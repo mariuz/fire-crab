@@ -214,7 +214,7 @@ fn external_type_to_desc(ftype: i64, flength: i64) -> Option<(u8, u16)> {
 }
 
 /// Decode every committed primary record of `rel` with `descs`.
-fn each_row<F: FnMut(Vec<Value>)>(file: &[u8], page_size: usize, rel: u16, descs: &[Descriptor], mut f: F) {
+fn each_row<F: FnMut(Vec<Value>)>(file: &crate::Image, page_size: usize, rel: u16, descs: &[Descriptor], mut f: F) {
     for dp_no in relation_data_pages(file, page_size, rel) {
         let Some(dp) = crate::page_at(file, page_size, dp_no).and_then(DataPage::decode) else {
             continue;
@@ -274,7 +274,7 @@ fn as_int(v: &Value) -> Option<i64> {
 /// so that two attachments to different databases in one process cannot
 /// share an entry that was never theirs.
 fn cached_system_formats(
-    file: &[u8],
+    file: &crate::Image,
     page_size: usize,
     rel_name: &str,
 ) -> Option<Option<Vec<(u8, Vec<Descriptor>)>>> {
@@ -286,7 +286,7 @@ fn cached_system_formats(
     if !(name.starts_with("RDB$") || name.starts_with("MON$") || name.starts_with("SEC$")) {
         return None;
     }
-    let ods = crate::header::HeaderPage::decode(file)?.ods_major();
+    let ods = crate::header::HeaderPage::decode(crate::page_at(file, page_size, 0)?)?.ods_major();
     static CACHE: OnceLock<Mutex<HashMap<(u16, usize, String), Option<Vec<(u8, Vec<Descriptor>)>>>>> =
         OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
@@ -304,7 +304,7 @@ fn cached_system_formats(
 }
 
 pub fn system_relation_formats(
-    file: &[u8],
+    file: &crate::Image,
     page_size: usize,
     rel_name: &str,
 ) -> Option<Vec<(u8, Vec<Descriptor>)>> {
@@ -315,7 +315,7 @@ pub fn system_relation_formats(
 }
 
 fn system_relation_formats_uncached(
-    file: &[u8],
+    file: &crate::Image,
     page_size: usize,
     rel_name: &str,
 ) -> Option<Vec<(u8, Vec<Descriptor>)>> {

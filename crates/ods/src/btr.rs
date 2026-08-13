@@ -258,11 +258,11 @@ pub fn read_node(page: &[u8], at: usize, leaf: bool) -> Option<IndexNode> {
 /// Find a relation's index root page by scanning (catalog-free, like
 /// the pointer-page scan).
 pub fn find_index_root<'a>(
-    file: &'a [u8],
+    file: &'a crate::Image,
     page_size: usize,
     relation: u16,
 ) -> Option<IndexRootPage<'a>> {
-    file.chunks_exact(page_size)
+    file.pages()
         .filter(|p| p[0] == PageType::IndexRoot as u8)
         .filter_map(IndexRootPage::decode)
         .find(|irt| irt.relation == relation)
@@ -274,7 +274,7 @@ pub fn find_index_root<'a>(
 /// stops at END_BUCKET (the sibling continues the level) and the
 /// level ends at END_LEVEL.
 pub fn walk_index_leaves(
-    file: &[u8],
+    file: &crate::Image,
     page_size: usize,
     relation: u16,
     index_id: u8,
@@ -336,7 +336,7 @@ pub fn walk_index_leaves(
 /// Duplicates may span pages, so the sibling chain is followed while
 /// the key still matches.
 pub fn lookup_key(
-    file: &[u8],
+    file: &crate::Image,
     page_size: usize,
     relation: u16,
     index_id: u8,
@@ -388,7 +388,7 @@ pub fn lookup_key(
 /// descending one complements its keys, so its caller must hand the
 /// bounds over already swapped.
 pub fn lookup_range(
-    file: &[u8],
+    file: &crate::Image,
     page_size: usize,
     relation: u16,
     index_id: u8,

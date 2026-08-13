@@ -74,7 +74,7 @@ fn relation_row(image: &[u8]) -> Option<(u16, String)> {
 /// Every (relation id, name) pair in the database, read from the raw
 /// `RDB$RELATIONS` data pages - the from-file mirror of
 /// `SELECT RDB$RELATION_ID, RDB$RELATION_NAME FROM RDB$RELATIONS`.
-pub fn list_relations(file: &[u8], page_size: usize) -> Vec<(u16, String)> {
+pub fn list_relations(file: &crate::Image, page_size: usize) -> Vec<(u16, String)> {
     let mut out = Vec::new();
     for dp_no in relation_data_pages(file, page_size, REL_RELATIONS) {
         let Some(dp) = crate::page_at(file, page_size, dp_no).and_then(DataPage::decode) else {
@@ -97,7 +97,7 @@ pub fn list_relations(file: &[u8], page_size: usize) -> Vec<(u16, String)> {
 /// Resolve a table name to its relation id (case-insensitive, matching
 /// the engine's unquoted-identifier folding). Returns None if no relation
 /// of that name exists.
-pub fn resolve_relation(file: &[u8], page_size: usize, name: &str) -> Option<u16> {
+pub fn resolve_relation(file: &crate::Image, page_size: usize, name: &str) -> Option<u16> {
     let want = name.trim();
     for (id, rel_name) in list_relations(file, page_size) {
         if rel_name.eq_ignore_ascii_case(want) {
@@ -135,7 +135,7 @@ fn cstr(image: &[u8], off: usize) -> Option<String> {
 /// by field id (the record-format / SELECT * order). The relation is
 /// matched by name because `RDB$RELATION_FIELDS` is keyed by name, which
 /// is what a query gives us.
-pub fn relation_columns(file: &[u8], page_size: usize, relation_name: &str) -> Vec<RelationColumn> {
+pub fn relation_columns(file: &crate::Image, page_size: usize, relation_name: &str) -> Vec<RelationColumn> {
     // A SYSTEM relation's columns are memoised, for the same reason and
     // with the same safety argument as [crate::sysfmt::system_relation_formats]:
     // this walks every data page of RDB$RELATION_FIELDS on every call and
@@ -156,7 +156,7 @@ pub fn relation_columns(file: &[u8], page_size: usize, relation_name: &str) -> V
 }
 
 fn cached_system_columns(
-    file: &[u8],
+    file: &crate::Image,
     page_size: usize,
     relation_name: &str,
 ) -> Option<Vec<RelationColumn>> {
@@ -166,7 +166,7 @@ fn cached_system_columns(
     if !(name.starts_with("RDB$") || name.starts_with("MON$") || name.starts_with("SEC$")) {
         return None;
     }
-    let ods = crate::header::HeaderPage::decode(file)?.ods_major();
+    let ods = crate::header::HeaderPage::decode(crate::page_at(file, page_size, 0)?)?.ods_major();
     static CACHE: OnceLock<Mutex<HashMap<(u16, usize, String), Vec<RelationColumn>>>> =
         OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
@@ -184,7 +184,7 @@ fn cached_system_columns(
 }
 
 fn relation_columns_uncached(
-    file: &[u8],
+    file: &crate::Image,
     page_size: usize,
     relation_name: &str,
 ) -> Vec<RelationColumn> {
@@ -235,7 +235,7 @@ fn relation_columns_uncached(
 /// (a freshly created or gbak-restored file), this equals the row count
 /// the engine returns; the same clean-file precondition `qa/diff-select.sh`
 /// relies on. (Full MVCC-visibility counting lives in `tra::visible_rows`.)
-pub fn count_primary_records(file: &[u8], page_size: usize, relation: u16) -> u64 {
+pub fn count_primary_records(file: &crate::Image, page_size: usize, relation: u16) -> u64 {
     let mut primary = 0u64;
     for dp_no in relation_data_pages(file, page_size, relation) {
         let Some(dp) = crate::page_at(file, page_size, dp_no).and_then(DataPage::decode) else {

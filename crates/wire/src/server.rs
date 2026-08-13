@@ -1196,7 +1196,9 @@ impl Database {
         if want.any_but_mode() && self.is_read_only() {
             return Err(HeaderDpbErr::ReadOnly);
         }
-        let head = HeaderPage::decode(&self.bytes()).ok_or(HeaderDpbErr::NoHeader)?;
+        let img0 = self.bytes();
+        let head =
+            HeaderPage::decode(img0.page(0).ok_or(HeaderDpbErr::NoHeader)?).ok_or(HeaderDpbErr::NoHeader)?;
         let mut moves: Vec<String> = Vec::new();
 
         // Decide what would change BEFORE taking a work copy: an
@@ -1222,8 +1224,12 @@ impl Database {
         }
         // the sweep interval is not a FIELD, it is a clumplet in the
         // variable header, and a fresh database has none at all
+        let hdr_img = self.bytes();
         let sweep = want.sweep_interval.filter(|n| {
-            fire_crab_ods::header::variable_header(&self.bytes())
+            hdr_img
+                .page(0)
+                .map(fire_crab_ods::header::variable_header)
+                .unwrap_or_default()
                 .iter()
                 .filter(|c| c.tag == hdr_clump::SWEEP_INTERVAL && c.data.len() >= 4)
                 .last()
@@ -1241,14 +1247,14 @@ impl Database {
         // the one that clears the flag - and the check above has already
         // refused every other item
         let mut work = self.work_copy_unchecked().map_err(HeaderDpbErr::Other)?;
-        work[22..24].copy_from_slice(&flags.to_le_bytes());
+        work.page_mut(0).expect("header page")[22..24].copy_from_slice(&flags.to_le_bytes());
         if let Some(n) = buffers {
-            work[32..36].copy_from_slice(&n.to_le_bytes());
+            work.page_mut(0).expect("header page")[32..36].copy_from_slice(&n.to_le_bytes());
         }
         if let Some(n) = sweep {
             let page_size = self.page_size;
             store_clumplet(
-                &mut work,
+                work.page_mut(0).expect("header page"),
                 page_size,
                 hdr_clump::SWEEP_INTERVAL,
                 &n.to_le_bytes(),
@@ -1323,7 +1329,7 @@ impl Database {
     /// The pages as they stand. Reference counted: the caller reads
     /// without holding a lock, and a writer installing a new image
     /// never changes one out from under a read in progress.
-    fn bytes(&self) -> std::sync::Arc<Vec<u8>> {
+    fn bytes(&self) -> std::sync::Arc<fire_crab_ods::Image> {
         self.shared.image()
     }
 
@@ -1332,7 +1338,7 @@ impl Database {
     /// edit. The order matters - the copy has to be taken while the
     /// write side is held, or two writers clone the same base and the
     /// second install silently drops the first's rows.
-    fn work_copy(&mut self) -> Result<Vec<u8>, String> {
+    fn work_copy(&mut self) -> Result<fire_crab_ods::Image, String> {
         // A READ-ONLY DATABASE HAS NO WRITE PATH AT ALL, and this is the
         // one funnel every write goes through - records, catalog rows,
         // generators, index pages, the header's own clumplets. Refusing
@@ -1352,7 +1358,7 @@ impl Database {
     /// write a read-only database allows, which is the one that turns the
     /// mode off again (`gfix -mode read_write`, measured to work on a
     /// read-only file where `gfix -write sync` on the same file does not).
-    fn work_copy_unchecked(&mut self) -> Result<Vec<u8>, String> {
+    fn work_copy_unchecked(&mut self) -> Result<fire_crab_ods::Image, String> {
         self.take_write_side()?;
         // every write in this server starts here, so this is where the
         // transaction stops being a reader
@@ -1395,7 +1401,7 @@ impl Database {
     /// takes [Database::work_copy] alone and burns no transaction -
     /// otherwise a rolled-back statement's generator flush would leave
     /// an active transaction in the file that nothing wrote a row under.
-    fn work_copy_with_tx(&mut self) -> Result<(Vec<u8>, u32), String> {
+    fn work_copy_with_tx(&mut self) -> Result<(fire_crab_ods::Image, u32), String> {
         let mut work = self.work_copy()?;
         // THE INNERMOST UNDO WINDOW THAT OWNS IDS is the one whose id
         // these records carry - a savepoint's, a body's, an autonomous
@@ -1560,7 +1566,7 @@ impl Database {
     /// off the image like [Database::is_read_only], and for the same
     /// reason: another attachment can change it while this one is open.
     fn shutdown_mode(&self) -> u8 {
-        self.bytes().get(25).copied().unwrap_or(0)
+        self.bytes().page(0).and_then(|p| p.get(25).copied()).unwrap_or(0)
     }
 
     /// This attachment's transaction became real - count it where
@@ -1584,7 +1590,8 @@ impl Database {
         // `hdr_flags` is at offset 22, which is where [Database::apply_header_dpb]
         // writes it.
         self.bytes()
-            .get(22..24)
+            .page(0)
+            .and_then(|p| p.get(22..24))
             .map(|b| u16::from_le_bytes([b[0], b[1]]))
             .is_some_and(|f| f & fire_crab_ods::header::hdr_flags::READ_ONLY != 0)
     }
@@ -1601,13 +1608,13 @@ impl Database {
     /// the shared image, not yet on the file. The next flush writes
     /// them, because a careful flush diffs against what is on disk and
     /// not against the last thing published.
-    fn install(&mut self, bytes: Vec<u8>) {
+    fn install(&mut self, bytes: fire_crab_ods::Image) {
         self.shared.publish(bytes);
     }
 
     /// Install an image the caller has just written to the file WHOLE,
     /// so nothing about it is dirty any more.
-    fn install_flushed(&mut self, bytes: Vec<u8>) {
+    fn install_flushed(&mut self, bytes: fire_crab_ods::Image) {
         let arc = self.shared.publish(bytes);
         self.shared.note_flushed(arc);
         self.note_disk();
@@ -1615,7 +1622,7 @@ impl Database {
 
     /// [Database::install_flushed] for an image the caller already
     /// holds - a snapshot being put back.
-    fn install_flushed_image(&mut self, img: std::sync::Arc<Vec<u8>>) {
+    fn install_flushed_image(&mut self, img: std::sync::Arc<fire_crab_ods::Image>) {
         self.shared.publish_image(std::sync::Arc::clone(&img));
         self.shared.note_flushed(img);
         self.note_disk();
@@ -1626,7 +1633,7 @@ impl Database {
     /// earlier install that was never flushed - the transaction id's
     /// own reservation, for one - left its pages dirty, and diffing
     /// against the current image would drop them silently.
-    fn flush_and_install(&mut self, work: Vec<u8>) -> Result<(), String> {
+    fn flush_and_install(&mut self, work: fire_crab_ods::Image) -> Result<(), String> {
         let flushed = self.shared.flushed();
         timed("flush", || flush_careful(&self.path, &flushed, &work, self.page_size))?;
         self.install_flushed(work);
@@ -1649,7 +1656,7 @@ impl Database {
     /// be reordered - the data before the TIP bits that make it real -
     /// is the careful flush's own business, and it sees the whole set
     /// at once now rather than one statement at a time.
-    fn install_dirty(&mut self, work: Vec<u8>) {
+    fn install_dirty(&mut self, work: fire_crab_ods::Image) {
         self.install(work);
     }
 
@@ -1848,7 +1855,8 @@ impl Database {
     fn retune_tx(&mut self) {
         let image = self.bytes();
         let next = image
-            .get(40..48)
+            .page(0)
+            .and_then(|p| p.get(40..48))
             .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
             .unwrap_or(0);
         if self.tx.is_some_and(|tx| next < u64::from(tx)) {
@@ -1984,7 +1992,7 @@ struct UndoWindow {
     /// the image this window started from, put back only when the undo
     /// cannot be done by state (a settled write went before - see
     /// [Database::ddl_undo])
-    base: Option<std::sync::Arc<Vec<u8>>>,
+    base: Option<std::sync::Arc<fire_crab_ods::Image>>,
 }
 
 impl UndoWindow {
@@ -2029,7 +2037,7 @@ fn mark_generator_set(db: &mut Database, name: &str) {
 fn undo_window_push(
     database: &mut Option<Database>,
     kind: WindowKind,
-    base: Option<std::sync::Arc<Vec<u8>>>,
+    base: Option<std::sync::Arc<fire_crab_ods::Image>>,
 ) -> usize {
     let Some(db) = database.as_mut() else { return 0 };
     let mut w = UndoWindow::new(kind);
@@ -2069,7 +2077,7 @@ fn kill_window_ids(db: &mut Database, ids: &[u32]) -> bool {
         return false;
     }
     let Ok(mut work) = db.work_copy() else { return false };
-    let next = u64::from_le_bytes(work.get(40..48).and_then(|b| b.try_into().ok()).unwrap_or([0; 8]));
+    let next = u64::from_le_bytes(work.page(0).and_then(|p0| p0.get(40..48)).and_then(|b| b.try_into().ok()).unwrap_or([0; 8]));
     let mut killed = false;
     for id in ids {
         if u64::from(*id) > next {
@@ -2257,7 +2265,8 @@ fn load_database(path: &str) -> Option<Database> {
     // THROUGH THE POOL, not `fs::read`: the pages of one file are one
     // image, shared by every attachment to it. See [Database].
     let shared = fire_crab_cch::pool::open(p)?;
-    let h = fire_crab_ods::header::HeaderPage::decode(&shared.image())?;
+    let img0 = shared.image();
+    let h = fire_crab_ods::header::HeaderPage::decode(img0.page(0)?)?;
     let page_size = h.page_size as usize;
     if page_size == 0 {
         return None;
@@ -2863,7 +2872,7 @@ fn run_gbak_backup_at(
     }
     let shared = fire_crab_cch::pool::open(&db).ok_or(SpecialErr::Plain(GDS_IO_ERROR))?;
     let image = shared.image();
-    let page_size = fire_crab_ods::header::HeaderPage::decode(&image)
+    let page_size = fire_crab_ods::header::HeaderPage::decode(image.page(0).unwrap_or(&[]))
         .map(|h| h.page_size as usize)
         .ok_or(SpecialErr::Plain(GDS_IO_ERROR))?;
     let now = std::time::SystemTime::now()
@@ -3038,10 +3047,11 @@ fn run_gbak_restore_core(
         Gds(GDS_IO_ERROR)
     })?;
     let build = (|| -> Result<(), String> {
-        let mut file = std::fs::read(&db).map_err(|e| e.to_string())?;
-        let page_size = fire_crab_ods::header::HeaderPage::decode(&file)
+        let raw = std::fs::read(&db).map_err(|e| e.to_string())?;
+        let page_size = fire_crab_ods::header::HeaderPage::decode(&raw)
             .map(|h| h.page_size as usize)
             .ok_or("the fresh shell has no header")?;
+        let mut file = fire_crab_ods::Image::from_bytes(&raw, page_size);
         for t in &restored.tables {
             // FIELD RECORDS ARRIVE BLOBS-FIRST (the engine's own file
             // order), and att 13 carries the true position - so the
@@ -3149,7 +3159,7 @@ fn run_gbak_restore_core(
                 }
             }
         }
-        std::fs::write(&db, &file).map_err(|e| e.to_string())?;
+        std::fs::write(&db, &file.to_bytes()).map_err(|e| e.to_string())?;
         Ok(())
     })();
     // however it went, the pool must not keep the half-known image
@@ -3384,15 +3394,15 @@ fn run_nbak(b: &fire_crab_svc::Buffer) -> Result<String, i32> {
     }
     let shared = fire_crab_cch::pool::open(&db).ok_or(GDS_IO_ERROR)?;
     let image = shared.image();
-    let page_size = fire_crab_ods::header::HeaderPage::decode(&image)
+    let page_size = fire_crab_ods::header::HeaderPage::decode(image.page(0).unwrap_or(&[]))
         .map(|h| h.page_size as usize)
         .ok_or(GDS_IO_ERROR)?;
     if page_size == 0 {
         return Err(GDS_IO_ERROR);
     }
     let mut copy = image.as_ref().clone();
-    if copy.len() > 24 {
-        copy[24] = 1; // hdr_backup_mode = stalled, as the engine's .nbk carries
+    if copy.byte_len() > 24 {
+        copy.page_mut(0).expect("header page")[24] = 1; // hdr_backup_mode = stalled, as the engine's .nbk carries
     }
     // THE BACKUP GUID CLUMPLET (HDR_backup_guid, tag 7) - not decoration:
     // `nbackup -R` REFUSES a level-0 file without one ("Cannot get backup
@@ -3403,7 +3413,7 @@ fn run_nbak(b: &fire_crab_svc::Buffer) -> Result<String, i32> {
     // leaves the main file untouched, which the gate asserts as the same
     // boundary the missing history row belongs to.
     fire_crab_ods::header::store_clumplet(
-        &mut copy,
+        copy.page_mut(0).expect("header page"),
         page_size,
         fire_crab_ods::header::hdr_clump::BACKUP_GUID,
         &fresh_guid(),
@@ -3422,8 +3432,8 @@ fn run_nbak(b: &fire_crab_svc::Buffer) -> Result<String, i32> {
             GDS_IO_ERROR
         })?;
     use std::io::Write as _;
-    out.write_all(&copy).and_then(|_| out.sync_all()).map_err(|_| GDS_IO_ERROR)?;
-    let pages = copy.len() / page_size;
+    out.write_all(&copy.to_bytes()).and_then(|_| out.sync_all()).map_err(|_| GDS_IO_ERROR)?;
+    let pages = copy.byte_len() / page_size;
     // nbackup's own stat lines, streamed back the way the engine's
     // server-side nbackup streams them: reads count the header probe
     // plus every page, writes count the pages written
@@ -15852,7 +15862,7 @@ impl Database {
         // read-only refusal exactly as the mode switch is (SHUT_database
         // never calls ensureDbWritable)
         let mut work = self.work_copy_unchecked().map_err(HeaderDpbErr::Other)?;
-        work[25] = target;
+        work.page_mut(0).expect("header page")[25] = target;
         self.flush_and_install(work).map_err(HeaderDpbErr::Other)?;
         self.end_write();
         Ok(format!(
@@ -17190,7 +17200,7 @@ fn parse_gen_where(
 /// value drawn, for the caller's [burn_generator].
 fn collect_dml_targets_drawing(
     db: &Database,
-    work: &mut [u8],
+    work: &mut fire_crab_ods::Image,
     rel: u16,
     formats: &[(u8, Vec<Descriptor>)],
     g: &GenFilter,
@@ -18088,7 +18098,7 @@ fn execute_dml_collecting_inner(
                     // allocates between here and the store)
                     DefaultVal::Transaction => WireParam::Int(
                         (u64::from_le_bytes(
-                            work.get(40..48)
+                            work.page(0).and_then(|p0| p0.get(40..48))
                                 .and_then(|b| b.try_into().ok())
                                 .ok_or("header unreadable")?,
                         ) + 1) as i64,
@@ -18559,17 +18569,17 @@ fn execute_dml_collecting_inner(
 /// whole: extending a file is itself a careful-write question the model
 /// does not cover, and answering it by guessing would be worse than not
 /// answering it.
-fn flush_careful(path: &str, before: &[u8], after: &[u8], page_size: usize) -> Result<(), String> {
+fn flush_careful(path: &str, before: &fire_crab_ods::Image, after: &fire_crab_ods::Image, page_size: usize) -> Result<(), String> {
     // FC_NO_CAREFUL restores the whole-file write. It exists for the
     // GATE, for the same reason FC_NO_INDEX does: an assertion that the
     // ordering happened is worth nothing unless it can be seen not to.
     if std::env::var("FC_NO_CAREFUL").is_ok() {
-        return std::fs::write(path, after).map_err(|e| e.to_string());
+        return std::fs::write(path, &after.to_bytes()).map_err(|e| e.to_string());
     }
-    if before.len() != after.len() || before.is_empty() || page_size == 0 {
-        return std::fs::write(path, after).map_err(|e| e.to_string());
+    if before.byte_len() != after.byte_len() || before.num_pages() == 0 || page_size == 0 {
+        return std::fs::write(path, &after.to_bytes()).map_err(|e| e.to_string());
     }
-    let mut cache = fire_crab_cch::careful_plan(before, after, page_size);
+    let mut cache = fire_crab_cch::careful_plan(&before.to_bytes(), &after.to_bytes(), page_size);
     cache.flush();
     let order: Vec<u32> = cache.write_order().to_vec();
     if order.is_empty() {
@@ -18582,7 +18592,7 @@ fn flush_careful(path: &str, before: &[u8], after: &[u8], page_size: usize) -> R
     // write when it is not. `fire-crab-pio` has held that rule - and the
     // offset arithmetic, and the retry count - since it was converted,
     // with nothing calling it.
-    let flags = fire_crab_ods::header::HeaderPage::decode(&after[..page_size.min(after.len())])
+    let flags = fire_crab_ods::header::HeaderPage::decode(after.page(0).unwrap_or(&[]))
         .map(|h| h.flags)
         .unwrap_or(0);
     let mut plan = fire_crab_pio::plan_for_header(flags, false);
@@ -18597,7 +18607,7 @@ fn flush_careful(path: &str, before: &[u8], after: &[u8], page_size: usize) -> R
     // read-write; a flush that leaves it set is an ordinary write to a
     // read-only file and must not happen (see [Database::work_copy],
     // which is what stops it before it gets here).
-    let ro_before = fire_crab_ods::header::HeaderPage::decode(&before[..page_size.min(before.len())])
+    let ro_before = fire_crab_ods::header::HeaderPage::decode(before.page(0).unwrap_or(&[]))
         .map(|h| h.flags & fire_crab_ods::header::hdr_flags::READ_ONLY != 0)
         .unwrap_or(false);
     plan.read_only = plan.read_only && ro_before;
@@ -18605,12 +18615,10 @@ fn flush_careful(path: &str, before: &[u8], after: &[u8], page_size: usize) -> R
     let forced = plan.force_write;
     let pio = fire_crab_pio::Pio::open(path, page_size as u32, plan)?;
     for page in &order {
-        let start = *page as usize * page_size;
-        let end = (start + page_size).min(after.len());
-        if start >= after.len() {
+        let Some(page_bytes) = after.page(*page) else {
             continue;
-        }
-        let mut buf = after[start..end].to_vec();
+        };
+        let mut buf = page_bytes.to_vec();
         buf.resize(page_size, 0);
         pio.write_page(*page, &buf)?;
     }
@@ -18929,7 +18937,7 @@ fn leaf_source(
 
 impl IndexPick {
     /// The candidates this pick offers: `(entry key, record number)`.
-    fn candidates(&self, bytes: &[u8], page_size: usize, rel: u16) -> Vec<(Vec<u8>, u64)> {
+    fn candidates(&self, bytes: &fire_crab_ods::Image, page_size: usize, rel: u16) -> Vec<(Vec<u8>, u64)> {
         fire_crab_ods::btr::lookup_range(
             bytes,
             page_size,
@@ -19438,7 +19446,7 @@ fn validate_select_bind(plan: &Plan, args: &[WireParam]) -> Result<(), ExecErr> 
 /// duplicate.
 #[allow(clippy::too_many_arguments)]
 fn insert_entry_verified(
-    work: &mut Vec<u8>,
+    work: &mut fire_crab_ods::Image,
     page_size: usize,
     rel: u16,
     op: &IndexOp,
@@ -19624,7 +19632,7 @@ fn index_error_names(db: &Database, table: &str, index_id: u8) -> Option<(String
 /// entry is fetched and its key recomputed; only a live record that
 /// still carries the key is a duplicate.
 fn unique_conflict(
-    work: &[u8],
+    work: &fire_crab_ods::Image,
     page_size: usize,
     rel: u16,
     op: &IndexOp,
@@ -19657,10 +19665,8 @@ fn unique_conflict(
         .any(|values| op.key_for(values).is_some_and(|(k, _)| k == key))
 }
 
-fn recno_of(work: &[u8], page_size: usize, page_no: u32, slot: u16) -> Result<u64, String> {
-    let start = page_no as usize * page_size;
-    let dp = work
-        .get(start..start + page_size)
+fn recno_of(work: &fire_crab_ods::Image, page_size: usize, page_no: u32, slot: u16) -> Result<u64, String> {
+    let dp = fire_crab_ods::page_at(work, page_size, page_no)
         .and_then(DataPage::decode)
         .ok_or("bad data page")?;
     Ok(dp.sequence as u64 * fire_crab_ods::format::max_recs_per_dp(page_size) + slot as u64)
@@ -26819,22 +26825,21 @@ fn records_for_2pc(
 /// answer - and the only defect of its kind on the live single-relation
 /// path.
 fn page_sequence_map(
-    bytes: &[u8],
+    bytes: &fire_crab_ods::Image,
     page_size: usize,
     rel: u16,
 ) -> std::collections::HashMap<u32, u32> {
     relation_data_pages(bytes, page_size, rel)
         .into_iter()
         .filter_map(|no| {
-            let start = no as usize * page_size;
-            let dp = bytes.get(start..start + page_size).and_then(DataPage::decode)?;
+            let dp = fire_crab_ods::page_at(bytes, page_size, no).and_then(DataPage::decode)?;
             Some((dp.sequence, no))
         })
         .collect()
 }
 
 fn records_at_in(
-    bytes: &[u8],
+    bytes: &fire_crab_ods::Image,
     page_size: usize,
     rel: u16,
     formats: &[(u8, Vec<Descriptor>)],
@@ -26885,7 +26890,7 @@ struct ReadView<'a> {
 }
 
 impl<'a> ReadView<'a> {
-    fn of(db: &Database, image: &'a [u8]) -> ReadView<'a> {
+    fn of(db: &Database, image: &'a fire_crab_ods::Image) -> ReadView<'a> {
         ReadView {
             tips: fire_crab_ods::tra::TipChain::read(image, db.page_size),
             own: db.own_tx(),
@@ -26903,7 +26908,7 @@ impl<'a> ReadView<'a> {
     /// uniqueness and FK checks see ALL committed rows, not the
     /// transaction's stable view (the engine's constraints are not
     /// snapshot-bound).
-    fn over(image: &'a [u8], page_size: usize, own: fire_crab_ods::tra::OwnTx) -> ReadView<'a> {
+    fn over(image: &'a fire_crab_ods::Image, page_size: usize, own: fire_crab_ods::tra::OwnTx) -> ReadView<'a> {
         ReadView {
             tips: fire_crab_ods::tra::TipChain::read(image, page_size),
             own,
@@ -26918,7 +26923,7 @@ impl<'a> ReadView<'a> {
     /// not).
     fn version(
         &self,
-        bytes: &[u8],
+        bytes: &fire_crab_ods::Image,
         page_size: usize,
         r: &fire_crab_ods::RecordHeader,
     ) -> Option<(Vec<u8>, u8)> {
@@ -26982,7 +26987,7 @@ impl<'a> ReadView<'a> {
     /// not be the head's: an older version can carry an older format.
     fn values(
         &self,
-        bytes: &[u8],
+        bytes: &fire_crab_ods::Image,
         page_size: usize,
         formats: &[(u8, Vec<Descriptor>)],
         r: &fire_crab_ods::RecordHeader,
@@ -27000,7 +27005,7 @@ impl<'a> ReadView<'a> {
 /// retrieval loop wants, so the walk above happens once and not once per
 /// row.
 fn records_at_in_with(
-    bytes: &[u8],
+    bytes: &fire_crab_ods::Image,
     page_size: usize,
     formats: &[(u8, Vec<Descriptor>)],
     pages: &std::collections::HashMap<u32, u32>,
@@ -27013,8 +27018,7 @@ fn records_at_in_with(
         let seq = (recno / per_page) as u32;
         let slot = (recno % per_page) as usize;
         let Some(&dp_no) = pages.get(&seq) else { continue };
-        let start = dp_no as usize * page_size;
-        let Some(dp) = bytes.get(start..start + page_size).and_then(DataPage::decode) else {
+        let Some(dp) = fire_crab_ods::page_at(bytes, page_size, dp_no).and_then(DataPage::decode) else {
             continue;
         };
         // `record(slot)`, NOT `records().nth(slot)` - see the DML walk:
@@ -41316,7 +41320,7 @@ fn run_body_dml(
 // is the cost model this server already runs on.
 
 /// The page image as it stands, to be restored if a statement fails.
-fn snapshot_db(database: &Option<Database>) -> Option<std::sync::Arc<Vec<u8>>> {
+fn snapshot_db(database: &Option<Database>) -> Option<std::sync::Arc<fire_crab_ods::Image>> {
     // A REFERENCE, NOT A COPY. A published image is never edited in
     // place, so holding one keeps the file as it was however many
     // installs follow - and taking the snapshot costs a refcount bump
@@ -41340,7 +41344,7 @@ fn snapshot_db(database: &Option<Database>) -> Option<std::sync::Arc<Vec<u8>>> {
 /// is what says whether this connection wrote, and it is held from the
 /// transaction's first write until here, so no other writer can have
 /// committed inside the window this restore covers.
-fn restore_db(database: &mut Option<Database>, snap: Option<std::sync::Arc<Vec<u8>>>) -> bool {
+fn restore_db(database: &mut Option<Database>, snap: Option<std::sync::Arc<fire_crab_ods::Image>>) -> bool {
     if let (Some(db), Some(bytes)) = (database.as_mut(), snap) {
         if !db.wrote() {
             return false;
@@ -41357,11 +41361,13 @@ fn restore_db(database: &mut Option<Database>, snap: Option<std::sync::Arc<Vec<u
         } else {
             let mut img = bytes.as_ref().clone();
             for (page, data) in &db.auto_pages {
-                let at = *page as usize * db.page_size;
-                if at + data.len() > img.len() {
-                    img.resize(at + data.len(), 0);
+                if *page as usize >= img.num_pages() {
+                    img.grow((*page as usize + 1) * db.page_size);
                 }
-                img[at..at + data.len()].copy_from_slice(data);
+                if let Some(p) = img.page_mut(*page) {
+                    let n = data.len().min(p.len());
+                    p[..n].copy_from_slice(&data[..n]);
+                }
             }
             std::sync::Arc::new(img)
         };
@@ -41398,7 +41404,7 @@ fn restore_db(database: &mut Option<Database>, snap: Option<std::sync::Arc<Vec<u
 fn undo_window(
     database: &mut Option<Database>,
     mark: usize,
-    base: Option<std::sync::Arc<Vec<u8>>>,
+    base: Option<std::sync::Arc<fire_crab_ods::Image>>,
 ) {
     if database.as_ref().is_some_and(|d| d.ddl_undo) {
         restore_db(database, base);
@@ -41428,7 +41434,7 @@ fn undo_window(
 /// written forward over whatever the rollback left).
 fn rollback_now(
     database: &mut Option<Database>,
-    tx_snapshot: &mut Option<std::sync::Arc<Vec<u8>>>,
+    tx_snapshot: &mut Option<std::sync::Arc<fire_crab_ods::Image>>,
 ) -> (TxEnd, bool) {
     let by_image = database.as_ref().is_some_and(|d| d.ddl_undo);
     let wrote = database.as_ref().is_some_and(|d| d.wrote());
@@ -42495,15 +42501,12 @@ fn run_autonomous(
     // have nothing an enclosing undo must keep.
     if outcome.is_ok() {
         let after = d.bytes();
-        let ps = d.page_size;
-        let pages = after.len().div_ceil(ps);
         let mut changed = std::collections::HashMap::new();
-        for p in 0..pages {
-            let at = p * ps;
-            let new = &after[at..(at + ps).min(after.len())];
-            let old = before.get(at..(at + ps).min(before.len())).unwrap_or(&[]);
+        for p in 0..after.num_pages() as u32 {
+            let new = after.page(p).unwrap_or(&[]);
+            let old = before.page(p).unwrap_or(&[]);
             if new != old {
-                changed.insert(p as u32, new.to_vec());
+                changed.insert(p, new.to_vec());
             }
         }
         if std::env::var("FC_SRV_TRACE").is_ok() {
@@ -45048,12 +45051,12 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
     // takes the snapshot, op_rollback restores it, op_commit drops it.
     // One clone per transaction - the same cost model statement-level
     // rollback already runs on.
-    let mut tx_snapshot: Option<std::sync::Arc<Vec<u8>>> = None;
+    let mut tx_snapshot: Option<std::sync::Arc<fire_crab_ods::Image>> = None;
     // Named marks inside the transaction, oldest first: the image as it
     // stood when each mark was made. ROLLBACK TO puts that image back and
     // KEEPS the mark; RELEASE forgets the mark but keeps the work. Both
     // discard the marks made AFTER the named one.
-    let mut savepoints: Vec<(String, std::sync::Arc<Vec<u8>>)> = Vec::new();
+    let mut savepoints: Vec<(String, std::sync::Arc<fire_crab_ods::Image>)> = Vec::new();
     // TWO-PHASE COMMIT state: this connection's transaction has been
     // PREPARED (limbo on disk; only commit/rollback may follow), or
     // this connection RECONNECTED somebody else's limbo id to resolve
@@ -46840,7 +46843,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     page_size: database.as_ref().map_or(8192, |d| d.page_size as u32),
                     replica_mode: database
                         .as_ref()
-                        .and_then(|d| d.bytes().get(26).copied())
+                        .and_then(|d| d.bytes().page(0).and_then(|p| p.get(26).copied()))
                         .unwrap_or(0),
                     val_counts: database.as_ref().and_then(|d| d.val_counts),
                     read_only: database.as_ref().is_some_and(|d| d.is_read_only()),
@@ -46873,7 +46876,8 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     .as_ref()
                     .and_then(|d| {
                         d.bytes()
-                            .get(40..44)
+                            .page(0)
+                            .and_then(|p| p.get(40..44))
                             .map(|b| [b[0], b[1], b[2], b[3]])
                     })
                     .map(|b| i32::from_le_bytes(b).wrapping_add(1))
@@ -48209,7 +48213,7 @@ fn generator_id(db: &Database, name: &str) -> Option<i64> {
 /// Errs if the generator page has not been allocated - fire-crab writes
 /// to existing generators, it does not grow the generator vector.
 fn write_generator_value(
-    bytes: &mut [u8],
+    bytes: &mut fire_crab_ods::Image,
     page_size: usize,
     id: i64,
     value: i64,

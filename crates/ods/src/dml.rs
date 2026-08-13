@@ -69,7 +69,7 @@ pub struct DmlOutcome {
 // they are handed - a page (the usual caller, since slices 4-9 made every
 // write page-local) or a record image. The parameter is named `buf`, not
 // `file`, so that `file` names the whole database image alone: the coming
-// storage flip swaps `file: &[u8]` for a paged `&Image` by name, and these
+// storage flip swaps `file: &crate::Image` for a paged `&Image` by name, and these
 // generic helpers, which take an ordinary `&mut [u8]`, must not be caught
 // by that swap.
 pub(crate) fn put_u16(buf: &mut [u8], at: usize, v: u16) {
@@ -86,9 +86,9 @@ fn put_u64(buf: &mut [u8], at: usize, v: u64) {
 /// and the shift within it. TIP pages chain via `tip_next`; the head is
 /// the one no other TIP points to (the same walk `TipChain` does, done
 /// index-wise so the caller can mutate).
-fn tip_bits_at(file: &[u8], page_size: usize, tx: u64) -> Result<(u32, usize, u32), String> {
+fn tip_bits_at(file: &crate::Image, page_size: usize, tx: u64) -> Result<(u32, usize, u32), String> {
     let tips: Vec<(usize, u32, u32)> = file
-        .chunks_exact(page_size)
+        .pages()
         .enumerate()
         .filter(|(_, p)| p[0] == PageType::TransactionInventory as u8)
         .filter_map(|(i, p)| TipPage::decode(p).map(|t| (i, t.pag.page_no, t.next)))
@@ -131,7 +131,7 @@ fn tip_bits_at(file: &[u8], page_size: usize, tx: u64) -> Result<(u32, usize, u3
 /// an active slot, and OR-ing onto whatever was there is only correct
 /// when the slot reads zero.
 pub fn set_tx_state(
-    file: &mut [u8],
+    file: &mut crate::Image,
     page_size: usize,
     tx: u64,
     state: crate::tip::TxState,
@@ -151,7 +151,7 @@ pub fn set_tx_state(
 ///
 /// The id is `hdr_next_transaction + 1`, and the header is advanced to
 /// it so nobody else reserves the same one.
-pub fn begin_active_tx(file: &mut [u8], page_size: usize) -> Result<u64, String> {
+pub fn begin_active_tx(file: &mut crate::Image, page_size: usize) -> Result<u64, String> {
     // hdr_next_transaction @40 lives on the header, page 0
     let tx = u64_at(
         crate::page_at(file, page_size, 0).ok_or("no header page")?,
@@ -177,7 +177,7 @@ pub fn begin_active_tx(file: &mut [u8], page_size: usize) -> Result<u64, String>
 /// page, anything whose visibility is not the transaction's to decide.
 /// A user-table write in an open transaction takes [begin_active_tx]
 /// instead and is committed at COMMIT.
-pub(crate) fn allocate_committed_tx(file: &mut [u8], page_size: usize) -> Result<u64, String> {
+pub(crate) fn allocate_committed_tx(file: &mut crate::Image, page_size: usize) -> Result<u64, String> {
     // hdr_next_transaction @40 lives on the header, page 0
     let tx = u64_at(
         crate::page_at(file, page_size, 0).ok_or("no header page")?,
@@ -207,7 +207,7 @@ struct Spot {
 /// Free space on a data page is the gap between the directory's end and
 /// the lowest used record offset - records grow down from the page end,
 /// entries grow up (dpm.epp's layout).
-fn find_space(file: &[u8], page_size: usize, rel: u16, rec_len: usize) -> Option<Spot> {
+fn find_space(file: &crate::Image, page_size: usize, rel: u16, rec_len: usize) -> Option<Spot> {
     let aligned = (rec_len + 3) & !3; // ODS_ALIGNMENT placement
     for dp_no in relation_data_pages(file, page_size, rel) {
         let Some(page) = crate::page_at(file, page_size, dp_no) else {
@@ -248,7 +248,7 @@ fn find_space(file: &[u8], page_size: usize, rel: u16, rec_len: usize) -> Option
 /// landing on a page clears its `ppg_dp_empty` (0x10) bit - the
 /// engine's DPM keeps those in sync and `gfix -v -full` warns when a
 /// pointer page calls a non-empty data page empty.
-fn write_at_spot(file: &mut [u8], page_size: usize, spot: &Spot, rec: &[u8]) {
+fn write_at_spot(file: &mut crate::Image, page_size: usize, spot: &Spot, rec: &[u8]) {
     {
         // every byte here is on ONE page - the record body, its slot
         // directory entry, and the page's own count - so it is written
@@ -271,14 +271,14 @@ fn write_at_spot(file: &mut [u8], page_size: usize, spot: &Spot, rec: &[u8]) {
 /// Find `page_no`'s slot on its relation's pointer pages and clear
 /// `mask` in the fill-bits byte (ods.h:841-853: one byte per slot
 /// after the full page-number vector capacity).
-fn clear_fill_bits(file: &mut [u8], page_size: usize, page_no: u32, mask: u8) {
+fn clear_fill_bits(file: &mut crate::Image, page_size: usize, page_no: u32, mask: u8) {
     let rel = u16_at(
         crate::page_at(file, page_size, page_no).expect("clear_fill_bits: page out of range"),
         20,
     ); // dpg_relation @20
     let capacity = data_pages_per_pp(page_size) as usize;
     let pps: Vec<usize> = file
-        .chunks_exact(page_size)
+        .pages()
         .enumerate()
         .filter(|(_, p)| p[0] == PageType::Pointer as u8 && u16_at(p, 26) == rel)
         .map(|(i, _)| i)
@@ -319,7 +319,7 @@ fn rhd_bytes(tx: u32, b_page: u32, b_line: u16, rflags: u16, format: u8, data: &
 /// used count and min-free hint, extend the file to cover it. Public
 /// for the blob crate - blob pages are plain PIP allocations that no
 /// pointer page ever names (dpm.epp allocates them the same way).
-pub fn allocate_page(file: &mut Vec<u8>, page_size: usize) -> Result<u32, String> {
+pub fn allocate_page(file: &mut crate::Image, page_size: usize) -> Result<u32, String> {
     let per_pip = PipPage::pages_per_pip(page_size);
     // PIP 0 is page 1: find a free page on it, then claim it - both
     // page-local on the PIP, the file only GROWS to cover the result
@@ -346,8 +346,8 @@ pub fn allocate_page(file: &mut Vec<u8>, page_size: usize) -> Result<u32, String
         }
     }
     let need = (found + 1) * page_size;
-    if file.len() < need {
-        file.resize(need, 0);
+    if file.byte_len() < need {
+        file.grow(need);
     }
     Ok(found as u32)
 }
@@ -359,12 +359,12 @@ pub fn allocate_page(file: &mut Vec<u8>, page_size: usize) -> Result<u32, String
 /// byte (ods.h:841-853, one byte after the slot vector's full
 /// `dataPagesPerPP` capacity) zeroed: the page is about to receive its
 /// first record, so it is neither full nor empty.
-fn extend_relation(file: &mut Vec<u8>, page_size: usize, rel: u16) -> Result<u32, String> {
+fn extend_relation(file: &mut crate::Image, page_size: usize, rel: u16) -> Result<u32, String> {
     let sequence = relation_data_pages(file, page_size, rel).len() as u32;
 
     // the relation's last pointer page (highest ppg_sequence)
     let mut last: Option<(u32, u32)> = None; // (page number, sequence)
-    for (i, p) in file.chunks_exact(page_size).enumerate() {
+    for (i, p) in file.pages().enumerate() {
         if p[0] == PageType::Pointer as u8
             && PageHeader::decode(p).is_some()
             && u16_at(p, 26) == rel
@@ -412,7 +412,7 @@ fn extend_relation(file: &mut Vec<u8>, page_size: usize, rel: u16) -> Result<u32
 /// freshly allocated page when every existing one is full. The record
 /// is stored NOT_PACKED under a freshly committed transaction.
 pub fn insert_record(
-    file: &mut Vec<u8>,
+    file: &mut crate::Image,
     page_size: usize,
     rel: u16,
     format_no: u8,
@@ -430,7 +430,7 @@ pub fn insert_record(
 /// server's open transaction, still active in the TIP, so the row is
 /// invisible to everybody else until that transaction commits.
 pub fn insert_record_under(
-    file: &mut Vec<u8>,
+    file: &mut crate::Image,
     page_size: usize,
     rel: u16,
     format_no: u8,
@@ -452,7 +452,7 @@ pub fn insert_record_under(
 /// by system transaction"), and its release-build error path then
 /// leaves a latched buffer behind - the attach appears to hang.
 pub fn insert_record_system(
-    file: &mut Vec<u8>,
+    file: &mut crate::Image,
     page_size: usize,
     rel: u16,
     format_no: u8,
@@ -462,7 +462,7 @@ pub fn insert_record_system(
 }
 
 fn insert_record_as(
-    file: &mut Vec<u8>,
+    file: &mut crate::Image,
     page_size: usize,
     rel: u16,
     format_no: u8,
@@ -508,7 +508,7 @@ fn insert_record_as(
 /// free again, `pip_used` decremented, the `pip_min` hint lowered.
 /// The page bytes are left as-is - a freed page keeps stale content,
 /// exactly like the engine (allocation zeroes on reuse).
-pub(crate) fn release_page(file: &mut [u8], page_size: usize, page_no: u32) -> Result<(), String> {
+pub(crate) fn release_page(file: &mut crate::Image, page_size: usize, page_no: u32) -> Result<(), String> {
     let per_pip = PipPage::pages_per_pip(page_size);
     if page_no as usize >= per_pip {
         return Err("page beyond the first PIP".into());
@@ -540,7 +540,7 @@ pub(crate) fn release_page(file: &mut [u8], page_size: usize, page_no: u32) -> R
 /// probe of RDB$FORMATS/RDB$RUNTIME blobs). Returns the blob's record
 /// number - what a blob id in an owning record points at.
 pub fn insert_blob(
-    file: &mut Vec<u8>,
+    file: &mut crate::Image,
     page_size: usize,
     rel: u16,
     segments: &[Vec<u8>],
@@ -556,7 +556,7 @@ pub fn insert_blob(
 /// charset), not 1; the engine's `CAST(RDB$DESCRIPTION AS VARCHAR)`
 /// decodes through the blob's own charset, so it must match.
 pub fn insert_blob_cs(
-    file: &mut Vec<u8>,
+    file: &mut crate::Image,
     page_size: usize,
     rel: u16,
     segments: &[Vec<u8>],
@@ -591,7 +591,7 @@ pub fn insert_blob_cs(
 /// blh down in place of a record header). The caller owns the blh
 /// bytes; this owns WHERE they live.
 pub fn insert_blob_slot(
-    file: &mut Vec<u8>,
+    file: &mut crate::Image,
     page_size: usize,
     rel: u16,
     blh: &[u8],
@@ -658,7 +658,7 @@ pub fn insert_blob_slot(
 /// byte-identical INCLUDING tail-resident `RDB$SCHEMA_NAME`, and comment
 /// text poked into 88 fragmented rows reads back through Firebird.
 pub fn patch_head_in_place(
-    file: &mut [u8],
+    file: &mut crate::Image,
     page_size: usize,
     page_no: u32,
     slot: u16,
@@ -736,7 +736,7 @@ pub fn patch_head_in_place(
 }
 
 fn push_back_version(
-    file: &mut Vec<u8>,
+    file: &mut crate::Image,
     page_size: usize,
     rel: u16,
     page_no: u32,
@@ -783,7 +783,7 @@ fn push_back_version(
 /// unpacked successor usually is), so space is re-found on the page
 /// with the old body's bytes counted as free.
 pub(crate) fn rewrite_primary(
-    file: &mut [u8],
+    file: &mut crate::Image,
     page_size: usize,
     page_no: u32,
     slot: u16,
@@ -853,7 +853,7 @@ pub(crate) fn rewrite_primary(
 /// error partway the file image is left inconsistent - callers work on
 /// a copy and discard it (the whole-file-flush model).
 pub fn update_records(
-    file: &mut Vec<u8>,
+    file: &mut crate::Image,
     page_size: usize,
     rel: u16,
     targets: &[(u32, u16, Vec<u8>)],
@@ -874,7 +874,7 @@ pub fn update_records(
 /// caller can interleave its per-row writes with per-row constraint
 /// checks (the engine enforces UNIQUE/PK row at a time, in record-number
 /// order, seeing the rows the same statement already rewrote).
-pub fn begin_committed_tx(file: &mut Vec<u8>, page_size: usize) -> Result<u32, String> {
+pub fn begin_committed_tx(file: &mut crate::Image, page_size: usize) -> Result<u32, String> {
     let tx = allocate_committed_tx(file, page_size)?;
     if tx > u32::MAX as u64 {
         return Err("64-bit transaction ids (rhde) not supported yet".into());
@@ -887,7 +887,7 @@ pub fn begin_committed_tx(file: &mut Vec<u8>, page_size: usize) -> Result<u32, S
 /// server can write and then index-check each row before touching the
 /// next.
 pub fn update_record_under(
-    file: &mut Vec<u8>,
+    file: &mut crate::Image,
     page_size: usize,
     rel: u16,
     tx: u32,
@@ -929,7 +929,7 @@ pub fn update_record_under(
 /// "row gone" and the engine's garbage collector later expunges along
 /// with the chain.
 pub fn delete_records(
-    file: &mut Vec<u8>,
+    file: &mut crate::Image,
     page_size: usize,
     rel: u16,
     targets: &[(u32, u16)],
@@ -953,7 +953,7 @@ pub fn delete_records(
 /// count that transaction walks past the stub to the version behind
 /// it and still sees the row.
 pub fn delete_records_under(
-    file: &mut Vec<u8>,
+    file: &mut crate::Image,
     page_size: usize,
     rel: u16,
     targets: &[(u32, u16)],
@@ -979,7 +979,7 @@ mod tests {
     /// next_transaction, a TIP (page 1), a pointer page (page 2) for
     /// relation 42 listing one data page (page 3) with one existing
     /// record.
-    fn scratch_file(page_size: usize) -> Vec<u8> {
+    fn scratch_file(page_size: usize) -> crate::Image {
         let mut f = vec![0u8; page_size * 4];
         // header
         f[0] = PageType::Header as u8;
@@ -1006,7 +1006,7 @@ mod tests {
         let off = page_size - 20;
         put_u16(&mut f, d + 24, off as u16);
         put_u16(&mut f, d + 26, 20);
-        f
+        crate::Image::from_bytes(&f, page_size)
     }
 
     /// AN OPEN TRANSACTION LOOKS DIFFERENT IN THE FILE, which is the
@@ -1271,7 +1271,7 @@ mod head_patch_tests {
         file
     }
 
-    fn head_bytes(file: &[u8]) -> Vec<u8> {
+    fn head_bytes(file: &crate::Image) -> Vec<u8> {
         let dp = DataPage::decode(&file[4096..8192]).unwrap();
         let r = dp.record(0).unwrap();
         crate::sqz::unpack(r.packed_data).unwrap()

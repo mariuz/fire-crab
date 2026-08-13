@@ -346,7 +346,7 @@ mod tests {
 /// the engine planned INDEX. The first row this assembled decoded to
 /// `PK_BS2P_500` on table `BS2P_500`, the first index on that list.
 pub fn assembled_image(
-    file: &[u8],
+    file: &crate::Image,
     page_size: usize,
     head: &RecordHeader<'_>,
 ) -> Option<Vec<u8>> {
@@ -365,7 +365,7 @@ pub fn assembled_image(
     let mut next = head.next_fragment();
     // A chain longer than the file has pages is a corrupt file, not a
     // long record; bound it rather than loop forever.
-    let max_hops = (file.len() / page_size.max(1)).max(1);
+    let max_hops = (file.byte_len() / page_size.max(1)).max(1);
     let mut hops = 0usize;
     while let Some((pno, line)) = next {
         hops += 1;

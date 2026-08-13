@@ -61,9 +61,9 @@ impl<'a> PointerPage<'a> {
 /// (scanning for owners rather than reading RDB$PAGES - catalog-free,
 /// which is what a low-level tool wants), yielding data page numbers
 /// in (sequence, slot) order.
-pub fn relation_data_pages(file: &[u8], page_size: usize, relation: u16) -> Vec<u32> {
+pub fn relation_data_pages(file: &crate::Image, page_size: usize, relation: u16) -> Vec<u32> {
     let mut pps: Vec<PointerPage> = file
-        .chunks_exact(page_size)
+        .pages()
         .filter(|p| p[0] == PageType::Pointer as u8)
         .filter_map(PointerPage::decode)
         .filter(|pp| pp.relation == relation)

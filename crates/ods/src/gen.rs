@@ -28,7 +28,7 @@ fn gens_per_page(page_size: usize) -> usize {
 /// generator page that would hold it has not been allocated - the
 /// engine's `DPM_gen_id` grows the vector on demand; fire-crab writes
 /// into the vector that exists.
-pub fn slot_offset(bytes: &[u8], page_size: usize, id: i64) -> Option<(u32, usize)> {
+pub fn slot_offset(bytes: &crate::Image, page_size: usize, id: i64) -> Option<(u32, usize)> {
     if id < 0 {
         return None;
     }
@@ -39,7 +39,7 @@ pub fn slot_offset(bytes: &[u8], page_size: usize, id: i64) -> Option<(u32, usiz
     }
     let sequence = (id / per) as u32;
     let offset = id % per;
-    let pages = (bytes.len() / page_size) as u32;
+    let pages = (bytes.byte_len() / page_size) as u32;
     for pno in 0..pages {
         let page = crate::page_at(bytes, page_size, pno)?;
         if page[0] != PageType::Generators as u8 {
@@ -58,7 +58,7 @@ pub fn slot_offset(bytes: &[u8], page_size: usize, id: i64) -> Option<(u32, usiz
 
 /// Read generator `id`'s stored value. A generator whose page has never
 /// been allocated reads 0 - the engine's zero-initialised slot.
-pub fn read(bytes: &[u8], page_size: usize, id: i64) -> i64 {
+pub fn read(bytes: &crate::Image, page_size: usize, id: i64) -> i64 {
     match slot_offset(bytes, page_size, id) {
         Some((pno, at)) => {
             match crate::page_at(bytes, page_size, pno).and_then(|p| p.get(at..at + 8)) {
@@ -71,7 +71,7 @@ pub fn read(bytes: &[u8], page_size: usize, id: i64) -> i64 {
 }
 
 /// Write generator `id`'s value into its slot.
-pub fn write(bytes: &mut [u8], page_size: usize, id: i64, value: i64) -> Result<(), String> {
+pub fn write(bytes: &mut crate::Image, page_size: usize, id: i64, value: i64) -> Result<(), String> {
     let (pno, at) = slot_offset(bytes, page_size, id).ok_or("generator page not allocated")?;
     let page = crate::page_mut(bytes, page_size, pno).ok_or("generator page out of range")?;
     page[at..at + 8].copy_from_slice(&value.to_le_bytes());
@@ -79,7 +79,7 @@ pub fn write(bytes: &mut [u8], page_size: usize, id: i64, value: i64) -> Result<
 }
 
 /// Add `step` to generator `id` and return the new value - `GEN_ID`.
-pub fn bump(bytes: &mut [u8], page_size: usize, id: i64, step: i64) -> Result<i64, String> {
+pub fn bump(bytes: &mut crate::Image, page_size: usize, id: i64, step: i64) -> Result<i64, String> {
     let next = read(bytes, page_size, id).wrapping_add(step);
     write(bytes, page_size, id, next)?;
     Ok(next)
@@ -95,11 +95,11 @@ mod tests {
     use super::*;
 
     /// A two-page file whose second page is a generator page (sequence 0).
-    fn scratch(page_size: usize) -> Vec<u8> {
+    fn scratch(page_size: usize) -> crate::Image {
         let mut f = vec![0u8; page_size * 2];
         f[page_size] = PageType::Generators as u8;
         f[page_size + 16..page_size + 20].copy_from_slice(&0u32.to_le_bytes());
-        f
+        crate::Image::from_bytes(&f, page_size)
     }
 
     #[test]

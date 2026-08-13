@@ -223,7 +223,7 @@ impl<'a> Iterator for SegmentIter<'a> {
 /// out of shape: an unknown level, a page of the wrong type, a
 /// truncated vector.
 pub fn read_blob(
-    file: &[u8],
+    file: &fire_crab_ods::Image,
     page_size: usize,
     relation: u16,
     recno: u64,
@@ -262,7 +262,7 @@ pub fn read_blob(
 
 /// The blob slot's bytes off its data page.
 fn blob_slot(
-    file: &[u8],
+    file: &fire_crab_ods::Image,
     page_size: usize,
     relation: u16,
     recno: u64,
@@ -272,8 +272,7 @@ fn blob_slot(
     let dp_no = *pages
         .get((recno / recs) as usize)
         .ok_or("blob id names a page past the relation")?;
-    let start = dp_no as usize * page_size;
-    let dp = DataPage::decode(file.get(start..start + page_size).ok_or("page past EOF")?)
+    let dp = DataPage::decode(fire_crab_ods::page_at(file, page_size, dp_no).ok_or("page past EOF")?)
         .ok_or("blob id names a non-data page")?;
     dp.slot_bytes((recno % recs) as u16)
         .map(|b| b.to_vec())
@@ -299,14 +298,12 @@ fn page_vector(slot: &[u8]) -> Vec<u32> {
 /// `pointers` says which kind the caller expects; a mismatch refuses
 /// (the level said one thing, the page another).
 fn blob_page_data(
-    file: &[u8],
+    file: &fire_crab_ods::Image,
     page_size: usize,
     page: u32,
     pointers: bool,
 ) -> Result<Vec<u8>, String> {
-    let start = page as usize * page_size;
-    let p = file
-        .get(start..start + page_size)
+    let p = fire_crab_ods::page_at(file, page_size, page)
         .ok_or_else(|| format!("blob page {} past EOF", page))?;
     if p[0] != 8 {
         return Err(format!("page {} is not a blob page (type {})", page, p[0]));
@@ -332,7 +329,7 @@ fn blob_page_data(
 /// blob's record number for the referencing record's `bid`.
 /// Level 2 refuses: unconverted, never guessed.
 pub fn create_blob(
-    file: &mut Vec<u8>,
+    file: &mut fire_crab_ods::Image,
     page_size: usize,
     relation: u16,
     segments: &[Vec<u8>],
@@ -351,7 +348,7 @@ pub fn create_blob(
 /// cannot be made to WRITE one through isql - the differential runs
 /// the other way: fire-crab writes, the engine reads.
 pub fn create_stream_blob(
-    file: &mut Vec<u8>,
+    file: &mut fire_crab_ods::Image,
     page_size: usize,
     relation: u16,
     content: &[u8],
@@ -371,7 +368,7 @@ pub fn create_stream_blob(
 
 #[allow(clippy::too_many_arguments)]
 fn create_blob_kind(
-    file: &mut Vec<u8>,
+    file: &mut fire_crab_ods::Image,
     page_size: usize,
     relation: u16,
     segments: &[Vec<u8>],
@@ -476,7 +473,7 @@ fn create_blob_kind(
 /// Lay one blob page down: type 8, the given flags, the blob-wide
 /// lead page, the sequence, and the data area with its blp_length.
 fn write_blob_page(
-    file: &mut Vec<u8>,
+    file: &mut fire_crab_ods::Image,
     page_size: usize,
     page: u32,
     lead: u32,
@@ -484,22 +481,22 @@ fn write_blob_page(
     pflags: u8,
     data: &[u8],
 ) {
-    let base = page as usize * page_size;
-    file[base..base + page_size].fill(0);
-    file[base] = 8; // pag_type blob
-    file[base + 1] = pflags;
-    file[base + 12..base + 16].copy_from_slice(&page.to_le_bytes()); // pag_pageno
-    file[base + 16..base + 20].copy_from_slice(&lead.to_le_bytes()); // blp_lead_page
-    file[base + 20..base + 24].copy_from_slice(&sequence.to_le_bytes()); // blp_sequence
-    file[base + 24..base + 26].copy_from_slice(&(data.len() as u16).to_le_bytes());
-    file[base + BLP_DATA_OFFSET..base + BLP_DATA_OFFSET + data.len()].copy_from_slice(data);
+    let pg = fire_crab_ods::page_mut(file, page_size, page).expect("blob page out of range");
+    pg.fill(0);
+    pg[0] = 8; // pag_type blob
+    pg[1] = pflags;
+    pg[12..16].copy_from_slice(&page.to_le_bytes()); // pag_pageno
+    pg[16..20].copy_from_slice(&lead.to_le_bytes()); // blp_lead_page
+    pg[20..24].copy_from_slice(&sequence.to_le_bytes()); // blp_sequence
+    pg[24..26].copy_from_slice(&(data.len() as u16).to_le_bytes());
+    pg[BLP_DATA_OFFSET..BLP_DATA_OFFSET + data.len()].copy_from_slice(data);
 }
 
 /// The whole content by blob id, framing decided by the blob itself -
 /// the adapter the wire server serves through (op_open_blob /
 /// op_get_segment hand out CONTENT; the framing is storage detail).
 pub fn read_blob_content(
-    file: &[u8],
+    file: &fire_crab_ods::Image,
     page_size: usize,
     relation: u16,
     recno: u64,

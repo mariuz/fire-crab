@@ -297,7 +297,7 @@ struct Pred {
 
 /// Every single-segment index of a table, in catalog id order.
 pub fn indexes_of(
-    file: &[u8],
+    file: &fire_crab_ods::Image,
     page_size: usize,
     table: &str,
 ) -> Result<Vec<IndexInfo>, String> {
@@ -316,8 +316,7 @@ pub fn indexes_of(
     let unique_f = fid("RDB$UNIQUE_FLAG");
     let mut out = Vec::new();
     for dp_no in relation_data_pages(file, page_size, rel) {
-        let start = dp_no as usize * page_size;
-        let Some(dp) = file.get(start..start + page_size).and_then(DataPage::decode)
+        let Some(dp) = fire_crab_ods::page_at(file, page_size, dp_no).and_then(DataPage::decode)
         else {
             continue;
         };
@@ -365,7 +364,7 @@ pub fn indexes_of(
 
 /// An index's segment columns, in key order (RDB$INDEX_SEGMENTS).
 fn index_columns(
-    file: &[u8],
+    file: &fire_crab_ods::Image,
     page_size: usize,
     index: &str,
 ) -> Result<Vec<String>, String> {
@@ -381,8 +380,7 @@ fn index_columns(
     let pos_f = fid("RDB$FIELD_POSITION");
     let mut out: Vec<(i64, String)> = Vec::new();
     for dp_no in relation_data_pages(file, page_size, rel) {
-        let start = dp_no as usize * page_size;
-        let Some(dp) = file.get(start..start + page_size).and_then(DataPage::decode)
+        let Some(dp) = fire_crab_ods::page_at(file, page_size, dp_no).and_then(DataPage::decode)
         else {
             continue;
         };
@@ -414,7 +412,7 @@ fn index_columns(
 /// Parse a single-table SELECT far enough to plan it, then CHOOSE.
 /// Everything outside the slice returns an error naming itself.
 pub fn plan_query(
-    file: &[u8],
+    file: &fire_crab_ods::Image,
     page_size: usize,
     sql: &str,
 ) -> Result<Plan, String> {
@@ -603,7 +601,7 @@ fn swap_join_sides(from_s: &str) -> Result<String, String> {
 /// free to swap (B drives A through A_BX), and only then does the outer
 /// join wrap it.
 fn plan_outer_chain(
-    file: &[u8],
+    file: &fire_crab_ods::Image,
     page_size: usize,
     from_s: &str,
     where_s: Option<&str>,
@@ -723,7 +721,7 @@ fn outer_kind(from_s: &str) -> OuterKind {
 }
 
 fn plan_join(
-    file: &[u8],
+    file: &fire_crab_ods::Image,
     page_size: usize,
     from_s: &str,
     where_s: Option<&str>,
@@ -993,7 +991,7 @@ fn plan_join(
 /// in SQL order too - which is why an unindexable link ends up
 /// driving: no arrangement starting anywhere else completes.
 fn plan_chain(
-    file: &[u8],
+    file: &fire_crab_ods::Image,
     page_size: usize,
     from_s: &str,
     where_s: Option<&str>,
@@ -1512,7 +1510,7 @@ fn parse_join_key(
 /// How many committed rows a table holds - an exact count, useful
 /// for the gate and for reasoning; the OPTIMIZER works from the
 /// ESTIMATE below instead, because that is what the engine does.
-pub fn row_count(file: &[u8], page_size: usize, table: &str) -> Result<u64, String> {
+pub fn row_count(file: &fire_crab_ods::Image, page_size: usize, table: &str) -> Result<u64, String> {
     let rel = resolve_relation(file, page_size, table)
         .ok_or_else(|| format!("no table {}", table))?;
     Ok(fire_crab_ods::count_primary_records(file, page_size, rel))
@@ -1535,7 +1533,7 @@ pub fn row_count(file: &[u8], page_size: usize, table: &str) -> Result<u64, Stri
 ///
 /// This is the number every cost decision starts from, so converting
 /// it is the first step of converting cost at all.
-pub fn cardinality(file: &[u8], page_size: usize, table: &str) -> Result<f64, String> {
+pub fn cardinality(file: &fire_crab_ods::Image, page_size: usize, table: &str) -> Result<f64, String> {
     const DPG_SIZE: usize = 24; // data_page less its first slot
     const RHD_SIZE: usize = 16; // ods.h:912 - the record header
     const RHDF_SIZE: usize = 20; // the FRAGMENT header
@@ -1556,13 +1554,14 @@ pub fn cardinality(file: &[u8], page_size: usize, table: &str) -> Result<f64, St
     let mut count = 0usize;
     let mut length = 0usize;
     for p in &pages {
-        let start = *p as usize * page_size;
-        let Some(dp) = file.get(start..start + page_size).and_then(DataPage::decode)
-        else {
+        let Some(page) = fire_crab_ods::page_at(file, page_size, *p) else {
+            continue;
+        };
+        let Some(dp) = DataPage::decode(page) else {
             continue;
         };
         // dpg_secondary (0x10 in pag_flags) pages hold no primaries
-        if file[start + 1] & 0x10 != 0 {
+        if page[1] & 0x10 != 0 {
             continue;
         }
         let mut c = 0usize;
@@ -1596,7 +1595,7 @@ pub fn cardinality(file: &[u8], page_size: usize, table: &str) -> Result<f64, St
 /// present: the engine keeps using it, which is why a stale index
 /// makes it plan differently.
 pub fn index_selectivity(
-    file: &[u8],
+    file: &fire_crab_ods::Image,
     page_size: usize,
     index: &str,
 ) -> Result<f64, String> {
@@ -1629,7 +1628,7 @@ pub fn index_selectivity(
 
 /// `RDB$INDEX_SEGMENTS.RDB$STATISTICS` at `position`, when it holds one.
 fn segment_selectivity(
-    file: &[u8],
+    file: &fire_crab_ods::Image,
     page_size: usize,
     index: &str,
     position: i64,
@@ -1643,8 +1642,7 @@ fn segment_selectivity(
     let pos_f = fid("RDB$FIELD_POSITION")?;
     let stat_f = fid("RDB$STATISTICS")?;
     for dp_no in relation_data_pages(file, page_size, rel) {
-        let start = dp_no as usize * page_size;
-        let Some(dp) = file.get(start..start + page_size).and_then(DataPage::decode) else {
+        let Some(dp) = fire_crab_ods::page_at(file, page_size, dp_no).and_then(DataPage::decode) else {
             continue;
         };
         for r in dp.records() {
@@ -1678,7 +1676,7 @@ fn segment_selectivity(
 }
 
 fn whole_index_selectivity(
-    file: &[u8],
+    file: &fire_crab_ods::Image,
     page_size: usize,
     index: &str,
 ) -> Result<f64, String> {
@@ -1692,8 +1690,7 @@ fn whole_index_selectivity(
     let name_f = fid("RDB$INDEX_NAME").ok_or("no name column")?;
     let stat_f = fid("RDB$STATISTICS").ok_or("no statistics column")?;
     for dp_no in relation_data_pages(file, page_size, rel) {
-        let start = dp_no as usize * page_size;
-        let Some(dp) = file.get(start..start + page_size).and_then(DataPage::decode)
+        let Some(dp) = fire_crab_ods::page_at(file, page_size, dp_no).and_then(DataPage::decode)
         else {
             continue;
         };
@@ -1916,7 +1913,7 @@ enum JoinShape {
 /// The cost guard: a join is planned only where the cardinality
 /// bands make the engine's decision unambiguous.
 fn cost_free_or_refuse(
-    file: &[u8],
+    file: &fire_crab_ods::Image,
     page_size: usize,
     tables: &[String],
 ) -> Result<(), String> {
@@ -1941,7 +1938,7 @@ fn cost_free_or_refuse(
 /// A column's TYPE FAMILY (0 numeric, 1 text, 2 other) - an index
 /// cannot serve a join whose sides disagree (probed).
 fn column_family(
-    file: &[u8],
+    file: &fire_crab_ods::Image,
     page_size: usize,
     table: &str,
     column: &str,

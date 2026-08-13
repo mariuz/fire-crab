@@ -67,38 +67,135 @@ pub use pointer::{relation_data_pages, PointerPage};
 pub use tip::{TipPage, TxState};
 pub use tra::{visible_rows, Snapshot, TipChain};
 
-/// The bytes of page `page`, or `None` when the image does not hold a
-/// whole page there.
-///
-/// This is the ONE place the page-address arithmetic lives: a page is at
-/// `page * page_size` in the contiguous image, `page_size` bytes long.
-/// Every reader that wants "page N" asks here rather than computing an
-/// absolute offset of its own - which is the seam a page-addressed image
-/// (`Vec<Arc<[u8]>>`) replaces without touching a single caller: the
-/// callers already speak in page numbers, and only this body changes from
-/// a slice of one buffer to an index into many. The checked arithmetic
-/// answers `None` for an out-of-range page exactly as the `file.get(..)`
-/// it replaces did, and never panics on a page number past the file.
-#[inline]
-pub fn page_at(file: &[u8], page_size: usize, page: u32) -> Option<&[u8]> {
-    let start = (page as usize).checked_mul(page_size)?;
-    let end = start.checked_add(page_size)?;
-    file.get(start..end)
+/// A database image addressed by PAGE rather than by absolute byte
+/// offset. The pages live in a `Vec<Arc<[u8]>>`, so a reader shares them
+/// by cloning `Arc`s and a writer copies only the one page it touches
+/// (copy-on-write in [`Image::page_mut`]). That is what lets the buffer
+/// pool publish - and a write make its work copy - in O(pages) rather
+/// than O(file): the point of per-page fetch. The preparation slices
+/// routed every whole-image access through `page_at`/`page_mut`, so this
+/// representation change touches only their bodies and the type threaded
+/// through the readers.
+#[derive(Clone)]
+pub struct Image {
+    pages: Vec<std::sync::Arc<[u8]>>,
+    page_size: usize,
 }
 
-/// The MUTABLE bytes of page `page` - the write-side twin of `page_at`,
-/// and the accessor a page-addressed image reaches through to give a
-/// writer a page of its own (`Arc::make_mut` on that one page) rather
-/// than a slice of a shared buffer. A caller writes a FIELD by indexing
-/// into the returned page at its page-local offset (`page[22..24]`, the
-/// data-page count) rather than at `page * page_size + 22` in the file -
-/// the two are the same bytes today, but only the first survives the
-/// image ceasing to be contiguous.
+impl Image {
+    /// Split a contiguous file image into pages. A trailing partial page
+    /// (a file length not a whole multiple of `page_size`) is kept as its
+    /// own short page so `to_bytes` round-trips it.
+    pub fn from_bytes(bytes: &[u8], page_size: usize) -> Image {
+        let pages = if page_size == 0 {
+            Vec::new()
+        } else {
+            bytes.chunks(page_size).map(std::sync::Arc::from).collect()
+        };
+        Image { pages, page_size }
+    }
+
+    /// The whole image as one contiguous vector - for a whole-file write
+    /// or a caller that still needs a flat buffer.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.byte_len());
+        for p in &self.pages {
+            out.extend_from_slice(p);
+        }
+        out
+    }
+
+    #[inline]
+    pub fn page_size(&self) -> usize {
+        self.page_size
+    }
+
+    /// Number of pages in the image.
+    #[inline]
+    pub fn num_pages(&self) -> usize {
+        self.pages.len()
+    }
+
+    /// The image's length in bytes - what `file.len()` used to answer.
+    #[inline]
+    pub fn byte_len(&self) -> usize {
+        self.pages.iter().map(|p| p.len()).sum()
+    }
+
+    /// The bytes of page `page`, `None` when there is no such page.
+    #[inline]
+    pub fn page(&self, page: u32) -> Option<&[u8]> {
+        self.pages.get(page as usize).map(|a| a.as_ref())
+    }
+
+    /// The MUTABLE bytes of page `page`, copying that one page out of any
+    /// sharing first (copy-on-write) so a writer never disturbs a reader's
+    /// snapshot. `None` when there is no such page.
+    #[inline]
+    pub fn page_mut(&mut self, page: u32) -> Option<&mut [u8]> {
+        let arc = self.pages.get_mut(page as usize)?;
+        if std::sync::Arc::get_mut(arc).is_none() {
+            let owned: std::sync::Arc<[u8]> = std::sync::Arc::from(&**arc);
+            *arc = owned;
+        }
+        std::sync::Arc::get_mut(arc)
+    }
+
+    /// Iterate the pages as slices - what `file.pages()`
+    /// used to produce (a trailing short page is skipped, as chunks_exact
+    /// dropped a partial final chunk).
+    pub fn pages(&self) -> impl Iterator<Item = &[u8]> {
+        let ps = self.page_size;
+        self.pages
+            .iter()
+            .map(|a| a.as_ref())
+            .filter(move |p| p.len() == ps)
+    }
+
+    /// Grow the image to cover at least `bytes` bytes by appending zeroed
+    /// whole pages - what `file.resize(bytes, 0)` did for a file that only
+    /// ever grows by whole pages.
+    pub fn grow(&mut self, bytes: usize) {
+        if self.page_size == 0 {
+            return;
+        }
+        let want = bytes.div_ceil(self.page_size);
+        while self.pages.len() < want {
+            self.pages
+                .push(std::sync::Arc::from(vec![0u8; self.page_size]));
+        }
+    }
+
+    /// The page numbers whose bytes differ from `base` - by `Arc` IDENTITY
+    /// (O(1) per page, no byte compare), exact because a writer only ever
+    /// replaces a page's `Arc` through `page_mut`. A page present on one
+    /// side and not the other counts as changed.
+    pub fn changed_pages(&self, base: &Image) -> Vec<u32> {
+        let n = self.pages.len().max(base.pages.len());
+        (0..n)
+            .filter(|&i| match (self.pages.get(i), base.pages.get(i)) {
+                (Some(a), Some(b)) => !std::sync::Arc::ptr_eq(a, b),
+                (a, b) => a.is_some() != b.is_some(),
+            })
+            .map(|i| i as u32)
+            .collect()
+    }
+}
+
+/// Page `page`'s bytes, or `None`. Free-function twin of [`Image::page`],
+/// kept at the historical three-argument shape - the `page_size` argument
+/// is redundant now (the image carries it) but every call site passes it,
+/// so keeping it means the representation change did not have to touch
+/// them.
 #[inline]
-pub fn page_mut(file: &mut [u8], page_size: usize, page: u32) -> Option<&mut [u8]> {
-    let start = (page as usize).checked_mul(page_size)?;
-    let end = start.checked_add(page_size)?;
-    file.get_mut(start..end)
+pub fn page_at(file: &Image, _page_size: usize, page: u32) -> Option<&[u8]> {
+    file.page(page)
+}
+
+/// The mutable twin - see [`page_at`] and [`Image::page_mut`].
+#[inline]
+pub fn page_mut(file: &mut Image, _page_size: usize, page: u32) -> Option<&mut [u8]> {
+    file.page_mut(page)
 }
 
 /// Read a `u16` at `offset`, little-endian, like the engine's

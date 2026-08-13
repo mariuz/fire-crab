@@ -23,9 +23,9 @@ pub struct TipChain<'a> {
 }
 
 impl<'a> TipChain<'a> {
-    pub fn read(file: &'a [u8], page_size: usize) -> Option<TipChain<'a>> {
+    pub fn read(file: &'a crate::Image, page_size: usize) -> Option<TipChain<'a>> {
         let mut tips: Vec<TipPage> = file
-            .chunks_exact(page_size)
+            .pages()
             .filter(|p| p[0] == crate::PageType::TransactionInventory as u8)
             .filter_map(TipPage::decode)
             .collect();
@@ -224,14 +224,13 @@ impl Snapshot {
     /// transaction, `active` = every id below it the TIP does not read
     /// as committed and that is not dead (active or limbo - the ones
     /// that could still commit later and must stay invisible).
-    pub fn capture(file: &[u8], page_size: usize) -> Snapshot {
+    pub fn capture(file: &crate::Image, page_size: usize) -> Snapshot {
         // hdr_next_transaction (offset 40) holds the HIGHEST id
         // ASSIGNED so far (begin_active_tx returns it + 1 and stores
         // that), so the snapshot's exclusive limit is one PAST it - a
         // transaction committed by that id must be visible to a reader
         // starting now.
-        let limit = file
-            .get(40..48)
+        let limit = crate::page_at(file, page_size, 0).and_then(|hdr| hdr.get(40..48))
             .map(|b| u64::from_le_bytes(b.try_into().unwrap()) + 1)
             .unwrap_or(0);
         let mut active = Vec::new();
@@ -254,7 +253,7 @@ impl Snapshot {
 
 
 pub fn visible_version(
-    file: &[u8],
+    file: &crate::Image,
     page_size: usize,
     head: &crate::data::RecordHeader,
     tips: &TipChain,
@@ -270,7 +269,7 @@ pub fn visible_version(
 /// speaks yet, walks past). `strict` false is the old walk - what the
 /// tools that must read a wrecked file want.
 pub fn visible_version_2pc(
-    file: &[u8],
+    file: &crate::Image,
     page_size: usize,
     head: &crate::data::RecordHeader,
     tips: &TipChain,
@@ -357,12 +356,11 @@ pub fn visible_version_2pc(
 /// Every transaction the inventory holds in LIMBO, oldest first - what
 /// `isc_info_limbo` answers one cluster per id, and what `gfix -list`
 /// prints. The range is 1..the header's next id (offset 40, u64 LE).
-pub fn limbo_ids(file: &[u8], page_size: usize) -> Vec<u64> {
+pub fn limbo_ids(file: &crate::Image, page_size: usize) -> Vec<u64> {
     let Some(tips) = TipChain::read(file, page_size) else {
         return Vec::new();
     };
-    let next = file
-        .get(40..48)
+    let next = crate::page_at(file, page_size, 0).and_then(|hdr| hdr.get(40..48))
         .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
         .unwrap_or(0);
     (1..=next)
@@ -378,7 +376,7 @@ pub fn limbo_ids(file: &[u8], page_size: usize) -> Vec<u64> {
 /// Deltas are irrelevant here for the same reason - a delta version
 /// is still a version, and whether it is DELETED is in its header.
 pub fn visible_exists(
-    file: &[u8],
+    file: &crate::Image,
     page_size: usize,
     head: &crate::data::RecordHeader,
     tips: &TipChain,
@@ -389,7 +387,7 @@ pub fn visible_exists(
 
 /// [visible_exists] under the limbo law - see [visible_version_2pc].
 pub fn visible_exists_2pc(
-    file: &[u8],
+    file: &crate::Image,
     page_size: usize,
     head: &crate::data::RecordHeader,
     tips: &TipChain,
@@ -434,7 +432,7 @@ pub fn visible_exists_2pc(
 /// differences) - and drop the row if that version is a deleted stub
 /// or no committed version exists (an uncommitted insert).
 pub fn visible_rows(
-    file: &[u8],
+    file: &crate::Image,
     page_size: usize,
     relation: u16,
     descs: &[Descriptor],
@@ -447,7 +445,7 @@ pub fn visible_rows(
 /// engine's backup DIES on "record from transaction N is stuck in
 /// limbo" rather than writing a file that silently lacks the rows.
 pub fn visible_rows_2pc(
-    file: &[u8],
+    file: &crate::Image,
     page_size: usize,
     relation: u16,
     descs: &[Descriptor],
@@ -493,9 +491,9 @@ pub fn visible_rows_2pc(
 
 /// Header-vs-TIP invariants a healthy database file satisfies; each
 /// violated invariant is returned as a message.
-pub fn check_invariants(file: &[u8], page_size: usize) -> Vec<String> {
+pub fn check_invariants(file: &crate::Image, page_size: usize) -> Vec<String> {
     let mut problems = Vec::new();
-    let Some(h) = crate::HeaderPage::decode(file) else {
+    let Some(h) = crate::page_at(file, page_size, 0).and_then(crate::HeaderPage::decode) else {
         return vec!["no header page".into()];
     };
     let _ = page_size;

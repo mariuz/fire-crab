@@ -164,7 +164,7 @@ fn data_page_structure_ok(page: &[u8], page_size: usize) -> bool {
 /// no transaction states consulted - for the one caller that cannot
 /// consult them: naming the broken TIP page. A validation of a corrupt
 /// file reads what is there.
-fn pages_rows_stateless(file: &[u8], page_size: usize) -> Vec<(u32, u16, u16)> {
+fn pages_rows_stateless(file: &crate::Image, page_size: usize) -> Vec<(u32, u16, u16)> {
     let Some(formats) = crate::sysfmt::system_relation_formats(file, page_size, "RDB$PAGES")
     else {
         return Vec::new();
@@ -200,12 +200,12 @@ fn pages_rows_stateless(file: &[u8], page_size: usize) -> Vec<(u32, u16, u16)> {
 /// Validate the file: the page walk of `gfix -v`, plus the record walk
 /// under `full` (`-full`). Counts, or the abort the engine turns into a
 /// failed attach.
-pub fn validate(file: &[u8], page_size: usize, full: bool) -> Result<ValCounts, ValAbort> {
+pub fn validate(file: &crate::Image, page_size: usize, full: bool) -> Result<ValCounts, ValAbort> {
     let mut c = ValCounts::default();
-    if crate::HeaderPage::decode(file).is_none() {
+    if crate::page_at(file, page_size, 0).and_then(crate::HeaderPage::decode).is_none() {
         return Err(ValAbort::Broken("no header page".into()));
     }
-    let npages = (file.len() / page_size) as u32;
+    let npages = (file.byte_len() / page_size) as u32;
     let page_of = |no: u32| crate::page_at(file, page_size, no);
 
     // THE FIXED-POSITION PAGES: page 1 is the first PIP and page 2 the

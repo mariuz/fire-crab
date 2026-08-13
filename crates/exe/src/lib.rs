@@ -1312,7 +1312,7 @@ struct StreamFrame {
 }
 
 struct Exec<'a> {
-    file: &'a [u8],
+    file: &'a fire_crab_ods::Image,
     page_size: usize,
     /// generator advances live HERE, never in the file - reads in
     /// one execution see each other's steps
@@ -1332,7 +1332,7 @@ struct Exec<'a> {
 /// to a scheduler; the sends carry the same images they would carry
 /// across the API boundary.
 pub fn execute(
-    file: &[u8],
+    file: &fire_crab_ods::Image,
     page_size: usize,
     request: &Request,
     args: &[String],
@@ -1368,7 +1368,7 @@ pub fn execute(
 /// [execute] with the arguments already typed - what the wire server
 /// binds (its parameters arrive as [Value]s, not text).
 pub fn bind_and_execute(
-    file: &[u8],
+    file: &fire_crab_ods::Image,
     page_size: usize,
     request: &Request,
     args: &[Value],
@@ -2285,10 +2285,7 @@ impl<'a> Exec<'a> {
         for dp_no in
             fire_crab_ods::relation_data_pages(self.file, self.page_size, rel)
         {
-            let start = dp_no as usize * self.page_size;
-            let Some(dp) = self
-                .file
-                .get(start..start + self.page_size)
+            let Some(dp) = fire_crab_ods::page_at(self.file, self.page_size, dp_no)
                 .and_then(fire_crab_ods::DataPage::decode)
             else {
                 continue;
@@ -2338,10 +2335,7 @@ impl<'a> Exec<'a> {
         for dp_no in
             fire_crab_ods::relation_data_pages(self.file, self.page_size, rel)
         {
-            let start = dp_no as usize * self.page_size;
-            let Some(dp) = self
-                .file
-                .get(start..start + self.page_size)
+            let Some(dp) = fire_crab_ods::page_at(self.file, self.page_size, dp_no)
                 .and_then(DataPage::decode)
             else {
                 continue;
@@ -3127,7 +3121,7 @@ fn null_aware_cmp(a: &Value, b: &Value, desc: bool) -> std::cmp::Ordering {
 
 /// The catalog read: RDB$PROCEDURES' committed primary row named
 /// `name`, its RDB$PROCEDURE_BLR blob.
-pub fn procedure_blr(file: &[u8], page_size: usize, name: &str) -> Result<Vec<u8>, String> {
+pub fn procedure_blr(file: &fire_crab_ods::Image, page_size: usize, name: &str) -> Result<Vec<u8>, String> {
     let rel = resolve_relation(file, page_size, "RDB$PROCEDURES")
         .ok_or("no RDB$PROCEDURES relation")?;
     let formats = system_relation_formats(file, page_size, "RDB$PROCEDURES")
@@ -3145,8 +3139,7 @@ pub fn procedure_blr(file: &[u8], page_size: usize, name: &str) -> Result<Vec<u8
     let name_f = fid("RDB$PROCEDURE_NAME").ok_or("no RDB$PROCEDURE_NAME column")?;
     let blr_f = fid("RDB$PROCEDURE_BLR").ok_or("no RDB$PROCEDURE_BLR column")?;
     for dp_no in relation_data_pages(file, page_size, rel) {
-        let start = dp_no as usize * page_size;
-        let Some(dp) = file.get(start..start + page_size).and_then(DataPage::decode)
+        let Some(dp) = fire_crab_ods::page_at(file, page_size, dp_no).and_then(DataPage::decode)
         else {
             continue;
         };

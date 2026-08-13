@@ -115,16 +115,16 @@ pub struct Census {
 
 /// Census over a full database file image (or any prefix of whole
 /// pages). The page size is taken from the header page.
-pub fn census(file: &[u8]) -> Option<Census> {
-    let page_size = u16_at(file, 16) as usize; // hdr_page_size, ods.h:642
-    if page_size == 0 || !page_size.is_power_of_two() || file.len() < page_size {
+pub fn census(file: &crate::Image) -> Option<Census> {
+    let page_size = file.page_size(); // the image carries it (== hdr_page_size)
+    if page_size == 0 || !page_size.is_power_of_two() || file.byte_len() < page_size {
         return None;
     }
     let mut c = Census {
         page_size,
         ..Default::default()
     };
-    for chunk in file.chunks_exact(page_size) {
+    for chunk in file.pages() {
         c.total_pages += 1;
         match PageType::from_byte(chunk[0]) {
             Some(t) => c.counts[t as usize] += 1,

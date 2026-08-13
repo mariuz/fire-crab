@@ -499,7 +499,7 @@ struct PageContent {
     term: Terminator,
 }
 
-fn load_page(file: &[u8], page_size: usize, no: u32) -> Option<BtreePage<'_>> {
+fn load_page(file: &crate::Image, page_size: usize, no: u32) -> Option<BtreePage<'_>> {
     crate::page_at(file, page_size, no).and_then(BtreePage::decode)
 }
 
@@ -613,7 +613,7 @@ fn common_prefix(a: &[u8], b: &[u8]) -> usize {
 /// predecessor, END_BUCKET/END_LEVEL terminator, `btr_prefix_total`,
 /// `btr_length`, empty jump table. Err = does not fit.
 fn encode_page(
-    file: &mut [u8],
+    file: &mut crate::Image,
     page_size: usize,
     page_no: u32,
     relation: u16,
@@ -717,7 +717,7 @@ pub fn key_cmp_desc(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
 /// by a deleted (dropped, or key-changed) record is a ghost the GC has
 /// not swept yet, and re-using its key is legal. Absent record, absent
 /// page, a back-version or a deleted stub all read as NOT live.
-fn recno_is_live(file: &[u8], page_size: usize, rel: u16, recno: u64) -> bool {
+fn recno_is_live(file: &crate::Image, page_size: usize, rel: u16, recno: u64) -> bool {
     let recs = crate::format::max_recs_per_dp(page_size);
     if recs == 0 {
         return false;
@@ -741,7 +741,7 @@ fn recno_is_live(file: &[u8], page_size: usize, rel: u16, recno: u64) -> bool {
 }
 
 pub fn insert_index_entry(
-    file: &mut Vec<u8>,
+    file: &mut crate::Image,
     page_size: usize,
     rel: u16,
     index_id: u8,
@@ -759,14 +759,13 @@ pub fn insert_index_entry(
             node_cmp(k, r, n)
         }
     };
-    // the index root page's location (to repoint irt_root on a root split)
-    let irt_page_off = file
-        .chunks_exact(page_size)
+    // the index root page (to repoint irt_root on a root split)
+    let irt_page = file
+        .pages()
         .position(|p| {
             p[0] == PageType::IndexRoot as u8 && u16_at(p, 16) == rel
         })
-        .ok_or("no index root page")?
-        * page_size;
+        .ok_or("no index root page")? as u32;
     let root_page = {
         let irt = find_index_root(file, page_size, rel).ok_or("no index root")?;
         let e = irt.entry(index_id).ok_or("no such index")?;
@@ -911,8 +910,10 @@ pub fn insert_index_entry(
                 encode_page(file, page_size, new_root, rel, index_id, &rc)
                     .map_err(|_| "new root does not fit".to_string())?;
                 // repoint irt_root (irt_rpt entry offset 24 + id*24, root @8)
-                let at = irt_page_off + 24 + index_id as usize * 24 + 8;
-                file[at..at + 4].copy_from_slice(&new_root.to_le_bytes());
+                let at = 24 + index_id as usize * 24 + 8; // page-local
+                crate::page_mut(file, page_size, irt_page)
+                    .ok_or("irt page out of range")?[at..at + 4]
+                    .copy_from_slice(&new_root.to_le_bytes());
                 return Ok(());
             }
         }
@@ -924,7 +925,7 @@ pub fn insert_index_entry(
 /// END_LEVEL marker byte). The engine reads and fills it like any
 /// bucket of its own.
 pub fn write_empty_root(
-    file: &mut [u8],
+    file: &mut crate::Image,
     page_size: usize,
     page_no: u32,
     relation: u16,
@@ -944,13 +945,13 @@ pub fn write_empty_root(
 /// The single-segment descriptor of an index: (field id, itype), read
 /// from the irtd array the root entry points at (ods.h:437-447).
 pub fn index_segment(
-    file: &[u8],
+    file: &crate::Image,
     page_size: usize,
     rel: u16,
     index_id: u8,
 ) -> Option<(u16, u16, u16)> {
     let irt_page = file
-        .chunks_exact(page_size)
+        .pages()
         .position(|p| p[0] == PageType::IndexRoot as u8 && u16_at(p, 16) == rel)? as u32;
     let page = crate::page_at(file, page_size, irt_page)?;
     PageHeader::decode(page)?;
@@ -969,14 +970,14 @@ pub fn index_segment(
 /// selectivity f32; ods.h:437-447) sits at the entry's irt_desc offset,
 /// page-relative.
 pub fn index_segments(
-    file: &[u8],
+    file: &crate::Image,
     page_size: usize,
     rel: u16,
     index_id: u8,
     count: usize,
 ) -> Option<(Vec<(u16, u16)>, u16)> {
     let irt_page = file
-        .chunks_exact(page_size)
+        .pages()
         .position(|p| p[0] == PageType::IndexRoot as u8 && u16_at(p, 16) == rel)? as u32;
     let page = crate::page_at(file, page_size, irt_page)?;
     PageHeader::decode(page)?;

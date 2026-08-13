@@ -43,7 +43,7 @@ pub struct GcReport {
 /// Count the versions in a back-chain starting at (page, line),
 /// following `rhd_b_page`/`rhd_b_line` until 0. Bounded by a hop cap
 /// to survive malformed chains.
-fn chain_len(file: &[u8], page_size: usize, mut page: u32, mut line: u16) -> u64 {
+fn chain_len(file: &crate::Image, page_size: usize, mut page: u32, mut line: u16) -> u64 {
     let mut n = 0u64;
     let mut hops = 0;
     while page != 0 && hops < 100_000 {
@@ -64,7 +64,7 @@ fn chain_len(file: &[u8], page_size: usize, mut page: u32, mut line: u16) -> u64
 /// Analyze one relation's collectable garbage against `oldest_snapshot`
 /// (the header's OST — the threshold the sweeper uses).
 pub fn analyze(
-    file: &[u8],
+    file: &crate::Image,
     page_size: usize,
     relation: u16,
     oldest_snapshot: u64,
@@ -142,7 +142,7 @@ pub fn analyze(
 
 /// Just the raw version count (primaries + back versions + stubs),
 /// used to measure a file before and after `gfix -sweep`.
-pub fn version_count(file: &[u8], page_size: usize, relation: u16) -> u64 {
+pub fn version_count(file: &crate::Image, page_size: usize, relation: u16) -> u64 {
     let mut n = 0u64;
     for dp_no in relation_data_pages(file, page_size, relation) {
         let Some(dp) = crate::page_at(file, page_size, dp_no)
@@ -233,7 +233,7 @@ struct Member {
 /// they are - `find_space` measures free space from the LIVE entries,
 /// so a zeroed slot is reusable room, which is also what the engine's
 /// own lazily-compacted pages look like.
-fn free_slot(file: &mut [u8], page_size: usize, page: u32, slot: u16) {
+fn free_slot(file: &mut crate::Image, page_size: usize, page: u32, slot: u16) {
     let p = crate::page_mut(file, page_size, page).expect("free_slot: page out of range");
     let dir = crate::data::DPG_RPT_OFFSET + slot as usize * 4;
     crate::dml::put_u16(p, dir, 0);
@@ -241,7 +241,7 @@ fn free_slot(file: &mut [u8], page_size: usize, page: u32, slot: u16) {
 }
 
 /// Read one record's header fields straight off the page.
-fn member_at(file: &[u8], page_size: usize, page: u32, slot: u16) -> Option<Member> {
+fn member_at(file: &crate::Image, page_size: usize, page: u32, slot: u16) -> Option<Member> {
     let dp = crate::page_at(file, page_size, page).and_then(DataPage::decode)?;
     let r = dp.record(slot)?;
     Some(Member {
@@ -257,7 +257,7 @@ fn member_at(file: &[u8], page_size: usize, page: u32, slot: u16) -> Option<Memb
 /// The whole back chain FROM (page, line), validated: every member
 /// present, none fragmented. `None` = the chain cannot be swept safely.
 fn chain_members(
-    file: &[u8],
+    file: &crate::Image,
     page_size: usize,
     mut page: u32,
     mut line: u16,
@@ -282,9 +282,9 @@ fn chain_members(
 
 /// Every relation with a pointer page, straight off the pages - the
 /// same catalog-free reading `relation_data_pages` does.
-fn relations_of(file: &[u8], page_size: usize) -> Vec<u16> {
+fn relations_of(file: &crate::Image, page_size: usize) -> Vec<u16> {
     let mut rels: Vec<u16> = file
-        .chunks_exact(page_size)
+        .pages()
         .filter(|p| p[0] == crate::PageType::Pointer as u8)
         .map(|p| crate::u16_at(p, 26)) // ppg_relation
         .collect();
@@ -298,7 +298,7 @@ fn relations_of(file: &[u8], page_size: usize) -> Vec<u16> {
 /// one that does is skipped, one that does not is garbage - marked DEAD
 /// in the TIP and backed out like any other dead transaction.
 pub fn sweep(
-    file: &mut Vec<u8>,
+    file: &mut crate::Image,
     page_size: usize,
     is_held: &dyn Fn(u64) -> bool,
 ) -> Result<SweepOutcome, String> {
@@ -572,7 +572,7 @@ mod sweep_tests {
     /// The same four-page scratch dml's own tests use: header, TIP, a
     /// pointer page for relation 42, one data page with a pre-existing
     /// 20-byte record in slot 0.
-    fn scratch_file(page_size: usize) -> Vec<u8> {
+    fn scratch_file(page_size: usize) -> crate::Image {
         use crate::dml::{put_u16, put_u32};
         fn put_u64(f: &mut [u8], at: usize, v: u64) {
             f[at..at + 8].copy_from_slice(&v.to_le_bytes());
@@ -598,7 +598,7 @@ mod sweep_tests {
         let off = page_size - 20;
         put_u16(&mut f, d + 24, off as u16);
         put_u16(&mut f, d + 26, 20);
-        f
+        crate::Image::from_bytes(&f, page_size)
     }
 
     const NOBODY: &dyn Fn(u64) -> bool = &|_| false;

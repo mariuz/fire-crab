@@ -259,7 +259,7 @@ fn blob_id_bytes(rel: u16, num: u64) -> [u8; 8] {
 /// Walk every committed-looking primary record of a system relation,
 /// decoded with `descs`.
 fn walk_rows(
-    file: &[u8],
+    file: &crate::Image,
     page_size: usize,
     rel: u16,
     descs: &[Descriptor],
@@ -342,7 +342,7 @@ fn encode_sys_value(d: &Descriptor, v: &SysVal<'_>) -> Result<Vec<u8>, String> {
 /// relation maintained. This is what makes the row real to the
 /// engine: its metadata lookups go through these indexes.
 fn sys_insert(
-    file: &mut Vec<u8>,
+    file: &mut crate::Image,
     page_size: usize,
     rel_name: &str,
     rel: u16,
@@ -408,7 +408,7 @@ fn sys_insert(
 /// entry of its own: `gfix` reports "Index n is corrupt {missing
 /// entries for record m}" otherwise.
 fn maintain_indexes(
-    file: &mut Vec<u8>,
+    file: &mut crate::Image,
     page_size: usize,
     rel: u16,
     recno: u64,
@@ -450,7 +450,7 @@ fn maintain_indexes(
 /// The next free `RDB$<n>` auto-domain number: one past the highest in
 /// RDB$FIELDS. The engine's own generator skips used names, so this
 /// cannot break later engine-side DDL.
-fn next_domain_number(file: &[u8], page_size: usize) -> Result<u64, String> {
+fn next_domain_number(file: &crate::Image, page_size: usize) -> Result<u64, String> {
     let formats = system_relation_formats(file, page_size, "RDB$FIELDS")
         .ok_or("no computed RDB$FIELDS format")?;
     let (_, descs) = formats.iter().max_by_key(|(n, _)| *n).ok_or("empty format")?;
@@ -476,7 +476,7 @@ fn next_domain_number(file: &[u8], page_size: usize) -> Result<u64, String> {
 /// in `RDB$FORMATS.RDB$DESCRIPTOR`; the engine reads it to lay out records
 /// of that format version.
 fn write_format_blob(
-    file: &mut Vec<u8>,
+    file: &mut crate::Image,
     page_size: usize,
     descs: &[Descriptor],
 ) -> Result<u64, String> {
@@ -540,7 +540,7 @@ pub fn has_computed_field(descs: &[Descriptor]) -> bool {
 /// [crate::expr::field_names_of_blr] can read - the caller must then
 /// assume it references anything.
 fn computed_dependencies(
-    file: &[u8],
+    file: &crate::Image,
     page_size: usize,
     table: &str,
 ) -> Vec<(String, Option<Vec<String>>)> {
@@ -611,7 +611,7 @@ fn computed_dependencies(
 /// `pred`: its data page and slot. For an in-place catalog update or
 /// delete (ALTER).
 fn find_sys_row_slot(
-    file: &[u8],
+    file: &crate::Image,
     page_size: usize,
     rel_name: &str,
     rel: u16,
@@ -639,7 +639,7 @@ fn find_sys_row_slot(
 /// slot, current record image, and record format number - what an
 /// in-place catalog update (ALTER) needs to rewrite the row.
 fn find_relations_row(
-    file: &[u8],
+    file: &crate::Image,
     page_size: usize,
     table: &str,
 ) -> Option<(u32, u16, Vec<u8>, u8)> {
@@ -676,7 +676,7 @@ fn find_relations_row(
 /// length for text, position, and a not-null marker. `descs` is the new
 /// full format, indexed by field id, for lengths.
 fn rebuild_runtime_blob(
-    file: &mut Vec<u8>,
+    file: &mut crate::Image,
     page_size: usize,
     table: &str,
     descs: &[Descriptor],
@@ -847,7 +847,7 @@ fn rebuild_runtime_blob(
 /// positions 0/1/5 list in position order regardless of name or event;
 /// same-position triggers list lexically (CHECK_10 before CHECK_7); the
 /// event type does not participate.
-fn relation_trigger_names(file: &[u8], page_size: usize, table: &str) -> Vec<String> {
+fn relation_trigger_names(file: &crate::Image, page_size: usize, table: &str) -> Vec<String> {
     let (Some(rel), Some(formats)) = (
         crate::resolve_relation(file, page_size, "RDB$TRIGGERS"),
         system_relation_formats(file, page_size, "RDB$TRIGGERS"),
@@ -894,7 +894,7 @@ fn relation_trigger_names(file: &[u8], page_size: usize, table: &str) -> Vec<Str
 /// [create_table] for the single new field, plus a version rewrite of the
 /// `RDB$RELATIONS` row to bump its `RDB$FORMAT` and field count.
 pub fn alter_table_add_column(
-    file: &mut Vec<u8>,
+    file: &mut crate::Image,
     page_size: usize,
     table: &str,
     col: &ColumnDef,
@@ -1090,7 +1090,7 @@ fn catalog_field_length(col: &ColumnDef) -> i64 {
 /// the OLD name (probed: the engine updates both on rename, and the
 /// domain's DEFAULT keeps applying afterwards).
 pub fn rename_domain(
-    file: &mut Vec<u8>,
+    file: &mut crate::Image,
     page_size: usize,
     old: &str,
     new: &str,
@@ -1221,7 +1221,7 @@ pub fn rename_domain(
 }
 
 /// Whether an `RDB$FIELDS` domain of this name exists.
-fn domain_exists(file: &[u8], page_size: usize, name: &str) -> bool {
+fn domain_exists(file: &crate::Image, page_size: usize, name: &str) -> bool {
     let (Some(rel), Some(formats)) = (
         crate::resolve_relation(file, page_size, "RDB$FIELDS"),
         system_relation_formats(file, page_size, "RDB$FIELDS"),
@@ -1255,7 +1255,7 @@ fn domain_exists(file: &[u8], page_size: usize, name: &str) -> bool {
 /// column ALTER TYPE performs after its own guards: existing records
 /// keep their old format and read back promoted.
 fn reformat_for_retype(
-    file: &mut Vec<u8>,
+    file: &mut crate::Image,
     page_size: usize,
     table: &str,
     fids: &[usize],
@@ -1338,7 +1338,7 @@ fn reformat_for_retype(
 /// as (relation name, column name) pairs - what the ALTER DOMAIN TYPE
 /// dependents guard walks.
 fn domain_dependents(
-    file: &[u8],
+    file: &crate::Image,
     page_size: usize,
     name: &str,
 ) -> Result<Vec<(String, String)>, String> {
@@ -1364,7 +1364,7 @@ fn domain_dependents(
 /// The first table.column that uses a domain as its `RDB$FIELD_SOURCE`
 /// (None if the domain is unused) - a `DROP DOMAIN` is refused while it
 /// is in use.
-fn domain_user(file: &[u8], page_size: usize, name: &str) -> Option<String> {
+fn domain_user(file: &crate::Image, page_size: usize, name: &str) -> Option<String> {
     let rel = crate::resolve_relation(file, page_size, "RDB$RELATION_FIELDS")?;
     let formats = system_relation_formats(file, page_size, "RDB$RELATION_FIELDS")?;
     let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
@@ -1387,7 +1387,7 @@ fn domain_user(file: &[u8], page_size: usize, name: &str) -> Option<String> {
 /// no security class). The same row a table column's auto-domain gets,
 /// with the user's name; `NOT NULL` sets `RDB$NULL_FLAG` on the domain
 /// itself (a table column keeps its NOT NULL on `RDB$RELATION_FIELDS`).
-pub fn create_domain(file: &mut Vec<u8>, page_size: usize, col: &ColumnDef) -> Result<(), String> {
+pub fn create_domain(file: &mut crate::Image, page_size: usize, col: &ColumnDef) -> Result<(), String> {
     let name = col.name.trim().trim_matches('"').to_ascii_uppercase();
     if name.is_empty() {
         return Err("a domain needs a name".into());
@@ -1444,7 +1444,7 @@ pub fn create_domain(file: &mut Vec<u8>, page_size: usize, col: &ColumnDef) -> R
 /// `DROP DOMAIN <name>` - delete the `RDB$FIELDS` row. Refused while a
 /// table column still uses the domain as its `RDB$FIELD_SOURCE`, or when
 /// the domain does not exist.
-pub fn drop_domain(file: &mut Vec<u8>, page_size: usize, name: &str) -> Result<(), String> {
+pub fn drop_domain(file: &mut crate::Image, page_size: usize, name: &str) -> Result<(), String> {
     let want = name.trim().trim_matches('"').to_ascii_uppercase();
     if !domain_exists(file, page_size, &want) {
         return Err(format!("Domain {} not found", want));
@@ -1474,7 +1474,7 @@ pub fn drop_domain(file: &mut Vec<u8>, page_size: usize, name: &str) -> Result<(
 }
 
 /// A domain's `RDB$SECURITY_CLASS` off its `RDB$FIELDS` row (None if unset).
-fn domain_security_class(file: &[u8], page_size: usize, dname: &str) -> Option<String> {
+fn domain_security_class(file: &crate::Image, page_size: usize, dname: &str) -> Option<String> {
     let rel = crate::resolve_relation(file, page_size, "RDB$FIELDS")?;
     let formats = system_relation_formats(file, page_size, "RDB$FIELDS")?;
     let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
@@ -1502,7 +1502,7 @@ fn domain_security_class(file: &[u8], page_size: usize, dname: &str) -> Option<S
 /// column that uses the domain without its own default sees the change on its
 /// next insert.
 pub fn alter_domain_default(
-    file: &mut Vec<u8>,
+    file: &mut crate::Image,
     page_size: usize,
     name: &str,
     default: Option<&ColumnDefault>,
@@ -1552,7 +1552,7 @@ pub fn alter_domain_default(
 /// existing row of any column using the domain is NULL before a SET, which an
 /// offline writer over freshly-created (unused) domains never has to.
 pub fn alter_domain_not_null(
-    file: &mut Vec<u8>,
+    file: &mut crate::Image,
     page_size: usize,
     name: &str,
     not_null: bool,
@@ -1601,7 +1601,7 @@ pub fn field_type_to_dtype(ft: i16) -> Option<u8> {
 
 /// A domain's current `(field_type, byte length, scale, sub_type)` off its
 /// `RDB$FIELDS` row.
-pub fn domain_type_info(file: &[u8], page_size: usize, name: &str) -> Option<(i16, u16, i8, i16)> {
+pub fn domain_type_info(file: &crate::Image, page_size: usize, name: &str) -> Option<(i16, u16, i8, i16)> {
     let rel = crate::resolve_relation(file, page_size, "RDB$FIELDS")?;
     let formats = system_relation_formats(file, page_size, "RDB$FIELDS")?;
     let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
@@ -1645,7 +1645,7 @@ pub struct DomainType {
     pub default_blr: Option<Vec<u8>>,
 }
 
-fn resolve_domain_type(file: &[u8], page_size: usize, dname: &str) -> Option<DomainType> {
+fn resolve_domain_type(file: &crate::Image, page_size: usize, dname: &str) -> Option<DomainType> {
     let rel = crate::resolve_relation(file, page_size, "RDB$FIELDS")?;
     let formats = system_relation_formats(file, page_size, "RDB$FIELDS")?;
     let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
@@ -1716,7 +1716,7 @@ fn resolve_domain_type(file: &[u8], page_size: usize, dname: &str) -> Option<Dom
 /// fire-crab does not yet declare a domain-typed column, so there is no table
 /// format to carry along.
 pub fn alter_domain_type(
-    file: &mut Vec<u8>,
+    file: &mut crate::Image,
     page_size: usize,
     name: &str,
     new_col: &ColumnDef,
@@ -1849,7 +1849,7 @@ pub fn alter_domain_type(
 /// column, an indexed/key column, or the table's only column each error
 /// (they need constraint or index teardown first).
 pub fn alter_table_drop_column(
-    file: &mut Vec<u8>,
+    file: &mut crate::Image,
     page_size: usize,
     table: &str,
     col_name: &str,
@@ -2069,7 +2069,7 @@ fn int_width(dt: u8) -> Option<u16> {
 /// (index name, is-a-FOREIGN-KEY index - its RDB$FOREIGN_KEY names a
 /// partner).
 fn indices_containing(
-    file: &[u8],
+    file: &crate::Image,
     page_size: usize,
     table: &str,
     col: &str,
@@ -2112,7 +2112,7 @@ fn indices_containing(
 /// refuse, ANY segment of a multi-column key included, while a plain
 /// CREATE INDEX column retypes fine).
 fn column_in_constraint_index(
-    file: &[u8],
+    file: &crate::Image,
     page_size: usize,
     table: &str,
     col: &str,
@@ -2167,7 +2167,7 @@ fn type_change_supported(old: &Descriptor, new: &ColumnDef) -> bool {
 /// is bumped. Only a widening conversion (see [type_change_supported]) is
 /// performed; anything else errors.
 pub fn alter_table_alter_column_type(
-    file: &mut Vec<u8>,
+    file: &mut crate::Image,
     page_size: usize,
     table: &str,
     col_name: &str,
@@ -2369,7 +2369,7 @@ pub fn alter_table_alter_column_type(
 /// format version (the probe shows `RDB$FORMAT` unchanged); the row layout
 /// does not move.
 pub fn alter_column_default(
-    file: &mut Vec<u8>,
+    file: &mut crate::Image,
     page_size: usize,
     table: &str,
     column: &str,
@@ -2441,7 +2441,7 @@ pub fn alter_column_default(
 /// The identity generator backing a column - its `RDB$GENERATOR_NAME` when
 /// `RDB$IDENTITY_TYPE` is set - or None if the column is not an identity column.
 fn column_identity_generator(
-    file: &[u8],
+    file: &crate::Image,
     page_size: usize,
     table: &str,
     column: &str,
@@ -2472,7 +2472,7 @@ fn column_identity_generator(
 
 /// A generator's `(RDB$GENERATOR_ID, RDB$GENERATOR_INCREMENT,
 /// RDB$INITIAL_VALUE)`.
-fn generator_incr_init(file: &[u8], page_size: usize, name: &str) -> Option<(i64, i64, i64)> {
+fn generator_incr_init(file: &crate::Image, page_size: usize, name: &str) -> Option<(i64, i64, i64)> {
     let rel = crate::resolve_relation(file, page_size, "RDB$GENERATORS")?;
     let formats = system_relation_formats(file, page_size, "RDB$GENERATORS")?;
     let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
@@ -2503,7 +2503,7 @@ fn generator_incr_init(file: &[u8], page_size: usize, name: &str) -> Option<(i64
 /// `RDB$INITIAL_VALUE`. Neither changes the catalog (`RDB$INITIAL_VALUE` and
 /// the increment stay); only the generator's stored value moves.
 pub fn alter_column_restart(
-    file: &mut Vec<u8>,
+    file: &mut crate::Image,
     page_size: usize,
     table: &str,
     column: &str,
@@ -2525,7 +2525,7 @@ pub fn alter_column_restart(
 /// The generator and its value are untouched; the relation's `RDB$RUNTIME` is
 /// rebuilt so the runtime's identity-type segment (23) follows.
 pub fn alter_column_set_generated(
-    file: &mut Vec<u8>,
+    file: &mut crate::Image,
     page_size: usize,
     table: &str,
     column: &str,
@@ -2559,7 +2559,7 @@ pub fn alter_column_set_generated(
 /// identity segments 22/23 but keeps the not-null, since the RF row still
 /// carries the flag).
 pub fn alter_column_drop_identity(
-    file: &mut Vec<u8>,
+    file: &mut crate::Image,
     page_size: usize,
     table: &str,
     column: &str,
@@ -2612,7 +2612,7 @@ pub fn alter_column_drop_identity(
 /// stored bytes are untouched - reordering is a display change, not a storage
 /// one.
 pub fn alter_column_position(
-    file: &mut Vec<u8>,
+    file: &mut crate::Image,
     page_size: usize,
     table: &str,
     column: &str,
@@ -2669,7 +2669,7 @@ pub fn alter_column_position(
 
 /// Whether any committed primary record of `rel` has a NULL in field
 /// `fid` - the check `SET NOT NULL` makes before it can succeed.
-fn column_has_nulls(file: &[u8], page_size: usize, rel: u16, fid: usize) -> bool {
+fn column_has_nulls(file: &crate::Image, page_size: usize, rel: u16, fid: usize) -> bool {
     let formats = crate::relation_formats(file, page_size, rel);
     for dp_no in relation_data_pages(file, page_size, rel) {
         let Some(dp) = crate::page_at(file, page_size, dp_no).and_then(DataPage::decode) else {
@@ -2697,7 +2697,7 @@ fn column_has_nulls(file: &[u8], page_size: usize, rel: u16, fid: usize) -> bool
 /// Set (or clear) the `RDB$NULL_FLAG` of a column's `RDB$RELATION_FIELDS`
 /// row in place: `Some(1)` for NOT NULL, `None` to make it nullable again.
 fn patch_rf_null_flag(
-    file: &mut Vec<u8>,
+    file: &mut crate::Image,
     page_size: usize,
     table: &str,
     col_up: &str,
@@ -2752,7 +2752,7 @@ fn patch_rf_null_flag(
 /// a change to a field's not-null status, so the engine's DSQL metadata
 /// carries the RSR_field_not_null marker. The format is NOT bumped (a
 /// NOT NULL constraint changes no record layout).
-fn refresh_runtime(file: &mut Vec<u8>, page_size: usize, table: &str) -> Result<(), String> {
+fn refresh_runtime(file: &mut crate::Image, page_size: usize, table: &str) -> Result<(), String> {
     let formats = crate::relation_formats(
         file,
         page_size,
@@ -2795,7 +2795,7 @@ fn refresh_runtime(file: &mut Vec<u8>, page_size: usize, table: &str) -> Result<
 /// refreshed so the engine enforces it. Fails - as the engine does - if
 /// the column already holds a NULL.
 pub fn alter_table_set_not_null(
-    file: &mut Vec<u8>,
+    file: &mut crate::Image,
     page_size: usize,
     table: &str,
     col_name: &str,
@@ -2841,7 +2841,7 @@ pub fn alter_table_set_not_null(
 /// constraint - clear the column's `RDB$NULL_FLAG`, delete the
 /// `RDB$RELATION_CONSTRAINTS`/`RDB$CHECK_CONSTRAINTS` rows, refresh runtime.
 pub fn alter_table_drop_not_null(
-    file: &mut Vec<u8>,
+    file: &mut crate::Image,
     page_size: usize,
     table: &str,
     col_name: &str,
@@ -2954,7 +2954,7 @@ pub struct ForeignKeyDef {
 }
 
 pub fn create_table(
-    file: &mut Vec<u8>,
+    file: &mut crate::Image,
     page_size: usize,
     name: &str,
     cols: &[ColumnDef],
@@ -3381,7 +3381,7 @@ pub fn create_table(
 /// checks - the table's existing rows, so this works on a populated
 /// table exactly as the engine's own does.
 fn write_key(
-    file: &mut Vec<u8>,
+    file: &mut crate::Image,
     page_size: usize,
     table: &str,
     key: &KeyDef,
@@ -3423,7 +3423,7 @@ fn write_key(
 /// (create_table draws them before building the runtime summary, which
 /// must already name them).
 fn write_check(
-    file: &mut Vec<u8>,
+    file: &mut crate::Image,
     page_size: usize,
     table: &str,
     check: &CheckDef,
@@ -3530,7 +3530,7 @@ pub struct UserTriggerDef {
 /// referenced field, and a refresh of the relation's RDB$RUNTIME - a
 /// trigger absent from the summary never fires.
 pub fn create_user_trigger(
-    file: &mut Vec<u8>,
+    file: &mut crate::Image,
     page_size: usize,
     table: &str,
     def: &UserTriggerDef,
@@ -3572,7 +3572,7 @@ pub fn create_user_trigger(
             ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
         ],
     )?;
-    let dep = |file: &mut Vec<u8>, on: &str, field: Option<&str>, otype: i64| -> Result<(), String> {
+    let dep = |file: &mut crate::Image, on: &str, field: Option<&str>, otype: i64| -> Result<(), String> {
         let drel = crate::resolve_relation(file, page_size, "RDB$DEPENDENCIES")
             .ok_or("no RDB$DEPENDENCIES relation")?;
         let mut row = vec![
@@ -3614,7 +3614,7 @@ pub fn create_user_trigger(
 /// (probed: a violating row survives the ALTER untouched; only future
 /// DML is checked) - so neither does this.
 pub fn alter_table_add_check(
-    file: &mut Vec<u8>,
+    file: &mut crate::Image,
     page_size: usize,
     table: &str,
     check: &CheckDef,
@@ -3649,7 +3649,7 @@ pub fn alter_table_add_check(
 /// add one over a nullable column rather than making it not-null
 /// (probed), and so does this.
 pub fn alter_table_add_key(
-    file: &mut Vec<u8>,
+    file: &mut crate::Image,
     page_size: usize,
     table: &str,
     key: &KeyDef,
@@ -3702,7 +3702,7 @@ pub fn alter_table_add_key(
 /// as the engine refuses it ("Cannot delete PRIMARY KEY being used in
 /// FOREIGN KEY definition").
 pub fn alter_table_drop_constraint(
-    file: &mut Vec<u8>,
+    file: &mut crate::Image,
     page_size: usize,
     table: &str,
     constraint: &str,
@@ -3789,7 +3789,7 @@ pub fn alter_table_drop_constraint(
 /// used by an Integrity Constraint", DdlNodes.epp:14643) and refers the
 /// user to ALTER TABLE DROP CONSTRAINT. The removal itself is the
 /// engine's deferred one - see [deferred_drop_index].
-pub fn drop_index(file: &mut Vec<u8>, page_size: usize, index_name: &str) -> Result<(), String> {
+pub fn drop_index(file: &mut crate::Image, page_size: usize, index_name: &str) -> Result<(), String> {
     let want = index_name.trim().trim_matches('"').to_ascii_uppercase();
     let (table, system) = find_index_relation(file, page_size, &want)
         .ok_or_else(|| format!("index {} not found", want))?;
@@ -3839,7 +3839,7 @@ pub enum CommentTarget {
 /// charset, not the 1 the binary metadata blobs carry), or NULL when the
 /// comment is being cleared.
 fn description_blob(
-    file: &mut Vec<u8>,
+    file: &mut crate::Image,
     page_size: usize,
     owner_rel: u16,
     text: Option<&str>,
@@ -3868,7 +3868,7 @@ fn description_blob(
 /// through the blob's own charset, so it must match (see
 /// [crate::dml::insert_blob_cs]).
 pub fn comment_on(
-    file: &mut Vec<u8>,
+    file: &mut crate::Image,
     page_size: usize,
     target: &CommentTarget,
     text: Option<&str>,
@@ -4027,7 +4027,7 @@ pub fn comment_on(
 /// (the engine recomputes both) - so the only failure is an index that
 /// does not exist ("Index not found").
 pub fn set_index_statistics(
-    file: &mut Vec<u8>,
+    file: &mut crate::Image,
     page_size: usize,
     index_name: &str,
 ) -> Result<(), String> {
@@ -4094,7 +4094,7 @@ pub fn set_index_statistics(
 /// ("Cannot deactivate index used by a PRIMARY/UNIQUE constraint" /
 /// "... by an integrity constraint").
 pub fn alter_index_active(
-    file: &mut Vec<u8>,
+    file: &mut crate::Image,
     page_size: usize,
     index_name: &str,
     active: bool,
@@ -4195,7 +4195,7 @@ pub fn alter_index_active(
 /// An index's `(RDB$INDEX_INACTIVE, unique, descending)` from
 /// RDB$INDICES. A NULL `RDB$INDEX_INACTIVE` counts as active (0), the
 /// way `MetadataCache::getIndexStatus` reads it.
-fn index_row_state(file: &[u8], page_size: usize, name: &str) -> Result<(i64, bool, bool), String> {
+fn index_row_state(file: &crate::Image, page_size: usize, name: &str) -> Result<(i64, bool, bool), String> {
     let formats = system_relation_formats(file, page_size, "RDB$INDICES")
         .ok_or("no RDB$INDICES format")?;
     let (_, descs) = formats.iter().max_by_key(|(n, _)| *n).ok_or("empty format")?;
@@ -4221,7 +4221,7 @@ fn index_row_state(file: &[u8], page_size: usize, name: &str) -> Result<(i64, bo
 }
 
 /// An index's `RDB$INDEX_ID` (the index-root slot plus one).
-fn index_id_of(file: &[u8], page_size: usize, name: &str) -> Result<usize, String> {
+fn index_id_of(file: &crate::Image, page_size: usize, name: &str) -> Result<usize, String> {
     let formats = system_relation_formats(file, page_size, "RDB$INDICES")
         .ok_or("no RDB$INDICES format")?;
     let (_, descs) = formats.iter().max_by_key(|(n, _)| *n).ok_or("empty format")?;
@@ -4240,7 +4240,7 @@ fn index_id_of(file: &[u8], page_size: usize, name: &str) -> Result<usize, Strin
 
 /// An index's column names, in key order, from RDB$INDEX_SEGMENTS.
 fn index_segment_columns(
-    file: &[u8],
+    file: &crate::Image,
     page_size: usize,
     name: &str,
 ) -> Result<Vec<String>, String> {
@@ -4273,13 +4273,13 @@ fn index_segment_columns(
 /// `irt_unique|irt_foreign|irt_primary`, so the tree is still maintained
 /// but no longer enforces anything.
 fn mark_index_slot_dropped(
-    file: &mut Vec<u8>,
+    file: &mut crate::Image,
     page_size: usize,
     rel: u16,
     slot: usize,
 ) -> Result<(), String> {
     let irt_page = file
-        .chunks_exact(page_size)
+        .pages()
         .position(|p| p[0] == 6 && u16_at(p, 16) == rel)
         .ok_or("relation has no index root page")? as u32;
     let page = crate::page_mut(file, page_size, irt_page).ok_or("irt page out of range")?;
@@ -4293,7 +4293,7 @@ fn mark_index_slot_dropped(
 }
 
 /// An index's (relation name, RDB$SYSTEM_FLAG) from RDB$INDICES.
-fn find_index_relation(file: &[u8], page_size: usize, index_name: &str) -> Option<(String, i64)> {
+fn find_index_relation(file: &crate::Image, page_size: usize, index_name: &str) -> Option<(String, i64)> {
     let rel = crate::resolve_relation(file, page_size, "RDB$INDICES")?;
     let formats = system_relation_formats(file, page_size, "RDB$INDICES")?;
     let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
@@ -4321,7 +4321,7 @@ fn find_index_relation(file: &[u8], page_size: usize, index_name: &str) -> Optio
 
 /// The constraint (if any) an index backs - a PRIMARY KEY, UNIQUE or
 /// FOREIGN KEY row of RDB$RELATION_CONSTRAINTS naming it.
-fn constraint_using_index(file: &[u8], page_size: usize, index_name: &str) -> Option<String> {
+fn constraint_using_index(file: &crate::Image, page_size: usize, index_name: &str) -> Option<String> {
     let rel = crate::resolve_relation(file, page_size, "RDB$RELATION_CONSTRAINTS")?;
     let formats = system_relation_formats(file, page_size, "RDB$RELATION_CONSTRAINTS")?;
     let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
@@ -4341,7 +4341,7 @@ fn constraint_using_index(file: &[u8], page_size: usize, index_name: &str) -> Op
 
 /// A constraint's (type, index name) from RDB$RELATION_CONSTRAINTS.
 fn find_constraint(
-    file: &[u8],
+    file: &crate::Image,
     page_size: usize,
     table: &str,
     cname: &str,
@@ -4376,7 +4376,7 @@ fn find_constraint(
 
 /// The column a NOT NULL constraint guards (RDB$CHECK_CONSTRAINTS'
 /// RDB$TRIGGER_NAME holds the column name for those rows).
-fn check_constraint_column(file: &[u8], page_size: usize, cname: &str) -> Option<String> {
+fn check_constraint_column(file: &crate::Image, page_size: usize, cname: &str) -> Option<String> {
     let rel = crate::resolve_relation(file, page_size, "RDB$CHECK_CONSTRAINTS")?;
     let formats = system_relation_formats(file, page_size, "RDB$CHECK_CONSTRAINTS")?;
     let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
@@ -4397,7 +4397,7 @@ fn check_constraint_column(file: &[u8], page_size: usize, cname: &str) -> Option
 /// EVERY trigger name a check constraint's RDB$CHECK_CONSTRAINTS rows
 /// link to - a CHECK has a pair, where a NOT NULL has its single column
 /// name in the same place ([check_constraint_column]).
-fn check_constraint_trigger_names(file: &[u8], page_size: usize, cname: &str) -> Vec<String> {
+fn check_constraint_trigger_names(file: &crate::Image, page_size: usize, cname: &str) -> Vec<String> {
     let mut names = Vec::new();
     let (Some(rel), Some(formats)) = (
         crate::resolve_relation(file, page_size, "RDB$CHECK_CONSTRAINTS"),
@@ -4428,7 +4428,7 @@ fn check_constraint_trigger_names(file: &[u8], page_size: usize, cname: &str) ->
 
 /// The foreign key (if any) whose RDB$REF_CONSTRAINTS row names this
 /// unique/primary constraint as its partner.
-fn foreign_key_referencing(file: &[u8], page_size: usize, cname: &str) -> Option<String> {
+fn foreign_key_referencing(file: &crate::Image, page_size: usize, cname: &str) -> Option<String> {
     let rel = crate::resolve_relation(file, page_size, "RDB$REF_CONSTRAINTS")?;
     let formats = system_relation_formats(file, page_size, "RDB$REF_CONSTRAINTS")?;
     let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
@@ -4452,7 +4452,7 @@ fn foreign_key_referencing(file: &[u8], page_size: usize, cname: &str) -> Option
 /// index-root slot moved to irt_drop (6) with its flags cleared - the
 /// state fcstat reads back from an engine-dropped index, pages and all.
 fn deferred_drop_index(
-    file: &mut Vec<u8>,
+    file: &mut crate::Image,
     page_size: usize,
     rel: u16,
     index_name: &str,
@@ -4516,7 +4516,7 @@ fn deferred_drop_index(
     })?;
     // the index-root slot: irt_drop, flags cleared, root page kept
     let irt_page = file
-        .chunks_exact(page_size)
+        .pages()
         .position(|p| p[0] == 6 && u16_at(p, 16) == rel)
         .ok_or("relation has no index root page")? as u32;
     let page = crate::page_mut(file, page_size, irt_page).ok_or("irt page out of range")?;
@@ -4538,7 +4538,7 @@ fn deferred_drop_index(
 }
 
 /// Whether a column's `RDB$RELATION_FIELDS.RDB$NULL_FLAG` is set.
-fn column_is_not_null(file: &[u8], page_size: usize, table: &str, col_up: &str) -> bool {
+fn column_is_not_null(file: &crate::Image, page_size: usize, table: &str, col_up: &str) -> bool {
     let Some(rel) = crate::resolve_relation(file, page_size, "RDB$RELATION_FIELDS") else {
         return false;
     };
@@ -4570,7 +4570,7 @@ fn column_is_not_null(file: &[u8], page_size: usize, table: &str, col_up: &str) 
 /// as it now stands (every writer takes its number this way, so the
 /// sequence advances across mixed constraint kinds the way the engine's
 /// does).
-fn next_integ_name(file: &[u8], page_size: usize) -> Result<String, String> {
+fn next_integ_name(file: &crate::Image, page_size: usize) -> Result<String, String> {
     let n = next_numeric_suffix(
         file, page_size, "RDB$RELATION_CONSTRAINTS", "RDB$CONSTRAINT_NAME", "INTEG_",
     )?;
@@ -4725,7 +4725,7 @@ fn fk_trigger_blr(
 /// trigger is loaded ([update_relation_runtime]).
 #[allow(clippy::too_many_arguments)]
 fn store_fk_trigger(
-    file: &mut Vec<u8>,
+    file: &mut crate::Image,
     page_size: usize,
     parent: &str,
     child_rel: &str,
@@ -4761,7 +4761,7 @@ fn store_fk_trigger(
             ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
         ],
     )?;
-    let dep = |file: &mut Vec<u8>, on: &str, field: Option<&str>| -> Result<(), String> {
+    let dep = |file: &mut crate::Image, on: &str, field: Option<&str>| -> Result<(), String> {
         let mut row = vec![
             ("RDB$DEPENDENT_NAME", SysVal::S(&tname)),
             ("RDB$DEPENDED_ON_NAME", SysVal::S(on)),
@@ -4791,7 +4791,7 @@ fn store_fk_trigger(
 /// row in place - the way to make a newly written trigger loadable, since
 /// [rebuild_runtime_blob] now folds the relation's trigger names into the
 /// summary the engine loads triggers from.
-fn update_relation_runtime(file: &mut Vec<u8>, page_size: usize, table: &str) -> Result<(), String> {
+fn update_relation_runtime(file: &mut crate::Image, page_size: usize, table: &str) -> Result<(), String> {
     let rel = crate::resolve_relation(file, page_size, table)
         .ok_or_else(|| format!("table {} not found", table))?;
     let formats = crate::relation_formats(file, page_size, rel);
@@ -4822,7 +4822,7 @@ fn update_relation_runtime(file: &mut Vec<u8>, page_size: usize, table: &str) ->
 /// table (single column), refreshing that table's RDB$RUNTIME so they load.
 /// Shared by create_table and ALTER TABLE ADD CONSTRAINT.
 fn write_foreign_key(
-    file: &mut Vec<u8>,
+    file: &mut crate::Image,
     page_size: usize,
     table: &str,
     fk_name: &str,
@@ -4897,7 +4897,7 @@ fn write_foreign_key(
 /// constraint catalog rows are written - the same shape create_table
 /// produces, so the engine reads and gbak restores it identically.
 pub fn alter_table_add_foreign_key(
-    file: &mut Vec<u8>,
+    file: &mut crate::Image,
     page_size: usize,
     table: &str,
     fk: &ForeignKeyDef,
@@ -4936,7 +4936,7 @@ pub fn alter_table_add_foreign_key(
 /// this as its implicit MATCHING list, exactly as the engine does
 /// (StmtNodes.cpp `UpdateOrInsertNode`).
 pub fn primary_key_columns(
-    file: &[u8],
+    file: &crate::Image,
     page_size: usize,
     table: &str,
 ) -> Option<Vec<String>> {
@@ -4946,7 +4946,7 @@ pub fn primary_key_columns(
 }
 
 fn find_partner_key(
-    file: &[u8],
+    file: &crate::Image,
     page_size: usize,
     ref_table: &str,
     ref_columns: &[String],
@@ -5002,7 +5002,7 @@ fn find_partner_key(
 }
 
 /// An index's columns in key order, from RDB$INDEX_SEGMENTS.
-fn index_segment_names(file: &[u8], page_size: usize, index_name: &str) -> Vec<String> {
+fn index_segment_names(file: &crate::Image, page_size: usize, index_name: &str) -> Vec<String> {
     let Some(rel) = crate::resolve_relation(file, page_size, "RDB$INDEX_SEGMENTS") else {
         return Vec::new();
     };
@@ -5046,7 +5046,7 @@ fn index_segment_names(file: &[u8], page_size: usize, index_name: &str) -> Vec<S
 /// unnamed PRIMARY KEY index from ONE sequence (probed: a table
 /// declaring UNIQUE then PRIMARY KEY got RDB$7 and RDB$PRIMARY8), so
 /// both spellings are scanned and the higher successor wins.
-fn next_index_number(file: &[u8], page_size: usize) -> Result<u64, String> {
+fn next_index_number(file: &crate::Image, page_size: usize) -> Result<u64, String> {
     let plain = next_numeric_suffix(file, page_size, "RDB$INDICES", "RDB$INDEX_NAME", "RDB$")?;
     let primary =
         next_numeric_suffix(file, page_size, "RDB$INDICES", "RDB$INDEX_NAME", "RDB$PRIMARY")?;
@@ -5054,7 +5054,7 @@ fn next_index_number(file: &[u8], page_size: usize) -> Result<u64, String> {
 }
 
 fn next_numeric_suffix(
-    file: &[u8],
+    file: &crate::Image,
     page_size: usize,
     rel_name: &str,
     col: &str,
@@ -5086,7 +5086,7 @@ fn next_numeric_suffix(
 /// [sys_insert] with the relation id resolved by name - for catalog
 /// relations whose ids this module does not hardcode.
 fn sys_row_by_name(
-    file: &mut Vec<u8>,
+    file: &mut crate::Image,
     page_size: usize,
     rel_name: &str,
     values: &[(&str, SysVal<'_>)],
@@ -5114,7 +5114,7 @@ fn index_itype(d: &Descriptor) -> Option<u16> {
 }
 
 /// Whether an index of `index_name` already exists (any relation).
-fn index_name_taken(file: &[u8], page_size: usize, index_name: &str) -> Result<bool, String> {
+fn index_name_taken(file: &crate::Image, page_size: usize, index_name: &str) -> Result<bool, String> {
     let irel = crate::resolve_relation(file, page_size, "RDB$INDICES")
         .ok_or("no RDB$INDICES relation")?;
     let formats = system_relation_formats(file, page_size, "RDB$INDICES")
@@ -5147,7 +5147,7 @@ fn index_name_taken(file: &[u8], page_size: usize, index_name: &str) -> Result<b
 /// exactly like the engine's index build does.
 #[allow(clippy::too_many_arguments)]
 pub fn create_index(
-    file: &mut Vec<u8>,
+    file: &mut crate::Image,
     page_size: usize,
     table: &str,
     index_name: &str,
@@ -5271,32 +5271,36 @@ pub fn create_index(
 /// allocated, the repeat written `irt_normal`. Returns the slot -
 /// `RDB$INDEX_ID - 1`.
 fn allocate_index_slot(
-    file: &mut Vec<u8>,
+    file: &mut crate::Image,
     page_size: usize,
     rel: u16,
     segs: &[(u16, u16, i8)],
     iflags: u16,
 ) -> Result<usize, String> {
     let irt_page = file
-        .chunks_exact(page_size)
+        .pages()
         .position(|p| p[0] == 6 && u16_at(p, 16) == rel)
         .ok_or("relation has no index root page")? as u32;
-    let base = irt_page as usize * page_size;
-    let mut slot = None;
-    let mut lowest_desc = page_size;
-    for i in 0..((page_size - 24) / 24) {
-        let at = base + 24 + i * 24;
-        let root = u32_at(file, at + 8);
-        if root == 0 {
-            if slot.is_none() {
-                slot = Some(i);
-                break;
+    // find a free slot and the lowest descriptor offset, page-local on
+    // the irt page; the borrow drops before allocate_page takes the file
+    let (slot, lowest_desc) = {
+        let page = crate::page_at(file, page_size, irt_page).ok_or("irt page out of range")?;
+        let mut slot = None;
+        let mut lowest_desc = page_size;
+        for i in 0..((page_size - 24) / 24) {
+            let at = 24 + i * 24;
+            let root = u32_at(page, at + 8);
+            if root == 0 {
+                if slot.is_none() {
+                    slot = Some(i);
+                    break;
+                }
+            } else {
+                lowest_desc = lowest_desc.min(u16_at(page, at + 16) as usize);
             }
-        } else {
-            lowest_desc = lowest_desc.min(u16_at(file, at + 16) as usize);
         }
-    }
-    let slot = slot.ok_or("no free index slot")?;
+        (slot.ok_or("no free index slot")?, lowest_desc)
+    };
     let desc_off = lowest_desc
         .checked_sub(8 * segs.len())
         .ok_or("irt page full")?;
@@ -5310,26 +5314,28 @@ fn allocate_index_slot(
         .fill(0);
     btw::write_empty_root(file, page_size, root_page, rel, slot as u8)?;
 
-    let at = base + 24 + slot * 24;
-    file[at..at + 8].copy_from_slice(&0u64.to_le_bytes()); // irt_transaction
-    dml::put_u32(file, at + 8, root_page);
-    dml::put_u32(file, at + 12, 0); // page space
-    dml::put_u16(file, at + 16, desc_off as u16);
-    dml::put_u16(file, at + 18, iflags);
-    file[at + 20] = 3; // irt_normal
-    file[at + 21] = segs.len() as u8;
-    file[at + 22] = 0;
-    file[at + 23] = 0;
+    // the index-root entry, its segment descriptors and the count are all
+    // on the irt page
+    let page = crate::page_mut(file, page_size, irt_page).ok_or("irt page out of range")?;
+    let at = 24 + slot * 24;
+    page[at..at + 8].copy_from_slice(&0u64.to_le_bytes()); // irt_transaction
+    dml::put_u32(page, at + 8, root_page);
+    dml::put_u32(page, at + 12, 0); // page space
+    dml::put_u16(page, at + 16, desc_off as u16);
+    dml::put_u16(page, at + 18, iflags);
+    page[at + 20] = 3; // irt_normal
+    page[at + 21] = segs.len() as u8;
+    page[at + 22] = 0;
+    page[at + 23] = 0;
     for (i, (field, itype, _)) in segs.iter().enumerate() {
-        let d = base + desc_off + i * 8;
-        dml::put_u16(file, d, *field);
-        dml::put_u16(file, d + 2, *itype);
-        dml::put_u32(file, d + 4, 0); // selectivity, computed after the build
+        let d = desc_off + i * 8;
+        dml::put_u16(page, d, *field);
+        dml::put_u16(page, d + 2, *itype);
+        dml::put_u32(page, d + 4, 0); // selectivity, computed after the build
     }
-    let count_at = base + 18; // irt_count @18
-    let count = u16_at(file, count_at);
+    let count = u16_at(page, 18); // irt_count @18
     if (slot as u16) + 1 > count {
-        dml::put_u16(file, count_at, slot as u16 + 1);
+        dml::put_u16(page, 18, slot as u16 + 1);
     }
     Ok(slot)
 }
@@ -5340,7 +5346,7 @@ fn allocate_index_slot(
 /// primary index fails the whole statement, as the engine's build does.
 #[allow(clippy::too_many_arguments)]
 fn backfill_index(
-    file: &mut Vec<u8>,
+    file: &mut crate::Image,
     page_size: usize,
     rel: u16,
     slot: usize,
@@ -5399,7 +5405,7 @@ fn backfill_index(
 /// Walk a system relation like [walk_rows], also yielding each row's
 /// (data page, slot) - what [crate::dml::delete_records] targets.
 fn walk_rows_at(
-    file: &[u8],
+    file: &crate::Image,
     page_size: usize,
     rel: u16,
     descs: &[Descriptor],
@@ -5425,7 +5431,7 @@ fn walk_rows_at(
 /// entries valid: they point at deleted stubs, exactly as after an
 /// engine-side DELETE.
 fn delete_catalog_rows(
-    file: &mut Vec<u8>,
+    file: &mut crate::Image,
     page_size: usize,
     rel_name: &str,
     pred: impl Fn(&[Value]) -> bool,
@@ -5450,7 +5456,7 @@ fn delete_catalog_rows(
 
 /// The field id of a named column in a system relation's computed
 /// format.
-fn sys_fid(file: &[u8], page_size: usize, rel_name: &str, col: &str) -> Result<usize, String> {
+fn sys_fid(file: &crate::Image, page_size: usize, rel_name: &str, col: &str) -> Result<usize, String> {
     relation_columns(file, page_size, rel_name)
         .iter()
         .find(|c| c.name == col)
@@ -5474,7 +5480,7 @@ fn int_eq(v: Option<&Value>, want: i64) -> bool {
 /// physically gone; every page the relation owned (data, pointer,
 /// index root, every B-tree bucket, level-1 blob pages) is released
 /// back to the PIP.
-pub fn drop_table(file: &mut Vec<u8>, page_size: usize, name: &str) -> Result<(), String> {
+pub fn drop_table(file: &mut crate::Image, page_size: usize, name: &str) -> Result<(), String> {
     let name = name.trim().to_ascii_uppercase();
     let rel = crate::resolve_relation(file, page_size, &name)
         .ok_or_else(|| format!("table {} not found", name))?;
@@ -5582,7 +5588,7 @@ pub fn drop_table(file: &mut Vec<u8>, page_size: usize, name: &str) -> Result<()
         }
         pages.push(dp_no);
     }
-    for (i, p) in file.chunks_exact(page_size).enumerate() {
+    for (i, p) in file.pages().enumerate() {
         let owned = match p[0] {
             4 => u16_at(p, 26) == rel,  // pointer: ppg_relation
             6 => u16_at(p, 16) == rel,  // index root: irt_relation
@@ -5700,7 +5706,7 @@ pub fn drop_table(file: &mut Vec<u8>, page_size: usize, name: &str) -> Result<()
 /// safe for columns no index of the relation keys; a keyed column needs
 /// [maintain_indexes] afterwards, as the deferred index drop does.
 fn patch_sys_row(
-    file: &mut Vec<u8>,
+    file: &mut crate::Image,
     page_size: usize,
     rel_name: &str,
     rel: u16,
@@ -5799,7 +5805,7 @@ fn patch_sys_row(
 /// The engine stores these as 4-byte floats both on the index root page
 /// (`irtd_selectivity`) and in the catalog, so they are computed as f32.
 fn index_selectivity(
-    file: &[u8],
+    file: &crate::Image,
     page_size: usize,
     rel: u16,
     segs: &[(u16, u16, i8)],
@@ -5857,7 +5863,7 @@ fn index_selectivity(
 /// root page, `RDB$INDEX_SEGMENTS.RDB$STATISTICS` per segment, and
 /// `RDB$INDICES.RDB$STATISTICS` (the whole key's, i.e. the last prefix).
 fn write_index_statistics(
-    file: &mut Vec<u8>,
+    file: &mut crate::Image,
     page_size: usize,
     rel: u16,
     slot: usize,
@@ -5865,7 +5871,7 @@ fn write_index_statistics(
     selectivity: &[f32],
 ) -> Result<(), String> {
     let irt_page = file
-        .chunks_exact(page_size)
+        .pages()
         .position(|p| p[0] == 6 && u16_at(p, 16) == rel)
         .ok_or("relation has no index root page")? as u32;
     {
@@ -5908,7 +5914,7 @@ fn write_index_statistics(
 /// A generator's `(RDB$GENERATOR_ID, RDB$SYSTEM_FLAG, RDB$SECURITY_CLASS)`
 /// from `RDB$GENERATORS`, by name. None when there is no such generator.
 fn find_generator(
-    file: &[u8],
+    file: &crate::Image,
     page_size: usize,
     name: &str,
 ) -> Option<(i64, i64, Option<String>)> {
@@ -5948,7 +5954,7 @@ fn find_generator(
 /// Whether a generator id is already spoken for - the condition the
 /// engine's store loop discovers as a unique-key violation on
 /// RDB$INDEX_46 and retries (DdlNodes.epp:6624).
-fn generator_id_taken(file: &[u8], page_size: usize, id: i64) -> bool {
+fn generator_id_taken(file: &crate::Image, page_size: usize, id: i64) -> bool {
     let Some(rel) = crate::resolve_relation(file, page_size, "RDB$GENERATORS") else {
         return false;
     };
@@ -6011,7 +6017,7 @@ fn owner_acl(owner: &str, privileges: &[u8]) -> Vec<u8> {
 /// that relation's own data pages, then the row pointing at it. The
 /// class name is the caller's `SQL$<n>`.
 fn store_security_class(
-    file: &mut Vec<u8>,
+    file: &mut crate::Image,
     page_size: usize,
     class: &str,
     owner: &str,
@@ -6050,7 +6056,7 @@ fn store_security_class(
 /// Creating a sequence therefore *writes generator values* - two of
 /// them - before it has a value of its own.
 pub fn create_sequence(
-    file: &mut Vec<u8>,
+    file: &mut crate::Image,
     page_size: usize,
     name: &str,
     start: Option<i64>,
@@ -6082,7 +6088,7 @@ pub fn create_sequence(
 /// an `SQL$<n>` security class with the owner's ACL and a USAGE privilege; and
 /// the slot is primed to `initial - step` so the first draw yields `initial`.
 fn write_generator(
-    file: &mut Vec<u8>,
+    file: &mut crate::Image,
     page_size: usize,
     name: &str,
     system_flag: i64,
@@ -6129,7 +6135,7 @@ fn write_generator(
 
 /// The next free system-generated `RDB$<n>` generator name (identity
 /// generators): one past the highest numeric `RDB$<n>` in `RDB$GENERATORS`.
-fn next_generator_number(file: &[u8], page_size: usize) -> u64 {
+fn next_generator_number(file: &crate::Image, page_size: usize) -> u64 {
     let (Some(rel), Some(formats)) = (
         crate::resolve_relation(file, page_size, "RDB$GENERATORS"),
         system_relation_formats(file, page_size, "RDB$GENERATORS"),
@@ -6171,7 +6177,7 @@ const OWNER: &str = "SYSDBA";
 /// S/I/U/D/R (select, insert, update, delete, references), the five
 /// rows an engine-created table carries.
 fn store_privileges(
-    file: &mut Vec<u8>,
+    file: &mut crate::Image,
     page_size: usize,
     name: &str,
     object_type: i64,
@@ -6207,7 +6213,7 @@ const TABLE_OWNER_PRIVILEGES: &[&str] = &["S", "I", "U", "D", "R"];
 /// A relation's `(RDB$SECURITY_CLASS, RDB$OWNER_NAME, RDB$DEFAULT_CLASS)`
 /// from RDB$RELATIONS.
 fn relation_security(
-    file: &[u8],
+    file: &crate::Image,
     page_size: usize,
     table: &str,
 ) -> Option<(String, String, String)> {
@@ -6375,7 +6381,7 @@ struct RecomputedAcls {
 /// by their last field. Each granted field gets its own class ACL (owner
 /// + relation grantees + that field's grantees), and if field grants add
 /// relation-level ACEs the default class is rebuilt without them.
-fn recompute_acls(file: &[u8], page_size: usize, table: &str, owner: &str) -> RecomputedAcls {
+fn recompute_acls(file: &crate::Image, page_size: usize, table: &str, owner: &str) -> RecomputedAcls {
     use std::collections::BTreeMap;
     let mut public_priv = 0u32;
     let mut rel_grantees: BTreeMap<String, u32> = BTreeMap::new();
@@ -6498,7 +6504,7 @@ fn recompute_acls(file: &[u8], page_size: usize, table: &str, owner: &str) -> Re
 
 /// Write (rewrite in place) a security class's `RDB$ACL` blob.
 fn write_class_acl(
-    file: &mut Vec<u8>,
+    file: &mut crate::Image,
     page_size: usize,
     class: &str,
     acl: &[u8],
@@ -6520,7 +6526,7 @@ fn write_class_acl(
 
 /// A field's current `RDB$SECURITY_CLASS` (None if NULL/empty).
 fn field_security_class(
-    file: &[u8],
+    file: &crate::Image,
     page_size: usize,
     table: &str,
     field: &str,
@@ -6552,7 +6558,7 @@ fn field_security_class(
 /// The fields of a relation that currently carry a `SQL$GRANT<n>` security
 /// class (a column grant's class), as (field name, class name).
 fn granted_field_classes(
-    file: &[u8],
+    file: &crate::Image,
     page_size: usize,
     table: &str,
 ) -> Vec<(String, String)> {
@@ -6589,7 +6595,7 @@ fn granted_field_classes(
 
 /// Set (or clear, with `None`) a field's `RDB$RELATION_FIELDS.RDB$SECURITY_CLASS`.
 fn set_field_security_class(
-    file: &mut Vec<u8>,
+    file: &mut crate::Image,
     page_size: usize,
     table: &str,
     field: &str,
@@ -6619,7 +6625,7 @@ fn set_field_security_class(
 /// dropping and clearing one whose last grant was revoked) and, when field
 /// grants added relation-level ACEs, the default class.
 fn recompute_relation_acl(
-    file: &mut Vec<u8>,
+    file: &mut crate::Image,
     page_size: usize,
     table: &str,
 ) -> Result<(), String> {
@@ -6684,7 +6690,7 @@ fn recompute_relation_acl(
 /// grantee, letter and field (`None` = the relation-level, NULL-field
 /// row) - so a re-`GRANT` does not duplicate it.
 fn priv_row_present(
-    file: &[u8],
+    file: &crate::Image,
     page_size: usize,
     table: &str,
     grantee: &str,
@@ -6747,7 +6753,7 @@ fn priv_row_present(
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 pub fn grant_table(
-    file: &mut Vec<u8>,
+    file: &mut crate::Image,
     page_size: usize,
     table: &str,
     grantees: &[String],
@@ -6849,7 +6855,7 @@ pub fn grant_table(
 }
 
 /// A procedure's `(RDB$OWNER_NAME, RDB$SECURITY_CLASS)` from `RDB$PROCEDURES`.
-fn procedure_owner_class(file: &[u8], page_size: usize, proc: &str) -> Option<(String, String)> {
+fn procedure_owner_class(file: &crate::Image, page_size: usize, proc: &str) -> Option<(String, String)> {
     let rel = crate::resolve_relation(file, page_size, "RDB$PROCEDURES")?;
     let formats = system_relation_formats(file, page_size, "RDB$PROCEDURES")?;
     let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
@@ -6884,7 +6890,7 @@ fn procedure_owner_class(file: &[u8], page_size: usize, proc: &str) -> Option<(S
 /// `priv_letter` select the object's rows (procedure 5/`X`, function 15/`X`,
 /// sequence 14/`G`).
 fn build_object_acl(
-    file: &[u8],
+    file: &crate::Image,
     page_size: usize,
     name: &str,
     object_type: i64,
@@ -6942,7 +6948,7 @@ fn build_object_acl(
 /// A function's `(RDB$OWNER_NAME, RDB$SECURITY_CLASS)` from `RDB$FUNCTIONS`
 /// (the packaged-function rows carry a package name; a standalone function's
 /// `RDB$PACKAGE_NAME` is NULL, which is the one this grants on).
-fn function_owner_class(file: &[u8], page_size: usize, func: &str) -> Option<(String, String)> {
+fn function_owner_class(file: &crate::Image, page_size: usize, func: &str) -> Option<(String, String)> {
     let rel = crate::resolve_relation(file, page_size, "RDB$FUNCTIONS")?;
     let formats = system_relation_formats(file, page_size, "RDB$FUNCTIONS")?;
     let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
@@ -6979,7 +6985,7 @@ fn function_owner_class(file: &[u8], page_size: usize, func: &str) -> Option<(St
 /// analogue of [grant_table].
 #[allow(clippy::too_many_arguments)]
 fn grant_object(
-    file: &mut Vec<u8>,
+    file: &mut crate::Image,
     page_size: usize,
     name: &str,
     object_type: i64,
@@ -7040,7 +7046,7 @@ fn grant_object(
 /// `GRANT EXECUTE ON PROCEDURE <p> TO <grantees> [WITH GRANT OPTION]` and its
 /// `REVOKE ... FROM` inverse (object type 5, privilege `X`).
 pub fn grant_procedure(
-    file: &mut Vec<u8>,
+    file: &mut crate::Image,
     page_size: usize,
     proc: &str,
     grantees: &[String],
@@ -7059,7 +7065,7 @@ pub fn grant_procedure(
 /// `GRANT EXECUTE ON FUNCTION <f> TO <grantees> [WITH GRANT OPTION]` and its
 /// `REVOKE ... FROM` inverse (object type 15, privilege `X`).
 pub fn grant_function(
-    file: &mut Vec<u8>,
+    file: &mut crate::Image,
     page_size: usize,
     func: &str,
     grantees: &[String],
@@ -7076,7 +7082,7 @@ pub fn grant_function(
 }
 
 /// A sequence's `(RDB$OWNER_NAME, RDB$SECURITY_CLASS)` from `RDB$GENERATORS`.
-fn generator_owner_class(file: &[u8], page_size: usize, seq: &str) -> Option<(String, String)> {
+fn generator_owner_class(file: &crate::Image, page_size: usize, seq: &str) -> Option<(String, String)> {
     let rel = crate::resolve_relation(file, page_size, "RDB$GENERATORS")?;
     let formats = system_relation_formats(file, page_size, "RDB$GENERATORS")?;
     let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
@@ -7108,7 +7114,7 @@ fn generator_owner_class(file: &[u8], page_size: usize, seq: &str) -> Option<(St
 /// and its `REVOKE ... FROM` inverse (object type 14, privilege `G`). The
 /// owner ACE is alter/control/drop/usage; a grantee gets usage.
 pub fn grant_sequence(
-    file: &mut Vec<u8>,
+    file: &mut crate::Image,
     page_size: usize,
     seq: &str,
     grantees: &[String],
@@ -7130,7 +7136,7 @@ pub fn grant_sequence(
 }
 
 /// An exception's `(RDB$OWNER_NAME, RDB$SECURITY_CLASS)` from `RDB$EXCEPTIONS`.
-fn exception_owner_class(file: &[u8], page_size: usize, exc: &str) -> Option<(String, String)> {
+fn exception_owner_class(file: &crate::Image, page_size: usize, exc: &str) -> Option<(String, String)> {
     let rel = crate::resolve_relation(file, page_size, "RDB$EXCEPTIONS")?;
     let formats = system_relation_formats(file, page_size, "RDB$EXCEPTIONS")?;
     let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
@@ -7161,7 +7167,7 @@ fn exception_owner_class(file: &[u8], page_size: usize, exc: &str) -> Option<(St
 /// `GRANT USAGE ON EXCEPTION <e> TO <grantees> [WITH GRANT OPTION]` and its
 /// `REVOKE ... FROM` inverse (object type 7, privilege `G`).
 pub fn grant_exception(
-    file: &mut Vec<u8>,
+    file: &mut crate::Image,
     page_size: usize,
     exc: &str,
     grantees: &[String],
@@ -7181,7 +7187,7 @@ pub fn grant_exception(
 }
 
 /// A role's `(RDB$OWNER_NAME, RDB$SECURITY_CLASS)` from `RDB$ROLES`.
-fn role_owner_class(file: &[u8], page_size: usize, role: &str) -> Option<(String, String)> {
+fn role_owner_class(file: &crate::Image, page_size: usize, role: &str) -> Option<(String, String)> {
     let rel = crate::resolve_relation(file, page_size, "RDB$ROLES")?;
     let formats = system_relation_formats(file, page_size, "RDB$ROLES")?;
     let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
@@ -7211,7 +7217,7 @@ fn role_owner_class(file: &[u8], page_size: usize, role: &str) -> Option<(String
 
 /// Whether a user already holds membership of a role (an `M` /
 /// object-type-13 row in `RDB$USER_PRIVILEGES`).
-fn role_member_present(file: &[u8], page_size: usize, role: &str, grantee: &str) -> bool {
+fn role_member_present(file: &crate::Image, page_size: usize, role: &str, grantee: &str) -> bool {
     let (Some(rel), Some(formats)) = (
         crate::resolve_relation(file, page_size, "RDB$USER_PRIVILEGES"),
         system_relation_formats(file, page_size, "RDB$USER_PRIVILEGES"),
@@ -7249,7 +7255,7 @@ fn role_member_present(file: &[u8], page_size: usize, role: &str, grantee: &str)
 /// (grant_option = 2) alphabetically, with the `drop` privilege the engine
 /// gives an admin member (grant.epp maps a role membership to `"O"` =
 /// drop). A member without the admin option is not in the ACL.
-fn recompute_role_acl(file: &mut Vec<u8>, page_size: usize, role: &str) -> Result<(), String> {
+fn recompute_role_acl(file: &mut crate::Image, page_size: usize, role: &str) -> Result<(), String> {
     use std::collections::BTreeSet;
     let (owner, class) = role_owner_class(file, page_size, role)
         .ok_or_else(|| format!("role {} has no security class", role))?;
@@ -7300,7 +7306,7 @@ fn recompute_role_acl(file: &mut Vec<u8>, page_size: usize, role: &str) -> Resul
 /// recomputes the role's ACL - every admin-option member gets a `drop`
 /// ACE. Unlike a table grant, the role must exist.
 pub fn grant_role(
-    file: &mut Vec<u8>,
+    file: &mut crate::Image,
     page_size: usize,
     role: &str,
     grantees: &[String],
@@ -7358,7 +7364,7 @@ pub fn grant_role(
 /// the counter would hand the engine a duplicate-key error on its next
 /// DDL.
 fn next_security_class(
-    file: &mut Vec<u8>,
+    file: &mut crate::Image,
     page_size: usize,
     privileges: &[u8],
 ) -> Result<String, String> {
@@ -7374,7 +7380,7 @@ fn next_security_class(
 /// names come from their own counter - generator slot 2, the system
 /// generator actually named `SQL$DEFAULT`. It carries the same ACL as
 /// the relation's own class.
-fn next_default_class(file: &mut Vec<u8>, page_size: usize) -> Result<String, String> {
+fn next_default_class(file: &mut crate::Image, page_size: usize) -> Result<String, String> {
     let id = generator_id_by_name(file, page_size, "SQL$DEFAULT")
         .ok_or("no SQL$DEFAULT generator")?;
     let class = format!("SQL$DEFAULT{}", gen::bump(file, page_size, id, 1)?);
@@ -7384,7 +7390,7 @@ fn next_default_class(file: &mut Vec<u8>, page_size: usize) -> Result<String, St
 
 /// A system generator's id by name - the counters the DDL draws names
 /// from live in `RDB$GENERATORS` like any other.
-fn generator_id_by_name(file: &[u8], page_size: usize, name: &str) -> Option<i64> {
+fn generator_id_by_name(file: &crate::Image, page_size: usize, name: &str) -> Option<i64> {
     find_generator(file, page_size, name).map(|(id, _, _)| id)
 }
 
@@ -7399,7 +7405,7 @@ fn generator_id_by_name(file: &[u8], page_size: usize, name: &str) -> Option<i64
 /// dropped sequence leaves its last value behind as garbage, and the
 /// next `CREATE SEQUENCE` takes a fresh id from the master generator
 /// rather than reusing the hole.
-pub fn drop_sequence(file: &mut Vec<u8>, page_size: usize, name: &str) -> Result<(), String> {
+pub fn drop_sequence(file: &mut crate::Image, page_size: usize, name: &str) -> Result<(), String> {
     let want = name.trim().trim_matches('"').to_ascii_uppercase();
     let (_, system, class) = find_generator(file, page_size, &want)
         .ok_or_else(|| format!("generator {} is not defined", want))?;
@@ -7436,7 +7442,7 @@ pub fn drop_sequence(file: &mut Vec<u8>, page_size: usize, name: &str) -> Result
 /// RDB$SECURITY_CLASS)` from `RDB$EXCEPTIONS`, by name. None when there is
 /// no such exception.
 fn find_exception(
-    file: &[u8],
+    file: &crate::Image,
     page_size: usize,
     name: &str,
 ) -> Option<(i64, i64, Option<String>)> {
@@ -7482,7 +7488,7 @@ fn find_exception(
 /// only writes those rows for the dependencies it tracks, so a
 /// body-to-body call it never recorded cannot be caught here, a
 /// recorded boundary).
-pub fn drop_procedure(file: &mut Vec<u8>, page_size: usize, name: &str) -> Result<(), String> {
+pub fn drop_procedure(file: &mut crate::Image, page_size: usize, name: &str) -> Result<(), String> {
     let want = name.trim().trim_matches('"').to_ascii_uppercase();
     // the row, and its parameter domains, gathered before anything is
     // deleted
@@ -7634,7 +7640,7 @@ pub struct ProcParamDef {
 /// this stores.
 #[allow(clippy::too_many_arguments)]
 pub fn create_procedure(
-    file: &mut Vec<u8>,
+    file: &mut crate::Image,
     page_size: usize,
     name: &str,
     ins: &[ProcParamDef],
@@ -7768,7 +7774,7 @@ pub fn create_procedure(
 /// owner's USAGE grant (object type 7, `obj_exception`). Unlike a
 /// sequence there is no value of its own to store.
 pub fn create_exception(
-    file: &mut Vec<u8>,
+    file: &mut crate::Image,
     page_size: usize,
     name: &str,
     message: &str,
@@ -7811,7 +7817,7 @@ pub fn create_exception(
 /// alter arm: the message is rewritten in place, the number and security
 /// class untouched. The exception must exist ("Exception not found").
 pub fn alter_exception(
-    file: &mut Vec<u8>,
+    file: &mut crate::Image,
     page_size: usize,
     name: &str,
     message: &str,
@@ -7838,7 +7844,7 @@ pub fn alter_exception(
 /// `CREATE OR ALTER EXCEPTION <name> <message>`: alter it if it exists
 /// (keeping its number and class), otherwise create it.
 pub fn create_or_alter_exception(
-    file: &mut Vec<u8>,
+    file: &mut crate::Image,
     page_size: usize,
     name: &str,
     message: &str,
@@ -7856,7 +7862,7 @@ pub fn create_or_alter_exception(
 /// owner's privilege all go (an engine probe: after the drop the
 /// `SQL$<n>` class row is gone, no orphan). The number counter is not
 /// rewound - the next exception takes the following number.
-pub fn drop_exception(file: &mut Vec<u8>, page_size: usize, name: &str) -> Result<(), String> {
+pub fn drop_exception(file: &mut crate::Image, page_size: usize, name: &str) -> Result<(), String> {
     let want = name.trim().trim_matches('"').to_ascii_uppercase();
     let (_, system, class) = find_exception(file, page_size, &want)
         .ok_or_else(|| format!("Exception {} not found", want))?;
@@ -7888,7 +7894,7 @@ pub fn drop_exception(file: &mut Vec<u8>, page_size: usize, name: &str) -> Resul
 
 /// A role's `(RDB$SYSTEM_FLAG, RDB$SECURITY_CLASS)` from `RDB$ROLES`, by
 /// name. None when there is no such role.
-fn find_role(file: &[u8], page_size: usize, name: &str) -> Option<(i64, Option<String>)> {
+fn find_role(file: &crate::Image, page_size: usize, name: &str) -> Option<(i64, Option<String>)> {
     let rel = crate::resolve_relation(file, page_size, "RDB$ROLES")?;
     let formats = system_relation_formats(file, page_size, "RDB$ROLES")?;
     let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
@@ -7928,7 +7934,7 @@ fn find_role(file: &[u8], page_size: usize, name: &str) -> Option<(i64, Option<S
 /// and CREATE ROLE writes it as eight ZERO bytes (an empty system-privilege
 /// bitmask) - not NULL, and not the spaces a text CHAR would pad with, so
 /// it needs [SysVal::O].
-pub fn create_role(file: &mut Vec<u8>, page_size: usize, name: &str) -> Result<(), String> {
+pub fn create_role(file: &mut crate::Image, page_size: usize, name: &str) -> Result<(), String> {
     let want = name.trim().trim_matches('"').to_ascii_uppercase();
     if want.is_empty() {
         return Err("a role needs a name".into());
@@ -7958,7 +7964,7 @@ pub fn create_role(file: &mut Vec<u8>, page_size: usize, name: &str) -> Result<(
 /// `DROP ROLE <name>` - `DropRoleNode`. The row and its security class go
 /// (an engine probe: after the drop the `SQL$<n>` class is gone, no
 /// orphan); a role owns no privileges of its own to remove.
-pub fn drop_role(file: &mut Vec<u8>, page_size: usize, name: &str) -> Result<(), String> {
+pub fn drop_role(file: &mut crate::Image, page_size: usize, name: &str) -> Result<(), String> {
     let want = name.trim().trim_matches('"').to_ascii_uppercase();
     let (system, class) = find_role(file, page_size, &want)
         .ok_or_else(|| format!("Role {} not found", want))?;
@@ -7990,12 +7996,14 @@ pub fn drop_role(file: &mut Vec<u8>, page_size: usize, name: &str) -> Result<(),
 /// records; attach was re-verified fine without this) - but leaving
 /// OIT a dozen transactions behind next would misrepresent a cleanly
 /// closed database and make every attach start with catch-up work.
-fn advance_oldest_transactions(file: &mut Vec<u8>, page_size: usize) -> Result<(), String> {
+fn advance_oldest_transactions(file: &mut crate::Image, page_size: usize) -> Result<(), String> {
     let t1 = dml::allocate_committed_tx(file, page_size)?;
     let t2 = dml::allocate_committed_tx(file, page_size)?;
     let _ = t2;
-    let put = |file: &mut Vec<u8>, at: usize, v: u64| {
-        file[at..at + 8].copy_from_slice(&v.to_le_bytes());
+    let put = |file: &mut crate::Image, at: usize, v: u64| {
+        if let Some(hdr) = crate::page_mut(file, page_size, 0) {
+            hdr[at..at + 8].copy_from_slice(&v.to_le_bytes());
+        }
     };
     put(file, 48, t1); // hdr_oldest_transaction @48
     put(file, 56, t2); // hdr_oldest_active @56

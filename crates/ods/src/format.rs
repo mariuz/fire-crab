@@ -444,7 +444,7 @@ pub fn max_recs_per_dp(page_size: usize) -> u64 {
 /// Locate a record by its 40-bit record number: number -> (data page
 /// sequence, line) -> page via the relation's pointer pages.
 pub fn locate_record<'a>(
-    file: &'a [u8],
+    file: &'a crate::Image,
     page_size: usize,
     relation: u16,
     recno: u64,
@@ -463,7 +463,7 @@ pub fn locate_record<'a>(
 /// `u16 length` prefixes inside the data stream; `segmented = true`
 /// strips them, concatenating segment payloads like BLB_get_data.
 pub fn read_blob(
-    file: &[u8],
+    file: &crate::Image,
     page_size: usize,
     relation: u16,
     recno: u64,
@@ -527,7 +527,7 @@ pub fn read_blob(
 /// stream-mode blobs (`rhd_stream_blob`, ods.h:1012 - `blh_flags`
 /// aliases the record flags word) are raw bytes.
 pub fn read_blob_content(
-    file: &[u8],
+    file: &crate::Image,
     page_size: usize,
     relation: u16,
     recno: u64,
@@ -547,7 +547,7 @@ pub fn read_blob_content(
 /// RDB$FORMATS using its hardcoded system format, then parse each
 /// descriptor blob. Returns matches for `relation`.
 pub fn relation_formats(
-    file: &[u8],
+    file: &crate::Image,
     page_size: usize,
     relation: u16,
 ) -> Vec<(u8, Vec<Descriptor>)> {

@@ -54,9 +54,10 @@ fn main() {
     }
     let naive = args.get(6).map(|a| a == "naive").unwrap_or(false);
     let run = || -> Result<(), String> {
-        let before = std::fs::read(&args[2]).map_err(|e| e.to_string())?;
+        let raw = std::fs::read(&args[2]).map_err(|e| e.to_string())?;
         let page_size =
-            fire_crab_ods::tra::page_size_of(&before).ok_or("cannot read the page size")?;
+            fire_crab_ods::tra::page_size_of(&raw).ok_or("cannot read the page size")?;
+        let before = fire_crab_ods::Image::from_bytes(&raw, page_size);
         let workload = args[4].as_str();
         let n: usize = args[5].parse().map_err(|_| "n is not a number")?;
 

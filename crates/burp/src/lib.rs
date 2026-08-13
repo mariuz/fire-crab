@@ -245,7 +245,7 @@ pub struct Refused(pub String);
 /// carried in the header attributes exactly as gbak carries them;
 /// `now_secs` stamps the backup date.
 pub fn write_backup(
-    image: &[u8],
+    image: &fire_crab_ods::Image,
     page_size: usize,
     db_path: &str,
     fbk_path: &str,
@@ -266,14 +266,16 @@ pub fn write_backup(
 /// records, so no privilege lines - the one difference from the
 /// engine's stream on the same source, and the gate's recorded filter.
 pub fn write_backup_verbose(
-    image: &[u8],
+    image: &fire_crab_ods::Image,
     page_size: usize,
     db_path: &str,
     fbk_path: &str,
     now_secs: i64,
     log: &mut Vec<String>,
 ) -> Result<Vec<u8>, Refused> {
-    let head = fire_crab_ods::header::HeaderPage::decode(image)
+    let head = image
+        .page(0)
+        .and_then(fire_crab_ods::header::HeaderPage::decode)
         .ok_or_else(|| Refused("not a database image".into()))?;
 
     // THE SURFACE CHECK, first and fail-closed: anything present that
@@ -704,7 +706,7 @@ struct UCons {
 
 /// The user constraints, typed: PRIMARY KEY rides the file, NOT NULL is
 /// carried separately, and anything else refuses the backup whole.
-fn read_constraints(image: &[u8], page_size: usize) -> Result<Vec<UCons>, Refused> {
+fn read_constraints(image: &fire_crab_ods::Image, page_size: usize) -> Result<Vec<UCons>, Refused> {
     let Some((cols, rows)) = sys_rows(image, page_size, "RDB$RELATION_CONSTRAINTS") else {
         return Ok(Vec::new());
     };
@@ -788,7 +790,7 @@ fn read_constraints(image: &[u8], page_size: usize) -> Result<Vec<UCons>, Refuse
 /// The user indexes with their segments, key order preserved. An FK
 /// index or an inactive one refuses - both are states this file format
 /// slice cannot say.
-fn read_indexes(image: &[u8], page_size: usize) -> Result<Vec<UIndex>, Refused> {
+fn read_indexes(image: &fire_crab_ods::Image, page_size: usize) -> Result<Vec<UIndex>, Refused> {
     let Some((cols, rows)) = sys_rows(image, page_size, "RDB$INDICES") else {
         return Ok(Vec::new());
     };
@@ -864,7 +866,7 @@ fn read_indexes(image: &[u8], page_size: usize) -> Result<Vec<UIndex>, Refused> 
 
 /// The NOT NULL columns of one relation - RDB$RELATION_FIELDS rows
 /// whose RDB$NULL_FLAG is 1, matched by name.
-fn not_null_columns(image: &[u8], page_size: usize, rel_name: &str) -> Vec<String> {
+fn not_null_columns(image: &fire_crab_ods::Image, page_size: usize, rel_name: &str) -> Vec<String> {
     let Some((cols, rows)) = sys_rows(image, page_size, "RDB$RELATION_FIELDS") else {
         return Vec::new();
     };
@@ -891,7 +893,7 @@ fn not_null_columns(image: &[u8], page_size: usize, rel_name: &str) -> Vec<Strin
 /// A system relation's rows plus its column-name -> value-index map -
 /// what every surface check reads.
 fn sys_rows(
-    image: &[u8],
+    image: &fire_crab_ods::Image,
     page_size: usize,
     rel_name: &str,
 ) -> Option<(Vec<(String, usize)>, Vec<fire_crab_ods::tra::VisibleRow>)> {
@@ -914,7 +916,7 @@ fn sys_rows(
 
 /// USER rows in a system relation: rows whose RDB$SYSTEM_FLAG is 0 or
 /// NULL. What the surface checks count.
-fn user_rows_in(image: &[u8], page_size: usize, rel_name: &str) -> u64 {
+fn user_rows_in(image: &fire_crab_ods::Image, page_size: usize, rel_name: &str) -> u64 {
     let Some((cols, rows)) = sys_rows(image, page_size, rel_name) else {
         return 0;
     };
@@ -936,7 +938,7 @@ fn user_rows_in(image: &[u8], page_size: usize, rel_name: &str) -> u64 {
 /// backup (its "rows" are a query, and writing it as a table would
 /// restore a table where a view was - the right rows today, the wrong
 /// database from then on).
-fn user_tables(image: &[u8], page_size: usize) -> Result<Vec<(u16, String)>, Refused> {
+fn user_tables(image: &fire_crab_ods::Image, page_size: usize) -> Result<Vec<(u16, String)>, Refused> {
     let Some((cols, rows)) = sys_rows(image, page_size, "RDB$RELATIONS") else {
         return Err(Refused("RDB$RELATIONS is unreadable".into()));
     };

@@ -125,14 +125,14 @@ pub struct SharedImage {
     /// the old one (a metadata cache, say) is about a database that is
     /// no longer there
     epoch: AtomicU64,
-    image: Mutex<Arc<Vec<u8>>>,
+    image: Mutex<Arc<fire_crab_ods::Image>>,
     /// the image as it is ON DISK - what a careful flush must diff
     /// against, since an install that is not itself flushed leaves its
     /// pages dirty for the next one to write. Diffing against the
     /// CURRENT image instead loses them: they are equal in both halves
     /// of that comparison, so the flush finds nothing changed and the
     /// pages never reach the file.
-    flushed: Mutex<Arc<Vec<u8>>>,
+    flushed: Mutex<Arc<fire_crab_ods::Image>>,
     disk: Mutex<Option<Fingerprint>>,
     write: Mutex<WriteState>,
     wake: Condvar,
@@ -151,7 +151,7 @@ impl SharedImage {
     /// The image as it stands now. Reference counted, so the caller
     /// reads it without holding any lock and a writer installing a new
     /// one does not disturb it.
-    pub fn image(&self) -> Arc<Vec<u8>> {
+    pub fn image(&self) -> Arc<fire_crab_ods::Image> {
         lock(&self.image).clone()
     }
 
@@ -170,8 +170,8 @@ impl SharedImage {
     /// Install a new image. The caller must hold the write token: this
     /// is the second half of a read-modify-write that started with
     /// [`SharedImage::image`].
-    pub fn publish(&self, bytes: Vec<u8>) -> Arc<Vec<u8>> {
-        let arc = Arc::new(bytes);
+    pub fn publish(&self, img: fire_crab_ods::Image) -> Arc<fire_crab_ods::Image> {
+        let arc = Arc::new(img);
         self.publish_image(Arc::clone(&arc));
         arc
     }
@@ -183,19 +183,19 @@ impl SharedImage {
     /// many installs follow, which is what makes a SNAPSHOT free: the
     /// transaction that may need to put the file back keeps a reference
     /// rather than a copy, and putting it back is this call.
-    pub fn publish_image(&self, img: Arc<Vec<u8>>) {
+    pub fn publish_image(&self, img: Arc<fire_crab_ods::Image>) {
         *lock(&self.image) = img;
         stats().publishes.fetch_add(1, Ordering::Relaxed);
     }
 
     /// The image as it stands ON DISK - the baseline for the next
     /// careful flush.
-    pub fn flushed(&self) -> Arc<Vec<u8>> {
+    pub fn flushed(&self) -> Arc<fire_crab_ods::Image> {
         lock(&self.flushed).clone()
     }
 
     /// Record that `img` is what the file now holds.
-    pub fn note_flushed(&self, img: Arc<Vec<u8>>) {
+    pub fn note_flushed(&self, img: Arc<fire_crab_ods::Image>) {
         *lock(&self.flushed) = img;
     }
 
@@ -306,16 +306,19 @@ pub fn open(path: &str) -> Option<Arc<SharedImage>> {
         // re-create the same path against a running server; the engine
         // itself writes these files too. A resident image that no
         // longer matches its file is re-read, not served.
-        let bytes = std::fs::read(path).ok()?;
+        let raw = std::fs::read(path).ok()?;
+        let ps = fire_crab_ods::tra::page_size_of(&raw)?;
         stats().reloads.fetch_add(1, Ordering::Relaxed);
         sh.epoch.fetch_add(1, Ordering::Relaxed);
-        let arc = Arc::new(bytes);
+        let arc = Arc::new(fire_crab_ods::Image::from_bytes(&raw, ps));
         *lock(&sh.image) = Arc::clone(&arc);
         *lock(&sh.flushed) = arc;
         *lock(&sh.disk) = fp;
         return Some(Arc::clone(sh));
     }
-    let bytes = Arc::new(std::fs::read(path).ok()?);
+    let raw = std::fs::read(path).ok()?;
+    let ps = fire_crab_ods::tra::page_size_of(&raw)?;
+    let bytes = Arc::new(fire_crab_ods::Image::from_bytes(&raw, ps));
     let sh = Arc::new(SharedImage {
         path: path.to_string(),
         epoch: AtomicU64::new(0),
@@ -334,7 +337,8 @@ pub fn open(path: &str) -> Option<Arc<SharedImage>> {
 /// a database-shaped value without a database - the row-source tree's
 /// tests reach one only to prove they never touch it.
 pub fn detached(bytes: Vec<u8>) -> Arc<SharedImage> {
-    let arc = Arc::new(bytes);
+    let ps = fire_crab_ods::tra::page_size_of(&bytes).unwrap_or(0);
+    let arc = Arc::new(fire_crab_ods::Image::from_bytes(&bytes, ps));
     Arc::new(SharedImage {
         path: String::new(),
         epoch: AtomicU64::new(0),
