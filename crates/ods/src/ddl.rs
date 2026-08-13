@@ -4281,13 +4281,14 @@ fn mark_index_slot_dropped(
     let irt_page = file
         .chunks_exact(page_size)
         .position(|p| p[0] == 6 && u16_at(p, 16) == rel)
-        .ok_or("relation has no index root page")?;
-    let at = irt_page * page_size + 24 + slot * 24;
-    if at + 24 > file.len() {
+        .ok_or("relation has no index root page")? as u32;
+    let page = crate::page_mut(file, page_size, irt_page).ok_or("irt page out of range")?;
+    let at = 24 + slot * 24;
+    if at + 24 > page.len() {
         return Err("index slot beyond the root page".into());
     }
-    dml::put_u16(file, at + 18, 0); // irt_flags
-    file[at + 20] = 6; // irt_drop (ods.h:456)
+    dml::put_u16(page, at + 18, 0); // irt_flags
+    page[at + 20] = 6; // irt_drop (ods.h:456)
     Ok(())
 }
 
@@ -4517,9 +4518,10 @@ fn deferred_drop_index(
     let irt_page = file
         .chunks_exact(page_size)
         .position(|p| p[0] == 6 && u16_at(p, 16) == rel)
-        .ok_or("relation has no index root page")?;
-    let at = irt_page * page_size + 24 + index_id.saturating_sub(1) * 24;
-    if at + 24 > file.len() {
+        .ok_or("relation has no index root page")? as u32;
+    let page = crate::page_mut(file, page_size, irt_page).ok_or("irt page out of range")?;
+    let at = 24 + index_id.saturating_sub(1) * 24;
+    if at + 24 > page.len() {
         return Err("index slot beyond the root page".into());
     }
     // irt_drop (6) with the flags cleared: the SETTLED shape an
@@ -4530,8 +4532,8 @@ fn deferred_drop_index(
     // already committed when it returns, so the settled state is the
     // honest one - and it is the one gfix validates as clean, since a
     // state-5 index is still scanned while its segment rows are gone
-    dml::put_u16(file, at + 18, 0); // irt_flags
-    file[at + 20] = 6; // irt_drop (ods.h:456)
+    dml::put_u16(page, at + 18, 0); // irt_flags
+    page[at + 20] = 6; // irt_drop (ods.h:456)
     Ok(())
 }
 
@@ -5865,15 +5867,17 @@ fn write_index_statistics(
     let irt_page = file
         .chunks_exact(page_size)
         .position(|p| p[0] == 6 && u16_at(p, 16) == rel)
-        .ok_or("relation has no index root page")?;
-    let base = irt_page * page_size;
-    let at = base + 24 + slot * 24;
-    let desc_off = u16_at(file, at + 16) as usize;
-    for (i, sel) in selectivity.iter().enumerate() {
-        let d = base + desc_off + i * 8 + 4;
-        file.get_mut(d..d + 4)
-            .ok_or("segment descriptor beyond the root page")?
-            .copy_from_slice(&sel.to_le_bytes());
+        .ok_or("relation has no index root page")? as u32;
+    {
+        let page = crate::page_mut(file, page_size, irt_page).ok_or("irt page out of range")?;
+        let at = 24 + slot * 24;
+        let desc_off = u16_at(page, at + 16) as usize;
+        for (i, sel) in selectivity.iter().enumerate() {
+            let d = desc_off + i * 8 + 4;
+            page.get_mut(d..d + 4)
+                .ok_or("segment descriptor beyond the root page")?
+                .copy_from_slice(&sel.to_le_bytes());
+        }
     }
     let seg_name = sys_fid(file, page_size, "RDB$INDEX_SEGMENTS", "RDB$INDEX_NAME")?;
     let seg_pos = sys_fid(file, page_size, "RDB$INDEX_SEGMENTS", "RDB$FIELD_POSITION")?;

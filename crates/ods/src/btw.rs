@@ -949,11 +949,10 @@ pub fn index_segment(
     rel: u16,
     index_id: u8,
 ) -> Option<(u16, u16, u16)> {
-    let start = file
+    let irt_page = file
         .chunks_exact(page_size)
-        .position(|p| p[0] == PageType::IndexRoot as u8 && u16_at(p, 16) == rel)?
-        * page_size;
-    let page = &file[start..start + page_size];
+        .position(|p| p[0] == PageType::IndexRoot as u8 && u16_at(p, 16) == rel)? as u32;
+    let page = crate::page_at(file, page_size, irt_page)?;
     PageHeader::decode(page)?;
     let entry_at = 24 + index_id as usize * 24;
     let desc_off = u16_at(page, entry_at + 16) as usize; // irt_desc @16
@@ -976,11 +975,10 @@ pub fn index_segments(
     index_id: u8,
     count: usize,
 ) -> Option<(Vec<(u16, u16)>, u16)> {
-    let start = file
+    let irt_page = file
         .chunks_exact(page_size)
-        .position(|p| p[0] == PageType::IndexRoot as u8 && u16_at(p, 16) == rel)?
-        * page_size;
-    let page = &file[start..start + page_size];
+        .position(|p| p[0] == PageType::IndexRoot as u8 && u16_at(p, 16) == rel)? as u32;
+    let page = crate::page_at(file, page_size, irt_page)?;
     PageHeader::decode(page)?;
     let entry_at = 24 + index_id as usize * 24;
     let desc_off = u16_at(page, entry_at + 16) as usize; // irt_desc @16
