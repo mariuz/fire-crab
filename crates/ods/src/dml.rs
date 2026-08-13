@@ -657,27 +657,29 @@ pub fn patch_head_in_place(
     slot: u16,
     pokes: &[(usize, Vec<u8>)],
 ) -> Result<(), String> {
-    let base = (page_no as usize)
-        .checked_mul(page_size)
-        .ok_or("page number out of range")?;
-    let dir = base + DPG_RPT_OFFSET + slot as usize * 4;
-    if dir + 4 > file.len() {
-        return Err("slot directory beyond the file".into());
-    }
-    let (off, len) = (u16_at(file, dir) as usize, u16_at(file, dir + 2) as usize);
-    if len == 0 || base + off + len > file.len() {
-        return Err("target slot is empty or corrupt".into());
-    }
-    let rflags = u16_at(file, base + off + 10);
-    if rflags & flags::INCOMPLETE == 0 {
-        return Err("not a fragmented record - use the ordinary update path".into());
-    }
+    let dir = DPG_RPT_OFFSET + slot as usize * 4; // page-local
     // the head's payload starts at RHDF_DATA_OFFSET, not RHD's 13
     let data_at = crate::data::RHDF_DATA_OFFSET;
-    if len < data_at {
-        return Err("fragmented head shorter than its own header".into());
-    }
-    let packed = file[base + off + data_at..base + off + len].to_vec();
+    // read the slot entry and the head's packed payload off ITS page; the
+    // payload is cloned out, so the read borrow drops before the repack
+    let (off, len, rflags, packed) = {
+        let page = crate::page_at(file, page_size, page_no).ok_or("page number out of range")?;
+        if dir + 4 > page.len() {
+            return Err("slot directory beyond the file".into());
+        }
+        let (off, len) = (u16_at(page, dir) as usize, u16_at(page, dir + 2) as usize);
+        if len == 0 || off + len > page.len() {
+            return Err("target slot is empty or corrupt".into());
+        }
+        let rflags = u16_at(page, off + 10);
+        if rflags & flags::INCOMPLETE == 0 {
+            return Err("not a fragmented record - use the ordinary update path".into());
+        }
+        if len < data_at {
+            return Err("fragmented head shorter than its own header".into());
+        }
+        (off, len, rflags, page[off + data_at..off + len].to_vec())
+    };
     let mut head = if rflags & flags::NOT_PACKED != 0 {
         packed.clone()
     } else {
@@ -713,15 +715,16 @@ pub fn patch_head_in_place(
                 .into(),
         );
     }
-    let start = base + off + data_at;
-    file[start..start + repacked.len()].copy_from_slice(&repacked);
+    let page = crate::page_mut(file, page_size, page_no).ok_or("page number out of range")?;
+    let start = off + data_at; // page-local
+    page[start..start + repacked.len()].copy_from_slice(&repacked);
     // zero the remainder of the old body so no stale bytes remain inside
     // the record's own extent
-    for b in file[start + repacked.len()..base + off + len].iter_mut() {
+    for b in page[start + repacked.len()..off + len].iter_mut() {
         *b = 0;
     }
     // and shorten the directory entry to what the record now occupies
-    put_u16(file, dir + 2, (data_at + repacked.len()) as u16);
+    put_u16(page, dir + 2, (data_at + repacked.len()) as u16);
     Ok(())
 }
 
