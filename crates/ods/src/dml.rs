@@ -506,19 +506,19 @@ pub(crate) fn release_page(file: &mut [u8], page_size: usize, page_no: u32) -> R
     if page_no as usize >= per_pip {
         return Err("page beyond the first PIP".into());
     }
-    let base = page_size; // PIP 0 is page 1
-    let bit = base + PIP_BITS_OFFSET + page_no as usize / 8;
+    // every field is on PIP 0 (page 1); page-local offsets
+    let pip = crate::page_mut(file, page_size, 1).ok_or("no PIP page")?;
+    let bit = PIP_BITS_OFFSET + page_no as usize / 8;
     let mask = 1u8 << (page_no % 8);
-    if file[bit] & mask != 0 {
+    if pip[bit] & mask != 0 {
         return Ok(()); // already free
     }
-    file[bit] |= mask; // set = FREE (ods.h:753)
-    let used_at = base + 24; // pip_used @24
-    let used = u32_at(file, used_at);
-    put_u32(file, used_at, used.saturating_sub(1));
-    let min_at = base + 16; // pip_min @16
-    if u32_at(file, min_at) > page_no {
-        put_u32(file, min_at, page_no);
+    pip[bit] |= mask; // set = FREE (ods.h:753)
+    let used = u32_at(pip, 24); // pip_used @24
+    put_u32(pip, 24, used.saturating_sub(1));
+    if u32_at(pip, 16) > page_no {
+        // pip_min @16
+        put_u32(pip, 16, page_no);
     }
     Ok(())
 }
