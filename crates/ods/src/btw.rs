@@ -500,8 +500,7 @@ struct PageContent {
 }
 
 fn load_page(file: &[u8], page_size: usize, no: u32) -> Option<BtreePage<'_>> {
-    let start = no as usize * page_size;
-    file.get(start..start + page_size).and_then(BtreePage::decode)
+    crate::page_at(file, page_size, no).and_then(BtreePage::decode)
 }
 
 /// Decode a page's full node list (keys prefix-decompressed).
@@ -726,9 +725,7 @@ fn recno_is_live(file: &[u8], page_size: usize, rel: u16, recno: u64) -> bool {
     let seq = (recno / recs) as u32;
     let slot = (recno % recs) as u16;
     for dp_no in crate::pointer::relation_data_pages(file, page_size, rel) {
-        let start = dp_no as usize * page_size;
-        let Some(dp) = file
-            .get(start..start + page_size)
+        let Some(dp) = crate::page_at(file, page_size, dp_no)
             .and_then(crate::data::DataPage::decode)
         else {
             continue;

@@ -266,8 +266,7 @@ fn walk_rows(
     mut cb: impl FnMut(&[Value]),
 ) {
     for dp_no in relation_data_pages(file, page_size, rel) {
-        let start = dp_no as usize * page_size;
-        let Some(dp) = file.get(start..start + page_size).and_then(DataPage::decode) else {
+        let Some(dp) = crate::page_at(file, page_size, dp_no).and_then(DataPage::decode) else {
             continue;
         };
         for r in dp.records() {
@@ -618,9 +617,7 @@ fn find_sys_row_slot(
     let formats = system_relation_formats(file, page_size, rel_name)?;
     let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
     for dp_no in relation_data_pages(file, page_size, rel) {
-        let start = dp_no as usize * page_size;
-        let dp = file
-            .get(start..start + page_size)
+        let dp = crate::page_at(file, page_size, dp_no)
             .and_then(DataPage::decode)?;
         for r in dp.records() {
             if !r.is_primary_record() {
@@ -650,9 +647,7 @@ fn find_relations_row(
         .find(|c| c.name == "RDB$RELATION_NAME")
         .map(|c| c.field_id as usize)?;
     for dp_no in relation_data_pages(file, page_size, 6) {
-        let start = dp_no as usize * page_size;
-        let dp = file
-            .get(start..start + page_size)
+        let dp = crate::page_at(file, page_size, dp_no)
             .and_then(DataPage::decode)?;
         for r in dp.records() {
             if !r.is_primary_record() {
@@ -1122,8 +1117,7 @@ pub fn rename_domain(
         .ok_or("no RDB$FIELD_NAME")?;
     let mut hit: Option<(u32, u16, Vec<u8>, u8)> = None;
     for dp_no in relation_data_pages(file, page_size, 2) {
-        let start = dp_no as usize * page_size;
-        let Some(dp) = file.get(start..start + page_size).and_then(DataPage::decode) else {
+        let Some(dp) = crate::page_at(file, page_size, dp_no).and_then(DataPage::decode) else {
             continue;
         };
         for r in dp.records() {
@@ -1171,8 +1165,7 @@ pub fn rename_domain(
     let mut patches: Vec<(u32, u16, Vec<u8>, u8)> = Vec::new();
     let mut tables: Vec<String> = Vec::new();
     for dp_no in relation_data_pages(file, page_size, 5) {
-        let start = dp_no as usize * page_size;
-        let Some(dp) = file.get(start..start + page_size).and_then(DataPage::decode) else {
+        let Some(dp) = crate::page_at(file, page_size, dp_no).and_then(DataPage::decode) else {
             continue;
         };
         for r in dp.records() {
@@ -1792,8 +1785,7 @@ pub fn alter_domain_type(
         (*n, d.clone())
     };
     let mut f_image = {
-        let start = fpage as usize * page_size;
-        let dp = DataPage::decode(file.get(start..start + page_size).ok_or("bad page")?)
+        let dp = DataPage::decode(crate::page_at(file, page_size, fpage).ok_or("bad page")?)
             .ok_or("bad data page")?;
         dp.record(fslot)
             .and_then(|r| r.image())
@@ -2296,8 +2288,7 @@ pub fn alter_table_alter_column_type(
         (*n, d.clone())
     };
     let mut f_image = {
-        let start = fpage as usize * page_size;
-        let dp = DataPage::decode(file.get(start..start + page_size).ok_or("bad page")?)
+        let dp = DataPage::decode(crate::page_at(file, page_size, fpage).ok_or("bad page")?)
             .ok_or("bad data page")?;
         // `image()`, NOT `assembled_image` - ON PURPOSE. This reads a
         // record it is about to REWRITE IN PLACE, and a fragmented one
@@ -2672,8 +2663,7 @@ pub fn alter_column_position(
 fn column_has_nulls(file: &[u8], page_size: usize, rel: u16, fid: usize) -> bool {
     let formats = crate::relation_formats(file, page_size, rel);
     for dp_no in relation_data_pages(file, page_size, rel) {
-        let start = dp_no as usize * page_size;
-        let Some(dp) = file.get(start..start + page_size).and_then(DataPage::decode) else {
+        let Some(dp) = crate::page_at(file, page_size, dp_no).and_then(DataPage::decode) else {
             continue;
         };
         for r in dp.records() {
@@ -2726,8 +2716,7 @@ fn patch_rf_null_flag(
     let (page, slot) = find_sys_row_slot(file, page_size, "RDB$RELATION_FIELDS", 5, pred)
         .ok_or("RDB$RELATION_FIELDS row not found")?;
     let mut image = {
-        let start = page as usize * page_size;
-        let dp = DataPage::decode(file.get(start..start + page_size).ok_or("bad page")?)
+        let dp = DataPage::decode(crate::page_at(file, page_size, page).ok_or("bad page")?)
             .ok_or("bad data page")?;
         dp.record(slot).and_then(|r| r.image()).ok_or("no field image")?
     };
@@ -4473,8 +4462,7 @@ fn deferred_drop_index(
     })
     .ok_or_else(|| format!("index {} not found", index_name))?;
     let mut image = {
-        let start = page as usize * page_size;
-        let dp = DataPage::decode(file.get(start..start + page_size).ok_or("bad page")?)
+        let dp = DataPage::decode(crate::page_at(file, page_size, page).ok_or("bad page")?)
             .ok_or("bad data page")?;
         dp.record(slot).and_then(|r| r.image()).ok_or("no index image")?
     };
@@ -5351,11 +5339,10 @@ fn backfill_index(
 ) -> Result<(), String> {
     let recs = max_recs_per_dp(page_size);
     for dp_no in relation_data_pages(file, page_size, rel) {
-        let start = dp_no as usize * page_size;
-        let Some(dp) = file.get(start..start + page_size).and_then(DataPage::decode) else {
+        let Some(dp) = crate::page_at(file, page_size, dp_no).and_then(DataPage::decode) else {
             continue;
         };
-        let seq = u32_at(file, start + 16) as u64;
+        let seq = dp.sequence as u64;
         let rows: Vec<(u16, Vec<Value>)> = dp
             .records()
             .filter(|r| r.is_primary_record())
@@ -5406,8 +5393,7 @@ fn walk_rows_at(
     mut cb: impl FnMut(u32, u16, &[Value]),
 ) {
     for dp_no in relation_data_pages(file, page_size, rel) {
-        let start = dp_no as usize * page_size;
-        let Some(dp) = file.get(start..start + page_size).and_then(DataPage::decode) else {
+        let Some(dp) = crate::page_at(file, page_size, dp_no).and_then(DataPage::decode) else {
             continue;
         };
         for r in dp.records() {
@@ -5565,8 +5551,7 @@ pub fn drop_table(file: &mut Vec<u8>, page_size: usize, name: &str) -> Result<()
     let mut pages: Vec<u32> = Vec::new();
     let data_pages = relation_data_pages(file, page_size, rel);
     for &dp_no in &data_pages {
-        let start = dp_no as usize * page_size;
-        if let Some(dp) = file.get(start..start + page_size).and_then(DataPage::decode) {
+        if let Some(dp) = crate::page_at(file, page_size, dp_no).and_then(DataPage::decode) {
             for i in 0..dp.count {
                 let Some(b) = dp.slot_bytes(i) else { continue };
                 if b.len() >= 28 && u16_at(b, 10) & crate::data::flags::BLOB != 0 && b[27] == 1 {
@@ -5728,8 +5713,7 @@ fn patch_sys_row(
     // so it has been latent rather than absent - and it is reachable on
     // ORDINARY rows, nothing to do with fragmentation.
     let (mut image, format_no, fragmented) = {
-        let start = page as usize * page_size;
-        let dp = DataPage::decode(file.get(start..start + page_size).ok_or("bad page")?)
+        let dp = DataPage::decode(crate::page_at(file, page_size, page).ok_or("bad page")?)
             .ok_or("bad data page")?;
         let r = dp.record(slot).ok_or("no row image")?;
         let frag = r.flags & crate::data::flags::INCOMPLETE != 0;
@@ -5816,8 +5800,7 @@ fn index_selectivity(
         vec![std::collections::BTreeSet::new(); segs.len()];
     let mut rows = 0usize;
     for dp_no in relation_data_pages(file, page_size, rel) {
-        let start = dp_no as usize * page_size;
-        let Some(dp) = file.get(start..start + page_size).and_then(DataPage::decode) else {
+        let Some(dp) = crate::page_at(file, page_size, dp_no).and_then(DataPage::decode) else {
             continue;
         };
         for r in dp.records() {
