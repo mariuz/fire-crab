@@ -552,10 +552,11 @@ pub fn sweep(
     // engine lands oldest-active and oldest-snapshot at next and
     // oldest-transaction just below it (its own sweep transaction);
     // this server burns no id, so all three land at next
-    let next = crate::u64_at(file, 40);
-    file[48..56].copy_from_slice(&next.to_le_bytes()); // hdr_oldest_transaction
-    file[56..64].copy_from_slice(&next.to_le_bytes()); // hdr_oldest_active
-    file[64..72].copy_from_slice(&next.to_le_bytes()); // hdr_oldest_snapshot
+    let header = crate::page_mut(file, page_size, 0).ok_or("no header page")?;
+    let next = crate::u64_at(header, 40); // hdr_next_transaction @40
+    header[48..56].copy_from_slice(&next.to_le_bytes()); // hdr_oldest_transaction
+    header[56..64].copy_from_slice(&next.to_le_bytes()); // hdr_oldest_active
+    header[64..72].copy_from_slice(&next.to_le_bytes()); // hdr_oldest_snapshot
     Ok(out)
 }
 

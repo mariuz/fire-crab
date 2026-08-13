@@ -47,7 +47,7 @@ use crate::pages::{PageHeader, PageType};
 use crate::pip::{PipPage, PIP_BITS_OFFSET};
 use crate::pointer::relation_data_pages;
 use crate::tip::{TipPage, TIP_TRANSACTIONS_OFFSET};
-use crate::{u16_at, u32_at};
+use crate::{u16_at, u32_at, u64_at};
 
 /// Where an insert landed - reported for tracing and tests.
 #[derive(Debug, PartialEq)]
@@ -145,10 +145,18 @@ pub fn set_tx_state(
 /// The id is `hdr_next_transaction + 1`, and the header is advanced to
 /// it so nobody else reserves the same one.
 pub fn begin_active_tx(file: &mut [u8], page_size: usize) -> Result<u64, String> {
-    let tx = u64::from_le_bytes(file[40..48].try_into().unwrap()) + 1;
+    // hdr_next_transaction @40 lives on the header, page 0
+    let tx = u64_at(
+        crate::page_at(file, page_size, 0).ok_or("no header page")?,
+        40,
+    ) + 1;
     // it must EXIST in the chain before the header claims it
     set_tx_state(file, page_size, tx, crate::tip::TxState::Active)?;
-    put_u64(file, 40, tx);
+    put_u64(
+        crate::page_mut(file, page_size, 0).ok_or("no header page")?,
+        40,
+        tx,
+    );
     Ok(tx)
 }
 
@@ -163,9 +171,17 @@ pub fn begin_active_tx(file: &mut [u8], page_size: usize) -> Result<u64, String>
 /// A user-table write in an open transaction takes [begin_active_tx]
 /// instead and is committed at COMMIT.
 pub(crate) fn allocate_committed_tx(file: &mut [u8], page_size: usize) -> Result<u64, String> {
-    let tx = u64::from_le_bytes(file[40..48].try_into().unwrap()) + 1; // hdr_next_transaction @40
+    // hdr_next_transaction @40 lives on the header, page 0
+    let tx = u64_at(
+        crate::page_at(file, page_size, 0).ok_or("no header page")?,
+        40,
+    ) + 1;
     set_tx_state(file, page_size, tx, crate::tip::TxState::Committed)?;
-    put_u64(file, 40, tx);
+    put_u64(
+        crate::page_mut(file, page_size, 0).ok_or("no header page")?,
+        40,
+        tx,
+    );
     Ok(tx)
 }
 
