@@ -243,7 +243,10 @@ fn write_at_spot(file: &mut [u8], page_size: usize, spot: &Spot, rec: &[u8]) {
 /// `mask` in the fill-bits byte (ods.h:841-853: one byte per slot
 /// after the full page-number vector capacity).
 fn clear_fill_bits(file: &mut [u8], page_size: usize, page_no: u32, mask: u8) {
-    let rel = u16_at(file, page_no as usize * page_size + 20); // dpg_relation @20
+    let rel = u16_at(
+        crate::page_at(file, page_size, page_no).expect("clear_fill_bits: page out of range"),
+        20,
+    ); // dpg_relation @20
     let capacity = data_pages_per_pp(page_size) as usize;
     let pps: Vec<usize> = file
         .chunks_exact(page_size)
@@ -252,10 +255,11 @@ fn clear_fill_bits(file: &mut [u8], page_size: usize, page_no: u32, mask: u8) {
         .map(|(i, _)| i)
         .collect();
     for pp in pps {
-        let base = pp * page_size;
+        let page = crate::page_mut(file, page_size, pp as u32)
+            .expect("clear_fill_bits: pointer page out of range");
         for slot in 0..capacity {
-            if u32_at(file, base + 32 + slot * 4) == page_no {
-                file[base + 32 + capacity * 4 + slot] &= !mask;
+            if u32_at(page, 32 + slot * 4) == page_no {
+                page[32 + capacity * 4 + slot] &= !mask;
                 return;
             }
         }
@@ -447,8 +451,9 @@ fn insert_record_as(
     // a primary record on the page contradicts dpg_secondary ("primary
     // record versions not stored on this page", ods.h:370) - the engine
     // clears it when storing a primary, and gfix -v -full checks
-    let flags_at = spot.page_no as usize * page_size + 1; // pag_flags @1
-    file[flags_at] &= !0x10; // dpg_secondary
+    // dpg_secondary lives in pag_flags @1 on the primary's own page
+    crate::page_mut(file, page_size, spot.page_no)
+        .expect("primary flags page out of range")[1] &= !0x10;
     // ...and the pointer page mirrors it per slot (ppg_dp_secondary)
     clear_fill_bits(file, page_size, spot.page_no, 0x08);
     Ok(InsertOutcome { tx_id: tx, page_no: spot.page_no, slot: spot.slot })

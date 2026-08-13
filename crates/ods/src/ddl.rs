@@ -3050,20 +3050,20 @@ pub fn create_table(
     let pointer_page = dml::allocate_page(file, page_size)?;
     let root_page = dml::allocate_page(file, page_size)?;
     {
-        let base = pointer_page as usize * page_size;
-        file[base..base + page_size].fill(0);
-        file[base] = 4; // pag_pointer
-        file[base + 1] = 1; // pag_flags = ppg_eof (last pointer page)
-        dml::put_u32(file, base + 12, pointer_page); // pag_pageno
-        dml::put_u16(file, base + 26, rel_id_u16); // ppg_relation @26
+        let page = crate::page_mut(file, page_size, pointer_page).expect("pointer page out of range");
+        page.fill(0);
+        page[0] = 4; // pag_pointer
+        page[1] = 1; // pag_flags = ppg_eof (last pointer page)
+        dml::put_u32(page, 12, pointer_page); // pag_pageno
+        dml::put_u16(page, 26, rel_id_u16); // ppg_relation @26
     }
     {
-        let base = root_page as usize * page_size;
-        file[base..base + page_size].fill(0);
-        file[base] = 6; // pag_root
-        dml::put_u32(file, base + 12, root_page); // pag_pageno
-        dml::put_u16(file, base + 16, rel_id_u16); // irt_relation @16
-        dml::put_u16(file, base + 18, 0); // irt_count
+        let page = crate::page_mut(file, page_size, root_page).expect("root page out of range");
+        page.fill(0);
+        page[0] = 6; // pag_root
+        dml::put_u32(page, 12, root_page); // pag_pageno
+        dml::put_u16(page, 16, rel_id_u16); // irt_relation @16
+        dml::put_u16(page, 18, 0); // irt_count
     }
 
     // --- the format descriptor blob (makeFormat) ---------------------
@@ -5291,10 +5291,9 @@ fn allocate_index_slot(
     }
 
     let root_page = dml::allocate_page(file, page_size)?;
-    {
-        let start = root_page as usize * page_size;
-        file[start..start + page_size].fill(0);
-    }
+    crate::page_mut(file, page_size, root_page)
+        .expect("index root page out of range")
+        .fill(0);
     btw::write_empty_root(file, page_size, root_page, rel, slot as u8)?;
 
     let at = base + 24 + slot * 24;

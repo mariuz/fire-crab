@@ -234,9 +234,10 @@ struct Member {
 /// so a zeroed slot is reusable room, which is also what the engine's
 /// own lazily-compacted pages look like.
 fn free_slot(file: &mut [u8], page_size: usize, page: u32, slot: u16) {
-    let dir = page as usize * page_size + crate::data::DPG_RPT_OFFSET + slot as usize * 4;
-    crate::dml::put_u16(file, dir, 0);
-    crate::dml::put_u16(file, dir + 2, 0);
+    let p = crate::page_mut(file, page_size, page).expect("free_slot: page out of range");
+    let dir = crate::data::DPG_RPT_OFFSET + slot as usize * 4;
+    crate::dml::put_u16(p, dir, 0);
+    crate::dml::put_u16(p, dir + 2, 0);
 }
 
 /// Read one record's header fields straight off the page.

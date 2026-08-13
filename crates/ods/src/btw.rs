@@ -645,24 +645,24 @@ fn encode_page(
     if total > page_size {
         return Err(());
     }
-    let base = page_no as usize * page_size;
-    file[base..base + page_size].fill(0);
-    file[base] = PageType::Index as u8;
-    file[base + 12..base + 16].copy_from_slice(&page_no.to_le_bytes()); // pag_pageno
-    file[base + 16..base + 20].copy_from_slice(&c.sibling.to_le_bytes());
-    file[base + 20..base + 24].copy_from_slice(&c.left_sibling.to_le_bytes());
-    file[base + 24..base + 28].copy_from_slice(&(prefix_total as u32).to_le_bytes());
-    file[base + 28..base + 30].copy_from_slice(&relation.to_le_bytes());
-    file[base + 30..base + 32].copy_from_slice(&(total as u16).to_le_bytes());
-    file[base + 32] = index_id;
-    file[base + 33] = c.level;
+    let page = crate::page_mut(file, page_size, page_no).expect("encode_page: page out of range");
+    page.fill(0);
+    page[0] = PageType::Index as u8;
+    page[12..16].copy_from_slice(&page_no.to_le_bytes()); // pag_pageno
+    page[16..20].copy_from_slice(&c.sibling.to_le_bytes());
+    page[20..24].copy_from_slice(&c.left_sibling.to_le_bytes());
+    page[24..28].copy_from_slice(&(prefix_total as u32).to_le_bytes());
+    page[28..30].copy_from_slice(&relation.to_le_bytes());
+    page[30..32].copy_from_slice(&(total as u16).to_le_bytes());
+    page[32] = index_id;
+    page[33] = c.level;
     // btr_jump_interval kept as the engine writes fresh pages; an
     // EMPTY jump table (size 0, count 0) - readers start nodes at
     // BTR_SIZE + jump_size and the engine re-jumps pages it touches
-    file[base + 34..base + 36].copy_from_slice(&0u16.to_le_bytes());
-    file[base + 36..base + 38].copy_from_slice(&0u16.to_le_bytes());
-    file[base + 38] = 0;
-    file[base + BTR_NODES_OFFSET..base + total].copy_from_slice(&body);
+    page[34..36].copy_from_slice(&0u16.to_le_bytes());
+    page[36..38].copy_from_slice(&0u16.to_le_bytes());
+    page[38] = 0;
+    page[BTR_NODES_OFFSET..total].copy_from_slice(&body);
     Ok(())
 }
 
@@ -868,8 +868,9 @@ pub fn insert_index_entry(
             .map_err(|_| "split right half does not fit".to_string())?;
         // old right neighbor's left link
         if right.sibling != 0 {
-            let nb = right.sibling as usize * page_size;
-            file[nb + 20..nb + 24].copy_from_slice(&new_page.to_le_bytes());
+            crate::page_mut(file, page_size, right.sibling)
+                .expect("sibling page out of range")[20..24]
+                .copy_from_slice(&new_page.to_le_bytes());
         }
         level_content.sibling = new_page;
         encode_page(file, page_size, level_page, rel, index_id, &level_content)
