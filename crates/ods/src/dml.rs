@@ -65,14 +65,21 @@ pub struct DmlOutcome {
     pub affected: usize,
 }
 
-pub(crate) fn put_u16(file: &mut [u8], at: usize, v: u16) {
-    file[at..at + 2].copy_from_slice(&v.to_le_bytes());
+// These write a little-endian field at a byte offset into WHATEVER slice
+// they are handed - a page (the usual caller, since slices 4-9 made every
+// write page-local) or a record image. The parameter is named `buf`, not
+// `file`, so that `file` names the whole database image alone: the coming
+// storage flip swaps `file: &[u8]` for a paged `&Image` by name, and these
+// generic helpers, which take an ordinary `&mut [u8]`, must not be caught
+// by that swap.
+pub(crate) fn put_u16(buf: &mut [u8], at: usize, v: u16) {
+    buf[at..at + 2].copy_from_slice(&v.to_le_bytes());
 }
-pub(crate) fn put_u32(file: &mut [u8], at: usize, v: u32) {
-    file[at..at + 4].copy_from_slice(&v.to_le_bytes());
+pub(crate) fn put_u32(buf: &mut [u8], at: usize, v: u32) {
+    buf[at..at + 4].copy_from_slice(&v.to_le_bytes());
 }
-fn put_u64(file: &mut [u8], at: usize, v: u64) {
-    file[at..at + 8].copy_from_slice(&v.to_le_bytes());
+fn put_u64(buf: &mut [u8], at: usize, v: u64) {
+    buf[at..at + 8].copy_from_slice(&v.to_le_bytes());
 }
 
 /// Where transaction `tx`'s two bits live: the byte index in the file
