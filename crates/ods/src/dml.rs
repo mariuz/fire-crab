@@ -79,7 +79,7 @@ fn put_u64(file: &mut [u8], at: usize, v: u64) {
 /// and the shift within it. TIP pages chain via `tip_next`; the head is
 /// the one no other TIP points to (the same walk `TipChain` does, done
 /// index-wise so the caller can mutate).
-fn tip_bits_at(file: &[u8], page_size: usize, tx: u64) -> Result<(usize, u32), String> {
+fn tip_bits_at(file: &[u8], page_size: usize, tx: u64) -> Result<(u32, usize, u32), String> {
     let tips: Vec<(usize, u32, u32)> = file
         .chunks_exact(page_size)
         .enumerate()
@@ -108,8 +108,11 @@ fn tip_bits_at(file: &[u8], page_size: usize, tx: u64) -> Result<(usize, u32), S
         .get(tx as usize / per_page)
         .ok_or("transaction id beyond the TIP chain")?;
     let within = tx as usize % per_page;
+    // the TIP page, the byte WITHIN it, and the 2-bit shift - the slot
+    // is read/written through page_mut, not at an absolute file offset
     Ok((
-        tip_idx * page_size + TIP_TRANSACTIONS_OFFSET + within / 4,
+        tip_idx as u32,
+        TIP_TRANSACTIONS_OFFSET + within / 4,
         2 * (within % 4) as u32,
     ))
 }
@@ -126,8 +129,9 @@ pub fn set_tx_state(
     tx: u64,
     state: crate::tip::TxState,
 ) -> Result<(), String> {
-    let (byte, shift) = tip_bits_at(file, page_size, tx)?;
-    let b = file.get_mut(byte).ok_or("TIP byte outside the file")?;
+    let (tip_page, byte, shift) = tip_bits_at(file, page_size, tx)?;
+    let page = crate::page_mut(file, page_size, tip_page).ok_or("TIP page outside the file")?;
+    let b = page.get_mut(byte).ok_or("TIP byte outside the page")?;
     *b = (*b & !(0b11 << shift)) | ((state as u8) << shift);
     Ok(())
 }
@@ -696,22 +700,29 @@ fn push_back_version(
     page_no: u32,
     slot: u16,
 ) -> Result<(u32, u16, u8), String> {
-    let base = page_no as usize * page_size;
-    let dir = base + DPG_RPT_OFFSET + slot as usize * 4;
-    let (off, len) = (u16_at(file, dir) as usize, u16_at(file, dir + 2) as usize);
-    if len < RHD_DATA_OFFSET || base + off + len > file.len() {
-        return Err("target slot is empty or corrupt".into());
-    }
-    let mut rec = file[base + off..base + off + len].to_vec();
-    let rflags = u16_at(&rec, 10);
-    if rflags
-        & (flags::CHAIN | flags::BLOB | flags::FRAGMENT | flags::INCOMPLETE | flags::DELETED)
-        != 0
-    {
-        return Err("target is not a live primary record version".into());
-    }
-    let format = rec[12];
-    put_u16(&mut rec, 10, rflags | flags::CHAIN);
+    // read the live version off its page (page-local), clone it, and flag
+    // it a back version - all before find_space/write_at_spot take the
+    // file mutably; a record never spans its page, so the bound is the
+    // page's length
+    let (rec, format) = {
+        let page = crate::page_at(file, page_size, page_no).ok_or("target page out of range")?;
+        let dir = DPG_RPT_OFFSET + slot as usize * 4;
+        let (off, len) = (u16_at(page, dir) as usize, u16_at(page, dir + 2) as usize);
+        if len < RHD_DATA_OFFSET || off + len > page.len() {
+            return Err("target slot is empty or corrupt".into());
+        }
+        let mut rec = page[off..off + len].to_vec();
+        let rflags = u16_at(&rec, 10);
+        if rflags
+            & (flags::CHAIN | flags::BLOB | flags::FRAGMENT | flags::INCOMPLETE | flags::DELETED)
+            != 0
+        {
+            return Err("target is not a live primary record version".into());
+        }
+        let format = rec[12];
+        put_u16(&mut rec, 10, rflags | flags::CHAIN);
+        (rec, format)
+    };
     let spot = match find_space(file, page_size, rel, rec.len()) {
         Some(s) => s,
         None => {

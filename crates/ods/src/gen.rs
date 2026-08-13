@@ -28,7 +28,7 @@ fn gens_per_page(page_size: usize) -> usize {
 /// generator page that would hold it has not been allocated - the
 /// engine's `DPM_gen_id` grows the vector on demand; fire-crab writes
 /// into the vector that exists.
-pub fn slot_offset(bytes: &[u8], page_size: usize, id: i64) -> Option<usize> {
+pub fn slot_offset(bytes: &[u8], page_size: usize, id: i64) -> Option<(u32, usize)> {
     if id < 0 {
         return None;
     }
@@ -39,15 +39,18 @@ pub fn slot_offset(bytes: &[u8], page_size: usize, id: i64) -> Option<usize> {
     }
     let sequence = (id / per) as u32;
     let offset = id % per;
-    for pno in 0..bytes.len() / page_size {
-        let pstart = pno * page_size;
-        let page = &bytes[pstart..pstart + page_size];
+    let pages = (bytes.len() / page_size) as u32;
+    for pno in 0..pages {
+        let page = crate::page_at(bytes, page_size, pno)?;
         if page[0] != PageType::Generators as u8 {
             continue;
         }
         let seq = u32::from_le_bytes([page[16], page[17], page[18], page[19]]);
         if seq == sequence {
-            return Some(pstart + 24 + offset * 8);
+            // the slot's PAGE and its PAGE-LOCAL offset - a generator
+            // value read/written through page_at/page_mut, no absolute
+            // offset into the whole image
+            return Some((pno, 24 + offset * 8));
         }
     }
     None
@@ -57,18 +60,21 @@ pub fn slot_offset(bytes: &[u8], page_size: usize, id: i64) -> Option<usize> {
 /// been allocated reads 0 - the engine's zero-initialised slot.
 pub fn read(bytes: &[u8], page_size: usize, id: i64) -> i64 {
     match slot_offset(bytes, page_size, id) {
-        Some(at) => match bytes.get(at..at + 8) {
-            Some(raw) => i64::from_le_bytes(raw.try_into().unwrap_or([0; 8])),
-            None => 0,
-        },
+        Some((pno, at)) => {
+            match crate::page_at(bytes, page_size, pno).and_then(|p| p.get(at..at + 8)) {
+                Some(raw) => i64::from_le_bytes(raw.try_into().unwrap_or([0; 8])),
+                None => 0,
+            }
+        }
         None => 0,
     }
 }
 
 /// Write generator `id`'s value into its slot.
 pub fn write(bytes: &mut [u8], page_size: usize, id: i64, value: i64) -> Result<(), String> {
-    let at = slot_offset(bytes, page_size, id).ok_or("generator page not allocated")?;
-    bytes[at..at + 8].copy_from_slice(&value.to_le_bytes());
+    let (pno, at) = slot_offset(bytes, page_size, id).ok_or("generator page not allocated")?;
+    let page = crate::page_mut(bytes, page_size, pno).ok_or("generator page out of range")?;
+    page[at..at + 8].copy_from_slice(&value.to_le_bytes());
     Ok(())
 }
 
@@ -101,8 +107,8 @@ mod tests {
         let ps = 8192;
         let f = scratch(ps);
         // sequence 0 holds ids 0..(ps-24)/8
-        assert_eq!(slot_offset(&f, ps, 0), Some(ps + 24));
-        assert_eq!(slot_offset(&f, ps, 3), Some(ps + 24 + 24));
+        assert_eq!(slot_offset(&f, ps, 0), Some((1, 24)));
+        assert_eq!(slot_offset(&f, ps, 3), Some((1, 24 + 24)));
         // the page for the next sequence does not exist
         assert_eq!(slot_offset(&f, ps, gens_per_page(ps) as i64), None);
         assert_eq!(slot_offset(&f, ps, -1), None);
