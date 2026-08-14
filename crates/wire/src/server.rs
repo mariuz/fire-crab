@@ -4900,6 +4900,11 @@ AlterDomainRename {
         cols: Vec<ProjCol>,
         filter: Option<Predicate>,
         order_by: Vec<OrderKey>,
+        /// a PARAMETERISED driver WHERE has no band at prepare; this
+        /// carries the reconstructed single-table statement so the DRIVER
+        /// (`base`) is index-scanned at EXECUTE from the bound predicate -
+        /// see [DeferredAccess] and `resolve_driver_base`.
+        defer: Option<DeferredAccess>,
     },
     /// A grouped or aggregated JOIN: the combined rows a `Join` produces,
     /// folded by the same machinery `Group` uses. Kept as its own variant
@@ -4919,6 +4924,9 @@ AlterDomainRename {
         filter: Option<Predicate>,
         having: Option<Predicate>,
         order_by: Vec<OrderKey>,
+        /// a deferred DRIVER band, as in [Plan::Join] - a grouped join
+        /// keys its driver at execute for a parameterised WHERE too
+        defer: Option<DeferredAccess>,
     },
     Group {
         rel: u16,
@@ -19038,6 +19046,38 @@ fn resolve_access(
     choose_index(db, rel, &d.table, descs, filter, &d.sql, order_by)
 }
 
+/// A join's DRIVER (`base`) with any DEFERRED band resolved at execute: a
+/// parameterised driver WHERE had no band at prepare, so the base was left
+/// a `TableScan` and its reconstructed statement carried in `defer`; here
+/// the bound predicate keys it, turning `base` into an `IndexScan`. Not a
+/// deferred driver (or a base that is not a plain scan) is returned as-is.
+fn resolve_driver_base(
+    db: &Database,
+    base: &RowSource,
+    defer: &Option<DeferredAccess>,
+    filter: &Option<Predicate>,
+) -> RowSource {
+    let (Some(_), RowSource::TableScan { rel, formats, width }) = (defer.as_ref(), base) else {
+        return base.clone();
+    };
+    let descs: Vec<Descriptor> = formats
+        .iter()
+        .max_by_key(|(n, _)| *n)
+        .map(|(_, d)| d.clone())
+        .unwrap_or_default();
+    // the driver's index navigates by nothing (the join's order sits above
+    // it), as at prepare
+    match resolve_access(&None, defer, db, *rel, &descs, filter, &[]) {
+        Some(access) => {
+            if trace_on() {
+                eprintln!("[srv] driver index: rel={} {} (deferred)", rel, access.describe());
+            }
+            RowSource::IndexScan { rel: *rel, formats: formats.clone(), access, width: *width }
+        }
+        None => base.clone(),
+    }
+}
+
 /// The retrieval leaf for a relation: the optimizer's index, or a scan.
 /// One statement of the rule, for every site that builds a tree.
 fn leaf_source(
@@ -20762,7 +20802,7 @@ fn plan_lateral(
     let planned = plan_join(
         proj, &from, &join, where_s, None, None, order_s, db, db_all, proj_params, params,
     )?;
-    let Plan::Join { base, base_width, parts, cols, filter, order_by } = planned else {
+    let Plan::Join { base, base_width, parts, cols, filter, order_by, .. } = planned else {
         return None;
     };
     if parts.len() != 1 {
@@ -21562,9 +21602,10 @@ fn plan_join_bound(
     // and a conjunct on the INNER already demoted the join above. The
     // Filter above the join re-checks the whole WHERE, so the band only
     // narrows what is READ, never what is answered. A `?` has no band at
-    // prepare and stays a scan (a deferred driver band is a follow-up);
-    // an aliased or mixed driver text makes `choose_index` decline, which
-    // also just scans.
+    // prepare, so it is DEFERRED (carried in `driver_defer`) and built at
+    // execute like a projection's; an aliased or mixed driver text makes
+    // `choose_index` decline, which also just scans.
+    let mut driver_defer: Option<DeferredAccess> = None;
     let driver_src = sides[0].probe_src.clone();
     let driver_descs = sides[0].descs.clone();
     let driver_cols = sides[0].columns.clone();
@@ -21595,18 +21636,24 @@ fn plan_join_bound(
         .flatten();
         if let (Some(col), true) = (key_col, bare(&src.table)) {
             let opt_sql = format!("SELECT 1 FROM {} WHERE {} = 0", src.table, col);
-            if let Some(access) =
-                choose_index(db, src.rel, &src.table, &driver_descs, &filter, &opt_sql, &[])
-            {
-                if trace_on() {
-                    eprintln!("[srv] driver index: rel={} {}", src.rel, access.describe());
+            match choose_index(db, src.rel, &src.table, &driver_descs, &filter, &opt_sql, &[]) {
+                Some(access) => {
+                    if trace_on() {
+                        eprintln!("[srv] driver index: rel={} {}", src.rel, access.describe());
+                    }
+                    sides[0].src = RowSource::IndexScan {
+                        rel: src.rel,
+                        formats: src.formats.clone(),
+                        access,
+                        width: Some(driver_width),
+                    };
                 }
-                sides[0].src = RowSource::IndexScan {
-                    rel: src.rel,
-                    formats: src.formats.clone(),
-                    access,
-                    width: Some(driver_width),
-                };
+                // a bound `?` has no band yet - carry the reconstruction so
+                // the driver keys at EXECUTE from the bound predicate
+                None if filter_has_params(&filter) => {
+                    driver_defer = Some(DeferredAccess { table: src.table.clone(), sql: opt_sql });
+                }
+                None => {}
             }
         }
     }
@@ -21706,6 +21753,7 @@ fn plan_join_bound(
             filter,
             having,
             order_by,
+            defer: driver_defer,
         });
     }
 
@@ -21874,6 +21922,7 @@ fn plan_join_bound(
         cols,
         filter,
         order_by,
+        defer: driver_defer,
     })
 }
 
@@ -22514,6 +22563,8 @@ fn plan_over_source(
             filter,
             having,
             order_by,
+            // a grouped DERIVED source has no base table to key
+            defer: None,
         });
     }
     let computed = Default::default();
@@ -23504,10 +23555,11 @@ fn branch_rows_res(
     // all arrive here. The rows are sorted on the COMBINED row (the
     // ORDER BY indexes it, not the projection) and then projected, the
     // same two steps `Plan::Project` takes below.
-    if let Plan::Join { base, base_width, parts, cols, filter, order_by } = plan {
+    if let Plan::Join { base, base_width, parts, cols, filter, order_by, defer } = plan {
         let filter = bind_filter(filter, args).map_err(|_| EvalErr::Unsupported)?;
+        let base = resolve_driver_base(db, base, defer, &filter);
         let mut rows =
-            join_rows(db, base, *base_width, parts, &filter)?;
+            join_rows(db, &base, *base_width, parts, &filter)?;
         if !order_by.is_empty() {
             sort_rows(&mut rows, order_by)?;
         }
@@ -23530,11 +23582,13 @@ fn branch_rows_res(
         filter,
         having,
         order_by,
+        defer,
     } = plan
     {
         let filter = bind_filter(filter, args).map_err(|_| EvalErr::Unsupported)?;
         let having = bind_filter(having, args).map_err(|_| EvalErr::Unsupported)?;
-        let input = join_rows(db, base, *base_width, parts, &filter)?;
+        let base = resolve_driver_base(db, base, defer, &filter);
+        let input = join_rows(db, &base, *base_width, parts, &filter)?;
         // the joined rows are a materialised leaf; the fold and the sort
         // above them are tree nodes (a NestedLoopJoin leaf is R3)
         let rows = RowSource::aggregate_sorted(
@@ -30490,11 +30544,13 @@ fn emit_rows_inner(
             cols,
             filter,
             order_by,
+            defer,
         } => {
             if let Some(db) = db {
                 let filter = bind_filter(filter, args)?;
+                let base = resolve_driver_base(db, base, defer, &filter);
                 let mut rows =
-                    join_rows(db, base, *base_width, parts, &filter)
+                    join_rows(db, &base, *base_width, parts, &filter)
                         .map_err(EmitErr::Eval)?;
                 if !order_by.is_empty() {
                     sort_rows(&mut rows, order_by).map_err(EmitErr::Eval)?;
@@ -30519,12 +30575,14 @@ fn emit_rows_inner(
             filter,
             having,
             order_by,
+            defer,
         } => {
             if let Some(db) = db {
                 let filter = bind_filter(filter, args)?;
                 let having = bind_filter(having, args)?;
+                let base = resolve_driver_base(db, base, defer, &filter);
                 let input =
-                    join_rows(db, base, *base_width, parts, &filter)
+                    join_rows(db, &base, *base_width, parts, &filter)
                         .map_err(EmitErr::Eval)?;
                 let rows = RowSource::aggregate_sorted(
                     RowSource::Rows(input),

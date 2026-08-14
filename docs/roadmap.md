@@ -1987,9 +1987,20 @@ plus *the subsystem is now on the path*.
       a mixed WHERE all decline to the scan. `base = sides[0].src` so a
       grouped join inherits it for free. `qa/serve-real-leftjoinindex.sh`
       gates it (`driver_indexed`, unique + non-unique + unordered +
-      under-GROUP-BY), `FC_NO_INDEX`-twinned. Still open: a RANGE driver
-      (cost-decided access, divergent order) and a PARAMETERISED driver
-      WHERE (needs a deferred driver band, like the projection's).
+      under-GROUP-BY), `FC_NO_INDEX`-twinned.
+
+      *And a PARAMETERISED driver WHERE defers it* — `Plan::Join` and
+      `Plan::JoinGroup` grew a `defer` field for the driver's band, built
+      at prepare when the equality is a `?`, and `resolve_driver_base`
+      turns `base` from a `TableScan` into an `IndexScan` at EXECUTE from
+      the bound predicate before `join_rows` runs. No batch pre-resolve is
+      needed (unlike a bare `Plan::Group`): the join's materialisation
+      goes through the emit arm that now resolves the driver. A `pdriver`
+      twin drives node-bound `WHERE driver.col = ?` (equality, non-unique,
+      and under a GROUP BY), each answering the engine's rows with the
+      driver band built at execute. Still open: a RANGE driver
+      (cost-decided access, divergent order) - the hard, order-coupled
+      half.
 
       *LEFT — the slice is ON.* A LEFT JOIN never hashes. In every
       probe the engine's plan IS fire-crab's execution tree: driver =

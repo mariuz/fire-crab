@@ -639,6 +639,55 @@ else
     fail=1
 fi
 
+# --- 9. a PARAMETERISED driver WHERE defers its band to EXECUTE --------
+# isql cannot bind a `?`, so node drives it. A `WHERE driver.col = ?` has
+# no band at prepare; the driver keys at EXECUTE from the bound value, and
+# fire-crab's log shows the DEFERRED driver index. Rows must match the
+# engine both ways.
+if command -v node >/dev/null 2>&1; then
+    pquery() { # <sql> <port> <db> <json-args>
+        n=0
+        while [ $n -lt 6 ]; do
+            r=$(timeout 25 env FC_Q="$1" FC_PORT="$2" FC_DB="$3" FC_ARGS="$4" node -e '
+              process.on("uncaughtException", () => { console.log("CONN_ERR"); process.exit(0); });
+              const F=require("node-firebird");
+              F.attach({host:"127.0.0.1",port:+process.env.FC_PORT,database:process.env.FC_DB,
+                        user:"SYSDBA",password:"masterkey",encoding:"NONE"},(e,db)=>{
+                if(e){console.log("CONN_ERR");process.exit(0);}
+                db.query(process.env.FC_Q,JSON.parse(process.env.FC_ARGS),(e2,r)=>{
+                  if(e2){console.log("ERR "+(e2.message||"").split("\n")[0].slice(0,50));db.detach();process.exit(0);}
+                  console.log(JSON.stringify(Array.isArray(r)?r:(r?[r]:[])));
+                  db.detach();process.exit(0);});});' 2>/dev/null)
+            case "$r" in
+                CONN_ERR|"") n=$((n + 1)); sleep 0.3 ;;
+                *) printf '%s' "$r"; return ;;
+            esac
+        done
+        printf 'CONN_ERR'
+    }
+    pdriver() { # <label> <sql> <json-args>
+        ran=$((ran + 1))
+        before=$(count_line "driver index: rel=")
+        a=$(pquery "$2" "$PORT" "$A" "$3")
+        b=$(pquery "$2" "$REAL" "$B" "$3")
+        after=$(count_line "driver index: rel=")
+        if [ "$a" = "$b" ]; then echo "OK   $1: $a"; else echo "DIFF $1"; echo "  fc: $a"; echo "  en: $b"; fail=1; fi
+        ran=$((ran + 1))
+        if [ "$after" -gt "$before" ]; then
+            echo "OK   ... and the driver's band was built at EXECUTE"
+        else
+            echo "DIFF $1: no deferred driver index"; fail=1
+        fi
+    }
+    REAL="${FC_REAL_PORT:-3050}"
+    pdriver "a parameterised driver equality (unique PK)" \
+        "SELECT PAR.N, DUP.N FROM PAR LEFT JOIN DUP ON DUP.K = PAR.K WHERE PAR.K = ? ORDER BY DUP.N" "[5]"
+    pdriver "a parameterised driver equality (non-unique, 6 rows)" \
+        "SELECT COUNT(*) AS C FROM DUP LEFT JOIN PAR ON PAR.K = DUP.K WHERE DUP.K = ?" "[5]"
+    pdriver "a parameterised driver equality UNDER A GROUP BY" \
+        "SELECT DUP.K, COUNT(PAR.N) AS C FROM DUP LEFT JOIN PAR ON PAR.K = DUP.K WHERE DUP.K = ? GROUP BY DUP.K" "[5]"
+fi
+
 rm -f "$A" "$B"
 if [ "$ran" -lt 114 ]; then
     echo "DIFF only $ran checks ran (expected at least 114) - did one silently skip?"
