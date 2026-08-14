@@ -349,6 +349,26 @@ dfparam "LIKE pat"     "D LIKE ?"          '["1%"]'
 dfparam "LIKE sci"     "D LIKE ?"          '["%E+38"]'
 dfparam "STARTING pat" "D STARTING WITH ?" '["-"]'
 
+# the LIKE/STARTING pattern `?` slot on a NUMERIC column describes as a
+# FIXED VARYING(30) - the engine's numeric-to-text render width, NOT the
+# column's own shape (a TEXT column's pattern keeps the column width). Read
+# the input-param describe through fire-crab and the engine on the same file.
+patlen() { # <col> <table>
+    printf 'SET SQLDA_DISPLAY ON;\nSELECT ID FROM %s WHERE %s LIKE ?;\n' "$2" "$1" |
+        "$ISQL" -q -user "$U" -pas "$P" "$3" 2>&1 |
+        grep -oiE 'VARYING.*len: [0-9]+' | head -1 | grep -oiE 'len: [0-9]+'
+}
+patw() { # <label> <col> <table>
+    check "LIKE pattern width $1 [$2]" \
+          "$(patlen "$2" "$3" "127.0.0.1/$PORT:$WORK")" "$(patlen "$2" "$3" "$WORK")"
+}
+patw "NUMERIC(9,2)"  "N"  "T"
+patw "NUMERIC(18,4)" "M"  "T"
+patw "INT128"        "I"  "T"
+patw "INTEGER"       "A"  "T"
+patw "DECFLOAT(34)"  "D"  "DF2"
+patw "DECFLOAT(16)"  "S"  "DF2"
+
 # --- 1d. WIDE INT128 LITERAL in INSERT VALUES --------------------------
 # The value-list tokenizer reads a magnitude past i64 as Tok::Int128; the
 # store now encodes it into an exact-numeric column (rescaling in i128) or

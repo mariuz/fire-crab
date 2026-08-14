@@ -45088,6 +45088,15 @@ fn cond_no_raise(c: &Cond2, descs: &[Descriptor]) -> bool {
     }
 }
 
+/// The descriptor length of a LIKE/STARTING pattern `?` slot on ANY
+/// numeric column (NUMERIC/INTEGER/INT128/DECFLOAT): the engine describes
+/// it as a FIXED `VARYING(30)`, not the column's own width the way a TEXT
+/// column's pattern is (probed: N92, I, BIGINT, INT128, DECFLOAT(34) and
+/// (16) all len 30). A VARYING descriptor length carries the 2-byte count,
+/// so 32 announces 30. (A text column's pattern still claims the column's
+/// own descriptor, which is already its width.)
+const NUM_LIKE_PATTERN_LEN: u16 = 32;
+
 /// [typed_term] for a scaled NUMERIC/DECIMAL or INT128 column - the
 /// kinds [col_kind] does not classify. Comparisons take integer and
 /// decimal literals (exact, scale-aligned - the engine's dialect-3
@@ -45115,7 +45124,7 @@ fn numeric_term(
         params[slot] = Some(Descriptor {
             dtype: dtype::VARYING,
             scale: 0,
-            length: 32765,
+            length: NUM_LIKE_PATTERN_LEN,
             sub_type: 0,
             flags: 0,
             offset: 4,
@@ -45220,7 +45229,7 @@ fn decfloat_term(
         params[slot] = Some(Descriptor {
             dtype: dtype::VARYING,
             scale: 0,
-            length: 32765,
+            length: NUM_LIKE_PATTERN_LEN,
             sub_type: 0,
             flags: 0,
             offset: 4,
@@ -45322,7 +45331,7 @@ fn param_or_typed_term(
                 params[slot] = Some(Descriptor {
                     dtype: dtype::VARYING,
                     scale: 0,
-                    length: 32765,
+                    length: NUM_LIKE_PATTERN_LEN,
                     sub_type: 0,
                     flags: 0,
                     offset: 4,
@@ -45366,7 +45375,7 @@ fn param_or_typed_term(
                 params[slot] = Some(Descriptor {
                     dtype: dtype::VARYING,
                     scale: 0,
-                    length: 32765,
+                    length: NUM_LIKE_PATTERN_LEN,
                     sub_type: 0,
                     flags: 0,
                     offset: 4,
@@ -53221,11 +53230,13 @@ mod tests {
         assert!(!hit("N LIKE '1!%' ESCAPE '!'", 1));
         // N LIKE NULL is UNKNOWN per row
         assert!(!hit("N LIKE NULL", 1));
-        // the bound pattern claims the SYNTHESIZED text slot ...
+        // the bound pattern claims the SYNTHESIZED text slot, a fixed
+        // VARYING(30) as the engine describes any numeric-column pattern
+        // (length 32 = 30 + the 2-byte VARYING count)
         let (p, params) = resolve("N LIKE ?").unwrap();
         assert_eq!(params.len(), 1);
         let pd = params[0].as_ref().unwrap();
-        assert_eq!((pd.dtype, pd.length), (dtype::VARYING, 32765));
+        assert_eq!((pd.dtype, pd.length), (dtype::VARYING, NUM_LIKE_PATTERN_LEN));
         // ... a text bind matches the render, an int bind 1 is the
         // EXACT pattern '1' (probed: takes N=1, not N=10), NULL is
         // UNKNOWN

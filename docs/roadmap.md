@@ -2334,11 +2334,25 @@ plus *the subsystem is now on the path*.
       value and matches `v.render()`. Gated (numericwhere +11): literal and
       `?` patterns, wildcards `%`/`_`, the scientific form, cohort, NOT
       LIKE, over both widths. SIMILAR TO stays text-only, as for the
-      exact-numeric columns. One recorded simplification, shared with
-      `numeric_term`: the LIKE-pattern `?` slot is described VARYING(32763)
-      where the engine gives a fixed VARYING(30) for every numeric column -
-      a pre-existing describe width the driver ignores (the value binds at
-      its true length either way), its own cross-cutting slice. Still
+      exact-numeric columns.
+
+      *And the numeric LIKE-pattern describe WIDTH was corrected* — the `?`
+      pattern slot on ANY numeric column had been described VARYING(32763)
+      where the engine gives a FIXED VARYING(30) (the numeric-to-text render
+      width, not the column's own shape - probed: `N92`, `I`, `BIGINT`,
+      `INT128`, `DECFLOAT(34)` and `(16)` all len 30, while a text column's
+      pattern keeps the column width: `VARCHAR(10)`→10, `CHAR(5)`→5). A new
+      `NUM_LIKE_PATTERN_LEN = 32` (32 = 30 + the 2-byte VARYING count)
+      replaces the hardcoded 32765 at the four numeric column-path claim
+      sites (`numeric_term`, `decfloat_term`, and `param_or_typed_term`'s
+      INT LIKE/STARTING); the text-column path already claimed the column's
+      own descriptor, so it was right. The value binding was never affected
+      (the driver sends the pattern at its true length) - this is purely the
+      announced describe. Gated (numericwhere +6): the pattern width read
+      through fire-crab and the engine matches len 30 for NUMERIC(9,2),
+      NUMERIC(18,4), INT128, INTEGER, DECFLOAT(34) and (16). The two rarer
+      constructs left at 32765 (a `?`-tested-side LIKE, an EXPRESSION-LHS
+      LIKE that mixes text and integer) are a separate follow-up. Still
       refused deliberately: DECFLOAT in arithmetic / nested, the
       `Infinity`/`NaN` text-literal specials, and a value past DECFLOAT(34)
       range.
