@@ -2053,11 +2053,35 @@ plus *the subsystem is now on the path*.
       write path wrote, and a value too wide for `i64` never becomes an
       `Rhs` in the first place, so it scans rather than mis-keying. (The
       cross-cutting `Rhs`-carries-`i128` change is only for a >`i64`
-      LITERAL, which stays a separate slice; the INDEX itself needed no
-      new representation.) **Slice B is closed** —
-      `qa/serve-real-leftjoinindex.sh` is 136 checks, every inner shape
+      LITERAL, closed next; the INDEX itself needed no new
+      representation.) **Slice B is closed** —
+      `qa/serve-real-leftjoinindex.sh` is 139 checks, every inner shape
       the engine keys now probed, with a `FC_NO_INDEX` twin proving each
       answers the same scanned.
+
+  - **The >`i64` INTEGER LITERAL** — *(done)*, and it was NOT the
+      113-site widening the entry below feared. A literal wider than
+      `i64` (a `NUMERIC(38,0)` magnitude, up to 39 digits) was REFUSED
+      at the tokenizer (`.parse::<i64>().ok()?`); now the tokenizer tries
+      `i64` then `i128`, carrying a `Tok::Int128` → `Rhs::Int128` that
+      ONLY the exact-numeric compare and index-retrieval paths consume.
+      Adding the variants cost **7 compile breaks** (the compiler
+      enumerated every exhaustive match), each either handled (the numeric
+      resolver routes it to `Term::NumCmp`, `Term::matches` aligns it in
+      `i128` through `num_cmp`, `pick_for_terms` carries it to the
+      column's scale and keys IDX_BCD) or failed CLOSED (a wide literal in
+      a projected expression, a BETWEEN/IN bound, a bound param, or
+      against a text column refuses rather than truncating). The compare
+      core (`numeric_parts`/`num_cmp`) and the IDX_BCD encoder were
+      already `i128`; nothing widened `Rhs::Int` or its 100+ sites. Still
+      refused, deliberately: a PROJECTED wide literal (`SELECT <huge>` —
+      its describe is INT128/DECFLOAT, a separate concern), wide
+      arithmetic, a past-`i128` magnitude (DECFLOAT), and a wide OUTER
+      join VALUE (the probe's `band` still caps at `i64` → scans).
+      `qa/serve-real-leftjoinindex.sh` proves it three ways with the
+      `FC_NO_INDEX` twin: a 38-digit equality keys and scan-compares
+      identically to the engine, a range past `i64`, and an OR mixing a
+      wide and a small literal.
   - **A predicted bug that measurement did not confirm, recorded as
     such.** `ods::ddl::index_itype` maps every TEXT/VARYING column to
     `idx_string`, ignoring the charset, so a `CREATE INDEX` issued to
@@ -2142,9 +2166,12 @@ plus *the subsystem is now on the path*.
     engine folds the sign in before it types the literal: `-<digits>`,
     `- <digits>` and `-(<digits>)` all describe as **INT64**, while the
     bare magnitude and anything wider are **INT128** (and past 2¹²⁷,
-    DECFLOAT(34)). Only the exact magnitude is folded; everything wider
+    DECFLOAT(34)). Only the exact magnitude is folded; ~~everything wider
     stays refused until INT128 literals are their own slice, which is a
-    real one — `Rhs` carries an `i64` raw across 113 sites.
+    real one — `Rhs` carries an `i64` raw across 113 sites~~ — **the wide
+    magnitude is DONE** (the entry two above): a `Tok::Int128`/`Rhs::Int128`
+    the compare and retrieval paths consume, without widening `Rhs::Int`
+    at all. Past `i128` (DECFLOAT) still refuses.
 
     **It also uncovered a silent wraparound.** `Expr::Neg` used
     `wrapping_neg` where `+` and `-` beside it have always raised, and

@@ -5345,6 +5345,12 @@ enum Rhs {
     /// an exact-numeric literal as (raw, scale) - what a decimal
     /// literal or an integer against a scaled/INT128 column becomes
     Num(i64, i8),
+    /// an integer literal too WIDE for i64 - a `NUMERIC(38,0)`/INT128
+    /// magnitude (up to 39 digits). Only the retrieval and scan-compare
+    /// paths against an exact-numeric column consume it; every other
+    /// consumer treats it like an out-of-domain literal and declines,
+    /// which fails closed (a scan, or a refusal) rather than truncating.
+    Int128(i128),
     /// an APPROXIMATE value - built ONLY at bind, for a blr_double
     /// parameter against a TEXT column ([Term::TextNumCmp]'s double
     /// domain; probed: `S = ?` bound 4.5 answers the '4.5' row). The
@@ -5839,6 +5845,10 @@ impl Predicate {
                     // reads WIRE values, cannot build one
                     Some(Rhs::Str(t) | Rhs::StrKey(t)) => Some(Expr::Str(t)),
                     Some(Rhs::Null | Rhs::Param(..)) => Some(Expr::Null),
+                    // a wide INT128 literal has no Expr carrier (Expr::Int
+                    // is i64) - this describe-as-literal path is for the
+                    // TEXT-param shape and never meets one; refuse
+                    Some(Rhs::Int128(_)) => None,
                 },
             })
         };
@@ -6527,6 +6537,7 @@ impl Term {
             // before evaluating; this is the defensive answer)
             Term::Cmp(_, _, Rhs::Param(..)) => None,
             Term::Cmp(_, _, Rhs::Num(..)) => None, // Num travels in NumCmp
+            Term::Cmp(_, _, Rhs::Int128(..)) => None, // Int128 travels in NumCmp
             // resolution turns StrKey into a plain term or a
             // KeyConvErr; one reaching a Term is unreachable-defensive
             Term::Cmp(_, _, Rhs::StrKey(_)) => None,
@@ -6578,6 +6589,13 @@ impl Term {
                     None => None,
                 }
             }
+            // a wide integer literal (INT128): the compare aligns it
+            // against the column's value in i128 exactly as the i64 arm
+            // does, `num_cmp` doing the width-safe part.
+            Term::NumCmp(fid, op, Rhs::Int128(r)) => match values.get(*fid) {
+                Some(v) => num_cmp(v, &Value::Int128(*r, 0)).map(|o| ord_ok(o, *op)),
+                None => None,
+            },
             Term::NumCmp(..) => None, // unbound parameter / wrong shape
             Term::Like(fid, pattern, escape, negated) => match (values.get(*fid), pattern) {
                 // NO pad trim: the engine matches the stored value,
@@ -19286,6 +19304,23 @@ fn pick_for_terms(
                         continue;
                     };
                     (*fid, *cmp, v)
+                }
+                // A WIDE integer literal (INT128) against an exact-numeric
+                // column - already i128 at scale 0, carried EXACTLY to the
+                // column's scale (no rounding, same rule as the scaled
+                // arms) and handed to the encoder AS a `Value::Int128`.
+                // Only the IDX_BCD encoder takes that shape; an i64-storage
+                // column's IDX_NUMERIC/NUMERIC2 encoder declines it, so a
+                // wide literal against such a column builds no key and
+                // scans - exactly right, since no i64 value equals it.
+                Term::Cmp(fid, cmp, Rhs::Int128(v))
+                | Term::NumCmp(fid, cmp, Rhs::Int128(v))
+                    if !text =>
+                {
+                    let Some(scaled) = rescale_int(*v, 0, col_scale) else {
+                        continue;
+                    };
+                    (*fid, *cmp, Value::Int128(scaled, col_scale))
                 }
                 // TEXT keys, equality only. The literal must be ASCII:
                 // above 0x7F a charset or a collation decides the bytes,
@@ -36651,6 +36686,7 @@ fn render_toks(toks: &[Tok]) -> Option<String> {
         parts.push(match t {
             Tok::Ident(s) => s.clone(),
             Tok::Int(i) => i.to_string(),
+            Tok::Int128(i) => i.to_string(),
             // a Dec's scale is always negative (the tokenizer keeps
             // `12.50` as (1250, -2)), which is the half value_literal
             // spells; a non-negative scale answers None there and the
@@ -39278,6 +39314,12 @@ enum Tok {
     Comma,
     Agg(AggFn, AggTarget),
     Int(i64),
+    /// an integer literal too WIDE for i64 (a NUMERIC(38,0)/INT128
+    /// magnitude). Only the exact-numeric compare and index-retrieval
+    /// paths consume it (via [Rhs::Int128]); anywhere else it falls
+    /// through to a refusal, so a wide literal in an unsupported position
+    /// scans or refuses rather than truncating.
+    Int128(i128),
     /// a decimal literal as (raw digits, scale): `12.50` is (1250, -2)
     /// - trailing zeros count, like the expression parser's literals
     Dec(i64, i8),
@@ -39373,7 +39415,14 @@ fn numeric_tok(s: &str, b: &[u8], start: usize, i: &mut usize) -> Option<Tok> {
         let digits: String = s[start..*i].chars().filter(|c| *c != '.').collect();
         return Some(Tok::Dec(digits.parse().ok()?, scale));
     }
-    Some(Tok::Int(s[start..*i].parse().ok()?))
+    // an integer literal: i64 for the common case, else an i128 magnitude
+    // (a NUMERIC(38,0) key). Wider than i128 (past 39 digits) still
+    // refuses - that is DECFLOAT territory, its own slice.
+    let lit = &s[start..*i];
+    Some(match lit.parse::<i64>() {
+        Ok(n) => Tok::Int(n),
+        Err(_) => Tok::Int128(lit.parse::<i128>().ok()?),
+    })
 }
 
 /// Tokenise a WHERE/HAVING clause. Single-quoted strings ('' escapes a
@@ -39975,6 +40024,7 @@ fn parse_unary(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
 fn parse_value(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Rhs> {
     let v = match t.get(*pos)? {
         Tok::Int(n) => Rhs::Int(*n),
+        Tok::Int128(n) => Rhs::Int128(*n),
         Tok::Dec(r, s) => Rhs::Num(*r, *s),
         Tok::Str(s) => Rhs::Str(s.clone()),
         Tok::StrKey(s) => Rhs::StrKey(s.clone()),
@@ -40214,8 +40264,12 @@ fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
                     Rhs::Null => RawExpr::Null,
                     // Dbl exists only at bind - the parser never sees
                     // it; a StrKey would LOSE its grammar marker on the
-                    // way into a RawExpr, so it refuses instead
-                    Rhs::Dbl(_) | Rhs::Param(..) | Rhs::StrKey(_) => return None,
+                    // way into a RawExpr, so it refuses instead; a wide
+                    // INT128 literal has no RawExpr carrier, so BETWEEN/IN
+                    // over one refuses rather than truncating a bound
+                    Rhs::Dbl(_) | Rhs::Param(..) | Rhs::StrKey(_) | Rhs::Int128(_) => {
+                        return None
+                    }
                 })
             };
             match t.get(p3) {
@@ -43542,6 +43596,14 @@ fn typed_term(idx: usize, kind: ColKind, raw: RawKind) -> Option<Term> {
             ColKind::Text => Term::TextNumCmp(idx, op, Rhs::Int(n)),
             _ => return None,
         },
+        // a wide INT128 literal against a plain i64-storage integer
+        // column: no such column can equal it, but the compare is
+        // meaningful (`> ` / `< ` decide, `=` finds nothing), so it
+        // aligns in i128 via NumCmp and scans - a text column refuses.
+        RawKind::Cmp(op, Rhs::Int128(n)) => match kind {
+            ColKind::Int => Term::NumCmp(idx, op, Rhs::Int128(n)),
+            _ => return None,
+        },
         // a decimal literal against an integer column compares exactly
         // (A > 1.5 is meaningful, A = 1.5 simply never matches)
         RawKind::Cmp(op, Rhs::Num(r, s)) => match kind {
@@ -43822,8 +43884,10 @@ fn resolve_expr_term(
             Rhs::Str(s) => Expr::Str(s.clone()),
             Rhs::Null => Expr::Null,
             // Dbl exists only at bind - unreachable-defensive here; a
-            // StrKey refuses rather than drop its grammar marker
-            Rhs::Dbl(_) | Rhs::Param(..) | Rhs::StrKey(_) => return None,
+            // StrKey refuses rather than drop its grammar marker; a wide
+            // INT128 literal has no Expr carrier (Expr::Int is i64), so an
+            // expression comparison over one refuses
+            Rhs::Dbl(_) | Rhs::Param(..) | Rhs::StrKey(_) | Rhs::Int128(_) => return None,
         })
     };
     let term = match &rt.kind {
@@ -44346,6 +44410,11 @@ fn numeric_term(
         RawKind::CmpExpr(..) => return None, // see typed_term
         RawKind::Cmp(op, Rhs::Int(n)) => Term::NumCmp(idx, op, Rhs::Num(n, 0)),
         RawKind::Cmp(op, Rhs::Num(r, s)) => Term::NumCmp(idx, op, Rhs::Num(r, s)),
+        // an integer literal too wide for i64: a NUMERIC(38,0)/INT128
+        // magnitude. It travels as `Rhs::Int128`; the compare aligns it
+        // against the column in i128 ([num_cmp]) and the IDX_BCD key is
+        // built from it directly ([pick_for_terms]).
+        RawKind::Cmp(op, Rhs::Int128(n)) => Term::NumCmp(idx, op, Rhs::Int128(n)),
         RawKind::Cmp(_, Rhs::Null) => Term::Unknown,
         RawKind::Cmp(op, Rhs::Param(slot, _)) => {
             if !param_target_ok(d) {

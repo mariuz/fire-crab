@@ -119,7 +119,9 @@ ran=0
 #         other through the ON
 #   BIG   a NUMERIC(38,0) (INT128 / IDX_BCD) index, plus one real 38-digit
 #         key - an i64-range join value keys its own IDX_BCD band and
-#         navigates past the 39-digit one
+#         navigates past the 39-digit one; and a WIDE integer LITERAL
+#         (>i64) in a WHERE keys and scan-compares in i128 (section 8),
+#         which fire-crab used to refuse at the tokenizer
 make_db() {
     rm -f "$1"
     "$ISQL" -q -b -user "$U" -pas "$P" <<EOF >/dev/null 2>&1 || return 1
@@ -534,6 +536,16 @@ same3 "two indexed ON columns (one band + ON residual)" \
     "SELECT CHI.ID, BAND.N FROM CHI LEFT JOIN BAND ON BAND.K1 = CHI.K AND BAND.K2 = CHI.K ORDER BY CHI.ID, BAND.N"
 same3 "the NUMERIC(38,0) INT128 inner" \
     "SELECT CHI.ID, BIG.N FROM CHI LEFT JOIN BIG ON BIG.K = CHI.K ORDER BY CHI.ID"
+# a WIDE integer LITERAL (>i64) against the INT128 column - fire-crab
+# used to REFUSE it at the tokenizer; now it keys the IDX_BCD band (index
+# server) and scan-compares in i128 (FC_NO_INDEX server), both the
+# engine's answer. The literal itself is 38 nines, a genuine INT128.
+same3 "an INT128 literal equality (the 38-digit key)" \
+    "SELECT N FROM BIG WHERE K = 99999999999999999999999999999999999999"
+same3 "an INT128 literal range (> a value past i64)" \
+    "SELECT COUNT(*) FROM BIG WHERE K > 1000000000000000000000"
+same3 "an INT128 literal equality on a small in-range value" \
+    "SELECT N FROM BIG WHERE K = 40000000000000000000 OR K = 7 ORDER BY N"
 same3 "the chain of two LEFT JOINs" \
     "SELECT CHI.ID, PAR.N, DUP.N FROM CHI LEFT JOIN PAR ON PAR.K = CHI.K LEFT JOIN DUP ON DUP.K = PAR.K WHERE CHI.ID < 30 ORDER BY CHI.ID, DUP.N"
 same3 "the unindexed inner" \
