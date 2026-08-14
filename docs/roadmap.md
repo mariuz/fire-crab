@@ -2233,10 +2233,28 @@ plus *the subsystem is now on the path*.
       (Infinity, by contrast, is a normal ordered value `decfloat::cmp`
       handles). Gated (+20): the full DECFLOAT(34) and DECFLOAT(16) column
       matrix, a scaled-column vs DECFLOAT literal, and the NaN-trap SQLSTATE
-      parity. The one adjacent gap still open: a wide INT128 *literal in
-      INSERT VALUES* does not parse. Still refused deliberately: DECFLOAT
-      in arithmetic / nested, a DECFLOAT column against a text/param
-      literal or LIKE, and a value past DECFLOAT range.
+      parity.
+
+      *And the wide INT128 LITERAL in INSERT VALUES came next* — the value
+      list already tokenised a magnitude past i64 as `Tok::Int128` (my
+      earlier tokenizer work), but the store's arm-match refused it (`_ =>
+      None`). A new `InsVal::Int128(i128)` and a direct branch in
+      `encode_set_value` (a new `WireParam` variant would have touched 152
+      match sites, so it encodes STRAIGHT to the column bytes) stores it:
+      into an INT128 or a `NUMERIC(38,x)` it rescales in i128 (via
+      `rescale_int`, the shared `exact_int_le` writing the little-endian
+      field), and into a DECFLOAT(34) it promotes to decimal128
+      (`dec128_from_int_digits`, rounding a 39-digit i128 to 34 sig). A
+      narrower integer column (BIGINT and down) OVERFLOWS - refused at
+      prepare (the engine raises 22003 at execute; both reject, the row
+      never lands). i128::MAX and i128::MIN both store; the negative folds
+      in the tokenizer as always. Gated (+3): fire-crab WRITES the rows and
+      the ENGINE reading the same file back byte-identically is the proof
+      (INT128, NUMERIC(38,2) x100, DECFLOAT(34) exact and rounded), plus
+      the BIGINT-overflow rejection. Still refused deliberately: a value
+      PAST i128::MAX in INSERT (`Tok::DecFloat34` into a DECFLOAT column -
+      its own slice), DECFLOAT in arithmetic / nested, a DECFLOAT column
+      against a text/param literal or LIKE, and a value past DECFLOAT range.
 
       *And the wide OUTER value came with it* — the probe's `band` capped
       an `Int128` driving value at `i64` and scanned; now it carries the

@@ -9191,6 +9191,11 @@ fn build_projcols(
 /// and stores the NEW value.
 enum InsVal {
     Int(i64),
+    /// an integer literal too WIDE for i64 - a NUMERIC(38,0)/INT128
+    /// magnitude (up to i128::MAX). Rescales exactly into an exact-numeric
+    /// column (INT128, or a NUMERIC(38,x) with room) and promotes into a
+    /// DECFLOAT(34); a narrower integer column overflows and refuses.
+    Int128(i128),
     /// a decimal literal as (raw, scale): rescales exactly into the
     /// target column or refuses (1.5 fits NUMERIC(9,2) as 1.50; it
     /// does not fit an INTEGER)
@@ -15143,6 +15148,7 @@ fn plan_insert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
         for part in split_top_commas(&toks) {
             vals.push(match part {
                 [Tok::Int(n)] => InsVal::Int(*n),
+                [Tok::Int128(n)] => InsVal::Int128(*n),
                 [Tok::Dec(r, s)] => InsVal::Dec(*r, *s),
                 [Tok::Str(v)] => InsVal::Str(v.clone()),
                 [Tok::FnExpr(RawExpr::Bool(b))] => InsVal::Bool(*b),
@@ -15451,9 +15457,28 @@ fn build_insert_image(
 /// literal into a scaled NUMERIC column rescales exactly like an
 /// integer parameter does (5 into NUMERIC(9,2) stores 500).
 fn encode_set_value(d: &Descriptor, v: &InsVal) -> Option<Option<Vec<u8>>> {
+    // a wide magnitude has no i64 WireParam; encode it straight into the
+    // column bytes. Exact-numeric targets rescale in i128 (a too-narrow one
+    // overflows -> refuse); a DECFLOAT(34) target promotes the magnitude to
+    // decimal128, rounding to 34 significant digits as the engine does.
+    if let InsVal::Int128(n) = v {
+        return Some(Some(match d.dtype {
+            dtype::SHORT | dtype::LONG | dtype::INT64 | dtype::INT128 => {
+                exact_int_le(d.dtype, rescale_int(*n, 0, d.scale)?)?
+            }
+            dtype::DEC128 => fire_crab_ods::decfloat::dec128_from_int_digits(
+                *n < 0,
+                n.unsigned_abs().to_string().as_bytes(),
+            )
+            .to_le_bytes()
+            .to_vec(),
+            _ => return None,
+        }));
+    }
     let wp = match v {
         InsVal::Null => WireParam::Null,
         InsVal::Int(n) => WireParam::Int(*n, 0),
+        InsVal::Int128(_) => unreachable!("handled above"),
         InsVal::Dec(r, s) => WireParam::Int(*r, *s),
         InsVal::Str(text) => WireParam::Text(text.clone()),
         InsVal::Bool(b) => WireParam::Bool(*b),
@@ -16293,17 +16318,24 @@ fn rescale_int(v: i128, from: i8, to: i8) -> Option<i128> {
 /// then truncates), a blr_timestamp truncates into DATE or TIME
 /// targets (node sends JS Dates that way for all three temporal
 /// column types).
+/// The little-endian field bytes for an exact-numeric column holding
+/// `stored` (already rescaled to the column's scale). None when the value
+/// does not fit the target's width - which for a wide magnitude into a
+/// SHORT/LONG/INT64 column is an overflow refusal (the engine raises 22003
+/// there; this server refuses the statement, never truncates).
+fn exact_int_le(dtype: u8, stored: i128) -> Option<Vec<u8>> {
+    Some(match dtype {
+        dtype::SHORT => i16::try_from(stored).ok()?.to_le_bytes().to_vec(),
+        dtype::LONG => i32::try_from(stored).ok()?.to_le_bytes().to_vec(),
+        dtype::INT64 => i64::try_from(stored).ok()?.to_le_bytes().to_vec(),
+        dtype::INT128 => stored.to_le_bytes().to_vec(),
+        _ => return None,
+    })
+}
+
 fn encode_wire_value(d: &Descriptor, wp: &WireParam) -> Option<Option<Vec<u8>>> {
     let flen = d.length as usize;
-    let int_bytes = |stored: i128| -> Option<Vec<u8>> {
-        Some(match d.dtype {
-            dtype::SHORT => i16::try_from(stored).ok()?.to_le_bytes().to_vec(),
-            dtype::LONG => i32::try_from(stored).ok()?.to_le_bytes().to_vec(),
-            dtype::INT64 => i64::try_from(stored).ok()?.to_le_bytes().to_vec(),
-            dtype::INT128 => stored.to_le_bytes().to_vec(),
-            _ => return None,
-        })
-    };
+    let int_bytes = |stored: i128| -> Option<Vec<u8>> { exact_int_le(d.dtype, stored) };
     Some(match wp {
         WireParam::Null => None,
         WireParam::Int(v, ws) => Some(match d.dtype {
@@ -50318,6 +50350,29 @@ mod tests {
         // type mismatches are refused, NULL passes through
         assert!(encode_set_value(&d(dtype::LONG, 4, 0), &InsVal::Str("x".into())).is_none());
         assert_eq!(encode_set_value(&d(dtype::LONG, 4, 0), &InsVal::Null), Some(None));
+        // a WIDE INT128 literal stores into an INT128 column verbatim,
+        // rescales into a NUMERIC(38,2) (x100), and OVERFLOWS a narrower
+        // integer column (refused, never truncated)
+        let wide = 99999999999999999999i128; // 20 digits, past i64
+        assert_eq!(
+            encode_set_value(&d(dtype::INT128, 16, 0), &InsVal::Int128(wide)),
+            Some(Some(wide.to_le_bytes().to_vec()))
+        );
+        assert_eq!(
+            encode_set_value(&d(dtype::INT128, 16, -2), &InsVal::Int128(wide)),
+            Some(Some((wide * 100).to_le_bytes().to_vec()))
+        );
+        assert!(encode_set_value(&d(dtype::INT64, 8, 0), &InsVal::Int128(wide)).is_none());
+        // into a DECFLOAT(34) it promotes to decimal128 - the same bits the
+        // literal encoder builds, verified by decoding to the value back
+        let bits = match encode_set_value(&d(dtype::DEC128, 16, 0), &InsVal::Int128(wide)) {
+            Some(Some(b)) => u128::from_le_bytes(b.try_into().unwrap()),
+            other => panic!("expected dec128 bytes, got {other:?}"),
+        };
+        assert_eq!(
+            fire_crab_ods::decfloat::decode_dec128(bits),
+            fire_crab_ods::decfloat::Dec::Finite { neg: false, coeff: wide as u128, exp: 0 }
+        );
     }
 
     fn desc(dt: u8, len: u16, scale: i8) -> Descriptor {

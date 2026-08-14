@@ -71,6 +71,10 @@ CREATE TABLE DFNAN (ID INTEGER, D DECFLOAT(34));
 COMMIT;
 INSERT INTO DFNAN VALUES (1, 5);
 INSERT INTO DFNAN VALUES (2, CAST('NaN' AS DECFLOAT(34)));
+COMMIT;
+-- empty target for the wide-INT128-literal INSERT section (1d): fire-crab
+-- WRITES the rows, the engine reading the same file back is the check
+CREATE TABLE WI (ID INTEGER, W INT128, N2 NUMERIC(38,2), DF DECFLOAT(34), B BIGINT);
 COMMIT;"
 
 for f in "$REF" "$WORK"; do
@@ -241,6 +245,36 @@ SQL
 }
 raisef "NaN > 0"  "D > 0"
 raisef "NaN <> 5" "D <> 5"
+
+# --- 1d. WIDE INT128 LITERAL in INSERT VALUES --------------------------
+# The value-list tokenizer reads a magnitude past i64 as Tok::Int128; the
+# store now encodes it into an exact-numeric column (rescaling in i128) or
+# a DECFLOAT(34) (promoting to decimal128) instead of refusing. fire-crab
+# WRITES the rows; the ENGINE reading the SAME file back byte-identically
+# (compared here as fc-served isql vs engine-read isql, one render) is the
+# proof the stored bytes are the engine's.
+inswide() { node_run "INSERT INTO WI (ID, $1) VALUES ($2, $3)" >/dev/null; }
+inswide "W"  1 "99999999999999999999"                            # INT128
+inswide "W"  2 "170141183460469231731687303715884105727"         # i128::MAX
+inswide "W"  3 "-170141183460469231731687303715884105728"        # i128::MIN
+inswide "N2" 4 "99999999999999999999"                            # NUMERIC(38,2), rescales x100
+inswide "DF" 5 "99999999999999999999"                            # DECFLOAT(34), exact
+inswide "DF" 6 "170141183460469231731687303715884105727"         # DECFLOAT(34), rounds to 34 sig
+wi_read() { "$ISQL" -q -b -user "$U" -pas "$P" "$1" 2>&1 <<SQL | strip | grep -v '^$' | tr -s ' \n' ' '
+SET HEADING OFF;
+SELECT ID, W, N2, DF FROM WI ORDER BY ID;
+SQL
+}
+check "wide-literal INSERT: fc-served == engine-read (same file)" \
+      "$(wi_read "127.0.0.1/$PORT:$WORK")" "$(wi_read "$WORK")"
+# a wide literal into a too-narrow BIGINT column: both REJECT the write
+# (the engine raises 22003 at execute, fire-crab refuses at prepare - the
+# row must not land either way)
+bigovf=$(node_run 'INSERT INTO WI (ID, B) VALUES (9, 99999999999999999999)')
+case "$bigovf" in ERR*) echo "OK   wide literal into BIGINT refuses (overflow)" ;;
+    *) echo "DIFF wide-into-BIGINT should refuse, got: $bigovf"; fail=1 ;; esac
+landed=$(node_run 'SELECT COUNT(*) FROM WI WHERE B IS NOT NULL')
+check "the rejected BIGINT row did not land" "$landed" "0"
 
 # --- 2. DML through numeric predicates + decimal literals --------------
 check "fc INSERT with decimal literals" \
