@@ -29,7 +29,7 @@ ISQL="${ISQL:-isql}"; GFIX="${GFIX:-gfix}"; GBAK="${GBAK:-gbak}"
 PORT="${1:-4289}"
 U="${ISC_USER:-SYSDBA}"; P="${ISC_PASSWORD:-masterkey}"
 D=/tmp/fbhandson
-WORK="$D/fc-numw-work.fdb"; REF="$D/fc-numw-ref.fdb"
+WORK="$D/fc-numw-work.fdb"; REF="$D/fc-numw-ref.fdb"; PDB="$D/fc-numw-pdb.fdb"
 FBK="$D/fc-numw-work.fbk"; RST="$D/fc-numw-rst.fdb"
 
 command -v node >/dev/null 2>&1 || { echo "SKIP node not found"; exit 0; }
@@ -86,7 +86,7 @@ done
 
 "$FCWIRE" serve "127.0.0.1:$PORT" "$U" "$P" >/tmp/fc-serve-numw.log 2>&1 &
 srv=$!
-trap 'kill $srv 2>/dev/null; rm -f "$WORK" "$REF" "$FBK" "$RST"' EXIT
+trap 'kill $srv 2>/dev/null; rm -f "$WORK" "$REF" "$FBK" "$RST" "$PDB"' EXIT
 i=0; while [ $i -lt 20 ]; do
     command -v nc >/dev/null 2>&1 && nc -z 127.0.0.1 "$PORT" 2>/dev/null && break
     i=$((i + 1)); sleep 0.1
@@ -99,6 +99,26 @@ kill -0 $srv 2>/dev/null || {
     echo "FAIL fcwire is not running - port $PORT already in use? (see the server log)"
     exit 1
 }
+
+# a SERVER-OWNED copy of DF2 for the engine side of the DECFLOAT `?` gate:
+# node binds through the 3050 engine, which cannot open the plain-path
+# WORK/REF files (created by this user; the server runs as another), so the
+# engine reference gets its own copy created THROUGH the server. fire-crab
+# never serves it. Its DF2 mirrors the one in $SETUP exactly.
+rm -f "$PDB"
+"$ISQL" -q -b -user "$U" -pas "$P" <<EOF >/dev/null 2>&1
+CREATE DATABASE 'localhost:$PDB' USER '$U' PASSWORD '$P' PAGE_SIZE 8192;
+CREATE TABLE DF2 (ID INTEGER, D DECFLOAT(34), S DECFLOAT(16));
+COMMIT;
+INSERT INTO DF2 VALUES (1, 100, 100);
+INSERT INTO DF2 VALUES (2, 1.5, 1.5);
+INSERT INTO DF2 VALUES (3, -2.5, -2.5);
+INSERT INTO DF2 VALUES (4, 340282366920938463463374607431768211455, 250);
+INSERT INTO DF2 VALUES (5, NULL, NULL);
+INSERT INTO DF2 VALUES (6, CAST('Infinity' AS DECFLOAT(34)), 7);
+COMMIT;
+EOF
+chmod 666 "$PDB" 2>/dev/null
 
 strip() { sed 's/^[[:space:]]*//; s/[[:space:]]*$//'; }
 node_q() { # <query> [json params]
@@ -277,6 +297,40 @@ SQL
 convraise "bad text"   "D = 'abc'"
 convraise "spaced num" "D = ' 1.5 '"
 convraise "empty text" "D = ''"
+
+# a `?` parameter against a DECFLOAT column: the input slot describes
+# DECFLOAT(34) len 16 and the driver's value promotes to decimal128 - an
+# integer/decimal exactly, a DOUBLE by its EXACT binary value (probed: the
+# f64 1.1 finds no decimal-1.1 row), a text by the decNumber grammar. Bound
+# through node against BOTH servers on the same file.
+node_at() { # <port> <db> <query> <json-params>
+    FC_DB="$2" FC_PORT="$1" FC_Q="$3" FC_P="$4" timeout 15 node -e '
+      process.on("uncaughtException",()=>{console.log("CONN_ERR");process.exit(1);});
+      const F=require("node-firebird");
+      F.attach({host:"127.0.0.1",port:+process.env.FC_PORT,database:process.env.FC_DB,user:"SYSDBA",password:"masterkey"},(e,db)=>{
+        if(e){console.log("CONN_ERR");process.exit(1);}
+        db.query(process.env.FC_Q,JSON.parse(process.env.FC_P),(e2,r)=>{
+          if(e2){console.log("ERR");db.detach();process.exit(0);}
+          if(!r||!r.length){console.log("(none)");db.detach();process.exit(0);}
+          console.log(r.map(x=>Object.values(x).join()).join(","));db.detach();process.exit(0);
+        });
+      });' 2>/dev/null
+}
+dfparam() { # <label> <where-with-?> <json-params>
+    local fc is
+    fc=$(node_at "$PORT" "$WORK" "SELECT ID FROM DF2 WHERE $2 ORDER BY ID" "$3" | strip)
+    is=$(node_at "${FC_REAL_PORT:-3050}" "$PDB" "SELECT ID FROM DF2 WHERE $2 ORDER BY ID" "$3" | strip)
+    check "param $1 [$2 $3]" "$fc" "$is"
+}
+dfparam "int"         "D = ?"  "[100]"
+dfparam "double"      "D = ?"  "[1.5]"
+dfparam "double miss" "D = ?"  "[1.1]"
+dfparam "gt zero"     "D > ?"  "[0]"
+dfparam "le neg"      "D <= ?" "[-2.5]"
+dfparam "text"        "D = ?"  '["1.5"]'
+dfparam "null"        "D = ?"  "[null]"
+dfparam "D16 int"     "S = ?"  "[100]"
+dfparam "D16 double"  "S = ?"  "[1.5]"
 
 # --- 1d. WIDE INT128 LITERAL in INSERT VALUES --------------------------
 # The value-list tokenizer reads a magnitude past i64 as Tok::Int128; the

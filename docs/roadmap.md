@@ -2305,11 +2305,26 @@ plus *the subsystem is now on the path*.
       rare and would need the infinity/NaN encodings and the literal-side
       trap. Gated (numericwhere +10): the convertible matrix (sign, dot,
       exponent, scientific, cohort) and the 22018 raise on `'abc'`/`' 1.5
-      '`/`''`; a `text_to_dec128` grammar unit test. Still refused
-      deliberately: a DECFLOAT column against a PARAMETER (needs the input
-      slot described DECFLOAT and the bind to decode a decimal128 - its own
-      slice) or LIKE, DECFLOAT in arithmetic / nested, the `Infinity`/`NaN`
-      text specials, and a value past DECFLOAT(34) range.
+      '`/`''`; a `text_to_dec128` grammar unit test.
+
+      *And a `?` PARAMETER against a DECFLOAT column came next* — the input
+      slot describes as the column itself (probed: DECFLOAT(34) len 16), so
+      `decfloat_term` registers `params[slot] = d.clone()` and produces a
+      `Rhs::Param(slot, ColKind::DecFloat)` (a new binding marker). At bind,
+      `bind_rhs` promotes the driver's value to decimal128: an integer or
+      decimal `v * 10^ws` encodes exactly, a text value goes through the
+      same `text_to_dec128`, and a DOUBLE promotes by its EXACT binary value
+      - probed decisively: the f64 `1.1` finds NO decimal-`1.1` row, because
+      the double is `1.1000...0888`, not the decimal `1.1` (only exact
+      binary fractions like `1.5` match). fire-crab reproduces that exact
+      expansion by formatting past 34 significant digits and re-parsing.
+      Gated (numericwhere +9): int, exact and inexact double, text and NULL
+      params over DECFLOAT(34) and DECFLOAT(16), each bound through node
+      against BOTH servers - the engine side on its own server-owned copy,
+      since the 3050 engine cannot open the plain-path file fire-crab
+      serves. Still refused deliberately: a DECFLOAT column against LIKE,
+      DECFLOAT in arithmetic / nested, the `Infinity`/`NaN` text specials,
+      and a value past DECFLOAT(34) range.
 
       *And the wide OUTER value came with it* — the probe's `band` capped
       an `Int128` driving value at `i64` and scanned; now it carries the

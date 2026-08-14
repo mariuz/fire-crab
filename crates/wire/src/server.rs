@@ -5758,6 +5758,45 @@ impl Predicate {
                 // a numeric column's parameter keeps its wire scale -
                 // num_cmp aligns it against the stored value exactly
                 (ColKind::Numeric, WireParam::Int(v, ws)) => Some(Rhs::Num(*v, *ws)),
+                // a DECFLOAT column's parameter promotes to decimal128: an
+                // integer/decimal value `v * 10^ws` encodes exactly (the
+                // scale is the exponent), a text value converts by the
+                // decNumber grammar and raises 22018 when it cannot.
+                (ColKind::DecFloat, WireParam::Int(v, ws)) => Some(Rhs::DecFloat34(
+                    fire_crab_ods::decfloat::encode_dec128(
+                        *v < 0,
+                        (*v as i128).unsigned_abs(),
+                        *ws as i32,
+                    ),
+                )),
+                (ColKind::DecFloat, WireParam::Text(s)) => Some(Rhs::DecFloat34(
+                    text_to_dec128(s).ok_or_else(|| format!("conversion error from string \"{}\"", s))?,
+                )),
+                // a DOUBLE value (a driver sends a non-integer JS number as
+                // blr_double) promotes by its EXACT binary value, rounded to
+                // 34 significant - probed: `DF = ?` bound the f64 1.1 finds
+                // NO 1.1 row, because the double is 1.1000...0888, not the
+                // decimal 1.1. Formatting past 34 significant digits then
+                // re-parsing reproduces that exact expansion.
+                (ColKind::DecFloat, WireParam::Double(x)) => {
+                    if !x.is_finite() {
+                        return Err("cannot convert a non-finite value to DECFLOAT".into());
+                    }
+                    if *x == 0.0 {
+                        Some(Rhs::DecFloat34(fire_crab_ods::decfloat::encode_dec128(
+                            x.is_sign_negative(),
+                            0,
+                            0,
+                        )))
+                    } else {
+                        let e10 = x.abs().log10().floor() as i32;
+                        let prec = (40 - e10).clamp(0, 700) as usize;
+                        let s = format!("{:.*}", prec, x);
+                        Some(Rhs::DecFloat34(
+                            text_to_dec128(&s).ok_or("could not convert the double value")?,
+                        ))
+                    }
+                }
                 // A TEXT parameter against a NUMERIC column. The engine
                 // converts it here too - `WHERE N_INT = ?` with `'5'`
                 // answers rows - but by DIFFERENT rules from the store
@@ -35836,6 +35875,7 @@ impl Expr {
                         ColKind::Numeric
                         | ColKind::Temporal(_)
                         | ColKind::Approx
+                        | ColKind::DecFloat
                         | ColKind::Bool,
                     ) => None,
                     None if is_numeric_col(d) => Some(ExprType::Numeric),
@@ -41532,6 +41572,10 @@ enum ColKind {
     Temporal(TKind),
     /// a FLOAT/DOUBLE PRECISION parameter target - a binding marker only
     Approx,
+    /// a DECFLOAT(16/34) parameter target - a binding marker only. The
+    /// bound value (an integer, decimal or text the driver sends) promotes
+    /// to decimal128 for the comparison, as the engine coerces it.
+    DecFloat,
     /// a BOOLEAN parameter target - a binding marker only
     Bool,
 }
@@ -44422,7 +44466,7 @@ fn resolve_predicate(
                 // numeric comparison surface
                 None if is_numeric_col(d) => numeric_term(fid, rt.kind, d, params)?,
                 // DECFLOAT columns: the decimal128 comparison surface
-                None if is_decfloat_col(d) => decfloat_term(fid, rt.kind)?,
+                None if is_decfloat_col(d) => decfloat_term(fid, rt.kind, d, params)?,
                 // a DATE/TIME/TIMESTAMP column takes the EXPRESSION
                 // path. Its comparison rules already live there -
                 // `value_cmp` converts a DATE to midnight against a
@@ -45160,10 +45204,25 @@ fn numeric_term(
 /// anywhere. A text/parameter literal, LIKE/STARTING/SIMILAR, and an
 /// expression right side are separate surfaces and refuse (fail closed);
 /// a DECFLOAT literal never keys an index, so nothing here bands.
-fn decfloat_term(idx: usize, raw: RawKind) -> Option<Term> {
+fn decfloat_term(
+    idx: usize,
+    raw: RawKind,
+    d: &Descriptor,
+    params: &mut Vec<Option<Descriptor>>,
+) -> Option<Term> {
     Some(match raw {
         RawKind::Const(b) => Term::Const(b),
         RawKind::Cmp(_, Rhs::Null) => Term::Unknown,
+        // a `?` against a DECFLOAT column: the input slot describes as the
+        // column itself (probed: DECFLOAT(34) len 16), and the driver's
+        // value promotes to decimal128 at bind ([ColKind::DecFloat])
+        RawKind::Cmp(op, Rhs::Param(slot, _)) => {
+            if params.len() <= slot {
+                params.resize(slot + 1, None);
+            }
+            params[slot] = Some(d.clone());
+            Term::NumCmp(idx, op, Rhs::Param(slot, ColKind::DecFloat))
+        }
         // a TEXT literal converts to decimal128 by the engine's decNumber
         // grammar; a non-convertible one raises 22018 PER ROW (UNKNOWN over
         // NULL, no raise on an empty table), which is exactly what
