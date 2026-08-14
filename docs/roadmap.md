@@ -2164,9 +2164,36 @@ plus *the subsystem is now on the path*.
       as the engine does (it promotes to DECFLOAT for a bare wider literal
       but RAISES on integer arithmetic overflow, probed). Gated in
       `serve-real-numsubtype.sh`: arithmetic type+value, WHERE-side
-      counts, and SQLSTATE parity on the two overflow forms. Still
-      refused: a past-`i128` magnitude (DECFLOAT(34) - no `Value` carrier
-      exists, its own slice).
+      counts, and SQLSTATE parity on the two overflow forms.
+
+      *And the PAST-i128 magnitude is a DECFLOAT(34) literal now* — a bare
+      integer literal too big for `i128` (past `170141183460469231731687303715884105727`)
+      is what the engine describes DECFLOAT(34) (`sqltype` 32762, len 16),
+      rounding the magnitude to 34 significant digits HALF-UP (round half
+      AWAY from zero - PROBED, distinct from the HALF-EVEN the text-compare
+      grammar uses) and carrying it as an IEEE 754-2008 decimal128. The
+      `Value::DecFloat34` carrier and the DPD *decode* already existed (for
+      stored DECFLOAT columns); the missing half was an *encoder* - the
+      `ods::decfloat` module gained the vendored `BIN2DPD` table (decDPD.h),
+      `encode_dec128(neg, coeff, exp)` (the exact inverse of `decode_dec128`;
+      the exponent's top two bits are always < 0b11 for a valid decimal128,
+      so the combination-field split never collides), and
+      `dec128_from_int_digits` (the HALF-UP round + encode), all unit-tested
+      by encode→decode identity and against the probed rounding cases.
+      `Expr`/`RawExpr` grew a `DecFloat34(u128)` carrier (raw bits);
+      `build_expr_col_from` SHORT-CIRCUITS it to `(Wire::Dec34, 32762, 16)`
+      before the exact-numeric describe (its `type_of` deliberately declines,
+      fail-closing any attempt to nest it in arithmetic - a later slice). The
+      SIGN is folded in before the type is chosen (`neg_wide_min`, the
+      i128-boundary analog of the existing `neg_i64_min`): exactly `-2^127`
+      is `i128::MIN`, an INT128 - only larger magnitudes stay DECFLOAT with
+      the sign carried into the encoding. Wire *send* already handled
+      `Value::DecFloat34` (`xdr_dec128`). Gated in `serve-real-numsubtype.sh`:
+      DECFLOAT type (positive, negative, u128::MAX, 52-digit), the INT128
+      `-2^127` boundary, and value round-trips (exact-half, below-half, the
+      all-nines carry, and negatives). Still refused deliberately: DECFLOAT
+      in a WHERE literal / arithmetic / nested (its own slice, like INT128's
+      WHERE-literal was), and a value past DECFLOAT range.
 
       *And the wide OUTER value came with it* — the probe's `band` capped
       an `Int128` driving value at `i64` and scanned; now it carries the

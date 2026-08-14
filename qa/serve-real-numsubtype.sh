@@ -136,5 +136,41 @@ qstate() {
 qstate "SELECT 170141183460469231731687303715884105727 + 1 FROM RDB\$DATABASE;"
 qstate "SELECT 100000000000000000000 * 100000000000000000000 FROM RDB\$DATABASE;"
 
+# PAST i128::MAX a bare integer literal is a DECFLOAT(34) (sqltype 32762,
+# len 16): the magnitude no longer fits an exact 128-bit integer, so the
+# engine rounds it to 34 significant digits (HALF-UP) and carries it as an
+# IEEE 754 decimal128. fire-crab now ENCODES that decimal128 (the DPD form)
+# from the digits itself - the module was decode-only before - so the value
+# decodes on the client to the same E-notation isql prints.
+dfty() { printf 'SET SQLDA_DISPLAY ON;\nSELECT %s FROM T;\n' "$2" |
+    "$ISQL" -q -user "$U" -pas "$P" "$1" 2>&1 | grep -iE 'sqltype:' | head -1 |
+    grep -oiE 'DECFLOAT\([0-9]+\) .*len: [0-9]+' | sed 's/Nullable //'; }
+dfboth() { # <literal> - compares the DECFLOAT type name, scale-less, len
+    local e c
+    e=$(dfty "$E" "$1"); c=$(dfty "$F" "$1")
+    ran=$((ran + 1))
+    if [ -n "$e" ] && [ "$e" = "$c" ]; then echo "OK   df $1 [$e]"
+    else echo "DIFF df $1"; echo "     engine: [$e]"; echo "     fcrab:  [$c]"; fail=1; fi
+}
+# type is DECFLOAT(34)/len 16, the boundary is MAGNITUDE > i128::MAX
+dfboth "170141183460469231731687303715884105728"    # i128::MAX + 1
+dfboth "340282366920938463463374607431768211455"    # u128::MAX (39 digits)
+dfboth "9999999999999999999999999999999999999999999999999999" # 52 nines
+dfboth "-170141183460469231731687303715884105729"   # negative, past i128::MIN
+dfboth "-9999999999999999999999999999999999999999999999999999"
+# the SIGN folds in before the type is chosen: exactly -2^127 is i128::MIN,
+# an INT128 (len 16) - NOT DECFLOAT (the boundary the magnitude alone misses)
+both "-170141183460469231731687303715884105728"
+# and every value round-trips (rounded HALF-UP to 34 sig digits, sign carried)
+bothval "170141183460469231731687303715884105728"
+bothval "340282366920938463463374607431768211455"
+bothval "9999999999999999999999999999999999999999999999999999"
+bothval "222222222222222222222222222222222250000"    # exact-half -> UP (probed)
+bothval "222222222222222222222222222222222249999"    # below-half  -> down
+bothval "99999999999999999999999999999999999999999"   # all-nines carry -> 10^41
+bothval "-170141183460469231731687303715884105728"   # -2^127 = i128::MIN, exact
+bothval "-170141183460469231731687303715884105729"   # negative DECFLOAT
+bothval "-9999999999999999999999999999999999999999999999999999"
+
 echo "ran $ran checks"
 exit $fail

@@ -8967,6 +8967,27 @@ fn build_expr_col(
 /// through [resolve_proj_expr] (collecting the `?` slots) and hand the
 /// result here without a second resolution.
 fn build_expr_col_from(e: Expr, name: &str, descs: &[Descriptor]) -> Option<ProjCol> {
+    // a DECFLOAT(34) literal (an integer magnitude past i128::MAX) rides
+    // its own wire form - not an exact-numeric width, so it short-circuits
+    // the scaled-integer describe below. `type_of` deliberately declines a
+    // DecFloat34 (nesting it in arithmetic/conditionals is a later slice),
+    // so this MUST precede the `type_of(descs)?` match.
+    if matches!(e, Expr::DecFloat34(_)) {
+        return Some(ProjCol {
+            name: name.to_string(),
+            oct_length: 16,
+            fname: None,
+            relation: None,
+            rel_alias: None,
+            field_id: 0,
+            wire: Wire::Dec34,
+            sql_type: nullable(32762),
+            length: 16,
+            scale: 0,
+            sub_type: 0,
+            expr: Some(e),
+        });
+    }
     // an exact-numeric result travels as a scaled integer - INT64-backed
     // (SQL_INT64, the raw integer on the wire, the client divides), or
     // INT128-backed (SQL_INT128, 16 bytes) when the engine's dtype rules
@@ -31658,6 +31679,9 @@ enum RawExpr {
     /// an integer literal too WIDE for i64 (up to i128::MAX) - lowers to
     /// [Expr::Int128] and describes INT128, as the engine does
     Int128(i128),
+    /// an integer literal PAST i128::MAX - lowers to [Expr::DecFloat34]
+    /// and describes DECFLOAT(34). Carries the encoded decimal128 bits
+    DecFloat34(u128),
     /// a decimal literal `d.dd`: (raw integer, scale) - `1.5` is
     /// `(15, -1)`, `1.50` is `(150, -2)` (trailing zeros count, as the
     /// engine's scale does)
@@ -32452,14 +32476,82 @@ fn neg_i64_min(b: &[char], pos: &mut usize) -> Option<RawExpr> {
     Some(RawExpr::Int(i64::MIN))
 }
 
+/// Consume a digit run PAST i128::MAX under a unary minus (spaces and
+/// wrapping parens included) and answer the SIGNED literal, folding the
+/// sign in before the type is chosen - the engine's rule, and the same
+/// one [neg_i64_min] applies one boundary down.
+///
+/// The magnitude alone would be a DECFLOAT(34) ([Expr::DecFloat34]); the
+/// sign can pull it back to INT128 at exactly ONE value, `2^127`, whose
+/// negation is `i128::MIN`. Every larger magnitude stays DECFLOAT with
+/// the sign carried into its encoding. Only fires when the magnitude is
+/// past i128::MAX, so the working `-<i64>` (Neg(Int)) and `-<i128>`
+/// (Neg(Int128)) paths are left exactly as they were.
+fn neg_wide_min(b: &[char], pos: &mut usize) -> Option<RawExpr> {
+    let mut p = *pos;
+    let mut opens = 0usize;
+    loop {
+        while b.get(p).is_some_and(|c| c.is_whitespace()) {
+            p += 1;
+        }
+        if b.get(p) == Some(&'(') {
+            opens += 1;
+            p += 1;
+        } else {
+            break;
+        }
+    }
+    let dstart = p;
+    while b.get(p).is_some_and(|c| c.is_ascii_digit()) {
+        p += 1;
+    }
+    if p == dstart {
+        return None;
+    }
+    // a `.` or exponent makes it a different literal entirely
+    if b.get(p).is_some_and(|c| *c == '.' || *c == 'e' || *c == 'E') {
+        return None;
+    }
+    let digits: String = b[dstart..p].iter().collect();
+    // only a magnitude PAST i128::MAX is ours; narrower ones keep their
+    // existing Neg(Int)/Neg(Int128) parse
+    if digits.parse::<i128>().is_ok() {
+        return None;
+    }
+    let e = match format!("-{digits}").parse::<i128>() {
+        // the sign pulled it back into range: exactly i128::MIN
+        Ok(n) => RawExpr::Int128(n),
+        // still past i128 - a negative DECFLOAT(34)
+        Err(_) => {
+            RawExpr::DecFloat34(fire_crab_ods::decfloat::dec128_from_int_digits(true, digits.as_bytes()))
+        }
+    };
+    for _ in 0..opens {
+        while b.get(p).is_some_and(|c| c.is_whitespace()) {
+            p += 1;
+        }
+        if b.get(p) != Some(&')') {
+            return None;
+        }
+        p += 1;
+    }
+    *pos = p;
+    Some(e)
+}
+
 fn expr_unary(b: &[char], pos: &mut usize) -> Option<RawExpr> {
     skip_ws(b, pos);
     if b.get(*pos) == Some(&'-') {
         *pos += 1;
         // the sign folds into the literal before the type is chosen -
-        // see [neg_i64_min]
+        // see [neg_i64_min] (the i64::MIN boundary) and [neg_wide_min]
+        // (the i128::MIN boundary and negative DECFLOAT)
         let after_minus = *pos;
         if let Some(e) = neg_i64_min(b, pos) {
+            return Some(e);
+        }
+        *pos = after_minus;
+        if let Some(e) = neg_wide_min(b, pos) {
             return Some(e);
         }
         *pos = after_minus;
@@ -32587,8 +32679,14 @@ fn expr_atom(b: &[char], pos: &mut usize) -> Option<RawExpr> {
             match text.parse::<i64>() {
                 Ok(n) => Some(RawExpr::Int(n)),
                 // a magnitude past i64 up to i128::MAX is an INT128
-                // literal; wider still is DECFLOAT, which stays refused
-                Err(_) => text.parse::<i128>().ok().map(RawExpr::Int128),
+                // literal; past i128::MAX the engine describes DECFLOAT(34),
+                // rounding to 34 significant digits (HALF-UP)
+                Err(_) => Some(match text.parse::<i128>() {
+                    Ok(n) => RawExpr::Int128(n),
+                    Err(_) => RawExpr::DecFloat34(
+                        fire_crab_ods::decfloat::dec128_from_int_digits(false, text.as_bytes()),
+                    ),
+                }),
             }
         }
         c if c.is_alphabetic() || *c == '_' || *c == '$' || *c == '"' => {
@@ -32924,6 +33022,7 @@ fn raw_bad_substring_len(e: &RawExpr) -> Option<i64> {
         RawExpr::Col(_)
         | RawExpr::Int(_)
         | RawExpr::Int128(_)
+        | RawExpr::DecFloat34(_)
         | RawExpr::Dec(..)
         | RawExpr::Str(_)
         | RawExpr::Null
@@ -33633,6 +33732,7 @@ fn resolve_expr_inner(
         }
         RawExpr::Int(n) => Expr::Int(*n),
         RawExpr::Int128(n) => Expr::Int128(*n),
+        RawExpr::DecFloat34(b) => Expr::DecFloat34(*b),
         RawExpr::Dec(raw, scale) => Expr::Dec(*raw, *scale),
         RawExpr::Double(d) => Expr::Double(*d),
         RawExpr::Bool(b) => Expr::Bool(*b),
@@ -33732,9 +33832,14 @@ enum Expr {
     /// magnitude, up to i128::MAX. It evaluates to `Value::Int128` and
     /// DESCRIBES as INT128 (`sqltype` 32752, len 16, scale 0), as the
     /// engine describes a bare magnitude between i64::MAX and i128::MAX.
-    /// Past i128::MAX the engine describes DECFLOAT(34), which stays
-    /// refused (its own representation).
+    /// Past i128::MAX the engine describes DECFLOAT(34).
     Int128(i128),
+    /// an integer literal PAST i128::MAX: the engine describes it
+    /// DECFLOAT(34) (`sqltype` 32762, len 16), rounding the magnitude to
+    /// 34 significant digits HALF-UP. Carries the encoded decimal128 bits
+    /// ([fire_crab_ods::decfloat::encode_dec128]); evaluates to
+    /// `Value::DecFloat34`.
+    DecFloat34(u128),
     /// a decimal literal: (raw integer, scale)
     Dec(i64, i8),
     /// an APPROXIMATE literal - what a string literal becomes when the
@@ -35451,6 +35556,11 @@ impl Expr {
                 }
             }
             Expr::Int(_) | Expr::Int128(_) => Some(ExprType::Int),
+            // a DECFLOAT(34) literal has no ExprType of its own (the
+            // describe short-circuits it in build_expr_col_from); declining
+            // here fail-closes any attempt to NEST it (arithmetic, a
+            // conditional) - a later slice
+            Expr::DecFloat34(_) => None,
             Expr::Dec(..) => Some(ExprType::Numeric),
             Expr::Double(_) => Some(ExprType::Approx),
             Expr::Bool(_) | Expr::Cond(_) => Some(ExprType::Bool),
@@ -35665,6 +35775,8 @@ impl Expr {
                 }
             }
             Expr::Int(_) | Expr::Int128(_) => Some(0),
+            // DECFLOAT carries no exact scale; the describe short-circuits
+            Expr::DecFloat34(_) => None,
             Expr::Dec(_, scale) => Some(*scale),
             // a CAST states its own scale - that is what the target IS
             Expr::Cast(_, CastTarget::Numeric { scale, .. }) => Some(*scale),
@@ -35786,6 +35898,8 @@ impl Expr {
             }),
             // a magnitude past i64 announces INT128, as the engine does
             Expr::Int128(_) => Some(NumRank::I128),
+            // DECFLOAT is not an exact-numeric rank (it is not i128-backed)
+            Expr::DecFloat34(_) => None,
             Expr::Dec(raw, _) => Some(if i32::try_from(*raw).is_ok() {
                 NumRank::Long
             } else {
@@ -36003,6 +36117,8 @@ impl Expr {
             },
             Expr::Int(n) => Value::Int(*n),
             Expr::Int128(n) => Value::Int128(*n, 0),
+            // the decimal128 bits were encoded at parse; ship them as-is
+            Expr::DecFloat34(b) => Value::DecFloat34(*b),
             Expr::Dec(raw, scale) => Value::Scaled(*raw, *scale),
             Expr::Str(s) => Value::Text(s.clone()),
             Expr::Null => Value::Null,
@@ -39389,8 +39505,9 @@ fn default_expr_name(raw: &RawExpr) -> String {
             "CONSTANT"
         }
         RawExpr::Neg(_) => "",
-        RawExpr::Int(_) | RawExpr::Int128(_) | RawExpr::Dec(..) | RawExpr::Double(_)
-        | RawExpr::Str(_) | RawExpr::Bool(_) | RawExpr::BareTrue | RawExpr::Null => "CONSTANT",
+        RawExpr::Int(_) | RawExpr::Int128(_) | RawExpr::DecFloat34(_) | RawExpr::Dec(..)
+        | RawExpr::Double(_) | RawExpr::Str(_) | RawExpr::Bool(_) | RawExpr::BareTrue
+        | RawExpr::Null => "CONSTANT",
         // every boolean-valued expression is named BOOL, whatever
         // produced it - `B AND C`, `ID > 2`, `NOT B`, `B IS NULL`,
         // `ID BETWEEN 1 AND 2`, `ID IN (1, 2)` all describe as BOOL
@@ -44514,6 +44631,7 @@ fn expr_no_raise(e: &Expr, descs: &[Descriptor]) -> bool {
         | Expr::GenVal(_)
         | Expr::Int(_)
         | Expr::Int128(_)
+        | Expr::DecFloat34(_)
         | Expr::Dec(..)
         | Expr::Double(_)
         | Expr::Bool(_)
