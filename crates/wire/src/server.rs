@@ -4987,21 +4987,34 @@ struct ProbeSrc {
 /// where it does pick JOIN it swaps the driver to the side this
 /// executor loops as the outer, so they stay a materialised scan.
 ///
-/// `outer` is the driver-side of the ON equality, evaluated against the
-/// COMBINED accumulated row per driving row - a plain `Expr::Col` into
-/// that row in the common case, an expression like `A.K + 0` when the ON
-/// writes one; `inner_fid` is this side's OWN field id (`ri - offset`),
-/// because the band is built against the relation, not the combined row.
+/// `keys` carries one boundary equality per DNF branch of the ON: a
+/// plain `PAR.K = CHI.K` is one key, an `OR` is one per branch, and the
+/// per-outer-row band is their UNION (deduplicated on acceptance by
+/// `records_for_2pc`, which already handles a row named by two branches).
+/// Every branch must be servable - a single one that is not declines the
+/// whole probe to a scan, because a PARTIAL union is a missing set of
+/// rows.
 #[derive(Clone)]
 struct JoinProbe {
     src: ProbeSrc,
     descs: Vec<Descriptor>,
-    outer: Expr,
-    inner_fid: usize,
-    /// the index the gatekeeper blessed, for the trace only - the real
-    /// band is rebuilt per outer row from that row's own value
+    keys: Vec<ProbeKey>,
+    /// the index the gatekeeper blessed for the FIRST branch, for the
+    /// trace only - the real bands are rebuilt per outer row
     index_id: u8,
     column: String,
+}
+
+/// One boundary equality of the ON. `outer` is the driver-side,
+/// evaluated against the COMBINED accumulated row per driving row - a
+/// plain `Expr::Col` in the common case, an expression like `A.K + 0` or
+/// a constant like the `0` in `PAR.K = CHI.K OR PAR.K = 0`. `inner_fid`
+/// is this side's OWN field id, because the band is built against the
+/// relation, not the combined row.
+#[derive(Clone)]
+struct ProbeKey {
+    inner_fid: usize,
+    outer: Expr,
 }
 
 /// What one outer row's probe yields.
@@ -5022,40 +5035,54 @@ enum Band {
 impl JoinProbe {
     /// The band this outer row names on the inner side.
     fn band(&self, db: &Database, row: &[Value]) -> Band {
-        // the outer key is the driver-side expression over the accumulated
-        // row - a plain column in the common case, `A.K + 0` and its like
-        // when the ON writes one. An evaluation that RAISES falls back to
-        // Scan, where the ON re-evaluates the same expression and raises
-        // identically, so the answer (the raise) is preserved.
-        let Ok(v) = self.outer.eval(row) else { return Band::Scan };
-        let rhs = match v {
-            Value::Null => return Band::Nothing,
-            Value::Int(i) => Rhs::Int(i),
-            // an exact numeric AT SCALE 0 is the same integer; a scaled
-            // one is not, and neither is anything else this first slice
-            // can hand to the key builder
-            Value::Scaled(raw, 0) => Rhs::Int(raw),
-            Value::Int128(raw, 0) => match i64::try_from(raw) {
-                Ok(i) => Rhs::Int(i),
-                Err(_) => return Band::Scan,
-            },
-            _ => return Band::Scan,
-        };
-        // REUSED VERBATIM, not re-implemented: every guard in it
-        // (ascending only, keyable itypes only, scale 0, i64::MIN
-        // refused) is a measured missed row, and a second key encoder
-        // would have to re-learn all of them.
-        match pick_for_terms(
-            db,
-            self.src.rel,
-            &self.src.table,
-            &self.descs,
-            &[Term::Cmp(self.inner_fid, Cmp::Eq, rhs)],
-            &[],
-        ) {
-            Some(p) => Band::Index(IndexAccess::one(p)),
-            None => Band::Scan,
+        // one band per ON branch; the answer is their UNION. A branch
+        // whose outer key is NULL names nothing (the equality is UNKNOWN
+        // for every inner row) and simply drops out of the union; a
+        // branch the key builder cannot serve declines the WHOLE probe to
+        // a scan, because a partial union would be a missing set of rows.
+        let mut picks = Vec::with_capacity(self.keys.len());
+        for key in &self.keys {
+            // the outer key is the driver-side expression over the
+            // accumulated row - a plain column in the common case, `A.K
+            // + 0` and its like when the ON writes one. An evaluation
+            // that RAISES falls back to Scan, where the ON re-evaluates
+            // the same expression and raises identically.
+            let Ok(v) = key.outer.eval(row) else { return Band::Scan };
+            let rhs = match v {
+                Value::Null => continue,
+                Value::Int(i) => Rhs::Int(i),
+                // an exact numeric AT SCALE 0 is the same integer; a
+                // scaled one is not, and neither is anything else this
+                // key builder takes
+                Value::Scaled(raw, 0) => Rhs::Int(raw),
+                Value::Int128(raw, 0) => match i64::try_from(raw) {
+                    Ok(i) => Rhs::Int(i),
+                    Err(_) => return Band::Scan,
+                },
+                _ => return Band::Scan,
+            };
+            // REUSED VERBATIM, not re-implemented: every guard in it
+            // (ascending only, keyable itypes only, scale 0, i64::MIN
+            // refused) is a measured missed row, and a second key encoder
+            // would have to re-learn all of them.
+            match pick_for_terms(
+                db,
+                self.src.rel,
+                &self.src.table,
+                &self.descs,
+                &[Term::Cmp(key.inner_fid, Cmp::Eq, rhs)],
+                &[],
+            ) {
+                Some(p) => picks.push(p),
+                None => return Band::Scan,
+            }
         }
+        if picks.is_empty() {
+            // every branch's key was NULL: the disjunction names none,
+            // which is the ANSWER, not a reason to scan
+            return Band::Nothing;
+        }
+        Band::Index(IndexAccess { picks })
     }
 }
 
@@ -20839,72 +20866,119 @@ fn build_join_probe(
     if !matches!(side.src, RowSource::TableScan { .. }) {
         return None;
     }
-    let [terms] = on.groups.as_slice() else { return None };
     // where this side's fields begin in the combined row - the same sum
     // `join_rows` accumulates into `left_width`, step by step
     let offset = side.offset;
-    // the INNER side of the key must be a bare column of THIS side (a band
+    // the INNER side of a key must be a bare column of THIS side (a band
     // builds on it); the OUTER side may be any expression over the
     // ACCUMULATED columns (`< offset`), evaluated per driving row - a
-    // plain `A.K` (the common case) or `A.K + 0`. An outer expression
-    // that reaches PAST the boundary (an inner column, a not-yet-joined
-    // side, or a generator) is not evaluable at probe time and is not a
+    // plain `A.K` (the common case), an `A.K + 0`, or a constant like the
+    // `0` in `PAR.K = CHI.K OR PAR.K = 0`. An outer expression that
+    // reaches PAST the boundary (an inner column, a not-yet-joined side,
+    // or a generator) is not evaluable at probe time and is not a
     // boundary equality the engine indexes this way.
     let inner_col = |e: &Expr| match e {
         Expr::Col(fid) if *fid >= offset => Some(*fid - offset),
         _ => None,
     };
     let outer_only = |e: &Expr| !expr_reads(e, &|fid| fid >= offset);
-    let mut found: Option<(Expr, usize)> = None;
-    for t in terms {
-        let Term::ExprCond(c) = t else { continue };
-        let Cond2::Cmp(a, Cmp::Eq, b) = c.as_ref() else { continue };
-        // either orientation is one equality across the boundary; a
-        // pair on the same side of it is not one at all
-        let (outer_expr, inner_fid) = match (inner_col(a), inner_col(b)) {
-            (Some(fid), None) if outer_only(b) => ((**b).clone(), fid),
-            (None, Some(fid)) if outer_only(a) => ((**a).clone(), fid),
-            _ => continue,
-        };
-        if inner_fid >= side.descs.len() || found.is_some() {
-            return None;
+    let ndescs = side.descs.len();
+    // one boundary equality of a branch, as (outer-value expression,
+    // inner field id), in either resolved shape: an inner bare column
+    // against an OUTER expression (`PAR.K = CHI.K`, `= CHI.K + 0`), or an
+    // inner column against a CONSTANT (`PAR.K = 5`, which resolves to a
+    // specialised numeric term, not an expression pair). A constant is
+    // carried as `Expr::Int` so the band builder sees the one shape; a
+    // non-integer constant declines (its own key encoding is a later
+    // slice).
+    let as_key = |t: &Term| -> Option<(Expr, usize)> {
+        match t {
+            Term::ExprCond(c) => {
+                let Cond2::Cmp(a, Cmp::Eq, b) = c.as_ref() else { return None };
+                let (outer, fid) = match (inner_col(a), inner_col(b)) {
+                    (Some(fid), None) if outer_only(b) => ((**b).clone(), fid),
+                    (None, Some(fid)) if outer_only(a) => ((**a).clone(), fid),
+                    _ => return None,
+                };
+                (fid < ndescs).then_some((outer, fid))
+            }
+            Term::Cmp(idx, Cmp::Eq, rhs) | Term::NumCmp(idx, Cmp::Eq, rhs) => {
+                let fid = idx.checked_sub(offset)?;
+                if fid >= ndescs {
+                    return None;
+                }
+                let lit = match rhs {
+                    Rhs::Int(i) => Expr::Int(*i),
+                    Rhs::Num(raw, 0) => Expr::Int(*raw),
+                    _ => return None,
+                };
+                Some((lit, fid))
+            }
+            _ => None,
         }
-        found = Some((outer_expr, inner_fid));
-    }
-    let (outer_expr, inner_fid) = found?;
-    let col = side.columns.iter().find(|c| c.field_id as usize == inner_fid)?;
+    };
     // an UNQUOTED identifier is stored folded up, so a name carrying a
     // lower-case letter was quoted and cannot be re-spelt bare
     let bare = |s: &str| ident_ok(s) && !s.chars().any(|c| c.is_ascii_lowercase());
-    if !bare(&src.table) || !bare(&col.name) {
+    if !bare(&src.table) {
         return None;
     }
-    // A SINGLE-TABLE statement for the inner side alone. Never a join
-    // text: `choose_index` takes only a one-stream answer, and fcopt's
-    // join ordering is known-divergent from the engine's in exactly the
-    // two places this would care about (a WHERE does not move its join
-    // order, and it does not demote a LEFT join whose inner carries
-    // one), so trusting its stream order to pick a side would turn two
-    // harmless optimizer divergences into wrong plans.
-    //
-    // The sentinel literal is sound because fcopt's answer for the
-    // equality shape is VALUE-INDEPENDENT (probed: `K = 0` and
-    // `K = 12345678` answer the same PLAN). It buys the gatekeeper's
-    // blessing only - the real band is rebuilt per outer row from that
-    // row's own value. `SELECT 1` for the reason the projection site
-    // states: fcopt ignores the select list, and a rendered literal
-    // could itself contain " FROM ".
-    let opt_sql = format!("SELECT 1 FROM {} WHERE {} = 0", src.table, col.name);
-    let filter = Predicate::dnf(vec![vec![Term::Cmp(inner_fid, Cmp::Eq, Rhs::Int(0))]]);
-    let index = choose_index(db, src.rel, &src.table, &side.descs, &Some(filter), &opt_sql, &[])?;
-    let [pick] = index.picks.as_slice() else { return None };
+    // ONE key per DNF branch of the ON: a plain equality is one group, an
+    // OR is one per branch, and the per-outer-row band is their union.
+    // EVERY branch must yield a servable equality - one that does not
+    // declines the whole probe, because a partial union misses rows.
+    let mut keys: Vec<ProbeKey> = Vec::new();
+    let mut trace: Option<(u8, String)> = None;
+    for terms in &on.groups {
+        // exactly one boundary equality per branch; a SECOND declines the
+        // whole probe (a compound/bitmap shape is its own slice), while
+        // any other conjuncts are re-checked by the ON over the fetched
+        // rows, so they only narrow the answer, never miss it.
+        let mut found: Option<(Expr, usize)> = None;
+        for t in terms {
+            let Some((outer_expr, inner_fid)) = as_key(t) else { continue };
+            if found.is_some() {
+                return None;
+            }
+            found = Some((outer_expr, inner_fid));
+        }
+        let (outer_expr, inner_fid) = found?;
+        let col = side.columns.iter().find(|c| c.field_id as usize == inner_fid)?;
+        if !bare(&col.name) {
+            return None;
+        }
+        // A SINGLE-TABLE statement for the inner COLUMN alone. Never a
+        // join text: `choose_index` takes only a one-stream answer, and
+        // fcopt's join ordering is known-divergent from the engine's in
+        // exactly the two places this would care about (a WHERE does not
+        // move its join order, and it does not demote a LEFT join whose
+        // inner carries one), so trusting its stream order to pick a side
+        // would turn two harmless optimizer divergences into wrong plans.
+        //
+        // The sentinel literal is sound because fcopt's answer for the
+        // equality shape is VALUE-INDEPENDENT (probed: `K = 0` and
+        // `K = 12345678` answer the same PLAN). It buys the gatekeeper's
+        // blessing only - the real band is rebuilt per outer row from
+        // that row's own value. `SELECT 1` for the reason the projection
+        // site states: fcopt ignores the select list, and a rendered
+        // literal could itself contain " FROM ".
+        let opt_sql = format!("SELECT 1 FROM {} WHERE {} = 0", src.table, col.name);
+        let filter = Predicate::dnf(vec![vec![Term::Cmp(inner_fid, Cmp::Eq, Rhs::Int(0))]]);
+        let index =
+            choose_index(db, src.rel, &src.table, &side.descs, &Some(filter), &opt_sql, &[])?;
+        let [pick] = index.picks.as_slice() else { return None };
+        if trace.is_none() {
+            trace = Some((pick.op.id, col.name.clone()));
+        }
+        keys.push(ProbeKey { inner_fid, outer: outer_expr });
+    }
+    let (index_id, column) = trace?;
     Some(JoinProbe {
-        index_id: pick.op.id,
+        index_id,
+        column,
         descs: side.descs.clone(),
-        column: col.name.clone(),
         src,
-        outer: outer_expr,
-        inner_fid,
+        keys,
     })
 }
 

@@ -59,23 +59,26 @@
 # bill: SEVEN inner sides the ENGINE indexes and this probe declined -
 # a DESCENDING index, ~~a NUMERIC(9,2) index~~, NUMERIC(38,0), a VIEW
 # inner (the engine flattens it), a DERIVED inner, ~~an expression in the
-# ON (`RZ.K = O.K + 0`)~~, an OR in the ON, and the engine's bitmap AND of
-# two indexes. Their ROWS agree, which is what section 5 asserts and
+# ON (`RZ.K = O.K + 0`)~~, ~~an OR in the ON~~, and the engine's bitmap AND
+# of two indexes. Their ROWS agree, which is what section 5 asserts and
 # all it asserts; with a RAISING ON they do not, because fire-crab
 # scans where the engine keys. Every one is a candidate for Slice B,
 # and each is one more shape where identical SQL raises or answers
 # depending on whether this server's heuristics bless the inner.
 #
-# FIVE now. The scaled NUMERIC inner side is CLOSED: the refusal was
+# FOUR now. The scaled NUMERIC inner side is CLOSED: the refusal was
 # never about the join at all - `pick_for_terms` declined every column
 # with a non-zero scale, so a plain `WHERE N92 = 1.50` scanned too. The
 # literal is carried to the column's own scale now and the probe takes
-# that inner side like any other (section 5 asserts it INDEXED). And an
-# EXPRESSION on the outer side of the ON is closed: the inner side stays
-# a bare indexable column, and the outer expression (`CHI.K + 0`) is
-# evaluated per driving row to the value the band probes with - the
-# engine's own indexed shape. What remains: NUMERIC(38,0) (an INT128
-# key), a VIEW inner, a DERIVED inner, an OR in the ON, and bitmap AND.
+# that inner side like any other (section 5 asserts it INDEXED). An
+# EXPRESSION on the outer side of the ON is closed too: the inner side
+# stays a bare indexable column, and the outer expression (`CHI.K + 0`)
+# is evaluated per driving row to the value the band probes with. And an
+# OR in the ON is closed: one band per DNF branch, their UNION
+# deduplicated on acceptance (`records_for_2pc` already does that for the
+# projection's OR), every branch required servable or the probe scans.
+# What remains: NUMERIC(38,0) (an INT128 key), a VIEW inner, a DERIVED
+# inner, and the engine's bitmap AND of two indexes.
 #
 #   qa/serve-real-leftjoinindex.sh [port]     (the twin runs on port+1)
 #
@@ -344,8 +347,15 @@ join_indexed "an EXPRESSION on the outer side of the ON" \
     "SELECT COUNT(*) FROM CHI LEFT JOIN PAR ON PAR.K = CHI.K + 0" 1
 join_indexed "... and its rows, ordered" \
     "SELECT CHI.ID, PAR.N FROM CHI LEFT JOIN PAR ON PAR.K = CHI.K + 0 ORDER BY CHI.ID" 1
-join_natural "an OR in the ON (the band would be a MISSING set of rows)" \
-    "SELECT COUNT(*) FROM CHI LEFT JOIN PAR ON PAR.K = CHI.K OR PAR.K = 0"
+# ...and this one closes another. An OR in the ON is a UNION OF BANDS,
+# one per branch - `PAR.K = CHI.K` (per driving row) and `PAR.K = 5`
+# (a constant band) - deduplicated on acceptance, which is what saves it
+# from the MISSING set of rows a single band would leave. Every branch
+# must be servable or the whole probe falls back to a scan.
+join_indexed "an OR in the ON, one branch constant" \
+    "SELECT COUNT(*) FROM CHI LEFT JOIN PAR ON PAR.K = CHI.K OR PAR.K = 5" 1
+join_indexed "... and its rows: each driver pairs with its key AND row 5" \
+    "SELECT CHI.ID, PAR.N FROM CHI LEFT JOIN PAR ON PAR.K = CHI.K OR PAR.K = 5 ORDER BY CHI.ID, PAR.K" 1
 join_natural "a VIEW inner side (the engine FLATTENS it; fire-crab materialises)" \
     "SELECT CHI.ID, VPAR.N FROM CHI LEFT JOIN VPAR ON VPAR.K = CHI.K ORDER BY CHI.ID"
 join_natural "a DERIVED inner side (same)" \
@@ -467,6 +477,8 @@ same3 "the BIGINT inner key" \
     "SELECT CHI.ID, W.T FROM CHI LEFT JOIN WIDEK W ON W.K = CHI.K ORDER BY CHI.ID"
 same3 "the expression on the outer side of the ON" \
     "SELECT CHI.ID, PAR.N FROM CHI LEFT JOIN PAR ON PAR.K = CHI.K + 0 ORDER BY CHI.ID"
+same3 "the OR in the ON (a union of bands)" \
+    "SELECT CHI.ID, PAR.N FROM CHI LEFT JOIN PAR ON PAR.K = CHI.K OR PAR.K = 5 ORDER BY CHI.ID, PAR.K"
 same3 "the chain of two LEFT JOINs" \
     "SELECT CHI.ID, PAR.N, DUP.N FROM CHI LEFT JOIN PAR ON PAR.K = CHI.K LEFT JOIN DUP ON DUP.K = PAR.K WHERE CHI.ID < 30 ORDER BY CHI.ID, DUP.N"
 same3 "the unindexed inner" \
