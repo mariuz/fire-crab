@@ -21032,62 +21032,65 @@ fn build_join_probe(
     if !bare(&src.table) {
         return None;
     }
-    // ONE key per DNF branch of the ON: a plain equality is one group, an
-    // OR is one per branch, and the per-outer-row band is their union.
-    // EVERY branch must yield a servable equality - one that does not
-    // declines the whole probe, because a partial union misses rows.
-    let mut keys: Vec<ProbeKey> = Vec::new();
-    let mut trace: Option<(u8, String)> = None;
-    for terms in &on.groups {
-        // exactly one boundary equality per branch; a SECOND declines the
-        // whole probe (a compound/bitmap shape is its own slice), while
-        // any other conjuncts are re-checked by the ON over the fetched
-        // rows, so they only narrow the answer, never miss it.
-        let mut found: Option<(Expr, usize)> = None;
-        for t in terms {
-            let Some((outer_expr, inner_fid)) = as_key(t) else { continue };
-            if found.is_some() {
-                return None;
-            }
-            found = Some((outer_expr, inner_fid));
-        }
-        let (outer_expr, out_pos) = found?;
-        // translate this side's OUTPUT column to the BASE field id it
-        // keys: identity for a plain table, the flatten's map for a view
-        // or derived side. An output that is not a plain base column has
-        // no base field, so its branch is unservable and the probe scans.
+    // Translate one of this side's OUTPUT columns to the BASE field id it
+    // keys (identity for a plain table, the flatten's map for a view) and
+    // ask the gatekeeper whether it has a single-column index for it.
+    //
+    // A SINGLE-TABLE statement for the inner COLUMN alone. Never a join
+    // text: `choose_index` takes only a one-stream answer, and fcopt's
+    // join ordering is known-divergent from the engine's in exactly the
+    // two places this would care about (a WHERE does not move its join
+    // order, and it does not demote a LEFT join whose inner carries one),
+    // so trusting its stream order to pick a side would turn two harmless
+    // optimizer divergences into wrong plans.
+    //
+    // The sentinel literal is sound because fcopt's answer for the
+    // equality shape is VALUE-INDEPENDENT (probed: `K = 0` and
+    // `K = 12345678` answer the same PLAN). It buys the gatekeeper's
+    // blessing only - the real band is rebuilt per outer row. `SELECT 1`
+    // for the reason the projection site states: fcopt ignores the select
+    // list, and a rendered literal could itself contain " FROM ".
+    let bless = |out_pos: usize| -> Option<(usize, u8, String)> {
         let inner_fid = match &base_map {
-            Some(m) => (*m.get(out_pos)?)?,
+            Some(m) => m.get(out_pos).copied().flatten()?,
             None => out_pos,
         };
         let col = base_cols.iter().find(|c| c.field_id as usize == inner_fid)?;
         if !bare(&col.name) {
             return None;
         }
-        // A SINGLE-TABLE statement for the inner COLUMN alone. Never a
-        // join text: `choose_index` takes only a one-stream answer, and
-        // fcopt's join ordering is known-divergent from the engine's in
-        // exactly the two places this would care about (a WHERE does not
-        // move its join order, and it does not demote a LEFT join whose
-        // inner carries one), so trusting its stream order to pick a side
-        // would turn two harmless optimizer divergences into wrong plans.
-        //
-        // The sentinel literal is sound because fcopt's answer for the
-        // equality shape is VALUE-INDEPENDENT (probed: `K = 0` and
-        // `K = 12345678` answer the same PLAN). It buys the gatekeeper's
-        // blessing only - the real band is rebuilt per outer row from
-        // that row's own value. `SELECT 1` for the reason the projection
-        // site states: fcopt ignores the select list, and a rendered
-        // literal could itself contain " FROM ".
         let opt_sql = format!("SELECT 1 FROM {} WHERE {} = 0", src.table, col.name);
         let filter = Predicate::dnf(vec![vec![Term::Cmp(inner_fid, Cmp::Eq, Rhs::Int(0))]]);
         let index =
             choose_index(db, src.rel, &src.table, &base_descs, &Some(filter), &opt_sql, &[])?;
         let [pick] = index.picks.as_slice() else { return None };
-        if trace.is_none() {
-            trace = Some((pick.op.id, col.name.clone()));
+        Some((inner_fid, pick.op.id, col.name.clone()))
+    };
+    // ONE band per DNF branch of the ON: a plain equality is one group, an
+    // OR is one per branch, and the per-outer-row band is their union.
+    // EVERY branch must yield a servable equality, or a partial union
+    // would miss rows and the whole probe scans.
+    let mut keys: Vec<ProbeKey> = Vec::new();
+    let mut trace: Option<(u8, String)> = None;
+    for terms in &on.groups {
+        // The engine may key SEVERAL columns of a branch (`B.K1 = A.X AND
+        // B.K2 = A.Y` is a bitmap AND of two indexes). Naming candidates
+        // from ONE of them and letting the ON re-check the rest is the
+        // SAME set of rows - the single-column band is a SUPERSET of the
+        // conjunction's matches, and "candidates, not answers" narrows it
+        // through the ON like any residual conjunct. So the FIRST equality
+        // the gatekeeper blesses is the band; the others fall to the ON.
+        let mut chosen: Option<ProbeKey> = None;
+        for t in terms {
+            let Some((outer_expr, out_pos)) = as_key(t) else { continue };
+            let Some((inner_fid, id, name)) = bless(out_pos) else { continue };
+            if trace.is_none() {
+                trace = Some((id, name));
+            }
+            chosen = Some(ProbeKey { inner_fid, outer: outer_expr });
+            break;
         }
-        keys.push(ProbeKey { inner_fid, outer: outer_expr });
+        keys.push(chosen?);
     }
     let (index_id, column) = trace?;
     Some(JoinProbe {

@@ -2019,7 +2019,7 @@ plus *the subsystem is now on the path*.
       equivalence oracle only for non-raising ONs from here on.
 
       *And it measured the gap, which is the shape of Slice B*: SEVEN
-      inner sides the engine INDEXES and this probe declines — **two
+      inner sides the engine INDEXES and this probe declines — **one
       now**: the scaled-NUMERIC keys closed `NUMERIC(9,2)` and the
       descending arithmetic closed the DESCENDING index, both of them
       OUTSIDE the join, because neither refusal was ever about the join
@@ -2040,14 +2040,21 @@ plus *the subsystem is now on the path*.
       table's), so `build_flatten` keys the base relation through an
       output-column-to-base-field map off the inner `Plan::Project`,
       declining any side carrying a WHERE, DISTINCT, aggregate or window
-      the flatten would silently drop. The rest: `NUMERIC(38,0)` and the
-      engine's bitmap AND of two indexes. Their rows
-      agree today; with a raising ON they do not, so each is a shape
+      the flatten would silently drop; and the **bitmap AND** of two
+      indexes closed — two ON equalities on two indexed columns, where
+      the probe bands on ONE and lets the ON re-check the other, the
+      single-column band being a SUPERSET of the conjunction's matches
+      ("candidates, not answers" again), so the rows are the engine's and
+      only the plan (a residual filter where the engine intersects two
+      bitmaps) differs. The rest: `NUMERIC(38,0)`, an INT128 key - a
+      cross-cutting change (`Rhs` carries an `i64` across ~113 sites),
+      its own slice. Its rows
+      agree today; with a raising ON they do not, so it is a shape
       where identical SQL raises or answers depending on whether
-      fire-crab's heuristics bless the inner. `pick_for_terms`, not the
-      fcopt gatekeeper, is what refuses most of them (fcopt blesses
-      `NUMERIC(9,2)` happily) — which is why the band is built through
-      `choose_index` rather than trusted from the plan text.
+      fire-crab's heuristics bless the inner - `pick_for_terms`, not the
+      fcopt gatekeeper, is what refuses it (fcopt blesses `NUMERIC(9,2)`
+      happily), which is why the band is built through `choose_index`
+      rather than trusted from the plan text.
   - **A predicted bug that measurement did not confirm, recorded as
     such.** `ods::ddl::index_itype` maps every TEXT/VARYING column to
     `idx_string`, ignoring the charset, so a `CREATE INDEX` issued to
