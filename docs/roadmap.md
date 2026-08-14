@@ -1998,9 +1998,22 @@ plus *the subsystem is now on the path*.
       goes through the emit arm that now resolves the driver. A `pdriver`
       twin drives node-bound `WHERE driver.col = ?` (equality, non-unique,
       and under a GROUP BY), each answering the engine's rows with the
-      driver band built at execute. Still open: a RANGE driver
-      (cost-decided access, divergent order) - the hard, order-coupled
-      half.
+      driver band built at execute.
+
+      *And the RANGE driver is ON too — the feared row-order coupling was
+      a MISREADING of the engine.* An index range scan does NOT return key
+      order: the engine fetches through a record BITMAP (recno order), and
+      fire-crab through `records_for_2pc`'s acceptance (recno order too) -
+      probed side by side on a column whose storage order differs from its
+      key order, both answer identically. A plain scan is recno order as
+      well, so keying a RANGE driver changes WHICH rows are read, never
+      their order, WHATEVER access the two sides pick - there is no
+      cost-agreement to get right. So the driver injection keys `>`, `>=`,
+      `<`, `<=` and BETWEEN as well as `=` (the `= 0` sentinel still
+      blesses - equality is always selective - and `pick_for_terms` builds
+      the real range band off the true filter); a param range defers like
+      a param equality. Gated unordered, literal and parameterised. **The
+      driver index is closed** for every equality and range shape.
 
       *LEFT — the slice is ON.* A LEFT JOIN never hashes. In every
       probe the engine's plan IS fire-crab's execution tree: driver =

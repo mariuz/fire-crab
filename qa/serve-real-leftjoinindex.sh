@@ -344,6 +344,16 @@ driver_indexed "... and its rows UNORDERED (the driver's index order IS the engi
     "SELECT DUP.N, PAR.N FROM DUP LEFT JOIN PAR ON PAR.K = DUP.K WHERE DUP.K = 5"
 driver_indexed "the driver keys UNDER A GROUP BY too (base = the indexed side)" \
     "SELECT DUP.K, COUNT(PAR.N) AS C FROM DUP LEFT JOIN PAR ON PAR.K = DUP.K WHERE DUP.K = 5 GROUP BY DUP.K"
+# a RANGE on the driver keys too - the row order is safe because an index
+# retrieval yields RECNO order (a record bitmap) on BOTH sides, the same
+# order a scan gives, so the UNORDERED differential holds. The band is a
+# real range, only the sentinel that blesses the index is an equality.
+driver_indexed "a RANGE on the driver (COUNT)" \
+    "SELECT COUNT(*) AS C FROM DUP LEFT JOIN PAR ON PAR.K = DUP.K WHERE DUP.K > 15"
+driver_indexed "... and its rows UNORDERED (recno order, both sides)" \
+    "SELECT DUP.N FROM DUP LEFT JOIN PAR ON PAR.K = DUP.K WHERE DUP.K > 18"
+driver_indexed "a BETWEEN on the driver (two range bounds)" \
+    "SELECT DUP.N, PAR.N FROM DUP LEFT JOIN PAR ON PAR.K = DUP.K WHERE DUP.K BETWEEN 17 AND 19 ORDER BY DUP.N"
 # A WHERE on the INNER side demotes the LEFT to an INNER and the engine
 # then FLIPS the driver (PLAN JOIN (PAR NATURAL, CHI INDEX ...)). This
 # executor cannot flip - its tree is fixed by the SQL - so it keeps
@@ -686,6 +696,8 @@ if command -v node >/dev/null 2>&1; then
         "SELECT COUNT(*) AS C FROM DUP LEFT JOIN PAR ON PAR.K = DUP.K WHERE DUP.K = ?" "[5]"
     pdriver "a parameterised driver equality UNDER A GROUP BY" \
         "SELECT DUP.K, COUNT(PAR.N) AS C FROM DUP LEFT JOIN PAR ON PAR.K = DUP.K WHERE DUP.K = ? GROUP BY DUP.K" "[5]"
+    pdriver "a parameterised driver RANGE (deferred range band)" \
+        "SELECT DUP.N FROM DUP LEFT JOIN PAR ON PAR.K = DUP.K WHERE DUP.K > ? ORDER BY DUP.N" "[18]"
 fi
 
 rm -f "$A" "$B"

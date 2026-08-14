@@ -21612,21 +21612,28 @@ fn plan_join_bound(
     let driver_width = driver_descs.len();
     if let (Some(f), Some(src)) = (filter.as_ref(), driver_src.as_ref()) {
         let bare = |s: &str| ident_ok(s) && !s.chars().any(|c| c.is_ascii_lowercase());
-        // an EQUALITY conjunct on a bare-spellable driver column: the
-        // shape the engine reliably indexes and whose row order (the
-        // equal-key band, recno within it) matches a scan-free plan on
-        // BOTH sides. A range is left scanning - its access is
-        // cost-decided and its order would diverge. The band is built
-        // through `choose_index` off the real filter (as the projection's
-        // is); the `SELECT 1 ... = 0` is a value-independent SENTINEL that
-        // buys fcopt's blessing, bare-spelt for the reason
+        // an EQUALITY OR RANGE conjunct on a bare-spellable driver column.
+        // Row order is safe for both: an index retrieval yields RECNO
+        // order (Firebird fetches through a record bitmap, fire-crab
+        // through `records_for_2pc`'s acceptance), and a plain scan yields
+        // recno order too - so keying the driver changes WHICH rows are
+        // read, never their order, whatever access the two sides pick. The
+        // band is built through `choose_index` off the REAL filter (as the
+        // projection's is), so a range gets a range band; the value-
+        // independent `SELECT 1 ... = 0` SENTINEL only buys fcopt's
+        // "this column is indexable" blessing (equality is always
+        // selective, so it always blesses), bare-spelt for the reason
         // build_join_probe states.
         let key_col = (f.groups.len() == 1
             && f.groups[0].iter().all(|t| term_side_only(t, &(0..driver_width))))
         .then(|| {
             f.groups[0].iter().find_map(|t| {
                 let fid = match t {
-                    Term::Cmp(fid, Cmp::Eq, _) | Term::NumCmp(fid, Cmp::Eq, _) => *fid,
+                    Term::Cmp(fid, op, _) | Term::NumCmp(fid, op, _)
+                        if matches!(op, Cmp::Eq | Cmp::Gt | Cmp::Ge | Cmp::Lt | Cmp::Le) =>
+                    {
+                        *fid
+                    }
                     _ => return None,
                 };
                 let c = driver_cols.iter().find(|c| c.field_id as usize == fid)?;
