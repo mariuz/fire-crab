@@ -91,9 +91,10 @@ fn main() {
                 std::process::exit(2);
             });
             let h = decode_header(&data);
+            let image = fire_crab_ods::Image::from_bytes(&data, h.page_size as usize);
             println!(
                 "{}",
-                fire_crab_ods::version_count(&data, h.page_size as usize, rel)
+                fire_crab_ods::version_count(&image, h.page_size as usize, rel)
             );
         }
         "tx-state" => {
@@ -159,7 +160,8 @@ fn main() {
             // name -> id resolution read straight from RDB$RELATIONS pages,
             // the mirror of SELECT RDB$RELATION_ID, RDB$RELATION_NAME.
             let h = decode_header(&data);
-            let mut rels = fire_crab_ods::list_relations(&data, h.page_size as usize);
+            let image = fire_crab_ods::Image::from_bytes(&data, h.page_size as usize);
+            let mut rels = fire_crab_ods::list_relations(&image, h.page_size as usize);
             rels.sort();
             for (id, name) in rels {
                 println!("{}\t{}", id, name);
@@ -173,7 +175,8 @@ fn main() {
                 std::process::exit(2);
             });
             let h = decode_header(&data);
-            for c in fire_crab_ods::relation_columns(&data, h.page_size as usize, &name) {
+            let image = fire_crab_ods::Image::from_bytes(&data, h.page_size as usize);
+            for c in fire_crab_ods::relation_columns(&image, h.page_size as usize, &name) {
                 println!("{}\t{}", c.field_id, c.name);
             }
         }
@@ -186,8 +189,9 @@ fn main() {
             });
             let h = decode_header(&data);
             let ps = h.page_size as usize;
-            match fire_crab_ods::resolve_relation(&data, ps, &name) {
-                Some(id) => println!("{}", fire_crab_ods::count_primary_records(&data, ps, id)),
+            let image = fire_crab_ods::Image::from_bytes(&data, ps);
+            match fire_crab_ods::resolve_relation(&image, ps, &name) {
+                Some(id) => println!("{}", fire_crab_ods::count_primary_records(&image, ps, id)),
                 None => {
                     eprintln!("fcstat: no relation named {}", name);
                     std::process::exit(1);
@@ -254,7 +258,9 @@ fn header(data: &[u8]) {
 }
 
 fn census_cmd(data: &[u8]) {
-    let c = match census(data) {
+    let ps = fire_crab_ods::tra::page_size_of(data).unwrap_or(0);
+    let image = fire_crab_ods::Image::from_bytes(data, ps);
+    let c = match census(&image) {
         Some(c) => c,
         None => {
             eprintln!("fcstat: cannot take census (bad page size?)");
@@ -324,8 +330,9 @@ fn tip(data: &[u8]) {
 fn records(data: &[u8], relation: u16) {
     let h = decode_header(data);
     let page_size = h.page_size as usize;
+    let image = fire_crab_ods::Image::from_bytes(data, page_size);
 
-    let dp_numbers = relation_data_pages(data, page_size, relation);
+    let dp_numbers = relation_data_pages(&image, page_size, relation);
     if dp_numbers.is_empty() {
         println!("relation {}: no pointer pages found", relation);
         return;
@@ -400,8 +407,9 @@ fn rows(data: &[u8], relation: u16) {
 fn rows_inner(data: &[u8], relation: u16, with_recno: bool) {
     let h = decode_header(data);
     let page_size = h.page_size as usize;
+    let image = fire_crab_ods::Image::from_bytes(data, page_size);
 
-    let formats = relation_formats(data, page_size, relation);
+    let formats = relation_formats(&image, page_size, relation);
     if formats.is_empty() {
         eprintln!(
             "fcstat: no formats for relation {} in RDB$FORMATS (system relation?)",
@@ -410,7 +418,7 @@ fn rows_inner(data: &[u8], relation: u16, with_recno: bool) {
         std::process::exit(1);
     }
 
-    for dp_no in relation_data_pages(data, page_size, relation) {
+    for dp_no in relation_data_pages(&image, page_size, relation) {
         let start = dp_no as usize * page_size;
         let Some(dp) = data
             .get(start..start + page_size)
@@ -422,7 +430,7 @@ fn rows_inner(data: &[u8], relation: u16, with_recno: bool) {
             if !r.is_primary_record() {
                 continue;
             }
-            let Some(image) = fire_crab_ods::data::assembled_image(data, page_size, &r) else {
+            let Some(image) = fire_crab_ods::data::assembled_image(&image, page_size, &r) else {
                 eprintln!("fcstat: sqz error at page {} slot {}", dp_no, r.slot);
                 continue;
             };
@@ -448,7 +456,8 @@ fn rows_inner(data: &[u8], relation: u16, with_recno: bool) {
 
 fn indexes(data: &[u8], relation: u16) {
     let h = decode_header(data);
-    let Some(irt) = fire_crab_ods::btr::find_index_root(data, h.page_size as usize, relation)
+    let image = fire_crab_ods::Image::from_bytes(data, h.page_size as usize);
+    let Some(irt) = fire_crab_ods::btr::find_index_root(&image, h.page_size as usize, relation)
     else {
         eprintln!("fcstat: no index root page for relation {}", relation);
         std::process::exit(1);
@@ -470,7 +479,8 @@ fn indexes(data: &[u8], relation: u16) {
 /// prefix decompression is wrong.
 fn index_walk(data: &[u8], relation: u16, index_id: u8) {
     let h = decode_header(data);
-    let Some(entries) = walk_index_leaves(data, h.page_size as usize, relation, index_id) else {
+    let image = fire_crab_ods::Image::from_bytes(data, h.page_size as usize);
+    let Some(entries) = walk_index_leaves(&image, h.page_size as usize, relation, index_id) else {
         eprintln!(
             "fcstat: cannot walk index {} of relation {}",
             index_id, relation
@@ -507,11 +517,12 @@ fn index_walk(data: &[u8], relation: u16, index_id: u8) {
 fn gc(data: &[u8], relation: u16) {
     let h = decode_header(data);
     let page_size = h.page_size as usize;
-    let Some(tips) = fire_crab_ods::TipChain::read(data, page_size) else {
+    let image = fire_crab_ods::Image::from_bytes(data, page_size);
+    let Some(tips) = fire_crab_ods::TipChain::read(&image, page_size) else {
         eprintln!("fcstat: no TIP chain");
         std::process::exit(1);
     };
-    let rep = fire_crab_ods::gc_analyze(data, page_size, relation, h.oldest_snapshot, &tips);
+    let rep = fire_crab_ods::gc_analyze(&image, page_size, relation, h.oldest_snapshot, &tips);
     println!(
         "relation {} (oldest snapshot {}):",
         relation, h.oldest_snapshot
@@ -526,11 +537,12 @@ fn gc(data: &[u8], relation: u16) {
 
 fn tx_state(data: &[u8], id: u64) {
     let h = decode_header(data);
-    let Some(tips) = fire_crab_ods::TipChain::read(data, h.page_size as usize) else {
+    let image = fire_crab_ods::Image::from_bytes(data, h.page_size as usize);
+    let Some(tips) = fire_crab_ods::TipChain::read(&image, h.page_size as usize) else {
         eprintln!("fcstat: no TIP chain found");
         std::process::exit(1);
     };
-    for p in fire_crab_ods::tra::check_invariants(data, h.page_size as usize) {
+    for p in fire_crab_ods::tra::check_invariants(&image, h.page_size as usize) {
         eprintln!("invariant violated: {}", p);
     }
     match tips.state(id) {
@@ -555,16 +567,17 @@ fn tx_state(data: &[u8], id: u64) {
 fn visible(data: &[u8], relation: u16) {
     let h = decode_header(data);
     let page_size = h.page_size as usize;
-    let formats = relation_formats(data, page_size, relation);
+    let image = fire_crab_ods::Image::from_bytes(data, page_size);
+    let formats = relation_formats(&image, page_size, relation);
     let Some((_, descs)) = formats.iter().max_by_key(|(n, _)| *n) else {
         eprintln!("fcstat: no formats for relation {}", relation);
         std::process::exit(1);
     };
-    let Some(tips) = fire_crab_ods::TipChain::read(data, page_size) else {
+    let Some(tips) = fire_crab_ods::TipChain::read(&image, page_size) else {
         eprintln!("fcstat: no TIP chain found");
         std::process::exit(1);
     };
-    let rows = fire_crab_ods::visible_rows(data, page_size, relation, descs, &tips);
+    let rows = fire_crab_ods::visible_rows(&image, page_size, relation, descs, &tips);
     let walked: u32 = rows.iter().map(|r| r.versions_walked).sum();
     let deltas: u32 = rows.iter().map(|r| r.deltas_applied).sum();
     for r in &rows {
@@ -580,11 +593,13 @@ fn visible(data: &[u8], relation: u16) {
 }
 
 fn bench_census(data: &[u8], iters: u32) {
+    let ps = fire_crab_ods::tra::page_size_of(data).unwrap_or(0);
+    let image = fire_crab_ods::Image::from_bytes(data, ps);
     // warmup
-    let c = census(data).expect("census failed");
+    let c = census(&image).expect("census failed");
     let start = Instant::now();
     for _ in 0..iters {
-        std::hint::black_box(census(std::hint::black_box(data)));
+        std::hint::black_box(census(std::hint::black_box(&image)));
     }
     let elapsed = start.elapsed();
     // the census reads ONE byte per page, so report pages/s - a

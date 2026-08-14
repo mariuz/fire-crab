@@ -261,14 +261,15 @@ fn login(
 fn stored_pair(sec_db: &str, user: &str) -> Result<(Vec<u8>, Vec<u8>), String> {
     let file = std::fs::read(sec_db).map_err(|e| e.to_string())?;
     let ps = fire_crab_ods::tra::page_size_of(&file).ok_or("bad page size")?;
-    let rel = fire_crab_ods::resolve_relation(&file, ps, "PLG$SRP")
+    let image = fire_crab_ods::Image::from_bytes(&file, ps);
+    let rel = fire_crab_ods::resolve_relation(&image, ps, "PLG$SRP")
         .ok_or("no PLG$SRP relation - is this a security database?")?;
-    let formats = fire_crab_ods::relation_formats(&file, ps, rel);
+    let formats = fire_crab_ods::relation_formats(&image, ps, rel);
     let (_, descs) = formats
         .iter()
         .max_by_key(|(n, _)| *n)
         .ok_or("PLG$SRP has no format")?;
-    let cols = fire_crab_ods::relation_columns(&file, ps, "PLG$SRP");
+    let cols = fire_crab_ods::relation_columns(&image, ps, "PLG$SRP");
     let field = |name: &str| -> Result<usize, String> {
         cols.iter()
             .find(|c| c.name.eq_ignore_ascii_case(name))
@@ -280,8 +281,8 @@ fn stored_pair(sec_db: &str, user: &str) -> Result<(Vec<u8>, Vec<u8>), String> {
         field("PLG$VERIFIER")?,
         field("PLG$SALT")?,
     );
-    let tips = fire_crab_ods::TipChain::read(&file, ps).ok_or("cannot read the TIP chain")?;
-    for row in fire_crab_ods::visible_rows(&file, ps, rel, descs, &tips) {
+    let tips = fire_crab_ods::TipChain::read(&image, ps).ok_or("cannot read the TIP chain")?;
+    for row in fire_crab_ods::visible_rows(&image, ps, rel, descs, &tips) {
         let name = match row.values.get(fname) {
             Some(fire_crab_ods::Value::Text(t)) => t.trim().to_string(),
             _ => continue,

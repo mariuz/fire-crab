@@ -555,6 +555,7 @@ mod tests {
         let entry_at = page_size + 24;
         file[entry_at + 8..entry_at + 12].copy_from_slice(&2u32.to_le_bytes());
         file[entry_at + 20] = IRT_NORMAL;
+        let mut file = crate::Image::from_bytes(&file, page_size);
         crate::btw::write_empty_root(&mut file, page_size, 2, rel, 0).unwrap();
 
         let key = |n: u8| vec![0xC0, n];
@@ -595,6 +596,7 @@ mod tests {
         let entry_at = page_size + 24;
         file[entry_at + 8..entry_at + 12].copy_from_slice(&2u32.to_le_bytes());
         file[entry_at + 20] = IRT_NORMAL;
+        let mut file = crate::Image::from_bytes(&file, page_size);
         crate::btw::write_empty_root(&mut file, page_size, 2, rel, 0).unwrap();
 
         let key = |n: u8| vec![0xC0, n];

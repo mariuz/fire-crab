@@ -118,8 +118,7 @@ fn main() {
                     )?;
                     if let Some((id, segs)) = &index {
                         let seq = u32::from_le_bytes(
-                            after[out.page_no as usize * page_size + 16
-                                ..out.page_no as usize * page_size + 20]
+                            after.page(out.page_no).unwrap()[16..20]
                                 .try_into()
                                 .unwrap(),
                         ) as u64;
@@ -215,6 +214,12 @@ fn main() {
             }
             other => return Err(format!("unknown workload {}", other)),
         }
+
+        // the byte-based cch helpers below (careful_plan, changed_pages,
+        // page_type, crash_prefix) predate the page-addressed image; the
+        // fcstat tool is off the hot path, so flatten once here.
+        let before = before.to_bytes();
+        let after = after.to_bytes();
 
         // the write order: the precedence-graph flush, or its reverse
         let plan = careful_plan(&before, &after, page_size);

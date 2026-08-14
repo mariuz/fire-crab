@@ -518,8 +518,15 @@ pub fn check_invariants(file: &crate::Image, page_size: usize) -> Vec<String> {
     problems
 }
 
-/// Convenience: page-size accessor for tools.
+/// Convenience: page-size accessor for tools. A buffer too short to hold
+/// the `hdr_page_size` field (offset 16, a u16) is not a database image -
+/// `None`, not a panic - so a caller handed an empty or truncated image
+/// (a detached zero-length pool image, say) gets an answer rather than a
+/// crash.
 pub fn page_size_of(file: &[u8]) -> Option<usize> {
+    if file.len() < 18 {
+        return None;
+    }
     Some(u16_at(file, 16) as usize)
 }
 
@@ -599,7 +606,8 @@ mod tests {
             ps,
             &[(11, TxState::Committed), (12, TxState::Dead), (13, TxState::Active)],
         );
-        let tips = TipChain::read(&f, ps).expect("tip chain");
+        let img = crate::Image::from_bytes(&f, ps);
+        let tips = TipChain::read(&img, ps).expect("tip chain");
         assert_eq!(tips.state(11), Some(TxState::Committed));
         assert_eq!(tips.state(12), Some(TxState::Dead));
         assert_eq!(tips.state(13), Some(TxState::Active));

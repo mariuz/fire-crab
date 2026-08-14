@@ -649,7 +649,7 @@ mod sweep_tests {
 
         // C reads its PRE-UPDATE image again - the promotion, verified
         // by bytes and not by counts
-        let dp = crate::data::DataPage::decode(&f[ps * 3..ps * 4]).unwrap();
+        let dp = crate::data::DataPage::decode(f.page(3).unwrap()).unwrap();
         let head_c = dp.record(c.slot).unwrap();
         assert_eq!(head_c.back_page, 0, "no chain left under C");
         // (a stored image may carry alignment padding past the format's
@@ -697,16 +697,16 @@ mod sweep_tests {
         let out = sweep(&mut f, ps, NOBODY).unwrap();
         assert_eq!(out.stale_actives, 1, "the orphaned active was named");
         assert_eq!(out.records_removed, 2, "the expunged delete and the orphan");
-        let dp = crate::data::DataPage::decode(&f[ps * 3..ps * 4]).unwrap();
+        let dp = crate::data::DataPage::decode(f.page(3).unwrap()).unwrap();
         assert!(dp.record(a.slot).is_none(), "the stub and its chain are gone");
         assert!(dp.record(b.slot).is_none(), "the orphan's row is gone");
         // ...and the TIP now says DEAD where it said active
         let tips = TipChain::read(&f, ps).unwrap();
         assert_eq!(tips.state(tx2), Some(TxState::Dead));
         // the header moved past all of it
-        let next = crate::u64_at(&f, 40);
-        assert_eq!(crate::u64_at(&f, 48), next, "oldest transaction");
-        assert_eq!(crate::u64_at(&f, 64), next, "oldest snapshot");
+        let next = crate::u64_at(f.page(0).unwrap(), 40);
+        assert_eq!(crate::u64_at(f.page(0).unwrap(), 48), next, "oldest transaction");
+        assert_eq!(crate::u64_at(f.page(0).unwrap(), 64), next, "oldest snapshot");
     }
 }
 

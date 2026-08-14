@@ -30,8 +30,9 @@ fn main() {
     };
     let run = || -> Result<(), String> {
         let page_size = page_size_of(&file).ok_or("cannot read the page size")?;
+        let image = fire_crab_ods::Image::from_bytes(&file, page_size);
         let name = args[2].trim().to_ascii_uppercase();
-        let blr = procedure_blr(&file, page_size, &name)?;
+        let blr = procedure_blr(&image, page_size, &name)?;
         let request = parse(&blr)?;
         // message 1 is the output contract: (value, null-flag) pairs
         // and the trailing EOF short
@@ -45,7 +46,7 @@ fn main() {
             return Err("output message is not (value, null)* + EOF".into());
         }
         let outputs = (out_slots - 1) / 2;
-        for (msg, buf) in execute(&file, page_size, &request, &args[3..])? {
+        for (msg, buf) in execute(&image, page_size, &request, &args[3..])? {
             if msg != 1 {
                 continue;
             }

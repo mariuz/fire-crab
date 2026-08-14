@@ -26,7 +26,7 @@ use fire_crab_ods::{
 const SLICE: usize = 64;
 
 fn blob_ids(
-    file: &[u8],
+    file: &fire_crab_ods::Image,
     page_size: usize,
     table: &str,
     column: &str,
@@ -60,6 +60,7 @@ fn run() -> Result<(), String> {
         "scan" if args.len() == 5 => {
             let file = std::fs::read(&args[2]).map_err(|e| e.to_string())?;
             let ps = fire_crab_ods::tra::page_size_of(&file).ok_or("bad page size")?;
+            let file = fire_crab_ods::Image::from_bytes(&file, ps);
             for (i, id) in blob_ids(&file, ps, &args[3].to_ascii_uppercase(), &args[4])?
                 .iter()
                 .enumerate()
@@ -83,6 +84,7 @@ fn run() -> Result<(), String> {
         "slices" if args.len() == 6 => {
             let file = std::fs::read(&args[2]).map_err(|e| e.to_string())?;
             let ps = fire_crab_ods::tra::page_size_of(&file).ok_or("bad page size")?;
+            let file = fire_crab_ods::Image::from_bytes(&file, ps);
             let idx: usize = args[5].parse().map_err(|_| "bad row index")?;
             let ids = blob_ids(&file, ps, &args[3].to_ascii_uppercase(), &args[4])?;
             let (brel, brec) = ids
@@ -104,8 +106,9 @@ fn run() -> Result<(), String> {
             );
         }
         "write" if args.len() == 7 => {
-            let mut file = std::fs::read(&args[2]).map_err(|e| e.to_string())?;
+            let file = std::fs::read(&args[2]).map_err(|e| e.to_string())?;
             let ps = fire_crab_ods::tra::page_size_of(&file).ok_or("bad page size")?;
+            let mut file = fire_crab_ods::Image::from_bytes(&file, ps);
             let content = std::fs::read(&args[5]).map_err(|e| e.to_string())?;
             let seg: usize = args[6].parse().map_err(|_| "bad segment size")?;
             let table = args[3].to_ascii_uppercase();
@@ -149,7 +152,7 @@ fn run() -> Result<(), String> {
             image[at + 3] = (recno >> 32) as u8;
             image[at + 4..at + 8].copy_from_slice(&(recno as u32).to_le_bytes());
             insert_record(&mut file, ps, rel, *format_no, &image)?;
-            std::fs::write(&args[2], &file).map_err(|e| e.to_string())?;
+            std::fs::write(&args[2], file.to_bytes()).map_err(|e| e.to_string())?;
             println!("RECNO {} LEVEL {}", recno, level);
         }
         _ => {

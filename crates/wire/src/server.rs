@@ -52779,12 +52779,14 @@ mod tests {
                 Err(EvalErr::ConversionError(Some(ref t))) if t == "x"
             ));
         }
-        // a value too long for the target text width is also the conversion error
+        // a NUMERIC too wide for the target text is a conversion error that
+        // CARRIES the rendered value (probed: CAST(12345 AS VARCHAR(3)) is
+        // 22018 "...12345"); A is Int(10), so "10" overflows VARCHAR(1)
         {
             let raw = parse_raw_expr("CAST(A AS VARCHAR(1))").unwrap();
             assert!(matches!(
                 resolve_expr(&raw, &columns, &descs).unwrap().eval(&row),
-                Err(EvalErr::ConversionError(None))
+                Err(EvalErr::ConversionError(Some(ref t))) if t == "10"
             ));
         }
         // NULL casts to NULL

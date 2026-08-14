@@ -22,7 +22,8 @@ fn main() {
     };
     let run = || -> Result<(), String> {
         let ps = fire_crab_ods::tra::page_size_of(&file).ok_or("bad page size")?;
-        println!("{}", plan_query(&file, ps, &args[3])?.render());
+        let image = fire_crab_ods::Image::from_bytes(&file, ps);
+        println!("{}", plan_query(&image, ps, &args[3])?.render());
         Ok(())
     };
     if let Err(e) = run() {

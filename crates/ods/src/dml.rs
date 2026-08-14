@@ -1019,15 +1019,15 @@ mod tests {
         let mut f = scratch_file(ps);
         let tx = begin_active_tx(&mut f, ps).unwrap();
         assert_eq!(tx, 11);
-        assert_eq!(u64::from_le_bytes(f[40..48].try_into().unwrap()), 11); // header claimed it
-        let bits = |f: &[u8], id: usize| (f[ps + TIP_TRANSACTIONS_OFFSET + id / 4] >> (2 * (id % 4))) & 3;
+        assert_eq!(u64::from_le_bytes(f.page(0).unwrap()[40..48].try_into().unwrap()), 11); // header claimed it
+        let bits = |f: &crate::Image, id: usize| (f.page(1).unwrap()[TIP_TRANSACTIONS_OFFSET + id / 4] >> (2 * (id % 4))) & 3;
         assert_eq!(bits(&f, 11), 0, "tra_active");
 
         let image = vec![0u8, 7, 7, 7, 1, 2, 3, 4];
         let out = insert_record_under(&mut f, ps, 42, 1, &image, tx as u32).unwrap();
         assert_eq!(out.tx_id, 11, "the row carries the OPEN transaction");
         assert_eq!(bits(&f, 11), 0, "and writing did not commit it");
-        let dp = DataPage::decode(&f[ps * 3..ps * 4]).unwrap();
+        let dp = DataPage::decode(f.page(3).unwrap()).unwrap();
         assert_eq!(dp.record(1).unwrap().transaction, 11);
 
         // commit: the same slot, the same row, two bits later
@@ -1050,12 +1050,12 @@ mod tests {
         let tx = begin_active_tx(&mut f, ps).unwrap();
         let out = delete_records_under(&mut f, ps, 42, &[(ins.page_no, ins.slot)], tx as u32).unwrap();
         assert_eq!(out.affected, 1);
-        let dp = DataPage::decode(&f[ps * 3..ps * 4]).unwrap();
+        let dp = DataPage::decode(f.page(3).unwrap()).unwrap();
         let stub = dp.record(ins.slot).unwrap();
         assert!(stub.flags & flags::DELETED != 0);
         assert_eq!(stub.transaction, tx);
-        let byte = ps + TIP_TRANSACTIONS_OFFSET + (tx as usize) / 4;
-        assert_eq!((f[byte] >> (2 * (tx as usize % 4))) & 3, 0, "still active");
+        let byte = TIP_TRANSACTIONS_OFFSET + (tx as usize) / 4;
+        assert_eq!((f.page(1).unwrap()[byte] >> (2 * (tx as usize % 4))) & 3, 0, "still active");
     }
 
     #[test]
@@ -1066,12 +1066,12 @@ mod tests {
         let out = insert_record(&mut f, ps, 42, 1, &image).unwrap();
         assert_eq!(out, InsertOutcome { tx_id: 11, page_no: 3, slot: 1 });
         // header advanced
-        assert_eq!(u64::from_le_bytes(f[40..48].try_into().unwrap()), 11);
+        assert_eq!(u64::from_le_bytes(f.page(0).unwrap()[40..48].try_into().unwrap()), 11);
         // TIP: tx 11 committed (bits 3 at position 11)
-        let byte = ps + TIP_TRANSACTIONS_OFFSET + 11 / 4;
-        assert_eq!((f[byte] >> (2 * (11 % 4))) & 3, 3);
+        let byte = TIP_TRANSACTIONS_OFFSET + 11 / 4;
+        assert_eq!((f.page(1).unwrap()[byte] >> (2 * (11 % 4))) & 3, 3);
         // the record decodes back through the normal read path
-        let dp = DataPage::decode(&f[ps * 3..ps * 4]).unwrap();
+        let dp = DataPage::decode(f.page(3).unwrap()).unwrap();
         assert_eq!(dp.count, 2);
         let rec = dp.record(1).unwrap();
         assert_eq!(rec.transaction, 11);
@@ -1091,13 +1091,12 @@ mod tests {
         let ps = 4096;
         let mut f = scratch_file(ps);
         // empty slot 1 in the directory (count 2, zero length)
-        let d = ps * 3;
-        put_u16(&mut f, d + 22, 2);
-        put_u16(&mut f, d + 28, 0);
-        put_u16(&mut f, d + 30, 0);
+        put_u16(f.page_mut(3).unwrap(), 22, 2);
+        put_u16(f.page_mut(3).unwrap(), 28, 0);
+        put_u16(f.page_mut(3).unwrap(), 30, 0);
         let out = insert_record(&mut f, ps, 42, 1, &[0u8; 8]).unwrap();
         assert_eq!(out.slot, 1); // reused, not appended
-        assert_eq!(DataPage::decode(&f[d..d + ps]).unwrap().count, 2);
+        assert_eq!(DataPage::decode(f.page(3).unwrap()).unwrap().count, 2);
         // an image too big for the remaining space fails cleanly
         let huge = vec![0u8; ps];
         assert!(insert_record(&mut f, ps, 42, 1, &huge).is_err());
@@ -1113,7 +1112,7 @@ mod tests {
         let out =
             update_records(&mut f, ps, 42, &[(ins.page_no, ins.slot, new.clone())], 1).unwrap();
         assert_eq!(out, DmlOutcome { tx_id: 12, affected: 1 });
-        let dp = DataPage::decode(&f[ps * 3..ps * 4]).unwrap();
+        let dp = DataPage::decode(f.page(3).unwrap()).unwrap();
         // the primary: new image, new tx, back pointer set
         let head = dp.record(ins.slot).unwrap();
         assert_eq!(head.transaction, 12);
@@ -1130,7 +1129,7 @@ mod tests {
         // a second update extends the chain through the copy
         let newer = vec![0u8, 3, 3, 3, 3, 3, 3, 3];
         update_records(&mut f, ps, 42, &[(ins.page_no, ins.slot, newer.clone())], 1).unwrap();
-        let dp = DataPage::decode(&f[ps * 3..ps * 4]).unwrap();
+        let dp = DataPage::decode(f.page(3).unwrap()).unwrap();
         let head = dp.record(ins.slot).unwrap();
         assert_eq!(head.image().unwrap(), newer);
         let mid = dp.record(head.back_line).unwrap();
@@ -1178,24 +1177,25 @@ mod tests {
         let big = ps - DPG_RPT_OFFSET - 4 - 32;
         put_u16(&mut f, d + 24, (ps - big) as u16);
         put_u16(&mut f, d + 26, big as u16);
+        let mut f = crate::Image::from_bytes(&f, ps);
 
         // no room on page 4: the insert must allocate page 5
         let image = vec![0u8; 64];
         let out = insert_record(&mut f, ps, 42, 1, &image).unwrap();
         assert_eq!((out.page_no, out.slot), (5, 0));
-        assert_eq!(f.len(), ps * 6); // the FILE grew
+        assert_eq!(f.byte_len(), ps * 6); // the FILE grew
         // the new page is a formatted data page with the next sequence
-        let dp = DataPage::decode(&f[ps * 5..ps * 6]).unwrap();
+        let dp = DataPage::decode(f.page(5).unwrap()).unwrap();
         assert_eq!((dp.relation, dp.sequence, dp.count), (42, 1, 1));
         assert_eq!(dp.pag.page_no, 5);
         assert_eq!(dp.record(0).unwrap().image().unwrap(), image);
         // hooked into the pointer page, fill byte clear
-        assert_eq!(u16_at(&f, p + 24), 2); // ppg_count
-        assert_eq!(u32_at(&f, p + 36), 5); // slot 1 -> page 5
+        assert_eq!(u16_at(f.page(3).unwrap(), 24), 2); // ppg_count
+        assert_eq!(u32_at(f.page(3).unwrap(), 36), 5); // slot 1 -> page 5
         let cap = data_pages_per_pp(ps) as usize;
-        assert_eq!(f[p + 32 + cap * 4 + 1], 0);
+        assert_eq!(f.page(3).unwrap()[32 + cap * 4 + 1], 0);
         // the PIP: bit 5 cleared, hint and used advanced
-        let pip = PipPage::decode(&f[ps..ps * 2]).unwrap();
+        let pip = PipPage::decode(f.page(1).unwrap()).unwrap();
         assert_eq!(pip.is_free(5), Some(false));
         assert_eq!(pip.is_free(6), Some(true));
         assert_eq!((pip.min, pip.used), (6, 6));
@@ -1203,7 +1203,7 @@ mod tests {
         let big_img = vec![7u8; ps - 100];
         let out2 = insert_record(&mut f, ps, 42, 1, &big_img).unwrap();
         assert_eq!(out2.page_no, 6); // grew again
-        assert_eq!(f.len(), ps * 7);
+        assert_eq!(f.byte_len(), ps * 7);
     }
 
     #[test]
@@ -1214,7 +1214,7 @@ mod tests {
         let ins = insert_record(&mut f, ps, 42, 1, &image).unwrap();
         let out = delete_records(&mut f, ps, 42, &[(ins.page_no, ins.slot)]).unwrap();
         assert_eq!(out, DmlOutcome { tx_id: 12, affected: 1 });
-        let dp = DataPage::decode(&f[ps * 3..ps * 4]).unwrap();
+        let dp = DataPage::decode(f.page(3).unwrap()).unwrap();
         let stub = dp.record(ins.slot).unwrap();
         assert!(stub.flags & flags::DELETED != 0);
         assert!(!stub.is_primary_record()); // COUNT no longer sees it
@@ -1227,12 +1227,12 @@ mod tests {
         // deleting the stub again is refused - it is not a live primary
         assert!(delete_records(&mut f, ps, 42, &[(ins.page_no, ins.slot)]).is_err());
         // an empty target list is a no-op that burns no transaction
-        let before = u64::from_le_bytes(f[40..48].try_into().unwrap());
+        let before = u64::from_le_bytes(f.page(0).unwrap()[40..48].try_into().unwrap());
         assert_eq!(
             delete_records(&mut f, ps, 42, &[]).unwrap(),
             DmlOutcome { tx_id: 0, affected: 0 }
         );
-        assert_eq!(u64::from_le_bytes(f[40..48].try_into().unwrap()), before);
+        assert_eq!(u64::from_le_bytes(f.page(0).unwrap()[40..48].try_into().unwrap()), before);
     }
 }
 
@@ -1242,7 +1242,7 @@ mod head_patch_tests {
     use crate::data::{DataPage, RHDF_DATA_OFFSET, RHDF_F_LINE_OFFSET, RHDF_F_PAGE_OFFSET};
 
     /// One page holding a fragmented HEAD at slot 0, pointing at page 2.
-    fn page_with_head(payload: &[u8], head_flags: u16) -> Vec<u8> {
+    fn page_with_head(payload: &[u8], head_flags: u16) -> crate::Image {
         let ps = 4096usize;
         let mut file = vec![0u8; ps * 3];
         let p = ps;
@@ -1268,11 +1268,11 @@ mod head_patch_tests {
             .copy_from_slice(&(r as u16).to_le_bytes());
         file[p + DPG_RPT_OFFSET + 2..p + DPG_RPT_OFFSET + 4]
             .copy_from_slice(&(len as u16).to_le_bytes());
-        file
+        crate::Image::from_bytes(&file, ps)
     }
 
     fn head_bytes(file: &crate::Image) -> Vec<u8> {
-        let dp = DataPage::decode(&file[4096..8192]).unwrap();
+        let dp = DataPage::decode(file.page(1).unwrap()).unwrap();
         let r = dp.record(0).unwrap();
         crate::sqz::unpack(r.packed_data).unwrap()
     }
@@ -1281,7 +1281,7 @@ mod head_patch_tests {
     fn a_poke_inside_the_head_lands_and_changes_nothing_else() {
         let payload = b"AAAABBBBCCCCDDDDEEEEFFFF".to_vec();
         let mut file = page_with_head(&payload, flags::INCOMPLETE);
-        let before = DataPage::decode(&file[4096..8192]).unwrap().record(0).unwrap();
+        let before = DataPage::decode(file.page(1).unwrap()).unwrap().record(0).unwrap();
         let (tx, bp, bl, fmt, fp) =
             (before.transaction, before.back_page, before.back_line, before.format,
              before.next_fragment());
@@ -1293,7 +1293,7 @@ mod head_patch_tests {
         assert_eq!(head_bytes(&file), want);
 
         // and NOTHING else about the record moved
-        let after = DataPage::decode(&file[4096..8192]).unwrap().record(0).unwrap();
+        let after = DataPage::decode(file.page(1).unwrap()).unwrap().record(0).unwrap();
         assert_eq!(after.transaction, tx, "transaction id must not change");
         assert_eq!(after.back_page, bp, "back pointer must not change");
         assert_eq!(after.back_line, bl);

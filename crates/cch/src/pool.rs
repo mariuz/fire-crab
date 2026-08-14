@@ -374,17 +374,17 @@ mod tests {
         let b = open(&path).expect("attach");
         assert!(Arc::ptr_eq(&a, &b), "one file is one image");
         let t = a.begin_write(Duration::from_secs(1)).expect("write side");
-        a.publish(vec![2u8; 64]);
+        a.publish(fire_crab_ods::Image::from_bytes(&[2u8; 64], 64));
         drop(t);
         // the OTHER attachment sees it - the whole point
-        assert_eq!(b.image()[0], 2);
+        assert_eq!(b.image().page(0).unwrap()[0], 2);
         forget(&path);
         let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn the_write_side_is_exclusive_and_recursive() {
-        let path = scratch("fc-pool-excl.bin", &[0u8; 16]);
+        let path = scratch("fc-pool-excl.bin", &[0u8; 64]);
         let a = open(&path).expect("attach");
         let outer = a.begin_write(Duration::from_secs(1)).expect("write side");
         // the same thread re-enters (a row-by-row statement does)
@@ -407,21 +407,21 @@ mod tests {
     fn a_replaced_file_is_re_read() {
         let path = scratch("fc-pool-reload.bin", &[7u8; 32]);
         let a = open(&path).expect("attach");
-        assert_eq!(a.image()[0], 7);
+        assert_eq!(a.image().page(0).unwrap()[0], 7);
         // what every gate does: delete the scratch db and make it again
         std::fs::remove_file(&path).unwrap();
         std::thread::sleep(Duration::from_millis(20));
         std::fs::write(&path, [9u8; 48]).unwrap();
         let b = open(&path).expect("attach");
-        assert_eq!(b.image()[0], 9, "the image follows the file, not the name");
-        assert_eq!(b.image().len(), 48);
+        assert_eq!(b.image().page(0).unwrap()[0], 9, "the image follows the file, not the name");
+        assert_eq!(b.image().byte_len(), 48);
         forget(&path);
         let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn a_missing_file_is_not_a_database() {
-        let path = scratch("fc-pool-gone.bin", &[0u8; 8]);
+        let path = scratch("fc-pool-gone.bin", &[0u8; 64]);
         assert!(open(&path).is_some());
         std::fs::remove_file(&path).unwrap();
         assert!(open(&path).is_none(), "no file, no image");

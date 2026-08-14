@@ -471,7 +471,7 @@ mod frag_tests {
         let dp = DataPage::decode(&file[4096..8192]).unwrap();
         let head = dp.record(0).unwrap();
         assert_eq!(
-            assembled_image(&file, 4096, &head),
+            assembled_image(&crate::Image::from_bytes(&file, 4096), 4096,&head),
             Some(b"HEADTAIL".to_vec())
         );
     }
@@ -483,7 +483,7 @@ mod frag_tests {
         let frag = dp.record(0).unwrap();
         // the terminal piece on its own is an ordinary rhd record
         assert_eq!(frag.next_fragment(), None);
-        assert_eq!(assembled_image(&file, 4096, &frag), Some(b"TAIL".to_vec()));
+        assert_eq!(assembled_image(&crate::Image::from_bytes(&file, 4096), 4096,&frag), Some(b"TAIL".to_vec()));
     }
 
     /// A MIXED chain: a raw head and a compressed tail. The engine
@@ -505,7 +505,7 @@ mod frag_tests {
         let dp = DataPage::decode(&file[4096..8192]).unwrap();
         let head = dp.record(0).unwrap();
         assert_eq!(
-            assembled_image(&file, 4096, &head),
+            assembled_image(&crate::Image::from_bytes(&file, 4096), 4096,&head),
             Some(b"HEADTAIL".to_vec())
         );
     }
@@ -517,7 +517,7 @@ mod frag_tests {
         let file = two_page_chain(&lit(b"HEAD"), &lit(b"TAIL"), 0);
         let dp = DataPage::decode(&file[4096..8192]).unwrap();
         let head = dp.record(0).unwrap();
-        assert_eq!(assembled_image(&file, 4096, &head), None);
+        assert_eq!(assembled_image(&crate::Image::from_bytes(&file, 4096), 4096,&head), None);
     }
 }
 
