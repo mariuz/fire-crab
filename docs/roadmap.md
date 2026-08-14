@@ -1970,11 +1970,26 @@ plus *the subsystem is now on the path*.
       `FC_NO_INDEX`-twinned. What a grouped join lacks relative to a
       single-relation `Plan::Group` is that group's scalar `index`/`defer`
       field — but it needs none, because its retrieval IS the join tree,
-      whose only indexed leaf is the inner probe. The one real join
-      retrieval gap left is the DRIVER index (a WHERE on the outer side
-      driving the outer's OWN index), which is not grouped-specific and is
-      row-order-coupled to the engine's driver choice — the same reason
-      the INNER hashes are pinned.
+      whose only indexed leaf is the inner probe.
+
+      *The DRIVER index — its EQUALITY half is now ON.* A WHERE
+      constraining ONLY the driver keys the outer by its own index, as the
+      engine does (probed: `A LEFT JOIN B … WHERE A.col = v` is `PLAN JOIN
+      (A INDEX(…), B …)`). The feared row-order coupling turned out inert
+      for equality: the equal-key band is recno-ordered on both sides, and
+      a scan-filter of `col = v` already yields that same recno order, so
+      the driver index CHANGES WHICH ROWS ARE READ, NOT THEIR ORDER — the
+      unordered differential holds. `plan_join_bound` swaps `sides[0].src`
+      to an `IndexScan` when the WHERE is a single-group (AND) predicate
+      over the driver alone with a bare-spellable equality conjunct
+      (`choose_index` off the real filter, a bare `SELECT 1 … = 0`
+      sentinel for fcopt's blessing); an OR, a range, an aliased driver or
+      a mixed WHERE all decline to the scan. `base = sides[0].src` so a
+      grouped join inherits it for free. `qa/serve-real-leftjoinindex.sh`
+      gates it (`driver_indexed`, unique + non-unique + unordered +
+      under-GROUP-BY), `FC_NO_INDEX`-twinned. Still open: a RANGE driver
+      (cost-decided access, divergent order) and a PARAMETERISED driver
+      WHERE (needs a deferred driver band, like the projection's).
 
       *LEFT — the slice is ON.* A LEFT JOIN never hashes. In every
       probe the engine's plan IS fire-crab's execution tree: driver =

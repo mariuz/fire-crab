@@ -264,6 +264,20 @@ join_natural() { # <label> <sql> - answers alike AND every step scanned
         fail=1
     fi
 }
+# the DRIVER's own index - a WHERE constraining the outer side drives it
+# by that index ("driver index:", distinct from the inner probe's line)
+driver_indexed() { # <label> <sql> - alike AND the DRIVER drove an index
+    before=$(count_line "driver index: rel=")
+    same "$1" "$2"
+    after=$(count_line "driver index: rel=")
+    ran=$((ran + 1))
+    if [ "$after" -gt "$before" ]; then
+        echo "OK   ... and the DRIVER drove its own index"
+    else
+        echo "DIFF $1: the driver did NOT drive an index"
+        fail=1
+    fi
+}
 
 # --- 0. the control: the log is being read at all ----------------------
 # If this printed nothing the two helpers above would agree with
@@ -318,6 +332,18 @@ join_indexed "a GROUP BY over the join still probes the inner" \
     "SELECT CHI.K, COUNT(PAR.N) AS C FROM CHI LEFT JOIN PAR ON PAR.K = CHI.K GROUP BY CHI.K ORDER BY CHI.K" 1
 join_indexed "... and a global aggregate over the join probes too" \
     "SELECT COUNT(PAR.N) AS C FROM CHI LEFT JOIN PAR ON PAR.K = CHI.K" 1
+# THE DRIVER's own index: a WHERE constraining the OUTER side drives it by
+# that index, as the engine does (PLAN JOIN (PAR INDEX(...), DUP ...)).
+# The inner still probes; the Filter above the join re-checks the whole
+# WHERE. Row order is the driver's index order, which is the engine's.
+driver_indexed "a WHERE keys the unique DRIVER (equality on its PK)" \
+    "SELECT PAR.N, DUP.N FROM PAR LEFT JOIN DUP ON DUP.K = PAR.K WHERE PAR.K = 5 ORDER BY DUP.N"
+driver_indexed "a WHERE keys the NON-UNIQUE driver (6 equal-key rows)" \
+    "SELECT COUNT(*) AS C FROM DUP LEFT JOIN PAR ON PAR.K = DUP.K WHERE DUP.K = 5"
+driver_indexed "... and its rows UNORDERED (the driver's index order IS the engine's)" \
+    "SELECT DUP.N, PAR.N FROM DUP LEFT JOIN PAR ON PAR.K = DUP.K WHERE DUP.K = 5"
+driver_indexed "the driver keys UNDER A GROUP BY too (base = the indexed side)" \
+    "SELECT DUP.K, COUNT(PAR.N) AS C FROM DUP LEFT JOIN PAR ON PAR.K = DUP.K WHERE DUP.K = 5 GROUP BY DUP.K"
 # A WHERE on the INNER side demotes the LEFT to an INNER and the engine
 # then FLIPS the driver (PLAN JOIN (PAR NATURAL, CHI INDEX ...)). This
 # executor cannot flip - its tree is fixed by the SQL - so it keeps

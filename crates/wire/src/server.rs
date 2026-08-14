@@ -21551,6 +21551,66 @@ fn plan_join_bound(
         }
     }
 
+    // DRIVE THE OUTER by its own index when the WHERE constrains ONLY it.
+    // The engine plans `A LEFT JOIN B ... WHERE A.col = v` as
+    // `PLAN JOIN (A INDEX(...), B ...)` - driving A by its index - and the
+    // driver's rows then arrive in that index's order, which is the order
+    // fire-crab's single-table index scan already produces (so the
+    // differential holds without an ORDER BY). Only a SINGLE-GROUP (AND)
+    // WHERE over the driver alone is safe: an OR would need a union of
+    // bands (a partial band drops driver rows the LEFT join must keep),
+    // and a conjunct on the INNER already demoted the join above. The
+    // Filter above the join re-checks the whole WHERE, so the band only
+    // narrows what is READ, never what is answered. A `?` has no band at
+    // prepare and stays a scan (a deferred driver band is a follow-up);
+    // an aliased or mixed driver text makes `choose_index` decline, which
+    // also just scans.
+    let driver_src = sides[0].probe_src.clone();
+    let driver_descs = sides[0].descs.clone();
+    let driver_cols = sides[0].columns.clone();
+    let driver_width = driver_descs.len();
+    if let (Some(f), Some(src)) = (filter.as_ref(), driver_src.as_ref()) {
+        let bare = |s: &str| ident_ok(s) && !s.chars().any(|c| c.is_ascii_lowercase());
+        // an EQUALITY conjunct on a bare-spellable driver column: the
+        // shape the engine reliably indexes and whose row order (the
+        // equal-key band, recno within it) matches a scan-free plan on
+        // BOTH sides. A range is left scanning - its access is
+        // cost-decided and its order would diverge. The band is built
+        // through `choose_index` off the real filter (as the projection's
+        // is); the `SELECT 1 ... = 0` is a value-independent SENTINEL that
+        // buys fcopt's blessing, bare-spelt for the reason
+        // build_join_probe states.
+        let key_col = (f.groups.len() == 1
+            && f.groups[0].iter().all(|t| term_side_only(t, &(0..driver_width))))
+        .then(|| {
+            f.groups[0].iter().find_map(|t| {
+                let fid = match t {
+                    Term::Cmp(fid, Cmp::Eq, _) | Term::NumCmp(fid, Cmp::Eq, _) => *fid,
+                    _ => return None,
+                };
+                let c = driver_cols.iter().find(|c| c.field_id as usize == fid)?;
+                bare(&c.name).then(|| c.name.clone())
+            })
+        })
+        .flatten();
+        if let (Some(col), true) = (key_col, bare(&src.table)) {
+            let opt_sql = format!("SELECT 1 FROM {} WHERE {} = 0", src.table, col);
+            if let Some(access) =
+                choose_index(db, src.rel, &src.table, &driver_descs, &filter, &opt_sql, &[])
+            {
+                if trace_on() {
+                    eprintln!("[srv] driver index: rel={} {}", src.rel, access.describe());
+                }
+                sides[0].src = RowSource::IndexScan {
+                    rel: src.rel,
+                    formats: src.formats.clone(),
+                    access,
+                    width: Some(driver_width),
+                };
+            }
+        }
+    }
+
     // An AGGREGATE in the projection (or any GROUP BY) folds the joined
     // rows instead of emitting them. The fold is the same machinery a
     // single relation's grouping uses; only the INPUT differs, so the
