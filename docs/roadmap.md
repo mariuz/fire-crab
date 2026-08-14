@@ -2146,9 +2146,27 @@ plus *the subsystem is now on the path*.
       `rank_of`, `eval`) plus a few catch-all sites; the wire encoder
       already sent `Value::Int128`. `qa/serve-real-numsubtype.sh` gates
       the describe (i64::MAX+1, a 20-digit, and `i128::MAX` all
-      INT128/len-16) and the VALUE round-trip. Still refused: wide
-      arithmetic and a past-`i128` magnitude (DECFLOAT(34) - no `Value`
-      carrier exists, its own slice).
+      INT128/len-16) and the VALUE round-trip.
+
+      *And wide-literal ARITHMETIC came with it* — `99999999999999999999
+      + 1`, `5000000000 * 5000000000` (both operands i64 but the PRODUCT
+      wide), and the same inside a `WHERE`. The select-list arithmetic
+      already worked once the `RawExpr::Int128` carrier existed (it flows
+      through the shared `expr_atom`→`Expr::Bin` eval, which the prior
+      slice built); the gap was the WHERE-*expression* atom parser
+      `texpr_atom`, which matched only `Tok::Int(n)` and hit `_ => None`
+      on a `Tok::Int128` - one arm (`Tok::Int128(n) => RawExpr::Int128`)
+      opened it. The second door was the Expr-LHS comparison lowering's
+      `rhs_expr` closure, which refused `Rhs::Int128` for want of a
+      carrier (`WHERE <expr> = <wide>`); it now emits `Expr::Int128`. The
+      i128-boundary OVERFLOW was already faithful - the shared `Expr::Bin`
+      eval uses checked i128 arithmetic and raises SQLSTATE 22003 exactly
+      as the engine does (it promotes to DECFLOAT for a bare wider literal
+      but RAISES on integer arithmetic overflow, probed). Gated in
+      `serve-real-numsubtype.sh`: arithmetic type+value, WHERE-side
+      counts, and SQLSTATE parity on the two overflow forms. Still
+      refused: a past-`i128` magnitude (DECFLOAT(34) - no `Value` carrier
+      exists, its own slice).
 
       *And the wide OUTER value came with it* — the probe's `band` capped
       an `Int128` driving value at `i64` and scanned; now it carries the

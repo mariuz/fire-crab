@@ -40327,6 +40327,7 @@ fn texpr_unary(t: &[Tok], pos: &mut usize) -> Option<RawExpr> {
 fn texpr_atom(t: &[Tok], pos: &mut usize) -> Option<RawExpr> {
     let e = match t.get(*pos)? {
         Tok::Int(n) => RawExpr::Int(*n),
+        Tok::Int128(n) => RawExpr::Int128(*n),
         Tok::Dec(r, sc) => RawExpr::Dec(*r, *sc),
         Tok::Str(v) => RawExpr::Str(v.clone()),
         Tok::Null => RawExpr::Null,
@@ -44109,14 +44110,13 @@ fn resolve_expr_term(
     let rhs_expr = |rhs: &Rhs| -> Option<Expr> {
         Some(match rhs {
             Rhs::Int(n) => Expr::Int(*n),
+            Rhs::Int128(n) => Expr::Int128(*n),
             Rhs::Num(r, s) => Expr::Dec(*r, *s),
             Rhs::Str(s) => Expr::Str(s.clone()),
             Rhs::Null => Expr::Null,
             // Dbl exists only at bind - unreachable-defensive here; a
-            // StrKey refuses rather than drop its grammar marker; a wide
-            // INT128 literal has no Expr carrier (Expr::Int is i64), so an
-            // expression comparison over one refuses
-            Rhs::Dbl(_) | Rhs::Param(..) | Rhs::StrKey(_) | Rhs::Int128(_) => return None,
+            // StrKey refuses rather than drop its grammar marker
+            Rhs::Dbl(_) | Rhs::Param(..) | Rhs::StrKey(_) => return None,
         })
     };
     let term = match &rt.kind {

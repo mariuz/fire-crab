@@ -96,5 +96,45 @@ bothval() {
 bothval "99999999999999999999"
 bothval "170141183460469231731687303715884105727"
 
+# WIDE-LITERAL ARITHMETIC: an integer expression over a wide literal keeps
+# the engine's INT128 promotion, in the SELECT list AND inside a WHERE.
+# The parser refused a Tok::Int128 as an expression atom before (only the
+# bare projected/compared literal was carried); it now flows through
+# RawExpr::Int128 into the shared arithmetic/eval path.
+# type of the arithmetic result: INT128, subtype 0, len 16
+both "99999999999999999999 + 1"                # operand is INT128
+both "5000000000 * 5000000000"                 # both operands i64, product wide
+both "170141183460469231731687303715884105727 + 0"  # i128::MAX identity
+# and the value round-trips
+bothval "99999999999999999999 + 1"             # 100000000000000000000
+bothval "5000000000 * 5000000000"              # 25000000000000000000
+bothval "99999999999999999999 * 2"             # 199999999999999999998
+# a full-statement comparison, for the WHERE-expression side and for the
+# i128-boundary OVERFLOW, which must raise (SQLSTATE 22003) not wrap
+qval() {
+    local e c
+    e=$(printf '%s\n' "$1" | "$ISQL" -q -user "$U" -pas "$P" "$E" 2>&1 | tr -s ' \n' ' ' | sed 's/^ *//;s/ *$//')
+    c=$(printf '%s\n' "$1" | "$ISQL" -q -user "$U" -pas "$P" "$F" 2>&1 | tr -s ' \n' ' ' | sed 's/^ *//;s/ *$//')
+    ran=$((ran + 1))
+    if [ "$e" = "$c" ]; then echo "OK   q $1"; else echo "DIFF q $1"; echo "     engine: $e"; echo "     fcrab:  $c"; fail=1; fi
+}
+# wide arithmetic inside WHERE, both sides of the comparison wide
+qval "SELECT COUNT(*) FROM RDB\$DATABASE WHERE 99999999999999999999 + 1 = 100000000000000000000;"
+qval "SELECT COUNT(*) FROM RDB\$DATABASE WHERE 5000000000 * 5000000000 = 25000000000000000000;"
+qval "SELECT COUNT(*) FROM RDB\$DATABASE WHERE 99999999999999999999 + 1 > 5;"
+# i128::MAX + 1 and a wide*wide product both overflow INT128 - the engine
+# raises rather than promoting to DECFLOAT, and so must the twin. The
+# message wording differs (this server emits the shorter secondary line),
+# so parity is checked on the SQLSTATE class alone.
+qstate() {
+    local e c
+    e=$(printf '%s\n' "$1" | "$ISQL" -q -user "$U" -pas "$P" "$E" 2>&1 | grep -oiE 'SQLSTATE = [0-9]+' | head -1)
+    c=$(printf '%s\n' "$1" | "$ISQL" -q -user "$U" -pas "$P" "$F" 2>&1 | grep -oiE 'SQLSTATE = [0-9]+' | head -1)
+    ran=$((ran + 1))
+    if [ -n "$e" ] && [ "$e" = "$c" ]; then echo "OK   raise $1 [$e]"; else echo "DIFF raise $1"; echo "     engine: [$e]"; echo "     fcrab:  [$c]"; fail=1; fi
+}
+qstate "SELECT 170141183460469231731687303715884105727 + 1 FROM RDB\$DATABASE;"
+qstate "SELECT 100000000000000000000 * 100000000000000000000 FROM RDB\$DATABASE;"
+
 echo "ran $ran checks"
 exit $fail
