@@ -2209,12 +2209,34 @@ plus *the subsystem is now on the path*.
       band (`render_toks` declines the token → scan), no BETWEEN/IN bound,
       no expr-compare, no param bind. Gated in `serve-real-numericwhere.sh`
       (+9: the rounding boundary on INT128 and NUMERIC(38,0), `<`/`>`/`<>`/
-      `>=`, negative literals, an AND of two DECFLOAT bounds). Two adjacent
-      gaps found and left as their own slices: a DECFLOAT *column* in WHERE
-      refuses outright today (even `DF = 100` - the resolver never routes
-      DEC128 columns), and a wide INT128 *literal in INSERT VALUES* does not
-      parse. Still refused deliberately: DECFLOAT in arithmetic / nested,
-      and a value past DECFLOAT range.
+      `>=`, negative literals, an AND of two DECFLOAT bounds).
+
+      *And the DECFLOAT COLUMN in WHERE came next* — `col_kind` never
+      classified DEC64/DEC128, so a DECFLOAT column refused every predicate
+      (even `DF = 100`). A new `decfloat_term` resolver (routed beside
+      `numeric_term` on `is_decfloat_col`) makes EVERY comparison decimal:
+      the literal is promoted to decimal128 (`rhs_to_dec128`, rounding a
+      wide integer to 34 significant digits) and carried as
+      `Rhs::DecFloat34`, which the existing `Term::matches` arm compares
+      against the column - `value_as_dec` decodes a stored DECFLOAT or
+      rounds an exact numeric - with `decfloat::cmp`. `=`/`<>`/`<`/`<=`/
+      `>`/`>=`, IS [NOT] NULL, BETWEEN, IN and NOT all ride this; a
+      text/param literal, LIKE/STARTING and an expression side refuse
+      (fail closed). A scale-sign bug in `value_as_dec`/`rhs_to_dec128`
+      surfaced and was fixed - a stored numeric is `raw * 10^scale`, so
+      the decimal exponent IS the scale, not its negation (the prior slice
+      only ever hit scale-0 INT128/NUMERIC(38,0) columns, which hid it);
+      the scaled-column-vs-DECFLOAT-literal path is now correct too. A
+      **NaN** column value TRAPS on comparison (`isc_decfloat_invalid_operation`,
+      SQLSTATE 22000) exactly as the engine does - PROBED, per row - so a
+      new `EvalErr::DecfloatInvalidOperation` raises the identical vector
+      (Infinity, by contrast, is a normal ordered value `decfloat::cmp`
+      handles). Gated (+20): the full DECFLOAT(34) and DECFLOAT(16) column
+      matrix, a scaled-column vs DECFLOAT literal, and the NaN-trap SQLSTATE
+      parity. The one adjacent gap still open: a wide INT128 *literal in
+      INSERT VALUES* does not parse. Still refused deliberately: DECFLOAT
+      in arithmetic / nested, a DECFLOAT column against a text/param
+      literal or LIKE, and a value past DECFLOAT range.
 
       *And the wide OUTER value came with it* — the probe's `band` capped
       an `Int128` driving value at `i64` and scanned; now it carries the

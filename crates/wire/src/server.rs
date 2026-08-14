@@ -6627,13 +6627,24 @@ impl Term {
                 Some(v) => num_cmp(v, &Value::Int128(*r, 0)).map(|o| ord_ok(o, *op)),
                 None => None,
             },
-            // a DECFLOAT(34) literal (magnitude past i128::MAX): the engine
-            // promotes the column to decimal128 too - value_as_dec rounds it
-            // to 34 significant digits (HALF-UP) - and compares there.
+            // a DECFLOAT literal, or ANY literal against a DECFLOAT column
+            // (decfloat_term encodes the literal to decimal128): both sides
+            // compare in decimal - value_as_dec promotes the column (an
+            // exact numeric rounded to 34 significant digits HALF-UP, a
+            // stored DECFLOAT decoded), decfloat::cmp orders them.
             Term::NumCmp(fid, op, Rhs::DecFloat34(bits)) => match values.get(*fid) {
-                Some(v) => value_as_dec(v).map(|d| {
-                    ord_ok(fire_crab_ods::decfloat::cmp(&d, &fire_crab_ods::decfloat::decode_dec128(*bits)), *op)
-                }),
+                Some(v) => match value_as_dec(v) {
+                    // a NaN column value: the engine TRAPS per row (probed),
+                    // it is not UNKNOWN - so raise, not skip
+                    Some(fire_crab_ods::decfloat::Dec::Nan) => {
+                        return Err(EvalErr::DecfloatInvalidOperation)
+                    }
+                    Some(d) => Some(ord_ok(
+                        fire_crab_ods::decfloat::cmp(&d, &fire_crab_ods::decfloat::decode_dec128(*bits)),
+                        *op,
+                    )),
+                    None => None,
+                },
                 None => None,
             },
             Term::NumCmp(..) => None, // unbound parameter / wrong shape
@@ -29126,6 +29137,10 @@ impl From<ExecErr> for EmitErr {
 /// by zero".
 const GDS_ARITH_EXCEPT: i32 = 335544321;
 const GDS_INTEGER_DIVIDE: i32 = 335544778;
+/// `isc_decfloat_invalid_operation` - SQLSTATE 22000, emitted ALONE (not
+/// under arith_except): the engine's per-row trap when a comparison meets
+/// a NaN DECFLOAT value ("Decimal float invalid operation. ...")
+const GDS_DECFLOAT_INVALID_OPERATION: i32 = 335545141;
 /// `isc_exception_float_divide_by_zero` - SQLSTATE 22012
 const GDS_FLOAT_DIVIDE: i32 = 335544772;
 /// `isc_exception_float_overflow` - SQLSTATE 22003
@@ -29330,6 +29345,12 @@ fn eval_status_items(w: &mut W, e: &EvalErr) {
                 .int(GDS_ARITH_EXCEPT)
                 .int(1) // isc_arg_gds
                 .int(GDS_FLOAT_DIVIDE);
+        }
+        EvalErr::DecfloatInvalidOperation => {
+            // emitted ALONE - the engine's isql shows only "Decimal float
+            // invalid operation. ..." with no arith_except prefix (probed)
+            w.int(1) // isc_arg_gds
+                .int(GDS_DECFLOAT_INVALID_OPERATION);
         }
         EvalErr::FloatOverflow => {
             w.int(1) // isc_arg_gds
@@ -34060,6 +34081,12 @@ enum EvalErr {
     /// sum past `i64`, or an operation past `i128`:
     /// `isc_exception_integer_overflow` (SQLSTATE 22003)
     IntegerOverflow,
+    /// a comparison (or other operation) that met a NaN DECFLOAT value:
+    /// `isc_decfloat_invalid_operation` (SQLSTATE 22000). The engine traps
+    /// per row - `WHERE df > 0` over a table with a NaN row answers the
+    /// rows before it, then raises (probed) - so it is an eval error, not
+    /// an UNKNOWN.
+    DecfloatInvalidOperation,
     /// a CAST whose value does not fit the integer target's width -
     /// `isc_numeric_out_of_range` under `isc_arith_except` (SQLSTATE
     /// 22003), a DIFFERENT vector from IntegerOverflow's single code
@@ -34444,6 +34471,13 @@ fn is_numeric_col(d: &Descriptor) -> bool {
         || d.dtype == dtype::INT128
 }
 
+/// A DECFLOAT column - the IEEE 754-2008 decimal64/decimal128 types. Its
+/// comparison surface is entirely decimal (both sides promote to
+/// decimal128), separate from the i128-aligned exact-numeric one.
+fn is_decfloat_col(d: &Descriptor) -> bool {
+    matches!(d.dtype, dtype::DEC64 | dtype::DEC128)
+}
+
 /// Decompose a numeric value into (raw integer, scale) for arithmetic:
 /// an integer is scale 0, a scaled numeric keeps its scale, an INT128
 /// likewise. Anything else (text, temporal, ...) is not a numeric operand.
@@ -34463,14 +34497,39 @@ fn numeric_parts(v: &Value) -> Option<(i128, i8)> {
 /// promotion and declines, which reads as UNKNOWN at the compare.
 fn value_as_dec(v: &Value) -> Option<fire_crab_ods::decfloat::Dec> {
     use fire_crab_ods::decfloat::{decode_dec128, decode_dec64, round_to_dec34};
+    // a stored exact numeric is `raw * 10^scale` (render_scaled_i128), so
+    // the decimal exponent IS the scale, not its negation
     Some(match v {
         Value::Int(n) => round_to_dec34(*n < 0, (*n as i128).unsigned_abs(), 0),
-        Value::Scaled(r, s) => round_to_dec34(*r < 0, (*r as i128).unsigned_abs(), -(*s as i32)),
-        Value::Int128(r, s) => round_to_dec34(*r < 0, r.unsigned_abs(), -(*s as i32)),
+        Value::Scaled(r, s) => round_to_dec34(*r < 0, (*r as i128).unsigned_abs(), *s as i32),
+        Value::Int128(r, s) => round_to_dec34(*r < 0, r.unsigned_abs(), *s as i32),
         Value::DecFloat34(b) => decode_dec128(*b),
         Value::DecFloat16(b) => decode_dec64(*b),
         _ => return None,
     })
+}
+
+/// Encode a numeric literal as the decimal128 bits a DECFLOAT column
+/// compares against: the engine promotes the literal to DECFLOAT(34),
+/// rounding a wide integer to 34 significant digits (HALF-UP) exactly as
+/// [value_as_dec] rounds the column. A text/param/approximate literal has
+/// no such promotion here and declines (the DECFLOAT column refuses it).
+fn rhs_to_dec128(rhs: &Rhs) -> Option<u128> {
+    use fire_crab_ods::decfloat::{encode_dec128, round_to_dec34, Dec};
+    let dec = match rhs {
+        Rhs::Int(n) => round_to_dec34(*n < 0, (*n as i128).unsigned_abs(), 0),
+        // Rhs::Num carries (raw, scale) = raw * 10^scale; the exponent IS
+        // the scale (`1.5` is (15, -1))
+        Rhs::Num(r, s) => round_to_dec34(*r < 0, (*r as i128).unsigned_abs(), *s as i32),
+        Rhs::Int128(n) => round_to_dec34(*n < 0, n.unsigned_abs(), 0),
+        Rhs::DecFloat34(b) => return Some(*b),
+        Rhs::Dbl(_) | Rhs::Str(_) | Rhs::StrKey(_) | Rhs::Null | Rhs::Param(..) => return None,
+    };
+    match dec {
+        Dec::Finite { neg, coeff, exp } => Some(encode_dec128(neg, coeff, exp)),
+        // round_to_dec34 only ever builds Finite
+        _ => None,
+    }
 }
 
 /// The storage width of an exact-numeric operand - what decides INT128
@@ -44166,6 +44225,8 @@ fn resolve_predicate(
                 // scaled NUMERIC/DECIMAL and INT128 columns: the exact
                 // numeric comparison surface
                 None if is_numeric_col(d) => numeric_term(fid, rt.kind, d, params)?,
+                // DECFLOAT columns: the decimal128 comparison surface
+                None if is_decfloat_col(d) => decfloat_term(fid, rt.kind)?,
                 // a DATE/TIME/TIMESTAMP column takes the EXPRESSION
                 // path. Its comparison rules already live there -
                 // `value_cmp` converts a DATE to midnight against a
@@ -44891,6 +44952,32 @@ fn numeric_term(
         }
         RawKind::Starting(Rhs::Null, _) => Term::Unknown,
         RawKind::Starting(..) => return None,
+    })
+}
+
+/// [numeric_term] for a DECFLOAT column - the kind neither [col_kind] nor
+/// [is_numeric_col] classifies. Every comparison is decimal: the literal
+/// is promoted to decimal128 ([rhs_to_dec128], rounding a wide integer to
+/// 34 significant digits) and carried as `Rhs::DecFloat34`, which
+/// [Term::matches] compares against the column - itself promoted to
+/// decimal128 by [value_as_dec] - with [decfloat::cmp]. NULL tests work as
+/// anywhere. A text/parameter literal, LIKE/STARTING/SIMILAR, and an
+/// expression right side are separate surfaces and refuse (fail closed);
+/// a DECFLOAT literal never keys an index, so nothing here bands.
+fn decfloat_term(idx: usize, raw: RawKind) -> Option<Term> {
+    Some(match raw {
+        RawKind::Const(b) => Term::Const(b),
+        RawKind::Cmp(_, Rhs::Null) => Term::Unknown,
+        RawKind::Cmp(op, rhs) => Term::NumCmp(idx, op, Rhs::DecFloat34(rhs_to_dec128(&rhs)?)),
+        RawKind::IsNull => Term::IsNull(idx),
+        RawKind::IsNotNull => Term::IsNotNull(idx),
+        RawKind::Like(Rhs::Null, ..)
+        | RawKind::Similar(Rhs::Null, ..)
+        | RawKind::Starting(Rhs::Null, _) => Term::Unknown,
+        RawKind::CmpExpr(..)
+        | RawKind::Like(..)
+        | RawKind::Similar(..)
+        | RawKind::Starting(..) => return None,
     })
 }
 

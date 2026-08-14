@@ -53,6 +53,24 @@ INSERT INTO W VALUES (1, 170141183460469231731687303715884100000, 17014118346046
 INSERT INTO W VALUES (2, 170141183460469231731687303715884105727, 170141183460469231731687303715884105727);
 INSERT INTO W VALUES (3, 5, 5);
 INSERT INTO W VALUES (4, -170141183460469231731687303715884105728, -170141183460469231731687303715884105728);
+COMMIT;
+-- DECFLOAT columns (section 1c): the decimal128 comparison surface. Row 6
+-- is +Infinity (a normal ordered value, no trap); row 7 is NaN, which the
+-- engine TRAPS on any comparison (SQLSTATE 22000) - kept in its own table
+-- DFNAN so it does not poison the finite matrix.
+CREATE TABLE DF2 (ID INTEGER, D DECFLOAT(34), S DECFLOAT(16));
+COMMIT;
+INSERT INTO DF2 VALUES (1, 100, 100);
+INSERT INTO DF2 VALUES (2, 1.5, 1.5);
+INSERT INTO DF2 VALUES (3, -2.5, -2.5);
+INSERT INTO DF2 VALUES (4, 340282366920938463463374607431768211455, 250);
+INSERT INTO DF2 VALUES (5, NULL, NULL);
+INSERT INTO DF2 VALUES (6, CAST('Infinity' AS DECFLOAT(34)), 7);
+COMMIT;
+CREATE TABLE DFNAN (ID INTEGER, D DECFLOAT(34));
+COMMIT;
+INSERT INTO DFNAN VALUES (1, 5);
+INSERT INTO DFNAN VALUES (2, CAST('NaN' AS DECFLOAT(34)));
 COMMIT;"
 
 for f in "$REF" "$WORK"; do
@@ -172,6 +190,57 @@ predw "INT128 col >= negative DECFLOAT lit"         "K >= -340282366920938463463
 predw "INT128 col < negative DECFLOAT lit"          "K < -340282366920938463463374607431768211455"
 predw "NUMERIC col < DECFLOAT lit"                  "NB < 340282366920938463463374607431768211455"
 predw "DECFLOAT lit both bounds (AND)"              "K < 340282366920938463463374607431768211455 AND K > -340282366920938463463374607431768211455"
+# a SCALED numeric column (scale != 0) vs a DECFLOAT literal: the column's
+# scale IS its decimal exponent, so the promotion must not negate it
+predq "scaled NUMERIC(9,2) col < DECFLOAT lit"      "N < 340282366920938463463374607431768211455"
+predq "fine NUMERIC(18,4) col > -DECFLOAT lit"      "M > -340282366920938463463374607431768211455"
+
+# --- 1c. DECFLOAT COLUMNS: the decimal128 comparison surface ------------
+predf() { # <label> <where-clause> - fire-crab vs the ENGINE, same file, table DF2
+    fc=$(node_run "SELECT ID FROM DF2 WHERE $2 ORDER BY ID" | tr '\n' ' ' | strip)
+    [ "$fc" = "OK" ] && fc=""
+    is=$("$ISQL" -q -b -user "$U" -pas "$P" "$WORK" 2>&1 <<SQL | strip | grep -v '^$' | tr '\n' ' ' | strip
+SET HEADING OFF;
+SELECT ID FROM DF2 WHERE $2 ORDER BY ID;
+SQL
+)
+    check "$1 [$2]" "$fc" "$is"
+}
+predf "DECFLOAT col = int lit"        "D = 100"
+predf "DECFLOAT col = decimal lit"    "D = 1.5"
+predf "DECFLOAT col > decimal lit"    "D > 2.5"
+predf "DECFLOAT col <= neg decimal"   "D <= -2.5"
+predf "DECFLOAT col <> int lit"       "D <> 100"
+predf "DECFLOAT col IS NULL"          "D IS NULL"
+predf "DECFLOAT col IS NOT NULL"      "D IS NOT NULL"
+predf "DECFLOAT col BETWEEN"          "D BETWEEN 1 AND 200"
+predf "DECFLOAT col IN"               "D IN (100, 1.5)"
+predf "DECFLOAT col NOT (<)"          "NOT (D < 5)"
+predf "DECFLOAT col = wide (>i128)"   "D = 340282366920938463463374607431768211455"
+predf "DECFLOAT col = 1 vs 1 int"     "D = 100"
+predf "DECFLOAT col > 0 (+Infinity)"  "D > 0"
+predf "DECFLOAT(16) col = int"        "S = 100"
+predf "DECFLOAT(16) col = decimal"    "S = 1.5"
+predf "DECFLOAT(16) col <= neg"       "S <= -2.5"
+# a NaN column value TRAPS on comparison (SQLSTATE 22000), as the engine
+# does - fire-crab raises the identical isc_decfloat_invalid_operation
+raisef() { # <label> <where-clause>
+    fce=$(FC_DB="$WORK" FC_PORT="$PORT" FC_Q="SELECT ID FROM DFNAN WHERE $2" FC_P='[]' timeout 15 node -e '
+      const F=require("node-firebird");
+      F.attach({host:"127.0.0.1",port:+process.env.FC_PORT,database:process.env.FC_DB,user:"SYSDBA",password:"masterkey"},(e,db)=>{
+        if(e){console.log("ATT");process.exit(0);}
+        db.query(process.env.FC_Q,[],(er)=>{console.log(er?("ERR "+(er.gdscode||er.message||"")):"NOERR");db.detach();process.exit(0);});
+      });' 2>/dev/null)
+    ise=$("$ISQL" -q -user "$U" -pas "$P" "$WORK" <<SQL 2>&1 | grep -oiE 'SQLSTATE = [0-9]+' | head -1
+SELECT ID FROM DFNAN WHERE $2;
+SQL
+)
+    case "$fce" in ERR*) fcok=raise ;; *) fcok=noraise ;; esac
+    case "$ise" in *22000*) isok=raise ;; *) isok=noraise ;; esac
+    check "NaN traps [$2]" "$fcok/$isok" "raise/raise"
+}
+raisef "NaN > 0"  "D > 0"
+raisef "NaN <> 5" "D <> 5"
 
 # --- 2. DML through numeric predicates + decimal literals --------------
 check "fc INSERT with decimal literals" \
