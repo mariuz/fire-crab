@@ -2076,12 +2076,20 @@ plus *the subsystem is now on the path*.
       already `i128`; nothing widened `Rhs::Int` or its 100+ sites. Still
       refused, deliberately: a PROJECTED wide literal (`SELECT <huge>` —
       its describe is INT128/DECFLOAT, a separate concern), wide
-      arithmetic, a past-`i128` magnitude (DECFLOAT), and a wide OUTER
-      join VALUE (the probe's `band` still caps at `i64` → scans).
+      arithmetic, and a past-`i128` magnitude (DECFLOAT).
       `qa/serve-real-leftjoinindex.sh` proves it three ways with the
       `FC_NO_INDEX` twin: a 38-digit equality keys and scan-compares
       identically to the engine, a range past `i64`, and an OR mixing a
       wide and a small literal.
+
+      *And the wide OUTER value came with it* — the probe's `band` capped
+      an `Int128` driving value at `i64` and scanned; now it carries the
+      wide value as `Rhs::Int128` into the IDX_BCD band (an i64-range one
+      stays `Rhs::Int`, so it still keys a narrower inner). An `INT128`
+      driver whose key IS the inner's 38-digit one finds its partner
+      through the index, proved `index == scan == engine` by the twin.
+      So a wide magnitude is a first-class key on BOTH sides of a join
+      now, literal or value.
   - **A predicted bug that measurement did not confirm, recorded as
     such.** `ods::ddl::index_itype` maps every TEXT/VARYING column to
     `idx_string`, ignoring the charset, so a `CREATE INDEX` issued to

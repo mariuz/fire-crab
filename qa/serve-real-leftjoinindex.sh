@@ -122,6 +122,8 @@ ran=0
 #         navigates past the 39-digit one; and a WIDE integer LITERAL
 #         (>i64) in a WHERE keys and scan-compares in i128 (section 8),
 #         which fire-crab used to refuse at the tokenizer
+#   WIDEDRV an INT128 DRIVER whose key is >i64: the probe's band carries
+#         the wide OUTER value (not just a literal) into the IDX_BCD band
 make_db() {
     rm -f "$1"
     "$ISQL" -q -b -user "$U" -pas "$P" <<EOF >/dev/null 2>&1 || return 1
@@ -135,6 +137,7 @@ CREATE TABLE CHI (ID INTEGER, K INTEGER, N VARCHAR(8));
 CREATE TABLE WIDEK (K BIGINT, NM NUMERIC(9,2), T VARCHAR(8));
 CREATE TABLE BAND (K1 INTEGER, K2 INTEGER, N VARCHAR(8));
 CREATE TABLE BIG (K NUMERIC(38,0), N VARCHAR(8));
+CREATE TABLE WIDEDRV (ID INTEGER, K NUMERIC(38,0));
 COMMIT;
 CREATE INDEX DUP_K ON DUP (K);
 CREATE INDEX EMPT_K ON EMPT (K);
@@ -173,6 +176,13 @@ INSERT INTO DUP VALUES (NULL, 'dnull');
 -- a real 38-digit key in the tree: the small join keys must navigate
 -- PAST it, which only holds if the IDX_BCD key order is the engine's
 INSERT INTO BIG VALUES (99999999999999999999999999999999999999, 'ghuge');
+-- an INT128 DRIVER: a small key, a WIDE key that matches BIG's 38-digit
+-- one (the value the probe's band must carry past i64), a wide key with
+-- no partner, and a NULL
+INSERT INTO WIDEDRV VALUES (1, 5);
+INSERT INTO WIDEDRV VALUES (2, 99999999999999999999999999999999999999);
+INSERT INTO WIDEDRV VALUES (3, 40000000000000000000);
+INSERT INTO WIDEDRV VALUES (4, NULL);
 COMMIT;
 SET STATISTICS INDEX DUP_K;
 SET STATISTICS INDEX EMPT_K;
@@ -409,6 +419,12 @@ join_indexed "a NUMERIC(38,0) INT128 inner index" \
     "SELECT COUNT(*) FROM CHI LEFT JOIN BIG ON BIG.K = CHI.K" 1
 join_indexed "... and its rows, ordered" \
     "SELECT CHI.ID, BIG.N FROM CHI LEFT JOIN BIG ON BIG.K = CHI.K ORDER BY CHI.ID" 1
+# and the OTHER direction: a WIDE OUTER value (not a literal). The driver
+# WIDEDRV's key is >i64; the probe's band carries it into the IDX_BCD band
+# instead of capping at i64 and scanning. Row 2's key IS BIG's 38-digit
+# one, so it must find 'ghuge'; row 3's wide key has no partner (padded).
+join_indexed "an INT128 driver: the band carries a WIDE outer value" \
+    "SELECT WIDEDRV.ID, BIG.N FROM WIDEDRV LEFT JOIN BIG ON BIG.K = WIDEDRV.K ORDER BY WIDEDRV.ID" 1
 
 # --- 6. the pins: the join kinds the engine does NOT plan this way -----
 # A server that always says "index" is as wrong as one that never does.
@@ -536,6 +552,8 @@ same3 "two indexed ON columns (one band + ON residual)" \
     "SELECT CHI.ID, BAND.N FROM CHI LEFT JOIN BAND ON BAND.K1 = CHI.K AND BAND.K2 = CHI.K ORDER BY CHI.ID, BAND.N"
 same3 "the NUMERIC(38,0) INT128 inner" \
     "SELECT CHI.ID, BIG.N FROM CHI LEFT JOIN BIG ON BIG.K = CHI.K ORDER BY CHI.ID"
+same3 "the INT128 driver with a WIDE outer value" \
+    "SELECT WIDEDRV.ID, BIG.N FROM WIDEDRV LEFT JOIN BIG ON BIG.K = WIDEDRV.K ORDER BY WIDEDRV.ID"
 # a WIDE integer LITERAL (>i64) against the INT128 column - fire-crab
 # used to REFUSE it at the tokenizer; now it keys the IDX_BCD band (index
 # server) and scan-compares in i128 (FC_NO_INDEX server), both the

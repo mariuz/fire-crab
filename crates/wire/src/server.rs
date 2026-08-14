@@ -5072,9 +5072,13 @@ impl JoinProbe {
                 // scaled one is not, and neither is anything else this
                 // key builder takes
                 Value::Scaled(raw, 0) => Rhs::Int(raw),
+                // an i64-range value stays `Rhs::Int` so it can key an
+                // INT64 inner too; a WIDER one carries as `Rhs::Int128`,
+                // which keys an INT128 (IDX_BCD) inner and scans against a
+                // narrower one - correct, since no i64 column holds it.
                 Value::Int128(raw, 0) => match i64::try_from(raw) {
                     Ok(i) => Rhs::Int(i),
-                    Err(_) => return Band::Scan,
+                    Err(_) => Rhs::Int128(raw),
                 },
                 _ => return Band::Scan,
             };
