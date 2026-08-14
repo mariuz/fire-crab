@@ -759,6 +759,16 @@ pboth "a parameter beside a literal" \
       "SELECT ID FROM EMP WHERE DEPT_ID = ? AND SALARY > 100" "[1]" yes
 pboth "a NULL parameter, which matches nothing" \
       "SELECT ID FROM EMP WHERE DEPT_ID = ?" "[null]" no
+# a GROUPED query defers its band the same way a projection does now: the
+# fold reads its input through a retrieval, so a parameterised WHERE keys
+# at EXECUTE instead of scanning. (The literal grouped checks in section 2
+# already index; these are their bound-parameter twins.)
+pboth "a GROUPED query, parameter equality" \
+      "SELECT DEPT_ID, COUNT(*) AS K FROM EMP WHERE DEPT_ID = ? GROUP BY DEPT_ID" "[1]" yes
+pboth "a GROUPED query, parameter range" \
+      "SELECT DEPT_ID, COUNT(*) AS K FROM EMP WHERE DEPT_ID > ? GROUP BY DEPT_ID ORDER BY DEPT_ID" "[1]" yes
+pboth "a GROUPED query, parameter on an unindexed column" \
+      "SELECT DEPT_ID, COUNT(*) AS K FROM EMP WHERE SALARY = ? GROUP BY DEPT_ID" "[300]" no
 
 # --- 4. the answers themselves, index and scan side by side ------------
 # the same question asked two ways: if the index path lost a row, these

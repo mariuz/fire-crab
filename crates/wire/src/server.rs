@@ -4932,6 +4932,11 @@ AlterDomainRename {
         /// fold's input is a retrieval leaf like any other, so a
         /// grouped query looks up rather than scanning too
         index: Option<IndexAccess>,
+        /// a PARAMETERISED filter has no band at prepare (a `?` has no
+        /// value); this carries the reconstructed statement so the band
+        /// is built at EXECUTE from the bound predicate, exactly as a
+        /// plain projection defers - see [DeferredAccess].
+        defer: Option<DeferredAccess>,
     },
     /// `SET GENERATOR <name> TO <n>` or `ALTER SEQUENCE|GENERATOR <name>
     /// RESTART WITH <n>`: write a new value into the generator page at
@@ -23345,13 +23350,23 @@ fn branch_rows_res(
         having,
         order_by,
         index,
+        defer,
     } = plan
     {
         let having = bind_filter(having, args).map_err(|_| EvalErr::Unsupported)?;
+        let filter = bind_filter(filter, args).map_err(|_| EvalErr::Unsupported)?;
+        // a parameterised WHERE builds its band here from the bound
+        // predicate - a grouped derived table or CTE looks up too
+        let descs_now: Vec<Descriptor> = formats
+            .iter()
+            .max_by_key(|(n, _)| *n)
+            .map(|(_, d)| d.clone())
+            .unwrap_or_default();
+        let index = &resolve_access(index, defer, db, *rel, &descs_now, &filter, &[]);
         let rows = RowSource::aggregate_sorted(
             RowSource::Filter {
                 input: Box::new(leaf_source(*rel, formats.to_vec(), index)),
-                pred: bind_filter(filter, args).map_err(|_| EvalErr::Unsupported)?,
+                pred: filter,
             },
             gitems,
             key_fids,
@@ -25650,6 +25665,13 @@ fn plan_query_inner_ctx(
                     None => eprintln!("[srv] natural scan: rel={}", rel),
                 }
             }
+            // a `?` has no band at prepare; defer it to EXECUTE exactly as
+            // the projection does, so a parameterised GROUP BY looks up
+            // rather than scanning once the value is bound
+            let defer = (index.is_none() && filter_has_params(&filter)).then(|| DeferredAccess {
+                table: table.to_string(),
+                sql: opt_sql.clone(),
+            });
             Some(Plan::Group {
                 rel,
                 formats,
@@ -25662,6 +25684,7 @@ fn plan_query_inner_ctx(
                 having,
                 order_by,
                 index,
+                defer,
             })
         }
         Some(p) => Some(p),
@@ -26585,6 +26608,7 @@ fn plan_group(
         // filled in by the caller, which has the statement text
         // `fire-crab-opt` needs to choose the access path
         index: None,
+        defer: None,
     })
 }
 
@@ -30431,10 +30455,27 @@ fn emit_rows_inner(
             having,
             order_by,
             index,
+            defer,
         } => {
             if let Some(db) = db {
                 let filter = bind_filter(filter, args)?;
                 let having = bind_filter(having, args)?;
+                // a parameterised WHERE has no band at prepare; build it
+                // HERE from the bound predicate, exactly as a projection
+                // does. The fold's ORDER BY is the OUTPUT sort above the
+                // aggregate, so the index navigates by nothing (`&[]`), as
+                // it did at prepare.
+                let descs_now: Vec<Descriptor> = formats
+                    .iter()
+                    .max_by_key(|(n, _)| *n)
+                    .map(|(_, d)| d.clone())
+                    .unwrap_or_default();
+                let index = &resolve_access(index, defer, db, *rel, &descs_now, &filter, &[]);
+                if trace_on() {
+                    if let (Some(a), true) = (index.as_ref(), defer.is_some()) {
+                        eprintln!("[srv] index scan: rel={} {} (deferred)", rel, a.describe());
+                    }
+                }
                 // scan -> filter -> aggregate -> sort, as one tree. The
                 // ORDER BY keys are OUTPUT indexes and the folded rows
                 // are aligned with gitems/cols, which is exactly why the
@@ -46633,6 +46674,38 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                             let a = resolve_access(
                                 &None, defer, db, *rel, &descs, &bound, order_by,
                             );
+                            if let Some(a) = a {
+                                if std::env::var("FC_SRV_TRACE").is_ok() {
+                                    eprintln!(
+                                        "[srv] index scan: rel={} {} (deferred)",
+                                        rel,
+                                        a.describe()
+                                    );
+                                }
+                                *index = Some(a);
+                            }
+                        }
+                    }
+                }
+                // The SAME resolution for a GROUPED cursor: a fold reads
+                // its input through a retrieval, so a parameterised WHERE
+                // must have its band built here, before the cursor
+                // materialises and the scan runs. Its index navigates by
+                // nothing (the sort is above the aggregate), so `&[]`.
+                if let (
+                    Plan::Group { rel, formats, filter, index, defer, .. },
+                    Some(db),
+                ) = (std::rc::Rc::make_mut(&mut plan), database.as_ref())
+                {
+                    if index.is_none() && defer.is_some() {
+                        if let Ok(bound) = bind_filter(filter, &bound_args) {
+                            let descs: Vec<Descriptor> = formats
+                                .iter()
+                                .max_by_key(|(n, _)| *n)
+                                .map(|(_, d)| d.clone())
+                                .unwrap_or_default();
+                            let a =
+                                resolve_access(&None, defer, db, *rel, &descs, &bound, &[]);
                             if let Some(a) = a {
                                 if std::env::var("FC_SRV_TRACE").is_ok() {
                                     eprintln!(

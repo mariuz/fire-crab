@@ -2205,9 +2205,17 @@ plus *the subsystem is now on the path*.
     union is a missing set of rows) and candidates deduplicated ACROSS
     bands (one row can satisfy two branches).
   - **Parameters** *(done)*: the bands are built at EXECUTE from the
-    bound predicate, since a `?` has no value at prepare. Only the
-    projection's retrieval defers so far - a parameterised GROUP BY or
-    DML WHERE still scans.
+    bound predicate, since a `?` has no value at prepare. ~~Only the
+    projection's retrieval defers so far~~ — a parameterised **GROUP BY**
+    defers too now: `Plan::Group` grew a `defer` field beside its
+    `index`, built at prepare under the same `index.is_none() &&
+    filter_has_params` guard the projection uses, and `resolve_access`
+    runs it at execute (in the batch cursor path before the fold
+    materialises, and in the streaming path) so a grouped query looks up
+    on a bound `?` instead of scanning - proved by `pboth … yes` in
+    `qa/serve-real-index.sh`, whose `(deferred)` trace fires for the
+    grouped case as it does for the projection. **DML WHERE still scans**
+    - `Plan::Update`/`Plan::Delete` need the same `defer` field, next.
   - **A failure that was the GATE's, and a claim of mine that was
     wrong.** `qa/serve-real-params.sh` had been failing since before W1,
     and I reported it as "fire-crab accepts a boolean parameter INSERT
