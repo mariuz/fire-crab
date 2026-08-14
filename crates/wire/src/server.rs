@@ -4975,6 +4975,23 @@ struct ProbeSrc {
     formats: Vec<(u8, Vec<Descriptor>)>,
 }
 
+/// A view or derived side the engine FLATTENS to one base relation - a
+/// plain projection of a single table, no WHERE/DISTINCT/aggregate/join,
+/// so its rows ARE the table's and an index on it can be keyed. Carries
+/// everything a probe of the BASE table needs (its [ProbeSrc], its own
+/// descriptors and columns, laid out by base field id), plus a map from
+/// each of the side's OUTPUT columns to the base field id it projects -
+/// `None` for an output that is not a plain base column (an expression, a
+/// literal), which cannot be keyed. A side with a filter or transform is
+/// NOT flattenable and keeps its materialised plan.
+#[derive(Clone)]
+struct FlatSrc {
+    src: ProbeSrc,
+    descs: Vec<Descriptor>,
+    columns: Vec<RelationColumn>,
+    base_fid: Vec<Option<usize>>,
+}
+
 /// The index probe for a LEFT join's inner side: everything the
 /// planning-time `JoinSide` knows that `JoinPart` used to drop.
 ///
@@ -20147,6 +20164,12 @@ struct JoinSide {
     /// what an index probe of this side would need ([ProbeSrc]), which
     /// `JoinPart` used to drop. Only a PLAIN RELATION has one.
     probe_src: Option<ProbeSrc>,
+    /// set when this side is a view or derived table the engine flattens
+    /// to a single base relation ([FlatSrc]); the probe keys that base
+    /// table through the output-to-base column map. `None` for a plain
+    /// relation (which probes through `probe_src`) and for any side that
+    /// is not flattenable.
+    flatten: Option<FlatSrc>,
 }
 
 /// Resolve a (possibly qualified) column name against the two join sides
@@ -20853,6 +20876,74 @@ fn mark_hash_keys(on: &mut Predicate, offset: usize, part_width: usize) {
     }
 }
 
+/// A view or derived side the engine FLATTENS to one base relation, when
+/// its inner plan is a PURE PROJECTION of a single table - no WHERE,
+/// order, generator or window, each of which is a transform the flatten
+/// keeps but a base-table probe would silently drop. The base relation,
+/// its formats and (for the plain path's own reasons) the base column
+/// names come straight off the `Plan::Project`; `base_fid` maps each
+/// output column to the base field id it projects, `None` where the
+/// output is an expression rather than a plain column.
+fn build_flatten(db: &Database, inner: &Plan) -> Option<FlatSrc> {
+    let Plan::Project {
+        rel,
+        formats,
+        cols,
+        filter,
+        order_by,
+        gen_cols,
+        windows,
+        ..
+    } = inner
+    else {
+        return None;
+    };
+    if filter.is_some()
+        || !order_by.is_empty()
+        || !gen_cols.is_empty()
+        || !windows.is_empty()
+    {
+        return None;
+    }
+    // the base table's name, off the projection's own columns (each
+    // plain column carries the base relation) - it must be one table and
+    // bare-spellable, since the probe reconstructs `... FROM <table>`
+    let table = cols.iter().find_map(|c| c.relation.clone())?;
+    let bare = |s: &str| ident_ok(s) && !s.chars().any(|c| c.is_ascii_lowercase());
+    if !bare(&table) {
+        return None;
+    }
+    if cols.iter().any(|c| {
+        c.relation
+            .as_deref()
+            .is_some_and(|r| !r.eq_ignore_ascii_case(&table))
+    }) {
+        return None;
+    }
+    let descs = formats
+        .iter()
+        .max_by_key(|(n, _)| *n)
+        .map(|(_, d)| d.clone())
+        .unwrap_or_default();
+    if descs.is_empty() {
+        return None;
+    }
+    let base_fid = cols
+        .iter()
+        .map(|c| c.expr.is_none().then_some(c.field_id))
+        .collect();
+    Some(FlatSrc {
+        src: ProbeSrc {
+            rel: *rel,
+            table: table.clone(),
+            formats: formats.clone(),
+        },
+        descs,
+        columns: relation_columns(&db.bytes(), db.page_size, &table),
+        base_fid,
+    })
+}
+
 fn build_join_probe(
     db: &Database,
     kind: JoinKind,
@@ -20862,10 +20953,28 @@ fn build_join_probe(
     if !matches!(kind, JoinKind::Left) {
         return None;
     }
-    let src = side.probe_src.clone()?;
-    if !matches!(side.src, RowSource::TableScan { .. }) {
-        return None;
-    }
+    // the base table to KEY, this side's descriptors and columns laid out
+    // by base field id, and how its OUTPUT columns map to that base. A
+    // plain relation is the identity through `probe_src`; a view or
+    // derived side the engine flattens maps through its `FlatSrc`.
+    let (src, base_descs, base_cols, base_map): (
+        ProbeSrc,
+        Vec<Descriptor>,
+        Vec<RelationColumn>,
+        Option<Vec<Option<usize>>>,
+    ) = if let Some(f) = &side.flatten {
+        (f.src.clone(), f.descs.clone(), f.columns.clone(), Some(f.base_fid.clone()))
+    } else {
+        if !matches!(side.src, RowSource::TableScan { .. }) {
+            return None;
+        }
+        (
+            side.probe_src.clone()?,
+            side.descs.clone(),
+            side.columns.clone(),
+            None,
+        )
+    };
     // where this side's fields begin in the combined row - the same sum
     // `join_rows` accumulates into `left_width`, step by step
     let offset = side.offset;
@@ -20942,8 +21051,16 @@ fn build_join_probe(
             }
             found = Some((outer_expr, inner_fid));
         }
-        let (outer_expr, inner_fid) = found?;
-        let col = side.columns.iter().find(|c| c.field_id as usize == inner_fid)?;
+        let (outer_expr, out_pos) = found?;
+        // translate this side's OUTPUT column to the BASE field id it
+        // keys: identity for a plain table, the flatten's map for a view
+        // or derived side. An output that is not a plain base column has
+        // no base field, so its branch is unservable and the probe scans.
+        let inner_fid = match &base_map {
+            Some(m) => (*m.get(out_pos)?)?,
+            None => out_pos,
+        };
+        let col = base_cols.iter().find(|c| c.field_id as usize == inner_fid)?;
         if !bare(&col.name) {
             return None;
         }
@@ -20965,7 +21082,7 @@ fn build_join_probe(
         let opt_sql = format!("SELECT 1 FROM {} WHERE {} = 0", src.table, col.name);
         let filter = Predicate::dnf(vec![vec![Term::Cmp(inner_fid, Cmp::Eq, Rhs::Int(0))]]);
         let index =
-            choose_index(db, src.rel, &src.table, &side.descs, &Some(filter), &opt_sql, &[])?;
+            choose_index(db, src.rel, &src.table, &base_descs, &Some(filter), &opt_sql, &[])?;
         let [pick] = index.picks.as_slice() else { return None };
         if trace.is_none() {
             trace = Some((pick.op.id, col.name.clone()));
@@ -20976,7 +21093,7 @@ fn build_join_probe(
     Some(JoinProbe {
         index_id,
         column,
-        descs: side.descs.clone(),
+        descs: base_descs,
         src,
         keys,
     })
@@ -21046,6 +21163,7 @@ fn plan_join_bound(
             }
             let (columns, descs) = derived_view(&inner_cols);
             let offset: usize = sides.iter().map(|s: &JoinSide| s.descs.len()).sum();
+            let flatten = build_flatten(db, &inner);
             sides.push(JoinSide {
                 key: tr.alias?.to_string(),
                 // a DERIVED side has no relation and so no schema: its
@@ -21065,6 +21183,7 @@ fn plan_join_bound(
                 rel_alias: tr.alias.map(str::to_string),
                 merged_away: Vec::new(),
                 probe_src: None,
+                flatten,
             });
             continue;
         }
@@ -21084,6 +21203,7 @@ fn plan_join_bound(
         if let Some((inner, view_cols)) = plan_view(db_opt, db, tr.table) {
             let (columns, descs) = derived_view(&view_cols);
             let offset: usize = sides.iter().map(|s: &JoinSide| s.descs.len()).sum();
+            let flatten = build_flatten(db, &inner);
             sides.push(JoinSide {
                 key: tr.alias.unwrap_or(tr.table).to_string(),
                 // a view is a relation like any other, and an ALIAS
@@ -21103,6 +21223,7 @@ fn plan_join_bound(
                 rel_alias: tr.alias.map(str::to_string),
                 merged_away: Vec::new(),
                 probe_src: None,
+                flatten,
             });
             continue;
         }
@@ -21131,6 +21252,7 @@ fn plan_join_bound(
                     rel_alias: Some(tr.alias.unwrap_or(tr.table).to_string()),
                     merged_away: Vec::new(),
                     probe_src: None,
+                    flatten: None,
                 });
                 continue;
             }
@@ -21177,6 +21299,7 @@ fn plan_join_bound(
             rel_alias: tr.alias.map(str::to_string),
             merged_away: Vec::new(),
             probe_src,
+            flatten: None,
         });
     }
     // every side must be distinguishable by qualifier
@@ -51387,6 +51510,7 @@ mod tests {
                 rel_alias: Some("E".into()),
                 merged_away: Vec::new(),
                 probe_src: None,
+                flatten: None,
             },
             JoinSide {
                 key: "D".into(),
@@ -51403,6 +51527,7 @@ mod tests {
                 rel_alias: Some("D".into()),
                 merged_away: Vec::new(),
                 probe_src: None,
+                flatten: None,
             },
         ]
     }

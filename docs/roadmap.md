@@ -2019,7 +2019,7 @@ plus *the subsystem is now on the path*.
       equivalence oracle only for non-raising ONs from here on.
 
       *And it measured the gap, which is the shape of Slice B*: SEVEN
-      inner sides the engine INDEXES and this probe declines — **three
+      inner sides the engine INDEXES and this probe declines — **two
       now**: the scaled-NUMERIC keys closed `NUMERIC(9,2)` and the
       descending arithmetic closed the DESCENDING index, both of them
       OUTSIDE the join, because neither refusal was ever about the join
@@ -2034,9 +2034,14 @@ plus *the subsystem is now on the path*.
       CHI.K OR PAR.K = 0`), and the per-outer-row band is their UNION,
       deduplicated on acceptance by `records_for_2pc` exactly as the
       projection's OR already was; every branch must be servable, or a
-      partial union would miss rows and the whole probe scans. The rest:
-      `NUMERIC(38,0)`, a VIEW inner (the engine flattens it), a DERIVED
-      inner, and the engine's bitmap AND of two indexes. Their rows
+      partial union would miss rows and the whole probe scans; and a
+      **VIEW or DERIVED inner** that is a plain projection of ONE base
+      table closed too — the engine FLATTENS it (its rows ARE the
+      table's), so `build_flatten` keys the base relation through an
+      output-column-to-base-field map off the inner `Plan::Project`,
+      declining any side carrying a WHERE, DISTINCT, aggregate or window
+      the flatten would silently drop. The rest: `NUMERIC(38,0)` and the
+      engine's bitmap AND of two indexes. Their rows
       agree today; with a raising ON they do not, so each is a shape
       where identical SQL raises or answers depending on whether
       fire-crab's heuristics bless the inner. `pick_for_terms`, not the
