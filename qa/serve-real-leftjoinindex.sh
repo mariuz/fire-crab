@@ -58,19 +58,24 @@
 # and stated here because section 5 would otherwise read as a clean
 # bill: SEVEN inner sides the ENGINE indexes and this probe declined -
 # a DESCENDING index, ~~a NUMERIC(9,2) index~~, NUMERIC(38,0), a VIEW
-# inner (the engine flattens it), a DERIVED inner, an expression in the
-# ON (`RZ.K = O.K + 0`), an OR in the ON, and the engine's bitmap AND of
+# inner (the engine flattens it), a DERIVED inner, ~~an expression in the
+# ON (`RZ.K = O.K + 0`)~~, an OR in the ON, and the engine's bitmap AND of
 # two indexes. Their ROWS agree, which is what section 5 asserts and
 # all it asserts; with a RAISING ON they do not, because fire-crab
 # scans where the engine keys. Every one is a candidate for Slice B,
 # and each is one more shape where identical SQL raises or answers
 # depending on whether this server's heuristics bless the inner.
 #
-# SIX now. The scaled NUMERIC inner side is CLOSED: the refusal was
+# FIVE now. The scaled NUMERIC inner side is CLOSED: the refusal was
 # never about the join at all - `pick_for_terms` declined every column
 # with a non-zero scale, so a plain `WHERE N92 = 1.50` scanned too. The
 # literal is carried to the column's own scale now and the probe takes
-# that inner side like any other (section 5 asserts it INDEXED).
+# that inner side like any other (section 5 asserts it INDEXED). And an
+# EXPRESSION on the outer side of the ON is closed: the inner side stays
+# a bare indexable column, and the outer expression (`CHI.K + 0`) is
+# evaluated per driving row to the value the band probes with - the
+# engine's own indexed shape. What remains: NUMERIC(38,0) (an INT128
+# key), a VIEW inner, a DERIVED inner, an OR in the ON, and bitmap AND.
 #
 #   qa/serve-real-leftjoinindex.sh [port]     (the twin runs on port+1)
 #
@@ -331,8 +336,14 @@ join_natural "a TEXT inner index against a numeric outer value" \
     "SELECT COUNT(*) FROM CHI LEFT JOIN WIDEK W ON W.T = CHI.N"
 join_natural "a NON-EQUALITY ON (a range band does not exclude the NULL entries)" \
     "SELECT COUNT(*) FROM CHI LEFT JOIN PAR ON PAR.K > CHI.K"
-join_natural "an EXPRESSION in the ON" \
-    "SELECT COUNT(*) FROM CHI LEFT JOIN PAR ON PAR.K = CHI.K + 0"
+# ...and this one closes another of them. An EXPRESSION on the OUTER
+# side of the ON equality (`CHI.K + 0`) is evaluated per driving row to
+# the value the band probes with, while the INNER side stays a bare
+# indexable column - which is the shape the engine indexes too.
+join_indexed "an EXPRESSION on the outer side of the ON" \
+    "SELECT COUNT(*) FROM CHI LEFT JOIN PAR ON PAR.K = CHI.K + 0" 1
+join_indexed "... and its rows, ordered" \
+    "SELECT CHI.ID, PAR.N FROM CHI LEFT JOIN PAR ON PAR.K = CHI.K + 0 ORDER BY CHI.ID" 1
 join_natural "an OR in the ON (the band would be a MISSING set of rows)" \
     "SELECT COUNT(*) FROM CHI LEFT JOIN PAR ON PAR.K = CHI.K OR PAR.K = 0"
 join_natural "a VIEW inner side (the engine FLATTENS it; fire-crab materialises)" \
@@ -454,6 +465,8 @@ same3 "the empty indexed inner" \
     "SELECT COUNT(*) FROM CHI LEFT JOIN EMPT ON EMPT.K = CHI.K"
 same3 "the BIGINT inner key" \
     "SELECT CHI.ID, W.T FROM CHI LEFT JOIN WIDEK W ON W.K = CHI.K ORDER BY CHI.ID"
+same3 "the expression on the outer side of the ON" \
+    "SELECT CHI.ID, PAR.N FROM CHI LEFT JOIN PAR ON PAR.K = CHI.K + 0 ORDER BY CHI.ID"
 same3 "the chain of two LEFT JOINs" \
     "SELECT CHI.ID, PAR.N, DUP.N FROM CHI LEFT JOIN PAR ON PAR.K = CHI.K LEFT JOIN DUP ON DUP.K = PAR.K WHERE CHI.ID < 30 ORDER BY CHI.ID, DUP.N"
 same3 "the unindexed inner" \

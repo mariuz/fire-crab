@@ -2019,20 +2019,24 @@ plus *the subsystem is now on the path*.
       equivalence oracle only for non-raising ONs from here on.
 
       *And it measured the gap, which is the shape of Slice B*: SEVEN
-      inner sides the engine INDEXES and this probe declines — **five
+      inner sides the engine INDEXES and this probe declines — **four
       now**: the scaled-NUMERIC keys closed `NUMERIC(9,2)` and the
       descending arithmetic closed the DESCENDING index, both of them
       OUTSIDE the join, because neither refusal was ever about the join
       (`pick_for_terms` declined every scaled column and every
-      descending one, so plain `WHERE` retrievals scanned too). The
-      rest: `NUMERIC(38,0)`, a VIEW inner
-      (the engine flattens it), a DERIVED inner, an expression in the
-      ON (`RZ.K = O.K + 0`), an OR in the ON, and the engine's bitmap
-      AND of two indexes. Their rows agree today; with a raising ON
-      they do not, so each is a shape where identical SQL raises or
-      answers depending on whether fire-crab's heuristics bless the
-      inner. `pick_for_terms`, not the fcopt gatekeeper, is what
-      refuses most of them (fcopt blesses `NUMERIC(9,2)` happily) —
+      descending one, so plain `WHERE` retrievals scanned too); and the
+      **expression in the ON** (`RZ.K = O.K + 0`) closed INSIDE it — the
+      inner side stays a bare indexable column, and the outer side is
+      now any expression over the accumulated row, evaluated per driving
+      row to the value the band probes with (`JoinProbe` carries an
+      `outer: Expr`, an evaluation that raises falls back to the scan
+      where the ON re-raises). The rest: `NUMERIC(38,0)`, a VIEW inner
+      (the engine flattens it), a DERIVED inner, an OR in the ON, and
+      the engine's bitmap AND of two indexes. Their rows agree today;
+      with a raising ON they do not, so each is a shape where identical
+      SQL raises or answers depending on whether fire-crab's heuristics
+      bless the inner. `pick_for_terms`, not the fcopt gatekeeper, is
+      what refuses most of them (fcopt blesses `NUMERIC(9,2)` happily) —
       which is why the band is built through `choose_index` rather than
       trusted from the plan text.
   - **A predicted bug that measurement did not confirm, recorded as

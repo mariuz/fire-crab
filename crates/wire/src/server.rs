@@ -4987,14 +4987,16 @@ struct ProbeSrc {
 /// where it does pick JOIN it swaps the driver to the side this
 /// executor loops as the outer, so they stay a materialised scan.
 ///
-/// `outer_fid` is a COMBINED-row index into the accumulated side;
-/// `inner_fid` is this side's OWN field id (`ri - offset`), because the
-/// band is built against the relation, not against the combined row.
+/// `outer` is the driver-side of the ON equality, evaluated against the
+/// COMBINED accumulated row per driving row - a plain `Expr::Col` into
+/// that row in the common case, an expression like `A.K + 0` when the ON
+/// writes one; `inner_fid` is this side's OWN field id (`ri - offset`),
+/// because the band is built against the relation, not the combined row.
 #[derive(Clone)]
 struct JoinProbe {
     src: ProbeSrc,
     descs: Vec<Descriptor>,
-    outer_fid: usize,
+    outer: Expr,
     inner_fid: usize,
     /// the index the gatekeeper blessed, for the trace only - the real
     /// band is rebuilt per outer row from that row's own value
@@ -5020,15 +5022,20 @@ enum Band {
 impl JoinProbe {
     /// The band this outer row names on the inner side.
     fn band(&self, db: &Database, row: &[Value]) -> Band {
-        let Some(v) = row.get(self.outer_fid) else { return Band::Scan };
+        // the outer key is the driver-side expression over the accumulated
+        // row - a plain column in the common case, `A.K + 0` and its like
+        // when the ON writes one. An evaluation that RAISES falls back to
+        // Scan, where the ON re-evaluates the same expression and raises
+        // identically, so the answer (the raise) is preserved.
+        let Ok(v) = self.outer.eval(row) else { return Band::Scan };
         let rhs = match v {
             Value::Null => return Band::Nothing,
-            Value::Int(i) => Rhs::Int(*i),
+            Value::Int(i) => Rhs::Int(i),
             // an exact numeric AT SCALE 0 is the same integer; a scaled
             // one is not, and neither is anything else this first slice
             // can hand to the key builder
-            Value::Scaled(raw, 0) => Rhs::Int(*raw),
-            Value::Int128(raw, 0) => match i64::try_from(*raw) {
+            Value::Scaled(raw, 0) => Rhs::Int(raw),
+            Value::Int128(raw, 0) => match i64::try_from(raw) {
                 Ok(i) => Rhs::Int(i),
                 Err(_) => return Band::Scan,
             },
@@ -20836,25 +20843,35 @@ fn build_join_probe(
     // where this side's fields begin in the combined row - the same sum
     // `join_rows` accumulates into `left_width`, step by step
     let offset = side.offset;
-    let mut found: Option<(usize, usize)> = None;
+    // the INNER side of the key must be a bare column of THIS side (a band
+    // builds on it); the OUTER side may be any expression over the
+    // ACCUMULATED columns (`< offset`), evaluated per driving row - a
+    // plain `A.K` (the common case) or `A.K + 0`. An outer expression
+    // that reaches PAST the boundary (an inner column, a not-yet-joined
+    // side, or a generator) is not evaluable at probe time and is not a
+    // boundary equality the engine indexes this way.
+    let inner_col = |e: &Expr| match e {
+        Expr::Col(fid) if *fid >= offset => Some(*fid - offset),
+        _ => None,
+    };
+    let outer_only = |e: &Expr| !expr_reads(e, &|fid| fid >= offset);
+    let mut found: Option<(Expr, usize)> = None;
     for t in terms {
         let Term::ExprCond(c) = t else { continue };
         let Cond2::Cmp(a, Cmp::Eq, b) = c.as_ref() else { continue };
-        let (Expr::Col(x), Expr::Col(y)) = (a.as_ref(), b.as_ref()) else { continue };
         // either orientation is one equality across the boundary; a
         // pair on the same side of it is not one at all
-        let (outer_fid, ri) = match (*x < offset, *y < offset) {
-            (true, false) => (*x, *y),
-            (false, true) => (*y, *x),
+        let (outer_expr, inner_fid) = match (inner_col(a), inner_col(b)) {
+            (Some(fid), None) if outer_only(b) => ((**b).clone(), fid),
+            (None, Some(fid)) if outer_only(a) => ((**a).clone(), fid),
             _ => continue,
         };
-        let inner_fid = ri - offset;
         if inner_fid >= side.descs.len() || found.is_some() {
             return None;
         }
-        found = Some((outer_fid, inner_fid));
+        found = Some((outer_expr, inner_fid));
     }
-    let (outer_fid, inner_fid) = found?;
+    let (outer_expr, inner_fid) = found?;
     let col = side.columns.iter().find(|c| c.field_id as usize == inner_fid)?;
     // an UNQUOTED identifier is stored folded up, so a name carrying a
     // lower-case letter was quoted and cannot be re-spelt bare
@@ -20886,7 +20903,7 @@ fn build_join_probe(
         descs: side.descs.clone(),
         column: col.name.clone(),
         src,
-        outer_fid,
+        outer: outer_expr,
         inner_fid,
     })
 }
