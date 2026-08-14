@@ -285,15 +285,65 @@ pub fn page_type(image: &[u8], page_size: usize, page: u32) -> u8 {
 /// nothing and frees nothing early).
 pub fn careful_plan(before: &[u8], after: &[u8], page_size: usize) -> Cache {
     let changed = changed_pages(before, after, page_size);
-    let mut cache = Cache::attach(before.to_vec(), page_size);
+    let cache = Cache::attach(before.to_vec(), page_size);
+    build_plan(
+        cache,
+        &changed,
+        page_size,
+        |p| page_type(after, page_size, p),
+        |p| {
+            let start = p as usize * page_size;
+            after
+                .get(start..(start + page_size).min(after.len()))
+                .unwrap_or(&[])
+                .to_vec()
+        },
+    )
+}
+
+/// [`careful_plan`] given a changed set found by ARC IDENTITY. The
+/// per-page-fetch flush compares the work image's page `Arc`s against the
+/// on-disk baseline's - O(pages), not a whole-file byte diff - and hands
+/// the set here. The precedence graph and the write order are identical
+/// to [`careful_plan`]'s; only how the changed set was found differs.
+///
+/// A write always copies its page out ([`fire_crab_ods::Image::page_mut`]
+/// is copy-on-write), so a written page has a new `Arc` and is caught. A
+/// page written back to the bytes it already held is caught too - the
+/// set is a SUPERSET of the byte diff - and re-writing an unchanged page
+/// leaves the file identical, so it costs a page write and nothing else.
+pub fn careful_plan_paged(after: &fire_crab_ods::Image, changed: &[u32]) -> Cache {
+    let page_size = after.page_size();
+    // the write order needs the precedence graph, not the base image, so
+    // this Cache attaches over nothing; the flush reads each page's bytes
+    // from `after` directly.
+    let cache = Cache::attach(Vec::new(), page_size);
+    build_plan(
+        cache,
+        changed,
+        page_size,
+        |p| after.page(p).and_then(|b| b.first().copied()).unwrap_or(0),
+        |p| after.page(p).map(<[u8]>::to_vec).unwrap_or_default(),
+    )
+}
+
+/// The careful-write precedence graph, built from the changed pages and
+/// their TYPES (not their bytes). Shared by [`careful_plan`] and
+/// [`careful_plan_paged`]: `type_of` gives a page's `pag_type`, and
+/// `page_bytes` its `page_size` bytes.
+fn build_plan(
+    mut cache: Cache,
+    changed: &[u32],
+    page_size: usize,
+    type_of: impl Fn(u32) -> u8,
+    page_bytes: impl Fn(u32) -> Vec<u8>,
+) -> Cache {
     let mut by_type: BTreeMap<u8, Vec<u32>> = BTreeMap::new();
-    for &p in &changed {
-        let start = p as usize * page_size;
-        let bytes = after[start..(start + page_size).min(after.len())].to_vec();
-        let mut page = bytes;
+    for &p in changed {
+        let mut page = page_bytes(p);
         page.resize(page_size, 0);
         cache.mark(p, page);
-        by_type.entry(page_type(after, page_size, p)).or_default().push(p);
+        by_type.entry(type_of(p)).or_default().push(p);
     }
     let of = |t: u8, m: &BTreeMap<u8, Vec<u32>>| m.get(&t).cloned().unwrap_or_default();
     let header = of(1, &by_type);
@@ -346,16 +396,16 @@ pub fn careful_plan(before: &[u8], after: &[u8], page_size: usize) -> Cache {
     }
     // the header's transaction high-water before any page naming one
     for &h in &header {
-        for &p in &changed {
-            if page_type(after, page_size, p) != 1 {
+        for &p in changed {
+            if type_of(p) != 1 {
                 cache.precedence(p, h);
             }
         }
     }
     // the commit flip last
     for &t in &tip {
-        for &p in &changed {
-            if page_type(after, page_size, p) != 3 {
+        for &p in changed {
+            if type_of(p) != 3 {
                 cache.precedence(t, p);
             }
         }

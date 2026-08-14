@@ -18579,7 +18579,11 @@ fn flush_careful(path: &str, before: &fire_crab_ods::Image, after: &fire_crab_od
     if before.byte_len() != after.byte_len() || before.num_pages() == 0 || page_size == 0 {
         return std::fs::write(path, &after.to_bytes()).map_err(|e| e.to_string());
     }
-    let mut cache = fire_crab_cch::careful_plan(&before.to_bytes(), &after.to_bytes(), page_size);
+    // the changed set by ARC IDENTITY - O(pages), the point of per-page
+    // fetch: a written page has a new Arc, so this never materialises
+    // either whole image to diff them byte by byte
+    let changed = after.changed_pages(before);
+    let mut cache = fire_crab_cch::careful_plan_paged(after, &changed);
     cache.flush();
     let order: Vec<u32> = cache.write_order().to_vec();
     if order.is_empty() {
