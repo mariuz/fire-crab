@@ -34593,6 +34593,118 @@ fn value_as_dec(v: &Value) -> Option<fire_crab_ods::decfloat::Dec> {
     })
 }
 
+/// Convert a TEXT literal to the decimal128 bits a DECFLOAT column
+/// compares against, by the engine's decNumber string grammar (NOT the
+/// exact-numeric CVT grammar): an optional sign, then `digits[.digits]`
+/// with an optional `[eE][+-]?digits` exponent, and NOTHING else -
+/// interior OR surrounding spaces raise (probed: `DF = ' 1.5 '` is 22018
+/// where `N92 = ' 1.5 '` converts), letters and a second dot raise, an
+/// empty string raises. The coefficient rounds to 34 significant digits
+/// HALF-UP. `None` = not convertible; the caller raises 22018 per row.
+///
+/// The specials decNumber also accepts - `Infinity`, `NaN`, `sNaN` - are
+/// deliberately NOT parsed here: they are vanishingly rare as text
+/// literals and would need the infinity/NaN encodings and the NaN trap,
+/// so this returns `None` and the compare raises 22018 instead of the
+/// engine's convert/trap. A recorded boundary.
+fn text_to_dec128(s: &str) -> Option<u128> {
+    let b = s.as_bytes();
+    let mut i = 0;
+    let neg = match b.first() {
+        Some(b'+') => {
+            i = 1;
+            false
+        }
+        Some(b'-') => {
+            i = 1;
+            true
+        }
+        _ => false,
+    };
+    let mut digits: Vec<u8> = Vec::new();
+    let mut seen_dot = false;
+    let mut frac: i64 = 0;
+    while i < b.len() {
+        match b[i] {
+            c @ b'0'..=b'9' => {
+                digits.push(c);
+                if seen_dot {
+                    frac += 1;
+                }
+                i += 1;
+            }
+            b'.' => {
+                if seen_dot {
+                    return None;
+                }
+                seen_dot = true;
+                i += 1;
+            }
+            b'e' | b'E' => break,
+            _ => return None,
+        }
+    }
+    if digits.is_empty() {
+        return None;
+    }
+    let mut exp: i64 = -frac;
+    if i < b.len() && (b[i] == b'e' || b[i] == b'E') {
+        i += 1;
+        let esign: i64 = match b.get(i) {
+            Some(b'+') => {
+                i += 1;
+                1
+            }
+            Some(b'-') => {
+                i += 1;
+                -1
+            }
+            _ => 1,
+        };
+        let estart = i;
+        let mut ev: i64 = 0;
+        while i < b.len() && b[i].is_ascii_digit() {
+            ev = ev.checked_mul(10)?.checked_add((b[i] - b'0') as i64)?;
+            i += 1;
+        }
+        if i == estart {
+            return None;
+        }
+        exp += esign * ev;
+    }
+    if i != b.len() {
+        return None; // trailing junk
+    }
+    // round the significant digits to 34, HALF-UP, the dropped places
+    // moving into the exponent (the string can be longer than u128 holds,
+    // so only the kept 34 are folded)
+    let first = digits.iter().position(|&d| d != b'0').unwrap_or(digits.len() - 1);
+    let sig = &digits[first..];
+    let fold = |ds: &[u8]| ds.iter().fold(0u128, |m, &d| m * 10 + (d - b'0') as u128);
+    let (coeff, drop) = if sig.len() <= 34 {
+        (fold(sig), 0i64)
+    } else {
+        let mut c = fold(&sig[..34]);
+        let rest = &sig[34..];
+        let mut ea = rest.len() as i64;
+        if rest[0] >= b'5' {
+            c += 1;
+            if c == 10u128.pow(34) {
+                c /= 10;
+                ea += 1;
+            }
+        }
+        (c, ea)
+    };
+    let biased = exp + drop + 6176;
+    // outside decimal128's exponent range: an exotic huge/tiny exponent -
+    // refuse rather than panic (the engine over/underflows there)
+    if !(0..=12287).contains(&biased) {
+        return None;
+    }
+    Some(fire_crab_ods::decfloat::encode_dec128(neg, coeff, (exp + drop) as i32))
+}
+
 /// Encode a numeric literal as the decimal128 bits a DECFLOAT column
 /// compares against: the engine promotes the literal to DECFLOAT(34),
 /// rounding a wide integer to 34 significant digits (HALF-UP) exactly as
@@ -45052,6 +45164,14 @@ fn decfloat_term(idx: usize, raw: RawKind) -> Option<Term> {
     Some(match raw {
         RawKind::Const(b) => Term::Const(b),
         RawKind::Cmp(_, Rhs::Null) => Term::Unknown,
+        // a TEXT literal converts to decimal128 by the engine's decNumber
+        // grammar; a non-convertible one raises 22018 PER ROW (UNKNOWN over
+        // NULL, no raise on an empty table), which is exactly what
+        // [Term::CmpConvErr] with no lenient fallback does
+        RawKind::Cmp(op, Rhs::Str(v)) => match text_to_dec128(&v) {
+            Some(bits) => Term::NumCmp(idx, op, Rhs::DecFloat34(bits)),
+            None => Term::CmpConvErr(idx, op, v, None),
+        },
         RawKind::Cmp(op, rhs) => Term::NumCmp(idx, op, Rhs::DecFloat34(rhs_to_dec128(&rhs)?)),
         RawKind::IsNull => Term::IsNull(idx),
         RawKind::IsNotNull => Term::IsNotNull(idx),
@@ -50467,6 +50587,33 @@ mod tests {
             fire_crab_ods::decfloat::to_string(&fire_crab_ods::decfloat::decode_dec64(d16)),
             "1.000000000000000E+20"
         );
+    }
+
+    #[test]
+    fn text_to_dec128_follows_decnumber_grammar() {
+        let r = |s: &str| {
+            text_to_dec128(s)
+                .map(|b| fire_crab_ods::decfloat::to_string(&fire_crab_ods::decfloat::decode_dec128(b)))
+        };
+        // convertible: sign, dot, exponent, leading zeros, cohort kept
+        assert_eq!(r("1.5").as_deref(), Some("1.5"));
+        assert_eq!(r("1.50").as_deref(), Some("1.50")); // trailing zero = cohort
+        assert_eq!(r("-2.5").as_deref(), Some("-2.5"));
+        assert_eq!(r("1.5e0").as_deref(), Some("1.5"));
+        assert_eq!(r("150e-2").as_deref(), Some("1.50"));
+        assert_eq!(r("05").as_deref(), Some("5"));
+        assert_eq!(r("100").as_deref(), Some("100"));
+        // NOT convertible (the caller raises 22018): surrounding/interior
+        // space, letters, empty, a second dot, and - a noted boundary - the
+        // decNumber specials
+        assert_eq!(text_to_dec128(" 1.5 "), None);
+        assert_eq!(text_to_dec128("1 5"), None);
+        assert_eq!(text_to_dec128("abc"), None);
+        assert_eq!(text_to_dec128(""), None);
+        assert_eq!(text_to_dec128("1.5.5"), None);
+        assert_eq!(text_to_dec128("1.5e"), None); // exponent with no digits
+        assert_eq!(text_to_dec128("Infinity"), None);
+        assert_eq!(text_to_dec128("NaN"), None);
     }
 
     fn desc(dt: u8, len: u16, scale: i8) -> Descriptor {

@@ -246,6 +246,38 @@ SQL
 raisef "NaN > 0"  "D > 0"
 raisef "NaN <> 5" "D <> 5"
 
+# a TEXT literal against a DECFLOAT column converts by decNumber's grammar
+# (no surrounding spaces - distinct from the exact-numeric CVT grammar -
+# but exponents allowed, cohort-insensitive equality); a non-convertible
+# one raises 22018 PER ROW (UNKNOWN over NULL, no raise on empty)
+predf "DECFLOAT col = text '1.5'"   "D = '1.5'"
+predf "DECFLOAT col = text '1.50'"  "D = '1.50'"
+predf "DECFLOAT col = text '100'"   "D = '100'"
+predf "DECFLOAT col > text '2'"     "D > '2'"
+predf "DECFLOAT col = text '1.5e0'" "D = '1.5e0'"
+predf "DECFLOAT col = text sci"     "D = '150e-2'"
+predf "DECFLOAT col <= text '-2.5'" "D <= '-2.5'"
+# non-convertible text raises 22018 on both (per row); a surrounding-space
+# spelling raises where an exact-numeric column would convert
+convraise() { # <label> <where-clause>
+    fce=$(FC_DB="$WORK" FC_PORT="$PORT" FC_Q="SELECT ID FROM DF2 WHERE $2" FC_P='[]' timeout 15 node -e '
+      const F=require("node-firebird");
+      F.attach({host:"127.0.0.1",port:+process.env.FC_PORT,database:process.env.FC_DB,user:"SYSDBA",password:"masterkey"},(e,db)=>{
+        if(e){console.log("ATT");process.exit(0);}
+        db.query(process.env.FC_Q,[],(er)=>{console.log(er?"ERR":"NOERR");db.detach();process.exit(0);});
+      });' 2>/dev/null)
+    ise=$("$ISQL" -q -user "$U" -pas "$P" "$WORK" <<SQL 2>&1 | grep -oiE 'SQLSTATE = [0-9]+' | head -1
+SELECT ID FROM DF2 WHERE $2;
+SQL
+)
+    case "$fce" in ERR*) fcok=raise ;; *) fcok=noraise ;; esac
+    case "$ise" in *22018*) isok=raise ;; *) isok=noraise ;; esac
+    check "text 22018 [$2]" "$fcok/$isok" "raise/raise"
+}
+convraise "bad text"   "D = 'abc'"
+convraise "spaced num" "D = ' 1.5 '"
+convraise "empty text" "D = ''"
+
 # --- 1d. WIDE INT128 LITERAL in INSERT VALUES --------------------------
 # The value-list tokenizer reads a magnitude past i64 as Tok::Int128; the
 # store now encodes it into an exact-numeric column (rescaling in i128) or

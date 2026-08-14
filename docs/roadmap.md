@@ -2286,9 +2286,30 @@ plus *the subsystem is now on the path*.
       to the wide-INSERT table, small ints, decimals, a wide i128 and a
       past-i128 all written and read back byte-identically; encode_dec64
       encode->decode identity + probed 16-sig rounding, and encode_set_value
-      DECFLOAT(16)/small-literal unit tests. Still refused deliberately:
-      DECFLOAT in arithmetic / nested, a DECFLOAT column against a
-      text/param literal or LIKE, and a value past DECFLOAT(34) range.
+      DECFLOAT(16)/small-literal unit tests.
+
+      *And a TEXT literal against a DECFLOAT column came next* — the engine
+      converts it by decNumber's string grammar, NOT the exact-numeric CVT
+      one: an optional sign, `digits[.digits]` and an optional `[eE][+-]?
+      digits` exponent, and NOTHING else - interior OR surrounding spaces
+      raise (`DF = ' 1.5 '` is 22018 where `N92 = ' 1.5 '` converts,
+      probed), the coefficient rounds to 34 significant, equality is
+      cohort-insensitive (`'1.50'` = 1.5). A new `text_to_dec128` parses
+      that grammar; `decfloat_term` maps a convertible text to
+      `Rhs::DecFloat34` and a non-convertible one to
+      `Term::CmpConvErr(_, _, s, None)` - which raises 22018 PER ROW (UNKNOWN
+      over NULL, no raise on an empty table, probed identical). The specials
+      decNumber also accepts (`Infinity`/`NaN`/`sNaN`) are deliberately left
+      to `text_to_dec128` returning None → 22018, a recorded divergence from
+      the engine's convert/trap, since a special TEXT literal is vanishingly
+      rare and would need the infinity/NaN encodings and the literal-side
+      trap. Gated (numericwhere +10): the convertible matrix (sign, dot,
+      exponent, scientific, cohort) and the 22018 raise on `'abc'`/`' 1.5
+      '`/`''`; a `text_to_dec128` grammar unit test. Still refused
+      deliberately: a DECFLOAT column against a PARAMETER (needs the input
+      slot described DECFLOAT and the bind to decode a decimal128 - its own
+      slice) or LIKE, DECFLOAT in arithmetic / nested, the `Infinity`/`NaN`
+      text specials, and a value past DECFLOAT(34) range.
 
       *And the wide OUTER value came with it* — the probe's `band` capped
       an `Int128` driving value at `i64` and scanned; now it carries the
