@@ -15478,6 +15478,14 @@ fn encode_set_value(d: &Descriptor, v: &InsVal) -> Option<Option<Vec<u8>>> {
             )
             .to_le_bytes()
             .to_vec(),
+            // a DECFLOAT(16) rounds the EXACT i128 digits to 16 significant
+            // (no double rounding - the full magnitude is in hand here)
+            dtype::DEC64 => fire_crab_ods::decfloat::dec64_from_int_digits(
+                *n < 0,
+                n.unsigned_abs().to_string().as_bytes(),
+            )
+            .to_le_bytes()
+            .to_vec(),
             _ => return None,
         }));
     }
@@ -15489,6 +15497,14 @@ fn encode_set_value(d: &Descriptor, v: &InsVal) -> Option<Option<Vec<u8>>> {
     if let InsVal::DecFloat34(bits) = v {
         return Some(Some(match d.dtype {
             dtype::DEC128 => bits.to_le_bytes().to_vec(),
+            // a DECFLOAT(16) target re-rounds the 34-sig value to 16 and
+            // encodes decimal64. This is a DOUBLE rounding (the token was
+            // already rounded to 34); faithful for every value but the
+            // rare one whose digits 17..34 hide a carry - see round_to_dec16
+            dtype::DEC64 => match fire_crab_ods::decfloat::round_to_dec16_of(*bits) {
+                Some(bits64) => bits64.to_le_bytes().to_vec(),
+                None => return None,
+            },
             _ => return None,
         }));
     }
@@ -16359,6 +16375,25 @@ fn encode_wire_value(d: &Descriptor, wp: &WireParam) -> Option<Option<Vec<u8>>> 
             dtype::SHORT | dtype::LONG | dtype::INT64 | dtype::INT128 => {
                 int_bytes(rescale_int(*v as i128, *ws, d.scale)?)?
             }
+            // an integer/decimal value into a DECFLOAT column: the exact
+            // value `v * 10^ws` becomes a decimal128/64 (its scale IS the
+            // exponent, cohort preserved as the engine's conversion does).
+            // DECFLOAT(16) rounds an over-long coefficient to 16 significant.
+            dtype::DEC128 => {
+                fire_crab_ods::decfloat::encode_dec128(*v < 0, (*v as i128).unsigned_abs(), *ws as i32)
+                    .to_le_bytes()
+                    .to_vec()
+            }
+            dtype::DEC64 => match fire_crab_ods::decfloat::round_to_dec16(
+                *v < 0,
+                (*v as i128).unsigned_abs(),
+                *ws as i32,
+            ) {
+                fire_crab_ods::decfloat::Dec::Finite { neg, coeff, exp } => {
+                    fire_crab_ods::decfloat::encode_dec64(neg, coeff as u64, exp).to_le_bytes().to_vec()
+                }
+                _ => return None,
+            },
             dtype::DOUBLE if *ws == 0 => (*v as f64).to_le_bytes().to_vec(),
             dtype::REAL if *ws == 0 => (*v as f32).to_le_bytes().to_vec(),
             // an INTEGER parameter into a TEXT column: the engine
@@ -50402,7 +50437,36 @@ mod tests {
             Some(Some(df.to_le_bytes().to_vec()))
         );
         assert!(encode_set_value(&d(dtype::INT128, 16, 0), &InsVal::DecFloat34(df)).is_none());
-        assert!(encode_set_value(&d(dtype::DEC64, 8, 0), &InsVal::DecFloat34(df)).is_none());
+        // a DECFLOAT(16) target re-rounds the past-i128 value to 16 sig and
+        // encodes decimal64 (u128::MAX -> 3.402823669209385E+38)
+        let d64 = match encode_set_value(&d(dtype::DEC64, 8, 0), &InsVal::DecFloat34(df)) {
+            Some(Some(b)) => u64::from_le_bytes(b.try_into().unwrap()),
+            other => panic!("expected dec64 bytes, got {other:?}"),
+        };
+        assert_eq!(
+            fire_crab_ods::decfloat::to_string(&fire_crab_ods::decfloat::decode_dec64(d64)),
+            "3.402823669209385E+38"
+        );
+        // small int / decimal literals into a DECFLOAT column store their
+        // decimal value with the cohort the scale names (1.5 is 15 x 10^-1)
+        let render_dec128 = |iv: &InsVal| match encode_set_value(&d(dtype::DEC128, 16, 0), iv) {
+            Some(Some(b)) => fire_crab_ods::decfloat::to_string(
+                &fire_crab_ods::decfloat::decode_dec128(u128::from_le_bytes(b.try_into().unwrap())),
+            ),
+            other => panic!("expected dec128 bytes, got {other:?}"),
+        };
+        assert_eq!(render_dec128(&InsVal::Int(100)), "100");
+        assert_eq!(render_dec128(&InsVal::Dec(15, -1)), "1.5");
+        assert_eq!(render_dec128(&InsVal::Dec(-250, -2)), "-2.50");
+        // a wide i128 into DECFLOAT(16) rounds the EXACT digits to 16 sig
+        let d16 = match encode_set_value(&d(dtype::DEC64, 8, 0), &InsVal::Int128(wide)) {
+            Some(Some(b)) => u64::from_le_bytes(b.try_into().unwrap()),
+            other => panic!("expected dec64 bytes, got {other:?}"),
+        };
+        assert_eq!(
+            fire_crab_ods::decfloat::to_string(&fire_crab_ods::decfloat::decode_dec64(d16)),
+            "1.000000000000000E+20"
+        );
     }
 
     fn desc(dt: u8, len: u16, scale: i8) -> Descriptor {

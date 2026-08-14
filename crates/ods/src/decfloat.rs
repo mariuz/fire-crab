@@ -324,6 +324,97 @@ pub fn encode_dec128(neg: bool, coeff: u128, exp: i32) -> u128 {
     v
 }
 
+/// Encode a FINITE decimal64 from (sign, coefficient, exponent-of-the-
+/// last-digit), the exact inverse of [decode_dec64]. `coeff` carries up to
+/// 16 decimal digits; `exp` is unbiased (the engine's `qe`), in
+/// [-398, 369]. The exponent's top two bits are always < 0b11 for a valid
+/// decimal64 (biased qe <= 767 < 3*256), the same combination-field
+/// guarantee decimal128 has.
+pub fn encode_dec64(neg: bool, coeff: u64, exp: i32) -> u64 {
+    let biased = (exp + 398) as u32;
+    // 16 digits, MSD first; the MSD rides the combination field, the
+    // remaining 15 ride 5 declets of 3 digits each
+    let digits = format!("{coeff:0>16}");
+    let db = digits.as_bytes();
+    let msd = (db[0] - b'0') as u64;
+    let exp_top = ((biased >> 8) & 0x3) as u64; // 0b00/0b01/0b10 only
+    let comb = if msd <= 7 {
+        (exp_top << 3) | msd
+    } else {
+        0b11000 | (exp_top << 1) | (msd & 1)
+    };
+    let mut v: u64 = ((neg as u64) << 63) | (comb << 58) | (((biased & 0xFF) as u64) << 50);
+    // group j=0 is the MOST significant declet; it lands in declet slot 4,
+    // matching decode's MSB-first read
+    for j in 0..5 {
+        let s = 1 + 3 * j;
+        let three =
+            (db[s] - b'0') as usize * 100 + (db[s + 1] - b'0') as usize * 10 + (db[s + 2] - b'0') as usize;
+        v |= (BIN2DPD[three] as u64) << (10 * (4 - j));
+    }
+    v
+}
+
+/// [dec128_from_int_digits] for a DECFLOAT(16): rounds to 16 significant
+/// digits (HALF-UP) and encodes as decimal64. Used when a wide integer
+/// literal targets a DECFLOAT(16) column.
+pub fn dec64_from_int_digits(neg: bool, digits: &[u8]) -> u64 {
+    let first = digits.iter().position(|&d| d != b'0').unwrap_or(digits.len() - 1);
+    let sig = &digits[first..];
+    let fold = |ds: &[u8]| ds.iter().fold(0u64, |m, &d| m * 10 + (d - b'0') as u64);
+    if sig.len() <= 16 {
+        return encode_dec64(neg, fold(sig), 0);
+    }
+    let mut coeff = fold(&sig[..16]);
+    let rest = &sig[16..];
+    let mut exp = rest.len() as i32;
+    if rest[0] >= b'5' {
+        coeff += 1;
+        if coeff == 10u64.pow(16) {
+            coeff /= 10;
+            exp += 1;
+        }
+    }
+    encode_dec64(neg, coeff, exp)
+}
+
+/// [round_to_dec34] to 16 significant digits, for a value already in [Dec]
+/// form that must fit a decimal64. NOTE: rounding a value that was ALREADY
+/// rounded to 34 digits is a DOUBLE ROUNDING - faithful for every value
+/// but the vanishingly rare one whose digits 17..34 hide a carry the
+/// original digits 17..N would not have made.
+pub fn round_to_dec16(neg: bool, coeff: u128, exp: i32) -> Dec {
+    let digits = coeff.to_string();
+    if digits.len() <= 16 {
+        return Dec::Finite { neg, coeff, exp };
+    }
+    let drop = digits.len() - 16;
+    let mut c: u128 = digits[..16].parse().unwrap();
+    let mut e = exp + drop as i32;
+    if digits.as_bytes()[16] >= b'5' {
+        c += 1;
+        if c == 10u128.pow(16) {
+            c /= 10;
+            e += 1;
+        }
+    }
+    Dec::Finite { neg, coeff: c, exp: e }
+}
+
+/// Re-express a DECFLOAT(34) value (its decimal128 bits) as a DECFLOAT(16)
+/// (decimal64 bits), rounding to 16 significant digits HALF-UP. `None` for
+/// a non-finite value (Infinity/NaN) - a literal is never one, so this only
+/// declines the shapes an INSERT of a plain literal cannot reach.
+pub fn round_to_dec16_of(bits128: u128) -> Option<u64> {
+    match decode_dec128(bits128) {
+        Dec::Finite { neg, coeff, exp } => match round_to_dec16(neg, coeff, exp) {
+            Dec::Finite { neg, coeff, exp } => Some(encode_dec64(neg, coeff as u64, exp)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// Encode a base-10 INTEGER literal (a string of ASCII digits, no sign,
 /// leading zeros allowed) as a DECFLOAT(34), rounding to 34 significant
 /// digits the way the engine's literal conversion does: HALF-UP (round
@@ -480,6 +571,36 @@ mod tests {
             r(false, "99999999999999999999999999999999999999999"),
             "1.000000000000000000000000000000000E+41"
         );
+    }
+
+    #[test]
+    fn encode_dec64_is_the_inverse_of_decode() {
+        // the canonical +1 decimal64 vector round-trips to the same bits
+        assert_eq!(encode_dec64(false, 1, 0), 0x2238000000000001);
+        assert_eq!(encode_dec64(true, 1, 0), 0xA238000000000001);
+        // encode->decode identity across signs, exponents and every declet
+        for &(neg, coeff, exp) in &[
+            (false, 1u64, 0i32),
+            (false, 15, -1),
+            (false, 1234567890123456, 5), // 16 digits, all 5 declets + MSD
+            (true, 9999999999999999, -398),
+        ] {
+            assert_eq!(
+                decode_dec64(encode_dec64(neg, coeff, exp)),
+                Dec::Finite { neg, coeff: coeff as u128, exp }
+            );
+        }
+    }
+
+    #[test]
+    fn dec64_int_literal_rounds_half_up_to_16_digits() {
+        let r = |neg, s: &str| to_string(&decode_dec64(dec64_from_int_digits(neg, s.as_bytes())));
+        // u128::MAX rounds to 16 sig - the engine's DECFLOAT(16) form (probed)
+        assert_eq!(r(false, "340282366920938463463374607431768211455"), "3.402823669209385E+38");
+        // 16 digits exactly: no rounding
+        assert_eq!(r(false, "1234567890123456"), "1234567890123456");
+        // 17th digit >= 5 rounds up; all-nines carry to 10^15
+        assert_eq!(r(false, "99999999999999999"), "1.000000000000000E+17");
     }
 
     #[test]

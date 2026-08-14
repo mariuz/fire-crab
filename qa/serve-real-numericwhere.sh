@@ -74,7 +74,7 @@ INSERT INTO DFNAN VALUES (2, CAST('NaN' AS DECFLOAT(34)));
 COMMIT;
 -- empty target for the wide-INT128-literal INSERT section (1d): fire-crab
 -- WRITES the rows, the engine reading the same file back is the check
-CREATE TABLE WI (ID INTEGER, W INT128, N2 NUMERIC(38,2), DF DECFLOAT(34), B BIGINT);
+CREATE TABLE WI (ID INTEGER, W INT128, N2 NUMERIC(38,2), DF DECFLOAT(34), D16 DECFLOAT(16), B BIGINT);
 COMMIT;"
 
 for f in "$REF" "$WORK"; do
@@ -264,9 +264,17 @@ inswide "DF" 6 "170141183460469231731687303715884105727"         # DECFLOAT(34),
 # stores into the DECFLOAT(34) column verbatim (already 34-sig in the token)
 inswide "DF" 7 "340282366920938463463374607431768211455"                     # u128::MAX
 inswide "DF" 8 "-9999999999999999999999999999999999999999999999999999"       # negative, 52 nines
+# small integer and decimal literals into DECFLOAT columns too (the scale
+# IS the exponent, cohort preserved); DECFLOAT(16) via the decimal64 encoder
+inswide "DF"  10 "1.5"                                            # DECFLOAT(34), cohort 15e-1
+inswide "DF"  11 "-2.50"                                          # DECFLOAT(34), cohort 250e-2
+inswide "D16" 12 "100"                                            # DECFLOAT(16), small int
+inswide "D16" 13 "1.5"                                            # DECFLOAT(16), decimal
+inswide "D16" 14 "99999999999999999999"                          # DECFLOAT(16), wide int -> 16 sig
+inswide "D16" 15 "340282366920938463463374607431768211455"       # DECFLOAT(16), past-i128 -> 16 sig
 wi_read() { "$ISQL" -q -b -user "$U" -pas "$P" "$1" 2>&1 <<SQL | strip | grep -v '^$' | tr -s ' \n' ' '
 SET HEADING OFF;
-SELECT ID, W, N2, DF FROM WI ORDER BY ID;
+SELECT ID, W, N2, DF, D16 FROM WI ORDER BY ID;
 SQL
 }
 check "wide-literal INSERT: fc-served == engine-read (same file)" \

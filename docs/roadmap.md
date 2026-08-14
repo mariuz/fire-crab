@@ -2259,16 +2259,36 @@ plus *the subsystem is now on the path*.
       `InsVal::DecFloat34(u128)` + one `encode_set_value` branch stores it
       into a DECFLOAT(34) column VERBATIM (`bits.to_le_bytes()` - no
       re-encode). Every exact-numeric target OVERFLOWS (the value does not
-      fit i128) and refuses, as does DECFLOAT(16) - decimal64 is a
-      different encoding (5 declets, bias 398, 16 sig) with no encoder yet,
-      and re-rounding the 34-sig token to 16 could double-round, so it is
-      its own slice. Gated in the same wide-INSERT section (fc writes
-      u128::MAX and a negative 52-digit into the DECFLOAT column, the
-      engine reads them back identically; plus a past-i128-into-INT128
-      overflow rejection). Still refused deliberately: a past-i128 literal
-      into DECFLOAT(16) (needs a decimal64 encoder), DECFLOAT in arithmetic
-      / nested, a DECFLOAT column against a text/param literal or LIKE, and
-      a value past DECFLOAT(34) range.
+      fit i128) and refuses. Gated in the same wide-INSERT section (fc
+      writes u128::MAX and a negative 52-digit into the DECFLOAT column,
+      the engine reads them back identically; plus a past-i128-into-INT128
+      overflow rejection).
+
+      *And the DECIMAL64 ENCODER closed DECFLOAT(16) INSERT and small
+      literals* — `ods::decfloat` was decode-only for decimal64 too; a new
+      `encode_dec64` (inverse of `decode_dec64` - 5 declets, bias 398, an
+      8-bit exponent continuation, the same combination-field split as
+      decimal128 since biased qe <= 767 < 3*256), `dec64_from_int_digits`
+      (round an integer's digits to 16 sig HALF-UP + encode) and
+      `round_to_dec16`/`round_to_dec16_of` join it. Wiring them revealed a
+      WIDER gap than the DECFLOAT(16) tail: a SMALL integer or decimal
+      literal into ANY DECFLOAT column refused too, because
+      `encode_wire_value`'s `WireParam::Int` arm had no DEC64/DEC128 case -
+      only wide (Int128/DecFloat34) literals had ever been wired. Both arms
+      now encode: an INT128 or small integer into DECFLOAT(16) rounds the
+      EXACT digits to 16 sig (no double rounding - the full magnitude is in
+      hand); a DECFLOAT(34) literal into DECFLOAT(16) re-rounds the 34-sig
+      token to 16 (a double rounding, faithful for every value but the rare
+      one whose digits 17..34 hide a carry - `round_to_dec16`'s note); a
+      small integer/decimal literal into either DECFLOAT keeps its cohort
+      (`1.5` is `15 x 10^-1`, `-2.50` is `250 x 10^-2`), the scale becoming
+      the decimal exponent. Gated (numericwhere): DECFLOAT(16) column added
+      to the wide-INSERT table, small ints, decimals, a wide i128 and a
+      past-i128 all written and read back byte-identically; encode_dec64
+      encode->decode identity + probed 16-sig rounding, and encode_set_value
+      DECFLOAT(16)/small-literal unit tests. Still refused deliberately:
+      DECFLOAT in arithmetic / nested, a DECFLOAT column against a
+      text/param literal or LIKE, and a value past DECFLOAT(34) range.
 
       *And the wide OUTER value came with it* — the probe's `band` capped
       an `Int128` driving value at `i64` and scanned; now it carries the
