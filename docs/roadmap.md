@@ -2322,9 +2322,26 @@ plus *the subsystem is now on the path*.
       params over DECFLOAT(34) and DECFLOAT(16), each bound through node
       against BOTH servers - the engine side on its own server-owned copy,
       since the 3050 engine cannot open the plain-path file fire-crab
-      serves. Still refused deliberately: a DECFLOAT column against LIKE,
-      DECFLOAT in arithmetic / nested, the `Infinity`/`NaN` text specials,
-      and a value past DECFLOAT(34) range.
+      serves.
+
+      *And LIKE / STARTING WITH closed the compare surface* — the engine
+      renders the DECFLOAT value to its decNumber string and matches the
+      pattern per row (`1.5`, `100`, `-2.5`, the cohort-preserving `1.50`,
+      the scientific `3.402...E+38`, `Infinity`), which is exactly
+      `Value::render`. So `decfloat_term` reuses the same
+      `Term::ExprLike`/`Term::ExprStarting` (and their `?`-pattern variants)
+      that `numeric_term` builds - the term evaluates `Expr::Col` to the
+      value and matches `v.render()`. Gated (numericwhere +11): literal and
+      `?` patterns, wildcards `%`/`_`, the scientific form, cohort, NOT
+      LIKE, over both widths. SIMILAR TO stays text-only, as for the
+      exact-numeric columns. One recorded simplification, shared with
+      `numeric_term`: the LIKE-pattern `?` slot is described VARYING(32763)
+      where the engine gives a fixed VARYING(30) for every numeric column -
+      a pre-existing describe width the driver ignores (the value binds at
+      its true length either way), its own cross-cutting slice. Still
+      refused deliberately: DECFLOAT in arithmetic / nested, the
+      `Infinity`/`NaN` text-literal specials, and a value past DECFLOAT(34)
+      range.
 
       *And the wide OUTER value came with it* — the probe's `band` capped
       an `Int128` driving value at `i64` and scanned; now it carries the

@@ -332,6 +332,23 @@ dfparam "null"        "D = ?"  "[null]"
 dfparam "D16 int"     "S = ?"  "[100]"
 dfparam "D16 double"  "S = ?"  "[1.5]"
 
+# LIKE / STARTING WITH render the DECFLOAT value to its decNumber string
+# (Value::render: 1.5, 100, -2.5, 3.402...E+38, cohort preserved) and match
+# the pattern per row - a literal pattern or a `?`. (SIMILAR TO stays text-
+# only, as for the exact-numeric columns; the pattern-slot describe width is
+# a pre-existing numeric simplification, node ignores it.)
+predf "DECFLOAT col LIKE exact" "D LIKE '1.5'"
+predf "DECFLOAT col LIKE wild"  "D LIKE '1%'"
+predf "DECFLOAT col LIKE under" "D LIKE '1_0'"
+predf "DECFLOAT col LIKE sci"   "D LIKE '%E+38'"
+predf "DECFLOAT col STARTING -" "D STARTING WITH '-'"
+predf "DECFLOAT col STARTING 1" "D STARTING WITH '1'"
+predf "DECFLOAT col NOT LIKE"   "D NOT LIKE '1%'"
+predf "DECFLOAT(16) col LIKE"   "S LIKE '2%'"
+dfparam "LIKE pat"     "D LIKE ?"          '["1%"]'
+dfparam "LIKE sci"     "D LIKE ?"          '["%E+38"]'
+dfparam "STARTING pat" "D STARTING WITH ?" '["-"]'
+
 # --- 1d. WIDE INT128 LITERAL in INSERT VALUES --------------------------
 # The value-list tokenizer reads a magnitude past i64 as Tok::Int128; the
 # store now encodes it into an exact-numeric column (rescaling in i128) or

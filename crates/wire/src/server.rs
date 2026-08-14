@@ -45210,6 +45210,22 @@ fn decfloat_term(
     d: &Descriptor,
     params: &mut Vec<Option<Descriptor>>,
 ) -> Option<Term> {
+    // a LIKE/STARTING pattern `?` is plain VARYING text whatever the column
+    // (the engine renders the DECFLOAT value and matches against text) -
+    // the same synthesized slot [numeric_term] claims
+    let mut claim_text = |slot: usize| {
+        if params.len() <= slot {
+            params.resize(slot + 1, None);
+        }
+        params[slot] = Some(Descriptor {
+            dtype: dtype::VARYING,
+            scale: 0,
+            length: 32765,
+            sub_type: 0,
+            flags: 0,
+            offset: 4,
+        });
+    };
     Some(match raw {
         RawKind::Const(b) => Term::Const(b),
         RawKind::Cmp(_, Rhs::Null) => Term::Unknown,
@@ -45234,13 +45250,32 @@ fn decfloat_term(
         RawKind::Cmp(op, rhs) => Term::NumCmp(idx, op, Rhs::DecFloat34(rhs_to_dec128(&rhs)?)),
         RawKind::IsNull => Term::IsNull(idx),
         RawKind::IsNotNull => Term::IsNotNull(idx),
-        RawKind::Like(Rhs::Null, ..)
-        | RawKind::Similar(Rhs::Null, ..)
-        | RawKind::Starting(Rhs::Null, _) => Term::Unknown,
-        RawKind::CmpExpr(..)
-        | RawKind::Like(..)
-        | RawKind::Similar(..)
-        | RawKind::Starting(..) => return None,
+        // LIKE/STARTING render the DECFLOAT value to its decNumber string
+        // (Value::render) and match the pattern per row - exactly the
+        // [Term::ExprLike]/[Term::ExprStarting] path [numeric_term] uses
+        RawKind::Like(Rhs::Str(p), escape, negated) => {
+            Term::ExprLike(Box::new(Expr::Col(idx)), p, escape, negated)
+        }
+        RawKind::Like(Rhs::Param(slot, _), escape, negated) => {
+            claim_text(slot);
+            Term::ExprLikeParam(Box::new(Expr::Col(idx)), slot, escape, negated)
+        }
+        RawKind::Like(Rhs::Null, ..) => Term::Unknown,
+        RawKind::Like(..) => return None,
+        RawKind::Starting(Rhs::Str(p), negated) => {
+            Term::ExprStarting(Box::new(Expr::Col(idx)), p, negated)
+        }
+        RawKind::Starting(Rhs::Param(slot, _), negated) => {
+            claim_text(slot);
+            Term::ExprStartingParam(Box::new(Expr::Col(idx)), slot, negated)
+        }
+        RawKind::Starting(Rhs::Null, _) => Term::Unknown,
+        RawKind::Starting(..) => return None,
+        // SIMILAR TO on a numeric/DECFLOAT column is a later slice (text
+        // only), as in numeric_term
+        RawKind::Similar(Rhs::Null, ..) => Term::Unknown,
+        RawKind::Similar(..) => return None,
+        RawKind::CmpExpr(..) => return None,
     })
 }
 
