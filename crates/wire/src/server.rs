@@ -9196,6 +9196,11 @@ enum InsVal {
     /// column (INT128, or a NUMERIC(38,x) with room) and promotes into a
     /// DECFLOAT(34); a narrower integer column overflows and refuses.
     Int128(i128),
+    /// an integer literal PAST i128::MAX, carried as its decimal128 bits
+    /// (already rounded to 34 significant digits by the tokenizer). Stores
+    /// into a DECFLOAT(34) column verbatim; every exact-numeric target
+    /// overflows and refuses (the value does not fit i128).
+    DecFloat34(u128),
     /// a decimal literal as (raw, scale): rescales exactly into the
     /// target column or refuses (1.5 fits NUMERIC(9,2) as 1.50; it
     /// does not fit an INTEGER)
@@ -15149,6 +15154,7 @@ fn plan_insert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
             vals.push(match part {
                 [Tok::Int(n)] => InsVal::Int(*n),
                 [Tok::Int128(n)] => InsVal::Int128(*n),
+                [Tok::DecFloat34(b)] => InsVal::DecFloat34(*b),
                 [Tok::Dec(r, s)] => InsVal::Dec(*r, *s),
                 [Tok::Str(v)] => InsVal::Str(v.clone()),
                 [Tok::FnExpr(RawExpr::Bool(b))] => InsVal::Bool(*b),
@@ -15475,10 +15481,21 @@ fn encode_set_value(d: &Descriptor, v: &InsVal) -> Option<Option<Vec<u8>>> {
             _ => return None,
         }));
     }
+    // a magnitude PAST i128::MAX is a DECFLOAT literal; the token already
+    // holds its decimal128 bits (rounded to 34 significant digits). Only a
+    // DECFLOAT(34) column takes it; an exact-numeric target overflows (the
+    // value does not fit i128), and DECFLOAT(16) needs a decimal64 re-round
+    // + encode (its own slice) - all refuse.
+    if let InsVal::DecFloat34(bits) = v {
+        return Some(Some(match d.dtype {
+            dtype::DEC128 => bits.to_le_bytes().to_vec(),
+            _ => return None,
+        }));
+    }
     let wp = match v {
         InsVal::Null => WireParam::Null,
         InsVal::Int(n) => WireParam::Int(*n, 0),
-        InsVal::Int128(_) => unreachable!("handled above"),
+        InsVal::Int128(_) | InsVal::DecFloat34(_) => unreachable!("handled above"),
         InsVal::Dec(r, s) => WireParam::Int(*r, *s),
         InsVal::Str(text) => WireParam::Text(text.clone()),
         InsVal::Bool(b) => WireParam::Bool(*b),
@@ -50373,6 +50390,19 @@ mod tests {
             fire_crab_ods::decfloat::decode_dec128(bits),
             fire_crab_ods::decfloat::Dec::Finite { neg: false, coeff: wide as u128, exp: 0 }
         );
+        // a PAST-i128 literal (DecFloat34, carrying its decimal128 bits)
+        // stores into a DECFLOAT(34) column verbatim; every exact-numeric
+        // target overflows and refuses
+        let df = fire_crab_ods::decfloat::dec128_from_int_digits(
+            false,
+            b"340282366920938463463374607431768211455",
+        );
+        assert_eq!(
+            encode_set_value(&d(dtype::DEC128, 16, 0), &InsVal::DecFloat34(df)),
+            Some(Some(df.to_le_bytes().to_vec()))
+        );
+        assert!(encode_set_value(&d(dtype::INT128, 16, 0), &InsVal::DecFloat34(df)).is_none());
+        assert!(encode_set_value(&d(dtype::DEC64, 8, 0), &InsVal::DecFloat34(df)).is_none());
     }
 
     fn desc(dt: u8, len: u16, scale: i8) -> Descriptor {

@@ -2251,10 +2251,24 @@ plus *the subsystem is now on the path*.
       in the tokenizer as always. Gated (+3): fire-crab WRITES the rows and
       the ENGINE reading the same file back byte-identically is the proof
       (INT128, NUMERIC(38,2) x100, DECFLOAT(34) exact and rounded), plus
-      the BIGINT-overflow rejection. Still refused deliberately: a value
-      PAST i128::MAX in INSERT (`Tok::DecFloat34` into a DECFLOAT column -
-      its own slice), DECFLOAT in arithmetic / nested, a DECFLOAT column
-      against a text/param literal or LIKE, and a value past DECFLOAT range.
+      the BIGINT-overflow rejection.
+
+      *And the PAST-i128 literal in INSERT came next* — a magnitude beyond
+      i128::MAX tokenises as `Tok::DecFloat34`, which already carries its
+      decimal128 bits (rounded to 34 sig by the tokenizer). A new
+      `InsVal::DecFloat34(u128)` + one `encode_set_value` branch stores it
+      into a DECFLOAT(34) column VERBATIM (`bits.to_le_bytes()` - no
+      re-encode). Every exact-numeric target OVERFLOWS (the value does not
+      fit i128) and refuses, as does DECFLOAT(16) - decimal64 is a
+      different encoding (5 declets, bias 398, 16 sig) with no encoder yet,
+      and re-rounding the 34-sig token to 16 could double-round, so it is
+      its own slice. Gated in the same wide-INSERT section (fc writes
+      u128::MAX and a negative 52-digit into the DECFLOAT column, the
+      engine reads them back identically; plus a past-i128-into-INT128
+      overflow rejection). Still refused deliberately: a past-i128 literal
+      into DECFLOAT(16) (needs a decimal64 encoder), DECFLOAT in arithmetic
+      / nested, a DECFLOAT column against a text/param literal or LIKE, and
+      a value past DECFLOAT(34) range.
 
       *And the wide OUTER value came with it* — the probe's `band` capped
       an `Int128` driving value at `i64` and scanned; now it carries the

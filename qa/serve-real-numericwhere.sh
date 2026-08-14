@@ -260,6 +260,10 @@ inswide "W"  3 "-170141183460469231731687303715884105728"        # i128::MIN
 inswide "N2" 4 "99999999999999999999"                            # NUMERIC(38,2), rescales x100
 inswide "DF" 5 "99999999999999999999"                            # DECFLOAT(34), exact
 inswide "DF" 6 "170141183460469231731687303715884105727"         # DECFLOAT(34), rounds to 34 sig
+# a magnitude PAST i128::MAX is a DECFLOAT literal (Tok::DecFloat34); it
+# stores into the DECFLOAT(34) column verbatim (already 34-sig in the token)
+inswide "DF" 7 "340282366920938463463374607431768211455"                     # u128::MAX
+inswide "DF" 8 "-9999999999999999999999999999999999999999999999999999"       # negative, 52 nines
 wi_read() { "$ISQL" -q -b -user "$U" -pas "$P" "$1" 2>&1 <<SQL | strip | grep -v '^$' | tr -s ' \n' ' '
 SET HEADING OFF;
 SELECT ID, W, N2, DF FROM WI ORDER BY ID;
@@ -275,6 +279,11 @@ case "$bigovf" in ERR*) echo "OK   wide literal into BIGINT refuses (overflow)" 
     *) echo "DIFF wide-into-BIGINT should refuse, got: $bigovf"; fail=1 ;; esac
 landed=$(node_run 'SELECT COUNT(*) FROM WI WHERE B IS NOT NULL')
 check "the rejected BIGINT row did not land" "$landed" "0"
+# a PAST-i128 literal into an INT128 column overflows - it does not fit an
+# exact integer (the engine raises 22003; fire-crab refuses); row must not land
+pi_ovf=$(node_run 'INSERT INTO WI (ID, W) VALUES (10, 340282366920938463463374607431768211455)')
+case "$pi_ovf" in ERR*) echo "OK   past-i128 literal into INT128 refuses (overflow)" ;;
+    *) echo "DIFF past-i128-into-INT128 should refuse, got: $pi_ovf"; fail=1 ;; esac
 
 # --- 2. DML through numeric predicates + decimal literals --------------
 check "fc INSERT with decimal literals" \
