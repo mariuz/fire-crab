@@ -19215,8 +19215,15 @@ fn pick_for_terms(
         if op.descending && compound {
             continue;
         }
+        // IDX_BCD is the 128-bit integer key (a NUMERIC/DECIMAL of
+        // precision >= 19, stored `dtype::INT128`). Its encoder
+        // (`btw::index_key`'s IDX_BCD arm) takes the value AS i128 from a
+        // `Value::Int`/`Value::Scaled`/`Value::Int128` alike, so an
+        // i64-range bound builds the SAME key bytes the write path wrote -
+        // a literal too wide for i64 never becomes an `Rhs` in the first
+        // place, so it scans rather than keying a wrong band.
         let text = matches!(*itype, btw::IDX_STRING | btw::IDX_METADATA);
-        if !text && !matches!(*itype, btw::IDX_NUMERIC | btw::IDX_NUMERIC2) {
+        if !text && !matches!(*itype, btw::IDX_NUMERIC | btw::IDX_NUMERIC2 | btw::IDX_BCD) {
             continue;
         }
         // A SCALED column stores `Value::Scaled`, and a key built from
@@ -19231,7 +19238,7 @@ fn pick_for_terms(
         // scanned.
         let Some(d) = descs.get(*seg_fid) else { continue };
         let exact_numeric =
-            matches!(d.dtype, dtype::SHORT | dtype::LONG | dtype::INT64);
+            matches!(d.dtype, dtype::SHORT | dtype::LONG | dtype::INT64 | dtype::INT128);
         // an APPROXIMATE column (FLOAT/DOUBLE) is keyed by its own bits,
         // and a decimal literal reaching it would have to travel through
         // the engine's literal->double conversion to land on the same

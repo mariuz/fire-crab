@@ -57,31 +57,28 @@
 # AND THE SIZE OF THE REMAINING GAP, measured by that same refute pass
 # and stated here because section 5 would otherwise read as a clean
 # bill: SEVEN inner sides the ENGINE indexes and this probe declined -
-# a DESCENDING index, ~~a NUMERIC(9,2) index~~, NUMERIC(38,0), ~~a VIEW
+# a DESCENDING index, ~~a NUMERIC(9,2) index~~, ~~NUMERIC(38,0)~~, ~~a VIEW
 # inner (the engine flattens it)~~, ~~a DERIVED inner~~, ~~an expression in
 # the ON (`RZ.K = O.K + 0`)~~, ~~an OR in the ON~~, and ~~the engine's bitmap
 # AND of two indexes~~. Their ROWS agree, which is what section 5 asserts
 # and all it asserts; with a RAISING ON they do not, because fire-crab
-# scans where the engine keys. Every one is a candidate for Slice B,
-# and each is one more shape where identical SQL raises or answers
-# depending on whether this server's heuristics bless the inner.
+# scans where the engine keys.
 #
-# ONE now. Closed since: the scaled NUMERIC inner side (the refusal was
-# never about the join - `pick_for_terms` declined every non-zero-scale
-# column, so a plain `WHERE N92 = 1.50` scanned too; the literal reaches
-# the column's scale now); an EXPRESSION on the outer side of the ON
-# (`CHI.K + 0` evaluated per driving row to the value the band probes
-# with); an OR in the ON (one band per DNF branch, their UNION
-# deduplicated on acceptance by `records_for_2pc`, every branch required
-# servable); a VIEW or DERIVED inner that is a PLAIN PROJECTION of one
-# base table - the engine FLATTENS it, so the probe keys that base table
-# through an output-column-to-base-field map, declining any side with a
-# WHERE/DISTINCT/aggregate/window the flatten would drop; and the BITMAP
-# AND of two indexes - two ON equalities on two indexed columns, where
-# this server bands on one and lets the ON re-check the other (the
-# single-column band is a superset of the conjunction, so the rows are
-# the engine's). What remains: NUMERIC(38,0), an INT128 key - a
-# cross-cutting change (`Rhs` carries an `i64`), its own slice.
+# NONE now - Slice B is closed. In order: the scaled NUMERIC inner side
+# (the literal reaches the column's scale); an EXPRESSION on the outer
+# side of the ON (`CHI.K + 0` evaluated per driving row to the value the
+# band probes with); an OR in the ON (one band per DNF branch, their
+# UNION deduplicated on acceptance by `records_for_2pc`, every branch
+# required servable); a VIEW or DERIVED inner that is a PLAIN PROJECTION
+# of one base table (the engine FLATTENS it, so the probe keys that base
+# table through an output-column-to-base-field map, declining any side
+# with a WHERE/DISTINCT/aggregate/window); the BITMAP AND of two indexes
+# (two ON equalities on two indexed columns - band on one, the ON
+# re-checks the other, the single-column band a superset of the
+# conjunction); and a NUMERIC(38,0) INT128 inner (IDX_BCD - the same
+# encoder the write path uses takes an i64-range value AS i128, so the
+# retrieval band's bytes are the engine's; a value too wide for i64
+# never becomes a literal, so it scans, never mis-keys).
 #
 #   qa/serve-real-leftjoinindex.sh [port]     (the twin runs on port+1)
 #
@@ -120,6 +117,9 @@ ran=0
 #   BAND  TWO single-column indexes (K1, K2) - a two-equality ON is the
 #         engine's bitmap AND; this server bands on one and re-checks the
 #         other through the ON
+#   BIG   a NUMERIC(38,0) (INT128 / IDX_BCD) index, plus one real 38-digit
+#         key - an i64-range join value keys its own IDX_BCD band and
+#         navigates past the 39-digit one
 make_db() {
     rm -f "$1"
     "$ISQL" -q -b -user "$U" -pas "$P" <<EOF >/dev/null 2>&1 || return 1
@@ -132,6 +132,7 @@ CREATE TABLE DESCT (K INTEGER, N VARCHAR(8));
 CREATE TABLE CHI (ID INTEGER, K INTEGER, N VARCHAR(8));
 CREATE TABLE WIDEK (K BIGINT, NM NUMERIC(9,2), T VARCHAR(8));
 CREATE TABLE BAND (K1 INTEGER, K2 INTEGER, N VARCHAR(8));
+CREATE TABLE BIG (K NUMERIC(38,0), N VARCHAR(8));
 COMMIT;
 CREATE INDEX DUP_K ON DUP (K);
 CREATE INDEX EMPT_K ON EMPT (K);
@@ -141,6 +142,7 @@ CREATE INDEX WIDEK_NM ON WIDEK (NM);
 CREATE INDEX WIDEK_T ON WIDEK (T);
 CREATE INDEX BAND_K1 ON BAND (K1);
 CREATE INDEX BAND_K2 ON BAND (K2);
+CREATE INDEX BIG_K ON BIG (K);
 CREATE VIEW VPAR AS SELECT K, N FROM PAR;
 COMMIT;
 SET TERM ^ ;
@@ -160,10 +162,15 @@ EXECUTE BLOCK AS DECLARE I INTEGER = 0; BEGIN
   I = 0;
   WHILE (I < 100) DO BEGIN I = I + 1;
     INSERT INTO BAND VALUES (MOD(:I, 10) + 1, MOD(:I, 5) + 1, 'b' || :I); END
+  I = 0;
+  WHILE (I < 60) DO BEGIN I = I + 1; INSERT INTO BIG VALUES (:I, 'g' || :I); END
 END^
 SET TERM ; ^
 COMMIT;
 INSERT INTO DUP VALUES (NULL, 'dnull');
+-- a real 38-digit key in the tree: the small join keys must navigate
+-- PAST it, which only holds if the IDX_BCD key order is the engine's
+INSERT INTO BIG VALUES (99999999999999999999999999999999999999, 'ghuge');
 COMMIT;
 SET STATISTICS INDEX DUP_K;
 SET STATISTICS INDEX EMPT_K;
@@ -392,6 +399,14 @@ join_indexed "two indexed ON columns: one band, the ON re-checks the rest" \
     "SELECT COUNT(*) FROM CHI LEFT JOIN BAND ON BAND.K1 = CHI.K AND BAND.K2 = CHI.K" 1
 join_indexed "... and its rows, ordered (the K2 conjunct removes K1-only rows)" \
     "SELECT CHI.ID, BAND.N FROM CHI LEFT JOIN BAND ON BAND.K1 = CHI.K AND BAND.K2 = CHI.K ORDER BY CHI.ID, BAND.N" 1
+# ...and the LAST of the seven. A NUMERIC(38,0) inner (INT128, IDX_BCD)
+# is keyed now: the driving row's i64-range value builds an IDX_BCD band
+# through the SAME encoder the write path uses, so its bytes are the
+# engine's and the descent walks past the 38-digit key in the tree.
+join_indexed "a NUMERIC(38,0) INT128 inner index" \
+    "SELECT COUNT(*) FROM CHI LEFT JOIN BIG ON BIG.K = CHI.K" 1
+join_indexed "... and its rows, ordered" \
+    "SELECT CHI.ID, BIG.N FROM CHI LEFT JOIN BIG ON BIG.K = CHI.K ORDER BY CHI.ID" 1
 
 # --- 6. the pins: the join kinds the engine does NOT plan this way -----
 # A server that always says "index" is as wrong as one that never does.
@@ -517,6 +532,8 @@ same3 "the flattened DERIVED inner" \
     "SELECT CHI.ID, DD.N FROM CHI LEFT JOIN (SELECT K, N FROM PAR) DD ON DD.K = CHI.K ORDER BY CHI.ID"
 same3 "two indexed ON columns (one band + ON residual)" \
     "SELECT CHI.ID, BAND.N FROM CHI LEFT JOIN BAND ON BAND.K1 = CHI.K AND BAND.K2 = CHI.K ORDER BY CHI.ID, BAND.N"
+same3 "the NUMERIC(38,0) INT128 inner" \
+    "SELECT CHI.ID, BIG.N FROM CHI LEFT JOIN BIG ON BIG.K = CHI.K ORDER BY CHI.ID"
 same3 "the chain of two LEFT JOINs" \
     "SELECT CHI.ID, PAR.N, DUP.N FROM CHI LEFT JOIN PAR ON PAR.K = CHI.K LEFT JOIN DUP ON DUP.K = PAR.K WHERE CHI.ID < 30 ORDER BY CHI.ID, DUP.N"
 same3 "the unindexed inner" \
