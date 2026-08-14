@@ -1142,6 +1142,42 @@ else
     fail=1
 fi
 
+# --- parameterised DML defers its band too (LAST - it mutates) ---------
+# An UPDATE/DELETE whose WHERE holds a `?` had no band at prepare and
+# scanned; now the DML walk keys at EXECUTE from the bound predicate, like
+# a projection or GROUP BY. node drives the bind; fire-crab and the engine
+# must reach the same STATE, and fire-crab's log must show the DEFERRED
+# DML index ("dml index: rel=" appears at execute, not prepare, for a `?`).
+# Runs last, since it changes EMP.
+if command -v node >/dev/null 2>&1; then
+    pdml() { # <label> <dml-sql> <json-args> <check-sql>
+        ran=$((ran + 1))
+        before=$(grep -c "dml index: rel=" "$LOG" 2>/dev/null || true)
+        pquery "$2" "$PORT" "$A" "$3" >/dev/null
+        pquery "$2" "$REAL" "$B" "$3" >/dev/null
+        after=$(grep -c "dml index: rel=" "$LOG" 2>/dev/null || true)
+        a=$(query "$4" "$PORT" "$A")
+        b=$(query "$4" "$REAL" "$B")
+        if [ "$a" = "$b" ]; then
+            echo "OK   $1: $a"
+        else
+            echo "DIFF $1"; echo "     fcwire: $a"; echo "     engine: $b"; fail=1
+        fi
+        ran=$((ran + 1))
+        if [ "$after" -gt "$before" ]; then
+            echo "OK   ... and the DML walk drove a DEFERRED index"
+        else
+            echo "DIFF $1: the parameterised DML did not defer to an index"; fail=1
+        fi
+    }
+    pdml "an UPDATE with a parameter equality" \
+        "UPDATE EMP SET NAME = 'zz' WHERE ID = ?" "[3]" \
+        "SELECT ID, NAME FROM EMP WHERE ID = 3"
+    pdml "a DELETE with a parameter equality" \
+        "DELETE FROM EMP WHERE ID = ?" "[4]" \
+        "SELECT COUNT(*) AS K FROM EMP WHERE ID = 4"
+fi
+
 rm -f "$A" "$B"
 if [ "$ran" -lt 236 ]; then
     echo "DIFF only $ran checks ran (expected at least 236) - did one silently skip?"

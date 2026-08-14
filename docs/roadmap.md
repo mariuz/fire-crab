@@ -2214,8 +2214,15 @@ plus *the subsystem is now on the path*.
     materialises, and in the streaming path) so a grouped query looks up
     on a bound `?` instead of scanning - proved by `pboth … yes` in
     `qa/serve-real-index.sh`, whose `(deferred)` trace fires for the
-    grouped case as it does for the projection. **DML WHERE still scans**
-    - `Plan::Update`/`Plan::Delete` need the same `defer` field, next.
+    grouped case as it does for the projection. **And DML WHERE defers
+    too**: `Plan::Update`/`Plan::Delete` grew the same `defer` field, built
+    at prepare in `plan_update`/`plan_delete` and resolved by
+    `resolve_access` before `collect_dml_targets` walks the targets, so a
+    parameterised `UPDATE … WHERE id = ?` / `DELETE … WHERE id = ?` keys
+    the walk at execute (a `pdml` twin drives node-bound DML and checks
+    both the resulting STATE and the deferred `dml index:` trace). Every
+    retrieval shape - projection, grouped, DML - now defers a `?`'s band
+    to execute alike.
   - **A failure that was the GATE's, and a claim of mine that was
     wrong.** `qa/serve-real-params.sh` had been failing since before W1,
     and I reported it as "fire-crab accepts a boolean parameter INSERT

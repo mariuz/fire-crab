@@ -4780,6 +4780,10 @@ AlterDomainRename {
         fk_children: Vec<FkPartner>,
         /// the access path for finding the rows to update
         index: Option<IndexAccess>,
+        /// a PARAMETERISED WHERE has no band at prepare; deferred to
+        /// EXECUTE from the bound predicate, exactly as a projection or a
+        /// GROUP BY - see [DeferredAccess]
+        defer: Option<DeferredAccess>,
         /// set instead of `filter` when the WHERE holds a generator
         /// draw - see [Plan::Delete]'s field of the same name
         gen_filter: Option<GenFilter>,
@@ -4807,6 +4811,8 @@ AlterDomainRename {
         /// reads before it writes, and that read is a retrieval like
         /// any other
         index: Option<IndexAccess>,
+        /// a PARAMETERISED WHERE deferred to EXECUTE - see [Plan::Update]
+        defer: Option<DeferredAccess>,
         /// set instead of `filter` when the WHERE holds a generator
         /// draw: the walk must ADVANCE the generator once per row it
         /// compares, which the [Predicate] machinery cannot do
@@ -16876,9 +16882,7 @@ fn plan_update(sql: &str, db_outer: &Option<Database>) -> Option<(Plan, Vec<Desc
     // The trace pair is DISTINCT from "index scan:" on purpose:
     // serve-real-index's FC_NO_INDEX twin asserts ZERO "index scan:"
     // lines over a log full of plain DML, and a distinct string keeps
-    // that claim and this one independently greppable. Plan::Update
-    // has no defer field, so a param'd WHERE stays a scan at prepare
-    // (the engine indexes it - an enumerated follow-up, not W1).
+    // that claim and this one independently greppable.
     let opt_sql = folded_where.as_ref().map(|w| format!("SELECT 1 FROM {} WHERE {}", table, w));
     let index = opt_sql
         .as_deref()
@@ -16889,6 +16893,13 @@ fn plan_update(sql: &str, db_outer: &Option<Database>) -> Option<(Plan, Vec<Desc
             None => eprintln!("[srv] dml natural: rel={}", rel),
         }
     }
+    // a `?` in the WHERE has no band at prepare; carry the reconstructed
+    // statement so the walk keys at EXECUTE from the bound predicate,
+    // exactly as a projection or GROUP BY defers
+    let defer = match (&opt_sql, index.is_none() && filter_has_params(&filter)) {
+        (Some(sql), true) => Some(DeferredAccess { table: table.to_string(), sql: sql.clone() }),
+        _ => None,
+    };
     Some((
         Plan::Update {
             rel,
@@ -16903,6 +16914,7 @@ fn plan_update(sql: &str, db_outer: &Option<Database>) -> Option<(Plan, Vec<Desc
             fk_refs,
             fk_children,
             index,
+            defer,
             gen_filter,
         },
         params,
@@ -16998,7 +17010,12 @@ fn plan_delete(sql: &str, db_outer: &Option<Database>) -> Option<(Plan, Vec<Desc
             None => eprintln!("[srv] dml natural: rel={}", rel),
         }
     }
-    Some((Plan::Delete { rel, formats, filter, fk_children, index, gen_filter }, params))
+    // a parameterised WHERE defers its band to EXECUTE, as in plan_update
+    let defer = match (&opt_sql, index.is_none() && filter_has_params(&filter)) {
+        (Some(sql), true) => Some(DeferredAccess { table: table.to_string(), sql: sql.clone() }),
+        _ => None,
+    };
+    Some((Plan::Delete { rel, formats, filter, fk_children, index, defer, gen_filter }, params))
 }
 
 /// The DML target walk: every committed primary record of `rel` the
@@ -18254,7 +18271,7 @@ fn execute_dml_collecting_inner(
             }
             (1, 0, 0)
         }
-        Plan::Update { rel, table, format_no, formats, sets, filter, index_ops, not_null, checks, fk_refs, fk_children, index, gen_filter } => {
+        Plan::Update { rel, table, format_no, formats, sets, filter, index_ops, not_null, checks, fk_refs, fk_children, index, defer, gen_filter } => {
             let descs = formats
                 .iter()
                 .find(|(n, _)| n == format_no)
@@ -18293,6 +18310,16 @@ fn execute_dml_collecting_inner(
             }
             let sets = &bound_sets;
             let filter = &bind_filter(filter, args)?;
+            // a parameterised WHERE builds its band HERE, from the bound
+            // predicate - the DML walk reads before it writes, and that
+            // read is a retrieval like any other (traced through the DML
+            // pair by collect_dml_targets, not "index scan:")
+            let index = &resolve_access(index, defer, db, *rel, descs, filter, &[]);
+            if trace_on() {
+                if let (Some(a), true) = (index.as_ref(), defer.is_some()) {
+                    eprintln!("[srv] dml index: rel={} {} (deferred)", rel, a.describe());
+                }
+            }
             // fmt_length, exactly as met.epp:1071 derives it (the last
             // stored descriptor's offset + length, no rounding) - see
             // the law stated at [build_insert_image]. A STORED record
@@ -18539,8 +18566,20 @@ fn execute_dml_collecting_inner(
             }
             (0, affected as i32, 0)
         }
-        Plan::Delete { rel, formats, filter, fk_children, index, gen_filter } => {
+        Plan::Delete { rel, formats, filter, fk_children, index, defer, gen_filter } => {
             let filter = &bind_filter(filter, args)?;
+            // a parameterised WHERE keys at EXECUTE, as in the UPDATE arm
+            let descs_now: Vec<Descriptor> = formats
+                .iter()
+                .max_by_key(|(n, _)| *n)
+                .map(|(_, d)| d.clone())
+                .unwrap_or_default();
+            let index = &resolve_access(index, defer, db, *rel, &descs_now, filter, &[]);
+            if trace_on() {
+                if let (Some(a), true) = (index.as_ref(), defer.is_some()) {
+                    eprintln!("[srv] dml index: rel={} {} (deferred)", rel, a.describe());
+                }
+            }
             let mut targets: Vec<(u32, u16)> = Vec::new();
             // a generator drawn in the WHERE advances ONCE PER ROW
             // COMPARED, matching or not - see [collect_dml_targets_drawing]
@@ -55766,6 +55805,7 @@ mod tests {
             filter: None,
             fk_children: Vec::new(),
             index: None,
+            defer: None,
             gen_filter: None,
         };
         let wrap = |p: Plan| Plan::Returning {
@@ -55787,6 +55827,7 @@ mod tests {
                 filter: None,
                 fk_children: Vec::new(),
                 index: None,
+                defer: None,
                 gen_filter: None,
             }),
             4
@@ -55866,6 +55907,7 @@ mod tests {
                 fk_refs: Vec::new(),
                 fk_children: Vec::new(),
                 index: None,
+                defer: None,
                 gen_filter: None,
             })
         };
