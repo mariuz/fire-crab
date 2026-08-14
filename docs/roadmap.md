@@ -1961,6 +1961,21 @@ plus *the subsystem is now on the path*.
       have; the correlated-subquery precedent applies verbatim. **A
       pin, not code.**
 
+      *A GROUP BY over a LEFT join keys its inner side ALREADY* — a
+      `Plan::JoinGroup` routes through the SAME `base`+`parts`+`join_rows`
+      a plain `Plan::Join` does, so the inner probe fires under the fold
+      exactly as without it (the driver scans in both). Measured, not
+      assumed: `qa/serve-real-leftjoinindex.sh` now pins a grouped join
+      and a global aggregate over the join as `join_indexed`, each
+      `FC_NO_INDEX`-twinned. What a grouped join lacks relative to a
+      single-relation `Plan::Group` is that group's scalar `index`/`defer`
+      field — but it needs none, because its retrieval IS the join tree,
+      whose only indexed leaf is the inner probe. The one real join
+      retrieval gap left is the DRIVER index (a WHERE on the outer side
+      driving the outer's OWN index), which is not grouped-specific and is
+      row-order-coupled to the engine's driver choice — the same reason
+      the INNER hashes are pinned.
+
       *LEFT — the slice is ON.* A LEFT JOIN never hashes. In every
       probe the engine's plan IS fire-crab's execution tree: driver =
       the syntactic left, inner = the syntactic right, `INDEX` on the

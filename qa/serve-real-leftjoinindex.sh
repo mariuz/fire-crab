@@ -308,6 +308,16 @@ join_indexed "an extra ON conjunct naming the OUTER side" \
     "SELECT CHI.ID, PAR.N FROM CHI LEFT JOIN PAR ON PAR.K = CHI.K AND CHI.ID < 40 ORDER BY CHI.ID" 1
 join_indexed "a WHERE on the OUTER side" \
     "SELECT CHI.ID, PAR.N FROM CHI LEFT JOIN PAR ON PAR.K = CHI.K WHERE CHI.ID = 7" 1
+# A GROUP BY over the join folds ABOVE the join tree, which the probe is
+# part of: the inner side is still probed per driving row (a JoinGroup
+# routes through the SAME base+parts+join_rows a plain join does), so the
+# grouped join is not handicapped - it inherits the plain join's probe.
+# The driver scans in both, as it must (a driver index is a separate,
+# pinned concern).
+join_indexed "a GROUP BY over the join still probes the inner" \
+    "SELECT CHI.K, COUNT(PAR.N) AS C FROM CHI LEFT JOIN PAR ON PAR.K = CHI.K GROUP BY CHI.K ORDER BY CHI.K" 1
+join_indexed "... and a global aggregate over the join probes too" \
+    "SELECT COUNT(PAR.N) AS C FROM CHI LEFT JOIN PAR ON PAR.K = CHI.K" 1
 # A WHERE on the INNER side demotes the LEFT to an INNER and the engine
 # then FLIPS the driver (PLAN JOIN (PAR NATURAL, CHI INDEX ...)). This
 # executor cannot flip - its tree is fixed by the SQL - so it keeps
@@ -554,6 +564,8 @@ same3 "the NUMERIC(38,0) INT128 inner" \
     "SELECT CHI.ID, BIG.N FROM CHI LEFT JOIN BIG ON BIG.K = CHI.K ORDER BY CHI.ID"
 same3 "the INT128 driver with a WIDE outer value" \
     "SELECT WIDEDRV.ID, BIG.N FROM WIDEDRV LEFT JOIN BIG ON BIG.K = WIDEDRV.K ORDER BY WIDEDRV.ID"
+same3 "a GROUP BY over the join (the fold sits above the probe)" \
+    "SELECT CHI.K, COUNT(PAR.N) AS C FROM CHI LEFT JOIN PAR ON PAR.K = CHI.K GROUP BY CHI.K ORDER BY CHI.K"
 # a WIDE integer LITERAL (>i64) against the INT128 column - fire-crab
 # used to REFUSE it at the tokenizer; now it keys the IDX_BCD band (index
 # server) and scan-compares in i128 (FC_NO_INDEX server), both the
