@@ -5374,6 +5374,13 @@ enum Rhs {
     /// consumer treats it like an out-of-domain literal and declines,
     /// which fails closed (a scan, or a refusal) rather than truncating.
     Int128(i128),
+    /// an integer literal PAST i128::MAX, carried as its encoded decimal128
+    /// bits. Only the scan-compare path consumes it, PROMOTING the column
+    /// value to decimal128 (rounded to 34 significant digits, HALF-UP) and
+    /// comparing as the engine does; it never builds an index band (a
+    /// DECFLOAT key is a different index kind), and every other consumer
+    /// declines, failing closed.
+    DecFloat34(u128),
     /// an APPROXIMATE value - built ONLY at bind, for a blr_double
     /// parameter against a TEXT column ([Term::TextNumCmp]'s double
     /// domain; probed: `S = ?` bound 4.5 answers the '4.5' row). The
@@ -5868,10 +5875,10 @@ impl Predicate {
                     // reads WIRE values, cannot build one
                     Some(Rhs::Str(t) | Rhs::StrKey(t)) => Some(Expr::Str(t)),
                     Some(Rhs::Null | Rhs::Param(..)) => Some(Expr::Null),
-                    // a wide INT128 literal has no Expr carrier (Expr::Int
-                    // is i64) - this describe-as-literal path is for the
-                    // TEXT-param shape and never meets one; refuse
-                    Some(Rhs::Int128(_)) => None,
+                    // a wide INT128/DECFLOAT literal - this describe-as-
+                    // literal path is for the TEXT-param shape and never
+                    // meets one; refuse
+                    Some(Rhs::Int128(_) | Rhs::DecFloat34(_)) => None,
                 },
             })
         };
@@ -6561,6 +6568,7 @@ impl Term {
             Term::Cmp(_, _, Rhs::Param(..)) => None,
             Term::Cmp(_, _, Rhs::Num(..)) => None, // Num travels in NumCmp
             Term::Cmp(_, _, Rhs::Int128(..)) => None, // Int128 travels in NumCmp
+            Term::Cmp(_, _, Rhs::DecFloat34(..)) => None, // DECFLOAT travels in NumCmp
             // resolution turns StrKey into a plain term or a
             // KeyConvErr; one reaching a Term is unreachable-defensive
             Term::Cmp(_, _, Rhs::StrKey(_)) => None,
@@ -6617,6 +6625,15 @@ impl Term {
             // does, `num_cmp` doing the width-safe part.
             Term::NumCmp(fid, op, Rhs::Int128(r)) => match values.get(*fid) {
                 Some(v) => num_cmp(v, &Value::Int128(*r, 0)).map(|o| ord_ok(o, *op)),
+                None => None,
+            },
+            // a DECFLOAT(34) literal (magnitude past i128::MAX): the engine
+            // promotes the column to decimal128 too - value_as_dec rounds it
+            // to 34 significant digits (HALF-UP) - and compares there.
+            Term::NumCmp(fid, op, Rhs::DecFloat34(bits)) => match values.get(*fid) {
+                Some(v) => value_as_dec(v).map(|d| {
+                    ord_ok(fire_crab_ods::decfloat::cmp(&d, &fire_crab_ods::decfloat::decode_dec128(*bits)), *op)
+                }),
                 None => None,
             },
             Term::NumCmp(..) => None, // unbound parameter / wrong shape
@@ -34439,6 +34456,23 @@ fn numeric_parts(v: &Value) -> Option<(i128, i8)> {
     }
 }
 
+/// Promote a numeric [Value] to the decimal128 the engine compares against
+/// a DECFLOAT literal: an EXACT value is rounded to 34 significant digits
+/// (HALF-UP, [round_to_dec34]), and a stored DECFLOAT decodes to its own
+/// [Dec]. A non-numeric value (text, approximate, temporal) has no such
+/// promotion and declines, which reads as UNKNOWN at the compare.
+fn value_as_dec(v: &Value) -> Option<fire_crab_ods::decfloat::Dec> {
+    use fire_crab_ods::decfloat::{decode_dec128, decode_dec64, round_to_dec34};
+    Some(match v {
+        Value::Int(n) => round_to_dec34(*n < 0, (*n as i128).unsigned_abs(), 0),
+        Value::Scaled(r, s) => round_to_dec34(*r < 0, (*r as i128).unsigned_abs(), -(*s as i32)),
+        Value::Int128(r, s) => round_to_dec34(*r < 0, r.unsigned_abs(), -(*s as i32)),
+        Value::DecFloat34(b) => decode_dec128(*b),
+        Value::DecFloat16(b) => decode_dec64(*b),
+        _ => return None,
+    })
+}
+
 /// The storage width of an exact-numeric operand - what decides INT128
 /// promotion, exactly as the engine's descriptor dtypes do (dsc.cpp
 /// `DSC_multiply_result` + ExprNodes.cpp `getDescDialect3`): a
@@ -37032,6 +37066,10 @@ fn render_toks(toks: &[Tok]) -> Option<String> {
             Tok::Ident(s) => s.clone(),
             Tok::Int(i) => i.to_string(),
             Tok::Int128(i) => i.to_string(),
+            // a DECFLOAT literal never keys an index - decline, so the
+            // band reconstruction costs the index (a scan) rather than
+            // spelling a value the optimizer would refuse anyway
+            Tok::DecFloat34(_) => return None,
             // a Dec's scale is always negative (the tokenizer keeps
             // `12.50` as (1250, -2)), which is the half value_literal
             // spells; a non-negative scale answers None there and the
@@ -39666,6 +39704,11 @@ enum Tok {
     /// through to a refusal, so a wide literal in an unsupported position
     /// scans or refuses rather than truncating.
     Int128(i128),
+    /// an integer literal PAST i128::MAX - the engine promotes the compare
+    /// to DECFLOAT(34). Carries the encoded decimal128 bits; only the
+    /// scan-compare path consumes it (via [Rhs::DecFloat34], comparing a
+    /// column PROMOTED to decimal128), and it never builds an index band
+    DecFloat34(u128),
     /// a decimal literal as (raw digits, scale): `12.50` is (1250, -2)
     /// - trailing zeros count, like the expression parser's literals
     Dec(i64, i8),
@@ -39761,13 +39804,28 @@ fn numeric_tok(s: &str, b: &[u8], start: usize, i: &mut usize) -> Option<Tok> {
         let digits: String = s[start..*i].chars().filter(|c| *c != '.').collect();
         return Some(Tok::Dec(digits.parse().ok()?, scale));
     }
-    // an integer literal: i64 for the common case, else an i128 magnitude
-    // (a NUMERIC(38,0) key). Wider than i128 (past 39 digits) still
-    // refuses - that is DECFLOAT territory, its own slice.
+    // an integer literal: i64 for the common case, an i128 magnitude
+    // (a NUMERIC(38,0) key) next, and past i128::MAX the engine promotes
+    // the compare to DECFLOAT(34) - carried as its encoded decimal128 bits
     let lit = &s[start..*i];
     Some(match lit.parse::<i64>() {
         Ok(n) => Tok::Int(n),
-        Err(_) => Tok::Int128(lit.parse::<i128>().ok()?),
+        Err(_) => match lit.parse::<i128>() {
+            Ok(n) => Tok::Int128(n),
+            // past i128::MAX in magnitude - a DECFLOAT(34). `lit` carries
+            // the sign here (the tokenizer hands numeric_tok the leading
+            // `-`), so split it off before encoding the digits
+            Err(_) => {
+                let (neg, digits) = match lit.strip_prefix('-') {
+                    Some(d) => (true, d),
+                    None => (false, lit),
+                };
+                Tok::DecFloat34(fire_crab_ods::decfloat::dec128_from_int_digits(
+                    neg,
+                    digits.as_bytes(),
+                ))
+            }
+        },
     })
 }
 
@@ -40371,6 +40429,7 @@ fn parse_value(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Rhs> {
     let v = match t.get(*pos)? {
         Tok::Int(n) => Rhs::Int(*n),
         Tok::Int128(n) => Rhs::Int128(*n),
+        Tok::DecFloat34(b) => Rhs::DecFloat34(*b),
         Tok::Dec(r, s) => Rhs::Num(*r, *s),
         Tok::Str(s) => Rhs::Str(s.clone()),
         Tok::StrKey(s) => Rhs::StrKey(s.clone()),
@@ -40612,11 +40671,10 @@ fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
                     // Dbl exists only at bind - the parser never sees
                     // it; a StrKey would LOSE its grammar marker on the
                     // way into a RawExpr, so it refuses instead; a wide
-                    // INT128 literal has no RawExpr carrier, so BETWEEN/IN
-                    // over one refuses rather than truncating a bound
-                    Rhs::Dbl(_) | Rhs::Param(..) | Rhs::StrKey(_) | Rhs::Int128(_) => {
-                        return None
-                    }
+                    // a wide INT128/DECFLOAT literal - BETWEEN/IN over one
+                    // refuses rather than truncating a bound
+                    Rhs::Dbl(_) | Rhs::Param(..) | Rhs::StrKey(_) | Rhs::Int128(_)
+                    | Rhs::DecFloat34(_) => return None,
                 })
             };
             match t.get(p3) {
@@ -43951,6 +44009,13 @@ fn typed_term(idx: usize, kind: ColKind, raw: RawKind) -> Option<Term> {
             ColKind::Int => Term::NumCmp(idx, op, Rhs::Int128(n)),
             _ => return None,
         },
+        // a DECFLOAT(34) literal (magnitude past i128::MAX) against a plain
+        // integer column: no integer equals it, but `<`/`>` decide; the
+        // column promotes to decimal128 at compare and it scans
+        RawKind::Cmp(op, Rhs::DecFloat34(b)) => match kind {
+            ColKind::Int => Term::NumCmp(idx, op, Rhs::DecFloat34(b)),
+            _ => return None,
+        },
         // a decimal literal against an integer column compares exactly
         // (A > 1.5 is meaningful, A = 1.5 simply never matches)
         RawKind::Cmp(op, Rhs::Num(r, s)) => match kind {
@@ -44232,8 +44297,10 @@ fn resolve_expr_term(
             Rhs::Str(s) => Expr::Str(s.clone()),
             Rhs::Null => Expr::Null,
             // Dbl exists only at bind - unreachable-defensive here; a
-            // StrKey refuses rather than drop its grammar marker
-            Rhs::Dbl(_) | Rhs::Param(..) | Rhs::StrKey(_) => return None,
+            // StrKey refuses rather than drop its grammar marker; a DECFLOAT
+            // literal against an EXPRESSION side refuses (its own slice, as
+            // the INT128 expression-compare was after its column compare)
+            Rhs::Dbl(_) | Rhs::Param(..) | Rhs::StrKey(_) | Rhs::DecFloat34(_) => return None,
         })
     };
     let term = match &rt.kind {
@@ -44763,6 +44830,11 @@ fn numeric_term(
         // against the column in i128 ([num_cmp]) and the IDX_BCD key is
         // built from it directly ([pick_for_terms]).
         RawKind::Cmp(op, Rhs::Int128(n)) => Term::NumCmp(idx, op, Rhs::Int128(n)),
+        // an integer literal PAST i128::MAX: the engine promotes BOTH
+        // sides to DECFLOAT(34) and compares there. The column value is
+        // rounded to 34 significant digits at scan-compare ([Term::matches]
+        // via [value_as_dec]); it never keys an index.
+        RawKind::Cmp(op, Rhs::DecFloat34(b)) => Term::NumCmp(idx, op, Rhs::DecFloat34(b)),
         RawKind::Cmp(_, Rhs::Null) => Term::Unknown,
         RawKind::Cmp(op, Rhs::Param(slot, _)) => {
             if !param_target_ok(d) {

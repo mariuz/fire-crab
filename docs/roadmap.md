@@ -2191,9 +2191,30 @@ plus *the subsystem is now on the path*.
       `Value::DecFloat34` (`xdr_dec128`). Gated in `serve-real-numsubtype.sh`:
       DECFLOAT type (positive, negative, u128::MAX, 52-digit), the INT128
       `-2^127` boundary, and value round-trips (exact-half, below-half, the
-      all-nines carry, and negatives). Still refused deliberately: DECFLOAT
-      in a WHERE literal / arithmetic / nested (its own slice, like INT128's
-      WHERE-literal was), and a value past DECFLOAT range.
+      all-nines carry, and negatives).
+
+      *And the DECFLOAT WHERE-literal came next* — `WHERE <numeric-col> <op>
+      <past-i128-literal>`. The engine promotes BOTH sides to decimal128,
+      rounding the COLUMN to 34 significant digits HALF-UP too - PROBED: two
+      INT128 values differing only past the 34th digit BOTH match one
+      DECFLOAT literal, and `i128::MAX+1` rounds DOWN to `…884100000`, which
+      an exact `i128::MAX` column also rounds to, so `col = <i128::MAX+1>`
+      matches both. The WHERE tokenizer's `numeric_tok` grew the past-i128
+      arm (→ `Tok::DecFloat34`, stripping the sign the tokenizer prepends);
+      `parse_value` → `Rhs::DecFloat34`; `typed_term`/`numeric_term` →
+      `Term::NumCmp(_, _, Rhs::DecFloat34)`; `Term::matches` promotes the
+      column via a new `value_as_dec` (exact numerics rounded by
+      `ods::decfloat::round_to_dec34`, a stored DECFLOAT decoded) and
+      compares with `decfloat::cmp`. Fail-closed everywhere else: no index
+      band (`render_toks` declines the token → scan), no BETWEEN/IN bound,
+      no expr-compare, no param bind. Gated in `serve-real-numericwhere.sh`
+      (+9: the rounding boundary on INT128 and NUMERIC(38,0), `<`/`>`/`<>`/
+      `>=`, negative literals, an AND of two DECFLOAT bounds). Two adjacent
+      gaps found and left as their own slices: a DECFLOAT *column* in WHERE
+      refuses outright today (even `DF = 100` - the resolver never routes
+      DEC128 columns), and a wide INT128 *literal in INSERT VALUES* does not
+      parse. Still refused deliberately: DECFLOAT in arithmetic / nested,
+      and a value past DECFLOAT range.
 
       *And the wide OUTER value came with it* — the probe's `band` capped
       an `Int128` driving value at `i64` and scanned; now it carries the

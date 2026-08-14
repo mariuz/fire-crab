@@ -41,6 +41,18 @@ INSERT INTO T VALUES (1, 10, 12.50, 0.0001, 42);
 INSERT INTO T VALUES (2, 3, -1.25, 7.0000, -5000000000);
 INSERT INTO T VALUES (3, 9, NULL, 123.4567, NULL);
 INSERT INTO T VALUES (4, -8, 2.00, NULL, 0);
+COMMIT;
+-- wide-valued rows for the DECFLOAT-literal section (section 1b). Written
+-- by the ENGINE here: a wide INT128 LITERAL in INSERT VALUES is a separate
+-- surface fire-crab does not yet parse; this slice is the READ/compare side.
+-- Rows 1 and 2 differ only past the 34th significant digit, so both round
+-- to the same DECFLOAT(34).
+CREATE TABLE W (ID INTEGER, K INT128, NB NUMERIC(38,0));
+COMMIT;
+INSERT INTO W VALUES (1, 170141183460469231731687303715884100000, 170141183460469231731687303715884100000);
+INSERT INTO W VALUES (2, 170141183460469231731687303715884105727, 170141183460469231731687303715884105727);
+INSERT INTO W VALUES (3, 5, 5);
+INSERT INTO W VALUES (4, -170141183460469231731687303715884105728, -170141183460469231731687303715884105728);
 COMMIT;"
 
 for f in "$REF" "$WORK"; do
@@ -131,6 +143,35 @@ predq "mixed AND/OR across kinds"        "N > 0 AND I >= 0 OR A = 3"
 # a parameter binds with its wire scale
 fcp=$(node_run 'SELECT ID FROM T WHERE M = ? ORDER BY ID' '[7]' | tr '\n' ' ' | strip)
 check "numeric parameter (M = ? bound 7)" "$fcp" "2"
+
+# --- 1b. a DECFLOAT(34) literal (magnitude PAST i128::MAX) against the
+# exact-numeric columns. The engine promotes BOTH sides to decimal128 - the
+# COLUMN rounded to 34 significant digits, HALF-UP - so an INT128 literal
+# like i128::MAX+1, which rounds DOWN to ...884100000, is matched by BOTH a
+# column holding exactly that AND one holding i128::MAX (...884105727, which
+# rounds to the same 34 digits). A DECFLOAT literal never keys an index; a
+# DECFLOAT COLUMN in WHERE is a separate surface fire-crab does not resolve.
+predw() { # <label> <where-clause> - fire-crab vs the ENGINE, same file, table W
+    fc=$(node_run "SELECT ID FROM W WHERE $2 ORDER BY ID" | tr '\n' ' ' | strip)
+    # node_q prints "OK" for an EMPTY result set; the engine prints nothing
+    [ "$fc" = "OK" ] && fc=""
+    is=$("$ISQL" -q -b -user "$U" -pas "$P" "$WORK" 2>&1 <<SQL | strip | grep -v '^$' | tr '\n' ' ' | strip
+SET HEADING OFF;
+SELECT ID FROM W WHERE $2 ORDER BY ID;
+SQL
+)
+    check "$1 [$2]" "$fc" "$is"
+}
+# the ROUNDING boundary: rows 1 and 2 both equal the rounded literal
+predw "INT128 col = DECFLOAT lit (round boundary)"  "K = 170141183460469231731687303715884105728"
+predw "NUMERIC col = DECFLOAT lit (round boundary)" "NB = 170141183460469231731687303715884105728"
+predw "INT128 col < DECFLOAT lit"                   "K < 340282366920938463463374607431768211455"
+predw "INT128 col > DECFLOAT lit"                   "K > 340282366920938463463374607431768211455"
+predw "INT128 col <> DECFLOAT lit"                  "K <> 340282366920938463463374607431768211455"
+predw "INT128 col >= negative DECFLOAT lit"         "K >= -340282366920938463463374607431768211455"
+predw "INT128 col < negative DECFLOAT lit"          "K < -340282366920938463463374607431768211455"
+predw "NUMERIC col < DECFLOAT lit"                  "NB < 340282366920938463463374607431768211455"
+predw "DECFLOAT lit both bounds (AND)"              "K < 340282366920938463463374607431768211455 AND K > -340282366920938463463374607431768211455"
 
 # --- 2. DML through numeric predicates + decimal literals --------------
 check "fc INSERT with decimal literals" \

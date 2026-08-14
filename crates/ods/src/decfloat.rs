@@ -352,6 +352,31 @@ pub fn dec128_from_int_digits(neg: bool, digits: &[u8]) -> u128 {
     encode_dec128(neg, coeff, exp)
 }
 
+/// Round a decimal (sign, coefficient, exponent-of-the-last-digit) to a
+/// finite [Dec] of at most 34 significant digits, HALF-UP (away from
+/// zero) - the promotion the engine applies to an EXACT numeric value
+/// before comparing it to a DECFLOAT(34). A coefficient already within 34
+/// digits is exact; a wider one (an INT128 up to 39 digits) drops its low
+/// places into the exponent, carrying to 10^33 when an all-nines run
+/// rounds up.
+pub fn round_to_dec34(neg: bool, coeff: u128, exp: i32) -> Dec {
+    let digits = coeff.to_string();
+    if digits.len() <= 34 {
+        return Dec::Finite { neg, coeff, exp };
+    }
+    let drop = digits.len() - 34;
+    let mut c: u128 = digits[..34].parse().unwrap();
+    let mut e = exp + drop as i32;
+    if digits.as_bytes()[34] >= b'5' {
+        c += 1;
+        if c == 10u128.pow(34) {
+            c /= 10;
+            e += 1;
+        }
+    }
+    Dec::Finite { neg, coeff: c, exp: e }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -454,6 +479,29 @@ mod tests {
         assert_eq!(
             r(false, "99999999999999999999999999999999999999999"),
             "1.000000000000000000000000000000000E+41"
+        );
+    }
+
+    #[test]
+    fn round_to_dec34_promotes_an_exact_value() {
+        use std::cmp::Ordering::*;
+        // <= 34 digits is exact (no rounding), any exponent kept
+        assert_eq!(round_to_dec34(false, 12345, -2), Dec::Finite { neg: false, coeff: 12345, exp: -2 });
+        // i128::MAX (39 digits) rounds to 34 sig, first dropped 0 -> down
+        let imax = 170141183460469231731687303715884105727u128;
+        assert_eq!(
+            round_to_dec34(false, imax, 0),
+            Dec::Finite { neg: false, coeff: 1701411834604692317316873037158841, exp: 5 }
+        );
+        // two INT128 magnitudes differing only past the 34th digit round
+        // EQUAL - the promotion that makes both match one DECFLOAT literal
+        let a = round_to_dec34(false, 170141183460469231731687303715884100000, 0);
+        let b = round_to_dec34(false, 170141183460469231731687303715884105727, 0);
+        assert_eq!(cmp(&a, &b), Equal);
+        // all-nines carry to 10^33 with exp bumped
+        assert_eq!(
+            round_to_dec34(false, 99999999999999999999999999999999999u128, 0), // 35 nines
+            Dec::Finite { neg: false, coeff: 1000000000000000000000000000000000, exp: 2 }
         );
     }
 }
