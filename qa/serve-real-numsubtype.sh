@@ -75,5 +75,26 @@ both "IIF(N40 > 0, N40, N40)"  # SHORT subtype 1 - scale-0 NUMERIC kept
 both "N40 + N40"               # INT64 subtype 1
 both "I + 1"                   # INT64 subtype 0
 
+# a BARE INTEGER LITERAL takes its width from its MAGNITUDE, as the engine
+# does: <= i64::MAX is INT64/LONG, past that up to i128::MAX is INT128
+# (subtype 0, len 16). Past i128::MAX is DECFLOAT, which stays refused.
+# The wide literal was refused OUTRIGHT before - the select-list parser
+# capped at i64.
+both "5000000000"                              # INT64 (> i32, <= i64)
+both "9223372036854775807"                     # INT64 (i64::MAX)
+both "9223372036854775808"                     # INT128 (i64::MAX + 1)
+both "99999999999999999999"                    # INT128 (20 digits)
+both "170141183460469231731687303715884105727" # INT128 (i128::MAX)
+# and the VALUE round-trips, not just the type
+bothval() {
+    local e c
+    e=$(printf 'SELECT %s FROM RDB$DATABASE;\n' "$1" | "$ISQL" -q -user "$U" -pas "$P" "$E" 2>&1 | tr -s ' \n' ' ')
+    c=$(printf 'SELECT %s FROM RDB$DATABASE;\n' "$1" | "$ISQL" -q -user "$U" -pas "$P" "$F" 2>&1 | tr -s ' \n' ' ')
+    ran=$((ran + 1))
+    if [ "$e" = "$c" ]; then echo "OK   value $1"; else echo "DIFF value $1"; echo "     engine: $e"; echo "     fcrab:  $c"; fail=1; fi
+}
+bothval "99999999999999999999"
+bothval "170141183460469231731687303715884105727"
+
 echo "ran $ran checks"
 exit $fail

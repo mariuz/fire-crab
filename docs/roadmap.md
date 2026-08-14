@@ -2127,14 +2127,28 @@ plus *the subsystem is now on the path*.
       a projected expression, a BETWEEN/IN bound, a bound param, or
       against a text column refuses rather than truncating). The compare
       core (`numeric_parts`/`num_cmp`) and the IDX_BCD encoder were
-      already `i128`; nothing widened `Rhs::Int` or its 100+ sites. Still
-      refused, deliberately: a PROJECTED wide literal (`SELECT <huge>` —
-      its describe is INT128/DECFLOAT, a separate concern), wide
-      arithmetic, and a past-`i128` magnitude (DECFLOAT).
+      already `i128`; nothing widened `Rhs::Int` or its 100+ sites.
       `qa/serve-real-leftjoinindex.sh` proves it three ways with the
       `FC_NO_INDEX` twin: a 38-digit equality keys and scan-compares
       identically to the engine, a range past `i64`, and an OR mixing a
       wide and a small literal.
+
+      *And the PROJECTED wide literal describes INT128 now too* —
+      `SELECT 99999999999999999999` announced nothing (the select-list
+      parser capped at `i64` and REFUSED the statement). The RawExpr/Expr
+      literal carriers grew an `Int128(i128)` variant (the select-list
+      parser tries `i64` then `i128`); it evaluates to `Value::Int128` and
+      `rank_of` returns `NumRank::I128`, which flows through
+      `is_wide`→`result_width_bytes`==16→`exact_width_form` to
+      `(Wire::Int128, sqltype 32752, len 16)` - the same describe the
+      engine gives a magnitude between `i64::MAX` and `i128::MAX`. Adding
+      the variant cost three exhaustive `Expr` matches (`type_of`,
+      `rank_of`, `eval`) plus a few catch-all sites; the wire encoder
+      already sent `Value::Int128`. `qa/serve-real-numsubtype.sh` gates
+      the describe (i64::MAX+1, a 20-digit, and `i128::MAX` all
+      INT128/len-16) and the VALUE round-trip. Still refused: wide
+      arithmetic and a past-`i128` magnitude (DECFLOAT(34) - no `Value`
+      carrier exists, its own slice).
 
       *And the wide OUTER value came with it* — the probe's `band` capped
       an `Int128` driving value at `i64` and scanned; now it carries the

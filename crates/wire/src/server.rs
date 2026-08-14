@@ -31655,6 +31655,9 @@ enum RawExpr {
     /// `?` outside the projection refuses exactly as it did before.
     Param(usize),
     Int(i64),
+    /// an integer literal too WIDE for i64 (up to i128::MAX) - lowers to
+    /// [Expr::Int128] and describes INT128, as the engine does
+    Int128(i128),
     /// a decimal literal `d.dd`: (raw integer, scale) - `1.5` is
     /// `(15, -1)`, `1.50` is `(150, -2)` (trailing zeros count, as the
     /// engine's scale does)
@@ -32580,8 +32583,13 @@ fn expr_atom(b: &[char], pos: &mut usize) -> Option<RawExpr> {
                 let raw: i64 = digits.parse().ok()?;
                 return Some(RawExpr::Dec(raw, scale));
             }
-            let n: i64 = b[start..*pos].iter().collect::<String>().parse().ok()?;
-            Some(RawExpr::Int(n))
+            let text: String = b[start..*pos].iter().collect();
+            match text.parse::<i64>() {
+                Ok(n) => Some(RawExpr::Int(n)),
+                // a magnitude past i64 up to i128::MAX is an INT128
+                // literal; wider still is DECFLOAT, which stays refused
+                Err(_) => text.parse::<i128>().ok().map(RawExpr::Int128),
+            }
         }
         c if c.is_alphabetic() || *c == '_' || *c == '$' || *c == '"' => {
             let quoted = *c == '"';
@@ -32915,6 +32923,7 @@ fn raw_bad_substring_len(e: &RawExpr) -> Option<i64> {
             .or_else(|| else_.as_ref().and_then(|e| raw_bad_substring_len(e))),
         RawExpr::Col(_)
         | RawExpr::Int(_)
+        | RawExpr::Int128(_)
         | RawExpr::Dec(..)
         | RawExpr::Str(_)
         | RawExpr::Null
@@ -33623,6 +33632,7 @@ fn resolve_expr_inner(
             Expr::Col(fid)
         }
         RawExpr::Int(n) => Expr::Int(*n),
+        RawExpr::Int128(n) => Expr::Int128(*n),
         RawExpr::Dec(raw, scale) => Expr::Dec(*raw, *scale),
         RawExpr::Double(d) => Expr::Double(*d),
         RawExpr::Bool(b) => Expr::Bool(*b),
@@ -33718,6 +33728,13 @@ enum Expr {
     /// expression INT64, probed)
     GenVal(usize),
     Int(i64),
+    /// an integer literal too WIDE for i64 - a NUMERIC(38,0)/INT128
+    /// magnitude, up to i128::MAX. It evaluates to `Value::Int128` and
+    /// DESCRIBES as INT128 (`sqltype` 32752, len 16, scale 0), as the
+    /// engine describes a bare magnitude between i64::MAX and i128::MAX.
+    /// Past i128::MAX the engine describes DECFLOAT(34), which stays
+    /// refused (its own representation).
+    Int128(i128),
     /// a decimal literal: (raw integer, scale)
     Dec(i64, i8),
     /// an APPROXIMATE literal - what a string literal becomes when the
@@ -35433,7 +35450,7 @@ impl Expr {
                     None => temporal_kind(d).map(ExprType::Temporal),
                 }
             }
-            Expr::Int(_) => Some(ExprType::Int),
+            Expr::Int(_) | Expr::Int128(_) => Some(ExprType::Int),
             Expr::Dec(..) => Some(ExprType::Numeric),
             Expr::Double(_) => Some(ExprType::Approx),
             Expr::Bool(_) | Expr::Cond(_) => Some(ExprType::Bool),
@@ -35647,7 +35664,7 @@ impl Expr {
                     None
                 }
             }
-            Expr::Int(_) => Some(0),
+            Expr::Int(_) | Expr::Int128(_) => Some(0),
             Expr::Dec(_, scale) => Some(*scale),
             // a CAST states its own scale - that is what the target IS
             Expr::Cast(_, CastTarget::Numeric { scale, .. }) => Some(*scale),
@@ -35767,6 +35784,8 @@ impl Expr {
             } else {
                 NumRank::I64
             }),
+            // a magnitude past i64 announces INT128, as the engine does
+            Expr::Int128(_) => Some(NumRank::I128),
             Expr::Dec(raw, _) => Some(if i32::try_from(*raw).is_ok() {
                 NumRank::Long
             } else {
@@ -35983,6 +36002,7 @@ impl Expr {
                 v => v,
             },
             Expr::Int(n) => Value::Int(*n),
+            Expr::Int128(n) => Value::Int128(*n, 0),
             Expr::Dec(raw, scale) => Value::Scaled(*raw, *scale),
             Expr::Str(s) => Value::Text(s.clone()),
             Expr::Null => Value::Null,
@@ -39369,8 +39389,8 @@ fn default_expr_name(raw: &RawExpr) -> String {
             "CONSTANT"
         }
         RawExpr::Neg(_) => "",
-        RawExpr::Int(_) | RawExpr::Dec(..) | RawExpr::Double(_) | RawExpr::Str(_)
-        | RawExpr::Bool(_) | RawExpr::BareTrue | RawExpr::Null => "CONSTANT",
+        RawExpr::Int(_) | RawExpr::Int128(_) | RawExpr::Dec(..) | RawExpr::Double(_)
+        | RawExpr::Str(_) | RawExpr::Bool(_) | RawExpr::BareTrue | RawExpr::Null => "CONSTANT",
         // every boolean-valued expression is named BOOL, whatever
         // produced it - `B AND C`, `ID > 2`, `NOT B`, `B IS NULL`,
         // `ID BETWEEN 1 AND 2`, `ID IN (1, 2)` all describe as BOOL
@@ -44493,6 +44513,7 @@ fn expr_no_raise(e: &Expr, descs: &[Descriptor]) -> bool {
         Expr::Col(_)
         | Expr::GenVal(_)
         | Expr::Int(_)
+        | Expr::Int128(_)
         | Expr::Dec(..)
         | Expr::Double(_)
         | Expr::Bool(_)
