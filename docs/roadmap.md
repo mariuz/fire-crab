@@ -19,26 +19,63 @@ matters more than the row count:
 | **converted, wired** | `evt` | `POST_EVENT` posts into it, commits move its counters, and the delivery is CARRIED over the auxiliary connection - the paper's own `samples/nodejs/events.js` prints the same lines against fire-crab as against the engine (W5 done) |
 | **converted, wired** | `stmc` | the plan a statement resolves to is kept per attachment and dropped by DDL. It took moving the two prepare-time FOLDS to fetch first — a lone aggregate and a `GEN_ID` read were computed by the planner and carried in the plan, so a kept plan answered the same number for ever |
 | **wired** | `lck` | a writer that meets another transaction's uncommitted row waits on that transaction's own lock and then re-reads, and two waiting on each other are denied by the wait-for scan with the engine's `isc_deadlock` (W4) |
-| **being wired** | `opt`, `cch`, `pio` | the server asks `opt` for the access path and takes an index when it says so (W1); the pages of a file live once per process in `cch`'s buffer pool and are flushed in its careful write order (W2), and written with `pio`, in the open mode the header's Forced Writes flag calls for (W3) |
+| **converted, wired** | `opt`, `cch`, `pio` | the server asks `opt` for the access path and takes an index when it says so (W1 — equality, ranges, compound prefixes, text keys, ORDER BY navigation, the FK check, DML targets, the fold's input, the LEFT-join inner side and the join DRIVER); the pages of a file live once per process in `cch`'s buffer pool, are FETCHED one page at a time and flushed in its careful write order (W2), and written with `pio` in the open mode the header's Forced Writes flag calls for (W3) |
 
-That third row was the honest headline, and it is one crate long now:
-`crates/wire/Cargo.toml` depends on `-lck` as well as `-opt`, `-cch`
-and `-pio`; only `-evt` is still a conversion nothing calls. The optimizer's
-choice is executed rather than merely printed — for the one shape W1
-covers so far. The lock manager arbitrates the rows two transactions
-both want, and denies the cycle when they wait on each other. The page
-cache holds the file's pages once for every attachment, and flushes them
-in its careful order — what it does not do yet is hand them out one page
-at a time.
+That third row **is closed.** `crates/wire/Cargo.toml` depends on `-lck`
+as well as `-opt`, `-cch` and `-pio`; only `-evt` is a conversion the
+delivery path reaches without the running server linking a call site. The
+optimizer's choice is executed rather than merely printed, across every
+retrieval shape W1 has taken. The lock manager arbitrates the rows two
+transactions both want, and denies the cycle when they wait on each other.
+The page cache holds the file's pages once for every attachment, hands
+them out ONE PAGE AT A TIME (the per-page fetch flip — a page-addressed
+`ods::Image` of `Vec<Arc<[u8]>>`, so a write's cost is O(pages) end to
+end rather than O(file)), and flushes only the pages an Arc-identity diff
+says changed.
 
-And inside the SQL layer there is a second structural gap: the server
-answers views, CTEs and constant subqueries by **rewriting SQL text and
-re-planning it**, where the engine builds a tree of record sources. That
-approach has worked far better than it has any right to — but it is why
-a CTE body that GROUPs refused, why `FROM (SELECT ...)` did not exist,
-why `WITH RECURSIVE` could not work, and why a qualifier-stripping pass
-had to be taught not to reach inside a subquery. R1–R6 have closed all
-four; R7 is the removal of what they replaced.
+And inside the SQL layer the second structural gap **is closed too.** The
+server used to answer views, CTEs and constant subqueries by rewriting SQL
+text and re-planning it, where the engine builds a tree of record sources.
+That is why a CTE body that GROUPed refused, why `FROM (SELECT ...)` did
+not exist, why `WITH RECURSIVE` could not work, and why a qualifier-
+stripping pass had to be taught not to reach inside a subquery. R1–R6
+closed all four, R7 retired the rewriting they replaced (~870 lines gone),
+and R8 made the fetch PULL the tree rather than materialise a `Vec` — so
+`FIRST n` stops the scan and a raiser deep in a derived table delivers the
+rows before it.
+
+**So the two things this document was about are done — and so is the
+frontier the savepoint slice named after them.** Snapshot isolation is in:
+`op_transaction` parses the TPB (`parse_tpb` reads concurrency vs read
+committed, wait/nowait, lock-timeout and consistency), an explicit
+`isc_tpb_concurrency` captures a stable `ods::tra::Snapshot { limit,
+active }` whose `sees(tx)` decides every version's visibility, and the
+autonomous-block boundary the savepoint section closed with ("the outer
+transaction does not see its own block's commit") is a passing check now,
+gated by `serve-real-snapshot.sh`, `serve-real-concurrency.sh` and
+`serve-real-autonomous.sh`.
+
+What is left is no longer one headline chunk but a **short list of
+measured or pinned items**, each recorded in its own place below:
+
+- **cost** — the per-statement cost at HEAD is ~2.9 ms against the
+  engine's ~0.95 ms, and the residual is CPU-bound in an uncached
+  `catalog::relation_columns` walk (the metadata cache already took the
+  bulk; this is the same disease at the next call site);
+- **the optimizer's stale-statistics region** — statistics non-zero but
+  WRONG are unmeasured, needing their own fixture family (load,
+  `SET STATISTICS`, grow);
+- **the two R8 tails** — `NestedLoopJoin` still materialises for RIGHT and
+  FULL, and the fetch is a PUSH with a `Flow::Stop` rather than the
+  engine's row-by-row pull across the wire (observationally equal for
+  errors and early exit);
+- **the write-side refusals held on purpose** — a store that would
+  fragment across pages, the DDL patch sites that would rewrite a
+  fragmented record, transliteration between charsets, and the scattered
+  correctness boundaries each gate pins.
+
+The rest of this document records how the surface got here and every one
+of those boundaries.
 
 ## Measured gaps that are nobody's slice yet
 
@@ -1853,18 +1890,23 @@ it", which is a different risk profile from converting something new:
 the oracle already exists, so the gate is *behaviour must not change*
 plus *the subsystem is now on the path*.
 
-- **The optimizer's cost model has three further known gaps**, measured
-  by a fleet against the engine's own source and confirmed by sweeping
-  the crossover: `loop_cost` charges the index SCAN term against the
-  table's cardinality where the engine uses the index's PAGE count
-  (Retrieval.cpp:186-194), so a keyed loop looks roughly twice its true
-  cost; the driver's own natural scan is not charged at position 0
-  (InnerJoin.cpp:323); and only one hash arrangement is costed where the
-  engine takes the minimum over all of them. Between them the engine
-  crosses from HASH to a keyed loop at ~115 distinct inner values and
-  fcopt at ~441. None of these is a wrong ANSWER - they choose a slower
-  plan, not a different result - which is why they are recorded here
-  rather than fixed in a hurry.
+- ~~**The optimizer's cost model has three further known gaps**~~ —
+  *closed, on fresh statistics.* The three were: `loop_cost` charged the
+  index SCAN term against the table's cardinality where the engine uses
+  the index's PAGE count (Retrieval.cpp:186-194), so a keyed loop looked
+  roughly twice its true cost; the driver's own natural scan was not
+  charged at position 0 (InnerJoin.cpp:323); and only one hash arrangement
+  was costed where the engine takes the minimum over all of them. All
+  three are in the crate now (`index_pages` is the page-count term,
+  `loop_cost` charges the row term ONCE through it, `hash_cost` carries
+  the `MINIMUM_CARDINALITY` cap on a unique hashed side), together with
+  the `DEFAULT_SELECTIVITY = 0.1` substitution and the removal of the
+  stale-statistics guard — both fresh and stale 169-cell grids score
+  169/169 with zero refusals (opt slices 7-9 + the selectivity, grid-hole
+  and guard fixes). The residual is the **stale region** (statistics
+  non-zero but WRONG): still unmeasured, because it needs its own fixture
+  family (load, `SET STATISTICS`, then grow the table) — recorded under
+  "Measured gaps" above, not here.
 
 - **W1 — index-driven retrieval.** *(equality, ranges, compound prefixes, text keys, the fold's input, ORDER BY navigation, the FK check and DML targets done)* The first
   slice that put a converted subsystem on the running server's path.
@@ -3448,12 +3490,26 @@ writing outside it, so the limit fails closed. On an 8 KB page that is
 some 32,000 ids, which no gate approaches; a workload that opens a
 savepoint per statement would.
 
-**What it opens.** Snapshot isolation is now the interesting gap rather
-than an impossible one: a reader that counts a SET of transactions is one
-step from a reader that counts *the set as of a moment*, which is what
-`serve-real-autonomous.sh`'s last recorded boundary (the outer
-transaction reading what the block committed: engine 0, fire-crab 1) is
-waiting on. It also needs the TPB parsed, which nothing does yet.
+**What it opened, and what then walked through.** Snapshot isolation was
+the interesting gap the moment a reader counted a SET of transactions —
+one step from a reader that counts *the set as of a moment* — and that
+step is TAKEN. `op_transaction` parses the TPB, an explicit
+`isc_tpb_concurrency` (the engine's and isql's default) captures a stable
+`ods::tra::Snapshot`, and the visibility readers (`visible_version_2pc`,
+`visible_exists_2pc`, `visible_rows_2pc`) take it: a version is visible iff
+its transaction was committed as of the snapshot's start. That closed
+`serve-real-autonomous.sh`'s last recorded boundary — the outer
+transaction reading what its own block committed, engine 0 and now
+fire-crab 0 too — and read committed, wait/nowait, lock-timeout and
+`isc_tpb_consistency` (degree-3 table stability) came with it.
+`serve-real-snapshot.sh` and `serve-real-concurrency.sh` gate the stable
+view directly.
+
+*Still waiting on more than a snapshot*: a reader that counts the set as
+of a moment does not by itself give the engine's every concurrency
+answer — two concurrent writers of the SAME row, the update-conflict
+timing, and the OIT/OAT bookkeeping `gstat -h` reads are their own
+measured slices, pinned where each gate meets them.
 
 ## How these slices are gated
 
