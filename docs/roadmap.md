@@ -80,8 +80,19 @@ measured or pinned items**, each recorded in its own place below:
   unchanged (nothing to prune). This is where COLUMN PRUNING — decoding
   only the read fields — failed at 2%, because the decode was never the
   cost; the decompression was. What is left is the fundamental decompress
-  of the columns actually read and the wire, both of which the engine
-  pays too;
+  of the columns actually read and the WIRE ENCODE, and the wire encode
+  was measured too: on a wide `SELECT` shipping eight VARCHARs it is
+  ~0.76 µs per string column, but that is byte-shipping, not redundancy —
+  removing `render()`'s String clone and short-circuiting
+  `enforce_out_capacity` each moved it ~0% (Rust's allocator makes a small
+  String clone free against the copy and the send). fire-crab is ~1.6× the
+  engine on such a scan (80 vs 50 ms for 3,000 wide rows), and the gap is
+  the batch MATERIALISATION — the whole cursor is collected into a
+  `Vec<Vec<Value>>` before a byte is encoded, so every value is copied
+  through decode → project → `Plan::Rows` → encode. Closing that is
+  STREAMING the cursor (R8's remaining "the fetch pulls the tree" step, a
+  PUSH with `Flow::Stop` today), an architectural change, not a residual to
+  shave in the encoder;
 - **the optimizer's stale-statistics region** — statistics non-zero but
   WRONG are unmeasured, needing their own fixture family (load,
   `SET STATISTICS`, grow);
@@ -316,8 +327,28 @@ of those boundaries.
   29, `savepointtx` 30, `snapshot`/`concurrency`/`autonomous`, `diff-mvcc`,
   all 0 DIFF), with `sqz::unpack_prefix` and the ods decode unit-tested.
   This is where COLUMN PRUNING's 2% went: the decode was never the cost;
-  the decompression was. The rest — decompressing the columns actually
-  read and the XDR encode — is the fundamental work the engine does too.
+  the decompression was.
+
+  The XDR ENCODE was measured next, and it is fundamental. Isolated (two
+  scans that decompress the SAME whole record but ship a different number
+  of strings), shipping one 190-byte VARCHAR costs ~0.76 µs — but that is
+  byte-shipping, and the two obvious redundancies are not: removing
+  `render()`'s String clone in the row encoder (a value that IS text can
+  go straight to the wire) moved a wide `SELECT` ~0%, and short-circuiting
+  `enforce_out_capacity` (which `render()`s and `chars().count()`s each
+  string) moved it ~0% too — a small String clone is free against the copy
+  into the send buffer and the send itself. Both were reverted; neither
+  earned its churn. fire-crab is ~1.6× the engine here (80 vs 50 ms for
+  3,000 wide rows), and that gap is not the encoder but the batch
+  MATERIALISATION: the cursor is collected whole into a `Vec<Vec<Value>>`
+  (the documented deadlock-avoidance shape) before any byte is encoded, so
+  every value is copied through decode → project → `Plan::Rows` → encode
+  and the whole result set is held at once. Closing it is STREAMING the
+  cursor — R8's remaining step, the fetch pulling the tree row by row
+  across the wire rather than materialising, today a PUSH with `Flow::Stop`
+  — an architectural change with its own gate story, not a shave in the
+  encoder. The rest — decompressing the columns actually read and shipping
+  their bytes — is the fundamental work the engine does too.
 
 - **169/169 does NOT mean the cost model is right everywhere the guard
   used to refuse.** On a stale UNIQUE/PK index there is a structural miss
