@@ -27976,6 +27976,14 @@ fn value_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
             &fire_crab_ods::decfloat::decode_dec128(*x),
             &fire_crab_ods::decfloat::decode_dec128(*y),
         ),
+        // a DECFLOAT value against ANY exact numeric (or the two widths
+        // mixed): both promote to decimal128 and compare there - what an
+        // arithmetic result (`df + 1 > 5`) needs on a WHERE side
+        (Value::DecFloat34(_) | Value::DecFloat16(_), _) | (_, Value::DecFloat34(_) | Value::DecFloat16(_))
+            if value_as_dec(a).is_some() && value_as_dec(b).is_some() =>
+        {
+            fire_crab_ods::decfloat::cmp(&value_as_dec(a).unwrap(), &value_as_dec(b).unwrap())
+        }
         // APPROXIMATE values compare as f64 whatever their widths, and
         // against an exact value the exact side converts - the engine's
         // promotion. Without these arms the pair fell to the
@@ -44891,10 +44899,19 @@ fn resolve_expr_term(
     fn cond_types(c: &Cond2, descs: &[Descriptor]) -> Option<()> {
         match c {
             Cond2::Cmp(a, _, b) => {
-                a.type_of(descs)?;
-                b.type_of(descs)?;
+                // a DECFLOAT arithmetic side has no ExprType but is a valid
+                // decimal comparison (cmp_sides vetted the pairing)
+                if !(is_decfloat_arith(a, descs) || is_decfloat_arith(b, descs)) {
+                    a.type_of(descs)?;
+                    b.type_of(descs)?;
+                }
             }
-            Cond2::IsNull(a) | Cond2::IsNotNull(a) | Cond2::Like(a, ..) => {
+            Cond2::IsNull(a) | Cond2::IsNotNull(a) => {
+                if !is_decfloat_arith(a, descs) {
+                    a.type_of(descs)?;
+                }
+            }
+            Cond2::Like(a, ..) => {
                 a.type_of(descs)?;
             }
             Cond2::Not(inner) => cond_types(inner, descs)?,
@@ -44943,6 +44960,16 @@ fn cmp_sides(lhs: Expr, rhs: Expr, descs: &[Descriptor]) -> Option<(Expr, Expr)>
     // cost a `NOT IN (SELECT ...)` whose inner set held a NULL.)
     if matches!(lhs, Expr::Null) || matches!(rhs, Expr::Null) {
         return Some((lhs, rhs));
+    }
+    // a DECFLOAT arithmetic side (`df + 1 > 5`) has no ExprType of its own -
+    // it compares in decimal128. The other side must be exact-numeric (an
+    // int/NUMERIC/DECFLOAT expression); value_cmp does the decimal compare.
+    if is_decfloat_arith(&lhs, descs) || is_decfloat_arith(&rhs, descs) {
+        let numeric = |e: &Expr| {
+            is_decfloat_arith(e, descs)
+                || matches!(e.type_of(descs), Some(ExprType::Int | ExprType::Numeric))
+        };
+        return if numeric(&lhs) && numeric(&rhs) { Some((lhs, rhs)) } else { None };
     }
     let (lt, rt) = (lhs.type_of(descs)?, rhs.type_of(descs)?);
     let coerce = |k: TKind, e: &Expr| -> Option<Expr> {

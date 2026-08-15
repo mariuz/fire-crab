@@ -2441,10 +2441,24 @@ plus *the subsystem is now on the path*.
       22012, a new `EvalErr` emitted alone), `0/0` the invalid-operation
       22000 - both probed and matched. `is_decfloat_arith` and the eval
       branch now take `/`. Gated (numericwhere +6): column/int/decimal/
-      nested quotients and the `x/0` SQLSTATE. Still refused deliberately:
-      DECFLOAT arithmetic on a WHERE side, `CAST(x AS DECFLOAT)` (which is
-      why a `0/0` LITERAL still refuses at prepare - the CAST does, not the
-      division), and a value past DECFLOAT(34) range.
+      nested quotients and the `x/0` SQLSTATE.
+
+      *And the WHERE side came along* - `WHERE df + 1 > 5` had refused at
+      TWO type gates, both keyed on `type_of` (None for a DECFLOAT
+      arithmetic expression): `cmp_sides` (which pairs a comparison's sides)
+      and the `cond_types` re-check `resolve_expr_term` runs on the built
+      term. Both now recognise a DECFLOAT-arithmetic side
+      (`is_decfloat_arith`) and let it through when the other side is
+      exact-numeric; `value_cmp` grew a mixed arm so a DECFLOAT value
+      against any exact numeric (or the two widths) promotes both to
+      decimal128 (`value_as_dec`) and compares with `decfloat::cmp` - which
+      is what the `Cond2::Cmp` eval falls back to. All four operators,
+      column/literal/expression right sides, `IS [NOT] NULL`, negation and
+      AND-composition ride it; a NaN from the arithmetic still traps at eval
+      before the compare. Gated (numericwhere +10). Still refused
+      deliberately: `CAST(x AS DECFLOAT)` (which is why a `0/0` LITERAL
+      still refuses at prepare - the CAST does, not the division), and a
+      value past DECFLOAT(34) range.
 
       *And the wide OUTER value came with it* — the probe's `band` capped
       an `Int128` driving value at `i64` and scanned; now it carries the

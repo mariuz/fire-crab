@@ -411,6 +411,18 @@ dfsqlstate() { # <label> <expr>
     check "decfloat div-by-0 $1 [$2]" "$fc" "$en"
 }
 dfsqlstate "x / 0"  "D / 0"
+# DECFLOAT arithmetic on a WHERE side: the arithmetic result compares in
+# decimal128 (row 6 of DF2 is +Infinity, an ordered operand - no NaN trap).
+predf "arith D+1 > 5"    "D + 1 > 5"
+predf "arith D*2 = 200"  "D * 2 = 200"
+predf "arith D/2 < 1"    "D / 2 < 1"
+predf "arith -D > 0"     "-D > 0"
+predf "arith col + col"  "D + S > 200"
+predf "arith D16 * 3"    "S * 3 = 300"
+predf "arith cmp col"    "D + 1 > S"
+predf "arith AND classic" "D * 2 > 5 AND ID > 0"
+predf "arith IS NULL"    "D + 1 IS NULL"
+predf "arith IS NOT NULL" "D + 1 IS NOT NULL"
 
 # the LIKE/STARTING pattern `?` slot on a NUMERIC column describes as a
 # FIXED VARYING(30) - the engine's numeric-to-text render width, NOT the
