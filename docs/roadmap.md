@@ -2391,8 +2391,29 @@ plus *the subsystem is now on the path*.
       lit the whole surface. Gated (wherexpr +9): concat `=`/LIKE/STARTING,
       two-column and multi-`||` (left-assoc), literal-first, concat with a
       CAST, and NULL propagation (`NULL||x` is NULL). Still refused
-      deliberately: DECFLOAT in arithmetic / nested, the `Infinity`/`NaN`
-      text-literal specials, and a value past DECFLOAT(34) range.
+      deliberately: DECFLOAT in arithmetic / nested, and a value past
+      DECFLOAT(34) range.
+
+      *And the `Infinity`/`NaN` TEXT SPECIALS converted* - the boundary the
+      DECFLOAT text-literal slice noted: decNumber accepts `inf`/`infinity`
+      and `nan`/`snan` (case-insensitive, an optional sign, a NaN payload of
+      digits), and the engine converts them where fire-crab had raised
+      22018. `encode_dec128_special` builds the decimal128 `±Infinity`
+      (combination `11110`) and `NaN` (`11111`) bits; `text_to_dec128`
+      recognises the spellings (trailing junk like `Infinityx` still falls
+      through to 22018). An Infinity is a normal ORDERED value
+      (`decfloat::cmp` ranks it, `DF > '0'` takes it, `DF = 'Infinity'`
+      finds it); a NaN TRAPS the comparison (SQLSTATE 22000) on any non-NULL
+      row - the same `EvalErr::DecfloatInvalidOperation` the column-NaN uses,
+      now also fired when the LITERAL decodes NaN. Both the literal and the
+      text-parameter paths inherit it (`text_to_dec128` is shared). Gated
+      (numericwhere +9): the Infinity conversions and ordering, the `NaN`/
+      `nan`/`sNaN` traps, and the junk refusal. One wording nuance recorded:
+      the engine prepends a `decfloat_invalid_operation` line to the *22018
+      message* of a malformed special (`Infinityx`); the SQLSTATE matches,
+      the extra line does not, an exotic-input boundary. Still refused
+      deliberately: DECFLOAT in arithmetic / nested, and a value past
+      DECFLOAT(34) range.
 
       *And the wide OUTER value came with it* — the probe's `band` capped
       an `Int128` driving value at `i64` and scanned; now it carries the

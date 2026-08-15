@@ -6673,15 +6673,20 @@ impl Term {
             // stored DECFLOAT decoded), decfloat::cmp orders them.
             Term::NumCmp(fid, op, Rhs::DecFloat34(bits)) => match values.get(*fid) {
                 Some(v) => match value_as_dec(v) {
-                    // a NaN column value: the engine TRAPS per row (probed),
-                    // it is not UNKNOWN - so raise, not skip
+                    // a NaN on EITHER side traps per row (probed), it is not
+                    // UNKNOWN - so raise, not skip. The column NaN is caught
+                    // here; a NaN LITERAL (the `'NaN'` text form) is caught
+                    // once the row is known non-NULL, below.
                     Some(fire_crab_ods::decfloat::Dec::Nan) => {
                         return Err(EvalErr::DecfloatInvalidOperation)
                     }
-                    Some(d) => Some(ord_ok(
-                        fire_crab_ods::decfloat::cmp(&d, &fire_crab_ods::decfloat::decode_dec128(*bits)),
-                        *op,
-                    )),
+                    Some(d) => {
+                        let lit = fire_crab_ods::decfloat::decode_dec128(*bits);
+                        if matches!(lit, fire_crab_ods::decfloat::Dec::Nan) {
+                            return Err(EvalErr::DecfloatInvalidOperation);
+                        }
+                        Some(ord_ok(fire_crab_ods::decfloat::cmp(&d, &lit), *op))
+                    }
                     None => None,
                 },
                 None => None,
@@ -34660,6 +34665,22 @@ fn text_to_dec128(s: &str) -> Option<u128> {
         }
         _ => false,
     };
+    // the decNumber specials (probed): `inf`/`infinity` is ±Infinity - a
+    // normal ordered value in a comparison - and `nan`/`snan` (with an
+    // optional payload of digits) is a NaN, which TRAPS the comparison
+    // (SQLSTATE 22000, handled at [Term::matches]). Case-insensitive;
+    // anything trailing (`Infinityx`) falls through and raises 22018.
+    {
+        let rest = s[i..].to_ascii_lowercase();
+        if rest == "inf" || rest == "infinity" {
+            return Some(fire_crab_ods::decfloat::encode_dec128_special(neg, false));
+        }
+        if let Some(payload) = rest.strip_prefix("snan").or_else(|| rest.strip_prefix("nan")) {
+            if payload.bytes().all(|c| c.is_ascii_digit()) {
+                return Some(fire_crab_ods::decfloat::encode_dec128_special(neg, true));
+            }
+        }
+    }
     let mut digits: Vec<u8> = Vec::new();
     let mut seen_dot = false;
     let mut frac: i64 = 0;
@@ -50759,16 +50780,24 @@ mod tests {
         assert_eq!(r("05").as_deref(), Some("5"));
         assert_eq!(r("100").as_deref(), Some("100"));
         // NOT convertible (the caller raises 22018): surrounding/interior
-        // space, letters, empty, a second dot, and - a noted boundary - the
-        // decNumber specials
+        // space, letters, empty, a second dot, junk after a special
         assert_eq!(text_to_dec128(" 1.5 "), None);
         assert_eq!(text_to_dec128("1 5"), None);
         assert_eq!(text_to_dec128("abc"), None);
         assert_eq!(text_to_dec128(""), None);
         assert_eq!(text_to_dec128("1.5.5"), None);
         assert_eq!(text_to_dec128("1.5e"), None); // exponent with no digits
-        assert_eq!(text_to_dec128("Infinity"), None);
-        assert_eq!(text_to_dec128("NaN"), None);
+        assert_eq!(text_to_dec128("Infinityx"), None); // trailing junk
+        // the decNumber SPECIALS convert (case-insensitive, optional sign,
+        // NaN with an optional payload) - `inf`/`infinity` to ±Infinity, a
+        // normal ordered value, `nan`/`snan` to a NaN that traps at compare
+        use fire_crab_ods::decfloat::{decode_dec128, Dec};
+        assert!(matches!(decode_dec128(text_to_dec128("Infinity").unwrap()), Dec::Infinity { neg: false }));
+        assert!(matches!(decode_dec128(text_to_dec128("inf").unwrap()), Dec::Infinity { neg: false }));
+        assert!(matches!(decode_dec128(text_to_dec128("-INF").unwrap()), Dec::Infinity { neg: true }));
+        assert!(matches!(decode_dec128(text_to_dec128("NaN").unwrap()), Dec::Nan));
+        assert!(matches!(decode_dec128(text_to_dec128("snan").unwrap()), Dec::Nan));
+        assert!(matches!(decode_dec128(text_to_dec128("NaN0").unwrap()), Dec::Nan));
     }
 
     fn desc(dt: u8, len: u16, scale: i8) -> Descriptor {

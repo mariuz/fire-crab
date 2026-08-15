@@ -401,6 +401,17 @@ pub fn round_to_dec16(neg: bool, coeff: u128, exp: i32) -> Dec {
     Dec::Finite { neg, coeff: c, exp: e }
 }
 
+/// The decimal128 bits of a SPECIAL value: `±Infinity` or `NaN`, the
+/// forms decNumber's string grammar accepts as `inf`/`infinity`/`nan`/
+/// `snan`. The combination field alone carries them - `11110` is infinity,
+/// `11111` NaN ([combination]/[decode_dec128]); the coefficient and
+/// exponent are unread. (sNaN vs NaN is not distinguished: [decode_dec128]
+/// collapses both to [Dec::Nan], and either traps a comparison the same.)
+pub fn encode_dec128_special(neg: bool, nan: bool) -> u128 {
+    let comb: u128 = if nan { 0b11111 } else { 0b11110 };
+    ((neg as u128) << 127) | (comb << 122)
+}
+
 /// Re-express a DECFLOAT(34) value (its decimal128 bits) as a DECFLOAT(16)
 /// (decimal64 bits), rounding to 16 significant digits HALF-UP. `None` for
 /// a non-finite value (Infinity/NaN) - a literal is never one, so this only
@@ -571,6 +582,20 @@ mod tests {
             r(false, "99999999999999999999999999999999999999999"),
             "1.000000000000000000000000000000000E+41"
         );
+    }
+
+    #[test]
+    fn encode_dec128_special_decodes_back() {
+        assert!(matches!(
+            decode_dec128(encode_dec128_special(false, false)),
+            Dec::Infinity { neg: false }
+        ));
+        assert!(matches!(
+            decode_dec128(encode_dec128_special(true, false)),
+            Dec::Infinity { neg: true }
+        ));
+        assert!(matches!(decode_dec128(encode_dec128_special(false, true)), Dec::Nan));
+        assert!(matches!(decode_dec128(encode_dec128_special(true, true)), Dec::Nan));
     }
 
     #[test]

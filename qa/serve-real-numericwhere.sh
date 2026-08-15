@@ -297,6 +297,19 @@ SQL
 convraise "bad text"   "D = 'abc'"
 convraise "spaced num" "D = ' 1.5 '"
 convraise "empty text" "D = ''"
+# the decNumber SPECIALS: `inf`/`infinity` (case-insensitive, optional
+# sign) converts to a ±Infinity that ORDERS in a comparison (row 6 of DF2
+# is +Infinity); `nan`/`snan` converts to a NaN that TRAPS (22000).
+predf "text Infinity"   "D = 'Infinity'"
+predf "text inf lower"  "D = 'inf'"
+predf "text +INF"       "D = '+INF'"
+predf "col < Infinity"  "D < 'Infinity'"
+predf "col > finite"    "D > '0'"
+convraise "special junk" "D = 'Infinityx'"
+# `= 'NaN'` traps on any non-NULL row (DFNAN has one), like a NaN column
+raisef "text NaN"   "D = 'NaN'"
+raisef "text nan"   "D = 'nan'"
+raisef "text sNaN"  "D = 'sNaN'"
 
 # a `?` parameter against a DECFLOAT column: the input slot describes
 # DECFLOAT(34) len 16 and the driver's value promotes to decimal128 - an
