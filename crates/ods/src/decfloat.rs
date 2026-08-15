@@ -401,6 +401,189 @@ pub fn round_to_dec16(neg: bool, coeff: u128, exp: i32) -> Dec {
     Dec::Finite { neg, coeff: c, exp: e }
 }
 
+// --- decimal arithmetic on decoded values -------------------------------
+// Digit-string big-decimal (MSD-first ASCII, no leading zeros, "0" = zero):
+// exact, then rounded to 34 significant digits HALF-UP - the engine's
+// DecimalContext rounding (probed). A 34x34 multiply overflows every fixed
+// integer, so the coefficients are carried as digit strings.
+
+fn strip0(mut d: Vec<u8>) -> Vec<u8> {
+    let nz = d.iter().position(|&c| c != b'0').unwrap_or(d.len() - 1);
+    d.drain(..nz);
+    d
+}
+fn ucmp(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+    a.len().cmp(&b.len()).then_with(|| a.cmp(b))
+}
+fn uadd(a: &[u8], b: &[u8]) -> Vec<u8> {
+    let mut r = Vec::new();
+    let mut carry = 0u8;
+    let (mut i, mut j) = (a.len(), b.len());
+    while i > 0 || j > 0 || carry > 0 {
+        let x = if i > 0 { i -= 1; a[i] - b'0' } else { 0 };
+        let y = if j > 0 { j -= 1; b[j] - b'0' } else { 0 };
+        let s = x + y + carry;
+        r.push(b'0' + s % 10);
+        carry = s / 10;
+    }
+    r.reverse();
+    strip0(r)
+}
+fn usub(a: &[u8], b: &[u8]) -> Vec<u8> {
+    // requires a >= b
+    let mut r = Vec::new();
+    let mut borrow = 0i8;
+    let (mut i, mut j) = (a.len(), b.len());
+    while i > 0 {
+        i -= 1;
+        let x = (a[i] - b'0') as i8;
+        let y = if j > 0 { j -= 1; (b[j] - b'0') as i8 } else { 0 };
+        let mut d = x - y - borrow;
+        if d < 0 { d += 10; borrow = 1; } else { borrow = 0; }
+        r.push(b'0' + d as u8);
+    }
+    r.reverse();
+    strip0(r)
+}
+fn umul(a: &[u8], b: &[u8]) -> Vec<u8> {
+    if a == b"0" || b == b"0" {
+        return vec![b'0'];
+    }
+    let mut acc = vec![0u32; a.len() + b.len()];
+    for (i, &x) in a.iter().rev().enumerate() {
+        for (j, &y) in b.iter().rev().enumerate() {
+            acc[i + j] += (x - b'0') as u32 * (y - b'0') as u32;
+        }
+    }
+    let mut out = Vec::new();
+    let mut carry = 0u32;
+    for v in &acc {
+        let s = v + carry;
+        out.push(b'0' + (s % 10) as u8);
+        carry = s / 10;
+    }
+    while carry > 0 {
+        out.push(b'0' + (carry % 10) as u8);
+        carry /= 10;
+    }
+    out.reverse();
+    strip0(out)
+}
+/// Round MSD-first digits to at most 34 significant, HALF-UP; returns the
+/// kept digits and how many places were dropped (added to the exponent).
+fn round34(d: &[u8]) -> (Vec<u8>, i64) {
+    if d.len() <= 34 {
+        return (d.to_vec(), 0);
+    }
+    let mut drop = (d.len() - 34) as i64;
+    let mut kept = d[..34].to_vec();
+    if d[34] >= b'5' {
+        kept = uadd(&kept, b"1");
+        if kept.len() > 34 {
+            // carried to 35 digits (all-nines): renormalise
+            let extra = kept.len() - 34;
+            kept.truncate(34);
+            drop += extra as i64;
+        }
+    }
+    (kept, drop)
+}
+fn digits_u128(d: &[u8]) -> u128 {
+    d.iter().fold(0u128, |m, &c| m * 10 + (c - b'0') as u128)
+}
+/// (sign, coefficient digits MSD-first, exponent) of a finite value.
+fn parts(d: &Dec) -> (bool, Vec<u8>, i64) {
+    if let Dec::Finite { neg, coeff, exp } = d {
+        (*neg, coeff.to_string().into_bytes(), *exp as i64)
+    } else {
+        unreachable!("parts on a non-finite Dec")
+    }
+}
+fn finite(neg: bool, digits: Vec<u8>, exp: i64) -> Dec {
+    let d = strip0(digits);
+    let coeff = digits_u128(&d);
+    // a zero result normalises to +0 at the working exponent
+    let neg = if coeff == 0 { false } else { neg };
+    Dec::Finite { neg, coeff, exp: exp.clamp(i32::MIN as i64, i32::MAX as i64) as i32 }
+}
+
+/// Encode a computed [Dec] back to its decimal128 bits.
+pub fn dec_to_bits(d: &Dec) -> u128 {
+    match d {
+        Dec::Finite { neg, coeff, exp } => encode_dec128(*neg, *coeff, *exp),
+        Dec::Infinity { neg } => encode_dec128_special(*neg, false),
+        Dec::Nan => encode_dec128_special(false, true),
+    }
+}
+
+/// Negate: flips the sign of a finite value or an Infinity (NaN stays NaN).
+pub fn negate(d: &Dec) -> Dec {
+    match d {
+        Dec::Finite { neg, coeff, exp } => Dec::Finite { neg: *coeff != 0 && !*neg, coeff: *coeff, exp: *exp },
+        Dec::Infinity { neg } => Dec::Infinity { neg: !*neg },
+        Dec::Nan => Dec::Nan,
+    }
+}
+
+/// `a + b`, to 34 significant digits HALF-UP. `Infinity + -Infinity` is NaN
+/// (an invalid operation, which the caller traps); every other special
+/// propagates as decNumber does.
+pub fn add(a: &Dec, b: &Dec) -> Dec {
+    match (a, b) {
+        (Dec::Nan, _) | (_, Dec::Nan) => return Dec::Nan,
+        (Dec::Infinity { neg: x }, Dec::Infinity { neg: y }) => {
+            return if x == y { Dec::Infinity { neg: *x } } else { Dec::Nan };
+        }
+        (Dec::Infinity { neg }, _) | (_, Dec::Infinity { neg }) => return Dec::Infinity { neg: *neg },
+        _ => {}
+    }
+    let (na, ca, ea) = parts(a);
+    let (nb, cb, eb) = parts(b);
+    let e = ea.min(eb);
+    let mut da = ca;
+    da.extend(std::iter::repeat(b'0').take((ea - e) as usize));
+    let mut db = cb;
+    db.extend(std::iter::repeat(b'0').take((eb - e) as usize));
+    let (sign, mag) = if na == nb {
+        (na, uadd(&da, &db))
+    } else {
+        match ucmp(&da, &db) {
+            std::cmp::Ordering::Greater => (na, usub(&da, &db)),
+            std::cmp::Ordering::Less => (nb, usub(&db, &da)),
+            std::cmp::Ordering::Equal => (false, vec![b'0']),
+        }
+    };
+    let (kept, drop) = round34(&mag);
+    finite(sign, kept, e + drop)
+}
+
+/// `a - b`.
+pub fn sub(a: &Dec, b: &Dec) -> Dec {
+    add(a, &negate(b))
+}
+
+/// `a * b`, to 34 significant digits HALF-UP.
+pub fn mul(a: &Dec, b: &Dec) -> Dec {
+    let zero = |d: &Dec| matches!(d, Dec::Finite { coeff: 0, .. });
+    match (a, b) {
+        (Dec::Nan, _) | (_, Dec::Nan) => return Dec::Nan,
+        // Infinity * 0 is an invalid operation (NaN)
+        (Dec::Infinity { .. }, x) | (x, Dec::Infinity { .. }) if zero(x) => return Dec::Nan,
+        (Dec::Infinity { neg: x }, Dec::Infinity { neg: y }) => {
+            return Dec::Infinity { neg: x != y };
+        }
+        (Dec::Infinity { neg }, Dec::Finite { neg: f, .. })
+        | (Dec::Finite { neg: f, .. }, Dec::Infinity { neg }) => {
+            return Dec::Infinity { neg: neg != f };
+        }
+        _ => {}
+    }
+    let (na, ca, ea) = parts(a);
+    let (nb, cb, eb) = parts(b);
+    let (kept, drop) = round34(&umul(&ca, &cb));
+    finite(na != nb, kept, ea + eb + drop)
+}
+
 /// The decimal128 bits of a SPECIAL value: `±Infinity` or `NaN`, the
 /// forms decNumber's string grammar accepts as `inf`/`infinity`/`nan`/
 /// `snan`. The combination field alone carries them - `11110` is infinity,
@@ -582,6 +765,36 @@ mod tests {
             r(false, "99999999999999999999999999999999999999999"),
             "1.000000000000000000000000000000000E+41"
         );
+    }
+
+    #[test]
+    fn decimal_arithmetic_matches_the_engine() {
+        // render helpers over the decoded/computed values
+        let d = |neg, coeff, exp| Dec::Finite { neg, coeff, exp };
+        let s = |x: &Dec| to_string(x);
+        // 1.5 + 1 = 2.5 (cohort: result exp -1)
+        assert_eq!(s(&add(&d(false, 15, -1), &d(false, 1, 0))), "2.5");
+        // 1.5 * 2 = 3.0 (exp -1, trailing zero kept)
+        assert_eq!(s(&mul(&d(false, 15, -1), &d(false, 2, 0))), "3.0");
+        // 1.5 + 2.5 = 4.0
+        assert_eq!(s(&add(&d(false, 15, -1), &d(false, 25, -1))), "4.0");
+        // 1.5 - 2.5 = -1.0
+        assert_eq!(s(&sub(&d(false, 15, -1), &d(false, 25, -1))), "-1.0");
+        // -1.5
+        assert_eq!(s(&negate(&d(false, 15, -1))), "-1.5");
+        // opposite-sign add that cancels to zero
+        assert_eq!(s(&add(&d(false, 5, 0), &d(true, 5, 0))), "0");
+        // HALF-UP at the 34-sig boundary: 34 twos + 0.5 -> ...2223 (probed)
+        let twos: u128 = "2222222222222222222222222222222222".parse().unwrap();
+        assert_eq!(s(&add(&d(false, twos, 0), &d(false, 5, -1))), "2222222222222222222222222222222223");
+        // a 34x34 multiply that overflows any integer, rounded to 34 sig
+        let big: u128 = "9999999999999999999999999999999999".parse().unwrap(); // 34 nines
+        // 34-nines squared = 10^68 - 2e34 + 1 -> 34 sig ...998 (probed engine)
+        assert_eq!(s(&mul(&d(false, big, 0), &d(false, big, 0))), "9.999999999999999999999999999999998E+67");
+        // Infinity arithmetic
+        assert!(matches!(add(&Dec::Infinity { neg: false }, &d(false, 1, 0)), Dec::Infinity { neg: false }));
+        assert!(matches!(add(&Dec::Infinity { neg: false }, &Dec::Infinity { neg: true }), Dec::Nan));
+        assert!(matches!(mul(&Dec::Infinity { neg: false }, &d(false, 0, 0)), Dec::Nan));
     }
 
     #[test]

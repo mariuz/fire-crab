@@ -2411,8 +2411,27 @@ plus *the subsystem is now on the path*.
       `nan`/`sNaN` traps, and the junk refusal. One wording nuance recorded:
       the engine prepends a `decfloat_invalid_operation` line to the *22018
       message* of a malformed special (`Infinityx`); the SQLSTATE matches,
-      the extra line does not, an exotic-input boundary. Still refused
-      deliberately: DECFLOAT in arithmetic / nested, and a value past
+      the extra line does not, an exotic-input boundary.
+
+      *And DECFLOAT ARITHMETIC arrived (`+`/`-`/`*`, unary `-`)* - fc had
+      refused any DECFLOAT operand in an expression. `ods::decfloat` gained
+      a digit-string big-decimal engine (`add`/`sub`/`mul`/`negate`): exact
+      then rounded to 34 significant digits HALF-UP (probed:
+      `…2222 + 0.5 → …2223` rounds up off an even digit), the coefficients
+      carried as strings so a 34x34 multiply needs no wide integer, with
+      `Infinity`/`NaN` propagation (`Inf − Inf` and `Inf × 0` are NaN). The
+      wire side: `resolve_expr_inner` now lets a DECFLOAT column into an
+      expression; `eval` computes a `Bin`/`Neg` with a DECFLOAT operand in
+      decimal (a NaN result traps 22000); and `build_expr_col_from`
+      short-circuits an arithmetic tree with a DECFLOAT leaf
+      (`is_decfloat_arith`) to the DECFLOAT(34) wire form - any DECFLOAT
+      operand promotes the whole result, even `D16 * 2` and a `NUMERIC` mix,
+      probed. The cohort rides through (`1.5 * 2` is `3.0`, `1.5 + 1` is
+      `2.5`). Gated (numericwhere +11): value AND describe for int/decimal/
+      column/nested operands over DECFLOAT(34) and DECFLOAT(16). Still
+      refused deliberately: DECFLOAT DIVISION (its exponent/cohort is
+      decNumber's `decDivide`, a later slice - fc refuses `/`, the engine
+      computes it), DECFLOAT arithmetic in a WHERE side, and a value past
       DECFLOAT(34) range.
 
       *And the wide OUTER value came with it* — the probe's `band` capped

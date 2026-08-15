@@ -362,6 +362,40 @@ dfparam "LIKE pat"     "D LIKE ?"          '["1%"]'
 dfparam "LIKE sci"     "D LIKE ?"          '["%E+38"]'
 dfparam "STARTING pat" "D STARTING WITH ?" '["-"]'
 
+# DECFLOAT ARITHMETIC in a projection: +, -, * and unary - over a DECFLOAT
+# operand compute in decimal128 (34 sig, HALF-UP) and describe DECFLOAT(34).
+# Value AND describe compared, fire-crab-served vs engine-read on DF2 (whose
+# rows include +Infinity, a normal ordered operand). Division is a later
+# slice (fire-crab refuses it; the engine computes it).
+dfexpr() { # <label> <select-expr>
+    local q fc en
+    q="SET HEADING OFF;
+SELECT $2 FROM DF2 ORDER BY ID;"
+    fc=$(printf '%s\n' "$q" | "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$WORK" 2>&1 | strip | grep -v '^$' | tr -s ' \n' ' ')
+    en=$(printf '%s\n' "$q" | "$ISQL" -q -user "$U" -pas "$P" "$WORK" 2>&1 | strip | grep -v '^$' | tr -s ' \n' ' ')
+    check "decfloat arith $1 [$2]" "$fc" "$en"
+}
+dfexpr "add int"      "D + 1"
+dfexpr "sub int"      "D - 1"
+dfexpr "mul int"      "D * 2"
+dfexpr "unary minus"  "-D"
+dfexpr "add decimal"  "D + 0.5"
+dfexpr "col + col"    "D + S"
+dfexpr "col - col"    "D - S"
+dfexpr "nested"       "D * 2 + 1"
+dfexpr "d16 mul"      "S * 3"
+# the describe of a DECFLOAT arithmetic result is DECFLOAT(34) (len 16)
+dw_expr() { # <label> <select-expr>
+    local q fc en
+    q="SET SQLDA_DISPLAY ON;
+SELECT $2 FROM DF2;"
+    fc=$(printf '%s\n' "$q" | "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$WORK" 2>&1 | grep -oiE 'DECFLOAT\([0-9]+\)|len: [0-9]+' | head -2 | paste -sd,)
+    en=$(printf '%s\n' "$q" | "$ISQL" -q -user "$U" -pas "$P" "$WORK" 2>&1 | grep -oiE 'DECFLOAT\([0-9]+\)|len: [0-9]+' | head -2 | paste -sd,)
+    check "decfloat arith describe $1 [$2]" "$fc" "$en"
+}
+dw_expr "add"    "D + 1"
+dw_expr "d16"    "S * 3"
+
 # the LIKE/STARTING pattern `?` slot on a NUMERIC column describes as a
 # FIXED VARYING(30) - the engine's numeric-to-text render width, NOT the
 # column's own shape (a TEXT column's pattern keeps the column width). Read

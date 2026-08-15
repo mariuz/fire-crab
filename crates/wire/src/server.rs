@@ -9044,7 +9044,10 @@ fn build_expr_col_from(e: Expr, name: &str, descs: &[Descriptor]) -> Option<Proj
     // the scaled-integer describe below. `type_of` deliberately declines a
     // DecFloat34 (nesting it in arithmetic/conditionals is a later slice),
     // so this MUST precede the `type_of(descs)?` match.
-    if matches!(e, Expr::DecFloat34(_)) {
+    // a DECFLOAT literal, OR a numeric arithmetic tree with a DECFLOAT
+    // operand (`df + 1`, `df * 2`, `df1 - df2`, `-df`) - both ride the
+    // DECFLOAT(34) wire form and short-circuit the exact-numeric describe
+    if matches!(e, Expr::DecFloat34(_)) || is_decfloat_arith(&e, descs) {
         return Some(ProjCol {
             name: name.to_string(),
             oct_length: 16,
@@ -33884,10 +33887,13 @@ fn resolve_expr_inner(
                 return None;
             }
             let d = descs.get(fid)?;
-            // an int, text, scaled-numeric, temporal or approximate
-            // column (type_of/eval decide what each may do)
+            // an int, text, scaled-numeric, DECFLOAT, temporal or
+            // approximate column (type_of/eval decide what each may do; a
+            // DECFLOAT one is usable only inside decimal arithmetic, which
+            // the describe short-circuit picks up)
             if col_kind(d).is_none()
                 && !is_numeric_col(d)
+                && !is_decfloat_col(d)
                 && temporal_kind(d).is_none()
                 && !is_approx_col(d)
                 && d.dtype != dtype::BOOLEAN
@@ -34604,6 +34610,38 @@ fn is_numeric_col(d: &Descriptor) -> bool {
 /// decimal128), separate from the i128-aligned exact-numeric one.
 fn is_decfloat_col(d: &Descriptor) -> bool {
     matches!(d.dtype, dtype::DEC64 | dtype::DEC128)
+}
+
+/// TRUE when `e` is a numeric arithmetic tree - `+`/`-`/`*` and unary `-`
+/// over integer / NUMERIC / DECFLOAT leaves - with at least one DECFLOAT
+/// leaf. That shape computes and describes as DECFLOAT(34) (any DECFLOAT
+/// operand promotes the whole result, probed). Division is a later slice,
+/// so a `/` anywhere makes this false and the statement refuses rather than
+/// answering a wrong value.
+fn is_decfloat_arith(e: &Expr, descs: &[Descriptor]) -> bool {
+    fn walk(e: &Expr, descs: &[Descriptor]) -> Option<bool> {
+        Some(match e {
+            Expr::DecFloat34(_) => true,
+            Expr::Int(_) | Expr::Int128(_) | Expr::Dec(..) => false,
+            Expr::Col(fid) => {
+                let d = descs.get(*fid)?;
+                if is_decfloat_col(d) {
+                    true
+                } else if matches!(d.dtype, dtype::SHORT | dtype::LONG | dtype::INT64 | dtype::INT128)
+                {
+                    false
+                } else {
+                    return None;
+                }
+            }
+            Expr::Neg(x) => walk(x, descs)?,
+            Expr::Bin(a, op, b) if matches!(op, ArithOp::Add | ArithOp::Sub | ArithOp::Mul) => {
+                walk(a, descs)? || walk(b, descs)?
+            }
+            _ => return None,
+        })
+    }
+    walk(e, descs) == Some(true)
 }
 
 /// Decompose a numeric value into (raw integer, scale) for arithmetic:
@@ -36493,6 +36531,13 @@ impl Expr {
                 }
                 Value::Double(d) => Value::Double(-d),
                 Value::Float(f) => Value::Float(-f),
+                // a DECFLOAT negates in decimal (sign flip, cohort kept)
+                Value::DecFloat34(bits) => Value::DecFloat34(fire_crab_ods::decfloat::dec_to_bits(
+                    &fire_crab_ods::decfloat::negate(&fire_crab_ods::decfloat::decode_dec128(bits)),
+                )),
+                Value::DecFloat16(bits) => Value::DecFloat34(fire_crab_ods::decfloat::dec_to_bits(
+                    &fire_crab_ods::decfloat::negate(&fire_crab_ods::decfloat::decode_dec64(bits)),
+                )),
                 _ => Value::Null,
             },
             Expr::Bin(a, op, b) => {
@@ -36556,6 +36601,28 @@ impl Expr {
                         return Err(EvalErr::FloatOverflow);
                     }
                     Value::Double(out)
+                } else if matches!(va, Value::DecFloat34(_) | Value::DecFloat16(_))
+                    || matches!(vb, Value::DecFloat34(_) | Value::DecFloat16(_))
+                {
+                    // any DECFLOAT operand makes the arithmetic decimal128:
+                    // both sides promote to a Dec (an exact numeric exactly,
+                    // a stored DECFLOAT decoded), the op computes to 34
+                    // significant digits HALF-UP, and a NaN result traps
+                    // (SQLSTATE 22000). Division is a later slice; the
+                    // describe refuses it, so it never reaches here.
+                    use fire_crab_ods::decfloat as df;
+                    let da = value_as_dec(&va).ok_or(EvalErr::ConversionError(None))?;
+                    let db = value_as_dec(&vb).ok_or(EvalErr::ConversionError(None))?;
+                    let r = match op {
+                        ArithOp::Add => df::add(&da, &db),
+                        ArithOp::Sub => df::sub(&da, &db),
+                        ArithOp::Mul => df::mul(&da, &db),
+                        ArithOp::Div => return Err(EvalErr::Unsupported),
+                    };
+                    if matches!(r, df::Dec::Nan) {
+                        return Err(EvalErr::DecfloatInvalidOperation);
+                    }
+                    Value::DecFloat34(df::dec_to_bits(&r))
                 } else if let (Some((r1, s1)), Some((r2, s2))) =
                     (numeric_parts(&va), numeric_parts(&vb))
                 {
