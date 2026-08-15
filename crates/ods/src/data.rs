@@ -95,13 +95,23 @@ impl RecordHeader<'_> {
     /// understood (the mis-offset payload happened to fail to unpack)
     /// and is the safe half of the two behaviours.
     pub fn image(&self) -> Option<Vec<u8>> {
+        self.image_prefix(usize::MAX)
+    }
+
+    /// [image], decompressing only enough to cover the first `min_len`
+    /// bytes - the prefix a reader that decodes only low-offset fields
+    /// needs. `usize::MAX` is the whole record, exactly as [image] was.
+    /// A fragmented head has no single packed stream to cut, so this
+    /// declines it (as [image] does) and the assembler handles it whole.
+    pub fn image_prefix(&self, min_len: usize) -> Option<Vec<u8>> {
         if self.flags & flags::INCOMPLETE != 0 {
             return None;
         }
         if self.flags & flags::NOT_PACKED != 0 {
-            Some(self.packed_data.to_vec())
+            let n = min_len.min(self.packed_data.len());
+            Some(self.packed_data[..n].to_vec())
         } else {
-            crate::sqz::unpack(self.packed_data)
+            crate::sqz::unpack_prefix(self.packed_data, min_len)
         }
     }
 }
@@ -350,8 +360,31 @@ pub fn assembled_image(
     page_size: usize,
     head: &RecordHeader<'_>,
 ) -> Option<Vec<u8>> {
+    assembled_image_prefix(file, page_size, head, usize::MAX)
+}
+
+/// [assembled_image], decompressing only enough to cover the first
+/// `min_len` bytes of a NON-FRAGMENTED head - so a scan projecting a
+/// low-offset column decompresses a prefix instead of the whole record.
+/// A fragmented record is spread across pages and reconstructed whole
+/// (the prefix cut does not apply), and `usize::MAX` is the whole record
+/// either way, exactly as [assembled_image] always was.
+///
+/// SAFETY: the returned image may be SHORTER than the record, so a field
+/// whose bytes fall past `min_len` reads out of bounds and decodes to
+/// `Unsupported`. The caller must pass a `min_len` covering every field
+/// it reads (an over-estimate is safe, an under-estimate is a wrong
+/// answer), and must NOT feed a prefix into MVCC delta reconstruction,
+/// which needs the whole image - see the re-decompress in
+/// `tra::visible_version_2pc`.
+pub fn assembled_image_prefix(
+    file: &crate::Image,
+    page_size: usize,
+    head: &RecordHeader<'_>,
+    min_len: usize,
+) -> Option<Vec<u8>> {
     if head.flags & flags::INCOMPLETE == 0 {
-        return head.image();
+        return head.image_prefix(min_len);
     }
     // one piece, by ITS OWN flags (vio.cpp:575-602)
     let piece = |flags: u16, bytes: &[u8]| -> Option<Vec<u8>> {

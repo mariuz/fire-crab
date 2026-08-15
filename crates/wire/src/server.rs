@@ -3663,6 +3663,12 @@ enum RowSource {
         rel: u16,
         formats: Vec<(u8, Vec<Descriptor>)>,
         width: Option<usize>,
+        /// PARTIAL DECOMPRESSION: unpack only this many record bytes
+        /// (usize::MAX = whole record). Set by [RowSource::prune_leaf] when
+        /// a plain-scan projection reads a known low-offset subset; a join
+        /// side, a width-padded stream or any read it cannot prove leaves
+        /// it MAX. See [project_read_len].
+        decode_len: usize,
     },
     /// the records an INDEX says may match: the tree is descended once
     /// per level and only the leaf pages holding the key are read, then
@@ -3776,12 +3782,12 @@ impl RowSource {
         sink: &mut dyn FnMut(Vec<Value>) -> Result<Flow, EvalErr>,
     ) -> Result<Flow, EvalErr> {
         match self {
-            RowSource::TableScan { rel, formats, width } => {
+            RowSource::TableScan { rel, formats, width, decode_len } => {
                 // the walk ENDS on Stop now, rather than reading the
                 // rest of the relation and discarding it
                 let mut flow = Flow::Continue;
                 let mut err: Option<EvalErr> = None;
-                let limbo = for_each_record_while(db, *rel, formats, |values| {
+                let limbo = for_each_record_while(db, *rel, formats, *decode_len, |values| {
                     let mut row = values.to_vec();
                     if let Some(w) = width {
                         row.resize(*w, Value::Null);
@@ -3919,6 +3925,24 @@ impl RowSource {
         }
     }
 
+    /// PARTIAL DECOMPRESSION: set the decompression read-length on the
+    /// plain-scan LEAF beneath any Filter/Sort wrapping this source. A
+    /// no-op on anything else - an IndexScan, a join, a materialised
+    /// buffer - which decompress whole. usize::MAX is also a no-op (the
+    /// default), so passing a computed length only ever narrows.
+    fn prune_leaf(&mut self, read_len: usize) {
+        if read_len == usize::MAX {
+            return;
+        }
+        match self {
+            RowSource::TableScan { decode_len, .. } => *decode_len = read_len,
+            RowSource::Filter { input, .. } | RowSource::Sort { input, .. } => {
+                input.prune_leaf(read_len)
+            }
+            _ => {}
+        }
+    }
+
     /// Collect the whole walk. Every caller that wants a `Vec` goes
     /// through here, so there is ONE traversal to reason about.
     fn rows(&self, db: &Database) -> Result<Vec<Vec<Value>>, EvalErr> {
@@ -3932,9 +3956,9 @@ impl RowSource {
 
     fn rows_materialised(&self, db: &Database) -> Result<Vec<Vec<Value>>, EvalErr> {
         match self {
-            RowSource::TableScan { rel, formats, width } => {
+            RowSource::TableScan { rel, formats, width, decode_len: _ } => {
                 let mut out = Vec::new();
-                for_each_record(db, *rel, formats, |values| {
+                for_each_record(db, *rel, formats, usize::MAX, |values| {
                     let mut row = values.to_vec();
                     if let Some(w) = width {
                         row.resize(*w, Value::Null);
@@ -6513,6 +6537,116 @@ fn term_side_only(t: &Term, win: &std::ops::Range<usize>) -> bool {
     }
 }
 
+/// Mark every base field id a predicate TERM reads, or answer `false`
+/// when it is a term this cannot fully account for. Mirrors
+/// [term_side_only]'s variant handling exactly - the same trusted
+/// analysis - and any arm it does not list returns `false`, read by the
+/// caller as "cannot prove the read set complete". A `Cmp`/`Like`/...
+/// carries ONE field id and a literal `Rhs` (a column-vs-column compare
+/// is an `ExprCond`), so marking that id accounts for it.
+fn collect_term_fids(t: &Term, mark: &dyn Fn(usize) -> bool) -> bool {
+    match t {
+        Term::Const(_) | Term::Never | Term::Unknown => true,
+        Term::Cmp(fid, ..)
+        | Term::NumCmp(fid, ..)
+        | Term::CmpConvErr(fid, ..)
+        | Term::TextNumCmp(fid, ..)
+        | Term::IsNull(fid)
+        | Term::IsNotNull(fid)
+        | Term::Like(fid, ..)
+        | Term::BadLike(fid, ..)
+        | Term::Starting(fid, ..) => {
+            mark(*fid);
+            true
+        }
+        Term::ExprCond(c) => {
+            cond_reads(c, mark);
+            true
+        }
+        Term::ExprLike(e, ..) | Term::ExprStarting(e, ..) | Term::BadExprLike(e, ..) => {
+            expr_reads(e, mark);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// PARTIAL DECOMPRESSION: the number of record BYTES a plain-scan
+/// `Plan::Project` needs decompressed - the furthest extent
+/// (`offset + length`) of any field its projection, WHERE and ORDER BY
+/// read - or `usize::MAX` to decompress the whole record.
+///
+/// A scan `sqz::unpack`s the whole record before the projection picks
+/// fields, so `SELECT a_low_offset_column FROM <wide table>` decompresses
+/// bytes it never looks at. This says how far the decompression must
+/// actually go; the null bitmap sits at the front, inside any field's
+/// extent, and a field decoded PAST this length reads out of bounds and
+/// becomes `Unsupported` - harmless only because it is not one this plan
+/// reads. So OVER-estimating (returning more, down to `MAX`) is always
+/// safe and UNDER-estimating is a wrong answer, and this returns `MAX` the
+/// moment any piece cannot be accounted for: an index or generator or
+/// window column, a field id a format does not carry, or a WHERE term or
+/// projection expression it does not fully understand.
+fn project_read_len(plan: &Plan) -> usize {
+    let Plan::Project {
+        formats, cols, filter, order_by, gen_cols, index, windows, ..
+    } = plan
+    else {
+        return usize::MAX;
+    };
+    if index.is_some() || !gen_cols.is_empty() || !windows.is_empty() {
+        return usize::MAX;
+    }
+    let needed = std::cell::RefCell::new(std::collections::BTreeSet::<usize>::new());
+    let mark = |fid: usize| -> bool {
+        needed.borrow_mut().insert(fid);
+        false
+    };
+    for c in cols {
+        match &c.expr {
+            None => {
+                mark(c.field_id);
+            }
+            Some(e) => {
+                expr_reads(e, &mark);
+            }
+        }
+    }
+    if let Some(p) = filter {
+        for term in p.groups.iter().flatten() {
+            if !collect_term_fids(term, &mark) {
+                return usize::MAX;
+            }
+        }
+    }
+    for k in order_by {
+        match &k.expr {
+            None => {
+                mark(k.field);
+            }
+            Some(e) => {
+                expr_reads(e, &mark);
+            }
+        }
+    }
+    let needed = needed.into_inner();
+    if needed.is_empty() {
+        return usize::MAX;
+    }
+    // the furthest byte any needed field reaches, across every format the
+    // record might carry (an over-estimate across formats is safe)
+    let mut len = 0usize;
+    for (_, descs) in formats {
+        for &fid in &needed {
+            match descs.get(fid) {
+                Some(d) => len = len.max(d.offset as usize + d.length as usize),
+                None => return usize::MAX,
+            }
+        }
+    }
+    len
+}
+
 /// The part of a join's WHERE that names ONE side: the top-level
 /// conjuncts every term of which reads inside the window. Evaluating
 /// the result evaluates exactly those conjuncts - [Predicate::conjunct]
@@ -7358,7 +7492,7 @@ fn not_null_fids_uncached(db: &Database, table: &str) -> Vec<usize> {
     };
     let mut out = Vec::new();
     let fmts = vec![(0u8, descs.clone())];
-    for_each_record(db, 5, &fmts, |values| {
+    for_each_record(db, 5, &fmts, usize::MAX, |values| {
         let is_rel = matches!(values.get(rel_fid), Some(Value::Text(t)) if t.trim_end().eq_ignore_ascii_case(table));
         if is_rel
             && matches!(values.get(nn_fid), Some(Value::Int(1)))
@@ -7413,7 +7547,7 @@ fn identity_columns_uncached(db: &Database, table: &str) -> Vec<(usize, String, 
     };
     let mut out = Vec::new();
     let fmts = vec![(0u8, descs.clone())];
-    for_each_record(db, 5, &fmts, |values| {
+    for_each_record(db, 5, &fmts, usize::MAX, |values| {
         let is_rel = matches!(values.get(rel_fid), Some(Value::Text(t)) if t.trim_end().eq_ignore_ascii_case(table));
         if !is_rel {
             return;
@@ -7476,7 +7610,7 @@ fn computed_sources_uncached(
     // (field id, field source) of the table's columns
     let mut members: Vec<(usize, String)> = Vec::new();
     let fmts = vec![(0u8, rf_descs.clone())];
-    for_each_record(db, 5, &fmts, |values| {
+    for_each_record(db, 5, &fmts, usize::MAX, |values| {
         let is_rel = matches!(values.get(rel_f), Some(Value::Text(t)) if t.trim_end().eq_ignore_ascii_case(table));
         if !is_rel {
             return;
@@ -7507,7 +7641,7 @@ fn computed_sources_uncached(
     };
     let mut blobs: Vec<(usize, u16, u64)> = Vec::new();
     let fmts2 = vec![(0u8, f_descs.clone())];
-    for_each_record(db, 2, &fmts2, |values| {
+    for_each_record(db, 2, &fmts2, usize::MAX, |values| {
         let Some(Value::Text(fname)) = values.get(name_f) else { return };
         let fname = fname.trim_end();
         for (id, src) in &members {
@@ -7565,7 +7699,7 @@ fn fk_trigger_parent_cols(db: &Database, table: &str, trigs: &[String]) -> Optio
     let rel = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, "RDB$DEPENDENCIES")?;
     let fmts = vec![(0u8, descs.clone())];
     let mut out: Vec<String> = Vec::new();
-    for_each_record(db, rel, &fmts, |values| {
+    for_each_record(db, rel, &fmts, usize::MAX, |values| {
         let Some(Value::Text(dep)) = values.get(dep_f) else { return };
         if !trigs.iter().any(|t| t.eq_ignore_ascii_case(dep.trim_end())) {
             return;
@@ -7765,7 +7899,7 @@ fn table_defaults(
     let rf_fmts = vec![(0u8, rf_descs.clone())];
     // (fid, column default blob, domain source name)
     let mut omitted: Vec<(usize, Option<(u16, u64)>, String)> = Vec::new();
-    for_each_record(db, 5, &rf_fmts, |values| {
+    for_each_record(db, 5, &rf_fmts, usize::MAX, |values| {
         let is_rel = matches!(values.get(rel_f), Some(Value::Text(t)) if t.trim_end().eq_ignore_ascii_case(table));
         if !is_rel {
             return;
@@ -7819,7 +7953,7 @@ fn table_defaults(
         let (fname_f, fdef_f) = (ffid("RDB$FIELD_NAME")?, ffid("RDB$DEFAULT_VALUE")?);
         let f_fmts = vec![(0u8, f_descs.clone())];
         let mut blobs: Vec<(usize, u16, u64)> = Vec::new();
-        for_each_record(db, 2, &f_fmts, |values| {
+        for_each_record(db, 2, &f_fmts, usize::MAX, |values| {
             let Some(Value::Text(fname)) = values.get(fname_f) else { return };
             let fname = fname.trim_end();
             for (fid, src) in &pending {
@@ -7909,7 +8043,7 @@ fn fk_partners_uncached(
     let irel = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, "RDB$INDICES")?;
     let ifmts = vec![(0u8, i_descs.clone())];
     let mut rows: Vec<(String, String, Option<String>)> = Vec::new();
-    for_each_record(db, irel, &ifmts, |values| {
+    for_each_record(db, irel, &ifmts, usize::MAX, |values| {
         let Some(Value::Text(ix)) = values.get(ix_f) else { return };
         let Some(Value::Text(rn)) = values.get(rn_f) else { return };
         let fk = match values.get(fk_f) {
@@ -7938,7 +8072,7 @@ fn fk_partners_uncached(
     let srel = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, "RDB$INDEX_SEGMENTS")?;
     let sfmts = vec![(0u8, s_descs.clone())];
     let mut segrows: Vec<(String, i64, String)> = Vec::new();
-    for_each_record(db, srel, &sfmts, |values| {
+    for_each_record(db, srel, &sfmts, usize::MAX, |values| {
         let Some(Value::Text(ix)) = values.get(sn_f) else { return };
         let Some(Value::Text(col)) = values.get(sc_f) else { return };
         let pos = match values.get(sp_f) {
@@ -8062,7 +8196,7 @@ fn fk_partner_has(db: &Database, fk: &FkPartner, key: &[&Value]) -> bool {
             .any(|v| matches_key(v));
     }
     let mut found = false;
-    for_each_record(db, fk.other_rel, &fk.other_formats, |v| {
+    for_each_record(db, fk.other_rel, &fk.other_formats, usize::MAX, |v| {
         if !found && matches_key(v) {
             found = true;
         }
@@ -8267,7 +8401,7 @@ fn check_predicates_uncached(
     let mut fk_unknown = false;
     let mut fk_update_trigs: Vec<String> = Vec::new();
     let fmts = vec![(0u8, t_descs.clone())];
-    for_each_record(db, trel, &fmts, |values| {
+    for_each_record(db, trel, &fmts, usize::MAX, |values| {
         let is_rel = matches!(values.get(rel_f), Some(Value::Text(t)) if t.trim_end().eq_ignore_ascii_case(table));
         if !is_rel {
             return;
@@ -8421,7 +8555,7 @@ fn check_constraint_names(db: &Database) -> Option<Vec<(String, String)>> {
     let rel = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, "RDB$CHECK_CONSTRAINTS")?;
     let fmts = vec![(0u8, descs.clone())];
     let mut out = Vec::new();
-    for_each_record(db, rel, &fmts, |values| {
+    for_each_record(db, rel, &fmts, usize::MAX, |values| {
         if let (Some(Value::Text(t)), Some(Value::Text(c))) = (values.get(tn_f), values.get(cn_f)) {
             out.push((t.trim_end().to_string(), c.trim_end().to_string()));
         }
@@ -8446,7 +8580,7 @@ fn constraint_for_index(db: &Database, index_name: &str) -> Option<String> {
     let rel = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, "RDB$RELATION_CONSTRAINTS")?;
     let fmts = vec![(0u8, descs.clone())];
     let mut found: Option<String> = None;
-    for_each_record(db, rel, &fmts, |values| {
+    for_each_record(db, rel, &fmts, usize::MAX, |values| {
         if found.is_some() {
             return;
         }
@@ -12030,7 +12164,7 @@ fn exception_identity(db: &Database, name: &str) -> Option<(i64, String)> {
     let rel = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, "RDB$EXCEPTIONS")?;
     let fmts = vec![(0u8, descs.clone())];
     let mut found = None;
-    for_each_record(db, rel, &fmts, |values| {
+    for_each_record(db, rel, &fmts, usize::MAX, |values| {
         let is_it = matches!(values.get(name_f),
             Some(Value::Text(t)) if t.trim_end().eq_ignore_ascii_case(name));
         if !is_it {
@@ -12074,7 +12208,7 @@ fn exception_exists(db: &Database, name: &str) -> bool {
     };
     let fmts = vec![(0u8, descs.clone())];
     let mut found = false;
-    for_each_record(db, rel, &fmts, |values| {
+    for_each_record(db, rel, &fmts, usize::MAX, |values| {
         if matches!(values.get(name_f), Some(Value::Text(t)) if t.trim_end().eq_ignore_ascii_case(name)) {
             found = true;
         }
@@ -19275,7 +19409,7 @@ fn resolve_driver_base(
     defer: &Option<DeferredAccess>,
     filter: &Option<Predicate>,
 ) -> RowSource {
-    let (Some(_), RowSource::TableScan { rel, formats, width }) = (defer.as_ref(), base) else {
+    let (Some(_), RowSource::TableScan { rel, formats, width, .. }) = (defer.as_ref(), base) else {
         return base.clone();
     };
     let descs: Vec<Descriptor> = formats
@@ -19310,7 +19444,7 @@ fn leaf_source(
             access: access.clone(),
             width: None,
         },
-        None => RowSource::TableScan { rel, formats, width: None },
+        None => RowSource::TableScan { rel, formats, width: None, decode_len: usize::MAX },
     }
 }
 
@@ -20017,7 +20151,7 @@ fn index_error_names(db: &Database, table: &str, index_id: u8) -> Option<(String
     let rel = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, "RDB$INDICES")?;
     let fmts = vec![(0u8, descs.clone())];
     let mut found: Option<String> = None;
-    for_each_record(db, rel, &fmts, |values| {
+    for_each_record(db, rel, &fmts, usize::MAX, |values| {
         if found.is_some() {
             return;
         }
@@ -21653,6 +21787,8 @@ fn plan_join_bound(
                 rel,
                 formats,
                 width: Some(descs.len()),
+                // a join side is combined and padded; never pruned
+                decode_len: usize::MAX,
             },
             columns: columns.as_ref().clone(),
             descs,
@@ -23084,7 +23220,7 @@ fn view_of(db: &Database, name: &str) -> Option<ViewDef> {
     let (name_f, src_f) = (fid("RDB$RELATION_NAME")?, fid("RDB$VIEW_SOURCE")?);
     let fmts = vec![(0u8, rdescs)];
     let mut source: Option<String> = None;
-    for_each_record(db, 6, &fmts, |v| {
+    for_each_record(db, 6, &fmts, usize::MAX, |v| {
         let hit = matches!(v.get(name_f),
             Some(Value::Text(t)) if t.trim_end().eq_ignore_ascii_case(name));
         if !hit || source.is_some() {
@@ -23131,7 +23267,7 @@ fn relation_schema(db: &Database, name: &str) -> Option<String> {
     let flag_f = fid("RDB$SYSTEM_FLAG");
     let fmts = vec![(0u8, rdescs)];
     let mut found: Option<String> = None;
-    for_each_record(db, 6, &fmts, |v| {
+    for_each_record(db, 6, &fmts, usize::MAX, |v| {
         let hit = matches!(v.get(name_f),
             Some(Value::Text(t)) if t.trim_end().eq_ignore_ascii_case(name));
         if !hit || found.is_some() {
@@ -23865,7 +24001,10 @@ fn branch_rows_res(
         Plan::Project { index, .. } => index.clone(),
         _ => None,
     };
-    let src = RowSource::scan_filter_sort(*rel, formats.clone(), filter, order_by, index);
+    let mut src = RowSource::scan_filter_sort(*rel, formats.clone(), filter, order_by, index);
+    // PARTIAL DECOMPRESSION: this materialising path serves the plain
+    // cursor fetch, so a wide-table narrow projection prunes its scan here
+    src.prune_leaf(project_read_len(plan));
     let records = src.rows(db)?;
     let mut out = Vec::with_capacity(records.len());
     for values in &records {
@@ -23924,13 +24063,14 @@ fn branch_rows_each(
     }
     if let Plan::Project { rel, formats, cols, filter, order_by, index, .. } = plan {
         let filter = bind_filter(filter, args).map_err(|_| EvalErr::Unsupported)?;
-        let src = RowSource::scan_filter_sort(
+        let mut src = RowSource::scan_filter_sort(
             *rel,
             formats.clone(),
             filter,
             order_by.clone(),
             index.clone(),
         );
+        src.prune_leaf(project_read_len(plan));
         for values in &src.rows(db)? {
             let mut row = Vec::with_capacity(cols.len());
             for c in cols {
@@ -27262,7 +27402,7 @@ fn aggregate(
             },
             Some(_) => {
                 let mut n = 0i64;
-                let hit = for_each_candidate(db, rel, formats, index, |v| {
+                let hit = for_each_candidate(db, rel, formats, index, usize::MAX, |v| {
                     if matches(v) {
                         n += 1;
                     }
@@ -27294,7 +27434,7 @@ fn aggregate(
     // COUNT(col) counts non-null values; MIN/MAX/SUM need an integer column
     if matches!(func, AggFn::Count) {
         let mut n = 0i64;
-        let hit = for_each_candidate(db, rel, formats, index, |v| {
+        let hit = for_each_candidate(db, rel, formats, index, usize::MAX, |v| {
             if matches(v) && matches!(v.get(fid), Some(x) if !matches!(x, Value::Null)) {
                 n += 1;
             }
@@ -27323,7 +27463,7 @@ fn aggregate(
         return None;
     }
     let mut acc: Option<i64> = None;
-    let hit = for_each_candidate(db, rel, formats, index, |v| {
+    let hit = for_each_candidate(db, rel, formats, index, usize::MAX, |v| {
         if !matches(v) {
             return;
         }
@@ -27568,6 +27708,12 @@ struct ReadView<'a> {
     /// stop on it and their callers raise `isc_rec_in_limbo` - walking
     /// past would silently hide a row the engine refuses to adjudicate
     limbo: std::cell::Cell<u64>,
+    /// PARTIAL DECOMPRESSION: decompress only the first `decode_len` bytes
+    /// of each record's image - enough to cover the fields this walk
+    /// reads. `usize::MAX` is the whole record, which every walk but a
+    /// pruned plain scan uses. Set after construction; see
+    /// [project_read_len].
+    decode_len: usize,
 }
 
 impl<'a> ReadView<'a> {
@@ -27580,6 +27726,7 @@ impl<'a> ReadView<'a> {
             // only a concurrency snapshot makes a write conflict
             is_isolation: db.snapshot.is_some(),
             limbo: std::cell::Cell::new(0),
+            decode_len: usize::MAX,
         }
     }
 
@@ -27596,6 +27743,7 @@ impl<'a> ReadView<'a> {
             snapshot: None,
             is_isolation: false,
             limbo: std::cell::Cell::new(0),
+            decode_len: usize::MAX,
         }
     }
 
@@ -27618,8 +27766,9 @@ impl<'a> ReadView<'a> {
             return None;
         }
         match &self.tips {
-            Some(tips) => match fire_crab_ods::tra::visible_version_2pc(
+            Some(tips) => match fire_crab_ods::tra::visible_version_2pc_prefix(
                 bytes, page_size, r, tips, &self.own, true, self.snapshot.as_ref(),
+                self.decode_len,
             ) {
                 Ok(v) => v.map(|v| (v.image, v.format)),
                 Err(id) => {
@@ -27631,7 +27780,8 @@ impl<'a> ReadView<'a> {
                 if !r.is_primary_record() {
                     return None;
                 }
-                fire_crab_ods::data::assembled_image(bytes, page_size, r).map(|i| (i, r.format))
+                fire_crab_ods::data::assembled_image_prefix(bytes, page_size, r, self.decode_len)
+                    .map(|i| (i, r.format))
             }
         }
     }
@@ -27730,10 +27880,14 @@ fn for_each_candidate<F: FnMut(&[Value])>(
     rel: u16,
     formats: &[(u8, Vec<Descriptor>)],
     index: &Option<IndexAccess>,
+    decode_len: usize,
     mut f: F,
 ) -> u64 {
     let Some(access) = index else {
-        return for_each_record(db, rel, formats, f);
+        // the plain scan honours the read-length; an index retrieval
+        // (records_for_2pc) decompresses whole, so a length that reached
+        // an index-resolved path is simply not applied - safe
+        return for_each_record(db, rel, formats, decode_len, f);
     };
     let (rows, limbo) = records_for_2pc(db, rel, formats, access);
     for values in rows {
@@ -27757,10 +27911,12 @@ fn for_each_record_while<F: FnMut(&[Value]) -> Flow>(
     db: &Database,
     rel: u16,
     formats: &[(u8, Vec<Descriptor>)],
+    decode_len: usize,
     mut f: F,
 ) -> u64 {
     let db_image = db.bytes();
-    let view = ReadView::of(db, &db_image);
+    let mut view = ReadView::of(db, &db_image);
+    view.decode_len = decode_len;
     for dp_no in relation_data_pages(&db_image, db.page_size, rel) {
         let Some(dp) = fire_crab_ods::page_at(&db_image, db.page_size, dp_no)
             .and_then(DataPage::decode)
@@ -27823,11 +27979,13 @@ fn for_each_record<F: FnMut(&[Value])>(
     db: &Database,
     rel: u16,
     formats: &[(u8, Vec<Descriptor>)],
+    decode_len: usize,
     mut f: F,
 ) -> u64 {
     db.reserve_relation_read(rel);
     let db_image = db.bytes();
-    let view = ReadView::of(db, &db_image);
+    let mut view = ReadView::of(db, &db_image);
+    view.decode_len = decode_len;
     for dp_no in relation_data_pages(&db_image, db.page_size, rel) {
         let Some(dp) = fire_crab_ods::page_at(&db_image, db.page_size, dp_no)
             .and_then(DataPage::decode)
@@ -30501,6 +30659,13 @@ fn emit_rows_inner(
             win_base,
         } => {
             if let Some(db) = db {
+                // PARTIAL DECOMPRESSION: how many record bytes the plain
+                // scan below must unpack (the extent of the fields this
+                // projection, WHERE and ORDER BY read); usize::MAX for
+                // anything it cannot prove - an index, a generator/window
+                // column, an unanalysable term. Applied on the streaming
+                // no-sort path, which is where a wide-table scan lives.
+                let read_len = project_read_len(plan);
                 let filter = bind_filter(filter, args)?;
                 // the bands, now that any `?` has a value
                 let descs_now: Vec<Descriptor> = formats
@@ -30556,7 +30721,7 @@ fn emit_rows_inner(
                     // handed back for the caller to persist.
                     let mut rows: Vec<Vec<Value>> = Vec::new();
                     let mut ferr: Option<EvalErr> = None;
-                    let limbo = for_each_candidate(db, *rel, formats, index, |values| {
+                    let limbo = for_each_candidate(db, *rel, formats, index, usize::MAX, |values| {
                         if ferr.is_some() {
                             return;
                         }
@@ -30592,7 +30757,7 @@ fn emit_rows_inner(
                     // (divide by zero, a failed cast) stops the walk and is
                     // reported after it
                     let mut eval_err: Option<EvalErr> = None;
-                    let limbo = for_each_candidate(db, *rel, formats, index, |values| {
+                    let limbo = for_each_candidate(db, *rel, formats, index, read_len, |values| {
                         if eval_err.is_some() {
                             return;
                         }
@@ -38069,7 +38234,7 @@ fn build_correlated_lookup(
     // gather the inner rows per correlation key
     let mut buckets: Vec<(Value, Vec<Vec<Value>>)> = Vec::new();
     let mut bad = false;
-    for_each_candidate(db, rel, &formats, &index, |vals| {
+    for_each_candidate(db, rel, &formats, &index, usize::MAX, |vals| {
         if bad {
             return;
         }
@@ -38829,7 +38994,7 @@ fn eval_subquery_rel(
     if existence_only && want_fid.is_none() {
         let mut any = false;
         let mut ferr = false;
-        for_each_candidate(db, rel, &formats, &index, |v| {
+        for_each_candidate(db, rel, &formats, &index, usize::MAX, |v| {
             if !any
                 && !ferr
                 && match filter.as_ref().map_or(Ok(true), |p| p.matches(v)) {
@@ -38852,7 +39017,7 @@ fn eval_subquery_rel(
     let mut values = Vec::new();
     let mut any = false;
     let mut ferr = false;
-    for_each_candidate(db, rel, &formats, &index, |v| {
+    for_each_candidate(db, rel, &formats, &index, usize::MAX, |v| {
         if ferr {
             return;
         }
@@ -41950,7 +42115,7 @@ fn load_procedure(db: &Database, name: &str) -> Option<ProcMeta> {
     // `source.is_some()` (as it did) would let a LATER row supply the
     // type for the body this one read
     let mut found = false;
-    for_each_record(db, 26, &pfmts, |v| {
+    for_each_record(db, 26, &pfmts, usize::MAX, |v| {
         let hit = matches!(v.get(name_f),
             Some(Value::Text(t)) if t.trim_end().eq_ignore_ascii_case(name));
         if !hit || found || !catalog_row_public(v, schema_f, pkg_f) {
@@ -41992,7 +42157,7 @@ fn load_procedure(db: &Database, name: &str) -> Option<ProcMeta> {
     // relation, and merging them in was the probed arity error
     let (cschema_f, cpkg_f) = (cfid("RDB$SCHEMA_NAME"), cfid("RDB$PACKAGE_NAME"));
     let cfmts = vec![(0u8, cdescs)];
-    for_each_record(db, 27, &cfmts, |v| {
+    for_each_record(db, 27, &cfmts, usize::MAX, |v| {
         let hit = matches!(v.get(pn_f),
             Some(Value::Text(t)) if t.trim_end().eq_ignore_ascii_case(name));
         if !hit || !catalog_row_public(v, cschema_f, cpkg_f) {
@@ -47817,7 +47982,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                                 Ok(bound) => {
                                     let mut rows: Vec<Vec<Value>> = Vec::new();
                                     let mut ferr: Option<EvalErr> = None;
-                                    for_each_candidate(db, *rel, formats, index, |values| {
+                                    for_each_candidate(db, *rel, formats, index, usize::MAX, |values| {
                                         if ferr.is_some() {
                                             return;
                                         }
@@ -49370,7 +49535,7 @@ fn exec_blr_stmt(
                     return;
                 }
                 let mut rows: Vec<Vec<Value>> = Vec::new();
-                for_each_record(db, rel, &formats, |values| rows.push(values.to_vec()));
+                for_each_record(db, rel, &formats, usize::MAX, |values| rows.push(values.to_vec()));
                 streams.push(StreamData { ctx: *ctx, columns: columns.as_ref().clone(), rows });
             }
             // nested-loop join: every combination of one row per stream,
@@ -49625,7 +49790,7 @@ fn generator_info(db: &Database, name: &str) -> Option<(i64, i64)> {
     let incr_fid = field("RDB$GENERATOR_INCREMENT")?;
     let want = name.trim();
     let mut found = None;
-    for_each_record(db, rel, &formats, |row| {
+    for_each_record(db, rel, &formats, usize::MAX, |row| {
         if found.is_some() {
             return;
         }
@@ -52820,7 +52985,7 @@ mod tests {
                 key: "E".into(),
                 // aliased, so no 3-part binding (an alias is exclusive)
                 schema: None,
-                src: RowSource::TableScan { rel: 10, formats: vec![(1, vec![d(dtype::LONG), d(dtype::LONG), d(dtype::VARYING)])], width: None },
+                src: RowSource::TableScan { rel: 10, formats: vec![(1, vec![d(dtype::LONG), d(dtype::LONG), d(dtype::VARYING)])], width: None, decode_len: usize::MAX },
                 columns: vec![
                     RelationColumn { name: "ID".into(), field_id: 0, position: 0 },
                     RelationColumn { name: "DEPT_ID".into(), field_id: 1, position: 1 },
@@ -52838,7 +53003,7 @@ mod tests {
             JoinSide {
                 key: "D".into(),
                 schema: None,
-                src: RowSource::TableScan { rel: 11, formats: vec![(1, vec![d(dtype::LONG), d(dtype::VARYING)])], width: None },
+                src: RowSource::TableScan { rel: 11, formats: vec![(1, vec![d(dtype::LONG), d(dtype::VARYING)])], width: None, decode_len: usize::MAX },
                 columns: vec![
                     RelationColumn { name: "ID".into(), field_id: 0, position: 0 },
                     RelationColumn { name: "NAME".into(), field_id: 1, position: 1 },

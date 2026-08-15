@@ -277,6 +277,32 @@ pub fn visible_version_2pc(
     strict: bool,
     snap: Option<&Snapshot>,
 ) -> Result<Option<VisibleVersion>, u64> {
+    visible_version_2pc_prefix(file, page_size, head, tips, own, strict, snap, usize::MAX)
+}
+
+/// [visible_version_2pc], decompressing only the first `min_len` bytes of
+/// the VISIBLE head - so a scan projecting low-offset columns need not
+/// unpack the whole record. `usize::MAX` is the whole image, exactly as
+/// [visible_version_2pc] always was.
+///
+/// The prefix is taken of the HEAD only, and used only when the head is
+/// itself the visible version. The moment the walk steps to a BACK
+/// version stored as a delta, the head is reconstructed in FULL first,
+/// because `apply_differences` rebuilds the prior image against the whole
+/// current one; a prefix there would silently corrupt an updated row's
+/// visible value. The caller (a scan) passes a `min_len` covering every
+/// field it reads - see the read-extent computed at the plan.
+#[allow(clippy::too_many_arguments)]
+pub fn visible_version_2pc_prefix(
+    file: &crate::Image,
+    page_size: usize,
+    head: &crate::data::RecordHeader,
+    tips: &TipChain,
+    own: &OwnTx,
+    strict: bool,
+    snap: Option<&Snapshot>,
+    min_len: usize,
+) -> Result<Option<VisibleVersion>, u64> {
     let fetch_page = |no: u32| {
         crate::page_at(file, page_size, no)
             .and_then(DataPage::decode)
@@ -285,8 +311,11 @@ pub fn visible_version_2pc(
     let mut image: Option<Vec<u8>> = if current.flags & flags::DELETED != 0 {
         None // deleted stubs carry no data
     } else {
-        crate::data::assembled_image(file, page_size, &current)
+        crate::data::assembled_image_prefix(file, page_size, &current, min_len)
     };
+    // did we take only a PREFIX of the head? then a delta back-version
+    // below must re-read it whole before reconstructing against it
+    let mut prefixed = min_len != usize::MAX;
     let mut walked = 0u32;
     let mut deltas = 0u32;
     loop {
@@ -326,6 +355,14 @@ pub fn visible_version_2pc(
         if current.back_page == 0 {
             return Ok(None); // an insert this reader does not count
         }
+        // A DELTA back version is reconstructed against THIS image; if we
+        // only took a prefix of the head, get the whole thing now, before
+        // it is used. (A non-delta back version replaces the image
+        // outright, so the prefix is simply discarded and this is skipped.)
+        if prefixed && current.flags & flags::DELTA != 0 && current.flags & flags::DELETED == 0 {
+            image = crate::data::assembled_image(file, page_size, &current);
+        }
+        prefixed = false;
         let Some(back) = fetch_page(current.back_page).and_then(|p| p.record(current.back_line))
         else {
             return Ok(None);

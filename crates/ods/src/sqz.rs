@@ -17,9 +17,31 @@
 /// Decompress `input` into a Vec. Returns None on a malformed stream
 /// (truncated run), mirroring unpack's "decompression error" path.
 pub fn unpack(input: &[u8]) -> Option<Vec<u8>> {
-    let mut out = Vec::with_capacity(input.len() * 2);
+    unpack_prefix(input, usize::MAX)
+}
+
+/// [unpack], stopping once at least `min_len` bytes have been produced -
+/// the PREFIX a reader that needs only the first N bytes of a record's
+/// image wants, so a scan projecting a low-offset column need not
+/// decompress the whole row. The returned image is `>= min_len` bytes
+/// (or the whole record when it is shorter), and a field whose bytes fall
+/// PAST the prefix reads out of bounds - which is why the caller must
+/// pass a `min_len` covering every field it decodes (see the column-read
+/// mask at the scan). `usize::MAX` decompresses the whole record, exactly
+/// as [unpack] always did.
+///
+/// NOTE: stopping early does not validate the rest of the stream, so a
+/// record whose TAIL is corrupt still yields a prefix here where full
+/// [unpack] would answer None. That only diverges on a corrupt file, and
+/// the prefix it returns is the same bytes the full unpack would have put
+/// there.
+pub fn unpack_prefix(input: &[u8], min_len: usize) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity((input.len() * 2).min(min_len.saturating_add(64)));
     let mut i = 0usize;
     while i < input.len() {
+        if out.len() >= min_len {
+            break;
+        }
         let control = input[i] as i8;
         i += 1;
         if control >= 0 {
@@ -129,6 +151,24 @@ mod tests {
         ] {
             assert_eq!(unpack(&pack(case)).unwrap(), case, "case {:?}", case);
         }
+    }
+
+    #[test]
+    fn unpack_prefix_stops_at_min_len_and_matches_the_whole() {
+        // a mix of a literal run and a repeat run, so stopping lands in
+        // the middle of both cases
+        let data: Vec<u8> = b"abcdef".iter().copied().chain(std::iter::repeat(b'z').take(50)).collect();
+        let packed = pack(&data);
+        let whole = unpack(&packed).unwrap();
+        assert_eq!(whole, data);
+        // every prefix length: >= min_len bytes, and a byte-prefix of the whole
+        for min in [0usize, 1, 3, 6, 7, 20, 56, 1000] {
+            let p = unpack_prefix(&packed, min).unwrap();
+            assert!(p.len() >= min.min(data.len()), "min {min}: got {}", p.len());
+            assert_eq!(&whole[..p.len()], &p[..], "min {min}: prefix must match the whole");
+        }
+        // MAX is exactly the whole record
+        assert_eq!(unpack_prefix(&packed, usize::MAX).unwrap(), data);
     }
 
     #[test]

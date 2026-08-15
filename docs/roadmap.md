@@ -69,20 +69,19 @@ measured or pinned items**, each recorded in its own place below:
   its optimizer GATE (does an index serve this? — invariant across a
   prepared statement's executes) is memoised in the epoch cache, so a
   parameterised WHERE resolves its band without re-running the optimizer
-  each time (~26–43% off a re-executed `WHERE col = ?`). What is left is
-  the record walk and the wire itself — measured, not near-zero: a narrow
-  50k-row scan is ~110 ms against the engine's ~80 (≈1.4×, more in server
-  CPU). COLUMN PRUNING (decode only the fields a plan reads) was built and
-  MEASURED, and it does NOT pay: the per-column cost is not the field
-  decode, it is `sqz::unpack` decompressing the WHOLE record in
-  `assembled_image`, which a decode mask cannot avoid — old-vs-new on a
-  `SELECT id` over eight VARCHAR(200) columns was 2.99 → 2.92 µs/row, ~2%,
-  for a decode mask threaded through the whole scan path and a permanent
-  wrong-answer-risk surface (a missed field reference reads back Null).
-  Reverted. The real lever, if the walk is ever worth it, is PARTIAL
-  DECOMPRESSION — unpacking only up to the last needed field's offset —
-  which is an `ods`-core change to `sqz::unpack`, not a decode-time mask;
-  the rest is the fundamental decompress and the wire the engine pays too;
+  each time (~26–43% off a re-executed `WHERE col = ?`). The record walk
+  was the last measured residual, and PARTIAL DECOMPRESSION closed it: a
+  scan `sqz::unpack`ed the WHOLE record before the projection picked
+  fields, so a plain scan now decompresses only up to the last byte its
+  projection, WHERE and ORDER BY read (`sqz::unpack_prefix`, a read-length
+  carried from `Plan::Project` to the scan leaf; `usize::MAX` for anything
+  it cannot prove). Old-vs-new on `SELECT id` over eight VARCHAR(200)
+  columns: **3.01 → 1.52 µs/row, ~49%**, and a narrow all-int scan is
+  unchanged (nothing to prune). This is where COLUMN PRUNING — decoding
+  only the read fields — failed at 2%, because the decode was never the
+  cost; the decompression was. What is left is the fundamental decompress
+  of the columns actually read and the wire, both of which the engine
+  pays too;
 - **the optimizer's stale-statistics region** — statistics non-zero but
   WRONG are unmeasured, needing their own fixture family (load,
   `SET STATISTICS`, grow);
@@ -290,13 +289,35 @@ of those boundaries.
   surface (a field left out of the mask reads back Null) across the core
   query path.
 
-  The real lever, if the record walk is ever worth more, is PARTIAL
-  DECOMPRESSION — `sqz::unpack` stopping at the last needed field's byte
-  offset, so `SELECT id` (offset 0) decompresses almost nothing. That is
-  an `ods`-core change with its own risk, not a decode-time mask, and it
-  is unclaimed. The rest — the per-row `Vec<u8>`, the `Vec<Value>` and the
-  XDR encode of the columns actually asked for — is the fundamental work
-  the engine does too.
+  PARTIAL DECOMPRESSION was the real lever, and it is DONE. A prototype
+  proved it first — decompressing a fixed 16-byte prefix took `SELECT id`
+  from 3.01 to 1.00 µs/row, against the mask's 2.92 — and then it was
+  built properly. `sqz::unpack_prefix` stops once it has produced the
+  bytes asked for; `RecordHeader::image_prefix` and
+  `data::assembled_image_prefix` carry a `min_len` down to it; and
+  `tra::visible_version_2pc_prefix` takes a prefix of the VISIBLE head,
+  re-reading it WHOLE the moment the walk steps to a delta back-version
+  (which reconstructs against the full image — the one correctness trap,
+  covered by `diff-mvcc`'s delta reconstruction and the snapshot/
+  concurrency/update gates). The read-length is `project_read_len`: the
+  furthest `offset + length` any field the projection, WHERE or ORDER BY
+  reads reaches (the same `expr_reads`/`collect_term_fids` analysis the
+  mask used, so already gate-validated), carried on the `TableScan` leaf
+  by `prune_leaf` and applied where the plain cursor materialises. An
+  over-estimate is safe and `usize::MAX` (the default, and the answer for
+  an index, a generator/window column, or any unprovable term) is the
+  whole record — so a wrong read set costs decompression, and a field
+  decoded past the prefix reads out of bounds to `Unsupported`, never
+  silent bad data. Old-vs-new: `SELECT id` over eight VARCHAR(200) columns
+  **3.01 → 1.52 µs/row (~49%)**; `SELECT v8` (the last column, needing the
+  whole record) unchanged, the internal control; a narrow all-int scan
+  unchanged. Correct across the whole suite (`index` 403, `textcolcmp`
+  345, `subquery` 70, `view` 34, `charset` 43, `modifiers` 66, `update`
+  29, `savepointtx` 30, `snapshot`/`concurrency`/`autonomous`, `diff-mvcc`,
+  all 0 DIFF), with `sqz::unpack_prefix` and the ods decode unit-tested.
+  This is where COLUMN PRUNING's 2% went: the decode was never the cost;
+  the decompression was. The rest — decompressing the columns actually
+  read and the XDR encode — is the fundamental work the engine does too.
 
 - **169/169 does NOT mean the cost model is right everywhere the guard
   used to refuse.** On a stale UNIQUE/PK index there is a structural miss
