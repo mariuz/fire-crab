@@ -106,10 +106,22 @@ pub fn char_length(dtype: u8, length: u16, sub_type: i16) -> usize {
 /// -> `"äbcde"` - each five characters, each what the engine returned
 /// when asked.
 pub fn fit_char(text: &str, char_len: usize) -> String {
-    let mut out: String = text.chars().take(char_len).collect();
-    let have = out.chars().count();
-    if have < char_len {
-        out.extend(std::iter::repeat(' ').take(char_len - have));
+    // ONE pass, not two. The old form collected the first `char_len`
+    // characters and then walked the result AGAIN to count them; the
+    // count is known as we take. `char_len` bytes is the right capacity
+    // for single-byte content (the common case) and a lower bound for
+    // wide, which reallocates at most a handful of times.
+    let mut out = String::with_capacity(char_len);
+    let mut have = 0;
+    for c in text.chars() {
+        if have == char_len {
+            break;
+        }
+        out.push(c);
+        have += 1;
+    }
+    for _ in have..char_len {
+        out.push(' ');
     }
     out
 }

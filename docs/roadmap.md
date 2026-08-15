@@ -62,9 +62,11 @@ measured or pinned items**, each recorded in its own place below:
   the primary plan path, and `Database::columns` has now routed the
   SECONDARY planners (DML targets, subquery/derived sources, join sides,
   the correlated-outer split) through it too (~21% off a re-planning
-  DELETE, measured old-vs-new); what is left in the profile is the
-  deferred `choose_index` at execute and `intl::fit_char`, not a field
-  walk;
+  DELETE, measured old-vs-new); the CHAR-decode residual is closed too —
+  `intl::fit_char` is a single pass now and the decoder trims a CHAR's
+  blank padding as bytes before UTF8-decoding it (~20% off a CHAR-decode-
+  bound scan), so what is left in the profile is the deferred
+  `choose_index` at execute, not a field walk or a per-value re-scan;
 - **the optimizer's stale-statistics region** — statistics non-zero but
   WRONG are unmeasured, needing their own fixture family (load,
   `SET STATISTICS`, grow);
@@ -201,8 +203,26 @@ of those boundaries.
   **1.72 → 1.36 ms/statement, ~21%** (155 → 122 CPU ticks over 900
   statements). No answer moves — `serve-real-metadata.sh` runs every check
   cached and under `FC_NO_MDC=1`, both equal the engine, with hits and
-  invalidations non-zero. Still secondary in the profile: `intl::fit_char`,
-  and the deferred `choose_index` at execute.
+  invalidations non-zero.
+
+  The other named residual, `intl::fit_char`, is closed on the same
+  principle — do not touch what the answer does not depend on. A CHAR
+  decode used to build the whole blank-padded image into a string
+  (`from_utf8_lossy` over every trailing space of a wide CHAR — 240 bytes
+  for a UTF8 CHAR(60)) and then walk the characters TWICE, once to take
+  `char_len` of them and once to count what it took. It now trims the
+  trailing `0x20` padding as BYTES first (0x20 is a one-byte character
+  that never appears inside a multibyte sequence, so trimming bytes trims
+  exactly the trailing spaces), decodes only the content, and fits it in a
+  single pass. The trim-then-pad is an identity on what the engine returns
+  — a CHAR is padded to `char_len` on both sides — and a `decode_field`
+  unit test pins it for UTF8-wide, exact-fill, single-byte and all-blank.
+  Measured old-vs-new on a CHAR-decode-bound filter (5,000 wide-CHAR
+  decodes per query, minimal output): **7.92 → 6.33 ms/query, ~20%**
+  (95 → 76 CPU ticks over 120 queries). The charset gates
+  (`serve-real-charset.sh` 43, `utf8index` 21, `varcharfmt` 10, `outblr`
+  32, `starting` 36) hold the answers. What is left is the deferred
+  `choose_index` at execute.
 
 - **169/169 does NOT mean the cost model is right everywhere the guard
   used to refuse.** On a stale UNIQUE/PK index there is a structural miss

@@ -370,10 +370,22 @@ pub fn decode_field(image: &[u8], desc: &Descriptor, index: usize) -> Value {
         // written; [crate::intl::fit_char] cuts it to the five the
         // engine returns. In a single-byte set the two are the same
         // number and this is the identity it always was.
-        dtype::TEXT => Value::Text(crate::intl::fit_char(
-            &String::from_utf8_lossy(f),
-            crate::intl::char_length(desc.dtype, desc.length, desc.sub_type),
-        )),
+        dtype::TEXT => {
+            // A CHAR is blank-padded (0x20) to its full byte length, and
+            // only the first char_len CHARACTERS are the value. Trim the
+            // padding as BYTES before decoding, so a wide CHAR does not
+            // UTF8-validate hundreds of trailing spaces: 0x20 is a
+            // one-byte character that never appears inside a multibyte
+            // sequence, so dropping trailing 0x20 bytes drops exactly the
+            // trailing space characters, and `fit_char` pads back to
+            // char_len - the engine's own output is padded too, so the
+            // trim-then-pad is an identity on what it returns.
+            let end = f.iter().rposition(|&b| b != b' ').map_or(0, |i| i + 1);
+            Value::Text(crate::intl::fit_char(
+                &String::from_utf8_lossy(&f[..end]),
+                crate::intl::char_length(desc.dtype, desc.length, desc.sub_type),
+            ))
+        }
         dtype::VARYING => {
             let n = (u16_at(f, 0) as usize).min(len.saturating_sub(2));
             Value::Text(String::from_utf8_lossy(&f[2..2 + n]).into_owned())
@@ -667,6 +679,35 @@ mod tests {
         let row = decode_record(&image, &descs);
         assert_eq!(row[0], Value::Int(42));
         assert_eq!(row[1], Value::Null);
+    }
+
+    #[test]
+    fn char_decode_trims_padding_and_refits() {
+        // A CHAR is blank-padded (0x20) to its full byte length; decode
+        // trims the padding as bytes before UTF8-decoding and pads back to
+        // char_len, which must equal taking the first char_len characters
+        // of the whole padded image. Field @4 so the flag byte is @0.
+        let field = |dtype, length, sub_type, bytes: &[u8]| {
+            let d = Descriptor { dtype, scale: 0, length, sub_type, flags: 0, offset: 4 };
+            let mut image = vec![0u8; 4 + length as usize];
+            image[4..4 + bytes.len()].copy_from_slice(bytes);
+            // pad the remainder with 0x20, as the engine stores a CHAR
+            for b in image[4 + bytes.len()..].iter_mut() {
+                *b = b' ';
+            }
+            decode_field(&image, &d, 0)
+        };
+        // UTF8 CHAR(5) = 20 bytes: narrow content pads to five chars
+        assert_eq!(field(dtype::TEXT, 20, 4, b"ab"), Value::Text("ab   ".into()));
+        // UTF8 CHAR(5): five-char wide content fills exactly, no padding
+        assert_eq!(
+            field(dtype::TEXT, 20, 4, "\u{e4}bcde".as_bytes()),
+            Value::Text("\u{e4}bcde".into())
+        );
+        // NONE CHAR(5) = 5 bytes: same rule, single-byte set
+        assert_eq!(field(dtype::TEXT, 5, 0, b"ab"), Value::Text("ab   ".into()));
+        // an all-blank field is five spaces, not empty
+        assert_eq!(field(dtype::TEXT, 5, 0, b""), Value::Text("     ".into()));
     }
 
     #[test]
