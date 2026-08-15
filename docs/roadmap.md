@@ -2363,13 +2363,24 @@ plus *the subsystem is now on the path*.
       arm already did) also LIT a previously refused shape: `(N+0) LIKE ?`
       now binds and renders, at width 30, exactly as the engine answers it.
       Gated (numericwhere +4): the expression-LHS width for `(A+0)`,
-      `(N+0)`, `(I+0)` and a `CAST`. One rarer construct still at 32765 - a
-      `?`-on-the-tested-side LIKE (`resolve_param_lhs`) - and a genuinely
-      separate gap left as-is: a CONCATENATION-LHS LIKE (`VC||'x' LIKE ...`)
-      is refused outright even with a literal pattern, a pre-existing
-      expression-support boundary, not a width one. Still refused
-      deliberately: DECFLOAT in arithmetic / nested, the `Infinity`/`NaN`
-      text-literal specials, and a value past DECFLOAT(34) range.
+      `(N+0)`, `(I+0)` and a `CAST`.
+
+      *And the `?`-ON-THE-TESTED-SIDE closed the last width* - the tested
+      `?` of `? LIKE/STARTING <pattern>` describes as the PATTERN's own
+      width (probed): a literal pattern its char length (`'abc%'` is 4,
+      `'a_c%def'` is 7, `'x'` is 1), a NULL pattern a bare 1, and a
+      parameter pattern the fixed 30 (both `?`s of `? LIKE ?` are 30).
+      `resolve_param_lhs` now claims the tested slot with a
+      char-length-derived VARYING (`+2` for the count) instead of the flat
+      32765, per pattern kind. The value binding was untouched (the driver
+      sends both sides at their true length). Gated (numericwhere +6): the
+      literal, NULL and param-pattern widths for `? LIKE` and `? STARTING
+      WITH`. A CONCATENATION-LHS LIKE (`VC||'x' LIKE ...`) is still refused
+      outright even with a literal pattern - a pre-existing
+      expression-support boundary, not a width one, its own slice. Still
+      refused deliberately: DECFLOAT in arithmetic / nested, the
+      `Infinity`/`NaN` text-literal specials, and a value past DECFLOAT(34)
+      range.
 
       *And the wide OUTER value came with it* — the probe's `band` capped
       an `Int128` driving value at `i64` and scanned; now it carries the

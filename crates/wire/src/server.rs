@@ -44503,15 +44503,22 @@ fn resolve_param_lhs(
         }
         params[slot] = Some(d);
     };
-    // the synthesized wide-text bind target, the 25500s convention
-    let text_desc = || Descriptor {
+    // the tested `?` of a `? LIKE/STARTING <pattern>` describes as the
+    // PATTERN's own width (probed): a literal pattern its char length
+    // (`'abc%'` is 4, `'x'` is 1), a NULL pattern a bare 1, a parameter
+    // pattern the fixed 30 (both `?`s of `? LIKE ?` are 30). A VARYING
+    // descriptor length carries the 2-byte count, so it is chars + 2.
+    let text_desc_chars = |chars: usize| Descriptor {
         dtype: dtype::VARYING,
         scale: 0,
-        length: 32765,
+        length: chars.saturating_add(2).min(u16::MAX as usize) as u16,
         sub_type: 0,
         flags: 0,
         offset: 4,
     };
+    // the width of a `?` pattern against another `?` (or the tested `?`
+    // when the pattern is itself a `?`): 30, matching numeric_term's slot
+    let param_pat_chars = (NUM_LIKE_PATTERN_LEN - 2) as usize;
     // the SQL_NULL slot (32766/len 0) - what the engine describes for
     // `? IS NULL`, and honest: the bind is type-blind
     let null_desc = || Descriptor {
@@ -44532,13 +44539,14 @@ fn resolve_param_lhs(
             Term::ParamIsNull(slot, true)
         }
         RawKind::Like(pattern, escape, negated) => {
-            claim(slot, text_desc());
             match pattern {
-                Rhs::Str(_) => {
+                Rhs::Str(p) => {
+                    claim(slot, text_desc_chars(p.chars().count()));
                     Term::ParamLike(slot, pattern.clone(), *escape, *negated)
                 }
                 Rhs::Param(pslot, _) => {
-                    claim(*pslot, text_desc());
+                    claim(slot, text_desc_chars(param_pat_chars));
+                    claim(*pslot, text_desc_chars(param_pat_chars));
                     Term::ParamLike(
                         slot,
                         Rhs::Param(*pslot, ColKind::Text),
@@ -44546,21 +44554,31 @@ fn resolve_param_lhs(
                         *negated,
                     )
                 }
-                // `? LIKE NULL` is UNKNOWN for every bind (probed) -
-                // but the slot still describes, so prepare succeeds
-                Rhs::Null => Term::Never,
+                // `? LIKE NULL` is UNKNOWN for every bind (probed) - but
+                // the slot still describes (a bare VARYING(1), probed), so
+                // prepare succeeds
+                Rhs::Null => {
+                    claim(slot, text_desc_chars(1));
+                    Term::Never
+                }
                 _ => return None,
             }
         }
         RawKind::Starting(prefix, negated) => {
-            claim(slot, text_desc());
             match prefix {
-                Rhs::Str(_) => Term::ParamStarting(slot, prefix.clone(), *negated),
+                Rhs::Str(p) => {
+                    claim(slot, text_desc_chars(p.chars().count()));
+                    Term::ParamStarting(slot, prefix.clone(), *negated)
+                }
                 Rhs::Param(pslot, _) => {
-                    claim(*pslot, text_desc());
+                    claim(slot, text_desc_chars(param_pat_chars));
+                    claim(*pslot, text_desc_chars(param_pat_chars));
                     Term::ParamStarting(slot, Rhs::Param(*pslot, ColKind::Text), *negated)
                 }
-                Rhs::Null => Term::Never,
+                Rhs::Null => {
+                    claim(slot, text_desc_chars(1));
+                    Term::Never
+                }
                 _ => return None,
             }
         }

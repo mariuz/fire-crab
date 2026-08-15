@@ -375,6 +375,25 @@ patw "int expr"      "(A + 0)"               "T"
 patw "numeric expr"  "(N + 0)"               "T"
 patw "int128 expr"   "(I + 0)"               "T"
 patw "cast expr"     "CAST(A AS VARCHAR(7))" "T"
+# the `?`-on-the-tested-side of `? LIKE/STARTING <pattern>` describes as the
+# PATTERN's width: a literal its char length, a NULL a bare 1, a `?` the
+# fixed 30 (both `?`s of `? LIKE ?` are 30).
+plw() { # <label> <where-clause> - all input VARYING param widths, in order
+    local q fw ew
+    q="SET SQLDA_DISPLAY ON;
+SELECT ID FROM T WHERE $2;"
+    fw=$(printf '%s\n' "$q" | "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$WORK" 2>&1 |
+         grep -oiE 'VARYING[^,]*len: [0-9]+' | grep -oiE 'len: [0-9]+' | paste -sd,)
+    ew=$(printf '%s\n' "$q" | "$ISQL" -q -user "$U" -pas "$P" "$WORK" 2>&1 |
+         grep -oiE 'VARYING[^,]*len: [0-9]+' | grep -oiE 'len: [0-9]+' | paste -sd,)
+    check "param-lhs LIKE width $1 [$2]" "$fw" "$ew"
+}
+plw "literal pat"  "? LIKE 'abc%'"
+plw "literal long" "? LIKE 'a_c%def'"
+plw "param pat"    "? LIKE ?"
+plw "starting lit" "? STARTING WITH 'x'"
+plw "starting par" "? STARTING WITH ?"
+plw "null pat"     "? LIKE NULL"
 
 # --- 1d. WIDE INT128 LITERAL in INSERT VALUES --------------------------
 # The value-list tokenizer reads a magnitude past i64 as Tok::Int128; the
