@@ -2428,11 +2428,23 @@ plus *the subsystem is now on the path*.
       operand promotes the whole result, even `D16 * 2` and a `NUMERIC` mix,
       probed. The cohort rides through (`1.5 * 2` is `3.0`, `1.5 + 1` is
       `2.5`). Gated (numericwhere +11): value AND describe for int/decimal/
-      column/nested operands over DECFLOAT(34) and DECFLOAT(16). Still
-      refused deliberately: DECFLOAT DIVISION (its exponent/cohort is
-      decNumber's `decDivide`, a later slice - fc refuses `/`, the engine
-      computes it), DECFLOAT arithmetic in a WHERE side, and a value past
-      DECFLOAT(34) range.
+      column/nested operands over DECFLOAT(34) and DECFLOAT(16).
+
+      *And DIVISION completed the four operators* - the feared decNumber
+      `decDivide` exponent turned out to fall out of long division over the
+      operands' OWN cohort coefficients (probed and matched): `6/2` is `3`,
+      `1/2` is `0.5`, `12.0/3` is `4.0` (120/3 = 40 at exp -1), `1/3` is 34
+      threes, `2/3` rounds up to `…667`. `ods::decfloat::div` does schoolbook
+      long division to exactness or 35 sig then rounds to 34 HALF-UP - no
+      wide integer, no separate cohort-reduction step. Divide-by-zero traps
+      as the engine does: `x/0` is `isc_decfloat_divide_by_zero` (SQLSTATE
+      22012, a new `EvalErr` emitted alone), `0/0` the invalid-operation
+      22000 - both probed and matched. `is_decfloat_arith` and the eval
+      branch now take `/`. Gated (numericwhere +6): column/int/decimal/
+      nested quotients and the `x/0` SQLSTATE. Still refused deliberately:
+      DECFLOAT arithmetic on a WHERE side, `CAST(x AS DECFLOAT)` (which is
+      why a `0/0` LITERAL still refuses at prepare - the CAST does, not the
+      division), and a value past DECFLOAT(34) range.
 
       *And the wide OUTER value came with it* — the probe's `band` capped
       an `Int128` driving value at `i64` and scanned; now it carries the

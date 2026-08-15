@@ -395,6 +395,22 @@ SELECT $2 FROM DF2;"
 }
 dw_expr "add"    "D + 1"
 dw_expr "d16"    "S * 3"
+# DECFLOAT DIVISION: the quotient's exponent/cohort falls out of long
+# division (12.0/3 is 4.0, 1/3 is 34 threes); x/0 traps 22012, 0/0 traps
+# 22000. Value differential over DF2, trap by SQLSTATE.
+dfexpr "div col"     "D / S"
+dfexpr "div int"     "D / 3"
+dfexpr "div d16"     "S / 4"
+dfexpr "div literal" "100 / S"
+dfexpr "div nested"  "D / 2 + 1"
+dfsqlstate() { # <label> <expr>
+    local q fc en
+    q="SELECT $2 FROM DF2;"
+    fc=$(printf '%s\n' "$q" | "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$WORK" 2>&1 | grep -oiE 'SQLSTATE = [0-9]+' | head -1)
+    en=$(printf '%s\n' "$q" | "$ISQL" -q -user "$U" -pas "$P" "$WORK" 2>&1 | grep -oiE 'SQLSTATE = [0-9]+' | head -1)
+    check "decfloat div-by-0 $1 [$2]" "$fc" "$en"
+}
+dfsqlstate "x / 0"  "D / 0"
 
 # the LIKE/STARTING pattern `?` slot on a NUMERIC column describes as a
 # FIXED VARYING(30) - the engine's numeric-to-text render width, NOT the

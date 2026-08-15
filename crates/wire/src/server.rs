@@ -29272,6 +29272,9 @@ const GDS_INTEGER_DIVIDE: i32 = 335544778;
 /// under arith_except): the engine's per-row trap when a comparison meets
 /// a NaN DECFLOAT value ("Decimal float invalid operation. ...")
 const GDS_DECFLOAT_INVALID_OPERATION: i32 = 335545141;
+/// `isc_decfloat_divide_by_zero` - SQLSTATE 22012, emitted ALONE: a
+/// DECFLOAT `x / 0` ("Decimal float divide by zero. ...", probed)
+const GDS_DECFLOAT_DIVIDE_BY_ZERO: i32 = 335545139;
 /// `isc_exception_float_divide_by_zero` - SQLSTATE 22012
 const GDS_FLOAT_DIVIDE: i32 = 335544772;
 /// `isc_exception_float_overflow` - SQLSTATE 22003
@@ -29482,6 +29485,11 @@ fn eval_status_items(w: &mut W, e: &EvalErr) {
             // invalid operation. ..." with no arith_except prefix (probed)
             w.int(1) // isc_arg_gds
                 .int(GDS_DECFLOAT_INVALID_OPERATION);
+        }
+        EvalErr::DecfloatDivideByZero => {
+            // emitted ALONE ("Decimal float divide by zero. ...", probed)
+            w.int(1) // isc_arg_gds
+                .int(GDS_DECFLOAT_DIVIDE_BY_ZERO);
         }
         EvalErr::FloatOverflow => {
             w.int(1) // isc_arg_gds
@@ -34221,6 +34229,9 @@ enum EvalErr {
     /// rows before it, then raises (probed) - so it is an eval error, not
     /// an UNKNOWN.
     DecfloatInvalidOperation,
+    /// a DECFLOAT `x / 0` (x != 0): `isc_decfloat_divide_by_zero` (SQLSTATE
+    /// 22012). `0 / 0` is the invalid-operation trap above (22000, probed).
+    DecfloatDivideByZero,
     /// a CAST whose value does not fit the integer target's width -
     /// `isc_numeric_out_of_range` under `isc_arith_except` (SQLSTATE
     /// 22003), a DIFFERENT vector from IntegerOverflow's single code
@@ -34612,12 +34623,10 @@ fn is_decfloat_col(d: &Descriptor) -> bool {
     matches!(d.dtype, dtype::DEC64 | dtype::DEC128)
 }
 
-/// TRUE when `e` is a numeric arithmetic tree - `+`/`-`/`*` and unary `-`
-/// over integer / NUMERIC / DECFLOAT leaves - with at least one DECFLOAT
+/// TRUE when `e` is a numeric arithmetic tree - `+`/`-`/`*`/`/` and unary
+/// `-` over integer / NUMERIC / DECFLOAT leaves - with at least one DECFLOAT
 /// leaf. That shape computes and describes as DECFLOAT(34) (any DECFLOAT
-/// operand promotes the whole result, probed). Division is a later slice,
-/// so a `/` anywhere makes this false and the statement refuses rather than
-/// answering a wrong value.
+/// operand promotes the whole result, probed).
 fn is_decfloat_arith(e: &Expr, descs: &[Descriptor]) -> bool {
     fn walk(e: &Expr, descs: &[Descriptor]) -> Option<bool> {
         Some(match e {
@@ -34635,9 +34644,7 @@ fn is_decfloat_arith(e: &Expr, descs: &[Descriptor]) -> bool {
                 }
             }
             Expr::Neg(x) => walk(x, descs)?,
-            Expr::Bin(a, op, b) if matches!(op, ArithOp::Add | ArithOp::Sub | ArithOp::Mul) => {
-                walk(a, descs)? || walk(b, descs)?
-            }
+            Expr::Bin(a, _, b) => walk(a, descs)? || walk(b, descs)?,
             _ => return None,
         })
     }
@@ -36617,7 +36624,17 @@ impl Expr {
                         ArithOp::Add => df::add(&da, &db),
                         ArithOp::Sub => df::sub(&da, &db),
                         ArithOp::Mul => df::mul(&da, &db),
-                        ArithOp::Div => return Err(EvalErr::Unsupported),
+                        ArithOp::Div => {
+                            // x / 0 traps 22012, 0 / 0 traps 22000 (probed)
+                            if df::is_zero(&db) {
+                                return Err(if df::is_zero(&da) {
+                                    EvalErr::DecfloatInvalidOperation
+                                } else {
+                                    EvalErr::DecfloatDivideByZero
+                                });
+                            }
+                            df::div(&da, &db)
+                        }
                     };
                     if matches!(r, df::Dec::Nan) {
                         return Err(EvalErr::DecfloatInvalidOperation);

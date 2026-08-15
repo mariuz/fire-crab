@@ -507,6 +507,80 @@ fn finite(neg: bool, digits: Vec<u8>, exp: i64) -> Dec {
     Dec::Finite { neg, coeff, exp: exp.clamp(i32::MIN as i64, i32::MAX as i64) as i32 }
 }
 
+fn sig_len(d: &[u8]) -> usize {
+    let s = strip0(d.to_vec());
+    if s == b"0" { 0 } else { s.len() }
+}
+/// (quotient, remainder) of `a / b` as digit strings, schoolbook long
+/// division. `b` must be non-zero.
+fn udivmod(a: &[u8], b: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    if ucmp(a, b) == std::cmp::Ordering::Less {
+        return (vec![b'0'], a.to_vec());
+    }
+    let mut q = Vec::new();
+    let mut rem: Vec<u8> = vec![b'0'];
+    for &ch in a {
+        if rem == b"0" {
+            rem = vec![ch];
+        } else {
+            rem.push(ch);
+        }
+        rem = strip0(rem);
+        // the largest digit d with b*d <= rem
+        let mut d = 0u8;
+        while d < 9 && ucmp(&umul(b, &[b'0' + d + 1]), &rem) != std::cmp::Ordering::Greater {
+            d += 1;
+        }
+        q.push(b'0' + d);
+        rem = usub(&rem, &umul(b, &[b'0' + d]));
+    }
+    (strip0(q), rem)
+}
+
+/// TRUE for a finite zero (any cohort).
+pub fn is_zero(d: &Dec) -> bool {
+    matches!(d, Dec::Finite { coeff: 0, .. })
+}
+
+/// `a / b`, to 34 significant digits HALF-UP. The result exponent falls out
+/// of long division over the operands' OWN cohort coefficients - the ideal
+/// exponent `e1 - e2` when the quotient is exact there, else as many places
+/// as the exact value needs (up to 34 sig): `12.0 / 3` is `4.0`, `1 / 2` is
+/// `0.5`, `1 / 3` is 34 threes. A ZERO divisor is the caller's to trap
+/// (22012, or 22000 for `0/0`); the specials propagate as decNumber does
+/// (`Infinity / Infinity` is NaN, `finite / Infinity` is 0).
+pub fn div(a: &Dec, b: &Dec) -> Dec {
+    match (a, b) {
+        (Dec::Nan, _) | (_, Dec::Nan) => return Dec::Nan,
+        (Dec::Infinity { .. }, Dec::Infinity { .. }) => return Dec::Nan,
+        (Dec::Infinity { neg: x }, Dec::Finite { neg: f, .. }) => {
+            return Dec::Infinity { neg: x != f };
+        }
+        (Dec::Finite { .. }, Dec::Infinity { .. }) => {
+            return Dec::Finite { neg: false, coeff: 0, exp: 0 };
+        }
+        _ => {}
+    }
+    let (na, ca, ea) = parts(a);
+    let (nb, cb, eb) = parts(b);
+    if cb == b"0" {
+        return if ca == b"0" { Dec::Nan } else { Dec::Infinity { neg: na != nb } };
+    }
+    let ideal = ea - eb;
+    let (mut q, mut rem) = udivmod(&ca, &cb);
+    let mut exp = ideal;
+    while rem != b"0" && sig_len(&q) < 35 {
+        rem.push(b'0'); // rem *= 10
+        rem = strip0(rem);
+        let (d, r) = udivmod(&rem, &cb);
+        q.extend(d); // a single digit (rem < 10*cb)
+        rem = r;
+        exp -= 1;
+    }
+    let (kept, drop) = round34(&strip0(q));
+    finite(na != nb, kept, exp + drop)
+}
+
 /// Encode a computed [Dec] back to its decimal128 bits.
 pub fn dec_to_bits(d: &Dec) -> u128 {
     match d {
@@ -791,6 +865,17 @@ mod tests {
         let big: u128 = "9999999999999999999999999999999999".parse().unwrap(); // 34 nines
         // 34-nines squared = 10^68 - 2e34 + 1 -> 34 sig ...998 (probed engine)
         assert_eq!(s(&mul(&d(false, big, 0), &d(false, big, 0))), "9.999999999999999999999999999999998E+67");
+        // division - the exponent/cohort rules probed against the engine
+        assert_eq!(s(&div(&d(false, 1, 0), &d(false, 3, 0))), "0.3333333333333333333333333333333333"); // 34 threes
+        assert_eq!(s(&div(&d(false, 6, 0), &d(false, 2, 0))), "3");
+        assert_eq!(s(&div(&d(false, 1, 0), &d(false, 2, 0))), "0.5");
+        assert_eq!(s(&div(&d(false, 10, 0), &d(false, 4, 0))), "2.5");
+        assert_eq!(s(&div(&d(false, 15, -1), &d(false, 4, 0))), "0.375"); // 1.5 / 4
+        assert_eq!(s(&div(&d(false, 120, -1), &d(false, 3, 0))), "4.0"); // 12.0 / 3, cohort kept
+        assert_eq!(s(&div(&d(false, 10, -1), &d(false, 4, 0))), "0.25"); // 1.0 / 4
+        assert_eq!(s(&div(&d(false, 2, 0), &d(false, 3, 0))), "0.6666666666666666666666666666666667");
+        assert_eq!(s(&div(&d(false, 5, 0), &d(false, 1000, 0))), "0.005");
+        assert_eq!(s(&div(&d(true, 6, 0), &d(false, 2, 0))), "-3"); // sign
         // Infinity arithmetic
         assert!(matches!(add(&Dec::Infinity { neg: false }, &d(false, 1, 0)), Dec::Infinity { neg: false }));
         assert!(matches!(add(&Dec::Infinity { neg: false }, &Dec::Infinity { neg: true }), Dec::Nan));
