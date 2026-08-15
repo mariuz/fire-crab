@@ -85,14 +85,16 @@ measured or pinned items**, each recorded in its own place below:
   ~0.76 µs per string column, but that is byte-shipping, not redundancy —
   removing `render()`'s String clone and short-circuiting
   `enforce_out_capacity` each moved it ~0% (Rust's allocator makes a small
-  String clone free against the copy and the send). fire-crab is ~1.6× the
-  engine on such a scan (80 vs 50 ms for 3,000 wide rows), and the gap is
-  the batch MATERIALISATION — the whole cursor is collected into a
-  `Vec<Vec<Value>>` before a byte is encoded, so every value is copied
-  through decode → project → `Plan::Rows` → encode. Closing that is
-  STREAMING the cursor (R8's remaining "the fetch pulls the tree" step, a
-  PUSH with `Flow::Stop` today), an architectural change, not a residual to
-  shave in the encoder;
+  String clone free against the copy and the send). What DID cost was the
+  batch MATERIALISATION — the whole cursor was collected into a
+  `Vec<Vec<Value>>` before a byte was encoded — and CURSOR STREAMING closed
+  it: a plain scan now produces `want` rows per fetch and remembers its
+  place (`StreamCursor`) rather than building the whole result. Reading the
+  first 200 rows of a 50,000-row cursor went from 18.8 to 3.3 ms of server
+  CPU (~5.7×, now O(rows fetched) not O(result)), reading ALL 50,000 from
+  38.5 to 25.6 ms (~33%, the copy through `Plan::Rows` gone), and peak
+  memory from O(result) to O(batch) — the scalability wall a large result
+  hit. R8's "the fetch pulls the tree" is real for the shape it fits;
 - **the optimizer's stale-statistics region** — statistics non-zero but
   WRONG are unmeasured, needing their own fixture family (load,
   `SET STATISTICS`, grow);
@@ -338,17 +340,31 @@ of those boundaries.
   `enforce_out_capacity` (which `render()`s and `chars().count()`s each
   string) moved it ~0% too — a small String clone is free against the copy
   into the send buffer and the send itself. Both were reverted; neither
-  earned its churn. fire-crab is ~1.6× the engine here (80 vs 50 ms for
-  3,000 wide rows), and that gap is not the encoder but the batch
-  MATERIALISATION: the cursor is collected whole into a `Vec<Vec<Value>>`
-  (the documented deadlock-avoidance shape) before any byte is encoded, so
-  every value is copied through decode → project → `Plan::Rows` → encode
-  and the whole result set is held at once. Closing it is STREAMING the
-  cursor — R8's remaining step, the fetch pulling the tree row by row
-  across the wire rather than materialising, today a PUSH with `Flow::Stop`
-  — an architectural change with its own gate story, not a shave in the
-  encoder. The rest — decompressing the columns actually read and shipping
-  their bytes — is the fundamental work the engine does too.
+  earned its churn. What DID cost was the batch MATERIALISATION: the cursor
+  was collected whole into a `Vec<Vec<Value>>` (the deadlock-avoidance
+  shape) before any byte was encoded, so every value was copied through
+  decode → project → `Plan::Rows` → encode and the whole result set held at
+  once. CURSOR STREAMING closed it — R8's remaining step, the fetch pulling
+  the tree rather than materialising. `StreamCursor` produces up to `want`
+  visible, filtered records per op_fetch and resumes from a `(page, slot)`
+  position over the relation's page list, for the shape it fits: a plain
+  `Plan::Project` over a full scan with no index, sort, generator, window
+  or deferred access (a parameterised WHERE is bound at open). It holds the
+  `Arc` image it opened over — the view stays the one committed at open as
+  other transactions commit between fetches, the stability materialising
+  once gave without holding every row — and it is keyed by statement handle
+  (a client can hold a cursor open across another statement's fetches);
+  everything else materialises as before, because `open` answers `None`.
+  The `want` batch size is the flow control, so the deadlock the
+  materialising path guarded against cannot arise. Measured (connection
+  reused): reading the first 200 rows of a 50,000-row cursor is 3.3 ms of
+  server CPU against 18.8 before (~5.7×, O(rows fetched) not O(result)),
+  reading ALL 50,000 is 25.6 against 38.5 (~33%, the `Plan::Rows` copy
+  gone), and peak memory is O(batch) not O(result). Correct across the
+  suite (index 403, subquery 70, view 34, modifiers 66, describe 110,
+  charset 43, snapshot/concurrency/update, all 0 DIFF; ods 107, wire 232).
+  The rest — decompressing the columns actually read and shipping their
+  bytes — is the fundamental work the engine does too.
 
 - **169/169 does NOT mean the cost model is right everywhere the guard
   used to refuse.** On a stale UNIQUE/PK index there is a structural miss
@@ -2019,11 +2035,16 @@ pulled by the fetch.
 
   **R8's published steps are done.** What the programme has not taken:
   `NestedLoopJoin` for RIGHT and FULL still materialises (their mirror
-  emits the other side's unmatched rows), `Aggregate` and `Sort` are
-  blocking by nature, and the fetch still asks for a whole batch rather
-  than pulling row by row across the wire - the walk is a PUSH with a
-  `Flow::Stop`, which is observationally equal for errors and early
-  exit but is not the engine's iterator.
+  emits the other side's unmatched rows), and `Aggregate` and `Sort` are
+  blocking by nature. The fetch itself, though, now PULLS the tree for the
+  shape it fits: a plain `Plan::Project` over a full scan streams through
+  `StreamCursor`, producing `want` rows per op_fetch and resuming from a
+  `(page, slot)` position rather than materialising the whole cursor - so
+  reading the first 200 rows of a 50,000-row result is O(200), not
+  O(50,000), and peak memory is O(batch), not O(result). A sort, an
+  aggregate, a join, an index retrieval or a generator still materialises;
+  the wire cursor is the engine's iterator now for the plain scan, and a
+  PUSH with `Flow::Stop` for the rest.
 
   ~~The next thing worth doing here is a boundary the gates already pin:
   the engine raises a blocking node's error at OPEN, where this server
