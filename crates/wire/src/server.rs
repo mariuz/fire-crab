@@ -28157,6 +28157,20 @@ fn join_rows(
     // the engine's own status vector - it used to be collected and
     // DROPPED, returning the rows computed before it as if nothing had
     // happened, which is a wrong answer with no error attached.)
+    join_rowsource(base, base_width, parts, filter).rows(db)
+}
+
+/// The left-deep join TREE as a row source, before it is pulled. Kept
+/// separate from [join_rows] so a caller that wants to WALK the join
+/// lazily - a `FIRST n` above it, which stops the driver after `n`
+/// matched rows rather than building every one and slicing - can, instead
+/// of materialising the whole result first.
+fn join_rowsource(
+    base: &RowSource,
+    base_width: usize,
+    parts: &[JoinPart],
+    filter: &Option<Predicate>,
+) -> RowSource {
     let mut src = base.clone();
     let mut left_width = base_width;
     for part in parts {
@@ -28169,7 +28183,7 @@ fn join_rows(
         };
         left_width += part.width;
     }
-    RowSource::Filter { input: Box::new(src), pred: filter.clone() }.rows(db)
+    RowSource::Filter { input: Box::new(src), pred: filter.clone() }
 }
 
 /// One step of the fold: join the rows accumulated so far with the next
@@ -30664,6 +30678,63 @@ fn emit_rows_inner(
                         }
                         for r in rows_v.iter().skip(*skip).take(take.unwrap_or(usize::MAX)) {
                             encode_row(w, cols, r, out)?;
+                        }
+                        return Ok(());
+                    }
+                }
+                // A JOIN under an unsorted, non-DISTINCT FIRST/SKIP STREAMS
+                // TOO, for the same reason the plain scan does: the engine
+                // stops the cursor after `skip + take` rows, so a raiser in
+                // a LATER row never runs. The materialising path below built
+                // EVERY joined row and projected it - which evaluated the
+                // select list (a `100/W` divide, a cast) on rows past the
+                // limit and raised where the engine answers. Walking the
+                // join tree and stopping keeps the projection lazy: the ON
+                // still decides matches (an error there ends the join, as
+                // the engine's does), but the OUTPUT columns are evaluated
+                // only for a row this modifier actually delivers. A
+                // RIGHT/FULL join still materialises its mirror inside the
+                // walk, but its rows are yielded one at a time, so the
+                // projection stays lazy and the limit still stops it.
+                if let Plan::Join { base, base_width, parts, cols: jcols, filter, order_by, defer } =
+                    &**inner
+                {
+                    if !*distinct && order_by.is_empty() {
+                        let bound = bind_filter(filter, args)?;
+                        let base = resolve_driver_base(db, base, defer, &bound);
+                        let src = join_rowsource(&base, *base_width, parts, &bound);
+                        let stop_at = take.map(|t| skip.saturating_add(t));
+                        let mut accepted = 0usize;
+                        let mut enc: Option<EvalErr> = None;
+                        src.for_each(db, &mut |combined| {
+                            accepted += 1;
+                            if accepted > *skip {
+                                // the join's OUTPUT columns first (the
+                                // select list), then the modifier's
+                                // positional columns over them
+                                let mut jrow = Vec::with_capacity(jcols.len());
+                                for c in jcols {
+                                    match c.value_of(&combined) {
+                                        Ok(v) => jrow.push(v),
+                                        Err(e) => {
+                                            enc = Some(e);
+                                            return Ok(Flow::Stop);
+                                        }
+                                    }
+                                }
+                                if let Err(e) = encode_row(w, cols, &jrow, out) {
+                                    enc = Some(e);
+                                    return Ok(Flow::Stop);
+                                }
+                            }
+                            Ok(match stop_at {
+                                Some(n) if accepted >= n => Flow::Stop,
+                                _ => Flow::Continue,
+                            })
+                        })
+                        .map_err(EmitErr::Eval)?;
+                        if let Some(e) = enc {
+                            return Err(EmitErr::Eval(e));
                         }
                         return Ok(());
                     }
