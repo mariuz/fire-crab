@@ -70,7 +70,20 @@ measured or pinned items**, each recorded in its own place below:
   prepared statement's executes) is memoised in the epoch cache, so a
   parameterised WHERE resolves its band without re-running the optimizer
   each time (~26–43% off a re-executed `WHERE col = ?`). What is left is
-  the record walk and the wire itself;
+  the record walk and the wire itself — measured, not near-zero: a narrow
+  50k-row scan is ~110 ms against the engine's ~80 (≈1.4×, more in server
+  CPU), and the one clear redundancy is that the walk decodes EVERY column
+  of every row and the projection selects fields afterward, so
+  `SELECT id FROM <wide table>` pays to decode (and allocate strings for)
+  columns it discards — measured ~2× on a wide-table narrow projection.
+  Closing it is COLUMN PRUNING (decode only the fields the plan reads),
+  and it is a feature, not a residual: it threads a decode mask from
+  `Plan::Project` through `scan_filter_sort`/`leaf_source`/the scan walk
+  to `decode_record`, and a MISSED field reference is a silent wrong
+  answer, so it wants its own carefully-gated slice with a complete
+  referenced-field analysis (the trusted `expr_reads` walker is the tool)
+  and a conservative decode-all fallback — not to be folded into a cache
+  cleanup;
 - **the optimizer's stale-statistics region** — statistics non-zero but
   WRONG are unmeasured, needing their own fixture family (load,
   `SET STATISTICS`, grow);
@@ -249,7 +262,29 @@ of those boundaries.
   more because costing an index is the optimizer's heavier path.
   `serve-real-index.sh` (403), `leftjoinindex` (169), `paramshapes` (114)
   and `serve-real-metadata.sh` (cached and under `FC_NO_MDC=1`, both equal
-  the engine) hold it. What is left is the record walk and the wire.
+  the engine) hold it.
+
+  That leaves the record walk itself, and it was measured rather than
+  assumed. Decomposed on a 50k-row scan: the pure visibility walk (a
+  `COUNT`, no image assembled) is ~0.22 µs/row; assembling the record
+  (RLE decompress + a `Vec<u8>`), decoding it into a `Vec<Value>` and
+  encoding it to the wire adds the rest, to ~0.9 µs/row for four ints.
+  Against the engine, a narrow 50k-row scan is ~110 ms to its ~80 — close,
+  but not parity, and wider on server CPU. The one clear redundancy is
+  that the walk decodes EVERY column and the projection selects fields
+  afterward: `SELECT id FROM <wide table>` decodes and allocates the wide
+  CHARs it then discards, measured ~2× the cost of decoding only what is
+  read. Closing that is COLUMN PRUNING — a decode mask carried from
+  `Plan::Project` (the union of the fields `cols`, `filter`, `order_by`,
+  `gen_cols` and `windows` reference, via the trusted `expr_reads` walker)
+  down through `scan_filter_sort`, `leaf_source` and the scan walk to
+  `decode_record`, decoding only masked fields and falling back to
+  decode-all whenever the reference set cannot be proven complete. It is a
+  FEATURE, not a residual to shave in a cache pass: a missed field
+  reference is a silent wrong answer, it touches ~30 sites in the core
+  query path, and it belongs in its own slice gated the differential way.
+  The rest — the per-row `Vec<u8>` and `Vec<Value>` and the XDR encode —
+  is the fundamental work the engine does too.
 
 - **169/169 does NOT mean the cost model is right everywhere the guard
   used to refuse.** On a stale UNIQUE/PK index there is a structural miss
