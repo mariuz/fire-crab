@@ -44687,16 +44687,28 @@ fn resolve_expr_term(
         // the literal STARTING arm carries; the slot claims the
         // synthesized text descriptor.
         RawKind::Like(Rhs::Param(slot, _), escape, negated) => {
-            if !matches!(lhs.type_of(descs)?, ExprType::Text | ExprType::Int) {
-                return None;
-            }
+            // the pattern slot describes as the LHS expression's own result
+            // text width (probed): a numeric expression renders to the fixed
+            // 30, a text one to its computed width - UPPER(VC10) is 10,
+            // VC||'x' is 11, SUBSTRING(.. FOR 3) is 3, CAST(I AS VARCHAR(7))
+            // is 7. A width the describe machinery cannot pin keeps the max.
+            let length = match lhs.type_of(descs)? {
+                // a numeric expression (INT or scaled NUMERIC) renders to
+                // the fixed 30, matching the literal-pattern arm above,
+                // which already accepts a numeric side
+                ExprType::Int | ExprType::Numeric => NUM_LIKE_PATTERN_LEN,
+                ExprType::Text => text_form(&lhs, descs)
+                    .map(|(_, w, _)| (w as u16).saturating_add(2))
+                    .unwrap_or(32765),
+                _ => return None,
+            };
             if params.len() <= *slot {
                 params.resize(*slot + 1, None);
             }
             params[*slot] = Some(Descriptor {
                 dtype: dtype::VARYING,
                 scale: 0,
-                length: 32765,
+                length,
                 sub_type: 0,
                 flags: 0,
                 offset: 4,

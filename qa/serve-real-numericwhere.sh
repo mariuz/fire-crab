@@ -368,6 +368,13 @@ patw "INT128"        "I"  "T"
 patw "INTEGER"       "A"  "T"
 patw "DECFLOAT(34)"  "D"  "DF2"
 patw "DECFLOAT(16)"  "S"  "DF2"
+# an EXPRESSION-LHS LIKE pattern takes the EXPRESSION's result text width:
+# a numeric expression the fixed 30, a CAST its target width. (A numeric-
+# expression `?` pattern - refused before - now binds and renders too.)
+patw "int expr"      "(A + 0)"               "T"
+patw "numeric expr"  "(N + 0)"               "T"
+patw "int128 expr"   "(I + 0)"               "T"
+patw "cast expr"     "CAST(A AS VARCHAR(7))" "T"
 
 # --- 1d. WIDE INT128 LITERAL in INSERT VALUES --------------------------
 # The value-list tokenizer reads a magnitude past i64 as Tok::Int128; the

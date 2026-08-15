@@ -2350,12 +2350,26 @@ plus *the subsystem is now on the path*.
       (the driver sends the pattern at its true length) - this is purely the
       announced describe. Gated (numericwhere +6): the pattern width read
       through fire-crab and the engine matches len 30 for NUMERIC(9,2),
-      NUMERIC(18,4), INT128, INTEGER, DECFLOAT(34) and (16). The two rarer
-      constructs left at 32765 (a `?`-tested-side LIKE, an EXPRESSION-LHS
-      LIKE that mixes text and integer) are a separate follow-up. Still
-      refused deliberately: DECFLOAT in arithmetic / nested, the
-      `Infinity`/`NaN` text-literal specials, and a value past DECFLOAT(34)
-      range.
+      NUMERIC(18,4), INT128, INTEGER, DECFLOAT(34) and (16).
+
+      *And the EXPRESSION-LHS pattern width followed the expression* -
+      `<expr> LIKE ?` describes the slot as the LHS EXPRESSION's own result
+      text width (probed): a numeric expression the fixed 30, a text one its
+      computed width - `UPPER(VC10)` is 10, `UPPER(VC200)` is 200,
+      `SUBSTRING(.. FOR 3)` is 3, `CAST(I AS VARCHAR(7))` is 7. So
+      `resolve_expr_term` computes it from `text_form` (`+2` for the VARYING
+      count) for a text side and `NUM_LIKE_PATTERN_LEN` for a numeric one.
+      Widening that arm to accept a scaled-NUMERIC side (the literal-pattern
+      arm already did) also LIT a previously refused shape: `(N+0) LIKE ?`
+      now binds and renders, at width 30, exactly as the engine answers it.
+      Gated (numericwhere +4): the expression-LHS width for `(A+0)`,
+      `(N+0)`, `(I+0)` and a `CAST`. One rarer construct still at 32765 - a
+      `?`-on-the-tested-side LIKE (`resolve_param_lhs`) - and a genuinely
+      separate gap left as-is: a CONCATENATION-LHS LIKE (`VC||'x' LIKE ...`)
+      is refused outright even with a literal pattern, a pre-existing
+      expression-support boundary, not a width one. Still refused
+      deliberately: DECFLOAT in arithmetic / nested, the `Infinity`/`NaN`
+      text-literal specials, and a value past DECFLOAT(34) range.
 
       *And the wide OUTER value came with it* — the probe's `band` capped
       an `Int128` driving value at `i64` and scanned; now it carries the
