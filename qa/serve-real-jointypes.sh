@@ -173,5 +173,24 @@ both "a LEFT join with a typed WHERE" \
 both "COUNT(*) over a join with a typed WHERE" \
      "SELECT COUNT(*) FROM A JOIN C ON A.K = C.K WHERE AMT > 10"
 
+# --- FIRST n over a join STOPS the cursor before a later raiser --------
+# `10/(A.ID - 2)` divides by zero on the A.ID = 2 row. The engine closes
+# the cursor after `take` rows, so a raiser PAST the limit never runs and
+# FIRST 1 answers one row; fire-crab used to materialise and project every
+# joined row here - through branch_rows_res - and RAISED the divide-by-zero
+# on a row the answer never reaches. Probed identical to the engine for
+# every join kind, which is the whole point: it was not RIGHT/FULL-only.
+both "FIRST 1 over an INNER join, raiser past the limit" \
+     "SELECT FIRST 1 A.ID, 10/(A.ID - 2) AS Q FROM A JOIN C ON A.K = C.K"
+both "FIRST 1 over a LEFT join, raiser past the limit" \
+     "SELECT FIRST 1 A.ID, 10/(A.ID - 2) AS Q FROM A LEFT JOIN C ON A.K = C.K"
+both "FIRST 1 over a RIGHT join, raiser past the limit" \
+     "SELECT FIRST 1 C.K, 10/(A.ID - 2) AS Q FROM A RIGHT JOIN C ON A.K = C.K"
+both "FIRST 1 over a FULL join, raiser past the limit" \
+     "SELECT FIRST 1 C.K, 10/(A.ID - 2) AS Q FROM A FULL JOIN C ON A.K = C.K"
+# and the CONTROL: with no FIRST the raiser DOES run, on both, mid-result
+both "no FIRST: the join raiser runs on both" \
+     "SELECT A.ID, 10/(A.ID - 2) AS Q FROM A JOIN C ON A.K = C.K ORDER BY A.ID"
+
 rm -f "$A" "$B"
 exit $fail
