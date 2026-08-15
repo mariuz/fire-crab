@@ -65,8 +65,12 @@ measured or pinned items**, each recorded in its own place below:
   DELETE, measured old-vs-new); the CHAR-decode residual is closed too —
   `intl::fit_char` is a single pass now and the decoder trims a CHAR's
   blank padding as bytes before UTF8-decoding it (~20% off a CHAR-decode-
-  bound scan), so what is left in the profile is the deferred
-  `choose_index` at execute, not a field walk or a per-value re-scan;
+  bound scan); and the deferred `choose_index` at execute is closed —
+  its optimizer GATE (does an index serve this? — invariant across a
+  prepared statement's executes) is memoised in the epoch cache, so a
+  parameterised WHERE resolves its band without re-running the optimizer
+  each time (~26–43% off a re-executed `WHERE col = ?`). What is left is
+  the record walk and the wire itself;
 - **the optimizer's stale-statistics region** — statistics non-zero but
   WRONG are unmeasured, needing their own fixture family (load,
   `SET STATISTICS`, grow);
@@ -186,8 +190,9 @@ of those boundaries.
   epoch, so the PRIMARY plan path (`plan_query_inner`, the fold, the DML
   targets) reads them once per schema, not once per statement. Measured
   today on the quiet box, a REPEATED statement re-plans for free (the
-  statement cache serves it) and a distinct one against a cached table
-  pays ~190 us of deferred `choose_index` at execute, not a field walk.
+  statement cache serves it) and a parameterised one used to pay a
+  deferred `choose_index` at execute — itself now closed by memoising the
+  optimizer gate (below), not a field walk.
   `relation_columns` itself is no longer visible in the per-statement
   profile of the SELECT path.
 
@@ -221,8 +226,30 @@ of those boundaries.
   decodes per query, minimal output): **7.92 → 6.33 ms/query, ~20%**
   (95 → 76 CPU ticks over 120 queries). The charset gates
   (`serve-real-charset.sh` 43, `utf8index` 21, `varcharfmt` 10, `outblr`
-  32, `starting` 36) hold the answers. What is left is the deferred
-  `choose_index` at execute.
+  32, `starting` 36) hold the answers.
+
+  The last named residual, the deferred `choose_index` at execute, is
+  closed on the same principle a third time — do not recompute what cannot
+  have changed. A parameterised WHERE has no band at prepare (the values
+  arrive at execute), so `resolve_access` re-ran `choose_index` on every
+  execute, and inside it the expensive step is asking the OPTIMIZER
+  whether an index serves the statement — a full `fire_crab_opt::plan_query`.
+  But that is a GATE, not the band: it answers a boolean that depends on
+  the reconstructed statement's SHAPE and the catalog, never on the bound
+  values, so across a prepared statement's executes it cannot move.
+  `pick_for_terms` still builds the actual band from the bound values each
+  time; only the gate is memoised, in the same epoch-keyed cache the
+  metadata reads use, so DDL (which invalidates it and drops the prepared
+  plan with it) is the only thing that changes the answer. And the answer
+  it caches can only choose an index over a scan, which is
+  ANSWER-EQUIVALENT by the whole programme's construction — a stale gate
+  costs a plan, never a row. Measured old-vs-new on a re-executed
+  `WHERE col = ?`: **0.68 → 0.39 ms/statement on an indexed table (~43%)**
+  and **0.54 → 0.40 on an unindexed one (~26%)** — the indexed case saves
+  more because costing an index is the optimizer's heavier path.
+  `serve-real-index.sh` (403), `leftjoinindex` (169), `paramshapes` (114)
+  and `serve-real-metadata.sh` (cached and under `FC_NO_MDC=1`, both equal
+  the engine) hold it. What is left is the record walk and the wire.
 
 - **169/169 does NOT mean the cost model is right everywhere the guard
   used to refuse.** On a stale UNIQUE/PK index there is a structural miss

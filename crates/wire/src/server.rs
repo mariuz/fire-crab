@@ -19425,22 +19425,34 @@ fn choose_index_inner(
     // ORDER BY the index already delivers is reason enough to walk it.
     // What would the engine do here? opt answers from the same catalog
     // and the same rules its PLAN gate holds against the live server.
-    let plan = fire_crab_opt::plan_query(&db.bytes(), db.page_size, sql).ok()?;
-    // `Access::Index` is a retrieval; `Access::Order` is the engine
-    // NAVIGATING an index for the ORDER BY, which it does with the same
-    // predicate as bounds - so both mean "an index serves this". Only
-    // the retrieval half is taken here; the sort still runs above,
-    // which costs work and cannot change an answer. Without this,
-    // `WHERE ID > 3 ORDER BY ID` scanned while `WHERE DEPT_ID > 3
-    // ORDER BY ID` did not, purely because the second one's ORDER BY
-    // names a different index.
-    if !matches!(
-        plan.streams.as_slice(),
-        [fire_crab_opt::Stream {
-            access: fire_crab_opt::Access::Index(_) | fire_crab_opt::Access::Order(_),
-            ..
-        }]
-    ) {
+    //
+    // This is a GATE, not a choice: the answer is only whether an index
+    // serves the statement, and `pick_for_terms` below builds the actual
+    // band. That answer depends on the reconstructed `sql`'s SHAPE and the
+    // catalog, NOT on the bound parameter values - so for a parameterised
+    // WHERE, whose band is resolved at EVERY execute, running the whole
+    // optimizer each time re-derived a decision that could not have moved.
+    // It is memoised in the same epoch-keyed cache the metadata reads use,
+    // so DDL (which invalidates it, and drops the prepared plan with it)
+    // is the only thing that can change the answer. `Access::Index` is a
+    // retrieval; `Access::Order` is the engine NAVIGATING an index for the
+    // ORDER BY with the same predicate as bounds - so both mean "an index
+    // serves this". Without the ORDER BY half, `WHERE ID > 3 ORDER BY ID`
+    // scanned while `WHERE DEPT_ID > 3 ORDER BY ID` did not, purely
+    // because the second one's ORDER BY names a different index.
+    let approved = *db.meta_memo("idx-gate", sql, || {
+        match fire_crab_opt::plan_query(&db.bytes(), db.page_size, sql) {
+            Ok(plan) => matches!(
+                plan.streams.as_slice(),
+                [fire_crab_opt::Stream {
+                    access: fire_crab_opt::Access::Index(_) | fire_crab_opt::Access::Order(_),
+                    ..
+                }]
+            ),
+            Err(_) => false,
+        }
+    });
+    if !approved {
         return None;
     }
 
