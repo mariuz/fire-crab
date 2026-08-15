@@ -669,6 +669,26 @@ pub fn encode_dec128_special(neg: bool, nan: bool) -> u128 {
     ((neg as u128) << 127) | (comb << 122)
 }
 
+/// The decimal64 bits of a SPECIAL value (`±Infinity` / `NaN`), the dec64
+/// analog of [encode_dec128_special] (combination field at bits 58..63).
+pub fn encode_dec64_special(neg: bool, nan: bool) -> u64 {
+    let comb: u64 = if nan { 0b11111 } else { 0b11110 };
+    ((neg as u64) << 63) | (comb << 58)
+}
+
+/// Encode a computed [Dec] as DECFLOAT(16) (decimal64) bits, rounding a
+/// finite value to 16 significant digits HALF-UP.
+pub fn dec_to_dec64_bits(d: &Dec) -> u64 {
+    match d {
+        Dec::Finite { neg, coeff, exp } => match round_to_dec16(*neg, *coeff, *exp) {
+            Dec::Finite { neg, coeff, exp } => encode_dec64(neg, coeff as u64, exp),
+            _ => encode_dec64_special(false, true),
+        },
+        Dec::Infinity { neg } => encode_dec64_special(*neg, false),
+        Dec::Nan => encode_dec64_special(false, true),
+    }
+}
+
 /// Re-express a DECFLOAT(34) value (its decimal128 bits) as a DECFLOAT(16)
 /// (decimal64 bits), rounding to 16 significant digits HALF-UP. `None` for
 /// a non-finite value (Infinity/NaN) - a literal is never one, so this only
@@ -880,6 +900,20 @@ mod tests {
         assert!(matches!(add(&Dec::Infinity { neg: false }, &d(false, 1, 0)), Dec::Infinity { neg: false }));
         assert!(matches!(add(&Dec::Infinity { neg: false }, &Dec::Infinity { neg: true }), Dec::Nan));
         assert!(matches!(mul(&Dec::Infinity { neg: false }, &d(false, 0, 0)), Dec::Nan));
+    }
+
+    #[test]
+    fn dec_to_dec64_bits_rounds_and_encodes() {
+        let d = |neg, coeff, exp| Dec::Finite { neg, coeff, exp };
+        let r = |x: &Dec| to_string(&decode_dec64(dec_to_dec64_bits(x)));
+        assert_eq!(r(&d(false, 15, -1)), "1.5"); // 1.5 exact
+        assert_eq!(r(&d(false, 100, 0)), "100");
+        // a value past 16 sig digits rounds to 16 (HALF-UP)
+        let wide: u128 = "12345678901234567".parse().unwrap(); // 17 digits
+        assert_eq!(r(&d(false, wide, 0)), "1.234567890123457E+16");
+        // specials carry through
+        assert!(matches!(decode_dec64(dec_to_dec64_bits(&Dec::Infinity { neg: true })), Dec::Infinity { neg: true }));
+        assert!(matches!(decode_dec64(dec_to_dec64_bits(&Dec::Nan)), Dec::Nan));
     }
 
     #[test]

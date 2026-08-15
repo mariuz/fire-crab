@@ -2455,10 +2455,29 @@ plus *the subsystem is now on the path*.
       is what the `Cond2::Cmp` eval falls back to. All four operators,
       column/literal/expression right sides, `IS [NOT] NULL`, negation and
       AND-composition ride it; a NaN from the arithmetic still traps at eval
-      before the compare. Gated (numericwhere +10). Still refused
-      deliberately: `CAST(x AS DECFLOAT)` (which is why a `0/0` LITERAL
-      still refuses at prepare - the CAST does, not the division), and a
-      value past DECFLOAT(34) range.
+      before the compare. Gated (numericwhere +10).
+
+      *And `CAST(x AS DECFLOAT(16|34))` closed the surface* - a new
+      `CastTarget::DecFloat { wide }` (`DECFLOAT` alone defaults to 34; only
+      `(16)`/`(34)` are legal precisions). The five exhaustive `CastTarget`
+      matches took it (compiler-guided): `cast_target_descriptor` announces
+      DEC128(16 bytes)/DEC64(8) for a `?` slot, `type_of`/`rank_of` decline
+      it (the describe short-circuits), `cvt_cap` leaves the text length to
+      the decNumber grammar, and `eval` promotes the value to a `Dec` -
+      value_as_dec for a numeric or stored DECFLOAT, `text_to_dec128` for a
+      string - then encodes decimal128, or (rounded to 16 significant)
+      decimal64. `build_expr_col_from` short-circuits a bare cast to its
+      declared width, and `is_decfloat_arith` treats a cast-to-DECFLOAT as a
+      decimal leaf (`CAST(x AS DECFLOAT) + 1` promotes). NaN/Infinity carry
+      through (a CAST re-represents, never traps). This also unblocked the
+      `0/0` LITERAL - `CAST(0 AS DECFLOAT)/0` now traps 22000. Gated
+      (numericwhere +9): both widths, a text source, the default precision,
+      cast-then-arith, the describe width, a WHERE cast, and the `0/0`
+      trap. **The DECFLOAT surface is now complete** - literal (projected,
+      WHERE, INSERT), column comparison, LIKE/STARTING, parameter, the four
+      arithmetic operators (projection and WHERE), and CAST, both widths.
+      The one boundary left: a value past DECFLOAT(34) range (DECFLOAT
+      cannot exceed its own range - not a real gap).
 
       *And the wide OUTER value came with it* — the probe's `band` capped
       an `Int128` driving value at `i64` and scanned; now it carries the

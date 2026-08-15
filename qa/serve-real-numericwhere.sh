@@ -424,6 +424,21 @@ predf "arith AND classic" "D * 2 > 5 AND ID > 0"
 predf "arith IS NULL"    "D + 1 IS NULL"
 predf "arith IS NOT NULL" "D + 1 IS NOT NULL"
 
+# CAST(x AS DECFLOAT(16|34)): DECFLOAT(34) is decimal128 (len 16),
+# DECFLOAT(16) decimal64 (len 8); no precision defaults to 34. Value
+# round-trips (a text source by the decNumber grammar, a DECFLOAT(16)
+# re-rounds to 16 sig); the describe carries the declared width.
+dfexpr "cast int -> 34"  "CAST(ID AS DECFLOAT(34))"
+dfexpr "cast D -> 16"    "CAST(D AS DECFLOAT(16))"
+dfexpr "cast text -> 34" "CAST('2.75' AS DECFLOAT(34))"
+dfexpr "cast default 34" "CAST(7 AS DECFLOAT)"
+dfexpr "cast then arith" "CAST(ID AS DECFLOAT(34)) + 1"
+dw_expr "cast 34 width"  "CAST(ID AS DECFLOAT(34))"
+dw_expr "cast 16 width"  "CAST(D AS DECFLOAT(16))"
+predf "WHERE cast > 50"  "CAST(ID AS DECFLOAT(34)) > 50"
+# a 0/0 through a CAST now traps 22000 (the CAST parses; the division traps)
+dfsqlstate "cast 0/0"    "CAST(ID - ID AS DECFLOAT(34)) / (ID - ID)"
+
 # the LIKE/STARTING pattern `?` slot on a NUMERIC column describes as a
 # FIXED VARYING(30) - the engine's numeric-to-text render width, NOT the
 # column's own shape (a TEXT column's pattern keeps the column width). Read

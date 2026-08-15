@@ -9044,6 +9044,27 @@ fn build_expr_col_from(e: Expr, name: &str, descs: &[Descriptor]) -> Option<Proj
     // the scaled-integer describe below. `type_of` deliberately declines a
     // DecFloat34 (nesting it in arithmetic/conditionals is a later slice),
     // so this MUST precede the `type_of(descs)?` match.
+    // a bare CAST to DECFLOAT carries its declared WIDTH - DECFLOAT(34) is
+    // decimal128 (16 bytes), DECFLOAT(16) decimal64 (8) - so it describes
+    // its own form, not the arithmetic tree's always-34
+    if let Expr::Cast(_, CastTarget::DecFloat { wide }) = &e {
+        let (wire, sql_type, length) =
+            if *wide { (Wire::Dec34, 32762, 16i32) } else { (Wire::Dec16, 32760, 8i32) };
+        return Some(ProjCol {
+            name: name.to_string(),
+            oct_length: length,
+            fname: None,
+            relation: None,
+            rel_alias: None,
+            field_id: 0,
+            wire,
+            sql_type: nullable(sql_type),
+            length,
+            scale: 0,
+            sub_type: 0,
+            expr: Some(e),
+        });
+    }
     // a DECFLOAT literal, OR a numeric arithmetic tree with a DECFLOAT
     // operand (`df + 1`, `df * 2`, `df1 - df2`, `-df`) - both ride the
     // DECFLOAT(34) wire form and short-circuit the exact-numeric describe
@@ -32142,6 +32163,10 @@ enum CastTarget {
     Approx,
     /// `DATE` / `TIME` / `TIMESTAMP`
     Temporal(TKind),
+    /// `DECFLOAT [(16|34)]` - `wide` is DECFLOAT(34) (decimal128, 16 bytes,
+    /// sqltype 32762); false is DECFLOAT(16) (decimal64, 8 bytes, 32760).
+    /// `DECFLOAT` with no precision defaults to 34.
+    DecFloat { wide: bool },
 }
 
 impl CastTarget {
@@ -32193,7 +32218,9 @@ impl CastTarget {
                 _ => Some(52),
             },
             CastTarget::Approx | CastTarget::Temporal(_) => Some(130),
-            CastTarget::Text { .. } => None,
+            // a DECFLOAT text conversion is capped by decNumber's own
+            // grammar (text_to_dec128), not a fixed buffer here
+            CastTarget::Text { .. } | CastTarget::DecFloat { .. } => None,
         }
     }
 }
@@ -33607,6 +33634,27 @@ fn parse_cast_target(b: &[char], pos: &mut usize) -> Option<CastTarget> {
     if ku == "FLOAT" {
         return Some(CastTarget::Approx);
     }
+    // `DECFLOAT [(16|34)]` - no precision defaults to 34; only 16 and 34
+    // are legal precisions (probed: any other is a -842 at prepare)
+    if ku == "DECFLOAT" {
+        let mut wide = true;
+        skip_ws(b, pos);
+        if b.get(*pos) == Some(&'(') {
+            *pos += 1;
+            let prec = parse_uint(b, pos)?;
+            skip_ws(b, pos);
+            if b.get(*pos) != Some(&')') {
+                return None;
+            }
+            *pos += 1;
+            wide = match prec {
+                34 => true,
+                16 => false,
+                _ => return None,
+            };
+        }
+        return Some(CastTarget::DecFloat { wide });
+    }
     // `DOUBLE PRECISION` - two words, the second optional in no dialect
     // but skipped tolerantly here the way the engine's parser reads it
     if ku == "DOUBLE" {
@@ -33817,6 +33865,9 @@ fn cast_target_descriptor(t: &CastTarget) -> Option<Descriptor> {
         CastTarget::Text { len, pad: false, .. } => {
             d(dtype::VARYING, 0, (*len as u16).saturating_add(2), 0)
         }
+        // DECFLOAT(34) is decimal128 (16 bytes), DECFLOAT(16) decimal64 (8)
+        CastTarget::DecFloat { wide: true } => d(dtype::DEC128, 0, 16, 0),
+        CastTarget::DecFloat { wide: false } => d(dtype::DEC64, 0, 8, 0),
     })
 }
 
@@ -34653,6 +34704,11 @@ fn is_decfloat_arith(e: &Expr, descs: &[Descriptor]) -> bool {
             }
             Expr::Neg(x) => walk(x, descs)?,
             Expr::Bin(a, _, b) => walk(a, descs)? || walk(b, descs)?,
+            // a CAST to DECFLOAT is a decimal leaf (so `CAST(x AS DECFLOAT)
+            // + 1` promotes); a CAST to an exact-numeric type is an ordinary
+            // numeric leaf whatever it wraps (the result is that type)
+            Expr::Cast(_, CastTarget::DecFloat { .. }) => true,
+            Expr::Cast(_, CastTarget::Int { .. } | CastTarget::Numeric { .. }) => false,
             _ => return None,
         })
     }
@@ -36054,6 +36110,11 @@ impl Expr {
                     CastTarget::Numeric { .. } => ExprType::Numeric,
                     CastTarget::Approx => ExprType::Approx,
                     CastTarget::Temporal(k) => ExprType::Temporal(*k),
+                    // a DECFLOAT cast has no ExprType of its own; the
+                    // describe short-circuits it, so declining here
+                    // fail-closes any attempt to nest it where a type is
+                    // needed (a conditional branch)
+                    CastTarget::DecFloat { .. } => return None,
                 })
             }
             Expr::Func(f, args) => {
@@ -36343,7 +36404,10 @@ impl Expr {
                 CastTarget::Numeric { bytes, .. } => {
                     Some(if *bytes == 16 { NumRank::I128 } else { NumRank::Long })
                 }
-                CastTarget::Text { .. } | CastTarget::Approx | CastTarget::Temporal(_) => None,
+                CastTarget::Text { .. }
+                | CastTarget::Approx
+                | CastTarget::Temporal(_)
+                | CastTarget::DecFloat { .. } => None,
             },
             Expr::Func(f, args) => match f {
                 // ABS ranks (and so widens) as its operand does - ABS
@@ -36731,6 +36795,27 @@ impl Expr {
                     cvt_cap_check(s, t.cvt_cap())?;
                 }
                 match t {
+                    // to DECFLOAT: promote the value to a Dec - an exact
+                    // numeric or a stored DECFLOAT through value_as_dec, a
+                    // string through the decNumber grammar - then encode as
+                    // decimal128 (34) or, rounded to 16 significant,
+                    // decimal64 (16). NaN/Infinity carry through as-is (a
+                    // CAST re-represents, it does not trap).
+                    CastTarget::DecFloat { wide } => {
+                        let dec = if let Value::Text(s) = &v {
+                            match text_to_dec128(s) {
+                                Some(bits) => fire_crab_ods::decfloat::decode_dec128(bits),
+                                None => return Err(EvalErr::ConversionError(Some(s.clone()))),
+                            }
+                        } else {
+                            value_as_dec(&v).ok_or(EvalErr::ConversionError(None))?
+                        };
+                        if *wide {
+                            Value::DecFloat34(fire_crab_ods::decfloat::dec_to_bits(&dec))
+                        } else {
+                            Value::DecFloat16(fire_crab_ods::decfloat::dec_to_dec64_bits(&dec))
+                        }
+                    }
                     // to the integer family: an integer is kept, a scaled
                     // numeric is rounded half away from zero, a string is
                     // SPACE-trimmed and parsed (a non-numeric string, or a
