@@ -58,10 +58,13 @@ gated by `serve-real-snapshot.sh`, `serve-real-concurrency.sh` and
 What is left is no longer one headline chunk but a **short list of
 measured or pinned items**, each recorded in its own place below:
 
-- **cost** — the per-statement cost at HEAD is ~2.9 ms against the
-  engine's ~0.95 ms, and the residual is CPU-bound in an uncached
-  `catalog::relation_columns` walk (the metadata cache already took the
-  bulk; this is the same disease at the next call site);
+- **cost** — the metadata cache took the per-statement column walk off
+  the primary plan path, and `Database::columns` has now routed the
+  SECONDARY planners (DML targets, subquery/derived sources, join sides,
+  the correlated-outer split) through it too (~21% off a re-planning
+  DELETE, measured old-vs-new); what is left in the profile is the
+  deferred `choose_index` at execute and `intl::fit_char`, not a field
+  walk;
 - **the optimizer's stale-statistics region** — statistics non-zero but
   WRONG are unmeasured, needing their own fixture family (load,
   `SET STATISTICS`, grow);
@@ -172,15 +175,34 @@ of those boundaries.
   filter side turned out to have different rules, and the filter
   comparison is exact rather than through a double.
 
-- **The per-statement cost at HEAD is 2.92 ms against the engine's
-  0.95 ms**, measured on a verified-quiet box (nproc 1, load 0.04, 97%
-  idle, serialised). The metadata cache took it from 19.6 ms and server
-  CPU from 3,810 to 730 ms per 200 statements. The residual is CPU-bound,
-  not waiting, and the cause is the same disease at the next call site:
-  `catalog::relation_columns` (`catalog.rs:139`) is an uncached full walk
-  of `RDB$RELATION_FIELDS` with 121 call sites — 60.9% of what is left,
-  with `sqz::unpack` and `catalog::cstr` beneath it. `intl::fit_char` is
-  secondary.
+- ~~**The per-statement cost at HEAD is 2.92 ms**~~ — *the named cause was
+  already addressed, and the tail of it is closed now.* This entry
+  predated the metadata cache by 51 commits: it named
+  `catalog::relation_columns` (an uncached full walk of
+  `RDB$RELATION_FIELDS`) as 60.9% of the residual, and then `mdc` landed
+  and cached exactly that — `relation_meta` holds a relation's columns per
+  epoch, so the PRIMARY plan path (`plan_query_inner`, the fold, the DML
+  targets) reads them once per schema, not once per statement. Measured
+  today on the quiet box, a REPEATED statement re-plans for free (the
+  statement cache serves it) and a distinct one against a cached table
+  pays ~190 us of deferred `choose_index` at execute, not a field walk.
+  `relation_columns` itself is no longer visible in the per-statement
+  profile of the SELECT path.
+
+  What remained were the SECONDARY planners that reached
+  `catalog::relation_columns` DIRECTLY rather than through `relation_meta`
+  — the DELETE/UPDATE target walk, the subquery and derived-table source
+  planners, the join-flatten sides, the correlated-outer split, and a few
+  error-naming paths. Each re-walked `RDB$RELATION_FIELDS` on every
+  re-plan even though the cache already held that table. A `Database::columns`
+  accessor now routes all of them through the same epoch-keyed
+  `mdc::memo`, so DDL invalidates them exactly as it does everything else.
+  Measured old-vs-new, both cache-on, on a re-planning DELETE workload:
+  **1.72 → 1.36 ms/statement, ~21%** (155 → 122 CPU ticks over 900
+  statements). No answer moves — `serve-real-metadata.sh` runs every check
+  cached and under `FC_NO_MDC=1`, both equal the engine, with hits and
+  invalidations non-zero. Still secondary in the profile: `intl::fit_char`,
+  and the deferred `choose_index` at execute.
 
 - **169/169 does NOT mean the cost model is right everywhere the guard
   used to refuse.** On a stale UNIQUE/PK index there is a structural miss

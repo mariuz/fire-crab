@@ -1304,6 +1304,23 @@ impl Database {
         })
     }
 
+    /// A relation's columns, from the metadata cache rather than a fresh
+    /// walk of every `RDB$RELATION_FIELDS` page. `catalog::relation_columns`
+    /// already memoises SYSTEM relations process-wide (their column set is
+    /// fixed by the ODS), but a USER relation took the full walk on every
+    /// call, at ~20 planning sites - measured as most of the residual
+    /// per-statement CPU once the format cache landed. This holds it in the
+    /// same epoch-keyed cache `relation_meta` uses, so DDL (which calls
+    /// [invalidate_meta]) is what makes it stale and nothing else - the same
+    /// safety argument, one level down. Returns an `Arc` so a hit is a hash
+    /// lookup and a clone of a refcount, not of the vector.
+    fn columns(&self, table: &str) -> std::sync::Arc<Vec<fire_crab_ods::RelationColumn>> {
+        let image = self.bytes();
+        let ps = self.page_size;
+        self.meta
+            .memo("columns", table, || relation_columns(&image, ps, table))
+    }
+
     /// The schema may have changed: everything the metadata cache holds
     /// was about the old one.
     fn invalidate_meta(&self) {
@@ -11643,7 +11660,7 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
     // OLD row, a DELETE trigger no NEW, and only a BEFORE INSERT/UPDATE
     // may ASSIGN to NEW (the engine's rules)
     let db = db.as_ref()?;
-    let columns = relation_columns(&db.bytes(), db.page_size, table);
+    let columns = db.columns(table);
     let meta = db.relation_meta(table)?; // see [crate::mdc]
     let rel = meta.id;
     let formats = meta.formats.as_ref().clone();
@@ -11854,7 +11871,7 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
     let mut store_deps: Vec<(String, Vec<String>)> = Vec::new();
     for st in &stores {
         let TrigStmt::Store { table: stab, cols, .. } = st else { continue };
-        let scols = relation_columns(&db.bytes(), db.page_size, stab);
+        let scols = db.columns(stab);
         let srel = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, stab)?;
         if srel < 128 {
             return None; // system relations are not store targets
@@ -11891,7 +11908,7 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
                 TrigStmt::Delete { table, wher, .. } => (table, None, wher),
                 _ => continue,
             };
-        let dcols = relation_columns(&db.bytes(), db.page_size, dtab);
+        let dcols = db.columns(dtab);
         let drel = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, dtab)?;
         if drel < 128 {
             return None; // system relations are not DML targets
@@ -13945,7 +13962,7 @@ fn plan_alter_table_add(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<D
     // CATALOG's columns (needs the attached database)
     if let Some((cname, source)) = parse_check_clause(tail) {
         let db = db.as_ref()?;
-        let columns = relation_columns(&db.bytes(), db.page_size, table);
+        let columns = db.columns(table);
         let meta = db.relation_meta(table)?; // see [crate::mdc]
         let rel = meta.id;
         let formats = meta.formats.as_ref().clone();
@@ -14007,7 +14024,7 @@ fn plan_alter_table_add(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<D
     // (needs the attached database - the statement's text has no types)
     if let Some((cname, src)) = parse_computed_item(tail) {
         let db = db.as_ref()?;
-        let columns = relation_columns(&db.bytes(), db.page_size, table);
+        let columns = db.columns(table);
         let meta = db.relation_meta(table)?; // see [crate::mdc]
         let rel = meta.id;
         let formats = meta.formats.as_ref().clone();
@@ -14638,7 +14655,7 @@ fn wrap_returning(
     let rel = fire_crab_ods::resolve_relation(&dbr.bytes(), dbr.page_size, table)?;
     let formats = fire_crab_ods::relation_formats(&dbr.bytes(), dbr.page_size, rel);
     let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
-    let columns = fire_crab_ods::relation_columns(&dbr.bytes(), dbr.page_size, table);
+    let columns = dbr.columns(table);
     let mut cols = Vec::new();
     let mut fields = Vec::new();
     // the CATALOG's spelling of the target table, for the quoted
@@ -17151,7 +17168,7 @@ fn plan_delete(sql: &str, db_outer: &Option<Database>) -> Option<(Plan, Vec<Desc
     // no index guard here: DELETE never touches indexes - the engine's
     // VIO_erase does not either (entries outlive their records until
     // garbage collection removes both)
-    let columns = relation_columns(&db.bytes(), db.page_size, table);
+    let columns = db.columns(table);
     let formats = relation_formats(&db.bytes(), db.page_size, rel);
     // a relation with no RDB$FORMATS entry (a system relation) cannot
     // be walked by format - refuse rather than silently delete nothing
@@ -18295,8 +18312,8 @@ fn execute_dml_collecting_inner(
             // set, reaching the backing RDB$<n> generator, and it leaves
             // the same compensating record - see [GenWindow]
             let want = column.trim().trim_matches('"');
-            let fid = relation_columns(&db.bytes(), db.page_size, table)
-                .into_iter()
+            let fid = db.columns(table)
+                .iter()
                 .find(|c| c.name.eq_ignore_ascii_case(want))
                 .map(|c| c.field_id as usize);
             if let Some((_, gen, _)) = identity_columns(db, table)
@@ -19906,10 +19923,10 @@ fn entry_err_to_exec(
 /// the one unquoted argument in the 23000 family (captured raw).
 /// Descriptive text stands in when the column has no catalog name.
 fn not_valid_err(db: &Database, table: &str, fid: usize) -> ExecErr {
-    let name = relation_columns(&db.bytes(), db.page_size, table)
-        .into_iter()
+    let name = db.columns(table)
+        .iter()
         .find(|c| c.field_id as usize == fid)
-        .map(|c| c.name);
+        .map(|c| c.name.clone());
     match name {
         Some(n) => ExecErr::Eval(EvalErr::NotValid {
             column: format!(
@@ -19949,7 +19966,7 @@ fn unique_violation_err(
     values: &[Value],
 ) -> Option<EvalErr> {
     let (ix_name, constraint) = index_error_names(db, table, op.id)?;
-    let cols = relation_columns(&db.bytes(), db.page_size, table);
+    let cols = db.columns(table);
     let parts: Option<Vec<(String, &Value)>> = op
         .segs
         .iter()
@@ -20980,7 +20997,7 @@ fn plan_lateral(
         return None;
     }
     let bref = parse_table_ref(base_s)?;
-    let columns = relation_columns(&db.bytes(), db.page_size, bref.table);
+    let columns = db.columns(bref.table);
     if columns.is_empty() {
         return None;
     }
@@ -21018,7 +21035,7 @@ fn plan_lateral(
         base: base.clone(),
         base_width,
         outer_alias: outer_alias.to_string(),
-        outer_cols: columns,
+        outer_cols: columns.as_ref().clone(),
         outer_descs,
         subquery: sub,
         left,
@@ -21270,7 +21287,7 @@ fn build_flatten(db: &Database, inner: &Plan) -> Option<FlatSrc> {
             formats: formats.clone(),
         },
         descs,
-        columns: relation_columns(&db.bytes(), db.page_size, &table),
+        columns: db.columns(&table).as_ref().clone(),
         base_fid,
     })
 }
@@ -21592,7 +21609,7 @@ fn plan_join_bound(
             }
         }
         let rel = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, tr.table)?;
-        let columns = relation_columns(&db.bytes(), db.page_size, tr.table);
+        let columns = db.columns(tr.table);
         let formats = select_formats(db, tr.table, rel);
         // joining needs decodable records
         if formats.is_empty() {
@@ -21625,7 +21642,7 @@ fn plan_join_bound(
                 formats,
                 width: Some(descs.len()),
             },
-            columns,
+            columns: columns.as_ref().clone(),
             descs,
             offset,
             fnames,
@@ -23069,9 +23086,9 @@ fn view_of(db: &Database, name: &str) -> Option<ViewDef> {
     });
     let source = source?;
     // the view's own columns, in field-id order
-    let mut cols: Vec<(u16, String)> = relation_columns(&db.bytes(), db.page_size, name)
-        .into_iter()
-        .map(|c| (c.field_id, c.name))
+    let mut cols: Vec<(u16, String)> = db.columns(name)
+        .iter()
+        .map(|c| (c.field_id, c.name.clone()))
         .collect();
     cols.sort_by_key(|(f, _)| *f);
     Some(ViewDef { source, cols: cols.into_iter().map(|(_, n)| n).collect() })
@@ -37641,7 +37658,7 @@ fn plan_correlated_select(
     }
     let table = from.table;
     let rel = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, table)?;
-    let columns = relation_columns(&db.bytes(), db.page_size, table);
+    let columns = db.columns(table);
     let formats = select_formats(db, table, rel);
     let descs = formats
         .iter()
@@ -37944,7 +37961,7 @@ fn build_correlated_lookup(
         return None; // the same empty-storage guard [eval_subquery] makes
     }
     let rel = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, table)?;
-    let columns = relation_columns(&db.bytes(), db.page_size, table);
+    let columns = db.columns(table);
     let formats = select_formats(db, table, rel);
     let descs = formats
         .iter()
@@ -38583,7 +38600,7 @@ fn eval_subquery_rel(
         return None;
     }
     let rel = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, table)?;
-    let columns = relation_columns(&db.bytes(), db.page_size, table);
+    let columns = db.columns(table);
     let formats = select_formats(db, table, rel);
     let descs = formats
         .iter()
@@ -39205,7 +39222,7 @@ fn correlated_outer_col(
     // three times drifts twice.
     let (_, table_s, where_s, _, _, _) = split_query(sql)?;
     let (from, _) = parse_from(table_s)?;
-    let columns = relation_columns(&db.bytes(), db.page_size, from.table);
+    let columns = db.columns(from.table);
     let toks = tokenize(where_s?)?;
     let (_, outer, _) =
         split_correlation(&toks, from.table, from.alias, &columns, outer_cols, Some(outer_bind))?;
@@ -49335,14 +49352,14 @@ fn exec_blr_stmt(
                 else {
                     return;
                 };
-                let columns = relation_columns(&db.bytes(), db.page_size, relname);
+                let columns = db.columns(relname);
                 let formats = select_formats(db, relname, rel);
                 if formats.is_empty() {
                     return;
                 }
                 let mut rows: Vec<Vec<Value>> = Vec::new();
                 for_each_record(db, rel, &formats, |values| rows.push(values.to_vec()));
-                streams.push(StreamData { ctx: *ctx, columns, rows });
+                streams.push(StreamData { ctx: *ctx, columns: columns.as_ref().clone(), rows });
             }
             // nested-loop join: every combination of one row per stream,
             // kept when the rse boolean holds over the enclosing contexts
