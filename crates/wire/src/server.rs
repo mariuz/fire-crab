@@ -27832,6 +27832,129 @@ impl<'a> ReadView<'a> {
     }
 }
 
+/// A resumable cursor over a plain full scan: it produces up to `want`
+/// visible, filtered rows per fetch and REMEMBERS where it stopped, so a
+/// client that reads part of a large result does not pay to materialise
+/// the whole of it - which the batch fetch otherwise does on its first
+/// call, making "read the first 200 of 50,000" cost the same as reading
+/// all 50,000. It is the engine's lazy cursor, for the one shape it fits.
+///
+/// It holds the IMAGE it opened over (an `Arc`, cheap), so its rows are
+/// the ones committed when the cursor opened even as other transactions
+/// commit between fetches - the stability materialising the whole cursor
+/// once gave, now without holding every row. Visibility (the
+/// transaction's own set and snapshot) is read from the live `Database`
+/// each batch, stable across a cursor's life because a cursor lives inside
+/// one transaction.
+///
+/// STREAMABLE SHAPES ONLY. A plain `Plan::Project` over a FULL TABLE SCAN
+/// with no index, sort, generator, window or deferred access; a parameter
+/// in the WHERE is fine (bound at open). Everything else - a sort (must
+/// see every row), an aggregate or join (accumulates), an index
+/// retrieval, a generator (advances per row in output order), a modifier,
+/// a derived table, a union, RETURNING - materialises as before, because
+/// [StreamCursor::open] answers `None` for it.
+struct StreamCursor {
+    image: std::sync::Arc<fire_crab_ods::Image>,
+    rel: u16,
+    formats: Vec<(u8, Vec<Descriptor>)>,
+    /// the BOUND predicate (any `?` already substituted)
+    filter: Option<Predicate>,
+    /// partial-decompression read length, as the materialising scan uses
+    read_len: usize,
+    /// the relation's data pages, listed once at open
+    pages: Vec<u32>,
+    /// resume position: the index into `pages`, and the next record slot
+    /// within that page
+    pi: usize,
+    si: usize,
+    done: bool,
+}
+
+impl StreamCursor {
+    /// Open a cursor for a streamable plan, or `None` to leave the
+    /// materialising path in charge. `args` binds the WHERE's parameters.
+    fn open(db: &Database, plan: &Plan, args: &[WireParam]) -> Option<StreamCursor> {
+        let Plan::Project {
+            rel, formats, filter, order_by, gen_cols, index, defer, windows, ..
+        } = plan
+        else {
+            return None;
+        };
+        if index.is_some()
+            || defer.is_some()
+            || !order_by.is_empty()
+            || !gen_cols.is_empty()
+            || !windows.is_empty()
+        {
+            return None;
+        }
+        let filter = bind_filter(filter, args).ok()?;
+        let image = db.bytes();
+        db.reserve_relation_read(*rel);
+        let pages = fire_crab_ods::relation_data_pages(&image, db.page_size, *rel);
+        Some(StreamCursor {
+            image,
+            rel: *rel,
+            formats: formats.clone(),
+            filter,
+            read_len: project_read_len(plan),
+            pages,
+            pi: 0,
+            si: 0,
+            done: false,
+        })
+    }
+
+    /// The next up-to-`want` DECODED RECORDS this reader sees and the
+    /// filter keeps, resuming where the last batch stopped. The bool is
+    /// "the cursor is now exhausted". Records come back whole (field-id
+    /// indexed); the caller projects them with the plan's columns, exactly
+    /// as the materialised path does.
+    fn next_batch(&mut self, db: &Database, want: usize) -> Result<(Vec<Vec<Value>>, bool), EvalErr> {
+        if self.done || want == 0 {
+            return Ok((Vec::new(), self.done));
+        }
+        let mut view = ReadView::of(db, &self.image);
+        view.decode_len = self.read_len;
+        let mut out: Vec<Vec<Value>> = Vec::with_capacity(want);
+        while self.pi < self.pages.len() {
+            let page = fire_crab_ods::page_at(&self.image, db.page_size, self.pages[self.pi]);
+            let Some(dp) = page.and_then(DataPage::decode) else {
+                self.pi += 1;
+                self.si = 0;
+                continue;
+            };
+            let recs: Vec<_> = dp.records().collect();
+            while self.si < recs.len() {
+                let r = &recs[self.si];
+                self.si += 1;
+                let Some(values) = view.values(&self.image, db.page_size, &self.formats, r) else {
+                    if view.limbo.get() != 0 {
+                        return Err(EvalErr::RecInLimbo(view.limbo.get()));
+                    }
+                    continue;
+                };
+                let keep = match &self.filter {
+                    None => true,
+                    Some(p) => p.matches(&values)?,
+                };
+                if keep {
+                    out.push(values);
+                    if out.len() >= want {
+                        // full batch, not end of cursor - the client asks again
+                        return Ok((out, false));
+                    }
+                }
+            }
+            self.pi += 1;
+            self.si = 0;
+        }
+        self.done = true;
+        Ok((out, true))
+    }
+}
+
 /// [records_at_in] with the page map already built - the form a
 /// retrieval loop wants, so the walk above happens once and not once per
 /// row.
@@ -46646,6 +46769,14 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
     let mut aux_listener: Option<std::net::TcpListener> = None;
     let mut event_session: Option<u32> = None;
     let mut stmts: std::collections::HashMap<i32, StmtSlot> = std::collections::HashMap::new();
+    // A streaming cursor per open statement handle (see [StreamCursor]).
+    // Keyed by handle rather than parked with the working set, because a
+    // cursor's position is the one piece of statement state a client can
+    // hold open across another statement's fetches. Opened lazily on the
+    // first fetch of a streamable plan; dropped when the cursor ends, is
+    // re-executed, or is freed.
+    let mut cursors: std::collections::HashMap<i32, StreamCursor> =
+        std::collections::HashMap::new();
     let mut cur_stmt: i32 = 3;
     // handles run 3, 4, 5, ... - starting at 3 keeps the first one the
     // value every existing gate already expects, and they stay well
@@ -47228,6 +47359,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
             x if x == OP_EXECUTE => {
                 let h = read_int(&mut s, &mut dec)?; // stmt
                 use_stmt!(h);
+                cursors.remove(&h); // a fresh execute opens a fresh cursor
                 read_int(&mut s, &mut dec)?; // tr
                 let in_blr = read_wire_bytes(&mut s, &mut dec)?; // input blr
                 read_int(&mut s, &mut dec)?; // msg number
@@ -47869,6 +48001,77 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     respond_kicked(&mut s, &mut enc)?;
                     continue;
                 }
+                // STREAMING FAST PATH. A plain full scan produces `want`
+                // rows and REMEMBERS its place, so a client reading part of
+                // a large result does not pay to materialise all of it (the
+                // path below does). Opened lazily on the first fetch of a
+                // streamable plan; anything else - a sort, an index, a
+                // generator, a deferred access, an already-materialised
+                // Plan::Rows - is left to the materialising path, because
+                // [StreamCursor::open] answers None for it. The batch size
+                // is `want`, so the deadlock the materialising path guards
+                // against cannot arise: the server writes exactly what the
+                // client asked for and waits for the next op_fetch.
+                if want > 0 {
+                    if !cursors.contains_key(&cur_stmt)
+                        && !matches!(&*plan, Plan::Rows { .. })
+                    {
+                        if let Some(db) = database.as_ref() {
+                            if let Some(c) = StreamCursor::open(db, &*plan, &bound_args) {
+                                cursors.insert(cur_stmt, c);
+                            }
+                        }
+                    }
+                    if cursors.contains_key(&cur_stmt) {
+                        if let Some(db) = database.as_ref() {
+                            let cols: &[ProjCol] = match &*plan {
+                                Plan::Project { cols, .. } => cols,
+                                _ => &[],
+                            };
+                            let mut w = W::default();
+                            let batch = cursors
+                                .get_mut(&cur_stmt)
+                                .unwrap()
+                                .next_batch(db, want as usize);
+                            match batch {
+                                Ok((rows, done)) => {
+                                    let mut err = None;
+                                    for rec in &rows {
+                                        if let Err(e) =
+                                            encode_row(&mut w, cols, rec, out_fmt.as_ref())
+                                        {
+                                            err = Some(e);
+                                            break;
+                                        }
+                                    }
+                                    match err {
+                                        // a per-row evaluation error is the
+                                        // engine's own, mid-cursor: an error
+                                        // response after the rows that landed
+                                        Some(e) => {
+                                            write_eval_error(&mut w, &e);
+                                            cursors.remove(&cur_stmt);
+                                        }
+                                        None if done => {
+                                            w.int(OP_FETCH_RESPONSE).int(100).int(0);
+                                            cursors.remove(&cur_stmt);
+                                        }
+                                        // end of BATCH, rows still to come
+                                        None => {
+                                            w.int(OP_FETCH_RESPONSE).int(0).int(0);
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    write_eval_error(&mut w, &e);
+                                    cursors.remove(&cur_stmt);
+                                }
+                            }
+                            w.send(&mut s, &mut enc)?;
+                            continue;
+                        }
+                    }
+                }
                 // THE COUNT IS THE CLIENT'S BATCH SIZE, and ignoring it
                 // DEADLOCKS the pair. The server used to answer every
                 // fetch with the WHOLE result: the client reads the batch
@@ -48108,6 +48311,9 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
             x if x == OP_FREE_STATEMENT => {
                 let h = read_int(&mut s, &mut dec)?; // stmt
                 let how = read_int(&mut s, &mut dec)?; // 1 close, 2 drop, 4 unprepare
+                // CLOSE and DROP both end the cursor - a streaming one is
+                // dropped so a later execute of a CLOSEd handle opens fresh.
+                cursors.remove(&h);
                 // DROP retires the handle for good; CLOSE only ends the
                 // cursor and leaves the statement prepared for another
                 // execute, so its working set must survive.
@@ -48617,6 +48823,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
             x if x == OP_EXECUTE2 => {
                 let h = read_int(&mut s, &mut dec)?; // stmt
                 use_stmt!(h);
+                cursors.remove(&h); // a fresh execute opens a fresh cursor
                 read_int(&mut s, &mut dec)?; // tr
                 let in_blr = read_wire_bytes(&mut s, &mut dec)?; // input blr
                 read_int(&mut s, &mut dec)?; // msg number
