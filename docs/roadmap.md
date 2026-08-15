@@ -2375,12 +2375,24 @@ plus *the subsystem is now on the path*.
       32765, per pattern kind. The value binding was untouched (the driver
       sends both sides at their true length). Gated (numericwhere +6): the
       literal, NULL and param-pattern widths for `? LIKE` and `? STARTING
-      WITH`. A CONCATENATION-LHS LIKE (`VC||'x' LIKE ...`) is still refused
-      outright even with a literal pattern - a pre-existing
-      expression-support boundary, not a width one, its own slice. Still
-      refused deliberately: DECFLOAT in arithmetic / nested, the
-      `Infinity`/`NaN` text-literal specials, and a value past DECFLOAT(34)
-      range.
+      WITH`.
+
+      *And `||` CONCATENATION became a WHERE expression* - the boundary the
+      LIKE-width slices kept bumping into was broader than LIKE: a
+      concatenation was refused in ANY WHERE side (`VC||'x' = 'abx'` too),
+      because the token-level parser did not know `|`. It now tokenises `||`
+      to `Tok::Concat` and folds it in a `texpr_concat` level - tighter than
+      the arithmetic operators, left-associative, mirroring the select
+      list's `expr_concat` - into a `RawExpr::Concat`. Everything downstream
+      already handled a concatenation (`resolve_expr` types it Text, `eval`
+      renders it, `resolve_expr_term` LIKEs/compares it, and the
+      expression-LHS width slice gives its pattern `?` the concat's own
+      result width - `VC||'x'` is 11, `VC||VC2` is 15), so the one operator
+      lit the whole surface. Gated (wherexpr +9): concat `=`/LIKE/STARTING,
+      two-column and multi-`||` (left-assoc), literal-first, concat with a
+      CAST, and NULL propagation (`NULL||x` is NULL). Still refused
+      deliberately: DECFLOAT in arithmetic / nested, the `Infinity`/`NaN`
+      text-literal specials, and a value past DECFLOAT(34) range.
 
       *And the wide OUTER value came with it* — the probe's `band` capped
       an `Int128` driving value at `i64` and scanned; now it carries the

@@ -146,6 +146,20 @@ same "DML with a raising WHERE"     "UPDATE T SET B = B WHERE A / 0 = 1"
 # predfull slice (its gate covers them); what remains refused:
 same "CASE in WHERE answers now"    "SELECT ID FROM T WHERE CASE WHEN A > 1 THEN 1 ELSE 0 END = 1 ORDER BY ID"
 
+# --- `||` string concatenation as a WHERE expression -------------------
+# the token-level parser learned `||` (tighter than the arithmetic ops,
+# left-associative), so a concatenation is a WHERE side like any other:
+# compared, LIKE'd, STARTING-tested, and NULL-propagating (NULL||x = NULL).
+same "concat = literal"             "SELECT ID FROM T WHERE S||'x' = 'pearx'"
+same "concat LIKE"                  "SELECT ID FROM T WHERE S||'!' LIKE 'apple%' ORDER BY ID"
+same "concat STARTING WITH"         "SELECT ID FROM T WHERE S||S STARTING WITH 'fig'"
+same "two columns concat"           "SELECT ID FROM T WHERE S||S = 'figfig'"
+same "multi concat, left-assoc"     "SELECT ID FROM T WHERE S||'-'||S = 'fig-fig'"
+same "literal-first concat"         "SELECT ID FROM T WHERE 'z'||S = 'zpear'"
+same "concat with a CAST"           "SELECT ID FROM T WHERE S||CAST(A AS VARCHAR(3)) = 'pear1'"
+same "NULL propagates through ||"   "SELECT ID FROM T WHERE S||'x' IS NULL"
+same "concat in AND beside classic" "SELECT ID FROM T WHERE S||'x' LIKE 'a%' AND A > 0 ORDER BY ID"
+
 # --- refusals that REMAIN ----------------------------------------------
 for bad in "SELECT ID FROM T WHERE DECODE(A, 1, 2) = 2" \
            "SELECT ID FROM T WHERE A = ? + 1"; do

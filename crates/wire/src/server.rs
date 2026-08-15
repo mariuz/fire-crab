@@ -37397,6 +37397,7 @@ fn render_toks(toks: &[Tok]) -> Option<String> {
             Tok::Minus => "-".to_string(),
             Tok::Star => "*".to_string(),
             Tok::Slash => "/".to_string(),
+            Tok::Concat => "||".to_string(),
             // a `?` passes through verbatim: fcopt accepts a parameter
             // marker (probed: `ID = 100 AND V = ?` answers INDEX
             // (RDB$PRIMARY1, T_V)), and the band for it is built at
@@ -40057,6 +40058,8 @@ enum Tok {
     Minus,
     Star,
     Slash,
+    /// the `||` string concatenation operator ([texpr_concat])
+    Concat,
 }
 
 /// Finish an integer-or-decimal literal whose integer digits end at
@@ -40246,6 +40249,13 @@ fn tokenize(s: &str) -> Option<Vec<Tok>> {
             b'/' => {
                 out.push(Tok::Slash);
                 i += 1;
+            }
+            // `||` string concatenation - a single `|` is not an operator
+            // this parser knows, so it refuses (the whole predicate falls
+            // back rather than mis-reading it)
+            b'|' if b.get(i + 1) == Some(&b'|') => {
+                out.push(Tok::Concat);
+                i += 2;
             }
             // '-' AFTER a value-like token is the subtraction operator
             // (A - 1); before a digit elsewhere it starts a negative
@@ -40792,7 +40802,19 @@ fn texpr_unary(t: &[Tok], pos: &mut usize) -> Option<RawExpr> {
         *pos += 1;
         return texpr_unary(t, pos);
     }
-    texpr_atom(t, pos)
+    texpr_concat(t, pos)
+}
+
+/// The `||` concatenation level - tighter than unary minus and the
+/// arithmetic operators, left-associative, mirroring the char-level
+/// [expr_concat] the select-list parser uses.
+fn texpr_concat(t: &[Tok], pos: &mut usize) -> Option<RawExpr> {
+    let mut left = texpr_atom(t, pos)?;
+    while matches!(t.get(*pos), Some(Tok::Concat)) {
+        *pos += 1;
+        left = RawExpr::Concat(Box::new(left), Box::new(texpr_atom(t, pos)?));
+    }
+    Some(left)
 }
 
 fn texpr_atom(t: &[Tok], pos: &mut usize) -> Option<RawExpr> {
