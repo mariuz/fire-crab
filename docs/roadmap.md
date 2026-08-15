@@ -72,18 +72,17 @@ measured or pinned items**, each recorded in its own place below:
   each time (~26–43% off a re-executed `WHERE col = ?`). What is left is
   the record walk and the wire itself — measured, not near-zero: a narrow
   50k-row scan is ~110 ms against the engine's ~80 (≈1.4×, more in server
-  CPU), and the one clear redundancy is that the walk decodes EVERY column
-  of every row and the projection selects fields afterward, so
-  `SELECT id FROM <wide table>` pays to decode (and allocate strings for)
-  columns it discards — measured ~2× on a wide-table narrow projection.
-  Closing it is COLUMN PRUNING (decode only the fields the plan reads),
-  and it is a feature, not a residual: it threads a decode mask from
-  `Plan::Project` through `scan_filter_sort`/`leaf_source`/the scan walk
-  to `decode_record`, and a MISSED field reference is a silent wrong
-  answer, so it wants its own carefully-gated slice with a complete
-  referenced-field analysis (the trusted `expr_reads` walker is the tool)
-  and a conservative decode-all fallback — not to be folded into a cache
-  cleanup;
+  CPU). COLUMN PRUNING (decode only the fields a plan reads) was built and
+  MEASURED, and it does NOT pay: the per-column cost is not the field
+  decode, it is `sqz::unpack` decompressing the WHOLE record in
+  `assembled_image`, which a decode mask cannot avoid — old-vs-new on a
+  `SELECT id` over eight VARCHAR(200) columns was 2.99 → 2.92 µs/row, ~2%,
+  for a decode mask threaded through the whole scan path and a permanent
+  wrong-answer-risk surface (a missed field reference reads back Null).
+  Reverted. The real lever, if the walk is ever worth it, is PARTIAL
+  DECOMPRESSION — unpacking only up to the last needed field's offset —
+  which is an `ods`-core change to `sqz::unpack`, not a decode-time mask;
+  the rest is the fundamental decompress and the wire the engine pays too;
 - **the optimizer's stale-statistics region** — statistics non-zero but
   WRONG are unmeasured, needing their own fixture family (load,
   `SET STATISTICS`, grow);
@@ -270,21 +269,34 @@ of those boundaries.
   (RLE decompress + a `Vec<u8>`), decoding it into a `Vec<Value>` and
   encoding it to the wire adds the rest, to ~0.9 µs/row for four ints.
   Against the engine, a narrow 50k-row scan is ~110 ms to its ~80 — close,
-  but not parity, and wider on server CPU. The one clear redundancy is
-  that the walk decodes EVERY column and the projection selects fields
-  afterward: `SELECT id FROM <wide table>` decodes and allocates the wide
-  CHARs it then discards, measured ~2× the cost of decoding only what is
-  read. Closing that is COLUMN PRUNING — a decode mask carried from
-  `Plan::Project` (the union of the fields `cols`, `filter`, `order_by`,
-  `gen_cols` and `windows` reference, via the trusted `expr_reads` walker)
-  down through `scan_filter_sort`, `leaf_source` and the scan walk to
-  `decode_record`, decoding only masked fields and falling back to
-  decode-all whenever the reference set cannot be proven complete. It is a
-  FEATURE, not a residual to shave in a cache pass: a missed field
-  reference is a silent wrong answer, it touches ~30 sites in the core
-  query path, and it belongs in its own slice gated the differential way.
-  The rest — the per-row `Vec<u8>` and `Vec<Value>` and the XDR encode —
-  is the fundamental work the engine does too.
+  but not parity, and wider on server CPU.
+
+  COLUMN PRUNING — decode only the fields a `Plan::Project` reads — looked
+  like the redundancy to close, and it was BUILT to find out: a decode
+  mask (the union of the fields `cols`, `filter` and `order_by` reference,
+  collected via the trusted `expr_reads` walker with a decode-all fallback
+  on anything unproven) carried on the `TableScan` node down the scan walk
+  to a `decode_record_masked`, over the plain-scan projection only. It is
+  correct — the full differential suite passes (`serve-real-index` 403,
+  `textcolcmp` 345, `subquery` 70, `view` 34, `charset` 43, `modifiers`
+  66, and the rest, all 0 DIFF) — and it does NOT pay. Old-vs-new on a
+  `SELECT id` over eight VARCHAR(200) columns: 2.99 → 2.92 µs/row, ~2%.
+  The reason is structural: the per-column cost is not the field decode
+  (a `from_utf8_lossy` over already-decompressed bytes plus a `String`),
+  it is `sqz::unpack` in `assembled_image` decompressing the ENTIRE
+  record, which runs whole whatever the mask says. So the mask skipped the
+  cheap half and left the expensive half untouched, and the change was
+  reverted: a 2% gain does not justify a permanent wrong-answer-risk
+  surface (a field left out of the mask reads back Null) across the core
+  query path.
+
+  The real lever, if the record walk is ever worth more, is PARTIAL
+  DECOMPRESSION — `sqz::unpack` stopping at the last needed field's byte
+  offset, so `SELECT id` (offset 0) decompresses almost nothing. That is
+  an `ods`-core change with its own risk, not a decode-time mask, and it
+  is unclaimed. The rest — the per-row `Vec<u8>`, the `Vec<Value>` and the
+  XDR encode of the columns actually asked for — is the fundamental work
+  the engine does too.
 
 - **169/169 does NOT mean the cost model is right everywhere the guard
   used to refuse.** On a stale UNIQUE/PK index there is a structural miss
