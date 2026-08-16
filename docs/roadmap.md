@@ -2055,14 +2055,25 @@ pulled by the fetch.
   cannot deadlock), serving it from the streaming `emit_rows` instead. The
   two together took `FIRST 2` over an 8,000x8,000 nested-loop join from
   ~7 s (the whole 64,000,000-comparison result) to 0.35 s (two driver
-  rows), INNER, LEFT, RIGHT and FULL alike - O(rows fetched x inner), not
-  O(join). Pinned across all four kinds in `serve-real-jointypes.sh`. What
-  still materialises: a bigger `FIRST n` (`take > want`, drained in
-  batches), a sort or aggregate above the join, and the RIGHT/FULL mirror
-  ONLY when a consumer reads into it - which is fundamental, not a
-  shortfall. The wire cursor is the engine's iterator now, a lazy PUSH with
-  `Flow::Stop` for a scan or a `FIRST n` join, a materialising PUSH for the
-  blocking rest.
+  rows). And a LARGER `FIRST n`, past that one batch, no longer
+  materialises the whole source either: `branch_rows_res` collects a
+  bounded, non-DISTINCT FIRST n by WALKING a streamable inner and stopping
+  at `skip + take` (`stream_first_n`) rather than building the inner whole
+  and slicing - the same rows in the same order (the walk is what `.rows()`
+  collects), so every caller (a subquery, a derived table, an
+  `INSERT ... SELECT`, the batch fetch) is unchanged but for the part past
+  the limit it no longer builds. So `FIRST n` over the 8,000x8,000 join
+  scales with n now, not N: 100 -> 0.4 s, 500 -> 0.8, 2000 -> 2.2, 5000 ->
+  5.1 (was ~7.1 for all), INNER/LEFT/RIGHT/FULL alike - and it fixed a
+  WRONG ANSWER on the way, `FIRST 250` past a raiser at row 280 having
+  materialised into the raise the engine's limit steps over. Pinned across
+  the four kinds and the large-n case in `serve-real-jointypes.sh`. What
+  still materialises: a `DISTINCT` set or a sort or aggregate above the
+  source (blocking on the engine too), and the RIGHT/FULL mirror ONLY when
+  a consumer reads into it - both fundamental, not a shortfall. The wire
+  cursor is the engine's iterator now, a lazy PUSH with `Flow::Stop` for a
+  scan or a `FIRST n` (of any size) over a scan or a join, a materialising
+  PUSH for the blocking rest.
 
   ~~The next thing worth doing here is a boundary the gates already pin:
   the engine raises a blocking node's error at OPEN, where this server
