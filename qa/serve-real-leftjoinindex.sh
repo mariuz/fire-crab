@@ -431,7 +431,11 @@ join_indexed "a scaled NUMERIC inner index" \
     "SELECT COUNT(*) FROM CHI LEFT JOIN WIDEK W ON W.NM = CHI.K" 1
 join_indexed "... and its rows, ordered" \
     "SELECT CHI.ID, W.T FROM CHI LEFT JOIN WIDEK W ON W.NM = CHI.K ORDER BY CHI.ID" 1
-join_natural "a TEXT inner index against a numeric outer value" \
+# a TEXT equi-join (both VARCHAR): the inner's index cannot be driven (a
+# collation makes its key a collation key, which choose_index declines), so
+# it HASHES instead - by the trailing-trimmed string, the engine's own HASH
+# for a text join.
+join_hashed "a TEXT equi-join hashes (no drivable text index)" \
     "SELECT COUNT(*) FROM CHI LEFT JOIN WIDEK W ON W.T = CHI.N"
 join_natural "a NON-EQUALITY ON (a range band does not exclude the NULL entries)" \
     "SELECT COUNT(*) FROM CHI LEFT JOIN PAR ON PAR.K > CHI.K"

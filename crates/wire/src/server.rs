@@ -3876,7 +3876,7 @@ impl RowSource {
                 // unbuildable key cost a full scan for every outer row
                 let mut whole: Option<Vec<Vec<Value>>> = None;
                 let mut fallback: Option<Vec<Vec<Value>>> = None;
-                let mut key_hash: Option<std::collections::HashMap<i128, Vec<usize>>> = None;
+                let mut key_hash: Option<KeyHash> = None;
                 let mut scan_buf: Vec<Vec<Value>> = Vec::new();
                 left.for_each(db, &mut |row| {
                     let paired = match part.probe.as_ref() {
@@ -4129,7 +4129,7 @@ impl RowSource {
                 // result for LEFT and INNER alike, whose loop body reads
                 // only `l`, `rrows` and `part`, so join_step is untouched.
                 let mut fallback: Option<Vec<Vec<Value>>> = None;
-                let mut key_hash: Option<std::collections::HashMap<i128, Vec<usize>>> = None;
+                let mut key_hash: Option<KeyHash> = None;
                 let mut scan_buf: Vec<Vec<Value>> = Vec::new();
                 let mut out = Vec::new();
                 for row in l {
@@ -5297,62 +5297,115 @@ impl JoinProbe {
     }
 }
 
-/// The integer a value keys a HASH JOIN by, or None. INTEGER-family AND
-/// SCALE 0 only - the same shapes `band` keys an index by (`Int`, an exact
-/// numeric at scale 0, a 128-bit at scale 0), so two rows land in one bucket
-/// iff their keys compare EQUAL under the ON's integer comparison. A NULL, a
-/// scaled decimal, a text, a date or a float is None: it is not hashable this
-/// way, and the caller scans instead - the ON decides, byte-exact.
-fn join_int_key(v: &Value) -> Option<i128> {
+/// The key FAMILY a hash bucket groups by. A driver key is only looked up in
+/// a bucket of its OWN family: `value_cmp` compares a scale-0 integer against
+/// an integer NUMERICALLY, two texts by their trailing-trimmed BYTES, but a
+/// MISMATCHED pair (an int against a text) by their RENDERED text - so an int
+/// driver against a text inner does NOT belong in the text buckets and falls
+/// to the scan, where the ON renders and decides.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum KeyKind {
+    Int,
+    Text,
+}
+
+/// The key a value hashes a JOIN by, or None when it is not hashable this way.
+/// INTEGER-family at scale 0 keys by its i128 (numeric equality); TEXT keys by
+/// its trailing-space-trimmed string ("blanks not significant", the same
+/// `value_cmp` gives a text ON) - so two rows land in one bucket IFF their
+/// keys compare EQUAL under the ON. A NULL, a scaled decimal, a date, a float
+/// is None: the caller scans instead and the ON decides.
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum JoinKey {
+    Int(i128),
+    Text(String),
+}
+
+fn join_key(v: &Value) -> Option<JoinKey> {
     match v {
-        Value::Int(i) => Some(*i as i128),
-        Value::Scaled(raw, 0) => Some(*raw as i128),
-        Value::Int128(raw, 0) => Some(*raw),
+        Value::Int(i) => Some(JoinKey::Int(*i as i128)),
+        Value::Scaled(raw, 0) => Some(JoinKey::Int(*raw as i128)),
+        Value::Int128(raw, 0) => Some(JoinKey::Int(*raw)),
+        // trailing blanks are not significant in a Firebird text comparison,
+        // so 'k5' and 'k5   ' are the SAME key - exactly `value_cmp`'s rule
+        Value::Text(s) => Some(JoinKey::Text(s.trim_end_matches(' ').to_string())),
         _ => None,
     }
 }
 
-/// Group an unindexed inner side by its ONE integer equi-key, for a HASH
-/// JOIN: `key -> the indices of the inner rows carrying it`, appended IN SCAN
-/// ORDER, so pairing a driver with its bucket yields the SAME rows in the
-/// SAME order the whole-inner scan did - only without walking the whole inner
-/// per driver (O(N + M), not O(N x M)). `None` when the join cannot be hashed
-/// this way: more than one key (an OR - a union of buckets is a later slice),
-/// or an inner key that is not an integer (a text or scaled key, whose
-/// equality this bucket cannot reproduce). A NULL inner key is dropped - it
-/// never matches - which is the equi-join answer, not a lost row.
-fn build_join_key_hash(
-    rows: &[Vec<Value>],
-    probe: &JoinProbe,
-) -> Option<std::collections::HashMap<i128, Vec<usize>>> {
-    let [key] = probe.keys.as_slice() else { return None };
-    let fid = key.inner_fid;
-    let mut h: std::collections::HashMap<i128, Vec<usize>> = std::collections::HashMap::new();
-    for (i, r) in rows.iter().enumerate() {
-        match r.get(fid) {
-            Some(v) => match join_int_key(v) {
-                Some(k) => h.entry(k).or_default().push(i),
-                None if matches!(v, Value::Null) => {} // NULL never matches
-                None => return None,                   // not an integer column
-            },
-            None => return None,
-        }
+fn join_key_kind(k: &JoinKey) -> KeyKind {
+    match k {
+        JoinKey::Int(_) => KeyKind::Int,
+        JoinKey::Text(_) => KeyKind::Text,
     }
-    Some(h)
 }
 
-/// The inner rows a driver pairs with under the SCAN fallback: its HASH
-/// BUCKET when the single equi-key is an integer the hash was built on, the
-/// WHOLE inner otherwise. A NULL driver key matches nothing (an empty
-/// bucket); a non-integer or RAISING driver key falls to the whole inner so
-/// the ON decides exactly as the scan would have - `join_int_key`/`band`
-/// decline the same shapes, so the two agree. `buf` holds a hit's gathered
-/// rows and is reused across drivers.
+/// The hash-join FAMILY a column keys by, or None when it is not hashable (a
+/// scaled decimal, a date, a float). A join is hashed only when BOTH sides are
+/// the same family - `value_cmp` compares a mismatched pair by rendered text,
+/// which a bucket cannot reproduce, so a numeric driver against a text inner
+/// (or the reverse) stays a scan.
+fn desc_family(d: &Descriptor) -> Option<KeyKind> {
+    use fire_crab_ods::format::dtype;
+    if matches!(d.dtype, dtype::SHORT | dtype::LONG | dtype::INT64 | dtype::INT128) && d.scale == 0 {
+        Some(KeyKind::Int)
+    } else if matches!(d.dtype, dtype::TEXT | dtype::VARYING) {
+        Some(KeyKind::Text)
+    } else {
+        None
+    }
+}
+
+/// An unindexed inner side grouped by its ONE equi-key: `key -> the indices of
+/// the inner rows carrying it`, appended IN SCAN ORDER (so a driver's bucket
+/// yields the SAME rows in the SAME order the whole-inner scan did), plus the
+/// key FAMILY the column carries.
+struct KeyHash {
+    kind: KeyKind,
+    buckets: std::collections::HashMap<JoinKey, Vec<usize>>,
+}
+
+/// Build the [KeyHash] for a hash join, or `None` when the join cannot be
+/// hashed: more than one key (an OR - a union of buckets is a later slice), a
+/// key value that is not hashable (a scaled decimal, a date), or a column that
+/// MIXES families (defensive - a typed column does not). A NULL inner key is
+/// dropped: it never matches, which is the equi-join answer, not a lost row.
+fn build_join_key_hash(rows: &[Vec<Value>], probe: &JoinProbe) -> Option<KeyHash> {
+    let [key] = probe.keys.as_slice() else { return None };
+    let fid = key.inner_fid;
+    let mut buckets: std::collections::HashMap<JoinKey, Vec<usize>> =
+        std::collections::HashMap::new();
+    let mut kind: Option<KeyKind> = None;
+    for (i, r) in rows.iter().enumerate() {
+        let v = r.get(fid)?;
+        match join_key(v) {
+            Some(k) => {
+                let kk = join_key_kind(&k);
+                match kind {
+                    None => kind = Some(kk),
+                    Some(prev) if prev != kk => return None, // mixed families
+                    _ => {}
+                }
+                buckets.entry(k).or_default().push(i);
+            }
+            None if matches!(v, Value::Null) => {} // NULL never matches
+            None => return None,                   // not a hashable column
+        }
+    }
+    Some(KeyHash { kind: kind.unwrap_or(KeyKind::Int), buckets })
+}
+
+/// The inner rows a driver pairs with under the SCAN fallback: its HASH BUCKET
+/// when the driver key is the SAME FAMILY the hash was built on, the WHOLE
+/// inner otherwise. A NULL driver key matches nothing (an empty bucket); a
+/// different-family, unhashable or RAISING driver key falls to the whole inner
+/// so the ON decides exactly as the scan would have. `buf` holds a hit's
+/// gathered rows and is reused across drivers.
 fn join_scan_rows<'a>(
     driver: &[Value],
     probe: &JoinProbe,
     inner: &'a [Vec<Value>],
-    hash: Option<&std::collections::HashMap<i128, Vec<usize>>>,
+    hash: Option<&KeyHash>,
     buf: &'a mut Vec<Vec<Value>>,
 ) -> &'a [Vec<Value>] {
     let (Some(h), [key]) = (hash, probe.keys.as_slice()) else {
@@ -5363,17 +5416,17 @@ fn join_scan_rows<'a>(
             buf.clear();
             buf
         }
-        Ok(v) => match join_int_key(&v) {
-            Some(k) => {
+        Ok(v) => match join_key(&v) {
+            Some(k) if join_key_kind(&k) == h.kind => {
                 buf.clear();
-                if let Some(idxs) = h.get(&k) {
+                if let Some(idxs) = h.buckets.get(&k) {
                     for &i in idxs {
                         buf.push(inner[i].clone());
                     }
                 }
                 buf
             }
-            None => inner,
+            _ => inner,
         },
         Err(_) => inner,
     }
@@ -21679,6 +21732,7 @@ fn build_join_probe(
     kind: JoinKind,
     on: &Predicate,
     side: &JoinSide,
+    outer_descs: &[Descriptor],
 ) -> Option<JoinProbe> {
     // LEFT and INNER both DRIVE the outer and read one accumulated row at a
     // time, so a per-driver index probe of the inner concatenates to the
@@ -21836,16 +21890,32 @@ fn build_join_probe(
         for t in terms {
             let Some((outer_expr, out_pos)) = as_key(t) else { continue };
             let Some((inner_fid, name)) = inner_of(out_pos) else { continue };
-            // a HASHABLE key is an INTEGER inner column at scale 0 - the one
-            // shape `build_join_key_hash`/`join_int_key` group by exactly. A
-            // text or scaled inner with no index stays a NATURAL scan (its
-            // equality the bucket cannot reproduce), as it always was.
-            let hashable_here = base_descs.get(inner_fid).is_some_and(|d| {
-                use fire_crab_ods::format::dtype;
-                matches!(d.dtype, dtype::SHORT | dtype::LONG | dtype::INT64 | dtype::INT128)
-                    && d.scale == 0
-            });
-            if hashable.is_none() && hashable_here {
+            // a HASHABLE key is an INTEGER inner column at scale 0, or a TEXT
+            // one (the shapes `join_key` groups by exactly), AND an outer of
+            // the SAME family - a numeric driver against a text inner hashes
+            // neither, since `value_cmp` renders and compares that pair. When
+            // the outer is a plain column its family is checked; an expression
+            // is trusted (the runtime kind-check still guards a mismatch).
+            let inner_family = base_descs.get(inner_fid).and_then(desc_family);
+            // the outer's family when it can be TOLD - a plain column (from
+            // the accumulated descriptors), an integer or a text literal; an
+            // expression or a coercion is None (unknown).
+            let outer_family = match &outer_expr {
+                Expr::Col(fid) => outer_descs.get(*fid).and_then(desc_family),
+                Expr::Int(_) => Some(KeyKind::Int),
+                Expr::Str(_) => Some(KeyKind::Text),
+                _ => None,
+            };
+            // hash when the families are KNOWN EQUAL, or (integers only, whose
+            // equality is unambiguous) an untyped expression the runtime
+            // kind-check will fall to the scan on a mismatch. A text key under
+            // any coercion scans - its rendering need not match a stored one.
+            let outer_ok = match (inner_family, outer_family) {
+                (Some(i), Some(o)) => i == o,
+                (Some(KeyKind::Int), None) => true,
+                _ => false,
+            };
+            if hashable.is_none() && outer_ok {
                 hashable = Some(ProbeKey { inner_fid, outer: outer_expr.clone() });
             }
             if let Some(id) = bless(inner_fid, &name) {
@@ -22127,7 +22197,12 @@ fn plan_join_bound(
         if matches!(kind, JoinKind::Inner) {
             mark_hash_keys(&mut on, sides[k + 1].offset, sides[k + 1].descs.len());
         }
-        let probe = build_join_probe(db, *kind, &on, &sides[k + 1]);
+        // the combined descriptors of every side ALREADY joined, indexed by
+        // the outer field id an ON key names - so `build_join_probe` can tell
+        // the outer's family and refuse to hash a cross-family key
+        let outer_descs: Vec<Descriptor> =
+            sides[..=k].iter().flat_map(|s| s.descs.iter().cloned()).collect();
+        let probe = build_join_probe(db, *kind, &on, &sides[k + 1], &outer_descs);
         if trace_on() {
             match probe.as_ref().map(|p| (p, &p.index)) {
                 Some((p, Some((id, col)))) => {
