@@ -2164,17 +2164,23 @@ pulled by the fetch.
   `i128` (numeric equality) and a TEXT inner by its trailing-space-TRIMMED
   string - exactly how `value_cmp` compares those, so two rows share a bucket
   iff the ON holds (CHAR padding and a VARCHAR-against-a-CHAR fold the same).
-  A VARCHAR equi-join that cost 650 ms drops to 50 ms too. A scaled decimal or
-  a date inner, or an OR of keys, still scans and the ON decides. The bucket
-  carries its key FAMILY, and a driver only looks up a bucket of its OWN
-  family: `value_cmp` compares a MISMATCHED pair (an int against a text) by
-  RENDERED text, which a bucket cannot reproduce, so an int-vs-text join falls
-  to the scan and the ON renders - `build_join_probe` refuses the hash key up
-  front when the outer's family is known and differs. The bucket is filled IN
-  SCAN ORDER, so a driver's matches come back exactly as the whole-inner scan
-  gave them: the row order does not move. LEFT and INNER alike; RIGHT/FULL
-  still scan. So the only O(N x M) join left is an unindexed SCALED-numeric or
-  temporal equi-join, or a theta join - which the engine loops too.
+  A VARCHAR equi-join that cost 650 ms drops to 50 ms too. And a SCALED numeric
+  is keyed by its digits with TRAILING ZEROS STRIPPED - a scale-independent
+  canonical form, so `1.50` (150 @ -2) and `1.5` (15 @ -1) land in the one
+  bucket `value_cmp` aligns them into; a NUMERIC(9,2) equi-join drops 516 ms ->
+  50. A date inner, or an OR of keys, still scans and the ON decides. The
+  bucket carries its key FAMILY, and a driver only looks up a bucket of its OWN
+  family: `value_cmp` compares a MISMATCHED pair by RENDERED text (an int
+  against a text, or an i64-backed scaled against an i128-backed one of a
+  different width - it only ALIGNS numerics of the SAME width), which a bucket
+  cannot reproduce, so such a pair falls to the scan and the ON renders. The
+  family is split by storage width for exactly that reason, and
+  `build_join_probe` refuses the hash key up front when the outer's family is
+  known and differs. The bucket is filled IN SCAN ORDER, so a driver's matches
+  come back exactly as the whole-inner scan gave them: the row order does not
+  move. LEFT and INNER alike; RIGHT/FULL still scan. So the only O(N x M) join
+  left is an unindexed TEMPORAL or DECFLOAT equi-join, or a theta join - which
+  the engine loops too.
 
   ~~The next thing worth doing here is a boundary the gates already pin:
   the engine raises a blocking node's error at OPEN, where this server
