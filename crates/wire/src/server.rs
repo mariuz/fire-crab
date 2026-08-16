@@ -5318,6 +5318,9 @@ enum KeyKind {
     Time,
     TimeTz,
     TimestampTz,
+    // DECFLOAT(16) and DECFLOAT(34) share a family: `value_cmp` promotes both
+    // to a decimal128 and compares there, so the two widths can meet.
+    DecFloat,
 }
 
 /// The key a value hashes a JOIN by. An INTEGER at scale 0 keys by its i128;
@@ -5337,6 +5340,10 @@ enum JoinKey {
     DateTime(i32, u32),
     /// a TIME, or a TIME WITH TIME ZONE by its UTC time units
     Time(u32),
+    /// a DECFLOAT, `(neg, coefficient, exponent)` REDUCED to no trailing zeros
+    /// - the canonical `value_cmp`'s cohort comparison sees, so `1.0` and `1.00`
+    /// share it; every zero maps to `(false, 0, 0)`
+    DecFloat(bool, u128, i32),
 }
 
 /// Strip trailing decimal zeros: `(150, -2)` -> `(15, -1)`, `(500, -2)` ->
@@ -5353,6 +5360,22 @@ fn reduce_scaled(mut raw: i128, mut scale: i8) -> (i128, i8) {
         scale += 1;
     }
     (raw, scale)
+}
+
+/// The canonical [JoinKey] for a FINITE DECFLOAT `(sign, coefficient,
+/// exponent)`: strip the coefficient's trailing zeros (a COHORT - `1.0` and
+/// `1.00` are the same number, which `decfloat::cmp` treats as equal), and map
+/// EVERY zero to `(false, 0, 0)` (a zero of any sign or exponent compares
+/// equal). Two DECFLOATs share this key iff `value_cmp` calls them equal.
+fn reduce_decfloat(neg: bool, mut coeff: u128, mut exp: i32) -> JoinKey {
+    if coeff == 0 {
+        return JoinKey::DecFloat(false, 0, 0);
+    }
+    while coeff % 10 == 0 {
+        coeff /= 10;
+        exp += 1;
+    }
+    JoinKey::DecFloat(neg, coeff, exp)
 }
 
 /// The `(family, key)` a value hashes a JOIN by, or None when it is not
@@ -5387,6 +5410,21 @@ fn join_key(v: &Value) -> Option<(KeyKind, JoinKey)> {
         Value::TimestampTz(d, t, _) => {
             Some((KeyKind::TimestampTz, JoinKey::DateTime(*d, *t)))
         }
+        // a DECFLOAT hashes by its reduced decimal; an Infinity or a NaN is NOT
+        // hashed - it scans, and the ON's `decfloat::cmp` decides (those never
+        // key an index either, and are vanishing in real data)
+        Value::DecFloat16(bits) => match fire_crab_ods::decfloat::decode_dec64(*bits) {
+            fire_crab_ods::decfloat::Dec::Finite { neg, coeff, exp } => {
+                Some((KeyKind::DecFloat, reduce_decfloat(neg, coeff, exp)))
+            }
+            _ => None,
+        },
+        Value::DecFloat34(bits) => match fire_crab_ods::decfloat::decode_dec128(*bits) {
+            fire_crab_ods::decfloat::Dec::Finite { neg, coeff, exp } => {
+                Some((KeyKind::DecFloat, reduce_decfloat(neg, coeff, exp)))
+            }
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -5413,6 +5451,8 @@ fn desc_family(d: &Descriptor) -> Option<KeyKind> {
         Some(KeyKind::TimeTz)
     } else if matches!(d.dtype, dtype::TIMESTAMP_TZ | dtype::EX_TIMESTAMP_TZ) {
         Some(KeyKind::TimestampTz)
+    } else if matches!(d.dtype, dtype::DEC64 | dtype::DEC128) {
+        Some(KeyKind::DecFloat)
     } else {
         None
     }
