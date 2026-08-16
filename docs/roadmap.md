@@ -2184,9 +2184,16 @@ pulled by the fetch.
   TIMESTAMP as MIDNIGHT, so a DATE keys as `(day, 0)` and meets a zero-time
   TIMESTAMP; TIME is its own, and a WITH-TIME-ZONE value keys by its UTC instant
   (its own family too, since `value_cmp` renders across the temporal kinds).
-  LEFT and INNER alike; RIGHT/FULL still scan. So the only O(N x M) equi-join
-  left is an unindexed DECFLOAT one (its canonical a later slice, if ever), and
-  a theta join - which the engine loops too.
+  And a DECFLOAT key hashes now, the LAST family: `join_key` decodes it and
+  keys by `(sign, coefficient, exponent)` with the coefficient's trailing zeros
+  stripped - the canonical `decfloat::cmp`'s COHORT comparison sees, so `1.0`
+  and `1.00` share it and every zero maps to one; an unindexed DECFLOAT equi-
+  join drops 716 ms -> 50. DECFLOAT(16) and DECFLOAT(34) are one family (both
+  promote to a decimal128), an Infinity or NaN scans (never keys an index).
+  LEFT and INNER alike; RIGHT/FULL still scan. So the equi-join FAMILIES are
+  closed - an unindexed INT, TEXT, scaled, temporal or DECFLOAT join all HASH,
+  the engine's plan - and the only O(N x M) join left is a THETA join, which
+  the engine loops too.
 
   ~~The next thing worth doing here is a boundary the gates already pin:
   the engine raises a blocking node's error at OPEN, where this server
