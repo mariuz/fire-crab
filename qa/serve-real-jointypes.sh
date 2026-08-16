@@ -245,6 +245,20 @@ both "FIRST 2 sorted JOIN ORDER BY b.ID, raiser at 280 past (small)" \
      "SELECT FIRST 2 b.ID, 10/(b.ID - 280) AS Q FROM BIG b JOIN BIG c ON b.ID = c.ID ORDER BY b.ID"
 both "FIRST 250 sorted JOIN ORDER BY b.ID, raiser at 280 past (large)" \
      "SELECT FIRST 250 b.ID, 10/(b.ID - 280) AS Q FROM BIG b JOIN BIG c ON b.ID = c.ID ORDER BY b.ID"
+# A JOIN ordered by the DRIVER's NAVIGABLE key does not sort ABOVE the join
+# at all: the driver (BIGK, a PK) walks its index in key order, the join
+# emits each driver row's matches in that order, so the result is already
+# sorted - the engine's `BIGK ORDER RDB$PRIMARY, BIG` plan. A FIRST n stops
+# after n driver rows rather than materialising the whole join to sort it
+# (measured 1.78 s -> 15 ms), so the raiser at 280, past FIRST 250, never
+# runs; the whole-materialise sort would have hit it. INNER and LEFT both,
+# since neither has a mirror out of driver order.
+both "FIRST 250 nav-DRIVER JOIN ORDER BY b.pk, raiser at 280 past" \
+     "SELECT FIRST 250 b.ID, 10/(b.ID - 280) AS Q FROM BIGK b JOIN BIG c ON b.ID = c.ID ORDER BY b.ID"
+both "FIRST 250 nav-DRIVER LEFT JOIN ORDER BY b.pk, raiser at 280 past" \
+     "SELECT FIRST 250 b.ID, 10/(b.ID - 280) AS Q FROM BIGK b LEFT JOIN BIG c ON b.ID = c.ID ORDER BY b.ID"
+both "FIRST 3 nav-DRIVER JOIN ORDER BY b.pk, clean values" \
+     "SELECT FIRST 3 b.ID, c.ID FROM BIGK b JOIN BIG c ON b.ID = c.ID ORDER BY b.ID"
 # the CONTROL: a limit that REACHES the raiser raises on both, and a clean
 # limit answers the same ordered rows on both (values, not just no-error)
 both "FIRST 285 nav ORDER BY pk REACHES the raiser, both raise" \

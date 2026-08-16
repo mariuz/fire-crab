@@ -22378,7 +22378,7 @@ fn plan_join_bound(
     // taken expression sort keys for several increments and this one
     // took names and ordinals only.
     let (ord_cols, ord_descs) = combined_view(&sides);
-    let order_by = match order_s {
+    let mut order_by = match order_s {
         None => Vec::new(),
         Some(os) => parse_order_by_expr(
             os,
@@ -22387,6 +22387,75 @@ fn plan_join_bound(
             |text| parse_raw_expr(text).and_then(|r| resolve_expr(&r, &ord_cols, &ord_descs)),
         )?,
     };
+
+    // NAVIGATE THE DRIVER FOR THE ORDER BY instead of sorting above the join.
+    // `... FROM A JOIN B ... ORDER BY A.<pk>` is the engine's `A ORDER
+    // RDB$PRIMARY1`: the driver walks its index in key order, the join emits
+    // each driver row's matches in that order, so the result is ALREADY
+    // sorted and a `FIRST n` stops after n drivers rather than materialising
+    // the whole join to sort it - measured 1.78 s -> the unsorted 15 ms on a
+    // 4,000-row join. The navigated walk GUARANTEES the order, so `order_by`
+    // is CLEARED and every unsorted-join path (the streaming FIRST n
+    // included) just works. Taken only when:
+    //   - every step is INNER or LEFT (a RIGHT/FULL mirror emits the OTHER
+    //     side's unmatched rows at the end, NULL in the driver key, out of
+    //     driver order - it must sort);
+    //   - the ORDER BY is a SINGLE ascending plain-field key on the DRIVER
+    //     (side 0, whose `offset` is 0, so the key's `field` IS the driver
+    //     record field id - see `resolve_join_col`);
+    //   - the driver is still a plain scan: a WHERE band already keyed it and
+    //     BOUNDS BEAT NAVIGATION, so keep that and sort;
+    //   - the driver's table has a navigable index on that field (the same
+    //     `Access::Order` gate the single-relation path holds).
+    if let [key] = order_by.as_slice() {
+        let plain_asc =
+            key.expr.is_none() && !key.desc && matches!(key.nulls, NullsAt::Default);
+        let inner_or_left =
+            parts.iter().all(|p| matches!(p.kind, JoinKind::Inner | JoinKind::Left));
+        let bare = |s: &str| ident_ok(s) && !s.chars().any(|c| c.is_ascii_lowercase());
+        if plain_asc
+            && inner_or_left
+            && key.field < driver_width
+            && matches!(sides[0].src, RowSource::TableScan { .. })
+        {
+            if let Some(src) = driver_src.as_ref() {
+                let col = driver_cols
+                    .iter()
+                    .find(|c| c.field_id as usize == key.field)
+                    .map(|c| c.name.clone())
+                    .filter(|c| bare(c));
+                if let (Some(col), true) = (col, bare(&src.table)) {
+                    let opt_sql = format!("SELECT 1 FROM {} ORDER BY {}", src.table, col);
+                    let nav = [OrderKey {
+                        field: key.field,
+                        expr: None,
+                        desc: false,
+                        nulls: NullsAt::Default,
+                    }];
+                    if let Some(access) =
+                        choose_index(db, src.rel, &src.table, &driver_descs, &None, &opt_sql, &nav)
+                    {
+                        if access.navigate() {
+                            if trace_on() {
+                                eprintln!(
+                                    "[srv] driver ORDER navigate: rel={} {}",
+                                    src.rel,
+                                    access.describe()
+                                );
+                            }
+                            sides[0].src = RowSource::IndexScan {
+                                rel: src.rel,
+                                formats: src.formats.clone(),
+                                access,
+                                width: Some(driver_width),
+                            };
+                            order_by = Vec::new();
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     // A COMMA JOIN CARRIES ITS KEY IN THE WHERE, not in an ON, and the
     // engine hashes it just the same (`FROM A, B WHERE A.N = B.T` is
