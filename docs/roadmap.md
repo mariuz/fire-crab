@@ -2136,6 +2136,23 @@ pulled by the fetch.
   reads only the rows the limit keeps, a materialising PUSH for the blocking
   rest - and even there the projection runs only over those rows.
 
+  And the JOIN itself PROBES its inner index for an INNER pair now, not just a
+  LEFT one. `build_join_probe` was LEFT-only, so `SELECT A.ID FROM A JOIN B ON
+  A.K=B.K` over 4,000 x 4,000 did the whole O(N x M) nested-loop scan - 1.79 s,
+  every pair compared - where the engine plans `B INDEX RDB$PRIMARY` and reads
+  ~one inner row per driver. (A COUNT of the same join was already 190 ms on a
+  different path, so the cost hid until a real projection asked for the rows.)
+  LEFT and INNER both drive the outer one accumulated row at a time, so the
+  per-driver probe the LEFT path used concatenates to the whole INNER result
+  too - `join_step` just DROPS an unmatched INNER driver where LEFT pads it -
+  and the driver stays the syntactic left, so the inner's record-order matches
+  do not move the row order the scan gave. 1.79 s -> 70 ms. The engine HASHes
+  these (this server has no hash join), but a nested-loop index probe is its
+  best plan and far past the scan it did; RIGHT/FULL still decline (the mirror
+  needs the whole other side) and an unindexed inner still scans. That closes
+  the join residual the driver-navigation slice named: the FULL sort-less join
+  is the PROBE now, not a scan.
+
   ~~The next thing worth doing here is a boundary the gates already pin:
   the engine raises a blocking node's error at OPEN, where this server
   announces the result set and raises at the first FETCH.~~
