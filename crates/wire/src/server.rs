@@ -5311,6 +5311,13 @@ enum KeyKind {
     Text,
     NumSmall,
     NumWide,
+    // DATE and TIMESTAMP share a family: `value_cmp` compares a DATE against a
+    // TIMESTAMP as MIDNIGHT, so a DATE keys as `(day, 0)` and can meet one. The
+    // rest are their own families - `value_cmp` renders across them.
+    DateTime,
+    Time,
+    TimeTz,
+    TimestampTz,
 }
 
 /// The key a value hashes a JOIN by. An INTEGER at scale 0 keys by its i128;
@@ -5324,6 +5331,12 @@ enum JoinKey {
     Int(i128),
     Text(String),
     Num(i128, i8),
+    /// a DATE `(day, 0)`, a TIMESTAMP `(day, time)`, or a WITH-TIME-ZONE one
+    /// by its UTC `(day, time)` - the family (kept in [KeyKind]) tells them
+    /// apart, and a single-family hash never mixes them, so the shape is shared
+    DateTime(i32, u32),
+    /// a TIME, or a TIME WITH TIME ZONE by its UTC time units
+    Time(u32),
 }
 
 /// Strip trailing decimal zeros: `(150, -2)` -> `(15, -1)`, `(500, -2)` ->
@@ -5363,6 +5376,17 @@ fn join_key(v: &Value) -> Option<(KeyKind, JoinKey)> {
         Value::Text(s) => {
             Some((KeyKind::Text, JoinKey::Text(s.trim_end_matches(' ').to_string())))
         }
+        // a DATE is a TIMESTAMP at midnight (`value_cmp` compares them so), so
+        // it keys as `(day, 0)` in the SAME family a TIMESTAMP does
+        Value::Date(d) => Some((KeyKind::DateTime, JoinKey::DateTime(*d, 0))),
+        Value::Timestamp(d, t) => Some((KeyKind::DateTime, JoinKey::DateTime(*d, *t))),
+        Value::Time(t) => Some((KeyKind::Time, JoinKey::Time(*t))),
+        // WITH TIME ZONE values compare by their UTC INSTANT - the stored form
+        // is already UTC (the zone is presentation), so key by it, zone ignored
+        Value::TimeTz(t, _) => Some((KeyKind::TimeTz, JoinKey::Time(*t))),
+        Value::TimestampTz(d, t, _) => {
+            Some((KeyKind::TimestampTz, JoinKey::DateTime(*d, *t)))
+        }
         _ => None,
     }
 }
@@ -5381,6 +5405,14 @@ fn desc_family(d: &Descriptor) -> Option<KeyKind> {
         Some(KeyKind::NumSmall)
     } else if matches!(d.dtype, dtype::TEXT | dtype::VARYING) {
         Some(KeyKind::Text)
+    } else if matches!(d.dtype, dtype::SQL_DATE | dtype::TIMESTAMP) {
+        Some(KeyKind::DateTime)
+    } else if matches!(d.dtype, dtype::SQL_TIME) {
+        Some(KeyKind::Time)
+    } else if matches!(d.dtype, dtype::SQL_TIME_TZ | dtype::EX_TIME_TZ) {
+        Some(KeyKind::TimeTz)
+    } else if matches!(d.dtype, dtype::TIMESTAMP_TZ | dtype::EX_TIMESTAMP_TZ) {
+        Some(KeyKind::TimestampTz)
     } else {
         None
     }
