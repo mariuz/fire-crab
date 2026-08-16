@@ -53,10 +53,17 @@ INSERT INTO C VALUES (10, 1, 'one', 10.50);
 INSERT INTO C VALUES (20, 2, 'two', 99.00);
 COMMIT;
 CREATE TABLE BIG (ID INTEGER);
+-- BIGK carries a PRIMARY KEY, so ORDER BY ID NAVIGATES its index (the
+-- walk IS the order, no Sort) - the case a FIRST n over a sorted scan
+-- must stop the walk in, not materialise and project into a later raiser.
+CREATE TABLE BIGK (ID INTEGER NOT NULL PRIMARY KEY);
 COMMIT;
 SET TERM ^;
 EXECUTE BLOCK AS DECLARE I INTEGER = 0; BEGIN
-  WHILE (I < 300) DO BEGIN I = I + 1; INSERT INTO BIG VALUES (:I); END
+  WHILE (I < 300) DO BEGIN I = I + 1;
+    INSERT INTO BIG VALUES (:I);
+    INSERT INTO BIGK VALUES (:I);
+  END
 END^
 SET TERM ;^
 COMMIT;
@@ -215,6 +222,35 @@ both "FIRST 250 over a LEFT self-join, raiser at 280, stops" \
      "SELECT FIRST 250 b.ID, 10/(b.ID - 280) AS Q FROM BIG b LEFT JOIN BIG c ON b.ID = c.ID"
 both "FIRST 5 SKIP 260 over the streamed window" \
      "SELECT FIRST 5 SKIP 260 ID FROM BIG ORDER BY ID"
+
+# --- a FIRST n over a SORTED source defers the projection past the limit --
+# The SORT blocks (the whole cursor is read and ordered - the engine's too),
+# but the SELECT LIST is not the sort key: the engine orders the raw rows,
+# cuts to `take`, and only THEN projects. So a raiser in a COLUMN of a row
+# PAST the limit never runs, where fire-crab used to materialise the sorted
+# cursor and PROJECT every row - raising on `10/(ID-280)` at ID 280 that the
+# limit steps over. Three orderings that reach the source three ways:
+#   - a NAVIGABLE key (BIGK's PK): the walk IS the order, no Sort node;
+#   - a real SORT (BIG.ID DESC, unindexed): materialise-and-order;
+#   - a sorted JOIN: the combined rows are ordered, then projected.
+# small n (one wire batch) and large n (past it) take different server
+# paths, so each ordering is pinned at both sizes.
+both "FIRST 2 nav ORDER BY pk, raiser at 280 past (small)" \
+     "SELECT FIRST 2 ID, 10/(ID - 280) AS Q FROM BIGK ORDER BY ID"
+both "FIRST 250 nav ORDER BY pk, raiser at 280 past (large)" \
+     "SELECT FIRST 250 ID, 10/(ID - 280) AS Q FROM BIGK ORDER BY ID"
+both "FIRST 250 real-sort ORDER BY ID DESC, raiser at 25 past" \
+     "SELECT FIRST 250 ID, 10/(ID - 25) AS Q FROM BIG ORDER BY ID DESC"
+both "FIRST 2 sorted JOIN ORDER BY b.ID, raiser at 280 past (small)" \
+     "SELECT FIRST 2 b.ID, 10/(b.ID - 280) AS Q FROM BIG b JOIN BIG c ON b.ID = c.ID ORDER BY b.ID"
+both "FIRST 250 sorted JOIN ORDER BY b.ID, raiser at 280 past (large)" \
+     "SELECT FIRST 250 b.ID, 10/(b.ID - 280) AS Q FROM BIG b JOIN BIG c ON b.ID = c.ID ORDER BY b.ID"
+# the CONTROL: a limit that REACHES the raiser raises on both, and a clean
+# limit answers the same ordered rows on both (values, not just no-error)
+both "FIRST 285 nav ORDER BY pk REACHES the raiser, both raise" \
+     "SELECT FIRST 285 ID, 10/(ID - 280) AS Q FROM BIGK ORDER BY ID"
+both "FIRST 3 nav ORDER BY pk DESC, clean values" \
+     "SELECT FIRST 3 ID FROM BIGK ORDER BY ID DESC"
 
 rm -f "$A" "$B"
 exit $fail

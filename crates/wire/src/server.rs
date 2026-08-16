@@ -23873,13 +23873,17 @@ fn plan_draws_generator(plan: &Plan) -> bool {
     }
 }
 
-/// The FIRST `stop` PROJECTED rows of a streamable inner - a plain scan
-/// or a join, unsorted - collected by WALKING it and STOPPING, so a
-/// bounded `FIRST n` does not materialise the whole source. The rows and
-/// their order are exactly what `branch_rows_res` would have produced and
-/// then sliced; this only avoids building the part past the limit.
-/// `None` for an inner that cannot stream (a sort, an aggregate, a union,
-/// a derived table) - those are blocking and materialise as before.
+/// The FIRST `stop` PROJECTED rows of an inner whose PROJECTION can be
+/// deferred past the limit - a plain scan or an unsorted join (WALKED and
+/// STOPPED, so the source is not materialised), or a SORTED scan (the sort
+/// blocks and materialises, as the engine's does, but the projection still
+/// runs only over the `stop` rows kept). The rows and their order are
+/// exactly what `branch_rows_res` would have produced and then sliced; this
+/// avoids building the part past the limit AND projecting it - the latter
+/// being a WRONG ANSWER when the projection raises on a row past the limit.
+/// `None` for an inner whose projection cannot be lifted out (an aggregate,
+/// a union, a derived table, a windowed or generator Project) - those
+/// materialise and project whole, as before.
 fn stream_first_n(
     inner: &Plan,
     db: &Database,
@@ -23891,13 +23895,28 @@ fn stream_first_n(
     }
     match inner {
         // a plain scan, exactly as branch_rows_res builds it (the index is
-        // the plan's, already resolved where the batch fetch resolves one)
+        // the plan's, already resolved where the batch fetch resolves one).
+        // ORDER BY is CARRIED into the source, not refused: a NAVIGABLE key
+        // walks the index in key order (`scan_filter_sort` drops the Sort),
+        // so a `FIRST n ... ORDER BY <pk>` streams and stops at the limit; a
+        // real sort still blocks and materialises - the engine's does too -
+        // but either way the PROJECTION runs only over the `stop` rows kept,
+        // which is what fixes the WRONG ANSWER: `FIRST 2 K, 10/(K-5) ORDER BY
+        // K` used to project every row and RAISE on one past the limit the
+        // engine sorts, cuts, and never reaches. `project_read_len` already
+        // folds the ORDER BY key into the read length, so the pruned leaf
+        // still carries what the sort reads.
         Plan::Project { rel, formats, cols, filter, order_by, gen_cols, index, windows, .. }
-            if order_by.is_empty() && gen_cols.is_empty() && windows.is_empty() =>
+            if gen_cols.is_empty() && windows.is_empty() =>
         {
             let filter = bind_filter(filter, args).map_err(|_| EvalErr::Unsupported)?;
-            let mut src =
-                RowSource::scan_filter_sort(*rel, formats.clone(), filter, Vec::new(), index.clone());
+            let mut src = RowSource::scan_filter_sort(
+                *rel,
+                formats.clone(),
+                filter,
+                order_by.clone(),
+                index.clone(),
+            );
             src.prune_leaf(project_read_len(inner));
             let mut out: Vec<Vec<Value>> = Vec::new();
             src.for_each(db, &mut |values| {
@@ -23910,23 +23929,39 @@ fn stream_first_n(
             })?;
             Ok(Some(out))
         }
-        // a join, walked left-deep - the RIGHT/FULL mirror streams too, so
-        // the limit stops in the matched portion before it
-        Plan::Join { base, base_width, parts, cols, filter, order_by, defer }
-            if order_by.is_empty() =>
-        {
+        // a join. UNSORTED it is walked left-deep and STOPPED - the
+        // RIGHT/FULL mirror streams too, so the limit stops in the matched
+        // portion before it, and the join is not materialised. SORTED it
+        // BLOCKS (the combined rows are materialised and ordered, as the
+        // engine's are), but the PROJECTION still runs only over the `stop`
+        // rows kept - so `FIRST 2 A.K, 10/(A.K-5) ... ORDER BY A.K` cuts to
+        // two rows where projecting the whole sorted result raised on a row
+        // past the limit.
+        Plan::Join { base, base_width, parts, cols, filter, order_by, defer } => {
             let bound = bind_filter(filter, args).map_err(|_| EvalErr::Unsupported)?;
             let base = resolve_driver_base(db, base, defer, &bound);
             let src = join_rowsource(&base, *base_width, parts, &bound);
             let mut out: Vec<Vec<Value>> = Vec::new();
-            src.for_each(db, &mut |combined| {
-                let mut row = Vec::with_capacity(cols.len());
-                for c in cols {
-                    row.push(c.value_of(&combined)?);
+            if order_by.is_empty() {
+                src.for_each(db, &mut |combined| {
+                    let mut row = Vec::with_capacity(cols.len());
+                    for c in cols {
+                        row.push(c.value_of(&combined)?);
+                    }
+                    out.push(row);
+                    Ok(if out.len() >= stop { Flow::Stop } else { Flow::Continue })
+                })?;
+            } else {
+                let mut rows = src.rows(db)?;
+                sort_rows(&mut rows, order_by)?;
+                for values in rows.iter().take(stop) {
+                    let mut row = Vec::with_capacity(cols.len());
+                    for c in cols {
+                        row.push(c.value_of(values)?);
+                    }
+                    out.push(row);
                 }
-                out.push(row);
-                Ok(if out.len() >= stop { Flow::Stop } else { Flow::Continue })
-            })?;
+            }
             Ok(Some(out))
         }
         _ => Ok(None),
@@ -30810,13 +30845,20 @@ fn emit_rows_inner(
                             }
                             return Ok(());
                         }
-                        // DISTINCT or a sort must read the whole cursor
-                        // (the engine sorts before it slices, so a bad row
-                        // raises even under FIRST) - materialise through
-                        // the error-PRESERVING row-source path, so the
-                        // 22018 keeps its argument
+                        // A SORT BLOCKS - the whole cursor is read and
+                        // ordered before a slice can name its first row - so
+                        // this materialises through the error-PRESERVING
+                        // row-source path. But the SORT is not the
+                        // PROJECTION: the engine orders the RAW rows, cuts to
+                        // `skip + take`, and only THEN evaluates the select
+                        // list, so a raiser in a column of a row PAST the
+                        // limit never runs. `FIRST 2 K, 10/(K-5) ORDER BY K`
+                        // answers two rows where projecting the whole sorted
+                        // cursor raised on `K = 5`. So the raw rows are
+                        // ordered here and only the delivered slice is
+                        // projected - the same lazy projection the unsorted
+                        // scan and the join arms above already make.
                         let filter = bind_filter(filter, args)?;
-                        let mut rows_v: Vec<Vec<Value>> = Vec::new();
                         let src = RowSource::scan_filter_sort(
                             *rel,
                             formats.clone(),
@@ -30824,20 +30866,31 @@ fn emit_rows_inner(
                             order_by.clone(),
                             index.clone(),
                         );
-                        for values in src.rows(db).map_err(EmitErr::Eval)? {
-                            // the INNER projection, for the same reason
-                            // as the streaming branch above: DISTINCT
-                            // compares what the select list PRODUCES, and
-                            // this used to compare table fields
+                        let sorted = src.rows(db).map_err(EmitErr::Eval)?;
+                        if !*distinct {
+                            for values in
+                                sorted.iter().skip(*skip).take(take.unwrap_or(usize::MAX))
+                            {
+                                let mut row = Vec::with_capacity(icols.len());
+                                for c in icols {
+                                    row.push(c.value_of(values).map_err(EmitErr::Eval)?);
+                                }
+                                encode_row(w, cols, &row, out)?;
+                            }
+                            return Ok(());
+                        }
+                        // DISTINCT compares what the select list PRODUCES, so
+                        // it cannot defer the projection: every row is
+                        // projected, THEN deduplicated, THEN sliced.
+                        let mut rows_v: Vec<Vec<Value>> = Vec::with_capacity(sorted.len());
+                        for values in &sorted {
                             let mut row = Vec::with_capacity(icols.len());
                             for c in icols {
-                                row.push(c.value_of(&values).map_err(EmitErr::Eval)?);
+                                row.push(c.value_of(values).map_err(EmitErr::Eval)?);
                             }
                             rows_v.push(row);
                         }
-                        if *distinct {
-                            distinct_rows(&mut rows_v, !order_by.is_empty());
-                        }
+                        distinct_rows(&mut rows_v, !order_by.is_empty());
                         for r in rows_v.iter().skip(*skip).take(take.unwrap_or(usize::MAX)) {
                             encode_row(w, cols, r, out)?;
                         }
@@ -30897,6 +30950,27 @@ fn emit_rows_inner(
                         .map_err(EmitErr::Eval)?;
                         if let Some(e) = enc {
                             return Err(EmitErr::Eval(e));
+                        }
+                        return Ok(());
+                    } else if !*distinct {
+                        // A SORTED join BLOCKS - the combined rows are
+                        // materialised and ordered (the engine's are too) -
+                        // but the PROJECTION defers past the cut: sort, take
+                        // skip+take, THEN project, so a raiser in a row past
+                        // the limit never runs. `FIRST 2 A.K, 10/(A.K-5) ...
+                        // ORDER BY A.K` raised on a later row where the engine
+                        // sorts, cuts to two rows, and projects only those.
+                        let bound = bind_filter(filter, args)?;
+                        let base = resolve_driver_base(db, base, defer, &bound);
+                        let src = join_rowsource(&base, *base_width, parts, &bound);
+                        let mut rows = src.rows(db).map_err(EmitErr::Eval)?;
+                        sort_rows(&mut rows, order_by).map_err(EmitErr::Eval)?;
+                        for values in rows.iter().skip(*skip).take(take.unwrap_or(usize::MAX)) {
+                            let mut jrow = Vec::with_capacity(jcols.len());
+                            for c in jcols {
+                                jrow.push(c.value_of(values).map_err(EmitErr::Eval)?);
+                            }
+                            encode_row(w, cols, &jrow, out)?;
                         }
                         return Ok(());
                     }
