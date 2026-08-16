@@ -2178,9 +2178,15 @@ pulled by the fetch.
   `build_join_probe` refuses the hash key up front when the outer's family is
   known and differs. The bucket is filled IN SCAN ORDER, so a driver's matches
   come back exactly as the whole-inner scan gave them: the row order does not
-  move. LEFT and INNER alike; RIGHT/FULL still scan. So the only O(N x M) join
-  left is an unindexed TEMPORAL or DECFLOAT equi-join, or a theta join - which
-  the engine loops too.
+  move. And a TEMPORAL key hashes now as well: a DATE, TIME or TIMESTAMP by its
+  stored `(day, time)` fields, an unindexed DATE equi-join dropping 483 ms ->
+  50. DATE and TIMESTAMP are ONE family - `value_cmp` compares a DATE against a
+  TIMESTAMP as MIDNIGHT, so a DATE keys as `(day, 0)` and meets a zero-time
+  TIMESTAMP; TIME is its own, and a WITH-TIME-ZONE value keys by its UTC instant
+  (its own family too, since `value_cmp` renders across the temporal kinds).
+  LEFT and INNER alike; RIGHT/FULL still scan. So the only O(N x M) equi-join
+  left is an unindexed DECFLOAT one (its canonical a later slice, if ever), and
+  a theta join - which the engine loops too.
 
   ~~The next thing worth doing here is a boundary the gates already pin:
   the engine raises a blocking node's error at OPEN, where this server
