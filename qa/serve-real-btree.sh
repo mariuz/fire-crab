@@ -127,6 +127,17 @@ check() { # <label> <got> <want>
         fail=1
     fi
 }
+# fire-crab's answer against the ENGINE's for the SAME query on the SAME
+# database - a twin, not a pinned string. A refusal pinned as a literal
+# ("Statement failed") is a GUESS about what the parser cannot do, and a
+# guess goes stale the day the parser learns it: the two INT128 checks below
+# pinned a refusal fire-crab has since closed - it folds the magnitude in the
+# select list and under a WHERE now, exactly as the engine does - and a stale
+# "Statement failed" turned that fix into a false DIFF. The engine is the
+# oracle, so ask it.
+twin() { # <label> <sql>
+    check "$1" "$(fc_isql_q "$2")" "$(isql_q "$2")"
+}
 
 # --- phase 1: 2000 inserts - three indexes maintained, PK root splits --
 bulk=$(FC_DB="$WORK" FC_PORT="$PORT" FC_U="$U" FC_P="$P" timeout 400 node -e '
@@ -235,8 +246,11 @@ check "across whitespace too" \
       "$(fc_isql_q "SELECT - 9223372036854775808 AS X FROM RDB\$DATABASE;")" "-9223372036854775808"
 check "and it is a value, not a spelling - arithmetic keeps it" \
       "$(fc_isql_q "SELECT -9223372036854775808 + 0 AS X FROM RDB\$DATABASE;")" "-9223372036854775808"
-check "the BARE magnitude is INT128 and stays refused" \
-      "$(fc_isql_q "SELECT 9223372036854775808 AS X FROM RDB\$DATABASE;" | head -1 | cut -c1-16)" "Statement failed"
+# the BARE magnitude is 2^63 - one past INT64 - so the engine types it INT128
+# and answers it. fire-crab does the same now; it used to refuse (the literal
+# overflowed the parser's unsigned half). A twin, so it tracks the engine.
+twin "the BARE INT128 magnitude answers, as the engine types it" \
+     "SELECT 9223372036854775808 AS X FROM RDB\$DATABASE;"
 # negating it overflows - the engine describes INT64 and raises 22003 at
 # the row. This arm used to WRAP silently; nothing could reach it until
 # the literal became spellable.
@@ -244,16 +258,15 @@ check "double negation raises rather than wrapping" \
       "$(fc_isql_q "SELECT - -9223372036854775808 AS X FROM RDB\$DATABASE;" | head -1 | cut -c1-16)" "Statement failed"
 check "and so does arithmetic that leaves the range" \
       "$(fc_isql_q "SELECT -9223372036854775808 - 1 AS X FROM RDB\$DATABASE;" | head -1 | cut -c1-16)" "Statement failed"
-# A RECORDED REFUSAL, not a wrong answer. The WHERE clause has its OWN
-# tokeniser, and the fold lives in the select list's parser - so the
-# PARENTHESISED spelling under a WHERE still refuses where the engine
-# answers. The bare one works on both sides (checked above and below).
-# This is pinned so it cannot quietly turn into a wrong ANSWER; closing
-# it means teaching the token lexer the same magnitude.
-check "bare, a WHERE takes it" \
-      "$(fc_isql_q "SELECT T FROM TMIN WHERE A = -9223372036854775808;")" "min"
-check "parenthesised under a WHERE is REFUSED (engine answers)" \
-      "$(fc_isql_q "SELECT T FROM TMIN WHERE A = -(9223372036854775808);" | head -1 | cut -c1-16)" "Statement failed"
+# Under a WHERE the magnitude folds too now, bare and PARENTHESISED alike -
+# the WHERE tokeniser learned the same INT128 spelling the select list knew,
+# so `A = -(9223372036854775808)` finds the i64::MIN row where it once refused
+# (the fold lived only in the select list's parser). Both are twins against
+# the engine, which finds the row through the index fire-crab wrote.
+twin "bare, a WHERE takes the i64::MIN literal" \
+     "SELECT T FROM TMIN WHERE A = -9223372036854775808;"
+twin "parenthesised under a WHERE folds too, as the engine answers" \
+     "SELECT T FROM TMIN WHERE A = -(9223372036854775808);"
 
 # --- phase 2: the ENGINE reads through the indexes fire-crab wrote -----
 kill $srv 2>/dev/null; wait $srv 2>/dev/null
