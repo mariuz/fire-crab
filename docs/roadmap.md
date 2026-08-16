@@ -2094,11 +2094,26 @@ pulled by the fetch.
   navigated or bounded `FIRST n` reads ~n records now: `FIRST 10` over a
   50,000-row PK went 19 ms -> 8.4, `FIRST 250` -> 8.6, both near the 6.2 ms
   unordered baseline - and it SCALES, the fetch-all grew with the row count,
-  the walk and map only with the page count. What still materialises: a
-  `DISTINCT` set (it compares what the select list PRODUCES, so it must project
-  whole before it dedups), an aggregate, and the RIGHT/FULL mirror ONLY when a
-  consumer reads into it - all fundamental, not a shortfall, and blocking on
-  the engine too. The wire cursor is the engine's iterator now, a lazy PUSH
+  the walk and map only with the page count.
+
+  Then the WALK streamed too, closing the last O(candidates) cost: `for_each_
+  2pc` had still built the whole candidate list (`lookup_range` -> a Vec of
+  every entry the range names) before the streamed fetch read ~n of them, an
+  overhead that grew with the relation - a `FIRST 10` cost 2.2 ms extra at
+  50,000 rows and 9.6 at 200,000, to read ten entries. So `btr::for_each_in_
+  range` hands each entry to a callback that STOPS the walk (`lookup_range` is
+  that, collected), and a NAVIGATED retrieval - one pick whose key order IS the
+  answer, no record-number sort to force the list - drives it, fetching and
+  stopping as it walks. A navigated `FIRST n` is flat in the table size now, at
+  the unordered baseline: `FIRST 10` over a PK 8.6 -> 6.0 ms at 50,000 rows,
+  15.8 -> 6.2 at 200,000 (baseline 6.0), `FIRST 250` at 200,000 is 6.4. Truly
+  O(n). A non-navigating retrieval still collects (it sorts by record number
+  before it fetches) - the BOUNDED case, whose candidates are the band, not the
+  relation. What still materialises: a `DISTINCT` set (it compares what the
+  select list PRODUCES, so it must project whole before it dedups), an
+  aggregate, and the RIGHT/FULL mirror ONLY when a consumer reads into it - all
+  fundamental, not a shortfall, and blocking on the engine too. The wire cursor
+  is the engine's iterator now, a lazy PUSH
   with `Flow::Stop` for a scan or a `FIRST n` (of any size, sorted or not, over
   a scan or a join) that reads only the rows the limit keeps, a materialising
   PUSH for the blocking rest - and even there the projection runs only over
