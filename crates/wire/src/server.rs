@@ -3812,15 +3812,21 @@ impl RowSource {
                 }
             }
             RowSource::IndexScan { rel, formats, access, width } => {
-                let (rows, limbo) = records_for_2pc(db, *rel, formats, access);
-                for values in rows {
+                // STREAM the 2PC walk: `for_each_2pc` fetches ONE record at a
+                // time and stops when the sink does, so a `FIRST n` over a
+                // navigated (or bounded) index reads ~n records rather than
+                // every candidate the range names - the per-record fetch is
+                // the retrieval's whole cost. The collecting form materialised
+                // the lot before this sink ever saw a row.
+                let (flow, limbo) = for_each_2pc(db, *rel, formats, access, &mut |values| {
                     let mut row = values;
                     if let Some(w) = width {
                         row.resize(*w, Value::Null);
                     }
-                    if matches!(sink(row)?, Flow::Stop) {
-                        return Ok(Flow::Stop);
-                    }
+                    sink(row)
+                })?;
+                if matches!(flow, Flow::Stop) {
+                    return Ok(Flow::Stop);
                 }
                 // the index narrows what is READ, and limbo raises only
                 // when a named record was read - measured both ways
@@ -27724,14 +27730,28 @@ fn records_for(
 /// limbo transaction a FETCHED record belonged to (0 = none). The index
 /// narrows what is read, and limbo raises only when read - a probe away
 /// from the limbo key answers normally, measured.
-fn records_for_2pc(
+/// The rows a 2PC index retrieval names, DELIVERED ONE AT A TIME to a sink
+/// that can END the walk. The candidate collection (the btree walk) and the
+/// page map are cheap; the per-record FETCH is not - measured at 10 ms of an
+/// 11.5 ms retrieval over 50,000 rows. So a navigated (or bounded) `FIRST n`
+/// that stops the sink at `n` fetches ~n records, not every candidate the
+/// range names: `SELECT FIRST 10 K FROM S ORDER BY <pk>` over 50,000 rows
+/// went 19 ms -> ~8 ms, and it scales - the fetch-all grows with the row
+/// count, the walk and map only with the page count. The materialising
+/// callers ([records_for_2pc]) pass a sink that never stops.
+///
+/// Returns `(flow, limbo)`: `flow` is `Stop` when the sink stopped the walk,
+/// and `limbo` the transaction a record was found in limbo under (0 when
+/// none) - a limbo the caller raises `isc_rec_in_limbo` for, exactly as the
+/// collecting form always did. A sink error ends the walk and propagates.
+fn for_each_2pc(
     db: &Database,
     rel: u16,
     formats: &[(u8, Vec<Descriptor>)],
     access: &IndexAccess,
-) -> (Vec<Vec<Value>>, u64) {
+    sink: &mut dyn FnMut(Vec<Value>) -> Result<Flow, EvalErr>,
+) -> Result<(Flow, u64), EvalErr> {
     db.reserve_relation_read(rel);
-    let mut out = Vec::new();
     // ONE ROW PER RECORD, however many entries name it. `insert_index_entry`
     // skips an entry it already holds, but only within the leaf page it
     // descended to - so a key that LEAVES a row and comes back can end
@@ -27784,7 +27804,7 @@ fn records_for_2pc(
     // [page_sequence_map] for the measurements.
     let per_page = fire_crab_ods::format::max_recs_per_dp(db.page_size);
     if per_page == 0 {
-        return (out, 0);
+        return Ok((Flow::Continue, 0));
     }
     let image = db.bytes();
     let view = ReadView::of(db, &image);
@@ -27802,14 +27822,41 @@ fn records_for_2pc(
         {
             if !verify || pick.entry_is_current(&entry_key, &values) {
                 seen.insert(recno);
-                out.push(values);
+                // THE FETCH STOPS HERE, not after the whole range is read:
+                // a sink that has all it wants ends the walk before the
+                // next record is fetched.
+                if matches!(sink(values)?, Flow::Stop) {
+                    return Ok((Flow::Stop, view.limbo.get()));
+                }
             }
         }
         if view.limbo.get() != 0 {
-            return (out, view.limbo.get());
+            return Ok((Flow::Continue, view.limbo.get()));
         }
     }
-    (out, view.limbo.get())
+    Ok((Flow::Continue, view.limbo.get()))
+}
+
+/// [for_each_2pc], collected whole - for the callers that materialise the
+/// retrieval (`rows`, a subquery, a COUNT). The sink never stops, so the
+/// walk reads every candidate; the returned `limbo` is raised by the caller.
+fn records_for_2pc(
+    db: &Database,
+    rel: u16,
+    formats: &[(u8, Vec<Descriptor>)],
+    access: &IndexAccess,
+) -> (Vec<Vec<Value>>, u64) {
+    let mut out = Vec::new();
+    let limbo = match for_each_2pc(db, rel, formats, access, &mut |values| {
+        out.push(values);
+        Ok(Flow::Continue)
+    }) {
+        Ok((_, limbo)) => limbo,
+        // the collecting sink returns Ok(Continue) unconditionally, so the
+        // walk cannot error through it; keep what was gathered if it ever does
+        Err(_) => 0,
+    };
+    (out, limbo)
 }
 
 /// The relation's `sequence -> page number` map.
@@ -30746,6 +30793,14 @@ fn emit_rows_inner(
         Plan::ProcSelect { .. } => return Err(EmitErr::Eval(EvalErr::ConversionError(None))),
         Plan::Modified { inner, cols, distinct, skip, take } => {
             if let Some(db) = db {
+                // FIRST 0 delivers NO rows, whatever the inner or the SKIP.
+                // The streaming blocks below count a row, project it, THEN
+                // test the limit - so a `stop` of 0 would emit the first row
+                // before cutting it. Stop before fetching one. (branch_rows_
+                // res / stream_first_n handle `stop == 0` the same way.)
+                if *take == Some(0) {
+                    return Ok(());
+                }
                 // FIRST/SKIP over an UNSORTED, non-DISTINCT scan STOPS
                 // THE CURSOR: the engine closes it after `skip + take`
                 // accepted rows, so a LATER bad row never evaluates
@@ -30779,7 +30834,7 @@ fn emit_rows_inner(
                     // a generator-advancing OR windowed Project keeps the
                     // branch_rows refusal below - see that function
                     if gen_cols.is_empty() && windows.is_empty() {
-                        if !*distinct && order_by.is_empty() {
+                        if !*distinct {
                             let filter = bind_filter(filter, args)?;
                             let descs_now: Vec<Descriptor> = formats
                                 .iter()
@@ -30795,19 +30850,22 @@ fn emit_rows_inner(
                             // `SKIP 1 <raiser>` before it raises on row 3.
                             let stop_at = take.map(|t| skip.saturating_add(t));
                             let mut accepted = 0usize;
-                            // R8: the walk itself STOPS. This used to be
-                            // a hand-rolled early exit that kept reading
-                            // the relation and threw the rest away - the
-                            // right answer, at the cost of the scan the
-                            // engine does not do. `Flow::Stop` travels
-                            // down the tree to the leaf, which ends its
-                            // page walk, and the FILTER lives in the
-                            // tree rather than in this closure.
+                            // R8: the walk itself STOPS. `Flow::Stop` travels
+                            // down the tree to the leaf, which ends its page
+                            // walk (or, for a NAVIGATED index, its per-record
+                            // fetch - `for_each_2pc` reads ~n records, not the
+                            // whole range), and the FILTER lives in the tree
+                            // rather than in this closure. ORDER BY is carried
+                            // in: a navigable key walks its index in order and
+                            // stops HERE; a real sort blocks in `scan_filter_
+                            // sort`'s Sort node (materialise-and-order, the
+                            // engine's too) and only the projection below is
+                            // held to the `stop` rows kept.
                             let src = RowSource::scan_filter_sort(
                                 *rel,
                                 formats.clone(),
                                 filter,
-                                Vec::new(), // unsorted: this branch's whole premise
+                                order_by.clone(),
                                 index.clone(),
                             );
                             let mut enc: Option<EvalErr> = None;
@@ -30845,19 +30903,12 @@ fn emit_rows_inner(
                             }
                             return Ok(());
                         }
-                        // A SORT BLOCKS - the whole cursor is read and
-                        // ordered before a slice can name its first row - so
-                        // this materialises through the error-PRESERVING
-                        // row-source path. But the SORT is not the
-                        // PROJECTION: the engine orders the RAW rows, cuts to
-                        // `skip + take`, and only THEN evaluates the select
-                        // list, so a raiser in a column of a row PAST the
-                        // limit never runs. `FIRST 2 K, 10/(K-5) ORDER BY K`
-                        // answers two rows where projecting the whole sorted
-                        // cursor raised on `K = 5`. So the raw rows are
-                        // ordered here and only the delivered slice is
-                        // projected - the same lazy projection the unsorted
-                        // scan and the join arms above already make.
+                        // DISTINCT is the only Project case left here (every
+                        // non-DISTINCT one, sorted or not, streamed above). It
+                        // cannot defer the projection: it compares what the
+                        // SELECT LIST produces, so every row is materialised
+                        // and projected, THEN deduplicated, THEN sliced - the
+                        // whole cursor blocks, as the engine's does too.
                         let filter = bind_filter(filter, args)?;
                         let src = RowSource::scan_filter_sort(
                             *rel,
@@ -30867,21 +30918,6 @@ fn emit_rows_inner(
                             index.clone(),
                         );
                         let sorted = src.rows(db).map_err(EmitErr::Eval)?;
-                        if !*distinct {
-                            for values in
-                                sorted.iter().skip(*skip).take(take.unwrap_or(usize::MAX))
-                            {
-                                let mut row = Vec::with_capacity(icols.len());
-                                for c in icols {
-                                    row.push(c.value_of(values).map_err(EmitErr::Eval)?);
-                                }
-                                encode_row(w, cols, &row, out)?;
-                            }
-                            return Ok(());
-                        }
-                        // DISTINCT compares what the select list PRODUCES, so
-                        // it cannot defer the projection: every row is
-                        // projected, THEN deduplicated, THEN sliced.
                         let mut rows_v: Vec<Vec<Value>> = Vec::with_capacity(sorted.len());
                         for values in &sorted {
                             let mut row = Vec::with_capacity(icols.len());
