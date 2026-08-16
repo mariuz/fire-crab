@@ -3910,6 +3910,93 @@ impl RowSource {
                     Ok(Flow::Continue)
                 })
             }
+            // A RIGHT or FULL join STREAMS ITS MATCHED PORTION and emits
+            // its MIRROR at the end. The mirror - the unmatched rows of the
+            // preserved side - is not knowable one driver row at a time, so
+            // the old path materialised the WHOLE join; but the MATCHES
+            // are, so they stream, and the mirror only runs if a consumer
+            // reads past them. That is what a `FIRST n` inside the matched
+            // portion needs: over an 8000x8000 nested loop it stopped after
+            // n rows instead of building all 64,000,000. This mirrors
+            // [join_step] EXACTLY - same match order, same partnerless-ON
+            // evaluation on the padded rows, same mirror - with the driver
+            // walked lazily and rows pushed rather than collected. The
+            // probe is LEFT-only, so a RIGHT/FULL side is always the whole
+            // scan (`part.probe` is None); a hypothetical probed one falls
+            // to the materialising arm.
+            RowSource::NestedLoopJoin { left, left_width, right, part, above }
+                if matches!(part.kind, JoinKind::Right | JoinKind::Full)
+                    && part.probe.is_none() =>
+            {
+                let rrows = right.rows(db)?;
+                let mut right_matched = vec![false; rrows.len()];
+                let lgate = side_filter(above, 0..*left_width);
+                let rgate = side_filter(above, *left_width..*left_width + part.width);
+                let open = |g: &Option<Predicate>, row: &[Value]| -> Result<bool, EvalErr> {
+                    match g {
+                        None => Ok(true),
+                        Some(p) => p.matches(row),
+                    }
+                };
+                // stream the driver: each left row's matches, then (FULL)
+                // its own padded unmatched row - the per-left order
+                // join_step produces
+                let mut stopped = false;
+                let flow = left.for_each(db, &mut |l| {
+                    let mut matched = false;
+                    for (ri, r) in rrows.iter().enumerate() {
+                        let mut row = l.clone();
+                        row.extend(r.iter().cloned());
+                        if !part.on.matches(&row)? {
+                            continue;
+                        }
+                        matched = true;
+                        right_matched[ri] = true;
+                        if matches!(sink(row)?, Flow::Stop) {
+                            stopped = true;
+                            return Ok(Flow::Stop);
+                        }
+                    }
+                    // an unmatched left row still meets the ON (the
+                    // partnerless raise), and a FULL join keeps it padded;
+                    // a RIGHT drops it. The empty-right RIGHT case does not
+                    // open the ON, exactly as join_step guards it.
+                    if !matched && !(rrows.is_empty() && matches!(part.kind, JoinKind::Right)) {
+                        let mut row = l.clone();
+                        row.resize(*left_width + part.width, Value::Null);
+                        if open(&lgate, &row)? {
+                            part.on.matches(&row)?;
+                        }
+                        if matches!(part.kind, JoinKind::Full)
+                            && matches!(sink(row)?, Flow::Stop)
+                        {
+                            stopped = true;
+                            return Ok(Flow::Stop);
+                        }
+                    }
+                    Ok(Flow::Continue)
+                })?;
+                if stopped || matches!(flow, Flow::Stop) {
+                    return Ok(Flow::Stop);
+                }
+                // THE MIRROR: the preserved side's unmatched rows, padded
+                // on the left, each meeting the ON there (the partnerless
+                // raise) just as join_step's tail does
+                for (ri, r) in rrows.iter().enumerate() {
+                    if right_matched[ri] {
+                        continue;
+                    }
+                    let mut row = vec![Value::Null; *left_width];
+                    row.extend(r.iter().cloned());
+                    if open(&rgate, &row)? {
+                        part.on.matches(&row)?;
+                    }
+                    if matches!(sink(row)?, Flow::Stop) {
+                        return Ok(Flow::Stop);
+                    }
+                }
+                Ok(Flow::Continue)
+            }
             // the blocking and not-yet-converted nodes: one
             // materialisation, then the same delivery every other node
             // makes. Keeping them here rather than in `rows` is what
@@ -48303,7 +48390,18 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                         plan = std::rc::Rc::new(Plan::Rows { cols, rows });
                     }
                 }
-                if want > 0 && !matches!(&*plan, Plan::Rows { .. }) {
+                // A small FIRST n - its whole result fits this one batch -
+                // is NOT materialised: it is left for `emit_rows` below,
+                // whose Modified fast path walks the source and STOPS at
+                // skip + take. So `SELECT FIRST 2 ... FROM <big join>` reads
+                // two rows, not the whole join, and a RIGHT/FULL one stops
+                // in its matched portion before the mirror. `take <= want`
+                // keeps it to one batch, so the flow-control deadlock the
+                // materialising path guards against cannot arise; a bigger
+                // `take` (or a bare SKIP) still materialises and drains.
+                let small_first = matches!(&*plan,
+                    Plan::Modified { take: Some(t), distinct: false, .. } if *t <= want as usize);
+                if want > 0 && !matches!(&*plan, Plan::Rows { .. }) && !small_first {
                     if let Some(db) = database.as_ref() {
                         if let Some(rows) = branch_rows(&*plan, db, &bound_args) {
                             // `branch_rows` hands back rows that are
