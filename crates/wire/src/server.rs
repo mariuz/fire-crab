@@ -23873,6 +23873,66 @@ fn plan_draws_generator(plan: &Plan) -> bool {
     }
 }
 
+/// The FIRST `stop` PROJECTED rows of a streamable inner - a plain scan
+/// or a join, unsorted - collected by WALKING it and STOPPING, so a
+/// bounded `FIRST n` does not materialise the whole source. The rows and
+/// their order are exactly what `branch_rows_res` would have produced and
+/// then sliced; this only avoids building the part past the limit.
+/// `None` for an inner that cannot stream (a sort, an aggregate, a union,
+/// a derived table) - those are blocking and materialise as before.
+fn stream_first_n(
+    inner: &Plan,
+    db: &Database,
+    args: &[WireParam],
+    stop: usize,
+) -> Result<Option<Vec<Vec<Value>>>, EvalErr> {
+    if stop == 0 {
+        return Ok(Some(Vec::new()));
+    }
+    match inner {
+        // a plain scan, exactly as branch_rows_res builds it (the index is
+        // the plan's, already resolved where the batch fetch resolves one)
+        Plan::Project { rel, formats, cols, filter, order_by, gen_cols, index, windows, .. }
+            if order_by.is_empty() && gen_cols.is_empty() && windows.is_empty() =>
+        {
+            let filter = bind_filter(filter, args).map_err(|_| EvalErr::Unsupported)?;
+            let mut src =
+                RowSource::scan_filter_sort(*rel, formats.clone(), filter, Vec::new(), index.clone());
+            src.prune_leaf(project_read_len(inner));
+            let mut out: Vec<Vec<Value>> = Vec::new();
+            src.for_each(db, &mut |values| {
+                let mut row = Vec::with_capacity(cols.len());
+                for c in cols {
+                    row.push(c.value_of(&values)?);
+                }
+                out.push(row);
+                Ok(if out.len() >= stop { Flow::Stop } else { Flow::Continue })
+            })?;
+            Ok(Some(out))
+        }
+        // a join, walked left-deep - the RIGHT/FULL mirror streams too, so
+        // the limit stops in the matched portion before it
+        Plan::Join { base, base_width, parts, cols, filter, order_by, defer }
+            if order_by.is_empty() =>
+        {
+            let bound = bind_filter(filter, args).map_err(|_| EvalErr::Unsupported)?;
+            let base = resolve_driver_base(db, base, defer, &bound);
+            let src = join_rowsource(&base, *base_width, parts, &bound);
+            let mut out: Vec<Vec<Value>> = Vec::new();
+            src.for_each(db, &mut |combined| {
+                let mut row = Vec::with_capacity(cols.len());
+                for c in cols {
+                    row.push(c.value_of(&combined)?);
+                }
+                out.push(row);
+                Ok(if out.len() >= stop { Flow::Stop } else { Flow::Continue })
+            })?;
+            Ok(Some(out))
+        }
+        _ => Ok(None),
+    }
+}
+
 /// row's own error for the second.
 fn branch_rows_res(
     plan: &Plan,
@@ -23938,6 +23998,21 @@ fn branch_rows_res(
     // a modified plan is a row source too, so DISTINCT/FIRST can feed a
     // FOR SELECT loop or an INSERT ... SELECT
     if let Plan::Modified { inner, distinct, skip, take, .. } = plan {
+        // A bounded, non-DISTINCT FIRST n stream-collects only skip+take
+        // rows from a streamable inner, instead of materialising the whole
+        // of it and slicing - so FIRST 500 over a big join walks 500
+        // driver rows, not the whole 64,000,000-comparison result. Same
+        // rows, same order (the walk is what `.rows()` collects); a
+        // DISTINCT set or an unbounded take (a bare SKIP) has no early
+        // stop and falls through to the whole materialisation.
+        if !*distinct {
+            if let Some(t) = take {
+                let stop = skip.saturating_add(*t);
+                if let Some(rows) = stream_first_n(inner, db, args, stop)? {
+                    return Ok(rows.into_iter().skip(*skip).collect());
+                }
+            }
+        }
         let mut rows = branch_rows_res(inner, db, args)?;
         if *distinct {
             distinct_rows(&mut rows, plan_is_ordered(inner));
