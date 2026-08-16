@@ -2160,14 +2160,21 @@ pulled by the fetch.
   key and each driver reads its bucket - O(N + M) - for 50 ms, FLAT in the row
   count. `build_join_probe` carries its keys even with no index (its `index` is
   optional now), so the join reaches the scan fallback and groups the inner by
-  `build_join_key_hash` there. Only an INTEGER inner at scale 0 is hashed - the
-  shape whose equality an `i128` bucket reproduces exactly (`join_int_key`, the
-  same the index band keys by) - so a text or scaled inner, or an OR of keys,
-  still scans and the ON decides. The bucket is filled IN SCAN ORDER, so a
-  driver's matches come back exactly as the whole-inner scan gave them: the row
-  order does not move. LEFT and INNER alike; RIGHT/FULL still scan. So the only
-  O(N x M) join left is an unindexed NON-integer equi-join (a text or scaled
-  key) or a theta join - which the engine loops too.
+  `build_join_key_hash` there. An INTEGER inner at scale 0 is keyed by its
+  `i128` (numeric equality) and a TEXT inner by its trailing-space-TRIMMED
+  string - exactly how `value_cmp` compares those, so two rows share a bucket
+  iff the ON holds (CHAR padding and a VARCHAR-against-a-CHAR fold the same).
+  A VARCHAR equi-join that cost 650 ms drops to 50 ms too. A scaled decimal or
+  a date inner, or an OR of keys, still scans and the ON decides. The bucket
+  carries its key FAMILY, and a driver only looks up a bucket of its OWN
+  family: `value_cmp` compares a MISMATCHED pair (an int against a text) by
+  RENDERED text, which a bucket cannot reproduce, so an int-vs-text join falls
+  to the scan and the ON renders - `build_join_probe` refuses the hash key up
+  front when the outer's family is known and differs. The bucket is filled IN
+  SCAN ORDER, so a driver's matches come back exactly as the whole-inner scan
+  gave them: the row order does not move. LEFT and INNER alike; RIGHT/FULL
+  still scan. So the only O(N x M) join left is an unindexed SCALED-numeric or
+  temporal equi-join, or a theta join - which the engine loops too.
 
   ~~The next thing worth doing here is a boundary the gates already pin:
   the engine raises a blocking node's error at OPEN, where this server
