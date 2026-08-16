@@ -2149,9 +2149,25 @@ pulled by the fetch.
   do not move the row order the scan gave. 1.79 s -> 70 ms. The engine HASHes
   these (this server has no hash join), but a nested-loop index probe is its
   best plan and far past the scan it did; RIGHT/FULL still decline (the mirror
-  needs the whole other side) and an unindexed inner still scans. That closes
-  the join residual the driver-navigation slice named: the FULL sort-less join
-  is the PROBE now, not a scan.
+  needs the whole other side). That closes the join residual the
+  driver-navigation slice named: the FULL sort-less join is the PROBE now, not
+  a scan.
+
+  And when the inner has NO index, the join HASHes it rather than scanning it
+  whole per driver - the engine's own `HASH (A NATURAL, B NATURAL)` plan.
+  `SELECT A.ID FROM A JOIN B ON A.K=B.K` with an unindexed `B.K` cost 466 ms
+  over 2,000 x 2,000, every pair compared; now the inner is grouped ONCE by the
+  key and each driver reads its bucket - O(N + M) - for 50 ms, FLAT in the row
+  count. `build_join_probe` carries its keys even with no index (its `index` is
+  optional now), so the join reaches the scan fallback and groups the inner by
+  `build_join_key_hash` there. Only an INTEGER inner at scale 0 is hashed - the
+  shape whose equality an `i128` bucket reproduces exactly (`join_int_key`, the
+  same the index band keys by) - so a text or scaled inner, or an OR of keys,
+  still scans and the ON decides. The bucket is filled IN SCAN ORDER, so a
+  driver's matches come back exactly as the whole-inner scan gave them: the row
+  order does not move. LEFT and INNER alike; RIGHT/FULL still scan. So the only
+  O(N x M) join left is an unindexed NON-integer equi-join (a text or scaled
+  key) or a theta join - which the engine loops too.
 
   ~~The next thing worth doing here is a boundary the gates already pin:
   the engine raises a blocking node's error at OPEN, where this server
