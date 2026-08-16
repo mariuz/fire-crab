@@ -5297,58 +5297,88 @@ impl JoinProbe {
     }
 }
 
-/// The key FAMILY a hash bucket groups by. A driver key is only looked up in
-/// a bucket of its OWN family: `value_cmp` compares a scale-0 integer against
-/// an integer NUMERICALLY, two texts by their trailing-trimmed BYTES, but a
-/// MISMATCHED pair (an int against a text) by their RENDERED text - so an int
-/// driver against a text inner does NOT belong in the text buckets and falls
-/// to the scan, where the ON renders and decides.
+/// The key FAMILY a hash bucket groups by. A driver key is only looked up in a
+/// bucket of its OWN family - `value_cmp` compares WITHIN a family by value
+/// (integers numerically, texts by trailing-trimmed bytes, a scaled numeric by
+/// its digits aligned) but ACROSS families by RENDERED text, which a bucket
+/// cannot reproduce. So a mismatched driver falls to the scan, where the ON
+/// renders and decides. `Num` is split by STORAGE width because `value_cmp`
+/// only aligns two numerics of the SAME width and renders across them (an
+/// i64-backed NUMERIC(9,2) against an i128-backed NUMERIC(38,3)).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum KeyKind {
     Int,
     Text,
+    NumSmall,
+    NumWide,
 }
 
-/// The key a value hashes a JOIN by, or None when it is not hashable this way.
-/// INTEGER-family at scale 0 keys by its i128 (numeric equality); TEXT keys by
-/// its trailing-space-trimmed string ("blanks not significant", the same
-/// `value_cmp` gives a text ON) - so two rows land in one bucket IFF their
-/// keys compare EQUAL under the ON. A NULL, a scaled decimal, a date, a float
-/// is None: the caller scans instead and the ON decides.
+/// The key a value hashes a JOIN by. An INTEGER at scale 0 keys by its i128;
+/// TEXT by its trailing-space-trimmed string; a SCALED numeric by its digits
+/// with trailing zeros stripped - a scale-independent canonical form, so
+/// `1.50` (150 @ -2) and `1.5` (15 @ -1) share the one bucket `value_cmp`
+/// aligns them into. Two rows land in one bucket IFF their keys compare EQUAL
+/// under the ON.
 #[derive(Clone, PartialEq, Eq, Hash)]
 enum JoinKey {
     Int(i128),
     Text(String),
+    Num(i128, i8),
 }
 
-fn join_key(v: &Value) -> Option<JoinKey> {
+/// Strip trailing decimal zeros: `(150, -2)` -> `(15, -1)`, `(500, -2)` ->
+/// `(5, 0)`, `0` -> `(0, 0)`. Two scaled values compare EQUAL under `value_cmp`
+/// (which aligns them to a common scale) iff they reduce to the same
+/// `(raw, scale)`, so this is the canonical hash key. It only divides, so it
+/// never overflows.
+fn reduce_scaled(mut raw: i128, mut scale: i8) -> (i128, i8) {
+    if raw == 0 {
+        return (0, 0);
+    }
+    while raw % 10 == 0 {
+        raw /= 10;
+        scale += 1;
+    }
+    (raw, scale)
+}
+
+/// The `(family, key)` a value hashes a JOIN by, or None when it is not
+/// hashable this way (a NULL, a float, a date, a DECFLOAT): the caller scans
+/// instead and the ON decides.
+fn join_key(v: &Value) -> Option<(KeyKind, JoinKey)> {
     match v {
-        Value::Int(i) => Some(JoinKey::Int(*i as i128)),
-        Value::Scaled(raw, 0) => Some(JoinKey::Int(*raw as i128)),
-        Value::Int128(raw, 0) => Some(JoinKey::Int(*raw)),
+        Value::Int(i) => Some((KeyKind::Int, JoinKey::Int(*i as i128))),
+        Value::Int128(raw, 0) => Some((KeyKind::Int, JoinKey::Int(*raw))),
+        Value::Int128(raw, sc) => {
+            let (r, s) = reduce_scaled(*raw, *sc);
+            Some((KeyKind::NumWide, JoinKey::Num(r, s)))
+        }
+        // `Value::Scaled` is only ever a non-zero scale (scale 0 decodes to Int)
+        Value::Scaled(raw, sc) => {
+            let (r, s) = reduce_scaled(*raw as i128, *sc);
+            Some((KeyKind::NumSmall, JoinKey::Num(r, s)))
+        }
         // trailing blanks are not significant in a Firebird text comparison,
         // so 'k5' and 'k5   ' are the SAME key - exactly `value_cmp`'s rule
-        Value::Text(s) => Some(JoinKey::Text(s.trim_end_matches(' ').to_string())),
+        Value::Text(s) => {
+            Some((KeyKind::Text, JoinKey::Text(s.trim_end_matches(' ').to_string())))
+        }
         _ => None,
     }
 }
 
-fn join_key_kind(k: &JoinKey) -> KeyKind {
-    match k {
-        JoinKey::Int(_) => KeyKind::Int,
-        JoinKey::Text(_) => KeyKind::Text,
-    }
-}
-
 /// The hash-join FAMILY a column keys by, or None when it is not hashable (a
-/// scaled decimal, a date, a float). A join is hashed only when BOTH sides are
-/// the same family - `value_cmp` compares a mismatched pair by rendered text,
-/// which a bucket cannot reproduce, so a numeric driver against a text inner
-/// (or the reverse) stays a scan.
+/// date, a float, a DECFLOAT). A join is hashed only when BOTH sides are the
+/// same family - see [KeyKind].
 fn desc_family(d: &Descriptor) -> Option<KeyKind> {
     use fire_crab_ods::format::dtype;
-    if matches!(d.dtype, dtype::SHORT | dtype::LONG | dtype::INT64 | dtype::INT128) && d.scale == 0 {
+    let int_dtype = matches!(d.dtype, dtype::SHORT | dtype::LONG | dtype::INT64 | dtype::INT128);
+    if int_dtype && d.scale == 0 {
         Some(KeyKind::Int)
+    } else if matches!(d.dtype, dtype::INT128) {
+        Some(KeyKind::NumWide)
+    } else if int_dtype {
+        Some(KeyKind::NumSmall)
     } else if matches!(d.dtype, dtype::TEXT | dtype::VARYING) {
         Some(KeyKind::Text)
     } else {
@@ -5379,8 +5409,7 @@ fn build_join_key_hash(rows: &[Vec<Value>], probe: &JoinProbe) -> Option<KeyHash
     for (i, r) in rows.iter().enumerate() {
         let v = r.get(fid)?;
         match join_key(v) {
-            Some(k) => {
-                let kk = join_key_kind(&k);
+            Some((kk, k)) => {
                 match kind {
                     None => kind = Some(kk),
                     Some(prev) if prev != kk => return None, // mixed families
@@ -5417,7 +5446,7 @@ fn join_scan_rows<'a>(
             buf
         }
         Ok(v) => match join_key(&v) {
-            Some(k) if join_key_kind(&k) == h.kind => {
+            Some((kk, k)) if kk == h.kind => {
                 buf.clear();
                 if let Some(idxs) = h.buckets.get(&k) {
                     for &i in idxs {
