@@ -2109,15 +2109,32 @@ pulled by the fetch.
   15.8 -> 6.2 at 200,000 (baseline 6.0), `FIRST 250` at 200,000 is 6.4. Truly
   O(n). A non-navigating retrieval still collects (it sorts by record number
   before it fetches) - the BOUNDED case, whose candidates are the band, not the
-  relation. What still materialises: a `DISTINCT` set (it compares what the
-  select list PRODUCES, so it must project whole before it dedups), an
-  aggregate, and the RIGHT/FULL mirror ONLY when a consumer reads into it - all
-  fundamental, not a shortfall, and blocking on the engine too. The wire cursor
-  is the engine's iterator now, a lazy PUSH
-  with `Flow::Stop` for a scan or a `FIRST n` (of any size, sorted or not, over
-  a scan or a join) that reads only the rows the limit keeps, a materialising
-  PUSH for the blocking rest - and even there the projection runs only over
-  those rows.
+  relation.
+
+  And a SORT ABOVE A JOIN is not always a sort: when the ORDER BY is the
+  DRIVER's own key, the engine navigates the driver's index for it - its
+  `A ORDER RDB$PRIMARY1` - rather than materialising the join to sort. It had
+  to, and fire-crab did not: `FIRST 10 ... FROM A JOIN B ... ORDER BY A.<pk>`
+  cost 1.78 s - the whole 4,000-row join built and ordered - where the
+  unsorted `FIRST 10` was 15 ms, because the driver navigated "by nothing" and
+  a Sort hung above the join. Now, when the ORDER BY is a SINGLE ascending
+  plain-field key on the driver (side 0, offset 0, so the key's field IS the
+  driver record field id), every step is INNER or LEFT (a RIGHT/FULL mirror
+  emits the other side's unmatched rows out of driver order), the driver is
+  still a plain scan (a WHERE band already keyed it beats navigation), and the
+  driver's table has a navigable index on that field, the driver base becomes
+  a navigated IndexScan and the `order_by` is CLEARED: the join emits each
+  driver row's matches in key order, so the result is already sorted and every
+  unsorted-join path - the streaming FIRST n included - just works. 1.78 s ->
+  15 ms, INNER and LEFT alike. What still materialises: a `DISTINCT` set (it
+  compares what the select list PRODUCES, so it must project whole before it
+  dedups), an aggregate, a sort whose key is NOT the driver's (a real sort, on
+  the engine too), and the RIGHT/FULL mirror ONLY when a consumer reads into
+  it - all fundamental, not a shortfall, and blocking on the engine too. The
+  wire cursor is the engine's iterator now, a lazy PUSH with `Flow::Stop` for a
+  scan or a `FIRST n` (of any size, sorted or not, over a scan or a join) that
+  reads only the rows the limit keeps, a materialising PUSH for the blocking
+  rest - and even there the projection runs only over those rows.
 
   ~~The next thing worth doing here is a boundary the gates already pin:
   the engine raises a blocking node's error at OPEN, where this server
