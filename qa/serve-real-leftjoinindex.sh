@@ -264,6 +264,23 @@ join_natural() { # <label> <sql> - answers alike AND every step scanned
         fail=1
     fi
 }
+join_hashed() { # <label> <sql> - answers alike AND the inner side was HASHED
+    # An equi-join whose inner key is an INTEGER column with NO index: rather
+    # than scan the whole inner per driver, this server groups it once by the
+    # key and looks up the bucket (the engine's own HASH plan). A distinct
+    # "join hash:" trace line, so it counts apart from an index probe and a
+    # whole-inner scan.
+    bh=$(count_line "join hash: rel=")
+    same "$1" "$2"
+    ah=$(count_line "join hash: rel=")
+    ran=$((ran + 1))
+    if [ "$ah" -gt "$bh" ]; then
+        echo "OK   ... and the inner side was HASHED (keyed in one pass, no index)"
+    else
+        echo "DIFF $1: expected a hashed inner side (hash $bh->$ah)"
+        fail=1
+    fi
+}
 # the DRIVER's own index - a WHERE constraining the outer side drives it
 # by that index ("driver index:", distinct from the inner probe's line)
 driver_indexed() { # <label> <sql> - alike AND the DRIVER drove an index
@@ -393,10 +410,12 @@ join_indexed "a chain of two LEFT JOINs, both inners probed" \
 join_indexed "... and its rows, ordered" \
     "SELECT CHI.ID, PAR.N, DUP.N FROM CHI LEFT JOIN PAR ON PAR.K = CHI.K LEFT JOIN DUP ON DUP.K = PAR.K WHERE CHI.ID < 30 ORDER BY CHI.ID, DUP.N" 2
 
-# --- 5. the shapes that must FALL BACK to a scan -----------------------
-# Each one is asserted to answer identically too: falling back costs
+# --- 5. the shapes that HASH or fall back to a scan --------------------
+# Each one is asserted to answer identically too: a hash or a scan costs
 # work, never a row.
-join_natural "no index on the inner column" \
+# An UNINDEXED INTEGER inner key is HASHED now (grouped once, not scanned
+# per driver) - the engine's HASH plan, O(N + M) not O(N x M).
+join_hashed "no index on the inner INTEGER column: hashed" \
     "SELECT CHI.ID, NOIX.N FROM CHI LEFT JOIN NOIX ON NOIX.K = CHI.K ORDER BY CHI.ID"
 # ...nor this one. A DESCENDING inner index was the first of the seven;
 # its keys are complemented, which the band arithmetic now follows.

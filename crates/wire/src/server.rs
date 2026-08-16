@@ -3876,6 +3876,8 @@ impl RowSource {
                 // unbuildable key cost a full scan for every outer row
                 let mut whole: Option<Vec<Vec<Value>>> = None;
                 let mut fallback: Option<Vec<Vec<Value>>> = None;
+                let mut key_hash: Option<std::collections::HashMap<i128, Vec<usize>>> = None;
+                let mut scan_buf: Vec<Vec<Value>> = Vec::new();
                 left.for_each(db, &mut |row| {
                     let paired = match part.probe.as_ref() {
                         None => {
@@ -3899,12 +3901,29 @@ impl RowSource {
                             Band::Nothing => {
                                 join_step(vec![row], *left_width, &[], part, above)?
                             }
+                            // NO INDEX on the inner key. Rather than walk the
+                            // whole inner PER DRIVER (O(N x M), what the engine
+                            // avoids with a HASH), group it ONCE by the key and
+                            // look up the driver's bucket - O(N + M). The bucket
+                            // holds the same rows in the same order the scan
+                            // would have kept, so nothing moves; a key the hash
+                            // cannot serve (a non-integer, an OR) scans, as
+                            // before, and the ON decides either way.
                             Band::Scan => {
                                 if fallback.is_none() {
-                                    fallback = Some(right.rows(db)?);
+                                    let rows = right.rows(db)?;
+                                    key_hash = build_join_key_hash(&rows, probe);
+                                    fallback = Some(rows);
                                 }
-                                let r = fallback.as_deref().unwrap_or(&[]);
-                                join_step(vec![row], *left_width, r, part, above)?
+                                let inner = fallback.as_deref().unwrap_or(&[]);
+                                let matched = join_scan_rows(
+                                    &row,
+                                    probe,
+                                    inner,
+                                    key_hash.as_ref(),
+                                    &mut scan_buf,
+                                );
+                                join_step(vec![row], *left_width, matched, part, above)?
                             }
                         },
                     };
@@ -4107,10 +4126,11 @@ impl RowSource {
                 // partnerless ON evaluation and the row order stay
                 // decided exactly where they are decided today.
                 // Concatenating the per-row results IS the whole-acc
-                // result for JoinKind::Left, whose loop body reads only
-                // `l`, `rrows` and `part` - which is why the probe is
-                // LEFT-only and why join_step is untouched.
+                // result for LEFT and INNER alike, whose loop body reads
+                // only `l`, `rrows` and `part`, so join_step is untouched.
                 let mut fallback: Option<Vec<Vec<Value>>> = None;
+                let mut key_hash: Option<std::collections::HashMap<i128, Vec<usize>>> = None;
+                let mut scan_buf: Vec<Vec<Value>> = Vec::new();
                 let mut out = Vec::new();
                 for row in l {
                     match probe.band(db, &row) {
@@ -4132,15 +4152,25 @@ impl RowSource {
                             out.extend(join_step(vec![row], *left_width, &[], part, above)?);
                         }
                         Band::Scan => {
-                            // ONCE per join node, lazily: a per-row
-                            // materialisation would make one unbuildable
-                            // key cost a full scan for every outer row -
-                            // a pessimisation dressed as a fallback
+                            // ONCE per join node, lazily, and GROUPED BY KEY
+                            // so a driver reads its bucket, not the whole
+                            // inner - the same O(N + M) hash the streaming arm
+                            // uses (a non-integer key or an OR scans, the ON
+                            // deciding either way).
                             if fallback.is_none() {
-                                fallback = Some(right.rows(db)?);
+                                let rows = right.rows(db)?;
+                                key_hash = build_join_key_hash(&rows, probe);
+                                fallback = Some(rows);
                             }
-                            let r = fallback.as_deref().unwrap_or(&[]);
-                            out.extend(join_step(vec![row], *left_width, r, part, above)?);
+                            let inner = fallback.as_deref().unwrap_or(&[]);
+                            let matched = join_scan_rows(
+                                &row,
+                                probe,
+                                inner,
+                                key_hash.as_ref(),
+                                &mut scan_buf,
+                            );
+                            out.extend(join_step(vec![row], *left_width, matched, part, above)?);
                         }
                     }
                 }
@@ -5169,10 +5199,11 @@ struct JoinProbe {
     src: ProbeSrc,
     descs: Vec<Descriptor>,
     keys: Vec<ProbeKey>,
-    /// the index the gatekeeper blessed for the FIRST branch, for the
-    /// trace only - the real bands are rebuilt per outer row
-    index_id: u8,
-    column: String,
+    /// the index the gatekeeper blessed for the FIRST branch `(id, column)`,
+    /// for the trace only - the real bands are rebuilt per outer row. `None`
+    /// when NO branch has an index: the keys are still carried, but the inner
+    /// is HASHED by them per [build_join_key_hash] rather than index-probed.
+    index: Option<(u8, String)>,
 }
 
 /// One boundary equality of the ON. `outer` is the driver-side,
@@ -5205,6 +5236,12 @@ enum Band {
 impl JoinProbe {
     /// The band this outer row names on the inner side.
     fn band(&self, db: &Database, row: &[Value]) -> Band {
+        // NO branch has an index: the inner is hashed by the keys instead of
+        // probed, so every row scans (the hash intercepts the Scan) - and
+        // asking the gatekeeper per row would just re-derive that.
+        if self.index.is_none() {
+            return Band::Scan;
+        }
         // one band per ON branch; the answer is their UNION. A branch
         // whose outer key is NULL names nothing (the equality is UNKNOWN
         // for every inner row) and simply drops out of the union; a
@@ -5257,6 +5294,88 @@ impl JoinProbe {
             return Band::Nothing;
         }
         Band::Index(IndexAccess { picks })
+    }
+}
+
+/// The integer a value keys a HASH JOIN by, or None. INTEGER-family AND
+/// SCALE 0 only - the same shapes `band` keys an index by (`Int`, an exact
+/// numeric at scale 0, a 128-bit at scale 0), so two rows land in one bucket
+/// iff their keys compare EQUAL under the ON's integer comparison. A NULL, a
+/// scaled decimal, a text, a date or a float is None: it is not hashable this
+/// way, and the caller scans instead - the ON decides, byte-exact.
+fn join_int_key(v: &Value) -> Option<i128> {
+    match v {
+        Value::Int(i) => Some(*i as i128),
+        Value::Scaled(raw, 0) => Some(*raw as i128),
+        Value::Int128(raw, 0) => Some(*raw),
+        _ => None,
+    }
+}
+
+/// Group an unindexed inner side by its ONE integer equi-key, for a HASH
+/// JOIN: `key -> the indices of the inner rows carrying it`, appended IN SCAN
+/// ORDER, so pairing a driver with its bucket yields the SAME rows in the
+/// SAME order the whole-inner scan did - only without walking the whole inner
+/// per driver (O(N + M), not O(N x M)). `None` when the join cannot be hashed
+/// this way: more than one key (an OR - a union of buckets is a later slice),
+/// or an inner key that is not an integer (a text or scaled key, whose
+/// equality this bucket cannot reproduce). A NULL inner key is dropped - it
+/// never matches - which is the equi-join answer, not a lost row.
+fn build_join_key_hash(
+    rows: &[Vec<Value>],
+    probe: &JoinProbe,
+) -> Option<std::collections::HashMap<i128, Vec<usize>>> {
+    let [key] = probe.keys.as_slice() else { return None };
+    let fid = key.inner_fid;
+    let mut h: std::collections::HashMap<i128, Vec<usize>> = std::collections::HashMap::new();
+    for (i, r) in rows.iter().enumerate() {
+        match r.get(fid) {
+            Some(v) => match join_int_key(v) {
+                Some(k) => h.entry(k).or_default().push(i),
+                None if matches!(v, Value::Null) => {} // NULL never matches
+                None => return None,                   // not an integer column
+            },
+            None => return None,
+        }
+    }
+    Some(h)
+}
+
+/// The inner rows a driver pairs with under the SCAN fallback: its HASH
+/// BUCKET when the single equi-key is an integer the hash was built on, the
+/// WHOLE inner otherwise. A NULL driver key matches nothing (an empty
+/// bucket); a non-integer or RAISING driver key falls to the whole inner so
+/// the ON decides exactly as the scan would have - `join_int_key`/`band`
+/// decline the same shapes, so the two agree. `buf` holds a hit's gathered
+/// rows and is reused across drivers.
+fn join_scan_rows<'a>(
+    driver: &[Value],
+    probe: &JoinProbe,
+    inner: &'a [Vec<Value>],
+    hash: Option<&std::collections::HashMap<i128, Vec<usize>>>,
+    buf: &'a mut Vec<Vec<Value>>,
+) -> &'a [Vec<Value>] {
+    let (Some(h), [key]) = (hash, probe.keys.as_slice()) else {
+        return inner;
+    };
+    match key.outer.eval(driver) {
+        Ok(v) if matches!(v, Value::Null) => {
+            buf.clear();
+            buf
+        }
+        Ok(v) => match join_int_key(&v) {
+            Some(k) => {
+                buf.clear();
+                if let Some(idxs) = h.get(&k) {
+                    for &i in idxs {
+                        buf.push(inner[i].clone());
+                    }
+                }
+                buf
+            }
+            None => inner,
+        },
+        Err(_) => inner,
     }
 }
 
@@ -21671,56 +21790,78 @@ fn build_join_probe(
     // blessing only - the real band is rebuilt per outer row. `SELECT 1`
     // for the reason the projection site states: fcopt ignores the select
     // list, and a rendered literal could itself contain " FROM ".
-    let bless = |out_pos: usize| -> Option<(usize, u8, String)> {
+    // this side's OUTPUT column, as the BASE field id it keys and its bare
+    // name (identity for a plain table, the flatten's map for a view) - a
+    // key even with NO index, since the hash join keys by it too.
+    let inner_of = |out_pos: usize| -> Option<(usize, String)> {
         let inner_fid = match &base_map {
             Some(m) => m.get(out_pos).copied().flatten()?,
             None => out_pos,
         };
         let col = base_cols.iter().find(|c| c.field_id as usize == inner_fid)?;
-        if !bare(&col.name) {
-            return None;
-        }
-        let opt_sql = format!("SELECT 1 FROM {} WHERE {} = 0", src.table, col.name);
+        bare(&col.name).then(|| (inner_fid, col.name.clone()))
+    };
+    // ...and whether the gatekeeper has a single-column index for it, so a
+    // branch can DRIVE it instead of hashing. A single-table statement for
+    // the inner COLUMN alone; never a join text (`choose_index` takes only a
+    // one-stream answer, and fcopt's join ordering is known-divergent from
+    // the engine's exactly where this would care). The sentinel literal is
+    // sound because fcopt's answer for the equality shape is
+    // VALUE-INDEPENDENT (probed: `K = 0` and `K = 12345678` plan alike).
+    let bless = |inner_fid: usize, col: &str| -> Option<u8> {
+        let opt_sql = format!("SELECT 1 FROM {} WHERE {} = 0", src.table, col);
         let filter = Predicate::dnf(vec![vec![Term::Cmp(inner_fid, Cmp::Eq, Rhs::Int(0))]]);
         let index =
             choose_index(db, src.rel, &src.table, &base_descs, &Some(filter), &opt_sql, &[])?;
         let [pick] = index.picks.as_slice() else { return None };
-        Some((inner_fid, pick.op.id, col.name.clone()))
+        Some(pick.op.id)
     };
     // ONE band per DNF branch of the ON: a plain equality is one group, an
     // OR is one per branch, and the per-outer-row band is their union.
     // EVERY branch must yield a servable equality, or a partial union
     // would miss rows and the whole probe scans.
     let mut keys: Vec<ProbeKey> = Vec::new();
-    let mut trace: Option<(u8, String)> = None;
+    let mut index: Option<(u8, String)> = None;
     for terms in &on.groups {
         // The engine may key SEVERAL columns of a branch (`B.K1 = A.X AND
         // B.K2 = A.Y` is a bitmap AND of two indexes). Naming candidates
         // from ONE of them and letting the ON re-check the rest is the
         // SAME set of rows - the single-column band is a SUPERSET of the
         // conjunction's matches, and "candidates, not answers" narrows it
-        // through the ON like any residual conjunct. So the FIRST equality
-        // the gatekeeper blesses is the band; the others fall to the ON.
-        let mut chosen: Option<ProbeKey> = None;
+        // through the ON like any residual conjunct. So an INDEXABLE
+        // equality is the band, PREFERRED; failing that, the first bare
+        // key is carried anyway, for the hash join to group the inner by.
+        let mut indexed: Option<ProbeKey> = None;
+        let mut hashable: Option<ProbeKey> = None;
         for t in terms {
             let Some((outer_expr, out_pos)) = as_key(t) else { continue };
-            let Some((inner_fid, id, name)) = bless(out_pos) else { continue };
-            if trace.is_none() {
-                trace = Some((id, name));
+            let Some((inner_fid, name)) = inner_of(out_pos) else { continue };
+            // a HASHABLE key is an INTEGER inner column at scale 0 - the one
+            // shape `build_join_key_hash`/`join_int_key` group by exactly. A
+            // text or scaled inner with no index stays a NATURAL scan (its
+            // equality the bucket cannot reproduce), as it always was.
+            let hashable_here = base_descs.get(inner_fid).is_some_and(|d| {
+                use fire_crab_ods::format::dtype;
+                matches!(d.dtype, dtype::SHORT | dtype::LONG | dtype::INT64 | dtype::INT128)
+                    && d.scale == 0
+            });
+            if hashable.is_none() && hashable_here {
+                hashable = Some(ProbeKey { inner_fid, outer: outer_expr.clone() });
             }
-            chosen = Some(ProbeKey { inner_fid, outer: outer_expr });
-            break;
+            if let Some(id) = bless(inner_fid, &name) {
+                if index.is_none() {
+                    index = Some((id, name));
+                }
+                indexed = Some(ProbeKey { inner_fid, outer: outer_expr });
+                break;
+            }
         }
-        keys.push(chosen?);
+        keys.push(indexed.or(hashable)?);
     }
-    let (index_id, column) = trace?;
-    Some(JoinProbe {
-        index_id,
-        column,
-        descs: base_descs,
-        src,
-        keys,
-    })
+    if keys.is_empty() {
+        return None;
+    }
+    Some(JoinProbe { index, descs: base_descs, src, keys })
 }
 
 fn plan_join_bound(
@@ -21988,11 +22129,13 @@ fn plan_join_bound(
         }
         let probe = build_join_probe(db, *kind, &on, &sides[k + 1]);
         if trace_on() {
-            match &probe {
-                Some(p) => eprintln!(
-                    "[srv] join index: rel={} index={} col={}",
-                    p.src.rel, p.index_id, p.column
-                ),
+            match probe.as_ref().map(|p| (p, &p.index)) {
+                Some((p, Some((id, col)))) => {
+                    eprintln!("[srv] join index: rel={} index={} col={}", p.src.rel, id, col)
+                }
+                // a keyed but UNINDEXED inner: hashed, not probed, not scanned
+                // whole - a distinct line so the coverage counters stay apart
+                Some((p, None)) => eprintln!("[srv] join hash: rel={}", p.src.rel),
                 None => eprintln!("[srv] join natural: side={}", sides[k + 1].key),
             }
         }
