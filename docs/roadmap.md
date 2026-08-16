@@ -2081,14 +2081,28 @@ pulled by the fetch.
   no Sort node, nothing materialised; a real sort or a sorted join blocks
   and materialises but projects only the rows kept. It reaches the scan and
   the join, ASC and DESC, at both batch sizes - pinned in the same gate
-  (44 checks). What still materialises: a `DISTINCT` set (it compares what
-  the select list PRODUCES, so it must project whole before it dedups), an
-  aggregate, and the RIGHT/FULL mirror ONLY when a consumer reads into it -
-  all fundamental, not a shortfall, and blocking on the engine too. The wire
-  cursor is the engine's iterator now, a lazy PUSH with `Flow::Stop` for a
-  scan or a `FIRST n` (of any size, sorted or not) over a scan or a join, a
-  materialising PUSH for the blocking rest - and even there the projection
-  runs only over the rows the limit keeps.
+  (44 checks).
+
+  And a NAVIGATED `FIRST n` now streams its FETCH, not just its projection. It
+  walked the index in key order but read every record the range named before
+  the limit cut it: `records_for_2pc` returned a whole Vec. Decomposed over
+  50,000 rows, the btree walk is 1.4 ms and the page map 0.02 ms, but FETCHING
+  all 50,000 records is 10 ms - the retrieval's whole cost, paid to answer ten
+  rows. So the 2PC walk streams: `for_each_2pc` fetches ONE record at a time
+  and STOPS when the sink does (`records_for_2pc` is a thin collecting wrapper
+  for the callers that still materialise - `rows`, a subquery, a COUNT). A
+  navigated or bounded `FIRST n` reads ~n records now: `FIRST 10` over a
+  50,000-row PK went 19 ms -> 8.4, `FIRST 250` -> 8.6, both near the 6.2 ms
+  unordered baseline - and it SCALES, the fetch-all grew with the row count,
+  the walk and map only with the page count. What still materialises: a
+  `DISTINCT` set (it compares what the select list PRODUCES, so it must project
+  whole before it dedups), an aggregate, and the RIGHT/FULL mirror ONLY when a
+  consumer reads into it - all fundamental, not a shortfall, and blocking on
+  the engine too. The wire cursor is the engine's iterator now, a lazy PUSH
+  with `Flow::Stop` for a scan or a `FIRST n` (of any size, sorted or not, over
+  a scan or a join) that reads only the rows the limit keeps, a materialising
+  PUSH for the blocking rest - and even there the projection runs only over
+  those rows.
 
   ~~The next thing worth doing here is a boundary the gates already pin:
   the engine raises a blocking node's error at OPEN, where this server
