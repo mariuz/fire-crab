@@ -2033,31 +2033,36 @@ pulled by the fetch.
      binary, with both controls and the new blocking check green on
      BOTH binaries.
 
-  **R8's published steps are done.** What the programme has not taken:
-  `NestedLoopJoin` for RIGHT and FULL still materialises its MIRROR inside
-  the walk (the unmatched rows of the other side are not knowable one
-  outer row at a time), and `Aggregate` and `Sort` are blocking by nature.
-  The fetch itself, though, now PULLS the tree for the shape it fits: a
-  plain `Plan::Project` over a full scan streams through `StreamCursor`,
-  producing `want` rows per op_fetch and resuming from a `(page, slot)`
-  position rather than materialising the whole cursor - so reading the
-  first 200 rows of a 50,000-row result is O(200), not O(50,000), and peak
-  memory is O(batch), not O(result).
+  **R8's published steps are done, and the tree pulls now.** `Aggregate`
+  and `Sort` are blocking by nature; everything else streams. The fetch
+  itself pulls a plain `Plan::Project` over a full scan through
+  `StreamCursor`, producing `want` rows per op_fetch and resuming from a
+  `(page, slot)` position rather than materialising the whole cursor - so
+  reading the first 200 rows of a 50,000-row result is O(200), not
+  O(50,000), and peak memory is O(batch), not O(result).
 
-  And `FIRST n` OVER A JOIN stops the cursor now, which was a WRONG ANSWER
-  before, not just a slower one. `SELECT FIRST 2 B.K, 100/B.W FROM A RIGHT
-  JOIN B` raised a divide-by-zero on a row past the limit the engine never
-  reaches - and it was every join kind, not RIGHT/FULL, because the
-  `Modified` path sent a join through `branch_rows_res`, which projected
-  EVERY joined row before the slice could drop it. A join under an
-  unsorted, non-DISTINCT modifier now walks `join_rowsource`'s tree and
-  stops at `skip + take`, evaluating the select list only for a row it
-  delivers; a RIGHT/FULL mirror still materialises inside the walk but its
-  rows are yielded one at a time, so the projection stays lazy and the
-  limit stops it. Pinned across INNER/LEFT/RIGHT/FULL in
-  `serve-real-jointypes.sh`. The wire cursor is the engine's iterator now
-  for the plain scan, a lazy PUSH with `Flow::Stop` for a `FIRST n` join,
-  and a materialising PUSH for the blocking rest.
+  And a JOIN streams under `FIRST n` too, RIGHT and FULL included. This was
+  two things. First a WRONG ANSWER: `SELECT FIRST 2 B.K, 100/B.W FROM A
+  RIGHT JOIN B` raised a divide-by-zero on a row past the limit the engine
+  never reaches, every join kind, because the `Modified` path projected
+  every joined row before slicing - fixed by walking `join_rowsource`'s
+  tree and stopping at `skip + take` with the select list evaluated only
+  for a delivered row. Then a slow one: the RIGHT/FULL `for_each` arm now
+  STREAMS its matched portion (driver walked lazily, matches pushed, the
+  MIRROR - the preserved side's unmatched rows - emitted only after the
+  driver is done, exactly `join_step`'s order), and the batch fetch stops
+  MATERIALISING a small `FIRST n` (`take <= want`, so it fits one batch and
+  cannot deadlock), serving it from the streaming `emit_rows` instead. The
+  two together took `FIRST 2` over an 8,000x8,000 nested-loop join from
+  ~7 s (the whole 64,000,000-comparison result) to 0.35 s (two driver
+  rows), INNER, LEFT, RIGHT and FULL alike - O(rows fetched x inner), not
+  O(join). Pinned across all four kinds in `serve-real-jointypes.sh`. What
+  still materialises: a bigger `FIRST n` (`take > want`, drained in
+  batches), a sort or aggregate above the join, and the RIGHT/FULL mirror
+  ONLY when a consumer reads into it - which is fundamental, not a
+  shortfall. The wire cursor is the engine's iterator now, a lazy PUSH with
+  `Flow::Stop` for a scan or a `FIRST n` join, a materialising PUSH for the
+  blocking rest.
 
   ~~The next thing worth doing here is a boundary the gates already pin:
   the engine raises a blocking node's error at OPEN, where this server
