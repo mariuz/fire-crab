@@ -2067,13 +2067,28 @@ pulled by the fetch.
   5.1 (was ~7.1 for all), INNER/LEFT/RIGHT/FULL alike - and it fixed a
   WRONG ANSWER on the way, `FIRST 250` past a raiser at row 280 having
   materialised into the raise the engine's limit steps over. Pinned across
-  the four kinds and the large-n case in `serve-real-jointypes.sh`. What
-  still materialises: a `DISTINCT` set or a sort or aggregate above the
-  source (blocking on the engine too), and the RIGHT/FULL mirror ONLY when
-  a consumer reads into it - both fundamental, not a shortfall. The wire
+  the four kinds and the large-n case in `serve-real-jointypes.sh`.
+
+  A `FIRST n` over a SORTED source was the same wrong answer, one step out:
+  `SELECT FIRST 2 K, 10/(K-5) FROM T ORDER BY K` raised on `K = 5` where the
+  engine orders the rows, cuts to two, and never projects the fifth. The
+  SORT is not the PROJECTION - a sort blocks (its whole cursor is read and
+  ordered, the engine's too), but the select list is evaluated AFTER the
+  cut, so the projection is now lifted past `skip + take` on every path: the
+  batch-fetch emit for a small `n`, `stream_first_n` for a large one and for
+  a subquery / derived table / CTE / `INSERT ... SELECT`. A NAVIGABLE key
+  (a PK, a unique index) walks its index in order and STOPS at the limit -
+  no Sort node, nothing materialised; a real sort or a sorted join blocks
+  and materialises but projects only the rows kept. It reaches the scan and
+  the join, ASC and DESC, at both batch sizes - pinned in the same gate
+  (44 checks). What still materialises: a `DISTINCT` set (it compares what
+  the select list PRODUCES, so it must project whole before it dedups), an
+  aggregate, and the RIGHT/FULL mirror ONLY when a consumer reads into it -
+  all fundamental, not a shortfall, and blocking on the engine too. The wire
   cursor is the engine's iterator now, a lazy PUSH with `Flow::Stop` for a
-  scan or a `FIRST n` (of any size) over a scan or a join, a materialising
-  PUSH for the blocking rest.
+  scan or a `FIRST n` (of any size, sorted or not) over a scan or a join, a
+  materialising PUSH for the blocking rest - and even there the projection
+  runs only over the rows the limit keeps.
 
   ~~The next thing worth doing here is a boundary the gates already pin:
   the engine raises a blocking node's error at OPEN, where this server
