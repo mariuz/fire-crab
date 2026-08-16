@@ -387,7 +387,20 @@ pub fn lookup_key(
 /// for), so a byte range IS a value range - for an ASCENDING index. A
 /// descending one complements its keys, so its caller must hand the
 /// bounds over already swapped.
-pub fn lookup_range(
+/// The range lookup, DELIVERED one entry at a time to a callback that can
+/// END the walk - the callback returns `false` to stop. A navigated
+/// `FIRST n` wants the first n entries in key order and nothing more, and
+/// building the whole candidate Vec to read ten of them is O(candidates)
+/// where the answer is O(n): over a 200,000-row index the eager walk cost
+/// 10 ms to answer a `FIRST 10`. [lookup_range] is this, collected.
+///
+/// `Some(())` when the walk finished or the callback stopped it; `None` on
+/// a decode failure or a missing index - the same cases [lookup_range]
+/// answers `None` for. The key handed to the callback is BORROWED for the
+/// call only (it is rebuilt in place per entry), so a callback that keeps
+/// it must copy it.
+#[allow(clippy::too_many_arguments)]
+pub fn for_each_in_range(
     file: &crate::Image,
     page_size: usize,
     relation: u16,
@@ -395,7 +408,8 @@ pub fn lookup_range(
     lo: Option<(&[u8], bool)>,
     hi: Option<(&[u8], bool)>,
     descending: bool,
-) -> Option<Vec<(Vec<u8>, u64)>> {
+    mut f: impl FnMut(&[u8], u64) -> bool,
+) -> Option<()> {
     // A DESCENDING index stores its keys COMPLEMENTED, so they are laid
     // out in descending VALUE order and plain `memcmp` almost reads
     // them - except where one key is a byte PREFIX of another, which
@@ -471,13 +485,12 @@ pub fn lookup_range(
                 page = get(page.sibling)?;
                 continue;
             }
-            None => return Some(Vec::new()),
+            None => return Some(()),
         }
     }
 
     // Walk the leaf level, keeping what the bounds admit and stopping
     // at the first key past the upper one.
-    let mut out = Vec::new();
     let mut leaf_key: Vec<u8> = Vec::new();
     loop {
         let bytes = page.bytes();
@@ -485,7 +498,7 @@ pub fn lookup_range(
         loop {
             let node = read_node(bytes, at, true)?;
             if node.is_end_level {
-                return Some(out);
+                return Some(());
             }
             if node.is_end_bucket {
                 break;
@@ -499,7 +512,7 @@ pub fn lookup_range(
                     std::cmp::Ordering::Less => false,
                 };
                 if past {
-                    return Some(out);
+                    return Some(());
                 }
             }
             let admitted = match lo {
@@ -514,16 +527,41 @@ pub fn lookup_range(
                 // the KEY travels with the record number: an entry
                 // outlives the version that put it there, so the caller
                 // has to be able to ask whether the record it names
-                // still carries this key
-                out.push((leaf_key.clone(), node.record_number));
+                // still carries this key. A callback that returns `false`
+                // has all it wants - the walk ENDS rather than reading the
+                // rest of the level and handing it back.
+                if !f(leaf_key.as_slice(), node.record_number) {
+                    return Some(());
+                }
             }
             at = node.next_at;
         }
         if page.sibling == 0 {
-            return Some(out);
+            return Some(());
         }
         page = get(page.sibling)?;
     }
+}
+
+/// [for_each_in_range], collected whole - the callers that want the entire
+/// candidate list in hand (a bounded band, a non-navigating retrieval that
+/// must sort its rows by record number before it fetches them).
+#[allow(clippy::too_many_arguments)]
+pub fn lookup_range(
+    file: &crate::Image,
+    page_size: usize,
+    relation: u16,
+    index_id: u8,
+    lo: Option<(&[u8], bool)>,
+    hi: Option<(&[u8], bool)>,
+    descending: bool,
+) -> Option<Vec<(Vec<u8>, u64)>> {
+    let mut out = Vec::new();
+    for_each_in_range(file, page_size, relation, index_id, lo, hi, descending, |key, recno| {
+        out.push((key.to_vec(), recno));
+        true
+    })?;
+    Some(out)
 }
 
 #[cfg(test)]

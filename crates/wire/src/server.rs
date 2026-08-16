@@ -19556,6 +19556,30 @@ impl IndexPick {
         .unwrap_or_default()
     }
 
+    /// [candidates], WALKED - each `(key, record number)` handed to `f`,
+    /// which returns `false` to stop the walk. A navigated `FIRST n` stops
+    /// after it has fetched n rows, so it reads the first n entries of the
+    /// index rather than every one the range names. The key is borrowed for
+    /// the call.
+    fn for_each_candidate(
+        &self,
+        bytes: &fire_crab_ods::Image,
+        page_size: usize,
+        rel: u16,
+        f: impl FnMut(&[u8], u64) -> bool,
+    ) {
+        fire_crab_ods::btr::for_each_in_range(
+            bytes,
+            page_size,
+            rel,
+            self.op.id,
+            self.lo.as_ref().map(|(k, i)| (k.as_slice(), *i)),
+            self.hi.as_ref().map(|(k, i)| (k.as_slice(), *i)),
+            self.op.descending,
+            f,
+        );
+    }
+
     /// Does `values` - a record the index named - STILL CARRY the key
     /// the entry was found under?
     ///
@@ -27726,10 +27750,6 @@ fn records_for(
     out
 }
 
-/// [records_for] with the limbo hit SURFACED: the second element is the
-/// limbo transaction a FETCHED record belonged to (0 = none). The index
-/// narrows what is read, and limbo raises only when read - a probe away
-/// from the limbo key answers normally, measured.
 /// The rows a 2PC index retrieval names, DELIVERED ONE AT A TIME to a sink
 /// that can END the walk. The candidate collection (the btree walk) and the
 /// page map are cheap; the per-record FETCH is not - measured at 10 ms of an
@@ -27752,40 +27772,11 @@ fn for_each_2pc(
     sink: &mut dyn FnMut(Vec<Value>) -> Result<Flow, EvalErr>,
 ) -> Result<(Flow, u64), EvalErr> {
     db.reserve_relation_read(rel);
-    // ONE ROW PER RECORD, however many entries name it. `insert_index_entry`
-    // skips an entry it already holds, but only within the leaf page it
-    // descended to - so a key that LEAVES a row and comes back can end
-    // up with two identical entries in different pages, both of them
-    // current. Verification cannot separate those two: they are the
-    // same key on the same record, and the row came back TWICE.
-    // ACROSS BANDS TOO: a row can satisfy two branches of an OR, and
-    // `A = 1 OR B = 2` would then return it twice.
-    // COLLECT EVERY CANDIDATE FIRST - do NOT dedup here. A record can be
-    // named by a STALE entry and by its current one, and the stale one
-    // may come first; dropping the later duplicate would then leave only
-    // the entry that fails verification, and the row would vanish. The
-    // dedup belongs on ACCEPTANCE, below.
-    let mut cands: Vec<(&IndexPick, Vec<u8>, u64)> = Vec::new();
-    for pick in &access.picks {
-        for (entry_key, recno) in pick.candidates(&db.bytes(), db.page_size, rel) {
-            cands.push((pick, entry_key, recno));
-        }
-    }
-    // IN RECORD ORDER, unless the walk IS the order. The engine's
-    // non-navigational retrieval ORs its branches into a record-number
-    // bitmap and hands rows back in RECORD order; ours came back in band
-    // order, then key order within a band. With no ORDER BY that is an
-    // unordered result either way - until `FIRST 2` makes it a
-    // different SET OF ROWS, which is what this cost. Navigation is the
-    // exception: there the key order is the answer.
-    if !access.navigate() {
-        cands.sort_by_key(|(_, _, recno)| *recno);
-    }
     // THE VERIFICATION IS ONLY APPLIED WHERE IT IS NEEDED, and that is
     // navigation. Its purpose is twofold: to stop a moved row coming
     // back twice, and to stop it appearing at its OLD key's position in
     // a navigated walk. The first is already handled by the
-    // record-number dedup below. The second needs the check - but only
+    // record-number dedup. The second needs the check - but only
     // when the walk IS the order.
     //
     // That matters because the check CANNOT TELL "this entry is stale"
@@ -27811,8 +27802,70 @@ fn for_each_2pc(
     let pages = page_sequence_map(&image, db.page_size, rel);
     // a SET, not a Vec scanned linearly: the dedup is consulted once per
     // candidate, so `contains` on a Vec makes the acceptance loop
-    // quadratic in the candidate count
+    // quadratic in the candidate count. It is ALSO the dedup the whole
+    // retrieval turns on: `insert_index_entry` skips an entry it already
+    // holds only within the leaf page it descended to, so a key that
+    // LEAVES a row and comes back is named by two current entries in
+    // different pages, and a row satisfying two OR branches is named by
+    // both - the record-number dedup collapses each to one row.
     let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+
+    // NAVIGATION WALKS LAZILY. `navigate()` is a SINGLE pick whose key
+    // order IS the answer, so there is no record-number sort forcing the
+    // whole candidate list into being: the walk yields entries in order
+    // and STOPS when the sink does, reading the first n rather than every
+    // one the range names. A `FIRST 10` over a 200,000-row index that
+    // built a 200,000-entry Vec to read ten now builds none.
+    if access.navigate() {
+        let pick = &access.picks[0];
+        let mut outcome: Result<Flow, EvalErr> = Ok(Flow::Continue);
+        pick.for_each_candidate(&image, db.page_size, rel, |entry_key, recno| {
+            if seen.contains(&recno) {
+                return true;
+            }
+            for values in
+                records_at_in_with(&image, db.page_size, formats, &pages, per_page, &[recno], &view)
+            {
+                // verify is always true under navigation - the stale-entry
+                // check that keeps a moved row out of its old key's slot
+                if pick.entry_is_current(entry_key, &values) {
+                    seen.insert(recno);
+                    match sink(values) {
+                        Ok(Flow::Continue) => {}
+                        Ok(Flow::Stop) => {
+                            outcome = Ok(Flow::Stop);
+                            return false;
+                        }
+                        Err(e) => {
+                            outcome = Err(e);
+                            return false;
+                        }
+                    }
+                }
+            }
+            // a limbo record ends the walk; the caller raises for it
+            view.limbo.get() == 0
+        });
+        let flow = outcome?;
+        return Ok((flow, view.limbo.get()));
+    }
+
+    // EVERY OTHER retrieval COLLECTS FIRST. A non-navigating walk hands
+    // its rows back IN RECORD ORDER (the engine ORs its branches into a
+    // record-number bitmap), which needs the whole candidate list sorted
+    // by record number before the first fetch - so it cannot stream. That
+    // is fine: it is the BOUNDED case, whose candidate list is the band,
+    // not the relation. COLLECT EVERY CANDIDATE - do NOT dedup here; a
+    // record named by a STALE entry and its current one may meet the stale
+    // one first, and dropping the later duplicate would leave only the
+    // entry that fails verification, vanishing the row. Dedup on ACCEPTANCE.
+    let mut cands: Vec<(&IndexPick, Vec<u8>, u64)> = Vec::new();
+    for pick in &access.picks {
+        for (entry_key, recno) in pick.candidates(&db.bytes(), db.page_size, rel) {
+            cands.push((pick, entry_key, recno));
+        }
+    }
+    cands.sort_by_key(|(_, _, recno)| *recno);
     for (pick, entry_key, recno) in cands {
         if seen.contains(&recno) {
             continue;
@@ -27822,9 +27875,6 @@ fn for_each_2pc(
         {
             if !verify || pick.entry_is_current(&entry_key, &values) {
                 seen.insert(recno);
-                // THE FETCH STOPS HERE, not after the whole range is read:
-                // a sink that has all it wants ends the walk before the
-                // next record is fetched.
                 if matches!(sink(values)?, Flow::Stop) {
                     return Ok((Flow::Stop, view.limbo.get()));
                 }
