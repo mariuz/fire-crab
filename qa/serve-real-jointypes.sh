@@ -52,6 +52,14 @@ INSERT INTO A VALUES (4, 3, NULL,  NULL,          NULL, TRUE);
 INSERT INTO C VALUES (10, 1, 'one', 10.50);
 INSERT INTO C VALUES (20, 2, 'two', 99.00);
 COMMIT;
+CREATE TABLE BIG (ID INTEGER);
+COMMIT;
+SET TERM ^;
+EXECUTE BLOCK AS DECLARE I INTEGER = 0; BEGIN
+  WHILE (I < 300) DO BEGIN I = I + 1; INSERT INTO BIG VALUES (:I); END
+END^
+SET TERM ;^
+COMMIT;
 EOF
     chmod 666 "$1"
 }
@@ -191,6 +199,22 @@ both "FIRST 1 over a FULL join, raiser past the limit" \
 # and the CONTROL: with no FIRST the raiser DOES run, on both, mid-result
 both "no FIRST: the join raiser runs on both" \
      "SELECT A.ID, 10/(A.ID - 2) AS Q FROM A JOIN C ON A.K = C.K ORDER BY A.ID"
+
+# --- a BIG FIRST n (past the wire batch) stream-collects, not the whole --
+# BIG has 300 rows; `10/(ID - 280)` divides by zero at row 280. FIRST 250
+# is past the client's ~200-row fetch, so it used to MATERIALISE the whole
+# source and hit the raiser at 280 - a raise where the engine answers 250
+# rows. Now it stops at the limit, on a plain scan and a self-join alike
+# (whichever path the driver's batch size takes, both must stop before the
+# raiser). SKIP shifts the window past it too.
+both "FIRST 250 over 300 rows, raiser at 280, stops (scan)" \
+     "SELECT FIRST 250 ID, 10/(ID - 280) AS Q FROM BIG"
+both "FIRST 250 over 300 rows, raiser at 280, stops (self-join)" \
+     "SELECT FIRST 250 b.ID, 10/(b.ID - 280) AS Q FROM BIG b JOIN BIG c ON b.ID = c.ID"
+both "FIRST 250 over a LEFT self-join, raiser at 280, stops" \
+     "SELECT FIRST 250 b.ID, 10/(b.ID - 280) AS Q FROM BIG b LEFT JOIN BIG c ON b.ID = c.ID"
+both "FIRST 5 SKIP 260 over the streamed window" \
+     "SELECT FIRST 5 SKIP 260 ID FROM BIG ORDER BY ID"
 
 rm -f "$A" "$B"
 exit $fail
