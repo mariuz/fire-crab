@@ -472,19 +472,28 @@ join_indexed "... and its rows, ordered" \
 join_indexed "an INT128 driver: the band carries a WIDE outer value" \
     "SELECT WIDEDRV.ID, BIG.N FROM WIDEDRV LEFT JOIN BIG ON BIG.K = WIDEDRV.K ORDER BY WIDEDRV.ID" 1
 
-# --- 6. the pins: the join kinds the engine does NOT plan this way -----
-# A server that always says "index" is as wrong as one that never does.
-# The engine HASHes every one of these (verbatim plans in the header),
-# and where it does pick JOIN for an INNER pair it drives the side this
-# executor loops as the inner - which this fold cannot reproduce without
-# moving row order.
-join_natural "INNER equi-join: the engine HASHes" \
-    "SELECT COUNT(*) FROM CHI JOIN PAR ON PAR.K = CHI.K"
-join_natural "comma join: the engine HASHes" \
+# --- 6. INNER equi-joins drive the inner's index too ------------------
+# The engine HASHes these (verbatim plans in the header), but this server
+# has no hash join - so its choice is a nested loop that either SCANS the
+# inner for every driver (O(N x M)) or PROBES its index (O(N log M)). The
+# probe is the better plan and the one it takes: an INNER equi-join with an
+# ON drives the inner's index exactly as a LEFT one does, since both loop
+# the same driver one accumulated row at a time (`join_step` just drops an
+# unmatched INNER driver where LEFT pads it). The driver stays the
+# SYNTACTIC LEFT - so the row order does not move from what the full scan
+# gave, only the inner reads fewer rows. COUNT(*), so the order the engine's
+# HASH would give is not being claimed; the count is the whole assertion.
+join_indexed "INNER equi-join drives the inner index" \
+    "SELECT COUNT(*) FROM CHI JOIN PAR ON PAR.K = CHI.K" 1
+join_indexed "self-join on the PK drives the inner index" \
+    "SELECT COUNT(*) FROM PAR A JOIN PAR B ON B.K = A.K" 1
+# --- and the kinds that still SCAN their inner -------------------------
+# A comma join carries its key in the WHERE, not an ON, so no probe is
+# built (the key never reaches `build_join_probe`); RIGHT and FULL decline
+# because their mirror needs the whole other side, not one keyed lookup.
+join_natural "comma join: key in the WHERE, no ON probe" \
     "SELECT COUNT(*) FROM CHI, PAR WHERE PAR.K = CHI.K"
-join_natural "self-join on the PK: the engine HASHes" \
-    "SELECT COUNT(*) FROM PAR A JOIN PAR B ON B.K = A.K"
-join_natural "RIGHT join: the engine indexes the syntactic LEFT - a different mapping" \
+join_natural "RIGHT join: the mirror needs the whole other side" \
     "SELECT COUNT(*) FROM CHI RIGHT JOIN PAR ON PAR.K = CHI.K"
 join_natural "FULL join: two loops, one each direction" \
     "SELECT COUNT(*) FROM CHI FULL JOIN PAR ON PAR.K = CHI.K"

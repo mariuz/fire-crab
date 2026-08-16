@@ -21561,7 +21561,17 @@ fn build_join_probe(
     on: &Predicate,
     side: &JoinSide,
 ) -> Option<JoinProbe> {
-    if !matches!(kind, JoinKind::Left) {
+    // LEFT and INNER both DRIVE the outer and read one accumulated row at a
+    // time, so a per-driver index probe of the inner concatenates to the
+    // whole result (the identity the streaming for_each already relies on for
+    // both kinds). INNER just drops an unmatched driver where LEFT pads it -
+    // `join_step` decides that, unchanged. Without this an INNER equi-join
+    // over an indexed key did the whole O(N x M) nested-loop scan the engine
+    // plans as `B INDEX RDB$PRIMARY`: `SELECT A.ID FROM A JOIN B ON A.K=B.K`
+    // over 4,000 x 4,000 cost 1.8 s where the probe reads ~one inner row per
+    // driver. RIGHT/FULL still decline - their mirror needs the whole other
+    // side, not one keyed lookup.
+    if !matches!(kind, JoinKind::Left | JoinKind::Inner) {
         return None;
     }
     // the base table to KEY, this side's descriptors and columns laid out
