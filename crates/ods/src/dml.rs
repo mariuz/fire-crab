@@ -143,6 +143,77 @@ pub fn set_tx_state(
     Ok(())
 }
 
+/// Recompute the header's oldest-transaction bookkeeping - the three
+/// fields `gstat -h` prints as "Oldest transaction/active/snapshot" -
+/// as the engine's TRA_update_oldest maintains them (probed, gstat -h
+/// after each scenario against a live engine):
+///
+///   * OIT (`hdr_oldest_transaction` @48): the oldest id whose TIP state
+///     is not COMMITTED - dead, limbo and active all count as
+///     "interesting". The engine writes it at a transaction's START; the
+///     starting transaction is itself active, so after an all-committed
+///     history the field lands on the LAST id, and that transaction's
+///     own commit does NOT advance it past itself (probed: three
+///     committed writers leave OIT = the last id, one below the
+///     next-to-assign). So it moves only under `include_oit` - at
+///     BEGIN, never at END.
+///   * OAT (`hdr_oldest_active` @56): the oldest ACTIVE id; none active
+///     leaves it one past the last assigned id (probed: the last commit
+///     advances OAT to the engine's next-to-assign).
+///   * OST (`hdr_oldest_snapshot` @64): the oldest snapshot an active
+///     transaction still needs; with every snapshot taken at its
+///     transaction's start this is OAT (probed equal in every scenario).
+///
+/// Both scans start from the STORED values - the fields only move
+/// forward, so the work is bounded by how far they advance, not by the
+/// id space. NOTE the display convention: this server's
+/// `hdr_next_transaction` holds the LAST id assigned where the engine
+/// stores the next to assign, so `gstat -h` on a file this server wrote
+/// shows OAT = Next + 1 after a quiet commit where the engine shows
+/// OAT = Next - the same real ids, one display slot apart.
+pub fn update_oldest(
+    file: &mut crate::Image,
+    page_size: usize,
+    include_oit: bool,
+) -> Result<(), String> {
+    let (last, mut oit, mut oat) = {
+        let hdr = crate::page_at(file, page_size, 0).ok_or("no header page")?;
+        (u64_at(hdr, 40), u64_at(hdr, 48).max(1), u64_at(hdr, 56).max(1))
+    };
+    {
+        let chain = crate::tra::TipChain::read(file, page_size).ok_or("no TIP chain")?;
+        if include_oit {
+            while oit <= last && chain.state(oit) == Some(crate::tip::TxState::Committed) {
+                oit += 1;
+            }
+        }
+        while oat <= last && chain.state(oat) != Some(crate::tip::TxState::Active) {
+            oat += 1;
+        }
+    }
+    // CLAMPED to the stored next-transaction field. This server stores
+    // the LAST id assigned there where the engine stores the next to
+    // assign - and the engine's own validation (pag.cpp: "next
+    // transaction older than oldest active transaction (266)") reads
+    // these fields by ITS convention, so an OAT one past the stored
+    // field reads as corruption and every engine-side open of the file
+    // fails. Under that lens `OAT == stored next` already means
+    // "nothing is active" - exactly what the unclamped value said -
+    // and the same one-slot skew applies to OIT: after an
+    // all-committed history this file shows OIT = OAT = OST = Next
+    // where the engine's own file shows OIT = Next - 1, OAT = OST =
+    // Next. Same real ids, one display slot apart.
+    let cap = last.max(1);
+    let (oit, oat) = (oit.min(cap), oat.min(cap));
+    let hdr = crate::page_mut(file, page_size, 0).ok_or("no header page")?;
+    if include_oit {
+        put_u64(hdr, 48, oit);
+    }
+    put_u64(hdr, 56, oat);
+    put_u64(hdr, 64, oat);
+    Ok(())
+}
+
 /// Reserve a fresh transaction id, leaving it ACTIVE in the TIP - what
 /// a transaction that has begun writing but not committed looks like to
 /// everybody else, which is the whole point: a reader that walks the
@@ -164,6 +235,10 @@ pub fn begin_active_tx(file: &mut crate::Image, page_size: usize) -> Result<u64,
         40,
         tx,
     );
+    // a transaction START is where the engine recomputes ALL the oldest
+    // bookkeeping - including OIT, which lands on this id itself when
+    // everything before it committed
+    update_oldest(file, page_size, true)?;
     Ok(tx)
 }
 
@@ -189,6 +264,9 @@ pub(crate) fn allocate_committed_tx(file: &mut crate::Image, page_size: usize) -
         40,
         tx,
     );
+    // a settled id was never active, so OAT/OST step past it; OIT is a
+    // transaction-START recomputation and stays
+    update_oldest(file, page_size, false)?;
     Ok(tx)
 }
 
@@ -1007,6 +1085,47 @@ mod tests {
         put_u16(&mut f, d + 24, off as u16);
         put_u16(&mut f, d + 26, 20);
         crate::Image::from_bytes(&f, page_size)
+    }
+
+    /// The oldest-transaction bookkeeping follows the engine's
+    /// TRA_update_oldest (probed via gstat -h): OIT recomputed at BEGIN
+    /// only - it lands on the starting id itself once everything before
+    /// it committed, and that transaction's own commit does not advance
+    /// it past its own id - while OAT/OST recompute at both ends and
+    /// stand one past the last id when nothing is active. A dead id
+    /// pins OIT at the next begin, exactly as the engine's no-undo
+    /// rollback does.
+    #[test]
+    fn oldest_bookkeeping_moves_like_the_engines() {
+        let ps = 4096;
+        let mut f = scratch_file(ps);
+        // settle the fixture's phantom actives: ids 1..=10 committed
+        for id in 1..=10u64 {
+            set_tx_state(&mut f, ps, id, crate::tip::TxState::Committed).unwrap();
+        }
+        let hdr = |f: &crate::Image, off: usize| {
+            u64::from_le_bytes(f.page(0).unwrap()[off..off + 8].try_into().unwrap())
+        };
+        let tx = begin_active_tx(&mut f, ps).unwrap(); // 11
+        assert_eq!((hdr(&f, 48), hdr(&f, 56), hdr(&f, 64)), (11, 11, 11), "start: all = self");
+        set_tx_state(&mut f, ps, tx, crate::tip::TxState::Committed).unwrap();
+        update_oldest(&mut f, ps, false).unwrap();
+        // "nothing active" is spelled OAT == the stored next field (this
+        // server's last-assigned convention; the engine's validation
+        // reads the fields by its next-to-assign lens, so one past the
+        // stored value would read as corruption there)
+        assert_eq!(
+            (hdr(&f, 48), hdr(&f, 56), hdr(&f, 64)),
+            (11, 11, 11),
+            "commit: OAT/OST clamp at the stored next; OIT stays at its begin-time value"
+        );
+        let tx2 = begin_active_tx(&mut f, ps).unwrap(); // 12
+        set_tx_state(&mut f, ps, tx2, crate::tip::TxState::Dead).unwrap();
+        update_oldest(&mut f, ps, false).unwrap();
+        assert_eq!((hdr(&f, 48), hdr(&f, 56), hdr(&f, 64)), (12, 12, 12));
+        let _tx3 = begin_active_tx(&mut f, ps).unwrap(); // 13
+        assert_eq!(hdr(&f, 48), 12, "OIT pinned at the dead id");
+        assert_eq!((hdr(&f, 56), hdr(&f, 64)), (13, 13), "OAT/OST at the new active");
     }
 
     /// AN OPEN TRANSACTION LOOKS DIFFERENT IN THE FILE, which is the

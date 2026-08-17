@@ -4000,9 +4000,41 @@ view directly.
 
 *Still waiting on more than a snapshot*: a reader that counts the set as
 of a moment does not by itself give the engine's every concurrency
-answer — two concurrent writers of the SAME row, the update-conflict
-timing, and the OIT/OAT bookkeeping `gstat -h` reads are their own
-measured slices, pinned where each gate meets them.
+answer — two concurrent writers of the SAME row and the update-conflict
+timing are their own measured slices, pinned where each gate meets them.
+
+**DONE — the OIT/OAT/OST bookkeeping `gstat -h` reads.** The three
+"Oldest" header fields froze at whatever the engine left in the file;
+`ods::dml::update_oldest` now maintains them by the engine's own law
+(probed scenario by scenario with gstat -h against a live engine): OIT
+is recomputed at a transaction's START only — the starting transaction
+is itself active, so after an all-committed history it lands on the
+LAST id, and that transaction's own commit does not advance it past
+its own id — while OAT (and OST, the oldest snapshot an active
+transaction needs, equal to OAT with every snapshot taken at start)
+recompute at start AND end, stepping past dead, limbo and committed
+ids. Wired at `begin_active_tx` / `allocate_committed_tx` (start
+rules) and `commit_tx` / `kill_tx` / `prepare_tx` / `resolve_tx` (end
+rules). Both scans start from the stored values, so the cost is how
+far the fields advance, not the id space. THE CLAMP THE FIRST BUILD
+LEARNED THE HARD WAY: this server stores `hdr_next_transaction` as the
+LAST id assigned where the engine stores the next to assign, and the
+engine's validation (pag.cpp: *next transaction older than oldest
+active transaction (266)*) reads the fields by ITS convention — an OAT
+one past the stored field read as corruption and EVERY engine-side
+open of an fc-written file failed (gfix, gbak, isql reads across
+eight gates at once). So OAT/OST clamp at the stored field: under the
+engine's lens `OAT == stored next` already means "nothing is active",
+and the whole display sits one slot from the engine's own by design.
+Two recorded divergences, pinned per side in the gate: a rolled-back
+writer pins fc's OIT at its dead id (the engine undoes and marks it
+COMMITTED — rollback via undo log — so its OIT moves past; fc's
+rollback-by-state is the engine's own no-undo path), and a read-only
+transaction leaves fc's header untouched (the id is allocated lazily
+at first write) where the engine burns ids. New gate
+`serve-real-oldesttx.sh` (5): the per-side law triples over
+all-committed / dead-final / dead-mid histories, the read-only
+no-move, and the OIT <= OAT <= OST ordering the loader asserts.
 
 ## How these slices are gated
 

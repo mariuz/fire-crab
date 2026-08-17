@@ -1775,6 +1775,11 @@ impl Database {
                 fire_crab_ods::tip::TxState::Committed,
             )?;
         }
+        // the last active id just left: OAT/OST advance (to one past the
+        // last assigned when nothing else is active - the engine's
+        // commit-time TRA_update_oldest, probed); OIT is a START-time
+        // recomputation and stays where the last begin put it
+        fire_crab_ods::dml::update_oldest(&mut work, self.page_size, false)?;
         self.flush_and_install(work)?;
         Ok(())
     }
@@ -1808,6 +1813,14 @@ impl Database {
                 fire_crab_ods::tip::TxState::Dead,
             )?;
         }
+        // dead is not active: OAT/OST advance exactly as at commit. OIT
+        // stays behind, PINNED at the dead id once the next begin
+        // recomputes it - which is where this server and the engine
+        // part: the engine undoes a small rollback and marks it
+        // COMMITTED (rollback via undo log), so its OIT moves past it,
+        // while this server's rollback-by-state leaves tra_dead (the
+        // engine's own no-undo path). Recorded divergence, gstat-only.
+        fire_crab_ods::dml::update_oldest(&mut work, self.page_size, false)?;
         self.flush_and_install(work)?;
         Ok(())
     }
@@ -1838,6 +1851,8 @@ impl Database {
                 fire_crab_ods::tip::TxState::Limbo,
             )?;
         }
+        // limbo is interesting but no longer active: OAT/OST step past it
+        fire_crab_ods::dml::update_oldest(&mut work, self.page_size, false)?;
         self.flush_and_install(work)?;
         self.touched = true;
         Ok(())
@@ -1861,6 +1876,7 @@ impl Database {
                 fire_crab_ods::tip::TxState::Dead
             },
         )?;
+        fire_crab_ods::dml::update_oldest(&mut work, self.page_size, false)?;
         self.flush_and_install(work)
     }
 
