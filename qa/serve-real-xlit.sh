@@ -53,11 +53,37 @@ INSERT INTO XL VALUES (1, 'café', 'café');
 INSERT INTO XL VALUES (2, 'für', 'für');
 INSERT INTO XL VALUES (3, '€uro', 'ascii');
 COMMIT;
+CREATE TABLE XC (ID INTEGER, C VARCHAR(10) CHARACTER SET WIN1250,
+                 Y VARCHAR(10) CHARACTER SET WIN1251,
+                 T VARCHAR(10) CHARACTER SET ISO8859_2);
+COMMIT;
+INSERT INTO XC VALUES (1, 'řeka', 'река', 'řeka');
+INSERT INTO XC VALUES (2, 'żółw', 'мышь', 'żółw');
+INSERT INTO XC VALUES (3, 'ascii', 'ascii', 'ascii');
+COMMIT;
 EOF
     chmod 666 "$1"
 }
 mkdb "$RE" || { echo "FAIL scratch RE"; exit 1; }
 mkdb "$FC" || { echo "FAIL scratch FC"; exit 1; }
+
+# every high byte of the generated-table sets, stored VERBATIM via hex
+# literals through a NONE attachment (a NONE source assigns bytes as-is,
+# the same technique that generated the tables off the engine)
+BSQL=$D/xlit-bytes.sql
+python3 - "$BSQL" <<'PYEOF'
+import sys
+out = open(sys.argv[1], 'w')
+for t, cs in [("B1250", "WIN1250"), ("B1251", "WIN1251"), ("B8859", "ISO8859_2")]:
+    out.write(f"CREATE TABLE {t} (ID INTEGER, S VARCHAR(1) CHARACTER SET {cs});\n")
+out.write("COMMIT;\n")
+for t in ("B1250", "B1251", "B8859"):
+    for b in range(0x80, 0x100):
+        out.write(f"INSERT INTO {t} VALUES ({b}, x'{b:02X}');\n")
+out.write("COMMIT;\n")
+PYEOF
+"$ISQL" -q -b -ch NONE -user "$U" -pas "$P" "$RE" < "$BSQL" >/dev/null 2>&1 || { echo "FAIL bytes RE"; exit 1; }
+"$ISQL" -q -b -ch NONE -user "$U" -pas "$P" "$FC" < "$BSQL" >/dev/null 2>&1 || { echo "FAIL bytes FC"; exit 1; }
 
 "$FCWIRE" serve "127.0.0.1:$PORT" "$U" "$P" >/tmp/fc-serve-xlit.log 2>&1 &
 srv=$!
@@ -262,7 +288,92 @@ else
     fail=1
 fi
 
-# --- 7. the file survives the engine's own verifier --------------------
+# --- 7. the GENERATED codepages: WIN1250, WIN1251, ISO8859_2 -----------
+# three more tables in ods::intl, generated FROM the live engine (hex
+# literals in, UNICODE_VAL out) rather than typed from a chart. Real
+# words first, then every DEFINED printable byte of each set compared
+# fc-served vs engine. Excluded from the byte sweep: the codepage HOLES
+# (0x81/83/88/90/98 in 1250, 0x98 in 1251 - the engine transliterates
+# those to U+0000, fc keeps the C1 carrier; recorded divergence), NBSP
+# 0xA0 and SHY 0xAD (whitespace normalization would eat them), and the
+# 8859_2 C1 control row (raw controls break line-based comparison).
+twin "a WIN1250 column decodes by its codepage" "SELECT ID, C FROM XC ORDER BY ID"
+twin "a WIN1251 column speaks Cyrillic" "SELECT ID, Y FROM XC ORDER BY ID"
+twin "an ISO8859_2 column speaks Latin-2" "SELECT ID, T FROM XC ORDER BY ID"
+twin "lengths count the codepage's single bytes" \
+     "SELECT ID, OCTET_LENGTH(C) AS OC, CHAR_LENGTH(Y) AS CY, OCTET_LENGTH(T) AS OT FROM XC ORDER BY ID"
+twin "a WHERE literal meets WIN1250 characters" "SELECT ID FROM XC WHERE C = 'řeka'"
+twin "... and Cyrillic ones" "SELECT ID FROM XC WHERE Y = 'мышь'"
+twin "LIKE walks WIN1250 characters, not bytes" "SELECT ID FROM XC WHERE C LIKE 'ř_ka'"
+twin "UPPER maps the Latin-2 and Cyrillic letters" \
+     "SELECT ID, UPPER(C) AS UC, UPPER(Y) AS UY FROM XC ORDER BY ID"
+twin "every defined WIN1250 punctuation byte (the 0x80 row, holes aside)" \
+     "SELECT ID, S FROM B1250 WHERE ID BETWEEN 128 AND 159 AND ID NOT IN (129,131,136,144,152) ORDER BY ID"
+twin "every WIN1250 letter byte (0xA1..0xFF)" \
+     "SELECT ID, S FROM B1250 WHERE ID >= 161 AND ID <> 173 ORDER BY ID"
+twin "every defined WIN1251 punctuation byte" \
+     "SELECT ID, S FROM B1251 WHERE ID BETWEEN 128 AND 159 AND ID <> 152 ORDER BY ID"
+twin "every WIN1251 letter byte (0xA1..0xFF)" \
+     "SELECT ID, S FROM B1251 WHERE ID >= 161 AND ID <> 173 ORDER BY ID"
+twin "every ISO8859_2 letter byte (0xA1..0xFF)" \
+     "SELECT ID, S FROM B8859 WHERE ID >= 161 AND ID <> 173 ORDER BY ID"
+twin "all 128 WIN1250 high-byte rows are readable (holes included)" \
+     "SELECT COUNT(*) AS N, SUM(OCTET_LENGTH(S)) AS O FROM B1250"
+twin "... all 128 WIN1251 rows" \
+     "SELECT COUNT(*) AS N, SUM(OCTET_LENGTH(S)) AS O FROM B1251"
+twin "... all 128 ISO8859_2 rows" \
+     "SELECT COUNT(*) AS N, SUM(OCTET_LENGTH(S)) AS O FROM B8859"
+
+# fc WRITES the new codepages' bytes, the ENGINE reads them back
+ran=$((ran + 1))
+r=$(node_q "INSERT INTO XC VALUES (4, 'čaj', 'чай', 'čaj')")
+got=$(isql_q "$FC" "SELECT ID, C, Y, T, OCTET_LENGTH(C) FROM XC WHERE ID = 4")
+if [ "$r" = "OK" ] && [ "$got" = "4|čaj|чай|čaj|3" ]; then
+    echo "OK   fc stores all three codepages; the engine reads 3 octets of 'čaj'"
+else
+    echo "DIFF new-codepage store: insert [$r], engine read [$got]"
+    fail=1
+fi
+ran=$((ran + 1))
+got=$(isql_q "$FC" "SELECT ID FROM XC WHERE Y = 'чай'")
+if [ "$got" = "4" ]; then
+    echo "OK   ... and finds the Cyrillic row by value"
+else
+    echo "DIFF engine WHERE over fc's cp1251 row: [$got]"
+    fail=1
+fi
+
+# the unmappable pair: Cyrillic has no image in Latin-2 - both refuse
+ran=$((ran + 1))
+r=$(node_q "INSERT INTO XC VALUES (9, 'x', 'x', 'жук')")
+e=$(printf "INSERT INTO XC VALUES (9, 'x', 'x', 'жук');\n" | "$ISQL" -q -b -ch UTF8 -user "$U" -pas "$P" "$RE" 2>&1 | grep -c "SQLSTATE = 22018")
+if [ "$r" = "ERR" ] && [ "$e" -ge 1 ]; then
+    echo "OK   Cyrillic into ISO8859_2: fc refuses, the engine raises 22018"
+else
+    echo "DIFF cross-set unmappable: fc [$r], engine 22018-count $e"
+    fail=1
+fi
+
+# an INDEXED WIN1251 column: the INTL itype generalizes (ttype 52 + 32831)
+"$ISQL" -q -b -ch UTF8 -user "$U" -pas "$P" "$FC" <<EOF >/dev/null 2>&1
+CREATE TABLE KY (ID INTEGER, Y VARCHAR(10) CHARACTER SET WIN1251);
+CREATE INDEX IDX_KY_Y ON KY (Y);
+COMMIT;
+INSERT INTO KY VALUES (1, 'море');
+COMMIT;
+EOF
+ran=$((ran + 1))
+r=$(node_q "INSERT INTO KY VALUES (2, 'юг')")
+got=$(isql_q "$FC" "SELECT ID FROM KY WHERE Y = 'юг'")
+a=$(node_q "SELECT ID FROM KY WHERE Y = 'море'")
+if [ "$r" = "OK" ] && [ "$got" = "2" ] && [ "$a" = "1" ]; then
+    echo "OK   fc keys a WIN1251 index the engine's scan finds, and bands it itself"
+else
+    echo "DIFF WIN1251 index: insert [$r], engine find [$got], fc band [$a]"
+    fail=1
+fi
+
+# --- 8. the file survives the engine's own verifier --------------------
 ran=$((ran + 1))
 g=$("$GFIX" -v -full -user "$U" -pas "$P" "$FC" 2>&1)
 if [ -z "$g" ]; then
@@ -274,8 +385,8 @@ fi
 
 kill $srv 2>/dev/null; srv=""
 rm -f "$RE" "$FC"
-if [ "$ran" -lt 20 ]; then
-    echo "DIFF only $ran checks ran (expected at least 20) - did one silently skip?"
+if [ "$ran" -lt 40 ]; then
+    echo "DIFF only $ran checks ran (expected at least 40) - did one silently skip?"
     fail=1
 fi
 exit $fail

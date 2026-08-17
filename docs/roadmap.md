@@ -197,8 +197,31 @@ measured or pinned items**, each recorded in its own place below:
   source codepage's bytes, fc stores the decoded text's UTF-8) -
   recorded. ASCII content is the identity through every seam, which is
   why the whole existing gate surface is untouched.
-  serve-real-xlit.sh 17 -> 20. Still held: the untabled codepages and
-  the real collations.
+  serve-real-xlit.sh 17 -> 20. ~~Still held: the untabled codepages~~ —
+  three more TAKEN: WIN1250, WIN1251 and ISO8859_2, and their tables
+  were GENERATED FROM THE LIVE ENGINE rather than typed from a chart:
+  128 one-byte rows per set inserted as hex literals through a NONE
+  attachment, read back as `UNICODE_VAL(S)` through a UTF8 one — the
+  engine's own transliteration IS the table (`ods::intl`, full
+  128-entry high halves since Latin-2 and Cyrillic diverge from
+  Latin-1 above 0xA0 too; `tabled()` extended, which carries the
+  DECODE, STORE, KEYS, WIRE, LENGTHS and INTL-itype seams for free —
+  a WIN1251 index fc keys is found by the engine's scan, measured in
+  the gate). The generation surfaced an engine law the chart never
+  shows: a codepage HOLE (WIN1250's 0x81/83/88/90/98, WIN1251's 0x98,
+  WIN1252's five) transliterates to U+0000, and the REVERSE direction
+  refuses (storing U+0081 raises 22018) — ISO8859_2 has NO holes, its
+  0x80..0x9F row is identity C1. fire-crab keeps a hole at its C1
+  point instead (the WIN1252 precedent): that keeps each table a
+  bijection on 256 bytes, which the NONE-attachment passthrough
+  depends on — the divergence is confined to undefined bytes crossing
+  charsets, recorded not gated. serve-real-xlit.sh 20 -> 40: real
+  Czech/Polish/Cyrillic words through every seam, and EVERY DEFINED
+  PRINTABLE BYTE of each new set compared fc-served against the
+  engine (holes, NBSP and SHY excluded from the byte sweep — the
+  first for the recorded divergence, the last two because whitespace
+  normalization eats them). Still held: the real collations
+  (PXW_INTL and kin, their own weight tables).
 
 The rest of this document records how the surface got here and every one
 of those boundaries.
@@ -512,10 +535,17 @@ of those boundaries.
   `serve-real-restored.sh` reads the patched values back THROUGH THE
   ENGINE rather than trusting survival.
 
-  It did NOT acquire the four missing machinery items (rhdf writer,
+  It did NOT acquire the four missing machinery items (~~rhdf writer~~,
   packed stream truncate, tail teardown, page compaction) and should not:
   each is a new way to write into a user's database, and nothing in the
-  184 statements needs one.
+  184 statements needs one. *(Reconciled later: the rhdf WRITER exists
+  now — the fragmenting store writes head+chain for big NEW images and
+  grown updates, `serve-real-fragstore.sh`. The DDL patch sites still
+  route through `patch_head_in_place` and that remains correct: the
+  guard is measured-unreachable — 266/266 fragmented system rows keep
+  every poked field inside the head — so the head rewrite never needs
+  to re-fragment, and "writing across pages" is no longer the reason;
+  the measurement is.)*
 
   **The remaining 5** are indexes owning a fragmented
   `RDB$INDEX_SEGMENTS` row, deleted via the same guard. Still refused,
