@@ -224,17 +224,21 @@ else
 fi
 
 # ------------------------------------------ 5. the action refusal -------
+# ~~fire-crab refuses the action (isc_wish_list)~~ - STALE: the service
+# manager RUNS db_stats now (qa/svc-stats.sh gates the report text line
+# for line against local gstat), so this pin flips to the new truth:
+# both servers ANSWER, with the same header-report shape
 a=$(svcmgr "$PORT" action_db_stats dbname "$REALDB" sts_hdr_pages)
 case "$a" in
-    *"not supported"*)
-        echo "OK   a service ACTION is refused by fire-crab (isc_wish_list), not silently ack'd" ;;
-    *) echo "DIFF fire-crab answered a db_stats action: [$(printf '%s' "$a" | tr '\n' ' ' | cut -c1-120)]"
+    *"Database "*|*"Checksum"*|*"Generation"*)
+        echo "OK   fire-crab RUNS a db_stats action (the svc-stats gate owns the text)" ;;
+    *) echo "DIFF fire-crab's db_stats answer: [$(printf '%s' "$a" | tr '\n' ' ' | cut -c1-120)]"
        fail=1 ;;
 esac
 r=$(svcmgr "$REAL" action_db_stats dbname "$REALDB" sts_hdr_pages)
 case "$r" in
     *"Database "*|*"Checksum"*|*"Generation"*)
-        echo "OK   the same action succeeds on the real server (so the refusal is ours, not the request's)" ;;
+        echo "OK   the real server answers the same action with the same report shape" ;;
     *) echo "DIFF the real server did not run db_stats: [$(printf '%s' "$r" | tr '\n' ' ' | cut -c1-120)]"
        fail=1 ;;
 esac
