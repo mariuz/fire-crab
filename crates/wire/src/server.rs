@@ -34274,10 +34274,22 @@ fn parse_raw_cond(b: &[char], pos: &mut usize) -> Option<RawCond> {
     // an expression here would swallow the left side of a comparison.
     // ... and so is a bare BOOLEAN LITERAL - `FL AND TRUE`,
     // `CASE WHEN FALSE THEN ...` - which is already boolean-typed, so
-    // the same BARE marker resolves it without coercing anything
-    if matches!(left, RawExpr::Col(_) | RawExpr::Bool(_))
+    // the same BARE marker resolves it without coercing anything. And so
+    // is a bare NULL/UNKNOWN (both lex to RawExpr::Null, and the engine
+    // treats them alike - probed: `CASE WHEN NULL` and `CASE WHEN
+    // UNKNOWN` both take the ELSE): the constant UNKNOWN condition,
+    // spelled as `NULL = TRUE` so the Cmp arm evaluates it to UNKNOWN
+    // per row with no new machinery.
+    if matches!(left, RawExpr::Col(_) | RawExpr::Bool(_) | RawExpr::Null)
         && !matches!(b.get(*pos), Some('=' | '<' | '>' | '!'))
     {
+        if matches!(left, RawExpr::Null) {
+            return Some(RawCond::Cmp(
+                Box::new(RawExpr::Null),
+                Cmp::Eq,
+                Box::new(RawExpr::Bool(true)),
+            ));
+        }
         return Some(RawCond::Cmp(
             Box::new(left),
             Cmp::Eq,
@@ -35609,7 +35621,9 @@ fn resolve_raw_cond(
         // resolution knows the type
         RawCond::IsUnknown(a, negated) => {
             let l = resolve_expr(a, columns, descs)?;
-            if !matches!(l.type_of(descs), Some(ExprType::Bool)) {
+            // a NULL literal passes too: `NULL IS UNKNOWN` is TRUE on the
+            // engine (probed), the untyped literal standing as boolean
+            if !matches!(l.type_of(descs), Some(ExprType::Bool)) && !matches!(l, Expr::Null) {
                 return None;
             }
             if *negated {
@@ -43245,11 +43259,19 @@ fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
     // ([RawExpr::BareTrue]) is what says so now that an EXPLICIT
     // `NAME = TRUE` coerces the text column per row instead.
     // ... and so is a bare BOOLEAN LITERAL - `WHERE TRUE`, `WHERE FL AND
-    // TRUE` - which the resolver's type gate passes as boolean already
+    // TRUE` - which the resolver's type gate passes as boolean already.
+    // A bare NULL/UNKNOWN (one token: UNKNOWN lexes as Tok::Null) is the
+    // constant UNKNOWN predicate - `WHERE UNKNOWN` keeps no row, `WHERE
+    // FL OR UNKNOWN` keeps the TRUE ones (probed) - spelled `NULL = TRUE`
+    // so it evaluates to UNKNOWN with no new machinery (cmp_sides passes
+    // a NULL side untyped; the BARE marker would refuse it).
     if !negated
-        && matches!(lhs, RawLhs::Col(_) | RawLhs::Expr(RawExpr::Bool(_)))
+        && matches!(lhs, RawLhs::Col(_) | RawLhs::Expr(RawExpr::Bool(_) | RawExpr::Null))
         && matches!(t.get(*pos), None | Some(Tok::And | Tok::Or | Tok::RParen))
     {
+        if matches!(lhs, RawLhs::Expr(RawExpr::Null)) {
+            return Some(leaf(RawKind::CmpExpr(Cmp::Eq, RawExpr::Bool(true))));
+        }
         return Some(leaf(RawKind::CmpExpr(Cmp::Eq, RawExpr::BareTrue)));
     }
     match t.get(*pos)? {

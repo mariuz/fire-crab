@@ -241,6 +241,19 @@ both "SELECT DISTINCT is still the modifier, not the predicate" \
 where "WHERE TRUE keeps every row" "TRUE"
 where "WHERE FALSE keeps none" "FALSE"
 where "a literal operand in the WHERE fold" "B AND TRUE"
+# UNKNOWN (and its synonym-by-value NULL) is the third boolean literal:
+# the constant UNKNOWN condition. `B AND UNKNOWN` shows the Kleene fold
+# again (FALSE AND UNKNOWN = FALSE on row 2), and a WHERE treats the
+# constant as every UNKNOWN - the row drops.
+val "B AND UNKNOWN"
+val "B OR UNKNOWN"
+val "NOT UNKNOWN"
+val "UNKNOWN IS UNKNOWN"
+both "CASE WHEN UNKNOWN takes the ELSE" \
+     "SELECT ID, CASE WHEN UNKNOWN THEN 1 ELSE 0 END FROM T ORDER BY ID"
+where "WHERE UNKNOWN keeps no row" "UNKNOWN"
+where "WHERE NULL keeps no row" "NULL"
+where "UNKNOWN under the OR fold" "B OR UNKNOWN"
 
 # --- refusals ----------------------------------------------------------
 # a non-boolean column is not a condition, in either grammar
@@ -272,8 +285,8 @@ rm -f "$A" "$B"
 # "command not found" that does not touch `fail`, so eight checks once
 # vanished from this gate while it still reported success. Counting them
 # turns a silent skip into a visible failure.
-if [ "$ran" -lt 74 ]; then
-    echo "DIFF only $ran checks ran (expected at least 74) - did one silently skip?"
+if [ "$ran" -lt 82 ]; then
+    echo "DIFF only $ran checks ran (expected at least 82) - did one silently skip?"
     fail=1
 fi
 exit $fail

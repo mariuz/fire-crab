@@ -2337,6 +2337,19 @@ pulled by the fetch.
   DISTINCT` still the modifier, `WHERE TRUE/FALSE`, and the two
   boolean-only-operand refusals (engine-probed SQLSTATE 22000).
 
+  **DONE — and UNKNOWN, the third boolean literal.** `UNKNOWN` (and a
+  bare `NULL`, which the engine treats identically as a condition -
+  probed: `CASE WHEN NULL` and `CASE WHEN UNKNOWN` both take the ELSE,
+  `WHERE NULL` and `WHERE UNKNOWN` both keep no row) is the constant
+  UNKNOWN condition. Both lex to the same NULL literal, so one arm in
+  each bare-boolean rule covers both: the leaf is spelled `NULL = TRUE`,
+  which the Cmp evaluator already answers as UNKNOWN per row - no new
+  machinery. `NULL IS UNKNOWN` passes the boolean-only operand gate as
+  the untyped literal (TRUE on the engine, probed). `B AND UNKNOWN` /
+  `B OR UNKNOWN` now show the Kleene fold against a literal UNKNOWN
+  operand, projected and in the WHERE. `serve-real-boolvalue.sh` +8
+  (74 -> 82).
+
   ~~The next thing worth doing here is a boundary the gates already pin:
   the engine raises a blocking node's error at OPEN, where this server
   announces the result set and raises at the first FETCH.~~
