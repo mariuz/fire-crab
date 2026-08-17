@@ -192,11 +192,23 @@ measured or pinned items**, each recorded in its own place below:
   `param_or_typed_term`, where the descriptor is) - so 'café' meets
   the stored C3 A9 pair and not a raw E9, the engine's byte compare.
   The STORE keeps the client-boundary rule (a literal's UTF-8 bytes
-  verbatim - already the engine's behaviour); a cross-charset
+  verbatim - already the engine's behaviour); ~~a cross-charset
   INSERT..SELECT INTO a NONE column diverges (the engine copies the
   source codepage's bytes, fc stores the decoded text's UTF-8) -
-  recorded. ASCII content is the identity through every seam, which is
-  why the whole existing gate surface is untouched.
+  recorded~~ — TAKEN: the engine's whole assignment matrix was
+  measured off the live engine (a tabled source writes its CODEPAGE
+  bytes into a NONE column — WIN1252 'é€2' lands E9 80 32, not
+  UTF-8's six; a NONE source copies bytes VERBATIM into any
+  single-byte destination and only validly into UTF8 — F8 EC 32
+  refuses there with the engine's 22000; tabled-to-tabled
+  transliterates through Unicode with 22018 on a missing image), and
+  `insert_select` now binds a selected text value as a
+  charset-tagged parameter (`WireParam::TextCs`, the source column's
+  charset read off the SELECT's projection) so `text_bytes_for` can
+  follow that law instead of losing the charset in a re-spelled
+  literal. Gated in serve-real-xlit.sh (40 -> 42). ASCII content is
+  the identity through every seam, which is why the whole existing
+  gate surface is untouched.
   serve-real-xlit.sh 17 -> 20. ~~Still held: the untabled codepages~~ —
   three more TAKEN: WIN1250, WIN1251 and ISO8859_2, and their tables
   were GENERATED FROM THE LIVE ENGINE rather than typed from a chart:

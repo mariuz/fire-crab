@@ -16139,6 +16139,17 @@ enum WireParam {
     Null,
     Int(i64, i8),
     Text(String),
+    /// A text value that KNOWS the character set it was decoded from -
+    /// an INTERNAL shape, never decoded off the wire. `insert_select`
+    /// binds a selected text value with its SOURCE column's charset so
+    /// the store can follow the engine's assignment law: a NONE/OCTETS
+    /// source copies its BYTES verbatim into any destination
+    /// (validated against the destination's encoding), a tabled source
+    /// writes its CODEPAGE bytes into a byte-carrier destination, and
+    /// everything else transliterates as text (all probed live -
+    /// WIN1252 'é€2' lands E9 80 32 in a NONE column, raw F8 EC 32
+    /// lands verbatim in a WIN1252 one, and into UTF8 refuses).
+    TextCs(String, u8),
     Double(f64),
     Timestamp(i32, u32),
     Date(i32),
@@ -17004,11 +17015,15 @@ fn encode_wire_value(d: &Descriptor, wp: &WireParam) -> Option<Option<Vec<u8>>> 
             // stores its decimal rendering ("42", "-7"), and REFUSES
             // rather than truncate when it does not fit
             dtype::TEXT | dtype::VARYING if *ws == 0 => {
-                text_bytes_for(&v.to_string(), d, flen)?
+                text_bytes_for(&v.to_string(), fire_crab_ods::intl::CS_UTF8, d, flen)?
             }
             _ => return None,
         }),
-        WireParam::Text(text) => {
+        WireParam::Text(text) | WireParam::TextCs(text, _) => {
+            let src_cs = match wp {
+                WireParam::TextCs(_, cs) => *cs,
+                _ => fire_crab_ods::intl::CS_UTF8,
+            };
             match d.dtype {
                 // one function, not a second copy of it: these two arms
                 // used to duplicate `text_bytes_for`, and when the
@@ -17017,7 +17032,7 @@ fn encode_wire_value(d: &Descriptor, wp: &WireParam) -> Option<Option<Vec<u8>>> 
                 // the `?` matters: `text_bytes_for`'s None means "does
                 // not fit", which is a REFUSAL - returned as-is here it
                 // would read as SQL NULL and store one.
-                dtype::VARYING | dtype::TEXT => Some(text_bytes_for(text, d, flen)?),
+                dtype::VARYING | dtype::TEXT => Some(text_bytes_for(text, src_cs, d, flen)?),
                 // a TEXT parameter into a BOOLEAN column. The engine
                 // takes exactly two words, case-insensitively and with
                 // surrounding blanks ignored: probed, `'true'`, `'TRUE'`,
@@ -17091,7 +17106,7 @@ fn encode_wire_value(d: &Descriptor, wp: &WireParam) -> Option<Option<Vec<u8>>> 
             // a BOOLEAN parameter into a TEXT column: the engine stores
             // "1" or "0" - probed, not the word
             dtype::TEXT | dtype::VARYING => {
-                text_bytes_for(if *v { "1" } else { "0" }, d, flen)?
+                text_bytes_for(if *v { "1" } else { "0" }, fire_crab_ods::intl::CS_UTF8, d, flen)?
             }
             _ => return None,
         }),
@@ -19520,7 +19535,7 @@ fn flush_careful(path: &str, before: &fire_crab_ods::Image, after: &fire_crab_od
 /// The byte bound stays. It is the field's actual capacity, it is what
 /// stops a wide value overrunning the record image, and in every
 /// single-byte character set the two bounds are the same number.
-fn text_bytes_for(text: &str, d: &Descriptor, flen: usize) -> Option<Vec<u8>> {
+fn text_bytes_for(text: &str, src_cs: u8, d: &Descriptor, flen: usize) -> Option<Vec<u8>> {
     // a TABLED single-byte column (WIN1252, ISO8859_1) stores its
     // codepage's bytes, not UTF-8 - 'é' into a WIN1252 column is the one
     // byte 0xE9, exactly what the engine wrote and reads back. A
@@ -19530,16 +19545,36 @@ fn text_bytes_for(text: &str, d: &Descriptor, flen: usize) -> Option<Vec<u8>> {
     // and the row never lands (recorded boundary, same shape as the
     // numeric-overflow refusals).
     let encoded: Vec<u8>;
-    let b: &[u8] = match fire_crab_ods::intl::encode_text(
-        fire_crab_ods::intl::charset_id(d.sub_type),
-        text,
-    ) {
-        Err(_) => return None,
-        Ok(Some(v)) => {
-            encoded = v;
-            &encoded
+    let dest_cs = fire_crab_ods::intl::charset_id(d.sub_type);
+    let b: &[u8] = if fire_crab_ods::intl::byte_carrier(src_cs) {
+        // a NONE/OCTETS/ASCII SOURCE copies its bytes VERBATIM into any
+        // destination (probed: raw F8 EC 32 lands unchanged in a
+        // WIN1252 column and reads back as its codepage's characters) -
+        // validated only against the destination's encoding: the same
+        // bytes into UTF8 raise the engine's 22000 malformed-string,
+        // which this refusal stands in for (both reject, no row lands)
+        encoded = fire_crab_ods::intl::carrier_encode(text)?;
+        if dest_cs == fire_crab_ods::intl::CS_UTF8 && std::str::from_utf8(&encoded).is_err() {
+            return None;
         }
-        Ok(None) => text.as_bytes(),
+        &encoded
+    } else if fire_crab_ods::intl::tabled(src_cs)
+        && fire_crab_ods::intl::byte_carrier(dest_cs)
+    {
+        // a TABLED source into a byte-carrier destination: the engine
+        // copies the SOURCE CODEPAGE's bytes (probed: WIN1252 'é€2'
+        // lands E9 80 32 in a NONE column, not the UTF-8 six)
+        encoded = fire_crab_ods::intl::encode_text(src_cs, text).ok().flatten()?;
+        &encoded
+    } else {
+        match fire_crab_ods::intl::encode_text(dest_cs, text) {
+            Err(_) => return None,
+            Ok(Some(v)) => {
+                encoded = v;
+                &encoded
+            }
+            Ok(None) => text.as_bytes(),
+        }
     };
     if text.chars().count() > fire_crab_ods::intl::char_length(d.dtype, flen as u16, d.sub_type) {
         return None;
@@ -31873,7 +31908,7 @@ fn param_to_expr(p: &WireParam) -> Option<Expr> {
         WireParam::Null => Expr::Null,
         WireParam::Int(v, 0) => Expr::Int(*v),
         WireParam::Int(v, s) => Expr::Dec(*v, *s),
-        WireParam::Text(s) => Expr::Str(s.clone()),
+        WireParam::Text(s) | WireParam::TextCs(s, _) => Expr::Str(s.clone()),
         WireParam::Double(x) => Expr::Double(*x),
         WireParam::Bool(b) => Expr::Bool(*b),
         // a bound temporal value binds to its literal, so CAST(? AS DATE)
@@ -45005,6 +45040,27 @@ fn insert_select(
     // rows carry a nested id and the failure kills it (the image is
     // kept as the fallback for a transaction that has done DDL - see
     // [undo_window]).
+    // The SOURCE column's character set, per projected column: a text
+    // value re-spelled as a plain literal would lose it, and the
+    // engine's assignment law needs it (a NONE source copies BYTES, a
+    // tabled source writes its codepage's bytes into a carrier - both
+    // probed live; see [WireParam::TextCs]). A carrier or tabled
+    // source binds as a charset-tagged PARAMETER instead of a literal;
+    // every other source keeps the literal path, whose UTF-8 spelling
+    // is the engine's own for UTF8 and expression sources.
+    let src_cs: Vec<u8> = output_cols_of(src)
+        .iter()
+        .map(|c| {
+            if (0..=i16::MAX as i32).contains(&c.sub_type) {
+                let cs = fire_crab_ods::intl::charset_id(c.sub_type as i16);
+                if fire_crab_ods::intl::byte_carrier(cs) || fire_crab_ods::intl::tabled(cs) {
+                    return cs;
+                }
+            }
+            fire_crab_ods::intl::CS_UTF8
+        })
+        .collect();
+
     let snap = snapshot_db(database);
     let mark = undo_window_push(database, WindowKind::Nested, snap.clone());
     let mut n = 0i32;
@@ -45013,9 +45069,20 @@ fn insert_select(
             if row.len() != cols.len() {
                 return Err("the SELECT's column count does not match the INSERT's".into());
             }
+            let mut bound: Vec<WireParam> = Vec::new();
             let vals: Vec<String> = row
                 .iter()
-                .map(psql_literal)
+                .enumerate()
+                .map(|(i, v)| {
+                    let cs = src_cs.get(i).copied().unwrap_or(fire_crab_ods::intl::CS_UTF8);
+                    if cs != fire_crab_ods::intl::CS_UTF8 {
+                        if let Value::Text(t) = v {
+                            bound.push(WireParam::TextCs(t.clone(), cs));
+                            return Some("?".to_string());
+                        }
+                    }
+                    psql_literal(v)
+                })
                 .collect::<Option<Vec<_>>>()
                 .ok_or("a selected value cannot be written as a literal")?;
             // The OVERRIDING clause rides the per-row statement, so the
@@ -45047,7 +45114,7 @@ fn insert_select(
             // order, which is the order the engine's RETURNING cursor
             // answered in the probe. On a row failure the local
             // Affected is dropped with the error - no phantom rows.
-            execute_dml_collecting(&plan, database, &[], ctx, affected.as_deref_mut())?;
+            execute_dml_collecting(&plan, database, &bound, ctx, affected.as_deref_mut())?;
             Ok(())
         })();
         if let Err(e) = step {
@@ -53942,22 +54009,22 @@ mod tests {
             flags: 0,
             offset: 4,
         };
-        assert!(text_bytes_for("1234567890", &v10, 42).is_some());
-        assert!(text_bytes_for("12345678901", &v10, 42).is_none());
-        assert!(text_bytes_for("ääääääääää", &v10, 42).is_some()); // 10 chars, 20 bytes
-        assert!(text_bytes_for("äääääääääää", &v10, 42).is_none()); // 11
+        assert!(text_bytes_for("1234567890", fire_crab_ods::intl::CS_UTF8, &v10, 42).is_some());
+        assert!(text_bytes_for("12345678901", fire_crab_ods::intl::CS_UTF8, &v10, 42).is_none());
+        assert!(text_bytes_for("ääääääääää", fire_crab_ods::intl::CS_UTF8, &v10, 42).is_some()); // 10 chars, 20 bytes
+        assert!(text_bytes_for("äääääääääää", fire_crab_ods::intl::CS_UTF8, &v10, 42).is_none()); // 11
         // CHAR(5) UTF8: twenty bytes, five characters, and stored
         // blank-padded to the full BYTE length
         let c5 = Descriptor { sub_type: 4, dtype: dtype::TEXT, length: 20, scale: 0, flags: 0, offset: 4 };
-        assert_eq!(text_bytes_for("abc", &c5, 20).map(|b| b.len()), Some(20));
-        assert!(text_bytes_for("123456", &c5, 20).is_none());
-        assert!(text_bytes_for("äbcde", &c5, 20).is_some()); // 5 chars, 6 bytes
-        assert!(text_bytes_for("ääääää", &c5, 20).is_none()); // 6 chars, 12 bytes
+        assert_eq!(text_bytes_for("abc", fire_crab_ods::intl::CS_UTF8, &c5, 20).map(|b| b.len()), Some(20));
+        assert!(text_bytes_for("123456", fire_crab_ods::intl::CS_UTF8, &c5, 20).is_none());
+        assert!(text_bytes_for("äbcde", fire_crab_ods::intl::CS_UTF8, &c5, 20).is_some()); // 5 chars, 6 bytes
+        assert!(text_bytes_for("ääääää", fire_crab_ods::intl::CS_UTF8, &c5, 20).is_none()); // 6 chars, 12 bytes
         // ... and in a single-byte set the two bounds coincide, which is
         // what every earlier gate was measuring
         let n5 = Descriptor { sub_type: 0, dtype: dtype::TEXT, length: 5, scale: 0, flags: 0, offset: 4 };
-        assert!(text_bytes_for("12345", &n5, 5).is_some());
-        assert!(text_bytes_for("123456", &n5, 5).is_none());
+        assert!(text_bytes_for("12345", fire_crab_ods::intl::CS_UTF8, &n5, 5).is_some());
+        assert!(text_bytes_for("123456", fire_crab_ods::intl::CS_UTF8, &n5, 5).is_none());
     }
 
     #[test]

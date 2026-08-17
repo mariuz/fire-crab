@@ -288,6 +288,33 @@ else
     fail=1
 fi
 
+# cross-charset INSERT..SELECT: ~~recorded divergence~~ TAKEN. The
+# engine's assignment law (probed): a tabled source writes its
+# CODEPAGE bytes into a NONE column ('café' from WIN1252 lands 4
+# bytes, not UTF-8's 5; 'řeka' from WIN1250 lands 4, not 5), a NONE
+# source copies bytes VERBATIM into any single-byte destination, and
+# into UTF8 only when the bytes are valid there. fire-crab now binds
+# a selected text value as a charset-tagged parameter
+# (WireParam::TextCs) so the store can follow that law.
+ran=$((ran + 1))
+r=$(node_q "INSERT INTO NB SELECT 4, W FROM XL WHERE ID = 1")
+got=$(isql_q "$FC" "SELECT ID, OCTET_LENGTH(S) FROM NB WHERE ID = 4")
+if [ "$r" = "OK" ] && [ "$got" = "4|4" ]; then
+    echo "OK   WIN1252 -> NONE copies the codepage's 4 bytes (not UTF-8's 5)"
+else
+    echo "DIFF WIN1252 -> NONE: insert [$r], engine read [$got] (want 4|4)"
+    fail=1
+fi
+ran=$((ran + 1))
+r=$(node_q "INSERT INTO NB SELECT 5, C FROM XC WHERE ID = 1")
+got=$(isql_q "$FC" "SELECT ID, OCTET_LENGTH(S) FROM NB WHERE ID = 5")
+if [ "$r" = "OK" ] && [ "$got" = "5|4" ]; then
+    echo "OK   WIN1250 -> NONE too ('řeka' is its 4 codepage bytes)"
+else
+    echo "DIFF WIN1250 -> NONE: insert [$r], engine read [$got] (want 5|4)"
+    fail=1
+fi
+
 # --- 7. the GENERATED codepages: WIN1250, WIN1251, ISO8859_2 -----------
 # three more tables in ods::intl, generated FROM the live engine (hex
 # literals in, UNICODE_VAL out) rather than typed from a chart. Real
@@ -385,8 +412,8 @@ fi
 
 kill $srv 2>/dev/null; srv=""
 rm -f "$RE" "$FC"
-if [ "$ran" -lt 40 ]; then
-    echo "DIFF only $ran checks ran (expected at least 40) - did one silently skip?"
+if [ "$ran" -lt 42 ]; then
+    echo "DIFF only $ran checks ran (expected at least 42) - did one silently skip?"
     fail=1
 fi
 exit $fail
