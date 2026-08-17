@@ -306,6 +306,19 @@ impl Plan {
 struct Pred {
     column: String,
     matchable: bool,
+    kind: PredKind,
+}
+
+/// The comparison's shape, which picks both the matched-segment REDUCE
+/// factor (Retrieval.cpp:1091-1129) and the unindexed-filter factor
+/// (Optimizer.h:52-58) in the navigate-vs-sort arithmetic.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum PredKind {
+    Eq,
+    Range,
+    Between,
+    Starting,
+    Other,
 }
 
 /// Every single-segment index of a table, in catalog id order.
@@ -433,6 +446,12 @@ pub fn plan_query(
     if !up.starts_with("SELECT ") {
         return Err("not a SELECT".into());
     }
+    // FIRST n puts the optimizer in first-rows mode (favorFirstRows):
+    // navigation that delivers the order without reading everything is
+    // preferred however small the table - probed: FIRST 3 ORDER BY pk
+    // NAVIGATES on a 6-row table whose bare ORDER BY sorts. A SKIP
+    // without FIRST does not set it (probed: SKIP 2 still sorts).
+    let favor_first = up["SELECT ".len()..].trim_start().starts_with("FIRST ");
     for word in [" JOIN ", " UNION ", "(SELECT", " EXISTS", ","] {
         // a comma in the FROM clause is a join too; the select list's
         // commas are cut away below before this test
@@ -476,12 +495,16 @@ pub fn plan_query(
         Some(w) => parse_predicates(w, &|c| !by_col(c).is_empty())?,
     };
     let mut matched: Vec<&IndexInfo> = Vec::new();
+    // each matched conjunct/branch with its index and its comparison's
+    // shape - what the navigate-vs-sort arithmetic below prices
+    let mut pairs: Vec<(PredKind, &IndexInfo)> = Vec::new();
     if all_or_matchable {
         for p in preds.iter().filter(|p| p.matchable) {
             // the LOWEST-id index on the column (the engine's pick
             // among equals - an ascending index serves a range where
             // a descending twin exists)
             if let Some(i) = by_col(&p.column).into_iter().min_by_key(|i| i.id) {
+                pairs.push((p.kind, i));
                 // an OR union is ONE INVERSION PER BRANCH, listed in
                 // BRANCH order (probed: `ID = 5 OR ID = 7` prints the
                 // index twice; `AMT = 2 OR ID = 5` prints AMT first);
@@ -512,11 +535,15 @@ pub fn plan_query(
             .min_by_key(|i| i.id);
         if let Some(n) = nav {
             // WHAT RIDES THE WALK, WHAT SORTS - the engine's
-            // applyNavigation, mapped cell by cell against the live
-            // optimizer. The filter's inversions that cannot merge into
-            // the navigation are its LIST: an AND's nav-index conjuncts
-            // ride and drop out, everything else it matched stays; an
-            // OR's branches ALL stay - the union cannot ride, even on
+            // applyNavigation (Retrieval.cpp:667-755), converted term by
+            // term and checked cell by cell against the live optimizer on
+            // empty, small and grown fixtures, with zero, stale and fresh
+            // statistics alike.
+            //
+            // The filter's inversions that cannot merge into the
+            // navigation are its LIST: an AND's nav-index conjuncts ride
+            // the walk and drop out, everything else it matched stays;
+            // an OR's branches ALL stay - the union cannot ride, even on
             // the nav index itself.
             let filter: Vec<String> = if is_or {
                 matched.iter().map(|i| i.name.clone()).collect()
@@ -527,36 +554,116 @@ pub fn plan_query(
                     .map(|i| i.name.clone())
                     .collect()
             };
-            let every_pred_indexed = preds.iter().all(|p| p.matchable) && all_or_matchable;
-            // The engine then compares the walk against an external sort
-            // (Retrieval.cpp:applyNavigation). Two measured regimes:
-            //
-            //  * a NEAR-EMPTY table (csb_cardinality at its 1.0 floor,
-            //    the fixture every prepared-on-empty statement sees):
-            //    navigation wins ONLY when nothing is listed beside it -
-            //    `NOTE = 'x' ORDER BY ID` navigates (no inversion at
-            //    all: the engine is "pessimistic about a relation that
-            //    looks empty" and avoids the sort), `ID = 5 ORDER BY
-            //    ID` navigates (the equality rides), but ANY listed
-            //    inversion sorts: `AMT = 2` / `AMT > 3` are
-            //    SORT (INDEX (IDX_AMT)) and `ID = 5 OR ID = 7` is
-            //    SORT (INDEX (IDX_ID, IDX_ID)).
-            //
-            //  * a POPULATED table: an UNINDEXED conjunct or branch
-            //    sends the plan to the sort (`K = 9 ORDER BY ID` is
-            //    SORT (NATURAL), `K = 9 AND ID = 5` SORT (INDEX));
-            //    a fully-indexed filter NAVIGATES with its list -
-            //    equality, range and OR alike (`AMT = 2`, `AMT > 3`,
-            //    `AMT = 2 OR AMT = 3` all ORDER ... INDEX (...)).
-            //
-            //  The band between (a few rows, a listed inversion) is the
-            //  engine's raw cost arithmetic and is not fully mapped;
-            //  the 1.0 threshold is its measured floor.
             let card = cardinality(file, page_size, &table).unwrap_or(1.0);
-            let navigates = if card <= 1.0 {
-                filter.is_empty() && (!is_or || matched.is_empty())
+            // a matched conjunct/branch's selectivity: the index's own
+            // figure (zero substituting the engine's leading-segment 0.1,
+            // Retrieval.cpp:1019-1026), a range/BETWEEN/STARTING reduced
+            // toward MAXIMUM_SELECTIVITY by its factor (:1125-1129)
+            let pair_sel = |k: PredKind, i: &IndexInfo| -> f64 {
+                let base = {
+                    let s = index_selectivity(file, page_size, &i.name).unwrap_or(0.0);
+                    if s <= 0.0 {
+                        DEFAULT_SELECTIVITY
+                    } else {
+                        s
+                    }
+                };
+                match k {
+                    PredKind::Eq => base,
+                    PredKind::Between => base + (1.0 - base) * 0.0025,
+                    PredKind::Range => base + (1.0 - base) * 0.05,
+                    PredKind::Starting | PredKind::Other => base + (1.0 - base) * 0.01,
+                }
+            };
+            // the MATCHED part: an OR composes its branches by SUM
+            // (a union names the union of the bands); an AND multiplies,
+            // split by whether the conjunct rides the nav scratch
+            let (match_sel, nav_ride_sel, nav_rides, has_sep_inversion) = if is_or {
+                let sum: f64 = pairs.iter().map(|(k, i)| pair_sel(*k, i)).sum::<f64>().min(1.0);
+                (if pairs.is_empty() { 1.0 } else { sum }, 1.0, false, !pairs.is_empty())
             } else {
-                every_pred_indexed
+                let mut ride = 1.0f64;
+                let mut rides = false;
+                let mut sep = 1.0f64;
+                let mut has_sep = false;
+                for (k, i) in &pairs {
+                    if i.name == n.name {
+                        ride *= pair_sel(*k, i);
+                        rides = true;
+                    } else {
+                        sep *= pair_sel(*k, i);
+                        has_sep = true;
+                    }
+                }
+                (ride * sep, ride, rides, has_sep)
+            };
+            // the UNINDEXED conjuncts (or an unusable OR, whose branch
+            // factors SUM) become filter factors, backed off behind the
+            // matches (applyFilters passes matchCount as priorConjuncts)
+            let factor_of = |k: PredKind| -> f64 {
+                match k {
+                    PredKind::Eq => 0.001,
+                    PredKind::Between => 0.0025,
+                    PredKind::Range => 0.05,
+                    PredKind::Starting => 0.01,
+                    PredKind::Other => 0.01,
+                }
+            };
+            let factors: Vec<f64> = if is_or && !all_or_matchable {
+                vec![preds.iter().map(|p| factor_of(p.kind)).sum::<f64>().min(1.0)]
+            } else if !is_or {
+                preds.iter().filter(|p| !p.matchable).map(|p| factor_of(p.kind)).collect()
+            } else {
+                Vec::new()
+            };
+            let filter_sel = estimate_selectivity(&factors, card, pairs.len());
+            let cand_sel = match_sel * filter_sel;
+            // "If the table looks like empty during preparation time ...
+            // let's better be pessimistic and avoid external sorting"
+            // (:681-686) - only when NO inversion sits beside the walk.
+            // First-rows mode with NO local filtering skips the sort
+            // outright (:684-685: favorFirstRows && selectivity ==
+            // MAXIMUM_SELECTIVITY).
+            let avoid_sorting = (card <= 1.0
+                && !has_sep_inversion
+                && !(is_or && !pairs.is_empty()))
+                || (favor_first && cand_sel >= 1.0);
+            let navigates = if avoid_sorting {
+                true
+            } else {
+                // sortCost: copying in and out (2 x MEMCOPY 0.5) plus
+                // quicksort's n log n at COST_FACTOR_QUICKSORT 0.1 -
+                // log2 of a sub-row cardinality goes NEGATIVE, and that
+                // is the engine's own arithmetic (it is what makes a
+                // heavily-filtered sort nearly free)
+                let c = card * cand_sel;
+                let sort_cost = if c > 0.0 { c + 0.1 * c * c.log2() } else { 0.0 };
+                // navigationCost: the walk's own cost only when nothing
+                // rides it (a riding match accounts it in the candidate),
+                // plus an index-leaf fetch per MATCH-cardinality record
+                // at the nav scratch's selectivity (:710-717)
+                let match_card = card * match_sel;
+                let nav_cost = if favor_first {
+                    // first-rows mode reprices the walk as "to the first
+                    // matching record" (:727-737): a single retrieval
+                    // (DEFAULT_INDEX_COST unless a match rides the walk)
+                    // plus the fraction of the index walked to reach it
+                    let base = if nav_rides { 0.0 } else { 3.0 };
+                    let fraction = if cand_sel > 0.0 && card > 0.0 {
+                        (1.0 / cand_sel) / card
+                    } else {
+                        1.0
+                    };
+                    base + index_pages(card) * fraction * nav_ride_sel
+                } else {
+                    let nav_cost0 = if nav_rides {
+                        0.0
+                    } else {
+                        3.0 + 1.0 * index_pages(card)
+                    };
+                    nav_cost0 + match_card * nav_ride_sel
+                };
+                !(sort_cost < nav_cost)
             };
             if navigates {
                 return Ok(Plan {
@@ -1877,6 +1984,37 @@ fn index_pages(cardinality: f64) -> f64 {
     (cardinality * per_page / (PAGE_SIZE - 39.0)).max(MINIMUM_CARDINALITY)
 }
 
+/// `Optimizer::estimateSelectivity` (Optimizer.cpp:1240-1267): the
+/// factors sorted ascending, the FRONT one floored by the small-table
+/// adjustment (the product is scaled so it lands at 1/cardinality), and
+/// each factor decaying by repeated square root (`applyBackoff`) as
+/// `prior` conjuncts accumulate - index matches count as priors, so a
+/// filter beside a match starts deeper in the backoff.
+fn estimate_selectivity(factors: &[f64], cardinality: f64, prior_conjuncts: usize) -> f64 {
+    if factors.is_empty() {
+        return 1.0;
+    }
+    let mut sorted = factors.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let mut selectivity = 1.0f64;
+    if prior_conjuncts == 0 && cardinality > 0.0 {
+        let min_selectivity = 1.0 / cardinality;
+        if sorted[0] < min_selectivity {
+            selectivity *= min_selectivity / sorted[0];
+        }
+    }
+    let mut prior = prior_conjuncts;
+    for f in &sorted {
+        let mut x = *f;
+        for _ in 0..prior {
+            x = x.sqrt();
+        }
+        selectivity *= x;
+        prior += 1;
+    }
+    selectivity.min(1.0)
+}
+
 /// The engine's FILTER-selectivity estimate for one stream of a join -
 /// `Optimizer::estimateSelectivity` over the stream's own WHERE conjuncts
 /// (Optimizer.cpp:1240-1267 with the getSelectivity factors,
@@ -1977,25 +2115,7 @@ fn stream_filter_selectivity(
         }
         factors.push(factor);
     }
-    if factors.is_empty() {
-        return Some(1.0);
-    }
-    factors.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let mut selectivity = 1.0f64;
-    if cardinality > 0.0 {
-        let min_selectivity = 1.0 / cardinality;
-        if factors[0] < min_selectivity {
-            selectivity *= min_selectivity / factors[0];
-        }
-    }
-    for (prior, f) in factors.iter().enumerate() {
-        let mut x = *f;
-        for _ in 0..prior {
-            x = x.sqrt();
-        }
-        selectivity *= x;
-    }
-    Some(selectivity.min(1.0))
+    Some(estimate_selectivity(&factors, cardinality, 0))
 }
 
 fn loop_cost(outer_card: f64, inner_card: f64, inner_sel: f64, inner_unique: bool) -> f64 {
@@ -2260,7 +2380,20 @@ fn parse_one_predicate(
     } else {
         return Err(format!("predicate {:?} unconverted", p));
     };
-    Ok(Pred { column: column.clone(), matchable: matchable && indexed(&column) })
+    let kind = if rest.starts_with('=') {
+        PredKind::Eq
+    } else if rest.starts_with("BETWEEN") {
+        PredKind::Between
+    } else if (rest.starts_with('>') || rest.starts_with('<'))
+        && !rest.starts_with("<>")
+    {
+        PredKind::Range
+    } else if rest.starts_with("STARTING") || rest.starts_with("LIKE ") {
+        PredKind::Starting
+    } else {
+        PredKind::Other
+    };
+    Ok(Pred { column: column.clone(), matchable: matchable && indexed(&column), kind })
 }
 
 /// The ORDER BY keys: `[BY] col [ASC|DESC] [, ...]`, each key's

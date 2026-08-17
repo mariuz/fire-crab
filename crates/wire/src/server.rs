@@ -24097,6 +24097,49 @@ fn unqualify_single(text: &str, bind: &ColBinding<'_>) -> Option<String> {
 // resolving it across branches with different names is not worth
 // guessing at).
 
+thread_local! {
+    /// The engine's FIRST-ROWS mode is OPTIMIZER-AMBIENT state: OPT_compile
+    /// sets favorFirstRows from the statement's FIRST/ROWS before the inner
+    /// rse is costed, so the stripped modifier still reaches the access-path
+    /// decision. The same ambient flag carries it past `strip_modifiers`
+    /// here, and the index gate's reconstructed sentinel re-spells it as
+    /// `FIRST 1` so fcopt costs in first-rows mode (probed: `FIRST 3 ORDER
+    /// BY pk` NAVIGATES on a 6-row table whose bare ORDER BY sorts).
+    static FIRST_ROWS_MODE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Scoped setter for [FIRST_ROWS_MODE]; restores the previous value on drop.
+struct FirstRowsGuard(bool);
+impl FirstRowsGuard {
+    fn set(v: bool) -> FirstRowsGuard {
+        let prev = FIRST_ROWS_MODE.with(|c| c.replace(v));
+        FirstRowsGuard(prev)
+    }
+}
+impl Drop for FirstRowsGuard {
+    fn drop(&mut self) {
+        let prev = self.0;
+        FIRST_ROWS_MODE.with(|c| c.set(prev));
+    }
+}
+
+/// Re-spell the ambient first-rows mode into a reconstructed gatekeeper
+/// statement: `SELECT ...` becomes `SELECT FIRST 1 ...` when the original
+/// statement carried a FIRST/ROWS limit. The constant 1 is not the limit's
+/// value - fcopt's favorFirstRows only keys on the MODE, as the engine's
+/// does.
+fn with_first_rows(sql: String) -> String {
+    if !FIRST_ROWS_MODE.with(|c| c.get()) {
+        return sql;
+    }
+    let t = sql.trim_start();
+    if t.len() >= 7 && t[..7].eq_ignore_ascii_case("SELECT ") {
+        format!("SELECT FIRST 1 {}", &t[7..])
+    } else {
+        sql
+    }
+}
+
 /// Pull the result modifiers off a SELECT.
 ///
 /// THE ENGINE'S GRAMMAR IS `SELECT [FIRST m] [SKIP n] [DISTINCT|ALL]
@@ -25259,7 +25302,10 @@ fn plan_query_inner_ctx(
             return Some(Plan::Refused);
         }
         // an inner query this server cannot plan must RAISE - falling
-        // through would answer 4242 to a DISTINCT/FIRST query
+        // through would answer 4242 to a DISTINCT/FIRST query. The
+        // stripped FIRST/ROWS limit stays visible to the access-path
+        // decision as the engine's ambient first-rows mode.
+        let _first_rows = FirstRowsGuard::set(take.is_some());
         let Some(plan) = plan_query_inner(&inner_sql, db, params) else {
             return Some(Plan::Refused);
         };
@@ -26236,7 +26282,7 @@ fn plan_query_inner_ctx(
     // `ID > (fold) ORDER BY ID` with T ORDER RDB$PRIMARY1, and fcopt
     // answers ORDER for the reconstruction). With no fold this IS the
     // original text and nothing changes.
-    let opt_sql: String = match &folded_where {
+    let opt_sql: String = with_first_rows(match &folded_where {
         Some(w) => format!(
             "SELECT 1 FROM {} WHERE {}{}",
             table,
@@ -26244,7 +26290,7 @@ fn plan_query_inner_ctx(
             order_s.map(|o| format!(" ORDER BY {}", o)).unwrap_or_default()
         ),
         None => sql.to_string(),
-    };
+    });
 
     let items = match proj {
         Proj::Star => {

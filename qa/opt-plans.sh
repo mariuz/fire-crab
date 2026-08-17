@@ -483,5 +483,13 @@ check "SELECT PID FROM TP WHERE PID = 5 ORDER BY PID"
 # ... and the EMPTY-table side of the flip, on T
 check "SELECT ID FROM T WHERE AMT = 2 ORDER BY ID"
 check "SELECT ID FROM T WHERE ID = 5 OR ID = 7 ORDER BY ID"
+# the applyNavigation COST arithmetic proper: a bare ORDER BY navigates
+# on the populated table (the 500-row quicksort loses to the walk) and
+# FIRST enters first-rows mode, which skips the sort outright - the
+# size-flip's other cells (a 6-row table sorting bare, SKIP not being
+# first-rows) are pinned in serve-real-index.sh over its live fixture
+check "SELECT PID FROM TP ORDER BY PID"
+check "SELECT FIRST 3 PID FROM TP ORDER BY PID"
+check "SELECT FIRST 3 PID FROM TP WHERE PAMT = 2 ORDER BY PID"
 
 exit $fail

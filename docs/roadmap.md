@@ -659,11 +659,35 @@ of those boundaries.
   listed beside the walk (any listed inversion sorts — the engine's
   pessimism about relations that look empty at prepare), populated
   tables navigate any FULLY-INDEXED filter (equality, range and OR
-  alike) and sort on an unindexed conjunct or branch. The band between
-  (a few rows, a listed inversion) is the raw cost arithmetic and is
-  not fully mapped; the 1.0-cardinality threshold is its measured
-  floor. `qa/opt-plans.sh` 91 -> 105 (a populated TP fixture beside the
-  empty T, both sides of the flip pinned).
+  alike) and sort on an unindexed conjunct or branch. ~~The band between
+  is not fully mapped~~ — **NOW IT IS: the binary rule became the
+  engine's applyNavigation COST ARITHMETIC itself** (Retrieval.cpp:
+  667-755, term by term): `sortCost = c·(2·MEMCOPY) +
+  c·log2(c)·QUICKSORT` over the candidate-filtered cardinality (log2 of
+  a sub-row figure goes NEGATIVE, the engine's own arithmetic — it is
+  what makes a heavily-filtered sort nearly free), against
+  `navigationCost` = the walk's own cost when nothing rides it plus an
+  index-leaf fetch per match-cardinality record; an AND conjunct on the
+  nav index RIDES the scratch (zeroing the walk's own cost and scaling
+  the leaf term by its selectivity), an OR never rides; matched
+  selectivities substitute 0.1 when stored zero and reduce by the
+  range/BETWEEN/STARTING factors; unindexed conjuncts become
+  estimateSelectivity filter factors (equality 0.001, floored at
+  1/cardinality, sqrt-backoff behind the matches, an unusable OR's
+  branch factors summing); `avoidSorting` keeps the prepare-on-empty
+  pessimism, and FIRST enters first-rows mode (`favorFirstRows`:
+  unfiltered skips the sort outright, filtered reprices the walk as
+  to-the-first-match). Measured wall to wall: a 50-cell size sweep
+  (5..2000 rows x five shapes — the engine SORTS a bare ORDER BY below
+  ~20 rows and fcopt agrees cell for cell), the 6-row EMP/TX replicas,
+  and SKIP-alone not being first-rows. THE SERVER carries the mode as
+  the engine does — ambient (`FIRST_ROWS_MODE`, set where
+  `strip_modifiers` peels the limit, re-spelled as `FIRST 1` into the
+  idx-gate's reconstructed sentinel) — and `serve-real-index.sh` had
+  THREE pins that said `navigated` where the LIVE ENGINE SORTS (bare
+  ORDER BY and SKIP-alone on the 6-row fixtures): they pinned fc's
+  divergence, now flipped to the engine's own answers. opt-plans
+  91 -> 108; index 403 with the corrected pins.
 
 - **The stale grid's only threshold is the 20→30 step**, which the
   widened size set barely straddles and the old `{0,1,5,50,500,3000}` set

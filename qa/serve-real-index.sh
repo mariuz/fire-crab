@@ -605,13 +605,22 @@ sorted_anyway() { # <label> <sql> - answers like the engine and SORTS
         fail=1
     fi
 }
-navigated "ORDER BY the primary key, with no predicate at all" \
+# THE ENGINE SORTS a bare ORDER BY on a table this small - probed on a
+# live replica: applyNavigation's cost compare makes a 6-row quicksort
+# cheaper than the index walk (`PLAN SORT (EMP NATURAL)`), and a SKIP
+# without FIRST does not enter first-rows mode. These pins used to say
+# `navigated` - which pinned a DIVERGENCE, fc navigating where the
+# engine sorts. A range that RIDES the walk navigates at any size (its
+# match is accounted in the candidate), and FIRST enters first-rows
+# mode (favorFirstRows), which skips the sort outright.
+sorted_anyway "ORDER BY the primary key, with no predicate at all" \
           "SELECT ID, NAME FROM EMP ORDER BY ID"
 navigated "... and with a range, which bounds the same walk" \
           "SELECT ID FROM EMP WHERE ID > 2 ORDER BY ID"
 navigated "... under FIRST, where the order decides WHICH rows" \
           "SELECT FIRST 3 ID FROM EMP ORDER BY ID"
-navigated "... and SKIP" "SELECT SKIP 2 ID FROM EMP ORDER BY ID"
+sorted_anyway "... and SKIP alone, which is not first-rows mode" \
+          "SELECT SKIP 2 ID FROM EMP ORDER BY ID"
 # every one of these has an order the index does NOT deliver
 sorted_anyway "DESCENDING - the walk goes the other way" \
               "SELECT ID FROM EMP ORDER BY ID DESC"
@@ -637,7 +646,9 @@ sorted_anyway "the predicate's index is not the order's" \
 # A column with a NON-default collation cannot reach here at all: its
 # index carries an itype outside the accepted list, so no pick is built
 # for the relation. The sequences below are the assertion.
-navigated "ORDER BY a UNIQUE NOT NULL text column" \
+# the same size law on the text fixture: 6 rows sort bare (probed:
+# `PLAN SORT (TX NATURAL)` on a live replica), FIRST navigates
+sorted_anyway "ORDER BY a UNIQUE NOT NULL text column (6 rows sort bare)" \
           "SELECT N FROM TX ORDER BY S"
 navigated "... under FIRST, where the order decides which rows" \
           "SELECT FIRST 3 N FROM TX ORDER BY S"
