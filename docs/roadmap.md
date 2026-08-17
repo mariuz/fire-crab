@@ -223,6 +223,23 @@ measured or pinned items**, each recorded in its own place below:
   normalization eats them). Still held: the real collations
   (PXW_INTL and kin, their own weight tables).
 
+  **The 22018 argument spells the COLUMN CHARSET's bytes** — the full
+  sweep after the codepage slice caught two textcolcmp cells the
+  byte-carrier slice had silently broken: fc escaped the Rust
+  String's UTF-8 (`text.bytes()`), so a NONE value spelled
+  `#xc3#x82#xc2#xa02` where the engine spells `#xc2#xa02` — and the
+  same bug would have doubled a WIN1252 'é' (probed: the engine's
+  CVT_conversion_error renders the value's bytes in its OWN character
+  set before any transliteration to the attachment, CAST and implicit
+  compare alike). The charset rides the wraps now — `Expr::Cast`,
+  `TextNum`, `TextNumKey`, `TextBool`, `Term::ExprParam` each carry
+  the text side's charset, stamped at resolution off the descriptor
+  (a field, not a transparent wrapper: the field makes every
+  shape-matching site a compile error where a wrapper would slip past
+  them silently) — and the raise sites build
+  `EvalErr::ConversionErrorBytes` through `conv_err`. textcolcmp
+  345 -> 352 with a per-charset spelling section, all green.
+
 The rest of this document records how the surface got here and every one
 of those boundaries.
 

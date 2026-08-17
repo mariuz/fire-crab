@@ -289,6 +289,25 @@ EOF
 make_db "$A" || { echo "FAIL scratch A"; exit 1; }
 make_db "$B" || { echo "FAIL scratch B"; exit 1; }
 
+# TXCS: the 22018 argument must spell the value's bytes IN ITS OWN
+# CHARACTER SET (probed: a WIN1252 'é2' spells #xe92 even through a
+# UTF8 attachment, a WIN1250 'ř2' #xf82, a UTF8 'é2' #xc3#xa92) -
+# seeded through a UTF8 attachment so the letters land as their
+# codepage bytes, unlike make_db's NONE attachment
+seed_xcs() {
+    "$ISQL" -q -b -ch UTF8 -user "$U" -pas "$P" "$1" <<EOF >/dev/null 2>&1
+CREATE TABLE TXCS (ID INTEGER NOT NULL PRIMARY KEY,
+                   W VARCHAR(10) CHARACTER SET WIN1252,
+                   C VARCHAR(10) CHARACTER SET WIN1250,
+                   U VARCHAR(10) CHARACTER SET UTF8);
+COMMIT;
+INSERT INTO TXCS VALUES (1, 'é2', 'ř2', 'é2');
+COMMIT;
+EOF
+}
+seed_xcs "$A" || { echo "FAIL seed TXCS A"; exit 1; }
+seed_xcs "$B" || { echo "FAIL seed TXCS B"; exit 1; }
+
 "$FCWIRE" serve "127.0.0.1:$PORT" "$U" "$P" >/tmp/fc-serve-textcolcmp.log 2>&1 &
 srv=$!
 trap 'kill $srv 2>/dev/null' EXIT
@@ -547,9 +566,12 @@ cst() { # <id> <target> - one row, one numeric target
 for tgt in SMALLINT INTEGER BIGINT "NUMERIC(9,2)" "DOUBLE PRECISION"; do
     for id in 1 2 3 4 5 6 7 8 9 10 11 12 13; do cst $id "$tgt"; done
 done
-# ' 2.5 ' only to the SCALED targets: fc's integer CAST refuses a
-# fraction the engine ROUNDS (`CAST('2.5' AS INTEGER)` is 3 there) -
-# a narrow-grammar residual of its own, recorded, not this slice's
+# ' 2.5 ' to every target: the once-recorded "fc refuses a fraction
+# the engine ROUNDS" residual is CLOSED (probed live: both answer 3
+# for the integer family - half away from zero)
+cst 14 SMALLINT
+cst 14 INTEGER
+cst 14 BIGINT
 cst 14 "NUMERIC(9,2)"
 cst 14 "DOUBLE PRECISION"
 for id in 15 16 17 18 19; do cst $id INTEGER; done
@@ -885,9 +907,31 @@ both "... and UPDATEs one" "UPDATE TCN SET N = ' 6 ' WHERE ID = 3"
 both "the stored numbers read back (fresh attachment)" \
      "SELECT ID, N, Q, D FROM TCN ORDER BY ID"
 
-# --- 14. the ran counter -----------------------------------------------
-if [ "$ran" -ne 345 ]; then
-    echo "DIFF $ran checks ran (expected exactly 345) - did one silently skip?"
+# --- 14. the 22018 argument spells the COLUMN CHARSET's bytes ----------
+# CVT_conversion_error renders the value BEFORE any transliteration to
+# the attachment set, so the escape is over the codepage's bytes: the
+# WIN1252 'é' is one #xe9, the WIN1250 'ř' one #xf8, and the UTF8 'é'
+# the two-byte #xc3#xa9 - all through the same UTF8 attachment. Before
+# the charset rode the Cast/TextNum wraps, fc escaped the Rust String's
+# UTF-8 for every source and the single-byte columns spelled doubled.
+both "the CAST 22018 spells WIN1252 bytes (#xe92)" \
+     "SELECT CAST(W AS INTEGER) AS V FROM TXCS WHERE ID = 1"
+both "... WIN1250 bytes (#xf82)" \
+     "SELECT CAST(C AS INTEGER) AS V FROM TXCS WHERE ID = 1"
+both "... and UTF8 stays two-byte (#xc3#xa92)" \
+     "SELECT CAST(U AS INTEGER) AS V FROM TXCS WHERE ID = 1"
+both "the COMPARE vector spells the same way" \
+     "SELECT ID FROM TXCS WHERE ID = W"
+both "... on the WIN1250 side too" \
+     "SELECT ID FROM TXCS WHERE ID = C"
+both "a numeric CAST target as well (NUMERIC(9,2))" \
+     "SELECT CAST(W AS NUMERIC(9,2)) AS V FROM TXCS WHERE ID = 1"
+both "DOUBLE PRECISION too" \
+     "SELECT CAST(C AS DOUBLE PRECISION) AS V FROM TXCS WHERE ID = 1"
+
+# --- 15. the ran counter -----------------------------------------------
+if [ "$ran" -ne 355 ]; then
+    echo "DIFF $ran checks ran (expected exactly 355) - did one silently skip?"
     fail=1
 fi
 

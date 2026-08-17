@@ -5994,7 +5994,9 @@ enum Term {
     /// from the expression's type (what the client builds its encoder
     /// from); at execute, [Predicate::bind] substitutes the arrived
     /// value as a literal and the term becomes an ordinary [ExprCond].
-    ExprParam(Box<Expr>, Cmp, usize, ColKind),
+    /// The trailing `u8` is the expression side's charset for the
+    /// 22018 spelling when a numeric bind wraps it in [Expr::TextNum].
+    ExprParam(Box<Expr>, Cmp, usize, ColKind, u8),
     /// `? IS [NOT] NULL` - ROW-INDEPENDENT, decided at bind, and
     /// TYPE-BLIND there (probed: a text value in the slot answers 0
     /// rows, no error). The slot describes as SQL_NULL (32766/len 0),
@@ -6604,7 +6606,7 @@ impl Predicate {
                     // mechanism-consistent with [cmp_sides]' wrap for
                     // the literal spelling of the same comparison
                     // (the gate pins the plain-column rows).
-                    Term::ExprParam(lhs, op, idx, kind) => {
+                    Term::ExprParam(lhs, op, idx, kind, cs) => {
                         let num_lit = if matches!(kind, ColKind::Text) {
                             match args.get(*idx).ok_or("missing parameter value")? {
                                 WireParam::Int(v, 0) => Some(Expr::Int(*v)),
@@ -6617,7 +6619,7 @@ impl Predicate {
                         };
                         if let Some(lit) = num_lit {
                             Term::ExprCond(Box::new(Cond2::Cmp(
-                                Box::new(Expr::TextNum(lhs.clone())),
+                                Box::new(Expr::TextNum(lhs.clone(), *cs)),
                                 *op,
                                 Box::new(lit),
                             )))
@@ -6862,8 +6864,8 @@ fn expr_reads(e: &Expr, f: &dyn Fn(usize) -> bool) -> bool {
         // the per-row coercion wrappers read whatever they wrap - a
         // wrapped COLUMN must keep its term row-DEPENDENT, or the
         // invariant pass would raise a value-gated 22018 over no row
-        Expr::TextNum(a) | Expr::TextNumKey(a) | Expr::TextBool(a) => expr_reads(a, f),
-        Expr::Neg(a) | Expr::Cast(a, _) => expr_reads(a, f),
+        Expr::TextNum(a, _) | Expr::TextNumKey(a, _) | Expr::TextBool(a, _) => expr_reads(a, f),
+        Expr::Neg(a) | Expr::Cast(a, _, _) => expr_reads(a, f),
         Expr::Bin(a, _, b) | Expr::Concat(a, b) | Expr::NullIf(a, b) => {
             expr_reads(a, f) || expr_reads(b, f)
         }
@@ -9225,8 +9227,8 @@ fn exact_dtype_bytes(dt: u8) -> Option<u8> {
 /// `_` arm through [Expr::is_wide], matching what num_form did.
 fn result_width_bytes(e: &Expr, descs: &[Descriptor]) -> u8 {
     match e {
-        Expr::Cast(_, CastTarget::Int { bytes })
-        | Expr::Cast(_, CastTarget::Numeric { bytes, .. }) => *bytes,
+        Expr::Cast(_, CastTarget::Int { bytes }, _)
+        | Expr::Cast(_, CastTarget::Numeric { bytes, .. }, _) => *bytes,
         Expr::Col(fid) => descs.get(*fid).and_then(|d| exact_dtype_bytes(d.dtype)).unwrap_or(8),
         Expr::Neg(a) => result_width_bytes(a, descs),
         Expr::Coalesce(v) => v.iter().map(|x| result_width_bytes(x, descs)).max().unwrap_or(8),
@@ -9262,7 +9264,7 @@ fn exact_width_form(bytes: u8) -> (Wire, i32, i32) {
 /// arithmetic, negation and the conditionals.
 fn numeric_subtype(e: &Expr, descs: &[Descriptor]) -> i16 {
     match e {
-        Expr::Cast(_, CastTarget::Numeric { sub_type, .. }) => *sub_type,
+        Expr::Cast(_, CastTarget::Numeric { sub_type, .. }, _) => *sub_type,
         // any exact-numeric-family column carries its RDB$FIELD_SUB_TYPE,
         // scale 0 included: NUMERIC(4,0) is subtype 1 though it is a
         // SHORT this server otherwise types as a plain integer
@@ -9335,6 +9337,7 @@ fn pad_conditional(e: Expr, descs: &[Descriptor]) -> Expr {
             Expr::Cast(
                 Box::new(e),
                 CastTarget::Text { len: w as usize, pad: true, synthetic: true },
+                fire_crab_ods::intl::CS_UTF8,
             )
         }
         _ => e,
@@ -9464,7 +9467,7 @@ fn text_form_m(
                 _ => None,
             }
         }
-        Expr::Cast(inner, CastTarget::Text { len, pad, synthetic }) => {
+        Expr::Cast(inner, CastTarget::Text { len, pad, synthetic }, _) => {
             // a USER cast is typed in the attachment charset and declares
             // its own width, in characters of it either way.
             //
@@ -9580,7 +9583,7 @@ fn build_expr_col_from(e: Expr, name: &str, descs: &[Descriptor]) -> Option<Proj
     // a bare CAST to DECFLOAT carries its declared WIDTH - DECFLOAT(34) is
     // decimal128 (16 bytes), DECFLOAT(16) decimal64 (8) - so it describes
     // its own form, not the arithmetic tree's always-34
-    if let Expr::Cast(_, CastTarget::DecFloat { wide }) = &e {
+    if let Expr::Cast(_, CastTarget::DecFloat { wide }, _) = &e {
         let (wire, sql_type, length) =
             if *wide { (Wire::Dec34, 32762, 16i32) } else { (Wire::Dec16, 32760, 8i32) };
         return Some(ProjCol {
@@ -21722,9 +21725,9 @@ fn null_rejecting(t: &Term, win: &std::ops::Range<usize>) -> bool {
                 fn bare(e: &Expr, win: &std::ops::Range<usize>) -> bool {
                     match e {
                         Expr::Col(i) => win.contains(i),
-                        Expr::TextNum(inner)
-                        | Expr::TextNumKey(inner)
-                        | Expr::TextBool(inner) => bare(inner, win),
+                        Expr::TextNum(inner, _)
+                        | Expr::TextNumKey(inner, _)
+                        | Expr::TextBool(inner, _) => bare(inner, win),
                         _ => false,
                     }
                 }
@@ -21759,11 +21762,11 @@ fn mark_hash_keys(on: &mut Predicate, offset: usize, part_width: usize) {
         let Cond2::Cmp(l, Cmp::Eq, r) = c.as_ref() else { continue };
         // the text-wrapped side and the plain column it is compared to
         let pair = match (l.as_ref(), r.as_ref()) {
-            (Expr::TextNum(inner), Expr::Col(j)) => match inner.as_ref() {
+            (Expr::TextNum(inner, _), Expr::Col(j)) => match inner.as_ref() {
                 Expr::Col(i2) => Some((*i2, *j)),
                 _ => None,
             },
-            (Expr::Col(j), Expr::TextNum(inner)) => match inner.as_ref() {
+            (Expr::Col(j), Expr::TextNum(inner, _)) => match inner.as_ref() {
                 Expr::Col(i2) => Some((*i2, *j)),
                 _ => None,
             },
@@ -21791,10 +21794,10 @@ fn mark_hash_keys(on: &mut Predicate, offset: usize, part_width: usize) {
     for i in marks {
         let Term::ExprCond(c) = &mut on.groups[0][i] else { continue };
         let Cond2::Cmp(l, _, r) = c.as_mut() else { continue };
-        if let Expr::TextNum(inner) = l.as_ref() {
-            **l = Expr::TextNumKey(inner.clone());
-        } else if let Expr::TextNum(inner) = r.as_ref() {
-            **r = Expr::TextNumKey(inner.clone());
+        if let Expr::TextNum(inner, cs) = l.as_ref() {
+            **l = Expr::TextNumKey(inner.clone(), *cs);
+        } else if let Expr::TextNum(inner, cs) = r.as_ref() {
+            **r = Expr::TextNumKey(inner.clone(), *cs);
         }
     }
 }
@@ -31104,8 +31107,17 @@ const GDS_CONVERT_ERROR: i32 = 335544334;
 /// -204/-206 unknown-name arguments and the -104 token all carry the
 /// raw byte on the engine's own wire.
 fn conversion_error_arg(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for b in text.bytes() {
+    conversion_error_arg_bytes(text.as_bytes())
+}
+
+/// The byte form [conversion_error_arg] wraps: what the engine escapes
+/// is the value's bytes IN ITS OWN CHARACTER SET, so a raise site that
+/// knows the source charset re-encodes first
+/// ([EvalErr::ConversionErrorBytes]) and only the UTF-8-sourced sites
+/// take the &str shortcut above.
+fn conversion_error_arg_bytes(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len());
+    for &b in bytes {
         if (0x20..=0x7f).contains(&b) {
             out.push(b as char);
         } else {
@@ -31113,6 +31125,48 @@ fn conversion_error_arg(text: &str) -> String {
         }
     }
     out
+}
+
+/// Build the 22018 conversion error spelling the value in its OWN
+/// character set. `cs` is the charset the text value was decoded from:
+/// a byte carrier's chars ARE its bytes (`carrier_encode`), a tabled
+/// set's bytes come back through its codepage table, and anything else
+/// (UTF8 above all) keeps the String's UTF-8 - the engine's own
+/// spelling for each, probed per charset. A value that will not
+/// re-encode (impossible for one decoded FROM that set; defensive)
+/// falls back to the UTF-8 spelling rather than losing the argument.
+/// The charset to stamp on a TextNum/TextBool/Cast wrapper for its
+/// 22018 spelling: a bare text COLUMN of a byte-carrier or tabled
+/// single-byte set answers that set; every other shape (literals,
+/// UTF8 and multibyte columns, expressions - whose result charset
+/// fire-crab does not track) answers `CS_UTF8`, which [conv_err]
+/// spells as the String's UTF-8 bytes, the pre-existing behaviour.
+fn err_spell_charset(e: &Expr, descs: &[Descriptor]) -> u8 {
+    use fire_crab_ods::intl::{byte_carrier, charset_id, tabled, CS_UTF8};
+    if let Expr::Col(fid) = e {
+        if let Some(d) = descs.get(*fid) {
+            if matches!(d.dtype, dtype::TEXT | dtype::VARYING) {
+                let cs = charset_id(d.sub_type);
+                if byte_carrier(cs) || tabled(cs) {
+                    return cs;
+                }
+            }
+        }
+    }
+    CS_UTF8
+}
+
+fn conv_err(cs: u8, s: String) -> EvalErr {
+    use fire_crab_ods::intl;
+    let bytes = if intl::byte_carrier(cs) {
+        intl::carrier_encode(&s)
+    } else {
+        intl::encode_text(cs, &s).ok().flatten()
+    };
+    match bytes {
+        Some(b) => EvalErr::ConversionErrorBytes(b),
+        None => EvalErr::ConversionError(Some(s)),
+    }
 }
 
 /// isc_sing_select_err - "multiple rows in singleton select" (SQLSTATE
@@ -31353,6 +31407,12 @@ fn eval_status_items(w: &mut W, e: &EvalErr) {
                 // the engine escapes the unprintable bytes on the way in
                 .int(2)
                 .bytes(conversion_error_arg(text).as_bytes());
+        }
+        EvalErr::ConversionErrorBytes(raw) => {
+            w.int(1) // isc_arg_gds
+                .int(GDS_CONVERT_ERROR)
+                .int(2)
+                .bytes(conversion_error_arg_bytes(raw).as_bytes());
         }
         EvalErr::ConversionError(None) | EvalErr::Unsupported => {
             w.int(1) // isc_arg_gds
@@ -31828,7 +31888,7 @@ fn param_to_expr(p: &WireParam) -> Option<Expr> {
 fn expr_has_param(e: &Expr) -> bool {
     match e {
         Expr::Param(_) => true,
-        Expr::Neg(a) | Expr::Cast(a, _) => expr_has_param(a),
+        Expr::Neg(a) | Expr::Cast(a, _, _) => expr_has_param(a),
         Expr::Bin(a, _, b) | Expr::Concat(a, b) | Expr::NullIf(a, b) => {
             expr_has_param(a) || expr_has_param(b)
         }
@@ -31846,7 +31906,7 @@ fn subst_params_expr(e: &Expr, args: &[WireParam]) -> Option<Expr> {
     Some(match e {
         Expr::Param(i) => param_to_expr(args.get(*i)?)?,
         Expr::Neg(a) => Expr::Neg(Box::new(subst_params_expr(a, args)?)),
-        Expr::Cast(a, t) => Expr::Cast(Box::new(subst_params_expr(a, args)?), *t),
+        Expr::Cast(a, t, cs) => Expr::Cast(Box::new(subst_params_expr(a, args)?), *t, *cs),
         Expr::Bin(a, op, b) => Expr::Bin(
             Box::new(subst_params_expr(a, args)?),
             *op,
@@ -33310,7 +33370,7 @@ fn expr_contains_genval(e: &Expr) -> bool {
     }
     match e {
         Expr::GenVal(_) => true,
-        Expr::Neg(a) | Expr::Cast(a, _) => expr_contains_genval(a),
+        Expr::Neg(a) | Expr::Cast(a, _, _) => expr_contains_genval(a),
         Expr::Bin(a, _, b) | Expr::Concat(a, b) | Expr::NullIf(a, b) => {
             expr_contains_genval(a) || expr_contains_genval(b)
         }
@@ -35927,9 +35987,13 @@ fn resolve_proj_expr(
         RawExpr::Cast(inner, t) => {
             if let RawExpr::Param(i) = &**inner {
                 set(sink, *i, cast_target_descriptor(t)?);
-                Expr::Cast(Box::new(Expr::Param(*i)), *t)
+                Expr::Cast(Box::new(Expr::Param(*i)), *t, fire_crab_ods::intl::CS_UTF8)
             } else {
-                Expr::Cast(Box::new(resolve_proj_expr(inner, columns, descs, sink)?), *t)
+                {
+                    let e = resolve_proj_expr(inner, columns, descs, sink)?;
+                    let cs = err_spell_charset(&e, descs);
+                    Expr::Cast(Box::new(e), *t, cs)
+                }
             }
         }
         RawExpr::Neg(a) => Expr::Neg(Box::new(resolve_proj_expr(a, columns, descs, sink)?)),
@@ -36025,7 +36089,11 @@ fn resolve_expr_inner(
             Box::new(resolve_expr(a, columns, descs)?),
             Box::new(resolve_expr(b, columns, descs)?),
         ),
-        RawExpr::Cast(e, t) => Expr::Cast(Box::new(resolve_expr(e, columns, descs)?), *t),
+        RawExpr::Cast(e, t) => {
+            let inner = resolve_expr(e, columns, descs)?;
+            let cs = err_spell_charset(&inner, descs);
+            Expr::Cast(Box::new(inner), *t, cs)
+        }
         RawExpr::Coalesce(args) => Expr::Coalesce(
             args.iter()
                 .map(|a| resolve_expr(a, columns, descs))
@@ -36149,8 +36217,16 @@ enum Expr {
     Bin(Box<Expr>, ArithOp, Box<Expr>),
     /// `a || b` - both operands coerced to text, NULL-propagating
     Concat(Box<Expr>, Box<Expr>),
-    /// `CAST(a AS <type>)` - convert the operand to the target type
-    Cast(Box<Expr>, CastTarget),
+    /// `CAST(a AS <type>)` - convert the operand to the target type.
+    /// The `u8` is the SOURCE's character set when the operand is a
+    /// text COLUMN of a byte-carrier or tabled single-byte set (else
+    /// `CS_UTF8`): the engine's 22018 argument spells the value's
+    /// bytes IN ITS OWN CHARSET (probed: a WIN1252 'é2' spells #xe92
+    /// through a UTF8 attachment, a NONE C2 A0 32 spells #xc2#xa02,
+    /// a UTF8 'é2' spells #xc3#xa92), so the raise site needs the
+    /// charset the value was decoded from - stamped at resolution,
+    /// where the descriptor is, the [SysFn::OctetLengthCs] precedent.
+    Cast(Box<Expr>, CastTarget, u8),
     /// `COALESCE(a, b, ...)` - the first non-NULL operand
     Coalesce(Vec<Expr>),
     /// `NULLIF(a, b)` - NULL when equal, else `a`
@@ -36197,7 +36273,9 @@ enum Expr {
     /// capital-X hex an orders-high sentinel. This is what fixes
     /// `5 = S`, `NAME = ID`, `ON A.S = B.ID` and `S = D` - all probed
     /// wrong (rendered-text rows or refusals) before it.
-    TextNum(Box<Expr>),
+    /// The `u8` is the text side's charset for the 22018 spelling,
+    /// as on [Expr::Cast].
+    TextNum(Box<Expr>, u8),
     /// The STRICT twin of [Expr::TextNum], for a text side that the
     /// engine reads as a HASH KEY rather than as a comparison operand.
     ///
@@ -36215,12 +36293,13 @@ enum Expr {
     /// sibling answers, and a silent fallback in `type_of`/`rank_of`/
     /// `result_scale` would be a wrong ANSWER rather than a compile
     /// error - the law this file states for every new [Expr].
-    TextNumKey(Box<Expr>),
+    TextNumKey(Box<Expr>, u8),
     /// The BOOLEAN sibling: a text side against a BOOLEAN side
     /// converts per row by trimmed case-insensitive TRUE/FALSE
     /// (probed: 'true', ' True ', 'FALSE' convert; '1', 't', '5'
     /// raise 22018; NULL is UNKNOWN).
-    TextBool(Box<Expr>),
+    /// The `u8` is the text side's charset for the 22018 spelling.
+    TextBool(Box<Expr>, u8),
 }
 
 /// A resolved [RawCond].
@@ -36331,6 +36410,15 @@ enum EvalErr {
     /// `conversion error from string "pear"` - without it the client
     /// shows a missing-argument placeholder.
     ConversionError(Option<String>),
+    /// The same `isc_convert_error` vector, but the offending value
+    /// carried as the BYTES OF ITS OWN CHARACTER SET rather than a
+    /// Rust string's UTF-8. The engine's CVT_conversion_error renders
+    /// the value before transliteration to the attachment set (probed:
+    /// a WIN1252 column's 'é2' spells `#xe92` even through a UTF8
+    /// attachment; a NONE column's C2 A0 32 spells `#xc2#xa02` where
+    /// the carrier String's UTF-8 would spell `#xc3#x82#xc2#xa02`).
+    /// Raised by the sites that know the source charset - [conv_err].
+    ConversionErrorBytes(Vec<u8>),
     /// an exact-numeric result that left its announced range - an INT64
     /// sum past `i64`, or an operation past `i128`:
     /// `isc_exception_integer_overflow` (SQLSTATE 22003)
@@ -36765,8 +36853,8 @@ fn is_decfloat_arith(e: &Expr, descs: &[Descriptor]) -> bool {
             // a CAST to DECFLOAT is a decimal leaf (so `CAST(x AS DECFLOAT)
             // + 1` promotes); a CAST to an exact-numeric type is an ordinary
             // numeric leaf whatever it wraps (the result is that type)
-            Expr::Cast(_, CastTarget::DecFloat { .. }) => true,
-            Expr::Cast(_, CastTarget::Int { .. } | CastTarget::Numeric { .. }) => false,
+            Expr::Cast(_, CastTarget::DecFloat { .. }, _) => true,
+            Expr::Cast(_, CastTarget::Int { .. } | CastTarget::Numeric { .. }, _) => false,
             _ => return None,
         })
     }
@@ -38085,10 +38173,10 @@ impl Expr {
             // the wrapped text side answers a NUMBER (a BOOLEAN for
             // the sibling) - that is the point of the wrap; the inner
             // side must still type
-            Expr::TextNum(e) | Expr::TextNumKey(e) => {
+            Expr::TextNum(e, _) | Expr::TextNumKey(e, _) => {
                 e.type_of(descs).map(|_| ExprType::Numeric)
             }
-            Expr::TextBool(e) => e.type_of(descs).map(|_| ExprType::Bool),
+            Expr::TextBool(e, _) => e.type_of(descs).map(|_| ExprType::Bool),
             Expr::Null => Some(ExprType::Int),
             Expr::DateLit(_) => Some(ExprType::Temporal(TKind::Date)),
             Expr::TimeLit(_) => Some(ExprType::Temporal(TKind::Time)),
@@ -38154,7 +38242,7 @@ impl Expr {
                 b.type_of(descs)?;
                 Some(ExprType::Text)
             }
-            Expr::Cast(e, t) => {
+            Expr::Cast(e, t, _) => {
                 // the operand must be typeable; the result type is the
                 // cast target. A `?` parameter is the exception - it has
                 // no type of its own and is typed BY this cast, which is
@@ -38310,8 +38398,8 @@ impl Expr {
             Expr::DecFloat34(_) => None,
             Expr::Dec(_, scale) => Some(*scale),
             // a CAST states its own scale - that is what the target IS
-            Expr::Cast(_, CastTarget::Numeric { scale, .. }) => Some(*scale),
-            Expr::Cast(_, CastTarget::Int { .. }) => Some(0),
+            Expr::Cast(_, CastTarget::Numeric { scale, .. }, _) => Some(*scale),
+            Expr::Cast(_, CastTarget::Int { .. }, _) => Some(0),
             // A CONDITIONAL'S SCALE IS ITS WIDEST BRANCH'S. Scales are
             // negative (12.50 is scale -2), so "widest" is the MINIMUM -
             // taking anything narrower would truncate a branch's value
@@ -38399,7 +38487,7 @@ impl Expr {
             // the per-row coercion wrappers have no STATIC rank - the
             // value's width is decided by each row's text. They live
             // only inside WHERE comparisons, never in a describe.
-            Expr::TextNum(_) | Expr::TextNumKey(_) | Expr::TextBool(_) => None,
+            Expr::TextNum(_, _) | Expr::TextNumKey(_, _) | Expr::TextBool(_, _) => None,
             Expr::Coalesce(args) => args.iter().filter_map(|a| a.rank_of(descs)).max(),
             Expr::Case(branches, else_) => branches
                 .iter()
@@ -38461,7 +38549,7 @@ impl Expr {
                     }
                 })
             }
-            Expr::Cast(_, t) => match t {
+            Expr::Cast(_, t, _) => match t {
                 // BIGINT ranks I64; a NUMERIC past precision 18 is stored
                 // as INT128 and must announce that width, or the value
                 // travels in a slot too narrow to hold it
@@ -38599,7 +38687,7 @@ impl Expr {
             // exactly through num_cmp, a double one through the
             // approx promotion, and a bad one raises 22018 carrying
             // the raw (CHAR-padded) value
-            Expr::TextNum(e) => match e.eval(values)? {
+            Expr::TextNum(e, cs) => match e.eval(values)? {
                 Value::Null => Value::Null,
                 Value::Text(s) => match text_col_num(&s) {
                     ColNum::Exact(m, sc) => match i8::try_from(sc) {
@@ -38611,16 +38699,14 @@ impl Expr {
                     },
                     ColNum::Dbl(d) => Value::Double(d),
                     ColNum::HexHigh => Value::Double(f64::MAX),
-                    ColNum::Raise => {
-                        return Err(EvalErr::ConversionError(Some(s)))
-                    }
+                    ColNum::Raise => return Err(conv_err(*cs, s)),
                 },
                 v => v, // a non-text value passes through (defensive)
             },
             // the KEY twin: the CAST/store grammar decides, so a
             // spelling the compare grammar would have taken (interior
             // blanks) raises here, as the engine's hash build does
-            Expr::TextNumKey(e) => match e.eval(values)? {
+            Expr::TextNumKey(e, cs) => match e.eval(values)? {
                 Value::Null => Value::Null,
                 Value::Text(s) => match text_number(&s) {
                     // the same shapes [Expr::TextNum] produces, so the
@@ -38633,12 +38719,12 @@ impl Expr {
                     // a hex literal is the orders-high sentinel its
                     // sibling uses, not a value
                     Some(TextNum::Hex { .. }) => Value::Double(f64::MAX),
-                    None => return Err(EvalErr::ConversionError(Some(s))),
+                    None => return Err(conv_err(*cs, s)),
                 },
                 v => v, // a non-text value passes through (defensive)
             },
             // the boolean sibling: trimmed case-insensitive TRUE/FALSE
-            Expr::TextBool(e) => match e.eval(values)? {
+            Expr::TextBool(e, cs) => match e.eval(values)? {
                 Value::Null => Value::Null,
                 Value::Text(s) => {
                     let t = s.trim();
@@ -38647,7 +38733,7 @@ impl Expr {
                     } else if t.eq_ignore_ascii_case("false") {
                         Value::Bool(false)
                     } else {
-                        return Err(EvalErr::ConversionError(Some(s)));
+                        return Err(conv_err(*cs, s));
                     }
                 }
                 v => v,
@@ -38850,7 +38936,7 @@ impl Expr {
                 (Value::Null, _) | (_, Value::Null) => Value::Null,
                 (x, y) => Value::Text(format!("{}{}", x.render(), y.render())),
             },
-            Expr::Cast(e, t) => {
+            Expr::Cast(e, t, cs) => {
                 let v = e.eval(values)?;
                 if matches!(v, Value::Null) {
                     return Ok(Value::Null); // NULL casts to NULL of any type
@@ -38875,7 +38961,7 @@ impl Expr {
                         let dec = if let Value::Text(s) = &v {
                             match text_to_dec128(s) {
                                 Some(bits) => fire_crab_ods::decfloat::decode_dec128(bits),
-                                None => return Err(EvalErr::ConversionError(Some(s.clone()))),
+                                None => return Err(conv_err(*cs, s.clone())),
                             }
                         } else {
                             value_as_dec(&v).ok_or(EvalErr::ConversionError(None))?
@@ -38931,7 +39017,7 @@ impl Expr {
                                     Some(x) => fit(x)?,
                                     None => return Err(EvalErr::NumericOutOfRange),
                                 },
-                                None => return Err(EvalErr::ConversionError(Some(s))),
+                                None => return Err(conv_err(*cs, s)),
                             },
                             // an approximate source rounds the same way -
                             // Rust's `round` is half away from zero, which
@@ -39019,7 +39105,7 @@ impl Expr {
                     CastTarget::Numeric { scale, bytes, .. } => {
                         let (raw, from) = match &v {
                             Value::Text(t) => decimal_parts(t)
-                                .ok_or_else(|| EvalErr::ConversionError(Some(t.clone())))?,
+                                .ok_or_else(|| conv_err(*cs, t.clone()))?,
                             // an approximate source rounds at the target
                             // scale directly - it has no exact form to
                             // rescale from
@@ -39055,7 +39141,7 @@ impl Expr {
                         }
                         Value::Text(t) => match t.trim_matches(' ').parse::<f64>() {
                             Ok(d) => Value::Double(d),
-                            Err(_) => return Err(EvalErr::ConversionError(Some(t.clone()))),
+                            Err(_) => return Err(conv_err(*cs, t.clone())),
                         },
                         other => match numeric_parts(other) {
                             Some((raw, sc)) => {
@@ -39071,7 +39157,7 @@ impl Expr {
                     // does not compare with one - the engine would use
                     // the CURRENT DATE, which this server does not do.
                     CastTarget::Temporal(k) => {
-                        let bad = |v: &Value| EvalErr::ConversionError(Some(v.render()));
+                        let bad = |v: &Value| conv_err(*cs, v.render());
                         match (k, &v) {
                             (TKind::Date, Value::Date(d)) => Value::Date(*d),
                             (TKind::Date, Value::Timestamp(d, _)) => Value::Date(*d),
@@ -46989,7 +47075,8 @@ fn resolve_expr_term(
                 params.resize(*slot + 1, None);
             }
             params[*slot] = Some(desc);
-            return Some(Term::ExprParam(Box::new(lhs), *op, *slot, kind));
+            let cs = err_spell_charset(&lhs, descs);
+            return Some(Term::ExprParam(Box::new(lhs), *op, *slot, kind, cs));
         }
         RawKind::Cmp(op, rhs) => {
             let (l, r) = cmp_sides(lhs, rhs_expr(rhs)?, descs)?;
@@ -47215,7 +47302,8 @@ fn cmp_sides(lhs: Expr, rhs: Expr, descs: &[Descriptor]) -> Option<(Expr, Expr)>
                 let r = approx_literal(&rhs)?;
                 Some((lhs, r))
             } else {
-                Some((lhs, Expr::TextNum(Box::new(rhs))))
+                let cs = err_spell_charset(&rhs, descs);
+                Some((lhs, Expr::TextNum(Box::new(rhs), cs)))
             }
         }
         (ExprType::Text, ExprType::Approx) => {
@@ -47223,7 +47311,8 @@ fn cmp_sides(lhs: Expr, rhs: Expr, descs: &[Descriptor]) -> Option<(Expr, Expr)>
                 let l = approx_literal(&lhs)?;
                 Some((l, rhs))
             } else {
-                Some((Expr::TextNum(Box::new(lhs)), rhs))
+                let cs = err_spell_charset(&lhs, descs);
+                Some((Expr::TextNum(Box::new(lhs), cs), rhs))
             }
         }
         (ExprType::Approx, _) | (_, ExprType::Approx) => None,
@@ -47240,7 +47329,8 @@ fn cmp_sides(lhs: Expr, rhs: Expr, descs: &[Descriptor]) -> Option<(Expr, Expr)>
                 let r = bool_literal(&rhs)?;
                 Some((lhs, r))
             } else {
-                Some((lhs, Expr::TextBool(Box::new(rhs))))
+                let cs = err_spell_charset(&rhs, descs);
+                Some((lhs, Expr::TextBool(Box::new(rhs), cs)))
             }
         }
         (ExprType::Text, ExprType::Bool) => {
@@ -47248,7 +47338,8 @@ fn cmp_sides(lhs: Expr, rhs: Expr, descs: &[Descriptor]) -> Option<(Expr, Expr)>
                 let l = bool_literal(&lhs)?;
                 Some((l, rhs))
             } else {
-                Some((Expr::TextBool(Box::new(lhs)), rhs))
+                let cs = err_spell_charset(&lhs, descs);
+                Some((Expr::TextBool(Box::new(lhs), cs), rhs))
             }
         }
         (ExprType::Bool, _) | (_, ExprType::Bool) => None,
@@ -47275,7 +47366,8 @@ fn cmp_sides(lhs: Expr, rhs: Expr, descs: &[Descriptor]) -> Option<(Expr, Expr)>
                 let r = num_literal_expr(s)?;
                 Some((lhs, r))
             } else {
-                Some((lhs, Expr::TextNum(Box::new(rhs))))
+                let cs = err_spell_charset(&rhs, descs);
+                Some((lhs, Expr::TextNum(Box::new(rhs), cs)))
             }
         }
         (ExprType::Text, ExprType::Int | ExprType::Numeric) => {
@@ -47283,7 +47375,8 @@ fn cmp_sides(lhs: Expr, rhs: Expr, descs: &[Descriptor]) -> Option<(Expr, Expr)>
                 let l = num_literal_expr(s)?;
                 Some((l, rhs))
             } else {
-                Some((Expr::TextNum(Box::new(lhs)), rhs))
+                let cs = err_spell_charset(&lhs, descs);
+                Some((Expr::TextNum(Box::new(lhs), cs), rhs))
             }
         }
         _ => Some((lhs, rhs)),
@@ -47391,7 +47484,7 @@ fn expr_no_raise(e: &Expr, descs: &[Descriptor]) -> bool {
         // exactly their value-gated engine behavior, carried by the
         // error-propagating term paths, never admitted where a raise
         // cannot travel
-        Expr::TextNum(_) | Expr::TextNumKey(_) | Expr::TextBool(_) => false,
+        Expr::TextNum(_, _) | Expr::TextNumKey(_, _) | Expr::TextBool(_, _) => false,
         Expr::Neg(x) => expr_no_raise(x, descs),
         // arithmetic can overflow / divide by zero; CAST can fail
         Expr::Bin(..) | Expr::Cast(..) => false,
@@ -52488,7 +52581,7 @@ mod tests {
         let padded = pad_conditional(all_char, &descs);
         assert!(matches!(
             padded,
-            Expr::Cast(_, CastTarget::Text { len: 6, pad: true, .. })
+            Expr::Cast(_, CastTarget::Text { len: 6, pad: true, .. }, _)
         ));
         assert_eq!(padded.eval(&[]).unwrap(), Value::Text("ab    ".into()));
         assert!(!matches!(pad_conditional(mixed, &descs), Expr::Cast(..)));
@@ -52648,13 +52741,14 @@ mod tests {
             ),
             &descs,
         );
-        assert!(matches!(cond, Expr::Cast(_, CastTarget::Text { len: 3, pad: true, .. })));
+        assert!(matches!(cond, Expr::Cast(_, CastTarget::Text { len: 3, pad: true, .. }, _)));
         assert_eq!(text_form(&cond, &descs), Some((false, 3, TfCs::Att)));
         assert_eq!(text_form_oct(&cond, &descs), Some((false, 6, TfCs::Att)));
         // a USER cast declares its own width in either measure
         let cast = Expr::Cast(
             Box::new(lit(three)),
             CastTarget::Text { len: 10, pad: false, synthetic: false },
+            fire_crab_ods::intl::CS_UTF8,
         );
         assert_eq!(text_form(&cast, &descs), Some((true, 10, TfCs::Att)));
         assert_eq!(text_form_oct(&cast, &descs), Some((true, 10, TfCs::Att)));
@@ -53657,7 +53751,7 @@ mod tests {
     // NULL-transparent and raise 22018 with the raw value otherwise.
     #[test]
     fn expr_textnum_and_textbool_convert_per_row() {
-        let tn = Expr::TextNum(Box::new(Expr::Col(0)));
+        let tn = Expr::TextNum(Box::new(Expr::Col(0)), fire_crab_ods::intl::CS_UTF8);
         assert_eq!(tn.eval(&[Value::Text("5.0".into())]).unwrap(), Value::Int128(50, -1));
         assert_eq!(tn.eval(&[Value::Text("02".into())]).unwrap(), Value::Int128(2, 0));
         assert_eq!(tn.eval(&[Value::Text("1e3".into())]).unwrap(), Value::Double(1000.0));
@@ -53669,7 +53763,7 @@ mod tests {
         );
         // the wrap keeps its term row-dependent - the value gate
         assert!(expr_has_col(&tn));
-        let tb = Expr::TextBool(Box::new(Expr::Col(0)));
+        let tb = Expr::TextBool(Box::new(Expr::Col(0)), fire_crab_ods::intl::CS_UTF8);
         assert_eq!(tb.eval(&[Value::Text(" True ".into())]).unwrap(), Value::Bool(true));
         assert_eq!(tb.eval(&[Value::Text("FALSE".into())]).unwrap(), Value::Bool(false));
         assert_eq!(tb.eval(&[Value::Null]).unwrap(), Value::Null);
@@ -56557,7 +56651,7 @@ mod tests {
             let raw = parse_raw_expr("CAST(NAME AS INTEGER)").unwrap();
             assert!(matches!(
                 resolve_expr(&raw, &columns, &descs).unwrap().eval(&row),
-                Err(EvalErr::ConversionError(Some(ref t))) if t == "x"
+                Err(EvalErr::ConversionErrorBytes(ref b)) if b == b"x"
             ));
         }
         // a NUMERIC too wide for the target text is a conversion error that
@@ -57736,7 +57830,7 @@ mod tests {
         assert_eq!(explicit.eval(&named_row(" True ")).unwrap(), Some(true));
         assert_eq!(
             explicit.eval(&named_row("1")),
-            Err(EvalErr::ConversionError(Some("1".into())))
+            Err(EvalErr::ConversionErrorBytes(b"1".to_vec()))
         );
     }
 
