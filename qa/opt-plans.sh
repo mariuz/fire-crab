@@ -43,7 +43,18 @@ CREATE TABLE CS (X INTEGER, Y INTEGER);
 CREATE TABLE SMALLT (X INTEGER);
 CREATE INDEX IDX_CS_XY ON CS (X, Y);
 CREATE INDEX IDX_SMALLT_X ON SMALLT (X);
+-- TP is POPULATED with two single-column indexes and an unindexed
+-- column: the fixture for the OR-union spelling and the navigate-vs-sort
+-- decision, which flips between an empty table (T above) and a real one
+CREATE TABLE TP (PID INTEGER, PAMT INTEGER, PK INTEGER);
+CREATE INDEX IDX_TP_PID ON TP (PID);
+CREATE INDEX IDX_TP_PAMT ON TP (PAMT);
 COMMIT;
+SET TERM ^ ;
+EXECUTE BLOCK AS DECLARE I INTEGER = 0; BEGIN
+  WHILE (I < 500) DO BEGIN I = I + 1; INSERT INTO TP VALUES (:I, MOD(:I,50), :I); END
+END^
+SET TERM ; ^
 SET TERM ^ ;
 EXECUTE BLOCK AS DECLARE I INTEGER = 0; BEGIN
   WHILE (I < 5000) DO BEGIN I = I + 1; INSERT INTO CS VALUES (MOD(:I,10), :I); END
@@ -447,5 +458,30 @@ acheck "SELECT A.ID FROM A LEFT JOIN B ON A.BX = B.ID"
 acheck "SELECT A.ID FROM A RIGHT JOIN B ON A.BX = B.ID"
 acheck "SELECT A.ID FROM A FULL JOIN B ON A.BX = B.ID"
 acheck "SELECT A.ID FROM A LEFT JOIN B ON A.BX = B.ID LEFT JOIN C ON B.CX = C.ID"
+
+# --- the OR union's spelling, and navigate-vs-sort ---------------------
+# An OR is ONE INVERSION PER BRANCH, listed in BRANCH order - the same
+# index twice for two branches on it, and `PAMT = 2 OR PID = 5` prints
+# PAMT first. An AND's conjuncts on one index combine and print once.
+check "SELECT PID FROM TP WHERE PID = 5 OR PID = 7"
+check "SELECT PID FROM TP WHERE PAMT = 2 OR PID = 5"
+check "SELECT PID FROM TP WHERE PID = 5 OR PID = 7 OR PID = 9"
+# Navigation on a POPULATED table rides any fully-indexed filter, its
+# other inversions listed beside it (`ORDER ... INDEX (...)`); an
+# unindexed conjunct sends the plan to the SORT. On the EMPTY T above the
+# same shapes sort whenever anything is listed - the engine's
+# applyNavigation cost flip, measured on both fixtures.
+check "SELECT PID FROM TP WHERE PAMT = 2 ORDER BY PID"
+check "SELECT PID FROM TP WHERE PAMT > 3 ORDER BY PID"
+check "SELECT PID FROM TP WHERE PID = 5 OR PID = 7 ORDER BY PID"
+check "SELECT PID FROM TP WHERE PAMT = 2 OR PAMT = 3 ORDER BY PID"
+check "SELECT PID FROM TP WHERE PID = 5 AND PAMT = 2 ORDER BY PID"
+check "SELECT PID FROM TP WHERE PK = 9 ORDER BY PID"
+check "SELECT PID FROM TP WHERE PK = 9 AND PID = 5 ORDER BY PID"
+check "SELECT PID FROM TP WHERE PID = 5 OR PK = 9 ORDER BY PID"
+check "SELECT PID FROM TP WHERE PID = 5 ORDER BY PID"
+# ... and the EMPTY-table side of the flip, on T
+check "SELECT ID FROM T WHERE AMT = 2 ORDER BY ID"
+check "SELECT ID FROM T WHERE ID = 5 OR ID = 7 ORDER BY ID"
 
 exit $fail

@@ -95,9 +95,13 @@ measured or pinned items**, each recorded in its own place below:
   38.5 to 25.6 ms (~33%, the copy through `Plan::Rows` gone), and peak
   memory from O(result) to O(batch) — the scalability wall a large result
   hit. R8's "the fetch pulls the tree" is real for the shape it fits;
-- **the optimizer's stale-statistics region** — statistics non-zero but
-  WRONG are unmeasured, needing their own fixture family (load,
-  `SET STATISTICS`, grow);
+- **the optimizer's stale-statistics region** — ~~statistics non-zero but
+  WRONG are unmeasured~~ MEASURED (`qa/opt-stale.sh`, the load /
+  `SET STATISTICS` / grow fixture family): fcopt reads the stale figure
+  the way the engine reads it across the single-table surface and the
+  unfiltered join; the ONE named gap is the filtered-driver join, where
+  the engine's loop cost is nearly independent of the stale figure — see
+  the stale-statistics section below;
 - **the two R8 tails** — `NestedLoopJoin` still materialises for RIGHT and
   FULL, and the fetch is a PUSH with a `Flow::Stop` rather than the
   engine's row-by-row pull across the wire (observationally equal for
@@ -609,11 +613,48 @@ of those boundaries.
   fcopt's stale guard tests `sa == 0.0`, so an index whose statistics
   were computed and then went stale as the table grew takes the ordinary
   costing path with a figure that no longer describes the data. The
-  engine takes its `useDefaultSelectivity == false` branch there. That
-  third region is **entirely unmeasured** — neither the fresh grid nor
-  the stale one reaches it — so nothing currently says whether fcopt is
-  right in it. Measured and named by the grid fleet; it needs its own
-  fixture family (load, `SET STATISTICS`, then grow the table).
+  engine takes its `useDefaultSelectivity == false` branch there.
+  ~~That third region is **entirely unmeasured**.~~ **MEASURED —
+  `qa/opt-stale.sh` is the fixture family** (100 rows at 10 distinct,
+  `SET STATISTICS` snapshots 0.1, then 10,000 all-distinct rows land
+  with no re-analyse: the figure claims one key in ten where the truth
+  is one in ten thousand, at 100x the cardinality it was measured
+  against). NINE cells of the decision surface AGREE — the equality,
+  range, OR-union, navigation and unfiltered-join choices all read the
+  stale figure as the engine reads it. THE ONE THAT DOES NOT, pinned
+  per side in the gate as the region's named gap: a join whose DRIVER
+  is filtered (`B JOIN S ON S.K = B.BK WHERE B.BV = 3`). The engine
+  keeps `JOIN (B NATURAL, S INDEX)` at EVERY stale selectivity probed
+  (0.5, 0.25, 0.1, 0.05, 0.02; it converges with fcopt only at 0.01),
+  while fcopt's loop/hash arithmetic — the one that reproduces the
+  engine's whole fresh-stats 6x6 grid — flips to HASH, because
+  `loop_cost` charges `selectivity * cardinality` per probe and the
+  stale figure makes that enormous. The engine's loop cost is therefore
+  NEARLY INDEPENDENT of the stale figure in this shape, in a way the
+  converted InnerJoin.cpp:192-236 arithmetic does not capture; the
+  gate's CONTROL (same database, statistics refreshed) proves it is the
+  stale figure that flips fcopt, not a general join-cost gap. Closing
+  the arithmetic is the follow-up slice this measurement now anchors.
+
+- **DONE while measuring it — the OR union's plan spelling, and
+  navigate-vs-sort.** Probing the stale fixture surfaced plan-shape gaps
+  orthogonal to statistics (the fresh CONTROL showed them too), all now
+  closed against the live optimizer: an OR is ONE INVERSION PER BRANCH,
+  listed in BRANCH order (`ID = 5 OR ID = 7` prints the index twice,
+  `AMT = 2 OR ID = 5` prints AMT first) where fcopt deduped and
+  id-sorted; a navigated stream carries its filter's other inversions
+  BESIDE it (`Access::Order { nav, filter }`, rendered
+  `ORDER ... INDEX (...)`); and the navigate-vs-sort choice is the
+  engine's applyNavigation COST FLIP, measured on both an empty and a
+  populated fixture: near-empty tables navigate only when NOTHING is
+  listed beside the walk (any listed inversion sorts — the engine's
+  pessimism about relations that look empty at prepare), populated
+  tables navigate any FULLY-INDEXED filter (equality, range and OR
+  alike) and sort on an unindexed conjunct or branch. The band between
+  (a few rows, a listed inversion) is the raw cost arithmetic and is
+  not fully mapped; the 1.0-cardinality threshold is its measured
+  floor. `qa/opt-plans.sh` 91 -> 105 (a populated TP fixture beside the
+  empty T, both sides of the flip pinned).
 
 - **The stale grid's only threshold is the 20→30 step**, which the
   widened size set barely straddles and the old `{0,1,5,50,500,3000}` set

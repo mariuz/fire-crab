@@ -19985,7 +19985,7 @@ fn choose_index_inner(
             Ok(plan) => matches!(
                 plan.streams.as_slice(),
                 [fire_crab_opt::Stream {
-                    access: fire_crab_opt::Access::Index(_) | fire_crab_opt::Access::Order(_),
+                    access: fire_crab_opt::Access::Index(_) | fire_crab_opt::Access::Order { .. },
                     ..
                 }]
             ),

@@ -169,7 +169,13 @@ impl IndexInfo {
 pub enum Access {
     Natural,
     Index(Vec<String>),
-    Order(String),
+    /// NAVIGATION, with the filter's own inversions beside it. The
+    /// engine spells a navigated stream whose WHERE uses OTHER indexes
+    /// (or an OR union) as `ORDER <nav> INDEX (<list>)` - probed:
+    /// `AMT = 2 ORDER BY ID` is `ORDER IDX_ID INDEX (IDX_AMT)`, and
+    /// `ID = 5 OR ID = 7 ORDER BY ID` is `ORDER IDX_ID INDEX (IDX_ID,
+    /// IDX_ID)`. An empty `filter` is plain navigation.
+    Order { nav: String, filter: Vec<String> },
 }
 
 /// How several streams combine (probed): nested-loop JOIN when the
@@ -236,7 +242,14 @@ impl Plan {
             };
             match &st.access {
                 Access::Natural => format!("{} NATURAL", name),
-                Access::Order(i) => format!("{} ORDER {}", name, q(i)),
+                Access::Order { nav, filter } => {
+                    if filter.is_empty() {
+                        format!("{} ORDER {}", name, q(nav))
+                    } else {
+                        let names: Vec<String> = filter.iter().map(|n| q(n)).collect();
+                        format!("{} ORDER {} INDEX ({})", name, q(nav), names.join(", "))
+                    }
+                }
                 Access::Index(list) => {
                     let names: Vec<String> = list.iter().map(|n| q(n)).collect();
                     format!("{} INDEX ({})", name, names.join(", "))
@@ -458,8 +471,8 @@ pub fn plan_query(
     };
 
     // ---- the predicates -------------------------------------------
-    let (preds, all_or_matchable) = match where_s {
-        None => (Vec::new(), true),
+    let (preds, all_or_matchable, is_or) = match where_s {
+        None => (Vec::new(), true, false),
         Some(w) => parse_predicates(w, &|c| !by_col(c).is_empty())?,
     };
     let mut matched: Vec<&IndexInfo> = Vec::new();
@@ -469,13 +482,20 @@ pub fn plan_query(
             // among equals - an ascending index serves a range where
             // a descending twin exists)
             if let Some(i) = by_col(&p.column).into_iter().min_by_key(|i| i.id) {
-                if !matched.iter().any(|m| m.name == i.name) {
+                // an OR union is ONE INVERSION PER BRANCH, listed in
+                // BRANCH order (probed: `ID = 5 OR ID = 7` prints the
+                // index twice; `AMT = 2 OR ID = 5` prints AMT first);
+                // an AND's conjuncts on one index combine into ONE
+                // scan and print once, id-ordered
+                if is_or || !matched.iter().any(|m| m.name == i.name) {
                     matched.push(i);
                 }
             }
         }
     }
-    matched.sort_by_key(|i| i.id);
+    if !is_or {
+        matched.sort_by_key(|i| i.id);
+    }
 
     // ---- the ORDER BY ---------------------------------------------
     let order: Option<Vec<(String, bool)>> = match order_s {
@@ -491,13 +511,58 @@ pub fn plan_query(
             .filter(|i| i.navigates(okeys))
             .min_by_key(|i| i.id);
         if let Some(n) = nav {
-            let predicate_ok = matched.is_empty()
-                || (matched.len() == 1 && matched[0].name == n.name);
-            if predicate_ok && (preds.is_empty() || all_or_matchable) {
+            // WHAT RIDES THE WALK, WHAT SORTS - the engine's
+            // applyNavigation, mapped cell by cell against the live
+            // optimizer. The filter's inversions that cannot merge into
+            // the navigation are its LIST: an AND's nav-index conjuncts
+            // ride and drop out, everything else it matched stays; an
+            // OR's branches ALL stay - the union cannot ride, even on
+            // the nav index itself.
+            let filter: Vec<String> = if is_or {
+                matched.iter().map(|i| i.name.clone()).collect()
+            } else {
+                matched
+                    .iter()
+                    .filter(|i| i.name != n.name)
+                    .map(|i| i.name.clone())
+                    .collect()
+            };
+            let every_pred_indexed = preds.iter().all(|p| p.matchable) && all_or_matchable;
+            // The engine then compares the walk against an external sort
+            // (Retrieval.cpp:applyNavigation). Two measured regimes:
+            //
+            //  * a NEAR-EMPTY table (csb_cardinality at its 1.0 floor,
+            //    the fixture every prepared-on-empty statement sees):
+            //    navigation wins ONLY when nothing is listed beside it -
+            //    `NOTE = 'x' ORDER BY ID` navigates (no inversion at
+            //    all: the engine is "pessimistic about a relation that
+            //    looks empty" and avoids the sort), `ID = 5 ORDER BY
+            //    ID` navigates (the equality rides), but ANY listed
+            //    inversion sorts: `AMT = 2` / `AMT > 3` are
+            //    SORT (INDEX (IDX_AMT)) and `ID = 5 OR ID = 7` is
+            //    SORT (INDEX (IDX_ID, IDX_ID)).
+            //
+            //  * a POPULATED table: an UNINDEXED conjunct or branch
+            //    sends the plan to the sort (`K = 9 ORDER BY ID` is
+            //    SORT (NATURAL), `K = 9 AND ID = 5` SORT (INDEX));
+            //    a fully-indexed filter NAVIGATES with its list -
+            //    equality, range and OR alike (`AMT = 2`, `AMT > 3`,
+            //    `AMT = 2 OR AMT = 3` all ORDER ... INDEX (...)).
+            //
+            //  The band between (a few rows, a listed inversion) is the
+            //  engine's raw cost arithmetic and is not fully mapped;
+            //  the 1.0 threshold is its measured floor.
+            let card = cardinality(file, page_size, &table).unwrap_or(1.0);
+            let navigates = if card <= 1.0 {
+                filter.is_empty() && (!is_or || matched.is_empty())
+            } else {
+                every_pred_indexed
+            };
+            if navigates {
                 return Ok(Plan {
                     streams: vec![Stream {
                         name: qualified(&table),
-                        access: Access::Order(n.name.clone()),
+                        access: Access::Order { nav: n.name.clone(), filter },
                     }],
                     combine: Combine::Single,
                     sorted: false,
@@ -962,7 +1027,7 @@ fn plan_join(
             .filter(|i| i.navigates(&[(ocol.clone(), odesc)]))
             .min_by_key(|i| i.id)
         {
-            drive_access = Access::Order(i.name.clone());
+            drive_access = Access::Order { nav: i.name.clone(), filter: Vec::new() };
             sorted = false;
         }
     }
@@ -1435,7 +1500,7 @@ fn plan_chain(
                     .filter(|x| x.navigates(&[(c.clone(), *odesc)]))
                     .min_by_key(|x| x.id)
                 {
-                    access = Access::Order(i.name.clone());
+                    access = Access::Order { nav: i.name.clone(), filter: Vec::new() };
                     sorted = false;
                     break;
                 }
@@ -1979,7 +2044,7 @@ fn qualified(table: &str) -> String {
 fn parse_predicates(
     w: &str,
     indexed: &dyn Fn(&str) -> bool,
-) -> Result<(Vec<Pred>, bool), String> {
+) -> Result<(Vec<Pred>, bool, bool), String> {
     if w.contains('(') {
         return Err("parenthesized predicates unconverted".into());
     }
@@ -2014,7 +2079,7 @@ fn parse_predicates(
         preds.push(parse_one_predicate(p.trim(), indexed)?);
     }
     let all_matchable = preds.iter().all(|p| p.matchable);
-    Ok((preds, if is_or { all_matchable } else { true }))
+    Ok((preds, if is_or { all_matchable } else { true }, is_or))
 }
 
 fn parse_one_predicate(
@@ -2231,7 +2296,7 @@ mod tests {
             "PLAN SORT (\"PUBLIC\".\"T\" INDEX (\"PUBLIC\".\"IDX_A\", \"PUBLIC\".\"IDX_B\"))"
         );
         assert_eq!(
-            single(Access::Order("IDX_A".into()), false).render(),
+            single(Access::Order { nav: "IDX_A".into(), filter: Vec::new() }, false).render(),
             "PLAN (\"PUBLIC\".\"T\" ORDER \"PUBLIC\".\"IDX_A\")"
         );
     }
@@ -2289,12 +2354,12 @@ mod tests {
     #[test]
     fn an_unmatchable_or_branch_spoils_the_clause() {
         let indexed = |c: &str| c == "ID";
-        let (_, ok) = parse_predicates("ID = 5 OR NAME = 'x'", &indexed).unwrap();
+        let (_, ok, _) = parse_predicates("ID = 5 OR NAME = 'x'", &indexed).unwrap();
         assert!(!ok);
-        let (_, ok) = parse_predicates("ID = 5 OR ID = 6", &indexed).unwrap();
+        let (_, ok, _) = parse_predicates("ID = 5 OR ID = 6", &indexed).unwrap();
         assert!(ok);
         // an AND keeps its matchable half regardless
-        let (preds, ok) = parse_predicates("ID = 5 AND NAME = 'x'", &indexed).unwrap();
+        let (preds, ok, _) = parse_predicates("ID = 5 AND NAME = 'x'", &indexed).unwrap();
         assert!(ok);
         assert_eq!(preds.iter().filter(|p| p.matchable).count(), 1);
     }
