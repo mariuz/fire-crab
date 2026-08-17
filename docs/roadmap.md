@@ -2303,6 +2303,40 @@ pulled by the fetch.
   ORDER BY (whose sort must see every combined row, as the engine's does)
   keeps the materialising path.
 
+  **DONE — the boolean grammar closes: truth tests, literals, IS DISTINCT
+  FROM.** Three families the condition-as-a-value grammar (`RawCond`, the
+  one the select list, `IIF` and a searched `CASE WHEN` share) refused:
+  `x IS [NOT] TRUE/FALSE/UNKNOWN`, a bare boolean LITERAL as a condition
+  operand (`B AND TRUE` - `B AND (ID > 1)` already worked), and
+  `x IS [NOT] DISTINCT FROM y`. All three desugar at parse into the
+  Kleene shapes the pipeline already evaluates, with the TWO-valued
+  results a projected value needs: `x IS TRUE` is `x IS NOT NULL AND
+  x = TRUE` (false AND UNKNOWN = false, so a NULL operand answers
+  `<false>`, never `<null>` - probed), `x IS NOT TRUE` is `x IS NULL OR
+  x = FALSE`; NOT-DISTINCT is `(a IS NULL AND b IS NULL) OR (a IS NOT
+  NULL AND b IS NOT NULL AND a = b)` - every arm decided whatever is
+  NULL - and DISTINCT its NOT. The `= TRUE/FALSE` leaf doubles as the
+  TYPE GATE (`cmp_sides` refuses a non-boolean side, as the engine's
+  "Invalid usage of boolean expression" does); `IS [NOT] UNKNOWN` alone
+  needs a carried variant (`RawCond::IsUnknown`), because it is the NULL
+  test with a boolean-ONLY operand - `ID IS UNKNOWN` must refuse at
+  prepare where `ID IS NULL` answers, and only resolution knows the
+  type. The literal fix is one arm each in the two bare-boolean rules
+  (`RawExpr::Bool` beside the bare column, select-list and WHERE), so
+  `WHERE TRUE` / `WHERE FL AND TRUE` answer too. GOTCHA that hid the
+  whole DISTINCT family: the STATEMENT SPLITTER took the first
+  depth-0 FROM as the clause FROM - and `IS DISTINCT FROM` embeds one
+  with no parentheses to hide in (SUBSTRING/TRIM/EXTRACT are all
+  parenthesised), so `SELECT S IS DISTINCT FROM 'x' FROM T` split at
+  the predicate's FROM and refused; a FROM whose preceding word is
+  DISTINCT is now skipped (a legitimate clause FROM is never preceded
+  by the bare keyword). Pinned by `serve-real-boolvalue.sh` +23
+  (51 -> 74): the truth-test matrix over a NULL operand, the literal
+  operands under the Kleene fold, the DISTINCT family including
+  NULL-vs-NULL and both-columns, IIF/CASE composition, `SELECT
+  DISTINCT` still the modifier, `WHERE TRUE/FALSE`, and the two
+  boolean-only-operand refusals (engine-probed SQLSTATE 22000).
+
   ~~The next thing worth doing here is a boundary the gates already pin:
   the engine raises a blocking node's error at OPEN, where this server
   announces the result set and raises at the first FETCH.~~

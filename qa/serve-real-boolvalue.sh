@@ -205,6 +205,43 @@ both "arithmetic still parses as arithmetic" \
 both "and the WHERE grammar is unchanged" \
      "SELECT ID FROM T WHERE (ID + 1) > 2 AND NAME LIKE 'b%' ORDER BY ID"
 
+# --- 9. truth tests, boolean literals, IS DISTINCT FROM ----------------
+# `IS [NOT] TRUE/FALSE` are TWO-valued: a NULL operand answers false (or
+# true under NOT), never UNKNOWN - row 3's NULL B separates them from
+# `= TRUE`, which stays three-valued. `IS [NOT] UNKNOWN` is the NULL
+# test with the engine's boolean-only operand rule. A boolean LITERAL is
+# a condition operand like any other (`B AND TRUE`), which only shows
+# once the fold is Kleene's (`NULL AND TRUE` is UNKNOWN, `NULL OR TRUE`
+# is TRUE).
+val "B IS TRUE"
+val "B IS NOT TRUE"
+val "B IS FALSE"
+val "B IS NOT FALSE"
+val "B IS UNKNOWN"
+val "B IS NOT UNKNOWN"
+val "B AND TRUE"
+val "FALSE OR C"
+val "B AND NOT FALSE"
+# IS [NOT] DISTINCT FROM is the NULL-SAFE comparison, two-valued too:
+# a NULL side DECIDES (row 3 against 'cc' is distinct, not UNKNOWN),
+# and NULL against NULL is not-distinct
+val "NAME IS DISTINCT FROM 'aa'"
+val "NAME IS NOT DISTINCT FROM 'aa'"
+val "B IS DISTINCT FROM C"
+val "B IS NOT DISTINCT FROM C"
+val "B IS DISTINCT FROM NULL"
+val "B IS DISTINCT FROM TRUE"
+both "IS TRUE inside an IIF" "SELECT ID, IIF(B IS TRUE, 1, 0) FROM T ORDER BY ID"
+both "IS DISTINCT FROM inside a CASE" \
+     "SELECT ID, CASE WHEN NAME IS DISTINCT FROM 'aa' THEN 1 ELSE 0 END FROM T ORDER BY ID"
+# the clause FROM must not be taken by the predicate's own FROM ...
+both "SELECT DISTINCT is still the modifier, not the predicate" \
+     "SELECT DISTINCT B FROM T ORDER BY 1"
+# ... and the WHERE grammar takes the bare literals too
+where "WHERE TRUE keeps every row" "TRUE"
+where "WHERE FALSE keeps none" "FALSE"
+where "a literal operand in the WHERE fold" "B AND TRUE"
+
 # --- refusals ----------------------------------------------------------
 # a non-boolean column is not a condition, in either grammar
 ran=$((ran + 1))
@@ -213,14 +250,30 @@ case "$r" in
     ERR*) echo "OK   a text column is not a CASE condition" ;;
     *) echo "DIFF CASE WHEN NAME answered: [$r]"; fail=1 ;;
 esac
+# IS UNKNOWN takes only a BOOLEAN operand - the engine refuses
+# `ID IS UNKNOWN` at prepare (probed: SQLSTATE 22000, "Invalid usage of
+# boolean expression") where `ID IS NULL` answers
+ran=$((ran + 1))
+r=$(query "SELECT ID IS UNKNOWN FROM T" "$PORT" "$A")
+case "$r" in
+    ERR*) echo "OK   IS UNKNOWN keeps its boolean-only operand" ;;
+    *) echo "DIFF ID IS UNKNOWN answered: [$r]"; fail=1 ;;
+esac
+# ... and so do IS TRUE / IS FALSE (same engine refusal, probed)
+ran=$((ran + 1))
+r=$(query "SELECT NAME IS TRUE FROM T" "$PORT" "$A")
+case "$r" in
+    ERR*) echo "OK   IS TRUE keeps its boolean-only operand" ;;
+    *) echo "DIFF NAME IS TRUE answered: [$r]"; fail=1 ;;
+esac
 
 rm -f "$A" "$B"
 # A COUNT of what actually ran. A mistyped helper name is a shell
 # "command not found" that does not touch `fail`, so eight checks once
 # vanished from this gate while it still reported success. Counting them
 # turns a silent skip into a visible failure.
-if [ "$ran" -lt 51 ]; then
-    echo "DIFF only $ran checks ran (expected at least 51) - did one silently skip?"
+if [ "$ran" -lt 74 ]; then
+    echo "DIFF only $ran checks ran (expected at least 74) - did one silently skip?"
     fail=1
 fi
 exit $fail

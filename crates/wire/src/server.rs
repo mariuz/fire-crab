@@ -27108,9 +27108,10 @@ fn walk_cond_aggs(c: &RawCond, out: &mut Vec<(AggFn, AggTarget)>) {
             walk_aggs(a, out);
             walk_aggs(b, out);
         }
-        RawCond::IsNull(a) | RawCond::IsNotNull(a) | RawCond::Like(a, _, _, _) => {
-            walk_aggs(a, out)
-        }
+        RawCond::IsNull(a)
+        | RawCond::IsNotNull(a)
+        | RawCond::IsUnknown(a, _)
+        | RawCond::Like(a, _, _, _) => walk_aggs(a, out),
         RawCond::Not(a) => walk_cond_aggs(a, out),
         RawCond::And(v) | RawCond::Or(v) => {
             for x in v {
@@ -27169,6 +27170,7 @@ fn substitute_cond_aggs(
         RawCond::Cmp(a, op, b) => RawCond::Cmp(subb(a)?, *op, subb(b)?),
         RawCond::IsNull(a) => RawCond::IsNull(subb(a)?),
         RawCond::IsNotNull(a) => RawCond::IsNotNull(subb(a)?),
+        RawCond::IsUnknown(a, n) => RawCond::IsUnknown(subb(a)?, *n),
         RawCond::Like(a, p, e, n) => RawCond::Like(subb(a)?, p.clone(), *e, *n),
         RawCond::Not(a) => RawCond::Not(Box::new(substitute_cond_aggs(a, slot_of)?)),
         RawCond::And(v) => RawCond::And(
@@ -27803,6 +27805,7 @@ fn normalize_cond(c: &RawCond) -> RawCond {
         RawCond::Cmp(a, op, b) => RawCond::Cmp(nb(a), *op, nb(b)),
         RawCond::IsNull(a) => RawCond::IsNull(nb(a)),
         RawCond::IsNotNull(a) => RawCond::IsNotNull(nb(a)),
+        RawCond::IsUnknown(a, n) => RawCond::IsUnknown(nb(a), *n),
         RawCond::Like(a, p, e, n) => RawCond::Like(nb(a), p.clone(), *e, *n),
         RawCond::Not(inner) => RawCond::Not(Box::new(normalize_cond(inner))),
         RawCond::And(v) => RawCond::And(v.iter().map(normalize_cond).collect()),
@@ -33880,6 +33883,11 @@ enum RawCond {
     /// `<expr> [NOT] LIKE '<pattern>' [ESCAPE '<c>']` - a condition like
     /// any other, and so a VALUE like any other
     Like(Box<RawExpr>, String, Option<char>, bool),
+    /// `<expr> IS [NOT] UNKNOWN` - the NULL test, but with the engine's
+    /// BOOLEAN-ONLY operand rule (`ID IS UNKNOWN` refuses at prepare
+    /// where `ID IS NULL` answers), so it cannot desugar to IsNull at
+    /// parse: resolution applies the type gate first. `true` = NOT.
+    IsUnknown(Box<RawExpr>, bool),
     Not(Box<RawCond>),
     And(Vec<RawCond>),
     Or(Vec<RawCond>),
@@ -34081,14 +34089,76 @@ fn parse_raw_cond(b: &[char], pos: &mut usize) -> Option<RawCond> {
         skip_ws(b, pos);
         let negated = take_keyword(b, pos, "NOT");
         skip_ws(b, pos);
-        if !take_keyword(b, pos, "NULL") {
-            return None;
+        if take_keyword(b, pos, "NULL") {
+            return Some(if negated {
+                RawCond::IsNotNull(Box::new(left))
+            } else {
+                RawCond::IsNull(Box::new(left))
+            });
         }
-        return Some(if negated {
-            RawCond::IsNotNull(Box::new(left))
-        } else {
-            RawCond::IsNull(Box::new(left))
-        });
+        // IS [NOT] UNKNOWN - the NULL test with a BOOLEAN-ONLY operand:
+        // the engine refuses `ID IS UNKNOWN` at prepare where `ID IS
+        // NULL` answers, so this cannot desugar to IsNull here - the
+        // variant carries the type gate to resolution
+        if take_keyword(b, pos, "UNKNOWN") {
+            return Some(RawCond::IsUnknown(Box::new(left), negated));
+        }
+        // IS [NOT] TRUE / FALSE - TWO-valued truth tests: a NULL operand
+        // answers false (or true under NOT), never UNKNOWN. The Kleene
+        // fold expresses that exactly: `x IS TRUE` is `x IS NOT NULL AND
+        // x = TRUE` (false AND UNKNOWN = false), `x IS NOT TRUE` is
+        // `x IS NULL OR x = FALSE` (true OR UNKNOWN = true). The `=`
+        // against a boolean literal is also the TYPE GATE: cmp_sides
+        // refuses a non-boolean side, as the engine does at prepare.
+        for (kw, val) in [("TRUE", true), ("FALSE", false)] {
+            if take_keyword(b, pos, kw) {
+                let test = |v: bool| {
+                    RawCond::Cmp(
+                        Box::new(left.clone()),
+                        Cmp::Eq,
+                        Box::new(RawExpr::Bool(v)),
+                    )
+                };
+                return Some(if negated {
+                    RawCond::Or(vec![RawCond::IsNull(Box::new(left.clone())), test(!val)])
+                } else {
+                    RawCond::And(vec![RawCond::IsNotNull(Box::new(left.clone())), test(val)])
+                });
+            }
+        }
+        // IS [NOT] DISTINCT FROM <expr> - the NULL-SAFE comparison,
+        // desugared as the WHERE grammar desugars it, but into the
+        // TWO-valued Kleene shape a projected value needs: NOT DISTINCT
+        // is `(a IS NULL AND b IS NULL) OR (a IS NOT NULL AND b IS NOT
+        // NULL AND a = b)` - every arm decided whatever is NULL - and
+        // DISTINCT is its NOT (of a decided value, so still decided).
+        // A literal NULL right side is the null test itself.
+        if take_keyword(b, pos, "DISTINCT") {
+            if !take_keyword(b, pos, "FROM") {
+                return None;
+            }
+            let right = expr_add(b, pos)?;
+            if matches!(right, RawExpr::Null) {
+                return Some(if negated {
+                    RawCond::IsNull(Box::new(left))
+                } else {
+                    RawCond::IsNotNull(Box::new(left))
+                });
+            }
+            let nd = RawCond::Or(vec![
+                RawCond::And(vec![
+                    RawCond::IsNull(Box::new(left.clone())),
+                    RawCond::IsNull(Box::new(right.clone())),
+                ]),
+                RawCond::And(vec![
+                    RawCond::IsNotNull(Box::new(left.clone())),
+                    RawCond::IsNotNull(Box::new(right.clone())),
+                    RawCond::Cmp(Box::new(left), Cmp::Eq, Box::new(right)),
+                ]),
+            ]);
+            return Some(if negated { nd } else { RawCond::Not(Box::new(nd)) });
+        }
+        return None;
     }
     // LIKE is its own leaf (the pattern is a literal, so there is
     // nothing to desugar into) - `SELECT NAME LIKE 'a%'` is a value like
@@ -34202,7 +34272,10 @@ fn parse_raw_cond(b: &[char], pos: &mut usize) -> Option<RawCond> {
     // non-boolean column, so `CASE WHEN NAME` still fails. Restricted to
     // a column for the same reason the predicate grammar restricts it:
     // an expression here would swallow the left side of a comparison.
-    if matches!(left, RawExpr::Col(_))
+    // ... and so is a bare BOOLEAN LITERAL - `FL AND TRUE`,
+    // `CASE WHEN FALSE THEN ...` - which is already boolean-typed, so
+    // the same BARE marker resolves it without coercing anything
+    if matches!(left, RawExpr::Col(_) | RawExpr::Bool(_))
         && !matches!(b.get(*pos), Some('=' | '<' | '>' | '!'))
     {
         return Some(RawCond::Cmp(
@@ -34309,7 +34382,9 @@ fn renumber_cond_params(c: &mut RawCond, next: &mut usize) {
             renumber_raw_params(a, next);
             renumber_raw_params(b, next);
         }
-        RawCond::IsNull(a) | RawCond::IsNotNull(a) => renumber_raw_params(a, next),
+        RawCond::IsNull(a) | RawCond::IsNotNull(a) | RawCond::IsUnknown(a, _) => {
+            renumber_raw_params(a, next)
+        }
         RawCond::Like(a, _, _, _) => renumber_raw_params(a, next),
         RawCond::Not(inner) => renumber_cond_params(inner, next),
         RawCond::And(v) | RawCond::Or(v) => {
@@ -35008,9 +35083,10 @@ fn raw_cond_bad_substring_len(c: &RawCond) -> Option<i64> {
         RawCond::Cmp(x, _, y) => {
             raw_bad_substring_len(x).or_else(|| raw_bad_substring_len(y))
         }
-        RawCond::IsNull(x) | RawCond::IsNotNull(x) | RawCond::Like(x, ..) => {
-            raw_bad_substring_len(x)
-        }
+        RawCond::IsNull(x)
+        | RawCond::IsNotNull(x)
+        | RawCond::IsUnknown(x, _)
+        | RawCond::Like(x, ..) => raw_bad_substring_len(x),
         RawCond::Not(inner) => raw_cond_bad_substring_len(inner),
         RawCond::And(parts) | RawCond::Or(parts) => {
             parts.iter().find_map(raw_cond_bad_substring_len)
@@ -35527,6 +35603,21 @@ fn resolve_raw_cond(
         ),
         RawCond::IsNull(a) => Cond2::IsNull(Box::new(resolve_expr(a, columns, descs)?)),
         RawCond::IsNotNull(a) => Cond2::IsNotNull(Box::new(resolve_expr(a, columns, descs)?)),
+        // the NULL test with the engine's BOOLEAN-ONLY operand rule:
+        // `ID IS UNKNOWN` refuses at prepare (as the engine does) where
+        // `ID IS NULL` answers - the gate lives here because only
+        // resolution knows the type
+        RawCond::IsUnknown(a, negated) => {
+            let l = resolve_expr(a, columns, descs)?;
+            if !matches!(l.type_of(descs), Some(ExprType::Bool)) {
+                return None;
+            }
+            if *negated {
+                Cond2::IsNotNull(Box::new(l))
+            } else {
+                Cond2::IsNull(Box::new(l))
+            }
+        }
         RawCond::Not(inner) => Cond2::Not(Box::new(resolve_raw_cond(inner, columns, descs)?)),
         RawCond::And(parts) => Cond2::And(
             parts
@@ -40988,7 +41079,12 @@ fn split_query(
     }
     // the clause FROM is the first one at paren depth 0 - SUBSTRING(S
     // FROM 2) and TRIM(x FROM y) carry their own FROM keyword INSIDE the
-    // select list's parentheses, and a literal's is masked out entirely
+    // select list's parentheses, and a literal's is masked out entirely.
+    // One select-list construct embeds a FROM at depth 0 with no parens:
+    // `<x> IS [NOT] DISTINCT FROM <y>` - so a FROM whose preceding word
+    // is DISTINCT is that predicate's, not the clause's (a legitimate
+    // clause FROM is always preceded by a select item, never by the bare
+    // keyword DISTINCT, which cannot end one)
     let masked_up = mask_literals(&up);
     let from = {
         let mut cand = find_word(&masked_up, "FROM", "SELECT".len());
@@ -40999,7 +41095,12 @@ fn split_query(
                 b')' => d - 1,
                 _ => d,
             });
-            if depth == 0 {
+            let after_distinct = masked_up[..p]
+                .trim_end()
+                .rsplit(|c: char| c.is_whitespace())
+                .next()
+                .is_some_and(|w| w == "DISTINCT");
+            if depth == 0 && !after_distinct {
                 break Some(p);
             }
             cand = find_word(&masked_up, "FROM", p + "FROM".len());
@@ -43143,8 +43244,10 @@ fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
     // fails rather than testing emptiness - the BARE marker
     // ([RawExpr::BareTrue]) is what says so now that an EXPLICIT
     // `NAME = TRUE` coerces the text column per row instead.
+    // ... and so is a bare BOOLEAN LITERAL - `WHERE TRUE`, `WHERE FL AND
+    // TRUE` - which the resolver's type gate passes as boolean already
     if !negated
-        && matches!(lhs, RawLhs::Col(_))
+        && matches!(lhs, RawLhs::Col(_) | RawLhs::Expr(RawExpr::Bool(_)))
         && matches!(t.get(*pos), None | Some(Tok::And | Tok::Or | Tok::RParen))
     {
         return Some(leaf(RawKind::CmpExpr(Cmp::Eq, RawExpr::BareTrue)));
