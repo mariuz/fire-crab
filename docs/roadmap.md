@@ -108,8 +108,36 @@ measured or pinned items**, each recorded in its own place below:
   errors and early exit);
 - **the write-side refusals held on purpose** — a store that would
   fragment across pages, the DDL patch sites that would rewrite a
-  fragmented record, transliteration between charsets, and the scattered
-  correctness boundaries each gate pins.
+  fragmented record, ~~transliteration between charsets~~, and the
+  scattered correctness boundaries each gate pins.
+
+  **Transliteration is TAKEN** (`ods::intl::decode_text`/`encode_text`,
+  WIN1252 + ISO8859_1 codepage tables, bijective on all 256 bytes so a
+  round trip reproduces the stored bytes). Before them, a stored 0xE9
+  read through `from_utf8_lossy` became the replacement character - the
+  value DESTROYED on rows the ENGINE had written, `OCTET_LENGTH`
+  counting the replacement's three bytes - and a write stored UTF-8
+  bytes the engine read as mojibake. Now the DECODE speaks the
+  codepage; the STORE writes the codepage's bytes (the engine reads
+  fire-crab's `garçon` back byte-identically and finds it by value);
+  INDEX KEYS carry the codepage bytes (`KeySeg::charset`, threaded
+  through every build and band so a key lands where the engine's own
+  keys sit — an unmappable search key answers None and SCANS rather
+  than missing rows); the WIRE encode re-spells a value into a
+  single-byte attachment's codepage (a WIN1252 isql attachment reads
+  identical bytes from fire-crab's file and the engine's);
+  `OCTET_LENGTH` over such a column counts the COLUMN's bytes
+  (`SysFn::OctetLengthCs`, rewritten at resolution where the
+  descriptor is); and an unmappable character refuses where the engine
+  raises SQLSTATE 22018 (*Cannot transliterate*, the
+  `EvalErr::TransliterationFailed` vector) - both reject, the row
+  never lands. `qa/serve-real-xlit.sh` (14) pins the whole family
+  against live twins, the write-back read with the engine's own tools.
+  Still held: DML on a table whose index carries an INTL itype (the
+  itype allowlist refuses it, fail-closed, as before this slice); a
+  NONE column's high bytes (lossy at decode, recorded of old); the
+  untabled codepages - each is one 256-entry table away, not a new
+  seam.
 
 The rest of this document records how the surface got here and every one
 of those boundaries.

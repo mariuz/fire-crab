@@ -1,0 +1,197 @@
+#!/bin/bash
+# TRANSLITERATION: a WIN1252 (or ISO8859_1) column's bytes are not UTF-8,
+# and every seam that touches them must speak its codepage.
+#
+# Before the codepage tables, fire-crab read a stored 0xE9 through
+# String::from_utf8_lossy - the replacement character DESTROYED the
+# value ('café' read as 'caf<?>', OCTET_LENGTH counted the replacement's
+# three bytes), the write path stored UTF-8 bytes the engine then read
+# as mojibake, and an index key built from those bytes landed elsewhere
+# in the tree. The tables (ods::intl, WIN1252 + ISO8859_1, bijective on
+# all 256 bytes) close all of it at once:
+#
+#   DECODE   a stored byte becomes its codepage's character
+#   STORE    text becomes the codepage's bytes - the bytes the ENGINE
+#            writes and reads; a character with no image refuses where
+#            the engine raises 22018 (both reject, the row never lands)
+#   KEYS     index keys are the codepage bytes (KeySeg.charset), so a
+#            band finds what the engine's own keys hold
+#   WIRE     a single-byte ATTACHMENT receives the codepage bytes back
+#            (the UTF8 attachment receives UTF-8, as always)
+#   LENGTHS  OCTET_LENGTH counts the COLUMN's bytes (café = 4), not the
+#            decoded text's UTF-8 bytes (5)
+#
+# Twin databases: the engine populates both identically; fire-crab
+# serves one over the wire, isql reads the other; every answer must
+# match. Then fire-crab WRITES, and the ENGINE reads the file - the
+# corruption direction, checked with the engine's own tools.
+#
+#   qa/serve-real-xlit.sh [port]
+
+set -u
+FCWIRE="${FCWIRE:-$(dirname "$0")/../target/release/fcwire}"
+ISQL="${ISQL:-isql}"
+GFIX="${GFIX:-gfix}"
+PORT="${1:-4489}"
+U="${ISC_USER:-SYSDBA}"; P="${ISC_PASSWORD:-masterkey}"
+D=/tmp/fbhandson
+RE="$D/fc-xlit-re.fdb"; FC="$D/fc-xlit-fc.fdb"
+NODE_PATH="${NODE_PATH:-/home/ubuntu/work}"; export NODE_PATH
+
+command -v node >/dev/null 2>&1 || { echo "SKIP node not found"; exit 0; }
+mkdir -p "$D"
+fail=0; ran=0
+
+mkdb() {
+    rm -f "$1"
+    "$ISQL" -q -b -ch UTF8 -user "$U" -pas "$P" <<EOF >/dev/null 2>&1 || return 1
+CREATE DATABASE '$1' USER '$U' PASSWORD '$P' PAGE_SIZE 8192;
+CREATE TABLE XL (ID INTEGER, W VARCHAR(10) CHARACTER SET WIN1252,
+                 L VARCHAR(10) CHARACTER SET ISO8859_1);
+COMMIT;
+INSERT INTO XL VALUES (1, 'café', 'café');
+INSERT INTO XL VALUES (2, 'für', 'für');
+INSERT INTO XL VALUES (3, '€uro', 'ascii');
+COMMIT;
+EOF
+    chmod 666 "$1"
+}
+mkdb "$RE" || { echo "FAIL scratch RE"; exit 1; }
+mkdb "$FC" || { echo "FAIL scratch FC"; exit 1; }
+
+"$FCWIRE" serve "127.0.0.1:$PORT" "$U" "$P" >/tmp/fc-serve-xlit.log 2>&1 &
+srv=$!
+trap 'kill $srv 2>/dev/null' EXIT
+i=0; while [ $i -lt 20 ]; do
+    command -v nc >/dev/null 2>&1 && nc -z 127.0.0.1 "$PORT" 2>/dev/null && break
+    i=$((i + 1)); sleep 0.1
+done
+kill -0 $srv 2>/dev/null || { echo "FAIL fcwire not running - port $PORT taken?"; exit 1; }
+
+node_q() { FC_DB="$FC" FC_PORT="$PORT" FC_Q="$1" timeout 30 node -e '
+  process.on("uncaughtException", () => { console.log("CONN_ERR"); process.exit(1); });
+  const F=require("node-firebird");
+  F.attach({host:"127.0.0.1",port:+process.env.FC_PORT,database:process.env.FC_DB,
+            user:"SYSDBA",password:"masterkey",encoding:"UTF8"},(e,db)=>{
+    if(e){console.log("CONN_ERR");process.exit(1);}
+    db.query(process.env.FC_Q,(e2,r)=>{
+      if(e2){console.log("ERR");db.detach();process.exit(0);}
+      if(Array.isArray(r)) for(const row of r)
+        console.log(Object.values(row).map(v=>v===null?"<null>":String(v).replace(/\s+$/,"")).join("|"));
+      else console.log("OK");
+      db.detach();process.exit(0);});});' 2>/dev/null
+}
+isql_q() { # <db> <sql>
+    printf 'SET HEADING OFF;\n%s;\n' "$2" |
+        "$ISQL" -q -b -ch UTF8 -user "$U" -pas "$P" "$1" 2>&1 |
+        sed 's/^[[:space:]]*//; s/[[:space:]]\{1,\}/|/g; s/|$//' | grep -v '^$'
+}
+twin() { # <label> <sql> - fc over the wire vs the engine, same rows
+    ran=$((ran + 1))
+    a=$(node_q "$2")
+    b=$(isql_q "$RE" "$2")
+    if [ "$a" = "$b" ]; then
+        echo "OK   $1"
+    else
+        echo "DIFF $1"
+        echo "     fcwire: [$a]"
+        echo "     engine: [$b]"
+        fail=1
+    fi
+}
+
+# --- 1. reading the engine's rows --------------------------------------
+twin "a WIN1252 column decodes by its codepage" "SELECT ID, W FROM XL ORDER BY ID"
+twin "an ISO8859_1 column too" "SELECT ID, L FROM XL ORDER BY ID"
+twin "OCTET_LENGTH counts the COLUMN's bytes, CHAR_LENGTH its characters" \
+     "SELECT ID, OCTET_LENGTH(W) AS OW, CHAR_LENGTH(W) AS CW, OCTET_LENGTH(L) AS OL FROM XL ORDER BY ID"
+twin "a WHERE literal meets the column's characters" \
+     "SELECT ID FROM XL WHERE W = 'café'"
+twin "... and the cp1252 punctuation row (the 0x80 block)" \
+     "SELECT ID FROM XL WHERE W = '€uro'"
+twin "LIKE walks characters, not bytes" \
+     "SELECT ID FROM XL WHERE W LIKE 'f_r'"
+twin "UPPER maps the accents" "SELECT ID, UPPER(W) FROM XL ORDER BY ID"
+
+# --- 2. fire-crab WRITES, the ENGINE reads -----------------------------
+ran=$((ran + 1))
+r=$(node_q "INSERT INTO XL VALUES (4, 'garçon', 'Ähre')")
+if [ "$r" = "OK" ]; then
+    echo "OK   fc stores non-ASCII through a UTF8 attachment"
+else
+    echo "DIFF fc INSERT refused: [$r]"
+    fail=1
+fi
+ran=$((ran + 1))
+got=$(isql_q "$FC" "SELECT ID, W, L, OCTET_LENGTH(W) FROM XL WHERE ID = 4")
+if [ "$got" = "4|garçon|Ähre|6" ]; then
+    echo "OK   the ENGINE reads fc's row back - codepage bytes, 6 octets"
+else
+    echo "DIFF engine read of fc's row: [$got]"
+    fail=1
+fi
+ran=$((ran + 1))
+got=$(isql_q "$FC" "SELECT ID FROM XL WHERE W = 'garçon'")
+if [ "$got" = "4" ]; then
+    echo "OK   ... and finds it by value"
+else
+    echo "DIFF engine WHERE over fc's row: [$got]"
+    fail=1
+fi
+
+# --- 3. the unmappable character ---------------------------------------
+# the engine raises SQLSTATE 22018 (Cannot transliterate) at execute;
+# fire-crab refuses at prepare - both reject, and the row never lands
+ran=$((ran + 1))
+r=$(node_q "INSERT INTO XL VALUES (9, '₹', 'x')")
+e=$(printf "INSERT INTO XL VALUES (9, '₹', 'x');\n" | "$ISQL" -q -b -ch UTF8 -user "$U" -pas "$P" "$RE" 2>&1 | grep -c "SQLSTATE = 22018")
+if [ "$r" = "ERR" ] && [ "$e" -ge 1 ]; then
+    echo "OK   an unmappable character: fc refuses, the engine raises 22018"
+else
+    echo "DIFF unmappable: fc [$r], engine 22018-count $e"
+    fail=1
+fi
+ran=$((ran + 1))
+a=$(node_q "SELECT COUNT(*) FROM XL WHERE ID = 9")
+b=$(isql_q "$RE" "SELECT COUNT(*) FROM XL WHERE ID = 9")
+if [ "$a" = "0" ] && [ "$b" = "0" ]; then
+    echo "OK   ... and the row landed on NEITHER side"
+else
+    echo "DIFF unmappable row count: fc [$a] engine [$b]"
+    fail=1
+fi
+
+# --- 4. a single-byte ATTACHMENT gets the codepage bytes back ----------
+# reading the fc-SERVED file through isql -ch WIN1252: the wire encode
+# re-spells the value in the attachment's codepage, which for a
+# same-charset column is the STORED bytes - compared against the
+# engine's own WIN1252-attachment answer on the twin
+ran=$((ran + 1))
+a=$(printf 'SET HEADING OFF;\nSELECT ID, W, OCTET_LENGTH(W) AS OW FROM XL WHERE ID <= 3 ORDER BY ID;\n' |
+    "$ISQL" -q -b -ch WIN1252 -user "$U" -pas "$P" "$FC" 2>&1 | md5sum | cut -d' ' -f1)
+b=$(printf 'SET HEADING OFF;\nSELECT ID, W, OCTET_LENGTH(W) AS OW FROM XL WHERE ID <= 3 ORDER BY ID;\n' |
+    "$ISQL" -q -b -ch WIN1252 -user "$U" -pas "$P" "$RE" 2>&1 | md5sum | cut -d' ' -f1)
+if [ "$a" = "$b" ]; then
+    echo "OK   a WIN1252 attachment reads identical bytes from both files"
+else
+    echo "DIFF WIN1252-attachment reads differ between the twins"
+    fail=1
+fi
+
+# --- 5. the file survives the engine's own verifier --------------------
+ran=$((ran + 1))
+g=$("$GFIX" -v -full -user "$U" -pas "$P" "$FC" 2>&1)
+if [ -z "$g" ]; then
+    echo "OK   gfix -v -full finds nothing wrong with the fc-written file"
+else
+    echo "DIFF gfix: $g"
+    fail=1
+fi
+
+kill $srv 2>/dev/null; srv=""
+rm -f "$RE" "$FC"
+if [ "$ran" -lt 14 ]; then
+    echo "DIFF only $ran checks ran (expected at least 14) - did one silently skip?"
+    fail=1
+fi
+exit $fail

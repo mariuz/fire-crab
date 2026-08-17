@@ -205,14 +205,29 @@ fn int64_key(raw: i64, scale: i16) -> Option<Vec<u8>> {
 /// Encode one column value as an index key for `itype` (ascending,
 /// single segment). None = a value/itype pairing this conversion does
 /// not cover - the caller must refuse the statement, never guess.
-pub fn index_key(itype: u16, value: &Value, scale: i8) -> Option<Vec<u8>> {
+pub fn index_key(itype: u16, value: &Value, scale: i8, charset: u8) -> Option<Vec<u8>> {
     if matches!(value, Value::Null) {
         return Some(Vec::new()); // ASC NULL: no data
     }
     match itype {
         IDX_STRING => {
             let Value::Text(s) = value else { return None };
-            let trimmed = s.as_bytes().trim_ascii_end_matches();
+            // a TABLED single-byte column (WIN1252, ISO8859_1) keys its
+            // CODEPAGE bytes - the bytes the write path stored, the bytes
+            // the engine's own keys hold. A character with no image in
+            // the set has no key: answering None SCANS, where a UTF-8
+            // key would land elsewhere in the tree and silently MISS the
+            // row (the LEFT-join law: a missed inner is a wrong answer).
+            let owned: Vec<u8>;
+            let bytes: &[u8] = match crate::intl::encode_text(charset, s) {
+                Err(_) => return None,
+                Ok(Some(v)) => {
+                    owned = v;
+                    &owned
+                }
+                Ok(None) => s.as_bytes(),
+            };
+            let trimmed = bytes.trim_ascii_end_matches();
             Some(if trimmed.is_empty() { vec![b' '] } else { trimmed.to_vec() })
         }
         IDX_METADATA => {
@@ -394,6 +409,9 @@ pub struct KeySeg<'a> {
     pub itype: u16,
     pub value: &'a Value,
     pub scale: i8,
+    /// the column's character set (a text segment keys its CODEPAGE
+    /// bytes for a tabled single-byte set; 0 = NONE keeps raw bytes)
+    pub charset: u8,
 }
 
 /// Compress one segment the way `compress` (btr.cpp:3444) does for a
@@ -404,11 +422,17 @@ pub struct KeySeg<'a> {
 /// (btr.cpp:3603/3978: the pre-complement image of the 0xFE
 /// end-value guard, which keeps values distinguishable from the NULL
 /// marker after complement).
-fn compress_seg(itype: u16, value: &Value, scale: i8, descending: bool) -> Option<Vec<u8>> {
+fn compress_seg(
+    itype: u16,
+    value: &Value,
+    scale: i8,
+    charset: u8,
+    descending: bool,
+) -> Option<Vec<u8>> {
     if matches!(value, Value::Null) {
         return Some(if descending { vec![0] } else { Vec::new() });
     }
-    let mut k = index_key(itype, value, scale)?;
+    let mut k = index_key(itype, value, scale, charset)?;
     if descending && matches!(k.first(), Some(0) | Some(1)) {
         k.insert(0, 1);
     }
@@ -433,7 +457,7 @@ pub fn build_index_key(segs: &[KeySeg<'_>], descending: bool) -> Option<(Vec<u8>
     let all_null = segs.iter().all(|s| matches!(s.value, Value::Null));
     let mut out;
     if segs.len() == 1 {
-        out = compress_seg(segs[0].itype, segs[0].value, segs[0].scale, descending)?;
+        out = compress_seg(segs[0].itype, segs[0].value, segs[0].scale, segs[0].charset, descending)?;
     } else {
         out = Vec::new();
         let total = segs.len();
@@ -444,7 +468,7 @@ pub fn build_index_key(segs: &[KeySeg<'_>], descending: bool) -> Option<(Vec<u8>
                 out.push(0);
                 stuff -= 1;
             }
-            let temp = compress_seg(seg.itype, seg.value, seg.scale, descending)?;
+            let temp = compress_seg(seg.itype, seg.value, seg.scale, seg.charset, descending)?;
             for &b in &temp {
                 if stuff == 0 {
                     out.push((total - n) as u8);
@@ -1048,7 +1072,7 @@ mod tests {
 
     #[test]
     fn compound_keys_stuff_like_btr_key() {
-        let seg = |itype, value, scale| KeySeg { itype, value, scale };
+        let seg = |itype, value, scale| KeySeg { itype, value, scale, charset: 0 };
         let ab = Value::Text("AB".into());
         let abcde = Value::Text("ABCDE".into());
         let one = Value::Int(1);
@@ -1097,7 +1121,7 @@ mod tests {
 
     #[test]
     fn descending_keys_complement_like_btr() {
-        let seg = |itype, value, scale| KeySeg { itype, value, scale };
+        let seg = |itype, value, scale| KeySeg { itype, value, scale, charset: 0 };
         let ab = Value::Text("AB".into());
         // single descending segment = complemented ascending bytes
         let (k, _) = build_index_key(&[seg(IDX_STRING, &ab, 0)], true).unwrap();
@@ -1110,7 +1134,7 @@ mod tests {
         // the 0x01 end-value guard prepended before the complement
         // (btr.cpp:3978): a near-minimum double's munged bytes start 0x00
         let neg = Value::Double(-1.7e308);
-        let asc = index_key(IDX_NUMERIC, &neg, 0).unwrap();
+        let asc = index_key(IDX_NUMERIC, &neg, 0, 0).unwrap();
         assert_eq!(asc[0], 0x00);
         let (k, _) = build_index_key(&[seg(IDX_NUMERIC, &neg, 0)], true).unwrap();
         assert_eq!(k[0], !0x01u8); // the guard byte, complemented
@@ -1131,45 +1155,45 @@ mod tests {
     #[test]
     fn keys_encode_like_compress() {
         // NULL: no data
-        assert_eq!(index_key(IDX_STRING, &Value::Null, 0), Some(vec![]));
+        assert_eq!(index_key(IDX_STRING, &Value::Null, 0, 0), Some(vec![]));
         // strings: trailing pads stripped, empty collapses to one pad
         assert_eq!(
-            index_key(IDX_STRING, &Value::Text("abc  ".into()), 0),
+            index_key(IDX_STRING, &Value::Text("abc  ".into()), 0, 0),
             Some(b"abc".to_vec())
         );
-        assert_eq!(index_key(IDX_STRING, &Value::Text("".into()), 0), Some(vec![b' ']));
-        assert_eq!(index_key(IDX_STRING, &Value::Text("   ".into()), 0), Some(vec![b' ']));
+        assert_eq!(index_key(IDX_STRING, &Value::Text("".into()), 0, 0), Some(vec![b' ']));
+        assert_eq!(index_key(IDX_STRING, &Value::Text("   ".into()), 0, 0), Some(vec![b' ']));
         // idx_numeric doubles: 1.0 -> BE 3FF0.. -> flip sign bit, chop
-        assert_eq!(index_key(IDX_NUMERIC, &Value::Int(1), 0), Some(vec![0xBF, 0xF0]));
-        assert_eq!(index_key(IDX_NUMERIC, &Value::Int(0), 0), Some(vec![0x80]));
+        assert_eq!(index_key(IDX_NUMERIC, &Value::Int(1), 0, 0), Some(vec![0xBF, 0xF0]));
+        assert_eq!(index_key(IDX_NUMERIC, &Value::Int(0), 0, 0), Some(vec![0x80]));
         // negative: complement of BE(-1.0 = BFF0..) = 400F FF..FF chopped? no -
         // complement keeps FFs: ~BF=0x40, ~F0=0x0F, ~00=FF x6 -> no zero chop
         assert_eq!(
-            index_key(IDX_NUMERIC, &Value::Int(-1), 0),
+            index_key(IDX_NUMERIC, &Value::Int(-1), 0, 0),
             Some(vec![0x40, 0x0F, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF])
         );
         // scaled: NUMERIC(9,2) raw 150 scale -2 = 1.5
         assert_eq!(
-            index_key(IDX_NUMERIC, &Value::Scaled(150, -2), 0),
-            index_key(IDX_NUMERIC, &Value::Double(1.5), 0)
+            index_key(IDX_NUMERIC, &Value::Scaled(150, -2), 0, 0),
+            index_key(IDX_NUMERIC, &Value::Double(1.5), 0, 0)
         );
         // ordering sanity across the encoding
-        let k = |v: i64| index_key(IDX_NUMERIC, &Value::Int(v), 0).unwrap();
+        let k = |v: i64| index_key(IDX_NUMERIC, &Value::Int(v), 0, 0).unwrap();
         assert!(k(-5) < k(-1));
         assert!(k(-1) < k(0));
         assert!(k(0) < k(1));
         assert!(k(1) < k(2));
         assert!(k(2) < k(100));
         // int64 keys order too, incl. the short part
-        let k64 = |v: i64| index_key(IDX_NUMERIC2, &Value::Int(v), 0).unwrap();
+        let k64 = |v: i64| index_key(IDX_NUMERIC2, &Value::Int(v), 0, 0).unwrap();
         assert!(k64(-2) < k64(-1));
         assert!(k64(-1) < k64(0));
         assert!(k64(0) < k64(1));
         assert!(k64(9999) < k64(10000));
         assert!(k64(10000) < k64(10001));
         // booleans
-        assert_eq!(index_key(IDX_BOOLEAN, &Value::Bool(false), 0), Some(vec![0x80]));
-        assert_eq!(index_key(IDX_BOOLEAN, &Value::Bool(true), 0), Some(vec![0x81]));
+        assert_eq!(index_key(IDX_BOOLEAN, &Value::Bool(false), 0, 0), Some(vec![0x80]));
+        assert_eq!(index_key(IDX_BOOLEAN, &Value::Bool(true), 0, 0), Some(vec![0x81]));
     }
 
     #[test]

@@ -134,6 +134,10 @@ fn main() {
                                     .get(*fid as usize)
                                     .map(|d| d.scale)
                                     .unwrap_or(0),
+                                charset: descs
+                                    .get(*fid as usize)
+                                    .map(|d| fire_crab_ods::intl::charset_id(d.sub_type))
+                                    .unwrap_or(0),
                             })
                             .collect();
                         let (key, _all_null) =

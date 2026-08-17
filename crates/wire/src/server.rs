@@ -6813,7 +6813,7 @@ fn index_key_fids(db: &Database, rel: u16, descs: &[Descriptor]) -> Vec<usize> {
     resolve_index_ops(db, rel, descs)
         .unwrap_or_default()
         .iter()
-        .filter_map(|op| op.segs.first().map(|(fid, _, _)| *fid))
+        .filter_map(|op| op.segs.first().map(|(fid, _, _, _)| *fid))
         .collect()
 }
 
@@ -8603,7 +8603,7 @@ fn fk_partner_lookup(db: &Database, fk: &FkPartner, key: &[&Value]) -> Option<Ve
             && o.segs
                 .iter()
                 .zip(&fk.other_fids)
-                .all(|((sf, itype, _), of)| {
+                .all(|((sf, itype, _, _), of)| {
                     sf == of && matches!(*itype, btw::IDX_NUMERIC | btw::IDX_NUMERIC2)
                 })
     })?;
@@ -9293,7 +9293,7 @@ fn int_func_form(e: &Expr, descs: &[Descriptor]) -> Option<(Wire, i32, i32)> {
     };
     match f {
         SysFn::Sign => Some(short),
-        SysFn::CharLength | SysFn::OctetLength | SysFn::Position => Some(long),
+        SysFn::CharLength | SysFn::OctetLength | SysFn::OctetLengthCs(_) | SysFn::Position => Some(long),
         SysFn::Mod => match src_dtype(0)? {
             dtype::SHORT => Some(short),
             dtype::LONG => Some(long),
@@ -17590,7 +17590,7 @@ fn plan_update(sql: &str, db_outer: &Option<Database>) -> Option<(Plan, Vec<Desc
         let set_fids: Vec<usize> = sets.iter().map(|(f, _)| *f).collect();
         let rewrites_unique = index_ops
             .iter()
-            .any(|op| op.unique && op.segs.iter().any(|(f, _, _)| set_fids.contains(f)));
+            .any(|op| op.unique && op.segs.iter().any(|(f, _, _, _)| set_fids.contains(f)));
         if rewrites_unique && !filter_pins_one_row(&filter, &index_ops) {
             return None;
         }
@@ -17904,7 +17904,7 @@ fn filter_pins_one_row(filter: &Option<Predicate>, index_ops: &[IndexOp]) -> boo
     };
     index_ops
         .iter()
-        .any(|op| op.unique && !op.segs.is_empty() && op.segs.iter().all(|(f, _, _)| pinned(*f)))
+        .any(|op| op.unique && !op.segs.is_empty() && op.segs.iter().all(|(f, _, _, _)| pinned(*f)))
 }
 
 /// Recognise a DML `WHERE` that is EXACTLY one comparison against a
@@ -19518,7 +19518,26 @@ fn flush_careful(path: &str, before: &fire_crab_ods::Image, after: &fire_crab_od
 /// stops a wide value overrunning the record image, and in every
 /// single-byte character set the two bounds are the same number.
 fn text_bytes_for(text: &str, d: &Descriptor, flen: usize) -> Option<Vec<u8>> {
-    let b = text.as_bytes();
+    // a TABLED single-byte column (WIN1252, ISO8859_1) stores its
+    // codepage's bytes, not UTF-8 - 'é' into a WIN1252 column is the one
+    // byte 0xE9, exactly what the engine wrote and reads back. A
+    // character with no image in the set answers None: the engine raises
+    // SQLSTATE 22018 (*Cannot transliterate character between character
+    // sets*) at execute, this server refuses at prepare - both reject,
+    // and the row never lands (recorded boundary, same shape as the
+    // numeric-overflow refusals).
+    let encoded: Vec<u8>;
+    let b: &[u8] = match fire_crab_ods::intl::encode_text(
+        fire_crab_ods::intl::charset_id(d.sub_type),
+        text,
+    ) {
+        Err(_) => return None,
+        Ok(Some(v)) => {
+            encoded = v;
+            &encoded
+        }
+        Ok(None) => text.as_bytes(),
+    };
     if text.chars().count() > fire_crab_ods::intl::char_length(d.dtype, flen as u16, d.sub_type) {
         return None;
     }
@@ -19550,7 +19569,7 @@ fn text_bytes_for(text: &str, d: &Descriptor, flen: usize) -> Option<Vec<u8>> {
 #[derive(Clone, Debug, PartialEq)]
 struct IndexOp {
     id: u8,
-    segs: Vec<(usize, u16, i8)>,
+    segs: Vec<(usize, u16, i8, u8)>,
     descending: bool,
     unique: bool,
 }
@@ -19568,10 +19587,11 @@ impl IndexOp {
         let segs: Vec<btw::KeySeg<'_>> = self
             .segs
             .iter()
-            .map(|(fid, itype, scale)| btw::KeySeg {
+            .map(|(fid, itype, scale, charset)| btw::KeySeg {
                 itype: *itype,
                 value: values.get(*fid).unwrap_or(&null),
                 scale: *scale,
+                charset: *charset,
             })
             .collect();
         btw::build_index_key(&segs, self.descending)
@@ -19712,7 +19732,7 @@ fn navigates(
     // search key is built from. A FLOAT or scaled segment cannot be
     // re-keyed, so its entries cannot be judged, and an unjudgeable
     // entry may be stale and sit at the wrong place in the walk.
-    let [(seg, itype, _)] = op.segs.as_slice() else { return false };
+    let [(seg, itype, _, _)] = op.segs.as_slice() else { return false };
     let text = matches!(*itype, fire_crab_ods::btw::IDX_STRING | fire_crab_ods::btw::IDX_METADATA);
     if !text {
         if !matches!(
@@ -19725,7 +19745,7 @@ fn navigates(
             return false;
         }
     }
-    let [(seg_fid, _, _)] = op.segs.as_slice() else { return false };
+    let [(seg_fid, _, _, _)] = op.segs.as_slice() else { return false };
     if *seg_fid != key.field {
         return false;
     }
@@ -20061,7 +20081,7 @@ fn pick_for_terms(
         // The LEADING segment is what a predicate can match - a compound
         // index orders by its first column, then within that by the
         // second, so an equality on the first names a CONTIGUOUS BAND.
-        let Some((seg_fid, itype, _)) = op.segs.first() else { continue };
+        let Some((seg_fid, itype, _, _)) = op.segs.first() else { continue };
         let compound = op.segs.len() > 1;
         // A DESCENDING index IS keyed now, and the arithmetic was read
         // back off the engine's own index rather than derived. Dumping
@@ -20357,7 +20377,7 @@ fn resolve_index_ops_uncached(db: &Database, rel: u16, descs: &[Descriptor]) -> 
                 return None;
             }
             let d = descs.get(field as usize)?;
-            op_segs.push((field as usize, itype, d.scale));
+            op_segs.push((field as usize, itype, d.scale, fire_crab_ods::intl::charset_id(d.sub_type)));
         }
         ops.push(IndexOp {
             id: e.id,
@@ -20522,7 +20542,7 @@ fn unique_violation_err(
     let parts: Option<Vec<(String, &Value)>> = op
         .segs
         .iter()
-        .map(|(fid, _, _)| {
+        .map(|(fid, _, _, _)| {
             cols.iter()
                 .find(|c| c.field_id as usize == *fid)
                 .map(|c| (c.name.clone(), values.get(*fid).unwrap_or(&Value::Null)))
@@ -31043,6 +31063,9 @@ impl From<ExecErr> for EmitErr {
 /// iberror.h). isql renders it "arithmetic exception ... / Integer divide
 /// by zero".
 const GDS_ARITH_EXCEPT: i32 = 335544321;
+/// isc_transliteration_failed - "Cannot transliterate character between
+/// character sets" (SQLSTATE 22018)
+const GDS_TRANSLITERATION_FAILED: i32 = 335544565;
 const GDS_INTEGER_DIVIDE: i32 = 335544778;
 /// `isc_decfloat_invalid_operation` - SQLSTATE 22000, emitted ALONE (not
 /// under arith_except): the engine's per-row trap when a comparison meets
@@ -31255,6 +31278,12 @@ fn eval_status_items(w: &mut W, e: &EvalErr) {
                 .int(GDS_ARITH_EXCEPT)
                 .int(1) // isc_arg_gds
                 .int(GDS_FLOAT_DIVIDE);
+        }
+        EvalErr::TransliterationFailed => {
+            w.int(1) // isc_arg_gds
+                .int(GDS_ARITH_EXCEPT)
+                .int(1) // isc_arg_gds
+                .int(GDS_TRANSLITERATION_FAILED);
         }
         EvalErr::DecfloatInvalidOperation => {
             // emitted ALONE - the engine's isql shows only "Decimal float
@@ -32856,14 +32885,19 @@ fn encode_row(
         enforce_out_capacity(cols, &mut vals, out)?;
     }
     w.int(OP_FETCH_RESPONSE).int(0).int(1);
-    encode_row_body(w, cols, &vals);
+    encode_row_body(w, cols, &vals, out)?;
     Ok(())
 }
 
 /// The message itself - null bitmap then values - with no framing op in
 /// front. A fetch prefixes op_fetch_response; op_execute2's singleton
 /// reply prefixes op_sql_response instead.
-fn encode_row_body(w: &mut W, cols: &[ProjCol], vals: &[Value]) {
+fn encode_row_body(
+    w: &mut W,
+    cols: &[ProjCol],
+    vals: &[Value],
+    out: Option<&OutFmt>,
+) -> Result<(), EvalErr> {
     let n = cols.len();
     let nbytes = n.div_ceil(8);
     let mut bitmap = vec![0u8; nbytes];
@@ -32919,7 +32953,35 @@ fn encode_row_body(w: &mut W, cols: &[ProjCol], vals: &[Value]) {
             }
             Wire::Varying => {
                 let s = v.render();
-                let b = s.as_bytes();
+                // a TABLED single-byte DESTINATION (a WIN1252 or
+                // ISO8859_1 attachment, or a varying2 slot declaring one)
+                // receives the value in ITS codepage - the engine
+                // transliterates on the way out, and a same-charset
+                // column round-trips to its stored bytes. A character
+                // with no image in the destination raises the engine's
+                // transliteration error. A UTF8 or NONE destination -
+                // every driver the gates run - takes the UTF-8 bytes as
+                // always.
+                let owned: Vec<u8>;
+                let b: &[u8] = match out.and_then(|o| {
+                    let slot_cs = cols
+                        .iter()
+                        .position(|cc| std::ptr::eq(cc, c))
+                        .and_then(|i| o.slots.get(i))
+                        .and_then(|sl| sl.text)
+                        .and_then(|(_, decl)| decl.map(|t| AttCs::by_id((t & 0xFF) as u8)));
+                    let dest = slot_cs.unwrap_or(o.att);
+                    fire_crab_ods::intl::encode_text(dest.id, &s).transpose()
+                }) {
+                    Some(Ok(v)) => {
+                        owned = v;
+                        &owned
+                    }
+                    Some(Err(_)) => {
+                        return Err(EvalErr::TransliterationFailed);
+                    }
+                    None => s.as_bytes(),
+                };
                 w.int(b.len() as i32);
                 w.raw(b);
                 for _ in 0..(4 - b.len() % 4) % 4 {
@@ -32972,6 +33034,7 @@ fn encode_row_body(w: &mut W, cols: &[ProjCol], vals: &[Value]) {
             }
         }
     }
+    Ok(())
 }
 
 /// The 8 wire bytes of a blob id: the on-disk bid layout (u16 relation
@@ -33835,6 +33898,12 @@ enum SysFn {
     /// its blank padding (probed: CHAR_LENGTH of CHAR(5) 'ab' is 5)
     CharLength,
     OctetLength,
+    /// OCTET_LENGTH over a COLUMN whose character set is a tabled
+    /// single-byte codepage: the engine counts the COLUMN's stored
+    /// bytes (a WIN1252 'caf\u{e9}' is 4), not the UTF-8 bytes of the
+    /// decoded text (5). Rewritten from `OctetLength` at resolution,
+    /// where the descriptor is at hand.
+    OctetLengthCs(u8),
     /// SUBSTRING(s FROM start [FOR len]) - args [s, start] or
     /// [s, start, len]; start may be < 1 (the window clips), a negative
     /// len raises isc_bad_substring_length
@@ -33931,7 +34000,7 @@ impl SysFn {
             SysFn::Upper => "UPPER",
             SysFn::Lower => "LOWER",
             SysFn::CharLength => "CHAR_LENGTH",
-            SysFn::OctetLength => "OCTET_LENGTH",
+            SysFn::OctetLength | SysFn::OctetLengthCs(_) => "OCTET_LENGTH",
             SysFn::Substring => "SUBSTRING",
             SysFn::Trim(_) => "TRIM",
             SysFn::Left => "LEFT",
@@ -35427,6 +35496,7 @@ fn parse_sysfn_call(up: &str, b: &[char], pos: &mut usize) -> Option<RawExpr> {
         | SysFn::Lower
         | SysFn::CharLength
         | SysFn::OctetLength
+        | SysFn::OctetLengthCs(_)
         | SysFn::Reverse
         | SysFn::Abs
         | SysFn::Sign => (1, 1),
@@ -35949,12 +36019,30 @@ fn resolve_expr_inner(
             Box::new(resolve_expr(a, columns, descs)?),
             Box::new(resolve_expr(b, columns, descs)?),
         ),
-        RawExpr::Func(f, args) => Expr::Func(
-            *f,
-            args.iter()
+        RawExpr::Func(f, args) => {
+            let resolved: Vec<Expr> = args
+                .iter()
                 .map(|a| resolve_expr(a, columns, descs))
-                .collect::<Option<Vec<_>>>()?,
-        ),
+                .collect::<Option<Vec<_>>>()?;
+            // OCTET_LENGTH over a COLUMN of a tabled single-byte set
+            // counts the COLUMN's stored bytes (WIN1252 'café' is 4,
+            // probed), not the decoded text's UTF-8 bytes - the charset
+            // is only knowable here, where the descriptor is
+            let f = match (f, resolved.as_slice()) {
+                (SysFn::OctetLength, [Expr::Col(fid)]) => {
+                    let cs = descs
+                        .get(*fid)
+                        .map_or(0, |d| fire_crab_ods::intl::charset_id(d.sub_type));
+                    if fire_crab_ods::intl::tabled(cs) {
+                        SysFn::OctetLengthCs(cs)
+                    } else {
+                        *f
+                    }
+                }
+                _ => *f,
+            };
+            Expr::Func(f, resolved)
+        }
         RawExpr::Case(branches, else_) => Expr::Case(
             branches
                 .iter()
@@ -36223,6 +36311,11 @@ enum EvalErr {
     /// sum past `i64`, or an operation past `i128`:
     /// `isc_exception_integer_overflow` (SQLSTATE 22003)
     IntegerOverflow,
+    /// a value with no image in the destination character set:
+    /// `isc_arith_except` / `isc_transliteration_failed` (SQLSTATE 22018,
+    /// *Cannot transliterate character between character sets*) - probed
+    /// on an unmappable INSERT, the same vector the read side raises
+    TransliterationFailed,
     /// a comparison (or other operation) that met a NaN DECFLOAT value:
     /// `isc_decfloat_invalid_operation` (SQLSTATE 22000). The engine traps
     /// per row - `WHERE df > 0` over a table with a NaN row answers the
@@ -38134,7 +38227,16 @@ impl Expr {
                     | SysFn::Reverse
                     | SysFn::Lpad
                     | SysFn::Rpad => Some(ExprType::Text),
-                    SysFn::CharLength | SysFn::OctetLength | SysFn::Position => {
+                    SysFn::CharLength
+                    | SysFn::OctetLength
+        | SysFn::OctetLengthCs(_)
+                | SysFn::OctetLength
+        | SysFn::OctetLengthCs(_)
+                    | SysFn::OctetLength
+        | SysFn::OctetLengthCs(_)
+                | SysFn::OctetLength
+        | SysFn::OctetLengthCs(_)
+                    | SysFn::Position => {
                         Some(ExprType::Int)
                     }
                     // MOD and SIGN take numbers; a text operand would go
@@ -38359,6 +38461,9 @@ impl Expr {
                 SysFn::Mod => args.iter().filter_map(|a| a.rank_of(descs)).max(),
                 SysFn::CharLength
                 | SysFn::OctetLength
+        | SysFn::OctetLengthCs(_)
+                | SysFn::OctetLength
+        | SysFn::OctetLengthCs(_)
                 | SysFn::Position
                 | SysFn::Sign
                 | SysFn::Extract(_) => Some(NumRank::Long),
@@ -39069,6 +39174,18 @@ impl Expr {
                         Value::Int(fn_text(&vs[0]).chars().count() as i64)
                     }
                     SysFn::OctetLength => Value::Int(fn_text(&vs[0]).len() as i64),
+                    // the column's own codepage bytes - every character a
+                    // decoded value holds came FROM the set, so encoding
+                    // back cannot fail; the UTF-8 count stands in if it
+                    // somehow does
+                    SysFn::OctetLengthCs(cs) => {
+                        let t = fn_text(&vs[0]);
+                        let n = match fire_crab_ods::intl::encode_text(*cs, &t) {
+                            Ok(Some(b)) => b.len(),
+                            _ => t.len(),
+                        };
+                        Value::Int(n as i64)
+                    }
                     SysFn::Substring => {
                         let len = vs.get(2).map(fn_int).transpose()?;
                         Value::Text(substring_impl(&fn_text(&vs[0]), fn_int(&vs[1])?, len)?)
@@ -47269,6 +47386,9 @@ fn expr_no_raise(e: &Expr, descs: &[Descriptor]) -> bool {
                 | SysFn::Lower
                 | SysFn::CharLength
                 | SysFn::OctetLength
+        | SysFn::OctetLengthCs(_)
+                | SysFn::OctetLength
+        | SysFn::OctetLengthCs(_)
                 | SysFn::Trim(_)
                 | SysFn::Replace
                 | SysFn::Reverse
@@ -50601,7 +50721,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                                 w.int(OP_SQL_RESPONSE).int(0);
                             } else {
                                 w.int(OP_SQL_RESPONSE).int(1);
-                                encode_row_body(&mut w, &pcols, &values);
+                                encode_row_body(&mut w, &pcols, &values, None).ok();
                             }
                             w.int(OP_RESPONSE)
                                 .int(TX_HANDLE)
@@ -50640,7 +50760,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                                 w.int(OP_SQL_RESPONSE).int(0); // no message
                             } else {
                                 w.int(OP_SQL_RESPONSE).int(1);
-                                encode_row_body(&mut w, &pcols, &values);
+                                encode_row_body(&mut w, &pcols, &values, None).ok();
                             }
                             // the op_response that closes the execute
                             w.int(OP_RESPONSE)
@@ -50749,7 +50869,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                                         w.int(OP_SQL_RESPONSE).int(0); // no message
                                     } else {
                                         w.int(OP_SQL_RESPONSE).int(1);
-                                        encode_row_body(&mut w, &rcols, &values);
+                                        encode_row_body(&mut w, &rcols, &values, None).ok();
                                     }
                                     w.int(OP_RESPONSE)
                                         .int(TX_HANDLE)
@@ -60852,10 +60972,10 @@ mod tests {
     /// makes fire-crab's patch-then-write order indistinguishable.
     #[test]
     fn filter_pins_one_row_wants_a_full_unique_key_equality() {
-        let uniq = IndexOp { id: 1, segs: vec![(0, 8, 0)], descending: false, unique: true };
+        let uniq = IndexOp { id: 1, segs: vec![(0, 8, 0, 0)], descending: false, unique: true };
         let compound =
-            IndexOp { id: 2, segs: vec![(0, 8, 0), (1, 8, 0)], descending: false, unique: true };
-        let nonuniq = IndexOp { id: 3, segs: vec![(0, 8, 0)], descending: false, unique: false };
+            IndexOp { id: 2, segs: vec![(0, 8, 0, 0), (1, 8, 0, 0)], descending: false, unique: true };
+        let nonuniq = IndexOp { id: 3, segs: vec![(0, 8, 0, 0)], descending: false, unique: false };
         let eq0 = || Term::Cmp(0, Cmp::Eq, Rhs::Int(3));
         let eq1 = || Term::Cmp(1, Cmp::Eq, Rhs::Int(4));
         // no WHERE at all is the whole table
@@ -60942,7 +61062,7 @@ mod tests {
         // scan and an index retrieval differ in what they READ, and the
         // Filter/Sort above them is identical either way
         let pick = IndexPick {
-            op: IndexOp { id: 2, segs: vec![(0, 8, 0)], descending: false, unique: true },
+            op: IndexOp { id: 2, segs: vec![(0, 8, 0, 0)], descending: false, unique: true },
             lo: Some((vec![0xC0, 8], true)),
             hi: Some((vec![0xC0, 8], true)),
             navigate: false,
@@ -61033,7 +61153,7 @@ mod tests {
         // predicate cannot catch, because the row genuinely matches.
         let op = IndexOp {
             id: 0,
-            segs: vec![(0, fire_crab_ods::btw::IDX_NUMERIC, 0)],
+            segs: vec![(0, fire_crab_ods::btw::IDX_NUMERIC, 0, 0)],
             descending: false,
             unique: true,
         };

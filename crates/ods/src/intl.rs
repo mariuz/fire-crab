@@ -35,13 +35,18 @@
 //! table against that catalogue row by row, and fails if the engine ever
 //! disagrees.
 //!
-//! Deliberately NOT here: transliteration. The engine converts a
-//! WIN1252 column's bytes into the connection's character set on the way
-//! out; fire-crab passes the stored bytes through. For ASCII content
-//! - which is what every fixture and every gate uses - the two are
-//! identical, and for a high byte they are not. That is a codepage-table
-//! job, it is recorded in the roadmap, and this module does not pretend
-//! to do it.
+//! ~~Deliberately NOT here: transliteration.~~ The codepage tables ARE
+//! here now (`decode_text`/`encode_text`, WIN1252 and ISO8859_1,
+//! bijective on all 256 bytes): a stored 0xE9 decodes to 'é' instead of
+//! the lossy replacement character that DESTROYED the value, the store
+//! path writes the codepage's bytes (the bytes the engine writes and
+//! reads), index keys carry them (`KeySeg::charset`), and the wire
+//! encode re-spells a value into a single-byte attachment's codepage.
+//! An unmappable character refuses where the engine raises SQLSTATE
+//! 22018. Gated by `qa/serve-real-xlit.sh` against live twins. Sets
+//! with no table here (the DOS codepages, the CJK multibyte sets) keep
+//! the pre-table lossy read - `decode_text` answers `None` and every
+//! caller falls back - so adding one is one table, not a new seam.
 
 /// The character set id from a text descriptor's `sub_type` (ttype).
 pub fn charset_id(sub_type: i16) -> u8 {
@@ -181,5 +186,130 @@ mod tests {
         assert_eq!(bytes_per_char(69), 4);
         assert_eq!(bytes_per_char(3), 3);
         assert_eq!(bytes_per_char(56), 2);
+    }
+}
+
+/// `CHARACTER SET ISO8859_1` - Latin-1, identity to U+00..U+FF.
+pub const CS_ISO8859_1: u8 = 21;
+/// `CHARACTER SET WIN1252` - Latin-1 with the 0x80..0x9F row remapped.
+pub const CS_WIN1252: u8 = 53;
+
+/// The WIN1252 0x80..0x9F row: Microsoft's cp1252 assignments, with the
+/// five unassigned bytes (0x81, 0x8D, 0x8F, 0x90, 0x9D) kept at their
+/// C1 control points - which is what makes the mapping a BIJECTION on
+/// all 256 bytes, so a decode/encode round trip reproduces the stored
+/// bytes exactly (the NONE-attachment read path depends on that).
+const WIN1252_HIGH: [char; 32] = [
+    '\u{20AC}', '\u{0081}', '\u{201A}', '\u{0192}', '\u{201E}', '\u{2026}',
+    '\u{2020}', '\u{2021}', '\u{02C6}', '\u{2030}', '\u{0160}', '\u{2039}',
+    '\u{0152}', '\u{008D}', '\u{017D}', '\u{008F}', '\u{0090}', '\u{2018}',
+    '\u{2019}', '\u{201C}', '\u{201D}', '\u{2022}', '\u{2013}', '\u{2014}',
+    '\u{02DC}', '\u{2122}', '\u{0161}', '\u{203A}', '\u{0153}', '\u{009D}',
+    '\u{017E}', '\u{0178}',
+];
+
+/// Decode one byte of a TABLED single-byte character set, or `None` when
+/// the set is not tabled here (multibyte, NONE/OCTETS/ASCII, or a set no
+/// table was written for - the caller keeps its previous behaviour).
+fn single_byte_char(charset: u8, b: u8) -> Option<char> {
+    match charset {
+        CS_ISO8859_1 => Some(b as char),
+        CS_WIN1252 => Some(if (0x80..=0x9F).contains(&b) {
+            WIN1252_HIGH[(b - 0x80) as usize]
+        } else {
+            b as char
+        }),
+        _ => None,
+    }
+}
+
+/// Encode one character into a TABLED single-byte character set.
+/// `Ok(None)` = the set is not tabled; `Err(())` = the character has no
+/// image there (the engine's *Cannot transliterate character between
+/// character sets*, SQLSTATE 22018).
+fn single_byte_of(charset: u8, c: char) -> Result<Option<u8>, ()> {
+    match charset {
+        CS_ISO8859_1 => match u32::from(c) {
+            v @ 0..=0xFF => Ok(Some(v as u8)),
+            _ => Err(()),
+        },
+        CS_WIN1252 => {
+            let v = u32::from(c);
+            if (0x80..=0x9F).contains(&v) || v > 0xFF {
+                match WIN1252_HIGH.iter().position(|&h| h == c) {
+                    Some(i) => Ok(Some(0x80 + i as u8)),
+                    None => Err(()),
+                }
+            } else {
+                Ok(Some(v as u8))
+            }
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Is this character set one the codepage tables here can convert?
+pub fn tabled(charset: u8) -> bool {
+    matches!(charset, CS_ISO8859_1 | CS_WIN1252)
+}
+
+/// Decode a TABLED single-byte column's stored bytes into text, or
+/// `None` when the set is not tabled (the caller keeps its lossy-UTF8
+/// reading, the pre-table behaviour).
+pub fn decode_text(charset: u8, bytes: &[u8]) -> Option<String> {
+    if !tabled(charset) {
+        return None;
+    }
+    Some(bytes.iter().map(|&b| single_byte_char(charset, b).unwrap()).collect())
+}
+
+/// Encode text into a TABLED single-byte character set. `Ok(None)` = the
+/// set is not tabled (caller stores UTF-8 bytes as before); `Err(c)` =
+/// `c` has no image in the set - the engine raises SQLSTATE 22018,
+/// *Cannot transliterate character between character sets*.
+pub fn encode_text(charset: u8, s: &str) -> Result<Option<Vec<u8>>, char> {
+    if !tabled(charset) {
+        return Ok(None);
+    }
+    let mut out = Vec::with_capacity(s.len());
+    for c in s.chars() {
+        match single_byte_of(charset, c) {
+            Ok(Some(b)) => out.push(b),
+            Ok(None) => unreachable!("tabled() gated"),
+            Err(()) => return Err(c),
+        }
+    }
+    Ok(Some(out))
+}
+
+#[cfg(test)]
+mod xlit_tests {
+    use super::*;
+
+    #[test]
+    fn win1252_round_trips_all_256_bytes() {
+        for b in 0..=255u8 {
+            let c = single_byte_char(CS_WIN1252, b).unwrap();
+            assert_eq!(single_byte_of(CS_WIN1252, c), Ok(Some(b)), "byte {b:#x}");
+        }
+        // the marquee mappings, spot-checked against cp1252
+        assert_eq!(single_byte_char(CS_WIN1252, 0x80), Some('\u{20AC}')); // euro
+        assert_eq!(single_byte_char(CS_WIN1252, 0xE9), Some('é'));
+        assert_eq!(single_byte_of(CS_WIN1252, '€'), Ok(Some(0x80)));
+        assert_eq!(single_byte_of(CS_WIN1252, '₹'), Err(())); // unmappable
+    }
+
+    #[test]
+    fn iso8859_1_is_the_identity() {
+        assert_eq!(decode_text(CS_ISO8859_1, &[0x61, 0xE9]), Some("aé".into()));
+        assert_eq!(encode_text(CS_ISO8859_1, "aé"), Ok(Some(vec![0x61, 0xE9])));
+        assert_eq!(encode_text(CS_ISO8859_1, "€"), Err('€'));
+    }
+
+    #[test]
+    fn untabled_sets_answer_none() {
+        assert_eq!(decode_text(CS_UTF8, b"ab"), None);
+        assert_eq!(decode_text(CS_NONE, b"ab"), None);
+        assert_eq!(encode_text(CS_UTF8, "ab"), Ok(None));
     }
 }

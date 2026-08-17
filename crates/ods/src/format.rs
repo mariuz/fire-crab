@@ -381,14 +381,25 @@ pub fn decode_field(image: &[u8], desc: &Descriptor, index: usize) -> Value {
             // char_len - the engine's own output is padded too, so the
             // trim-then-pad is an identity on what it returns.
             let end = f.iter().rposition(|&b| b != b' ').map_or(0, |i| i + 1);
+            // a TABLED single-byte set (WIN1252, ISO8859_1) decodes by
+            // its codepage - a 0xE9 is 'é', not an invalid-UTF8 byte the
+            // lossy read replaced (which destroyed the stored value:
+            // OCTET_LENGTH counted the replacement's three bytes)
+            let cs = crate::intl::charset_id(desc.sub_type);
+            let text = crate::intl::decode_text(cs, &f[..end])
+                .unwrap_or_else(|| String::from_utf8_lossy(&f[..end]).into_owned());
             Value::Text(crate::intl::fit_char(
-                &String::from_utf8_lossy(&f[..end]),
+                &text,
                 crate::intl::char_length(desc.dtype, desc.length, desc.sub_type),
             ))
         }
         dtype::VARYING => {
             let n = (u16_at(f, 0) as usize).min(len.saturating_sub(2));
-            Value::Text(String::from_utf8_lossy(&f[2..2 + n]).into_owned())
+            let cs = crate::intl::charset_id(desc.sub_type);
+            Value::Text(
+                crate::intl::decode_text(cs, &f[2..2 + n])
+                    .unwrap_or_else(|| String::from_utf8_lossy(&f[2..2 + n]).into_owned()),
+            )
         }
         dtype::SHORT => scaled_or_int(u16_at(f, 0) as i16 as i64, desc.scale),
         dtype::LONG => scaled_or_int(u32_at(f, 0) as i32 as i64, desc.scale),

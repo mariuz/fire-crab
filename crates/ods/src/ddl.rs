@@ -429,6 +429,8 @@ fn maintain_indexes(
                 itype: *itype,
                 value: key_values.get(*field as usize).unwrap_or(&null),
                 scale: descs.get(*field as usize).map_or(0, |d| d.scale),
+                // system-catalog text is UTF8/metadata - no codepage
+                charset: 0,
             })
             .collect();
         let (key, all_null) = btw::build_index_key(&key_segs, iflags & btw::IRT_DESCENDING != 0)
@@ -5383,6 +5385,9 @@ fn backfill_index(
                     itype: *itype,
                     value: values.get(*field as usize).unwrap_or(&null),
                     scale: *scale,
+                    charset: descs
+                        .get(*field as usize)
+                        .map_or(0, |d| crate::intl::charset_id(d.sub_type)),
                 })
                 .collect();
             let (key, all_null) = btw::build_index_key(&key_segs, descending)
@@ -5838,6 +5843,9 @@ fn index_selectivity(
                         itype: *itype,
                         value: values.get(*field as usize).unwrap_or(&null),
                         scale: *scale,
+                        charset: descs
+                            .get(*field as usize)
+                            .map_or(0, |d| crate::intl::charset_id(d.sub_type)),
                     })
                     .collect();
                 let (key, _) = btw::build_index_key(&key_segs, descending)
