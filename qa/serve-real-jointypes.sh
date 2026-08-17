@@ -164,6 +164,27 @@ on_cmp "with >=" "A.K >= C.K"
 on_cmp "with <>" "A.K <> C.K"
 on_cmp "an AND of two different operators" "A.K = C.K AND A.ID > C.K"
 on_cmp "an OR in the ON" "A.K = C.K OR A.ID = 1"
+
+# --- the WHOLE fetch of a plain join STREAMS a driver row at a time -----
+# A bare join (no FIRST, no ORDER BY) is served by a RESUMABLE JOIN CURSOR:
+# it materialises the two SIDES and produces the join a driver row at a
+# time, so a client reading part of a big theta join pays O(fetched), not
+# O(N x M). These pin its CORRECTNESS - the same rows, in the same order,
+# as the engine's - across the two arms the cursor drives: a theta ON with
+# no index (the whole inner is scanned) and an unindexed equi ON (the inner
+# is hashed). Both A.K and C.K are unindexed, so neither has an index probe
+# and the whole-output materialisation these replace was the last O(N x M)
+# join shape. (A driver-recno order that matches the engine's here is what
+# lets the twin compare without an ORDER BY - which would send it back to
+# the materialising, non-streaming path.)
+both "the WHOLE theta join, no FIRST, streams" \
+     "SELECT A.ID AS AID, C.ID AS CID FROM A JOIN C ON A.K > C.K"
+both "the WHOLE unindexed equi-join (hashed), no FIRST, streams" \
+     "SELECT A.ID AS AID, C.ID AS CID FROM A JOIN C ON A.K = C.K"
+both "the WHOLE LEFT theta join pads and streams" \
+     "SELECT A.ID AS AID, C.ID AS CID FROM A LEFT JOIN C ON A.K > C.K"
+both "a WHERE above the WHOLE streamed join" \
+     "SELECT A.ID AS AID, C.ID AS CID FROM A JOIN C ON A.K > C.K WHERE A.ID > 2"
 # a NULL key never joins, whatever the operator - the comparison is
 # UNKNOWN, so the row is padded by an outer join and dropped by an
 # inner. Row 4's AMT is NULL, so it is the padded one.

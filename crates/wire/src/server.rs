@@ -28647,6 +28647,224 @@ impl StreamCursor {
     }
 }
 
+/// A resumable cursor over a plain single-JOIN whose OUTPUT would
+/// otherwise be materialised WHOLE before the first batch. The batch
+/// fetch's fallback runs `join_rows` and holds every combined row - so a
+/// `SELECT ... FROM A JOIN B ON A.k > B.k` with no FIRST/ORDER BY built
+/// the entire N x M product just to hand back the first `want` rows. This
+/// cursor materialises the two SIDES (O(N + M)) and produces the join a
+/// DRIVER ROW AT A TIME, remembering where it stopped, so reading part of
+/// a big join costs O(fetched), not O(N x M).
+///
+/// It is [StreamCursor] for the join shape: the same lazy-cursor answer,
+/// for the one join the executor can resume without re-deriving. BOTH
+/// SIDES are decoded into `Vec`s at open, so - like a materialised cursor
+/// and like `StreamCursor`'s frozen image - the rows are the ones the
+/// transaction saw when the cursor opened, stable across fetches even as
+/// others commit. The per-driver step reads only those buffers (no
+/// database, no live probe), which is what makes it both resumable and
+/// snapshot-stable.
+///
+/// STREAMABLE SHAPES ONLY. A bare `Plan::Join` (no wrapping FIRST/SKIP -
+/// those already stream via `stream_first_n`), a SINGLE part (a two-table
+/// join; a longer chain's driver is itself a join and materialising it is
+/// already O(N x M)), a LEFT or INNER kind (a RIGHT/FULL mirror emits the
+/// unmatched rows of the OTHER side, which is not resumable one driver row
+/// at a time), no ORDER BY (a sort must see every combined row), and NO
+/// LIVE INDEX PROBE on the inner (its rows come from a per-driver index
+/// read against the live database, which a frozen cursor cannot repeat
+/// consistently). The inner is then always materialised whole - a theta
+/// join scans it, an unindexed equi-join hashes it - which is exactly the
+/// shape whose OUTPUT the fallback was building in full. [JoinCursor::open]
+/// answers `None` for everything else, leaving the materialising path in
+/// charge.
+struct JoinCursor {
+    /// the driver side, decoded once at open (O(N))
+    driver: Vec<Vec<Value>>,
+    left_width: usize,
+    /// the single join part - its ON, kind, width and (hash) probe
+    part: JoinPart,
+    /// the inner side, decoded once at open (O(M)); a theta join scans it,
+    /// an unindexed equi-join hashes it via `key_hash`
+    inner: Vec<Vec<Value>>,
+    /// the hash of the inner by its equi-key, when the ON is a hashable
+    /// equality with no index (an unindexed equi-join); `None` leaves the
+    /// ON to decide over the whole inner, as a theta join needs
+    key_hash: Option<KeyHash>,
+    /// the WHERE above the join: it gates the ON's raising on a partnerless
+    /// row (`join_step`) AND filters the combined rows (the top `Filter` of
+    /// `join_rowsource`), so it is applied in both places, exactly as the
+    /// materialising path does
+    above: Option<Predicate>,
+    /// the output projection, applied per combined row that the WHERE keeps
+    cols: Vec<ProjCol>,
+    /// a hit's gathered inner rows, reused across drivers (as the streaming
+    /// join arm's `scan_buf` is)
+    scan_buf: Vec<Vec<Value>>,
+    /// resume position: the next driver index, the current driver's
+    /// produced-and-projected output rows, and the next index into them
+    di: usize,
+    pending: Vec<Vec<Value>>,
+    pj: usize,
+    done: bool,
+}
+
+impl JoinCursor {
+    /// Open a cursor for a streamable bare join, or `None` to leave the
+    /// materialising path in charge. `args` binds the WHERE's parameters
+    /// and (via `resolve_driver_base`) the deferred driver band.
+    fn open(db: &Database, plan: &Plan, args: &[WireParam]) -> Option<JoinCursor> {
+        let Plan::Join { base, base_width, parts, cols, filter, order_by, defer } = plan else {
+            return None;
+        };
+        // a sort must see every combined row; FIRST/SKIP already stream via
+        // stream_first_n (this is the BARE join)
+        if !order_by.is_empty() {
+            return None;
+        }
+        // ONE part only: a longer chain's driver is itself a join, so
+        // materialising it is already O(N x M) and the O(N + M) promise is
+        // lost
+        let [part] = parts.as_slice() else {
+            return None;
+        };
+        // RIGHT/FULL emit their mirror - the unmatched rows of the other
+        // side - which the driver-at-a-time walk cannot resume
+        if !matches!(part.kind, JoinKind::Left | JoinKind::Inner) {
+            return None;
+        }
+        // a LIVE INDEX PROBE reads the inner per driver from the current
+        // database, which a frozen cursor cannot repeat consistently across
+        // fetches. `probe = None` (a theta join) or an unindexed equi-join
+        // (`index = None`, hashed) both materialise the inner WHOLE, which
+        // is the shape whose output the fallback built in full.
+        if part.probe.as_ref().is_some_and(|p| p.index.is_some()) {
+            return None;
+        }
+        let above = bind_filter(filter, args).ok()?;
+        let base = resolve_driver_base(db, base, defer, &above);
+        // both sides decoded once, frozen for the cursor's life
+        let driver = base.rows(db).ok()?;
+        let inner = part.src.rows(db).ok()?;
+        // an unindexed equi-join hashes its inner by the ON's key; a theta
+        // join (no probe, or a key the hash declines) leaves it `None` and
+        // the ON scans the whole inner
+        let key_hash = part.probe.as_ref().and_then(|p| build_join_key_hash(&inner, p));
+        Some(JoinCursor {
+            driver,
+            left_width: *base_width,
+            part: part.clone(),
+            inner,
+            key_hash,
+            above,
+            cols: cols.clone(),
+            scan_buf: Vec::new(),
+            di: 0,
+            pending: Vec::new(),
+            pj: 0,
+            done: false,
+        })
+    }
+
+    /// The next up-to-`want` PROJECTED output rows, resuming where the last
+    /// batch stopped. The bool is "the cursor is now exhausted". Rows come
+    /// back ALREADY PROJECTED (one value per output column, in output
+    /// order), so the caller encodes them positionally, as the
+    /// materialised `Plan::Rows` path does.
+    fn next_batch(&mut self, want: usize) -> Result<(Vec<Vec<Value>>, bool), EvalErr> {
+        if self.done || want == 0 {
+            return Ok((Vec::new(), self.done));
+        }
+        let mut out: Vec<Vec<Value>> = Vec::with_capacity(want);
+        loop {
+            // deliver the current driver's remaining rows first
+            while self.pj < self.pending.len() {
+                out.push(std::mem::take(&mut self.pending[self.pj]));
+                self.pj += 1;
+                if out.len() >= want {
+                    return Ok((out, false));
+                }
+            }
+            // that driver is drained; step to the next
+            if self.di >= self.driver.len() {
+                self.finish();
+                return Ok((out, true));
+            }
+            let driver_row = self.driver[self.di].clone();
+            self.di += 1;
+            self.pending = self.driver_output(driver_row)?;
+            self.pj = 0;
+        }
+    }
+
+    /// Mark the cursor exhausted AND free its side buffers. The cursor is
+    /// NOT removed from the fetch map when it finishes (the drive site keeps
+    /// it) - a client's fetch-until-empty loop sends one op_fetch PAST the
+    /// last row, and a removed cursor would be RE-OPENED and re-deliver the
+    /// whole join (a materialised `Plan::Rows` survives the same extra fetch
+    /// because it was drained to empty in place). So the exhausted cursor
+    /// stays and answers that fetch empty; freeing the O(N + M) buffers here
+    /// keeps it from holding both sides until the statement is re-executed.
+    fn finish(&mut self) {
+        self.done = true;
+        self.driver = Vec::new();
+        self.inner = Vec::new();
+        self.pending = Vec::new();
+        self.key_hash = None;
+        self.scan_buf = Vec::new();
+    }
+
+    /// One driver row's combined-and-projected output: match it against the
+    /// inner (whole, or its hash bucket), keep what the WHERE admits, and
+    /// project. This is the streaming LEFT/INNER join arm ([RowSource::for_each])
+    /// for a single driver row, then the top `Filter` and the projection -
+    /// the same three steps `join_rowsource` composes, so the rows and their
+    /// order are exactly what the materialising path produces.
+    fn driver_output(&mut self, driver_row: Vec<Value>) -> Result<Vec<Vec<Value>>, EvalErr> {
+        // disjoint field borrows: the step reads `part`/`inner`/`key_hash`
+        // and writes `scan_buf`, and the projection reads `cols`/`above`
+        let JoinCursor { part, left_width, inner, key_hash, above, cols, scan_buf, .. } = self;
+        let combined = match part.probe.as_ref() {
+            // a theta join (or any ON the hash declined): the ON decides
+            // over the whole inner
+            None => join_step(vec![driver_row], *left_width, inner, part, above)?,
+            // an unindexed equi-join: the driver pairs with its hash bucket
+            // (the whole inner when the key's family differs), and the ON
+            // decides over that, exactly as the scan fallback does
+            Some(probe) => {
+                let matched = join_scan_rows(&driver_row, probe, inner, key_hash.as_ref(), scan_buf);
+                join_step(vec![driver_row], *left_width, matched, part, above)?
+            }
+        };
+        let mut out = Vec::new();
+        for row in combined {
+            let keep = match above {
+                None => true,
+                Some(p) => p.matches(&row)?,
+            };
+            if keep {
+                let mut projected = Vec::with_capacity(cols.len());
+                for c in cols.iter() {
+                    projected.push(c.value_of(&row)?);
+                }
+                out.push(projected);
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// One of the two resumable fetch cursors, keyed by statement handle in
+/// the fetch loop's `cursors` map: a plain full SCAN ([StreamCursor]) or a
+/// single JOIN ([JoinCursor]). Both hand back up to `want` rows per batch
+/// and remember where they stopped; they differ in what a row IS - a
+/// scan's are decoded RECORDS the caller still projects, a join's are
+/// ALREADY PROJECTED - so the drive site encodes each accordingly.
+enum RowCursor {
+    Scan(StreamCursor),
+    Join(JoinCursor),
+}
+
 /// [records_at_in] with the page map already built - the form a
 /// retrieval loop wants, so the walk above happens once and not once per
 /// row.
@@ -47566,7 +47784,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
     // hold open across another statement's fetches. Opened lazily on the
     // first fetch of a streamable plan; dropped when the cursor ends, is
     // re-executed, or is freed.
-    let mut cursors: std::collections::HashMap<i32, StreamCursor> =
+    let mut cursors: std::collections::HashMap<i32, RowCursor> =
         std::collections::HashMap::new();
     let mut cur_stmt: i32 = 3;
     // handles run 3, 4, 5, ... - starting at 3 keeps the first one the
@@ -48808,28 +49026,65 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                         && !matches!(&*plan, Plan::Rows { .. })
                     {
                         if let Some(db) = database.as_ref() {
+                            // a plain full scan streams as a StreamCursor; a
+                            // bare single join whose OUTPUT the fallback
+                            // would materialise whole streams as a JoinCursor
+                            // (both sides O(N + M), the product a driver row
+                            // at a time). Everything else is left to the
+                            // materialising path below.
                             if let Some(c) = StreamCursor::open(db, &*plan, &bound_args) {
-                                cursors.insert(cur_stmt, c);
+                                cursors.insert(cur_stmt, RowCursor::Scan(c));
+                            } else if let Some(c) = JoinCursor::open(db, &*plan, &bound_args) {
+                                cursors.insert(cur_stmt, RowCursor::Join(c));
                             }
                         }
                     }
                     if cursors.contains_key(&cur_stmt) {
                         if let Some(db) = database.as_ref() {
-                            let cols: &[ProjCol] = match &*plan {
-                                Plan::Project { cols, .. } => cols,
-                                _ => &[],
-                            };
                             let mut w = W::default();
-                            let batch = cursors
-                                .get_mut(&cur_stmt)
-                                .unwrap()
-                                .next_batch(db, want as usize);
+                            // a scan hands back decoded RECORDS the plan's
+                            // columns still project; a join hands back rows
+                            // ALREADY PROJECTED, encoded POSITIONALLY like the
+                            // materialised `Plan::Rows` path.
+                            // a SCAN cursor is REMOVED when it finishes - a
+                            // client's fetch-until-empty loop does not send an
+                            // extra op_fetch past its short final batch. A
+                            // JOIN cursor can produce its whole result in one
+                            // batch and still see one extra fetch; it is KEPT
+                            // (finished, buffers freed) so that fetch answers
+                            // empty rather than RE-OPENING and re-delivering
+                            // the join.
+                            let (batch, enc_cols, keep_on_done): (
+                                Result<(Vec<Vec<Value>>, bool), EvalErr>,
+                                Vec<ProjCol>,
+                                bool,
+                            ) = match cursors.get_mut(&cur_stmt).unwrap() {
+                                RowCursor::Scan(c) => {
+                                    let cols = match &*plan {
+                                        Plan::Project { cols, .. } => cols.clone(),
+                                        _ => Vec::new(),
+                                    };
+                                    (c.next_batch(db, want as usize), cols, false)
+                                }
+                                RowCursor::Join(c) => {
+                                    let cols = output_cols_of(&*plan)
+                                        .iter()
+                                        .enumerate()
+                                        .map(|(i, c)| ProjCol {
+                                            field_id: i,
+                                            expr: None,
+                                            ..c.clone()
+                                        })
+                                        .collect();
+                                    (c.next_batch(want as usize), cols, true)
+                                }
+                            };
                             match batch {
                                 Ok((rows, done)) => {
                                     let mut err = None;
                                     for rec in &rows {
                                         if let Err(e) =
-                                            encode_row(&mut w, cols, rec, out_fmt.as_ref())
+                                            encode_row(&mut w, &enc_cols, rec, out_fmt.as_ref())
                                         {
                                             err = Some(e);
                                             break;
@@ -48845,7 +49100,9 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                                         }
                                         None if done => {
                                             w.int(OP_FETCH_RESPONSE).int(100).int(0);
-                                            cursors.remove(&cur_stmt);
+                                            if !keep_on_done {
+                                                cursors.remove(&cur_stmt);
+                                            }
                                         }
                                         // end of BATCH, rows still to come
                                         None => {
