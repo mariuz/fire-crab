@@ -313,3 +313,58 @@ mod xlit_tests {
         assert_eq!(encode_text(CS_UTF8, "ab"), Ok(None));
     }
 }
+
+/// `CHARACTER SET ASCII`.
+pub const CS_ASCII: u8 = 2;
+
+/// Is this a BYTE-CARRIER set - NONE, OCTETS or ASCII? Their values
+/// have no character semantics beyond the byte, the engine never
+/// transliterates them (a stored 0xE9 travels 0xE9 to a UTF8 attachment,
+/// measured), and CHAR_LENGTH counts their BYTES. Inside fire-crab such
+/// a value is carried as one char per byte (U+0000..U+00FF - the
+/// Latin-1 carrier), which round-trips every byte losslessly where the
+/// old lossy-UTF8 read destroyed the high ones.
+pub fn byte_carrier(charset: u8) -> bool {
+    matches!(charset, CS_NONE | CS_OCTETS | CS_ASCII)
+}
+
+/// Decode a byte-carrier value: one char per byte.
+pub fn carrier_decode(bytes: &[u8]) -> String {
+    bytes.iter().map(|&b| b as char).collect()
+}
+
+/// Re-spell text into a byte-carrier's bytes. `None` when a char is
+/// past U+00FF - text that never came from a carrier decode; the caller
+/// falls back to its UTF-8 bytes (the engine's own rule for a value
+/// ARRIVING at a NONE column: the client's bytes are stored verbatim).
+pub fn carrier_encode(s: &str) -> Option<Vec<u8>> {
+    s.chars()
+        .map(|c| u8::try_from(u32::from(c)).ok())
+        .collect()
+}
+
+/// Lift REAL text (a literal, a parameter - UTF-8 semantics) into the
+/// carrier: the char-per-byte spelling of its UTF-8 bytes. This is what
+/// the engine does with a value arriving at a NONE column or compared
+/// against one - the bytes are the value.
+pub fn to_carrier(s: &str) -> String {
+    carrier_decode(s.as_bytes())
+}
+
+#[cfg(test)]
+mod carrier_tests {
+    use super::*;
+
+    #[test]
+    fn the_carrier_round_trips_every_byte() {
+        let all: Vec<u8> = (0..=255u8).collect();
+        assert_eq!(carrier_encode(&carrier_decode(&all)).unwrap(), all);
+        // ASCII is the identity in and out
+        assert_eq!(carrier_decode(b"plain"), "plain");
+        assert_eq!(to_carrier("plain"), "plain");
+        // a real 'é' lifts to its two UTF-8 bytes
+        assert_eq!(to_carrier("é"), "\u{c3}\u{a9}");
+        // and a non-Latin-1 char refuses the byte spelling
+        assert_eq!(carrier_encode("₹"), None);
+    }
+}

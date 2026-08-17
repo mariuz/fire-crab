@@ -150,9 +150,30 @@ measured or pinned items**, each recorded in its own place below:
   UPDATEs maintain the tree with the engine's own keys (verified:
   the engine finds fc's 'süß' — [73,FC,DF] in the dump — through ITS
   index, gfix -v -full clean), and fc's own retrieval bands the
-  codepage key. serve-real-xlit.sh 14 -> 17. Still held: a NONE
-  column's high bytes (lossy at decode, recorded of old); the untabled
-  codepages and the real collations.
+  codepage key. serve-real-xlit.sh 14 -> 17. ~~Still held: a NONE
+  column's high bytes.~~ — TAKEN: NONE (with OCTETS and ASCII) is a
+  BYTE CARRIER now. The engine never transliterates such a column (a
+  stored 0xE9 reaches a UTF8 attachment as the one byte 0xE9,
+  measured), CHAR_LENGTH counts its bytes, comparison is byte-wise,
+  and its index keys are the raw bytes ([72,61,74,E9] for a raw-byte
+  row, off a live engine index). fire-crab carries such values one
+  char per byte (the Latin-1 carrier, `carrier_decode`/
+  `carrier_encode` - lossless where the lossy-UTF8 read destroyed the
+  high bytes of engine-written rows): the DECODE speaks it, index KEYS
+  encode back to the raw bytes, the WIRE hands every attachment the
+  stored bytes verbatim, OCTET_LENGTH counts the carrier's bytes, and
+  a REAL literal compared against a carrier column is LIFTED to the
+  carrier of its own UTF-8 bytes (one transform in
+  `param_or_typed_term`, where the descriptor is) - so 'café' meets
+  the stored C3 A9 pair and not a raw E9, the engine's byte compare.
+  The STORE keeps the client-boundary rule (a literal's UTF-8 bytes
+  verbatim - already the engine's behaviour); a cross-charset
+  INSERT..SELECT INTO a NONE column diverges (the engine copies the
+  source codepage's bytes, fc stores the decoded text's UTF-8) -
+  recorded. ASCII content is the identity through every seam, which is
+  why the whole existing gate surface is untouched.
+  serve-real-xlit.sh 17 -> 20. Still held: the untabled codepages and
+  the real collations.
 
 The rest of this document records how the surface got here and every one
 of those boundaries.

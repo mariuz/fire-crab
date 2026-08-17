@@ -386,8 +386,15 @@ pub fn decode_field(image: &[u8], desc: &Descriptor, index: usize) -> Value {
             // lossy read replaced (which destroyed the stored value:
             // OCTET_LENGTH counted the replacement's three bytes)
             let cs = crate::intl::charset_id(desc.sub_type);
-            let text = crate::intl::decode_text(cs, &f[..end])
-                .unwrap_or_else(|| String::from_utf8_lossy(&f[..end]).into_owned());
+            // a BYTE-CARRIER set (NONE/OCTETS/ASCII) decodes one char per
+            // byte - lossless, where the lossy-UTF8 read destroyed the
+            // high bytes of engine-written rows
+            let text = if crate::intl::byte_carrier(cs) {
+                crate::intl::carrier_decode(&f[..end])
+            } else {
+                crate::intl::decode_text(cs, &f[..end])
+                    .unwrap_or_else(|| String::from_utf8_lossy(&f[..end]).into_owned())
+            };
             Value::Text(crate::intl::fit_char(
                 &text,
                 crate::intl::char_length(desc.dtype, desc.length, desc.sub_type),
@@ -396,10 +403,12 @@ pub fn decode_field(image: &[u8], desc: &Descriptor, index: usize) -> Value {
         dtype::VARYING => {
             let n = (u16_at(f, 0) as usize).min(len.saturating_sub(2));
             let cs = crate::intl::charset_id(desc.sub_type);
-            Value::Text(
+            Value::Text(if crate::intl::byte_carrier(cs) {
+                crate::intl::carrier_decode(&f[2..2 + n])
+            } else {
                 crate::intl::decode_text(cs, &f[2..2 + n])
-                    .unwrap_or_else(|| String::from_utf8_lossy(&f[2..2 + n]).into_owned()),
-            )
+                    .unwrap_or_else(|| String::from_utf8_lossy(&f[2..2 + n]).into_owned())
+            })
         }
         dtype::SHORT => scaled_or_int(u16_at(f, 0) as i16 as i64, desc.scale),
         dtype::LONG => scaled_or_int(u32_at(f, 0) as i32 as i64, desc.scale),

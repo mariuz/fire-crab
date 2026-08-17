@@ -217,7 +217,52 @@ else
     fail=1
 fi
 
-# --- 6. the file survives the engine's own verifier --------------------
+# --- 6. NONE is a BYTE CARRIER -----------------------------------------
+# a NONE column holds bytes with no charset semantics: the engine never
+# transliterates them (a stored 0xE9 reaches a UTF8 attachment as the
+# one byte 0xE9, measured), CHAR_LENGTH counts bytes, and comparison is
+# byte-wise - a UTF-8 literal's C3 A9 pair matches a C3 A9 row and NOT a
+# raw E9 one. fire-crab carries such values one char per byte (the
+# Latin-1 carrier), which round-trips every byte the old lossy-UTF8 read
+# destroyed. The raw-byte row comes from a WIN1252 -> NONE copy: the
+# engine copies the codepage bytes verbatim.
+"$ISQL" -q -b -ch UTF8 -user "$U" -pas "$P" "$FC" <<'EOF' >/dev/null 2>&1
+CREATE TABLE NB (ID INTEGER, S VARCHAR(10) CHARACTER SET NONE);
+CREATE INDEX IDX_NB_S ON NB (S);
+COMMIT;
+INSERT INTO NB VALUES (1, 'café');
+INSERT INTO NB SELECT 2, W FROM XL WHERE ID = 1;
+COMMIT;
+EOF
+ran=$((ran + 1))
+a=$(node_q "SELECT ID, OCTET_LENGTH(S) AS O, CHAR_LENGTH(S) AS C FROM NB ORDER BY ID")
+b=$(isql_q "$FC" "SELECT ID, OCTET_LENGTH(S) AS O, CHAR_LENGTH(S) AS C FROM NB ORDER BY ID")
+if [ "$a" = "$b" ] && [ -n "$a" ]; then
+    echo "OK   NONE lengths count BYTES on both sides ($a)"
+else
+    echo "DIFF NONE lengths: fc [$a] engine [$b]"
+    fail=1
+fi
+ran=$((ran + 1))
+a=$(node_q "SELECT ID FROM NB WHERE S = 'café'")
+b=$(isql_q "$FC" "SELECT ID FROM NB WHERE S = 'café'")
+if [ "$a" = "1" ] && [ "$b" = "1" ]; then
+    echo "OK   the byte compare: the UTF-8 literal matches its own bytes, not the raw-byte row"
+else
+    echo "DIFF NONE byte compare: fc [$a] engine [$b]"
+    fail=1
+fi
+ran=$((ran + 1))
+r=$(node_q "INSERT INTO NB VALUES (3, 'naïve')")
+got=$(isql_q "$FC" "SELECT ID FROM NB WHERE S = 'naïve'")
+if [ "$r" = "OK" ] && [ "$got" = "3" ]; then
+    echo "OK   fc writes NONE bytes the engine finds - index keys included"
+else
+    echo "DIFF NONE write-back: insert [$r], engine find [$got]"
+    fail=1
+fi
+
+# --- 7. the file survives the engine's own verifier --------------------
 ran=$((ran + 1))
 g=$("$GFIX" -v -full -user "$U" -pas "$P" "$FC" 2>&1)
 if [ -z "$g" ]; then
@@ -229,8 +274,8 @@ fi
 
 kill $srv 2>/dev/null; srv=""
 rm -f "$RE" "$FC"
-if [ "$ran" -lt 17 ]; then
-    echo "DIFF only $ran checks ran (expected at least 17) - did one silently skip?"
+if [ "$ran" -lt 20 ]; then
+    echo "DIFF only $ran checks ran (expected at least 20) - did one silently skip?"
     fail=1
 fi
 exit $fail

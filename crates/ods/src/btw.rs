@@ -244,14 +244,27 @@ pub fn index_key(itype: u16, value: &Value, scale: i8, charset: u8) -> Option<Ve
             // the set has no key: answering None SCANS, where a UTF-8
             // key would land elsewhere in the tree and silently MISS the
             // row (the LEFT-join law: a missed inner is a wrong answer).
+            // A BYTE-CARRIER column (NONE/OCTETS/ASCII) keys its carrier
+            // bytes - the raw stored bytes, measured off a live engine
+            // index ([72,61,74,E9] for a raw-byte 'rat\u{e9}').
             let owned: Vec<u8>;
-            let bytes: &[u8] = match crate::intl::encode_text(charset, s) {
-                Err(_) => return None,
-                Ok(Some(v)) => {
-                    owned = v;
-                    &owned
+            let bytes: &[u8] = if crate::intl::byte_carrier(charset) {
+                match crate::intl::carrier_encode(s) {
+                    Some(v) => {
+                        owned = v;
+                        &owned
+                    }
+                    None => return None,
                 }
-                Ok(None) => s.as_bytes(),
+            } else {
+                match crate::intl::encode_text(charset, s) {
+                    Err(_) => return None,
+                    Ok(Some(v)) => {
+                        owned = v;
+                        &owned
+                    }
+                    Ok(None) => s.as_bytes(),
+                }
             };
             let trimmed = bytes.trim_ascii_end_matches();
             Some(if trimmed.is_empty() { vec![b' '] } else { trimmed.to_vec() })

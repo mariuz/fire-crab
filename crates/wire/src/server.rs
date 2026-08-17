@@ -32956,6 +32956,24 @@ fn encode_row_body(
             }
             Wire::Varying => {
                 let s = v.render();
+                // a BYTE-CARRIER source column (NONE/OCTETS/ASCII) is
+                // never transliterated: its raw stored bytes travel to
+                // EVERY attachment (measured: a NONE column's 0xE9
+                // reaches a UTF8 attachment as the one byte 0xE9)
+                if (0..=i16::MAX as i32).contains(&c.sub_type)
+                    && fire_crab_ods::intl::byte_carrier(fire_crab_ods::intl::charset_id(
+                        c.sub_type as i16,
+                    ))
+                {
+                    if let Some(b) = fire_crab_ods::intl::carrier_encode(&s) {
+                        w.int(b.len() as i32);
+                        w.raw(&b);
+                        for _ in 0..(4 - b.len() % 4) % 4 {
+                            w.raw(&[0u8]);
+                        }
+                        continue;
+                    }
+                }
                 // a TABLED single-byte DESTINATION (a WIN1252 or
                 // ISO8859_1 attachment, or a varying2 slot declaring one)
                 // receives the value in ITS codepage - the engine
@@ -36036,7 +36054,10 @@ fn resolve_expr_inner(
                     let cs = descs
                         .get(*fid)
                         .map_or(0, |d| fire_crab_ods::intl::charset_id(d.sub_type));
-                    if fire_crab_ods::intl::tabled(cs) {
+                    // ... and a BYTE-CARRIER column's octets are its
+                    // carrier bytes, not the carrier's UTF-8 spelling
+                    if fire_crab_ods::intl::tabled(cs) || fire_crab_ods::intl::byte_carrier(cs)
+                    {
                         SysFn::OctetLengthCs(cs)
                     } else {
                         *f
@@ -39183,9 +39204,15 @@ impl Expr {
                     // somehow does
                     SysFn::OctetLengthCs(cs) => {
                         let t = fn_text(&vs[0]);
-                        let n = match fire_crab_ods::intl::encode_text(*cs, &t) {
-                            Ok(Some(b)) => b.len(),
-                            _ => t.len(),
+                        let n = if fire_crab_ods::intl::byte_carrier(*cs) {
+                            fire_crab_ods::intl::carrier_encode(&t)
+                                .map(|b| b.len())
+                                .unwrap_or(t.len())
+                        } else {
+                            match fire_crab_ods::intl::encode_text(*cs, &t) {
+                                Ok(Some(b)) => b.len(),
+                                _ => t.len(),
+                            }
                         };
                         Value::Int(n as i64)
                     }
@@ -47651,6 +47678,30 @@ fn param_or_typed_term(
     d: &Descriptor,
     params: &mut Vec<Option<Descriptor>>,
 ) -> Option<Term> {
+    // A BYTE-CARRIER column (NONE/OCTETS/ASCII) compares BYTES, and its
+    // decoded values live in the char-per-byte carrier spelling - so a
+    // REAL literal (UTF-8 semantics) is lifted into the carrier of its
+    // own bytes before any term is built: 'café' meets the stored
+    // C3 A9 pair (the engine's byte compare over a NONE column,
+    // measured) and not a raw E9. ASCII text is the identity, which is
+    // why every existing gate is untouched.
+    let raw = if matches!(kind, ColKind::Text)
+        && fire_crab_ods::intl::byte_carrier(fire_crab_ods::intl::charset_id(d.sub_type))
+    {
+        let lift = |r: Rhs| match r {
+            Rhs::Str(v) => Rhs::Str(fire_crab_ods::intl::to_carrier(&v)),
+            other => other,
+        };
+        match raw {
+            RawKind::Cmp(op, r) => RawKind::Cmp(op, lift(r)),
+            RawKind::Like(r, e, n) => RawKind::Like(lift(r), e, n),
+            RawKind::Similar(r, e, n) => RawKind::Similar(lift(r), e, n),
+            RawKind::Starting(r, n) => RawKind::Starting(lift(r), n),
+            other => other,
+        }
+    } else {
+        raw
+    };
     let mut claim = |slot: usize| -> Option<()> {
         if !param_target_ok(d) {
             return None;
