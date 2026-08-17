@@ -3998,10 +3998,29 @@ fire-crab 0 too — and read committed, wait/nowait, lock-timeout and
 `serve-real-snapshot.sh` and `serve-real-concurrency.sh` gate the stable
 view directly.
 
-*Still waiting on more than a snapshot*: a reader that counts the set as
-of a moment does not by itself give the engine's every concurrency
-answer — two concurrent writers of the SAME row and the update-conflict
-timing are their own measured slices, pinned where each gate meets them.
+~~*Still waiting on more than a snapshot*: two concurrent writers of the
+SAME row and the update-conflict timing are their own measured
+slices.~~ — **TAKEN, by the lock manager** ("The lock manager,
+participating"): a NO WAIT writer meeting a row another active
+transaction holds raises the update-conflict at once naming the
+blocker; a WAIT writer parks on the holder's transaction lock
+(`wait_for_transaction`, capped by `isc_tpb_lock_timeout` or the
+server's own wait) and retries when it ends; a cycle is denied as the
+engine's deadlock. `serve-real-concurrency.sh` pins the whole family
+with coverage counters (writers queued, parked, a cycle denied) beside
+the behaviour checks, and `serve-real-updateconflict.sh` pins the
+snapshot-over-commit vectors.
+
+**DONE — a reader meeting a LIMBO record delivers the settled rows
+first.** The one behaviour `serve-real-limbo.sh` had recorded as a DIFF:
+the engine streams a scan per row, so `SELECT` over a table holding a
+limbo record prints the settled rows and THEN raises *record from
+transaction N is stuck in limbo* — while `StreamCursor::next_batch` hit
+the limbo record mid-batch and returned the error, DISCARDING the rows
+already built into the batch. The cursor now hands the partial batch
+back and holds the error (`pending_err`) for the next fetch, which is
+exactly the order the engine's own wire conversation has. limbo
+19/1 -> 20/0.
 
 **DONE — the OIT/OAT/OST bookkeeping `gstat -h` reads.** The three
 "Oldest" header fields froze at whatever the engine left in the file;

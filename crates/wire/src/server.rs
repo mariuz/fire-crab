@@ -28600,6 +28600,12 @@ struct StreamCursor {
     /// within that page
     pi: usize,
     si: usize,
+    /// an error met MID-BATCH, held back so the rows fetched before it
+    /// are delivered first: the engine streams a scan per row, so a
+    /// reader meeting a limbo record gets the settled rows THEN the
+    /// raise (probed: isql prints them before the error) - an error
+    /// that discarded the built batch reordered that
+    pending_err: Option<EvalErr>,
     done: bool,
 }
 
@@ -28634,6 +28640,7 @@ impl StreamCursor {
             pages,
             pi: 0,
             si: 0,
+            pending_err: None,
             done: false,
         })
     }
@@ -28644,6 +28651,9 @@ impl StreamCursor {
     /// indexed); the caller projects them with the plan's columns, exactly
     /// as the materialised path does.
     fn next_batch(&mut self, db: &Database, want: usize) -> Result<(Vec<Vec<Value>>, bool), EvalErr> {
+        if let Some(e) = self.pending_err.take() {
+            return Err(e);
+        }
         if self.done || want == 0 {
             return Ok((Vec::new(), self.done));
         }
@@ -28663,7 +28673,16 @@ impl StreamCursor {
                 self.si += 1;
                 let Some(values) = view.values(&self.image, db.page_size, &self.formats, r) else {
                     if view.limbo.get() != 0 {
-                        return Err(EvalErr::RecInLimbo(view.limbo.get()));
+                        let e = EvalErr::RecInLimbo(view.limbo.get());
+                        if out.is_empty() {
+                            return Err(e);
+                        }
+                        // the rows fetched BEFORE the limbo record are
+                        // delivered first; the raise waits for the next
+                        // fetch, exactly as the engine's streamed scan
+                        // orders it
+                        self.pending_err = Some(e);
+                        return Ok((out, false));
                     }
                     continue;
                 };
