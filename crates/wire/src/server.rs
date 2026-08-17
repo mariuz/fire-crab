@@ -6179,7 +6179,7 @@ impl Predicate {
             Ok(match (kind, arg) {
                 (_, WireParam::Null) => None,
                 (ColKind::Int, WireParam::Int(v, 0)) => Some(Rhs::Int(*v)),
-                (ColKind::Text, WireParam::Text(s)) => Some(Rhs::Str(s.clone())),
+                (ColKind::Text, WireParam::Text(s) | WireParam::TextCs(s, _)) => Some(Rhs::Str(s.clone())),
                 // a numeric column's parameter keeps its wire scale -
                 // num_cmp aligns it against the stored value exactly
                 (ColKind::Numeric, WireParam::Int(v, ws)) => Some(Rhs::Num(*v, *ws)),
@@ -6194,7 +6194,7 @@ impl Predicate {
                         *ws as i32,
                     ),
                 )),
-                (ColKind::DecFloat, WireParam::Text(s)) => Some(Rhs::DecFloat34(
+                (ColKind::DecFloat, WireParam::Text(s) | WireParam::TextCs(s, _)) => Some(Rhs::DecFloat34(
                     text_to_dec128(s).ok_or_else(|| format!("conversion error from string \"{}\"", s))?,
                 )),
                 // a DOUBLE value (a driver sends a non-integer JS number as
@@ -6242,7 +6242,7 @@ impl Predicate {
                 // single f64, and the engine picks a DIFFERENT ROW for
                 // each of those strings. So the value keeps its own
                 // scale and `num_cmp` aligns it in i128.
-                (ColKind::Int | ColKind::Numeric, WireParam::Text(s)) => {
+                (ColKind::Int | ColKind::Numeric, WireParam::Text(s) | WireParam::TextCs(s, _)) => {
                     match text_number(s) {
                         Some(TextNum::Dec { mantissa, exp }) => {
                             let raw = i64::try_from(mantissa)
@@ -6317,12 +6317,12 @@ impl Predicate {
                 // text value against a BOOLEAN one (probed on this side
                 // too: `'true'`, `'FALSE'` and `' True '` all answer
                 // rows, `'t'` is a conversion error)
-                (ColKind::Approx, WireParam::Text(s)) => Some(Expr::Double(
+                (ColKind::Approx, WireParam::Text(s) | WireParam::TextCs(s, _)) => Some(Expr::Double(
                     text_number(s)
                         .and_then(|n| text_to_approx(n, s))
                         .ok_or_else(|| format!("conversion error from string \"{}\"", s))?,
                 )),
-                (ColKind::Bool, WireParam::Text(s)) => Some(Expr::Bool(match s.trim() {
+                (ColKind::Bool, WireParam::Text(s) | WireParam::TextCs(s, _)) => Some(Expr::Bool(match s.trim() {
                     t if t.eq_ignore_ascii_case("true") => true,
                     t if t.eq_ignore_ascii_case("false") => false,
                     _ => return Err(format!("conversion error from string \"{}\"", s)),
@@ -6358,7 +6358,7 @@ impl Predicate {
             if !matches!(kind, ColKind::Int | ColKind::Numeric) {
                 return None;
             }
-            let WireParam::Text(s) = args.get(*idx)? else {
+            let (WireParam::Text(s) | WireParam::TextCs(s, _)) = args.get(*idx)? else {
                 return None;
             };
             if text_number(s).is_some() {
@@ -6476,7 +6476,7 @@ impl Predicate {
                         let fetch = |s: usize| -> Result<Option<String>, String> {
                             match args.get(s).ok_or("missing parameter value")? {
                                 WireParam::Null => Ok(None),
-                                WireParam::Text(t) => Ok(Some(t.clone())),
+                                WireParam::Text(t) | WireParam::TextCs(t, _) => Ok(Some(t.clone())),
                                 WireParam::Int(v, 0) => Ok(Some(v.to_string())),
                                 _ => Err("parameter type does not match its column"
                                     .to_string()),
@@ -6533,7 +6533,7 @@ impl Predicate {
                         let fetch = |s: usize| -> Result<Option<String>, String> {
                             match args.get(s).ok_or("missing parameter value")? {
                                 WireParam::Null => Ok(None),
-                                WireParam::Text(t) => Ok(Some(t.clone())),
+                                WireParam::Text(t) | WireParam::TextCs(t, _) => Ok(Some(t.clone())),
                                 WireParam::Int(v, 0) => Ok(Some(v.to_string())),
                                 _ => Err("parameter type does not match its column"
                                     .to_string()),
@@ -6562,7 +6562,7 @@ impl Predicate {
                     Term::ExprStartingParam(e, slot, negated) => {
                         match args.get(*slot).ok_or("missing parameter value")? {
                             WireParam::Null => Term::Unknown,
-                            WireParam::Text(t) => {
+                            WireParam::Text(t) | WireParam::TextCs(t, _) => {
                                 Term::ExprStarting(e.clone(), t.clone(), *negated)
                             }
                             // probed: a blr_long 1 binds as '1'
@@ -6582,7 +6582,7 @@ impl Predicate {
                     Term::ExprLikeParam(e, slot, escape, negated) => {
                         match args.get(*slot).ok_or("missing parameter value")? {
                             WireParam::Null => Term::Unknown,
-                            WireParam::Text(t) => {
+                            WireParam::Text(t) | WireParam::TextCs(t, _) => {
                                 Term::ExprLike(e.clone(), t.clone(), *escape, *negated)
                             }
                             // probed: an int bind 1 is the pattern '1'
@@ -16255,10 +16255,38 @@ fn parse_param_blr(b: &[u8]) -> Option<Vec<PSlot>> {
 /// Read the op_execute parameter message: the null bitmap (one bit per
 /// parameter, padded to 4 bytes), then each NON-null parameter's value
 /// in its BLR-declared XDR layout.
+/// Decode one wire text parameter's bytes BY THE ATTACHMENT CHARSET -
+/// the engine's rule for what a parameter's bytes mean. All-ASCII bytes
+/// keep the plain [WireParam::Text] (identical under every charset, and
+/// the shape the whole existing bind surface matches). Non-ASCII bytes
+/// under a byte-carrier attachment become the carrier's chars tagged
+/// CS_NONE, and under a tabled single-byte attachment decode by its
+/// codepage - both [WireParam::TextCs], which the store path's
+/// assignment matrix already speaks. Before this, EVERY high byte went
+/// through from_utf8_lossy: a NONE-attachment client's 0xE9 was
+/// DESTROYED into the replacement character (stored, not refused), a
+/// WIN1252 column refused a byte the engine stores verbatim, and a
+/// UTF8 column ACCEPTED a malformed string the engine refuses - all
+/// three probed live against port 3050.
+fn wire_text_param(bytes: &[u8], att_id: u8) -> WireParam {
+    use fire_crab_ods::intl;
+    if bytes.is_ascii() {
+        return WireParam::Text(String::from_utf8_lossy(bytes).into_owned());
+    }
+    if intl::byte_carrier(att_id) {
+        return WireParam::TextCs(intl::carrier_decode(bytes), intl::CS_NONE);
+    }
+    if let Some(t) = intl::decode_text(att_id, bytes) {
+        return WireParam::TextCs(t, att_id);
+    }
+    WireParam::Text(String::from_utf8_lossy(bytes).into_owned())
+}
+
 fn read_param_message(
     s: &mut TcpStream,
     dec: &mut Option<Rc4>,
     slots: &[PSlot],
+    att_id: u8,
 ) -> std::io::Result<Vec<WireParam>> {
     let n = slots.len();
     let bitmap = read_n(s, dec, n.div_ceil(8).div_ceil(4) * 4)?;
@@ -16271,12 +16299,12 @@ fn read_param_message(
         out.push(match slot {
             PSlot::Text(len) => {
                 let raw = read_n(s, dec, len.div_ceil(4) * 4)?;
-                WireParam::Text(String::from_utf8_lossy(&raw[..*len]).into_owned())
+                wire_text_param(&raw[..*len], att_id)
             }
             PSlot::Varying => {
                 let len = read_int(s, dec)?.max(0) as usize;
                 let raw = read_n(s, dec, len.div_ceil(4) * 4)?;
-                WireParam::Text(String::from_utf8_lossy(&raw[..len]).into_owned())
+                wire_text_param(&raw[..len], att_id)
             }
             PSlot::Int32(scale) => WireParam::Int(read_int(s, dec)? as i64, *scale),
             PSlot::Int64(scale) => {
@@ -49358,7 +49386,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                             "undecodable input-message BLR",
                         )
                     })?;
-                    read_param_message(&mut s, &mut dec, &slots)?
+                    read_param_message(&mut s, &mut dec, &slots, att_cs.id)?
                 } else {
                     Vec::new()
                 };
@@ -50871,7 +50899,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                             "undecodable input-message BLR",
                         )
                     })?;
-                    read_param_message(&mut s, &mut dec, &slots)?
+                    read_param_message(&mut s, &mut dec, &slots, att_cs.id)?
                 } else {
                     Vec::new()
                 };

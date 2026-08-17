@@ -56,6 +56,7 @@ COMMIT;
 CREATE TABLE XC (ID INTEGER, C VARCHAR(10) CHARACTER SET WIN1250,
                  Y VARCHAR(10) CHARACTER SET WIN1251,
                  T VARCHAR(10) CHARACTER SET ISO8859_2);
+CREATE TABLE XU (ID INTEGER, S VARCHAR(10) CHARACTER SET UTF8);
 COMMIT;
 INSERT INTO XC VALUES (1, 'řeka', 'река', 'řeka');
 INSERT INTO XC VALUES (2, 'żółw', 'мышь', 'żółw');
@@ -400,7 +401,74 @@ else
     fail=1
 fi
 
-# --- 8. the file survives the engine's own verifier --------------------
+# --- 8. a RAW-BYTE PARAMETER through a NONE attachment -----------------
+# a parameter's bytes mean what the ATTACHMENT charset says (probed on
+# the live engine): under a NONE attachment they are BYTES - stored
+# verbatim into a NONE or single-byte column, refused by a UTF8 one
+# when malformed there. Before the attachment-aware decode, fc pushed
+# every wire text param through from_utf8_lossy: the 0xE9 was
+# DESTROYED into the replacement character (stored, not refused), the
+# WIN1252 column refused what the engine stores, and the UTF8 column
+# accepted a malformed string the engine refuses.
+node_raw() { # <sql> - E9 32 as the one bound parameter, NONE attachment
+    FC_DB="$FC" FC_PORT="$PORT" FC_Q="$1" timeout 30 node -e '
+      process.on("uncaughtException", () => { console.log("CONN_ERR"); process.exit(1); });
+      const F=require("node-firebird");
+      F.attach({host:"127.0.0.1",port:+process.env.FC_PORT,database:process.env.FC_DB,
+                user:"SYSDBA",password:"masterkey",encoding:"NONE"},(e,db)=>{
+        if(e){console.log("CONN_ERR");process.exit(1);}
+        const s = Buffer.from([0xE9, 0x32]).toString("latin1");
+        db.query(process.env.FC_Q,[s],(e2,r)=>{
+          if(e2){console.log("ERR");db.detach();process.exit(0);}
+          if(Array.isArray(r)) for(const row of r)
+            console.log(Object.values(row).join("|"));
+          else console.log("OK");
+          db.detach();process.exit(0);});});' 2>/dev/null
+}
+ran=$((ran + 1))
+r=$(node_raw "INSERT INTO NB VALUES (9, ?)")
+got=$(isql_q "$FC" "SELECT ID, OCTET_LENGTH(S) FROM NB WHERE ID = 9")
+if [ "$r" = "OK" ] && [ "$got" = "9|2" ]; then
+    echo "OK   a raw E9 32 param lands VERBATIM in a NONE column (2 octets, not lossy 4)"
+else
+    echo "DIFF raw param into NONE: insert [$r], engine read [$got] (want 9|2)"
+    fail=1
+fi
+ran=$((ran + 1))
+r=$(node_raw "INSERT INTO XL (ID, W) VALUES (9, ?)")
+got=$(isql_q "$FC" "SELECT ID, OCTET_LENGTH(W) FROM XL WHERE W = 'é2'")
+if [ "$r" = "OK" ] && [ "$got" = "9|2" ]; then
+    echo "OK   ... and verbatim in a WIN1252 column, where the byte IS 'é'"
+else
+    echo "DIFF raw param into WIN1252: insert [$r], engine find [$got] (want 9|2)"
+    fail=1
+fi
+ran=$((ran + 1))
+r=$(node_raw "INSERT INTO XU VALUES (9, ?)")
+e=$(FC_DB="$RE" FC_PORT=3050 FC_Q="INSERT INTO XU VALUES (9, ?)" timeout 30 node -e '
+      const F=require("node-firebird");
+      F.attach({host:"127.0.0.1",port:+process.env.FC_PORT,database:process.env.FC_DB,
+                user:"SYSDBA",password:"masterkey",encoding:"NONE"},(e,db)=>{
+        if(e){console.log("CONN_ERR");process.exit(1);}
+        const s = Buffer.from([0xE9, 0x32]).toString("latin1");
+        db.query(process.env.FC_Q,[s],(e2)=>{
+          console.log(e2?"ERR":"OK");db.detach();process.exit(0);});});' 2>/dev/null)
+if [ "$r" = "ERR" ] && [ "$e" = "ERR" ]; then
+    echo "OK   ... and a UTF8 column refuses the malformed bytes on BOTH sides"
+else
+    echo "DIFF raw param into UTF8: fc [$r], engine [$e] (want ERR ERR)"
+    fail=1
+fi
+ran=$((ran + 1))
+got=$(node_raw "SELECT ID FROM NB WHERE S = ?")
+if [ "$got" = "9" ]; then
+    echo "OK   the byte compare finds the raw row through the same param"
+else
+    echo "DIFF raw param compare: [$got] (want 9)"
+    fail=1
+fi
+
+# --- 9. the file survives the engine's own verifier --------------------
 ran=$((ran + 1))
 g=$("$GFIX" -v -full -user "$U" -pas "$P" "$FC" 2>&1)
 if [ -z "$g" ]; then
@@ -412,8 +480,8 @@ fi
 
 kill $srv 2>/dev/null; srv=""
 rm -f "$RE" "$FC"
-if [ "$ran" -lt 42 ]; then
-    echo "DIFF only $ran checks ran (expected at least 42) - did one silently skip?"
+if [ "$ran" -lt 46 ]; then
+    echo "DIFF only $ran checks ran (expected at least 46) - did one silently skip?"
     fail=1
 fi
 exit $fail

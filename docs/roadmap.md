@@ -209,6 +209,22 @@ measured or pinned items**, each recorded in its own place below:
   literal. Gated in serve-real-xlit.sh (40 -> 42). ASCII content is
   the identity through every seam, which is why the whole existing
   gate surface is untouched.
+
+  **A wire PARAMETER's bytes mean what the ATTACHMENT charset says** —
+  the last lossy seam: every text param came off the XDR message
+  through `from_utf8_lossy`, so a NONE-attachment client's raw 0xE9
+  was corrupted into the replacement character (stored!), a WIN1252
+  column refused a byte the engine stores verbatim, and a UTF8 column
+  accepted a malformed string the engine refuses (all probed against
+  the live engine). `wire_text_param` decodes by the attachment's
+  lc_ctype now — conservatively: all-ASCII bytes keep the old shape
+  (identical under every charset, whole gate surface untouched by
+  construction), non-ASCII bytes become `WireParam::TextCs` (the
+  carrier's chars under NONE, the codepage's under a tabled set) and
+  the store's assignment matrix already speaks them. The bind sites
+  alias TextCs beside Text, and the byte compare answers through the
+  same parameter with no lift and no double encoding.
+  serve-real-xlit.sh 42 -> 46.
   serve-real-xlit.sh 17 -> 20. ~~Still held: the untabled codepages~~ —
   three more TAKEN: WIN1250, WIN1251 and ISO8859_2, and their tables
   were GENERATED FROM THE LIVE ENGINE rather than typed from a chart:
