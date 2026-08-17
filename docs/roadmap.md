@@ -2201,15 +2201,33 @@ pulled by the fetch.
   is 50 ms, the full COUNT 400), and the projection is held past the limit, so
   a raiser at a driver the limit steps over never runs - probed identical to
   the engine over `>`, `<>`, and a LEFT theta, now pinned in
-  `serve-real-jointypes.sh`. What does NOT stream is a THETA join fetched
-  WHOLE with no limit: the batch fetch materialises its every combined row
-  before draining batches, where the engine produces them on demand. Closing
-  that is a resumable JOIN cursor - the StreamCursor a scan already has, but
-  over a join's `(driver, match)` walk - which materialises both SIDES
-  (O(N + M)) rather than the OUTPUT (O(N x M)). It is left for later: the
-  common shapes (a `FIRST n`, an aggregate, a filtered result) do not
-  materialise the whole output, and a plain unbounded join of millions of rows
-  is the rare case that does.
+  `serve-real-jointypes.sh`. What did NOT stream was a THETA join fetched
+  WHOLE with no limit: the batch fetch materialised its every combined row
+  before draining batches, where the engine produces them on demand.
+
+  **DONE — the resumable JOIN cursor.** `JoinCursor` is the StreamCursor a
+  scan already has, over a join's `(driver, match)` walk: it materialises
+  the two SIDES (O(N + M)) and produces the product a DRIVER ROW AT A TIME,
+  resuming from `(driver index, that driver's output rows, index into them)`.
+  Reading the first 100 rows of an 8M-pair theta join was 72,162 ms (all 8M
+  built first); it is now 25 ms, and peak memory is O(batch), not O(N x M).
+  It opens for a bare single-part LEFT/INNER join with no ORDER BY and no
+  live index probe on the inner - so the inner is always materialised whole
+  (a theta join scans it, an unindexed equi-join hashes it), which is exactly
+  the shape whose OUTPUT the fallback built in full; every other join keeps
+  the materialising path. The per-driver step reuses `join_step` /
+  `join_scan_rows` and the top WHERE `Filter` unchanged, so the rows and
+  order are byte-identical to the materialising path. GOTCHA: an exhausted
+  join cursor is KEPT in the fetch map (buffers freed), not removed - a
+  client's fetch-until-empty loop sends one op_fetch past the last row, and a
+  removed cursor would be RE-OPENED and re-deliver the whole join (a
+  materialised `Plan::Rows` survives the same extra fetch because it was
+  drained to empty in place). Pinned by `serve-real-jointypes.sh` +4 (the
+  whole theta / hashed-equi / LEFT-theta / WHERE-above join, no FIRST) and by
+  `serve-real-leftjoinindex.sh`'s existing whole-fetch `same3` (the check that
+  caught the double-emission). RIGHT/FULL, a multi-table chain, an ORDER BY
+  or an indexed inner keep the materialising path - the rare unbounded plain
+  join of millions of rows is the case this closes.
 
   ~~The next thing worth doing here is a boundary the gates already pin:
   the engine raises a blocking node's error at OPEN, where this server
