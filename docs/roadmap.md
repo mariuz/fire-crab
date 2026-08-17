@@ -123,11 +123,18 @@ measured or pinned items**, each recorded in its own place below:
   fragment total for the same bytes — the split, not the data).
   Verified whole: fire-crab inserts a 20,000-byte row as a 3-piece
   chain, reassembles it itself, the ENGINE reassembles it, finds it by
-  content, and `gfix -v -full` is clean. UPDATE and DELETE of a
-  fragmented HEAD still refuse — fail-closed and PER ROW (the same
-  table's small rows move freely), the rows and the file untouched —
-  the recorded boundary `qa/serve-real-fragstore.sh` (11) pins beside
-  the store itself.
+  content, and `gfix -v -full` is clean. ~~UPDATE and DELETE of a
+  fragmented HEAD still refuse~~ — TAKEN with it: `push_back_version`
+  accepts an `rhd_incomplete` head (the copied head keeps its rhdf
+  forward pointer, so the back version IS the old chain — fragments
+  never point at the head, so moving it moves nothing else), and a big
+  NEW image in an UPDATE chains with its head rewritten IN PLACE at the
+  fixed primary slot, carrying both the back pointer and the forward
+  pointer (the head's data sized to what the slot already held — every
+  stored record is padded to RHDF_SIZE, so the bare header always
+  fits). Shrink-to-small, grow-to-chain, and DELETE of a fragmented
+  head all verified with the engine reading the result and gfix clean.
+  `qa/serve-real-fragstore.sh` (13) pins the store and the DML both.
 
   **Transliteration is TAKEN** (`ods::intl::decode_text`/`encode_text`,
   WIN1252 + ISO8859_1 codepage tables, bijective on all 256 bytes so a

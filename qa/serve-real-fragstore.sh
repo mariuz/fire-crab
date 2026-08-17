@@ -12,10 +12,11 @@
 # fragment total for the same bytes - that is the split, not the data).
 #
 # Before this, `INSERT` of a big row was refused ("record larger than a
-# page") while the READ side already assembled engine-written chains.
-# UPDATE and DELETE of a fragmented HEAD still refuse - fail-closed,
-# per-row (the same table's small rows update and delete fine), the row
-# and the file untouched - pinned below as the recorded boundary.
+# page") while the READ side already assembled engine-written chains -
+# and DML over a fragmented HEAD refused with it. Both are taken: the
+# back version keeps the old chain (the copied head's forward pointer
+# still names it), and a big NEW image chains with its head rewritten
+# in place at the fixed primary slot.
 #
 #   qa/serve-real-fragstore.sh [port]
 
@@ -113,24 +114,38 @@ else
     fail=1
 fi
 
-# --- 3. the recorded boundary: DML over a fragmented HEAD --------------
-# refused fail-closed and PER ROW - the same table's small rows move
-check "UPDATE of a fragmented head refuses (recorded boundary)" \
-    "$(node_q "UPDATE F SET T = 'x' WHERE ID = 3")" "ERR"
-check "DELETE of a fragmented head refuses too" \
-    "$(node_q 'DELETE FROM F WHERE ID = 1')" "ERR"
-check "... while the small row on the same table still updates" \
-    "$(node_q "UPDATE F SET T = 'moved' WHERE ID = 2")" "OK"
-check "and the fragmented rows are untouched by the refusals" \
+# --- 3. DML over a fragmented HEAD -------------------------------------
+# push_back_version keeps the rhdf header and forward pointer intact, so
+# the back version IS the old chain (fragments never point at the head);
+# a big NEW image chains with its head rewritten IN PLACE at the fixed
+# primary slot, carrying both the back pointer and the forward pointer.
+check "UPDATE shrinks a fragmented row to a small value" \
+    "$(node_q "UPDATE F SET T = 'shrunk' WHERE ID = 3")" "OK"
+check "UPDATE grows a small row into a chain at its own slot" \
+    "$(node_q 'UPDATE F SET T = ? WHERE ID = 2' "$BIG")" "OK"
+check "DELETE of a fragmented head" \
+    "$(node_q 'DELETE FROM F WHERE ID = 1')" "OK"
+check "fc reads the reshaped table" \
+    "$(node_q 'SELECT ID, CHAR_LENGTH(T) AS L FROM F ORDER BY ID')" \
+    "2|20000
+3|6"
+check "... and so does the ENGINE" \
     "$(isql_q 'SELECT ID, CHAR_LENGTH(T) FROM F ORDER BY ID')" \
-    "1|20000
-2|5
-3|20000"
+    "2|20000
+3|6"
+ran=$((ran + 1))
+g=$("$GFIX" -v -full -user "$U" -pas "$P" "$FC" 2>&1)
+if [ -z "$g" ]; then
+    echo "OK   gfix -v -full is clean after the fragmented DML"
+else
+    echo "DIFF gfix after DML: $g"
+    fail=1
+fi
 
 kill $srv 2>/dev/null; srv=""
 rm -f "$FC"
-if [ "$ran" -lt 11 ]; then
-    echo "DIFF only $ran checks ran (expected at least 11) - did one silently skip?"
+if [ "$ran" -lt 13 ]; then
+    echo "DIFF only $ran checks ran (expected at least 13) - did one silently skip?"
     fail=1
 fi
 exit $fail

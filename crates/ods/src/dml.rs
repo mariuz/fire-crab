@@ -383,6 +383,8 @@ fn clear_fill_bits(file: &mut crate::Image, page_size: usize, page_no: u32, mask
 /// plain `rhd` header.
 fn rhdf_bytes(
     tx: u32,
+    b_page: u32,
+    b_line: u16,
     rflags: u16,
     format: u8,
     f_page: u32,
@@ -391,8 +393,8 @@ fn rhdf_bytes(
 ) -> Vec<u8> {
     let mut rec = Vec::with_capacity(RHDF_DATA_OFFSET + data.len());
     rec.extend_from_slice(&tx.to_le_bytes());
-    rec.extend_from_slice(&0u32.to_le_bytes()); // b_page
-    rec.extend_from_slice(&0u16.to_le_bytes()); // b_line
+    rec.extend_from_slice(&b_page.to_le_bytes());
+    rec.extend_from_slice(&b_line.to_le_bytes());
     rec.extend_from_slice(&rflags.to_le_bytes());
     rec.push(format);
     rec.extend_from_slice(&[0u8; 3]); // alignment to rhdf_f_page @16
@@ -618,6 +620,8 @@ fn insert_record_fragmented(
             let (np, nl) = next.ok_or("fragment chain out of order")?;
             rhdf_bytes(
                 tx,
+                0,
+                0,
                 flags::FRAGMENT | flags::INCOMPLETE | flags::NOT_PACKED,
                 format_no,
                 np,
@@ -639,6 +643,8 @@ fn insert_record_fragmented(
     let (np, nl) = next.ok_or("a fragmented record with no fragments")?;
     let head = rhdf_bytes(
         tx,
+        0,
+        0,
         flags::INCOMPLETE | flags::NOT_PACKED,
         format_no,
         np,
@@ -956,10 +962,11 @@ fn push_back_version(
         }
         let mut rec = page[off..off + len].to_vec();
         let rflags = u16_at(&rec, 10);
-        if rflags
-            & (flags::CHAIN | flags::BLOB | flags::FRAGMENT | flags::INCOMPLETE | flags::DELETED)
-            != 0
-        {
+        // a FRAGMENTED head (rhd_incomplete) is a live primary too: its
+        // copy keeps the rhdf header and forward pointer intact, so the
+        // back version IS the old chain - fragments never point at the
+        // head, so moving it moves nothing else
+        if rflags & (flags::CHAIN | flags::BLOB | flags::FRAGMENT | flags::DELETED) != 0 {
             return Err("target is not a live primary record version".into());
         }
         let format = rec[12];
@@ -1098,6 +1105,75 @@ pub fn update_record_under(
     format_no: u8,
 ) -> Result<(), String> {
     let (b_page, b_line, _) = push_back_version(file, page_size, rel, page_no, slot)?;
+    // a NEW image too large for one page becomes a fragment chain whose
+    // HEAD sits at the fixed primary slot (the record number is
+    // positional): the tail fragments are placed first, then the head -
+    // rhdf with BOTH the back pointer and the forward pointer - is
+    // rewritten in place. The head's data is sized to what the slot
+    // already held (every stored record is padded to RHDF_SIZE, so the
+    // old body always fits at least the bare header).
+    if RHD_DATA_OFFSET + image.len() + DPG_RPT_OFFSET + 4 > page_size {
+        let old_len = {
+            let page =
+                crate::page_at(file, page_size, page_no).ok_or("primary page out of range")?;
+            let dir = DPG_RPT_OFFSET + slot as usize * 4;
+            u16_at(page, dir + 2) as usize
+        };
+        let head_cap = old_len.saturating_sub(RHDF_DATA_OFFSET) & !3;
+        let frag_cap = (page_size - DPG_RPT_OFFSET - 4 - RHDF_DATA_OFFSET - 8) & !3;
+        if frag_cap == 0 {
+            return Err("page too small to fragment into".into());
+        }
+        let (head_data, mut tail) = image.split_at(image.len().min(head_cap));
+        let mut frags: Vec<&[u8]> = Vec::new();
+        while !tail.is_empty() {
+            let take = tail.len().min(frag_cap);
+            let (piece, rest) = tail.split_at(take);
+            frags.push(piece);
+            tail = rest;
+        }
+        let mut next: Option<(u32, u16)> = None;
+        for (i, piece) in frags.iter().enumerate().rev() {
+            let last = i == frags.len() - 1;
+            let rec = if last {
+                rhd_bytes(tx, 0, 0, flags::FRAGMENT | flags::NOT_PACKED, format_no, piece)
+            } else {
+                let (np, nl) = next.ok_or("fragment chain out of order")?;
+                rhdf_bytes(
+                    tx,
+                    0,
+                    0,
+                    flags::FRAGMENT | flags::INCOMPLETE | flags::NOT_PACKED,
+                    format_no,
+                    np,
+                    nl,
+                    piece,
+                )
+            };
+            let spot = match find_space(file, page_size, rel, rec.len()) {
+                Some(s) => s,
+                None => {
+                    extend_relation(file, page_size, rel)?;
+                    find_space(file, page_size, rel, rec.len())
+                        .ok_or("no room for a fragment on a fresh page")?
+                }
+            };
+            write_at_spot(file, page_size, &spot, &rec);
+            next = Some((spot.page_no, spot.slot));
+        }
+        let (np, nl) = next.ok_or("a fragmented update with no fragments")?;
+        let head = rhdf_bytes(
+            tx,
+            b_page,
+            b_line,
+            flags::INCOMPLETE | flags::NOT_PACKED,
+            format_no,
+            np,
+            nl,
+            head_data,
+        );
+        return rewrite_primary(file, page_size, page_no, slot, &head);
+    }
     // RLE-pack the new version, as the engine stores records: the
     // primary must stay at its positional slot, so a NOT_PACKED
     // (uncompressed) image can overflow a tight page - packed, it is
