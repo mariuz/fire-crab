@@ -133,11 +133,26 @@ measured or pinned items**, each recorded in its own place below:
   `EvalErr::TransliterationFailed` vector) - both reject, the row
   never lands. `qa/serve-real-xlit.sh` (14) pins the whole family
   against live twins, the write-back read with the engine's own tools.
-  Still held: DML on a table whose index carries an INTL itype (the
-  itype allowlist refuses it, fail-closed, as before this slice); a
-  NONE column's high bytes (lossy at decode, recorded of old); the
-  untabled codepages - each is one 256-entry table away, not a new
-  seam.
+  ~~Still held: DML on a table whose index carries an INTL itype~~ —
+  TAKEN the same day. The on-disk irtd stamps
+  `ttype + idx_offset_intl_range` (btr.h:141, 0x7FFF + 64: a WIN1252
+  default collation stores 32884 = 32831 + 53 — the first build decoded
+  against `idx_first_intl_string` alone and refused everything, caught
+  by dumping the irtd off a live file). Its key, measured off a live
+  engine index: the CODEPAGE bytes with trailing 0x20 stripped, the
+  empty value keyed [00] — IDX_METADATA's shape in the column's own
+  character set ('café' keys [63,61,66,E9], '€' keys [80]).
+  `btw::intl_binary_charset` recognises the DEFAULT (binary) collation
+  of a tabled set; a REAL collation (PXW_INTL and kin, its own weight
+  tables) still answers None — fail-closed as the allowlists always
+  were. With the itype accepted in `resolve_index_ops`,
+  `pick_for_terms` and the navigation gate, fire-crab INSERTs and
+  UPDATEs maintain the tree with the engine's own keys (verified:
+  the engine finds fc's 'süß' — [73,FC,DF] in the dump — through ITS
+  index, gfix -v -full clean), and fc's own retrieval bands the
+  codepage key. serve-real-xlit.sh 14 -> 17. Still held: a NONE
+  column's high bytes (lossy at decode, recorded of old); the untabled
+  codepages and the real collations.
 
 The rest of this document records how the surface got here and every one
 of those boundaries.

@@ -50,6 +50,32 @@ use crate::{u16_at, u32_at};
 // itypes, btr.h:123-136
 pub const IDX_NUMERIC: u16 = 0;
 pub const IDX_STRING: u16 = 1;
+/// `idx_offset_intl_range` (btr.h:141, `0x7FFF + idx_first_intl_string`):
+/// an on-disk irtd itype at or above this encodes a TTYPE -
+/// `itype - 32831` is `(collation << 8) | charset` (a WIN1252 default
+/// collation stores 32884 = 32831 + 53, read off a live file). The
+/// DEFAULT (binary) collation of a tabled single-byte charset keys
+/// exactly like [IDX_METADATA] in that charset's codepage - measured off
+/// a live engine index over WIN1252: 'café' keys [63,61,66,E9], 'a '
+/// keys [61] (trailing 0x20 stripped), '' keys [00], '€' keys [80].
+pub const IDX_OFFSET_INTL: u16 = 0x7FFF + 64;
+
+/// The CHARACTER SET of an INTL itype whose key this crate can build:
+/// the DEFAULT (binary) collation of a TABLED single-byte set. A real
+/// collation (PXW_INTL and kin) has its own weight tables and answers
+/// None - fail-closed, exactly as the allowlists always were.
+pub fn intl_binary_charset(itype: u16) -> Option<u8> {
+    if itype < IDX_OFFSET_INTL {
+        return None;
+    }
+    let ttype = itype - IDX_OFFSET_INTL;
+    let (charset, collation) = ((ttype & 0xFF) as u8, ttype >> 8);
+    if collation == 0 && crate::intl::tabled(charset) {
+        Some(charset)
+    } else {
+        None
+    }
+}
 pub const IDX_METADATA: u16 = 4;
 pub const IDX_SQL_DATE: u16 = 5;
 pub const IDX_SQL_TIME: u16 = 6;
@@ -237,6 +263,22 @@ pub fn index_key(itype: u16, value: &Value, scale: i8, charset: u8) -> Option<Ve
             // itype is 0x00, not the blank (btr.cpp:3593)
             let Value::Text(s) = value else { return None };
             let trimmed = s.as_bytes().trim_ascii_end_matches();
+            Some(if trimmed.is_empty() { vec![0] } else { trimmed.to_vec() })
+        }
+        // an INTL itype with the DEFAULT (binary) collation: the
+        // codepage's bytes, trailing 0x20 stripped, empty keyed [00] -
+        // IDX_METADATA's shape in the column's own character set
+        // (measured off a live engine index, see IDX_FIRST_INTL)
+        it if intl_binary_charset(it).is_some() => {
+            let cs = intl_binary_charset(it).unwrap();
+            let Value::Text(s) = value else { return None };
+            let owned = match crate::intl::encode_text(cs, s) {
+                Ok(Some(v)) => v,
+                // an unmappable (or untabled) search key has no image in
+                // the tree: None SCANS, where a UTF-8 key would MISS
+                _ => return None,
+            };
+            let trimmed = owned.trim_ascii_end_matches();
             Some(if trimmed.is_empty() { vec![0] } else { trimmed.to_vec() })
         }
         IDX_NUMERIC => {

@@ -178,7 +178,46 @@ else
     fail=1
 fi
 
-# --- 5. the file survives the engine's own verifier --------------------
+# --- 5. an INDEXED WIN1252 column: the INTL itype ----------------------
+# the irtd stamps `ttype + idx_offset_intl_range` (32831 + 53 for the
+# default WIN1252 collation); its key is the codepage bytes with
+# trailing blanks stripped, the empty value keyed [00] - measured off a
+# live engine index. fire-crab now builds the same keys, so DML
+# maintains the tree and the ENGINE's own index scans find the rows.
+"$ISQL" -q -b -ch UTF8 -user "$U" -pas "$P" "$FC" <<EOF >/dev/null 2>&1
+CREATE TABLE KI (ID INTEGER, W VARCHAR(10) CHARACTER SET WIN1252);
+CREATE INDEX IDX_KI_W ON KI (W);
+COMMIT;
+INSERT INTO KI VALUES (1, 'café');
+COMMIT;
+EOF
+ran=$((ran + 1))
+r=$(node_q "INSERT INTO KI VALUES (2, 'süß')")
+r2=$(node_q "UPDATE KI SET W = 'çedille' WHERE ID = 1")
+if [ "$r" = "OK" ] && [ "$r2" = "OK" ]; then
+    echo "OK   fc INSERTs and UPDATEs through the INTL-itype index"
+else
+    echo "DIFF INTL-index DML: insert [$r] update [$r2]"
+    fail=1
+fi
+ran=$((ran + 1))
+got=$(isql_q "$FC" "SELECT ID FROM KI WHERE W = 'süß'")$(isql_q "$FC" "SELECT ID FROM KI WHERE W = 'çedille'")
+if [ "$got" = "21" ]; then
+    echo "OK   the ENGINE finds both fc-keyed rows through ITS index"
+else
+    echo "DIFF engine index lookups over fc's keys: [$got]"
+    fail=1
+fi
+ran=$((ran + 1))
+a=$(node_q "SELECT ID FROM KI WHERE W = 'süß'")
+if [ "$a" = "2" ]; then
+    echo "OK   ... and fc's own retrieval bands the codepage key"
+else
+    echo "DIFF fc indexed retrieval: [$a]"
+    fail=1
+fi
+
+# --- 6. the file survives the engine's own verifier --------------------
 ran=$((ran + 1))
 g=$("$GFIX" -v -full -user "$U" -pas "$P" "$FC" 2>&1)
 if [ -z "$g" ]; then
@@ -190,8 +229,8 @@ fi
 
 kill $srv 2>/dev/null; srv=""
 rm -f "$RE" "$FC"
-if [ "$ran" -lt 14 ]; then
-    echo "DIFF only $ran checks ran (expected at least 14) - did one silently skip?"
+if [ "$ran" -lt 17 ]; then
+    echo "DIFF only $ran checks ran (expected at least 17) - did one silently skip?"
     fail=1
 fi
 exit $fail

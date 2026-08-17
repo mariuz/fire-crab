@@ -19733,7 +19733,8 @@ fn navigates(
     // re-keyed, so its entries cannot be judged, and an unjudgeable
     // entry may be stale and sit at the wrong place in the walk.
     let [(seg, itype, _, _)] = op.segs.as_slice() else { return false };
-    let text = matches!(*itype, fire_crab_ods::btw::IDX_STRING | fire_crab_ods::btw::IDX_METADATA);
+    let text = matches!(*itype, fire_crab_ods::btw::IDX_STRING | fire_crab_ods::btw::IDX_METADATA)
+        || fire_crab_ods::btw::intl_binary_charset(*itype).is_some();
     if !text {
         if !matches!(
             *itype,
@@ -20118,7 +20119,8 @@ fn pick_for_terms(
         // i64-range bound builds the SAME key bytes the write path wrote -
         // a literal too wide for i64 never becomes an `Rhs` in the first
         // place, so it scans rather than keying a wrong band.
-        let text = matches!(*itype, btw::IDX_STRING | btw::IDX_METADATA);
+        let text = matches!(*itype, btw::IDX_STRING | btw::IDX_METADATA)
+            || btw::intl_binary_charset(*itype).is_some();
         if !text && !matches!(*itype, btw::IDX_NUMERIC | btw::IDX_NUMERIC2 | btw::IDX_BCD) {
             continue;
         }
@@ -20373,7 +20375,8 @@ fn resolve_index_ops_uncached(db: &Database, rel: u16, descs: &[Descriptor]) -> 
                     | btw::IDX_TIMESTAMP
                     | btw::IDX_BOOLEAN
                     | btw::IDX_BCD
-            ) {
+            ) && btw::intl_binary_charset(itype).is_none()
+            {
                 return None;
             }
             let d = descs.get(field as usize)?;
