@@ -106,10 +106,28 @@ measured or pinned items**, each recorded in its own place below:
   FULL, and the fetch is a PUSH with a `Flow::Stop` rather than the
   engine's row-by-row pull across the wire (observationally equal for
   errors and early exit);
-- **the write-side refusals held on purpose** — a store that would
-  fragment across pages, the DDL patch sites that would rewrite a
+- **the write-side refusals held on purpose** — ~~a store that would
+  fragment across pages~~, the DDL patch sites that would rewrite a
   fragmented record, ~~transliteration between charsets~~, and the
   scattered correctness boundaries each gate pins.
+
+  **The fragmenting store is TAKEN** (`ods::dml::insert_record_fragmented`):
+  a record too large for one page is written as the engine's own chain
+  shape — the head with `rhd_incomplete` and an rhdf forward pointer,
+  middle fragments `rhd_fragment | rhd_incomplete`, the last
+  `rhd_fragment` alone — every piece NOT_PACKED, because the engine's
+  unpack tests that PER PIECE (vio.cpp:575-602), and written TAIL FIRST
+  so each piece points at an already-placed successor. The split points
+  are this writer's own: the assembled image is identical either way,
+  and both readers just follow the chain (gstat counts a different
+  fragment total for the same bytes — the split, not the data).
+  Verified whole: fire-crab inserts a 20,000-byte row as a 3-piece
+  chain, reassembles it itself, the ENGINE reassembles it, finds it by
+  content, and `gfix -v -full` is clean. UPDATE and DELETE of a
+  fragmented HEAD still refuse — fail-closed and PER ROW (the same
+  table's small rows move freely), the rows and the file untouched —
+  the recorded boundary `qa/serve-real-fragstore.sh` (11) pins beside
+  the store itself.
 
   **Transliteration is TAKEN** (`ods::intl::decode_text`/`encode_text`,
   WIN1252 + ISO8859_1 codepage tables, bijective on all 256 bytes so a

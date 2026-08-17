@@ -375,6 +375,33 @@ fn clear_fill_bits(file: &mut crate::Image, page_size: usize, page_no: u32, mask
 
 /// Serialize an rhd (ods.h:894) + data: transaction, b_page, b_line,
 /// flags, format, then the record body.
+/// A FRAGMENTED record header (`rhdf`, ods.h:940-961): the `rhd` fields,
+/// three alignment bytes, then the forward pointer to the next fragment
+/// (`rhdf_f_page` @16, `rhdf_f_line` @20) and the data at 22. Present
+/// whenever the piece carries `rhd_incomplete` - the head of a chain and
+/// every middle fragment; the LAST fragment has no pointer and uses the
+/// plain `rhd` header.
+fn rhdf_bytes(
+    tx: u32,
+    rflags: u16,
+    format: u8,
+    f_page: u32,
+    f_line: u16,
+    data: &[u8],
+) -> Vec<u8> {
+    let mut rec = Vec::with_capacity(RHDF_DATA_OFFSET + data.len());
+    rec.extend_from_slice(&tx.to_le_bytes());
+    rec.extend_from_slice(&0u32.to_le_bytes()); // b_page
+    rec.extend_from_slice(&0u16.to_le_bytes()); // b_line
+    rec.extend_from_slice(&rflags.to_le_bytes());
+    rec.push(format);
+    rec.extend_from_slice(&[0u8; 3]); // alignment to rhdf_f_page @16
+    rec.extend_from_slice(&f_page.to_le_bytes());
+    rec.extend_from_slice(&f_line.to_le_bytes());
+    rec.extend_from_slice(data);
+    rec
+}
+
 fn rhd_bytes(tx: u32, b_page: u32, b_line: u16, rflags: u16, format: u8, data: &[u8]) -> Vec<u8> {
     let mut rec = Vec::with_capacity(RHD_DATA_OFFSET + data.len());
     rec.extend_from_slice(&tx.to_le_bytes());
@@ -496,10 +523,12 @@ pub fn insert_record(
     format_no: u8,
     image: &[u8],
 ) -> Result<InsertOutcome, String> {
-    if u64::from(u16::try_from(RHD_DATA_OFFSET + image.len()).map_err(|_| "record too large")?)
-        > page_size as u64
-    {
-        return Err("record larger than a page".into());
+    if RHD_DATA_OFFSET + image.len() + DPG_RPT_OFFSET + 4 > page_size {
+        let tx = allocate_committed_tx(file, page_size)?;
+        if tx > u32::MAX as u64 {
+            return Err("64-bit transaction ids (rhde) not supported yet".into());
+        }
+        return insert_record_fragmented(file, page_size, rel, format_no, image, tx as u32);
     }
     insert_record_as(file, page_size, rel, format_no, image, None)
 }
@@ -515,10 +544,8 @@ pub fn insert_record_under(
     image: &[u8],
     tx: u32,
 ) -> Result<InsertOutcome, String> {
-    if u64::from(u16::try_from(RHD_DATA_OFFSET + image.len()).map_err(|_| "record too large")?)
-        > page_size as u64
-    {
-        return Err("record larger than a page".into());
+    if RHD_DATA_OFFSET + image.len() + DPG_RPT_OFFSET + 4 > page_size {
+        return insert_record_fragmented(file, page_size, rel, format_no, image, tx);
     }
     insert_record_as(file, page_size, rel, format_no, image, Some(tx))
 }
@@ -537,6 +564,102 @@ pub fn insert_record_system(
     image: &[u8],
 ) -> Result<InsertOutcome, String> {
     insert_record_as(file, page_size, rel, format_no, image, Some(0))
+}
+
+/// Store a record too large for one page as a FRAGMENT CHAIN - the
+/// engine's big-record shape, written tail first so every piece can
+/// point at an already-placed successor:
+///
+///   head:   `rhd_incomplete` (+ NOT_PACKED), rhdf header, forward
+///           pointer to the first continuation
+///   middle: `rhd_fragment | rhd_incomplete`, rhdf header, pointer on
+///   last:   `rhd_fragment` alone, plain rhd header, no pointer
+///
+/// Each piece is NOT_PACKED - `unpack` tests that PER PIECE
+/// (vio.cpp:575-602), so a chain of raw pieces reassembles on the
+/// engine and on this crate's own [crate::data::assembled_image] alike.
+/// The SPLIT POINTS are this writer's own (each piece filling a page);
+/// they need not match what the engine would have chosen - the
+/// assembled image is identical, and both readers just follow the
+/// chain. The head is the PRIMARY record: its page and slot are the
+/// record number, exactly as a small insert's are.
+fn insert_record_fragmented(
+    file: &mut crate::Image,
+    page_size: usize,
+    rel: u16,
+    format_no: u8,
+    image: &[u8],
+    tx: u32,
+) -> Result<InsertOutcome, String> {
+    // a piece's data capacity on a FRESH page: the directory start, one
+    // directory entry, the rhdf header, alignment slack
+    let cap = (page_size - DPG_RPT_OFFSET - 4 - RHDF_DATA_OFFSET - 8) & !3;
+    if cap == 0 {
+        return Err("page too small to fragment into".into());
+    }
+    // the head takes the first `cap` bytes; the tail splits into `cap`
+    // sized fragments
+    let (head_data, mut tail) = image.split_at(image.len().min(cap));
+    let mut frags: Vec<&[u8]> = Vec::new();
+    while !tail.is_empty() {
+        let take = tail.len().min(cap);
+        let (piece, rest) = tail.split_at(take);
+        frags.push(piece);
+        tail = rest;
+    }
+    // tail first: the LAST fragment carries no pointer, every earlier
+    // piece points at the one just placed
+    let mut next: Option<(u32, u16)> = None;
+    for (i, piece) in frags.iter().enumerate().rev() {
+        let last = i == frags.len() - 1;
+        let rec = if last {
+            rhd_bytes(tx, 0, 0, flags::FRAGMENT | flags::NOT_PACKED, format_no, piece)
+        } else {
+            let (np, nl) = next.ok_or("fragment chain out of order")?;
+            rhdf_bytes(
+                tx,
+                flags::FRAGMENT | flags::INCOMPLETE | flags::NOT_PACKED,
+                format_no,
+                np,
+                nl,
+                piece,
+            )
+        };
+        let spot = match find_space(file, page_size, rel, rec.len()) {
+            Some(s) => s,
+            None => {
+                extend_relation(file, page_size, rel)?;
+                find_space(file, page_size, rel, rec.len())
+                    .ok_or("no room for a fragment on a fresh page")?
+            }
+        };
+        write_at_spot(file, page_size, &spot, &rec);
+        next = Some((spot.page_no, spot.slot));
+    }
+    let (np, nl) = next.ok_or("a fragmented record with no fragments")?;
+    let head = rhdf_bytes(
+        tx,
+        flags::INCOMPLETE | flags::NOT_PACKED,
+        format_no,
+        np,
+        nl,
+        head_data,
+    );
+    let spot = match find_space(file, page_size, rel, head.len()) {
+        Some(s) => s,
+        None => {
+            extend_relation(file, page_size, rel)?;
+            find_space(file, page_size, rel, head.len())
+                .ok_or("no room for the fragment head")?
+        }
+    };
+    write_at_spot(file, page_size, &spot, &head);
+    // the head is a PRIMARY record: the same page-flag bookkeeping a
+    // small insert does (dpg_secondary cleared, ppg mirrored)
+    crate::page_mut(file, page_size, spot.page_no)
+        .expect("primary flags page out of range")[1] &= !0x10;
+    clear_fill_bits(file, page_size, spot.page_no, 0x08);
+    Ok(InsertOutcome { tx_id: tx as u64, page_no: spot.page_no, slot: spot.slot })
 }
 
 fn insert_record_as(
