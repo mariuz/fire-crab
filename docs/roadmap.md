@@ -2245,6 +2245,31 @@ pulled by the fetch.
   chain, an ORDER BY or an indexed inner now keep the materialising path -
   every single-part unbounded plain join of millions of rows streams.
 
+  **DONE — the chain folds through the cursor.** The cursor now streams a
+  MULTI-PART chain too: one `PartData` per join (its side decoded once at
+  open, plus the unindexed-equi key hash), and each base row is FOLDED
+  through every part - a row of A expands into its B-matches, each of those
+  into its C-matches - so the cursor produces one base row's whole
+  contribution to the output and NEVER the intermediate `(A join B)`, whose
+  materialisation is the O(product) the fallback pays. This is sound because
+  each base row's expansion is an independent slice of the output (the
+  concatenation identity `join_step` already relies on within a step), so
+  concatenating the slices in base order IS the whole join, in the order the
+  materialising path produces. Every part but the LAST must be LEFT or INNER
+  (a mirror in a non-terminal part emits rows that belong to no base row and
+  would break the fold); the last part may be RIGHT or FULL - its mirror is
+  still the cursor's second phase, walking the LAST side's unmatched rows
+  padded out to `mirror_left_width` (the base plus every inner part's width).
+  No side may carry a live index probe, as before. Reading the first 100 rows
+  of an 8M-pair three-table theta chain (4,000 x 4,000 x 1) took 5.3-6.1 s;
+  it now answers at the wire round-trip floor (~330 ms attach-to-row, the
+  same as `SELECT 1` - the server-side join work is gone from the fetch).
+  Pinned by `serve-real-joinchain.sh` +5 (a three-table theta chain, an
+  unindexed-equi-then-theta chain, a LEFT-LEFT chain's padding, a chain
+  ENDING in a RIGHT - matches then the mirror - and a WHERE above the whole
+  chain, all multiset-compared against the engine). Only an ORDER BY or an
+  indexed inner keep the materialising path now.
+
   ~~The next thing worth doing here is a boundary the gates already pin:
   the engine raises a blocking node's error at OPEN, where this server
   announces the result set and raises at the first FETCH.~~

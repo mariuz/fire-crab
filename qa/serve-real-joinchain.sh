@@ -234,8 +234,51 @@ case "$r" in
     *) echo "DIFF ambiguous bare name answered: [$r]"; fail=1 ;;
 esac
 
-if [ "$ran" -lt 33 ]; then
-    echo "DIFF only $ran checks ran (expected at least 33) - did one silently skip?"
+# --- the WHOLE fetch of a chain STREAMS a base row at a time ------------
+# A bare chain (no FIRST/ORDER BY) is served by a RESUMABLE JOIN CURSOR
+# that folds each base row through every part - never materialising the
+# intermediate join - so reading part of a big chain costs O(fetched), not
+# O(product). These pin its correctness: a chain whose parts are theta or
+# unindexed-equi (no index probe) routes THROUGH the cursor, and its rows
+# must be the engine's. The projection is one column, so node's `|`-joined
+# text and isql's are the same shape; the row ORDER of an unordered join is
+# the driver's, which the two engines need not share, so the MULTISETS are
+# compared (sorted), which is what "the same rows" means without an ORDER BY.
+chain_ms() { # <label> <sql> - same SQL both sides, MULTISET (sorted) compare
+    ran=$((ran + 1))
+    a=$(node_q "$2" | sort)
+    b=$(isql_q "$2;" | sort)
+    if [ "$a" = "$b" ]; then
+        echo "OK   $1 ($(printf '%s\n' "$a" | grep -c .) rows)"
+    else
+        echo "DIFF $1"
+        printf '%s\n' "$b" > /tmp/fc-jc-isql.txt
+        printf '%s\n' "$a" > /tmp/fc-jc-crab.txt
+        diff /tmp/fc-jc-isql.txt /tmp/fc-jc-crab.txt | head -8 | sed 's/^/     /'
+        fail=1
+    fi
+}
+# a THREE-table THETA chain: neither part is indexed, so both fold in the
+# cursor (a theta ON never has a probe)
+chain_ms "a three-table theta chain streams" \
+    "SELECT E.ID FROM EMP E JOIN DEPT D ON E.SALARY > D.ID JOIN REGION R ON E.REGION_ID > R.ID"
+# an unindexed-equi first step (both keyed on the non-PK REGION_ID = hash)
+# then a theta second step
+chain_ms "an unindexed-equi then theta chain streams" \
+    "SELECT E.ID FROM EMP E JOIN DEPT D ON E.REGION_ID = D.REGION_ID JOIN REGION R ON E.SALARY > R.ID"
+# LEFT then LEFT over the same unindexed keys keeps the unmatched base rows
+chain_ms "a LEFT-LEFT unindexed chain pads and streams" \
+    "SELECT E.ID FROM EMP E LEFT JOIN DEPT D ON E.DEPT_ID = D.REGION_ID LEFT JOIN REGION R ON E.SALARY > R.ID"
+# a trailing RIGHT: the inner parts fold, then the last part's mirror emits
+# the REGION rows nothing reached
+chain_ms "a chain ending in a RIGHT streams matches then the mirror" \
+    "SELECT R.NAME FROM EMP E JOIN DEPT D ON E.DEPT_ID = D.REGION_ID RIGHT JOIN REGION R ON E.SALARY > R.ID"
+# a WHERE above the whole streamed chain
+chain_ms "a WHERE above the whole streamed chain" \
+    "SELECT E.ID FROM EMP E JOIN DEPT D ON E.SALARY > D.ID JOIN REGION R ON E.REGION_ID > R.ID WHERE E.ID < 20"
+
+if [ "$ran" -lt 38 ]; then
+    echo "DIFF only $ran checks ran (expected at least 38) - did one silently skip?"
     fail=1
 fi
 exit $fail

@@ -28647,58 +28647,76 @@ impl StreamCursor {
     }
 }
 
-/// A resumable cursor over a plain single-JOIN whose OUTPUT would
-/// otherwise be materialised WHOLE before the first batch. The batch
-/// fetch's fallback runs `join_rows` and holds every combined row - so a
-/// `SELECT ... FROM A JOIN B ON A.k > B.k` with no FIRST/ORDER BY built
-/// the entire N x M product just to hand back the first `want` rows. This
-/// cursor materialises the two SIDES (O(N + M)) and produces the join a
-/// DRIVER ROW AT A TIME, remembering where it stopped, so reading part of
-/// a big join costs O(fetched), not O(N x M).
-///
-/// It is [StreamCursor] for the join shape: the same lazy-cursor answer,
-/// for the one join the executor can resume without re-deriving. BOTH
-/// SIDES are decoded into `Vec`s at open, so - like a materialised cursor
-/// and like `StreamCursor`'s frozen image - the rows are the ones the
-/// transaction saw when the cursor opened, stable across fetches even as
-/// others commit. The per-driver step reads only those buffers (no
-/// database, no live probe), which is what makes it both resumable and
-/// snapshot-stable.
-///
-/// A RIGHT or FULL join streams in TWO PHASES, exactly as the streaming
-/// join arm ([RowSource::for_each]) does: the DRIVER PHASE walks the driver
-/// and emits each row's matches (plus, for FULL, its own padded unmatched
-/// row), marking which inner rows were hit; then the MIRROR PHASE emits the
-/// inner rows nothing matched, padded on the left. The mirror needs the
-/// WHOLE driver pass first, which is why it is a second phase reached only
-/// once the driver index exhausts - and a resumable cursor is what lets that
-/// pass span many fetches without re-deriving it.
-///
-/// STREAMABLE SHAPES ONLY. A bare `Plan::Join` (no wrapping FIRST/SKIP -
-/// those already stream via `stream_first_n`), a SINGLE part (a two-table
-/// join; a longer chain's driver is itself a join and materialising it is
-/// already O(N x M)), no ORDER BY (a sort must see every combined row), and
-/// NO LIVE INDEX PROBE on the inner (its rows come from a per-driver index
-/// read against the live database, which a frozen cursor cannot repeat
-/// consistently; RIGHT/FULL never have a probe, so this only ever declines a
-/// LEFT/INNER one). The inner is then always materialised whole - a theta
-/// join scans it, an unindexed equi-join hashes it, a RIGHT/FULL join walks
-/// it for both the match and the mirror - which is exactly the shape whose
-/// OUTPUT the fallback was building in full. [JoinCursor::open] answers
-/// `None` for everything else, leaving the materialising path in charge.
-struct JoinCursor {
-    /// the driver side, decoded once at open (O(N))
-    driver: Vec<Vec<Value>>,
-    left_width: usize,
-    /// the single join part - its ON, kind, width and (hash) probe
+/// One materialised part of the chain the cursor folds a base row through:
+/// the join's ON/kind/width, its inner side decoded once at open, and (for
+/// an unindexed equi-join) the hash of that inner by the ON's key.
+struct PartData {
     part: JoinPart,
-    /// the inner side, decoded once at open (O(M)); a theta join scans it,
-    /// an unindexed equi-join hashes it via `key_hash`
+    /// the inner side, decoded once (O(M_i)); a theta part scans it whole,
+    /// an unindexed equi part hashes it via `key_hash`
     inner: Vec<Vec<Value>>,
     /// the hash of the inner by its equi-key, when the ON is a hashable
-    /// equality with no index (an unindexed equi-join); `None` leaves the
-    /// ON to decide over the whole inner, as a theta join needs
+    /// equality with no index; `None` leaves the ON to decide over the whole
+    /// inner, as a theta join needs
     key_hash: Option<KeyHash>,
+}
+
+/// A resumable cursor over a plain JOIN whose OUTPUT would otherwise be
+/// materialised WHOLE before the first batch. The batch fetch's fallback
+/// runs `join_rows` and holds every combined row - so a
+/// `SELECT ... FROM A JOIN B ON A.k > B.k` with no FIRST/ORDER BY built the
+/// entire N x M product just to hand back the first `want` rows. This cursor
+/// materialises the SIDES (O(N + sum of side sizes)) and produces the join a
+/// BASE ROW AT A TIME, remembering where it stopped, so reading part of a
+/// big join costs O(fetched), not O(product).
+///
+/// It is [StreamCursor] for the join shape: the same lazy-cursor answer, for
+/// the joins the executor can resume without re-deriving. EVERY SIDE is
+/// decoded into a `Vec` at open, so - like a materialised cursor and like
+/// `StreamCursor`'s frozen image - the rows are the ones the transaction saw
+/// when the cursor opened, stable across fetches even as others commit. The
+/// per-base-row step reads only those buffers (no database, no live probe),
+/// which is what makes it both resumable and snapshot-stable.
+///
+/// A CHAIN folds each base row through every part: `A JOIN B JOIN C` expands
+/// a row of A into its B-matches, then each of those into its C-matches -
+/// one base row's whole contribution to the output, and NEVER the
+/// intermediate `(A join B)`, whose materialisation is the O(product) the
+/// fallback pays. This works because each base row's expansion is an
+/// INDEPENDENT slice of the output (the concatenation identity `join_step`
+/// already relies on within a step), so concatenating them in base order IS
+/// the whole join, in the order `join_rowsource` produces.
+///
+/// A RIGHT or FULL join streams in TWO PHASES, exactly as the streaming join
+/// arm ([RowSource::for_each]) does: the DRIVER PHASE emits each (folded)
+/// row's matches against the last side (plus, for FULL, its own padded
+/// unmatched row), marking which of the last side's rows were hit; then the
+/// MIRROR PHASE emits the last-side rows nothing matched, padded on the left.
+/// The mirror needs the WHOLE driver pass first, which is why it is a second
+/// phase reached only once the driver exhausts - and a resumable cursor is
+/// what lets that pass span many fetches without re-deriving it.
+///
+/// STREAMABLE SHAPES ONLY. A bare `Plan::Join` (no wrapping FIRST/SKIP -
+/// those already stream via `stream_first_n`), no ORDER BY (a sort must see
+/// every combined row), NO LIVE INDEX PROBE on any side (its rows come from
+/// a per-driver index read against the live database, which a frozen cursor
+/// cannot repeat consistently), and - in a MULTI-PART chain - every part but
+/// the LAST must be LEFT or INNER, because a mirror in a non-terminal part
+/// emits rows that belong to no base row and so break the per-base-row
+/// concatenation. The last part may be any kind. Every side is then
+/// materialised whole - a theta part scans it, an unindexed equi part hashes
+/// it, a RIGHT/FULL last part walks it for both the match and the mirror -
+/// which is exactly the shape whose OUTPUT the fallback was building in full.
+/// [JoinCursor::open] answers `None` for everything else, leaving the
+/// materialising path in charge.
+struct JoinCursor {
+    /// the driver (base) side, decoded once at open (O(N))
+    driver: Vec<Vec<Value>>,
+    base_width: usize,
+    /// one per JOIN in the chain, in fold order. Each base row is expanded
+    /// through `parts[0..]`; every part but the last is LEFT/INNER, and the
+    /// LAST part may be RIGHT/FULL (its mirror is the second phase).
+    parts: Vec<PartData>,
     /// the WHERE above the join: it gates the ON's raising on a partnerless
     /// row (`join_step`) AND filters the combined rows (the top `Filter` of
     /// `join_rowsource`), so it is applied in both places, exactly as the
@@ -28706,26 +28724,31 @@ struct JoinCursor {
     above: Option<Predicate>,
     /// the output projection, applied per combined row that the WHERE keeps
     cols: Vec<ProjCol>,
-    /// a hit's gathered inner rows, reused across drivers (as the streaming
-    /// join arm's `scan_buf` is)
+    /// a hash hit's gathered inner rows, reused across the fold (as the
+    /// streaming join arm's `scan_buf` is)
     scan_buf: Vec<Vec<Value>>,
-    /// RIGHT/FULL only: which inner rows a driver has matched, accumulated
-    /// over the whole DRIVER PHASE; the MIRROR PHASE then emits the ones
-    /// still false. Empty for LEFT/INNER, which have no mirror. Because the
-    /// mirror phase runs only after the driver phase exhausts, this vector is
-    /// final before the mirror reads it - which is what makes a mirror that
-    /// depends on the WHOLE driver pass resumable one driver row at a time.
+    /// where a mirror row's NULL padding ends and the last side begins: the
+    /// base plus every inner part's width (RIGHT/FULL last part only)
+    mirror_left_width: usize,
+    /// RIGHT/FULL last part only: which of the last side's rows a driver has
+    /// matched, accumulated over the whole DRIVER PHASE; the MIRROR PHASE
+    /// then emits the ones still false. Empty when the last part is
+    /// LEFT/INNER (no mirror). Because the mirror phase runs only after the
+    /// driver phase exhausts, this vector is final before the mirror reads
+    /// it - which is what makes a mirror that depends on the WHOLE driver
+    /// pass resumable one base row at a time.
     right_matched: Vec<bool>,
-    /// RIGHT/FULL only: the WHERE conjuncts naming one side, which GATE
-    /// whether a partnerless row's ON is evaluated for its raise - `lgate`
-    /// for a partnerless DRIVER row (driver side), `rgate` for a MIRROR row
-    /// (inner side). `None`/`None` for LEFT/INNER (join_step gates its own).
+    /// RIGHT/FULL last part only: the WHERE conjuncts naming one side, which
+    /// GATE whether a partnerless row's ON is evaluated for its raise -
+    /// `lgate` for a partnerless accumulated row (the left of the last
+    /// join), `rgate` for a MIRROR row (last side). `None`/`None` otherwise.
     lgate: Option<Predicate>,
     rgate: Option<Predicate>,
-    /// resume position. The DRIVER PHASE walks `di` over the driver; when it
-    /// exhausts, a RIGHT/FULL join enters the MIRROR PHASE, walking `mi` over
-    /// the inner and emitting the rows `right_matched` left false. `pending`
-    /// holds whichever phase's current output rows, `pj` the next of them.
+    /// resume position. The DRIVER PHASE walks `di` over the base rows; when
+    /// it exhausts, a RIGHT/FULL last part enters the MIRROR PHASE, walking
+    /// `mi` over the last side and emitting the rows `right_matched` left
+    /// false. `pending` holds whichever phase's current output, `pj` the next
+    /// of them.
     di: usize,
     mi: usize,
     pending: Vec<Vec<Value>>,
@@ -28746,53 +28769,64 @@ impl JoinCursor {
         if !order_by.is_empty() {
             return None;
         }
-        // ONE part only: a longer chain's driver is itself a join, so
-        // materialising it is already O(N x M) and the O(N + M) promise is
-        // lost
-        let [part] = parts.as_slice() else {
+        let Some((last, inner_parts)) = parts.split_last() else {
             return None;
         };
-        // a LIVE INDEX PROBE reads the inner per driver from the current
+        // in a CHAIN, every part but the last must be LEFT/INNER: the
+        // per-base-row fold relies on each base row's expansion being an
+        // independent slice of the output (the concatenation identity), which
+        // a mirror in a non-terminal part breaks - its unmatched rows belong
+        // to no base row. The LAST part may be RIGHT/FULL: its mirror is the
+        // cursor's second phase.
+        if inner_parts.iter().any(|p| !matches!(p.kind, JoinKind::Left | JoinKind::Inner)) {
+            return None;
+        }
+        // a LIVE INDEX PROBE reads a side per driver from the current
         // database, which a frozen cursor cannot repeat consistently across
         // fetches. `probe = None` (a theta join) or an unindexed equi-join
-        // (`index = None`, hashed) both materialise the inner WHOLE, which
-        // is the shape whose output the fallback built in full. RIGHT/FULL
-        // never carry a probe (it is built LEFT/INNER only), so this only
-        // ever declines a LEFT/INNER one - the mirror path stays streamable.
-        if part.probe.as_ref().is_some_and(|p| p.index.is_some()) {
+        // (`index = None`, hashed) both materialise the side WHOLE, which is
+        // the shape whose output the fallback built in full. RIGHT/FULL never
+        // carry a probe (it is built LEFT/INNER only).
+        if parts.iter().any(|p| p.probe.as_ref().is_some_and(|pr| pr.index.is_some())) {
             return None;
         }
         let above = bind_filter(filter, args).ok()?;
         let base = resolve_driver_base(db, base, defer, &above);
-        // both sides decoded once, frozen for the cursor's life
+        // the driver and every side decoded once, frozen for the cursor's life
         let driver = base.rows(db).ok()?;
-        let inner = part.src.rows(db).ok()?;
-        // an unindexed equi-join hashes its inner by the ON's key; a theta
-        // join (no probe, or a key the hash declines) leaves it `None` and
-        // the ON scans the whole inner
-        let key_hash = part.probe.as_ref().and_then(|p| build_join_key_hash(&inner, p));
-        // RIGHT/FULL need the mirror machinery: the match bitmap and the
-        // one-side WHERE gates for a partnerless/mirror row's ON raise. A
-        // LEFT/INNER join has no mirror, so it carries none of it.
-        let is_mirror = matches!(part.kind, JoinKind::Right | JoinKind::Full);
-        let (lgate, rgate) = if is_mirror {
+        let mut parts_data: Vec<PartData> = Vec::with_capacity(parts.len());
+        for p in parts {
+            let inner = p.src.rows(db).ok()?;
+            // an unindexed equi part hashes its inner by the ON's key; a theta
+            // part (no probe, or a key the hash declines) leaves it `None` and
+            // the ON scans the whole inner
+            let key_hash = p.probe.as_ref().and_then(|pr| build_join_key_hash(&inner, pr));
+            parts_data.push(PartData { part: p.clone(), inner, key_hash });
+        }
+        // a RIGHT/FULL last part needs the mirror machinery: the match bitmap
+        // over its side and the one-side WHERE gates for a partnerless/mirror
+        // row's ON raise. `mirror_left_width` is where its side begins - the
+        // base plus every inner part's width.
+        let is_mirror = matches!(last.kind, JoinKind::Right | JoinKind::Full);
+        let mirror_left_width =
+            *base_width + inner_parts.iter().map(|p| p.width).sum::<usize>();
+        let (lgate, rgate, right_matched) = if is_mirror {
             (
-                side_filter(&above, 0..*base_width),
-                side_filter(&above, *base_width..*base_width + part.width),
+                side_filter(&above, 0..mirror_left_width),
+                side_filter(&above, mirror_left_width..mirror_left_width + last.width),
+                vec![false; parts_data.last().map_or(0, |pd| pd.inner.len())],
             )
         } else {
-            (None, None)
+            (None, None, Vec::new())
         };
-        let right_matched = if is_mirror { vec![false; inner.len()] } else { Vec::new() };
         Some(JoinCursor {
             driver,
-            left_width: *base_width,
-            part: part.clone(),
-            inner,
-            key_hash,
+            base_width: *base_width,
+            parts: parts_data,
             above,
             cols: cols.clone(),
             scan_buf: Vec::new(),
+            mirror_left_width,
             right_matched,
             lgate,
             rgate,
@@ -28802,6 +28836,12 @@ impl JoinCursor {
             pj: 0,
             done: false,
         })
+    }
+
+    /// Does the LAST part emit a mirror (a RIGHT or FULL join)? Only then is
+    /// there a second phase after the driver pass.
+    fn has_mirror(&self) -> bool {
+        matches!(self.parts.last(), Some(pd) if matches!(pd.part.kind, JoinKind::Right | JoinKind::Full))
     }
 
     /// The next up-to-`want` PROJECTED output rows, resuming where the last
@@ -28823,16 +28863,16 @@ impl JoinCursor {
                     return Ok((out, false));
                 }
             }
-            // refill: the DRIVER PHASE while drivers remain, then (RIGHT/FULL)
-            // the MIRROR PHASE over the inner rows nothing matched
+            // refill: the DRIVER PHASE while base rows remain, then (a
+            // RIGHT/FULL last part) the MIRROR PHASE over the last side's rows
+            // nothing matched
+            let last_inner = self.parts.last().map_or(0, |pd| pd.inner.len());
             if self.di < self.driver.len() {
-                let driver_row = self.driver[self.di].clone();
+                let base_row = self.driver[self.di].clone();
                 self.di += 1;
-                self.pending = self.driver_output(driver_row)?;
+                self.pending = self.driver_output(base_row)?;
                 self.pj = 0;
-            } else if matches!(self.part.kind, JoinKind::Right | JoinKind::Full)
-                && self.mi < self.inner.len()
-            {
+            } else if self.has_mirror() && self.mi < last_inner {
                 self.pending = self.mirror_output()?;
                 self.pj = 0;
             } else {
@@ -28848,142 +28888,155 @@ impl JoinCursor {
     /// last row, and a removed cursor would be RE-OPENED and re-deliver the
     /// whole join (a materialised `Plan::Rows` survives the same extra fetch
     /// because it was drained to empty in place). So the exhausted cursor
-    /// stays and answers that fetch empty; freeing the O(N + M) buffers here
-    /// keeps it from holding both sides until the statement is re-executed.
+    /// stays and answers that fetch empty; freeing the O(N + sum) buffers here
+    /// keeps it from holding every side until the statement is re-executed.
     fn finish(&mut self) {
         self.done = true;
         self.driver = Vec::new();
-        self.inner = Vec::new();
+        self.parts = Vec::new();
         self.pending = Vec::new();
-        self.key_hash = None;
         self.scan_buf = Vec::new();
         self.right_matched = Vec::new();
     }
 
-    /// One driver row's combined-and-projected output: match it against the
-    /// inner (whole, or its hash bucket), keep what the WHERE admits, and
-    /// project. This is the streaming LEFT/INNER join arm ([RowSource::for_each])
-    /// for a single driver row, then the top `Filter` and the projection -
-    /// the same three steps `join_rowsource` composes, so the rows and their
-    /// order are exactly what the materialising path produces.
-    fn driver_output(&mut self, driver_row: Vec<Value>) -> Result<Vec<Vec<Value>>, EvalErr> {
-        // a RIGHT/FULL join matches inline and tracks the mirror bitmap; its
-        // padding rule (drop an unmatched driver for RIGHT, pad it for FULL)
-        // and its mirror are not `join_step`'s per-call shape
-        if matches!(self.part.kind, JoinKind::Right | JoinKind::Full) {
-            return self.driver_output_mirror(driver_row);
+    /// One base row's combined-and-projected output. The row is folded
+    /// through the chain: for a LEFT/INNER-terminated join through every
+    /// part, then the top `Filter` (the WHERE) and the projection; for a
+    /// RIGHT/FULL-terminated one through the inner parts, then the last part's
+    /// mirror-tracking match. The rows and their order are exactly what
+    /// `join_rowsource` (and so the materialising path) produces.
+    fn driver_output(&mut self, base_row: Vec<Value>) -> Result<Vec<Vec<Value>>, EvalErr> {
+        let n = self.parts.len();
+        if self.has_mirror() {
+            // fold through the inner (LEFT/INNER) parts, then the RIGHT/FULL
+            // last part matches each accumulated row and tracks the mirror
+            let acc = self.fold(base_row, n - 1)?;
+            return self.mirror_driver_output(acc);
         }
-        // disjoint field borrows: the step reads `part`/`inner`/`key_hash`
-        // and writes `scan_buf`, and the projection reads `cols`/`above`
-        let JoinCursor { part, left_width, inner, key_hash, above, cols, scan_buf, .. } = self;
-        let combined = match part.probe.as_ref() {
-            // a theta join (or any ON the hash declined): the ON decides
-            // over the whole inner
-            None => join_step(vec![driver_row], *left_width, inner, part, above)?,
-            // an unindexed equi-join: the driver pairs with its hash bucket
-            // (the whole inner when the key's family differs), and the ON
-            // decides over that, exactly as the scan fallback does
-            Some(probe) => {
-                let matched = join_scan_rows(&driver_row, probe, inner, key_hash.as_ref(), scan_buf);
-                join_step(vec![driver_row], *left_width, matched, part, above)?
-            }
-        };
-        let mut out = Vec::new();
-        for row in combined {
-            let keep = match above {
-                None => true,
-                Some(p) => p.matches(&row)?,
-            };
-            if keep {
-                let mut projected = Vec::with_capacity(cols.len());
-                for c in cols.iter() {
-                    projected.push(c.value_of(&row)?);
-                }
-                out.push(projected);
-            }
-        }
-        Ok(out)
-    }
-
-    /// One driver row's DRIVER-PHASE output for a RIGHT or FULL join: its
-    /// matches (marking `right_matched` so the mirror skips them) plus, for
-    /// FULL, its own padded row when nothing matched. This is the streaming
-    /// join arm's per-driver block ([RowSource::for_each]) reproduced a
-    /// driver row at a time - same match order, same partnerless-ON raise
-    /// gated by the driver-side WHERE, same FULL-keeps / RIGHT-drops rule -
-    /// then the top `Filter` (the WHERE) and the projection.
-    fn driver_output_mirror(&mut self, driver_row: Vec<Value>) -> Result<Vec<Vec<Value>>, EvalErr> {
-        let JoinCursor { part, left_width, inner, above, cols, right_matched, lgate, .. } = self;
-        let mut out = Vec::new();
-        let mut matched = false;
-        for (ri, r) in inner.iter().enumerate() {
-            let mut row = driver_row.clone();
-            row.extend(r.iter().cloned());
-            // `matches` answers false for UNKNOWN (a NULL key never joins);
-            // an eval error ends the whole join, where the engine raises it
-            if !part.on.matches(&row)? {
-                continue;
-            }
-            matched = true;
-            right_matched[ri] = true;
-            let keep = match above {
-                None => true,
-                Some(p) => p.matches(&row)?,
-            };
-            if keep {
-                let mut projected = Vec::with_capacity(cols.len());
-                for c in cols.iter() {
-                    projected.push(c.value_of(&row)?);
-                }
-                out.push(projected);
-            }
-        }
-        // a PARTNERLESS driver row still meets the ON (the partnerless raise,
-        // gated by the driver-side WHERE); a FULL join keeps it padded, a
-        // RIGHT drops it, and an empty-inner RIGHT does not open the ON at all
-        if !matched && !(inner.is_empty() && matches!(part.kind, JoinKind::Right)) {
-            let mut row = driver_row.clone();
-            row.resize(*left_width + part.width, Value::Null);
-            if match lgate {
+        // fold through every part, then keep what the WHERE admits and project
+        let acc = self.fold(base_row, n)?;
+        let JoinCursor { above, cols, .. } = self;
+        let mut out = Vec::with_capacity(acc.len());
+        for row in acc {
+            if match above {
                 None => true,
                 Some(p) => p.matches(&row)?,
             } {
-                part.on.matches(&row)?;
+                out.push(project_row(&row, cols)?);
             }
-            if matches!(part.kind, JoinKind::Full) {
-                let keep = match above {
+        }
+        Ok(out)
+    }
+
+    /// Expand a base row through `parts[0..upto]` (all LEFT/INNER): the
+    /// combined rows of everything to the left folded against each next
+    /// side's, exactly as the left-deep tree of `join_step`s does - never
+    /// materialising the intermediate join, only this one base row's slice.
+    /// A part with a hash looks each accumulated row up in its bucket; a theta
+    /// part scans the whole side. `join_step` carries the WHERE for the
+    /// partnerless-raise gating at each step, as `join_rowsource` does.
+    fn fold(&mut self, base_row: Vec<Value>, upto: usize) -> Result<Vec<Vec<Value>>, EvalErr> {
+        let JoinCursor { base_width, parts, above, scan_buf, .. } = self;
+        let mut acc = vec![base_row];
+        let mut w = *base_width;
+        for pd in &parts[..upto] {
+            acc = match pd.part.probe.as_ref() {
+                // a theta part (or a key the hash declined): the ON decides
+                // over the whole side, for every accumulated row at once
+                None => join_step(acc, w, &pd.inner, &pd.part, above)?,
+                // an unindexed equi part: each accumulated row pairs with its
+                // hash bucket (the whole side when the key's family differs)
+                Some(probe) => {
+                    let mut next = Vec::new();
+                    for row in acc {
+                        let matched =
+                            join_scan_rows(&row, probe, &pd.inner, pd.key_hash.as_ref(), scan_buf);
+                        next.extend(join_step(vec![row], w, matched, &pd.part, above)?);
+                    }
+                    next
+                }
+            };
+            w += pd.part.width;
+        }
+        Ok(acc)
+    }
+
+    /// The DRIVER-PHASE output of a RIGHT/FULL last part, over the rows a base
+    /// row folded to: each accumulated row's matches against the last side
+    /// (marking `right_matched` so the mirror skips them) plus, for FULL, its
+    /// own padded row when nothing matched. This is the streaming join arm's
+    /// per-driver block ([RowSource::for_each]) reproduced over the folded
+    /// rows - same match order, same partnerless-ON raise gated by the
+    /// left-side WHERE, same FULL-keeps / RIGHT-drops rule - then the top
+    /// `Filter` (the WHERE) and the projection.
+    fn mirror_driver_output(&mut self, acc: Vec<Vec<Value>>) -> Result<Vec<Vec<Value>>, EvalErr> {
+        let JoinCursor { parts, mirror_left_width, above, cols, right_matched, lgate, .. } = self;
+        let pd = parts.last().expect("a mirror cursor has a last part");
+        let (part, inner) = (&pd.part, &pd.inner);
+        let mut out = Vec::new();
+        for acc_row in acc {
+            let mut matched = false;
+            for (ri, r) in inner.iter().enumerate() {
+                let mut row = acc_row.clone();
+                row.extend(r.iter().cloned());
+                // `matches` answers false for UNKNOWN (a NULL key never
+                // joins); an eval error ends the join, where the engine raises
+                if !part.on.matches(&row)? {
+                    continue;
+                }
+                matched = true;
+                right_matched[ri] = true;
+                if match above {
                     None => true,
                     Some(p) => p.matches(&row)?,
-                };
-                if keep {
-                    let mut projected = Vec::with_capacity(cols.len());
-                    for c in cols.iter() {
-                        projected.push(c.value_of(&row)?);
+                } {
+                    out.push(project_row(&row, cols)?);
+                }
+            }
+            // a PARTNERLESS accumulated row still meets the ON (the raise,
+            // gated by the left-side WHERE); a FULL join keeps it padded, a
+            // RIGHT drops it, an empty last side does not open the ON at all
+            if !matched && !(inner.is_empty() && matches!(part.kind, JoinKind::Right)) {
+                let mut row = acc_row.clone();
+                row.resize(*mirror_left_width + part.width, Value::Null);
+                if match lgate {
+                    None => true,
+                    Some(p) => p.matches(&row)?,
+                } {
+                    part.on.matches(&row)?;
+                }
+                if matches!(part.kind, JoinKind::Full)
+                    && match above {
+                        None => true,
+                        Some(p) => p.matches(&row)?,
                     }
-                    out.push(projected);
+                {
+                    out.push(project_row(&row, cols)?);
                 }
             }
         }
         Ok(out)
     }
 
-    /// The MIRROR PHASE, one row at a time: the next inner row `right_matched`
-    /// left false, padded on the left with NULLs, meeting the ON there (the
-    /// partnerless raise, gated by the inner-side WHERE) just as the streaming
-    /// join arm's tail does, then the top `Filter` and the projection.
-    /// Advances `mi` past every inner row it inspects - matched ones and rows
-    /// the WHERE drops - returning the first it produces (or empty at the
-    /// end). The driver phase has finished by the time this runs, so
-    /// `right_matched` is final.
+    /// The MIRROR PHASE, one row at a time: the next last-side row
+    /// `right_matched` left false, padded on the left with NULLs, meeting the
+    /// ON there (the partnerless raise, gated by the last-side WHERE) just as
+    /// the streaming join arm's tail does, then the top `Filter` and the
+    /// projection. Advances `mi` past every last-side row it inspects -
+    /// matched ones and rows the WHERE drops - returning the first it produces
+    /// (or empty at the end). The driver phase has finished by the time this
+    /// runs, so `right_matched` is final.
     fn mirror_output(&mut self) -> Result<Vec<Vec<Value>>, EvalErr> {
-        let JoinCursor { part, left_width, inner, above, cols, right_matched, rgate, mi, .. } = self;
+        let JoinCursor { parts, mirror_left_width, above, cols, right_matched, rgate, mi, .. } = self;
+        let pd = parts.last().expect("a mirror cursor has a last part");
+        let (part, inner) = (&pd.part, &pd.inner);
         while *mi < inner.len() {
             let ri = *mi;
             *mi += 1;
             if right_matched[ri] {
                 continue;
             }
-            let mut row = vec![Value::Null; *left_width];
+            let mut row = vec![Value::Null; *mirror_left_width];
             row.extend(inner[ri].iter().cloned());
             if match rgate {
                 None => true,
@@ -28991,25 +29044,31 @@ impl JoinCursor {
             } {
                 part.on.matches(&row)?;
             }
-            let keep = match above {
+            if match above {
                 None => true,
                 Some(p) => p.matches(&row)?,
-            };
-            if keep {
-                let mut projected = Vec::with_capacity(cols.len());
-                for c in cols.iter() {
-                    projected.push(c.value_of(&row)?);
-                }
-                return Ok(vec![projected]);
+            } {
+                return Ok(vec![project_row(&row, cols)?]);
             }
         }
         Ok(Vec::new())
     }
 }
 
+/// Project a combined row into its output columns - one value per column, in
+/// output order. Shared by every [JoinCursor] phase.
+fn project_row(row: &[Value], cols: &[ProjCol]) -> Result<Vec<Value>, EvalErr> {
+    let mut projected = Vec::with_capacity(cols.len());
+    for c in cols {
+        projected.push(c.value_of(row)?);
+    }
+    Ok(projected)
+}
+
 /// One of the two resumable fetch cursors, keyed by statement handle in
 /// the fetch loop's `cursors` map: a plain full SCAN ([StreamCursor]) or a
-/// single JOIN ([JoinCursor]). Both hand back up to `want` rows per batch
+/// plain JOIN - a single one or a chain ([JoinCursor]). Both hand back up
+/// to `want` rows per batch
 /// and remember where they stopped; they differ in what a row IS - a
 /// scan's are decoded RECORDS the caller still projects, a join's are
 /// ALREADY PROJECTED - so the drive site encodes each accordingly.
