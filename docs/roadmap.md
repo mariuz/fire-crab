@@ -2226,8 +2226,24 @@ pulled by the fetch.
   whole theta / hashed-equi / LEFT-theta / WHERE-above join, no FIRST) and by
   `serve-real-leftjoinindex.sh`'s existing whole-fetch `same3` (the check that
   caught the double-emission). RIGHT/FULL, a multi-table chain, an ORDER BY
-  or an indexed inner keep the materialising path - the rare unbounded plain
-  join of millions of rows is the case this closes.
+  or an indexed inner keep the materialising path.
+
+  **DONE — the RIGHT/FULL resumable mirror.** The cursor now also streams a
+  RIGHT or FULL join, in the same TWO PHASES the streaming join arm uses: a
+  DRIVER PHASE that emits each driver row's matches (and, for FULL, its own
+  padded unmatched row) while marking which inner rows were hit, then a
+  MIRROR PHASE that emits the inner rows nothing matched, padded on the left.
+  The mirror depends on the WHOLE driver pass, so it is a second resume point
+  the cursor reaches only once the driver index exhausts - `right_matched` is
+  final by then. The per-phase step reproduces the arm's inline matching /
+  partnerless-ON raise (gated by the one-side WHERE) / FULL-keeps-RIGHT-drops
+  rule exactly, then the top WHERE `Filter` and the projection, so the rows
+  and order are byte-identical to the materialising path. Reading the first
+  100 rows of the matched portion of a RIGHT theta join over 4,000 x 4,000
+  drops 66,770 ms -> 19 ms. Pinned by `serve-real-jointypes.sh` +5 (the whole
+  RIGHT/FULL equi and theta join, and a WHERE above one). Only a multi-table
+  chain, an ORDER BY or an indexed inner now keep the materialising path -
+  every single-part unbounded plain join of millions of rows streams.
 
   ~~The next thing worth doing here is a boundary the gates already pin:
   the engine raises a blocking node's error at OPEN, where this server

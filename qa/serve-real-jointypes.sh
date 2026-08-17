@@ -185,6 +185,21 @@ both "the WHOLE LEFT theta join pads and streams" \
      "SELECT A.ID AS AID, C.ID AS CID FROM A LEFT JOIN C ON A.K > C.K"
 both "a WHERE above the WHOLE streamed join" \
      "SELECT A.ID AS AID, C.ID AS CID FROM A JOIN C ON A.K > C.K WHERE A.ID > 2"
+# a RIGHT or FULL join streams in TWO PHASES - its matches a driver row at
+# a time, then the MIRROR (the inner rows nothing matched, padded). The
+# mirror needs the WHOLE driver pass first, so it is a resume point the
+# cursor reaches once the driver exhausts - the case the cursor was
+# extended to cover. Same driver-recno order the engine gives here.
+both "the WHOLE RIGHT equi-join streams matches then the mirror" \
+     "SELECT A.ID AS AID, C.ID AS CID FROM A RIGHT JOIN C ON A.K = C.K"
+both "the WHOLE FULL equi-join: both mirrors stream" \
+     "SELECT A.ID AS AID, C.ID AS CID FROM A FULL JOIN C ON A.K = C.K"
+both "the WHOLE RIGHT theta join streams" \
+     "SELECT A.ID AS AID, C.ID AS CID FROM A RIGHT JOIN C ON A.K > C.K"
+both "the WHOLE FULL theta join streams" \
+     "SELECT A.ID AS AID, C.ID AS CID FROM A FULL JOIN C ON A.K > C.K"
+both "a WHERE above the WHOLE RIGHT streamed join" \
+     "SELECT A.ID AS AID, C.ID AS CID FROM A RIGHT JOIN C ON A.K = C.K WHERE C.ID >= 10"
 # a NULL key never joins, whatever the operator - the comparison is
 # UNKNOWN, so the row is padded by an outer join and dropped by an
 # inner. Row 4's AMT is NULL, so it is the padded one.
