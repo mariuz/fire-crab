@@ -13,21 +13,20 @@
 # one in ten thousand, at 100x the cardinality it was measured against.
 #
 # Ten statements walk the decision surface on that fixture; fcopt must
-# print the engine's own PLANONLY line. NINE cells agree - retrieval,
-# range, OR union, navigation and the unfiltered join all read the stale
-# figure the way the engine reads it.
+# print the engine's own PLANONLY line. All ten agree - retrieval, range,
+# OR union, navigation, the unfiltered join AND the filtered-driver join
+# all read the stale figure the way the engine reads it.
 #
-# THE ONE CELL THAT DOES NOT is pinned as the region's named gap: a join
-# whose DRIVER is filtered (`B JOIN S ON S.K = B.BK WHERE B.BV = 3`).
-# The engine keeps `JOIN (B NATURAL, S INDEX)` at EVERY stale selectivity
-# probed (0.5, 0.25, 0.1, 0.05, 0.02 - it converges with fcopt only at
-# 0.01), while fcopt's loop/hash arithmetic - which reproduces the
-# engine's whole 6x6 fresh-stats grid - flips to
-# `HASH (S NATURAL, B NATURAL)`. The engine's loop cost is therefore
-# nearly independent of the stale figure in this shape, in a way
-# InnerJoin.cpp:192-236 as converted does not capture. The CONTROL in
-# this gate proves it is the stale figure that flips fcopt: the same
-# database after SET STATISTICS agrees.
+# The FILTERED-DRIVER join was the region's one named gap when it was
+# first measured: the engine kept `JOIN (B NATURAL, S INDEX)` at every
+# stale selectivity while fcopt flipped to HASH. The missing arithmetic
+# was the DRIVER's own filter: the engine's estimateSelectivity prices
+# `B.BV = 3` over 200 rows at ONE row (unindexed-equality factor 0.001,
+# floored by the small-table adjustment at 1/cardinality), so the loop
+# behind that driver costs one probe however stale the inner's figure is
+# - which is what makes its loop nearly independent of the stale figure.
+# `stream_filter_selectivity` converts exactly that; the CONTROL at the
+# end brackets the arithmetic from the fresh side too.
 #
 #   qa/opt-stale.sh
 
@@ -103,21 +102,22 @@ same "SELECT * FROM S WHERE K = 5 ORDER BY K"
 same "SELECT FIRST 5 K FROM S ORDER BY K"
 same "SELECT * FROM S JOIN B ON S.K = B.BK"
 
-# --- the region's NAMED GAP, pinned per side ---------------------------
+# --- the tenth cell: the FILTERED-DRIVER join --------------------------
+# This was the region's one named gap - the engine kept
+# JOIN (B NATURAL, S INDEX) at every stale selectivity while fcopt
+# flipped to HASH - until the driver's FILTER entered the arithmetic:
+# `B.BV = 3` over 200 rows estimates ONE row (the engine's
+# estimateSelectivity: unindexed-equality factor 0.001, floored by the
+# small-table adjustment at 1/cardinality), so the loop behind it costs
+# one probe however stale the inner's figure is. With
+# stream_filter_selectivity converted, the cell agrees at every stale
+# selectivity probed (0.5 through 0.01).
 JQ="SELECT * FROM B JOIN S ON S.K = B.BK WHERE B.BV = 3"
-ran=$((ran + 1))
-e=$(eng "$JQ" | grep -o "^PLAN JOIN\|^PLAN HASH")
-f=$(fcp "$JQ" | grep -o "^PLAN JOIN\|^PLAN HASH")
-if [ "$e" = "PLAN JOIN" ] && [ "$f" = "PLAN HASH" ]; then
-    echo "OK   the filtered-driver join is the region's named gap: engine JOIN, fcopt HASH (recorded)"
-else
-    echo "DIFF filtered-driver join moved: engine [$e], fcopt [$f] - re-measure the region"
-    fail=1
-fi
+same "$JQ"
 
 # --- the CONTROL: the same database, statistics refreshed --------------
-# fcopt agrees once the figure is fresh, so it is the STALE figure that
-# flips it - not a general join-cost gap.
+# the same join with a fresh figure keeps agreeing - the two regimes
+# bracket the arithmetic from both sides.
 cp "$DB" "$D/fc-optstale-fresh.fdb"; chmod 666 "$D/fc-optstale-fresh.fdb"
 printf 'SET STATISTICS INDEX IDX_S_K;\nCOMMIT;\n' |
     "$ISQL" -q -b -user "$U" -pas "$P" "$D/fc-optstale-fresh.fdb" >/dev/null 2>&1

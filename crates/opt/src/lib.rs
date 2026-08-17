@@ -1315,8 +1315,25 @@ fn plan_chain(
                         // only after `hashCost <= loopCost` has already
                         // passed - so it renormalises the printed sides
                         // rather than restricting what gets costed.
-                        let loop_ab = ca + loop_cost(ca, cb, sb, ub); // A drives, B indexed
-                        let loop_ba = cb + loop_cost(cb, ca, sa, ua); // B drives, A indexed
+                        // each stream's OWN filter scales the rows it
+                        // feeds forward (the engine's estimateSelectivity;
+                        // an unpriceable shape keeps the raw cardinality)
+                        let fa = stream_filter_selectivity(
+                            where_s, 0, &qual_of, ca,
+                            &|c| indexes[0].iter().any(|x| x.matches(c)),
+                        )
+                        .unwrap_or(1.0);
+                        let fb = stream_filter_selectivity(
+                            where_s, 1, &qual_of, cb,
+                            &|c| indexes[1].iter().any(|x| x.matches(c)),
+                        )
+                        .unwrap_or(1.0);
+                        let (ca_f, cb_f) = (ca * fa, cb * fb);
+                        // the seed terms stay RAW: position 0 pays the
+                        // driver's own SCAN, which reads every row the
+                        // filter then drops
+                        let loop_ab = ca + loop_cost(ca_f, cb, sb, ub); // A drives, B indexed
+                        let loop_ba = cb + loop_cost(cb_f, ca, sa, ua); // B drives, A indexed
                         // avoidHashJoin (InnerJoin.cpp:217): a stream
                         // that looks empty or single-rowed at prepare
                         // time is never hashed - the engine distrusts
@@ -1324,12 +1341,12 @@ fn plan_chain(
                         let hash_ab = if cb <= 1.0 {
                             f64::INFINITY
                         } else {
-                            ca + hash_cost(ca, cb, sb, ub) // A probes, B hashed
+                            ca + hash_cost(ca_f, cb, fb, sb, ub) // A probes, B hashed
                         };
                         let hash_ba = if ca <= 1.0 {
                             f64::INFINITY
                         } else {
-                            cb + hash_cost(cb, ca, sa, ua) // B probes, A hashed
+                            cb + hash_cost(cb_f, ca, fa, sa, ua) // B probes, A hashed
                         };
                         let best_loop = loop_ab.min(loop_ba);
                         let best_hash = hash_ab.min(hash_ba);
@@ -1860,6 +1877,127 @@ fn index_pages(cardinality: f64) -> f64 {
     (cardinality * per_page / (PAGE_SIZE - 39.0)).max(MINIMUM_CARDINALITY)
 }
 
+/// The engine's FILTER-selectivity estimate for one stream of a join -
+/// `Optimizer::estimateSelectivity` over the stream's own WHERE conjuncts
+/// (Optimizer.cpp:1240-1267 with the getSelectivity factors,
+/// Optimizer.h:52-58). Each single-stream, non-join conjunct contributes a
+/// REDUCE factor: equality 0.001, `<`/`>` 0.05, BETWEEN 0.0025, STARTING
+/// 0.01. The smallest factor is floored by the "table is small enough"
+/// adjustment (the product is scaled so the front factor lands at
+/// MAXIMUM_SELECTIVITY / cardinality), and each factor past the first
+/// decays by repeated square root (`applyBackoff`). This is what makes a
+/// filtered DRIVER cheap: `B.BV = 3` over 200 rows estimates ONE row
+/// (200 x 0.005 after the floor), so a nested loop behind it costs one
+/// probe - the arithmetic that keeps the engine's loop nearly independent
+/// of a STALE inner selectivity, measured in qa/opt-stale.sh.
+///
+/// `None` = a shape this conversion does not price (a conjunct on an
+/// INDEXED column takes the engine's inversion path instead of a factor;
+/// an unqualified or unrecognised conjunct could belong to either
+/// stream) - the caller keeps the unfiltered cardinality, which is the
+/// pre-conversion behaviour, fail-conservative.
+fn stream_filter_selectivity(
+    where_s: Option<&str>,
+    stream: usize,
+    qual_of: &dyn Fn(&str) -> Option<usize>,
+    cardinality: f64,
+    indexed: &dyn Fn(&str) -> bool,
+) -> Option<f64> {
+    let w = match where_s {
+        None => return Some(1.0),
+        Some(w) => w,
+    };
+    // BETWEEN's own AND is not a conjunction - re-absorb the split half
+    let raw: Vec<String> = {
+        let mut parts: Vec<String> = Vec::new();
+        let mut pending: Option<String> = None;
+        for p in split_kw(w, "AND") {
+            let p = p.trim().to_string();
+            match pending.take() {
+                Some(prev) => parts.push(format!("{} AND {}", prev, p)),
+                None => {
+                    if find_kw(&p.to_uppercase(), "BETWEEN").is_some() {
+                        pending = Some(p);
+                    } else {
+                        parts.push(p);
+                    }
+                }
+            }
+        }
+        if let Some(last) = pending {
+            parts.push(last);
+        }
+        parts
+    };
+    let mut factors: Vec<f64> = Vec::new();
+    for clause in &raw {
+        let clause = clause.trim();
+        // which stream does the clause's qualified column name?
+        let col_end = clause
+            .find(|c: char| c.is_whitespace() || "=<>!".contains(c))
+            .unwrap_or(clause.len());
+        let lhs = clause[..col_end].trim();
+        let Some((q, col)) = lhs.split_once('.') else {
+            // an unqualified conjunct could belong to either stream
+            return None;
+        };
+        let Some(si) = qual_of(q) else { return None };
+        let rest = clause[col_end..].trim();
+        let rest_up = rest.to_uppercase();
+        // both sides qualified column names = the join predicate itself
+        // (the comma form carries it in the WHERE) - a match, not a filter
+        if rest.starts_with('=') {
+            let rhs = rest[1..].trim();
+            if rhs.contains('.') && !rhs.contains('\'') {
+                continue;
+            }
+        }
+        if si != stream {
+            continue;
+        }
+        let col = col.trim().trim_matches('"');
+        let factor = if rest.starts_with('=') {
+            0.001 // REDUCE_SELECTIVITY_FACTOR_EQUALITY
+        } else if rest_up.starts_with("BETWEEN") {
+            0.0025 // REDUCE_SELECTIVITY_FACTOR_BETWEEN
+        } else if rest.starts_with('>') || rest.starts_with('<') {
+            if rest.starts_with("<>") {
+                return None;
+            }
+            0.05 // REDUCE_SELECTIVITY_FACTOR_LESS / _GREATER
+        } else if rest_up.starts_with("STARTING") {
+            0.01 // REDUCE_SELECTIVITY_FACTOR_STARTING
+        } else {
+            return None;
+        };
+        // an INDEXED filter column becomes an inversion with the index's
+        // own statistics, not a factor - unconverted for join costing
+        if indexed(col) {
+            return None;
+        }
+        factors.push(factor);
+    }
+    if factors.is_empty() {
+        return Some(1.0);
+    }
+    factors.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let mut selectivity = 1.0f64;
+    if cardinality > 0.0 {
+        let min_selectivity = 1.0 / cardinality;
+        if factors[0] < min_selectivity {
+            selectivity *= min_selectivity / factors[0];
+        }
+    }
+    for (prior, f) in factors.iter().enumerate() {
+        let mut x = *f;
+        for _ in 0..prior {
+            x = x.sqrt();
+        }
+        selectivity *= x;
+    }
+    Some(selectivity.min(1.0))
+}
+
 fn loop_cost(outer_card: f64, inner_card: f64, inner_sel: f64, inner_unique: bool) -> f64 {
     // A UNIQUE inner lookup is priced at a FIXED DEFAULT_INDEX_COST + 1
     // (Retrieval.cpp:371-376, "independent from a possibly outdated
@@ -1906,16 +2044,25 @@ fn loop_cost(outer_card: f64, inner_card: f64, inner_sel: f64, inner_unique: boo
 /// was priced as though every probe copied `inner_card * inner_sel`
 /// rows, which for a large unique inner is an enormous over-charge and
 /// made fcopt prefer a loop where the engine hashes.
-fn hash_cost(outer_card: f64, inner_card: f64, inner_sel: f64, inner_unique: bool) -> f64 {
+fn hash_cost(
+    outer_card: f64,
+    inner_card: f64,
+    inner_filter: f64,
+    inner_sel: f64,
+    inner_unique: bool,
+) -> f64 {
     const MEMCOPY: f64 = 0.5;
     const HASHING: f64 = 0.5;
     const MINIMUM_CARDINALITY: f64 = 1.0;
-    // the inner side is retrieved UNFILTERED for hashing: a full
-    // scan, whose cost is its cardinality, and whose selectivity is
-    // 1.0 (every row hashes)
+    // the hashed side's own SCAN reads every row whatever its filter
+    // keeps (baseCost), but only the KEPT rows are copied into the table
+    // (hashCardinality = baseSelectivity * streamCardinality,
+    // InnerJoin.cpp:228) and only they can match a probe
+    // (currentCardinality carries the stream's whole selectivity -
+    // its filter times the join match)
     let base_cost = inner_card;
-    let hash_cardinality = inner_card;
-    let mut current_cardinality = inner_card * inner_sel;
+    let hash_cardinality = inner_card * inner_filter;
+    let mut current_cardinality = inner_card * inner_filter * inner_sel;
     if inner_unique && current_cardinality > MINIMUM_CARDINALITY {
         current_cardinality = MINIMUM_CARDINALITY;
     }

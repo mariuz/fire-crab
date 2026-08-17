@@ -96,12 +96,12 @@ measured or pinned items**, each recorded in its own place below:
   memory from O(result) to O(batch) — the scalability wall a large result
   hit. R8's "the fetch pulls the tree" is real for the shape it fits;
 - **the optimizer's stale-statistics region** — ~~statistics non-zero but
-  WRONG are unmeasured~~ MEASURED (`qa/opt-stale.sh`, the load /
-  `SET STATISTICS` / grow fixture family): fcopt reads the stale figure
-  the way the engine reads it across the single-table surface and the
-  unfiltered join; the ONE named gap is the filtered-driver join, where
-  the engine's loop cost is nearly independent of the stale figure — see
-  the stale-statistics section below;
+  WRONG are unmeasured~~ MEASURED AND CLOSED (`qa/opt-stale.sh`, the
+  load / `SET STATISTICS` / grow fixture family): fcopt reads the stale
+  figure the way the engine reads it across the whole measured surface,
+  the filtered-driver join included — the missing term was the driver's
+  own filter selectivity (`stream_filter_selectivity`), see the
+  stale-statistics section below;
 - **the two R8 tails** — `NestedLoopJoin` still materialises for RIGHT and
   FULL, and the fetch is a PUSH with a `Flow::Stop` rather than the
   engine's row-by-row pull across the wire (observationally equal for
@@ -619,22 +619,31 @@ of those boundaries.
   `SET STATISTICS` snapshots 0.1, then 10,000 all-distinct rows land
   with no re-analyse: the figure claims one key in ten where the truth
   is one in ten thousand, at 100x the cardinality it was measured
-  against). NINE cells of the decision surface AGREE — the equality,
-  range, OR-union, navigation and unfiltered-join choices all read the
-  stale figure as the engine reads it. THE ONE THAT DOES NOT, pinned
-  per side in the gate as the region's named gap: a join whose DRIVER
-  is filtered (`B JOIN S ON S.K = B.BK WHERE B.BV = 3`). The engine
-  keeps `JOIN (B NATURAL, S INDEX)` at EVERY stale selectivity probed
-  (0.5, 0.25, 0.1, 0.05, 0.02; it converges with fcopt only at 0.01),
-  while fcopt's loop/hash arithmetic — the one that reproduces the
-  engine's whole fresh-stats 6x6 grid — flips to HASH, because
-  `loop_cost` charges `selectivity * cardinality` per probe and the
-  stale figure makes that enormous. The engine's loop cost is therefore
-  NEARLY INDEPENDENT of the stale figure in this shape, in a way the
-  converted InnerJoin.cpp:192-236 arithmetic does not capture; the
-  gate's CONTROL (same database, statistics refreshed) proves it is the
-  stale figure that flips fcopt, not a general join-cost gap. Closing
-  the arithmetic is the follow-up slice this measurement now anchors.
+  against). All TEN cells of the decision surface AGREE — equality,
+  range, OR-union, navigation, the unfiltered join AND the
+  filtered-driver join read the stale figure as the engine reads it.
+  The filtered-driver join (`B JOIN S ON S.K = B.BK WHERE B.BV = 3`)
+  was the region's one named gap when first measured: the engine kept
+  `JOIN (B NATURAL, S INDEX)` at EVERY stale selectivity probed (0.5
+  down to 0.02) while fcopt's loop/hash arithmetic flipped to HASH.
+  The missing term was the DRIVER'S OWN FILTER: the engine's
+  `estimateSelectivity` (Optimizer.cpp:1240-1267) prices `B.BV = 3`
+  over 200 rows at ONE row — unindexed-equality factor 0.001
+  (Optimizer.h:52), floored by the small-table adjustment at
+  1/cardinality, later conjuncts decaying by repeated square root
+  (`applyBackoff`) — so the loop behind that driver costs ONE probe
+  however stale the inner's figure is. That is the whole of "the
+  engine's loop cost is nearly independent of the stale figure".
+  `stream_filter_selectivity` converts it (each stream's WHERE
+  conjuncts scale the rows it feeds forward; `hash_cost` gained the
+  hashed side's filter — its scan still reads every row, but only the
+  kept rows are hashed and only they match a probe; the driver's seed
+  term stays raw, its scan reads what the filter then drops).
+  Fail-conservative: a conjunct on an INDEXED column (the engine's
+  inversion path), an unqualified column or an unrecognised shape keeps
+  the unfiltered cardinality. The cell now agrees at every stale
+  selectivity, and the gate's fresh-statistics CONTROL brackets the
+  arithmetic from the other side.
 
 - **DONE while measuring it — the OR union's plan spelling, and
   navigate-vs-sort.** Probing the stale fixture surfaced plan-shape gaps
