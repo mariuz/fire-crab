@@ -68,7 +68,8 @@ COMMIT;
 EOF
 cp "$SRC" "$CLEAN"; cp "$CLEAN" "$WORK"
 
-"$FCWIRE" serve "127.0.0.1:$PORT" "$U" "$P" >/tmp/fc-serve-selexpr.log 2>&1 &
+LOG=/tmp/fc-serve-selexpr-$PORT.log
+"$FCWIRE" serve "127.0.0.1:$PORT" "$U" "$P" >"$LOG" 2>&1 &
 srv=$!
 trap 'kill $srv 2>/dev/null; rm -f "$WORK"' EXIT
 i=0; while [ $i -lt 20 ]; do
@@ -374,7 +375,7 @@ mbrej "mb ABS over NBSP text" "SELECT ABS('${NBSP}2') AS X FROM RDB\$DATABASE"
 # attachment answering after all of the above is the check that counts
 kill -0 $srv 2>/dev/null || { echo "FAIL fcwire died on a multi-byte item"; exit 1; }
 compare  "alive after multi-byte" "SELECT 1 AS ALIVE FROM RDB\$DATABASE"
-grep -q 'panicked' /tmp/fc-serve-selexpr.log && { echo "FAIL a connection thread panicked"; fail=1; }
+grep -q 'panicked' "$LOG" && { echo "FAIL a connection thread panicked"; fail=1; }
 CH=""
 
 # --- a multi-byte QUOTED IDENTIFIER: the sixth byte-slicing site ------
@@ -442,7 +443,7 @@ for CH in "" UTF8; do
         "SELECT 1 AS \"$MB2\" FROM RDB\$DATABASE ORDER BY 1"
 done
 CH=""
-grep -q 'panicked' /tmp/fc-serve-selexpr.log && {
+grep -q 'panicked' "$LOG" && {
     echo "FAIL a connection thread panicked on a multi-byte identifier"; fail=1; }
 
 # --- runtime errors: BOTH the engine and fire-crab reject the row rather

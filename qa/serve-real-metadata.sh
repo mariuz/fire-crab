@@ -126,6 +126,7 @@ i=0; while [ $i -lt 20 ]; do
     command -v nc >/dev/null 2>&1 && nc -z 127.0.0.1 "$P2" 2>/dev/null && break
     i=$((i + 1)); sleep 0.1
 done
+kill -0 $srv2 2>/dev/null || { echo "FAIL second fcwire not running - port $P2 taken?"; exit 1; }
 B="$D/fc-meta-crab2.fdb"; rm -f "$B"
 "$ISQL" -q -b -user "$U" -pas "$P" <<EOF >/dev/null 2>&1
 CREATE DATABASE '$B' USER '$U' PASSWORD '$P' PAGE_SIZE 8192;

@@ -30,7 +30,7 @@
 set -u
 FCWIRE="${FCWIRE:-$(dirname "$0")/../target/release/fcwire}"
 ISQL="${ISQL:-isql}"
-PORT="${1:-4491}"
+PORT="${1:-4776}"
 U="${ISC_USER:-SYSDBA}"; P="${ISC_PASSWORD:-masterkey}"
 D=/tmp/fbhandson
 DB="$D/fc-wherexpr.fdb"

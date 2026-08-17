@@ -31,7 +31,7 @@
 set -u
 FCWIRE="${FCWIRE:-$(dirname "$0")/../target/release/fcwire}"
 ISQL="${ISQL:-isql}"; GFIX="${GFIX:-gfix}"; GBAK="${GBAK:-gbak}"
-PORT="${1:-4287}"
+PORT="${1:-4773}"
 ENGPORT="${ENGPORT:-3050}"
 U="${ISC_USER:-SYSDBA}"; P="${ISC_PASSWORD:-masterkey}"
 D=/tmp/fbhandson

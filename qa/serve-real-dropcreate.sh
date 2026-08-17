@@ -34,6 +34,7 @@ chmod 666 "$EDB" "$FDB" 2>/dev/null
 srv=$!
 trap 'kill $srv 2>/dev/null; rm -f "$EDB" "$FDB"' EXIT
 i=0; while [ $i -lt 20 ]; do command -v nc >/dev/null && nc -z 127.0.0.1 "$PORT" 2>/dev/null && break; i=$((i+1)); sleep 0.1; done
+kill -0 $srv 2>/dev/null || { echo "FAIL fcwire not running - port $PORT taken?"; exit 1; }
 check() { ran=$((ran+1)); if [ "$2" = "$3" ]; then echo "OK   $1"; else echo "DIFF $1"; echo "     want: $3"; echo "     got:  $2"; fail=1; fi; }
 E="localhost:$EDB"; F="127.0.0.1/$PORT:$FDB"
 both() { check "$1" "$(printf '%s\n' "$2" | "$ISQL" -q -user "$U" -pas "$P" "$F" 2>&1 | tr -s ' \n' ' ')" "$(printf '%s\n' "$2" | "$ISQL" -q -user "$U" -pas "$P" "$E" 2>&1 | tr -s ' \n' ' ')"; }

@@ -56,7 +56,7 @@ U="${ISC_USER:-SYSDBA}"; P="${ISC_PASSWORD:-masterkey}"
 D=/tmp/fbhandson
 A="$D/fc-conc-crab.fdb"
 B="$D/fc-conc-engine.fdb"
-LOG=/tmp/fc-serve-conc.log
+LOG=/tmp/fc-serve-conc-$PORT.log
 
 command -v node >/dev/null 2>&1 || { echo "SKIP node not found"; exit 0; }
 node -e "require('node-firebird')" 2>/dev/null || { echo "SKIP node-firebird not found"; exit 0; }

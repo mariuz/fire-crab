@@ -88,7 +88,7 @@
 set -u
 FCWIRE="${FCWIRE:-$(dirname "$0")/../target/release/fcwire}"
 ISQL="${ISQL:-isql}"
-PORT="${1:-4761}"
+PORT="${1:-4777}"
 U="${ISC_USER:-SYSDBA}"; P="${ISC_PASSWORD:-masterkey}"
 D=/tmp/fbhandson
 A="$D/fc-w1a-crab.fdb"

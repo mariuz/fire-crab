@@ -36,6 +36,7 @@ EOF
 srv=$!
 trap 'kill $srv 2>/dev/null; rm -f "$RIG" "$D"/fc-nw-*.fdb' EXIT
 i=0; while [ $i -lt 20 ]; do command -v nc >/dev/null && nc -z 127.0.0.1 "$PORT" 2>/dev/null && break; i=$((i+1)); sleep 0.1; done
+kill -0 $srv 2>/dev/null || { echo "FAIL fcwire not running - port $PORT taken?"; exit 1; }
 check() { ran=$((ran+1)); if [ "$2" = "$3" ]; then echo "OK   $1"; else echo "DIFF $1"; echo "     engine: $2"; echo "     fcrab:  $3"; fail=1; fi; }
 norm() { printf '%s' "$1" | sed 's/number is [0-9]*/number is N/'; }
 run() { norm "$(timeout 15 "$RIG" "$1" "$2" 2>&1)"; }

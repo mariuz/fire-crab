@@ -32,7 +32,7 @@ set -u
 FCWIRE="${FCWIRE:-$(dirname "$0")/../target/release/fcwire}"
 ISQL="${ISQL:-isql}"
 GFIX="${GFIX:-gfix}"
-PORT="${1:-4489}"
+PORT="${1:-4775}"
 U="${ISC_USER:-SYSDBA}"; P="${ISC_PASSWORD:-masterkey}"
 D=/tmp/fbhandson
 RE="$D/fc-xlit-re.fdb"; FC="$D/fc-xlit-fc.fdb"
