@@ -701,7 +701,22 @@ of those boundaries.
   (1.50, 1.55]; at base 100 in (1.30, 1.40]; at base 1000 in (1.55,
   1.70]. So the band is *narrowest in the middle*. Any "HASH iff the
   cardinalities are within factor F" model is refuted by measurement, and
-  one fitted on a single decade will mis-predict another.
+  one fitted on a single decade will mis-predict another. **That warning
+  is now historical**: those edges live in the INDEXED regime, which the
+  converted cost arithmetic owns outright, and the band fallback's own
+  domain (no index on the join key) turned out to have no edge at all —
+  measured across a 1..500-per-side sweep, an UNINDEXED equi key HASHES
+  at every size (the engine's page-based cardinality estimate never
+  looks empty enough for avoidHashJoin on a real table), larger stream
+  probing first, ties in SQL order; a THETA join cannot hash and LOOPS
+  with the smaller stream driving; a HALF-INDEXED equality nests the
+  indexed side as the loop's inner (the old bands' arrangement search,
+  kept for exactly that case); and a CROSS-FAMILY equality still hashes
+  — the type family only gates INDEX use. The old band's middle refused
+  those cells, and its large-large corner even HASHED a theta join the
+  engine loops — a live wrong plan the conversion closed.
+  `qa/opt-plans.sh` +4 on a new unindexed fixture (108 -> 112), the
+  half-indexed and cross-family cells already pinned on T/U.
 
 - ~~The `DEFAULT_SELECTIVITY = 0.1` substitution and the stale-statistics
   guard~~ — *done*. Both grids now score 169/169 with zero refusals. The

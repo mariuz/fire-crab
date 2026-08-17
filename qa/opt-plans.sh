@@ -49,10 +49,19 @@ CREATE INDEX IDX_SMALLT_X ON SMALLT (X);
 CREATE TABLE TP (PID INTEGER, PAMT INTEGER, PK INTEGER);
 CREATE INDEX IDX_TP_PID ON TP (PID);
 CREATE INDEX IDX_TP_PAMT ON TP (PAMT);
+-- UA/UB carry NO indexes at all: the fixture for the uncosted join laws
+-- (an unindexed equi key HASHES at every size, larger stream probing
+-- first; a THETA join LOOPS with the smaller stream driving)
+CREATE TABLE UA (ID INTEGER, K INTEGER);
+CREATE TABLE UB (ID INTEGER, K INTEGER);
 COMMIT;
 SET TERM ^ ;
 EXECUTE BLOCK AS DECLARE I INTEGER = 0; BEGIN
   WHILE (I < 500) DO BEGIN I = I + 1; INSERT INTO TP VALUES (:I, MOD(:I,50), :I); END
+  I = 0;
+  WHILE (I < 30) DO BEGIN I = I + 1; INSERT INTO UA VALUES (:I, :I); END
+  I = 0;
+  WHILE (I < 20) DO BEGIN I = I + 1; INSERT INTO UB VALUES (:I, :I); END
 END^
 SET TERM ; ^
 SET TERM ^ ;
@@ -491,5 +500,17 @@ check "SELECT ID FROM T WHERE ID = 5 OR ID = 7 ORDER BY ID"
 check "SELECT PID FROM TP ORDER BY PID"
 check "SELECT FIRST 3 PID FROM TP ORDER BY PID"
 check "SELECT FIRST 3 PID FROM TP WHERE PAMT = 2 ORDER BY PID"
+
+# --- the uncosted two-stream joins, measured law by law ----------------
+# no index serves either key: an EQUI join HASHES at every size with the
+# LARGER stream probing first; a THETA join cannot hash and LOOPS with
+# the SMALLER stream driving; ties keep SQL order. (The half-indexed and
+# cross-family equalities are pinned above on T/U: the indexed side
+# becomes the loop's inner, and a VARCHAR = INTEGER equality still
+# hashes - the type family only gates INDEX use.)
+check "SELECT UA.ID FROM UA JOIN UB ON UA.K = UB.K"
+check "SELECT UA.ID FROM UB JOIN UA ON UA.K = UB.K"
+check "SELECT UA.ID FROM UA JOIN UB ON UA.K > UB.K"
+check "SELECT UA.ID FROM UB JOIN UA ON UA.K < UB.K"
 
 exit $fail

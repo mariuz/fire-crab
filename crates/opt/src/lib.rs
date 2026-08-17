@@ -1344,11 +1344,20 @@ fn plan_chain(
                 break;
             }
         }
+        // ONE side's key indexed and the other's not: the engine builds
+        // the nested loop with the INDEXED side as the inner (probed:
+        // `JOIN (B NATURAL, A INDEX)` on the empty fixtures) - the old
+        // cardinality bands' arrangement search finds exactly that, so
+        // the half-indexed case keeps them
+        let mut half_indexed = false;
         let costed = match &cols {
             None => None,
             Some((ca_col, cb_col)) => {
                 let sa = key_sel(0, ca_col)?;
                 let sb = key_sel(1, cb_col)?;
+                if sa.is_some() != sb.is_some() {
+                    half_indexed = true;
+                }
                 match (sa, sb) {
                     (Some((sa, ua)), Some((sb, ub))) => {
                         // a ZERO selectivity on a POPULATED index means
@@ -1480,9 +1489,89 @@ fn plan_chain(
         // were probed against, and those all had symmetric indexes. The
         // per-arrangement costing below is what distinguishes a unique
         // inner lookup from a non-unique one.
+        // does the ON (or the comma form's WHERE) carry ANY equality
+        // between the two streams? The equivalence classes exclude a
+        // CROSS-FAMILY pair - rightly, for INDEX use - but the engine
+        // still HASHES one (probed: `A.NAME = B.UA`, VARCHAR = INTEGER,
+        // is `PLAN HASH`), so the hash law keys on the raw equality
+        let mut has_equi = cols.is_some();
+        if !has_equi {
+            let mut check = |text: &str| {
+                for clause in split_kw(text, "AND") {
+                    if let Some((a, b)) = clause.split_once('=') {
+                        if b.contains('\'') {
+                            continue;
+                        }
+                        if let (Some((aq, _)), Some((bq, _))) =
+                            (a.trim().split_once('.'), b.trim().split_once('.'))
+                        {
+                            if qual_of(aq).is_some() && qual_of(bq).is_some() {
+                                has_equi = true;
+                            }
+                        }
+                    }
+                }
+            };
+            for on in &ons {
+                check(on);
+            }
+            if let Some(w) = where_s {
+                check(w);
+            }
+        }
         let (shape, from_cost) = match costed {
             Some(sh) => (sh, true),
-            None => (join_band(ca, cb)?, false),
+            None if half_indexed => (join_band(ca, cb)?, false),
+            // NO COSTED ANSWER means no index serves the join key. The
+            // engine's choice here was MEASURED across a size sweep
+            // (1..500 on each side, live PLANONLY) and is uniform:
+            //
+            //  * an EQUI key with no index HASHES AT EVERY SIZE - even
+            //    1 x 1 (the engine's page-based cardinality estimate
+            //    never looks empty enough for avoidHashJoin on a real
+            //    table) - with the LARGER stream probing first and ties
+            //    keeping SQL order, exactly what the Hash arm below
+            //    spells;
+            //  * a THETA join (no equi key at all) cannot hash: it
+            //    LOOPS, and the SMALLER stream drives
+            //    (`JOIN (B NATURAL, A NATURAL)` at 80 x 60), ties
+            //    keeping SQL order.
+            //
+            // This replaces the probed cardinality BANDS (join_band),
+            // whose middle refused: the 6x6 grid behind them was
+            // measured on INDEXED fixtures - a region the costed path
+            // above now decides - so the bands' loop cells never spoke
+            // for THIS path's actual domain. The old large-large band
+            // even HASHED a theta join the engine loops (measured:
+            // 60 x 80 `A.K > B.K`), a live wrong plan this closes.
+            None => {
+                if !has_equi {
+                    // a THETA join (no equi key at all) cannot hash: the
+                    // engine LOOPS with the SMALLER stream driving
+                    // (`JOIN (B NATURAL, A NATURAL)` at 80 x 60, measured),
+                    // ties keeping SQL order. Returned HERE, because the
+                    // arrangement search below cannot place a keyless
+                    // stream and its "no arrangement" error would fall to
+                    // the HASH fallback - the exact wrong plan this closes.
+                    let mut order = vec![0usize, 1];
+                    if cb < ca {
+                        order = vec![1, 0];
+                    }
+                    return Ok(Plan {
+                        streams: order
+                            .into_iter()
+                            .map(|i| Stream {
+                                name: names[i].clone(),
+                                access: Access::Natural,
+                            })
+                            .collect(),
+                        combine: Combine::Join,
+                        sorted: order_s.is_some(),
+                        node: None,
+                    });
+                }
+                (JoinShape::Hash, true)
+            }
         };
         match shape {
             JoinShape::SqlOrder => order_decided = from_cost,
