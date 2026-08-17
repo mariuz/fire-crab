@@ -259,6 +259,20 @@ both "FIRST 250 nav-DRIVER LEFT JOIN ORDER BY b.pk, raiser at 280 past" \
      "SELECT FIRST 250 b.ID, 10/(b.ID - 280) AS Q FROM BIGK b LEFT JOIN BIG c ON b.ID = c.ID ORDER BY b.ID"
 both "FIRST 3 nav-DRIVER JOIN ORDER BY b.pk, clean values" \
      "SELECT FIRST 3 b.ID, c.ID FROM BIGK b JOIN BIG c ON b.ID = c.ID ORDER BY b.ID"
+# A THETA join (a non-equality ON) cannot be hashed or index-probed - it is
+# the O(N x M) nested loop the engine loops too - but a FIRST n over it STILL
+# STREAMS its driver and STOPS: the inner is scanned per driver, but a driver
+# past the limit is never reached, so the projection's raiser at 280 does not
+# run. Navigable driver so the order is the engine's. `>` and `<>` both, and a
+# LEFT theta, since none of these has an equi-key to shortcut with.
+both "FIRST 5 THETA (>) nav-driver, raiser at 280 past, stops" \
+     "SELECT FIRST 5 b.ID, 10/(b.ID - 280) AS Q FROM BIGK b JOIN BIG c ON b.ID > c.ID ORDER BY b.ID"
+both "FIRST 5 THETA (<>) nav-driver, raiser at 280 past, stops" \
+     "SELECT FIRST 5 b.ID, 10/(b.ID - 280) AS Q FROM BIGK b JOIN BIG c ON b.ID <> c.ID ORDER BY b.ID, c.ID"
+both "FIRST 5 THETA (>) LEFT nav-driver, raiser at 280 past, stops" \
+     "SELECT FIRST 5 b.ID, 10/(b.ID - 280) AS Q FROM BIGK b LEFT JOIN BIG c ON b.ID > c.ID ORDER BY b.ID"
+both "FIRST 4 THETA (>) clean values" \
+     "SELECT FIRST 4 b.ID, c.ID FROM BIGK b JOIN BIG c ON b.ID > c.ID ORDER BY b.ID, c.ID"
 # the CONTROL: a limit that REACHES the raiser raises on both, and a clean
 # limit answers the same ordered rows on both (values, not just no-error)
 both "FIRST 285 nav ORDER BY pk REACHES the raiser, both raise" \

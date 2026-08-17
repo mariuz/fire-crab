@@ -2195,6 +2195,22 @@ pulled by the fetch.
   the engine's plan - and the only O(N x M) join left is a THETA join, which
   the engine loops too.
 
+  A THETA join (a non-equality ON) cannot be hashed - but MEASURED, a `FIRST n`
+  over one already STREAMS: the driver walks and STOPS, the inner scanned only
+  for the drivers a delivered row needs (`FIRST 1` of an 8,000 x 8,000 `>` join
+  is 50 ms, the full COUNT 400), and the projection is held past the limit, so
+  a raiser at a driver the limit steps over never runs - probed identical to
+  the engine over `>`, `<>`, and a LEFT theta, now pinned in
+  `serve-real-jointypes.sh`. What does NOT stream is a THETA join fetched
+  WHOLE with no limit: the batch fetch materialises its every combined row
+  before draining batches, where the engine produces them on demand. Closing
+  that is a resumable JOIN cursor - the StreamCursor a scan already has, but
+  over a join's `(driver, match)` walk - which materialises both SIDES
+  (O(N + M)) rather than the OUTPUT (O(N x M)). It is left for later: the
+  common shapes (a `FIRST n`, an aggregate, a filtered result) do not
+  materialise the whole output, and a plain unbounded join of millions of rows
+  is the rare case that does.
+
   ~~The next thing worth doing here is a boundary the gates already pin:
   the engine raises a blocking node's error at OPEN, where this server
   announces the result set and raises at the first FETCH.~~
