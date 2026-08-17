@@ -28170,6 +28170,40 @@ fn for_each_2pc(
     sink: &mut dyn FnMut(Vec<Value>) -> Result<Flow, EvalErr>,
 ) -> Result<(Flow, u64), EvalErr> {
     db.reserve_relation_read(rel);
+    // ONCE, not once per row. The map costs a walk of the whole file and
+    // a decode of every data page of the relation; the loop below asks
+    // for ONE record at a time, so building it inside the fetch made an
+    // index retrieval cost O(rows x pages) and, past a few hundred rows,
+    // several times more than ignoring the index altogether. See
+    // [page_sequence_map] for the measurements.
+    let per_page = fire_crab_ods::format::max_recs_per_dp(db.page_size);
+    if per_page == 0 {
+        return Ok((Flow::Continue, 0));
+    }
+    let image = db.bytes();
+    let view = ReadView::of(db, &image);
+    let pages = page_sequence_map(&image, db.page_size, rel);
+    for_each_2pc_on(&image, &view, db.page_size, &pages, per_page, rel, formats, access, sink)
+}
+
+/// [for_each_2pc] against an ALREADY-FROZEN image: the walk itself, with the
+/// snapshot machinery (the image, the visibility view, the sequence -> page
+/// map) supplied by the caller. [for_each_2pc] derives them from the live
+/// database per call; a resumable cursor ([JoinCursor]'s live index probe)
+/// derives them ONCE from the image it froze at open, so every fetch of the
+/// cursor walks the same pages the cursor's materialised sides came from.
+#[allow(clippy::too_many_arguments)]
+fn for_each_2pc_on(
+    image: &fire_crab_ods::Image,
+    view: &ReadView,
+    page_size: usize,
+    pages: &std::collections::HashMap<u32, u32>,
+    per_page: u64,
+    rel: u16,
+    formats: &[(u8, Vec<Descriptor>)],
+    access: &IndexAccess,
+    sink: &mut dyn FnMut(Vec<Value>) -> Result<Flow, EvalErr>,
+) -> Result<(Flow, u64), EvalErr> {
     // THE VERIFICATION IS ONLY APPLIED WHERE IT IS NEEDED, and that is
     // navigation. Its purpose is twofold: to stop a moved row coming
     // back twice, and to stop it appearing at its OLD key's position in
@@ -28185,19 +28219,6 @@ fn for_each_2pc(
     // ordinary predicate decides - which is the same contract the index
     // has everywhere else.
     let verify = access.navigate();
-    // ONCE, not once per row. The map costs a walk of the whole file and
-    // a decode of every data page of the relation; the loop below asks
-    // for ONE record at a time, so building it inside the fetch made an
-    // index retrieval cost O(rows x pages) and, past a few hundred rows,
-    // several times more than ignoring the index altogether. See
-    // [page_sequence_map] for the measurements.
-    let per_page = fire_crab_ods::format::max_recs_per_dp(db.page_size);
-    if per_page == 0 {
-        return Ok((Flow::Continue, 0));
-    }
-    let image = db.bytes();
-    let view = ReadView::of(db, &image);
-    let pages = page_sequence_map(&image, db.page_size, rel);
     // a SET, not a Vec scanned linearly: the dedup is consulted once per
     // candidate, so `contains` on a Vec makes the acceptance loop
     // quadratic in the candidate count. It is ALSO the dedup the whole
@@ -28217,12 +28238,12 @@ fn for_each_2pc(
     if access.navigate() {
         let pick = &access.picks[0];
         let mut outcome: Result<Flow, EvalErr> = Ok(Flow::Continue);
-        pick.for_each_candidate(&image, db.page_size, rel, |entry_key, recno| {
+        pick.for_each_candidate(image, page_size, rel, |entry_key, recno| {
             if seen.contains(&recno) {
                 return true;
             }
             for values in
-                records_at_in_with(&image, db.page_size, formats, &pages, per_page, &[recno], &view)
+                records_at_in_with(image, page_size, formats, pages, per_page, &[recno], view)
             {
                 // verify is always true under navigation - the stale-entry
                 // check that keeps a moved row out of its old key's slot
@@ -28259,7 +28280,7 @@ fn for_each_2pc(
     // entry that fails verification, vanishing the row. Dedup on ACCEPTANCE.
     let mut cands: Vec<(&IndexPick, Vec<u8>, u64)> = Vec::new();
     for pick in &access.picks {
-        for (entry_key, recno) in pick.candidates(&db.bytes(), db.page_size, rel) {
+        for (entry_key, recno) in pick.candidates(image, page_size, rel) {
             cands.push((pick, entry_key, recno));
         }
     }
@@ -28269,7 +28290,7 @@ fn for_each_2pc(
             continue;
         }
         for values in
-            records_at_in_with(&image, db.page_size, formats, &pages, per_page, &[recno], &view)
+            records_at_in_with(image, page_size, formats, pages, per_page, &[recno], view)
         {
             if !verify || pick.entry_is_current(&entry_key, &values) {
                 seen.insert(recno);
@@ -28653,12 +28674,32 @@ impl StreamCursor {
 struct PartData {
     part: JoinPart,
     /// the inner side, decoded once (O(M_i)); a theta part scans it whole,
-    /// an unindexed equi part hashes it via `key_hash`
+    /// an unindexed equi part hashes it via `key_hash`. EMPTY for a probed
+    /// part, whose rows come from the frozen index walk per accumulated row
     inner: Vec<Vec<Value>>,
     /// the hash of the inner by its equi-key, when the ON is a hashable
     /// equality with no index; `None` leaves the ON to decide over the whole
     /// inner, as a theta join needs
     key_hash: Option<KeyHash>,
+    /// `Some` = the ON has a LIVE INDEX PROBE: the side is NOT materialised;
+    /// each accumulated row bands the index and walks the cursor's FROZEN
+    /// image instead - the same per-driver read the streaming join arm does,
+    /// pinned to the snapshot the cursor opened on
+    probed: Option<ProbedSide>,
+}
+
+/// What a probed part's frozen index walk needs per fetch, derived ONCE at
+/// open from the image the cursor froze - the maps [for_each_2pc] would
+/// otherwise rebuild from the live database on every call.
+struct ProbedSide {
+    /// the relation's `sequence -> page` map on the frozen image
+    pages: std::collections::HashMap<u32, u32>,
+    per_page: u64,
+    /// the relation's data pages, for the [Band::Scan] whole-side fallback
+    data_pages: Vec<u32>,
+    /// the lazily-built frozen WHOLE side, for a driver key the band cannot
+    /// spell ([Band::Scan]) - built at most once, the first time one occurs
+    fallback: Option<Vec<Vec<Value>>>,
 }
 
 /// A resumable cursor over a plain JOIN whose OUTPUT would otherwise be
@@ -28696,20 +28737,35 @@ struct PartData {
 /// phase reached only once the driver exhausts - and a resumable cursor is
 /// what lets that pass span many fetches without re-deriving it.
 ///
+/// An INDEXED side streams too: the cursor cannot repeat a per-driver index
+/// read against the LIVE database (the pages move under it between fetches),
+/// so it freezes the page image at open - the same answer [StreamCursor]
+/// gives a plain scan - and walks the index THERE, rebuilding the visibility
+/// view over that image per batch exactly as `StreamCursor::next_batch`
+/// does. The band still only NAMES candidates (built per accumulated row by
+/// [JoinProbe::band], whose catalog reads are DDL-stable); the ON decides,
+/// over rows fetched from the frozen pages. A driver key the band cannot
+/// spell falls back to the WHOLE side, read once from the same image.
+///
 /// STREAMABLE SHAPES ONLY. A bare `Plan::Join` (no wrapping FIRST/SKIP -
 /// those already stream via `stream_first_n`), no ORDER BY (a sort must see
-/// every combined row), NO LIVE INDEX PROBE on any side (its rows come from
-/// a per-driver index read against the live database, which a frozen cursor
-/// cannot repeat consistently), and - in a MULTI-PART chain - every part but
-/// the LAST must be LEFT or INNER, because a mirror in a non-terminal part
-/// emits rows that belong to no base row and so break the per-base-row
-/// concatenation. The last part may be any kind. Every side is then
-/// materialised whole - a theta part scans it, an unindexed equi part hashes
-/// it, a RIGHT/FULL last part walks it for both the match and the mirror -
-/// which is exactly the shape whose OUTPUT the fallback was building in full.
-/// [JoinCursor::open] answers `None` for everything else, leaving the
-/// materialising path in charge.
+/// every combined row), a probed side only when it is a PLAIN TABLE (a
+/// flattened view or derived side keeps the materialising path), and - in a
+/// MULTI-PART chain - every part but the LAST must be LEFT or INNER, because
+/// a mirror in a non-terminal part emits rows that belong to no base row and
+/// so break the per-base-row concatenation. The last part may be any kind.
+/// Every unprobed side is materialised whole - a theta part scans it, an
+/// unindexed equi part hashes it, a RIGHT/FULL last part walks it for both
+/// the match and the mirror - which is exactly the shape whose OUTPUT the
+/// fallback was building in full. [JoinCursor::open] answers `None` for
+/// everything else, leaving the materialising path in charge.
 struct JoinCursor {
+    /// the page image frozen at open - the snapshot the sides were decoded
+    /// from, and the pages a probed part's index walk reads on every fetch
+    /// (the visibility view over it is rebuilt per batch, exactly as
+    /// [StreamCursor::next_batch] does). `None` once finished: the cursor is
+    /// kept for the client's extra fetch, the image is not.
+    image: Option<std::sync::Arc<fire_crab_ods::Image>>,
     /// the driver (base) side, decoded once at open (O(N))
     driver: Vec<Vec<Value>>,
     base_width: usize,
@@ -28781,27 +28837,57 @@ impl JoinCursor {
         if inner_parts.iter().any(|p| !matches!(p.kind, JoinKind::Left | JoinKind::Inner)) {
             return None;
         }
-        // a LIVE INDEX PROBE reads a side per driver from the current
-        // database, which a frozen cursor cannot repeat consistently across
-        // fetches. `probe = None` (a theta join) or an unindexed equi-join
-        // (`index = None`, hashed) both materialise the side WHOLE, which is
-        // the shape whose output the fallback built in full. RIGHT/FULL never
-        // carry a probe (it is built LEFT/INNER only).
-        if parts.iter().any(|p| p.probe.as_ref().is_some_and(|pr| pr.index.is_some())) {
+        // a LIVE INDEX PROBE reads its side per accumulated row. The cursor
+        // freezes the page image at open (as StreamCursor does), so the probe
+        // can repeat that read on every fetch against the SAME pages its
+        // materialised sides came from - but only for a PLAIN TABLE side,
+        // whose rows the walk fetches directly off the relation; a flattened
+        // view or derived side keeps the materialising path. RIGHT/FULL never
+        // carry a probe (it is built LEFT/INNER only), so the mirror side is
+        // always materialised whole.
+        if parts.iter().any(|p| {
+            p.probe.as_ref().is_some_and(|pr| pr.index.is_some())
+                && !matches!(&p.src, RowSource::TableScan { rel, .. } if *rel == p.probe.as_ref().unwrap().src.rel)
+        }) {
             return None;
         }
         let above = bind_filter(filter, args).ok()?;
         let base = resolve_driver_base(db, base, defer, &above);
-        // the driver and every side decoded once, frozen for the cursor's life
+        // the image first, then the driver and every unprobed side decoded
+        // once - all frozen for the cursor's life
+        let image = db.bytes();
+        let per_page = fire_crab_ods::format::max_recs_per_dp(db.page_size);
         let driver = base.rows(db).ok()?;
         let mut parts_data: Vec<PartData> = Vec::with_capacity(parts.len());
         for p in parts {
+            if p.probe.as_ref().is_some_and(|pr| pr.index.is_some()) {
+                // a probed side is NOT materialised: its rows come from the
+                // frozen index walk per accumulated row. Build the walk's
+                // maps once, here, from the frozen image.
+                if per_page == 0 {
+                    return None;
+                }
+                let rel = p.probe.as_ref().unwrap().src.rel;
+                db.reserve_relation_read(rel);
+                parts_data.push(PartData {
+                    part: p.clone(),
+                    inner: Vec::new(),
+                    key_hash: None,
+                    probed: Some(ProbedSide {
+                        pages: page_sequence_map(&image, db.page_size, rel),
+                        per_page,
+                        data_pages: fire_crab_ods::relation_data_pages(&image, db.page_size, rel),
+                        fallback: None,
+                    }),
+                });
+                continue;
+            }
             let inner = p.src.rows(db).ok()?;
             // an unindexed equi part hashes its inner by the ON's key; a theta
             // part (no probe, or a key the hash declines) leaves it `None` and
             // the ON scans the whole inner
             let key_hash = p.probe.as_ref().and_then(|pr| build_join_key_hash(&inner, pr));
-            parts_data.push(PartData { part: p.clone(), inner, key_hash });
+            parts_data.push(PartData { part: p.clone(), inner, key_hash, probed: None });
         }
         // a RIGHT/FULL last part needs the mirror machinery: the match bitmap
         // over its side and the one-side WHERE gates for a partnerless/mirror
@@ -28820,6 +28906,7 @@ impl JoinCursor {
             (None, None, Vec::new())
         };
         Some(JoinCursor {
+            image: Some(image),
             driver,
             base_width: *base_width,
             parts: parts_data,
@@ -28849,10 +28936,15 @@ impl JoinCursor {
     /// back ALREADY PROJECTED (one value per output column, in output
     /// order), so the caller encodes them positionally, as the
     /// materialised `Plan::Rows` path does.
-    fn next_batch(&mut self, want: usize) -> Result<(Vec<Vec<Value>>, bool), EvalErr> {
+    fn next_batch(&mut self, db: &Database, want: usize) -> Result<(Vec<Vec<Value>>, bool), EvalErr> {
         if self.done || want == 0 {
             return Ok((Vec::new(), self.done));
         }
+        // the visibility view is rebuilt per batch OVER THE FROZEN IMAGE,
+        // exactly as StreamCursor::next_batch does - the pages never move
+        // under the cursor, whatever commits between fetches
+        let image = self.image.clone().expect("an unfinished cursor holds its frozen image");
+        let view = ReadView::of(db, &image);
         let mut out: Vec<Vec<Value>> = Vec::with_capacity(want);
         loop {
             // deliver the current unit's remaining rows first
@@ -28870,7 +28962,7 @@ impl JoinCursor {
             if self.di < self.driver.len() {
                 let base_row = self.driver[self.di].clone();
                 self.di += 1;
-                self.pending = self.driver_output(base_row)?;
+                self.pending = self.driver_output(db, &image, &view, base_row)?;
                 self.pj = 0;
             } else if self.has_mirror() && self.mi < last_inner {
                 self.pending = self.mirror_output()?;
@@ -28892,6 +28984,7 @@ impl JoinCursor {
     /// keeps it from holding every side until the statement is re-executed.
     fn finish(&mut self) {
         self.done = true;
+        self.image = None;
         self.driver = Vec::new();
         self.parts = Vec::new();
         self.pending = Vec::new();
@@ -28905,16 +28998,22 @@ impl JoinCursor {
     /// RIGHT/FULL-terminated one through the inner parts, then the last part's
     /// mirror-tracking match. The rows and their order are exactly what
     /// `join_rowsource` (and so the materialising path) produces.
-    fn driver_output(&mut self, base_row: Vec<Value>) -> Result<Vec<Vec<Value>>, EvalErr> {
+    fn driver_output(
+        &mut self,
+        db: &Database,
+        image: &fire_crab_ods::Image,
+        view: &ReadView,
+        base_row: Vec<Value>,
+    ) -> Result<Vec<Vec<Value>>, EvalErr> {
         let n = self.parts.len();
         if self.has_mirror() {
             // fold through the inner (LEFT/INNER) parts, then the RIGHT/FULL
             // last part matches each accumulated row and tracks the mirror
-            let acc = self.fold(base_row, n - 1)?;
+            let acc = self.fold(db, image, view, base_row, n - 1)?;
             return self.mirror_driver_output(acc);
         }
         // fold through every part, then keep what the WHERE admits and project
-        let acc = self.fold(base_row, n)?;
+        let acc = self.fold(db, image, view, base_row, n)?;
         let JoinCursor { above, cols, .. } = self;
         let mut out = Vec::with_capacity(acc.len());
         for row in acc {
@@ -28935,28 +29034,76 @@ impl JoinCursor {
     /// A part with a hash looks each accumulated row up in its bucket; a theta
     /// part scans the whole side. `join_step` carries the WHERE for the
     /// partnerless-raise gating at each step, as `join_rowsource` does.
-    fn fold(&mut self, base_row: Vec<Value>, upto: usize) -> Result<Vec<Vec<Value>>, EvalErr> {
+    fn fold(
+        &mut self,
+        db: &Database,
+        image: &fire_crab_ods::Image,
+        view: &ReadView,
+        base_row: Vec<Value>,
+        upto: usize,
+    ) -> Result<Vec<Vec<Value>>, EvalErr> {
         let JoinCursor { base_width, parts, above, scan_buf, .. } = self;
         let mut acc = vec![base_row];
         let mut w = *base_width;
-        for pd in &parts[..upto] {
-            acc = match pd.part.probe.as_ref() {
-                // a theta part (or a key the hash declined): the ON decides
-                // over the whole side, for every accumulated row at once
-                None => join_step(acc, w, &pd.inner, &pd.part, above)?,
-                // an unindexed equi part: each accumulated row pairs with its
-                // hash bucket (the whole side when the key's family differs)
-                Some(probe) => {
+        for pd in &mut parts[..upto] {
+            let PartData { part, inner, key_hash, probed } = pd;
+            acc = match (probed.as_mut(), part.probe.as_ref()) {
+                // a LIVE INDEX PROBE: band the index per accumulated row and
+                // walk the FROZEN image for its candidates - the streaming
+                // join arm's per-driver read, pinned to the open snapshot.
+                // The band only NAMES candidates; the ON (join_step) decides.
+                (Some(ps), Some(probe)) => {
                     let mut next = Vec::new();
                     for row in acc {
-                        let matched =
-                            join_scan_rows(&row, probe, &pd.inner, pd.key_hash.as_ref(), scan_buf);
-                        next.extend(join_step(vec![row], w, matched, &pd.part, above)?);
+                        match probe.band(db, &row) {
+                            Band::Index(access) => {
+                                let rrows = frozen_probe_rows(
+                                    image, view, db.page_size, ps, probe, &access, part.width,
+                                )?;
+                                next.extend(join_step(vec![row], w, &rrows, part, above)?);
+                            }
+                            // a NULL outer key names nothing - the answer,
+                            // not a reason to scan
+                            Band::Nothing => {
+                                next.extend(join_step(vec![row], w, &[], part, above)?);
+                            }
+                            // a key the band cannot spell: the ON decides over
+                            // the WHOLE side, read once from the frozen image
+                            Band::Scan => {
+                                if ps.fallback.is_none() {
+                                    ps.fallback = Some(frozen_side_rows(
+                                        image,
+                                        view,
+                                        db.page_size,
+                                        &probe.src.formats,
+                                        &ps.data_pages,
+                                        part.width,
+                                    )?);
+                                }
+                                let whole = ps.fallback.as_deref().unwrap_or(&[]);
+                                next.extend(join_step(vec![row], w, whole, part, above)?);
+                            }
+                        }
                     }
                     next
                 }
+                // a theta part (or a key the hash declined): the ON decides
+                // over the whole side, for every accumulated row at once
+                (None, None) => join_step(acc, w, inner, part, above)?,
+                // an unindexed equi part: each accumulated row pairs with its
+                // hash bucket (the whole side when the key's family differs)
+                (None, Some(probe)) => {
+                    let mut next = Vec::new();
+                    for row in acc {
+                        let matched = join_scan_rows(&row, probe, inner, key_hash.as_ref(), scan_buf);
+                        next.extend(join_step(vec![row], w, matched, part, above)?);
+                    }
+                    next
+                }
+                // a ProbedSide is only ever built for a part WITH a probe
+                (Some(_), None) => unreachable!("a probed part carries its probe"),
             };
-            w += pd.part.width;
+            w += part.width;
         }
         Ok(acc)
     }
@@ -29053,6 +29200,76 @@ impl JoinCursor {
         }
         Ok(Vec::new())
     }
+}
+
+/// The candidates a probed part's band names, fetched from the FROZEN image:
+/// [for_each_2pc]'s walk with the cursor-held maps, collected, each row
+/// padded to the part's width - exactly what the streaming join arm's
+/// per-driver `IndexScan` fetch produces, from the pages the cursor froze
+/// at open.
+fn frozen_probe_rows(
+    image: &fire_crab_ods::Image,
+    view: &ReadView,
+    page_size: usize,
+    ps: &ProbedSide,
+    probe: &JoinProbe,
+    access: &IndexAccess,
+    width: usize,
+) -> Result<Vec<Vec<Value>>, EvalErr> {
+    let mut out = Vec::new();
+    let (_, limbo) = for_each_2pc_on(
+        image,
+        view,
+        page_size,
+        &ps.pages,
+        ps.per_page,
+        probe.src.rel,
+        &probe.src.formats,
+        access,
+        &mut |mut row| {
+            row.resize(width, Value::Null);
+            out.push(row);
+            Ok(Flow::Continue)
+        },
+    )?;
+    // the index narrows what is READ, and limbo raises only when a named
+    // record was read - as the streaming arm's IndexScan fetch does
+    if limbo != 0 {
+        return Err(EvalErr::RecInLimbo(limbo));
+    }
+    Ok(out)
+}
+
+/// A probed part's WHOLE side, read once from the FROZEN image - the
+/// [Band::Scan] fallback for a driver key the band cannot spell. The walk is
+/// [StreamCursor::next_batch]'s page loop (decode each data page, judge each
+/// record through the view), collected, padded to the part's width.
+fn frozen_side_rows(
+    image: &fire_crab_ods::Image,
+    view: &ReadView,
+    page_size: usize,
+    formats: &[(u8, Vec<Descriptor>)],
+    data_pages: &[u32],
+    width: usize,
+) -> Result<Vec<Vec<Value>>, EvalErr> {
+    let mut out = Vec::new();
+    for &pno in data_pages {
+        let Some(dp) = fire_crab_ods::page_at(image, page_size, pno).and_then(DataPage::decode)
+        else {
+            continue;
+        };
+        for r in dp.records() {
+            let Some(mut values) = view.values(image, page_size, formats, &r) else {
+                if view.limbo.get() != 0 {
+                    return Err(EvalErr::RecInLimbo(view.limbo.get()));
+                }
+                continue;
+            };
+            values.resize(width, Value::Null);
+            out.push(values);
+        }
+    }
+    Ok(out)
 }
 
 /// Project a combined row into its output columns - one value per column, in
@@ -49288,7 +49505,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                                             ..c.clone()
                                         })
                                         .collect();
-                                    (c.next_batch(want as usize), cols, true)
+                                    (c.next_batch(db, want as usize), cols, true)
                                 }
                             };
                             match batch {

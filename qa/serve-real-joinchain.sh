@@ -276,9 +276,14 @@ chain_ms "a chain ending in a RIGHT streams matches then the mirror" \
 # a WHERE above the whole streamed chain
 chain_ms "a WHERE above the whole streamed chain" \
     "SELECT E.ID FROM EMP E JOIN DEPT D ON E.SALARY > D.ID JOIN REGION R ON E.REGION_ID > R.ID WHERE E.ID < 20"
+# an INDEXED first step (DEPT's PK) folds through the cursor too: the
+# probe walks the index on the FROZEN image per accumulated row, so an
+# indexed part no longer sends the whole fetch back to the materialiser
+chain_ms "an indexed then theta chain streams" \
+    "SELECT E.ID FROM EMP E JOIN DEPT D ON E.DEPT_ID = D.ID JOIN REGION R ON E.SALARY > R.ID"
 
-if [ "$ran" -lt 38 ]; then
-    echo "DIFF only $ran checks ran (expected at least 38) - did one silently skip?"
+if [ "$ran" -lt 39 ]; then
+    echo "DIFF only $ran checks ran (expected at least 39) - did one silently skip?"
     fail=1
 fi
 exit $fail

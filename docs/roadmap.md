@@ -2270,6 +2270,39 @@ pulled by the fetch.
   chain, all multiset-compared against the engine). Only an ORDER BY or an
   indexed inner keep the materialising path now.
 
+  **DONE — the INDEXED side streams: the probe walks the frozen image.** The
+  cursor declined any part with a live index probe, because a per-driver
+  index read against the live database cannot be repeated consistently
+  across fetches - the pages move under the cursor. The answer was already
+  in the file: freeze the page image at open, exactly as `StreamCursor`
+  does, and walk the index THERE, rebuilding the visibility view over that
+  image per batch. `for_each_2pc` was split: the walk itself
+  (`for_each_2pc_on`) now takes the image, the view and the sequence -> page
+  map as arguments, and `for_each_2pc` is the wrapper that derives them from
+  the live database - so a probed part derives them ONCE at open
+  (`ProbedSide`) and every fetch walks the same pages its materialised
+  sides came from. Per accumulated row the probe still bands the index
+  (`JoinProbe::band`, whose catalog reads are DDL-stable) and the ON still
+  decides over the fetched candidates; a NULL driver key names nothing
+  (`Band::Nothing`), and a key the band cannot spell - a scaled NUMERIC
+  against an integer PK - falls back to the WHOLE side, read once lazily
+  from the same frozen image (`Band::Scan`), so the answer is the scan's
+  wherever the band declines. Probed sides must be PLAIN TABLES (a
+  flattened view or derived side keeps the materialising path). Reading the
+  first 100 rows of a 4M-row indexed equi-join (4,000 drivers x 1,000
+  matches each) took 2.7-2.8 s of whole-output materialisation; it now
+  answers at the wire round-trip floor (~330 ms attach-to-row, the same as
+  `SELECT 1`), and the server-side cost - which grew linearly with the
+  output (~270 ms at 400k rows, ~2.4 s at 4M) - is gone from the fetch.
+  Pinned by `serve-real-jointypes.sh` +4 (the whole indexed equi-join over
+  all 300 drivers, an indexed LEFT join's padding, a NULL and an
+  unspellable scaled driver key through the streamed probe, and a WHERE
+  above one) and `serve-real-joinchain.sh` +1 (an indexed-then-theta
+  chain); `serve-real-leftjoinindex.sh`'s 169 checks - whose whole-fetch
+  `same3` probes all route through the cursor now - hold unchanged. Only an
+  ORDER BY (whose sort must see every combined row, as the engine's does)
+  keeps the materialising path.
+
   ~~The next thing worth doing here is a boundary the gates already pin:
   the engine raises a blocking node's error at OPEN, where this server
   announces the result set and raises at the first FETCH.~~

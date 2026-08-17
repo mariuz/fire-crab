@@ -200,6 +200,22 @@ both "the WHOLE FULL theta join streams" \
      "SELECT A.ID AS AID, C.ID AS CID FROM A FULL JOIN C ON A.K > C.K"
 both "a WHERE above the WHOLE RIGHT streamed join" \
      "SELECT A.ID AS AID, C.ID AS CID FROM A RIGHT JOIN C ON A.K = C.K WHERE C.ID >= 10"
+# an INDEXED inner streams too: the cursor freezes the page image at open
+# and the probe walks the index THERE per driver row, fetching candidates
+# from the frozen pages - the ON still decides. These pin the three probe
+# answers through the cursor: a banded equality (Band::Index), a NULL
+# driver key (Band::Nothing - names nothing, the equi-join answer), and a
+# key the band cannot spell (a scaled NUMERIC against the integer PK ->
+# Band::Scan, the whole side read once from the frozen image, where the
+# ON aligns 5.00 = 5 exactly as the scan always did).
+both "the WHOLE indexed equi-join streams, all 300 drivers probed" \
+     "SELECT b.ID AS BID, c.ID AS CID FROM BIG b JOIN BIGK c ON c.ID = b.ID"
+both "the WHOLE indexed LEFT join pads and streams" \
+     "SELECT a.ID AS AID, c.ID AS CID FROM A a LEFT JOIN BIGK c ON c.ID = a.K AND c.ID > 1"
+both "a NULL and an unspellable (scaled) driver key through the streamed probe" \
+     "SELECT a.ID AS AID, c.ID AS CID FROM A a LEFT JOIN BIGK c ON c.ID = a.AMT"
+both "a WHERE above the WHOLE streamed indexed join" \
+     "SELECT b.ID AS BID, c.ID AS CID FROM BIG b JOIN BIGK c ON c.ID = b.ID WHERE b.ID > 295"
 # a NULL key never joins, whatever the operator - the comparison is
 # UNKNOWN, so the row is padded by an outer join and dropped by an
 # inner. Row 4's AMT is NULL, so it is the padded one.
