@@ -3653,6 +3653,8 @@ pub fn restore_view(
 /// referential action's, stored VERBATIM: the BLR and source are the
 /// engine's own bytes off the file, not compiled here.
 pub struct CarriedTrigger {
+    /// the PSQL debug map, stored sub_type 9 like CREATE TRIGGER's
+    pub debug: Option<Vec<u8>>,
     pub name: String,
     pub relation: String,
     pub sequence: i64,
@@ -3676,6 +3678,10 @@ pub fn restore_carried_trigger(
         .ok_or("no RDB$TRIGGERS relation")?;
     let src = dml::insert_blob_cs(file, page_size, trel, &[t.source.clone()], 1, 4)?;
     let blr = dml::insert_blob(file, page_size, trel, &[t.blr.clone()], 2)?;
+    let dbg = match &t.debug {
+        Some(d) => Some(dml::insert_blob(file, page_size, trel, &[d.clone()], 9)?),
+        None => None,
+    };
     let mut vals: Vec<(&str, SysVal)> = vec![
         ("RDB$TRIGGER_NAME", SysVal::S(&t.name)),
         ("RDB$RELATION_NAME", SysVal::S(&t.relation)),
@@ -3692,6 +3698,10 @@ pub fn restore_carried_trigger(
     }
     if let Some(v) = t.valid_blr {
         vals.push(("RDB$VALID_BLR", SysVal::I(v)));
+    }
+    let dbg_bytes = dbg.map(|d| blob_id_bytes(trel, d));
+    if let Some(b) = &dbg_bytes {
+        vals.push(("RDB$DEBUG_INFO", SysVal::B(*b)));
     }
     sys_insert(file, page_size, "RDB$TRIGGERS", trel, &vals)?;
     Ok(())

@@ -309,7 +309,6 @@ pub fn write_backup_verbose(
     // must read, not guess (RDB$GENERATORS is relation 20, not the 10
     // a first guess said, and the gate caught it).
     for (what, rel_name) in [
-        ("a trigger", "RDB$TRIGGERS"),
         ("an exception", "RDB$EXCEPTIONS"),
         ("a user function", "RDB$FUNCTIONS"),
         ("a role", "RDB$ROLES"),
@@ -862,6 +861,9 @@ pub fn write_backup_verbose(
         if let Some(v) = t.valid_blr {
             r = r.int(13, v);
         }
+        if let Some(d) = &t.debug {
+            r = r.blob(14, d);
+        }
         r.end();
     }
     log.push("gbak:writing trigger messages".into());
@@ -1294,6 +1296,8 @@ struct UGen {
 /// trigger (flag 0/NULL) never reaches here, the surface check
 /// refuses it upstream.
 struct UTrig {
+    /// the PSQL source-to-BLR map (att 14) - user triggers carry one
+    debug: Option<Vec<u8>>,
     name: String,
     relation: String,
     sequence: i32,
@@ -1334,8 +1338,8 @@ fn read_triggers(
     let mut out = Vec::new();
     for r in &rows {
         let flag = int(r, at("RDB$SYSTEM_FLAG")).unwrap_or(0);
-        if flag == 1 || flag == 0 {
-            continue; // real system triggers never ride; user ones refused upstream
+        if flag == 1 {
+            continue; // real system triggers never ride (the engine's filter)
         }
         let Some(name) = text_opt(r, at("RDB$TRIGGER_NAME")) else { continue };
         let blr = blob(r, at("RDB$TRIGGER_BLR")).ok_or_else(|| {
@@ -1343,7 +1347,9 @@ fn read_triggers(
         })?;
         let mut source = blob(r, at("RDB$TRIGGER_SOURCE")).unwrap_or_default();
         source.push(0); // the file carries the text NUL-terminated
+        let debug = blob(r, at("RDB$DEBUG_INFO"));
         out.push(UTrig {
+            debug,
             relation: text_opt(r, at("RDB$RELATION_NAME")).unwrap_or_default(),
             sequence: int(r, at("RDB$TRIGGER_SEQUENCE")).unwrap_or(0) as i32,
             ttype: int(r, at("RDB$TRIGGER_TYPE")).unwrap_or(0),
@@ -1971,6 +1977,8 @@ pub struct RProcParam {
 
 /// One carried trigger row (a CHECK's or a referential action's).
 pub struct RTrigger {
+    /// the PSQL source-to-BLR map, when the file carries one
+    pub debug: Option<Vec<u8>>,
     pub name: String,
     pub relation: String,
     pub sequence: i32,
@@ -2265,6 +2273,7 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                 // count and the RAW bytes OUT-OF-BAND, so the generic
                 // attribute walk cannot read this record
                 let mut tr = RTrigger {
+                    debug: None,
                     name: String::new(),
                     relation: String::new(),
                     sequence: 0,
@@ -2317,7 +2326,8 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                                         tr.source.pop();
                                     }
                                 }
-                                _ => {} // descriptions/debug info set aside
+                                14 => tr.debug = Some(raw),
+                                _ => {} // descriptions set aside
                             }
                         }
                         4 => tr.name = String::from_utf8_lossy(&data).into_owned(),
@@ -2337,12 +2347,6 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                             )));
                         }
                     }
-                }
-                if tr.system_flag == 0 {
-                    return Err(Refused(format!(
-                        "trigger {} is a USER trigger - outside this restore's surface",
-                        tr.name
-                    )));
                 }
                 out.triggers.push(tr);
             }
@@ -2899,7 +2903,9 @@ mod trigger_tests {
     }
 
     #[test]
-    fn a_user_trigger_refuses_typed() {
+    fn a_user_trigger_rides_with_its_debug_map() {
+        // ~~user triggers refuse~~ - they ride now, the debug map
+        // (att 14, the PSQL source-to-BLR map) carried beside the BLR
         let mut f = Vec::new();
         Rec::new(&mut f, rec::BURP).int(2, 12).int(4, 1).int(5, 1).end();
         Rec::new(&mut f, rec::TRIGGER)
@@ -2908,12 +2914,12 @@ mod trigger_tests {
             .int(1, 1)
             .blob(2, &[5, 2, 76])
             .int(8, 0)
+            .blob(14, &[1, 2, 3])
             .end();
         f.push(rec::END);
-        let e = match read_backup(&f) {
-            Err(e) => e,
-            Ok(_) => panic!("a user trigger must refuse"),
-        };
-        assert!(e.0.contains("USER trigger"), "{}", e.0);
+        let r = read_backup(&f).expect("parses");
+        assert_eq!(r.triggers.len(), 1);
+        assert_eq!(r.triggers[0].system_flag, 0);
+        assert_eq!(r.triggers[0].debug.as_deref(), Some(&[1u8, 2, 3][..]));
     }
 }

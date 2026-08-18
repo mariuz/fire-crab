@@ -54,8 +54,14 @@ vanishes; and rec 29 — procedure_end, a bare byte — must close a
 procedure or the reader walks the next record as trigger messages.
 The engine executing an fc-AUTHORED procedure catalog remains the
 old recorded loader boundary; every other corner of the matrix runs.
-The catalog chunk's arc closes: what still refuses is typed and
-small (user triggers, exceptions, functions, roles, packages, GTTs,
+The catalog chunk's arc closes. ~~User triggers refuse~~ — they
+RIDE too (the same rec 13 the constraint triggers took, plus the
+att-14 debug map carried verbatim): the ENGINE restores fc's backup
+and the trigger FIRES on an insert, both directions; fc's OWN DML on
+a restored user-trigger table refuses fail-closed where its executor
+cannot speak the carried body — the engine fires on the same file,
+recorded. What still refuses is typed and small (exceptions — now
+the fail-closed representative — functions, roles, packages, GTTs,
 expression-columned views).
 
 The subsystem map's rows fall into three states, and the difference

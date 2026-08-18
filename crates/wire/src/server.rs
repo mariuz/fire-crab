@@ -3333,6 +3333,7 @@ fn run_gbak_restore_core(
                 &mut file,
                 page_size,
                 &fire_crab_ods::ddl::CarriedTrigger {
+                    debug: tr.debug.clone(),
                     name: tr.name.clone(),
                     relation: tr.relation.clone(),
                     sequence: tr.sequence as i64,

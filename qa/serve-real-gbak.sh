@@ -265,9 +265,43 @@ else
 fi
 rm -f "$VPDB" "$D/fc-gbak-vp.fbk" "$D/fc-gbak-vpr.fdb"
 
-refusal "a trigger" "SET TERM ^;
-CREATE TRIGGER TR FOR T BEFORE INSERT AS BEGIN NEW.X = 1; END^
-SET TERM ;^"
+# ~~a trigger refuses~~ - USER TRIGGERS RIDE (the same rec 13 the
+# constraint triggers took, plus the att-14 debug map): proven by the
+# ENGINE restoring fc's backup and the trigger FIRING on an insert.
+# fc's OWN DML on the restored table refuses fail-closed where its
+# executor cannot speak the carried body - the engine fires; recorded.
+UTDB="$D/fc-gbak-ut.fdb"; rm -f "$UTDB" "$D/fc-gbak-ut.fbk" "$D/fc-gbak-utr.fdb"
+"$ISQL" -q -b -user "$U" -pas "$P" <<EOF >/dev/null 2>&1
+CREATE DATABASE '$UTDB' USER '$U' PASSWORD '$P' PAGE_SIZE 8192;
+CREATE TABLE UT (X INTEGER, Y INTEGER);
+COMMIT;
+SET TERM ^;
+CREATE TRIGGER TRU FOR UT BEFORE INSERT POSITION 5 AS BEGIN NEW.Y = NEW.X * 2; END^
+SET TERM ;^
+COMMIT;
+INSERT INTO UT (X) VALUES (7);
+COMMIT;
+EOF
+chmod 666 "$UTDB"
+ran=$((ran + 1))
+fo=$(svc_backup "$FMGR" "$UTDB" "$D/fc-gbak-ut.fbk")
+if [ "${fo##*rc=}" = "0" ]; then
+    echo "OK   a USER TRIGGER rides the backup (fc backs it up, debug map included)"
+else
+    echo "DIFF user-trigger backup: [$fo]"; fail=1
+fi
+ran=$((ran + 1))
+sudo -n chmod 666 "$D/fc-gbak-ut.fbk" 2>/dev/null || chmod 666 "$D/fc-gbak-ut.fbk" 2>/dev/null
+"$FBSVCMGR" "$EMGR" user "$U" password "$P" action_restore dbname "$D/fc-gbak-utr.fdb" bkp_file "$D/fc-gbak-ut.fbk" >/dev/null 2>&1
+grab "$D/fc-gbak-utr.fdb"
+got=$(printf 'SET HEADING OFF;\nINSERT INTO UT (X) VALUES (9);\nSELECT X, Y FROM UT ORDER BY X;\n' |
+    "$ISQL" -q -b -user "$U" -pas "$P" "$D/fc-gbak-utr.fdb" 2>&1 | tr -s ' \n' ' ')
+if [ "$got" = " 7 14 9 18 " ]; then
+    echo "OK   the ENGINE restores fc's fbk and the trigger FIRES (X=9 doubles to Y=18)"
+else
+    echo "DIFF trigger after engine restore: [$got] (want ' 7 14 9 18 ')"; fail=1
+fi
+rm -f "$UTDB" "$D/fc-gbak-ut.fbk" "$D/fc-gbak-utr.fdb"
 refusal "an exception" "CREATE EXCEPTION E_X 'boom';"
 
 # --- 4. RECORDED BOUNDARY: NOT NULL is not carried ---------------------------
