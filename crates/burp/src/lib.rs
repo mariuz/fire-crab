@@ -45,6 +45,7 @@ mod rec {
     pub const PROCEDURE: u8 = 27;
     pub const PROCEDURE_PRM: u8 = 28;
     pub const GENERATOR: u8 = 26;
+    pub const EXCEPTION: u8 = 30;
     pub const REL_CONSTRAINT: u8 = 31;
     pub const REF_CONSTRAINT: u8 = 32;
     pub const CHK_CONSTRAINT: u8 = 33;
@@ -309,7 +310,6 @@ pub fn write_backup_verbose(
     // must read, not guess (RDB$GENERATORS is relation 20, not the 10
     // a first guess said, and the gate caught it).
     for (what, rel_name) in [
-        ("an exception", "RDB$EXCEPTIONS"),
         ("a user function", "RDB$FUNCTIONS"),
         ("a role", "RDB$ROLES"),
     ] {
@@ -652,6 +652,14 @@ pub fn write_backup_verbose(
         r.int(9, g.increment).end();
     }
     log.push("gbak:writing exceptions".into());
+    for (name, msg) in read_exceptions(image, page_size)? {
+        log.push(format!("gbak:writing exception \"PUBLIC\".\"{}\"", name));
+        Rec::new(&mut out, rec::EXCEPTION)
+            .text(8, "PUBLIC")
+            .text(1, &name)
+            .text(2, &msg)
+            .end();
+    }
     log.push("gbak:writing functions".into());
     log.push("gbak:writing stored procedures".into());
     for pr in &procedures {
@@ -1655,6 +1663,31 @@ fn field_type_of(
     None
 }
 
+/// The user EXCEPTIONS: name and message text (RDB$MESSAGE is a
+/// plain VARCHAR - the record's att 2 is an ordinary text attribute,
+/// not a framed blob).
+fn read_exceptions(
+    image: &fire_crab_ods::Image,
+    page_size: usize,
+) -> Result<Vec<(String, String)>, Refused> {
+    let Some((cols, rows)) = sys_rows(image, page_size, "RDB$EXCEPTIONS") else {
+        return Ok(Vec::new());
+    };
+    let at = |n: &str| cols.iter().find(|(c, _)| c.eq_ignore_ascii_case(n)).map(|(_, i)| *i);
+    let mut out = Vec::new();
+    for r in &rows {
+        if matches!(
+            at("RDB$SYSTEM_FLAG").and_then(|i| r.values.get(i)),
+            Some(fire_crab_ods::format::Value::Int(n)) if *n != 0
+        ) {
+            continue;
+        }
+        let Some(name) = text_opt(r, at("RDB$EXCEPTION_NAME")) else { continue };
+        out.push((name, text_opt(r, at("RDB$MESSAGE")).unwrap_or_default()));
+    }
+    Ok(out)
+}
+
 fn read_generators(
     image: &fire_crab_ods::Image,
     page_size: usize,
@@ -1936,6 +1969,8 @@ pub struct Restored {
     pub domain_types: Vec<(String, i64, i64, i64, i64)>,
     /// the carried procedures, file order
     pub procedures: Vec<RProc>,
+    /// the user exceptions: (name, message), file order
+    pub exceptions: Vec<(String, String)>,
     /// privilege records seen and set aside - the count keeps the
     /// omission visible in the trace instead of silent
     pub privileges_skipped: u64,
@@ -2122,6 +2157,7 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
         triggers: Vec::new(),
         domain_types: Vec::new(),
         procedures: Vec::new(),
+        exceptions: Vec::new(),
         privileges_skipped: 0,
     };
     // (schema, source name) -> not-null flag learned from constraints
@@ -2349,6 +2385,15 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                     }
                 }
                 out.triggers.push(tr);
+            }
+            rec::EXCEPTION => {
+                let atts = read_atts(f, &mut at)?;
+                out.exceptions.push((
+                    att(&atts, 1)
+                        .map(|a| a.text())
+                        .ok_or_else(|| Refused("an exception with no name".into()))?,
+                    att(&atts, 2).map(|a| a.text()).unwrap_or_default(),
+                ));
             }
             rec::GENERATOR => {
                 let atts = read_atts(f, &mut at)?;

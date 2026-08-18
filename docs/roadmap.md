@@ -60,9 +60,15 @@ att-14 debug map carried verbatim): the ENGINE restores fc's backup
 and the trigger FIRES on an insert, both directions; fc's OWN DML on
 a restored user-trigger table refuses fail-closed where its executor
 cannot speak the carried body — the engine fires on the same file,
-recorded. What still refuses is typed and small (exceptions — now
-the fail-closed representative — functions, roles, packages, GTTs,
-expression-columned views).
+recorded. ~~Exceptions refuse~~ — they RIDE (rec 30, the smallest
+record of the chunk: the message is a plain u8-length text
+attribute, not a framed blob, because RDB$MESSAGE is a VARCHAR):
+both restores raise the carried exception with its exact message,
+and file order preserves the RDB$EXCEPTION_NUMBER sequence because
+create_exception's counter walks the same order the backup walked
+the catalog. gbak 25, gbakrestore 37; a FUNCTION is the fail-closed
+representative now. What still refuses is typed and small
+(functions, roles, packages, GTTs, expression-columned views).
 
 The subsystem map's rows fall into three states, and the difference
 matters more than the row count:

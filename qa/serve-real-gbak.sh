@@ -302,7 +302,37 @@ else
     echo "DIFF trigger after engine restore: [$got] (want ' 7 14 9 18 ')"; fail=1
 fi
 rm -f "$UTDB" "$D/fc-gbak-ut.fbk" "$D/fc-gbak-utr.fdb"
-refusal "an exception" "CREATE EXCEPTION E_X 'boom';"
+# ~~an exception refuses~~ - EXCEPTIONS RIDE (rec 30, the message a
+# plain text attribute): the ENGINE restores fc's backup and RAISES
+# the exception with the carried message
+EXDB="$D/fc-gbak-ex.fdb"; rm -f "$EXDB" "$D/fc-gbak-ex.fbk" "$D/fc-gbak-exr.fdb"
+"$ISQL" -q -b -user "$U" -pas "$P" <<EOF >/dev/null 2>&1
+CREATE DATABASE '$EXDB' USER '$U' PASSWORD '$P' PAGE_SIZE 8192;
+CREATE TABLE T (X INTEGER);
+COMMIT;
+CREATE EXCEPTION E_X 'boom: value too large';
+COMMIT;
+EOF
+chmod 666 "$EXDB"
+ran=$((ran + 1))
+fo=$(svc_backup "$FMGR" "$EXDB" "$D/fc-gbak-ex.fbk")
+if [ "${fo##*rc=}" = "0" ]; then
+    echo "OK   an EXCEPTION rides the backup (fc backs it up)"
+else
+    echo "DIFF exception backup: [$fo]"; fail=1
+fi
+ran=$((ran + 1))
+sudo -n chmod 666 "$D/fc-gbak-ex.fbk" 2>/dev/null || chmod 666 "$D/fc-gbak-ex.fbk" 2>/dev/null
+"$FBSVCMGR" "$EMGR" user "$U" password "$P" action_restore dbname "$D/fc-gbak-exr.fdb" bkp_file "$D/fc-gbak-ex.fbk" >/dev/null 2>&1
+grab "$D/fc-gbak-exr.fdb"
+got=$(printf 'SET TERM ^;\nEXECUTE BLOCK AS BEGIN EXCEPTION E_X; END^\nSET TERM ;^\n' |
+    "$ISQL" -q -user "$U" -pas "$P" "$D/fc-gbak-exr.fdb" 2>&1 | grep -c "boom: value too large")
+if [ "$got" = "1" ]; then
+    echo "OK   the ENGINE restores fc's fbk and RAISES it with the carried message"
+else
+    echo "DIFF exception raise after engine restore: match-count [$got] (want 1)"; fail=1
+fi
+rm -f "$EXDB" "$D/fc-gbak-ex.fbk" "$D/fc-gbak-exr.fdb"
 
 # --- 4. RECORDED BOUNDARY: NOT NULL is not carried ---------------------------
 NN="$D/fc-gbak-nn.fdb"; rm -f "$NN"

@@ -3085,6 +3085,12 @@ fn run_gbak_restore_core(
             .map(|h| h.page_size as usize)
             .ok_or("the fresh shell has no header")?;
         let mut file = fire_crab_ods::Image::from_bytes(&raw, page_size);
+        // EXCEPTIONS first - nothing references them at restore time,
+        // and create_exception's own counter numbers them in file
+        // order, which is the catalog order the backup walked
+        for (name, msg) in &restored.exceptions {
+            fire_crab_ods::ddl::create_exception(&mut file, page_size, name, msg)?;
+        }
         // SEQUENCES first - they are independent of the tables, and the
         // backed-up CURRENT value is written into the generator vector
         // after the catalog row exists (the value is not a catalog
