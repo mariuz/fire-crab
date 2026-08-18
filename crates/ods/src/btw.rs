@@ -278,6 +278,22 @@ pub fn index_key(itype: u16, value: &Value, scale: i8, charset: u8) -> Option<Ve
             let trimmed = s.as_bytes().trim_ascii_end_matches();
             Some(if trimmed.is_empty() { vec![0] } else { trimmed.to_vec() })
         }
+        // a REAL collation's itype: the collation driver's SORT key -
+        // primary weights, then secondaries, then the special trailer
+        // (ods::coll, converted from the engine's lc_narrow driver;
+        // PXW_INTL is the one driven). Trailing blanks are stripped by
+        // the driver's pad option; the empty value keys [00] like its
+        // binary siblings. Proven the differential way: the ENGINE's
+        // own index scan finds the rows fire-crab keys.
+        it if it == IDX_OFFSET_INTL + crate::coll::TTYPE_PXW_INTL => {
+            let Value::Text(s) = value else { return None };
+            let bytes = match crate::intl::encode_text(crate::intl::CS_WIN1252, s) {
+                Ok(Some(v)) => v,
+                _ => return None,
+            };
+            let key = crate::coll::pxw_intl_key(&bytes, false);
+            Some(if key.is_empty() { vec![0] } else { key })
+        }
         // an INTL itype with the DEFAULT (binary) collation: the
         // codepage's bytes, trailing 0x20 stripped, empty keyed [00] -
         // IDX_METADATA's shape in the column's own character set

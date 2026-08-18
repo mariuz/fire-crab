@@ -242,13 +242,27 @@ measured or pinned items**, each recorded in its own place below:
   DEFAULT collation only, measured: a REAL collation carries its OWN
   case tables — PXW_INTL upcases 'é' to 'E' (accent-stripping, the
   Paradox convention) and does NOT raise on 'ƒ' — so a collated
-  column keeps the simple-mapping arm until the collation driver is
-  converted (recorded divergence: fc answers 'É' there). The driver
-  itself is in reach: the vendored source ships the whole narrow
-  machinery (lc_narrow.cpp string_to_key — primary bytes ++
-  secondaries ++ tertiaries ++ 0x00+specials — with
-  collations/pw1252intl.h's SortOrder/case/Compress/Expansion
-  tables), the next conversion slice, not a held boundary.
+  column keeps the simple-mapping arm until the collation's case
+  tables are wired (recorded divergence: fc answers 'É' there).
+
+  **The narrow collation driver is CONVERTED** (`ods::coll`, from the
+  vendored lc_narrow.cpp with pw1252intl.h transcribed by script):
+  PXW_INTL orders, compares and KEYS. ORDER BY answers the engine's
+  measured order (a á A a-b ab aB Ab ab- aé b e é ss ß st z — case
+  and accents at the secondary level, the ß expansion losing its tie
+  against 'ss'); WHERE compares through `Expr::CollKey` wraps (both
+  sides evaluate to the collation KEY spelled as a carrier string —
+  keys collate bytewise, so the plain value compare over wrapped
+  sides IS the collation's compare); and fire-crab's DML maintains
+  the PXW_INTL index with the engine's own key bytes, proven by the
+  ENGINE's index scan finding fc-written rows by collated equality
+  and accent-blind range, gfix clean. Discovered against the first
+  reading of the C source: PXW_INTL has NO specials — its punctuation
+  carries a plain primary in place ('a-b' < 'ab', probed live).
+  `qa/serve-real-collate.sh` (13). Deferred, recorded: a bound `?`
+  against a collated column, grouped ORDER BY stamps, collated
+  retrieval BANDS (scans today, correctly), the collation's own case
+  tables for UPPER/LOWER, and the other PXW weight tables.
   serve-real-xlit.sh 17 -> 20. ~~Still held: the untabled codepages~~ —
   three more TAKEN: WIN1250, WIN1251 and ISO8859_2, and their tables
   were GENERATED FROM THE LIVE ENGINE rather than typed from a chart:

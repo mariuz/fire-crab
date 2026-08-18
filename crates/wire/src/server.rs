@@ -6864,7 +6864,7 @@ fn expr_reads(e: &Expr, f: &dyn Fn(usize) -> bool) -> bool {
         // the per-row coercion wrappers read whatever they wrap - a
         // wrapped COLUMN must keep its term row-DEPENDENT, or the
         // invariant pass would raise a value-gated 22018 over no row
-        Expr::TextNum(a, _) | Expr::TextNumKey(a, _) | Expr::TextBool(a, _) => expr_reads(a, f),
+        Expr::TextNum(a, _) | Expr::TextNumKey(a, _) | Expr::TextBool(a, _) | Expr::CollKey(a, _) => expr_reads(a, f),
         Expr::Neg(a) | Expr::Cast(a, _, _) => expr_reads(a, f),
         Expr::Bin(a, _, b) | Expr::Concat(a, b) | Expr::NullIf(a, b) => {
             expr_reads(a, f) || expr_reads(b, f)
@@ -20442,6 +20442,9 @@ fn resolve_index_ops_uncached(db: &Database, rel: u16, descs: &[Descriptor]) -> 
                     | btw::IDX_BOOLEAN
                     | btw::IDX_BCD
             ) && btw::intl_binary_charset(itype).is_none()
+                // ... and the one REAL collation the driver speaks:
+                // its keys come from ods::coll's converted lc_narrow
+                && itype != btw::IDX_OFFSET_INTL + fire_crab_ods::coll::TTYPE_PXW_INTL
             {
                 return None;
             }
@@ -22658,7 +22661,7 @@ fn plan_join_bound(
         // columns' - the same rule the single-relation grouping follows
         let order_by = match order_s {
             None => Vec::new(),
-            Some(os) => parse_order_by(os, &cols, |n| {
+            Some(os) => parse_order_by(os, &cols, &[], |n| {
                 let bare = n.rsplit('.').next().unwrap_or(n);
                 cols.iter()
                     .position(|c| c.name.eq_ignore_ascii_case(bare))
@@ -22817,6 +22820,7 @@ fn plan_join_bound(
         Some(os) => parse_order_by_expr(
             os,
             &cols,
+            &ord_descs,
             |n| resolve_join_col(&sides, n).map(|(idx, _, _)| idx),
             |text| parse_raw_expr(text).and_then(|r| resolve_expr(&r, &ord_cols, &ord_descs)),
         )?,
@@ -22865,6 +22869,7 @@ fn plan_join_bound(
                         expr: None,
                         desc: false,
                         nulls: NullsAt::Default,
+                        coll: 0,
                     }];
                     if let Some(access) =
                         choose_index(db, src.rel, &src.table, &driver_descs, &None, &opt_sql, &nav)
@@ -23536,7 +23541,7 @@ fn plan_over_source(
         }
         let order_by = match order_s {
             None => Vec::new(),
-            Some(os) => parse_order_by(os, &gcols, |n| {
+            Some(os) => parse_order_by(os, &gcols, &[], |n| {
                 let bare = n.rsplit('.').next().unwrap_or(n);
                 gcols
                     .iter()
@@ -23649,6 +23654,7 @@ fn plan_over_source(
         Some(os) => parse_order_by_expr(
             &unq(os),
             &out_cols,
+            &descs,
             |n| {
                 columns
                     .iter()
@@ -26403,6 +26409,7 @@ fn plan_query_inner_ctx(
                 Some(os) => parse_order_by_expr(
                     os,
                     &cols,
+                    &descs,
                     |n| {
                         columns
                             .iter()
@@ -26699,6 +26706,7 @@ fn plan_query_inner_ctx(
                             Some(os) => parse_order_by_expr(
                                 os,
                                 &[],
+                                &descs,
                                 |n| {
                                     columns
                                         .iter()
@@ -26888,6 +26896,7 @@ fn plan_query_inner_ctx(
                 match parse_order_by_expr(
                     os,
                     &cols,
+                    &descs,
                     |n| {
                         columns
                             .iter()
@@ -27882,7 +27891,7 @@ fn plan_group(
     // whose DID is the base table's DEPT_ID becomes exactly this.
     let order_by = match order_s {
         None => Vec::new(),
-        Some(os) => parse_order_by(os, &cols, |n| {
+        Some(os) => parse_order_by(os, &cols, &[], |n| {
             if let Some(c) = cols.iter().find(|c| c.name.eq_ignore_ascii_case(n)) {
                 return Some(c.field_id);
             }
@@ -29902,11 +29911,15 @@ struct OrderKey {
     expr: Option<Expr>,
     desc: bool,
     nulls: NullsAt,
+    /// The ttype whose COLLATION orders this key's text - `0` = none
+    /// (the plain value ordering). Stamped at resolution off the
+    /// column descriptor; only `coll::TTYPE_PXW_INTL` is driven so far.
+    coll: u16,
 }
 
 impl OrderKey {
     fn field(field: usize, desc: bool, nulls: NullsAt) -> OrderKey {
-        OrderKey { field, expr: None, desc, nulls }
+        OrderKey { field, expr: None, desc, nulls, coll: 0 }
     }
     /// This key's value for a decoded row.
     fn value_of(&self, values: &[Value]) -> Result<Value, EvalErr> {
@@ -29941,13 +29954,24 @@ fn sort_rows(rows: &mut [Vec<Value>], keys: &[OrderKey]) -> Result<(), EvalErr> 
     let flat: Vec<OrderKey> = keys
         .iter()
         .enumerate()
-        .map(|(i, k)| OrderKey::field(i, k.desc, k.nulls))
+        .map(|(i, k)| OrderKey { field: i, expr: None, desc: k.desc, nulls: k.nulls, coll: k.coll })
         .collect();
     decorated.sort_by(|a, b| order_cmp(&a.0, &b.0, &flat));
     for (dst, (_, row)) in rows.iter_mut().zip(decorated.into_iter()) {
         *dst = row;
     }
     Ok(())
+}
+
+/// Compare two text values under PXW_INTL: re-encode the decoded
+/// chars to their WIN1252 bytes (infallible for values decoded FROM
+/// that set; a foreign char answers None and the caller keeps the
+/// plain ordering) and run the converted collation driver.
+fn collated_text_cmp(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
+    let (Value::Text(x), Value::Text(y)) = (a, b) else { return None };
+    let bx = fire_crab_ods::intl::encode_text(fire_crab_ods::intl::CS_WIN1252, x).ok().flatten()?;
+    let by = fire_crab_ods::intl::encode_text(fire_crab_ods::intl::CS_WIN1252, y).ok().flatten()?;
+    Some(fire_crab_ods::coll::pxw_intl_compare(&bx, &by))
 }
 
 fn order_cmp(a: &[Value], b: &[Value], keys: &[OrderKey]) -> std::cmp::Ordering {
@@ -29975,7 +29999,11 @@ fn order_cmp(a: &[Value], b: &[Value], keys: &[OrderKey]) -> std::cmp::Ordering 
                 }
             }
         } else {
-            let o = value_cmp(va, vb);
+            let o = if key.coll == fire_crab_ods::coll::TTYPE_PXW_INTL {
+                collated_text_cmp(va, vb).unwrap_or_else(|| value_cmp(va, vb))
+            } else {
+                value_cmp(va, vb)
+            };
             if desc {
                 o.reverse()
             } else {
@@ -30081,7 +30109,7 @@ fn compute_windows(
             .order
             .iter()
             .enumerate()
-            .map(|(i, k)| OrderKey::field(i, k.desc, k.nulls))
+            .map(|(i, k)| OrderKey { field: i, expr: None, desc: k.desc, nulls: k.nulls, coll: k.coll })
             .collect();
         if !spec.order.is_empty() {
             ordrows.reserve(n);
@@ -32677,6 +32705,7 @@ fn emit_rows_inner(
                                         expr: None,
                                         desc: k.desc,
                                         nulls: k.nulls,
+                                        coll: k.coll,
                                     })
                                 })
                                 .collect()
@@ -36419,6 +36448,18 @@ enum Expr {
     /// raise 22018; NULL is UNKNOWN).
     /// The `u8` is the text side's charset for the 22018 spelling.
     TextBool(Box<Expr>, u8),
+    /// A comparison side under a COLLATION: evaluates to the value's
+    /// COLLATION KEY spelled as a carrier string, so the ordinary
+    /// value compare over two wrapped sides IS the collation's compare
+    /// - keys collate bytewise, which is the whole point of a key
+    /// (`ods::coll`, PXW_INTL driven). Wrapped over BOTH sides of a
+    /// text-vs-text comparison at [cmp_sides] when either is a bare
+    /// column of the collation's ttype (a literal adopts the column's
+    /// collation - the engine's rule). Shape-matching sites that look
+    /// for `Col` through this wrapper (hash-key marking, equi
+    /// detection) simply MISS and keep their lenient path - a safe
+    /// degradation, not a wrong answer.
+    CollKey(Box<Expr>, u16),
 }
 
 /// A resolved [RawCond].
@@ -38296,6 +38337,7 @@ impl Expr {
                 e.type_of(descs).map(|_| ExprType::Numeric)
             }
             Expr::TextBool(e, _) => e.type_of(descs).map(|_| ExprType::Bool),
+            Expr::CollKey(e, _) => e.type_of(descs),
             Expr::Null => Some(ExprType::Int),
             Expr::DateLit(_) => Some(ExprType::Temporal(TKind::Date)),
             Expr::TimeLit(_) => Some(ExprType::Temporal(TKind::Time)),
@@ -38608,7 +38650,7 @@ impl Expr {
             // the per-row coercion wrappers have no STATIC rank - the
             // value's width is decided by each row's text. They live
             // only inside WHERE comparisons, never in a describe.
-            Expr::TextNum(_, _) | Expr::TextNumKey(_, _) | Expr::TextBool(_, _) => None,
+            Expr::TextNum(_, _) | Expr::TextNumKey(_, _) | Expr::TextBool(_, _) | Expr::CollKey(_, _) => None,
             Expr::Coalesce(args) => args.iter().filter_map(|a| a.rank_of(descs)).max(),
             Expr::Case(branches, else_) => branches
                 .iter()
@@ -38808,6 +38850,23 @@ impl Expr {
             // exactly through num_cmp, a double one through the
             // approx promotion, and a bad one raises 22018 carrying
             // the raw (CHAR-padded) value
+            Expr::CollKey(e, _tt) => match e.eval(values)? {
+                Value::Null => Value::Null,
+                Value::Text(s) => {
+                    match fire_crab_ods::intl::encode_text(
+                        fire_crab_ods::intl::CS_WIN1252,
+                        &s,
+                    ) {
+                        Ok(Some(b)) => Value::Text(fire_crab_ods::intl::carrier_decode(
+                            &fire_crab_ods::coll::pxw_intl_key(&b, false),
+                        )),
+                        // a char with no WIN1252 image cannot have come
+                        // from the column; keep the raw text (defensive)
+                        _ => Value::Text(s),
+                    }
+                }
+                v => v,
+            },
             Expr::TextNum(e, cs) => match e.eval(values)? {
                 Value::Null => Value::Null,
                 Value::Text(s) => match text_col_num(&s) {
@@ -40114,6 +40173,7 @@ fn plan_correlated_select(
         Some(os) => parse_order_by_expr(
             &unq(os),
             &cols,
+            &descs,
             |n| {
                 columns
                     .iter()
@@ -42394,9 +42454,10 @@ fn default_expr_name(raw: &RawExpr) -> String {
 fn parse_order_by(
     order: &str,
     cols: &[ProjCol],
+    descs: &[Descriptor],
     resolve_name: impl Fn(&str) -> Option<usize>,
 ) -> Option<Vec<OrderKey>> {
-    parse_order_by_expr(order, cols, resolve_name, |_| None)
+    parse_order_by_expr(order, cols, descs, resolve_name, |_| None)
 }
 
 /// The same, with a resolver for ORDER BY items that are EXPRESSIONS
@@ -42407,9 +42468,21 @@ fn parse_order_by(
 fn parse_order_by_expr(
     order: &str,
     cols: &[ProjCol],
+    descs: &[Descriptor],
     resolve_name: impl Fn(&str) -> Option<usize>,
     resolve_expression: impl Fn(&str) -> Option<Expr>,
 ) -> Option<Vec<OrderKey>> {
+    // a FIELD key over a COLLATED column sorts by that collation - the
+    // ttype rides the key ([OrderKey::coll]; PXW_INTL is the one driven)
+    let stamp = |mut k: OrderKey| -> OrderKey {
+        if k.expr.is_none()
+            && descs.get(k.field).map(|d| d.sub_type as u16)
+                == Some(fire_crab_ods::coll::TTYPE_PXW_INTL)
+        {
+            k.coll = fire_crab_ods::coll::TTYPE_PXW_INTL;
+        }
+        k
+    };
     let mut keys = Vec::new();
     // an ORDER BY list is split on commas - but an expression may CONTAIN
     // one (`SUBSTRING(x FROM 1 FOR 2)`), so the split is depth-aware
@@ -42457,7 +42530,7 @@ fn parse_order_by_expr(
         if qualified {
             let fid = resolve_name(name)
                 .or_else(|| resolve_name(name.split('.').nth(1)?.trim_matches('"')))?;
-            keys.push(OrderKey::field(fid, desc, nulls));
+            keys.push(stamp(OrderKey::field(fid, desc, nulls)));
             continue;
         }
         if !plain_ident {
@@ -42465,7 +42538,7 @@ fn parse_order_by_expr(
             // EXPRESSION key, computed per row
             match resolve_expression(head) {
                 Some(e) => {
-                    keys.push(OrderKey { field: 0, expr: Some(e), desc, nulls });
+                    keys.push(OrderKey { field: 0, expr: Some(e), desc, nulls, coll: 0 });
                     continue;
                 }
                 None => return None,
@@ -42486,7 +42559,7 @@ fn parse_order_by_expr(
             // `sort_rows`. This used to refuse, which was right only
             // while nothing evaluated expression keys.
             if let Some(e) = &cols[ord - 1].expr {
-                keys.push(OrderKey { field: 0, expr: Some(e.clone()), desc, nulls });
+                keys.push(OrderKey { field: 0, expr: Some(e.clone()), desc, nulls, coll: 0 });
                 continue;
             }
             cols[ord - 1].field_id
@@ -42502,14 +42575,14 @@ fn parse_order_by_expr(
                     // the same rule as the ordinal above: an aliased
                     // EXPRESSION sorts by the expression it names
                     if let Some(e) = &c.expr {
-                        keys.push(OrderKey { field: 0, expr: Some(e.clone()), desc, nulls });
+                        keys.push(OrderKey { field: 0, expr: Some(e.clone()), desc, nulls, coll: 0 });
                         continue;
                     }
                     c.field_id
                 }
             }
         };
-        keys.push(OrderKey::field(fid, desc, nulls));
+        keys.push(stamp(OrderKey::field(fid, desc, nulls)));
     }
     if keys.is_empty() {
         None
@@ -47560,6 +47633,25 @@ fn cmp_sides(lhs: Expr, rhs: Expr, descs: &[Descriptor]) -> Option<(Expr, Expr)>
                 Some((Expr::TextNum(Box::new(lhs), cs), rhs))
             }
         }
+        (ExprType::Text, ExprType::Text) => {
+            // a comparison against a COLLATED column compares by that
+            // collation, and a literal or plain-text side ADOPTS it
+            // (the engine's rule); both sides wrap so the ordinary
+            // value compare runs over collation KEYS
+            let tt = fire_crab_ods::coll::TTYPE_PXW_INTL;
+            let collated = |e: &Expr| {
+                matches!(e, Expr::Col(fid)
+                    if descs.get(*fid).map(|d| d.sub_type as u16) == Some(tt))
+            };
+            if collated(&lhs) || collated(&rhs) {
+                Some((
+                    Expr::CollKey(Box::new(lhs), tt),
+                    Expr::CollKey(Box::new(rhs), tt),
+                ))
+            } else {
+                Some((lhs, rhs))
+            }
+        }
         _ => Some((lhs, rhs)),
     }
 }
@@ -47666,6 +47758,7 @@ fn expr_no_raise(e: &Expr, descs: &[Descriptor]) -> bool {
         // error-propagating term paths, never admitted where a raise
         // cannot travel
         Expr::TextNum(_, _) | Expr::TextNumKey(_, _) | Expr::TextBool(_, _) => false,
+        Expr::CollKey(a, _) => expr_no_raise(a, descs),
         Expr::Neg(x) => expr_no_raise(x, descs),
         // arithmetic can overflow / divide by zero; CAST can fail
         Expr::Bin(..) | Expr::Cast(..) => false,
@@ -47954,6 +48047,26 @@ fn param_or_typed_term(
     d: &Descriptor,
     params: &mut Vec<Option<Descriptor>>,
 ) -> Option<Term> {
+    // A COLLATED column compares by its COLLATION, and a literal
+    // against it adopts that collation (the engine's rule): the term
+    // becomes an ordinary per-row comparison over [Expr::CollKey]
+    // wraps - collation KEYS collate bytewise, so the plain value
+    // compare over two wrapped sides IS the collation's compare. An
+    // ExprCond is never banded, which is the right conservatism while
+    // no collated index is accepted. (A bound `?` against such a
+    // column still takes the plain path - recorded, not driven yet.)
+    if matches!(kind, ColKind::Text)
+        && d.sub_type as u16 == fire_crab_ods::coll::TTYPE_PXW_INTL
+    {
+        if let RawKind::Cmp(op, Rhs::Str(lit)) = &raw {
+            let tt = fire_crab_ods::coll::TTYPE_PXW_INTL;
+            return Some(Term::ExprCond(Box::new(Cond2::Cmp(
+                Box::new(Expr::CollKey(Box::new(Expr::Col(idx)), tt)),
+                *op,
+                Box::new(Expr::CollKey(Box::new(Expr::Str(lit.clone())), tt)),
+            ))));
+        }
+    }
     // A BYTE-CARRIER column (NONE/OCTETS/ASCII) compares BYTES, and its
     // decoded values live in the char-per-byte carrier spelling - so a
     // REAL literal (UTF-8 semantics) is lifted into the carrier of its
@@ -53268,6 +53381,7 @@ mod tests {
             expr: Some(Expr::Col(1)),
             desc: false,
             nulls: NullsAt::Default,
+            coll: 0,
         };
         sort_rows(&mut rows, &[key]).unwrap();
         let ids: Vec<i64> = rows
@@ -54872,28 +54986,28 @@ mod tests {
             k.map(|v| v.iter().map(|k| (k.field, k.desc, k.nulls)).collect())
         };
         assert_eq!(
-            shape(parse_order_by("2 DESC, ID", &cols, by_col)),
+            shape(parse_order_by("2 DESC, ID", &cols, &[], by_col)),
             Some(vec![(1, true, NullsAt::Default), (3, false, NullsAt::Default)])
         );
         // the NULLS clause is independent of the direction, and either
         // may appear alone
         assert_eq!(
-            shape(parse_order_by("ID NULLS LAST", &cols, by_col)),
+            shape(parse_order_by("ID NULLS LAST", &cols, &[], by_col)),
             Some(vec![(3, false, NullsAt::Last)])
         );
         assert_eq!(
-            shape(parse_order_by("ID DESC NULLS FIRST", &cols, by_col)),
+            shape(parse_order_by("ID DESC NULLS FIRST", &cols, &[], by_col)),
             Some(vec![(3, true, NullsAt::First)])
         );
         assert_eq!(
-            shape(parse_order_by("2 DESC NULLS LAST, ID NULLS FIRST", &cols, by_col)),
+            shape(parse_order_by("2 DESC NULLS LAST, ID NULLS FIRST", &cols, &[], by_col)),
             Some(vec![(1, true, NullsAt::Last), (3, false, NullsAt::First)])
         );
         // a position that is not FIRST or LAST is refused, not guessed
-        assert!(parse_order_by("ID NULLS SIDEWAYS", &cols, by_col).is_none());
-        assert!(parse_order_by("ID NULLS", &cols, by_col).is_none());
-        assert!(parse_order_by("3", &cols, by_col).is_none()); // ordinal out of range
-        assert!(parse_order_by("BOGUS", &cols, by_col).is_none()); // unknown column
+        assert!(parse_order_by("ID NULLS SIDEWAYS", &cols, &[], by_col).is_none());
+        assert!(parse_order_by("ID NULLS", &cols, &[], by_col).is_none());
+        assert!(parse_order_by("3", &cols, &[], by_col).is_none()); // ordinal out of range
+        assert!(parse_order_by("BOGUS", &cols, &[], by_col).is_none()); // unknown column
     }
 
     #[test]
@@ -57825,7 +57939,7 @@ mod tests {
             "NAME" => Some(1usize),
             _ => None,
         };
-        let keys = |o: &str| parse_order_by(o, &cols, bare_only);
+        let keys = |o: &str| parse_order_by(o, &cols, &[], bare_only);
         assert_eq!(keys("ID").map(|k| k[0].field), Some(0));
         assert_eq!(keys("E.ID").map(|k| k[0].field), Some(0));
         assert_eq!(keys("E.NAME").map(|k| k[0].field), Some(1));
@@ -61428,7 +61542,7 @@ mod tests {
         // NAVIGATION removes the Sort - and only navigation does. A
         // sort dropped wrongly does not lose rows; it hands back the
         // right rows in an order the engine did not choose.
-        let keys = vec![OrderKey { field: 0, expr: None, desc: false, nulls: NullsAt::Default }];
+        let keys = vec![OrderKey { field: 0, expr: None, desc: false, nulls: NullsAt::Default, coll: 0 }];
         let sorted = RowSource::scan_filter_sort(
             128,
             Vec::new(),
