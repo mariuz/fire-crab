@@ -85,9 +85,26 @@ writer's surface and the reader's walk. Both restores carry the
 roles and take a live GRANT; grants TO roles stay in the recorded
 privilege set-aside. PACKAGES joined the writer's fail-closed
 surface check (a bare package header has no member to refuse
-through) and a PACKAGE is the boundary representative now. What
-still refuses is typed and small (packages, GTTs,
-expression-columned views).
+through) and a PACKAGE is the boundary representative now.
+~~Packages refuse~~ — PACKAGES RIDE (rec 38 + members as ordinary
+records with their package attribute, gbak 33): the header row's
+two sources verbatim, the members' rows tagged with
+RDB$PACKAGE_NAME and RDB$PRIVATE_FLAG (no security class, no own
+grant — the package is the privilege boundary, object type 18), and
+the arguments' rec-16 records carrying package att 10, without
+which the engine's restore matches zero args and refuses the file.
+Both restores EXECUTE both members and the carried PRIVATE flag
+still guards the hidden one. **And the slice closed an OLD recorded
+boundary**: "the engine executing an fc-authored procedure catalog
+crashes the loader" was ONE NULL COLUMN — the param rows'
+RDB$FIELD_SOURCE_SCHEMA_NAME, which the engine's loader
+dereferences (the FK-blocker lesson found again by full-row diff
+against the engine's own restore). With it written, the engine
+executes procedures off fc's restores in every corner
+(gbakrestore 39). A GTT is the boundary representative now — and
+the reader REFUSES relation type > 1 instead of silently landing a
+GTT as a plain table (att 18 was ignored before, a found bug). What
+still refuses is typed and small (GTTs, expression-columned views).
 
 The subsystem map's rows fall into three states, and the difference
 matters more than the row count:

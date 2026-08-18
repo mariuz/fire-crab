@@ -410,6 +410,58 @@ else
 fi
 rm -f "$RLDB" "$D/fc-gbak-rl.fbk" "$D/fc-gbak-rlr.fdb"
 
+# PACKAGES RIDE (rec 38 + members as ordinary records with the package
+# attribute): the ENGINE restores fc's backup and EXECUTES both
+# members, and the PRIVATE flag still guards the hidden function
+PKDB="$D/fc-gbak-pk.fdb"; rm -f "$PKDB" "$D/fc-gbak-pk.fbk" "$D/fc-gbak-pkr.fdb"
+"$ISQL" -q -b -user "$U" -pas "$P" <<EOF >/dev/null 2>&1
+CREATE DATABASE '$PKDB' USER '$U' PASSWORD '$P' PAGE_SIZE 8192;
+CREATE TABLE T (X INTEGER);
+COMMIT;
+SET TERM ^;
+CREATE PACKAGE PK AS
+BEGIN
+  FUNCTION FD (A INTEGER) RETURNS INTEGER;
+  PROCEDURE PS (B INTEGER) RETURNS (C INTEGER);
+END^
+CREATE PACKAGE BODY PK AS
+BEGIN
+  FUNCTION FD (A INTEGER) RETURNS INTEGER AS BEGIN RETURN A * 3; END
+  FUNCTION FHID (A INTEGER) RETURNS INTEGER AS BEGIN RETURN A + 100; END
+  PROCEDURE PS (B INTEGER) RETURNS (C INTEGER) AS BEGIN C = FHID(B); SUSPEND; END
+END^
+SET TERM ;^
+COMMIT;
+EOF
+chmod 666 "$PKDB"
+ran=$((ran + 1))
+fo=$(svc_backup "$FMGR" "$PKDB" "$D/fc-gbak-pk.fbk")
+if [ "${fo##*rc=}" = "0" ]; then
+    echo "OK   a PACKAGE rides the backup (fc backs it up, members and all)"
+else
+    echo "DIFF package backup: [$fo]"; fail=1
+fi
+ran=$((ran + 1))
+sudo -n chmod 666 "$D/fc-gbak-pk.fbk" 2>/dev/null || chmod 666 "$D/fc-gbak-pk.fbk" 2>/dev/null
+"$FBSVCMGR" "$EMGR" user "$U" password "$P" action_restore dbname "$D/fc-gbak-pkr.fdb" bkp_file "$D/fc-gbak-pk.fbk" >/dev/null 2>&1
+grab "$D/fc-gbak-pkr.fdb"
+got=$(printf "SELECT PK.FD(14) || '/' || (SELECT C FROM PK.PS(7)) FROM RDB\$DATABASE;\n" |
+    "$ISQL" -q -b -user "$U" -pas "$P" "$D/fc-gbak-pkr.fdb" 2>&1 | grep -c "42/107")
+if [ "$got" = "1" ]; then
+    echo "OK   the ENGINE restores fc's fbk and EXECUTES both members (42/107)"
+else
+    echo "DIFF package member execution after engine restore: match-count [$got] (want 1)"; fail=1
+fi
+ran=$((ran + 1))
+got=$(printf "SELECT PK.FHID(1) FROM RDB\$DATABASE;\n" |
+    "$ISQL" -q -b -user "$U" -pas "$P" "$D/fc-gbak-pkr.fdb" 2>&1 | grep -c "private to package")
+if [ "$got" = "1" ]; then
+    echo "OK   ...and the carried PRIVATE flag still guards the hidden member"
+else
+    echo "DIFF private member after engine restore: match-count [$got] (want 1)"; fail=1
+fi
+rm -f "$PKDB" "$D/fc-gbak-pk.fbk" "$D/fc-gbak-pkr.fdb"
+
 # --- 4. RECORDED BOUNDARY: NOT NULL is not carried ---------------------------
 NN="$D/fc-gbak-nn.fdb"; rm -f "$NN"
 "$ISQL" -q -b -user "$U" -pas "$P" <<EOF >/dev/null 2>&1

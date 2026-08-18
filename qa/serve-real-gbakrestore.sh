@@ -213,13 +213,16 @@ check "UNIQUE + FK ride the engine's fbk through fc's restore" "$(cons "$D/fc-gb
 check "...and fc's own round trip" "$(cons "$D/fc-gbr-r2.fdb")" "$cbase"
 check "...and fc's fbk through the ENGINE's restore" "$(cons "$D/fc-gbr-r3.fdb")" "$cbase"
 
-# the VIEW and the PROCEDURE, in the corners the loaders allow: the
-# engine reads BOTH off its own restore of either fbk; fc's restore
-# serves them through fc (gated in serve-real-gbak.sh's live probe) -
-# the ENGINE executing an fc-AUTHORED procedure catalog is the old
-# recorded loader boundary, so r1's procedure corner stays out
+# the VIEW and the PROCEDURE in EVERY corner: ~~the ENGINE executing
+# an fc-authored procedure catalog was the old recorded loader
+# boundary~~ - CLOSED: the crash was one NULL column, the param rows'
+# RDB$FIELD_SOURCE_SCHEMA_NAME the engine's loader dereferences (the
+# FK-blocker lesson found again by full-row diff), and with it
+# written the engine executes procedures off fc's restores too
 vbase=$(vwproc "$D/fc-gbr-r4.fdb")
 check "the view and procedure ride fc's fbk through the ENGINE's restore" "$(vwproc "$D/fc-gbr-r3.fdb")" "$vbase"
+check "...and the engine's fbk through FC's restore (the old boundary, closed)" "$(vwproc "$D/fc-gbr-r1.fdb")" "$vbase"
+check "...and fc's own round trip" "$(vwproc "$D/fc-gbr-r2.fdb")" "$vbase"
 for r in r1 r2; do
     ran=$((ran + 1))
     v=$("$GFIX" -v -full -user "$U" -pas "$P" "$D/fc-gbr-$r.fdb" 2>&1 | tr -d ' \n')
@@ -258,24 +261,21 @@ check "...and res_replace overwrites (fc)" \
 check "the replaced database still reads right" "$(rows "$D/fc-gbr-r1.fdb")" "$base"
 
 # --- 4. FAIL-CLOSED: an fbk carrying what this reader cannot ----------------
-# (~~a role refuses~~ - roles ride now; the representative refusal is
-# a PACKAGE, its own record family on both the writer's surface check
-# and the reader's record walk)
+# (~~a package refuses~~ - packages ride now; the representative
+# refusal is a GLOBAL TEMPORARY table - att 18 relation type 4/5 on
+# the relation record, refused so a GTT never lands as a plain table)
 rm -f "$D/fc-gbr-pk.fdb" "$D/fc-gbr-pk.fbk"
 "$ISQL" -q -b -user "$U" -pas "$P" <<EOF >/dev/null 2>&1
 CREATE DATABASE '$D/fc-gbr-pk.fdb' USER '$U' PASSWORD '$P' PAGE_SIZE 8192;
 CREATE TABLE T (X INTEGER);
 COMMIT;
-SET TERM ^;
-CREATE PACKAGE PK AS BEGIN FUNCTION F (A INTEGER) RETURNS INTEGER; END^
-CREATE PACKAGE BODY PK AS BEGIN FUNCTION F (A INTEGER) RETURNS INTEGER AS BEGIN RETURN A; END END^
-SET TERM ;^
+CREATE GLOBAL TEMPORARY TABLE GT (A INTEGER) ON COMMIT PRESERVE ROWS;
 COMMIT;
 EOF
 chmod 666 "$D/fc-gbr-pk.fdb"
 svc "$EMGR" action_backup dbname "$D/fc-gbr-pk.fdb" bkp_file "$D/fc-gbr-pk.fbk" >/dev/null
 grab "$D/fc-gbr-pk.fbk"
-check "an fbk with a PACKAGE refuses fc's restore whole" \
+check "an fbk with a GLOBAL TEMPORARY table refuses fc's restore whole" \
     "$(svc "$FMGR" action_restore dbname "$D/fc-gbr-rpk.fdb" bkp_file "$D/fc-gbr-pk.fbk")" \
     "feature is not supported|rc=1"
 ran=$((ran + 1))

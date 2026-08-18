@@ -50,6 +50,7 @@ mod rec {
     pub const FUNCTION_ARG: u8 = 16;
     pub const FUNCTION_END: u8 = 17;
     pub const SQL_ROLES: u8 = 36;
+    pub const PACKAGE: u8 = 38;
     pub const REL_CONSTRAINT: u8 = 31;
     pub const REF_CONSTRAINT: u8 = 32;
     pub const CHK_CONSTRAINT: u8 = 33;
@@ -321,13 +322,9 @@ pub fn write_backup_verbose(
     // NAME - relation ids and field positions are ODS facts the check
     // must read, not guess (RDB$GENERATORS is relation 20, not the 10
     // a first guess said, and the gate caught it).
-    for (what, rel_name) in [
-        ("a package", "RDB$PACKAGES"),
-    ] {
-        if user_rows_in(image, page_size, rel_name) > 0 {
-            return Err(Refused(format!("{} is outside this backup's surface", what)));
-        }
-    }
+    // (the per-relation surface loop emptied out as its families rode:
+    // functions, roles, packages - what remains typed lives in the
+    // family readers and user_tables' relation-type check)
     // CONSTRAINTS are checked by TYPE: NOT NULL and PRIMARY KEY ride the
     // file; UNIQUE / FOREIGN KEY / CHECK constraints are their own
     // slices (an FK needs cross-table restore ordering, a UNIQUE
@@ -358,6 +355,7 @@ pub fn write_backup_verbose(
     let triggers = read_triggers(image, page_size)?;
     let procedures = read_procedures(image, page_size)?;
     let functions = read_functions(image, page_size)?;
+    let packages = read_packages(image, page_size)?;
     // ...and the INDEXES, per relation, segments in order
     let indexes = read_indexes(image, page_size)?;
     // ...and USER DOMAINS: this writer invents its column sources
@@ -709,18 +707,31 @@ pub fn write_backup_verbose(
     }
     log.push("gbak:writing functions".into());
     for fu in &functions {
-        log.push(format!("gbak:    writing function \"PUBLIC\".\"{}\"", fu.name));
+        log.push(match &fu.package {
+            Some((pk, _)) => format!(
+                "gbak:    writing function \"PUBLIC\".\"{}\".\"{}\"",
+                pk, fu.name
+            ),
+            None => format!("gbak:    writing function \"PUBLIC\".\"{}\"", fu.name),
+        });
         // att order is the engine's own, annotated off a real record:
         // schema(23), name(1), return_arg(6), type(8) - NULL prints 0 -
         // query_name(7) empty, blr(13), source(14), valid(15),
         // debug(16), secclass(17), owner(18), legacy(19),
         // deterministic(20), aggregate(24)
-        let mut r = Rec::new(&mut out, rec::FUNCTION)
-            .text(23, "PUBLIC")
+        let mut r = Rec::new(&mut out, rec::FUNCTION).text(23, "PUBLIC");
+        if let Some((pk, _)) = &fu.package {
+            r = r.text(11, pk);
+        }
+        r = r
             .text(1, &fu.name)
             .int(6, fu.return_arg as i32)
             .int(8, 0)
-            .text(7, "")
+            .text(7, "");
+        if let Some((_, pv)) = &fu.package {
+            r = r.int(12, *pv as i32);
+        }
+        r = r
             .blob(13, &fu.blr)
             .blob(14, &fu.source)
             .int(15, fu.valid_blr as i32);
@@ -744,10 +755,16 @@ pub fn write_backup_verbose(
         }
         r.end();
         for a in &fu.args {
-            log.push(format!(
-                "gbak:    writing argument for function \"PUBLIC\".\"{}\"",
-                fu.name
-            ));
+            log.push(match &fu.package {
+                Some((pk, _)) => format!(
+                    "gbak:    writing argument for function \"PUBLIC\".\"{}\".\"{}\"",
+                    pk, fu.name
+                ),
+                None => format!(
+                    "gbak:    writing argument for function \"PUBLIC\".\"{}\"",
+                    fu.name
+                ),
+            });
             let dom = fnarg_domains
                 .iter()
                 .find(|(n, p, _)| n == &fu.name && *p == a.position)
@@ -755,8 +772,11 @@ pub fn write_backup_verbose(
                 .unwrap_or_default();
             // the zeroed type quintet mirrors the engine's unconditional
             // put_int32 of NULL catalog columns - the domain is the type
-            let mut ar = Rec::new(&mut out, rec::FUNCTION_ARG)
-                .text(21, "PUBLIC")
+            let mut ar = Rec::new(&mut out, rec::FUNCTION_ARG).text(21, "PUBLIC");
+            if let Some((pk, _)) = &fu.package {
+                ar = ar.text(10, pk);
+            }
+            ar = ar
                 .text(1, &fu.name)
                 .int(2, a.position as i32)
                 .int(3, 0)
@@ -782,9 +802,18 @@ pub fn write_backup_verbose(
     }
     log.push("gbak:writing stored procedures".into());
     for pr in &procedures {
-        log.push(format!("gbak:writing stored procedure \"PUBLIC\".\"{}\"", pr.name));
-        let mut r = Rec::new(&mut out, rec::PROCEDURE)
-            .text(20, "PUBLIC")
+        log.push(match &pr.package {
+            Some((pk, _)) => format!(
+                "gbak:writing stored procedure \"PUBLIC\".\"{}\".\"{}\"",
+                pk, pr.name
+            ),
+            None => format!("gbak:writing stored procedure \"PUBLIC\".\"{}\"", pr.name),
+        });
+        let mut r = Rec::new(&mut out, rec::PROCEDURE).text(20, "PUBLIC");
+        if let Some((pk, _)) = &pr.package {
+            r = r.text(16, pk);
+        }
+        r = r
             .text(1, &pr.name)
             .int(2, pr.inputs)
             .int(3, pr.outputs)
@@ -793,6 +822,9 @@ pub fn write_backup_verbose(
             .int(11, pr.ptype);
         if let Some(v) = pr.valid_blr {
             r = r.int(12, v);
+        }
+        if let Some((_, pv)) = &pr.package {
+            r = r.int(17, *pv as i32);
         }
         r.end();
         for pp in &pr.params {
@@ -820,6 +852,22 @@ pub fn write_backup_verbose(
         out.push(29);
     }
     log.push("gbak:writing packages".into());
+    for pk in &packages {
+        log.push(format!("gbak:writing package \"PUBLIC\".\"{}\"", pk.name));
+        let mut r = Rec::new(&mut out, rec::PACKAGE)
+            .text(10, "PUBLIC")
+            .text(1, &pk.name)
+            .blob(2, &pk.header)
+            .blob(3, &pk.body)
+            .int(4, pk.valid_body as i32);
+        if let Some(sc) = &pk.sec_class {
+            r = r.text(5, sc);
+        }
+        if let Some(ow) = &pk.owner {
+            r = r.text(6, ow);
+        }
+        r.end();
+    }
     let tips = fire_crab_ods::tra::TipChain::read(image, page_size);
     // THE DATA PHASE WALKS THE RELATIONS IN REVERSE CREATION ORDER -
     // burp prepends each relation to its list and the data pass walks
@@ -1650,6 +1698,8 @@ struct UProc {
     /// RDB$PROCEDURE_TYPE: 1 = selectable, 2 = executable
     ptype: i32,
     valid_blr: Option<i32>,
+    /// (package name, RDB$PRIVATE_FLAG) when the procedure is a member
+    package: Option<(String, i64)>,
     params: Vec<UProcParam>,
 }
 
@@ -1671,6 +1721,8 @@ struct UProcParam {
 /// real catalog - the facts live on the domain, measured).
 struct UFunc {
     name: String,
+    /// (package name, RDB$PRIVATE_FLAG) when the function is a member
+    package: Option<(String, i64)>,
     return_arg: i64,
     valid_blr: i64,
     legacy: Option<i64>,
@@ -1719,7 +1771,7 @@ fn read_functions(
         }
         _ => None,
     };
-    let args_of = |fn_name: &str| -> Result<Vec<UFnArg>, Refused> {
+    let args_of = |fn_name: &str, pkg: Option<&str>| -> Result<Vec<UFnArg>, Refused> {
         let Some((acols, arows)) = sys_rows(image, page_size, "RDB$FUNCTION_ARGUMENTS")
         else {
             return Ok(Vec::new());
@@ -1741,7 +1793,9 @@ fn read_functions(
         };
         let mut out = Vec::new();
         for r in &arows {
-            if text_opt(r, aat("RDB$FUNCTION_NAME")).as_deref() != Some(fn_name) {
+            if text_opt(r, aat("RDB$FUNCTION_NAME")).as_deref() != Some(fn_name)
+                || text_opt(r, aat("RDB$PACKAGE_NAME")).as_deref() != pkg
+            {
                 continue;
             }
             if matches!(aint(r, aat("RDB$SYSTEM_FLAG")), Some(f) if f != 0) {
@@ -1785,12 +1839,8 @@ fn read_functions(
             continue;
         }
         let Some(name) = text_opt(r, at("RDB$FUNCTION_NAME")) else { continue };
-        if text_opt(r, at("RDB$PACKAGE_NAME")).is_some() {
-            return Err(Refused(format!(
-                "function {} lives in a PACKAGE - outside this backup's surface",
-                name
-            )));
-        }
+        let package = text_opt(r, at("RDB$PACKAGE_NAME"))
+            .map(|p| (p, int(r, at("RDB$PRIVATE_FLAG")).unwrap_or(0)));
         // MODULE_NAME/ENTRYPOINT is a legacy UDF, ENGINE_NAME a UDR -
         // both are code outside the file and cannot be carried
         if text_opt(r, at("RDB$MODULE_NAME")).is_some()
@@ -1813,7 +1863,7 @@ fn read_functions(
         })?;
         let mut source = blob(r, at("RDB$FUNCTION_SOURCE")).unwrap_or_default();
         source.push(0);
-        let args = args_of(&name)?;
+        let args = args_of(&name, package.as_ref().map(|(p, _)| p.as_str()))?;
         out.push(UFunc {
             return_arg: int(r, at("RDB$RETURN_ARGUMENT")).unwrap_or(0),
             valid_blr: int(r, at("RDB$VALID_BLR")).unwrap_or(1),
@@ -1824,6 +1874,7 @@ fn read_functions(
             owner: text_opt(r, at("RDB$OWNER_NAME")),
             debug: blob(r, at("RDB$DEBUG_INFO")),
             name,
+            package,
             source,
             blr,
             args,
@@ -1857,7 +1908,7 @@ fn read_procedures(
         _ => None,
     };
     // the parameters, keyed by procedure name
-    let params_of = |proc_name: &str| -> Result<Vec<UProcParam>, Refused> {
+    let params_of = |proc_name: &str, pkg: Option<&str>| -> Result<Vec<UProcParam>, Refused> {
         let Some((pcols, prows)) = sys_rows(image, page_size, "RDB$PROCEDURE_PARAMETERS")
         else {
             return Ok(Vec::new());
@@ -1873,7 +1924,9 @@ fn read_procedures(
         };
         let mut out = Vec::new();
         for r in &prows {
-            if text_opt(r, pat("RDB$PROCEDURE_NAME")).as_deref() != Some(proc_name) {
+            if text_opt(r, pat("RDB$PROCEDURE_NAME")).as_deref() != Some(proc_name)
+                || text_opt(r, pat("RDB$PACKAGE_NAME")).as_deref() != pkg
+            {
                 continue;
             }
             let Some(name) = text_opt(r, pat("RDB$PARAMETER_NAME")) else { continue };
@@ -1904,18 +1957,14 @@ fn read_procedures(
             continue;
         }
         let Some(name) = text_opt(r, at("RDB$PROCEDURE_NAME")) else { continue };
-        if text_opt(r, at("RDB$PACKAGE_NAME")).is_some() {
-            return Err(Refused(format!(
-                "procedure {} lives in a PACKAGE - outside this backup's surface",
-                name
-            )));
-        }
+        let package = text_opt(r, at("RDB$PACKAGE_NAME"))
+            .map(|p| (p, int(r, at("RDB$PRIVATE_FLAG")).unwrap_or(0)));
         let blr = blob(r, at("RDB$PROCEDURE_BLR")).ok_or_else(|| {
             Refused(format!("procedure {}: its BLR blob is unreadable", name))
         })?;
         let mut source = blob(r, at("RDB$PROCEDURE_SOURCE")).unwrap_or_default();
         source.push(0);
-        let params = params_of(&name)?;
+        let params = params_of(&name, package.as_ref().map(|(p, _)| p.as_str()))?;
         out.push(UProc {
             inputs: int(r, at("RDB$PROCEDURE_INPUTS")).unwrap_or(0) as i32,
             outputs: int(r, at("RDB$PROCEDURE_OUTPUTS")).unwrap_or(0) as i32,
@@ -1924,6 +1973,7 @@ fn read_procedures(
             name,
             source,
             blr,
+            package,
             params,
         });
     }
@@ -1955,6 +2005,79 @@ fn field_type_of(
         }
     }
     None
+}
+
+/// A user PACKAGE off the source catalog: the header and body sources
+/// verbatim (members ride as ordinary procedure/function records with
+/// their package attribute - the engine's own layout).
+struct UPack {
+    name: String,
+    header: Vec<u8>,
+    body: Vec<u8>,
+    valid_body: i64,
+    sec_class: Option<String>,
+    owner: Option<String>,
+}
+
+fn read_packages(
+    image: &fire_crab_ods::Image,
+    page_size: usize,
+) -> Result<Vec<UPack>, Refused> {
+    let Some((cols, rows)) = sys_rows(image, page_size, "RDB$PACKAGES") else {
+        return Ok(Vec::new());
+    };
+    let prel = fire_crab_ods::resolve_relation(image, page_size, "RDB$PACKAGES")
+        .ok_or_else(|| Refused("no RDB$PACKAGES relation".into()))?;
+    let at = |n: &str| cols.iter().find(|(c, _)| c.eq_ignore_ascii_case(n)).map(|(_, i)| *i);
+    let int = |r: &fire_crab_ods::tra::VisibleRow, i: Option<usize>| match i
+        .and_then(|i| r.values.get(i))
+    {
+        Some(fire_crab_ods::format::Value::Int(n)) => Some(*n),
+        _ => None,
+    };
+    let blob = |r: &fire_crab_ods::tra::VisibleRow, i: Option<usize>| match i
+        .and_then(|i| r.values.get(i))
+    {
+        Some(fire_crab_ods::format::Value::Blob(_, num)) => {
+            fire_crab_blb::read_blob_content(image, page_size, prel, *num)
+        }
+        _ => None,
+    };
+    let mut out = Vec::new();
+    for r in &rows {
+        if matches!(int(r, at("RDB$SYSTEM_FLAG")), Some(f) if f != 0) {
+            continue;
+        }
+        let Some(name) = text_opt(r, at("RDB$PACKAGE_NAME")) else { continue };
+        if blob(r, at("RDB$DESCRIPTION")).is_some() {
+            return Err(Refused(format!(
+                "package {}: a description blob is outside this backup's surface",
+                name
+            )));
+        }
+        if !matches!(
+            at("RDB$SQL_SECURITY").and_then(|i| r.values.get(i)),
+            None | Some(fire_crab_ods::format::Value::Null)
+        ) {
+            return Err(Refused(format!(
+                "package {}: SQL SECURITY is outside this backup's surface",
+                name
+            )));
+        }
+        let mut header = blob(r, at("RDB$PACKAGE_HEADER_SOURCE")).unwrap_or_default();
+        header.push(0);
+        let mut body = blob(r, at("RDB$PACKAGE_BODY_SOURCE")).unwrap_or_default();
+        body.push(0);
+        out.push(UPack {
+            valid_body: int(r, at("RDB$VALID_BODY_FLAG")).unwrap_or(1),
+            sec_class: text_opt(r, at("RDB$SECURITY_CLASS")),
+            owner: text_opt(r, at("RDB$OWNER_NAME")),
+            name,
+            header,
+            body,
+        });
+    }
+    Ok(out)
 }
 
 /// The user SQL ROLES: name and owner. The record's att 4 is the
@@ -2305,6 +2428,8 @@ pub struct Restored {
     pub functions: Vec<RFunc>,
     /// the user SQL roles, file order
     pub roles: Vec<String>,
+    /// the carried packages, file order
+    pub packages: Vec<RPackage>,
     /// privilege records seen and set aside - the count keeps the
     /// omission visible in the trace instead of silent
     pub privileges_skipped: u64,
@@ -2324,8 +2449,19 @@ pub struct RFk {
 }
 
 /// One carried stored procedure.
+/// A package off the file: name and its two sources verbatim (the
+/// members arrive as ordinary procedure/function records tagged with
+/// the package attribute).
+pub struct RPackage {
+    pub name: String,
+    pub header: Vec<u8>,
+    pub body: Vec<u8>,
+}
+
 pub struct RProc {
     pub name: String,
+    /// (package name, RDB$PRIVATE_FLAG) when the procedure is a member
+    pub package: Option<(String, i64)>,
     pub inputs: i32,
     pub outputs: i32,
     pub source: Vec<u8>,
@@ -2350,6 +2486,8 @@ pub struct RProcParam {
 /// carried global-field records).
 pub struct RFunc {
     pub name: String,
+    /// (package name, RDB$PRIVATE_FLAG) when the function is a member
+    pub package: Option<(String, i64)>,
     pub return_arg: i64,
     pub deterministic: i64,
     pub source: Vec<u8>,
@@ -2514,6 +2652,7 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
         exceptions: Vec::new(),
         functions: Vec::new(),
         roles: Vec::new(),
+        packages: Vec::new(),
         privileges_skipped: 0,
     };
     // (schema, source name) -> not-null flag learned from constraints
@@ -2576,6 +2715,7 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                 // the procedure record
                 let mut fu = RFunc {
                     name: String::new(),
+                    package: None,
                     return_arg: 0,
                     deterministic: 0,
                     source: Vec::new(),
@@ -2629,17 +2769,28 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                             }
                         }
                         // MODULE_NAME (4), ENTRYPOINT (5), ENGINE_NAME
-                        // (10), PACKAGE_NAME (11): code outside the file
-                        4 | 5 | 10 | 11 => {
+                        // (10): code outside the file
+                        4 | 5 | 10 => {
                             return Err(Refused(format!(
                                 "function {}: attribute {} names EXTERNAL code - outside this restore's surface",
                                 fu.name, tag
                             )));
                         }
                         1 => fu.name = String::from_utf8_lossy(&data).into_owned(),
+                        11 => {
+                            let pk = String::from_utf8_lossy(&data).into_owned();
+                            fu.package = Some((pk, fu.package.take().map(|(_, v)| v).unwrap_or(0)));
+                        }
+                        12 => {
+                            let v = as_int(&data);
+                            fu.package = Some((
+                                fu.package.take().map(|(n, _)| n).unwrap_or_default(),
+                                v,
+                            ));
+                        }
                         6 => fu.return_arg = as_int(&data),
                         20 => fu.deterministic = as_int(&data),
-                        2 | 3 | 7 | 8 | 12 | 15 | 17 | 18 | 19 | 21 | 22 | 23 | 24 => {}
+                        2 | 3 | 7 | 8 | 15 | 17 | 18 | 19 | 21 | 22 | 23 | 24 => {}
                         other => {
                             return Err(Refused(format!(
                                 "function {}: attribute {} is outside this restore's surface",
@@ -2721,6 +2872,7 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                 // like the trigger record
                 let mut pr = RProc {
                     name: String::new(),
+                    package: None,
                     inputs: 0,
                     outputs: 0,
                     source: Vec::new(),
@@ -2776,6 +2928,17 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                         2 => pr.inputs = as_int(&data) as i32,
                         3 => pr.outputs = as_int(&data) as i32,
                         11 => pr.ptype = as_int(&data) as i32,
+                        16 => {
+                            let pk = String::from_utf8_lossy(&data).into_owned();
+                            pr.package = Some((pk, pr.package.take().map(|(_, v)| v).unwrap_or(0)));
+                        }
+                        17 => {
+                            let v = as_int(&data);
+                            pr.package = Some((
+                                pr.package.take().map(|(n, _)| n).unwrap_or_default(),
+                                v,
+                            ));
+                        }
                         6 => {
                             // att_procedure_source (the pre-source2
                             // spelling): TEXT framed like any other
@@ -2896,6 +3059,81 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                     att(&atts, 2).map(|a| a.text()).unwrap_or_default(),
                 ));
             }
+            rec::PACKAGE => {
+                // header (2), body (3) and description (7) sources are
+                // int32-framed blobs - walked by hand
+                let mut pk = RPackage {
+                    name: String::new(),
+                    header: Vec::new(),
+                    body: Vec::new(),
+                };
+                loop {
+                    let tag = *f
+                        .get(at)
+                        .ok_or_else(|| Refused("truncated package record".into()))?;
+                    at += 1;
+                    if tag == 0 {
+                        break;
+                    }
+                    let len = *f
+                        .get(at)
+                        .ok_or_else(|| Refused("truncated package attribute".into()))?
+                        as usize;
+                    at += 1;
+                    let data = f
+                        .get(at..at + len)
+                        .ok_or_else(|| Refused("truncated package attribute".into()))?
+                        .to_vec();
+                    at += len;
+                    let as_int = |d: &[u8]| {
+                        let mut v: i64 = 0;
+                        for (k, b) in d.iter().enumerate().take(8) {
+                            v |= (*b as i64) << (8 * k);
+                        }
+                        v
+                    };
+                    match tag {
+                        2 | 3 | 7 => {
+                            let n = as_int(&data) as usize;
+                            let raw = f
+                                .get(at..at + n)
+                                .ok_or_else(|| Refused("truncated package blob".into()))?
+                                .to_vec();
+                            at += n;
+                            match tag {
+                                2 => {
+                                    pk.header = raw;
+                                    if pk.header.last() == Some(&0) {
+                                        pk.header.pop();
+                                    }
+                                }
+                                3 => {
+                                    pk.body = raw;
+                                    if pk.body.last() == Some(&0) {
+                                        pk.body.pop();
+                                    }
+                                }
+                                _ => {} // description set aside
+                            }
+                        }
+                        1 => pk.name = String::from_utf8_lossy(&data).into_owned(),
+                        8 | 9 => {
+                            return Err(Refused(format!(
+                                "package {}: SQL SECURITY is outside this restore's surface",
+                                pk.name
+                            )));
+                        }
+                        4 | 5 | 6 | 10 => {} // valid body/secclass/owner/schema
+                        other => {
+                            return Err(Refused(format!(
+                                "package {}: attribute {} is outside this restore's surface",
+                                pk.name, other
+                            )));
+                        }
+                    }
+                }
+                out.packages.push(pk);
+            }
             rec::SQL_ROLES => {
                 let atts = read_atts(f, &mut at)?;
                 if let Some(pv) = att(&atts, 4) {
@@ -2984,7 +3222,20 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                             }
                         }
                         1 => name = String::from_utf8_lossy(&data).into_owned(),
-                        8 | 12 | 16 | 18 | 21 => {} // security/owner/flags/type/schema
+                        // att 18 is RDB$RELATION_TYPE: 0 = persistent,
+                        // 1 = view; a GTT (4/5) or external table (2)
+                        // restored as a plain table would keep the rows
+                        // and silently change what the schema MEANS
+                        18 => {
+                            if as_int(&data) > 1 {
+                                return Err(Refused(format!(
+                                    "relation {}: relation type {} is outside this restore's surface",
+                                    name,
+                                    as_int(&data)
+                                )));
+                            }
+                        }
+                        8 | 12 | 16 | 21 => {} // security/owner/flags/schema
                         other => {
                             return Err(Refused(format!(
                                 "relation {}: attribute {} is outside this restore's surface",

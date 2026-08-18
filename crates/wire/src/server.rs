@@ -3371,6 +3371,17 @@ fn run_gbak_restore_core(
                 fire_crab_ods::ddl::restore_chk_row(&mut file, page_size, cname, tname)?;
             }
         }
+        // the PACKAGES first - the members' rows tag themselves with
+        // the package name and the header row is the privilege boundary
+        for pk in &restored.packages {
+            fire_crab_ods::ddl::restore_carried_package(
+                &mut file,
+                page_size,
+                &pk.name,
+                &pk.header,
+                &pk.body,
+            )?;
+        }
         // the PROCEDURES, blobs verbatim: the params re-type through
         // the carried domain records, and create_procedure invents its
         // own RDB$n domains for them - the numbering matches on a
@@ -3412,6 +3423,7 @@ fn run_gbak_restore_core(
                 pr.ptype == 1,
                 &String::from_utf8_lossy(&pr.source),
                 &pr.blr,
+                pr.package.as_ref().map(|(n, v)| (n.as_str(), *v)),
             )?;
         }
         // the FUNCTIONS, blobs verbatim: the args re-type through the
@@ -3450,6 +3462,7 @@ fn run_gbak_restore_core(
                 &String::from_utf8_lossy(&fu.source),
                 &fu.blr,
                 fu.debug.as_deref(),
+                fu.package.as_ref().map(|(n, v)| (n.as_str(), *v)),
             )?;
         }
         let mut refreshed: Vec<&str> = Vec::new();
@@ -18939,6 +18952,7 @@ fn execute_dml_collecting_inner(
         Plan::CreateProcedure { name, ins, outs, selectable, source, blr } => {
             fire_crab_ods::ddl::create_procedure(
                 &mut work, db.page_size, name, ins, outs, *selectable, source, blr,
+                None,
             )?;
             (0, 0, 0)
         }
