@@ -66,9 +66,19 @@ attribute, not a framed blob, because RDB$MESSAGE is a VARCHAR):
 both restores raise the carried exception with its exact message,
 and file order preserves the RDB$EXCEPTION_NUMBER sequence because
 create_exception's counter walks the same order the backup walked
-the catalog. gbak 25, gbakrestore 37; a FUNCTION is the fail-closed
-representative now. What still refuses is typed and small
-(functions, roles, packages, GTTs, expression-columned views).
+the catalog. ~~Functions refuse~~ — PSQL FUNCTIONS RIDE (rec
+15/16/17, gbak 28): the argument rows' own type columns are NULL in
+a real catalog — the domain IS the type — so the writer resolves
+each argument through its RDB$n domain and mints carrier domains
+continuing the same counter the columns and procedure params draw
+from, while the record's zeroed type quintet mirrors the engine's
+unconditional put_int32 of NULL columns. Both restores EXECUTE the
+carried functions; the DETERMINISTIC flag, the argument names and a
+NOT NULL argument's validation (with its carried name in the error)
+survive both directions. External functions (UDF/UDR), packaged
+functions, argument DEFAULTs and BLOB-typed arguments refuse typed.
+A ROLE is the fail-closed representative now. What still refuses is
+typed and small (roles, packages, GTTs, expression-columned views).
 
 The subsystem map's rows fall into three states, and the difference
 matters more than the row count:

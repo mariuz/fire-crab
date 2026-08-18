@@ -8069,6 +8069,155 @@ pub fn create_procedure(
     advance_oldest_transactions(file, page_size)
 }
 
+/// One carried function argument: the position off the file, the type
+/// facts resolved through the carried domain records. Position 0 is
+/// the RETURN argument (RDB$RETURN_ARGUMENT names it on the header row).
+pub struct FnArgDef {
+    pub name: Option<String>,
+    pub position: i64,
+    pub field_type: i16,
+    pub length: u16,
+    pub scale: i16,
+    pub sub_type: i16,
+    pub null_flag: bool,
+}
+
+/// Restore a carried PSQL function: the `RDB$FUNCTIONS` row with the
+/// engine's BLR and source verbatim, one invented `RDB$n` domain per
+/// argument (the argument row's own type columns stay NULL, exactly the
+/// engine's catalog - the domain IS the type), and the owner's EXECUTE
+/// grant (object type 15, `obj_udf`). `RDB$MECHANISM` lands 0, not
+/// NULL, mirroring the ENGINE'S OWN RESTORE of the same record (the
+/// file carries an unconditional int32 where the source catalog held
+/// NULL - measured on a round trip).
+pub fn restore_carried_function(
+    file: &mut crate::Image,
+    page_size: usize,
+    name: &str,
+    args: &[FnArgDef],
+    return_arg: i64,
+    deterministic: bool,
+    source: &str,
+    blr: &[u8],
+    debug: Option<&[u8]>,
+) -> Result<(), String> {
+    let want = name.trim().trim_matches('"').to_ascii_uppercase();
+    if want.is_empty() {
+        return Err("a function needs a name".into());
+    }
+    let frel = crate::resolve_relation(file, page_size, "RDB$FUNCTIONS")
+        .ok_or("no RDB$FUNCTIONS relation")?;
+    // already exists? refuse before any row lands
+    {
+        let formats = system_relation_formats(file, page_size, "RDB$FUNCTIONS")
+            .ok_or("no RDB$FUNCTIONS format")?;
+        let (_, descs) = formats
+            .iter()
+            .max_by_key(|(n, _)| *n)
+            .ok_or("no RDB$FUNCTIONS format")?;
+        let cols = relation_columns(file, page_size, "RDB$FUNCTIONS");
+        let name_f = cols
+            .iter()
+            .find(|c| c.name == "RDB$FUNCTION_NAME")
+            .map(|c| c.field_id as usize)
+            .ok_or("no RDB$FUNCTION_NAME column")?;
+        let mut dup = false;
+        walk_rows(file, page_size, frel, descs, |v| {
+            if text_eq(v.get(name_f), &want) {
+                dup = true;
+            }
+        });
+        if dup {
+            return Err(format!("Function {} already exists", want));
+        }
+    }
+    let slot = generator_id_by_name(file, page_size, "RDB$FUNCTIONS")
+        .ok_or("no RDB$FUNCTIONS generator")?;
+    let id = gen::bump(file, page_size, slot, 1)?;
+    let class = next_security_class(file, page_size, ACL_SEQUENCE_OWNER)?;
+    let src_blob =
+        dml::insert_blob_cs(file, page_size, frel, &[source.as_bytes().to_vec()], 1, 4)?;
+    let blr_blob = dml::insert_blob(file, page_size, frel, &[blr.to_vec()], 2)?;
+    let dbg_blob = match debug {
+        Some(d) => Some(dml::insert_blob(file, page_size, frel, &[d.to_vec()], 9)?),
+        None => None,
+    };
+    let mut vals: Vec<(&str, SysVal<'_>)> = vec![
+        ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
+        ("RDB$FUNCTION_NAME", SysVal::S(&want)),
+        ("RDB$FUNCTION_ID", SysVal::I(id)),
+        ("RDB$RETURN_ARGUMENT", SysVal::I(return_arg)),
+        ("RDB$FUNCTION_SOURCE", SysVal::B(blob_id_bytes(frel, src_blob))),
+        ("RDB$FUNCTION_BLR", SysVal::B(blob_id_bytes(frel, blr_blob))),
+        ("RDB$VALID_BLR", SysVal::I(1)),
+        ("RDB$SECURITY_CLASS", SysVal::S(&class)),
+        ("RDB$OWNER_NAME", SysVal::S(OWNER)),
+        ("RDB$SYSTEM_FLAG", SysVal::I(0)),
+        ("RDB$LEGACY_FLAG", SysVal::I(0)),
+        (
+            "RDB$DETERMINISTIC_FLAG",
+            SysVal::I(if deterministic { 1 } else { 0 }),
+        ),
+        ("RDB$AGGREGATE_FLAG", SysVal::I(0)),
+    ];
+    if let Some(db) = dbg_blob {
+        vals.push(("RDB$DEBUG_INFO", SysVal::B(blob_id_bytes(frel, db))));
+    }
+    sys_insert(file, page_size, "RDB$FUNCTIONS", frel, &vals)?;
+    // arguments: an invented domain each, then the argument row
+    let arel = crate::resolve_relation(file, page_size, "RDB$FUNCTION_ARGUMENTS")
+        .ok_or("no RDB$FUNCTION_ARGUMENTS relation")?;
+    for a in args {
+        let domain_num = next_domain_number(file, page_size)?;
+        let dom = format!("RDB${}", domain_num);
+        let mut field_vals: Vec<(&str, SysVal<'_>)> = vec![
+            ("RDB$FIELD_NAME", SysVal::S(&dom)),
+            ("RDB$FIELD_TYPE", SysVal::I(a.field_type as i64)),
+            ("RDB$FIELD_LENGTH", SysVal::I(a.length as i64)),
+            ("RDB$FIELD_SCALE", SysVal::I(a.scale as i64)),
+            ("RDB$SYSTEM_FLAG", SysVal::I(0)),
+            ("RDB$OWNER_NAME", SysVal::S(OWNER)),
+            ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
+        ];
+        if subtype_carried(a.field_type) {
+            field_vals.push(("RDB$FIELD_SUB_TYPE", SysVal::I(a.sub_type as i64)));
+        }
+        // the PRECISION-0 law from the procedure slice holds here too: a
+        // NULL precision on an exact-numeric domain crashed the engine's
+        // executor reading an fc-authored catalog
+        if matches!(a.field_type, 7 | 8 | 16 | 26) {
+            field_vals.push(("RDB$FIELD_PRECISION", SysVal::I(0)));
+        }
+        if matches!(a.field_type, 14 | 37) {
+            field_vals.push(("RDB$CHARACTER_SET_ID", SysVal::I(0)));
+            field_vals.push(("RDB$CHARACTER_LENGTH", SysVal::I(a.length as i64)));
+        }
+        let fdrel = crate::resolve_relation(file, page_size, "RDB$FIELDS")
+            .ok_or("no RDB$FIELDS relation")?;
+        sys_insert(file, page_size, "RDB$FIELDS", fdrel, &field_vals)?;
+        let mut avals: Vec<(&str, SysVal<'_>)> = vec![
+            ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
+            ("RDB$FUNCTION_NAME", SysVal::S(&want)),
+            ("RDB$ARGUMENT_POSITION", SysVal::I(a.position)),
+            ("RDB$FIELD_SOURCE", SysVal::S(&dom)),
+            ("RDB$FIELD_SOURCE_SCHEMA_NAME", SysVal::S("PUBLIC")),
+            ("RDB$MECHANISM", SysVal::I(0)),
+            ("RDB$ARGUMENT_MECHANISM", SysVal::I(0)),
+            ("RDB$SYSTEM_FLAG", SysVal::I(0)),
+        ];
+        if let Some(an) = &a.name {
+            avals.push(("RDB$ARGUMENT_NAME", SysVal::S(an.as_str())));
+        }
+        if a.null_flag {
+            avals.push(("RDB$NULL_FLAG", SysVal::I(1)));
+        }
+        sys_insert(file, page_size, "RDB$FUNCTION_ARGUMENTS", arel, &avals)?;
+    }
+    // the owner's EXECUTE grant, object type 15 (obj_udf)
+    store_privileges(file, page_size, &want, 15, &["X"])?;
+    advance_oldest_transactions(file, page_size)
+}
+
 /// `CREATE EXCEPTION <name> <message>` - `CreateAlterExceptionNode`
 /// (DdlNodes.epp) against the file image. The mirror of CREATE SEQUENCE:
 /// a `RDB$EXCEPTIONS` row whose number comes from the system generator

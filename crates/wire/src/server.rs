@@ -3409,6 +3409,44 @@ fn run_gbak_restore_core(
                 &pr.blr,
             )?;
         }
+        // the FUNCTIONS, blobs verbatim: the args re-type through the
+        // carried domain records, position 0 the RETURN argument
+        for fu in &restored.functions {
+            let mut args = Vec::new();
+            for a in &fu.args {
+                let (_, ft, len, sc, st) = restored
+                    .domain_types
+                    .iter()
+                    .find(|(n, ..)| n == &a.source)
+                    .ok_or_else(|| {
+                        format!(
+                            "function argument at position {}: its domain {} is not in the file",
+                            a.position, a.source
+                        )
+                    })?;
+                args.push(fire_crab_ods::ddl::FnArgDef {
+                    name: a.name.clone(),
+                    position: a.position,
+                    field_type: *ft as i16,
+                    length: *len as u16,
+                    scale: *sc as i16,
+                    sub_type: *st as i16,
+                    null_flag: a.null_flag,
+                });
+            }
+            args.sort_by_key(|a| a.position);
+            fire_crab_ods::ddl::restore_carried_function(
+                &mut file,
+                page_size,
+                &fu.name,
+                &args,
+                fu.return_arg,
+                fu.deterministic != 0,
+                &String::from_utf8_lossy(&fu.source),
+                &fu.blr,
+                fu.debug.as_deref(),
+            )?;
+        }
         let mut refreshed: Vec<&str> = Vec::new();
         for tr in &restored.triggers {
             if !tr.relation.is_empty() && !refreshed.contains(&tr.relation.as_str()) {

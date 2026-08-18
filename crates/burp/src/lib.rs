@@ -46,6 +46,9 @@ mod rec {
     pub const PROCEDURE_PRM: u8 = 28;
     pub const GENERATOR: u8 = 26;
     pub const EXCEPTION: u8 = 30;
+    pub const FUNCTION: u8 = 15;
+    pub const FUNCTION_ARG: u8 = 16;
+    pub const FUNCTION_END: u8 = 17;
     pub const REL_CONSTRAINT: u8 = 31;
     pub const REF_CONSTRAINT: u8 = 32;
     pub const CHK_CONSTRAINT: u8 = 33;
@@ -310,7 +313,6 @@ pub fn write_backup_verbose(
     // must read, not guess (RDB$GENERATORS is relation 20, not the 10
     // a first guess said, and the gate caught it).
     for (what, rel_name) in [
-        ("a user function", "RDB$FUNCTIONS"),
         ("a role", "RDB$ROLES"),
     ] {
         if user_rows_in(image, page_size, rel_name) > 0 {
@@ -346,6 +348,7 @@ pub fn write_backup_verbose(
         .unwrap_or_default();
     let triggers = read_triggers(image, page_size)?;
     let procedures = read_procedures(image, page_size)?;
+    let functions = read_functions(image, page_size)?;
     // ...and the INDEXES, per relation, segments in order
     let indexes = read_indexes(image, page_size)?;
     // ...and USER DOMAINS: this writer invents its column sources
@@ -473,6 +476,15 @@ pub fn write_backup_verbose(
         }
     }
 
+    // ...and the function arguments' invented domains continue it too
+    let mut fnarg_domains: Vec<(String, i64, String)> = Vec::new(); // (func, position, RDB$n)
+    for fu in &functions {
+        for a in &fu.args {
+            fnarg_domains.push((fu.name.clone(), a.position, format!("RDB${}", next_source)));
+            next_source += 1;
+        }
+    }
+
     // --- rec_global_field: one per column, in file order ------------------
     log.push("gbak:writing domains".into());
     for (_, _, cols) in &rel_cols {
@@ -528,6 +540,32 @@ pub fn write_backup_verbose(
                 .int(9, pp.scale as i32)
                 .int(44, 0)
                 .end();
+        }
+    }
+
+    // ... and one per function argument - the argument row's own type
+    // columns are NULL in a real catalog (measured), the domain is the
+    // type, so the invented domain carries the resolved facts
+    for fu in &functions {
+        for a in &fu.args {
+            let dom = fnarg_domains
+                .iter()
+                .find(|(n, p, _)| n == &fu.name && *p == a.position)
+                .map(|(_, _, d)| d.clone())
+                .unwrap_or_default();
+            log.push(format!("gbak:    writing domain \"PUBLIC\".\"{}\"", dom));
+            let r = Rec::new(&mut out, rec::GLOBAL_FIELD)
+                .text(48, "PUBLIC")
+                .text(1, &dom)
+                .int(8, a.field_type as i32)
+                .int(10, a.length as i32)
+                .int(9, a.scale as i32)
+                .int(11, 0);
+            if a.field_type == 37 || a.field_type == 14 {
+                r.int(41, a.length as i32).int(42, 0).int(43, 0).end()
+            } else {
+                r.int(44, 0).end()
+            }
         }
     }
 
@@ -661,6 +699,78 @@ pub fn write_backup_verbose(
             .end();
     }
     log.push("gbak:writing functions".into());
+    for fu in &functions {
+        log.push(format!("gbak:    writing function \"PUBLIC\".\"{}\"", fu.name));
+        // att order is the engine's own, annotated off a real record:
+        // schema(23), name(1), return_arg(6), type(8) - NULL prints 0 -
+        // query_name(7) empty, blr(13), source(14), valid(15),
+        // debug(16), secclass(17), owner(18), legacy(19),
+        // deterministic(20), aggregate(24)
+        let mut r = Rec::new(&mut out, rec::FUNCTION)
+            .text(23, "PUBLIC")
+            .text(1, &fu.name)
+            .int(6, fu.return_arg as i32)
+            .int(8, 0)
+            .text(7, "")
+            .blob(13, &fu.blr)
+            .blob(14, &fu.source)
+            .int(15, fu.valid_blr as i32);
+        if let Some(d) = &fu.debug {
+            r = r.blob(16, d);
+        }
+        if let Some(sc) = &fu.sec_class {
+            r = r.text(17, sc);
+        }
+        if let Some(ow) = &fu.owner {
+            r = r.text(18, ow);
+        }
+        if let Some(v) = fu.legacy {
+            r = r.int(19, v as i32);
+        }
+        if let Some(v) = fu.deterministic {
+            r = r.int(20, v as i32);
+        }
+        if let Some(v) = fu.aggregate {
+            r = r.int(24, v as i32);
+        }
+        r.end();
+        for a in &fu.args {
+            log.push(format!(
+                "gbak:    writing argument for function \"PUBLIC\".\"{}\"",
+                fu.name
+            ));
+            let dom = fnarg_domains
+                .iter()
+                .find(|(n, p, _)| n == &fu.name && *p == a.position)
+                .map(|(_, _, d)| d.clone())
+                .unwrap_or_default();
+            // the zeroed type quintet mirrors the engine's unconditional
+            // put_int32 of NULL catalog columns - the domain is the type
+            let mut ar = Rec::new(&mut out, rec::FUNCTION_ARG)
+                .text(21, "PUBLIC")
+                .text(1, &fu.name)
+                .int(2, a.position as i32)
+                .int(3, 0)
+                .int(4, 0)
+                .int(5, 0)
+                .int(6, 0)
+                .int(7, 0);
+            if let Some(an) = &a.name {
+                ar = ar.text(11, an);
+            }
+            ar = ar.text(22, "PUBLIC").text(12, &dom);
+            if let Some(nf) = a.null_flag {
+                ar = ar.int(16, nf as i32);
+            }
+            if let Some(am) = a.arg_mech {
+                ar = ar.int(17, am as i32);
+            }
+            ar.end();
+        }
+        // rec_function_end - a bare byte, closing the args like
+        // rec_procedure_end closes the params
+        out.push(rec::FUNCTION_END);
+    }
     log.push("gbak:writing stored procedures".into());
     for pr in &procedures {
         log.push(format!("gbak:writing stored procedure \"PUBLIC\".\"{}\"", pr.name));
@@ -1538,6 +1648,173 @@ struct UProcParam {
     sub_type: i64,
 }
 
+/// A user PSQL function off the source catalog: header facts, the two
+/// blobs verbatim, and its arguments re-typed through their RDB$n
+/// domains (the argument row's own FIELD_TYPE columns are NULL in a
+/// real catalog - the facts live on the domain, measured).
+struct UFunc {
+    name: String,
+    return_arg: i64,
+    valid_blr: i64,
+    legacy: Option<i64>,
+    deterministic: Option<i64>,
+    aggregate: Option<i64>,
+    sec_class: Option<String>,
+    owner: Option<String>,
+    source: Vec<u8>,
+    blr: Vec<u8>,
+    debug: Option<Vec<u8>>,
+    args: Vec<UFnArg>,
+}
+
+struct UFnArg {
+    position: i64,
+    name: Option<String>,
+    null_flag: Option<i64>,
+    arg_mech: Option<i64>,
+    field_type: i64,
+    length: i64,
+    scale: i64,
+    sub_type: i64,
+}
+
+fn read_functions(
+    image: &fire_crab_ods::Image,
+    page_size: usize,
+) -> Result<Vec<UFunc>, Refused> {
+    let Some((cols, rows)) = sys_rows(image, page_size, "RDB$FUNCTIONS") else {
+        return Ok(Vec::new());
+    };
+    let frel = fire_crab_ods::resolve_relation(image, page_size, "RDB$FUNCTIONS")
+        .ok_or_else(|| Refused("no RDB$FUNCTIONS relation".into()))?;
+    let at = |n: &str| cols.iter().find(|(c, _)| c.eq_ignore_ascii_case(n)).map(|(_, i)| *i);
+    let int = |r: &fire_crab_ods::tra::VisibleRow, i: Option<usize>| match i
+        .and_then(|i| r.values.get(i))
+    {
+        Some(fire_crab_ods::format::Value::Int(n)) => Some(*n),
+        _ => None,
+    };
+    let blob = |r: &fire_crab_ods::tra::VisibleRow, i: Option<usize>| match i
+        .and_then(|i| r.values.get(i))
+    {
+        Some(fire_crab_ods::format::Value::Blob(_, num)) => {
+            fire_crab_blb::read_blob_content(image, page_size, frel, *num)
+        }
+        _ => None,
+    };
+    let args_of = |fn_name: &str| -> Result<Vec<UFnArg>, Refused> {
+        let Some((acols, arows)) = sys_rows(image, page_size, "RDB$FUNCTION_ARGUMENTS")
+        else {
+            return Ok(Vec::new());
+        };
+        let aat = |n: &str| {
+            acols.iter().find(|(c, _)| c.eq_ignore_ascii_case(n)).map(|(_, i)| *i)
+        };
+        let aint = |r: &fire_crab_ods::tra::VisibleRow, i: Option<usize>| match i
+            .and_then(|i| r.values.get(i))
+        {
+            Some(fire_crab_ods::format::Value::Int(n)) => Some(*n),
+            _ => None,
+        };
+        let has_blob = |r: &fire_crab_ods::tra::VisibleRow, i: Option<usize>| {
+            matches!(
+                i.and_then(|i| r.values.get(i)),
+                Some(fire_crab_ods::format::Value::Blob(..))
+            )
+        };
+        let mut out = Vec::new();
+        for r in &arows {
+            if text_opt(r, aat("RDB$FUNCTION_NAME")).as_deref() != Some(fn_name) {
+                continue;
+            }
+            if matches!(aint(r, aat("RDB$SYSTEM_FLAG")), Some(f) if f != 0) {
+                continue;
+            }
+            if has_blob(r, aat("RDB$DEFAULT_VALUE")) || has_blob(r, aat("RDB$DEFAULT_SOURCE")) {
+                return Err(Refused(format!(
+                    "function {}: an argument DEFAULT is outside this backup's surface",
+                    fn_name
+                )));
+            }
+            let src = text_opt(r, aat("RDB$FIELD_SOURCE")).unwrap_or_default();
+            let f = field_type_of(image, page_size, &src).ok_or_else(|| {
+                Refused(format!("function {}: argument domain {} is unreadable", fn_name, src))
+            })?;
+            // a BLOB-typed argument would need quad plumbing the minted
+            // domains do not speak yet - refuse, typed
+            if f.0 == 261 {
+                return Err(Refused(format!(
+                    "function {}: a BLOB-typed argument is outside this backup's surface",
+                    fn_name
+                )));
+            }
+            out.push(UFnArg {
+                position: aint(r, aat("RDB$ARGUMENT_POSITION")).unwrap_or(0),
+                name: text_opt(r, aat("RDB$ARGUMENT_NAME")),
+                null_flag: aint(r, aat("RDB$NULL_FLAG")),
+                arg_mech: aint(r, aat("RDB$ARGUMENT_MECHANISM")),
+                field_type: f.0,
+                length: f.1,
+                scale: f.2,
+                sub_type: f.3,
+            });
+        }
+        out.sort_by_key(|a| a.position);
+        Ok(out)
+    };
+    let mut out = Vec::new();
+    for r in &rows {
+        if matches!(int(r, at("RDB$SYSTEM_FLAG")), Some(f) if f != 0) {
+            continue;
+        }
+        let Some(name) = text_opt(r, at("RDB$FUNCTION_NAME")) else { continue };
+        if text_opt(r, at("RDB$PACKAGE_NAME")).is_some() {
+            return Err(Refused(format!(
+                "function {} lives in a PACKAGE - outside this backup's surface",
+                name
+            )));
+        }
+        // MODULE_NAME/ENTRYPOINT is a legacy UDF, ENGINE_NAME a UDR -
+        // both are code outside the file and cannot be carried
+        if text_opt(r, at("RDB$MODULE_NAME")).is_some()
+            || text_opt(r, at("RDB$ENTRYPOINT")).is_some()
+            || text_opt(r, at("RDB$ENGINE_NAME")).is_some()
+        {
+            return Err(Refused(format!(
+                "function {} is EXTERNAL - outside this backup's surface",
+                name
+            )));
+        }
+        if blob(r, at("RDB$DESCRIPTION")).is_some() {
+            return Err(Refused(format!(
+                "function {}: a description blob is outside this backup's surface",
+                name
+            )));
+        }
+        let blr = blob(r, at("RDB$FUNCTION_BLR")).ok_or_else(|| {
+            Refused(format!("function {}: its BLR blob is unreadable", name))
+        })?;
+        let mut source = blob(r, at("RDB$FUNCTION_SOURCE")).unwrap_or_default();
+        source.push(0);
+        let args = args_of(&name)?;
+        out.push(UFunc {
+            return_arg: int(r, at("RDB$RETURN_ARGUMENT")).unwrap_or(0),
+            valid_blr: int(r, at("RDB$VALID_BLR")).unwrap_or(1),
+            legacy: int(r, at("RDB$LEGACY_FLAG")),
+            deterministic: int(r, at("RDB$DETERMINISTIC_FLAG")),
+            aggregate: int(r, at("RDB$AGGREGATE_FLAG")),
+            sec_class: text_opt(r, at("RDB$SECURITY_CLASS")),
+            owner: text_opt(r, at("RDB$OWNER_NAME")),
+            debug: blob(r, at("RDB$DEBUG_INFO")),
+            name,
+            source,
+            blr,
+            args,
+        });
+    }
+    Ok(out)
+}
+
 fn read_procedures(
     image: &fire_crab_ods::Image,
     page_size: usize,
@@ -1971,6 +2248,8 @@ pub struct Restored {
     pub procedures: Vec<RProc>,
     /// the user exceptions: (name, message), file order
     pub exceptions: Vec<(String, String)>,
+    /// the carried PSQL functions, file order
+    pub functions: Vec<RFunc>,
     /// privilege records seen and set aside - the count keeps the
     /// omission visible in the trace instead of silent
     pub privileges_skipped: u64,
@@ -2011,6 +2290,26 @@ pub struct RProcParam {
 }
 
 /// One carried trigger row (a CHECK's or a referential action's).
+/// A function off the file: the two blobs verbatim, the args by
+/// position with their domain names (re-typed at restore through the
+/// carried global-field records).
+pub struct RFunc {
+    pub name: String,
+    pub return_arg: i64,
+    pub deterministic: i64,
+    pub source: Vec<u8>,
+    pub blr: Vec<u8>,
+    pub debug: Option<Vec<u8>>,
+    pub args: Vec<RFnArg>,
+}
+
+pub struct RFnArg {
+    pub position: i64,
+    pub name: Option<String>,
+    pub source: String,
+    pub null_flag: bool,
+}
+
 pub struct RTrigger {
     /// the PSQL source-to-BLR map, when the file carries one
     pub debug: Option<Vec<u8>>,
@@ -2158,6 +2457,7 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
         domain_types: Vec::new(),
         procedures: Vec::new(),
         exceptions: Vec::new(),
+        functions: Vec::new(),
         privileges_skipped: 0,
     };
     // (schema, source name) -> not-null flag learned from constraints
@@ -2214,6 +2514,151 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                     out.domains.push(name);
                 }
             }
+            rec::FUNCTION => {
+                // BLR (13), source (14), debug (16) and description2
+                // (9) are int32-framed blobs - walked by hand, like
+                // the procedure record
+                let mut fu = RFunc {
+                    name: String::new(),
+                    return_arg: 0,
+                    deterministic: 0,
+                    source: Vec::new(),
+                    blr: Vec::new(),
+                    debug: None,
+                    args: Vec::new(),
+                };
+                loop {
+                    let tag = *f
+                        .get(at)
+                        .ok_or_else(|| Refused("truncated function record".into()))?;
+                    at += 1;
+                    if tag == 0 {
+                        break;
+                    }
+                    let len = *f
+                        .get(at)
+                        .ok_or_else(|| Refused("truncated function attribute".into()))?
+                        as usize;
+                    at += 1;
+                    let data = f
+                        .get(at..at + len)
+                        .ok_or_else(|| Refused("truncated function attribute".into()))?
+                        .to_vec();
+                    at += len;
+                    let as_int = |d: &[u8]| {
+                        let mut v: i64 = 0;
+                        for (k, b) in d.iter().enumerate().take(8) {
+                            v |= (*b as i64) << (8 * k);
+                        }
+                        v
+                    };
+                    match tag {
+                        9 | 13 | 14 | 16 => {
+                            let n = as_int(&data) as usize;
+                            let raw = f
+                                .get(at..at + n)
+                                .ok_or_else(|| Refused("truncated function blob".into()))?
+                                .to_vec();
+                            at += n;
+                            match tag {
+                                13 => fu.blr = raw,
+                                14 => {
+                                    fu.source = raw;
+                                    if fu.source.last() == Some(&0) {
+                                        fu.source.pop();
+                                    }
+                                }
+                                16 => fu.debug = Some(raw),
+                                _ => {} // description set aside
+                            }
+                        }
+                        // MODULE_NAME (4), ENTRYPOINT (5), ENGINE_NAME
+                        // (10), PACKAGE_NAME (11): code outside the file
+                        4 | 5 | 10 | 11 => {
+                            return Err(Refused(format!(
+                                "function {}: attribute {} names EXTERNAL code - outside this restore's surface",
+                                fu.name, tag
+                            )));
+                        }
+                        1 => fu.name = String::from_utf8_lossy(&data).into_owned(),
+                        6 => fu.return_arg = as_int(&data),
+                        20 => fu.deterministic = as_int(&data),
+                        2 | 3 | 7 | 8 | 12 | 15 | 17 | 18 | 19 | 21 | 22 | 23 | 24 => {}
+                        other => {
+                            return Err(Refused(format!(
+                                "function {}: attribute {} is outside this restore's surface",
+                                fu.name, other
+                            )));
+                        }
+                    }
+                }
+                out.functions.push(fu);
+            }
+            rec::FUNCTION_ARG => {
+                // DEFAULT blobs (13/14) and the description (20) are
+                // int32-framed; a DEFAULT refuses typed - the restore
+                // does not write argument defaults yet
+                let mut position = 0i64;
+                let mut aname: Option<String> = None;
+                let mut fname = String::new();
+                let mut source = String::new();
+                let mut null_flag = false;
+                loop {
+                    let tag = *f
+                        .get(at)
+                        .ok_or_else(|| Refused("truncated function argument".into()))?;
+                    at += 1;
+                    if tag == 0 {
+                        break;
+                    }
+                    let len = *f
+                        .get(at)
+                        .ok_or_else(|| Refused("truncated function argument".into()))?
+                        as usize;
+                    at += 1;
+                    let data = f
+                        .get(at..at + len)
+                        .ok_or_else(|| Refused("truncated function argument".into()))?
+                        .to_vec();
+                    at += len;
+                    let as_int = |d: &[u8]| {
+                        let mut v: i64 = 0;
+                        for (k, b) in d.iter().enumerate().take(8) {
+                            v |= (*b as i64) << (8 * k);
+                        }
+                        v
+                    };
+                    match tag {
+                        13 | 14 => {
+                            return Err(Refused(format!(
+                                "function {}: an argument DEFAULT is outside this restore's surface",
+                                fname
+                            )));
+                        }
+                        20 => {
+                            let n = as_int(&data) as usize;
+                            at += n; // description set aside
+                        }
+                        1 => fname = String::from_utf8_lossy(&data).into_owned(),
+                        2 => position = as_int(&data),
+                        11 => aname = Some(String::from_utf8_lossy(&data).into_owned()),
+                        12 => source = String::from_utf8_lossy(&data).into_owned(),
+                        16 => null_flag = as_int(&data) != 0,
+                        3..=9 | 10 | 15 | 17 | 21 | 22 => {}
+                        other => {
+                            return Err(Refused(format!(
+                                "function {}: argument attribute {} is outside this restore's surface",
+                                fname, other
+                            )));
+                        }
+                    }
+                }
+                let fu = out.functions.last_mut().ok_or_else(|| {
+                    Refused(format!("an argument for {} with no function before it", fname))
+                })?;
+                fu.args.push(RFnArg { position, name: aname, source, null_flag });
+            }
+            rec::FUNCTION_END => {}
             rec::PROCEDURE => {
                 // BLR (8), source (7), descriptions (4/5) and debug
                 // info (13) are int32-framed blobs - walked by hand,

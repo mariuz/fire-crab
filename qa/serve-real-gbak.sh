@@ -334,6 +334,49 @@ else
 fi
 rm -f "$EXDB" "$D/fc-gbak-ex.fbk" "$D/fc-gbak-exr.fdb"
 
+# FUNCTIONS RIDE (rec 15/16/17): fc backs up a PSQL-function database,
+# the ENGINE restores it and EXECUTES both functions - the deterministic
+# flag, the NOT NULL argument and the argument names carried
+FNDB="$D/fc-gbak-fn.fdb"; rm -f "$FNDB" "$D/fc-gbak-fn.fbk" "$D/fc-gbak-fnr.fdb"
+"$ISQL" -q -b -user "$U" -pas "$P" <<EOF >/dev/null 2>&1
+CREATE DATABASE '$FNDB' USER '$U' PASSWORD '$P' PAGE_SIZE 8192;
+CREATE TABLE T (X INTEGER);
+COMMIT;
+SET TERM ^;
+CREATE FUNCTION FDOUBLE (A INTEGER) RETURNS INTEGER AS BEGIN RETURN A * 2; END^
+CREATE FUNCTION FCAT (S VARCHAR(10), N INTEGER NOT NULL) RETURNS VARCHAR(40) DETERMINISTIC AS BEGIN RETURN S || ':' || N; END^
+SET TERM ;^
+COMMIT;
+EOF
+chmod 666 "$FNDB"
+ran=$((ran + 1))
+fo=$(svc_backup "$FMGR" "$FNDB" "$D/fc-gbak-fn.fbk")
+if [ "${fo##*rc=}" = "0" ]; then
+    echo "OK   a PSQL FUNCTION rides the backup (fc backs it up)"
+else
+    echo "DIFF function backup: [$fo]"; fail=1
+fi
+ran=$((ran + 1))
+sudo -n chmod 666 "$D/fc-gbak-fn.fbk" 2>/dev/null || chmod 666 "$D/fc-gbak-fn.fbk" 2>/dev/null
+"$FBSVCMGR" "$EMGR" user "$U" password "$P" action_restore dbname "$D/fc-gbak-fnr.fdb" bkp_file "$D/fc-gbak-fn.fbk" >/dev/null 2>&1
+grab "$D/fc-gbak-fnr.fdb"
+got=$(printf "SELECT FDOUBLE(21) || '/' || FCAT('a', 5) FROM RDB\$DATABASE;\n" |
+    "$ISQL" -q -b -user "$U" -pas "$P" "$D/fc-gbak-fnr.fdb" 2>&1 | grep -c "42/a:5")
+if [ "$got" = "1" ]; then
+    echo "OK   the ENGINE restores fc's fbk and EXECUTES both functions (42/a:5)"
+else
+    echo "DIFF function execution after engine restore: match-count [$got] (want 1)"; fail=1
+fi
+ran=$((ran + 1))
+got=$(printf "SELECT FCAT('x', NULL) FROM RDB\$DATABASE;\n" |
+    "$ISQL" -q -b -user "$U" -pas "$P" "$D/fc-gbak-fnr.fdb" 2>&1 | grep -c 'validation error for variable "N"')
+if [ "$got" = "1" ]; then
+    echo "OK   ...and the argument's NOT NULL validates with its carried NAME"
+else
+    echo "DIFF function NOT NULL arg after engine restore: match-count [$got] (want 1)"; fail=1
+fi
+rm -f "$FNDB" "$D/fc-gbak-fn.fbk" "$D/fc-gbak-fnr.fdb"
+
 # --- 4. RECORDED BOUNDARY: NOT NULL is not carried ---------------------------
 NN="$D/fc-gbak-nn.fdb"; rm -f "$NN"
 "$ISQL" -q -b -user "$U" -pas "$P" <<EOF >/dev/null 2>&1
