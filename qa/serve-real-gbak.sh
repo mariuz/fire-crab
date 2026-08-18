@@ -620,6 +620,44 @@ else
 fi
 rm -f "$DSDB" "$D/fc-gbak-ds.fbk" "$D/fc-gbak-ds2.fbk" "$D/fc-gbak-dsr.fdb"
 
+# NAMED DOMAINS RIDE - the real name on the rec-2 record (with NOT
+# NULL att 38, char length, COMMENT), columns keeping the name in
+# att 2: the ENGINE restores fc's backup with the binding, the data,
+# the comment and the domain's NOT NULL enforcement intact
+NDDB="$D/fc-gbak-nd.fdb"; rm -f "$NDDB" "$D/fc-gbak-nd.fbk" "$D/fc-gbak-ndr.fdb"
+"$ISQL" -q -b -user "$U" -pas "$P" <<EOF >/dev/null 2>&1
+CREATE DATABASE '$NDDB' USER '$U' PASSWORD '$P' PAGE_SIZE 8192;
+CREATE DOMAIN D_AGE AS INTEGER NOT NULL;
+CREATE DOMAIN D_TXT AS VARCHAR(8);
+COMMIT;
+CREATE TABLE P (AGE D_AGE, NICK D_TXT, PLAIN INTEGER);
+COMMIT;
+INSERT INTO P VALUES (30, 'ada', 1);
+COMMIT;
+COMMENT ON DOMAIN D_TXT IS 'dom words';
+COMMIT;
+EOF
+chmod 666 "$NDDB"
+ran=$((ran + 1))
+fo=$(svc_backup "$FMGR" "$NDDB" "$D/fc-gbak-nd.fbk")
+if [ "${fo##*rc=}" = "0" ]; then
+    echo "OK   a NAMED DOMAIN rides the backup (fc backs it up)"
+else
+    echo "DIFF named-domain backup: [$fo]"; fail=1
+fi
+ran=$((ran + 1))
+sudo -n chmod 666 "$D/fc-gbak-nd.fbk" 2>/dev/null || chmod 666 "$D/fc-gbak-nd.fbk" 2>/dev/null
+"$FBSVCMGR" "$EMGR" user "$U" password "$P" action_restore dbname "$D/fc-gbak-ndr.fdb" bkp_file "$D/fc-gbak-nd.fbk" >/dev/null 2>&1
+grab "$D/fc-gbak-ndr.fdb"
+got=$(printf "SELECT AGE || '/' || NICK || '/' || TRIM(RDB\$FIELD_SOURCE) || '/' || (SELECT CAST(RDB\$DESCRIPTION AS VARCHAR(20)) FROM RDB\$FIELDS WHERE RDB\$FIELD_NAME='D_TXT') FROM P JOIN RDB\$RELATION_FIELDS ON RDB\$RELATION_NAME='P' AND RDB\$FIELD_NAME='AGE';\nINSERT INTO P (NICK, PLAIN) VALUES ('x', 2);\n" |
+    "$ISQL" -q -b -user "$U" -pas "$P" "$D/fc-gbak-ndr.fdb" 2>&1 | grep -cE '30/ada/D_AGE/dom words|validation error for column')
+if [ "$got" = "2" ]; then
+    echo "OK   the ENGINE restores fc's fbk: binding, data, COMMENT, NOT NULL all carried"
+else
+    echo "DIFF named domain after engine restore: match-count [$got] (want 2)"; fail=1
+fi
+rm -f "$NDDB" "$D/fc-gbak-nd.fbk" "$D/fc-gbak-ndr.fdb"
+
 # --- 4. RECORDED BOUNDARY: NOT NULL is not carried ---------------------------
 NN="$D/fc-gbak-nn.fdb"; rm -f "$NN"
 "$ISQL" -q -b -user "$U" -pas "$P" <<EOF >/dev/null 2>&1

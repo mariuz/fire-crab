@@ -132,6 +132,9 @@ struct Col {
     /// columns to domains by NAME WITHIN THE FILE, so consistency is
     /// all that matters)
     source: String,
+    /// true when `source` is a user-NAMED domain carried whole - the
+    /// invented-domain emission skips it
+    named_domain: bool,
     position: u16,
     desc: Descriptor,
     /// RDB$RELATION_FIELDS.RDB$NULL_FLAG - carried as the same three
@@ -371,12 +374,8 @@ pub fn write_backup_verbose(
                 name_at.and_then(|i| r.values.get(i))
             {
                 let t = t.trim_end();
-                if !t.starts_with("RDB$") && !t.starts_with("SEC$") && !t.starts_with("MON$") {
-                    return Err(Refused(format!(
-                        "domain {} is outside this backup's surface",
-                        t
-                    )));
-                }
+                // (named domains RIDE now - read_named_domains carries
+                // them whole, refusing DEFAULT/CHECK/computed/array)
                 // a COMMENT on an invented RDB$n domain cannot follow
                 // the renumbering a restore performs - refuse typed
                 if t.starts_with("RDB$")
@@ -461,6 +460,17 @@ pub fn write_backup_verbose(
                     name, names[i].name
                 )));
             }
+            // a column bound to a user-NAMED domain keeps the real
+            // name through the file; invented RDB$n only for the rest
+            let orig = column_source_of(image, page_size, name, &names[i].name);
+            let (source, named_domain) = match orig {
+                Some(o) if !o.starts_with("RDB$") => (o, true),
+                _ => {
+                    let s = format!("RDB${}", next_source);
+                    next_source += 1;
+                    (s, false)
+                }
+            };
             cols.push(Col {
                 name: names[i].name.clone(),
                 // the field id follows CREATION order - the reference
@@ -468,12 +478,12 @@ pub fn write_backup_verbose(
                 // after the blobs'
                 field_id: (i + 1) as i32,
                 bitmap_bit: i,
-                source: format!("RDB${}", next_source),
+                source,
+                named_domain,
                 position: names[i].position,
                 desc: d.clone(),
                 not_null: not_nulls.iter().any(|n| n == &names[i].name),
             });
-            next_source += 1;
         }
         // BLOBS FIRST - the measured field-record order of a real file
         // (TXT pos 1, BIN pos 2, ID pos 0), which the DATA rows follow:
@@ -517,8 +527,38 @@ pub fn write_backup_verbose(
 
     // --- rec_global_field: one per column, in file order ------------------
     log.push("gbak:writing domains".into());
+    // the user-NAMED domains lead, real names and all - measured atts:
+    // 48,1,8,10,9,11,[38 null],[35 desc],[44 prec | 41/42/43 for text]
+    let named_domains = read_named_domains(image, page_size)?;
+    for nd in &named_domains {
+        log.push(format!("gbak:    writing domain \"PUBLIC\".\"{}\"", nd.name));
+        let mut r = Rec::new(&mut out, rec::GLOBAL_FIELD)
+            .text(48, "PUBLIC")
+            .text(1, &nd.name)
+            .int(8, nd.field_type as i32)
+            .int(10, nd.length as i32)
+            .int(9, nd.scale as i32)
+            .int(11, nd.sub_type as i32);
+        if nd.not_null {
+            r = r.int(38, 1);
+        }
+        if let Some(d) = &nd.desc {
+            r = r.blob(35, d);
+        }
+        if matches!(nd.field_type, 14 | 37) {
+            r.int(41, nd.char_len.unwrap_or(nd.length) as i32)
+                .int(42, 0)
+                .int(43, 0)
+                .end();
+        } else {
+            r.int(44, nd.precision.unwrap_or(0) as i32).end();
+        }
+    }
     for (_, _, cols) in &rel_cols {
         for c in cols {
+            if c.named_domain {
+                continue; // its domain rode above, once, by name
+            }
             log.push(format!("gbak:    writing domain \"PUBLIC\".\"{}\"", c.source));
             let t = rdb_field_type(&c.desc).unwrap();
             // FOR A BLOB THE SCALE SLOT (att 9) CARRIES THE SUB_TYPE -
@@ -1495,6 +1535,7 @@ fn read_indexes(image: &fire_crab_ods::Image, page_size: usize) -> Result<Vec<UI
     let type_at = at("RDB$INDEX_TYPE");
     let inactive_at = at("RDB$INDEX_INACTIVE");
     let fk_at = at("RDB$FOREIGN_KEY");
+    let expr_at = at("RDB$EXPRESSION_BLR");
     let flag_at = at("RDB$SYSTEM_FLAG");
     let text = |r: &fire_crab_ods::tra::VisibleRow, i: usize| match r.values.get(i) {
         Some(fire_crab_ods::format::Value::Text(t)) => t.trim_end().to_string(),
@@ -1536,6 +1577,15 @@ fn read_indexes(image: &fire_crab_ods::Image, page_size: usize) -> Result<Vec<UI
         if num(r, inactive_at) != 0 {
             return Err(Refused(format!(
                 "index {} is inactive - a state this backup cannot say",
+                name
+            )));
+        }
+        if matches!(
+            expr_at.and_then(|i| r.values.get(i)),
+            Some(fire_crab_ods::format::Value::Blob(..))
+        ) {
+            return Err(Refused(format!(
+                "index {} is an EXPRESSION index - outside this backup's surface",
                 name
             )));
         }
@@ -2186,6 +2236,121 @@ fn read_procedures(
     Ok(out)
 }
 
+/// A user-NAMED domain off RDB$FIELDS: name, type facts, NOT NULL,
+/// and its COMMENT. Domain DEFAULTs, CHECKs, computed expressions and
+/// array dimensions refuse typed - each changes what the domain MEANS
+/// beyond its type.
+struct UNamedDomain {
+    name: String,
+    field_type: i64,
+    length: i64,
+    scale: i64,
+    sub_type: i64,
+    precision: Option<i64>,
+    char_len: Option<i64>,
+    not_null: bool,
+    desc: Option<Vec<u8>>,
+}
+
+fn read_named_domains(
+    image: &fire_crab_ods::Image,
+    page_size: usize,
+) -> Result<Vec<UNamedDomain>, Refused> {
+    let Some((cols, rows)) = sys_rows(image, page_size, "RDB$FIELDS") else {
+        return Ok(Vec::new());
+    };
+    let frel = fire_crab_ods::resolve_relation(image, page_size, "RDB$FIELDS")
+        .ok_or_else(|| Refused("no RDB$FIELDS relation".into()))?;
+    let at = |n: &str| cols.iter().find(|(c, _)| c.eq_ignore_ascii_case(n)).map(|(_, i)| *i);
+    let int = |r: &fire_crab_ods::tra::VisibleRow, i: Option<usize>| match i
+        .and_then(|i| r.values.get(i))
+    {
+        Some(fire_crab_ods::format::Value::Int(n)) => Some(*n),
+        _ => None,
+    };
+    let has_blob = |r: &fire_crab_ods::tra::VisibleRow, i: Option<usize>| {
+        matches!(
+            i.and_then(|i| r.values.get(i)),
+            Some(fire_crab_ods::format::Value::Blob(..))
+        )
+    };
+    let mut out = Vec::new();
+    for r in &rows {
+        if matches!(int(r, at("RDB$SYSTEM_FLAG")), Some(f) if f != 0) {
+            continue;
+        }
+        let Some(name) = text_opt(r, at("RDB$FIELD_NAME")) else { continue };
+        if name.starts_with("RDB$") || name.starts_with("SEC$") || name.starts_with("MON$") {
+            continue;
+        }
+        for (col, what) in [
+            ("RDB$DEFAULT_VALUE", "a DEFAULT"),
+            ("RDB$VALIDATION_BLR", "a CHECK"),
+            ("RDB$COMPUTED_BLR", "a COMPUTED expression"),
+            ("RDB$MISSING_VALUE", "a MISSING value"),
+        ] {
+            if has_blob(r, at(col)) {
+                return Err(Refused(format!(
+                    "domain {}: {} is outside this backup's surface",
+                    name, what
+                )));
+            }
+        }
+        if int(r, at("RDB$DIMENSIONS")).unwrap_or(0) != 0 {
+            return Err(Refused(format!(
+                "domain {}: array dimensions are outside this backup's surface",
+                name
+            )));
+        }
+        let ft = int(r, at("RDB$FIELD_TYPE")).unwrap_or(0);
+        if !matches!(ft, 7 | 8 | 16 | 14 | 37) {
+            return Err(Refused(format!(
+                "domain {}: field type {} is outside this backup's surface",
+                name, ft
+            )));
+        }
+        let desc = match at("RDB$DESCRIPTION").and_then(|i| r.values.get(i)) {
+            Some(fire_crab_ods::format::Value::Blob(_, num)) => {
+                fire_crab_blb::read_blob_content(image, page_size, frel, *num).map(|mut d| {
+                    d.push(0);
+                    d
+                })
+            }
+            _ => None,
+        };
+        out.push(UNamedDomain {
+            field_type: ft,
+            length: int(r, at("RDB$FIELD_LENGTH")).unwrap_or(0),
+            scale: int(r, at("RDB$FIELD_SCALE")).unwrap_or(0),
+            sub_type: int(r, at("RDB$FIELD_SUB_TYPE")).unwrap_or(0),
+            precision: int(r, at("RDB$FIELD_PRECISION")),
+            char_len: int(r, at("RDB$CHARACTER_LENGTH")),
+            not_null: int(r, at("RDB$NULL_FLAG")).unwrap_or(0) != 0,
+            desc,
+            name,
+        });
+    }
+    Ok(out)
+}
+
+/// A column's ORIGINAL RDB$FIELD_SOURCE off RDB$RELATION_FIELDS - the
+/// binding a named-domain column keeps through the file.
+fn column_source_of(
+    image: &fire_crab_ods::Image,
+    page_size: usize,
+    rel: &str,
+    col: &str,
+) -> Option<String> {
+    let (cols, rows) = sys_rows(image, page_size, "RDB$RELATION_FIELDS")?;
+    let at = |n: &str| cols.iter().find(|(c, _)| c.eq_ignore_ascii_case(n)).map(|(_, i)| *i);
+    rows.iter()
+        .find(|r| {
+            text_opt(r, at("RDB$RELATION_NAME")).as_deref() == Some(rel)
+                && text_opt(r, at("RDB$FIELD_NAME")).as_deref() == Some(col)
+        })
+        .and_then(|r| text_opt(r, at("RDB$FIELD_SOURCE")))
+}
+
 /// A catalog row's RDB$DESCRIPTION blob (a COMMENT), NUL-terminated
 /// like every carried source blob - matched on every (column, value)
 /// pair given.
@@ -2528,6 +2693,7 @@ mod tests {
                 field_id: 1,
                 bitmap_bit: 0,
                 source: "RDB$1".into(),
+                named_domain: false,
                 position: 0,
                 desc: Descriptor { dtype: dtype::LONG, scale: 0, length: 4, sub_type: 0, flags: 0, offset: 4 },
                 not_null: false,
@@ -2537,6 +2703,7 @@ mod tests {
                 field_id: 2,
                 bitmap_bit: 1,
                 source: "RDB$2".into(),
+                named_domain: false,
                 position: 1,
                 desc: Descriptor { dtype: dtype::VARYING, scale: 0, length: 10, sub_type: 0, flags: 0, offset: 8 },
                 not_null: false,
@@ -2611,6 +2778,8 @@ pub struct RCol {
     /// att 22 - what a rec_blob's field number points at
     pub field_id: i32,
     pub not_null: bool,
+    /// att 2 when it names a user domain - the column binds by name
+    pub domain: Option<String>,
 }
 
 /// One restored index.
@@ -2692,6 +2861,8 @@ pub struct Restored {
     pub domain_computed: Vec<(String, Vec<u8>)>,
     /// the COMMENTS: (family, name, sub-name or empty, text), file order
     pub descriptions: Vec<(String, String, String, String)>,
+    /// the user-NAMED domains, file order
+    pub named_domains: Vec<RNamedDomain>,
     /// the carried packages, file order
     pub packages: Vec<RPackage>,
     /// privilege records seen and set aside - the count keeps the
@@ -2713,6 +2884,15 @@ pub struct RFk {
 }
 
 /// One carried stored procedure.
+/// A user-NAMED domain off the file - the type facts ride in
+/// [Restored::domain_types] under the same name.
+pub struct RNamedDomain {
+    pub name: String,
+    pub not_null: bool,
+    pub char_len: Option<i64>,
+    pub precision: Option<i64>,
+}
+
 /// A package off the file: name and its two sources verbatim (the
 /// members arrive as ordinary procedure/function records tagged with
 /// the package attribute).
@@ -2961,6 +3141,7 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
         roles: Vec::new(),
         domain_computed: Vec::new(),
         descriptions: Vec::new(),
+        named_domains: Vec::new(),
         packages: Vec::new(),
         privileges_skipped: 0,
     };
@@ -3013,6 +3194,7 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                 // walker desynced on the first one (measured)
                 let mut atts: Vec<Att> = Vec::new();
                 let mut computed: Option<Vec<u8>> = None;
+                let mut dom_desc: Option<Vec<u8>> = None;
                 loop {
                     let tag = *f
                         .get(at)
@@ -3031,7 +3213,7 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                         .ok_or_else(|| Refused("truncated domain attribute".into()))?
                         .to_vec();
                     at += len;
-                    if matches!(tag, 15..=21) {
+                    if matches!(tag, 15..=21 | 35) {
                         let mut n: i64 = 0;
                         for (k, b) in data.iter().enumerate().take(8) {
                             n |= (*b as i64) << (8 * k);
@@ -3042,24 +3224,39 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                             .ok_or_else(|| Refused("truncated domain blob".into()))?
                             .to_vec();
                         at += n;
-                        if tag == 18 {
-                            computed = Some(raw);
+                        match tag {
+                            18 => computed = Some(raw),
+                            35 => dom_desc = Some(raw),
+                            _ => {} // defaults/validation set aside
                         }
-                        continue; // defaults/validation/descriptions set aside
+                        continue;
                     }
                     atts.push(Att { tag, data });
                 }
                 if let Some(a) = att(&atts, 1) {
                     let name = a.text();
-                    // a NAMED domain restored as a plain type would
-                    // keep the data and silently change what the
-                    // schema MEANS - refuse until the named-domain
-                    // slice carries it whole
+                    // a user-NAMED domain rides whole: kept with its
+                    // NOT NULL, char length and COMMENT for
+                    // create_domain to rebuild by name
                     if !name.starts_with("RDB$") {
-                        return Err(Refused(format!(
-                            "domain {} is outside this restore's surface",
-                            name
-                        )));
+                        out.named_domains.push(RNamedDomain {
+                            name: name.clone(),
+                            not_null: att(&atts, 38).map(|a| a.int()).unwrap_or(0) != 0,
+                            char_len: att(&atts, 41).map(|a| a.int()),
+                            precision: att(&atts, 44).map(|a| a.int()),
+                        });
+                        if let Some(d) = &dom_desc {
+                            let mut d = d.clone();
+                            if d.last() == Some(&0) {
+                                d.pop();
+                            }
+                            out.descriptions.push((
+                                "domain".into(),
+                                name.clone(),
+                                String::new(),
+                                String::from_utf8_lossy(&d).into_owned(),
+                            ));
+                        }
                     }
                     out.domain_types.push((
                         name.clone(),
@@ -3815,6 +4012,9 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                     position: att(&atts, 13).map(|a| a.int() as i32).unwrap_or(n as i32),
                     field_id: att(&atts, 22).map(|a| a.int() as i32).unwrap_or((n + 1) as i32),
                     not_null: att(&atts, 38).map(|a| a.int() == 1).unwrap_or(false),
+                    domain: att(&atts, 2)
+                        .map(|a| a.text())
+                        .filter(|d| !d.starts_with("RDB$")),
                 });
             }
             rec::RELATION_END => {

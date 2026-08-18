@@ -3085,6 +3085,30 @@ fn run_gbak_restore_core(
             .map(|h| h.page_size as usize)
             .ok_or("the fresh shell has no header")?;
         let mut file = fire_crab_ods::Image::from_bytes(&raw, page_size);
+        // the user-NAMED domains first - table columns bind to them
+        // by name, so the RDB$FIELDS rows must exist before the tables
+        for nd in &restored.named_domains {
+            let (_, ft, len, sc, st) = restored
+                .domain_types
+                .iter()
+                .find(|(n, ..)| n == &nd.name)
+                .ok_or_else(|| format!("named domain {}: no type facts in the file", nd.name))?;
+            let mut col = restore_column_def(&fire_crab_burp::RCol {
+                name: nd.name.clone(),
+                field_type: *ft as i32,
+                length: *len as u16,
+                scale: *sc as i8,
+                sub_type: *st as i16,
+                position: 0,
+                field_id: 0,
+                not_null: nd.not_null,
+                domain: None,
+            })?;
+            if let Some(cl) = nd.char_len {
+                col.char_len = Some(cl as u16);
+            }
+            fire_crab_ods::ddl::create_domain(&mut file, page_size, &col)?;
+        }
         // the SQL ROLES - independent of everything, grants to them
         // stay in the privilege set-aside (the recorded difference)
         for name in &restored.roles {
@@ -3529,6 +3553,7 @@ fn run_gbak_restore_core(
                 "trigger" => ("RDB$TRIGGERS", vec![("RDB$TRIGGER_NAME", name)]),
                 "role" => ("RDB$ROLES", vec![("RDB$ROLE_NAME", name)]),
                 "package" => ("RDB$PACKAGES", vec![("RDB$PACKAGE_NAME", name)]),
+                "domain" => ("RDB$FIELDS", vec![("RDB$FIELD_NAME", name)]),
                 other => return Err(format!("a COMMENT on a {} is outside this restore's surface", other)),
             };
             fire_crab_ods::ddl::set_catalog_description(&mut file, page_size, rel, &keys, text)?;
@@ -3653,7 +3678,9 @@ fn restore_column_def(
         not_null: c.not_null,
         not_null_constraint: c.not_null,
         default: None,
-        domain: None,
+        // a named-domain column binds by NAME - create_table resolves
+        // the type off the domain's own RDB$FIELDS row
+        domain: c.domain.clone(),
         identity: None,
         computed: None,
     })

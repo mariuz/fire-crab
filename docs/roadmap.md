@@ -137,9 +137,21 @@ generic attribute walker and would have mis-stepped on any
 commented object — every arm now speaks the blob framing
 (read_atts_blob). A COMMENT on an invented RDB$n domain refuses
 typed on both sides — it cannot follow the renumbering a restore
-performs. What still refuses is typed (named domains, argument
-DEFAULTs, expression indexes — and the permanent boundaries,
-external tables and external functions).
+performs. ~~Named domains refuse~~ — NAMED DOMAINS RIDE (gbak 42), the
+catalog chunk's closing slice: the real name on the rec-2 record
+(NOT NULL att 38, char length 41, precision 44, COMMENT 35 — the
+walker learned att 35's blob framing on rec 2 too), columns keeping
+the name in att 2 instead of drawing an invented RDB$n, and the
+restore running ddl::create_domain FIRST so create_table's
+long-standing ColumnDef::domain path binds by name. Domain
+DEFAULTs, CHECKs, computed expressions and array dimensions refuse
+typed — each changes what a domain MEANS beyond its type. The
+writer also refuses EXPRESSION (COMPUTED BY) indexes typed now
+(they were silently dropped — a found bug), and an expression index
+is the boundary representative. What still refuses is typed
+(domain DEFAULTs/CHECKs, argument DEFAULTs, expression indexes —
+and the permanent boundaries, external tables and external
+functions).
 
 The subsystem map's rows fall into three states, and the difference
 matters more than the row count:
