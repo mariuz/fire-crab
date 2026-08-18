@@ -925,6 +925,10 @@ pub fn insert_index_entry(
             .iter()
             .any(|n| n.key == key && n.recno != recno && recno_is_live(file, page_size, rel, n.recno))
     {
+        // the EXACT string is load-bearing: the server matches on it to
+        // build the typed 23000 vector (gdscode 335544665 with the
+        // constraint and key params) - a debugging enrichment of this
+        // message degraded seven gates' vectors to the generic code
         return Err("duplicate key in unique index".into());
     }
     let pos = content

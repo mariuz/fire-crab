@@ -18,10 +18,32 @@ with the four-way cross-restore matrix as the oracle (fc.fbk x
 engine-restore and back), so each remaining object type is one
 measured slice over an already-pinned format: annotate the record
 family off a real .fbk, write it, restore it on both sides, read it
-back through the engine. Generators first (smallest record), then the
-constraint family (the restore half already enforces FKs), then
-views, triggers, procedures - the last two reusing the dsql BLR
-oracle that CREATE PROCEDURE already stores byte-identically.
+back through the engine. ~~Generators first (smallest record)~~ —
+SEQUENCES RIDE THE FILE now (rec_generator pinned off a real .fbk,
+the current value carried TWICE the way backup.epp writes it, and
+restored into the generator vector where it lives — gbak 22,
+gbakrestore with sequences in every corner of the cross-restore
+matrix). ~~Then the constraint family~~ — UNIQUE and plain FOREIGN
+KEY RIDE too: the engine's three-block order (rel_constraint rows,
+ref rows, chk rows), the FK index carrying its partner (att 8), the
+restore applying UNIQUEs constraint-driven and FKs last through the
+keyed-constraint map — both directions enforce 23000-identically,
+gfix clean. ~~CASCADE / SET NULL / SET DEFAULT and CHECK refuse~~ —
+THE TRIGGER RECORDS RIDE: rec 13 with its int32-framed BLR/source
+walked by hand, the stored blobs COPIED verbatim both ways (no
+compilation — the bytes are the engine's own), the restore storing
+them through `restore_carried_trigger` and the FK application
+switching to `alter_table_add_foreign_key_carried` so fc's own
+trigger synthesis does not collide with the carried records (the
+first restore's duplicate-CHECK_1 failure, measured). The ENGINE
+enforces a CHECK through the carried trigger BY NAME and CASCADES on
+fc's restored file; fc's own DML enforces the restored CHECK too
+(the carried engine BLR executes), while fc's own CASCADE EXECUTION
+refuses fail-closed — recorded. USER triggers are the fail-closed
+representative now (arbitrary PSQL bodies), typed both directions.
+gbak 22, gbakrestore 36. Next: views and procedures, reusing the
+dsql BLR oracle that CREATE PROCEDURE already stores
+byte-identically.
 
 The subsystem map's rows fall into three states, and the difference
 matters more than the row count:

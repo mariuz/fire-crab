@@ -139,15 +139,92 @@ EOF
     fi
     rm -f "$db"
 }
-refusal "a sequence" "CREATE SEQUENCE G;"
+# ~~a sequence refuses~~ - SEQUENCES RIDE THE FILE now (rec_generator,
+# the value doubled the way backup.epp writes it); the carriage is
+# proven by the ENGINE restoring fc's backup and reading the value
+SEQDB="$D/fc-gbak-seq.fdb"; rm -f "$SEQDB" "$D/fc-gbak-seq.fbk" "$D/fc-gbak-seqr.fdb"
+"$ISQL" -q -b -user "$U" -pas "$P" <<EOF >/dev/null 2>&1
+CREATE DATABASE '$SEQDB' USER '$U' PASSWORD '$P' PAGE_SIZE 8192;
+CREATE TABLE T (X INTEGER);
+CREATE SEQUENCE G;
+CREATE SEQUENCE H START WITH 500 INCREMENT BY 3;
+COMMIT;
+SELECT GEN_ID(G, 7) FROM RDB\$DATABASE;
+COMMIT;
+EOF
+chmod 666 "$SEQDB"
+ran=$((ran + 1))
+fo=$(svc_backup "$FMGR" "$SEQDB" "$D/fc-gbak-seq.fbk")
+if [ "${fo##*rc=}" = "0" ]; then
+    echo "OK   a sequence RIDES the backup (fc backs it up)"
+else
+    echo "DIFF sequence backup: [$fo]"; fail=1
+fi
+ran=$((ran + 1))
+sudo -n chmod 666 "$D/fc-gbak-seq.fbk" 2>/dev/null || chmod 666 "$D/fc-gbak-seq.fbk" 2>/dev/null
+"$FBSVCMGR" "$EMGR" user "$U" password "$P" action_restore dbname "$D/fc-gbak-seqr.fdb" bkp_file "$D/fc-gbak-seq.fbk" >/dev/null 2>&1
+grab "$D/fc-gbak-seqr.fdb"
+# two statements, not one row: two GEN_ID calls in one projection
+# evaluate in an order the engine does not promise, and the +3 bump
+# ran before the 0-read in the first version of this check
+got=$(printf 'SET HEADING OFF;\nSELECT GEN_ID(G, 0), GEN_ID(H, 0) FROM RDB$DATABASE;\nSELECT GEN_ID(H, 3) FROM RDB$DATABASE;\n' |
+    "$ISQL" -q -b -user "$U" -pas "$P" "$D/fc-gbak-seqr.fdb" 2>&1 | tr -s ' \n' ' ')
+if [ "$got" = " 7 497 500 " ]; then
+    echo "OK   the ENGINE restores fc's sequences - value 7 kept, H's next draw is 500"
+else
+    echo "DIFF engine restore of fc's sequences: [$got] (want ' 7 497 500 ')"; fail=1
+fi
+rm -f "$SEQDB" "$D/fc-gbak-seq.fbk" "$D/fc-gbak-seqr.fdb"
+
 refusal "a view" "CREATE VIEW VW AS SELECT X FROM T;"
 # a PRIMARY KEY and plain/unique indexes RIDE THE FILE now (rec_index +
 # the PRIMARY KEY rel_constraint) - what still refuses is the constraint
 # kinds whose meaning is more than an index
-refusal "a UNIQUE constraint" "CREATE TABLE UQT (X INTEGER NOT NULL, CONSTRAINT UQ_X UNIQUE (X));"
-refusal "a FOREIGN KEY" "CREATE TABLE PARENT (ID INTEGER NOT NULL PRIMARY KEY);
-CREATE TABLE CHILD (PID INTEGER REFERENCES PARENT (ID));"
-refusal "a CHECK constraint" "CREATE TABLE CKT (X INTEGER CHECK (X > 0));"
+# ~~UNIQUE and plain FOREIGN KEY refuse~~ - BOTH RIDE THE FILE now
+# (rel_constraint + ref_constraint + the FK index with its partner
+# att); proven by the ENGINE restoring fc's backup and ENFORCING both
+CONSDB="$D/fc-gbak-cons.fdb"; rm -f "$CONSDB" "$D/fc-gbak-cons.fbk" "$D/fc-gbak-consr.fdb"
+"$ISQL" -q -b -user "$U" -pas "$P" <<EOF >/dev/null 2>&1
+CREATE DATABASE '$CONSDB' USER '$U' PASSWORD '$P' PAGE_SIZE 8192;
+CREATE TABLE PARENT (ID INTEGER NOT NULL PRIMARY KEY, UX INTEGER NOT NULL, CONSTRAINT UQ_X UNIQUE (UX));
+CREATE TABLE CHILD (PID INTEGER NOT NULL, X INTEGER CHECK (X > 0),
+                    CONSTRAINT FK_C FOREIGN KEY (PID) REFERENCES PARENT (ID) ON DELETE CASCADE);
+COMMIT;
+INSERT INTO PARENT VALUES (1, 10);
+INSERT INTO PARENT VALUES (2, 20);
+INSERT INTO CHILD VALUES (1, 5);
+INSERT INTO CHILD VALUES (2, 7);
+COMMIT;
+EOF
+chmod 666 "$CONSDB"
+ran=$((ran + 1))
+fo=$(svc_backup "$FMGR" "$CONSDB" "$D/fc-gbak-cons.fbk")
+if [ "${fo##*rc=}" = "0" ]; then
+    echo "OK   UNIQUE, FK (CASCADE rule) and CHECK all RIDE the backup (fc backs them up)"
+else
+    echo "DIFF constraint backup: [$fo]"; fail=1
+fi
+ran=$((ran + 1))
+sudo -n chmod 666 "$D/fc-gbak-cons.fbk" 2>/dev/null || chmod 666 "$D/fc-gbak-cons.fbk" 2>/dev/null
+"$FBSVCMGR" "$EMGR" user "$U" password "$P" action_restore dbname "$D/fc-gbak-consr.fdb" bkp_file "$D/fc-gbak-cons.fbk" >/dev/null 2>&1
+grab "$D/fc-gbak-consr.fdb"
+viol=$(printf 'INSERT INTO PARENT VALUES (3, 10);\nINSERT INTO CHILD VALUES (99, 1);\nINSERT INTO CHILD VALUES (1, -5);\n' |
+    "$ISQL" -q -user "$U" -pas "$P" "$D/fc-gbak-consr.fdb" 2>&1 | grep -c "SQLSTATE = 23000")
+if [ "$viol" = "3" ]; then
+    echo "OK   the ENGINE restores fc's fbk and enforces ALL THREE (UNIQUE dup, dangling FK, CHECK violation)"
+else
+    echo "DIFF constraint enforcement after engine restore: 23000-count [$viol] (want 3)"; fail=1
+fi
+ran=$((ran + 1))
+printf 'DELETE FROM PARENT WHERE ID = 2;\nCOMMIT;\n' | "$ISQL" -q -user "$U" -pas "$P" "$D/fc-gbak-consr.fdb" >/dev/null 2>&1
+left=$(printf 'SET HEADING OFF;\nSELECT COUNT(*) FROM CHILD;\n' |
+    "$ISQL" -q -b -user "$U" -pas "$P" "$D/fc-gbak-consr.fdb" 2>&1 | tr -d ' \n')
+if [ "$left" = "1" ]; then
+    echo "OK   ... and the CASCADE fires through the carried trigger (parent 2's child went with it)"
+else
+    echo "DIFF cascade after engine restore: CHILD count [$left] (want 1)"; fail=1
+fi
+rm -f "$CONSDB" "$D/fc-gbak-cons.fbk" "$D/fc-gbak-consr.fdb"
 refusal "a trigger" "SET TERM ^;
 CREATE TRIGGER TR FOR T BEFORE INSERT AS BEGIN NEW.X = 1; END^
 SET TERM ;^"

@@ -70,6 +70,19 @@ CREATE TABLE KEYED (ID INTEGER NOT NULL PRIMARY KEY, W VARCHAR(8));
 CREATE INDEX KX_W ON KEYED (W);
 CREATE UNIQUE INDEX KU_2 ON KEYED (W, ID);
 CREATE TABLE BT (ID INTEGER, TXT BLOB SUB_TYPE TEXT, BIN BLOB SUB_TYPE 0, W VARCHAR(6));
+CREATE SEQUENCE SQ1;
+CREATE SEQUENCE SQ2 START WITH 500 INCREMENT BY 3;
+CREATE TABLE UPAR (ID INTEGER NOT NULL PRIMARY KEY, UX INTEGER NOT NULL, CONSTRAINT UQ_UX UNIQUE (UX));
+CREATE TABLE UCHILD (PID INTEGER NOT NULL, X INTEGER CHECK (X > 0),
+                     CONSTRAINT FK_UP FOREIGN KEY (PID) REFERENCES UPAR (ID) ON DELETE CASCADE);
+COMMIT;
+INSERT INTO UPAR VALUES (1, 10);
+INSERT INTO UPAR VALUES (2, 20);
+INSERT INTO UPAR VALUES (5, 50);
+INSERT INTO UCHILD VALUES (1, 4);
+INSERT INTO UCHILD VALUES (5, 6);
+COMMIT;
+SELECT GEN_ID(SQ1, 7) FROM RDB\$DATABASE;
 COMMIT;
 INSERT INTO KEYED VALUES (1, 'aa');
 INSERT INTO KEYED VALUES (2, 'bb');
@@ -118,6 +131,28 @@ blobs() { # <db file> - a digest of every blob: null/empty/short/30k
     printf 'SET HEADING OFF;\nSELECT ID, CHAR_LENGTH(TXT), CAST(SUBSTRING(TXT FROM 1 FOR 10) AS VARCHAR(10)), CAST(SUBSTRING(TXT FROM 29996) AS VARCHAR(5)), CAST(BIN AS VARCHAR(10)), W FROM BT ORDER BY ID;\n' |
         "$ISQL" -q -b -user "$U" -pas "$P" "$1" 2>&1 | tr -s ' \n' ' '
 }
+cons() { # <db> - the whole constraint family: catalog, the three
+         # violations, the valid row, and the CASCADE through the
+         # carried trigger
+    grab "$1"
+    local cat trg viol n
+    cat=$(printf 'SET HEADING OFF;\nSELECT TRIM(RDB$CONSTRAINT_NAME) FROM RDB$RELATION_CONSTRAINTS WHERE RDB$CONSTRAINT_TYPE IN (%s, %s, %s) ORDER BY 1;\n' "'UNIQUE'" "'FOREIGN KEY'" "'CHECK'" |
+        "$ISQL" -q -b -user "$U" -pas "$P" "$1" 2>&1 | tr -s ' \n' ' ')
+    trg=$(printf 'SET HEADING OFF;\nSELECT TRIM(RDB$TRIGGER_NAME) || RDB$SYSTEM_FLAG FROM RDB$TRIGGERS WHERE RDB$SYSTEM_FLAG IN (3, 4) ORDER BY 1;\n' |
+        "$ISQL" -q -b -user "$U" -pas "$P" "$1" 2>&1 | tr -s ' \n' ' ')
+    viol=$(printf 'INSERT INTO UPAR VALUES (3, 10);\nINSERT INTO UCHILD VALUES (99, 1);\nINSERT INTO UCHILD VALUES (1, -4);\nINSERT INTO UCHILD VALUES (2, 8);\n' |
+        "$ISQL" -q -user "$U" -pas "$P" "$1" 2>&1 | grep -c "SQLSTATE = 23000")
+    printf 'DELETE FROM UPAR WHERE ID = 5;\nCOMMIT;\n' |
+        "$ISQL" -q -user "$U" -pas "$P" "$1" >/dev/null 2>&1
+    n=$(printf 'SET HEADING OFF;\nSELECT COUNT(*) FROM UCHILD;\n' |
+        "$ISQL" -q -b -user "$U" -pas "$P" "$1" 2>&1 | tr -s ' \n' ' ')
+    printf '%s/%s/23000x%s/rows%s' "$cat" "$trg" "$viol" "$n"
+}
+gens() { # <db> - sequence catalog + CURRENT values (GEN_ID step 0)
+    grab "$1"
+    printf 'SET HEADING OFF;\nSELECT TRIM(RDB\$GENERATOR_NAME), RDB\$INITIAL_VALUE, RDB\$GENERATOR_INCREMENT FROM RDB\$GENERATORS WHERE RDB\$SYSTEM_FLAG = 0 ORDER BY 1;\nSELECT GEN_ID(SQ1, 0), GEN_ID(SQ2, 0) FROM RDB\$DATABASE;\n' |
+        "$ISQL" -q -b -user "$U" -pas "$P" "$1" 2>&1 | tr -s ' \n' ' '
+}
 pk_and_indexes() { # <db>: "dup-refusals/index-list"
     local dup ix
     dup=$(printf 'INSERT INTO KEYED VALUES (1, %s);\n' "'x'" |
@@ -149,6 +184,24 @@ bbase=$(blobs "$D/fc-gbr-r4.fdb")
 check "the BLOBS read identically from fc's restore of the engine's fbk" "$(blobs "$D/fc-gbr-r1.fdb")" "$bbase"
 check "...and from fc's round trip" "$(blobs "$D/fc-gbr-r2.fdb")" "$bbase"
 check "...and from the engine's restore of fc's fbk" "$(blobs "$D/fc-gbr-r3.fdb")" "$bbase"
+
+# the SEQUENCES: catalog row AND the current value out of the generator
+# vector, all four corners of the matrix reading the same numbers -
+# SQ1 advanced to 7 before the backup, SQ2 sits at 497 (START 500
+# INCREMENT 3, never drawn)
+gbase=$(gens "$SRC")
+check "sequences ride the engine's fbk through fc's restore" "$(gens "$D/fc-gbr-r1.fdb")" "$gbase"
+check "...and fc's own round trip" "$(gens "$D/fc-gbr-r2.fdb")" "$gbase"
+check "...and fc's fbk through the ENGINE's restore" "$(gens "$D/fc-gbr-r3.fdb")" "$gbase"
+check "...and the engine's own round trip agrees" "$(gens "$D/fc-gbr-r4.fdb")" "$gbase"
+
+# the CONSTRAINT FAMILY: UNIQUE + plain FK in every corner - catalog
+# rows present, the duplicate and the dangling PID both raise 23000,
+# and the VALID child row lands (enforcement, not refusal)
+cbase=$(cons "$D/fc-gbr-r4.fdb")
+check "UNIQUE + FK ride the engine's fbk through fc's restore" "$(cons "$D/fc-gbr-r1.fdb")" "$cbase"
+check "...and fc's own round trip" "$(cons "$D/fc-gbr-r2.fdb")" "$cbase"
+check "...and fc's fbk through the ENGINE's restore" "$(cons "$D/fc-gbr-r3.fdb")" "$cbase"
 for r in r1 r2; do
     ran=$((ran + 1))
     v=$("$GFIX" -v -full -user "$U" -pas "$P" "$D/fc-gbr-$r.fdb" 2>&1 | tr -d ' \n')
@@ -187,19 +240,23 @@ check "...and res_replace overwrites (fc)" \
 check "the replaced database still reads right" "$(rows "$D/fc-gbr-r1.fdb")" "$base"
 
 # --- 4. FAIL-CLOSED: an fbk carrying what this reader cannot ----------------
-# (a PRIMARY KEY rides the file now; the representative refusal is a
-# FOREIGN KEY, whose restore needs cross-table ordering)
+# (~~a CASCADE rule refuses~~ - the trigger records ride now; the
+# representative refusal is a USER trigger, whose body is arbitrary
+# PSQL this restore does not speak)
 rm -f "$D/fc-gbr-pk.fdb" "$D/fc-gbr-pk.fbk"
 "$ISQL" -q -b -user "$U" -pas "$P" <<EOF >/dev/null 2>&1
 CREATE DATABASE '$D/fc-gbr-pk.fdb' USER '$U' PASSWORD '$P' PAGE_SIZE 8192;
-CREATE TABLE PARENT (ID INTEGER NOT NULL PRIMARY KEY);
-CREATE TABLE CHILD (PID INTEGER REFERENCES PARENT (ID));
+CREATE TABLE T (X INTEGER);
+COMMIT;
+SET TERM ^;
+CREATE TRIGGER TRU FOR T BEFORE INSERT AS BEGIN NEW.X = 1; END^
+SET TERM ;^
 COMMIT;
 EOF
 chmod 666 "$D/fc-gbr-pk.fdb"
 svc "$EMGR" action_backup dbname "$D/fc-gbr-pk.fdb" bkp_file "$D/fc-gbr-pk.fbk" >/dev/null
 grab "$D/fc-gbr-pk.fbk"
-check "an fbk with a FOREIGN KEY refuses fc's restore whole" \
+check "an fbk with a USER trigger refuses fc's restore whole" \
     "$(svc "$FMGR" action_restore dbname "$D/fc-gbr-rpk.fdb" bkp_file "$D/fc-gbr-pk.fbk")" \
     "feature is not supported|rc=1"
 ran=$((ran + 1))

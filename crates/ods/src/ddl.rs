@@ -3367,7 +3367,7 @@ pub fn create_table(
         } else {
             fk.name.clone()
         };
-        write_foreign_key(file, page_size, &name, &fk_name, fk)?;
+        write_foreign_key_full(file, page_size, &name, &fk_name, fk, true)?;
     }
     advance_oldest_transactions(file, page_size)?;
     Ok(())
@@ -3499,6 +3499,96 @@ fn write_check(
         ])?;
     }
     Ok(())
+}
+
+/// One trigger row as a BACKUP carries it - a CHECK constraint's or a
+/// referential action's, stored VERBATIM: the BLR and source are the
+/// engine's own bytes off the file, not compiled here.
+pub struct CarriedTrigger {
+    pub name: String,
+    pub relation: String,
+    pub sequence: i64,
+    pub ttype: i64,
+    pub blr: Vec<u8>,
+    pub source: Vec<u8>,
+    pub system_flag: i64,
+    pub inactive: i64,
+    pub flags: Option<i64>,
+    pub valid_blr: Option<i64>,
+}
+
+/// Store one carried trigger row (gbak restore). The caller refreshes
+/// the relation runtime once per table when its triggers are in.
+pub fn restore_carried_trigger(
+    file: &mut crate::Image,
+    page_size: usize,
+    t: &CarriedTrigger,
+) -> Result<(), String> {
+    let trel = crate::resolve_relation(file, page_size, "RDB$TRIGGERS")
+        .ok_or("no RDB$TRIGGERS relation")?;
+    let src = dml::insert_blob_cs(file, page_size, trel, &[t.source.clone()], 1, 4)?;
+    let blr = dml::insert_blob(file, page_size, trel, &[t.blr.clone()], 2)?;
+    let mut vals: Vec<(&str, SysVal)> = vec![
+        ("RDB$TRIGGER_NAME", SysVal::S(&t.name)),
+        ("RDB$RELATION_NAME", SysVal::S(&t.relation)),
+        ("RDB$TRIGGER_SEQUENCE", SysVal::I(t.sequence)),
+        ("RDB$TRIGGER_TYPE", SysVal::I(t.ttype)),
+        ("RDB$TRIGGER_SOURCE", SysVal::B(blob_id_bytes(trel, src))),
+        ("RDB$TRIGGER_BLR", SysVal::B(blob_id_bytes(trel, blr))),
+        ("RDB$TRIGGER_INACTIVE", SysVal::I(t.inactive)),
+        ("RDB$SYSTEM_FLAG", SysVal::I(t.system_flag)),
+        ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
+    ];
+    if let Some(fl) = t.flags {
+        vals.push(("RDB$FLAGS", SysVal::I(fl)));
+    }
+    if let Some(v) = t.valid_blr {
+        vals.push(("RDB$VALID_BLR", SysVal::I(v)));
+    }
+    sys_insert(file, page_size, "RDB$TRIGGERS", trel, &vals)?;
+    Ok(())
+}
+
+/// Store a CHECK constraint's RDB$RELATION_CONSTRAINTS row (gbak
+/// restore; the chk rows and the triggers arrive separately, verbatim).
+pub fn restore_check_constraint_row(
+    file: &mut crate::Image,
+    page_size: usize,
+    cname: &str,
+    table: &str,
+) -> Result<(), String> {
+    sys_row_by_name(file, page_size, "RDB$RELATION_CONSTRAINTS", &[
+        ("RDB$CONSTRAINT_NAME", SysVal::S(cname)),
+        ("RDB$CONSTRAINT_TYPE", SysVal::S("CHECK")),
+        ("RDB$RELATION_NAME", SysVal::S(table)),
+        ("RDB$DEFERRABLE", SysVal::S("NO")),
+        ("RDB$INITIALLY_DEFERRED", SysVal::S("NO")),
+        ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
+    ])
+}
+
+/// Store one RDB$CHECK_CONSTRAINTS row verbatim (gbak restore).
+pub fn restore_chk_row(
+    file: &mut crate::Image,
+    page_size: usize,
+    cname: &str,
+    tname: &str,
+) -> Result<(), String> {
+    sys_row_by_name(file, page_size, "RDB$CHECK_CONSTRAINTS", &[
+        ("RDB$CONSTRAINT_NAME", SysVal::S(cname)),
+        ("RDB$TRIGGER_NAME", SysVal::S(tname)),
+        ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
+    ])
+}
+
+/// Refresh a relation's runtime summary - public for the gbak restore,
+/// which stores carried triggers and must make them FIRE.
+pub fn refresh_relation_runtime(
+    file: &mut crate::Image,
+    page_size: usize,
+    table: &str,
+) -> Result<(), String> {
+    update_relation_runtime(file, page_size, &table.trim().to_ascii_uppercase())
 }
 
 /// A user `CREATE TRIGGER`, compiled: the catalog values plus the three
@@ -4823,12 +4913,13 @@ fn update_relation_runtime(file: &mut crate::Image, page_size: usize, table: &st
 /// action - the system trigger(s) the engine synthesises on the referenced
 /// table (single column), refreshing that table's RDB$RUNTIME so they load.
 /// Shared by create_table and ALTER TABLE ADD CONSTRAINT.
-fn write_foreign_key(
+fn write_foreign_key_full(
     file: &mut crate::Image,
     page_size: usize,
     table: &str,
     fk_name: &str,
     fk: &ForeignKeyDef,
+    synth_triggers: bool,
 ) -> Result<(), String> {
     let (uq_constraint, partner_index) =
         find_partner_key(file, page_size, &fk.ref_table, &fk.ref_columns).ok_or_else(|| {
@@ -4869,7 +4960,9 @@ fn write_foreign_key(
     // referenced (parent) table - the update trigger first (the engine
     // numbers it CHECK_<lower>), then delete - and the parent's RDB$RUNTIME
     // is refreshed so the engine loads them
-    if fk.on_update != RefAction::Restrict || fk.on_delete != RefAction::Restrict {
+    if synth_triggers
+        && (fk.on_update != RefAction::Restrict || fk.on_delete != RefAction::Restrict)
+    {
         let parent = fk.ref_table.trim().to_ascii_uppercase();
         let pk_cols = if fk.ref_columns.is_empty() {
             index_segment_columns(file, page_size, &partner_index)?
@@ -4918,7 +5011,37 @@ pub fn alter_table_add_foreign_key(
     } else {
         fk.name.clone()
     };
-    write_foreign_key(file, page_size, &name, &fk_name, fk)?;
+    write_foreign_key_full(file, page_size, &name, &fk_name, fk, true)?;
+    advance_oldest_transactions(file, page_size)?;
+    Ok(())
+}
+
+/// The gbak-restore variant: the referential-action TRIGGERS arrive
+/// CARRIED in the file (the engine's own BLR, stored verbatim by the
+/// caller), so this must not synthesise its own - two CHECK_<n>
+/// triggers for one rule was the first restore's duplicate-key
+/// failure, measured.
+pub fn alter_table_add_foreign_key_carried(
+    file: &mut crate::Image,
+    page_size: usize,
+    table: &str,
+    fk: &ForeignKeyDef,
+) -> Result<(), String> {
+    let rel = crate::resolve_relation(file, page_size, table)
+        .ok_or_else(|| format!("table {} not found", table))?;
+    if rel < 128 {
+        return Err("system relations are read-only".into());
+    }
+    let name = table.trim().to_ascii_uppercase();
+    let fk_name = if fk.name.is_empty() {
+        let integ = next_numeric_suffix(
+            file, page_size, "RDB$RELATION_CONSTRAINTS", "RDB$CONSTRAINT_NAME", "INTEG_",
+        )?;
+        format!("INTEG_{}", integ)
+    } else {
+        fk.name.clone()
+    };
+    write_foreign_key_full(file, page_size, &name, &fk_name, fk, false)?;
     advance_oldest_transactions(file, page_size)?;
     Ok(())
 }
@@ -6095,6 +6218,21 @@ pub fn create_sequence(
 /// generator (modulo `MAX_SSHORT + 1`, never 0, never a live id); the row gets
 /// an `SQL$<n>` security class with the owner's ACL and a USAGE privilege; and
 /// the slot is primed to `initial - step` so the first draw yields `initial`.
+/// Set a sequence's CURRENT value - what `gbak`'s restore does with
+/// the value the backup carried (the engine's att_gen_value_int64):
+/// the slot in the generator vector, not any catalog column.
+pub fn set_sequence_value(
+    file: &mut crate::Image,
+    page_size: usize,
+    name: &str,
+    value: i64,
+) -> Result<(), String> {
+    let want = name.trim().trim_matches('"').to_ascii_uppercase();
+    let (id, _, _) = find_generator(file, page_size, &want)
+        .ok_or_else(|| format!("Sequence {} does not exist", want))?;
+    gen::write(file, page_size, id, value)
+}
+
 fn write_generator(
     file: &mut crate::Image,
     page_size: usize,

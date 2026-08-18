@@ -3085,6 +3085,20 @@ fn run_gbak_restore_core(
             .map(|h| h.page_size as usize)
             .ok_or("the fresh shell has no header")?;
         let mut file = fire_crab_ods::Image::from_bytes(&raw, page_size);
+        // SEQUENCES first - they are independent of the tables, and the
+        // backed-up CURRENT value is written into the generator vector
+        // after the catalog row exists (the value is not a catalog
+        // column; gbak carries it separately and so does this restore)
+        for g in &restored.generators {
+            fire_crab_ods::ddl::create_sequence(
+                &mut file,
+                page_size,
+                &g.name,
+                g.init,
+                Some(g.increment),
+            )?;
+            fire_crab_ods::ddl::set_sequence_value(&mut file, page_size, &g.name, g.value)?;
+        }
         for t in &restored.tables {
             // FIELD RECORDS ARRIVE BLOBS-FIRST (the engine's own file
             // order), and att 13 carries the true position - so the
@@ -3166,7 +3180,19 @@ fn run_gbak_restore_core(
             // enforces uniqueness and NOT NULL as it backfills); the rest
             // through create_index.
             for ix in &t.indexes {
+                if ix.foreign.is_some() {
+                    // a FOREIGN KEY's index is built by the FK
+                    // application below, once every table exists
+                    continue;
+                }
                 if t.pk_index.as_deref() == Some(ix.name.as_str()) {
+                    // the PK's INTEG_<n> name is REGENERATED, not the
+                    // file's: fc's create_table already burned INTEG
+                    // numbers for the NOT NULLs in ITS order, so the
+                    // file's name can collide (measured: passing it
+                    // failed the whole restore). The enforcement is
+                    // identical; the name drift is the recorded
+                    // fidelity note.
                     fire_crab_ods::ddl::alter_table_add_key(
                         &mut file,
                         page_size,
@@ -3175,6 +3201,25 @@ fn run_gbak_restore_core(
                             name: String::new(),
                             columns: ix.segments.clone(),
                             primary: true,
+                        },
+                    )?;
+                } else if let Some((cname, ..)) = restored
+                    .uniques
+                    .iter()
+                    .find(|(_, tbl, idx)| tbl == &t.name && idx == &ix.name)
+                {
+                    // a UNIQUE CONSTRAINT's index arrives through the
+                    // constraint, which backfills and enforces as the
+                    // PK's does - a create_index beside it would build
+                    // the same index twice
+                    fire_crab_ods::ddl::alter_table_add_key(
+                        &mut file,
+                        page_size,
+                        &t.name,
+                        &fire_crab_ods::ddl::KeyDef {
+                            name: cname.clone(),
+                            columns: ix.segments.clone(),
+                            primary: false,
                         },
                     )?;
                 } else {
@@ -3190,6 +3235,96 @@ fn run_gbak_restore_core(
                         None,
                     )?;
                 }
+            }
+        }
+        // FOREIGN KEYS LAST, once every table and key exists: the
+        // file names the REFERENCED CONSTRAINT; its table and columns
+        // resolve through the uq_map and the referenced index's own
+        // segments
+        for fk in &restored.fks {
+            if std::env::var("FC_SRV_TRACE").is_ok() {
+                eprintln!("[srv] restore fk {}", fk.name);
+            }
+            let (_, ref_table, ref_index) = restored
+                .uq_map
+                .iter()
+                .find(|(n, ..)| n == &fk.uq_constraint)
+                .ok_or_else(|| {
+                    format!("FK {} references unknown constraint {}", fk.name, fk.uq_constraint)
+                })?;
+            let ref_cols = restored
+                .tables
+                .iter()
+                .find(|t| &t.name == ref_table)
+                .and_then(|t| t.indexes.iter().find(|i| &i.name == ref_index))
+                .map(|i| i.segments.clone())
+                .ok_or_else(|| format!("FK {}: referenced index {} not found", fk.name, ref_index))?;
+            let cols = restored
+                .tables
+                .iter()
+                .find(|t| t.name == fk.table)
+                .and_then(|t| t.indexes.iter().find(|i| i.name == fk.index))
+                .map(|i| i.segments.clone())
+                .ok_or_else(|| format!("FK {}: its index {} not found", fk.name, fk.index))?;
+            fire_crab_ods::ddl::alter_table_add_foreign_key_carried(
+                &mut file,
+                page_size,
+                &fk.table,
+                &fire_crab_ods::ddl::ForeignKeyDef {
+                    name: fk.name.clone(),
+                    columns: cols,
+                    ref_table: ref_table.clone(),
+                    ref_columns: ref_cols,
+                    on_update: restore_ref_action(&fk.update_rule)?,
+                    on_delete: restore_ref_action(&fk.delete_rule)?,
+                },
+            )?;
+        }
+        // the CARRIED CONSTRAINT TRIGGERS - a CHECK's pair, a
+        // referential action's partner - stored VERBATIM (the blr and
+        // source are the engine's own bytes), then the CHECK
+        // constraint rows and every chk row that maps a constraint to
+        // its triggers. The NOT NULL chk rows are NOT re-stored:
+        // create_table already wrote those pairs for its columns.
+        for tr in &restored.triggers {
+            if std::env::var("FC_SRV_TRACE").is_ok() {
+                eprintln!("[srv] restore trigger {}", tr.name);
+            }
+            fire_crab_ods::ddl::restore_carried_trigger(
+                &mut file,
+                page_size,
+                &fire_crab_ods::ddl::CarriedTrigger {
+                    name: tr.name.clone(),
+                    relation: tr.relation.clone(),
+                    sequence: tr.sequence as i64,
+                    ttype: tr.ttype,
+                    blr: tr.blr.clone(),
+                    source: tr.source.clone(),
+                    system_flag: tr.system_flag as i64,
+                    inactive: tr.inactive as i64,
+                    flags: tr.flags.map(|v| v as i64),
+                    valid_blr: tr.valid_blr.map(|v| v as i64),
+                },
+            )?;
+        }
+        for (cname, table) in &restored.checks {
+            if std::env::var("FC_SRV_TRACE").is_ok() {
+                eprintln!("[srv] restore check row {} on {}", cname, table);
+            }
+            fire_crab_ods::ddl::restore_check_constraint_row(&mut file, page_size, cname, table)?;
+        }
+        for (cname, tname) in &restored.chk_rows {
+            let of_check = restored.checks.iter().any(|(c, _)| c == cname);
+            let of_fk = restored.fks.iter().any(|k| &k.name == cname);
+            if of_check || of_fk {
+                fire_crab_ods::ddl::restore_chk_row(&mut file, page_size, cname, tname)?;
+            }
+        }
+        let mut refreshed: Vec<&str> = Vec::new();
+        for tr in &restored.triggers {
+            if !tr.relation.is_empty() && !refreshed.contains(&tr.relation.as_str()) {
+                fire_crab_ods::ddl::refresh_relation_runtime(&mut file, page_size, &tr.relation)?;
+                refreshed.push(&tr.relation);
             }
         }
         std::fs::write(&db, &file.to_bytes()).map_err(|e| e.to_string())?;
@@ -45371,6 +45506,18 @@ fn insert_select(
     }
     undo_window_unwind(database, mark, false);
     Ok(n)
+}
+
+/// A backup's RDB$UPDATE_RULE / RDB$DELETE_RULE spelling as the
+/// RefAction it names. "NO ACTION" is the catalog's RESTRICT.
+fn restore_ref_action(rule: &str) -> Result<fire_crab_ods::ddl::RefAction, String> {
+    Ok(match rule.trim() {
+        "" | "RESTRICT" | "NO ACTION" => fire_crab_ods::ddl::RefAction::Restrict,
+        "CASCADE" => fire_crab_ods::ddl::RefAction::Cascade,
+        "SET NULL" => fire_crab_ods::ddl::RefAction::SetNull,
+        "SET DEFAULT" => fire_crab_ods::ddl::RefAction::SetDefault,
+        other => return Err(format!("unknown referential rule {}", other)),
+    })
 }
 
 /// A value as the SQL literal that names it. Types this server cannot

@@ -40,7 +40,10 @@ mod rec {
     pub const RELATION_END: u8 = 9;
     pub const END: u8 = 10;
     pub const PHYSICAL_DB: u8 = 14;
+    pub const TRIGGER: u8 = 13;
+    pub const GENERATOR: u8 = 26;
     pub const REL_CONSTRAINT: u8 = 31;
+    pub const REF_CONSTRAINT: u8 = 32;
     pub const CHK_CONSTRAINT: u8 = 33;
     pub const SCHEMA: u8 = 42;
 }
@@ -67,6 +70,24 @@ impl<'a> Rec<'a> {
         self.out.push(v);
         self
     }
+    /// a BLOB-carrying attribute: att, 0x04, the int32 byte count,
+    /// then the RAW bytes out-of-band (put_blr_blob/put_source_blob -
+    /// the reference trigger record's att 2 reads exactly so)
+    fn blob(mut self, att: u8, bytes: &[u8]) -> Self {
+        self.out.push(att);
+        self.out.push(4);
+        self.out.extend_from_slice(&(bytes.len() as i32).to_le_bytes());
+        self.out.extend_from_slice(bytes);
+        self
+    }
+
+    fn int64(mut self, att: u8, v: i64) -> Self {
+        self.out.push(att);
+        self.out.push(8);
+        self.out.extend_from_slice(&v.to_le_bytes());
+        self
+    }
+
     fn text(self, att: u8, s: &str) -> Self {
         let b = s.as_bytes();
         let n = b.len().min(255);
@@ -287,7 +308,6 @@ pub fn write_backup_verbose(
     for (what, rel_name) in [
         ("a stored procedure", "RDB$PROCEDURES"),
         ("a trigger", "RDB$TRIGGERS"),
-        ("a sequence", "RDB$GENERATORS"),
         ("an exception", "RDB$EXCEPTIONS"),
         ("a user function", "RDB$FUNCTIONS"),
         ("a role", "RDB$ROLES"),
@@ -302,6 +322,28 @@ pub fn write_backup_verbose(
     // constraint is more than its index - dropping either silently
     // changes what the schema MEANS).
     let constraints = read_constraints(image, page_size)?;
+    // the RDB$CHECK_CONSTRAINTS rows ride verbatim, catalog order
+    let chk_rows: Vec<(String, String)> = sys_rows(image, page_size, "RDB$CHECK_CONSTRAINTS")
+        .map(|(ccols, crows)| {
+            let cat = |n: &str| {
+                ccols.iter().find(|(c, _)| c.eq_ignore_ascii_case(n)).map(|(_, i)| *i)
+            };
+            let (Some(cn), Some(tn)) = (cat("RDB$CONSTRAINT_NAME"), cat("RDB$TRIGGER_NAME"))
+            else {
+                return Vec::new();
+            };
+            crows
+                .iter()
+                .filter_map(|r| {
+                    let c = text_opt(r, Some(cn))?;
+                    let t = text_opt(r, Some(tn))?;
+                    // system tables' own constraints stay home
+                    if c.starts_with("RDB$") { None } else { Some((c, t)) }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let triggers = read_triggers(image, page_size)?;
     // ...and the INDEXES, per relation, segments in order
     let indexes = read_indexes(image, page_size)?;
     // ...and USER DOMAINS: this writer invents its column sources
@@ -498,6 +540,30 @@ pub fn write_backup_verbose(
     log.push("gbak:writing types".into());
     log.push("gbak:writing filters".into());
     log.push("gbak:writing id generators".into());
+    for g in read_generators(image, page_size)? {
+        log.push(format!(
+            "gbak:    writing generator \"PUBLIC\".\"{}\" value {}",
+            g.name, g.value
+        ));
+        let mut r = Rec::new(&mut out, rec::GENERATOR)
+            .text(10, "PUBLIC")
+            .text(1, &g.name)
+            // the engine writes the value TWICE - backup.epp puts
+            // att_gen_value_int64 both inside and after its
+            // !gbl_sw_meta guard, and the reference bytes carry both
+            .int64(3, g.value)
+            .int64(3, g.value);
+        if let Some(sc) = &g.sec_class {
+            r = r.text(5, sc);
+        }
+        if let Some(ow) = &g.owner {
+            r = r.text(6, ow);
+        }
+        if let Some(init) = g.init {
+            r = r.int64(8, init);
+        }
+        r.int(9, g.increment).end();
+    }
     log.push("gbak:writing exceptions".into());
     log.push("gbak:writing functions".into());
     log.push("gbak:writing stored procedures".into());
@@ -529,7 +595,11 @@ pub fn write_backup_verbose(
             for seg in &ix.segments {
                 r = r.text(5, seg);
             }
-            r.int(7, ix.itype).end();
+            r = r.int(7, ix.itype);
+            if let Some(partner) = &ix.foreign {
+                r = r.text(14, "PUBLIC").text(8, partner);
+            }
+            r.end();
         }
         let descs: Vec<Descriptor> = cols.iter().map(|c| c.desc.clone()).collect();
         let rows = match tips.as_ref() {
@@ -619,6 +689,29 @@ pub fn write_backup_verbose(
     }
 
     log.push("gbak:writing triggers".into());
+    for t in &triggers {
+        log.push(format!(
+            "gbak:    writing trigger \"PUBLIC\".\"{}\"",
+            t.name
+        ));
+        let mut r = Rec::new(&mut out, rec::TRIGGER)
+            .text(20, "PUBLIC")
+            .text(4, &t.name)
+            .text(5, &t.relation)
+            .int(6, t.sequence)
+            .int(1, t.ttype as i32)
+            .blob(2, &t.blr)
+            .blob(10, &t.source)
+            .int(8, t.system_flag)
+            .int(9, t.inactive);
+        if let Some(fl) = t.flags {
+            r = r.int(12, fl);
+        }
+        if let Some(v) = t.valid_blr {
+            r = r.int(13, v);
+        }
+        r.end();
+    }
     log.push("gbak:writing trigger messages".into());
     log.push("gbak:writing security classes".into());
     log.push("gbak:writing table constraints".into());
@@ -628,40 +721,60 @@ pub fn write_backup_verbose(
     // invented: the PRIMARY KEY names its INDEX through att 6, and a
     // NOT NULL is a rel_constraint + chk_constraint pair whose second
     // record names the COLUMN.
+    // ALL the rel_constraint rows first, then the ref_constraint
+    // rows, then the chk_constraint rows - three blocks, the engine's
+    // own file order (the reference file's NOT NULL chk pairs sit
+    // AFTER the FK's ref record, not beside their rel rows)
     for c in &constraints {
         log.push(format!("gbak:writing constraint \"PUBLIC\".\"{}\"", c.name));
-        match c.kind {
-            UConsKind::PrimaryKey => {
-                Rec::new(&mut out, rec::REL_CONSTRAINT)
-                    .text(7, "PUBLIC")
-                    .text(1, &c.name)
-                    .text(2, "PRIMARY KEY")
-                    .text(3, &c.relation)
-                    .text(4, "NO")
-                    .text(5, "NO")
-                    .text(6, &c.index)
-                    .end();
-            }
-            UConsKind::NotNull => {
-                Rec::new(&mut out, rec::REL_CONSTRAINT)
-                    .text(7, "PUBLIC")
-                    .text(1, &c.name)
-                    .text(2, "NOT NULL")
-                    .text(3, &c.relation)
-                    .text(4, "NO")
-                    .text(5, "NO")
-                    .end();
-                Rec::new(&mut out, rec::CHK_CONSTRAINT)
-                    .text(3, "PUBLIC")
-                    .text(1, &c.name)
-                    .text(2, &c.column)
-                    .end();
-            }
+        let type_name = match &c.kind {
+            UConsKind::PrimaryKey => "PRIMARY KEY",
+            UConsKind::NotNull => "NOT NULL",
+            UConsKind::Unique => "UNIQUE",
+            UConsKind::Check => "CHECK",
+            UConsKind::ForeignKey { .. } => "FOREIGN KEY",
+        };
+        let mut r = Rec::new(&mut out, rec::REL_CONSTRAINT)
+            .text(7, "PUBLIC")
+            .text(1, &c.name)
+            .text(2, type_name)
+            .text(3, &c.relation)
+            .text(4, "NO")
+            .text(5, "NO");
+        if !matches!(c.kind, UConsKind::NotNull | UConsKind::Check) {
+            r = r.text(6, &c.index);
         }
+        r.end();
     }
 
     log.push("gbak:writing referential constraints".into());
+    for c in &constraints {
+        if let UConsKind::ForeignKey { uq_constraint, match_option, update_rule, delete_rule } =
+            &c.kind
+        {
+            Rec::new(&mut out, rec::REF_CONSTRAINT)
+                .text(6, "PUBLIC")
+                .text(1, &c.name)
+                .text(7, "PUBLIC")
+                .text(2, uq_constraint)
+                .text(3, match_option)
+                .text(4, update_rule)
+                .text(5, delete_rule)
+                .end();
+        }
+    }
     log.push("gbak:writing check constraints".into());
+    // EVERY RDB$CHECK_CONSTRAINTS row, in catalog row order - a NOT
+    // NULL's names its COLUMN, a CHECK's its two CHECK_<n> triggers,
+    // a referential action's the partner trigger (the reference file
+    // interleaves them exactly as the catalog stores them)
+    for (cname, tname) in &chk_rows {
+        Rec::new(&mut out, rec::CHK_CONSTRAINT)
+            .text(3, "PUBLIC")
+            .text(1, cname)
+            .text(2, tname)
+            .end();
+    }
     log.push("gbak:writing SQL roles".into());
     log.push("gbak:writing names mapping".into());
     log.push("gbak:writing publications".into());
@@ -684,12 +797,24 @@ struct UIndex {
     itype: i32,
     /// segment field names, in key order
     segments: Vec<String>,
+    /// the PARTNER index of a FOREIGN KEY's index (RDB$FOREIGN_KEY)
+    foreign: Option<String>,
 }
 
 #[derive(PartialEq)]
 enum UConsKind {
     PrimaryKey,
     NotNull,
+    Unique,
+    Check,
+    /// referenced-constraint name + MATCH/UPDATE/DELETE rules, spelled
+    /// the way RDB$REF_CONSTRAINTS stores them ("FULL", "RESTRICT")
+    ForeignKey {
+        uq_constraint: String,
+        match_option: String,
+        update_rule: String,
+        delete_rule: String,
+    },
 }
 
 /// One table constraint, in catalog row order - which IS the file
@@ -745,6 +870,36 @@ fn read_constraints(image: &fire_crab_ods::Image, page_size: usize) -> Result<Ve
             crows.iter().map(|r| (t(r, cn), t(r, tn))).collect()
         })
         .unwrap_or_default();
+    // the FK half of the pair: RDB$REF_CONSTRAINTS names the
+    // REFERENCED constraint and the rules
+    let refs: Vec<(String, String, String, String, String)> =
+        sys_rows(image, page_size, "RDB$REF_CONSTRAINTS")
+            .map(|(rcols, rrows)| {
+                let rat = |n: &str| {
+                    rcols
+                        .iter()
+                        .find(|(c, _)| c.eq_ignore_ascii_case(n))
+                        .map(|(_, i)| *i)
+                };
+                let t = |r: &fire_crab_ods::tra::VisibleRow, i: Option<usize>| match i
+                    .and_then(|i| r.values.get(i))
+                {
+                    Some(fire_crab_ods::format::Value::Text(t)) => t.trim_end().to_string(),
+                    _ => String::new(),
+                };
+                let (cn, uq, mo, ur, dr) = (
+                    rat("RDB$CONSTRAINT_NAME"),
+                    rat("RDB$CONST_NAME_UQ"),
+                    rat("RDB$MATCH_OPTION"),
+                    rat("RDB$UPDATE_RULE"),
+                    rat("RDB$DELETE_RULE"),
+                );
+                rrows
+                    .iter()
+                    .map(|r| (t(r, cn), t(r, uq), t(r, mo), t(r, ur), t(r, dr)))
+                    .collect()
+            })
+            .unwrap_or_default();
     // CATALOG ROW ORDER IS THE FILE ORDER: the engine writes its
     // rel_constraint records straight off RDB$RELATION_CONSTRAINTS, so
     // a NOT NULL created before the PRIMARY KEY rides before it - the
@@ -758,6 +913,42 @@ fn read_constraints(image: &fire_crab_ods::Image, page_size: usize) -> Result<Ve
         let kind = text(r, type_at);
         let name = text(r, name_at);
         match kind.as_str() {
+            "CHECK" => out.push(UCons {
+                name,
+                kind: UConsKind::Check,
+                relation: rel,
+                index: String::new(),
+                column: String::new(),
+            }),
+            "UNIQUE" => out.push(UCons {
+                name,
+                kind: UConsKind::Unique,
+                relation: rel,
+                index: index_at.map(|i| text(r, i)).unwrap_or_default(),
+                column: String::new(),
+            }),
+            "FOREIGN KEY" => {
+                let rf = refs
+                    .iter()
+                    .find(|(n, ..)| n == &name)
+                    .ok_or_else(|| {
+                        Refused(format!("FK {} has no RDB$REF_CONSTRAINTS row", name))
+                    })?;
+                // every rule rides now - a CASCADE's enforcement is a
+                // system trigger, and the trigger records ride too
+                out.push(UCons {
+                    name,
+                    kind: UConsKind::ForeignKey {
+                        uq_constraint: rf.1.clone(),
+                        match_option: rf.2.clone(),
+                        update_rule: rf.3.clone(),
+                        delete_rule: rf.4.clone(),
+                    },
+                    relation: rel,
+                    index: index_at.map(|i| text(r, i)).unwrap_or_default(),
+                    column: String::new(),
+                });
+            }
             "NOT NULL" => out.push(UCons {
                 column: col_of
                     .iter()
@@ -834,13 +1025,12 @@ fn read_indexes(image: &fire_crab_ods::Image, page_size: usize) -> Result<Vec<UI
             continue;
         }
         let name = text(r, name_at);
-        if fk_at.is_some_and(|i| matches!(r.values.get(i), Some(fire_crab_ods::format::Value::Text(_))))
-        {
-            return Err(Refused(format!(
-                "index {} backs a FOREIGN KEY - outside this backup's surface",
-                name
-            )));
-        }
+        // an FK's index carries its PARTNER index name (att 8 + the
+        // schema att 14, both in the reference bytes)
+        let foreign = match fk_at.and_then(|i| r.values.get(i)) {
+            Some(fire_crab_ods::format::Value::Text(t)) => Some(t.trim_end().to_string()),
+            _ => None,
+        };
         if num(r, inactive_at) != 0 {
             return Err(Refused(format!(
                 "index {} is inactive - a state this backup cannot say",
@@ -859,6 +1049,7 @@ fn read_indexes(image: &fire_crab_ods::Image, page_size: usize) -> Result<Vec<UI
             unique: num(r, uniq_at) != 0,
             itype: num(r, type_at) as i32,
             segments: mine.into_iter().map(|(_, f)| f).collect(),
+            foreign,
         });
     }
     Ok(out)
@@ -932,6 +1123,142 @@ fn user_rows_in(image: &fire_crab_ods::Image, page_size: usize, rel_name: &str) 
             )
         })
         .count() as u64
+}
+
+/// One user SEQUENCE as the backup carries it: the catalog row plus
+/// the CURRENT VALUE out of the generator vector (`gen::read` - the
+/// value is not a catalog column).
+struct UGen {
+    name: String,
+    value: i64,
+    init: Option<i64>,
+    increment: i32,
+    sec_class: Option<String>,
+    owner: Option<String>,
+}
+
+/// One RDB$TRIGGERS row as the backup carries it - the CONSTRAINT
+/// triggers (system flag 3 = CHECK, 4 = referential action); a USER
+/// trigger (flag 0/NULL) never reaches here, the surface check
+/// refuses it upstream.
+struct UTrig {
+    name: String,
+    relation: String,
+    sequence: i32,
+    ttype: i64,
+    blr: Vec<u8>,
+    /// the source text; the file carries it NUL-terminated
+    source: Vec<u8>,
+    system_flag: i32,
+    inactive: i32,
+    flags: Option<i32>,
+    valid_blr: Option<i32>,
+}
+
+fn read_triggers(
+    image: &fire_crab_ods::Image,
+    page_size: usize,
+) -> Result<Vec<UTrig>, Refused> {
+    let Some((cols, rows)) = sys_rows(image, page_size, "RDB$TRIGGERS") else {
+        return Ok(Vec::new());
+    };
+    let trel = fire_crab_ods::resolve_relation(image, page_size, "RDB$TRIGGERS")
+        .ok_or_else(|| Refused("no RDB$TRIGGERS relation".into()))?;
+    let at = |n: &str| cols.iter().find(|(c, _)| c.eq_ignore_ascii_case(n)).map(|(_, i)| *i);
+    let int = |r: &fire_crab_ods::tra::VisibleRow, i: Option<usize>| match i
+        .and_then(|i| r.values.get(i))
+    {
+        Some(fire_crab_ods::format::Value::Int(n)) => Some(*n),
+        _ => None,
+    };
+    let blob = |r: &fire_crab_ods::tra::VisibleRow, i: Option<usize>| match i
+        .and_then(|i| r.values.get(i))
+    {
+        Some(fire_crab_ods::format::Value::Blob(_, num)) => {
+            fire_crab_blb::read_blob_content(image, page_size, trel, *num)
+        }
+        _ => None,
+    };
+    let mut out = Vec::new();
+    for r in &rows {
+        let flag = int(r, at("RDB$SYSTEM_FLAG")).unwrap_or(0);
+        if flag == 1 || flag == 0 {
+            continue; // real system triggers never ride; user ones refused upstream
+        }
+        let Some(name) = text_opt(r, at("RDB$TRIGGER_NAME")) else { continue };
+        let blr = blob(r, at("RDB$TRIGGER_BLR")).ok_or_else(|| {
+            Refused(format!("trigger {}: its BLR blob is unreadable", name))
+        })?;
+        let mut source = blob(r, at("RDB$TRIGGER_SOURCE")).unwrap_or_default();
+        source.push(0); // the file carries the text NUL-terminated
+        out.push(UTrig {
+            relation: text_opt(r, at("RDB$RELATION_NAME")).unwrap_or_default(),
+            sequence: int(r, at("RDB$TRIGGER_SEQUENCE")).unwrap_or(0) as i32,
+            ttype: int(r, at("RDB$TRIGGER_TYPE")).unwrap_or(0),
+            system_flag: flag as i32,
+            inactive: int(r, at("RDB$TRIGGER_INACTIVE")).unwrap_or(0) as i32,
+            flags: int(r, at("RDB$FLAGS")).map(|v| v as i32),
+            valid_blr: int(r, at("RDB$VALID_BLR")).map(|v| v as i32),
+            name,
+            blr,
+            source,
+        });
+    }
+    Ok(out)
+}
+
+fn read_generators(
+    image: &fire_crab_ods::Image,
+    page_size: usize,
+) -> Result<Vec<UGen>, Refused> {
+    let Some((cols, rows)) = sys_rows(image, page_size, "RDB$GENERATORS") else {
+        return Err(Refused("RDB$GENERATORS is unreadable".into()));
+    };
+    let at = |n: &str| cols.iter().find(|(c, _)| c.eq_ignore_ascii_case(n)).map(|(_, i)| *i);
+    let (name_at, id_at) = match (at("RDB$GENERATOR_NAME"), at("RDB$GENERATOR_ID")) {
+        (Some(n), Some(i)) => (n, i),
+        _ => return Err(Refused("RDB$GENERATORS has no name/id columns".into())),
+    };
+    let flag_at = at("RDB$SYSTEM_FLAG");
+    let init_at = at("RDB$INITIAL_VALUE");
+    let inc_at = at("RDB$GENERATOR_INCREMENT");
+    let sec_at = at("RDB$SECURITY_CLASS");
+    let own_at = at("RDB$OWNER_NAME");
+    let int = |r: &fire_crab_ods::tra::VisibleRow, i: Option<usize>| match i
+        .and_then(|i| r.values.get(i))
+    {
+        Some(fire_crab_ods::format::Value::Int(n)) => Some(*n),
+        _ => None,
+    };
+    let mut out = Vec::new();
+    for r in &rows {
+        if matches!(flag_at.and_then(|i| r.values.get(i)),
+            Some(fire_crab_ods::format::Value::Int(n)) if *n != 0)
+        {
+            continue;
+        }
+        let (Some(name), Some(id)) = (text_opt(r, Some(name_at)), int(r, Some(id_at))) else {
+            return Err(Refused("a generator row is missing its name or id".into()));
+        };
+        out.push(UGen {
+            name,
+            value: fire_crab_ods::gen::read(image, page_size, id),
+            init: int(r, init_at),
+            increment: int(r, inc_at).unwrap_or(1) as i32,
+            sec_class: text_opt(r, sec_at),
+            owner: text_opt(r, own_at),
+        });
+    }
+    // the reference file carries them in creation order, which is the
+    // storage order an append-only system relation walks
+    Ok(out)
+}
+
+fn text_opt(r: &fire_crab_ods::tra::VisibleRow, i: Option<usize>) -> Option<String> {
+    match i.and_then(|i| r.values.get(i)) {
+        Some(fire_crab_ods::format::Value::Text(t)) => Some(t.trim_end().to_string()),
+        _ => None,
+    }
 }
 
 /// The user TABLES - and only tables: a VIEW in the list refuses the
@@ -1100,6 +1427,9 @@ pub struct RIndex {
     pub unique: bool,
     pub descending: bool,
     pub segments: Vec<String>,
+    /// a FOREIGN KEY index's PARTNER index name (att 8) - such an
+    /// index is built by the FK application, not the index backfill
+    pub foreign: Option<String>,
 }
 
 /// One restored table.
@@ -1125,9 +1455,64 @@ pub struct Restored {
     /// verbose restore narrates that order
     pub data_order: Vec<usize>,
     pub tables: Vec<RTable>,
+    /// user sequences: name, CURRENT value, initial value, increment -
+    /// the current value comes off the generator vector, not the
+    /// catalog, and the restore writes it back there
+    pub generators: Vec<RGen>,
+    /// UNIQUE constraints: (constraint name, table, index name)
+    pub uniques: Vec<(String, String, String)>,
+    /// FOREIGN KEY constraints, applied AFTER every table exists
+    pub fks: Vec<RFk>,
+    /// every keyed constraint's (name, table, index) - PRIMARY KEY and
+    /// UNIQUE alike - what an RFk's `uq_constraint` resolves through
+    pub uq_map: Vec<(String, String, String)>,
+    /// CHECK constraints: (constraint name, table)
+    pub checks: Vec<(String, String)>,
+    /// the RDB$CHECK_CONSTRAINTS rows verbatim: (constraint, trigger-
+    /// or-column name) - NOT NULL folding reads it, and the CHECK/FK
+    /// application maps constraints to their carried triggers by it
+    pub chk_rows: Vec<(String, String)>,
+    /// the carried constraint triggers, file order
+    pub triggers: Vec<RTrigger>,
     /// privilege records seen and set aside - the count keeps the
     /// omission visible in the trace instead of silent
     pub privileges_skipped: u64,
+}
+
+/// One restored FOREIGN KEY.
+pub struct RFk {
+    pub name: String,
+    pub table: String,
+    /// the FK's own index name
+    pub index: String,
+    /// the referenced PRIMARY KEY / UNIQUE constraint's name
+    pub uq_constraint: String,
+    /// RDB$UPDATE_RULE / RDB$DELETE_RULE as the file spells them
+    pub update_rule: String,
+    pub delete_rule: String,
+}
+
+/// One carried trigger row (a CHECK's or a referential action's).
+pub struct RTrigger {
+    pub name: String,
+    pub relation: String,
+    pub sequence: i32,
+    pub ttype: i64,
+    pub blr: Vec<u8>,
+    /// NUL-terminated in the file; stored without the terminator
+    pub source: Vec<u8>,
+    pub system_flag: i32,
+    pub inactive: i32,
+    pub flags: Option<i32>,
+    pub valid_blr: Option<i32>,
+}
+
+/// One restored sequence.
+pub struct RGen {
+    pub name: String,
+    pub value: i64,
+    pub init: Option<i64>,
+    pub increment: i64,
 }
 
 /// One parsed attribute.
@@ -1243,6 +1628,13 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
         domains: Vec::new(),
         data_order: Vec::new(),
         tables: Vec::new(),
+        generators: Vec::new(),
+        uniques: Vec::new(),
+        fks: Vec::new(),
+        uq_map: Vec::new(),
+        checks: Vec::new(),
+        chk_rows: Vec::new(),
+        triggers: Vec::new(),
         privileges_skipped: 0,
     };
     // (schema, source name) -> not-null flag learned from constraints
@@ -1289,6 +1681,112 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                 if let Some(a) = att(&atts, 1) {
                     out.domains.push(a.text());
                 }
+            }
+            rec::TRIGGER => {
+                // its BLR and SOURCE attributes carry an int32 byte
+                // count and the RAW bytes OUT-OF-BAND, so the generic
+                // attribute walk cannot read this record
+                let mut tr = RTrigger {
+                    name: String::new(),
+                    relation: String::new(),
+                    sequence: 0,
+                    ttype: 0,
+                    blr: Vec::new(),
+                    source: Vec::new(),
+                    system_flag: 0,
+                    inactive: 0,
+                    flags: None,
+                    valid_blr: None,
+                };
+                loop {
+                    let tag = *f
+                        .get(at)
+                        .ok_or_else(|| Refused("truncated trigger record".into()))?;
+                    at += 1;
+                    if tag == 0 {
+                        break;
+                    }
+                    let len = *f
+                        .get(at)
+                        .ok_or_else(|| Refused("truncated trigger attribute".into()))?
+                        as usize;
+                    at += 1;
+                    let data = f
+                        .get(at..at + len)
+                        .ok_or_else(|| Refused("truncated trigger attribute".into()))?
+                        .to_vec();
+                    at += len;
+                    let as_int = |d: &[u8]| {
+                        let mut v: i64 = 0;
+                        for (k, b) in d.iter().enumerate().take(8) {
+                            v |= (*b as i64) << (8 * k);
+                        }
+                        v
+                    };
+                    match tag {
+                        2 | 7 | 10 | 11 | 14 => {
+                            let n = as_int(&data) as usize;
+                            let raw = f
+                                .get(at..at + n)
+                                .ok_or_else(|| Refused("truncated trigger blob".into()))?
+                                .to_vec();
+                            at += n;
+                            match tag {
+                                2 => tr.blr = raw,
+                                10 => {
+                                    tr.source = raw;
+                                    if tr.source.last() == Some(&0) {
+                                        tr.source.pop();
+                                    }
+                                }
+                                _ => {} // descriptions/debug info set aside
+                            }
+                        }
+                        4 => tr.name = String::from_utf8_lossy(&data).into_owned(),
+                        5 => tr.relation = String::from_utf8_lossy(&data).into_owned(),
+                        6 => tr.sequence = as_int(&data) as i32,
+                        1 => tr.ttype = as_int(&data),
+                        16 => tr.ttype = as_int(&data),
+                        8 => tr.system_flag = as_int(&data) as i32,
+                        9 => tr.inactive = as_int(&data) as i32,
+                        12 => tr.flags = Some(as_int(&data) as i32),
+                        13 => tr.valid_blr = Some(as_int(&data) as i32),
+                        20 => {} // schema name: PUBLIC
+                        other => {
+                            return Err(Refused(format!(
+                                "trigger {}: attribute {} is outside this restore's surface",
+                                tr.name, other
+                            )));
+                        }
+                    }
+                }
+                if tr.system_flag == 0 {
+                    return Err(Refused(format!(
+                        "trigger {} is a USER trigger - outside this restore's surface",
+                        tr.name
+                    )));
+                }
+                out.triggers.push(tr);
+            }
+            rec::GENERATOR => {
+                let atts = read_atts(f, &mut at)?;
+                let name = att(&atts, 1)
+                    .map(|a| a.text())
+                    .ok_or_else(|| Refused("a generator with no name".into()))?;
+                // att 4 is a description BLOB whose framing this walk
+                // does not speak - refuse rather than mis-step the file
+                if att(&atts, 4).is_some() {
+                    return Err(Refused(format!(
+                        "generator {} carries a description blob",
+                        name
+                    )));
+                }
+                out.generators.push(RGen {
+                    value: att(&atts, 3).map(|a| a.int()).unwrap_or(0),
+                    init: att(&atts, 8).map(|a| a.int()),
+                    increment: att(&atts, 9).map(|a| a.int()).unwrap_or(1),
+                    name,
+                });
             }
             rec::RELATION => {
                 let atts = read_atts(f, &mut at)?;
@@ -1378,6 +1876,7 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                     unique: att(&atts, 4).map(|a| a.int() == 1).unwrap_or(false),
                     descending: itype == 1,
                     segments,
+                    foreign: att(&atts, 8).map(|a| a.text()),
                 });
             }
             rec::DATA => {
@@ -1497,8 +1996,30 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                     "PRIMARY KEY" => {
                         let index = att(&atts, 6).map(|a| a.text()).unwrap_or_default();
                         if let Some(t) = out.tables.iter_mut().find(|t| t.name == table) {
-                            t.pk_index = Some(index);
+                            t.pk_index = Some(index.clone());
                         }
+                        out.uq_map.push((cname, table, index));
+                    }
+                    "UNIQUE" => {
+                        let index = att(&atts, 6).map(|a| a.text()).unwrap_or_default();
+                        out.uq_map.push((cname.clone(), table.clone(), index.clone()));
+                        out.uniques.push((cname, table, index));
+                    }
+                    "CHECK" => {
+                        out.checks.push((cname, table));
+                    }
+                    "FOREIGN KEY" => {
+                        let index = att(&atts, 6).map(|a| a.text()).unwrap_or_default();
+                        // the rules arrive in the rec 32 that follows;
+                        // uq_constraint is patched there
+                        out.fks.push(RFk {
+                            name: cname,
+                            table,
+                            index,
+                            uq_constraint: String::new(),
+                            update_rule: String::new(),
+                            delete_rule: String::new(),
+                        });
                     }
                     other => {
                         // UNIQUE / FOREIGN KEY / CHECK are their own
@@ -1511,11 +2032,32 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                     }
                 }
             }
+            rec::REF_CONSTRAINT => {
+                let atts = read_atts(f, &mut at)?;
+                let cname = att(&atts, 1).map(|a| a.text()).unwrap_or_default();
+                let uq = att(&atts, 2).map(|a| a.text()).unwrap_or_default();
+                let update = att(&atts, 4).map(|a| a.text()).unwrap_or_default();
+                let delete = att(&atts, 5).map(|a| a.text()).unwrap_or_default();
+                match out.fks.iter_mut().find(|k| k.name == cname) {
+                    Some(k) => {
+                        k.uq_constraint = uq;
+                        k.update_rule = update;
+                        k.delete_rule = delete;
+                    }
+                    None => {
+                        return Err(Refused(format!(
+                            "a referential record for unknown FK {}",
+                            cname
+                        )))
+                    }
+                }
+            }
             rec::CHK_CONSTRAINT => {
                 let atts = read_atts(f, &mut at)?;
                 let cname = att(&atts, 1).map(|a| a.text()).unwrap_or_default();
                 let col = att(&atts, 2).map(|a| a.text()).unwrap_or_default();
-                cons_column.push((cname, col));
+                cons_column.push((cname.clone(), col.clone()));
+                out.chk_rows.push((cname, col));
             }
             22 => {
                 // rec_user_privilege: parsed and set aside. GRANTs are
@@ -1643,5 +2185,65 @@ mod read_tests {
         let end = bad.len() - 1;
         bad[end] = 13; // rec_trigger where rec_end was
         assert!(read_backup(&bad).is_err());
+    }
+}
+
+#[cfg(test)]
+mod trigger_tests {
+    use super::*;
+
+    #[test]
+    fn a_trigger_record_walks_and_round_trips() {
+        // the reference record's shape: schema, name, relation,
+        // sequence, type, BLR (int32-framed + raw), source2 (the same,
+        // NUL-terminated), system flag, inactive, flags, valid_blr
+        let mut f = Vec::new();
+        Rec::new(&mut f, rec::BURP).int(2, 12).int(4, 1).int(5, 1).end();
+        Rec::new(&mut f, rec::PHYSICAL_DB).int(5, 8192).end();
+        let blr: &[u8] = &[5, 2, 8, 52, 76];
+        Rec::new(&mut f, rec::TRIGGER)
+            .text(20, "PUBLIC")
+            .text(4, "CHECK_1")
+            .text(5, "CHILD")
+            .int(6, 0)
+            .int(1, 1)
+            .blob(2, blr)
+            .blob(10, b"CHECK (X > 0)\0")
+            .int(8, 3)
+            .int(9, 0)
+            .int(12, 1)
+            .int(13, 1)
+            .end();
+        f.push(rec::END);
+        let r = read_backup(&f).expect("parses");
+        assert_eq!(r.triggers.len(), 1);
+        let t = &r.triggers[0];
+        assert_eq!(t.name, "CHECK_1");
+        assert_eq!(t.relation, "CHILD");
+        assert_eq!(t.ttype, 1);
+        assert_eq!(t.blr, blr);
+        // the NUL terminator is the FILE's, not the source's
+        assert_eq!(t.source, b"CHECK (X > 0)");
+        assert_eq!(t.system_flag, 3);
+        assert_eq!((t.flags, t.valid_blr), (Some(1), Some(1)));
+    }
+
+    #[test]
+    fn a_user_trigger_refuses_typed() {
+        let mut f = Vec::new();
+        Rec::new(&mut f, rec::BURP).int(2, 12).int(4, 1).int(5, 1).end();
+        Rec::new(&mut f, rec::TRIGGER)
+            .text(4, "TR_USER")
+            .text(5, "T")
+            .int(1, 1)
+            .blob(2, &[5, 2, 76])
+            .int(8, 0)
+            .end();
+        f.push(rec::END);
+        let e = match read_backup(&f) {
+            Err(e) => e,
+            Ok(_) => panic!("a user trigger must refuse"),
+        };
+        assert!(e.0.contains("USER trigger"), "{}", e.0);
     }
 }
