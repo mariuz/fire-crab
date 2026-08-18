@@ -8154,6 +8154,36 @@ pub fn mint_carrier_domain(
     Ok(dom)
 }
 
+/// Store a COMMENT: write `text` as a subtype-1 blob into the
+/// `RDB$DESCRIPTION` column of the catalog row matching every
+/// `(column, value)` pair. The restore's generic description pass -
+/// one helper, every commentable family.
+pub fn set_catalog_description(
+    file: &mut crate::Image,
+    page_size: usize,
+    rel_name: &str,
+    matches: &[(&str, &str)],
+    text: &str,
+) -> Result<(), String> {
+    let rel = crate::resolve_relation(file, page_size, rel_name)
+        .ok_or_else(|| format!("no {} relation", rel_name))?;
+    let fids: Vec<(usize, String)> = matches
+        .iter()
+        .map(|(col, val)| {
+            sys_fid(file, page_size, rel_name, col).map(|f| (f, val.trim().to_ascii_uppercase()))
+        })
+        .collect::<Result<_, _>>()?;
+    let blob = dml::insert_blob_cs(file, page_size, rel, &[text.as_bytes().to_vec()], 1, 4)?;
+    patch_sys_row(
+        file,
+        page_size,
+        rel_name,
+        rel,
+        move |v| fids.iter().all(|(f, want)| text_eq(v.get(*f), want)),
+        &[("RDB$DESCRIPTION", SysVal::B(blob_id_bytes(rel, blob)))],
+    )
+}
+
 /// Patch a relation's `RDB$DBKEY_LENGTH`. The engine's own RESTORE of
 /// a GTT writes 0 where live DDL writes 8 (measured on a round trip) -
 /// fc's restore mirrors the restored catalog.

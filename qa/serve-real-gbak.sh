@@ -534,6 +534,92 @@ else
 fi
 rm -f "$EXVDB" "$D/fc-gbak-exv.fbk" "$D/fc-gbak-exvr.fdb"
 
+# COMMENTS RIDE - every commentable family of the carried surface in
+# one fixture (description2 blob atts, measured per record family):
+# table 13, column 35, view 13, view column 35, index 9, sequence 4,
+# exception 4, procedure 5, parameter 6, function 9, trigger 11,
+# role 3. A COMMENT on an invented RDB$n domain refuses typed - it
+# cannot follow the renumbering a restore performs.
+DSDB="$D/fc-gbak-ds.fdb"; rm -f "$DSDB" "$D/fc-gbak-ds.fbk" "$D/fc-gbak-dsr.fdb"
+"$ISQL" -q -b -user "$U" -pas "$P" <<EOF >/dev/null 2>&1
+CREATE DATABASE '$DSDB' USER '$U' PASSWORD '$P' PAGE_SIZE 8192;
+CREATE TABLE T (X INTEGER, Y VARCHAR(6));
+CREATE INDEX IX_T ON T (X);
+COMMIT;
+CREATE SEQUENCE SQ;
+CREATE EXCEPTION E_D 'boom';
+COMMIT;
+SET TERM ^;
+CREATE PROCEDURE PP (B INTEGER) RETURNS (C INTEGER) AS BEGIN C = B; SUSPEND; END^
+CREATE FUNCTION FF (A INTEGER) RETURNS INTEGER AS BEGIN RETURN A; END^
+CREATE TRIGGER TG FOR T BEFORE INSERT AS BEGIN NEW.X = COALESCE(NEW.X, 0); END^
+SET TERM ;^
+CREATE VIEW VV (VX) AS SELECT X FROM T;
+CREATE ROLE R_D;
+COMMIT;
+COMMENT ON TABLE T IS 'table words';
+COMMENT ON COLUMN T.X IS 'column words';
+COMMENT ON VIEW VV IS 'view words';
+COMMENT ON COLUMN VV.VX IS 'vcol words';
+COMMENT ON INDEX IX_T IS 'index words';
+COMMENT ON SEQUENCE SQ IS 'seq words';
+COMMENT ON EXCEPTION E_D IS 'exc words';
+COMMENT ON PROCEDURE PP IS 'proc words';
+COMMENT ON PARAMETER PP.B IS 'parm words';
+COMMENT ON FUNCTION FF IS 'fn words';
+COMMENT ON TRIGGER TG IS 'trg words';
+COMMENT ON ROLE R_D IS 'role words';
+COMMIT;
+EOF
+chmod 666 "$DSDB"
+ran=$((ran + 1))
+fo=$(svc_backup "$FMGR" "$DSDB" "$D/fc-gbak-ds.fbk")
+if [ "${fo##*rc=}" = "0" ]; then
+    echo "OK   COMMENTS on all twelve families ride the backup (fc backs them up)"
+else
+    echo "DIFF comment backup: [$fo]"; fail=1
+fi
+ran=$((ran + 1))
+sudo -n chmod 666 "$D/fc-gbak-ds.fbk" 2>/dev/null || chmod 666 "$D/fc-gbak-ds.fbk" 2>/dev/null
+"$FBSVCMGR" "$EMGR" user "$U" password "$P" action_restore dbname "$D/fc-gbak-dsr.fdb" bkp_file "$D/fc-gbak-ds.fbk" >/dev/null 2>&1
+grab "$D/fc-gbak-dsr.fdb"
+descdig() {
+    "$ISQL" -q -b -user "$U" -pas "$P" "$1" <<'EOF' 2>/dev/null | awk 'NF {$1=$1; printf "/%s", $0} END {print "/"}'
+SET HEADING OFF;
+SELECT CAST(RDB$DESCRIPTION AS VARCHAR(20)) FROM RDB$RELATIONS WHERE RDB$RELATION_NAME IN ('T','VV') ORDER BY RDB$RELATION_NAME;
+SELECT CAST(RDB$DESCRIPTION AS VARCHAR(20)) FROM RDB$RELATION_FIELDS WHERE RDB$DESCRIPTION IS NOT NULL ORDER BY RDB$RELATION_NAME;
+SELECT CAST(RDB$DESCRIPTION AS VARCHAR(20)) FROM RDB$INDICES WHERE RDB$INDEX_NAME='IX_T';
+SELECT CAST(RDB$DESCRIPTION AS VARCHAR(20)) FROM RDB$GENERATORS WHERE RDB$GENERATOR_NAME='SQ';
+SELECT CAST(RDB$DESCRIPTION AS VARCHAR(20)) FROM RDB$EXCEPTIONS WHERE RDB$EXCEPTION_NAME='E_D';
+SELECT CAST(RDB$DESCRIPTION AS VARCHAR(20)) FROM RDB$PROCEDURES WHERE RDB$PROCEDURE_NAME='PP';
+SELECT CAST(RDB$DESCRIPTION AS VARCHAR(20)) FROM RDB$PROCEDURE_PARAMETERS WHERE RDB$PARAMETER_NAME='B' AND RDB$PROCEDURE_NAME='PP';
+SELECT CAST(RDB$DESCRIPTION AS VARCHAR(20)) FROM RDB$FUNCTIONS WHERE RDB$FUNCTION_NAME='FF';
+SELECT CAST(RDB$DESCRIPTION AS VARCHAR(20)) FROM RDB$TRIGGERS WHERE RDB$TRIGGER_NAME='TG';
+SELECT CAST(RDB$DESCRIPTION AS VARCHAR(20)) FROM RDB$ROLES WHERE RDB$ROLE_NAME='R_D';
+EOF
+}
+want="/table words/view words/column words/vcol words/index words/seq words/exc words/proc words/parm words/fn words/trg words/role words/"
+got=$(descdig "$D/fc-gbak-dsr.fdb")
+ran=$((ran + 1))
+if [ "$got" = "$want" ]; then
+    echo "OK   the ENGINE restores fc's fbk with every COMMENT in place"
+else
+    echo "DIFF comments after engine restore: [$got] want [$want]"; fail=1
+fi
+ran=$((ran + 1))
+"$ISQL" -q -b -user "$U" -pas "$P" <<EOF >/dev/null 2>&1
+CONNECT '$DSDB' USER '$U' PASSWORD '$P';
+COMMENT ON DOMAIN RDB\$1 IS 'dom words';
+COMMIT;
+EOF
+fo=$(svc_backup "$FMGR" "$DSDB" "$D/fc-gbak-ds2.fbk")
+if [ "${fo##*rc=}" = "0" ]; then
+    echo "DIFF a COMMENT on an invented domain should refuse: [$fo]"; fail=1
+else
+    echo "OK   a COMMENT on an invented RDB\$n domain refuses typed"
+fi
+rm -f "$DSDB" "$D/fc-gbak-ds.fbk" "$D/fc-gbak-ds2.fbk" "$D/fc-gbak-dsr.fdb"
+
 # --- 4. RECORDED BOUNDARY: NOT NULL is not carried ---------------------------
 NN="$D/fc-gbak-nn.fdb"; rm -f "$NN"
 "$ISQL" -q -b -user "$U" -pas "$P" <<EOF >/dev/null 2>&1

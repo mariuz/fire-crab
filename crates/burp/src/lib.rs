@@ -377,6 +377,17 @@ pub fn write_backup_verbose(
                         t
                     )));
                 }
+                // a COMMENT on an invented RDB$n domain cannot follow
+                // the renumbering a restore performs - refuse typed
+                if t.starts_with("RDB$")
+                    && catalog_description(image, page_size, "RDB$FIELDS", &[("RDB$FIELD_NAME", t)])
+                        .is_some()
+                {
+                    return Err(Refused(format!(
+                        "domain {}: a COMMENT on an invented domain is outside this backup's surface",
+                        t
+                    )));
+                }
             }
         }
     }
@@ -629,12 +640,20 @@ pub fn write_backup_verbose(
             .find(|(_, n, ..)| n == name)
             .map(|t| t.3)
             .unwrap_or(0);
-        Rec::new(&mut out, rec::RELATION)
+        let mut r = Rec::new(&mut out, rec::RELATION)
             .text(21, "PUBLIC")
             .text(1, name)
             .int(16, 1) // att_relation_flags (pinned from the reference file)
-            .int(18, rtype as i32) // relation type: 0 persistent, 4/5 GTT
-            .end();
+            .int(18, rtype as i32); // relation type: 0 persistent, 4/5 GTT
+        if let Some(d) = catalog_description(
+            image,
+            page_size,
+            "RDB$RELATIONS",
+            &[("RDB$RELATION_NAME", name)],
+        ) {
+            r = r.blob(13, &d); // att_relation_description2
+        }
+        r.end();
         for c in cols.iter() {
             let att9 = if c.desc.dtype == dtype::BLOB {
                 c.desc.sub_type as i32
@@ -658,6 +677,14 @@ pub fn write_backup_verbose(
                 // carries on its NOT NULL column
                 r = r.int(38, 1);
             }
+            if let Some(d) = catalog_description(
+                image,
+                page_size,
+                "RDB$RELATION_FIELDS",
+                &[("RDB$RELATION_NAME", name), ("RDB$FIELD_NAME", &c.name)],
+            ) {
+                r = r.blob(35, &d); // att_field_description2
+            }
             match c.desc.dtype {
                 dtype::VARYING | dtype::TEXT => r.int(42, 0).int(43, 0).end(),
                 dtype::BLOB if c.desc.sub_type == 1 => r.int(42, 0).int(43, 0).end(),
@@ -672,14 +699,22 @@ pub fn write_backup_verbose(
     // domains minted above), and the context records
     for v in &views {
         log.push(format!("gbak:    writing view \"PUBLIC\".\"{}\"", v.name));
-        Rec::new(&mut out, rec::RELATION)
+        let mut vr = Rec::new(&mut out, rec::RELATION)
             .text(21, "PUBLIC")
             .text(1, &v.name)
             .blob(2, &v.blr)
             .int(16, 1)
             .blob(14, &v.source)
-            .int(18, 1) // relation type: view
-            .end();
+            .int(18, 1); // relation type: view
+        if let Some(d) = catalog_description(
+            image,
+            page_size,
+            "RDB$RELATIONS",
+            &[("RDB$RELATION_NAME", &v.name)],
+        ) {
+            vr = vr.blob(13, &d);
+        }
+        vr.end();
         for (i, f) in v.fields.iter().enumerate() {
             log.push(format!("gbak:         writing column \"{}\"", f.name));
             let r = Rec::new(&mut out, rec::FIELD)
@@ -694,6 +729,15 @@ pub fn write_backup_verbose(
                 // relation's RDB$FIELD_ID from; without it the field
                 // vector sizes to ZERO and every column vanishes
                 .int(22, (i + 1) as i32);
+            let r = match catalog_description(
+                image,
+                page_size,
+                "RDB$RELATION_FIELDS",
+                &[("RDB$RELATION_NAME", &v.name), ("RDB$FIELD_NAME", &f.name)],
+            ) {
+                Some(d) => r.blob(35, &d),
+                None => r,
+            };
             if f.base_field.is_empty() {
                 // an EXPRESSION column, the measured shape: read-only,
                 // context 0, computed_flag 1, and NO base-field att
@@ -743,16 +787,33 @@ pub fn write_backup_verbose(
         if let Some(init) = g.init {
             r = r.int64(8, init);
         }
-        r.int(9, g.increment).end();
+        r = r.int(9, g.increment);
+        if let Some(d) = catalog_description(
+            image,
+            page_size,
+            "RDB$GENERATORS",
+            &[("RDB$GENERATOR_NAME", &g.name)],
+        ) {
+            r = r.blob(4, &d); // att_gen_description2
+        }
+        r.end();
     }
     log.push("gbak:writing exceptions".into());
     for (name, msg) in read_exceptions(image, page_size)? {
         log.push(format!("gbak:writing exception \"PUBLIC\".\"{}\"", name));
-        Rec::new(&mut out, rec::EXCEPTION)
+        let mut r = Rec::new(&mut out, rec::EXCEPTION)
             .text(8, "PUBLIC")
             .text(1, &name)
-            .text(2, &msg)
-            .end();
+            .text(2, &msg);
+        if let Some(d) = catalog_description(
+            image,
+            page_size,
+            "RDB$EXCEPTIONS",
+            &[("RDB$EXCEPTION_NAME", &name)],
+        ) {
+            r = r.blob(4, &d); // att_exception_description2
+        }
+        r.end();
     }
     log.push("gbak:writing functions".into());
     for fu in &functions {
@@ -801,6 +862,14 @@ pub fn write_backup_verbose(
         }
         if let Some(v) = fu.aggregate {
             r = r.int(24, v as i32);
+        }
+        if let Some(d) = catalog_description(
+            image,
+            page_size,
+            "RDB$FUNCTIONS",
+            &[("RDB$FUNCTION_NAME", &fu.name)],
+        ) {
+            r = r.blob(9, &d); // att_function_description2
         }
         r.end();
         for a in &fu.args {
@@ -875,6 +944,14 @@ pub fn write_backup_verbose(
         if let Some((_, pv)) = &pr.package {
             r = r.int(17, *pv as i32);
         }
+        if let Some(d) = catalog_description(
+            image,
+            page_size,
+            "RDB$PROCEDURES",
+            &[("RDB$PROCEDURE_NAME", &pr.name)],
+        ) {
+            r = r.blob(5, &d); // att_procedure_description2
+        }
         r.end();
         for pp in &pr.params {
             log.push(format!(
@@ -886,14 +963,22 @@ pub fn write_backup_verbose(
                 .find(|(a, b, _)| a == &pr.name && b == &pp.name)
                 .map(|(_, _, d)| d.clone())
                 .unwrap_or_default();
-            Rec::new(&mut out, rec::PROCEDURE_PRM)
+            let mut r = Rec::new(&mut out, rec::PROCEDURE_PRM)
                 .text(1, &pp.name)
                 .int(2, pp.number)
                 .int(3, pp.ptype)
                 .text(14, "PUBLIC")
                 .text(4, &dom)
-                .int(11, 0)
-                .end();
+                .int(11, 0);
+            if let Some(d) = catalog_description(
+                image,
+                page_size,
+                "RDB$PROCEDURE_PARAMETERS",
+                &[("RDB$PROCEDURE_NAME", &pr.name), ("RDB$PARAMETER_NAME", &pp.name)],
+            ) {
+                r = r.blob(6, &d); // att_procedureprm_description2
+            }
+            r.end();
         }
         // rec_procedure_end - a bare byte, like relation_end; without
         // it the engine's reader walks the next record as this
@@ -914,6 +999,14 @@ pub fn write_backup_verbose(
         }
         if let Some(ow) = &pk.owner {
             r = r.text(6, ow);
+        }
+        if let Some(d) = catalog_description(
+            image,
+            page_size,
+            "RDB$PACKAGES",
+            &[("RDB$PACKAGE_NAME", &pk.name)],
+        ) {
+            r = r.blob(7, &d); // att_package_description
         }
         r.end();
     }
@@ -973,6 +1066,14 @@ pub fn write_backup_verbose(
             r = r.int(7, ix.itype);
             if let Some(partner) = &ix.foreign {
                 r = r.text(14, "PUBLIC").text(8, partner);
+            }
+            if let Some(d) = catalog_description(
+                image,
+                page_size,
+                "RDB$INDICES",
+                &[("RDB$INDEX_NAME", &ix.name)],
+            ) {
+                r = r.blob(9, &d); // att_index_description2
             }
             r.end();
         }
@@ -1088,6 +1189,14 @@ pub fn write_backup_verbose(
         if let Some(d) = &t.debug {
             r = r.blob(14, d);
         }
+        if let Some(d) = catalog_description(
+            image,
+            page_size,
+            "RDB$TRIGGERS",
+            &[("RDB$TRIGGER_NAME", &t.name)],
+        ) {
+            r = r.blob(11, &d); // att_trig_description2
+        }
         r.end();
     }
     log.push("gbak:writing trigger messages".into());
@@ -1156,11 +1265,18 @@ pub fn write_backup_verbose(
     log.push("gbak:writing SQL roles".into());
     for (name, owner) in read_roles(image, page_size)? {
         log.push(format!("gbak:    writing SQL role: \"{}\"", name));
-        Rec::new(&mut out, rec::SQL_ROLES)
+        let mut r = Rec::new(&mut out, rec::SQL_ROLES)
             .text(1, &name)
-            .text(2, &owner)
-            .bytes(4, &[0u8; 8])
-            .end();
+            .text(2, &owner);
+        if let Some(d) = catalog_description(
+            image,
+            page_size,
+            "RDB$ROLES",
+            &[("RDB$ROLE_NAME", &name)],
+        ) {
+            r = r.blob(3, &d); // att_role_description
+        }
+        r.bytes(4, &[0u8; 8]).end();
     }
     log.push("gbak:writing names mapping".into());
     log.push("gbak:writing publications".into());
@@ -1948,12 +2064,6 @@ fn read_functions(
                 name
             )));
         }
-        if blob(r, at("RDB$DESCRIPTION")).is_some() {
-            return Err(Refused(format!(
-                "function {}: a description blob is outside this backup's surface",
-                name
-            )));
-        }
         let blr = blob(r, at("RDB$FUNCTION_BLR")).ok_or_else(|| {
             Refused(format!("function {}: its BLR blob is unreadable", name))
         })?;
@@ -2076,6 +2186,32 @@ fn read_procedures(
     Ok(out)
 }
 
+/// A catalog row's RDB$DESCRIPTION blob (a COMMENT), NUL-terminated
+/// like every carried source blob - matched on every (column, value)
+/// pair given.
+fn catalog_description(
+    image: &fire_crab_ods::Image,
+    page_size: usize,
+    rel_name: &str,
+    keys: &[(&str, &str)],
+) -> Option<Vec<u8>> {
+    let (cols, rows) = sys_rows(image, page_size, rel_name)?;
+    let rel = fire_crab_ods::resolve_relation(image, page_size, rel_name)?;
+    let at = |n: &str| cols.iter().find(|(c, _)| c.eq_ignore_ascii_case(n)).map(|(_, i)| *i);
+    let desc_at = at("RDB$DESCRIPTION")?;
+    for r in &rows {
+        if keys.iter().all(|(col, val)| text_opt(r, at(col)).as_deref() == Some(*val)) {
+            if let Some(fire_crab_ods::format::Value::Blob(_, num)) = r.values.get(desc_at) {
+                let mut d = fire_crab_blb::read_blob_content(image, page_size, rel, *num)?;
+                d.push(0);
+                return Some(d);
+            }
+            return None;
+        }
+    }
+    None
+}
+
 /// A domain's COMPUTED_BLR blob and precision off its RDB$FIELDS row.
 fn domain_computed_of(
     image: &fire_crab_ods::Image,
@@ -2176,12 +2312,6 @@ fn read_packages(
             continue;
         }
         let Some(name) = text_opt(r, at("RDB$PACKAGE_NAME")) else { continue };
-        if blob(r, at("RDB$DESCRIPTION")).is_some() {
-            return Err(Refused(format!(
-                "package {}: a description blob is outside this backup's surface",
-                name
-            )));
-        }
         if !matches!(
             at("RDB$SQL_SECURITY").and_then(|i| r.values.get(i)),
             None | Some(fire_crab_ods::format::Value::Null)
@@ -2560,6 +2690,8 @@ pub struct Restored {
     /// domains carrying a COMPUTED expression (an expression view
     /// column's), by name
     pub domain_computed: Vec<(String, Vec<u8>)>,
+    /// the COMMENTS: (family, name, sub-name or empty, text), file order
+    pub descriptions: Vec<(String, String, String, String)>,
     /// the carried packages, file order
     pub packages: Vec<RPackage>,
     /// privilege records seen and set aside - the count keeps the
@@ -2680,6 +2812,49 @@ impl Att {
 
 /// Read one attribute list (up to att_end). Tolerant: unknown tags ride
 /// along with their data for the caller to pick from.
+/// [read_atts] for records whose listed tags are int32-framed blobs
+/// (a COMMENT's description2, for one). The blob atts come back
+/// separately as (tag, raw bytes).
+#[allow(clippy::type_complexity)]
+fn read_atts_blob(
+    f: &[u8],
+    at: &mut usize,
+    blob_tags: &[u8],
+) -> Result<(Vec<Att>, Vec<(u8, Vec<u8>)>), Refused> {
+    let mut atts = Vec::new();
+    let mut blobs = Vec::new();
+    loop {
+        let tag = *f.get(*at).ok_or_else(|| Refused("truncated record".into()))?;
+        *at += 1;
+        if tag == 0 {
+            break;
+        }
+        let len = *f.get(*at).ok_or_else(|| Refused("truncated attribute".into()))? as usize;
+        *at += 1;
+        let data = f
+            .get(*at..*at + len)
+            .ok_or_else(|| Refused("truncated attribute".into()))?
+            .to_vec();
+        *at += len;
+        if blob_tags.contains(&tag) {
+            let mut n: i64 = 0;
+            for (k, b) in data.iter().enumerate().take(8) {
+                n |= (*b as i64) << (8 * k);
+            }
+            let n = n as usize;
+            let raw = f
+                .get(*at..*at + n)
+                .ok_or_else(|| Refused("truncated blob attribute".into()))?
+                .to_vec();
+            *at += n;
+            blobs.push((tag, raw));
+        } else {
+            atts.push(Att { tag, data });
+        }
+    }
+    Ok((atts, blobs))
+}
+
 fn read_atts(f: &[u8], at: &mut usize) -> Result<Vec<Att>, Refused> {
     let mut out = Vec::new();
     loop {
@@ -2785,6 +2960,7 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
         functions: Vec::new(),
         roles: Vec::new(),
         domain_computed: Vec::new(),
+        descriptions: Vec::new(),
         packages: Vec::new(),
         privileges_skipped: 0,
     };
@@ -2902,6 +3078,7 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                 // BLR (13), source (14), debug (16) and description2
                 // (9) are int32-framed blobs - walked by hand, like
                 // the procedure record
+                let mut fn_desc: Option<Vec<u8>> = None;
                 let mut fu = RFunc {
                     name: String::new(),
                     package: None,
@@ -2954,7 +3131,8 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                                     }
                                 }
                                 16 => fu.debug = Some(raw),
-                                _ => {} // description set aside
+                                9 => fn_desc = Some(raw),
+                                _ => {} // old descriptions set aside
                             }
                         }
                         // MODULE_NAME (4), ENTRYPOINT (5), ENGINE_NAME
@@ -2987,6 +3165,18 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                             )));
                         }
                     }
+                }
+                if let Some(d) = fn_desc {
+                    let mut d = d;
+                    if d.last() == Some(&0) {
+                        d.pop();
+                    }
+                    out.descriptions.push((
+                        "function".into(),
+                        fu.name.clone(),
+                        String::new(),
+                        String::from_utf8_lossy(&d).into_owned(),
+                    ));
                 }
                 out.functions.push(fu);
             }
@@ -3059,6 +3249,7 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                 // BLR (8), source (7), descriptions (4/5) and debug
                 // info (13) are int32-framed blobs - walked by hand,
                 // like the trigger record
+                let mut proc_desc: Option<Vec<u8>> = None;
                 let mut pr = RProc {
                     name: String::new(),
                     package: None,
@@ -3110,7 +3301,8 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                                         pr.source.pop();
                                     }
                                 }
-                                _ => {} // descriptions/debug set aside
+                                5 => proc_desc = Some(raw),
+                                _ => {} // old descriptions/debug set aside
                             }
                         }
                         1 => pr.name = String::from_utf8_lossy(&data).into_owned(),
@@ -3141,10 +3333,38 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                         }
                     }
                 }
+                if let Some(d) = proc_desc {
+                    let mut d = d;
+                    if d.last() == Some(&0) {
+                        d.pop();
+                    }
+                    out.descriptions.push((
+                        "procedure".into(),
+                        pr.name.clone(),
+                        String::new(),
+                        String::from_utf8_lossy(&d).into_owned(),
+                    ));
+                }
                 out.procedures.push(pr);
             }
             rec::PROCEDURE_PRM => {
-                let atts = read_atts(f, &mut at)?;
+                const DESC_TAG: u8 = 6;
+                let (atts, blobs) = read_atts_blob(f, &mut at, &[DESC_TAG])?;
+                let parent = out
+                    .procedures
+                    .last()
+                    .map(|p| p.name.clone())
+                    .unwrap_or_default();
+                if let Some((_, d)) = blobs.iter().find(|(t, _)| *t == DESC_TAG) {
+                    let mut d = d.clone();
+                    if d.last() == Some(&0) { d.pop(); }
+                    out.descriptions.push((
+                        "procedure_prm".into(),
+                        parent,
+                        att(&atts, 1).map(|a| a.text()).unwrap_or_default(),
+                        String::from_utf8_lossy(&d).into_owned(),
+                    ));
+                }
                 let pr = out.procedures.last_mut().ok_or_else(|| {
                     Refused("a procedure parameter outside a procedure".into())
                 })?;
@@ -3161,6 +3381,7 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                 // its BLR and SOURCE attributes carry an int32 byte
                 // count and the RAW bytes OUT-OF-BAND, so the generic
                 // attribute walk cannot read this record
+                let mut trig_desc: Option<Vec<u8>> = None;
                 let mut tr = RTrigger {
                     debug: None,
                     name: String::new(),
@@ -3216,7 +3437,8 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                                     }
                                 }
                                 14 => tr.debug = Some(raw),
-                                _ => {} // descriptions set aside
+                                11 => trig_desc = Some(raw),
+                                _ => {} // old-style descriptions set aside
                             }
                         }
                         4 => tr.name = String::from_utf8_lossy(&data).into_owned(),
@@ -3237,10 +3459,33 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                         }
                     }
                 }
+                if let Some(d) = trig_desc {
+                    let mut d = d;
+                    if d.last() == Some(&0) {
+                        d.pop();
+                    }
+                    out.descriptions.push((
+                        "trigger".into(),
+                        tr.name.clone(),
+                        String::new(),
+                        String::from_utf8_lossy(&d).into_owned(),
+                    ));
+                }
                 out.triggers.push(tr);
             }
             rec::EXCEPTION => {
-                let atts = read_atts(f, &mut at)?;
+                const DESC_TAG: u8 = 4;
+                let (atts, blobs) = read_atts_blob(f, &mut at, &[DESC_TAG])?;
+                if let Some((_, d)) = blobs.iter().find(|(t, _)| *t == DESC_TAG) {
+                    let mut d = d.clone();
+                    if d.last() == Some(&0) { d.pop(); }
+                    out.descriptions.push((
+                        "exception".into(),
+                        att(&atts, 1).map(|a| a.text()).unwrap_or_default(),
+                        String::new(),
+                        String::from_utf8_lossy(&d).into_owned(),
+                    ));
+                }
                 out.exceptions.push((
                     att(&atts, 1)
                         .map(|a| a.text())
@@ -3251,6 +3496,7 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
             rec::PACKAGE => {
                 // header (2), body (3) and description (7) sources are
                 // int32-framed blobs - walked by hand
+                let mut pk_desc: Option<Vec<u8>> = None;
                 let mut pk = RPackage {
                     name: String::new(),
                     header: Vec::new(),
@@ -3302,7 +3548,8 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                                         pk.body.pop();
                                     }
                                 }
-                                _ => {} // description set aside
+                                7 => pk_desc = Some(raw),
+                                _ => {}
                             }
                         }
                         1 => pk.name = String::from_utf8_lossy(&data).into_owned(),
@@ -3321,10 +3568,33 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                         }
                     }
                 }
+                if let Some(d) = pk_desc {
+                    let mut d = d;
+                    if d.last() == Some(&0) {
+                        d.pop();
+                    }
+                    out.descriptions.push((
+                        "package".into(),
+                        pk.name.clone(),
+                        String::new(),
+                        String::from_utf8_lossy(&d).into_owned(),
+                    ));
+                }
                 out.packages.push(pk);
             }
             rec::SQL_ROLES => {
-                let atts = read_atts(f, &mut at)?;
+                const DESC_TAG: u8 = 3;
+                let (atts, blobs) = read_atts_blob(f, &mut at, &[DESC_TAG])?;
+                if let Some((_, d)) = blobs.iter().find(|(t, _)| *t == DESC_TAG) {
+                    let mut d = d.clone();
+                    if d.last() == Some(&0) { d.pop(); }
+                    out.descriptions.push((
+                        "role".into(),
+                        att(&atts, 1).map(|a| a.text()).unwrap_or_default(),
+                        String::new(),
+                        String::from_utf8_lossy(&d).into_owned(),
+                    ));
+                }
                 if let Some(pv) = att(&atts, 4) {
                     if pv.data.iter().any(|b| *b != 0) {
                         return Err(Refused(
@@ -3340,17 +3610,20 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                 );
             }
             rec::GENERATOR => {
-                let atts = read_atts(f, &mut at)?;
+                const DESC_TAG: u8 = 4;
+                let (atts, blobs) = read_atts_blob(f, &mut at, &[DESC_TAG])?;
                 let name = att(&atts, 1)
                     .map(|a| a.text())
                     .ok_or_else(|| Refused("a generator with no name".into()))?;
-                // att 4 is a description BLOB whose framing this walk
-                // does not speak - refuse rather than mis-step the file
-                if att(&atts, 4).is_some() {
-                    return Err(Refused(format!(
-                        "generator {} carries a description blob",
-                        name
-                    )));
+                if let Some((_, d)) = blobs.iter().find(|(t, _)| *t == DESC_TAG) {
+                    let mut d = d.clone();
+                    if d.last() == Some(&0) { d.pop(); }
+                    out.descriptions.push((
+                        "generator".into(),
+                        name.clone(),
+                        String::new(),
+                        String::from_utf8_lossy(&d).into_owned(),
+                    ));
                 }
                 out.generators.push(RGen {
                     value: att(&atts, 3).map(|a| a.int()).unwrap_or(0),
@@ -3366,6 +3639,7 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                 let mut rtype = 0i64;
                 let mut view_blr: Option<Vec<u8>> = None;
                 let mut view_source: Option<Vec<u8>> = None;
+                let mut rel_desc: Option<Vec<u8>> = None;
                 loop {
                     let tag = *f
                         .get(at)
@@ -3392,7 +3666,7 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                         v
                     };
                     match tag {
-                        2 | 3 | 14 | 34 => {
+                        2 | 3 | 13 | 14 | 34 => {
                             let n = as_int(&data) as usize;
                             let raw = f
                                 .get(at..at + n)
@@ -3401,6 +3675,13 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                             at += n;
                             match tag {
                                 2 => view_blr = Some(raw),
+                                13 => {
+                                    let mut d = raw;
+                                    if d.last() == Some(&0) {
+                                        d.pop();
+                                    }
+                                    rel_desc = Some(d);
+                                }
                                 14 => {
                                     let mut src = raw;
                                     if src.last() == Some(&0) {
@@ -3408,7 +3689,7 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                                     }
                                     view_source = Some(src);
                                 }
-                                _ => {} // descriptions set aside
+                                _ => {} // ext descriptions set aside
                             }
                         }
                         1 => name = String::from_utf8_lossy(&data).into_owned(),
@@ -3436,6 +3717,14 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                 }
                 if name.is_empty() {
                     return Err(Refused("a relation with no name".into()));
+                }
+                if let Some(d) = rel_desc {
+                    out.descriptions.push((
+                        "relation".into(),
+                        name.clone(),
+                        String::new(),
+                        String::from_utf8_lossy(&d).into_owned(),
+                    ));
                 }
                 out.tables.push(RTable {
                     name,
@@ -3467,7 +3756,8 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                 // rec_procedure_end: a bare byte, like relation_end
             }
             rec::FIELD => {
-                let atts = read_atts(f, &mut at)?;
+                const DESC_TAG: u8 = 35;
+                let (atts, blobs) = read_atts_blob(f, &mut at, &[DESC_TAG])?;
                 let t = current_rel.ok_or_else(|| Refused("a field outside a relation".into()))?;
                 let ftype = att(&atts, 8)
                     .map(|a| a.int() as i32)
@@ -3477,6 +3767,18 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                         "field type {} is outside this restore's surface",
                         ftype
                     )));
+                }
+                if let Some((_, d)) = blobs.iter().find(|(tg, _)| *tg == DESC_TAG) {
+                    let mut d = d.clone();
+                    if d.last() == Some(&0) {
+                        d.pop();
+                    }
+                    out.descriptions.push((
+                        "field".into(),
+                        out.tables[t].name.clone(),
+                        att(&atts, 1).map(|a| a.text()).unwrap_or_default(),
+                        String::from_utf8_lossy(&d).into_owned(),
+                    ));
                 }
                 if out.tables[t].view_blr.is_some() {
                     // a VIEW's field: kept with its base/context links,
@@ -3535,7 +3837,19 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
             rec::INDEX => {
                 let t = data_rel
                     .ok_or_else(|| Refused("an index outside relation data".into()))?;
-                let atts = read_atts(f, &mut at)?;
+                const DESC_TAG: u8 = 9;
+                let (atts, blobs) = read_atts_blob(f, &mut at, &[DESC_TAG])?;
+                if let Some((_, d)) = blobs.iter().find(|(t, _)| *t == DESC_TAG) {
+                    let mut d = d.clone();
+                    if d.last() == Some(&0) { d.pop(); }
+                    out.descriptions.push((
+                        "index".into(),
+                        att(&atts, 1).map(|a| a.text()).unwrap_or_default(),
+                        String::new(),
+                        String::from_utf8_lossy(&d).into_owned(),
+                    ));
+                }
+                let _ = &blobs;
                 let segments: Vec<String> = atts
                     .iter()
                     .filter(|a| a.tag == 5)

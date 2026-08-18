@@ -3509,6 +3509,30 @@ fn run_gbak_restore_core(
                 fu.package.as_ref().map(|(n, v)| (n.as_str(), *v)),
             )?;
         }
+        // the COMMENTS, last - every row they annotate exists now
+        for (family, name, sub, text) in &restored.descriptions {
+            let (rel, keys): (&str, Vec<(&str, &str)>) = match family.as_str() {
+                "relation" => ("RDB$RELATIONS", vec![("RDB$RELATION_NAME", name)]),
+                "field" => (
+                    "RDB$RELATION_FIELDS",
+                    vec![("RDB$RELATION_NAME", name), ("RDB$FIELD_NAME", sub)],
+                ),
+                "index" => ("RDB$INDICES", vec![("RDB$INDEX_NAME", name)]),
+                "generator" => ("RDB$GENERATORS", vec![("RDB$GENERATOR_NAME", name)]),
+                "exception" => ("RDB$EXCEPTIONS", vec![("RDB$EXCEPTION_NAME", name)]),
+                "procedure" => ("RDB$PROCEDURES", vec![("RDB$PROCEDURE_NAME", name)]),
+                "procedure_prm" => (
+                    "RDB$PROCEDURE_PARAMETERS",
+                    vec![("RDB$PROCEDURE_NAME", name), ("RDB$PARAMETER_NAME", sub)],
+                ),
+                "function" => ("RDB$FUNCTIONS", vec![("RDB$FUNCTION_NAME", name)]),
+                "trigger" => ("RDB$TRIGGERS", vec![("RDB$TRIGGER_NAME", name)]),
+                "role" => ("RDB$ROLES", vec![("RDB$ROLE_NAME", name)]),
+                "package" => ("RDB$PACKAGES", vec![("RDB$PACKAGE_NAME", name)]),
+                other => return Err(format!("a COMMENT on a {} is outside this restore's surface", other)),
+            };
+            fire_crab_ods::ddl::set_catalog_description(&mut file, page_size, rel, &keys, text)?;
+        }
         let mut refreshed: Vec<&str> = Vec::new();
         for tr in &restored.triggers {
             if !tr.relation.is_empty() && !refreshed.contains(&tr.relation.as_str()) {

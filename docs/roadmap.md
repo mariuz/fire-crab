@@ -124,9 +124,22 @@ answers "cannot access column" over a perfect catalog. A NAMED
 DOMAIN is the boundary representative now, refused on BOTH sides
 (the reader used to accept any rec 2 — restored as a plain type a
 named domain would keep the data and silently change what the
-schema MEANS). What still refuses is typed (named domains, argument
-DEFAULTs, description blobs, expression indexes — and the permanent
-boundaries, external tables and external functions).
+schema MEANS). ~~Description blobs refuse~~ — COMMENTS RIDE (gbak 40): all
+twelve commentable families of the carried surface — table, column,
+view, view column, index, sequence, exception, procedure,
+parameter, function, trigger, role — as their measured
+description2 blob atts (13/35/9/4/5/6/9/11/3 per family), collected
+generically into one (family, name, sub, text) list and restored
+last through one ddl::set_catalog_description helper. The slice
+also closed the LATENT DESYNC the expression slice first exposed:
+five reader arms walked description-carrying records with the
+generic attribute walker and would have mis-stepped on any
+commented object — every arm now speaks the blob framing
+(read_atts_blob). A COMMENT on an invented RDB$n domain refuses
+typed on both sides — it cannot follow the renumbering a restore
+performs. What still refuses is typed (named domains, argument
+DEFAULTs, expression indexes — and the permanent boundaries,
+external tables and external functions).
 
 The subsystem map's rows fall into three states, and the difference
 matters more than the row count:
