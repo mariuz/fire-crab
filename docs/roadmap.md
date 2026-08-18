@@ -103,8 +103,20 @@ against the engine's own restore). With it written, the engine
 executes procedures off fc's restores in every corner
 (gbakrestore 39). A GTT is the boundary representative now — and
 the reader REFUSES relation type > 1 instead of silently landing a
-GTT as a plain table (att 18 was ignored before, a found bug). What
-still refuses is typed and small (GTTs, expression-columned views).
+GTT as a plain table (att 18 was ignored before, a found bug).
+~~GTTs refuse~~ — GLOBAL TEMPORARY TABLES RIDE (gbak 35): the same
+relation record with att 18 typed 4/5, restored EMPTY — a GTT's
+rows are per-attachment and never in the file, so the writer finds
+none and the restore allocates the ordinary page skeleton — with
+the restore-side DBKEY_LENGTH 0 the engine's own restore writes
+(live DDL writes 8, the restored catalog 0, measured on a round
+trip). A live INSERT lands in the restored instance both
+directions. External tables (type 2) stay refused — their data
+lives outside the file. An EXPRESSION-COLUMNED view is the boundary
+representative now; what still refuses beyond it is typed
+(expression-columned views, then the long tail: named domains,
+argument DEFAULTs, description blobs, expression indexes — and the
+permanent boundaries, external tables and external functions).
 
 The subsystem map's rows fall into three states, and the difference
 matters more than the row count:

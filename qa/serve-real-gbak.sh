@@ -462,6 +462,43 @@ else
 fi
 rm -f "$PKDB" "$D/fc-gbak-pk.fbk" "$D/fc-gbak-pkr.fdb"
 
+# GTTs RIDE (att 18 relation type 4/5 on the ordinary relation record):
+# restored EMPTY - a GTT's rows are per-attachment and never in the
+# file - typed 4/5 with FLAGS 1 and the restore-side DBKEY_LENGTH 0,
+# and a live INSERT lands in the restored instance
+GTDB="$D/fc-gbak-gt.fdb"; rm -f "$GTDB" "$D/fc-gbak-gt.fbk" "$D/fc-gbak-gtr.fdb"
+"$ISQL" -q -b -user "$U" -pas "$P" <<EOF >/dev/null 2>&1
+CREATE DATABASE '$GTDB' USER '$U' PASSWORD '$P' PAGE_SIZE 8192;
+CREATE TABLE T (X INTEGER);
+COMMIT;
+CREATE GLOBAL TEMPORARY TABLE GP (A INTEGER) ON COMMIT PRESERVE ROWS;
+CREATE GLOBAL TEMPORARY TABLE GD (B INTEGER) ON COMMIT DELETE ROWS;
+COMMIT;
+INSERT INTO T VALUES (5);
+INSERT INTO GP VALUES (1);
+COMMIT;
+EOF
+chmod 666 "$GTDB"
+ran=$((ran + 1))
+fo=$(svc_backup "$FMGR" "$GTDB" "$D/fc-gbak-gt.fbk")
+if [ "${fo##*rc=}" = "0" ]; then
+    echo "OK   a GLOBAL TEMPORARY table rides the backup (fc backs it up)"
+else
+    echo "DIFF GTT backup: [$fo]"; fail=1
+fi
+ran=$((ran + 1))
+sudo -n chmod 666 "$D/fc-gbak-gt.fbk" 2>/dev/null || chmod 666 "$D/fc-gbak-gt.fbk" 2>/dev/null
+"$FBSVCMGR" "$EMGR" user "$U" password "$P" action_restore dbname "$D/fc-gbak-gtr.fdb" bkp_file "$D/fc-gbak-gt.fbk" >/dev/null 2>&1
+grab "$D/fc-gbak-gtr.fdb"
+got=$(printf "SELECT (SELECT COUNT(*) FROM GP) || '/' || TRIM(RDB\$RELATION_TYPE) || '/' || (SELECT X FROM T) FROM RDB\$RELATIONS WHERE RDB\$RELATION_NAME='GP';\nINSERT INTO GP VALUES (9);\nSELECT 'live:' || A FROM GP;\n" |
+    "$ISQL" -q -b -user "$U" -pas "$P" "$D/fc-gbak-gtr.fdb" 2>&1 | grep -cE '0/4/5|live:9')
+if [ "$got" = "2" ]; then
+    echo "OK   the ENGINE restores fc's fbk: GTT typed 4, EMPTY, live-writable; T kept"
+else
+    echo "DIFF GTT after engine restore: match-count [$got] (want 2)"; fail=1
+fi
+rm -f "$GTDB" "$D/fc-gbak-gt.fbk" "$D/fc-gbak-gtr.fdb"
+
 # --- 4. RECORDED BOUNDARY: NOT NULL is not carried ---------------------------
 NN="$D/fc-gbak-nn.fdb"; rm -f "$NN"
 "$ISQL" -q -b -user "$U" -pas "$P" <<EOF >/dev/null 2>&1

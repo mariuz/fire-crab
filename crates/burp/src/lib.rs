@@ -380,16 +380,16 @@ pub fn write_backup_verbose(
             }
         }
     }
-    let all_rels: Vec<(u16, String, bool)> = user_tables(image, page_size)?;
+    let all_rels: Vec<(u16, String, bool, i64)> = user_tables(image, page_size)?;
     let user_rels: Vec<(u16, String)> = all_rels
         .iter()
-        .filter(|(_, _, v)| !v)
-        .map(|(i, n, _)| (*i, n.clone()))
+        .filter(|(_, _, v, _)| !v)
+        .map(|(i, n, _, _)| (*i, n.clone()))
         .collect();
     let view_rels: Vec<(u16, String)> = all_rels
         .iter()
-        .filter(|(_, _, v)| *v)
-        .map(|(i, n, _)| (*i, n.clone()))
+        .filter(|(_, _, v, _)| *v)
+        .map(|(i, n, _, _)| (*i, n.clone()))
         .collect();
 
     let mut out = Vec::new();
@@ -586,11 +586,16 @@ pub fn write_backup_verbose(
         for c in cols.iter() {
             log.push(format!("gbak:         writing column \"{}\"", c.name));
         }
+        let rtype = all_rels
+            .iter()
+            .find(|(_, n, ..)| n == name)
+            .map(|t| t.3)
+            .unwrap_or(0);
         Rec::new(&mut out, rec::RELATION)
             .text(21, "PUBLIC")
             .text(1, name)
             .int(16, 1) // att_relation_flags (pinned from the reference file)
-            .int(18, 0) // relation type: persistent
+            .int(18, rtype as i32) // relation type: 0 persistent, 4/5 GTT
             .end();
         for c in cols.iter() {
             let att9 = if c.desc.dtype == dtype::BLOB {
@@ -2199,7 +2204,7 @@ fn text_opt(r: &fire_crab_ods::tra::VisibleRow, i: Option<usize>) -> Option<Stri
 /// backup (its "rows" are a query, and writing it as a table would
 /// restore a table where a view was - the right rows today, the wrong
 /// database from then on).
-fn user_tables(image: &fire_crab_ods::Image, page_size: usize) -> Result<Vec<(u16, String, bool)>, Refused> {
+fn user_tables(image: &fire_crab_ods::Image, page_size: usize) -> Result<Vec<(u16, String, bool, i64)>, Refused> {
     let Some((cols, rows)) = sys_rows(image, page_size, "RDB$RELATIONS") else {
         return Err(Refused("RDB$RELATIONS is unreadable".into()));
     };
@@ -2227,20 +2232,20 @@ fn user_tables(image: &fire_crab_ods::Image, page_size: usize) -> Result<Vec<(u1
             Some(fire_crab_ods::format::Value::Int(n)) => *n as u16,
             _ => continue,
         };
-        // relation type 0 = persistent table, 1 = VIEW (carried);
-        // anything else (4/5 = GTT) is outside the surface
-        let is_view = match type_at.and_then(|i| r.values.get(i)) {
-            Some(fire_crab_ods::format::Value::Int(0)) | None => false,
-            Some(fire_crab_ods::format::Value::Null) => false,
-            Some(fire_crab_ods::format::Value::Int(1)) => true,
-            _ => {
-                return Err(Refused(format!(
-                    "relation {} is not a persistent table - outside this backup's surface",
-                    name
-                )))
-            }
+        // relation type 0 = persistent table, 1 = VIEW, 4/5 = GTT
+        // (preserve/delete rows - all carried); an EXTERNAL table (2)
+        // keeps its data outside the file and refuses
+        let rtype = match type_at.and_then(|i| r.values.get(i)) {
+            Some(fire_crab_ods::format::Value::Int(t)) => *t,
+            _ => 0,
         };
-        out.push((id, name, is_view));
+        if matches!(rtype, 2 | 3) {
+            return Err(Refused(format!(
+                "relation {} is not a persistent table - outside this backup's surface",
+                name
+            )));
+        }
+        out.push((id, name, rtype == 1, rtype));
     }
     Ok(out)
 }
@@ -2370,6 +2375,8 @@ pub struct RIndex {
 /// One restored table.
 pub struct RTable {
     pub name: String,
+    /// RDB$RELATION_TYPE off the file: 0 persistent, 1 view, 4/5 GTT
+    pub rtype: i64,
     pub cols: Vec<RCol>,
     pub rows: Vec<Vec<RVal>>,
     pub indexes: Vec<RIndex>,
@@ -3174,6 +3181,7 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                 // a VIEW's record carries its BLR (att 2) and SOURCE
                 // (att 14) as int32-framed blobs - walked by hand
                 let mut name = String::new();
+                let mut rtype = 0i64;
                 let mut view_blr: Option<Vec<u8>> = None;
                 let mut view_source: Option<Vec<u8>> = None;
                 loop {
@@ -3223,15 +3231,15 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                         }
                         1 => name = String::from_utf8_lossy(&data).into_owned(),
                         // att 18 is RDB$RELATION_TYPE: 0 = persistent,
-                        // 1 = view; a GTT (4/5) or external table (2)
-                        // restored as a plain table would keep the rows
-                        // and silently change what the schema MEANS
+                        // 1 = view, 4/5 = GTT (carried); an EXTERNAL
+                        // table (2) restored as a plain table would
+                        // silently change what the schema MEANS
                         18 => {
-                            if as_int(&data) > 1 {
+                            rtype = as_int(&data);
+                            if matches!(rtype, 2 | 3) {
                                 return Err(Refused(format!(
                                     "relation {}: relation type {} is outside this restore's surface",
-                                    name,
-                                    as_int(&data)
+                                    name, rtype
                                 )));
                             }
                         }
@@ -3249,6 +3257,7 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                 }
                 out.tables.push(RTable {
                     name,
+                    rtype,
                     cols: Vec::new(),
                     rows: Vec::new(),
                     indexes: Vec::new(),

@@ -3124,7 +3124,22 @@ fn run_gbak_restore_core(
                 .iter()
                 .map(|i| restore_column_def(&t.cols[*i]))
                 .collect::<Result<_, _>>()?;
-            fire_crab_ods::ddl::create_table(&mut file, page_size, &t.name, &cols, &[], &[], 0)?;
+            fire_crab_ods::ddl::create_table(
+                &mut file,
+                page_size,
+                &t.name,
+                &cols,
+                &[],
+                &[],
+                t.rtype,
+            )?;
+            // a GTT's restored row carries DBKEY_LENGTH 0 - the
+            // ENGINE'S OWN RESTORE writes 0 where live DDL writes 8
+            // (measured on a round trip), and this restore mirrors
+            // the restored catalog, not the source
+            if matches!(t.rtype, 4 | 5) {
+                fire_crab_ods::ddl::patch_relation_dbkey_length(&mut file, page_size, &t.name, 0)?;
+            }
             let rel = fire_crab_ods::resolve_relation(&file, page_size, &t.name)
                 .ok_or("the created table cannot be found")?;
             let formats = fire_crab_ods::relation_formats(&file, page_size, rel);

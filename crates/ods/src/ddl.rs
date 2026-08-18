@@ -8091,6 +8091,29 @@ pub fn create_procedure(
     advance_oldest_transactions(file, page_size)
 }
 
+/// Patch a relation's `RDB$DBKEY_LENGTH`. The engine's own RESTORE of
+/// a GTT writes 0 where live DDL writes 8 (measured on a round trip) -
+/// fc's restore mirrors the restored catalog.
+pub fn patch_relation_dbkey_length(
+    file: &mut crate::Image,
+    page_size: usize,
+    name: &str,
+    value: i64,
+) -> Result<(), String> {
+    let want = name.trim().trim_matches('"').to_ascii_uppercase();
+    let rel = crate::resolve_relation(file, page_size, "RDB$RELATIONS")
+        .ok_or("no RDB$RELATIONS relation")?;
+    let name_f = sys_fid(file, page_size, "RDB$RELATIONS", "RDB$RELATION_NAME")?;
+    patch_sys_row(
+        file,
+        page_size,
+        "RDB$RELATIONS",
+        rel,
+        move |v| text_eq(v.get(name_f), &want),
+        &[("RDB$DBKEY_LENGTH", SysVal::I(value))],
+    )
+}
+
 /// One carried function argument: the position off the file, the type
 /// facts resolved through the carried domain records. Position 0 is
 /// the RETURN argument (RDB$RETURN_ARGUMENT names it on the header row).

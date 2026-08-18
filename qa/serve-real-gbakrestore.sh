@@ -261,21 +261,23 @@ check "...and res_replace overwrites (fc)" \
 check "the replaced database still reads right" "$(rows "$D/fc-gbr-r1.fdb")" "$base"
 
 # --- 4. FAIL-CLOSED: an fbk carrying what this reader cannot ----------------
-# (~~a package refuses~~ - packages ride now; the representative
-# refusal is a GLOBAL TEMPORARY table - att 18 relation type 4/5 on
-# the relation record, refused so a GTT never lands as a plain table)
+# (~~a GTT refuses~~ - GTTs ride now; the representative refusal is
+# an EXPRESSION-COLUMNED view - a view field with no BASE_FIELD,
+# refused so the column's meaning never silently changes)
 rm -f "$D/fc-gbr-pk.fdb" "$D/fc-gbr-pk.fbk"
 "$ISQL" -q -b -user "$U" -pas "$P" <<EOF >/dev/null 2>&1
 CREATE DATABASE '$D/fc-gbr-pk.fdb' USER '$U' PASSWORD '$P' PAGE_SIZE 8192;
 CREATE TABLE T (X INTEGER);
 COMMIT;
-CREATE GLOBAL TEMPORARY TABLE GT (A INTEGER) ON COMMIT PRESERVE ROWS;
+CREATE TABLE VB (A INTEGER);
+COMMIT;
+CREATE VIEW VX (D) AS SELECT A * 2 FROM VB;
 COMMIT;
 EOF
 chmod 666 "$D/fc-gbr-pk.fdb"
 svc "$EMGR" action_backup dbname "$D/fc-gbr-pk.fdb" bkp_file "$D/fc-gbr-pk.fbk" >/dev/null
 grab "$D/fc-gbr-pk.fbk"
-check "an fbk with a GLOBAL TEMPORARY table refuses fc's restore whole" \
+check "an fbk with an EXPRESSION-columned view refuses fc's restore whole" \
     "$(svc "$FMGR" action_restore dbname "$D/fc-gbr-rpk.fdb" bkp_file "$D/fc-gbr-pk.fbk")" \
     "feature is not supported|rc=1"
 ran=$((ran + 1))
