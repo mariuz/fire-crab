@@ -259,10 +259,19 @@ measured or pinned items**, each recorded in its own place below:
   and accent-blind range, gfix clean. Discovered against the first
   reading of the C source: PXW_INTL has NO specials — its punctuation
   carries a plain primary in place ('a-b' < 'ab', probed live).
-  `qa/serve-real-collate.sh` (13). Deferred, recorded: a bound `?`
-  against a collated column, grouped ORDER BY stamps, collated
-  retrieval BANDS (scans today, correctly), the collation's own case
-  tables for UPPER/LOWER, and the other PXW weight tables.
+  `qa/serve-real-collate.sh` (13). ~~Deferred: a bound `?` against a
+  collated column, the collation's own case tables~~ — both TAKEN the
+  next slice: `SysFn::UpperColl`/`LowerColl` drive the transcribed
+  ToUpper/ToLowerConversionTbl (validated byte-for-byte against the
+  live engine; accent-stripping on UPPER only, LOWER keeps accents,
+  nothing raises), and a collated column's `?` term resolves with the
+  CollKey lhs so the bind wraps the arriving value to match (a bound
+  'a ' pads, a bound range takes accents with their bases; a NUMERIC
+  bind steps around the wrap for the per-row coercion).
+  serve-real-collate.sh 13 -> 16. Still deferred, recorded: grouped
+  ORDER BY stamps, collated retrieval BANDS (scans today, correctly),
+  and the other PXW weight tables (same driver, tables per collation
+  — PXW_CSY brings the first live CompressTbl, the 'ch' digraph).
   serve-real-xlit.sh 17 -> 20. ~~Still held: the untabled codepages~~ —
   three more TAKEN: WIN1250, WIN1251 and ISO8859_2, and their tables
   were GENERATED FROM THE LIVE ENGINE rather than typed from a chart:

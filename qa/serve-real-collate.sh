@@ -126,6 +126,45 @@ twin "the punctuation weight ('a-b' below 'ab', not equal to it)" \
 twin "<> excludes exactly the padded match" \
      "SELECT COUNT(*) FROM K WHERE S <> 'a'"
 
+# --- 2b. UPPER/LOWER by the COLLATION's own case tables ----------------
+# the Paradox accent-stripping convention (ToUpperConversionTbl,
+# transcribed and validated byte-for-byte against the live engine):
+# UPPER('é') is 'E' where the default collation answers 'É'; LOWER
+# keeps the accent; 'ß' and 'ƒ' have no pairs and nothing raises
+twin "UPPER strips accents, LOWER keeps them - the collation's own tables" \
+     "SELECT S, UPPER(S) AS U, LOWER(S) AS L FROM K ORDER BY S"
+
+# --- 2c. a bound parameter adopts the collation ------------------------
+node_qa() { FC_DB="$FC" FC_PORT="$PORT" FC_Q="$1" FC_A="$2" timeout 30 node -e '
+  process.on("uncaughtException", () => { console.log("CONN_ERR"); process.exit(1); });
+  const F=require("node-firebird");
+  F.attach({host:"127.0.0.1",port:+process.env.FC_PORT,database:process.env.FC_DB,
+            user:"SYSDBA",password:"masterkey",encoding:"UTF8"},(e,db)=>{
+    if(e){console.log("CONN_ERR");process.exit(1);}
+    db.query(process.env.FC_Q,[process.env.FC_A],(e2,r)=>{
+      if(e2){console.log("ERR");db.detach();process.exit(0);}
+      if(Array.isArray(r)) for(const row of r)
+        console.log(Object.values(row).map(v=>String(v).replace(/\s+$/,"")).join("|"));
+      else console.log("OK");
+      db.detach();process.exit(0);});});' 2>/dev/null
+}
+ran=$((ran + 1))
+a=$(node_qa "SELECT COUNT(*) FROM K WHERE S = ?" "a ")
+if [ "$a" = "1" ]; then
+    echo "OK   a bound 'a ' pads to the one 'a' row through the collation"
+else
+    echo "DIFF bound-param collated equality: [$a] (want 1)"
+    fail=1
+fi
+ran=$((ran + 1))
+a=$(node_qa "SELECT COUNT(*) FROM K WHERE S < ?" "b")
+if [ "$a" = "9" ]; then
+    echo "OK   a bound range compares by the collation (accents ride their bases)"
+else
+    echo "DIFF bound-param collated range: [$a] (want 9)"
+    fail=1
+fi
+
 # --- 3. fire-crab WRITES, the ENGINE's index reads ---------------------
 ran=$((ran + 1))
 r=$(node_q "INSERT INTO K VALUES ('mésa')")
@@ -164,8 +203,8 @@ fi
 
 kill $srv 2>/dev/null; srv=""
 rm -f "$RE" "$FC"
-if [ "$ran" -lt 13 ]; then
-    echo "DIFF only $ran checks ran (expected at least 13) - did one silently skip?"
+if [ "$ran" -lt 16 ]; then
+    echo "DIFF only $ran checks ran (expected at least 16) - did one silently skip?"
     fail=1
 fi
 exit $fail

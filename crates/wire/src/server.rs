@@ -6618,8 +6618,14 @@ impl Predicate {
                             None
                         };
                         if let Some(lit) = num_lit {
+                            // the per-row coercion reads the VALUE, so
+                            // a collation wrap steps aside for it
+                            let base = match lhs.as_ref() {
+                                Expr::CollKey(inner, _) => inner.clone(),
+                                _ => lhs.clone(),
+                            };
                             Term::ExprCond(Box::new(Cond2::Cmp(
-                                Box::new(Expr::TextNum(lhs.clone(), *cs)),
+                                Box::new(Expr::TextNum(base, *cs)),
                                 *op,
                                 Box::new(lit),
                             )))
@@ -6627,6 +6633,15 @@ impl Predicate {
                             match bind_literal(idx, kind)? {
                                 None => Term::Unknown, // compared with NULL: UNKNOWN
                                 Some(lit) => {
+                                    // a text value against a COLLATED
+                                    // side adopts the collation, like a
+                                    // literal in the statement text
+                                    let lit = match lhs.as_ref() {
+                                        Expr::CollKey(_, tt) => {
+                                            Expr::CollKey(Box::new(lit), *tt)
+                                        }
+                                        _ => lit,
+                                    };
                                     Term::ExprCond(Box::new(Cond2::Cmp(
                                         lhs.clone(),
                                         *op,
@@ -9517,7 +9532,7 @@ fn text_form_m(
                 _ => None,
             };
             match f {
-                SysFn::Upper | SysFn::Lower | SysFn::UpperCs(_) | SysFn::LowerCs(_) => arg(0),
+                SysFn::Upper | SysFn::Lower | SysFn::UpperCs(_) | SysFn::LowerCs(_) | SysFn::UpperColl(_) | SysFn::LowerColl(_) => arg(0),
                 SysFn::Trim(_) => arg(1).map(|(_, w, c)| (true, w, c)),
                 SysFn::Left | SysFn::Right | SysFn::Reverse => {
                     arg(0).map(|(_, w, c)| (true, w, c))
@@ -34106,6 +34121,13 @@ enum SysFn {
     UpperCs(u8),
     /// LOWER's twin of [SysFn::UpperCs].
     LowerCs(u8),
+    /// UPPER over a column under a REAL collation: the COLLATION's own
+    /// case tables (`coll::pxw_intl_case` - the Paradox
+    /// accent-stripping convention, UPPER('é') = 'E', LOWER keeps the
+    /// accent; validated byte-for-byte against the live engine).
+    UpperColl(u16),
+    /// LOWER's twin of [SysFn::UpperColl].
+    LowerColl(u16),
     /// SUBSTRING(s FROM start [FOR len]) - args [s, start] or
     /// [s, start, len]; start may be < 1 (the window clips), a negative
     /// len raises isc_bad_substring_length
@@ -34199,8 +34221,8 @@ impl SysFn {
     /// probed against isql).
     fn header(&self) -> &'static str {
         match self {
-            SysFn::Upper | SysFn::UpperCs(_) => "UPPER",
-            SysFn::Lower | SysFn::LowerCs(_) => "LOWER",
+            SysFn::Upper | SysFn::UpperCs(_) | SysFn::UpperColl(_) => "UPPER",
+            SysFn::Lower | SysFn::LowerCs(_) | SysFn::LowerColl(_) => "LOWER",
             SysFn::CharLength => "CHAR_LENGTH",
             SysFn::OctetLength | SysFn::OctetLengthCs(_) => "OCTET_LENGTH",
             SysFn::Substring => "SUBSTRING",
@@ -35698,6 +35720,8 @@ fn parse_sysfn_call(up: &str, b: &[char], pos: &mut usize) -> Option<RawExpr> {
         | SysFn::Lower
         | SysFn::UpperCs(_)
         | SysFn::LowerCs(_)
+        | SysFn::UpperColl(_)
+        | SysFn::LowerColl(_)
         | SysFn::CharLength
         | SysFn::OctetLength
         | SysFn::OctetLengthCs(_)
@@ -36266,7 +36290,15 @@ fn resolve_expr_inner(
                     let d0 = descs.get(*fid);
                     let cs = d0.map_or(0, |d| fire_crab_ods::intl::charset_id(d.sub_type));
                     let coll = d0.map_or(0, |d| fire_crab_ods::intl::collation_id(d.sub_type));
-                    if coll == 0
+                    let tt = d0.map_or(0, |d| d.sub_type as u16);
+                    if tt == fire_crab_ods::coll::TTYPE_PXW_INTL {
+                        // a REAL collation cases by its OWN tables
+                        if matches!(f, SysFn::Upper) {
+                            SysFn::UpperColl(tt)
+                        } else {
+                            SysFn::LowerColl(tt)
+                        }
+                    } else if coll == 0
                         && (fire_crab_ods::intl::tabled(cs)
                             || fire_crab_ods::intl::byte_carrier(cs))
                     {
@@ -38494,6 +38526,8 @@ impl Expr {
                     | SysFn::Lower
                     | SysFn::UpperCs(_)
                     | SysFn::LowerCs(_)
+                    | SysFn::UpperColl(_)
+                    | SysFn::LowerColl(_)
                     | SysFn::Substring
                     | SysFn::Trim(_)
                     | SysFn::Left
@@ -39469,6 +39503,31 @@ impl Expr {
                     // 0x83 UPPER) raises the engine's 22018 vector. A
                     // byte-carrier's set answers None: ASCII-only case,
                     // the engine's law for NONE (probed, 'é' untouched)
+                    SysFn::UpperColl(_tt) | SysFn::LowerColl(_tt) => {
+                        let up = matches!(f, SysFn::UpperColl(_));
+                        let t = fn_text(&vs[0]);
+                        let mut out = String::with_capacity(t.len());
+                        for c in t.chars() {
+                            match fire_crab_ods::intl::encode_text(
+                                fire_crab_ods::intl::CS_WIN1252,
+                                &c.to_string(),
+                            ) {
+                                Ok(Some(b)) if b.len() == 1 => {
+                                    let m = fire_crab_ods::coll::pxw_intl_case(b[0], up);
+                                    match fire_crab_ods::intl::decode_text(
+                                        fire_crab_ods::intl::CS_WIN1252,
+                                        &[m],
+                                    ) {
+                                        Some(d) => out.push_str(&d),
+                                        None => out.push(c),
+                                    }
+                                }
+                                // not of the set (defensive): unchanged
+                                _ => out.push(c),
+                            }
+                        }
+                        Value::Text(out)
+                    }
                     SysFn::UpperCs(cs) | SysFn::LowerCs(cs) => {
                         let up = matches!(f, SysFn::UpperCs(_));
                         let t = fn_text(&vs[0]);
@@ -47783,6 +47842,8 @@ fn expr_no_raise(e: &Expr, descs: &[Descriptor]) -> bool {
                 | SysFn::Lower
                 | SysFn::UpperCs(_)
                 | SysFn::LowerCs(_)
+                | SysFn::UpperColl(_)
+                | SysFn::LowerColl(_)
                 | SysFn::CharLength
                 | SysFn::OctetLength
         | SysFn::OctetLengthCs(_)
@@ -48104,6 +48165,22 @@ fn param_or_typed_term(
     match raw {
         RawKind::Cmp(op, Rhs::Param(slot, _)) => {
             claim(slot)?;
+            // a `?` against a COLLATED column compares by the
+            // collation like a literal does: the ExprParam's lhs is
+            // already the CollKey wrap, and the BIND arm wraps the
+            // arriving text value to match ([Term::ExprParam])
+            if matches!(kind, ColKind::Text)
+                && d.sub_type as u16 == fire_crab_ods::coll::TTYPE_PXW_INTL
+            {
+                let tt = fire_crab_ods::coll::TTYPE_PXW_INTL;
+                return Some(Term::ExprParam(
+                    Box::new(Expr::CollKey(Box::new(Expr::Col(idx)), tt)),
+                    op,
+                    slot,
+                    ColKind::Text,
+                    fire_crab_ods::intl::CS_UTF8,
+                ));
+            }
             Some(Term::Cmp(idx, op, Rhs::Param(slot, kind)))
         }
         RawKind::Like(Rhs::Param(slot, _), escape, negated) => match kind {
