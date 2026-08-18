@@ -225,6 +225,30 @@ measured or pinned items**, each recorded in its own place below:
   alias TextCs beside Text, and the byte compare answers through the
   same parameter with no lift and no double encoding.
   serve-real-xlit.sh 42 -> 46.
+
+  **UPPER/LOWER take the CHARSET's own case law** — generated from the
+  live engine like the codepage tables (`UNICODE_VAL(UPPER(S))` over
+  one-byte rows, all five tabled sets). The law is per-charset, not
+  Unicode's: WIN1252 'ß' upcases to ITSELF (Rust's full mapping says
+  "SS" — a length change the engine never makes, and the UTF8 UPPER
+  keeps 'ß' too, so the default arm switched to the SIMPLE mapping);
+  ISO8859_1's 'ÿ' has no pair and stays while WIN1252's becomes 'Ÿ';
+  and exactly ONE cell errors — WIN1252 0x83 'ƒ' UPPER raises the
+  engine's 22018 (no 'Ƒ' in cp1252) while its LOWER answers. Wrapped
+  at the OctetLengthCs seam (`SysFn::UpperCs`/`LowerCs`, stamped at
+  resolution; a byte-carrier column cases ASCII only, probed).
+  serve-real-xlit.sh 46 -> 57 with UPPER and LOWER over every letter
+  byte of the three generated sets compared against the engine.
+  DEFAULT collation only, measured: a REAL collation carries its OWN
+  case tables — PXW_INTL upcases 'é' to 'E' (accent-stripping, the
+  Paradox convention) and does NOT raise on 'ƒ' — so a collated
+  column keeps the simple-mapping arm until the collation driver is
+  converted (recorded divergence: fc answers 'É' there). The driver
+  itself is in reach: the vendored source ships the whole narrow
+  machinery (lc_narrow.cpp string_to_key — primary bytes ++
+  secondaries ++ tertiaries ++ 0x00+specials — with
+  collations/pw1252intl.h's SortOrder/case/Compress/Expansion
+  tables), the next conversion slice, not a held boundary.
   serve-real-xlit.sh 17 -> 20. ~~Still held: the untabled codepages~~ —
   three more TAKEN: WIN1250, WIN1251 and ISO8859_2, and their tables
   were GENERATED FROM THE LIVE ENGINE rather than typed from a chart:

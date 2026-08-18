@@ -9517,7 +9517,7 @@ fn text_form_m(
                 _ => None,
             };
             match f {
-                SysFn::Upper | SysFn::Lower => arg(0),
+                SysFn::Upper | SysFn::Lower | SysFn::UpperCs(_) | SysFn::LowerCs(_) => arg(0),
                 SysFn::Trim(_) => arg(1).map(|(_, w, c)| (true, w, c)),
                 SysFn::Left | SysFn::Right | SysFn::Reverse => {
                     arg(0).map(|(_, w, c)| (true, w, c))
@@ -31169,6 +31169,26 @@ const GDS_CONVERT_ERROR: i32 = 335544334;
 /// It belongs to THIS vector only: the 23000 key value (print_key), the
 /// -204/-206 unknown-name arguments and the -104 token all carry the
 /// raw byte on the engine's own wire.
+/// Unicode SIMPLE case mapping: a character whose full mapping is
+/// more than one character ('ß' -> "SS", the ligatures) has no simple
+/// pair and stays itself - which is what the engine answers for a UTF8
+/// value (UPPER('ß') is 'ß', probed live).
+fn simple_case(t: &str, upper: bool) -> String {
+    let mut out = String::with_capacity(t.len());
+    for c in t.chars() {
+        if upper {
+            let mut it = c.to_uppercase();
+            let first = it.next().unwrap_or(c);
+            out.push(if it.next().is_some() { c } else { first });
+        } else {
+            let mut it = c.to_lowercase();
+            let first = it.next().unwrap_or(c);
+            out.push(if it.next().is_some() { c } else { first });
+        }
+    }
+    out
+}
+
 fn conversion_error_arg(text: &str) -> String {
     conversion_error_arg_bytes(text.as_bytes())
 }
@@ -34048,6 +34068,15 @@ enum SysFn {
     /// decoded text (5). Rewritten from `OctetLength` at resolution,
     /// where the descriptor is at hand.
     OctetLengthCs(u8),
+    /// UPPER over a column of a tabled or byte-carrier set: the case
+    /// law is the CHARSET's own (`intl::case_char`, tables generated
+    /// from the live engine - WIN1252 'ß' stays 'ß', ISO8859_1's 'ÿ'
+    /// has no pair, WIN1252 0x83 UPPER raises 22018), and a carrier
+    /// cases ASCII only (probed: a NONE 'é' byte is untouched).
+    /// Rewritten from `Upper` at resolution, the OctetLengthCs seam.
+    UpperCs(u8),
+    /// LOWER's twin of [SysFn::UpperCs].
+    LowerCs(u8),
     /// SUBSTRING(s FROM start [FOR len]) - args [s, start] or
     /// [s, start, len]; start may be < 1 (the window clips), a negative
     /// len raises isc_bad_substring_length
@@ -34141,8 +34170,8 @@ impl SysFn {
     /// probed against isql).
     fn header(&self) -> &'static str {
         match self {
-            SysFn::Upper => "UPPER",
-            SysFn::Lower => "LOWER",
+            SysFn::Upper | SysFn::UpperCs(_) => "UPPER",
+            SysFn::Lower | SysFn::LowerCs(_) => "LOWER",
             SysFn::CharLength => "CHAR_LENGTH",
             SysFn::OctetLength | SysFn::OctetLengthCs(_) => "OCTET_LENGTH",
             SysFn::Substring => "SUBSTRING",
@@ -35638,6 +35667,8 @@ fn parse_sysfn_call(up: &str, b: &[char], pos: &mut usize) -> Option<RawExpr> {
     let (min, max) = match f {
         SysFn::Upper
         | SysFn::Lower
+        | SysFn::UpperCs(_)
+        | SysFn::LowerCs(_)
         | SysFn::CharLength
         | SysFn::OctetLength
         | SysFn::OctetLengthCs(_)
@@ -36190,6 +36221,31 @@ fn resolve_expr_inner(
                     if fire_crab_ods::intl::tabled(cs) || fire_crab_ods::intl::byte_carrier(cs)
                     {
                         SysFn::OctetLengthCs(cs)
+                    } else {
+                        *f
+                    }
+                }
+                // UPPER/LOWER over such a column takes the CHARSET's
+                // case law (intl::case_char, engine-generated tables;
+                // a carrier cases ASCII only) - same seam, same reason.
+                // DEFAULT collation only: a real collation carries its
+                // OWN case tables (probed: PXW_INTL upcases 'é' to 'E'
+                // - accent-stripping - and does NOT raise on 'ƒ'), so
+                // a collated column keeps the untabled arm until the
+                // collation driver is converted.
+                (SysFn::Upper | SysFn::Lower, [Expr::Col(fid)]) => {
+                    let d0 = descs.get(*fid);
+                    let cs = d0.map_or(0, |d| fire_crab_ods::intl::charset_id(d.sub_type));
+                    let coll = d0.map_or(0, |d| fire_crab_ods::intl::collation_id(d.sub_type));
+                    if coll == 0
+                        && (fire_crab_ods::intl::tabled(cs)
+                            || fire_crab_ods::intl::byte_carrier(cs))
+                    {
+                        if matches!(f, SysFn::Upper) {
+                            SysFn::UpperCs(cs)
+                        } else {
+                            SysFn::LowerCs(cs)
+                        }
                     } else {
                         *f
                     }
@@ -38394,6 +38450,8 @@ impl Expr {
                     },
                     SysFn::Upper
                     | SysFn::Lower
+                    | SysFn::UpperCs(_)
+                    | SysFn::LowerCs(_)
                     | SysFn::Substring
                     | SysFn::Trim(_)
                     | SysFn::Left
@@ -39336,13 +39394,41 @@ impl Expr {
                             _ => Value::Null, // type-checked away
                         }
                     }
-                    // Unicode case mapping. Exact for a UTF8 database
-                    // (the engine goes through ICU); a NONE-charset
-                    // column's non-ASCII bytes were already lossy at
-                    // decode, so ASCII - where the two agree - is what
-                    // actually reaches here either way.
-                    SysFn::Upper => Value::Text(fn_text(&vs[0]).to_uppercase()),
-                    SysFn::Lower => Value::Text(fn_text(&vs[0]).to_lowercase()),
+                    // Unicode SIMPLE case mapping, per character.
+                    // The engine's UPPER on a UTF8 value keeps 'ß'
+                    // (probed) where Rust's FULL to_uppercase answers
+                    // "SS" - a char whose full mapping is more than
+                    // one character has no simple pair and stays
+                    // itself. ~~a NONE column's non-ASCII bytes were
+                    // already lossy at decode~~ - stale twice over:
+                    // carrier columns decode losslessly now AND their
+                    // UPPER is the ASCII-only [SysFn::UpperCs] arm.
+                    SysFn::Upper => Value::Text(simple_case(&fn_text(&vs[0]), true)),
+                    SysFn::Lower => Value::Text(simple_case(&fn_text(&vs[0]), false)),
+                    // the CHARSET's own case law, tables generated from
+                    // the live engine; the one unmappable cell (WIN1252
+                    // 0x83 UPPER) raises the engine's 22018 vector. A
+                    // byte-carrier's set answers None: ASCII-only case,
+                    // the engine's law for NONE (probed, 'é' untouched)
+                    SysFn::UpperCs(cs) | SysFn::LowerCs(cs) => {
+                        let up = matches!(f, SysFn::UpperCs(_));
+                        let t = fn_text(&vs[0]);
+                        let mut out = String::with_capacity(t.len());
+                        for c in t.chars() {
+                            match fire_crab_ods::intl::case_char(*cs, c, up) {
+                                Some(Ok(m)) => out.push(m),
+                                Some(Err(())) => {
+                                    return Err(EvalErr::TransliterationFailed)
+                                }
+                                None => out.push(if up {
+                                    c.to_ascii_uppercase()
+                                } else {
+                                    c.to_ascii_lowercase()
+                                }),
+                            }
+                        }
+                        Value::Text(out)
+                    }
                     SysFn::CharLength => {
                         Value::Int(fn_text(&vs[0]).chars().count() as i64)
                     }
@@ -47602,6 +47688,8 @@ fn expr_no_raise(e: &Expr, descs: &[Descriptor]) -> bool {
             match f {
                 SysFn::Upper
                 | SysFn::Lower
+                | SysFn::UpperCs(_)
+                | SysFn::LowerCs(_)
                 | SysFn::CharLength
                 | SysFn::OctetLength
         | SysFn::OctetLengthCs(_)

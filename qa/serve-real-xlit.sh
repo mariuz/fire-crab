@@ -62,6 +62,12 @@ INSERT INTO XC VALUES (1, 'řeka', 'река', 'řeka');
 INSERT INTO XC VALUES (2, 'żółw', 'мышь', 'żółw');
 INSERT INTO XC VALUES (3, 'ascii', 'ascii', 'ascii');
 COMMIT;
+CREATE TABLE XF (ID INTEGER, W VARCHAR(4) CHARACTER SET WIN1252,
+                 L VARCHAR(4) CHARACTER SET ISO8859_1);
+COMMIT;
+INSERT INTO XF VALUES (1, 'ß', 'ÿ');
+INSERT INTO XF VALUES (2, 'ÿ', 'ß');
+COMMIT;
 EOF
     chmod 666 "$1"
 }
@@ -401,7 +407,61 @@ else
     fail=1
 fi
 
-# --- 8. a RAW-BYTE PARAMETER through a NONE attachment -----------------
+# --- 8. UPPER/LOWER by the CHARSET's OWN case law ----------------------
+# tables generated from the live engine like the codepage tables
+# (UNICODE_VAL(UPPER(S)) over one-byte rows). The law is per-charset,
+# not Unicode's: WIN1252 'ß' upcases to ITSELF (Rust's full mapping
+# says "SS"), WIN1252 'ÿ' becomes 'Ÿ' (0x9F) while ISO8859_1's stays
+# (no 'Ÿ' there), and exactly one cell ERRORS - WIN1252 0x83 'ƒ'
+# UPPER, whose 'Ƒ' has no cp1252 image (engine 22018, probed).
+twin "WIN1252 'ß' upcases to ITSELF, its 'ÿ' to 'Ÿ'" \
+     "SELECT ID, UPPER(W) AS UW FROM XF ORDER BY ID"
+twin "ISO8859_1 'ÿ' has no pair and stays; its 'ß' stays too" \
+     "SELECT ID, UPPER(L) AS UL FROM XF ORDER BY ID"
+twin "... and LOWER walks back what has a pair" \
+     "SELECT ID, LOWER(UPPER(W)) AS RT FROM XF ORDER BY ID"
+twin "UPPER over every WIN1250 letter byte" \
+     "SELECT ID, UPPER(S) AS U FROM B1250 WHERE ID >= 161 AND ID <> 173 ORDER BY ID"
+twin "LOWER over every WIN1250 letter byte" \
+     "SELECT ID, LOWER(S) AS L FROM B1250 WHERE ID >= 161 AND ID <> 173 ORDER BY ID"
+twin "UPPER over every WIN1251 letter byte" \
+     "SELECT ID, UPPER(S) AS U FROM B1251 WHERE ID >= 161 AND ID <> 173 ORDER BY ID"
+twin "LOWER over every WIN1251 letter byte" \
+     "SELECT ID, LOWER(S) AS L FROM B1251 WHERE ID >= 161 AND ID <> 173 ORDER BY ID"
+twin "UPPER over every ISO8859_2 letter byte" \
+     "SELECT ID, UPPER(S) AS U FROM B8859 WHERE ID >= 161 AND ID <> 173 ORDER BY ID"
+twin "LOWER over every ISO8859_2 letter byte" \
+     "SELECT ID, LOWER(S) AS L FROM B8859 WHERE ID >= 161 AND ID <> 173 ORDER BY ID"
+# the one ERRORING cell: seeded as a raw byte so no attachment ever
+# transliterates it on the way in
+"$ISQL" -q -b -ch NONE -user "$U" -pas "$P" "$FC" <<'EOF' >/dev/null 2>&1
+INSERT INTO XF VALUES (9, x'83', 'x');
+COMMIT;
+EOF
+"$ISQL" -q -b -ch NONE -user "$U" -pas "$P" "$RE" <<'EOF' >/dev/null 2>&1
+INSERT INTO XF VALUES (9, x'83', 'x');
+COMMIT;
+EOF
+ran=$((ran + 1))
+r=$(node_q "SELECT UPPER(W) FROM XF WHERE ID = 9")
+e=$(printf "SELECT UPPER(W) FROM XF WHERE ID = 9;\n" | "$ISQL" -q -b -ch UTF8 -user "$U" -pas "$P" "$RE" 2>&1 | grep -c "SQLSTATE = 22018")
+if [ "$r" = "ERR" ] && [ "$e" -ge 1 ]; then
+    echo "OK   UPPER of WIN1252 0x83: fc raises where the engine raises 22018"
+else
+    echo "DIFF the erroring case cell: fc [$r], engine 22018-count $e"
+    fail=1
+fi
+ran=$((ran + 1))
+a=$(node_q "SELECT LOWER(W) FROM XF WHERE ID = 9")
+b=$(isql_q "$RE" "SELECT LOWER(W) FROM XF WHERE ID = 9")
+if [ "$a" = "$b" ] && [ -n "$a" ] && [ "$a" != "ERR" ]; then
+    echo "OK   ... while LOWER of the same byte answers on both sides"
+else
+    echo "DIFF LOWER of 0x83: fc [$a] engine [$b]"
+    fail=1
+fi
+
+# --- 9. a RAW-BYTE PARAMETER through a NONE attachment -----------------
 # a parameter's bytes mean what the ATTACHMENT charset says (probed on
 # the live engine): under a NONE attachment they are BYTES - stored
 # verbatim into a NONE or single-byte column, refused by a UTF8 one
@@ -480,8 +540,8 @@ fi
 
 kill $srv 2>/dev/null; srv=""
 rm -f "$RE" "$FC"
-if [ "$ran" -lt 46 ]; then
-    echo "DIFF only $ran checks ran (expected at least 46) - did one silently skip?"
+if [ "$ran" -lt 57 ]; then
+    echo "DIFF only $ran checks ran (expected at least 57) - did one silently skip?"
     fail=1
 fi
 exit $fail
