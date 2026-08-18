@@ -377,6 +377,39 @@ else
 fi
 rm -f "$FNDB" "$D/fc-gbak-fn.fbk" "$D/fc-gbak-fnr.fdb"
 
+# SQL ROLES RIDE (rec 36 - name, owner, and the eight zero bytes of a
+# plain role's privilege block): the ENGINE restores fc's backup, the
+# roles are there and a live GRANT lands on one
+RLDB="$D/fc-gbak-rl.fdb"; rm -f "$RLDB" "$D/fc-gbak-rl.fbk" "$D/fc-gbak-rlr.fdb"
+"$ISQL" -q -b -user "$U" -pas "$P" <<EOF >/dev/null 2>&1
+CREATE DATABASE '$RLDB' USER '$U' PASSWORD '$P' PAGE_SIZE 8192;
+CREATE TABLE T (X INTEGER);
+COMMIT;
+CREATE ROLE R_APP;
+CREATE ROLE R_AUDIT;
+COMMIT;
+EOF
+chmod 666 "$RLDB"
+ran=$((ran + 1))
+fo=$(svc_backup "$FMGR" "$RLDB" "$D/fc-gbak-rl.fbk")
+if [ "${fo##*rc=}" = "0" ]; then
+    echo "OK   a SQL ROLE rides the backup (fc backs it up)"
+else
+    echo "DIFF role backup: [$fo]"; fail=1
+fi
+ran=$((ran + 1))
+sudo -n chmod 666 "$D/fc-gbak-rl.fbk" 2>/dev/null || chmod 666 "$D/fc-gbak-rl.fbk" 2>/dev/null
+"$FBSVCMGR" "$EMGR" user "$U" password "$P" action_restore dbname "$D/fc-gbak-rlr.fdb" bkp_file "$D/fc-gbak-rl.fbk" >/dev/null 2>&1
+grab "$D/fc-gbak-rlr.fdb"
+got=$(printf "SELECT TRIM(RDB\$ROLE_NAME) || '.' FROM RDB\$ROLES WHERE RDB\$SYSTEM_FLAG=0 ORDER BY 1;\nGRANT R_AUDIT TO PUBLIC;\n" |
+    "$ISQL" -q -b -user "$U" -pas "$P" "$D/fc-gbak-rlr.fdb" 2>&1 | grep -cE 'R_APP\.|R_AUDIT\.')
+if [ "$got" = "2" ]; then
+    echo "OK   the ENGINE restores fc's fbk: both roles present, a GRANT lands"
+else
+    echo "DIFF roles after engine restore: match-count [$got] (want 2)"; fail=1
+fi
+rm -f "$RLDB" "$D/fc-gbak-rl.fbk" "$D/fc-gbak-rlr.fdb"
+
 # --- 4. RECORDED BOUNDARY: NOT NULL is not carried ---------------------------
 NN="$D/fc-gbak-nn.fdb"; rm -f "$NN"
 "$ISQL" -q -b -user "$U" -pas "$P" <<EOF >/dev/null 2>&1

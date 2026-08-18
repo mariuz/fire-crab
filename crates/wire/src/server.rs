@@ -3085,6 +3085,11 @@ fn run_gbak_restore_core(
             .map(|h| h.page_size as usize)
             .ok_or("the fresh shell has no header")?;
         let mut file = fire_crab_ods::Image::from_bytes(&raw, page_size);
+        // the SQL ROLES - independent of everything, grants to them
+        // stay in the privilege set-aside (the recorded difference)
+        for name in &restored.roles {
+            fire_crab_ods::ddl::create_role(&mut file, page_size, name)?;
+        }
         // EXCEPTIONS first - nothing references them at restore time,
         // and create_exception's own counter numbers them in file
         // order, which is the catalog order the backup walked

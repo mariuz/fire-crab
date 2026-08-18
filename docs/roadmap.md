@@ -77,8 +77,17 @@ carried functions; the DETERMINISTIC flag, the argument names and a
 NOT NULL argument's validation (with its carried name in the error)
 survive both directions. External functions (UDF/UDR), packaged
 functions, argument DEFAULTs and BLOB-typed arguments refuse typed.
-A ROLE is the fail-closed representative now. What still refuses is
-typed and small (roles, packages, GTTs, expression-columned views).
+~~Roles refuse~~ — SQL ROLES RIDE (rec 36, gbak 30): name, owner,
+and the CHAR(8) OCTETS system-privilege block as a plain u8-length
+attribute — eight zero bytes for a plain CREATE ROLE, and a role
+that actually HOLDS system privileges refuses typed on both the
+writer's surface and the reader's walk. Both restores carry the
+roles and take a live GRANT; grants TO roles stay in the recorded
+privilege set-aside. PACKAGES joined the writer's fail-closed
+surface check (a bare package header has no member to refuse
+through) and a PACKAGE is the boundary representative now. What
+still refuses is typed and small (packages, GTTs,
+expression-columned views).
 
 The subsystem map's rows fall into three states, and the difference
 matters more than the row count:

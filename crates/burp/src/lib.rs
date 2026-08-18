@@ -49,6 +49,7 @@ mod rec {
     pub const FUNCTION: u8 = 15;
     pub const FUNCTION_ARG: u8 = 16;
     pub const FUNCTION_END: u8 = 17;
+    pub const SQL_ROLES: u8 = 36;
     pub const REL_CONSTRAINT: u8 = 31;
     pub const REF_CONSTRAINT: u8 = 32;
     pub const CHK_CONSTRAINT: u8 = 33;
@@ -103,6 +104,14 @@ impl<'a> Rec<'a> {
         self.out.extend_from_slice(&b[..n]);
         self
     }
+    fn bytes(self, att: u8, b: &[u8]) -> Self {
+        let n = b.len().min(255);
+        self.out.push(att);
+        self.out.push(n as u8);
+        self.out.extend_from_slice(&b[..n]);
+        self
+    }
+
     fn end(self) {
         self.out.push(0); // att_end
     }
@@ -313,7 +322,7 @@ pub fn write_backup_verbose(
     // must read, not guess (RDB$GENERATORS is relation 20, not the 10
     // a first guess said, and the gate caught it).
     for (what, rel_name) in [
-        ("a role", "RDB$ROLES"),
+        ("a package", "RDB$PACKAGES"),
     ] {
         if user_rows_in(image, page_size, rel_name) > 0 {
             return Err(Refused(format!("{} is outside this backup's surface", what)));
@@ -1048,6 +1057,14 @@ pub fn write_backup_verbose(
             .end();
     }
     log.push("gbak:writing SQL roles".into());
+    for (name, owner) in read_roles(image, page_size)? {
+        log.push(format!("gbak:    writing SQL role: \"{}\"", name));
+        Rec::new(&mut out, rec::SQL_ROLES)
+            .text(1, &name)
+            .text(2, &owner)
+            .bytes(4, &[0u8; 8])
+            .end();
+    }
     log.push("gbak:writing names mapping".into());
     log.push("gbak:writing publications".into());
     log.push("gbak:writing constants".into());
@@ -1940,6 +1957,42 @@ fn field_type_of(
     None
 }
 
+/// The user SQL ROLES: name and owner. The record's att 4 is the
+/// CHAR(8) OCTETS system-privilege block, a plain u8-length attribute;
+/// a role that actually HOLDS system privileges refuses typed - this
+/// writer emits the eight zero bytes a plain CREATE ROLE owns.
+fn read_roles(
+    image: &fire_crab_ods::Image,
+    page_size: usize,
+) -> Result<Vec<(String, String)>, Refused> {
+    let Some((cols, rows)) = sys_rows(image, page_size, "RDB$ROLES") else {
+        return Ok(Vec::new());
+    };
+    let at = |n: &str| cols.iter().find(|(c, _)| c.eq_ignore_ascii_case(n)).map(|(_, i)| *i);
+    let mut out = Vec::new();
+    for r in &rows {
+        if matches!(
+            at("RDB$SYSTEM_FLAG").and_then(|i| r.values.get(i)),
+            Some(fire_crab_ods::format::Value::Int(n)) if *n != 0
+        ) {
+            continue;
+        }
+        let Some(name) = text_opt(r, at("RDB$ROLE_NAME")) else { continue };
+        if let Some(fire_crab_ods::format::Value::Text(t)) =
+            at("RDB$SYSTEM_PRIVILEGES").and_then(|i| r.values.get(i))
+        {
+            if t.bytes().any(|b| b != 0 && b != b' ') {
+                return Err(Refused(format!(
+                    "role {} holds SYSTEM PRIVILEGES - outside this backup's surface",
+                    name
+                )));
+            }
+        }
+        out.push((name, text_opt(r, at("RDB$OWNER_NAME")).unwrap_or_default()));
+    }
+    Ok(out)
+}
+
 /// The user EXCEPTIONS: name and message text (RDB$MESSAGE is a
 /// plain VARCHAR - the record's att 2 is an ordinary text attribute,
 /// not a framed blob).
@@ -2250,6 +2303,8 @@ pub struct Restored {
     pub exceptions: Vec<(String, String)>,
     /// the carried PSQL functions, file order
     pub functions: Vec<RFunc>,
+    /// the user SQL roles, file order
+    pub roles: Vec<String>,
     /// privilege records seen and set aside - the count keeps the
     /// omission visible in the trace instead of silent
     pub privileges_skipped: u64,
@@ -2458,6 +2513,7 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
         procedures: Vec::new(),
         exceptions: Vec::new(),
         functions: Vec::new(),
+        roles: Vec::new(),
         privileges_skipped: 0,
     };
     // (schema, source name) -> not-null flag learned from constraints
@@ -2839,6 +2895,22 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                         .ok_or_else(|| Refused("an exception with no name".into()))?,
                     att(&atts, 2).map(|a| a.text()).unwrap_or_default(),
                 ));
+            }
+            rec::SQL_ROLES => {
+                let atts = read_atts(f, &mut at)?;
+                if let Some(pv) = att(&atts, 4) {
+                    if pv.data.iter().any(|b| *b != 0) {
+                        return Err(Refused(
+                            "a role with SYSTEM PRIVILEGES is outside this restore's surface"
+                                .into(),
+                        ));
+                    }
+                }
+                out.roles.push(
+                    att(&atts, 1)
+                        .map(|a| a.text())
+                        .ok_or_else(|| Refused("a role with no name".into()))?,
+                );
             }
             rec::GENERATOR => {
                 let atts = read_atts(f, &mut at)?;
