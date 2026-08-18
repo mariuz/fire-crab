@@ -492,6 +492,18 @@ pub fn write_backup_verbose(
         }
     }
 
+    // the VIEWS read early: an EXPRESSION column's invented domain
+    // must ride the domain section below, so the counter assigns now
+    let mut views = read_views(image, page_size, &view_rels, &rel_cols)?;
+    for v in views.iter_mut() {
+        for f in v.fields.iter_mut() {
+            if f.base_field.is_empty() {
+                f.source = format!("RDB${}", next_source);
+                next_source += 1;
+            }
+        }
+    }
+
     // --- rec_global_field: one per column, in file order ------------------
     log.push("gbak:writing domains".into());
     for (_, _, cols) in &rel_cols {
@@ -576,6 +588,32 @@ pub fn write_backup_verbose(
         }
     }
 
+    // ... and one per EXPRESSION view column, carrying the
+    // expression's own resolved type
+    for v in &views {
+        for f in &v.fields {
+            if !f.base_field.is_empty() {
+                continue;
+            }
+            log.push(format!("gbak:    writing domain \"PUBLIC\".\"{}\"", f.source));
+            let mut r = Rec::new(&mut out, rec::GLOBAL_FIELD)
+                .text(48, "PUBLIC")
+                .text(1, &f.source)
+                .int(8, f.ftype)
+                .int(10, f.length)
+                .int(9, f.scale)
+                .int(11, f.sub_type);
+            if let Some(cb) = &f.computed_blr {
+                r = r.blob(18, cb);
+            }
+            if f.ftype == 37 || f.ftype == 14 {
+                r.int(41, f.length).int(42, 0).int(43, 0).end()
+            } else {
+                r.int(44, f.precision.unwrap_or(0) as i32).end()
+            }
+        }
+    }
+
     // --- per relation: rec_relation + fields + end -----------------------
     log.push("gbak:writing shadow files".into());
     log.push("gbak:writing character sets".into());
@@ -630,8 +668,8 @@ pub fn write_backup_verbose(
     }
 
     // --- the VIEWS: relation records with the two blobs, their fields
-    // referencing the BASE columns' domains, and the context records
-    let views = read_views(image, page_size, &view_rels, &rel_cols)?;
+    // referencing the BASE columns' domains (or the expression
+    // domains minted above), and the context records
     for v in &views {
         log.push(format!("gbak:    writing view \"PUBLIC\".\"{}\"", v.name));
         Rec::new(&mut out, rec::RELATION)
@@ -644,7 +682,7 @@ pub fn write_backup_verbose(
             .end();
         for (i, f) in v.fields.iter().enumerate() {
             log.push(format!("gbak:         writing column \"{}\"", f.name));
-            Rec::new(&mut out, rec::FIELD)
+            let r = Rec::new(&mut out, rec::FIELD)
                 .text(1, &f.name)
                 .text(48, "PUBLIC")
                 .text(2, &f.source)
@@ -655,11 +693,17 @@ pub fn write_backup_verbose(
                 // att_field_number - what the restore derives the
                 // relation's RDB$FIELD_ID from; without it the field
                 // vector sizes to ZERO and every column vanishes
-                .int(22, (i + 1) as i32)
-                .int(34, 1) // att_field_update_flag
-                .int(4, f.view_context as i32) // att_view_context
-                .text(3, &f.base_field)
-                .end();
+                .int(22, (i + 1) as i32);
+            if f.base_field.is_empty() {
+                // an EXPRESSION column, the measured shape: read-only,
+                // context 0, computed_flag 1, and NO base-field att
+                r.int(34, 0).int(4, 0).int(23, 1).end();
+            } else {
+                r.int(34, 1) // att_field_update_flag
+                    .int(4, f.view_context as i32) // att_view_context
+                    .text(3, &f.base_field)
+                    .end();
+            }
         }
         for (rel, ctx, cname) in &v.contexts {
             Rec::new(&mut out, rec::VIEW)
@@ -1567,13 +1611,20 @@ struct UView {
 struct UViewField {
     name: String,
     position: i64,
+    /// empty for an EXPRESSION column (no base - the measured record
+    /// carries computed_flag 1 and NO att 3)
     base_field: String,
     view_context: i64,
-    /// the writer-invented domain of the BASE column
+    /// the writer-invented domain: the BASE column's for a plain view
+    /// field, a fresh one carrying the EXPRESSION's own type otherwise
     source: String,
     ftype: i32,
     length: i32,
     scale: i32,
+    sub_type: i32,
+    /// the expression's BLR off the domain (expression columns only)
+    computed_blr: Option<Vec<u8>>,
+    precision: Option<i64>,
 }
 
 fn read_views(
@@ -1656,10 +1707,47 @@ fn read_views(
             let Some(fname) = text_opt(fr, fat("RDB$FIELD_NAME")) else { continue };
             let base = text_opt(fr, fat("RDB$BASE_FIELD")).unwrap_or_default();
             if base.is_empty() {
-                return Err(Refused(format!(
-                    "view {}: column {} is an expression - outside this backup's surface",
-                    vname, fname
-                )));
+                // an EXPRESSION column: no base - its type AND its
+                // expression live on its OWN RDB$n domain (measured;
+                // A*2 promotes to BIGINT on the domain, and the
+                // expression itself is the domain's COMPUTED_BLR,
+                // subtype 2 - without it the engine answers "cannot
+                // access column" to the restored view)
+                let src = text_opt(fr, fat("RDB$FIELD_SOURCE")).unwrap_or_default();
+                let f = field_type_of(image, page_size, &src).ok_or_else(|| {
+                    Refused(format!(
+                        "view {}: expression column {}: its domain {} is unreadable",
+                        vname, fname, src
+                    ))
+                })?;
+                if f.0 == 261 {
+                    return Err(Refused(format!(
+                        "view {}: a BLOB-typed expression column is outside this backup's surface",
+                        vname
+                    )));
+                }
+                let (computed_blr, precision) =
+                    domain_computed_of(image, page_size, &src);
+                let computed_blr = Some(computed_blr.ok_or_else(|| {
+                    Refused(format!(
+                        "view {}: expression column {}: its domain {} carries no expression",
+                        vname, fname, src
+                    ))
+                })?);
+                fields.push(UViewField {
+                    name: fname,
+                    position: fint(fr, fat("RDB$FIELD_POSITION")),
+                    base_field: String::new(),
+                    view_context: 0,
+                    source: String::new(), // minted by the caller
+                    ftype: f.0 as i32,
+                    length: f.1 as i32,
+                    scale: f.2 as i32,
+                    sub_type: f.3 as i32,
+                    computed_blr,
+                    precision,
+                });
+                continue;
             }
             let ctx = fint(fr, fat("RDB$VIEW_CONTEXT"));
             // the BASE column, through the context's relation
@@ -1684,6 +1772,9 @@ fn read_views(
                 ftype: rdb_field_type(&bc.desc).unwrap_or(8),
                 length: bc.desc.length as i32,
                 scale: bc.desc.scale as i32,
+                sub_type: bc.desc.sub_type as i32,
+                computed_blr: None,
+                precision: None,
             });
         }
         fields.sort_by_key(|f| f.position);
@@ -1983,6 +2074,37 @@ fn read_procedures(
         });
     }
     Ok(out)
+}
+
+/// A domain's COMPUTED_BLR blob and precision off its RDB$FIELDS row.
+fn domain_computed_of(
+    image: &fire_crab_ods::Image,
+    page_size: usize,
+    domain: &str,
+) -> (Option<Vec<u8>>, Option<i64>) {
+    let Some((cols, rows)) = sys_rows(image, page_size, "RDB$FIELDS") else {
+        return (None, None);
+    };
+    let Some(frel) = fire_crab_ods::resolve_relation(image, page_size, "RDB$FIELDS") else {
+        return (None, None);
+    };
+    let at = |n: &str| cols.iter().find(|(c, _)| c.eq_ignore_ascii_case(n)).map(|(_, i)| *i);
+    for r in &rows {
+        if text_opt(r, at("RDB$FIELD_NAME")).as_deref() == Some(domain) {
+            let blr = match at("RDB$COMPUTED_BLR").and_then(|i| r.values.get(i)) {
+                Some(fire_crab_ods::format::Value::Blob(_, num)) => {
+                    fire_crab_blb::read_blob_content(image, page_size, frel, *num)
+                }
+                _ => None,
+            };
+            let prec = match at("RDB$FIELD_PRECISION").and_then(|i| r.values.get(i)) {
+                Some(fire_crab_ods::format::Value::Int(n)) => Some(*n),
+                _ => None,
+            };
+            return (blr, prec);
+        }
+    }
+    (None, None)
 }
 
 /// A domain's (type, length, scale, sub_type) off its RDB$FIELDS row.
@@ -2387,7 +2509,7 @@ pub struct RTable {
     pub view_blr: Option<Vec<u8>>,
     pub view_source: Option<Vec<u8>>,
     /// (name, source domain, base field, context, position)
-    pub view_fields: Vec<(String, String, String, i64, i64)>,
+    pub view_fields: Vec<(String, String, String, i64, i64, bool)>,
     /// (base relation, context id, context name)
     pub view_contexts: Vec<(String, i64, String)>,
 }
@@ -2435,6 +2557,9 @@ pub struct Restored {
     pub functions: Vec<RFunc>,
     /// the user SQL roles, file order
     pub roles: Vec<String>,
+    /// domains carrying a COMPUTED expression (an expression view
+    /// column's), by name
+    pub domain_computed: Vec<(String, Vec<u8>)>,
     /// the carried packages, file order
     pub packages: Vec<RPackage>,
     /// privilege records seen and set aside - the count keeps the
@@ -2659,6 +2784,7 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
         exceptions: Vec::new(),
         functions: Vec::new(),
         roles: Vec::new(),
+        domain_computed: Vec::new(),
         packages: Vec::new(),
         privileges_skipped: 0,
     };
@@ -2702,10 +2828,63 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                 // the column types arrive re-derived from the field
                 // records; the domain NAME is kept for the verbose
                 // stream's "restoring domain" lines, and the TYPE for
-                // the procedure parameters that reference the domain
-                let atts = read_atts(f, &mut at)?;
+                // the procedure parameters that reference the domain.
+                // Walked BY HAND: default (15), description (16),
+                // missing (17), computed blr/source (18/19) and
+                // validation blr/source (20/21) are int32-framed
+                // blobs - an EXPRESSION view column's domain carries
+                // its expression as computed_blr, and the generic
+                // walker desynced on the first one (measured)
+                let mut atts: Vec<Att> = Vec::new();
+                let mut computed: Option<Vec<u8>> = None;
+                loop {
+                    let tag = *f
+                        .get(at)
+                        .ok_or_else(|| Refused("truncated domain record".into()))?;
+                    at += 1;
+                    if tag == 0 {
+                        break;
+                    }
+                    let len = *f
+                        .get(at)
+                        .ok_or_else(|| Refused("truncated domain attribute".into()))?
+                        as usize;
+                    at += 1;
+                    let data = f
+                        .get(at..at + len)
+                        .ok_or_else(|| Refused("truncated domain attribute".into()))?
+                        .to_vec();
+                    at += len;
+                    if matches!(tag, 15..=21) {
+                        let mut n: i64 = 0;
+                        for (k, b) in data.iter().enumerate().take(8) {
+                            n |= (*b as i64) << (8 * k);
+                        }
+                        let n = n as usize;
+                        let raw = f
+                            .get(at..at + n)
+                            .ok_or_else(|| Refused("truncated domain blob".into()))?
+                            .to_vec();
+                        at += n;
+                        if tag == 18 {
+                            computed = Some(raw);
+                        }
+                        continue; // defaults/validation/descriptions set aside
+                    }
+                    atts.push(Att { tag, data });
+                }
                 if let Some(a) = att(&atts, 1) {
                     let name = a.text();
+                    // a NAMED domain restored as a plain type would
+                    // keep the data and silently change what the
+                    // schema MEANS - refuse until the named-domain
+                    // slice carries it whole
+                    if !name.starts_with("RDB$") {
+                        return Err(Refused(format!(
+                            "domain {} is outside this restore's surface",
+                            name
+                        )));
+                    }
                     out.domain_types.push((
                         name.clone(),
                         att(&atts, 8).map(|a| a.int()).unwrap_or(0),
@@ -2713,6 +2892,9 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                         att(&atts, 9).map(|a| a.int()).unwrap_or(0),
                         att(&atts, 11).map(|a| a.int()).unwrap_or(0),
                     ));
+                    if let Some(cb) = computed {
+                        out.domain_computed.push((name.clone(), cb));
+                    }
                     out.domains.push(name);
                 }
             }
@@ -3307,6 +3489,7 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                         att(&atts, 3).map(|a| a.text()).unwrap_or_default(),
                         att(&atts, 4).map(|a| a.int()).unwrap_or(1),
                         att(&atts, 13).map(|a| a.int()).unwrap_or(0),
+                        att(&atts, 23).map(|a| a.int()).unwrap_or(0) != 0,
                     ));
                     continue;
                 }

@@ -3272,17 +3272,46 @@ fn run_gbak_restore_core(
             let (Some(blr), Some(srcb)) = (&t.view_blr, &t.view_source) else {
                 continue;
             };
-            let fields: Vec<fire_crab_ods::ddl::RestoredViewField> = t
-                .view_fields
-                .iter()
-                .map(|(name, source, base, ctx, pos)| fire_crab_ods::ddl::RestoredViewField {
+            let mut fields: Vec<fire_crab_ods::ddl::RestoredViewField> = Vec::new();
+            for (name, source, base, ctx, pos, computed) in &t.view_fields {
+                // an EXPRESSION column's carried domain is re-minted
+                // with the type facts off the file's global-field
+                // record - nobody else creates its RDB$FIELDS row
+                let source = if *computed || base.is_empty() {
+                    let (_, ft, len, sc, st) = restored
+                        .domain_types
+                        .iter()
+                        .find(|(n, ..)| n == source)
+                        .ok_or_else(|| {
+                            format!(
+                                "view {}: expression column {}: its domain {} is not in the file",
+                                t.name, name, source
+                            )
+                        })?;
+                    fire_crab_ods::ddl::mint_carrier_domain(
+                        &mut file,
+                        page_size,
+                        *ft as i16,
+                        *len as u16,
+                        *sc as i16,
+                        *st as i16,
+                        restored
+                            .domain_computed
+                            .iter()
+                            .find(|(n, _)| n == source)
+                            .map(|(_, b)| b.as_slice()),
+                    )?
+                } else {
+                    source.clone()
+                };
+                fields.push(fire_crab_ods::ddl::RestoredViewField {
                     name: name.clone(),
-                    source: source.clone(),
+                    source,
                     base_field: base.clone(),
                     view_context: *ctx,
                     position: *pos,
-                })
-                .collect();
+                });
+            }
             let contexts: Vec<fire_crab_ods::ddl::RestoredViewContext> = t
                 .view_contexts
                 .iter()

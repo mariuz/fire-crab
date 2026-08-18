@@ -261,23 +261,22 @@ check "...and res_replace overwrites (fc)" \
 check "the replaced database still reads right" "$(rows "$D/fc-gbr-r1.fdb")" "$base"
 
 # --- 4. FAIL-CLOSED: an fbk carrying what this reader cannot ----------------
-# (~~a GTT refuses~~ - GTTs ride now; the representative refusal is
-# an EXPRESSION-COLUMNED view - a view field with no BASE_FIELD,
-# refused so the column's meaning never silently changes)
+# (~~an expression view refuses~~ - they ride now; the representative
+# refusal is a NAMED DOMAIN - restored as a plain type it would keep
+# the data and silently change what the schema MEANS)
 rm -f "$D/fc-gbr-pk.fdb" "$D/fc-gbr-pk.fbk"
 "$ISQL" -q -b -user "$U" -pas "$P" <<EOF >/dev/null 2>&1
 CREATE DATABASE '$D/fc-gbr-pk.fdb' USER '$U' PASSWORD '$P' PAGE_SIZE 8192;
 CREATE TABLE T (X INTEGER);
 COMMIT;
-CREATE TABLE VB (A INTEGER);
-COMMIT;
-CREATE VIEW VX (D) AS SELECT A * 2 FROM VB;
+CREATE DOMAIN D_AGE AS INTEGER;
+CREATE TABLE P2 (AGE D_AGE);
 COMMIT;
 EOF
 chmod 666 "$D/fc-gbr-pk.fdb"
 svc "$EMGR" action_backup dbname "$D/fc-gbr-pk.fdb" bkp_file "$D/fc-gbr-pk.fbk" >/dev/null
 grab "$D/fc-gbr-pk.fbk"
-check "an fbk with an EXPRESSION-columned view refuses fc's restore whole" \
+check "an fbk with a NAMED DOMAIN refuses fc's restore whole" \
     "$(svc "$FMGR" action_restore dbname "$D/fc-gbr-rpk.fdb" bkp_file "$D/fc-gbr-pk.fbk")" \
     "feature is not supported|rc=1"
 ran=$((ran + 1))

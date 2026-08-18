@@ -3523,8 +3523,10 @@ fn write_check(
 /// One field of a restored VIEW, as the backup carries it.
 pub struct RestoredViewField {
     pub name: String,
-    /// its RDB$FIELD_SOURCE domain - shared with the base column
+    /// its RDB$FIELD_SOURCE domain - the base column's, or the
+    /// expression's own carried domain
     pub source: String,
+    /// empty for an EXPRESSION column
     pub base_field: String,
     pub view_context: i64,
     pub position: i64,
@@ -3613,19 +3615,26 @@ pub fn restore_view(
         ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
     ])?;
     for (i, f) in fields.iter().enumerate() {
-        sys_insert(file, page_size, "RDB$RELATION_FIELDS", relfields_rel, &[
+        // an EXPRESSION column: BASE_FIELD stays NULL (omitted -
+        // sys_insert starts every field NULL), context 0, read-only -
+        // the engine's own restored row (measured)
+        let expr = f.base_field.is_empty();
+        let mut fvals: Vec<(&str, SysVal<'_>)> = vec![
             ("RDB$FIELD_NAME", SysVal::S(&f.name)),
             ("RDB$RELATION_NAME", SysVal::S(&name)),
             ("RDB$FIELD_SOURCE", SysVal::S(&f.source)),
             ("RDB$FIELD_POSITION", SysVal::I(f.position)),
             ("RDB$FIELD_ID", SysVal::I(i as i64)),
-            ("RDB$BASE_FIELD", SysVal::S(&f.base_field)),
             ("RDB$VIEW_CONTEXT", SysVal::I(f.view_context)),
             ("RDB$SYSTEM_FLAG", SysVal::I(0)),
-            ("RDB$UPDATE_FLAG", SysVal::I(1)),
+            ("RDB$UPDATE_FLAG", SysVal::I(if expr { 0 } else { 1 })),
             ("RDB$FIELD_SOURCE_SCHEMA_NAME", SysVal::S("PUBLIC")),
             ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
-        ])?;
+        ];
+        if !expr {
+            fvals.push(("RDB$BASE_FIELD", SysVal::S(&f.base_field)));
+        }
+        sys_insert(file, page_size, "RDB$RELATION_FIELDS", relfields_rel, &fvals)?;
     }
     for c in contexts {
         sys_insert(file, page_size, "RDB$VIEW_RELATIONS", viewrels_rel, &[
@@ -8089,6 +8098,60 @@ pub fn create_procedure(
         store_privileges(file, page_size, &want, 5, &["X"])?;
     }
     advance_oldest_transactions(file, page_size)
+}
+
+/// Mint one carrier domain (`RDB$<n>`) with the given type facts and
+/// return its name - the same rows create_procedure writes for its
+/// params, factored for callers that bind by name (expression view
+/// columns). The PRECISION-0 law applies.
+pub fn mint_carrier_domain(
+    file: &mut crate::Image,
+    page_size: usize,
+    field_type: i16,
+    length: u16,
+    scale: i16,
+    sub_type: i16,
+    computed_blr: Option<&[u8]>,
+) -> Result<String, String> {
+    let domain_num = next_domain_number(file, page_size)?;
+    let dom = format!("RDB${}", domain_num);
+    // an expression view column's domain IS the expression: the
+    // carried BLR stores as RDB$COMPUTED_BLR, subtype 2 - without it
+    // the engine answers "cannot access column" to the view (measured)
+    let cb_blob = match computed_blr {
+        Some(b) => {
+            let frel = crate::resolve_relation(file, page_size, "RDB$FIELDS")
+                .ok_or("no RDB$FIELDS relation")?;
+            Some(dml::insert_blob(file, page_size, frel, &[b.to_vec()], 2)?)
+        }
+        None => None,
+    };
+    let mut field_vals: Vec<(&str, SysVal<'_>)> = vec![
+        ("RDB$FIELD_NAME", SysVal::S(&dom)),
+        ("RDB$FIELD_TYPE", SysVal::I(field_type as i64)),
+        ("RDB$FIELD_LENGTH", SysVal::I(length as i64)),
+        ("RDB$FIELD_SCALE", SysVal::I(scale as i64)),
+        ("RDB$SYSTEM_FLAG", SysVal::I(0)),
+        ("RDB$OWNER_NAME", SysVal::S(OWNER)),
+        ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
+    ];
+    if subtype_carried(field_type) {
+        field_vals.push(("RDB$FIELD_SUB_TYPE", SysVal::I(sub_type as i64)));
+    }
+    if matches!(field_type, 7 | 8 | 16 | 26) {
+        field_vals.push(("RDB$FIELD_PRECISION", SysVal::I(0)));
+    }
+    if matches!(field_type, 14 | 37) {
+        field_vals.push(("RDB$CHARACTER_SET_ID", SysVal::I(0)));
+        field_vals.push(("RDB$CHARACTER_LENGTH", SysVal::I(length as i64)));
+    }
+    let frel = crate::resolve_relation(file, page_size, "RDB$FIELDS")
+        .ok_or("no RDB$FIELDS relation")?;
+    if let Some(cb) = cb_blob {
+        field_vals.push(("RDB$COMPUTED_BLR", SysVal::B(blob_id_bytes(frel, cb))));
+    }
+    sys_insert(file, page_size, "RDB$FIELDS", frel, &field_vals)?;
+    Ok(dom)
 }
 
 /// Patch a relation's `RDB$DBKEY_LENGTH`. The engine's own RESTORE of

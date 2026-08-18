@@ -499,6 +499,41 @@ else
 fi
 rm -f "$GTDB" "$D/fc-gbak-gt.fbk" "$D/fc-gbak-gtr.fdb"
 
+# EXPRESSION view columns RIDE: the expression lives on the column's
+# OWN domain as COMPUTED_BLR (subtype 2, carried verbatim on the
+# rec-2 record's att 18) - the ENGINE restores fc's backup and reads
+# base, arithmetic and concat columns through the view, live rows too
+EXVDB="$D/fc-gbak-exv.fdb"; rm -f "$EXVDB" "$D/fc-gbak-exv.fbk" "$D/fc-gbak-exvr.fdb"
+"$ISQL" -q -b -user "$U" -pas "$P" <<EOF >/dev/null 2>&1
+CREATE DATABASE '$EXVDB' USER '$U' PASSWORD '$P' PAGE_SIZE 8192;
+CREATE TABLE VB (A INTEGER, S VARCHAR(8));
+COMMIT;
+CREATE VIEW VX (A2, DBL, TXT) AS SELECT A, A * 2, S || '!' FROM VB;
+COMMIT;
+INSERT INTO VB VALUES (21, 'hi');
+COMMIT;
+EOF
+chmod 666 "$EXVDB"
+ran=$((ran + 1))
+fo=$(svc_backup "$FMGR" "$EXVDB" "$D/fc-gbak-exv.fbk")
+if [ "${fo##*rc=}" = "0" ]; then
+    echo "OK   an EXPRESSION-columned view rides the backup (fc backs it up)"
+else
+    echo "DIFF expression view backup: [$fo]"; fail=1
+fi
+ran=$((ran + 1))
+sudo -n chmod 666 "$D/fc-gbak-exv.fbk" 2>/dev/null || chmod 666 "$D/fc-gbak-exv.fbk" 2>/dev/null
+"$FBSVCMGR" "$EMGR" user "$U" password "$P" action_restore dbname "$D/fc-gbak-exvr.fdb" bkp_file "$D/fc-gbak-exv.fbk" >/dev/null 2>&1
+grab "$D/fc-gbak-exvr.fdb"
+got=$(printf "SELECT A2 || '/' || DBL || '/' || TXT FROM VX;\nINSERT INTO VB VALUES (5, 'yo');\nSELECT DBL || TXT FROM VX WHERE A2 = 5;\n" |
+    "$ISQL" -q -b -user "$U" -pas "$P" "$D/fc-gbak-exvr.fdb" 2>&1 | grep -cE '21/42/hi!|10yo!')
+if [ "$got" = "2" ]; then
+    echo "OK   the ENGINE restores fc's fbk and computes through the view (42, hi!, live rows)"
+else
+    echo "DIFF expression view after engine restore: match-count [$got] (want 2)"; fail=1
+fi
+rm -f "$EXVDB" "$D/fc-gbak-exv.fbk" "$D/fc-gbak-exvr.fdb"
+
 # --- 4. RECORDED BOUNDARY: NOT NULL is not carried ---------------------------
 NN="$D/fc-gbak-nn.fdb"; rm -f "$NN"
 "$ISQL" -q -b -user "$U" -pas "$P" <<EOF >/dev/null 2>&1

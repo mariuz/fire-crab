@@ -112,11 +112,21 @@ the restore-side DBKEY_LENGTH 0 the engine's own restore writes
 (live DDL writes 8, the restored catalog 0, measured on a round
 trip). A live INSERT lands in the restored instance both
 directions. External tables (type 2) stay refused — their data
-lives outside the file. An EXPRESSION-COLUMNED view is the boundary
-representative now; what still refuses beyond it is typed
-(expression-columned views, then the long tail: named domains,
-argument DEFAULTs, description blobs, expression indexes — and the
-permanent boundaries, external tables and external functions).
+lives outside the file. ~~An expression-columned view refuses~~ — EXPRESSION VIEW
+COLUMNS RIDE (gbak 37): the finding is that the expression lives on
+the column's OWN RDB$n domain as a subtype-2 COMPUTED_BLR — the
+field record carries computed_flag 1, context 0, read-only, NO base
+att, and the domain record carries the expression blob on att 18,
+which the generic rec-2 walker desynced on (the reader walks
+domains by hand now, atts 15–21 blob-framed). Restore mints the
+carrier domain WITH the computed blob — without it the engine
+answers "cannot access column" over a perfect catalog. A NAMED
+DOMAIN is the boundary representative now, refused on BOTH sides
+(the reader used to accept any rec 2 — restored as a plain type a
+named domain would keep the data and silently change what the
+schema MEANS). What still refuses is typed (named domains, argument
+DEFAULTs, description blobs, expression indexes — and the permanent
+boundaries, external tables and external functions).
 
 The subsystem map's rows fall into three states, and the difference
 matters more than the row count:
