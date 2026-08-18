@@ -698,6 +698,9 @@ fn rebuild_runtime_blob(
     let default_fid = fid_of("RDB$DEFAULT_VALUE");
     let gen_fid = fid_of("RDB$GENERATOR_NAME");
     let idt_fid = fid_of("RDB$IDENTITY_TYPE");
+    let base_fid = fid_of("RDB$BASE_FIELD");
+    let vctx_fid = fid_of("RDB$VIEW_CONTEXT");
+    let mut view_links: Vec<(String, i64, String)> = Vec::new();
 
     // collect (field_id, name, source, position, not_null), by field id
     let text = |v: Option<&Value>| match v {
@@ -742,6 +745,15 @@ fn rebuild_runtime_blob(
                 .and_then(|g| text(vals.get(g)))
                 .map(|g| (g, t as i16))
         });
+        // a VIEW field's context + base, for the runtime's
+        // RSR_view_context / RSR_base_field segments
+        if let (Some(bf), Some(vf)) = (base_fid, vctx_fid) {
+            if let (Some(crate::format::Value::Text(b)), Some(crate::format::Value::Int(c))) =
+                (vals.get(bf), vals.get(vf))
+            {
+                view_links.push((name.clone(), *c, b.trim_end().to_string()));
+            }
+        }
         fields.push((id as u16, name, src, pos as u16, not_null, default, identity));
     });
     fields.sort_by_key(|f| f.0);
@@ -792,6 +804,13 @@ fn rebuild_runtime_blob(
         let d = descs.get(*id as usize).ok_or("field beyond format")?;
         runtime.push(seg(0, &id.to_le_bytes())); // RSR_field_id
         runtime.push(seg(1, name.as_bytes())); // RSR_field_name
+        // a VIEW's field carries its context and base field - the
+        // relation loader binds fld_source through them
+        // (met.epp RSR_view_context / RSR_base_field)
+        if let Some((ctx, base)) = view_links.iter().find(|(n, ..)| n == name).map(|(_, c, b)| (*c, b)) {
+            runtime.push(seg(2, &(ctx as u16).to_le_bytes())); // RSR_view_context
+            runtime.push(seg(3, base.as_bytes())); // RSR_base_field
+        }
         let qsrc = format!("\"PUBLIC\".\"{}\"", src);
         runtime.push(seg(25, qsrc.as_bytes())); // RSR_field_source
         let char_len = match d.dtype {
@@ -3498,6 +3517,135 @@ fn write_check(
             ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
         ])?;
     }
+    Ok(())
+}
+
+/// One field of a restored VIEW, as the backup carries it.
+pub struct RestoredViewField {
+    pub name: String,
+    /// its RDB$FIELD_SOURCE domain - shared with the base column
+    pub source: String,
+    pub base_field: String,
+    pub view_context: i64,
+    pub position: i64,
+}
+
+/// One FROM-context of a restored VIEW (an RDB$VIEW_RELATIONS row).
+pub struct RestoredViewContext {
+    pub relation: String,
+    pub context: i64,
+    pub context_name: String,
+}
+
+/// Store a VIEW as gbak's restore does: the RDB$RELATIONS row
+/// (type 1) with the carried VIEW_BLR and VIEW_SOURCE blobs verbatim,
+/// one format row derived from the fields' domains, the
+/// RDB$RELATION_FIELDS rows with their base-field and context links,
+/// and the RDB$VIEW_RELATIONS context rows. A view owns no pages -
+/// its rows are a query - so nothing else is allocated.
+pub fn restore_view(
+    file: &mut crate::Image,
+    page_size: usize,
+    name: &str,
+    view_blr: &[u8],
+    view_source: &[u8],
+    fields: &[RestoredViewField],
+    contexts: &[RestoredViewContext],
+) -> Result<(), String> {
+    let name = name.trim().to_ascii_uppercase();
+    let rels = list_relations(file, page_size);
+    if rels.iter().any(|(_, n)| n.trim_end().eq_ignore_ascii_case(&name)) {
+        return Err(format!("relation {} already exists", name));
+    }
+    let rel_id = (rels.iter().map(|(id, _)| *id).max().unwrap_or(127).max(127) + 1) as i64;
+    // the format: each field's descriptor from its (already restored)
+    // domain, offsets laid out the way the row would be
+    let mut descs: Vec<Descriptor> = Vec::new();
+    let mut off = 4u16; // the null bitmap slot, as create_table lays out
+    for f in fields {
+        let (ft, len, sc, st) = domain_type_info(file, page_size, &f.source)
+            .ok_or_else(|| format!("view {}: domain {} not found", name, f.source))?;
+        let dt = field_type_to_dtype(ft)
+            .ok_or_else(|| format!("view {}: field type {} unsupported", name, ft))?;
+        descs.push(Descriptor {
+            dtype: dt,
+            scale: sc,
+            length: len,
+            sub_type: st,
+            flags: 0,
+            offset: off as u32,
+        });
+        off += len;
+    }
+    let fmt_blob = write_format_blob(file, page_size, &descs)?;
+    let formats_rel = crate::resolve_relation(file, page_size, "RDB$FORMATS")
+        .ok_or("no RDB$FORMATS relation")?;
+    let relations_rel = crate::resolve_relation(file, page_size, "RDB$RELATIONS")
+        .ok_or("no RDB$RELATIONS relation")?;
+    let relfields_rel = crate::resolve_relation(file, page_size, "RDB$RELATION_FIELDS")
+        .ok_or("no RDB$RELATION_FIELDS relation")?;
+    let viewrels_rel = crate::resolve_relation(file, page_size, "RDB$VIEW_RELATIONS")
+        .ok_or("no RDB$VIEW_RELATIONS relation")?;
+    sys_insert(file, page_size, "RDB$FORMATS", formats_rel, &[
+        ("RDB$RELATION_ID", SysVal::I(rel_id)),
+        ("RDB$FORMAT", SysVal::I(1)),
+        ("RDB$DESCRIPTOR", SysVal::B(blob_id_bytes(formats_rel, fmt_blob))),
+    ])?;
+    let src = dml::insert_blob_cs(file, page_size, relations_rel, &[view_source.to_vec()], 1, 4)?;
+    let blr = dml::insert_blob(file, page_size, relations_rel, &[view_blr.to_vec()], 2)?;
+    sys_insert(file, page_size, "RDB$RELATIONS", relations_rel, &[
+        ("RDB$RELATION_NAME", SysVal::S(&name)),
+        ("RDB$RELATION_ID", SysVal::I(rel_id)),
+        ("RDB$RELATION_TYPE", SysVal::I(1)),
+        ("RDB$SYSTEM_FLAG", SysVal::I(0)),
+        // a VIEW's dbkey length is 0 and its FLAGS bit 1 marks the
+        // view (both diffed off the engine's own restore - and the
+        // missing schema qualifier on the field-source was exactly
+        // what made the engine answer "Column unknown" over an
+        // otherwise perfect catalog, the FK-blocker lesson again)
+        ("RDB$FLAGS", SysVal::I(1)),
+        ("RDB$DBKEY_LENGTH", SysVal::I(0)),
+        ("RDB$FORMAT", SysVal::I(1)),
+        ("RDB$FIELD_ID", SysVal::I(fields.len() as i64)),
+        ("RDB$VIEW_BLR", SysVal::B(blob_id_bytes(relations_rel, blr))),
+        ("RDB$VIEW_SOURCE", SysVal::B(blob_id_bytes(relations_rel, src))),
+        ("RDB$OWNER_NAME", SysVal::S(OWNER)),
+        ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
+    ])?;
+    for (i, f) in fields.iter().enumerate() {
+        sys_insert(file, page_size, "RDB$RELATION_FIELDS", relfields_rel, &[
+            ("RDB$FIELD_NAME", SysVal::S(&f.name)),
+            ("RDB$RELATION_NAME", SysVal::S(&name)),
+            ("RDB$FIELD_SOURCE", SysVal::S(&f.source)),
+            ("RDB$FIELD_POSITION", SysVal::I(f.position)),
+            ("RDB$FIELD_ID", SysVal::I(i as i64)),
+            ("RDB$BASE_FIELD", SysVal::S(&f.base_field)),
+            ("RDB$VIEW_CONTEXT", SysVal::I(f.view_context)),
+            ("RDB$SYSTEM_FLAG", SysVal::I(0)),
+            ("RDB$UPDATE_FLAG", SysVal::I(1)),
+            ("RDB$FIELD_SOURCE_SCHEMA_NAME", SysVal::S("PUBLIC")),
+            ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
+        ])?;
+    }
+    for c in contexts {
+        sys_insert(file, page_size, "RDB$VIEW_RELATIONS", viewrels_rel, &[
+            ("RDB$VIEW_NAME", SysVal::S(&name)),
+            ("RDB$RELATION_NAME", SysVal::S(&c.relation)),
+            ("RDB$VIEW_CONTEXT", SysVal::I(c.context)),
+            ("RDB$CONTEXT_NAME", SysVal::S(&c.context_name)),
+            ("RDB$CONTEXT_TYPE", SysVal::I(0)),
+            ("RDB$RELATION_SCHEMA_NAME", SysVal::S("PUBLIC")),
+            ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
+        ])?;
+    }
+    // THE RUNTIME SUMMARY IS THE FIELD LIST: the engine's relation
+    // loader reads its fields from the RDB$RUNTIME blob, not from the
+    // RDB$RELATION_FIELDS rows (met.epp "Pick up field specific
+    // stuff", blb::open(&REL.RDB$RUNTIME)) - a view restored with a
+    // perfect catalog and no runtime answered "Column unknown" to
+    // every column while COUNT(*) ran fine, measured
+    update_relation_runtime(file, page_size, &name)?;
+    advance_oldest_transactions(file, page_size)?;
     Ok(())
 }
 

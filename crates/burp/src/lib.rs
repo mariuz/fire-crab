@@ -40,7 +40,10 @@ mod rec {
     pub const RELATION_END: u8 = 9;
     pub const END: u8 = 10;
     pub const PHYSICAL_DB: u8 = 14;
+    pub const VIEW: u8 = 11;
     pub const TRIGGER: u8 = 13;
+    pub const PROCEDURE: u8 = 27;
+    pub const PROCEDURE_PRM: u8 = 28;
     pub const GENERATOR: u8 = 26;
     pub const REL_CONSTRAINT: u8 = 31;
     pub const REF_CONSTRAINT: u8 = 32;
@@ -306,7 +309,6 @@ pub fn write_backup_verbose(
     // must read, not guess (RDB$GENERATORS is relation 20, not the 10
     // a first guess said, and the gate caught it).
     for (what, rel_name) in [
-        ("a stored procedure", "RDB$PROCEDURES"),
         ("a trigger", "RDB$TRIGGERS"),
         ("an exception", "RDB$EXCEPTIONS"),
         ("a user function", "RDB$FUNCTIONS"),
@@ -344,6 +346,7 @@ pub fn write_backup_verbose(
         })
         .unwrap_or_default();
     let triggers = read_triggers(image, page_size)?;
+    let procedures = read_procedures(image, page_size)?;
     // ...and the INDEXES, per relation, segments in order
     let indexes = read_indexes(image, page_size)?;
     // ...and USER DOMAINS: this writer invents its column sources
@@ -368,7 +371,17 @@ pub fn write_backup_verbose(
             }
         }
     }
-    let user_rels: Vec<(u16, String)> = user_tables(image, page_size)?;
+    let all_rels: Vec<(u16, String, bool)> = user_tables(image, page_size)?;
+    let user_rels: Vec<(u16, String)> = all_rels
+        .iter()
+        .filter(|(_, _, v)| !v)
+        .map(|(i, n, _)| (*i, n.clone()))
+        .collect();
+    let view_rels: Vec<(u16, String)> = all_rels
+        .iter()
+        .filter(|(_, _, v)| *v)
+        .map(|(i, n, _)| (*i, n.clone()))
+        .collect();
 
     let mut out = Vec::new();
     // --- rec_burp: the program attributes, pinned against FB6 ---------
@@ -450,6 +463,17 @@ pub fn write_backup_verbose(
         rel_cols.push((*id, name.clone(), cols));
     }
 
+    // the procedure parameters' invented domains continue the same
+    // counter the table columns draw from; the assignment is kept so
+    // the rec 28 records can name them
+    let mut param_domains: Vec<(String, String, String)> = Vec::new(); // (proc, param, RDB$n)
+    for pr in &procedures {
+        for pp in &pr.params {
+            param_domains.push((pr.name.clone(), pp.name.clone(), format!("RDB${}", next_source)));
+            next_source += 1;
+        }
+    }
+
     // --- rec_global_field: one per column, in file order ------------------
     log.push("gbak:writing domains".into());
     for (_, _, cols) in &rel_cols {
@@ -485,6 +509,26 @@ pub fn write_backup_verbose(
                 dtype::BLOB => r.int(12, 80).end(),
                 _ => r.int(44, 0).end(),
             }
+        }
+    }
+
+    // ... and one per procedure parameter, the same record family
+    for pr in &procedures {
+        for pp in &pr.params {
+            let dom = param_domains
+                .iter()
+                .find(|(a, b, _)| a == &pr.name && b == &pp.name)
+                .map(|(_, _, d)| d.clone())
+                .unwrap_or_default();
+            log.push(format!("gbak:    writing domain \"PUBLIC\".\"{}\"", dom));
+            Rec::new(&mut out, rec::GLOBAL_FIELD)
+                .text(48, "PUBLIC")
+                .text(1, &dom)
+                .int(8, pp.field_type as i32)
+                .int(10, pp.length as i32)
+                .int(9, pp.scale as i32)
+                .int(44, 0)
+                .end();
         }
     }
 
@@ -536,6 +580,50 @@ pub fn write_backup_verbose(
         out.push(rec::RELATION_END);
     }
 
+    // --- the VIEWS: relation records with the two blobs, their fields
+    // referencing the BASE columns' domains, and the context records
+    let views = read_views(image, page_size, &view_rels, &rel_cols)?;
+    for v in &views {
+        log.push(format!("gbak:    writing view \"PUBLIC\".\"{}\"", v.name));
+        Rec::new(&mut out, rec::RELATION)
+            .text(21, "PUBLIC")
+            .text(1, &v.name)
+            .blob(2, &v.blr)
+            .int(16, 1)
+            .blob(14, &v.source)
+            .int(18, 1) // relation type: view
+            .end();
+        for (i, f) in v.fields.iter().enumerate() {
+            log.push(format!("gbak:         writing column \"{}\"", f.name));
+            Rec::new(&mut out, rec::FIELD)
+                .text(1, &f.name)
+                .text(48, "PUBLIC")
+                .text(2, &f.source)
+                .int(13, f.position as i32)
+                .int(8, f.ftype)
+                .int(10, f.length)
+                .int(9, f.scale)
+                // att_field_number - what the restore derives the
+                // relation's RDB$FIELD_ID from; without it the field
+                // vector sizes to ZERO and every column vanishes
+                .int(22, (i + 1) as i32)
+                .int(34, 1) // att_field_update_flag
+                .int(4, f.view_context as i32) // att_view_context
+                .text(3, &f.base_field)
+                .end();
+        }
+        for (rel, ctx, cname) in &v.contexts {
+            Rec::new(&mut out, rec::VIEW)
+                .text(20, "PUBLIC")
+                .text(8, rel)
+                .int(9, *ctx as i32)
+                .text(10, cname)
+                .int(11, 0)
+                .end();
+        }
+        out.push(rec::RELATION_END);
+    }
+
     // --- per relation: the data ------------------------------------------
     log.push("gbak:writing types".into());
     log.push("gbak:writing filters".into());
@@ -567,6 +655,44 @@ pub fn write_backup_verbose(
     log.push("gbak:writing exceptions".into());
     log.push("gbak:writing functions".into());
     log.push("gbak:writing stored procedures".into());
+    for pr in &procedures {
+        log.push(format!("gbak:writing stored procedure \"PUBLIC\".\"{}\"", pr.name));
+        let mut r = Rec::new(&mut out, rec::PROCEDURE)
+            .text(20, "PUBLIC")
+            .text(1, &pr.name)
+            .int(2, pr.inputs)
+            .int(3, pr.outputs)
+            .blob(7, &pr.source)
+            .blob(8, &pr.blr)
+            .int(11, pr.ptype);
+        if let Some(v) = pr.valid_blr {
+            r = r.int(12, v);
+        }
+        r.end();
+        for pp in &pr.params {
+            log.push(format!(
+                "gbak:writing parameter \"{}\" for stored procedure",
+                pp.name
+            ));
+            let dom = param_domains
+                .iter()
+                .find(|(a, b, _)| a == &pr.name && b == &pp.name)
+                .map(|(_, _, d)| d.clone())
+                .unwrap_or_default();
+            Rec::new(&mut out, rec::PROCEDURE_PRM)
+                .text(1, &pp.name)
+                .int(2, pp.number)
+                .int(3, pp.ptype)
+                .text(14, "PUBLIC")
+                .text(4, &dom)
+                .int(11, 0)
+                .end();
+        }
+        // rec_procedure_end - a bare byte, like relation_end; without
+        // it the engine's reader walks the next record as this
+        // procedure's trigger messages (measured desync)
+        out.push(29);
+    }
     log.push("gbak:writing packages".into());
     let tips = fire_crab_ods::tra::TipChain::read(image, page_size);
     // THE DATA PHASE WALKS THE RELATIONS IN REVERSE CREATION ORDER -
@@ -575,6 +701,32 @@ pub fn write_backup_verbose(
     // C,B,A). The restore maps blocks by name, so only the bytes'
     // ORDER carries the engine's shape - and the verbose stream shows
     // it.
+    // views join the reverse walk with EMPTY blocks - the reference
+    // file carries a relation_data + relation_end pair for a view and
+    // the verbose stream stays silent about it
+    let mut data_walk: Vec<(u16, &str, bool)> = rel_cols
+        .iter()
+        .map(|(id, n, _)| (*id, n.as_str(), false))
+        .chain(views.iter().map(|v| {
+            let id = view_rels
+                .iter()
+                .find(|(_, n)| n == &v.name)
+                .map(|(i, _)| *i)
+                .unwrap_or(u16::MAX);
+            (id, v.name.as_str(), true)
+        }))
+        .collect();
+    data_walk.sort_by_key(|(id, ..)| *id);
+    for (_, vname, is_view) in data_walk.iter().rev() {
+        if !*is_view {
+            continue; // tables take the full block in the loop below
+        }
+        Rec::new(&mut out, rec::RELATION_DATA)
+            .text(21, "PUBLIC")
+            .text(1, vname)
+            .end();
+        out.push(rec::RELATION_END);
+    }
     for (id, name, cols) in rel_cols.iter().rev() {
         Rec::new(&mut out, rec::RELATION_DATA)
             .text(21, "PUBLIC")
@@ -1207,6 +1359,296 @@ fn read_triggers(
     Ok(out)
 }
 
+/// One VIEW as the backup carries it: the two blobs verbatim, the
+/// fields with their base/context links, the FROM contexts.
+struct UView {
+    name: String,
+    blr: Vec<u8>,
+    /// NUL-terminated
+    source: Vec<u8>,
+    fields: Vec<UViewField>,
+    contexts: Vec<(String, i64, String)>, // (relation, context, context name)
+}
+
+struct UViewField {
+    name: String,
+    position: i64,
+    base_field: String,
+    view_context: i64,
+    /// the writer-invented domain of the BASE column
+    source: String,
+    ftype: i32,
+    length: i32,
+    scale: i32,
+}
+
+fn read_views(
+    image: &fire_crab_ods::Image,
+    page_size: usize,
+    view_rels: &[(u16, String)],
+    rel_cols: &[(u16, String, Vec<Col>)],
+) -> Result<Vec<UView>, Refused> {
+    if view_rels.is_empty() {
+        return Ok(Vec::new());
+    }
+    let (rcols, rrows) = sys_rows(image, page_size, "RDB$RELATIONS")
+        .ok_or_else(|| Refused("RDB$RELATIONS is unreadable".into()))?;
+    let rat = |n: &str| rcols.iter().find(|(c, _)| c.eq_ignore_ascii_case(n)).map(|(_, i)| *i);
+    let rels_rel = fire_crab_ods::resolve_relation(image, page_size, "RDB$RELATIONS")
+        .ok_or_else(|| Refused("no RDB$RELATIONS".into()))?;
+    let blob = |r: &fire_crab_ods::tra::VisibleRow, i: Option<usize>| match i
+        .and_then(|i| r.values.get(i))
+    {
+        Some(fire_crab_ods::format::Value::Blob(_, num)) => {
+            fire_crab_blb::read_blob_content(image, page_size, rels_rel, *num)
+        }
+        _ => None,
+    };
+    // contexts, per view
+    let vctx: Vec<(String, String, i64, String)> =
+        sys_rows(image, page_size, "RDB$VIEW_RELATIONS")
+            .map(|(vc, vr)| {
+                let vat = |n: &str| {
+                    vc.iter().find(|(c, _)| c.eq_ignore_ascii_case(n)).map(|(_, i)| *i)
+                };
+                let vint = |r: &fire_crab_ods::tra::VisibleRow, i: Option<usize>| match i
+                    .and_then(|i| r.values.get(i))
+                {
+                    Some(fire_crab_ods::format::Value::Int(n)) => *n,
+                    _ => 0,
+                };
+                vr.iter()
+                    .filter_map(|r| {
+                        Some((
+                            text_opt(r, vat("RDB$VIEW_NAME"))?,
+                            text_opt(r, vat("RDB$RELATION_NAME"))?,
+                            vint(r, vat("RDB$VIEW_CONTEXT")),
+                            text_opt(r, vat("RDB$CONTEXT_NAME")).unwrap_or_default(),
+                        ))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+    // fields, per view, off RDB$RELATION_FIELDS
+    let (fcols, frows) = sys_rows(image, page_size, "RDB$RELATION_FIELDS")
+        .ok_or_else(|| Refused("RDB$RELATION_FIELDS is unreadable".into()))?;
+    let fat = |n: &str| fcols.iter().find(|(c, _)| c.eq_ignore_ascii_case(n)).map(|(_, i)| *i);
+    let fint = |r: &fire_crab_ods::tra::VisibleRow, i: Option<usize>| match i
+        .and_then(|i| r.values.get(i))
+    {
+        Some(fire_crab_ods::format::Value::Int(n)) => *n,
+        _ => 0,
+    };
+    let mut out = Vec::new();
+    for (_, vname) in view_rels {
+        let vrow = rrows
+            .iter()
+            .find(|r| text_opt(r, rat("RDB$RELATION_NAME")).as_deref() == Some(vname))
+            .ok_or_else(|| Refused(format!("view {}: no catalog row", vname)))?;
+        let blr = blob(vrow, rat("RDB$VIEW_BLR"))
+            .ok_or_else(|| Refused(format!("view {}: its BLR blob is unreadable", vname)))?;
+        let mut source = blob(vrow, rat("RDB$VIEW_SOURCE")).unwrap_or_default();
+        source.push(0);
+        let contexts: Vec<(String, i64, String)> = vctx
+            .iter()
+            .filter(|(v, ..)| v == vname)
+            .map(|(_, r, c, n)| (r.clone(), *c, n.clone()))
+            .collect();
+        let mut fields = Vec::new();
+        for fr in &frows {
+            if text_opt(fr, fat("RDB$RELATION_NAME")).as_deref() != Some(vname) {
+                continue;
+            }
+            let Some(fname) = text_opt(fr, fat("RDB$FIELD_NAME")) else { continue };
+            let base = text_opt(fr, fat("RDB$BASE_FIELD")).unwrap_or_default();
+            if base.is_empty() {
+                return Err(Refused(format!(
+                    "view {}: column {} is an expression - outside this backup's surface",
+                    vname, fname
+                )));
+            }
+            let ctx = fint(fr, fat("RDB$VIEW_CONTEXT"));
+            // the BASE column, through the context's relation
+            let base_rel = contexts
+                .iter()
+                .find(|(_, c, _)| *c == ctx)
+                .map(|(r, ..)| r.clone())
+                .ok_or_else(|| Refused(format!("view {}: context {} unknown", vname, ctx)))?;
+            let bc = rel_cols
+                .iter()
+                .find(|(_, n, _)| n == &base_rel)
+                .and_then(|(_, _, cols)| cols.iter().find(|c| c.name == base))
+                .ok_or_else(|| {
+                    Refused(format!("view {}: base column {}.{} not carried", vname, base_rel, base))
+                })?;
+            fields.push(UViewField {
+                name: fname,
+                position: fint(fr, fat("RDB$FIELD_POSITION")),
+                base_field: base,
+                view_context: ctx,
+                source: bc.source.clone(),
+                ftype: rdb_field_type(&bc.desc).unwrap_or(8),
+                length: bc.desc.length as i32,
+                scale: bc.desc.scale as i32,
+            });
+        }
+        fields.sort_by_key(|f| f.position);
+        out.push(UView { name: vname.clone(), blr, source, fields, contexts });
+    }
+    Ok(out)
+}
+
+/// One stored procedure as the backup carries it, blobs verbatim.
+struct UProc {
+    name: String,
+    inputs: i32,
+    outputs: i32,
+    /// NUL-terminated, the file's own convention
+    source: Vec<u8>,
+    blr: Vec<u8>,
+    /// RDB$PROCEDURE_TYPE: 1 = selectable, 2 = executable
+    ptype: i32,
+    valid_blr: Option<i32>,
+    params: Vec<UProcParam>,
+}
+
+struct UProcParam {
+    name: String,
+    number: i32,
+    /// 0 = input, 1 = output
+    ptype: i32,
+    /// the param's type, read off its RDB$FIELDS row
+    field_type: i64,
+    length: i64,
+    scale: i64,
+    sub_type: i64,
+}
+
+fn read_procedures(
+    image: &fire_crab_ods::Image,
+    page_size: usize,
+) -> Result<Vec<UProc>, Refused> {
+    let Some((cols, rows)) = sys_rows(image, page_size, "RDB$PROCEDURES") else {
+        return Ok(Vec::new());
+    };
+    let prel = fire_crab_ods::resolve_relation(image, page_size, "RDB$PROCEDURES")
+        .ok_or_else(|| Refused("no RDB$PROCEDURES relation".into()))?;
+    let at = |n: &str| cols.iter().find(|(c, _)| c.eq_ignore_ascii_case(n)).map(|(_, i)| *i);
+    let int = |r: &fire_crab_ods::tra::VisibleRow, i: Option<usize>| match i
+        .and_then(|i| r.values.get(i))
+    {
+        Some(fire_crab_ods::format::Value::Int(n)) => Some(*n),
+        _ => None,
+    };
+    let blob = |r: &fire_crab_ods::tra::VisibleRow, i: Option<usize>| match i
+        .and_then(|i| r.values.get(i))
+    {
+        Some(fire_crab_ods::format::Value::Blob(_, num)) => {
+            fire_crab_blb::read_blob_content(image, page_size, prel, *num)
+        }
+        _ => None,
+    };
+    // the parameters, keyed by procedure name
+    let params_of = |proc_name: &str| -> Result<Vec<UProcParam>, Refused> {
+        let Some((pcols, prows)) = sys_rows(image, page_size, "RDB$PROCEDURE_PARAMETERS")
+        else {
+            return Ok(Vec::new());
+        };
+        let pat = |n: &str| {
+            pcols.iter().find(|(c, _)| c.eq_ignore_ascii_case(n)).map(|(_, i)| *i)
+        };
+        let pint = |r: &fire_crab_ods::tra::VisibleRow, i: Option<usize>| match i
+            .and_then(|i| r.values.get(i))
+        {
+            Some(fire_crab_ods::format::Value::Int(n)) => Some(*n),
+            _ => None,
+        };
+        let mut out = Vec::new();
+        for r in &prows {
+            if text_opt(r, pat("RDB$PROCEDURE_NAME")).as_deref() != Some(proc_name) {
+                continue;
+            }
+            let Some(name) = text_opt(r, pat("RDB$PARAMETER_NAME")) else { continue };
+            let src = text_opt(r, pat("RDB$FIELD_SOURCE")).unwrap_or_default();
+            let f = field_type_of(image, page_size, &src).ok_or_else(|| {
+                Refused(format!("parameter {}: its domain {} is unreadable", name, src))
+            })?;
+            out.push(UProcParam {
+                name,
+                number: pint(r, pat("RDB$PARAMETER_NUMBER")).unwrap_or(0) as i32,
+                ptype: pint(r, pat("RDB$PARAMETER_TYPE")).unwrap_or(0) as i32,
+                field_type: f.0,
+                length: f.1,
+                scale: f.2,
+                sub_type: f.3,
+            });
+        }
+        out.sort_by_key(|p| (p.ptype, p.number));
+        Ok(out)
+    };
+    let mut out = Vec::new();
+    for r in &rows {
+        // SYSTEM procedures (flag 1 - the RDB$BLOB_UTIL/PROFILER/SQL
+        // packages) never ride, exactly the engine's filter; a USER
+        // procedure living in a package refuses typed - packages are
+        // their own record family
+        if matches!(int(r, at("RDB$SYSTEM_FLAG")), Some(f) if f != 0) {
+            continue;
+        }
+        let Some(name) = text_opt(r, at("RDB$PROCEDURE_NAME")) else { continue };
+        if text_opt(r, at("RDB$PACKAGE_NAME")).is_some() {
+            return Err(Refused(format!(
+                "procedure {} lives in a PACKAGE - outside this backup's surface",
+                name
+            )));
+        }
+        let blr = blob(r, at("RDB$PROCEDURE_BLR")).ok_or_else(|| {
+            Refused(format!("procedure {}: its BLR blob is unreadable", name))
+        })?;
+        let mut source = blob(r, at("RDB$PROCEDURE_SOURCE")).unwrap_or_default();
+        source.push(0);
+        let params = params_of(&name)?;
+        out.push(UProc {
+            inputs: int(r, at("RDB$PROCEDURE_INPUTS")).unwrap_or(0) as i32,
+            outputs: int(r, at("RDB$PROCEDURE_OUTPUTS")).unwrap_or(0) as i32,
+            ptype: int(r, at("RDB$PROCEDURE_TYPE")).unwrap_or(2) as i32,
+            valid_blr: int(r, at("RDB$VALID_BLR")).map(|v| v as i32),
+            name,
+            source,
+            blr,
+            params,
+        });
+    }
+    Ok(out)
+}
+
+/// A domain's (type, length, scale, sub_type) off its RDB$FIELDS row.
+fn field_type_of(
+    image: &fire_crab_ods::Image,
+    page_size: usize,
+    domain: &str,
+) -> Option<(i64, i64, i64, i64)> {
+    let (cols, rows) = sys_rows(image, page_size, "RDB$FIELDS")?;
+    let at = |n: &str| cols.iter().find(|(c, _)| c.eq_ignore_ascii_case(n)).map(|(_, i)| *i);
+    let int = |r: &fire_crab_ods::tra::VisibleRow, i: Option<usize>| match i
+        .and_then(|i| r.values.get(i))
+    {
+        Some(fire_crab_ods::format::Value::Int(n)) => Some(*n),
+        _ => None,
+    };
+    for r in &rows {
+        if text_opt(r, at("RDB$FIELD_NAME")).as_deref() == Some(domain) {
+            return Some((
+                int(r, at("RDB$FIELD_TYPE"))?,
+                int(r, at("RDB$FIELD_LENGTH")).unwrap_or(0),
+                int(r, at("RDB$FIELD_SCALE")).unwrap_or(0),
+                int(r, at("RDB$FIELD_SUB_TYPE")).unwrap_or(0),
+            ));
+        }
+    }
+    None
+}
+
 fn read_generators(
     image: &fire_crab_ods::Image,
     page_size: usize,
@@ -1265,7 +1707,7 @@ fn text_opt(r: &fire_crab_ods::tra::VisibleRow, i: Option<usize>) -> Option<Stri
 /// backup (its "rows" are a query, and writing it as a table would
 /// restore a table where a view was - the right rows today, the wrong
 /// database from then on).
-fn user_tables(image: &fire_crab_ods::Image, page_size: usize) -> Result<Vec<(u16, String)>, Refused> {
+fn user_tables(image: &fire_crab_ods::Image, page_size: usize) -> Result<Vec<(u16, String, bool)>, Refused> {
     let Some((cols, rows)) = sys_rows(image, page_size, "RDB$RELATIONS") else {
         return Err(Refused("RDB$RELATIONS is unreadable".into()));
     };
@@ -1293,19 +1735,20 @@ fn user_tables(image: &fire_crab_ods::Image, page_size: usize) -> Result<Vec<(u1
             Some(fire_crab_ods::format::Value::Int(n)) => *n as u16,
             _ => continue,
         };
-        // relation type 0 = persistent table; anything else (1 = view,
-        // 4/5 = GTT) is outside the surface
-        match type_at.and_then(|i| r.values.get(i)) {
-            Some(fire_crab_ods::format::Value::Int(0)) | None => {}
-            Some(fire_crab_ods::format::Value::Null) => {}
+        // relation type 0 = persistent table, 1 = VIEW (carried);
+        // anything else (4/5 = GTT) is outside the surface
+        let is_view = match type_at.and_then(|i| r.values.get(i)) {
+            Some(fire_crab_ods::format::Value::Int(0)) | None => false,
+            Some(fire_crab_ods::format::Value::Null) => false,
+            Some(fire_crab_ods::format::Value::Int(1)) => true,
             _ => {
                 return Err(Refused(format!(
                     "relation {} is not a persistent table - outside this backup's surface",
                     name
                 )))
             }
-        }
-        out.push((id, name));
+        };
+        out.push((id, name, is_view));
     }
     Ok(out)
 }
@@ -1440,6 +1883,14 @@ pub struct RTable {
     pub indexes: Vec<RIndex>,
     /// the index name the PRIMARY KEY constraint points at, if one does
     pub pk_index: Option<String>,
+    /// a VIEW's compiled body and source, verbatim - `Some` makes this
+    /// relation a view, restored through the catalog rather than pages
+    pub view_blr: Option<Vec<u8>>,
+    pub view_source: Option<Vec<u8>>,
+    /// (name, source domain, base field, context, position)
+    pub view_fields: Vec<(String, String, String, i64, i64)>,
+    /// (base relation, context id, context name)
+    pub view_contexts: Vec<(String, i64, String)>,
 }
 
 /// What a .fbk holds, as far as this slice carries it.
@@ -1474,6 +1925,11 @@ pub struct Restored {
     pub chk_rows: Vec<(String, String)>,
     /// the carried constraint triggers, file order
     pub triggers: Vec<RTrigger>,
+    /// (domain name, RDB$FIELD_TYPE, length, scale, sub_type) off the
+    /// global-field records - what types a procedure parameter
+    pub domain_types: Vec<(String, i64, i64, i64, i64)>,
+    /// the carried procedures, file order
+    pub procedures: Vec<RProc>,
     /// privilege records seen and set aside - the count keeps the
     /// omission visible in the trace instead of silent
     pub privileges_skipped: u64,
@@ -1490,6 +1946,27 @@ pub struct RFk {
     /// RDB$UPDATE_RULE / RDB$DELETE_RULE as the file spells them
     pub update_rule: String,
     pub delete_rule: String,
+}
+
+/// One carried stored procedure.
+pub struct RProc {
+    pub name: String,
+    pub inputs: i32,
+    pub outputs: i32,
+    pub source: Vec<u8>,
+    pub blr: Vec<u8>,
+    /// 1 = selectable, 2 = executable
+    pub ptype: i32,
+    pub params: Vec<RProcParam>,
+}
+
+pub struct RProcParam {
+    pub name: String,
+    pub number: i32,
+    /// 0 = input, 1 = output
+    pub ptype: i32,
+    /// the domain (RDB$n) its type lives under
+    pub source: String,
 }
 
 /// One carried trigger row (a CHECK's or a referential action's).
@@ -1635,6 +2112,8 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
         checks: Vec::new(),
         chk_rows: Vec::new(),
         triggers: Vec::new(),
+        domain_types: Vec::new(),
+        procedures: Vec::new(),
         privileges_skipped: 0,
     };
     // (schema, source name) -> not-null flag learned from constraints
@@ -1676,11 +2155,110 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
             rec::GLOBAL_FIELD => {
                 // the column types arrive re-derived from the field
                 // records; the domain NAME is kept for the verbose
-                // stream's "restoring domain" lines
+                // stream's "restoring domain" lines, and the TYPE for
+                // the procedure parameters that reference the domain
                 let atts = read_atts(f, &mut at)?;
                 if let Some(a) = att(&atts, 1) {
-                    out.domains.push(a.text());
+                    let name = a.text();
+                    out.domain_types.push((
+                        name.clone(),
+                        att(&atts, 8).map(|a| a.int()).unwrap_or(0),
+                        att(&atts, 10).map(|a| a.int()).unwrap_or(0),
+                        att(&atts, 9).map(|a| a.int()).unwrap_or(0),
+                        att(&atts, 11).map(|a| a.int()).unwrap_or(0),
+                    ));
+                    out.domains.push(name);
                 }
+            }
+            rec::PROCEDURE => {
+                // BLR (8), source (7), descriptions (4/5) and debug
+                // info (13) are int32-framed blobs - walked by hand,
+                // like the trigger record
+                let mut pr = RProc {
+                    name: String::new(),
+                    inputs: 0,
+                    outputs: 0,
+                    source: Vec::new(),
+                    blr: Vec::new(),
+                    ptype: 2,
+                    params: Vec::new(),
+                };
+                loop {
+                    let tag = *f
+                        .get(at)
+                        .ok_or_else(|| Refused("truncated procedure record".into()))?;
+                    at += 1;
+                    if tag == 0 {
+                        break;
+                    }
+                    let len = *f
+                        .get(at)
+                        .ok_or_else(|| Refused("truncated procedure attribute".into()))?
+                        as usize;
+                    at += 1;
+                    let data = f
+                        .get(at..at + len)
+                        .ok_or_else(|| Refused("truncated procedure attribute".into()))?
+                        .to_vec();
+                    at += len;
+                    let as_int = |d: &[u8]| {
+                        let mut v: i64 = 0;
+                        for (k, b) in d.iter().enumerate().take(8) {
+                            v |= (*b as i64) << (8 * k);
+                        }
+                        v
+                    };
+                    match tag {
+                        4 | 5 | 7 | 8 | 13 => {
+                            let n = as_int(&data) as usize;
+                            let raw = f
+                                .get(at..at + n)
+                                .ok_or_else(|| Refused("truncated procedure blob".into()))?
+                                .to_vec();
+                            at += n;
+                            match tag {
+                                8 => pr.blr = raw,
+                                7 => {
+                                    pr.source = raw;
+                                    if pr.source.last() == Some(&0) {
+                                        pr.source.pop();
+                                    }
+                                }
+                                _ => {} // descriptions/debug set aside
+                            }
+                        }
+                        1 => pr.name = String::from_utf8_lossy(&data).into_owned(),
+                        2 => pr.inputs = as_int(&data) as i32,
+                        3 => pr.outputs = as_int(&data) as i32,
+                        11 => pr.ptype = as_int(&data) as i32,
+                        6 => {
+                            // att_procedure_source (the pre-source2
+                            // spelling): TEXT framed like any other
+                        }
+                        9 | 10 | 12 | 20 => {} // security/owner/valid/schema
+                        other => {
+                            return Err(Refused(format!(
+                                "procedure {}: attribute {} is outside this restore's surface",
+                                pr.name, other
+                            )));
+                        }
+                    }
+                }
+                out.procedures.push(pr);
+            }
+            rec::PROCEDURE_PRM => {
+                let atts = read_atts(f, &mut at)?;
+                let pr = out.procedures.last_mut().ok_or_else(|| {
+                    Refused("a procedure parameter outside a procedure".into())
+                })?;
+                pr.params.push(RProcParam {
+                    name: att(&atts, 1)
+                        .map(|a| a.text())
+                        .ok_or_else(|| Refused("a parameter with no name".into()))?,
+                    number: att(&atts, 2).map(|a| a.int()).unwrap_or(0) as i32,
+                    ptype: att(&atts, 3).map(|a| a.int()).unwrap_or(0) as i32,
+                    source: att(&atts, 4).map(|a| a.text()).unwrap_or_default(),
+                });
             }
             rec::TRIGGER => {
                 // its BLR and SOURCE attributes carry an int32 byte
@@ -1789,18 +2367,96 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                 });
             }
             rec::RELATION => {
-                let atts = read_atts(f, &mut at)?;
-                let name = att(&atts, 1)
-                    .map(|a| a.text())
-                    .ok_or_else(|| Refused("a relation with no name".into()))?;
+                // a VIEW's record carries its BLR (att 2) and SOURCE
+                // (att 14) as int32-framed blobs - walked by hand
+                let mut name = String::new();
+                let mut view_blr: Option<Vec<u8>> = None;
+                let mut view_source: Option<Vec<u8>> = None;
+                loop {
+                    let tag = *f
+                        .get(at)
+                        .ok_or_else(|| Refused("truncated relation record".into()))?;
+                    at += 1;
+                    if tag == 0 {
+                        break;
+                    }
+                    let len = *f
+                        .get(at)
+                        .ok_or_else(|| Refused("truncated relation attribute".into()))?
+                        as usize;
+                    at += 1;
+                    let data = f
+                        .get(at..at + len)
+                        .ok_or_else(|| Refused("truncated relation attribute".into()))?
+                        .to_vec();
+                    at += len;
+                    let as_int = |d: &[u8]| {
+                        let mut v: i64 = 0;
+                        for (k, b) in d.iter().enumerate().take(8) {
+                            v |= (*b as i64) << (8 * k);
+                        }
+                        v
+                    };
+                    match tag {
+                        2 | 3 | 14 | 34 => {
+                            let n = as_int(&data) as usize;
+                            let raw = f
+                                .get(at..at + n)
+                                .ok_or_else(|| Refused("truncated relation blob".into()))?
+                                .to_vec();
+                            at += n;
+                            match tag {
+                                2 => view_blr = Some(raw),
+                                14 => {
+                                    let mut src = raw;
+                                    if src.last() == Some(&0) {
+                                        src.pop();
+                                    }
+                                    view_source = Some(src);
+                                }
+                                _ => {} // descriptions set aside
+                            }
+                        }
+                        1 => name = String::from_utf8_lossy(&data).into_owned(),
+                        8 | 12 | 16 | 18 | 21 => {} // security/owner/flags/type/schema
+                        other => {
+                            return Err(Refused(format!(
+                                "relation {}: attribute {} is outside this restore's surface",
+                                name, other
+                            )));
+                        }
+                    }
+                }
+                if name.is_empty() {
+                    return Err(Refused("a relation with no name".into()));
+                }
                 out.tables.push(RTable {
                     name,
                     cols: Vec::new(),
                     rows: Vec::new(),
                     indexes: Vec::new(),
                     pk_index: None,
+                    view_blr,
+                    view_source,
+                    view_fields: Vec::new(),
+                    view_contexts: Vec::new(),
                 });
                 current_rel = Some(out.tables.len() - 1);
+            }
+            rec::VIEW => {
+                let atts = read_atts(f, &mut at)?;
+                let t = current_rel
+                    .ok_or_else(|| Refused("a view context outside a relation".into()))?;
+                out.tables[t].view_contexts.push((
+                    att(&atts, 8)
+                        .map(|a| a.text())
+                        .ok_or_else(|| Refused("a view context with no relation".into()))?,
+                    att(&atts, 9).map(|a| a.int()).unwrap_or(0),
+                    att(&atts, 10).map(|a| a.text()).unwrap_or_default(),
+                ));
+            }
+            29 => {
+                // rec_procedure_end: a bare byte, like relation_end
             }
             rec::FIELD => {
                 let atts = read_atts(f, &mut at)?;
@@ -1813,6 +2469,20 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                         "field type {} is outside this restore's surface",
                         ftype
                     )));
+                }
+                if out.tables[t].view_blr.is_some() {
+                    // a VIEW's field: kept with its base/context links,
+                    // not as a stored column
+                    out.tables[t].view_fields.push((
+                        att(&atts, 1)
+                            .map(|a| a.text())
+                            .ok_or_else(|| Refused("a field with no name".into()))?,
+                        att(&atts, 2).map(|a| a.text()).unwrap_or_default(),
+                        att(&atts, 3).map(|a| a.text()).unwrap_or_default(),
+                        att(&atts, 4).map(|a| a.int()).unwrap_or(1),
+                        att(&atts, 13).map(|a| a.int()).unwrap_or(0),
+                    ));
+                    continue;
                 }
                 let n = out.tables[t].cols.len();
                 out.tables[t].cols.push(RCol {

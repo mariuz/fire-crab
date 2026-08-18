@@ -3100,6 +3100,9 @@ fn run_gbak_restore_core(
             fire_crab_ods::ddl::set_sequence_value(&mut file, page_size, &g.name, g.value)?;
         }
         for t in &restored.tables {
+            if t.view_blr.is_some() {
+                continue; // views restore after their base tables
+            }
             // FIELD RECORDS ARRIVE BLOBS-FIRST (the engine's own file
             // order), and att 13 carries the true position - so the
             // table is created in POSITION order and each row's values
@@ -3237,6 +3240,42 @@ fn run_gbak_restore_core(
                 }
             }
         }
+        // the VIEWS, in file order - each after its base tables, the
+        // two blobs verbatim, fields sharing the base columns' domains
+        for t in &restored.tables {
+            let (Some(blr), Some(srcb)) = (&t.view_blr, &t.view_source) else {
+                continue;
+            };
+            let fields: Vec<fire_crab_ods::ddl::RestoredViewField> = t
+                .view_fields
+                .iter()
+                .map(|(name, source, base, ctx, pos)| fire_crab_ods::ddl::RestoredViewField {
+                    name: name.clone(),
+                    source: source.clone(),
+                    base_field: base.clone(),
+                    view_context: *ctx,
+                    position: *pos,
+                })
+                .collect();
+            let contexts: Vec<fire_crab_ods::ddl::RestoredViewContext> = t
+                .view_contexts
+                .iter()
+                .map(|(rel, ctx, cname)| fire_crab_ods::ddl::RestoredViewContext {
+                    relation: rel.clone(),
+                    context: *ctx,
+                    context_name: cname.clone(),
+                })
+                .collect();
+            fire_crab_ods::ddl::restore_view(
+                &mut file,
+                page_size,
+                &t.name,
+                blr,
+                srcb,
+                &fields,
+                &contexts,
+            )?;
+        }
         // FOREIGN KEYS LAST, once every table and key exists: the
         // file names the REFERENCED CONSTRAINT; its table and columns
         // resolve through the uq_map and the referenced index's own
@@ -3319,6 +3358,49 @@ fn run_gbak_restore_core(
             if of_check || of_fk {
                 fire_crab_ods::ddl::restore_chk_row(&mut file, page_size, cname, tname)?;
             }
+        }
+        // the PROCEDURES, blobs verbatim: the params re-type through
+        // the carried domain records, and create_procedure invents its
+        // own RDB$n domains for them - the numbering matches on a
+        // fresh shell and drift is a name, not a type
+        for pr in &restored.procedures {
+            let param = |pp: &fire_crab_burp::RProcParam| -> Result<fire_crab_ods::ddl::ProcParamDef, String> {
+                let (_, ft, len, sc, st) = restored
+                    .domain_types
+                    .iter()
+                    .find(|(n, ..)| n == &pp.source)
+                    .ok_or_else(|| {
+                        format!("parameter {}: its domain {} is not in the file", pp.name, pp.source)
+                    })?;
+                Ok(fire_crab_ods::ddl::ProcParamDef {
+                    name: pp.name.clone(),
+                    field_type: *ft as i16,
+                    length: *len as u16,
+                    scale: *sc as i16,
+                    sub_type: *st as i16,
+                })
+            };
+            let mut ins = Vec::new();
+            let mut outs = Vec::new();
+            let mut sorted: Vec<&fire_crab_burp::RProcParam> = pr.params.iter().collect();
+            sorted.sort_by_key(|p| (p.ptype, p.number));
+            for pp in sorted {
+                if pp.ptype == 0 {
+                    ins.push(param(pp)?);
+                } else {
+                    outs.push(param(pp)?);
+                }
+            }
+            fire_crab_ods::ddl::create_procedure(
+                &mut file,
+                page_size,
+                &pr.name,
+                &ins,
+                &outs,
+                pr.ptype == 1,
+                &String::from_utf8_lossy(&pr.source),
+                &pr.blr,
+            )?;
         }
         let mut refreshed: Vec<&str> = Vec::new();
         for tr in &restored.triggers {

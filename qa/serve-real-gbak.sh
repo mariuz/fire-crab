@@ -176,7 +176,6 @@ else
 fi
 rm -f "$SEQDB" "$D/fc-gbak-seq.fbk" "$D/fc-gbak-seqr.fdb"
 
-refusal "a view" "CREATE VIEW VW AS SELECT X FROM T;"
 # a PRIMARY KEY and plain/unique indexes RIDE THE FILE now (rec_index +
 # the PRIMARY KEY rel_constraint) - what still refuses is the constraint
 # kinds whose meaning is more than an index
@@ -225,6 +224,47 @@ else
     echo "DIFF cascade after engine restore: CHILD count [$left] (want 1)"; fail=1
 fi
 rm -f "$CONSDB" "$D/fc-gbak-cons.fbk" "$D/fc-gbak-consr.fdb"
+# ~~a view refuses~~ / ~~a procedure refuses~~ - BOTH RIDE now: the
+# view as its rec_relation with the BLR/source blobs and its fields'
+# base/context links, the procedure as rec 27/28 with the blobs
+# verbatim - proven by the ENGINE restoring fc's backup and running
+# both
+VPDB="$D/fc-gbak-vp.fdb"; rm -f "$VPDB" "$D/fc-gbak-vp.fbk" "$D/fc-gbak-vpr.fdb"
+"$ISQL" -q -b -user "$U" -pas "$P" <<EOF >/dev/null 2>&1
+CREATE DATABASE '$VPDB' USER '$U' PASSWORD '$P' PAGE_SIZE 8192;
+CREATE TABLE VT (ID INTEGER, V VARCHAR(10));
+COMMIT;
+CREATE VIEW VV AS SELECT ID, V FROM VT WHERE ID > 1;
+COMMIT;
+SET TERM ^;
+CREATE PROCEDURE PSUM (A INTEGER, B INTEGER) RETURNS (S INTEGER) AS BEGIN S = A + B; SUSPEND; END^
+SET TERM ;^
+COMMIT;
+INSERT INTO VT VALUES (1, 'one');
+INSERT INTO VT VALUES (2, 'two');
+COMMIT;
+EOF
+chmod 666 "$VPDB"
+ran=$((ran + 1))
+fo=$(svc_backup "$FMGR" "$VPDB" "$D/fc-gbak-vp.fbk")
+if [ "${fo##*rc=}" = "0" ]; then
+    echo "OK   a VIEW and a PROCEDURE ride the backup (fc backs them up)"
+else
+    echo "DIFF view/procedure backup: [$fo]"; fail=1
+fi
+ran=$((ran + 1))
+sudo -n chmod 666 "$D/fc-gbak-vp.fbk" 2>/dev/null || chmod 666 "$D/fc-gbak-vp.fbk" 2>/dev/null
+"$FBSVCMGR" "$EMGR" user "$U" password "$P" action_restore dbname "$D/fc-gbak-vpr.fdb" bkp_file "$D/fc-gbak-vp.fbk" >/dev/null 2>&1
+grab "$D/fc-gbak-vpr.fdb"
+got=$(printf 'SET HEADING OFF;\nSELECT ID, V FROM VV;\nSELECT S FROM PSUM(30, 12);\n' |
+    "$ISQL" -q -b -user "$U" -pas "$P" "$D/fc-gbak-vpr.fdb" 2>&1 | tr -s ' \n' ' ')
+if [ "$got" = " 2 two 42 " ]; then
+    echo "OK   the ENGINE restores fc's fbk, READS the view and RUNS the procedure"
+else
+    echo "DIFF view/procedure after engine restore: [$got] (want ' 2 two 42 ')"; fail=1
+fi
+rm -f "$VPDB" "$D/fc-gbak-vp.fbk" "$D/fc-gbak-vpr.fdb"
+
 refusal "a trigger" "SET TERM ^;
 CREATE TRIGGER TR FOR T BEFORE INSERT AS BEGIN NEW.X = 1; END^
 SET TERM ;^"

@@ -41,9 +41,22 @@ fc's restored file; fc's own DML enforces the restored CHECK too
 (the carried engine BLR executes), while fc's own CASCADE EXECUTION
 refuses fail-closed — recorded. USER triggers are the fail-closed
 representative now (arbitrary PSQL bodies), typed both directions.
-gbak 22, gbakrestore 36. Next: views and procedures, reusing the
-dsql BLR oracle that CREATE PROCEDURE already stores
-byte-identically.
+gbak 22, gbakrestore 36. ~~Next: views and procedures~~ — BOTH RIDE
+(gbak 23, gbakrestore 37): a view as its rec_relation with the two
+blobs and base-linked fields plus rec_view contexts, a procedure as
+rec 27/28/29 with blobs verbatim and params re-typed through carried
+domains. Three laws learned from failures, not the annotation: the
+RDB$RUNTIME blob IS the field list the engine's relation loader
+reads (a perfect catalog with no runtime answers "Column unknown" to
+every column while COUNT(*) runs); att_field_number (22) is where
+the restore derives RDB$FIELD_ID, and without it every column
+vanishes; and rec 29 — procedure_end, a bare byte — must close a
+procedure or the reader walks the next record as trigger messages.
+The engine executing an fc-AUTHORED procedure catalog remains the
+old recorded loader boundary; every other corner of the matrix runs.
+The catalog chunk's arc closes: what still refuses is typed and
+small (user triggers, exceptions, functions, roles, packages, GTTs,
+expression-columned views).
 
 The subsystem map's rows fall into three states, and the difference
 matters more than the row count:

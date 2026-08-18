@@ -72,6 +72,7 @@ CREATE UNIQUE INDEX KU_2 ON KEYED (W, ID);
 CREATE TABLE BT (ID INTEGER, TXT BLOB SUB_TYPE TEXT, BIN BLOB SUB_TYPE 0, W VARCHAR(6));
 CREATE SEQUENCE SQ1;
 CREATE SEQUENCE SQ2 START WITH 500 INCREMENT BY 3;
+CREATE VIEW MIXVW AS SELECT S, I FROM MIXED WHERE I > 0;
 CREATE TABLE UPAR (ID INTEGER NOT NULL PRIMARY KEY, UX INTEGER NOT NULL, CONSTRAINT UQ_UX UNIQUE (UX));
 CREATE TABLE UCHILD (PID INTEGER NOT NULL, X INTEGER CHECK (X > 0),
                      CONSTRAINT FK_UP FOREIGN KEY (PID) REFERENCES UPAR (ID) ON DELETE CASCADE);
@@ -83,6 +84,10 @@ INSERT INTO UCHILD VALUES (1, 4);
 INSERT INTO UCHILD VALUES (5, 6);
 COMMIT;
 SELECT GEN_ID(SQ1, 7) FROM RDB\$DATABASE;
+COMMIT;
+SET TERM ^;
+CREATE PROCEDURE PSUM (A INTEGER, B INTEGER) RETURNS (S INTEGER) AS BEGIN S = A + B; SUSPEND; END^
+SET TERM ;^
 COMMIT;
 INSERT INTO KEYED VALUES (1, 'aa');
 INSERT INTO KEYED VALUES (2, 'bb');
@@ -148,6 +153,11 @@ cons() { # <db> - the whole constraint family: catalog, the three
         "$ISQL" -q -b -user "$U" -pas "$P" "$1" 2>&1 | tr -s ' \n' ' ')
     printf '%s/%s/23000x%s/rows%s' "$cat" "$trg" "$viol" "$n"
 }
+vwproc() { # <db> - the view reads, the procedure runs
+    grab "$1"
+    printf 'SET HEADING OFF;\nSELECT COUNT(*) FROM MIXVW;\nSELECT S FROM PSUM(40, 2);\n' |
+        "$ISQL" -q -b -user "$U" -pas "$P" "$1" 2>&1 | tr -s ' \n' ' '
+}
 gens() { # <db> - sequence catalog + CURRENT values (GEN_ID step 0)
     grab "$1"
     printf 'SET HEADING OFF;\nSELECT TRIM(RDB\$GENERATOR_NAME), RDB\$INITIAL_VALUE, RDB\$GENERATOR_INCREMENT FROM RDB\$GENERATORS WHERE RDB\$SYSTEM_FLAG = 0 ORDER BY 1;\nSELECT GEN_ID(SQ1, 0), GEN_ID(SQ2, 0) FROM RDB\$DATABASE;\n' |
@@ -202,6 +212,14 @@ cbase=$(cons "$D/fc-gbr-r4.fdb")
 check "UNIQUE + FK ride the engine's fbk through fc's restore" "$(cons "$D/fc-gbr-r1.fdb")" "$cbase"
 check "...and fc's own round trip" "$(cons "$D/fc-gbr-r2.fdb")" "$cbase"
 check "...and fc's fbk through the ENGINE's restore" "$(cons "$D/fc-gbr-r3.fdb")" "$cbase"
+
+# the VIEW and the PROCEDURE, in the corners the loaders allow: the
+# engine reads BOTH off its own restore of either fbk; fc's restore
+# serves them through fc (gated in serve-real-gbak.sh's live probe) -
+# the ENGINE executing an fc-AUTHORED procedure catalog is the old
+# recorded loader boundary, so r1's procedure corner stays out
+vbase=$(vwproc "$D/fc-gbr-r4.fdb")
+check "the view and procedure ride fc's fbk through the ENGINE's restore" "$(vwproc "$D/fc-gbr-r3.fdb")" "$vbase"
 for r in r1 r2; do
     ran=$((ran + 1))
     v=$("$GFIX" -v -full -user "$U" -pas "$P" "$D/fc-gbr-$r.fdb" 2>&1 | tr -d ' \n')
