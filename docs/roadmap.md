@@ -211,10 +211,21 @@ carry) — and the flip taught the harness a lesson worth its own
 line: the SERVER LINGERS a previously-attached database of the same
 path, so a reused fixture filename hands the backup a STALE
 instance (the shadow silently missing from the fbk, measured) —
-boundary fixtures take fresh names now. **The gbak surface has no
-named refusals left** — shadows, publications, filters and the
-other never-fixtured families refuse typed at the surface check or
-the record walk, and everything else rides.
+boundary fixtures take fresh names now. ~~Publications and filters were never-fixtured~~ — both RIDE
+now (gbak 56): the DEFAULT publication's ENABLE state travels as
+two booleans on the DATABASE record (atts 20/21 — the system row
+itself never gets a record, measured off the engine's own restore
+path), its INCLUDEd tables as rec-41 rows; a BLOB FILTER
+declaration as rec 20 with the att series that continues the TYPE
+atts (name 6, module 8, entrypoint 9, subtypes 10/11) — names and
+subtypes verbatim, the code outside the file, the same honest
+carriage a legacy UDF gets. The filter's negative OUTPUT_SUB_TYPE
+found a GLOBAL reader bug: attribute ints were accumulated
+UNSIGNED, so −4 read as four billion and overflowed the SMALLINT —
+Att::int sign-extends by width now. **The gbak surface has no named
+refusals left** — shadows and the remaining never-fixtured
+families refuse typed at the surface check or the record walk, and
+everything else rides.
 
 The subsystem map's rows fall into three states, and the difference
 matters more than the row count:

@@ -3126,6 +3126,31 @@ fn run_gbak_restore_core(
                 fire_crab_ods::ddl::set_domain_validation(&mut file, page_size, &nd.name, blr, src)?;
             }
         }
+        // the DEFAULT publication's state + its included tables
+        if restored.default_pub_active
+            || restored.default_pub_auto
+            || !restored.pub_tables.is_empty()
+        {
+            fire_crab_ods::ddl::restore_publication_state(
+                &mut file,
+                page_size,
+                restored.default_pub_active,
+                restored.default_pub_auto,
+                &restored.pub_tables,
+            )?;
+        }
+        // the BLOB FILTER declarations - names and subtypes verbatim
+        for fl in &restored.filters {
+            fire_crab_ods::ddl::restore_carried_filter(
+                &mut file,
+                page_size,
+                &fl.name,
+                &fl.module,
+                &fl.entrypoint,
+                fl.input_sub_type,
+                fl.output_sub_type,
+            )?;
+        }
         // the security-name MAPPINGS - pure catalog, verbatim
         for m in &restored.mappings {
             fire_crab_ods::ddl::restore_carried_mapping(
@@ -3671,6 +3696,7 @@ fn run_gbak_restore_core(
                 "package" => ("RDB$PACKAGES", vec![("RDB$PACKAGE_NAME", name)]),
                 "domain" => ("RDB$FIELDS", vec![("RDB$FIELD_NAME", name)]),
                 "mapping" => ("RDB$AUTH_MAPPING", vec![("RDB$MAP_NAME", name)]),
+                "filter" => ("RDB$FILTERS", vec![("RDB$FUNCTION_NAME", name)]),
                 other => return Err(format!("a COMMENT on a {} is outside this restore's surface", other)),
             };
             fire_crab_ods::ddl::set_catalog_description(&mut file, page_size, rel, &keys, text)?;

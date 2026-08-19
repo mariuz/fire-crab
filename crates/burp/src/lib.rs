@@ -51,6 +51,8 @@ mod rec {
     pub const FUNCTION_END: u8 = 17;
     pub const SQL_ROLES: u8 = 36;
     pub const MAPPING: u8 = 37;
+    pub const PUB_TABLE: u8 = 41;
+    pub const FILTER: u8 = 20;
     pub const PACKAGE: u8 = 38;
     pub const REL_CONSTRAINT: u8 = 31;
     pub const REF_CONSTRAINT: u8 = 32;
@@ -428,10 +430,13 @@ pub fn write_backup_verbose(
         .text(1, db_path) // att_file_name
         .end();
     // --- rec_database ---------------------------------------------------
+    // the DEFAULT publication's two flags ride HERE (atts 20/21) - the
+    // system row itself never gets a record, measured
+    let (pub_active, pub_auto, pub_tables) = default_publication(image, page_size);
     Rec::new(&mut out, rec::DATABASE)
         .text(11, "NONE") // att_database_dfl_charset
-        .byte(20, 0)
-        .byte(21, 0)
+        .byte(20, pub_active)
+        .byte(21, pub_auto)
         .end();
     // --- rec_schema: PUBLIC ----------------------------------------------
     log.push("gbak:writing schemas".into());
@@ -842,6 +847,24 @@ pub fn write_backup_verbose(
     // --- per relation: the data ------------------------------------------
     log.push("gbak:writing types".into());
     log.push("gbak:writing filters".into());
+    for fl in read_filters(image, page_size)? {
+        log.push(format!("gbak:    writing filter \"{}\"", fl.name));
+        let mut r = Rec::new(&mut out, rec::FILTER)
+            .text(6, &fl.name)
+            .text(8, &fl.module)
+            .text(9, &fl.entrypoint)
+            .int(10, fl.input_sub_type as i32)
+            .int(11, fl.output_sub_type as i32);
+        if let Some(d) = catalog_description(
+            image,
+            page_size,
+            "RDB$FILTERS",
+            &[("RDB$FUNCTION_NAME", &fl.name)],
+        ) {
+            r = r.blob(12, &d); // att_filter_description2
+        }
+        r.end();
+    }
     log.push("gbak:writing id generators".into());
     for g in read_generators(image, page_size)? {
         log.push(format!(
@@ -1431,6 +1454,17 @@ pub fn write_backup_verbose(
         r.end();
     }
     log.push("gbak:writing publications".into());
+    for (pubname, tname) in &pub_tables {
+        log.push(format!(
+            "gbak:    writing publication for table \"PUBLIC\".\"{}\"",
+            tname
+        ));
+        Rec::new(&mut out, rec::PUB_TABLE)
+            .text(1, pubname)
+            .text(2, tname)
+            .text(3, "PUBLIC")
+            .end();
+    }
     log.push("gbak:writing constants".into());
     out.push(rec::END);
     // gbak pads its last block with zeros; 512 is what the reference
@@ -2757,6 +2791,89 @@ fn read_packages(
     Ok(out)
 }
 
+/// A BLOB FILTER declaration off RDB$FILTERS - like a legacy UDF,
+/// the names and subtypes ARE the declaration; the code stays outside.
+struct UFilter {
+    name: String,
+    module: String,
+    entrypoint: String,
+    input_sub_type: i64,
+    output_sub_type: i64,
+}
+
+fn read_filters(
+    image: &fire_crab_ods::Image,
+    page_size: usize,
+) -> Result<Vec<UFilter>, Refused> {
+    let Some((cols, rows)) = sys_rows(image, page_size, "RDB$FILTERS") else {
+        return Ok(Vec::new());
+    };
+    let at = |n: &str| cols.iter().find(|(c, _)| c.eq_ignore_ascii_case(n)).map(|(_, i)| *i);
+    let int = |r: &fire_crab_ods::tra::VisibleRow, i: Option<usize>| match i
+        .and_then(|i| r.values.get(i))
+    {
+        Some(fire_crab_ods::format::Value::Int(n)) => Some(*n),
+        _ => None,
+    };
+    let mut out = Vec::new();
+    for r in &rows {
+        if matches!(int(r, at("RDB$SYSTEM_FLAG")), Some(f) if f != 0) {
+            continue;
+        }
+        let Some(name) = text_opt(r, at("RDB$FUNCTION_NAME")) else { continue };
+        out.push(UFilter {
+            module: text_opt(r, at("RDB$MODULE_NAME")).unwrap_or_default(),
+            entrypoint: text_opt(r, at("RDB$ENTRYPOINT")).unwrap_or_default(),
+            input_sub_type: int(r, at("RDB$INPUT_SUB_TYPE")).unwrap_or(0),
+            output_sub_type: int(r, at("RDB$OUTPUT_SUB_TYPE")).unwrap_or(0),
+            name,
+        });
+    }
+    Ok(out)
+}
+
+/// The DEFAULT publication's state off RDB$PUBLICATIONS - the system
+/// row itself never rides (the engine filters SYSTEM_FLAG), its two
+/// flags travel on the DATABASE record (atts 20/21, measured), and
+/// its included tables as rec 41 rows.
+fn default_publication(
+    image: &fire_crab_ods::Image,
+    page_size: usize,
+) -> (u8, u8, Vec<(String, String)>) {
+    let mut active = 0u8;
+    let mut auto = 0u8;
+    if let Some((cols, rows)) = sys_rows(image, page_size, "RDB$PUBLICATIONS") {
+        let at = |n: &str| cols.iter().find(|(c, _)| c.eq_ignore_ascii_case(n)).map(|(_, i)| *i);
+        for r in &rows {
+            if text_opt(r, at("RDB$PUBLICATION_NAME")).as_deref() == Some("RDB$DEFAULT") {
+                if let Some(fire_crab_ods::format::Value::Int(v)) =
+                    at("RDB$ACTIVE_FLAG").and_then(|i| r.values.get(i))
+                {
+                    active = (*v != 0) as u8;
+                }
+                if let Some(fire_crab_ods::format::Value::Int(v)) =
+                    at("RDB$AUTO_ENABLE").and_then(|i| r.values.get(i))
+                {
+                    auto = (*v != 0) as u8;
+                }
+            }
+        }
+    }
+    let mut tables = Vec::new();
+    if let Some((cols, rows)) = sys_rows(image, page_size, "RDB$PUBLICATION_TABLES") {
+        let at = |n: &str| cols.iter().find(|(c, _)| c.eq_ignore_ascii_case(n)).map(|(_, i)| *i);
+        for r in &rows {
+            if let (Some(p), Some(t)) = (
+                text_opt(r, at("RDB$PUBLICATION_NAME")),
+                text_opt(r, at("RDB$TABLE_NAME")),
+            ) {
+                tables.push((p, t));
+            }
+        }
+    }
+    (active, auto, tables)
+}
+
 /// A security-name MAPPING off RDB$AUTH_MAPPING - every column of
 /// the row, verbatim (the record's att_map series).
 struct UMapping {
@@ -3175,6 +3292,13 @@ pub struct Restored {
     pub packages: Vec<RPackage>,
     /// the security-name mappings, file order
     pub mappings: Vec<RMapping>,
+    /// the DEFAULT publication's flags off the database record
+    pub default_pub_active: bool,
+    pub default_pub_auto: bool,
+    /// (publication, table) rows, file order
+    pub pub_tables: Vec<(String, String)>,
+    /// the BLOB FILTER declarations, file order
+    pub filters: Vec<RFilter>,
     /// privilege records seen and set aside - the count keeps the
     /// omission visible in the trace instead of silent
     pub privileges_skipped: u64,
@@ -3205,6 +3329,15 @@ pub struct RNamedDomain {
     pub default: Option<(Vec<u8>, String)>,
     /// CHECK: (validation BLR verbatim, source text)
     pub check: Option<(Vec<u8>, String)>,
+}
+
+/// A BLOB FILTER declaration off the file.
+pub struct RFilter {
+    pub name: String,
+    pub module: String,
+    pub entrypoint: String,
+    pub input_sub_type: i64,
+    pub output_sub_type: i64,
 }
 
 /// A security-name MAPPING off the file, every column verbatim.
@@ -3320,11 +3453,19 @@ struct Att {
 
 impl Att {
     fn int(&self) -> i64 {
+        // SIGN-EXTENDED by the attribute's width: put_int32 writes
+        // negatives (a filter's OUTPUT_SUB_TYPE -4, a NUMERIC scale)
+        // and a plain LE accumulate read them as 4 billion
         let mut v: i64 = 0;
         for (k, b) in self.data.iter().enumerate().take(8) {
             v |= (*b as i64) << (8 * k);
         }
-        v
+        match self.data.len() {
+            1 => v as i8 as i64,
+            2 => v as i16 as i64,
+            4 => v as i32 as i64,
+            _ => v,
+        }
     }
     fn text(&self) -> String {
         String::from_utf8_lossy(&self.data).into_owned()
@@ -3485,6 +3626,10 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
         named_domains: Vec::new(),
         packages: Vec::new(),
         mappings: Vec::new(),
+        default_pub_active: false,
+        default_pub_auto: false,
+        pub_tables: Vec::new(),
+        filters: Vec::new(),
         privileges_skipped: 0,
     };
     // (schema, source name) -> not-null flag learned from constraints
@@ -3519,9 +3664,50 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                 let atts = read_atts(f, &mut at)?;
                 out.page_size = att(&atts, 5).map(|a| a.int() as u32);
             }
-            rec::DATABASE | rec::SCHEMA => {
-                // the database attributes this slice carries are defaults
+            rec::DATABASE => {
+                let atts = read_atts(f, &mut at)?;
+                // the DEFAULT publication's flags (atts 20/21)
+                out.default_pub_active = att(&atts, 20).map(|a| a.int()).unwrap_or(0) != 0;
+                out.default_pub_auto = att(&atts, 21).map(|a| a.int()).unwrap_or(0) != 0;
+            }
+            rec::SCHEMA => {
                 let _ = read_atts(f, &mut at)?;
+            }
+            rec::FILTER => {
+                let (atts, blobs) = read_atts_blob(f, &mut at, &[7, 12])?;
+                let name = att(&atts, 6)
+                    .map(|a| a.text())
+                    .ok_or_else(|| Refused("a filter with no name".into()))?;
+                if let Some((_, d)) = blobs.iter().find(|(t, _)| *t == 12) {
+                    let mut d = d.clone();
+                    if d.last() == Some(&0) {
+                        d.pop();
+                    }
+                    out.descriptions.push((
+                        "filter".into(),
+                        name.clone(),
+                        String::new(),
+                        String::from_utf8_lossy(&d).into_owned(),
+                    ));
+                }
+                out.filters.push(RFilter {
+                    module: att(&atts, 8).map(|a| a.text()).unwrap_or_default(),
+                    entrypoint: att(&atts, 9).map(|a| a.text()).unwrap_or_default(),
+                    input_sub_type: att(&atts, 10).map(|a| a.int()).unwrap_or(0),
+                    output_sub_type: att(&atts, 11).map(|a| a.int()).unwrap_or(0),
+                    name,
+                });
+            }
+            rec::PUB_TABLE => {
+                let atts = read_atts(f, &mut at)?;
+                out.pub_tables.push((
+                    att(&atts, 1)
+                        .map(|a| a.text())
+                        .ok_or_else(|| Refused("a publication table with no publication".into()))?,
+                    att(&atts, 2)
+                        .map(|a| a.text())
+                        .ok_or_else(|| Refused("a publication table with no table".into()))?,
+                ));
             }
             rec::GLOBAL_FIELD => {
                 // the column types arrive re-derived from the field

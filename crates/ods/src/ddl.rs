@@ -8399,6 +8399,75 @@ pub fn set_catalog_description(
     )
 }
 
+/// Restore a carried BLOB FILTER declaration: one RDB$FILTERS row,
+/// names and subtypes verbatim, a fresh SQL$ class - the code the
+/// names point at stays outside the file (no grant rows: measured,
+/// the engine writes none for a filter).
+pub fn restore_carried_filter(
+    file: &mut crate::Image,
+    page_size: usize,
+    name: &str,
+    module: &str,
+    entrypoint: &str,
+    input_sub_type: i64,
+    output_sub_type: i64,
+) -> Result<(), String> {
+    let rel = crate::resolve_relation(file, page_size, "RDB$FILTERS")
+        .ok_or("no RDB$FILTERS relation")?;
+    let class = next_security_class(file, page_size, ACL_SEQUENCE_OWNER)?;
+    sys_insert(file, page_size, "RDB$FILTERS", rel, &[
+        ("RDB$FUNCTION_NAME", SysVal::S(name)),
+        ("RDB$MODULE_NAME", SysVal::S(module)),
+        ("RDB$ENTRYPOINT", SysVal::S(entrypoint)),
+        ("RDB$INPUT_SUB_TYPE", SysVal::I(input_sub_type)),
+        ("RDB$OUTPUT_SUB_TYPE", SysVal::I(output_sub_type)),
+        ("RDB$SYSTEM_FLAG", SysVal::I(0)),
+        ("RDB$SECURITY_CLASS", SysVal::S(&class)),
+        ("RDB$OWNER_NAME", SysVal::S(OWNER)),
+    ])?;
+    advance_oldest_transactions(file, page_size)
+}
+
+/// Patch the DEFAULT publication's flags (ALTER DATABASE ENABLE
+/// PUBLICATION travels as two booleans on the DATABASE record) and
+/// insert the carried (publication, table) rows.
+pub fn restore_publication_state(
+    file: &mut crate::Image,
+    page_size: usize,
+    active: bool,
+    auto_enable: bool,
+    tables: &[(String, String)],
+) -> Result<(), String> {
+    if active || auto_enable {
+        let rel = crate::resolve_relation(file, page_size, "RDB$PUBLICATIONS")
+            .ok_or("no RDB$PUBLICATIONS relation")?;
+        let name_f = sys_fid(file, page_size, "RDB$PUBLICATIONS", "RDB$PUBLICATION_NAME")?;
+        patch_sys_row(
+            file,
+            page_size,
+            "RDB$PUBLICATIONS",
+            rel,
+            move |v| text_eq(v.get(name_f), "RDB$DEFAULT"),
+            &[
+                ("RDB$ACTIVE_FLAG", SysVal::I(if active { 1 } else { 0 })),
+                ("RDB$AUTO_ENABLE", SysVal::I(if auto_enable { 1 } else { 0 })),
+            ],
+        )?;
+    }
+    if !tables.is_empty() {
+        let rel = crate::resolve_relation(file, page_size, "RDB$PUBLICATION_TABLES")
+            .ok_or("no RDB$PUBLICATION_TABLES relation")?;
+        for (p, t) in tables {
+            sys_insert(file, page_size, "RDB$PUBLICATION_TABLES", rel, &[
+                ("RDB$PUBLICATION_NAME", SysVal::S(p)),
+                ("RDB$TABLE_NAME", SysVal::S(t)),
+                ("RDB$TABLE_SCHEMA_NAME", SysVal::S("PUBLIC")),
+            ])?;
+        }
+    }
+    advance_oldest_transactions(file, page_size)
+}
+
 /// Restore a carried security-name MAPPING: the RDB$AUTH_MAPPING row,
 /// every column verbatim. Nothing else - a local mapping is pure
 /// catalog, read by the engine's own login machinery.

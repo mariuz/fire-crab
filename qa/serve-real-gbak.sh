@@ -840,6 +840,43 @@ else
 fi
 rm -f "$MPDB" "$D/fc-gbak-mp.fbk" "$D/fc-gbak-mp2.fbk" "$D/fc-gbak-mpr.fdb" "$D/fc-gbak-mp.shd"
 
+# PUBLICATIONS RIDE - the DEFAULT publication's two flags travel on
+# the DATABASE record (atts 20/21, the system row itself never gets a
+# record), its included tables as rec 41 rows. FILTER declarations
+# ride as rec 20 - names and subtypes verbatim, the code outside the
+# file, the same honest carriage a legacy UDF gets.
+PFDB="$D/fc-gbak-pf.fdb"; rm -f "$PFDB" "$D/fc-gbak-pf.fbk" "$D/fc-gbak-pfr.fdb"
+"$ISQL" -q -b -user "$U" -pas "$P" <<EOF >/dev/null 2>&1
+CREATE DATABASE '$PFDB' USER '$U' PASSWORD '$P' PAGE_SIZE 8192;
+CREATE TABLE T (X INTEGER PRIMARY KEY);
+COMMIT;
+ALTER DATABASE ENABLE PUBLICATION;
+ALTER DATABASE INCLUDE TABLE T TO PUBLICATION;
+COMMIT;
+DECLARE FILTER F1 INPUT_TYPE 1 OUTPUT_TYPE -4 ENTRY_POINT 'ep1' MODULE_NAME 'nomod';
+COMMIT;
+EOF
+chmod 666 "$PFDB"
+ran=$((ran + 1))
+fo=$(svc_backup "$FMGR" "$PFDB" "$D/fc-gbak-pf.fbk")
+if [ "${fo##*rc=}" = "0" ]; then
+    echo "OK   the publication state and a FILTER declaration ride the backup"
+else
+    echo "DIFF publication/filter backup: [$fo]"; fail=1
+fi
+ran=$((ran + 1))
+sudo -n chmod 666 "$D/fc-gbak-pf.fbk" 2>/dev/null || chmod 666 "$D/fc-gbak-pf.fbk" 2>/dev/null
+"$FBSVCMGR" "$EMGR" user "$U" password "$P" action_restore dbname "$D/fc-gbak-pfr.fdb" bkp_file "$D/fc-gbak-pf.fbk" >/dev/null 2>&1
+grab "$D/fc-gbak-pfr.fdb"
+got=$(printf "SELECT RDB\$ACTIVE_FLAG || '/' || (SELECT TRIM(RDB\$TABLE_NAME) FROM RDB\$PUBLICATION_TABLES) FROM RDB\$PUBLICATIONS;\nSELECT TRIM(RDB\$FUNCTION_NAME) || RDB\$INPUT_SUB_TYPE || RDB\$OUTPUT_SUB_TYPE FROM RDB\$FILTERS;\n" |
+    "$ISQL" -q -b -user "$U" -pas "$P" "$D/fc-gbak-pfr.fdb" 2>&1 | grep -cE '1/T|F11 *-4')
+if [ "$got" = "2" ]; then
+    echo "OK   the ENGINE restores fc's fbk: publication ENABLED with its table, filter typed -4"
+else
+    echo "DIFF publication/filter after engine restore: match-count [$got] (want 2)"; fail=1
+fi
+rm -f "$PFDB" "$D/fc-gbak-pf.fbk" "$D/fc-gbak-pfr.fdb"
+
 # --- 4. RECORDED BOUNDARY: NOT NULL is not carried ---------------------------
 NN="$D/fc-gbak-nn.fdb"; rm -f "$NN"
 "$ISQL" -q -b -user "$U" -pas "$P" <<EOF >/dev/null 2>&1
