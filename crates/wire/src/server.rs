@@ -4250,10 +4250,7 @@ fn run_nrest(b: &fire_crab_svc::Buffer) -> Result<String, i32> {
         .filter(|c| c.tag == nbk::FILE)
         .map(|c| c.text())
         .collect();
-    if files.len() != 1 {
-        if std::env::var("FC_SRV_TRACE").is_ok() {
-            eprintln!("[srv] nrest with {} files refused - one level-0 file only", files.len());
-        }
+    if files.is_empty() {
         return Err(GDS_WISH_LIST);
     }
     let mut image = std::fs::read(&files[0]).map_err(|e| {
@@ -4262,8 +4259,71 @@ fn run_nrest(b: &fire_crab_svc::Buffer) -> Result<String, i32> {
         }
         GDS_IO_ERROR
     })?;
-    if fire_crab_ods::header::HeaderPage::decode(&image).is_none() {
+    let page_size = fire_crab_ods::header::HeaderPage::decode(&image)
+        .map(|h| h.page_size as usize)
+        .ok_or(GDS_IO_ERROR)?;
+    if page_size < 52 || image.len() < page_size {
         return Err(GDS_IO_ERROR);
+    }
+    // THE CHAIN: prev_guid seeds from the level-0's own backup-guid
+    // clumplet (the engine refuses a level-0 without one); each
+    // increment must name it as ITS previous, or the order is wrong -
+    // the GUID check the engine spells "Wrong order of backup files"
+    let mut prev_guid: [u8; 16] = image
+        .get(..page_size)
+        .map(fire_crab_ods::header::variable_header)
+        .unwrap_or_default()
+        .iter()
+        .filter(|c| {
+            c.tag == fire_crab_ods::header::hdr_clump::BACKUP_GUID && c.data.len() == 16
+        })
+        .last()
+        .map(|c| {
+            let mut g = [0u8; 16];
+            g.copy_from_slice(&c.data);
+            g
+        })
+        .ok_or_else(|| {
+            if std::env::var("FC_SRV_TRACE").is_ok() {
+                eprintln!("[srv] nrest: no backup-guid clumplet in the level-0 file");
+            }
+            GDS_IO_ERROR
+        })?;
+    for (idx, f) in files.iter().enumerate().skip(1) {
+        let inc = std::fs::read(f).map_err(|_| GDS_IO_ERROR)?;
+        if inc.len() < page_size || &inc[0..4] != b"NBAK" {
+            if std::env::var("FC_SRV_TRACE").is_ok() {
+                eprintln!("[srv] nrest: {} is not an NBAK increment", f);
+            }
+            return Err(GDS_IO_ERROR);
+        }
+        let version = i16::from_le_bytes([inc[4], inc[5]]);
+        let level = i16::from_le_bytes([inc[6], inc[7]]);
+        if version != 2 || level as usize != idx {
+            if std::env::var("FC_SRV_TRACE").is_ok() {
+                eprintln!("[srv] nrest: {} version {} level {} at position {}", f, version, level, idx);
+            }
+            return Err(GDS_IO_ERROR);
+        }
+        if inc[24..40] != prev_guid {
+            if std::env::var("FC_SRV_TRACE").is_ok() {
+                eprintln!("[srv] nrest: wrong order - {} does not extend the previous file", f);
+            }
+            return Err(GDS_IO_ERROR);
+        }
+        let inc_ps = u32::from_le_bytes([inc[40], inc[41], inc[42], inc[43]]) as usize;
+        if inc_ps != page_size || inc.len() % page_size != 0 {
+            return Err(GDS_IO_ERROR);
+        }
+        for chunk in inc[page_size..].chunks_exact(page_size) {
+            let pno = u32::from_le_bytes([chunk[12], chunk[13], chunk[14], chunk[15]]) as usize;
+            let end = (pno + 1) * page_size;
+            if image.len() < end {
+                image.resize(end, 0); // the database GREW between levels
+            }
+            image[pno * page_size..end].copy_from_slice(chunk);
+        }
+        prev_guid.copy_from_slice(&inc[8..24]);
     }
     if image.len() > 24 {
         image[24] = 0; // hdr_backup_mode = none: the fixup

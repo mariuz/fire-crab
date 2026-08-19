@@ -57,10 +57,15 @@ previous era, raw and ascending, the restore placing each by its
 own pag_pageno; page 0 rides STALLED (the fixup expects state 1,
 measured). The gate walks an all-fc chain and a three-level MIXED
 one (fc level-0, engine level-1, fc level-2 — an engine-written row
-inside fc's increment) through the ENGINE's restore. Remaining
-slices: fc RESTORES chains (GUID verification, "Wrong order"
-refusals), and ALTER DATABASE BEGIN/END BACKUP with the .delta
-redirection.
+inside fc's increment) through the ENGINE's restore. ~~fc restores chains~~ — slice C is in: the level-0's guid
+clumplet seeds the chain, each increment must carry version 2, its
+POSITION as its level, and its predecessor's GUID (a mismatch
+refuses whole, no half-restored database — the engine's "Wrong
+order" as a typed refusal), and each raw page lands at its own
+pag_pageno, the file EXTENDING when the database grew between
+levels. fc restores the engine's three-level chain; the wrong order
+refuses. Remaining: ALTER DATABASE BEGIN/END BACKUP with the .delta
+redirection — the one nbackup surface fc still refuses.
 (TIMESTAMP WITH TIME ZONE learned its system-format mapping on the
 way — type 29 was unanswerable, which had hidden RDB$BACKUP_HISTORY
 from every reader.)

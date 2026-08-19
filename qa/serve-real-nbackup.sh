@@ -260,7 +260,32 @@ if [ "$got" = "/1/3/7/" ]; then
 else
     echo "DIFF mixed chain: [$got] (want /1/3/7/)"; fail=1
 fi
-rm -f "$CHDB" "$D/fc-nb-ch0.nbk" "$D/fc-nb-ch1.nbk" "$D/fc-nb-ch2.nbk" "$D/fc-nb-chr.fdb" "$D/fc-nb-chr2.fdb"
+# ...and FC RESTORES a chain the ENGINE produced - the level-0's
+# guid clumplet seeds the chain, each increment must name its
+# predecessor, and a wrong order refuses whole with no half-db
+rm -f "$D/fc-nb-e0.nbk" "$D/fc-nb-e1.nbk" "$D/fc-nb-fcr.fdb" "$D/fc-nb-bad.fdb"
+"$NBACKUP" -B 0 "$CHDB" "$D/fc-nb-e0.nbk" -user "$U" -password "$P" >/dev/null 2>&1
+printf 'INSERT INTO T VALUES (9);\nCOMMIT;\n' | "$ISQL" -q -b -user "$U" -pas "$P" "$CHDB" >/dev/null 2>&1
+"$NBACKUP" -B 1 "$CHDB" "$D/fc-nb-e1.nbk" -user "$U" -password "$P" >/dev/null 2>&1
+chmod 666 "$D/fc-nb-e0.nbk" "$D/fc-nb-e1.nbk" 2>/dev/null
+ran=$((ran + 1))
+fo=$(svc "$FMGR" action_nrest dbname "$D/fc-nb-fcr.fdb" nbk_file "$D/fc-nb-e0.nbk" nbk_file "$D/fc-nb-e1.nbk")
+grab "$D/fc-nb-fcr.fdb"
+got=$(printf 'SET HEADING OFF;\nSELECT MAX(X) FROM T;\n' |
+    "$ISQL" -q -b -user "$U" -pas "$P" "$D/fc-nb-fcr.fdb" 2>&1 | tr -d ' \n')
+if [ "$got" = "9" ]; then
+    echo "OK   FC restores the ENGINE's chain (the increment's row is the answer)"
+else
+    echo "DIFF fc chain restore: [$fo] max=[$got] (want 9)"; fail=1
+fi
+ran=$((ran + 1))
+fo=$(svc "$FMGR" action_nrest dbname "$D/fc-nb-bad.fdb" nbk_file "$D/fc-nb-e1.nbk" nbk_file "$D/fc-nb-e0.nbk")
+if [ "${fo##*rc=}" = "1" ] && [ ! -e "$D/fc-nb-bad.fdb" ]; then
+    echo "OK   a WRONG ORDER refuses whole (no half-restored database)"
+else
+    echo "DIFF wrong-order restore: [$fo]"; fail=1
+fi
+rm -f "$CHDB" "$D/fc-nb-ch0.nbk" "$D/fc-nb-ch1.nbk" "$D/fc-nb-ch2.nbk" "$D/fc-nb-chr.fdb" "$D/fc-nb-chr2.fdb" "$D/fc-nb-e0.nbk" "$D/fc-nb-e1.nbk" "$D/fc-nb-fcr.fdb" "$D/fc-nb-bad.fdb"
 
 # --- 6. and the MAIN database survives its own backup ------------------------
 ran=$((ran + 1))
