@@ -201,8 +201,18 @@ absent module fails with the byte-identical engine error — the code
 outside the file stays outside, honestly, on both sides. The
 fail-closed representative is a MAPPING now, refused typed on both
 sides (the writer previously would have silently DROPPED
-RDB$AUTH_MAPPING rows — a found bug closed). **The gbak surface has
-no named refusals left** — mappings, publications, filters and the
+RDB$AUTH_MAPPING rows — a found bug closed). ~~Mappings refuse~~ — SECURITY-NAME MAPPINGS RIDE (rec 37,
+every RDB$AUTH_MAPPING column verbatim, gbak 54): both restores
+land the row column-identical, and the mapping's COMMENT joins the
+generic description pass. The fail-closed representative is a
+SHADOW now — refused typed on BOTH sides (the writer's surface
+check took RDB$FILES; a page-level mirror is not this pair's to
+carry) — and the flip taught the harness a lesson worth its own
+line: the SERVER LINGERS a previously-attached database of the same
+path, so a reused fixture filename hands the backup a STALE
+instance (the shadow silently missing from the fbk, measured) —
+boundary fixtures take fresh names now. **The gbak surface has no
+named refusals left** — shadows, publications, filters and the
 other never-fixtured families refuse typed at the surface check or
 the record walk, and everything else rides.
 

@@ -3126,6 +3126,21 @@ fn run_gbak_restore_core(
                 fire_crab_ods::ddl::set_domain_validation(&mut file, page_size, &nd.name, blr, src)?;
             }
         }
+        // the security-name MAPPINGS - pure catalog, verbatim
+        for m in &restored.mappings {
+            fire_crab_ods::ddl::restore_carried_mapping(
+                &mut file,
+                page_size,
+                &m.name,
+                &m.using_,
+                m.plugin.as_deref(),
+                m.db.as_deref(),
+                &m.from_type,
+                &m.from,
+                m.to_type,
+                m.to.as_deref(),
+            )?;
+        }
         // the SQL ROLES - independent of everything, grants to them
         // stay in the privilege set-aside (the recorded difference)
         for name in &restored.roles {
@@ -3655,6 +3670,7 @@ fn run_gbak_restore_core(
                 "role" => ("RDB$ROLES", vec![("RDB$ROLE_NAME", name)]),
                 "package" => ("RDB$PACKAGES", vec![("RDB$PACKAGE_NAME", name)]),
                 "domain" => ("RDB$FIELDS", vec![("RDB$FIELD_NAME", name)]),
+                "mapping" => ("RDB$AUTH_MAPPING", vec![("RDB$MAP_NAME", name)]),
                 other => return Err(format!("a COMMENT on a {} is outside this restore's surface", other)),
             };
             fire_crab_ods::ddl::set_catalog_description(&mut file, page_size, rel, &keys, text)?;

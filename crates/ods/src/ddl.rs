@@ -8399,6 +8399,45 @@ pub fn set_catalog_description(
     )
 }
 
+/// Restore a carried security-name MAPPING: the RDB$AUTH_MAPPING row,
+/// every column verbatim. Nothing else - a local mapping is pure
+/// catalog, read by the engine's own login machinery.
+#[allow(clippy::too_many_arguments)]
+pub fn restore_carried_mapping(
+    file: &mut crate::Image,
+    page_size: usize,
+    name: &str,
+    using_: &str,
+    plugin: Option<&str>,
+    db: Option<&str>,
+    from_type: &str,
+    from: &str,
+    to_type: i64,
+    to: Option<&str>,
+) -> Result<(), String> {
+    let rel = crate::resolve_relation(file, page_size, "RDB$AUTH_MAPPING")
+        .ok_or("no RDB$AUTH_MAPPING relation")?;
+    let mut vals: Vec<(&str, SysVal<'_>)> = vec![
+        ("RDB$MAP_NAME", SysVal::S(name)),
+        ("RDB$MAP_USING", SysVal::S(using_)),
+        ("RDB$MAP_FROM_TYPE", SysVal::S(from_type)),
+        ("RDB$MAP_FROM", SysVal::S(from)),
+        ("RDB$MAP_TO_TYPE", SysVal::I(to_type)),
+        ("RDB$SYSTEM_FLAG", SysVal::I(0)),
+    ];
+    if let Some(pl) = plugin {
+        vals.push(("RDB$MAP_PLUGIN", SysVal::S(pl)));
+    }
+    if let Some(d) = db {
+        vals.push(("RDB$MAP_DB", SysVal::S(d)));
+    }
+    if let Some(t) = to {
+        vals.push(("RDB$MAP_TO", SysVal::S(t)));
+    }
+    sys_insert(file, page_size, "RDB$AUTH_MAPPING", rel, &vals)?;
+    advance_oldest_transactions(file, page_size)
+}
+
 /// A relation's `RDB$EXTERNAL_FILE` path, if it is an EXTERNAL table.
 pub fn relation_external_file(
     file: &crate::Image,

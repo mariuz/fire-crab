@@ -795,6 +795,51 @@ else
 fi
 rm -f "$EFDB" "$D/fc-gbak-ef.fbk" "$D/fc-gbak-efr.fdb"
 
+# MAPPINGS RIDE (rec 37, every RDB$AUTH_MAPPING column verbatim):
+# the ENGINE restores fc's backup with the row column-identical. A
+# SHADOW refuses typed on both sides - its file is a page-level
+# mirror this writer does not speak.
+MPDB="$D/fc-gbak-mp.fdb"; rm -f "$MPDB" "$D/fc-gbak-mp.fbk" "$D/fc-gbak-mpr.fdb"
+"$ISQL" -q -b -user "$U" -pas "$P" <<EOF >/dev/null 2>&1
+CREATE DATABASE '$MPDB' USER '$U' PASSWORD '$P' PAGE_SIZE 8192;
+CREATE TABLE T (X INTEGER);
+COMMIT;
+CREATE MAPPING M1 USING PLUGIN SRP FROM USER U1 TO USER U2;
+COMMIT;
+EOF
+chmod 666 "$MPDB"
+ran=$((ran + 1))
+fo=$(svc_backup "$FMGR" "$MPDB" "$D/fc-gbak-mp.fbk")
+if [ "${fo##*rc=}" = "0" ]; then
+    echo "OK   a security-name MAPPING rides the backup (fc backs it up)"
+else
+    echo "DIFF mapping backup: [$fo]"; fail=1
+fi
+ran=$((ran + 1))
+sudo -n chmod 666 "$D/fc-gbak-mp.fbk" 2>/dev/null || chmod 666 "$D/fc-gbak-mp.fbk" 2>/dev/null
+"$FBSVCMGR" "$EMGR" user "$U" password "$P" action_restore dbname "$D/fc-gbak-mpr.fdb" bkp_file "$D/fc-gbak-mp.fbk" >/dev/null 2>&1
+grab "$D/fc-gbak-mpr.fdb"
+got=$(printf "SELECT TRIM(RDB\$MAP_NAME) || '/' || TRIM(RDB\$MAP_USING) || TRIM(RDB\$MAP_PLUGIN) || '/' || TRIM(RDB\$MAP_FROM) || '>' || TRIM(RDB\$MAP_TO) FROM RDB\$AUTH_MAPPING;\n" |
+    "$ISQL" -q -b -user "$U" -pas "$P" "$D/fc-gbak-mpr.fdb" 2>&1 | grep -c 'M1/PSRP/U1>U2')
+if [ "$got" = "1" ]; then
+    echo "OK   the ENGINE restores fc's fbk with the mapping column-identical"
+else
+    echo "DIFF mapping after engine restore: match-count [$got] (want 1)"; fail=1
+fi
+ran=$((ran + 1))
+"$ISQL" -q -b -user "$U" -pas "$P" <<EOF >/dev/null 2>&1
+CONNECT '$MPDB' USER '$U' PASSWORD '$P';
+CREATE SHADOW 9 '$D/fc-gbak-mp.shd';
+COMMIT;
+EOF
+fo=$(svc_backup "$FMGR" "$MPDB" "$D/fc-gbak-mp2.fbk")
+if [ "${fo##*rc=}" = "0" ]; then
+    echo "DIFF a SHADOW should refuse the backup: [$fo]"; fail=1
+else
+    echo "OK   a SHADOW refuses the backup typed (a page mirror this writer does not speak)"
+fi
+rm -f "$MPDB" "$D/fc-gbak-mp.fbk" "$D/fc-gbak-mp2.fbk" "$D/fc-gbak-mpr.fdb" "$D/fc-gbak-mp.shd"
+
 # --- 4. RECORDED BOUNDARY: NOT NULL is not carried ---------------------------
 NN="$D/fc-gbak-nn.fdb"; rm -f "$NN"
 "$ISQL" -q -b -user "$U" -pas "$P" <<EOF >/dev/null 2>&1

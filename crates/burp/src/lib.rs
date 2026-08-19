@@ -50,6 +50,7 @@ mod rec {
     pub const FUNCTION_ARG: u8 = 16;
     pub const FUNCTION_END: u8 = 17;
     pub const SQL_ROLES: u8 = 36;
+    pub const MAPPING: u8 = 37;
     pub const PACKAGE: u8 = 38;
     pub const REL_CONSTRAINT: u8 = 31;
     pub const REF_CONSTRAINT: u8 = 32;
@@ -328,7 +329,7 @@ pub fn write_backup_verbose(
     // the per-relation surface check: what this writer cannot carry
     // refuses the whole backup. A MAPPING would otherwise be silently
     // DROPPED - the writer never walks RDB$AUTH_MAPPING.
-    for (what, rel_name) in [("a mapping", "RDB$AUTH_MAPPING")] {
+    for (what, rel_name) in [("a shadow", "RDB$FILES")] {
         if user_rows_in(image, page_size, rel_name) > 0 {
             return Err(Refused(format!("{} is outside this backup's surface", what)));
         }
@@ -1404,6 +1405,31 @@ pub fn write_backup_verbose(
         r.bytes(4, &[0u8; 8]).end();
     }
     log.push("gbak:writing names mapping".into());
+    for m in read_mappings(image, page_size)? {
+        log.push(format!("gbak:    writing map for \"{}\"", m.name));
+        let mut r = Rec::new(&mut out, rec::MAPPING)
+            .text(1, &m.name)
+            .text(2, &m.using_);
+        if let Some(pl) = &m.plugin {
+            r = r.text(3, pl);
+        }
+        if let Some(db) = &m.db {
+            r = r.text(5, db);
+        }
+        r = r.text(6, &m.from_type).text(7, &m.from).int(8, m.to_type as i32);
+        if let Some(to) = &m.to {
+            r = r.text(9, to);
+        }
+        if let Some(d) = catalog_description(
+            image,
+            page_size,
+            "RDB$AUTH_MAPPING",
+            &[("RDB$MAP_NAME", &m.name)],
+        ) {
+            r = r.blob(10, &d);
+        }
+        r.end();
+    }
     log.push("gbak:writing publications".into());
     log.push("gbak:writing constants".into());
     out.push(rec::END);
@@ -2731,6 +2757,54 @@ fn read_packages(
     Ok(out)
 }
 
+/// A security-name MAPPING off RDB$AUTH_MAPPING - every column of
+/// the row, verbatim (the record's att_map series).
+struct UMapping {
+    name: String,
+    using_: String,
+    plugin: Option<String>,
+    db: Option<String>,
+    from_type: String,
+    from: String,
+    to_type: i64,
+    to: Option<String>,
+}
+
+fn read_mappings(
+    image: &fire_crab_ods::Image,
+    page_size: usize,
+) -> Result<Vec<UMapping>, Refused> {
+    let Some((cols, rows)) = sys_rows(image, page_size, "RDB$AUTH_MAPPING") else {
+        return Ok(Vec::new());
+    };
+    let at = |n: &str| cols.iter().find(|(c, _)| c.eq_ignore_ascii_case(n)).map(|(_, i)| *i);
+    let mut out = Vec::new();
+    for r in &rows {
+        if matches!(
+            at("RDB$SYSTEM_FLAG").and_then(|i| r.values.get(i)),
+            Some(fire_crab_ods::format::Value::Int(n)) if *n != 0
+        ) {
+            continue;
+        }
+        let Some(name) = text_opt(r, at("RDB$MAP_NAME")) else { continue };
+        let to_type = match at("RDB$MAP_TO_TYPE").and_then(|i| r.values.get(i)) {
+            Some(fire_crab_ods::format::Value::Int(n)) => *n,
+            _ => 0,
+        };
+        out.push(UMapping {
+            using_: text_opt(r, at("RDB$MAP_USING")).unwrap_or_default(),
+            plugin: text_opt(r, at("RDB$MAP_PLUGIN")),
+            db: text_opt(r, at("RDB$MAP_DB")),
+            from_type: text_opt(r, at("RDB$MAP_FROM_TYPE")).unwrap_or_default(),
+            from: text_opt(r, at("RDB$MAP_FROM")).unwrap_or_default(),
+            to_type,
+            to: text_opt(r, at("RDB$MAP_TO")),
+            name,
+        });
+    }
+    Ok(out)
+}
+
 /// The user SQL ROLES: name and owner. The record's att 4 is the
 /// CHAR(8) OCTETS system-privilege block, a plain u8-length attribute;
 /// a role that actually HOLDS system privileges refuses typed - this
@@ -3099,6 +3173,8 @@ pub struct Restored {
     pub named_domains: Vec<RNamedDomain>,
     /// the carried packages, file order
     pub packages: Vec<RPackage>,
+    /// the security-name mappings, file order
+    pub mappings: Vec<RMapping>,
     /// privilege records seen and set aside - the count keeps the
     /// omission visible in the trace instead of silent
     pub privileges_skipped: u64,
@@ -3129,6 +3205,18 @@ pub struct RNamedDomain {
     pub default: Option<(Vec<u8>, String)>,
     /// CHECK: (validation BLR verbatim, source text)
     pub check: Option<(Vec<u8>, String)>,
+}
+
+/// A security-name MAPPING off the file, every column verbatim.
+pub struct RMapping {
+    pub name: String,
+    pub using_: String,
+    pub plugin: Option<String>,
+    pub db: Option<String>,
+    pub from_type: String,
+    pub from: String,
+    pub to_type: i64,
+    pub to: Option<String>,
 }
 
 /// A package off the file: name and its two sources verbatim (the
@@ -3396,6 +3484,7 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
         descriptions: Vec::new(),
         named_domains: Vec::new(),
         packages: Vec::new(),
+        mappings: Vec::new(),
         privileges_skipped: 0,
     };
     // (schema, source name) -> not-null flag learned from constraints
@@ -4103,6 +4192,35 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                     ));
                 }
                 out.packages.push(pk);
+            }
+            rec::MAPPING => {
+                const DESC_TAG: u8 = 10;
+                let (atts, blobs) = read_atts_blob(f, &mut at, &[DESC_TAG])?;
+                let name = att(&atts, 1)
+                    .map(|a| a.text())
+                    .ok_or_else(|| Refused("a mapping with no name".into()))?;
+                if let Some((_, d)) = blobs.iter().find(|(t, _)| *t == DESC_TAG) {
+                    let mut d = d.clone();
+                    if d.last() == Some(&0) {
+                        d.pop();
+                    }
+                    out.descriptions.push((
+                        "mapping".into(),
+                        name.clone(),
+                        String::new(),
+                        String::from_utf8_lossy(&d).into_owned(),
+                    ));
+                }
+                out.mappings.push(RMapping {
+                    using_: att(&atts, 2).map(|a| a.text()).unwrap_or_default(),
+                    plugin: att(&atts, 3).map(|a| a.text()),
+                    db: att(&atts, 5).map(|a| a.text()),
+                    from_type: att(&atts, 6).map(|a| a.text()).unwrap_or_default(),
+                    from: att(&atts, 7).map(|a| a.text()).unwrap_or_default(),
+                    to_type: att(&atts, 8).map(|a| a.int()).unwrap_or(0),
+                    to: att(&atts, 9).map(|a| a.text()),
+                    name,
+                });
             }
             rec::SQL_ROLES => {
                 const DESC_TAG: u8 = 3;
