@@ -261,9 +261,9 @@ check "...and res_replace overwrites (fc)" \
 check "the replaced database still reads right" "$(rows "$D/fc-gbr-r1.fdb")" "$base"
 
 # --- 4. FAIL-CLOSED: an fbk carrying what this reader cannot ----------------
-# (~~a mapping refuses~~ - they ride now; the representative refusal
-# is a SHADOW - a page-level mirror file neither side of this pair
-# can carry, refused typed rather than silently dropped)
+# (~~a shadow refuses~~ - shadows ride now; the representative
+# refusal is a role holding SYSTEM PRIVILEGES - carrying its zeroed
+# block would silently DISARM it, so both sides refuse typed)
 rm -f "$D/fc-gbr-shb.fdb" "$D/fc-gbr-shb.fbk" "$D/fc-gbr-rshb.fdb" "$D/fc-gbr-boundary.shd"
 "$ISQL" -q -b -user "$U" -pas "$P" <<EOF >/dev/null 2>&1
 CREATE DATABASE '$D/fc-gbr-shb.fdb' USER '$U' PASSWORD '$P' PAGE_SIZE 8192;
@@ -271,18 +271,16 @@ CREATE TABLE T (X INTEGER);
 COMMIT;
 CREATE TABLE P2 (AGE INTEGER);
 COMMIT;
-CREATE SHADOW 9 '/tmp/fbhandson/fc-gbr-boundary.shd';
+CREATE ROLE R_SYS SET SYSTEM PRIVILEGES TO USER_MANAGEMENT;
 COMMIT;
 EOF
-# the SERVER (the firebird user) must open the shadow to attach - the
-# embedded isql above made it 0660 ubuntu:ubuntu
-chmod 666 "$D/fc-gbr-shb.fdb" "$D/fc-gbr-boundary.shd"
 # (the fixture name is FRESH each era on purpose: the server LINGERS a
 # previously-attached database of the same path and would back up the
-# stale instance - measured, the shadow silently missing from the fbk)
+# stale instance - measured, a shadow once silently missing from the fbk)
+chmod 666 "$D/fc-gbr-shb.fdb"
 svc "$EMGR" action_backup dbname "$D/fc-gbr-shb.fdb" bkp_file "$D/fc-gbr-shb.fbk" >/dev/null
 grab "$D/fc-gbr-shb.fbk"
-check "an fbk with a SHADOW refuses fc's restore whole" \
+check "an fbk with a SYSTEM-PRIVILEGED role refuses fc's restore whole" \
     "$(svc "$FMGR" action_restore dbname "$D/fc-gbr-rshb.fdb" bkp_file "$D/fc-gbr-shb.fbk")" \
     "feature is not supported|rc=1"
 ran=$((ran + 1))

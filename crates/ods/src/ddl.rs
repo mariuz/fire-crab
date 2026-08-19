@@ -8399,6 +8399,54 @@ pub fn set_catalog_description(
     )
 }
 
+/// Restore a carried SHADOW: the RDB$FILES row (the physical file is
+/// the CALLER's to write - it is the database image itself with the
+/// header marked, and only the caller holds the finished image).
+pub fn restore_shadow_row(
+    file: &mut crate::Image,
+    page_size: usize,
+    path: &str,
+    shadow: i64,
+) -> Result<(), String> {
+    let rel = crate::resolve_relation(file, page_size, "RDB$FILES")
+        .ok_or("no RDB$FILES relation")?;
+    sys_insert(file, page_size, "RDB$FILES", rel, &[
+        ("RDB$FILE_NAME", SysVal::S(path)),
+        ("RDB$FILE_SEQUENCE", SysVal::I(0)),
+        ("RDB$FILE_START", SysVal::I(0)),
+        ("RDB$FILE_LENGTH", SysVal::I(0)),
+        ("RDB$FILE_FLAGS", SysVal::I(1)),
+        ("RDB$SHADOW_NUMBER", SysVal::I(shadow)),
+    ])?;
+    advance_oldest_transactions(file, page_size)
+}
+
+/// Mark a database image as an ACTIVE SHADOW of `root_path`: the
+/// header takes hdr_active_shadow (bit 0x1 of hdr_flags @22) and the
+/// HDR_root_file_name clumplet (tag 1, u8 length, the main file's
+/// path) appended at hdr_end (@36), the end offset moved past it -
+/// the measured byte diff between a live shadow and its database,
+/// which is otherwise page-identical.
+pub fn shadow_image_of(image: &[u8], page_size: usize, root_path: &str) -> Vec<u8> {
+    let mut out = image.to_vec();
+    if out.len() < page_size {
+        return out;
+    }
+    let flags = u16::from_le_bytes([out[22], out[23]]) | 0x1;
+    out[22..24].copy_from_slice(&flags.to_le_bytes());
+    let end = u32::from_le_bytes([out[36], out[37], out[38], out[39]]) as usize;
+    let p = root_path.as_bytes();
+    let n = p.len().min(255);
+    if end + 2 + n < page_size {
+        out[end] = 1; // HDR_root_file_name
+        out[end + 1] = n as u8;
+        out[end + 2..end + 2 + n].copy_from_slice(&p[..n]);
+        let new_end = (end + 2 + n) as u32;
+        out[36..40].copy_from_slice(&new_end.to_le_bytes());
+    }
+    out
+}
+
 /// Restore a carried BLOB FILTER declaration: one RDB$FILTERS row,
 /// names and subtypes verbatim, a fresh SQL$ class - the code the
 /// names point at stays outside the file (no grant rows: measured,

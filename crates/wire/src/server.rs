@@ -3126,6 +3126,15 @@ fn run_gbak_restore_core(
                 fire_crab_ods::ddl::set_domain_validation(&mut file, page_size, &nd.name, blr, src)?;
             }
         }
+        // the SHADOWS: refuse whole BEFORE building when a shadow file
+        // already exists - the engine's own restore errors there
+        // ("File exists"), and this one leaves no half-restored db
+        for (path, shadow) in &restored.shadows {
+            if std::path::Path::new(path).exists() {
+                return Err(format!("shadow file {} already exists", path));
+            }
+            fire_crab_ods::ddl::restore_shadow_row(&mut file, page_size, path, *shadow)?;
+        }
         // the DEFAULT publication's state + its included tables
         if restored.default_pub_active
             || restored.default_pub_auto
@@ -3708,7 +3717,15 @@ fn run_gbak_restore_core(
                 refreshed.push(&tr.relation);
             }
         }
-        std::fs::write(&db, &file.to_bytes()).map_err(|e| e.to_string())?;
+        let final_bytes = file.to_bytes();
+        std::fs::write(&db, &final_bytes).map_err(|e| e.to_string())?;
+        // the physical shadows: the finished image itself, header
+        // marked ACTIVE_SHADOW + the root file's name (measured - a
+        // live shadow is otherwise page-identical to its database)
+        for (path, _) in &restored.shadows {
+            let sh = fire_crab_ods::ddl::shadow_image_of(&final_bytes, page_size, &db);
+            std::fs::write(path, &sh).map_err(|e| e.to_string())?;
+        }
         Ok(())
     })();
     // however it went, the pool must not keep the half-known image

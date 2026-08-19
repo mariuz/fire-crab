@@ -53,6 +53,7 @@ mod rec {
     pub const MAPPING: u8 = 37;
     pub const PUB_TABLE: u8 = 41;
     pub const FILTER: u8 = 20;
+    pub const FILES: u8 = 25;
     pub const PACKAGE: u8 = 38;
     pub const REL_CONSTRAINT: u8 = 31;
     pub const REF_CONSTRAINT: u8 = 32;
@@ -328,14 +329,8 @@ pub fn write_backup_verbose(
     // NAME - relation ids and field positions are ODS facts the check
     // must read, not guess (RDB$GENERATORS is relation 20, not the 10
     // a first guess said, and the gate caught it).
-    // the per-relation surface check: what this writer cannot carry
-    // refuses the whole backup. A MAPPING would otherwise be silently
-    // DROPPED - the writer never walks RDB$AUTH_MAPPING.
-    for (what, rel_name) in [("a shadow", "RDB$FILES")] {
-        if user_rows_in(image, page_size, rel_name) > 0 {
-            return Err(Refused(format!("{} is outside this backup's surface", what)));
-        }
-    }
+    // (the surface check's last tenant, shadows, rides now -
+    // read_shadow_files refuses the non-shadow RDB$FILES shapes typed)
     // CONSTRAINTS are checked by TYPE: NOT NULL and PRIMARY KEY ride the
     // file; UNIQUE / FOREIGN KEY / CHECK constraints are their own
     // slices (an FK needs cross-table restore ordering, a UNIQUE
@@ -696,6 +691,17 @@ pub fn write_backup_verbose(
 
     // --- per relation: rec_relation + fields + end -----------------------
     log.push("gbak:writing shadow files".into());
+    for (path, shadow, flags) in read_shadow_files(image, page_size)? {
+        log.push(format!("gbak:    writing shadow file \"{}\"", path));
+        Rec::new(&mut out, rec::FILES)
+            .text(1, &path)
+            .int(2, 0) // att_file_sequence
+            .int(3, 0) // att_file_start
+            .int(4, 0) // att_file_length
+            .int(5, flags as i32)
+            .int(6, shadow as i32)
+            .end();
+    }
     log.push("gbak:writing character sets".into());
     log.push("gbak:writing collations".into());
     log.push("gbak:writing tables".into());
@@ -2791,6 +2797,40 @@ fn read_packages(
     Ok(out)
 }
 
+/// The SHADOW files off RDB$FILES: path, shadow number, flags. A
+/// non-shadow row (a secondary database file, sequence > 0) refuses
+/// typed - a multi-file database is not this writer's to carry.
+fn read_shadow_files(
+    image: &fire_crab_ods::Image,
+    page_size: usize,
+) -> Result<Vec<(String, i64, i64)>, Refused> {
+    let Some((cols, rows)) = sys_rows(image, page_size, "RDB$FILES") else {
+        return Ok(Vec::new());
+    };
+    let at = |n: &str| cols.iter().find(|(c, _)| c.eq_ignore_ascii_case(n)).map(|(_, i)| *i);
+    let int = |r: &fire_crab_ods::tra::VisibleRow, i: Option<usize>| match i
+        .and_then(|i| r.values.get(i))
+    {
+        Some(fire_crab_ods::format::Value::Int(n)) => Some(*n),
+        _ => None,
+    };
+    let mut out = Vec::new();
+    for r in &rows {
+        let Some(path) = text_opt(r, at("RDB$FILE_NAME")) else { continue };
+        let shadow = int(r, at("RDB$SHADOW_NUMBER")).unwrap_or(0);
+        let flags = int(r, at("RDB$FILE_FLAGS")).unwrap_or(0);
+        let seq = int(r, at("RDB$FILE_SEQUENCE")).unwrap_or(0);
+        if shadow == 0 || flags != 1 || seq != 0 {
+            return Err(Refused(format!(
+                "file {} is not a plain shadow - outside this backup's surface",
+                path
+            )));
+        }
+        out.push((path, shadow, flags));
+    }
+    Ok(out)
+}
+
 /// A BLOB FILTER declaration off RDB$FILTERS - like a legacy UDF,
 /// the names and subtypes ARE the declaration; the code stays outside.
 struct UFilter {
@@ -3299,6 +3339,8 @@ pub struct Restored {
     pub pub_tables: Vec<(String, String)>,
     /// the BLOB FILTER declarations, file order
     pub filters: Vec<RFilter>,
+    /// the SHADOW files: (path, shadow number), file order
+    pub shadows: Vec<(String, i64)>,
     /// privilege records seen and set aside - the count keeps the
     /// omission visible in the trace instead of silent
     pub privileges_skipped: u64,
@@ -3630,6 +3672,7 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
         default_pub_auto: false,
         pub_tables: Vec::new(),
         filters: Vec::new(),
+        shadows: Vec::new(),
         privileges_skipped: 0,
     };
     // (schema, source name) -> not-null flag learned from constraints
@@ -3672,6 +3715,22 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
             }
             rec::SCHEMA => {
                 let _ = read_atts(f, &mut at)?;
+            }
+            rec::FILES => {
+                let atts = read_atts(f, &mut at)?;
+                let path = att(&atts, 1)
+                    .map(|a| a.text())
+                    .ok_or_else(|| Refused("a file record with no name".into()))?;
+                let shadow = att(&atts, 6).map(|a| a.int()).unwrap_or(0);
+                let flags = att(&atts, 5).map(|a| a.int()).unwrap_or(0);
+                let seq = att(&atts, 2).map(|a| a.int()).unwrap_or(0);
+                if shadow == 0 || flags != 1 || seq != 0 {
+                    return Err(Refused(format!(
+                        "file {} is not a plain shadow - outside this restore's surface",
+                        path
+                    )));
+                }
+                out.shadows.push((path, shadow));
             }
             rec::FILTER => {
                 let (atts, blobs) = read_atts_blob(f, &mut at, &[7, 12])?;

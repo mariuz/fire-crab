@@ -222,10 +222,22 @@ subtypes verbatim, the code outside the file, the same honest
 carriage a legacy UDF gets. The filter's negative OUTPUT_SUB_TYPE
 found a GLOBAL reader bug: attribute ints were accumulated
 UNSIGNED, so −4 read as four billion and overflowed the SMALLINT —
-Att::int sign-extends by width now. **The gbak surface has no named
-refusals left** — shadows and the remaining never-fixtured
-families refuse typed at the surface check or the record walk, and
-everything else rides.
+Att::int sign-extends by width now. ~~Shadows refuse~~ — SHADOWS RIDE (gbak 57), the physical
+family's last word: the rec-25 record carries path, flags and
+shadow number, and fc's restore WRITES THE PHYSICAL SHADOW — the
+finished image itself with hdr_active_shadow flagged and the
+HDR_root_file_name clumplet appended at hdr_end, the measured
+whole difference between a live shadow and its database. The
+engine then MAINTAINS fc's shadow (a live INSERT lands in both
+files, only the header page differing), and both sides refuse
+whole when the shadow file already exists — the engine's own
+"File exists" semantic, minus its half-restored wreckage.
+Multi-file databases refuse typed (FB6 dropped the DDL; a
+non-shadow RDB$FILES row cannot be fixtured but cannot silently
+drop either). **The gbak surface has no named refusals left** —
+the standing fail-closed representative is a role holding SYSTEM
+PRIVILEGES, refused typed on both sides because carrying its
+zeroed block would silently disarm it.
 
 The subsystem map's rows fall into three states, and the difference
 matters more than the row count:

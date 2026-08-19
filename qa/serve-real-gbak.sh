@@ -826,19 +826,32 @@ if [ "$got" = "1" ]; then
 else
     echo "DIFF mapping after engine restore: match-count [$got] (want 1)"; fail=1
 fi
+# ~~a shadow refuses~~ - SHADOWS RIDE: fc backs up the shadowed
+# database (rec 25: path, flags 1, shadow number), and the ENGINE's
+# restore of fc's fbk RECREATES the physical shadow file itself
 ran=$((ran + 1))
 "$ISQL" -q -b -user "$U" -pas "$P" <<EOF >/dev/null 2>&1
 CONNECT '$MPDB' USER '$U' PASSWORD '$P';
 CREATE SHADOW 9 '$D/fc-gbak-mp.shd';
 COMMIT;
 EOF
+chmod 666 "$D/fc-gbak-mp.shd" 2>/dev/null
 fo=$(svc_backup "$FMGR" "$MPDB" "$D/fc-gbak-mp2.fbk")
 if [ "${fo##*rc=}" = "0" ]; then
-    echo "DIFF a SHADOW should refuse the backup: [$fo]"; fail=1
+    echo "OK   a SHADOW rides the backup (fc backs it up)"
 else
-    echo "OK   a SHADOW refuses the backup typed (a page mirror this writer does not speak)"
+    echo "DIFF shadow backup: [$fo]"; fail=1
 fi
-rm -f "$MPDB" "$D/fc-gbak-mp.fbk" "$D/fc-gbak-mp2.fbk" "$D/fc-gbak-mpr.fdb" "$D/fc-gbak-mp.shd"
+ran=$((ran + 1))
+sudo -n chmod 666 "$D/fc-gbak-mp2.fbk" 2>/dev/null || chmod 666 "$D/fc-gbak-mp2.fbk" 2>/dev/null
+rm -f "$D/fc-gbak-mp.shd" "$D/fc-gbak-mpr2.fdb"
+"$FBSVCMGR" "$EMGR" user "$U" password "$P" action_restore dbname "$D/fc-gbak-mpr2.fdb" bkp_file "$D/fc-gbak-mp2.fbk" >/dev/null 2>&1
+if [ -f "$D/fc-gbak-mp.shd" ]; then
+    echo "OK   the ENGINE restores fc's fbk and RECREATES the physical shadow"
+else
+    echo "DIFF the engine's restore left no shadow file"; fail=1
+fi
+rm -f "$MPDB" "$D/fc-gbak-mp.fbk" "$D/fc-gbak-mp2.fbk" "$D/fc-gbak-mpr.fdb" "$D/fc-gbak-mpr2.fdb" "$D/fc-gbak-mp.shd"
 
 # PUBLICATIONS RIDE - the DEFAULT publication's two flags travel on
 # the DATABASE record (atts 20/21, the system row itself never gets a
