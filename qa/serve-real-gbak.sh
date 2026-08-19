@@ -629,10 +629,11 @@ NDDB="$D/fc-gbak-nd.fdb"; rm -f "$NDDB" "$D/fc-gbak-nd.fbk" "$D/fc-gbak-ndr.fdb"
 CREATE DATABASE '$NDDB' USER '$U' PASSWORD '$P' PAGE_SIZE 8192;
 CREATE DOMAIN D_AGE AS INTEGER NOT NULL;
 CREATE DOMAIN D_TXT AS VARCHAR(8);
+CREATE DOMAIN D_POS AS INTEGER DEFAULT 7 CHECK (VALUE > 0);
 COMMIT;
-CREATE TABLE P (AGE D_AGE, NICK D_TXT, PLAIN INTEGER);
+CREATE TABLE P (AGE D_AGE, NICK D_TXT, PLAIN INTEGER, POS D_POS);
 COMMIT;
-INSERT INTO P VALUES (30, 'ada', 1);
+INSERT INTO P (AGE, NICK, PLAIN) VALUES (30, 'ada', 1);
 COMMIT;
 COMMENT ON DOMAIN D_TXT IS 'dom words';
 COMMIT;
@@ -655,6 +656,14 @@ if [ "$got" = "2" ]; then
     echo "OK   the ENGINE restores fc's fbk: binding, data, COMMENT, NOT NULL all carried"
 else
     echo "DIFF named domain after engine restore: match-count [$got] (want 2)"; fail=1
+fi
+ran=$((ran + 1))
+got=$(printf "INSERT INTO P (AGE, NICK, PLAIN) VALUES (1, 'd', 9);\nSELECT 'def:' || POS FROM P WHERE PLAIN = 9;\nINSERT INTO P (AGE, NICK, PLAIN, POS) VALUES (1, 'd', 10, -5);\n" |
+    "$ISQL" -q -b -user "$U" -pas "$P" "$D/fc-gbak-ndr.fdb" 2>&1 | grep -cE "def:7|validation error for column.*POS")
+if [ "$got" = "2" ]; then
+    echo "OK   ...and the domain's DEFAULT lands and its CHECK refuses (7, -5 raises)"
+else
+    echo "DIFF domain DEFAULT/CHECK after engine restore: match-count [$got] (want 2)"; fail=1
 fi
 rm -f "$NDDB" "$D/fc-gbak-nd.fbk" "$D/fc-gbak-ndr.fdb"
 

@@ -767,11 +767,13 @@ fn rebuild_runtime_blob(
     // the RSR_default_value segment this rebuild used to drop)
     let mut computed_blobs: Vec<(String, (u16, u64))> = Vec::new();
     let mut domain_defaults: Vec<(String, (u16, u64))> = Vec::new();
+    let mut domain_validations: Vec<(String, (u16, u64))> = Vec::new();
     if let Some(f_formats) = system_relation_formats(file, page_size, "RDB$FIELDS") {
         if let Some((_, f_descs)) = f_formats.iter().max_by_key(|(n, _)| *n) {
             let fcols = relation_columns(file, page_size, "RDB$FIELDS");
             let ffid =
                 |n: &str| fcols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+            let vblr_f = ffid("RDB$VALIDATION_BLR");
             if let (Some(fname_f), Some(cblr_f), dval_f) = (
                 ffid("RDB$FIELD_NAME"),
                 ffid("RDB$COMPUTED_BLR"),
@@ -786,7 +788,10 @@ fn rebuild_runtime_blob(
                         computed_blobs.push((fname.clone(), (*r, *n)));
                     }
                     if let Some(Some(Value::Blob(r, n))) = dval_f.map(|f| vals.get(f)) {
-                        domain_defaults.push((fname, (*r, *n)));
+                        domain_defaults.push((fname.clone(), (*r, *n)));
+                    }
+                    if let Some(Some(Value::Blob(r, n))) = vblr_f.map(|f| vals.get(f)) {
+                        domain_validations.push((fname, (*r, *n)));
                     }
                 });
             }
@@ -841,6 +846,15 @@ fn rebuild_runtime_blob(
         if let Some((r, n)) = effective_default {
             if let Some(blr) = crate::format::read_blob_content(file, page_size, r, n) {
                 runtime.push(seg(6, &blr));
+            }
+        }
+        // the DOMAIN's CHECK (RSR_validation_blr = 7): the engine
+        // enforces field validation from THIS summary segment, not from
+        // the domain row - a byte-identical catalog with no segment
+        // let a CHECK (VALUE > 0) domain take -5 (measured)
+        if let Some((_, (r, n))) = domain_validations.iter().find(|(s, _)| s == src) {
+            if let Some(blr) = crate::format::read_blob_content(file, page_size, *r, *n) {
+                runtime.push(seg(7, &blr));
             }
         }
         if *not_null {
@@ -1664,6 +1678,7 @@ pub struct DomainType {
     pub char_len: Option<u16>,
     pub not_null: bool,
     pub default_blr: Option<Vec<u8>>,
+    pub validation_blr: Option<Vec<u8>>,
 }
 
 fn resolve_domain_type(file: &crate::Image, page_size: usize, dname: &str) -> Option<DomainType> {
@@ -1680,7 +1695,18 @@ fn resolve_domain_type(file: &crate::Image, page_size: usize, dname: &str) -> Op
     let cl_f = fid("RDB$CHARACTER_LENGTH");
     let nf_f = fid("RDB$NULL_FLAG");
     let dv_f = fid("RDB$DEFAULT_VALUE");
-    let mut found: Option<(i16, u16, i8, i16, Option<u16>, bool, Option<(u16, u64)>)> = None;
+    let vb_f = fid("RDB$VALIDATION_BLR");
+    #[allow(clippy::type_complexity)]
+    let mut found: Option<(
+        i16,
+        u16,
+        i8,
+        i16,
+        Option<u16>,
+        bool,
+        Option<(u16, u64)>,
+        Option<(u16, u64)>,
+    )> = None;
     walk_rows(file, page_size, rel, descs, |v| {
         if found.is_none() && text_eq(v.get(name_f), dname) {
             let geti = |f: usize| match v.get(f) {
@@ -1696,6 +1722,10 @@ fn resolve_domain_type(file: &crate::Image, page_size: usize, dname: &str) -> Op
                 Some(Value::Blob(r, n)) => Some((*r, *n)),
                 _ => None,
             });
+            let vblr = vb_f.and_then(|f| match v.get(f) {
+                Some(Value::Blob(r, n)) => Some((*r, *n)),
+                _ => None,
+            });
             found = Some((
                 geti(ft_f) as i16,
                 geti(len_f) as u16,
@@ -1704,10 +1734,11 @@ fn resolve_domain_type(file: &crate::Image, page_size: usize, dname: &str) -> Op
                 char_len,
                 not_null,
                 def,
+                vblr,
             ));
         }
     });
-    let (field_type, byte_len, scale, sub_type, char_len, not_null, def) = found?;
+    let (field_type, byte_len, scale, sub_type, char_len, not_null, def, vblr) = found?;
     let dtype = field_type_to_dtype(field_type)?;
     // dsc_length: a VARYING carries its 2-byte count word, other types do not
     let length = if dtype == crate::format::dtype::VARYING {
@@ -1716,6 +1747,8 @@ fn resolve_domain_type(file: &crate::Image, page_size: usize, dname: &str) -> Op
         byte_len
     };
     let default_blr = def.and_then(|(r, n)| crate::format::read_blob_content(file, page_size, r, n));
+    let validation_blr =
+        vblr.and_then(|(r, n)| crate::format::read_blob_content(file, page_size, r, n));
     Some(DomainType {
         field_type,
         dtype,
@@ -1725,6 +1758,7 @@ fn resolve_domain_type(file: &crate::Image, page_size: usize, dname: &str) -> Op
         char_len,
         not_null,
         default_blr,
+        validation_blr,
     })
 }
 
@@ -3025,7 +3059,9 @@ pub fn create_table(
     let gen_base = next_generator_number(file, page_size);
     let mut resolved: Vec<ColumnDef> = Vec::with_capacity(cols.len());
     // per column: (source name, is_domain, inherited default BLR, inherited not_null)
-    let mut src_meta: Vec<(String, bool, Option<Vec<u8>>, bool)> = Vec::with_capacity(cols.len());
+    #[allow(clippy::type_complexity)]
+    let mut src_meta: Vec<(String, bool, Option<Vec<u8>>, bool, Option<Vec<u8>>)> =
+        Vec::with_capacity(cols.len());
     // per column: the identity generator name and its definition, if any
     let mut identity_meta: Vec<Option<(String, IdentityDef)>> = Vec::with_capacity(cols.len());
     let mut auto_idx: u64 = 0;
@@ -3043,11 +3079,11 @@ pub fn create_table(
             rc.sub_type = dt.sub_type;
             rc.char_len = dt.char_len;
             resolved.push(rc);
-            src_meta.push((dname, true, dt.default_blr, dt.not_null));
+            src_meta.push((dname, true, dt.default_blr, dt.not_null, dt.validation_blr));
             identity_meta.push(None);
         } else {
             resolved.push(c.clone());
-            src_meta.push((format!("RDB${}", domain_base + auto_idx), false, None, false));
+            src_meta.push((format!("RDB${}", domain_base + auto_idx), false, None, false, None));
             auto_idx += 1;
             match &c.identity {
                 Some(id) => {
@@ -3130,7 +3166,7 @@ pub fn create_table(
         s
     };
     for (i, c) in cols.iter().enumerate() {
-        let (source, is_domain, dom_default, dom_not_null) = &src_meta[i];
+        let (source, is_domain, dom_default, dom_not_null, dom_validation) = &src_meta[i];
         runtime.push(seg(0, &(i as u16).to_le_bytes())); // RSR_field_id
         runtime.push(seg(1, c.name.as_bytes())); // RSR_field_name
         let src = format!("\"PUBLIC\".\"{}\"", source);
@@ -3158,6 +3194,15 @@ pub fn create_table(
             .or(if *is_domain { dom_default.as_deref() } else { None });
         if let Some(blr) = default_blr {
             runtime.push(seg(6, blr));
+        }
+        // the DOMAIN's CHECK (RSR_validation_blr = 7): the engine
+        // enforces field validation from THIS summary segment, not from
+        // the domain row - measured, a byte-identical catalog with no
+        // segment let a CHECK (VALUE > 0) domain take -5
+        if *is_domain {
+            if let Some(blr) = dom_validation {
+                runtime.push(seg(7, blr));
+            }
         }
         // NOT NULL: a column-level NOT NULL, or (for a domain column) the
         // domain's own NOT NULL, or (implicitly) an identity column
@@ -3190,7 +3235,7 @@ pub fn create_table(
     // the auto-domain RDB$FIELDS row - only for a built-in-typed column; a
     // domain column's RDB$FIELDS row already exists (the domain itself)
     for (i, c) in cols.iter().enumerate() {
-        let (source, is_domain, _, _) = &src_meta[i];
+        let (source, is_domain, ..) = &src_meta[i];
         if *is_domain {
             continue;
         }
@@ -3237,7 +3282,7 @@ pub fn create_table(
         sys_insert(file, page_size, "RDB$FIELDS", 2, &vals)?;
     }
     for (i, c) in cols.iter().enumerate() {
-        let (source, is_domain, _, _) = &src_meta[i];
+        let (source, is_domain, ..) = &src_meta[i];
         let mut vals: Vec<(&str, SysVal<'_>)> = vec![
             ("RDB$FIELD_NAME", SysVal::S(&c.name)),
             ("RDB$RELATION_NAME", SysVal::S(&name)),
@@ -8152,6 +8197,35 @@ pub fn mint_carrier_domain(
     }
     sys_insert(file, page_size, "RDB$FIELDS", frel, &field_vals)?;
     Ok(dom)
+}
+
+/// Store a carried domain CHECK: the engine's own validation BLR
+/// (subtype 2) and its `CHECK (VALUE > 0)` source (subtype 1) onto the
+/// domain's RDB$FIELDS row, verbatim - nothing is compiled here.
+pub fn set_domain_validation(
+    file: &mut crate::Image,
+    page_size: usize,
+    name: &str,
+    blr: &[u8],
+    source: &str,
+) -> Result<(), String> {
+    let want = name.trim().trim_matches('"').to_ascii_uppercase();
+    let rel = crate::resolve_relation(file, page_size, "RDB$FIELDS")
+        .ok_or("no RDB$FIELDS relation")?;
+    let blr_blob = dml::insert_blob(file, page_size, rel, &[blr.to_vec()], 2)?;
+    let src_blob = dml::insert_blob_cs(file, page_size, rel, &[source.as_bytes().to_vec()], 1, 4)?;
+    let name_f = sys_fid(file, page_size, "RDB$FIELDS", "RDB$FIELD_NAME")?;
+    patch_sys_row(
+        file,
+        page_size,
+        "RDB$FIELDS",
+        rel,
+        move |v| text_eq(v.get(name_f), &want),
+        &[
+            ("RDB$VALIDATION_BLR", SysVal::B(blob_id_bytes(rel, blr_blob))),
+            ("RDB$VALIDATION_SOURCE", SysVal::B(blob_id_bytes(rel, src_blob))),
+        ],
+    )
 }
 
 /// Store a COMMENT: write `text` as a subtype-1 blob into the

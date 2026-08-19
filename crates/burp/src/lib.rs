@@ -542,6 +542,18 @@ pub fn write_backup_verbose(
         if nd.not_null {
             r = r.int(38, 1);
         }
+        if let Some((blr, src)) = &nd.default {
+            r = r.blob(15, blr); // att_field_default_value
+            if !src.is_empty() {
+                r = r.blob(39, src); // att_field_default_source2
+            }
+        }
+        if let Some((blr, src)) = &nd.check {
+            r = r.blob(20, blr); // att_field_validation_blr
+            if !src.is_empty() {
+                r = r.blob(36, src); // att_field_validation_source2
+            }
+        }
         if let Some(d) = &nd.desc {
             r = r.blob(35, d);
         }
@@ -2250,6 +2262,10 @@ struct UNamedDomain {
     char_len: Option<i64>,
     not_null: bool,
     desc: Option<Vec<u8>>,
+    /// DEFAULT: (value BLR, NUL-terminated source text)
+    default: Option<(Vec<u8>, Vec<u8>)>,
+    /// CHECK: (validation BLR, NUL-terminated source text)
+    check: Option<(Vec<u8>, Vec<u8>)>,
 }
 
 fn read_named_domains(
@@ -2284,8 +2300,6 @@ fn read_named_domains(
             continue;
         }
         for (col, what) in [
-            ("RDB$DEFAULT_VALUE", "a DEFAULT"),
-            ("RDB$VALIDATION_BLR", "a CHECK"),
             ("RDB$COMPUTED_BLR", "a COMPUTED expression"),
             ("RDB$MISSING_VALUE", "a MISSING value"),
         ] {
@@ -2318,6 +2332,31 @@ fn read_named_domains(
             }
             _ => None,
         };
+        let blob_of = |col: &str, nul: bool| -> Option<Vec<u8>> {
+            match at(col).and_then(|i| r.values.get(i)) {
+                Some(fire_crab_ods::format::Value::Blob(_, num)) => {
+                    fire_crab_blb::read_blob_content(image, page_size, frel, *num).map(|mut d| {
+                        if nul {
+                            d.push(0);
+                        }
+                        d
+                    })
+                }
+                _ => None,
+            }
+        };
+        // a DEFAULT or CHECK rides whole: the engine's own BLR verbatim
+        // beside its source text - nothing recompiles
+        let default = match (blob_of("RDB$DEFAULT_VALUE", false), blob_of("RDB$DEFAULT_SOURCE", true)) {
+            (Some(b), Some(src)) => Some((b, src)),
+            (Some(b), None) => Some((b, Vec::new())),
+            _ => None,
+        };
+        let check = match (blob_of("RDB$VALIDATION_BLR", false), blob_of("RDB$VALIDATION_SOURCE", true)) {
+            (Some(b), Some(src)) => Some((b, src)),
+            (Some(b), None) => Some((b, Vec::new())),
+            _ => None,
+        };
         out.push(UNamedDomain {
             field_type: ft,
             length: int(r, at("RDB$FIELD_LENGTH")).unwrap_or(0),
@@ -2327,6 +2366,8 @@ fn read_named_domains(
             char_len: int(r, at("RDB$CHARACTER_LENGTH")),
             not_null: int(r, at("RDB$NULL_FLAG")).unwrap_or(0) != 0,
             desc,
+            default,
+            check,
             name,
         });
     }
@@ -2891,6 +2932,10 @@ pub struct RNamedDomain {
     pub not_null: bool,
     pub char_len: Option<i64>,
     pub precision: Option<i64>,
+    /// DEFAULT: (value BLR verbatim, source text)
+    pub default: Option<(Vec<u8>, String)>,
+    /// CHECK: (validation BLR verbatim, source text)
+    pub check: Option<(Vec<u8>, String)>,
 }
 
 /// A package off the file: name and its two sources verbatim (the
@@ -3195,6 +3240,10 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                 let mut atts: Vec<Att> = Vec::new();
                 let mut computed: Option<Vec<u8>> = None;
                 let mut dom_desc: Option<Vec<u8>> = None;
+                let mut dom_default_blr: Option<Vec<u8>> = None;
+                let mut dom_default_src: Option<Vec<u8>> = None;
+                let mut dom_check_blr: Option<Vec<u8>> = None;
+                let mut dom_check_src: Option<Vec<u8>> = None;
                 loop {
                     let tag = *f
                         .get(at)
@@ -3213,7 +3262,7 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                         .ok_or_else(|| Refused("truncated domain attribute".into()))?
                         .to_vec();
                     at += len;
-                    if matches!(tag, 15..=21 | 35) {
+                    if matches!(tag, 15..=21 | 35 | 36 | 39) {
                         let mut n: i64 = 0;
                         for (k, b) in data.iter().enumerate().take(8) {
                             n |= (*b as i64) << (8 * k);
@@ -3227,7 +3276,11 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                         match tag {
                             18 => computed = Some(raw),
                             35 => dom_desc = Some(raw),
-                            _ => {} // defaults/validation set aside
+                            15 => dom_default_blr = Some(raw),
+                            39 => dom_default_src = Some(raw),
+                            20 => dom_check_blr = Some(raw),
+                            36 => dom_check_src = Some(raw),
+                            _ => {} // missing values set aside
                         }
                         continue;
                     }
@@ -3239,11 +3292,25 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                     // NOT NULL, char length and COMMENT for
                     // create_domain to rebuild by name
                     if !name.starts_with("RDB$") {
+                        let strip = |v: Option<Vec<u8>>| {
+                            v.map(|mut d| {
+                                if d.last() == Some(&0) {
+                                    d.pop();
+                                }
+                                String::from_utf8_lossy(&d).into_owned()
+                            })
+                        };
                         out.named_domains.push(RNamedDomain {
                             name: name.clone(),
                             not_null: att(&atts, 38).map(|a| a.int()).unwrap_or(0) != 0,
                             char_len: att(&atts, 41).map(|a| a.int()),
                             precision: att(&atts, 44).map(|a| a.int()),
+                            default: dom_default_blr
+                                .take()
+                                .map(|b| (b, strip(dom_default_src.take()).unwrap_or_default())),
+                            check: dom_check_blr
+                                .take()
+                                .map(|b| (b, strip(dom_check_src.take()).unwrap_or_default())),
                         });
                         if let Some(d) = &dom_desc {
                             let mut d = d.clone();

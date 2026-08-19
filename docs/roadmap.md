@@ -148,10 +148,19 @@ DEFAULTs, CHECKs, computed expressions and array dimensions refuse
 typed — each changes what a domain MEANS beyond its type. The
 writer also refuses EXPRESSION (COMPUTED BY) indexes typed now
 (they were silently dropped — a found bug), and an expression index
-is the boundary representative. What still refuses is typed
-(domain DEFAULTs/CHECKs, argument DEFAULTs, expression indexes —
-and the permanent boundaries, external tables and external
-functions).
+is the boundary representative. ~~Domain DEFAULTs and CHECKs refuse~~ — they RIDE (gbak 43):
+the four blobs verbatim (default BLR att 15 + source att 39,
+validation BLR att 20 + source att 36 — two more atts the rec-2
+walker learned to frame), create_domain storing the default and a
+new set_domain_validation patching the CHECK on. The law the
+differential paid for: the engine enforces field validation from
+the RUNTIME's RSR_validation_blr segment (7), NOT from the domain
+row — a byte-identical catalog with no segment let CHECK (VALUE>0)
+take -5 — so both runtime builders (create_table's inline one and
+update_relation_runtime) now emit the domain's validation BLR
+beside the default it already carried. What still refuses is typed
+(argument DEFAULTs, expression indexes — and the permanent
+boundaries, external tables and external functions).
 
 The subsystem map's rows fall into three states, and the difference
 matters more than the row count:

@@ -3107,7 +3107,16 @@ fn run_gbak_restore_core(
             if let Some(cl) = nd.char_len {
                 col.char_len = Some(cl as u16);
             }
+            if let Some((blr, src)) = &nd.default {
+                col.default = Some(fire_crab_ods::ddl::ColumnDefault {
+                    source: src.clone(),
+                    value_blr: blr.clone(),
+                });
+            }
             fire_crab_ods::ddl::create_domain(&mut file, page_size, &col)?;
+            if let Some((blr, src)) = &nd.check {
+                fire_crab_ods::ddl::set_domain_validation(&mut file, page_size, &nd.name, blr, src)?;
+            }
         }
         // the SQL ROLES - independent of everything, grants to them
         // stay in the privilege set-aside (the recorded difference)
