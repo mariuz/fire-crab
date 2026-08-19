@@ -4006,11 +4006,21 @@ fn run_nbak(b: &fire_crab_svc::Buffer) -> Result<String, i32> {
     let db = b.text(fire_crab_svc::spb::DBNAME).ok_or(GDS_WISH_LIST)?;
     let file = b.text(nbk::FILE).ok_or(GDS_WISH_LIST)?;
     let level = b.number(nbk::LEVEL);
-    if level != Some(0) || b.text(nbk::GUID).is_some() {
+    if b.text(nbk::GUID).is_some() {
         if std::env::var("FC_SRV_TRACE").is_ok() {
-            eprintln!("[srv] nbak level {:?} refused - level 0 only", level);
+            eprintln!("[srv] nbak by GUID refused - levels only");
         }
         return Err(GDS_WISH_LIST);
+    }
+    match level {
+        Some(0) => {}
+        Some(n) if n > 0 => return run_nbak_incremental(&db, &file, n as i64),
+        _ => {
+            if std::env::var("FC_SRV_TRACE").is_ok() {
+                eprintln!("[srv] nbak level {:?} refused", level);
+            }
+            return Err(GDS_WISH_LIST);
+        }
     }
     let shared = fire_crab_cch::pool::open(&db).ok_or(GDS_IO_ERROR)?;
     let image = shared.image();
@@ -4107,6 +4117,120 @@ page writes	{}
     ))
 }
 
+/// An INCREMENTAL backup (level N > 0): the engine's own container
+/// (nbackup.cpp inc_header) - one zero-padded header page holding
+/// 'NBAK', version 2, the level, this backup's GUID and the PREVIOUS
+/// level's (off the RDB$BACKUP_HISTORY row the chain hangs from), the
+/// page size and both SCNs - then every page whose pag_scn is ABOVE
+/// the previous backup's, RAW, ascending; the restore places each by
+/// its own pag_pageno. The main database takes the same bookkeeping a
+/// level-0 writes: the new GUID, the era-anchored history row, the
+/// era bump.
+fn run_nbak_incremental(db: &str, file: &str, level: i64) -> Result<String, i32> {
+    let shared = fire_crab_cch::pool::open(db).ok_or(GDS_IO_ERROR)?;
+    let image = shared.image();
+    let page_size = fire_crab_ods::header::HeaderPage::decode(image.page(0).unwrap_or(&[]))
+        .map(|h| h.page_size as usize)
+        .ok_or(GDS_IO_ERROR)?;
+    if page_size < 52 {
+        return Err(GDS_IO_ERROR);
+    }
+    let (prev_guid_text, prev_scn) =
+        fire_crab_ods::ddl::last_backup_history(image.as_ref(), page_size, level - 1).ok_or_else(
+            || {
+                if std::env::var("FC_SRV_TRACE").is_ok() {
+                    eprintln!("[srv] nbak level {}: no level-{} history row", level, level - 1);
+                }
+                GDS_IO_ERROR
+            },
+        )?;
+    let prev_guid = guid_bytes(&prev_guid_text).ok_or(GDS_IO_ERROR)?;
+    let guid = fresh_guid();
+    let era = u32::from_le_bytes(
+        image
+            .page(0)
+            .and_then(|p| p.get(8..12))
+            .map(|b| [b[0], b[1], b[2], b[3]])
+            .unwrap_or_default(),
+    );
+    // the container: header page then the qualifying pages, raw
+    let mut hdr = vec![0u8; page_size];
+    hdr[0..4].copy_from_slice(b"NBAK");
+    hdr[4..6].copy_from_slice(&2i16.to_le_bytes()); // version
+    hdr[6..8].copy_from_slice(&(level as i16).to_le_bytes());
+    hdr[8..24].copy_from_slice(&guid);
+    hdr[24..40].copy_from_slice(&prev_guid);
+    hdr[40..44].copy_from_slice(&(page_size as u32).to_le_bytes());
+    hdr[44..48].copy_from_slice(&era.to_le_bytes());
+    hdr[48..52].copy_from_slice(&(prev_scn as u32).to_le_bytes());
+    let mut out = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(file)
+        .map_err(|e| {
+            if std::env::var("FC_SRV_TRACE").is_ok() {
+                eprintln!("[srv] nbak cannot create {}: {}", file, e);
+            }
+            GDS_IO_ERROR
+        })?;
+    use std::io::Write as _;
+    out.write_all(&hdr).map_err(|_| GDS_IO_ERROR)?;
+    let mut writes = 1usize;
+    let pages = image.byte_len() / page_size;
+    for pno in 0..pages as u32 {
+        let Some(p) = image.page(pno) else { continue };
+        let scn = u32::from_le_bytes([p[8], p[9], p[10], p[11]]);
+        if i64::from(scn) > prev_scn {
+            if pno == 0 {
+                // the header rides STALLED (hdr_backup_mode 1) - the
+                // engine's own increments are taken under BEGIN BACKUP
+                // and the fixup expects state 1 ("not in state (1) to
+                // be safely fixed up" without it, measured)
+                let mut h = p.to_vec();
+                if h.len() > 24 {
+                    h[24] = 1;
+                }
+                out.write_all(&h).map_err(|_| GDS_IO_ERROR)?;
+            } else {
+                out.write_all(p).map_err(|_| GDS_IO_ERROR)?;
+            }
+            writes += 1;
+        }
+    }
+    out.sync_all().map_err(|_| GDS_IO_ERROR)?;
+    // the main database's bookkeeping, exactly the level-0 shape
+    let mut main = image.as_ref().clone();
+    fire_crab_ods::header::store_clumplet(
+        main.page_mut(0).expect("header page"),
+        page_size,
+        fire_crab_ods::header::hdr_clump::BACKUP_GUID,
+        &guid,
+    )
+    .map_err(|_| GDS_IO_ERROR)?;
+    fire_crab_ods::ddl::insert_backup_history(
+        &mut main,
+        page_size,
+        level,
+        &guid_text(&guid),
+        era as i64,
+        file,
+    )
+    .map_err(|_| GDS_IO_ERROR)?;
+    if let Some(p) = main.page_mut(0) {
+        p[8..12].copy_from_slice(&(era + 1).to_le_bytes());
+    }
+    std::fs::write(db, &main.to_bytes()).map_err(|_| GDS_IO_ERROR)?;
+    fire_crab_cch::pool::forget(db);
+    Ok(format!(
+        "time elapsed	0 sec 
+page reads	{} 
+page writes	{}
+",
+        pages + 1,
+        writes
+    ))
+}
+
 /// `isc_action_svc_nrest`, one level-0 file: the FIXUP restore.
 ///
 /// Measured against the engine's own `-R`: the restored file is the
@@ -4173,6 +4297,24 @@ fn guid_text(g: &[u8; 16]) -> String {
         g[3], g[2], g[1], g[0], g[5], g[4], g[7], g[6],
         g[8], g[9], g[10], g[11], g[12], g[13], g[14], g[15]
     )
+}
+
+/// Parse the braced GUID text back to its 16 stored bytes - the
+/// reverse of [guid_text]'s mixed-endian convention.
+fn guid_bytes(t: &str) -> Option<[u8; 16]> {
+    let hex: String = t.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+    if hex.len() != 32 {
+        return None;
+    }
+    let mut b = [0u8; 16];
+    for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
+        b[i] = u8::from_str_radix(std::str::from_utf8(chunk).ok()?, 16).ok()?;
+    }
+    // display order -> storage order: first three groups little-endian
+    Some([
+        b[3], b[2], b[1], b[0], b[5], b[4], b[7], b[6],
+        b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15],
+    ])
 }
 
 fn fresh_guid() -> [u8; 16] {

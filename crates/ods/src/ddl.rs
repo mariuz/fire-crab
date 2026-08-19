@@ -8427,6 +8427,38 @@ pub fn insert_backup_history(
     advance_oldest_transactions(file, page_size)
 }
 
+/// The most recent RDB$BACKUP_HISTORY row of a given level: its GUID
+/// text and SCN - what an incremental backup chains onto.
+pub fn last_backup_history(
+    file: &crate::Image,
+    page_size: usize,
+    level: i64,
+) -> Option<(String, i64)> {
+    let rel = crate::resolve_relation(file, page_size, "RDB$BACKUP_HISTORY")?;
+    let formats = system_relation_formats(file, page_size, "RDB$BACKUP_HISTORY")?;
+    let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
+    let cols = relation_columns(file, page_size, "RDB$BACKUP_HISTORY");
+    let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (id_f, lvl_f, guid_f, scn_f) = (
+        fid("RDB$BACKUP_ID")?,
+        fid("RDB$BACKUP_LEVEL")?,
+        fid("RDB$GUID")?,
+        fid("RDB$SCN")?,
+    );
+    let mut best: Option<(i64, String, i64)> = None;
+    walk_rows(file, page_size, rel, descs, |v| {
+        let (Some(Value::Int(id)), Some(Value::Int(l)), Some(Value::Text(g)), Some(Value::Int(scn))) =
+            (v.get(id_f), v.get(lvl_f), v.get(guid_f), v.get(scn_f))
+        else {
+            return;
+        };
+        if *l == level && best.as_ref().map_or(true, |(bid, ..)| *id > *bid) {
+            best = Some((*id, g.trim_end().to_string(), *scn));
+        }
+    });
+    best.map(|(_, g, scn)| (g, scn))
+}
+
 /// Restore a carried SHADOW: the RDB$FILES row (the physical file is
 /// the CALLER's to write - it is the database image itself with the
 /// header marked, and only the caller holds the finished image).

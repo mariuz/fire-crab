@@ -49,11 +49,18 @@ server was missing from an engine level-1 chained on a level-0,
 because an fc-written page looked unchanged to the engine's
 incremental selection. The cross-implementation chain is the gate's
 own cell now: fc anchors, fc writes, the ENGINE increments and
-restores, and the fc-written row rides. Remaining slices: fc
-PRODUCES level-N (the NBAK container: magic + version + level +
-this/previous GUIDs + page size, then the changed pages), fc
-RESTORES chains (GUID verification, "Wrong order" refusals), and
-ALTER DATABASE BEGIN/END BACKUP with the .delta redirection.
+restores, and the fc-written row rides. ~~fc produces level-N~~ — slice B is in: the engine's own
+inc_header container (one zero-padded page — NBAK, version 2, the
+level, this and the previous backup's GUIDs off the history chain,
+the page size and both SCNs) followed by every page above the
+previous era, raw and ascending, the restore placing each by its
+own pag_pageno; page 0 rides STALLED (the fixup expects state 1,
+measured). The gate walks an all-fc chain and a three-level MIXED
+one (fc level-0, engine level-1, fc level-2 — an engine-written row
+inside fc's increment) through the ENGINE's restore. Remaining
+slices: fc RESTORES chains (GUID verification, "Wrong order"
+refusals), and ALTER DATABASE BEGIN/END BACKUP with the .delta
+redirection.
 (TIMESTAMP WITH TIME ZONE learned its system-format mapping on the
 way — type 29 was unanswerable, which had hidden RDB$BACKUP_HISTORY
 from every reader.)

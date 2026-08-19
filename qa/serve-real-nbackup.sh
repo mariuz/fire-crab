@@ -180,8 +180,19 @@ fi
 # engine's does - a backup GUID into the main header, an
 # RDB$BACKUP_HISTORY row anchored at the current ERA, the era
 # advanced - so the ENGINE's own incremental chains onto it.
+# ~~producing an incremental refuses~~ - fc PRODUCES level N now:
+# the engine's own inc_header container (one zero-padded page:
+# NBAK, version 2, level, this/prev GUIDs, page size, both SCNs)
+# then the raw pages above the previous era, ascending
+rm -f "$D/fc-nbackup-l1.nbk"
+ran=$((ran + 1))
 fo=$(svc "$FMGR" action_nbak nbk_level 1 dbname "$DBF" nbk_file "$D/fc-nbackup-l1.nbk")
-check "boundary: PRODUCING an incremental is refused (the next slice)" "$fo" "feature is not supported|rc=1"
+if [ "${fo##*rc=}" = "0" ]; then
+    echo "OK   fc PRODUCES a level-1 increment (the engine's own container)"
+else
+    echo "DIFF fc level-1 production: [$fo]"; fail=1
+fi
+rm -f "$D/fc-nbackup-l1.nbk"
 hist() { # <conn> - how many backup-history rows
     printf 'SET HEADING OFF;\nSELECT COUNT(*) FROM RDB$BACKUP_HISTORY;\n' |
         "$ISQL" -q -b -user "$U" -pas "$P" "$1" 2>&1 | tr -d ' \n'
@@ -227,7 +238,29 @@ if [ "$got" = "/1/3/" ]; then
 else
     echo "DIFF cross-implementation chain: [$got] (want /1/3/)"; fail=1
 fi
-rm -f "$CHDB" "$D/fc-nb-ch0.nbk" "$D/fc-nb-ch1.nbk" "$D/fc-nb-chr.fdb"
+# ...and the ALL-FC chain: fc anchors, fc writes, fc INCREMENTS, the
+# ENGINE restores - then an engine write and FC's level 2 on top
+rm -f "$D/fc-nb-ch2.nbk" "$D/fc-nb-chr2.fdb"
+printf 'INSERT INTO T VALUES (7);\nCOMMIT;\n' | "$ISQL" -q -b -user "$U" -pas "$P" "$CHDB" >/dev/null 2>&1
+ran=$((ran + 1))
+fo=$(svc "$FMGR" action_nbak nbk_level 2 dbname "$CHDB" nbk_file "$D/fc-nb-ch2.nbk")
+if [ "${fo##*rc=}" = "0" ]; then
+    echo "OK   fc's level-2 increments the mixed chain (an ENGINE-written row inside)"
+else
+    echo "DIFF fc level-2: [$fo]"; fail=1
+fi
+sudo -n chmod 666 "$D/fc-nb-ch2.nbk" 2>/dev/null || chmod 666 "$D/fc-nb-ch2.nbk" 2>/dev/null
+"$NBACKUP" -R "$D/fc-nb-chr2.fdb" "$D/fc-nb-ch0.nbk" "$D/fc-nb-ch1.nbk" "$D/fc-nb-ch2.nbk" >/dev/null 2>&1
+chmod 666 "$D/fc-nb-chr2.fdb" 2>/dev/null
+ran=$((ran + 1))
+got=$(printf 'SET HEADING OFF;\nSELECT X FROM T ORDER BY X;\n' |
+    "$ISQL" -q -b -user "$U" -pas "$P" "$D/fc-nb-chr2.fdb" 2>&1 | tr -s ' \n' '/')
+if [ "$got" = "/1/3/7/" ]; then
+    echo "OK   the ENGINE restores the three-level MIXED chain (fc-0, engine-1, fc-2)"
+else
+    echo "DIFF mixed chain: [$got] (want /1/3/7/)"; fail=1
+fi
+rm -f "$CHDB" "$D/fc-nb-ch0.nbk" "$D/fc-nb-ch1.nbk" "$D/fc-nb-ch2.nbk" "$D/fc-nb-chr.fdb" "$D/fc-nb-chr2.fdb"
 
 # --- 6. and the MAIN database survives its own backup ------------------------
 ran=$((ran + 1))
