@@ -287,6 +287,65 @@ else
 fi
 rm -f "$CHDB" "$D/fc-nb-ch0.nbk" "$D/fc-nb-ch1.nbk" "$D/fc-nb-ch2.nbk" "$D/fc-nb-chr.fdb" "$D/fc-nb-chr2.fdb" "$D/fc-nb-e0.nbk" "$D/fc-nb-e1.nbk" "$D/fc-nb-fcr.fdb" "$D/fc-nb-bad.fdb"
 
+# --- 5c. BEGIN/END BACKUP: the difference-file mode, both directions --------
+# fc's BEGIN freezes the main file (only the transition header page
+# changes), diverts writes to the .delta in the engine's own
+# alloc-table format, and the ENGINE reads the mid-mode state through
+# fc's delta; END merges whole and removes it. And the reverse: fc
+# reads through a delta the ENGINE is writing.
+BBDB="$D/fc-nb-bb.fdb"
+rm -f "$BBDB" "$BBDB.delta"
+"$ISQL" -q -b -user "$U" -pas "$P" <<EOF >/dev/null 2>&1
+CREATE DATABASE '$BBDB' USER '$U' PASSWORD '$P' PAGE_SIZE 8192;
+CREATE TABLE T (X INTEGER);
+COMMIT;
+INSERT INTO T VALUES (1);
+COMMIT;
+EOF
+chmod 666 "$BBDB"
+ran=$((ran + 1))
+printf 'ALTER DATABASE BEGIN BACKUP;\nCOMMIT;\nINSERT INTO T VALUES (2);\nCOMMIT;\n' |
+    "$ISQL" -q -b -user "$U" -pas "$P" "127.0.0.1/$PORT:$BBDB" >/dev/null 2>&1
+chmod 666 "$BBDB.delta" 2>/dev/null
+mode=$(python3 -c "print(open('$BBDB','rb').read(25)[24])" 2>/dev/null)
+if [ -f "$BBDB.delta" ] && [ "$mode" = "1" ]; then
+    echo "OK   fc's BEGIN BACKUP: main stalled, the .delta exists"
+else
+    echo "DIFF BEGIN BACKUP: delta=$([ -f "$BBDB.delta" ] && echo yes || echo no) mode=$mode"; fail=1
+fi
+ran=$((ran + 1))
+got=$(printf 'SET HEADING OFF;\nSELECT MAX(X) FROM T;\n' |
+    "$ISQL" -q -b -user "$U" -pas "$P" "127.0.0.1/$REAL:$BBDB" 2>&1 | tr -d ' \n')
+if [ "$got" = "2" ]; then
+    echo "OK   the ENGINE reads fc's mid-mode state THROUGH fc's delta"
+else
+    echo "DIFF engine mid-mode read: [$got] (want 2)"; fail=1
+fi
+ran=$((ran + 1))
+printf 'ALTER DATABASE END BACKUP;\nCOMMIT;\n' |
+    "$ISQL" -q -b -user "$U" -pas "$P" "127.0.0.1/$PORT:$BBDB" >/dev/null 2>&1
+got=$(printf 'SET HEADING OFF;\nSELECT MAX(X) FROM T;\n' |
+    "$ISQL" -q -b -user "$U" -pas "$P" "127.0.0.1/$REAL:$BBDB" 2>&1 | tr -d ' \n')
+if [ ! -f "$BBDB.delta" ] && [ "$got" = "2" ]; then
+    echo "OK   fc's END BACKUP merges whole and removes the delta"
+else
+    echo "DIFF END BACKUP: delta=$([ -f "$BBDB.delta" ] && echo left || echo gone) read=[$got]"; fail=1
+fi
+ran=$((ran + 1))
+printf 'ALTER DATABASE BEGIN BACKUP;\nCOMMIT;\nINSERT INTO T VALUES (9);\nCOMMIT;\n' |
+    "$ISQL" -q -b -user "$U" -pas "$P" "127.0.0.1/$REAL:$BBDB" >/dev/null 2>&1
+chmod 666 "$BBDB.delta" 2>/dev/null
+got=$(printf 'SET HEADING OFF;\nSELECT MAX(X) FROM T;\n' |
+    "$ISQL" -q -b -user "$U" -pas "$P" "127.0.0.1/$PORT:$BBDB" 2>&1 | tr -d ' \n')
+printf 'ALTER DATABASE END BACKUP;\nCOMMIT;\n' |
+    "$ISQL" -q -b -user "$U" -pas "$P" "127.0.0.1/$REAL:$BBDB" >/dev/null 2>&1
+if [ "$got" = "9" ]; then
+    echo "OK   ...and FC reads the ENGINE's mid-mode state through ITS delta"
+else
+    echo "DIFF fc mid-mode read of the engine's delta: [$got] (want 9)"; fail=1
+fi
+rm -f "$BBDB" "$BBDB.delta"
+
 # --- 6. and the MAIN database survives its own backup ------------------------
 ran=$((ran + 1))
 v=$("$GFIX" -v -full -user "$U" -pas "$P" "$DBF" 2>&1 | tr -d ' \n')

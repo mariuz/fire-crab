@@ -23,6 +23,7 @@
 //! - Record compression is converted from `src/jrd/sqz.cpp` including
 //!   the Firebird 4+ extended run lengths (control bytes -1/-2).
 
+pub mod delta;
 pub mod blr;
 pub mod btr;
 pub mod btw;

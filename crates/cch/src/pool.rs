@@ -285,6 +285,23 @@ fn key(path: &str) -> String {
 /// for that file, otherwise the file, read once. `None` when there is
 /// no readable file there - the caller then behaves exactly as it did
 /// when its own `fs::read` failed.
+/// Read a database file, OVERLAYING its difference file when the
+/// header says backup mode is on (nbak stalled): the engine reads a
+/// locked database through its delta, and so must this pool - a
+/// stalled main file alone is the FROZEN state, not the current one.
+fn read_with_delta(path: &str) -> Option<Vec<u8>> {
+    let mut raw = std::fs::read(path).ok()?;
+    if raw.len() > 24 && raw[24] == 1 {
+        let delta_path = format!("{}.delta", path);
+        if let Ok(delta) = std::fs::read(&delta_path) {
+            if let Some(ps) = fire_crab_ods::tra::page_size_of(&raw) {
+                let _ = fire_crab_ods::delta::apply_delta(&mut raw, &delta, ps);
+            }
+        }
+    }
+    Some(raw)
+}
+
 pub fn open(path: &str) -> Option<Arc<SharedImage>> {
     let k = key(path);
     let mut p = lock(pool());
@@ -306,7 +323,7 @@ pub fn open(path: &str) -> Option<Arc<SharedImage>> {
         // re-create the same path against a running server; the engine
         // itself writes these files too. A resident image that no
         // longer matches its file is re-read, not served.
-        let raw = std::fs::read(path).ok()?;
+        let raw = read_with_delta(path)?;
         let ps = fire_crab_ods::tra::page_size_of(&raw)?;
         stats().reloads.fetch_add(1, Ordering::Relaxed);
         sh.epoch.fetch_add(1, Ordering::Relaxed);
@@ -316,7 +333,7 @@ pub fn open(path: &str) -> Option<Arc<SharedImage>> {
         *lock(&sh.disk) = fp;
         return Some(Arc::clone(sh));
     }
-    let raw = std::fs::read(path).ok()?;
+    let raw = read_with_delta(path)?;
     let ps = fire_crab_ods::tra::page_size_of(&raw)?;
     let bytes = Arc::new(fire_crab_ods::Image::from_bytes(&raw, ps));
     let sh = Arc::new(SharedImage {

@@ -64,8 +64,18 @@ refuses whole, no half-restored database — the engine's "Wrong
 order" as a typed refusal), and each raw page lands at its own
 pag_pageno, the file EXTENDING when the database grew between
 levels. fc restores the engine's three-level chain; the wrong order
-refuses. Remaining: ALTER DATABASE BEGIN/END BACKUP with the .delta
-redirection — the one nbackup surface fc still refuses.
+refuses. ~~BEGIN/END BACKUP refuses~~ — slice D closes the chunk:
+ALTER DATABASE BEGIN BACKUP creates the .delta (one zeroed page,
+the empty allocation table), stalls the header, advances the era
+and mints the GUID; the flush DIVERTS while stalled (both-sides
+rule, like the read-only switch) writing changed pages into the
+delta's alloc-table format; the pool OVERLAYS a delta on attach;
+END BACKUP merges whole — this architecture's in-memory image IS
+main+delta — and removes it. Both directions read each other's
+mid-mode state: the ENGINE reads fc's delta, fc reads the
+ENGINE's. **The nbackup chunk is COMPLETE**: anchor, increment,
+restore, refuse, and the difference-file mode, each proven
+cross-implementation.
 (TIMESTAMP WITH TIME ZONE learned its system-format mapping on the
 way — type 29 was unanswerable, which had hidden RDB$BACKUP_HISTORY
 from every reader.)

@@ -5566,6 +5566,9 @@ enum Plan {
     /// `CREATE ROLE <name>`: a RDB$ROLES row and its security class, no
     /// number and no privileges
     CreateRole { name: String },
+    /// `ALTER DATABASE BEGIN BACKUP` / `END BACKUP` - the nbackup
+    /// difference-file mode
+    AlterDatabaseBackup { begin: bool },
     /// `DROP ROLE <name>`: the row and its security class go
     DropRole { name: String },
     /// `CREATE DOMAIN <name> [AS] <type> [NOT NULL]`: a standalone
@@ -14203,6 +14206,28 @@ fn plan_create_role(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
     Some((Plan::CreateRole { name: unquote_ident(toks[2])? }, Vec::new()))
 }
 
+/// Parse `ALTER DATABASE BEGIN BACKUP` / `ALTER DATABASE END BACKUP`.
+/// Everything else ALTER DATABASE says stays refused.
+fn plan_alter_database(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
+    let s = sql.trim().trim_end_matches(';').trim();
+    let toks: Vec<&str> = s.split_whitespace().collect();
+    if toks.len() != 4
+        || !toks[0].eq_ignore_ascii_case("ALTER")
+        || !toks[1].eq_ignore_ascii_case("DATABASE")
+        || !toks[3].eq_ignore_ascii_case("BACKUP")
+    {
+        return None;
+    }
+    let begin = if toks[2].eq_ignore_ascii_case("BEGIN") {
+        true
+    } else if toks[2].eq_ignore_ascii_case("END") {
+        false
+    } else {
+        return None;
+    };
+    Some((Plan::AlterDatabaseBackup { begin }, Vec::new()))
+}
+
 /// Parse `DROP ROLE <name>`.
 fn plan_drop_role(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
     let s = sql.trim().trim_end_matches(';').trim();
@@ -19532,6 +19557,54 @@ fn execute_dml_collecting_inner(
             fire_crab_ods::ddl::create_role(&mut work, db.page_size, name, &[])?;
             (0, 0, 0)
         }
+        Plan::AlterDatabaseBackup { begin } => {
+            let stalled = work.page(0).map(|p| p.len() > 24 && p[24] == 1).unwrap_or(false);
+            let delta_path = format!("{}.delta", db.path);
+            if *begin {
+                if stalled {
+                    return Err("database is already in the physical backup mode".into());
+                }
+                // the DIFFERENCE FILE, one zeroed page: the empty
+                // allocation table the engine's BEGIN BACKUP writes
+                use std::io::Write as _;
+                let mut f = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&delta_path)
+                    .map_err(|e| format!("difference file {}: {}", delta_path, e))?;
+                f.write_all(&vec![0u8; db.page_size])
+                    .and_then(|_| f.sync_all())
+                    .map_err(|e| e.to_string())?;
+                // the header the engine writes: mode STALLED, the era
+                // advanced (this is where the SCN bump lives), a fresh
+                // backup GUID
+                let hdr = work.page_mut(0).ok_or("no header page")?;
+                hdr[24] = 1;
+                let scn = u32::from_le_bytes([hdr[8], hdr[9], hdr[10], hdr[11]]) + 1;
+                hdr[8..12].copy_from_slice(&scn.to_le_bytes());
+                let page_size = db.page_size;
+                fire_crab_ods::header::store_clumplet(
+                    work.page_mut(0).ok_or("no header page")?,
+                    page_size,
+                    fire_crab_ods::header::hdr_clump::BACKUP_GUID,
+                    &fresh_guid(),
+                )?;
+            } else {
+                if !stalled {
+                    return Err("database is not in the physical backup mode".into());
+                }
+                // the MERGE, this architecture's way: the in-memory
+                // image IS main+delta already (every stalled write
+                // landed in both), so the whole image to the main
+                // file is the merge, and the delta is done
+                if let Some(p) = work.page_mut(0) {
+                    p[24] = 0;
+                }
+                std::fs::write(&db.path, work.to_bytes()).map_err(|e| e.to_string())?;
+                let _ = std::fs::remove_file(&delta_path);
+            }
+            (0, 0, 0)
+        }
         Plan::DropRole { name } => {
             fire_crab_ods::ddl::drop_role(&mut work, db.page_size, name)?;
             (0, 0, 0)
@@ -20334,6 +20407,35 @@ fn flush_careful(path: &str, before: &fire_crab_ods::Image, after: &fire_crab_od
     // FC_NO_CAREFUL restores the whole-file write. It exists for the
     // GATE, for the same reason FC_NO_INDEX does: an assertion that the
     // ordering happened is worth nothing unless it can be seen not to.
+    // BACKUP MODE DIVERTS THE FLUSH: while the database is stalled
+    // (BEGIN BACKUP), page writes go to the DIFFERENCE file and the
+    // main file stays frozen - that is the mode's entire point, an
+    // external copy of the main file must see the moment the backup
+    // began. The TRANSITION flushes (mode turning on or off) write the
+    // main file - the same rule the read-only switch follows.
+    let stalled = |img: &fire_crab_ods::Image| {
+        img.page(0).map(|p| p.len() > 24 && p[24] == 1).unwrap_or(false)
+    };
+    if stalled(before) && stalled(after) {
+        let mut changed = after.changed_pages(before);
+        if after.num_pages() > before.num_pages() {
+            changed.extend(before.num_pages() as u32..after.num_pages() as u32);
+        }
+        changed.sort_unstable();
+        changed.dedup();
+        let pages: Vec<(u32, &[u8])> = changed
+            .iter()
+            .filter_map(|pno| after.page(*pno).map(|p| (*pno, p)))
+            .collect();
+        if pages.is_empty() {
+            return Ok(());
+        }
+        return fire_crab_ods::delta::upsert_delta_pages(
+            &format!("{}.delta", path),
+            page_size,
+            &pages,
+        );
+    }
     if std::env::var("FC_NO_CAREFUL").is_ok() {
         return std::fs::write(path, &after.to_bytes()).map_err(|e| e.to_string());
     }
@@ -31497,6 +31599,7 @@ fn describe_for(plan: &Plan, params: &[Descriptor], att: AttCs) -> Vec<u8> {
         | Plan::CreateException { .. } | Plan::CreateProcedure { .. } | Plan::DropProcedure { .. } | Plan::DropException { .. }
         | Plan::AlterException { .. } | Plan::CreateOrAlterException { .. }
         | Plan::CreateRole { .. } | Plan::DropRole { .. }
+        | Plan::AlterDatabaseBackup { .. }
         | Plan::CreateDomain { .. } | Plan::DropDomain { .. }
         | Plan::AlterDomainDefault { .. } | Plan::AlterDomainRename { .. }
         | Plan::AlterDomainNotNull { .. }
@@ -31599,6 +31702,7 @@ fn stmt_type_of(plan: &Plan) -> i32 {
         | Plan::CreateException { .. } | Plan::CreateProcedure { .. } | Plan::DropProcedure { .. } | Plan::DropException { .. }
         | Plan::AlterException { .. } | Plan::CreateOrAlterException { .. }
         | Plan::CreateRole { .. } | Plan::DropRole { .. }
+        | Plan::AlterDatabaseBackup { .. }
         | Plan::CreateDomain { .. } | Plan::DropDomain { .. }
         | Plan::AlterDomainDefault { .. } | Plan::AlterDomainRename { .. }
         | Plan::AlterDomainNotNull { .. }
@@ -32974,6 +33078,7 @@ fn emit_rows_inner(
         | Plan::CreateException { .. } | Plan::CreateProcedure { .. } | Plan::DropProcedure { .. } | Plan::DropException { .. }
         | Plan::AlterException { .. } | Plan::CreateOrAlterException { .. }
         | Plan::CreateRole { .. } | Plan::DropRole { .. }
+        | Plan::AlterDatabaseBackup { .. }
         | Plan::CreateDomain { .. } | Plan::DropDomain { .. }
         | Plan::AlterDomainDefault { .. } | Plan::AlterDomainRename { .. }
         | Plan::AlterDomainNotNull { .. }
@@ -45749,6 +45854,7 @@ fn plan_immediate(text: &str, database: &Option<Database>) -> Option<(Plan, Vec<
                     .or_else(|| plan_alter_exception(text))
                     .or_else(|| plan_create_or_alter_exception(text))
                     .or_else(|| plan_create_role(text))
+                    .or_else(|| plan_alter_database(text))
                     .or_else(|| plan_drop_role(text))
                     .or_else(|| plan_create_domain(text))
                     .or_else(|| plan_drop_domain(text))
@@ -50314,6 +50420,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                         .or_else(|| plan_alter_exception(&stmt_sql))
                         .or_else(|| plan_create_or_alter_exception(&stmt_sql))
                         .or_else(|| plan_create_role(&stmt_sql))
+                        .or_else(|| plan_alter_database(&stmt_sql))
                         .or_else(|| plan_drop_role(&stmt_sql))
                         .or_else(|| plan_create_domain(&stmt_sql))
                         .or_else(|| plan_drop_domain(&stmt_sql))
@@ -50590,6 +50697,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                         | Plan::DropException { .. }
                         | Plan::CreateRole { .. }
                         | Plan::DropRole { .. }
+                        | Plan::AlterDatabaseBackup { .. }
                         | Plan::CreateDomain { .. }
                         | Plan::DropDomain { .. }
                         | Plan::AlterDomainDefault { .. } | Plan::AlterDomainRename { .. }
