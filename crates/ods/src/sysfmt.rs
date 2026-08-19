@@ -205,6 +205,9 @@ fn external_type_to_desc(ftype: i64, flength: i64) -> Option<(u8, u16)> {
         10 => (dtype::REAL, 4),      // blr_float
         27 | 11 => (dtype::DOUBLE, 8), // blr_double, blr_d_float
         35 => (dtype::TIMESTAMP, 8), // blr_timestamp
+        // TIMESTAMP WITH TIME ZONE (RDB$BACKUP_HISTORY.RDB$TIMESTAMP_TZ)
+        29 => (dtype::TIMESTAMP_TZ, 12),
+        28 => (dtype::SQL_TIME_TZ, 8), // TIME WITH TIME ZONE
         12 => (dtype::SQL_DATE, 4),  // blr_sql_date
         13 => (dtype::SQL_TIME, 4),  // blr_sql_time
         23 => (dtype::BOOLEAN, 1),   // blr_bool

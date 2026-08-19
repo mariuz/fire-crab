@@ -1659,10 +1659,60 @@ impl Database {
     /// own reservation, for one - left its pages dirty, and diffing
     /// against the current image would drop them silently.
     fn flush_and_install(&mut self, work: fire_crab_ods::Image) -> Result<(), String> {
+        let mut work = work;
+        self.stamp_page_scns(&mut work);
         let flushed = self.shared.flushed();
         timed("flush", || flush_careful(&self.path, &flushed, &work, self.page_size))?;
         self.install_flushed(work);
         Ok(())
+    }
+
+    /// Stamp the nbackup ERA on every page this install changes: the
+    /// page's own pag_scn (@8) and its slot on the SCN inventory page
+    /// (type 10, page 2, slots from byte 20) both take the header's
+    /// CURRENT scn. Without this an fc-written page looks UNCHANGED to
+    /// the engine's incremental backup - measured, a row inserted
+    /// through this server was silently missing from an engine level-1
+    /// chained on a level-0. One SCN page covers (page_size-20)/4
+    /// pages; pages beyond it are stamped on the page only (a database
+    /// that large is the next slice's measurement, not a guess here).
+    fn stamp_page_scns(&self, work: &mut fire_crab_ods::Image) {
+        let base = self.bytes();
+        let ps = self.page_size;
+        if ps < 24 || work.num_pages() < 3 {
+            return;
+        }
+        let scn = u32::from_le_bytes(
+            work.page(0).and_then(|p| p.get(8..12)).map(|b| [b[0], b[1], b[2], b[3]]).unwrap_or_default(),
+        );
+        let changed = work.changed_pages(&base);
+        if changed.is_empty() {
+            return;
+        }
+        let slots = (ps - 20) / 4;
+        let mut scns_dirty = false;
+        for pno in changed {
+            if pno == 0 || pno == 2 {
+                continue; // the header IS the era; the SCN page is stamped below
+            }
+            if let Some(p) = work.page_mut(pno) {
+                p[8..12].copy_from_slice(&scn.to_le_bytes());
+            }
+            if (pno as usize) < slots {
+                if let Some(sp) = work.page_mut(2) {
+                    let at = 20 + (pno as usize) * 4;
+                    sp[at..at + 4].copy_from_slice(&scn.to_le_bytes());
+                    scns_dirty = true;
+                }
+            }
+        }
+        if scns_dirty {
+            if let Some(sp) = work.page_mut(2) {
+                sp[8..12].copy_from_slice(&scn.to_le_bytes());
+                let at = 20 + 2 * 4;
+                sp[at..at + 4].copy_from_slice(&scn.to_le_bytes());
+            }
+        }
     }
 
     /// A STATEMENT'S WRITE STOPS AT THE POOL. Its pages are installed
@@ -1682,6 +1732,8 @@ impl Database {
     /// is the careful flush's own business, and it sees the whole set
     /// at once now rather than one statement at a time.
     fn install_dirty(&mut self, work: fire_crab_ods::Image) {
+        let mut work = work;
+        self.stamp_page_scns(&mut work);
         self.install(work);
     }
 
@@ -3977,16 +4029,46 @@ fn run_nbak(b: &fire_crab_svc::Buffer) -> Result<String, i32> {
     // guid clumplet from L0 backup"), because the GUID is how a level-1
     // file later names the backup it increments. The engine writes it
     // into the MAIN header at BEGIN BACKUP (nbak.cpp:337) and the copy
-    // inherits it; fire-crab writes it into the COPY alone - its backup
-    // leaves the main file untouched, which the gate asserts as the same
-    // boundary the missing history row belongs to.
+    // inherits it - and so does fire-crab now: the SAME guid lands in
+    // the main header AND an RDB$BACKUP_HISTORY row records the chain
+    // anchor, so the ENGINE's own `nbackup -B 1` can increment a
+    // level-0 this server took (the gate's cross-implementation cell).
+    let guid = fresh_guid();
     fire_crab_ods::header::store_clumplet(
         copy.page_mut(0).expect("header page"),
         page_size,
         fire_crab_ods::header::hdr_clump::BACKUP_GUID,
-        &fresh_guid(),
+        &guid,
     )
     .map_err(|_| GDS_IO_ERROR)?;
+    let mut main = image.as_ref().clone();
+    fire_crab_ods::header::store_clumplet(
+        main.page_mut(0).expect("header page"),
+        page_size,
+        fire_crab_ods::header::hdr_clump::BACKUP_GUID,
+        &guid,
+    )
+    .map_err(|_| GDS_IO_ERROR)?;
+    let era = u32::from_le_bytes(
+        main.page(0)
+            .and_then(|p| p.get(8..12))
+            .map(|b| [b[0], b[1], b[2], b[3]])
+            .unwrap_or_default(),
+    );
+    fire_crab_ods::ddl::insert_backup_history(
+        &mut main,
+        page_size,
+        0,
+        &guid_text(&guid),
+        era as i64,
+        &file,
+    )
+    .map_err(|e| {
+        if std::env::var("FC_SRV_TRACE").is_ok() {
+            eprintln!("[srv] nbak history row failed: {}", e);
+        }
+        GDS_IO_ERROR
+    })?;
     // the target must be FRESH - overwriting a backup somebody has is
     // worse than refusing (the engine refuses too; the gate compares)
     let mut out = std::fs::OpenOptions::new()
@@ -4001,6 +4083,16 @@ fn run_nbak(b: &fire_crab_svc::Buffer) -> Result<String, i32> {
         })?;
     use std::io::Write as _;
     out.write_all(&copy.to_bytes()).and_then(|_| out.sync_all()).map_err(|_| GDS_IO_ERROR)?;
+    // the ERA ADVANCES: pages written after this backup carry a scn
+    // ABOVE the one the history row anchors, which is exactly what the
+    // engine's incremental selection reads (nbak.cpp's own rule)
+    if let Some(p) = main.page_mut(0) {
+        p[8..12].copy_from_slice(&(era + 1).to_le_bytes());
+    }
+    // the MAIN database takes the chain bookkeeping - written the way
+    // the restore path writes files, with the pool told to reload
+    std::fs::write(&db, &main.to_bytes()).map_err(|_| GDS_IO_ERROR)?;
+    fire_crab_cch::pool::forget(&db);
     let pages = copy.byte_len() / page_size;
     // nbackup's own stat lines, streamed back the way the engine's
     // server-side nbackup streams them: reads count the header probe
@@ -4073,6 +4165,16 @@ fn run_nrest(b: &fire_crab_svc::Buffer) -> Result<String, i32> {
 }
 
 /// A fresh v4 UUID: random bytes with the version and variant bits set.
+/// The braced text form of a GUID's 16 stored bytes - the mixed-endian
+/// convention the engine prints (first three groups little-endian).
+fn guid_text(g: &[u8; 16]) -> String {
+    format!(
+        "{{{:02X}{:02X}{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}}}",
+        g[3], g[2], g[1], g[0], g[5], g[4], g[7], g[6],
+        g[8], g[9], g[10], g[11], g[12], g[13], g[14], g[15]
+    )
+}
+
 fn fresh_guid() -> [u8; 16] {
     let mut guid = [0u8; 16];
     let _ = std::fs::File::open("/dev/urandom")

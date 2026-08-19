@@ -8399,6 +8399,34 @@ pub fn set_catalog_description(
     )
 }
 
+/// One RDB$BACKUP_HISTORY row - the chain bookkeeping a level-0
+/// nbackup writes into the MAIN database so a later incremental can
+/// name the backup it extends. The id comes from the system's own
+/// RDB$BACKUP_HISTORY generator; the timestamp stays NULL (a clock is
+/// not a differential surface - the GUID is the chain key).
+pub fn insert_backup_history(
+    file: &mut crate::Image,
+    page_size: usize,
+    level: i64,
+    guid_text: &str,
+    scn: i64,
+    file_name: &str,
+) -> Result<(), String> {
+    let rel = crate::resolve_relation(file, page_size, "RDB$BACKUP_HISTORY")
+        .ok_or("no RDB$BACKUP_HISTORY relation")?;
+    let slot = generator_id_by_name(file, page_size, "RDB$BACKUP_HISTORY")
+        .ok_or("no RDB$BACKUP_HISTORY generator")?;
+    let id = gen::bump(file, page_size, slot, 1)?;
+    sys_insert(file, page_size, "RDB$BACKUP_HISTORY", rel, &[
+        ("RDB$BACKUP_ID", SysVal::I(id)),
+        ("RDB$BACKUP_LEVEL", SysVal::I(level)),
+        ("RDB$GUID", SysVal::S(guid_text)),
+        ("RDB$SCN", SysVal::I(scn)),
+        ("RDB$FILE_NAME", SysVal::S(file_name)),
+    ])?;
+    advance_oldest_transactions(file, page_size)
+}
+
 /// Restore a carried SHADOW: the RDB$FILES row (the physical file is
 /// the CALLER's to write - it is the database image itself with the
 /// header marked, and only the caller holds the finished image).

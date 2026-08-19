@@ -37,6 +37,27 @@ same-path attachments — are each one line in the ledger below, with
 the narrative in the commit that paid for it. Per-slice: gbak 58
 checks, gbakrestore 39, gbakse 12, gbakverbose 14.
 
+**The next big chunk: incremental nbackup — and its first slice is
+in.** Level-0 nbak/nrest were already served; what was missing was
+the CHAIN. Slice A (done): fc's level-0 writes the same bookkeeping
+the engine's does — the backup GUID into the main header, an
+RDB$BACKUP_HISTORY row anchored at the current ERA, the era
+advanced — and fc's page writes now stamp the nbackup SCN (the
+page's own pag_scn and its slot on the type-10 inventory page),
+closing a measured SILENT DATA LOSS: a row inserted through this
+server was missing from an engine level-1 chained on a level-0,
+because an fc-written page looked unchanged to the engine's
+incremental selection. The cross-implementation chain is the gate's
+own cell now: fc anchors, fc writes, the ENGINE increments and
+restores, and the fc-written row rides. Remaining slices: fc
+PRODUCES level-N (the NBAK container: magic + version + level +
+this/previous GUIDs + page size, then the changed pages), fc
+RESTORES chains (GUID verification, "Wrong order" refusals), and
+ALTER DATABASE BEGIN/END BACKUP with the .delta redirection.
+(TIMESTAMP WITH TIME ZONE learned its system-format mapping on the
+way — type 29 was unanswerable, which had hidden RDB$BACKUP_HISTORY
+from every reader.)
+
 The subsystem map's rows fall into three states, and the difference
 matters more than the row count:
 

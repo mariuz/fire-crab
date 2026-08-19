@@ -175,27 +175,61 @@ else
 fi
 
 # --- 5. RECORDED BOUNDARY: the incremental chain ----------------------------
-# fire-crab refuses level > 0; the engine performs it. And the level-0
-# bookkeeping differs the same way: the engine's nbak writes an
-# RDB$BACKUP_HISTORY row and a backup GUID into the MAIN file,
-# fire-crab's writes neither - the same feature seen from the other end.
+# fire-crab still refuses PRODUCING level > 0 (that is the next
+# slice); but its level-0 now writes the SAME chain bookkeeping the
+# engine's does - a backup GUID into the main header, an
+# RDB$BACKUP_HISTORY row anchored at the current ERA, the era
+# advanced - so the ENGINE's own incremental chains onto it.
 fo=$(svc "$FMGR" action_nbak nbk_level 1 dbname "$DBF" nbk_file "$D/fc-nbackup-l1.nbk")
-check "boundary: an incremental backup is refused" "$fo" "feature is not supported|rc=1"
+check "boundary: PRODUCING an incremental is refused (the next slice)" "$fo" "feature is not supported|rc=1"
 hist() { # <conn> - how many backup-history rows
     printf 'SET HEADING OFF;\nSELECT COUNT(*) FROM RDB$BACKUP_HISTORY;\n' |
         "$ISQL" -q -b -user "$U" -pas "$P" "$1" 2>&1 | tr -d ' \n'
 }
 ran=$((ran + 1))
 eh=$(hist "127.0.0.1/$REAL:$DBE"); fh=$(hist "127.0.0.1/$PORT:$DBF")
-if [ "$eh" -ge 1 ] 2>/dev/null && [ "$fh" = "0" ]; then
-    echo "OK   boundary: the engine's nbak wrote history rows ($eh), fire-crab's wrote none"
+if [ "$eh" -ge 1 ] 2>/dev/null && [ "$fh" -ge 1 ] 2>/dev/null; then
+    echo "OK   ~~boundary~~ both nbaks write the chain bookkeeping (engine $eh, fc $fh)"
 else
-    echo "DIFF boundary MOVED: history rows engine=$eh fc=$fh"
-    echo "     (if fire-crab writes the chain bookkeeping now, level > 0 should work too)"
-    fail=1
+    echo "DIFF history rows: engine=$eh fc=$fh (want >=1 both)"; fail=1
 fi
 
-# --- 6. and the MAIN database is untouched by its own backup ----------------
+# --- 5b. THE CROSS-IMPLEMENTATION CHAIN: the engine's level-1 extends
+# fc's level-0, and a row written through FC'S OWN DML rides it - the
+# SCN stamping this asserts was measured missing (a silent data loss)
+CHDB="$D/fc-nbackup-chain.fdb"
+rm -f "$CHDB" "$D/fc-nb-ch0.nbk" "$D/fc-nb-ch1.nbk" "$D/fc-nb-chr.fdb"
+"$ISQL" -q -b -user "$U" -pas "$P" <<EOF >/dev/null 2>&1
+CREATE DATABASE '$CHDB' USER '$U' PASSWORD '$P' PAGE_SIZE 8192;
+CREATE TABLE T (X INTEGER);
+COMMIT;
+INSERT INTO T VALUES (1);
+COMMIT;
+EOF
+chmod 666 "$CHDB"
+ran=$((ran + 1))
+fo=$(svc "$FMGR" action_nbak nbk_level 0 dbname "$CHDB" nbk_file "$D/fc-nb-ch0.nbk")
+if [ "${fo##*rc=}" = "0" ]; then
+    echo "OK   fc anchors a chain (level 0 with the bookkeeping)"
+else
+    echo "DIFF chain level-0: [$fo]"; fail=1
+fi
+printf 'INSERT INTO T VALUES (3);\nCOMMIT;\n' | "$ISQL" -q -b -user "$U" -pas "$P" "127.0.0.1/$PORT:$CHDB" >/dev/null 2>&1
+sudo -n chmod 666 "$D/fc-nb-ch0.nbk" 2>/dev/null || chmod 666 "$D/fc-nb-ch0.nbk" 2>/dev/null
+"$NBACKUP" -B 1 "$CHDB" "$D/fc-nb-ch1.nbk" -user "$U" -password "$P" >/dev/null 2>&1
+"$NBACKUP" -R "$D/fc-nb-chr.fdb" "$D/fc-nb-ch0.nbk" "$D/fc-nb-ch1.nbk" >/dev/null 2>&1
+chmod 666 "$D/fc-nb-chr.fdb" 2>/dev/null
+ran=$((ran + 1))
+got=$(printf 'SET HEADING OFF;\nSELECT X FROM T ORDER BY X;\n' |
+    "$ISQL" -q -b -user "$U" -pas "$P" "$D/fc-nb-chr.fdb" 2>&1 | tr -s ' \n' '/')
+if [ "$got" = "/1/3/" ]; then
+    echo "OK   the ENGINE's level-1 chains onto fc's level-0 and carries FC's OWN write"
+else
+    echo "DIFF cross-implementation chain: [$got] (want /1/3/)"; fail=1
+fi
+rm -f "$CHDB" "$D/fc-nb-ch0.nbk" "$D/fc-nb-ch1.nbk" "$D/fc-nb-chr.fdb"
+
+# --- 6. and the MAIN database survives its own backup ------------------------
 ran=$((ran + 1))
 v=$("$GFIX" -v -full -user "$U" -pas "$P" "$DBF" 2>&1 | tr -d ' \n')
 if [ -z "$v" ]; then echo "OK   gfix -v -full accepts the live database after its backups"
