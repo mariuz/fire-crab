@@ -3575,27 +3575,48 @@ fn run_gbak_restore_core(
         // the FUNCTIONS, blobs verbatim: the args re-type through the
         // carried domain records, position 0 the RETURN argument
         for fu in &restored.functions {
+            let external = if fu.module.is_some() || fu.engine.is_some() {
+                Some(fire_crab_ods::ddl::ExternalFn {
+                    module: fu.module.clone(),
+                    entrypoint: fu.entrypoint.clone(),
+                    engine: fu.engine.clone(),
+                    legacy: fu.module.is_some(),
+                })
+            } else {
+                None
+            };
             let mut args = Vec::new();
             for a in &fu.args {
-                let (_, ft, len, sc, st) = restored
-                    .domain_types
-                    .iter()
-                    .find(|(n, ..)| n == &a.source)
-                    .ok_or_else(|| {
-                        format!(
-                            "function argument at position {}: its domain {} is not in the file",
-                            a.position, a.source
-                        )
-                    })?;
+                // a LEGACY arg types itself inline; a domain-sourced
+                // arg re-types through the carried global fields
+                let (ft, len, sc, st, inline, precision) = if a.source.is_empty() {
+                    let (t, sc_, ln, st_, pr) = a.inline_type;
+                    (t, ln, sc_, st_, true, Some(pr))
+                } else {
+                    let (_, ft, len, sc, st) = restored
+                        .domain_types
+                        .iter()
+                        .find(|(n, ..)| n == &a.source)
+                        .ok_or_else(|| {
+                            format!(
+                                "function argument at position {}: its domain {} is not in the file",
+                                a.position, a.source
+                            )
+                        })?;
+                    (*ft, *len, *sc, *st, false, None)
+                };
                 args.push(fire_crab_ods::ddl::FnArgDef {
                     name: a.name.clone(),
                     position: a.position,
-                    field_type: *ft as i16,
-                    length: *len as u16,
-                    scale: *sc as i16,
-                    sub_type: *st as i16,
+                    field_type: ft as i16,
+                    length: len as u16,
+                    scale: sc as i16,
+                    sub_type: st as i16,
                     null_flag: a.null_flag,
                     default: a.default.clone(),
+                    inline,
+                    precision,
+                    mech: a.mech,
                 });
             }
             args.sort_by_key(|a| a.position);
@@ -3610,6 +3631,7 @@ fn run_gbak_restore_core(
                 &fu.blr,
                 fu.debug.as_deref(),
                 fu.package.as_ref().map(|(n, v)| (n.as_str(), *v)),
+                external.as_ref(),
             )?;
         }
         // the COMMENTS, last - every row they annotate exists now

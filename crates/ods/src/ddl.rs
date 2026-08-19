@@ -8483,6 +8483,21 @@ pub struct FnArgDef {
     pub null_flag: bool,
     /// an argument DEFAULT: (value BLR verbatim, `= 42` source text)
     pub default: Option<(Vec<u8>, String)>,
+    /// a LEGACY arg: type facts land INLINE on the row, no domain
+    pub inline: bool,
+    pub precision: Option<i64>,
+    /// RDB$MECHANISM: 0 by value, 1 by reference (a legacy arg's)
+    pub mech: i64,
+}
+
+/// The EXTERNAL half of a carried function declaration: the code the
+/// names point at stays OUTSIDE the file, exactly the engine's own
+/// carriage.
+pub struct ExternalFn {
+    pub module: Option<String>,
+    pub entrypoint: Option<String>,
+    pub engine: Option<String>,
+    pub legacy: bool,
 }
 
 /// Restore a carried PSQL function: the `RDB$FUNCTIONS` row with the
@@ -8493,6 +8508,7 @@ pub struct FnArgDef {
 /// NULL, mirroring the ENGINE'S OWN RESTORE of the same record (the
 /// file carries an unconditional int32 where the source catalog held
 /// NULL - measured on a round trip).
+#[allow(clippy::too_many_arguments)]
 pub fn restore_carried_function(
     file: &mut crate::Image,
     page_size: usize,
@@ -8504,6 +8520,7 @@ pub fn restore_carried_function(
     blr: &[u8],
     debug: Option<&[u8]>,
     package: Option<(&str, i64)>,
+    external: Option<&ExternalFn>,
 ) -> Result<(), String> {
     let want = name.trim().trim_matches('"').to_ascii_uppercase();
     if want.is_empty() {
@@ -8544,9 +8561,17 @@ pub fn restore_carried_function(
         None => Some(next_security_class(file, page_size, ACL_SEQUENCE_OWNER)?),
         Some(_) => None,
     };
-    let src_blob =
-        dml::insert_blob_cs(file, page_size, frel, &[source.as_bytes().to_vec()], 1, 4)?;
-    let blr_blob = dml::insert_blob(file, page_size, frel, &[blr.to_vec()], 2)?;
+    // an EXTERNAL function has NO blobs of its own - the names are
+    // the whole declaration (measured: no blr, no source, VALID_BLR
+    // null on the engine's rows)
+    let blobs = if external.is_some() {
+        None
+    } else {
+        let src_blob =
+            dml::insert_blob_cs(file, page_size, frel, &[source.as_bytes().to_vec()], 1, 4)?;
+        let blr_blob = dml::insert_blob(file, page_size, frel, &[blr.to_vec()], 2)?;
+        Some((src_blob, blr_blob))
+    };
     let dbg_blob = match debug {
         Some(d) => Some(dml::insert_blob(file, page_size, frel, &[d.to_vec()], 9)?),
         None => None,
@@ -8556,18 +8581,34 @@ pub fn restore_carried_function(
         ("RDB$FUNCTION_NAME", SysVal::S(&want)),
         ("RDB$FUNCTION_ID", SysVal::I(id)),
         ("RDB$RETURN_ARGUMENT", SysVal::I(return_arg)),
-        ("RDB$FUNCTION_SOURCE", SysVal::B(blob_id_bytes(frel, src_blob))),
-        ("RDB$FUNCTION_BLR", SysVal::B(blob_id_bytes(frel, blr_blob))),
-        ("RDB$VALID_BLR", SysVal::I(1)),
         ("RDB$OWNER_NAME", SysVal::S(OWNER)),
         ("RDB$SYSTEM_FLAG", SysVal::I(0)),
-        ("RDB$LEGACY_FLAG", SysVal::I(0)),
         (
             "RDB$DETERMINISTIC_FLAG",
             SysVal::I(if deterministic { 1 } else { 0 }),
         ),
         ("RDB$AGGREGATE_FLAG", SysVal::I(0)),
     ];
+    if let Some((src_blob, blr_blob)) = blobs {
+        vals.push(("RDB$FUNCTION_SOURCE", SysVal::B(blob_id_bytes(frel, src_blob))));
+        vals.push(("RDB$FUNCTION_BLR", SysVal::B(blob_id_bytes(frel, blr_blob))));
+        vals.push(("RDB$VALID_BLR", SysVal::I(1)));
+    }
+    match external {
+        Some(ext) => {
+            if let Some(m) = &ext.module {
+                vals.push(("RDB$MODULE_NAME", SysVal::S(m)));
+            }
+            if let Some(e) = &ext.entrypoint {
+                vals.push(("RDB$ENTRYPOINT", SysVal::S(e)));
+            }
+            if let Some(en) = &ext.engine {
+                vals.push(("RDB$ENGINE_NAME", SysVal::S(en)));
+            }
+            vals.push(("RDB$LEGACY_FLAG", SysVal::I(if ext.legacy { 1 } else { 0 })));
+        }
+        None => vals.push(("RDB$LEGACY_FLAG", SysVal::I(0))),
+    }
     if let Some(db) = dbg_blob {
         vals.push(("RDB$DEBUG_INFO", SysVal::B(blob_id_bytes(frel, db))));
     }
@@ -8583,6 +8624,29 @@ pub fn restore_carried_function(
     let arel = crate::resolve_relation(file, page_size, "RDB$FUNCTION_ARGUMENTS")
         .ok_or("no RDB$FUNCTION_ARGUMENTS relation")?;
     for a in args {
+        if a.inline {
+            // a LEGACY arg: the type facts land INLINE, no domain, the
+            // measured row shape (FIELD_SOURCE null, MECHANISM 0/1)
+            let mut avals: Vec<(&str, SysVal<'_>)> = vec![
+                ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
+                ("RDB$FUNCTION_NAME", SysVal::S(&want)),
+                ("RDB$ARGUMENT_POSITION", SysVal::I(a.position)),
+                ("RDB$MECHANISM", SysVal::I(a.mech)),
+                ("RDB$FIELD_TYPE", SysVal::I(a.field_type as i64)),
+                ("RDB$FIELD_SCALE", SysVal::I(a.scale as i64)),
+                ("RDB$FIELD_LENGTH", SysVal::I(a.length as i64)),
+                ("RDB$FIELD_SUB_TYPE", SysVal::I(a.sub_type as i64)),
+                ("RDB$SYSTEM_FLAG", SysVal::I(0)),
+            ];
+            if let Some(pr) = a.precision {
+                avals.push(("RDB$FIELD_PRECISION", SysVal::I(pr)));
+            }
+            if let Some(an) = &a.name {
+                avals.push(("RDB$ARGUMENT_NAME", SysVal::S(an.as_str())));
+            }
+            sys_insert(file, page_size, "RDB$FUNCTION_ARGUMENTS", arel, &avals)?;
+            continue;
+        }
         let domain_num = next_domain_number(file, page_size)?;
         let dom = format!("RDB${}", domain_num);
         let mut field_vals: Vec<(&str, SysVal<'_>)> = vec![

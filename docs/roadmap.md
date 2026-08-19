@@ -188,10 +188,23 @@ external file through the engine. fc's own SQL REFUSES an external
 table loudly rather than answering an empty lie (the relation is
 absent to every plan builder — one seam, relation_meta). The gate
 needs ExternalFileAccess = Restrict /tmp/fbhandson in
-firebird.conf. What still refuses is the last PERMANENT boundary:
-external functions (UDF/UDR), whose code lives outside the file —
-an external function declaration is gbakrestore's standing
-fail-closed representative.
+firebird.conf. ~~External functions refuse~~ — their DECLARATIONS RIDE
+(gbak 51), and with them the LAST named refusal falls: a legacy UDF
+as module+entrypoint (atts 4/5) with INLINE-typed args (the type
+facts live on the argument row, no domain — the third typing
+convention the argument family speaks), a UDR as
+entrypoint+engine (atts 5/10) with the ordinary domain-sourced
+args. No BLR, no source — the names ARE the declaration, exactly
+the engine's own carriage. A UDR against the stock udf_compat
+module EXECUTES off both restores; a legacy declaration with an
+absent module fails with the byte-identical engine error — the code
+outside the file stays outside, honestly, on both sides. The
+fail-closed representative is a MAPPING now, refused typed on both
+sides (the writer previously would have silently DROPPED
+RDB$AUTH_MAPPING rows — a found bug closed). **The gbak surface has
+no named refusals left** — mappings, publications, filters and the
+other never-fixtured families refuse typed at the surface check or
+the record walk, and everything else rides.
 
 The subsystem map's rows fall into three states, and the difference
 matters more than the row count:

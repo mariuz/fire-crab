@@ -756,6 +756,45 @@ else
 fi
 rm -f "$ETDB" "$ETF" "$D/fc-gbak-et.fbk" "$D/fc-gbak-etr.fdb"
 
+# EXTERNAL functions: the DECLARATION rides (legacy module+entrypoint
+# atts 4/5, UDR entrypoint+engine atts 5/10, args inline-typed or
+# domain-sourced) - the CODE stays outside the file, exactly the
+# engine's own carriage. A UDR against the stock udf_compat module
+# EXECUTES off both restores; a legacy declaration whose module is
+# absent fails with the byte-identical engine error.
+EFDB="$D/fc-gbak-ef.fdb"; rm -f "$EFDB" "$D/fc-gbak-ef.fbk" "$D/fc-gbak-efr.fdb"
+"$ISQL" -q -b -user "$U" -pas "$P" <<EOF >/dev/null 2>&1
+CREATE DATABASE '$EFDB' USER '$U' PASSWORD '$P' PAGE_SIZE 8192;
+CREATE TABLE T (X INTEGER);
+COMMIT;
+DECLARE EXTERNAL FUNCTION UFX INTEGER RETURNS INTEGER BY VALUE ENTRY_POINT 'xf' MODULE_NAME 'nosuch';
+COMMIT;
+SET TERM ^;
+CREATE FUNCTION UDIV (N1 INTEGER, N2 INTEGER) RETURNS DOUBLE PRECISION EXTERNAL NAME 'udf_compat!UC_div' ENGINE UDR^
+SET TERM ;^
+COMMIT;
+EOF
+chmod 666 "$EFDB"
+ran=$((ran + 1))
+fo=$(svc_backup "$FMGR" "$EFDB" "$D/fc-gbak-ef.fbk")
+if [ "${fo##*rc=}" = "0" ]; then
+    echo "OK   EXTERNAL function declarations ride the backup (fc backs them up)"
+else
+    echo "DIFF external function backup: [$fo]"; fail=1
+fi
+ran=$((ran + 1))
+sudo -n chmod 666 "$D/fc-gbak-ef.fbk" 2>/dev/null || chmod 666 "$D/fc-gbak-ef.fbk" 2>/dev/null
+"$FBSVCMGR" "$EMGR" user "$U" password "$P" action_restore dbname "$D/fc-gbak-efr.fdb" bkp_file "$D/fc-gbak-ef.fbk" >/dev/null 2>&1
+grab "$D/fc-gbak-efr.fdb"
+got=$(printf "SELECT UDIV(10, 4) FROM RDB\$DATABASE;\nSELECT UFX(3) FROM RDB\$DATABASE;\n" |
+    "$ISQL" -q -b -user "$U" -pas "$P" "$D/fc-gbak-efr.fdb" 2>&1 | grep -cE '2\.0000|module name or entrypoint could not be found')
+if [ "$got" = "2" ]; then
+    echo "OK   the ENGINE restores fc's fbk: the UDR EXECUTES, the absent module refuses identically"
+else
+    echo "DIFF external functions after engine restore: match-count [$got] (want 2)"; fail=1
+fi
+rm -f "$EFDB" "$D/fc-gbak-ef.fbk" "$D/fc-gbak-efr.fdb"
+
 # --- 4. RECORDED BOUNDARY: NOT NULL is not carried ---------------------------
 NN="$D/fc-gbak-nn.fdb"; rm -f "$NN"
 "$ISQL" -q -b -user "$U" -pas "$P" <<EOF >/dev/null 2>&1

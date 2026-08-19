@@ -261,9 +261,9 @@ check "...and res_replace overwrites (fc)" \
 check "the replaced database still reads right" "$(rows "$D/fc-gbr-r1.fdb")" "$base"
 
 # --- 4. FAIL-CLOSED: an fbk carrying what this reader cannot ----------------
-# (~~an expression index refuses~~ - they ride now; the representative
-# refusal is an EXTERNAL FUNCTION - a legacy UDF declaration, whose
-# code lives outside the file: the PERMANENT boundary)
+# (~~an external function refuses~~ - the declarations ride now; the
+# representative refusal is a MAPPING - a security-name mapping this
+# writer and reader both refuse typed rather than silently dropping)
 rm -f "$D/fc-gbr-pk.fdb" "$D/fc-gbr-pk.fbk"
 "$ISQL" -q -b -user "$U" -pas "$P" <<EOF >/dev/null 2>&1
 CREATE DATABASE '$D/fc-gbr-pk.fdb' USER '$U' PASSWORD '$P' PAGE_SIZE 8192;
@@ -271,13 +271,13 @@ CREATE TABLE T (X INTEGER);
 COMMIT;
 CREATE TABLE P2 (AGE INTEGER);
 COMMIT;
-DECLARE EXTERNAL FUNCTION UFX INTEGER RETURNS INTEGER BY VALUE ENTRY_POINT 'xf' MODULE_NAME 'nosuch';
+CREATE MAPPING M1 USING PLUGIN SRP FROM USER U1 TO USER U2;
 COMMIT;
 EOF
 chmod 666 "$D/fc-gbr-pk.fdb"
 svc "$EMGR" action_backup dbname "$D/fc-gbr-pk.fdb" bkp_file "$D/fc-gbr-pk.fbk" >/dev/null
 grab "$D/fc-gbr-pk.fbk"
-check "an fbk with an EXTERNAL FUNCTION refuses fc's restore whole" \
+check "an fbk with a MAPPING refuses fc's restore whole" \
     "$(svc "$FMGR" action_restore dbname "$D/fc-gbr-rpk.fdb" bkp_file "$D/fc-gbr-pk.fbk")" \
     "feature is not supported|rc=1"
 ran=$((ran + 1))

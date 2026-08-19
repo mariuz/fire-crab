@@ -325,9 +325,14 @@ pub fn write_backup_verbose(
     // NAME - relation ids and field positions are ODS facts the check
     // must read, not guess (RDB$GENERATORS is relation 20, not the 10
     // a first guess said, and the gate caught it).
-    // (the per-relation surface loop emptied out as its families rode:
-    // functions, roles, packages - what remains typed lives in the
-    // family readers and user_tables' relation-type check)
+    // the per-relation surface check: what this writer cannot carry
+    // refuses the whole backup. A MAPPING would otherwise be silently
+    // DROPPED - the writer never walks RDB$AUTH_MAPPING.
+    for (what, rel_name) in [("a mapping", "RDB$AUTH_MAPPING")] {
+        if user_rows_in(image, page_size, rel_name) > 0 {
+            return Err(Refused(format!("{} is outside this backup's surface", what)));
+        }
+    }
     // CONSTRAINTS are checked by TYPE: NOT NULL and PRIMARY KEY ride the
     // file; UNIQUE / FOREIGN KEY / CHECK constraints are their own
     // slices (an FK needs cross-table restore ordering, a UNIQUE
@@ -508,6 +513,9 @@ pub fn write_backup_verbose(
     let mut fnarg_domains: Vec<(String, i64, String)> = Vec::new(); // (func, position, RDB$n)
     for fu in &functions {
         for a in &fu.args {
+            if a.inline {
+                continue; // a LEGACY arg types itself, no domain
+            }
             fnarg_domains.push((fu.name.clone(), a.position, format!("RDB${}", next_source)));
             next_source += 1;
         }
@@ -630,6 +638,9 @@ pub fn write_backup_verbose(
     // type, so the invented domain carries the resolved facts
     for fu in &functions {
         for a in &fu.args {
+            if a.inline {
+                continue;
+            }
             let dom = fnarg_domains
                 .iter()
                 .find(|(n, p, _)| n == &fu.name && *p == a.position)
@@ -907,10 +918,27 @@ pub fn write_backup_verbose(
         if let Some((_, pv)) = &fu.package {
             r = r.int(12, *pv as i32);
         }
-        r = r
-            .blob(13, &fu.blr)
-            .blob(14, &fu.source)
-            .int(15, fu.valid_blr as i32);
+        // an EXTERNAL function: module (4, legacy) / entry point (5) /
+        // engine (10, UDR) verbatim - and NO blr or source, the
+        // measured record shape
+        if let Some(m) = &fu.module {
+            r = r.text(4, m);
+        }
+        if let Some(e) = &fu.entrypoint {
+            r = r.text(5, e);
+        }
+        if let Some(en) = &fu.engine {
+            r = r.text(10, en);
+        }
+        if !fu.blr.is_empty() {
+            r = r.blob(13, &fu.blr);
+        }
+        if !fu.source.is_empty() {
+            r = r.blob(14, &fu.source);
+        }
+        if let Some(v) = fu.valid_blr {
+            r = r.int(15, v as i32);
+        }
         if let Some(d) = &fu.debug {
             r = r.blob(16, d);
         }
@@ -960,18 +988,31 @@ pub fn write_backup_verbose(
             if let Some((pk, _)) = &fu.package {
                 ar = ar.text(10, pk);
             }
+            // a LEGACY arg's record carries its mechanism and type
+            // INLINE (measured); a domain-sourced arg the zeroed
+            // quintet the engine's own writer puts
             ar = ar
                 .text(1, &fu.name)
                 .int(2, a.position as i32)
-                .int(3, 0)
-                .int(4, 0)
-                .int(5, 0)
-                .int(6, 0)
-                .int(7, 0);
+                .int(3, a.mech.unwrap_or(0) as i32);
+            if a.inline {
+                ar = ar
+                    .int(4, a.field_type as i32)
+                    .int(5, a.scale as i32)
+                    .int(6, a.length as i32)
+                    .int(7, a.sub_type as i32);
+                if let Some(pr) = a.precision {
+                    ar = ar.int(9, pr as i32);
+                }
+            } else {
+                ar = ar.int(4, 0).int(5, 0).int(6, 0).int(7, 0);
+            }
             if let Some(an) = &a.name {
                 ar = ar.text(11, an);
             }
-            ar = ar.text(22, "PUBLIC").text(12, &dom);
+            if !a.inline {
+                ar = ar.text(22, "PUBLIC").text(12, &dom);
+            }
             if let Some((blr, src)) = &a.default {
                 ar = ar.blob(13, blr);
                 if !src.is_empty() {
@@ -2054,8 +2095,15 @@ struct UFunc {
     name: String,
     /// (package name, RDB$PRIVATE_FLAG) when the function is a member
     package: Option<(String, i64)>,
+    /// an EXTERNAL function: legacy UDF module name (att 4)
+    module: Option<String>,
+    /// an EXTERNAL function's entry point (att 5) - the legacy symbol,
+    /// or the UDR 'module!function' external name
+    entrypoint: Option<String>,
+    /// a UDR function's engine name (att 10)
+    engine: Option<String>,
     return_arg: i64,
-    valid_blr: i64,
+    valid_blr: Option<i64>,
     legacy: Option<i64>,
     deterministic: Option<i64>,
     aggregate: Option<i64>,
@@ -2072,6 +2120,11 @@ struct UFnArg {
     name: Option<String>,
     null_flag: Option<i64>,
     arg_mech: Option<i64>,
+    /// RDB$MECHANISM - a LEGACY arg's by-value(0)/by-reference(1)
+    mech: Option<i64>,
+    /// a LEGACY arg: the type facts live INLINE on the row, no domain
+    inline: bool,
+    precision: Option<i64>,
     field_type: i64,
     length: i64,
     scale: i64,
@@ -2151,9 +2204,29 @@ fn read_functions(
             let default = blob_of(aat("RDB$DEFAULT_VALUE"), false)
                 .map(|b| (b, blob_of(aat("RDB$DEFAULT_SOURCE"), true).unwrap_or_default()));
             let src = text_opt(r, aat("RDB$FIELD_SOURCE")).unwrap_or_default();
-            let f = field_type_of(image, page_size, &src).ok_or_else(|| {
-                Refused(format!("function {}: argument domain {} is unreadable", fn_name, src))
-            })?;
+            // a LEGACY arg carries its type INLINE on the row - no
+            // domain to resolve (FIELD_SOURCE is NULL, measured)
+            let (f, inline) = if src.is_empty() {
+                (
+                    (
+                        aint(r, aat("RDB$FIELD_TYPE")).unwrap_or(0),
+                        aint(r, aat("RDB$FIELD_LENGTH")).unwrap_or(0),
+                        aint(r, aat("RDB$FIELD_SCALE")).unwrap_or(0),
+                        aint(r, aat("RDB$FIELD_SUB_TYPE")).unwrap_or(0),
+                    ),
+                    true,
+                )
+            } else {
+                (
+                    field_type_of(image, page_size, &src).ok_or_else(|| {
+                        Refused(format!(
+                            "function {}: argument domain {} is unreadable",
+                            fn_name, src
+                        ))
+                    })?,
+                    false,
+                )
+            };
             // a BLOB-typed argument would need quad plumbing the minted
             // domains do not speak yet - refuse, typed
             if f.0 == 261 {
@@ -2167,6 +2240,9 @@ fn read_functions(
                 name: text_opt(r, aat("RDB$ARGUMENT_NAME")),
                 null_flag: aint(r, aat("RDB$NULL_FLAG")),
                 arg_mech: aint(r, aat("RDB$ARGUMENT_MECHANISM")),
+                mech: aint(r, aat("RDB$MECHANISM")),
+                inline,
+                precision: aint(r, aat("RDB$FIELD_PRECISION")),
                 field_type: f.0,
                 length: f.1,
                 scale: f.2,
@@ -2185,26 +2261,34 @@ fn read_functions(
         let Some(name) = text_opt(r, at("RDB$FUNCTION_NAME")) else { continue };
         let package = text_opt(r, at("RDB$PACKAGE_NAME"))
             .map(|p| (p, int(r, at("RDB$PRIVATE_FLAG")).unwrap_or(0)));
-        // MODULE_NAME/ENTRYPOINT is a legacy UDF, ENGINE_NAME a UDR -
-        // both are code outside the file and cannot be carried
-        if text_opt(r, at("RDB$MODULE_NAME")).is_some()
-            || text_opt(r, at("RDB$ENTRYPOINT")).is_some()
-            || text_opt(r, at("RDB$ENGINE_NAME")).is_some()
-        {
-            return Err(Refused(format!(
-                "function {} is EXTERNAL - outside this backup's surface",
-                name
-            )));
-        }
-        let blr = blob(r, at("RDB$FUNCTION_BLR")).ok_or_else(|| {
-            Refused(format!("function {}: its BLR blob is unreadable", name))
-        })?;
+        // MODULE_NAME/ENTRYPOINT is a legacy UDF, ENGINE_NAME a UDR:
+        // the DECLARATION rides (names verbatim, no BLR) - the CODE
+        // stays outside the file, exactly the engine's own carriage
+        let module = text_opt(r, at("RDB$MODULE_NAME"));
+        let entrypoint = text_opt(r, at("RDB$ENTRYPOINT"));
+        let engine = text_opt(r, at("RDB$ENGINE_NAME"));
+        let external = module.is_some() || engine.is_some();
+        let blr = match blob(r, at("RDB$FUNCTION_BLR")) {
+            Some(b) => b,
+            None if external => Vec::new(),
+            None => {
+                return Err(Refused(format!(
+                    "function {}: its BLR blob is unreadable",
+                    name
+                )))
+            }
+        };
         let mut source = blob(r, at("RDB$FUNCTION_SOURCE")).unwrap_or_default();
-        source.push(0);
+        if !external || !source.is_empty() {
+            source.push(0);
+        }
         let args = args_of(&name, package.as_ref().map(|(p, _)| p.as_str()))?;
         out.push(UFunc {
             return_arg: int(r, at("RDB$RETURN_ARGUMENT")).unwrap_or(0),
-            valid_blr: int(r, at("RDB$VALID_BLR")).unwrap_or(1),
+            valid_blr: int(r, at("RDB$VALID_BLR")),
+            module,
+            entrypoint,
+            engine,
             legacy: int(r, at("RDB$LEGACY_FLAG")),
             deterministic: int(r, at("RDB$DETERMINISTIC_FLAG")),
             aggregate: int(r, at("RDB$AGGREGATE_FLAG")),
@@ -3088,6 +3172,11 @@ pub struct RFunc {
     pub name: String,
     /// (package name, RDB$PRIVATE_FLAG) when the function is a member
     pub package: Option<(String, i64)>,
+    /// EXTERNAL: legacy module (att 4), entry point (att 5), UDR
+    /// engine (att 10) - the declaration rides, the code stays out
+    pub module: Option<String>,
+    pub entrypoint: Option<String>,
+    pub engine: Option<String>,
     pub return_arg: i64,
     pub deterministic: i64,
     pub source: Vec<u8>,
@@ -3099,7 +3188,13 @@ pub struct RFunc {
 pub struct RFnArg {
     pub position: i64,
     pub name: Option<String>,
+    /// empty for a LEGACY arg - its type rides inline below
     pub source: String,
+    /// (field_type, scale, length, sub_type, precision) off the record
+    /// - meaningful when `source` is empty
+    pub inline_type: (i64, i64, i64, i64, i64),
+    /// RDB$MECHANISM (att 3)
+    pub mech: i64,
     pub null_flag: bool,
     /// DEFAULT: (value BLR verbatim, `= 42` source text)
     pub default: Option<(Vec<u8>, String)>,
@@ -3459,6 +3554,9 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                 let mut fu = RFunc {
                     name: String::new(),
                     package: None,
+                    module: None,
+                    entrypoint: None,
+                    engine: None,
                     return_arg: 0,
                     deterministic: 0,
                     source: Vec::new(),
@@ -3513,13 +3611,10 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                             }
                         }
                         // MODULE_NAME (4), ENTRYPOINT (5), ENGINE_NAME
-                        // (10): code outside the file
-                        4 | 5 | 10 => {
-                            return Err(Refused(format!(
-                                "function {}: attribute {} names EXTERNAL code - outside this restore's surface",
-                                fu.name, tag
-                            )));
-                        }
+                        // (10): the EXTERNAL declaration, verbatim
+                        4 => fu.module = Some(String::from_utf8_lossy(&data).into_owned()),
+                        5 => fu.entrypoint = Some(String::from_utf8_lossy(&data).into_owned()),
+                        10 => fu.engine = Some(String::from_utf8_lossy(&data).into_owned()),
                         1 => fu.name = String::from_utf8_lossy(&data).into_owned(),
                         11 => {
                             let pk = String::from_utf8_lossy(&data).into_owned();
@@ -3566,6 +3661,8 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                 let mut fname = String::new();
                 let mut source = String::new();
                 let mut null_flag = false;
+                let mut mech = 0i64;
+                let mut it = (0i64, 0i64, 0i64, 0i64, 0i64);
                 let mut def_blr: Option<Vec<u8>> = None;
                 let mut def_src: Option<Vec<u8>> = None;
                 loop {
@@ -3612,7 +3709,13 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                         11 => aname = Some(String::from_utf8_lossy(&data).into_owned()),
                         12 => source = String::from_utf8_lossy(&data).into_owned(),
                         16 => null_flag = as_int(&data) != 0,
-                        3..=9 | 10 | 15 | 17 | 21 | 22 => {}
+                        3 => mech = as_int(&data),
+                        4 => it.0 = as_int(&data),
+                        5 => it.1 = as_int(&data),
+                        6 => it.2 = as_int(&data),
+                        7 => it.3 = as_int(&data),
+                        9 => it.4 = as_int(&data),
+                        8 | 10 | 15 | 17 | 21 | 22 => {}
                         other => {
                             return Err(Refused(format!(
                                 "function {}: argument attribute {} is outside this restore's surface",
@@ -3633,7 +3736,15 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                     })
                 };
                 let default = def_blr.map(|b| (b, strip(def_src).unwrap_or_default()));
-                fu.args.push(RFnArg { position, name: aname, source, null_flag, default });
+                fu.args.push(RFnArg {
+                    position,
+                    name: aname,
+                    source,
+                    inline_type: it,
+                    mech,
+                    null_flag,
+                    default,
+                });
             }
             rec::FUNCTION_END => {}
             rec::PROCEDURE => {
