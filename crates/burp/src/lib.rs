@@ -695,8 +695,22 @@ pub fn write_backup_verbose(
         let mut r = Rec::new(&mut out, rec::RELATION)
             .text(21, "PUBLIC")
             .text(1, name)
-            .int(16, 1) // att_relation_flags (pinned from the reference file)
-            .int(18, rtype as i32); // relation type: 0 persistent, 4/5 GTT
+            .int(16, 1); // att_relation_flags (pinned from the reference file)
+        if rtype == 2 {
+            // the EXTERNAL FILE path verbatim (att 17, measured
+            // between owner and type on a real record)
+            if let Some(path) = catalog_text(
+                image,
+                page_size,
+                "RDB$RELATIONS",
+                "RDB$RELATION_NAME",
+                name,
+                "RDB$EXTERNAL_FILE",
+            ) {
+                r = r.text(17, &path);
+            }
+        }
+        let mut r = r.int(18, rtype as i32); // relation type: 0 persistent, 2 external, 4/5 GTT
         if let Some(d) = catalog_description(
             image,
             page_size,
@@ -2492,6 +2506,22 @@ fn catalog_description(
     None
 }
 
+/// One text column off a catalog row matched by key column = value.
+fn catalog_text(
+    image: &fire_crab_ods::Image,
+    page_size: usize,
+    rel_name: &str,
+    key_col: &str,
+    key_val: &str,
+    want_col: &str,
+) -> Option<String> {
+    let (cols, rows) = sys_rows(image, page_size, rel_name)?;
+    let at = |n: &str| cols.iter().find(|(c, _)| c.eq_ignore_ascii_case(n)).map(|(_, i)| *i);
+    rows.iter()
+        .find(|r| text_opt(r, at(key_col)).as_deref() == Some(key_val))
+        .and_then(|r| text_opt(r, at(want_col)))
+}
+
 /// A domain's COMPUTED_BLR blob and precision off its RDB$FIELDS row.
 fn domain_computed_of(
     image: &fire_crab_ods::Image,
@@ -2764,14 +2794,14 @@ fn user_tables(image: &fire_crab_ods::Image, page_size: usize) -> Result<Vec<(u1
             Some(fire_crab_ods::format::Value::Int(n)) => *n as u16,
             _ => continue,
         };
-        // relation type 0 = persistent table, 1 = VIEW, 4/5 = GTT
-        // (preserve/delete rows - all carried); an EXTERNAL table (2)
-        // keeps its data outside the file and refuses
+        // relation type 0 = persistent table, 1 = VIEW, 2 = EXTERNAL
+        // (definition + path carried, the DATA lives in the external
+        // file and never rides - the engine's own layout), 4/5 = GTT
         let rtype = match type_at.and_then(|i| r.values.get(i)) {
             Some(fire_crab_ods::format::Value::Int(t)) => *t,
             _ => 0,
         };
-        if matches!(rtype, 2 | 3) {
+        if rtype == 3 {
             return Err(Refused(format!(
                 "relation {} is not a persistent table - outside this backup's surface",
                 name
@@ -2913,8 +2943,11 @@ pub struct RIndex {
 /// One restored table.
 pub struct RTable {
     pub name: String,
-    /// RDB$RELATION_TYPE off the file: 0 persistent, 1 view, 4/5 GTT
+    /// RDB$RELATION_TYPE off the file: 0 persistent, 1 view,
+    /// 2 external, 4/5 GTT
     pub rtype: i64,
+    /// an EXTERNAL table's file path (att 17), verbatim
+    pub ext_file: Option<String>,
     pub cols: Vec<RCol>,
     pub rows: Vec<Vec<RVal>>,
     pub indexes: Vec<RIndex>,
@@ -4015,6 +4048,7 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                 // (att 14) as int32-framed blobs - walked by hand
                 let mut name = String::new();
                 let mut rtype = 0i64;
+                let mut ext_file: Option<String> = None;
                 let mut view_blr: Option<Vec<u8>> = None;
                 let mut view_source: Option<Vec<u8>> = None;
                 let mut rel_desc: Option<Vec<u8>> = None;
@@ -4072,18 +4106,18 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                         }
                         1 => name = String::from_utf8_lossy(&data).into_owned(),
                         // att 18 is RDB$RELATION_TYPE: 0 = persistent,
-                        // 1 = view, 4/5 = GTT (carried); an EXTERNAL
-                        // table (2) restored as a plain table would
-                        // silently change what the schema MEANS
+                        // 1 = view, 2 = EXTERNAL, 4/5 = GTT - carried
                         18 => {
                             rtype = as_int(&data);
-                            if matches!(rtype, 2 | 3) {
+                            if rtype == 3 {
                                 return Err(Refused(format!(
                                     "relation {}: relation type {} is outside this restore's surface",
                                     name, rtype
                                 )));
                             }
                         }
+                        // att 17: an EXTERNAL table's file path
+                        17 => ext_file = Some(String::from_utf8_lossy(&data).into_owned()),
                         8 | 12 | 16 | 21 => {} // security/owner/flags/schema
                         other => {
                             return Err(Refused(format!(
@@ -4107,6 +4141,7 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                 out.tables.push(RTable {
                     name,
                     rtype,
+                    ext_file,
                     cols: Vec::new(),
                     rows: Vec::new(),
                     indexes: Vec::new(),

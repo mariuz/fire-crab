@@ -713,6 +713,49 @@ else
 fi
 rm -f "$EXIDB" "$D/fc-gbak-exi.fbk" "$D/fc-gbak-exir.fdb"
 
+# EXTERNAL tables: the DEFINITION rides (att 17 path + type 2, no
+# pages - the engine-restored shape), the DATA stays in the external
+# file both restores share. Requires ExternalFileAccess = Restrict
+# /tmp/fbhandson in firebird.conf. fc's own SQL REFUSES the external
+# table loudly rather than answering an empty lie.
+ETDB="$D/fc-gbak-et.fdb"; ETF="$D/fc-gbak-et.dat"
+rm -f "$ETDB" "$ETF" "$D/fc-gbak-et.fbk" "$D/fc-gbak-etr.fdb"
+"$ISQL" -q -b -user "$U" -pas "$P" <<EOF >/dev/null 2>&1
+CREATE DATABASE '$ETDB' USER '$U' PASSWORD '$P' PAGE_SIZE 8192;
+CREATE TABLE ET EXTERNAL FILE '$ETF' (A INTEGER, S CHAR(4));
+COMMIT;
+INSERT INTO ET VALUES (5, 'abcd');
+COMMIT;
+EOF
+chmod 666 "$ETDB" "$ETF" 2>/dev/null
+ran=$((ran + 1))
+fo=$(svc_backup "$FMGR" "$ETDB" "$D/fc-gbak-et.fbk")
+if [ "${fo##*rc=}" = "0" ]; then
+    echo "OK   an EXTERNAL table's definition rides the backup (fc backs it up)"
+else
+    echo "DIFF external table backup: [$fo]"; fail=1
+fi
+ran=$((ran + 1))
+sudo -n chmod 666 "$D/fc-gbak-et.fbk" 2>/dev/null || chmod 666 "$D/fc-gbak-et.fbk" 2>/dev/null
+"$FBSVCMGR" "$EMGR" user "$U" password "$P" action_restore dbname "$D/fc-gbak-etr.fdb" bkp_file "$D/fc-gbak-et.fbk" >/dev/null 2>&1
+grab "$D/fc-gbak-etr.fdb"
+got=$(printf "SELECT RDB\$RELATION_TYPE || '/' || A || S FROM ET JOIN RDB\$RELATIONS ON RDB\$RELATION_NAME='ET';\nINSERT INTO ET VALUES (6, 'wxyz');\nSELECT COUNT(*) FROM ET;\n" |
+    "$ISQL" -q -b -user "$U" -pas "$P" "$D/fc-gbak-etr.fdb" 2>&1 | grep -cE '2/5abcd|^ *2 *$')
+if [ "$got" = "2" ]; then
+    echo "OK   the ENGINE restores fc's fbk: typed 2, reads AND writes the external file"
+else
+    echo "DIFF external table after engine restore: match-count [$got] (want 2)"; fail=1
+fi
+ran=$((ran + 1))
+got=$(printf 'SELECT A FROM ET;\nSELECT 1 FROM RDB$DATABASE;\n' |
+    "$ISQL" -q -b -user "$U" -pas "$P" "127.0.0.1/$PORT:$ETDB" 2>&1 | grep -c 'Dynamic SQL Error')
+if [ "$got" = "1" ]; then
+    echo "OK   fc's OWN SQL refuses the external table loudly (no empty lie)"
+else
+    echo "DIFF fc serve-side external refusal: match-count [$got] (want 1)"; fail=1
+fi
+rm -f "$ETDB" "$ETF" "$D/fc-gbak-et.fbk" "$D/fc-gbak-etr.fdb"
+
 # --- 4. RECORDED BOUNDARY: NOT NULL is not carried ---------------------------
 NN="$D/fc-gbak-nn.fdb"; rm -f "$NN"
 "$ISQL" -q -b -user "$U" -pas "$P" <<EOF >/dev/null 2>&1

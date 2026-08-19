@@ -1296,6 +1296,14 @@ impl Database {
         let ps = self.page_size;
         self.meta.relation(table, || {
             let id = fire_crab_ods::resolve_relation(&image, ps, table)?;
+            // an EXTERNAL table's rows live in a file this executor
+            // does not read - answering an empty result would be a
+            // silent lie, so the relation is ABSENT to every plan
+            // builder (fail-closed; the restore still carries the
+            // definition whole, and the ENGINE serves the data)
+            if fire_crab_ods::ddl::relation_external_file(&image, ps, table).is_some() {
+                return None;
+            }
             Some(crate::mdc::Relation {
                 id,
                 columns: std::sync::Arc::new(relation_columns(&image, ps, table)),
@@ -3172,6 +3180,17 @@ fn run_gbak_restore_core(
             // the restored catalog, not the source
             if matches!(t.rtype, 4 | 5) {
                 fire_crab_ods::ddl::patch_relation_dbkey_length(&mut file, page_size, &t.name, 0)?;
+            }
+            // an EXTERNAL table: the carried path lands verbatim, the
+            // DBKEY mirror is the restored catalog's 0, and the DATA
+            // stays where it always was - in the external file
+            if t.rtype == 2 {
+                fire_crab_ods::ddl::patch_relation_dbkey_length(&mut file, page_size, &t.name, 0)?;
+                if let Some(path) = &t.ext_file {
+                    fire_crab_ods::ddl::patch_relation_external_file(
+                        &mut file, page_size, &t.name, path,
+                    )?;
+                }
             }
             let rel = fire_crab_ods::resolve_relation(&file, page_size, &t.name)
                 .ok_or("the created table cannot be found")?;

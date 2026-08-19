@@ -3112,24 +3112,38 @@ pub fn create_table(
         return Err("format computation failed".into());
     }
 
-    // --- pages first (DPM_create_relation): pointer + index root ------
-    let pointer_page = dml::allocate_page(file, page_size)?;
-    let root_page = dml::allocate_page(file, page_size)?;
-    {
-        let page = crate::page_mut(file, page_size, pointer_page).expect("pointer page out of range");
-        page.fill(0);
-        page[0] = 4; // pag_pointer
-        page[1] = 1; // pag_flags = ppg_eof (last pointer page)
-        dml::put_u32(page, 12, pointer_page); // pag_pageno
-        dml::put_u16(page, 26, rel_id_u16); // ppg_relation @26
-    }
-    {
-        let page = crate::page_mut(file, page_size, root_page).expect("root page out of range");
-        page.fill(0);
-        page[0] = 6; // pag_root
-        dml::put_u32(page, 12, root_page); // pag_pageno
-        dml::put_u16(page, 16, rel_id_u16); // irt_relation @16
-        dml::put_u16(page, 18, 0); // irt_count
+    // --- pages first (DPM_create_relation): pointer + index root.
+    // An EXTERNAL table (type 2) owns NO pages - its rows live in the
+    // external file, and the engine's own restore leaves RDB$PAGES
+    // empty for it (measured)
+    let external = relation_type == 2;
+    let (pointer_page, root_page) = if external {
+        (0u32, 0u32)
+    } else {
+        (
+            dml::allocate_page(file, page_size)?,
+            dml::allocate_page(file, page_size)?,
+        )
+    };
+    if !external {
+        {
+            let page =
+                crate::page_mut(file, page_size, pointer_page).expect("pointer page out of range");
+            page.fill(0);
+            page[0] = 4; // pag_pointer
+            page[1] = 1; // pag_flags = ppg_eof (last pointer page)
+            dml::put_u32(page, 12, pointer_page); // pag_pageno
+            dml::put_u16(page, 26, rel_id_u16); // ppg_relation @26
+        }
+        {
+            let page =
+                crate::page_mut(file, page_size, root_page).expect("root page out of range");
+            page.fill(0);
+            page[0] = 6; // pag_root
+            dml::put_u32(page, 12, root_page); // pag_pageno
+            dml::put_u16(page, 16, rel_id_u16); // irt_relation @16
+            dml::put_u16(page, 18, 0); // irt_count
+        }
     }
 
     // --- the format descriptor blob (makeFormat) ---------------------
@@ -3370,7 +3384,11 @@ pub fn create_table(
             ("RDB$DESCRIPTOR", SysVal::B(blob_id_bytes(8, fmt_blob))),
         ],
     )?;
-    for (page, ptype) in [(pointer_page, 4i64), (root_page, 6i64)] {
+    for (page, ptype) in if external {
+        vec![]
+    } else {
+        vec![(pointer_page, 4i64), (root_page, 6i64)]
+    } {
         sys_insert(
             file,
             page_size,
@@ -8378,6 +8396,54 @@ pub fn set_catalog_description(
         rel,
         move |v| fids.iter().all(|(f, want)| text_eq(v.get(*f), want)),
         &[("RDB$DESCRIPTION", SysVal::B(blob_id_bytes(rel, blob)))],
+    )
+}
+
+/// A relation's `RDB$EXTERNAL_FILE` path, if it is an EXTERNAL table.
+pub fn relation_external_file(
+    file: &crate::Image,
+    page_size: usize,
+    name: &str,
+) -> Option<String> {
+    let want = name.trim().to_ascii_uppercase();
+    let rel = crate::resolve_relation(file, page_size, "RDB$RELATIONS")?;
+    let formats = system_relation_formats(file, page_size, "RDB$RELATIONS")?;
+    let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
+    let name_f = sys_fid(file, page_size, "RDB$RELATIONS", "RDB$RELATION_NAME").ok()?;
+    let ext_f = sys_fid(file, page_size, "RDB$RELATIONS", "RDB$EXTERNAL_FILE").ok()?;
+    let mut found: Option<String> = None;
+    walk_rows(file, page_size, rel, descs, |v| {
+        if found.is_none() && text_eq(v.get(name_f), &want) {
+            if let Some(Value::Text(t)) = v.get(ext_f) {
+                let t = t.trim_end();
+                if !t.is_empty() {
+                    found = Some(t.to_string());
+                }
+            }
+        }
+    });
+    found
+}
+
+/// Patch a relation's `RDB$EXTERNAL_FILE` - the carried path of an
+/// EXTERNAL table, verbatim (the restore does not touch the file).
+pub fn patch_relation_external_file(
+    file: &mut crate::Image,
+    page_size: usize,
+    name: &str,
+    path: &str,
+) -> Result<(), String> {
+    let want = name.trim().trim_matches('"').to_ascii_uppercase();
+    let rel = crate::resolve_relation(file, page_size, "RDB$RELATIONS")
+        .ok_or("no RDB$RELATIONS relation")?;
+    let name_f = sys_fid(file, page_size, "RDB$RELATIONS", "RDB$RELATION_NAME")?;
+    patch_sys_row(
+        file,
+        page_size,
+        "RDB$RELATIONS",
+        rel,
+        move |v| text_eq(v.get(name_f), &want),
+        &[("RDB$EXTERNAL_FILE", SysVal::S(path))],
     )
 }
 

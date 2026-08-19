@@ -177,10 +177,21 @@ walker stays with the executor, the writer only builds what it is
 handed. The ENGINE plans through fc's restored index and MAINTAINS
 it on live inserts, gfix-clean. Partial (WHERE-conditioned) indexes
 refuse typed; an expression this restore cannot evaluate refuses
-typed rather than guessing a key. What still refuses is exactly the
-PERMANENT boundary set: external tables and external functions,
-whose data and code live outside the file — an external function
-declaration is gbakrestore's standing fail-closed representative.
+typed rather than guessing a key. ~~External tables refuse~~ — their DEFINITIONS RIDE
+(gbak 49): the relation record's att 17 carries the file path
+verbatim beside type 2, the restore writes the row with NO pages
+and DBKEY 0 (the engine's restored shape, measured — even the
+engine's own validator grumbles one pointer-page line at EVERY
+external table, original included, so the differential is the
+identical grumble), and both restores read AND write the shared
+external file through the engine. fc's own SQL REFUSES an external
+table loudly rather than answering an empty lie (the relation is
+absent to every plan builder — one seam, relation_meta). The gate
+needs ExternalFileAccess = Restrict /tmp/fbhandson in
+firebird.conf. What still refuses is the last PERMANENT boundary:
+external functions (UDF/UDR), whose code lives outside the file —
+an external function declaration is gbakrestore's standing
+fail-closed representative.
 
 The subsystem map's rows fall into three states, and the difference
 matters more than the row count:
