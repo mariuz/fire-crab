@@ -261,17 +261,17 @@ check "...and res_replace overwrites (fc)" \
 check "the replaced database still reads right" "$(rows "$D/fc-gbr-r1.fdb")" "$base"
 
 # --- 4. FAIL-CLOSED: an fbk carrying what this reader cannot ----------------
-# (~~a shadow refuses~~ - shadows ride now; the representative
-# refusal is a role holding SYSTEM PRIVILEGES - carrying its zeroed
-# block would silently DISARM it, so both sides refuse typed)
+# (~~a system-privileged role refuses~~ - the block rides verbatim
+# now; the representative refusal is an INDEX EXPRESSION this
+# restore cannot evaluate - refused typed, never a guessed key)
 rm -f "$D/fc-gbr-shb.fdb" "$D/fc-gbr-shb.fbk" "$D/fc-gbr-rshb.fdb" "$D/fc-gbr-boundary.shd"
 "$ISQL" -q -b -user "$U" -pas "$P" <<EOF >/dev/null 2>&1
 CREATE DATABASE '$D/fc-gbr-shb.fdb' USER '$U' PASSWORD '$P' PAGE_SIZE 8192;
 CREATE TABLE T (X INTEGER);
 COMMIT;
-CREATE TABLE P2 (AGE INTEGER);
+CREATE TABLE P2 (AGE INTEGER, S VARCHAR(8));
 COMMIT;
-CREATE ROLE R_SYS SET SYSTEM PRIVILEGES TO USER_MANAGEMENT;
+CREATE INDEX IXU ON P2 COMPUTED BY (UPPER(S));
 COMMIT;
 EOF
 # (the fixture name is FRESH each era on purpose: the server LINGERS a
@@ -280,9 +280,17 @@ EOF
 chmod 666 "$D/fc-gbr-shb.fdb"
 svc "$EMGR" action_backup dbname "$D/fc-gbr-shb.fdb" bkp_file "$D/fc-gbr-shb.fbk" >/dev/null
 grab "$D/fc-gbr-shb.fbk"
-check "an fbk with a SYSTEM-PRIVILEGED role refuses fc's restore whole" \
-    "$(svc "$FMGR" action_restore dbname "$D/fc-gbr-rshb.fdb" bkp_file "$D/fc-gbr-shb.fbk")" \
-    "feature is not supported|rc=1"
+# the refusal here is DISCOVERED AT BUILD TIME (the expression BLR
+# decodes only in the executor), so it wears the mid-build error
+# shape, not the reader's typed refusal - what matters is rc=1 and
+# no half-restored database (the next check)
+ran=$((ran + 1))
+fo=$(svc "$FMGR" action_restore dbname "$D/fc-gbr-rshb.fdb" bkp_file "$D/fc-gbr-shb.fbk")
+if [ "${fo##*rc=}" = "1" ]; then
+    echo "OK   an fbk whose index expression this restore cannot evaluate refuses whole"
+else
+    echo "DIFF unevaluatable index expression should refuse: [$fo]"; fail=1
+fi
 ran=$((ran + 1))
 if [ ! -e "$D/fc-gbr-rshb.fdb" ]; then
     echo "OK   ...and no half-restored database is left behind"

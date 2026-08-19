@@ -418,6 +418,25 @@ if [ "$got" = "2" ]; then
 else
     echo "DIFF roles after engine restore: match-count [$got] (want 2)"; fail=1
 fi
+ran=$((ran + 1))
+"$ISQL" -q -b -user "$U" -pas "$P" <<EOF >/dev/null 2>&1
+CONNECT '$RLDB' USER '$U' PASSWORD '$P';
+CREATE ROLE R_SYS SET SYSTEM PRIVILEGES TO USER_MANAGEMENT, TRACE_ANY_ATTACHMENT;
+COMMIT;
+EOF
+rm -f "$D/fc-gbak-rl2.fbk" "$D/fc-gbak-rlr2.fdb"
+svc_backup "$FMGR" "$RLDB" "$D/fc-gbak-rl2.fbk" >/dev/null
+sudo -n chmod 666 "$D/fc-gbak-rl2.fbk" 2>/dev/null || chmod 666 "$D/fc-gbak-rl2.fbk" 2>/dev/null
+"$FBSVCMGR" "$EMGR" user "$U" password "$P" action_restore dbname "$D/fc-gbak-rlr2.fdb" bkp_file "$D/fc-gbak-rl2.fbk" >/dev/null 2>&1
+grab "$D/fc-gbak-rlr2.fdb"
+got=$(printf "SELECT RDB\$SYSTEM_PRIVILEGES FROM RDB\$ROLES WHERE RDB\$ROLE_NAME='R_SYS';\n" |
+    "$ISQL" -q -b -user "$U" -pas "$P" "$D/fc-gbak-rlr2.fdb" 2>&1 | grep -c '4200000000000000')
+if [ "$got" = "1" ]; then
+    echo "OK   ...and a role's SYSTEM PRIVILEGES block rides BIT-IDENTICAL (0x42)"
+else
+    echo "DIFF system-privileges block after engine restore: match-count [$got] (want 1)"; fail=1
+fi
+rm -f "$D/fc-gbak-rl2.fbk" "$D/fc-gbak-rlr2.fdb"
 rm -f "$RLDB" "$D/fc-gbak-rl.fbk" "$D/fc-gbak-rlr.fdb"
 
 # PACKAGES RIDE (rec 38 + members as ordinary records with the package

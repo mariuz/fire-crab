@@ -234,10 +234,15 @@ whole when the shadow file already exists — the engine's own
 "File exists" semantic, minus its half-restored wreckage.
 Multi-file databases refuse typed (FB6 dropped the DDL; a
 non-shadow RDB$FILES row cannot be fixtured but cannot silently
-drop either). **The gbak surface has no named refusals left** —
-the standing fail-closed representative is a role holding SYSTEM
-PRIVILEGES, refused typed on both sides because carrying its
-zeroed block would silently disarm it.
+drop either). ~~A system-privileged role refuses~~ — the BLOCK RIDES
+VERBATIM now (gbak 58): the CHAR(8) OCTETS bitmask travels the
+byte-carrier text decode reversibly (one char per byte), lands
+bit-identical through both restores (0x42 = USER_MANAGEMENT |
+TRACE_ANY_ATTACHMENT, measured), and the old carry-zeros-and-disarm
+hazard is gone because the real bits are what land. **The gbak
+surface has no named refusals left** — the standing fail-closed
+representative is an index expression this restore cannot evaluate,
+refused whole at build time rather than keyed by a guess.
 
 The subsystem map's rows fall into three states, and the difference
 matters more than the row count:

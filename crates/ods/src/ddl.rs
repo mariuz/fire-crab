@@ -9109,7 +9109,12 @@ fn find_role(file: &crate::Image, page_size: usize, name: &str) -> Option<(i64, 
 /// and CREATE ROLE writes it as eight ZERO bytes (an empty system-privilege
 /// bitmask) - not NULL, and not the spaces a text CHAR would pad with, so
 /// it needs [SysVal::O].
-pub fn create_role(file: &mut crate::Image, page_size: usize, name: &str) -> Result<(), String> {
+pub fn create_role(
+    file: &mut crate::Image,
+    page_size: usize,
+    name: &str,
+    sys_privileges: &[u8],
+) -> Result<(), String> {
     let want = name.trim().trim_matches('"').to_ascii_uppercase();
     if want.is_empty() {
         return Err("a role needs a name".into());
@@ -9130,7 +9135,7 @@ pub fn create_role(file: &mut crate::Image, page_size: usize, name: &str) -> Res
             ("RDB$OWNER_NAME", SysVal::S(OWNER)),
             ("RDB$SECURITY_CLASS", SysVal::S(&class)),
             ("RDB$SYSTEM_FLAG", SysVal::I(0)),
-            ("RDB$SYSTEM_PRIVILEGES", SysVal::O(&[])),
+            ("RDB$SYSTEM_PRIVILEGES", SysVal::O(sys_privileges)),
         ],
     )?;
     advance_oldest_transactions(file, page_size)

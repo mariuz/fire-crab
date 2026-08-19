@@ -3177,8 +3177,8 @@ fn run_gbak_restore_core(
         }
         // the SQL ROLES - independent of everything, grants to them
         // stay in the privilege set-aside (the recorded difference)
-        for name in &restored.roles {
-            fire_crab_ods::ddl::create_role(&mut file, page_size, name)?;
+        for (name, block) in &restored.roles {
+            fire_crab_ods::ddl::create_role(&mut file, page_size, name, block)?;
         }
         // EXCEPTIONS first - nothing references them at restore time,
         // and create_exception's own counter numbers them in file
@@ -19225,7 +19225,7 @@ fn execute_dml_collecting_inner(
             (0, 0, 0)
         }
         Plan::CreateRole { name } => {
-            fire_crab_ods::ddl::create_role(&mut work, db.page_size, name)?;
+            fire_crab_ods::ddl::create_role(&mut work, db.page_size, name, &[])?;
             (0, 0, 0)
         }
         Plan::DropRole { name } => {

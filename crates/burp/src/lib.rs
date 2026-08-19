@@ -1418,7 +1418,7 @@ pub fn write_backup_verbose(
             .end();
     }
     log.push("gbak:writing SQL roles".into());
-    for (name, owner) in read_roles(image, page_size)? {
+    for (name, owner, block) in read_roles(image, page_size)? {
         log.push(format!("gbak:    writing SQL role: \"{}\"", name));
         let mut r = Rec::new(&mut out, rec::SQL_ROLES)
             .text(1, &name)
@@ -1431,7 +1431,7 @@ pub fn write_backup_verbose(
         ) {
             r = r.blob(3, &d); // att_role_description
         }
-        r.bytes(4, &[0u8; 8]).end();
+        r.bytes(4, &block).end();
     }
     log.push("gbak:writing names mapping".into());
     for m in read_mappings(image, page_size)? {
@@ -2962,14 +2962,13 @@ fn read_mappings(
     Ok(out)
 }
 
-/// The user SQL ROLES: name and owner. The record's att 4 is the
-/// CHAR(8) OCTETS system-privilege block, a plain u8-length attribute;
-/// a role that actually HOLDS system privileges refuses typed - this
-/// writer emits the eight zero bytes a plain CREATE ROLE owns.
+/// The user SQL ROLES: name, owner, and the CHAR(8) OCTETS
+/// system-privilege block VERBATIM (an OCTETS column decodes one char
+/// per byte - reversible - so the bits survive the Value::Text trip).
 fn read_roles(
     image: &fire_crab_ods::Image,
     page_size: usize,
-) -> Result<Vec<(String, String)>, Refused> {
+) -> Result<Vec<(String, String, [u8; 8])>, Refused> {
     let Some((cols, rows)) = sys_rows(image, page_size, "RDB$ROLES") else {
         return Ok(Vec::new());
     };
@@ -2983,17 +2982,15 @@ fn read_roles(
             continue;
         }
         let Some(name) = text_opt(r, at("RDB$ROLE_NAME")) else { continue };
+        let mut block = [0u8; 8];
         if let Some(fire_crab_ods::format::Value::Text(t)) =
             at("RDB$SYSTEM_PRIVILEGES").and_then(|i| r.values.get(i))
         {
-            if t.bytes().any(|b| b != 0 && b != b' ') {
-                return Err(Refused(format!(
-                    "role {} holds SYSTEM PRIVILEGES - outside this backup's surface",
-                    name
-                )));
+            for (i, c) in t.chars().take(8).enumerate() {
+                block[i] = (c as u32).min(0xFF) as u8;
             }
         }
-        out.push((name, text_opt(r, at("RDB$OWNER_NAME")).unwrap_or_default()));
+        out.push((name, text_opt(r, at("RDB$OWNER_NAME")).unwrap_or_default(), block));
     }
     Ok(out)
 }
@@ -3319,8 +3316,8 @@ pub struct Restored {
     pub exceptions: Vec<(String, String)>,
     /// the carried PSQL functions, file order
     pub functions: Vec<RFunc>,
-    /// the user SQL roles, file order
-    pub roles: Vec<String>,
+    /// the user SQL roles: (name, SYSTEM PRIVILEGES block), file order
+    pub roles: Vec<(String, Vec<u8>)>,
     /// domains carrying a COMPUTED expression (an expression view
     /// column's), by name
     pub domain_computed: Vec<(String, Vec<u8>)>,
@@ -4480,19 +4477,12 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                         String::from_utf8_lossy(&d).into_owned(),
                     ));
                 }
-                if let Some(pv) = att(&atts, 4) {
-                    if pv.data.iter().any(|b| *b != 0) {
-                        return Err(Refused(
-                            "a role with SYSTEM PRIVILEGES is outside this restore's surface"
-                                .into(),
-                        ));
-                    }
-                }
-                out.roles.push(
+                out.roles.push((
                     att(&atts, 1)
                         .map(|a| a.text())
                         .ok_or_else(|| Refused("a role with no name".into()))?,
-                );
+                    att(&atts, 4).map(|a| a.data.clone()).unwrap_or_default(),
+                ));
             }
             rec::GENERATOR => {
                 const DESC_TAG: u8 = 4;
