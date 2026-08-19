@@ -7984,6 +7984,8 @@ pub struct ProcParamDef {
     pub length: u16,
     pub scale: i16,
     pub sub_type: i16,
+    /// a parameter DEFAULT: (value BLR verbatim, `= 7` source text)
+    pub default: Option<(Vec<u8>, String)>,
 }
 
 /// `CREATE PROCEDURE` - the catalog rows the engine writes, measured
@@ -8127,6 +8129,17 @@ pub fn create_procedure(
             ];
             if let Some((pk, _)) = package {
                 prm_vals.push(("RDB$PACKAGE_NAME", SysVal::S(pk)));
+            }
+            let def_blobs = match &p.default {
+                Some((blr, src)) => Some((
+                    dml::insert_blob(file, page_size, pprel, &[blr.clone()], 2)?,
+                    dml::insert_blob_cs(file, page_size, pprel, &[src.as_bytes().to_vec()], 1, 4)?,
+                )),
+                None => None,
+            };
+            if let Some((vb, sb)) = def_blobs {
+                prm_vals.push(("RDB$DEFAULT_VALUE", SysVal::B(blob_id_bytes(pprel, vb))));
+                prm_vals.push(("RDB$DEFAULT_SOURCE", SysVal::B(blob_id_bytes(pprel, sb))));
             }
             sys_insert(
                 file,
@@ -8292,6 +8305,8 @@ pub struct FnArgDef {
     pub scale: i16,
     pub sub_type: i16,
     pub null_flag: bool,
+    /// an argument DEFAULT: (value BLR verbatim, `= 42` source text)
+    pub default: Option<(Vec<u8>, String)>,
 }
 
 /// Restore a carried PSQL function: the `RDB$FUNCTIONS` row with the
@@ -8437,6 +8452,17 @@ pub fn restore_carried_function(
         }
         if let Some((pk, _)) = package {
             avals.push(("RDB$PACKAGE_NAME", SysVal::S(pk)));
+        }
+        let def_blobs = match &a.default {
+            Some((blr, src)) => Some((
+                dml::insert_blob(file, page_size, arel, &[blr.clone()], 2)?,
+                dml::insert_blob_cs(file, page_size, arel, &[src.as_bytes().to_vec()], 1, 4)?,
+            )),
+            None => None,
+        };
+        if let Some((vb, sb)) = def_blobs {
+            avals.push(("RDB$DEFAULT_VALUE", SysVal::B(blob_id_bytes(arel, vb))));
+            avals.push(("RDB$DEFAULT_SOURCE", SysVal::B(blob_id_bytes(arel, sb))));
         }
         sys_insert(file, page_size, "RDB$FUNCTION_ARGUMENTS", arel, &avals)?;
     }

@@ -158,9 +158,17 @@ the RUNTIME's RSR_validation_blr segment (7), NOT from the domain
 row — a byte-identical catalog with no segment let CHECK (VALUE>0)
 take -5 — so both runtime builders (create_table's inline one and
 update_relation_runtime) now emit the domain's validation BLR
-beside the default it already carried. What still refuses is typed
-(argument DEFAULTs, expression indexes — and the permanent
-boundaries, external tables and external functions).
+beside the default it already carried. ~~Argument DEFAULTs refuse~~ — they RIDE (gbak 44): a
+function argument's DEFAULT as rec-16 atts 13/14, a procedure
+parameter's as rec-28 atts 7/8, value BLR and `= 42` source
+verbatim onto the restored rows, applied by the engine on
+argument-less calls both directions. Two found bugs closed with the
+flip: the parameter reader would have DESYNCED on atts 7/8 (never
+framed), and the writer silently DROPPED parameter defaults — an
+argument-less call after a restore would have errored where the
+original answered. What still refuses is typed (expression indexes
+— and the permanent boundaries, external tables and external
+functions).
 
 The subsystem map's rows fall into three states, and the difference
 matters more than the row count:

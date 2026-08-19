@@ -3478,6 +3478,7 @@ fn run_gbak_restore_core(
                     length: *len as u16,
                     scale: *sc as i16,
                     sub_type: *st as i16,
+                    default: pp.default.clone(),
                 })
             };
             let mut ins = Vec::new();
@@ -3526,6 +3527,7 @@ fn run_gbak_restore_core(
                     scale: *sc as i16,
                     sub_type: *st as i16,
                     null_flag: a.null_flag,
+                    default: a.default.clone(),
                 });
             }
             args.sort_by_key(|a| a.position);
@@ -13682,6 +13684,7 @@ fn plan_create_procedure(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
     }
     let c = fire_crab_dsql::compile_procedure_full(sql)?;
     let conv = |m: &fire_crab_dsql::ProcParamMeta| fire_crab_ods::ddl::ProcParamDef {
+        default: None,
         name: m.name.clone(),
         field_type: m.field_type,
         length: m.length,

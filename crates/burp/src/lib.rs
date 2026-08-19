@@ -958,6 +958,12 @@ pub fn write_backup_verbose(
                 ar = ar.text(11, an);
             }
             ar = ar.text(22, "PUBLIC").text(12, &dom);
+            if let Some((blr, src)) = &a.default {
+                ar = ar.blob(13, blr);
+                if !src.is_empty() {
+                    ar = ar.blob(14, src);
+                }
+            }
             if let Some(nf) = a.null_flag {
                 ar = ar.int(16, nf as i32);
             }
@@ -1020,8 +1026,14 @@ pub fn write_backup_verbose(
                 .int(2, pp.number)
                 .int(3, pp.ptype)
                 .text(14, "PUBLIC")
-                .text(4, &dom)
-                .int(11, 0);
+                .text(4, &dom);
+            if let Some((blr, src)) = &pp.default {
+                r = r.blob(7, blr);
+                if !src.is_empty() {
+                    r = r.blob(8, src);
+                }
+            }
+            r = r.int(11, 0);
             if let Some(d) = catalog_description(
                 image,
                 page_size,
@@ -1987,6 +1999,9 @@ struct UProcParam {
     length: i64,
     scale: i64,
     sub_type: i64,
+    /// DEFAULT: (value BLR, NUL-terminated `= 7` source) - dropping it
+    /// silently would change every argument-less call after a restore
+    default: Option<(Vec<u8>, Vec<u8>)>,
 }
 
 /// A user PSQL function off the source catalog: header facts, the two
@@ -2019,6 +2034,8 @@ struct UFnArg {
     length: i64,
     scale: i64,
     sub_type: i64,
+    /// DEFAULT: (value BLR, NUL-terminated `= 42` source)
+    default: Option<(Vec<u8>, Vec<u8>)>,
 }
 
 fn read_functions(
@@ -2075,12 +2092,22 @@ fn read_functions(
             if matches!(aint(r, aat("RDB$SYSTEM_FLAG")), Some(f) if f != 0) {
                 continue;
             }
-            if has_blob(r, aat("RDB$DEFAULT_VALUE")) || has_blob(r, aat("RDB$DEFAULT_SOURCE")) {
-                return Err(Refused(format!(
-                    "function {}: an argument DEFAULT is outside this backup's surface",
-                    fn_name
-                )));
-            }
+            let arel = fire_crab_ods::resolve_relation(image, page_size, "RDB$FUNCTION_ARGUMENTS");
+            let blob_of = |i: Option<usize>, nul: bool| -> Option<Vec<u8>> {
+                match (arel, i.and_then(|i| r.values.get(i))) {
+                    (Some(rel), Some(fire_crab_ods::format::Value::Blob(_, num))) => {
+                        fire_crab_blb::read_blob_content(image, page_size, rel, *num).map(|mut d| {
+                            if nul {
+                                d.push(0);
+                            }
+                            d
+                        })
+                    }
+                    _ => None,
+                }
+            };
+            let default = blob_of(aat("RDB$DEFAULT_VALUE"), false)
+                .map(|b| (b, blob_of(aat("RDB$DEFAULT_SOURCE"), true).unwrap_or_default()));
             let src = text_opt(r, aat("RDB$FIELD_SOURCE")).unwrap_or_default();
             let f = field_type_of(image, page_size, &src).ok_or_else(|| {
                 Refused(format!("function {}: argument domain {} is unreadable", fn_name, src))
@@ -2102,6 +2129,7 @@ fn read_functions(
                 length: f.1,
                 scale: f.2,
                 sub_type: f.3,
+                default,
             });
         }
         out.sort_by_key(|a| a.position);
@@ -2198,6 +2226,23 @@ fn read_procedures(
                 continue;
             }
             let Some(name) = text_opt(r, pat("RDB$PARAMETER_NAME")) else { continue };
+            let pprel =
+                fire_crab_ods::resolve_relation(image, page_size, "RDB$PROCEDURE_PARAMETERS");
+            let blob_of = |i: Option<usize>, nul: bool| -> Option<Vec<u8>> {
+                match (pprel, i.and_then(|i| r.values.get(i))) {
+                    (Some(rel), Some(fire_crab_ods::format::Value::Blob(_, num))) => {
+                        fire_crab_blb::read_blob_content(image, page_size, rel, *num).map(|mut d| {
+                            if nul {
+                                d.push(0);
+                            }
+                            d
+                        })
+                    }
+                    _ => None,
+                }
+            };
+            let default = blob_of(pat("RDB$DEFAULT_VALUE"), false)
+                .map(|b| (b, blob_of(pat("RDB$DEFAULT_SOURCE"), true).unwrap_or_default()));
             let src = text_opt(r, pat("RDB$FIELD_SOURCE")).unwrap_or_default();
             let f = field_type_of(image, page_size, &src).ok_or_else(|| {
                 Refused(format!("parameter {}: its domain {} is unreadable", name, src))
@@ -2210,6 +2255,7 @@ fn read_procedures(
                 length: f.1,
                 scale: f.2,
                 sub_type: f.3,
+                default,
             });
         }
         out.sort_by_key(|p| (p.ptype, p.number));
@@ -2961,6 +3007,8 @@ pub struct RProc {
 }
 
 pub struct RProcParam {
+    /// DEFAULT: (value BLR verbatim, `= 7` source text)
+    pub default: Option<(Vec<u8>, String)>,
     pub name: String,
     pub number: i32,
     /// 0 = input, 1 = output
@@ -2990,6 +3038,8 @@ pub struct RFnArg {
     pub name: Option<String>,
     pub source: String,
     pub null_flag: bool,
+    /// DEFAULT: (value BLR verbatim, `= 42` source text)
+    pub default: Option<(Vec<u8>, String)>,
 }
 
 pub struct RTrigger {
@@ -3453,6 +3503,8 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                 let mut fname = String::new();
                 let mut source = String::new();
                 let mut null_flag = false;
+                let mut def_blr: Option<Vec<u8>> = None;
+                let mut def_src: Option<Vec<u8>> = None;
                 loop {
                     let tag = *f
                         .get(at)
@@ -3479,15 +3531,18 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                         v
                     };
                     match tag {
-                        13 | 14 => {
-                            return Err(Refused(format!(
-                                "function {}: an argument DEFAULT is outside this restore's surface",
-                                fname
-                            )));
-                        }
-                        20 => {
+                        13 | 14 | 20 => {
                             let n = as_int(&data) as usize;
-                            at += n; // description set aside
+                            let raw = f
+                                .get(at..at + n)
+                                .ok_or_else(|| Refused("truncated argument blob".into()))?
+                                .to_vec();
+                            at += n;
+                            match tag {
+                                13 => def_blr = Some(raw),
+                                14 => def_src = Some(raw),
+                                _ => {} // description set aside
+                            }
                         }
                         1 => fname = String::from_utf8_lossy(&data).into_owned(),
                         2 => position = as_int(&data),
@@ -3506,7 +3561,16 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                 let fu = out.functions.last_mut().ok_or_else(|| {
                     Refused(format!("an argument for {} with no function before it", fname))
                 })?;
-                fu.args.push(RFnArg { position, name: aname, source, null_flag });
+                let strip = |v: Option<Vec<u8>>| {
+                    v.map(|mut d| {
+                        if d.last() == Some(&0) {
+                            d.pop();
+                        }
+                        String::from_utf8_lossy(&d).into_owned()
+                    })
+                };
+                let default = def_blr.map(|b| (b, strip(def_src).unwrap_or_default()));
+                fu.args.push(RFnArg { position, name: aname, source, null_flag, default });
             }
             rec::FUNCTION_END => {}
             rec::PROCEDURE => {
@@ -3613,7 +3677,7 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
             }
             rec::PROCEDURE_PRM => {
                 const DESC_TAG: u8 = 6;
-                let (atts, blobs) = read_atts_blob(f, &mut at, &[DESC_TAG])?;
+                let (atts, blobs) = read_atts_blob(f, &mut at, &[5, DESC_TAG, 7, 8])?;
                 let parent = out
                     .procedures
                     .last()
@@ -3632,7 +3696,27 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                 let pr = out.procedures.last_mut().ok_or_else(|| {
                     Refused("a procedure parameter outside a procedure".into())
                 })?;
+                let strip = |v: Option<&Vec<u8>>| {
+                    v.map(|d| {
+                        let mut d = d.clone();
+                        if d.last() == Some(&0) {
+                            d.pop();
+                        }
+                        String::from_utf8_lossy(&d).into_owned()
+                    })
+                };
+                let default = blobs
+                    .iter()
+                    .find(|(t, _)| *t == 7)
+                    .map(|(_, b)| {
+                        (
+                            b.clone(),
+                            strip(blobs.iter().find(|(t, _)| *t == 8).map(|(_, b)| b))
+                                .unwrap_or_default(),
+                        )
+                    });
                 pr.params.push(RProcParam {
+                    default,
                     name: att(&atts, 1)
                         .map(|a| a.text())
                         .ok_or_else(|| Refused("a parameter with no name".into()))?,

@@ -345,6 +345,8 @@ COMMIT;
 SET TERM ^;
 CREATE FUNCTION FDOUBLE (A INTEGER) RETURNS INTEGER AS BEGIN RETURN A * 2; END^
 CREATE FUNCTION FCAT (S VARCHAR(10), N INTEGER NOT NULL) RETURNS VARCHAR(40) DETERMINISTIC AS BEGIN RETURN S || ':' || N; END^
+CREATE FUNCTION FDEF (A INTEGER = 42) RETURNS INTEGER AS BEGIN RETURN A; END^
+CREATE PROCEDURE PDEF (B INTEGER = 7) RETURNS (C INTEGER) AS BEGIN C = B; SUSPEND; END^
 SET TERM ;^
 COMMIT;
 EOF
@@ -374,6 +376,14 @@ if [ "$got" = "1" ]; then
     echo "OK   ...and the argument's NOT NULL validates with its carried NAME"
 else
     echo "DIFF function NOT NULL arg after engine restore: match-count [$got] (want 1)"; fail=1
+fi
+ran=$((ran + 1))
+got=$(printf "SELECT FDEF() || '/' || (SELECT C FROM PDEF) FROM RDB\$DATABASE;\n" |
+    "$ISQL" -q -b -user "$U" -pas "$P" "$D/fc-gbak-fnr.fdb" 2>&1 | grep -c "42/7")
+if [ "$got" = "1" ]; then
+    echo "OK   ...and the argument and parameter DEFAULTS apply on argument-less calls (42/7)"
+else
+    echo "DIFF argument DEFAULTs after engine restore: match-count [$got] (want 1)"; fail=1
 fi
 rm -f "$FNDB" "$D/fc-gbak-fn.fbk" "$D/fc-gbak-fnr.fdb"
 
