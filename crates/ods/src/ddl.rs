@@ -4369,7 +4369,7 @@ pub fn set_index_statistics(
         return Err(format!("index {} has no segments", want));
     }
     let sel = index_selectivity(file, page_size, rel, &segs, descending)?;
-    write_index_statistics(file, page_size, rel, slot, &want, &sel)?;
+    write_index_statistics(file, page_size, rel, slot, &want, &sel, true)?;
     advance_oldest_transactions(file, page_size)
 }
 
@@ -4492,7 +4492,7 @@ pub fn alter_index_active(
         ],
     )?;
     let sel = index_selectivity(file, page_size, rel, &segs, descending)?;
-    write_index_statistics(file, page_size, rel, slot, &want, &sel)?;
+    write_index_statistics(file, page_size, rel, slot, &want, &sel, true)?;
     advance_oldest_transactions(file, page_size)
 }
 
@@ -5599,7 +5599,112 @@ pub fn create_index(
     // the selectivity the engine computes at build time and keeps in
     // three places
     let sel = index_selectivity(file, page_size, rel, &segs, descending)?;
-    write_index_statistics(file, page_size, rel, slot, index_name, &sel)
+    write_index_statistics(file, page_size, rel, slot, index_name, &sel, true)
+}
+
+/// `CREATE INDEX ... COMPUTED BY (<expr>)` from a CARRIED expression:
+/// the RDB$INDICES row keeps the engine's BLR and source verbatim
+/// (segment count 0, no segment rows), the irt repeat takes
+/// IRT_EXPRESSION with ONE key descriptor of the expression's result
+/// type, and the backfill keys every committed row on `eval`'s answer -
+/// the CALLER evaluates the expression (the BLR walker lives with the
+/// executor), this writer only builds what it is handed.
+#[allow(clippy::too_many_arguments)]
+pub fn create_expression_index(
+    file: &mut crate::Image,
+    page_size: usize,
+    table: &str,
+    index_name: &str,
+    unique: bool,
+    descending: bool,
+    key_itype: u16,
+    expr_blr: &[u8],
+    expr_source: &str,
+    eval: &mut dyn FnMut(&[Value]) -> Result<Value, String>,
+) -> Result<(), String> {
+    let rel = crate::resolve_relation(file, page_size, table)
+        .ok_or_else(|| format!("table {} not found", table))?;
+    if rel < 128 {
+        return Err("system relations are read-only".into());
+    }
+    if index_name_taken(file, page_size, index_name)? {
+        return Err(format!("index {} already exists", index_name));
+    }
+    let formats = crate::relation_formats(file, page_size, rel);
+    let (_, descs) = formats
+        .iter()
+        .max_by_key(|(n, _)| *n)
+        .map(|(n, d)| (*n, d.clone()))
+        .ok_or("relation has no format")?;
+    let segs: Vec<(u16, u16, i8)> = vec![(0, key_itype, 0)];
+    let mut iflags = btw::IRT_EXPRESSION;
+    if unique {
+        iflags |= btw::IRT_UNIQUE;
+    }
+    if descending {
+        iflags |= btw::IRT_DESCENDING;
+    }
+    let slot = allocate_index_slot(file, page_size, rel, &segs, iflags)?;
+    let irel = crate::resolve_relation(file, page_size, "RDB$INDICES")
+        .ok_or("no RDB$INDICES relation")?;
+    let blr_blob = dml::insert_blob(file, page_size, irel, &[expr_blr.to_vec()], 2)?;
+    let src_blob =
+        dml::insert_blob_cs(file, page_size, irel, &[expr_source.as_bytes().to_vec()], 1, 4)?;
+    let table_upper = table.to_ascii_uppercase();
+    sys_row_by_name(file, page_size, "RDB$INDICES", &[
+        ("RDB$INDEX_NAME", SysVal::S(index_name)),
+        ("RDB$RELATION_NAME", SysVal::S(&table_upper)),
+        ("RDB$INDEX_ID", SysVal::I(slot as i64 + 1)),
+        ("RDB$UNIQUE_FLAG", SysVal::I(if unique { 1 } else { 0 })),
+        ("RDB$SEGMENT_COUNT", SysVal::I(0)),
+        ("RDB$SYSTEM_FLAG", SysVal::I(0)),
+        ("RDB$INDEX_INACTIVE", SysVal::I(0)),
+        ("RDB$INDEX_TYPE", SysVal::I(if descending { 1 } else { 0 })),
+        ("RDB$EXPRESSION_BLR", SysVal::B(blob_id_bytes(irel, blr_blob))),
+        ("RDB$EXPRESSION_SOURCE", SysVal::B(blob_id_bytes(irel, src_blob))),
+        ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
+    ])?;
+    // backfill on the EVALUATED expression, one key per committed row
+    let recs = max_recs_per_dp(page_size);
+    let mut distinct: Vec<Vec<u8>> = Vec::new();
+    let mut total = 0u64;
+    for dp_no in relation_data_pages(file, page_size, rel) {
+        let Some(dp) = crate::page_at(file, page_size, dp_no).and_then(DataPage::decode) else {
+            continue;
+        };
+        let seq = dp.sequence as u64;
+        let rows: Vec<(u16, Vec<Value>)> = dp
+            .records()
+            .filter(|r| r.is_primary_record())
+            .filter_map(|r| {
+                crate::data::assembled_image(file, page_size, &r)
+                    .map(|img| (r.slot, decode_record(&img, &descs)))
+            })
+            .collect();
+        for (line, values) in rows {
+            let recno = seq * recs + line as u64;
+            let v = eval(&values)?;
+            let key_segs = [btw::KeySeg { itype: key_itype, value: &v, scale: 0, charset: 0 }];
+            let (key, all_null) = btw::build_index_key(&key_segs, descending)
+                .ok_or("unsupported value for an expression index key")?;
+            btw::insert_index_entry(
+                file,
+                page_size,
+                rel,
+                slot as u8,
+                &key,
+                recno,
+                unique && !all_null,
+                descending,
+            )?;
+            total += 1;
+            if !distinct.contains(&key) {
+                distinct.push(key);
+            }
+        }
+    }
+    let sel = if total == 0 { 0.0 } else { 1.0 / distinct.len().max(1) as f32 };
+    write_index_statistics(file, page_size, rel, slot, index_name, &[sel], false)
 }
 
 /// Take the first free index-root slot for a new index of `rel`: the
@@ -6212,6 +6317,9 @@ fn write_index_statistics(
     slot: usize,
     index_name: &str,
     selectivity: &[f32],
+    // false for an EXPRESSION index: it has no RDB$INDEX_SEGMENTS rows
+    // to carry per-segment statistics
+    segment_rows: bool,
 ) -> Result<(), String> {
     let irt_page = file
         .pages()
@@ -6232,15 +6340,17 @@ fn write_index_statistics(
     let seg_pos = sys_fid(file, page_size, "RDB$INDEX_SEGMENTS", "RDB$FIELD_POSITION")?;
     let seg_rel = crate::resolve_relation(file, page_size, "RDB$INDEX_SEGMENTS")
         .ok_or("no RDB$INDEX_SEGMENTS relation")?;
-    for (i, sel) in selectivity.iter().enumerate() {
-        patch_sys_row(
-            file,
-            page_size,
-            "RDB$INDEX_SEGMENTS",
-            seg_rel,
-            |v| text_eq(v.get(seg_name), index_name) && int_eq(v.get(seg_pos), i as i64),
-            &[("RDB$STATISTICS", SysVal::F(*sel as f64))],
-        )?;
+    if segment_rows {
+        for (i, sel) in selectivity.iter().enumerate() {
+            patch_sys_row(
+                file,
+                page_size,
+                "RDB$INDEX_SEGMENTS",
+                seg_rel,
+                |v| text_eq(v.get(seg_name), index_name) && int_eq(v.get(seg_pos), i as i64),
+                &[("RDB$STATISTICS", SysVal::F(*sel as f64))],
+            )?;
+        }
     }
     let ix_name = sys_fid(file, page_size, "RDB$INDICES", "RDB$INDEX_NAME")?;
     let whole = *selectivity.last().unwrap_or(&0.0);

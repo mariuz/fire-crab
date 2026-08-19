@@ -166,9 +166,21 @@ argument-less calls both directions. Two found bugs closed with the
 flip: the parameter reader would have DESYNCED on atts 7/8 (never
 framed), and the writer silently DROPPED parameter defaults — an
 argument-less call after a restore would have errored where the
-original answered. What still refuses is typed (expression indexes
-— and the permanent boundaries, external tables and external
-functions).
+original answered. ~~Expression indexes refuse~~ — they RIDE (gbak 46), the
+typed tail's last carryable slice: the rec-5 record's atts 10/11
+(source + BLR verbatim), the irt repeat taking IRT_EXPRESSION with
+one key descriptor of the expression's result type, and the
+backfill keying every committed row on the EVALUATED expression —
+the restore decodes the carried BLR (BVal grew integer arithmetic,
+blr 34–37) and hands the ddl builder an evaluator closure; the BLR
+walker stays with the executor, the writer only builds what it is
+handed. The ENGINE plans through fc's restored index and MAINTAINS
+it on live inserts, gfix-clean. Partial (WHERE-conditioned) indexes
+refuse typed; an expression this restore cannot evaluate refuses
+typed rather than guessing a key. What still refuses is exactly the
+PERMANENT boundary set: external tables and external functions,
+whose data and code live outside the file — an external function
+declaration is gbakrestore's standing fail-closed representative.
 
 The subsystem map's rows fall into three states, and the difference
 matters more than the row count:

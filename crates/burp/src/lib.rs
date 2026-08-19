@@ -1128,6 +1128,12 @@ pub fn write_backup_verbose(
                 r = r.text(5, seg);
             }
             r = r.int(7, ix.itype);
+            if let Some((blr, src)) = &ix.expression {
+                if !src.is_empty() {
+                    r = r.blob(10, src); // att_index_expression_source
+                }
+                r = r.blob(11, blr); // att_index_expression_blr
+            }
             if let Some(partner) = &ix.foreign {
                 r = r.text(14, "PUBLIC").text(8, partner);
             }
@@ -1365,6 +1371,8 @@ struct UIndex {
     segments: Vec<String>,
     /// the PARTNER index of a FOREIGN KEY's index (RDB$FOREIGN_KEY)
     foreign: Option<String>,
+    /// an EXPRESSION index: (BLR verbatim, NUL-terminated source)
+    expression: Option<(Vec<u8>, Vec<u8>)>,
 }
 
 #[derive(PartialEq)]
@@ -1560,7 +1568,10 @@ fn read_indexes(image: &fire_crab_ods::Image, page_size: usize) -> Result<Vec<UI
     let inactive_at = at("RDB$INDEX_INACTIVE");
     let fk_at = at("RDB$FOREIGN_KEY");
     let expr_at = at("RDB$EXPRESSION_BLR");
+    let expr_src_at = at("RDB$EXPRESSION_SOURCE");
+    let cond_at = at("RDB$CONDITION_BLR");
     let flag_at = at("RDB$SYSTEM_FLAG");
+    let irel = fire_crab_ods::resolve_relation(image, page_size, "RDB$INDICES");
     let text = |r: &fire_crab_ods::tra::VisibleRow, i: usize| match r.values.get(i) {
         Some(fire_crab_ods::format::Value::Text(t)) => t.trim_end().to_string(),
         _ => String::new(),
@@ -1605,14 +1616,30 @@ fn read_indexes(image: &fire_crab_ods::Image, page_size: usize) -> Result<Vec<UI
             )));
         }
         if matches!(
-            expr_at.and_then(|i| r.values.get(i)),
+            cond_at.and_then(|i| r.values.get(i)),
             Some(fire_crab_ods::format::Value::Blob(..))
         ) {
             return Err(Refused(format!(
-                "index {} is an EXPRESSION index - outside this backup's surface",
+                "index {} is PARTIAL (a WHERE condition) - outside this backup's surface",
                 name
             )));
         }
+        // an EXPRESSION index rides whole: its BLR and source verbatim
+        let blob_of = |i: Option<usize>, nul: bool| -> Option<Vec<u8>> {
+            match (irel, i.and_then(|i| r.values.get(i))) {
+                (Some(rel), Some(fire_crab_ods::format::Value::Blob(_, num))) => {
+                    fire_crab_blb::read_blob_content(image, page_size, rel, *num).map(|mut d| {
+                        if nul {
+                            d.push(0);
+                        }
+                        d
+                    })
+                }
+                _ => None,
+            }
+        };
+        let expression = blob_of(expr_at, false)
+            .map(|b| (b, blob_of(expr_src_at, true).unwrap_or_default()));
         let mut mine: Vec<(i64, String)> = segs
             .iter()
             .filter(|(ix, _, _)| ix == &name)
@@ -1626,6 +1653,7 @@ fn read_indexes(image: &fire_crab_ods::Image, page_size: usize) -> Result<Vec<UI
             itype: num(r, type_at) as i32,
             segments: mine.into_iter().map(|(_, f)| f).collect(),
             foreign,
+            expression,
         });
     }
     Ok(out)
@@ -2878,6 +2906,8 @@ pub struct RIndex {
     /// a FOREIGN KEY index's PARTNER index name (att 8) - such an
     /// index is built by the FK application, not the index backfill
     pub foreign: Option<String>,
+    /// an EXPRESSION index: (BLR verbatim, source text)
+    pub expression: Option<(Vec<u8>, String)>,
 }
 
 /// One restored table.
@@ -4189,7 +4219,29 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                 let t = data_rel
                     .ok_or_else(|| Refused("an index outside relation data".into()))?;
                 const DESC_TAG: u8 = 9;
-                let (atts, blobs) = read_atts_blob(f, &mut at, &[DESC_TAG])?;
+                let (atts, blobs) = read_atts_blob(f, &mut at, &[DESC_TAG, 10, 11, 12, 13])?;
+                if blobs.iter().any(|(t, _)| *t == 13) {
+                    return Err(Refused(
+                        "a PARTIAL index (a WHERE condition) is outside this restore's surface"
+                            .into(),
+                    ));
+                }
+                let strip = |v: Option<&Vec<u8>>| {
+                    v.map(|d| {
+                        let mut d = d.clone();
+                        if d.last() == Some(&0) {
+                            d.pop();
+                        }
+                        String::from_utf8_lossy(&d).into_owned()
+                    })
+                };
+                let expression = blobs.iter().find(|(t, _)| *t == 11).map(|(_, b)| {
+                    (
+                        b.clone(),
+                        strip(blobs.iter().find(|(t, _)| *t == 10).map(|(_, b)| b))
+                            .unwrap_or_default(),
+                    )
+                });
                 if let Some((_, d)) = blobs.iter().find(|(t, _)| *t == DESC_TAG) {
                     let mut d = d.clone();
                     if d.last() == Some(&0) { d.pop(); }
@@ -4206,7 +4258,7 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                     .filter(|a| a.tag == 5)
                     .map(|a| a.text())
                     .collect();
-                if segments.is_empty() {
+                if segments.is_empty() && expression.is_none() {
                     return Err(Refused("an index with no segments".into()));
                 }
                 let itype = att(&atts, 7).map(|a| a.int()).unwrap_or(0);
@@ -4221,6 +4273,7 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                     descending: itype == 1,
                     segments,
                     foreign: att(&atts, 8).map(|a| a.text()),
+                    expression,
                 });
             }
             rec::DATA => {

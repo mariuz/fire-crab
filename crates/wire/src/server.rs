@@ -3247,6 +3247,55 @@ fn run_gbak_restore_core(
                     // application below, once every table exists
                     continue;
                 }
+                if let Some((blr, src)) = &ix.expression {
+                    // an EXPRESSION index: decode the carried BLR, key
+                    // every row on its evaluated value. The columns
+                    // map by POSITION order - the same order the
+                    // ColumnDefs went to create_table, so the decoded
+                    // record's value indexes line up.
+                    let expr = parse_index_expression_blr(blr).ok_or_else(|| {
+                        format!(
+                            "index {}: an expression this restore cannot evaluate",
+                            ix.name
+                        )
+                    })?;
+                    let mut order: Vec<usize> = (0..t.cols.len()).collect();
+                    order.sort_by_key(|i| t.cols[*i].position);
+                    let colmap: Vec<(String, i32)> = order
+                        .iter()
+                        .enumerate()
+                        .map(|(rank, i)| (t.cols[*i].name.clone(), t.cols[*i].field_type))
+                        .map(|(n, ft)| (n, ft))
+                        .collect();
+                    let key_itype = infer_index_expr_itype(&expr, &colmap).ok_or_else(|| {
+                        format!(
+                            "index {}: an expression type this restore cannot key",
+                            ix.name
+                        )
+                    })?;
+                    let cm = colmap.clone();
+                    let ixname = ix.name.clone();
+                    fire_crab_ods::ddl::create_expression_index(
+                        &mut file,
+                        page_size,
+                        &t.name,
+                        &ix.name,
+                        ix.unique,
+                        ix.descending,
+                        key_itype,
+                        blr,
+                        src,
+                        &mut |values| {
+                            eval_index_expr(&expr, &cm, values).ok_or_else(|| {
+                                format!(
+                                    "index {}: a row value the expression cannot take",
+                                    ixname
+                                )
+                            })
+                        },
+                    )?;
+                    continue;
+                }
                 if t.pk_index.as_deref() == Some(ix.name.as_str()) {
                     // the PK's INTEG_<n> name is REGENERATED, not the
                     // file's: fc's create_table already burned INTEG
@@ -51954,6 +52003,9 @@ enum BVal {
     ValueIf(Box<BBool>, Box<BVal>, Box<BVal>),
     /// blr_gen_id (101): the current value of a generator, name + operand
     GenId(String, Box<BVal>),
+    /// blr_add(34)/subtract(35)/multiply(36)/divide(37) - integer
+    /// arithmetic over the operands (an expression index's key)
+    Arith(u8, Box<BVal>, Box<BVal>),
 }
 
 #[derive(Clone, Copy)]
@@ -52321,6 +52373,86 @@ fn parse_blr_bool(c: &mut BlrCur) -> Option<BBool> {
     })
 }
 
+/// Decode an INDEX EXPRESSION blob: version byte, one value
+/// expression, blr_eoc. Anything else is an expression this restore
+/// cannot evaluate - refuse, never guess a key.
+fn parse_index_expression_blr(blr: &[u8]) -> Option<BVal> {
+    let mut c = BlrCur { b: blr, i: 0 };
+    let ver = c.u8()?;
+    if ver != 4 && ver != 5 {
+        return None;
+    }
+    let v = parse_blr_val(&mut c)?;
+    match c.u8() {
+        Some(76) | None => Some(v), // blr_eoc closes it
+        _ => None,
+    }
+}
+
+/// The btree key type an index expression's result wants, statically:
+/// arithmetic is numeric, a lone field takes its column's type, a
+/// literal its own. None = a shape this restore cannot key.
+fn infer_index_expr_itype(v: &BVal, cols: &[(String, i32)]) -> Option<u16> {
+    match v {
+        BVal::Arith(..) | BVal::LitLong(_) | BVal::GenId(..) => Some(fire_crab_ods::btw::IDX_NUMERIC),
+        BVal::LitStr(_) => Some(fire_crab_ods::btw::IDX_STRING),
+        BVal::Field(_, name) => {
+            let ft = cols
+                .iter()
+                .find(|(n, _)| n.eq_ignore_ascii_case(name))
+                .map(|(_, t)| *t)?;
+            match ft {
+                7 | 8 => Some(fire_crab_ods::btw::IDX_NUMERIC),
+                16 => Some(fire_crab_ods::btw::IDX_NUMERIC2),
+                14 | 37 => Some(fire_crab_ods::btw::IDX_STRING),
+                _ => None,
+            }
+        }
+        BVal::ValueIf(_, t, f) => {
+            let a = infer_index_expr_itype(t, cols)?;
+            let b = infer_index_expr_itype(f, cols)?;
+            if a == b { Some(a) } else { None }
+        }
+        _ => None,
+    }
+}
+
+/// Evaluate an index expression over one decoded row - the restore's
+/// own tiny walker: fields by name through the position-ordered column
+/// map, integer arithmetic, NULL propagating.
+fn eval_index_expr(
+    v: &BVal,
+    cols: &[(String, i32)],
+    values: &[fire_crab_ods::format::Value],
+) -> Option<fire_crab_ods::format::Value> {
+    use fire_crab_ods::format::Value;
+    Some(match v {
+        BVal::LitLong(n) => Value::Int(*n),
+        BVal::LitStr(s) => Value::Text(s.clone()),
+        BVal::Null => Value::Null,
+        BVal::Field(_, name) => {
+            let i = cols.iter().position(|(n, _)| n.eq_ignore_ascii_case(name))?;
+            values.get(i).cloned().unwrap_or(Value::Null)
+        }
+        BVal::Arith(op, l, r) => {
+            let a = eval_index_expr(l, cols, values)?;
+            let b = eval_index_expr(r, cols, values)?;
+            match (a, b) {
+                (Value::Int(x), Value::Int(y)) => match op {
+                    34 => Value::Int(x + y),
+                    35 => Value::Int(x - y),
+                    36 => Value::Int(x * y),
+                    37 if y != 0 => Value::Int(x / y),
+                    _ => return None,
+                },
+                (Value::Null, _) | (_, Value::Null) => Value::Null,
+                _ => return None,
+            }
+        }
+        _ => return None,
+    })
+}
+
 fn parse_blr_val(c: &mut BlrCur) -> Option<BVal> {
     Some(match c.u8()? {
         BLR_FIELD => {
@@ -52349,6 +52481,12 @@ fn parse_blr_val(c: &mut BlrCur) -> Option<BVal> {
             let name = c.name()?;
             let step = parse_blr_val(c)?;
             BVal::GenId(name, Box::new(step))
+        }
+        op @ (34..=37) => {
+            // blr_add/subtract/multiply/divide
+            let l = parse_blr_val(c)?;
+            let r = parse_blr_val(c)?;
+            BVal::Arith(op, Box::new(l), Box::new(r))
         }
         BLR_LITERAL => match c.u8()? {
             8 => {
@@ -52610,6 +52748,22 @@ fn eval_blr_val(v: &BVal, ctxs: &[Ctx], input: &[Value], db: &Database) -> Value
         }
         BVal::GenId(name, _step) => {
             read_generator_value(db, name).map_or(Value::Null, Value::Int)
+        }
+        BVal::Arith(op, l, r) => {
+            let (a, b) = (
+                eval_blr_val(l, ctxs, input, db),
+                eval_blr_val(r, ctxs, input, db),
+            );
+            match (a, b) {
+                (Value::Int(x), Value::Int(y)) => match op {
+                    34 => Value::Int(x + y),
+                    35 => Value::Int(x - y),
+                    36 => Value::Int(x * y),
+                    37 if y != 0 => Value::Int(x / y),
+                    _ => Value::Null,
+                },
+                _ => Value::Null,
+            }
         }
     }
 }

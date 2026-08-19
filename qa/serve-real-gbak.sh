@@ -677,6 +677,42 @@ else
 fi
 rm -f "$NDDB" "$D/fc-gbak-nd.fbk" "$D/fc-gbak-ndr.fdb"
 
+# EXPRESSION indexes RIDE (atts 10/11 on the rec-5 record, the BLR
+# verbatim; the irt repeat takes IRT_EXPRESSION and the backfill keys
+# every row on the EVALUATED expression): the ENGINE restores fc's
+# backup, PLANS through the index, and MAINTAINS it on a live insert
+EXIDB="$D/fc-gbak-exi.fdb"; rm -f "$EXIDB" "$D/fc-gbak-exi.fbk" "$D/fc-gbak-exir.fdb"
+"$ISQL" -q -b -user "$U" -pas "$P" <<EOF >/dev/null 2>&1
+CREATE DATABASE '$EXIDB' USER '$U' PASSWORD '$P' PAGE_SIZE 8192;
+CREATE TABLE T (X INTEGER, S VARCHAR(6));
+COMMIT;
+INSERT INTO T VALUES (10, 'ab');
+INSERT INTO T VALUES (3, 'cd');
+COMMIT;
+CREATE INDEX IXE ON T COMPUTED BY (X + 1);
+COMMIT;
+EOF
+chmod 666 "$EXIDB"
+ran=$((ran + 1))
+fo=$(svc_backup "$FMGR" "$EXIDB" "$D/fc-gbak-exi.fbk")
+if [ "${fo##*rc=}" = "0" ]; then
+    echo "OK   an EXPRESSION index rides the backup (fc backs it up)"
+else
+    echo "DIFF expression index backup: [$fo]"; fail=1
+fi
+ran=$((ran + 1))
+sudo -n chmod 666 "$D/fc-gbak-exi.fbk" 2>/dev/null || chmod 666 "$D/fc-gbak-exi.fbk" 2>/dev/null
+"$FBSVCMGR" "$EMGR" user "$U" password "$P" action_restore dbname "$D/fc-gbak-exir.fdb" bkp_file "$D/fc-gbak-exi.fbk" >/dev/null 2>&1
+grab "$D/fc-gbak-exir.fdb"
+got=$(printf "SET PLAN ON;\nSELECT X FROM T WHERE X + 1 = 4;\nINSERT INTO T VALUES (99, 'zz');\nSELECT X FROM T WHERE X + 1 = 100;\n" |
+    "$ISQL" -q -b -user "$U" -pas "$P" "$D/fc-gbak-exir.fdb" 2>&1 | grep -cE 'INDEX \("PUBLIC"\."IXE"\)|^ *3 *$|^ *99 *$')
+if [ "$got" = "4" ]; then
+    echo "OK   the ENGINE restores fc's fbk, PLANS through IXE and maintains it live"
+else
+    echo "DIFF expression index after engine restore: match-count [$got] (want 4)"; fail=1
+fi
+rm -f "$EXIDB" "$D/fc-gbak-exi.fbk" "$D/fc-gbak-exir.fdb"
+
 # --- 4. RECORDED BOUNDARY: NOT NULL is not carried ---------------------------
 NN="$D/fc-gbak-nn.fdb"; rm -f "$NN"
 "$ISQL" -q -b -user "$U" -pas "$P" <<EOF >/dev/null 2>&1
