@@ -9,240 +9,33 @@ This document is about the two things that are **not** more SQL surface.
 
 ## Where the project actually stands
 
-**The next big chunk: gbak carries the whole catalog.** The backup
-writer is fail-closed by design, and today that closes on almost any
-real database: sequences, views, triggers, procedures and the
-UNIQUE / FOREIGN KEY / CHECK constraints all refuse the whole backup.
-Plain tables, PK/indexes and blobs already ride the file both ways
-with the four-way cross-restore matrix as the oracle (fc.fbk x
-engine-restore and back), so each remaining object type is one
-measured slice over an already-pinned format: annotate the record
-family off a real .fbk, write it, restore it on both sides, read it
-back through the engine. ~~Generators first (smallest record)~~ —
-SEQUENCES RIDE THE FILE now (rec_generator pinned off a real .fbk,
-the current value carried TWICE the way backup.epp writes it, and
-restored into the generator vector where it lives — gbak 22,
-gbakrestore with sequences in every corner of the cross-restore
-matrix). ~~Then the constraint family~~ — UNIQUE and plain FOREIGN
-KEY RIDE too: the engine's three-block order (rel_constraint rows,
-ref rows, chk rows), the FK index carrying its partner (att 8), the
-restore applying UNIQUEs constraint-driven and FKs last through the
-keyed-constraint map — both directions enforce 23000-identically,
-gfix clean. ~~CASCADE / SET NULL / SET DEFAULT and CHECK refuse~~ —
-THE TRIGGER RECORDS RIDE: rec 13 with its int32-framed BLR/source
-walked by hand, the stored blobs COPIED verbatim both ways (no
-compilation — the bytes are the engine's own), the restore storing
-them through `restore_carried_trigger` and the FK application
-switching to `alter_table_add_foreign_key_carried` so fc's own
-trigger synthesis does not collide with the carried records (the
-first restore's duplicate-CHECK_1 failure, measured). The ENGINE
-enforces a CHECK through the carried trigger BY NAME and CASCADES on
-fc's restored file; fc's own DML enforces the restored CHECK too
-(the carried engine BLR executes), while fc's own CASCADE EXECUTION
-refuses fail-closed — recorded. USER triggers are the fail-closed
-representative now (arbitrary PSQL bodies), typed both directions.
-gbak 22, gbakrestore 36. ~~Next: views and procedures~~ — BOTH RIDE
-(gbak 23, gbakrestore 37): a view as its rec_relation with the two
-blobs and base-linked fields plus rec_view contexts, a procedure as
-rec 27/28/29 with blobs verbatim and params re-typed through carried
-domains. Three laws learned from failures, not the annotation: the
-RDB$RUNTIME blob IS the field list the engine's relation loader
-reads (a perfect catalog with no runtime answers "Column unknown" to
-every column while COUNT(*) runs); att_field_number (22) is where
-the restore derives RDB$FIELD_ID, and without it every column
-vanishes; and rec 29 — procedure_end, a bare byte — must close a
-procedure or the reader walks the next record as trigger messages.
-The engine executing an fc-AUTHORED procedure catalog remains the
-old recorded loader boundary; every other corner of the matrix runs.
-The catalog chunk's arc closes. ~~User triggers refuse~~ — they
-RIDE too (the same rec 13 the constraint triggers took, plus the
-att-14 debug map carried verbatim): the ENGINE restores fc's backup
-and the trigger FIRES on an insert, both directions; fc's OWN DML on
-a restored user-trigger table refuses fail-closed where its executor
-cannot speak the carried body — the engine fires on the same file,
-recorded. ~~Exceptions refuse~~ — they RIDE (rec 30, the smallest
-record of the chunk: the message is a plain u8-length text
-attribute, not a framed blob, because RDB$MESSAGE is a VARCHAR):
-both restores raise the carried exception with its exact message,
-and file order preserves the RDB$EXCEPTION_NUMBER sequence because
-create_exception's counter walks the same order the backup walked
-the catalog. ~~Functions refuse~~ — PSQL FUNCTIONS RIDE (rec
-15/16/17, gbak 28): the argument rows' own type columns are NULL in
-a real catalog — the domain IS the type — so the writer resolves
-each argument through its RDB$n domain and mints carrier domains
-continuing the same counter the columns and procedure params draw
-from, while the record's zeroed type quintet mirrors the engine's
-unconditional put_int32 of NULL columns. Both restores EXECUTE the
-carried functions; the DETERMINISTIC flag, the argument names and a
-NOT NULL argument's validation (with its carried name in the error)
-survive both directions. External functions (UDF/UDR), packaged
-functions, argument DEFAULTs and BLOB-typed arguments refuse typed.
-~~Roles refuse~~ — SQL ROLES RIDE (rec 36, gbak 30): name, owner,
-and the CHAR(8) OCTETS system-privilege block as a plain u8-length
-attribute — eight zero bytes for a plain CREATE ROLE, and a role
-that actually HOLDS system privileges refuses typed on both the
-writer's surface and the reader's walk. Both restores carry the
-roles and take a live GRANT; grants TO roles stay in the recorded
-privilege set-aside. PACKAGES joined the writer's fail-closed
-surface check (a bare package header has no member to refuse
-through) and a PACKAGE is the boundary representative now.
-~~Packages refuse~~ — PACKAGES RIDE (rec 38 + members as ordinary
-records with their package attribute, gbak 33): the header row's
-two sources verbatim, the members' rows tagged with
-RDB$PACKAGE_NAME and RDB$PRIVATE_FLAG (no security class, no own
-grant — the package is the privilege boundary, object type 18), and
-the arguments' rec-16 records carrying package att 10, without
-which the engine's restore matches zero args and refuses the file.
-Both restores EXECUTE both members and the carried PRIVATE flag
-still guards the hidden one. **And the slice closed an OLD recorded
-boundary**: "the engine executing an fc-authored procedure catalog
-crashes the loader" was ONE NULL COLUMN — the param rows'
-RDB$FIELD_SOURCE_SCHEMA_NAME, which the engine's loader
-dereferences (the FK-blocker lesson found again by full-row diff
-against the engine's own restore). With it written, the engine
-executes procedures off fc's restores in every corner
-(gbakrestore 39). A GTT is the boundary representative now — and
-the reader REFUSES relation type > 1 instead of silently landing a
-GTT as a plain table (att 18 was ignored before, a found bug).
-~~GTTs refuse~~ — GLOBAL TEMPORARY TABLES RIDE (gbak 35): the same
-relation record with att 18 typed 4/5, restored EMPTY — a GTT's
-rows are per-attachment and never in the file, so the writer finds
-none and the restore allocates the ordinary page skeleton — with
-the restore-side DBKEY_LENGTH 0 the engine's own restore writes
-(live DDL writes 8, the restored catalog 0, measured on a round
-trip). A live INSERT lands in the restored instance both
-directions. External tables (type 2) stay refused — their data
-lives outside the file. ~~An expression-columned view refuses~~ — EXPRESSION VIEW
-COLUMNS RIDE (gbak 37): the finding is that the expression lives on
-the column's OWN RDB$n domain as a subtype-2 COMPUTED_BLR — the
-field record carries computed_flag 1, context 0, read-only, NO base
-att, and the domain record carries the expression blob on att 18,
-which the generic rec-2 walker desynced on (the reader walks
-domains by hand now, atts 15–21 blob-framed). Restore mints the
-carrier domain WITH the computed blob — without it the engine
-answers "cannot access column" over a perfect catalog. A NAMED
-DOMAIN is the boundary representative now, refused on BOTH sides
-(the reader used to accept any rec 2 — restored as a plain type a
-named domain would keep the data and silently change what the
-schema MEANS). ~~Description blobs refuse~~ — COMMENTS RIDE (gbak 40): all
-twelve commentable families of the carried surface — table, column,
-view, view column, index, sequence, exception, procedure,
-parameter, function, trigger, role — as their measured
-description2 blob atts (13/35/9/4/5/6/9/11/3 per family), collected
-generically into one (family, name, sub, text) list and restored
-last through one ddl::set_catalog_description helper. The slice
-also closed the LATENT DESYNC the expression slice first exposed:
-five reader arms walked description-carrying records with the
-generic attribute walker and would have mis-stepped on any
-commented object — every arm now speaks the blob framing
-(read_atts_blob). A COMMENT on an invented RDB$n domain refuses
-typed on both sides — it cannot follow the renumbering a restore
-performs. ~~Named domains refuse~~ — NAMED DOMAINS RIDE (gbak 42), the
-catalog chunk's closing slice: the real name on the rec-2 record
-(NOT NULL att 38, char length 41, precision 44, COMMENT 35 — the
-walker learned att 35's blob framing on rec 2 too), columns keeping
-the name in att 2 instead of drawing an invented RDB$n, and the
-restore running ddl::create_domain FIRST so create_table's
-long-standing ColumnDef::domain path binds by name. Domain
-DEFAULTs, CHECKs, computed expressions and array dimensions refuse
-typed — each changes what a domain MEANS beyond its type. The
-writer also refuses EXPRESSION (COMPUTED BY) indexes typed now
-(they were silently dropped — a found bug), and an expression index
-is the boundary representative. ~~Domain DEFAULTs and CHECKs refuse~~ — they RIDE (gbak 43):
-the four blobs verbatim (default BLR att 15 + source att 39,
-validation BLR att 20 + source att 36 — two more atts the rec-2
-walker learned to frame), create_domain storing the default and a
-new set_domain_validation patching the CHECK on. The law the
-differential paid for: the engine enforces field validation from
-the RUNTIME's RSR_validation_blr segment (7), NOT from the domain
-row — a byte-identical catalog with no segment let CHECK (VALUE>0)
-take -5 — so both runtime builders (create_table's inline one and
-update_relation_runtime) now emit the domain's validation BLR
-beside the default it already carried. ~~Argument DEFAULTs refuse~~ — they RIDE (gbak 44): a
-function argument's DEFAULT as rec-16 atts 13/14, a procedure
-parameter's as rec-28 atts 7/8, value BLR and `= 42` source
-verbatim onto the restored rows, applied by the engine on
-argument-less calls both directions. Two found bugs closed with the
-flip: the parameter reader would have DESYNCED on atts 7/8 (never
-framed), and the writer silently DROPPED parameter defaults — an
-argument-less call after a restore would have errored where the
-original answered. ~~Expression indexes refuse~~ — they RIDE (gbak 46), the
-typed tail's last carryable slice: the rec-5 record's atts 10/11
-(source + BLR verbatim), the irt repeat taking IRT_EXPRESSION with
-one key descriptor of the expression's result type, and the
-backfill keying every committed row on the EVALUATED expression —
-the restore decodes the carried BLR (BVal grew integer arithmetic,
-blr 34–37) and hands the ddl builder an evaluator closure; the BLR
-walker stays with the executor, the writer only builds what it is
-handed. The ENGINE plans through fc's restored index and MAINTAINS
-it on live inserts, gfix-clean. Partial (WHERE-conditioned) indexes
-refuse typed; an expression this restore cannot evaluate refuses
-typed rather than guessing a key. ~~External tables refuse~~ — their DEFINITIONS RIDE
-(gbak 49): the relation record's att 17 carries the file path
-verbatim beside type 2, the restore writes the row with NO pages
-and DBKEY 0 (the engine's restored shape, measured — even the
-engine's own validator grumbles one pointer-page line at EVERY
-external table, original included, so the differential is the
-identical grumble), and both restores read AND write the shared
-external file through the engine. fc's own SQL REFUSES an external
-table loudly rather than answering an empty lie (the relation is
-absent to every plan builder — one seam, relation_meta). The gate
-needs ExternalFileAccess = Restrict /tmp/fbhandson in
-firebird.conf. ~~External functions refuse~~ — their DECLARATIONS RIDE
-(gbak 51), and with them the LAST named refusal falls: a legacy UDF
-as module+entrypoint (atts 4/5) with INLINE-typed args (the type
-facts live on the argument row, no domain — the third typing
-convention the argument family speaks), a UDR as
-entrypoint+engine (atts 5/10) with the ordinary domain-sourced
-args. No BLR, no source — the names ARE the declaration, exactly
-the engine's own carriage. A UDR against the stock udf_compat
-module EXECUTES off both restores; a legacy declaration with an
-absent module fails with the byte-identical engine error — the code
-outside the file stays outside, honestly, on both sides. The
-fail-closed representative is a MAPPING now, refused typed on both
-sides (the writer previously would have silently DROPPED
-RDB$AUTH_MAPPING rows — a found bug closed). ~~Mappings refuse~~ — SECURITY-NAME MAPPINGS RIDE (rec 37,
-every RDB$AUTH_MAPPING column verbatim, gbak 54): both restores
-land the row column-identical, and the mapping's COMMENT joins the
-generic description pass. The fail-closed representative is a
-SHADOW now — refused typed on BOTH sides (the writer's surface
-check took RDB$FILES; a page-level mirror is not this pair's to
-carry) — and the flip taught the harness a lesson worth its own
-line: the SERVER LINGERS a previously-attached database of the same
-path, so a reused fixture filename hands the backup a STALE
-instance (the shadow silently missing from the fbk, measured) —
-boundary fixtures take fresh names now. ~~Publications and filters were never-fixtured~~ — both RIDE
-now (gbak 56): the DEFAULT publication's ENABLE state travels as
-two booleans on the DATABASE record (atts 20/21 — the system row
-itself never gets a record, measured off the engine's own restore
-path), its INCLUDEd tables as rec-41 rows; a BLOB FILTER
-declaration as rec 20 with the att series that continues the TYPE
-atts (name 6, module 8, entrypoint 9, subtypes 10/11) — names and
-subtypes verbatim, the code outside the file, the same honest
-carriage a legacy UDF gets. The filter's negative OUTPUT_SUB_TYPE
-found a GLOBAL reader bug: attribute ints were accumulated
-UNSIGNED, so −4 read as four billion and overflowed the SMALLINT —
-Att::int sign-extends by width now. ~~Shadows refuse~~ — SHADOWS RIDE (gbak 57), the physical
-family's last word: the rec-25 record carries path, flags and
-shadow number, and fc's restore WRITES THE PHYSICAL SHADOW — the
-finished image itself with hdr_active_shadow flagged and the
-HDR_root_file_name clumplet appended at hdr_end, the measured
-whole difference between a live shadow and its database. The
-engine then MAINTAINS fc's shadow (a live INSERT lands in both
-files, only the header page differing), and both sides refuse
-whole when the shadow file already exists — the engine's own
-"File exists" semantic, minus its half-restored wreckage.
-Multi-file databases refuse typed (FB6 dropped the DDL; a
-non-shadow RDB$FILES row cannot be fixtured but cannot silently
-drop either). ~~A system-privileged role refuses~~ — the BLOCK RIDES
-VERBATIM now (gbak 58): the CHAR(8) OCTETS bitmask travels the
-byte-carrier text decode reversibly (one char per byte), lands
-bit-identical through both restores (0x42 = USER_MANAGEMENT |
-TRACE_ANY_ATTACHMENT, measured), and the old carry-zeros-and-disarm
-hazard is gone because the real bits are what land. **The gbak
-surface has no named refusals left** — the standing fail-closed
-representative is an index expression this restore cannot evaluate,
-refused whole at build time rather than keyed by a guess.
+**The gbak programme is COMPLETE.** What began as "the backup
+writer is fail-closed by design and refuses almost any real
+database" ended twenty-one measured slices later with the refusal
+ledger's carryable side EMPTY: sequences, the whole constraint
+family with its carried trigger records, views (expression columns
+included), procedures, user triggers, exceptions, PSQL functions,
+roles with their SYSTEM-PRIVILEGE blocks, packages, GTTs, COMMENTs
+on twelve families, named domains with DEFAULTs and CHECKs,
+argument DEFAULTs, expression indexes built on the EVALUATED
+expression, external tables and function declarations, security
+mappings, the publication state, blob-filter declarations, and
+physical SHADOWS — fc's restore writes the mirror itself and the
+engine maintains it. Every slice was pinned off a real .fbk before
+a line of writer existed, proven differentially in BOTH directions
+(the engine restores fc's file and fc restores the engine's, with
+execution — not just catalog digests — wherever the object can
+run), and swept. What still refuses is exactly what fail-closed
+honesty demands: an index expression the restore cannot evaluate
+(refused whole at build time, never keyed by a guess — the standing
+boundary representative in `qa/serve-real-gbakrestore.sh`), and
+multi-file shapes FB6 itself can no longer produce. The programme's
+laws — the runtime summary is the truth (field lists, trigger
+vectors, defaults, validation), the domain IS the type (and the
+expression), schema qualifiers are load-bearing, the server lingers
+same-path attachments — are each one line in the ledger below, with
+the narrative in the commit that paid for it. Per-slice: gbak 58
+checks, gbakrestore 39, gbakse 12, gbakverbose 14.
 
 The subsystem map's rows fall into three states, and the difference
 matters more than the row count:
@@ -783,6 +576,30 @@ narrative of every closure is in git history and the gate that pins it.
 
 One line each; the narrative lives in the commit that closed it and
 the gate that keeps it closed.
+
+**The gbak catalog programme (complete, sweeps 8-29):**
+
+- ~~Sequences refuse~~ — the value rides TWICE (backup.epp's own doubling) and restores into the generator vector.
+- ~~UNIQUE/FK/CHECK refuse~~ — the three-block constraint order, the FK partner index, carried trigger records verbatim.
+- ~~Views and procedures refuse~~ — the RDB$RUNTIME blob IS the field list; att 22 is where RDB$FIELD_ID comes from; rec 29 closes a procedure or the reader desyncs.
+- ~~User triggers refuse~~ — rec 13 with the att-14 debug map; the engine fires them on fc's fbk.
+- ~~Exceptions refuse~~ — the message is a plain text att; file order preserves RDB$EXCEPTION_NUMBER.
+- ~~PSQL functions refuse~~ — the argument's domain IS its type (the record's quintet is zeros); grant type 15.
+- ~~Roles refuse~~ — the CHAR(8) OCTETS block as a plain u8-length att; later the block itself rides verbatim (0x42 bit-identical) instead of refusing non-zero.
+- ~~Packages refuse~~ — members as ordinary records with package atts (args need att 10 too); and the OLD loader-crash boundary was ONE NULL column: RDB$FIELD_SOURCE_SCHEMA_NAME on param rows.
+- ~~GTTs refuse~~ — att 18 typed 4/5, restored EMPTY (their rows were never in the file), restore-side DBKEY 0.
+- ~~Expression view columns refuse~~ — the expression lives on the domain as COMPUTED_BLR; three reader desyncs closed with it.
+- ~~COMMENTs are dropped or refused~~ — twelve families, one description2 att each, one set_catalog_description; five latent walker desyncs closed.
+- ~~Named domains refuse~~ — the real name on rec 2, columns keep it in att 2, create_domain-first binding; expression indexes' silent drop found and typed.
+- ~~Domain DEFAULTs/CHECKs refuse~~ — four blobs verbatim; the engine enforces validation from the RUNTIME's RSR_validation_blr segment, not the domain row.
+- ~~Argument DEFAULTs refuse~~ — fn atts 13/14, param atts 7/8; the param reader would have desynced and the writer silently dropped them.
+- ~~Expression indexes refuse~~ — IRT_EXPRESSION, one key desc of the result type, backfill on the EVALUATED carried BLR; the engine plans through and maintains fc's index.
+- ~~External tables refuse~~ — the definition rides (att 17 path, type 2, NO pages); the validator's pointer-page grumble is the engine's own at every external table; fc's serve side stopped answering an empty lie.
+- ~~External functions refuse~~ — declarations ride (legacy module+entrypoint with INLINE-typed args — the third arg-typing convention; UDR entrypoint+engine); a stock-module UDR EXECUTES off both restores.
+- ~~Mappings are silently dropped~~ — rec 37 verbatim; and the boundary flip taught the lingering-server harness law (fresh fixture names per era).
+- ~~Publications were never fixtured~~ — the DEFAULT publication's state is two booleans on the DATABASE record (fc had hardcoded zeros); tables as rec 41.
+- ~~Filters were never fixtured~~ — rec 20 continues the TYPE att series; its OUTPUT_TYPE -4 exposed the global unsigned attribute-int decode (Att::int sign-extends by width now).
+- ~~Shadows refuse~~ — a live shadow is its database except the header page (ACTIVE_SHADOW + root-name clumplet); fc's restore writes the physical mirror and the engine maintains it.
 
 - ~~A scalar subquery's aggregate describes as BIGINT~~ — closed (`qa/serve-real-aggdescribe.sh`).
 - ~~A modifier dropped the SELECT LIST, and a set was not a sort~~ — closed (`qa/serve-real-modifiers.sh`).
