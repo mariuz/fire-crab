@@ -34125,6 +34125,25 @@ fn encode_row_body(
                         .and_then(|sl| sl.text)
                         .and_then(|(_, decl)| decl.map(|t| AttCs::by_id((t & 0xFF) as u8)));
                     let dest = slot_cs.unwrap_or(o.att);
+                    // a NONE DESTINATION transliterates NOTHING: the
+                    // column's own codepage bytes travel (measured -
+                    // the engine ships a WIN1252 column's 0xE9 raw to
+                    // a NONE attachment where this server shipped the
+                    // UTF-8 pair; the describe already announced the
+                    // column's charset, the bytes now agree with it)
+                    let col_cs = if (0..=i16::MAX as i32).contains(&c.sub_type) {
+                        fire_crab_ods::intl::charset_id(c.sub_type as i16)
+                    } else {
+                        0
+                    };
+                    let dest = if dest.id == 0
+                        && col_cs != 0
+                        && !fire_crab_ods::intl::byte_carrier(col_cs)
+                    {
+                        AttCs::by_id(col_cs)
+                    } else {
+                        dest
+                    };
                     fire_crab_ods::intl::encode_text(dest.id, &s).transpose()
                 }) {
                     Some(Ok(v)) => {

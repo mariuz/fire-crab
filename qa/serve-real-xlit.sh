@@ -528,6 +528,35 @@ else
     fail=1
 fi
 
+# --- 8b. a NONE ATTACHMENT transliterates NOTHING ----------------------
+# The engine ships a tabled column's OWN codepage bytes raw to a NONE
+# attachment (measured: a WIN1252 column's 0xE9 arrives as the one
+# byte, where fc used to ship the UTF-8 pair) - and a UTF8 column's
+# raw bytes likewise. The describe already announced the column's
+# charset; the bytes agree with it now.
+node_none() { XDB="$1" XPORT="$2" timeout 30 node -e '
+  process.on("uncaughtException", () => { console.log("CONN_ERR"); process.exit(1); });
+  const F=require("node-firebird");
+  F.attach({host:"127.0.0.1",port:+process.env.XPORT,database:process.env.XDB,
+            user:"SYSDBA",password:"masterkey",encoding:"NONE"},(e,db)=>{
+    if(e){console.log("CONN_ERR");process.exit(1);}
+    db.query("SELECT W FROM XL WHERE ID = 1",(e2,r)=>{
+      if(e2){console.log("ERR");db.detach();process.exit(0);}
+      const v=r[0].w ?? r[0].W;
+      console.log(Buffer.from(String(v),"binary").toString("hex"));
+      db.detach();process.exit(0);});});' 2>/dev/null
+}
+ran=$((ran + 1))
+chmod 666 "$RE" 2>/dev/null
+e_raw=$(node_none "$RE" 3050)
+f_raw=$(node_none "$FC" "$PORT")
+if [ -n "$e_raw" ] && [ "$e_raw" = "$f_raw" ]; then
+    echo "OK   a NONE attachment gets the tabled column's OWN bytes, identically [$f_raw]"
+else
+    echo "DIFF NONE-attachment bytes: engine [$e_raw] fc [$f_raw]"
+    fail=1
+fi
+
 # --- 9. the file survives the engine's own verifier --------------------
 ran=$((ran + 1))
 g=$("$GFIX" -v -full -user "$U" -pas "$P" "$FC" 2>&1)
@@ -540,8 +569,8 @@ fi
 
 kill $srv 2>/dev/null; srv=""
 rm -f "$RE" "$FC"
-if [ "$ran" -lt 57 ]; then
-    echo "DIFF only $ran checks ran (expected at least 57) - did one silently skip?"
+if [ "$ran" -lt 58 ]; then
+    echo "DIFF only $ran checks ran (expected at least 58) - did one silently skip?"
     fail=1
 fi
 exit $fail

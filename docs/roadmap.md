@@ -426,14 +426,22 @@ narrative of every closure is in git history and the gate that pins it.
   fragment as restore replays DDL onto crowded pages. An EMPTY database
   gains 26 fragmented rows from a backup/restore round trip alone.
 
-- **The engine converts a NONE column into the ATTACHMENT charset on
-  the way out, and fire-crab does not.** Measured with plain ASCII: a
-  stored `'ab '` (OCTET_LENGTH 3) answers `'ab'` through a UTF8
-  attachment and `'ab '` through a NONE one; fire-crab passes the
-  stored bytes through on every attachment. Same family as the
-  transliteration entry below, but it bites on a BLANK, not a high
-  byte — any gate comparing VARCHAR VALUES with trailing blanks must
-  compare a server-side length instead (see serve-real-starting.sh).
+- ~~**The engine converts a NONE column into the ATTACHMENT charset on
+  the way out, and fire-crab does not.**~~ **CLOSED — and the recorded
+  claim was half wrong.** Re-measured cell by cell (12 cells: NONE/
+  WIN1252/UTF8 columns × NONE/UTF8/WIN1252 attachments, per-column hex
+  off the wire): the `'ab '`→`'ab'` trim did NOT reproduce — a stored
+  `'ab '` answers 3 octets through EVERY attachment charset; the trim
+  in the original note was the measuring instrument's, not the wire's.
+  The REAL divergence was one cell in the opposite direction: a
+  **tabled-charset column over a NONE attachment** — the engine ships
+  the column's OWN codepage bytes raw (WIN1252 `é` = the one byte
+  `E9`), where fc transliterated to UTF8 and shipped the pair. The law:
+  a NONE *destination* transliterates NOTHING, in either direction.
+  Fixed in `encode_row_body` (a NONE attachment keeps the column's own
+  charset as the wire charset unless the column is itself a byte
+  carrier); gated in `qa/serve-real-xlit.sh` (58 checks, engine and fc
+  byte-identical on the raw cell).
 
 - **`qa/auth-srp.sh` has harness bugs**: its NF path is $0-relative
   (node resolves it as a module unless invoked by absolute path), its
