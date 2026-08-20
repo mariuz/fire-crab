@@ -83,15 +83,41 @@ stamping that knew page 2 only with 2,043 slots where the engine reads
 engine's increment reads the SCN SLOTS, nbackup.cpp:1462). All four
 now follow the engine's own allocator; see "The growth chunk" below.
 
-### B. Transactional DDL
+### B. Transactional DDL — slice 1 DONE (2026-08-20), slice 2 open
 
-DDL's undo is an in-memory image of the file. One root cause, four
-refusals: the savepoint keeps a base image as the fallback for a
-transaction that later does DDL (and pays the write side for it); an
-autonomous block inside a transaction that has done DDL refuses;
-`op_prepare` on a DDL transaction refuses with `isc_wish_list`
-(`server.rs:52235` — limbo promises to survive the process, an image
-does not); and rollback of DDL is rollback-by-image.
+**Done (`qa/serve-real-ddltx.sh` 22):** a DDL statement's catalog rows
+are written under the transaction's own id (`Image::ddl_tx` —
+`allocate_committed_tx` answers it; the engine's DdlNodes.epp STOREs
+under the user transaction), so ROLLBACK, ROLLBACK TO SAVEPOINT and a
+failing autonomous block undo DDL by TRANSACTION STATE. The catalog
+readers (`catalog_image`, `OwnTx::catalog`) step past a DEAD or LIMBO
+version — a rolled-back DROP gives its table back — and the unique-key
+liveness test (`btw::recno_is_live`) is MVCC-aware, so a dead row never
+blocks a key. What no state takes back is journaled per undo window
+and undone by hand (`DdlResidue`: a created relation's whole storage,
+a created index's tree + root slot, tx-0 `RDB$PAGES` rows — the eager
+form of dpm.epp's MRK_rollback resolution); what COMMIT owns is
+deferred to it (`DdlDeferred`: a dropped relation's pages, a dropped
+index's `irt_drop` — dfw.epp delete_relation / ods.h:456). The image
+fallback, the savepoint's write-side hold and the autonomous refusal
+are gone; `op_prepare` on a DDL transaction is allowed unless a DROP
+is pending (its page release is COMMIT's, and limbo may outlive this
+process's journal).
+
+**Open (slice 2):** the write side is still HELD for a DDL
+transaction's life — the engine's first-updater-wins on the metadata
+cache's version list ("table N is used by transaction M",
+CacheVector.h:947 `newVersionBusy`, immediate, no wait) is not built,
+and holding the side is the conservative reading of it. Per-transaction
+schema VISIBILITY: the catalog readers count every ACTIVE transaction's
+rows (no attachment to ask), where the engine shows an uncommitted
+CREATE TABLE to its owner alone (`att_meta_transaction`, read-committed
+with the owner's number). `RDB$FORMATS` is written at statement time
+here, at COMMIT there (DFW `makeFormat`; measured 0 before / 1 after).
+A limbo DDL transaction resolved by `gfix -commit` after a restart
+leaves its residue un-released (orphan pages, as the engine's own lazy
+markers do until reclaimed). `ddl_undo`/`image_undo` fields and the
+`restore_db` path survive as dead code to delete.
 
 ### C. Wire surface
 
@@ -230,11 +256,11 @@ pointer-page and TIP page numbers is the next step when it dominates.
 
 ## Next, in order
 
-- **B, transactional DDL — THE NEXT CHUNK** — it is one cause behind four refusals, and
-  limbo's promise cannot be kept by an image in memory.
-- **C, blob writes + COMMIT/ROLLBACK RETAIN** — the two most common
-  client operations a real driver issues that this server cannot
-  answer at all.
+- **B, transactional DDL, slice 2** — first-updater-wins on the catalog
+  (release the write-side hold), per-transaction schema visibility.
+- **C, blob writes + COMMIT/ROLLBACK RETAIN — THE NEXT CHUNK** if slice 2
+  is deferred: the two most common client operations a real driver
+  issues that this server cannot answer at all.
 - **D, the MERGE executor** — the BLR is already compiled and tested;
   only the executor is missing.
 - **G, the external sort** — every sort and hash build is bounded by

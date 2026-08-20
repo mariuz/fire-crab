@@ -585,6 +585,7 @@ pub fn relation_formats(
 ) -> Vec<(u8, Vec<Descriptor>)> {
     let sys = formats_table_format();
     let mut found = Vec::new();
+    let tips = crate::tra::TipChain::read(file, page_size);
     for dp_no in relation_data_pages(file, page_size, REL_FORMATS) {
         let Some(dp) = crate::page_at(file, page_size, dp_no)
             .and_then(DataPage::decode)
@@ -592,10 +593,7 @@ pub fn relation_formats(
             continue;
         };
         for r in dp.records() {
-            if !r.is_primary_record() {
-                continue;
-            }
-            let Some(image) = crate::data::assembled_image(file, page_size, &r) else {
+            let Some(image) = crate::data::catalog_image(file, page_size, &r, tips.as_ref()) else {
                 continue;
             };
             let row = decode_record(&image, &sys);

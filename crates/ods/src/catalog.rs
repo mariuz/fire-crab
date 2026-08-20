@@ -76,15 +76,13 @@ fn relation_row(image: &[u8]) -> Option<(u16, String)> {
 /// `SELECT RDB$RELATION_ID, RDB$RELATION_NAME FROM RDB$RELATIONS`.
 pub fn list_relations(file: &crate::Image, page_size: usize) -> Vec<(u16, String)> {
     let mut out = Vec::new();
+    let tips = crate::tra::TipChain::read(file, page_size);
     for dp_no in relation_data_pages(file, page_size, REL_RELATIONS) {
         let Some(dp) = crate::page_at(file, page_size, dp_no).and_then(DataPage::decode) else {
             continue;
         };
         for r in dp.records() {
-            if !r.is_primary_record() {
-                continue;
-            }
-            if let Some(image) = crate::data::assembled_image(file, page_size, &r) {
+            if let Some(image) = crate::data::catalog_image(file, page_size, &r, tips.as_ref()) {
                 if let Some(row) = relation_row(&image) {
                     out.push(row);
                 }
@@ -190,15 +188,13 @@ fn relation_columns_uncached(
 ) -> Vec<RelationColumn> {
     let want = relation_name.trim();
     let mut out = Vec::new();
+    let tips = crate::tra::TipChain::read(file, page_size);
     for dp_no in relation_data_pages(file, page_size, REL_RELATION_FIELDS) {
         let Some(dp) = crate::page_at(file, page_size, dp_no).and_then(DataPage::decode) else {
             continue;
         };
         for r in dp.records() {
-            if !r.is_primary_record() {
-                continue;
-            }
-            let Some(image) = crate::data::assembled_image(file, page_size, &r) else { continue };
+            let Some(image) = crate::data::catalog_image(file, page_size, &r, tips.as_ref()) else { continue };
             let Some(rname) = cstr(&image, RF_RELATION_NAME_OFFSET) else {
                 continue;
             };

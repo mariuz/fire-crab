@@ -13,6 +13,38 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-08-20 — DDL is the transaction's
+
+### Converted
+- **A DDL statement's catalog rows carry the user transaction's id**
+  (`Image::ddl_tx`), so ROLLBACK / ROLLBACK TO SAVEPOINT / a failing
+  autonomous block undo DDL by transaction state, as the engine does
+  (DdlNodes.epp STOREs under the user transaction). The catalog
+  readers step past DEAD and LIMBO versions (`catalog_image`); the
+  unique-key liveness test is MVCC-aware. The settled residue a
+  rollback must undo by hand is journaled per undo window
+  (`DdlResidue`: a created relation's storage, a created index's tree
+  and root slot, tx-0 `RDB$PAGES` rows) and COMMIT's work is deferred
+  (`DdlDeferred`: a dropped relation's pages, a dropped index's
+  `irt_drop`) - dfw.epp's shape. Gone: the whole-image undo of DDL,
+  the savepoint's write-side hold, the autonomous-over-DDL refusal,
+  the `op_prepare`-over-DDL refusal (kept only for a pending DROP).
+
+### Fixed
+- **A second DROP after a rolled-back DROP failed** ("target is not a
+  live primary record version"): a DELETED head whose transaction is
+  dead is now chained over like any version (VIO_modify leaves dead
+  versions to the collector).
+- **Deferred DDL work lost at COMMIT**: the window stack was
+  reset ahead of `commit_tx`; the deferred DDL work is stashed across
+  the reset now.
+
+### Gated
+- `qa/serve-real-ddltx.sh` (new, 22): same scripts against the engine
+  and fire-crab on twin databases, fc's file validated by `gfix -v
+  -full` after every section, written into and swept by the engine;
+  coverage by the server's own trace.
+
 ## 2026-08-20 — the file grows the engine's way
 
 ### Converted

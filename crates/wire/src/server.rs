@@ -893,6 +893,12 @@ struct Database {
     /// giving up state-based undo, which is the whole point of a
     /// savepoint being a transaction.
     ddl_undo: bool,
+    /// whether this transaction has run a DDL statement - recorded for
+    /// the trace and the gates; its rows are its own now
+    did_ddl: bool,
+    /// the DDL work the windows deferred to COMMIT, stashed here when the
+    /// window stack is reset ahead of the commit ([reset_gen_windows])
+    ddl_deferred: Vec<fire_crab_ods::DdlDeferred>,
     page_size: usize,
     /// where the bytes came from - an INSERT flushes back here
     path: String,
@@ -1808,6 +1814,8 @@ impl Database {
         self.autonomous_ids.clear();
         self.image_undo = false;
         self.ddl_undo = false;
+        self.did_ddl = false;
+        self.ddl_deferred.clear();
         self.nested_tx.clear();
         if self.counted_tx {
             self.attachments.active_tx.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
@@ -1841,12 +1849,24 @@ impl Database {
         // was thinking.
         self.take_write_side()?;
         let mut work = self.bytes().as_ref().clone();
+        // THE DEFERRED WORK FIRST (tra.cpp:488 DFW_perform_work before
+        // the TIP flip at 547): a dropped relation's pages go back now
+        // that the drop is final
+        let mut deferred: Vec<fire_crab_ods::DdlDeferred> = std::mem::take(&mut self.ddl_deferred);
+        for w in self.windows.iter_mut() {
+            deferred.append(&mut w.deferred);
+        }
+        if !deferred.is_empty() {
+            fire_crab_ods::dml::apply_ddl_deferred(&mut work, self.page_size, &deferred)?;
+            self.invalidate_meta();
+        }
         // A TRANSACTION ID IS NOT WHAT MAKES A COMMIT. One that only did
         // DDL never reserved one - its catalog rows are settled as they
         // are written - but its PAGES are dirty in the pool all the
         // same, and the commit is what puts them on the disk. Returning
         // early when there was no id left them there: the file did not
         // have the table, and the engine reading it said so.
+        // (History: a DDL statement reserves the window's id now.)
         // EVERY ID AT ONCE, IN ONE WORK COPY AND ONE FLUSH. A
         // transaction that opened undo windows wrote under a nested id
         // per window (see [UndoWindow]), and all of them become real
@@ -2137,11 +2157,26 @@ struct UndoWindow {
     /// cannot be done by state (a settled write went before - see
     /// [Database::ddl_undo])
     base: Option<std::sync::Arc<fire_crab_ods::Image>>,
+    /// what the DDL run inside this window wrote that no transaction
+    /// state takes back - undone by hand if the window is undone, folded
+    /// into the parent if it closes well ([fire_crab_ods::DdlResidue])
+    residue: Vec<fire_crab_ods::DdlResidue>,
+    /// the DDL work this window defers to COMMIT - dropped with the
+    /// window if it is undone ([fire_crab_ods::DdlDeferred])
+    deferred: Vec<fire_crab_ods::DdlDeferred>,
 }
 
 impl UndoWindow {
     fn new(kind: WindowKind) -> UndoWindow {
-        UndoWindow { gen: GenWindow::default(), kind, tx: None, folded: Vec::new(), base: None }
+        UndoWindow {
+            gen: GenWindow::default(),
+            kind,
+            tx: None,
+            folded: Vec::new(),
+            base: None,
+            residue: Vec::new(),
+            deferred: Vec::new(),
+        }
     }
 
     /// every id this window is answerable for
@@ -2323,6 +2358,8 @@ fn undo_window_unwind(database: &mut Option<Database>, mark: usize, undone: bool
     // write its parent had already made, and is closed before the next
     let mut merged = GenWindow::default();
     let mut ids: Vec<u32> = Vec::new();
+    let mut residue: Vec<fire_crab_ods::DdlResidue> = Vec::new();
+    let mut deferred: Vec<fire_crab_ods::DdlDeferred> = Vec::new();
     for w in inner {
         if w.kind != WindowKind::Autonomous {
             ids.extend(w.ids());
@@ -2331,11 +2368,16 @@ fn undo_window_unwind(database: &mut Option<Database>, mark: usize, undone: bool
             merged.draw.insert(k, v);
         }
         merged.dfw.extend(w.gen.dfw);
+        residue.extend(w.residue);
+        deferred.extend(w.deferred);
     }
     if undone {
         if mark > 0 {
             kill_window_ids(db, &ids);
         }
+        // the DDL's settled residue goes by hand, its deferred work
+        // goes nowhere (Savepoint.cpp:459 DFW_delete_deferred)
+        apply_ddl_residue(db, &residue);
         // the PAGE DRAWS go the other way: written FORWARD over
         // whatever the undo left, because a generator carries no
         // versions for a dead transaction to hide. The dfw postings in
@@ -2348,6 +2390,8 @@ fn undo_window_unwind(database: &mut Option<Database>, mark: usize, undone: bool
         Some(parent) => {
             if !undone {
                 parent.folded.extend(ids);
+                parent.residue.extend(residue);
+                parent.deferred.extend(deferred);
             }
             for (k, v) in merged.draw {
                 parent.gen.draw.insert(k, v);
@@ -2359,6 +2403,22 @@ fn undo_window_unwind(database: &mut Option<Database>, mark: usize, undone: bool
         // the transaction's own window was the one undone
         None => db.windows.push(UndoWindow::new(WindowKind::Transaction)),
     }
+}
+
+/// Undo a rolled-back DDL's settled residue - `RDB$PAGES` slots blanked,
+/// the object's pages released - and forget every cached answer about
+/// the schema it was part of.
+fn apply_ddl_residue(db: &mut Database, residue: &[fire_crab_ods::DdlResidue]) {
+    if residue.is_empty() {
+        return;
+    }
+    if let Ok(mut work) = db.work_copy() {
+        match fire_crab_ods::dml::undo_ddl_residue(&mut work, db.page_size, residue) {
+            Ok(()) => db.install_dirty(work),
+            Err(e) => eprintln!("[srv] ddl residue not undone: {}", e),
+        }
+    }
+    db.invalidate_meta();
 }
 
 /// Merge the window at `idx` into its parent without undoing it - what
@@ -2373,6 +2433,8 @@ fn undo_window_collapse(database: &mut Option<Database>, idx: usize) {
     // its rows keep counting and are committed with the transaction, so
     // the ids go up with the generator record
     parent.folded.extend(w.ids());
+    parent.residue.extend(w.residue);
+    parent.deferred.extend(w.deferred);
     for (k, v) in w.gen.draw {
         parent.gen.draw.insert(k, v);
     }
@@ -2469,6 +2531,12 @@ fn commit_gen_dfw(database: &mut Option<Database>) {
 /// and the cache both start empty.
 fn reset_gen_windows(database: &mut Option<Database>) {
     if let Some(db) = database.as_mut() {
+        // the deferred DDL work survives the reset: the commit that
+        // follows applies it (a rollback has already unwound the stack,
+        // dropping it, before it gets here)
+        for w in db.windows.iter_mut() {
+            db.ddl_deferred.append(&mut w.deferred);
+        }
         db.windows.clear();
         db.windows.push(UndoWindow::new(WindowKind::Transaction));
         // tra_gen_ids dies with the transaction: entries the commit
@@ -2529,6 +2597,8 @@ fn load_database(path: &str) -> Option<Database> {
         lock_owner,
         image_undo: false,
         ddl_undo: false,
+            did_ddl: false,
+            ddl_deferred: Vec::new(),
         nested_tx: Vec::new(),
         page_size,
         path: p.to_string(),
@@ -19603,21 +19673,36 @@ fn execute_dml_collecting_inner(
         // generator windows, which is why it does not ask for one.
         Plan::SetGenerator { .. } => (db.work_copy()?, None),
         _ => {
-            // A SETTLED WRITE: only the image can take it back, which is
-            // what [Database::ddl_undo] says, and the write side has to
-            // be held to the end so nothing else commits inside the
-            // window that image covers ([Database::image_undo]).
+            // A DDL STATEMENT IS THE TRANSACTION'S: its catalog rows are
+            // written under the window's own id (Image::ddl_tx), so a
+            // ROLLBACK or a ROLLBACK TO takes them back by transaction
+            // state - the engine's own way (DdlNodes.epp STOREs under
+            // the user transaction). The write side is still held to
+            // the transaction's end: two transactions altering one
+            // object must not both land a version of its catalog row,
+            // and the engine's first-updater-wins refusal ("table N is
+            // used by transaction M", CacheVector.h newVersionBusy) is
+            // not built yet - holding the side is the conservative
+            // reading of it ([Database::image_undo]).
             db.image_undo = true;
-            db.ddl_undo = true;
+            db.did_ddl = true;
             // ...AND EVERY ANSWER THE METADATA CACHE HOLDS WAS ABOUT
             // THE OLD SCHEMA. Invalidated before the statement runs,
             // not after: the DDL itself reads the catalog as it works,
             // and a plan built from a cached answer mid-change would be
             // built from the schema this statement is replacing.
             db.invalidate_meta();
-            (db.work_copy()?, None)
+            let (w, tx) = db.work_copy_with_tx()?;
+            (w, Some(tx))
         }
     };
+    let is_ddl = !matches!(
+        plan,
+        Plan::Insert { .. } | Plan::Update { .. } | Plan::Delete { .. } | Plan::SetGenerator { .. }
+    );
+    if is_ddl {
+        work.ddl_tx = stmt_tx.map(u64::from);
+    }
     // WHOSE ROWS THIS STATEMENT COUNTS while it writes - what the
     // uniqueness check reads to decide whether a key is really taken.
     // It is the transaction's whole set of ids, not the one this
@@ -20514,13 +20599,24 @@ fn execute_dml_collecting_inner(
         }
         _ => return Err("not a DML plan".into()),
     };
+    // what the DDL left that no state takes back, and what it defers
+    // to COMMIT, move to the window: the published image carries
+    // neither (a work copy clones the Image whole)
+    work.ddl_tx = None;
+    let residue = std::mem::take(&mut work.ddl_residue);
+    let deferred = std::mem::take(&mut work.ddl_deferred);
     db.install_dirty(work);
+    if let Some(w) = db.windows.last_mut() {
+        w.residue.extend(residue);
+        w.deferred.extend(deferred);
+    }
     // the statement's work is installed, so the id it reserved is this
     // attachment's transaction now - and a statement that failed above
     // never got here, which is exactly the point
     if let Some(tx) = stmt_tx {
         db.adopt_tx(tx);
-    } else {
+    }
+    if is_ddl {
         // a DDL statement that LANDED: invalidate again, because what
         // is cacheable now is what it wrote
         db.invalidate_meta();
@@ -47514,13 +47610,9 @@ fn run_autonomous(
         // (this transaction has done DDL) over a body that has already
         // written. Has it? A different image is published for every
         // write; a read publishes nothing.
-        if d.ddl_undo {
-            if let Some(base) = d.windows.last().and_then(|w| w.base.as_ref()) {
-                if !std::sync::Arc::ptr_eq(base, &d.bytes()) {
-                    return Err(PsqlStop::Unsupported);
-                }
-            }
-        }
+        // (the image-restore shape is gone: a DDL statement's catalog
+        // rows are its transaction's, undone by state like any row)
+        let _ = d;
     }
     // OPEN IT: a fresh id, ACTIVE in the TIP, installed so the reads
     // inside the block see a file that has it.
@@ -47578,6 +47670,18 @@ fn run_autonomous(
         }
         let w = d.windows.remove(mark);
         d.windows.truncate(mark);
+        // its DDL: the residue undone if the block failed, the deferred
+        // work done if it commits - this block IS a transaction
+        if outcome.is_err() {
+            apply_ddl_residue(d, &w.residue);
+        } else if !w.deferred.is_empty() {
+            if let Ok(mut work) = d.work_copy() {
+                if fire_crab_ods::dml::apply_ddl_deferred(&mut work, d.page_size, &w.deferred).is_ok() {
+                    d.install_dirty(work);
+                }
+            }
+            d.invalidate_meta();
+        }
         w.ids().collect()
     };
     let Some(d) = db.as_mut() else { return Err(PsqlStop::Unsupported) };
@@ -51352,9 +51456,6 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                                         // done DDL, and the write side
                                         // is held while it could still
                                         // be put back.
-                                        if let Some(db) = database.as_mut() {
-                                            db.image_undo = true;
-                                        }
                                         savepoints.push((name.clone(), std::sync::Arc::clone(&img)));
                                         undo_window_push(
                                             &mut database,
@@ -52340,12 +52441,16 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 } else {
                     Vec::new()
                 };
-                // a DDL transaction's undo is an image in THIS process's
-                // memory - it cannot survive the death limbo promises to
-                // survive, so it refuses rather than half-promises
-                if database.as_ref().is_some_and(|d| d.ddl_undo || d.image_undo) {
+                // A DDL transaction PREPARES (the engine runs its deferred
+                // work at TRA_prepare, tra.cpp:1085, and limbo holds the
+                // catalog rows like any others) - except one with a DROP
+                // still pending: its page release is COMMIT's (dpm.epp's
+                // MRK_commit -> MRK_drop waits for the commit and the
+                // OAT), and a promise kept by memory this process may not
+                // have when the limbo resolves is no promise. Refused.
+                if database.as_ref().is_some_and(|d| d.windows.iter().any(|w| !w.deferred.is_empty())) {
                     if std::env::var("FC_SRV_TRACE").is_ok() {
-                        eprintln!("[srv] op_prepare on a DDL transaction refused");
+                        eprintln!("[srv] op_prepare on a transaction with a pending DROP refused");
                     }
                     respond_error(&mut s, &mut enc, GDS_WISH_LIST)?;
                     continue;
@@ -54429,6 +54534,8 @@ mod tests {
             lock_owner: 0,
             image_undo: false,
             ddl_undo: false,
+            did_ddl: false,
+            ddl_deferred: Vec::new(),
             attachments: {
                 let g = std::sync::Arc::new(DbGate::default());
                 g.attaches.store(1, std::sync::atomic::Ordering::SeqCst);
@@ -57361,6 +57468,8 @@ mod tests {
             lock_owner: 0,
             image_undo: false,
             ddl_undo: false,
+            did_ddl: false,
+            ddl_deferred: Vec::new(),
             attachments: {
                 let g = std::sync::Arc::new(DbGate::default());
                 g.attaches.store(1, std::sync::atomic::Ordering::SeqCst);
@@ -63551,6 +63660,8 @@ mod tests {
             lock_owner: 0,
             image_undo: false,
             ddl_undo: false,
+            did_ddl: false,
+            ddl_deferred: Vec::new(),
             attachments: {
                 let g = std::sync::Arc::new(DbGate::default());
                 g.attaches.store(1, std::sync::atomic::Ordering::SeqCst);

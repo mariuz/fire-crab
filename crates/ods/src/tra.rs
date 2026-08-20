@@ -114,21 +114,37 @@ pub fn apply_differences(diff: &[u8], newer_image: &[u8]) -> Option<Vec<u8>> {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct OwnTx {
     ids: Vec<u64>,
+    /// THE CATALOG READER'S RULE: every ACTIVE transaction's rows count.
+    /// A DDL statement's catalog rows carry the user transaction's id
+    /// now, and the readers that resolve names, formats and columns
+    /// have no attachment to ask whose transaction that is - so they
+    /// count it, as this server's shared pool already let every
+    /// attachment see an uncommitted DDL (recorded divergence: the
+    /// engine shows it to the owning transaction alone). What they do
+    /// NOT count any more is a DEAD or LIMBO version: the walk steps
+    /// behind it, which is what makes a rolled-back DDL disappear by
+    /// state.
+    any_active: bool,
 }
 
 impl OwnTx {
     /// The committed-only walk: a reader with no transaction of its
     /// own, which is what a tool reading a quiet file is.
     pub fn none() -> OwnTx {
-        OwnTx { ids: Vec::new() }
+        OwnTx { ids: Vec::new(), any_active: false }
     }
 
     pub fn one(id: u64) -> OwnTx {
-        OwnTx { ids: vec![id] }
+        OwnTx { ids: vec![id], any_active: false }
     }
 
     pub fn of<I: IntoIterator<Item = u64>>(ids: I) -> OwnTx {
-        OwnTx { ids: ids.into_iter().collect() }
+        OwnTx { ids: ids.into_iter().collect(), any_active: false }
+    }
+
+    /// The catalog reader's walk - see `any_active`.
+    pub fn catalog() -> OwnTx {
+        OwnTx { ids: Vec::new(), any_active: true }
     }
 
     pub fn push(&mut self, id: u64) {
@@ -330,7 +346,8 @@ pub fn visible_version_2pc_prefix(
         let counts = own.contains(current.transaction)
             || current.transaction == 0
             || (tips.state(current.transaction) == Some(TxState::Committed)
-                && snap.is_none_or(|s| s.sees(current.transaction)));
+                && snap.is_none_or(|s| s.sees(current.transaction)))
+            || (own.any_active && tips.state(current.transaction) == Some(TxState::Active));
         if counts {
             if current.flags & flags::DELETED != 0 {
                 return Ok(None); // the reader's row is a deleted stub
@@ -440,7 +457,8 @@ pub fn visible_exists_2pc(
         let counts = own.contains(current.transaction)
             || current.transaction == 0
             || (tips.state(current.transaction) == Some(TxState::Committed)
-                && snap.is_none_or(|s| s.sees(current.transaction)));
+                && snap.is_none_or(|s| s.sees(current.transaction)))
+            || (own.any_active && tips.state(current.transaction) == Some(TxState::Active));
         if counts {
             return Ok(current.flags & flags::DELETED == 0);
         }

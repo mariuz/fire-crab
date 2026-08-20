@@ -819,6 +819,7 @@ fn recno_is_live(file: &crate::Image, page_size: usize, rel: u16, recno: u64) ->
     }
     let seq = (recno / recs) as u32;
     let slot = (recno % recs) as u16;
+    let tips = crate::tra::TipChain::read(file, page_size);
     for dp_no in crate::pointer::relation_data_pages(file, page_size, rel) {
         let Some(dp) = crate::page_at(file, page_size, dp_no)
             .and_then(crate::data::DataPage::decode)
@@ -828,9 +829,14 @@ fn recno_is_live(file: &crate::Image, page_size: usize, rel: u16, recno: u64) ->
         if dp.sequence != seq {
             continue;
         }
-        // is_primary_record() already excludes CHAIN/FRAGMENT/BLOB
-        // AND the DELETED stub - exactly "a live row at this slot"
-        return dp.record(slot).is_some_and(|r| r.is_primary_record());
+        // "a live row at this slot" is the MVCC question, not the flag
+        // one: a version whose transaction is DEAD is no row (a
+        // rolled-back DDL's catalog row, a rolled-back INSERT's key),
+        // and a deleted stub over a live back version IS one. The
+        // catalog walk answers both - committed and active count
+        return dp.record(slot).is_some_and(|r| {
+            crate::data::catalog_image(file, page_size, &r, tips.as_ref()).is_some()
+        });
     }
     false
 }

@@ -82,6 +82,53 @@ pub use tra::{visible_rows, Snapshot, TipChain};
 pub struct Image {
     pages: Vec<std::sync::Arc<[u8]>>,
     page_size: usize,
+    /// THE TRANSACTION A DDL STATEMENT WRITES UNDER. While set, every
+    /// catalog row and back version the `ddl` module writes carries this
+    /// id instead of a freshly minted committed one (`dml::
+    /// allocate_committed_tx` answers it), so a ROLLBACK takes the
+    /// statement back by transaction state - the engine's own way
+    /// (DdlNodes.epp STOREs under the user transaction). `None` is the
+    /// settled write: the tools, and a server that has no transaction.
+    pub ddl_tx: Option<u64>,
+    /// What a DDL statement under `ddl_tx` wrote that NO transaction
+    /// state can take back - the residue a ROLLBACK must undo by hand.
+    pub ddl_residue: Vec<DdlResidue>,
+    /// What a DDL statement under `ddl_tx` must NOT do until COMMIT -
+    /// the engine's deferred work (dfw.epp): a dropped relation's pages
+    /// are released when the drop is final, not when it is said.
+    pub ddl_deferred: Vec<DdlDeferred>,
+}
+
+/// A settled side effect of a DDL statement (see [Image::ddl_residue]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DdlResidue {
+    /// an `RDB$PAGES` row - a system-transaction (tx 0) record the
+    /// engine refuses under any other id (dpm.epp get_header); undone
+    /// by blanking its directory slot, the post-sweep shape
+    SysPagesRow { page: u32, slot: u16 },
+    /// a page allocated for the new object - released back to its PIP
+    Page(u32),
+    /// a relation this transaction CREATED: every page it owns by the
+    /// time of the rollback - its pointer and root pages, and the data
+    /// pages the transaction's own INSERTs gave it - goes back, and its
+    /// `RDB$PAGES` rows with them (dpm.epp's MRK_rollback resolution:
+    /// DPM_delete_relation when the creator is dead)
+    CreatedRelation { rel: u16 },
+    /// an index this transaction CREATED: every bucket of the tree
+    /// (found by `btr_relation`/`btr_id`, so the pages later inserts
+    /// split into count too) released, the root slot zeroed
+    IndexTree { irt_page: u32, rel: u16, slot: usize },
+}
+
+/// Deferred work of a DDL statement (see [Image::ddl_deferred]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DdlDeferred {
+    /// release every page relation `rel` owns and wipe its `RDB$PAGES`
+    /// rows - dfw.epp delete_relation, at commit
+    DropRelation { rel: u16 },
+    /// an index root slot's state goes `irt_drop` - ods.h:456's
+    /// irt_commit -> irt_drop step, taken when the drop is final
+    DropIndexSlot { irt_page: u32, slot: usize },
 }
 
 impl Image {
@@ -94,7 +141,13 @@ impl Image {
         } else {
             bytes.chunks(page_size).map(std::sync::Arc::from).collect()
         };
-        Image { pages, page_size }
+        Image {
+            pages,
+            page_size,
+            ddl_tx: None,
+            ddl_residue: Vec::new(),
+            ddl_deferred: Vec::new(),
+        }
     }
 
     /// The whole image as one contiguous vector - for a whole-file write

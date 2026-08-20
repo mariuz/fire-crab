@@ -218,15 +218,13 @@ fn external_type_to_desc(ftype: i64, flength: i64) -> Option<(u8, u16)> {
 
 /// Decode every committed primary record of `rel` with `descs`.
 fn each_row<F: FnMut(Vec<Value>)>(file: &crate::Image, page_size: usize, rel: u16, descs: &[Descriptor], mut f: F) {
+    let tips = crate::tra::TipChain::read(file, page_size);
     for dp_no in relation_data_pages(file, page_size, rel) {
         let Some(dp) = crate::page_at(file, page_size, dp_no).and_then(DataPage::decode) else {
             continue;
         };
         for r in dp.records() {
-            if !r.is_primary_record() {
-                continue;
-            }
-            if let Some(image) = crate::data::assembled_image(file, page_size, &r) {
+            if let Some(image) = crate::data::catalog_image(file, page_size, &r, tips.as_ref()) {
                 f(decode_record(&image, descs));
             }
         }

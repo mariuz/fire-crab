@@ -314,6 +314,11 @@ pub fn begin_active_tx(file: &mut crate::Image, page_size: usize) -> Result<u64,
 /// A user-table write in an open transaction takes [begin_active_tx]
 /// instead and is committed at COMMIT.
 pub(crate) fn allocate_committed_tx(file: &mut crate::Image, page_size: usize) -> Result<u64, String> {
+    // A DDL STATEMENT UNDER A TRANSACTION writes under THAT id - the
+    // row is the transaction's to commit or kill (see Image::ddl_tx)
+    if let Some(tx) = file.ddl_tx {
+        return Ok(tx);
+    }
     // hdr_next_transaction @40 lives on the header, page 0
     let tx = u64_at(
         crate::page_at(file, page_size, 0).ok_or("no header page")?,
@@ -948,6 +953,80 @@ pub(crate) fn release_page(file: &mut crate::Image, page_size: usize, page_no: u
     Ok(())
 }
 
+/// Undo the settled residue of a rolled-back DDL statement (see
+/// [crate::DdlResidue]): `RDB$PAGES` slots blanked, the object's pages
+/// released. Runs AFTER the statement's transaction id is dead.
+pub fn undo_ddl_residue(
+    file: &mut crate::Image,
+    page_size: usize,
+    residue: &[crate::DdlResidue],
+) -> Result<(), String> {
+    for r in residue {
+        match *r {
+            crate::DdlResidue::SysPagesRow { page, slot } => {
+                let p = crate::page_mut(file, page_size, page).ok_or("RDB$PAGES page out of range")?;
+                let dir = DPG_RPT_OFFSET + slot as usize * 4;
+                put_u16(p, dir, 0);
+                put_u16(p, dir + 2, 0);
+            }
+            crate::DdlResidue::Page(no) => release_page(file, page_size, no)?,
+            crate::DdlResidue::CreatedRelation { rel } => {
+                crate::ddl::release_relation_storage(file, page_size, rel)?;
+            }
+            crate::DdlResidue::IndexTree { irt_page, rel, slot } => {
+                // every bucket of this tree: type 7, btr_relation @28,
+                // btr_id @32 (ods.h btree_page)
+                let buckets: Vec<u32> = file
+                    .pages()
+                    .enumerate()
+                    .filter(|(_, p)| {
+                        p[0] == PageType::Index as u8
+                            && p.len() > 32
+                            && u16_at(p, 28) == rel
+                            && p[32] as usize == slot
+                    })
+                    .map(|(i, _)| i as u32)
+                    .collect();
+                for b in buckets {
+                    release_page(file, page_size, b)?;
+                }
+                let page = crate::page_mut(file, page_size, irt_page).ok_or("irt page out of range")?;
+                let at = 24 + slot * 24;
+                if at + 24 <= page.len() {
+                    page[at..at + 24].fill(0);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Perform the deferred work of a COMMITTING DDL transaction (see
+/// [crate::DdlDeferred]) - dfw.epp's commit phases, the part this
+/// server defers.
+pub fn apply_ddl_deferred(
+    file: &mut crate::Image,
+    page_size: usize,
+    deferred: &[crate::DdlDeferred],
+) -> Result<(), String> {
+    for d in deferred {
+        match *d {
+            crate::DdlDeferred::DropRelation { rel } => {
+                crate::ddl::release_relation_storage(file, page_size, rel)?;
+            }
+            crate::DdlDeferred::DropIndexSlot { irt_page, slot } => {
+                let page = crate::page_mut(file, page_size, irt_page).ok_or("irt page out of range")?;
+                let at = 24 + slot * 24;
+                if at + 24 <= page.len() {
+                    put_u16(page, at + 18, 0); // irt_flags
+                    page[at + 20] = 6; // irt_drop (ods.h:456)
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Write a level-0 SEGMENTED blob into `rel`'s data pages: the 32-byte
 /// blh header (ods.h:969, offsets pinned by the static_asserts there)
 /// followed by the segments, each `[u16 length][bytes]` - exactly the
@@ -1177,8 +1256,27 @@ fn push_back_version(
         // copy keeps the rhdf header and forward pointer intact, so the
         // back version IS the old chain - fragments never point at the
         // head, so moving it moves nothing else
-        if rflags & (flags::CHAIN | flags::BLOB | flags::FRAGMENT | flags::DELETED) != 0 {
+        if rflags & (flags::CHAIN | flags::BLOB | flags::FRAGMENT) != 0 {
             return Err("target is not a live primary record version".into());
+        }
+        // A DELETED head whose transaction is DEAD (a rolled-back DROP's
+        // stub) is not the row - the version behind it is - but it is
+        // still the chain's head, and the engine writes the next version
+        // over such a head too (VIO_modify walks dead versions and
+        // leaves them for the garbage collector). It goes into the chain
+        // as a back version like any other; every reader steps past it.
+        if rflags & flags::DELETED != 0 {
+            let head_tx = crate::data::DataPage::decode(page)
+                .and_then(|dp| dp.record(slot))
+                .map(|r| r.transaction)
+                .unwrap_or(0);
+            let dead = head_tx != 0
+                && crate::tra::TipChain::read(file, page_size)
+                    .and_then(|t| t.state(head_tx))
+                    == Some(crate::tip::TxState::Dead);
+            if !dead {
+                return Err("target is not a live primary record version".into());
+            }
         }
         let format = rec[12];
         put_u16(&mut rec, 10, rflags | flags::CHAIN);

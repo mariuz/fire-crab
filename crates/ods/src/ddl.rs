@@ -265,15 +265,13 @@ fn walk_rows(
     descs: &[Descriptor],
     mut cb: impl FnMut(&[Value]),
 ) {
+    let tips = crate::tra::TipChain::read(file, page_size);
     for dp_no in relation_data_pages(file, page_size, rel) {
         let Some(dp) = crate::page_at(file, page_size, dp_no).and_then(DataPage::decode) else {
             continue;
         };
         for r in dp.records() {
-            if !r.is_primary_record() {
-                continue;
-            }
-            let Some(image) = crate::data::assembled_image(file, page_size, &r) else { continue };
+            let Some(image) = crate::data::catalog_image(file, page_size, &r, tips.as_ref()) else { continue };
             cb(&decode_record(&image, descs));
         }
     }
@@ -387,7 +385,12 @@ pub(crate) fn sys_insert(
     // RDB$PAGES rows must be system-transaction (tx 0) records - the
     // engine's get_header refuses anything else with isc_wrong_page
     let out = if rel == 0 {
-        dml::insert_record_system(file, page_size, rel, format_no, &image)?
+        let out = dml::insert_record_system(file, page_size, rel, format_no, &image)?;
+        if file.ddl_tx.is_some() {
+            // a tx-0 row no state can take back: the rollback's residue
+            file.ddl_residue.push(crate::DdlResidue::SysPagesRow { page: out.page_no, slot: out.slot });
+        }
+        out
     } else {
         dml::insert_record(file, page_size, rel, format_no, &image)?
     };
@@ -621,14 +624,12 @@ fn find_sys_row_slot(
 ) -> Option<(u32, u16)> {
     let formats = system_relation_formats(file, page_size, rel_name)?;
     let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
+    let tips = crate::tra::TipChain::read(file, page_size);
     for dp_no in relation_data_pages(file, page_size, rel) {
         let dp = crate::page_at(file, page_size, dp_no)
             .and_then(DataPage::decode)?;
         for r in dp.records() {
-            if !r.is_primary_record() {
-                continue;
-            }
-            let Some(image) = crate::data::assembled_image(file, page_size, &r) else { continue };
+            let Some(image) = crate::data::catalog_image(file, page_size, &r, tips.as_ref()) else { continue };
             if pred(&decode_record(&image, descs)) {
                 return Some((dp_no, r.slot));
             }
@@ -651,14 +652,12 @@ fn find_relations_row(
         .iter()
         .find(|c| c.name == "RDB$RELATION_NAME")
         .map(|c| c.field_id as usize)?;
+    let tips = crate::tra::TipChain::read(file, page_size);
     for dp_no in relation_data_pages(file, page_size, 6) {
         let dp = crate::page_at(file, page_size, dp_no)
             .and_then(DataPage::decode)?;
         for r in dp.records() {
-            if !r.is_primary_record() {
-                continue;
-            }
-            let Some(image) = crate::data::assembled_image(file, page_size, &r) else { continue };
+            let Some(image) = crate::data::catalog_image(file, page_size, &r, tips.as_ref()) else { continue };
             let vals = decode_record(&image, descs);
             if let Some(Value::Text(t)) = vals.get(name_fid) {
                 if t.trim_end().eq_ignore_ascii_case(table) {
@@ -1154,15 +1153,13 @@ pub fn rename_domain(
         .map(|c| c.field_id as usize)
         .ok_or("no RDB$FIELD_NAME")?;
     let mut hit: Option<(u32, u16, Vec<u8>, u8)> = None;
+    let tips = crate::tra::TipChain::read(file, page_size);
     for dp_no in relation_data_pages(file, page_size, 2) {
         let Some(dp) = crate::page_at(file, page_size, dp_no).and_then(DataPage::decode) else {
             continue;
         };
         for r in dp.records() {
-            if !r.is_primary_record() {
-                continue;
-            }
-            let Some(image) = crate::data::assembled_image(file, page_size, &r) else { continue };
+            let Some(image) = crate::data::catalog_image(file, page_size, &r, tips.as_ref()) else { continue };
             let vals = decode_record(&image, &f_descs);
             if text_eq(vals.get(name_fid), &old) {
                 hit = Some((dp_no, r.slot, image, r.format));
@@ -1205,15 +1202,13 @@ pub fn rename_domain(
     let rel_fid = rf_fid("RDB$RELATION_NAME").ok_or("no RDB$RELATION_NAME")?;
     let mut patches: Vec<(u32, u16, Vec<u8>, u8)> = Vec::new();
     let mut tables: Vec<String> = Vec::new();
+    let tips = crate::tra::TipChain::read(file, page_size);
     for dp_no in relation_data_pages(file, page_size, 5) {
         let Some(dp) = crate::page_at(file, page_size, dp_no).and_then(DataPage::decode) else {
             continue;
         };
         for r in dp.records() {
-            if !r.is_primary_record() {
-                continue;
-            }
-            let Some(image) = crate::data::assembled_image(file, page_size, &r) else { continue };
+            let Some(image) = crate::data::catalog_image(file, page_size, &r, tips.as_ref()) else { continue };
             let vals = decode_record(&image, &rf_descs);
             if !text_eq(vals.get(src_fid), &old) {
                 continue;
@@ -2750,15 +2745,13 @@ pub fn alter_column_position(
 /// `fid` - the check `SET NOT NULL` makes before it can succeed.
 fn column_has_nulls(file: &crate::Image, page_size: usize, rel: u16, fid: usize) -> bool {
     let formats = crate::relation_formats(file, page_size, rel);
+    let tips = crate::tra::TipChain::read(file, page_size);
     for dp_no in relation_data_pages(file, page_size, rel) {
         let Some(dp) = crate::page_at(file, page_size, dp_no).and_then(DataPage::decode) else {
             continue;
         };
         for r in dp.records() {
-            if !r.is_primary_record() {
-                continue;
-            }
-            let Some(image) = crate::data::assembled_image(file, page_size, &r) else { continue };
+            let Some(image) = crate::data::catalog_image(file, page_size, &r, tips.as_ref()) else { continue };
             let descs = formats
                 .iter()
                 .find(|(n, _)| *n == r.format)
@@ -3150,6 +3143,11 @@ pub fn create_table(
         )
     };
     if !external {
+        if file.ddl_tx.is_some() {
+            // the relation's storage is the rollback's residue - whatever
+            // it owns by then, the transaction's own rows' pages included
+            file.ddl_residue.push(crate::DdlResidue::CreatedRelation { rel: rel_id_u16 });
+        }
         {
             let page =
                 crate::page_mut(file, page_size, pointer_page).expect("pointer page out of range");
@@ -4865,8 +4863,15 @@ fn deferred_drop_index(
         .pages()
         .position(|p| p[0] == 6 && u16_at(p, 16) == rel)
         .ok_or("relation has no index root page")? as u32;
+    let slot = index_id.saturating_sub(1);
+    if file.ddl_tx.is_some() {
+        // the slot's state is COMMIT's to change (irt_commit -> irt_drop
+        // on commit, -> irt_normal on rollback, ods.h:456): deferred
+        file.ddl_deferred.push(crate::DdlDeferred::DropIndexSlot { irt_page, slot });
+        return Ok(());
+    }
     let page = crate::page_mut(file, page_size, irt_page).ok_or("irt page out of range")?;
-    let at = 24 + index_id.saturating_sub(1) * 24;
+    let at = 24 + slot * 24;
     if at + 24 > page.len() {
         return Err("index slot beyond the root page".into());
     }
@@ -5792,6 +5797,10 @@ fn allocate_index_slot(
         return Err("irt page full".into());
     }
 
+    if file.ddl_tx.is_some() {
+        // the slot and every bucket of the tree are the rollback's residue
+        file.ddl_residue.push(crate::DdlResidue::IndexTree { irt_page, rel, slot });
+    }
     let root_page = dml::allocate_page(file, page_size)?;
     crate::page_mut(file, page_size, root_page)
         .expect("index root page out of range")
@@ -5830,6 +5839,21 @@ fn allocate_index_slot(
 /// primary index fails the whole statement, as the engine's build does.
 #[allow(clippy::too_many_arguments)]
 fn backfill_index(
+    file: &mut crate::Image,
+    page_size: usize,
+    rel: u16,
+    slot: usize,
+    segs: &[(u16, u16, i8)],
+    descs: &[Descriptor],
+    unique: bool,
+    descending: bool,
+    primary: bool,
+) -> Result<(), String> {
+    backfill_index_inner(file, page_size, rel, slot, segs, descs, unique, descending, primary)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn backfill_index_inner(
     file: &mut crate::Image,
     page_size: usize,
     rel: u16,
@@ -5898,15 +5922,13 @@ fn walk_rows_at(
     descs: &[Descriptor],
     mut cb: impl FnMut(u32, u16, &[Value]),
 ) {
+    let tips = crate::tra::TipChain::read(file, page_size);
     for dp_no in relation_data_pages(file, page_size, rel) {
         let Some(dp) = crate::page_at(file, page_size, dp_no).and_then(DataPage::decode) else {
             continue;
         };
         for r in dp.records() {
-            if !r.is_primary_record() {
-                continue;
-            }
-            let Some(image) = crate::data::assembled_image(file, page_size, &r) else { continue };
+            let Some(image) = crate::data::catalog_image(file, page_size, &r, tips.as_ref()) else { continue };
             cb(dp_no, r.slot, &decode_record(&image, descs));
         }
     }
@@ -6052,41 +6074,6 @@ pub fn drop_table(file: &mut crate::Image, page_size: usize, name: &str) -> Resu
         class
     };
 
-    // pages the relation owns - catalog-free page-type scans, plus the
-    // page vectors of any level-1 blob slots on its data pages
-    let mut pages: Vec<u32> = Vec::new();
-    let data_pages = relation_data_pages(file, page_size, rel);
-    for &dp_no in &data_pages {
-        if let Some(dp) = crate::page_at(file, page_size, dp_no).and_then(DataPage::decode) {
-            for i in 0..dp.count {
-                let Some(b) = dp.slot_bytes(i) else { continue };
-                if b.len() >= 28 && u16_at(b, 10) & crate::data::flags::BLOB != 0 && b[27] == 1 {
-                    let mut at = 28;
-                    while at + 4 <= b.len() {
-                        let pg = u32_at(b, at);
-                        if pg == 0 {
-                            break;
-                        }
-                        pages.push(pg);
-                        at += 4;
-                    }
-                }
-            }
-        }
-        pages.push(dp_no);
-    }
-    for (i, p) in file.pages().enumerate() {
-        let owned = match p[0] {
-            4 => u16_at(p, 26) == rel,  // pointer: ppg_relation
-            6 => u16_at(p, 16) == rel,  // index root: irt_relation
-            7 => u16_at(p, 28) == rel,  // B-tree bucket: btr_relation @28
-            _ => false,
-        };
-        if owned {
-            pages.push(i as u32);
-        }
-    }
-
     // catalog rows -> deleted stubs (version chains the engine sweeps)
     let idx_pred = |names: Vec<String>, fid: usize| {
         move |values: &[Value]| {
@@ -6154,6 +6141,63 @@ pub fn drop_table(file: &mut crate::Image, page_size: usize, name: &str) -> Resu
             move |values| text_eq(values.get(rel_f), &n) && int_eq(values.get(obj_f), 0))?;
     }
 
+    // the storage: released NOW for a settled drop, at COMMIT under a
+    // transaction (dfw.epp delete_relation) - a rolled-back DROP keeps
+    // its pages, and only the deleted stubs above die with the id
+    if file.ddl_tx.is_some() {
+        file.ddl_deferred.push(crate::DdlDeferred::DropRelation { rel });
+    } else {
+        release_relation_storage(file, page_size, rel)?;
+    }
+    advance_oldest_transactions(file, page_size)?;
+    Ok(())
+}
+
+
+/// Release everything relation `rel` owns on disk: its `RDB$PAGES` rows
+/// wiped (system-transaction records with no chains - the slots are
+/// blanked, the post-sweep engine state; rel 0 has no indexes, so no
+/// entries dangle) and every page it owns - data pages and the page
+/// vectors of their level-1 blobs, pointer pages, index roots and
+/// B-tree buckets, found by catalog-free page-type scans - given back
+/// to the PIP. The settled half of DROP TABLE, and a DDL transaction's
+/// deferred work at COMMIT.
+pub(crate) fn release_relation_storage(file: &mut crate::Image, page_size: usize, rel: u16) -> Result<(), String> {
+    // pages the relation owns - catalog-free page-type scans, plus the
+    // page vectors of any level-1 blob slots on its data pages
+    let mut pages: Vec<u32> = Vec::new();
+    let data_pages = relation_data_pages(file, page_size, rel);
+    for &dp_no in &data_pages {
+        if let Some(dp) = crate::page_at(file, page_size, dp_no).and_then(DataPage::decode) {
+            for i in 0..dp.count {
+                let Some(b) = dp.slot_bytes(i) else { continue };
+                if b.len() >= 28 && u16_at(b, 10) & crate::data::flags::BLOB != 0 && b[27] == 1 {
+                    let mut at = 28;
+                    while at + 4 <= b.len() {
+                        let pg = u32_at(b, at);
+                        if pg == 0 {
+                            break;
+                        }
+                        pages.push(pg);
+                        at += 4;
+                    }
+                }
+            }
+        }
+        pages.push(dp_no);
+    }
+    for (i, p) in file.pages().enumerate() {
+        let owned = match p[0] {
+            4 => u16_at(p, 26) == rel,  // pointer: ppg_relation
+            6 => u16_at(p, 16) == rel,  // index root: irt_relation
+            7 => u16_at(p, 28) == rel,  // B-tree bucket: btr_relation @28
+            _ => false,
+        };
+        if owned {
+            pages.push(i as u32);
+        }
+    }
+
     // RDB$PAGES rows: system-transaction records with no chains - wipe
     // the slots (the post-sweep engine state); rel 0 has no indexes,
     // so no entries dangle
@@ -6182,10 +6226,8 @@ pub fn drop_table(file: &mut crate::Image, page_size: usize, name: &str) -> Resu
     for p in pages {
         dml::release_page(file, page_size, p)?;
     }
-    advance_oldest_transactions(file, page_size)?;
     Ok(())
 }
-
 
 /// Rewrite named columns of ONE system-relation row in place, at its
 /// current format. The row keeps its position (so its record number,
@@ -6306,15 +6348,13 @@ fn index_selectivity(
     let mut distinct: Vec<std::collections::BTreeSet<Vec<u8>>> =
         vec![std::collections::BTreeSet::new(); segs.len()];
     let mut rows = 0usize;
+    let tips = crate::tra::TipChain::read(file, page_size);
     for dp_no in relation_data_pages(file, page_size, rel) {
         let Some(dp) = crate::page_at(file, page_size, dp_no).and_then(DataPage::decode) else {
             continue;
         };
         for r in dp.records() {
-            if !r.is_primary_record() {
-                continue;
-            }
-            let Some(image) = crate::data::assembled_image(file, page_size, &r) else { continue };
+            let Some(image) = crate::data::catalog_image(file, page_size, &r, tips.as_ref()) else { continue };
             let values = decode_record(&image, descs);
             rows += 1;
             let null = Value::Null;
@@ -9261,6 +9301,11 @@ pub fn drop_role(file: &mut crate::Image, page_size: usize, name: &str) -> Resul
 /// OIT a dozen transactions behind next would misrepresent a cleanly
 /// closed database and make every attach start with catch-up work.
 fn advance_oldest_transactions(file: &mut crate::Image, page_size: usize) -> Result<(), String> {
+    // under a transaction the markers are that transaction's business:
+    // it is ACTIVE, and OAT cannot step past it
+    if file.ddl_tx.is_some() {
+        return Ok(());
+    }
     let t1 = dml::allocate_committed_tx(file, page_size)?;
     let t2 = dml::allocate_committed_tx(file, page_size)?;
     let _ = t2;

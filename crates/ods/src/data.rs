@@ -67,6 +67,35 @@ pub struct RecordHeader<'a> {
     pub frag_ptr: Option<(u32, u16)>,
 }
 
+/// What a CATALOG reader sees of the chain headed by `r`: the image of
+/// its visible version under [crate::tra::OwnTx::catalog] - committed
+/// and ACTIVE versions count, a DEAD or LIMBO head steps to the version
+/// behind it (a rolled-back DDL's row vanishes; a rolled-back DROP's
+/// stub gives its row back). Not a head at all (a back version, a
+/// fragment, a blob) answers None. Without a TIP chain to consult the
+/// old state-blind read stands: the primary record as it lies.
+pub fn catalog_image(
+    file: &crate::Image,
+    page_size: usize,
+    r: &RecordHeader,
+    tips: Option<&crate::tra::TipChain>,
+) -> Option<Vec<u8>> {
+    if r.flags & (flags::CHAIN | flags::FRAGMENT | flags::BLOB) != 0 {
+        return None;
+    }
+    match tips {
+        Some(t) => crate::tra::visible_version(file, page_size, r, t, &crate::tra::OwnTx::catalog())
+            .map(|v| v.image),
+        None => {
+            if r.is_primary_record() {
+                assembled_image(file, page_size, r)
+            } else {
+                None
+            }
+        }
+    }
+}
+
 impl RecordHeader<'_> {
     /// A primary, present record version - what `SELECT COUNT(*)`
     /// counts on a database with no uncommitted work: not a back
