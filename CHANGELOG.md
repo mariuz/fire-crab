@@ -13,6 +13,29 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-08-20 — OIT is one below the first interesting id
+
+### Fixed
+- **Rolled-back rows came back after the engine's sweep.** fire-crab
+  wrote `hdr_oldest_transaction` AT the first non-committed id; the
+  engine's `transaction_start` writes it one BELOW (`--oldest`,
+  tra.cpp). With a dead final writer D and OIT = D the engine's sweep
+  skipped D's versions, advanced OIT past D, and everything below OIT
+  is assumed committed - 200 rolled-back rows resurrected. Measured
+  with the header patched by hand: OIT = D - 1 and the sweep collects.
+  Pre-existing, bisected against the previous commit; found by the
+  full sweep (`serve-real-undo`). `update_oldest` applies the rule,
+  monotonic like the engine's.
+- The recorded "one display slot apart" convention claim was wrong:
+  `hdr_next_transaction` is the highest id assigned on both sides.
+
+### Gated
+- `serve-real-undo` 16/16 again; `serve-real-oldesttx` rewritten to
+  one shared `last = Next` definition - fc and the engine answer the
+  same (1 0 0) triple on the committed and dead-final-writer
+  scenarios; the dead-mid-writer divergence (engine undoes and marks
+  committed, fc leaves `tra_dead`) re-pinned at (2 0 0) vs (1 0 0).
+
 ## 2026-08-20 — DDL is the transaction's
 
 ### Converted

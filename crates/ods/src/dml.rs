@@ -225,11 +225,12 @@ pub fn set_tx_state(
 ///
 /// Both scans start from the STORED values - the fields only move
 /// forward, so the work is bounded by how far they advance, not by the
-/// id space. NOTE the display convention: this server's
-/// `hdr_next_transaction` holds the LAST id assigned where the engine
-/// stores the next to assign, so `gstat -h` on a file this server wrote
-/// shows OAT = Next + 1 after a quiet commit where the engine shows
-/// OAT = Next - the same real ids, one display slot apart.
+/// id space. `hdr_next_transaction` is the HIGHEST id assigned, on this
+/// server and on the engine alike (tra.cpp bump_transaction_id stores
+/// the id it just handed out; an older note here claimed a one-slot
+/// display difference - there is none). OIT lands ONE BELOW the first
+/// interesting id (the engine's `--oldest`), so after a quiet commit
+/// both show OIT = Next - 1, OAT = OST = Next.
 pub fn update_oldest(
     file: &mut crate::Image,
     page_size: usize,
@@ -239,12 +240,23 @@ pub fn update_oldest(
         let hdr = crate::page_at(file, page_size, 0).ok_or("no header page")?;
         (u64_at(hdr, 40), u64_at(hdr, 48).max(1), u64_at(hdr, 56).max(1))
     };
+    let stored_oit = oit;
     {
         let chain = crate::tra::TipChain::read(file, page_size).ok_or("no TIP chain")?;
         if include_oit {
             while oit <= last && chain.state(oit) == Some(crate::tip::TxState::Committed) {
                 oit += 1;
             }
+            // THE ENGINE'S `--oldest` (tra.cpp transaction_start: "if
+            // (--oldest > dbb_oldest_transaction) dbb_oldest_transaction
+            // = oldest"): OIT is ONE BELOW the first interesting id, and
+            // it only ever moves up. Measured to matter: a dead final
+            // writer D with OIT = D makes the ENGINE's sweep skip D's
+            // versions (nothing at or above OIT is "old" to it), then
+            // advance OIT past D - and everything below OIT is assumed
+            // committed, so the rolled-back rows came BACK (202 of
+            // them). With OIT = D - 1 the sweep collects them.
+            oit = oit.saturating_sub(1).max(stored_oit);
         }
         while oat <= last && chain.state(oat) != Some(crate::tip::TxState::Active) {
             oat += 1;

@@ -46,6 +46,8 @@ One line each; the gate is the proof.
 
 ## Stale claims retired
 
+- "`hdr_next_transaction` is stored one display slot apart (fc: last assigned, engine: next to assign)" — FALSE, read off tra.cpp `bump_transaction_id` on 2026-08-20: both store the highest id assigned. The one-slot difference was fc's OIT sitting AT the first interesting id where the engine's `--oldest` puts it one below — and that was a LIVE bug: the engine's sweep over an fc-written file resurrected 200 rolled-back rows (`serve-real-undo`). Fixed in `update_oldest`; `serve-real-oldesttx` asserts the same triple on both sides now.
+
 An audit of the history file (2026-08-20) found fifteen places where a
 paragraph says "still to do" and a later paragraph, higher up, closed
 it. Recorded here once so nobody re-opens them:
@@ -185,7 +187,6 @@ Each is asserted by its gate so a change shows:
 - the engine stores a text value of exactly 4× the declared length, silently truncated (a buffer-sizing defect); fc refuses (`serve-real-charset`);
 - the engine's string→double is not correctly rounded; fc is (`serve-real-textnum` compares to 16 digits);
 - a codepage hole transliterates to U+0000 on the engine; fc keeps the C1 carrier so every table stays a bijection (`serve-real-xlit`);
-- `hdr_next_transaction` holds the LAST id assigned where the engine stores the next (one display slot, by design);
 - a rolled-back writer pins fc's OIT; a read-only transaction burns no id here (`serve-real-oldesttx`, gstat-only);
 - a conditional's text result is VARYING here, padded CHAR of the widest branch there; aggregates in a scalar subquery describe BIGINT (`serve-real-decode`, `qualname`);
 - generator draws on a DML that fails on row k: the engine draws k, fc draws all (`serve-real-genwrite`);

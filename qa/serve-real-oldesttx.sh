@@ -2,41 +2,40 @@
 # The OIT/OAT/OST bookkeeping `gstat -h` reads - fire-crab and the engine
 # driven through the SAME node scenarios on twin files, headers compared.
 #
-# The engine recomputes the three "Oldest" header fields in
-# TRA_update_oldest: OIT at a transaction's START (so after an
-# all-committed history it lands on the LAST id - the starting
-# transaction is itself active - and that transaction's own commit does
-# not advance it past its own id), OAT/OST at start AND end (one past
-# the last id when nothing is active). fire-crab now maintains the same
-# law at begin_active_tx / commit_tx / kill_tx / prepare_tx.
+# The engine recomputes the three "Oldest" fields at a transaction's
+# START (tra.cpp transaction_start): OIT is ONE BELOW the first id whose
+# state is not committed (`--oldest`) - after an all-committed history
+# that is the last id minus one, since the starting transaction is
+# itself active; OAT is the first active id, or the starting id itself
+# when nothing else is active; OST follows OAT. COMMIT and ROLLBACK
+# write no header field. `hdr_next_transaction` is the HIGHEST id
+# assigned on both sides (tra.cpp bump_transaction_id writes the id it
+# just handed out) - the old note that the two servers store it "one
+# slot apart" was wrong, and so was fire-crab's OIT, which sat AT the
+# first interesting id instead of below it. That mattered: a dead final
+# writer D with OIT = D made the ENGINE's sweep skip D's versions and
+# then advance OIT past D, after which everything below OIT is assumed
+# committed - 200 rolled-back rows came back (qa/serve-real-undo.sh).
 #
 # RAW ids cannot be twinned: node-firebird burns internal transactions
-# against the engine that fire-crab serves without ids, and the two
-# servers store `hdr_next_transaction` one display slot apart (engine:
-# next-to-assign; fire-crab: last-assigned). What IS pinned is the LAW,
-# as offsets from the last assigned id:
+# against the engine that fire-crab serves without ids. What IS pinned
+# is the LAW, as offsets from the last assigned id, the SAME definition
+# on both sides:
 #
-#     (last - OIT,  OAT - last,  OST - OAT)
+#     (last - OIT,  OAT - last,  OST - OAT)      last = Next transaction
 #
-# per side: the engine shows (0 1 0) after a plain committed workload,
-# fire-crab (0 0 0) - one display slot apart BY DESIGN, because the
-# engine's validation (pag.cpp 266) reads the fields by its own
-# convention and an fc OAT past its stored next field would read as
-# corruption on every engine-side open (measured exactly that way:
-# gfix -v on an fc-written file raised "next transaction older than
-# oldest active transaction (266)" until the clamp).
+# (1 0 0) after a plain committed workload, on both.
 #
-# Two knowingly-divergent scenarios are PINNED per side too:
-#   * a rolled-back writer: the engine undoes it and marks it COMMITTED
-#     (rollback via undo log), so its OIT moves past; fire-crab's
-#     rollback-by-state leaves tra_dead (the engine's own no-undo path)
-#     and OIT PINS there at the next begin. gstat-only divergence,
-#     recorded in the roadmap.
+# Two knowingly-divergent scenarios are PINNED per side:
+#   * a rolled-back writer with a commit AFTER it: the engine undoes it
+#     through its undo log and marks it COMMITTED, so its OIT moves
+#     past; fire-crab's rollback-by-state leaves tra_dead (the engine's
+#     own no-undo path) and OIT pins one below it at the next begin.
+#     gstat-only divergence, recorded in the roadmap.
 #   * a read-only transaction: the engine burns an id; fire-crab
 #     allocates lazily on first write, so the header does not move.
 #
 #   qa/serve-real-oldesttx.sh [port]
-
 set -u
 FCWIRE="${FCWIRE:-$(dirname "$0")/../target/release/fcwire}"
 ISQL="${ISQL:-isql}"
@@ -115,7 +114,7 @@ fields() { "$GSTAT" -h "$1" | grep -E "Oldest transaction|Oldest active|Oldest s
 offsets() { # <db> <engine|crab>
     set -- $(fields "$1") "$2"
     oit=$1; oat=$2; ost=$3; next=$4
-    if [ "$5" = engine ]; then last=$((next - 1)); else last=$next; fi
+    last=$next
     echo "$((last - oit)) $((oat - last)) $((ost - oat))"
 }
 
@@ -149,25 +148,25 @@ law() { # <label> <scenario> <crab-triple> <engine-triple>
     fi
 }
 
-law "an all-committed history: OIT at the last id, nothing active" \
-    "commits3" "0 0 0" "0 1 0"
+law "an all-committed history: OIT one below the last id, nothing active" \
+    "commits3" "1 0 0" "1 0 0"
 law "a dead FINAL writer: same shape (OIT was written at its begin)" \
-    "deadlast" "0 0 0" "0 1 0"
+    "deadlast" "1 0 0" "1 0 0"
 
 # --- the two recorded divergences, pinned per side ---------------------
 # a dead writer with a commit AFTER it: the next begin recomputes OIT and
 # fire-crab PINS it at the dead id (tra_dead stays interesting), where
 # the engine has undone-and-committed the rollback and moves past. The
 # dead id here is last-1 (the commit after it is last), so the fc triple
-# is (1 0 0) against the engine's (0 1 0).
+# is (2 0 0) - OIT one below the dead id - against the engine's (1 0 0).
 ran=$((ran + 1))
 scen "deadmid"
 a=$(offsets "$A" crab)
 b=$(offsets "$B" engine)
-if [ "$a" = "1 0 0" ] && [ "$b" = "0 1 0" ]; then
-    echo "OK   a dead mid-history writer: fc pins OIT at it (1 0 0), the engine's undo moves past (0 1 0)"
+if [ "$a" = "2 0 0" ] && [ "$b" = "1 0 0" ]; then
+    echo "OK   a dead mid-history writer: fc pins OIT below it (2 0 0), the engine's undo moves past (1 0 0)"
 else
-    echo "DIFF dead mid-history writer: fc ($a) expected (1 0 0), engine ($b) expected (0 1 0)"
+    echo "DIFF dead mid-history writer: fc ($a) expected (2 0 0), engine ($b) expected (1 0 0)"
     fail=1
 fi
 
@@ -179,10 +178,10 @@ scen "readonly"
 a=$(fields "$A")
 base=$(fields "$BASE")
 b=$(offsets "$B" engine)
-if [ "$a" = "$base" ] && [ "$b" = "0 1 0" ]; then
+if [ "$a" = "$base" ] && [ "$b" = "1 0 0" ]; then
     echo "OK   a read-only transaction: fc header untouched (lazy id), engine law holds ($b)"
 else
-    echo "DIFF read-only: fc [$a] vs baseline [$base]; engine ($b) expected (0 1 0)"
+    echo "DIFF read-only: fc [$a] vs baseline [$base]; engine ($b) expected (1 0 0)"
     fail=1
 fi
 
