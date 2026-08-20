@@ -214,11 +214,65 @@ probe_other() { # <conn-prefix> <db>
     wait
 }
 eo=$(probe_other "127.0.0.1/$REAL" "$DBE"); fo=$(probe_other "127.0.0.1/$PORT" "$DBF")
-if [ "$eo" = "$fo" ]; then
-    ran=$((ran + 1)); echo "OK   7 a second attachment's view of an uncommitted CREATE TABLE [$eo]"
-else
-    bound "7 a second attachment's view of an uncommitted CREATE TABLE" "$eo" "$fo"
-fi
+check "7 a second attachment's view of an uncommitted CREATE TABLE (RDB\$RELATIONS)" "$fo" "$eo"
+
+# --- 9. TWO TRANSACTIONS: first updater wins, DML and reads unaffected --
+# A holds an uncommitted DDL for 3 s (a background isql that sleeps and
+# ROLLS BACK); B starts 1 s later. The engine refuses a second DDL on
+# the same RELATION at once - no wait, even under WAIT (CacheVector.h
+# newVersionBusy / busyError, measured 60-100 ms against the hold) -
+# and leaves DML, reads and index DDL alone. Both sides are driven the
+# same way; transaction and relation numbers are normalised, since the
+# raw ids cannot be twinned.
+pair() { # <conn> <A-statement> <B-statements>
+    ( printf 'SET AUTODDL OFF;\n%s\nSHELL sleep 3;\nROLLBACK;\n' "$2" |
+        timeout 30 "$ISQL" -q -user "$U" -pas "$P" "$1" >/dev/null 2>&1 & )
+    sleep 1
+    printf 'SET AUTODDL OFF;\nSET HEADING OFF;\n%s\nROLLBACK;\n' "$3" |
+        timeout 30 "$ISQL" -q -user "$U" -pas "$P" "$1" 2>&1 |
+        sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -v '^$' |
+        sed -E 's/transaction [0-9]+/transaction N/; s/table ([0-9]+|id=[0-9]+)/table N/' | tr '\n' '|'
+    sleep 3
+}
+bothpair() { # <label> <A> <B>
+    local e c
+    e=$(pair "127.0.0.1/$REAL:$DBE" "$2" "$3"); c=$(pair "127.0.0.1/$PORT:$DBF" "$2" "$3")
+    ran=$((ran + 1))
+    if [ "$e" = "$c" ]; then echo "OK   $1 [$e]"
+    else echo "DIFF $1"; echo "     engine: $e"; echo "     fc:     $c"; fail=1; fi
+}
+eng "CREATE TABLE C1 (X INTEGER); CREATE TABLE D2 (X INTEGER); CREATE TABLE K (X INTEGER); COMMIT; INSERT INTO C1 VALUES (1); INSERT INTO D2 VALUES (1); COMMIT;" >/dev/null
+crab "CREATE TABLE C1 (X INTEGER); CREATE TABLE D2 (X INTEGER); CREATE TABLE K (X INTEGER); COMMIT; INSERT INTO C1 VALUES (1); INSERT INTO D2 VALUES (1); COMMIT;" >/dev/null
+bothpair "9 ALTER over an uncommitted ALTER: refused at once, the engine's vector" \
+    "ALTER TABLE C1 ADD Y INT;" "ALTER TABLE C1 ADD Z INT;"
+bothpair "9 DROP over an uncommitted ALTER: busy in another thread" \
+    "ALTER TABLE C1 ADD Y INT;" "DROP TABLE C1;"
+bothpair "9 DML and a read over an uncommitted ALTER: unaffected" \
+    "ALTER TABLE C1 ADD Y INT;" "INSERT INTO C1 VALUES (2); SELECT COUNT(*) FROM C1;"
+bothpair "9 CREATE INDEX over an uncommitted ALTER: a different element, allowed" \
+    "ALTER TABLE C1 ADD Y INT;" "CREATE INDEX C1_IX ON C1 (X);"
+bothpair "9 CREATE over an uncommitted CREATE of the same name: already exists" \
+    "CREATE TABLE NEWT (X INT);" "CREATE TABLE NEWT (X INT);"
+bothpair "9 ALTER over an uncommitted DROP: refused at once" \
+    "DROP TABLE D2;" "ALTER TABLE D2 ADD Z INT;"
+bothpair "9 DML and a read over an uncommitted DROP: the old table, unaffected" \
+    "DROP TABLE D2;" "INSERT INTO D2 VALUES (2); SELECT COUNT(*) FROM D2;"
+bothpair "9 CREATE INDEX beside an uncommitted CREATE INDEX on the table: allowed" \
+    "CREATE INDEX K_IX ON K (X);" "CREATE INDEX K_IX2 ON K (X);"
+# an uncommitted CREATE is invisible to another transaction's name
+# resolution: both refuse; the VECTOR differs (engine -204 Table unknown,
+# fc's generic refusal for an unknown table - pre-existing, recorded)
+ran=$((ran + 1))
+e=$(pair "127.0.0.1/$REAL:$DBE" "CREATE TABLE NEWT (X INT);" "SELECT COUNT(*) FROM NEWT;")
+c=$(pair "127.0.0.1/$PORT:$DBF" "CREATE TABLE NEWT (X INT);" "SELECT COUNT(*) FROM NEWT;")
+case "$e|$c" in
+    *"Statement failed"*"|"*"Statement failed"*) echo "OK   9 another transaction's uncommitted CREATE TABLE is not visible to a read (both refuse)";;
+    *) echo "DIFF 9 uncommitted CREATE visible: engine [$e] fc [$c]"; fail=1;;
+esac
+ran=$((ran + 1))
+busy=$(grep -c 'ddl busy' "$LOG")
+if [ "$busy" -ge 3 ]; then echo "OK   coverage: $busy first-updater refusals in the trace"; else
+    echo "DIFF coverage: only [$busy] first-updater refusals"; fail=1; fi
 
 # --- 8. COVERAGE: the undo was transaction state, and the residue went ---
 ran=$((ran + 1))

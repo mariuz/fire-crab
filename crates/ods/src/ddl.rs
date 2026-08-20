@@ -6229,6 +6229,58 @@ pub(crate) fn release_relation_storage(file: &mut crate::Image, page_size: usize
     Ok(())
 }
 
+/// The transaction that holds an UNCOMMITTED version of relation `name`'s
+/// `RDB$RELATIONS` row - the head version's id when its state is ACTIVE
+/// (an ALTER's new version, a DROP's deleted stub, a CREATE's first
+/// version) - or None when the row's head is settled. The engine's
+/// first-updater-wins check reads the same fact off its metadata
+/// cache's version list (CacheVector.h isAvailable: OCCUPIED by a
+/// transaction that is still active); measured: the second ALTER or
+/// DROP fails at once, no wait, even under WAIT. Read WIDE: every
+/// active transaction's version is exactly what is looked for.
+pub fn relation_head_owner(file: &crate::Image, page_size: usize, name: &str) -> Option<(u64, u16)> {
+    let want = name.trim().trim_matches('"').to_ascii_uppercase();
+    let formats = system_relation_formats(file, page_size, "RDB$RELATIONS")?;
+    let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
+    let cols = relation_columns(file, page_size, "RDB$RELATIONS");
+    let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let name_fid = fid("RDB$RELATION_NAME")?;
+    let id_fid = fid("RDB$RELATION_ID")?;
+    let tips = crate::tra::TipChain::read(file, page_size)?;
+    for dp_no in relation_data_pages(file, page_size, 6) {
+        let Some(dp) = crate::page_at(file, page_size, dp_no).and_then(DataPage::decode) else {
+            continue;
+        };
+        for r in dp.records() {
+            if r.flags & (crate::data::flags::CHAIN | crate::data::flags::FRAGMENT | crate::data::flags::BLOB) != 0 {
+                continue;
+            }
+            if r.transaction == 0 || tips.state(r.transaction) != Some(crate::tip::TxState::Active) {
+                continue;
+            }
+            // the name: off the head, or - for a DROP's stub - off the
+            // committed version behind it (the committed-only walk steps
+            // past an active head)
+            let image = if r.flags & crate::data::flags::DELETED == 0 {
+                crate::data::assembled_image(file, page_size, &r)
+            } else {
+                crate::tra::visible_version(file, page_size, &r, &tips, &crate::tra::OwnTx::none())
+                    .map(|v| v.image)
+            };
+            let Some(image) = image else { continue };
+            let values = decode_record(&image, descs);
+            if text_eq(values.get(name_fid), &want) {
+                let rel = match values.get(id_fid) {
+                    Some(Value::Int(i)) => *i as u16,
+                    _ => 0,
+                };
+                return Some((r.transaction, rel));
+            }
+        }
+    }
+    None
+}
+
 /// Rewrite named columns of ONE system-relation row in place, at its
 /// current format. The row keeps its position (so its record number,
 /// and every index entry pointing at it, stay valid) - which is only

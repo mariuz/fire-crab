@@ -42,6 +42,7 @@ One line each; the gate is the proof.
 | packaged procedures | a package qualifier resolves down the search path; `RDB$PROFILER` native no-ops with the engine's arity | `serve-real-pkgproc` 20 |
 | fragmenting store | records larger than a page chain the engine's way; UPDATE/DELETE of a fragmented head | `serve-real-fragstore` 13 |
 | UNIQUE is walk-order | enforcement row-at-a-time in RECNO order, 23000 byte-exact; the sub-9-byte RHDF corruption found and fixed with it | `serve-real-uniqueorder` |
+| transactional DDL | catalog rows under the user transaction's id, undo by state + journaled residue, deferred drops; first-updater-wins on a relation with the engine's vector; owner-only schema visibility | `serve-real-ddltx` 32 |
 | the file grows the engine's way | pointer-page chain, PIP chain, SCN pages at every `pagesPerSCN·N`, TIP chain — each crossed by fc and read by the engine (count, `gfix -v -full`, a write of its own on the new structure, a level-1 nbackup over fc's late pages), and the reverse | `serve-real-growth` 32 |
 
 ## Stale claims retired
@@ -85,7 +86,7 @@ stamping that knew page 2 only with 2,043 slots where the engine reads
 engine's increment reads the SCN SLOTS, nbackup.cpp:1462). All four
 now follow the engine's own allocator; see "The growth chunk" below.
 
-### B. Transactional DDL — slice 1 DONE (2026-08-20), slice 2 open
+### B. Transactional DDL — DONE (2026-08-20, slices 1 + 2)
 
 **Done (`qa/serve-real-ddltx.sh` 22):** a DDL statement's catalog rows
 are written under the transaction's own id (`Image::ddl_tx` —
@@ -106,20 +107,39 @@ are gone; `op_prepare` on a DDL transaction is allowed unless a DROP
 is pending (its page release is COMMIT's, and limbo may outlive this
 process's journal).
 
-**Open (slice 2):** the write side is still HELD for a DDL
-transaction's life — the engine's first-updater-wins on the metadata
-cache's version list ("table N is used by transaction M",
-CacheVector.h:947 `newVersionBusy`, immediate, no wait) is not built,
-and holding the side is the conservative reading of it. Per-transaction
-schema VISIBILITY: the catalog readers count every ACTIVE transaction's
-rows (no attachment to ask), where the engine shows an uncommitted
-CREATE TABLE to its owner alone (`att_meta_transaction`, read-committed
-with the owner's number). `RDB$FORMATS` is written at statement time
-here, at COMMIT there (DFW `makeFormat`; measured 0 before / 1 after).
-A limbo DDL transaction resolved by `gfix -commit` after a restart
-leaves its residue un-released (orphan pages, as the engine's own lazy
-markers do until reclaimed). `ddl_undo`/`image_undo` fields and the
-`restore_db` path survive as dead code to delete.
+**Slice 2 DONE (2026-08-20, `serve-real-ddltx` 22 → 32, zero
+recorded boundaries):** the write-side hold for a DDL transaction is
+gone. In its place, the engine's FIRST-UPDATER-WINS on a relation
+(`ddl::relation_head_owner`: the `RDB$RELATIONS` head version's
+transaction when ACTIVE — an ALTER's new version, a DROP's stub, a
+CREATE's first row): an ALTER or DROP of a relation another active
+transaction holds a version of refuses AT ONCE, no wait even under WAIT
+(measured 60–100 ms against a 3 s hold), with the engine's own vector —
+`isc_no_meta_update` / `<VERB> TABLE @1 failed` / `isc_random`
+"newVersion: table N is used by transaction M" (a DROP: "table id=N busy
+in another thread - operation failed"). DML, reads and index DDL are
+unaffected (CacheVector.h: a different cache element). Per-transaction
+SCHEMA VISIBILITY: a thread-local reader view (`tra::ReaderViewGuard`,
+set per request from the attachment's own ids and refreshed whenever
+they change — an adopted id, an autonomous block opened or closed, an
+undo) makes `catalog_image` owner-only, so another transaction's
+uncommitted CREATE TABLE is "unknown" to name resolution, while a DDL
+statement and the unique-key liveness test read WIDE (a second CREATE
+of the name says "already exists", as measured). The shared metadata
+cache is bypassed by an attachment with uncommitted DDL and invalidated
+when such a transaction commits.
+
+**Still recorded:** `RDB$FORMATS` is written at statement time here, at
+COMMIT there (DFW `makeFormat`; measured 0 before / 1 after). A limbo DDL
+transaction resolved by `gfix -commit` after a restart leaves its
+residue un-released (orphan pages, as the engine's own lazy markers do
+until reclaimed). An uncommitted table is "unknown" here with fc's
+generic unknown-table refusal where the engine spells −204 (the
+pre-existing vector boundary). Inside a PSQL body the reader view is the
+enclosing transaction's; an autonomous block sees the outer's
+uncommitted tables where the engine's separate transaction would not.
+`ddl_undo`/`image_undo` and the `restore_db` path survive as dead code
+to delete.
 
 ### C. Wire surface
 
@@ -257,11 +277,9 @@ pointer-page and TIP page numbers is the next step when it dominates.
 
 ## Next, in order
 
-- **B, transactional DDL, slice 2** — first-updater-wins on the catalog
-  (release the write-side hold), per-transaction schema visibility.
-- **C, blob writes + COMMIT/ROLLBACK RETAIN — THE NEXT CHUNK** if slice 2
-  is deferred: the two most common client operations a real driver
-  issues that this server cannot answer at all.
+- **C, blob writes + COMMIT/ROLLBACK RETAIN — THE NEXT CHUNK**: the two
+  most common client operations a real driver issues that this server
+  cannot answer at all.
 - **D, the MERGE executor** — the BLR is already compiled and tested;
   only the executor is missing.
 - **G, the external sort** — every sort and hash build is bounded by

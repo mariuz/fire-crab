@@ -84,8 +84,13 @@ pub fn catalog_image(
         return None;
     }
     match tips {
-        Some(t) => crate::tra::visible_version(file, page_size, r, t, &crate::tra::OwnTx::catalog())
-            .map(|v| v.image),
+        Some(t) => {
+            // the thread's reader view when a request set one (owner-only:
+            // the engine's per-transaction schema visibility), the wide
+            // catalog walk otherwise
+            let own = crate::tra::reader_view().unwrap_or_else(crate::tra::OwnTx::catalog);
+            crate::tra::visible_version(file, page_size, r, t, &own).map(|v| v.image)
+        }
         None => {
             if r.is_primary_record() {
                 assembled_image(file, page_size, r)

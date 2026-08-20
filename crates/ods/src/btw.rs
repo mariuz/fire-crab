@@ -834,8 +834,18 @@ fn recno_is_live(file: &crate::Image, page_size: usize, rel: u16, recno: u64) ->
         // rolled-back DDL's catalog row, a rolled-back INSERT's key),
         // and a deleted stub over a live back version IS one. The
         // catalog walk answers both - committed and active count
+        // ALWAYS THE WIDE WALK: a key is taken by any row that counts for
+        // anybody - committed, or any ACTIVE transaction's (the writer's
+        // own included, whatever view the request set: an autonomous
+        // block's id is younger than the request's reader view)
         return dp.record(slot).is_some_and(|r| {
-            crate::data::catalog_image(file, page_size, &r, tips.as_ref()).is_some()
+            if r.flags & (crate::data::flags::CHAIN | crate::data::flags::FRAGMENT | crate::data::flags::BLOB) != 0 {
+                return false;
+            }
+            match tips.as_ref() {
+                Some(t) => crate::tra::visible_version(file, page_size, &r, t, &crate::tra::OwnTx::catalog()).is_some(),
+                None => r.is_primary_record(),
+            }
         });
     }
     false

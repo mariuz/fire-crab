@@ -340,6 +340,31 @@ const GDS_NO_META_UPDATE: i32 = 335544351;
 /// probed dyn_dup_table + (dyn# - 132), checked against dyn_dup_index).
 /// `None` for a plan this wrapper does not carry: it falls through to
 /// the generic vector, unchanged.
+/// isc_dsql_alter_table_failed - "ALTER TABLE @1 failed" (sqlerr.h 999)
+const ALTER_TABLE_FAILED: i32 = 336397287;
+
+/// The relation a DDL statement takes a NEW VERSION of - the object the
+/// engine's first-updater-wins check guards. CREATE TABLE makes one (no
+/// conflict to find), index DDL takes the index's element, not the
+/// table's (measured: CREATE INDEX beside an uncommitted ALTER succeeds).
+fn ddl_relation_target(plan: &Plan) -> Option<&str> {
+    match plan {
+        Plan::DropTable { name } => Some(name),
+        Plan::AlterTableAdd { table, .. }
+        | Plan::AlterTableAddFk { table, .. }
+        | Plan::AlterTableDropConstraint { table, .. }
+        | Plan::AlterTableAddCheck { table, .. }
+        | Plan::AlterTableAddKey { table, .. }
+        | Plan::AlterTableDrop { table, .. }
+        | Plan::AlterColumnType { table, .. }
+        | Plan::AlterColumnNull { table, .. }
+        | Plan::AlterColumnDefault { table, .. }
+        | Plan::AlterColumnRestart { table, .. }
+        | Plan::AlterColumnGenerated { table, .. } => Some(table),
+        _ => None,
+    }
+}
+
 fn ddl_dup_codes(plan: &Plan) -> Option<(i32, i32, String)> {
     let q = |n: &str| format!("\"PUBLIC\".\"{}\"", n.trim().trim_matches('"').to_ascii_uppercase());
     match plan {
@@ -398,6 +423,32 @@ fn respond_ddl_meta(
             w.send(s, enc)?;
             return Ok(true);
         }
+    }
+    // FIRST-UPDATER-WINS on a relation: the wrapper, the verb, and the
+    // engine's free-text reason (fatal_exception::raiseFmt -> isc_random)
+    if lc.contains("newversion: table") || lc.contains("busy in another thread") {
+        let (failed, qn) = match plan {
+            Plan::DropTable { name } => (336397288, q(name)),
+            _ => match ddl_relation_target(plan) {
+                Some(t) => (ALTER_TABLE_FAILED, q(t)),
+                None => return Ok(false),
+            },
+        };
+        let mut w = W::default();
+        w.int(OP_RESPONSE).int(0).int(0).int(0).int(0);
+        w.int(1)
+            .int(GDS_NO_META_UPDATE)
+            .int(1)
+            .int(failed)
+            .int(2)
+            .bytes(qn.as_bytes())
+            .int(1)
+            .int(335544382) // isc_random - "@1"
+            .int(2)
+            .bytes(err_text.trim().as_bytes())
+            .int(0);
+        w.send(s, enc)?;
+        return Ok(true);
     }
     // (verb-failed code, qualified name, reason code, reason-carries-name)
     let parts: Option<(i32, String, i32, bool)> = if lc.contains("already exists") {
@@ -1309,6 +1360,20 @@ impl Database {
     fn relation_meta(&self, table: &str) -> Option<std::sync::Arc<crate::mdc::Relation>> {
         let image = self.bytes();
         let ps = self.page_size;
+        // an attachment with UNCOMMITTED DDL of its own reads the catalog
+        // directly: what it resolves may be its own uncommitted object,
+        // and the cache is shared by every attachment on the file
+        if self.did_ddl {
+            let id = fire_crab_ods::resolve_relation(&image, ps, table)?;
+            if fire_crab_ods::ddl::relation_external_file(&image, ps, table).is_some() {
+                return None;
+            }
+            return Some(std::sync::Arc::new(crate::mdc::Relation {
+                id,
+                columns: std::sync::Arc::new(relation_columns(&image, ps, table)),
+                formats: std::sync::Arc::new(relation_formats(&image, ps, id)),
+            }));
+        }
         self.meta.relation(table, || {
             let id = fire_crab_ods::resolve_relation(&image, ps, table)?;
             // an EXTERNAL table's rows live in a file this executor
@@ -1340,6 +1405,9 @@ impl Database {
     fn columns(&self, table: &str) -> std::sync::Arc<Vec<fire_crab_ods::RelationColumn>> {
         let image = self.bytes();
         let ps = self.page_size;
+        if self.did_ddl {
+            return std::sync::Arc::new(relation_columns(&image, ps, table));
+        }
         self.meta
             .memo("columns", table, || relation_columns(&image, ps, table))
     }
@@ -1363,6 +1431,9 @@ impl Database {
         T: Send + Sync + 'static,
         F: FnOnce() -> T,
     {
+        if self.did_ddl {
+            return std::sync::Arc::new(read());
+        }
         self.meta.memo(kind, about, read)
     }
 
@@ -1519,6 +1590,7 @@ impl Database {
             }
             None => self.tx = Some(tx),
         }
+        self.refresh_reader_view();
     }
 
     /// WHOSE ROWS THIS ATTACHMENT COUNTS AS ITS OWN right now.
@@ -1547,6 +1619,16 @@ impl Database {
             own.push(u64::from(tx));
         }
         own
+    }
+
+    /// The thread's reader view follows the attachment's OWN ids: set at
+    /// the request's start, and again whenever they change (an id
+    /// adopted, a window opened or closed) - a body that creates a table
+    /// and then reads it inside one statement must see its own row
+    fn refresh_reader_view(&self) {
+        fire_crab_ods::tra::set_reader_view(Some(fire_crab_ods::tra::OwnTx::owner(
+            self.own_tx().ids().to_vec(),
+        )));
     }
 
     /// The snapshot a READ decides visibility against. A concurrency
@@ -1886,6 +1968,10 @@ impl Database {
         // recomputation and stays where the last begin put it
         fire_crab_ods::dml::update_oldest(&mut work, self.page_size, false)?;
         self.flush_and_install(work)?;
+        if self.did_ddl {
+            // what every attachment may cache now is the committed schema
+            self.invalidate_meta();
+        }
         Ok(())
     }
 
@@ -2378,6 +2464,7 @@ fn undo_window_unwind(database: &mut Option<Database>, mark: usize, undone: bool
         // the DDL's settled residue goes by hand, its deferred work
         // goes nowhere (Savepoint.cpp:459 DFW_delete_deferred)
         apply_ddl_residue(db, &residue);
+        db.refresh_reader_view();
         // the PAGE DRAWS go the other way: written FORWARD over
         // whatever the undo left, because a generator carries no
         // versions for a dead transaction to hide. The dfw postings in
@@ -19587,6 +19674,11 @@ fn execute_dml_collecting(
     let mark = undo_window_push(database, WindowKind::Statement, None);
     let out = execute_dml_collecting_inner(plan, database, args, ctx, affected);
     undo_window_unwind(database, mark, out.is_err());
+    // the statement may have adopted an id (a DDL's wide-view guard put
+    // the view from BEFORE it back as it left): the reader view follows
+    if let Some(d) = database.as_ref() {
+        d.refresh_reader_view();
+    }
     out
 }
 
@@ -19684,7 +19776,6 @@ fn execute_dml_collecting_inner(
             // used by transaction M", CacheVector.h newVersionBusy) is
             // not built yet - holding the side is the conservative
             // reading of it ([Database::image_undo]).
-            db.image_undo = true;
             db.did_ddl = true;
             // ...AND EVERY ANSWER THE METADATA CACHE HOLDS WAS ABOUT
             // THE OLD SCHEMA. Invalidated before the statement runs,
@@ -19700,8 +19791,38 @@ fn execute_dml_collecting_inner(
         plan,
         Plan::Insert { .. } | Plan::Update { .. } | Plan::Delete { .. } | Plan::SetGenerator { .. }
     );
+    // A DDL STATEMENT READS THE CATALOG WIDE (every active transaction's
+    // rows): its duplicate check must see another transaction's
+    // uncommitted CREATE ("already exists", measured), and the row it
+    // writes is not its own until it lands
+    let _wide = if is_ddl { Some(fire_crab_ods::tra::ReaderViewGuard::wide()) } else { None };
     if is_ddl {
         work.ddl_tx = stmt_tx.map(u64::from);
+        // FIRST UPDATER WINS ON A RELATION (CacheVector.h newVersion ->
+        // isAvailable OCCUPIED -> newVersionBusy / busyError): an ALTER
+        // or DROP of a relation another ACTIVE transaction holds an
+        // uncommitted version of refuses AT ONCE - no wait, even under
+        // WAIT (measured 60-100 ms against a 3 s hold). Index DDL on the
+        // table does not conflict (a different cache element); DML and
+        // reads never do.
+        if let Some(table) = ddl_relation_target(plan) {
+            if let Some((owner, rel)) = fire_crab_ods::ddl::relation_head_owner(&work, db.page_size, table) {
+                let mut own = db.own_tx();
+                if let Some(tx) = stmt_tx {
+                    own.push(u64::from(tx));
+                }
+                if !own.contains(owner) {
+                    if std::env::var("FC_SRV_TRACE").is_ok() {
+                        eprintln!("[srv] ddl busy: relation {} ({}) held by transaction {}", rel, table, owner);
+                    }
+                    return Err(ExecErr::Text(if matches!(plan, Plan::DropTable { .. }) {
+                        format!("table id={} busy in another thread - operation failed", rel)
+                    } else {
+                        format!("newVersion: table {} is used by transaction {}", rel, owner)
+                    }));
+                }
+            }
+        }
     }
     // WHOSE ROWS THIS STATEMENT COUNTS while it writes - what the
     // uniqueness check reads to decide whether a key is really taken.
@@ -47658,7 +47779,13 @@ fn run_autonomous(
     if std::env::var("FC_SRV_TRACE").is_ok() {
         eprintln!("[srv] autonomous transaction {} opened", tx_opened);
     }
+    if let Some(d) = db.as_ref() {
+        d.refresh_reader_view(); // the block's own ids, not the outer's
+    }
     let outcome = run(f, steps, db, ctx);
+    if let Some(d) = db.as_ref() {
+        d.refresh_reader_view();
+    }
     // CLOSE THE FRAME FIRST, and take the ids with it: a block inside
     // this one has already ended itself, and a body that ran inside it
     // folded its nested ids into this window - all of them are ended by
@@ -50767,6 +50894,15 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
         // open savepoint - keeps it, because that image must not be put
         // back over anybody else's committed work.
         release_write_side(&mut database);
+        // THE READER'S VIEW OF THE CATALOG for this request: the
+        // attachment's own transaction ids, owner-only - another
+        // transaction's uncommitted CREATE TABLE is "Table unknown" here,
+        // as the engine's metadata transaction answers (measured)
+        let _reader_view = fire_crab_ods::tra::ReaderViewGuard::set(Some(
+            fire_crab_ods::tra::OwnTx::owner(
+                database.as_ref().map(|d| d.own_tx().ids().to_vec()).unwrap_or_default(),
+            ),
+        ));
         // AND THE IMAGE A ROLLBACK WOULD PUT BACK IS REFRESHED HERE.
         // While a transaction's undo is its own state, the snapshot is
         // unused; the moment a statement makes it need an IMAGE (DDL, a

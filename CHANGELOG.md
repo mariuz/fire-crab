@@ -13,6 +13,32 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-08-20 — first updater wins, and a schema is its transaction's
+
+### Converted
+- **First-updater-wins on a relation** (CacheVector.h `newVersion` →
+  `isAvailable` OCCUPIED): an ALTER or DROP of a relation another
+  ACTIVE transaction holds an uncommitted version of refuses at once -
+  no wait, even under WAIT - with the engine's vector
+  (`unsuccessful metadata update` / `ALTER TABLE @1 failed` /
+  `newVersion: table N is used by transaction M`; a DROP says `table
+  id=N busy in another thread`). DML, reads and index DDL beside it
+  are unaffected, as measured. The write side is no longer held for a
+  DDL transaction's life.
+- **Per-transaction schema visibility**: a thread-local reader view
+  (`tra::ReaderViewGuard`) set from the attachment's own ids makes the
+  catalog readers owner-only - another transaction's uncommitted
+  CREATE TABLE is unknown to name resolution - while DDL statements and
+  the unique-key check read wide (the second CREATE says "already
+  exists"). The shared metadata cache is bypassed by an attachment
+  with uncommitted DDL and invalidated at its commit.
+
+### Gated
+- `qa/serve-real-ddltx.sh` 22 → 32: nine two-transaction cells driven
+  identically against the engine (a background holder, a foreground
+  second transaction, ids normalised), the recorded visibility
+  boundary now an equality, coverage by the trace's refusals.
+
 ## 2026-08-20 — OIT is one below the first interesting id
 
 ### Fixed

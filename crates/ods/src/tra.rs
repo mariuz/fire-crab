@@ -147,6 +147,15 @@ impl OwnTx {
         OwnTx { ids: Vec::new(), any_active: true }
     }
 
+    /// A reader with a transaction of its own and the owner-only rule:
+    /// committed rows and its own rows count, another transaction's
+    /// ACTIVE rows do not - what the engine's metadata transaction sees
+    /// (Attachment::getMetaTransaction impersonates the user
+    /// transaction's number).
+    pub fn owner(ids: Vec<u64>) -> OwnTx {
+        OwnTx { ids, any_active: false }
+    }
+
     pub fn push(&mut self, id: u64) {
         if !self.contains(id) {
             self.ids.push(id);
@@ -267,6 +276,52 @@ impl Snapshot {
     }
 }
 
+
+thread_local! {
+    /// THE READER'S VIEW OF THE CATALOG for the current thread - set by
+    /// the server around each request from the attachment's own
+    /// transaction ids (one thread per connection), read by
+    /// [crate::data::catalog_image]. Unset (the tools, a server thread
+    /// outside a request, a DDL statement under [ReaderViewGuard::wide])
+    /// means the catalog walk: every active transaction's rows count.
+    static READER_VIEW: std::cell::RefCell<Option<OwnTx>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The current thread's reader view, if one is set.
+pub fn reader_view() -> Option<OwnTx> {
+    READER_VIEW.with(|v| v.borrow().clone())
+}
+
+/// Replace the thread's reader view outright - for the server when the
+/// attachment's own ids change mid-request (an id adopted, an autonomous
+/// block opened or closed). No restore: the request's guard does that.
+pub fn set_reader_view(view: Option<OwnTx>) {
+    READER_VIEW.with(|v| *v.borrow_mut() = view);
+}
+
+/// Set (or clear) the thread's reader view for a scope; the guard puts
+/// the previous view back when dropped.
+pub struct ReaderViewGuard(Option<OwnTx>);
+
+impl ReaderViewGuard {
+    pub fn set(view: Option<OwnTx>) -> ReaderViewGuard {
+        ReaderViewGuard(READER_VIEW.with(|v| v.replace(view)))
+    }
+    /// The wide view - every active transaction's rows count - for the
+    /// scope of a DDL statement: its duplicate checks must see another
+    /// transaction's uncommitted CREATE ("already exists", measured),
+    /// and its own rows are not adopted until it lands.
+    pub fn wide() -> ReaderViewGuard {
+        ReaderViewGuard::set(None)
+    }
+}
+
+impl Drop for ReaderViewGuard {
+    fn drop(&mut self) {
+        let prev = self.0.take();
+        READER_VIEW.with(|v| *v.borrow_mut() = prev);
+    }
+}
 
 pub fn visible_version(
     file: &crate::Image,
