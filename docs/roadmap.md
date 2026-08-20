@@ -535,11 +535,30 @@ narrative of every closure is in git history and the gate that pins it.
   carry the fill byte (NOT_PACKED, engine-forgiven); FK cascades and
   param'd UPDATE defer unchanged. `qa/serve-real-uniqueorder.sh`.
 
-- **Packaged-procedure calls refuse** — `EXECUTE PROCEDURE
-  RDB$PROFILER.FLUSH` (and the 3-part `SYSTEM.RDB$PROFILER.FLUSH`):
-  the engine prepares TYPE 8 and executes (`NONE []`); fc refuses. A
-  package qualifier is not a schema qualifier, and the PUBLIC rule
-  currently swallows both. Pre-existing, refusal-only. Unclaimed.
+- ~~**Packaged-procedure calls refuse**~~ **CLOSED — a package
+  qualifier is not a schema qualifier, and the resolution is now
+  measured**: a bare name and `PUBLIC.name` are the plain procedure;
+  any other two-part `Q.N` tries package Q down the search path
+  (PUBLIC, then SYSTEM — `RDB$PROFILER.FLUSH` answers, a user
+  package's member answers, and `SYSTEM.PADD` / `NOPKG.PADD` refuse
+  `-204 Procedure unknown` IDENTICALLY, so the failed package lookup
+  IS the schema refusal); a three-part `S.P.N` constrains the schema.
+  A user packaged procedure's text lives ONLY in the package BODY
+  source (its `RDB$PROCEDURES` row carries a NULL blob) — fc extracts
+  the member's `AS`-tail and interprets it as a plain body. The
+  SYSTEM package `RDB$PROFILER` is NATIVE: every member executes
+  silently with no session (measured), no session can ever exist on
+  fc (`START_SESSION` is a function outside the surface), so the
+  members run as no-ops with the engine's exact arity — DEFAULTED
+  inputs omittable (`ATTACHMENT_ID`, `PAUSE_SESSION`'s BOOLEAN
+  `FLUSH`), `SET_FLUSH_INTERVAL`'s interval still required.
+  `qa/serve-real-pkgproc.sh` (20 checks). Recorded beside it, both
+  pre-existing and shared with PLAIN procedures: the arity vector
+  diverges (engine `07001 Parameter mismatch` with the three-part
+  name, fc a bare refusal), and a NO-OUTPUT body whose only statement
+  is DML (`INSERT`) refuses on fc where the engine executes — the
+  same refusal for a plain procedure, so it is an interpreter
+  surface bound, not a package one.
 
 - ~~**The compensating undo of an absolute set is DEFERRED in the engine
   and EAGER here**~~ **CLOSED — and the recorded model was upside

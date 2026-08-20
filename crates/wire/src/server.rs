@@ -26578,22 +26578,30 @@ fn plan_query_inner_ctx(
     }
     // EXECUTE PROCEDURE is not a SELECT, but isql prepares and FETCHES
     // it like one, so it resolves to a plan here (see PSQL EXECUTION).
-    if let Some((qual, pname, pargs)) = parse_execute_procedure(sql) {
+    if let Some((parts, pargs)) = parse_execute_procedure(sql) {
         let db = db.as_ref()?;
         // a `?` argument would have to arrive with op_execute; this
         // slice takes literals only
         let args: Vec<Value> = pargs.into_iter().collect::<Option<Vec<_>>>()?;
-        // THE PUBLIC RULE: a foreign schema qualifier (`SYSTEM.PADD`,
-        // `NOSCHEMA.PADD`) names an object this catalog does not hold,
-        // and the engine refuses it too (probed: -204 Procedure
-        // unknown) - so the lookup is skipped and the same refusal
-        // answers. Message texts differ exactly as they already do for
-        // an unqualified unknown name - a recorded divergence.
-        let meta = match &qual {
-            Some(q) if q != "PUBLIC" => None,
-            _ => load_procedure(db, &pname),
+        // NAME RESOLUTION, measured: a bare name and `PUBLIC.name` are
+        // the plain procedure; any other two-part `Q.N` tries package
+        // Q down the search path (`RDB$PROFILER.FLUSH` answers, and
+        // so does a user package's member - while `SYSTEM.PADD` and
+        // `NOPKG.PADD` refuse -204 Procedure unknown IDENTICALLY, so
+        // the failed package lookup IS the schema refusal); a
+        // three-part `S.P.N` constrains the schema (`SYSTEM.PKG.PADD`
+        // refuses, `PUBLIC.PKG.PADD` answers). Message texts differ
+        // exactly as they already do for an unqualified unknown name -
+        // a recorded divergence. The dotted key is stored whole in
+        // ProcInvoke::name so every later load resolves the member.
+        let pname = match parts.as_slice() {
+            [n] => n.clone(),
+            [q, n] if q == "PUBLIC" => n.clone(),
+            [q, n] => format!("{}.{}", q, n),
+            [sc, pk, n] => format!("{}.{}.{}", sc, pk, n),
+            _ => return Some(Plan::Refused),
         };
-        let Some(meta) = meta else {
+        let Some(meta) = load_procedure(db, &pname) else {
             if trace {
                 eprintln!("[srv] plan: no such procedure {:?}", pname);
             }
@@ -45501,6 +45509,46 @@ fn catalog_row_public(v: &[Value], schema_f: Option<usize>, pkg_f: Option<usize>
 fn load_procedure(db: &Database, name: &str) -> Option<ProcMeta> {
     use fire_crab_ods::format::Value;
 
+    // A DOTTED spelling names a PACKAGED procedure: `PKG.MEMBER` finds
+    // package PKG down the search path (PUBLIC, then SYSTEM);
+    // `SCHEMA.PKG.MEMBER` constrains the schema. A bare name is the
+    // plain PUBLIC procedure it always was. The dotted key is what
+    // the EXECUTE PROCEDURE planner stores in ProcInvoke::name, so
+    // every later load (the BLR probe, the runtime, the error
+    // position) resolves the same member.
+    let parts: Vec<&str> = name.split('.').collect();
+    let (want_schema, want_pkg, name): (Option<&str>, Option<&str>, &str) =
+        match parts.as_slice() {
+            [n] => (None, None, *n),
+            [p, n] => (None, Some(*p), *n),
+            [sc, p, n] => (Some(*sc), Some(*p), *n),
+            _ => return None,
+        };
+    // which rows this lookup may see - the plain lookup keeps the
+    // PUBLIC package-less rule; a packaged one matches the package by
+    // name and the schema by constraint or search path
+    let row_visible = |v: &[Value], schema_f: Option<usize>, pkg_f: Option<usize>| -> bool {
+        match want_pkg {
+            None => catalog_row_public(v, schema_f, pkg_f),
+            Some(pk) => {
+                let pkg_ok = matches!(pkg_f.and_then(|i| v.get(i)),
+                    Some(Value::Text(t)) if t.trim_end().eq_ignore_ascii_case(pk));
+                let schema_ok = match schema_f.and_then(|i| v.get(i)) {
+                    Some(Value::Text(t)) => {
+                        let t = t.trim_end();
+                        match want_schema {
+                            Some(sc) => t.eq_ignore_ascii_case(sc),
+                            None => t == "PUBLIC" || t == "SYSTEM",
+                        }
+                    }
+                    // a pre-schema ODS holds no packaged rows at all
+                    _ => false,
+                };
+                pkg_ok && schema_ok
+            }
+        }
+    };
+
     // --- RDB$PROCEDURES (26): the body source blob -------------------
     let (pcols, pdescs) = sys_rel(db, "RDB$PROCEDURES")?;
     let pfid = |n: &str| pcols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
@@ -45518,13 +45566,17 @@ fn load_procedure(db: &Database, name: &str) -> Option<ProcMeta> {
     // `source.is_some()` (as it did) would let a LATER row supply the
     // type for the body this one read
     let mut found = false;
+    let mut found_schema: Option<String> = None;
     for_each_record(db, 26, &pfmts, usize::MAX, |v| {
         let hit = matches!(v.get(name_f),
             Some(Value::Text(t)) if t.trim_end().eq_ignore_ascii_case(name));
-        if !hit || found || !catalog_row_public(v, schema_f, pkg_f) {
+        if !hit || found || !row_visible(v, schema_f, pkg_f) {
             return;
         }
         found = true;
+        if let Some(Value::Text(t)) = schema_f.and_then(|i| v.get(i)) {
+            found_schema = Some(t.trim_end().to_string());
+        }
         // read before the blob: a procedure whose source blob will not
         // read must still fail exactly the way it does today (`source?`)
         if let Some(Value::Int(t)) = type_f.and_then(|i| v.get(i)) {
@@ -45541,7 +45593,38 @@ fn load_procedure(db: &Database, name: &str) -> Option<ProcMeta> {
             }
         }
     });
-    let source = source?;
+    if !found {
+        return None;
+    }
+    let mut native_noop = false;
+    let source = match source {
+        Some(sr) => sr,
+        // a PACKAGED procedure's text lives ONLY in the package BODY
+        // source - its own row carries a NULL blob (measured)
+        None => match want_pkg {
+            Some(pk) => {
+                let schema = found_schema.as_deref().unwrap_or("PUBLIC");
+                match package_body_source(db, schema, pk) {
+                    Some(body) => package_member_source(&body, name)?,
+                    // no body at all: a SYSTEM package is NATIVE, and
+                    // its reachable members NO-OP silently (measured:
+                    // every RDB$PROFILER procedure executes NONE []
+                    // with no session, and no session can ever exist
+                    // here - START_SESSION is a function outside the
+                    // surface); a USER package without a body is
+                    // unimplemented and refuses
+                    None if schema == "SYSTEM" => {
+                        native_noop = true;
+                        // EXIT rather than an empty block: the block
+                        // parser refuses zero statements by design
+                        "BEGIN EXIT; END".to_string()
+                    }
+                    None => return None,
+                }
+            }
+            None => return None,
+        },
+    };
 
     // --- RDB$PROCEDURE_PARAMETERS (27) + RDB$FIELDS for the types ----
     let (ccols, cdescs) = sys_rel(db, "RDB$PROCEDURE_PARAMETERS")?;
@@ -45552,9 +45635,10 @@ fn load_procedure(db: &Database, name: &str) -> Option<ProcMeta> {
         cfid("RDB$PARAMETER_TYPE")?,
         cfid("RDB$FIELD_SOURCE")?,
     );
-    // (parameter type 0=in/1=out, number, name, field source)
-    let mut raw: Vec<(i64, i64, String, String)> = Vec::new();
+    // (parameter type 0=in/1=out, number, name, field source, defaulted)
+    let mut raw: Vec<(i64, i64, String, String, bool)> = Vec::new();
     let pname_f = cfid("RDB$PARAMETER_NAME")?;
+    let cdef_f = cfid("RDB$DEFAULT_SOURCE");
     // the same schema/package filter as the source scan: FB6's packaged
     // SYSTEM parameters (RDB$PROFILER.FLUSH's among them) share this
     // relation, and merging them in was the probed arity error
@@ -45563,7 +45647,7 @@ fn load_procedure(db: &Database, name: &str) -> Option<ProcMeta> {
     for_each_record(db, 27, &cfmts, usize::MAX, |v| {
         let hit = matches!(v.get(pn_f),
             Some(Value::Text(t)) if t.trim_end().eq_ignore_ascii_case(name));
-        if !hit || !catalog_row_public(v, cschema_f, cpkg_f) {
+        if !hit || !row_visible(v, cschema_f, cpkg_f) {
             return;
         }
         if let (
@@ -45573,11 +45657,14 @@ fn load_procedure(db: &Database, name: &str) -> Option<ProcMeta> {
             Some(Value::Text(fs)),
         ) = (v.get(num_f), v.get(typ_f), v.get(pname_f), v.get(fs_f))
         {
+            let defaulted =
+                matches!(cdef_f.and_then(|i| v.get(i)), Some(Value::Blob(..) | Value::Text(_)));
             raw.push((
                 *typ as i64,
                 *num as i64,
                 pnm.trim_end().to_string(),
                 fs.trim_end().to_string(),
+                defaulted,
             ));
         }
     });
@@ -45604,8 +45691,18 @@ fn load_procedure(db: &Database, name: &str) -> Option<ProcMeta> {
     };
     let mut ins: Vec<ProcParam> = Vec::new();
     let mut outs: Vec<ProcParam> = Vec::new();
-    raw.sort_by_key(|(t, n, _, _)| (*t, *n));
-    for (typ, _, pnm, fs) in raw {
+    raw.sort_by_key(|(t, n, _, _, _)| (*t, *n));
+    for (typ, _, pnm, fs, defaulted) in raw {
+        // the native no-op body reads NOTHING, so its DEFAULTED inputs
+        // are simply omittable - the engine binds their defaults
+        // (ATTACHMENT_ID = the current one) and answers NONE [] either
+        // way (measured: 0-arg FLUSH/PAUSE_SESSION/... all execute,
+        // SET_FLUSH_INTERVAL still requires its interval). Skipped
+        // BEFORE the type check: PAUSE_SESSION's defaulted FLUSH is a
+        // BOOLEAN the interpreter would otherwise refuse outright.
+        if native_noop && typ == 0 && defaulted {
+            continue;
+        }
         let desc = domain_desc(&fs)?;
         // INTEGER and TEXT parameters, both directions: the frame's
         // variables have been Value slots all along, the body assigns
@@ -45625,6 +45722,151 @@ fn load_procedure(db: &Database, name: &str) -> Option<ProcMeta> {
         }
     }
     Some(ProcMeta { ins, outs, source, prc_type, body_at })
+}
+
+/// The BODY source of a package, off its RDB$PACKAGES row - the one
+/// place a packaged procedure's text lives (RDB$PROCEDURE_SOURCE is
+/// NULL on packaged rows, measured). None when the package does not
+/// exist in that schema or has no body installed.
+fn package_body_source(db: &Database, schema: &str, pkg: &str) -> Option<String> {
+    use fire_crab_ods::format::Value;
+    let rel = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, "RDB$PACKAGES")?;
+    let (cols, descs) = sys_rel(db, "RDB$PACKAGES")?;
+    let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let name_f = fid("RDB$PACKAGE_NAME")?;
+    let body_f = fid("RDB$PACKAGE_BODY_SOURCE")?;
+    let schema_f = fid("RDB$SCHEMA_NAME");
+    let fmts = vec![(0u8, descs)];
+    let mut body: Option<String> = None;
+    let mut found = false;
+    for_each_record(db, rel, &fmts, usize::MAX, |v| {
+        if found {
+            return;
+        }
+        let hit = matches!(v.get(name_f),
+            Some(Value::Text(t)) if t.trim_end().eq_ignore_ascii_case(pkg));
+        let schema_ok = match schema_f.and_then(|i| v.get(i)) {
+            Some(Value::Text(t)) => t.trim_end().eq_ignore_ascii_case(schema),
+            // a pre-schema ODS has no packages to find
+            _ => false,
+        };
+        if !hit || !schema_ok {
+            return;
+        }
+        found = true;
+        if let Some(Value::Blob(r, n)) = v.get(body_f) {
+            if let Some(bytes) =
+                fire_crab_blb::read_blob_content(&db.bytes(), db.page_size, *r, *n)
+            {
+                body = Some(String::from_utf8_lossy(&bytes).into_owned());
+            }
+        }
+    });
+    body
+}
+
+/// Extract ONE member's `AS`-tail out of a package body source - the
+/// same `BEGIN ... END` text a plain procedure's RDB$PROCEDURE_SOURCE
+/// holds, so the interpreter runs a packaged body exactly as it runs a
+/// plain one.
+///
+/// The body is `BEGIN <members> END`; each member is `PROCEDURE|
+/// FUNCTION <name> [(...)] [RETURNS (...)] AS [<declares>] BEGIN ...
+/// END`. Member headers sit at NESTING DEPTH 1 (inside the body's own
+/// BEGIN), so the walk counts BEGIN/CASE up and END down, skips
+/// comments, strings and quoted identifiers, and takes the text from
+/// the member's AS through the END that closes its outermost BEGIN.
+fn package_member_source(body: &str, member: &str) -> Option<String> {
+    let b = body.as_bytes();
+    let mut i = 0;
+    let mut depth: i32 = 0;
+    // the word most recently consumed, uppercased - AS detection needs
+    // one token of lookbehind
+    let mut in_member: Option<usize> = None; // Some(depth at the header)
+    let mut as_at: Option<usize> = None; // byte offset just after AS
+    let mut body_depth: Option<i32> = None; // depth before the member's first BEGIN
+    while i < b.len() {
+        let c = b[i];
+        // skip the shapes that may contain keywords verbatim
+        if c == b'\'' {
+            i += 1;
+            while i < b.len() && b[i] != b'\'' {
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        if c == b'"' {
+            i += 1;
+            while i < b.len() && b[i] != b'"' {
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        if c == b'-' && b.get(i + 1) == Some(&b'-') {
+            while i < b.len() && b[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if c == b'/' && b.get(i + 1) == Some(&b'*') {
+            i += 2;
+            while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
+                i += 1;
+            }
+            i += 2;
+            continue;
+        }
+        if !(c.is_ascii_alphanumeric() || c == b'_' || c == b'$') {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] == b'$') {
+            i += 1;
+        }
+        let w = body[start..i].to_ascii_uppercase();
+        match w.as_str() {
+            "BEGIN" | "CASE" => {
+                if in_member.is_some() && as_at.is_some() && body_depth.is_none() {
+                    body_depth = Some(depth);
+                }
+                depth += 1;
+            }
+            "END" => {
+                depth -= 1;
+                // the END that closes the member's outermost BEGIN
+                if let (Some(_), Some(at), Some(bd)) = (in_member, as_at, body_depth) {
+                    if depth == bd {
+                        return Some(body[at..i].trim().to_string());
+                    }
+                }
+            }
+            "PROCEDURE" | "FUNCTION" if depth == 1 && as_at.is_none() => {
+                // a header: the next identifier is the member's name
+                // (a quoted spelling is skipped above, so re-read it)
+                let rest = body[i..].trim_start();
+                let taken = rest.strip_prefix('"').map_or_else(
+                    || {
+                        let e = rest
+                            .find(|ch: char| {
+                                !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '$')
+                            })
+                            .unwrap_or(rest.len());
+                        rest[..e].to_string()
+                    },
+                    |q| q[..q.find('"').unwrap_or(q.len())].to_string(),
+                );
+                in_member = taken.eq_ignore_ascii_case(member).then_some(depth as usize);
+            }
+            "AS" if in_member.is_some() && depth == 1 && as_at.is_none() => {
+                as_at = Some(i);
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// The (line, column) of the FIRST source-to-BLR entry in an
@@ -47448,7 +47690,17 @@ fn run_dyn_statement(
     // EXECUTE PROCEDURE through a dynamic string is a call like any
     // other, and its outputs are the row it projects
     if find_word(&up, "EXECUTE", 0) == Some(0) && find_word(&up, "PROCEDURE", 0).is_some() {
-        let (_, name, args) = parse_execute_procedure(sql).ok_or(PsqlStop::Unsupported)?;
+        let (parts, args) = parse_execute_procedure(sql).ok_or(PsqlStop::Unsupported)?;
+        // the same dotted-key resolution the top-level planner makes -
+        // the OLD destructure dropped the qualifier on the floor, so a
+        // dynamic `PKG.PADD` would have run a bare PADD had one existed
+        let name = match parts.as_slice() {
+            [n] => n.clone(),
+            [q, n] if q == "PUBLIC" => n.clone(),
+            [q, n] => format!("{}.{}", q, n),
+            [sc, pk, n] => format!("{}.{}.{}", sc, pk, n),
+            _ => return Err(PsqlStop::Unsupported),
+        };
         // a `?` argument has nothing to bind to from inside a body
         let args: Vec<Value> =
             args.into_iter().collect::<Option<Vec<_>>>().ok_or(PsqlStop::Unsupported)?;
@@ -48097,7 +48349,7 @@ fn parse_execute_block(sql: &str) -> Option<(String, (usize, usize))> {
     Some((s[body_off..].trim().to_string(), at))
 }
 
-fn parse_execute_procedure(sql: &str) -> Option<(Option<String>, String, Vec<Option<Value>>)> {
+fn parse_execute_procedure(sql: &str) -> Option<(Vec<String>, Vec<Option<Value>>)> {
     let s = sql.trim().trim_end_matches(';').trim();
     let up = s.to_ascii_uppercase();
     if find_word(&up, "EXECUTE", 0) != Some(0) {
@@ -48109,10 +48361,12 @@ fn parse_execute_procedure(sql: &str) -> Option<(Option<String>, String, Vec<Opt
     // intact for the splitter, WHITESPACE AROUND THE DOT included -
     // stopping at the first blank handed the splitter a bare `PUBLIC`
     // and refused `EXECUTE PROCEDURE PUBLIC . PADD(2, 3)`, which the
-    // engine answers (probed, every spacing)
+    // engine answers (probed, every spacing). Up to THREE parts: a
+    // packaged procedure spells `PKG.P` and `SCHEMA.PKG.P` (probed,
+    // both answer).
     let end = qualified_name_span(rest)?;
-    let (qual, name) = split_qualified_name(rest[..end].trim())?;
-    if name.is_empty() {
+    let parts = split_qualified_parts(rest[..end].trim(), 3)?;
+    if parts.last().is_none_or(|n| n.is_empty()) {
         return None;
     }
     let mut arg_text = rest[end..].trim();
@@ -48123,7 +48377,54 @@ fn parse_execute_procedure(sql: &str) -> Option<(Option<String>, String, Vec<Opt
     if !arg_text.is_empty() {
         args = parse_call_args(arg_text, true)?;
     }
-    Some((qual, name, args))
+    Some((parts, args))
+}
+
+/// Split a dotted qualified name into up to `max` identifier parts -
+/// the three-part-capable sibling of [split_qualified_name], which
+/// stays two-part for every caller whose grammar has no packages.
+fn split_qualified_parts(s: &str, max: usize) -> Option<Vec<String>> {
+    fn take_part(s: &str) -> Option<(String, &str)> {
+        let s = s.trim_start();
+        if let Some(q) = s.strip_prefix('"') {
+            let b = q.as_bytes();
+            let mut i = 0;
+            while i < b.len() {
+                if b[i] == b'"' {
+                    if b.get(i + 1) == Some(&b'"') {
+                        i += 2;
+                        continue;
+                    }
+                    let name = q[..i].replace("\"\"", "\"");
+                    return if name.is_empty() { None } else { Some((name, &q[i + 1..])) };
+                }
+                i += 1;
+            }
+            None
+        } else {
+            let end = s
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$'))
+                .unwrap_or(s.len());
+            if end == 0 {
+                return None;
+            }
+            Some((s[..end].to_ascii_uppercase(), &s[end..]))
+        }
+    }
+    let mut parts = Vec::new();
+    let mut rest = s.trim();
+    loop {
+        let (part, tail) = take_part(rest)?;
+        parts.push(part);
+        rest = tail.trim_start();
+        if rest.is_empty() {
+            return Some(parts);
+        }
+        rest = rest.strip_prefix('.')?;
+        if parts.len() == max {
+            return None; // more parts than the grammar takes
+        }
+    }
 }
 
 fn col_kind(d: &Descriptor) -> Option<ColKind> {
@@ -60522,23 +60823,41 @@ mod tests {
     #[test]
     fn parse_execute_procedure_takes_qualified_names() {
         // the unqualified form is unchanged
-        let (q, n, a) = parse_execute_procedure("EXECUTE PROCEDURE PADD(2, 3)").unwrap();
-        assert_eq!((q, n.as_str(), a.len()), (None, "PADD", 2));
+        let (p, a) = parse_execute_procedure("EXECUTE PROCEDURE PADD(2, 3)").unwrap();
+        assert_eq!((p, a.len()), (vec!["PADD".to_string()], 2));
         // isql's SHOW PROCEDURES teaches PUBLIC.PADD; the engine answers
         // it and every quoting of it (probed)
-        let (q, n, _) = parse_execute_procedure("EXECUTE PROCEDURE PUBLIC.PADD(2, 3)").unwrap();
-        assert_eq!((q.as_deref(), n.as_str()), (Some("PUBLIC"), "PADD"));
-        let (q, n, _) =
+        let (p, _) = parse_execute_procedure("EXECUTE PROCEDURE PUBLIC.PADD(2, 3)").unwrap();
+        assert_eq!(p, vec!["PUBLIC".to_string(), "PADD".to_string()]);
+        let (p, _) =
             parse_execute_procedure("EXECUTE PROCEDURE \"PUBLIC\".\"PADD\"(2, 3)").unwrap();
-        assert_eq!((q.as_deref(), n.as_str()), (Some("PUBLIC"), "PADD"));
-        // a FOREIGN qualifier still PARSES - the caller's PUBLIC rule
+        assert_eq!(p, vec!["PUBLIC".to_string(), "PADD".to_string()]);
+        // a FOREIGN qualifier still PARSES - the caller's resolution
         // sends it down the no-such-procedure refusal, matching the
         // engine's -204 (probed), not a parse fallback
-        let (q, n, _) = parse_execute_procedure("EXECUTE PROCEDURE SYSTEM.PADD(2, 3)").unwrap();
-        assert_eq!((q.as_deref(), n.as_str()), (Some("SYSTEM"), "PADD"));
+        let (p, _) = parse_execute_procedure("EXECUTE PROCEDURE SYSTEM.PADD(2, 3)").unwrap();
+        assert_eq!(p, vec!["SYSTEM".to_string(), "PADD".to_string()]);
+        // a THREE-part packaged spelling parses whole (probed:
+        // `PUBLIC.PKG.PADD` and `SYSTEM.RDB$PROFILER.FLUSH` answer)
+        let (p, a) =
+            parse_execute_procedure("EXECUTE PROCEDURE SYSTEM.RDB$PROFILER.FLUSH").unwrap();
+        assert_eq!(
+            (p, a.len()),
+            (vec!["SYSTEM".to_string(), "RDB$PROFILER".to_string(), "FLUSH".to_string()], 0)
+        );
+        // ... quoted part by part too (probed: answers)
+        let (p, a) =
+            parse_execute_procedure("EXECUTE PROCEDURE \"PUBLIC\".\"PKG\".\"PADD\"(2, 3)")
+                .unwrap();
+        assert_eq!(
+            (p, a.len()),
+            (vec!["PUBLIC".to_string(), "PKG".to_string(), "PADD".to_string()], 2)
+        );
+        // a FOURTH part is not a name
+        assert!(parse_execute_procedure("EXECUTE PROCEDURE A.B.C.D").is_none());
         // no-argument and semicolon forms keep parsing
-        let (q, n, a) = parse_execute_procedure("EXECUTE PROCEDURE FLUSH;").unwrap();
-        assert_eq!((q, n.as_str(), a.len()), (None, "FLUSH", 0));
+        let (p, a) = parse_execute_procedure("EXECUTE PROCEDURE FLUSH;").unwrap();
+        assert_eq!((p, a.len()), (vec!["FLUSH".to_string()], 0));
         // whitespace around the qualifier dot: the dot is its own token
         // to the engine, which answers every spacing (probed) - the old
         // span-scanner stopped at the first blank and refused them all
@@ -60548,20 +60867,40 @@ mod tests {
             "EXECUTE PROCEDURE PUBLIC. PADD(2, 3)",
             "EXECUTE PROCEDURE \"PUBLIC\" . \"PADD\" (2, 3)",
         ] {
-            let (q, n, a) = parse_execute_procedure(sql).unwrap();
+            let (p, a) = parse_execute_procedure(sql).unwrap();
             assert_eq!(
-                (q.as_deref(), n.as_str(), a.len()),
-                (Some("PUBLIC"), "PADD", 2),
+                (p, a.len()),
+                (vec!["PUBLIC".to_string(), "PADD".to_string()], 2),
                 "{sql}"
             );
         }
         // ... and the spaced FOREIGN qualifier still parses whole, for
         // the caller's ordinary no-such-procedure refusal (engine -204)
-        let (q, n, _) = parse_execute_procedure("EXECUTE PROCEDURE NOSCHEMA . PADD(2, 3)").unwrap();
-        assert_eq!((q.as_deref(), n.as_str()), (Some("NOSCHEMA"), "PADD"));
+        let (p, _) = parse_execute_procedure("EXECUTE PROCEDURE NOSCHEMA . PADD(2, 3)").unwrap();
+        assert_eq!(p, vec!["NOSCHEMA".to_string(), "PADD".to_string()]);
         // argument-without-parens forms are not eaten by the lookahead
-        let (q, n, a) = parse_execute_procedure("EXECUTE PROCEDURE SUMTO 5").unwrap();
-        assert_eq!((q, n.as_str(), a), (None, "SUMTO", vec![Some(Value::Int(5))]));
+        let (p, a) = parse_execute_procedure("EXECUTE PROCEDURE SUMTO 5").unwrap();
+        assert_eq!((p, a), (vec!["SUMTO".to_string()], vec![Some(Value::Int(5))]));
+    }
+
+    #[test]
+    fn package_member_source_extracts_the_as_tail() {
+        let body = "BEGIN\n  PROCEDURE PADD (A INTEGER, B INTEGER) RETURNS (S INTEGER) AS\n  BEGIN\n    S = A + B;\n  END\n  PROCEDURE PSIDE AS\n  DECLARE X INTEGER;\n  BEGIN\n    IF (1 = 1) THEN\n    BEGIN\n      X = 2;\n    END\n  END\nEND";
+        assert_eq!(
+            package_member_source(body, "PADD").as_deref(),
+            Some("BEGIN\n    S = A + B;\n  END")
+        );
+        // nested BEGIN/END inside a member does not end it early, and
+        // the DECLARE section rides with the AS-tail
+        let pside = package_member_source(body, "PSIDE").unwrap();
+        assert!(pside.starts_with("DECLARE X INTEGER;"), "{pside}");
+        assert!(pside.ends_with("END"), "{pside}");
+        assert_eq!(pside.matches("BEGIN").count(), 2, "{pside}");
+        assert_eq!(package_member_source(body, "NOSUCH"), None);
+        // a keyword inside a comment or string moves no depth
+        let tricky = "BEGIN\n  PROCEDURE P1 AS\n  BEGIN\n    -- END of nothing\n    S = 'BEGIN';\n  END\nEND";
+        let p1 = package_member_source(tricky, "P1").unwrap();
+        assert!(p1.contains("'BEGIN'"), "{p1}");
     }
 
     #[test]
