@@ -82,46 +82,105 @@ fn put_u64(buf: &mut [u8], at: usize, v: u64) {
     buf[at..at + 8].copy_from_slice(&v.to_le_bytes());
 }
 
-/// Where transaction `tx`'s two bits live: the byte index in the file
-/// and the shift within it. TIP pages chain via `tip_next`; the head is
-/// the one no other TIP points to (the same walk `TipChain` does, done
-/// index-wise so the caller can mutate).
-fn tip_bits_at(file: &crate::Image, page_size: usize, tx: u64) -> Result<(u32, usize, u32), String> {
-    let tips: Vec<(usize, u32, u32)> = file
+/// The TIP chain as page numbers, in transaction order: TIPs chain
+/// via `tip_next`; the head is the one no other TIP points to (the same
+/// walk `TipChain` does, done index-wise so a caller can mutate).
+fn tip_chain_pages(file: &crate::Image) -> Result<Vec<u32>, String> {
+    let tips: Vec<(u32, u32)> = file
         .pages()
-        .enumerate()
-        .filter(|(_, p)| p[0] == PageType::TransactionInventory as u8)
-        .filter_map(|(i, p)| TipPage::decode(p).map(|t| (i, t.pag.page_no, t.next)))
+        .filter(|p| p[0] == PageType::TransactionInventory as u8)
+        .filter_map(|p| TipPage::decode(p).map(|t| (t.pag.page_no, t.next)))
         .collect();
     if tips.is_empty() {
         return Err("no transaction inventory pages".into());
     }
-    let mut ordered: Vec<usize> = Vec::new();
+    let mut ordered: Vec<u32> = Vec::new();
     let mut cur = tips
         .iter()
-        .map(|&(_, no, _)| no)
-        .find(|no| !tips.iter().any(|&(_, _, next)| next == *no))
+        .map(|&(no, _)| no)
+        .find(|no| !tips.iter().any(|&(_, next)| next == *no))
         .ok_or("TIP chain has no head")?;
     while cur != 0 {
-        let &(idx, _, next) = tips
+        let &(_, next) = tips
             .iter()
-            .find(|&&(_, no, _)| no == cur)
+            .find(|&&(no, _)| no == cur)
             .ok_or("broken TIP chain")?;
-        ordered.push(idx);
+        ordered.push(cur);
         cur = next;
     }
+    Ok(ordered)
+}
+
+/// Where transaction `tx`'s two bits live: the TIP page, the byte
+/// within it, and the 2-bit shift. The chain is `tx / per_page` deep.
+fn tip_bits_at(file: &crate::Image, page_size: usize, tx: u64) -> Result<(u32, usize, u32), String> {
+    let ordered = tip_chain_pages(file)?;
     let per_page = TipPage::transactions_per_page(page_size);
-    let tip_idx = *ordered
+    let tip_page = *ordered
         .get(tx as usize / per_page)
         .ok_or("transaction id beyond the TIP chain")?;
     let within = tx as usize % per_page;
     // the TIP page, the byte WITHIN it, and the 2-bit shift - the slot
     // is read/written through page_mut, not at an absolute file offset
     Ok((
-        tip_idx as u32,
+        tip_page,
         TIP_TRANSACTIONS_OFFSET + within / 4,
         2 * (within % 4) as u32,
     ))
+}
+
+/// `TRA_extend_tip` (tra.cpp:566): the FIRST transaction id of a TIP's
+/// range allocates that TIP - `TRA_start` calls it when `number %
+/// transPerTIP == 0` (tra.cpp:2041). The new page is zeroed (every
+/// slot `tra_active`, which is also "never started"), typed
+/// `pag_transactions`, the prior TIP's `tip_next` linked to it, and an
+/// `RDB$PAGES` row `(0, pag_transactions, sequence, page)` written -
+/// the row the engine's `PAG_init2` reads to find TIP `sequence`
+/// without walking the chain. A chain that already reaches the id
+/// (an engine-grown file, a re-run) needs nothing.
+fn ensure_tip_for(file: &mut crate::Image, page_size: usize, tx: u64) -> Result<(), String> {
+    let per_page = TipPage::transactions_per_page(page_size);
+    if tx as usize % per_page != 0 {
+        return Ok(());
+    }
+    let seq = tx as usize / per_page;
+    let chain = tip_chain_pages(file)?;
+    if chain.len() > seq {
+        return Ok(());
+    }
+    if chain.len() != seq {
+        return Err(format!(
+            "TIP chain is {} pages deep, transaction {} needs page {}",
+            chain.len(),
+            tx,
+            seq
+        ));
+    }
+    let new_tip = allocate_page(file, page_size)?;
+    {
+        let page = crate::page_mut(file, page_size, new_tip).ok_or("new TIP page out of range")?;
+        page.fill(0);
+        page[0] = PageType::TransactionInventory as u8;
+        put_u32(page, 12, new_tip); // pag_pageno
+                                    // tip_next @16 stays 0: the new end of the chain
+    }
+    {
+        let prior = chain[seq - 1];
+        let page = crate::page_mut(file, page_size, prior).ok_or("prior TIP page out of range")?;
+        put_u32(page, 16, new_tip); // tip_next
+    }
+    crate::ddl::sys_insert(
+        file,
+        page_size,
+        "RDB$PAGES",
+        0,
+        &[
+            ("RDB$RELATION_ID", crate::ddl::SysVal::I(0)),
+            ("RDB$PAGE_NUMBER", crate::ddl::SysVal::I(new_tip as i64)),
+            ("RDB$PAGE_SEQUENCE", crate::ddl::SysVal::I(seq as i64)),
+            ("RDB$PAGE_TYPE", crate::ddl::SysVal::I(PageType::TransactionInventory as i64)),
+        ],
+    )
 }
 
 /// Put a transaction into a state in the TIP - `tra_active` 0,
@@ -228,7 +287,9 @@ pub fn begin_active_tx(file: &mut crate::Image, page_size: usize) -> Result<u64,
         crate::page_at(file, page_size, 0).ok_or("no header page")?,
         40,
     ) + 1;
-    // it must EXIST in the chain before the header claims it
+    // it must EXIST in the chain before the header claims it - and the
+    // chain must reach it (the first id of a TIP's range mints the TIP)
+    ensure_tip_for(file, page_size, tx)?;
     set_tx_state(file, page_size, tx, crate::tip::TxState::Active)?;
     put_u64(
         crate::page_mut(file, page_size, 0).ok_or("no header page")?,
@@ -258,6 +319,7 @@ pub(crate) fn allocate_committed_tx(file: &mut crate::Image, page_size: usize) -
         crate::page_at(file, page_size, 0).ok_or("no header page")?,
         40,
     ) + 1;
+    ensure_tip_for(file, page_size, tx)?;
     set_tx_state(file, page_size, tx, crate::tip::TxState::Committed)?;
     put_u64(
         crate::page_mut(file, page_size, 0).ok_or("no header page")?,
@@ -415,59 +477,154 @@ fn rhd_bytes(tx: u32, b_page: u32, b_line: u16, rflags: u16, format: u8, data: &
     rec
 }
 
-/// Allocate one page from the first PIP (`PAG_allocate_pages`,
-/// pag.cpp): the first set bit (set = FREE, ods.h:753) is cleared,
-/// `pip_used` incremented and the `pip_min` hint advanced. The FILE
-/// GROWS when the allocated page lies beyond its current end - free
-/// bits past EOF are how the engine extends a database. Only the first
-/// PIP (page 1) is handled; a database needing its second PIP (65312
-/// pages at 8K) fails honestly.
-/// Allocate one page from the first PIP: clear its free bit, bump the
-/// used count and min-free hint, extend the file to cover it. Public
-/// for the blob crate - blob pages are plain PIP allocations that no
-/// pointer page ever names (dpm.epp allocates them the same way).
-pub fn allocate_page(file: &mut crate::Image, page_size: usize) -> Result<u32, String> {
-    let per_pip = PipPage::pages_per_pip(page_size);
-    // PIP 0 is page 1: find a free page on it, then claim it - both
-    // page-local on the PIP, the file only GROWS to cover the result
-    let found = {
-        let pip_bytes = crate::page_at(file, page_size, 1).ok_or("no PIP page")?;
-        let pip = PipPage::decode(pip_bytes).ok_or("page 1 is not a PIP")?;
-        let start = pip.min as usize;
-        (start..per_pip)
-            .chain(0..start) // the hint is only a hint
-            .find(|&i| {
-                pip_bytes
-                    .get(PIP_BITS_OFFSET + i / 8)
-                    .is_some_and(|b| b & (1 << (i % 8)) != 0)
-            })
-            .ok_or("first PIP exhausted (second-PIP allocation not converted)")?
-    };
-    {
-        let pip = crate::page_mut(file, page_size, 1).ok_or("no PIP page")?;
-        pip[PIP_BITS_OFFSET + found / 8] &= !(1 << (found % 8));
-        let used = u32_at(pip, 24) + 1;
-        pip[24..28].copy_from_slice(&used.to_le_bytes());
-        if found as u32 >= u32_at(pip, 16) {
-            pip[16..20].copy_from_slice(&((found as u32) + 1).to_le_bytes());
-        }
-    }
-    let need = (found + 1) * page_size;
-    if file.byte_len() < need {
-        file.grow(need);
-    }
-    Ok(found as u32)
+/// `Ods::pagesPerSCN` (ods.cpp:63): `pagesPerPIP / 32` - 2041 at 8K.
+/// ods.h:784 explains why it is tied to the PIP: "pagesPerPIP value
+/// must be multiply of pagesPerSCN value", so an SCN page and a PIP
+/// never want the same page number.
+pub fn pages_per_scn(page_size: usize) -> usize {
+    PipPage::pages_per_pip(page_size) / 32
 }
 
-/// Grow a relation by one data page (`DPM_allocate` + the extend half
-/// of dpm.epp's store path): allocate a page, format it as an empty
-/// data page with the next `dpg_sequence`, and hook it into the
-/// relation's LAST pointer page - the slot appended, the per-slot fill
-/// byte (ods.h:841-853, one byte after the slot vector's full
+/// Where PIP `seq` lives (ods.h:786): page 1 for the first, and
+/// `seq * pagesPerPIP - 1` - the LAST page of the previous PIP's range
+/// - for every later one.
+pub fn pip_page_no(page_size: usize, seq: usize) -> u32 {
+    if seq == 0 {
+        1
+    } else {
+        (seq * PipPage::pages_per_pip(page_size) - 1) as u32
+    }
+}
+
+/// Where SCN page `seq` lives (ods.h:787, PageSpace::getSCNPageNum):
+/// page 2 for the first, `seq * pagesPerSCN` after.
+pub fn scn_page_no(page_size: usize, seq: usize) -> u32 {
+    if seq == 0 {
+        2
+    } else {
+        (seq * pages_per_scn(page_size)) as u32
+    }
+}
+
+/// Allocate one page (`PAG_allocate_pages`, pag.cpp:430): the first
+/// set bit (set = FREE, ods.h:753) of the lowest PIP with one is
+/// cleared, `pip_used` raised to cover it (a HIGH-WATER mark, never a
+/// count - `PAG_last_page` derives the file's size from it and
+/// `PAG_release_page` never lowers it), and the `pip_min` hint moved
+/// past it. The FILE GROWS when the allocated page lies beyond its
+/// current end - free bits past EOF are how the engine extends a
+/// database.
+///
+/// Two page numbers are never handed out, exactly as the engine's
+/// allocator steps over them (pag.cpp:504-540):
+///
+///   * a multiple of `pagesPerSCN` is an SCN INVENTORY page - formatted
+///     here (type 10, its sequence) the moment the search reaches it,
+///     its bit cleared, the search continuing. `nbackup -B` reads the
+///     SLOTS of these pages to decide which pages an increment carries
+///     and `gfix -v` checks every page's `pag_scn` against its slot;
+///     a data page where the engine expects SCN page N is a file the
+///     engine cannot read past 16 MB;
+///   * the last bit of a PIP is the NEXT PIP's home - formatted with
+///     every bit set (all free), zero min/extent/used, its own bit
+///     cleared in the PIP that ran out, and the search moves on to it.
+///
+/// Public for the blob crate - blob pages are plain PIP allocations
+/// that no pointer page ever names (dpm.epp allocates them the same
+/// way).
+pub fn allocate_page(file: &mut crate::Image, page_size: usize) -> Result<u32, String> {
+    let per_pip = PipPage::pages_per_pip(page_size);
+    let per_scn = pages_per_scn(page_size);
+    let mut seq = 0usize;
+    loop {
+        let pip_no = pip_page_no(page_size, seq);
+        let found = {
+            let pip_bytes = crate::page_at(file, page_size, pip_no)
+                .ok_or_else(|| format!("PIP {} (page {}) outside the file", seq, pip_no))?;
+            let pip = PipPage::decode(pip_bytes)
+                .ok_or_else(|| format!("page {} is not a PIP", pip_no))?;
+            let start = (pip.min as usize).min(per_pip);
+            (start..per_pip)
+                .chain(0..start) // the hint is only a hint
+                .find(|&i| {
+                    pip_bytes
+                        .get(PIP_BITS_OFFSET + i / 8)
+                        .is_some_and(|b| b & (1 << (i % 8)) != 0)
+                })
+        };
+        let Some(bit) = found else {
+            // this PIP is spent; the engine's pipHighWater moves on
+            // (pag.cpp:640). Its last bit was handed out at some point,
+            // and handing it out is what minted the next PIP.
+            seq += 1;
+            if seq > 1 << 20 {
+                return Err("PIP chain has no free page".into());
+            }
+            continue;
+        };
+        let page_no = (seq * per_pip + bit) as u32;
+        {
+            let pip = crate::page_mut(file, page_size, pip_no).ok_or("no PIP page")?;
+            pip[PIP_BITS_OFFSET + bit / 8] &= !(1 << (bit % 8));
+            if (bit as u32) + 1 > u32_at(pip, 24) {
+                pip[24..28].copy_from_slice(&((bit as u32) + 1).to_le_bytes()); // pip_used
+            }
+            // pipMin = MIN(pipMin, firstBit); if (pipMin == firstBit) pipMin = lastBit + 1
+            pip[16..20].copy_from_slice(&((bit as u32) + 1).to_le_bytes());
+        }
+        let need = (page_no as usize + 1) * page_size;
+        if file.byte_len() < need {
+            file.grow(need);
+        }
+        if page_no != 0 && (page_no as usize) % per_scn == 0 {
+            // an SCN inventory page (pag.cpp:512-520): reserved, not handed out
+            let page = crate::page_mut(file, page_size, page_no).ok_or("SCN page out of range")?;
+            page.fill(0);
+            page[0] = PageType::ScnInventory as u8;
+            page[12..16].copy_from_slice(&page_no.to_le_bytes()); // pag_pageno
+            let scn_seq = (page_no as usize / per_scn) as u32;
+            page[16..20].copy_from_slice(&scn_seq.to_le_bytes()); // scn_sequence
+            continue;
+        }
+        if bit == per_pip - 1 {
+            // the next PIP's home (pag.cpp:521-528): all bits free
+            let page = crate::page_mut(file, page_size, page_no).ok_or("PIP page out of range")?;
+            page.fill(0);
+            page[0] = PageType::PageInventory as u8;
+            page[12..16].copy_from_slice(&page_no.to_le_bytes()); // pag_pageno
+            for b in page[PIP_BITS_OFFSET..].iter_mut() {
+                *b = 0xff;
+            }
+            seq += 1;
+            continue;
+        }
+        return Ok(page_no);
+    }
+}
+
+/// Grow a relation by one data page (`DPM_allocate` + dpm.epp's
+/// `extend_relation`): allocate a page, format it as an empty data page
+/// with its `dpg_sequence` (`pp_sequence * dp_per_pp + slot`), and hook
+/// it into the relation's LAST pointer page - the slot appended (or a
+/// hole left by a released page reused), the per-slot fill byte
+/// (ods.h:841-853, one byte after the slot vector's full
 /// `dataPagesPerPP` capacity) zeroed: the page is about to receive its
 /// first record, so it is neither full nor empty.
+///
+/// When that pointer page has no room - and the FIRST pointer page of
+/// a relation never uses its last slot (dpm.epp:3195: `ppg_count <
+/// dbb_dp_per_pp - 1` for sequence 0, measured true on engine files) -
+/// a NEW pointer page is chained the engine's way: `ppg_sequence` one
+/// up, `ppg_eof` MOVED from the old page to the new, the old page's
+/// `ppg_next` linked, and an `RDB$PAGES` row `(relation, pag_pointer,
+/// sequence, page)` written as `DPM_pages` writes it - for every
+/// relation but RDB$PAGES itself (the engine's `relation->getId()`
+/// guard), whose pointer pages the engine finds by scanning. That row
+/// is load-bearing: `DPM_scan_pages` builds the relation's pointer
+/// vector from it, and a second pointer page the catalogue does not
+/// name is a page the engine never reads.
 fn extend_relation(file: &mut crate::Image, page_size: usize, rel: u16) -> Result<u32, String> {
-    let sequence = relation_data_pages(file, page_size, rel).len() as u32;
+    let capacity = data_pages_per_pp(page_size) as usize;
 
     // the relation's last pointer page (highest ppg_sequence)
     let mut last: Option<(u32, u32)> = None; // (page number, sequence)
@@ -482,15 +639,58 @@ fn extend_relation(file: &mut crate::Image, page_size: usize, rel: u16) -> Resul
             }
         }
     }
-    let (pp, _) = last.ok_or("relation has no pointer page")?;
-    let capacity = data_pages_per_pp(page_size) as usize;
-    let slot = u16_at(
-        crate::page_at(file, page_size, pp).ok_or("pointer page out of range")?,
-        24,
-    ) as usize; // ppg_count
-    if slot >= capacity {
-        return Err("pointer page full (new pointer pages not converted)".into());
-    }
+    let (mut pp, mut pp_seq) = last.ok_or("relation has no pointer page")?;
+    let (count, hole) = {
+        let page = crate::page_at(file, page_size, pp).ok_or("pointer page out of range")?;
+        let count = u16_at(page, 24) as usize; // ppg_count
+        let hole = (0..count.min(capacity)).find(|&s| u32_at(page, 32 + s * 4) == 0);
+        (count, hole)
+    };
+    let slot = match hole {
+        Some(s) => s,
+        None => {
+            let room = if pp_seq > 0 { count < capacity } else { count < capacity - 1 };
+            if room {
+                count
+            } else {
+                let new_pp = allocate_page(file, page_size)?;
+                {
+                    let page = crate::page_mut(file, page_size, new_pp)
+                        .ok_or("new pointer page out of range")?;
+                    page.fill(0);
+                    page[0] = PageType::Pointer as u8;
+                    page[1] = 1; // pag_flags = ppg_eof
+                    put_u32(page, 12, new_pp); // pag_pageno
+                    put_u32(page, 16, pp_seq + 1); // ppg_sequence
+                    put_u16(page, 26, rel); // ppg_relation
+                }
+                {
+                    let page = crate::page_mut(file, page_size, pp)
+                        .ok_or("pointer page out of range")?;
+                    page[1] &= !1; // no longer the last
+                    put_u32(page, 20, new_pp); // ppg_next
+                }
+                if rel != 0 {
+                    crate::ddl::sys_insert(
+                        file,
+                        page_size,
+                        "RDB$PAGES",
+                        0,
+                        &[
+                            ("RDB$RELATION_ID", crate::ddl::SysVal::I(rel as i64)),
+                            ("RDB$PAGE_NUMBER", crate::ddl::SysVal::I(new_pp as i64)),
+                            ("RDB$PAGE_SEQUENCE", crate::ddl::SysVal::I((pp_seq + 1) as i64)),
+                            ("RDB$PAGE_TYPE", crate::ddl::SysVal::I(PageType::Pointer as i64)),
+                        ],
+                    )?;
+                }
+                pp = new_pp;
+                pp_seq += 1;
+                0
+            }
+        }
+    };
+    let sequence = pp_seq * capacity as u32 + slot as u32;
 
     let page_no = allocate_page(file, page_size)?;
     {
@@ -508,7 +708,13 @@ fn extend_relation(file: &mut crate::Image, page_size: usize, rel: u16) -> Resul
         let ppage = crate::page_mut(file, page_size, pp).ok_or("pointer page out of range")?;
         ppage[32 + slot * 4..36 + slot * 4].copy_from_slice(&page_no.to_le_bytes());
         ppage[32 + capacity * 4 + slot] = 0; // fill bits: not full, not empty
-        ppage[24..26].copy_from_slice(&((slot as u16) + 1).to_le_bytes());
+        let count = u16_at(ppage, 24) as usize;
+        if slot + 1 > count {
+            ppage[24..26].copy_from_slice(&((slot as u16) + 1).to_le_bytes());
+        }
+        if (slot as u16) < u16_at(ppage, 28) {
+            ppage[28..30].copy_from_slice(&(slot as u16).to_le_bytes()); // ppg_min_space
+        }
     }
     Ok(page_no)
 }
@@ -711,28 +917,33 @@ fn insert_record_as(
     Ok(InsertOutcome { tx_id: tx, page_no: spot.page_no, slot: spot.slot })
 }
 
-/// Release one page back to the PIP (`PAG_release_page`): its bit set
-/// free again, `pip_used` decremented, the `pip_min` hint lowered.
-/// The page bytes are left as-is - a freed page keeps stale content,
-/// exactly like the engine (allocation zeroes on reuse).
+/// Free a page (`PAG_release_page`, pag.cpp:1330-1380): its bit SET
+/// in the PIP that owns it, `pip_min` lowered to it, `pip_extent`
+/// lowered to its extent when the whole extent byte reads free. NOT
+/// `pip_used`: that is the high-water mark `PAG_last_page` sizes the
+/// file by, and the engine never lowers it on a release.
 pub(crate) fn release_page(file: &mut crate::Image, page_size: usize, page_no: u32) -> Result<(), String> {
     let per_pip = PipPage::pages_per_pip(page_size);
-    if page_no as usize >= per_pip {
-        return Err("page beyond the first PIP".into());
-    }
-    // every field is on PIP 0 (page 1); page-local offsets
-    let pip = crate::page_mut(file, page_size, 1).ok_or("no PIP page")?;
-    let bit = PIP_BITS_OFFSET + page_no as usize / 8;
-    let mask = 1u8 << (page_no % 8);
-    if pip[bit] & mask != 0 {
+    let seq = page_no as usize / per_pip;
+    let rel_bit = page_no as usize % per_pip;
+    let pip_no = pip_page_no(page_size, seq);
+    let pip = crate::page_mut(file, page_size, pip_no)
+        .ok_or_else(|| format!("PIP {} (page {}) outside the file", seq, pip_no))?;
+    let at = PIP_BITS_OFFSET + rel_bit / 8;
+    let mask = 1u8 << (rel_bit % 8);
+    if pip[at] & mask != 0 {
         return Ok(()); // already free
     }
-    pip[bit] |= mask; // set = FREE (ods.h:753)
-    let used = u32_at(pip, 24); // pip_used @24
-    put_u32(pip, 24, used.saturating_sub(1));
-    if u32_at(pip, 16) > page_no {
-        // pip_min @16
-        put_u32(pip, 16, page_no);
+    pip[at] |= mask; // set = FREE (ods.h:753)
+    if pip[at] == 0xFF {
+        // assume PAGES_IN_EXTENT == 8
+        let ext = (rel_bit & !7) as u32;
+        if u32_at(pip, 20) > ext {
+            put_u32(pip, 20, ext); // pip_extent
+        }
+    }
+    if u32_at(pip, 16) > rel_bit as u32 {
+        put_u32(pip, 16, rel_bit as u32); // pip_min
     }
     Ok(())
 }

@@ -229,7 +229,7 @@ pub enum TableConstraint {
 }
 
 /// Values a system-catalog row is built from, keyed by column name.
-enum SysVal<'a> {
+pub(crate) enum SysVal<'a> {
     I(i64),
     S(&'a str),
     /// a DOUBLE PRECISION catalog column (index selectivity)
@@ -341,7 +341,7 @@ fn encode_sys_value(d: &Descriptor, v: &SysVal<'_>) -> Result<Vec<u8>, String> {
 /// relation's computed (ini.epp-walk) format, EVERY index of the
 /// relation maintained. This is what makes the row real to the
 /// engine: its metadata lookups go through these indexes.
-fn sys_insert(
+pub(crate) fn sys_insert(
     file: &mut crate::Image,
     page_size: usize,
     rel_name: &str,

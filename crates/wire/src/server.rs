@@ -1688,7 +1688,7 @@ impl Database {
     fn stamp_page_scns(&self, work: &mut fire_crab_ods::Image) {
         let base = self.bytes();
         let ps = self.page_size;
-        if ps < 24 || work.num_pages() < 3 {
+        if ps < 28 || work.num_pages() < 3 {
             return;
         }
         let scn = u32::from_le_bytes(
@@ -1698,27 +1698,43 @@ impl Database {
         if changed.is_empty() {
             return;
         }
-        let slots = (ps - 20) / 4;
-        let mut scns_dirty = false;
+        // Every page's slot lives on the SCN page that OWNS it: page N
+        // sits on SCN page N / pagesPerSCN (page 2 for the first, seq *
+        // pagesPerSCN after - ods.h:787), at slot N % pagesPerSCN. An
+        // SCN page's own slot 0 holds its own pag_scn (validation.cpp:
+        // 1280-1290 fetches the page itself when scn_page_num ==
+        // page_number). pagesPerSCN is pagesPerPIP / 32 = 2041 at 8K -
+        // NOT the slot capacity of the page (2043): the engine reads
+        // by the former, and a stamp in slot 2041 of page 2 is a stamp
+        // nobody reads, while page 2041 itself is an SCN page.
+        let per_scn = fire_crab_ods::dml::pages_per_scn(ps);
+        let mut scns_dirty: Vec<u32> = Vec::new();
         for pno in changed {
-            if pno == 0 || pno == 2 {
-                continue; // the header IS the era; the SCN page is stamped below
+            if pno == 0 {
+                continue; // the header IS the era
             }
+            let seq = pno as usize / per_scn;
+            let scn_page = fire_crab_ods::dml::scn_page_no(ps, seq);
             if let Some(p) = work.page_mut(pno) {
                 p[8..12].copy_from_slice(&scn.to_le_bytes());
             }
-            if (pno as usize) < slots {
-                if let Some(sp) = work.page_mut(2) {
-                    let at = 20 + (pno as usize) * 4;
+            if let Some(sp) = work.page_mut(scn_page) {
+                let at = 20 + (pno as usize % per_scn) * 4;
+                if at + 4 <= ps {
                     sp[at..at + 4].copy_from_slice(&scn.to_le_bytes());
-                    scns_dirty = true;
+                    if !scns_dirty.contains(&scn_page) {
+                        scns_dirty.push(scn_page);
+                    }
                 }
             }
         }
-        if scns_dirty {
-            if let Some(sp) = work.page_mut(2) {
+        // the SCN pages this pass wrote are themselves changed pages:
+        // their own pag_scn and their own slot 0 carry the era too
+        for scn_page in scns_dirty {
+            if let Some(sp) = work.page_mut(scn_page) {
                 sp[8..12].copy_from_slice(&scn.to_le_bytes());
-                let at = 20 + 2 * 4;
+                let slot = scn_page as usize % per_scn; // 2 on the first, 0 after
+                let at = 20 + slot * 4;
                 sp[at..at + 4].copy_from_slice(&scn.to_le_bytes());
             }
         }
@@ -48073,6 +48089,16 @@ fn run_body_source(
         .collect();
     let body = parse_trigger_body(&meta.source, begin_at, meta.source.trim_end().len(), &names)
         .ok_or_else(|| format!("procedure {}'s body is outside this server's PSQL surface", name))?;
+    // the header's initialisers run first, as the assignments they are
+    let inits = declared_var_inits(&meta.source[..begin_at], &names)
+        .map_err(|e| ProcErr::from(format!("procedure {}: {}", name, e)))?;
+    let body = if inits.is_empty() {
+        body
+    } else {
+        let mut stmts = inits;
+        stmts.push(body);
+        TrigStmt::Block { stmts, handlers: Vec::new(), src_off: begin_at }
+    };
 
     let mut frame = PsqlFrame {
         vars: Vec::new(),
@@ -48296,6 +48322,91 @@ fn declared_var_names(header: &str) -> Vec<String> {
         at = d + "DECLARE".len();
     }
     out
+}
+
+/// The INITIALISERS a header declares - `DECLARE [VARIABLE] <name>
+/// <type> {= | DEFAULT} <value>;` - as the assignments they are, in
+/// declaration order, to run before the body's first statement.
+///
+/// Found by a silent no-op: `DECLARE I INTEGER = 0; ... WHILE (I < N)`
+/// ran ZERO iterations here and reported success, because the `= 0`
+/// was dropped and a NULL `I` makes the condition UNKNOWN - the engine
+/// initialises the variable and loops N times. A synthetic `<name> =
+/// <value>` statement gets exactly the assignment's own semantics
+/// (arithmetic through [parse_expr], a text literal through the
+/// AssignText arm), and an initialiser this server cannot read REFUSES
+/// the body rather than starting the variable NULL.
+fn declared_var_inits(header: &str, names: &[String]) -> Result<Vec<TrigStmt>, String> {
+    let up = header.to_ascii_uppercase();
+    let mut out = Vec::new();
+    let mut at = 0usize;
+    while let Some(d) = find_word(&up, "DECLARE", at) {
+        at = d + "DECLARE".len();
+        if declared_cursor_at(header, d).is_some() {
+            continue;
+        }
+        // the declaration runs to its top-level ';' (a type's
+        // parentheses - VARCHAR(10), DECIMAL(9,2) - nest nothing of ours)
+        let rest = &header[at..];
+        let mut depth = 0i32;
+        let mut end = rest.len();
+        for (i, c) in rest.char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                ';' if depth == 0 => {
+                    end = i;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let decl = &rest[..end];
+        let decl_up = &up[at..at + end];
+        let mut name_at = decl.len() - decl.trim_start().len();
+        if decl_up[name_at..]
+            .get(.."VARIABLE".len())
+            .is_some_and(|h| h == "VARIABLE")
+        {
+            name_at += "VARIABLE".len();
+            name_at += decl[name_at..].len() - decl[name_at..].trim_start().len();
+        }
+        let name_end = decl[name_at..]
+            .find(|c: char| c.is_whitespace() || c == ',')
+            .map(|i| name_at + i)
+            .unwrap_or(decl.len());
+        let name = decl[name_at..name_end].trim_matches('"').to_string();
+        if name.is_empty() {
+            continue;
+        }
+        // `= <value>` at top level, or `DEFAULT <value>`
+        let mut rhs: Option<&str> = None;
+        let mut depth = 0i32;
+        for (i, c) in decl[name_end..].char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                '=' if depth == 0 => {
+                    rhs = Some(&decl[name_end + i + 1..]);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        if rhs.is_none() {
+            if let Some(k) = find_word(decl_up, "DEFAULT", name_end) {
+                rhs = Some(&decl[k + "DEFAULT".len()..]);
+            }
+        }
+        let Some(rhs) = rhs else { continue };
+        let text = format!("{} = {};", name, rhs.trim());
+        let mut pos = 0usize;
+        let stmt = parse_trig_stmt(&text, &mut pos, text.len(), names).ok_or_else(|| {
+            format!("the initialiser of variable {} is outside this server's PSQL surface", name)
+        })?;
+        out.push(stmt);
+    }
+    Ok(out)
 }
 
 /// Parse `EXECUTE PROCEDURE <name> [(<v>, ...)]` / `EXECUTE PROCEDURE

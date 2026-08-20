@@ -98,6 +98,35 @@ SET TERM ;^
 SELECT COUNT(*) FROM T WHERE ID > 20;
 ROLLBACK;"
 
+# A DECLARE's INITIALISER is an assignment that runs before the body.
+# This used to be a SILENT NO-OP: the `= 0` was dropped, I started
+# NULL, `WHILE (I < 3)` was UNKNOWN, the block ran nothing and
+# reported success (found while probing the growth gate).
+both "a DECLARE with an initialiser (= 0) drives the loop" "SET HEADING OFF;
+SET TERM ^;
+EXECUTE BLOCK AS
+DECLARE I INTEGER = 0;
+BEGIN
+  WHILE (I < 3) DO
+  BEGIN
+    I = I + 1;
+    INSERT INTO T (ID, V) VALUES (30 + :I, :I);
+  END
+END^
+SET TERM ;^
+SELECT COUNT(*), SUM(V) FROM T WHERE ID > 30;
+ROLLBACK;"
+both "...and the DEFAULT spelling, VARIABLE keyword included" "SET HEADING OFF;
+SET TERM ^;
+EXECUTE BLOCK AS
+DECLARE VARIABLE K INTEGER DEFAULT 7;
+BEGIN
+  INSERT INTO T (ID, V) VALUES (40, :K * 2);
+END^
+SET TERM ;^
+SELECT V FROM T WHERE ID = 40;
+ROLLBACK;"
+
 # --- 2. a failure inside it is the engine's own error --------------------
 both "a division by zero inside the block" "SET HEADING OFF;
 SET TERM ^;

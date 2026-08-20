@@ -13,6 +13,42 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-08-20 — the file grows the engine's way
+
+### Converted
+- **The page allocator crosses its walls** (`ods::dml::allocate_page`,
+  `extend_relation`, `ensure_tip_for`): a relation's SECOND POINTER
+  PAGE (`ppg_eof` moved, `ppg_next` linked, the `RDB$PAGES` row
+  `DPM_scan_pages` needs), the SECOND PIP at `n·pagesPerPIP − 1`
+  minted all-free, the SCN INVENTORY PAGE reserved at every
+  `pagesPerSCN·N` and every page's era stamped in ITS slot on the SCN
+  page that owns it, and the SECOND TIP minted by the first id of its
+  range with its `RDB$PAGES (0, pag_transactions, seq, page)` row.
+  Before: "pointer page full" at ~13 MB per table, page 2041 handed
+  out as DATA at ~16 MB (an engine `nbackup -B 1` reads the SCN slots
+  and would have MISSED fc's late pages), "transaction id beyond the
+  TIP chain" at 32,688 ids, "first PIP exhausted" at ~510 MB.
+- **`pip_used` is a high-water mark** (`PAG_last_page` sizes the file
+  by it; `PAG_release_page` never lowers it) — fc decremented it on a
+  release.
+
+### Fixed
+- **`DECLARE I INTEGER = 0;` dropped its initialiser** — a `WHILE (I <
+  N)` body ran zero times and reported success (found probing the
+  growth gate). Initialisers now run as the assignments they are
+  (`declared_var_inits`); one outside the surface refuses the body.
+
+### Gated
+- `qa/serve-real-growth.sh` (new, 32): fc crosses each wall and the
+  ENGINE reads the result (count, `gfix -v -full`, a write of its own
+  on the new structure, a level-1 nbackup chain over fc's late pages,
+  restored and counted); the engine-grown twin read and extended by
+  fc; coverage checks read the page types at the predicted numbers.
+- `docs/roadmap.md` rewritten from the survey of what the engine still
+  has that fire-crab does not; the old narrative is
+  `docs/roadmap-history.md`, with fifteen stale "still to do" claims
+  retired in the new file.
+
 ## 2026-08-08 — an aggregate says its source's type
 
 ### Converted
