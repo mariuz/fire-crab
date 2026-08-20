@@ -13,6 +13,26 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-08-20 — the external sort
+
+### Converted
+- **`crates/wire/src/extsort.rs`** - sort.cpp's shape: rows buffered to
+  `FC_SORT_MEMORY` (64 MiB), the buffer sorted stably by the existing
+  comparator and written as a run under `FC_TEMP_DIR` (unlinked on
+  creation, TempFile's rule), the runs merged with ties broken by run
+  then position. ORDER BY (the `Sort` row source), GROUP BY and
+  DISTINCT spill now; DISTINCT's quadratic seen-list is gone. The
+  engine's tie order past one run is a merge artefact (measured:
+  780-row chunks per tie group) that no gate pins; this sort promises
+  the comparator's order with ties in record order, spilled or not.
+
+### Gated
+- `qa/serve-real-bigsort.sh` (new, 12): 300,000 rows, a 2 MB budget so
+  every query spills; ORDER BY / GROUP BY / DISTINCT / aggregates /
+  FIRST+SKIP compared to the engine by digest; fc's tie rule checked
+  small vs large; coverage by the trace's run counts and an empty temp
+  directory afterwards.
+
 ## 2026-08-20 — MERGE
 
 ### Converted

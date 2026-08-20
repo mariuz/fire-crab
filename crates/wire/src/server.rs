@@ -5385,11 +5385,8 @@ impl RowSource {
                 having,
             ),
             RowSource::Sort { input, keys } => {
-                let mut rows = input.rows(db)?;
-                if !keys.is_empty() {
-                    sort_rows(&mut rows, keys)?;
-                }
-                Ok(rows)
+                let rows = input.rows(db)?;
+                Ok(sort_rows_spilling(rows, keys)?)
             }
         }
     }
@@ -26370,23 +26367,49 @@ fn rows_equal(a: &[Value], b: &[Value]) -> bool {
 /// already decided the row order; only when nothing has does the set's
 /// own ascending order show through.
 fn distinct_rows(rows: &mut Vec<Vec<Value>>, ordered: bool) {
-    let mut seen: Vec<Vec<Value>> = Vec::new();
-    rows.retain(|r| {
-        if seen.iter().any(|s| rows_equal(s, r)) {
-            false
-        } else {
-            seen.push(r.clone());
-            true
-        }
-    });
-    if ordered {
-        return;
-    }
+    // SORT, THEN DROP ADJACENT EQUALS (the engine's SORT_unique over a
+    // projection) - in place of the quadratic seen-list this was. Each
+    // row carries its input position as a trailing key, so the stable
+    // sort keeps the FIRST occurrence of equals and, when something else
+    // already decided the order, puts the survivors back in it.
     let width = rows.iter().map(|r| r.len()).max().unwrap_or(0);
-    let keys: Vec<OrderKey> = (0..width)
+    let taken = std::mem::take(rows);
+    let decorated: Vec<Vec<Value>> = taken
+        .into_iter()
+        .enumerate()
+        .map(|(i, mut r)| {
+            r.resize(width, Value::Null);
+            r.push(Value::Int(i as i64));
+            r
+        })
+        .collect();
+    let mut keys: Vec<OrderKey> = (0..width)
         .map(|i| OrderKey::field(i, false, NullsAt::Default))
         .collect();
-    rows.sort_by(|a, b| order_cmp(a, b, &keys));
+    let sorted = match sort_rows_spilling(decorated, &keys) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let mut kept: Vec<Vec<Value>> = Vec::new();
+    for r in sorted {
+        if let Some(last) = kept.last() {
+            if rows_equal(&last[..width], &r[..width]) {
+                continue;
+            }
+        }
+        kept.push(r);
+    }
+    if ordered {
+        keys = vec![OrderKey::field(width, false, NullsAt::Default)];
+        kept = match sort_rows_spilling(kept, &keys) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+    }
+    for mut r in kept {
+        r.truncate(width);
+        rows.push(r);
+    }
 }
 
 /// Does this plan decide its own row order? A `DISTINCT` above one that
@@ -31419,6 +31442,52 @@ impl OrderKey {
 /// Sort rows by keys that may be EXPRESSIONS: every key is evaluated for
 /// every row first, so an arithmetic exception surfaces as the fetch's
 /// error instead of a wrong order.
+/// [sort_rows] for a set that may not fit: the rows go through the
+/// external sort (`crate::extsort`) when their estimated size is over
+/// the budget, in place otherwise - same comparator, same order, ties
+/// in record order either way. Expression keys are computed once per
+/// row and carried as a prefix through the runs.
+fn sort_rows_spilling(rows: Vec<Vec<Value>>, keys: &[OrderKey]) -> Result<Vec<Vec<Value>>, EvalErr> {
+    let budget = crate::extsort::budget();
+    let est: usize = rows.iter().map(|r| crate::extsort::row_bytes(r)).sum();
+    if keys.is_empty() || est <= budget {
+        let mut rows = rows;
+        if !keys.is_empty() {
+            sort_rows(&mut rows, keys)?;
+        }
+        return Ok(rows);
+    }
+    let nk = keys.len();
+    let prefix_keys: Vec<OrderKey> = keys
+        .iter()
+        .enumerate()
+        .map(|(i, k)| OrderKey::field(i, k.desc, k.nulls))
+        .collect();
+    let cmp = move |a: &[Value], b: &[Value]| order_cmp(a, b, &prefix_keys);
+    let mut sorter = crate::extsort::ExternalSort::with_budget(cmp, budget);
+    for r in rows {
+        let mut dec = Vec::with_capacity(nk + r.len());
+        for key in keys {
+            dec.push(key.value_of(&r)?);
+        }
+        dec.extend(r);
+        sorter.put(dec).map_err(|e| { eprintln!("[srv] sort spill: {}", e); EvalErr::Unsupported })?;
+    }
+    let cursor = sorter.finish().map_err(|e| { eprintln!("[srv] sort spill: {}", e); EvalErr::Unsupported })?;
+    if std::env::var("FC_SRV_TRACE").is_ok() {
+        eprintln!(
+            "[srv] sort: rows={} runs={} spilled={} budget={}",
+            cursor.stats.0, cursor.stats.1, cursor.stats.2, budget
+        );
+    }
+    let mut out = Vec::with_capacity(cursor.stats.0);
+    let mut cursor = cursor;
+    while let Some(mut r) = cursor.next().map_err(|e| { eprintln!("[srv] sort spill: {}", e); EvalErr::Unsupported })? {
+        out.push(r.split_off(nk));
+    }
+    Ok(out)
+}
+
 fn sort_rows(rows: &mut [Vec<Value>], keys: &[OrderKey]) -> Result<(), EvalErr> {
     if keys.iter().all(|k| !k.has_expr()) {
         rows.sort_by(|a, b| order_cmp(a, b, keys));
@@ -31941,7 +32010,7 @@ fn group_rows(
             .iter()
             .map(|&f| OrderKey::field(f, false, NullsAt::Default))
             .collect();
-        input.sort_by(|a, b| order_cmp(a, b, &keys));
+        let mut input = sort_rows_spilling(std::mem::take(&mut input), &keys)?;
         let mut i = 0;
         while i < input.len() {
             let mut j = i + 1;

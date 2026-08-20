@@ -42,6 +42,7 @@ One line each; the gate is the proof.
 | packaged procedures | a package qualifier resolves down the search path; `RDB$PROFILER` native no-ops with the engine's arity | `serve-real-pkgproc` 20 |
 | fragmenting store | records larger than a page chain the engine's way; UPDATE/DELETE of a fragmented head | `serve-real-fragstore` 13 |
 | UNIQUE is walk-order | enforcement row-at-a-time in RECNO order, 23000 byte-exact; the sub-9-byte RHDF corruption found and fixed with it | `serve-real-uniqueorder` |
+| external sort (slice 1) | runs to disk past a budget, stable merge; ORDER BY / GROUP BY / DISTINCT | `serve-real-bigsort` 12 |
 | MERGE | per-source-row desugar into the audited DML planners; first branch wins; dup-target raise | `serve-real-merge` 17 |
 | blob writes + RETAIN | temp blobs over the wire materialised at the store; COMMIT/ROLLBACK RETAIN keep the transaction with its snapshot | `serve-real-blobwrite` 8, `retain` 8 |
 | transactional DDL | catalog rows under the user transaction's id, undo by state + journaled residue, deferred drops; first-updater-wins on a relation with the engine's vector; owner-only schema visibility | `serve-real-ddltx` 32 |
@@ -215,7 +216,24 @@ compiler narrower than the interpreter (a bare `EXCEPTION;` in a
 `CREATE TRIGGER` body refuses, `server.rs:12764`); a read inside a
 PSQL body is read-committed regardless of the transaction's snapshot.
 
-### G. Absent subsystems
+### G. Absent subsystems — the external sort, slice 1 DONE (2026-08-20)
+
+**Done (`serve-real-bigsort` 12):** `crates/wire/src/extsort.rs`, the
+engine's `sort.cpp` shape - rows buffered to `FC_SORT_MEMORY` (64 MiB,
+`TempCacheLimit`'s default), the buffer sorted STABLY by the same
+comparator as before and written as a run under `FC_TEMP_DIR` (unlinked
+on creation), the runs merged with ties broken by run then position -
+so the order is the comparator's, ties in record order, identical
+spilled or not. Wired into the `Sort` row source, `group_rows` and
+`distinct_rows` (which was quadratic). Not copied, on purpose: the
+engine's quicksort over diddled keys and its seek-ordered merge tree -
+measured, its tie order past one 128 KB run is an artefact no gate pins.
+**Open (slices 2-3):** the hash-join build side and RIGHT/FULL mirror
+still materialise; the sorted output is re-collected into a `Vec` (no
+consumer pulls the merge yet - `StreamCursor`/`JoinCursor` still refuse
+ORDER BY, `FIRST n` after a sort pays the whole sort); `backfill_index`
+inserts keys one at a time.
+
 
 - **External sort + TempSpace** (`sort.cpp`): every sort, DISTINCT, GROUP BY and hash build lives in RAM (`server.rs:31046 sort_rows`) — a scalability ceiling, not only a feature.
 - **MON$** (`Monitoring.cpp`): answered as `Plan::VirtualEmpty` (`server.rs:27032`).
@@ -306,9 +324,10 @@ pointer-page and TIP page numbers is the next step when it dominates.
 
 ## Next, in order
 
-- **G, the external sort — THE NEXT CHUNK** — every sort and hash build
-  is bounded by RAM today; the next scalability ceiling a real database
-  reaches.
+- **G slices 2–3 — THE NEXT CHUNK**: the hash-join build side spilled
+  (a grace hash over the same run machinery) and the merge PULLED by the
+  cursors (`FIRST n` after ORDER BY stops early, an ordered fetch
+  streams).
 - **D, the MERGE executor** — the BLR is already compiled and tested;
   only the executor is missing.
 - **G, the external sort** — every sort and hash build is bounded by
