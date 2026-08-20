@@ -2575,6 +2575,30 @@ pub fn alter_column_restart(
     advance_oldest_transactions(file, page_size)
 }
 
+/// The DEFERRED half of `ALTER TABLE ... ALTER COLUMN ... RESTART`:
+/// resolve the identity column's backing generator and the value the
+/// restart stores (`target - increment`), WITHOUT writing the slot -
+/// the caller posts it to its transaction cache and the page learns it
+/// at COMMIT, the way the engine's dfw_set_generator does. The
+/// statement's header bookkeeping (the OIT advance) still lands here.
+pub fn column_restart_posting(
+    file: &mut crate::Image,
+    page_size: usize,
+    table: &str,
+    column: &str,
+    with_value: Option<i64>,
+) -> Result<(String, i64), String> {
+    let table = table.trim().to_ascii_uppercase();
+    let column = column.trim().trim_matches('"').to_ascii_uppercase();
+    let gen = column_identity_generator(file, page_size, &table, &column)
+        .ok_or_else(|| format!("column {} is not an identity column", column))?;
+    let (_id, increment, initial) = generator_incr_init(file, page_size, &gen)
+        .ok_or_else(|| format!("identity generator {} not found", gen))?;
+    let target = with_value.unwrap_or(initial);
+    advance_oldest_transactions(file, page_size)?;
+    Ok((gen, target.wrapping_sub(increment)))
+}
+
 /// `ALTER TABLE <t> ALTER [COLUMN] <c> SET GENERATED { ALWAYS | BY DEFAULT }` -
 /// change an identity column's `RDB$IDENTITY_TYPE` (0 ALWAYS / 1 BY DEFAULT).
 /// The generator and its value are untouched; the relation's `RDB$RUNTIME` is

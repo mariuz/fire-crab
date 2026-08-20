@@ -824,6 +824,15 @@ struct Database {
     /// windows' settled values are ([write_gen_window]). Cleared when
     /// the transaction ends, by which time they are on the disk.
     auto_pages: std::collections::HashMap<u32, Vec<u8>>,
+    /// tra_gen_ids: the TRANSACTION-scoped generator cache (tra.h:315).
+    /// An absolute set never touches the generator page - it lands HERE
+    /// (last put wins) and posts a dfw_set_generator into the current
+    /// undo window; every later read and draw of a cached name lives in
+    /// the cache too (dpm.epp DPM_gen_id checks it FIRST). COMMIT's
+    /// surviving postings write the cache value onto the page; a window
+    /// undo deletes the postings and leaves the cache answering
+    /// locally. Cleared when the transaction ends. See [GenWindow].
+    gen_cache: std::collections::HashMap<String, i64>,
     /// whether this TRANSACTION has written anything at all - which is
     /// not the same as holding the write side, now that the write side
     /// is one statement long. A rollback asks this to know whether
@@ -1975,46 +1984,72 @@ impl Database {
 
 /// What one undo window did to the generators inside it.
 ///
-/// ENGINE LAW, probed against a live engine with `SET AUTODDL OFF` and
+/// ENGINE LAW, probed against a live engine AND read from its source -
 /// the two kinds of write kept apart:
 ///
-///  * A DRAW - `GEN_ID(g,n)`, `NEXT VALUE FOR g`, an identity column's
-///    implicit bump - is NON-TRANSACTIONAL and pushes NO undo record.
-///    It survives ROLLBACK, ROLLBACK TO SAVEPOINT and a statement that
-///    FAILED (two dup-PK inserts drawing 7 then 5 leave the generator
-///    at 12 with the table empty). The LAST drawn value wins, not the
-///    maximum: a negative step is a draw too (10, then `GEN_ID(g,-4)`,
-///    then ROLLBACK leaves 6).
+///  * A DRAW off the PAGE - `GEN_ID(g,n)`, `NEXT VALUE FOR g`, an
+///    identity column's implicit bump, when the transaction holds no
+///    pending set of that name - is NON-TRANSACTIONAL and pushes NO
+///    undo record. It survives ROLLBACK, ROLLBACK TO SAVEPOINT and a
+///    statement that FAILED (two dup-PK inserts drawing 7 then 5 leave
+///    the generator at 12 with the table empty). The LAST drawn value
+///    wins, not the maximum: a negative step is a draw too (10, then
+///    `GEN_ID(g,-4)`, then ROLLBACK leaves 6).
 ///  * An ABSOLUTE SET - `SET GENERATOR ... TO n`, `ALTER SEQUENCE ...
 ///    RESTART WITH n`, `ALTER TABLE ... ALTER COLUMN ... RESTART WITH
-///    n` - writes the same cell but pushes a COMPENSATING undo record
-///    "put back the value you found". It is undone by a rollback of the
-///    window it was made in, and by nothing else.
+///    n` - NEVER TOUCHES THE PAGE. It puts the value in the
+///    transaction cache ([Database::gen_cache], the engine's
+///    tra_gen_ids) and posts a dfw_set_generator item into the CURRENT
+///    savepoint (DdlNodes.epp:6510-6515). The page learns the value at
+///    COMMIT, when the posting - if it survived - applies the cache's
+///    LAST value and removes the entry (dfw.epp:2156-2159,
+///    set_generator phase 3).
+///  * Once a name is CACHED, every later read AND draw of it in this
+///    transaction lives in the cache (dpm.epp DPM_gen_id:1421-1434
+///    checks the cache first) - so a post-set draw is itself pending,
+///    and is LOST if no posting survives. Other attachments see the
+///    page throughout.
+///  * ROLLBACK TO SAVEPOINT deletes the savepoint's postings
+///    (Savepoint.cpp:459 DFW_delete_deferred) and touches NOTHING else:
+///    the cache keeps answering locally, the page was never written.
+///    There is no compensating record.
 ///
-/// So undoing a window restores the cell to the value it held just
-/// before that window's FIRST absolute set, and leaves the cell exactly
-/// where it is when the window holds none. That single rule is what the
-/// probe matrix says, and it decides the two cases that pull against
-/// each other:
+/// The measured matrix this reproduces (base 50 committed, one txn):
 ///
-///   advance to 51, RESTART WITH 3, ROLLBACK          -> 51 (pre_set)
-///   SET GENERATOR TO 3, advance to 4, ROLLBACK       -> 50 (pre_set,
-///        NOT the later draw - the compensating record outlives it)
-///   advance to 10, SET GENERATOR TO 3, a FAILED
-///        statement, COMMIT                           -> 3 (the undone
-///        window is the statement, which holds neither)
+///   SAVEPOINT; SET TO 3; ROLLBACK TO SP        -> reads 3 locally,
+///        others read 50; COMMIT -> 50 (posting died with the SP)
+///   ... and a draw between the undo and COMMIT -> 4 locally, LOST at
+///        COMMIT (-> 50): it lived in the cache, no posting survived
+///   SET TO 10; SAVEPOINT B; SET TO 3;
+///        ROLLBACK TO B; COMMIT                 -> 3 (the FIRST set's
+///        surviving posting applies the cache's LAST value - the
+///        posting is a trigger, not a value)
+///   SET TO 3 (undone); SET TO 7; COMMIT        -> 7 (the second
+///        posting survives and the cache says 7)
+///   advance to 51, RESTART WITH 3, ROLLBACK    -> 51 (the pre-set
+///        draw hit the page; the set never did)
+///   SET TO 3, advance to 4, ROLLBACK           -> 50 (both pending,
+///        nothing survived)
+///   advance to 10, SET TO 3, a FAILED
+///        statement, COMMIT                     -> 3 (the undone
+///        window is the statement, which holds no posting)
+///   an AUTONOMOUS block draws PAST the cache   -> its own
+///        transaction, its own (empty) cache: the page moves, the
+///        outer cache stands
 ///
-/// A generator is not undone by transaction state either way - the cell
-/// is one number and carries no versions - so both halves are written
+/// Page draws are not undone by transaction state either way - the
+/// cell is one number and carries no versions - so they are written
 /// forward over whatever the window's undo left behind, by name.
 #[derive(Default)]
 struct GenWindow {
-    /// upper-cased name -> the value its LAST draw inside this window
-    /// reached
+    /// upper-cased name -> the value its LAST page draw inside this
+    /// window reached
     draw: std::collections::HashMap<String, i64>,
-    /// upper-cased name -> the value the cell held immediately before
-    /// this window's FIRST absolute set of it
-    pre_set: std::collections::HashMap<String, i64>,
+    /// upper-cased names whose dfw_set_generator posting lives in this
+    /// window: undoing the window deletes them, releasing it hands
+    /// them to the parent, COMMIT applies the cache value of every
+    /// survivor
+    dfw: std::collections::HashSet<String>,
 }
 
 /// WHAT KIND OF UNDO WINDOW THIS IS - which decides whether the records
@@ -2107,17 +2142,57 @@ fn burn_generator(db: &mut Database, name: &str, value: i64) {
     }
 }
 
-/// Record that `name` is about to be written ABSOLUTELY, keeping the
-/// value it holds now as the compensating record for the innermost open
-/// window. Only the FIRST set in a window is kept: the engine replays
-/// its undo records in reverse, so the earliest one has the last word
-/// (probed: `SET GENERATOR TO 3` then `TO 7` then ROLLBACK leaves the
-/// value from before the 3). See [GenWindow].
-fn mark_generator_set(db: &mut Database, name: &str) {
-    let Some(current) = read_generator_value(db, name) else { return };
+/// An absolute set: `value` into the transaction cache (last put wins)
+/// and a dfw_set_generator posting into the innermost open window -
+/// the page is NOT touched; COMMIT applies the survivors. See
+/// [GenWindow].
+fn post_generator_set(db: &mut Database, name: &str, value: i64) {
+    let key = name.to_ascii_uppercase();
+    db.gen_cache.insert(key.clone(), value);
     if let Some(w) = db.windows.last_mut() {
-        w.gen.pre_set.entry(name.to_ascii_uppercase()).or_insert(current);
+        w.gen.dfw.insert(key);
     }
+}
+
+/// Whether the transaction cache applies where we stand: an AUTONOMOUS
+/// block is a transaction of its own, with its own (empty) tra_gen_ids
+/// - its draws go past the outer cache to the page (probed: outer
+/// `SET TO 3` pending, the block's GEN_ID draws 51 off the page and
+/// the outer read still answers 3). See [GenWindow].
+fn gen_cache_active(db: &Database) -> bool {
+    !db.windows.iter().any(|w| w.kind == WindowKind::Autonomous)
+}
+
+/// The cached value of `name`, if this transaction holds a pending set
+/// of it where the cache applies - the first stop of every generator
+/// read and draw, the way DPM_gen_id checks tra_gen_ids first.
+fn gen_cached(db: &Database, name: &str) -> Option<i64> {
+    if !gen_cache_active(db) {
+        return None;
+    }
+    db.gen_cache.get(&name.to_ascii_uppercase()).copied()
+}
+
+/// One draw through the engine's DPM_gen_id shape: a cached name draws
+/// IN THE CACHE (pending with the set, no page write, no burn - lost
+/// if no posting survives, exactly as measured); an uncached one goes
+/// to the page in `work` and is burned into the window. See
+/// [GenWindow].
+fn gen_bump_through_cache(
+    db: &mut Database,
+    work: &mut fire_crab_ods::Image,
+    name: &str,
+    id: i64,
+    step: i64,
+) -> Result<i64, String> {
+    if let Some(cur) = gen_cached(db, name) {
+        let new_val = cur.wrapping_add(step);
+        db.gen_cache.insert(name.to_ascii_uppercase(), new_val);
+        return Ok(new_val);
+    }
+    let new_val = fire_crab_ods::gen::bump(work, db.page_size, id, step)?;
+    burn_generator(db, name, new_val);
+    Ok(new_val)
 }
 
 /// Open a new undo window, in step with a snapshot being taken. Returns
@@ -2201,18 +2276,18 @@ fn kill_window_ids(db: &mut Database, ids: &[u32]) -> bool {
 /// Close every window from `mark` inward, in step with a snapshot being
 /// put back (`undone`) or simply dropped.
 ///
-/// When the windows were UNDONE their generator writes are settled here
-/// - [write_gen_window] decides the value - and their compensating
-/// records die with them: the set they would put back has just been put
-/// back, and an outer rollback must not do it a second time (probed:
-/// advance to 51, mark, SET TO 3, ROLLBACK TO the mark, ROLLBACK leaves
-/// 51, not the pre-transaction value).
+/// When the windows were UNDONE their PAGE DRAWS are settled here -
+/// [write_gen_window] writes them forward over whatever the undo left,
+/// because the cell carries no versions - and their dfw postings are
+/// DELETED with them (Savepoint.cpp:459 DFW_delete_deferred): the
+/// pending set stays in the transaction cache, answering locally, and
+/// no longer reaches the page at COMMIT unless another posting
+/// survives. See [GenWindow].
 ///
 /// When they were merely CLOSED - a RELEASE, a statement that succeeded
 /// - the parent inherits both halves: an inner draw is still a draw
-/// inside the parent's window, and an inner set is still pending its
-/// undo, as the FIRST one the parent saw if the parent has none of its
-/// own.
+/// inside the parent's window, and an inner posting is still pending
+/// with the parent.
 /// THE TRANSACTION HALF: a window that was UNDONE has its ids killed,
 /// which is what makes its rows stop counting; one that merely CLOSED
 /// hands them to the parent, because they are the transaction's
@@ -2239,17 +2314,18 @@ fn undo_window_unwind(database: &mut Option<Database>, mark: usize, undone: bool
         for (k, v) in w.gen.draw {
             merged.draw.insert(k, v);
         }
-        for (k, v) in w.gen.pre_set {
-            merged.pre_set.entry(k).or_insert(v);
-        }
+        merged.dfw.extend(w.gen.dfw);
     }
     if undone {
         if mark > 0 {
             kill_window_ids(db, &ids);
         }
-        // the generators go the other way: their values are written
-        // FORWARD over whatever the undo left, because a generator
-        // carries no versions for a dead transaction to hide
+        // the PAGE DRAWS go the other way: written FORWARD over
+        // whatever the undo left, because a generator carries no
+        // versions for a dead transaction to hide. The dfw postings in
+        // `merged` simply DIE here (DFW_delete_deferred) - the cache
+        // keeps their values for local reads, and COMMIT applies only
+        // postings that survive in open windows.
         write_gen_window(db, &merged);
     }
     match db.windows.last_mut() {
@@ -2261,9 +2337,7 @@ fn undo_window_unwind(database: &mut Option<Database>, mark: usize, undone: bool
                 parent.gen.draw.insert(k, v);
             }
             if !undone {
-                for (k, v) in merged.pre_set {
-                    parent.gen.pre_set.entry(k).or_insert(v);
-                }
+                parent.gen.dfw.extend(merged.dfw);
             }
         }
         // the transaction's own window was the one undone
@@ -2286,13 +2360,12 @@ fn undo_window_collapse(database: &mut Option<Database>, idx: usize) {
     for (k, v) in w.gen.draw {
         parent.gen.draw.insert(k, v);
     }
-    for (k, v) in w.gen.pre_set {
-        parent.gen.pre_set.entry(k).or_insert(v);
-    }
+    parent.gen.dfw.extend(w.gen.dfw.iter().cloned());
 }
 
-/// Write an undone window's settled generator values over the image as
-/// it now stands, and flush.
+/// Write an undone window's PAGE DRAWS over the image as it now
+/// stands, and flush - the draws are non-transactional and must
+/// survive the snapshot the undo put back.
 ///
 /// THE DDL GUARD: a generator is only written if it still EXISTS in the
 /// restored image. A `CREATE SEQUENCE` that is rolled back must leave no
@@ -2302,14 +2375,8 @@ fn undo_window_collapse(database: &mut Option<Database>, idx: usize) {
 /// other way: the generator is back in the image and keeps the draw
 /// (probed: 6, advance to 7, DROP, ROLLBACK leaves 7).
 fn write_gen_window(db: &mut Database, w: &GenWindow) {
-    let mut targets: Vec<(&String, i64)> =
-        w.pre_set.iter().map(|(k, v)| (k, *v)).collect();
-    targets.extend(
-        w.draw
-            .iter()
-            .filter(|(k, _)| !w.pre_set.contains_key(*k))
-            .map(|(k, v)| (k, *v)),
-    );
+    let targets: Vec<(&String, i64)> =
+        w.draw.iter().map(|(k, v)| (k, *v)).collect();
     if targets.is_empty() {
         return;
     }
@@ -2335,14 +2402,63 @@ fn write_gen_window(db: &mut Database, w: &GenWindow) {
     }
 }
 
+/// COMMIT runs the surviving dfw_set_generator postings (dfw.epp
+/// set_generator, phase 3): every name still posted in ANY open window
+/// takes the transaction cache's LAST value onto the page and leaves
+/// the cache - which is why an outer window's surviving posting
+/// applies an undone inner window's later value (measured: SET TO 10,
+/// SAVEPOINT B, SET TO 3, ROLLBACK TO B, COMMIT -> 3). The posting is
+/// a trigger; the cache is the value. Runs BEFORE the commit snapshot
+/// so the write is part of what the commit flushes.
+fn commit_gen_dfw(database: &mut Option<Database>) {
+    let Some(db) = database.as_mut() else { return };
+    let names: Vec<String> = {
+        let mut n: Vec<String> = db
+            .windows
+            .iter()
+            .flat_map(|w| w.gen.dfw.iter().cloned())
+            .collect();
+        n.sort();
+        n.dedup();
+        n
+    };
+    let mut writes: Vec<(i64, i64)> = Vec::new();
+    for name in names {
+        // the posting fires only while the entry is still cached - a
+        // second posting of the same name finds nothing and no-ops
+        if let Some(v) = db.gen_cache.remove(&name) {
+            if let Some(id) = generator_id(db, &name) {
+                writes.push((id, v));
+            }
+        }
+    }
+    if !writes.is_empty() {
+        if let Ok(mut work) = db.work_copy() {
+            let mut moved = false;
+            for (id, v) in writes {
+                if write_generator_value(&mut work, db.page_size, id, v).is_ok() {
+                    moved = true;
+                }
+            }
+            if moved {
+                db.install_dirty(work);
+            }
+        }
+    }
+}
+
 /// COMMIT (and the start of the next transaction) makes the current
-/// image the new base: every draw is already in it and every pending
-/// compensating record is now unreachable, so all of them stop being
-/// replayed.
+/// image the new base: every page draw is already in it and
+/// [commit_gen_dfw] has applied the surviving postings, so the windows
+/// and the cache both start empty.
 fn reset_gen_windows(database: &mut Option<Database>) {
     if let Some(db) = database.as_mut() {
         db.windows.clear();
         db.windows.push(UndoWindow::new(WindowKind::Transaction));
+        // tra_gen_ids dies with the transaction: entries the commit
+        // consumed are already on the page, entries whose postings
+        // died were never anyone else's to see
+        db.gen_cache.clear();
     }
 }
 
@@ -2387,6 +2503,7 @@ fn load_database(path: &str) -> Option<Database> {
         write: None,
         tx: None,
         auto_pages: std::collections::HashMap::new(),
+        gen_cache: std::collections::HashMap::new(),
         touched: false,
         posted: std::cell::RefCell::new(Vec::new()),
         events,
@@ -18970,6 +19087,9 @@ fn collect_dml_targets_drawing(
 ) -> Result<(Vec<(u32, u16, u8, Vec<u8>)>, Option<i64>), ExecErr> {
     let (id, incr) = generator_info(db, &g.name).ok_or("no such generator")?;
     let step = g.step.unwrap_or(incr);
+    // a cached name draws in the cache, never in `work` - the caller
+    // writes `last` back to whichever side drew (see [GenWindow])
+    let mut cached = gen_cached(db, &g.name);
     let mut last = None;
     let mut out = Vec::new();
     let db_image = db.bytes();
@@ -18990,7 +19110,14 @@ fn collect_dml_targets_drawing(
                 .or_else(|| formats.iter().max_by_key(|(n, _)| *n));
             let Some((_, descs)) = descs else { continue };
             let values = decode_record(&image, descs);
-            let drawn = fire_crab_ods::gen::bump(work, db.page_size, id, step)?;
+            let drawn = match cached {
+                Some(c) => {
+                    let v = c.wrapping_add(step);
+                    cached = Some(v);
+                    v
+                }
+                None => fire_crab_ods::gen::bump(work, db.page_size, id, step)?,
+            };
             last = Some(drawn);
             // three-valued, like every other comparison: a NULL column
             // is UNKNOWN, which keeps no row
@@ -19800,26 +19927,19 @@ fn execute_dml_collecting_inner(
         }
         Plan::AlterColumnRestart { table, column, with_value } => {
             // RESTART WITH on an identity column is the same absolute
-            // set, reaching the backing RDB$<n> generator, and it leaves
-            // the same compensating record - see [GenWindow]
-            let want = column.trim().trim_matches('"');
-            let fid = db.columns(table)
-                .iter()
-                .find(|c| c.name.eq_ignore_ascii_case(want))
-                .map(|c| c.field_id as usize);
-            if let Some((_, gen, _)) = identity_columns(db, table)
-                .into_iter()
-                .find(|(id, _, _)| Some(*id) == fid)
-            {
-                mark_generator_set(db, &gen);
-            }
-            fire_crab_ods::ddl::alter_column_restart(
+            // set, reaching the backing RDB$<n> generator: the stored
+            // value goes to the transaction cache with a posting, not
+            // to the page - see [GenWindow]. The statement's own
+            // header bookkeeping (the OIT advance the engine's DDL
+            // makes) still lands in `work`.
+            let (gen, stored) = fire_crab_ods::ddl::column_restart_posting(
                 &mut work,
                 db.page_size,
                 table,
                 column,
                 *with_value,
             )?;
+            post_generator_set(db, &gen, stored);
             (0, 0, 0)
         }
         Plan::AlterColumnGenerated { table, column, identity_type } => {
@@ -19868,13 +19988,15 @@ fn execute_dml_collecting_inner(
             // so two NEXT VALUE FOR of one sequence in a row bump twice.
             for (fid, name, step) in gen_fields {
                 let (id, incr) = generator_info(db, name).ok_or("no such generator")?;
+                // the draw lands in the page (and is BURNED here,
+                // before the row is validated: the engine's
+                // PK-violating insert has already moved the generator
+                // when it raises, and `work` is about to be thrown
+                // away on that path - see [burn_generator]) - or in
+                // the transaction cache, when a pending set holds the
+                // name - see [GenWindow]
                 let new_val =
-                    fire_crab_ods::gen::bump(&mut work, db.page_size, id, step.unwrap_or(incr))?;
-                // the draw is BURNED here, before the row is validated:
-                // the engine's PK-violating insert has already moved the
-                // generator when it raises, and `work` is about to be
-                // thrown away on that path - see [burn_generator]
-                burn_generator(db, name, new_val);
+                    gen_bump_through_cache(db, &mut work, name, id, step.unwrap_or(incr))?;
                 let d = descs.get(*fid).ok_or("field beyond format")?;
                 match encode_wire_value(d, &WireParam::Int(new_val, 0))
                     .ok_or("generator value does not fit its column")?
@@ -20065,7 +20187,11 @@ fn execute_dml_collecting_inner(
                     let (rows, last) =
                         collect_dml_targets_drawing(db, &mut work, *rel, formats, g)?;
                     if let Some(v) = last {
-                        burn_generator(db, &g.name, v);
+                        if gen_cached(db, &g.name).is_some() {
+                            db.gen_cache.insert(g.name.to_ascii_uppercase(), v);
+                        } else {
+                            burn_generator(db, &g.name, v);
+                        }
                     }
                     rows
                 }
@@ -20111,13 +20237,13 @@ fn execute_dml_collecting_inner(
                 // statement that raises later keeps the draws it made.
                 for (fid, name, step) in &gen_sets {
                     let (id, incr) = generator_info(db, name).ok_or("no such generator")?;
-                    let new_val = fire_crab_ods::gen::bump(
+                    let new_val = gen_bump_through_cache(
+                        db,
                         &mut work,
-                        db.page_size,
+                        name,
                         id,
                         step.unwrap_or(incr),
                     )?;
-                    burn_generator(db, name, new_val);
                     let d = descs.get(*fid).ok_or("field beyond format")?;
                     match encode_wire_value(d, &WireParam::Int(new_val, 0))
                         .ok_or("generator value does not fit its column")?
@@ -20305,7 +20431,11 @@ fn execute_dml_collecting_inner(
                     let (rows, last) =
                         collect_dml_targets_drawing(db, &mut work, *rel, formats, g)?;
                     if let Some(v) = last {
-                        burn_generator(db, &g.name, v);
+                        if gen_cached(db, &g.name).is_some() {
+                            db.gen_cache.insert(g.name.to_ascii_uppercase(), v);
+                        } else {
+                            burn_generator(db, &g.name, v);
+                        }
                     }
                     rows
                 }
@@ -20354,16 +20484,16 @@ fn execute_dml_collecting_inner(
             // the generator's id locates its slot; its increment turns a
             // RESTART WITH n into the stored value n - increment (so the
             // next GEN_ID yields n) - both read from RDB$GENERATORS
-            let (id, incr) = generator_info(db, name).ok_or("no such generator")?;
+            let (_id, incr) = generator_info(db, name).ok_or("no such generator")?;
             let value = match mode {
                 GenWrite::Absolute(n) => *n,
                 GenWrite::Restart(n) => n - incr,
             };
-            // an absolute set is TRANSACTIONAL: it leaves a compensating
-            // record naming the value it found, and a rollback of this
-            // window puts that value back - see [GenWindow]
-            mark_generator_set(db, name);
-            write_generator_value(&mut work, db.page_size, id, value)?;
+            // an absolute set NEVER touches the page: it lands in the
+            // transaction cache and posts a dfw_set_generator into the
+            // current window; COMMIT applies the survivors - see
+            // [GenWindow]
+            post_generator_set(db, name, value);
             (0, 0, 0)
         }
         _ => return Err("not a DML plan".into()),
@@ -29060,7 +29190,12 @@ fn scalar_value(v: &ScalarVal, db: Option<&Database>) -> Result<Option<i64>, Sca
         ScalarVal::Fixed(n) => Ok(*n),
         ScalarVal::GenRead(name) => {
             let db = db.ok_or(ScalarErr::Gone)?;
-            read_generator_value(db, name).map(Some).ok_or(ScalarErr::Gone)
+            // the transaction cache first, like every generator read -
+            // see [GenWindow]
+            match gen_cached(db, name) {
+                Some(v) => Ok(Some(v)),
+                None => read_generator_value(db, name).map(Some).ok_or(ScalarErr::Gone),
+            }
         }
         ScalarVal::Agg(a) => {
             let db = db.ok_or(ScalarErr::Gone)?;
@@ -32839,9 +32974,21 @@ fn persist_generators(db: Option<&mut Database>, writes: &[(String, i64)]) {
         return;
     }
     let Some(db) = db else { return };
+    // a cached name's final value goes BACK TO THE CACHE - it is
+    // pending with the set that put it there and the page must not
+    // learn it before COMMIT does - see [GenWindow]
+    let (cached, paged): (Vec<_>, Vec<_>) = writes
+        .iter()
+        .partition(|(name, _)| gen_cached(db, name).is_some());
+    for (name, val) in &cached {
+        db.gen_cache.insert(name.to_ascii_uppercase(), *val);
+    }
+    if paged.is_empty() {
+        return;
+    }
     let Ok(mut work) = db.work_copy() else { return };
     let mut ok = true;
-    for (name, val) in writes {
+    for (name, val) in &paged {
         match generator_id(db, name) {
             Some(id) => {
                 if write_generator_value(&mut work, db.page_size, id, *val).is_err() {
@@ -32853,7 +33000,7 @@ fn persist_generators(db: Option<&mut Database>, writes: &[(String, i64)]) {
     }
     if ok {
         db.install_dirty(work); // the commit writes it - see [write_gen_window]
-        for (name, val) in writes {
+        for (name, val) in &paged {
             burn_generator(db, name, *val);
         }
     }
@@ -32898,7 +33045,11 @@ fn advance_generators(
     for (_, name, _) in slots {
         let key = name.to_ascii_uppercase();
         if !running.contains_key(&key) {
-            let base = read_generator_value(db, name).unwrap_or(0);
+            // the transaction cache first, like every generator read -
+            // see [GenWindow]
+            let base = gen_cached(db, name)
+                .or_else(|| read_generator_value(db, name))
+                .unwrap_or(0);
             let gi = generator_info(db, name).map(|(_, i)| i).unwrap_or(1);
             running.insert(key.clone(), base);
             incr.insert(key, gi);
@@ -50851,6 +51002,10 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                             }
                             outcome
                         } else {
+                            // the surviving generator postings write
+                            // BEFORE the snapshot: what commits is the
+                            // image with the cache applied
+                            commit_gen_dfw(&mut database);
                             tx_snapshot = snapshot_db(&database);
                             reset_gen_windows(&mut database);
                             TxEnd::Commit
@@ -51872,7 +52027,9 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     }
                     outcome
                 } else {
-                    // committed: this image is the new starting point
+                    // committed: this image is the new starting point,
+                    // with the surviving generator postings applied first
+                    commit_gen_dfw(&mut database);
                     tx_snapshot = snapshot_db(&database);
                     reset_gen_windows(&mut database);
                     TxEnd::Commit
@@ -53277,9 +53434,9 @@ fn eval_blr_val(v: &BVal, ctxs: &[Ctx], input: &[Value], db: &Database) -> Value
                 eval_blr_val(f, ctxs, input, db)
             }
         }
-        BVal::GenId(name, _step) => {
-            read_generator_value(db, name).map_or(Value::Null, Value::Int)
-        }
+        BVal::GenId(name, _step) => gen_cached(db, name)
+            .or_else(|| read_generator_value(db, name))
+            .map_or(Value::Null, Value::Int),
         BVal::Arith(op, l, r) => {
             let (a, b) = (
                 eval_blr_val(l, ctxs, input, db),
@@ -53464,8 +53621,16 @@ fn gen_id_increment(
 ) -> Result<i64, String> {
     let db = database.as_mut().ok_or("no database attached")?;
     let (id, incr) = generator_info(db, name).ok_or("no such generator")?;
+    let step = step.unwrap_or(incr);
+    // a cached name draws in the cache - pending with the set it rode
+    // in on - see [GenWindow]
+    if let Some(cur) = gen_cached(db, name) {
+        let new_val = cur.wrapping_add(step);
+        db.gen_cache.insert(name.to_ascii_uppercase(), new_val);
+        return Ok(new_val);
+    }
     let current = read_generator_value(db, name).unwrap_or(0);
-    let new_val = current.wrapping_add(step.unwrap_or(incr));
+    let new_val = current.wrapping_add(step);
     let mut work = db.work_copy()?;
     write_generator_value(&mut work, db.page_size, id, new_val)?;
     db.install_dirty(work); // the commit writes it - see [write_gen_window]
@@ -53836,6 +54001,7 @@ mod tests {
             write: None,
             tx: None,
             auto_pages: std::collections::HashMap::new(),
+        gen_cache: std::collections::HashMap::new(),
             touched: false,
             posted: std::cell::RefCell::new(Vec::new()),
             events: events_for("/nonexistent/fc-rowsource-test"),
@@ -56767,6 +56933,7 @@ mod tests {
             write: None,
             tx: None,
             auto_pages: std::collections::HashMap::new(),
+        gen_cache: std::collections::HashMap::new(),
             touched: false,
             posted: std::cell::RefCell::new(Vec::new()),
             events: events_for("/nonexistent/fc-rowsource-test"),
@@ -62918,6 +63085,7 @@ mod tests {
             write: None,
             tx: None,
             auto_pages: std::collections::HashMap::new(),
+        gen_cache: std::collections::HashMap::new(),
             touched: false,
             posted: std::cell::RefCell::new(Vec::new()),
             events: events_for(tag),

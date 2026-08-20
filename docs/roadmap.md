@@ -541,22 +541,37 @@ narrative of every closure is in git history and the gate that pins it.
   package qualifier is not a schema qualifier, and the PUBLIC rule
   currently swallows both. Pre-existing, refusal-only. Unclaimed.
 
-- **The compensating undo of an absolute set is DEFERRED in the engine
-  and EAGER here** — a divergence this slice's probing found and did
-  NOT introduce (identical on the pre-slice binary). The engine runs an
-  absolute set's compensating record at TRANSACTION END: read the
-  generator between a `ROLLBACK TO SAVEPOINT` that undid the set and
-  the commit, and the engine still answers the *un-compensated* value.
-  `SAVEPOINT SP; ALTER TABLE AID ALTER COLUMN ID RESTART WITH 100;
-  ROLLBACK TO SP; INSERT INTO AID (V) VALUES (3);` writes `ID 100` on
-  the engine and `ID 2` here; the same shape through `ALTER SEQUENCE`
-  answers 101 against 51. Put a `COMMIT` after the `ROLLBACK TO SP` and
-  both sides agree again, which is why every phase of
-  `qa/serve-real-gendurable.sh` — all of which read after a commit —
-  is green. Matching it needs the record to fire at transaction end
-  rather than at the savepoint undo, and to fire on COMMIT as well as
-  ROLLBACK when the window that held it was undone; that is a
-  visibility model, not a value model, and it is its own slice.
+- ~~**The compensating undo of an absolute set is DEFERRED in the engine
+  and EAGER here**~~ **CLOSED — and the recorded model was upside
+  down: there is no compensating record at all. The SET itself is
+  deferred.** Read from the engine's source and verified cell by cell:
+  an absolute set never touches the generator page — the value lands
+  in a TRANSACTION-scoped cache (`tra_gen_ids`, last put wins;
+  `DdlNodes.epp:6510`) and a `dfw_set_generator` posting lands in the
+  CURRENT savepoint; once cached, every later read AND draw of that
+  name lives in the cache (`dpm.epp DPM_gen_id:1421` checks it first)
+  while other attachments see the page; `ROLLBACK TO SAVEPOINT`
+  deletes the savepoint's postings and nothing else
+  (`Savepoint.cpp:459 DFW_delete_deferred`); COMMIT applies the
+  cache's LAST value for every name with a *surviving* posting
+  (`dfw.epp` set_generator phase 3 — the posting is a trigger, the
+  cache is the value, which is why `SET TO 10; SAVEPOINT B; SET TO 3;
+  ROLLBACK TO B; COMMIT` answers **3**, the outer posting firing the
+  inner value). Draws absorbed by the cache die with the postings —
+  measured: set 3 undone, draw answers 4 locally, COMMIT leaves 50.
+  fire-crab now implements exactly this (`Database::gen_cache` +
+  per-window `dfw` postings + `commit_gen_dfw`); the old
+  compensating-record machinery (`pre_set`) is deleted. The roadmap's
+  original probe pair — an undone identity `RESTART WITH 100` whose
+  INSERT writes `ID 100` on the engine and wrote `ID 2` here — is
+  pinned in `qa/serve-real-gencomp.sh` (22 checks: the 20-cell matrix
+  plus cache privacy across attachments, engine and fc cell-identical).
+  Two engine facts recorded beyond fc's surface: COMMIT RETAIN runs
+  the surviving postings and keeps the unapplied cache entries (fc
+  serves no retaining op); an AUTONOMOUS block draws PAST the outer
+  cache (its own transaction, its own empty cache — fc's guard
+  implements this, but fc's PSQL currently refuses `GEN_ID` inside an
+  autonomous body, so the cell is unexercisable today).
 
 - **Derived-table FLATTENING is the wrong way to close the sorted-raiser
   residual** — recorded so it is not attempted again. Merging `SELECT …
