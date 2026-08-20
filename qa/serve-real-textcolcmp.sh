@@ -826,6 +826,20 @@ both "... the comma spelling, whose key lives in the WHERE" \
      "SELECT ID FROM TNI, TK WHERE TNI.N = TK.S"
 both "... and the equality written the other way round" \
      "SELECT ID FROM TNI JOIN TK ON TNI.N = TK.S"
+# AN AGGREGATE OVER THE SAME KEY IS THE SAME KEY. The fold reads the
+# hashed stream, so COUNT/SUM/GROUP BY over the comma spelling raise
+# exactly as the rows do (measured on the engine; fire-crab's fold used
+# to answer 1 off the lenient compare, because the WHERE's key marking
+# sat AFTER the grouped plan's early return and only the row path got
+# it).
+both "COUNT(*) over the comma spelling raises the same" \
+     "SELECT COUNT(*) AS C FROM TNI, TK WHERE TNI.N = TK.S"
+both "... SUM the same" \
+     "SELECT SUM(TNI.N) AS S FROM TNI, TK WHERE TNI.N = TK.S"
+both "... and GROUP BY the same" \
+     "SELECT TNI.N AS GN, COUNT(*) AS C FROM TNI, TK WHERE TNI.N = TK.S GROUP BY TNI.N"
+both "a filter on the key's own stream silences the fold too" \
+     "SELECT COUNT(*) AS C FROM TNI, TK WHERE TNI.N = TK.S AND TK.S = '34'"
 # THE TWO SILENCERS, measured: the engine answers 0 rather than raising
 # when a sibling conjunct is INVARIANT (it never builds the hash) and
 # when a conjunct filters the KEY'S OWN STREAM (applied to that stream
@@ -930,8 +944,8 @@ both "DOUBLE PRECISION too" \
      "SELECT CAST(C AS DOUBLE PRECISION) AS V FROM TXCS WHERE ID = 1"
 
 # --- 15. the ran counter -----------------------------------------------
-if [ "$ran" -ne 355 ]; then
-    echo "DIFF $ran checks ran (expected exactly 355) - did one silently skip?"
+if [ "$ran" -ne 359 ]; then
+    echo "DIFF $ran checks ran (expected exactly 359) - did one silently skip?"
     fail=1
 fi
 

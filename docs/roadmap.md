@@ -609,23 +609,34 @@ narrative of every closure is in git history and the gate that pins it.
   * a FALSE sibling conjunct (`AND 1=0`) silences it, which the
     invariant pass gives for free.
 
-  Not built yet: it needs a strict twin of the `Expr::TextNum` wrap
-  (with arms in all of `type_of`/`rank_of`/`result_scale`/`eval`, per
-  this file's own law about new variants), the boundary equality of an
-  INNER or comma join rewritten to use it, and same-side ON conjuncts
-  pushed onto their stream first. Its own slice; the measurement above
-  is the expensive half and is done.
+  ~~Not built yet: it needs a strict twin of the `Expr::TextNum` wrap
+  … the boundary equality of an INNER or comma join rewritten to use
+  it, and same-side ON conjuncts pushed onto their stream first.~~
+  **BUILT — the joins programme brought the strict key
+  (`mark_hash_keys` on the INNER/comma boundary, the side-filter and
+  invariant silencers), and the LAST unmarked consumer closed after
+  it: the AGGREGATE/GROUP BY fold over the comma spelling.** The
+  grouped plan (`Plan::JoinGroup`) returned before the comma-WHERE
+  marking pass ran, so `SELECT COUNT(*) FROM S1, N1 WHERE S1.T =
+  N1.A` answered **1** off the lenient compare (matching `'1 2'` to
+  12 — a wrong row AND a wrong success) where the engine raises
+  22018 and fire-crab's own row path already raised. The pass now
+  runs before the grouped branch forks; COUNT/SUM/GROUP BY over the
+  comma spelling raise byte-identically, and a side filter silences
+  the fold exactly as it silences the rows (`serve-real-textcolcmp.sh`
+  355 → 359).
 
-  **The older note, kept:**
-  `FROM TNI JOIN TK ON TK.S = TNI.N` and the comma spelling both raise
-  on the engine and answer here, at HEAD as well as after this fix — the
-  join path compares those two columns per row with the lenient
-  grammar and does not know which of its equalities the engine turns
-  into hash keys. Pinned on both sides at the end of law 11. Closing it
-  is a join-path slice, not a fold one. Beside it: `= ANY` / `= ALL`
-  have no surface at all here, and an `INSERT ... SELECT` whose WHERE
-  carries ANY per-row conversion raiser refuses at prepare rather than
-  raising it (`WHERE ID = 'x'` does the same, and did before).
+  **A finer empty-side law than the older measurement recorded**: the
+  raise follows the TEXT side's surviving rows, not "either side
+  non-empty" — emptying the NUMERIC side still raises (the text keys
+  convert regardless), emptying the TEXT side answers 0. Engine and
+  fire-crab agree on all three empty cells today.
+
+  Still open beside it, both refusal-only: a BARE aggregate over a
+  comma join (`SELECT COUNT(*) FROM A, B WHERE …` with no alias)
+  refuses 42000 at prepare (pre-existing, projection surface);
+  `= ANY` / `= ALL` and the `INSERT … SELECT` per-row raiser notes
+  from the older text keep their standing (pinned at law 11's end).
 
 - **The parameter-bind and STORE vectors refuse with a bare `Dynamic
   SQL Error` where the engine raises 22018 with the argument** — the

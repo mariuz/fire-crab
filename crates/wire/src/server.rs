@@ -23673,6 +23673,29 @@ fn plan_join_bound(
         }
     }
 
+    // A COMMA JOIN CARRIES ITS KEY IN THE WHERE, not in an ON, and the
+    // engine hashes it just the same (`FROM A, B WHERE A.N = B.T` is
+    // PLAN HASH, probed). So the same marking the ON gets is applied to
+    // the WHERE's boundary equalities - but only when EVERY step is an
+    // inner join, since a LEFT step is planned as a nested loop and its
+    // text side stays lenient. This runs BEFORE the grouped branch
+    // forks off: an AGGREGATE over the comma join reads the same
+    // hashed key, and the engine raises 22018 through COUNT(*) exactly
+    // as it does through the rows (measured: `SELECT COUNT(*) FROM
+    // S1, N1 WHERE S1.T = N1.A` with an unconvertible S1 row raises on
+    // the engine; this pass used to sit after the JoinGroup return and
+    // the fold answered 1 off the lenient compare).
+    let mut filter = filter;
+    if parts.iter().all(|p| matches!(p.kind, JoinKind::Inner)) {
+        if let Some(f) = filter.as_mut() {
+            let mut at = sides[0].descs.len();
+            for p in parts.iter() {
+                mark_hash_keys(f, at, p.width);
+                at += p.width;
+            }
+        }
+    }
+
     // An AGGREGATE in the projection (or any GROUP BY) folds the joined
     // rows instead of emitting them. The fold is the same machinery a
     // single relation's grouping uses; only the INPUT differs, so the
@@ -23980,23 +24003,6 @@ fn plan_join_bound(
                         }
                     }
                 }
-            }
-        }
-    }
-
-    // A COMMA JOIN CARRIES ITS KEY IN THE WHERE, not in an ON, and the
-    // engine hashes it just the same (`FROM A, B WHERE A.N = B.T` is
-    // PLAN HASH, probed). So the same marking the ON gets is applied to
-    // the WHERE's boundary equalities - but only when EVERY step is an
-    // inner join, since a LEFT step is planned as a nested loop and its
-    // text side stays lenient.
-    let mut filter = filter;
-    if parts.iter().all(|p| matches!(p.kind, JoinKind::Inner)) {
-        if let Some(f) = filter.as_mut() {
-            let mut at = sides[0].descs.len();
-            for p in parts.iter() {
-                mark_hash_keys(f, at, p.width);
-                at += p.width;
             }
         }
     }
