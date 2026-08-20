@@ -13,6 +13,34 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-08-20 — MERGE
+
+### Converted
+- **MERGE** (`Plan::Merge`, StmtNodes.cpp MergeNode): table or derived
+  source, ON, MATCHED UPDATE/DELETE and NOT MATCHED INSERT branches with
+  AND conditions - the first of the row's kind whose condition holds,
+  in declaration order, or nothing; `isc_merge_dup_update` (21000,
+  -811) when two source rows reach one target, the statement undone.
+  Desugared per source row at execute into the UPDATE / DELETE / INSERT
+  planners (the pairs read first against the starting state, the
+  engine's one-cursor law); NOT MATCHED renders as `INSERT ... SELECT
+  ... FROM RDB$DATABASE [WHERE cond]` so expressions evaluate.
+
+### Fixed
+- **An UPDATE over a rolled-back DELETE's stub corrupted the file for
+  the engine**: the stub was chained in as a back version - a
+  zero-length "full image" the engine took for a record and
+  BUGCHECKED on ("wrong record length (183)", vio.cpp:1902). The new
+  head links past the stub now (the engine purges the dead version
+  before writing). Introduced with the dead-head rule in the DDL
+  slice; found by the MERGE probes, pinned as the merge gate's first
+  cell.
+
+### Gated
+- `qa/serve-real-merge.sh` (new, 17): thirteen `both` cells against
+  the engine, the engine reading fc's merged table, gfix, gbak,
+  coverage by the trace.
+
 ## 2026-08-20 — blob writes over the wire, and RETAIN
 
 ### Converted

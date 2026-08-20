@@ -1289,6 +1289,14 @@ fn push_back_version(
             if !dead {
                 return Err("target is not a live primary record version".into());
             }
+            // and it is NOT copied into the chain: a stub carries no data,
+            // and the engine, stepping past the dead head, would take a
+            // zero-length back version for a full image - BUGCHECK 183
+            // "wrong record length" (vio.cpp:1902), measured. The engine
+            // purges the dead version before writing (VIO_modify's
+            // backout); here the new head links straight to the stub's
+            // own back version, and the stub's slot is what it overwrites.
+            return Ok((u32_at(&rec, 4), u16_at(&rec, 8), rec[12]));
         }
         let format = rec[12];
         put_u16(&mut rec, 10, rflags | flags::CHAIN);

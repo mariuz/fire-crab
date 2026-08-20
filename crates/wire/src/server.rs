@@ -5674,6 +5674,14 @@ struct AggPlan {
     index: Option<IndexAccess>,
 }
 
+/// One MERGE branch's action (see [Plan::Merge]).
+#[derive(Clone, Debug)]
+enum MergeAction {
+    /// the SET list, verbatim
+    Update(String),
+    Delete,
+}
+
 #[derive(Clone)]
 enum Plan {
     /// (value, output-column name): the engine names a lone aggregate's
@@ -6160,6 +6168,28 @@ AlterDomainRename {
     /// MATCHING refuses at prepare with the engine's
     /// primary-key-required vector
     UpdateOrInsert { update: Box<Plan>, insert: Box<Plan> },
+    /// `MERGE INTO <t> USING <s> ON <cond> WHEN [NOT] MATCHED [AND c] THEN
+    /// ...` (StmtNodes.cpp MergeNode): a LEFT join of source onto
+    /// target with one action per joined row - the FIRST branch of the
+    /// row's kind whose condition holds, in declaration order, or
+    /// nothing (genBlr's if-else chain). Desugared PER SOURCE ROW at
+    /// execute into the UPDATE / DELETE / INSERT plans this server
+    /// already audits, the source's column references substituted as
+    /// literals; the clauses are kept as TEXT for that. A target row
+    /// two source rows reach raises isc_merge_dup_update (21000) and
+    /// the whole statement is undone.
+    Merge {
+        target: String,
+        tgt_alias: String,
+        /// `SELECT * FROM <source> <alias>`
+        source_sql: String,
+        src_alias: String,
+        on: String,
+        /// WHEN MATCHED [AND cond] THEN UPDATE SET <sets> | DELETE
+        matched: Vec<(Option<String>, MergeAction)>,
+        /// WHEN NOT MATCHED [AND cond] THEN INSERT [(cols)] VALUES (vals)
+        not_matched: Vec<(Option<String>, Option<String>, String)>,
+    },
     /// `DELETE FROM <t> [WHERE ...]`: op_execute rewrites each matching
     /// primary record as a deleted stub over its version chain
     Delete {
@@ -19548,6 +19578,7 @@ fn dml_target_rel(plan: &Plan, db: &Database) -> Option<u16> {
         }
         Plan::Returning { inner, .. } => dml_target_rel(inner, db),
         Plan::UpdateOrInsert { update, .. } => dml_target_rel(update, db),
+        Plan::Merge { target, .. } => db.relation_meta(target).map(|r| r.id),
         Plan::InsertSelect { table, .. } => db.relation_meta(table).map(|r| r.id),
         _ => None,
     }
@@ -19793,6 +19824,9 @@ fn execute_dml_collecting_inner(
         }
         let (inserted, _, _) = execute_dml_collecting(insert, database, args, ctx, affected)?;
         return Ok((inserted, 0, 0));
+    }
+    if let Plan::Merge { .. } = plan {
+        return merge_exec(plan, database, args, ctx, affected);
     }
     // INSERT INTO ... SELECT: materialise the query's rows and store
     // each through the ORDINARY insert path (defaults, NOT NULL,
@@ -32112,6 +32146,8 @@ fn describe_for(plan: &Plan, params: &[Descriptor], att: AttCs) -> Vec<u8> {
         // the engine types UPDATE OR INSERT as an INSERT
         // (UpdateOrInsertNode sets TYPE_INSERT)
         Plan::UpdateOrInsert { .. } => describe_dml(2, params),
+        // MergeNode::dsqlPass: TYPE_INSERT without RETURNING (StmtNodes.cpp:7646)
+        Plan::Merge { .. } => describe_dml(2, params),
         Plan::Update { .. } => describe_dml(3, params), // isc_info_sql_stmt_update
         Plan::Delete { .. } => describe_dml(4, params), // isc_info_sql_stmt_delete
         Plan::Project { cols, .. } => build_describe(cols, params, att),
@@ -32184,7 +32220,7 @@ fn stmt_type_of(plan: &Plan) -> i32 {
         Plan::Returning { inner, .. } => {
             if matches!(inner.as_ref(), Plan::Insert { .. }) { 8 } else { 1 }
         }
-        Plan::Insert { .. } | Plan::UpdateOrInsert { .. } => 2,
+        Plan::Insert { .. } | Plan::UpdateOrInsert { .. } | Plan::Merge { .. } => 2,
         Plan::Update { .. } => 3,
         Plan::Delete { .. } => 4,
         Plan::CreateTable { .. } | Plan::CreateIndex { .. } | Plan::DropTable { .. }
@@ -33578,7 +33614,7 @@ fn emit_rows_inner(
         | Plan::ExecBlock { .. }
         | Plan::Savepoint { .. }
         | Plan::InsertSelect { .. }
-        | Plan::Insert { .. } | Plan::UpdateOrInsert { .. }
+        | Plan::Insert { .. } | Plan::UpdateOrInsert { .. } | Plan::Merge { .. }
         | Plan::Update { .. } | Plan::Delete { .. }
         | Plan::CreateTable { .. } | Plan::CreateIndex { .. } | Plan::DropTable { .. }
         | Plan::DropIndex { .. }
@@ -46609,7 +46645,7 @@ fn immediate_verb(text: &str) -> (bool, bool) {
     let ddl = ["CREATE", "ALTER", "DROP", "RECREATE", "COMMENT", "GRANT", "REVOKE"]
         .into_iter()
         .any(|k| find_word(&up, k, 0) == Some(0));
-    let dml = ["INSERT", "UPDATE", "DELETE"]
+    let dml = ["INSERT", "UPDATE", "DELETE", "MERGE"]
         .into_iter()
         .any(|k| find_word(&up, k, 0) == Some(0));
     (ddl, dml)
@@ -46672,6 +46708,7 @@ fn plan_immediate(text: &str, database: &Option<Database>) -> Option<(Plan, Vec<
                     .or_else(|| plan_upsert(text, database))
                     .or_else(|| plan_update(text, database))
                     .or_else(|| plan_delete(text, database))
+                    .or_else(|| plan_merge(text, database))
             } else {
                 None
             }
@@ -47177,6 +47214,440 @@ fn insert_select(
 
 /// A backup's RDB$UPDATE_RULE / RDB$DELETE_RULE spelling as the
 /// RefAction it names. "NO ACTION" is the catalog's RESTRICT.
+/// `MERGE INTO <t> [[AS] a] USING <s | (subselect)> [[AS] b] ON <cond>
+/// {WHEN MATCHED [AND c] THEN UPDATE SET ... | DELETE | WHEN NOT MATCHED
+/// [BY TARGET] [AND c] THEN INSERT [(cols)] VALUES (...)}+` (parse.y:7579).
+/// The clauses are kept as text (see [Plan::Merge]). Refused here, as
+/// the prepare-time boundary: RETURNING, NOT MATCHED BY SOURCE, PLAN,
+/// ORDER BY, OVERRIDING, and parameters.
+fn plan_merge(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor>)> {
+    let text = sql.trim().trim_end_matches(';').trim();
+    let up = text.to_ascii_uppercase();
+    if find_word(&up, "MERGE", 0) != Some(0) {
+        return None;
+    }
+    let into = find_word(&up, "INTO", "MERGE".len())?;
+    let using = find_word(&up, "USING", into)?;
+    let on_kw = find_word(&up, "ON", using)?;
+    let when0 = find_word(&up, "WHEN", on_kw)?;
+    for kw in ["RETURNING", "PLAN", "OVERRIDING"] {
+        if find_word(&up, kw, 0).is_some() {
+            return None;
+        }
+    }
+    if up.contains('?') || find_word(&up, "ORDER", when0).is_some() {
+        return None;
+    }
+    // target [AS] alias
+    let (target, tgt_alias) = {
+        let seg = text[into + "INTO".len()..using].trim();
+        let mut parts: Vec<&str> = seg.split_whitespace().collect();
+        if parts.len() == 3 && parts[1].eq_ignore_ascii_case("AS") {
+            parts.remove(1);
+        }
+        match parts.as_slice() {
+            [t] => (t.trim_matches('"').to_ascii_uppercase(), t.trim_matches('"').to_ascii_uppercase()),
+            [t, a] => (t.trim_matches('"').to_ascii_uppercase(), a.trim_matches('"').to_ascii_uppercase()),
+            _ => return None,
+        }
+    };
+    // source: a table, or a parenthesised subselect; [AS] alias
+    let src_seg = text[using + "USING".len()..on_kw].trim();
+    let (src_item, src_alias) = if let Some(rest) = src_seg.strip_prefix('(') {
+        let mut depth = 1i32;
+        let mut close = None;
+        for (i, c) in rest.char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = Some(i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let close = close?;
+        let body = rest[..close].trim();
+        let mut tail: Vec<&str> = rest[close + 1..].split_whitespace().collect();
+        if tail.len() == 2 && tail[0].eq_ignore_ascii_case("AS") {
+            tail.remove(0);
+        }
+        let alias = match tail.as_slice() {
+            [a] => a.trim_matches('"').to_ascii_uppercase(),
+            _ => return None, // a derived source needs its alias
+        };
+        (format!("({})", body), alias)
+    } else {
+        let mut parts: Vec<&str> = src_seg.split_whitespace().collect();
+        if parts.len() == 3 && parts[1].eq_ignore_ascii_case("AS") {
+            parts.remove(1);
+        }
+        match parts.as_slice() {
+            [t] => (t.to_string(), t.trim_matches('"').to_ascii_uppercase()),
+            [t, a] => (t.to_string(), a.trim_matches('"').to_ascii_uppercase()),
+            _ => return None,
+        }
+    };
+    if src_alias == tgt_alias {
+        return None;
+    }
+    let on = text[on_kw + "ON".len()..when0].trim().to_string();
+    // the WHEN clauses, split at every top-level WHEN
+    let mut starts = vec![when0];
+    let mut at = when0 + "WHEN".len();
+    while let Some(w) = find_word(&up, "WHEN", at) {
+        starts.push(w);
+        at = w + "WHEN".len();
+    }
+    let mut matched: Vec<(Option<String>, MergeAction)> = Vec::new();
+    let mut not_matched: Vec<(Option<String>, Option<String>, String)> = Vec::new();
+    for (i, &st) in starts.iter().enumerate() {
+        let end = starts.get(i + 1).copied().unwrap_or(text.len());
+        let clause = text[st + "WHEN".len()..end].trim();
+        let cup = clause.to_ascii_uppercase();
+        let then = find_word(&cup, "THEN", 0)?;
+        let head = cup[..then].trim();
+        let action = clause[then + "THEN".len()..].trim();
+        let aup = action.to_ascii_uppercase();
+        let (is_matched, cond_from) = if head.starts_with("MATCHED") {
+            (true, "MATCHED".len())
+        } else if head.starts_with("NOT MATCHED BY SOURCE") {
+            return None; // the target-driven pass is not this slice
+        } else if head.starts_with("NOT MATCHED BY TARGET") {
+            (false, "NOT MATCHED BY TARGET".len())
+        } else if head.starts_with("NOT MATCHED") {
+            (false, "NOT MATCHED".len())
+        } else {
+            return None;
+        };
+        // the AND condition, in the clause's own spelling (the uppercase
+        // shadow has the same byte offsets)
+        let head_orig = &clause[..then];
+        let cond_txt = head_orig[cond_from..].trim();
+        let cond = if cond_txt.is_empty() {
+            None
+        } else if cond_txt.len() > 4 && cond_txt[..4].eq_ignore_ascii_case("AND ") {
+            Some(cond_txt[4..].trim().to_string())
+        } else {
+            return None;
+        };
+        if is_matched {
+            if aup == "DELETE" {
+                matched.push((cond, MergeAction::Delete));
+            } else if let Some(sets) = aup.strip_prefix("UPDATE") {
+                let sets_up = sets.trim();
+                if !sets_up.starts_with("SET") {
+                    return None;
+                }
+                let sets_txt = action["UPDATE".len()..].trim()["SET".len()..].trim().to_string();
+                matched.push((cond, MergeAction::Update(sets_txt)));
+            } else {
+                return None;
+            }
+        } else {
+            aup.strip_prefix("INSERT")?;
+            let ins_txt = action["INSERT".len()..].trim();
+            let values_at = find_word(&ins_txt.to_ascii_uppercase(), "VALUES", 0)?;
+            let cols_txt = ins_txt[..values_at].trim();
+            let cols = if cols_txt.is_empty() {
+                None
+            } else {
+                Some(cols_txt.trim_start_matches('(').trim_end_matches(')').trim().to_string())
+            };
+            let vals = ins_txt[values_at + "VALUES".len()..].trim();
+            let vals = vals.strip_prefix('(')?.strip_suffix(')')?.trim().to_string();
+            not_matched.push((cond, cols, vals));
+        }
+    }
+    if matched.is_empty() && not_matched.is_empty() {
+        return None;
+    }
+    // the target must be a table this server writes
+    let d = db.as_ref()?;
+    d.relation_meta(&target)?;
+    Some((
+        Plan::Merge {
+            target,
+            tgt_alias,
+            source_sql: format!("SELECT * FROM {} {}", src_item, src_alias),
+            src_alias,
+            on,
+            matched,
+            not_matched,
+        },
+        Vec::new(),
+    ))
+}
+
+/// Substitute the SOURCE alias's column references in a MERGE clause
+/// with the current source row's values as literals, and strip the
+/// TARGET alias's qualifier (the per-row statement runs over the target
+/// alone). String literals pass through untouched.
+fn merge_subst(
+    text: &str,
+    src_alias: &str,
+    src_cols: &[String],
+    row: &[Value],
+    tgt_alias: &str,
+) -> Result<String, String> {
+    let b = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0usize;
+    let ident_char = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$';
+    while i < b.len() {
+        let c = b[i];
+        if c == b'\'' {
+            // a string literal, doubled quotes included
+            let start = i;
+            i += 1;
+            while i < b.len() {
+                if b[i] == b'\'' {
+                    if i + 1 < b.len() && b[i + 1] == b'\'' {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            out.push_str(&text[start..i]);
+            continue;
+        }
+        if c.is_ascii_alphabetic() || c == b'_' || c == b'"' {
+            // an identifier, possibly qualified
+            let start = i;
+            if c == b'"' {
+                i += 1;
+                while i < b.len() && b[i] != b'"' {
+                    i += 1;
+                }
+                i = (i + 1).min(b.len());
+            } else {
+                while i < b.len() && ident_char(b[i]) {
+                    i += 1;
+                }
+            }
+            let first = text[start..i].trim_matches('"').to_ascii_uppercase();
+            if i < b.len() && b[i] == b'.' {
+                let mut j = i + 1;
+                let cstart = j;
+                if j < b.len() && b[j] == b'"' {
+                    j += 1;
+                    while j < b.len() && b[j] != b'"' {
+                        j += 1;
+                    }
+                    j = (j + 1).min(b.len());
+                } else {
+                    while j < b.len() && ident_char(b[j]) {
+                        j += 1;
+                    }
+                }
+                let col = text[cstart..j].trim_matches('"').to_ascii_uppercase();
+                if first == src_alias {
+                    let idx = src_cols
+                        .iter()
+                        .position(|n| n.eq_ignore_ascii_case(&col))
+                        .ok_or_else(|| format!("no column {} in the MERGE source", col))?;
+                    let lit = psql_literal(&row[idx])
+                        .ok_or_else(|| format!("a source value of {} cannot be written as a literal", col))?;
+                    out.push_str(&lit);
+                    i = j;
+                    continue;
+                }
+                if first == tgt_alias {
+                    out.push_str(&text[cstart..j]);
+                    i = j;
+                    continue;
+                }
+            }
+            out.push_str(&text[start..i]);
+            continue;
+        }
+        out.push(c as char);
+        i += 1;
+    }
+    Ok(out)
+}
+
+/// [Plan::Merge] at execute - see the variant's doc for the law.
+fn merge_exec(
+    plan: &Plan,
+    database: &mut Option<Database>,
+    args: &[WireParam],
+    ctx: &SessionCtx,
+    mut affected: Option<&mut Affected>,
+) -> Result<(i32, i32, i32), ExecErr> {
+    let Plan::Merge { target, tgt_alias, source_sql, src_alias, on, matched, not_matched } = plan else {
+        return Err("not a MERGE plan".into());
+    };
+    // the source rows, and the names their values answer to
+    let (rows, src_cols) = {
+        let (splan, _) = plan_query(source_sql, database);
+        if let Plan::RefusedEval(e) = &splan {
+            return Err(ExecErr::Eval(e.clone()));
+        }
+        let db = database.as_ref().ok_or("no database attached")?;
+        let rows = branch_rows(&splan, db, args)
+            .ok_or("the MERGE source is not one this server can run")?;
+        let cols: Vec<String> = output_cols_of(&splan).iter().map(|c| c.name.to_ascii_uppercase()).collect();
+        (rows, cols)
+    };
+    // the target's primary key, for a per-row identity predicate
+    let (rel, pk_cols, rel_cols) = {
+        let db = database.as_ref().ok_or("no database attached")?;
+        let image = db.bytes();
+        let ps = db.page_size;
+        let rel = fire_crab_ods::resolve_relation(&image, ps, target).ok_or("MERGE target not found")?;
+        let pk = fire_crab_ods::ddl::primary_key_columns(&image, ps, target).unwrap_or_default();
+        let cols = relation_columns(&image, ps, target);
+        (rel, pk, cols)
+    };
+    // PHASE 1 - THE JOIN: every source row paired with the target rows
+    // its ON reaches, read against the state the statement STARTED from
+    // (the engine's join is one cursor over that state: a row this MERGE
+    // deletes still pairs with a later source row - and raises). The
+    // rows are read through the audited DELETE planner's predicate.
+    let mut pairs: Vec<(String, Vec<(u64, Vec<u8>, u8)>)> = Vec::new();
+    let mut touched: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    for row in &rows {
+        let sub = |t: &str| merge_subst(t, src_alias, &src_cols, row, tgt_alias);
+        let on_s = sub(on)?;
+        let probe = format!("DELETE FROM {} WHERE {}", target, on_s);
+        let (dplan, _) = plan_delete(&probe, database)
+            .ok_or_else(|| format!("the MERGE ON clause is outside this server's surface: {}", probe))?;
+        let targets = match &dplan {
+            Plan::RefusedEval(e) => return Err(ExecErr::Eval(e.clone())),
+            Plan::Delete { rel: drel, formats, filter, .. } => {
+                let filter = bind_filter(filter, &[])?;
+                let db = database.as_ref().ok_or("no database attached")?;
+                let found = collect_dml_targets(db, *drel, formats, &filter, &None).map_err(ExecErr::Eval)?;
+                let image = db.bytes();
+                let mut out = Vec::new();
+                for (page, slot, fmt, img) in found {
+                    let recno = recno_of(&image, db.page_size, page, slot)?;
+                    // ForNode::checkRecordUpdated: a target row reached twice
+                    if !touched.insert(recno) {
+                        return Err(ExecErr::Gds(
+                            335545269,
+                            "Multiple source records cannot match the same target during MERGE".into(),
+                        ));
+                    }
+                    out.push((recno, img, fmt));
+                }
+                out
+            }
+            _ => return Err(format!("the MERGE ON clause is outside this server's surface: {}", probe).into()),
+        };
+        pairs.push((on_s, targets));
+    }
+    // PHASE 2 - THE ACTIONS, all or nothing
+    let snap = snapshot_db(database);
+    let mark = undo_window_push(database, WindowKind::Nested, snap.clone());
+    let (mut ins, mut upd, mut del) = (0i32, 0i32, 0i32);
+    for (row, (on_s, targets)) in rows.iter().zip(pairs) {
+        let step = (|| -> Result<(), ExecErr> {
+            let sub = |t: &str| merge_subst(t, src_alias, &src_cols, row, tgt_alias);
+            if targets.is_empty() {
+                for (cond, cols, vals) in not_matched {
+                    // INSERT ... SELECT <values> FROM RDB$DATABASE [WHERE <cond>]:
+                    // the values may be expressions (the SELECT planner
+                    // evaluates them), and the branch condition - which
+                    // names the source alone here - is its WHERE; no row
+                    // selected is "the condition did not hold"
+                    let where_ = match cond {
+                        Some(c) => format!(" WHERE {}", sub(c)?),
+                        None => String::new(),
+                    };
+                    let sql = match cols {
+                        Some(c) => format!("INSERT INTO {} ({}) SELECT {} FROM RDB$DATABASE{}", target, c, sub(vals)?, where_),
+                        None => format!("INSERT INTO {} SELECT {} FROM RDB$DATABASE{}", target, sub(vals)?, where_),
+                    };
+                    let (iplan, _) = plan_insert(&sql, database)
+                        .ok_or_else(|| format!("the MERGE INSERT branch is outside this server's surface: {}", sql))?;
+                    if let Plan::RefusedEval(e) = &iplan {
+                        return Err(ExecErr::Eval(e.clone()));
+                    }
+                    let (i, _, _) = execute_dml_collecting(&iplan, database, &[], ctx, affected.as_deref_mut())?;
+                    if i > 0 {
+                        ins += i;
+                        break; // the first branch whose condition held
+                    }
+                }
+                return Ok(());
+            }
+            for (_recno, img, fmt) in targets {
+                // the row's identity: its primary key as literals, or the
+                // ON clause alone when the table has none
+                let identity = if pk_cols.is_empty() {
+                    on_s.clone()
+                } else {
+                    let db = database.as_ref().ok_or("no database attached")?;
+                    let formats = relation_formats(&db.bytes(), db.page_size, rel);
+                    let descs = formats
+                        .iter()
+                        .find(|(n, _)| *n == fmt)
+                        .map(|(_, d)| d.clone())
+                        .ok_or("MERGE target format unknown")?;
+                    let values = decode_record(&img, &descs);
+                    let mut parts = Vec::new();
+                    for pk in &pk_cols {
+                        let col = rel_cols
+                            .iter()
+                            .find(|c| c.name.eq_ignore_ascii_case(pk))
+                            .ok_or("MERGE target key column unknown")?;
+                        let v = values.get(col.field_id as usize).cloned().unwrap_or(Value::Null);
+                        let lit = psql_literal(&v).ok_or("a key value cannot be written as a literal")?;
+                        parts.push(format!("{} = {}", pk, lit));
+                    }
+                    parts.join(" AND ")
+                };
+                for (cond, action) in matched {
+                    let mut where_ = identity.clone();
+                    if let Some(c) = cond {
+                        where_ = format!("({}) AND ({})", where_, sub(c)?);
+                    }
+                    let (sql, kind) = match action {
+                        MergeAction::Update(sets) => {
+                            (format!("UPDATE {} SET {} WHERE {}", target, sub(sets)?, where_), 1)
+                        }
+                        MergeAction::Delete => (format!("DELETE FROM {} WHERE {}", target, where_), 2),
+                    };
+                    let (aplan, _) = if kind == 1 {
+                        plan_update(&sql, database)
+                            .ok_or_else(|| format!("the MERGE UPDATE branch is outside this server's surface: {}", sql))?
+                    } else {
+                        plan_delete(&sql, database)
+                            .ok_or_else(|| format!("the MERGE DELETE branch is outside this server's surface: {}", sql))?
+                    };
+                    if let Plan::RefusedEval(e) = &aplan {
+                        return Err(ExecErr::Eval(e.clone()));
+                    }
+                    let (_, u, d) = execute_dml_collecting(&aplan, database, &[], ctx, affected.as_deref_mut())?;
+                    if u + d > 0 {
+                        upd += u;
+                        del += d;
+                        break; // the first branch whose condition held
+                    }
+                }
+            }
+            Ok(())
+        })();
+        if let Err(e) = step {
+            undo_window(database, mark, snap);
+            return Err(e);
+        }
+    }
+    undo_window_unwind(database, mark, false);
+    if std::env::var("FC_SRV_TRACE").is_ok() {
+        eprintln!("[srv] merge: {} source rows -> {} inserted, {} updated, {} deleted", rows.len(), ins, upd, del);
+    }
+    Ok((ins, upd, del))
+}
+
 fn restore_ref_action(rule: &str) -> Result<fire_crab_ods::ddl::RefAction, String> {
     Ok(match rule.trim() {
         "" | "RESTRICT" | "NO ACTION" => fire_crab_ods::ddl::RefAction::Restrict,
@@ -51418,7 +51889,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 let ddl_kw = ["CREATE", "ALTER", "DROP", "RECREATE", "COMMENT", "GRANT", "REVOKE"]
                     .into_iter()
                     .find(|k| find_word(&up, k, 0) == Some(0));
-                let dml_kw = ["INSERT", "UPDATE", "DELETE"]
+                let dml_kw = ["INSERT", "UPDATE", "DELETE", "MERGE"]
                     .into_iter()
                     .find(|k| find_word(&up, k, 0) == Some(0));
                 if let Some((p, ps)) = plan_set_generator(&stmt_sql)
@@ -51513,6 +51984,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                             "INSERT" => plan_insert(&dml_sql, &database),
                             "UPDATE" => plan_upsert(&dml_sql, &database)
                                 .or_else(|| plan_update(&dml_sql, &database)),
+                            "MERGE" => plan_merge(&dml_sql, &database),
                             _ => plan_delete(&dml_sql, &database),
                         };
                         match database.as_ref() {
@@ -51713,6 +52185,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                         // it changed
                         | Plan::Returning { .. }
                         | Plan::InsertSelect { .. }
+                        | Plan::Merge { .. }
                         | Plan::TxControl { .. }
                         | Plan::Savepoint { .. }
                         | Plan::Update { .. }

@@ -42,6 +42,7 @@ One line each; the gate is the proof.
 | packaged procedures | a package qualifier resolves down the search path; `RDB$PROFILER` native no-ops with the engine's arity | `serve-real-pkgproc` 20 |
 | fragmenting store | records larger than a page chain the engine's way; UPDATE/DELETE of a fragmented head | `serve-real-fragstore` 13 |
 | UNIQUE is walk-order | enforcement row-at-a-time in RECNO order, 23000 byte-exact; the sub-9-byte RHDF corruption found and fixed with it | `serve-real-uniqueorder` |
+| MERGE | per-source-row desugar into the audited DML planners; first branch wins; dup-target raise | `serve-real-merge` 17 |
 | blob writes + RETAIN | temp blobs over the wire materialised at the store; COMMIT/ROLLBACK RETAIN keep the transaction with its snapshot | `serve-real-blobwrite` 8, `retain` 8 |
 | transactional DDL | catalog rows under the user transaction's id, undo by state + journaled residue, deferred drops; first-updater-wins on a relation with the engine's vector; owner-only schema visibility | `serve-real-ddltx` 32 |
 | the file grows the engine's way | pointer-page chain, PIP chain, SCN pages at every `pagesPerSCN·N`, TIP chain — each crossed by fc and read by the engine (count, `gfix -v -full`, a write of its own on the new structure, a level-1 nbackup over fc's late pages), and the reverse | `serve-real-growth` 32 |
@@ -163,10 +164,24 @@ parameters in UPDATE … SET, `op_batch_*` (the batch API), `op_fetch_scroll`
 zlib. `op_info_transaction` answers only `isc_info_tra_id`. A text blob
 is stored in the database charset (UTF8) with no bpb transliteration.
 
-### D. Converted, not wired
+### D. Converted, not wired — MERGE executor DONE (2026-08-20)
 
-- **MERGE**: `crates/dsql/src/lib.rs:8444` compiles it to byte-identical BLR with a test corpus; the server has no executor (`MERGE INTO` has zero hits in `server.rs`).
-- **Scrollable cursors**: `blr_scrollable` emitted; `op_fetch_scroll` unimplemented, so no client can scroll.
+**Done:** `Plan::Merge` (`serve-real-merge` 17): a table or derived-table
+source, `ON`, `WHEN MATCHED [AND c] THEN UPDATE SET … | DELETE`, `WHEN NOT
+MATCHED [AND c] THEN INSERT`, several branches per kind — the first whose
+condition holds in declaration order, or nothing (MergeNode::genBlr's
+if-else chain) — and `isc_merge_dup_update` (21000) when two source rows
+reach one target, the statement undone. Desugared per source row at
+execute into the audited UPDATE/DELETE/INSERT planners; the pairs are
+read first against the statement's starting state, as the engine's one
+join cursor does. **Still absent:** `RETURNING` (a multi-row cursor in
+DSQL), `WHEN NOT MATCHED BY SOURCE` (the target-driven pass), `PLAN` /
+`ORDER BY`, `OVERRIDING`, parameters inside a MERGE, the failed
+statement's partial `Records affected` (the engine reports the rows it
+moved before the raise; fc reports 0), a trigger-bearing target
+(refused by the per-row planners at execute, not at prepare).
+Scrollable cursors: `dsql` emits `blr_scrollable`, `op_fetch_scroll` is
+unimplemented.
 
 ### E. DDL without planners
 
@@ -291,8 +306,9 @@ pointer-page and TIP page numbers is the next step when it dominates.
 
 ## Next, in order
 
-- **D, the MERGE executor — THE NEXT CHUNK** — the BLR is already
-  compiled and tested; only the executor is missing.
+- **G, the external sort — THE NEXT CHUNK** — every sort and hash build
+  is bounded by RAM today; the next scalability ceiling a real database
+  reaches.
 - **D, the MERGE executor** — the BLR is already compiled and tested;
   only the executor is missing.
 - **G, the external sort** — every sort and hash build is bounded by
