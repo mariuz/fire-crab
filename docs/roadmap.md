@@ -42,7 +42,7 @@ One line each; the gate is the proof.
 | packaged procedures | a package qualifier resolves down the search path; `RDB$PROFILER` native no-ops with the engine's arity | `serve-real-pkgproc` 20 |
 | fragmenting store | records larger than a page chain the engine's way; UPDATE/DELETE of a fragmented head | `serve-real-fragstore` 13 |
 | UNIQUE is walk-order | enforcement row-at-a-time in RECNO order, 23000 byte-exact; the sub-9-byte RHDF corruption found and fixed with it | `serve-real-uniqueorder` |
-| external sort (slice 1) | runs to disk past a budget, stable merge; ORDER BY / GROUP BY / DISTINCT | `serve-real-bigsort` 12 |
+| external sort | runs to disk past a budget, stable merge; ORDER BY / GROUP BY / DISTINCT; the hash-join build side in a spilling row store; ORDER BY fetches stream from the merge | `serve-real-bigsort` 12 |
 | MERGE | per-source-row desugar into the audited DML planners; first branch wins; dup-target raise | `serve-real-merge` 17 |
 | blob writes + RETAIN | temp blobs over the wire materialised at the store; COMMIT/ROLLBACK RETAIN keep the transaction with its snapshot | `serve-real-blobwrite` 8, `retain` 8 |
 | transactional DDL | catalog rows under the user transaction's id, undo by state + journaled residue, deferred drops; first-updater-wins on a relation with the engine's vector; owner-only schema visibility | `serve-real-ddltx` 32 |
@@ -228,11 +228,19 @@ spilled or not. Wired into the `Sort` row source, `group_rows` and
 `distinct_rows` (which was quadratic). Not copied, on purpose: the
 engine's quicksort over diddled keys and its seek-ordered merge tree -
 measured, its tie order past one 128 KB run is an artefact no gate pins.
-**Open (slices 2-3):** the hash-join build side and RIGHT/FULL mirror
-still materialise; the sorted output is re-collected into a `Vec` (no
-consumer pulls the merge yet - `StreamCursor`/`JoinCursor` still refuse
-ORDER BY, `FIRST n` after a sort pays the whole sort); `backfill_index`
-inserts keys one at a time.
+**Slices 2–3 DONE (2026-08-20):** the hash-join build side lives in a
+`RowStore` (the engine's RecordBuffer over a TempSpace: rows to the
+budget in RAM, then an unlinked file, fetched by offset; the hash table
+keeps offsets only) — a 300k-row build side spills to 18 MB and answers
+byte-identically; an `ORDER BY` fetch streams through `SortedCursor`
+(the scan drained into the external sort at open, each fetch pulled
+from the merge — the result is never a `Vec`); the `Sort` row source
+pulls its merge and honours `Flow::Stop`, so `FIRST n` after a sort
+stops the delivery (the runs are still written whole, as the engine's
+are). **Still open:** the RIGHT/FULL mirror materialises; an ORDER BY
+over a JOIN fetch still materialises (the join cursor's rows are
+projected outputs, the order keys are over the combined row);
+`backfill_index` inserts keys one at a time; no merge join.
 
 
 - **External sort + TempSpace** (`sort.cpp`): every sort, DISTINCT, GROUP BY and hash build lives in RAM (`server.rs:31046 sort_rows`) — a scalability ceiling, not only a feature.
@@ -324,10 +332,11 @@ pointer-page and TIP page numbers is the next step when it dominates.
 
 ## Next, in order
 
-- **G slices 2–3 — THE NEXT CHUNK**: the hash-join build side spilled
-  (a grace hash over the same run machinery) and the merge PULLED by the
-  cursors (`FIRST n` after ORDER BY stops early, an ordered fetch
-  streams).
+- **NEXT**: the recorded tails — MERGE `RETURNING` / `NOT MATCHED BY
+  SOURCE`, `op_info_blob` / `op_seek_blob`, an ORDER BY over a JOIN
+  fetch streaming, the RIGHT/FULL mirror, `backfill_index` through the
+  sort; then the dead-code cleanup (`ddl_undo` / `image_undo` /
+  `restore_db`).
 - **D, the MERGE executor** — the BLR is already compiled and tested;
   only the executor is missing.
 - **G, the external sort** — every sort and hash build is bounded by

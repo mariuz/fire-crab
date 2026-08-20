@@ -78,7 +78,7 @@ both "FIRST and SKIP after the sort" "SELECT FIRST 20 ID, K FROM BS ORDER BY K, 
 small=$(q "127.0.0.1/$PORT:$DBF" "SELECT FIRST 5 ID FROM BS WHERE ID < 3000 AND K = 0 ORDER BY K;" | tr '\n' ' ')
 large=$(q "127.0.0.1/$PORT:$DBF" "SELECT FIRST 5 ID FROM BS WHERE K = 0 ORDER BY K;" | tr '\n' ' ')
 check "fc's tie order is record order, spilled or not" "$small|$large" "0 1000 2000 |0 1000 2000 3000 4000 "
-ran=$((ran + 1)); spilled=$(grep -c 'sort: rows=300000 runs=[2-9][0-9]*' "$LOG")
+ran=$((ran + 1)); spilled=$(grep -cE 'sort( cursor)?: rows=300000 runs=[2-9][0-9]*' "$LOG")
 if [ "$spilled" -ge 6 ]; then echo "OK   coverage: $spilled sorts spilled to runs (2 MB budget)"; else echo "DIFF coverage: [$spilled] spilled sorts"; fail=1; fi
 ran=$((ran + 1)); left=$(ls "$TMP" 2>/dev/null | wc -l)
 if [ "$left" = "0" ]; then echo "OK   coverage: no run file survives in $TMP"; else echo "DIFF coverage: $left run files left"; fail=1; fi

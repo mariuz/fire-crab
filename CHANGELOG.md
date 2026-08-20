@@ -13,6 +13,31 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-08-20 — the sort streams, the build side spills
+
+### Converted
+- **`RowStore`** (`extsort.rs`): the hash-join build side kept to the
+  budget in RAM and past it in an unlinked file, rows fetched by
+  offset - the engine's RecordBuffer over a TempSpace. The hash table
+  keeps offsets only; a key the hash cannot serve still falls back to
+  the materialised scan.
+- **`SortedCursor`**: an ORDER BY fetch over a scan drains into the
+  external sort at open and pulls each batch from the merge - the
+  result is never a Vec. The `Sort` row source pulls its merge too and
+  honours `Flow::Stop`, so FIRST n after a sort ends the delivery.
+
+### Fixed
+- The spilling sort's key prefix dropped the key's COLLATION, so a
+  collated ORDER BY compared raw once every ordered fetch went through
+  the sorted cursor - caught by `serve-real-collate` in the full sweep
+  before the commit; the prefix carries `coll` now.
+
+### Gated
+- `serve-real-bigsort` coverage counts the sorted cursor's runs; the
+  join/sort gate family (join, outerjoin, joinchain, joingroup,
+  leftjoinindex, viewjoin, subqindex, fetchbatch, modifiers, window,
+  union, recursive, cte, derived ...) green on the new paths.
+
 ## 2026-08-20 — the external sort
 
 ### Converted

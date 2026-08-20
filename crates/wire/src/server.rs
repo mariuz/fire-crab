@@ -5103,10 +5103,11 @@ impl RowSource {
                             // cannot serve (a non-integer, an OR) scans, as
                             // before, and the ON decides either way.
                             Band::Scan => {
-                                if fallback.is_none() {
-                                    let rows = right.rows(db)?;
-                                    key_hash = build_join_key_hash(&rows, probe);
-                                    fallback = Some(rows);
+                                if fallback.is_none() && key_hash.is_none() {
+                                    key_hash = build_join_key_hash(right, db, probe)?;
+                                    if key_hash.is_none() {
+                                        fallback = Some(right.rows(db)?);
+                                    }
                                 }
                                 let inner = fallback.as_deref().unwrap_or(&[]);
                                 let matched = join_scan_rows(
@@ -5210,6 +5211,23 @@ impl RowSource {
                         part.on.matches(&row)?;
                     }
                     if matches!(sink(row)?, Flow::Stop) {
+                        return Ok(Flow::Stop);
+                    }
+                }
+                Ok(Flow::Continue)
+            }
+            // A SORT PULLS ITS MERGE: the input streams into the external
+            // sort (runs past the budget), and the sorted rows come out of
+            // the merge one at a time - a `Flow::Stop` (FIRST n) ends the
+            // delivery without the output ever being a Vec. The runs are
+            // written whole either way; so are the engine's (sort.cpp).
+            RowSource::Sort { input, keys } if !keys.is_empty() => {
+                let mut cursor = sorted_cursor_over(input, db, keys)?;
+                while let Some(r) = cursor.next().map_err(|e| {
+                    eprintln!("[srv] sort merge: {}", e);
+                    EvalErr::Unsupported
+                })? {
+                    if matches!(sink(r)?, Flow::Stop) {
                         return Ok(Flow::Stop);
                     }
                 }
@@ -5350,10 +5368,11 @@ impl RowSource {
                             // inner - the same O(N + M) hash the streaming arm
                             // uses (a non-integer key or an OR scans, the ON
                             // deciding either way).
-                            if fallback.is_none() {
-                                let rows = right.rows(db)?;
-                                key_hash = build_join_key_hash(&rows, probe);
-                                fallback = Some(rows);
+                            if fallback.is_none() && key_hash.is_none() {
+                                key_hash = build_join_key_hash(right, db, probe)?;
+                                if key_hash.is_none() {
+                                    fallback = Some(right.rows(db)?);
+                                }
                             }
                             let inner = fallback.as_deref().unwrap_or(&[]);
                             let matched = join_scan_rows(
@@ -6690,7 +6709,11 @@ fn desc_family(d: &Descriptor) -> Option<KeyKind> {
 /// key FAMILY the column carries.
 struct KeyHash {
     kind: KeyKind,
-    buckets: std::collections::HashMap<JoinKey, Vec<usize>>,
+    /// per key, the offsets of its rows in `store`, in arrival order
+    buckets: std::collections::HashMap<JoinKey, Vec<u64>>,
+    /// the build side's rows - in RAM to the budget, on disk past it
+    /// (the engine's RecordBuffer over a TempSpace)
+    store: crate::extsort::RowStore,
 }
 
 /// Build the [KeyHash] for a hash join, or `None` when the join cannot be
@@ -6698,28 +6721,87 @@ struct KeyHash {
 /// key value that is not hashable (a scaled decimal, a date), or a column that
 /// MIXES families (defensive - a typed column does not). A NULL inner key is
 /// dropped: it never matches, which is the equi-join answer, not a lost row.
-fn build_join_key_hash(rows: &[Vec<Value>], probe: &JoinProbe) -> Option<KeyHash> {
+/// [build_join_key_hash] over rows already in hand (the join cursor's
+/// materialised inner): the same store, the same buckets.
+fn build_join_key_hash_from_rows(rows: &[Vec<Value>], probe: &JoinProbe) -> Option<KeyHash> {
     let [key] = probe.keys.as_slice() else { return None };
     let fid = key.inner_fid;
-    let mut buckets: std::collections::HashMap<JoinKey, Vec<usize>> =
-        std::collections::HashMap::new();
+    let mut buckets: std::collections::HashMap<JoinKey, Vec<u64>> = std::collections::HashMap::new();
+    let mut store = crate::extsort::RowStore::new();
     let mut kind: Option<KeyKind> = None;
-    for (i, r) in rows.iter().enumerate() {
+    for r in rows {
         let v = r.get(fid)?;
         match join_key(v) {
             Some((kk, k)) => {
                 match kind {
                     None => kind = Some(kk),
-                    Some(prev) if prev != kk => return None, // mixed families
+                    Some(prev) if prev != kk => return None,
                     _ => {}
                 }
-                buckets.entry(k).or_default().push(i);
+                let off = store.push(r).ok()?;
+                buckets.entry(k).or_default().push(off);
             }
-            None if matches!(v, Value::Null) => {} // NULL never matches
-            None => return None,                   // not a hashable column
+            None if matches!(v, Value::Null) => {}
+            None => return None,
         }
     }
-    Some(KeyHash { kind: kind.unwrap_or(KeyKind::Int), buckets })
+    Some(KeyHash { kind: kind.unwrap_or(KeyKind::Int), buckets, store })
+}
+
+fn build_join_key_hash(right: &RowSource, db: &Database, probe: &JoinProbe) -> Result<Option<KeyHash>, EvalErr> {
+    let [key] = probe.keys.as_slice() else { return Ok(None) };
+    let fid = key.inner_fid;
+    let mut buckets: std::collections::HashMap<JoinKey, Vec<u64>> =
+        std::collections::HashMap::new();
+    let mut store = crate::extsort::RowStore::new();
+    let mut kind: Option<KeyKind> = None;
+    let mut hashable = true;
+    // ONE pass over the build side: each row into the store, its offset
+    // into its key's bucket. A key the hash cannot serve (a mixed family,
+    // a non-hashable column) abandons the hash, and the caller scans.
+    right.for_each(db, &mut |r| {
+        let Some(v) = r.get(fid) else {
+            hashable = false;
+            return Ok(Flow::Stop);
+        };
+        match join_key(v) {
+            Some((kk, k)) => {
+                match kind {
+                    None => kind = Some(kk),
+                    Some(prev) if prev != kk => {
+                        hashable = false;
+                        return Ok(Flow::Stop);
+                    }
+                    _ => {}
+                }
+                let off = store.push(&r).map_err(|e| {
+                    eprintln!("[srv] join hash store: {}", e);
+                    EvalErr::Unsupported
+                })?;
+                buckets.entry(k).or_default().push(off);
+            }
+            None if matches!(v, Value::Null) => {
+                // NULL never matches - the row need not be kept
+            }
+            None => {
+                hashable = false;
+                return Ok(Flow::Stop);
+            }
+        }
+        Ok(Flow::Continue)
+    })?;
+    if !hashable {
+        return Ok(None);
+    }
+    if std::env::var("FC_SRV_TRACE").is_ok() {
+        eprintln!(
+            "[srv] join hash store: rows={} keys={} spilled={}",
+            store.len(),
+            buckets.len(),
+            store.spilled_bytes()
+        );
+    }
+    Ok(Some(KeyHash { kind: kind.unwrap_or(KeyKind::Int), buckets, store }))
 }
 
 /// The inner rows a driver pairs with under the SCAN fallback: its HASH BUCKET
@@ -6746,14 +6828,36 @@ fn join_scan_rows<'a>(
         Ok(v) => match join_key(&v) {
             Some((kk, k)) if kk == h.kind => {
                 buf.clear();
-                if let Some(idxs) = h.buckets.get(&k) {
-                    for &i in idxs {
-                        buf.push(inner[i].clone());
+                if let Some(offs) = h.buckets.get(&k) {
+                    for &off in offs {
+                        match h.store.get(off) {
+                            Ok(r) => buf.push(r),
+                            Err(e) => {
+                                eprintln!("[srv] join hash store: {}", e);
+                                break;
+                            }
+                        }
                     }
                 }
                 buf
             }
-            _ => inner,
+            // a key outside the hash's family: the whole build side must
+            // be scanned, which the store can give back in order
+            _ => {
+                buf.clear();
+                if inner.is_empty() {
+                    let mut offs: Vec<u64> = h.buckets.values().flatten().copied().collect();
+                    offs.sort_unstable();
+                    for off in offs {
+                        if let Ok(r) = h.store.get(off) {
+                            buf.push(r);
+                        }
+                    }
+                    buf
+                } else {
+                    inner
+                }
+            }
         },
         Err(_) => inner,
     }
@@ -30263,6 +30367,12 @@ impl StreamCursor {
     /// Open a cursor for a streamable plan, or `None` to leave the
     /// materialising path in charge. `args` binds the WHERE's parameters.
     fn open(db: &Database, plan: &Plan, args: &[WireParam]) -> Option<StreamCursor> {
+        StreamCursor::open_inner(db, plan, args, false)
+    }
+
+    /// [StreamCursor::open], with an ORDER BY tolerated - for the sorted
+    /// cursor, which drains this scan into its sort
+    fn open_inner(db: &Database, plan: &Plan, args: &[WireParam], allow_order: bool) -> Option<StreamCursor> {
         let Plan::Project {
             rel, formats, filter, order_by, gen_cols, index, defer, windows, ..
         } = plan
@@ -30271,7 +30381,7 @@ impl StreamCursor {
         };
         if index.is_some()
             || defer.is_some()
-            || !order_by.is_empty()
+            || (!allow_order && !order_by.is_empty())
             || !gen_cols.is_empty()
             || !windows.is_empty()
         {
@@ -30574,7 +30684,7 @@ impl JoinCursor {
             // an unindexed equi part hashes its inner by the ON's key; a theta
             // part (no probe, or a key the hash declines) leaves it `None` and
             // the ON scans the whole inner
-            let key_hash = p.probe.as_ref().and_then(|pr| build_join_key_hash(&inner, pr));
+            let key_hash = p.probe.as_ref().and_then(|pr| build_join_key_hash_from_rows(&inner, pr));
             parts_data.push(PartData { part: p.clone(), inner, key_hash, probed: None });
         }
         // a RIGHT/FULL last part needs the mirror machinery: the match bitmap
@@ -30980,6 +31090,95 @@ fn project_row(row: &[Value], cols: &[ProjCol]) -> Result<Vec<Value>, EvalErr> {
 enum RowCursor {
     Scan(StreamCursor),
     Join(JoinCursor),
+    Sorted(SortedCursor),
+}
+
+/// An ORDER BY fetch that STREAMS: the scan is drained into the external
+/// sort at open (runs past the budget), and each fetch pulls its batch
+/// from the merge - the result is never a Vec. The first fetch pays the
+/// sort, as the engine's SortedStream::open does.
+struct SortedCursor {
+    rows: SortedRows,
+    pending_err: Option<EvalErr>,
+    done: bool,
+}
+
+impl SortedCursor {
+    fn open(db: &Database, plan: &Plan, args: &[WireParam]) -> Option<SortedCursor> {
+        let Plan::Project { order_by, .. } = plan else { return None };
+        if order_by.is_empty() {
+            return None;
+        }
+        let mut scan = StreamCursor::open_inner(db, plan, args, true)?;
+        let mut sorter = spill_sorter(order_by);
+        let mut pending_err = None;
+        loop {
+            match scan.next_batch(db, 4096) {
+                Ok((batch, done)) => {
+                    for r in batch {
+                        match decorate_for_sort(order_by, r) {
+                            Ok(dec) => {
+                                if let Err(e) = sorter.put(dec) {
+                                    eprintln!("[srv] sort spill: {}", e);
+                                    pending_err = Some(EvalErr::Unsupported);
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                pending_err = Some(e);
+                                break;
+                            }
+                        }
+                    }
+                    if done || pending_err.is_some() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    pending_err = Some(e);
+                    break;
+                }
+            }
+        }
+        let cursor = match sorter.finish() {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("[srv] sort spill: {}", e);
+                return None;
+            }
+        };
+        if std::env::var("FC_SRV_TRACE").is_ok() {
+            eprintln!(
+                "[srv] sort cursor: rows={} runs={} spilled={}",
+                cursor.stats.0, cursor.stats.1, cursor.stats.2
+            );
+        }
+        Some(SortedCursor { rows: SortedRows { cursor, nk: order_by.len() }, pending_err, done: false })
+    }
+
+    fn next_batch(&mut self, want: usize) -> Result<(Vec<Vec<Value>>, bool), EvalErr> {
+        if let Some(e) = self.pending_err.take() {
+            return Err(e);
+        }
+        if self.done || want == 0 {
+            return Ok((Vec::new(), self.done));
+        }
+        let mut out = Vec::with_capacity(want);
+        while out.len() < want {
+            match self.rows.next() {
+                Ok(Some(r)) => out.push(r),
+                Ok(None) => {
+                    self.done = true;
+                    return Ok((out, true));
+                }
+                Err(e) => {
+                    eprintln!("[srv] sort merge: {}", e);
+                    return Err(EvalErr::Unsupported);
+                }
+            }
+        }
+        Ok((out, false))
+    }
 }
 
 /// [records_at_in] with the page map already built - the form a
@@ -31442,6 +31641,65 @@ impl OrderKey {
 /// Sort rows by keys that may be EXPRESSIONS: every key is evaluated for
 /// every row first, so an arithmetic exception surfaces as the fetch's
 /// error instead of a wrong order.
+/// The comparator and decoration for a spilling sort over `keys`: the
+/// expression keys are computed once per row and carried as a PREFIX
+/// (the comparator reads the prefix by position), the row follows.
+fn spill_sorter(keys: &[OrderKey]) -> crate::extsort::ExternalSort<Box<dyn Fn(&[Value], &[Value]) -> std::cmp::Ordering>> {
+    let prefix_keys: Vec<OrderKey> = keys
+        .iter()
+        .enumerate()
+        .map(|(i, k)| OrderKey { field: i, expr: None, desc: k.desc, nulls: k.nulls, coll: k.coll })
+        .collect();
+    let cmp: Box<dyn Fn(&[Value], &[Value]) -> std::cmp::Ordering> =
+        Box::new(move |a: &[Value], b: &[Value]| order_cmp(a, b, &prefix_keys));
+    crate::extsort::ExternalSort::new(cmp)
+}
+
+fn decorate_for_sort(keys: &[OrderKey], r: Vec<Value>) -> Result<Vec<Value>, EvalErr> {
+    let mut dec = Vec::with_capacity(keys.len() + r.len());
+    for key in keys {
+        dec.push(key.value_of(&r)?);
+    }
+    dec.extend(r);
+    Ok(dec)
+}
+
+/// The rows a source yields, sorted by `keys`, as a cursor over the
+/// merge - the key prefix stripped on the way out.
+struct SortedRows {
+    cursor: crate::extsort::SortCursor<Box<dyn Fn(&[Value], &[Value]) -> std::cmp::Ordering>>,
+    nk: usize,
+}
+
+impl SortedRows {
+    fn next(&mut self) -> std::io::Result<Option<Vec<Value>>> {
+        Ok(self.cursor.next()?.map(|mut r| r.split_off(self.nk)))
+    }
+}
+
+fn sorted_cursor_over(input: &RowSource, db: &Database, keys: &[OrderKey]) -> Result<SortedRows, EvalErr> {
+    let mut sorter = spill_sorter(keys);
+    input.for_each(db, &mut |r| {
+        let dec = decorate_for_sort(keys, r)?;
+        sorter.put(dec).map_err(|e| {
+            eprintln!("[srv] sort spill: {}", e);
+            EvalErr::Unsupported
+        })?;
+        Ok(Flow::Continue)
+    })?;
+    let cursor = sorter.finish().map_err(|e| {
+        eprintln!("[srv] sort spill: {}", e);
+        EvalErr::Unsupported
+    })?;
+    if std::env::var("FC_SRV_TRACE").is_ok() {
+        eprintln!(
+            "[srv] sort cursor: rows={} runs={} spilled={}",
+            cursor.stats.0, cursor.stats.1, cursor.stats.2
+        );
+    }
+    Ok(SortedRows { cursor, nk: keys.len() })
+}
+
 /// [sort_rows] for a set that may not fit: the rows go through the
 /// external sort (`crate::extsort`) when their estimated size is over
 /// the budget, in place otherwise - same comparator, same order, ties
@@ -31461,7 +31719,7 @@ fn sort_rows_spilling(rows: Vec<Vec<Value>>, keys: &[OrderKey]) -> Result<Vec<Ve
     let prefix_keys: Vec<OrderKey> = keys
         .iter()
         .enumerate()
-        .map(|(i, k)| OrderKey::field(i, k.desc, k.nulls))
+        .map(|(i, k)| OrderKey { field: i, expr: None, desc: k.desc, nulls: k.nulls, coll: k.coll })
         .collect();
     let cmp = move |a: &[Value], b: &[Value]| order_cmp(a, b, &prefix_keys);
     let mut sorter = crate::extsort::ExternalSort::with_budget(cmp, budget);
@@ -52860,6 +53118,8 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                             // materialising path below.
                             if let Some(c) = StreamCursor::open(db, &*plan, &bound_args) {
                                 cursors.insert(cur_stmt, RowCursor::Scan(c));
+                            } else if let Some(c) = SortedCursor::open(db, &*plan, &bound_args) {
+                                cursors.insert(cur_stmt, RowCursor::Sorted(c));
                             } else if let Some(c) = JoinCursor::open(db, &*plan, &bound_args) {
                                 cursors.insert(cur_stmt, RowCursor::Join(c));
                             }
@@ -52891,6 +53151,13 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                                         _ => Vec::new(),
                                     };
                                     (c.next_batch(db, want as usize), cols, false)
+                                }
+                                RowCursor::Sorted(c) => {
+                                    let cols = match &*plan {
+                                        Plan::Project { cols, .. } => cols.clone(),
+                                        _ => Vec::new(),
+                                    };
+                                    (c.next_batch(want as usize), cols, false)
                                 }
                                 RowCursor::Join(c) => {
                                     let cols = output_cols_of(&*plan)

@@ -450,3 +450,112 @@ mod tests {
         }
     }
 }
+
+/// A ROW STORE for a hash join's build side (the engine's RecordBuffer,
+/// which owns a TempSpace): rows appended in arrival order, each
+/// addressed by its byte offset; held in RAM to the budget, then the
+/// buffer goes to an unlinked file and later rows append there. A
+/// bucket of offsets is all a hash table need keep in memory.
+pub struct RowStore {
+    budget: usize,
+    mem: Vec<u8>,
+    /// bytes already in the file - offsets below this are read from it
+    spilled: u64,
+    file: Option<File>,
+    count: usize,
+}
+
+impl RowStore {
+    pub fn new() -> RowStore {
+        RowStore { budget: budget(), mem: Vec::new(), spilled: 0, file: None, count: 0 }
+    }
+
+    pub fn with_budget(budget: usize) -> RowStore {
+        RowStore { budget, mem: Vec::new(), spilled: 0, file: None, count: 0 }
+    }
+
+    pub fn len(&self) -> usize {
+        self.count
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    pub fn spilled_bytes(&self) -> u64 {
+        self.spilled
+    }
+
+    /// Append a row; its offset is the handle.
+    pub fn push(&mut self, row: &[Value]) -> io::Result<u64> {
+        let off = self.spilled + self.mem.len() as u64;
+        let at = self.mem.len();
+        self.mem.extend_from_slice(&[0, 0, 0, 0]);
+        encode_row(row, &mut self.mem);
+        let len = (self.mem.len() - at - 4) as u32;
+        self.mem[at..at + 4].copy_from_slice(&len.to_le_bytes());
+        self.count += 1;
+        if self.mem.len() > self.budget {
+            self.spill()?;
+        }
+        Ok(off)
+    }
+
+    fn spill(&mut self) -> io::Result<()> {
+        if self.file.is_none() {
+            let n = RUN_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path = temp_dir().join(format!("fc_sort_{}_{}", std::process::id(), n));
+            let file = File::options().read(true).write(true).create_new(true).open(&path)?;
+            let _ = std::fs::remove_file(&path);
+            self.file = Some(file);
+        }
+        let file = self.file.as_mut().unwrap();
+        use std::os::unix::fs::FileExt;
+        file.write_all_at(&self.mem, self.spilled)?;
+        self.spilled += self.mem.len() as u64;
+        self.mem.clear();
+        Ok(())
+    }
+
+    /// The row at `off` - off the file when it was spilled, off the
+    /// buffer otherwise.
+    pub fn get(&self, off: u64) -> io::Result<Vec<Value>> {
+        if off >= self.spilled {
+            let at = (off - self.spilled) as usize;
+            let len = u32::from_le_bytes(
+                self.mem
+                    .get(at..at + 4)
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "row store offset"))?
+                    .try_into()
+                    .unwrap(),
+            ) as usize;
+            return decode_row(&self.mem[at + 4..at + 4 + len]);
+        }
+        use std::os::unix::fs::FileExt;
+        let file = self.file.as_ref().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "row store file"))?;
+        let mut len = [0u8; 4];
+        file.read_exact_at(&mut len, off)?;
+        let len = u32::from_le_bytes(len) as usize;
+        let mut buf = vec![0u8; len];
+        file.read_exact_at(&mut buf, off + 4)?;
+        decode_row(&buf)
+    }
+}
+
+#[cfg(test)]
+mod store_tests {
+    use super::*;
+
+    #[test]
+    fn rows_come_back_by_offset_across_the_spill() {
+        let mut st = RowStore::with_budget(512);
+        let mut offs = Vec::new();
+        for i in 0..200i64 {
+            offs.push(st.push(&[Value::Int(i), Value::Text(format!("r{}", i))]).unwrap());
+        }
+        assert!(st.spilled_bytes() > 0);
+        for (i, off) in offs.iter().enumerate() {
+            assert_eq!(st.get(*off).unwrap(), vec![Value::Int(i as i64), Value::Text(format!("r{}", i))]);
+        }
+    }
+}
