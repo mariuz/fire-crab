@@ -242,6 +242,11 @@ pub struct VisibleVersion {
 pub struct Snapshot {
     pub limit: u64,
     pub active: Vec<u64>,
+    /// ids this transaction COMMITTED while keeping its snapshot - a
+    /// COMMIT RETAIN's (tra.cpp retain_context: TBM_SET(tra_commit_sub_trans,
+    /// old_number), read by TRA_snapshot_state ahead of the snapshot).
+    /// They count even though they are at or past `limit`.
+    pub committed_own: Vec<u64>,
 }
 
 impl Snapshot {
@@ -267,12 +272,12 @@ impl Snapshot {
                 }
             }
         }
-        Snapshot { limit, active }
+        Snapshot { limit, active, committed_own: Vec::new() }
     }
 
     /// Was transaction `tx` committed as of this snapshot?
     pub fn sees(&self, tx: u64) -> bool {
-        tx < self.limit && !self.active.contains(&tx)
+        (tx < self.limit && !self.active.contains(&tx)) || self.committed_own.contains(&tx)
     }
 }
 

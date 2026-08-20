@@ -63,6 +63,13 @@ const OP_INFO_DATABASE: i32 = 40;
 const OP_INFO_TRANSACTION: i32 = 42;
 const OP_INFO_SQL: i32 = 70;
 const OP_PREPARE_TX: i32 = 32; // op_prepare - two-phase commit, phase one
+const OP_COMMIT_RETAINING: i32 = 50;
+const OP_CREATE_BLOB: i32 = 34;
+const OP_PUT_SEGMENT: i32 = 37;
+const OP_CANCEL_BLOB: i32 = 38;
+const OP_BATCH_SEGMENTS: i32 = 44;
+const OP_CREATE_BLOB2: i32 = 57;
+const OP_ROLLBACK_RETAINING: i32 = 86;
 const OP_RECONNECT: i32 = 33; // op_reconnect - pick a limbo transaction back up
 const OP_PREPARE2: i32 = 51; // op_prepare with a TDR message
 const OP_OPEN_BLOB: i32 = 35;
@@ -137,6 +144,34 @@ impl W {
             None => self.buf.clone(),
         };
         s.write_all(&out)
+    }
+}
+
+/// isc_bpb_type (tag 1) of a blob parameter block: 1 = a STREAM blob
+/// (blb.cpp:331 `BLB_stream`), 0 or absent = segmented. The bpb is
+/// `isc_bpb_version1` then `[tag][len][bytes]` items.
+fn bpb_stream_type(bpb: &[u8]) -> bool {
+    let mut at = 1usize;
+    while at + 2 <= bpb.len() {
+        let (tag, len) = (bpb[at], bpb[at + 1] as usize);
+        if tag == 1 && len >= 1 && at + 2 < bpb.len() {
+            return bpb[at + 2] == 1;
+        }
+        at += 2 + len;
+    }
+    false
+}
+
+/// One put segment into a temp blob: a segmented blob keeps it whole, a
+/// stream blob has no segments - the bytes run on (blb.cpp:1630-1642)
+fn put_blob_segment(tb: &mut TempBlob, data: &[u8]) {
+    if tb.stream {
+        match tb.segments.first_mut() {
+            Some(s) => s.extend_from_slice(data),
+            None => tb.segments.push(data.to_vec()),
+        }
+    } else {
+        tb.segments.push(data.to_vec());
     }
 }
 
@@ -884,6 +919,15 @@ struct Database {
     /// undo deletes the postings and leaves the cache answering
     /// locally. Cleared when the transaction ends. See [GenWindow].
     gen_cache: std::collections::HashMap<String, i64>,
+    /// TEMPORARY BLOBS (blb.cpp BLB_temporary / tra_blobs): what a client
+    /// creates with op_create_blob(2) and fills with op_put_segment /
+    /// op_batch_segments, addressed by a temp id (relation 0, the id in
+    /// the number - bid::set_temporary) until a record store MATERIALISES
+    /// it into the relation's pages (blb::move, "the only place in the
+    /// engine where blobs are materialized"). Never stored: gone with the
+    /// transaction. Kept across a COMMIT/ROLLBACK RETAIN, as tra_blobs is.
+    temp_blobs: std::collections::HashMap<u32, TempBlob>,
+    next_temp_blob: u32,
     /// whether this TRANSACTION has written anything at all - which is
     /// not the same as holding the write side, now that the write side
     /// is one statement long. A rollback asks this to know whether
@@ -1650,6 +1694,7 @@ impl Database {
         Some(fire_crab_ods::tra::Snapshot {
             limit: u64::MAX,
             active: self.autonomous_ids.iter().map(|&id| u64::from(id)).collect(),
+            committed_own: Vec::new(),
         })
     }
 
@@ -1898,6 +1943,7 @@ impl Database {
         self.ddl_undo = false;
         self.did_ddl = false;
         self.ddl_deferred.clear();
+        self.temp_blobs.clear(); // never stored: gone with the transaction
         self.nested_tx.clear();
         if self.counted_tx {
             self.attachments.active_tx.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
@@ -2675,6 +2721,8 @@ fn load_database(path: &str) -> Option<Database> {
         tx: None,
         auto_pages: std::collections::HashMap::new(),
         gen_cache: std::collections::HashMap::new(),
+        temp_blobs: std::collections::HashMap::new(),
+        next_temp_blob: 0,
         touched: false,
         posted: std::cell::RefCell::new(Vec::new()),
         events,
@@ -5683,6 +5731,9 @@ enum Plan {
     /// 31 on the wire at all), so transaction control has to be a plan.
     TxControl {
         rollback: bool,
+        /// `COMMIT RETAIN` / `ROLLBACK RETAIN`: the transaction's work
+        /// ends, the transaction does not (tra.cpp retain_context)
+        retain: bool,
     },
     /// `SAVEPOINT <n>` / `ROLLBACK TO [SAVEPOINT] <n>` / `RELEASE
     /// SAVEPOINT <n>`. Like COMMIT/ROLLBACK these arrive as PREPARED
@@ -17304,9 +17355,26 @@ fn encode_set_value(d: &Descriptor, v: &InsVal) -> Option<Option<Vec<u8>>> {
 /// integer arrives as blr_long even when the column is BIGINT, a JS
 /// Date as blr_timestamp even for DATE/TIME columns). The scale on
 /// `Int` is the BLR-declared one.
+/// A blob a client is building over the wire - see [Database::temp_blobs].
+#[derive(Clone, Debug, Default)]
+struct TempBlob {
+    /// the put segments (a stream blob: one growing segment)
+    segments: Vec<Vec<u8>>,
+    stream: bool,
+    /// closed by op_close_blob - only a closed blob may be stored
+    /// (blb.cpp:1247 isc_bad_segstr_id otherwise)
+    closed: bool,
+    /// the permanent id once a store materialised it: a second store of
+    /// the same temp id re-resolves to it (blb.cpp:1205)
+    materialised: Option<[u8; 8]>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 enum WireParam {
     Null,
+    /// an 8-byte blob id as the client sent it (blr_quad): a temp id
+    /// (relation 0) to materialise at the store, or a permanent one
+    BlobId([u8; 8]),
     Int(i64, i8),
     Text(String),
     /// A text value that KNOWS the character set it was decoded from -
@@ -17331,6 +17399,8 @@ enum WireParam {
 /// out in the XDR message.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum PSlot {
+    /// blr_quad - a blob id, 8 bytes
+    Quad,
     /// blr_text: `len` bytes, padded to 4 (no length prefix)
     Text(usize),
     /// blr_varying: 4-byte BE length + bytes + padding
@@ -17411,7 +17481,11 @@ fn parse_param_blr(b: &[u8]) -> Option<Vec<PSlot>> {
             12 => PSlot::Date,
             13 => PSlot::Time,
             23 => PSlot::Bool,
-            _ => return None, // quad/blob, int128, decfloat, tz: not bindable
+            9 => {
+                i += 1; // scale
+                PSlot::Quad
+            }
+            _ => return None, // int128, decfloat, tz: not bindable
         };
         if field % 2 == 0 {
             slots.push(slot);
@@ -17502,6 +17576,10 @@ fn read_param_message(
             PSlot::Bool => {
                 let raw = read_n(s, dec, 4)?;
                 WireParam::Bool(raw[0] != 0)
+            }
+            PSlot::Quad => {
+                let raw = read_n(s, dec, 8)?;
+                WireParam::BlobId(raw.try_into().unwrap())
             }
         });
     }
@@ -18130,6 +18208,7 @@ fn param_target_ok(d: &Descriptor) -> bool {
             | dtype::SQL_TIME
             | dtype::TIMESTAMP
             | dtype::BOOLEAN
+            | dtype::BLOB // a blr_quad: a temp blob id materialised at the store
     )
 }
 
@@ -18184,6 +18263,10 @@ fn encode_wire_value(d: &Descriptor, wp: &WireParam) -> Option<Option<Vec<u8>>> 
     let int_bytes = |stored: i128| -> Option<Vec<u8>> { exact_int_le(d.dtype, stored) };
     Some(match wp {
         WireParam::Null => None,
+        WireParam::BlobId(b) => Some(match d.dtype {
+            dtype::BLOB => b.to_vec(),
+            _ => return None,
+        }),
         WireParam::Int(v, ws) => Some(match d.dtype {
             dtype::SHORT | dtype::LONG | dtype::INT64 | dtype::INT128 => {
                 int_bytes(rescale_int(*v as i128, *ws, d.scale)?)?
@@ -20190,6 +20273,30 @@ fn execute_dml_collecting_inner(
         }
         Plan::Insert { rel, table, format_no, image, descs, index_ops, param_fields, gen_fields, not_null, checks, fk_refs, default_fields } => {
             let mut image = image.clone();
+            // MATERIALISE the temporary blobs the parameters name (blb::move):
+            // the closed temp blob's segments land in THIS relation's pages
+            // and the record carries the permanent id
+            let args: Vec<WireParam> = args
+                .iter()
+                .enumerate()
+                .map(|(slot, a)| -> Result<WireParam, String> { match a {
+                    WireParam::BlobId(b) if decode_blob_id(b).0 == 0 => {
+                        let (_, temp) = decode_blob_id(b);
+                        if temp == 0 {
+                            return Ok(WireParam::Null); // an all-zero quad is the empty blob
+                        }
+                        let fid = param_fields.iter().find(|(_, s)| *s == slot).map(|(f, _)| *f);
+                        let sub_type = fid
+                            .and_then(|f| descs.get(f))
+                            .map(|d| d.sub_type.max(0) as u16)
+                            .unwrap_or(0);
+                        let perm = materialise_temp_blob(db, &mut work, *rel, temp as u32, sub_type)?;
+                        Ok(WireParam::BlobId(perm))
+                    }
+                    other => Ok(other.clone()),
+                } })
+                .collect::<Result<_, String>>()?;
+            let args = &args[..];
             for (fid, slot) in param_fields {
                 let d = descs.get(*fid).ok_or("field beyond format")?;
                 let arg = args.get(*slot).ok_or("missing parameter value")?;
@@ -26429,9 +26536,11 @@ fn plan_query_inner_ctx(
     let trace = std::env::var("FC_SRV_TRACE").is_ok();
     {
         let up = sql.trim().trim_end_matches(';').trim().to_ascii_uppercase();
-        // COMMIT / ROLLBACK [WORK] [RETAIN ...]: RETAIN keeps the
-        // transaction open and is not this slice
-        if !up.contains("RETAIN") {
+        // COMMIT / ROLLBACK [WORK] [RETAIN [SNAPSHOT]] (parse.y:6200):
+        // RETAIN ends the work and keeps the transaction - the handle,
+        // the snapshot, the cursors, the statements
+        let retain = find_word(&up, "RETAIN", 0).is_some();
+        {
             if find_word(&up, "ROLLBACK", 0) == Some(0) {
                 // ROLLBACK TO [SAVEPOINT] <name> before plain ROLLBACK
                 if let Some(to) = find_word(&up, "TO", "ROLLBACK".len()) {
@@ -26448,7 +26557,7 @@ fn plan_query_inner_ctx(
                     }
                     return Some(Plan::Refused);
                 }
-                return Some(Plan::TxControl { rollback: true });
+                return Some(Plan::TxControl { rollback: true, retain });
             }
             if find_word(&up, "SAVEPOINT", 0) == Some(0) {
                 let name = up["SAVEPOINT".len()..].trim();
@@ -26475,7 +26584,7 @@ fn plan_query_inner_ctx(
                 return Some(Plan::Refused);
             }
             if find_word(&up, "COMMIT", 0) == Some(0) {
-                return Some(Plan::TxControl { rollback: false });
+                return Some(Plan::TxControl { rollback: false, retain });
             }
         }
     }
@@ -32041,7 +32150,7 @@ fn stmt_type_of(plan: &Plan) -> i32 {
         // statement type. Announcing 6 (get_segment) for a savepoint made
         // isql abandon the statement and issue a real op_rollback, which
         // silently threw the whole transaction away.
-        Plan::TxControl { rollback } => if *rollback { 11 } else { 10 },
+        Plan::TxControl { rollback, .. } => if *rollback { 11 } else { 10 },
         Plan::Savepoint { .. } => 14,
         Plan::Union { .. }
         | Plan::ProcSelect { .. }
@@ -33350,6 +33459,7 @@ fn param_to_expr(p: &WireParam) -> Option<Expr> {
         WireParam::Date(d) => Expr::DateLit(*d),
         WireParam::Time(t) => Expr::TimeLit(*t),
         WireParam::Timestamp(d, t) => Expr::TsLit(*d, *t),
+        WireParam::BlobId(_) => return None, // a blob is no literal
     })
 }
 
@@ -34612,6 +34722,42 @@ fn encode_row_body(
 /// LE, reserved byte, the record number's high byte, then its low 32
 /// bits LE) - the same bytes `decode_field` read. Clients treat the
 /// quad as opaque and echo it in op_open_blob.
+/// blb::move's temp-to-permanent half: the closed temp blob `temp` is
+/// written into relation `rel`'s pages (`blb::create_blob` /
+/// `create_stream_blob`, levels 0-2) and its permanent id returned; a
+/// blob already materialised answers the id it got (blb.cpp:1205).
+fn materialise_temp_blob(
+    db: &mut Database,
+    work: &mut fire_crab_ods::Image,
+    rel: u16,
+    temp: u32,
+    sub_type: u16,
+) -> Result<[u8; 8], String> {
+    let tb = db.temp_blobs.get(&temp).ok_or("invalid BLOB ID")?;
+    if let Some(perm) = tb.materialised {
+        return Ok(perm);
+    }
+    if !tb.closed {
+        return Err("invalid BLOB ID".into()); // isc_bad_segstr_id: stored before close
+    }
+    // a text blob carries the database's charset (UTF8 here), a binary one none
+    let charset = if sub_type == 1 { 4 } else { 0 };
+    let recno = if tb.stream {
+        let content: Vec<u8> = tb.segments.concat();
+        fire_crab_blb::create_stream_blob(work, db.page_size, rel, &content, sub_type, charset)?
+    } else {
+        fire_crab_blb::create_blob(work, db.page_size, rel, &tb.segments, sub_type, charset)?
+    };
+    let perm = encode_blob_id(rel, recno);
+    if let Some(tb) = db.temp_blobs.get_mut(&temp) {
+        tb.materialised = Some(perm);
+    }
+    if std::env::var("FC_SRV_TRACE").is_ok() {
+        eprintln!("[srv] blob temp {} materialised into relation {} as record {}", temp, rel, recno);
+    }
+    Ok(perm)
+}
+
 fn encode_blob_id(rel: u16, num: u64) -> [u8; 8] {
     let mut b = [0u8; 8];
     b[0..2].copy_from_slice(&rel.to_le_bytes());
@@ -46762,6 +46908,64 @@ fn release_write_side(database: &mut Option<Database>) {
 ///
 /// Every caller sits AFTER the generator windows have been written
 /// forward, since that write needs the write side too.
+/// What a RETAINING commit or rollback keeps across the end of the
+/// transaction's work (tra.cpp retain_context): the snapshot, the ids
+/// about to be committed (they count for this transaction ahead of the
+/// snapshot - TBM_SET(tra_commit_sub_trans)), and the generator cache's
+/// unapplied entries (measured: COMMIT RETAIN runs the surviving postings
+/// and keeps the rest). Taken BEFORE the ordinary end sequence runs.
+struct Retained {
+    snapshot: Option<fire_crab_ods::tra::Snapshot>,
+    ids: Vec<u64>,
+    gen_cache: std::collections::HashMap<String, i64>,
+    temp_blobs: std::collections::HashMap<u32, TempBlob>,
+}
+
+fn retain_begin(database: &Option<Database>) -> Retained {
+    match database.as_ref() {
+        Some(d) => Retained {
+            snapshot: d.snapshot.clone(),
+            ids: d.all_tx().into_iter().map(u64::from).collect(),
+            gen_cache: d.gen_cache.clone(),
+            temp_blobs: d.temp_blobs.clone(),
+        },
+        None => Retained {
+            snapshot: None,
+            ids: Vec::new(),
+            gen_cache: Default::default(),
+            temp_blobs: Default::default(),
+        },
+    }
+}
+
+/// ...and put back AFTER it: the transaction goes on with the same
+/// handle (TX_HANDLE is the one handle there is), the same snapshot -
+/// now seeing its own committed ids - the same cursors and statements
+/// (never dropped here), counted as active still, and a fresh id to be
+/// reserved at its next write (the engine's bump_transaction_id; this
+/// server reserves lazily). What the end sequence dropped stays dropped:
+/// every savepoint (tra.cpp:2573), the nested ids, the write side.
+fn retain_end(database: &mut Option<Database>, kept: Retained, committed: bool) {
+    let Some(db) = database.as_mut() else { return };
+    if let Some(mut snap) = kept.snapshot {
+        if committed {
+            snap.committed_own.extend(kept.ids.iter().copied());
+        }
+        db.snapshot = Some(snap);
+    }
+    db.gen_cache = kept.gen_cache;
+    db.temp_blobs = kept.temp_blobs;
+    db.note_tx_begun();
+    if std::env::var("FC_SRV_TRACE").is_ok() {
+        eprintln!(
+            "[srv] {} RETAIN: ids {:?} {}, transaction kept",
+            if committed { "COMMIT" } else { "ROLLBACK" },
+            kept.ids,
+            if committed { "committed" } else { "ended" }
+        );
+    }
+}
+
 fn end_transaction(database: &mut Option<Database>, outcome: TxEnd) {
     let Some(db) = database.as_mut() else { return };
     // AN EVENT IS COUNTED AT COMMIT, and swallowed by a rollback. The
@@ -50863,6 +51067,8 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
     // assembled at open (the whole file is in memory anyway); get_segment
     // then just slices it.
     let mut blobs: std::collections::HashMap<i32, (Vec<u8>, usize)> = std::collections::HashMap::new();
+    // handles open FOR WRITING: handle -> temp blob id (see Database::temp_blobs)
+    let mut write_blobs: std::collections::HashMap<i32, u32> = std::collections::HashMap::new();
     let mut next_blob_handle: i32 = 7000;
     // the legacy BLR request (isql SHOW): the compiled request, the
     // queue of xdr-encoded output messages built at start, and the
@@ -51639,12 +51845,22 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                         last_dml = (0, 0, 0);
                         if ok {
                             respond(&mut s, &mut enc, TX_HANDLE)?;
+                        } else if matches!(kind, SavepointOp::RollbackTo | SavepointOp::Release) {
+                            // isc_invalid_savepoint (jrd.h 500, SQLSTATE 3B000):
+                            // "Unable to find savepoint with name @1 in
+                            // transaction context" - a mark that never was, or
+                            // one a COMMIT/ROLLBACK RETAIN took with it
+                            let mut w = W::default();
+                            w.int(OP_RESPONSE).int(0).int(0).int(0).int(0);
+                            w.int(1).int(335544820).int(2).bytes(format!("\"{}\"", name).as_bytes()).int(0);
+                            w.send(&mut s, &mut enc)?;
                         } else {
                             respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
                         }
-                    } else if let Plan::TxControl { rollback } = &*plan {
+                    } else if let Plan::TxControl { rollback, retain } = &*plan {
                         // ending the transaction discards every mark
                         savepoints.clear();
+                        let kept = if *retain { Some(retain_begin(&database)) } else { None };
                         let outcome = if *rollback {
                             let (outcome, undone) = rollback_now(&mut database, &mut tx_snapshot);
                             // the transaction is window 0, so the whole
@@ -51669,6 +51885,9 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                         // have been written forward over the restored
                         // image - that write needs it too
                         end_transaction(&mut database, outcome);
+                        if let Some(kept) = kept {
+                            retain_end(&mut database, kept, matches!(outcome, TxEnd::Commit));
+                        }
                         last_dml = (0, 0, 0);
                         respond(&mut s, &mut enc, TX_HANDLE)?;
                     } else if let Plan::Returning { inner, cols, fields } = &*plan {
@@ -52650,8 +52869,10 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 reconnected = Some(id);
                 respond(&mut s, &mut enc, 1)?; // the reconnected handle
             }
-            x if x == OP_COMMIT || x == OP_ROLLBACK => {
+            x if x == OP_COMMIT || x == OP_ROLLBACK || x == OP_COMMIT_RETAINING || x == OP_ROLLBACK_RETAINING => {
                 read_int(&mut s, &mut dec)?; // tr
+                let retain = x == OP_COMMIT_RETAINING || x == OP_ROLLBACK_RETAINING;
+                let rollback = x == OP_ROLLBACK || x == OP_ROLLBACK_RETAINING;
                 // A RECONNECTED LIMBO TRANSACTION: the commit or
                 // rollback IS the resolution - somebody else's id, so
                 // none of this connection's own machinery applies
@@ -52677,7 +52898,8 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 // generator windows are stacked one per mark, so the two
                 // lists have to end together
                 savepoints.clear();
-                let outcome = if x == OP_ROLLBACK {
+                let kept = if retain { Some(retain_begin(&database)) } else { None };
+                let outcome = if rollback {
                     let (outcome, undone) = rollback_now(&mut database, &mut tx_snapshot);
                     undo_window_unwind(&mut database, 0, undone);
                     reset_gen_windows(&mut database);
@@ -52694,6 +52916,9 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     TxEnd::Commit
                 };
                 end_transaction(&mut database, outcome);
+                if let Some(kept) = kept {
+                    retain_end(&mut database, kept, matches!(outcome, TxEnd::Commit));
+                }
                 respond(&mut s, &mut enc, 0)?;
             }
             x if x == OP_CANCEL => {
@@ -52705,6 +52930,79 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 // replying desyncs the stream.
                 read_int(&mut s, &mut dec)?; // p_co_kind
             }
+            x if x == OP_CREATE_BLOB || x == OP_CREATE_BLOB2 => {
+                // p_blob: [bpb (blob2 only)], transaction, a zero quad
+                // (protocol.cpp:465 - create carries the id field too)
+                let bpb = if x == OP_CREATE_BLOB2 { read_wire_bytes(&mut s, &mut dec)? } else { Vec::new() };
+                read_int(&mut s, &mut dec)?; // transaction handle
+                read_n(&mut s, &mut dec, 8)?; // the quad the client sends (zero)
+                // isc_bpb_type (1) = 1 is a STREAM blob (blb.cpp:331); the
+                // rest of the bpb (source/target type, charsets) is not read
+                let stream = bpb_stream_type(&bpb);
+                match database.as_mut() {
+                    Some(db) => {
+                        db.next_temp_blob += 1;
+                        let temp = db.next_temp_blob;
+                        db.temp_blobs.insert(temp, TempBlob { stream, ..TempBlob::default() });
+                        next_blob_handle += 1;
+                        write_blobs.insert(next_blob_handle, temp);
+                        // the handle in p_resp_object, the TEMP id (relation 0,
+                        // bid::set_temporary) in p_resp_blob_id - the same 8
+                        // bytes the row encoder would ship
+                        let id = encode_blob_id(0, u64::from(temp));
+                        let mut w = W::default();
+                        w.int(OP_RESPONSE)
+                            .int(next_blob_handle)
+                            .int(i32::from_be_bytes(id[0..4].try_into().unwrap()))
+                            .int(i32::from_be_bytes(id[4..8].try_into().unwrap()))
+                            .int(0)
+                            .int(0);
+                        w.send(&mut s, &mut enc)?;
+                        if std::env::var("FC_SRV_TRACE").is_ok() {
+                            eprintln!("[srv] create blob -> temp {} handle {} stream={}", temp, next_blob_handle, stream);
+                        }
+                    }
+                    None => respond_error(&mut s, &mut enc, GDS_BAD_BLOB_ID)?,
+                }
+            }
+            x if x == OP_PUT_SEGMENT || x == OP_BATCH_SEGMENTS => {
+                // p_sgmt: handle, length, the segment cstring - ONE raw
+                // segment for put (server.cpp:5500), [u16 LE len][bytes]*
+                // for batch (server.cpp:5510)
+                let handle = read_int(&mut s, &mut dec)?;
+                read_int(&mut s, &mut dec)?; // p_sgmt_length
+                let data = read_wire_bytes(&mut s, &mut dec)?;
+                let temp = write_blobs.get(&handle).copied();
+                let tb = temp.and_then(|t| database.as_mut().and_then(|db| db.temp_blobs.get_mut(&t)));
+                match tb {
+                    Some(tb) if !tb.closed => {
+                        if x == OP_PUT_SEGMENT {
+                            put_blob_segment(tb, &data);
+                        } else {
+                            let mut at = 0usize;
+                            while at + 2 <= data.len() {
+                                let len = u16::from_le_bytes([data[at], data[at + 1]]) as usize;
+                                at += 2;
+                                let end = (at + len).min(data.len());
+                                put_blob_segment(tb, &data[at..end]);
+                                at = end;
+                            }
+                        }
+                        respond(&mut s, &mut enc, 0)?;
+                    }
+                    _ => respond_error(&mut s, &mut enc, GDS_BAD_BLOB_ID)?,
+                }
+            }
+            x if x == OP_CANCEL_BLOB => {
+                let handle = read_int(&mut s, &mut dec)?;
+                if let Some(temp) = write_blobs.remove(&handle) {
+                    if let Some(db) = database.as_mut() {
+                        db.temp_blobs.remove(&temp); // BLB_cancel: the temp blob is gone
+                    }
+                }
+                blobs.remove(&handle);
+                respond(&mut s, &mut enc, 0)?;
+            }
             x if x == OP_OPEN_BLOB || x == OP_OPEN_BLOB2 => {
                 // p_blob: [bpb (blob2 only)], transaction, 8-byte blob id
                 if x == OP_OPEN_BLOB2 {
@@ -52713,9 +53011,21 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 read_int(&mut s, &mut dec)?; // transaction handle
                 let id = read_n(&mut s, &mut dec, 8)?;
                 let (rel, num) = decode_blob_id(&id);
-                let content = database.as_ref().and_then(|db| {
-                    fire_crab_blb::read_blob_content(&db.bytes(), db.page_size, rel, num)
-                });
+                // relation 0: a TEMP id of this transaction (legal to open
+                // before it is stored, blb.cpp:1370); all zero: the empty blob
+                let content = if rel == 0 {
+                    database.as_ref().map(|db| {
+                        if num == 0 {
+                            Vec::new()
+                        } else {
+                            db.temp_blobs.get(&(num as u32)).map(|tb| tb.segments.concat()).unwrap_or_default()
+                        }
+                    })
+                } else {
+                    database.as_ref().and_then(|db| {
+                        fire_crab_blb::read_blob_content(&db.bytes(), db.page_size, rel, num)
+                    })
+                };
                 match content {
                     Some(data) => {
                         next_blob_handle += 1;
@@ -52763,6 +53073,12 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
             }
             x if x == OP_CLOSE_BLOB => {
                 let handle = read_int(&mut s, &mut dec)?;
+                if let Some(temp) = write_blobs.remove(&handle) {
+                    // closed: storable from now on (blb.cpp:1247)
+                    if let Some(tb) = database.as_mut().and_then(|db| db.temp_blobs.get_mut(&temp)) {
+                        tb.closed = true;
+                    }
+                }
                 blobs.remove(&handle);
                 respond(&mut s, &mut enc, 0)?;
             }
@@ -54661,6 +54977,8 @@ mod tests {
             tx: None,
             auto_pages: std::collections::HashMap::new(),
         gen_cache: std::collections::HashMap::new(),
+        temp_blobs: std::collections::HashMap::new(),
+        next_temp_blob: 0,
             touched: false,
             posted: std::cell::RefCell::new(Vec::new()),
             events: events_for("/nonexistent/fc-rowsource-test"),
@@ -56280,8 +56598,10 @@ mod tests {
         assert_eq!(parse_param_blr(&blr3), Some(vec![PSlot::Int32(0), PSlot::Text(8)]));
         let blr4 = [5u8, 2, 4, 0, 2, 0, 38, 0, 0, 20, 0, 7, 0, 255, 76];
         assert_eq!(parse_param_blr(&blr4), Some(vec![PSlot::Varying]));
-        // an undecodable dtype (blr_quad = blob id) refuses the whole BLR
-        assert!(parse_param_blr(&[5u8, 2, 4, 0, 2, 0, 9, 0, 7, 0, 255, 76]).is_none());
+        // blr_quad (a blob id, node's SQLParamQuad) binds as 8 raw bytes
+        assert_eq!(parse_param_blr(&[5u8, 2, 4, 0, 2, 0, 9, 0, 7, 0, 255, 76]), Some(vec![PSlot::Quad]));
+        // an undecodable dtype (blr_int128 = 26) still refuses the whole BLR
+        assert!(parse_param_blr(&[5u8, 2, 4, 0, 2, 0, 26, 0, 7, 0, 255, 76]).is_none());
         // odd field count is not pairs
         assert!(parse_param_blr(&[5u8, 2, 4, 0, 1, 0, 8, 0, 255, 76]).is_none());
     }
@@ -57595,6 +57915,8 @@ mod tests {
             tx: None,
             auto_pages: std::collections::HashMap::new(),
         gen_cache: std::collections::HashMap::new(),
+        temp_blobs: std::collections::HashMap::new(),
+        next_temp_blob: 0,
             touched: false,
             posted: std::cell::RefCell::new(Vec::new()),
             events: events_for("/nonexistent/fc-rowsource-test"),
@@ -63787,6 +64109,8 @@ mod tests {
             tx: None,
             auto_pages: std::collections::HashMap::new(),
         gen_cache: std::collections::HashMap::new(),
+        temp_blobs: std::collections::HashMap::new(),
+        next_temp_blob: 0,
             touched: false,
             posted: std::cell::RefCell::new(Vec::new()),
             events: events_for(tag),

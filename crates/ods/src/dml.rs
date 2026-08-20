@@ -1627,24 +1627,27 @@ mod tests {
             u64::from_le_bytes(f.page(0).unwrap()[off..off + 8].try_into().unwrap())
         };
         let tx = begin_active_tx(&mut f, ps).unwrap(); // 11
-        assert_eq!((hdr(&f, 48), hdr(&f, 56), hdr(&f, 64)), (11, 11, 11), "start: all = self");
+        // OIT is ONE BELOW the first interesting id - the starting
+        // transaction itself (tra.cpp `--oldest`); OAT/OST land on it
+        assert_eq!((hdr(&f, 48), hdr(&f, 56), hdr(&f, 64)), (10, 11, 11), "start: OIT = self - 1");
         set_tx_state(&mut f, ps, tx, crate::tip::TxState::Committed).unwrap();
         update_oldest(&mut f, ps, false).unwrap();
-        // "nothing active" is spelled OAT == the stored next field (this
-        // server's last-assigned convention; the engine's validation
-        // reads the fields by its next-to-assign lens, so one past the
-        // stored value would read as corruption there)
+        // "nothing active" is spelled OAT == the stored next field (the
+        // highest id assigned, on both servers); OIT is a START-time
+        // value and stays where the begin put it
         assert_eq!(
             (hdr(&f, 48), hdr(&f, 56), hdr(&f, 64)),
-            (11, 11, 11),
-            "commit: OAT/OST clamp at the stored next; OIT stays at its begin-time value"
+            (10, 11, 11),
+            "commit: OAT/OST at the stored next; OIT stays at its begin-time value"
         );
         let tx2 = begin_active_tx(&mut f, ps).unwrap(); // 12
         set_tx_state(&mut f, ps, tx2, crate::tip::TxState::Dead).unwrap();
         update_oldest(&mut f, ps, false).unwrap();
-        assert_eq!((hdr(&f, 48), hdr(&f, 56), hdr(&f, 64)), (12, 12, 12));
+        assert_eq!((hdr(&f, 48), hdr(&f, 56), hdr(&f, 64)), (11, 12, 12));
         let _tx3 = begin_active_tx(&mut f, ps).unwrap(); // 13
-        assert_eq!(hdr(&f, 48), 12, "OIT pinned at the dead id");
+        // the dead id is the first interesting one: OIT stays one below
+        // it, which is what lets the ENGINE's sweep collect its versions
+        assert_eq!(hdr(&f, 48), 11, "OIT pinned one below the dead id");
         assert_eq!((hdr(&f, 56), hdr(&f, 64)), (13, 13), "OAT/OST at the new active");
     }
 

@@ -42,6 +42,7 @@ One line each; the gate is the proof.
 | packaged procedures | a package qualifier resolves down the search path; `RDB$PROFILER` native no-ops with the engine's arity | `serve-real-pkgproc` 20 |
 | fragmenting store | records larger than a page chain the engine's way; UPDATE/DELETE of a fragmented head | `serve-real-fragstore` 13 |
 | UNIQUE is walk-order | enforcement row-at-a-time in RECNO order, 23000 byte-exact; the sub-9-byte RHDF corruption found and fixed with it | `serve-real-uniqueorder` |
+| blob writes + RETAIN | temp blobs over the wire materialised at the store; COMMIT/ROLLBACK RETAIN keep the transaction with its snapshot | `serve-real-blobwrite` 8, `retain` 8 |
 | transactional DDL | catalog rows under the user transaction's id, undo by state + journaled residue, deferred drops; first-updater-wins on a relation with the engine's vector; owner-only schema visibility | `serve-real-ddltx` 32 |
 | the file grows the engine's way | pointer-page chain, PIP chain, SCN pages at every `pagesPerSCN·N`, TIP chain — each crossed by fc and read by the engine (count, `gfix -v -full`, a write of its own on the new structure, a level-1 nbackup over fc's late pages), and the reverse | `serve-real-growth` 32 |
 
@@ -141,13 +142,26 @@ uncommitted tables where the engine's separate transaction would not.
 `ddl_undo`/`image_undo` and the `restore_db` path survive as dead code
 to delete.
 
-### C. Wire surface
+### C. Wire surface — blob writes + RETAIN DONE (2026-08-20)
 
-- Blob WRITES over the wire are absent: `op_create_blob`(34), `op_put_segment`(37), `op_cancel_blob`(38), `op_info_blob`(43), `op_create_blob2`(57), `op_seek_blob`(61), `op_batch_segments`(44). Blobs are read-only for a client; only internal DML writes them.
-- `COMMIT RETAIN` / `ROLLBACK RETAIN` absent — no `op_commit_retaining`(50), no `op_rollback_retaining`(86), no SQL spelling (grep: zero hits in wire/dsql/exe/svc).
-- `op_batch_*` (99–111, `BulkInsert.cpp`), `op_fetch_scroll`(112) — `dsql` already emits `blr_scrollable`; `op_ping`(93); the array family `op_slice`/`op_put_slice`/`op_get_slice`; `op_transact`; `op_info_cursor`; `op_inline_blob`.
-- Auth/negotiation: only `Srp256` is offered (`server.rs:50080`); no `Legacy_Auth`, no ChaCha wire crypt, no zlib. `op_info_transaction` answers only `isc_info_tra_id` (`server.rs:52446` — the rest "would be a guess").
-- `AttCs::by_name` maps an unknown charset to 255 instead of refusing the attach (`server.rs:17518`).
+**Done:** `op_create_blob`/`op_create_blob2`, `op_put_segment`,
+`op_batch_segments`, `op_cancel_blob`, a `blr_quad` parameter, and the
+store that MATERIALISES a temporary blob into the relation's pages
+(blb.cpp `blb::move`; levels 0–2 through `crates/blb`) — a driver's
+`INSERT … VALUES (?)` with a Buffer works and the engine reads the
+result (`serve-real-blobwrite` 8). `COMMIT RETAIN` / `ROLLBACK RETAIN`
+as SQL and as `op_commit_retaining` (50) / `op_rollback_retaining`
+(86): the transaction keeps its handle, snapshot (seeing its own
+retained commits — `tra_commit_sub_trans`), cursors, statements,
+generator cache and temp blobs; savepoints die; a retain without work
+burns no id (`serve-real-retain` 8). `isc_invalid_savepoint` spelled.
+
+**Still absent:** `op_info_blob`, `op_seek_blob` (stream only), blob
+parameters in UPDATE … SET, `op_batch_*` (the batch API), `op_fetch_scroll`
+(dsql already emits `blr_scrollable`), `op_ping`, `op_slice` (arrays),
+`op_transact`. Auth: only Srp256 offered; no Legacy_Auth / ChaCha /
+zlib. `op_info_transaction` answers only `isc_info_tra_id`. A text blob
+is stored in the database charset (UTF8) with no bpb transliteration.
 
 ### D. Converted, not wired
 
@@ -277,9 +291,8 @@ pointer-page and TIP page numbers is the next step when it dominates.
 
 ## Next, in order
 
-- **C, blob writes + COMMIT/ROLLBACK RETAIN — THE NEXT CHUNK**: the two
-  most common client operations a real driver issues that this server
-  cannot answer at all.
+- **D, the MERGE executor — THE NEXT CHUNK** — the BLR is already
+  compiled and tested; only the executor is missing.
 - **D, the MERGE executor** — the BLR is already compiled and tested;
   only the executor is missing.
 - **G, the external sort** — every sort and hash build is bounded by

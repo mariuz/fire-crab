@@ -13,6 +13,33 @@ categories are the project's own: **Converted** (a new engine behavior,
 differential-gated), **Fixed** (a divergence from the engine, and how it
 was caught), **Guarded** (a wrong-answer path closed by refusal).
 
+## 2026-08-20 — blob writes over the wire, and RETAIN
+
+### Converted
+- **Blob writes**: `op_create_blob(2)`, `op_put_segment`,
+  `op_batch_segments`, `op_cancel_blob`; a `blr_quad` parameter binds;
+  the temp blob (relation 0, blb.cpp `BLB_temporary`) is materialised
+  into the relation's pages at the store (`blb::move`) through
+  `crates/blb` (levels 0-2). A temp id opens before the store; an
+  all-zero quad is the empty blob; a blob never stored dies with the
+  transaction. Before: a blr_quad parameter dropped the connection.
+- **COMMIT RETAIN / ROLLBACK RETAIN** as SQL and as ops 50/86
+  (tra.cpp retain_context): the handle, the snapshot - now counting the
+  retained commits (`Snapshot::committed_own`, TRA_snapshot_state's
+  tra_commit_sub_trans) -, cursors, statements, the generator cache and
+  the temp blobs stay; every savepoint dies; a retain without work
+  burns no id (the tra.cpp:457 fast path, for free from `touched`).
+- `isc_invalid_savepoint` (3B000) for a ROLLBACK TO / RELEASE of a mark
+  that is not there.
+
+### Gated
+- `qa/serve-real-blobwrite.sh` (new, 8): the same node script against
+  both servers, then the engine reads fc's blobs (lengths, content, the
+  level-1 tail, the binary bytes), gfix and gbak.
+- `qa/serve-real-retain.sh` (new, 8): SQL cells on both, the
+  two-attachment snapshot law through node's commitRetaining /
+  rollbackRetaining, Next advancing only for retains with work.
+
 ## 2026-08-20 — first updater wins, and a schema is its transaction's
 
 ### Converted
