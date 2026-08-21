@@ -158,7 +158,28 @@ retained commits — `tra_commit_sub_trans`), cursors, statements,
 generator cache and temp blobs; savepoints die; a retain without work
 burns no id (`serve-real-retain` 8). `isc_invalid_savepoint` spelled.
 
-**Still absent:** `op_info_blob`, `op_seek_blob` (stream only), blob
+**op_info_blob / op_seek_blob DONE (2026-08-21, `serve-real-blobinfo`
+50):** the client is `qa/c/blobinfo.c` against libfbclient (node has
+neither op). `isc_blob_info` answers num_segments / max_segment /
+total_length / type on the read and the write handle; `isc_seek_blob`
+is stream-only (`isc_bad_segstr_type`), clamped to [0, length] in all
+three modes (`BLB_lseek`); `op_get_segment` on a SEGMENTED blob now
+packs whole segments into the client's buffer, one frame each, and
+answers resp_object 1 for a partial segment (server.cpp `get_segment`)
+— the client sees the segments it wrote, not one run. Measured on the
+way: the engine's stream-blob header counts the PUTS (5 × 10 bytes:
+count 5, max 10 — this crate wrote 1 / 50), `isc_bpb_type` is tag 3
+(fc read tag 1, so every stream bpb was taken as segmented), and
+libfbclient describes an SQL_BLOB parameter as `blr_blob2` (17), which
+the parameter parser now binds. **Inline blobs are NOT sent** (FB6
+`op_inline_blob`, protocol 19: a blob up to `max_inline_blob_size` rides
+with the fetch, framed by max_segment, and the client then answers
+info / seek / get_segment from its cache); the gate disables inlining
+through the DPB so both servers answer the ops over the wire — a
+default client reads the same bytes either way, in differently sized
+frames for a stream blob.
+
+**Still absent:** `op_inline_blob`, blob
 parameters in UPDATE … SET, `op_batch_*` (the batch API), `op_fetch_scroll`
 (dsql already emits `blr_scrollable`), `op_ping`, `op_slice` (arrays),
 `op_transact`. Auth: only Srp256 offered; no Legacy_Auth / ChaCha /
@@ -250,10 +271,28 @@ byte-identically; an `ORDER BY` fetch streams through `SortedCursor`
 from the merge — the result is never a `Vec`); the `Sort` row source
 pulls its merge and honours `Flow::Stop`, so `FIRST n` after a sort
 stops the delivery (the runs are still written whole, as the engine's
-are). **Still open:** the RIGHT/FULL mirror materialises; an ORDER BY
-over a JOIN fetch still materialises (the join cursor's rows are
-projected outputs, the order keys are over the combined row);
-`backfill_index` inserts keys one at a time; no merge join.
+are). **Slices 4–6 DONE (2026-08-21):** an ORDER BY over a JOIN fetch
+streams (`serve-real-joinorder` 12: the join cursor hands back its
+COMBINED rows unprojected, the external sort takes them at open, each
+fetch pulls from the merge and projects — spills at a 64 KB budget in
+the gate); the RIGHT/FULL last part is HASHED by the ON's equi-key by
+row index (`build_join_probe` now yields the key for RIGHT/FULL, never an
+index; `index_hash` / `mirror_candidates` serve the cursor's mirror
+phase, the streaming `for_each` arm and `join_step` alike — 4000×4000
+RIGHT/FULL equi-join 2.2 s → 0.37 s, same rows; the side itself is still
+a RAM `Vec`, its mirror bitmap needs it whole); `backfill_index` builds
+the tree WHOLE from the sorted keys (`btw::build_index_bulk`, the
+engine's `fast_load`: leaves in sequence, each level above, the top page
+into the existing root — a 300k-row CREATE INDEX 41 s → 0.6 s, `gfix -v
+-full` clean, the engine navigates and inserts into the result). **Bug
+found on the way, fixed:** the insert path compared the interior page's
+DEGENERATE first node (empty key) under the DESCENDING rule, where an
+empty key is the GREATEST — once the root had split, every key of a
+descending index descended the leftmost child and a propagated split key
+landed before the degenerate node: a 300k-row descending index had 52
+validation errors and a lookup missed rows. The degenerate node is
+−∞ by position now, both directions. **Still open:** no merge join;
+the RIGHT/FULL side in RAM.
 
 
 - **External sort + TempSpace** (`sort.cpp`): every sort, DISTINCT, GROUP BY and hash build lives in RAM (`server.rs:31046 sort_rows`) — a scalability ceiling, not only a feature.
@@ -345,11 +384,20 @@ pointer-page and TIP page numbers is the next step when it dominates.
 
 ## Next, in order
 
-- **NEXT**: the recorded tails — `op_info_blob` / `op_seek_blob`, an
-  ORDER BY over a JOIN fetch streaming, the RIGHT/FULL mirror,
-  `backfill_index` through the sort; then the dead-code cleanup
-  (`ddl_undo` / `image_undo` / `restore_db`). (MERGE `RETURNING` / `NOT
-  MATCHED BY SOURCE` done 2026-08-21.)
+- **Dead-code cleanup DONE (2026-08-21):** `Database::image_undo` /
+  `ddl_undo` were never set once DDL became the transaction's, so
+  `restore_db`, the image branch of `undo_window` / `rollback_now`
+  (`TxEnd::RolledBackImage`), `snapshot_db`, the per-transaction and
+  per-savepoint image snapshots, `UndoWindow::base`, and the autonomous
+  block's page carve-out (`auto_pages` — an O(file) page compare on every
+  autonomous commit, read by nobody) are gone. Every undo is by
+  transaction state; the write side is released between requests
+  unconditionally. The gates that pinned the image path pin the state
+  path now (`serve-real-autonomous` counts commits, not carve-outs).
+- **NEXT**: `op_inline_blob`; a merge join; the RIGHT/FULL side in a
+  `RowStore`. (MERGE `RETURNING` / `NOT MATCHED BY SOURCE`, `op_info_blob`
+  / `op_seek_blob`, the ordered JOIN fetch streaming, the RIGHT/FULL
+  hash, the bulk index build, the cleanup — all done 2026-08-21.)
 - **D, the MERGE executor** — the BLR is already compiled and tested;
   only the executor is missing.
 - **G, the external sort** — every sort and hash build is bounded by

@@ -336,17 +336,17 @@ pub fn create_blob(
     sub_type: u16,
     charset: u8,
 ) -> Result<u64, String> {
-    create_blob_kind(file, page_size, relation, segments, sub_type, charset, false)
+    create_blob_kind(file, page_size, relation, segments, sub_type, charset, None)
 }
 
 /// Create a STREAM blob (`rhd_stream_blob`): the content rides RAW -
-/// no `[u16 length]` frames at all - and `blh_count` is 1 with
-/// `blh_max_segment` the whole length, the shape the engine's own
-/// stream blobs carry (a stream blob is "one segment" by
-/// bookkeeping). Stream blobs arrive from the API's BPB
-/// (`isc_bpb_type_stream`), never from SQL literals, so the engine
-/// cannot be made to WRITE one through isql - the differential runs
-/// the other way: fire-crab writes, the engine reads.
+/// no `[u16 length]` frames at all. `blh_count` and `blh_max_segment`
+/// are the engine's put bookkeeping (`BLB_put_segment` counts every
+/// put and keeps the longest, stream or not - measured through
+/// `isc_blob_info` on a blob the engine stored from five 10-byte
+/// puts: 5 and 10, where this crate had written 1 and 50); this entry
+/// point is the one-put case. Stream blobs arrive from the API's BPB
+/// (`isc_bpb_type_stream`), never from SQL literals.
 pub fn create_stream_blob(
     file: &mut fire_crab_ods::Image,
     page_size: usize,
@@ -355,6 +355,22 @@ pub fn create_stream_blob(
     sub_type: u16,
     charset: u8,
 ) -> Result<u64, String> {
+    create_stream_blob_counted(file, page_size, relation, content, sub_type, charset, 1, content.len())
+}
+
+/// [create_stream_blob] with the put bookkeeping of the blob being
+/// stored: `count` puts, the longest `max_segment` bytes.
+#[allow(clippy::too_many_arguments)]
+pub fn create_stream_blob_counted(
+    file: &mut fire_crab_ods::Image,
+    page_size: usize,
+    relation: u16,
+    content: &[u8],
+    sub_type: u16,
+    charset: u8,
+    count: u32,
+    max_segment: usize,
+) -> Result<u64, String> {
     create_blob_kind(
         file,
         page_size,
@@ -362,7 +378,7 @@ pub fn create_stream_blob(
         std::slice::from_ref(&content.to_vec()),
         sub_type,
         charset,
-        true,
+        Some((count, max_segment)),
     )
 }
 
@@ -374,9 +390,11 @@ fn create_blob_kind(
     segments: &[Vec<u8>],
     sub_type: u16,
     charset: u8,
-    stream: bool,
+    // Some((count, max_segment)) = a STREAM blob with that put bookkeeping
+    stream: Option<(u32, usize)>,
 ) -> Result<u64, String> {
     let payload: usize = segments.iter().map(|s| s.len()).sum();
+    let (stream, stream_counts) = (stream.is_some(), stream);
     let max_segment = segments.iter().map(|s| s.len()).max().unwrap_or(0);
     if !stream && max_segment > u16::MAX as usize {
         return Err("blob segment longer than a u16 frame".into());
@@ -392,18 +410,20 @@ fn create_blob_kind(
     let mut header = BlobHeader {
         lead_page: 0,
         max_sequence: 0,
-        // a stream blob counts as ONE segment of the whole length
-        max_segment: if stream {
-            payload.min(u16::MAX as usize) as u16
-        } else {
-            max_segment as u16
+        // a stream blob's counters are its puts (see create_stream_blob)
+        max_segment: match stream_counts {
+            Some((_, m)) => m.min(u16::MAX as usize) as u16,
+            None => max_segment as u16,
         },
         flags: if stream {
             flags::BLOB | flags::STREAM
         } else {
             flags::BLOB
         },
-        count: if stream { 1 } else { segments.len() as u32 },
+        count: match stream_counts {
+            Some((c, _)) => c,
+            None => segments.len() as u32,
+        },
         length: payload as u64,
         sub_type,
         charset,

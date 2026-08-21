@@ -870,13 +870,6 @@ pub fn insert_index_entry(
             node_cmp(k, r, n)
         }
     };
-    // the index root page (to repoint irt_root on a root split)
-    let irt_page = file
-        .pages()
-        .position(|p| {
-            p[0] == PageType::IndexRoot as u8 && u16_at(p, 16) == rel
-        })
-        .ok_or("no index root page")? as u32;
     let root_page = {
         let irt = find_index_root(file, page_size, rel).ok_or("no index root")?;
         let e = irt.entry(index_id).ok_or("no such index")?;
@@ -903,9 +896,16 @@ pub fn insert_index_entry(
             break;
         }
         // interior: the LAST node whose (key, recno) <= ours; the
-        // first node (degenerate) when everything is greater
+        // first node (degenerate) when everything is greater. THE
+        // DEGENERATE NODE IS NOT COMPARED: its empty key is -infinity
+        // by position, and under the DESCENDING rule an empty key
+        // compares GREATEST (0xFF padding) - comparing it sent every
+        // key of a descending index down the leftmost child once the
+        // root had split, and put the split keys before the degenerate
+        // node in the parent (gfix: "inconsistent left sibling
+        // pointer", a lookup that missed rows; 300k-row probe).
         let mut child = c.nodes.first().ok_or("empty interior page")?.page;
-        for n in &c.nodes {
+        for n in c.nodes.iter().skip(1) {
             if cmp(key, recno, n) == std::cmp::Ordering::Less {
                 break;
             }
@@ -996,14 +996,16 @@ pub fn insert_index_entry(
             Some(parent) => {
                 let pb = load_page(file, page_size, parent).ok_or("bad parent page")?;
                 let mut pc = decode_content(&pb).ok_or("undecodable parent")?;
+                // the degenerate first node stays first (see the descent)
                 let pos = pc
                     .nodes
                     .iter()
+                    .skip(1)
                     .position(|n| {
                         cmp(&parent_node.key, parent_node.recno, n)
                             == std::cmp::Ordering::Less
                     })
-                    .unwrap_or(pc.nodes.len());
+                    .map_or(pc.nodes.len(), |i| i + 1);
                 pc.nodes.insert(pos, parent_node);
                 level_page = parent;
                 level_content = pc;
@@ -1024,7 +1026,14 @@ pub fn insert_index_entry(
                 };
                 encode_page(file, page_size, new_root, rel, index_id, &rc)
                     .map_err(|_| "new root does not fit".to_string())?;
-                // repoint irt_root (irt_rpt entry offset 24 + id*24, root @8)
+                // repoint irt_root (irt_rpt entry offset 24 + id*24, root @8).
+                // The index root page is looked up HERE, on the root split
+                // alone - a whole-file scan per insert had been the cost of
+                // every index write (a 300k-row CREATE INDEX: 41 s)
+                let irt_page = file
+                    .pages()
+                    .position(|p| p[0] == PageType::IndexRoot as u8 && u16_at(p, 16) == rel)
+                    .ok_or("no index root page")? as u32;
                 let at = 24 + index_id as usize * 24 + 8; // page-local
                 crate::page_mut(file, page_size, irt_page)
                     .ok_or("irt page out of range")?[at..at + 4]
@@ -1032,6 +1041,129 @@ pub fn insert_index_entry(
                 return Ok(());
             }
         }
+    }
+}
+
+/// Build index `index_id` of `rel` WHOLE from `sorted` (key, recno) pairs
+/// already in the tree's order - the engine's `fast_load` (btr.cpp): the
+/// leaves are filled in sequence, each closed with the next page's first
+/// node as its END_BUCKET and linked to it, then every level above from
+/// the (first key, recno, page) of the pages below - the leftmost page of
+/// each upper level opening with the degenerate empty-key node - until
+/// one page remains, which is written INTO the index's existing root page
+/// (`irt_root` untouched). The tree is what a sequence of
+/// [insert_index_entry] calls would have grown, without each insert
+/// decoding and re-encoding a page (a 300k-row CREATE INDEX: 41 s as
+/// inserts, ~1 s here).
+///
+/// `unique` refuses two consecutive equal keys (the rows are all live -
+/// a build keys committed primary rows); a NULL key (`all_null`) is
+/// exempt unless the index is a primary key, the rule [insert_index_entry]
+/// is given per key.
+pub fn build_index_bulk(
+    file: &mut crate::Image,
+    page_size: usize,
+    rel: u16,
+    index_id: u8,
+    sorted: &[(Vec<u8>, u64, bool)],
+    unique: bool,
+    primary: bool,
+) -> Result<(), String> {
+    let root_page = {
+        let irt = find_index_root(file, page_size, rel).ok_or("no index root")?;
+        let e = irt.entry(index_id).ok_or("no such index")?;
+        if e.root_page == 0 {
+            return Err("index has no root page".into());
+        }
+        e.root_page
+    };
+    // nothing to key: the empty root the index was created with stands
+    if sorted.is_empty() {
+        return Ok(());
+    }
+    if unique || primary {
+        for w in sorted.windows(2) {
+            let (a, b) = (&w[0], &w[1]);
+            let dup_counts = (unique && !a.0.is_empty() && !a.2 && !b.2) || primary;
+            if dup_counts && a.0 == b.0 && a.1 != b.1 {
+                return Err("duplicate key in unique index".into());
+            }
+        }
+    }
+    // one level: the pages written, each remembered by its first node
+    // (key, recno) and number, for the level above
+    fn write_level(
+        file: &mut crate::Image,
+        page_size: usize,
+        rel: u16,
+        index_id: u8,
+        level: u8,
+        nodes: &[BtNode],
+        root_page: u32,
+    ) -> Result<Vec<BtNode>, String> {
+        let leaf = level == 0;
+        let cap = page_size - BTR_NODES_OFFSET - 1; // the END_LEVEL byte
+        let mut pages: Vec<(u32, PageContent)> = Vec::new();
+        let mut cur: Vec<BtNode> = Vec::new();
+        let mut body = 0usize;
+        let mut prev: &[u8] = &[];
+        let mut scratch = Vec::new();
+        for n in nodes {
+            let p = common_prefix(prev, &n.key);
+            scratch.clear();
+            write_node(&mut scratch, leaf, false, p, &n.key[p..], n.recno, n.page);
+            // the node, and room for it again as the END_BUCKET it would
+            // become (its own prefix against the last key)
+            if !cur.is_empty() && body + 2 * scratch.len() + 2 > cap {
+                let page_no = crate::dml::allocate_page(file, page_size)?;
+                pages.push((
+                    page_no,
+                    PageContent { level, sibling: 0, left_sibling: 0, nodes: std::mem::take(&mut cur), term: Terminator::Bucket(n.clone()) },
+                ));
+                body = 0;
+                prev = &[];
+                let p = common_prefix(prev, &n.key);
+                scratch.clear();
+                write_node(&mut scratch, leaf, false, p, &n.key[p..], n.recno, n.page);
+            }
+            body += scratch.len();
+            cur.push(n.clone());
+            prev = &n.key;
+        }
+        // the rightmost page of the level: the root page when it is alone
+        let last_no = if pages.is_empty() { root_page } else { crate::dml::allocate_page(file, page_size)? };
+        pages.push((last_no, PageContent { level, sibling: 0, left_sibling: 0, nodes: cur, term: Terminator::Level }));
+        // link and write
+        let numbers: Vec<u32> = pages.iter().map(|(no, _)| *no).collect();
+        let mut firsts = Vec::with_capacity(pages.len());
+        for (i, (no, mut c)) in pages.into_iter().enumerate() {
+            c.sibling = numbers.get(i + 1).copied().unwrap_or(0);
+            c.left_sibling = if i == 0 { 0 } else { numbers[i - 1] };
+            let first = c.nodes.first().ok_or("empty index page in a bulk build")?;
+            // a level's leftmost page above the leaves opens with the
+            // degenerate node: its pointer key is -infinity by position
+            let key = if i == 0 && level > 0 { Vec::new() } else { first.key.clone() };
+            firsts.push(BtNode { key, recno: if i == 0 && level > 0 { 0 } else { first.recno }, page: no });
+            encode_page(file, page_size, no, rel, index_id, &c).map_err(|_| "bulk-built index page does not fit".to_string())?;
+        }
+        Ok(firsts)
+    }
+    let mut level_nodes: Vec<BtNode> = sorted.iter().map(|(k, r, _)| BtNode { key: k.clone(), recno: *r, page: 0 }).collect();
+    let mut level = 0u8;
+    loop {
+        let firsts = write_level(file, page_size, rel, index_id, level, &level_nodes, root_page)?;
+        if firsts.len() == 1 {
+            return Ok(());
+        }
+        // the degenerate node of a level's first page keeps the empty key;
+        // every other pointer is the page's first (key, recno)
+        let mut up = firsts;
+        if let Some(first) = up.first_mut() {
+            first.key.clear();
+            first.recno = 0;
+        }
+        level_nodes = up;
+        level += 1;
     }
 }
 

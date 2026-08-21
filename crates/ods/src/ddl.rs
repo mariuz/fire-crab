@@ -5837,6 +5837,13 @@ fn allocate_index_slot(
 /// what an index build (CREATE INDEX, ALTER INDEX ACTIVE, a key
 /// constraint over existing rows) does. A duplicate under a unique or
 /// primary index fails the whole statement, as the engine's build does.
+///
+/// THROUGH THE SORT: the keys are built for every row first, sorted in
+/// the index's own order (the complemented DESCENDING keys by their own
+/// rule, ties by record number), and the tree is built WHOLE from that
+/// order by [btw::build_index_bulk] - the engine's `fast_load`. Inserting
+/// in record order had each key decode and re-encode its leaf, split
+/// pages mid-way, and (descending) descend the wrong child.
 #[allow(clippy::too_many_arguments)]
 fn backfill_index(
     file: &mut crate::Image,
@@ -5865,6 +5872,8 @@ fn backfill_index_inner(
     primary: bool,
 ) -> Result<(), String> {
     let recs = max_recs_per_dp(page_size);
+    // (key, recno) for every row, then sorted in the tree's order
+    let mut keyed: Vec<(Vec<u8>, u64, bool)> = Vec::new();
     for dp_no in relation_data_pages(file, page_size, rel) {
         let Some(dp) = crate::page_at(file, page_size, dp_no).and_then(DataPage::decode) else {
             continue;
@@ -5898,19 +5907,14 @@ fn backfill_index_inner(
                 .collect();
             let (key, all_null) = btw::build_index_key(&key_segs, descending)
                 .ok_or("unsupported value for an index key")?;
-            btw::insert_index_entry(
-                file,
-                page_size,
-                rel,
-                slot as u8,
-                &key,
-                recno,
-                (unique && !all_null) || primary,
-                descending,
-            )?;
+            keyed.push((key, recno, all_null));
         }
     }
-    Ok(())
+    keyed.sort_by(|a, b| {
+        let k = if descending { btw::key_cmp_desc(&a.0, &b.0) } else { a.0.cmp(&b.0) };
+        k.then(a.1.cmp(&b.1))
+    });
+    btw::build_index_bulk(file, page_size, rel, slot as u8, &keyed, unique, primary)
 }
 
 /// Walk a system relation like [walk_rows], also yielding each row's

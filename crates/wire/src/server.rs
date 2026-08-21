@@ -73,6 +73,11 @@ const OP_ROLLBACK_RETAINING: i32 = 86;
 const OP_RECONNECT: i32 = 33; // op_reconnect - pick a limbo transaction back up
 const OP_PREPARE2: i32 = 51; // op_prepare with a TDR message
 const OP_OPEN_BLOB: i32 = 35;
+const OP_INFO_BLOB: i32 = 43;
+const OP_SEEK_BLOB: i32 = 61;
+/// isc_bad_segstr_type: "invalid BLOB type for operation" - a seek on a
+/// segmented blob (blb.cpp BLB_lseek)
+const GDS_BAD_SEGSTR_TYPE: i32 = 335544465;
 const OP_GET_SEGMENT: i32 = 36;
 const OP_CLOSE_BLOB: i32 = 39;
 const OP_OPEN_BLOB2: i32 = 56;
@@ -154,7 +159,9 @@ fn bpb_stream_type(bpb: &[u8]) -> bool {
     let mut at = 1usize;
     while at + 2 <= bpb.len() {
         let (tag, len) = (bpb[at], bpb[at + 1] as usize);
-        if tag == 1 && len >= 1 && at + 2 < bpb.len() {
+        // isc_bpb_type is 3 (1 and 2 are the source/target sub-types);
+        // isc_bpb_type_stream = 1
+        if tag == 3 && len >= 1 && at + 2 < bpb.len() {
             return bpb[at + 2] == 1;
         }
         at += 2 + len;
@@ -165,6 +172,8 @@ fn bpb_stream_type(bpb: &[u8]) -> bool {
 /// One put segment into a temp blob: a segmented blob keeps it whole, a
 /// stream blob has no segments - the bytes run on (blb.cpp:1630-1642)
 fn put_blob_segment(tb: &mut TempBlob, data: &[u8]) {
+    tb.puts += 1;
+    tb.max_put = tb.max_put.max(data.len().min(u16::MAX as usize) as u16);
     if tb.stream {
         match tb.segments.first_mut() {
             Some(s) => s.extend_from_slice(data),
@@ -172,6 +181,137 @@ fn put_blob_segment(tb: &mut TempBlob, data: &[u8]) {
         }
     } else {
         tb.segments.push(data.to_vec());
+    }
+}
+
+/// A blob open for READING over the wire: the engine's `blb` as the
+/// remote server sees it - the segments (one run for a stream blob),
+/// the header counters `isc_blob_info` answers, and the read position
+/// (`BLB_lseek` moves it; stream blobs only).
+struct ReadBlob {
+    segs: Vec<Vec<u8>>,
+    stream: bool,
+    /// blb_count, blb_max_segment, blb_length
+    count: u32,
+    max_segment: u16,
+    length: u64,
+    /// the next segment, and the offset into it (a partial delivery
+    /// of a segment longer than the client's buffer; the byte position
+    /// for a stream blob)
+    idx: usize,
+    off: usize,
+}
+
+impl ReadBlob {
+    fn of_temp(tb: &TempBlob) -> ReadBlob {
+        let length = tb.segments.iter().map(|s| s.len() as u64).sum();
+        ReadBlob {
+            segs: tb.segments.clone(),
+            stream: tb.stream,
+            count: tb.puts,
+            max_segment: tb.max_put,
+            length,
+            idx: 0,
+            off: 0,
+        }
+    }
+    fn empty() -> ReadBlob {
+        ReadBlob { segs: Vec::new(), stream: false, count: 0, max_segment: 0, length: 0, idx: 0, off: 0 }
+    }
+    /// BLB_lseek: stream blobs only; the position clamps to [0, length]
+    fn seek(&mut self, mode: i32, offset: i64) -> Result<i64, i32> {
+        if !self.stream {
+            return Err(GDS_BAD_SEGSTR_TYPE);
+        }
+        let mut position = offset;
+        if mode == 1 {
+            position += self.off as i64;
+        } else if mode == 2 {
+            position += self.length as i64;
+        }
+        let pos = if position <= 0 { 0 } else { (position as u64).min(self.length) };
+        self.idx = 0;
+        self.off = pos as usize;
+        Ok(pos as i64)
+    }
+    /// One op_get_segment response: [u16 LE len][bytes]* packed to the
+    /// client's buffer, and the remote server's state - 0 more to come,
+    /// 1 the last frame is a PARTIAL segment (isc_segment), 2 EOF
+    /// (server.cpp get_segment: whole segments while they fit; a stream
+    /// blob's bytes are one run cut to the buffer).
+    fn next_response(&mut self, buf_len: usize) -> (Vec<u8>, i32) {
+        let mut out = Vec::new();
+        let mut room = buf_len;
+        if self.stream {
+            let data = self.segs.first().map(|s| s.as_slice()).unwrap_or(&[]);
+            while room > 2 {
+                let remaining = data.len().saturating_sub(self.off);
+                if remaining == 0 {
+                    return (out, 2);
+                }
+                let chunk = remaining.min(room - 2).min(u16::MAX as usize);
+                out.extend_from_slice(&(chunk as u16).to_le_bytes());
+                out.extend_from_slice(&data[self.off..self.off + chunk]);
+                self.off += chunk;
+                room -= chunk + 2;
+            }
+            return (out, 0);
+        }
+        while room > 2 {
+            let Some(seg) = self.segs.get(self.idx) else {
+                return (out, 2);
+            };
+            let rest = &seg[self.off.min(seg.len())..];
+            let chunk = rest.len().min(room - 2).min(u16::MAX as usize);
+            out.extend_from_slice(&(chunk as u16).to_le_bytes());
+            out.extend_from_slice(&rest[..chunk]);
+            room -= chunk + 2;
+            if chunk < rest.len() {
+                self.off += chunk;
+                return (out, 1);
+            }
+            self.idx += 1;
+            self.off = 0;
+        }
+        (out, 0)
+    }
+    /// isc_blob_info: the items asked for, each `tag, u16 LE length,
+    /// value` (INF_convert: a ULONG is 4 bytes LE; the type is one
+    /// byte), isc_info_end closing; isc_info_truncated when the
+    /// client's buffer is too short (inf.cpp INF_blob_info)
+    fn info(&self, items: &[u8], buf_len: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        for &item in items {
+            let value: Vec<u8> = match item {
+                1 => break,                                       // isc_info_end
+                4 => self.count.to_le_bytes().to_vec(),           // num_segments
+                5 => u32::from(self.max_segment).to_le_bytes().to_vec(), // max_segment
+                6 => (self.length as u32).to_le_bytes().to_vec(), // total_length
+                7 => vec![u8::from(self.stream)],                 // type
+                other => {
+                    // isc_info_error: the item, then isc_infunk
+                    let mut v = vec![other];
+                    v.extend_from_slice(&335544414u32.to_le_bytes());
+                    if out.len() + 3 + v.len() + 1 > buf_len {
+                        out.push(2);
+                        return out;
+                    }
+                    out.push(3);
+                    out.extend_from_slice(&(v.len() as u16).to_le_bytes());
+                    out.extend_from_slice(&v);
+                    continue;
+                }
+            };
+            if out.len() + 3 + value.len() + 1 > buf_len {
+                out.push(2); // isc_info_truncated
+                return out;
+            }
+            out.push(item);
+            out.extend_from_slice(&(value.len() as u16).to_le_bytes());
+            out.extend_from_slice(&value);
+        }
+        out.push(1);
+        out
     }
 }
 
@@ -903,13 +1043,6 @@ struct Database {
     nested_tx: Vec<u32>,
     /// The pages an autonomous transaction COMMITTED, by page number.
     ///
-    /// An autonomous transaction is committed - that is the whole point
-    /// of it - so an enclosing undo must not take it back, and every
-    /// undo in this server is "put an image back". These are written
-    /// FORWARD over the restored image, exactly as the generator
-    /// windows' settled values are ([write_gen_window]). Cleared when
-    /// the transaction ends, by which time they are on the disk.
-    auto_pages: std::collections::HashMap<u32, Vec<u8>>,
     /// tra_gen_ids: the TRANSACTION-scoped generator cache (tra.h:315).
     /// An absolute set never touches the generator page - it lands HERE
     /// (last put wins) and posts a dfw_set_generator into the current
@@ -968,26 +1101,6 @@ struct Database {
     /// [crate::dblocks]
     locks: std::sync::Arc<crate::dblocks::DbLocks>,
     lock_owner: fire_crab_lck::OwnerId,
-    /// whether this transaction must HOLD THE WRITE SIDE to the end,
-    /// because an image it may put back was taken while it held it: a
-    /// DDL statement, or an open SAVEPOINT (whose base image is the
-    /// fallback when the window cannot be undone by state). Nothing
-    /// else may commit inside such a window, or the restore would land
-    /// on top of it.
-    image_undo: bool,
-    /// ...and whether an undo actually NEEDS that image. Only a SETTLED
-    /// write does: a DDL statement's catalog rows are committed as they
-    /// are written, since DDL is not transactional here, so no
-    /// transaction state can take them back. Everything a transaction
-    /// writes as RECORDS is undone by [Database::kill_tx] on the id
-    /// that wrote it - the transaction's own, or an undo window's
-    /// nested one (see [UndoWindow]).
-    ///
-    /// Kept apart from [Database::image_undo] because a savepoint has
-    /// to hold the write side (its image is the fallback) without
-    /// giving up state-based undo, which is the whole point of a
-    /// savepoint being a transaction.
-    ddl_undo: bool,
     /// whether this transaction has run a DDL statement - recorded for
     /// the trace and the gates; its rows are its own now
     did_ddl: bool,
@@ -1939,8 +2052,6 @@ impl Database {
         // op_transaction captures the inventory afresh
         self.snapshot = None;
         self.autonomous_ids.clear();
-        self.image_undo = false;
-        self.ddl_undo = false;
         self.did_ddl = false;
         self.ddl_deferred.clear();
         self.temp_blobs.clear(); // never stored: gone with the transaction
@@ -1949,10 +2060,6 @@ impl Database {
             self.attachments.active_tx.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
             self.counted_tx = false;
         }
-        // the autonomous carve-out has done its work: those pages are on
-        // the disk, and no undo of a LATER transaction reaches back past
-        // a snapshot taken after them
-        self.auto_pages.clear();
         // whoever was waiting for this transaction can go now
         self.locks.release(self.lock_owner);
     }
@@ -2285,10 +2392,6 @@ struct UndoWindow {
     /// one: their rows are uncommitted work still, so they are counted
     /// as this reader's own and killed with this window if it is undone
     folded: Vec<u32>,
-    /// the image this window started from, put back only when the undo
-    /// cannot be done by state (a settled write went before - see
-    /// [Database::ddl_undo])
-    base: Option<std::sync::Arc<fire_crab_ods::Image>>,
     /// what the DDL run inside this window wrote that no transaction
     /// state takes back - undone by hand if the window is undone, folded
     /// into the parent if it closes well ([fire_crab_ods::DdlResidue])
@@ -2305,7 +2408,6 @@ impl UndoWindow {
             kind,
             tx: None,
             folded: Vec::new(),
-            base: None,
             residue: Vec::new(),
             deferred: Vec::new(),
         }
@@ -2385,14 +2487,9 @@ fn gen_bump_through_cache(
 /// their own - see [WindowKind]. `base` is the image the window starts
 /// from, kept only as the fallback for a window whose undo cannot be
 /// done by state.
-fn undo_window_push(
-    database: &mut Option<Database>,
-    kind: WindowKind,
-    base: Option<std::sync::Arc<fire_crab_ods::Image>>,
-) -> usize {
+fn undo_window_push(database: &mut Option<Database>, kind: WindowKind) -> usize {
     let Some(db) = database.as_mut() else { return 0 };
-    let mut w = UndoWindow::new(kind);
-    w.base = base;
+    let w = UndoWindow::new(kind);
     db.windows.push(w);
     db.windows.len() - 1
 }
@@ -2719,7 +2816,6 @@ fn load_database(path: &str) -> Option<Database> {
         shared,
         write: None,
         tx: None,
-        auto_pages: std::collections::HashMap::new(),
         gen_cache: std::collections::HashMap::new(),
         temp_blobs: std::collections::HashMap::new(),
         next_temp_blob: 0,
@@ -2730,8 +2826,6 @@ fn load_database(path: &str) -> Option<Database> {
         stmts: Default::default(),
         locks,
         lock_owner,
-        image_undo: false,
-        ddl_undo: false,
             did_ddl: false,
             ddl_deferred: Vec::new(),
         nested_tx: Vec::new(),
@@ -5140,14 +5234,17 @@ impl RowSource {
             // [join_step] EXACTLY - same match order, same partnerless-ON
             // evaluation on the padded rows, same mirror - with the driver
             // walked lazily and rows pushed rather than collected. The
-            // probe is LEFT-only, so a RIGHT/FULL side is always the whole
-            // scan (`part.probe` is None); a hypothetical probed one falls
-            // to the materialising arm.
+            // a RIGHT/FULL side is always the whole scan, materialised (its
+            // mirror needs it); its probe, when the ON has an equi-key, is
+            // the key alone and HASHES that side by row. A (hypothetical)
+            // index-probed one falls to the materialising arm.
             RowSource::NestedLoopJoin { left, left_width, right, part, above }
                 if matches!(part.kind, JoinKind::Right | JoinKind::Full)
-                    && part.probe.is_none() =>
+                    && part.probe.as_ref().map_or(true, |p| p.index.is_none()) =>
             {
                 let rrows = right.rows(db)?;
+                let rhash = part.probe.as_ref().and_then(|p| index_hash(&rrows, p));
+                let mut cand: Vec<usize> = Vec::new();
                 let mut right_matched = vec![false; rrows.len()];
                 let lgate = side_filter(above, 0..*left_width);
                 let rgate = side_filter(above, *left_width..*left_width + part.width);
@@ -5163,7 +5260,8 @@ impl RowSource {
                 let mut stopped = false;
                 let flow = left.for_each(db, &mut |l| {
                     let mut matched = false;
-                    for (ri, r) in rrows.iter().enumerate() {
+                    for &ri in mirror_candidates(rhash.as_ref(), part.probe.as_ref(), &l, rrows.len(), &mut cand) {
+                        let r = &rrows[ri];
                         let mut row = l.clone();
                         row.extend(r.iter().cloned());
                         if !part.on.matches(&row)? {
@@ -5328,7 +5426,11 @@ impl RowSource {
             RowSource::Rows(rows) => Ok(rows.clone()),
             RowSource::NestedLoopJoin { left, left_width, right, part, above } => {
                 let l = left.rows(db)?;
-                let Some(probe) = part.probe.as_ref() else {
+                // a RIGHT/FULL part's probe is the KEY alone (for the
+                // mirror's hash inside join_step), never a per-driver read
+                let Some(probe) =
+                    part.probe.as_ref().filter(|_| matches!(part.kind, JoinKind::Left | JoinKind::Inner))
+                else {
                     let r = right.rows(db)?;
                     return join_step(l, *left_width, &r, part, above);
                 };
@@ -17538,6 +17640,13 @@ struct TempBlob {
     /// the put segments (a stream blob: one growing segment)
     segments: Vec<Vec<u8>>,
     stream: bool,
+    /// blb_count / blb_max_segment as the engine keeps them for a blob
+    /// being written: one per put_segment call, the longest put - what
+    /// isc_blob_info answers on the write handle, and what the header
+    /// of a stream blob records (its bytes are one run, the count is
+    /// still the number of puts)
+    puts: u32,
+    max_put: u16,
     /// closed by op_close_blob - only a closed blob may be stored
     /// (blb.cpp:1247 isc_bad_segstr_id otherwise)
     closed: bool,
@@ -17660,6 +17769,14 @@ fn parse_param_blr(b: &[u8]) -> Option<Vec<PSlot>> {
             23 => PSlot::Bool,
             9 => {
                 i += 1; // scale
+                PSlot::Quad
+            }
+            17 => {
+                // blr_blob2 (blr.h:63): sub_type word, charset word - how
+                // libfbclient describes an SQL_BLOB parameter (node's
+                // SQLParamQuad sends blr_quad); the value is the same
+                // 8-byte id
+                i += 4;
                 PSlot::Quad
             }
             _ => return None, // int128, decfloat, tz: not bindable
@@ -19860,12 +19977,6 @@ where
                 let Some(db) = database.as_mut() else {
                     return Err("no database attached".into());
                 };
-                if db.image_undo {
-                    // cannot let go, and cannot have got here either
-                    return Err(ExecErr::Text(
-                        "lock conflict inside a statement that holds the database".into(),
-                    ));
-                }
                 // NO WAIT does not block: the engine raises the
                 // update-conflict at once, naming the transaction that
                 // holds the row (measured, same vector as a committed
@@ -19932,7 +20043,7 @@ fn execute_dml_collecting(
     // ONE STATEMENT IS ITS OWN UNDO WINDOW, and it needs no id: its
     // records live in a working copy that is dropped whole if any part
     // of it fails (see [WindowKind::Statement]).
-    let mark = undo_window_push(database, WindowKind::Statement, None);
+    let mark = undo_window_push(database, WindowKind::Statement);
     let out = execute_dml_collecting_inner(plan, database, args, ctx, affected);
     undo_window_unwind(database, mark, out.is_err());
     // the statement may have adopted an id (a DDL's wide-view guard put
@@ -20038,8 +20149,8 @@ fn execute_dml_collecting_inner(
             // object must not both land a version of its catalog row,
             // and the engine's first-updater-wins refusal ("table N is
             // used by transaction M", CacheVector.h newVersionBusy) is
-            // not built yet - holding the side is the conservative
-            // reading of it ([Database::image_undo]).
+            // the conservative reading of it (the DDL-tx slices added
+            // the refusal; the hold stays).
             db.did_ddl = true;
             // ...AND EVERY ANSWER THE METADATA CACHE HOLDS WAS ABOUT
             // THE OLD SCHEMA. Invalidated before the statement runs,
@@ -23560,11 +23671,10 @@ fn build_join_probe(
     // over an indexed key did the whole O(N x M) nested-loop scan the engine
     // plans as `B INDEX RDB$PRIMARY`: `SELECT A.ID FROM A JOIN B ON A.K=B.K`
     // over 4,000 x 4,000 cost 1.8 s where the probe reads ~one inner row per
-    // driver. RIGHT/FULL still decline - their mirror needs the whole other
-    // side, not one keyed lookup.
-    if !matches!(kind, JoinKind::Left | JoinKind::Inner) {
-        return None;
-    }
+    // driver. RIGHT/FULL carry the KEY but never an INDEX: their mirror
+    // needs the whole other side materialised, and the key then hashes it
+    // by row ([index_hash]) instead of scanning it per driver row.
+    let index_allowed = matches!(kind, JoinKind::Left | JoinKind::Inner);
     // the base table to KEY, this side's descriptors and columns laid out
     // by base field id, and how its OUTPUT columns map to that base. A
     // plain relation is the identity through `probe_src`; a view or
@@ -23749,7 +23859,73 @@ fn build_join_probe(
     if keys.is_empty() {
         return None;
     }
-    Some(JoinProbe { index, descs: base_descs, src, keys })
+    Some(JoinProbe { index: if index_allowed { index } else { None }, descs: base_descs, src, keys })
+}
+
+/// A materialised side hashed by one equi-key BY ROW INDEX - the shape
+/// the RIGHT/FULL mirror needs, whose match bitmap is per row of the side
+/// it keeps whole. The family rules are [build_join_key_hash_from_rows]'s:
+/// NULL keys join nothing and are skipped; a side with keys of two
+/// families declines (`None`), leaving the ON to scan.
+struct IndexHash {
+    kind: KeyKind,
+    buckets: std::collections::HashMap<JoinKey, Vec<usize>>,
+}
+
+fn index_hash(rows: &[Vec<Value>], probe: &JoinProbe) -> Option<IndexHash> {
+    let [key] = probe.keys.as_slice() else { return None };
+    let fid = key.inner_fid;
+    let mut buckets: std::collections::HashMap<JoinKey, Vec<usize>> = std::collections::HashMap::new();
+    let mut kind: Option<KeyKind> = None;
+    for (i, r) in rows.iter().enumerate() {
+        let v = r.get(fid)?;
+        match join_key(v) {
+            Some((kk, k)) => {
+                match kind {
+                    None => kind = Some(kk),
+                    Some(prev) if prev != kk => return None,
+                    _ => {}
+                }
+                buckets.entry(k).or_default().push(i);
+            }
+            None if matches!(v, Value::Null) => {}
+            None => return None,
+        }
+    }
+    Some(IndexHash { kind: kind.unwrap_or(KeyKind::Int), buckets })
+}
+
+/// The row indices of a side a driver row can match, in side order: its
+/// key's bucket under the hash; none for a NULL key; EVERY row when there
+/// is no hash or the key is outside the hash's family (the ON decides,
+/// exactly as the unhashed loop did). `all` is the side's row count.
+fn mirror_candidates<'a>(
+    hash: Option<&IndexHash>,
+    probe: Option<&JoinProbe>,
+    driver: &[Value],
+    all: usize,
+    buf: &'a mut Vec<usize>,
+) -> &'a [usize] {
+    buf.clear();
+    let everything = |buf: &'a mut Vec<usize>| -> &'a [usize] {
+        buf.extend(0..all);
+        buf
+    };
+    let (Some(h), Some(pr)) = (hash, probe) else { return everything(buf) };
+    let [key] = pr.keys.as_slice() else { return everything(buf) };
+    match key.outer.eval(driver) {
+        Ok(v) if matches!(v, Value::Null) => buf,
+        Ok(v) => match join_key(&v) {
+            Some((kk, k)) if kk == h.kind => {
+                if let Some(ix) = h.buckets.get(&k) {
+                    buf.extend_from_slice(ix);
+                }
+                buf
+            }
+            _ => everything(buf),
+        },
+        Err(_) => everything(buf),
+    }
 }
 
 fn plan_join_bound(
@@ -30644,6 +30820,11 @@ struct JoinCursor {
     /// join), `rgate` for a MIRROR row (last side). `None`/`None` otherwise.
     lgate: Option<Predicate>,
     rgate: Option<Predicate>,
+    /// RIGHT/FULL last part only: its side hashed by the ON's equi-key,
+    /// by row index, so the driver phase tries a bucket per accumulated
+    /// row ([mirror_candidates]); `None` = the ON scans the side
+    mirror_hash: Option<IndexHash>,
+    mirror_cand: Vec<usize>,
     /// resume position. The DRIVER PHASE walks `di` over the base rows; when
     /// it exhausts, a RIGHT/FULL last part enters the MIRROR PHASE, walking
     /// `mi` over the last side and emitting the rows `right_matched` left
@@ -30661,12 +30842,20 @@ impl JoinCursor {
     /// materialising path in charge. `args` binds the WHERE's parameters
     /// and (via `resolve_driver_base`) the deferred driver band.
     fn open(db: &Database, plan: &Plan, args: &[WireParam]) -> Option<JoinCursor> {
+        Self::open_inner(db, plan, args, false)
+    }
+
+    /// `raw` = hand back the COMBINED rows, unprojected (an empty `cols`
+    /// is the identity in [project_row]) - the shape an ORDER BY's keys
+    /// are over; [SortedCursor] drains such a cursor into the external
+    /// sort and projects on the way out. Only a raw cursor admits an
+    /// ORDER BY: a sort must see every combined row.
+    fn open_inner(db: &Database, plan: &Plan, args: &[WireParam], raw: bool) -> Option<JoinCursor> {
         let Plan::Join { base, base_width, parts, cols, filter, order_by, defer } = plan else {
             return None;
         };
-        // a sort must see every combined row; FIRST/SKIP already stream via
-        // stream_first_n (this is the BARE join)
-        if !order_by.is_empty() {
+        // FIRST/SKIP already stream via stream_first_n (this is the BARE join)
+        if !order_by.is_empty() && !raw {
             return None;
         }
         let Some((last, inner_parts)) = parts.split_last() else {
@@ -30730,7 +30919,13 @@ impl JoinCursor {
             // an unindexed equi part hashes its inner by the ON's key; a theta
             // part (no probe, or a key the hash declines) leaves it `None` and
             // the ON scans the whole inner
-            let key_hash = p.probe.as_ref().and_then(|pr| build_join_key_hash_from_rows(&inner, pr));
+            // (a RIGHT/FULL last part is hashed BY ROW for its mirror -
+            // `mirror_hash` below - not copied into a RowStore here)
+            let key_hash = if matches!(p.kind, JoinKind::Left | JoinKind::Inner) {
+                p.probe.as_ref().and_then(|pr| build_join_key_hash_from_rows(&inner, pr))
+            } else {
+                None
+            };
             parts_data.push(PartData { part: p.clone(), inner, key_hash, probed: None });
         }
         // a RIGHT/FULL last part needs the mirror machinery: the match bitmap
@@ -30749,18 +30944,25 @@ impl JoinCursor {
         } else {
             (None, None, Vec::new())
         };
+        let mirror_hash = if is_mirror {
+            parts_data.last().and_then(|pd| pd.part.probe.as_ref().and_then(|p| index_hash(&pd.inner, p)))
+        } else {
+            None
+        };
         Some(JoinCursor {
             image: Some(image),
             driver,
             base_width: *base_width,
             parts: parts_data,
             above,
-            cols: cols.clone(),
+            cols: if raw { Vec::new() } else { cols.clone() },
             scan_buf: Vec::new(),
             mirror_left_width,
             right_matched,
             lgate,
             rgate,
+            mirror_hash,
+            mirror_cand: Vec::new(),
             di: 0,
             mi: 0,
             pending: Vec::new(),
@@ -30961,13 +31163,15 @@ impl JoinCursor {
     /// left-side WHERE, same FULL-keeps / RIGHT-drops rule - then the top
     /// `Filter` (the WHERE) and the projection.
     fn mirror_driver_output(&mut self, acc: Vec<Vec<Value>>) -> Result<Vec<Vec<Value>>, EvalErr> {
-        let JoinCursor { parts, mirror_left_width, above, cols, right_matched, lgate, .. } = self;
+        let JoinCursor { parts, mirror_left_width, above, cols, right_matched, lgate, mirror_hash, mirror_cand, .. } =
+            self;
         let pd = parts.last().expect("a mirror cursor has a last part");
         let (part, inner) = (&pd.part, &pd.inner);
         let mut out = Vec::new();
         for acc_row in acc {
             let mut matched = false;
-            for (ri, r) in inner.iter().enumerate() {
+            for &ri in mirror_candidates(mirror_hash.as_ref(), part.probe.as_ref(), &acc_row, inner.len(), mirror_cand) {
+                let r = &inner[ri];
                 let mut row = acc_row.clone();
                 row.extend(r.iter().cloned());
                 // `matches` answers false for UNKNOWN (a NULL key never
@@ -31119,6 +31323,9 @@ fn frozen_side_rows(
 /// Project a combined row into its output columns - one value per column, in
 /// output order. Shared by every [JoinCursor] phase.
 fn project_row(row: &[Value], cols: &[ProjCol]) -> Result<Vec<Value>, EvalErr> {
+    if cols.is_empty() {
+        return Ok(row.to_vec()); // a RAW cursor: the combined row itself
+    }
     let mut projected = Vec::with_capacity(cols.len());
     for c in cols {
         projected.push(c.value_of(row)?);
@@ -31147,19 +31354,41 @@ struct SortedCursor {
     rows: SortedRows,
     pending_err: Option<EvalErr>,
     done: bool,
+    /// a JOIN's output projection, applied to each COMBINED row as it
+    /// leaves the merge (a scan's rows are records the fetch site
+    /// projects; `None`)
+    project: Option<Vec<ProjCol>>,
 }
 
 impl SortedCursor {
     fn open(db: &Database, plan: &Plan, args: &[WireParam]) -> Option<SortedCursor> {
-        let Plan::Project { order_by, .. } = plan else { return None };
+        let (order_by, project) = match plan {
+            Plan::Project { order_by, .. } => (order_by, None),
+            // an ORDER BY over a JOIN: the raw join cursor's combined rows
+            // are the sort's input, the projection waits for the merge
+            Plan::Join { order_by, cols, .. } => (order_by, Some(cols.clone())),
+            _ => return None,
+        };
         if order_by.is_empty() {
             return None;
         }
-        let mut scan = StreamCursor::open_inner(db, plan, args, true)?;
+        enum Src {
+            Scan(StreamCursor),
+            Join(JoinCursor),
+        }
+        let mut src = if project.is_some() {
+            Src::Join(JoinCursor::open_inner(db, plan, args, true)?)
+        } else {
+            Src::Scan(StreamCursor::open_inner(db, plan, args, true)?)
+        };
         let mut sorter = spill_sorter(order_by);
         let mut pending_err = None;
         loop {
-            match scan.next_batch(db, 4096) {
+            let batch = match &mut src {
+                Src::Scan(c) => c.next_batch(db, 4096),
+                Src::Join(c) => c.next_batch(db, 4096),
+            };
+            match batch {
                 Ok((batch, done)) => {
                     for r in batch {
                         match decorate_for_sort(order_by, r) {
@@ -31199,7 +31428,8 @@ impl SortedCursor {
                 cursor.stats.0, cursor.stats.1, cursor.stats.2
             );
         }
-        Some(SortedCursor { rows: SortedRows { cursor, nk: order_by.len() }, pending_err, done: false })
+        drop(src); // the frozen image and the sides go with it; the runs stay
+        Some(SortedCursor { rows: SortedRows { cursor, nk: order_by.len() }, pending_err, done: false, project })
     }
 
     fn next_batch(&mut self, want: usize) -> Result<(Vec<Vec<Value>>, bool), EvalErr> {
@@ -31212,7 +31442,10 @@ impl SortedCursor {
         let mut out = Vec::with_capacity(want);
         while out.len() < want {
             match self.rows.next() {
-                Ok(Some(r)) => out.push(r),
+                Ok(Some(r)) => out.push(match &self.project {
+                    Some(cols) => project_row(&r, cols)?,
+                    None => r,
+                }),
                 Ok(None) => {
                     self.done = true;
                     return Ok((out, true));
@@ -31487,9 +31720,26 @@ fn join_step(
         None => Ok(true),
         Some(p) => p.matches(row),
     };
+    // a RIGHT/FULL part is handed its WHOLE side (the mirror needs it) -
+    // hashed by the ON's equi-key when it has one, so each accumulated
+    // row tries its bucket, not the side. LEFT/INNER arrive narrowed.
+    let rhash = if matches!(part.kind, JoinKind::Right | JoinKind::Full) {
+        part.probe.as_ref().and_then(|p| index_hash(rrows, p))
+    } else {
+        None
+    };
+    let mut cand: Vec<usize> = Vec::new();
     for l in &acc {
         let mut matched = false;
-        for (ri, r) in rrows.iter().enumerate() {
+        let ix: &[usize] = if rhash.is_some() {
+            mirror_candidates(rhash.as_ref(), part.probe.as_ref(), l, rrows.len(), &mut cand)
+        } else {
+            cand.clear();
+            cand.extend(0..rrows.len());
+            &cand
+        };
+        for &ri in ix {
+            let r = &rrows[ri];
             let mut row = l.clone();
             row.extend(r.iter().cloned());
             // `matches` answers false for UNKNOWN, which is what makes a
@@ -35153,7 +35403,16 @@ fn materialise_temp_blob(
     let charset = if sub_type == 1 { 4 } else { 0 };
     let recno = if tb.stream {
         let content: Vec<u8> = tb.segments.concat();
-        fire_crab_blb::create_stream_blob(work, db.page_size, rel, &content, sub_type, charset)?
+        fire_crab_blb::create_stream_blob_counted(
+            work,
+            db.page_size,
+            rel,
+            &content,
+            sub_type,
+            charset,
+            tb.puts,
+            usize::from(tb.max_put),
+        )?
     } else {
         fire_crab_blb::create_blob(work, db.page_size, rel, &tb.segments, sub_type, charset)?
     };
@@ -47154,136 +47413,38 @@ fn run_body_dml(
 // result. It costs one clone of the file per multi-row statement, which
 // is the cost model this server already runs on.
 
-/// The page image as it stands, to be restored if a statement fails.
-fn snapshot_db(database: &Option<Database>) -> Option<std::sync::Arc<fire_crab_ods::Image>> {
-    // A REFERENCE, NOT A COPY. A published image is never edited in
-    // place, so holding one keeps the file as it was however many
-    // installs follow - and taking the snapshot costs a refcount bump
-    // where it used to cost a copy of the whole database, once per
-    // transaction and once per savepoint.
-    database.as_ref().map(|d| d.bytes())
-}
 
-/// Put a snapshot back and flush it, undoing everything a failed
-/// statement wrote - EXCEPT the generators, whose settled values the
-/// matching [undo_window_unwind] writes forward over the restored image.
-/// That carve-out is the one exception to this server's "the image is
-/// the truth" isolation story, and every restore therefore sits between
-/// an [undo_window_push] and its unwind: the pair is what makes the
-/// carve-out as wide as the engine's law and no wider. See [GenWindow].
-///
-/// A CONNECTION THAT NEVER WROTE HAS NOTHING TO UNDO, and since the
-/// image is now shared it must not pretend otherwise: restoring a
-/// snapshot taken at transaction start would put back a whole file over
-/// ANOTHER attachment's committed rows. The write side ([Database::wrote])
-/// is what says whether this connection wrote, and it is held from the
-/// transaction's first write until here, so no other writer can have
-/// committed inside the window this restore covers.
-fn restore_db(database: &mut Option<Database>, snap: Option<std::sync::Arc<fire_crab_ods::Image>>) -> bool {
-    if let (Some(db), Some(bytes)) = (database.as_mut(), snap) {
-        if !db.wrote() {
-            return false;
-        }
-        // AN AUTONOMOUS TRANSACTION IS NOT UNDONE BY THE BODY AROUND IT.
-        // Its pages are written FORWARD over the image being put back -
-        // the same carve-out the generator windows have, for the same
-        // reason: the engine keeps what an autonomous transaction
-        // committed however the enclosing statement ends (probed - a
-        // block that logs a row and a body that then divides by zero
-        // leaves the row behind).
-        let bytes = if db.auto_pages.is_empty() {
-            bytes
-        } else {
-            let mut img = bytes.as_ref().clone();
-            for (page, data) in &db.auto_pages {
-                if *page as usize >= img.num_pages() {
-                    img.grow((*page as usize + 1) * db.page_size);
-                }
-                if let Some(p) = img.page_mut(*page) {
-                    let n = data.len().min(p.len());
-                    p[..n].copy_from_slice(&data[..n]);
-                }
-            }
-            std::sync::Arc::new(img)
-        };
-        // THE PAGES THAT DIFFER, not the file. Putting an image back
-        // is a write like any other, and the careful flush compares it
-        // against what is on the disk; `fs::write` of the whole image
-        // was O(database) for an undo of a few pages.
-        let flushed = db.shared.flushed();
-        let _ = flush_careful(&db.path, &flushed, &bytes, db.page_size);
-        db.install_flushed_image(bytes);
-        // the restored image carries the header and the TIP as they
-        // were, so the id this attachment reserved may no longer exist
-        db.retune_tx();
-        return true;
-    }
-    false
-}
 
-/// UNDO ONE WINDOW, and choose how: by TRANSACTION STATE when what it
-/// wrote were records - `tra_dead` on the id those records carry, which
-/// is two bits and touches nothing else - and by putting the IMAGE back
-/// when they were not.
-///
-/// The image is the fallback now rather than the rule, and only a
-/// SETTLED write needs it: a DDL statement commits its catalog rows as
-/// it writes them, so no transaction state can take them back
-/// ([Database::ddl_undo]).
-///
-/// Which matters beyond the cost, because an image restore has a hole
-/// that transaction state does not: the image was taken before the
+/// UNDO ONE WINDOW, by TRANSACTION STATE: `tra_dead` on the id the
+/// window's records carry, which is two bits and touches nothing else.
+/// A DDL statement's catalog rows carry the window's id too (the DDL
+/// arm writes them under it), so nothing in a window needs an image put
+/// back - and the image path this server once kept as a fallback is
+/// gone, which matters beyond the cost: an image restore had a hole
+/// that transaction state does not - the image was taken before the
 /// window's first write, and another attachment committing in between
 /// would be undone by putting it back. The state path cannot do that -
 /// it flips bits belonging to this transaction alone.
-fn undo_window(
-    database: &mut Option<Database>,
-    mark: usize,
-    base: Option<std::sync::Arc<fire_crab_ods::Image>>,
-) {
-    if database.as_ref().is_some_and(|d| d.ddl_undo) {
-        restore_db(database, base);
-    }
+fn undo_window(database: &mut Option<Database>, mark: usize) {
     // the ids die here, and the generator values are written forward
     // over whatever is left - see [undo_window_unwind]
     undo_window_unwind(database, mark, true);
 }
 
-/// Undo the transaction, and say how.
-///
-/// **A transaction that wrote only RECORDS is undone by its own
-/// transaction state**: `tra_dead` in the TIP, two bits, and every
-/// reader walks past its versions to the ones behind them. The rows
-/// stay on the pages, the index entries naming them stay in the trees,
-/// and the pages it allocated stay allocated - all of which is what the
-/// engine leaves behind too, and what its sweep collects.
-///
-/// The IMAGE is still what undoes anything else: a DDL statement,
-/// whose catalog rows are settled as they are written, and a
-/// ROLLBACK TO a mark, which asks a transaction to undo part of itself.
-/// Those transactions carry [Database::image_undo] and take the old
-/// path - restore the file the transaction started from.
+/// Undo the transaction: BY TRANSACTION STATE. `tra_dead` in the TIP,
+/// two bits, and every reader walks past its versions to the ones behind
+/// them. The rows stay on the pages, the index entries naming them stay
+/// in the trees, and the pages it allocated stay allocated - all of which
+/// is what the engine leaves behind too, and what its sweep collects. A
+/// DDL statement's catalog rows are the transaction's too (written under
+/// its id - see the DDL arm), so nothing needs an image put back; the
+/// image-restore path this server once had is gone.
 ///
 /// Returns the outcome for [end_transaction] and whether anything was
 /// undone at all (which the generator windows need: their values are
 /// written forward over whatever the rollback left).
-fn rollback_now(
-    database: &mut Option<Database>,
-    tx_snapshot: &mut Option<std::sync::Arc<fire_crab_ods::Image>>,
-) -> (TxEnd, bool) {
-    let by_image = database.as_ref().is_some_and(|d| d.ddl_undo);
+fn rollback_now(database: &Option<Database>) -> (TxEnd, bool) {
     let wrote = database.as_ref().is_some_and(|d| d.wrote());
-    if by_image {
-        let snap = tx_snapshot.take();
-        let undone = snap.is_some();
-        let put_back = restore_db(database, snap);
-        return (
-            if put_back { TxEnd::RolledBackImage } else { TxEnd::RollbackNoImage },
-            undone,
-        );
-    }
-    // nothing an image is needed for: the transaction state says it all
-    *tx_snapshot = None;
     (TxEnd::RollbackNoImage, wrote)
 }
 
@@ -47294,30 +47455,15 @@ fn dml_tx(stmt_tx: Option<u32>) -> Result<u32, String> {
     stmt_tx.ok_or_else(|| "no transaction reserved for a record write".to_string())
 }
 
-/// Let go of the database between requests, unless this transaction's
-/// undo needs the image it started from. The TRANSACTION is untouched -
-/// its id, its lock and its rows all stand; what goes back is only the
-/// right to be the one writing.
+/// Let go of the database between requests. The TRANSACTION is
+/// untouched - its id, its lock and its rows all stand; what goes back
+/// is only the right to be the one writing.
 fn release_write_side(database: &mut Option<Database>) {
     if let Some(db) = database.as_mut() {
-        if !db.image_undo {
-            db.write = None;
-        }
+        db.write = None;
     }
 }
 
-/// The transaction ended - COMMIT or ROLLBACK, statement or wire op -
-/// so the database's write side goes back and the next writer gets in.
-///
-/// It is held from the transaction's FIRST WRITE (see
-/// [Database::work_copy]) and not one statement at a time, because a
-/// rollback in this server restores a whole-image snapshot taken at
-/// transaction start: another connection committing inside that window
-/// would be undone by it. Holding the write side across the window is
-/// what makes the snapshot mean what it says.
-///
-/// Every caller sits AFTER the generator windows have been written
-/// forward, since that write needs the write side too.
 /// What a RETAINING commit or rollback keeps across the end of the
 /// transaction's work (tra.cpp retain_context): the snapshot, the ids
 /// about to be committed (they count for this transaction ahead of the
@@ -47432,7 +47578,6 @@ fn end_transaction(database: &mut Option<Database>, outcome: TxEnd) {
         // the image is back, and the generator windows have written
         // their values forward over it - that is dirty state nothing
         // else will write
-        TxEnd::RolledBackImage => db.flush_dirty(),
         TxEnd::RollbackNoImage => db.kill_tx(),
     };
     if let Err(e) = r {
@@ -47447,8 +47592,6 @@ fn end_transaction(database: &mut Option<Database>, outcome: TxEnd) {
 #[derive(Clone, Copy)]
 enum TxEnd {
     Commit,
-    /// rolled back by restoring the image the transaction started from
-    RolledBackImage,
     /// rolled back with no image to restore
     RollbackNoImage,
 }
@@ -47472,8 +47615,8 @@ enum TxEnd {
 ///
 /// The generator values the failed rows drew are NOT undone with them:
 /// the engine BURNS an advance through statement undo, savepoint undo
-/// and ROLLBACK alike, and [restore_db] carries them over the restored
-/// image. See [burn_generator].
+/// and ROLLBACK alike, and the generator windows write them forward over
+/// whatever the undo left. See [burn_generator].
 fn insert_select(
     table: &str,
     cols: &[String],
@@ -47519,8 +47662,7 @@ fn insert_select(
         })
         .collect();
 
-    let snap = snapshot_db(database);
-    let mark = undo_window_push(database, WindowKind::Nested, snap.clone());
+    let mark = undo_window_push(database, WindowKind::Nested);
     let mut n = 0i32;
     for row in rows {
         let step = (|| -> Result<(), ExecErr> {
@@ -47576,7 +47718,7 @@ fn insert_select(
             Ok(())
         })();
         if let Err(e) = step {
-            undo_window(database, mark, snap);
+            undo_window(database, mark);
             return Err(e);
         }
         n += 1;
@@ -48046,8 +48188,7 @@ fn merge_exec(
         }
     }
     // PHASE 2 - THE ACTIONS, all or nothing
-    let snap = snapshot_db(database);
-    let mark = undo_window_push(database, WindowKind::Nested, snap.clone());
+    let mark = undo_window_push(database, WindowKind::Nested);
     let (mut ins, mut upd, mut del) = (0i32, 0i32, 0i32);
     // the BY SOURCE branches name the target alone; the source's
     // columns are all NULL there (RETURNING S.X answers NULL, probed)
@@ -48084,7 +48225,7 @@ fn merge_exec(
             Ok(())
         })();
         if let Err(e) = step {
-            undo_window(database, mark, snap);
+            undo_window(database, mark);
             return Err(e);
         }
     }
@@ -48177,7 +48318,7 @@ fn merge_exec(
             Ok(())
         })();
         if let Err(e) = step {
-            undo_window(database, mark, snap);
+            undo_window(database, mark);
             return Err(e);
         }
     }
@@ -48923,10 +49064,9 @@ fn exec_psql_stmt_inner(
 ///     its walk at an autonomous window);
 ///   * what the block COMMITTED survives the failure of the body around
 ///     it - because that failure kills the id THE BODY wrote under and
-///     the block's rows carry a different one. Only a body whose undo
-///     is an IMAGE still needs the page carve-out
-///     ([Database::auto_pages]), and that is now the exception rather
-///     than the rule;
+///     the block's rows carry a different one (every undo is by
+///     transaction state now; the page carve-out an image undo needed
+///     is gone with it);
 ///   * an error inside the block ROLLS IT BACK and then escapes, so the
 ///     caller may catch it and nothing the block wrote remains.
 ///
@@ -48935,11 +49075,7 @@ fn exec_psql_stmt_inner(
 /// refuse: a body that had ALREADY WRITTEN before the block (its writes
 /// have a nested id to kill now), and a BLOCK INSIDE A BLOCK (each
 /// frame ends itself, and the inner one's rows are not the outer one's
-/// to keep or lose). What is still refused is the two of them meeting
-/// an IMAGE: if the transaction has done DDL, the enclosing undo puts
-/// the image back and the carve-out would carry the body's own rows
-/// forward with the autonomous ones - a failed statement's rows, still
-/// visible to its transaction.
+/// to keep or lose).
 fn run_autonomous(
     f: &mut PsqlFrame,
     steps: &mut u32,
@@ -48959,16 +49095,7 @@ fn run_autonomous(
     }
     // OPEN IT: a fresh id, ACTIVE in the TIP, installed so the reads
     // inside the block see a file that has it.
-    //
-    // THE CARVE-OUT'S BASELINE IS TAKEN HERE, BEFORE THE RESERVATION,
-    // and that is not a detail: the id costs a HEADER write
-    // (`hdr_next_transaction`) and a TIP write, and a carve-out that
-    // starts after them carries the rows forward while letting the
-    // header go back - so the NEXT autonomous block reserves the same
-    // id, marks it dead when it fails, and the row that was committed
-    // silently stops counting. Measured exactly that way.
-    let before = db.as_ref().map(|d| d.bytes()).ok_or(PsqlStop::Unsupported)?;
-    let mark = undo_window_push(db, WindowKind::Autonomous, Some(std::sync::Arc::clone(&before)));
+    let mark = undo_window_push(db, WindowKind::Autonomous);
     // OPENING IT CAN FAIL, and the window must not outlive the attempt:
     // an autonomous window left on the stack would stop every later read
     // in this transaction from counting the transaction's own rows.
@@ -49056,24 +49183,7 @@ fn run_autonomous(
     if std::env::var("FC_SRV_TRACE").is_ok() {
         eprintln!("[srv] autonomous transaction {} {:?} (ids {:?})", tx, state, ids);
     }
-    // THE CARVE-OUT, and only for a commit: a dead transaction's pages
-    // have nothing an enclosing undo must keep.
     if outcome.is_ok() {
-        let after = d.bytes();
-        let mut changed = std::collections::HashMap::new();
-        for p in 0..after.num_pages() as u32 {
-            let new = after.page(p).unwrap_or(&[]);
-            let old = before.page(p).unwrap_or(&[]);
-            if new != old {
-                changed.insert(p, new.to_vec());
-            }
-        }
-        if std::env::var("FC_SRV_TRACE").is_ok() {
-            eprintln!("[srv] autonomous carve-out: {} pages", changed.len());
-        }
-        for (p, bytes) in changed {
-            d.auto_pages.insert(p, bytes);
-        }
         // remember what this block committed: the transaction around it
         // must never see these rows, even in a later statement whose view
         // has moved past their ids (see [Database::view_snapshot])
@@ -49577,12 +49687,11 @@ fn run_body_source(
     // a statement that fails partway undoes everything the body wrote
     // before it, as the engine does - by killing the id those rows
     // carry, since they were installed statement by statement.
-    let snap = snapshot_db(database);
-    let mark = undo_window_push(database, WindowKind::Nested, snap.clone());
+    let mark = undo_window_push(database, WindowKind::Nested);
     let mut steps = 0u32;
     let outcome = exec_psql_stmt(&body, &mut frame, &mut steps, database, ctx);
     if outcome.is_err() {
-        undo_window(database, mark, snap);
+        undo_window(database, mark);
     } else {
         undo_window_unwind(database, mark, false);
     }
@@ -52026,18 +52135,11 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
     // The five locals above are the LIVE statement's working set;
     // every other open statement's set is parked here. `cur_stmt` says
     // which handle the locals currently belong to. See StmtSlot.
-    // TRANSACTION ROLLBACK. This server writes each statement straight
-    // into the file, so undoing a whole transaction means putting back
-    // the image as it stood when the transaction began: op_transaction
-    // takes the snapshot, op_rollback restores it, op_commit drops it.
-    // One clone per transaction - the same cost model statement-level
-    // rollback already runs on.
-    let mut tx_snapshot: Option<std::sync::Arc<fire_crab_ods::Image>> = None;
-    // Named marks inside the transaction, oldest first: the image as it
-    // stood when each mark was made. ROLLBACK TO puts that image back and
+    // Named marks inside the transaction, oldest first. ROLLBACK TO kills
+    // the window's ids and
     // KEEPS the mark; RELEASE forgets the mark but keeps the work. Both
     // discard the marks made AFTER the named one.
-    let mut savepoints: Vec<(String, std::sync::Arc<fire_crab_ods::Image>)> = Vec::new();
+    let mut savepoints: Vec<String> = Vec::new();
     // TWO-PHASE COMMIT state: this connection's transaction has been
     // PREPARED (limbo on disk; only commit/rollback may follow), or
     // this connection RECONNECTED somebody else's limbo id to resolve
@@ -52084,7 +52186,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
     // open blobs: handle -> (assembled content, read cursor). Content is
     // assembled at open (the whole file is in memory anyway); get_segment
     // then just slices it.
-    let mut blobs: std::collections::HashMap<i32, (Vec<u8>, usize)> = std::collections::HashMap::new();
+    let mut blobs: std::collections::HashMap<i32, ReadBlob> = std::collections::HashMap::new();
     // handles open FOR WRITING: handle -> temp blob id (see Database::temp_blobs)
     let mut write_blobs: std::collections::HashMap<i32, u32> = std::collections::HashMap::new();
     let mut next_blob_handle: i32 = 7000;
@@ -52139,9 +52241,6 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
         //
         // It costs a refcount bump, which is the other reason snapshots
         // stopped being copies.
-        if database.as_ref().is_some_and(|d| !d.image_undo) {
-            tx_snapshot = snapshot_db(&database);
-        }
         let op = match read_int(&mut s, &mut dec) {
             Ok(o) => o,
             Err(_) => break,
@@ -52179,10 +52278,6 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 break;
             }
             x if x == OP_TRANSACTION => {
-                // the image as the transaction found it
-                if tx_snapshot.is_none() {
-                    tx_snapshot = snapshot_db(&database);
-                }
                 read_int(&mut s, &mut dec)?; // db handle
                 let tpb = read_wire_bytes(&mut s, &mut dec)?;
                 // ISOLATION: the engine's (and isql's) default is
@@ -52788,7 +52883,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     // materialises the query's rows and re-enters per
                     // row, so bare and RETURNING forms share one path.
                     if let Plan::Savepoint { kind, name } = &*plan {
-                        let pos = savepoints.iter().position(|(n, _)| n.eq_ignore_ascii_case(name));
+                        let pos = savepoints.iter().position(|n| n.eq_ignore_ascii_case(name));
                         if std::env::var("FC_SRV_TRACE").is_ok() {
                             eprintln!("[srv] savepoint op on {:?}, known={:?}", name, pos);
                         }
@@ -52807,48 +52902,22 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                                     savepoints.remove(i);
                                     undo_window_collapse(&mut database, i + 1);
                                 }
-                                match snapshot_db(&database) {
-                                    Some(img) => {
-                                        // A MARK IS A TRANSACTION: the
-                                        // rows written after it carry
-                                        // an id of their own and
-                                        // ROLLBACK TO kills it. The
-                                        // image is kept as the fallback
-                                        // for a transaction that has
-                                        // done DDL, and the write side
-                                        // is held while it could still
-                                        // be put back.
-                                        savepoints.push((name.clone(), std::sync::Arc::clone(&img)));
-                                        undo_window_push(
-                                            &mut database,
-                                            WindowKind::Nested,
-                                            Some(img),
-                                        );
-                                        true
-                                    }
-                                    None => false,
-                                }
+                                // A MARK IS A TRANSACTION: the rows
+                                // written after it carry an id of their
+                                // own and ROLLBACK TO kills it
+                                savepoints.push(name.clone());
+                                undo_window_push(&mut database, WindowKind::Nested);
+                                true
                             }
                             SavepointOp::RollbackTo => match pos {
                                 Some(i) => {
-                                    let img = savepoints[i].1.clone();
                                     savepoints.truncate(i + 1);
-                                    undo_window(
-                                        &mut database,
-                                        i + 1,
-                                        Some(std::sync::Arc::clone(&img)),
-                                    );
+                                    undo_window(&mut database, i + 1);
                                     // ROLLBACK TO KEEPS THE MARK, so the
-                                    // window it names reopens empty -
-                                    // with the MARK's image, not the
-                                    // current one, because a second
-                                    // ROLLBACK TO the same mark must go
-                                    // back to the same place
-                                    undo_window_push(
-                                        &mut database,
-                                        WindowKind::Nested,
-                                        Some(img),
-                                    );
+                                    // window it names reopens empty: a
+                                    // second ROLLBACK TO the same mark
+                                    // kills what the reopened window wrote
+                                    undo_window_push(&mut database, WindowKind::Nested);
                                     true
                                 }
                                 None => false,
@@ -52882,7 +52951,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                         savepoints.clear();
                         let kept = if *retain { Some(retain_begin(&database)) } else { None };
                         let outcome = if *rollback {
-                            let (outcome, undone) = rollback_now(&mut database, &mut tx_snapshot);
+                            let (outcome, undone) = rollback_now(&database);
                             // the transaction is window 0, so the whole
                             // stack unwinds against the image the
                             // rollback left behind
@@ -52897,7 +52966,6 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                             // BEFORE the snapshot: what commits is the
                             // image with the cache applied
                             commit_gen_dfw(&mut database);
-                            tx_snapshot = snapshot_db(&database);
                             reset_gen_windows(&mut database);
                             TxEnd::Commit
                         };
@@ -53373,11 +53441,22 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                                     (c.next_batch(db, want as usize), cols, false)
                                 }
                                 RowCursor::Sorted(c) => {
-                                    let cols = match &*plan {
-                                        Plan::Project { cols, .. } => cols.clone(),
-                                        _ => Vec::new(),
+                                    // a sorted SCAN hands back records the
+                                    // plan's columns project; a sorted JOIN
+                                    // hands back projected rows, positional
+                                    // (and is kept on done, as a join is)
+                                    let (cols, keep) = match &*plan {
+                                        Plan::Project { cols, .. } => (cols.clone(), false),
+                                        _ => (
+                                            output_cols_of(&*plan)
+                                                .iter()
+                                                .enumerate()
+                                                .map(|(i, c)| ProjCol { field_id: i, expr: None, ..c.clone() })
+                                                .collect(),
+                                            true,
+                                        ),
                                     };
-                                    (c.next_batch(want as usize), cols, false)
+                                    (c.next_batch(want as usize), cols, keep)
                                 }
                                 RowCursor::Join(c) => {
                                     let cols = output_cols_of(&*plan)
@@ -53929,7 +54008,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 savepoints.clear();
                 let kept = if retain { Some(retain_begin(&database)) } else { None };
                 let outcome = if rollback {
-                    let (outcome, undone) = rollback_now(&mut database, &mut tx_snapshot);
+                    let (outcome, undone) = rollback_now(&database);
                     undo_window_unwind(&mut database, 0, undone);
                     reset_gen_windows(&mut database);
                     if undone && std::env::var("FC_SRV_TRACE").is_ok() {
@@ -53940,7 +54019,6 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     // committed: this image is the new starting point,
                     // with the surviving generator postings applied first
                     commit_gen_dfw(&mut database);
-                    tx_snapshot = snapshot_db(&database);
                     reset_gen_windows(&mut database);
                     TxEnd::Commit
                 };
@@ -53968,6 +54046,9 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 // isc_bpb_type (1) = 1 is a STREAM blob (blb.cpp:331); the
                 // rest of the bpb (source/target type, charsets) is not read
                 let stream = bpb_stream_type(&bpb);
+                if std::env::var("FC_SRV_TRACE").is_ok() {
+                    eprintln!("[srv] create blob bpb {:?} stream={}", bpb, stream);
+                }
                 match database.as_mut() {
                     Some(db) => {
                         db.next_temp_blob += 1;
@@ -54045,26 +54126,42 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 let content = if rel == 0 {
                     database.as_ref().map(|db| {
                         if num == 0 {
-                            Vec::new()
+                            ReadBlob::empty()
                         } else {
-                            db.temp_blobs.get(&(num as u32)).map(|tb| tb.segments.concat()).unwrap_or_default()
+                            db.temp_blobs.get(&(num as u32)).map(ReadBlob::of_temp).unwrap_or_else(ReadBlob::empty)
                         }
                     })
                 } else {
                     database.as_ref().and_then(|db| {
-                        fire_crab_blb::read_blob_content(&db.bytes(), db.page_size, rel, num)
+                        fire_crab_blb::read_blob(&db.bytes(), db.page_size, rel, num).ok().map(|b| {
+                            let stream = b.header.is_stream();
+                            let segs = if stream {
+                                vec![b.content()]
+                            } else {
+                                b.segments().map(|s| s.to_vec()).collect()
+                            };
+                            ReadBlob {
+                                segs,
+                                stream,
+                                count: b.header.count,
+                                max_segment: b.header.max_segment,
+                                length: b.header.length,
+                                idx: 0,
+                                off: 0,
+                            }
+                        })
                     })
                 };
                 match content {
-                    Some(data) => {
+                    Some(rb) => {
                         next_blob_handle += 1;
                         if std::env::var("FC_SRV_TRACE").is_ok() {
                             eprintln!(
-                                "[srv] open blob {}:{} -> handle {} ({} bytes)",
-                                rel, num, next_blob_handle, data.len()
+                                "[srv] open blob {}:{} -> handle {} ({} bytes, {} segments, stream={})",
+                                rel, num, next_blob_handle, rb.length, rb.count, rb.stream
                             );
                         }
-                        blobs.insert(next_blob_handle, (data, 0));
+                        blobs.insert(next_blob_handle, rb);
                         respond(&mut s, &mut enc, next_blob_handle)?;
                     }
                     None => respond_error(&mut s, &mut enc, GDS_BAD_BLOB_ID)?,
@@ -54075,19 +54172,11 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 let buf_len = read_int(&mut s, &mut dec)?.max(4) as usize;
                 read_int(&mut s, &mut dec)?; // p_sgmt_length, unused here
                 match blobs.get_mut(&handle) {
-                    Some((data, cursor)) => {
-                        // one [u16 LE length][bytes] segment per response,
-                        // sized to the client's buffer; resp_object = 2
-                        // signals blob EOF (server.cpp get_segment)
-                        let remaining = data.len() - *cursor;
-                        let chunk = remaining.min(buf_len - 2).min(u16::MAX as usize);
-                        let mut seg = Vec::with_capacity(chunk + 2);
-                        if chunk > 0 {
-                            seg.extend_from_slice(&(chunk as u16).to_le_bytes());
-                            seg.extend_from_slice(&data[*cursor..*cursor + chunk]);
-                            *cursor += chunk;
-                        }
-                        let object = if *cursor >= data.len() { 2 } else { 0 };
+                    Some(rb) => {
+                        // [u16 LE length][bytes]* packed to the client's
+                        // buffer; resp_object 2 = EOF, 1 = a partial
+                        // segment (server.cpp get_segment)
+                        let (seg, object) = rb.next_response(buf_len);
                         let mut w = W::default();
                         w.int(OP_RESPONSE)
                             .int(object)
@@ -54097,6 +54186,52 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                             .int(0); // clean status
                         w.send(&mut s, &mut enc)?;
                     }
+                    None => respond_error(&mut s, &mut enc, GDS_BAD_BLOB_ID)?,
+                }
+            }
+            x if x == OP_INFO_BLOB => {
+                // p_info: handle, incarnation, items, buffer length - on a
+                // read handle or a write handle (the blob being put)
+                let handle = read_int(&mut s, &mut dec)?;
+                read_int(&mut s, &mut dec)?;
+                let items = read_wire_bytes(&mut s, &mut dec)?;
+                let buf_len = read_int(&mut s, &mut dec)?.max(0) as usize;
+                let writing = write_blobs
+                    .get(&handle)
+                    .and_then(|t| database.as_ref().and_then(|db| db.temp_blobs.get(t)))
+                    .map(ReadBlob::of_temp);
+                match blobs.get(&handle).or(writing.as_ref()) {
+                    Some(rb) => {
+                        let info = rb.info(&items, buf_len);
+                        if std::env::var("FC_SRV_TRACE").is_ok() {
+                            eprintln!("[srv] info blob handle {} items {:?} -> {:?}", handle, items, info);
+                        }
+                        let mut w = W::default();
+                        w.int(OP_RESPONSE).int(0).int(0).int(0).bytes(&info).int(0);
+                        w.send(&mut s, &mut enc)?;
+                    }
+                    None => respond_error(&mut s, &mut enc, GDS_BAD_BLOB_ID)?,
+                }
+            }
+            x if x == OP_SEEK_BLOB => {
+                // p_seek: handle, mode (0 start, 1 current, 2 end), offset;
+                // the new position answers in p_resp_blob_id's low word
+                // (server.cpp seek_blob)
+                let handle = read_int(&mut s, &mut dec)?;
+                let mode = read_int(&mut s, &mut dec)?;
+                let offset = read_int(&mut s, &mut dec)?;
+                match blobs.get_mut(&handle) {
+                    Some(rb) => match rb.seek(mode, i64::from(offset)) {
+                        Ok(pos) => {
+                            if std::env::var("FC_SRV_TRACE").is_ok() {
+                                eprintln!("[srv] seek blob handle {} mode {} offset {} -> {}", handle, mode, offset, pos);
+                            }
+                            let mut w = W::default();
+                            w.int(OP_RESPONSE).int(0).int(0).int(pos as i32).bytes(&[]).int(0);
+                            w.send(&mut s, &mut enc)?;
+                        }
+                        Err(code) => respond_error(&mut s, &mut enc, code)?,
+                    },
                     None => respond_error(&mut s, &mut enc, GDS_BAD_BLOB_ID)?,
                 }
             }
@@ -56004,7 +56139,6 @@ mod tests {
             shared: fire_crab_cch::pool::detached(Vec::new()),
             write: None,
             tx: None,
-            auto_pages: std::collections::HashMap::new(),
         gen_cache: std::collections::HashMap::new(),
         temp_blobs: std::collections::HashMap::new(),
         next_temp_blob: 0,
@@ -56015,8 +56149,6 @@ mod tests {
             stmts: Default::default(),
             locks: crate::dblocks::for_path("/nonexistent/fc-rowsource-test"),
             lock_owner: 0,
-            image_undo: false,
-            ddl_undo: false,
             did_ddl: false,
             ddl_deferred: Vec::new(),
             attachments: {
@@ -57629,6 +57761,11 @@ mod tests {
         assert_eq!(parse_param_blr(&blr4), Some(vec![PSlot::Varying]));
         // blr_quad (a blob id, node's SQLParamQuad) binds as 8 raw bytes
         assert_eq!(parse_param_blr(&[5u8, 2, 4, 0, 2, 0, 9, 0, 7, 0, 255, 76]), Some(vec![PSlot::Quad]));
+        // blr_blob2 (libfbclient's SQL_BLOB): sub_type and charset words
+        assert_eq!(
+            parse_param_blr(&[5u8, 2, 4, 0, 4, 0, 17, 0, 0, 0, 0, 7, 0, 17, 1, 0, 4, 0, 7, 0, 255, 76]),
+            Some(vec![PSlot::Quad, PSlot::Quad])
+        );
         // an undecodable dtype (blr_int128 = 26) still refuses the whole BLR
         assert!(parse_param_blr(&[5u8, 2, 4, 0, 2, 0, 26, 0, 7, 0, 255, 76]).is_none());
         // odd field count is not pairs
@@ -58942,7 +59079,6 @@ mod tests {
             shared: fire_crab_cch::pool::detached(Vec::new()),
             write: None,
             tx: None,
-            auto_pages: std::collections::HashMap::new(),
         gen_cache: std::collections::HashMap::new(),
         temp_blobs: std::collections::HashMap::new(),
         next_temp_blob: 0,
@@ -58953,8 +59089,6 @@ mod tests {
             stmts: Default::default(),
             locks: crate::dblocks::for_path("/nonexistent/fc-rowsource-test"),
             lock_owner: 0,
-            image_undo: false,
-            ddl_undo: false,
             did_ddl: false,
             ddl_deferred: Vec::new(),
             attachments: {
@@ -65136,7 +65270,6 @@ mod tests {
             shared: fire_crab_cch::pool::detached(Vec::new()),
             write: None,
             tx: None,
-            auto_pages: std::collections::HashMap::new(),
         gen_cache: std::collections::HashMap::new(),
         temp_blobs: std::collections::HashMap::new(),
         next_temp_blob: 0,
@@ -65147,8 +65280,6 @@ mod tests {
             stmts: Default::default(),
             locks: crate::dblocks::for_path(tag),
             lock_owner: 0,
-            image_undo: false,
-            ddl_undo: false,
             did_ddl: false,
             ddl_deferred: Vec::new(),
             attachments: {

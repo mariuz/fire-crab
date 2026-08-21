@@ -323,25 +323,20 @@ ROLLBACK;"
 
 # --- 8. TEETH ------------------------------------------------------------
 # Both servers are compared, so a shared refusal reads as agreement. The
-# log must show the transactions this server opened and committed, and
-# the carve-out that keeps them.
+# log must show the transactions this server opened and committed (what
+# a block committed survives the body's failure by TRANSACTION STATE:
+# the body's undo kills the id the body wrote under, never the block's -
+# the page carve-out an image undo once needed is gone, 2026-08-21).
 opened=$(grep -c "autonomous transaction .* opened" "$LOG")
 committed=$(grep -c "autonomous transaction .* Committed" "$LOG")
 dead=$(grep -c "autonomous transaction .* Dead" "$LOG")
-carved=$(grep -c "autonomous carve-out" "$LOG")
 ran=$((ran + 1))
 if [ "$opened" -ge 8 ] && [ "$committed" -ge 6 ] && [ "$dead" -ge 2 ]; then
     echo "OK   teeth: $opened opened, $committed committed, $dead rolled back"
 else
     echo "DIFF teeth: opened=$opened committed=$committed dead=$dead"; fail=1
 fi
-ran=$((ran + 1))
-if [ "$carved" -ge 6 ]; then
-    echo "OK   teeth: $carved commits carved out of the enclosing undo"
-else
-    echo "DIFF teeth: only $carved carve-outs"; fail=1
-fi
-# and the row that proves the carve-out did its job cannot come from
+# and the row that proves the block's commit survived cannot come from
 # anywhere else: the body FAILED, and every other row it would have
 # written is gone
 ran=$((ran + 1))

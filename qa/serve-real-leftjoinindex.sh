@@ -512,13 +512,15 @@ join_indexed "self-join on the PK drives the inner index" \
     "SELECT COUNT(*) FROM PAR A JOIN PAR B ON B.K = A.K" 1
 # --- and the kinds that still SCAN their inner -------------------------
 # A comma join carries its key in the WHERE, not an ON, so no probe is
-# built (the key never reaches `build_join_probe`); RIGHT and FULL decline
-# because their mirror needs the whole other side, not one keyed lookup.
+# built (the key never reaches `build_join_probe`). RIGHT and FULL never
+# take an INDEX - their mirror needs the whole other side materialised -
+# but since 2026-08-21 that side is HASHED by the ON's key by row, so
+# each driver row tries its bucket rather than the side.
 join_natural "comma join: key in the WHERE, no ON probe" \
     "SELECT COUNT(*) FROM CHI, PAR WHERE PAR.K = CHI.K"
-join_natural "RIGHT join: the mirror needs the whole other side" \
+join_hashed "RIGHT join: the whole other side, hashed by the key" \
     "SELECT COUNT(*) FROM CHI RIGHT JOIN PAR ON PAR.K = CHI.K"
-join_natural "FULL join: two loops, one each direction" \
+join_hashed "FULL join: two loops, one each direction, the side hashed" \
     "SELECT COUNT(*) FROM CHI FULL JOIN PAR ON PAR.K = CHI.K"
 
 # --- 7. THE MOVED-KEY CASES --------------------------------------------
@@ -665,8 +667,8 @@ else
     fail=1
 fi
 ran=$((ran + 1))
-if [ "$(grep -c 'join natural:' "$LOG2" 2>/dev/null || true)" -gt 0 ]; then
-    echo "OK   ... and it still traced its natural inner sides"
+if [ "$(grep -c 'join natural:\|join hash:' "$LOG2" 2>/dev/null || true)" -gt 0 ]; then
+    echo "OK   ... and it still traced its inner sides (natural or hashed, never indexed)"
 else
     echo "DIFF the scan-only server traced nothing - its zero above is blindness, not proof"
     fail=1
