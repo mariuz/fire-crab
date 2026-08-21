@@ -577,8 +577,21 @@ pointer-page and TIP page numbers is the next step when it dominates.
   text) are not mirrored; a text-blob DOMAIN's charset does not reach the
   descriptor; NOT NULL through expressions / join sides still describes
   nullable.
-- **NEXT**: CAST(<blob> AS VARCHAR) (blob reads inside the expression
-  engine); NOT NULL describe through expressions and INNER JOIN sides;
+- **CAST(<blob> AS …) DONE (2026-08-21, `serve-real-blobcast` 21):** the
+  evaluator carries no database, so the connection loop arms a per-op
+  image (`BLOB_CTX`, an Arc clone) and `Expr::BlobText(fid)` —
+  produced when a CAST's operand is a plain BLOB column — materialises
+  the blob at evaluation: text and binary blobs cast to their bytes, the
+  text truncation vector when they do not fit, `isc_nofilter(st, 1)` for
+  a user sub_type, a numeric target converts the text; works in WHERE /
+  UPPER / LIKE / `||` / ORDER BY, and `expr_reads` decodes the blob
+  column only when read. **Boundaries:** `<blob> || 'x'` (a BLOB
+  result), CHAR_LENGTH(<blob>) and `WHERE <blob> = 'x'` without a CAST
+  stay refused; a temp blob of the running transaction is not readable
+  by an expression; CAST(x AS CHAR(n)) describes 448 on fc for ANY
+  operand (the engine 452) — the fixed-text wire form is its own slice.
+- **NEXT**: NOT NULL describe through expressions and INNER JOIN sides;
+  the CHAR (452) describe/wire form for CAST AS CHAR and CHAR columns;
   the `A`/`B`/`C`/`E` items above. (Full sweep 2026-08-21 after the UPDATE-format change: 259 gates, 8246 checks, 0 DIFF. MERGE `RETURNING` / `NOT MATCHED BY SOURCE`, `op_info_blob`
   / `op_seek_blob`, the ordered JOIN fetch streaming, the RIGHT/FULL
   hash, the bulk index build, the cleanup — all done 2026-08-21.)

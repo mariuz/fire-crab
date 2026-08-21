@@ -9426,6 +9426,7 @@ fn expr_has_col(e: &Expr) -> bool {
 fn expr_reads(e: &Expr, f: &dyn Fn(usize) -> bool) -> bool {
     match e {
         Expr::Col(fid) => f(*fid),
+        Expr::BlobText(fid) => f(*fid),
         Expr::GenVal(_) => true,
         // the per-row coercion wrappers read whatever they wrap - a
         // wrapped COLUMN must keep its term row-DEPENDENT, or the
@@ -37420,6 +37421,47 @@ fn bpb_conversion(bpb: &[u8]) -> (Option<i32>, Option<i32>) {
     (from, to)
 }
 
+thread_local! {
+    /// The database image a statement's expressions may read BLOBS from -
+    /// armed at the top of every op by the connection loop (an Arc clone
+    /// of the attachment's current image), so `Expr::BlobText` can
+    /// materialise a blob without the evaluator carrying a database.
+    static BLOB_CTX: std::cell::RefCell<Option<(std::sync::Arc<fire_crab_ods::Image>, usize)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// `CAST(<blob column> AS VARCHAR/CHAR)`: the field id when the operand
+/// is a plain BLOB column and the target is text (probed: a text or
+/// binary blob casts to its bytes; the cast to a number is the
+/// conversion error of the text, which the text path then raises).
+fn blob_col_cast(inner: &RawExpr, t: &CastTarget, columns: &[RelationColumn], descs: &[Descriptor]) -> Option<usize> {
+    let RawExpr::Col(name) = inner else { return None };
+    let _ = t; // every target: text directly, a number through the text's conversion
+    let rc = columns.iter().find(|c| c.name.eq_ignore_ascii_case(name))?;
+    let fid = rc.field_id as usize;
+    (descs.get(fid)?.dtype == dtype::BLOB).then_some(fid)
+}
+
+/// Read a stored blob's bytes for an expression: the text of
+/// `CAST(<blob> AS VARCHAR)`. A temp blob (relation 0) of this very
+/// transaction is not reachable here; a user sub_type (not 0 / 1) has
+/// no filter to TEXT - the engine's isc_nofilter(sub_type, 1).
+fn blob_text_of(rel: u16, num: u64) -> Result<String, EvalErr> {
+    let ctx = BLOB_CTX.with(|c| c.borrow().clone());
+    let Some((image, page_size)) = ctx else {
+        return Err(EvalErr::Unsupported);
+    };
+    if rel == 0 {
+        return Err(EvalErr::Unsupported);
+    }
+    let b = fire_crab_blb::read_blob(&image, page_size, rel, num).map_err(|_| EvalErr::Unsupported)?;
+    let st = b.header.sub_type as i16 as i32;
+    if !matches!(st, 0 | 1) {
+        return Err(EvalErr::NoFilter(st, 1));
+    }
+    Ok(String::from_utf8_lossy(&b.content()).into_owned())
+}
+
 fn store_blob_literal(
     db: &mut Database,
     work: &mut fire_crab_ods::Image,
@@ -40426,7 +40468,9 @@ fn resolve_proj_expr(
                 set(sink, *i, cast_target_descriptor(t)?);
                 Expr::Cast(Box::new(Expr::Param(*i)), *t, fire_crab_ods::intl::CS_UTF8)
             } else {
-                {
+                if let Some(fid) = blob_col_cast(inner, t, columns, descs) {
+                    Expr::Cast(Box::new(Expr::BlobText(fid)), *t, fire_crab_ods::intl::CS_UTF8)
+                } else {
                     let e = resolve_proj_expr(inner, columns, descs, sink)?;
                     let cs = err_spell_charset(&e, descs);
                     Expr::Cast(Box::new(e), *t, cs)
@@ -40527,6 +40571,9 @@ fn resolve_expr_inner(
             Box::new(resolve_expr(b, columns, descs)?),
         ),
         RawExpr::Cast(e, t) => {
+            if let Some(fid) = blob_col_cast(e, t, columns, descs) {
+                return Some(Expr::Cast(Box::new(Expr::BlobText(fid)), *t, fire_crab_ods::intl::CS_UTF8));
+            }
             let inner = resolve_expr(e, columns, descs)?;
             let cs = err_spell_charset(&inner, descs);
             Expr::Cast(Box::new(inner), *t, cs)
@@ -40659,6 +40706,11 @@ fn resolve_expr_inner(
 /// operand propagates (SQL three-valued arithmetic).
 #[derive(Clone)]
 enum Expr {
+    /// a BLOB column read as TEXT - `CAST(<blob> AS VARCHAR/CHAR)`: the
+    /// blob's bytes, fetched through the statement's [BLOB_CTX] at
+    /// evaluation (the evaluator itself holds no database); a user
+    /// sub_type has no filter to text (isc_nofilter)
+    BlobText(usize),
     /// a scale-0 integer column, by field id
     Col(usize),
     /// a `?` parameter in a projection, by input-SQLDA index. It carries
@@ -42615,6 +42667,7 @@ impl Expr {
     /// then falls back rather than answering wrong).
     fn type_of(&self, descs: &[Descriptor]) -> Option<ExprType> {
         match self {
+            Expr::BlobText(_) => Some(ExprType::Text),
             // a `?` is untyped on its own - it is always wrapped by the
             // CAST that gives it a type, so type_of never reaches it
             Expr::Param(_) => None,
@@ -42988,6 +43041,7 @@ impl Expr {
     /// engine's getDesc copies the non-null side. None = not numeric.
     fn rank_of(&self, descs: &[Descriptor]) -> Option<NumRank> {
         match self {
+            Expr::BlobText(_) => None,
             Expr::Param(_) => None,
             // a folded lookup answers within i64: its values came from
             // the inner table's own columns and folds
@@ -43196,6 +43250,10 @@ impl Expr {
                 }
             }
             Expr::Col(fid) => values.get(*fid).cloned().unwrap_or(Value::Null),
+            Expr::BlobText(fid) => match values.get(*fid) {
+                Some(Value::Blob(rel, num)) => Value::Text(blob_text_of(*rel, *num)?),
+                _ => Value::Null,
+            },
             Expr::GenVal(i) => values.get(*i).cloned().unwrap_or(Value::Null),
             // the per-row text-to-number coercion (see the variant):
             // NULL is UNKNOWN downstream, an exact spelling compares
@@ -53068,6 +53126,8 @@ fn expr_no_raise(e: &Expr, descs: &[Descriptor]) -> bool {
         // a parameter's value is substituted before eval; the CAST above
         // it may still raise, so it is not raise-free
         Expr::Param(_) => false,
+        // a blob read can raise (no filter to text for a user sub_type)
+        Expr::BlobText(_) => false,
         // the fold already happened at prepare; a lookup only compares
         Expr::Lookup { key, .. } => expr_no_raise(key, descs),
         Expr::Col(_)
@@ -54531,6 +54591,8 @@ fn after_auth(
             Err(_) => break,
         };
         if std::env::var("FC_SRV_TRACE").is_ok() { eprintln!("[srv] op-loop got op = {}", op); }
+        // the image this op's expressions read blobs from (see BLOB_CTX)
+        BLOB_CTX.with(|c| *c.borrow_mut() = database.as_ref().map(|d| (d.bytes(), d.page_size)));
         match op {
             x if x == OP_DETACH => {
                 read_int(&mut s, &mut dec)?; // handle
