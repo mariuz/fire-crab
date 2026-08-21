@@ -509,10 +509,30 @@ pointer-page and TIP page numbers is the next step when it dominates.
   where the engine converts; ARRAY columns only at CREATE TABLE (ALTER
   ADD refuses); `isc_array_lookup_bounds` (the client's catalog query
   through `system.rdb$sql.parse_unqualified_names`) is outside fc's SQL
-  surface — clients must build their descriptors.
-- **NEXT**: the recorded array tails (text/NUMERIC elements, element
-  conversion, ALTER ADD); `op_inline_blob` for the remaining singleton
-  path; `system.rdb$sql.parse_unqualified_names`. (MERGE `RETURNING` / `NOT MATCHED BY SOURCE`, `op_info_blob`
+  surface — clients must build their descriptors. (All lifted the same
+  day — see ARRAY TAILS below.)
+- **ARRAY TAILS DONE (2026-08-21, `serve-real-arrays` 34):** CHAR and
+  NUMERIC/DECIMAL elements (the catalog rows carry the scale; an SDL
+  `blr_text` element carries its length word); element CONVERSION on
+  get and put (`convert_element`: scaled ints, float/double, rounding
+  half away from zero; an element the SDL type cannot hold is the
+  engine's `isc_arith_except`); `ALTER TABLE … ADD <type> [l:u]` writes
+  the RDB$FIELD_DIMENSIONS rows, and an UPDATE now re-lays a record
+  stored in an OLDER format into the newest one instead of refusing
+  (`upgrade_image`, field by field by id — the first ALTER ADD + UPDATE
+  of an old row fc answers); `isc_array_lookup_bounds` runs over the
+  wire: `system.rdb$sql.parse_unqualified_names(rdb$get_context(
+  'SYSTEM','SEARCH_PATH'))` folds at prepare (`rewrite_system_sql`:
+  the SEARCH_PATH / CURRENT_USER / CURRENT_SCHEMA / ENGINE_VERSION
+  context to literals, the function to a `UNION ALL` derived table
+  of names), and a WINDOW over a derived table / CTE plans
+  (`plan_win_item` shared with the Project path; `Plan::Derived`
+  folds after the WHERE and before the sort; `OVER ()` with no order
+  numbers the scan order and ranks every row 1). The singleton inline
+  blob path was already covered by `op_inline_blob` (the remaining
+  `OP_SQL_RESPONSE` site is a scalar path with no blob).
+- **NEXT**: `op_info_transaction` beyond `isc_info_tra_id`; arrays of
+  domains; blob filters; the `A`/`B`/`C`/`E` items above. (MERGE `RETURNING` / `NOT MATCHED BY SOURCE`, `op_info_blob`
   / `op_seek_blob`, the ordered JOIN fetch streaming, the RIGHT/FULL
   hash, the bulk index build, the cleanup — all done 2026-08-21.)
 - **D, the MERGE executor** — the BLR is already compiled and tested;

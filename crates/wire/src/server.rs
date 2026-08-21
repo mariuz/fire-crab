@@ -461,11 +461,13 @@ fn parse_sdl(b: &[u8]) -> Option<Sdl> {
                     12 => (dtype::SQL_DATE, 4),
                     13 => (dtype::SQL_TIME, 4),
                     35 => (dtype::TIMESTAMP, 8),
-                    // text elements (blr_text/cstring/varying, and the
+                    // CHAR elements: blr_text / blr_cstring with a length
+                    // word (xdr: raw bytes padded to 4). VARYING (and the
                     // charset-carrying 2-variants) are not taken: a VARYING's
                     // wire form is per-element variable and a refusal keeps
                     // the stream whole (isc_invalid_sdl), where a guess would
                     // desync it
+                    14 | 40 => (dtype::TEXT, 0),
                     _ => return None,
                 };
                 out.dtype = dt;
@@ -474,6 +476,10 @@ fn parse_sdl(b: &[u8]) -> Option<Sdl> {
                     7 | 8 | 16 | 9 | 26 => {
                         out.scale = *b.get(i)? as i8;
                         i += 1;
+                    }
+                    14 | 40 => {
+                        out.elem_len = u16::from_le_bytes([*b.get(i)?, *b.get(i + 1)?]);
+                        i += 2;
                     }
                     _ => {}
                 }
@@ -595,6 +601,81 @@ fn xdr_element(w: &mut Vec<u8>, dtype: u8, bytes: &[u8]) {
     }
 }
 
+/// MOV_move between the slice's element type and the stored one, for the
+/// numeric families (short / long / int64 with their scales, float,
+/// double): the value is carried exactly as a scaled integer or as a
+/// double, and a conversion into an integer rounds half away from zero
+/// as the engine's CVT does. None = not convertible here (text <->
+/// number, dates): the caller refuses.
+fn convert_element(from: (u8, i8), bytes: &[u8], to: (u8, i8)) -> Option<Vec<u8>> {
+    use fire_crab_ods::format::dtype;
+    if from == to {
+        return Some(bytes.to_vec());
+    }
+    let int_of = |dt: u8| -> Option<i128> {
+        Some(match dt {
+            dtype::SHORT => i16::from_le_bytes([bytes[0], bytes[1]]) as i128,
+            dtype::LONG => i32::from_le_bytes(bytes[0..4].try_into().ok()?) as i128,
+            dtype::INT64 => i64::from_le_bytes(bytes[0..8].try_into().ok()?) as i128,
+            _ => return None,
+        })
+    };
+    let float_of = |dt: u8| -> Option<f64> {
+        Some(match dt {
+            dtype::REAL => f32::from_le_bytes(bytes[0..4].try_into().ok()?) as f64,
+            dtype::DOUBLE => f64::from_le_bytes(bytes[0..8].try_into().ok()?),
+            _ => return None,
+        })
+    };
+    let pow10 = |e: i32| -> f64 { 10f64.powi(e) };
+    let exact: Option<(i128, i8)> = int_of(from.0).map(|v| (v, from.1));
+    let approx: Option<f64> = float_of(from.0);
+    let emit_int = |v: i128, dt: u8| -> Option<Vec<u8>> {
+        Some(match dt {
+            dtype::SHORT => i16::try_from(v).ok()?.to_le_bytes().to_vec(),
+            dtype::LONG => i32::try_from(v).ok()?.to_le_bytes().to_vec(),
+            dtype::INT64 => i64::try_from(v).ok()?.to_le_bytes().to_vec(),
+            _ => return None,
+        })
+    };
+    match to.0 {
+        dtype::SHORT | dtype::LONG | dtype::INT64 => {
+            let v: i128 = match (exact, approx) {
+                (Some((v, sc)), _) => {
+                    let diff = sc as i32 - to.1 as i32;
+                    if diff >= 0 {
+                        v.checked_mul(10i128.checked_pow(diff as u32)?)?
+                    } else {
+                        let d = 10i128.checked_pow((-diff) as u32)?;
+                        let q = v / d;
+                        let r = v % d;
+                        if r.abs() * 2 >= d { q + v.signum() } else { q }
+                    }
+                }
+                (None, Some(f)) => {
+                    let scaled = f * pow10(-(to.1 as i32));
+                    let r = if scaled >= 0.0 { (scaled + 0.5).floor() } else { (scaled - 0.5).ceil() };
+                    if !r.is_finite() {
+                        return None;
+                    }
+                    r as i128
+                }
+                _ => return None,
+            };
+            emit_int(v, to.0)
+        }
+        dtype::REAL | dtype::DOUBLE => {
+            let f: f64 = match (exact, approx) {
+                (Some((v, sc)), _) => v as f64 * pow10(sc as i32),
+                (None, Some(f)) => f,
+                _ => return None,
+            };
+            Some(if to.0 == dtype::REAL { (f as f32).to_le_bytes().to_vec() } else { f.to_le_bytes().to_vec() })
+        }
+        _ => None,
+    }
+}
+
 /// The inverse of [xdr_element]: one element's memory form from the wire
 fn unxdr_element(b: &[u8], at: &mut usize, dtype: u8, elem_len: usize) -> Option<Vec<u8>> {
     use fire_crab_ods::format::dtype;
@@ -624,6 +705,92 @@ fn unxdr_element(b: &[u8], at: &mut usize, dtype: u8, elem_len: usize) -> Option
             v
         }
     })
+}
+
+/// `RDB$GET_CONTEXT('SYSTEM', <var>)` folded to its value, and the
+/// packaged selectable procedure
+/// `SYSTEM.RDB$SQL.PARSE_UNQUALIFIED_NAMES(<list>)` (the engine's
+/// rdb$sql package: a comma-separated list of possibly quoted names,
+/// one NAME row each) folded to a derived table of its rows - which is
+/// what `isc_array_lookup_bounds` / `isc_array_lookup_desc` build their
+/// catalog queries on (yvalve/array.cpp: a CTE over the search path
+/// joined to system.rdb$field_dimensions). The search path is the
+/// engine's default `"PUBLIC", "SYSTEM"`; the other SYSTEM variables
+/// answered are CURRENT_USER, CURRENT_SCHEMA and ENGINE_VERSION; an
+/// unknown one is NULL. None = nothing to rewrite.
+fn rewrite_system_sql(sql: &str) -> Option<String> {
+    let up = sql.to_ascii_uppercase();
+    if !up.contains("RDB$GET_CONTEXT") && !up.contains("PARSE_UNQUALIFIED_NAMES") {
+        return None;
+    }
+    let mut out = sql.to_string();
+    loop {
+        let u = out.to_ascii_uppercase();
+        let Some(at) = u.find("RDB$GET_CONTEXT") else { break };
+        let Some(open) = u[at..].find('(') else { break };
+        let Some(close) = u[at + open..].find(')') else { break };
+        let inner = out[at + open + 1..at + open + close].to_string();
+        let args: Vec<String> = inner.split(',').map(|a| a.trim().trim_matches('\'').to_ascii_uppercase()).collect();
+        let value: Option<&str> = match args.as_slice() {
+            [ns, var] if ns == "SYSTEM" => match var.as_str() {
+                "SEARCH_PATH" => Some("\"PUBLIC\", \"SYSTEM\""),
+                "CURRENT_USER" => Some("SYSDBA"),
+                "CURRENT_SCHEMA" => Some("PUBLIC"),
+                "ENGINE_VERSION" => Some("6.0.0"),
+                _ => None,
+            },
+            _ => None,
+        };
+        let lit = match value {
+            Some(v) => format!("'{}'", v.replace('\'', "''")),
+            None => "CAST(NULL AS VARCHAR(255))".to_string(),
+        };
+        out.replace_range(at..at + open + close + 1, &lit);
+    }
+    loop {
+        let u = out.to_ascii_uppercase();
+        let Some(p) = u.find("PARSE_UNQUALIFIED_NAMES") else { break };
+        let mut start = p;
+        for head in ["SYSTEM.RDB$SQL.", "RDB$SQL."] {
+            if u[..p].ends_with(head) {
+                start = p - head.len();
+                break;
+            }
+        }
+        let Some(open) = u[p..].find('(') else { break };
+        let Some(close) = u[p + open..].find(')') else { break };
+        let arg = out[p + open + 1..p + open + close].trim().to_string();
+        let names: Vec<String> = match arg.strip_prefix('\'').and_then(|a| a.strip_suffix('\'')) {
+            Some(q) => q
+                .replace("''", "'")
+                .split(',')
+                .map(|n| n.trim().to_string())
+                .filter(|n| !n.is_empty())
+                .map(|n| {
+                    let t = n.trim_matches('"').to_string();
+                    if n.starts_with('"') { t } else { t.to_ascii_uppercase() }
+                })
+                .collect(),
+            None => Vec::new(),
+        };
+        let derived = if names.is_empty() {
+            "(SELECT CAST(NULL AS VARCHAR(63)) AS NAME FROM RDB$DATABASE WHERE 1 = 0)".to_string()
+        } else {
+            let parts: Vec<String> = names
+                .iter()
+                .map(|n| format!("SELECT CAST('{}' AS VARCHAR(63)) AS NAME FROM RDB$DATABASE", n.replace('\'', "''")))
+                .collect();
+            format!("({})", parts.join(" UNION ALL "))
+        };
+        let after = out[p + open + close + 1..].to_string();
+        let next_word = after.trim_start().split(|c: char| c.is_whitespace() || c == ')' || c == ',').next().unwrap_or("").to_ascii_uppercase();
+        let has_alias = !next_word.is_empty()
+            && !matches!(next_word.as_str(), "JOIN" | "WHERE" | "ON" | "LEFT" | "INNER" | "RIGHT" | "FULL" | "CROSS" | "ORDER" | "GROUP" | "HAVING" | "UNION" | "ROWS" | "FETCH" | "AS")
+            || after.trim_start().to_ascii_uppercase().starts_with("AS ");
+        let replacement = if has_alias { derived } else { format!("{} PUN", derived) };
+        out.replace_range(start..p + open + close + 1, &replacement);
+    }
+    Some(out)
 }
 
 /// A blob open for READING over the wire: the engine's `blb` as the
@@ -7256,6 +7423,10 @@ AlterDomainRename {
         inner: Box<Plan>,
         cols: Vec<ProjCol>,
         filter: Option<Predicate>,
+        /// WINDOW output columns over the bound rows (usually empty):
+        /// folded at fetch after the WHERE, appended at `win_base + i`
+        windows: Vec<WinSpec>,
+        win_base: usize,
         order_by: Vec<OrderKey>,
     },
     /// A LATERAL derived table - `FROM <base> a, LATERAL (<subquery>) x`
@@ -12579,20 +12750,19 @@ fn parse_column_def(item: &str) -> Option<(fire_crab_ods::ddl::ColumnDef, Option
         // sub_type 1 = NUMERIC, 2 = DECIMAL
         ("NUMERIC" | "DECIMAL", [p]) => {
             let sub = if base == "NUMERIC" { 1 } else { 2 };
-            numeric_col(name, *p, 0, sub, not_null)
+            numeric_col(name, *p, 0, sub, not_null, dims.clone())
         }
         ("NUMERIC" | "DECIMAL", [p, s]) if s <= p => {
             let sub = if base == "NUMERIC" { 1 } else { 2 };
-            numeric_col(name, *p, *s, sub, not_null)
+            numeric_col(name, *p, *s, sub, not_null, dims.clone())
         }
         // an unrecognised single-identifier type with no arguments is taken
         // as a user domain reference; its type is a placeholder here and is
         // resolved from the domain's RDB$FIELDS row at create_table
-        // an ARRAY of a domain is not grammar the engine takes, and an
-        // ARRAY of NUMERIC/DECIMAL is not taken here (the element scale
-        // would need the numeric path): both refuse rather than make a
-        // scalar column
-        (_, _) if !dims.is_empty() && !matches!(base.as_str(), "SMALLINT" | "INTEGER" | "INT" | "BIGINT" | "FLOAT" | "DOUBLE PRECISION" | "DATE" | "TIME" | "TIMESTAMP") => None,
+        // an ARRAY of a domain is not grammar the engine takes; VARCHAR
+        // elements are not taken here (their wire form is per-element
+        // variable): both refuse rather than make a scalar column
+        (_, _) if !dims.is_empty() && !matches!(base.as_str(), "SMALLINT" | "INTEGER" | "INT" | "BIGINT" | "FLOAT" | "DOUBLE PRECISION" | "DATE" | "TIME" | "TIMESTAMP" | "CHAR" | "CHARACTER" | "NUMERIC" | "DECIMAL") => None,
         (dom, []) if ident_ok(dom) => Some(fire_crab_ods::ddl::ColumnDef {
             name: name.to_ascii_uppercase(),
             field_type: 0,
@@ -12679,6 +12849,7 @@ fn numeric_col(
     s: u16,
     sub_type: i16,
     not_null: bool,
+    dims: Vec<(i32, i32)>,
 ) -> Option<fire_crab_ods::ddl::ColumnDef> {
     use fire_crab_ods::format::dtype;
     let (field_type, dt, length) = match p {
@@ -12698,7 +12869,7 @@ fn numeric_col(
         length,
         scale: -(s as i8),
         sub_type,
-        dims: Vec::new(),
+        dims,
         char_len: None,
         // a NUMERIC/DECIMAL column's RDB$FIELD_PRECISION is its declared p
         precision: Some(p as i16),
@@ -18420,6 +18591,58 @@ fn plan_insert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
     ))
 }
 
+/// Re-lay a record image stored under an OLDER format into the newest
+/// one: every field the two formats share (same id, same type, length
+/// and scale) keeps its bytes and its null bit; every other field of
+/// the new format is NULL. The image length follows the same rule an
+/// INSERT's does (a live sample of the newest format, else the stored
+/// end), so the stored record is indistinguishable from a fresh one.
+fn upgrade_image(
+    image: &[u8],
+    old: &[Descriptor],
+    new: &[Descriptor],
+    db: &Database,
+    rel: u16,
+    format_no: u8,
+) -> Option<Vec<u8>> {
+    let mut stored_end = 0usize;
+    for d in new.iter() {
+        if d.offset != 0 {
+            stored_end = d.offset as usize + d.length as usize;
+        }
+    }
+    if stored_end == 0 {
+        return None;
+    }
+    let len = sample_image_len(db, rel, format_no).unwrap_or(stored_end);
+    if len < stored_end {
+        return None;
+    }
+    let mut out = vec![0u8; len];
+    for i in 0..new.len() {
+        out[i / 8] |= 1 << (i % 8);
+    }
+    for (fid, d) in new.iter().enumerate() {
+        let Some(o) = old.get(fid) else { continue };
+        if d.offset == 0 || o.offset == 0 {
+            continue; // a computed field has no stored bytes
+        }
+        if o.dtype != d.dtype || o.length != d.length || o.scale != d.scale {
+            continue; // a type change keeps nothing: NULL
+        }
+        if image.len() <= fid / 8 || image[fid / 8] & (1 << (fid % 8)) != 0 {
+            continue; // NULL stays NULL
+        }
+        let (from, to, n) = (o.offset as usize, d.offset as usize, d.length as usize);
+        if image.len() < from + n {
+            return None;
+        }
+        out[to..to + n].copy_from_slice(&image[from..from + n]);
+        out[fid / 8] &= !(1 << (fid % 8));
+    }
+    Some(out)
+}
+
 /// Build the record image: every field NULL except the provided ones,
 /// values validated against and laid at their descriptor offsets. The
 /// image length is taken from a live record of the same format when the
@@ -21856,10 +22079,22 @@ fn execute_dml_collecting_inner(
                 // the SET offsets were resolved in the NEWEST format; a
                 // record still stored in an older one would patch wrong
                 // bytes - refuse the whole statement instead
-                if fmt != *format_no {
-                    return Err("a matching record is in an older format".into());
-                }
-                let mut img = image.clone();
+                // bytes - so an older image is first re-laid into the
+                // newest format (field by field, by id; a field the new
+                // format does not carry, or carries differently, stays
+                // NULL), exactly what the engine's upgrade at the store
+                // does for a record whose format is behind the relation's
+                let mut img = if fmt != *format_no {
+                    let old = formats
+                        .iter()
+                        .find(|(n, _)| *n == fmt)
+                        .map(|(_, d)| d)
+                        .ok_or("no format for a matching record")?;
+                    upgrade_image(&image, old, descs, db, *rel, *format_no)
+                        .ok_or("a matching record is in an older format")?
+                } else {
+                    image.clone()
+                };
                 for (fid, bytes) in sets {
                     match bytes {
                         None => img[fid / 8] |= 1 << (fid % 8), // SET col = NULL
@@ -25933,6 +26168,10 @@ fn rewrite_named_windows(sql: &str) -> Option<String> {
 }
 
 fn plan_query(sql: &str, db: &Option<Database>) -> (Plan, Vec<Descriptor>) {
+    // the two system-SQL pieces libfbclient's array helpers lean on,
+    // folded into plain SQL before planning - see [rewrite_system_sql]
+    let sys = rewrite_system_sql(sql);
+    let sql = sys.as_deref().unwrap_or(sql);
     // a named WINDOW clause is rewritten to inline OVER (...) specs before
     // planning; an unsupported clause (or none) leaves the text unchanged
     let rewritten = rewrite_named_windows(sql);
@@ -26461,6 +26700,9 @@ fn plan_over_source(
     }
     let computed = Default::default();
     let mut out_cols: Vec<ProjCol> = Vec::new();
+    // window values are appended past every bound column
+    let win_base = descs.len();
+    let mut windows: Vec<WinSpec> = Vec::new();
     // the outer projection over a derived source is renumbered HERE: the
     // derived dispatch returns before the shared renumber_proj_params, so
     // a projection `?` takes the leading input slots and the WHERE's own
@@ -26527,6 +26769,14 @@ fn plan_over_source(
                         pc.fname = Some(fname.clone());
                         out_cols.push(pc)
                     }
+                    SelItem::Win(func, part_raw, order_raw, frame, alias, fname) => {
+                        let (pc, spec) = plan_win_item(
+                            &func, &part_raw, &order_raw, &frame, &alias, &fname,
+                            &columns, &descs, win_base, windows.len(),
+                        )?;
+                        windows.push(spec);
+                        out_cols.push(pc);
+                    }
                     _ => return None,
                 }
             }
@@ -26562,6 +26812,8 @@ fn plan_over_source(
         inner: Box::new(src.into_plan(cols)),
         cols: out_cols,
         filter,
+        windows,
+        win_base,
         order_by,
     })
 }
@@ -27610,16 +27862,22 @@ fn branch_rows_res(
             .map(|values| cols.iter().map(|c| c.value_of(values)).collect())
             .collect();
     }
-    if let Plan::Derived { inner, cols, filter, order_by } = plan {
+    if let Plan::Derived { inner, cols, filter, windows, win_base, order_by } = plan {
         let rows = branch_rows_res(inner, db, args)?;
-        let out = RowSource::Sort {
-            input: Box::new(RowSource::Filter {
-                input: Box::new(RowSource::Rows(rows)),
-                pred: bind_filter(filter, args).map_err(|_| EvalErr::Unsupported)?,
-            }),
-            keys: order_by.clone(),
+        let filtered = RowSource::Filter {
+            input: Box::new(RowSource::Rows(rows)),
+            pred: bind_filter(filter, args).map_err(|_| EvalErr::Unsupported)?,
         }
         .rows(db)?;
+        // a window folds over the FILTERED rows and is appended to each
+        // before the sort, exactly as the Project path orders it
+        let rows = if windows.is_empty() {
+            filtered
+        } else {
+            compute_windows(filtered, windows, *win_base)?
+        };
+        let out = RowSource::Sort { input: Box::new(RowSource::Rows(rows)), keys: order_by.clone() }
+            .rows(db)?;
         return out
             .iter()
             // a column's own evaluation error travels too - this used
@@ -29651,170 +29909,11 @@ fn plan_query_inner_ctx(
                     }
                     SelItem::Agg(..) => return None, // aggregates route to plan_group
                     SelItem::Win(func, part_raw, order_raw, frame, alias, fname) => {
-                        // PARTITION BY keys resolve over this relation; a
-                        // key naming no column, or one the resolver
-                        // refuses, refuses the whole window
-                        let mut part: Vec<Expr> = Vec::with_capacity(part_raw.len());
-                        for r in part_raw {
-                            part.push(resolve_expr(r, &columns, &descs)?);
-                        }
-                        // the OVER's ORDER BY resolves over the INPUT
-                        // columns through the SHARED order-by parser (so
-                        // ASC/DESC/NULLS and expression keys come free); a
-                        // key it refuses refuses the whole window
-                        let order: Vec<OrderKey> = match order_raw {
-                            None => Vec::new(),
-                            Some(os) => parse_order_by_expr(
-                                os,
-                                &[],
-                                &descs,
-                                |n| {
-                                    columns
-                                        .iter()
-                                        .find(|c| c.name.eq_ignore_ascii_case(n))
-                                        .map(|c| c.field_id as usize)
-                                        .filter(|fid| !is_computed_fid(&descs, *fid))
-                                },
-                                |text| {
-                                    parse_raw_expr(text)
-                                        .and_then(|r| resolve_expr(&r, &columns, &descs))
-                                },
-                            )?,
-                        };
-                        let (pc, kind) = match func {
-                            // AN AGGREGATE WINDOW THROUGH THE AGGREGATE
-                            // MACHINERY: its describe and fold are a bare
-                            // aggregate's, so feed one synthetic SelItem::Agg
-                            // to build_group_items and take back the ProjCol
-                            // it types and the GItem::Agg it plans - COUNT is
-                            // BIGINT, MIN/MAX keep the source, SUM widens,
-                            // the NUMERIC/text/temporal refusals, no copy.
-                            WinFunc::Agg(f, target) => {
-                                // a RANGE-offset frame measures its bounds in
-                                // the ORDER KEY's own values, so it needs
-                                // exactly one key, and this slice does the
-                                // arithmetic only for an INTEGER key (a
-                                // numeric/temporal key is a later slice)
-                                if matches!(&frame, Some(fr) if fr.mode == FrameMode::Range) {
-                                    if order.len() != 1 {
-                                        return None;
-                                    }
-                                    let k = &order[0];
-                                    let is_int = match &k.expr {
-                                        Some(e) => {
-                                            matches!(e.type_of(&descs), Some(ExprType::Int))
-                                        }
-                                        None => descs
-                                            .get(k.field)
-                                            .is_some_and(|d| {
-                                                matches!(col_kind(d), Some(ColKind::Int))
-                                            }),
-                                    };
-                                    if !is_int {
-                                        return None;
-                                    }
-                                }
-                                let mut sink: Vec<Option<Descriptor>> = Vec::new();
-                                let (wc, wg) = build_group_items(
-                                    std::slice::from_ref(&SelItem::Agg(
-                                        *f,
-                                        target.clone(),
-                                        alias.clone(),
-                                    )),
-                                    &columns,
-                                    &descs,
-                                    &[],
-                                    &[],
-                                    win_base,
-                                    &mut sink,
-                                )?;
-                                let mut pc = wc.into_iter().next()?;
-                                let GItem::Agg(gf, src, distinct) = wg.into_iter().next()?
-                                else {
-                                    return None;
-                                };
-                                pc.field_id = win_base + windows.len();
-                                pc.expr = None;
-                                (
-                                    pc,
-                                    WinKind::Agg {
-                                        func: gf,
-                                        src,
-                                        distinct,
-                                        frame: frame.clone(),
-                                    },
-                                )
-                            }
-                            // A RANKING WINDOW answers a NOT-NULLABLE BIGINT
-                            // named by the function (probed: 580, no Nullable
-                            // flag) - the row's position in the ordered
-                            // partition, computed at fetch
-                            WinFunc::Rank(rk) => {
-                                let pc = ProjCol {
-                                    name: alias.clone().unwrap_or_else(|| fname.clone()),
-                                    fname: Some(fname.clone()),
-                                    relation: None,
-                                    rel_alias: None,
-                                    field_id: win_base + windows.len(),
-                                    wire: Wire::Int64,
-                                    sql_type: 580,
-                                    length: 8,
-                                    oct_length: 8,
-                                    scale: 0,
-                                    sub_type: 0,
-                                    expr: None,
-                                };
-                                (pc, WinKind::Rank(*rk))
-                            }
-                            // A NAVIGATION WINDOW (LAG/LEAD) reads another
-                            // row's value by offset along the ordered
-                            // partition, so it NEEDS the order; it describes
-                            // as its ARGUMENT's own type, Nullable (probed).
-                            WinFunc::Nav(nf, arg_raw, offset, def_raw) => {
-                                if order.is_empty() {
-                                    return None; // navigation with no order is unpinned
-                                }
-                                let arg = resolve_expr(arg_raw, &columns, &descs)?;
-                                let default = match def_raw {
-                                    None => None,
-                                    Some(d) => Some(resolve_expr(d, &columns, &descs)?),
-                                };
-                                // the argument's describe, through the same
-                                // expression-column builder every scalar
-                                // uses (it announces NULLABLE, which LAG/LEAD
-                                // are); only the name and slot are the
-                                // window's
-                                let mut pc =
-                                    build_expr_col_from(arg.clone(), &fname, &descs)?;
-                                pc.name = alias.clone().unwrap_or_else(|| fname.clone());
-                                pc.fname = Some(fname.clone());
-                                pc.relation = None;
-                                pc.rel_alias = None;
-                                pc.field_id = win_base + windows.len();
-                                pc.expr = None;
-                                (pc, WinKind::Nav { func: *nf, arg, offset: *offset, default })
-                            }
-                            // A VALUE window (FIRST_VALUE/LAST_VALUE/
-                            // NTH_VALUE) reads a FRAME row by position, so it
-                            // needs the order too; it describes as its
-                            // argument's own type, Nullable (probed).
-                            WinFunc::Val(vf, arg_raw, nn) => {
-                                if order.is_empty() {
-                                    return None; // a value function needs the frame order
-                                }
-                                let arg = resolve_expr(arg_raw, &columns, &descs)?;
-                                let mut pc =
-                                    build_expr_col_from(arg.clone(), &fname, &descs)?;
-                                pc.name = alias.clone().unwrap_or_else(|| fname.clone());
-                                pc.fname = Some(fname.clone());
-                                pc.relation = None;
-                                pc.rel_alias = None;
-                                pc.field_id = win_base + windows.len();
-                                pc.expr = None;
-                                (pc, WinKind::Val { func: *vf, arg, n: *nn, frame: frame.clone() })
-                            }
-                        };
-                        windows.push(WinSpec { kind, part, order });
+                        let (pc, spec) = plan_win_item(
+                            &func, &part_raw, &order_raw, &frame, &alias, &fname,
+                            &columns, &descs, win_base, windows.len(),
+                        )?;
+                        windows.push(spec);
                         out.push(pc);
                     }
                 }
@@ -33328,6 +33427,189 @@ fn group_output(
 /// bucketing sort, the per-group fold and HAVING - is the same work
 /// whether the rows came from one relation's pages or from two joined
 /// ones.
+/// Plan ONE window item of a select list over `columns`/`descs` - the
+/// PARTITION BY keys, the OVER's ORDER BY, and the function's own
+/// describe - answering the output column (reading slot `win_base +
+/// nwin`) and the [WinSpec] the fetch folds. Shared by the Project path
+/// (a base table) and the derived/CTE path (a bound row source).
+fn plan_win_item(
+    func: &WinFunc,
+    part_raw: &[RawExpr],
+    order_raw: &Option<String>,
+    frame: &Option<Frame>,
+    alias: &Option<String>,
+    fname: &str,
+    columns: &[RelationColumn],
+    descs: &[Descriptor],
+    win_base: usize,
+    nwin: usize,
+) -> Option<(ProjCol, WinSpec)> {
+    // PARTITION BY keys resolve over this relation; a
+    // key naming no column, or one the resolver
+    // refuses, refuses the whole window
+    let mut part: Vec<Expr> = Vec::with_capacity(part_raw.len());
+    for r in part_raw {
+        part.push(resolve_expr(r, &columns, &descs)?);
+    }
+    // the OVER's ORDER BY resolves over the INPUT
+    // columns through the SHARED order-by parser (so
+    // ASC/DESC/NULLS and expression keys come free); a
+    // key it refuses refuses the whole window
+    let order: Vec<OrderKey> = match order_raw {
+        None => Vec::new(),
+        Some(os) => parse_order_by_expr(
+            os,
+            &[],
+            &descs,
+            |n| {
+                columns
+                    .iter()
+                    .find(|c| c.name.eq_ignore_ascii_case(n))
+                    .map(|c| c.field_id as usize)
+                    .filter(|fid| !is_computed_fid(&descs, *fid))
+            },
+            |text| {
+                parse_raw_expr(text)
+                    .and_then(|r| resolve_expr(&r, &columns, &descs))
+            },
+        )?,
+    };
+    let (pc, kind) = match func {
+        // AN AGGREGATE WINDOW THROUGH THE AGGREGATE
+        // MACHINERY: its describe and fold are a bare
+        // aggregate's, so feed one synthetic SelItem::Agg
+        // to build_group_items and take back the ProjCol
+        // it types and the GItem::Agg it plans - COUNT is
+        // BIGINT, MIN/MAX keep the source, SUM widens,
+        // the NUMERIC/text/temporal refusals, no copy.
+        WinFunc::Agg(f, target) => {
+            // a RANGE-offset frame measures its bounds in
+            // the ORDER KEY's own values, so it needs
+            // exactly one key, and this slice does the
+            // arithmetic only for an INTEGER key (a
+            // numeric/temporal key is a later slice)
+            if matches!(frame, Some(fr) if fr.mode == FrameMode::Range) {
+                if order.len() != 1 {
+                    return None;
+                }
+                let k = &order[0];
+                let is_int = match &k.expr {
+                    Some(e) => {
+                        matches!(e.type_of(&descs), Some(ExprType::Int))
+                    }
+                    None => descs
+                        .get(k.field)
+                        .is_some_and(|d| {
+                            matches!(col_kind(d), Some(ColKind::Int))
+                        }),
+                };
+                if !is_int {
+                    return None;
+                }
+            }
+            let mut sink: Vec<Option<Descriptor>> = Vec::new();
+            let (wc, wg) = build_group_items(
+                std::slice::from_ref(&SelItem::Agg(
+                    *f,
+                    target.clone(),
+                    alias.clone(),
+                )),
+                &columns,
+                &descs,
+                &[],
+                &[],
+                win_base,
+                &mut sink,
+            )?;
+            let mut pc = wc.into_iter().next()?;
+            let GItem::Agg(gf, src, distinct) = wg.into_iter().next()?
+            else {
+                return None;
+            };
+            pc.field_id = win_base + nwin;
+            pc.expr = None;
+            (
+                pc,
+                WinKind::Agg {
+                    func: gf,
+                    src,
+                    distinct,
+                    frame: frame.clone(),
+                },
+            )
+        }
+        // A RANKING WINDOW answers a NOT-NULLABLE BIGINT
+        // named by the function (probed: 580, no Nullable
+        // flag) - the row's position in the ordered
+        // partition, computed at fetch
+        WinFunc::Rank(rk) => {
+            let pc = ProjCol {
+                name: alias.clone().unwrap_or_else(|| fname.to_string()),
+                fname: Some(fname.to_string()),
+                relation: None,
+                rel_alias: None,
+                field_id: win_base + nwin,
+                wire: Wire::Int64,
+                sql_type: 580,
+                length: 8,
+                oct_length: 8,
+                scale: 0,
+                sub_type: 0,
+                expr: None,
+            };
+            (pc, WinKind::Rank(*rk))
+        }
+        // A NAVIGATION WINDOW (LAG/LEAD) reads another
+        // row's value by offset along the ordered
+        // partition, so it NEEDS the order; it describes
+        // as its ARGUMENT's own type, Nullable (probed).
+        WinFunc::Nav(nf, arg_raw, offset, def_raw) => {
+            if order.is_empty() {
+                return None; // navigation with no order is unpinned
+            }
+            let arg = resolve_expr(arg_raw, &columns, &descs)?;
+            let default = match def_raw {
+                None => None,
+                Some(d) => Some(resolve_expr(d, &columns, &descs)?),
+            };
+            // the argument's describe, through the same
+            // expression-column builder every scalar
+            // uses (it announces NULLABLE, which LAG/LEAD
+            // are); only the name and slot are the
+            // window's
+            let mut pc =
+                build_expr_col_from(arg.clone(), &fname, &descs)?;
+            pc.name = alias.clone().unwrap_or_else(|| fname.to_string());
+            pc.fname = Some(fname.to_string());
+            pc.relation = None;
+            pc.rel_alias = None;
+            pc.field_id = win_base + nwin;
+            pc.expr = None;
+            (pc, WinKind::Nav { func: *nf, arg, offset: *offset, default })
+        }
+        // A VALUE window (FIRST_VALUE/LAST_VALUE/
+        // NTH_VALUE) reads a FRAME row by position, so it
+        // needs the order too; it describes as its
+        // argument's own type, Nullable (probed).
+        WinFunc::Val(vf, arg_raw, nn) => {
+            if order.is_empty() {
+                return None; // a value function needs the frame order
+            }
+            let arg = resolve_expr(arg_raw, &columns, &descs)?;
+            let mut pc =
+                build_expr_col_from(arg.clone(), &fname, &descs)?;
+            pc.name = alias.clone().unwrap_or_else(|| fname.to_string());
+            pc.fname = Some(fname.to_string());
+            pc.relation = None;
+            pc.rel_alias = None;
+            pc.field_id = win_base + nwin;
+            pc.expr = None;
+            (pc, WinKind::Val { func: *vf, arg, n: *nn, frame: frame.clone() })
+        }
+    };
+    Some((pc, WinSpec { kind, part, order }))
+}
+
 /// Answer every WINDOW column on every input row (see [WinSpec]). For
 /// each window the rows are bucketed by its PARTITION BY keys - NULLs
 /// bucket together, the way [group_rows] groups. What each bucket produces
@@ -33565,14 +33847,19 @@ fn compute_windows(
                     // sort, so rows tying on the keys keep their scan order
                     // (the only order ROW_NUMBER can give a tie)
                     let mut perm: Vec<usize> = (0..idxs.len()).collect();
-                    perm.sort_by(|&a, &b| {
-                        order_cmp(&ordrows[idxs[a]], &ordrows[idxs[b]], &okeys)
-                    });
+                    // `OVER ()` has no order: ROW_NUMBER numbers the scan
+                    // order and RANK/DENSE_RANK see ONE peer group (every
+                    // row ranks 1) - there are no order values to compare
+                    if !okeys.is_empty() {
+                        perm.sort_by(|&a, &b| {
+                            order_cmp(&ordrows[idxs[a]], &ordrows[idxs[b]], &okeys)
+                        });
+                    }
                     let mut rank = 0i64;
                     let mut dense = 0i64;
                     for (pos, &p) in perm.iter().enumerate() {
                         let new_group = pos == 0
-                            || order_cmp(
+                            || !okeys.is_empty() && order_cmp(
                                 &ordrows[idxs[perm[pos - 1]]],
                                 &ordrows[idxs[p]],
                                 &okeys,
@@ -35932,13 +36219,30 @@ fn emit_rows_inner(
                 }
             }
         }
-        Plan::Derived { inner, cols, filter, order_by } => {
+        Plan::Derived { inner, cols, filter, windows, win_base, order_by } => {
             if let Some(db) = db {
                 // the inner plan's rows are a MATERIALISED LEAF; the
                 // outer WHERE and ORDER BY are nodes above it - the same
                 // Rows -> Filter -> Sort the grouped join builds
                 let pred = bind_filter(filter, args)?;
-                if order_by.is_empty() {
+                if !windows.is_empty() {
+                    // a WINDOW folds over every filtered row before any
+                    // ships (a partition is not known until its last row
+                    // is seen), so this shape materialises, like the
+                    // windowed Project does
+                    let rows = branch_rows_res(inner, db, args).map_err(EmitErr::Eval)?;
+                    let filtered = RowSource::Filter { input: Box::new(RowSource::Rows(rows)), pred }
+                        .rows(db)
+                        .map_err(EmitErr::Eval)?;
+                    let mut rows =
+                        compute_windows(filtered, windows, *win_base).map_err(EmitErr::Eval)?;
+                    if !order_by.is_empty() {
+                        sort_rows(&mut rows, order_by).map_err(EmitErr::Eval)?;
+                    }
+                    for values in &rows {
+                        encode_row(w, cols, values, out)?;
+                    }
+                } else if order_by.is_empty() {
                     // NOTHING BLOCKS, so the rows go out as they are
                     // produced - the engine delivers rows 1 and 2 of a
                     // derived table whose row 3 raises, and collecting
@@ -56164,11 +56468,14 @@ fn after_auth(
                         continue;
                     };
                     let elen = desc.elem_len as usize;
-                    // the SDL's element type must be the stored one: the
-                    // engine converts (MOV_move per element), this server
-                    // refuses (isc_invalid_sdl) rather than ship the wrong
-                    // width and desync the client's decode - recorded
-                    if sdl.dtype != desc.dtype || sdl.elem_len as usize != elen {
+                    // the SDL's element type may differ from the stored one:
+                    // the engine converts each element (MOV_move in
+                    // slice_callback) - numbers convert here too; a text /
+                    // date mismatch refuses (isc_invalid_sdl) rather than
+                    // ship the wrong width and desync the client's decode
+                    let converting = sdl.dtype != desc.dtype || sdl.elem_len != desc.elem_len;
+                    let slice_elen = if sdl.elem_len > 0 { sdl.elem_len as usize } else { elen };
+                    if converting && convert_element((desc.dtype, desc.scale), &vec![0u8; elen.max(16)], (sdl.dtype, sdl.scale)).is_none() {
                         respond_error(&mut s, &mut enc, 335544456)?;
                         continue;
                     }
@@ -56178,24 +56485,42 @@ fn after_auth(
                         respond_error(&mut s, &mut enc, 335545028)?; // isc_ss_out_of_bounds
                         continue;
                     }
-                    if subs.len() * elen > slice_len {
+                    if subs.len() * slice_elen > slice_len {
                         respond_error(&mut s, &mut enc, 335544457)?; // isc_out_of_bounds
                         continue;
                     }
                     let mut out: Vec<u8> = Vec::new();
                     let mut n = 0usize;
+                    // an element the SDL type cannot hold (a BIGINT read as
+                    // INTEGER) is the engine's arithmetic exception
+                    let mut overflow = false;
                     for sub in &subs {
                         let bytes: Vec<u8> = match desc.subscript(sub) {
                             Some(off) if (off + 1) * elen <= data.len() => data[off * elen..(off + 1) * elen].to_vec(),
                             _ => vec![0u8; elen], // beyond the stored data: zeros, as the engine answers
                         };
-                        xdr_element(&mut out, desc.dtype, &bytes);
+                        let bytes = if converting {
+                            match convert_element((desc.dtype, desc.scale), &bytes, (sdl.dtype, sdl.scale)) {
+                                Some(b) => b,
+                                None => {
+                                    overflow = true;
+                                    break;
+                                }
+                            }
+                        } else {
+                            bytes
+                        };
+                        xdr_element(&mut out, sdl.dtype, &bytes);
                         n += 1;
+                    }
+                    if overflow {
+                        respond_error(&mut s, &mut enc, 335544321)?; // isc_arith_except
+                        continue;
                     }
                     // op_slice: the byte length delivered, then xdr_slice
                     // (the same length again, then the elements)
                     let mut w = W::default();
-                    w.int(OP_SLICE).int((n * elen) as i32).int((n * elen) as i32).raw(&out);
+                    w.int(OP_SLICE).int((n * slice_elen) as i32).int((n * slice_elen) as i32).raw(&out);
                     w.send(&mut s, &mut enc)?;
                 } else {
                     // a put: the column's shape from the catalog is the array
@@ -56207,8 +56532,9 @@ fn after_auth(
                     };
                     let desc = ArrayDesc::from_shape(&shape);
                     let elen = desc.elem_len as usize;
-                    if sdl.dtype != desc.dtype || sdl.elem_len as usize != elen {
-                        respond_error(&mut s, &mut enc, 335544456)?; // isc_invalid_sdl: type differs (recorded)
+                    let converting = sdl.dtype != desc.dtype || sdl.elem_len != desc.elem_len;
+                    if converting && convert_element((sdl.dtype, sdl.scale), &vec![0u8; 16], (desc.dtype, desc.scale)).is_none() {
+                        respond_error(&mut s, &mut enc, 335544456)?; // isc_invalid_sdl: not convertible here
                         continue;
                     }
                     if subs.iter().any(|sub| desc.subscript(sub).is_none()) {
@@ -56238,6 +56564,14 @@ fn after_auth(
                     let mut at = 0usize;
                     for sub in &subs {
                         let Some(bytes) = unxdr_element(&put_bytes, &mut at, sdl.dtype, sdl.elem_len as usize) else { break };
+                        let bytes = if converting {
+                            match convert_element((sdl.dtype, sdl.scale), &bytes, (desc.dtype, desc.scale)) {
+                                Some(b) => b,
+                                None => break,
+                            }
+                        } else {
+                            bytes
+                        };
                         if let Some(off) = desc.subscript(sub) {
                             if (off + 1) * elen <= data.len() && bytes.len() == elen {
                                 data[off * elen..(off + 1) * elen].copy_from_slice(&bytes);

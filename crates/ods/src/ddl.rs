@@ -1057,11 +1057,6 @@ pub fn alter_table_add_column(
     table: &str,
     col: &ColumnDef,
 ) -> Result<(), String> {
-    // ARRAY columns are taken at CREATE TABLE only: an ALTER would have to
-    // write the dimension rows too, and today it does not (recorded)
-    if !col.dims.is_empty() {
-        return Err("an ARRAY column can only be declared at CREATE TABLE".into());
-    }
     let table = table.trim().to_ascii_uppercase();
     let rel = crate::resolve_relation(file, page_size, &table)
         .ok_or_else(|| format!("table {} not found", table))?;
@@ -1181,7 +1176,27 @@ pub fn alter_table_add_column(
         // a plain added column's precision, same rule as create_table
         field_vals.push(("RDB$FIELD_PRECISION", SysVal::I(p as i64)));
     }
+    if !col.dims.is_empty() {
+        field_vals.push(("RDB$DIMENSIONS", SysVal::I(col.dims.len() as i64)));
+    }
     sys_insert(file, page_size, "RDB$FIELDS", 2, &field_vals)?;
+    // an ARRAY column's bounds: one RDB$FIELD_DIMENSIONS row per dimension,
+    // exactly as create_table writes them
+    for (dim, (lo, hi)) in col.dims.iter().enumerate() {
+        sys_insert(
+            file,
+            page_size,
+            "RDB$FIELD_DIMENSIONS",
+            21,
+            &[
+                ("RDB$FIELD_NAME", SysVal::S(&dom)),
+                ("RDB$DIMENSION", SysVal::I(dim as i64)),
+                ("RDB$LOWER_BOUND", SysVal::I(*lo as i64)),
+                ("RDB$UPPER_BOUND", SysVal::I(*hi as i64)),
+                ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
+            ],
+        )?;
+    }
 
     let rf_vals: Vec<(&str, SysVal<'_>)> = vec![
         ("RDB$FIELD_NAME", SysVal::S(&col.name)),
