@@ -26405,6 +26405,8 @@ fn plan_join_bound(
         }
     }
 
+    let mut cols = cols;
+    mark_not_null_join(&mut cols, db, &sides, &parts);
     Some(Plan::Join {
         base: sides[0].src.clone(),
         base_width: sides[0].descs.len(),
@@ -27116,6 +27118,9 @@ fn plan_over_source(
                         // over `X + 1 AS C` answers "", alias V)
                         pc.relation = cols[pc.field_id].relation.clone();
                         pc.rel_alias = bind_alias.clone();
+                        // and its NULLABILITY (probed: D.ID over a NOT NULL
+                        // ID describes not-nullable through the derived table)
+                        pc.sql_type = (pc.sql_type & !1) | (cols[pc.field_id].sql_type & 1);
                         out_cols.push(pc);
                     }
                     SelItem::Expr(raw, n, fname) => {
@@ -28629,6 +28634,13 @@ fn plan_union(
                 // branch blanks all four relation-derived items)
                 relation: if all_plain[i] { c.relation.clone() } else { None },
                 rel_alias: if all_plain[i] { c.rel_alias.clone() } else { None },
+                // nullable when ANY branch's column is (probed: a NOT NULL
+                // column unioned with a nullable one describes nullable)
+                sql_type: if branches.iter().any(|b| output_cols_of(b).get(i).is_some_and(|bc| bc.sql_type & 1 == 1)) {
+                    c.sql_type | 1
+                } else {
+                    c.sql_type
+                },
                 ..c.clone()
             }
         })
@@ -30414,6 +30426,22 @@ fn plan_query_inner_ctx(
                 table: table.to_string(),
                 sql: opt_sql.clone(),
             });
+            // a PLAIN group key over a NOT NULL column describes not-nullable
+            // (probed: `SELECT ID FROM A GROUP BY ID`); the folds keep their
+            // own rule (COUNT never null, the rest nullable)
+            let mut cols = cols;
+            {
+                let nn = not_null_fids(db, table);
+                for (pos, gi) in gitems.iter().enumerate() {
+                    if let GItem::Key(fid) = gi {
+                        if *fid < synth_base && nn.contains(fid) {
+                            if let Some(c) = cols.get_mut(pos) {
+                                c.sql_type &= !1;
+                            }
+                        }
+                    }
+                }
+            }
             Some(Plan::Group {
                 rel,
                 formats,
@@ -30469,11 +30497,87 @@ fn mark_not_null_cols(cols: &mut [ProjCol], db: &Database, table: &str) {
     if nn.is_empty() {
         return;
     }
+    let is_nn = |fid: usize| nn.contains(&fid);
     for c in cols.iter_mut() {
-        if c.expr.is_none()
-            && c.relation.as_deref().is_some_and(|r| r.eq_ignore_ascii_case(table.trim_matches('"')))
-            && nn.contains(&c.field_id)
-        {
+        let nullable = match &c.expr {
+            None => !(c.relation.as_deref().is_some_and(|r| r.eq_ignore_ascii_case(table.trim_matches('"'))) && is_nn(c.field_id)),
+            Some(e) => expr_nullable(e, &is_nn),
+        };
+        if !nullable {
+            c.sql_type &= !1;
+        }
+    }
+}
+
+/// Whether an expression can answer NULL - the engine's describe rule
+/// (probed): a literal, CURRENT_DATE, a NOT NULL column never; arithmetic,
+/// negation, CAST, `||`, the string/date functions and CASE/IIF only when
+/// an input (a branch) can; COALESCE, NULLIF, a parameter, a boolean
+/// (`ID IS NULL`), a subquery and NULL itself always. Anything this does
+/// not know stays nullable - the bit is only ever CLEARED when certain.
+fn expr_nullable(e: &Expr, is_nn: &dyn Fn(usize) -> bool) -> bool {
+    match e {
+        Expr::Col(f) | Expr::BlobText(f) => !is_nn(*f),
+        Expr::Int(_)
+        | Expr::Int128(_)
+        | Expr::DecFloat34(_)
+        | Expr::Dec(..)
+        | Expr::Double(_)
+        | Expr::Bool(_)
+        | Expr::Str(_)
+        | Expr::DateLit(_)
+        | Expr::TimeLit(_)
+        | Expr::TsLit(..) => false,
+        Expr::Neg(a)
+        | Expr::Cast(a, ..)
+        | Expr::TextNum(a, _)
+        | Expr::TextNumKey(a, _)
+        | Expr::TextBool(a, _) => expr_nullable(a, is_nn),
+        Expr::Bin(a, _, b) | Expr::Concat(a, b) => expr_nullable(a, is_nn) || expr_nullable(b, is_nn),
+        Expr::Iif(_, a, b) => expr_nullable(a, is_nn) || expr_nullable(b, is_nn),
+        Expr::Case(arms, els) => {
+            arms.iter().any(|(_, x)| expr_nullable(x, is_nn))
+                || els.as_ref().map_or(true, |x| expr_nullable(x, is_nn))
+        }
+        Expr::Func(_, args) => args.iter().any(|a| expr_nullable(a, is_nn)),
+        _ => true,
+    }
+}
+
+/// NOT NULL through a JOIN: a column of a side keeps its flag unless the
+/// side can be NULL-extended - the right side of a LEFT / FULL, and every
+/// side before a RIGHT / FULL (probed: INNER keeps both sides, LEFT
+/// nulls the right one, RIGHT the left one, FULL both).
+fn mark_not_null_join(cols: &mut [ProjCol], db: &Database, sides: &[JoinSide], parts: &[JoinPart]) {
+    let mut nulled = vec![false; sides.len()];
+    for (i, p) in parts.iter().enumerate() {
+        if matches!(p.kind, JoinKind::Left | JoinKind::Full) {
+            if let Some(n) = nulled.get_mut(i + 1) {
+                *n = true;
+            }
+        }
+        if matches!(p.kind, JoinKind::Right | JoinKind::Full) {
+            for n in nulled.iter_mut().take(i + 1) {
+                *n = true;
+            }
+        }
+    }
+    let side_of = |fid: usize| sides.iter().position(|sd| fid >= sd.offset && fid < sd.offset + sd.descs.len());
+    let is_nn = |fid: usize| -> bool {
+        let Some(k) = side_of(fid) else { return false };
+        if nulled[k] {
+            return false;
+        }
+        let local = fid - sides[k].offset;
+        let Some(Some(table)) = sides[k].rels.get(local) else { return false };
+        not_null_fids(db, table).contains(&local)
+    };
+    for c in cols.iter_mut() {
+        let nullable = match &c.expr {
+            None => !is_nn(c.field_id),
+            Some(e) => expr_nullable(e, &is_nn),
+        };
+        if !nullable {
             c.sql_type &= !1;
         }
     }

@@ -590,9 +590,21 @@ pointer-page and TIP page numbers is the next step when it dominates.
   stay refused; a temp blob of the running transaction is not readable
   by an expression; CAST(x AS CHAR(n)) describes 448 on fc for ANY
   operand (the engine 452) — the fixed-text wire form is its own slice.
-- **NEXT**: NOT NULL describe through expressions and INNER JOIN sides;
-  the CHAR (452) describe/wire form for CAST AS CHAR and CHAR columns;
-  the `A`/`B`/`C`/`E` items above. (Full sweep 2026-08-21 after the UPDATE-format change: 259 gates, 8246 checks, 0 DIFF. MERGE `RETURNING` / `NOT MATCHED BY SOURCE`, `op_info_blob`
+- **NOT NULL IN DESCRIBE DONE (2026-08-21, `serve-real-notnulldesc`
+  27):** the nullable bit now travels the engine's way (probed):
+  `expr_nullable` — an expression is nullable only when an input is
+  (arithmetic, negation, CAST, `||`, the string/date functions, CASE/IIF
+  by their branches); COALESCE, NULLIF, a boolean, a parameter, a
+  subquery and NULL always; `mark_not_null_join` — INNER keeps both
+  sides, LEFT/FULL null the right side, RIGHT/FULL everything before;
+  a GROUP BY key keeps its column's bit; a derived table / CTE copies
+  the inner's; a UNION is nullable when any branch is. Unknown shapes
+  stay nullable (the bit is only ever cleared when certain).
+  **Boundary found:** `CURRENT_TIMESTAMP` in a select list refuses
+  (`CURRENT_DATE` answers).
+- **NEXT**: the CHAR (452) describe/wire form for CAST AS CHAR and CHAR
+  columns; `CURRENT_TIMESTAMP` / `CURRENT_TIME` in a select list; the
+  `A`/`B`/`C`/`E` items above. (Full sweep 2026-08-21 after the UPDATE-format change: 259 gates, 8246 checks, 0 DIFF. MERGE `RETURNING` / `NOT MATCHED BY SOURCE`, `op_info_blob`
   / `op_seek_blob`, the ordered JOIN fetch streaming, the RIGHT/FULL
   hash, the bulk index build, the cleanup — all done 2026-08-21.)
 - **D, the MERGE executor** — the BLR is already compiled and tested;
