@@ -401,9 +401,15 @@ pointer-page and TIP page numbers is the next step when it dominates.
   transaction state; the write side is released between requests
   unconditionally. The gates that pinned the image path pin the state
   path now (`serve-real-autonomous` counts commits, not carve-outs).
-- **NEXT**: a merge join; the RIGHT/FULL side in a `RowStore`;
-  `op_inline_blob` on the op_execute2 singleton path (`op_inline_blob`
-  for fetched rows done 2026-08-21). (MERGE `RETURNING` / `NOT MATCHED BY SOURCE`, `op_info_blob`
+- **Merge join — a non-gap, recorded (2026-08-21):** the engine plans
+  one only when a to-be-hashed river exceeds `HashJoin::maxCapacity()`
+  AND the join is INNER (Optimizer.cpp `useMergeJoin = hashOverflow &&
+  INNER`; "MERGE JOIN does not support other join types yet"); fc's
+  hash build side spills to a `RowStore` past its budget instead, so the
+  overflow case is answered without a second join algorithm.
+- **NEXT**: the RIGHT/FULL side in a `RowStore`; `op_batch_*`;
+  `op_fetch_scroll`. (`op_inline_blob` for fetched rows AND the
+  op_execute2 singleton done 2026-08-21.) (MERGE `RETURNING` / `NOT MATCHED BY SOURCE`, `op_info_blob`
   / `op_seek_blob`, the ordered JOIN fetch streaming, the RIGHT/FULL
   hash, the bulk index build, the cleanup — all done 2026-08-21.)
 - **D, the MERGE executor** — the BLR is already compiled and tested;

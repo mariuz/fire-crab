@@ -35217,6 +35217,21 @@ fn encode_row_inline(
     Ok(())
 }
 
+/// The op_execute2 singleton's inline blobs, ahead of its op_sql_response
+/// (server.cpp execute_statement: `sendInlineBlobs` before the output
+/// message; the client takes them before the response, interface.cpp).
+fn inline_singleton_blobs(w: &mut W, db: Option<&Database>, values: &[Value], max: Option<u32>) {
+    let (Some(db), Some(max)) = (db, max) else { return };
+    if max == 0 {
+        return;
+    }
+    for v in values {
+        if let Value::Blob(rel, num) = v {
+            inline_blob_packet(w, db, *rel, *num, max);
+        }
+    }
+}
+
 /// One `op_inline_blob` (server.cpp `sendInlineBlob`): the transaction,
 /// the blob id as the row carries it (the same 8 bytes), the info a `isc_blob_info` of num_segments /
 /// max_segment / total_length / type would answer, and the content
@@ -54572,7 +54587,8 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     read_int(&mut s, &mut dec)?; // p_sqldata_cursor_flags
                 }
                 if best >= 19 {
-                    read_int(&mut s, &mut dec)?; // p_sqldata_inline_blob_size
+                    let n = read_int(&mut s, &mut dec)?; // p_sqldata_inline_blob_size
+                    inline_sizes.insert(cur_stmt, n.max(0) as u32);
                 }
                 // kicked by a forced shutdown: the engine's vector, no work
                 if database.as_ref().is_some_and(|d| d.kicked()) {
@@ -54616,6 +54632,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                             if pcols.is_empty() {
                                 w.int(OP_SQL_RESPONSE).int(0);
                             } else {
+                                inline_singleton_blobs(&mut w, database.as_ref(), &values, inline_sizes.get(&cur_stmt).copied());
                                 w.int(OP_SQL_RESPONSE).int(1);
                                 encode_row_body(&mut w, &pcols, &values, None).ok();
                             }
@@ -54655,6 +54672,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                             if pcols.is_empty() {
                                 w.int(OP_SQL_RESPONSE).int(0); // no message
                             } else {
+                                inline_singleton_blobs(&mut w, database.as_ref(), &values, inline_sizes.get(&cur_stmt).copied());
                                 w.int(OP_SQL_RESPONSE).int(1);
                                 encode_row_body(&mut w, &pcols, &values, None).ok();
                             }
@@ -54764,6 +54782,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                                     if record.is_none() {
                                         w.int(OP_SQL_RESPONSE).int(0); // no message
                                     } else {
+                                        inline_singleton_blobs(&mut w, database.as_ref(), &values, inline_sizes.get(&cur_stmt).copied());
                                         w.int(OP_SQL_RESPONSE).int(1);
                                         encode_row_body(&mut w, &rcols, &values, None).ok();
                                     }
