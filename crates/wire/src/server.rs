@@ -83,6 +83,12 @@ const OP_BATCH_MSG: i32 = 100;
 const OP_BATCH_EXEC: i32 = 101;
 const OP_BATCH_RLS: i32 = 102;
 const OP_BATCH_CS: i32 = 103;
+const OP_BATCH_REGBLOB: i32 = 104;
+const OP_BATCH_BLOB_STREAM: i32 = 105;
+const OP_BATCH_SET_BPB: i32 = 106;
+const OP_INFO_BATCH: i32 = 111;
+/// isc_batch_blob_id: "Unknown blob ID @1 in the batch message"
+const GDS_BATCH_BLOB_ID: i32 = 335545197;
 const OP_BATCH_CANCEL: i32 = 109;
 const OP_BATCH_SYNC: i32 = 110;
 /// isc_bad_batch_handle: "invalid batch handle"
@@ -345,6 +351,207 @@ struct BatchState {
     multierror: bool,
     record_counts: bool,
     detailed: usize,
+    /// BLOBS IN THE BATCH (DsqlBatch.cpp): the blob stream the client
+    /// sends ahead of its messages, decoded as it arrives
+    /// ([BatchStreamState]) into closed TEMP blobs; the default bpb's
+    /// mode (op_batch_set_bpb); and `blob_map` - batch id on the wire ->
+    /// the blob it stands for (a temp id, or an EXISTING blob's id from
+    /// op_batch_regblob). At execute every message's blob field naming
+    /// a batch id is re-spelled to that blob - once: a second use of the
+    /// same id is unknown, as the engine's m_blobMap.remove makes it.
+    bs: BatchStreamState,
+    default_segmented: bool,
+    blob_map: std::collections::HashMap<[u8; 8], [u8; 8]>,
+    /// TAG_BUFFER_BYTES_SIZE (the client's, or the engine's 16 MB default)
+    buffer_bytes: u32,
+}
+
+/// The blob stream's decoder state across op_batch_blob_stream packets
+/// - protocol.cpp `xdr_blob_stream` mirrored. The stream is a LOGICAL
+/// byte sequence (the client's buffer: 4-aligned 16-byte headers, bpb,
+/// data, 2-aligned `u16` segment lengths) of which the packet declares
+/// how many bytes it covers, but the wire carries: the header as
+/// xdr_quad + two xdr_u_long (16 bytes, big-endian), bpb and data raw,
+/// a segment length as an xdr_u_short (4 bytes) - and NO alignment
+/// padding; a header that would straddle two packets is HELD BACK
+/// (its first bytes count in this packet's length, the whole header
+/// travels with the next). `pos` is the logical position, the rest the
+/// blob in flight.
+#[derive(Default)]
+struct BatchStreamState {
+    pos: u64,
+    hdr_prev: u64,
+    blob_rem: u64,
+    bpb_rem: u64,
+    seg_rem: u64,
+    cur_bpb: Vec<u8>,
+    segmented: bool,
+    /// the blob being received: its batch id (wire form), the temp
+    /// blob taking its segments, and the segment under way
+    cur: Option<([u8; 8], TempBlob, Vec<u8>)>,
+}
+
+impl BatchStreamState {
+    /// One op_batch_blob_stream packet: `len` logical bytes declared,
+    /// read from the socket as the machine dictates; every blob that
+    /// completes becomes a closed temp blob and a `blob_map` entry.
+    #[allow(clippy::too_many_arguments)]
+    fn take_packet(
+        &mut self,
+        s: &mut TcpStream,
+        dec: &mut Option<Rc4>,
+        len: u64,
+        default_segmented: bool,
+        db: &mut Database,
+        map: &mut std::collections::HashMap<[u8; 8], [u8; 8]>,
+    ) -> std::io::Result<()> {
+        let bad = |m: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, m.to_string());
+        let mut remains = len;
+        while remains > 0 {
+            if self.blob_rem == 0 && self.cur.is_none() {
+                // the boundary: 4-align (logical only), then a header -
+                // whole, or held back when fewer than 16 bytes remain
+                let pad = (4 - self.pos % 4) % 4;
+                let pad = pad.min(remains);
+                self.pos += pad;
+                remains -= pad;
+                if remains == 0 {
+                    break;
+                }
+                if remains + self.hdr_prev < 16 {
+                    self.hdr_prev += remains;
+                    self.pos += remains;
+                    remains = 0;
+                    break;
+                }
+                let hdr = read_n(s, dec, 16)?;
+                let id: [u8; 8] = hdr[0..8].try_into().unwrap();
+                let total = u64::from(u32::from_be_bytes(hdr[8..12].try_into().unwrap()));
+                let bpb_len = u64::from(u32::from_be_bytes(hdr[12..16].try_into().unwrap()));
+                let consumed = 16 - self.hdr_prev;
+                self.pos += consumed;
+                remains -= consumed;
+                self.hdr_prev = 0;
+                if bpb_len > total {
+                    return Err(bad("batch blob stream: bpb longer than its blob"));
+                }
+                self.blob_rem = total;
+                self.bpb_rem = bpb_len;
+                self.seg_rem = 0;
+                self.cur_bpb.clear();
+                self.segmented = default_segmented;
+                self.cur = Some((id, TempBlob { stream: !default_segmented, closed: true, ..TempBlob::default() }, Vec::new()));
+                if total == 0 {
+                    self.finish(db, map);
+                }
+                continue;
+            }
+            if self.bpb_rem > 0 {
+                let n = self.bpb_rem.min(remains);
+                let bytes = read_n(s, dec, n as usize)?;
+                self.cur_bpb.extend_from_slice(&bytes);
+                self.bpb_rem -= n;
+                self.blob_rem -= n;
+                self.pos += n;
+                remains -= n;
+                if self.bpb_rem == 0 {
+                    self.segmented = bpb_segmented(&self.cur_bpb);
+                    if let Some((_, tb, _)) = self.cur.as_mut() {
+                        tb.stream = !self.segmented;
+                    }
+                }
+                if self.blob_rem == 0 {
+                    self.finish(db, map);
+                }
+                continue;
+            }
+            if self.blob_rem > 0 {
+                if self.segmented {
+                    if self.seg_rem == 0 {
+                        if self.pos % 2 == 1 {
+                            // the segment header's 2-alignment: logical only,
+                            // charged to the blob as the encoder charges it
+                            self.pos += 1;
+                            remains -= 1;
+                            self.blob_rem -= 1;
+                            continue;
+                        }
+                        let raw = read_n(s, dec, 4)?; // xdr_u_short
+                        let seg = u64::from(u16::from_be_bytes([raw[2], raw[3]]));
+                        self.pos += 2;
+                        remains = remains.saturating_sub(2);
+                        self.blob_rem = self.blob_rem.saturating_sub(2);
+                        if seg > self.blob_rem {
+                            return Err(bad("batch blob stream: segment past its blob"));
+                        }
+                        self.seg_rem = seg;
+                        if seg == 0 {
+                            if let Some((_, tb, _)) = self.cur.as_mut() {
+                                put_blob_segment(tb, &[]);
+                            }
+                        }
+                    }
+                    let n = self.seg_rem.min(remains);
+                    if n > 0 {
+                        let bytes = read_n(s, dec, n as usize)?;
+                        if let Some((_, _, seg_buf)) = self.cur.as_mut() {
+                            seg_buf.extend_from_slice(&bytes);
+                        }
+                        self.seg_rem -= n;
+                        self.blob_rem -= n;
+                        self.pos += n;
+                        remains -= n;
+                        if self.seg_rem == 0 {
+                            if let Some((_, tb, seg_buf)) = self.cur.as_mut() {
+                                let seg = std::mem::take(seg_buf);
+                                put_blob_segment(tb, &seg);
+                            }
+                        }
+                    }
+                } else {
+                    let n = self.blob_rem.min(remains);
+                    let bytes = read_n(s, dec, n as usize)?;
+                    if let Some((_, tb, _)) = self.cur.as_mut() {
+                        put_blob_segment(tb, &bytes);
+                    }
+                    self.blob_rem -= n;
+                    self.pos += n;
+                    remains -= n;
+                }
+                if self.blob_rem == 0 {
+                    self.finish(db, map);
+                }
+                continue;
+            }
+            return Err(bad("batch blob stream: decoder stuck"));
+        }
+        Ok(())
+    }
+
+    /// The blob in flight is complete: a closed temp blob of this
+    /// transaction, and its batch id maps to it
+    fn finish(&mut self, db: &mut Database, map: &mut std::collections::HashMap<[u8; 8], [u8; 8]>) {
+        if let Some((id, tb, _)) = self.cur.take() {
+            db.next_temp_blob += 1;
+            let temp = db.next_temp_blob;
+            db.temp_blobs.insert(temp, tb);
+            map.insert(id, encode_blob_id(0, u64::from(temp)));
+        }
+    }
+}
+
+/// fb_utils::isBpbSegmented: a bpb without isc_bpb_type (3) is
+/// SEGMENTED; with it, stream iff the type has isc_bpb_type_stream set
+fn bpb_segmented(bpb: &[u8]) -> bool {
+    let mut at = 1usize;
+    while at + 2 <= bpb.len() {
+        let (tag, len) = (bpb[at], bpb[at + 1] as usize);
+        if tag == 3 && len >= 1 && at + 2 < bpb.len() {
+            return bpb[at + 2] & 1 == 0;
+        }
+        at += 2 + len;
+    }
+    true
 }
 
 /// The batch parameters block: a WIDE-tagged clumplet buffer
@@ -353,8 +560,8 @@ struct BatchState {
 /// integers). Read as a byte-length buffer, every knob came out off and
 /// libfbclient, expecting the counts it had asked for, crashed on a
 /// count-less completion state.
-fn batch_pb_flags(pb: &[u8]) -> (bool, bool, usize) {
-    let (mut multierror, mut counts, mut detailed) = (false, false, 64usize);
+fn batch_pb_flags(pb: &[u8]) -> (bool, bool, usize, u32) {
+    let (mut multierror, mut counts, mut detailed, mut buffer) = (false, false, 64usize, 16u32 << 20);
     let mut at = 1usize; // the version tag
     while at + 5 <= pb.len() {
         let tag = pb[at];
@@ -368,12 +575,13 @@ fn batch_pb_flags(pb: &[u8]) -> (bool, bool, usize) {
         match tag {
             1 => multierror = v != 0,          // TAG_MULTIERROR
             2 => counts = v != 0,              // TAG_RECORD_COUNTS
+            3 => buffer = v as u32,            // TAG_BUFFER_BYTES_SIZE
             5 => detailed = (v as usize).min(256), // TAG_DETAILED_ERRORS
             _ => {}
         }
         at = end;
     }
-    (multierror, counts, detailed)
+    (multierror, counts, detailed, buffer)
 }
 
 /// The status-vector ITEMS of a failed DML, without the terminator -
@@ -54008,14 +54216,27 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
                     continue;
                 };
-                let (multierror, record_counts, detailed) = batch_pb_flags(&pb);
+                let (multierror, record_counts, detailed, buffer_bytes) = batch_pb_flags(&pb);
                 if std::env::var("FC_SRV_TRACE").is_ok() {
                     eprintln!(
                         "[srv] batch create: stmt {} slots {} multierror={} counts={} detailed={}",
                         h, slots.len(), multierror, record_counts, detailed
                     );
                 }
-                batches.insert(h, BatchState { slots, msgs: Vec::new(), multierror, record_counts, detailed });
+                batches.insert(
+                    h,
+                    BatchState {
+                        slots,
+                        msgs: Vec::new(),
+                        multierror,
+                        record_counts,
+                        detailed,
+                        bs: BatchStreamState::default(),
+                        default_segmented: false, // DsqlBatch initBlobParameters: isc_bpb_type_stream
+                        blob_map: std::collections::HashMap::new(),
+                        buffer_bytes,
+                    },
+                );
                 respond(&mut s, &mut enc, 0)?;
             }
             x if x == OP_BATCH_MSG => {
@@ -54038,6 +54259,126 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 }
                 respond(&mut s, &mut enc, 0)?;
             }
+            x if x == OP_INFO_BATCH => {
+                // p_info over the batch (DsqlBatch::info): the client's
+                // setServerInfo asks INF_BLOB_ALIGNMENT (13 -> 4,
+                // BLOB_STREAM_ALIGN), INF_BUFFER_BYTES_SIZE (10) and
+                // INF_BLOB_HEADER (14 -> 16, SIZEOF_BLOB_HEAD) before its
+                // first blob packet; INF_DATA_BYTES_SIZE (11) and
+                // INF_BLOBS_BYTES_SIZE (12, only when non-zero) are the
+                // queued bytes. Each `tag, u16 LE length, i32 LE value`.
+                let h = read_int(&mut s, &mut dec)?;
+                read_int(&mut s, &mut dec)?; // incarnation
+                let items = read_wire_bytes(&mut s, &mut dec)?;
+                let buf_len = read_int(&mut s, &mut dec)?.max(0) as usize;
+                let Some(b) = batches.get(&h) else {
+                    respond_error(&mut s, &mut enc, GDS_BAD_BATCH_HANDLE)?;
+                    continue;
+                };
+                let mut info: Vec<u8> = Vec::new();
+                let mut want_length = false;
+                for &item in &items {
+                    let v: Option<i32> = match item {
+                        1 => break,
+                        10 => Some(b.buffer_bytes as i32),
+                        11 => Some(0),
+                        12 => {
+                            if b.bs.pos == 0 {
+                                continue;
+                            }
+                            Some(b.bs.pos as i32)
+                        }
+                        13 => Some(4),
+                        14 => Some(16),
+                        126 => {
+                            want_length = true; // isc_info_length
+                            continue;
+                        }
+                        _ => None,
+                    };
+                    match v {
+                        Some(v) => {
+                            info.push(item);
+                            info.extend_from_slice(&4u16.to_le_bytes());
+                            info.extend_from_slice(&v.to_le_bytes());
+                        }
+                        None => {
+                            info.push(3); // isc_info_error
+                            info.extend_from_slice(&4u16.to_le_bytes());
+                            info.extend_from_slice(&335544414i32.to_le_bytes()); // isc_infunk
+                        }
+                    }
+                }
+                info.push(1); // isc_info_end
+                if want_length {
+                    let n = (info.len() + 7) as i32;
+                    let mut with = vec![126u8];
+                    with.extend_from_slice(&4u16.to_le_bytes());
+                    with.extend_from_slice(&n.to_le_bytes());
+                    with.extend_from_slice(&info);
+                    info = with;
+                }
+                if info.len() > buf_len {
+                    info.truncate(buf_len.saturating_sub(1));
+                    info.push(2); // isc_info_truncated
+                }
+                let mut w = W::default();
+                w.int(OP_RESPONSE).int(0).int(0).int(0).bytes(&info).int(0);
+                w.send(&mut s, &mut enc)?;
+            }
+            x if x == OP_BATCH_SET_BPB => {
+                let h = read_int(&mut s, &mut dec)?;
+                let bpb = read_wire_bytes(&mut s, &mut dec)?;
+                match batches.get_mut(&h) {
+                    Some(b) => {
+                        b.default_segmented = bpb_segmented(&bpb);
+                        respond(&mut s, &mut enc, 0)?;
+                    }
+                    None => respond_error(&mut s, &mut enc, GDS_BAD_BATCH_HANDLE)?,
+                }
+            }
+            x if x == OP_BATCH_REGBLOB => {
+                // p_batch_regblob: statement, the EXISTING blob's id, the
+                // batch id that names it in the messages (both xdr_quad)
+                let h = read_int(&mut s, &mut dec)?;
+                let exist = read_n(&mut s, &mut dec, 8)?;
+                let batch_id = read_n(&mut s, &mut dec, 8)?;
+                match batches.get_mut(&h) {
+                    Some(b) => {
+                        b.blob_map.insert(batch_id.try_into().unwrap(), exist.try_into().unwrap());
+                        respond(&mut s, &mut enc, 0)?;
+                    }
+                    None => respond_error(&mut s, &mut enc, GDS_BAD_BATCH_HANDLE)?,
+                }
+            }
+            x if x == OP_BATCH_BLOB_STREAM => {
+                // p_batch_blob: statement, then u32 length + that many raw
+                // bytes of the stream (4-aligned; the engine's xdr carries
+                // a header split across packets along, the bytes are the
+                // client's stream in order)
+                let h = read_int(&mut s, &mut dec)?;
+                let len = read_int(&mut s, &mut dec)?.max(0) as u64;
+                match (batches.get_mut(&h), database.as_mut()) {
+                    (Some(b), Some(db)) => {
+                        let BatchState { bs, default_segmented, blob_map, .. } = b;
+                        // the decoder reads what the machine says is on the
+                        // wire; a refused stream cannot be consumed, so the
+                        // connection ends (as an undecodable message does)
+                        bs.take_packet(&mut s, &mut dec, len, *default_segmented, db, blob_map)?;
+                        if std::env::var("FC_SRV_TRACE").is_ok() {
+                            eprintln!(
+                                "[srv] batch blob stream: stmt {} +{} bytes (pos {}, {} blobs mapped)",
+                                h, len, bs.pos, blob_map.len()
+                            );
+                        }
+                        respond(&mut s, &mut enc, 0)?;
+                    }
+                    _ => {
+                        respond_error(&mut s, &mut enc, GDS_BAD_BATCH_HANDLE)?;
+                        break;
+                    }
+                }
+            }
             x if x == OP_BATCH_EXEC => {
                 let h = read_int(&mut s, &mut dec)?;
                 read_int(&mut s, &mut dec)?; // transaction handle
@@ -54046,13 +54387,49 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     respond_error(&mut s, &mut enc, GDS_BAD_BATCH_HANDLE)?;
                     continue;
                 };
-                let msgs = std::mem::take(&mut b.msgs);
+                let mut msgs = std::mem::take(&mut b.msgs);
                 let (multierror, record_counts, detailed) = (b.multierror, b.record_counts, b.detailed);
+                // THE BLOBS FIRST (DsqlBatch::execute): the stream's blobs
+                // become temp blobs, the registered ids stand for their
+                // existing blobs, and every message's blob field is
+                // re-spelled - once per batch id; an unknown id fails the
+                // whole execute with isc_batch_blob_id before any message
+                // runs
+                let mut map = std::mem::take(&mut b.blob_map);
+                b.bs = BatchStreamState::default(); // DsqlBatch::cancel: the stream is spent
+                if !map.is_empty() && std::env::var("FC_SRV_TRACE").is_ok() {
+                    eprintln!("[srv] batch blobs: stmt {} {} ids", h, map.len());
+                }
                 let ctx = SessionCtx { user, attach_id };
                 // per message: its update count, or its failure
                 let mut states: Vec<i32> = Vec::with_capacity(msgs.len());
                 let mut errors: Vec<(u32, ExecErr)> = Vec::new();
-                for (i, args) in msgs.iter().enumerate() {
+                let mut unknown: Option<[u8; 8]> = None;
+                for (i, args) in msgs.iter_mut().enumerate() {
+                    // THE MESSAGE'S BLOB IDS, checked as the message comes
+                    // up (DsqlBatch::execute: the map lookup sits inside
+                    // the message loop, before EXE_send): an unknown id
+                    // ends the execute with isc_batch_blob_id - the
+                    // messages before it are stored and STAY, the rest
+                    // never run (probed: two messages naming one id, the
+                    // first row is in the table after the error)
+                    for a in args.iter_mut() {
+                        if let WireParam::BlobId(id) = a {
+                            if *id == [0u8; 8] {
+                                continue;
+                            }
+                            match map.remove(id) {
+                                Some(engine) => *id = engine,
+                                None => {
+                                    unknown = Some(*id);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if unknown.is_some() {
+                        break;
+                    }
                     match timed("batch execute", || execute_dml(&*plan, &mut database, args, &ctx)) {
                         Ok((ins, upd, del)) => states.push(ins + upd + del),
                         Err(e) => {
@@ -54073,6 +54450,18 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                         "[srv] batch exec: stmt {} {} messages run, {} failed, counts={}",
                         h, states.len(), errors.len(), record_counts
                     );
+                }
+                if let Some(id) = unknown {
+                    // isc_dsql_error, isc_sqlerr -104, isc_batch_blob_id "<high>:<low>"
+                    let hi = u32::from_be_bytes(id[0..4].try_into().unwrap());
+                    let lo = u32::from_be_bytes(id[4..8].try_into().unwrap());
+                    let mut w = W::default();
+                    w.int(OP_RESPONSE).int(0).int(0).int(0).int(0);
+                    w.int(1).int(GDS_DSQL_ERROR);
+                    w.int(1).int(GDS_SQLERR).int(ISC_ARG_NUMBER).int(-104);
+                    w.int(1).int(GDS_BATCH_BLOB_ID).int(2).bytes(format!("{:x}:{:x}", hi, lo).as_bytes()).int(0);
+                    w.send(&mut s, &mut enc)?;
+                    continue;
                 }
                 // op_batch_cs: statement, records, update counters (all of
                 // them when counts were asked for, else none), the errors

@@ -186,7 +186,7 @@ max_segment pieces) — when the framed length fits; the client then serves
 info / seek / get_segment from its copy (the gate's inline pass: wire
 opens fall away, the answers are the engine's line for line).
 
-**Still absent:** blobs inside a batch, `op_ping`, `op_slice` (arrays),
+**Still absent:** `op_ping`, `op_slice` (arrays),
 `op_transact`. Auth: only Srp256 offered; no Legacy_Auth / ChaCha /
 zlib. `op_info_transaction` answers only `isc_info_tra_id`. A text blob
 is stored in the database charset (UTF8) with no bpb transliteration.
@@ -432,8 +432,8 @@ pointer-page and TIP page numbers is the next step when it dominates.
   (64), and the run stops at the first failure unless `TAG_MULTIERROR`.
   Laws probed: the parameters block is WIDE-tagged (u32 lengths); a
   second `createBatch` supersedes the open one. Client `qa/c/batch.cpp`
-  (OO API). **Still absent:** blobs inside a batch (`op_batch_regblob` /
-  `op_batch_blob_stream` / `op_batch_set_bpb`), `op_info_batch`.
+  (OO API). Blobs inside a batch and `op_info_batch` followed the same
+  day (below).
 - **Blob parameters in UPDATE … SET DONE (2026-08-21,
   `serve-real-blobupdate` 64, client `qa/c/blobupdate.c`):** a blr_quad
   parameter at an UPDATE's SET (and UPDATE OR INSERT's update half) goes
@@ -452,7 +452,24 @@ pointer-page and TIP page numbers is the next step when it dominates.
   source value; `SET blob = <expression>`; `OCTET_LENGTH` of the blob
   inside the writing statement's RETURNING; a blob id bound to a
   non-BLOB column refuses (the engine converts).
-- **NEXT**: blobs inside a batch; `op_ping` / `op_transact` / `op_slice`. (MERGE `RETURNING` / `NOT MATCHED BY SOURCE`, `op_info_blob`
+- **Blobs inside a batch DONE (2026-08-21, `serve-real-batchblob` 52,
+  client `qa/c/batchblob.cpp`):** `op_batch_blob_stream` decoded as a
+  per-statement state machine mirroring protocol.cpp `xdr_blob_stream`
+  (the 16-byte header as xdr_quad + two big-endian u32s, a header that
+  would straddle packets held back and counted in the next packet's
+  length, bpb and data raw, a segment length as a 4-byte xdr_u_short,
+  alignment padding never on the wire) into closed temp blobs;
+  `op_batch_set_bpb` (the default is STREAM — `initBlobParameters`);
+  `op_batch_regblob` (a batch id over an existing blob, which the store
+  then copies); `op_info_batch` (blob alignment 4, header 16, buffer
+  size — the client asks before its first blob packet). At execute each
+  message's blob field is re-spelled as the message comes up; an unknown
+  id ends the execute with `isc_dsql_error` / `-104` /
+  `isc_batch_blob_id`, the messages before it stored and kept (probed).
+  Policies BLOB_ID_ENGINE / BLOB_ID_USER / BLOB_STREAM, appendBlobData,
+  per-blob bpb, a 5000-byte blob, all line for line with the engine.
+- **NEXT**: `op_ping` / `op_transact` / `op_slice` (arrays); the auth
+  tail (Legacy_Auth / ChaCha / zlib). (MERGE `RETURNING` / `NOT MATCHED BY SOURCE`, `op_info_blob`
   / `op_seek_blob`, the ordered JOIN fetch streaming, the RIGHT/FULL
   hash, the bulk index build, the cleanup — all done 2026-08-21.)
 - **D, the MERGE executor** — the BLR is already compiled and tested;
