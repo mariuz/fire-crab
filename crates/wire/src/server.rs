@@ -15946,14 +15946,15 @@ fn plan_create_table(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
         return None;
     }
     let body = &s[open + 1..close];
-    // split on top-level commas (type args carry their own parens)
+    // split on top-level commas (type args carry their own parens; an ARRAY
+    // column's `[l:u, l:u]` bounds carry their own brackets)
     let mut items: Vec<&str> = Vec::new();
     let mut depth = 0usize;
     let mut start = 0usize;
     for (i, ch) in body.char_indices() {
         match ch {
-            '(' => depth += 1,
-            ')' => depth = depth.checked_sub(1)?,
+            '(' | '[' => depth += 1,
+            ')' | ']' => depth = depth.checked_sub(1)?,
             ',' if depth == 0 => {
                 items.push(&body[start..i]);
                 start = i + 1;

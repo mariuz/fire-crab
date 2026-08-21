@@ -134,6 +134,23 @@ int main(int argc, char **argv) {
             if (isc_dsql_execute(st, &tr, &sth, 1, in)) die("execute insert 3");
             isc_dsql_free_statement(st, &sth, DSQL_drop); free(in);
         }
+        /* 3b. a MULTI-DIMENSIONAL array in a table created THROUGH this server */
+        exec("CREATE TABLE AR3 (ID INTEGER NOT NULL PRIMARY KEY, MM INTEGER [1:2, 1:3])");
+        if (isc_commit_retaining(st, &tr)) die("commit retaining AR3");
+        {   ISC_ARRAY_DESC dmm; desc2(&dmm, "AR3", "MM", blr_long, 4, 1, 2, 1, 3);
+            int mm[2][3] = { { 10, 20, 30 }, { 40, 50, 60 } }; len = sizeof mm; memset(&id, 0, sizeof id);
+            if (isc_array_put_slice(st, &db, &tr, &id, &dmm, mm, &len)) die("put MM");
+            printf("put MM (2x3): len %ld\n", (long)len);
+            XSQLDA *in = (XSQLDA *)calloc(1, XSQLDA_LENGTH(2)); in->version = SQLDA_VERSION1; in->sqln = 2; in->sqld = 2;
+            int rid = 1; short i0 = 0, i1 = 0;
+            in->sqlvar[0].sqltype = SQL_LONG; in->sqlvar[0].sqldata = (char *)&rid; in->sqlvar[0].sqllen = 4; in->sqlvar[0].sqlind = &i0;
+            in->sqlvar[1].sqltype = SQL_ARRAY; in->sqlvar[1].sqldata = (char *)&id; in->sqlvar[1].sqllen = 8; in->sqlvar[1].sqlind = &i1;
+            isc_stmt_handle sth = 0;
+            if (isc_dsql_allocate_statement(st, &db, &sth)) die("alloc");
+            if (isc_dsql_prepare(st, &tr, &sth, 0, "INSERT INTO AR3 (ID, MM) VALUES (?, ?)", 3, NULL)) die("prepare insert AR3");
+            if (isc_dsql_execute(st, &tr, &sth, 1, in)) die("execute insert AR3");
+            isc_dsql_free_statement(st, &sth, DSQL_drop); free(in);
+        }
         /* 4. NUMERIC(9,2)[1:3] and CHAR(4)[1:2] elements, a BIGINT[0:1]; an ALTER ADD array */
         exec("CREATE TABLE AN (ID INTEGER NOT NULL PRIMARY KEY, N NUMERIC(9,2) [1:3], C CHAR(4) [1:2], B BIGINT [0:1])");
         exec("ALTER TABLE AR2 ADD Z SMALLINT [1:2]");
@@ -211,12 +228,18 @@ int main(int argc, char **argv) {
             if (isc_array_get_slice(st, &db, &tr, &id, &dw, buf, &len)) printf("W of row 7: get error %s\n", errtext());
             else printf("W of row 7: len %ld: %d %d %d\n", (long)len, buf[0], buf[1], buf[2]);
         } else printf("W of row 7: null\n"); }
+    {   ISC_ARRAY_DESC dmm; desc2(&dmm, "AR3", "MM", blr_long, 4, 1, 2, 1, 3);
+        if (fetch_id("SELECT MM FROM AR3 WHERE ID = 1", &id)) {
+            int buf[6] = { -1, -1, -1, -1, -1, -1 }; ISC_LONG len = sizeof buf;
+            if (isc_array_get_slice(st, &db, &tr, &id, &dmm, buf, &len)) printf("MM of row 1: get error %s\n", errtext());
+            else printf("MM of row 1: len %ld: %d %d %d %d %d %d\n", (long)len, buf[0], buf[1], buf[2], buf[3], buf[4], buf[5]);
+        } else printf("MM of row 1: null\n"); }
     /* the CLIENT's own catalog lookup - isc_array_lookup_bounds runs the
        search-path CTE (row_number() over a parse_unqualified_names derived
        table, joined to system.rdb$relation_fields / rdb$fields /
        rdb$field_dimensions) over the wire */
-    {   const char *lk[][2] = { { "AN", "N" }, { "AN", "C" }, { "AR", "M" }, { "AR2", "Z" }, { "AR", "NOPE" }, { "TD", "A" }, { "TD", "N" } };
-        for (int i = 0; i < 7; i++) {
+    {   const char *lk[][2] = { { "AN", "N" }, { "AN", "C" }, { "AR", "M" }, { "AR2", "Z" }, { "AR", "NOPE" }, { "TD", "A" }, { "TD", "N" }, { "AR3", "MM" } };
+        for (int i = 0; i < 8; i++) {
             ISC_ARRAY_DESC ld; memset(&ld, 0, sizeof ld);
             if (isc_array_lookup_bounds(st, &db, &tr, (char *)lk[i][0], (char *)lk[i][1], &ld)) { printf("lookup %s.%s: error %s\n", lk[i][0], lk[i][1], errtext()); continue; }
             printf("lookup %s.%s: dtype %d scale %d length %d dims %d [%d:%d]", lk[i][0], lk[i][1], ld.array_desc_dtype, ld.array_desc_scale, ld.array_desc_length, ld.array_desc_dimensions, ld.array_desc_bounds[0].array_bound_lower, ld.array_desc_bounds[0].array_bound_upper);
