@@ -1518,6 +1518,57 @@ fn respond_ddl_meta(
         format!("\"PUBLIC\".\"{}\"", n.trim().trim_matches('"').to_ascii_uppercase())
     };
     let lc = err_text.to_ascii_lowercase();
+    // BLOB FILTERS spell their own vectors (probed): a duplicate name is
+    // "DECLARE FILTER F1 failed" + "Blob filter "F1" already exists" (the
+    // bare name, then the quoted one); a duplicate (input, output) pair is
+    // the unique-key violation on RDB$INDEX_17 of "SYSTEM"."RDB$FILTERS"
+    // with the problematic key; a missing DROP is "DROP FILTER NOPE
+    // failed" + "BLOB Filter NOPE not found" - unqualified, unquoted.
+    let filter_vec: Option<Vec<(i32, String)>> = match plan {
+        Plan::DeclareFilter { name, input, output, .. } => {
+            let n = name.trim().trim_matches('"').to_ascii_uppercase();
+            if lc.contains("already exists") && lc.contains("pair") {
+                Some(vec![
+                    (1, "336397315".into()),
+                    (2, n),
+                    (1, "335544665".into()),
+                    (2, "\"RDB$INDEX_17\"".into()),
+                    (2, "\"SYSTEM\".\"RDB$FILTERS\"".into()),
+                    (1, "335545072".into()),
+                    (2, format!("(\"RDB$INPUT_SUB_TYPE\" = {}, \"RDB$OUTPUT_SUB_TYPE\" = {})", input, output)),
+                ])
+            } else if lc.contains("already exists") {
+                Some(vec![
+                    (1, "336397315".into()),
+                    (2, n.clone()),
+                    (1, "336068930".into()),
+                    (2, format!("\"{}\"", n)),
+                ])
+            } else {
+                None
+            }
+        }
+        Plan::DropFilter { name } if lc.contains("not found") => {
+            let n = name.trim().trim_matches('"').to_ascii_uppercase();
+            Some(vec![(1, "336397306".into()), (2, n.clone()), (1, "336068645".into()), (2, n)])
+        }
+        _ => None,
+    };
+    if let Some(items) = filter_vec {
+        let mut w = W::default();
+        w.int(OP_RESPONSE).int(0).int(0).int(0).int(0);
+        w.int(1).int(GDS_NO_META_UPDATE);
+        for (kind, v) in items {
+            if kind == 1 {
+                w.int(1).int(v.parse::<i32>().unwrap_or(0));
+            } else {
+                w.int(2).bytes(v.as_bytes());
+            }
+        }
+        w.int(0);
+        w.send(s, enc)?;
+        return Ok(true);
+    }
     // DROP TABLE of a missing name is the ONE nested reason: after the
     // "DROP TABLE @1 failed" wrapper the engine adds isc_dsql_command_err
     // (-607, "Invalid command") and a "-Table @1 does not exist" string
@@ -1943,7 +1994,13 @@ fn build_describe(cols: &[ProjCol], params: &[Descriptor], att: AttCs) -> Vec<u8
         // an attachment-charset or real-charset-expression text column
         // resolves to its announced charset, width in its bytes - same
         // law as [answer_prepare] (see [resolve_text_cs])
-        let (sub_type, length) = resolve_text_cs(c.sub_type, c.length, c.oct_length, &att);
+        // a BLOB's sub_type is its own (a negative one is a user
+        // sub_type, not the text-charset sentinel) and its length is 8
+        let (sub_type, length) = if matches!(c.wire, Wire::Blob) {
+            (c.sub_type, c.length)
+        } else {
+            resolve_text_cs(c.sub_type, c.length, c.oct_length, &att)
+        };
         int_item(&mut d, 9, (i + 1) as i32); // sqlda_seq
         int_item(&mut d, 11, c.sql_type); // type
         int_item(&mut d, 12, sub_type); // sub_type (blob text/binary, text ttype)
@@ -2182,6 +2239,12 @@ struct Database {
     /// seconds on another's lock then raises the same conflict rather
     /// than waiting on. None = wait to the server's own cap.
     lock_timeout: Option<u32>,
+    /// isc_tpb_read: the transaction was started READ ONLY (answered by
+    /// isc_info_tra_access; the write refusal is elsewhere)
+    read_only: bool,
+    /// the database name exactly as the client attached to it - alias,
+    /// host prefix and all - which fb_info_tra_dbpath answers verbatim
+    attach_name: String,
     /// isc_tpb_consistency (degree3, "table stability"). A consistency
     /// transaction RESERVES every table it touches in a PROTECTED mode,
     /// so no one else may write them while it lives. Ordinary
@@ -3879,6 +3942,8 @@ fn load_database(path: &str) -> Option<Database> {
         autonomous_ids: Vec::new(),
         wait: true,
         lock_timeout: None,
+        read_only: false,
+        attach_name: String::new(),
         consistency: false,
     })
 }
@@ -5361,6 +5426,8 @@ fn restore_column_def(
         precision,
         char_len,
         dims: Vec::new(),
+        segment_length: None,
+        charset_id: None,
         not_null: c.not_null,
         not_null_constraint: c.not_null,
         default: None,
@@ -7050,6 +7117,9 @@ enum Plan {
     /// from the RDB$EXCEPTIONS generator), its security class and the
     /// owner's USAGE grant
     CreateException { name: String, message: String },
+    /// `DECLARE FILTER <name> INPUT_TYPE i OUTPUT_TYPE o ENTRY_POINT 'e' MODULE_NAME 'm'`
+    DeclareFilter { name: String, input: i16, output: i16, entry: String, module: String },
+    DropFilter { name: String },
     /// `DROP PROCEDURE <name>`.
     DropProcedure { name: String },
     /// `CREATE PROCEDURE ...` - the BLR is the dsql crate's
@@ -7285,6 +7355,10 @@ AlterDomainRename {
         /// the DEFAULTs of the columns the INSERT list omits, applied
         /// at execute exactly where the engine fills them
         default_fields: Vec<(usize, DefaultVal)>,
+        /// LITERALS bound for BLOB columns: (field, bytes, the literal's
+        /// sub_type - 1 for a string, 0 for `_octets`), stored as blobs of
+        /// this relation at execute (the engine's blb::move of a temp blob)
+        blob_lits: Vec<(usize, Vec<u8>, i16)>,
     },
     /// `UPDATE <t> SET col = <lit|?> [, ...] [WHERE ...]`: literal SET
     /// values are encoded at prepare, parameter ones bind at execute;
@@ -8038,6 +8112,9 @@ enum GenWrite {
 #[derive(Clone)]
 enum SetVal {
     Lit(Option<Vec<u8>>),
+    /// a literal for a BLOB column: the bytes and the literal's sub_type
+    /// (1 string, 0 `_octets`), stored per matching row at execute
+    BlobLit(Vec<u8>, i16),
     Param(usize),
     /// `SET <col> = <expression>` - evaluated PER ROW against that row's
     /// own values, so `SET N = N + 5` reads the N it is replacing. A
@@ -10289,7 +10366,7 @@ fn wire_for(d: &Descriptor) -> (Wire, i32, i32, i32, i32) {
         dtype::BOOLEAN => (Wire::Bool, 32764, 1, 0, 0),  // SQL_BOOLEAN
         // blob: the 8-byte id travels, content via the blob ops; the
         // describe carries the sub_type so clients know text vs binary
-        dtype::BLOB => (Wire::Blob, 520, 8, 0, d.sub_type as i32), // SQL_BLOB
+        dtype::BLOB => (Wire::Blob, 520, 8, d.scale as i32, d.sub_type as i32), // SQL_BLOB: scale = charset
         dtype::ARRAY => (Wire::Blob, 540, 8, 0, 0), // SQL_ARRAY: the array blob's id
         dtype::INT128 => (Wire::Int128, 32752, 16, scale, d.sub_type as i32), // SQL_INT128
         dtype::SQL_TIME_TZ => (Wire::TimeTz, 32756, 8, 0, 0), // SQL_TIME_TZ
@@ -10357,25 +10434,61 @@ fn not_null_fids_uncached(db: &Database, table: &str) -> Vec<usize> {
             .find(|c| c.name == name)
             .map(|c| c.field_id as usize)
     };
-    let (Some(rel_fid), Some(id_fid), Some(nn_fid)) = (
+    let (Some(rel_fid), Some(id_fid), Some(nn_fid), Some(src_fid)) = (
         fid_of("RDB$RELATION_NAME"),
         fid_of("RDB$FIELD_ID"),
         fid_of("RDB$NULL_FLAG"),
+        fid_of("RDB$FIELD_SOURCE"),
     ) else {
         return Vec::new();
     };
     let mut out = Vec::new();
+    // a column of a DOMAIN carries the domain's nullability: RDB$NULL_FLAG
+    // on the domain's RDB$FIELDS row (the RELATION_FIELDS row stays NULL -
+    // probed: `CREATE DOMAIN DS AS INTEGER NOT NULL; CREATE TABLE TS (S
+    // DS)` refuses an omitted S with isc_not_valid on "TS"."S")
+    let mut by_source: Vec<(usize, String)> = Vec::new();
     let fmts = vec![(0u8, descs.clone())];
     for_each_record(db, 5, &fmts, usize::MAX, |values| {
         let is_rel = matches!(values.get(rel_fid), Some(Value::Text(t)) if t.trim_end().eq_ignore_ascii_case(table));
-        if is_rel
-            && matches!(values.get(nn_fid), Some(Value::Int(1)))
-        {
-            if let Some(Value::Int(id)) = values.get(id_fid) {
-                out.push(*id as usize);
-            }
+        if !is_rel {
+            return;
+        }
+        let Some(Value::Int(id)) = values.get(id_fid) else { return };
+        if matches!(values.get(nn_fid), Some(Value::Int(1))) {
+            out.push(*id as usize);
+        } else if let Some(Value::Text(src)) = values.get(src_fid) {
+            by_source.push((*id as usize, src.trim_end().to_string()));
         }
     });
+    if !by_source.is_empty() {
+        if let Some(ff) =
+            fire_crab_ods::sysfmt::system_relation_formats(&db.bytes(), db.page_size, "RDB$FIELDS")
+        {
+            if let Some((_, fdescs)) = ff.iter().max_by_key(|(n, _)| *n) {
+                let fcols = relation_columns(&db.bytes(), db.page_size, "RDB$FIELDS");
+                let ffid = |name: &str| fcols.iter().find(|c| c.name == name).map(|c| c.field_id as usize);
+                if let (Some(fname), Some(fnn)) = (ffid("RDB$FIELD_NAME"), ffid("RDB$NULL_FLAG")) {
+                    let ffmts = vec![(0u8, fdescs.clone())];
+                    for_each_record(db, 2, &ffmts, usize::MAX, |values| {
+                        if !matches!(values.get(fnn), Some(Value::Int(1))) {
+                            return;
+                        }
+                        if let Some(Value::Text(n)) = values.get(fname) {
+                            let n = n.trim_end();
+                            for (id, src) in &by_source {
+                                if src.eq_ignore_ascii_case(n) {
+                                    out.push(*id);
+                                }
+                            }
+                        }
+                    });
+                }
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+    }
     out
 }
 
@@ -12285,6 +12398,9 @@ fn build_projcols(
 /// `GEN_ID(<name>, <n>)`) evaluated at execute - it bumps the generator
 /// and stores the NEW value.
 enum InsVal {
+    /// `_octets '...'`: a binary literal - sub_type 0, which any blob
+    /// column takes without a filter (probed)
+    Octets(Vec<u8>),
     Int(i64),
     /// an integer literal too WIDE for i64 - a NUMERIC(38,0)/INT128
     /// magnitude (up to i128::MAX). Rescales exactly into an exact-numeric
@@ -12700,6 +12816,8 @@ fn parse_column_def(item: &str) -> Option<(fire_crab_ods::ddl::ColumnDef, Option
             sub_type,
             char_len,
             dims: dims.clone(),
+            segment_length: None,
+            charset_id: None,
             // the plain exact-int family carries RDB$FIELD_PRECISION 0
             // (probed); NUMERIC/DECIMAL come through numeric_col with
             // their declared p; every other type stays NULL
@@ -12734,6 +12852,32 @@ fn parse_column_def(item: &str) -> Option<(fire_crab_ods::ddl::ColumnDef, Option
         None => (ty.clone(), Vec::new()),
     };
     let built = match (base.as_str(), args.as_slice()) {
+        // `BLOB [SUB_TYPE {n|TEXT|BINARY}] [SEGMENT SIZE n] [CHARACTER SET cs]`
+        (b, []) if b == "BLOB" || b.starts_with("BLOB ") => {
+            if !dims.is_empty() {
+                return None; // no arrays of blobs
+            }
+            let (sub_type, seg, cs) = parse_blob_type(b)?;
+            Some(fire_crab_ods::ddl::ColumnDef {
+                name: name.to_ascii_uppercase(),
+                field_type: 261,
+                dtype: dtype::BLOB,
+                length: 8,
+                scale: 0,
+                sub_type,
+                char_len: None,
+                dims: Vec::new(),
+                segment_length: seg,
+                charset_id: cs,
+                precision: None,
+                not_null,
+                not_null_constraint: not_null,
+                default: None,
+                domain: None,
+                identity: None,
+                computed: None,
+            })
+        }
         ("SMALLINT", []) => col(7, dtype::SHORT, 2, 0, 0, None),
         ("INTEGER" | "INT", []) => col(8, dtype::LONG, 4, 0, 0, None),
         ("BIGINT", []) => col(16, dtype::INT64, 8, 0, 0, None),
@@ -12771,6 +12915,8 @@ fn parse_column_def(item: &str) -> Option<(fire_crab_ods::ddl::ColumnDef, Option
             scale: 0,
             sub_type: 0,
             dims: Vec::new(),
+            segment_length: None,
+            charset_id: None,
             char_len: None,
             precision: None, // the domain's own row carries it
             not_null,
@@ -12790,6 +12936,63 @@ fn parse_column_def(item: &str) -> Option<(fire_crab_ods::ddl::ColumnDef, Option
 
 /// Parse the optional `(START WITH <n> [INCREMENT [BY] <n>])` of an IDENTITY
 /// clause. Returns `(start, increment)`, defaulting to `(1, 1)` when absent.
+/// The clauses after `BLOB`: (sub_type, SEGMENT SIZE, CHARACTER SET id).
+/// TEXT is 1, BINARY 0; a sub_type above 1 is refused (the engine: "Blob
+/// sub_types bigger than 1 (text) are for internal use only"); a
+/// CHARACTER SET belongs to a text blob only.
+fn parse_blob_type(ty: &str) -> Option<(i16, Option<u16>, Option<u8>)> {
+    let toks: Vec<&str> = ty.split_whitespace().collect();
+    let (mut sub_type, mut seg, mut cs): (i16, Option<u16>, Option<u8>) = (0, None, None);
+    let mut i = 1;
+    while i < toks.len() {
+        match toks[i] {
+            "SUB_TYPE" => {
+                sub_type = match *toks.get(i + 1)? {
+                    "TEXT" => 1,
+                    "BINARY" => 0,
+                    n => n.parse::<i16>().ok()?,
+                };
+                i += 2;
+            }
+            "SEGMENT" => {
+                if toks.get(i + 1) != Some(&"SIZE") {
+                    return None;
+                }
+                seg = Some(toks.get(i + 2)?.parse::<u16>().ok()?);
+                i += 3;
+            }
+            "CHARACTER" => {
+                if toks.get(i + 1) != Some(&"SET") {
+                    return None;
+                }
+                cs = Some(charset_id_of(toks.get(i + 2)?)?);
+                i += 3;
+            }
+            _ => return None,
+        }
+    }
+    if sub_type > 1 || (sub_type != 1 && cs.is_some()) {
+        return None;
+    }
+    Some((sub_type, seg, cs))
+}
+
+/// RDB$CHARACTER_SETS ids of the character sets a column can name.
+fn charset_id_of(name: &str) -> Option<u8> {
+    Some(match name.trim_matches('"').to_ascii_uppercase().as_str() {
+        "NONE" => 0,
+        "OCTETS" | "BINARY" => 1,
+        "ASCII" => 2,
+        "UNICODE_FSS" => 3,
+        "UTF8" => 4,
+        "ISO8859_1" | "LATIN1" => 21,
+        "WIN1250" => 51,
+        "WIN1251" => 52,
+        "WIN1252" => 53,
+        _ => return None,
+    })
+}
+
 fn parse_identity_opts(opts: &str) -> Option<(i64, i64)> {
     let opts = opts.trim();
     if opts.is_empty() {
@@ -12870,6 +13073,8 @@ fn numeric_col(
         scale: -(s as i8),
         sub_type,
         dims,
+        segment_length: None,
+        charset_id: None,
         char_len: None,
         // a NUMERIC/DECIMAL column's RDB$FIELD_PRECISION is its declared p
         precision: Some(p as i16),
@@ -15173,6 +15378,27 @@ fn plan_create_table(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
         }
     }
     let close = close?;
+    // `BLOB SUB_TYPE n` with n > 1: "Blob sub_types bigger than 1 (text)
+    // are for internal use only" - a -204 inside the CREATE TABLE failed
+    // wrapper (probed), answered at prepare
+    {
+        let body = &masked[open..=close];
+        let mut from = 0;
+        while let Some(at) = find_word(body, "SUB_TYPE", from) {
+            let before = body[..at].trim_end();
+            let after = body[at + "SUB_TYPE".len()..].trim_start();
+            let num: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if before.ends_with("BLOB") && num.parse::<i64>().map_or(false, |n| n > 1) {
+                let raw = s[table_kw + "TABLE".len()..open].trim();
+                let name = unquote_ident(raw).unwrap_or_else(|| raw.to_ascii_uppercase());
+                return Some((
+                    Plan::RefusedEval(EvalErr::BlobSubTypeInternal(format!("\"PUBLIC\".\"{}\"", name))),
+                    Vec::new(),
+                ));
+            }
+            from = at + "SUB_TYPE".len();
+        }
+    }
     // whatever follows the column list: an ON COMMIT clause (GTT) or nothing
     let tail = s[close + 1..].trim();
     let relation_type: i64 = if is_gtt {
@@ -15310,6 +15536,8 @@ fn plan_create_table(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
                 char_len: None,
                 precision: None, // computed: ComputedCol carries it
                 dims: Vec::new(),
+                segment_length: None,
+                charset_id: None,
                 not_null: false,
                 not_null_constraint: false,
                 default: None,
@@ -15854,6 +16082,45 @@ fn plan_alter_exception(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
 fn plan_create_or_alter_exception(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
     let (name, message) = parse_exception_stmt(sql, "CREATE OR ALTER")?;
     Some((Plan::CreateOrAlterException { name, message }, Vec::new()))
+}
+
+/// Parse `DECLARE FILTER <name> INPUT_TYPE <i> OUTPUT_TYPE <o> ENTRY_POINT
+/// '<e>' MODULE_NAME '<m>'` - the clauses in the grammar's one order.
+fn plan_declare_filter(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
+    let s = sql.trim().trim_end_matches(';').trim();
+    let up = mask_literals(&s.to_ascii_uppercase());
+    if find_word(&up, "DECLARE", 0) != Some(0) {
+        return None;
+    }
+    let f = find_word(&up, "FILTER", "DECLARE".len())?;
+    if up["DECLARE".len()..f].trim() != "" {
+        return None;
+    }
+    let it = find_word(&up, "INPUT_TYPE", f)?;
+    let ot = find_word(&up, "OUTPUT_TYPE", it)?;
+    let ep = find_word(&up, "ENTRY_POINT", ot)?;
+    let mn = find_word(&up, "MODULE_NAME", ep)?;
+    let name = unquote_ident(s[f + "FILTER".len()..it].trim())?;
+    let input = s[it + "INPUT_TYPE".len()..ot].trim().parse::<i16>().ok()?;
+    let output = s[ot + "OUTPUT_TYPE".len()..ep].trim().parse::<i16>().ok()?;
+    let lit = |t: &str| -> Option<String> {
+        let t = t.trim();
+        (t.len() >= 2 && t.starts_with('\'') && t.ends_with('\''))
+            .then(|| t[1..t.len() - 1].replace("''", "'"))
+    };
+    let entry = lit(&s[ep + "ENTRY_POINT".len()..mn])?;
+    let module = lit(&s[mn + "MODULE_NAME".len()..])?;
+    Some((Plan::DeclareFilter { name, input, output, entry, module }, Vec::new()))
+}
+
+/// Parse `DROP FILTER <name>`.
+fn plan_drop_filter(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
+    let s = sql.trim().trim_end_matches(';').trim();
+    let toks: Vec<&str> = s.split_whitespace().collect();
+    if toks.len() != 3 || !toks[0].eq_ignore_ascii_case("DROP") || !toks[1].eq_ignore_ascii_case("FILTER") {
+        return None;
+    }
+    Some((Plan::DropFilter { name: unquote_ident(toks[2])? }, Vec::new()))
 }
 
 /// Parse `DROP EXCEPTION <name>`.
@@ -17137,6 +17404,8 @@ fn plan_alter_table_add(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<D
             char_len: None,
             precision: None, // computed: ComputedCol carries it
             dims: Vec::new(),
+            segment_length: None,
+            charset_id: None,
             not_null: false,
             not_null_constraint: false,
             default: None,
@@ -18360,6 +18629,9 @@ fn plan_insert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
                 [Tok::DecFloat34(b)] => InsVal::DecFloat34(*b),
                 [Tok::Dec(r, s)] => InsVal::Dec(*r, *s),
                 [Tok::Str(v)] => InsVal::Str(v.clone()),
+                [Tok::Ident(i), Tok::Str(v)] if i.eq_ignore_ascii_case("_OCTETS") => {
+                    InsVal::Octets(v.as_bytes().to_vec())
+                }
                 [Tok::FnExpr(RawExpr::Bool(b))] => InsVal::Bool(*b),
                 [Tok::Null] => InsVal::Null,
                 // the DEFAULT keyword: the column takes its column
@@ -18477,6 +18749,22 @@ fn plan_insert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
         .map(|(rc, v)| (*rc, v))
         .collect();
     let image = build_insert_image(&landing, descs, db, rel, *format_no)?;
+    // a literal for a BLOB column has no bytes in the image: it becomes a
+    // blob of this relation at execute (a string is sub_type 1, `_octets` 0)
+    let blob_lits: Vec<(usize, Vec<u8>, i16)> = landing
+        .iter()
+        .filter_map(|(rc, v)| {
+            let fid = rc.field_id as usize;
+            if !matches!(descs.get(fid).map(|d| d.dtype), Some(dtype::BLOB)) {
+                return None;
+            }
+            match v {
+                InsVal::Str(t) => Some((fid, t.as_bytes().to_vec(), 1)),
+                InsVal::Octets(b) => Some((fid, b.clone(), 0)),
+                _ => None,
+            }
+        })
+        .collect();
     // parameter targets in VALUES (= slot) order, each a bindable type;
     // generator targets, each a bump evaluated at execute
     let mut param_fields = Vec::new();
@@ -18586,6 +18874,7 @@ fn plan_insert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
             not_null,
             fk_refs,
             default_fields,
+            blob_lits,
         },
         params,
     ))
@@ -18702,6 +18991,9 @@ fn build_insert_image(
         }
         let fid = rc.field_id as usize;
         let d = descs.get(fid)?;
+        if d.dtype == dtype::BLOB && matches!(v, InsVal::Str(_) | InsVal::Octets(_)) {
+            continue; // a blob literal: stored at execute (stays NULL-flagged until then)
+        }
         match encode_set_value(d, v)? {
             None => continue, // NULL - flag already set
             Some(bytes) => {
@@ -18721,6 +19013,10 @@ fn build_insert_image(
 /// literal into a scaled NUMERIC column rescales exactly like an
 /// integer parameter does (5 into NUMERIC(9,2) stores 500).
 fn encode_set_value(d: &Descriptor, v: &InsVal) -> Option<Option<Vec<u8>>> {
+    if let InsVal::Octets(b) = v {
+        // a binary literal into a text column: the bytes as they are
+        return encode_set_value(d, &InsVal::Str(String::from_utf8_lossy(b).into_owned()));
+    }
     // a wide magnitude has no i64 WireParam; encode it straight into the
     // column bytes. Exact-numeric targets rescale in i128 (a too-narrow one
     // overflows -> refuse); a DECFLOAT(34) target promotes the magnitude to
@@ -18772,6 +19068,7 @@ fn encode_set_value(d: &Descriptor, v: &InsVal) -> Option<Option<Vec<u8>>> {
         InsVal::Int128(_) | InsVal::DecFloat34(_) => unreachable!("handled above"),
         InsVal::Dec(r, s) => WireParam::Int(*r, *s),
         InsVal::Str(text) => WireParam::Text(text.clone()),
+        InsVal::Octets(b) => WireParam::Text(String::from_utf8_lossy(b).into_owned()),
         InsVal::Bool(b) => WireParam::Bool(*b),
         // parameters bind, generators advance, at execute - not here.
         // DEFAULT never reaches an encoder at all: plan_insert drops a
@@ -20176,6 +20473,11 @@ fn plan_update(sql: &str, db_outer: &Option<Database>) -> Option<(Plan, Vec<Desc
             Some([Tok::Ident(c), Tok::Cmp(Cmp::Eq), Tok::Str(t)]) => {
                 Some((c.clone(), InsVal::Str(t.clone())))
             }
+            Some([Tok::Ident(c), Tok::Cmp(Cmp::Eq), Tok::Ident(i), Tok::Str(t)])
+                if i.eq_ignore_ascii_case("_OCTETS") =>
+            {
+                Some((c.clone(), InsVal::Octets(t.as_bytes().to_vec())))
+            }
             Some([Tok::Ident(c), Tok::Cmp(Cmp::Eq), Tok::FnExpr(RawExpr::Bool(b))]) => {
                 Some((c.clone(), InsVal::Bool(*b)))
             }
@@ -20270,6 +20572,8 @@ fn plan_update(sql: &str, db_outer: &Option<Database>) -> Option<(Plan, Vec<Desc
                 params.push(Some(d.clone()));
                 SetVal::Param(params.len() - 1)
             }
+            InsVal::Str(t) if d.dtype == dtype::BLOB => SetVal::BlobLit(t.into_bytes(), 1),
+            InsVal::Octets(b) if d.dtype == dtype::BLOB => SetVal::BlobLit(b, 0),
             lit => SetVal::Lit(encode_set_value(d, &lit)?),
         };
         sets.push((fid, sv));
@@ -21100,11 +21404,25 @@ fn execute_dml(
 /// properly matters now that a lock_timeout VALUE could otherwise be
 /// mistaken for a bare flag: a 7-second timeout is not isc_tpb_nowait,
 /// a 15-second one is not isc_tpb_read_committed.
-fn parse_tpb(tpb: &[u8]) -> (bool, bool, Option<u32>, bool) {
+/// What a TPB says (the tags this server acts on).
+struct Tpb {
+    read_committed: bool,
+    nowait: bool,
+    lock_timeout: Option<u32>,
+    consistency: bool,
+    /// isc_tpb_read (8) - READ ONLY; isc_tpb_write (9) or nothing is read-write
+    read_only: bool,
+    /// isc_tpb_at_snapshot_number (23): a base snapshot number to share
+    at_snapshot: Option<u64>,
+}
+
+fn parse_tpb(tpb: &[u8]) -> Tpb {
     let mut read_committed = false;
     let mut nowait = false;
     let mut lock_timeout = None;
     let mut consistency = false;
+    let mut read_only = false;
+    let mut at_snapshot = None;
     let mut i = 1; // past the version byte
     while i < tpb.len() {
         let tag = tpb[i];
@@ -21113,7 +21431,19 @@ fn parse_tpb(tpb: &[u8]) -> (bool, bool, Option<u32>, bool) {
             15 => read_committed = true, // isc_tpb_read_committed
             1 => consistency = true,     // isc_tpb_consistency (degree3)
             7 => nowait = true,          // isc_tpb_nowait
-            10 | 11 | 23 => {
+            8 => read_only = true,       // isc_tpb_read
+            9 => read_only = false,      // isc_tpb_write
+            23 => {
+                let len = tpb.get(i).copied().unwrap_or(0) as usize;
+                i += 1;
+                let mut v = 0u64;
+                for (k, b) in tpb.get(i..i + len).unwrap_or(&[]).iter().enumerate().take(8) {
+                    v |= (*b as u64) << (8 * k);
+                }
+                at_snapshot = Some(v);
+                i += len;
+            }
+            10 | 11 => {
                 let len = tpb.get(i).copied().unwrap_or(0) as usize;
                 i += 1 + len;
             }
@@ -21130,7 +21460,7 @@ fn parse_tpb(tpb: &[u8]) -> (bool, bool, Option<u32>, bool) {
             _ => {}
         }
     }
-    (read_committed, nowait, lock_timeout, consistency)
+    Tpb { read_committed, nowait, lock_timeout, consistency, read_only, at_snapshot }
 }
 
 fn conflict_wait() -> std::time::Duration {
@@ -21474,6 +21804,14 @@ fn execute_dml_collecting_inner(
             fire_crab_ods::ddl::create_exception(&mut work, db.page_size, name, message)?;
             (0, 0, 0)
         }
+        Plan::DeclareFilter { name, input, output, entry, module } => {
+            fire_crab_ods::ddl::declare_filter(&mut work, db.page_size, name, *input, *output, entry, module)?;
+            (0, 0, 0)
+        }
+        Plan::DropFilter { name } => {
+            fire_crab_ods::ddl::drop_filter(&mut work, db.page_size, name)?;
+            (0, 0, 0)
+        }
         Plan::DropProcedure { name } => {
             fire_crab_ods::ddl::drop_procedure(&mut work, db.page_size, name)?;
             (0, 0, 0)
@@ -21783,7 +22121,7 @@ fn execute_dml_collecting_inner(
             )?;
             (0, 0, 0)
         }
-        Plan::Insert { rel, table, format_no, image, descs, index_ops, param_fields, gen_fields, not_null, checks, fk_refs, default_fields } => {
+        Plan::Insert { rel, table, format_no, image, descs, index_ops, param_fields, gen_fields, not_null, checks, fk_refs, default_fields, blob_lits } => {
             let mut image = image.clone();
             // MATERIALISE the temporary blobs the parameters name (blb::move):
             // the closed temp blob's segments land in THIS relation's pages
@@ -21819,6 +22157,13 @@ fn execute_dml_collecting_inner(
             // value into `work`, atomic with the record) and store the new
             // value into its field. The current value is read from `work`
             // so two NEXT VALUE FOR of one sequence in a row bump twice.
+            for (fid, bytes, lit_st) in blob_lits {
+                let d = descs.get(*fid).ok_or("field beyond format")?;
+                let id = store_blob_literal(db, &mut work, *rel, d, bytes, *lit_st)?;
+                let at = d.offset as usize;
+                image[at..at + 8].copy_from_slice(&id);
+                image[fid / 8] &= !(1 << (fid % 8));
+            }
             for (fid, name, step) in gen_fields {
                 let (id, incr) = generator_info(db, name).ok_or("no such generator")?;
                 // the draw lands in the page (and is BURNED here,
@@ -21962,6 +22307,9 @@ fn execute_dml_collecting_inner(
             // - while TempBlob.materialised would keep the id of pages
             // that never landed. Field + slot.
             let mut blob_sets: Vec<(usize, usize)> = Vec::new();
+            // blob LITERALS: stored per matching row (a statement that
+            // matches no row stores nothing and raises nothing - probed)
+            let mut blob_lits: Vec<(usize, &[u8], i16)> = Vec::new();
             // the generator draws, in SET-LIST order: the engine
             // evaluates a row's assignments left to right (probed: `SET
             // V = GEN_ID(G,1) + GEN_ID(G,1)` stores 3, 7, 11 ... over
@@ -21970,6 +22318,10 @@ fn execute_dml_collecting_inner(
             for (fid, sv) in sets {
                 let bytes = match sv {
                     SetVal::Lit(b) => b.clone(),
+                    SetVal::BlobLit(b, st) => {
+                        blob_lits.push((*fid, b.as_slice(), *st));
+                        continue;
+                    }
                     SetVal::Param(slot) => {
                         let d = descs.get(*fid).ok_or("field beyond format")?;
                         let arg = args.get(*slot).ok_or("missing parameter value")?;
@@ -22095,6 +22447,16 @@ fn execute_dml_collecting_inner(
                 } else {
                     image.clone()
                 };
+                for (fid, bytes, lit_st) in &blob_lits {
+                    let d = descs.get(*fid).ok_or("field beyond format")?;
+                    let id = store_blob_literal(db, &mut work, *rel, d, bytes, *lit_st)?;
+                    let at = d.offset as usize;
+                    if img.len() < at + 8 {
+                        return Err("record image shorter than its format".into());
+                    }
+                    img[at..at + 8].copy_from_slice(&id);
+                    img[fid / 8] &= !(1 << (fid % 8));
+                }
                 for (fid, bytes) in sets {
                     match bytes {
                         None => img[fid / 8] |= 1 << (fid % 8), // SET col = NULL
@@ -29656,6 +30018,8 @@ fn plan_query_inner_ctx(
                 // still spell the `(SELECT` the gatekeeper refuses
                 sql: opt_sql.clone(),
             });
+            let mut cols = cols;
+            mark_not_null_cols(&mut cols, db, table);
             return Some(Plan::Project { rel, formats, cols, filter, order_by, gen_cols: Vec::new(), index, defer, windows: Vec::new(), win_base: 0 });
         }
         Proj::Items(items) => items,
@@ -30006,6 +30370,8 @@ fn plan_query_inner_ctx(
             // branch: the deferred re-plan must not see `(SELECT`
             sql: opt_sql.clone(),
         });
+        let mut cols = cols;
+        mark_not_null_cols(&mut cols, db, table);
         return Some(Plan::Project {
             rel, formats, cols, filter, order_by, gen_cols, index, defer,
             windows, win_base,
@@ -30092,13 +30458,33 @@ fn plan_query_inner_ctx(
 /// `offset == 0 && length != 0` as "this is a computed column", so a
 /// freshly built descriptor claims to be one and every expression over
 /// it refuses - a trap this codebase has already paid for once.
+/// A plain base column that is NOT NULL describes in the even, not-nullable
+/// form (probed: `ID INT NOT NULL PRIMARY KEY` is sqltype 496, a nullable
+/// column 497). Only a column read straight from the relation qualifies -
+/// an expression over it, or a column on the outer side of a join, stays
+/// nullable (the engine's rule for those is a later slice).
+fn mark_not_null_cols(cols: &mut [ProjCol], db: &Database, table: &str) {
+    let nn = not_null_fids(db, table);
+    if nn.is_empty() {
+        return;
+    }
+    for c in cols.iter_mut() {
+        if c.expr.is_none()
+            && c.relation.as_deref().is_some_and(|r| r.eq_ignore_ascii_case(table.trim_matches('"')))
+            && nn.contains(&c.field_id)
+        {
+            c.sql_type &= !1;
+        }
+    }
+}
+
 fn desc_of_projcol(c: &ProjCol) -> Descriptor {
     // the describe adds 1 for NULLABLE; the type is the even value
     let t = c.sql_type & !1;
     // a real-charset EXPRESSION column ([enc_real_cs]) becomes an
     // ordinary column of that charset for the query above: sub_type
     // the ttype, length back in BYTES (the sentinel held characters)
-    let (c_sub, c_len) = if c.sub_type <= -2 {
+    let (c_sub, c_len) = if c.sub_type <= -2 && t != 520 {
         let cs = (-2 - c.sub_type) as u8;
         (cs as i32, c.length * fire_crab_ods::intl::bytes_per_char(cs) as i32)
     } else {
@@ -30117,6 +30503,7 @@ fn desc_of_projcol(c: &ProjCol) -> Descriptor {
         560 => (dtype::SQL_TIME, 4),
         510 => (dtype::TIMESTAMP, 8),
         32764 => (dtype::BOOLEAN, 1),
+        520 => (dtype::BLOB, 8),
         _ => (dtype::INT64, 8),
     };
     Descriptor {
@@ -34192,6 +34579,7 @@ fn describe_for(plan: &Plan, params: &[Descriptor], att: AttCs) -> Vec<u8> {
         | Plan::DropIndex { .. }
         | Plan::CreateSequence { .. } | Plan::DropSequence { .. }
         | Plan::CreateException { .. } | Plan::CreateProcedure { .. } | Plan::DropProcedure { .. } | Plan::DropException { .. }
+        | Plan::DeclareFilter { .. } | Plan::DropFilter { .. }
         | Plan::AlterException { .. } | Plan::CreateOrAlterException { .. }
         | Plan::CreateRole { .. } | Plan::DropRole { .. }
         | Plan::AlterDatabaseBackup { .. }
@@ -34297,6 +34685,7 @@ fn stmt_type_of(plan: &Plan) -> i32 {
         | Plan::DropIndex { .. }
         | Plan::CreateSequence { .. } | Plan::DropSequence { .. }
         | Plan::CreateException { .. } | Plan::CreateProcedure { .. } | Plan::DropProcedure { .. } | Plan::DropException { .. }
+        | Plan::DeclareFilter { .. } | Plan::DropFilter { .. }
         | Plan::AlterException { .. } | Plan::CreateOrAlterException { .. }
         | Plan::CreateRole { .. } | Plan::DropRole { .. }
         | Plan::AlterDatabaseBackup { .. }
@@ -34492,7 +34881,11 @@ fn answer_prepare(items: &[u8], plan: &Plan, params: &[Descriptor], att: AttCs) 
             // 'ab' under a UTF8 attachment is length 8 CHARSET UTF8,
             // under NONE it is length 2 CHARSET NONE; a real-charset
             // EXPRESSION resolves the same way (see [resolve_text_cs])
-            let (sub_type, length) = resolve_text_cs(c.sub_type, c.length, c.oct_length, &att);
+            let (sub_type, length) = if matches!(c.wire, Wire::Blob) {
+                (c.sub_type, c.length)
+            } else {
+                resolve_text_cs(c.sub_type, c.length, c.oct_length, &att)
+            };
             Var {
                 sql_type: c.sql_type,
                 sub_type,
@@ -34938,6 +35331,7 @@ const GDS_IDX_KEY_VALUE: i32 = 335545072;
 const GDS_FOREIGN_KEY: i32 = 335544466;
 const GDS_FK_TARGET_MISSING: i32 = 335544838;
 const GDS_FK_REFS_PRESENT: i32 = 335544839;
+const GDS_NO_FILTER: i32 = 335544454;
 const GDS_NOT_VALID: i32 = 335544347;
 /// `isc_overriding_missing` (jrd.h msg 817, -902, SQLSTATE 42000):
 /// an explicit value into a GENERATED ALWAYS identity column without
@@ -35130,6 +35524,32 @@ fn eval_status_items(w: &mut W, e: &EvalErr) {
                 .int(GDS_BAD_SUBSTRING_LENGTH)
                 .int(ISC_ARG_NUMBER)
                 .int(*n as i32);
+        }
+        EvalErr::BlobSubTypeInternal(qname) => {
+            w.int(1) // isc_arg_gds - unsuccessful metadata update
+                .int(GDS_NO_META_UPDATE)
+                .int(1) // CREATE TABLE @1 failed
+                .int(336397286)
+                .int(2)
+                .bytes(qname.as_bytes())
+                .int(1) // Dynamic SQL Error
+                .int(GDS_DSQL_ERROR)
+                .int(1) // SQL error code = -204
+                .int(335544436)
+                .int(ISC_ARG_NUMBER)
+                .int(-204)
+                .int(1) // Data type unknown
+                .int(335544573)
+                .int(1) // Blob sub_types bigger than 1 (text) are for internal use only
+                .int(335544867);
+        }
+        EvalErr::NoFilter(from, to) => {
+            w.int(1) // isc_arg_gds - filter not found to convert type @1 to type @2
+                .int(GDS_NO_FILTER)
+                .int(ISC_ARG_NUMBER)
+                .int(*from)
+                .int(ISC_ARG_NUMBER)
+                .int(*to);
         }
         EvalErr::RecInLimbo(id) => {
             w.int(1) // isc_arg_gds
@@ -35690,6 +36110,7 @@ fn emit_rows_inner(
         | Plan::DropIndex { .. }
         | Plan::CreateSequence { .. } | Plan::DropSequence { .. }
         | Plan::CreateException { .. } | Plan::CreateProcedure { .. } | Plan::DropProcedure { .. } | Plan::DropException { .. }
+        | Plan::DeclareFilter { .. } | Plan::DropFilter { .. }
         | Plan::AlterException { .. } | Plan::CreateOrAlterException { .. }
         | Plan::CreateRole { .. } | Plan::DropRole { .. }
         | Plan::AlterDatabaseBackup { .. }
@@ -36965,6 +37386,58 @@ fn encode_row_body(
 ///   the client): the engine COPIES the blob (blb.cpp:1167 `copy_blob`)
 ///   and the record carries a NEW id ("s7 ids: different" in the gate)
 ///   - the source row keeps reading its own
+/// Store a LITERAL as a blob of `rel` for the column `d` - the engine's
+/// move of a temporary blob into the record. A text literal (sub_type 1)
+/// needs a filter to land in a user sub_type (probed: `isc_nofilter 1 ->
+/// -5`); a binary literal (`_octets`, sub_type 0) lands anywhere. The
+/// stored blob takes the COLUMN's sub_type and character set.
+/// The `isc_bpb_source_type` (1) and `isc_bpb_target_type` (2) clumps of a
+/// blob parameter block - each a length byte then a little-endian value
+/// (a user sub_type is negative: one byte 0xFB is -5).
+fn bpb_conversion(bpb: &[u8]) -> (Option<i32>, Option<i32>) {
+    let (mut from, mut to) = (None, None);
+    if bpb.len() < 2 || bpb[0] != 1 {
+        return (from, to);
+    }
+    let mut i = 1;
+    while i + 1 < bpb.len() {
+        let tag = bpb[i];
+        let len = bpb[i + 1] as usize;
+        let Some(v) = bpb.get(i + 2..i + 2 + len) else { break };
+        let val: i32 = match len {
+            1 => v[0] as i8 as i32,
+            2 => i16::from_le_bytes([v[0], v[1]]) as i32,
+            4 => i32::from_le_bytes([v[0], v[1], v[2], v[3]]),
+            _ => 0,
+        };
+        match tag {
+            1 => from = Some(val),
+            2 => to = Some(val),
+            _ => {}
+        }
+        i += 2 + len;
+    }
+    (from, to)
+}
+
+fn store_blob_literal(
+    db: &mut Database,
+    work: &mut fire_crab_ods::Image,
+    rel: u16,
+    d: &Descriptor,
+    bytes: &[u8],
+    lit_sub_type: i16,
+) -> Result<[u8; 8], ExecErr> {
+    if lit_sub_type == 1 && !matches!(d.sub_type, 0 | 1) {
+        return Err(ExecErr::Eval(EvalErr::NoFilter(1, d.sub_type as i32)));
+    }
+    let sub_type = d.sub_type.max(0) as u16;
+    let charset: u8 = if sub_type == 1 { d.scale as u8 } else { 0 };
+    let recno = fire_crab_blb::create_blob(work, db.page_size, rel, &[bytes.to_vec()], sub_type, charset)
+        .map_err(ExecErr::Text)?;
+    Ok(encode_blob_id(rel, recno))
+}
+
 fn store_blob_param(
     db: &mut Database,
     work: &mut fire_crab_ods::Image,
@@ -40472,6 +40945,12 @@ enum EvalErr {
     /// 42000 "must be zero or positive" on LPAD/RPAD/POSITION bounds -
     /// an error either way, never a wrong row
     InvalidLength(i64),
+    /// `BLOB SUB_TYPE n` (n > 1) in a CREATE TABLE: the engine's "Blob
+    /// sub_types bigger than 1 (text) are for internal use only", inside
+    /// the "CREATE TABLE @1 failed" wrapper - carries the qualified name
+    BlobSubTypeInternal(String),
+    /// isc_nofilter: no blob filter converts sub_type .0 to sub_type .1
+    NoFilter(i32, i32),
     /// The INTO slots an `EXECUTE STATEMENT` names do not match what its
     /// statement projects: `isc_eds_output_prm_mismatch` (JRD 608,
     /// SQLSTATE 42000, "Output parameters mismatch"), one code with no
@@ -44121,6 +44600,8 @@ fn plan_correlated_select(
         table: table.to_string(),
         sql: opt_sql.clone().unwrap_or_default(),
     });
+    let mut cols = cols;
+    mark_not_null_cols(&mut cols, db, table);
     Some(Plan::Project { rel, formats, cols, filter, order_by, gen_cols: Vec::new(), index, defer, windows: Vec::new(), win_base: 0 })
 }
 
@@ -48942,7 +49423,7 @@ enum DmlKind {
 /// and DML paths, and a statement in neither is a SET or a query.
 fn immediate_verb(text: &str) -> (bool, bool) {
     let up = text.trim_start().to_ascii_uppercase();
-    let ddl = ["CREATE", "ALTER", "DROP", "RECREATE", "COMMENT", "GRANT", "REVOKE"]
+    let ddl = ["CREATE", "ALTER", "DROP", "RECREATE", "COMMENT", "GRANT", "REVOKE", "DECLARE"]
         .into_iter()
         .any(|k| find_word(&up, k, 0) == Some(0));
     let dml = ["INSERT", "UPDATE", "DELETE", "MERGE"]
@@ -48983,6 +49464,8 @@ fn plan_immediate(text: &str, database: &Option<Database>) -> Option<(Plan, Vec<
                     .or_else(|| plan_drop_procedure(text))
                     .or_else(|| plan_drop_sequence(text))
                     .or_else(|| plan_create_exception(text))
+                    .or_else(|| plan_declare_filter(text))
+                    .or_else(|| plan_drop_filter(text))
                     .or_else(|| plan_drop_exception(text))
                     .or_else(|| plan_alter_exception(text))
                     .or_else(|| plan_create_or_alter_exception(text))
@@ -51964,6 +52447,19 @@ fn resolve_predicate(
                 return None;
             }
             let d = descs.get(fid)?;
+            // IS [NOT] NULL reads only the null flag, so a column of ANY
+            // type takes it - a BLOB or ARRAY column included (probed:
+            // `WHERE N IS NULL` over a BLOB counts the unset rows)
+            if matches!(rt.kind, RawKind::IsNull | RawKind::IsNotNull)
+                && matches!(d.dtype, dtype::BLOB | dtype::ARRAY)
+            {
+                terms.push(if matches!(rt.kind, RawKind::IsNull) {
+                    Term::IsNull(fid)
+                } else {
+                    Term::IsNotNull(fid)
+                });
+                continue;
+            }
             let term = match col_kind(d) {
                 Some(kind) => param_or_typed_term(fid, kind, rt.kind, d, params)?,
                 // scaled NUMERIC/DECIMAL and INT128 columns: the exact
@@ -53643,6 +54139,9 @@ fn after_auth(
     // client attached to a name with no file behind it), the server falls
     // back to the fixed constant so the pipeline still round-trips.
     let mut database: Option<Database> = load_database(&db_path);
+    if let Some(d) = database.as_mut() {
+        d.attach_name = attach_name.clone();
+    }
     // A SHUT-DOWN DATABASE REFUSES THE ATTACH ITSELF, before any of the
     // DPB's work - and the order of the two exemptions was MEASURED, not
     // assumed: an attach carrying `-shut`/`-online` gets past the FULL
@@ -54075,11 +54574,22 @@ fn after_auth(
                 // 15, but real TPBs put isolation first and flag-only -
                 // a false read-committed merely keeps the old behaviour
                 // for that transaction, never a crash).
-                let (read_committed, nowait, lock_timeout, consistency) = parse_tpb(&tpb);
+                let Tpb { read_committed, nowait, lock_timeout, consistency, read_only, at_snapshot } =
+                    parse_tpb(&tpb);
+                // isc_tpb_at_snapshot_number names another transaction's
+                // base snapshot to share; this server keeps no numbered
+                // snapshots to find, so the engine's "does not exist" is
+                // the honest answer for every number (probed: the engine
+                // refuses a number no live transaction holds the same way)
+                if at_snapshot.is_some() {
+                    respond_error(&mut s, &mut enc, 335545252)?; // isc_tra_snapshot_does_not_exist
+                    continue;
+                }
                 if let Some(db) = database.as_mut() {
                     db.wait = !nowait;
                     db.lock_timeout = lock_timeout;
                     db.consistency = consistency;
+                    db.read_only = read_only;
                     db.snapshot = if read_committed {
                         None
                     } else {
@@ -54349,6 +54859,8 @@ fn after_auth(
                         .or_else(|| plan_create_procedure(&stmt_sql))
                         .or_else(|| plan_drop_procedure(&stmt_sql))
                         .or_else(|| plan_create_exception(&stmt_sql))
+                        .or_else(|| plan_declare_filter(&stmt_sql))
+                        .or_else(|| plan_drop_filter(&stmt_sql))
                         .or_else(|| plan_drop_exception(&stmt_sql))
                         .or_else(|| plan_alter_exception(&stmt_sql))
                         .or_else(|| plan_create_or_alter_exception(&stmt_sql))
@@ -54632,6 +55144,7 @@ fn after_auth(
                         | Plan::CreateSequence { .. }
                         | Plan::DropSequence { .. }
                         | Plan::CreateException { .. }
+                        | Plan::DeclareFilter { .. } | Plan::DropFilter { .. }
                         | Plan::CreateProcedure { .. }
                         | Plan::DropProcedure { .. }
                         | Plan::AlterException { .. }
@@ -56322,12 +56835,41 @@ fn after_auth(
             }
             x if x == OP_OPEN_BLOB || x == OP_OPEN_BLOB2 => {
                 // p_blob: [bpb (blob2 only)], transaction, 8-byte blob id
-                if x == OP_OPEN_BLOB2 {
-                    read_wire_bytes(&mut s, &mut dec)?; // bpb, ignored
-                }
+                let bpb = if x == OP_OPEN_BLOB2 {
+                    read_wire_bytes(&mut s, &mut dec)?
+                } else {
+                    Vec::new()
+                };
                 read_int(&mut s, &mut dec)?; // transaction handle
                 let id = read_n(&mut s, &mut dec, 8)?;
                 let (rel, num) = decode_blob_id(&id);
+                // a bpb naming a SOURCE / TARGET sub_type asks for a
+                // conversion on the way out. The engine runs a filter for
+                // it, and has none between two different user sub_types:
+                // no filter is needed when source == target, when the
+                // target is 0 (binary takes anything), or from 0 to TEXT
+                // (its built-in); everything else is isc_nofilter(from, to)
+                // (probed: -5 -> 1, 0 -> -5 and 1 -> -7 refuse; -5 -> 0,
+                // 0 -> 1 and 1 -> 0 read through). The internal filters
+                // of the system sub_types (BLR, ACL, ... -> text) are not
+                // mirrored: a bpb naming one on a user blob refuses here.
+                let (bpb_from, bpb_to) = bpb_conversion(&bpb);
+                if bpb_from.is_some() || bpb_to.is_some() {
+                    let stored: i32 = if rel == 0 {
+                        0
+                    } else {
+                        database
+                            .as_ref()
+                            .and_then(|db| fire_crab_blb::read_blob(&db.bytes(), db.page_size, rel, num).ok())
+                            .map_or(0, |b| b.header.sub_type as i16 as i32)
+                    };
+                    let from = bpb_from.unwrap_or(stored);
+                    let to = bpb_to.unwrap_or(from);
+                    if from != to && to != 0 && !(from == 0 && to == 1) {
+                        respond_eval_error(&mut s, &mut enc, &EvalErr::NoFilter(from, to))?;
+                        continue;
+                    }
+                }
                 // relation 0: a TEMP id of this transaction (legal to open
                 // before it is stored, blb.cpp:1370); all zero: the empty blob
                 let content = if rel == 0 {
@@ -56683,52 +57225,112 @@ fn after_auth(
             }
             x if x == OP_INFO_TRANSACTION => {
                 // isc_transaction_info - a client asking a live
-                // transaction about itself. This server runs one
-                // transaction per attachment and has no snapshot
-                // machinery, so it answers the items it can mean
-                // honestly and SKIPS the rest (build_db_info's rule for
-                // an unknown item). Answering at all is the point: the
-                // arm exists so an info request never ends the
-                // connection, because libfbclient SEGFAULTS on that.
+                // transaction about itself. Answered item by item IN
+                // REQUEST ORDER (a repeated item repeats; an unknown one
+                // is isc_info_error + isc_infunk), except that the
+                // remote server puts fb_info_tra_dbpath FIRST whenever it
+                // is asked for (probed: requested eighth, answered
+                // first); a buffer the answer does not fit ends in
+                // isc_info_truncated. The arm exists so an info request
+                // never ends the connection - libfbclient SEGFAULTS on
+                // that.
                 read_int(&mut s, &mut dec)?; // tr handle
                 read_int(&mut s, &mut dec)?; // incarnation
                 let items = read_wire_bytes(&mut s, &mut dec)?;
-                read_int(&mut s, &mut dec)?; // buffer length
+                let buf_len = read_int(&mut s, &mut dec)?.max(0) as usize;
                 if std::env::var("FC_SRV_TRACE").is_ok() {
                     eprintln!("[srv] op_info_transaction items: {:?}", items);
                 }
-                // the header's next-transaction counter is the id this
-                // attachment's work carries (the same value the
-                // CURRENT_TRANSACTION session default resolves to)
-                let tra_id = database
-                    .as_ref()
-                    .and_then(|d| {
-                        d.bytes()
-                            .page(0)
-                            .and_then(|p| p.get(40..44))
-                            .map(|b| [b[0], b[1], b[2], b[3]])
-                    })
-                    .map(|b| i32::from_le_bytes(b).wrapping_add(1))
-                    .unwrap_or(1);
+                // the header's counters: next-transaction (the id this
+                // attachment's work carries - the value CURRENT_TRANSACTION
+                // resolves to), oldest interesting, oldest active, oldest
+                // snapshot - all answered as the engine's 4-byte numbers
+                let hdr = |off: usize| -> i32 {
+                    database
+                        .as_ref()
+                        .and_then(|d| d.bytes().page(0).and_then(|p| p.get(off..off + 8)).map(|b| {
+                            u64::from_le_bytes(b.try_into().unwrap()) as i32
+                        }))
+                        .unwrap_or(0)
+                };
+                let tra_id = hdr(40).wrapping_add(1);
+                let (read_committed, consistency, wait, lock_timeout, read_only, dbpath, snap) =
+                    match database.as_ref() {
+                        Some(d) => (
+                            d.snapshot.is_none(),
+                            d.consistency,
+                            d.wait,
+                            d.lock_timeout,
+                            d.read_only,
+                            d.attach_name.clone(),
+                            d.snapshot.as_ref().map_or(0, |sn| sn.limit as i32),
+                        ),
+                        None => (false, false, true, None, false, String::new(), 0),
+                    };
                 let mut info: Vec<u8> = Vec::new();
+                let mut truncated = false;
+                let mut put = |info: &mut Vec<u8>, item: u8, v: &[u8]| {
+                    if truncated {
+                        return;
+                    }
+                    if info.len() + 3 + v.len() + 1 > buf_len {
+                        info.push(2); // isc_info_truncated
+                        truncated = true;
+                        return;
+                    }
+                    info.push(item);
+                    info.extend_from_slice(&(v.len() as u16).to_le_bytes());
+                    info.extend_from_slice(v);
+                };
+                if items.iter().take_while(|c| **c != 1).any(|c| *c == 11) {
+                    put(&mut info, 11, dbpath.as_bytes()); // fb_info_tra_dbpath, first
+                }
                 for &code in items.iter() {
                     match code {
-                        4 => {
-                            // isc_info_tra_id
-                            info.push(4);
-                            info.extend_from_slice(&4u16.to_le_bytes());
-                            info.extend_from_slice(&tra_id.to_le_bytes());
+                        1 => break, // isc_info_end
+                        4 => put(&mut info, 4, &tra_id.to_le_bytes()), // isc_info_tra_id
+                        5 => put(&mut info, 5, &hdr(48).to_le_bytes()), // oldest_interesting
+                        6 => put(&mut info, 6, &hdr(64).to_le_bytes()), // oldest_snapshot
+                        7 => put(&mut info, 7, &hdr(56).to_le_bytes()), // oldest_active
+                        8 => {
+                            // isc_info_tra_isolation: consistency 1,
+                            // concurrency 2, read committed 3 + its
+                            // option - READ CONSISTENCY (2) for every
+                            // flavour on this engine (probed: rec_version,
+                            // no_rec_version and read_consistency all
+                            // answer 3,2 - ReadConsistency=1 is the default)
+                            if read_committed {
+                                put(&mut info, 8, &[3, 2]);
+                            } else if consistency {
+                                put(&mut info, 8, &[1]);
+                            } else {
+                                put(&mut info, 8, &[2]);
+                            }
                         }
-                        1 => break, // isc_info_end already in the request
-                        // everything else - oldest_interesting/snapshot/
-                        // active, isolation, access, lock_timeout, dbpath
-                        // and fb_info_tra_snapshot_number - would be a
-                        // GUESS, and a wrong snapshot number reads as a
-                        // real answer. Skipped rather than invented.
-                        _ => {}
+                        9 => put(&mut info, 9, &[if read_only { 0 } else { 1 }]), // access
+                        10 => {
+                            // lock_timeout: -1 = wait without limit, 0 =
+                            // no wait, else the seconds (probed)
+                            let v: i32 = match (wait, lock_timeout) {
+                                (false, _) => 0,
+                                (true, Some(t)) => t as i32,
+                                (true, None) => -1,
+                            };
+                            put(&mut info, 10, &v.to_le_bytes());
+                        }
+                        11 => {} // already first
+                        12 => put(&mut info, 12, &snap.to_le_bytes()), // fb_info_tra_snapshot_number: 0 when read committed
+                        other => {
+                            // isc_info_error: the item, then isc_infunk
+                            let mut v = vec![other];
+                            v.extend_from_slice(&335544414u32.to_le_bytes());
+                            put(&mut info, 3, &v);
+                        }
                     }
                 }
-                info.push(1); // isc_info_end
+                if !truncated {
+                    info.push(1); // isc_info_end
+                }
                 let mut w = W::default();
                 w.int(OP_RESPONSE).int(0).int(0).int(0).bytes(&info).int(0);
                 w.send(&mut s, &mut enc)?;
@@ -58641,7 +59243,7 @@ mod tests {
             autonomous_ids: Vec::new(),
             wait: true,
             lock_timeout: None,
-            consistency: false,
+            consistency: false, read_only: false, attach_name: String::new(),
         };
         let row = |a: i64, b: i64| vec![Value::Int(a), Value::Int(b)];
         let base = RowSource::Rows(vec![row(1, 30), row(2, 10), row(3, 20)]);
@@ -61581,7 +62183,7 @@ mod tests {
             autonomous_ids: Vec::new(),
             wait: true,
             lock_timeout: None,
-            consistency: false,
+            consistency: false, read_only: false, attach_name: String::new(),
         };
         let src = RowSource::Filter {
             input: Box::new(RowSource::Rows(rows)),
@@ -65546,6 +66148,7 @@ mod tests {
             checks: Vec::new(),
             fk_refs: Vec::new(),
             default_fields: Vec::new(),
+            blob_lits: Vec::new(),
         };
         let delete = Plan::Delete {
             rel: 128,
@@ -65639,6 +66242,7 @@ mod tests {
                 checks: Vec::new(),
                 fk_refs: Vec::new(),
                 default_fields: Vec::new(),
+                blob_lits: Vec::new(),
             })
         };
         let update = || {
@@ -67772,7 +68376,7 @@ mod tests {
             autonomous_ids: Vec::new(),
             wait: true,
             lock_timeout: None,
-            consistency: false,
+            consistency: false, read_only: false, attach_name: String::new(),
         }
     }
 

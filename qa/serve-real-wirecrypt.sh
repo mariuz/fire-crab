@@ -24,6 +24,7 @@ set -u
 FCWIRE="${FCWIRE:-$(dirname "$0")/../target/release/fcwire}"
 ISQL="${ISQL:-isql}"
 PORT="${1:-4863}"
+LOG="/tmp/fc-serve-wirecrypt-$PORT.log"
 REAL="${FC_REAL_PORT:-3050}"
 U="${ISC_USER:-SYSDBA}"; P="${ISC_PASSWORD:-masterkey}"
 D=/tmp/fbhandson

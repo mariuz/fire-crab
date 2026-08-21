@@ -90,6 +90,12 @@ pub struct ColumnDef {
     /// RDB$FIELD_DIMENSIONS - probed); the record stores an 8-byte array
     /// blob id, dsc dtype_array.
     pub dims: Vec<(i32, i32)>,
+    /// a BLOB column's `SEGMENT SIZE` (RDB$SEGMENT_LENGTH; the engine's
+    /// default is 80); None for every other type
+    pub segment_length: Option<u16>,
+    /// a text BLOB's `CHARACTER SET` id (RDB$CHARACTER_SET_ID; also the
+    /// format descriptor's scale, which is how a blob describes it)
+    pub charset_id: Option<u8>,
     /// NOT NULL - explicit, or implied by PRIMARY KEY membership
     pub not_null: bool,
     /// whether this column's NOT NULL is a COLUMN-level declaration
@@ -541,7 +547,12 @@ fn col_field(dtype: u8, length: u16, scale: i8, sub_type: i16) -> (u8, u16, i8, 
 /// [col_field] for a column definition: an ARRAY column's storage is the
 /// 8-byte array blob id (dtype_array), whatever its element type
 fn col_field_of(c: &ColumnDef) -> (u8, u16, i8, i16) {
-    if c.dims.is_empty() {
+    if c.dtype == crate::format::dtype::BLOB && c.dims.is_empty() {
+        // a blob's descriptor carries its sub_type, and its CHARACTER SET
+        // where a scale would be (dsc_blob_charset = dsc_scale; probed:
+        // a UTF8 text blob describes sqlscale 4)
+        (c.dtype, 8, c.charset_id.unwrap_or(0) as i8, c.sub_type)
+    } else if c.dims.is_empty() {
         col_field(c.dtype, c.length, c.scale, c.sub_type)
     } else {
         (crate::format::dtype::ARRAY, 8, 0, 0)
@@ -1157,6 +1168,13 @@ pub fn alter_table_add_column(
         field_vals.push(("RDB$CHARACTER_LENGTH", SysVal::I(cl as i64)));
         field_vals.push(("RDB$COLLATION_ID", SysVal::I(0)));
     }
+    if col.field_type == 261 {
+        field_vals.push(("RDB$SEGMENT_LENGTH", SysVal::I(col.segment_length.unwrap_or(80) as i64)));
+        if col.sub_type == 1 {
+            field_vals.push(("RDB$CHARACTER_SET_ID", SysVal::I(col.charset_id.unwrap_or(0) as i64)));
+            field_vals.push(("RDB$COLLATION_ID", SysVal::I(0)));
+        }
+    }
     // a computed column: the verbatim `(expr)` source + compiled BLR +
     // the result type's precision, exactly as create_table writes them
     let computed_blobs = match &col.computed {
@@ -1591,6 +1609,13 @@ pub fn create_domain(file: &mut crate::Image, page_size: usize, col: &ColumnDef)
         vals.push(("RDB$CHARACTER_LENGTH", SysVal::I(cl as i64)));
         vals.push(("RDB$COLLATION_ID", SysVal::I(0)));
     }
+    if col.field_type == 261 {
+        vals.push(("RDB$SEGMENT_LENGTH", SysVal::I(col.segment_length.unwrap_or(80) as i64)));
+        if col.sub_type == 1 {
+            vals.push(("RDB$CHARACTER_SET_ID", SysVal::I(col.charset_id.unwrap_or(0) as i64)));
+            vals.push(("RDB$COLLATION_ID", SysVal::I(0)));
+        }
+    }
     if let Some(p) = col.precision {
         // same rule as a table column's auto-domain: 0 for plain exact
         // ints, the declared p for NUMERIC/DECIMAL (probed on domains)
@@ -1598,6 +1623,9 @@ pub fn create_domain(file: &mut crate::Image, page_size: usize, col: &ColumnDef)
     }
     if col.not_null {
         vals.push(("RDB$NULL_FLAG", SysVal::I(1)));
+    }
+    if !col.dims.is_empty() {
+        vals.push(("RDB$DIMENSIONS", SysVal::I(col.dims.len() as i64)));
     }
     // a domain DEFAULT lives on the domain's own RDB$FIELDS row (the source
     // text, subtype 1 charset 4 like a description, and the value BLR,
@@ -1611,6 +1639,24 @@ pub fn create_domain(file: &mut crate::Image, page_size: usize, col: &ColumnDef)
         vals.push(("RDB$DEFAULT_VALUE", SysVal::B(blob_id_bytes(2, val))));
     }
     sys_insert(file, page_size, "RDB$FIELDS", 2, &vals)?;
+    // an ARRAY domain's bounds: one RDB$FIELD_DIMENSIONS row per
+    // dimension on the domain's own name (a column of the domain has no
+    // rows of its own - array_shape follows RDB$FIELD_SOURCE here)
+    for (dim, (lo, hi)) in col.dims.iter().enumerate() {
+        sys_insert(
+            file,
+            page_size,
+            "RDB$FIELD_DIMENSIONS",
+            21,
+            &[
+                ("RDB$FIELD_NAME", SysVal::S(&name)),
+                ("RDB$DIMENSION", SysVal::I(dim as i64)),
+                ("RDB$LOWER_BOUND", SysVal::I(*lo as i64)),
+                ("RDB$UPPER_BOUND", SysVal::I(*hi as i64)),
+                ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
+            ],
+        )?;
+    }
     store_privileges(file, page_size, &name, 9, &["G"])?;
     advance_oldest_transactions(file, page_size)
 }
@@ -1618,6 +1664,124 @@ pub fn create_domain(file: &mut crate::Image, page_size: usize, col: &ColumnDef)
 /// `DROP DOMAIN <name>` - delete the `RDB$FIELDS` row. Refused while a
 /// table column still uses the domain as its `RDB$FIELD_SOURCE`, or when
 /// the domain does not exist.
+/// `DECLARE FILTER <name> INPUT_TYPE <i> OUTPUT_TYPE <o> ENTRY_POINT '<e>'
+/// MODULE_NAME '<m>'`: one RDB$FILTERS row (owner, a security class like
+/// a sequence's, no privilege row - probed). A name already declared is
+/// "Blob filter already exists"; a (input, output) pair already declared
+/// is the engine's unique-key violation on RDB$INDEX_17 (the caller
+/// spells that vector).
+pub fn declare_filter(
+    file: &mut crate::Image,
+    page_size: usize,
+    name: &str,
+    input: i16,
+    output: i16,
+    entry: &str,
+    module: &str,
+) -> Result<(), String> {
+    let want = name.trim().trim_matches('"').to_ascii_uppercase();
+    if want.is_empty() {
+        return Err("a filter needs a name".into());
+    }
+    let (names, pairs) = filters(file, page_size);
+    if names.iter().any(|n| n == &want) {
+        return Err(format!("Blob filter {} already exists", want));
+    }
+    if pairs.contains(&(input, output)) {
+        return Err(format!("filter pair {} {} already exists", input, output));
+    }
+    let rel = crate::resolve_relation(file, page_size, "RDB$FILTERS").ok_or("no RDB$FILTERS relation")?;
+    let class = next_security_class(file, page_size, ACL_SEQUENCE_OWNER)?;
+    sys_insert(
+        file,
+        page_size,
+        "RDB$FILTERS",
+        rel,
+        &[
+            ("RDB$FUNCTION_NAME", SysVal::S(&want)),
+            ("RDB$MODULE_NAME", SysVal::S(module)),
+            ("RDB$ENTRYPOINT", SysVal::S(entry)),
+            ("RDB$INPUT_SUB_TYPE", SysVal::I(input as i64)),
+            ("RDB$OUTPUT_SUB_TYPE", SysVal::I(output as i64)),
+            ("RDB$SYSTEM_FLAG", SysVal::I(0)),
+            ("RDB$SECURITY_CLASS", SysVal::S(&class)),
+            ("RDB$OWNER_NAME", SysVal::S(OWNER)),
+        ],
+    )?;
+    advance_oldest_transactions(file, page_size)
+}
+
+/// Every declared filter: the names, and the (input, output) pairs.
+fn filters(file: &crate::Image, page_size: usize) -> (Vec<String>, Vec<(i16, i16)>) {
+    let mut names = Vec::new();
+    let mut pairs = Vec::new();
+    let (Some(rel), Some(formats)) = (
+        crate::resolve_relation(file, page_size, "RDB$FILTERS"),
+        system_relation_formats(file, page_size, "RDB$FILTERS"),
+    ) else {
+        return (names, pairs);
+    };
+    let Some((_, descs)) = formats.iter().max_by_key(|(n, _)| *n) else {
+        return (names, pairs);
+    };
+    let cols = relation_columns(file, page_size, "RDB$FILTERS");
+    let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (Some(name_f), Some(in_f), Some(out_f)) =
+        (fid("RDB$FUNCTION_NAME"), fid("RDB$INPUT_SUB_TYPE"), fid("RDB$OUTPUT_SUB_TYPE"))
+    else {
+        return (names, pairs);
+    };
+    walk_rows(file, page_size, rel, descs, |v| {
+        if let Some(Value::Text(t)) = v.get(name_f) {
+            names.push(t.trim_end().to_string());
+        }
+        let geti = |f: usize| match v.get(f) {
+            Some(Value::Int(i)) => *i as i16,
+            _ => 0,
+        };
+        pairs.push((geti(in_f), geti(out_f)));
+    });
+    (names, pairs)
+}
+
+/// `DROP FILTER <name>`: the row and its security class go.
+pub fn drop_filter(file: &mut crate::Image, page_size: usize, name: &str) -> Result<(), String> {
+    let want = name.trim().trim_matches('"').to_ascii_uppercase();
+    let (names, _) = filters(file, page_size);
+    if !names.iter().any(|n| n == &want) {
+        return Err(format!("BLOB Filter {} not found", want));
+    }
+    let name_f = sys_fid(file, page_size, "RDB$FILTERS", "RDB$FUNCTION_NAME")?;
+    let cls_f_src = sys_fid(file, page_size, "RDB$FILTERS", "RDB$SECURITY_CLASS")?;
+    let mut class: Option<String> = None;
+    if let (Some(rel), Some(formats)) = (
+        crate::resolve_relation(file, page_size, "RDB$FILTERS"),
+        system_relation_formats(file, page_size, "RDB$FILTERS"),
+    ) {
+        if let Some((_, descs)) = formats.iter().max_by_key(|(n, _)| *n) {
+            let w = want.clone();
+            walk_rows(file, page_size, rel, descs, |v| {
+                if class.is_none() && text_eq(v.get(name_f), &w) {
+                    if let Some(Value::Text(t)) = v.get(cls_f_src) {
+                        class = Some(t.trim_end().to_string());
+                    }
+                }
+            });
+        }
+    }
+    {
+        let w = want.clone();
+        delete_catalog_rows(file, page_size, "RDB$FILTERS", move |v| text_eq(v.get(name_f), &w))?;
+    }
+    if let Some(class) = class {
+        let cls_f = sys_fid(file, page_size, "RDB$SECURITY_CLASSES", "RDB$SECURITY_CLASS")?;
+        delete_catalog_rows(file, page_size, "RDB$SECURITY_CLASSES", move |v| {
+            text_eq(v.get(cls_f), &class)
+        })?;
+    }
+    advance_oldest_transactions(file, page_size)
+}
+
 pub fn drop_domain(file: &mut crate::Image, page_size: usize, name: &str) -> Result<(), String> {
     let want = name.trim().trim_matches('"').to_ascii_uppercase();
     if !domain_exists(file, page_size, &want) {
@@ -1818,6 +1982,39 @@ pub struct DomainType {
     pub not_null: bool,
     pub default_blr: Option<Vec<u8>>,
     pub validation_blr: Option<Vec<u8>>,
+    /// an ARRAY domain's bounds (RDB$DIMENSIONS + RDB$FIELD_DIMENSIONS);
+    /// empty for a scalar domain
+    pub dims: Vec<(i32, i32)>,
+}
+
+/// The bounds of an ARRAY field's dimensions, in dimension order -
+/// RDB$FIELD_DIMENSIONS (relation 21) for `fname`; empty for a scalar.
+fn field_dimensions(file: &crate::Image, page_size: usize, fname: &str) -> Vec<(i32, i32)> {
+    let Some(formats) = system_relation_formats(file, page_size, "RDB$FIELD_DIMENSIONS") else {
+        return Vec::new();
+    };
+    let Some((_, descs)) = formats.iter().max_by_key(|(n, _)| *n) else {
+        return Vec::new();
+    };
+    let cols = relation_columns(file, page_size, "RDB$FIELD_DIMENSIONS");
+    let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (Some(n_f), Some(d_f), Some(l_f), Some(u_f)) =
+        (fid("RDB$FIELD_NAME"), fid("RDB$DIMENSION"), fid("RDB$LOWER_BOUND"), fid("RDB$UPPER_BOUND"))
+    else {
+        return Vec::new();
+    };
+    let mut dims: Vec<(i64, i32, i32)> = Vec::new();
+    walk_rows(file, page_size, 21, descs, |v| {
+        if text_eq(v.get(n_f), fname) {
+            let geti = |f: usize| match v.get(f) {
+                Some(Value::Int(i)) => *i,
+                _ => 0,
+            };
+            dims.push((geti(d_f), geti(l_f) as i32, geti(u_f) as i32));
+        }
+    });
+    dims.sort_by_key(|d| d.0);
+    dims.into_iter().map(|d| (d.1, d.2)).collect()
 }
 
 fn resolve_domain_type(file: &crate::Image, page_size: usize, dname: &str) -> Option<DomainType> {
@@ -1835,6 +2032,7 @@ fn resolve_domain_type(file: &crate::Image, page_size: usize, dname: &str) -> Op
     let nf_f = fid("RDB$NULL_FLAG");
     let dv_f = fid("RDB$DEFAULT_VALUE");
     let vb_f = fid("RDB$VALIDATION_BLR");
+    let dim_f = fid("RDB$DIMENSIONS");
     #[allow(clippy::type_complexity)]
     let mut found: Option<(
         i16,
@@ -1845,6 +2043,7 @@ fn resolve_domain_type(file: &crate::Image, page_size: usize, dname: &str) -> Op
         bool,
         Option<(u16, u64)>,
         Option<(u16, u64)>,
+        i64,
     )> = None;
     walk_rows(file, page_size, rel, descs, |v| {
         if found.is_none() && text_eq(v.get(name_f), dname) {
@@ -1874,10 +2073,12 @@ fn resolve_domain_type(file: &crate::Image, page_size: usize, dname: &str) -> Op
                 not_null,
                 def,
                 vblr,
+                dim_f.map_or(0, geti),
             ));
         }
     });
-    let (field_type, byte_len, scale, sub_type, char_len, not_null, def, vblr) = found?;
+    let (field_type, byte_len, scale, sub_type, char_len, not_null, def, vblr, ndims) = found?;
+    let dims = if ndims > 0 { field_dimensions(file, page_size, dname) } else { Vec::new() };
     let dtype = field_type_to_dtype(field_type)?;
     // dsc_length: a VARYING carries its 2-byte count word, other types do not
     let length = if dtype == crate::format::dtype::VARYING {
@@ -1898,6 +2099,7 @@ fn resolve_domain_type(file: &crate::Image, page_size: usize, dname: &str) -> Op
         not_null,
         default_blr,
         validation_blr,
+        dims,
     })
 }
 
@@ -3244,6 +3446,10 @@ pub fn create_table(
             rc.scale = dt.scale;
             rc.sub_type = dt.sub_type;
             rc.char_len = dt.char_len;
+            // an ARRAY domain makes the column an array of its shape (the
+            // bounds live on the domain's RDB$FIELDS row; the column's
+            // storage is the 8-byte array id like any other)
+            rc.dims = dt.dims.clone();
             resolved.push(rc);
             src_meta.push((dname, true, dt.default_blr, dt.not_null, dt.validation_blr));
             identity_meta.push(None);
@@ -3441,6 +3647,17 @@ pub fn create_table(
             vals.push(("RDB$CHARACTER_SET_ID", SysVal::I(0))); // NONE
             vals.push(("RDB$CHARACTER_LENGTH", SysVal::I(cl as i64)));
             vals.push(("RDB$COLLATION_ID", SysVal::I(0)));
+        }
+        // a BLOB: its segment size (80 unless declared) and, for a TEXT
+        // blob, its character set with the default collation (probed:
+        // `BLOB SUB_TYPE TEXT CHARACTER SET UTF8` -> charset 4, collation 0;
+        // a binary blob carries neither)
+        if c.field_type == 261 {
+            vals.push(("RDB$SEGMENT_LENGTH", SysVal::I(c.segment_length.unwrap_or(80) as i64)));
+            if c.sub_type == 1 {
+                vals.push(("RDB$CHARACTER_SET_ID", SysVal::I(c.charset_id.unwrap_or(0) as i64)));
+                vals.push(("RDB$COLLATION_ID", SysVal::I(0)));
+            }
         }
         if !c.dims.is_empty() {
             vals.push(("RDB$DIMENSIONS", SysVal::I(c.dims.len() as i64)));

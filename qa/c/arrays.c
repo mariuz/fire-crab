@@ -166,6 +166,34 @@ int main(int argc, char **argv) {
             if (isc_dsql_execute(st, &tr, &sth, 1, in)) die("execute update Z");
             isc_dsql_free_statement(st, &sth, DSQL_drop); free(in);
         }
+        /* 5. ARRAY DOMAINS: the bounds live on the domain; a column of it is the array */
+        exec("CREATE DOMAIN DA AS INTEGER [1:3]");
+        exec("CREATE DOMAIN DN AS NUMERIC(9,2) [0:1, 1:2] NOT NULL");
+        exec("CREATE TABLE TD (ID INTEGER NOT NULL PRIMARY KEY, A DA, N DN, B DA)");
+        if (isc_commit_retaining(st, &tr)) die("commit retaining 3");
+        {   ISC_ARRAY_DESC da, dn; ISC_QUAD qa, qn;
+            desc1(&da, "TD", "A", blr_long, 4, 1, 3);
+            desc1(&dn, "TD", "N", blr_long, 4, 0, 1); dn.array_desc_scale = -2; dn.array_desc_dimensions = 2; dn.array_desc_bounds[1].array_bound_lower = 1; dn.array_desc_bounds[1].array_bound_upper = 2;
+            int a[3] = { 7, 8, 9 }; int n[2][2] = { { 100, 250 }, { -1, 99999 } };
+            len = sizeof a; memset(&qa, 0, 8); if (isc_array_put_slice(st, &db, &tr, &qa, &da, a, &len)) die("put A"); printf("put A: len %ld\n", (long)len);
+            len = sizeof n; memset(&qn, 0, 8); if (isc_array_put_slice(st, &db, &tr, &qn, &dn, n, &len)) die("put N (domain)"); printf("put N (domain): len %ld\n", (long)len);
+            XSQLDA *in = (XSQLDA *)calloc(1, XSQLDA_LENGTH(2)); in->version = SQLDA_VERSION1; in->sqln = 2; in->sqld = 2;
+            short i0 = 0, i1 = 0;
+            in->sqlvar[0].sqltype = SQL_ARRAY; in->sqlvar[0].sqldata = (char *)&qa; in->sqlvar[0].sqllen = 8; in->sqlvar[0].sqlind = &i0;
+            in->sqlvar[1].sqltype = SQL_ARRAY; in->sqlvar[1].sqldata = (char *)&qn; in->sqlvar[1].sqllen = 8; in->sqlvar[1].sqlind = &i1;
+            isc_stmt_handle sth = 0;
+            if (isc_dsql_allocate_statement(st, &db, &sth)) die("alloc");
+            if (isc_dsql_prepare(st, &tr, &sth, 0, "INSERT INTO TD (ID, A, N) VALUES (1, ?, ?)", 3, NULL)) die("prepare insert TD");
+            if (isc_dsql_execute(st, &tr, &sth, 1, in)) die("execute insert TD");
+            isc_dsql_free_statement(st, &sth, DSQL_drop); free(in);
+            /* the domain's NOT NULL holds for the array column */
+            sth = 0;
+            if (isc_dsql_allocate_statement(st, &db, &sth)) die("alloc");
+            if (isc_dsql_prepare(st, &tr, &sth, 0, "INSERT INTO TD (ID, A) VALUES (2, NULL)", 3, NULL)) printf("prepare insert TD 2: error %s\n", errtext());
+            else if (isc_dsql_execute(st, &tr, &sth, 1, NULL)) printf("insert TD 2 without N: error %s\n", errtext());
+            else printf("insert TD 2 without N: accepted\n");
+            isc_dsql_free_statement(st, &sth, DSQL_drop);
+        }
         if (isc_commit_transaction(st, &tr)) die("commit");
         if (isc_start_transaction(st, &tr, 1, &db, 0, NULL)) die("start 2");
     }
@@ -187,14 +215,26 @@ int main(int argc, char **argv) {
        search-path CTE (row_number() over a parse_unqualified_names derived
        table, joined to system.rdb$relation_fields / rdb$fields /
        rdb$field_dimensions) over the wire */
-    {   const char *lk[][2] = { { "AN", "N" }, { "AN", "C" }, { "AR", "M" }, { "AR2", "Z" }, { "AR", "NOPE" } };
-        for (int i = 0; i < 5; i++) {
+    {   const char *lk[][2] = { { "AN", "N" }, { "AN", "C" }, { "AR", "M" }, { "AR2", "Z" }, { "AR", "NOPE" }, { "TD", "A" }, { "TD", "N" } };
+        for (int i = 0; i < 7; i++) {
             ISC_ARRAY_DESC ld; memset(&ld, 0, sizeof ld);
             if (isc_array_lookup_bounds(st, &db, &tr, (char *)lk[i][0], (char *)lk[i][1], &ld)) { printf("lookup %s.%s: error %s\n", lk[i][0], lk[i][1], errtext()); continue; }
             printf("lookup %s.%s: dtype %d scale %d length %d dims %d [%d:%d]", lk[i][0], lk[i][1], ld.array_desc_dtype, ld.array_desc_scale, ld.array_desc_length, ld.array_desc_dimensions, ld.array_desc_bounds[0].array_bound_lower, ld.array_desc_bounds[0].array_bound_upper);
             if (ld.array_desc_dimensions > 1) printf(" [%d:%d]", ld.array_desc_bounds[1].array_bound_lower, ld.array_desc_bounds[1].array_bound_upper);
             printf("\n");
         }
+    }
+    /* the domain arrays read back */
+    {   ISC_ARRAY_DESC da, dn; ISC_QUAD q;
+        desc1(&da, "TD", "A", blr_long, 4, 1, 3);
+        desc1(&dn, "TD", "N", blr_long, 4, 0, 1); dn.array_desc_scale = -2; dn.array_desc_dimensions = 2; dn.array_desc_bounds[1].array_bound_lower = 1; dn.array_desc_bounds[1].array_bound_upper = 2;
+        if (fetch_id("SELECT A FROM TD WHERE ID = 1", &q)) show_ints("A of TD 1 (domain DA)", &da, &q, 3); else printf("A of TD 1: null\n");
+        if (fetch_id("SELECT N FROM TD WHERE ID = 1", &q)) {
+            show_ints("N of TD 1 (domain DN, scaled)", &dn, &q, 4);
+            ISC_ARRAY_DESC asd = dn; asd.array_desc_dtype = blr_double; asd.array_desc_length = 8; asd.array_desc_scale = 0;
+            show_doubles("N of TD 1 as DOUBLE", &asd, &q, 4);
+        } else printf("N of TD 1: null\n");
+        if (fetch_id("SELECT B FROM TD WHERE ID = 1", &q)) printf("B of TD 1: not null?!\n"); else printf("B of TD 1: null\n");
     }
     /* the NUMERIC / CHAR / BIGINT / ALTER-added arrays, and element CONVERSION */
     {   ISC_ARRAY_DESC dn, dc, dbg, dz; ISC_QUAD q;

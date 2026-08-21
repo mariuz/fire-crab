@@ -531,8 +531,55 @@ pointer-page and TIP page numbers is the next step when it dominates.
   numbers the scan order and ranks every row 1). The singleton inline
   blob path was already covered by `op_inline_blob` (the remaining
   `OP_SQL_RESPONSE` site is a scalar path with no blob).
-- **NEXT**: `op_info_transaction` beyond `isc_info_tra_id`; arrays of
-  domains; blob filters; the `A`/`B`/`C`/`E` items above. (MERGE `RETURNING` / `NOT MATCHED BY SOURCE`, `op_info_blob`
+- **`op_info_transaction` DONE (2026-08-21, `serve-real-trainfo` 36,
+  client `qa/c/trainfo.c`):** every item — `tra_id`, the oldest
+  interesting / snapshot / active counters (4-byte, obeying id ≥ oat ≥
+  ost ≥ oit on both servers), isolation (consistency 1, concurrency 2,
+  read committed 3 + the READ CONSISTENCY option 2 for every flavour),
+  access (the new `Tpb.read_only`), lock_timeout (−1 wait / 0 no wait /
+  N), `fb_info_tra_dbpath` (the attach string, answered FIRST whenever
+  asked — probed), `fb_info_tra_snapshot_number` (0 when read committed);
+  answers in request order, repeats repeated, an unknown item
+  `isc_info_error`, overflow `isc_info_truncated`;
+  `isc_tpb_at_snapshot_number` refused with the engine's "base snapshot
+  number does not exist".
+- **ARRAYS OF DOMAINS DONE (2026-08-21, `serve-real-arrays` 43):**
+  `CREATE DOMAIN DA AS INTEGER [1:3]` writes the dimension rows on the
+  domain; a column of it is the array (`DomainType.dims`, read back from
+  RDB$FIELD_DIMENSIONS); `isc_array_lookup_bounds` resolves through the
+  field source. Found on the way: a DOMAIN's NOT NULL was never enforced
+  at INSERT (fc read only RDB$RELATION_FIELDS.RDB$NULL_FLAG; the engine
+  keeps a domain's on RDB$FIELDS) — `not_null_fids` now follows the
+  field source.
+- **BLOB COLUMNS + BLOB FILTERS DONE (2026-08-21, `serve-real-blobfilter`
+  95, client `qa/c/blobcol.c` printing status vectors raw):**
+  until this slice fc's OWN DDL had no BLOB type at all (every blob table
+  in the gates was an engine-built fixture) and no literal could land in
+  a blob column. Now `BLOB [SUB_TYPE {n|TEXT|BINARY}] [SEGMENT SIZE n]
+  [CHARACTER SET cs]` (type 261, SEGMENT_LENGTH 80 unless declared, the
+  text blob's charset — also what DESCRIBE announces in sqlscale);
+  string (sub_type 1) and `_octets` (sub_type 0) literals stored as blobs
+  at INSERT and UPDATE (`store_blob_literal`; an UPDATE matching no row
+  stores and raises nothing); the engine's filter law (`isc_nofilter
+  from, to`: TEXT into a user sub_type refuses, binary lands anywhere; a
+  bpb on open needs no filter for same/same, to binary, or binary to
+  text); `DECLARE FILTER` / `DROP FILTER` (RDB$FILTERS row + security
+  class) with the engine's vectors — duplicate name, duplicate
+  (input, output) pair = the unique violation on RDB$INDEX_17, missing
+  name; `BLOB SUB_TYPE 2` refused at CREATE TABLE with the nested −204
+  vector; `IS [NOT] NULL` over a BLOB/ARRAY column. General fixes found
+  on the way: DESCRIBE never announced NOT NULL (every column was 497 —
+  now a plain base column reads its flag: 496); a blob's negative
+  sub_type went through the text-charset convention (−5 described as
+  charset 3, length 24, and the row message was 24 bytes wide).
+  **Recorded boundaries:** CAST(<blob> AS VARCHAR) is outside the
+  expression engine; the internal system-sub_type filters (BLR/ACL/… →
+  text) are not mirrored; a text-blob DOMAIN's charset does not reach the
+  descriptor; NOT NULL through expressions / join sides still describes
+  nullable.
+- **NEXT**: CAST(<blob> AS VARCHAR) (blob reads inside the expression
+  engine); NOT NULL describe through expressions and INNER JOIN sides;
+  the `A`/`B`/`C`/`E` items above. (Full sweep 2026-08-21 after the UPDATE-format change: 259 gates, 8246 checks, 0 DIFF. MERGE `RETURNING` / `NOT MATCHED BY SOURCE`, `op_info_blob`
   / `op_seek_blob`, the ordered JOIN fetch streaming, the RIGHT/FULL
   hash, the bulk index build, the cleanup — all done 2026-08-21.)
 - **D, the MERGE executor** — the BLR is already compiled and tested;
