@@ -12826,6 +12826,24 @@ fn infer_computed_type(
 /// (external RDB$FIELD_TYPE code plus the descriptor pieces, dsc.h
 /// dtypes) and its column-level key constraint, if any, as
 /// (constraint name - empty when unnamed, is-primary).
+/// A CHARACTER SET name to its id (RDB$CHARACTER_SET_ID). None for a name
+/// this server does not carry.
+fn charset_name_id(name: &str) -> Option<u8> {
+    Some(match name.trim().to_ascii_uppercase().as_str() {
+        "NONE" => 0,
+        "OCTETS" | "BINARY" => 1,
+        "ASCII" | "USASCII" | "ASCII7" => 2,
+        "UNICODE_FSS" | "UTF_FSS" | "SQL_TEXT" => 3,
+        "UTF8" | "UTF-8" => 4,
+        "ISO8859_1" | "LATIN1" | "ISO-8859-1" | "ISO88591" => 21,
+        "ISO8859_2" | "LATIN2" | "ISO-8859-2" => 22,
+        "WIN1250" => 51,
+        "WIN1251" => 52,
+        "WIN1252" => 53,
+        _ => return None,
+    })
+}
+
 fn parse_column_def(item: &str) -> Option<(fire_crab_ods::ddl::ColumnDef, Option<(String, bool)>)> {
     use fire_crab_ods::format::dtype;
     let item = item.trim();
@@ -13020,7 +13038,67 @@ fn parse_column_def(item: &str) -> Option<(fire_crab_ods::ddl::ColumnDef, Option
     };
     // a multi-word type keyword (`DOUBLE PRECISION`, `TIME WITH TIME ZONE`)
     // is matched on single spaces - collapse any run of whitespace first.
-    let ty = ty.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut ty = ty.split_whitespace().collect::<Vec<_>>().join(" ");
+    // CHARACTER SET / COLLATE / NCHAR / NATIONAL CHARACTER. A non-default
+    // COLLATE (its own RDB$COLLATION_ID) is a later slice - refuse it so the
+    // charset path never lies about the collation.
+    if find_word(&ty, "COLLATE", 0).is_some() {
+        return None;
+    }
+    let mut cs: Option<u8> = None;
+    if let Some(pos) = ty.find("CHARACTER SET ") {
+        let after = ty[pos + "CHARACTER SET ".len()..].trim_start();
+        let name = after.split(' ').next().unwrap_or("");
+        cs = Some(charset_name_id(name)?);
+        ty = ty[..pos].trim_end().to_string();
+    }
+    // NCHAR / NATIONAL CHAR[ACTER] [VARYING] = the ISO8859_1 charset (id 21)
+    for (pfx, repl) in [
+        ("NATIONAL CHARACTER VARYING", "VARCHAR"),
+        ("NATIONAL CHAR VARYING", "VARCHAR"),
+        ("NCHAR VARYING", "VARCHAR"),
+        ("NATIONAL CHARACTER", "CHAR"),
+        ("NATIONAL CHAR", "CHAR"),
+        ("NCHAR", "CHAR"),
+    ] {
+        if let Some(rest) = ty.strip_prefix(pfx) {
+            // only when the prefix is the whole keyword (next is `(` or end)
+            if rest.is_empty() || rest.trim_start().starts_with('(') {
+                ty = format!("{}{}", repl, rest);
+                cs = cs.or(Some(21));
+                break;
+            }
+        }
+    }
+    // A CHAR/VARCHAR column with a real charset: the descriptor sub_type is
+    // the ttype (charset id in the low byte - the collation rides the high
+    // byte, 0 here), the catalog RDB$FIELD_LENGTH is char_len * bytes-per-char
+    // (a byte length), and RDB$CHARACTER_LENGTH stays the char count.
+    let text_col = |field_type: i16, dt: u8, char_len: u16| {
+        let charset = cs.unwrap_or(0);
+        let bpc = fire_crab_ods::intl::bytes_per_char(charset) as u16;
+        let bytes = char_len.saturating_mul(bpc);
+        let length = if dt == dtype::VARYING { bytes + 2 } else { bytes };
+        Some(fire_crab_ods::ddl::ColumnDef {
+            name: name.to_ascii_uppercase(),
+            field_type,
+            dtype: dt,
+            length,
+            scale: 0,
+            sub_type: charset as i16, // ttype: charset (collation 0)
+            char_len: Some(char_len),
+            dims: dims.clone(),
+            segment_length: None,
+            charset_id: Some(charset),
+            precision: None,
+            not_null,
+            not_null_constraint: not_null,
+            default: None,
+            domain: None,
+            identity: None,
+            computed: None,
+        })
+    };
     let (base, args) = match ty.find('(') {
         Some(p) => {
             if !ty.ends_with(')') {
@@ -13076,8 +13154,8 @@ fn parse_column_def(item: &str) -> Option<(fire_crab_ods::ddl::ColumnDef, Option
         ("DECFLOAT", [p]) if *p == 16 => decfloat(24, dtype::DEC64, 8, 16),
         ("DECFLOAT", [p]) if *p == 34 => decfloat(25, dtype::DEC128, 16, 34),
         ("BOOLEAN", []) => col(23, dtype::BOOLEAN, 1, 0, 0, None),
-        ("CHAR" | "CHARACTER", [n]) if *n >= 1 => col(14, dtype::TEXT, *n, 0, 0, Some(*n)),
-        ("VARCHAR", [n]) if *n >= 1 => col(37, dtype::VARYING, *n + 2, 0, 0, Some(*n)),
+        ("CHAR" | "CHARACTER", [n]) if *n >= 1 => text_col(14, dtype::TEXT, *n),
+        ("VARCHAR" | "CHARACTER VARYING" | "CHAR VARYING", [n]) if *n >= 1 => text_col(37, dtype::VARYING, *n),
         // NUMERIC/DECIMAL: storage by precision (dialect-3 rule);
         // sub_type 1 = NUMERIC, 2 = DECIMAL
         ("NUMERIC" | "DECIMAL", [p]) => {

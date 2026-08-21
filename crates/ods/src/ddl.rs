@@ -961,7 +961,10 @@ fn rebuild_runtime_blob(
         // length - a VARYING's is d.length minus its 2-byte count word
         runtime.push(seg(19, &char_len.unwrap_or(d.length).to_le_bytes()));
         if let Some(cl) = char_len {
-            runtime.push(seg(26, &cl.to_le_bytes())); // RSR_character_length
+            // RSR_character_length is the CHARACTER count; char_len above is
+            // the BYTE length, so divide by the charset's bytes-per-char.
+            let bpc = crate::intl::bytes_per_char(crate::intl::charset_id(d.sub_type)).max(1);
+            runtime.push(seg(26, &(cl / bpc as u16).to_le_bytes()));
         }
         // the computed expression (RSR_computed_blr = 4) before the position
         if let Some((_, (r, n))) = computed_blobs.iter().find(|(s, _)| s == src) {
@@ -1161,12 +1164,16 @@ pub fn alter_table_add_column(
         ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
     ];
     if subtype_carried(col.field_type) {
-        field_vals.push(("RDB$FIELD_SUB_TYPE", SysVal::I(col.sub_type as i64)));
+        // text carries its charset in the DESCRIPTOR sub_type (the ttype) but
+        // RDB$FIELD_SUB_TYPE is 0 for CHAR/VARCHAR (the charset is in
+        // RDB$CHARACTER_SET_ID); numeric keeps its 1/2.
+        let st = if matches!(col.field_type, 14 | 37) { 0 } else { col.sub_type };
+        field_vals.push(("RDB$FIELD_SUB_TYPE", SysVal::I(st as i64)));
     }
     if let Some(cl) = col.char_len {
-        field_vals.push(("RDB$CHARACTER_SET_ID", SysVal::I(0)));
+        field_vals.push(("RDB$CHARACTER_SET_ID", SysVal::I(col.charset_id.unwrap_or(0) as i64)));
         field_vals.push(("RDB$CHARACTER_LENGTH", SysVal::I(cl as i64)));
-        field_vals.push(("RDB$COLLATION_ID", SysVal::I(0)));
+        field_vals.push(("RDB$COLLATION_ID", SysVal::I(crate::intl::collation_id(col.sub_type) as i64)));
     }
     if col.field_type == 261 {
         field_vals.push(("RDB$SEGMENT_LENGTH", SysVal::I(col.segment_length.unwrap_or(80) as i64)));
@@ -1271,7 +1278,19 @@ pub fn alter_table_add_column(
 /// [ColumnDef]'s `length` carries. A `CHAR`'s length is already the count;
 /// a non-text type has no `char_len` and uses `length` directly.
 fn catalog_field_length(col: &ColumnDef) -> i64 {
-    col.char_len.map(|c| c as i64).unwrap_or(col.length as i64)
+    // RDB$FIELD_LENGTH is a BYTE length (char_len * bytes-per-char), which is
+    // already what col.length holds for text (a VARYING carries its 2-byte
+    // count word on top, not counted here). A non-text column has no char_len
+    // and uses its length directly.
+    if col.char_len.is_some() {
+        (if col.dtype == crate::format::dtype::VARYING {
+            col.length.saturating_sub(2)
+        } else {
+            col.length
+        }) as i64
+    } else {
+        col.length as i64
+    }
 }
 
 /// `ALTER DOMAIN <old> TO <new>`: rename the domain's RDB$FIELDS row IN
@@ -1602,12 +1621,13 @@ pub fn create_domain(file: &mut crate::Image, page_size: usize, col: &ColumnDef)
         ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
     ];
     if subtype_carried(col.field_type) {
-        vals.push(("RDB$FIELD_SUB_TYPE", SysVal::I(col.sub_type as i64)));
+        let st = if matches!(col.field_type, 14 | 37) { 0 } else { col.sub_type };
+        vals.push(("RDB$FIELD_SUB_TYPE", SysVal::I(st as i64)));
     }
     if let Some(cl) = col.char_len {
-        vals.push(("RDB$CHARACTER_SET_ID", SysVal::I(0))); // NONE
+        vals.push(("RDB$CHARACTER_SET_ID", SysVal::I(col.charset_id.unwrap_or(0) as i64)));
         vals.push(("RDB$CHARACTER_LENGTH", SysVal::I(cl as i64)));
-        vals.push(("RDB$COLLATION_ID", SysVal::I(0)));
+        vals.push(("RDB$COLLATION_ID", SysVal::I(crate::intl::collation_id(col.sub_type) as i64)));
     }
     if col.field_type == 261 {
         vals.push(("RDB$SEGMENT_LENGTH", SysVal::I(col.segment_length.unwrap_or(80) as i64)));
@@ -3721,12 +3741,13 @@ pub fn create_table(
             ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
         ];
         if subtype_carried(c.field_type) {
-            vals.push(("RDB$FIELD_SUB_TYPE", SysVal::I(c.sub_type as i64)));
+            let st = if matches!(c.field_type, 14 | 37) { 0 } else { c.sub_type };
+            vals.push(("RDB$FIELD_SUB_TYPE", SysVal::I(st as i64)));
         }
         if let Some(cl) = c.char_len {
-            vals.push(("RDB$CHARACTER_SET_ID", SysVal::I(0))); // NONE
+            vals.push(("RDB$CHARACTER_SET_ID", SysVal::I(c.charset_id.unwrap_or(0) as i64)));
             vals.push(("RDB$CHARACTER_LENGTH", SysVal::I(cl as i64)));
-            vals.push(("RDB$COLLATION_ID", SysVal::I(0)));
+            vals.push(("RDB$COLLATION_ID", SysVal::I(crate::intl::collation_id(c.sub_type) as i64)));
         }
         // a BLOB: its segment size (80 unless declared) and, for a TEXT
         // blob, its character set with the default collation (probed:
