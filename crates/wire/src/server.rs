@@ -12865,6 +12865,24 @@ fn charset_name_id(name: &str) -> Option<u8> {
     })
 }
 
+/// A COLLATE name to its RDB$COLLATION_ID for a given charset. The default
+/// collation shares the charset's name (id 0). Only the built-in UTF8 family
+/// is carried here; another collation is a later slice (it needs the full
+/// RDB$COLLATIONS lookup and the collation-aware key ordering).
+fn collation_name_id(charset: u8, name: &str) -> Option<u8> {
+    let n = name.trim().trim_matches('"').to_ascii_uppercase();
+    if charset_name_id(&n) == Some(charset) {
+        return Some(0); // the charset's own name is its default collation
+    }
+    Some(match (charset, n.as_str()) {
+        (4, "UCS_BASIC") => 1,
+        (4, "UNICODE") => 2,
+        (4, "UNICODE_CI") => 3,
+        (4, "UNICODE_CI_AI") => 4,
+        _ => return None,
+    })
+}
+
 fn parse_column_def(item: &str) -> Option<(fire_crab_ods::ddl::ColumnDef, Option<(String, bool)>)> {
     use fire_crab_ods::format::dtype;
     let item = item.trim();
@@ -13060,18 +13078,24 @@ fn parse_column_def(item: &str) -> Option<(fire_crab_ods::ddl::ColumnDef, Option
     // a multi-word type keyword (`DOUBLE PRECISION`, `TIME WITH TIME ZONE`)
     // is matched on single spaces - collapse any run of whitespace first.
     let mut ty = ty.split_whitespace().collect::<Vec<_>>().join(" ");
-    // CHARACTER SET / COLLATE / NCHAR / NATIONAL CHARACTER. A non-default
-    // COLLATE (its own RDB$COLLATION_ID) is a later slice - refuse it so the
-    // charset path never lies about the collation.
-    if find_word(&ty, "COLLATE", 0).is_some() {
-        return None;
-    }
+    // CHARACTER SET / COLLATE / NCHAR / NATIONAL CHARACTER trail the base
+    // type; split them off together (COLLATE follows CHARACTER SET in the
+    // grammar, so stripping CHARACTER SET alone would drop the COLLATE too).
     let mut cs: Option<u8> = None;
-    if let Some(pos) = ty.find("CHARACTER SET ") {
-        let after = ty[pos + "CHARACTER SET ".len()..].trim_start();
-        let name = after.split(' ').next().unwrap_or("");
-        cs = Some(charset_name_id(name)?);
-        ty = ty[..pos].trim_end().to_string();
+    let mut coll_name: Option<String> = None;
+    let cs_pos = ty.find("CHARACTER SET ");
+    let co_pos = find_word(&ty, "COLLATE", 0);
+    if let Some(cstart) = [cs_pos, co_pos].into_iter().flatten().min() {
+        let clauses = ty[cstart..].to_string();
+        ty = ty[..cstart].trim_end().to_string();
+        if let Some(cp) = clauses.find("CHARACTER SET ") {
+            let name = clauses[cp + "CHARACTER SET ".len()..].trim_start().split(' ').next().unwrap_or("");
+            cs = Some(charset_name_id(name)?);
+        }
+        if let Some(op) = find_word(&clauses, "COLLATE", 0) {
+            let name = clauses[op + "COLLATE".len()..].trim_start().split(' ').next().unwrap_or("");
+            coll_name = Some(name.to_string());
+        }
     }
     // NCHAR / NATIONAL CHAR[ACTER] [VARYING] = the ISO8859_1 charset (id 21)
     for (pfx, repl) in [
@@ -13091,10 +13115,17 @@ fn parse_column_def(item: &str) -> Option<(fire_crab_ods::ddl::ColumnDef, Option
             }
         }
     }
+    // The COLLATE id (against the resolved charset); an unknown/user
+    // collation refuses (a later slice), so the catalog never lies about it.
+    let coll: u8 = match &coll_name {
+        Some(n) => collation_name_id(cs.unwrap_or(0), n)?,
+        None => 0,
+    };
     // A CHAR/VARCHAR column with a real charset: the descriptor sub_type is
-    // the ttype (charset id in the low byte - the collation rides the high
-    // byte, 0 here), the catalog RDB$FIELD_LENGTH is char_len * bytes-per-char
-    // (a byte length), and RDB$CHARACTER_LENGTH stays the char count.
+    // the ttype (charset id in the low byte, collation in the high byte),
+    // the catalog RDB$FIELD_LENGTH is char_len * bytes-per-char (a byte
+    // length), RDB$CHARACTER_LENGTH stays the char count, and
+    // RDB$COLLATION_ID reads the ttype's high byte.
     let text_col = |field_type: i16, dt: u8, char_len: u16| {
         let charset = cs.unwrap_or(0);
         let bpc = fire_crab_ods::intl::bytes_per_char(charset) as u16;
@@ -13106,7 +13137,7 @@ fn parse_column_def(item: &str) -> Option<(fire_crab_ods::ddl::ColumnDef, Option
             dtype: dt,
             length,
             scale: 0,
-            sub_type: charset as i16, // ttype: charset (collation 0)
+            sub_type: charset as i16 | ((coll as i16) << 8), // ttype: charset + collation
             char_len: Some(char_len),
             dims: dims.clone(),
             segment_length: None,

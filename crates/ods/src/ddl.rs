@@ -1234,9 +1234,9 @@ pub fn alter_table_add_column(
         ("RDB$SYSTEM_FLAG", SysVal::I(0)),
         ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
         ("RDB$FIELD_SOURCE_SCHEMA_NAME", SysVal::S("PUBLIC")),
-        // every built-in-typed column gets RDB$COLLATION_ID 0, text or not
-        // (probed - the same as create_table's non-domain columns)
-        ("RDB$COLLATION_ID", SysVal::I(0)),
+        // a text column's collation rides here too (the ttype high byte);
+        // a built-in non-text column is 0
+        ("RDB$COLLATION_ID", SysVal::I(crate::intl::collation_id(col.sub_type) as i64)),
     ];
     sys_insert(file, page_size, "RDB$RELATION_FIELDS", 5, &rf_vals)?;
 
@@ -3822,7 +3822,9 @@ pub fn create_table(
         // domain column (the collation is the domain's) - probe: an INTEGER
         // built-in column has 0 too, so this is not a text-only attribute
         if !is_domain {
-            vals.push(("RDB$COLLATION_ID", SysVal::I(0)));
+            // a text column's collation (the ttype high byte) rides the
+            // relation-field row too; a built-in non-text column is 0
+            vals.push(("RDB$COLLATION_ID", SysVal::I(crate::intl::collation_id(c.sub_type) as i64)));
         }
         // a COLUMN-level NOT NULL / DEFAULT lands on the RDB$RELATION_FIELDS
         // row (for a built-in or a domain column alike); a domain column with

@@ -7,8 +7,9 @@
 # UTF8 value's CHAR_LENGTH/OCTET_LENGTH are right, and the ENGINE reads fc's
 # table byte-identically. gfix validates it. NCHAR / NATIONAL CHARACTER map to
 # ISO8859_1.
-# Boundary (recorded): a non-default COLLATE clause refuses (a later slice -
-# its RDB$COLLATION_ID lookup).
+# Non-default COLLATE (the built-in UTF8 family) is supported; RDB$COLLATION_ID
+# is written on both the field and relation-field rows. Boundary (recorded): a
+# language collation this server does not carry refuses (a later slice).
 #
 #   qa/serve-real-charsetddl.sh [port]
 set -u
@@ -45,23 +46,23 @@ check() { ran=$((ran + 1)); if [ "$2" = "$3" ]; then echo "OK   $1"; else
     echo "DIFF $1"; echo "     got:  [$2]"; echo "     want: [$3]"; fail=1; fi; }
 norm() { grep -v '^$' | sed 's/  */ /g; s/ *$//' | tr '\n' '|'; }
 mk() { cat <<'SQL'
-CREATE TABLE CT (NC NCHAR(3), NCV NCHAR VARYING(4), CW CHAR(4) CHARACTER SET WIN1252, CI CHAR(4) CHARACTER SET ISO8859_1, VU VARCHAR(5) CHARACTER SET UTF8, VN VARCHAR(3) CHARACTER SET NONE, CA CHAR(2) CHARACTER SET ASCII, VW VARCHAR(6) CHARACTER SET WIN1251);
+CREATE TABLE CT (NC NCHAR(3), NCV NCHAR VARYING(4), CW CHAR(4) CHARACTER SET WIN1252, CI CHAR(4) CHARACTER SET ISO8859_1, VU VARCHAR(5) CHARACTER SET UTF8, VN VARCHAR(3) CHARACTER SET NONE, CA CHAR(2) CHARACTER SET ASCII, VW VARCHAR(6) CHARACTER SET WIN1251, CU VARCHAR(5) CHARACTER SET UTF8 COLLATE UNICODE, CB CHAR(4) CHARACTER SET UTF8 COLLATE UCS_BASIC);
 COMMIT;
-INSERT INTO CT VALUES ('abc', 'wx', 'qrst', 'lm', 'hello', 'yz', 'ok', 'zzz');
+INSERT INTO CT VALUES ('abc', 'wx', 'qrst', 'lm', 'hello', 'yz', 'ok', 'zzz', 'coll', 'basi');
 COMMIT;
 SQL
 }
 mk | "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$REAL:$B" >/dev/null 2>&1
 mk | "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$A" >/dev/null 2>&1
-cat_q="SET LIST ON; SELECT rf.RDB\$FIELD_NAME AS C, f.RDB\$FIELD_TYPE AS FT, f.RDB\$FIELD_LENGTH AS LEN, f.RDB\$CHARACTER_LENGTH AS CLEN, f.RDB\$CHARACTER_SET_ID AS CS, f.RDB\$COLLATION_ID AS COLL, f.RDB\$FIELD_SUB_TYPE AS SUB FROM RDB\$RELATION_FIELDS rf JOIN RDB\$FIELDS f ON f.RDB\$FIELD_NAME = rf.RDB\$FIELD_SOURCE WHERE rf.RDB\$RELATION_NAME = 'CT' ORDER BY rf.RDB\$FIELD_POSITION;"
+cat_q="SET LIST ON; SELECT rf.RDB\$FIELD_NAME AS C, f.RDB\$FIELD_TYPE AS FT, f.RDB\$FIELD_LENGTH AS LEN, f.RDB\$CHARACTER_LENGTH AS CLEN, f.RDB\$CHARACTER_SET_ID AS CS, f.RDB\$COLLATION_ID AS COLL, rf.RDB\$COLLATION_ID AS RFCOLL, f.RDB\$FIELD_SUB_TYPE AS SUB FROM RDB\$RELATION_FIELDS rf JOIN RDB\$FIELDS f ON f.RDB\$FIELD_NAME = rf.RDB\$FIELD_SOURCE WHERE rf.RDB\$RELATION_NAME = 'CT' ORDER BY rf.RDB\$FIELD_POSITION;"
 e=$(printf '%s\n' "$cat_q" | "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$REAL:$B" 2>&1 | norm)
 c=$(printf '%s\n' "$cat_q" | "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$A" 2>&1 | norm)
 check "the catalog (type / byte length / char length / charset / collation / sub_type)" "$c" "$e"
-desc_q="SET SQLDA_DISPLAY ON; SELECT NC, NCV, CW, CI, VU, VN, CA, VW FROM CT;"
+desc_q="SET SQLDA_DISPLAY ON; SELECT NC, NCV, CW, CI, VU, VN, CA, VW, CU, CB FROM CT;"
 e=$(printf '%s\n' "$desc_q" | "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$REAL:$B" 2>&1 | grep sqltype | norm)
 c=$(printf '%s\n' "$desc_q" | "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$A" 2>&1 | grep sqltype | norm)
 check "the describe (each column's charset and byte len)" "$c" "$e"
-row_q="SELECT NC, NCV, CW, CI, VU, VN, CA, VW FROM CT;"
+row_q="SELECT NC, NCV, CW, CI, VU, VN, CA, VW, CU, CB FROM CT;"
 e=$(printf '%s\n' "$row_q" | "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$REAL:$B" 2>&1 | norm)
 c=$(printf '%s\n' "$row_q" | "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$A" 2>&1 | norm)
 check "ASCII-range values round-trip through fc" "$c" "$e"
@@ -81,11 +82,12 @@ eng_q="SET LIST ON; SELECT ID, CHAR_LENGTH(S) AS CL, OCTET_LENGTH(S) AS OL, S FR
 e=$(printf '%s\n' "$eng_q" | "$ISQL" -q -ch UTF8 -user "$U" -pas "$P" "$B" 2>&1 | norm)
 c=$(printf '%s\n' "$eng_q" | "$ISQL" -q -ch UTF8 -user "$U" -pas "$P" "$A" 2>&1 | norm)
 check "the ENGINE reads fc's UTF8 table (multibyte content in fc's own layout)" "$c" "$e"
-# Boundary: a non-default COLLATE refuses
-cb=$("$D/sqlerr" "127.0.0.1/$PORT:$A" "CREATE TABLE C2 (X VARCHAR(5) CHARACTER SET UTF8 COLLATE UNICODE)" 2>&1 | norm)
+# Boundary: a collation this server does not carry (a language collation)
+# refuses; the built-in UTF8 family (tested above) is supported.
+cb=$("$D/sqlerr" "127.0.0.1/$PORT:$A" "CREATE TABLE C2 (X VARCHAR(5) CHARACTER SET ISO8859_1 COLLATE DE_DE)" 2>&1 | norm)
 ran=$((ran + 1))
-if [ "${cb#*gds}" != "$cb" ]; then echo "OK   boundary: a non-default COLLATE refuses (a later slice)"
-else echo "DIFF boundary MOVED: COLLATE"; echo "     fc: $cb"; fail=1; fi
+if [ "${cb#*gds}" != "$cb" ]; then echo "OK   boundary: a language collation (DE_DE) refuses; the UTF8 family is in"
+else echo "DIFF boundary MOVED: unknown COLLATE"; echo "     fc: $cb"; fail=1; fi
 gf=$("$GFIX" -v -full -user "$U" -pas "$P" "$A" 2>&1)
 ran=$((ran + 1))
 if [ -z "$gf" ]; then echo "OK   gfix -v -full clean on fc's file"; else echo "DIFF gfix: $gf"; fail=1; fi
