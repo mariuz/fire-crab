@@ -20,6 +20,13 @@
 # on ("wrong record length (183)", vio.cpp:1902). The new head links
 # past the stub now; the first cell pins it.
 #
+# WHEN NOT MATCHED BY SOURCE (the join turns FULL: every target row no
+# source row reached gets its own pass) and RETURNING (Firebird 5 makes
+# it a CURSOR: the after-image of each moved row, the old one for a
+# DELETE; the target is named by its ALIAS when it has one; a bare name
+# both sides carry is 42702 ambiguous; a source reference inside a BY
+# SOURCE clause is 42S22 Column unknown, not NULL) are in.
+#
 # RECORDED: a MERGE that raises the duplicate-target error reports, on
 # the engine, the rows it moved before the raise ("Records affected: 2")
 # - fc reports 0, having read every pair before moving any. Those two
@@ -68,6 +75,13 @@ both() { local e c; e=$(eng "$2"); c=$(crab "$2"); ran=$((ran + 1))
     if [ "$e" = "$c" ]; then echo "OK   $1 [$e]"; else echo "DIFF $1"; echo "     engine: $e"; echo "     fc:     $c"; fail=1; fi; }
 both_nocount() { local e c; e=$(eng "$2" | sed 's/Records affected: [0-9]*|//g'); c=$(crab "$2" | sed 's/Records affected: [0-9]*|//g'); ran=$((ran + 1))
     if [ "$e" = "$c" ]; then echo "OK   $1 [$e]"; else echo "DIFF $1"; echo "     engine: $e"; echo "     fc:     $c"; fail=1; fi; }
+# both sides refuse at prepare; the engine's vector names the column
+# (42S22 / 42702) where fc answers the one DSQL error every refused
+# statement gets - RECORDED. The SQLSTATE and the vector lines are
+# stripped; what stays is that both refused and the state after.
+refused() { sed 's/Statement failed, SQLSTATE = [0-9A-Z]*|/REFUSED|/; s/Dynamic SQL Error|//; s/SQL error code = -[0-9]*|//; s/-[^|]*|//g'; }
+both_refused() { local e c; e=$(eng "$2" | refused); c=$(crab "$2" | refused); ran=$((ran + 1))
+    if [ "$e" = "$c" ] && [ "${e#REFUSED}" != "$e" ]; then echo "OK   $1 [$e]"; else echo "DIFF $1"; echo "     engine: $e"; echo "     fc:     $c"; fail=1; fi; }
 check() { ran=$((ran + 1)); if [ "$2" = "$3" ]; then echo "OK   $1"; else
     echo "DIFF $1"; echo "     got:  [$2]"; echo "     want: [$3]"; fail=1; fi; }
 
@@ -95,6 +109,32 @@ both_nocount "...a DELETE branch too (the pairs are read before any row moves)" 
     "INSERT INTO S VALUES (2, 'dup'); MERGE INTO T USING S ON T.ID = S.ID WHEN MATCHED THEN DELETE; SELECT COUNT(*) FROM T; ROLLBACK;"
 both "two inserts of one key: the PRIMARY KEY, not MERGE, refuses" \
     "MERGE INTO T USING N ON T.ID = N.ID + 100 WHEN NOT MATCHED THEN INSERT VALUES (N.ID, N.V); SELECT COUNT(*) FROM T; ROLLBACK;"
+both "NOT MATCHED BY SOURCE updates the orphans (the join turns FULL)" \
+    "MERGE INTO T USING S ON T.ID = S.ID WHEN NOT MATCHED BY SOURCE THEN UPDATE SET V = 'orphan'; SELECT * FROM T ORDER BY ID; ROLLBACK;"
+both "all three kinds in one statement" \
+    "MERGE INTO T USING S ON T.ID = S.ID WHEN NOT MATCHED BY SOURCE THEN DELETE WHEN MATCHED THEN UPDATE SET V = S.V WHEN NOT MATCHED BY TARGET THEN INSERT VALUES (S.ID, S.V); SELECT * FROM T ORDER BY ID; ROLLBACK;"
+both "two BY SOURCE branches, the first in order wins" \
+    "MERGE INTO T USING S ON T.ID = S.ID WHEN NOT MATCHED BY SOURCE AND T.ID = 1 THEN UPDATE SET V = 'one' WHEN NOT MATCHED BY SOURCE THEN DELETE; SELECT * FROM T ORDER BY ID; ROLLBACK;"
+both "a BY SOURCE condition that does not hold: nothing happens" \
+    "MERGE INTO T USING S ON T.ID = S.ID WHEN NOT MATCHED BY SOURCE AND T.V = 'zz' THEN DELETE; SELECT * FROM T ORDER BY ID; ROLLBACK;"
+both "a PK-less target: identical orphans move together" \
+    "MERGE INTO N USING S ON N.ID = S.ID WHEN NOT MATCHED BY SOURCE AND N.ID = 1 THEN UPDATE SET V = 'o' WHEN NOT MATCHED BY SOURCE THEN DELETE; SELECT * FROM N ORDER BY ID, V; ROLLBACK;"
+both_refused "a source reference inside BY SOURCE is Column unknown (fc refuses at prepare: recorded vector)" \
+    "MERGE INTO T USING S ON T.ID = S.ID WHEN NOT MATCHED BY SOURCE AND S.ID IS NULL THEN UPDATE SET V = 'x'; SELECT COUNT(*) FROM T WHERE V = 'x'; ROLLBACK;"
+both "RETURNING over a MERGE is a cursor: the after-image per moved row" \
+    "MERGE INTO T USING S ON T.ID = S.ID WHEN MATCHED THEN UPDATE SET V = S.V WHEN NOT MATCHED THEN INSERT VALUES (S.ID, S.V) RETURNING T.ID, T.V; ROLLBACK;"
+both "RETURNING a DELETE branch answers the row as it was" \
+    "MERGE INTO T USING S ON T.ID = S.ID WHEN MATCHED AND S.V = 'del' THEN DELETE WHEN MATCHED THEN UPDATE SET V = S.V RETURNING T.ID, T.V; ROLLBACK;"
+both "RETURNING through the target's alias, and NEW." \
+    "MERGE INTO T tg USING S sr ON tg.ID = sr.ID WHEN MATCHED THEN UPDATE SET V = sr.V RETURNING tg.ID, NEW.V; ROLLBACK;"
+both_refused "RETURNING with the alias: the table name is unknown" \
+    "MERGE INTO T tg USING S sr ON tg.ID = sr.ID WHEN MATCHED THEN UPDATE SET V = sr.V RETURNING T.V; ROLLBACK;"
+both_refused "RETURNING a bare name both sides carry: ambiguous (fc refuses at prepare: recorded vector)" \
+    "MERGE INTO T USING S ON T.ID = S.ID WHEN MATCHED THEN UPDATE SET V = S.V RETURNING V; SELECT COUNT(*) FROM T WHERE V = 's2'; ROLLBACK;"
+both "RETURNING with no row moved: an empty cursor" \
+    "MERGE INTO T USING S ON T.ID = S.ID WHEN MATCHED AND 1 = 0 THEN UPDATE SET V = S.V RETURNING T.ID; ROLLBACK;"
+both "RETURNING from the BY SOURCE pass" \
+    "MERGE INTO T USING S ON T.ID = S.ID WHEN NOT MATCHED BY SOURCE THEN UPDATE SET V = 'orphan' RETURNING T.ID, T.V; ROLLBACK;"
 both "committed" \
     "MERGE INTO T USING S ON T.ID = S.ID WHEN MATCHED THEN UPDATE SET V = S.V WHEN NOT MATCHED THEN INSERT VALUES (S.ID, S.V); COMMIT; SELECT * FROM T ORDER BY ID;"
 check "the ENGINE reads the table fc merged" \

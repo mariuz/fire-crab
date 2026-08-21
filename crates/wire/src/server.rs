@@ -6205,6 +6205,12 @@ AlterDomainRename {
         matched: Vec<(Option<String>, MergeAction)>,
         /// WHEN NOT MATCHED [AND cond] THEN INSERT [(cols)] VALUES (vals)
         not_matched: Vec<(Option<String>, Option<String>, String)>,
+        /// WHEN NOT MATCHED BY SOURCE [AND cond] THEN UPDATE SET <sets> |
+        /// DELETE - the target-driven pass: every target row no source
+        /// row's ON reached (the engine's join turns FULL). A source
+        /// reference in these clauses is "Column unknown" on the engine
+        /// (probed: not NULL), so the planner refuses one.
+        by_source: Vec<(Option<String>, MergeAction)>,
     },
     /// `DELETE FROM <t> [WHERE ...]`: op_execute rewrites each matching
     /// primary record as a deleted stub over its version chain
@@ -16536,6 +16542,21 @@ fn wrap_returning(
         .into_iter()
         .find(|(id, _)| *id == rel)
         .map(|(_, n)| n)?;
+    // MERGE (probed): the target is named by its ALIAS when it has one
+    // (`MERGE INTO T tg ... RETURNING T.V` is Column unknown, `tg.V`
+    // answers), `NEW.` is the after-image this path serves, `OLD.` and
+    // the source's columns are not (refused - a boundary, not a guess),
+    // and a BARE name both sides carry is 42702 ambiguous on the engine
+    // - so a bare name is accepted only when the source has no column
+    // of that name
+    let merge = match &plan {
+        Plan::Merge { tgt_alias, source_sql, .. } => {
+            let (sp, _) = plan_query(source_sql, db);
+            let src: Vec<String> = output_cols_of(&sp).iter().map(|c| c.name.to_ascii_uppercase()).collect();
+            Some((tgt_alias.clone(), src))
+        }
+        _ => None,
+    };
     for item in list.split(',') {
         let item = item.trim();
         let (first, first_q, rest) = returning_ident(item)?;
@@ -16559,9 +16580,25 @@ fn wrap_returning(
         // A QUOTED qualifier compares exactly against the catalog name
         // (probed: `RETURNING "rt".ID` is `Column unknown "rt"."ID"`).
         if let Some((q, quoted)) = &qual {
-            let ok = if *quoted { *q == canon } else { q.eq_ignore_ascii_case(table) };
+            let ok = match &merge {
+                Some((alias, _)) => {
+                    (if *quoted { *q == *alias } else { q.eq_ignore_ascii_case(alias) })
+                        || (!*quoted && q.eq_ignore_ascii_case("NEW"))
+                }
+                None => {
+                    if *quoted {
+                        *q == canon
+                    } else {
+                        q.eq_ignore_ascii_case(table)
+                    }
+                }
+            };
             if !ok {
                 return None;
+            }
+        } else if let Some((_, src)) = &merge {
+            if src.iter().any(|n| if bare_q { *n == bare } else { n.eq_ignore_ascii_case(&bare) }) {
+                return None; // ambiguous between the source and the target
             }
         }
         if !bare_q && !ident_ok(&bare) {
@@ -16682,6 +16719,8 @@ fn dml_target(sql: &str) -> Option<(Option<NamePart<'_>>, &str)> {
         }
     } else if find_word(&masked, "DELETE", 0) == Some(0) {
         ("FROM", find_word(&masked, "FROM", 0)?)
+    } else if find_word(&masked, "MERGE", 0) == Some(0) {
+        ("INTO", find_word(&masked, "INTO", 0)?)
     } else {
         return None;
     };
@@ -16716,6 +16755,13 @@ fn unqualify_dml(sql: &str, db: &Option<Database>) -> Option<String> {
         return None;
     }
     let dbr = db.as_ref()?;
+    // MERGE names two tables, through aliases, and its 2-part
+    // references are the norm (`ON T.ID = S.ID`): the strip would turn
+    // the target's qualifier into a bare name - ambiguous in RETURNING,
+    // and wrong in a branch. Its planner keeps the text whole.
+    if find_word(&mask_literals(&sql.trim().to_ascii_uppercase()), "MERGE", 0) == Some(0) {
+        return None;
+    }
     let (_, table) = dml_target(sql)?;
     // a DML target takes no alias in this server's grammar, so the
     // relation name is the key and the 3-part form is always available
@@ -47544,9 +47590,13 @@ fn insert_select(
 /// `MERGE INTO <t> [[AS] a] USING <s | (subselect)> [[AS] b] ON <cond>
 /// {WHEN MATCHED [AND c] THEN UPDATE SET ... | DELETE | WHEN NOT MATCHED
 /// [BY TARGET] [AND c] THEN INSERT [(cols)] VALUES (...)}+` (parse.y:7579).
-/// The clauses are kept as text (see [Plan::Merge]). Refused here, as
-/// the prepare-time boundary: RETURNING, NOT MATCHED BY SOURCE, PLAN,
-/// ORDER BY, OVERRIDING, and parameters.
+/// The clauses are kept as text (see [Plan::Merge]). `WHEN NOT MATCHED
+/// BY SOURCE [AND c] THEN UPDATE SET ... | DELETE` is the target-driven
+/// pass. Refused here, as the prepare-time boundary: PLAN, ORDER BY,
+/// OVERRIDING, parameters, and a source reference inside a BY SOURCE
+/// clause (the engine's 42S22 Column unknown, probed). RETURNING is
+/// split off before this planner sees the text and wraps the plan
+/// ([wrap_returning]).
 fn plan_merge(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor>)> {
     let text = sql.trim().trim_end_matches(';').trim();
     let up = text.to_ascii_uppercase();
@@ -47631,6 +47681,7 @@ fn plan_merge(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor>
     }
     let mut matched: Vec<(Option<String>, MergeAction)> = Vec::new();
     let mut not_matched: Vec<(Option<String>, Option<String>, String)> = Vec::new();
+    let mut by_source: Vec<(Option<String>, MergeAction)> = Vec::new();
     for (i, &st) in starts.iter().enumerate() {
         let end = starts.get(i + 1).copied().unwrap_or(text.len());
         let clause = text[st + "WHEN".len()..end].trim();
@@ -47639,17 +47690,19 @@ fn plan_merge(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor>
         let head = cup[..then].trim();
         let action = clause[then + "THEN".len()..].trim();
         let aup = action.to_ascii_uppercase();
-        let (is_matched, cond_from) = if head.starts_with("MATCHED") {
-            (true, "MATCHED".len())
+        // 0 = MATCHED, 1 = NOT MATCHED [BY TARGET], 2 = NOT MATCHED BY SOURCE
+        let (kind, cond_from) = if head.starts_with("MATCHED") {
+            (0u8, "MATCHED".len())
         } else if head.starts_with("NOT MATCHED BY SOURCE") {
-            return None; // the target-driven pass is not this slice
+            (2, "NOT MATCHED BY SOURCE".len())
         } else if head.starts_with("NOT MATCHED BY TARGET") {
-            (false, "NOT MATCHED BY TARGET".len())
+            (1, "NOT MATCHED BY TARGET".len())
         } else if head.starts_with("NOT MATCHED") {
-            (false, "NOT MATCHED".len())
+            (1, "NOT MATCHED".len())
         } else {
             return None;
         };
+        let is_matched = kind != 1;
         // the AND condition, in the clause's own spelling (the uppercase
         // shadow has the same byte offsets)
         let head_orig = &clause[..then];
@@ -47662,17 +47715,33 @@ fn plan_merge(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor>
             return None;
         };
         if is_matched {
-            if aup == "DELETE" {
-                matched.push((cond, MergeAction::Delete));
+            let act = if aup == "DELETE" {
+                MergeAction::Delete
             } else if let Some(sets) = aup.strip_prefix("UPDATE") {
                 let sets_up = sets.trim();
                 if !sets_up.starts_with("SET") {
                     return None;
                 }
                 let sets_txt = action["UPDATE".len()..].trim()["SET".len()..].trim().to_string();
-                matched.push((cond, MergeAction::Update(sets_txt)));
+                MergeAction::Update(sets_txt)
             } else {
                 return None;
+            };
+            if kind == 2 {
+                // the source has no row here: a reference to it is
+                // Column unknown on the engine, at prepare
+                let names_source = |t: &str| mentions_qualifier(t, &src_alias);
+                if cond.as_deref().is_some_and(names_source) {
+                    return None;
+                }
+                if let MergeAction::Update(sets) = &act {
+                    if names_source(sets) {
+                        return None;
+                    }
+                }
+                by_source.push((cond, act));
+            } else {
+                matched.push((cond, act));
             }
         } else {
             aup.strip_prefix("INSERT")?;
@@ -47689,7 +47758,7 @@ fn plan_merge(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor>
             not_matched.push((cond, cols, vals));
         }
     }
-    if matched.is_empty() && not_matched.is_empty() {
+    if matched.is_empty() && not_matched.is_empty() && by_source.is_empty() {
         return None;
     }
     // the target must be a table this server writes
@@ -47704,9 +47773,57 @@ fn plan_merge(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor>
             on,
             matched,
             not_matched,
+            by_source,
         },
         Vec::new(),
     ))
+}
+
+/// Does a clause carry a `<alias>.<column>` reference? The same token
+/// walk [merge_subst] does - string literals skipped, quoted identifiers
+/// honoured - asked as a question at prepare.
+fn mentions_qualifier(text: &str, alias: &str) -> bool {
+    let b = text.as_bytes();
+    let mut i = 0usize;
+    let ident_char = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$';
+    while i < b.len() {
+        let c = b[i];
+        if c == b'\'' {
+            i += 1;
+            while i < b.len() {
+                if b[i] == b'\'' {
+                    if i + 1 < b.len() && b[i + 1] == b'\'' {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        if c.is_ascii_alphabetic() || c == b'_' || c == b'"' {
+            let start = i;
+            if c == b'"' {
+                i += 1;
+                while i < b.len() && b[i] != b'"' {
+                    i += 1;
+                }
+                i = (i + 1).min(b.len());
+            } else {
+                while i < b.len() && ident_char(b[i]) {
+                    i += 1;
+                }
+            }
+            if i < b.len() && b[i] == b'.' && text[start..i].trim_matches('"').eq_ignore_ascii_case(alias) {
+                return true;
+            }
+            continue;
+        }
+        i += 1;
+    }
+    false
 }
 
 /// Substitute the SOURCE alias's column references in a MERGE clause
@@ -47808,7 +47925,8 @@ fn merge_exec(
     ctx: &SessionCtx,
     mut affected: Option<&mut Affected>,
 ) -> Result<(i32, i32, i32), ExecErr> {
-    let Plan::Merge { target, tgt_alias, source_sql, src_alias, on, matched, not_matched } = plan else {
+    let Plan::Merge { target, tgt_alias, source_sql, src_alias, on, matched, not_matched, by_source } = plan
+    else {
         return Err("not a MERGE plan".into());
     };
     // the source rows, and the names their values answer to
@@ -47871,10 +47989,105 @@ fn merge_exec(
         };
         pairs.push((on_s, targets));
     }
+    // PHASE 1b - THE ORPHANS: with a BY SOURCE branch the join is FULL,
+    // and every target row no pair reached is one more row of it. Read
+    // from the same start state, identified by its primary key - or by
+    // every column when the table has none (identical rows are one
+    // identity: they take the same branch, as the engine's do, and the
+    // one statement moves them together)
+    let mut orphans: Vec<String> = Vec::new();
+    if !by_source.is_empty() {
+        let probe = format!("DELETE FROM {}", target);
+        let (dplan, _) = plan_delete(&probe, database)
+            .ok_or_else(|| format!("the MERGE target is outside this server's surface: {}", probe))?;
+        let Plan::Delete { rel: drel, formats, filter, .. } = &dplan else {
+            return Err(format!("the MERGE target is outside this server's surface: {}", probe).into());
+        };
+        let filter = bind_filter(filter, &[])?;
+        let db = database.as_ref().ok_or("no database attached")?;
+        let found = collect_dml_targets(db, *drel, formats, &filter, &None).map_err(ExecErr::Eval)?;
+        let image = db.bytes();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for (page, slot, fmt, img) in found {
+            let recno = recno_of(&image, db.page_size, page, slot)?;
+            if touched.contains(&recno) {
+                continue;
+            }
+            let descs = formats
+                .iter()
+                .find(|(n, _)| *n == fmt)
+                .map(|(_, d)| d.clone())
+                .ok_or("MERGE target format unknown")?;
+            let values = decode_record(&img, &descs);
+            let key_cols: Vec<&str> = if pk_cols.is_empty() {
+                rel_cols.iter().map(|c| c.name.as_str()).collect()
+            } else {
+                pk_cols.iter().map(|s| s.as_str()).collect()
+            };
+            let mut parts = Vec::new();
+            for name in key_cols {
+                let col = rel_cols
+                    .iter()
+                    .find(|c| c.name.eq_ignore_ascii_case(name))
+                    .ok_or("MERGE target key column unknown")?;
+                let v = values.get(col.field_id as usize).cloned().unwrap_or(Value::Null);
+                match v {
+                    Value::Null => parts.push(format!("{} IS NULL", name)),
+                    v => {
+                        let lit = psql_literal(&v).ok_or("a key value cannot be written as a literal")?;
+                        parts.push(format!("{} = {}", name, lit));
+                    }
+                }
+            }
+            let identity = parts.join(" AND ");
+            if seen.insert(identity.clone()) {
+                orphans.push(identity);
+            }
+        }
+    }
     // PHASE 2 - THE ACTIONS, all or nothing
     let snap = snapshot_db(database);
     let mark = undo_window_push(database, WindowKind::Nested, snap.clone());
     let (mut ins, mut upd, mut del) = (0i32, 0i32, 0i32);
+    // the BY SOURCE branches name the target alone; the source's
+    // columns are all NULL there (RETURNING S.X answers NULL, probed)
+    let null_row: Vec<Value> = vec![Value::Null; src_cols.len()];
+    for identity in &orphans {
+        let step = (|| -> Result<(), ExecErr> {
+            let sub = |t: &str| merge_subst(t, src_alias, &src_cols, &null_row, tgt_alias);
+            for (cond, action) in by_source {
+                let mut where_ = identity.clone();
+                if let Some(c) = cond {
+                    where_ = format!("({}) AND ({})", where_, sub(c)?);
+                }
+                let (sql, kind) = match action {
+                    MergeAction::Update(sets) => (format!("UPDATE {} SET {} WHERE {}", target, sub(sets)?, where_), 1),
+                    MergeAction::Delete => (format!("DELETE FROM {} WHERE {}", target, where_), 2),
+                };
+                let (aplan, _) = if kind == 1 {
+                    plan_update(&sql, database)
+                        .ok_or_else(|| format!("the MERGE UPDATE branch is outside this server's surface: {}", sql))?
+                } else {
+                    plan_delete(&sql, database)
+                        .ok_or_else(|| format!("the MERGE DELETE branch is outside this server's surface: {}", sql))?
+                };
+                if let Plan::RefusedEval(e) = &aplan {
+                    return Err(ExecErr::Eval(e.clone()));
+                }
+                let (_, u, d) = execute_dml_collecting(&aplan, database, &[], ctx, affected.as_deref_mut())?;
+                if u + d > 0 {
+                    upd += u;
+                    del += d;
+                    break; // the first branch whose condition held
+                }
+            }
+            Ok(())
+        })();
+        if let Err(e) = step {
+            undo_window(database, mark, snap);
+            return Err(e);
+        }
+    }
     for (row, (on_s, targets)) in rows.iter().zip(pairs) {
         let step = (|| -> Result<(), ExecErr> {
             let sub = |t: &str| merge_subst(t, src_alias, &src_cols, row, tgt_alias);
@@ -47970,7 +48183,14 @@ fn merge_exec(
     }
     undo_window_unwind(database, mark, false);
     if std::env::var("FC_SRV_TRACE").is_ok() {
-        eprintln!("[srv] merge: {} source rows -> {} inserted, {} updated, {} deleted", rows.len(), ins, upd, del);
+        eprintln!(
+            "[srv] merge: {} source rows, {} orphans -> {} inserted, {} updated, {} deleted",
+            rows.len(),
+            orphans.len(),
+            ins,
+            upd,
+            del
+        );
     }
     Ok((ins, upd, del))
 }

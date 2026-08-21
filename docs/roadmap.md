@@ -43,7 +43,7 @@ One line each; the gate is the proof.
 | fragmenting store | records larger than a page chain the engine's way; UPDATE/DELETE of a fragmented head | `serve-real-fragstore` 13 |
 | UNIQUE is walk-order | enforcement row-at-a-time in RECNO order, 23000 byte-exact; the sub-9-byte RHDF corruption found and fixed with it | `serve-real-uniqueorder` |
 | external sort | runs to disk past a budget, stable merge; ORDER BY / GROUP BY / DISTINCT; the hash-join build side in a spilling row store; ORDER BY fetches stream from the merge | `serve-real-bigsort` 12 |
-| MERGE | per-source-row desugar into the audited DML planners; first branch wins; dup-target raise | `serve-real-merge` 17 |
+| MERGE | per-source-row desugar into the audited DML planners; first branch wins; dup-target raise; `NOT MATCHED BY SOURCE` orphan pass; `RETURNING` cursor | `serve-real-merge` 30 |
 | blob writes + RETAIN | temp blobs over the wire materialised at the store; COMMIT/ROLLBACK RETAIN keep the transaction with its snapshot | `serve-real-blobwrite` 8, `retain` 8 |
 | transactional DDL | catalog rows under the user transaction's id, undo by state + journaled residue, deferred drops; first-updater-wins on a relation with the engine's vector; owner-only schema visibility | `serve-real-ddltx` 32 |
 | the file grows the engine's way | pointer-page chain, PIP chain, SCN pages at every `pagesPerSCN·N`, TIP chain — each crossed by fc and read by the engine (count, `gfix -v -full`, a write of its own on the new structure, a level-1 nbackup over fc's late pages), and the reverse | `serve-real-growth` 32 |
@@ -175,8 +175,21 @@ if-else chain) — and `isc_merge_dup_update` (21000) when two source rows
 reach one target, the statement undone. Desugared per source row at
 execute into the audited UPDATE/DELETE/INSERT planners; the pairs are
 read first against the statement's starting state, as the engine's one
-join cursor does. **Still absent:** `RETURNING` (a multi-row cursor in
-DSQL), `WHEN NOT MATCHED BY SOURCE` (the target-driven pass), `PLAN` /
+join cursor does. **Tails DONE (2026-08-21, `serve-real-merge` 30):**
+`WHEN NOT MATCHED BY SOURCE [AND c] THEN UPDATE | DELETE` — the join
+turns FULL; every target row no pair reached gets its own pass, read from
+the same starting state, identified by its primary key or (PK-less) by
+every column, identical rows as one identity (they take the same branch,
+as the engine's do); a source reference inside such a clause refuses at
+prepare (the engine: 42S22 Column unknown, probed — NOT a NULL). `RETURNING`
+wraps the plan like any DML's (a multi-row cursor: the after-image per
+moved row, the old row for a DELETE branch, the BY SOURCE pass included);
+the target is named by its ALIAS when it has one (`T.V` is unknown,
+`tg.V` answers — probed), `NEW.` is that same image, a bare name both
+sides carry refuses (the engine's 42702 ambiguous). The qualifier strip
+[`unqualify_dml`] skips MERGE: two tables through aliases make its 2-part
+references the norm. **Still absent:** `RETURNING OLD.x` / the source's
+columns in RETURNING / an expression there (refused at prepare), `PLAN` /
 `ORDER BY`, `OVERRIDING`, parameters inside a MERGE, the failed
 statement's partial `Records affected` (the engine reports the rows it
 moved before the raise; fc reports 0), a trigger-bearing target
@@ -332,11 +345,11 @@ pointer-page and TIP page numbers is the next step when it dominates.
 
 ## Next, in order
 
-- **NEXT**: the recorded tails — MERGE `RETURNING` / `NOT MATCHED BY
-  SOURCE`, `op_info_blob` / `op_seek_blob`, an ORDER BY over a JOIN
-  fetch streaming, the RIGHT/FULL mirror, `backfill_index` through the
-  sort; then the dead-code cleanup (`ddl_undo` / `image_undo` /
-  `restore_db`).
+- **NEXT**: the recorded tails — `op_info_blob` / `op_seek_blob`, an
+  ORDER BY over a JOIN fetch streaming, the RIGHT/FULL mirror,
+  `backfill_index` through the sort; then the dead-code cleanup
+  (`ddl_undo` / `image_undo` / `restore_db`). (MERGE `RETURNING` / `NOT
+  MATCHED BY SOURCE` done 2026-08-21.)
 - **D, the MERGE executor** — the BLR is already compiled and tested;
   only the executor is missing.
 - **G, the external sort** — every sort and hash build is bounded by
