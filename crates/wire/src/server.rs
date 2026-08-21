@@ -11834,11 +11834,23 @@ fn result_width_bytes(e: &Expr, descs: &[Descriptor]) -> u8 {
         Expr::Cast(_, CastTarget::Int { bytes }, _)
         | Expr::Cast(_, CastTarget::Numeric { bytes, .. }, _) => *bytes,
         Expr::Col(fid) => descs.get(*fid).and_then(|d| exact_dtype_bytes(d.dtype)).unwrap_or(8),
+        // an integer literal is LONG when it fits 32 bits, else BIGINT
+        // (probed: 2147483647 -> 496, 2147483648 -> 580; never SMALLINT)
+        Expr::Int(n) => if i32::try_from(*n).is_ok() { 4 } else { 8 },
+        Expr::Int128(_) => 16,
         Expr::Neg(a) => result_width_bytes(a, descs),
+        // a conditional takes its WIDEST branch (probed: CASE S/2 -> LONG,
+        // CASE S/S -> SHORT, COALESCE(S, B) -> INT64); NULLIF takes its
+        // FIRST argument's type (probed: NULLIF(S, 1) -> SHORT, NULLIF(1, S) -> LONG)
         Expr::Coalesce(v) => v.iter().map(|x| result_width_bytes(x, descs)).max().unwrap_or(8),
-        Expr::NullIf(a, b) | Expr::Iif(_, a, b) => {
-            result_width_bytes(a, descs).max(result_width_bytes(b, descs))
-        }
+        Expr::NullIf(a, _) => result_width_bytes(a, descs),
+        Expr::Iif(_, a, b) => result_width_bytes(a, descs).max(result_width_bytes(b, descs)),
+        Expr::Case(arms, els) => arms
+            .iter()
+            .map(|(_, x)| result_width_bytes(x, descs))
+            .chain(els.iter().map(|x| result_width_bytes(x, descs)))
+            .max()
+            .unwrap_or(8),
         _ => {
             if e.is_wide(descs) {
                 16

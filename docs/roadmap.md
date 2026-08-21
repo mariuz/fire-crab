@@ -611,9 +611,14 @@ pointer-page and TIP page numbers is the next step when it dominates.
   `Expr::TimeTzLit/TsTzLit`. Also `mark_not_null_cols` no longer skips
   a table without NOT NULL columns (a literal over RDB$DATABASE is
   not-nullable too).
-- **NEXT**: the CHAR (452) describe/wire form for CAST AS CHAR and CHAR
-  columns; the INT64-vs-LONG describe widths of CASE/COALESCE/IIF/NULLIF
-  and integer literals; the `A`/`B`/`C`/`E` items above. (Full sweep 2026-08-21 after the UPDATE-format change: 259 gates, 8246 checks, 0 DIFF. MERGE `RETURNING` / `NOT MATCHED BY SOURCE`, `op_info_blob`
+- **INTEGER WIDTHS DONE (2026-08-21, `serve-real-intwidth` 7):**
+  `result_width_bytes` now follows the engine — an integer literal is
+  LONG when it fits 32 bits (BIGINT beyond), negation keeps, CASE / IIF /
+  COALESCE take their widest branch, NULLIF its FIRST argument's type
+  (probed); arithmetic stays BIGINT. The wire form follows the describe.
+- **NEXT**: the CHAR (452) describe/wire form for CAST AS CHAR, CHAR
+  columns and text literals / text CASE branches; the `A`/`B`/`C`/`E`
+  items above. (Full sweep 2026-08-21 after the UPDATE-format change: 259 gates, 8246 checks, 0 DIFF. MERGE `RETURNING` / `NOT MATCHED BY SOURCE`, `op_info_blob`
   / `op_seek_blob`, the ordered JOIN fetch streaming, the RIGHT/FULL
   hash, the bulk index build, the cleanup — all done 2026-08-21.)
 - **D, the MERGE executor** — the BLR is already compiled and tested;
