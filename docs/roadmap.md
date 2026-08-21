@@ -670,10 +670,28 @@ pointer-page and TIP page numbers is the next step when it dominates.
   nested −607 with the VIEW verbs). **Boundaries:** WITH CHECK OPTION,
   UNION views, derived tables / CTEs in the FROM, an expression outside
   the dsql crate's surface, `ALTER VIEW`.
-- **NEXT**: `ALTER / DROP TRIGGER`, `CREATE OR ALTER TRIGGER / PROCEDURE`,
-  `ALTER PROCEDURE`, `CREATE FUNCTION`; `RECREATE`; the rest of `E`; a
-  full sweep to re-baseline after the CHAR wire form and the describe
-  charset rule. (Full sweep 2026-08-21 after the UPDATE-format change: 259 gates, 8246 checks, 0 DIFF. MERGE `RETURNING` / `NOT MATCHED BY SOURCE`, `op_info_blob`
+- **ALTER / DROP TRIGGER, CREATE OR ALTER TRIGGER / PROCEDURE, ALTER
+  PROCEDURE DONE (2026-08-21, `serve-real-altertrigger` 3):** `ALTER
+  TRIGGER` edits the active flag / position in place, or redefines (an
+  event clause or a body — through the CREATE planner over the stored
+  relation, unspoken attributes kept); `CREATE OR ALTER TRIGGER` keeps an
+  existing trigger's sequence and flag unless the statement says
+  (probed); `DROP TRIGGER` removes the row and its dependency rows;
+  `ALTER PROCEDURE` / `CREATE OR ALTER PROCEDURE` replace the row keeping
+  `RDB$PROCEDURE_ID` (`create_procedure_with_id`); the engine's
+  missing-object vectors (336397271/273/266 + 336068755/748), the name
+  checked before the body. `UserTriggerDef.inactive`.
+- **BLOB IDS ON THE WIRE ARE xdr_quad (2026-08-21):** every quad crossing
+  the wire (rows, inline blobs, op_create_blob's answer, parameters,
+  op_open_blob / slices, batch regblob and the batch blob stream's
+  headers) now carries the ISC_QUAD's two memory words big-endian; fc
+  sent and read the file's little-endian bytes, which every echoing
+  client round-tripped and isql rendered as `c000000:a000000` for the
+  engine's `c:1e6`. All nine blob/array/batch gates green after the
+  switch.
+- **NEXT**: `CREATE FUNCTION` (PSQL functions); `RECREATE`; `ALTER VIEW`;
+  the rest of `E`; a full sweep to re-baseline after the CHAR wire form,
+  the describe charset rule and the xdr_quad form. (Full sweep 2026-08-21 after the UPDATE-format change: 259 gates, 8246 checks, 0 DIFF. MERGE `RETURNING` / `NOT MATCHED BY SOURCE`, `op_info_blob`
   / `op_seek_blob`, the ordered JOIN fetch streaming, the RIGHT/FULL
   hash, the bulk index build, the cleanup — all done 2026-08-21.)
 - **D, the MERGE executor** — the BLR is already compiled and tested;

@@ -4496,6 +4496,9 @@ pub fn refresh_relation_runtime(
 #[derive(Clone)]
 pub struct UserTriggerDef {
     pub name: String,
+    /// RDB$TRIGGER_INACTIVE: 1 for `INACTIVE` (an ALTER / CREATE OR ALTER
+    /// keeps the stored flag when the statement does not say - probed)
+    pub inactive: bool,
     /// 1 = BEFORE INSERT, 3 = BEFORE UPDATE (the slice this writer
     /// compiles; AFTER/DELETE bodies have nothing our surface can say)
     pub trigger_type: i64,
@@ -4556,7 +4559,7 @@ pub fn create_user_trigger(
             ("RDB$TRIGGER_SOURCE", SysVal::B(blob_id_bytes(trel, src))),
             ("RDB$TRIGGER_BLR", SysVal::B(blob_id_bytes(trel, blr))),
             ("RDB$DEBUG_INFO", SysVal::B(blob_id_bytes(trel, dbg))),
-            ("RDB$TRIGGER_INACTIVE", SysVal::I(0)),
+            ("RDB$TRIGGER_INACTIVE", SysVal::I(def.inactive as i64)),
             ("RDB$SYSTEM_FLAG", SysVal::I(0)),
             ("RDB$FLAGS", SysVal::I(1)),
             ("RDB$VALID_BLR", SysVal::I(1)),
@@ -4604,6 +4607,90 @@ pub fn create_user_trigger(
 /// new triggers load. The engine does NOT validate existing rows
 /// (probed: a violating row survives the ALTER untouched; only future
 /// DML is checked) - so neither does this.
+/// A user trigger's row: (relation, trigger type, sequence, inactive).
+pub fn trigger_info(file: &crate::Image, page_size: usize, name: &str) -> Option<(String, i64, i64, i64)> {
+    let want = name.trim().trim_matches('"').to_ascii_uppercase();
+    let rel = crate::resolve_relation(file, page_size, "RDB$TRIGGERS")?;
+    let formats = system_relation_formats(file, page_size, "RDB$TRIGGERS")?;
+    let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
+    let cols = relation_columns(file, page_size, "RDB$TRIGGERS");
+    let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (name_f, rel_f, type_f, seq_f, ina_f) = (
+        fid("RDB$TRIGGER_NAME")?,
+        fid("RDB$RELATION_NAME")?,
+        fid("RDB$TRIGGER_TYPE")?,
+        fid("RDB$TRIGGER_SEQUENCE")?,
+        fid("RDB$TRIGGER_INACTIVE")?,
+    );
+    let mut out = None;
+    walk_rows(file, page_size, rel, descs, |v| {
+        if out.is_none() && text_eq(v.get(name_f), &want) {
+            let geti = |f: usize| match v.get(f) {
+                Some(Value::Int(i)) => *i,
+                _ => 0,
+            };
+            let table = match v.get(rel_f) {
+                Some(Value::Text(t)) => t.trim_end().to_string(),
+                _ => String::new(),
+            };
+            out = Some((table, geti(type_f), geti(seq_f), geti(ina_f)));
+        }
+    });
+    out
+}
+
+/// `ALTER TRIGGER <name> [ACTIVE|INACTIVE] [POSITION n]` without a new
+/// body: the row's flag and sequence change in place (probed).
+pub fn alter_trigger_attrs(
+    file: &mut crate::Image,
+    page_size: usize,
+    name: &str,
+    inactive: Option<bool>,
+    sequence: Option<i64>,
+) -> Result<(), String> {
+    let want = name.trim().trim_matches('"').to_ascii_uppercase();
+    if trigger_info(file, page_size, &want).is_none() {
+        return Err(format!("Trigger {} not found", want));
+    }
+    let rel = crate::resolve_relation(file, page_size, "RDB$TRIGGERS").ok_or("no RDB$TRIGGERS")?;
+    let name_f = sys_fid(file, page_size, "RDB$TRIGGERS", "RDB$TRIGGER_NAME")?;
+    let mut vals: Vec<(&str, SysVal<'_>)> = Vec::new();
+    if let Some(i) = inactive {
+        vals.push(("RDB$TRIGGER_INACTIVE", SysVal::I(i as i64)));
+    }
+    if let Some(sq) = sequence {
+        vals.push(("RDB$TRIGGER_SEQUENCE", SysVal::I(sq)));
+    }
+    if vals.is_empty() {
+        return Ok(());
+    }
+    let nm = want.clone();
+    patch_sys_row(file, page_size, "RDB$TRIGGERS", rel, move |v| text_eq(v.get(name_f), &nm), &vals)?;
+    advance_oldest_transactions(file, page_size)
+}
+
+/// `DROP TRIGGER <name>`: the row and the trigger's dependency rows go.
+pub fn drop_trigger(file: &mut crate::Image, page_size: usize, name: &str) -> Result<(), String> {
+    let want = name.trim().trim_matches('"').to_ascii_uppercase();
+    if trigger_info(file, page_size, &want).is_none() {
+        return Err(format!("Trigger {} not found", want));
+    }
+    {
+        let fid = sys_fid(file, page_size, "RDB$TRIGGERS", "RDB$TRIGGER_NAME")?;
+        let n = want.clone();
+        delete_catalog_rows(file, page_size, "RDB$TRIGGERS", move |v| text_eq(v.get(fid), &n))?;
+    }
+    if crate::resolve_relation(file, page_size, "RDB$DEPENDENCIES").is_some() {
+        let dn_f = sys_fid(file, page_size, "RDB$DEPENDENCIES", "RDB$DEPENDENT_NAME")?;
+        let dt_f = sys_fid(file, page_size, "RDB$DEPENDENCIES", "RDB$DEPENDENT_TYPE")?;
+        let n = want.clone();
+        delete_catalog_rows(file, page_size, "RDB$DEPENDENCIES", move |v| {
+            text_eq(v.get(dn_f), &n) && int_eq(v.get(dt_f), 2)
+        })?;
+    }
+    advance_oldest_transactions(file, page_size)
+}
+
 pub fn alter_table_add_check(
     file: &mut crate::Image,
     page_size: usize,
@@ -8741,6 +8828,26 @@ fn find_exception(
 /// only writes those rows for the dependencies it tracks, so a
 /// body-to-body call it never recorded cannot be caught here, a
 /// recorded boundary).
+/// A procedure's RDB$PROCEDURE_ID, if it exists.
+pub fn procedure_id(file: &crate::Image, page_size: usize, name: &str) -> Option<i64> {
+    let want = name.trim().trim_matches('"').to_ascii_uppercase();
+    let rel = crate::resolve_relation(file, page_size, "RDB$PROCEDURES")?;
+    let formats = system_relation_formats(file, page_size, "RDB$PROCEDURES")?;
+    let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
+    let cols = relation_columns(file, page_size, "RDB$PROCEDURES");
+    let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (name_f, id_f) = (fid("RDB$PROCEDURE_NAME")?, fid("RDB$PROCEDURE_ID")?);
+    let mut out = None;
+    walk_rows(file, page_size, rel, descs, |v| {
+        if out.is_none() && text_eq(v.get(name_f), &want) {
+            if let Some(Value::Int(i)) = v.get(id_f) {
+                out = Some(*i);
+            }
+        }
+    });
+    out
+}
+
 pub fn drop_procedure(file: &mut crate::Image, page_size: usize, name: &str) -> Result<(), String> {
     let want = name.trim().trim_matches('"').to_ascii_uppercase();
     // the row, and its parameter domains, gathered before anything is
@@ -8905,6 +9012,23 @@ pub fn create_procedure(
     blr: &[u8],
     package: Option<(&str, i64)>,
 ) -> Result<(), String> {
+    create_procedure_with_id(file, page_size, name, ins, outs, selectable, source, blr, package, None)
+}
+
+/// [create_procedure] keeping a given RDB$PROCEDURE_ID - what ALTER
+/// PROCEDURE does (probed: the id survives the redefinition).
+pub fn create_procedure_with_id(
+    file: &mut crate::Image,
+    page_size: usize,
+    name: &str,
+    ins: &[ProcParamDef],
+    outs: &[ProcParamDef],
+    selectable: bool,
+    source: &str,
+    blr: &[u8],
+    package: Option<(&str, i64)>,
+    keep_id: Option<i64>,
+) -> Result<(), String> {
     let want = name.trim().trim_matches('"').to_ascii_uppercase();
     if want.is_empty() {
         return Err("a procedure needs a name".into());
@@ -8935,9 +9059,14 @@ pub fn create_procedure(
             return Err(format!("Procedure {} already exists", want));
         }
     }
-    let slot = generator_id_by_name(file, page_size, "RDB$PROCEDURES")
-        .ok_or("no RDB$PROCEDURES generator")?;
-    let id = gen::bump(file, page_size, slot, 1)?;
+    let id = match keep_id {
+        Some(id) => id,
+        None => {
+            let slot = generator_id_by_name(file, page_size, "RDB$PROCEDURES")
+                .ok_or("no RDB$PROCEDURES generator")?;
+            gen::bump(file, page_size, slot, 1)?
+        }
+    };
     // a package MEMBER holds no security class of its own and gets no
     // grant - the PACKAGE is the privilege boundary (measured: the
     // member rows' RDB$SECURITY_CLASS is NULL and only the package

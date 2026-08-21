@@ -1023,7 +1023,8 @@ impl BatchStreamState {
                     break;
                 }
                 let hdr = read_n(s, dec, 16)?;
-                let id: [u8; 8] = hdr[0..8].try_into().unwrap();
+                // the stream's blob id is xdr'd like every quad (see quad_wire)
+                let id: [u8; 8] = quad_wire(&hdr[0..8]);
                 let total = u64::from(u32::from_be_bytes(hdr[8..12].try_into().unwrap()));
                 let bpb_len = u64::from(u32::from_be_bytes(hdr[12..16].try_into().unwrap()));
                 let consumed = 16 - self.hdr_prev;
@@ -1674,6 +1675,9 @@ fn respond_ddl_meta(
             Plan::DropException { name } => Some((336397284, q(name), 336068752, false)),
             Plan::DropSequence { name } => Some((336397303, q(name), 335544463, true)),
             Plan::DropProcedure { name } => Some((336397268, q(name), 336068748, true)),
+            Plan::AlterProcedure { name, .. } => Some((336397266, q(name), 336068748, true)), // ALTER PROCEDURE @1 failed / Procedure @1 not found
+            Plan::DropTrigger { name } => Some((336397273, q(name), 336068755, true)), // DROP TRIGGER @1 failed / Trigger @1 not found
+            Plan::AlterTrigger { name, .. } => Some((336397271, q(name), 336068755, true)),
             _ => None,
         }
     } else {
@@ -7319,6 +7323,26 @@ AlterDomainRename {
         table: String,
         def: fire_crab_ods::ddl::UserTriggerDef,
     },
+    /// `ALTER TRIGGER <name> [ACTIVE|INACTIVE] [BEFORE|AFTER ...] [POSITION n] [AS body]`:
+    /// the flag / sequence in place, or a redefinition (the row replaced,
+    /// unspecified attributes kept - probed)
+    AlterTrigger {
+        name: String,
+        inactive: Option<bool>,
+        sequence: Option<i64>,
+        redefine: Option<(String, fire_crab_ods::ddl::UserTriggerDef)>,
+    },
+    DropTrigger { name: String },
+    /// `CREATE OR ALTER TRIGGER`: a CreateTrigger, or an AlterTrigger when the name exists
+    CreateOrAlterTrigger {
+        table: String,
+        def: fire_crab_ods::ddl::UserTriggerDef,
+        explicit_active: Option<bool>,
+        explicit_position: bool,
+    },
+    /// `ALTER PROCEDURE`: the row replaced, its RDB$PROCEDURE_ID kept (probed)
+    AlterProcedure { name: String, ins: Vec<fire_crab_ods::ddl::ProcParamDef>, outs: Vec<fire_crab_ods::ddl::ProcParamDef>, selectable: bool, source: String, blr: Vec<u8> },
+    CreateOrAlterProcedure { name: String, ins: Vec<fire_crab_ods::ddl::ProcParamDef>, outs: Vec<fire_crab_ods::ddl::ProcParamDef>, selectable: bool, source: String, blr: Vec<u8> },
     /// `ALTER TABLE <t> ADD [CONSTRAINT <n>] CHECK (<cond>)`: the same
     /// trigger pair a CREATE-time CHECK writes, plus a runtime refresh.
     /// Existing rows are NOT validated (the engine's own rule).
@@ -14869,6 +14893,188 @@ fn trigger_debug_blob(
 /// the integer expression surface, references qualified as NEW./OLD.
 /// (contexts 1/0). AFTER and DELETE triggers, DECLARE, NOT in the IF and
 /// anything else refuse - the statement errors, never half-compiles.
+/// `ALTER TRIGGER <name> [ACTIVE|INACTIVE] [BEFORE|AFTER <events>] [POSITION n] [AS <body>]`.
+/// With an event clause or a body the trigger is REDEFINED through the
+/// CREATE planner (a synthetic CREATE over the stored relation); without,
+/// only the flag / sequence change. A missing trigger is answered at
+/// execute with the engine's "Trigger not found".
+fn plan_alter_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor>)> {
+    let s = sql.trim().trim_end_matches(';').trim();
+    let up = s.to_ascii_uppercase();
+    let masked = mask_literals(&up);
+    if find_word(&masked, "ALTER", 0) != Some(0) {
+        return None;
+    }
+    let tk = find_word(&masked, "TRIGGER", "ALTER".len())?;
+    if masked["ALTER".len()..tk].trim() != "" {
+        return None;
+    }
+    let rest = s[tk + "TRIGGER".len()..].trim();
+    let (name_raw, tail) = match rest.split_once(char::is_whitespace) {
+        Some((n, t)) => (n, t.trim()),
+        None => (rest, ""),
+    };
+    let name = unquote_ident(name_raw)?;
+    let tail_up = mask_literals(&tail.to_ascii_uppercase());
+    let as_at = find_word(&tail_up, "AS", 0);
+    let head = match as_at {
+        Some(a) => tail[..a].trim(),
+        None => tail,
+    };
+    let words: Vec<&str> = head.split_whitespace().map(|w| w).collect();
+    let mut inactive: Option<bool> = None;
+    let mut sequence: Option<i64> = None;
+    let mut event_words: Vec<&str> = Vec::new();
+    let mut i = 0;
+    while i < words.len() {
+        let w = words[i].to_ascii_uppercase();
+        match w.as_str() {
+            "ACTIVE" => inactive = Some(false),
+            "INACTIVE" => inactive = Some(true),
+            "POSITION" => {
+                sequence = Some(words.get(i + 1)?.parse::<i64>().ok()?);
+                i += 1;
+            }
+            _ => event_words.push(words[i]),
+        }
+        i += 1;
+    }
+    let dbr = db.as_ref()?;
+    let Some((table, ttype, _seq, _ina)) = fire_crab_ods::ddl::trigger_info(&dbr.bytes(), dbr.page_size, &name) else {
+        // unknown trigger: the execute answers the engine's vector
+        return Some((Plan::AlterTrigger { name, inactive, sequence, redefine: None }, Vec::new()));
+    };
+    if event_words.is_empty() && as_at.is_none() {
+        return Some((Plan::AlterTrigger { name, inactive, sequence, redefine: None }, Vec::new()));
+    }
+    // a redefinition: the events as given, else the stored ones
+    let events = if event_words.is_empty() { trigger_type_words(ttype)? } else { event_words.join(" ") };
+    let body = match as_at {
+        Some(a) => tail[a..].to_string(),
+        None => return None, // new events need a body (the engine's grammar)
+    };
+    let synth = format!("CREATE TRIGGER {} FOR {} {} POSITION {} {}", name, table, events, sequence.unwrap_or(_seq), body);
+    let (plan, _) = plan_create_trigger(&synth, db)?;
+    let Plan::CreateTrigger { table, mut def } = plan else { return None };
+    def.inactive = inactive.unwrap_or(_ina != 0);
+    Some((Plan::AlterTrigger { name, inactive, sequence, redefine: Some((table, def)) }, Vec::new()))
+}
+
+/// The `BEFORE|AFTER <events>` words of a stored RDB$TRIGGER_TYPE.
+fn trigger_type_words(t: i64) -> Option<String> {
+    if t <= 0 || t > 127 {
+        return None;
+    }
+    let before = t % 2 == 1;
+    let ev = |c: i64| match c {
+        1 => Some("INSERT"),
+        2 => Some("UPDATE"),
+        3 => Some("DELETE"),
+        _ => None,
+    };
+    let e1 = (t + 1) / 2 % 4;
+    let e2 = (t + 1) / 8 % 4;
+    let e3 = (t + 1) / 32 % 4;
+    let mut out = vec![if before { "BEFORE" } else { "AFTER" }.to_string(), ev(e1)?.to_string()];
+    for e in [e2, e3] {
+        if e != 0 {
+            out.push("OR".into());
+            out.push(ev(e)?.to_string());
+        }
+    }
+    Some(out.join(" "))
+}
+
+/// Parse `DROP TRIGGER <name>`.
+fn plan_drop_trigger(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
+    let s = sql.trim().trim_end_matches(';').trim();
+    let toks: Vec<&str> = s.split_whitespace().collect();
+    if toks.len() != 3 || !toks[0].eq_ignore_ascii_case("DROP") || !toks[1].eq_ignore_ascii_case("TRIGGER") {
+        return None;
+    }
+    Some((Plan::DropTrigger { name: unquote_ident(toks[2])? }, Vec::new()))
+}
+
+/// `CREATE OR ALTER TRIGGER ...`: the CREATE planner over the text with
+/// `OR ALTER` removed; the execute creates or redefines by existence.
+fn plan_create_or_alter_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor>)> {
+    let s = sql.trim();
+    let up = mask_literals(&s.to_ascii_uppercase());
+    if find_word(&up, "CREATE", 0) != Some(0) {
+        return None;
+    }
+    let or_at = find_word(&up, "OR", "CREATE".len())?;
+    let alter_at = find_word(&up, "ALTER", or_at + "OR".len())?;
+    let tk = find_word(&up, "TRIGGER", alter_at + "ALTER".len())?;
+    if up["CREATE".len()..or_at].trim() != "" || up[or_at + "OR".len()..alter_at].trim() != "" || up[alter_at + "ALTER".len()..tk].trim() != "" {
+        return None;
+    }
+    let synth = format!("CREATE{}", &s[tk - "TRIGGER".len() - 1..]);
+    let synth = format!("CREATE {}", s[tk..].trim());
+    let (plan, _) = plan_create_trigger(&synth, db)?;
+    let Plan::CreateTrigger { table, def } = plan else { return None };
+    let head_up = up[tk..].to_string();
+    let explicit_active = if find_word(&head_up, "INACTIVE", 0).is_some_and(|p| p < find_word(&head_up, "AS", 0).unwrap_or(usize::MAX)) {
+        Some(false)
+    } else if find_word(&head_up, "ACTIVE", 0).is_some_and(|p| p < find_word(&head_up, "AS", 0).unwrap_or(usize::MAX)) {
+        Some(true)
+    } else {
+        None
+    };
+    let explicit_position = find_word(&head_up, "POSITION", 0).is_some_and(|p| p < find_word(&head_up, "AS", 0).unwrap_or(usize::MAX));
+    Some((Plan::CreateOrAlterTrigger { table, def, explicit_active, explicit_position }, Vec::new()))
+}
+
+/// `ALTER PROCEDURE ...` / `CREATE OR ALTER PROCEDURE ...`: the CREATE
+/// planner over the rewritten head.
+fn plan_alter_procedure(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
+    let s = sql.trim();
+    let up = mask_literals(&s.to_ascii_uppercase());
+    let (create_or_alter, pk) = if find_word(&up, "ALTER", 0) == Some(0) {
+        let pk = find_word(&up, "PROCEDURE", "ALTER".len())?;
+        if up["ALTER".len()..pk].trim() != "" {
+            return None;
+        }
+        (false, pk)
+    } else if find_word(&up, "CREATE", 0) == Some(0) {
+        let or_at = find_word(&up, "OR", "CREATE".len())?;
+        let alter_at = find_word(&up, "ALTER", or_at + "OR".len())?;
+        let pk = find_word(&up, "PROCEDURE", alter_at + "ALTER".len())?;
+        if up["CREATE".len()..or_at].trim() != "" || up[or_at + "OR".len()..alter_at].trim() != "" || up[alter_at + "ALTER".len()..pk].trim() != "" {
+            return None;
+        }
+        (true, pk)
+    } else {
+        return None;
+    };
+    let synth = format!("CREATE {}", s[pk..].trim());
+    let Some((plan, _)) = plan_create_procedure(&synth) else {
+        // a body this planner cannot compile: the engine checks the NAME
+        // first (probed: `ALTER PROCEDURE NOPE AS BEGIN END` is "not
+        // found"), so the execute answers by existence - the vector for a
+        // missing one, the generic refusal otherwise (an empty BLR marks it)
+        let name_raw = s[pk + "PROCEDURE".len()..].trim().split(|c: char| c.is_whitespace() || c == '(').next()?;
+        let name = unquote_ident(name_raw)?;
+        return Some((
+            if create_or_alter {
+                return None;
+            } else {
+                Plan::AlterProcedure { name, ins: Vec::new(), outs: Vec::new(), selectable: false, source: String::new(), blr: Vec::new() }
+            },
+            Vec::new(),
+        ));
+    };
+    let Plan::CreateProcedure { name, ins, outs, selectable, source, blr } = plan else { return None };
+    Some((
+        if create_or_alter {
+            Plan::CreateOrAlterProcedure { name, ins, outs, selectable, source, blr }
+        } else {
+            Plan::AlterProcedure { name, ins, outs, selectable, source, blr }
+        },
+        Vec::new(),
+    ))
+}
+
 fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor>)> {
     let s = sql.trim().trim_end_matches(';').trim();
     let up = s.to_ascii_uppercase();
@@ -15332,6 +15538,7 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
             table: table.to_ascii_uppercase(),
             def: fire_crab_ods::ddl::UserTriggerDef {
                 name: name.to_ascii_uppercase(),
+                inactive: false,
                 trigger_type,
                 sequence,
                 source,
@@ -19609,7 +19816,7 @@ fn read_param_message(
                 WireParam::Bool(raw[0] != 0)
             }
             PSlot::Quad => {
-                let raw = read_n(s, dec, 8)?;
+                let raw = quad_wire(&read_n(s, dec, 8)?).to_vec();
                 WireParam::BlobId(raw.try_into().unwrap())
             }
         });
@@ -22336,6 +22543,59 @@ fn execute_dml_collecting_inner(
         }
         Plan::CreateTrigger { table, def } => {
             fire_crab_ods::ddl::create_user_trigger(&mut work, db.page_size, table, def)?;
+            (0, 0, 0)
+        }
+        Plan::AlterTrigger { name, inactive, sequence, redefine } => {
+            match redefine {
+                None => fire_crab_ods::ddl::alter_trigger_attrs(&mut work, db.page_size, name, *inactive, *sequence)?,
+                Some((table, def)) => {
+                    fire_crab_ods::ddl::drop_trigger(&mut work, db.page_size, name)?;
+                    fire_crab_ods::ddl::create_user_trigger(&mut work, db.page_size, table, def)?;
+                }
+            }
+            (0, 0, 0)
+        }
+        Plan::DropTrigger { name } => {
+            fire_crab_ods::ddl::drop_trigger(&mut work, db.page_size, name)?;
+            (0, 0, 0)
+        }
+        Plan::CreateOrAlterTrigger { table, def, explicit_active, explicit_position } => {
+            match fire_crab_ods::ddl::trigger_info(&work, db.page_size, &def.name) {
+                None => fire_crab_ods::ddl::create_user_trigger(&mut work, db.page_size, table, def)?,
+                Some((_, _, seq, ina)) => {
+                    // the stored flag and sequence survive an unspoken one (probed)
+                    let mut d = def.clone();
+                    if explicit_active.is_none() {
+                        d.inactive = ina != 0;
+                    }
+                    if !*explicit_position {
+                        d.sequence = seq;
+                    }
+                    fire_crab_ods::ddl::drop_trigger(&mut work, db.page_size, &def.name)?;
+                    fire_crab_ods::ddl::create_user_trigger(&mut work, db.page_size, table, &d)?;
+                }
+            }
+            (0, 0, 0)
+        }
+        Plan::AlterProcedure { name, ins, outs, selectable, source, blr } => {
+            let Some(id) = fire_crab_ods::ddl::procedure_id(&work, db.page_size, name) else {
+                return Err(format!("Procedure {} not found", name.trim().trim_matches('"').to_ascii_uppercase()).into());
+            };
+            if blr.is_empty() {
+                return Err("the procedure body is outside this server's surface".into());
+            }
+            fire_crab_ods::ddl::drop_procedure(&mut work, db.page_size, name)?;
+            fire_crab_ods::ddl::create_procedure_with_id(&mut work, db.page_size, name, ins, outs, *selectable, source, blr, None, Some(id))?;
+            (0, 0, 0)
+        }
+        Plan::CreateOrAlterProcedure { name, ins, outs, selectable, source, blr } => {
+            match fire_crab_ods::ddl::procedure_id(&work, db.page_size, name) {
+                Some(id) => {
+                    fire_crab_ods::ddl::drop_procedure(&mut work, db.page_size, name)?;
+                    fire_crab_ods::ddl::create_procedure_with_id(&mut work, db.page_size, name, ins, outs, *selectable, source, blr, None, Some(id))?;
+                }
+                None => fire_crab_ods::ddl::create_procedure(&mut work, db.page_size, name, ins, outs, *selectable, source, blr, None)?,
+            }
             (0, 0, 0)
         }
         Plan::AlterTableAddKey { table, key } => {
@@ -34978,6 +35238,7 @@ fn describe_for(plan: &Plan, params: &[Descriptor], att: AttCs) -> Vec<u8> {
         | Plan::CreateSequence { .. } | Plan::DropSequence { .. }
         | Plan::CreateException { .. } | Plan::CreateProcedure { .. } | Plan::DropProcedure { .. } | Plan::DropException { .. }
         | Plan::DeclareFilter { .. } | Plan::DropFilter { .. } | Plan::CreateView { .. } | Plan::DropView { .. }
+        | Plan::AlterTrigger { .. } | Plan::DropTrigger { .. } | Plan::CreateOrAlterTrigger { .. } | Plan::AlterProcedure { .. } | Plan::CreateOrAlterProcedure { .. }
         | Plan::AlterException { .. } | Plan::CreateOrAlterException { .. }
         | Plan::CreateRole { .. } | Plan::DropRole { .. }
         | Plan::AlterDatabaseBackup { .. }
@@ -35084,6 +35345,7 @@ fn stmt_type_of(plan: &Plan) -> i32 {
         | Plan::CreateSequence { .. } | Plan::DropSequence { .. }
         | Plan::CreateException { .. } | Plan::CreateProcedure { .. } | Plan::DropProcedure { .. } | Plan::DropException { .. }
         | Plan::DeclareFilter { .. } | Plan::DropFilter { .. } | Plan::CreateView { .. } | Plan::DropView { .. }
+        | Plan::AlterTrigger { .. } | Plan::DropTrigger { .. } | Plan::CreateOrAlterTrigger { .. } | Plan::AlterProcedure { .. } | Plan::CreateOrAlterProcedure { .. }
         | Plan::AlterException { .. } | Plan::CreateOrAlterException { .. }
         | Plan::CreateRole { .. } | Plan::DropRole { .. }
         | Plan::AlterDatabaseBackup { .. }
@@ -36517,6 +36779,7 @@ fn emit_rows_inner(
         | Plan::CreateSequence { .. } | Plan::DropSequence { .. }
         | Plan::CreateException { .. } | Plan::CreateProcedure { .. } | Plan::DropProcedure { .. } | Plan::DropException { .. }
         | Plan::DeclareFilter { .. } | Plan::DropFilter { .. } | Plan::CreateView { .. } | Plan::DropView { .. }
+        | Plan::AlterTrigger { .. } | Plan::DropTrigger { .. } | Plan::CreateOrAlterTrigger { .. } | Plan::AlterProcedure { .. } | Plan::CreateOrAlterProcedure { .. }
         | Plan::AlterException { .. } | Plan::CreateOrAlterException { .. }
         | Plan::CreateRole { .. } | Plan::DropRole { .. }
         | Plan::AlterDatabaseBackup { .. }
@@ -37586,7 +37849,7 @@ fn inline_blob_packet(w: &mut W, db: &Database, rel: u16, num: u64, max: u32) {
     }
     // the SAME 8 bytes the row encoder ships: the client decodes both
     // with xdr_quad, and matches the cached copy by that value
-    w.int(OP_INLINE_BLOB).int(TX_HANDLE).raw(&id).bytes(&info).bytes(&data);
+    w.int(OP_INLINE_BLOB).int(TX_HANDLE).raw(&quad_wire(&id)).bytes(&info).bytes(&data);
 }
 
 /// The message itself - null bitmap then values - with no framing op in
@@ -37758,7 +38021,7 @@ fn encode_row_body(
                 // layout); the client echoes them back verbatim in
                 // op_open_blob, where decode_blob_id reads them again
                 let (rel, num) = if let Value::Blob(rel, num) = v { (*rel, *num) } else { (0, 0) };
-                w.raw(&encode_blob_id(rel, num));
+                w.raw(&quad_wire(&encode_blob_id(rel, num)));
             }
             Wire::Int128 => {
                 // xdr_int128 (xdr.cpp:437): high hyper then low hyper =
@@ -38053,6 +38316,28 @@ fn materialise_temp_blob(
         eprintln!("[srv] blob temp {} materialised into relation {} as record {}", temp, rel, recno);
     }
     Ok(perm)
+}
+
+/// A blob / array id on the WIRE is an xdr_quad: two 32-bit halves, each
+/// big-endian (quad_high = the relation, quad_low = the record number).
+/// This server keeps ids in the file's little-endian half order, so every
+/// wire boundary swaps each half (probed: isql printed fc's `12:10` as
+/// `c000000:a000000` - the halves byte-reversed - until this; a client
+/// that only ECHOES an id never noticed). An involution: one function
+/// serves both directions.
+fn quad_wire(id: &[u8]) -> [u8; 8] {
+    let mut out = [0u8; 8];
+    if id.len() >= 8 {
+        out[0] = id[3];
+        out[1] = id[2];
+        out[2] = id[1];
+        out[3] = id[0];
+        out[4] = id[7];
+        out[5] = id[6];
+        out[6] = id[5];
+        out[7] = id[4];
+    }
+    out
 }
 
 fn encode_blob_id(rel: u16, num: u64) -> [u8; 8] {
@@ -50114,6 +50399,10 @@ fn plan_immediate(text: &str, database: &Option<Database>) -> Option<(Plan, Vec<
                     .or_else(|| plan_grant_role(text))
                     .or_else(|| plan_create_table(text))
                     .or_else(|| plan_create_trigger(text, database))
+                    .or_else(|| plan_alter_trigger(text, database))
+                    .or_else(|| plan_drop_trigger(text))
+                    .or_else(|| plan_create_or_alter_trigger(text, database))
+                    .or_else(|| plan_alter_procedure(text))
                     .or_else(|| plan_create_index(text))
                     .or_else(|| plan_drop_table(text))
                     .or_else(|| plan_drop_index(text))
@@ -55521,6 +55810,10 @@ fn after_auth(
                         .or_else(|| plan_grant_role(&stmt_sql))
                         .or_else(|| plan_create_table(&stmt_sql))
                         .or_else(|| plan_create_trigger(&stmt_sql, &database))
+                        .or_else(|| plan_alter_trigger(&stmt_sql, &database))
+                        .or_else(|| plan_drop_trigger(&stmt_sql))
+                        .or_else(|| plan_create_or_alter_trigger(&stmt_sql, &database))
+                        .or_else(|| plan_alter_procedure(&stmt_sql))
                         .or_else(|| plan_create_index(&stmt_sql))
                         .or_else(|| plan_drop_table(&stmt_sql))
                         .or_else(|| plan_drop_index(&stmt_sql))
@@ -55817,6 +56110,7 @@ fn after_auth(
                         | Plan::DropSequence { .. }
                         | Plan::CreateException { .. }
                         | Plan::DeclareFilter { .. } | Plan::DropFilter { .. } | Plan::CreateView { .. } | Plan::DropView { .. }
+        | Plan::AlterTrigger { .. } | Plan::DropTrigger { .. } | Plan::CreateOrAlterTrigger { .. } | Plan::AlterProcedure { .. } | Plan::CreateOrAlterProcedure { .. }
                         | Plan::CreateProcedure { .. }
                         | Plan::DropProcedure { .. }
                         | Plan::AlterException { .. }
@@ -56487,8 +56781,8 @@ fn after_auth(
                 // p_batch_regblob: statement, the EXISTING blob's id, the
                 // batch id that names it in the messages (both xdr_quad)
                 let h = read_int(&mut s, &mut dec)?;
-                let exist = read_n(&mut s, &mut dec, 8)?;
-                let batch_id = read_n(&mut s, &mut dec, 8)?;
+                let exist = quad_wire(&read_n(&mut s, &mut dec, 8)?).to_vec();
+                let batch_id = quad_wire(&read_n(&mut s, &mut dec, 8)?).to_vec();
                 match batches.get_mut(&h) {
                     Some(b) => {
                         b.blob_map.insert(batch_id.try_into().unwrap(), exist.try_into().unwrap());
@@ -56599,8 +56893,8 @@ fn after_auth(
                 }
                 if let Some(id) = unknown {
                     // isc_dsql_error, isc_sqlerr -104, isc_batch_blob_id "<high>:<low>"
-                    let hi = u32::from_be_bytes(id[0..4].try_into().unwrap());
-                    let lo = u32::from_be_bytes(id[4..8].try_into().unwrap());
+                    let hi = u32::from_le_bytes(id[0..4].try_into().unwrap());
+                    let lo = u32::from_le_bytes(id[4..8].try_into().unwrap());
                     let mut w = W::default();
                     w.int(OP_RESPONSE).int(0).int(0).int(0).int(0);
                     w.int(1).int(GDS_DSQL_ERROR);
@@ -57463,8 +57757,10 @@ fn after_auth(
                         let mut w = W::default();
                         w.int(OP_RESPONSE)
                             .int(next_blob_handle)
-                            .int(i32::from_be_bytes(id[0..4].try_into().unwrap()))
-                            .int(i32::from_be_bytes(id[4..8].try_into().unwrap()))
+                            // xdr_quad: the two ISC_QUAD memory words, each
+                            // big-endian on the wire (see quad_wire)
+                            .int(i32::from_le_bytes(id[0..4].try_into().unwrap()))
+                            .int(i32::from_le_bytes(id[4..8].try_into().unwrap()))
                             .int(0)
                             .int(0);
                         w.send(&mut s, &mut enc)?;
@@ -57521,7 +57817,7 @@ fn after_auth(
                     Vec::new()
                 };
                 read_int(&mut s, &mut dec)?; // transaction handle
-                let id = read_n(&mut s, &mut dec, 8)?;
+                let id = quad_wire(&read_n(&mut s, &mut dec, 8)?).to_vec();
                 let (rel, num) = decode_blob_id(&id);
                 // a bpb naming a SOURCE / TARGET sub_type asks for a
                 // conversion on the way out. The engine runs a filter for
@@ -57625,7 +57921,7 @@ fn after_auth(
                 // longs), then the slice itself (length, and for a put the
                 // elements xdr'd by type - empty for a get)
                 read_int(&mut s, &mut dec)?; // transaction
-                let id = read_n(&mut s, &mut dec, 8)?;
+                let id = quad_wire(&read_n(&mut s, &mut dec, 8)?).to_vec();
                 let slice_len = read_int(&mut s, &mut dec)?.max(0) as usize;
                 let sdl_bytes = read_wire_bytes(&mut s, &mut dec)?;
                 read_wire_bytes(&mut s, &mut dec)?; // parameters (unused by gen_sdl's shape)
@@ -57813,7 +58109,7 @@ fn after_auth(
                     let new_id = encode_blob_id(0, u64::from(temp));
                     // the response carries the array's id in p_resp_blob_id
                     let mut w = W::default();
-                    w.int(OP_RESPONSE).int(0).raw(&new_id).int(0).int(0);
+                    w.int(OP_RESPONSE).int(0).raw(&quad_wire(&new_id)).int(0).int(0);
                     w.send(&mut s, &mut enc)?;
                 }
             }
