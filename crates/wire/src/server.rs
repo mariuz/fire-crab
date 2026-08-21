@@ -12277,6 +12277,8 @@ fn build_expr_col_from(e: Expr, name: &str, descs: &[Descriptor]) -> Option<Proj
         ExprType::Temporal(TKind::Date) => (Wire::Date, nullable(570), 4, 0),
         ExprType::Temporal(TKind::Time) => (Wire::Time, nullable(560), 4, 0),
         ExprType::Temporal(TKind::Timestamp) => (Wire::Timestamp, nullable(510), 8, 0),
+        ExprType::Temporal(TKind::TimeTz) => (Wire::TimeTz, nullable(32756), 8, 0),
+        ExprType::Temporal(TKind::TimestampTz) => (Wire::TimestampTz, nullable(32754), 12, 0),
     };
     // a text result carries its CHARSET too (probed with SQLDA_DISPLAY):
     // NONE and OCTETS operands keep their charset with the width in
@@ -30493,10 +30495,9 @@ fn plan_query_inner_ctx(
 /// an expression over it, or a column on the outer side of a join, stays
 /// nullable (the engine's rule for those is a later slice).
 fn mark_not_null_cols(cols: &mut [ProjCol], db: &Database, table: &str) {
+    // an empty set still matters: a literal or CURRENT_TIMESTAMP over a
+    // table with no NOT NULL column is not-nullable all the same
     let nn = not_null_fids(db, table);
-    if nn.is_empty() {
-        return;
-    }
     let is_nn = |fid: usize| nn.contains(&fid);
     for c in cols.iter_mut() {
         let nullable = match &c.expr {
@@ -30527,7 +30528,9 @@ fn expr_nullable(e: &Expr, is_nn: &dyn Fn(usize) -> bool) -> bool {
         | Expr::Str(_)
         | Expr::DateLit(_)
         | Expr::TimeLit(_)
-        | Expr::TsLit(..) => false,
+        | Expr::TsLit(..)
+        | Expr::TimeTzLit(..)
+        | Expr::TsTzLit(..) => false,
         Expr::Neg(a)
         | Expr::Cast(a, ..)
         | Expr::TextNum(a, _)
@@ -31185,6 +31188,8 @@ fn build_group_items(
                             ExprType::Bool => (Wire::Bool, 32764, 1, 0, 0),
                             ExprType::Temporal(TKind::Date) => (Wire::Date, 570, 4, 0, 0),
                             ExprType::Temporal(TKind::Time) => (Wire::Time, 560, 4, 0, 0),
+                            ExprType::Temporal(TKind::TimeTz) => (Wire::TimeTz, 32756, 8, 0, 0),
+                            ExprType::Temporal(TKind::TimestampTz) => (Wire::TimestampTz, 32754, 12, 0, 0),
                             ExprType::Temporal(TKind::Timestamp) => {
                                 (Wire::Timestamp, 510, 8, 0, 0)
                             }
@@ -37538,6 +37543,24 @@ thread_local! {
 /// is a plain BLOB column and the target is text (probed: a text or
 /// binary blob casts to its bytes; the cast to a number is the
 /// conversion error of the text, which the text path then raises).
+/// Keep `p` fractional digits of a time-units value (1/10000 s).
+fn trunc_time_units(t: u32, p: u8) -> u32 {
+    let unit = 10u32.pow(4 - p.min(4) as u32);
+    t - t % unit
+}
+
+/// The session time zone - the engine's default is the server's OS zone
+/// (probed: `Etc/UTC` on this box, from /etc/timezone); TZ in the
+/// environment first, GMT when nothing names one.
+fn session_zone_id() -> u16 {
+    let name = std::env::var("TZ")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| std::fs::read_to_string("/etc/timezone").ok().map(|s| s.trim().to_string()))
+        .unwrap_or_default();
+    fire_crab_ods::tz::zone_id(name.trim_start_matches(':')).unwrap_or(65535)
+}
+
 fn blob_col_cast(inner: &RawExpr, t: &CastTarget, columns: &[RelationColumn], descs: &[Descriptor]) -> Option<usize> {
     let RawExpr::Col(name) = inner else { return None };
     let _ = t; // every target: text directly, a number through the text's conversion
@@ -38517,6 +38540,11 @@ enum RawExpr {
     CurrentDate,
     LocalTime,
     LocalTimestamp,
+    /// `CURRENT_TIME [(p)]` - TIME WITH TIME ZONE in the session zone,
+    /// p fractional digits (default 0 - probed: .0000)
+    CurrentTime(u8),
+    /// `CURRENT_TIMESTAMP [(p)]` - TIMESTAMP WITH TIME ZONE, default p 3
+    CurrentTimestamp(u8),
 }
 
 /// The built-in scalar functions this server evaluates. Two engine
@@ -39577,6 +39605,37 @@ fn expr_atom(b: &[char], pos: &mut usize) -> Option<RawExpr> {
                 Some(RawExpr::Null)
             } else if !quoted && word.eq_ignore_ascii_case("CURRENT_DATE") {
                 Some(RawExpr::CurrentDate)
+            } else if !quoted
+                && (word.eq_ignore_ascii_case("CURRENT_TIME") || word.eq_ignore_ascii_case("CURRENT_TIMESTAMP"))
+            {
+                // an optional precision in parentheses
+                let is_ts = word.eq_ignore_ascii_case("CURRENT_TIMESTAMP");
+                let mut prec: u8 = if is_ts { 3 } else { 0 };
+                let mut q = *pos;
+                while b.get(q) == Some(&' ') {
+                    q += 1;
+                }
+                if b.get(q) == Some(&'(') {
+                    let mut r = q + 1;
+                    let mut digits = String::new();
+                    while let Some(c) = b.get(r) {
+                        if c.is_ascii_digit() {
+                            digits.push(*c);
+                            r += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    if digits.is_empty() || b.get(r) != Some(&')') {
+                        return None;
+                    }
+                    prec = digits.parse::<u8>().ok()?;
+                    if prec > 4 {
+                        return None;
+                    }
+                    *pos = r + 1;
+                }
+                Some(if is_ts { RawExpr::CurrentTimestamp(prec) } else { RawExpr::CurrentTime(prec) })
             } else if !quoted && word.eq_ignore_ascii_case("LOCALTIME") {
                 Some(RawExpr::LocalTime)
             } else if !quoted && word.eq_ignore_ascii_case("LOCALTIMESTAMP") {
@@ -39893,6 +39952,8 @@ fn raw_bad_substring_len(e: &RawExpr) -> Option<i64> {
         | RawExpr::TimeLit(_)
         | RawExpr::TsLit(..)
         | RawExpr::CurrentDate
+        | RawExpr::CurrentTime(_)
+        | RawExpr::CurrentTimestamp(_)
         | RawExpr::LocalTime
         | RawExpr::LocalTimestamp => None,
     }
@@ -40523,6 +40584,7 @@ fn cast_target_descriptor(t: &CastTarget) -> Option<Descriptor> {
         CastTarget::Temporal(TKind::Date) => d(dtype::SQL_DATE, 0, 4, 0),
         CastTarget::Temporal(TKind::Time) => d(dtype::SQL_TIME, 0, 4, 0),
         CastTarget::Temporal(TKind::Timestamp) => d(dtype::TIMESTAMP, 0, 8, 0),
+        CastTarget::Temporal(TKind::TimeTz | TKind::TimestampTz) => return None,
         // a TEXT target travels in its native slot at the declared
         // width: VARCHAR (pad = false) is VARYING, whose length carries
         // the 2-byte count word ([wire_for]), so len + 2 announces `len`
@@ -40792,6 +40854,14 @@ fn resolve_expr_inner(
         // the plan-time clock capture (see the RawExpr variant docs);
         // LOCALTIME truncates the fractional second, as probed
         RawExpr::CurrentDate => Expr::DateLit(now_date_time().0),
+        RawExpr::CurrentTime(p) => {
+            let (_, t) = now_date_time();
+            Expr::TimeTzLit(trunc_time_units(t, *p), session_zone_id())
+        }
+        RawExpr::CurrentTimestamp(p) => {
+            let (d, t) = now_date_time();
+            Expr::TsTzLit(d, trunc_time_units(t, *p), session_zone_id())
+        }
         RawExpr::LocalTime => {
             let (_, t) = now_date_time();
             Expr::TimeLit(t - t % 10_000)
@@ -40904,6 +40974,10 @@ enum Expr {
     DateLit(i32),
     TimeLit(u32),
     TsLit(i32, u32),
+    /// CURRENT_TIME: (UTC time units, zone id) - TIME WITH TIME ZONE
+    TimeTzLit(u32, u16),
+    /// CURRENT_TIMESTAMP: (days, UTC time units, zone id)
+    TsTzLit(i32, u32, u16),
     /// A TEXT side of a comparison whose OTHER side is numeric,
     /// wrapped by [cmp_sides]: the engine coerces the TEXT side to a
     /// number PER ROW with the lenient compare grammar
@@ -41380,6 +41454,10 @@ enum TKind {
     Date,
     Time,
     Timestamp,
+    /// TIME WITH TIME ZONE (CURRENT_TIME)
+    TimeTz,
+    /// TIMESTAMP WITH TIME ZONE (CURRENT_TIMESTAMP)
+    TimestampTz,
 }
 
 /// A conditional's result type from all its branches: the first branch
@@ -42555,6 +42633,7 @@ fn dateadd_impl(
         TKind::Date => Value::Date(d as i32),
         TKind::Time => Value::Time(u as u32),
         TKind::Timestamp => Value::Timestamp(d as i32, u as u32),
+        TKind::TimeTz | TKind::TimestampTz => return Err(EvalErr::Unsupported),
     })
 }
 
@@ -42840,6 +42919,8 @@ impl Expr {
             Expr::CollKey(e, _) => e.type_of(descs),
             Expr::Null => Some(ExprType::Int),
             Expr::DateLit(_) => Some(ExprType::Temporal(TKind::Date)),
+            Expr::TimeTzLit(..) => Some(ExprType::Temporal(TKind::TimeTz)),
+            Expr::TsTzLit(..) => Some(ExprType::Temporal(TKind::TimestampTz)),
             Expr::TimeLit(_) => Some(ExprType::Temporal(TKind::Time)),
             Expr::TsLit(..) => Some(ExprType::Temporal(TKind::Timestamp)),
             Expr::Neg(e) => match e.type_of(descs)? {
@@ -43145,7 +43226,7 @@ impl Expr {
     /// engine's getDesc copies the non-null side. None = not numeric.
     fn rank_of(&self, descs: &[Descriptor]) -> Option<NumRank> {
         match self {
-            Expr::BlobText(_) => None,
+            Expr::BlobText(_) | Expr::TimeTzLit(..) | Expr::TsTzLit(..) => None,
             Expr::Param(_) => None,
             // a folded lookup answers within i64: its values came from
             // the inner table's own columns and folds
@@ -43440,6 +43521,8 @@ impl Expr {
             Expr::Str(s) => Value::Text(s.clone()),
             Expr::Null => Value::Null,
             Expr::DateLit(d) => Value::Date(*d),
+            Expr::TimeTzLit(t, z) => Value::TimeTz(*t, *z),
+            Expr::TsTzLit(d, t, z) => Value::TimestampTz(*d, *t, *z),
             Expr::TimeLit(t) => Value::Time(*t),
             Expr::TsLit(d, t) => Value::Timestamp(*d, *t),
             // NEGATION OVERFLOWS AT EXACTLY ONE VALUE, and it wrapped
@@ -43866,6 +43949,7 @@ impl Expr {
                                     Some(match k {
                                         TKind::Date => Value::Date(parse_date_lit(t)?),
                                         TKind::Time => Value::Time(parse_time_lit(t)?),
+                                        TKind::TimeTz | TKind::TimestampTz => return None,
                                         TKind::Timestamp => {
                                             // a date-only string is midnight, as
                                             // for a DATE value cast up (probed:
@@ -46742,7 +46826,7 @@ fn parse_projection(proj: &str) -> Option<Proj> {
         // the bare clock keywords LOOK like column names but are
         // expressions - route them to the expression parser before the
         // ident path reads them as a (nonexistent) column
-        let clock_kw = ["CURRENT_DATE", "LOCALTIME", "LOCALTIMESTAMP"]
+        let clock_kw = ["CURRENT_DATE", "CURRENT_TIME", "CURRENT_TIMESTAMP", "LOCALTIME", "LOCALTIMESTAMP"]
             .iter()
             .any(|k| body.trim().eq_ignore_ascii_case(k));
         if clock_kw {
@@ -46959,6 +47043,8 @@ fn default_expr_name(raw: &RawExpr) -> String {
         RawExpr::CurrentDate => "CURRENT_DATE",
         RawExpr::LocalTime => "LOCALTIME",
         RawExpr::LocalTimestamp => "LOCALTIMESTAMP",
+        RawExpr::CurrentTime(_) => "CURRENT_TIME",
+        RawExpr::CurrentTimestamp(_) => "CURRENT_TIMESTAMP",
         RawExpr::DateLit(_) | RawExpr::TimeLit(_) | RawExpr::TsLit(..) => "CONSTANT",
         // the engine leaves a unary-minus column unnamed (blank header)
         // a NEGATED LITERAL is still a constant (probed: `-3` describes
@@ -47542,7 +47628,7 @@ fn tokenize(s: &str) -> Option<Vec<Tok>> {
                 }
                 // the CLOCK keywords take no parentheses, so they need
                 // their own arm or they lex as column names
-                if matches!(upper.as_str(), "CURRENT_DATE" | "LOCALTIME" | "LOCALTIMESTAMP") {
+                if matches!(upper.as_str(), "CURRENT_DATE" | "CURRENT_TIME" | "CURRENT_TIMESTAMP" | "LOCALTIME" | "LOCALTIMESTAMP") {
                     out.push(Tok::FnExpr(parse_raw_expr_any(word)?));
                     continue;
                 }
@@ -52816,6 +52902,8 @@ fn resolve_expr_term(
                     d(dtype::TIMESTAMP, 8, 0),
                     ColKind::Temporal(TKind::Timestamp),
                 ),
+                ExprType::Temporal(TKind::TimeTz) => (d(dtype::SQL_TIME_TZ, 8, 0), ColKind::Temporal(TKind::TimeTz)),
+                ExprType::Temporal(TKind::TimestampTz) => (d(dtype::TIMESTAMP_TZ, 12, 0), ColKind::Temporal(TKind::TimestampTz)),
                 ExprType::Approx => (d(dtype::DOUBLE, 8, 0), ColKind::Approx),
                 ExprType::Bool => (d(dtype::BOOLEAN, 1, 0), ColKind::Bool),
             };
@@ -53005,6 +53093,7 @@ fn cmp_sides(lhs: Expr, rhs: Expr, descs: &[Descriptor]) -> Option<(Expr, Expr)>
             Expr::Str(s) => Some(match k {
                 TKind::Date => Expr::DateLit(parse_date_lit(s)?),
                 TKind::Time => Expr::TimeLit(parse_time_lit(s)?),
+                TKind::TimeTz | TKind::TimestampTz => return None,
                 TKind::Timestamp => {
                     let (d, t) = s.trim().split_once(' ')?;
                     Expr::TsLit(parse_date_lit(d)?, parse_time_lit(t.trim())?)
@@ -53246,7 +53335,9 @@ fn expr_no_raise(e: &Expr, descs: &[Descriptor]) -> bool {
         | Expr::Null
         | Expr::DateLit(_)
         | Expr::TimeLit(_)
-        | Expr::TsLit(..) => true,
+        | Expr::TsLit(..)
+        | Expr::TimeTzLit(..)
+        | Expr::TsTzLit(..) => true,
         // a condition as a value raises only where its own operands do
         Expr::Cond(c) => cond_no_raise(c, descs),
         // the per-row coercions raise 22018 by design - that raise is

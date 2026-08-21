@@ -192,6 +192,12 @@ pub fn displacement(zone: u16) -> Option<i32> {
 
 /// The zone's textual form: `+HH:MM`/`-HH:MM` for offset zones, the
 /// region name for named ones (TimeZoneUtil::format).
+/// The id of a named zone (the engine's TimeZoneUtil numbering: 65535
+/// minus its position in the list); None for a name not in the table.
+pub fn zone_id(name: &str) -> Option<u16> {
+    TIME_ZONE_LIST.iter().position(|n| n.eq_ignore_ascii_case(name)).map(|i| (65535 - i) as u16)
+}
+
 pub fn zone_text(zone: u16) -> String {
     if zone <= 2878 {
         let d = zone as i32 - 1439;

@@ -602,9 +602,18 @@ pointer-page and TIP page numbers is the next step when it dominates.
   stay nullable (the bit is only ever cleared when certain).
   **Boundary found:** `CURRENT_TIMESTAMP` in a select list refuses
   (`CURRENT_DATE` answers).
+- **CURRENT_TIME / CURRENT_TIMESTAMP DONE (2026-08-21,
+  `serve-real-currenttime` 8):** TIME / TIMESTAMP WITH TIME ZONE
+  (32756/8, 32754/12) in the session zone (the server's OS zone —
+  `/etc/timezone`, `TZ` — through `tz::zone_id`), optional precision
+  (`CURRENT_TIME` defaults to 0 fractional digits, `CURRENT_TIMESTAMP`
+  to 3, probed), never nullable; `TKind::TimeTz/TimestampTz`,
+  `Expr::TimeTzLit/TsTzLit`. Also `mark_not_null_cols` no longer skips
+  a table without NOT NULL columns (a literal over RDB$DATABASE is
+  not-nullable too).
 - **NEXT**: the CHAR (452) describe/wire form for CAST AS CHAR and CHAR
-  columns; `CURRENT_TIMESTAMP` / `CURRENT_TIME` in a select list; the
-  `A`/`B`/`C`/`E` items above. (Full sweep 2026-08-21 after the UPDATE-format change: 259 gates, 8246 checks, 0 DIFF. MERGE `RETURNING` / `NOT MATCHED BY SOURCE`, `op_info_blob`
+  columns; the INT64-vs-LONG describe widths of CASE/COALESCE/IIF/NULLIF
+  and integer literals; the `A`/`B`/`C`/`E` items above. (Full sweep 2026-08-21 after the UPDATE-format change: 259 gates, 8246 checks, 0 DIFF. MERGE `RETURNING` / `NOT MATCHED BY SOURCE`, `op_info_blob`
   / `op_seek_blob`, the ordered JOIN fetch streaming, the RIGHT/FULL
   hash, the bulk index build, the cleanup — all done 2026-08-21.)
 - **D, the MERGE executor** — the BLR is already compiled and tested;
