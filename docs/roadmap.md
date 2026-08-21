@@ -690,13 +690,17 @@ pointer-page and TIP page numbers is the next step when it dominates.
   engine's `c:1e6`. All nine blob/array/batch gates green after the
   switch.
 - **NEXT**: the rest of `E` — the remaining `CREATE TABLE` gaps (arrays;
-  non-default `COLLATE`, which just needs the RDB$COLLATION_ID lookup), and
-  the restore-only / auth DDL (packages, collations, users, mappings,
-  shadows). `DROP`-dependency enforcement is deferred on purpose: the engine
-  routes dependency refusals through Deferred Work so they fire at COMMIT
-  (not execute), and fc records NO view→table dependency rows at all (views
-  write only RDB$VIEW_RELATIONS) — a faithful version would be partial and
-  boundary-heavy, so it waits. (`CREATE TABLE` `CHARACTER SET` / NCHAR
+  non-default `COLLATE`, which just needs the RDB$COLLATION_ID lookup); the
+  rest of `DROP`-dependency enforcement (procedure recompilation and FK/PK
+  back-references — the view case is in); and the restore-only / auth DDL
+  (packages, collations, users, mappings, shadows). (`DROP TABLE`
+  view-dependency enforcement DONE 2026-08-21: a view over a table blocks
+  its DROP with the engine's "there are N dependencies" vector, N = distinct
+  dependent views from RDB$VIEW_RELATIONS — which is exactly the engine's
+  count whenever any view exists. The engine defers to COMMIT and fc refuses
+  at execute, but isql auto-commits so they read identically.
+  serve-real-dropdeps 5. Boundaries: procedure-only and FK/PK-parent drops
+  are refused by the engine, dropped by fc.) (`CREATE TABLE` `CHARACTER SET` / NCHAR
   columns DONE 2026-08-21, single-byte and multibyte UTF8: catalog +
   describe + record layout matched, a UTF8 value inserted through fc stores
   at the right width and the engine reads it back; serve-real-charsetddl 7.
