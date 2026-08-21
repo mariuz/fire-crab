@@ -3973,7 +3973,11 @@ fn body_compile(p: &mut P, func: bool, sub: bool) -> Option<BodyOut> {
     let mut inputs: Vec<(String, Dsc)> = Vec::new();
     if matches!(p.t.get(p.i), Some(Tok::LParen)) {
         p.i += 1;
-        loop {
+        // `()` - an EMPTY list, the same as none (a function may say it)
+        if matches!(p.t.get(p.i), Some(Tok::RParen)) {
+            p.i += 1;
+        }
+        while !inputs.is_empty() || !matches!(p.t.get(p.i.wrapping_sub(1)), Some(Tok::RParen)) {
             let Some(Tok::Ident(name)) = p.t.get(p.i) else {
                 return None;
             };
@@ -9746,6 +9750,54 @@ pub fn compile_procedure_full(sql: &str) -> Option<ProcCompiled> {
 }
 
 /// `compile_procedure` as uppercase hex.
+/// `CREATE FUNCTION <name> (<args>) RETURNS <type> [DETERMINISTIC] AS <body>`:
+/// the procedure compiler in FUNCTION mode (the one package functions
+/// use) - the body wrapped in one more blr_begin, `RETURN <e>` as the
+/// assignment to variable 0 then the send of message 1 and a leave, the
+/// final send without the EOS flag (probed byte for byte against the
+/// engine's RDB$FUNCTION_BLR).
+pub fn compile_function_full(sql: &str) -> Option<ProcCompiled> {
+    let trimmed = sql.trim().trim_end_matches(';');
+    let toks = lex(trimmed)?;
+    let mut p = P::fresh(&toks);
+    if !(p.kw("CREATE") && p.kw("FUNCTION")) {
+        return None;
+    }
+    let name = match p.t.get(p.i)? {
+        Tok::Ident(w) if !is_keyword(w) => {
+            p.i += 1;
+            w.to_ascii_uppercase()
+        }
+        _ => return None,
+    };
+    let bo = body_compile(&mut p, true, false)?;
+    let up = trimmed.to_ascii_uppercase();
+    let bytes = up.as_bytes();
+    let mut as_at = None;
+    let mut k = 0usize;
+    while let Some(rel) = up[k..].find("AS") {
+        let at = k + rel;
+        let before_ok = at == 0 || !bytes[at - 1].is_ascii_alphanumeric() && bytes[at - 1] != b'_' && bytes[at - 1] != b'$';
+        let after_ok = bytes
+            .get(at + 2)
+            .is_none_or(|c| !c.is_ascii_alphanumeric() && *c != b'_' && *c != b'$');
+        if before_ok && after_ok {
+            as_at = Some(at);
+            break;
+        }
+        k = at + 2;
+    }
+    let source = trimmed[as_at? + 2..].trim_start().to_string();
+    Some(ProcCompiled {
+        name,
+        blob: bo.blob,
+        ins: bo.ins.iter().map(|(n, d)| dsc_to_meta(n, d)).collect(),
+        outs: bo.outs.iter().map(|(n, d)| dsc_to_meta(n, d)).collect(),
+        selectable: bo.selectable,
+        source,
+    })
+}
+
 pub fn compile_procedure_hex(sql: &str) -> Option<String> {
     Some(
         compile_procedure(sql)?
@@ -12111,6 +12163,18 @@ mod tests {
         ] {
             assert!(compile_procedure(sql).is_none(), "{sql} was compiled");
         }
+    }
+
+    #[test]
+    fn standalone_function_blr_matches_the_engine() {
+        // probed: RDB$FUNCTION_BLR of `CREATE FUNCTION F (A INTEGER) RETURNS INTEGER AS BEGIN RETURN A + 1; END`
+        let c = compile_function_full("CREATE FUNCTION F (A INTEGER) RETURNS INTEGER AS BEGIN RETURN A + 1; END").unwrap();
+        let hex: String = c.blob.iter().map(|x| format!("{:02x}", x)).collect();
+        assert_eq!(hex, "05020400020008000700040103000800070007000c00020300000800012d1a00009b11000202020122290000000100150800010000001a00000e0102011a0000290100000100ff1200ffffffff0e0102011a0000290100000100ffff4c");
+        assert_eq!(c.name, "F");
+        assert_eq!(c.ins.len(), 1);
+        assert_eq!(c.outs.len(), 1);
+        assert_eq!(c.source, "BEGIN RETURN A + 1; END");
     }
 
     #[test]

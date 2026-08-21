@@ -168,10 +168,11 @@ fn read_n(s: &mut TcpStream, dec: &mut Option<Rc4>, n: usize) -> std::io::Result
     if !compressed {
         let mut b = vec![0u8; n];
         s.read_exact(&mut b)?;
-        return Ok(match dec {
+        let plain = match dec {
             Some(c) => c.transform(&b),
             None => b,
-        });
+        };
+        return Ok(plain);
     }
     // inflated bytes until `n` are at hand: read what the socket has
     // (blocking for at least one byte), decrypt, feed
@@ -1316,12 +1317,13 @@ fn send_request_batch(
     _batch: i32,
 ) -> std::io::Result<()> {
     let mut w = W::default();
+    let tx = TX_HANDLE;
     if let Some((msgno, msg)) = queue.get(*cursor) {
         *cursor += 1;
         w.int(OP_SEND)
             .int(handle)
             .int(0) // incarnation
-            .int(TX_HANDLE)
+            .int(tx)
             .int(*msgno)
             .int(0); // a one-message batch: 0 ends it, client re-requests
         w.raw(msg);
@@ -1330,7 +1332,7 @@ fn send_request_batch(
         w.int(OP_SEND)
             .int(handle)
             .int(0)
-            .int(TX_HANDLE)
+            .int(tx)
             .int(req_msgno)
             .int(0);
     }
@@ -1512,6 +1514,7 @@ fn ddl_dup_codes(plan: &Plan) -> Option<(i32, i32, String)> {
         Plan::CreateTable { name, .. } => Some((336397286, 336068740, q(name))),
         Plan::CreateException { name, .. } => Some((336397280, 336068861, q(name))),
         Plan::CreateView { name, .. } => Some((336397298, 336068740, q(name))), // CREATE VIEW @1 failed / Table @1 already exists
+        Plan::CreateFunction { name, .. } => Some((336397260, 336068876, q(name))), // CREATE FUNCTION @1 failed / Function @1 already exists
         Plan::CreateSequence { name, .. } => Some((336397285, 336068862, q(name))),
         Plan::CreateProcedure { name, .. } => Some((336397265, 336068743, q(name))),
         _ => None,
@@ -1678,6 +1681,7 @@ fn respond_ddl_meta(
             Plan::AlterProcedure { name, .. } => Some((336397266, q(name), 336068748, true)), // ALTER PROCEDURE @1 failed / Procedure @1 not found
             Plan::DropTrigger { name } => Some((336397273, q(name), 336068755, true)), // DROP TRIGGER @1 failed / Trigger @1 not found
             Plan::AlterTrigger { name, .. } => Some((336397271, q(name), 336068755, true)),
+            Plan::DropFunction { name } => Some((336397263, q(name), 336068649, true)), // DROP FUNCTION @1 failed / Function @1 not found
             _ => None,
         }
     } else {
@@ -7185,6 +7189,15 @@ enum Plan {
         contexts: Vec<fire_crab_ods::ddl::RestoredViewContext>,
     },
     DropView { name: String },
+    /// `CREATE FUNCTION <name> (<args>) RETURNS <type> [DETERMINISTIC] AS <body>`
+    CreateFunction {
+        name: String,
+        args: Vec<fire_crab_ods::ddl::FnArgDef>,
+        deterministic: bool,
+        source: String,
+        blr: Vec<u8>,
+    },
+    DropFunction { name: String },
     /// `DROP PROCEDURE <name>`.
     DropProcedure { name: String },
     /// `CREATE PROCEDURE ...` - the BLR is the dsql crate's
@@ -9521,7 +9534,7 @@ fn expr_reads(e: &Expr, f: &dyn Fn(usize) -> bool) -> bool {
         Expr::Bin(a, _, b) | Expr::Concat(a, b) | Expr::NullIf(a, b) => {
             expr_reads(a, f) || expr_reads(b, f)
         }
-        Expr::Coalesce(args) | Expr::Func(_, args) => args.iter().any(|a| expr_reads(a, f)),
+        Expr::Coalesce(args) | Expr::Func(_, args) | Expr::UserFn { args, .. } => args.iter().any(|a| expr_reads(a, f)),
         Expr::Cond(c) => cond_reads(c, f),
         Expr::Iif(c, a, b) => cond_reads(c, f) || expr_reads(a, f) || expr_reads(b, f),
         Expr::Case(branches, else_) => {
@@ -11923,6 +11936,7 @@ fn result_width_bytes(e: &Expr, descs: &[Descriptor]) -> u8 {
         // (probed: 2147483647 -> 496, 2147483648 -> 580; never SMALLINT)
         Expr::Int(n) => if i32::try_from(*n).is_ok() { 4 } else { 8 },
         Expr::Int128(_) => 16,
+        Expr::UserFn { ret, .. } => exact_dtype_bytes(ret.dtype).unwrap_or(8),
         Expr::Neg(a) => result_width_bytes(a, descs),
         // a conditional takes its WIDEST branch (probed: CASE S/2 -> LONG,
         // CASE S/S -> SHORT, COALESCE(S, B) -> INT64); NULLIF takes its
@@ -12213,6 +12227,14 @@ fn text_form_m(
         //   LPAD/RPAD     VARYING at the literal pad length
         //
         // Anything else keeps None, which is the catch-all declaration.
+        Expr::UserFn { ret, .. } => {
+            if ret.dtype != dtype::TEXT && ret.dtype != dtype::VARYING {
+                return None;
+            }
+            let bpc = i32::from(fire_crab_ods::intl::bytes_per_char(fire_crab_ods::intl::charset_id(ret.sub_type)));
+            let bytes = if ret.dtype == dtype::VARYING { (ret.length as i32 - 2).max(0) } else { ret.length as i32 };
+            Some((ret.dtype == dtype::VARYING, bytes / bpc, TfCs::Ttype(ret.sub_type as i32)))
+        }
         Expr::Func(f, args) => {
             let arg = |i: usize| args.get(i).and_then(|a| text_form(a, descs));
             let lit = |i: usize| match args.get(i) {
@@ -13286,6 +13308,11 @@ enum TrigStmt {
     /// `EXIT;` - end the body. A selectable procedure keeps the rows it
     /// has already SUSPENDed.
     Exit { src_off: usize },
+    /// `RETURN <expr>;` - a FUNCTION's answer: output 0 set, the body left
+    Return { expr: fire_crab_ods::expr::Expr, src_off: usize },
+    /// a FUNCTION's `RETURN <text>` - the same literal-or-variable
+    /// concatenation an [TrigStmt::AssignText] takes
+    ReturnText { text: Vec<DynPart>, src_off: usize },
     /// A BARE `EXCEPTION;` - re-raise what the enclosing handler caught,
     /// with its identity intact (the client sees the ORIGINAL exception,
     /// not a new one). Outside a handler there is nothing to re-raise
@@ -13819,6 +13846,8 @@ fn body_has_uninterpretable_blr(st: &TrigStmt) -> bool {
         | TrigStmt::Close { .. }
         | TrigStmt::Leave { .. }
         | TrigStmt::Exit { .. }
+        | TrigStmt::Return { .. }
+        | TrigStmt::ReturnText { .. }
         | TrigStmt::AssignText { .. }
         | TrigStmt::Autonomous { .. }
         | TrigStmt::ExecStmt { .. }
@@ -14547,6 +14576,13 @@ fn parse_trig_stmt(
         return Some(TrigStmt::Store { table, cols, exprs, src_off: start });
     }
     // NEW.<col> = <expr>  or  <var> = <expr>
+    if find_word(&up, "RETURN", 0) == Some(0) {
+        let rhs = text["RETURN".len()..].trim();
+        return match parse_expr(rhs) {
+            Some(e) => Some(TrigStmt::Return { expr: expr_resolve_vars(&e, vars), src_off: start }),
+            None => Some(TrigStmt::ReturnText { text: parse_dyn_text(rhs, vars)?, src_off: start }),
+        };
+    }
     let eq = text.find('=')?;
     let lhs = text[..eq].trim().to_ascii_uppercase();
     let target = if let Some(col) = lhs.strip_prefix("NEW.") {
@@ -14643,6 +14679,8 @@ fn emit_trigger_stmt(
         | TrigStmt::Close { .. }
         | TrigStmt::Leave { .. }
         | TrigStmt::Exit { .. }
+        | TrigStmt::Return { .. }
+        | TrigStmt::ReturnText { .. }
         | TrigStmt::AssignText { .. }
         | TrigStmt::Autonomous { .. }
         | TrigStmt::ExecStmt { .. }
@@ -15235,6 +15273,8 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
             | TrigStmt::Close { .. }
             | TrigStmt::Leave { .. }
             | TrigStmt::Exit { .. }
+            | TrigStmt::Return { .. }
+            | TrigStmt::ReturnText { .. }
             | TrigStmt::AssignText { .. }
             | TrigStmt::Autonomous { .. }
             | TrigStmt::ExecStmt { .. }
@@ -15277,6 +15317,8 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
             | TrigStmt::Close { .. }
             | TrigStmt::Leave { .. }
             | TrigStmt::Exit { .. }
+            | TrigStmt::Return { .. }
+            | TrigStmt::ReturnText { .. }
             | TrigStmt::AssignText { .. }
             | TrigStmt::Autonomous { .. }
             | TrigStmt::ExecStmt { .. }
@@ -15320,6 +15362,8 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
             | TrigStmt::Close { .. }
             | TrigStmt::Leave { .. }
             | TrigStmt::Exit { .. }
+            | TrigStmt::Return { .. }
+            | TrigStmt::ReturnText { .. }
             | TrigStmt::AssignText { .. }
             | TrigStmt::Autonomous { .. }
             | TrigStmt::ExecStmt { .. }
@@ -16587,6 +16631,55 @@ fn projcol_to_coldef(c: &ProjCol, name: &str) -> Option<fire_crab_ods::ddl::Colu
         identity: None,
         computed: None,
     })
+}
+
+/// `CREATE FUNCTION ...`: the dsql crate's function compiler (byte for byte
+/// the engine's RDB$FUNCTION_BLR); the arguments become RDB$FUNCTION_ARGUMENTS
+/// rows on auto-domains, the return is position 0.
+fn plan_create_function(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
+    let s = sql.trim();
+    let up = mask_literals(&s.to_ascii_uppercase());
+    if find_word(&up, "CREATE", 0) != Some(0) {
+        return None;
+    }
+    let fk = find_word(&up, "FUNCTION", "CREATE".len())?;
+    if up["CREATE".len()..fk].trim() != "" {
+        return None;
+    }
+    let c = fire_crab_dsql::compile_function_full(s)?;
+    if c.outs.len() != 1 {
+        return None;
+    }
+    let as_at = find_word(&up, "AS", fk).unwrap_or(up.len());
+    let deterministic = find_word(&up[..as_at], "DETERMINISTIC", fk).is_some();
+    let arg = |m: &fire_crab_dsql::ProcParamMeta, position: i64, named: bool| fire_crab_ods::ddl::FnArgDef {
+        name: if named { Some(m.name.to_ascii_uppercase()) } else { None },
+        position,
+        field_type: m.field_type,
+        length: m.length,
+        scale: m.scale,
+        sub_type: m.sub_type,
+        null_flag: false,
+        default: None,
+        inline: false,
+        precision: None,
+        mech: -1, // a PSQL function's RDB$MECHANISM is NULL (probed)
+    };
+    let mut args: Vec<fire_crab_ods::ddl::FnArgDef> = vec![arg(&c.outs[0], 0, false)];
+    for (i, m) in c.ins.iter().enumerate() {
+        args.push(arg(m, (i + 1) as i64, true));
+    }
+    Some((Plan::CreateFunction { name: c.name, args, deterministic, source: c.source, blr: c.blob }, Vec::new()))
+}
+
+/// Parse `DROP FUNCTION <name>`.
+fn plan_drop_function(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
+    let s = sql.trim().trim_end_matches(';').trim();
+    let toks: Vec<&str> = s.split_whitespace().collect();
+    if toks.len() != 3 || !toks[0].eq_ignore_ascii_case("DROP") || !toks[1].eq_ignore_ascii_case("FUNCTION") {
+        return None;
+    }
+    Some((Plan::DropFunction { name: unquote_ident(toks[2])? }, Vec::new()))
 }
 
 /// Parse `DROP VIEW <name>`.
@@ -22309,6 +22402,14 @@ fn execute_dml_collecting_inner(
             fire_crab_ods::ddl::drop_view(&mut work, db.page_size, name)?;
             (0, 0, 0)
         }
+        Plan::CreateFunction { name, args, deterministic, source, blr } => {
+            fire_crab_ods::ddl::restore_carried_function(&mut work, db.page_size, name, args, 0, *deterministic, source, blr, None, None, None)?;
+            (0, 0, 0)
+        }
+        Plan::DropFunction { name } => {
+            fire_crab_ods::ddl::drop_function(&mut work, db.page_size, name)?;
+            (0, 0, 0)
+        }
         Plan::DropProcedure { name } => {
             fire_crab_ods::ddl::drop_procedure(&mut work, db.page_size, name)?;
             (0, 0, 0)
@@ -27082,6 +27183,9 @@ fn rewrite_named_windows(sql: &str) -> Option<String> {
 }
 
 fn plan_query(sql: &str, db: &Option<Database>) -> (Plan, Vec<Descriptor>) {
+    USER_FNS.with(|m| *m.borrow_mut() = db.as_ref().map(user_function_sigs).unwrap_or_default());
+    FN_CALLS.with(|l| l.borrow_mut().clear());
+    PREPARE_REFUSAL.with(|r| *r.borrow_mut() = None);
     // the two system-SQL pieces libfbclient's array helpers lean on,
     // folded into plain SQL before planning - see [rewrite_system_sql]
     let sys = rewrite_system_sql(sql);
@@ -27123,7 +27227,10 @@ fn plan_query(sql: &str, db: &Option<Database>) -> (Plan, Vec<Descriptor>) {
         // The fixed-answer plan still exists for the one case that wants
         // it: a connection with no database behind it, where the wire
         // pipeline must still round-trip.
-        _ if db.is_some() => (Plan::Refused, Vec::new()),
+        _ if db.is_some() => match PREPARE_REFUSAL.with(|r| r.borrow_mut().take()) {
+            Some(e) => (Plan::RefusedEval(e), Vec::new()),
+            None => (Plan::Refused, Vec::new()),
+        },
         _ => (Plan::Scalar(ScalarVal::Fixed(Some(FIXED_ANSWER)), "CONSTANT".into(), None, ScalarTy::int64()), Vec::new()),
     }
 }
@@ -31091,6 +31198,8 @@ fn expr_nullable(e: &Expr, is_nn: &dyn Fn(usize) -> bool) -> bool {
         }
         Expr::Func(SysFn::GetContext, _) => true,
         Expr::Func(_, args) => args.iter().any(|a| expr_nullable(a, is_nn)),
+        // a function's RETURN is always nullable (probed)
+        Expr::UserFn { .. } => true,
         _ => true,
     }
 }
@@ -35239,6 +35348,7 @@ fn describe_for(plan: &Plan, params: &[Descriptor], att: AttCs) -> Vec<u8> {
         | Plan::CreateException { .. } | Plan::CreateProcedure { .. } | Plan::DropProcedure { .. } | Plan::DropException { .. }
         | Plan::DeclareFilter { .. } | Plan::DropFilter { .. } | Plan::CreateView { .. } | Plan::DropView { .. }
         | Plan::AlterTrigger { .. } | Plan::DropTrigger { .. } | Plan::CreateOrAlterTrigger { .. } | Plan::AlterProcedure { .. } | Plan::CreateOrAlterProcedure { .. }
+        | Plan::CreateFunction { .. } | Plan::DropFunction { .. }
         | Plan::AlterException { .. } | Plan::CreateOrAlterException { .. }
         | Plan::CreateRole { .. } | Plan::DropRole { .. }
         | Plan::AlterDatabaseBackup { .. }
@@ -35346,6 +35456,7 @@ fn stmt_type_of(plan: &Plan) -> i32 {
         | Plan::CreateException { .. } | Plan::CreateProcedure { .. } | Plan::DropProcedure { .. } | Plan::DropException { .. }
         | Plan::DeclareFilter { .. } | Plan::DropFilter { .. } | Plan::CreateView { .. } | Plan::DropView { .. }
         | Plan::AlterTrigger { .. } | Plan::DropTrigger { .. } | Plan::CreateOrAlterTrigger { .. } | Plan::AlterProcedure { .. } | Plan::CreateOrAlterProcedure { .. }
+        | Plan::CreateFunction { .. } | Plan::DropFunction { .. }
         | Plan::AlterException { .. } | Plan::CreateOrAlterException { .. }
         | Plan::CreateRole { .. } | Plan::DropRole { .. }
         | Plan::AlterDatabaseBackup { .. }
@@ -36203,6 +36314,34 @@ fn eval_status_items(w: &mut W, e: &EvalErr) {
                 .int(1) // Blob sub_types bigger than 1 (text) are for internal use only
                 .int(335544867);
         }
+        EvalErr::FunctionUnknown(name) => {
+            // isc_dsql_error, sqlerr -804, isc_dsql_function_err, isc_random '"NAME"'
+            w.int(1)
+                .int(GDS_DSQL_ERROR)
+                .int(1)
+                .int(335544436)
+                .int(ISC_ARG_NUMBER)
+                .int(-804)
+                .int(1)
+                .int(335544586)
+                .int(1)
+                .int(335544382)
+                .int(2)
+                .bytes(format!("\"{}\"", name).as_bytes());
+        }
+        EvalErr::FnArity { name, missing } => {
+            // isc_fun_param_mismatch '"PUBLIC"."F"', then isc_wronumarg
+            // (too many) or the missing argument's name (probed)
+            w.int(1).int(335545101).int(2).bytes(format!("\"PUBLIC\".\"{}\"", name).as_bytes());
+            match missing {
+                None => {
+                    w.int(1).int(335544380);
+                }
+                Some(a) => {
+                    w.int(1).int(335545291).int(2).bytes(a.as_bytes());
+                }
+            }
+        }
         EvalErr::CtxNamespace(ns, func) => {
             w.int(1) // isc_arg_gds
                 .int(335544844)
@@ -36780,6 +36919,7 @@ fn emit_rows_inner(
         | Plan::CreateException { .. } | Plan::CreateProcedure { .. } | Plan::DropProcedure { .. } | Plan::DropException { .. }
         | Plan::DeclareFilter { .. } | Plan::DropFilter { .. } | Plan::CreateView { .. } | Plan::DropView { .. }
         | Plan::AlterTrigger { .. } | Plan::DropTrigger { .. } | Plan::CreateOrAlterTrigger { .. } | Plan::AlterProcedure { .. } | Plan::CreateOrAlterProcedure { .. }
+        | Plan::CreateFunction { .. } | Plan::DropFunction { .. }
         | Plan::AlterException { .. } | Plan::CreateOrAlterException { .. }
         | Plan::CreateRole { .. } | Plan::DropRole { .. }
         | Plan::AlterDatabaseBackup { .. }
@@ -38124,6 +38264,27 @@ fn bpb_conversion(bpb: &[u8]) -> (Option<i32>, Option<i32>) {
 }
 
 thread_local! {
+    /// the USER functions the attached database holds, by upper-cased
+    /// name, with each one's RETURN descriptor - loaded at every
+    /// prepare ([user_function_sigs]) so the expression atom can tell a
+    /// function call from a column
+    static USER_FNS: std::cell::RefCell<std::collections::HashMap<String, (Descriptor, Vec<String>)>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+    /// the user-function values of the row being projected, by call id
+    static FN_VALS: std::cell::RefCell<std::collections::HashMap<u32, Value>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+    /// the calls the prepare in progress resolved, in POST-ORDER (an
+    /// argument's call before the call around it), taken by the
+    /// prepare into the statement's [FnCall] list
+    static FN_CALLS: std::cell::RefCell<Vec<FnCall>> = std::cell::RefCell::new(Vec::new());
+    static NEXT_FN_CALL: std::cell::Cell<u32> = std::cell::Cell::new(1);
+    /// a NAMED refusal the parser met on the way (an unknown function,
+    /// a call with the wrong argument count): [plan_query] answers it
+    /// in place of the generic refusal when the text does not plan
+    static PREPARE_REFUSAL: std::cell::RefCell<Option<EvalErr>> = std::cell::RefCell::new(None);
+}
+
+thread_local! {
     /// This attachment's context variables: (USER_SESSION, USER_TRANSACTION)
     /// - one connection is one thread, so the thread is the attachment;
     /// the transaction map empties at COMMIT / ROLLBACK (not RETAINING)
@@ -38592,7 +38753,7 @@ fn expr_contains_genval(e: &Expr) -> bool {
         Expr::Bin(a, _, b) | Expr::Concat(a, b) | Expr::NullIf(a, b) => {
             expr_contains_genval(a) || expr_contains_genval(b)
         }
-        Expr::Coalesce(args) | Expr::Func(_, args) => args.iter().any(expr_contains_genval),
+        Expr::Coalesce(args) | Expr::Func(_, args) | Expr::UserFn { args, .. } => args.iter().any(expr_contains_genval),
         Expr::Cond(c) => cond(c),
         Expr::Iif(c, a, b) => {
             cond(c) || expr_contains_genval(a) || expr_contains_genval(b)
@@ -39076,6 +39237,9 @@ enum WinKind {
 #[derive(Clone, PartialEq)]
 enum RawExpr {
     Col(String),
+    /// a call of a USER function (`F(A, B)`): the name is one the
+    /// catalog holds ([USER_FNS], loaded per prepare), upper-cased
+    UserFn(String, Vec<RawExpr>),
     /// a `?` parameter placeholder in a PROJECTION expression. Parsed by
     /// `expr_atom` with the index left UNASSIGNED (usize::MAX) and
     /// numbered in source order only along the projection path
@@ -40535,7 +40699,48 @@ fn expr_atom(b: &[char], pos: &mut usize) -> Option<RawExpr> {
                 }
                 *pos += 1; // ')'
                 Some(node)
+            } else if !quoted
+                && USER_FNS.with(|m| m.borrow().contains_key(&word.to_ascii_uppercase()))
+                && {
+                    skip_ws(b, pos);
+                    b.get(*pos) == Some(&'(')
+                }
+            {
+                // a USER function call: `F(<expr>, ...)` - only a name
+                // the catalog holds parses this way, so a column named
+                // like no function still resolves as a column
+                *pos += 1; // '('
+                let mut args = Vec::new();
+                skip_ws(b, pos);
+                if b.get(*pos) != Some(&')') {
+                    loop {
+                        args.push(expr_add(b, pos)?);
+                        skip_ws(b, pos);
+                        match b.get(*pos) {
+                            Some(',') => *pos += 1,
+                            Some(')') => break,
+                            _ => return None,
+                        }
+                    }
+                }
+                *pos += 1; // ')'
+                Some(RawExpr::UserFn(word.to_ascii_uppercase(), args))
             } else {
+                // `NAME(` where NAME is no function this server or the
+                // catalog knows: the engine's "Function unknown" (-804),
+                // recorded for the prepare's refusal. Words the grammar
+                // handles elsewhere (aggregates, predicates, windows,
+                // CAST) never reach here with their `(`; a built-in this
+                // server lacks keeps the generic refusal
+                if !quoted && !word.is_empty() {
+                    let mut p2 = *pos;
+                    skip_ws(b, &mut p2);
+                    if b.get(p2) == Some(&'(') && !engine_builtin_word(&word.to_ascii_uppercase()) {
+                        PREPARE_REFUSAL.with(|r| {
+                            r.borrow_mut().get_or_insert(EvalErr::FunctionUnknown(word.to_ascii_uppercase()));
+                        });
+                    }
+                }
                 Some(RawExpr::Col(word))
             }
         }
@@ -40560,6 +40765,7 @@ fn raw_bad_substring_len(e: &RawExpr) -> Option<i64> {
     let walk_all = |args: &[RawExpr]| args.iter().find_map(raw_bad_substring_len);
     match e {
         RawExpr::Param(_) => None,
+        RawExpr::UserFn(_, args) => walk_all(args),
         // a generator's step is an integer literal; nothing to check
         RawExpr::Gen { .. } => None,
         // an aggregate's ARGUMENT is an expression too, so a bad literal
@@ -41485,6 +41691,30 @@ fn resolve_expr_inner(
             };
             Expr::Func(f, resolved)
         }
+        RawExpr::UserFn(name, args) => {
+            let (ret, params) = USER_FNS.with(|m| m.borrow().get(name).cloned())?;
+            if args.len() != params.len() {
+                // "Input parameter mismatch for function F" - with the
+                // first MISSING argument's name, or wronumarg when there
+                // are too many (probed)
+                let missing = params.get(args.len()).cloned();
+                PREPARE_REFUSAL.with(|r| {
+                    r.borrow_mut().get_or_insert(EvalErr::FnArity { name: name.clone(), missing });
+                });
+                return None;
+            }
+            let resolved: Vec<Expr> = args
+                .iter()
+                .map(|a| resolve_expr(a, columns, descs))
+                .collect::<Option<Vec<_>>>()?;
+            let id = NEXT_FN_CALL.with(|c| {
+                let v = c.get();
+                c.set(v.wrapping_add(1));
+                v
+            });
+            FN_CALLS.with(|l| l.borrow_mut().push(FnCall { id, name: name.clone(), args: resolved.clone() }));
+            Expr::UserFn { name: name.clone(), args: resolved, ret, id }
+        }
         RawExpr::Case(branches, else_) => Expr::Case(
             branches
                 .iter()
@@ -41598,6 +41828,14 @@ enum Expr {
     Iif(Box<Cond2>, Box<Expr>, Box<Expr>),
     /// a built-in scalar function over resolved arguments
     Func(SysFn, Vec<Expr>),
+    /// a call of a USER (PSQL) function. The evaluator holds no
+    /// database, so the value is COMPUTED AHEAD of evaluation: the
+    /// statement's rows are materialised at the first fetch
+    /// ([materialise_user_fn_rows]), each call run through
+    /// [run_function] per row and its value parked under `id` in
+    /// [FN_VALS] for `eval` to read. `ret` is the return domain's
+    /// descriptor - the describe (type, width, charset) comes from it
+    UserFn { name: String, args: Vec<Expr>, ret: Descriptor, id: u32 },
     /// A CORRELATED scalar subquery, precomputed as a LOOKUP TABLE.
     ///
     /// `(SELECT COUNT(*) FROM EMP E WHERE E.DEPT_ID = D.ID)` has one
@@ -41829,6 +42067,11 @@ enum EvalErr {
     InvalidLength(i64),
     /// isc_ctx_namespace_invalid: "Invalid namespace name '@1' passed to @2"
     CtxNamespace(String, &'static str),
+    /// `NAME(...)` names no function: -804 "Function unknown" (probed)
+    FunctionUnknown(String),
+    /// a user-function call with the wrong argument count: the first
+    /// missing argument's name, or none when there are too many
+    FnArity { name: String, missing: Option<String> },
     /// `BLOB SUB_TYPE n` (n > 1) in a CREATE TABLE: the engine's "Blob
     /// sub_types bigger than 1 (text) are for internal use only", inside
     /// the "CREATE TABLE @1 failed" wrapper - carries the qualified name
@@ -43553,6 +43796,17 @@ impl Expr {
                     None => temporal_kind(d).map(ExprType::Temporal),
                 }
             }
+            Expr::UserFn { ret, .. } => match ret.dtype {
+                dtype::SHORT | dtype::LONG | dtype::INT64 if ret.scale == 0 => Some(ExprType::Int),
+                dtype::SHORT | dtype::LONG | dtype::INT64 => Some(ExprType::Numeric),
+                dtype::TEXT | dtype::VARYING => Some(ExprType::Text),
+                dtype::DOUBLE => Some(ExprType::Approx),
+                dtype::BOOLEAN => Some(ExprType::Bool),
+                dtype::SQL_DATE => Some(ExprType::Temporal(TKind::Date)),
+                dtype::SQL_TIME => Some(ExprType::Temporal(TKind::Time)),
+                dtype::TIMESTAMP => Some(ExprType::Temporal(TKind::Timestamp)),
+                _ => None,
+            },
             Expr::Int(_) | Expr::Int128(_) => Some(ExprType::Int),
             // a DECFLOAT(34) literal has no ExprType of its own (the
             // describe short-circuits it in build_expr_col_from); declining
@@ -43973,6 +44227,7 @@ impl Expr {
                 | CastTarget::Temporal(_)
                 | CastTarget::DecFloat { .. } => None,
             },
+            Expr::UserFn { .. } => None,
             Expr::Func(f, args) => match f {
                 // ABS ranks (and so widens) as its operand does - ABS
                 // over an INT128 column announces INT128
@@ -44631,6 +44886,9 @@ impl Expr {
                         }
                     }
                 }
+            }
+            Expr::UserFn { id, .. } => {
+                FN_VALS.with(|m| m.borrow().get(id).cloned()).ok_or(EvalErr::Unsupported)?
             }
             Expr::Func(f, args) => {
                 // every function here propagates NULL: any NULL argument
@@ -47735,6 +47993,7 @@ fn default_expr_name(raw: &RawExpr) -> String {
         RawExpr::Iif(_, _, _) => "CASE",
         RawExpr::Case(..) => "CASE",
         RawExpr::Func(f, _) => return f.header().to_string(),
+        RawExpr::UserFn(n, _) => return n.clone(),
         RawExpr::CurrentDate => "CURRENT_DATE",
         RawExpr::LocalTime => "LOCALTIME",
         RawExpr::LocalTimestamp => "LOCALTIMESTAMP",
@@ -50415,6 +50674,8 @@ fn plan_immediate(text: &str, database: &Option<Database>) -> Option<(Plan, Vec<
                     .or_else(|| plan_drop_filter(text))
                     .or_else(|| plan_create_view(text, database))
                     .or_else(|| plan_drop_view(text))
+                    .or_else(|| plan_create_function(text))
+                    .or_else(|| plan_drop_function(text))
                     .or_else(|| plan_drop_exception(text))
                     .or_else(|| plan_alter_exception(text))
                     .or_else(|| plan_create_or_alter_exception(text))
@@ -51651,6 +51912,8 @@ fn stmt_src_off(s: &TrigStmt) -> usize {
         | TrigStmt::Close { src_off, .. }
         | TrigStmt::Leave { src_off, .. }
         | TrigStmt::Exit { src_off, .. }
+        | TrigStmt::Return { src_off, .. }
+        | TrigStmt::ReturnText { src_off, .. }
         | TrigStmt::AssignText { src_off, .. }
         | TrigStmt::Autonomous { src_off, .. }
         | TrigStmt::ExecStmt { src_off, .. }
@@ -51935,6 +52198,16 @@ fn exec_psql_stmt_inner(
         }
         TrigStmt::Leave { .. } => Err(PsqlStop::Leave),
         TrigStmt::Exit { .. } => Err(PsqlStop::Exit),
+        TrigStmt::Return { expr, .. } => {
+            // a FUNCTION's RETURN: output 0 takes the value, the body ends
+            let v = eval_psql_expr(expr, f)?;
+            let n = f.out_at;
+            if n >= f.vars.len() {
+                f.vars.resize(n + 1, Value::Null);
+            }
+            f.vars[n] = v;
+            Err(PsqlStop::Exit)
+        }
         // a BEGIN..END block - which every body is, and which nests.
         // A WHEN handler catches a raise from inside its own block, the
         // way the engine's error_handler does.
@@ -52037,6 +52310,15 @@ fn exec_psql_stmt_inner(
         }
         // a TEXT assignment - what builds the statement a body is about
         // to run
+        TrigStmt::ReturnText { text, .. } => {
+            let v = render_dyn_text(text, f)?;
+            let n = f.out_at;
+            if n >= f.vars.len() {
+                f.vars.resize(n + 1, Value::Null);
+            }
+            f.vars[n] = v.map_or(Value::Null, Value::Text);
+            Err(PsqlStop::Exit)
+        }
         TrigStmt::AssignText { slot, text, .. } => {
             let v = render_dyn_text(text, f)?;
             let n = *slot as usize;
@@ -52653,6 +52935,252 @@ fn bind_proc_args(name: &str, meta: &ProcMeta, args: &[Value]) -> Result<Vec<Val
         });
     }
     Ok(bound)
+}
+
+/// A PSQL FUNCTION's meta, as [load_procedure] reads a procedure's: the
+/// source, the arguments (RDB$FUNCTION_ARGUMENTS positions 1.. typed by
+/// their domains) as inputs, the return (position 0) as the one output.
+/// Packaged and system functions are not this slice.
+/// One user-function call a prepared statement holds: what to run per
+/// row, and the [FN_VALS] slot its value fills.
+#[derive(Clone)]
+struct FnCall {
+    id: u32,
+    name: String,
+    args: Vec<Expr>,
+}
+
+/// Is this upper-cased word one the ENGINE has a meaning for before a
+/// `(` - so a `WORD(` this server does not parse is NOT "Function
+/// unknown" but a built-in outside its surface (generic refusal)?
+fn engine_builtin_word(w: &str) -> bool {
+    const WORDS: &[&str] = &[
+        "ABS", "ACOS", "ACOSH", "ASCII_CHAR", "ASCII_VAL", "ASIN", "ASINH", "ATAN", "ATAN2", "ATANH",
+        "AVG", "BASE64_DECODE", "BASE64_ENCODE", "BIN_AND", "BIN_NOT", "BIN_OR", "BIN_SHL", "BIN_SHR",
+        "BIN_XOR", "BLOB_APPEND", "CAST", "CEIL", "CEILING", "CHAR_LENGTH", "CHARACTER_LENGTH",
+        "CHAR_TO_UUID", "COALESCE", "COS", "COSH", "COT", "COUNT", "COVAR_POP", "COVAR_SAMP",
+        "CRYPT_HASH", "CUME_DIST", "DATEADD", "DATEDIFF", "DECODE", "DECRYPT", "DENSE_RANK",
+        "ENCRYPT", "EXISTS", "EXP", "EXTRACT", "FIRST_VALUE", "FLOOR", "GEN_ID", "GEN_UUID",
+        "HASH", "HEX_DECODE", "HEX_ENCODE", "IIF", "LAG", "LAST_VALUE", "LEAD", "LEFT", "LIST",
+        "LN", "LOG", "LOG10", "LOWER", "LPAD", "MAKE_DBKEY", "MAX", "MAXVALUE", "MIN", "MINVALUE",
+        "MOD", "NTH_VALUE", "NTILE", "NULLIF", "OCTET_LENGTH", "OVERLAY", "PERCENT_RANK", "PI",
+        "POSITION", "POWER", "RAND", "RANK", "REPLACE", "REVERSE", "RIGHT", "ROUND", "ROW_NUMBER",
+        "RPAD", "RSA_DECRYPT", "RSA_ENCRYPT", "RSA_PRIVATE", "RSA_PUBLIC", "RSA_SIGN_HASH",
+        "RSA_VERIFY_HASH", "SIGN", "SIN", "SINH", "SQRT", "STDDEV_POP", "STDDEV_SAMP", "SUBSTRING",
+        "SUM", "TAN", "TANH", "TRIM", "TRUNC", "UNICODE_CHAR", "UNICODE_VAL", "UPPER", "UUID_TO_CHAR",
+        "VAR_POP", "VAR_SAMP", "ANY", "ALL", "SOME", "IN", "VALUES", "OVER", "FILTER", "WITHIN",
+        "SINGULAR", "CONTAINING", "STARTING", "LIKE", "BETWEEN", "ESCAPE", "AND", "OR", "NOT",
+        "CORR", "REGR_AVGX", "REGR_AVGY", "REGR_COUNT", "REGR_INTERCEPT", "REGR_R2", "REGR_SLOPE",
+        "REGR_SXX", "REGR_SXY", "REGR_SYY", "FIRST_DAY", "LAST_DAY", "QUANTIZE", "NORMALIZE_DECFLOAT",
+        "COMPARE_DECFLOAT", "TOTALORDER", "DEFAULT", "ON", "USING", "WHERE", "GROUP", "ORDER",
+        "PARTITION", "ROWS", "RANGE", "PRECISION", "CHAR", "VARCHAR", "NUMERIC", "DECIMAL", "FLOAT",
+        "DECFLOAT", "BINARY", "VARBINARY", "TIME", "TIMESTAMP", "DATE", "INTERVAL", "NATIONAL",
+        "NCHAR", "WITH", "SELECT", "FROM", "RETURNING", "SET", "THEN", "ELSE", "WHEN", "CASE",
+    ];
+    w.starts_with("RDB$") || w.starts_with("SYSTEM.") || w.contains('.') || WORDS.contains(&w)
+}
+
+/// Does this upper-cased SQL text CALL `name` - the name as a whole
+/// word, followed by `(`?
+fn sql_calls_name(up: &str, name: &str) -> bool {
+    let b = up.as_bytes();
+    let mut from = 0;
+    while let Some(i) = up[from..].find(name) {
+        let at = from + i;
+        let end = at + name.len();
+        let word = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$';
+        let bounded = (at == 0 || !word(b[at - 1])) && (end >= b.len() || !word(b[end]));
+        if bounded {
+            let rest = up[end..].trim_start();
+            if rest.starts_with('(') {
+                return true;
+            }
+        }
+        from = at + 1;
+    }
+    false
+}
+
+/// Every USER function the database holds (not a package's, not a
+/// system one) with its RETURN descriptor - what the expression atom
+/// and resolver need to type a call. Loaded at each prepare.
+fn user_function_sigs(db: &Database) -> std::collections::HashMap<String, (Descriptor, Vec<String>)> {
+    use fire_crab_ods::format::Value;
+    let mut out = std::collections::HashMap::new();
+    let Some((fcols, fdescs)) = sys_rel(db, "RDB$FUNCTIONS") else { return out };
+    let ffid = |n: &str| fcols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let Some(name_f) = ffid("RDB$FUNCTION_NAME") else { return out };
+    let (pkg_f, sys_f) = (ffid("RDB$PACKAGE_NAME"), ffid("RDB$SYSTEM_FLAG"));
+    let ffmts = vec![(0u8, fdescs)];
+    let mut names: Vec<String> = Vec::new();
+    for_each_record(db, 14, &ffmts, usize::MAX, |v| {
+        if matches!(pkg_f.and_then(|i| v.get(i)), Some(Value::Text(_))) {
+            return;
+        }
+        if matches!(sys_f.and_then(|i| v.get(i)), Some(Value::Int(n)) if *n != 0) {
+            return;
+        }
+        if let Some(Value::Text(t)) = v.get(name_f) {
+            names.push(t.trim_end().to_ascii_uppercase());
+        }
+    });
+    for n in names {
+        if let Some(meta) = load_function(db, &n) {
+            if let Some(r) = meta.outs.first() {
+                let names = meta.ins.iter().map(|p| p.name.clone()).collect();
+                out.insert(n, (r.desc.clone(), names));
+            }
+        }
+    }
+    out
+}
+
+/// The rows of a statement whose select list CALLS user functions,
+/// computed at its first fetch: the base rows are scanned as the plan
+/// says, then every call runs per row (arguments evaluated against the
+/// row, inner calls first) and parks its value in [FN_VALS] before the
+/// row is projected. Only a plain table projection qualifies; anything
+/// else is refused (the fetch answers an error).
+fn materialise_user_fn_rows(
+    database: &mut Option<Database>,
+    plan: &Plan,
+    calls: &[FnCall],
+    args: &[WireParam],
+    ctx: &SessionCtx,
+) -> Result<Vec<Vec<Value>>, EvalErr> {
+    let Plan::Project { rel, formats, cols, filter, order_by, gen_cols, index, windows, .. } = plan else {
+        return Err(EvalErr::Unsupported);
+    };
+    if !gen_cols.is_empty() || !windows.is_empty() {
+        return Err(EvalErr::Unsupported);
+    }
+    let base: Vec<Vec<Value>> = {
+        let db = database.as_ref().ok_or(EvalErr::Unsupported)?;
+        let filter = bind_filter(filter, args).map_err(|_| EvalErr::Unsupported)?;
+        let src = RowSource::scan_filter_sort(*rel, formats.clone(), filter, order_by.clone(), index.clone());
+        src.rows(db)?
+    };
+    let mut out = Vec::with_capacity(base.len());
+    for values in &base {
+        FN_VALS.with(|m| m.borrow_mut().clear());
+        for c in calls {
+            let mut argv = Vec::with_capacity(c.args.len());
+            for a in &c.args {
+                argv.push(a.eval(values)?);
+            }
+            let v = run_function(database, &c.name, &argv, ctx).map_err(|e| {
+                if std::env::var("FC_SRV_TRACE").is_ok() {
+                    eprintln!("[srv] user function {}({:?}) failed: {}", c.name, argv, e);
+                }
+                EvalErr::Unsupported
+            })?;
+            FN_VALS.with(|m| m.borrow_mut().insert(c.id, v));
+        }
+        let mut row = Vec::with_capacity(cols.len());
+        for c in cols {
+            row.push(c.value_of(values)?);
+        }
+        out.push(row);
+    }
+    FN_VALS.with(|m| m.borrow_mut().clear());
+    Ok(out)
+}
+
+fn load_function(db: &Database, name: &str) -> Option<ProcMeta> {
+    use fire_crab_ods::format::Value;
+    let (fcols, fdescs) = sys_rel(db, "RDB$FUNCTIONS")?;
+    let ffid = |n: &str| fcols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (name_f, src_f) = (ffid("RDB$FUNCTION_NAME")?, ffid("RDB$FUNCTION_SOURCE")?);
+    let (pkg_f, sys_f, dbg_f) = (ffid("RDB$PACKAGE_NAME"), ffid("RDB$SYSTEM_FLAG"), ffid("RDB$DEBUG_INFO"));
+    let ffmts = vec![(0u8, fdescs)];
+    let mut source: Option<String> = None;
+    let mut body_at: Option<(usize, usize)> = None;
+    let mut found = false;
+    for_each_record(db, 14, &ffmts, usize::MAX, |v| {
+        let hit = matches!(v.get(name_f), Some(Value::Text(t)) if t.trim_end().eq_ignore_ascii_case(name));
+        if !hit || found {
+            return;
+        }
+        if matches!(pkg_f.and_then(|i| v.get(i)), Some(Value::Text(_))) {
+            return;
+        }
+        if matches!(sys_f.and_then(|i| v.get(i)), Some(Value::Int(n)) if *n != 0) {
+            return;
+        }
+        found = true;
+        if let Some(Value::Blob(r, n)) = v.get(src_f) {
+            if let Some(bytes) = fire_crab_blb::read_blob_content(&db.bytes(), db.page_size, *r, *n) {
+                source = Some(String::from_utf8_lossy(&bytes).into_owned());
+            }
+        }
+        if let Some(Value::Blob(r, n)) = dbg_f.and_then(|i| v.get(i)) {
+            if let Some(bytes) = fire_crab_blb::read_blob_content(&db.bytes(), db.page_size, *r, *n) {
+                body_at = first_debug_position(&bytes);
+            }
+        }
+    });
+    if !found {
+        return None;
+    }
+    let source = source?;
+    let (acols, adescs) = sys_rel(db, "RDB$FUNCTION_ARGUMENTS")?;
+    let afid = |n: &str| acols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (an_f, pos_f, fs_f) = (afid("RDB$FUNCTION_NAME")?, afid("RDB$ARGUMENT_POSITION")?, afid("RDB$FIELD_SOURCE")?);
+    let aname_f = afid("RDB$ARGUMENT_NAME");
+    let apkg_f = afid("RDB$PACKAGE_NAME");
+    let afmts = vec![(0u8, adescs)];
+    let mut raw: Vec<(i64, String, String)> = Vec::new();
+    for_each_record(db, 15, &afmts, usize::MAX, |v| {
+        let hit = matches!(v.get(an_f), Some(Value::Text(t)) if t.trim_end().eq_ignore_ascii_case(name));
+        if !hit || matches!(apkg_f.and_then(|i| v.get(i)), Some(Value::Text(_))) {
+            return;
+        }
+        if let (Some(Value::Int(pos)), Some(Value::Text(fs))) = (v.get(pos_f), v.get(fs_f)) {
+            let pname = match aname_f.and_then(|i| v.get(i)) {
+                Some(Value::Text(t)) => t.trim_end().to_string(),
+                _ => String::new(),
+            };
+            raw.push((*pos, pname, fs.trim_end().to_string()));
+        }
+    });
+    raw.sort_by_key(|(p, _, _)| *p);
+    let domain_desc = |dom: &str| -> Option<Descriptor> {
+        let (ft, len, scale, sub) = fire_crab_ods::ddl::domain_type_info(&db.bytes(), db.page_size, dom)?;
+        let dtype = fire_crab_ods::ddl::field_type_to_dtype(ft)?;
+        let length = if dtype == dtype::VARYING { len + 2 } else { len };
+        Some(Descriptor { dtype, scale, length, sub_type: sub, flags: 0, offset: 0 })
+    };
+    let mut ins: Vec<ProcParam> = Vec::new();
+    let mut outs: Vec<ProcParam> = Vec::new();
+    for (pos, pname, fs) in raw {
+        let desc = domain_desc(&fs)?;
+        if col_kind(&desc).is_none() {
+            return None;
+        }
+        if pos == 0 {
+            outs.push(ProcParam { name: "RETURN".into(), desc });
+        } else {
+            ins.push(ProcParam { name: pname, desc });
+        }
+    }
+    if outs.len() != 1 {
+        return None;
+    }
+    Some(ProcMeta { ins, outs, source, body_at, prc_type: None })
+}
+
+/// Run a PSQL FUNCTION from its source: the one output is its answer.
+fn run_function(
+    database: &mut Option<Database>,
+    name: &str,
+    args: &[Value],
+    ctx: &SessionCtx,
+) -> Result<Value, ProcErr> {
+    let db = database.as_ref().ok_or("no database attached")?;
+    let meta = load_function(db, name)
+        .ok_or_else(|| format!("function {} is not one this server can run", name))?;
+    let (outs, _) = run_body_source(database, name, &meta, args, ctx)?;
+    Ok(outs.into_iter().next().unwrap_or(Value::Null))
 }
 
 fn run_procedure(
@@ -54062,6 +54590,7 @@ fn expr_no_raise(e: &Expr, descs: &[Descriptor]) -> bool {
                 .all(|(c, t)| cond_no_raise(c, descs) && expr_no_raise(t, descs))
                 && else_.as_ref().map_or(true, |e| expr_no_raise(e, descs))
         }
+        Expr::UserFn { .. } => false,
         Expr::Func(f, args) => {
             if !args.iter().all(|a| expr_no_raise(a, descs)) {
                 return false;
@@ -55397,6 +55926,8 @@ fn after_auth(
     // once its first fetch arrives (the engine's BufferedStream under a
     // scrollable RSE) - see [ScrollState]
     let mut scrollable: std::collections::HashSet<i32> = std::collections::HashSet::new();
+    // the user-function calls the CURRENT plan holds (see [FnCall])
+    let mut fn_calls: std::rc::Rc<Vec<FnCall>> = std::rc::Rc::new(Vec::new());
     let mut scroll: std::collections::HashMap<i32, ScrollState> = std::collections::HashMap::new();
     // the open BATCH per statement (op_batch_create .. op_batch_rls):
     // the input message layout and the messages queued so far - see
@@ -55826,6 +56357,8 @@ fn after_auth(
                         .or_else(|| plan_drop_filter(&stmt_sql))
                         .or_else(|| plan_create_view(&stmt_sql, &database))
                         .or_else(|| plan_drop_view(&stmt_sql))
+                        .or_else(|| plan_create_function(&stmt_sql))
+                        .or_else(|| plan_drop_function(&stmt_sql))
                         .or_else(|| plan_drop_exception(&stmt_sql))
                         .or_else(|| plan_alter_exception(&stmt_sql))
                         .or_else(|| plan_create_or_alter_exception(&stmt_sql))
@@ -55969,16 +56502,24 @@ fn after_auth(
                     // computed - and a plan is a function of the schema
                     // and the text again.
                     let gen = database.as_ref().map_or(0, |d| d.meta.generation());
+                    // a text that CALLS a user function plans outside the
+                    // cache: its call list ([FN_CALLS]) is gathered while
+                    // planning, and a cached plan would not gather it
+                    let calls_fn = database.as_ref().is_some_and(|db| {
+                        let up = stmt_sql.to_ascii_uppercase();
+                        user_function_sigs(db).keys().any(|n| sql_calls_name(&up, n))
+                    });
                     let (p, ps) = timed("plan(select)", || match database.as_ref() {
-                        Some(db) => db
+                        Some(db) if !calls_fn => db
                             .stmts
                             .plan(gen, &stmt_sql, || Some(plan_query(&stmt_sql, &database)))
                             .expect("the planner answers every text"),
-                        None => {
+                        _ => {
                             let (p, ps) = plan_query(&stmt_sql, &database);
                             (std::rc::Rc::new(p), std::rc::Rc::new(ps))
                         }
                     });
+                    fn_calls = std::rc::Rc::new(FN_CALLS.with(|l| std::mem::take(&mut *l.borrow_mut())));
                     // A REFUSED STATEMENT FAILS AT PREPARE, which is where
                     // the engine fails an unsupported one too. Answering
                     // the prepare and then raising at fetch left the error
@@ -56111,6 +56652,7 @@ fn after_auth(
                         | Plan::CreateException { .. }
                         | Plan::DeclareFilter { .. } | Plan::DropFilter { .. } | Plan::CreateView { .. } | Plan::DropView { .. }
         | Plan::AlterTrigger { .. } | Plan::DropTrigger { .. } | Plan::CreateOrAlterTrigger { .. } | Plan::AlterProcedure { .. } | Plan::CreateOrAlterProcedure { .. }
+        | Plan::CreateFunction { .. } | Plan::DropFunction { .. }
                         | Plan::CreateProcedure { .. }
                         | Plan::DropProcedure { .. }
                         | Plan::AlterException { .. }
@@ -57000,6 +57542,32 @@ fn after_auth(
                     w.int(1).int(GDS_INVALID_FETCH_OPTION).int(2).bytes(name.as_bytes()).int(0);
                     w.send(&mut s, &mut enc)?;
                     continue;
+                }
+                if !fn_calls.is_empty() && !scroll.contains_key(&cur_stmt) {
+                    // the select list calls user functions: the rows are
+                    // computed NOW, the cursor served from the buffer
+                    let calls = fn_calls.clone();
+                    match materialise_user_fn_rows(
+                        &mut database,
+                        &*plan,
+                        &calls,
+                        &bound_args,
+                        &SessionCtx { user, attach_id },
+                    ) {
+                        Ok(rows) => {
+                            let cols: Vec<ProjCol> = output_cols_of(&*plan)
+                                .iter()
+                                .enumerate()
+                                .map(|(i, c)| ProjCol { field_id: i, expr: None, ..c.clone() })
+                                .collect();
+                            scroll.insert(cur_stmt, ScrollState { cols, rows, state: ScrollPos::Bos, pos: 0 });
+                            scrollable.insert(cur_stmt);
+                        }
+                        Err(e) => {
+                            respond_eval_error(&mut s, &mut enc, &e)?;
+                            continue;
+                        }
+                    }
                 }
                 if scrollable.contains(&cur_stmt) {
                     if !scroll.contains_key(&cur_stmt) {

@@ -1782,6 +1782,86 @@ pub fn drop_filter(file: &mut crate::Image, page_size: usize, name: &str) -> Res
     advance_oldest_transactions(file, page_size)
 }
 
+/// `DROP FUNCTION <name>`: the RDB$FUNCTIONS row, its argument rows and
+/// their auto-domains, its security class, privileges and dependencies go.
+pub fn drop_function(file: &mut crate::Image, page_size: usize, name: &str) -> Result<(), String> {
+    let want = name.trim().trim_matches('"').to_ascii_uppercase();
+    let (class, found) = {
+        let formats = system_relation_formats(file, page_size, "RDB$FUNCTIONS").ok_or("no RDB$FUNCTIONS format")?;
+        let (_, descs) = formats.iter().max_by_key(|(n, _)| *n).ok_or("empty format")?;
+        let rel = crate::resolve_relation(file, page_size, "RDB$FUNCTIONS").ok_or("no RDB$FUNCTIONS")?;
+        let cols = relation_columns(file, page_size, "RDB$FUNCTIONS");
+        let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+        let name_f = fid("RDB$FUNCTION_NAME").ok_or("no RDB$FUNCTION_NAME")?;
+        let cls_f = fid("RDB$SECURITY_CLASS");
+        let pkg_f = fid("RDB$PACKAGE_NAME");
+        let mut class = None;
+        let mut found = false;
+        walk_rows(file, page_size, rel, descs, |v| {
+            if !found && text_eq(v.get(name_f), &want) && !matches!(pkg_f.and_then(|f| v.get(f)), Some(Value::Text(_))) {
+                found = true;
+                if let Some(Value::Text(t)) = cls_f.and_then(|f| v.get(f)) {
+                    class = Some(t.trim_end().to_string());
+                }
+            }
+        });
+        (class, found)
+    };
+    if !found {
+        return Err(format!("Function {} not found", want));
+    }
+    let mut domain_names: Vec<String> = Vec::new();
+    {
+        let formats = system_relation_formats(file, page_size, "RDB$FUNCTION_ARGUMENTS").ok_or("no RDB$FUNCTION_ARGUMENTS format")?;
+        let (_, descs) = formats.iter().max_by_key(|(n, _)| *n).ok_or("empty format")?;
+        let rel = crate::resolve_relation(file, page_size, "RDB$FUNCTION_ARGUMENTS").ok_or("no RDB$FUNCTION_ARGUMENTS")?;
+        let fn_f = sys_fid(file, page_size, "RDB$FUNCTION_ARGUMENTS", "RDB$FUNCTION_NAME")?;
+        let src_f = sys_fid(file, page_size, "RDB$FUNCTION_ARGUMENTS", "RDB$FIELD_SOURCE")?;
+        walk_rows(file, page_size, rel, descs, |v| {
+            if text_eq(v.get(fn_f), &want) {
+                if let Some(Value::Text(t)) = v.get(src_f) {
+                    let t = t.trim_end();
+                    if t.strip_prefix("RDB$").is_some_and(|x| x.parse::<u64>().is_ok()) {
+                        domain_names.push(t.to_string());
+                    }
+                }
+            }
+        });
+    }
+    {
+        let fid = sys_fid(file, page_size, "RDB$FUNCTION_ARGUMENTS", "RDB$FUNCTION_NAME")?;
+        let n = want.clone();
+        delete_catalog_rows(file, page_size, "RDB$FUNCTION_ARGUMENTS", move |v| text_eq(v.get(fid), &n))?;
+    }
+    {
+        let fid = sys_fid(file, page_size, "RDB$FIELDS", "RDB$FIELD_NAME")?;
+        let names = domain_names.clone();
+        delete_catalog_rows(file, page_size, "RDB$FIELDS", move |v| names.iter().any(|d| text_eq(v.get(fid), d)))?;
+    }
+    {
+        let fid = sys_fid(file, page_size, "RDB$FUNCTIONS", "RDB$FUNCTION_NAME")?;
+        let n = want.clone();
+        delete_catalog_rows(file, page_size, "RDB$FUNCTIONS", move |v| text_eq(v.get(fid), &n))?;
+    }
+    if let Some(class) = class {
+        let fid = sys_fid(file, page_size, "RDB$SECURITY_CLASSES", "RDB$SECURITY_CLASS")?;
+        delete_catalog_rows(file, page_size, "RDB$SECURITY_CLASSES", move |v| text_eq(v.get(fid), &class))?;
+    }
+    {
+        let rel_f = sys_fid(file, page_size, "RDB$USER_PRIVILEGES", "RDB$RELATION_NAME")?;
+        let obj_f = sys_fid(file, page_size, "RDB$USER_PRIVILEGES", "RDB$OBJECT_TYPE")?;
+        let n = want.clone();
+        delete_catalog_rows(file, page_size, "RDB$USER_PRIVILEGES", move |v| text_eq(v.get(rel_f), &n) && int_eq(v.get(obj_f), 15))?;
+    }
+    if crate::resolve_relation(file, page_size, "RDB$DEPENDENCIES").is_some() {
+        let dn_f = sys_fid(file, page_size, "RDB$DEPENDENCIES", "RDB$DEPENDENT_NAME")?;
+        let dt_f = sys_fid(file, page_size, "RDB$DEPENDENCIES", "RDB$DEPENDENT_TYPE")?;
+        let n = want.clone();
+        delete_catalog_rows(file, page_size, "RDB$DEPENDENCIES", move |v| text_eq(v.get(dn_f), &n) && int_eq(v.get(dt_f), 15))?;
+    }
+    advance_oldest_transactions(file, page_size)
+}
+
 pub fn drop_domain(file: &mut crate::Image, page_size: usize, name: &str) -> Result<(), String> {
     let want = name.trim().trim_matches('"').to_ascii_uppercase();
     if !domain_exists(file, page_size, &want) {
@@ -9585,6 +9665,7 @@ pub fn patch_relation_dbkey_length(
 /// One carried function argument: the position off the file, the type
 /// facts resolved through the carried domain records. Position 0 is
 /// the RETURN argument (RDB$RETURN_ARGUMENT names it on the header row).
+#[derive(Clone, Debug)]
 pub struct FnArgDef {
     pub name: Option<String>,
     pub position: i64,
@@ -9792,10 +9873,13 @@ pub fn restore_carried_function(
             ("RDB$ARGUMENT_POSITION", SysVal::I(a.position)),
             ("RDB$FIELD_SOURCE", SysVal::S(&dom)),
             ("RDB$FIELD_SOURCE_SCHEMA_NAME", SysVal::S("PUBLIC")),
-            ("RDB$MECHANISM", SysVal::I(0)),
             ("RDB$ARGUMENT_MECHANISM", SysVal::I(0)),
             ("RDB$SYSTEM_FLAG", SysVal::I(0)),
         ];
+        if a.mech >= 0 {
+            // a PSQL function's argument has no RDB$MECHANISM (NULL, probed); a UDF's is carried
+            avals.push(("RDB$MECHANISM", SysVal::I(a.mech)));
+        }
         if let Some(an) = &a.name {
             avals.push(("RDB$ARGUMENT_NAME", SysVal::S(an.as_str())));
         }
