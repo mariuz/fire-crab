@@ -187,7 +187,7 @@ info / seek / get_segment from its copy (the gate's inline pass: wire
 opens fall away, the answers are the engine's line for line).
 
 **Still absent:** blob
-parameters in UPDATE … SET, `op_batch_*` (the batch API), `op_ping`, `op_slice` (arrays),
+parameters in UPDATE … SET, blobs inside a batch, `op_ping`, `op_slice` (arrays),
 `op_transact`. Auth: only Srp256 offered; no Legacy_Auth / ChaCha /
 zlib. `op_info_transaction` answers only `isc_info_tra_id`. A text blob
 is stored in the database charset (UTF8) with no bpb transliteration.
@@ -423,8 +423,20 @@ pointer-page and TIP page numbers is the next step when it dominates.
   The client is `qa/c/scroll.cpp` over the OO API (its own prefetch and
   relative re-positioning included). `blr_scrollable` in `dsql` was
   already there.
-- **NEXT**: `op_batch_*` (the batch API); blob parameters in UPDATE …
-  SET. (MERGE `RETURNING` / `NOT MATCHED BY SOURCE`, `op_info_blob`
+- **The batch API DONE (2026-08-21, `serve-real-batch` 22):**
+  `op_batch_create` / `msg` / `exec` / `rls` / `cancel` / `sync` — a
+  prepared DML statement's input messages queued (each in op_execute's
+  packed message form) and run in one round trip through the ordinary
+  DML path (one statement undo per message); the completion state
+  (`op_batch_cs`) carries a count per message under `TAG_RECORD_COUNTS`,
+  `EXECUTE_FAILED` and the failure's vector up to `TAG_DETAILED_ERRORS`
+  (64), and the run stops at the first failure unless `TAG_MULTIERROR`.
+  Laws probed: the parameters block is WIDE-tagged (u32 lengths); a
+  second `createBatch` supersedes the open one. Client `qa/c/batch.cpp`
+  (OO API). **Still absent:** blobs inside a batch (`op_batch_regblob` /
+  `op_batch_blob_stream` / `op_batch_set_bpb`), `op_info_batch`.
+- **NEXT**: blob parameters in UPDATE … SET; blobs inside a batch;
+  `op_ping` / `op_transact` / `op_slice`. (MERGE `RETURNING` / `NOT MATCHED BY SOURCE`, `op_info_blob`
   / `op_seek_blob`, the ordered JOIN fetch streaming, the RIGHT/FULL
   hash, the bulk index build, the cleanup — all done 2026-08-21.)
 - **D, the MERGE executor** — the BLR is already compiled and tested;

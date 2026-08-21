@@ -76,6 +76,17 @@ const OP_OPEN_BLOB: i32 = 35;
 const OP_INFO_BLOB: i32 = 43;
 /// protocol 19: a blob shipped with the row that names it
 const OP_INLINE_BLOB: i32 = 114;
+/// the BATCH API (protocol 16+): a statement's input messages queued and
+/// run in one round trip - IBatch over the wire
+const OP_BATCH_CREATE: i32 = 99;
+const OP_BATCH_MSG: i32 = 100;
+const OP_BATCH_EXEC: i32 = 101;
+const OP_BATCH_RLS: i32 = 102;
+const OP_BATCH_CS: i32 = 103;
+const OP_BATCH_CANCEL: i32 = 109;
+const OP_BATCH_SYNC: i32 = 110;
+/// isc_bad_batch_handle: "invalid batch handle"
+const GDS_BAD_BATCH_HANDLE: i32 = 335545159;
 /// protocol 18: a fetch with an operation and a position (p_sqldata_fetch_op /
 /// p_sqldata_fetch_pos) over a SCROLLABLE cursor
 const OP_FETCH_SCROLL: i32 = 112;
@@ -319,6 +330,64 @@ impl ReadBlob {
         }
         out.push(1);
         out
+    }
+}
+
+/// An open batch (IBatch) over one prepared statement: the input message
+/// layout the client declared at op_batch_create, the messages queued by
+/// op_batch_msg, and the parameters block's knobs - TAG_MULTIERROR (run
+/// on past a failed message), TAG_RECORD_COUNTS (a count per message in
+/// the completion state), TAG_DETAILED_ERRORS (how many failures carry
+/// their vector; 64 by default, DsqlBatch::DETAILED_LIMIT, 256 at most).
+struct BatchState {
+    slots: Vec<PSlot>,
+    msgs: Vec<Vec<WireParam>>,
+    multierror: bool,
+    record_counts: bool,
+    detailed: usize,
+}
+
+/// The batch parameters block: a WIDE-tagged clumplet buffer
+/// (ClumpletReader::WideTagged - the version byte IBatch::VERSION1, then
+/// `tag, u32 LE length, value` items; the values are little-endian
+/// integers). Read as a byte-length buffer, every knob came out off and
+/// libfbclient, expecting the counts it had asked for, crashed on a
+/// count-less completion state.
+fn batch_pb_flags(pb: &[u8]) -> (bool, bool, usize) {
+    let (mut multierror, mut counts, mut detailed) = (false, false, 64usize);
+    let mut at = 1usize; // the version tag
+    while at + 5 <= pb.len() {
+        let tag = pb[at];
+        let len = u32::from_le_bytes([pb[at + 1], pb[at + 2], pb[at + 3], pb[at + 4]]) as usize;
+        let start = at + 5;
+        let end = (start + len).min(pb.len());
+        let mut v: u64 = 0;
+        for (i, b) in pb[start..end].iter().enumerate() {
+            v |= u64::from(*b) << (8 * i);
+        }
+        match tag {
+            1 => multierror = v != 0,          // TAG_MULTIERROR
+            2 => counts = v != 0,              // TAG_RECORD_COUNTS
+            5 => detailed = (v as usize).min(256), // TAG_DETAILED_ERRORS
+            _ => {}
+        }
+        at = end;
+    }
+    (multierror, counts, detailed)
+}
+
+/// The status-vector ITEMS of a failed DML, without the terminator -
+/// what op_execute would have answered for the same statement, as the
+/// batch completion state carries it per message.
+fn exec_err_items(w: &mut W, e: &ExecErr) {
+    match e {
+        ExecErr::Eval(ev) => eval_status_items(w, ev),
+        ExecErr::Gds(code, _) => {
+            w.int(1).int(*code);
+        }
+        ExecErr::Text(_) | ExecErr::Conflict(_) => {
+            w.int(1).int(GDS_DSQL_ERROR);
+        }
     }
 }
 
@@ -17930,7 +17999,14 @@ fn read_param_message(
                 wire_text_param(&raw[..*len], att_id)
             }
             PSlot::Varying => {
-                let len = read_int(s, dec)?.max(0) as usize;
+                let len = read_int(s, dec)?;
+                // a varying's length is a u16 on the engine's side
+                // (vary_length); anything past it is a garbled message,
+                // and reading megabytes for it would hang the connection
+                if !(0..=i32::from(u16::MAX)).contains(&len) {
+                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "varying length out of range"));
+                }
+                let len = len as usize;
                 let raw = read_n(s, dec, len.div_ceil(4) * 4)?;
                 wire_text_param(&raw[..len], att_id)
             }
@@ -52443,6 +52519,10 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
     // scrollable RSE) - see [ScrollState]
     let mut scrollable: std::collections::HashSet<i32> = std::collections::HashSet::new();
     let mut scroll: std::collections::HashMap<i32, ScrollState> = std::collections::HashMap::new();
+    // the open BATCH per statement (op_batch_create .. op_batch_rls):
+    // the input message layout and the messages queued so far - see
+    // [BatchState]
+    let mut batches: std::collections::HashMap<i32, BatchState> = std::collections::HashMap::new();
     let mut cursors: std::collections::HashMap<i32, RowCursor> =
         std::collections::HashMap::new();
     let mut cur_stmt: i32 = 3;
@@ -53650,6 +53730,140 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 w.int(OP_RESPONSE).int(0).int(0).int(0).bytes(&info).int(0);
                 w.send(&mut s, &mut enc)?;
             }
+            // THE BATCH API (IBatch, DsqlBatch.cpp): the client queues
+            // input messages against a prepared DML statement and runs
+            // them in one round trip; the reply is one completion state -
+            // per message its update count (TAG_RECORD_COUNTS) or a
+            // failure, the first failure's vector, and unless
+            // TAG_MULTIERROR the run stops there. Blobs in a batch
+            // (op_batch_regblob / op_batch_blob_stream / op_batch_set_bpb)
+            // are not taken: a message naming one refuses at execute.
+            x if x == OP_BATCH_CREATE => {
+                // p_batch_create: statement, the input-message blr, the
+                // explicit message length, the parameters block
+                let h = read_int(&mut s, &mut dec)?;
+                let blr = read_wire_bytes(&mut s, &mut dec)?;
+                read_int(&mut s, &mut dec)?; // p_batch_msglen
+                let pb = read_wire_bytes(&mut s, &mut dec)?;
+                use_stmt!(h);
+                // a second createBatch on the statement SUPERSEDES the open
+                // one (probed through libfbclient: "opened", not
+                // isc_batch_open - the client lets the old handle go first)
+                let Some(slots) = parse_param_blr(&blr) else {
+                    respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
+                    continue;
+                };
+                let (multierror, record_counts, detailed) = batch_pb_flags(&pb);
+                if std::env::var("FC_SRV_TRACE").is_ok() {
+                    eprintln!(
+                        "[srv] batch create: stmt {} slots {} multierror={} counts={} detailed={}",
+                        h, slots.len(), multierror, record_counts, detailed
+                    );
+                }
+                batches.insert(h, BatchState { slots, msgs: Vec::new(), multierror, record_counts, detailed });
+                respond(&mut s, &mut enc, 0)?;
+            }
+            x if x == OP_BATCH_MSG => {
+                // p_batch_msg: statement, message count, then that many
+                // input messages, each in the format op_execute's travels
+                let h = read_int(&mut s, &mut dec)?;
+                let count = read_int(&mut s, &mut dec)?.max(0) as usize;
+                let Some(b) = batches.get_mut(&h) else {
+                    // the layout is unknowable without the batch: the
+                    // stream cannot be consumed, so say so and drop it
+                    respond_error(&mut s, &mut enc, GDS_BAD_BATCH_HANDLE)?;
+                    break;
+                };
+                for _ in 0..count {
+                    let args = read_param_message(&mut s, &mut dec, &b.slots, att_cs.id)?;
+                    b.msgs.push(args);
+                }
+                if std::env::var("FC_SRV_TRACE").is_ok() {
+                    eprintln!("[srv] batch msg: stmt {} +{} ({} queued)", h, count, b.msgs.len());
+                }
+                respond(&mut s, &mut enc, 0)?;
+            }
+            x if x == OP_BATCH_EXEC => {
+                let h = read_int(&mut s, &mut dec)?;
+                read_int(&mut s, &mut dec)?; // transaction handle
+                use_stmt!(h);
+                let Some(b) = batches.get_mut(&h) else {
+                    respond_error(&mut s, &mut enc, GDS_BAD_BATCH_HANDLE)?;
+                    continue;
+                };
+                let msgs = std::mem::take(&mut b.msgs);
+                let (multierror, record_counts, detailed) = (b.multierror, b.record_counts, b.detailed);
+                let ctx = SessionCtx { user, attach_id };
+                // per message: its update count, or its failure
+                let mut states: Vec<i32> = Vec::with_capacity(msgs.len());
+                let mut errors: Vec<(u32, ExecErr)> = Vec::new();
+                for (i, args) in msgs.iter().enumerate() {
+                    match timed("batch execute", || execute_dml(&*plan, &mut database, args, &ctx)) {
+                        Ok((ins, upd, del)) => states.push(ins + upd + del),
+                        Err(e) => {
+                            if std::env::var("FC_SRV_TRACE").is_ok() {
+                                eprintln!("[srv] batch message {} failed: {}", i, e);
+                            }
+                            states.push(-1); // EXECUTE_FAILED
+                            errors.push((i as u32, e));
+                            if !multierror {
+                                break;
+                            }
+                        }
+                    }
+                }
+                last_dml = (0, 0, 0);
+                if std::env::var("FC_SRV_TRACE").is_ok() {
+                    eprintln!(
+                        "[srv] batch exec: stmt {} {} messages run, {} failed, counts={}",
+                        h, states.len(), errors.len(), record_counts
+                    );
+                }
+                // op_batch_cs: statement, records, update counters (all of
+                // them when counts were asked for, else none), the errors
+                // WITH a vector (up to the detailed limit), then the
+                // record numbers of the rest
+                let with_vector = errors.len().min(detailed);
+                let mut w = W::default();
+                w.int(OP_BATCH_CS)
+                    .int(h)
+                    .int(states.len() as i32)
+                    .int(if record_counts { states.len() as i32 } else { 0 })
+                    .int(with_vector as i32)
+                    .int((errors.len() - with_vector) as i32);
+                if record_counts {
+                    for st in &states {
+                        w.int(*st);
+                    }
+                }
+                for (rec, e) in errors.iter().take(with_vector) {
+                    w.int(*rec as i32);
+                    exec_err_items(&mut w, e);
+                    w.int(0); // isc_arg_end
+                }
+                for (rec, _) in errors.iter().skip(with_vector) {
+                    w.int(*rec as i32);
+                }
+                w.send(&mut s, &mut enc)?;
+            }
+            x if x == OP_BATCH_RLS || x == OP_BATCH_CANCEL => {
+                // a release of a batch already superseded or gone is
+                // answered clean: the client's release() never raises
+                let h = read_int(&mut s, &mut dec)?;
+                if x == OP_BATCH_CANCEL {
+                    if let Some(b) = batches.get_mut(&h) {
+                        b.msgs.clear(); // IBatch::cancel: the queue, not the batch
+                    }
+                } else {
+                    batches.remove(&h);
+                }
+                respond(&mut s, &mut enc, 0)?;
+            }
+            x if x == OP_BATCH_SYNC => {
+                // a round trip for its own sake: the client flushes its
+                // deferred packets and reads every pending response
+                respond(&mut s, &mut enc, 0)?;
+            }
             x if x == OP_FETCH || x == OP_FETCH_SCROLL => {
                 let h = read_int(&mut s, &mut dec)?; // stmt
                 use_stmt!(h);
@@ -54149,6 +54363,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 let h = read_int(&mut s, &mut dec)?; // stmt
                 let how = read_int(&mut s, &mut dec)?; // 1 close, 2 drop, 4 unprepare
                 scroll.remove(&h);
+                batches.remove(&h);
                 // CLOSE and DROP both end the cursor - a streaming one is
                 // dropped so a later execute of a CLOSEd handle opens fresh.
                 cursors.remove(&h);
