@@ -1591,6 +1591,27 @@ fn respond_ddl_meta(
     // "DROP TABLE @1 failed" wrapper the engine adds isc_dsql_command_err
     // (-607, "Invalid command") and a "-Table @1 does not exist" string
     // - four items, not the three the others carry.
+    if lc.contains("there are") && lc.contains("dependencies") {
+        // DROP TABLE (or RECREATE TABLE) refused because a VIEW reads the
+        // table: "unsuccessful metadata update / cannot delete / TABLE @1 /
+        // there are N dependencies" (probed). N is carried in the message.
+        if let Plan::DropTable { name } = plan {
+            let n: i32 = err_text
+                .split_whitespace()
+                .find_map(|w| w.parse::<i32>().ok())
+                .unwrap_or(1);
+            let qn = q(name);
+            let mut w = W::default();
+            w.int(OP_RESPONSE).int(0).int(0).int(0).int(0);
+            w.int(1).int(GDS_NO_META_UPDATE)
+                .int(1).int(335544673) // isc_no_delete - "cannot delete"
+                .int(1).int(335544626).int(2).bytes(qn.as_bytes()) // isc_table_name - "TABLE @1"
+                .int(1).int(335544630).int(4).int(n) // isc_dependency - "there are @1 dependencies"
+                .int(0);
+            w.send(s, enc)?;
+            return Ok(true);
+        }
+    }
     if lc.contains("not found") {
         if let Plan::AlterView { name, .. } = plan {
             // ALTER VIEW of a missing name: "unsuccessful metadata update /

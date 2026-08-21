@@ -6876,6 +6876,38 @@ pub fn drop_table(file: &mut crate::Image, page_size: usize, name: &str) -> Resu
     if rel < 128 {
         return Err("system relations cannot be dropped".into());
     }
+    // A VIEW that reads this table blocks the drop, as the engine's deferred
+    // dependency scan does. The engine's count is DISTINCT dependent VIEWS
+    // whenever any view exists (procedures that also reference the table are
+    // recompiled, not counted); RDB$VIEW_RELATIONS holds one row per view
+    // context, so distinct RDB$VIEW_NAME over this relation is exactly N. A
+    // procedure/FK that is the SOLE dependent is a recorded boundary - this
+    // server drops there, where the engine refuses.
+    if let Some(vrel) = crate::resolve_relation(file, page_size, "RDB$VIEW_RELATIONS") {
+        let vfmts = system_relation_formats(file, page_size, "RDB$VIEW_RELATIONS")
+            .ok_or("no RDB$VIEW_RELATIONS format")?;
+        let (_, vdescs) = vfmts.iter().max_by_key(|(n, _)| *n).ok_or("no view-relations format")?;
+        let vname_f = sys_fid(file, page_size, "RDB$VIEW_RELATIONS", "RDB$VIEW_NAME")?;
+        let vreln_f = sys_fid(file, page_size, "RDB$VIEW_RELATIONS", "RDB$RELATION_NAME")?;
+        let mut views: Vec<String> = Vec::new();
+        walk_rows(file, page_size, vrel, vdescs, |v| {
+            if text_eq(v.get(vreln_f), &name) {
+                if let Some(Value::Text(t)) = v.get(vname_f) {
+                    let vn = t.trim_end().to_string();
+                    if !views.iter().any(|x| x.eq_ignore_ascii_case(&vn)) {
+                        views.push(vn);
+                    }
+                }
+            }
+        });
+        if !views.is_empty() {
+            return Err(format!(
+                "cannot delete TABLE {} - there are {} dependencies",
+                name,
+                views.len()
+            ));
+        }
+    }
 
     // gather what the catalog says belongs to this table BEFORE
     // stubbing it: index names, constraint names, auto-domain names
