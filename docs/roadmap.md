@@ -690,9 +690,15 @@ pointer-page and TIP page numbers is the next step when it dominates.
   engine's `c:1e6`. All nine blob/array/batch gates green after the
   switch.
 - **NEXT**: the rest of `E` — `DROP TABLE`/`DROP` dependency enforcement,
-  the `CREATE TABLE` column-type gaps (BLOB is in; DECFLOAT, `TIME/TIMESTAMP
-  WITH TIME ZONE`, NCHAR, arrays, `COLLATE`/`CHARACTER SET`), and the
-  restore-only / auth DDL (packages, collations, users, mappings, shadows).
+  the remaining `CREATE TABLE` column-type gaps (NCHAR, arrays,
+  `COLLATE`/`CHARACTER SET` — these need the multibyte record-format work),
+  and the restore-only / auth DDL (packages, collations, users, mappings,
+  shadows). (`CREATE TABLE` with DECFLOAT / DECFLOAT(16|34) and
+  `TIME/TIMESTAMP WITH TIME ZONE` DONE 2026-08-21: catalog + describe +
+  record layout matched, the engine writes tz values into fc's own table
+  and both read them back; serve-real-coltypes 7. BLOB, NUMERIC, BOOLEAN,
+  INT128 were already in. Separate value-parser gaps left: a WITH TIME
+  ZONE literal and a scientific `1E10` DECFLOAT literal in an INSERT.)
   (`RECREATE` DONE 2026-08-21: `RECREATE TABLE/VIEW/PROCEDURE/EXCEPTION/
   SEQUENCE/FUNCTION` = drop-if-exists then create, the CREATE planned at
   prepare so a bad definition preserves the old object; `Plan::Recreate(Box<Plan>)`,
