@@ -83,6 +83,13 @@ pub struct ColumnDef {
     pub precision: Option<i16>,
     /// character length, for CHAR/VARCHAR (charset NONE: == bytes)
     pub char_len: Option<u16>,
+    /// an ARRAY column's dimensions, `(lower, upper)` each, in
+    /// declaration order (`INTEGER [1:5, 0:2]`); empty for a scalar. The
+    /// type fields above describe the ELEMENT (RDB$FIELD_TYPE / LENGTH /
+    /// SCALE are the element's, RDB$DIMENSIONS the count, the bounds in
+    /// RDB$FIELD_DIMENSIONS - probed); the record stores an 8-byte array
+    /// blob id, dsc dtype_array.
+    pub dims: Vec<(i32, i32)>,
     /// NOT NULL - explicit, or implied by PRIMARY KEY membership
     pub not_null: bool,
     /// whether this column's NOT NULL is a COLUMN-level declaration
@@ -531,6 +538,123 @@ fn col_field(dtype: u8, length: u16, scale: i8, sub_type: i16) -> (u8, u16, i8, 
     (dtype, gfld, scale, sub_type)
 }
 
+/// [col_field] for a column definition: an ARRAY column's storage is the
+/// 8-byte array blob id (dtype_array), whatever its element type
+fn col_field_of(c: &ColumnDef) -> (u8, u16, i8, i16) {
+    if c.dims.is_empty() {
+        col_field(c.dtype, c.length, c.scale, c.sub_type)
+    } else {
+        (crate::format::dtype::ARRAY, 8, 0, 0)
+    }
+}
+
+/// An ARRAY column's shape as the engine keeps it (RDB$FIELDS +
+/// RDB$FIELD_DIMENSIONS): the element's (dtype, length, scale, sub_type)
+/// and the bounds per dimension - what `Ods::InternalArrayDesc` is built
+/// from (DdlNodes.epp getArrayDesc).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ArrayShape {
+    pub dtype: u8,
+    pub length: u16,
+    pub scale: i8,
+    pub sub_type: i16,
+    pub dims: Vec<(i32, i32)>,
+}
+
+/// The shape of `relation`.`field`, or None when it is not an array
+/// column (or unknown)
+pub fn array_shape(file: &crate::Image, page_size: usize, relation: &str, field: &str) -> Option<ArrayShape> {
+    let text = |v: Option<&Value>| -> Option<String> {
+        match v {
+            Some(Value::Text(t)) => Some(t.trim_end().to_string()),
+            _ => None,
+        }
+    };
+    let rf_formats = system_relation_formats(file, page_size, "RDB$RELATION_FIELDS")?;
+    let (_, rf_descs) = rf_formats.iter().max_by_key(|(n, _)| *n)?;
+    let rfcols = relation_columns(file, page_size, "RDB$RELATION_FIELDS");
+    let rff = |n: &str| rfcols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (rel_f, fld_f, src_f) = (rff("RDB$RELATION_NAME")?, rff("RDB$FIELD_NAME")?, rff("RDB$FIELD_SOURCE")?);
+    let mut source: Option<String> = None;
+    walk_rows(file, page_size, 5, rf_descs, |vals| {
+        if source.is_some() {
+            return;
+        }
+        let (Some(r), Some(f), Some(src)) = (text(vals.get(rel_f)), text(vals.get(fld_f)), text(vals.get(src_f))) else {
+            return;
+        };
+        if r.eq_ignore_ascii_case(relation) && f.eq_ignore_ascii_case(field) {
+            source = Some(src);
+        }
+    });
+    let source = source?;
+    let f_formats = system_relation_formats(file, page_size, "RDB$FIELDS")?;
+    let (_, f_descs) = f_formats.iter().max_by_key(|(n, _)| *n)?;
+    let fcols = relation_columns(file, page_size, "RDB$FIELDS");
+    let ff = |n: &str| fcols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (name_f, type_f, len_f, scale_f, sub_f, dims_f) = (
+        ff("RDB$FIELD_NAME")?,
+        ff("RDB$FIELD_TYPE")?,
+        ff("RDB$FIELD_LENGTH")?,
+        ff("RDB$FIELD_SCALE")?,
+        ff("RDB$FIELD_SUB_TYPE")?,
+        ff("RDB$DIMENSIONS")?,
+    );
+    let mut elem: Option<(i64, i64, i64, i64, i64)> = None;
+    walk_rows(file, page_size, 2, f_descs, |vals| {
+        if elem.is_some() {
+            return;
+        }
+        if text(vals.get(name_f)).as_deref() != Some(source.as_str()) {
+            return;
+        }
+        let int = |i: usize| match vals.get(i) {
+            Some(Value::Int(n)) => *n,
+            _ => 0,
+        };
+        elem = Some((int(type_f), int(len_f), int(scale_f), int(sub_f), int(dims_f)));
+    });
+    let (ftype, flen, fscale, fsub, ndims) = elem?;
+    if ndims <= 0 {
+        return None;
+    }
+    let d_formats = system_relation_formats(file, page_size, "RDB$FIELD_DIMENSIONS")?;
+    let (_, d_descs) = d_formats.iter().max_by_key(|(n, _)| *n)?;
+    let dcols = relation_columns(file, page_size, "RDB$FIELD_DIMENSIONS");
+    let df = |n: &str| dcols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (dn_f, dd_f, dl_f, du_f) = (df("RDB$FIELD_NAME")?, df("RDB$DIMENSION")?, df("RDB$LOWER_BOUND")?, df("RDB$UPPER_BOUND")?);
+    let mut dims: Vec<(i64, i32, i32)> = Vec::new();
+    walk_rows(file, page_size, 21, d_descs, |vals| {
+        if text(vals.get(dn_f)).as_deref() != Some(source.as_str()) {
+            return;
+        }
+        let int = |i: usize| match vals.get(i) {
+            Some(Value::Int(n)) => *n,
+            _ => 0,
+        };
+        dims.push((int(dd_f), int(dl_f) as i32, int(du_f) as i32));
+    });
+    dims.sort_by_key(|d| d.0);
+    if dims.len() != ndims as usize {
+        return None;
+    }
+    // RDB$FIELD_TYPE -> the element's dsc dtype, with the stored length
+    let (dtype, length) = match ftype {
+        7 => (crate::format::dtype::SHORT, 2u16),
+        8 => (crate::format::dtype::LONG, 4),
+        16 => (crate::format::dtype::INT64, 8),
+        10 => (crate::format::dtype::REAL, 4),
+        27 => (crate::format::dtype::DOUBLE, 8),
+        12 => (crate::format::dtype::SQL_DATE, 4),
+        13 => (crate::format::dtype::SQL_TIME, 4),
+        35 => (crate::format::dtype::TIMESTAMP, 8),
+        14 => (crate::format::dtype::TEXT, flen as u16),
+        37 => (crate::format::dtype::VARYING, flen as u16 + 2),
+        _ => return None,
+    };
+    Some(ArrayShape { dtype, length, scale: fscale as i8, sub_type: fsub as i16, dims: dims.into_iter().map(|d| (d.1, d.2)).collect() })
+}
+
 /// Whether a format contains a COMPUTED field: a descriptor at offset 0
 /// with a real type. No stored field can live at offset 0 (the null
 /// flags do), and a DROPPED-field placeholder there is all-zero - a
@@ -933,6 +1057,11 @@ pub fn alter_table_add_column(
     table: &str,
     col: &ColumnDef,
 ) -> Result<(), String> {
+    // ARRAY columns are taken at CREATE TABLE only: an ALTER would have to
+    // write the dimension rows too, and today it does not (recorded)
+    if !col.dims.is_empty() {
+        return Err("an ARRAY column can only be declared at CREATE TABLE".into());
+    }
     let table = table.trim().to_ascii_uppercase();
     let rel = crate::resolve_relation(file, page_size, &table)
         .ok_or_else(|| format!("table {} not found", table))?;
@@ -970,7 +1099,7 @@ pub fn alter_table_add_column(
         .zip(cur_descs.iter())
         .map(|((dt, l, s, st), d)| (dt, l, s, st, d.offset == 0 && d.length != 0))
         .collect();
-    let (dt, l, s, st) = col_field(col.dtype, col.length, col.scale, col.sub_type);
+    let (dt, l, s, st) = col_field_of(col);
     fields.push((dt, l, s, st, col.computed.is_some()));
     let new_descs = compute_format_mixed(&fields);
     if new_descs.len() != fields.len() {
@@ -1305,7 +1434,7 @@ fn reformat_for_retype(
         .zip(cur_descs.iter())
         .map(|((dt, l, s, st), d)| (dt, l, s, st, d.offset == 0 && d.length != 0))
         .collect();
-    let (dt, l, s, st) = col_field(new_col.dtype, new_col.length, new_col.scale, new_col.sub_type);
+    let (dt, l, s, st) = col_field_of(new_col);
     for fid in fids {
         let f = fields
             .get_mut(*fid)
@@ -2223,6 +2352,11 @@ pub fn alter_table_alter_column_type(
     col_name: &str,
     new_col: &ColumnDef,
 ) -> Result<(), String> {
+    // ARRAY columns are taken at CREATE TABLE only: an ALTER would have to
+    // write the dimension rows too, and today it does not (recorded)
+    if !new_col.dims.is_empty() {
+        return Err("an ARRAY column can only be declared at CREATE TABLE".into());
+    }
     let table = table.trim().to_ascii_uppercase();
     let col_up = col_name.trim().trim_matches('"').to_ascii_uppercase();
     let rel = crate::resolve_relation(file, page_size, &table)
@@ -2273,7 +2407,7 @@ pub fn alter_table_alter_column_type(
         .zip(cur_descs.iter())
         .map(|((dt, l, s, st), d)| (dt, l, s, st, d.offset == 0 && d.length != 0))
         .collect();
-    let (dt, l, s, st) = col_field(new_col.dtype, new_col.length, new_col.scale, new_col.sub_type);
+    let (dt, l, s, st) = col_field_of(new_col);
     fields[fid] = (dt, l, s, st, false);
     let new_descs = compute_format_mixed(&fields);
 
@@ -3120,7 +3254,7 @@ pub fn create_table(
     let fields: Vec<(u8, u16, i8, i16, bool)> = cols
         .iter()
         .map(|c| {
-            let (dt, l, s, st) = col_field(c.dtype, c.length, c.scale, c.sub_type);
+            let (dt, l, s, st) = col_field_of(c);
             (dt, l, s, st, c.computed.is_some())
         })
         .collect();
@@ -3293,6 +3427,9 @@ pub fn create_table(
             vals.push(("RDB$CHARACTER_LENGTH", SysVal::I(cl as i64)));
             vals.push(("RDB$COLLATION_ID", SysVal::I(0)));
         }
+        if !c.dims.is_empty() {
+            vals.push(("RDB$DIMENSIONS", SysVal::I(c.dims.len() as i64)));
+        }
         // a computed field: the verbatim `(expr)` source, the compiled
         // BLR, and the result type's precision (source before value, the
         // DEFAULT blob order). The blobs belong to RDB$FIELDS (rel 2)
@@ -3316,6 +3453,22 @@ pub fn create_table(
             vals.push(("RDB$FIELD_PRECISION", SysVal::I(p as i64)));
         }
         sys_insert(file, page_size, "RDB$FIELDS", 2, &vals)?;
+        // an ARRAY column's bounds, one RDB$FIELD_DIMENSIONS row per dimension
+        for (dim, (lo, hi)) in c.dims.iter().enumerate() {
+            sys_insert(
+                file,
+                page_size,
+                "RDB$FIELD_DIMENSIONS",
+                21,
+                &[
+                    ("RDB$FIELD_NAME", SysVal::S(source)),
+                    ("RDB$DIMENSION", SysVal::I(dim as i64)),
+                    ("RDB$LOWER_BOUND", SysVal::I(*lo as i64)),
+                    ("RDB$UPPER_BOUND", SysVal::I(*hi as i64)),
+                    ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
+                ],
+            )?;
+        }
     }
     for (i, c) in cols.iter().enumerate() {
         let (source, is_domain, ..) = &src_meta[i];

@@ -33,6 +33,9 @@ pub mod dtype {
     pub const SQL_TIME: u8 = 15;
     pub const TIMESTAMP: u8 = 16;
     pub const BLOB: u8 = 17;
+    /// an ARRAY column: the record holds the array blob's id (8 bytes,
+    /// aligned like a long - align.h type_alignments[dtype_array]; dsc_pub.h dtype_array 18)
+    pub const ARRAY: u8 = 18;
     pub const INT64: u8 = 19;
     pub const BOOLEAN: u8 = 21;
     pub const DEC64: u8 = 22;
@@ -419,7 +422,7 @@ pub fn decode_field(image: &[u8], desc: &Descriptor, index: usize) -> Value {
         dtype::SQL_DATE => Value::Date(u32_at(f, 0) as i32),
         dtype::SQL_TIME => Value::Time(u32_at(f, 0)),
         dtype::TIMESTAMP => Value::Timestamp(u32_at(f, 0) as i32, u32_at(f, 4)),
-        dtype::BLOB | dtype::QUAD => {
+        dtype::BLOB | dtype::QUAD | dtype::ARRAY => {
             // bid (RecordNumber.h:63-71, little-endian branch):
             // u16 relation, u8 reserved, u8 number_up, u32 number
             let rel = u16_at(f, 0);

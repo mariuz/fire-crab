@@ -186,7 +186,7 @@ max_segment pieces) — when the framed length fits; the client then serves
 info / seek / get_segment from its copy (the gate's inline pass: wire
 opens fall away, the answers are the engine's line for line).
 
-**Still absent:** `op_slice` (arrays). `op_info_transaction` answers only `isc_info_tra_id`. A text blob
+**Still absent:** nothing on the protocol list; see the array tails. `op_info_transaction` answers only `isc_info_tra_id`. A text blob
 is stored in the database charset (UTF8) with no bpb transliteration.
 
 ### D. Converted, not wired — MERGE executor DONE (2026-08-20)
@@ -488,9 +488,31 @@ pointer-page and TIP page numbers is the next step when it dominates.
   stays clear; a wrong password is `isc_login`). The engine takes neither
   a Legacy_Auth client (its `AuthServer` is Srp256) nor compression (its
   `WireCompression` is off) — those cells are fc-only, recorded.
-- **NEXT**: `op_slice` (arrays — a programme: ARRAY columns in DDL,
-  RDB$FIELD_DIMENSIONS, the array blob (InternalArrayDesc + data), the
-  SDL subset `gen_sdl` emits, op_get_slice / op_put_slice). (MERGE `RETURNING` / `NOT MATCHED BY SOURCE`, `op_info_blob`
+- **ARRAYS DONE (2026-08-21, `serve-real-arrays` 16, client
+  `qa/c/arrays.c`):** `<type> [l:u, …]` at CREATE TABLE (RDB$FIELDS
+  RDB$DIMENSIONS + RDB$FIELD_DIMENSIONS rows, the record field
+  `dtype_array` 18 = an 8-byte array-blob id, described SQL_ARRAY); the
+  array blob as `store_array` writes it (a stream blob: InternalArrayDesc
+  16 + 24/dim, then the elements row-major); op_put_slice over a zero id
+  makes a temp array the row's store materialises like a temp blob;
+  op_get_slice reads the stored blob through the header's strides, the
+  slice named by the SDL `gen_sdl` emits (element struct, relation,
+  field, a do-loop per dimension, the scalar's variables) and the
+  elements xdr'd by type. Laws probed: a temp array cannot be read before
+  its row is stored (`invalid BLOB ID`); unset elements of a partial put
+  are zero; out-of-bounds subscripts are `isc_ss_out_of_bounds`, a short
+  buffer `isc_out_of_bounds`. The engine reads fc's arrays, including a
+  table fc's own DDL created. **Recorded boundaries:** element types
+  SMALLINT/INTEGER/BIGINT/FLOAT/DOUBLE/DATE/TIME/TIMESTAMP only (text and
+  NUMERIC elements refuse; arrays of domains refuse); an SDL whose
+  element type differs from the stored one refuses (`isc_invalid_sdl`)
+  where the engine converts; ARRAY columns only at CREATE TABLE (ALTER
+  ADD refuses); `isc_array_lookup_bounds` (the client's catalog query
+  through `system.rdb$sql.parse_unqualified_names`) is outside fc's SQL
+  surface — clients must build their descriptors.
+- **NEXT**: the recorded array tails (text/NUMERIC elements, element
+  conversion, ALTER ADD); `op_inline_blob` for the remaining singleton
+  path; `system.rdb$sql.parse_unqualified_names`. (MERGE `RETURNING` / `NOT MATCHED BY SOURCE`, `op_info_blob`
   / `op_seek_blob`, the ordered JOIN fetch streaming, the RIGHT/FULL
   hash, the bulk index build, the cleanup — all done 2026-08-21.)
 - **D, the MERGE executor** — the BLR is already compiled and tested;

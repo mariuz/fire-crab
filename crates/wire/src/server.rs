@@ -100,6 +100,12 @@ const OP_PING: i32 = 93;
 /// transact_request)
 const OP_TRANSACT: i32 = 79;
 const OP_TRANSACT_RESPONSE: i32 = 80;
+/// op_get_slice (58) / op_put_slice (59) / op_slice (60): the ARRAY API -
+/// isc_array_get_slice / put_slice over an array blob, the slice named by
+/// SDL (slice description language)
+const OP_GET_SLICE: i32 = 58;
+const OP_PUT_SLICE: i32 = 59;
+const OP_SLICE: i32 = 60;
 /// isc_batch_blob_id: "Unknown blob ID @1 in the batch message"
 const GDS_BATCH_BLOB_ID: i32 = 335545197;
 const OP_BATCH_CANCEL: i32 = 109;
@@ -273,6 +279,351 @@ fn put_blob_segment(tb: &mut TempBlob, data: &[u8]) {
     } else {
         tb.segments.push(data.to_vec());
     }
+}
+
+// ------------------------------------------------------------ ARRAYS ------
+// An ARRAY column holds the id of an ARRAY BLOB: a stream blob whose
+// content is `Ods::InternalArrayDesc` (16 bytes + 24 per dimension: the
+// element descriptor, the dimension's stride, lower and upper bound) and
+// then the elements, row-major, each `iad_element_length` bytes in the
+// engine's own memory form (blb.cpp store_array / get_array). The client
+// names a slice with SDL - `gen_sdl` (yvalve/array.cpp) emits one shape:
+// version, the element struct, the relation and field, one `do` loop per
+// dimension (do1 when the lower bound is 1, do2 with an explicit lower),
+// `element 1 scalar 0 <dims> variable...`, eoc - and the slice buffer is
+// filled in loop order. op_get_slice answers the elements (op_slice:
+// length, then each element xdr'd by type - common/xdr.cpp xdr_datum);
+// op_put_slice over a zero id makes a TEMPORARY array the row's store
+// then materialises exactly as a temp blob (blb::move -> store_array).
+
+/// The array blob's header, `Ods::InternalArrayDesc` (ods.h:1044)
+#[derive(Clone, Debug)]
+struct ArrayDesc {
+    /// the element's dsc: dtype, scale, length, sub_type
+    dtype: u8,
+    scale: i8,
+    elem_len: u16,
+    sub_type: i16,
+    /// per dimension: (stride in elements, lower, upper)
+    dims: Vec<(u32, i32, i32)>,
+}
+
+impl ArrayDesc {
+    /// From the column's catalog shape (DdlNodes.epp getArrayDesc): the
+    /// last dimension varies fastest - its stride is 1
+    fn from_shape(sh: &fire_crab_ods::ddl::ArrayShape) -> ArrayDesc {
+        let mut dims: Vec<(u32, i32, i32)> = sh.dims.iter().map(|&(lo, hi)| (0u32, lo, hi)).collect();
+        let mut count: u32 = 1;
+        for d in dims.iter_mut().rev() {
+            d.0 = count;
+            count *= (d.2 - d.1 + 1).max(0) as u32;
+        }
+        ArrayDesc { dtype: sh.dtype, scale: sh.scale, elem_len: sh.length, sub_type: sh.sub_type, dims }
+    }
+    fn count(&self) -> u32 {
+        self.dims.iter().map(|d| (d.2 - d.1 + 1).max(0) as u32).product()
+    }
+    fn header_len(&self) -> usize {
+        16 + 24 * self.dims.len().max(1)
+    }
+    /// The 16 + 24n header bytes as the engine writes them
+    fn encode(&self) -> Vec<u8> {
+        let mut h = Vec::with_capacity(self.header_len());
+        h.push(1); // iad_version (IAD_VERSION_1)
+        h.push(self.dims.len() as u8);
+        h.extend_from_slice(&1u16.to_le_bytes()); // iad_struct_count
+        h.extend_from_slice(&self.elem_len.to_le_bytes());
+        h.extend_from_slice(&(self.header_len() as u16).to_le_bytes());
+        h.extend_from_slice(&self.count().to_le_bytes());
+        h.extend_from_slice(&(self.count() * u32::from(self.elem_len)).to_le_bytes());
+        for (i, (stride, lo, hi)) in self.dims.iter().enumerate() {
+            // iad_desc: the element descriptor in the FIRST repeat, zeroed
+            // in the others (the engine copies tfb_desc into iad_rpt[0])
+            if i == 0 {
+                h.push(self.dtype);
+                h.push(self.scale as u8);
+                h.extend_from_slice(&self.elem_len.to_le_bytes());
+                h.extend_from_slice(&self.sub_type.to_le_bytes());
+                h.extend_from_slice(&0u16.to_le_bytes()); // dsc_flags
+                h.extend_from_slice(&0u32.to_le_bytes()); // dsc_address
+            } else {
+                h.extend_from_slice(&[0u8; 12]);
+            }
+            h.extend_from_slice(&stride.to_le_bytes());
+            h.extend_from_slice(&lo.to_le_bytes());
+            h.extend_from_slice(&hi.to_le_bytes());
+        }
+        h
+    }
+    /// Parse a stored array blob: the header, and the data after it
+    fn decode(content: &[u8]) -> Option<(ArrayDesc, &[u8])> {
+        if content.len() < 40 || content[0] != 1 {
+            return None;
+        }
+        let ndims = content[1] as usize;
+        let elem_len = u16::from_le_bytes([content[4], content[5]]);
+        let hlen = u16::from_le_bytes([content[6], content[7]]) as usize;
+        if hlen < 16 + 24 * ndims.max(1) || content.len() < hlen {
+            return None;
+        }
+        let dtype = content[16];
+        let scale = content[17] as i8;
+        let sub_type = i16::from_le_bytes([content[20], content[21]]);
+        let mut dims = Vec::with_capacity(ndims);
+        for i in 0..ndims {
+            let at = 16 + 24 * i;
+            let stride = u32::from_le_bytes(content[at + 12..at + 16].try_into().ok()?);
+            let lo = i32::from_le_bytes(content[at + 16..at + 20].try_into().ok()?);
+            let hi = i32::from_le_bytes(content[at + 20..at + 24].try_into().ok()?);
+            dims.push((stride, lo, hi));
+        }
+        Some((ArrayDesc { dtype, scale, elem_len, sub_type, dims }, &content[hlen..]))
+    }
+    /// The element offset of a subscript vector (SDL_compute_subscript)
+    fn subscript(&self, subs: &[i32]) -> Option<usize> {
+        if subs.len() != self.dims.len() {
+            return None;
+        }
+        let mut off = 0usize;
+        for (&n, &(stride, lo, hi)) in subs.iter().zip(&self.dims) {
+            if n < lo || n > hi {
+                return None;
+            }
+            off += (n - lo) as usize * stride as usize;
+        }
+        Some(off)
+    }
+}
+
+/// The SDL subset the clients' `gen_sdl` emits, parsed: the element type
+/// it declares, the relation and field, the loops (variable, lower,
+/// upper) outermost first, and the subscript's variable order
+struct Sdl {
+    dtype: u8,
+    elem_len: u16,
+    scale: i8,
+    relation: String,
+    field: String,
+    loops: Vec<(u8, i64, i64)>,
+    subs: Vec<u8>,
+}
+
+fn parse_sdl(b: &[u8]) -> Option<Sdl> {
+    let mut i = 0usize;
+    if *b.first()? != 1 {
+        return None; // isc_sdl_version1
+    }
+    i += 1;
+    let mut out = Sdl { dtype: 0, elem_len: 0, scale: 0, relation: String::new(), field: String::new(), loops: Vec::new(), subs: Vec::new() };
+    // an SDL integer literal
+    fn lit(b: &[u8], i: &mut usize) -> Option<i64> {
+        let op = *b.get(*i)?;
+        *i += 1;
+        Some(match op {
+            9 => {
+                let v = b[*i] as i8 as i64;
+                *i += 1;
+                v
+            }
+            10 => {
+                let v = i16::from_le_bytes([*b.get(*i)?, *b.get(*i + 1)?]) as i64;
+                *i += 2;
+                v
+            }
+            11 => {
+                let v = i32::from_le_bytes([*b.get(*i)?, *b.get(*i + 1)?, *b.get(*i + 2)?, *b.get(*i + 3)?]) as i64;
+                *i += 4;
+                v
+            }
+            _ => return None,
+        })
+    }
+    loop {
+        let op = *b.get(i)?;
+        i += 1;
+        match op {
+            255 => break, // isc_sdl_eoc
+            6 => {
+                // isc_sdl_struct: count 1, then the element's blr type
+                if *b.get(i)? != 1 {
+                    return None;
+                }
+                i += 1;
+                let blr = *b.get(i)?;
+                i += 1;
+                use fire_crab_ods::format::dtype;
+                let (dt, len) = match blr {
+                    7 => (dtype::SHORT, 2),
+                    8 => (dtype::LONG, 4),
+                    16 => (dtype::INT64, 8),
+                    10 => (dtype::REAL, 4),
+                    27 | 11 => (dtype::DOUBLE, 8),
+                    12 => (dtype::SQL_DATE, 4),
+                    13 => (dtype::SQL_TIME, 4),
+                    35 => (dtype::TIMESTAMP, 8),
+                    // text elements (blr_text/cstring/varying, and the
+                    // charset-carrying 2-variants) are not taken: a VARYING's
+                    // wire form is per-element variable and a refusal keeps
+                    // the stream whole (isc_invalid_sdl), where a guess would
+                    // desync it
+                    _ => return None,
+                };
+                out.dtype = dt;
+                out.elem_len = len;
+                match blr {
+                    7 | 8 | 16 | 9 | 26 => {
+                        out.scale = *b.get(i)? as i8;
+                        i += 1;
+                    }
+                    _ => {}
+                }
+            }
+            2 | 4 | 37 => {
+                // isc_sdl_relation / isc_sdl_field / isc_sdl_schema: a counted name
+                let n = *b.get(i)? as usize;
+                i += 1;
+                let name = String::from_utf8_lossy(b.get(i..i + n)?).into_owned();
+                i += n;
+                if op == 2 {
+                    out.relation = name;
+                } else if op == 4 {
+                    out.field = name;
+                }
+            }
+            3 | 5 => {
+                i += 2; // isc_sdl_rid / isc_sdl_fid: a word
+            }
+            35 | 34 => {
+                // isc_sdl_do1 (var, upper) / isc_sdl_do2 (var, lower, upper)
+                let var = *b.get(i)?;
+                i += 1;
+                let lower = if op == 34 { lit(b, &mut i)? } else { 1 };
+                let upper = lit(b, &mut i)?;
+                out.loops.push((var, lower, upper));
+            }
+            33 => return None, // isc_sdl_do3 (with an increment): not emitted by gen_sdl
+            36 => {
+                // isc_sdl_element 1, then isc_sdl_scalar 0 <count> variables
+                if *b.get(i)? != 1 {
+                    return None;
+                }
+                i += 1;
+                if *b.get(i)? != 8 {
+                    return None; // isc_sdl_scalar
+                }
+                i += 1;
+                if *b.get(i)? != 0 {
+                    return None;
+                }
+                i += 1;
+                let count = *b.get(i)? as usize;
+                i += 1;
+                for _ in 0..count {
+                    if *b.get(i)? != 7 {
+                        return None; // isc_sdl_variable
+                    }
+                    i += 1;
+                    out.subs.push(*b.get(i)?);
+                    i += 1;
+                }
+            }
+            _ => return None,
+        }
+    }
+    if out.loops.is_empty() || out.subs.len() != out.loops.len() {
+        return None;
+    }
+    Some(out)
+}
+
+/// Every subscript vector of the slice, in the SDL's loop order (the
+/// outermost loop first) - the order the slice buffer is filled in
+fn sdl_subscripts(sdl: &Sdl) -> Vec<Vec<i32>> {
+    let mut out = Vec::new();
+    let n = sdl.loops.len();
+    let mut vals: Vec<i64> = sdl.loops.iter().map(|l| l.1).collect();
+    'outer: loop {
+        let mut subs = Vec::with_capacity(n);
+        for &v in &sdl.subs {
+            let k = sdl.loops.iter().position(|l| l.0 == v);
+            match k {
+                Some(k) => subs.push(vals[k] as i32),
+                None => return out,
+            }
+        }
+        out.push(subs);
+        // advance the innermost loop, carrying outward
+        let mut d = n;
+        loop {
+            if d == 0 {
+                break 'outer;
+            }
+            d -= 1;
+            vals[d] += 1;
+            if vals[d] <= sdl.loops[d].2 {
+                break;
+            }
+            vals[d] = sdl.loops[d].1;
+        }
+        if out.len() > 1 << 24 {
+            break;
+        }
+    }
+    out
+}
+
+/// One element's wire form (xdr_datum): shorts and longs as 4-byte
+/// big-endian ints, int64 and double 8, float 4, text raw padded to 4
+fn xdr_element(w: &mut Vec<u8>, dtype: u8, bytes: &[u8]) {
+    use fire_crab_ods::format::dtype;
+    match dtype {
+        dtype::SHORT => w.extend_from_slice(&(i16::from_le_bytes([bytes[0], bytes[1]]) as i32).to_be_bytes()),
+        dtype::LONG | dtype::SQL_DATE | dtype::SQL_TIME => {
+            w.extend_from_slice(&u32::from_le_bytes(bytes[0..4].try_into().unwrap()).to_be_bytes())
+        }
+        dtype::REAL => w.extend_from_slice(&u32::from_le_bytes(bytes[0..4].try_into().unwrap()).to_be_bytes()),
+        dtype::INT64 | dtype::DOUBLE => w.extend_from_slice(&u64::from_le_bytes(bytes[0..8].try_into().unwrap()).to_be_bytes()),
+        dtype::TIMESTAMP => {
+            w.extend_from_slice(&u32::from_le_bytes(bytes[0..4].try_into().unwrap()).to_be_bytes());
+            w.extend_from_slice(&u32::from_le_bytes(bytes[4..8].try_into().unwrap()).to_be_bytes());
+        }
+        _ => {
+            w.extend_from_slice(bytes);
+            let pad = (4 - bytes.len() % 4) % 4;
+            w.extend(std::iter::repeat(0u8).take(pad));
+        }
+    }
+}
+
+/// The inverse of [xdr_element]: one element's memory form from the wire
+fn unxdr_element(b: &[u8], at: &mut usize, dtype: u8, elem_len: usize) -> Option<Vec<u8>> {
+    use fire_crab_ods::format::dtype;
+    let take = |at: &mut usize, n: usize| -> Option<&[u8]> {
+        let s = b.get(*at..*at + n)?;
+        *at += n;
+        Some(s)
+    };
+    Some(match dtype {
+        dtype::SHORT => {
+            let v = i32::from_be_bytes(take(at, 4)?.try_into().unwrap());
+            (v as i16).to_le_bytes().to_vec()
+        }
+        dtype::LONG | dtype::SQL_DATE | dtype::SQL_TIME | dtype::REAL => {
+            u32::from_be_bytes(take(at, 4)?.try_into().unwrap()).to_le_bytes().to_vec()
+        }
+        dtype::INT64 | dtype::DOUBLE => u64::from_be_bytes(take(at, 8)?.try_into().unwrap()).to_le_bytes().to_vec(),
+        dtype::TIMESTAMP => {
+            let mut v = u32::from_be_bytes(take(at, 4)?.try_into().unwrap()).to_le_bytes().to_vec();
+            v.extend_from_slice(&u32::from_be_bytes(take(at, 4)?.try_into().unwrap()).to_le_bytes());
+            v
+        }
+        _ => {
+            let v = take(at, elem_len)?.to_vec();
+            let pad = (4 - elem_len % 4) % 4;
+            take(at, pad)?;
+            v
+        }
+    })
 }
 
 /// A blob open for READING over the wire: the engine's `blb` as the
@@ -4842,6 +5193,7 @@ fn restore_column_def(
         sub_type: c.sub_type,
         precision,
         char_len,
+        dims: Vec::new(),
         not_null: c.not_null,
         not_null_constraint: c.not_null,
         default: None,
@@ -9767,6 +10119,7 @@ fn wire_for(d: &Descriptor) -> (Wire, i32, i32, i32, i32) {
         // blob: the 8-byte id travels, content via the blob ops; the
         // describe carries the sub_type so clients know text vs binary
         dtype::BLOB => (Wire::Blob, 520, 8, 0, d.sub_type as i32), // SQL_BLOB
+        dtype::ARRAY => (Wire::Blob, 540, 8, 0, 0), // SQL_ARRAY: the array blob's id
         dtype::INT128 => (Wire::Int128, 32752, 16, scale, d.sub_type as i32), // SQL_INT128
         dtype::SQL_TIME_TZ => (Wire::TimeTz, 32756, 8, 0, 0), // SQL_TIME_TZ
         dtype::TIMESTAMP_TZ => (Wire::TimestampTz, 32754, 12, 0, 0), // SQL_TIMESTAMP_TZ
@@ -12131,6 +12484,41 @@ fn parse_column_def(item: &str) -> Option<(fire_crab_ods::ddl::ColumnDef, Option
         key = Some((cname, primary));
         ty = head;
     }
+    // an ARRAY column: `<type> [l:u, l:u ...]` - the bounds after the
+    // type (a bare `n` is `1:n`), before the constraints just stripped
+    let mut dims: Vec<(i32, i32)> = Vec::new();
+    if let Some(open) = ty.find('[') {
+        let close = ty.rfind(']')?;
+        if close < open {
+            return None;
+        }
+        for part in ty[open + 1..close].split(',') {
+            let part = part.trim();
+            if part.is_empty() {
+                return None;
+            }
+            let (lo, hi) = match part.split_once(':') {
+                Some((l, h)) => (l.trim().parse::<i32>().ok()?, h.trim().parse::<i32>().ok()?),
+                None => (1, part.parse::<i32>().ok()?),
+            };
+            if hi < lo {
+                return None;
+            }
+            dims.push((lo, hi));
+        }
+        if dims.is_empty() || dims.len() > 16 {
+            return None;
+        }
+        // a cap the engine does not have: 16M elements
+        let mut total: u64 = 1;
+        for (lo, hi) in &dims {
+            total = total.saturating_mul((*hi as i64 - *lo as i64 + 1) as u64);
+        }
+        if total > 16 << 20 {
+            return None;
+        }
+        ty = format!("{} {}", ty[..open].trim_end(), ty[close + 1..].trim_start()).trim().to_string();
+    }
     let col = |field_type: i16, dt: u8, length: u16, scale: i8, sub_type: i16, char_len: Option<u16>| {
         Some(fire_crab_ods::ddl::ColumnDef {
             name: name.to_ascii_uppercase(),
@@ -12140,6 +12528,7 @@ fn parse_column_def(item: &str) -> Option<(fire_crab_ods::ddl::ColumnDef, Option
             scale,
             sub_type,
             char_len,
+            dims: dims.clone(),
             // the plain exact-int family carries RDB$FIELD_PRECISION 0
             // (probed); NUMERIC/DECIMAL come through numeric_col with
             // their declared p; every other type stays NULL
@@ -12199,6 +12588,11 @@ fn parse_column_def(item: &str) -> Option<(fire_crab_ods::ddl::ColumnDef, Option
         // an unrecognised single-identifier type with no arguments is taken
         // as a user domain reference; its type is a placeholder here and is
         // resolved from the domain's RDB$FIELDS row at create_table
+        // an ARRAY of a domain is not grammar the engine takes, and an
+        // ARRAY of NUMERIC/DECIMAL is not taken here (the element scale
+        // would need the numeric path): both refuse rather than make a
+        // scalar column
+        (_, _) if !dims.is_empty() && !matches!(base.as_str(), "SMALLINT" | "INTEGER" | "INT" | "BIGINT" | "FLOAT" | "DOUBLE PRECISION" | "DATE" | "TIME" | "TIMESTAMP") => None,
         (dom, []) if ident_ok(dom) => Some(fire_crab_ods::ddl::ColumnDef {
             name: name.to_ascii_uppercase(),
             field_type: 0,
@@ -12206,6 +12600,7 @@ fn parse_column_def(item: &str) -> Option<(fire_crab_ods::ddl::ColumnDef, Option
             length: 0,
             scale: 0,
             sub_type: 0,
+            dims: Vec::new(),
             char_len: None,
             precision: None, // the domain's own row carries it
             not_null,
@@ -12303,6 +12698,7 @@ fn numeric_col(
         length,
         scale: -(s as i8),
         sub_type,
+        dims: Vec::new(),
         char_len: None,
         // a NUMERIC/DECIMAL column's RDB$FIELD_PRECISION is its declared p
         precision: Some(p as i16),
@@ -14742,6 +15138,7 @@ fn plan_create_table(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
                 sub_type: 0,
                 char_len: None,
                 precision: None, // computed: ComputedCol carries it
+                dims: Vec::new(),
                 not_null: false,
                 not_null_constraint: false,
                 default: None,
@@ -16568,6 +16965,7 @@ fn plan_alter_table_add(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<D
             sub_type: 0,
             char_len: None,
             precision: None, // computed: ComputedCol carries it
+            dims: Vec::new(),
             not_null: false,
             not_null_constraint: false,
             default: None,
@@ -17987,19 +18385,22 @@ fn plan_insert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
     // evaluate refuses the whole statement - never bypass
     let checks = timed("plan:checks", || {
         check_predicates(db, table, &columns, descs, DmlGuard::Insert)
-    })?;
+    });
+    let checks = checks?;
     let descs = descs.clone();
     let not_null = timed("plan:not-null", || not_null_fids(db, table));
     // the FKs on this table: the stored row must reference existing
     // parent keys; an unresolvable FK catalog refuses, never bypasses
-    let (fk_refs, _) = timed("plan:fks", || fk_partners(db, table, &columns))?;
+    let fk = timed("plan:fks", || fk_partners(db, table, &columns));
+    let (fk_refs, _) = fk?;
     // the omitted columns' DEFAULTs - an unevaluatable one (a session
     // id, an expression) refuses rather than writing a wrong NULL.
     // "Omitted" is `named`, not `listed`: a DEFAULT-keyword column asks
     // for exactly this treatment, and `INSERT INTO T DEFAULT VALUES`
     // names nothing at all, so every non-computed column is filled.
     let default_fields =
-        timed("plan:defaults", || insert_defaults(db, table, &columns, &descs, &named))?;
+        timed("plan:defaults", || insert_defaults(db, table, &columns, &descs, &named));
+    let default_fields = default_fields?;
     Some((
         Plan::Insert {
             rel,
@@ -19039,7 +19440,8 @@ fn param_target_ok(d: &Descriptor) -> bool {
             | dtype::SQL_TIME
             | dtype::TIMESTAMP
             | dtype::BOOLEAN
-            | dtype::BLOB // a blr_quad: a temp blob id materialised at the store or the update
+            | dtype::BLOB // a blr_quad: a temp blob id materialised at the store
+            | dtype::ARRAY // a temp array (op_put_slice) materialised the same way
     )
 }
 
@@ -19095,7 +19497,7 @@ fn encode_wire_value(d: &Descriptor, wp: &WireParam) -> Option<Option<Vec<u8>>> 
     Some(match wp {
         WireParam::Null => None,
         WireParam::BlobId(b) => Some(match d.dtype {
-            dtype::BLOB => b.to_vec(),
+            dtype::BLOB | dtype::ARRAY => b.to_vec(),
             _ => return None,
         }),
         WireParam::Int(v, ws) => Some(match d.dtype {
@@ -21354,7 +21756,7 @@ fn execute_dml_collecting_inner(
                             // refusal (a blob id is 8 bytes, and written
                             // over a shorter column it would overwrite
                             // the neighbouring field)
-                            if d.dtype != dtype::BLOB {
+                            if d.dtype != dtype::BLOB && d.dtype != dtype::ARRAY {
                                 return Err("parameter type does not match its column".into());
                             }
                             blob_sets.push((*fid, *slot));
@@ -55688,6 +56090,175 @@ fn after_auth(
                         w.send(&mut s, &mut enc)?;
                     }
                     None => respond_error(&mut s, &mut enc, GDS_BAD_BLOB_ID)?,
+                }
+            }
+            x if x == OP_GET_SLICE || x == OP_PUT_SLICE => {
+                // p_slc: transaction, the array id (xdr_quad: the 8 bytes
+                // the row carries), the slice length in bytes, the SDL,
+                // the parameters (xdr_longs: a counted byte string of
+                // longs), then the slice itself (length, and for a put the
+                // elements xdr'd by type - empty for a get)
+                read_int(&mut s, &mut dec)?; // transaction
+                let id = read_n(&mut s, &mut dec, 8)?;
+                let slice_len = read_int(&mut s, &mut dec)?.max(0) as usize;
+                let sdl_bytes = read_wire_bytes(&mut s, &mut dec)?;
+                read_wire_bytes(&mut s, &mut dec)?; // parameters (unused by gen_sdl's shape)
+                let data_len = read_int(&mut s, &mut dec)?.max(0) as usize;
+                // the elements are xdr'd per the SDL's type: to read them the
+                // SDL must parse first; the byte count follows from it
+                let sdl = parse_sdl(&sdl_bytes);
+                let Some(sdl) = sdl else {
+                    // isc_invalid_sdl. A get (or a put with no data) is fully
+                    // read - answer and go on; a put's elements cannot be
+                    // consumed without the element layout - say so and close
+                    if std::env::var("FC_SRV_TRACE").is_ok() {
+                        eprintln!("[srv] op_slice: SDL not parsed: {:?}", sdl_bytes);
+                    }
+                    respond_error(&mut s, &mut enc, 335544456)?;
+                    if x == OP_PUT_SLICE && data_len > 0 {
+                        break;
+                    }
+                    continue;
+                };
+                let subs = sdl_subscripts(&sdl);
+                let wire_elem = |dtype: u8, elem_len: usize| -> usize {
+                    use fire_crab_ods::format::dtype;
+                    match dtype {
+                        dtype::SHORT | dtype::LONG | dtype::SQL_DATE | dtype::SQL_TIME | dtype::REAL => 4,
+                        dtype::INT64 | dtype::DOUBLE | dtype::TIMESTAMP => 8,
+                        _ => elem_len.div_ceil(4) * 4,
+                    }
+                };
+                let put_bytes = if x == OP_PUT_SLICE && data_len > 0 {
+                    // data_len is the slice's byte length in MEMORY form; the
+                    // wire carries `count` elements in xdr form
+                    let count = if sdl.elem_len > 0 { data_len / sdl.elem_len as usize } else { 0 };
+                    read_n(&mut s, &mut dec, count * wire_elem(sdl.dtype, sdl.elem_len as usize))?
+                } else {
+                    Vec::new()
+                };
+                let (rel, num) = decode_blob_id(&id);
+                if std::env::var("FC_SRV_TRACE").is_ok() {
+                    eprintln!(
+                        "[srv] op_{}_slice {}.{} id {}:{} slice_len {} loops {:?} ({} elements)",
+                        if x == OP_GET_SLICE { "get" } else { "put" }, sdl.relation, sdl.field, rel, num, slice_len, sdl.loops, subs.len()
+                    );
+                }
+                let Some(db) = database.as_mut() else {
+                    respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
+                    continue;
+                };
+                if x == OP_GET_SLICE {
+                    // the stored array: a permanent id's blob, or this
+                    // transaction's temp array (a put not yet stored)
+                    // a TEMP array (a put not yet stored) cannot be read back:
+                    // the engine answers invalid BLOB ID for it (probed) - only
+                    // a stored array's blob opens
+                    let content: Option<Vec<u8>> = if rel == 0 {
+                        None
+                    } else {
+                        fire_crab_blb::read_blob_content(&db.bytes(), db.page_size, rel, num)
+                    };
+                    let Some((desc, data)) = content.as_deref().and_then(ArrayDesc::decode) else {
+                        respond_error(&mut s, &mut enc, 335544329)?; // isc_bad_segstr_id
+                        continue;
+                    };
+                    let elen = desc.elem_len as usize;
+                    // the SDL's element type must be the stored one: the
+                    // engine converts (MOV_move per element), this server
+                    // refuses (isc_invalid_sdl) rather than ship the wrong
+                    // width and desync the client's decode - recorded
+                    if sdl.dtype != desc.dtype || sdl.elem_len as usize != elen {
+                        respond_error(&mut s, &mut enc, 335544456)?;
+                        continue;
+                    }
+                    // a subscript outside the array's bounds, or a slice the
+                    // client's buffer cannot hold: the engine's own errors
+                    if subs.iter().any(|sub| desc.subscript(sub).is_none()) {
+                        respond_error(&mut s, &mut enc, 335545028)?; // isc_ss_out_of_bounds
+                        continue;
+                    }
+                    if subs.len() * elen > slice_len {
+                        respond_error(&mut s, &mut enc, 335544457)?; // isc_out_of_bounds
+                        continue;
+                    }
+                    let mut out: Vec<u8> = Vec::new();
+                    let mut n = 0usize;
+                    for sub in &subs {
+                        let bytes: Vec<u8> = match desc.subscript(sub) {
+                            Some(off) if (off + 1) * elen <= data.len() => data[off * elen..(off + 1) * elen].to_vec(),
+                            _ => vec![0u8; elen], // beyond the stored data: zeros, as the engine answers
+                        };
+                        xdr_element(&mut out, desc.dtype, &bytes);
+                        n += 1;
+                    }
+                    // op_slice: the byte length delivered, then xdr_slice
+                    // (the same length again, then the elements)
+                    let mut w = W::default();
+                    w.int(OP_SLICE).int((n * elen) as i32).int((n * elen) as i32).raw(&out);
+                    w.send(&mut s, &mut enc)?;
+                } else {
+                    // a put: the column's shape from the catalog is the array
+                    // (the slice may cover part of it - the rest zeros)
+                    let shape = fire_crab_ods::ddl::array_shape(&db.bytes(), db.page_size, &sdl.relation, &sdl.field);
+                    let Some(shape) = shape else {
+                        respond_error(&mut s, &mut enc, 335544412)?; // isc_field_ref_err / unknown array field
+                        continue;
+                    };
+                    let desc = ArrayDesc::from_shape(&shape);
+                    let elen = desc.elem_len as usize;
+                    if sdl.dtype != desc.dtype || sdl.elem_len as usize != elen {
+                        respond_error(&mut s, &mut enc, 335544456)?; // isc_invalid_sdl: type differs (recorded)
+                        continue;
+                    }
+                    if subs.iter().any(|sub| desc.subscript(sub).is_none()) {
+                        respond_error(&mut s, &mut enc, 335545028)?; // isc_ss_out_of_bounds
+                        continue;
+                    }
+                    // a cap the engine does not have: an array past 256 MB of
+                    // elements is refused rather than allocated
+                    if desc.count() as usize * elen > 256 << 20 {
+                        respond_error(&mut s, &mut enc, 335544456)?;
+                        continue;
+                    }
+                    let mut data = vec![0u8; desc.count() as usize * elen];
+                    // an existing array (a put over a permanent or temp id)
+                    // starts from its content
+                    let existing: Option<Vec<u8>> = if rel == 0 && num != 0 {
+                        db.temp_blobs.get(&(num as u32)).map(|tb| tb.segments.concat())
+                    } else if rel != 0 {
+                        fire_crab_blb::read_blob_content(&db.bytes(), db.page_size, rel, num)
+                    } else {
+                        None
+                    };
+                    if let Some((_, old)) = existing.as_deref().and_then(ArrayDesc::decode) {
+                        let n = old.len().min(data.len());
+                        data[..n].copy_from_slice(&old[..n]);
+                    }
+                    let mut at = 0usize;
+                    for sub in &subs {
+                        let Some(bytes) = unxdr_element(&put_bytes, &mut at, sdl.dtype, sdl.elem_len as usize) else { break };
+                        if let Some(off) = desc.subscript(sub) {
+                            if (off + 1) * elen <= data.len() && bytes.len() == elen {
+                                data[off * elen..(off + 1) * elen].copy_from_slice(&bytes);
+                            }
+                        }
+                    }
+                    // the temp array: a stream blob of header + data, in the
+                    // puts store_array makes (the header, then <= 32 KB runs)
+                    let mut tb = TempBlob { stream: true, closed: true, ..TempBlob::default() };
+                    put_blob_segment(&mut tb, &desc.encode());
+                    for chunk in data.chunks(32768) {
+                        put_blob_segment(&mut tb, chunk);
+                    }
+                    db.next_temp_blob += 1;
+                    let temp = db.next_temp_blob;
+                    db.temp_blobs.insert(temp, tb);
+                    let new_id = encode_blob_id(0, u64::from(temp));
+                    // the response carries the array's id in p_resp_blob_id
+                    let mut w = W::default();
+                    w.int(OP_RESPONSE).int(0).raw(&new_id).int(0).int(0);
+                    w.send(&mut s, &mut enc)?;
                 }
             }
             x if x == OP_INFO_BLOB => {
