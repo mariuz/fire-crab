@@ -4132,6 +4132,43 @@ pub fn create_view(
     if crate::resolve_relation(file, page_size, &want).is_some() {
         return Err(format!("relation {} already exists", want));
     }
+    create_view_impl(file, page_size, name, view_blr, view_source, fields, contexts, None)
+}
+
+/// `ALTER VIEW` - the view's definition is replaced but its RELATION ID
+/// survives (probed: 129 -> 129), so the drop-and-repopulate reuses the
+/// old id. The fields, view relations and auto-domains are all fresh.
+pub fn alter_view(
+    file: &mut crate::Image,
+    page_size: usize,
+    name: &str,
+    view_blr: &[u8],
+    view_source: &str,
+    fields: &[ViewFieldSpec],
+    contexts: &[RestoredViewContext],
+) -> Result<(), String> {
+    let want = name.trim().trim_matches('"').to_ascii_uppercase();
+    let rel = crate::resolve_relation(file, page_size, &want)
+        .ok_or_else(|| format!("View {} not found", want))?;
+    if rel < 128 || !is_view(file, page_size, &want) {
+        return Err(format!("View {} not found", want));
+    }
+    let old_id = rel as i64;
+    drop_view(file, page_size, &want)?;
+    create_view_impl(file, page_size, name, view_blr, view_source, fields, contexts, Some(old_id))
+}
+
+fn create_view_impl(
+    file: &mut crate::Image,
+    page_size: usize,
+    name: &str,
+    view_blr: &[u8],
+    view_source: &str,
+    fields: &[ViewFieldSpec],
+    contexts: &[RestoredViewContext],
+    forced_id: Option<i64>,
+) -> Result<(), String> {
+    let want = name.trim().trim_matches('"').to_ascii_uppercase();
     let domain_base = next_domain_number(file, page_size)?;
     let mut auto_idx = 0u64;
     let mut restored: Vec<RestoredViewField> = Vec::with_capacity(fields.len());
@@ -4172,6 +4209,7 @@ pub fn create_view(
         &restored,
         contexts,
         Some((dbkey, &class, &default_class)),
+        forced_id,
     )
 }
 
@@ -4342,7 +4380,7 @@ pub fn restore_view(
     fields: &[RestoredViewField],
     contexts: &[RestoredViewContext],
 ) -> Result<(), String> {
-    restore_view_with(file, page_size, name, view_blr, view_source, fields, contexts, None)
+    restore_view_with(file, page_size, name, view_blr, view_source, fields, contexts, None, None)
 }
 
 /// [restore_view] with what a CREATE writes beyond a restore - the dbkey
@@ -4359,13 +4397,16 @@ fn restore_view_with(
     fields: &[RestoredViewField],
     contexts: &[RestoredViewContext],
     created: Option<(i64, &str, &str)>,
+    forced_id: Option<i64>,
 ) -> Result<(), String> {
     let name = name.trim().to_ascii_uppercase();
     let rels = list_relations(file, page_size);
     if rels.iter().any(|(_, n)| n.trim_end().eq_ignore_ascii_case(&name)) {
         return Err(format!("relation {} already exists", name));
     }
-    let rel_id = (rels.iter().map(|(id, _)| *id).max().unwrap_or(127).max(127) + 1) as i64;
+    // ALTER VIEW keeps the relation's id across the drop-and-repopulate;
+    // a fresh CREATE takes the next free id (max + 1).
+    let rel_id = forced_id.unwrap_or_else(|| (rels.iter().map(|(id, _)| *id).max().unwrap_or(127).max(127) + 1) as i64);
     // the format: each field's descriptor from its (already restored)
     // domain, offsets laid out the way the row would be
     let mut descs: Vec<Descriptor> = Vec::new();

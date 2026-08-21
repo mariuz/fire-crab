@@ -1592,6 +1592,22 @@ fn respond_ddl_meta(
     // (-607, "Invalid command") and a "-Table @1 does not exist" string
     // - four items, not the three the others carry.
     if lc.contains("not found") {
+        if let Plan::AlterView { name, .. } = plan {
+            // ALTER VIEW of a missing name: "unsuccessful metadata update /
+            // ALTER VIEW @1 failed / view @1 not found" (probed - no nested
+            // -607, three items).
+            let qn = format!("\"PUBLIC\".\"{}\"", name.trim().trim_matches('"').to_ascii_uppercase());
+            let mut w = W::default();
+            w.int(OP_RESPONSE).int(0).int(0).int(0).int(0);
+            w.int(1).int(GDS_NO_META_UPDATE)
+                .int(1).int(336397299) // isc_dsql_alter_view_failed
+                .int(2).bytes(qn.as_bytes())
+                .int(1).int(336068662) // view not found
+                .int(2).bytes(qn.as_bytes())
+                .int(0);
+            w.send(s, enc)?;
+            return Ok(true);
+        }
         if let Plan::DropView { name } = plan {
             // DROP VIEW of a missing name (or of a TABLE - probed): the
             // same nested -607 as DROP TABLE, with the view verbs
@@ -7189,6 +7205,15 @@ enum Plan {
         contexts: Vec<fire_crab_ods::ddl::RestoredViewContext>,
     },
     DropView { name: String },
+    /// `ALTER VIEW <name> AS <select>` - the view's definition is replaced
+    /// but its relation id survives (the ods alter_view reuses it).
+    AlterView {
+        name: String,
+        blr: Vec<u8>,
+        source: String,
+        fields: Vec<fire_crab_ods::ddl::ViewFieldSpec>,
+        contexts: Vec<fire_crab_ods::ddl::RestoredViewContext>,
+    },
     /// `RECREATE <kind> ...` = DROP the object if it exists (of the wrapped
     /// CREATE's kind), then run the CREATE. The CREATE is planned at prepare
     /// (so a bad definition refuses before anything is dropped, as the engine
@@ -16697,6 +16722,28 @@ fn plan_drop_view(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
     Some((Plan::DropView { name: unquote_ident(toks[2])? }, Vec::new()))
 }
 
+/// `ALTER VIEW <name> AS <select>` reuses the CREATE VIEW planner (same
+/// SELECT compilation) and turns its plan into an AlterView; a SELECT this
+/// server cannot compile keeps the generic refusal, as CREATE VIEW does.
+fn plan_alter_view(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor>)> {
+    let up = sql.trim_start().to_ascii_uppercase();
+    if find_word(&up, "ALTER", 0) != Some(0) {
+        return None;
+    }
+    let vk = find_word(&up, "VIEW", "ALTER".len())?;
+    if up["ALTER".len()..vk].trim() != "" {
+        return None;
+    }
+    let s = sql.trim_start();
+    let create_sql = format!("CREATE VIEW {}", s[vk + "VIEW".len()..].trim_start());
+    let (create, descs) = plan_create_view(&create_sql, db)?;
+    if let Plan::CreateView { name, blr, source, fields, contexts } = create {
+        Some((Plan::AlterView { name, blr, source, fields, contexts }, descs))
+    } else {
+        None
+    }
+}
+
 /// Parse `DROP FILTER <name>`.
 fn plan_drop_filter(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
     let s = sql.trim().trim_end_matches(';').trim();
@@ -22418,6 +22465,10 @@ fn execute_dml_collecting_inner(
         }
         Plan::CreateView { name, blr, source, fields, contexts } => {
             fire_crab_ods::ddl::create_view(&mut work, db.page_size, name, blr, source, fields, contexts)?;
+            (0, 0, 0)
+        }
+        Plan::AlterView { name, blr, source, fields, contexts } => {
+            fire_crab_ods::ddl::alter_view(&mut work, db.page_size, name, blr, source, fields, contexts)?;
             (0, 0, 0)
         }
         Plan::DropView { name } => {
@@ -35368,7 +35419,7 @@ fn describe_for(plan: &Plan, params: &[Descriptor], att: AttCs) -> Vec<u8> {
         | Plan::DropIndex { .. }
         | Plan::CreateSequence { .. } | Plan::DropSequence { .. }
         | Plan::CreateException { .. } | Plan::CreateProcedure { .. } | Plan::DropProcedure { .. } | Plan::DropException { .. }
-        | Plan::DeclareFilter { .. } | Plan::DropFilter { .. } | Plan::CreateView { .. } | Plan::DropView { .. } | Plan::Recreate(_)
+        | Plan::DeclareFilter { .. } | Plan::DropFilter { .. } | Plan::CreateView { .. } | Plan::DropView { .. } | Plan::Recreate(_) | Plan::AlterView { .. }
         | Plan::AlterTrigger { .. } | Plan::DropTrigger { .. } | Plan::CreateOrAlterTrigger { .. } | Plan::AlterProcedure { .. } | Plan::CreateOrAlterProcedure { .. }
         | Plan::CreateFunction { .. } | Plan::DropFunction { .. }
         | Plan::AlterException { .. } | Plan::CreateOrAlterException { .. }
@@ -35476,7 +35527,7 @@ fn stmt_type_of(plan: &Plan) -> i32 {
         | Plan::DropIndex { .. }
         | Plan::CreateSequence { .. } | Plan::DropSequence { .. }
         | Plan::CreateException { .. } | Plan::CreateProcedure { .. } | Plan::DropProcedure { .. } | Plan::DropException { .. }
-        | Plan::DeclareFilter { .. } | Plan::DropFilter { .. } | Plan::CreateView { .. } | Plan::DropView { .. } | Plan::Recreate(_)
+        | Plan::DeclareFilter { .. } | Plan::DropFilter { .. } | Plan::CreateView { .. } | Plan::DropView { .. } | Plan::Recreate(_) | Plan::AlterView { .. }
         | Plan::AlterTrigger { .. } | Plan::DropTrigger { .. } | Plan::CreateOrAlterTrigger { .. } | Plan::AlterProcedure { .. } | Plan::CreateOrAlterProcedure { .. }
         | Plan::CreateFunction { .. } | Plan::DropFunction { .. }
         | Plan::AlterException { .. } | Plan::CreateOrAlterException { .. }
@@ -36939,7 +36990,7 @@ fn emit_rows_inner(
         | Plan::DropIndex { .. }
         | Plan::CreateSequence { .. } | Plan::DropSequence { .. }
         | Plan::CreateException { .. } | Plan::CreateProcedure { .. } | Plan::DropProcedure { .. } | Plan::DropException { .. }
-        | Plan::DeclareFilter { .. } | Plan::DropFilter { .. } | Plan::CreateView { .. } | Plan::DropView { .. } | Plan::Recreate(_)
+        | Plan::DeclareFilter { .. } | Plan::DropFilter { .. } | Plan::CreateView { .. } | Plan::DropView { .. } | Plan::Recreate(_) | Plan::AlterView { .. }
         | Plan::AlterTrigger { .. } | Plan::DropTrigger { .. } | Plan::CreateOrAlterTrigger { .. } | Plan::AlterProcedure { .. } | Plan::CreateOrAlterProcedure { .. }
         | Plan::CreateFunction { .. } | Plan::DropFunction { .. }
         | Plan::AlterException { .. } | Plan::CreateOrAlterException { .. }
@@ -50732,6 +50783,7 @@ fn plan_immediate(text: &str, database: &Option<Database>) -> Option<(Plan, Vec<
                     .or_else(|| plan_declare_filter(text))
                     .or_else(|| plan_drop_filter(text))
                     .or_else(|| plan_create_view(text, database))
+                    .or_else(|| plan_alter_view(text, database))
                     .or_else(|| plan_drop_view(text))
                     .or_else(|| plan_create_function(text))
                     .or_else(|| plan_drop_function(text))
@@ -56416,6 +56468,7 @@ fn after_auth(
                         .or_else(|| plan_declare_filter(&stmt_sql))
                         .or_else(|| plan_drop_filter(&stmt_sql))
                         .or_else(|| plan_create_view(&stmt_sql, &database))
+                        .or_else(|| plan_alter_view(&stmt_sql, &database))
                         .or_else(|| plan_drop_view(&stmt_sql))
                         .or_else(|| plan_create_function(&stmt_sql))
                         .or_else(|| plan_drop_function(&stmt_sql))
@@ -56710,7 +56763,7 @@ fn after_auth(
                         | Plan::CreateSequence { .. }
                         | Plan::DropSequence { .. }
                         | Plan::CreateException { .. }
-                        | Plan::DeclareFilter { .. } | Plan::DropFilter { .. } | Plan::CreateView { .. } | Plan::DropView { .. } | Plan::Recreate(_)
+                        | Plan::DeclareFilter { .. } | Plan::DropFilter { .. } | Plan::CreateView { .. } | Plan::DropView { .. } | Plan::Recreate(_) | Plan::AlterView { .. }
         | Plan::AlterTrigger { .. } | Plan::DropTrigger { .. } | Plan::CreateOrAlterTrigger { .. } | Plan::AlterProcedure { .. } | Plan::CreateOrAlterProcedure { .. }
         | Plan::CreateFunction { .. } | Plan::DropFunction { .. }
                         | Plan::CreateProcedure { .. }
