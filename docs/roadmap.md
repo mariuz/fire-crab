@@ -689,11 +689,19 @@ pointer-page and TIP page numbers is the next step when it dominates.
   client round-tripped and isql rendered as `c000000:a000000` for the
   engine's `c:1e6`. All nine blob/array/batch gates green after the
   switch.
-- **NEXT**: the rest of `E` — `DROP TABLE`/`DROP` dependency enforcement,
-  the remaining `CREATE TABLE` column-type gaps (NCHAR, arrays,
-  `COLLATE`/`CHARACTER SET` — these need the multibyte record-format work),
-  and the restore-only / auth DDL (packages, collations, users, mappings,
-  shadows). (`CREATE TABLE` with DECFLOAT / DECFLOAT(16|34) and
+- **NEXT**: the rest of `E` — the remaining `CREATE TABLE` gaps (arrays;
+  non-default `COLLATE`, which just needs the RDB$COLLATION_ID lookup), and
+  the restore-only / auth DDL (packages, collations, users, mappings,
+  shadows). `DROP`-dependency enforcement is deferred on purpose: the engine
+  routes dependency refusals through Deferred Work so they fire at COMMIT
+  (not execute), and fc records NO view→table dependency rows at all (views
+  write only RDB$VIEW_RELATIONS) — a faithful version would be partial and
+  boundary-heavy, so it waits. (`CREATE TABLE` `CHARACTER SET` / NCHAR
+  columns DONE 2026-08-21, single-byte and multibyte UTF8: catalog +
+  describe + record layout matched, a UTF8 value inserted through fc stores
+  at the right width and the engine reads it back; serve-real-charsetddl 7.
+  The descriptor sub_type is the ttype the read path already keys on, the
+  catalog RDB$FIELD_SUB_TYPE a separate 0.) (`CREATE TABLE` with DECFLOAT / DECFLOAT(16|34) and
   `TIME/TIMESTAMP WITH TIME ZONE` DONE 2026-08-21: catalog + describe +
   record layout matched, the engine writes tz values into fc's own table
   and both read them back; serve-real-coltypes 7. BLOB, NUMERIC, BOOLEAN,
