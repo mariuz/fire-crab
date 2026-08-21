@@ -8,10 +8,12 @@
 # servers, which auto-commits each statement so the engine's refusal (it
 # defers to COMMIT) and fire-crab's (at execute) read identically. gfix
 # validates fire-crab's file.
-# Boundaries (recorded): a table whose ONLY dependents are procedures, or a
-# PRIMARY KEY referenced by a FOREIGN KEY, is refused by the engine but
-# dropped by fire-crab (its dependency model is view-based; procedure
-# recompilation and FK/PK back-references are a later slice).
+# Views (RDB$VIEW_RELATIONS), procedures (RDB$DEPENDENCIES type 5) and the
+# FK/PK back-reference (RDB$RELATION_CONSTRAINTS / RDB$REF_CONSTRAINTS) all
+# block, matching the engine's vector and count. Boundary (recorded): a
+# table referenced ONLY by a TRIGGER on another table is refused by the
+# engine but dropped by fire-crab (the rarer trigger-on-other dependent is
+# not counted).
 #
 #   qa/serve-real-dropdeps.sh [port]
 set -u
@@ -33,11 +35,18 @@ CREATE TABLE STAND (X INTEGER);
 CREATE TABLE PAR (ID INTEGER NOT NULL PRIMARY KEY);
 CREATE TABLE CHI (ID INTEGER, PARID INTEGER, CONSTRAINT FK FOREIGN KEY (PARID) REFERENCES PAR(ID));
 CREATE TABLE PONLY (ID INTEGER, W INTEGER);
+CREATE TABLE PBOTH (ID INTEGER NOT NULL PRIMARY KEY, W INTEGER);
+CREATE TABLE CB (ID INTEGER, PID INTEGER, CONSTRAINT FK2 FOREIGN KEY (PID) REFERENCES PBOTH(ID));
+CREATE TABLE SOLO (ID INTEGER, W INTEGER);
+CREATE TABLE OTHER (ID INTEGER);
 COMMIT;
 CREATE VIEW V1 AS SELECT ID, V FROM T;
 CREATE VIEW V2 AS SELECT ID, W FROM T;
+CREATE VIEW VB AS SELECT ID FROM PBOTH;
 SET TERM ^;
 CREATE PROCEDURE PR RETURNS (S INTEGER) AS BEGIN SELECT SUM(W) FROM PONLY INTO :S; SUSPEND; END^
+CREATE PROCEDURE PR2 RETURNS (S INTEGER) AS BEGIN SELECT COUNT(*) FROM PONLY INTO :S; SUSPEND; END^
+CREATE TRIGGER TRG_O FOR OTHER BEFORE INSERT AS DECLARE X INTEGER; BEGIN SELECT SUM(W) FROM SOLO INTO X; END^
 SET TERM ;^
 COMMIT;
 EOF
@@ -66,19 +75,24 @@ check "dropping the views first frees the table" "$(run "$FC" "$q2")" "$(run "$E
 gf=$("$GFIX" -v -full -user "$U" -pas "$P" "$A" 2>&1)
 ran=$((ran + 1))
 if [ -z "$gf" ]; then echo "OK   gfix -v -full clean on fc's file"; else echo "DIFF gfix: $gf"; fail=1; fi
-# Boundary: a PRIMARY KEY used by a FOREIGN KEY - engine refuses, fc drops
-eb=$(run "$EN" "DROP TABLE PAR; COMMIT; SELECT COUNT(*) AS C FROM RDB\$RELATIONS WHERE RDB\$RELATION_NAME='PAR';")
-cb=$(run "$FC" "DROP TABLE PAR; COMMIT; SELECT COUNT(*) AS C FROM RDB\$RELATIONS WHERE RDB\$RELATION_NAME='PAR';")
-ran=$((ran + 1))
-if [ "$eb" != "$cb" ] && [ "${eb#*FOREIGN KEY}" != "$eb" ]; then
-    echo "OK   boundary: a PK referenced by a FK is refused by the engine, dropped by fc"
-else echo "DIFF boundary MOVED: FK parent"; echo "     engine: $eb"; echo "     fc: $cb"; fail=1; fi
-# Boundary: a table whose only dependent is a procedure - engine refuses, fc drops
-eb=$(run "$EN" "DROP TABLE PONLY; COMMIT; SELECT COUNT(*) AS C FROM RDB\$RELATIONS WHERE RDB\$RELATION_NAME='PONLY';")
-cb=$(run "$FC" "DROP TABLE PONLY; COMMIT; SELECT COUNT(*) AS C FROM RDB\$RELATIONS WHERE RDB\$RELATION_NAME='PONLY';")
+# a PRIMARY KEY referenced by a FOREIGN KEY: refused immediately with the
+# PRIMARY_KEY_REF vector, PAR survives
+q3="DROP TABLE PAR; COMMIT; SELECT COUNT(*) AS C FROM RDB\$RELATIONS WHERE RDB\$RELATION_NAME='PAR';"
+check "a PK referenced by a FK blocks the drop (PRIMARY_KEY_REF)" "$(run "$FC" "$q3")" "$(run "$EN" "$q3")"
+# a table whose only dependents are two procedures: "there are 2 dependencies"
+q4="DROP TABLE PONLY; COMMIT; SELECT COUNT(*) AS C FROM RDB\$RELATIONS WHERE RDB\$RELATION_NAME='PONLY';"
+check "two dependent procedures block the drop (N=2)" "$(run "$FC" "$q4")" "$(run "$EN" "$q4")"
+# a table that is BOTH a FK parent AND has a dependent view: FK/PK wins
+q5="DROP TABLE PBOTH; COMMIT; SELECT COUNT(*) AS C FROM RDB\$RELATIONS WHERE RDB\$RELATION_NAME='PBOTH';"
+check "FK/PK takes precedence over a dependent view" "$(run "$FC" "$q5")" "$(run "$EN" "$q5")"
+# Boundary: a table referenced only by a TRIGGER on another table - the
+# engine refuses (there are 1 dependencies), fc drops (it counts views and
+# procedures, not triggers-on-other-tables)
+eb=$(run "$EN" "DROP TABLE SOLO; COMMIT; SELECT COUNT(*) AS C FROM RDB\$RELATIONS WHERE RDB\$RELATION_NAME='SOLO';")
+cb=$(run "$FC" "DROP TABLE SOLO; COMMIT; SELECT COUNT(*) AS C FROM RDB\$RELATIONS WHERE RDB\$RELATION_NAME='SOLO';")
 ran=$((ran + 1))
 if [ "$eb" != "$cb" ] && [ "${eb#*dependencies}" != "$eb" ]; then
-    echo "OK   boundary: a procedure-only dependent is refused by the engine, dropped by fc"
-else echo "DIFF boundary MOVED: procedure-only"; echo "     engine: $eb"; echo "     fc: $cb"; fail=1; fi
+    echo "OK   boundary: a trigger-on-another-table sole dependent is refused by the engine, dropped by fc"
+else echo "DIFF boundary MOVED: trigger-on-other"; echo "     engine: $eb"; echo "     fc: $cb"; fail=1; fi
 echo "ran $ran checks"
 exit $fail

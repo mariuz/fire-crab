@@ -1591,6 +1591,23 @@ fn respond_ddl_meta(
     // "DROP TABLE @1 failed" wrapper the engine adds isc_dsql_command_err
     // (-607, "Invalid command") and a "-Table @1 does not exist" string
     // - four items, not the three the others carry.
+    if lc.contains("cannot delete primary key") {
+        // DROP TABLE whose PRIMARY KEY / UNIQUE is referenced by a FOREIGN
+        // KEY in another table: "unsuccessful metadata update / DROP TABLE @1
+        // failed / Cannot delete PRIMARY KEY being used in FOREIGN KEY
+        // definition." - fires at execute, its own vector (probed).
+        if let Plan::DropTable { name } = plan {
+            let qn = q(name);
+            let mut w = W::default();
+            w.int(OP_RESPONSE).int(0).int(0).int(0).int(0);
+            w.int(1).int(GDS_NO_META_UPDATE)
+                .int(1).int(336397288).int(2).bytes(qn.as_bytes()) // isc_dsql_drop_table_failed
+                .int(1).int(335544530) // isc_primary_key_ref (fixed message, no args)
+                .int(0);
+            w.send(s, enc)?;
+            return Ok(true);
+        }
+    }
     if lc.contains("there are") && lc.contains("dependencies") {
         // DROP TABLE (or RECREATE TABLE) refused because a VIEW reads the
         // table: "unsuccessful metadata update / cannot delete / TABLE @1 /

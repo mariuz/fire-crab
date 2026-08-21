@@ -5648,6 +5648,68 @@ fn check_constraint_trigger_names(file: &crate::Image, page_size: usize, cname: 
     names
 }
 
+/// Does a FOREIGN KEY on ANOTHER table reference this table's PRIMARY KEY
+/// or UNIQUE constraint? The engine refuses DROP TABLE there immediately
+/// (before the dependency count) with the PRIMARY_KEY_REF vector.
+fn table_pk_referenced_by_fk(file: &crate::Image, page_size: usize, table: &str) -> bool {
+    let Some(crel) = crate::resolve_relation(file, page_size, "RDB$RELATION_CONSTRAINTS") else { return false };
+    let Some(cfmts) = system_relation_formats(file, page_size, "RDB$RELATION_CONSTRAINTS") else { return false };
+    let Some((_, cdescs)) = cfmts.iter().max_by_key(|(n, _)| *n) else { return false };
+    let cols = relation_columns(file, page_size, "RDB$RELATION_CONSTRAINTS");
+    let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (Some(cn_f), Some(ct_f), Some(rn_f)) = (fid("RDB$CONSTRAINT_NAME"), fid("RDB$CONSTRAINT_TYPE"), fid("RDB$RELATION_NAME")) else { return false };
+    // this table's PRIMARY KEY / UNIQUE constraint names
+    let mut uniques: Vec<String> = Vec::new();
+    walk_rows(file, page_size, crel, cdescs, |v| {
+        if text_eq(v.get(rn_f), table) {
+            let ct = match v.get(ct_f) { Some(Value::Text(t)) => t.trim_end().to_string(), _ => String::new() };
+            if ct == "PRIMARY KEY" || ct == "UNIQUE" {
+                if let Some(Value::Text(cn)) = v.get(cn_f) {
+                    uniques.push(cn.trim_end().to_string());
+                }
+            }
+        }
+    });
+    // a FK naming one of them, whose own relation is not this table (a
+    // self-FK drops with the table)
+    uniques.iter().any(|uq| {
+        if let Some(fk) = foreign_key_referencing(file, page_size, uq) {
+            let mut on_other = false;
+            walk_rows(file, page_size, crel, cdescs, |v| {
+                if text_eq(v.get(cn_f), &fk) && !text_eq(v.get(rn_f), table) {
+                    on_other = true;
+                }
+            });
+            on_other
+        } else {
+            false
+        }
+    })
+}
+
+/// The DISTINCT procedures that reference this table (RDB$DEPENDENCIES,
+/// dependent type 5). When no view blocks, these are the drop's N.
+fn procedure_dependents(file: &crate::Image, page_size: usize, table: &str) -> Vec<String> {
+    let mut procs: Vec<String> = Vec::new();
+    let Some(drel) = crate::resolve_relation(file, page_size, "RDB$DEPENDENCIES") else { return procs };
+    let Some(dfmts) = system_relation_formats(file, page_size, "RDB$DEPENDENCIES") else { return procs };
+    let Some((_, ddescs)) = dfmts.iter().max_by_key(|(n, _)| *n) else { return procs };
+    let cols = relation_columns(file, page_size, "RDB$DEPENDENCIES");
+    let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (Some(dn_f), Some(dt_f), Some(don_f)) = (fid("RDB$DEPENDENT_NAME"), fid("RDB$DEPENDENT_TYPE"), fid("RDB$DEPENDED_ON_NAME")) else { return procs };
+    walk_rows(file, page_size, drel, ddescs, |v| {
+        if text_eq(v.get(don_f), table) && matches!(v.get(dt_f), Some(Value::Int(5))) {
+            if let Some(Value::Text(t)) = v.get(dn_f) {
+                let n = t.trim_end().to_string();
+                if !procs.iter().any(|x| x.eq_ignore_ascii_case(&n)) {
+                    procs.push(n);
+                }
+            }
+        }
+    });
+    procs
+}
+
 /// The foreign key (if any) whose RDB$REF_CONSTRAINTS row names this
 /// unique/primary constraint as its partner.
 fn foreign_key_referencing(file: &crate::Image, page_size: usize, cname: &str) -> Option<String> {
@@ -6878,20 +6940,30 @@ pub fn drop_table(file: &mut crate::Image, page_size: usize, name: &str) -> Resu
     if rel < 128 {
         return Err("system relations cannot be dropped".into());
     }
-    // A VIEW that reads this table blocks the drop, as the engine's deferred
-    // dependency scan does. The engine's count is DISTINCT dependent VIEWS
-    // whenever any view exists (procedures that also reference the table are
-    // recompiled, not counted); RDB$VIEW_RELATIONS holds one row per view
-    // context, so distinct RDB$VIEW_NAME over this relation is exactly N. A
-    // procedure/FK that is the SOLE dependent is a recorded boundary - this
+    // FK/PK takes precedence and fires immediately, with its own vector: a
+    // FOREIGN KEY on another table that references this table's PRIMARY KEY
+    // or UNIQUE constraint blocks the drop before any dependency count.
+    if table_pk_referenced_by_fk(file, page_size, &name) {
+        return Err(format!(
+            "Cannot delete PRIMARY KEY being used in FOREIGN KEY definition. DROP TABLE {}",
+            name
+        ));
+    }
+    // Then the dependency count. The engine's N is DISTINCT dependent VIEWS
+    // whenever any view exists (procedures/triggers that also reference the
+    // table are recompiled, not counted); with no view, DISTINCT dependent
+    // PROCEDURES. RDB$VIEW_RELATIONS holds one row per view context (fc
+    // writes it for its own views, so this is db-agnostic); the procedure
+    // count reads RDB$DEPENDENCIES, which the engine populates. A trigger on
+    // ANOTHER table that is the SOLE dependent is a recorded boundary - this
     // server drops there, where the engine refuses.
+    let mut views: Vec<String> = Vec::new();
     if let Some(vrel) = crate::resolve_relation(file, page_size, "RDB$VIEW_RELATIONS") {
         let vfmts = system_relation_formats(file, page_size, "RDB$VIEW_RELATIONS")
             .ok_or("no RDB$VIEW_RELATIONS format")?;
         let (_, vdescs) = vfmts.iter().max_by_key(|(n, _)| *n).ok_or("no view-relations format")?;
         let vname_f = sys_fid(file, page_size, "RDB$VIEW_RELATIONS", "RDB$VIEW_NAME")?;
         let vreln_f = sys_fid(file, page_size, "RDB$VIEW_RELATIONS", "RDB$RELATION_NAME")?;
-        let mut views: Vec<String> = Vec::new();
         walk_rows(file, page_size, vrel, vdescs, |v| {
             if text_eq(v.get(vreln_f), &name) {
                 if let Some(Value::Text(t)) = v.get(vname_f) {
@@ -6902,13 +6974,14 @@ pub fn drop_table(file: &mut crate::Image, page_size: usize, name: &str) -> Resu
                 }
             }
         });
-        if !views.is_empty() {
-            return Err(format!(
-                "cannot delete TABLE {} - there are {} dependencies",
-                name,
-                views.len()
-            ));
-        }
+    }
+    let n = if !views.is_empty() {
+        views.len()
+    } else {
+        procedure_dependents(file, page_size, &name).len()
+    };
+    if n > 0 {
+        return Err(format!("cannot delete TABLE {} - there are {} dependencies", name, n));
     }
 
     // gather what the catalog says belongs to this table BEFORE
