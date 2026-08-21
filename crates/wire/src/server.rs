@@ -87,6 +87,16 @@ const OP_BATCH_REGBLOB: i32 = 104;
 const OP_BATCH_BLOB_STREAM: i32 = 105;
 const OP_BATCH_SET_BPB: i32 = 106;
 const OP_INFO_BATCH: i32 = 111;
+/// op_ping (93): IAttachment::ping - "is the connection alive"; a bare op,
+/// answered with a clean op_response (server.cpp ping_connection)
+const OP_PING: i32 = 93;
+/// op_transact (79) / op_transact_response (80): isc_transact_request /
+/// IAttachment::transactRequest - a BLR request compiled, started with
+/// its input message and run to completion in ONE round trip, the
+/// output message coming back in the response (server.cpp
+/// transact_request)
+const OP_TRANSACT: i32 = 79;
+const OP_TRANSACT_RESPONSE: i32 = 80;
 /// isc_batch_blob_id: "Unknown blob ID @1 in the batch message"
 const GDS_BATCH_BLOB_ID: i32 = 335545197;
 const OP_BATCH_CANCEL: i32 = 109;
@@ -55572,6 +55582,62 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 let mut w = W::default();
                 w.int(OP_RESPONSE).int(0).int(0).int(0).bytes(&info).int(0);
                 w.send(&mut s, &mut enc)?;
+            }
+            x if x == OP_PING => {
+                respond(&mut s, &mut enc, 0)?;
+            }
+            x if x == OP_TRANSACT => {
+                // p_trrq: database, transaction, the BLR (its message 0 is
+                // the INPUT, message 1 the OUTPUT - xdr_trrq_blr parses
+                // both), the message count, then the input message when
+                // there is one. The request runs whole; the reply is
+                // op_transact_response with one output message (the first
+                // message 1 the program sent), or none.
+                read_int(&mut s, &mut dec)?; // db handle
+                read_int(&mut s, &mut dec)?; // transaction
+                let blr = read_wire_bytes(&mut s, &mut dec)?;
+                // THE BLR TRAVELS TWICE: protocol.cpp's op_transact case
+                // runs xdr_trrq_blr (which xdr's the cstring to parse the
+                // message formats) and then MAP(xdr_cstring, p_trrq_blr)
+                // over the same field again - a legacy quirk every client
+                // has shipped since; the second copy is read and dropped
+                read_wire_bytes(&mut s, &mut dec)?;
+                let messages = read_int(&mut s, &mut dec)?;
+                let req = parse_blr_request(&blr);
+                let input = if messages > 0 {
+                    let fields = req.as_ref().and_then(|r| r.msgs.first().cloned()).unwrap_or_default();
+                    read_request_message(&mut s, &mut dec, &fields)?
+                } else {
+                    Vec::new()
+                };
+                if std::env::var("FC_SRV_TRACE").is_ok() {
+                    eprintln!("[srv] op_transact blr ({} B), {} input message(s), parsed={}", blr.len(), messages, req.is_some());
+                }
+                match (req, database.as_ref()) {
+                    (Some(req), Some(db)) => {
+                        let out = exec_blr_request(&req, &input, db);
+                        let mut w = W::default();
+                        match out.iter().find(|(m, _)| *m == 1) {
+                            Some((_, msg)) => {
+                                w.int(OP_TRANSACT_RESPONSE).int(1).raw(msg);
+                            }
+                            None => {
+                                w.int(OP_TRANSACT_RESPONSE).int(0);
+                            }
+                        }
+                        w.send(&mut s, &mut enc)?;
+                    }
+                    (None, _) => {
+                        // isc_invalid_blr "invalid request BLR at offset @1":
+                        // this parser does not keep the offset it stopped
+                        // at, so it answers 0 where the engine names the byte
+                        let mut w = W::default();
+                        w.int(OP_RESPONSE).int(0).int(0).int(0).int(0);
+                        w.int(1).int(335544343).int(ISC_ARG_NUMBER).int(0).int(0);
+                        w.send(&mut s, &mut enc)?;
+                    }
+                    _ => respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?,
+                }
             }
             x if x == OP_COMPILE => {
                 // the legacy BLR request API that isql's SHOW commands

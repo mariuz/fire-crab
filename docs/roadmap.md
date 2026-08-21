@@ -186,8 +186,7 @@ max_segment pieces) — when the framed length fits; the client then serves
 info / seek / get_segment from its copy (the gate's inline pass: wire
 opens fall away, the answers are the engine's line for line).
 
-**Still absent:** `op_ping`, `op_slice` (arrays),
-`op_transact`. Auth: only Srp256 offered; no Legacy_Auth / ChaCha /
+**Still absent:** `op_slice` (arrays). Auth: only Srp256 offered; no Legacy_Auth / ChaCha /
 zlib. `op_info_transaction` answers only `isc_info_tra_id`. A text blob
 is stored in the database charset (UTF8) with no bpb transliteration.
 
@@ -468,7 +467,18 @@ pointer-page and TIP page numbers is the next step when it dominates.
   `isc_batch_blob_id`, the messages before it stored and kept (probed).
   Policies BLOB_ID_ENGINE / BLOB_ID_USER / BLOB_STREAM, appendBlobData,
   per-blob bpb, a 5000-byte blob, all line for line with the engine.
-- **NEXT**: `op_ping` / `op_transact` / `op_slice` (arrays); the auth
+- **`op_ping` / `op_transact` DONE (2026-08-21, `serve-real-transact`
+  8, client `qa/c/transact.cpp`):** ping is a bare op answered clean;
+  transactRequest compiles the BLR through the SHOW-request parser, runs
+  it with message 0 pre-filled from the input (the engine memcpy's it in
+  BEFORE the start — a `blr_receive` would stall the request), and
+  answers the first message 1 the program sent. Wire quirk recorded: the
+  BLR travels TWICE in op_transact (`xdr_trrq_blr` and then the MAP macro
+  over the same field). A BLR the parser refuses is `isc_invalid_blr`
+  (offset 0 — the parser keeps no offset).
+- **NEXT**: `op_slice` (arrays — a programme: ARRAY columns in DDL,
+  RDB$FIELD_DIMENSIONS, the array blob (InternalArrayDesc + data), the
+  SDL subset `gen_sdl` emits, op_get_slice / op_put_slice); the auth
   tail (Legacy_Auth / ChaCha / zlib). (MERGE `RETURNING` / `NOT MATCHED BY SOURCE`, `op_info_blob`
   / `op_seek_blob`, the ordered JOIN fetch streaming, the RIGHT/FULL
   hash, the bulk index build, the cleanup — all done 2026-08-21.)
