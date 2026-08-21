@@ -689,11 +689,25 @@ pointer-page and TIP page numbers is the next step when it dominates.
   client round-tripped and isql rendered as `c000000:a000000` for the
   engine's `c:1e6`. All nine blob/array/batch gates green after the
   switch.
-- **NEXT**: `CREATE FUNCTION` (PSQL functions); `RECREATE`; `ALTER VIEW`;
-  the rest of `E`; a full sweep to re-baseline after the CHAR wire form,
-  the describe charset rule and the xdr_quad form. (Full sweep 2026-08-21 after the UPDATE-format change: 259 gates, 8246 checks, 0 DIFF. MERGE `RETURNING` / `NOT MATCHED BY SOURCE`, `op_info_blob`
-  / `op_seek_blob`, the ordered JOIN fetch streaming, the RIGHT/FULL
-  hash, the bulk index build, the cleanup — all done 2026-08-21.)
+- **NEXT**: `RECREATE`; `ALTER VIEW`; the rest of `E`. (`CREATE FUNCTION`
+  DONE 2026-08-21: CREATE/DROP FUNCTION write the catalog and BLR, and a
+  PSQL function is CALLED from a select list — `F(<expr>)` resolves only
+  against the catalog, describes as the RETURN domain, and evaluates per
+  row by materialising the statement's rows at the first fetch, each call
+  run through `run_function`. `RETURN <text>` is a new `TrigStmt::ReturnText`;
+  an unknown `NAME(` is -804, the wrong arity `fun_param_mismatch`. Gate
+  serve-real-createfunction, 7 checks. Boundary: a long blob-returning
+  session under wire encryption accumulates op_inline_blob packets past
+  the client's cache — pre-existing, unrelated to functions — so the gate
+  checks the catalog query by query in fresh attachments. A distinct
+  per-transaction handle scheme (the engine's model, which would let one
+  session carry the catalog blobs beside the calls) was tried and reverted:
+  it fixed that case but desynced the SQLDA_DISPLAY request path under
+  crypt; deferred.) Full sweep 2026-08-21 after the UPDATE-format change:
+  259 gates, 8246 checks, 0 DIFF. MERGE `RETURNING` / `NOT MATCHED BY
+  SOURCE`, `op_info_blob` / `op_seek_blob`, the ordered JOIN fetch
+  streaming, the RIGHT/FULL hash, the bulk index build, the cleanup — all
+  done 2026-08-21.
 - **D, the MERGE executor** — the BLR is already compiled and tested;
   only the executor is missing.
 - **G, the external sort** — every sort and hash build is bounded by
