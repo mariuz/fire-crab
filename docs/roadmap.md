@@ -689,10 +689,14 @@ pointer-page and TIP page numbers is the next step when it dominates.
   client round-tripped and isql rendered as `c000000:a000000` for the
   engine's `c:1e6`. All nine blob/array/batch gates green after the
   switch.
-- **NEXT**: the rest of `E` — `CREATE TABLE` arrays; the rest of
-  `DROP`-dependency enforcement (procedure recompilation and FK/PK
-  back-references — the view case is in); and the restore-only / auth DDL
-  (packages, collations, users, mappings, shadows). (Non-default `COLLATE`
+- **NEXT**: the rest of `E` — the rest of `DROP`-dependency enforcement
+  (procedure recompilation and FK/PK back-references — the view case is in);
+  and the restore-only / auth DDL (packages, collations, users, mappings,
+  shadows). The common `CREATE TABLE` column types are now all in: BLOB,
+  NUMERIC, DECFLOAT, `TIME/TIMESTAMP WITH TIME ZONE`, `CHARACTER SET` /
+  NCHAR / `COLLATE`, and arrays (single- and multi-dimension; the multi-dim
+  fix was a `[]`-aware column-list splitter — serve-real-arrays 46, which
+  now round-trips a 2-D array through fc's own CREATE TABLE). (Non-default `COLLATE`
   DONE 2026-08-21 for the built-in UTF8 family: the collation rides the
   ttype high byte, RDB$COLLATION_ID written on both the field and
   relation-field rows; serve-real-charsetddl grew two COLLATE columns.
