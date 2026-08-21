@@ -689,11 +689,15 @@ pointer-page and TIP page numbers is the next step when it dominates.
   client round-tripped and isql rendered as `c000000:a000000` for the
   engine's `c:1e6`. All nine blob/array/batch gates green after the
   switch.
-- **NEXT**: the rest of `E` — the remaining `CREATE TABLE` gaps (arrays;
-  non-default `COLLATE`, which just needs the RDB$COLLATION_ID lookup); the
-  rest of `DROP`-dependency enforcement (procedure recompilation and FK/PK
+- **NEXT**: the rest of `E` — `CREATE TABLE` arrays; the rest of
+  `DROP`-dependency enforcement (procedure recompilation and FK/PK
   back-references — the view case is in); and the restore-only / auth DDL
-  (packages, collations, users, mappings, shadows). (`DROP TABLE`
+  (packages, collations, users, mappings, shadows). (Non-default `COLLATE`
+  DONE 2026-08-21 for the built-in UTF8 family: the collation rides the
+  ttype high byte, RDB$COLLATION_ID written on both the field and
+  relation-field rows; serve-real-charsetddl grew two COLLATE columns.
+  Boundaries: a language collation needs the full RDB$COLLATIONS lookup,
+  and collation-aware ORDER BY / index keys stay binary — later slices.) (`DROP TABLE`
   view-dependency enforcement DONE 2026-08-21: a view over a table blocks
   its DROP with the engine's "there are N dependencies" vector, N = distinct
   dependent views from RDB$VIEW_RELATIONS — which is exactly the engine's
