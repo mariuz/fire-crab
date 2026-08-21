@@ -69,9 +69,9 @@ COMMIT;
 EOF
 }
 # The BLOB garbage is built through the ENGINE on both files, before any
-# server holds them: blob DML is outside fire-crab's SQL surface, so a
-# blob UPDATE through fcwire would refuse silently and the boundary
-# below would compare two different histories.
+# server holds them: the gate wants IDENTICAL histories on the two files
+# (fcwire does take a blob UPDATE now - qa/serve-real-blobupdate.sh -
+# but a history written by two servers is not the same history).
 rm -f "$DBE" "$DBF"
 build "$DBE"; build "$DBF"; chmod 666 "$DBE" "$DBF"
 

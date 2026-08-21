@@ -1945,6 +1945,7 @@ impl Database {
         fire_crab_ods::tra::set_reader_view(Some(fire_crab_ods::tra::OwnTx::owner(
             self.own_tx().ids().to_vec(),
         )));
+        set_blob_source(Some(self));
     }
 
     /// The snapshot a READ decides visibility against. A concurrency
@@ -6444,7 +6445,13 @@ AlterDomainRename {
     /// INSERT plans this server already runs; a PK-less table without
     /// MATCHING refuses at prepare with the engine's
     /// primary-key-required vector
-    UpdateOrInsert { update: Box<Plan>, insert: Box<Plan> },
+    ///
+    /// `upd_args` is the update half's parameter map: the ONE message
+    /// (the value list's `?`s, in order - the insert half's slots as
+    /// they stand) feeds the update's SET list first and then its
+    /// WHERE, which repeats the MATCHING values; `upd_args[i]` is the
+    /// message slot the update plan's slot `i` reads
+    UpdateOrInsert { update: Box<Plan>, insert: Box<Plan>, upd_args: Vec<usize> },
     /// `MERGE INTO <t> USING <s> ON <cond> WHEN [NOT] MATCHED [AND c] THEN
     /// ...` (StmtNodes.cpp MergeNode): a LEFT join of source onto
     /// target with one action per joined row - the FIRST branch of the
@@ -10892,6 +10899,7 @@ fn int_func_form(e: &Expr, descs: &[Descriptor]) -> Option<(Wire, i32, i32)> {
     match f {
         SysFn::Sign => Some(short),
         SysFn::CharLength | SysFn::OctetLength | SysFn::OctetLengthCs(_) | SysFn::Position => Some(long),
+        SysFn::BlobOctetLength => Some(int64), // a blob's length is a BIGINT (probed)
         SysFn::Mod => match src_dtype(0)? {
             dtype::SHORT => Some(short),
             dtype::LONG => Some(long),
@@ -18668,7 +18676,7 @@ fn param_target_ok(d: &Descriptor) -> bool {
             | dtype::SQL_TIME
             | dtype::TIMESTAMP
             | dtype::BOOLEAN
-            | dtype::BLOB // a blr_quad: a temp blob id materialised at the store
+            | dtype::BLOB // a blr_quad: a temp blob id materialised at the store or the update
     )
 }
 
@@ -19033,9 +19041,27 @@ fn plan_upsert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
         }
         Some(split_ident_list(&m_rest[1..m_rest.len() - 1])?)
     };
-    // parameters would double-bind one message across the two plans
-    if masked[vopen..vclose].contains('?') {
-        return None;
+    // the `?`s of each value, in message order: the insert half reads
+    // the message as it is, the update half's WHERE repeats the
+    // MATCHING values after the SET list's - see [Plan::UpdateOrInsert]
+    let mut val_slots: Vec<Vec<usize>> = Vec::new();
+    {
+        let mut next = 0usize;
+        let mut depth = 0i32;
+        let mut cur: Vec<usize> = Vec::new();
+        for ch in masked[vopen + 1..vclose].chars() {
+            match ch {
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                ',' if depth == 0 => val_slots.push(std::mem::take(&mut cur)),
+                '?' => {
+                    cur.push(next);
+                    next += 1;
+                }
+                _ => {}
+            }
+        }
+        val_slots.push(cur);
     }
     let dbr = db.as_ref()?;
     let mcols = match matching {
@@ -19062,12 +19088,14 @@ fn plan_upsert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
     // every matching column must ride the insert list (its value is
     // the WHERE comparand), and a NULL there would need blr_equiv
     let mut wheres: Vec<String> = Vec::new();
+    let mut upd_args: Vec<usize> = val_slots.concat();
     for m in &mcols {
         let pos = cols.iter().position(|c| c.eq_ignore_ascii_case(m))?;
         if vals[pos].trim().eq_ignore_ascii_case("NULL") {
             return None;
         }
         wheres.push(format!("{} = {}", cols[pos], vals[pos]));
+        upd_args.extend_from_slice(&val_slots[pos]);
     }
     let sets: Vec<String> = cols
         .iter()
@@ -19089,7 +19117,9 @@ fn plan_upsert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
     );
     let (update, ups) = plan_update(&upd_sql, db)?;
     let (insert, ips) = plan_insert(&ins_sql, db)?;
-    if !ups.is_empty() || !ips.is_empty() {
+    // the two halves number the one message as [Plan::UpdateOrInsert]
+    // says, or the statement refuses: ONE describe serves both
+    if ups.len() != upd_args.len() || ips.len() != val_slots.concat().len() {
         return None;
     }
     // The insert half can plan to a REFUSAL (an OVERRIDING / identity
@@ -19104,8 +19134,8 @@ fn plan_upsert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
         return Some((Plan::RefusedEval(e), Vec::new()));
     }
     Some((
-        Plan::UpdateOrInsert { update: Box::new(update), insert: Box::new(insert) },
-        Vec::new(),
+        Plan::UpdateOrInsert { update: Box::new(update), insert: Box::new(insert), upd_args },
+        ips,
     ))
 }
 
@@ -19969,6 +19999,15 @@ enum ExecErr {
 }
 impl From<String> for ExecErr {
     fn from(t: String) -> Self {
+        // a blob id the store cannot honour - a temp id of a finished
+        // transaction, one not yet closed, a permanent id the pages do
+        // not hold - is the engine's isc_bad_segstr_id (blb.cpp:1247,
+        // probed: `UPDATE B SET SEG = ?` with a committed tx's temp id
+        // answers the single status line "invalid BLOB ID"), not the
+        // generic dynamic SQL error a bare text would become
+        if t == "invalid BLOB ID" {
+            return ExecErr::Gds(GDS_BAD_BLOB_ID, t);
+        }
         ExecErr::Text(t)
     }
 }
@@ -20210,7 +20249,27 @@ fn execute_dml_collecting(
     // records live in a working copy that is dropped whole if any part
     // of it fails (see [WindowKind::Statement]).
     let mark = undo_window_push(database, WindowKind::Statement);
+    // the temp blobs NOT yet materialised as this statement starts: the
+    // ones it materialises are exactly those that flip
+    let fresh: Vec<u32> = database
+        .as_ref()
+        .map(|d| d.temp_blobs.iter().filter(|(_, tb)| tb.materialised.is_none()).map(|(k, _)| *k).collect())
+        .unwrap_or_default();
     let out = execute_dml_collecting_inner(plan, database, args, ctx, affected);
+    if out.is_err() {
+        // the working copy that held the pages THIS statement
+        // materialised is gone with it: a later store of the same temp
+        // id must materialise afresh, not point at pages that never
+        // landed. Earlier statements' materialisations stand (their
+        // pages are in the image), as the engine's bli_materialized does.
+        if let Some(d) = database.as_mut() {
+            for k in &fresh {
+                if let Some(tb) = d.temp_blobs.get_mut(k) {
+                    tb.materialised = None;
+                }
+            }
+        }
+    }
     undo_window_unwind(database, mark, out.is_err());
     // the statement may have adopted an id (a DDL's wide-view guard put
     // the view from BEFORE it back as it left): the reader view follows
@@ -20240,9 +20299,16 @@ fn execute_dml_collecting_inner(
     // upsert the engine answers the AFTER image of whichever half ran,
     // one row per updated row (probed: a MATCHING that updates two
     // NOPK rows returns BOTH - a cursor, no singleton error in FB6).
-    if let Plan::UpdateOrInsert { update, insert } = plan {
+    if let Plan::UpdateOrInsert { update, insert, upd_args } = plan {
+        // the update half reads the message through its slot map; a
+        // temp blob it materialised stays materialised for the insert
+        // half (TempBlob.materialised), which never runs after a hit
+        let uargs: Vec<WireParam> = upd_args
+            .iter()
+            .map(|i| args.get(*i).cloned().ok_or("missing parameter value"))
+            .collect::<Result<_, &str>>()?;
         let (_, updated, _) =
-            execute_dml_collecting(update, database, args, ctx, affected.as_deref_mut())?;
+            execute_dml_collecting(update, database, &uargs, ctx, affected.as_deref_mut())?;
         if updated > 0 {
             return Ok((0, updated, 0));
         }
@@ -20738,18 +20804,10 @@ fn execute_dml_collecting_inner(
                 .iter()
                 .enumerate()
                 .map(|(slot, a)| -> Result<WireParam, String> { match a {
-                    WireParam::BlobId(b) if decode_blob_id(b).0 == 0 => {
-                        let (_, temp) = decode_blob_id(b);
-                        if temp == 0 {
-                            return Ok(WireParam::Null); // an all-zero quad is the empty blob
-                        }
+                    WireParam::BlobId(b) => {
                         let fid = param_fields.iter().find(|(_, s)| *s == slot).map(|(f, _)| *f);
-                        let sub_type = fid
-                            .and_then(|f| descs.get(f))
-                            .map(|d| d.sub_type.max(0) as u16)
-                            .unwrap_or(0);
-                        let perm = materialise_temp_blob(db, &mut work, *rel, temp as u32, sub_type)?;
-                        Ok(WireParam::BlobId(perm))
+                        let d = fid.and_then(|f| descs.get(f)).ok_or("field beyond format")?;
+                        Ok(WireParam::BlobId(store_blob_param(db, &mut work, *rel, d, b)?))
                     }
                     other => Ok(other.clone()),
                 } })
@@ -20909,6 +20967,13 @@ fn execute_dml_collecting_inner(
             // inside the scan instead
             let mut bound_sets: Vec<(usize, Option<Vec<u8>>)> = Vec::new();
             let mut expr_sets: Vec<(usize, &Expr)> = Vec::new();
+            // a blr_quad parameter is bound AFTER the target walk and
+            // the conflict check: storing it writes this relation's
+            // pages into `work` ([store_blob_param]), and `work` is
+            // thrown away on a Conflict retry - see [with_conflict_wait]
+            // - while TempBlob.materialised would keep the id of pages
+            // that never landed. Field + slot.
+            let mut blob_sets: Vec<(usize, usize)> = Vec::new();
             // the generator draws, in SET-LIST order: the engine
             // evaluates a row's assignments left to right (probed: `SET
             // V = GEN_ID(G,1) + GEN_ID(G,1)` stores 3, 7, 11 ... over
@@ -20920,6 +20985,18 @@ fn execute_dml_collecting_inner(
                     SetVal::Param(slot) => {
                         let d = descs.get(*fid).ok_or("field beyond format")?;
                         let arg = args.get(*slot).ok_or("missing parameter value")?;
+                        if matches!(arg, WireParam::BlobId(_)) {
+                            // only a BLOB column takes the deferred path;
+                            // anything else keeps encode_wire_value's
+                            // refusal (a blob id is 8 bytes, and written
+                            // over a shorter column it would overwrite
+                            // the neighbouring field)
+                            if d.dtype != dtype::BLOB {
+                                return Err("parameter type does not match its column".into());
+                            }
+                            blob_sets.push((*fid, *slot));
+                            continue;
+                        }
                         encode_wire_value(d, arg)
                             .ok_or("parameter type does not match its column")?
                     }
@@ -20934,7 +21011,6 @@ fn execute_dml_collecting_inner(
                 };
                 bound_sets.push((*fid, bytes));
             }
-            let sets = &bound_sets;
             let filter = &bind_filter(filter, args)?;
             // a parameterised WHERE builds its band HERE, from the bound
             // predicate - the DML walk reads before it writes, and that
@@ -20992,6 +21068,25 @@ fn execute_dml_collecting_inner(
             if let Some(other) = blocking_transaction(db, &found) {
                 return Err(ExecErr::Conflict(other));
             }
+            // THE BLOB PARAMETERS LAND PER ROW, from here on (blb.cpp
+            // blb::move - an UPDATE takes exactly the path a STORE
+            // takes): the FIRST row this statement rewrites materialises
+            // the closed temp blob into THIS relation's pages; every
+            // row after it gets a COPY of that blob (blb.cpp:1183-1210:
+            // a temp id already materialised is re-spelled as its
+            // permanent id and the loop goes round again into
+            // `copy_blob`), so no two records ever share a blob - which
+            // is what lets garbage collection free a purged version's
+            // blobs without looking at any other record (probed: one
+            // temp id over `WHERE N > 0` fills four rows reading the
+            // same content, with four stored blobs). The OLD version's
+            // blob is left where it is - it goes with that version at
+            // garbage collection, not here. With no matching row
+            // nothing is written, as the engine writes nothing (an
+            // UPDATE OR INSERT's insert half then materialises for
+            // itself).
+            let mut first_perm: Vec<Option<[u8; 8]>> = vec![None; blob_sets.len()];
+            let sets = &bound_sets;
             for (page, slot, fmt, image) in found {
                 // the SET offsets were resolved in the NEWEST format; a
                 // record still stored in an older one would patch wrong
@@ -21012,6 +21107,28 @@ fn execute_dml_collecting_inner(
                             img[fid / 8] &= !(1 << (fid % 8));
                         }
                     }
+                }
+                for (i, (fid, slot)) in blob_sets.iter().enumerate() {
+                    let d = descs.get(*fid).ok_or("field beyond format")?;
+                    let arg = args.get(*slot).ok_or("missing parameter value")?;
+                    let WireParam::BlobId(b) = arg else { unreachable!() };
+                    let at = d.offset as usize;
+                    if at + 8 > img.len() {
+                        return Err("record image shorter than its format".into());
+                    }
+                    // a row's OWN id echoed back (a client that writes
+                    // every column on save) is a no-op: blb::move returns
+                    // before copying when source and destination ids are
+                    // equal (blb.cpp:1059) - the record keeps its blob
+                    let own = img[fid / 8] & (1 << (fid % 8)) == 0 && &img[at..at + 8] == &b[..];
+                    if own {
+                        continue;
+                    }
+                    let src = first_perm[i].unwrap_or(*b);
+                    let perm = store_blob_param(db, &mut work, *rel, d, &src)?;
+                    first_perm[i] = Some(perm);
+                    img[at..at + 8].copy_from_slice(&perm);
+                    img[fid / 8] &= !(1 << (fid % 8));
                 }
                 // GENERATOR DRAWS: once per UPDATED row - the engine
                 // advances the sequence for each row it writes and for
@@ -26213,6 +26330,37 @@ thread_local! {
     /// `FIRST 1` so fcopt costs in first-rows mode (probed: `FIRST 3 ORDER
     /// BY pk` NAVIGATES on a 6-row table whose bare ORDER BY sorts).
     static FIRST_ROWS_MODE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+thread_local! {
+    /// WHERE A BLOB IS READ FROM during expression evaluation. A row's
+    /// decoded value carries only the blob's id, and `Expr::eval` has
+    /// no database in hand - so the attachment's shared image (the
+    /// pages as they stand, this statement's own stores included) is
+    /// published per thread at the request's start, the same moment
+    /// the reader view is. Read by [SysFn::BlobOctetLength].
+    static BLOB_SOURCE: std::cell::RefCell<Option<(std::sync::Arc<fire_crab_cch::pool::SharedImage>, usize)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Publish the attachment's pages to [BLOB_SOURCE] for this thread.
+fn set_blob_source(db: Option<&Database>) {
+    let src = db.map(|d| (d.shared.clone(), d.page_size));
+    BLOB_SOURCE.with(|c| *c.borrow_mut() = src);
+}
+
+/// BOUNDARY: the length is read from the PUBLISHED image, so
+/// `OCTET_LENGTH` of a blob column inside the statement that writes it
+/// (`... RETURNING OCTET_LENGTH(SEG)`) finds the new id's pages only in
+/// the working copy and answers an evaluation refusal, not the length.
+/// The stored length of blob `rel:num` through [BLOB_SOURCE]; None
+/// without a published image or for an id the pages do not hold.
+fn blob_length_of(rel: u16, num: u64) -> Option<i64> {
+    let (shared, page_size) = BLOB_SOURCE.with(|c| c.borrow().clone())?;
+    let image = shared.image();
+    fire_crab_blb::read_blob(&image, page_size, rel, num)
+        .ok()
+        .map(|b| b.header.length as i64)
 }
 
 /// Scoped setter for [FIRST_ROWS_MODE]; restores the previous value on drop.
@@ -35732,6 +35880,74 @@ fn encode_row_body(
 /// written into relation `rel`'s pages (`blb::create_blob` /
 /// `create_stream_blob`, levels 0-2) and its permanent id returned; a
 /// blob already materialised answers the id it got (blb.cpp:1205).
+/// A blr_quad PARAMETER arriving at a store - an INSERT's value or an
+/// UPDATE's SET - becomes the permanent id the record carries, by the
+/// three cases blb::move (blb.cpp:1003-1310) tells apart, each probed
+/// against the live engine through qa/c/blobupdate.c:
+///
+/// * a TEMPORARY id (relation 0): the closed temp blob is materialised
+///   into this relation's pages ([materialise_temp_blob]); an id from
+///   a committed or rolled-back transaction, or one not yet closed, is
+///   `invalid BLOB ID` (isc_bad_segstr_id)
+/// * the ALL-ZERO quad, indicator 0: NOT SQL NULL - the column reads
+///   back as an EMPTY blob (SEG = '', OCTET_LENGTH 0, IS NOT NULL);
+///   the SQL NULL arrives as a NULL indicator, never as a quad
+/// * a PERMANENT id (relation != 0 - a row's own blob echoed back by
+///   the client): the engine COPIES the blob (blb.cpp:1167 `copy_blob`)
+///   and the record carries a NEW id ("s7 ids: different" in the gate)
+///   - the source row keeps reading its own
+fn store_blob_param(
+    db: &mut Database,
+    work: &mut fire_crab_ods::Image,
+    rel: u16,
+    d: &Descriptor,
+    b: &[u8; 8],
+) -> Result<[u8; 8], String> {
+    let sub_type = d.sub_type.max(0) as u16;
+    let (mut src_rel, mut num) = decode_blob_id(b);
+    if src_rel == 0 {
+        if num == 0 {
+            let charset = if sub_type == 1 { 4 } else { 0 };
+            let recno = fire_crab_blb::create_blob(work, db.page_size, rel, &[], sub_type, charset)?;
+            return Ok(encode_blob_id(rel, recno));
+        }
+        // a temp id ALREADY materialised (by an earlier row or an
+        // earlier statement) is re-spelled as its permanent id and
+        // goes round again as a COPY (blb.cpp:1183-1210) - the second
+        // record never shares the first's blob
+        match db.temp_blobs.get(&(num as u32)).and_then(|tb| tb.materialised) {
+            None => return materialise_temp_blob(db, work, rel, num as u32, sub_type),
+            Some(perm) => (src_rel, num) = decode_blob_id(&perm),
+        }
+    }
+    let src = fire_crab_blb::read_blob(work, db.page_size, src_rel, num)
+        .map_err(|_| "invalid BLOB ID".to_string())?;
+    // the copy is stamped with the TARGET column's sub_type and charset
+    // (blb.cpp:1262 `blob->blb_sub_type = to_desc->getBlobSubType()`),
+    // not the source's: a binary blob copied into a text column reads
+    // back as text
+    let charset = if sub_type == 1 { 4 } else { 0 };
+    let recno = if src.header.is_stream() {
+        fire_crab_blb::create_stream_blob_counted(
+            work,
+            db.page_size,
+            rel,
+            &src.content(),
+            sub_type,
+            charset,
+            src.header.count,
+            usize::from(src.header.max_segment),
+        )?
+    } else {
+        let segments: Vec<Vec<u8>> = src.segments().map(|s| s.to_vec()).collect();
+        fire_crab_blb::create_blob(work, db.page_size, rel, &segments, sub_type, charset)?
+    };
+    if std::env::var("FC_SRV_TRACE").is_ok() {
+        eprintln!("[srv] blob {}:{} copied into relation {} as record {}", src_rel, num, rel, recno);
+    }
+    Ok(encode_blob_id(rel, recno))
+}
+
 fn materialise_temp_blob(
     db: &mut Database,
     work: &mut fire_crab_ods::Image,
@@ -36636,6 +36852,13 @@ enum SysFn {
     /// decoded text (5). Rewritten from `OctetLength` at resolution,
     /// where the descriptor is at hand.
     OctetLengthCs(u8),
+    /// OCTET_LENGTH over a BLOB column: the stored blob's payload
+    /// length (blh_length, segment framing excluded - probed: equal
+    /// for both framings), a BIGINT in the describe. Rewritten from
+    /// `OctetLength` at resolution, where the descriptor is; the
+    /// blob is read through [BLOB_SOURCE] at eval, because a row's
+    /// value is only the id.
+    BlobOctetLength,
     /// UPPER over a column of a tabled or byte-carrier set: the case
     /// law is the CHARSET's own (`intl::case_char`, tables generated
     /// from the live engine - WIN1252 'ß' stays 'ß', ISO8859_1's 'ÿ'
@@ -36748,7 +36971,7 @@ impl SysFn {
             SysFn::Upper | SysFn::UpperCs(_) | SysFn::UpperColl(_) => "UPPER",
             SysFn::Lower | SysFn::LowerCs(_) | SysFn::LowerColl(_) => "LOWER",
             SysFn::CharLength => "CHAR_LENGTH",
-            SysFn::OctetLength | SysFn::OctetLengthCs(_) => "OCTET_LENGTH",
+            SysFn::OctetLength | SysFn::OctetLengthCs(_) | SysFn::BlobOctetLength => "OCTET_LENGTH",
             SysFn::Substring => "SUBSTRING",
             SysFn::Trim(_) => "TRIM",
             SysFn::Left => "LEFT",
@@ -38249,6 +38472,7 @@ fn parse_sysfn_call(up: &str, b: &[char], pos: &mut usize) -> Option<RawExpr> {
         | SysFn::CharLength
         | SysFn::OctetLength
         | SysFn::OctetLengthCs(_)
+        | SysFn::BlobOctetLength
         | SysFn::Reverse
         | SysFn::Abs
         | SysFn::Sign => (1, 1),
@@ -38780,6 +39004,21 @@ fn resolve_expr_inner(
             Box::new(resolve_expr(b, columns, descs)?),
         ),
         RawExpr::Func(f, args) => {
+            // OCTET_LENGTH over a BLOB column: the column itself never
+            // resolves (a blob has no expression type here), so the
+            // length is recognised on the RAW shape and reads the
+            // stored blob at eval ([SysFn::BlobOctetLength])
+            if let (SysFn::OctetLength, [RawExpr::Col(name)]) = (f, args.as_slice()) {
+                let rc = columns.iter().find(|c| c.name.eq_ignore_ascii_case(name));
+                if let Some(d) = rc.and_then(|rc| descs.get(rc.field_id as usize)) {
+                    if d.dtype == dtype::BLOB && !is_computed_fid(descs, rc.unwrap().field_id as usize) {
+                        return Some(Expr::Func(
+                            SysFn::BlobOctetLength,
+                            vec![Expr::Col(rc.unwrap().field_id as usize)],
+                        ));
+                    }
+                }
+            }
             let resolved: Vec<Expr> = args
                 .iter()
                 .map(|a| resolve_expr(a, columns, descs))
@@ -40981,6 +41220,11 @@ impl Expr {
                 })
             }
             Expr::Func(f, args) => {
+                // a blob column has no expression type of its own: its
+                // length is the one thing asked of it here
+                if matches!(f, SysFn::BlobOctetLength) {
+                    return Some(ExprType::Int);
+                }
                 // every argument must be typeable; the arguments the
                 // engine converts (a number under UPPER renders to its
                 // text, a text length parses to its integer) convert in
@@ -40990,6 +41234,7 @@ impl Expr {
                     .map(|a| a.type_of(descs))
                     .collect::<Option<Vec<_>>>()?;
                 match f {
+                    SysFn::BlobOctetLength => Some(ExprType::Int), // answered above
                     // amount (Int/Numeric) + temporal operand -> the
                     // operand's kind; a TIME takes only clock units
                     SysFn::DateAdd(unit) => match (ts[0], ts[1]) {
@@ -41300,6 +41545,7 @@ impl Expr {
                 | SysFn::Position
                 | SysFn::Sign
                 | SysFn::Extract(_) => Some(NumRank::Long),
+                SysFn::BlobOctetLength => Some(NumRank::I64),
                 _ => None, // the text-valued functions
             },
             Expr::Str(_)
@@ -42132,6 +42378,12 @@ impl Expr {
                         let start = vs.get(2).map(fn_int).transpose()?.unwrap_or(1);
                         Value::Int(position_impl(&fn_text(&vs[0]), &fn_text(&vs[1]), start)?)
                     }
+                    SysFn::BlobOctetLength => match vs[0] {
+                        Value::Blob(rel, num) => {
+                            Value::Int(blob_length_of(rel, num).ok_or(EvalErr::Unsupported)?)
+                        }
+                        _ => return Err(EvalErr::Unsupported),
+                    },
                     SysFn::Reverse => {
                         Value::Text(fn_text(&vs[0]).chars().rev().collect())
                     }
@@ -51310,6 +51562,8 @@ fn expr_no_raise(e: &Expr, descs: &[Descriptor]) -> bool {
                 | SysFn::Reverse
                 | SysFn::Extract(_)
                 | SysFn::DateDiff(_) => true,
+                // an id the pages do not hold would raise; unprobed
+                SysFn::BlobOctetLength => false,
                 // DATEADD can leave the valid date range at runtime
                 SysFn::DateAdd(_) => false,
                 // a negative length raises - admit only a literal that
@@ -52591,6 +52845,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 database.as_ref().map(|d| d.own_tx().ids().to_vec()).unwrap_or_default(),
             ),
         ));
+        set_blob_source(database.as_ref());
         // AND THE IMAGE A ROLLBACK WOULD PUT BACK IS REFRESHED HERE.
         // While a transaction's undo is its own state, the snapshot is
         // unused; the moment a statement makes it need an IMAGE (DDL, a
@@ -63799,7 +64054,7 @@ mod tests {
                 gen_filter: None,
             })
         };
-        let upsert = Plan::UpdateOrInsert { update: update(), insert: insert() };
+        let upsert = Plan::UpdateOrInsert { update: update(), insert: insert(), upd_args: Vec::new() };
         let insel = Plan::InsertSelect {
             table: "DST".into(),
             cols: vec!["X".into()],
@@ -63814,7 +64069,7 @@ mod tests {
             fields: Vec::new(),
         };
         assert_eq!(
-            stmt_type_of(&wrap(Plan::UpdateOrInsert { update: update(), insert: insert() })),
+            stmt_type_of(&wrap(Plan::UpdateOrInsert { update: update(), insert: insert(), upd_args: Vec::new() })),
             1
         );
         assert_eq!(

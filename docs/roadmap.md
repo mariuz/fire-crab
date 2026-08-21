@@ -186,8 +186,7 @@ max_segment pieces) — when the framed length fits; the client then serves
 info / seek / get_segment from its copy (the gate's inline pass: wire
 opens fall away, the answers are the engine's line for line).
 
-**Still absent:** blob
-parameters in UPDATE … SET, blobs inside a batch, `op_ping`, `op_slice` (arrays),
+**Still absent:** blobs inside a batch, `op_ping`, `op_slice` (arrays),
 `op_transact`. Auth: only Srp256 offered; no Legacy_Auth / ChaCha /
 zlib. `op_info_transaction` answers only `isc_info_tra_id`. A text blob
 is stored in the database charset (UTF8) with no bpb transliteration.
@@ -435,8 +434,25 @@ pointer-page and TIP page numbers is the next step when it dominates.
   second `createBatch` supersedes the open one. Client `qa/c/batch.cpp`
   (OO API). **Still absent:** blobs inside a batch (`op_batch_regblob` /
   `op_batch_blob_stream` / `op_batch_set_bpb`), `op_info_batch`.
-- **NEXT**: blob parameters in UPDATE … SET; blobs inside a batch;
-  `op_ping` / `op_transact` / `op_slice`. (MERGE `RETURNING` / `NOT MATCHED BY SOURCE`, `op_info_blob`
+- **Blob parameters in UPDATE … SET DONE (2026-08-21,
+  `serve-real-blobupdate` 64, client `qa/c/blobupdate.c`):** a blr_quad
+  parameter at an UPDATE's SET (and UPDATE OR INSERT's update half) goes
+  through `store_blob_param`, blb::move's three cases probed live: a
+  TEMPORARY id is materialised into the relation (the first matched row;
+  every further row gets a COPY — no two records share a blob), the
+  ALL-ZERO quad stores an EMPTY blob (not NULL — INSERT too, probed), a
+  PERMANENT id is COPIED with the target column's sub_type/charset unless
+  it is the row's own id echoed back (kept, blb.cpp:1059). A stale temp
+  id (its transaction ended) is `invalid BLOB ID`. Also in:
+  `OCTET_LENGTH` over a BLOB column (BIGINT, from the stored header),
+  `UPDATE OR INSERT` with parameters (the update half's slot map), a
+  per-statement reset of materialised temp ids on failure. Before this,
+  an UPDATE with a blob parameter was silently wrong (the raw temp id
+  landed in the record). Boundaries: MERGE's UPDATE branch with a blob
+  source value; `SET blob = <expression>`; `OCTET_LENGTH` of the blob
+  inside the writing statement's RETURNING; a blob id bound to a
+  non-BLOB column refuses (the engine converts).
+- **NEXT**: blobs inside a batch; `op_ping` / `op_transact` / `op_slice`. (MERGE `RETURNING` / `NOT MATCHED BY SOURCE`, `op_info_blob`
   / `op_seek_blob`, the ordered JOIN fetch streaming, the RIGHT/FULL
   hash, the bulk index build, the cleanup — all done 2026-08-21.)
 - **D, the MERGE executor** — the BLR is already compiled and tested;
