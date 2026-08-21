@@ -689,7 +689,19 @@ pointer-page and TIP page numbers is the next step when it dominates.
   client round-tripped and isql rendered as `c000000:a000000` for the
   engine's `c:1e6`. All nine blob/array/batch gates green after the
   switch.
-- **NEXT**: `RECREATE`; `ALTER VIEW`; the rest of `E`. (`CREATE FUNCTION`
+- **NEXT**: the rest of `E` — `DROP TABLE`/`DROP` dependency enforcement,
+  the `CREATE TABLE` column-type gaps (BLOB is in; DECFLOAT, `TIME/TIMESTAMP
+  WITH TIME ZONE`, NCHAR, arrays, `COLLATE`/`CHARACTER SET`), and the
+  restore-only / auth DDL (packages, collations, users, mappings, shadows).
+  (`RECREATE` DONE 2026-08-21: `RECREATE TABLE/VIEW/PROCEDURE/EXCEPTION/
+  SEQUENCE/FUNCTION` = drop-if-exists then create, the CREATE planned at
+  prepare so a bad definition preserves the old object; `Plan::Recreate(Box<Plan>)`,
+  `plan_recreate` rewrites to CREATE and wraps, exec drops-then-creates.
+  serve-real-recreate 5 checks. `ALTER VIEW` DONE 2026-08-21: replaces a
+  view keeping its relation id — ods `alter_view` drops and repopulates with
+  a `forced_id`; missing-view vector matched. serve-real-alterview 5 checks.
+  Boundary carried by both: this server's DROP TABLE does not enforce
+  dependencies.) (`CREATE FUNCTION`
   DONE 2026-08-21: CREATE/DROP FUNCTION write the catalog and BLR, and a
   PSQL function is CALLED from a select list — `F(<expr>)` resolves only
   against the catalog, describes as the RETURN domain, and evaluates per
