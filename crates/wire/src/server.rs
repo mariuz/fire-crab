@@ -74,6 +74,8 @@ const OP_RECONNECT: i32 = 33; // op_reconnect - pick a limbo transaction back up
 const OP_PREPARE2: i32 = 51; // op_prepare with a TDR message
 const OP_OPEN_BLOB: i32 = 35;
 const OP_INFO_BLOB: i32 = 43;
+/// protocol 19: a blob shipped with the row that names it
+const OP_INLINE_BLOB: i32 = 114;
 const OP_SEEK_BLOB: i32 = 61;
 /// isc_bad_segstr_type: "invalid BLOB type for operation" - a seek on a
 /// segmented blob (blb.cpp BLB_lseek)
@@ -35176,6 +35178,20 @@ fn encode_row(
     values: &[Value],
     out: Option<&OutFmt>,
 ) -> Result<(), EvalErr> {
+    encode_row_inline(w, cols, values, out, None)
+}
+
+/// [encode_row], with the row's INLINE BLOBS sent ahead of it when the
+/// client declared a size (`inline` = the database to read them from
+/// and that size; 0 = none): server.cpp `sendInlineBlobs` runs before
+/// each message of a fetch batch.
+fn encode_row_inline(
+    w: &mut W,
+    cols: &[ProjCol],
+    values: &[Value],
+    out: Option<&OutFmt>,
+    inline: Option<(&Database, u32)>,
+) -> Result<(), EvalErr> {
     // each column's value: an expression's result, or the record field.
     // Computed up front so a divide-by-zero aborts before any byte lands.
     let mut vals: Vec<Value> = cols
@@ -35187,9 +35203,80 @@ fn encode_row(
     if let Some(out) = out {
         enforce_out_capacity(cols, &mut vals, out)?;
     }
+    if let Some((db, max)) = inline {
+        if max > 0 {
+            for v in &vals {
+                if let Value::Blob(rel, num) = v {
+                    inline_blob_packet(w, db, *rel, *num, max);
+                }
+            }
+        }
+    }
     w.int(OP_FETCH_RESPONSE).int(0).int(1);
     encode_row_body(w, cols, &vals, out)?;
     Ok(())
+}
+
+/// One `op_inline_blob` (server.cpp `sendInlineBlob`): the transaction,
+/// the blob id as the row carries it (the same 8 bytes), the info a `isc_blob_info` of num_segments /
+/// max_segment / total_length / type would answer, and the content
+/// framed `[u16 LE len][bytes]` per segment - a STREAM blob cut into
+/// max_segment pieces, which is why a small stream blob reads back in
+/// the pieces it was put in. Nothing is sent for the NULL blob, an id
+/// this server cannot read, or a blob whose framed length exceeds the
+/// client's size (capped at 65535): the client then opens it over the
+/// wire as before.
+fn inline_blob_packet(w: &mut W, db: &Database, rel: u16, num: u64, max: u32) {
+    if rel == 0 {
+        return; // the NULL blob (a zero id); a temp id never rides a row
+    }
+    let Ok(b) = fire_crab_blb::read_blob(&db.bytes(), db.page_size, rel, num) else {
+        return;
+    };
+    let stream = b.header.is_stream();
+    let total = b.header.length;
+    let max_segment = u64::from(b.header.max_segment);
+    let segments = if stream {
+        if max_segment == 0 { 0 } else { total.div_ceil(max_segment) }
+    } else {
+        u64::from(b.header.count)
+    };
+    let framed = total + 2 * segments;
+    if framed > u64::from(max.min(u16::MAX as u32)) {
+        return;
+    }
+    let mut data: Vec<u8> = Vec::with_capacity(framed as usize);
+    if total > 0 {
+        if stream {
+            let content = b.content();
+            for chunk in content.chunks(max_segment as usize) {
+                data.extend_from_slice(&(chunk.len() as u16).to_le_bytes());
+                data.extend_from_slice(chunk);
+            }
+        } else {
+            for seg in b.segments() {
+                data.extend_from_slice(&(seg.len() as u16).to_le_bytes());
+                data.extend_from_slice(seg);
+            }
+        }
+    }
+    let rb = ReadBlob {
+        segs: Vec::new(),
+        stream,
+        count: b.header.count,
+        max_segment: b.header.max_segment,
+        length: total,
+        idx: 0,
+        off: 0,
+    };
+    let info = rb.info(&[4, 5, 6, 7, 1], 64);
+    let id = encode_blob_id(rel, num);
+    if std::env::var("FC_SRV_TRACE").is_ok() {
+        eprintln!("[srv] inline blob {}:{} {} bytes in {} frames", rel, num, total, segments);
+    }
+    // the SAME 8 bytes the row encoder ships: the client decodes both
+    // with xdr_quad, and matches the cached copy by that value
+    w.int(OP_INLINE_BLOB).int(TX_HANDLE).raw(&id).bytes(&info).bytes(&data);
 }
 
 /// The message itself - null bitmap then values - with no framing op in
@@ -52161,6 +52248,11 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
     // hold open across another statement's fetches. Opened lazily on the
     // first fetch of a streamable plan; dropped when the cursor ends, is
     // re-executed, or is freed.
+    // the inline-blob size each statement's client declared at execute
+    // (p_sqldata_inline_blob_size, protocol 19): a blob up to that many
+    // bytes rides with the row that names it (op_inline_blob), and the
+    // client answers its info / seek / get_segment from the copy
+    let mut inline_sizes: std::collections::HashMap<i32, u32> = std::collections::HashMap::new();
     let mut cursors: std::collections::HashMap<i32, RowCursor> =
         std::collections::HashMap::new();
     let mut cur_stmt: i32 = 3;
@@ -52786,7 +52878,8 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     read_int(&mut s, &mut dec)?; // p_sqldata_cursor_flags
                 }
                 if best >= 19 {
-                    read_int(&mut s, &mut dec)?; // p_sqldata_inline_blob_size
+                    let n = read_int(&mut s, &mut dec)?; // p_sqldata_inline_blob_size
+                    inline_sizes.insert(cur_stmt, n.max(0) as u32);
                 }
                 if std::env::var("FC_SRV_TRACE").is_ok() && !bound_args.is_empty() {
                     eprintln!("[srv] execute params: {:?}", bound_args);
@@ -53476,7 +53569,13 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                                     let mut err = None;
                                     for rec in &rows {
                                         if let Err(e) =
-                                            encode_row(&mut w, &enc_cols, rec, out_fmt.as_ref())
+                                            encode_row_inline(
+                                                &mut w,
+                                                &enc_cols,
+                                                rec,
+                                                out_fmt.as_ref(),
+                                                Some((db, inline_sizes.get(&cur_stmt).copied().unwrap_or(0))),
+                                            )
                                         {
                                             err = Some(e);
                                             break;
@@ -53717,7 +53816,8 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     let batch: Vec<Vec<Value>> = rows.drain(..n).collect();
                     let mut err = None;
                     for r in &batch {
-                        if let Err(e) = encode_row(&mut w, cols, r, out_fmt.as_ref()) {
+                        let inline = database.as_ref().map(|db| (db, inline_sizes.get(&cur_stmt).copied().unwrap_or(0)));
+                        if let Err(e) = encode_row_inline(&mut w, cols, r, out_fmt.as_ref(), inline) {
                             err = Some(e);
                             break;
                         }

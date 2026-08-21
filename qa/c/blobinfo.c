@@ -6,7 +6,8 @@
  * segmented blob (isc_bad_segstr_type). Every number printed is
  * compared against the engine's.
  *
- *   blobinfo <connection-string>
+ *   blobinfo <connection-string> [inline]   (inline = keep the client's
+ *   default inline-blob size, so small blobs ride with the row)
  */
 #include <ibase.h>
 #include <stdio.h>
@@ -83,7 +84,9 @@ int main(int argc, char **argv) {
     /* no INLINE blobs (FB6 ships a small blob with the row and then
      * answers info / seek / get_segment from the client's cache): the
      * ops must reach the server on both sides for this to measure them */
-    dpb[dl++] = isc_dpb_max_inline_blob_size; dpb[dl++] = 4; dpb[dl++] = 0; dpb[dl++] = 0; dpb[dl++] = 0; dpb[dl++] = 0;
+    if (argc < 3 || strcmp(argv[2], "inline") != 0) {
+        dpb[dl++] = isc_dpb_max_inline_blob_size; dpb[dl++] = 4; dpb[dl++] = 0; dpb[dl++] = 0; dpb[dl++] = 0; dpb[dl++] = 0;
+    }
     if (isc_attach_database(st, 0, argv[1], &db, (short)dl, dpb)) die("attach");
     if (isc_start_transaction(st, &tr, 1, &db, 0, NULL)) die("start");
 
@@ -111,7 +114,11 @@ int main(int argc, char **argv) {
     in->sqlvar[1].sqltype = SQL_BLOB; in->sqlvar[1].sqldata = (char *)&str_id; in->sqlvar[1].sqllen = 8; in->sqlvar[1].sqlind = &ind1;
     isc_stmt_handle sth = 0;
     if (isc_dsql_allocate_statement(st, &db, &sth)) die("alloc");
-    if (isc_dsql_prepare(st, &tr, &sth, 0, "INSERT INTO B (ID, SEG, STR) VALUES (1, ?, ?)", 3, NULL)) die("prepare insert");
+    int inline_mode = (argc >= 3 && strcmp(argv[2], "inline") == 0);
+    char ins[96], sel[96];
+    snprintf(ins, sizeof ins, "INSERT INTO B (ID, SEG, STR) VALUES (%d, ?, ?)", inline_mode ? 2 : 1);
+    snprintf(sel, sizeof sel, "SELECT SEG, STR FROM B WHERE ID = %d", inline_mode ? 2 : 1);
+    if (isc_dsql_prepare(st, &tr, &sth, 0, ins, 3, NULL)) die("prepare insert");
     if (isc_dsql_execute(st, &tr, &sth, 1, in)) die("execute insert");
     if (isc_dsql_free_statement(st, &sth, DSQL_drop)) die("free");
     if (isc_commit_transaction(st, &tr)) die("commit");
@@ -124,7 +131,7 @@ int main(int argc, char **argv) {
     ISC_QUAD rseg, rstr; short i0, i1;
     sth = 0;
     if (isc_dsql_allocate_statement(st, &db, &sth)) die("alloc2");
-    if (isc_dsql_prepare(st, &tr, &sth, 0, "SELECT SEG, STR FROM B WHERE ID = 1", 3, out)) die("prepare select");
+    if (isc_dsql_prepare(st, &tr, &sth, 0, sel, 3, out)) die("prepare select");
     out->sqlvar[0].sqldata = (char *)&rseg; out->sqlvar[0].sqlind = &i0; out->sqlvar[0].sqltype = SQL_BLOB + 1;
     out->sqlvar[1].sqldata = (char *)&rstr; out->sqlvar[1].sqlind = &i1; out->sqlvar[1].sqltype = SQL_BLOB + 1;
     if (isc_dsql_execute(st, &tr, &sth, 1, NULL)) die("execute select");

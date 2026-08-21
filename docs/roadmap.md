@@ -177,9 +177,16 @@ with the fetch, framed by max_segment, and the client then answers
 info / seek / get_segment from its cache); the gate disables inlining
 through the DPB so both servers answer the ops over the wire — a
 default client reads the same bytes either way, in differently sized
-frames for a stream blob.
+frames for a stream blob. **`op_inline_blob` DONE (2026-08-21,
+`serve-real-blobinfo` 103):** a client that declares
+`p_sqldata_inline_blob_size` (protocol 19) gets each row's blobs ahead of
+the row — the same 8 id bytes the row carries, the info `isc_blob_info`
+would answer, the content framed per segment (a stream blob in
+max_segment pieces) — when the framed length fits; the client then serves
+info / seek / get_segment from its copy (the gate's inline pass: wire
+opens fall away, the answers are the engine's line for line).
 
-**Still absent:** `op_inline_blob`, blob
+**Still absent:** blob
 parameters in UPDATE … SET, `op_batch_*` (the batch API), `op_fetch_scroll`
 (dsql already emits `blr_scrollable`), `op_ping`, `op_slice` (arrays),
 `op_transact`. Auth: only Srp256 offered; no Legacy_Auth / ChaCha /
@@ -394,8 +401,9 @@ pointer-page and TIP page numbers is the next step when it dominates.
   transaction state; the write side is released between requests
   unconditionally. The gates that pinned the image path pin the state
   path now (`serve-real-autonomous` counts commits, not carve-outs).
-- **NEXT**: `op_inline_blob`; a merge join; the RIGHT/FULL side in a
-  `RowStore`. (MERGE `RETURNING` / `NOT MATCHED BY SOURCE`, `op_info_blob`
+- **NEXT**: a merge join; the RIGHT/FULL side in a `RowStore`;
+  `op_inline_blob` on the op_execute2 singleton path (`op_inline_blob`
+  for fetched rows done 2026-08-21). (MERGE `RETURNING` / `NOT MATCHED BY SOURCE`, `op_info_blob`
   / `op_seek_blob`, the ordered JOIN fetch streaming, the RIGHT/FULL
   hash, the bulk index build, the cleanup — all done 2026-08-21.)
 - **D, the MERGE executor** — the BLR is already compiled and tested;

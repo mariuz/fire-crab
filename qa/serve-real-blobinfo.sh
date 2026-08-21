@@ -59,12 +59,27 @@ while [ $i -le $n ]; do
     i=$((i + 1))
 done
 check "the same number of lines" "$(echo "$C" | wc -l)" "$n"
+# INLINE MODE: the client keeps its default inline-blob size, so both
+# servers ship the small blobs WITH the row (op_inline_blob, protocol 19)
+# and the client answers info / seek / get_segment from its copy - the
+# stream blob now reads back in max_segment pieces on both sides. A
+# second row, so the twin databases stay in step.
+E2=$("$D/blobinfo" "127.0.0.1/$REAL:$DBE" inline 2>&1)
+C2=$("$D/blobinfo" "127.0.0.1/$PORT:$DBF" inline 2>&1)
+n2=$(echo "$E2" | wc -l)
+i=1
+while [ $i -le $n2 ]; do
+    el=$(echo "$E2" | sed -n "${i}p"); cl=$(echo "$C2" | sed -n "${i}p")
+    check "inline, line $i: $el" "$cl" "$el"
+    i=$((i + 1))
+done
+check "inline: the same number of lines" "$(echo "$C2" | wc -l)" "$n2"
 check "the ENGINE reads the blobs fc stored" \
-    "$(printf 'SET HEADING OFF;\nSELECT OCTET_LENGTH(SEG), OCTET_LENGTH(STR) FROM B;\n' | "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$REAL:$DBF" 2>&1 | tr -s ' \n' ' ')" " 314 50 "
+    "$(printf 'SET HEADING OFF;\nSELECT OCTET_LENGTH(SEG), OCTET_LENGTH(STR) FROM B ORDER BY ID;\n' | "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$REAL:$DBF" 2>&1 | tr -s ' \n' ' ')" " 314 50 314 50 "
 ran=$((ran + 1)); g=$("$GFIX" -v -full -user "$U" -pas "$P" "$DBF" 2>&1)
 if [ -z "$g" ]; then echo "OK   gfix -v -full finds nothing on fc's file"; else echo "DIFF gfix: $g"; fail=1; fi
 ran=$((ran + 1)); if "$GBAK" -b -user "$U" -pas "$P" "$DBF" "$D/fc-blobinfo.fbk" >/dev/null 2>&1; then echo "OK   gbak -b carries fc's file"; else echo "DIFF gbak -b failed"; fail=1; fi
-ran=$((ran + 1)); a=$(grep -c 'info blob' "$LOG"); b=$(grep -c 'seek blob' "$LOG")
-if [ "$a" -ge 4 ] && [ "$b" -ge 8 ]; then echo "OK   coverage: $a info, $b seek through the server"; else echo "DIFF coverage: info $a seek $b"; fail=1; fi
+ran=$((ran + 1)); a=$(grep -c 'info blob' "$LOG"); b=$(grep -c 'seek blob' "$LOG"); c=$(grep -c 'inline blob' "$LOG")
+if [ "$a" -ge 4 ] && [ "$b" -ge 8 ] && [ "$c" -ge 2 ]; then echo "OK   coverage: $a info, $b seek through the server, $c blobs shipped inline"; else echo "DIFF coverage: info $a seek $b inline $c"; fail=1; fi
 echo "ran $ran checks"
 exit $fail
