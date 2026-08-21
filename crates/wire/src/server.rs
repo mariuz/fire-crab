@@ -23875,26 +23875,81 @@ struct IndexHash {
 }
 
 fn index_hash(rows: &[Vec<Value>], probe: &JoinProbe) -> Option<IndexHash> {
-    let [key] = probe.keys.as_slice() else { return None };
-    let fid = key.inner_fid;
-    let mut buckets: std::collections::HashMap<JoinKey, Vec<usize>> = std::collections::HashMap::new();
-    let mut kind: Option<KeyKind> = None;
+    let mut b = IndexHashBuilder::new(probe);
     for (i, r) in rows.iter().enumerate() {
-        let v = r.get(fid)?;
+        b.add(i, r);
+    }
+    b.finish()
+}
+
+/// [index_hash] one row at a time - for a side that streams into a
+/// [crate::extsort::RowStore] rather than a Vec
+struct IndexHashBuilder {
+    fid: Option<usize>,
+    kind: Option<KeyKind>,
+    buckets: std::collections::HashMap<JoinKey, Vec<usize>>,
+    declined: bool,
+}
+
+impl IndexHashBuilder {
+    fn new(probe: &JoinProbe) -> IndexHashBuilder {
+        let fid = match probe.keys.as_slice() {
+            [key] => Some(key.inner_fid),
+            _ => None,
+        };
+        IndexHashBuilder { declined: fid.is_none(), fid, kind: None, buckets: std::collections::HashMap::new() }
+    }
+    fn add(&mut self, i: usize, r: &[Value]) {
+        if self.declined {
+            return;
+        }
+        let Some(v) = self.fid.and_then(|f| r.get(f)) else {
+            self.declined = true;
+            return;
+        };
         match join_key(v) {
             Some((kk, k)) => {
-                match kind {
-                    None => kind = Some(kk),
-                    Some(prev) if prev != kk => return None,
+                match self.kind {
+                    None => self.kind = Some(kk),
+                    Some(prev) if prev != kk => {
+                        self.declined = true;
+                        return;
+                    }
                     _ => {}
                 }
-                buckets.entry(k).or_default().push(i);
+                self.buckets.entry(k).or_default().push(i);
             }
             None if matches!(v, Value::Null) => {}
-            None => return None,
+            None => self.declined = true,
         }
     }
-    Some(IndexHash { kind: kind.unwrap_or(KeyKind::Int), buckets })
+    fn finish(self) -> Option<IndexHash> {
+        if self.declined {
+            return None;
+        }
+        Some(IndexHash { kind: self.kind.unwrap_or(KeyKind::Int), buckets: self.buckets })
+    }
+}
+
+/// A RIGHT/FULL last side as the cursor keeps it: rows in a
+/// [crate::extsort::RowStore] (RAM to the budget, an unlinked file past
+/// it - the engine's RecordBuffer), addressed by row index through
+/// their offsets. The mirror's match bitmap and hash are by that index.
+struct MirrorSide {
+    store: crate::extsort::RowStore,
+    offs: Vec<u64>,
+}
+
+impl MirrorSide {
+    fn len(&self) -> usize {
+        self.offs.len()
+    }
+    fn get(&self, i: usize) -> Result<Vec<Value>, EvalErr> {
+        self.store.get(self.offs[i]).map_err(|e| {
+            eprintln!("[srv] join mirror store: {}", e);
+            EvalErr::Unsupported
+        })
+    }
 }
 
 /// The row indices of a side a driver row can match, in side order: its
@@ -30827,6 +30882,9 @@ struct JoinCursor {
     /// row ([mirror_candidates]); `None` = the ON scans the side
     mirror_hash: Option<IndexHash>,
     mirror_cand: Vec<usize>,
+    /// RIGHT/FULL last part only: its side, stored (the part's `inner`
+    /// stays empty)
+    mirror_side: Option<MirrorSide>,
     /// resume position. The DRIVER PHASE walks `di` over the base rows; when
     /// it exhausts, a RIGHT/FULL last part enters the MIRROR PHASE, walking
     /// `mi` over the last side and emitting the rows `right_matched` left
@@ -30894,6 +30952,8 @@ impl JoinCursor {
         let per_page = fire_crab_ods::format::max_recs_per_dp(db.page_size);
         let driver = base.rows(db).ok()?;
         let mut parts_data: Vec<PartData> = Vec::with_capacity(parts.len());
+        let mut mirror_side: Option<MirrorSide> = None;
+        let mut mirror_hash: Option<IndexHash> = None;
         for p in parts {
             if p.probe.as_ref().is_some_and(|pr| pr.index.is_some()) {
                 // a probed side is NOT materialised: its rows come from the
@@ -30917,17 +30977,39 @@ impl JoinCursor {
                 });
                 continue;
             }
+            if matches!(p.kind, JoinKind::Right | JoinKind::Full) {
+                // the RIGHT/FULL last side STREAMS into a RowStore - RAM
+                // to the budget, a file past it - hashed by row index on
+                // the way for the mirror ([mirror_candidates])
+                let mut store = crate::extsort::RowStore::new();
+                let mut offs: Vec<u64> = Vec::new();
+                let mut hb = p.probe.as_ref().map(IndexHashBuilder::new);
+                p.src
+                    .for_each(db, &mut |r| {
+                        let off = store.push(&r).map_err(|e| {
+                            eprintln!("[srv] join mirror store: {}", e);
+                            EvalErr::Unsupported
+                        })?;
+                        if let Some(b) = hb.as_mut() {
+                            b.add(offs.len(), &r);
+                        }
+                        offs.push(off);
+                        Ok(Flow::Continue)
+                    })
+                    .ok()?;
+                if std::env::var("FC_SRV_TRACE").is_ok() {
+                    eprintln!("[srv] join mirror store: rows={} spilled={}", offs.len(), store.spilled_bytes());
+                }
+                mirror_hash = hb.and_then(|b| b.finish());
+                mirror_side = Some(MirrorSide { store, offs });
+                parts_data.push(PartData { part: p.clone(), inner: Vec::new(), key_hash: None, probed: None });
+                continue;
+            }
             let inner = p.src.rows(db).ok()?;
             // an unindexed equi part hashes its inner by the ON's key; a theta
             // part (no probe, or a key the hash declines) leaves it `None` and
             // the ON scans the whole inner
-            // (a RIGHT/FULL last part is hashed BY ROW for its mirror -
-            // `mirror_hash` below - not copied into a RowStore here)
-            let key_hash = if matches!(p.kind, JoinKind::Left | JoinKind::Inner) {
-                p.probe.as_ref().and_then(|pr| build_join_key_hash_from_rows(&inner, pr))
-            } else {
-                None
-            };
+            let key_hash = p.probe.as_ref().and_then(|pr| build_join_key_hash_from_rows(&inner, pr));
             parts_data.push(PartData { part: p.clone(), inner, key_hash, probed: None });
         }
         // a RIGHT/FULL last part needs the mirror machinery: the match bitmap
@@ -30941,15 +31023,10 @@ impl JoinCursor {
             (
                 side_filter(&above, 0..mirror_left_width),
                 side_filter(&above, mirror_left_width..mirror_left_width + last.width),
-                vec![false; parts_data.last().map_or(0, |pd| pd.inner.len())],
+                vec![false; mirror_side.as_ref().map_or(0, |m| m.len())],
             )
         } else {
             (None, None, Vec::new())
-        };
-        let mirror_hash = if is_mirror {
-            parts_data.last().and_then(|pd| pd.part.probe.as_ref().and_then(|p| index_hash(&pd.inner, p)))
-        } else {
-            None
         };
         Some(JoinCursor {
             image: Some(image),
@@ -30965,6 +31042,7 @@ impl JoinCursor {
             rgate,
             mirror_hash,
             mirror_cand: Vec::new(),
+            mirror_side,
             di: 0,
             mi: 0,
             pending: Vec::new(),
@@ -31006,7 +31084,7 @@ impl JoinCursor {
             // refill: the DRIVER PHASE while base rows remain, then (a
             // RIGHT/FULL last part) the MIRROR PHASE over the last side's rows
             // nothing matched
-            let last_inner = self.parts.last().map_or(0, |pd| pd.inner.len());
+            let last_inner = self.mirror_side.as_ref().map_or(0, |m| m.len());
             if self.di < self.driver.len() {
                 let base_row = self.driver[self.di].clone();
                 self.di += 1;
@@ -31165,17 +31243,19 @@ impl JoinCursor {
     /// left-side WHERE, same FULL-keeps / RIGHT-drops rule - then the top
     /// `Filter` (the WHERE) and the projection.
     fn mirror_driver_output(&mut self, acc: Vec<Vec<Value>>) -> Result<Vec<Vec<Value>>, EvalErr> {
-        let JoinCursor { parts, mirror_left_width, above, cols, right_matched, lgate, mirror_hash, mirror_cand, .. } =
-            self;
+        let JoinCursor {
+            parts, mirror_left_width, above, cols, right_matched, lgate, mirror_hash, mirror_cand, mirror_side, ..
+        } = self;
         let pd = parts.last().expect("a mirror cursor has a last part");
-        let (part, inner) = (&pd.part, &pd.inner);
+        let part = &pd.part;
+        let side = mirror_side.as_ref().expect("a mirror cursor stores its last side");
         let mut out = Vec::new();
         for acc_row in acc {
             let mut matched = false;
-            for &ri in mirror_candidates(mirror_hash.as_ref(), part.probe.as_ref(), &acc_row, inner.len(), mirror_cand) {
-                let r = &inner[ri];
+            for &ri in mirror_candidates(mirror_hash.as_ref(), part.probe.as_ref(), &acc_row, side.len(), mirror_cand) {
+                let r = side.get(ri)?;
                 let mut row = acc_row.clone();
-                row.extend(r.iter().cloned());
+                row.extend(r);
                 // `matches` answers false for UNKNOWN (a NULL key never
                 // joins); an eval error ends the join, where the engine raises
                 if !part.on.matches(&row)? {
@@ -31193,7 +31273,7 @@ impl JoinCursor {
             // a PARTNERLESS accumulated row still meets the ON (the raise,
             // gated by the left-side WHERE); a FULL join keeps it padded, a
             // RIGHT drops it, an empty last side does not open the ON at all
-            if !matched && !(inner.is_empty() && matches!(part.kind, JoinKind::Right)) {
+            if !matched && !(side.len() == 0 && matches!(part.kind, JoinKind::Right)) {
                 let mut row = acc_row.clone();
                 row.resize(*mirror_left_width + part.width, Value::Null);
                 if match lgate {
@@ -31224,17 +31304,18 @@ impl JoinCursor {
     /// (or empty at the end). The driver phase has finished by the time this
     /// runs, so `right_matched` is final.
     fn mirror_output(&mut self) -> Result<Vec<Vec<Value>>, EvalErr> {
-        let JoinCursor { parts, mirror_left_width, above, cols, right_matched, rgate, mi, .. } = self;
+        let JoinCursor { parts, mirror_left_width, above, cols, right_matched, rgate, mi, mirror_side, .. } = self;
         let pd = parts.last().expect("a mirror cursor has a last part");
-        let (part, inner) = (&pd.part, &pd.inner);
-        while *mi < inner.len() {
+        let part = &pd.part;
+        let side = mirror_side.as_ref().expect("a mirror cursor stores its last side");
+        while *mi < side.len() {
             let ri = *mi;
             *mi += 1;
             if right_matched[ri] {
                 continue;
             }
             let mut row = vec![Value::Null; *mirror_left_width];
-            row.extend(inner[ri].iter().cloned());
+            row.extend(side.get(ri)?);
             if match rgate {
                 None => true,
                 Some(p) => p.matches(&row)?,

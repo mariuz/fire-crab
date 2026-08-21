@@ -407,9 +407,15 @@ pointer-page and TIP page numbers is the next step when it dominates.
   INNER`; "MERGE JOIN does not support other join types yet"); fc's
   hash build side spills to a `RowStore` past its budget instead, so the
   overflow case is answered without a second join algorithm.
-- **NEXT**: the RIGHT/FULL side in a `RowStore`; `op_batch_*`;
-  `op_fetch_scroll`. (`op_inline_blob` for fetched rows AND the
-  op_execute2 singleton done 2026-08-21.) (MERGE `RETURNING` / `NOT MATCHED BY SOURCE`, `op_info_blob`
+- **RIGHT/FULL side in a `RowStore` DONE (2026-08-21):** the join
+  cursor streams the preserved side into a `RowStore` (RAM to the sort
+  budget, an unlinked file past it), hashed by row index on the way;
+  the mirror's bitmap and candidates address rows by index through
+  their offsets (`serve-real-joinorder` 15 pins a spill at a 64 KB
+  budget). The materialising paths (`join_step`, the `for_each` arm)
+  still hold the side as a `Vec` — they materialise everything anyway.
+- **NEXT**: `op_batch_*` (the batch API); `op_fetch_scroll`; blob
+  parameters in UPDATE … SET. (MERGE `RETURNING` / `NOT MATCHED BY SOURCE`, `op_info_blob`
   / `op_seek_blob`, the ordered JOIN fetch streaming, the RIGHT/FULL
   hash, the bulk index build, the cleanup — all done 2026-08-21.)
 - **D, the MERGE executor** — the BLR is already compiled and tested;

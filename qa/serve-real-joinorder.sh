@@ -72,6 +72,10 @@ both "a WHERE above the join, then the sort" \
     "SELECT E.ID, D.NAME FROM E JOIN D ON D.ID = E.DID WHERE E.SAL > 900 ORDER BY D.NAME, E.ID;"
 both "RIGHT JOIN last part: the mirror rows sort with the rest" \
     "SELECT E.ID, D.NAME FROM E RIGHT JOIN D ON D.ID = E.DID ORDER BY D.NAME, E.ID;"
+both "RIGHT JOIN with the BIG side preserved: the stored side spills" \
+    "SELECT D.ID, E.ID FROM D RIGHT JOIN E ON E.DID = D.ID WHERE E.ID > 2980 OR D.ID IS NULL ORDER BY E.ID DESC;"
+both "FULL JOIN, the big side last, under a WHERE on each side" \
+    "SELECT COUNT(*), COUNT(D.ID), COUNT(E.ID) FROM D FULL JOIN E ON E.DID = D.ID;"
 both "FULL JOIN with ORDER BY" \
     "SELECT E.ID, D.ID FROM E FULL JOIN D ON D.ID = E.DID WHERE E.ID IS NULL OR E.ID > 2990 ORDER BY D.ID, E.ID;"
 both "FIRST n after the sort" \
@@ -82,5 +86,9 @@ both "the cursor fetched in small batches: the same rows" \
     "SELECT E.ID, D.NAME FROM E JOIN D ON D.ID = E.DID ORDER BY E.NAME DESC;"
 ran=$((ran + 1)); n=$(grep -c 'sort cursor:' "$LOG"); sp=$(grep -c 'sort cursor:.*runs=[0-9]*[2-9]' "$LOG")
 if [ "$n" -ge 8 ]; then echo "OK   coverage: $n ordered fetches streamed through the sort cursor ($sp past the budget)"; else echo "DIFF coverage: [$n] sort cursors"; grep 'sort' "$LOG" | head -3; fail=1; fi
+# the RIGHT/FULL last side lives in a RowStore (RAM to the budget, a
+# file past it); the 64 KB budget makes E's 3000 rows spill
+ran=$((ran + 1)); m=$(grep -c 'join mirror store: rows=' "$LOG"); ms=$(grep -c 'join mirror store: rows=[0-9]* spilled=[1-9]' "$LOG")
+if [ "$m" -ge 2 ] && [ "$ms" -ge 1 ]; then echo "OK   coverage: $m mirror sides stored, $ms spilled past the budget"; else echo "DIFF coverage: mirror stores $m, spilled $ms"; grep 'mirror' "$LOG" | head -3; fail=1; fi
 echo "ran $ran checks"
 exit $fail
