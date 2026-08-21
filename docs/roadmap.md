@@ -187,8 +187,7 @@ info / seek / get_segment from its copy (the gate's inline pass: wire
 opens fall away, the answers are the engine's line for line).
 
 **Still absent:** blob
-parameters in UPDATE … SET, `op_batch_*` (the batch API), `op_fetch_scroll`
-(dsql already emits `blr_scrollable`), `op_ping`, `op_slice` (arrays),
+parameters in UPDATE … SET, `op_batch_*` (the batch API), `op_ping`, `op_slice` (arrays),
 `op_transact`. Auth: only Srp256 offered; no Legacy_Auth / ChaCha /
 zlib. `op_info_transaction` answers only `isc_info_tra_id`. A text blob
 is stored in the database charset (UTF8) with no bpb transliteration.
@@ -222,8 +221,8 @@ columns in RETURNING / an expression there (refused at prepare), `PLAN` /
 statement's partial `Records affected` (the engine reports the rows it
 moved before the raise; fc reports 0), a trigger-bearing target
 (refused by the per-row planners at execute, not at prepare).
-Scrollable cursors: `dsql` emits `blr_scrollable`, `op_fetch_scroll` is
-unimplemented.
+Scrollable cursors: `dsql` emits `blr_scrollable`, and `op_fetch_scroll`
+is answered (2026-08-21, see the slice list).
 
 ### E. DDL without planners
 
@@ -414,8 +413,18 @@ pointer-page and TIP page numbers is the next step when it dominates.
   their offsets (`serve-real-joinorder` 15 pins a spill at a 64 KB
   budget). The materialising paths (`join_step`, the `for_each` arm)
   still hold the side as a `Vec` — they materialise everything anyway.
-- **NEXT**: `op_batch_*` (the batch API); `op_fetch_scroll`; blob
-  parameters in UPDATE … SET. (MERGE `RETURNING` / `NOT MATCHED BY SOURCE`, `op_info_blob`
+- **`op_fetch_scroll` DONE (2026-08-21, `serve-real-scroll` 49):** a
+  statement executed with `CURSOR_TYPE_SCROLLABLE` buffers its result at
+  the first fetch (the engine's BufferedStream) and answers NEXT / PRIOR
+  / FIRST / LAST / ABSOLUTE / RELATIVE with Cursor.cpp's rules (BOS / EOS
+  parking, absolute from either end, relative 0 re-reads); NEXT/PRIOR
+  deliver the client's batch, the positioned ops one row; a scroll op on
+  a plain cursor answers `isc_invalid_fetch_option` naming the option.
+  The client is `qa/c/scroll.cpp` over the OO API (its own prefetch and
+  relative re-positioning included). `blr_scrollable` in `dsql` was
+  already there.
+- **NEXT**: `op_batch_*` (the batch API); blob parameters in UPDATE …
+  SET. (MERGE `RETURNING` / `NOT MATCHED BY SOURCE`, `op_info_blob`
   / `op_seek_blob`, the ordered JOIN fetch streaming, the RIGHT/FULL
   hash, the bulk index build, the cleanup — all done 2026-08-21.)
 - **D, the MERGE executor** — the BLR is already compiled and tested;

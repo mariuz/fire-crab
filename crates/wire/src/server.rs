@@ -76,6 +76,11 @@ const OP_OPEN_BLOB: i32 = 35;
 const OP_INFO_BLOB: i32 = 43;
 /// protocol 19: a blob shipped with the row that names it
 const OP_INLINE_BLOB: i32 = 114;
+/// protocol 18: a fetch with an operation and a position (p_sqldata_fetch_op /
+/// p_sqldata_fetch_pos) over a SCROLLABLE cursor
+const OP_FETCH_SCROLL: i32 = 112;
+/// isc_invalid_fetch_option: "Fetch option @1 is invalid for a non-scrollable cursor"
+const GDS_INVALID_FETCH_OPTION: i32 = 335544993;
 const OP_SEEK_BLOB: i32 = 61;
 /// isc_bad_segstr_type: "invalid BLOB type for operation" - a seek on a
 /// segmented blob (blb.cpp BLB_lseek)
@@ -314,6 +319,89 @@ impl ReadBlob {
         }
         out.push(1);
         out
+    }
+}
+
+/// Where a scrollable cursor stands: before the first row, on a row,
+/// after the last (jrd/recsrc/Cursor.cpp BOS / POSITIONED / EOS).
+#[derive(Clone, Copy, PartialEq)]
+enum ScrollPos {
+    Bos,
+    On,
+    Eos,
+}
+
+/// A SCROLLABLE cursor's materialised result and position - the engine's
+/// BufferedStream under a scrollable RSE, with Cursor.cpp's positioning
+/// rules: ABSOLUTE n counts from the first row (n > 0) or from past the
+/// last (n < 0), 0 leaves the cursor before the first; RELATIVE k moves
+/// from the current row, from before-first when k > 0, from past-last
+/// when k < 0, and 0 re-reads the current row; a move past either end
+/// parks the cursor there and answers no row. NEXT/PRIOR/FIRST/LAST are
+/// RELATIVE ±1 and ABSOLUTE ±1.
+struct ScrollState {
+    cols: Vec<ProjCol>,
+    rows: Vec<Vec<Value>>,
+    state: ScrollPos,
+    pos: usize,
+}
+
+impl ScrollState {
+    /// One fetch operation: the index of the row it lands on, or None
+    /// (no data) with the position updated as the engine's would be
+    fn step(&mut self, op: i32, pos: i64) -> Option<usize> {
+        match op {
+            0 => self.relative(1),
+            1 => self.relative(-1),
+            2 => self.absolute(1),
+            3 => self.absolute(-1),
+            4 => self.absolute(pos),
+            _ => self.relative(pos),
+        }
+    }
+    fn land(&mut self, idx: i64) -> Option<usize> {
+        let count = self.rows.len() as i64;
+        if idx < 0 {
+            self.state = ScrollPos::Bos;
+            None
+        } else if idx >= count {
+            self.state = ScrollPos::Eos;
+            None
+        } else {
+            self.state = ScrollPos::On;
+            self.pos = idx as usize;
+            Some(self.pos)
+        }
+    }
+    fn absolute(&mut self, n: i64) -> Option<usize> {
+        if n == 0 {
+            self.state = ScrollPos::Bos;
+            return None;
+        }
+        let count = self.rows.len() as i64;
+        self.land(if n > 0 { n - 1 } else { count + n })
+    }
+    fn relative(&mut self, k: i64) -> Option<usize> {
+        let count = self.rows.len() as i64;
+        if k == 0 {
+            return if self.state == ScrollPos::On { Some(self.pos) } else { None };
+        }
+        let idx = match self.state {
+            ScrollPos::Bos => {
+                if k < 0 {
+                    return None;
+                }
+                k - 1
+            }
+            ScrollPos::Eos => {
+                if k > 0 {
+                    return None;
+                }
+                count + k
+            }
+            ScrollPos::On => self.pos as i64 + k,
+        };
+        self.land(idx)
     }
 }
 
@@ -52349,6 +52437,12 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
     // bytes rides with the row that names it (op_inline_blob), and the
     // client answers its info / seek / get_segment from the copy
     let mut inline_sizes: std::collections::HashMap<i32, u32> = std::collections::HashMap::new();
+    // statements executed with CURSOR_TYPE_SCROLLABLE (p_sqldata_cursor_flags
+    // & 1, protocol 18), and the materialised result each one scrolls over
+    // once its first fetch arrives (the engine's BufferedStream under a
+    // scrollable RSE) - see [ScrollState]
+    let mut scrollable: std::collections::HashSet<i32> = std::collections::HashSet::new();
+    let mut scroll: std::collections::HashMap<i32, ScrollState> = std::collections::HashMap::new();
     let mut cursors: std::collections::HashMap<i32, RowCursor> =
         std::collections::HashMap::new();
     let mut cur_stmt: i32 = 3;
@@ -52940,6 +53034,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 let h = read_int(&mut s, &mut dec)?; // stmt
                 use_stmt!(h);
                 cursors.remove(&h); // a fresh execute opens a fresh cursor
+                scroll.remove(&h);
                 read_int(&mut s, &mut dec)?; // tr
                 let in_blr = read_wire_bytes(&mut s, &mut dec)?; // input blr
                 read_int(&mut s, &mut dec)?; // msg number
@@ -52971,7 +53066,12 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     read_int(&mut s, &mut dec)?; // p_sqldata_timeout
                 }
                 if best >= 18 {
-                    read_int(&mut s, &mut dec)?; // p_sqldata_cursor_flags
+                    let flags = read_int(&mut s, &mut dec)?; // p_sqldata_cursor_flags
+                    if flags & 1 != 0 {
+                        scrollable.insert(cur_stmt); // CURSOR_TYPE_SCROLLABLE
+                    } else {
+                        scrollable.remove(&cur_stmt);
+                    }
                 }
                 if best >= 19 {
                     let n = read_int(&mut s, &mut dec)?; // p_sqldata_inline_blob_size
@@ -53550,7 +53650,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 w.int(OP_RESPONSE).int(0).int(0).int(0).bytes(&info).int(0);
                 w.send(&mut s, &mut enc)?;
             }
-            x if x == OP_FETCH => {
+            x if x == OP_FETCH || x == OP_FETCH_SCROLL => {
                 let h = read_int(&mut s, &mut dec)?; // stmt
                 use_stmt!(h);
                 // the client's declared OUTPUT-message BLR travels on
@@ -53563,12 +53663,102 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     .map(|slots| OutFmt { slots, att: att_cs });
                 read_int(&mut s, &mut dec)?; // msg number
                 let want = read_int(&mut s, &mut dec)?; // count
+                // op_fetch_scroll: the operation (0 next, 1 prior, 2 first,
+                // 3 last, 4 absolute, 5 relative) and its position
+                let (fop, fpos) = if x == OP_FETCH_SCROLL {
+                    let op = read_int(&mut s, &mut dec)?;
+                    let pos = read_int(&mut s, &mut dec)?;
+                    (op, pos)
+                } else {
+                    (0, 0)
+                };
                 if std::env::var("FC_SRV_TRACE").is_ok() {
-                    eprintln!("[srv] fetch: {:?} (want {})", stmt_sql.trim(), want);
+                    eprintln!("[srv] fetch: {:?} (want {}, op {} pos {})", stmt_sql.trim(), want, fop, fpos);
                 }
                 // kicked by a forced shutdown: the engine's vector, no work
                 if database.as_ref().is_some_and(|d| d.kicked()) {
                     respond_kicked(&mut s, &mut enc)?;
+                    continue;
+                }
+                // A SCROLLABLE CURSOR scrolls over its materialised result
+                // (the engine buffers a scrollable RSE whole, BufferedStream);
+                // a scroll op on a cursor opened without the flag is the
+                // engine's isc_invalid_fetch_option, naming the option.
+                if fop != 0 && !scrollable.contains(&cur_stmt) {
+                    let name = match fop {
+                        1 => "PRIOR",
+                        2 => "FIRST",
+                        3 => "LAST",
+                        4 => "ABSOLUTE",
+                        _ => "RELATIVE",
+                    };
+                    let mut w = W::default();
+                    w.int(OP_RESPONSE).int(0).int(0).int(0).int(0);
+                    w.int(1).int(GDS_INVALID_FETCH_OPTION).int(2).bytes(name.as_bytes()).int(0);
+                    w.send(&mut s, &mut enc)?;
+                    continue;
+                }
+                if scrollable.contains(&cur_stmt) {
+                    if !scroll.contains_key(&cur_stmt) {
+                        let built = database.as_ref().and_then(|db| {
+                            let rows = match &*plan {
+                                Plan::Rows { rows, .. } => Some(rows.clone()),
+                                _ => branch_rows(&*plan, db, &bound_args),
+                            }?;
+                            let cols: Vec<ProjCol> = output_cols_of(&*plan)
+                                .iter()
+                                .enumerate()
+                                .map(|(i, c)| ProjCol { field_id: i, expr: None, ..c.clone() })
+                                .collect();
+                            if cols.is_empty() {
+                                return None;
+                            }
+                            Some(ScrollState { cols, rows, state: ScrollPos::Bos, pos: 0 })
+                        });
+                        match built {
+                            Some(st) => {
+                                if std::env::var("FC_SRV_TRACE").is_ok() {
+                                    eprintln!("[srv] scrollable cursor: {} rows buffered", st.rows.len());
+                                }
+                                scroll.insert(cur_stmt, st);
+                            }
+                            None => {
+                                respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
+                                continue;
+                            }
+                        }
+                    }
+                    let st = scroll.get_mut(&cur_stmt).expect("just built");
+                    // NEXT and PRIOR deliver up to the client's batch, the
+                    // positioned fetches exactly one (server.cpp fetch:
+                    // prefetch only for next/prior)
+                    let steps = if fop == 0 || fop == 1 { want.max(1) } else { 1 };
+                    let inline = database.as_ref().map(|db| (db, inline_sizes.get(&cur_stmt).copied().unwrap_or(0)));
+                    let mut w = W::default();
+                    let mut ended = false;
+                    let mut err = None;
+                    for _ in 0..steps {
+                        match st.step(fop, i64::from(fpos)) {
+                            Some(i) => {
+                                let row = st.rows[i].clone();
+                                if let Err(e) = encode_row_inline(&mut w, &st.cols, &row, out_fmt.as_ref(), inline) {
+                                    err = Some(e);
+                                    break;
+                                }
+                            }
+                            None => {
+                                ended = true;
+                                break;
+                            }
+                        }
+                    }
+                    match err {
+                        Some(e) => write_eval_error(&mut w, &e),
+                        None => {
+                            w.int(OP_FETCH_RESPONSE).int(if ended { 100 } else { 0 }).int(0);
+                        }
+                    }
+                    w.send(&mut s, &mut enc)?;
                     continue;
                 }
                 // STREAMING FAST PATH. A plain full scan produces `want`
@@ -53958,6 +54148,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
             x if x == OP_FREE_STATEMENT => {
                 let h = read_int(&mut s, &mut dec)?; // stmt
                 let how = read_int(&mut s, &mut dec)?; // 1 close, 2 drop, 4 unprepare
+                scroll.remove(&h);
                 // CLOSE and DROP both end the cursor - a streaming one is
                 // dropped so a later execute of a CLOSEd handle opens fresh.
                 cursors.remove(&h);
@@ -54630,6 +54821,7 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                 let h = read_int(&mut s, &mut dec)?; // stmt
                 use_stmt!(h);
                 cursors.remove(&h); // a fresh execute opens a fresh cursor
+                scroll.remove(&h);
                 read_int(&mut s, &mut dec)?; // tr
                 let in_blr = read_wire_bytes(&mut s, &mut dec)?; // input blr
                 read_int(&mut s, &mut dec)?; // msg number
@@ -54665,7 +54857,12 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
                     read_int(&mut s, &mut dec)?; // p_sqldata_timeout
                 }
                 if best >= 18 {
-                    read_int(&mut s, &mut dec)?; // p_sqldata_cursor_flags
+                    let flags = read_int(&mut s, &mut dec)?; // p_sqldata_cursor_flags
+                    if flags & 1 != 0 {
+                        scrollable.insert(cur_stmt);
+                    } else {
+                        scrollable.remove(&cur_stmt);
+                    }
                 }
                 if best >= 19 {
                     let n = read_int(&mut s, &mut dec)?; // p_sqldata_inline_blob_size
