@@ -689,10 +689,14 @@ pointer-page and TIP page numbers is the next step when it dominates.
   client round-tripped and isql rendered as `c000000:a000000` for the
   engine's `c:1e6`. All nine blob/array/batch gates green after the
   switch.
-- **NEXT**: the rest of `E` — the rest of `DROP`-dependency enforcement
-  (procedure recompilation and FK/PK back-references — the view case is in);
-  and the restore-only / auth DDL (packages, collations, users, mappings,
-  shadows). The common `CREATE TABLE` column types are now all in: BLOB,
+- **NEXT**: the rest of `E` — the restore-only / auth DDL (packages,
+  collations, users, mappings, shadows). (`DROP TABLE` dependency
+  enforcement is now complete for the common cases: views, procedures, and
+  FK/PK back-references all block with the engine's exact vector and count.
+  serve-real-dropdeps 7 — FK/PK is checked first and wins over a view; the
+  count is views-else-procedures. One boundary remains: a table referenced
+  ONLY by a trigger on another table, which is DFW-internal category
+  precedence.) The common `CREATE TABLE` column types are now all in: BLOB,
   NUMERIC, DECFLOAT, `TIME/TIMESTAMP WITH TIME ZONE`, `CHARACTER SET` /
   NCHAR / `COLLATE`, and arrays (single- and multi-dimension; the multi-dim
   fix was a `[]`-aware column-list splitter — serve-real-arrays 46, which
