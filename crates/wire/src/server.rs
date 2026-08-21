@@ -7189,6 +7189,11 @@ enum Plan {
         contexts: Vec<fire_crab_ods::ddl::RestoredViewContext>,
     },
     DropView { name: String },
+    /// `RECREATE <kind> ...` = DROP the object if it exists (of the wrapped
+    /// CREATE's kind), then run the CREATE. The CREATE is planned at prepare
+    /// (so a bad definition refuses before anything is dropped, as the engine
+    /// does); only a drop this server can perform wraps.
+    Recreate(Box<Plan>),
     /// `CREATE FUNCTION <name> (<args>) RETURNS <type> [DETERMINISTIC] AS <body>`
     CreateFunction {
         name: String,
@@ -22191,6 +22196,23 @@ fn execute_dml_collecting_inner(
     if let Plan::Returning { inner, .. } = plan {
         return execute_dml_collecting(inner, database, args, ctx, affected);
     }
+    if let Plan::Recreate(inner) = plan {
+        // Drop the existing object of the CREATE's kind first, swallowing a
+        // "not found" (RECREATE of a name that does not exist is a plain
+        // CREATE); a drop blocked another way (a dependency) propagates.
+        if let Some(drop) = recreate_drop_plan(inner) {
+            match execute_dml_collecting(&drop, database, args, ctx, affected.as_deref_mut()) {
+                Ok(_) => {}
+                Err(ExecErr::Text(m))
+                    if {
+                        let l = m.to_ascii_lowercase();
+                        l.contains("not found") || l.contains("is not defined")
+                    } => {}
+                Err(e) => return Err(e),
+            }
+        }
+        return execute_dml_collecting(inner, database, args, ctx, affected);
+    }
     // the upsert recurses BEFORE the working copy is taken: each half
     // commits through the ordinary path, and the row count of the
     // update half decides whether the insert half runs at all - the
@@ -35346,7 +35368,7 @@ fn describe_for(plan: &Plan, params: &[Descriptor], att: AttCs) -> Vec<u8> {
         | Plan::DropIndex { .. }
         | Plan::CreateSequence { .. } | Plan::DropSequence { .. }
         | Plan::CreateException { .. } | Plan::CreateProcedure { .. } | Plan::DropProcedure { .. } | Plan::DropException { .. }
-        | Plan::DeclareFilter { .. } | Plan::DropFilter { .. } | Plan::CreateView { .. } | Plan::DropView { .. }
+        | Plan::DeclareFilter { .. } | Plan::DropFilter { .. } | Plan::CreateView { .. } | Plan::DropView { .. } | Plan::Recreate(_)
         | Plan::AlterTrigger { .. } | Plan::DropTrigger { .. } | Plan::CreateOrAlterTrigger { .. } | Plan::AlterProcedure { .. } | Plan::CreateOrAlterProcedure { .. }
         | Plan::CreateFunction { .. } | Plan::DropFunction { .. }
         | Plan::AlterException { .. } | Plan::CreateOrAlterException { .. }
@@ -35454,7 +35476,7 @@ fn stmt_type_of(plan: &Plan) -> i32 {
         | Plan::DropIndex { .. }
         | Plan::CreateSequence { .. } | Plan::DropSequence { .. }
         | Plan::CreateException { .. } | Plan::CreateProcedure { .. } | Plan::DropProcedure { .. } | Plan::DropException { .. }
-        | Plan::DeclareFilter { .. } | Plan::DropFilter { .. } | Plan::CreateView { .. } | Plan::DropView { .. }
+        | Plan::DeclareFilter { .. } | Plan::DropFilter { .. } | Plan::CreateView { .. } | Plan::DropView { .. } | Plan::Recreate(_)
         | Plan::AlterTrigger { .. } | Plan::DropTrigger { .. } | Plan::CreateOrAlterTrigger { .. } | Plan::AlterProcedure { .. } | Plan::CreateOrAlterProcedure { .. }
         | Plan::CreateFunction { .. } | Plan::DropFunction { .. }
         | Plan::AlterException { .. } | Plan::CreateOrAlterException { .. }
@@ -36917,7 +36939,7 @@ fn emit_rows_inner(
         | Plan::DropIndex { .. }
         | Plan::CreateSequence { .. } | Plan::DropSequence { .. }
         | Plan::CreateException { .. } | Plan::CreateProcedure { .. } | Plan::DropProcedure { .. } | Plan::DropException { .. }
-        | Plan::DeclareFilter { .. } | Plan::DropFilter { .. } | Plan::CreateView { .. } | Plan::DropView { .. }
+        | Plan::DeclareFilter { .. } | Plan::DropFilter { .. } | Plan::CreateView { .. } | Plan::DropView { .. } | Plan::Recreate(_)
         | Plan::AlterTrigger { .. } | Plan::DropTrigger { .. } | Plan::CreateOrAlterTrigger { .. } | Plan::AlterProcedure { .. } | Plan::CreateOrAlterProcedure { .. }
         | Plan::CreateFunction { .. } | Plan::DropFunction { .. }
         | Plan::AlterException { .. } | Plan::CreateOrAlterException { .. }
@@ -50642,6 +50664,42 @@ fn immediate_verb(text: &str) -> (bool, bool) {
 /// `isc_dsql_execute_immediate`), so the two share this chain rather
 /// than keeping two lists of what this server can execute - which would
 /// drift, and the direction it would drift is a body silently refusing
+/// `RECREATE <kind> <rest>` plans the equivalent `CREATE <kind> <rest>` and
+/// wraps it: at execute the existing object is dropped (if present) then the
+/// CREATE runs. Only the kinds this server can DROP wrap; anything else keeps
+/// the generic refusal, as it did before.
+fn plan_recreate(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor>)> {
+    let s = sql.trim();
+    let up = s.to_ascii_uppercase();
+    let rk = find_word(&up, "RECREATE", 0)?;
+    if rk != 0 {
+        return None;
+    }
+    let create_sql = format!("CREATE {}", s["RECREATE".len()..].trim_start());
+    let (create, descs) = plan_create_table(&create_sql)
+        .or_else(|| plan_create_view(&create_sql, db))
+        .or_else(|| plan_create_procedure(&create_sql))
+        .or_else(|| plan_create_exception(&create_sql))
+        .or_else(|| plan_create_sequence(&create_sql))
+        .or_else(|| plan_create_function(&create_sql))?;
+    recreate_drop_plan(&create)?;
+    Some((Plan::Recreate(Box::new(create)), descs))
+}
+
+/// The DROP that clears the way for a RECREATE's CREATE - `None` when the
+/// wrapped kind is one this server cannot drop.
+fn recreate_drop_plan(create: &Plan) -> Option<Plan> {
+    Some(match create {
+        Plan::CreateTable { name, .. } => Plan::DropTable { name: name.clone() },
+        Plan::CreateView { name, .. } => Plan::DropView { name: name.clone() },
+        Plan::CreateProcedure { name, .. } => Plan::DropProcedure { name: name.clone() },
+        Plan::CreateException { name, .. } => Plan::DropException { name: name.clone() },
+        Plan::CreateSequence { name, .. } => Plan::DropSequence { name: name.clone() },
+        Plan::CreateFunction { name, .. } => Plan::DropFunction { name: name.clone() },
+        _ => return None,
+    })
+}
+
 /// DDL a client is served.
 fn plan_immediate(text: &str, database: &Option<Database>) -> Option<(Plan, Vec<Descriptor>)> {
     let (ddl_kw, dml_kw) = immediate_verb(text);
@@ -50656,6 +50714,7 @@ fn plan_immediate(text: &str, database: &Option<Database>) -> Option<(Plan, Vec<
                     .or_else(|| plan_grant_usage(text))
                     .or_else(|| plan_grant(text))
                     .or_else(|| plan_grant_role(text))
+                    .or_else(|| plan_recreate(text, database))
                     .or_else(|| plan_create_table(text))
                     .or_else(|| plan_create_trigger(text, database))
                     .or_else(|| plan_alter_trigger(text, database))
@@ -56339,6 +56398,7 @@ fn after_auth(
                         .or_else(|| plan_grant_usage(&stmt_sql))
                         .or_else(|| plan_grant(&stmt_sql))
                         .or_else(|| plan_grant_role(&stmt_sql))
+                        .or_else(|| plan_recreate(&stmt_sql, &database))
                         .or_else(|| plan_create_table(&stmt_sql))
                         .or_else(|| plan_create_trigger(&stmt_sql, &database))
                         .or_else(|| plan_alter_trigger(&stmt_sql, &database))
@@ -56650,7 +56710,7 @@ fn after_auth(
                         | Plan::CreateSequence { .. }
                         | Plan::DropSequence { .. }
                         | Plan::CreateException { .. }
-                        | Plan::DeclareFilter { .. } | Plan::DropFilter { .. } | Plan::CreateView { .. } | Plan::DropView { .. }
+                        | Plan::DeclareFilter { .. } | Plan::DropFilter { .. } | Plan::CreateView { .. } | Plan::DropView { .. } | Plan::Recreate(_)
         | Plan::AlterTrigger { .. } | Plan::DropTrigger { .. } | Plan::CreateOrAlterTrigger { .. } | Plan::AlterProcedure { .. } | Plan::CreateOrAlterProcedure { .. }
         | Plan::CreateFunction { .. } | Plan::DropFunction { .. }
                         | Plan::CreateProcedure { .. }

@@ -142,9 +142,12 @@ case "$(node_run "ALTER TABLE TDDL DROP CONSTRAINT NOSUCH")" in
     ERR*) echo "OK   unsupported ALTER form raises an error" ;;
     *) echo "DIFF unsupported ALTER form raises an error"; fail=1 ;;
 esac
-case "$(node_run "RECREATE TABLE TDDL (X INTEGER)")" in
-    ERR*) echo "OK   unsupported RECREATE raises an error" ;;
-    *) echo "DIFF unsupported RECREATE raises an error"; fail=1 ;;
+# RECREATE is now supported (serve-real-recreate) - drop-if-exists then
+# create. On a throwaway name it just creates, no error, and does not
+# disturb TDDL (which phase 2 hands to the engine).
+case "$(node_run "RECREATE TABLE TDDL_RC (X INTEGER)")" in
+    ERR*) echo "DIFF RECREATE should now succeed"; fail=1 ;;
+    *) echo "OK   RECREATE TABLE creates a fresh table" ;;
 esac
 
 # --- phase 2: the ENGINE adopts the table ------------------------------
