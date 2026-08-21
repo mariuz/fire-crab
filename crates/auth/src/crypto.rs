@@ -340,16 +340,34 @@ impl BigUint {
     }
 }
 
-// ----------------------------------------------------------------- RC4 -----
-// Arc4, byte-for-byte the engine's Cypher (src/plugins/crypt/arc4/Arc4.cpp).
+// ---------------------------------------------------------- WIRE CIPHERS ---
+// The wire-encryption plugins the engine ships and a client may pick
+// (firebird.conf WireCryptPlugin, default "ChaCha64, ChaCha, Arc4"):
+//
+// * Arc4 - byte-for-byte the engine's Cypher
+//   (src/plugins/crypt/arc4/Arc4.cpp), keyed with the SRP session key;
+// * ChaCha / ChaCha64 - src/plugins/crypt/chacha/ChaCha.cpp: the key is
+//   SHA-256 of the session key (`createCypher`: "stretched key"), the IV
+//   is the plugin's SPECIFIC DATA - 16 bytes for ChaCha (12 of nonce, 4 of
+//   big-endian initial counter, `chacha_ivctr32`), 8 for ChaCha64 (an
+//   8-byte nonce with a 64-bit counter from 0, `chacha_ivctr64`) - which
+//   the SERVER generates and announces in its accept keys, the client
+//   adopting it.
+//
+// [Rc4] keeps its name (every read/write site in the server threads an
+// `Option<Rc4>`) and is now any of the three.
+
+enum Cipher {
+    Arc4 { s: [u8; 256], i: u8, j: u8 },
+    ChaCha(ChaCha20),
+}
 
 pub struct Rc4 {
-    s: [u8; 256],
-    i: u8,
-    j: u8,
+    c: Cipher,
 }
 
 impl Rc4 {
+    /// Arc4 over the key as given
     pub fn new(key: &[u8]) -> Self {
         let mut s = [0u8; 256];
         for (i, si) in s.iter_mut().enumerate() {
@@ -360,20 +378,159 @@ impl Rc4 {
             j = j.wrapping_add(s[i]).wrapping_add(key[i % key.len()]);
             s.swap(i, j as usize);
         }
-        Rc4 { s, i: 0, j: 0 }
+        Rc4 { c: Cipher::Arc4 { s, i: 0, j: 0 } }
+    }
+    /// The engine's "ChaCha" plugin: SHA-256-stretched key, a 16-byte IV
+    /// (12 nonce bytes, then the 32-bit initial counter big-endian)
+    pub fn chacha(session_key: &[u8], iv: &[u8; 16]) -> Self {
+        let key = sha256(session_key);
+        let mut nonce = [0u8; 12];
+        nonce.copy_from_slice(&iv[..12]);
+        let ctr = u32::from_be_bytes([iv[12], iv[13], iv[14], iv[15]]);
+        Rc4 { c: Cipher::ChaCha(ChaCha20::new(&key, Nonce::Ietf(nonce, ctr))) }
+    }
+    /// The engine's "ChaCha64" plugin: SHA-256-stretched key, an 8-byte
+    /// nonce with a 64-bit counter from zero
+    pub fn chacha64(session_key: &[u8], iv: &[u8; 8]) -> Self {
+        let key = sha256(session_key);
+        Rc4 { c: Cipher::ChaCha(ChaCha20::new(&key, Nonce::Original(*iv))) }
+    }
+    pub fn transform(&mut self, buf: &[u8]) -> Vec<u8> {
+        match &mut self.c {
+            Cipher::Arc4 { s, i, j } => {
+                let mut out = Vec::with_capacity(buf.len());
+                for &byte in buf {
+                    *i = i.wrapping_add(1);
+                    *j = j.wrapping_add(s[*i as usize]);
+                    s.swap(*i as usize, *j as usize);
+                    let k = s[(s[*i as usize].wrapping_add(s[*j as usize])) as usize];
+                    out.push(byte ^ k);
+                }
+                out
+            }
+            Cipher::ChaCha(c) => c.transform(buf),
+        }
+    }
+}
+
+/// The two ChaCha20 nonce layouts libtomcrypt offers: the IETF one (RFC
+/// 7539: 96-bit nonce, 32-bit counter) and the original (64-bit nonce,
+/// 64-bit counter).
+enum Nonce {
+    Ietf([u8; 12], u32),
+    Original([u8; 8]),
+}
+
+/// ChaCha20 (D. J. Bernstein; the quarter-round and block function of RFC
+/// 7539), as a byte stream: the keystream block is regenerated per 64
+/// bytes and XORed in, the position carried across calls.
+pub struct ChaCha20 {
+    state: [u32; 16],
+    block: [u8; 64],
+    used: usize,
+    wide_counter: bool,
+}
+
+impl ChaCha20 {
+    fn new(key: &[u8; 32], nonce: Nonce) -> ChaCha20 {
+        let mut state = [0u32; 16];
+        state[0..4].copy_from_slice(&[0x6170_7865, 0x3320_646e, 0x7962_2d32, 0x6b20_6574]);
+        for i in 0..8 {
+            state[4 + i] = u32::from_le_bytes(key[4 * i..4 * i + 4].try_into().unwrap());
+        }
+        let wide_counter = match nonce {
+            Nonce::Ietf(n, ctr) => {
+                state[12] = ctr;
+                for i in 0..3 {
+                    state[13 + i] = u32::from_le_bytes(n[4 * i..4 * i + 4].try_into().unwrap());
+                }
+                false
+            }
+            Nonce::Original(n) => {
+                state[12] = 0;
+                state[13] = 0;
+                state[14] = u32::from_le_bytes(n[0..4].try_into().unwrap());
+                state[15] = u32::from_le_bytes(n[4..8].try_into().unwrap());
+                true
+            }
+        };
+        ChaCha20 { state, block: [0u8; 64], used: 64, wide_counter }
+    }
+    fn quarter(x: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize) {
+        x[a] = x[a].wrapping_add(x[b]);
+        x[d] = (x[d] ^ x[a]).rotate_left(16);
+        x[c] = x[c].wrapping_add(x[d]);
+        x[b] = (x[b] ^ x[c]).rotate_left(12);
+        x[a] = x[a].wrapping_add(x[b]);
+        x[d] = (x[d] ^ x[a]).rotate_left(8);
+        x[c] = x[c].wrapping_add(x[d]);
+        x[b] = (x[b] ^ x[c]).rotate_left(7);
+    }
+    fn next_block(&mut self) {
+        let mut x = self.state;
+        for _ in 0..10 {
+            Self::quarter(&mut x, 0, 4, 8, 12);
+            Self::quarter(&mut x, 1, 5, 9, 13);
+            Self::quarter(&mut x, 2, 6, 10, 14);
+            Self::quarter(&mut x, 3, 7, 11, 15);
+            Self::quarter(&mut x, 0, 5, 10, 15);
+            Self::quarter(&mut x, 1, 6, 11, 12);
+            Self::quarter(&mut x, 2, 7, 8, 13);
+            Self::quarter(&mut x, 3, 4, 9, 14);
+        }
+        for i in 0..16 {
+            let v = x[i].wrapping_add(self.state[i]);
+            self.block[4 * i..4 * i + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        // the counter: 32 bits (IETF) or 64 bits (original)
+        self.state[12] = self.state[12].wrapping_add(1);
+        if self.wide_counter && self.state[12] == 0 {
+            self.state[13] = self.state[13].wrapping_add(1);
+        }
+        self.used = 0;
     }
     pub fn transform(&mut self, buf: &[u8]) -> Vec<u8> {
         let mut out = Vec::with_capacity(buf.len());
-        for &byte in buf {
-            self.i = self.i.wrapping_add(1);
-            self.j = self.j.wrapping_add(self.s[self.i as usize]);
-            self.s.swap(self.i as usize, self.j as usize);
-            let k =
-                self.s[(self.s[self.i as usize].wrapping_add(self.s[self.j as usize])) as usize];
-            out.push(byte ^ k);
+        for &b in buf {
+            if self.used == 64 {
+                self.next_block();
+            }
+            out.push(b ^ self.block[self.used]);
+            self.used += 1;
         }
         out
     }
+}
+
+// --------------------------------------------------------- LEGACY_AUTH ----
+// The Legacy_Auth plugin's credential is the classic DES crypt(3) of the
+// password under the fixed salt "9z" (src/common/enc.cpp ENC_crypt,
+// LEGACY_PASSWORD_SALT), the two salt characters dropped - the client
+// sends those 11 characters as its specific data. The C library's crypt
+// still implements the DES scheme on this platform, so it is asked
+// rather than ported.
+#[link(name = "crypt")]
+extern "C" {
+    fn crypt(key: *const std::os::raw::c_char, salt: *const std::os::raw::c_char) -> *const std::os::raw::c_char;
+}
+
+/// The 11 characters a Legacy_Auth client sends for `password`, or None
+/// when the platform's crypt has no DES scheme
+pub fn legacy_credential(password: &str) -> Option<String> {
+    let key = std::ffi::CString::new(password).ok()?;
+    let salt = std::ffi::CString::new("9z").ok()?;
+    // SAFETY: both pointers are valid NUL-terminated strings for the call;
+    // crypt returns a pointer into static storage (or NULL), copied out
+    // before any other call
+    let out = unsafe { crypt(key.as_ptr(), salt.as_ptr()) };
+    if out.is_null() {
+        return None;
+    }
+    let full = unsafe { std::ffi::CStr::from_ptr(out) }.to_string_lossy().into_owned();
+    if full.len() < 13 || !full.starts_with("9z") {
+        return None;
+    }
+    Some(full[2..].to_string())
 }
 
 #[cfg(test)]
@@ -444,5 +601,48 @@ mod tests {
     fn bytes_roundtrip_minimal() {
         let b = BigUint::from_bytes_be(&[0x00, 0x00, 0x12, 0x34, 0x56]);
         assert_eq!(b.to_bytes_be(), vec![0x12, 0x34, 0x56]); // leading zeros dropped
+    }
+}
+
+#[cfg(test)]
+mod cipher_tests {
+    use super::*;
+
+    #[test]
+    fn chacha20_rfc7539_block_vector() {
+        // RFC 7539 section 2.4.2: key 00..1f, nonce 00:00:00:00:00:00:00:4a:00:00:00:00, counter 1
+        let mut key = [0u8; 32];
+        for (i, k) in key.iter_mut().enumerate() {
+            *k = i as u8;
+        }
+        let nonce = [0, 0, 0, 0, 0, 0, 0, 0x4a, 0, 0, 0, 0];
+        let mut c = ChaCha20::new(&key, Nonce::Ietf(nonce, 1));
+        let plain = b"Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it.";
+        let out = c.transform(plain);
+        assert_eq!(&out[..8], &[0x6e, 0x2e, 0x35, 0x9a, 0x25, 0x68, 0xf9, 0x80]);
+    }
+
+    #[test]
+    fn chacha_roundtrips_and_the_wrapper_matches() {
+        let session = b"some session key bytes";
+        let iv16 = [7u8; 16];
+        let mut a = Rc4::chacha(session, &iv16);
+        let mut b = Rc4::chacha(session, &iv16);
+        let msg = b"the quick brown fox jumps over the lazy dog, twice over the block boundary, and then some more bytes to pass 64";
+        let enc = a.transform(msg);
+        assert_ne!(&enc[..], &msg[..]);
+        assert_eq!(b.transform(&enc), msg.to_vec());
+        let iv8 = [1u8, 2, 3, 4, 5, 6, 7, 8];
+        let mut c = Rc4::chacha64(session, &iv8);
+        let mut d = Rc4::chacha64(session, &iv8);
+        assert_eq!(d.transform(&c.transform(msg)), msg.to_vec());
+    }
+
+    #[test]
+    fn legacy_credential_is_the_des_crypt_tail() {
+        // crypt("masterkey", "9z") = "9zQP3LMZ/MJh." on a DES-capable libcrypt
+        if let Some(c) = legacy_credential("masterkey") {
+            assert_eq!(c, "QP3LMZ/MJh.");
+        }
     }
 }

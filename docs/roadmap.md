@@ -186,8 +186,7 @@ max_segment pieces) — when the framed length fits; the client then serves
 info / seek / get_segment from its copy (the gate's inline pass: wire
 opens fall away, the answers are the engine's line for line).
 
-**Still absent:** `op_slice` (arrays). Auth: only Srp256 offered; no Legacy_Auth / ChaCha /
-zlib. `op_info_transaction` answers only `isc_info_tra_id`. A text blob
+**Still absent:** `op_slice` (arrays). `op_info_transaction` answers only `isc_info_tra_id`. A text blob
 is stored in the database charset (UTF8) with no bpb transliteration.
 
 ### D. Converted, not wired — MERGE executor DONE (2026-08-20)
@@ -476,10 +475,22 @@ pointer-page and TIP page numbers is the next step when it dominates.
   BLR travels TWICE in op_transact (`xdr_trrq_blr` and then the MAP macro
   over the same field). A BLR the parser refuses is `isc_invalid_blr`
   (offset 0 — the parser keeps no offset).
+- **The auth tail DONE (2026-08-21, `serve-real-wirecrypt` 15):**
+  ChaCha64 / ChaCha / Arc4 on offer (server-generated IVs announced in
+  the accept keys as `TAG_PLUGIN_SPECIFIC`; key = SHA-256 of the SRP
+  session key; `FC_WIRE_CRYPT` narrows the offer) — a default libfbclient
+  now talks ChaCha64 to fire-crab, so every gate runs over it; wire
+  COMPRESSION (`pflag_compress` echoed on the accept, one zlib stream
+  each way below the encryption: a hand-written inflater for what
+  arrives, stored deflate blocks for what leaves; `FC_WIRE_COMPRESS=0`
+  declines); Legacy_Auth (the client's DES crypt of the password under
+  "9z", checked through the C library's `crypt`; no session key, the wire
+  stays clear; a wrong password is `isc_login`). The engine takes neither
+  a Legacy_Auth client (its `AuthServer` is Srp256) nor compression (its
+  `WireCompression` is off) — those cells are fc-only, recorded.
 - **NEXT**: `op_slice` (arrays — a programme: ARRAY columns in DDL,
   RDB$FIELD_DIMENSIONS, the array blob (InternalArrayDesc + data), the
-  SDL subset `gen_sdl` emits, op_get_slice / op_put_slice); the auth
-  tail (Legacy_Auth / ChaCha / zlib). (MERGE `RETURNING` / `NOT MATCHED BY SOURCE`, `op_info_blob`
+  SDL subset `gen_sdl` emits, op_get_slice / op_put_slice). (MERGE `RETURNING` / `NOT MATCHED BY SOURCE`, `op_info_blob`
   / `op_seek_blob`, the ordered JOIN fetch streaming, the RIGHT/FULL
   hash, the bulk index build, the cleanup — all done 2026-08-21.)
 - **D, the MERGE executor** — the BLR is already compiled and tested;

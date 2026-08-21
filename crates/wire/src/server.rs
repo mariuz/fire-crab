@@ -54,6 +54,9 @@ const OP_START_AND_RECEIVE: i32 = 73;
 const OP_START_SEND_AND_RECEIVE: i32 = 74;
 const BLR_REQ_HANDLE: i32 = 5;
 const OP_COND_ACCEPT: i32 = 98;
+/// op_accept_data (94): the accept that carries the authentication
+/// outcome (plugin, authenticated flag, keys) - protocol 13+
+const OP_ACCEPT_DATA: i32 = 94;
 const OP_CANCEL: i32 = 91;
 const OP_INFO_DATABASE: i32 = 40;
 /// `op_info_transaction` (protocol.h) - isc_transaction_info. A client
@@ -136,13 +139,56 @@ fn seed_bytes(n: usize, seed: u64) -> Vec<u8> {
 }
 
 /// Read exactly n bytes, decrypting if a cipher is armed.
+thread_local! {
+    /// WIRE COMPRESSION for this connection's thread (one thread per
+    /// connection): the inflater the received bytes feed once both sides
+    /// agreed on `pflag_compress`, and whether this side's zlib header
+    /// has gone out. Compression sits BELOW the wire encryption: what
+    /// arrives is decrypted, then inflated; what leaves is framed as
+    /// stored deflate blocks, then encrypted (remote.cpp REMOTE_inflate /
+    /// REMOTE_deflate around the crypt plugin in packet_receive/send).
+    static ZIN: std::cell::RefCell<Option<crate::zlib::Inflater>> = const { std::cell::RefCell::new(None) };
+    static ZOUT_HEADER_SENT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Turn wire compression on for this connection (after the accept packet)
+fn enable_wire_compression() {
+    ZIN.with(|z| *z.borrow_mut() = Some(crate::zlib::Inflater::new()));
+    ZOUT_HEADER_SENT.with(|h| h.set(false));
+}
+
 fn read_n(s: &mut TcpStream, dec: &mut Option<Rc4>, n: usize) -> std::io::Result<Vec<u8>> {
-    let mut b = vec![0u8; n];
-    s.read_exact(&mut b)?;
-    Ok(match dec {
-        Some(c) => c.transform(&b),
-        None => b,
-    })
+    let compressed = ZIN.with(|z| z.borrow().is_some());
+    if !compressed {
+        let mut b = vec![0u8; n];
+        s.read_exact(&mut b)?;
+        return Ok(match dec {
+            Some(c) => c.transform(&b),
+            None => b,
+        });
+    }
+    // inflated bytes until `n` are at hand: read what the socket has
+    // (blocking for at least one byte), decrypt, feed
+    loop {
+        let have = ZIN.with(|z| z.borrow().as_ref().map_or(0, |i| i.out.len()));
+        if have >= n {
+            return Ok(ZIN.with(|z| z.borrow_mut().as_mut().unwrap().out.drain(..n).collect()));
+        }
+        let mut buf = vec![0u8; 8192];
+        let got = s.read(&mut buf)?;
+        if got == 0 {
+            return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "peer closed"));
+        }
+        buf.truncate(got);
+        let plain = match dec {
+            Some(c) => c.transform(&buf),
+            None => buf,
+        };
+        let fed = ZIN.with(|z| z.borrow_mut().as_mut().unwrap().feed(&plain));
+        if let Err(e) = fed {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e));
+        }
+    }
 }
 fn read_int(s: &mut TcpStream, dec: &mut Option<Rc4>) -> std::io::Result<i32> {
     let b = read_n(s, dec, 4)?;
@@ -178,9 +224,20 @@ impl W {
         self
     }
     fn send(&self, s: &mut TcpStream, enc: &mut Option<Rc4>) -> std::io::Result<()> {
+        let compressed = ZIN.with(|z| z.borrow().is_some());
+        let framed: Vec<u8> = if compressed {
+            let mut v = Vec::new();
+            if !ZOUT_HEADER_SENT.with(|h| h.replace(true)) {
+                v.extend_from_slice(&crate::zlib::ZLIB_HEADER);
+            }
+            v.extend(crate::zlib::stored_blocks(&self.buf));
+            v
+        } else {
+            self.buf.clone()
+        };
         let out = match enc {
-            Some(c) => c.transform(&self.buf),
-            None => self.buf.clone(),
+            Some(c) => c.transform(&framed),
+            None => framed,
         };
         s.write_all(&out)
     }
@@ -1131,17 +1188,34 @@ fn expand_conf_macros(path: &str, root: &str) -> Option<String> {
 /// Extract the SRP client key A (specific_data chunks reassembled) and
 /// the login from a p_cnct_user_id block.
 fn parse_user_id(uid: &[u8]) -> (String, String) {
+    let p = parse_user_id_full(uid);
+    (p.login, p.specific)
+}
+
+/// The p_cnct_user_id block: the login, the plugin the client speaks
+/// FIRST (CNCT_plugin_name, 8) and its specific data (7, chunked), the
+/// plugins it could speak (CNCT_plugin_list, 10).
+struct ConnectUserId {
+    login: String,
+    plugin: String,
+    plugins: String,
+    specific: String,
+}
+
+fn parse_user_id_full(uid: &[u8]) -> ConnectUserId {
     let mut i = 0;
-    let mut login = String::new();
+    let mut out = ConnectUserId { login: String::new(), plugin: String::new(), plugins: String::new(), specific: String::new() };
     let mut specific: Vec<u8> = Vec::new();
     while i + 1 < uid.len() {
         let tag = uid[i];
         let len = uid[i + 1] as usize;
         let data = &uid[i + 2..(i + 2 + len).min(uid.len())];
         match tag {
-            9 => login = String::from_utf8_lossy(data).into_owned(), // CNCT_LOGIN
+            9 => out.login = String::from_utf8_lossy(data).into_owned(), // CNCT_login
+            8 => out.plugin = String::from_utf8_lossy(data).into_owned(), // CNCT_plugin_name
+            10 => out.plugins = String::from_utf8_lossy(data).into_owned(), // CNCT_plugin_list
             7 => {
-                // CNCT_SPECIFIC_DATA: first byte is the chunk sequence
+                // CNCT_specific_data: first byte is the chunk sequence
                 if !data.is_empty() {
                     specific.extend_from_slice(&data[1..]);
                 }
@@ -1150,7 +1224,78 @@ fn parse_user_id(uid: &[u8]) -> (String, String) {
         }
         i += 2 + len;
     }
-    (login, String::from_utf8_lossy(&specific).into_owned())
+    out.specific = String::from_utf8_lossy(&specific).into_owned();
+    out
+}
+
+/// The wire-crypt plugins this server offers, in preference order
+/// (firebird.conf WireCryptPlugin's default; FC_WIRE_CRYPT narrows it,
+/// e.g. `FC_WIRE_CRYPT=Arc4`), with the IV ("specific data") each
+/// ChaCha variant needs - generated HERE and announced in the accept
+/// keys, as the engine's server does; the client adopts it.
+struct CryptOffer {
+    plugins: Vec<String>,
+    iv_chacha: [u8; 16],
+    iv_chacha64: [u8; 8],
+}
+
+fn crypt_offer() -> CryptOffer {
+    let list = std::env::var("FC_WIRE_CRYPT").unwrap_or_else(|_| "ChaCha64 ChaCha Arc4".to_string());
+    let plugins: Vec<String> = list
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|p| !p.is_empty())
+        .map(|p| p.to_string())
+        .collect();
+    let mut iv = [0u8; 24];
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+        let _ = f.read_exact(&mut iv);
+    }
+    let mut iv_chacha = [0u8; 16];
+    iv_chacha[..12].copy_from_slice(&iv[..12]); // 12 of nonce, 4 of counter (zero)
+    let mut iv_chacha64 = [0u8; 8];
+    iv_chacha64.copy_from_slice(&iv[12..20]);
+    CryptOffer { plugins, iv_chacha, iv_chacha64 }
+}
+
+impl CryptOffer {
+    /// The accept's `keys`: UnTagged clumplets - TAG_KEY_TYPE (0)
+    /// "Symmetric", TAG_KEY_PLUGINS (1) the list, and for each ChaCha
+    /// variant TAG_PLUGIN_SPECIFIC (3) "<plugin>\0<iv>" (server.cpp
+    /// SrvAuthBlock::extractNewKeys, protocol 16+)
+    fn keys(&self) -> Vec<u8> {
+        let mut k = Vec::new();
+        let put = |k: &mut Vec<u8>, tag: u8, data: &[u8]| {
+            k.push(tag);
+            k.push(data.len() as u8);
+            k.extend_from_slice(data);
+        };
+        put(&mut k, 0, b"Symmetric");
+        put(&mut k, 1, self.plugins.join(" ").as_bytes());
+        for p in &self.plugins {
+            let iv: &[u8] = match p.as_str() {
+                "ChaCha" => &self.iv_chacha,
+                "ChaCha64" => &self.iv_chacha64,
+                _ => continue,
+            };
+            let mut d = p.as_bytes().to_vec();
+            d.push(0);
+            d.extend_from_slice(iv);
+            put(&mut k, 3, &d);
+        }
+        k
+    }
+    /// The cipher for the plugin the client's op_crypt named
+    fn cipher(&self, plugin: &str, session_key: &[u8]) -> Option<Rc4> {
+        if !self.plugins.iter().any(|p| p == plugin) {
+            return None;
+        }
+        Some(match plugin {
+            "Arc4" => Rc4::new(session_key),
+            "ChaCha" => Rc4::chacha(session_key, &self.iv_chacha),
+            "ChaCha64" => Rc4::chacha64(session_key, &self.iv_chacha64),
+            _ => return None,
+        })
+    }
 }
 
 /// Append the isc_info_sql_bind section: how many parameters the
@@ -52525,24 +52670,80 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
     let count = read_int(&mut s, &mut none)?;
     let uid = read_wire_bytes(&mut s, &mut none)?;
     let mut best = 0i32;
+    let mut best_max_ptype = 0i32;
     for _ in 0..count {
         let v = read_int(&mut s, &mut none)? & 0x7fff;
         read_int(&mut s, &mut none)?; // arch
         read_int(&mut s, &mut none)?; // min ptype
-        read_int(&mut s, &mut none)?; // max ptype
+        let max_ptype = read_int(&mut s, &mut none)?; // max ptype (| pflag_compress)
         read_int(&mut s, &mut none)?; // weight
         if (13..=20).contains(&v) && v > best {
             best = v;
+            best_max_ptype = max_ptype;
         }
     }
     if std::env::var("FC_SRV_TRACE").is_ok() { eprintln!("[srv] op_connect ok, best proto {}", best); }
     if best == 0 {
         return Ok(()); // no common protocol
     }
-    let (login, a_hex) = parse_user_id(&uid);
-    if std::env::var("FC_SRV_TRACE").is_ok() { eprintln!("[srv] login={} keylen={}", login, a_hex.len()); }
+    // WIRE COMPRESSION is asked for with pflag_compress (0x100) on the
+    // protocol's max ptype (a client with WireCompression = true, protocol
+    // 13+) and granted by echoing it on the accept's ptype; both sides
+    // then deflate everything after the accept packet (FC_WIRE_COMPRESS=0
+    // declines, as a server with WireCompression = false does)
+    const PFLAG_COMPRESS: i32 = 0x100;
+    let compress = best_max_ptype & PFLAG_COMPRESS != 0
+        && std::env::var("FC_WIRE_COMPRESS").map_or(true, |v| v != "0");
+    let ptype = 3 | if compress { PFLAG_COMPRESS } else { 0 };
+    let cu = parse_user_id_full(&uid);
+    let (login, a_hex) = (cu.login.clone(), cu.specific.clone());
+    if std::env::var("FC_SRV_TRACE").is_ok() {
+        eprintln!("[srv] login={} plugin={} list={} keylen={} compress={}", login, cu.plugin, cu.plugins, a_hex.len(), compress);
+    }
     if !login.eq_ignore_ascii_case(user) || a_hex.is_empty() {
         return Ok(());
+    }
+    let offer = crypt_offer();
+    // --- Legacy_Auth: the client's first plugin is the old one, its data
+    // the DES crypt of the password under the salt "9z" (the two salt
+    // characters dropped - src/auth/SecurityDatabase/LegacyClient.cpp);
+    // a match is an op_accept_data with the plugin and authenticated = 1,
+    // and no session key - so no wire encryption follows (a client set
+    // to WireCrypt = Required will not attach, as with the engine). A
+    // mismatch is the engine's isc_login.
+    if cu.plugin.eq_ignore_ascii_case("Legacy_Auth") {
+        let expected = fire_crab_auth::crypto::legacy_credential(password);
+        if expected.as_deref() != Some(a_hex.as_str()) {
+            if std::env::var("FC_SRV_TRACE").is_ok() {
+                eprintln!("[srv] Legacy_Auth: credential mismatch");
+            }
+            let mut w = W::default();
+            w.int(OP_RESPONSE).int(0).int(0).int(0).int(0);
+            w.int(1).int(335544472).int(0); // isc_login
+            w.send(&mut s, &mut none)?;
+            return Ok(());
+        }
+        if std::env::var("FC_SRV_TRACE").is_ok() {
+            eprintln!("[srv] Legacy_Auth: authenticated, no session key (cleartext wire)");
+        }
+        const FB_PROTOCOL_FLAG: i32 = 0x8000;
+        let mut w = W::default();
+        w.int(OP_ACCEPT_DATA)
+            .int(best | FB_PROTOCOL_FLAG)
+            .int(1) // arch
+            .int(ptype)
+            .bytes(&[]) // data
+            .bytes(b"Legacy_Auth")
+            .int(1) // authenticated
+            .bytes(&[]); // keys: no session key, nothing to encrypt with
+        w.send(&mut s, &mut none)?;
+        if compress {
+            enable_wire_compression();
+        }
+        let mut enc: Option<Rc4> = None;
+        let mut dec: Option<Rc4> = None;
+        let attach_op = read_int(&mut s, &mut dec)?;
+        return after_auth(s, best, attach_op, &mut enc, &mut dec, user, password);
     }
 
     // --- server SRP: salt + verifier, send op_cond_accept(salt, B) ---
@@ -52567,12 +52768,17 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
     w.int(OP_COND_ACCEPT)
         .int(best | FB_PROTOCOL_FLAG)
         .int(1) // arch
-        .int(3) // ptype
+        .int(ptype)
         .bytes(&data)
         .bytes(b"Srp256")
         .int(0) // authenticated flag (not yet)
-        .bytes(&[]); // keys
+        .bytes(&offer.keys()); // the wire-crypt plugins on offer, with their IVs
     w.send(&mut s, &mut none)?;
+    if compress {
+        // the engine turns compression on right after the accept packet
+        // leaves (server.cpp: initCompression after send); so do we
+        enable_wire_compression();
+    }
 
     if std::env::var("FC_SRV_TRACE").is_ok() { eprintln!("[srv] sent cond_accept, waiting cont_auth"); }
     // --- op_cont_auth: the client proof M ---
@@ -52628,15 +52834,54 @@ fn handle(mut s: TcpStream, user: &str, password: &str) -> std::io::Result<()> {
         eprintln!("[srv] op after auth = {} (op_crypt 96 => encrypt, op_attach 19 => cleartext)", cop);
     }
     let attach_op = if cop == OP_CRYPT {
-        read_wire_bytes(&mut s, &mut none)?; // "Arc4"
+        // p_crypt: the plugin the client picked from our offer (the first
+        // of ITS list we also named - ChaCha64 for a default client) and
+        // the key type ("Symmetric")
+        let plugin = String::from_utf8_lossy(&read_wire_bytes(&mut s, &mut none)?).into_owned();
         read_wire_bytes(&mut s, &mut none)?; // "Symmetric"
-        enc = Some(Rc4::new(&session_key));
-        dec = Some(Rc4::new(&session_key));
-        respond(&mut s, &mut enc, 0)?; // op_crypt reply, encrypted from here on
+        match (offer.cipher(&plugin, &session_key), offer.cipher(&plugin, &session_key)) {
+            (Some(e), Some(d)) => {
+                if std::env::var("FC_SRV_TRACE").is_ok() {
+                    eprintln!("[srv] op_crypt plugin={} - the wire is encrypted from here", plugin);
+                }
+                enc = Some(e);
+                dec = Some(d);
+                respond(&mut s, &mut enc, 0)?; // op_crypt reply, encrypted from here on
+            }
+            _ => {
+                // isc_wirecrypt_plugin "Unknown crypt plugin @1"
+                if std::env::var("FC_SRV_TRACE").is_ok() {
+                    eprintln!("[srv] op_crypt plugin={} - not on offer", plugin);
+                }
+                let mut w = W::default();
+                w.int(OP_RESPONSE).int(0).int(0).int(0).int(0);
+                w.int(1).int(335545073).int(2).bytes(plugin.as_bytes()).int(0);
+                w.send(&mut s, &mut none)?;
+                return Ok(());
+            }
+        }
         read_int(&mut s, &mut dec)? // now read the (encrypted) op_attach
     } else {
         cop // the op we already read IS op_attach (cleartext path)
     };
+    after_auth(s, best, attach_op, &mut enc, &mut dec, user, password)
+}
+
+/// Everything after the handshake: the service loop or the attachment
+/// loop, over whatever cipher (and compression) the handshake settled on.
+/// `best` is the protocol version accepted.
+fn after_auth(
+    mut s: TcpStream,
+    best: i32,
+    attach_op: i32,
+    enc: &mut Option<Rc4>,
+    dec: &mut Option<Rc4>,
+    user: &str,
+    password: &str,
+) -> std::io::Result<()> {
+    let _ = password;
+    let mut enc = enc.take();
+    let mut dec = dec.take();
 
     // --- op_service_attach: the Services manager the firebird-qa plugin
     // bootstraps against (connect_server). It reads the server version,
