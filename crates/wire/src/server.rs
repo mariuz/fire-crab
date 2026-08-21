@@ -12996,6 +12996,31 @@ fn parse_column_def(item: &str) -> Option<(fire_crab_ods::ddl::ColumnDef, Option
         })
     };
     // parenthesised argument(s), if any
+    // DECFLOAT carries a precision (16 or 34) the integer `col` does not.
+    let decfloat = |field_type: i16, dt: u8, length: u16, precision: i16| {
+        Some(fire_crab_ods::ddl::ColumnDef {
+            name: name.to_ascii_uppercase(),
+            field_type,
+            dtype: dt,
+            length,
+            scale: 0,
+            sub_type: 0,
+            char_len: None,
+            dims: dims.clone(),
+            segment_length: None,
+            charset_id: None,
+            precision: Some(precision),
+            not_null,
+            not_null_constraint: not_null,
+            default: None,
+            domain: None,
+            identity: None,
+            computed: None,
+        })
+    };
+    // a multi-word type keyword (`DOUBLE PRECISION`, `TIME WITH TIME ZONE`)
+    // is matched on single spaces - collapse any run of whitespace first.
+    let ty = ty.split_whitespace().collect::<Vec<_>>().join(" ");
     let (base, args) = match ty.find('(') {
         Some(p) => {
             if !ty.ends_with(')') {
@@ -13045,6 +13070,11 @@ fn parse_column_def(item: &str) -> Option<(fire_crab_ods::ddl::ColumnDef, Option
         ("DATE", []) => col(12, dtype::SQL_DATE, 4, 0, 0, None),
         ("TIME", []) => col(13, dtype::SQL_TIME, 4, 0, 0, None),
         ("TIMESTAMP", []) => col(35, dtype::TIMESTAMP, 8, 0, 0, None),
+        ("TIME WITH TIME ZONE", []) => col(28, dtype::SQL_TIME_TZ, 8, 0, 0, None),
+        ("TIMESTAMP WITH TIME ZONE", []) => col(29, dtype::TIMESTAMP_TZ, 12, 0, 0, None),
+        ("DECFLOAT", []) => decfloat(25, dtype::DEC128, 16, 34),
+        ("DECFLOAT", [p]) if *p == 16 => decfloat(24, dtype::DEC64, 8, 16),
+        ("DECFLOAT", [p]) if *p == 34 => decfloat(25, dtype::DEC128, 16, 34),
         ("BOOLEAN", []) => col(23, dtype::BOOLEAN, 1, 0, 0, None),
         ("CHAR" | "CHARACTER", [n]) if *n >= 1 => col(14, dtype::TEXT, *n, 0, 0, Some(*n)),
         ("VARCHAR", [n]) if *n >= 1 => col(37, dtype::VARYING, *n + 2, 0, 0, Some(*n)),
