@@ -724,28 +724,41 @@ fn rewrite_system_sql(sql: &str) -> Option<String> {
         return None;
     }
     let mut out = sql.to_string();
+    let mut from = 0usize;
     loop {
         let u = out.to_ascii_uppercase();
-        let Some(at) = u.find("RDB$GET_CONTEXT") else { break };
+        let Some(rel) = u[from..].find("RDB$GET_CONTEXT") else { break };
+        let at = from + rel;
         let Some(open) = u[at..].find('(') else { break };
         let Some(close) = u[at + open..].find(')') else { break };
         let inner = out[at + open + 1..at + open + close].to_string();
         let args: Vec<String> = inner.split(',').map(|a| a.trim().trim_matches('\'').to_ascii_uppercase()).collect();
+        // only the SYSTEM namespace folds here; USER_SESSION /
+        // USER_TRANSACTION are the attachment's live variables, read by
+        // the function at evaluation (see SysFn::GetContext)
+        // ... and only as the ARGUMENT of PARSE_UNQUALIFIED_NAMES (whose
+        // fold below needs a literal list); anywhere else the function
+        // answers at evaluation, named and typed as the engine's
+        let before = u[..at].trim_end();
         let value: Option<&str> = match args.as_slice() {
-            [ns, var] if ns == "SYSTEM" => match var.as_str() {
+            [ns, var] if ns == "SYSTEM" && before.ends_with("PARSE_UNQUALIFIED_NAMES(") => match var.as_str() {
                 "SEARCH_PATH" => Some("\"PUBLIC\", \"SYSTEM\""),
                 "CURRENT_USER" => Some("SYSDBA"),
                 "CURRENT_SCHEMA" => Some("PUBLIC"),
                 "ENGINE_VERSION" => Some("6.0.0"),
                 _ => None,
             },
-            _ => None,
+            _ => {
+                from = at + open + close + 1;
+                continue;
+            }
         };
         let lit = match value {
             Some(v) => format!("'{}'", v.replace('\'', "''")),
             None => "CAST(NULL AS VARCHAR(255))".to_string(),
         };
         out.replace_range(at..at + open + close + 1, &lit);
+        from = at + lit.len();
     }
     loop {
         let u = out.to_ascii_uppercase();
@@ -1497,6 +1510,7 @@ fn ddl_dup_codes(plan: &Plan) -> Option<(i32, i32, String)> {
     match plan {
         Plan::CreateTable { name, .. } => Some((336397286, 336068740, q(name))),
         Plan::CreateException { name, .. } => Some((336397280, 336068861, q(name))),
+        Plan::CreateView { name, .. } => Some((336397298, 336068740, q(name))), // CREATE VIEW @1 failed / Table @1 already exists
         Plan::CreateSequence { name, .. } => Some((336397285, 336068862, q(name))),
         Plan::CreateProcedure { name, .. } => Some((336397265, 336068743, q(name))),
         _ => None,
@@ -1574,6 +1588,23 @@ fn respond_ddl_meta(
     // (-607, "Invalid command") and a "-Table @1 does not exist" string
     // - four items, not the three the others carry.
     if lc.contains("not found") {
+        if let Plan::DropView { name } = plan {
+            // DROP VIEW of a missing name (or of a TABLE - probed): the
+            // same nested -607 as DROP TABLE, with the view verbs
+            let qn = format!("\"PUBLIC\".\"{}\"", name.trim().trim_matches('"').to_ascii_uppercase());
+            let mut w = W::default();
+            w.int(OP_RESPONSE).int(0).int(0).int(0).int(0);
+            w.int(1).int(GDS_NO_META_UPDATE)
+                .int(1).int(336397302) // isc_dsql_drop_view_failed
+                .int(2).bytes(qn.as_bytes())
+                .int(1).int(335544436).int(4).int(-607)
+                .int(1).int(335544570)
+                .int(1).int(336397207) // isc_dsql_view_not_found
+                .int(2).bytes(qn.as_bytes())
+                .int(0);
+            w.send(s, enc)?;
+            return Ok(true);
+        }
         if let Plan::DropTable { name } = plan {
             let qn = format!(
                 "\"PUBLIC\".\"{}\"",
@@ -5992,6 +6023,10 @@ enum Wire {
     /// 4-byte int 0/1 (XDR pads the 1-byte boolean to a slot)
     Bool,
     /// 4-byte length + bytes + padding to 4
+    /// CHAR: the bytes, space-padded to the declared byte width, no
+    /// length word (blr_text) - what a CHAR column and a fixed-text
+    /// expression (a literal, CAST AS CHAR, UPPER(<char>)) travel as
+    Text,
     Varying,
     /// 8-byte blob id (the on-disk bid bytes); the client fetches the
     /// content through op_open_blob/op_get_segment with this id
@@ -6721,6 +6756,20 @@ fn resolve_text_cs(sub: i32, len: i32, oct: i32, att: &AttCs) -> (i32, i32) {
         } else {
             (cs as i32, len * fire_crab_ods::intl::bytes_per_char(cs) as i32)
         }
+    } else if sub >= 0 && att.id != 0 {
+        // a PLAIN column of a REAL charset (anything but the byte carriers
+        // NONE / OCTETS - ASCII included) is announced in the ATTACHMENT's
+        // charset, its characters times the attachment's bytes per char
+        // (probed: WIN1252 CHAR(5) under UTF8 is len 20 charset 4, VARCHAR(6)
+        // is 24; a UTF8 CHAR(3) under WIN1252 is 3 charset 53); a NONE
+        // column keeps its own bytes
+        let col_cs = fire_crab_ods::intl::charset_id(sub as i16);
+        if col_cs > 1 && col_cs != att.id {
+            let chars = len / fire_crab_ods::intl::bytes_per_char(col_cs).max(1) as i32;
+            (att.id as i32, chars * att.bpc as i32)
+        } else {
+            (sub, len)
+        }
     } else {
         (sub, len)
     }
@@ -7120,6 +7169,18 @@ enum Plan {
     /// `DECLARE FILTER <name> INPUT_TYPE i OUTPUT_TYPE o ENTRY_POINT 'e' MODULE_NAME 'm'`
     DeclareFilter { name: String, input: i16, output: i16, entry: String, module: String },
     DropFilter { name: String },
+    /// `CREATE VIEW <name> [(cols)] AS <select>`: the SELECT planned at
+    /// prepare gave the columns (a plain column reuses its base field's
+    /// source; an expression gets an auto-domain), the FROM gave the
+    /// contexts, the dsql crate the BLR the engine will run
+    CreateView {
+        name: String,
+        blr: Vec<u8>,
+        source: String,
+        fields: Vec<fire_crab_ods::ddl::ViewFieldSpec>,
+        contexts: Vec<fire_crab_ods::ddl::RestoredViewContext>,
+    },
+    DropView { name: String },
     /// `DROP PROCEDURE <name>`.
     DropProcedure { name: String },
     /// `CREATE PROCEDURE ...` - the BLR is the dsql crate's
@@ -10391,7 +10452,7 @@ fn wire_for(d: &Descriptor) -> (Wire, i32, i32, i32, i32) {
         // engine announces the real ttype; so does this now, which also
         // hands `CHARACTER SET OCTETS` back as the binary buffer it is
         // rather than as lossy text.
-        dtype::TEXT => (Wire::Varying, 448, d.length as i32, 0, d.sub_type as i32),
+        dtype::TEXT => (Wire::Text, 452, d.length as i32, 0, d.sub_type as i32), // SQL_TEXT
         dtype::VARYING => (
             Wire::Varying,
             448,
@@ -11910,6 +11971,7 @@ fn int_func_form(e: &Expr, descs: &[Descriptor]) -> Option<(Wire, i32, i32)> {
         _ => None,
     };
     match f {
+        SysFn::SetContext => Some(long), // INTEGER, probed
         SysFn::Sign => Some(short),
         SysFn::CharLength | SysFn::OctetLength | SysFn::OctetLengthCs(_) | SysFn::Position => Some(long),
         SysFn::BlobOctetLength => Some(int64), // a blob's length is a BIGINT (probed)
@@ -12134,6 +12196,7 @@ fn text_form_m(
                 _ => None,
             };
             match f {
+                SysFn::GetContext => Some((true, 255, TfCs::Att)), // VARCHAR(255), probed
                 SysFn::Upper | SysFn::Lower | SysFn::UpperCs(_) | SysFn::LowerCs(_) | SysFn::UpperColl(_) | SysFn::LowerColl(_) => arg(0),
                 SysFn::Trim(_) => arg(1).map(|(_, w, c)| (true, w, c)),
                 SysFn::Left | SysFn::Right | SysFn::Reverse => {
@@ -12268,8 +12331,12 @@ fn build_expr_col_from(e: Expr, name: &str, descs: &[Descriptor]) -> Option<Proj
         },
         ExprType::Text => match text_form(&e, descs) {
             // the VALUE is padded where the conditional is resolved (see
-            // `pad_conditional`); here only the WIDTH is announced
-            Some((_, w, _)) => (Wire::Varying, nullable(448), w, 0),
+            // `pad_conditional`); here only the WIDTH is announced - and
+            // the FORM: a fixed-text result (a literal, CAST AS CHAR,
+            // UPPER of a CHAR, a CASE of CHARs) is 452 (probed), a
+            // varying one (TRIM, ||, SUBSTRING, a VARCHAR) 448
+            Some((false, w, _)) => (Wire::Text, nullable(452), w, 0),
+            Some((true, w, _)) => (Wire::Varying, nullable(448), w, 0),
             // no statically known width: the maximum is the only safe
             // declaration, which is what every text expression got before
             None => (Wire::Varying, nullable(448), 32765, 0),
@@ -16128,6 +16195,203 @@ fn plan_declare_filter(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
     Some((Plan::DeclareFilter { name, input, output, entry, module }, Vec::new()))
 }
 
+/// `CREATE VIEW <name> [(<cols>)] AS <select>` - planned here, at prepare,
+/// because the view's columns come from the SELECT's own plan: a plain
+/// column keeps its base relation's RDB$FIELD_SOURCE, base field and
+/// context; an expression column carries its type for an auto-domain
+/// (probed). The BLR is the dsql crate's byte-for-byte `RDB$VIEW_BLR`;
+/// a SELECT it cannot compile refuses the statement (no guessing - the
+/// engine runs that BLR when it reads this file). `WITH CHECK OPTION`
+/// is outside this slice.
+fn plan_create_view(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor>)> {
+    let s = sql.trim().trim_end_matches(';').trim();
+    let up = s.to_ascii_uppercase();
+    let masked = mask_literals(&up);
+    if find_word(&masked, "CREATE", 0) != Some(0) {
+        return None;
+    }
+    let vw = find_word(&masked, "VIEW", "CREATE".len())?;
+    if masked["CREATE".len()..vw].trim() != "" {
+        return None;
+    }
+    let as_at = find_word(&masked, "AS", vw)?;
+    let head = s[vw + "VIEW".len()..as_at].trim();
+    let (name_raw, cols): (&str, Option<Vec<String>>) = match head.find('(') {
+        Some(p) => {
+            let close = head.rfind(')')?;
+            let list = head[p + 1..close]
+                .split(',')
+                .map(|c| unquote_ident(c.trim()))
+                .collect::<Option<Vec<_>>>()?;
+            (head[..p].trim(), Some(list))
+        }
+        None => (head, None),
+    };
+    let name = unquote_ident(name_raw)?;
+    let select = s[as_at + "AS".len()..].trim();
+    let sel_up = mask_literals(&select.to_ascii_uppercase());
+    if find_word(&sel_up, "WITH", 0).is_some() && sel_up.contains("CHECK OPTION") {
+        return None; // WITH CHECK OPTION: a later slice
+    }
+    let dbr = db.as_ref()?;
+    let tr = |what: &str| {
+        if trace_on() {
+            eprintln!("[srv] create view {}: refused at {}", name, what);
+        }
+    };
+    let mut params: Vec<Option<Descriptor>> = Vec::new();
+    let Some(plan) = plan_query_inner(select, db, &mut params) else {
+        tr("the SELECT's plan");
+        return None;
+    };
+    if !params.is_empty() {
+        tr("a parameter");
+        return None;
+    }
+    let out_cols = output_cols_of(&plan);
+    if out_cols.is_empty() {
+        tr("no output columns");
+        return None;
+    }
+    if let Some(c) = &cols {
+        if c.len() != out_cols.len() {
+            return None;
+        }
+    }
+    // the FROM items, in order: context 1.. (probed: `FROM T a JOIN T b`
+    // is contexts 1 "A" and 2 "B"; an unaliased item is "PUBLIC"."T")
+    let (_, table_s, ..) = split_query(select)?;
+    let (from, joins) = parse_from(table_s)?;
+    let mut contexts: Vec<fire_crab_ods::ddl::RestoredViewContext> = Vec::new();
+    let mut keys: Vec<(String, String)> = Vec::new(); // (binding key, table)
+    for (i, tr) in std::iter::once(&from).chain(joins.iter().map(|(_, r, _, _)| r)).enumerate() {
+        if tr.schema.is_some_and(|(sc, _)| !sc.eq_ignore_ascii_case("PUBLIC")) {
+            return None;
+        }
+        let table = tr.table.trim_matches('"').to_ascii_uppercase();
+        if dbr.columns(&table).is_empty() {
+            return None; // a derived table / CTE / unknown item: not this slice
+        }
+        let key = tr.alias.unwrap_or(tr.table).trim_matches('"').to_ascii_uppercase();
+        let context_name = match tr.alias {
+            Some(a) => format!("\"{}\"", a.trim_matches('"').to_ascii_uppercase()),
+            None => format!("\"PUBLIC\".\"{}\"", table),
+        };
+        contexts.push(fire_crab_ods::ddl::RestoredViewContext { relation: table.clone(), context: (i + 1) as i64, context_name });
+        keys.push((key, table));
+    }
+    // the expression columns' BLR over the view's streams (the engine's
+    // RDB$COMPUTED_BLR on their auto-domains), one slot per select item
+    let Some(col_blrs) = fire_crab_dsql::compile_view_columns(select) else {
+        tr("the column BLR (outside the dsql crate's surface)");
+        return None;
+    };
+    if col_blrs.len() != out_cols.len() {
+        tr("the select-list item count");
+        return None;
+    }
+    let mut fields: Vec<fire_crab_ods::ddl::ViewFieldSpec> = Vec::with_capacity(out_cols.len());
+    for (i, c) in out_cols.iter().enumerate() {
+        let name = match &cols {
+            Some(list) => list[i].clone(),
+            None => c.name.trim().to_ascii_uppercase(),
+        };
+        if name.is_empty() {
+            return None; // an unaliased expression needs a column list (the engine refuses too)
+        }
+        let plain = c.expr.is_none() && c.relation.is_some() && c.fname.is_some();
+        if plain {
+            let base_table = c.relation.clone().unwrap_or_default().to_ascii_uppercase();
+            let base_field = c.fname.clone().unwrap_or_default().to_ascii_uppercase();
+            let key = c.rel_alias.clone().unwrap_or_else(|| base_table.clone()).to_ascii_uppercase();
+            let Some(ctx) = keys
+                .iter()
+                .position(|(k, t)| *k == key || (*t == base_table && keys.iter().filter(|(_, tt)| *tt == base_table).count() == 1))
+                .map(|p| p + 1)
+            else {
+                tr(&format!("the context of column {} (key {}, table {})", name, key, base_table));
+                return None;
+            };
+            let Some(source) = fire_crab_ods::ddl::relation_field_source(&dbr.bytes(), dbr.page_size, &base_table, &base_field) else {
+                tr(&format!("the field source of {}.{}", base_table, base_field));
+                return None;
+            };
+            fields.push(fire_crab_ods::ddl::ViewFieldSpec { name, base: Some((source, base_field, ctx as i64)), expr: None, computed_blr: None });
+        } else {
+            let Some(col) = projcol_to_coldef(c, &name) else {
+                tr(&format!("the type of expression column {} (sqltype {})", name, c.sql_type));
+                return None;
+            };
+            let Some(cblr) = col_blrs[i].clone() else {
+                tr(&format!("the expression BLR of column {}", name));
+                return None;
+            };
+            fields.push(fire_crab_ods::ddl::ViewFieldSpec { name, base: None, expr: Some(col), computed_blr: Some(cblr) });
+        }
+    }
+    let Some(blr) = fire_crab_dsql::compile_view_select(select) else {
+        tr("the BLR (outside the dsql crate's surface)");
+        return None;
+    };
+    Some((Plan::CreateView { name, blr, source: select.to_string(), fields, contexts }, Vec::new()))
+}
+
+/// The auto-domain type of a view's expression column, from its describe:
+/// the exact kinds by width with the storage width's precision (4 / 9 /
+/// 18 / 38, probed), text at its width, the rest as themselves. None for
+/// a type this slice does not spell (the statement refuses).
+fn projcol_to_coldef(c: &ProjCol, name: &str) -> Option<fire_crab_ods::ddl::ColumnDef> {
+    use fire_crab_ods::ddl::ColumnDef;
+    let t = c.sql_type & !1;
+    let (field_type, dt, length, char_len, precision, sub_type): (i16, u8, u16, Option<u16>, Option<i16>, i16) = match t {
+        500 => (7, dtype::SHORT, 2, None, Some(4), c.sub_type as i16),
+        496 => (8, dtype::LONG, 4, None, Some(9), c.sub_type as i16),
+        580 => (16, dtype::INT64, 8, None, Some(18), c.sub_type as i16),
+        32752 => (26, dtype::INT128, 16, None, Some(38), c.sub_type as i16),
+        448 => (37, dtype::VARYING, (c.length.max(0) as u16).saturating_add(2), Some(c.length.max(0) as u16), None, 0),
+        452 => (14, dtype::TEXT, c.length.max(0) as u16, Some(c.length.max(0) as u16), None, 0),
+        480 => (27, dtype::DOUBLE, 8, None, None, 0),
+        482 => (10, dtype::REAL, 4, None, None, 0),
+        570 => (12, dtype::SQL_DATE, 4, None, None, 0),
+        560 => (13, dtype::SQL_TIME, 4, None, None, 0),
+        510 => (35, dtype::TIMESTAMP, 8, None, None, 0),
+        32764 => (23, dtype::BOOLEAN, 1, None, None, 0),
+        520 => (261, dtype::BLOB, 8, None, None, c.sub_type as i16),
+        _ => return None,
+    };
+    // a scaled exact kind is NUMERIC (sub_type 1) unless the describe says DECIMAL
+    let sub_type = if matches!(t, 500 | 496 | 580 | 32752) && c.scale != 0 && sub_type == 0 { 1 } else { sub_type };
+    Some(ColumnDef {
+        name: name.to_string(),
+        field_type,
+        dtype: dt,
+        length,
+        scale: c.scale as i8,
+        sub_type,
+        char_len,
+        dims: Vec::new(),
+        segment_length: None,
+        charset_id: None,
+        precision,
+        not_null: false,
+        not_null_constraint: false,
+        default: None,
+        domain: None,
+        identity: None,
+        computed: None,
+    })
+}
+
+/// Parse `DROP VIEW <name>`.
+fn plan_drop_view(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
+    let s = sql.trim().trim_end_matches(';').trim();
+    let toks: Vec<&str> = s.split_whitespace().collect();
+    if toks.len() != 3 || !toks[0].eq_ignore_ascii_case("DROP") || !toks[1].eq_ignore_ascii_case("VIEW") {
+        return None;
+    }
+    Some((Plan::DropView { name: unquote_ident(toks[2])? }, Vec::new()))
+}
+
 /// Parse `DROP FILTER <name>`.
 fn plan_drop_filter(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
     let s = sql.trim().trim_end_matches(';').trim();
@@ -19366,6 +19630,9 @@ struct OutSlot {
     /// resolution that makes node-firebird trip the capacity rule where
     /// libfbclient (which always declares text2/varying2) never does.
     text: Option<(u16, Option<u16>)>,
+    /// blr_text / blr_text2: the client wants the FIXED form (bytes, no
+    /// length word); blr_varying / blr_varying2 the counted one
+    fixed: bool,
 }
 
 /// The client's declared output format for one statement: the parsed
@@ -19399,42 +19666,42 @@ fn parse_out_blr(b: &[u8]) -> Option<Vec<OutSlot>> {
                 // blr_text: word length
                 let len = u16::from_le_bytes([*b.get(i)?, *b.get(i + 1)?]);
                 i += 2;
-                OutSlot { text: Some((len, None)) }
+                OutSlot { text: Some((len, None)), fixed: true }
             }
             15 => {
                 // blr_text2: charset word then length word
                 let cs = u16::from_le_bytes([*b.get(i)?, *b.get(i + 1)?]);
                 let len = u16::from_le_bytes([*b.get(i + 2)?, *b.get(i + 3)?]);
                 i += 4;
-                OutSlot { text: Some((len, Some(cs))) }
+                OutSlot { text: Some((len, Some(cs))), fixed: true }
             }
             37 => {
                 // blr_varying: word length
                 let len = u16::from_le_bytes([*b.get(i)?, *b.get(i + 1)?]);
                 i += 2;
-                OutSlot { text: Some((len, None)) }
+                OutSlot { text: Some((len, None)), fixed: false }
             }
             38 => {
                 // blr_varying2: charset word then length word
                 let cs = u16::from_le_bytes([*b.get(i)?, *b.get(i + 1)?]);
                 let len = u16::from_le_bytes([*b.get(i + 2)?, *b.get(i + 3)?]);
                 i += 4;
-                OutSlot { text: Some((len, Some(cs))) }
+                OutSlot { text: Some((len, Some(cs))), fixed: false }
             }
             // scale-carrying numerics: short/long/quad/int64/int128
             7 | 8 | 9 | 16 | 26 => {
                 i += 1;
-                OutSlot { text: None }
+                OutSlot { text: None, fixed: false }
             }
             // no-operand dtypes: float/d_float/double, date/time/
             // timestamp, bool, dec64/dec128, the tz forms
             10 | 11 | 27 | 12 | 13 | 35 | 23 | 24 | 25 | 28 | 29 | 30 | 31 => {
-                OutSlot { text: None }
+                OutSlot { text: None, fixed: false }
             }
             17 => {
                 // blr_blob2: subtype word then charset word
                 i += 4;
-                OutSlot { text: None }
+                OutSlot { text: None, fixed: false }
             }
             _ => return None,
         };
@@ -21825,6 +22092,14 @@ fn execute_dml_collecting_inner(
         }
         Plan::DropFilter { name } => {
             fire_crab_ods::ddl::drop_filter(&mut work, db.page_size, name)?;
+            (0, 0, 0)
+        }
+        Plan::CreateView { name, blr, source, fields, contexts } => {
+            fire_crab_ods::ddl::create_view(&mut work, db.page_size, name, blr, source, fields, contexts)?;
+            (0, 0, 0)
+        }
+        Plan::DropView { name } => {
+            fire_crab_ods::ddl::drop_view(&mut work, db.page_size, name)?;
             (0, 0, 0)
         }
         Plan::DropProcedure { name } => {
@@ -30554,6 +30829,7 @@ fn expr_nullable(e: &Expr, is_nn: &dyn Fn(usize) -> bool) -> bool {
             arms.iter().any(|(_, x)| expr_nullable(x, is_nn))
                 || els.as_ref().map_or(true, |x| expr_nullable(x, is_nn))
         }
+        Expr::Func(SysFn::GetContext, _) => true,
         Expr::Func(_, args) => args.iter().any(|a| expr_nullable(a, is_nn)),
         _ => true,
     }
@@ -34701,7 +34977,7 @@ fn describe_for(plan: &Plan, params: &[Descriptor], att: AttCs) -> Vec<u8> {
         | Plan::DropIndex { .. }
         | Plan::CreateSequence { .. } | Plan::DropSequence { .. }
         | Plan::CreateException { .. } | Plan::CreateProcedure { .. } | Plan::DropProcedure { .. } | Plan::DropException { .. }
-        | Plan::DeclareFilter { .. } | Plan::DropFilter { .. }
+        | Plan::DeclareFilter { .. } | Plan::DropFilter { .. } | Plan::CreateView { .. } | Plan::DropView { .. }
         | Plan::AlterException { .. } | Plan::CreateOrAlterException { .. }
         | Plan::CreateRole { .. } | Plan::DropRole { .. }
         | Plan::AlterDatabaseBackup { .. }
@@ -34807,7 +35083,7 @@ fn stmt_type_of(plan: &Plan) -> i32 {
         | Plan::DropIndex { .. }
         | Plan::CreateSequence { .. } | Plan::DropSequence { .. }
         | Plan::CreateException { .. } | Plan::CreateProcedure { .. } | Plan::DropProcedure { .. } | Plan::DropException { .. }
-        | Plan::DeclareFilter { .. } | Plan::DropFilter { .. }
+        | Plan::DeclareFilter { .. } | Plan::DropFilter { .. } | Plan::CreateView { .. } | Plan::DropView { .. }
         | Plan::AlterException { .. } | Plan::CreateOrAlterException { .. }
         | Plan::CreateRole { .. } | Plan::DropRole { .. }
         | Plan::AlterDatabaseBackup { .. }
@@ -35665,6 +35941,14 @@ fn eval_status_items(w: &mut W, e: &EvalErr) {
                 .int(1) // Blob sub_types bigger than 1 (text) are for internal use only
                 .int(335544867);
         }
+        EvalErr::CtxNamespace(ns, func) => {
+            w.int(1) // isc_arg_gds
+                .int(335544844)
+                .int(2)
+                .bytes(ns.as_bytes())
+                .int(2)
+                .bytes(func.as_bytes());
+        }
         EvalErr::NoFilter(from, to) => {
             w.int(1) // isc_arg_gds - filter not found to convert type @1 to type @2
                 .int(GDS_NO_FILTER)
@@ -36232,7 +36516,7 @@ fn emit_rows_inner(
         | Plan::DropIndex { .. }
         | Plan::CreateSequence { .. } | Plan::DropSequence { .. }
         | Plan::CreateException { .. } | Plan::CreateProcedure { .. } | Plan::DropProcedure { .. } | Plan::DropException { .. }
-        | Plan::DeclareFilter { .. } | Plan::DropFilter { .. }
+        | Plan::DeclareFilter { .. } | Plan::DropFilter { .. } | Plan::CreateView { .. } | Plan::DropView { .. }
         | Plan::AlterException { .. } | Plan::CreateOrAlterException { .. }
         | Plan::CreateRole { .. } | Plan::DropRole { .. }
         | Plan::AlterDatabaseBackup { .. }
@@ -37105,7 +37389,9 @@ fn enforce_out_capacity(
     }
     for (i, c) in cols.iter().enumerate() {
         let Some((l, decl_cs)) = out.slots[i].text else { continue };
-        if !matches!(c.wire, Wire::Varying) || matches!(vals[i], Value::Null) {
+        // a CHAR slot obeys the same cap, its blank padding counting as
+        // actual length (probed: CHAR(5) 'ab' into a one-char cap raises (1, 5))
+        if !matches!(c.wire, Wire::Varying | Wire::Text) || matches!(vals[i], Value::Null) {
             continue;
         }
         // varying2/text2 wins; a bare slot resolves to the attachment
@@ -37199,10 +37485,14 @@ fn encode_row_inline(
 ) -> Result<(), EvalErr> {
     // each column's value: an expression's result, or the record field.
     // Computed up front so a divide-by-zero aborts before any byte lands.
-    let mut vals: Vec<Value> = cols
-        .iter()
-        .map(|c| c.value_of(values))
-        .collect::<Result<_, _>>()?;
+    let mut vals: Vec<Value> = if cols.iter().any(|c| c.expr.as_ref().is_some_and(expr_sets_context)) {
+        // right-to-left, the engine's order, when a SET_CONTEXT is in the list
+        let mut v: Vec<Value> = cols.iter().rev().map(|c| c.value_of(values)).collect::<Result<_, _>>()?;
+        v.reverse();
+        v
+    } else {
+        cols.iter().map(|c| c.value_of(values)).collect::<Result<_, _>>()?
+    };
     // the client-declared output capacity, enforced per row exactly like
     // the expression errors above: before any byte of the row lands
     if let Some(out) = out {
@@ -37361,8 +37651,44 @@ fn encode_row_body(
             Wire::Bool => {
                 w.int(if matches!(v, Value::Bool(true)) { 1 } else { 0 });
             }
-            Wire::Varying => {
+            Wire::Varying | Wire::Text => {
                 let s = v.render();
+                // the FORM the client asked for in its blr (a CHAR column
+                // may be fetched as blr_varying and a VARCHAR as blr_text;
+                // the engine serves whichever the message declares), else
+                // the column's own; a fixed slot is space-padded to the
+                // byte width the describe announced
+                let slot_i = cols.iter().position(|cc| std::ptr::eq(cc, c));
+                let fixed_out = out
+                    .and_then(|o| slot_i.and_then(|i| o.slots.get(i)).map(|sl| sl.fixed))
+                    .unwrap_or(matches!(c.wire, Wire::Text));
+                // the byte width is the one the client DECLARED for the slot
+                // (its blr_text length - exact by construction); without a
+                // slot, the width the describe would announce
+                let fixed_width = out
+                    .and_then(|o| slot_i.and_then(|i| o.slots.get(i)).and_then(|sl| sl.text.map(|(len, _)| len as i32)))
+                    .or_else(|| out.map(|o| resolve_text_cs(c.sub_type, c.length, c.oct_length, &o.att).1))
+                    .unwrap_or(c.length)
+                    .max(0) as usize;
+                let emit = |w: &mut W, b: &[u8]| {
+                    if std::env::var("FC_SRV_TRACE").is_ok() {
+                        eprintln!("[srv] text slot {:?}: fixed_out={} width={} bytes={:?}", c.name, fixed_out, fixed_width, b);
+                    }
+                    if fixed_out {
+                        let mut fb = b.to_vec();
+                        fb.resize(fixed_width, b' ');
+                        w.raw(&fb);
+                        for _ in 0..(4 - fb.len() % 4) % 4 {
+                            w.raw(&[0u8]);
+                        }
+                    } else {
+                        w.int(b.len() as i32);
+                        w.raw(b);
+                        for _ in 0..(4 - b.len() % 4) % 4 {
+                            w.raw(&[0u8]);
+                        }
+                    }
+                };
                 // a BYTE-CARRIER source column (NONE/OCTETS/ASCII) is
                 // never transliterated: its raw stored bytes travel to
                 // EVERY attachment (measured: a NONE column's 0xE9
@@ -37373,11 +37699,7 @@ fn encode_row_body(
                     ))
                 {
                     if let Some(b) = fire_crab_ods::intl::carrier_encode(&s) {
-                        w.int(b.len() as i32);
-                        w.raw(&b);
-                        for _ in 0..(4 - b.len() % 4) % 4 {
-                            w.raw(&[0u8]);
-                        }
+                        emit(w, &b);
                         continue;
                     }
                 }
@@ -37429,11 +37751,7 @@ fn encode_row_body(
                     }
                     None => s.as_bytes(),
                 };
-                w.int(b.len() as i32);
-                w.raw(b);
-                for _ in 0..(4 - b.len() % 4) % 4 {
-                    w.raw(&[0u8]);
-                }
+                emit(w, b);
             }
             Wire::Blob => {
                 // the on-disk bid bytes travel (RecordNumber.h:63-71
@@ -37540,6 +37858,31 @@ fn bpb_conversion(bpb: &[u8]) -> (Option<i32>, Option<i32>) {
         i += 2 + len;
     }
     (from, to)
+}
+
+thread_local! {
+    /// This attachment's context variables: (USER_SESSION, USER_TRANSACTION)
+    /// - one connection is one thread, so the thread is the attachment;
+    /// the transaction map empties at COMMIT / ROLLBACK (not RETAINING)
+    static CTX_VARS: std::cell::RefCell<(
+        std::collections::HashMap<String, String>,
+        std::collections::HashMap<String, String>,
+    )> = std::cell::RefCell::new((std::collections::HashMap::new(), std::collections::HashMap::new()));
+}
+
+/// Whether an expression calls RDB$SET_CONTEXT anywhere - a side effect
+/// the engine evaluates select-list items RIGHT-TO-LEFT around (probed:
+/// `SET_CONTEXT(K, v), GET_CONTEXT(K)` reads the OLD value), so a row
+/// holding one is evaluated in that order too.
+fn expr_sets_context(e: &Expr) -> bool {
+    match e {
+        Expr::Func(SysFn::SetContext, _) => true,
+        Expr::Func(_, args) | Expr::Coalesce(args) => args.iter().any(expr_sets_context),
+        Expr::Neg(a) | Expr::Cast(a, ..) | Expr::TextNum(a, _) | Expr::TextNumKey(a, _) | Expr::TextBool(a, _) => expr_sets_context(a),
+        Expr::Bin(a, _, b) | Expr::Concat(a, b) | Expr::NullIf(a, b) | Expr::Iif(_, a, b) => expr_sets_context(a) || expr_sets_context(b),
+        Expr::Case(arms, els) => arms.iter().any(|(_, x)| expr_sets_context(x)) || els.as_ref().is_some_and(|x| expr_sets_context(x)),
+        _ => false,
+    }
 }
 
 thread_local! {
@@ -38568,6 +38911,12 @@ enum RawExpr {
 /// live engine before it was written down - see qa/serve-real-functions.sh.
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum SysFn {
+    /// RDB$GET_CONTEXT(namespace, name): a USER_SESSION / USER_TRANSACTION
+    /// variable of this attachment (the SYSTEM ones fold at prepare)
+    GetContext,
+    /// RDB$SET_CONTEXT(namespace, name, value): sets (NULL deletes) and
+    /// answers 1 when the variable existed, 0 when it did not
+    SetContext,
     Upper,
     Lower,
     /// CHAR_LENGTH / CHARACTER_LENGTH - CHARACTERS, so a CHAR(5) counts
@@ -38696,6 +39045,8 @@ impl SysFn {
     /// probed against isql).
     fn header(&self) -> &'static str {
         match self {
+            SysFn::GetContext => "RDB$GET_CONTEXT",
+            SysFn::SetContext => "RDB$SET_CONTEXT",
             SysFn::Upper | SysFn::UpperCs(_) | SysFn::UpperColl(_) => "UPPER",
             SysFn::Lower | SysFn::LowerCs(_) | SysFn::LowerColl(_) => "LOWER",
             SysFn::CharLength => "CHAR_LENGTH",
@@ -40008,6 +40359,8 @@ fn names_expr_call(s: &str) -> bool {
 /// quoted `"LEFT"` stays a column - only the bare word is a call.
 fn sysfn_named(word: &str) -> Option<SysFn> {
     Some(match word.to_ascii_uppercase().as_str() {
+        "RDB$GET_CONTEXT" => SysFn::GetContext,
+        "RDB$SET_CONTEXT" => SysFn::SetContext,
         "UPPER" => SysFn::Upper,
         "LOWER" => SysFn::Lower,
         "CHAR_LENGTH" | "CHARACTER_LENGTH" => SysFn::CharLength,
@@ -40224,6 +40577,8 @@ fn parse_sysfn_call(up: &str, b: &[char], pos: &mut usize) -> Option<RawExpr> {
         args.push(expr_add(b, pos)?);
     }
     let (min, max) = match f {
+        SysFn::GetContext => (2, 2),
+        SysFn::SetContext => (3, 3),
         SysFn::Upper
         | SysFn::Lower
         | SysFn::UpperCs(_)
@@ -41187,6 +41542,8 @@ enum EvalErr {
     /// 42000 "must be zero or positive" on LPAD/RPAD/POSITION bounds -
     /// an error either way, never a wrong row
     InvalidLength(i64),
+    /// isc_ctx_namespace_invalid: "Invalid namespace name '@1' passed to @2"
+    CtxNamespace(String, &'static str),
     /// `BLOB SUB_TYPE n` (n > 1) in a CREATE TABLE: the engine's "Blob
     /// sub_types bigger than 1 (text) are for internal use only", inside
     /// the "CREATE TABLE @1 failed" wrapper - carries the qualified name
@@ -43089,6 +43446,8 @@ impl Expr {
                         }
                         _ => None,
                     },
+                    SysFn::GetContext => Some(ExprType::Text),
+                    SysFn::SetContext => Some(ExprType::Int),
                     SysFn::Upper
                     | SysFn::Lower
                     | SysFn::UpperCs(_)
@@ -43990,11 +44349,13 @@ impl Expr {
             }
             Expr::Func(f, args) => {
                 // every function here propagates NULL: any NULL argument
-                // makes the result NULL (probed for each one)
+                // makes the result NULL (probed for each one) - except
+                // RDB$SET_CONTEXT's VALUE, where NULL deletes the variable
+                // and the call still answers 0 / 1 (probed)
                 let mut vs = Vec::with_capacity(args.len());
-                for a in args {
+                for (i, a) in args.iter().enumerate() {
                     let v = a.eval(values)?;
-                    if matches!(v, Value::Null) {
+                    if matches!(v, Value::Null) && !(matches!(f, SysFn::SetContext) && i == 2) {
                         return Ok(Value::Null);
                     }
                     vs.push(v);
@@ -44072,6 +44433,43 @@ impl Expr {
                     // already lossy at decode~~ - stale twice over:
                     // carrier columns decode losslessly now AND their
                     // UPPER is the ASCII-only [SysFn::UpperCs] arm.
+                    SysFn::GetContext => {
+                        let ns = fn_text(&vs[0]).trim().to_ascii_uppercase();
+                        let name = fn_text(&vs[1]).trim().to_string();
+                        match ns.as_str() {
+                            "USER_SESSION" | "USER_TRANSACTION" => CTX_VARS.with(|c| {
+                                let c = c.borrow();
+                                let m = if ns == "USER_SESSION" { &c.0 } else { &c.1 };
+                                m.get(&name).map(|v| Value::Text(v.clone())).unwrap_or(Value::Null)
+                            }),
+                            "SYSTEM" => match name.to_ascii_uppercase().as_str() {
+                                "SEARCH_PATH" => Value::Text("\"PUBLIC\", \"SYSTEM\"".into()),
+                                "CURRENT_USER" => Value::Text("SYSDBA".into()),
+                                "CURRENT_SCHEMA" => Value::Text("PUBLIC".into()),
+                                "ENGINE_VERSION" => Value::Text("6.0.0".into()),
+                                "NETWORK_PROTOCOL" => Value::Text("TCPv4".into()),
+                                "ISOLATION_LEVEL" => Value::Text("SNAPSHOT".into()),
+                                _ => Value::Null,
+                            },
+                            _ => return Err(EvalErr::CtxNamespace(ns, "RDB$GET_CONTEXT")),
+                        }
+                    }
+                    SysFn::SetContext => {
+                        let ns = fn_text(&vs[0]).trim().to_ascii_uppercase();
+                        let name = fn_text(&vs[1]).trim().to_string();
+                        if !matches!(ns.as_str(), "USER_SESSION" | "USER_TRANSACTION") {
+                            return Err(EvalErr::CtxNamespace(ns, "RDB$SET_CONTEXT"));
+                        }
+                        let existed = CTX_VARS.with(|c| {
+                            let mut c = c.borrow_mut();
+                            let m = if ns == "USER_SESSION" { &mut c.0 } else { &mut c.1 };
+                            match &vs[2] {
+                                Value::Null => m.remove(&name).is_some(),
+                                v => m.insert(name.clone(), v.render()).is_some(),
+                            }
+                        });
+                        Value::Int(existed as i64)
+                    }
                     SysFn::Upper => Value::Text(simple_case(&fn_text(&vs[0]), true)),
                     SysFn::Lower => Value::Text(simple_case(&fn_text(&vs[0]), false)),
                     // the CHARSET's own case law, tables generated from
@@ -49726,6 +50124,8 @@ fn plan_immediate(text: &str, database: &Option<Database>) -> Option<(Plan, Vec<
                     .or_else(|| plan_create_exception(text))
                     .or_else(|| plan_declare_filter(text))
                     .or_else(|| plan_drop_filter(text))
+                    .or_else(|| plan_create_view(text, database))
+                    .or_else(|| plan_drop_view(text))
                     .or_else(|| plan_drop_exception(text))
                     .or_else(|| plan_alter_exception(text))
                     .or_else(|| plan_create_or_alter_exception(text))
@@ -53378,6 +53778,7 @@ fn expr_no_raise(e: &Expr, descs: &[Descriptor]) -> bool {
                 return false;
             }
             match f {
+                SysFn::GetContext | SysFn::SetContext => false,
                 SysFn::Upper
                 | SysFn::Lower
                 | SysFn::UpperCs(_)
@@ -55130,6 +55531,8 @@ fn after_auth(
                         .or_else(|| plan_create_exception(&stmt_sql))
                         .or_else(|| plan_declare_filter(&stmt_sql))
                         .or_else(|| plan_drop_filter(&stmt_sql))
+                        .or_else(|| plan_create_view(&stmt_sql, &database))
+                        .or_else(|| plan_drop_view(&stmt_sql))
                         .or_else(|| plan_drop_exception(&stmt_sql))
                         .or_else(|| plan_alter_exception(&stmt_sql))
                         .or_else(|| plan_create_or_alter_exception(&stmt_sql))
@@ -55413,7 +55816,7 @@ fn after_auth(
                         | Plan::CreateSequence { .. }
                         | Plan::DropSequence { .. }
                         | Plan::CreateException { .. }
-                        | Plan::DeclareFilter { .. } | Plan::DropFilter { .. }
+                        | Plan::DeclareFilter { .. } | Plan::DropFilter { .. } | Plan::CreateView { .. } | Plan::DropView { .. }
                         | Plan::CreateProcedure { .. }
                         | Plan::DropProcedure { .. }
                         | Plan::AlterException { .. }
@@ -56260,6 +56663,11 @@ fn after_auth(
                 // no check (the message length does not depend on it, so
                 // the stream stays in sync either way).
                 let out_blr = read_wire_bytes(&mut s, &mut dec)?;
+                if std::env::var("FC_SRV_TRACE").is_ok() {
+                    if let Some(slots) = parse_out_blr(&out_blr) {
+                        eprintln!("[srv] out_blr slots: {:?}", slots.iter().map(|sl| (sl.text, sl.fixed)).collect::<Vec<_>>());
+                    }
+                }
                 let out_fmt = parse_out_blr(&out_blr)
                     .map(|slots| OutFmt { slots, att: att_cs });
                 read_int(&mut s, &mut dec)?; // msg number
@@ -56970,6 +57378,9 @@ fn after_auth(
                 read_int(&mut s, &mut dec)?; // tr
                 let retain = x == OP_COMMIT_RETAINING || x == OP_ROLLBACK_RETAINING;
                 let rollback = x == OP_ROLLBACK || x == OP_ROLLBACK_RETAINING;
+                if !retain {
+                    CTX_VARS.with(|c| c.borrow_mut().1.clear()); // USER_TRANSACTION variables end with it
+                }
                 // A RECONNECTED LIMBO TRANSACTION: the commit or
                 // rollback IS the resolution - somebody else's id, so
                 // none of this connection's own machinery applies
@@ -57796,6 +58207,11 @@ fn after_auth(
                 // is (the engine checks inline and answers a bare error
                 // op_response in place of the sql_response)
                 let out_blr = read_wire_bytes(&mut s, &mut dec)?;
+                if std::env::var("FC_SRV_TRACE").is_ok() {
+                    if let Some(slots) = parse_out_blr(&out_blr) {
+                        eprintln!("[srv] out_blr slots: {:?}", slots.iter().map(|sl| (sl.text, sl.fixed)).collect::<Vec<_>>());
+                    }
+                }
                 let out_fmt = parse_out_blr(&out_blr)
                     .map(|slots| OutFmt { slots, att: att_cs });
                 read_int(&mut s, &mut dec)?; // out message number
@@ -63040,7 +63456,7 @@ mod tests {
         let (_, ty, len, _, _) = wire_for(&td(dtype::VARYING, 12));
         assert_eq!((ty, len), (448, 10)); // VARCHAR(10)
         let (_, ty, len, _, _) = wire_for(&td(dtype::TEXT, 5));
-        assert_eq!((ty, len), (448, 5)); // CHAR(5)
+        assert_eq!((ty, len), (452, 5)); // CHAR(5)
         // a dtype with no native mapping is rendered, width unknown
         let (_, ty, len, _, _) = wire_for(&td(dtype::QUAD, 8));
         assert_eq!((ty, len), (448, 32765));
@@ -63146,15 +63562,15 @@ mod tests {
         };
         // blr_varying(6) + blr_short: what 2.11.0 declares for VARCHAR(6)
         let got = parse_out_blr(&blr(&[&[37, 6, 0], &[8, 0]])).unwrap();
-        assert_eq!(got[0], OutSlot { text: Some((6, None)) });
-        assert_eq!(got[1], OutSlot { text: None });
+        assert_eq!(got[0], OutSlot { text: Some((6, None)), fixed: false });
+        assert_eq!(got[1], OutSlot { text: None, fixed: false });
         // blr_varying2 carries its charset word (libfbclient's form)
         let got = parse_out_blr(&blr(&[&[38, 4, 0, 24, 0]])).unwrap();
-        assert_eq!(got[0], OutSlot { text: Some((24, Some(4))) });
+        assert_eq!(got[0], OutSlot { text: Some((24, Some(4))), fixed: false });
         // blr_text / blr_text2
         let got = parse_out_blr(&blr(&[&[14, 5, 0], &[15, 0, 0, 5, 0]])).unwrap();
-        assert_eq!(got[0], OutSlot { text: Some((5, None)) });
-        assert_eq!(got[1], OutSlot { text: Some((5, Some(0))) });
+        assert_eq!(got[0], OutSlot { text: Some((5, None)), fixed: true });
+        assert_eq!(got[1], OutSlot { text: Some((5, Some(0))), fixed: true });
         // an empty or undecodable BLR = no check, never a dropped
         // connection (dtype 99 does not exist)
         assert_eq!(parse_out_blr(&[]), None);
@@ -63175,7 +63591,7 @@ mod tests {
         let run = |sub_type: i32, l: u16, att: AttCs, v: &str| {
             let cols = [col(sub_type)];
             let mut vals = [Value::Text(v.into())];
-            let out = OutFmt { slots: vec![OutSlot { text: Some((l, None)) }], att };
+            let out = OutFmt { slots: vec![OutSlot { text: Some((l, None)), fixed: false }], att };
             enforce_out_capacity(&cols, &mut vals, &out).map(|_| vals[0].render())
         };
         let err = |e: i64, a: i64| Err(EvalErr::StringTruncation { expected: e, actual: a });
@@ -63206,9 +63622,9 @@ mod tests {
         // a NULL slot and a non-text slot pass untouched
         let cols = [col(0)];
         let mut vals = [Value::Null];
-        let out = OutFmt { slots: vec![OutSlot { text: Some((6, None)) }], att: utf8 };
+        let out = OutFmt { slots: vec![OutSlot { text: Some((6, None)), fixed: false }], att: utf8 };
         assert!(enforce_out_capacity(&cols, &mut vals, &out).is_ok());
-        let out = OutFmt { slots: vec![OutSlot { text: None }], att: utf8 };
+        let out = OutFmt { slots: vec![OutSlot { text: None, fixed: false }], att: utf8 };
         let mut vals = [Value::Text("abcdef".into())];
         assert!(enforce_out_capacity(&cols, &mut vals, &out).is_ok());
         // slot count != column count: not this projection's BLR, no check
@@ -64698,7 +65114,7 @@ mod tests {
         assert_eq!((c.sql_type, c.scale), (581, 0));
         // text branches keep the first-typed rule
         let c = pc("CASE WHEN A > 0 THEN 'y' ELSE 'n' END");
-        assert_eq!(c.sql_type, 449); // nullable VARCHAR
+        assert_eq!(c.sql_type, 453); // nullable CHAR - a text literal is fixed (probed 452)
 
         // the header is CASE - for both forms and for IIF (probed)
         for q in [

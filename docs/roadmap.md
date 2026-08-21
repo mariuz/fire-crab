@@ -616,9 +616,64 @@ pointer-page and TIP page numbers is the next step when it dominates.
   LONG when it fits 32 bits (BIGINT beyond), negation keeps, CASE / IIF /
   COALESCE take their widest branch, NULLIF its FIRST argument's type
   (probed); arithmetic stays BIGINT. The wire form follows the describe.
-- **NEXT**: the CHAR (452) describe/wire form for CAST AS CHAR, CHAR
-  columns and text literals / text CASE branches; the `A`/`B`/`C`/`E`
-  items above. (Full sweep 2026-08-21 after the UPDATE-format change: 259 gates, 8246 checks, 0 DIFF. MERGE `RETURNING` / `NOT MATCHED BY SOURCE`, `op_info_blob`
+- **CHAR TRAVELS AS CHAR (2026-08-21, `serve-real-charform` 8,
+  `serve-real-charset` 43):** until this slice every CHAR column and every
+  fixed-text expression described as VARYING (448) — a client saw
+  CHAR(5) as VARCHAR(5). Now `Wire::Text`: a CHAR column, a text
+  literal, CAST AS CHAR, UPPER/LOWER of a CHAR, CASE/COALESCE/IIF of
+  CHARs describe 452 at the engine's width (a UTF8 CHAR(3) is 12
+  bytes); TRIM, `||`, SUBSTRING and VARCHAR stay 448 (`text_form`
+  already knew — the flag was dropped at the describe). The row carries
+  the FORM THE CLIENT DECLARED in its blr (`OutSlot.fixed`, at the
+  client's declared byte length — the engine serves a CHAR fetched as
+  VARCHAR and back); a fixed slot is space-padded, no length word. Input
+  binds keep the even form by design (see `nullable`).
+- **RDB$SET_CONTEXT / RDB$GET_CONTEXT DONE (2026-08-21,
+  `serve-real-context` 61):** the attachment's USER_SESSION /
+  USER_TRANSACTION variables (a thread-local per connection; the
+  transaction map empties at COMMIT / ROLLBACK, not RETAINING);
+  SET_CONTEXT answers 0 new / 1 existed, a NULL value deletes;
+  GET_CONTEXT is VARCHAR(255) nullable, NULL for an unknown name; SYSTEM
+  answers the session's facts at evaluation (and is read-only); any other
+  namespace is `isc_ctx_namespace_invalid`; the select list evaluates
+  RIGHT-TO-LEFT when a SET_CONTEXT is in it (probed — `SET(K, v),
+  GET(K)` reads the old value). Until this slice fc folded every
+  non-SYSTEM GET_CONTEXT to NULL at prepare — a silent wrong answer.
+  `rewrite_system_sql` now folds only inside `PARSE_UNQUALIFIED_NAMES(`.
+  Boundary: the functions inside a PSQL body (the dsql crate) are not
+  this slice.
+- **DESCRIBE IN THE ATTACHMENT CHARSET (2026-08-21, found by
+  `serve-real-outblr` 32 through node-firebird 2.11):** a plain column of
+  a REAL charset (anything but NONE / OCTETS — ASCII included) is
+  described in the ATTACHMENT's charset at chars × its bytes per char
+  (WIN1252 CHAR(5) under UTF8 is len 20 charset 4; a UTF8 CHAR(3) under
+  WIN1252 is 3 charset 53; NONE keeps its bytes — probed with `isql -ch`).
+  fc always announced the column's own charset; VARCHAR hid it (clients
+  read the counted length), CHAR exposed it (2.11 derives the char count
+  from the declared width). `resolve_text_cs` now carries the rule.
+- **CREATE / DROP VIEW DONE (2026-08-21, `serve-real-createview` 4 — the
+  ENGINE opens fc's file and runs fc's BLR):** `CREATE VIEW <name>
+  [(cols)] AS <select>` plans the SELECT at prepare: a plain column
+  reuses its base relation's RDB$FIELD_SOURCE with RDB$BASE_FIELD and
+  RDB$VIEW_CONTEXT; an expression column gets an auto-domain RDB$<n> of
+  its type (precision by storage width) carrying the expression's BLR
+  over the VIEW's streams in RDB$COMPUTED_BLR (no source — probed;
+  `dsql::compile_view_columns`); the FROM items are the contexts (1.. in
+  order, the alias quoted or `"PUBLIC"."T"`); `RDB$VIEW_BLR` is the dsql
+  crate's RSE (its select-list scanner now skips expression items,
+  aggregates still refuse); dbkey 8 bytes per context, a security class
+  and a default class written on the row at INSERT (a later patch of a
+  full system page has no room for a new version — measured on the fifth
+  view of one transaction); `DROP VIEW` removes the relation, its fields,
+  its own auto-domains, view relations, formats, class and privileges,
+  with the engine's vectors (duplicate name, missing / not-a-view: the
+  nested −607 with the VIEW verbs). **Boundaries:** WITH CHECK OPTION,
+  UNION views, derived tables / CTEs in the FROM, an expression outside
+  the dsql crate's surface, `ALTER VIEW`.
+- **NEXT**: `ALTER / DROP TRIGGER`, `CREATE OR ALTER TRIGGER / PROCEDURE`,
+  `ALTER PROCEDURE`, `CREATE FUNCTION`; `RECREATE`; the rest of `E`; a
+  full sweep to re-baseline after the CHAR wire form and the describe
+  charset rule. (Full sweep 2026-08-21 after the UPDATE-format change: 259 gates, 8246 checks, 0 DIFF. MERGE `RETURNING` / `NOT MATCHED BY SOURCE`, `op_info_blob`
   / `op_seek_blob`, the ordered JOIN fetch streaming, the RIGHT/FULL
   hash, the bulk index build, the cleanup — all done 2026-08-21.)
 - **D, the MERGE executor** — the BLR is already compiled and tested;

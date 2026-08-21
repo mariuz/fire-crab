@@ -1350,6 +1350,14 @@ impl<'a> P<'a> {
         let mut expect_item = true;
         loop {
             match self.t.get(self.i)? {
+                // an AGGREGATE in a view's select list is outside this
+                // surface (the RSE would need a group) - refuse, as before
+                Tok::Ident(w)
+                    if matches!(w.as_str(), "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "LIST")
+                        && matches!(self.t.get(self.i + 1), Some(Tok::LParen)) =>
+                {
+                    return None;
+                }
                 Tok::Ident(w) if w == "FROM" => {
                     self.i += 1;
                     return Some(cols);
@@ -1395,7 +1403,34 @@ impl<'a> P<'a> {
                     cols = None;
                     expect_item = false;
                 }
-                _ => return None,
+                // any other token: the item is an EXPRESSION (`V || 'x'`,
+                // `UPPER(S)`, `N + 1 AS X`) - not a plain column list; the
+                // tokens are skipped depth-aware up to the list's end, the
+                // expression itself compiles in compile_view_columns
+                Tok::LParen => {
+                    let mut depth = 0i32;
+                    loop {
+                        match self.t.get(self.i)? {
+                            Tok::LParen => depth += 1,
+                            Tok::RParen => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    self.i += 1;
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                        self.i += 1;
+                    }
+                    cols = None;
+                    expect_item = false;
+                }
+                _ => {
+                    self.i += 1;
+                    cols = None;
+                    expect_item = false;
+                }
             }
         }
     }
@@ -3136,6 +3171,163 @@ fn emit_relation3(out: &mut Vec<u8>, name: &str) {
 /// Compile a view-shaped SELECT to the BLR the engine's DSQL stores in
 /// `RDB$VIEW_BLR` - byte for byte. `None` for anything outside the
 /// converted surface (the caller refuses; this crate never guesses).
+/// The per-column BLR of a view's EXPRESSION columns - what the engine
+/// stores in the auto-domain's `RDB$COMPUTED_BLR` (probed: `V || 'x'` in
+/// `CREATE VIEW ... FROM T` is `05 27 17 01 01 'V' 15 0f 0000 0100 'x' 4c`:
+/// the expression over the VIEW's stream contexts, 1..n in FROM order,
+/// alias-aware, between blr_version5 and blr_eoc). One entry per select
+/// list item: `None` for a plain (qualified) column, `Some(blr)` for an
+/// expression. `None` overall when the SELECT is outside the converted
+/// surface (a UNION, `*`, an item this compiler cannot parse).
+pub fn compile_view_columns(sql: &str) -> Option<Vec<Option<Vec<u8>>>> {
+    let toks = lex(sql.trim().trim_end_matches(';'))?;
+    let mut p = P {
+        t: &toks,
+        i: 0,
+        streams: Vec::new(),
+        base: 1,
+        outer: None,
+        sub: None,
+        agg_map: Vec::new(),
+        agg_mode: false,
+        in_params: Vec::new(),
+        local_vars: Vec::new(),
+        next_label: 1,
+        proc: None,
+        agg_fid_ctx: 1,
+        domain_value: false,
+        cursors: Vec::new(),
+        cursor_decls: Vec::new(),
+        for_cursors: Vec::new(),
+        merge_scope: None,
+        in_func: false,
+        in_sub: false,
+        saw_suspend: false,
+        host: None,
+        ctes: Vec::new(),
+        sub_decls: Vec::new(),
+        sub_procs: Vec::new(),
+        sub_funcs: Vec::new(),
+    };
+    let mut depth = 0i32;
+    for t in toks.iter() {
+        match t {
+            Tok::LParen => depth += 1,
+            Tok::RParen => depth -= 1,
+            Tok::Ident(w) if w == "UNION" && depth == 0 => return None,
+            _ => {}
+        }
+    }
+    if !p.kw("SELECT") {
+        return None;
+    }
+    let _ = p.kw("DISTINCT");
+    // the select list as token ranges, split on depth-0 commas up to FROM
+    let mut items: Vec<(usize, usize)> = Vec::new();
+    let mut start = p.i;
+    let mut depth = 0i32;
+    loop {
+        match p.t.get(p.i)? {
+            Tok::LParen => depth += 1,
+            Tok::RParen => depth -= 1,
+            Tok::Comma if depth == 0 => {
+                items.push((start, p.i));
+                start = p.i + 1;
+            }
+            Tok::Ident(w) if depth == 0 && w == "FROM" => {
+                items.push((start, p.i));
+                p.i += 1;
+                break;
+            }
+            // a lone `*` (or `q.*`) selects all - not this slice; between
+            // operands it multiplies
+            Tok::Star if depth == 0 && (p.i == start || matches!(p.t.get(p.i - 1), Some(Tok::Dot))) => return None,
+            _ => {}
+        }
+        p.i += 1;
+    }
+    // the streams, exactly as the view's RSE numbers them
+    let first = p.stream_item()?;
+    p.streams.push(first);
+    if matches!(p.t.get(p.i), Some(Tok::Comma)) {
+        while matches!(p.t.get(p.i), Some(Tok::Comma)) {
+            p.i += 1;
+            let st = p.stream_item()?;
+            p.streams.push(st);
+        }
+    } else {
+        loop {
+            let jt = if p.kw("LEFT") || p.kw("RIGHT") || p.kw("FULL") {
+                let _ = p.kw("OUTER");
+                1u8
+            } else if matches!(p.t.get(p.i), Some(Tok::Ident(w)) if w == "JOIN" || w == "INNER") {
+                let _ = p.kw("INNER");
+                0u8
+            } else {
+                break;
+            };
+            let _ = jt;
+            if !p.kw("JOIN") {
+                return None;
+            }
+            let st = p.stream_item()?;
+            p.streams.push(st);
+            if !p.kw("ON") {
+                return None;
+            }
+            let _ = p.bool_or()?;
+        }
+    }
+    p.outer = Some(p.streams.len());
+    let end_of_list = p.i;
+    let mut out: Vec<Option<Vec<u8>>> = Vec::with_capacity(items.len());
+    for (a, b) in items {
+        if a >= b {
+            return None;
+        }
+        // a trailing `[AS] <alias>` is not part of the value
+        let mut e = b;
+        if e - a >= 2 {
+            if let Some(Tok::Ident(al)) = p.t.get(e - 1) {
+                if !is_keyword(al) {
+                    if matches!(p.t.get(e - 2), Some(Tok::Ident(k)) if k == "AS") {
+                        e -= 2;
+                    } else if e - a >= 2 && !matches!(p.t.get(e - 2), Some(Tok::Dot)) && !is_operator_tok(p.t.get(e - 2)) {
+                        e -= 1;
+                    }
+                }
+            }
+        }
+        // a plain column: `name` or `q.name`
+        let plain = match (e - a, p.t.get(a), p.t.get(a + 1), p.t.get(a + 2)) {
+            (1, Some(Tok::Ident(w)), _, _) => !is_keyword(w),
+            (3, Some(Tok::Ident(_)), Some(Tok::Dot), Some(Tok::Ident(_))) => true,
+            _ => false,
+        };
+        if plain {
+            out.push(None);
+            continue;
+        }
+        p.i = a;
+        let v = p.val()?;
+        if p.i != e {
+            return None;
+        }
+        let mut blr = vec![blr::VERSION5];
+        emit_val(&mut blr, &v);
+        blr.push(blr::EOC);
+        out.push(Some(blr));
+    }
+    p.i = end_of_list;
+    Some(out)
+}
+
+/// Whether a token ends a value (so a bare identifier after it is a
+/// column alias, not an operand) - `X ID` aliases, `X + ID` does not.
+fn is_operator_tok(t: Option<&Tok>) -> bool {
+    !matches!(t, Some(Tok::Ident(_)) | Some(Tok::RParen) | Some(Tok::Int(_)) | Some(Tok::Str(_)) | None)
+}
+
 pub fn compile_view_select(sql: &str) -> Option<Vec<u8>> {
     let toks = lex(sql.trim().trim_end_matches(';'))?;
     let mut p = P {
@@ -11919,6 +12111,26 @@ mod tests {
         ] {
             assert!(compile_procedure(sql).is_none(), "{sql} was compiled");
         }
+    }
+
+    #[test]
+    fn view_column_blr_matches_the_engine() {
+        // probed on the live engine: RDB$COMPUTED_BLR of the auto-domains
+        let hex = |v: &Option<Vec<u8>>| v.as_ref().map(|b| b.iter().map(|x| format!("{:02x}", x)).collect::<String>());
+        let c = compile_view_columns("SELECT ID, V || 'x' FROM T").unwrap();
+        assert_eq!(c.len(), 2);
+        assert_eq!(c[0], None);
+        assert_eq!(hex(&c[1]).as_deref(), Some("052717010156150f00000100784c"));
+        let c = compile_view_columns("SELECT a.ID AS AID, b.V, a.N + 1 AS NP FROM T a JOIN T b ON b.ID = a.ID WHERE a.N > 0").unwrap();
+        assert_eq!(c[0], None);
+        assert_eq!(c[1], None);
+        assert_eq!(hex(&c[2]).as_deref(), Some("05221701014e150800010000004c"));
+        let c = compile_view_columns("SELECT ID, N * 2 AS N2, UPPER(V) AS UV FROM T WHERE ID <> 2").unwrap();
+        assert_eq!(hex(&c[1]).as_deref(), Some("05241701014e150800020000004c"));
+        assert_eq!(hex(&c[2]).as_deref(), Some("0567170101564c"));
+        // the RSE of those views compiles too
+        assert!(compile_view_select("SELECT ID, V || 'x' FROM T").is_some());
+        assert!(compile_view_select("SELECT ID, N * 2 AS N2, UPPER(V) AS UV FROM T WHERE ID <> 2").is_some());
     }
 
     #[test]

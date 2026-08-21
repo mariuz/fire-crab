@@ -3991,6 +3991,7 @@ fn write_check(
 }
 
 /// One field of a restored VIEW, as the backup carries it.
+#[derive(Clone, Debug)]
 pub struct RestoredViewField {
     pub name: String,
     /// its RDB$FIELD_SOURCE domain - the base column's, or the
@@ -4003,6 +4004,7 @@ pub struct RestoredViewField {
 }
 
 /// One FROM-context of a restored VIEW (an RDB$VIEW_RELATIONS row).
+#[derive(Clone, Debug)]
 pub struct RestoredViewContext {
     pub relation: String,
     pub context: i64,
@@ -4015,6 +4017,242 @@ pub struct RestoredViewContext {
 /// RDB$RELATION_FIELDS rows with their base-field and context links,
 /// and the RDB$VIEW_RELATIONS context rows. A view owns no pages -
 /// its rows are a query - so nothing else is allocated.
+/// One output column of a `CREATE VIEW`: a PLAIN column reads a base
+/// relation's field (its RDB$FIELD_SOURCE is reused, RDB$BASE_FIELD and
+/// RDB$VIEW_CONTEXT name it); an EXPRESSION column gets an auto-domain
+/// RDB$<n> of its own type (probed: `V || 'x'` became RDB$4 VARCHAR(6)),
+/// no base field, RDB$UPDATE_FLAG 0.
+#[derive(Clone)]
+pub struct ViewFieldSpec {
+    pub name: String,
+    /// (the base relation's RDB$FIELD_SOURCE, base field name, view context)
+    pub base: Option<(String, String, i64)>,
+    /// the expression's type, for the auto-domain
+    pub expr: Option<ColumnDef>,
+    /// the expression's BLR over the view's streams - the auto-domain's
+    /// RDB$COMPUTED_BLR (probed: no RDB$COMPUTED_SOURCE on a view's)
+    pub computed_blr: Option<Vec<u8>>,
+}
+
+/// `CREATE VIEW <name> [(cols)] AS <select>`: the auto-domains of the
+/// expression columns, then the same rows the restore writes (RDB$FORMATS,
+/// RDB$RELATIONS with the BLR and the source text, RDB$RELATION_FIELDS,
+/// RDB$VIEW_RELATIONS), then what a CREATE writes beyond a restore: an
+/// 8-byte dbkey length, a security class and a default class (probed).
+pub fn create_view(
+    file: &mut crate::Image,
+    page_size: usize,
+    name: &str,
+    view_blr: &[u8],
+    view_source: &str,
+    fields: &[ViewFieldSpec],
+    contexts: &[RestoredViewContext],
+) -> Result<(), String> {
+    let want = name.trim().trim_matches('"').to_ascii_uppercase();
+    if crate::resolve_relation(file, page_size, &want).is_some() {
+        return Err(format!("relation {} already exists", want));
+    }
+    let domain_base = next_domain_number(file, page_size)?;
+    let mut auto_idx = 0u64;
+    let mut restored: Vec<RestoredViewField> = Vec::with_capacity(fields.len());
+    for (i, f) in fields.iter().enumerate() {
+        match (&f.base, &f.expr) {
+            (Some((source, base_field, ctx)), _) => restored.push(RestoredViewField {
+                name: f.name.clone(),
+                source: source.clone(),
+                base_field: base_field.clone(),
+                view_context: *ctx,
+                position: i as i64,
+            }),
+            (None, Some(col)) => {
+                let source = format!("RDB${}", domain_base + auto_idx);
+                auto_idx += 1;
+                insert_auto_field_row(file, page_size, &source, col, f.computed_blr.as_deref())?;
+                restored.push(RestoredViewField {
+                    name: f.name.clone(),
+                    source,
+                    base_field: String::new(),
+                    view_context: 0,
+                    position: i as i64,
+                });
+            }
+            (None, None) => return Err("a view column needs a base field or a type".into()),
+        }
+    }
+    let class = next_security_class(file, page_size, ACL_TABLE_OWNER)?;
+    let default_class = next_default_class(file, page_size)?;
+    // 8 bytes of dbkey per context (probed: a two-table view is 16)
+    let dbkey = 8 * contexts.len().max(1) as i64;
+    restore_view_with(
+        file,
+        page_size,
+        &want,
+        view_blr,
+        view_source.as_bytes(),
+        &restored,
+        contexts,
+        Some((dbkey, &class, &default_class)),
+    )
+}
+
+/// The RDB$FIELDS row of an auto-domain (`RDB$<n>`) - the type of an
+/// expression column, precision by storage width (4 / 9 / 18 / 38 for
+/// the exact kinds - probed on a view's expression columns).
+fn insert_auto_field_row(file: &mut crate::Image, page_size: usize, source: &str, c: &ColumnDef, computed_blr: Option<&[u8]>) -> Result<(), String> {
+    let blr_id = match computed_blr {
+        Some(b) => Some(blob_id_bytes(2, dml::insert_blob(file, page_size, 2, &[b.to_vec()], 2)?)),
+        None => None,
+    };
+    let mut vals: Vec<(&str, SysVal<'_>)> = vec![
+        ("RDB$FIELD_NAME", SysVal::S(source)),
+        ("RDB$FIELD_TYPE", SysVal::I(c.field_type as i64)),
+        ("RDB$FIELD_LENGTH", SysVal::I(catalog_field_length(c))),
+        ("RDB$FIELD_SCALE", SysVal::I(c.scale as i64)),
+        ("RDB$SYSTEM_FLAG", SysVal::I(0)),
+        ("RDB$OWNER_NAME", SysVal::S(OWNER)),
+        ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
+    ];
+    if subtype_carried(c.field_type) {
+        vals.push(("RDB$FIELD_SUB_TYPE", SysVal::I(c.sub_type as i64)));
+    }
+    if let Some(cl) = c.char_len {
+        vals.push(("RDB$CHARACTER_SET_ID", SysVal::I(c.charset_id.unwrap_or(0) as i64)));
+        vals.push(("RDB$CHARACTER_LENGTH", SysVal::I(cl as i64)));
+        vals.push(("RDB$COLLATION_ID", SysVal::I(0)));
+    }
+    if c.field_type == 261 {
+        vals.push(("RDB$SEGMENT_LENGTH", SysVal::I(80)));
+        if c.sub_type == 1 {
+            vals.push(("RDB$CHARACTER_SET_ID", SysVal::I(c.charset_id.unwrap_or(0) as i64)));
+            vals.push(("RDB$COLLATION_ID", SysVal::I(0)));
+        }
+    }
+    if let Some(p) = c.precision {
+        vals.push(("RDB$FIELD_PRECISION", SysVal::I(p as i64)));
+    }
+    if let Some(id) = &blr_id {
+        vals.push(("RDB$COMPUTED_BLR", SysVal::B(*id)));
+    }
+    sys_insert(file, page_size, "RDB$FIELDS", 2, &vals)
+}
+
+/// `DROP VIEW <name>`: the relation, its fields, its own auto-domains, its
+/// view relations, formats, security class and privileges go; a TABLE is
+/// not a view (the engine's "does not exist" for DROP VIEW, probed).
+pub fn drop_view(file: &mut crate::Image, page_size: usize, name: &str) -> Result<(), String> {
+    let name = name.trim().trim_matches('"').to_ascii_uppercase();
+    let rel = crate::resolve_relation(file, page_size, &name)
+        .ok_or_else(|| format!("View {} not found", name))?;
+    if rel < 128 || !is_view(file, page_size, &name) {
+        return Err(format!("View {} not found", name));
+    }
+    let mut domain_names: Vec<String> = Vec::new();
+    {
+        let formats = system_relation_formats(file, page_size, "RDB$RELATION_FIELDS")
+            .ok_or("no computed system format")?;
+        let (_, descs) = formats.iter().max_by_key(|(n, _)| *n).ok_or("empty format")?;
+        let src_fid = sys_fid(file, page_size, "RDB$RELATION_FIELDS", "RDB$FIELD_SOURCE")?;
+        let rel_fid = sys_fid(file, page_size, "RDB$RELATION_FIELDS", "RDB$RELATION_NAME")?;
+        let base_fid = sys_fid(file, page_size, "RDB$RELATION_FIELDS", "RDB$BASE_FIELD")?;
+        walk_rows(file, page_size, 5, descs, |values| {
+            if text_eq(values.get(rel_fid), &name) && !matches!(values.get(base_fid), Some(Value::Text(_))) {
+                if let Some(Value::Text(t)) = values.get(src_fid) {
+                    let t = t.trim_end();
+                    if t.strip_prefix("RDB$").is_some_and(|x| x.parse::<u64>().is_ok()) {
+                        domain_names.push(t.to_string());
+                    }
+                }
+            }
+        });
+    }
+    let security_class = {
+        let formats = system_relation_formats(file, page_size, "RDB$RELATIONS")
+            .ok_or("no computed system format")?;
+        let (_, descs) = formats.iter().max_by_key(|(n, _)| *n).ok_or("empty format")?;
+        let cls_fid = sys_fid(file, page_size, "RDB$RELATIONS", "RDB$SECURITY_CLASS")?;
+        let rel_fid = sys_fid(file, page_size, "RDB$RELATIONS", "RDB$RELATION_NAME")?;
+        let mut class = None;
+        walk_rows(file, page_size, 6, descs, |values| {
+            if text_eq(values.get(rel_fid), &name) {
+                if let Some(Value::Text(t)) = values.get(cls_fid) {
+                    class = Some(t.trim_end().to_string());
+                }
+            }
+        });
+        class
+    };
+    {
+        let fid = sys_fid(file, page_size, "RDB$RELATION_FIELDS", "RDB$RELATION_NAME")?;
+        let n = name.clone();
+        delete_catalog_rows(file, page_size, "RDB$RELATION_FIELDS", move |v| text_eq(v.get(fid), &n))?;
+    }
+    {
+        let fid = sys_fid(file, page_size, "RDB$FIELDS", "RDB$FIELD_NAME")?;
+        let names = domain_names.clone();
+        delete_catalog_rows(file, page_size, "RDB$FIELDS", move |v| names.iter().any(|d| text_eq(v.get(fid), d)))?;
+    }
+    {
+        let fid = sys_fid(file, page_size, "RDB$VIEW_RELATIONS", "RDB$VIEW_NAME")?;
+        let n = name.clone();
+        delete_catalog_rows(file, page_size, "RDB$VIEW_RELATIONS", move |v| text_eq(v.get(fid), &n))?;
+    }
+    {
+        let fid = sys_fid(file, page_size, "RDB$FORMATS", "RDB$RELATION_ID")?;
+        delete_catalog_rows(file, page_size, "RDB$FORMATS", move |v| int_eq(v.get(fid), rel as i64))?;
+    }
+    {
+        let fid = sys_fid(file, page_size, "RDB$RELATIONS", "RDB$RELATION_NAME")?;
+        let n = name.clone();
+        delete_catalog_rows(file, page_size, "RDB$RELATIONS", move |v| text_eq(v.get(fid), &n))?;
+    }
+    if let Some(class) = security_class {
+        let fid = sys_fid(file, page_size, "RDB$SECURITY_CLASSES", "RDB$SECURITY_CLASS")?;
+        delete_catalog_rows(file, page_size, "RDB$SECURITY_CLASSES", move |v| text_eq(v.get(fid), &class))?;
+    }
+    {
+        let rel_f = sys_fid(file, page_size, "RDB$USER_PRIVILEGES", "RDB$RELATION_NAME")?;
+        let obj_f = sys_fid(file, page_size, "RDB$USER_PRIVILEGES", "RDB$OBJECT_TYPE")?;
+        let n = name.clone();
+        delete_catalog_rows(file, page_size, "RDB$USER_PRIVILEGES", move |v| text_eq(v.get(rel_f), &n) && int_eq(v.get(obj_f), 0))?;
+    }
+    advance_oldest_transactions(file, page_size)
+}
+
+/// Whether a relation is a VIEW (RDB$RELATION_TYPE 1 / a view BLR).
+pub fn is_view(file: &crate::Image, page_size: usize, name: &str) -> bool {
+    let Some(formats) = system_relation_formats(file, page_size, "RDB$RELATIONS") else { return false };
+    let Some((_, descs)) = formats.iter().max_by_key(|(n, _)| *n) else { return false };
+    let cols = relation_columns(file, page_size, "RDB$RELATIONS");
+    let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (Some(name_f), Some(blr_f)) = (fid("RDB$RELATION_NAME"), fid("RDB$VIEW_BLR")) else { return false };
+    let mut view = false;
+    walk_rows(file, page_size, 6, descs, |v| {
+        if text_eq(v.get(name_f), name) && matches!(v.get(blr_f), Some(Value::Blob(..))) {
+            view = true;
+        }
+    });
+    view
+}
+
+/// A relation field's RDB$FIELD_SOURCE (the domain it reads) - what a view
+/// column over it reuses.
+pub fn relation_field_source(file: &crate::Image, page_size: usize, relation: &str, field: &str) -> Option<String> {
+    let formats = system_relation_formats(file, page_size, "RDB$RELATION_FIELDS")?;
+    let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
+    let cols = relation_columns(file, page_size, "RDB$RELATION_FIELDS");
+    let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (rel_f, fld_f, src_f) = (fid("RDB$RELATION_NAME")?, fid("RDB$FIELD_NAME")?, fid("RDB$FIELD_SOURCE")?);
+    let mut out = None;
+    walk_rows(file, page_size, 5, descs, |v| {
+        if out.is_none() && text_eq(v.get(rel_f), relation) && text_eq(v.get(fld_f), field) {
+            if let Some(Value::Text(t)) = v.get(src_f) {
+                out = Some(t.trim_end().to_string());
+            }
+        }
+    });
+    out
+}
+
 pub fn restore_view(
     file: &mut crate::Image,
     page_size: usize,
@@ -4023,6 +4261,24 @@ pub fn restore_view(
     view_source: &[u8],
     fields: &[RestoredViewField],
     contexts: &[RestoredViewContext],
+) -> Result<(), String> {
+    restore_view_with(file, page_size, name, view_blr, view_source, fields, contexts, None)
+}
+
+/// [restore_view] with what a CREATE writes beyond a restore - the dbkey
+/// length, the security class and the default class - put on the
+/// RDB$RELATIONS row at INSERT (a later patch of a system row needs room
+/// for a new version on a page that may be full - measured on the fifth
+/// view of one transaction).
+fn restore_view_with(
+    file: &mut crate::Image,
+    page_size: usize,
+    name: &str,
+    view_blr: &[u8],
+    view_source: &[u8],
+    fields: &[RestoredViewField],
+    contexts: &[RestoredViewContext],
+    created: Option<(i64, &str, &str)>,
 ) -> Result<(), String> {
     let name = name.trim().to_ascii_uppercase();
     let rels = list_relations(file, page_size);
@@ -4076,14 +4332,19 @@ pub fn restore_view(
         // what made the engine answer "Column unknown" over an
         // otherwise perfect catalog, the FK-blocker lesson again)
         ("RDB$FLAGS", SysVal::I(1)),
-        ("RDB$DBKEY_LENGTH", SysVal::I(0)),
+        ("RDB$DBKEY_LENGTH", SysVal::I(created.map_or(0, |c| c.0))),
         ("RDB$FORMAT", SysVal::I(1)),
         ("RDB$FIELD_ID", SysVal::I(fields.len() as i64)),
         ("RDB$VIEW_BLR", SysVal::B(blob_id_bytes(relations_rel, blr))),
         ("RDB$VIEW_SOURCE", SysVal::B(blob_id_bytes(relations_rel, src))),
         ("RDB$OWNER_NAME", SysVal::S(OWNER)),
         ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
-    ])?;
+    ]
+    .into_iter()
+    .chain(created.iter().flat_map(|(_, cls, dcls)| {
+        [("RDB$SECURITY_CLASS", SysVal::S(*cls)), ("RDB$DEFAULT_CLASS", SysVal::S(*dcls))]
+    }))
+    .collect::<Vec<_>>())?;
     for (i, f) in fields.iter().enumerate() {
         // an EXPRESSION column: BASE_FIELD stays NULL (omitted -
         // sys_insert starts every field NULL), context 0, read-only -
@@ -4095,13 +4356,14 @@ pub fn restore_view(
             ("RDB$FIELD_SOURCE", SysVal::S(&f.source)),
             ("RDB$FIELD_POSITION", SysVal::I(f.position)),
             ("RDB$FIELD_ID", SysVal::I(i as i64)),
-            ("RDB$VIEW_CONTEXT", SysVal::I(f.view_context)),
             ("RDB$SYSTEM_FLAG", SysVal::I(0)),
             ("RDB$UPDATE_FLAG", SysVal::I(if expr { 0 } else { 1 })),
             ("RDB$FIELD_SOURCE_SCHEMA_NAME", SysVal::S("PUBLIC")),
             ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
         ];
         if !expr {
+            // an expression column has no context and no base field (probed: both NULL)
+            fvals.push(("RDB$VIEW_CONTEXT", SysVal::I(f.view_context)));
             fvals.push(("RDB$BASE_FIELD", SysVal::S(&f.base_field)));
         }
         sys_insert(file, page_size, "RDB$RELATION_FIELDS", relfields_rel, &fvals)?;
