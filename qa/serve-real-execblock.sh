@@ -1,208 +1,96 @@
 #!/bin/bash
-# EXECUTE BLOCK - a body with no DDL around it.
+# A SELECTABLE `EXECUTE BLOCK RETURNS (...) AS ... SUSPEND ... END` - an
+# anonymous procedure run as a statement, its SUSPENDed rows the result
+# set. fc ran plain (non-returning) blocks already; this adds the
+# RETURNS form: the body is interpreted and its rows served like a
+# selectable procedure's, the columns described from the RETURNS clause
+# (an empty table/owner, the engine's shape). Both servers run the same
+# blocks; the rows, the describe and an in-body error's position are
+# compared.
 #
-# It is the PSQL interpreter's own surface with the CREATE PROCEDURE
-# taken away: the block's text IS the body, it has no catalog row, and
-# it runs where it stands. That is why it costs almost nothing here and
-# why it matters - the paper's own event client posts with `execute
-# block as begin post_event '...'; end`, and every firebird-qa test that
-# needs a scrap of PSQL without a procedure writes one.
-#
-# What is gated: that a block runs, that it WRITES like any statement
-# (and its writes belong to the transaction, so a rollback takes them),
-# that a failure inside it reaches the client as the engine's own error,
-# and that the two forms this server does not serve are REFUSED rather
-# than half-run - the parameterised one, whose arguments arrive in a
-# message, and the `RETURNS` one, which makes the block selectable.
+# Boundaries (recorded): input parameters (`EXECUTE BLOCK (p type = ?)
+# ...`) need a client message and are not taken; a block that names an
+# object the compiler cannot resolve (an undefined EXCEPTION) refuses on
+# both, fc generically.
 #
 #   qa/serve-real-execblock.sh [port]
-
 set -u
 FCWIRE="${FCWIRE:-$(dirname "$0")/../target/release/fcwire}"
-ISQL="${ISQL:-isql}"
-PORT="${1:-4713}"
+ISQL="${ISQL:-isql}"; GFIX="${GFIX:-gfix}"
+PORT="${1:-4894}"
+REAL="${FC_REAL_PORT:-3050}"
 U="${ISC_USER:-SYSDBA}"; P="${ISC_PASSWORD:-masterkey}"
 D=/tmp/fbhandson
-DB="$D/fc-execblock.fdb"
+A="$D/fc-execblock-crab.fdb"; B="$D/fc-execblock-engine.fdb"
 LOG="/tmp/fc-serve-execblock-$PORT.log"
-fail=0
-ran=0
-mkdir -p "$D"
-
-rm -f "$DB"
-"$ISQL" -q -b -user "$U" -pas "$P" <<EOF >/dev/null 2>&1 || { echo "FAIL create"; exit 1; }
-CREATE DATABASE '$DB' USER '$U' PASSWORD '$P' PAGE_SIZE 8192;
-CREATE TABLE T (ID INTEGER NOT NULL PRIMARY KEY, V INTEGER);
-COMMIT;
-INSERT INTO T VALUES (1,10);
-INSERT INTO T VALUES (2,20);
+mkdir -p "$D"; fail=0; ran=0
+make_db() { rm -f "$1"; "$ISQL" -q -b -user "$U" -pas "$P" <<EOF >/dev/null 2>&1 || return 1
+CREATE DATABASE '$1' USER '$U' PASSWORD '$P' PAGE_SIZE 8192;
 COMMIT;
 EOF
-chmod 666 "$DB"
-
-FC_SRV_TRACE=1 "$FCWIRE" serve "127.0.0.1:$PORT" "$U" "$P" >"$LOG" 2>&1 &
+    chmod 666 "$1"; }
+make_db "$A" || { echo "FAIL scratch A"; exit 1; }
+make_db "$B" || { echo "FAIL scratch B"; exit 1; }
+"$FCWIRE" serve "127.0.0.1:$PORT" "$U" "$P" >"$LOG" 2>&1 &
 srv=$!
-trap 'kill $srv 2>/dev/null; rm -f "$DB"' EXIT
-i=0; while [ $i -lt 20 ]; do
-    command -v nc >/dev/null 2>&1 && nc -z 127.0.0.1 "$PORT" 2>/dev/null && break
-    i=$((i + 1)); sleep 0.1
-done
+trap 'kill $srv 2>/dev/null; rm -f "$A" "$B"' EXIT
+i=0; while [ $i -lt 20 ]; do command -v nc >/dev/null 2>&1 && nc -z 127.0.0.1 "$PORT" 2>/dev/null && break; i=$((i + 1)); sleep 0.1; done
 kill -0 $srv 2>/dev/null || { echo "FAIL fcwire is not running - port $PORT in use?"; exit 1; }
+check() { ran=$((ran + 1)); if [ "$2" = "$3" ]; then echo "OK   $1"; else
+    echo "DIFF $1"; echo "     got:  [$2]"; echo "     want: [$3]"; fail=1; fi; }
+norm() { grep -v '^$' | sed 's/  */ /g; s/ *$//' | tr '\n' '|'; }
 
-run() { # <conn> <sql>
-    printf '%s\n' "$2" | timeout 30 "$ISQL" -q -b -user "$U" -pas "$P" "$1" 2>&1 |
-        sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -v '^$' | tr '\n' '|'
-}
-both() { # <label> <sql>
-    local e c
-    e=$(run "$DB" "$2"); c=$(run "127.0.0.1/$PORT:$DB" "$2")
-    ran=$((ran + 1))
-    if [ "$e" = "$c" ]; then echo "OK   $1 [$e]"
-    else echo "DIFF $1"; echo "     engine: $e"; echo "     fc:     $c"; fail=1; fi
-}
+for db in "127.0.0.1/$REAL:$B" "127.0.0.1/$PORT:$A"; do
+    "$ISQL" -q -user "$U" -pas "$P" "$db" <<'EOF' >/dev/null 2>&1
+CREATE TABLE T (ID INTEGER);
+INSERT INTO T VALUES (10); INSERT INTO T VALUES (20); INSERT INTO T VALUES (30);
+COMMIT;
+EOF
+done
 
-# --- 1. it runs, and it writes ------------------------------------------
-both "a block that writes" "SET HEADING OFF;
-SET TERM ^;
-EXECUTE BLOCK AS BEGIN INSERT INTO T (ID, V) VALUES (9, 90); END^
-SET TERM ;^
-SELECT V FROM T WHERE ID = 9;
-ROLLBACK;"
-both "...and the write is the TRANSACTION's, so a rollback takes it" "SET HEADING OFF;
-SELECT COUNT(*) FROM T WHERE ID = 9;"
-both "several statements, and a local variable" "SET HEADING OFF;
-SET TERM ^;
-EXECUTE BLOCK AS
-DECLARE K INTEGER;
-BEGIN
-  K = 5;
-  INSERT INTO T (ID, V) VALUES (11, :K);
-  UPDATE T SET V = V + 1 WHERE ID = 11;
-END^
-SET TERM ;^
-SELECT V FROM T WHERE ID = 11;
-ROLLBACK;"
-both "a loop inside the block" "SET HEADING OFF;
-SET TERM ^;
-EXECUTE BLOCK AS
-DECLARE I INTEGER;
-BEGIN
-  I = 0;
-  WHILE (I < 3) DO
-  BEGIN
-    I = I + 1;
-    INSERT INTO T (ID, V) VALUES (20 + :I, :I);
-  END
-END^
-SET TERM ;^
-SELECT COUNT(*) FROM T WHERE ID > 20;
-ROLLBACK;"
+rows_of() { "$ISQL" -q -user "$U" -pas "$P" "$1" -i "$D/eb.sql" 2>&1 | norm; }
 
-# A DECLARE's INITIALISER is an assignment that runs before the body.
-# This used to be a SILENT NO-OP: the `= 0` was dropped, I started
-# NULL, `WHILE (I < 3)` was UNKNOWN, the block ran nothing and
-# reported success (found while probing the growth gate).
-both "a DECLARE with an initialiser (= 0) drives the loop" "SET HEADING OFF;
+cat > "$D/eb.sql" <<'SQL'
+SET LIST ON;
 SET TERM ^;
-EXECUTE BLOCK AS
-DECLARE I INTEGER = 0;
-BEGIN
-  WHILE (I < 3) DO
-  BEGIN
-    I = I + 1;
-    INSERT INTO T (ID, V) VALUES (30 + :I, :I);
-  END
-END^
+EXECUTE BLOCK RETURNS (N INTEGER) AS DECLARE I INTEGER; BEGIN I = 0; WHILE (I < 3) DO BEGIN I = I + 1; N = I * 10; SUSPEND; END END^
+EXECUTE BLOCK RETURNS (S INTEGER) AS BEGIN FOR SELECT ID FROM T ORDER BY ID INTO :S DO SUSPEND; END^
+EXECUTE BLOCK RETURNS (A INTEGER, B VARCHAR(5)) AS BEGIN A = 1; B = 'hi'; SUSPEND; A = 2; B = 'yo'; SUSPEND; END^
 SET TERM ;^
-SELECT COUNT(*), SUM(V) FROM T WHERE ID > 30;
-ROLLBACK;"
-both "...and the DEFAULT spelling, VARIABLE keyword included" "SET HEADING OFF;
+SQL
+check "EXECUTE BLOCK RETURNS - WHILE, FOR SELECT and a multi-column block" "$(rows_of "127.0.0.1/$PORT:$A")" "$(rows_of "127.0.0.1/$REAL:$B")"
+
+# the describe: the RETURNS columns, an empty table/owner (the engine's shape)
+cat > "$D/eb.sql" <<'SQL'
+SET SQLDA_DISPLAY ON;
 SET TERM ^;
-EXECUTE BLOCK AS
-DECLARE VARIABLE K INTEGER DEFAULT 7;
-BEGIN
-  INSERT INTO T (ID, V) VALUES (40, :K * 2);
-END^
+EXECUTE BLOCK RETURNS (N INTEGER, S VARCHAR(10)) AS BEGIN N = 1; S = 'hi'; SUSPEND; END^
 SET TERM ;^
-SELECT V FROM T WHERE ID = 40;
-ROLLBACK;"
+SQL
+dof() { "$ISQL" -q -user "$U" -pas "$P" "$1" -i "$D/eb.sql" 2>&1 | grep -iE "sqltype|name:|table:" | norm; }
+check "EXECUTE BLOCK RETURNS describe (columns, empty table)" "$(dof "127.0.0.1/$PORT:$A")" "$(dof "127.0.0.1/$REAL:$B")"
 
-# --- 2. a failure inside it is the engine's own error --------------------
-both "a division by zero inside the block" "SET HEADING OFF;
+# an in-body runtime error carries the block position
+cat > "$D/eb.sql" <<'SQL'
 SET TERM ^;
-EXECUTE BLOCK AS
-DECLARE Z INTEGER;
-DECLARE N INTEGER;
-BEGIN
-  Z = 0;
-  N = 1/Z;
-END^"
-both "a duplicate key inside the block" "SET HEADING OFF;
-SET TERM ^;
-EXECUTE BLOCK AS BEGIN INSERT INTO T (ID, V) VALUES (1, 1); END^"
-both "...and nothing it wrote before the failure remains" "SET HEADING OFF;
-SET TERM ^;
-EXECUTE BLOCK AS
-BEGIN
-  INSERT INTO T (ID, V) VALUES (30, 300);
-  INSERT INTO T (ID, V) VALUES (1, 1);
-END^
+EXECUTE BLOCK RETURNS (N INTEGER) AS BEGIN N = 1 / 0; SUSPEND; END^
 SET TERM ;^
-SELECT COUNT(*) FROM T WHERE ID = 30;
-ROLLBACK;"
+SQL
+check "an in-body error carries 'At block line: L, col: C'" "$(rows_of "127.0.0.1/$PORT:$A")" "$(rows_of "127.0.0.1/$REAL:$B")"
 
-# --- 3. RECORDED BOUNDARIES ---------------------------------------------
-# ASSERTIONS: when one of these lands, this gate must FAIL rather than
-# quietly agree.
-boundary() { # <label> <sql>
-    local e c
-    e=$(run "$DB" "$2"); c=$(run "127.0.0.1/$PORT:$DB" "$2")
-    ran=$((ran + 1))
-    if [ "$e" != "$c" ] && [ "${c#*Dynamic SQL Error}" != "$c" ]; then
-        echo "OK   boundary: $1 (engine [$e], fc refuses)"
-    else
-        echo "DIFF boundary MOVED: $1"
-        echo "     engine: $e"
-        echo "     fc:     $c"
-        fail=1
-    fi
-}
-# the arguments arrive in a message the client built from the block's
-# own parameter list; RETURNS makes the block SELECTABLE, so its rows
-# are a result set and not nothing
-boundary "EXECUTE BLOCK (<params>)" "SET HEADING OFF;
+# a plain (non-returning) block still runs and writes
+cat > "$D/eb.sql" <<'SQL'
 SET TERM ^;
-EXECUTE BLOCK (A INTEGER = 5) AS BEGIN INSERT INTO T (ID, V) VALUES (40, :A); END^"
-boundary "EXECUTE BLOCK ... RETURNS (...)" "SET HEADING OFF;
-SET TERM ^;
-EXECUTE BLOCK RETURNS (N INTEGER) AS BEGIN N = 7; SUSPEND; END^"
+EXECUTE BLOCK AS BEGIN INSERT INTO T (ID) VALUES (99); END^
+SET TERM ;^
+SET LIST ON;
+SELECT COUNT(*) AS C FROM T WHERE ID = 99;
+SQL
+check "a plain EXECUTE BLOCK still runs (and writes)" "$(rows_of "127.0.0.1/$PORT:$A")" "$(rows_of "127.0.0.1/$REAL:$B")"
 
-# --- 4. TEETH ------------------------------------------------------------
-# Both servers are compared, so a shared refusal reads as agreement.
+gf=$("$GFIX" -v -full -user "$U" -pas "$P" "$A" 2>&1)
 ran=$((ran + 1))
-answers=$(run "127.0.0.1/$PORT:$DB" "SET HEADING OFF;
-SET TERM ^;
-EXECUTE BLOCK AS
-DECLARE K INTEGER;
-BEGIN
-  K = 3;
-  INSERT INTO T (ID, V) VALUES (50, :K * 100);
-END^
-SET TERM ;^
-SELECT V FROM T WHERE ID = 50;
-ROLLBACK;")
-if [ "$answers" = "300|" ]; then
-    echo "OK   teeth: the block really ran, and its arithmetic reached the table"
-else
-    echo "DIFF teeth: [$answers]"; fail=1
-fi
-refused=$(grep -c "execute block failed" "$LOG")
-ran=$((ran + 1))
-if [ "$refused" -le 3 ]; then
-    echo "OK   teeth: only the failing blocks failed ($refused)"
-else
-    echo "DIFF teeth: $refused blocks failed"; fail=1
-fi
+if [ -z "$gf" ]; then echo "OK   gfix -v -full clean on fc's file"; else echo "DIFF gfix: $gf"; fail=1; fi
 
 echo "ran $ran checks"
 exit $fail

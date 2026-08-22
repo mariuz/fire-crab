@@ -391,6 +391,17 @@ pointer-page and TIP page numbers is the next step when it dominates.
 
 ## Next, in order
 
+- **Selectable EXECUTE BLOCK RETURNS DONE (2026-08-22,
+  `serve-real-execblock` 5):** `EXECUTE BLOCK RETURNS (...) AS ... SUSPEND
+  ... END` runs as a statement whose SUSPENDed rows are the result set -
+  an anonymous selectable procedure. The output metadata is recovered by
+  compiling a synthesized `CREATE PROCEDURE` (which also validates the
+  body); the body is interpreted by the same run_body_source plain
+  EXECUTE BLOCK uses, and the rows are served through Plan::ProcRows. The
+  columns describe with an empty table/owner, the engine's shape, and an
+  in-body error carries `At block line: L, col: C`. Boundary: input
+  parameters (a client message) are not taken; a block naming an
+  unresolvable object (an undefined EXCEPTION) refuses on both.
 - **PSQL loop control CONTINUE / bare LEAVE DONE (2026-08-22,
   `serve-real-loopctl` 7):** `CONTINUE` (next iteration) and bare `LEAVE`
   (end the innermost loop) now COMPILE in fc's own dsql - a loop-label

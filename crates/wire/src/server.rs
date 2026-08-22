@@ -7181,6 +7181,17 @@ enum Plan {
         /// the engine's `At block` item counts
         body_at: (usize, usize),
     },
+    /// `EXECUTE BLOCK RETURNS (...) AS ... BEGIN ... SUSPEND ... END` - a
+    /// SELECTABLE anonymous block: the body is interpreted, its SUSPENDed
+    /// rows are the result set. `out_names`/`out_descs` shape the frame's
+    /// output slots and the describe; `cols` is the describe itself.
+    ExecBlockSelect {
+        source: String,
+        body_at: (usize, usize),
+        out_names: Vec<String>,
+        out_descs: Vec<Descriptor>,
+        cols: Vec<ProjCol>,
+    },
     /// `SELECT ... FROM <proc>(args)` before the body has run - a
     /// SELECTABLE procedure as a row source. Like ProcInvoke it executes
     /// at op_execute (the body may write) and is then replaced by the
@@ -30764,6 +30775,9 @@ fn plan_query_inner_ctx(
     }
     // EXECUTE BLOCK is a body with no DDL around it - prepared like any
     // statement, run at execute because it may write.
+    if let Some(p) = parse_execute_block_select(sql) {
+        return Some(p);
+    }
     if let Some((source, body_at)) = parse_execute_block(sql) {
         return Some(Plan::ExecBlock { source, body_at });
     }
@@ -36432,6 +36446,7 @@ fn describe_for(plan: &Plan, params: &[Descriptor], att: AttCs) -> Vec<u8> {
         Plan::ProcCall { cols, .. } | Plan::ProcInvoke { cols, .. } => build_describe(cols, params, att),
         Plan::Union { cols, .. }
         | Plan::ProcSelect { cols, .. }
+        | Plan::ExecBlockSelect { cols, .. }
         | Plan::ProcRows { cols, .. }
         | Plan::Modified { cols, .. }
         | Plan::Derived { cols, .. } => build_describe(cols, params, att),
@@ -36511,6 +36526,7 @@ fn stmt_type_of(plan: &Plan) -> i32 {
         Plan::Savepoint { .. } => 14,
         Plan::Union { .. }
         | Plan::ProcSelect { .. }
+        | Plan::ExecBlockSelect { .. }
         | Plan::ProcRows { .. }
         | Plan::Modified { .. }
         | Plan::Derived { .. } => 1,
@@ -36675,6 +36691,7 @@ fn output_cols_of(plan: &Plan) -> Vec<ProjCol> {
         Plan::ProcCall { cols, .. } | Plan::ProcInvoke { cols, .. } => cols.clone(),
         Plan::Union { cols, .. }
         | Plan::ProcSelect { cols, .. }
+        | Plan::ExecBlockSelect { cols, .. }
         | Plan::ProcRows { cols, .. }
         | Plan::Modified { cols, .. }
         | Plan::Derived { cols, .. }
@@ -38113,7 +38130,7 @@ fn emit_rows_inner(
         }
         // ProcSelect is replaced at op_execute; reaching a fetch still
         // holding one means the statement never executed
-        Plan::ProcSelect { .. } => return Err(EmitErr::Eval(EvalErr::ConversionError(None))),
+        Plan::ProcSelect { .. } | Plan::ExecBlockSelect { .. } => return Err(EmitErr::Eval(EvalErr::ConversionError(None))),
         Plan::Modified { inner, cols, distinct, skip, take } => {
             if let Some(db) = db {
                 // FIRST 0 delivers NO rows, whatever the inner or the SKIP.
@@ -54962,6 +54979,63 @@ fn declared_var_inits(header: &str, names: &[String]) -> Result<Vec<TrigStmt>, S
 /// The text handed back is what a procedure's catalog source looks
 /// like - declarations then `BEGIN ... END` - because that is what the
 /// body runner reads.
+/// A descriptor for one RETURNS parameter, from the metadata dsql
+/// recovered (mirrors load_procedure's domain_desc, but off inline types).
+fn desc_from_proc_meta(m: &fire_crab_dsql::ProcParamMeta) -> Option<Descriptor> {
+    let dtype = fire_crab_ods::ddl::field_type_to_dtype(m.field_type)?;
+    let length = if dtype == dtype::VARYING { m.length + 2 } else { m.length };
+    Some(Descriptor { dtype, scale: m.scale as i8, length, sub_type: m.sub_type, flags: 0, offset: 0 })
+}
+
+/// `EXECUTE BLOCK RETURNS (...) AS <body>` - a selectable anonymous
+/// block. Input parameters (`EXECUTE BLOCK (p type = ?) ...`) need a
+/// client message and are not taken; a block with no RETURNS is the
+/// plain (non-selectable) form parse_execute_block handles.
+fn parse_execute_block_select(sql: &str) -> Option<Plan> {
+    let s = sql.trim().trim_end_matches(';').trim();
+    let up = s.to_ascii_uppercase();
+    let masked = mask_literals(&up);
+    if find_word(&masked, "EXECUTE", 0) != Some(0) {
+        return None;
+    }
+    let block = find_word(&masked, "BLOCK", "EXECUTE".len())?;
+    if up["EXECUTE".len()..block].trim() != "" {
+        return None;
+    }
+    let after = block + "BLOCK".len();
+    let as_kw = find_word(&masked, "AS", after)?;
+    // between BLOCK and AS must be `RETURNS (...)` - a leading `(` is an
+    // input-parameter list, out of this slice
+    let between = up[after..as_kw].trim();
+    if find_word(&masked, "RETURNS", after) != Some(after + (up[after..].len() - up[after..].trim_start().len())) {
+        return None;
+    }
+    let _ = between;
+    let returns_text = s[after..as_kw].trim();
+    let body_off = as_kw + "AS".len();
+    let body = s[body_off..].trim();
+    let lead = s[body_off..].len() - s[body_off..].trim_start().len();
+    let at = source_line_col(s, body_off + lead);
+    // recover the output metadata (and validate the body) through the
+    // procedure compiler, then interpret the body as a nameless block
+    let synth = format!("CREATE PROCEDURE FC$BLOCK {} AS {}", returns_text, body);
+    let c = fire_crab_dsql::compile_procedure_full(&synth)?;
+    if !c.ins.is_empty() || c.outs.is_empty() {
+        return None; // no input params here; a RETURNS with columns
+    }
+    let mut out_names = Vec::new();
+    let mut out_descs = Vec::new();
+    let mut cols = Vec::new();
+    for (i, m) in c.outs.iter().enumerate() {
+        let d = desc_from_proc_meta(m)?;
+        // the engine describes a block column with an EMPTY table/owner
+        cols.push(proc_out_col(m.name.clone(), Some(m.name.clone()), "", i, &d));
+        out_names.push(m.name.clone());
+        out_descs.push(d);
+    }
+    Some(Plan::ExecBlockSelect { source: body.to_string(), body_at: at, out_names, out_descs, cols })
+}
+
 fn parse_execute_block(sql: &str) -> Option<(String, (usize, usize))> {
     let s = sql.trim().trim_end_matches(';').trim();
     let up = s.to_ascii_uppercase();
@@ -58301,6 +58375,45 @@ fn after_auth(
                             }
                         }
                     }
+                } else if matches!(&*plan, Plan::ExecBlockSelect { .. }) {
+                    // a selectable EXECUTE BLOCK: interpret the body and
+                    // keep the rows it SUSPENDed for the fetch
+                    let (source, body_at, out_names, out_descs, bcols) = match &*plan {
+                        Plan::ExecBlockSelect { source, body_at, out_names, out_descs, cols } => (
+                            source.clone(),
+                            *body_at,
+                            out_names.clone(),
+                            out_descs.clone(),
+                            cols.clone(),
+                        ),
+                        _ => unreachable!(),
+                    };
+                    let ctx = SessionCtx { user, attach_id };
+                    let meta = ProcMeta {
+                        ins: Vec::new(),
+                        outs: out_names
+                            .iter()
+                            .zip(out_descs.iter())
+                            .map(|(n, d)| ProcParam { name: n.clone(), desc: *d })
+                            .collect(),
+                        source,
+                        body_at: Some(body_at),
+                        prc_type: None,
+                    };
+                    match run_body_source(&mut database, ANONYMOUS_BLOCK, &meta, &[], &ctx) {
+                        Ok((_, suspended)) => {
+                            plan = std::rc::Rc::new(Plan::ProcRows { cols: bcols, rows: suspended });
+                            respond(&mut s, &mut enc, TX_HANDLE)?;
+                        }
+                        Err(e) => match e.status {
+                            Some(ev) => {
+                                plan = std::rc::Rc::new(Plan::RefusedEval(ev));
+                                respond(&mut s, &mut enc, TX_HANDLE)?;
+                            }
+                            None => respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?,
+                        },
+                    }
+                    continue;
                 } else if matches!(&*plan, Plan::ProcSelect { .. }) {
                     // a selectable procedure: run the body HERE (it may
                     // write) and keep the rows it SUSPENDed for the fetch
