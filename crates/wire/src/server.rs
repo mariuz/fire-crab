@@ -13780,7 +13780,7 @@ enum TrigStmt {
     /// the first; and the number of INTO slots must equal the projected
     /// column count exactly - a mismatch, INCLUDING a query with no INTO
     /// at all, is "Output parameters mismatch".
-    ExecStmt { text: Vec<DynPart>, into: Vec<u16>, src_off: usize },
+    ExecStmt { text: Vec<DynPart>, into: Vec<u16>, params: Vec<fire_crab_ods::expr::Expr>, src_off: usize },
     /// `SELECT ... INTO :v[, :v];` - the STATIC singleton. Same fetch
     /// contract as [TrigStmt::ExecStmt]'s INTO (one row assigns - NULLs
     /// included - none leaves the slots alone, several raise 21000) with
@@ -14320,6 +14320,99 @@ fn find_stmt_semi(s: &str, from: usize, limit: usize) -> Option<usize> {
 /// slice does not serve: a parameter list after the parenthesised text
 /// (`(...) (a := :k)`), `ON EXTERNAL`, `AS USER`, and anything else that
 /// is not a literal-or-variable concatenation.
+/// The parameterised EXECUTE STATEMENT operand `(sql) (v1, v2, ...)`:
+/// the first paren group is the SQL text (a literal/concat/variable), the
+/// second the POSITIONAL input values. A named head `(name := v)` is not
+/// taken here (a later slice). Returns the text parts and the value
+/// expressions.
+fn parse_exec_stmt_param_form(
+    operand: &str,
+    vars: &[String],
+) -> Option<(Vec<DynPart>, Vec<fire_crab_ods::expr::Expr>)> {
+    let t = operand.trim();
+    if !t.starts_with('(') {
+        return None;
+    }
+    // the SQL group: the matching ')' of the leading '(' (string-aware)
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut close = None;
+    for (i, c) in t.char_indices() {
+        match c {
+            '\'' => in_str = !in_str,
+            '(' if !in_str => depth += 1,
+            ')' if !in_str => {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let close = close?;
+    let sql_inner = &t[1..close];
+    let rest = t[close + 1..].trim();
+    if !rest.starts_with('(') || !rest.ends_with(')') {
+        return None;
+    }
+    let vals_inner = &rest[1..rest.len() - 1];
+    let dyn_text = parse_dyn_text(sql_inner, vars)?;
+    let mut params = Vec::new();
+    for part in vals_inner.split(',') {
+        let p = part.trim();
+        if p.is_empty() || p.contains(":=") {
+            return None; // empty, or a named (name := v) head - not this slice
+        }
+        let e = parse_expr(p.trim_start_matches(':').trim())?;
+        params.push(expr_resolve_vars(&e, vars));
+    }
+    if params.is_empty() {
+        return None;
+    }
+    Some((dyn_text, params))
+}
+
+/// Substitute the POSITIONAL `?` placeholders of a dynamic statement with
+/// its bound values, rendered as SQL literals - what an interpreter that
+/// does not carry a parameter message down its dynamic path can do and
+/// still answer the engine's rows. `?` inside the statement's own string
+/// literals is left alone. None when a value is a type this rendering
+/// does not cover, or the placeholder count does not match.
+fn bind_dyn_params(sql: &str, vals: &[Value]) -> Option<String> {
+    let lit = |v: &Value| -> Option<String> {
+        Some(match v {
+            Value::Int(n) => n.to_string(),
+            Value::Text(t) => format!("'{}'", t.replace('\'', "''")),
+            Value::Null => "NULL".to_string(),
+            _ => return None,
+        })
+    };
+    let b = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len() + 16);
+    let mut in_str = false;
+    let mut i = 0usize;
+    let mut next = 0usize;
+    while i < b.len() {
+        let c = b[i] as char;
+        if c == '\'' {
+            in_str = !in_str;
+            out.push(c);
+        } else if c == '?' && !in_str {
+            out.push_str(&lit(vals.get(next)?)?);
+            next += 1;
+        } else {
+            out.push(c);
+        }
+        i += 1;
+    }
+    if next != vals.len() {
+        return None;
+    }
+    Some(out)
+}
+
 fn parse_dyn_text(t: &str, vars: &[String]) -> Option<Vec<DynPart>> {
     let mut t = t.trim();
     // one wrapping paren pair, when it wraps the WHOLE operand - not the
@@ -14735,7 +14828,13 @@ fn parse_trig_stmt(
             }
             _ => (operand_end, false),
         };
-        let dyn_text = parse_dyn_text(&text[after..operand_end], vars)?;
+        let operand = &text[after..operand_end];
+        // the plain operand (a literal/concat/variable) or, when that
+        // declines, the parameterised head `(sql) (v1, v2, ...)`
+        let (dyn_text, params) = match parse_dyn_text(operand, vars) {
+            Some(dt) => (dt, Vec::new()),
+            None => parse_exec_stmt_param_form(operand, vars)?,
+        };
         let mut into = Vec::new();
         if let Some(k) = into_kw {
             for part in text[k + "INTO".len()..].split(',') {
@@ -14746,7 +14845,7 @@ fn parse_trig_stmt(
                 return None;
             }
         }
-        let exec = TrigStmt::ExecStmt { text: dyn_text, into, src_off: start };
+        let exec = TrigStmt::ExecStmt { text: dyn_text, into, params, src_off: start };
         return Some(if autonomous {
             TrigStmt::Autonomous { body: Box::new(exec), src_off: start }
         } else {
@@ -53720,11 +53819,20 @@ fn exec_psql_stmt_inner(
         // leaves ROW_COUNT saying what the last STATIC statement did
         // (probed - a body that updates two rows, then runs a dynamic
         // update, then reads ROW_COUNT, answers 2).
-        TrigStmt::ExecStmt { text, into, .. } => {
+        TrigStmt::ExecStmt { text, into, params, .. } => {
             // a NULL text is the engine's -104 exactly as an empty one
             // is, because concatenation with NULL is NULL and both reach
             // the parser with nothing to read (probed)
             let sql = render_dyn_text(text, f)?.unwrap_or_default();
+            let sql = if params.is_empty() {
+                sql
+            } else {
+                let mut vals = Vec::with_capacity(params.len());
+                for e in params {
+                    vals.push(eval_psql_expr(e, f)?);
+                }
+                bind_dyn_params(&sql, &vals).ok_or(PsqlStop::Unsupported)?
+            };
             let rows = run_dyn_statement(&sql, db, ctx)?;
             match (rows, into.is_empty()) {
                 // a statement with nothing to project and nothing asked
