@@ -39,7 +39,7 @@ One line each; the gate is the proof.
 | cost model + stale statistics | the stale region measured and matched, the filtered-driver term included | `opt-stale` |
 | transliteration + collation | eight codepage tables generated from the live engine, carriers, the assignment matrix, case law, PXW_INTL keys | `serve-real-xlit` 58, `collate` 16, `textcolcmp` 359 |
 | generator SET is deferred | `tra_gen_ids` cache + dfw postings per savepoint; no compensating record | `serve-real-gencomp` 22 |
-| packaged procedures + functions | a package qualifier resolves down the search path; a packaged FUNCTION runs in a select list and a selectable PROCEDURE in the FROM, bare or `PUBLIC.`/`SCHEMA.`-qualified, beside a same-named plain routine; `RDB$PROFILER` native no-ops with the engine's arity | `serve-real-pkgproc` 20, `serve-real-callpkg` 6 |
+| packaged procedures + functions | a package qualifier resolves down the search path; a packaged FUNCTION runs in a select list and a selectable PROCEDURE in the FROM, bare or `PUBLIC.`/`SCHEMA.`-qualified, beside a same-named plain routine; `RDB$PROFILER` native no-ops with the engine's arity | `serve-real-pkgproc` 20, `serve-real-callpkg` 7 |
 | fragmenting store | records larger than a page chain the engine's way; UPDATE/DELETE of a fragmented head | `serve-real-fragstore` 13 |
 | UNIQUE is walk-order | enforcement row-at-a-time in RECNO order, 23000 byte-exact; the sub-9-byte RHDF corruption found and fixed with it | `serve-real-uniqueorder` |
 | external sort | runs to disk past a budget, stable merge; ORDER BY / GROUP BY / DISTINCT; the hash-join build side in a spilling row store; ORDER BY fetches stream from the merge | `serve-real-bigsort` 12 |
@@ -713,9 +713,11 @@ pointer-page and TIP page numbers is the next step when it dominates.
   from a query DONE 2026-08-22: a packaged FUNCTION resolves in a select
   list and a selectable PROCEDURE in the FROM clause - bare, `PUBLIC.`-
   and `SCHEMA.`-qualified, over literals / table columns / nested calls -
-  with the engine's arity and -804 vectors; load_function became
-  package-aware like load_procedure, and a packaged member coexists with a
-  same-named plain routine. serve-real-callpkg 6.) (`MAPPING`
+  with the engine's arity, -804 (unknown function) and -204 "Procedure
+  unknown" (unknown selectable procedure in a FROM call) vectors;
+  load_function became package-aware like load_procedure, and a packaged
+  member coexists with a same-named plain routine (function AND procedure).
+  serve-real-callpkg 7.) (`MAPPING`
   and `COLLATION` DONE 2026-08-22: CREATE/ALTER/DROP MAPPING →
   RDB$AUTH_MAPPING and CREATE/DROP COLLATION → RDB$COLLATIONS, both
   byte-for-byte with the engine's catalog and vectors — serve-real-mapping

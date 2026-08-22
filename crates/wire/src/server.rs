@@ -12032,6 +12032,7 @@ fn downgrade_rewritten(p: Plan) -> Plan {
             EvalErr::NotSelectable { .. }
             | EvalErr::ProcNoOutputs { .. }
             | EvalErr::TableUnknown { .. }
+            | EvalErr::ProcUnknown { .. }
             | EvalErr::ProcArgMismatch(_),
         ) => Plan::Refused,
         other => other,
@@ -31179,6 +31180,26 @@ fn plan_query_inner_ctx(
                         }));
                     }
                     return Some(Plan::ProcSelect { name: pname, args, cols, picks });
+                } else if pargs_text.is_some() && procedure_defined(dbr, &pname) == false {
+                    // `FROM NAME(args)` written as a CALL, but no such
+                    // procedure: the engine's -204 "Procedure unknown"
+                    // (a bare NAME with no args is a RELATION reference,
+                    // whose -204 is "Table unknown" - a different code).
+                    // A procedure that EXISTS but load_procedure could
+                    // not model (an unsupported parameter type) is NOT
+                    // this - procedure_defined gates on existence, so it
+                    // still falls to the generic refusal. The name is
+                    // quoted AS WRITTEN, keeping any qualifier.
+                    let head = table_s.split('(').next().unwrap_or(table_s).trim();
+                    let name = head
+                        .split('.')
+                        .map(|q| format!("\"{}\"", q.trim().trim_matches('"').trim_end().to_ascii_uppercase()))
+                        .collect::<Vec<_>>()
+                        .join(".");
+                    return Some(match text_line_col(sql, table_s) {
+                        Some((line, col)) => Plan::RefusedEval(EvalErr::ProcUnknown { name, line, col }),
+                        None => Plan::Refused,
+                    });
                 }
             }
         }
@@ -36880,6 +36901,11 @@ const GDS_DSQL_LINE_COL_ERROR: i32 = 336397208;
 /// it. The engine has NO "schema unknown" diagnostic, so fire-crab must
 /// not invent one.
 const GDS_DSQL_RELATION_ERR: i32 = 335544580;
+/// isc_dsql_procedure_err - the -204 "Procedure unknown" sibling of
+/// GDS_DSQL_RELATION_ERR: a FROM item written as a CALL (`NAME(args)`)
+/// that resolves to no procedure. Same five-item shape, this code in
+/// place of the relation one, SQLSTATE 42000 instead of 42S02.
+const GDS_DSQL_PROCEDURE_ERR: i32 = 335544581;
 const GDS_RANDOM: i32 = 335544382;
 
 /// isc_string_truncation - "string right truncation" - and
@@ -37374,6 +37400,26 @@ fn eval_status_items(w: &mut W, e: &EvalErr) {
                 .int(-204)
                 .int(1) // isc_arg_gds
                 .int(GDS_DSQL_RELATION_ERR)
+                .int(1) // isc_arg_gds
+                .int(GDS_RANDOM)
+                .int(2) // isc_arg_string - PRE-QUOTED "SCHEMA"."NAME"
+                .bytes(name.as_bytes())
+                .int(1) // isc_arg_gds
+                .int(GDS_DSQL_LINE_COL_ERROR)
+                .int(ISC_ARG_NUMBER)
+                .int(*line as i32)
+                .int(ISC_ARG_NUMBER)
+                .int(*col as i32);
+        }
+        EvalErr::ProcUnknown { name, line, col } => {
+            w.int(1) // isc_arg_gds
+                .int(GDS_DSQL_ERROR)
+                .int(1) // isc_arg_gds
+                .int(GDS_SQLERR)
+                .int(ISC_ARG_NUMBER)
+                .int(-204)
+                .int(1) // isc_arg_gds
+                .int(GDS_DSQL_PROCEDURE_ERR)
                 .int(1) // isc_arg_gds
                 .int(GDS_RANDOM)
                 .int(2) // isc_arg_string - PRE-QUOTED "SCHEMA"."NAME"
@@ -43120,6 +43166,10 @@ enum EvalErr {
     /// generic Dynamic SQL Error: answering "Table unknown" to an
     /// unsupported ORDER BY would be a wrong error.
     TableUnknown { name: String, line: i64, col: i64 },
+    /// `FROM NAME(args)` where NAME(args) is a procedure CALL that names
+    /// no procedure: the engine's -204 "Procedure unknown". The name is
+    /// pre-quoted as written (`"PUBLIC"."NOSUCHPROC"`).
+    ProcUnknown { name: String, line: i64, col: i64 },
     /// a wrong argument count in a FROM-item procedure call:
     /// `isc_dsql_error` + `isc_prcmismat` (SQLCODE -902, SQLSTATE
     /// 07001). Fires BEFORE both of the above, for selectable and
@@ -50746,6 +50796,60 @@ fn catalog_row_public(v: &[Value], schema_f: Option<usize>, pkg_f: Option<usize>
 /// Load a procedure's parameters and body source from the catalog.
 /// None when the procedure does not exist, or when a parameter's type is
 /// outside the interpreter's surface.
+/// Does a procedure resolvable by this (possibly dotted) spelling EXIST
+/// in the catalog - regardless of whether load_procedure can model its
+/// signature? Mirrors load_procedure's name/schema/package visibility,
+/// but stops at the first matching row. It lets the FROM planner tell an
+/// UNKNOWN procedure (-204 "Procedure unknown") apart from one that
+/// exists but is outside the interpreter's surface (generic refusal).
+fn procedure_defined(db: &Database, name: &str) -> bool {
+    use fire_crab_ods::format::Value;
+    let parts: Vec<&str> = name.split('.').collect();
+    let (want_schema, want_pkg, member): (Option<&str>, Option<&str>, &str) = match parts.as_slice() {
+        [n] => (None, None, *n),
+        [p, n] if p.eq_ignore_ascii_case("PUBLIC") => (None, None, *n),
+        [p, n] => (None, Some(*p), *n),
+        [sc, p, n] => (Some(*sc), Some(*p), *n),
+        _ => return false,
+    };
+    let Some((cols, descs)) = sys_rel(db, "RDB$PROCEDURES") else { return false };
+    let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let Some(name_f) = fid("RDB$PROCEDURE_NAME") else { return false };
+    let (schema_f, pkg_f) = (fid("RDB$SCHEMA_NAME"), fid("RDB$PACKAGE_NAME"));
+    let fmts = vec![(0u8, descs)];
+    let mut found = false;
+    for_each_record(db, 26, &fmts, usize::MAX, |v| {
+        if found {
+            return;
+        }
+        if !matches!(v.get(name_f), Some(Value::Text(t)) if t.trim_end().eq_ignore_ascii_case(member)) {
+            return;
+        }
+        let visible = match want_pkg {
+            None => catalog_row_public(v, schema_f, pkg_f),
+            Some(pk) => {
+                let pkg_ok = matches!(pkg_f.and_then(|i| v.get(i)),
+                    Some(Value::Text(t)) if t.trim_end().eq_ignore_ascii_case(pk));
+                let schema_ok = match schema_f.and_then(|i| v.get(i)) {
+                    Some(Value::Text(t)) => {
+                        let t = t.trim_end();
+                        match want_schema {
+                            Some(sc) => t.eq_ignore_ascii_case(sc),
+                            None => t == "PUBLIC" || t == "SYSTEM",
+                        }
+                    }
+                    _ => false,
+                };
+                pkg_ok && schema_ok
+            }
+        };
+        if visible {
+            found = true;
+        }
+    });
+    found
+}
+
 fn load_procedure(db: &Database, name: &str) -> Option<ProcMeta> {
     use fire_crab_ods::format::Value;
 

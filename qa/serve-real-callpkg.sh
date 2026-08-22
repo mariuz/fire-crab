@@ -23,10 +23,17 @@
 # id is looked up by name AND package, so CREATE PACKAGE BODY does not
 # reuse a same-named plain routine's RDB$..._ID.
 #
-# Boundary (recorded): an unknown SELECTABLE procedure in the FROM clause
-# refuses generically on fc where the engine raises -204 "Procedure
-# unknown" (pre-existing, NOT package-specific - a plain `NOSUCHPROC(1)`
-# is the same); the -204-in-FROM vector is a separate slice.
+# An unknown SELECTABLE procedure in the FROM clause (call syntax,
+# `NAME(args)`) answers the engine's -204 "Procedure unknown" with the
+# name AS WRITTEN and its line/column - bare, PUBLIC.-qualified, and a
+# missing package member alike (checked below). A procedure that EXISTS
+# but is outside the interpreter's surface still falls to the generic
+# refusal (procedure_defined gates on existence).
+#
+# Boundary (recorded): a BARE unknown name with no call syntax (`FROM
+# NOSUCHTHING`) is a RELATION reference - the engine's -204 "Table
+# unknown" (a different code / SQLSTATE); fc refuses it generically, a
+# separate slice from the procedure case.
 #
 #   qa/serve-real-callpkg.sh [port]
 set -u
@@ -140,6 +147,18 @@ SQL
 e=$("$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$REAL:$B" -i "$D/callpkg-collide.sql" 2>&1 | norm)
 c=$("$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$A" -i "$D/callpkg-collide.sql" 2>&1 | norm)
 check "a plain FUNCTION and PROCEDURE coexist with same-named packaged members, each resolving" "$c" "$e"
+
+# an unknown SELECTABLE procedure in the FROM clause: -204 Procedure
+# unknown, bare / PUBLIC.-qualified / a missing package member
+cat > "$D/callpkg-unknownproc.sql" <<'SQL'
+SELECT X FROM NOSUCHPROC(1);
+SELECT X FROM NOSUCHPROC(1, 'a');
+SELECT X FROM PUBLIC.NOSUCHPROC(5);
+SELECT X FROM PKG.NOSUCHMEMBER(1);
+SQL
+e=$("$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$REAL:$B" -i "$D/callpkg-unknownproc.sql" 2>&1 | norm)
+c=$("$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$A" -i "$D/callpkg-unknownproc.sql" 2>&1 | norm)
+check "an unknown selectable procedure in FROM is -204 Procedure unknown (bare, qualified, missing member)" "$c" "$e"
 
 gf=$("$GFIX" -v -full -user "$U" -pas "$P" "$A" 2>&1)
 ran=$((ran + 1))
