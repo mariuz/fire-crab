@@ -31380,7 +31380,38 @@ fn plan_query_inner_ctx(
     }
     let table = left.table;
     // through the metadata cache, like the DML planners - see [crate::mdc]
-    let meta = db.relation_meta(table)?;
+    let meta = match db.relation_meta(table) {
+        Some(m) => m,
+        None => {
+            // A BARE name resolving to nothing here - having fallen past
+            // the procedure, view and CTE handlers above - is the
+            // engine's -204 "Table unknown". Emit it ONLY when the name
+            // is genuinely ABSENT: an EXTERNAL table is present in
+            // RDB$RELATIONS but relation_meta returns None for it too
+            // (its rows live in a file this executor does not read), and
+            // that must keep its generic refusal rather than claim the
+            // table does not exist; a procedure fc cannot model likewise
+            // is not "Table unknown". A qualified name was handled by the
+            // qualified-reference block above.
+            if left.schema.is_none()
+                && relation_schema(db, table).is_none()
+                && !procedure_defined(db, table)
+            {
+                if trace {
+                    eprintln!("[srv] plan: {} is no table/view/procedure - Table unknown", table);
+                }
+                return Some(match text_line_col(sql, left.span) {
+                    Some((line, col)) => Plan::RefusedEval(EvalErr::TableUnknown {
+                        name: left.quoted_name(),
+                        line,
+                        col,
+                    }),
+                    None => Plan::Refused,
+                });
+            }
+            return None;
+        }
+    };
     let rel = meta.id;
     let columns = meta.columns.as_ref().clone();
     let formats = select_formats(db, table, rel);

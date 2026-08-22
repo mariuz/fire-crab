@@ -30,10 +30,14 @@
 # but is outside the interpreter's surface still falls to the generic
 # refusal (procedure_defined gates on existence).
 #
-# Boundary (recorded): a BARE unknown name with no call syntax (`FROM
-# NOSUCHTHING`) is a RELATION reference - the engine's -204 "Table
-# unknown" (a different code / SQLSTATE); fc refuses it generically, a
-# separate slice from the procedure case.
+# A BARE unknown name with no call syntax (`FROM NOSUCHTHING`) is a
+# RELATION reference - the engine's -204 "Table unknown" (a different
+# code / SQLSTATE); fc answers it too, in the main FROM, once the name is
+# shown to be no table, view, procedure or CTE (checked below).
+#
+# Boundary (recorded): an unknown table inside a SUBQUERY (`... WHERE x IN
+# (SELECT ... FROM NOSUCHTAB)`) still refuses generically - the subquery
+# planner does not surface the typed -204 yet.
 #
 #   qa/serve-real-callpkg.sh [port]
 set -u
@@ -159,6 +163,16 @@ SQL
 e=$("$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$REAL:$B" -i "$D/callpkg-unknownproc.sql" 2>&1 | norm)
 c=$("$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$A" -i "$D/callpkg-unknownproc.sql" 2>&1 | norm)
 check "an unknown selectable procedure in FROM is -204 Procedure unknown (bare, qualified, missing member)" "$c" "$e"
+# an unknown RELATION (bare name, no call syntax) in FROM is -204 Table unknown
+cat > "$D/callpkg-unknowntab.sql" <<'SQL'
+SELECT X FROM NOSUCHTHING;
+SELECT * FROM NOSUCHTHING;
+SELECT COUNT(*) FROM NOSUCHTHING;
+SELECT ID FROM "lowernope";
+SQL
+e=$("$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$REAL:$B" -i "$D/callpkg-unknowntab.sql" 2>&1 | norm)
+c=$("$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$A" -i "$D/callpkg-unknowntab.sql" 2>&1 | norm)
+check "an unknown relation in FROM is -204 Table unknown (bare, star, count, quoted)" "$c" "$e"
 
 gf=$("$GFIX" -v -full -user "$U" -pas "$P" "$A" 2>&1)
 ran=$((ran + 1))
