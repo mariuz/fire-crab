@@ -28146,6 +28146,103 @@ fn first_unknown_relation(sql: &str, db: &Database) -> Option<(usize, usize, boo
     best
 }
 
+/// Strip the trailing row-locking / optimizer clauses a SELECT may carry
+/// - `FOR UPDATE [OF ...]`, `WITH LOCK [SKIP LOCKED]`, `OPTIMIZE FOR ...`
+/// - which this single-snapshot server does not act on but whose rows are
+/// the same as the plain query's. Returns the cleaned text, or None when
+/// there is no such clause. WITH LOCK over an AGGREGATE is left in place
+/// (the engine rejects it with -104; leaving it lets the normal parser
+/// refuse rather than answer a row the engine never returns).
+fn strip_row_locking(sql: &str, db: &Option<Database>) -> Option<String> {
+    let s = sql.trim().trim_end_matches(';').trim();
+    let up = mask_literals(&s.to_ascii_uppercase());
+    let word_after = |at: usize, w: &str| -> bool {
+        let rest = up[at..].trim_start();
+        rest.starts_with(w)
+            && rest[w.len()..].chars().next().is_none_or(|c| !(c.is_alphanumeric() || c == '_'))
+    };
+    let mut cut: Option<usize> = None;
+    let mut had_with_lock = false;
+    // FOR UPDATE / OPTIMIZE are lenient (the engine takes them over a
+    // view, CTE, join or aggregate too); WITH LOCK is not.
+    let mut from = 0;
+    while let Some(f) = find_word_depth0(&up, "FOR", from) {
+        from = f + "FOR".len();
+        if word_after(from, "UPDATE") {
+            cut = Some(cut.map_or(f, |c| c.min(f)));
+            break;
+        }
+    }
+    from = 0;
+    while let Some(w) = find_word_depth0(&up, "WITH", from) {
+        from = w + "WITH".len();
+        if word_after(from, "LOCK") {
+            cut = Some(cut.map_or(w, |c| c.min(w)));
+            had_with_lock = true;
+            break;
+        }
+    }
+    if let Some(o) = find_word_depth0(&up, "OPTIMIZE", 0) {
+        cut = Some(cut.map_or(o, |c| c.min(o)));
+    }
+    let cut = cut?;
+    let cleaned = s[..cut].trim_end();
+    // WITH LOCK is valid ONLY over a single physical base table with no
+    // aggregate (the engine's -104 otherwise). When it is not, leave the
+    // clause in so the normal parser refuses rather than answer rows the
+    // engine never returns.
+    if had_with_lock && !with_lock_target_ok(cleaned, db) {
+        return None;
+    }
+    Some(cleaned.to_string())
+}
+
+/// Is `sql` a plain single-physical-table select (no aggregate, GROUP BY,
+/// join, view, CTE or derived table) - the only shape the engine accepts
+/// WITH LOCK over?
+fn with_lock_target_ok(sql: &str, db: &Option<Database>) -> bool {
+    let Some((proj, table_s, _w, group, _h, _o)) = split_query(sql) else {
+        return false;
+    };
+    if group.is_some() {
+        return false;
+    }
+    // an aggregate anywhere in the projection
+    let pu = mask_literals(&proj.to_ascii_uppercase());
+    let b = pu.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i].is_ascii_alphabetic() {
+            let st = i;
+            while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                i += 1;
+            }
+            let word = &pu[st..i];
+            let mut j = i;
+            while j < b.len() && b[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if agg_named(word) && b.get(j) == Some(&b'(') {
+                return false;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    // a single bare FROM item that is a base relation, not a view
+    let Some((from, join)) = parse_from(table_s) else {
+        return false;
+    };
+    if !join.is_empty() {
+        return false;
+    }
+    let name = from.table;
+    match db.as_ref() {
+        Some(dbr) => relation_schema(dbr, name).is_some() && view_of(dbr, name).is_none(),
+        None => false,
+    }
+}
+
 fn plan_query(sql: &str, db: &Option<Database>) -> (Plan, Vec<Descriptor>) {
     USER_FNS.with(|m| *m.borrow_mut() = db.as_ref().map(user_function_sigs).unwrap_or_default());
     FN_CALLS.with(|l| l.borrow_mut().clear());
@@ -28158,6 +28255,9 @@ fn plan_query(sql: &str, db: &Option<Database>) -> (Plan, Vec<Descriptor>) {
     // planning; an unsupported clause (or none) leaves the text unchanged
     let rewritten = rewrite_named_windows(sql);
     let sql = rewritten.as_deref().unwrap_or(sql);
+    // row-locking / optimizer hints this server does not act on
+    let delocked = strip_row_locking(sql, db);
+    let sql = delocked.as_deref().unwrap_or(sql);
     let mut params = Vec::new();
     let planned = timed("plan:query-inner", || plan_query_inner(sql, db, &mut params));
     // A SELECT THAT DRAWS A GENERATOR IS A WRITE, and a read-only

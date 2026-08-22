@@ -244,8 +244,7 @@ DDL was.
 
 ### F. DML and PSQL gaps
 
-`INTERSECT`/`EXCEPT`; the named `WINDOW` clause; `WITH LOCK`, `FOR
-UPDATE`, an explicit `PLAN`; a `?` inside any PSQL query (loop, cursor,
+`INTERSECT`/`EXCEPT`; the named `WINDOW` clause; an explicit `PLAN` (WITH LOCK / FOR UPDATE / OPTIMIZE are done); a `?` inside any PSQL query (loop, cursor,
 `EXECUTE STATEMENT`, `SELECT INTO` — `server.rs:47089`);  `RDB$SET_CONTEXT`/`RDB$GET_CONTEXT`; `GEN_ID`
 inside an autonomous body; `INSERT … VALUES` without a column list in
 PSQL; `EXECUTE BLOCK` with parameters or `RETURNS`; `EXECUTE
@@ -391,6 +390,16 @@ pointer-page and TIP page numbers is the next step when it dominates.
 
 ## Next, in order
 
+- **Row-locking / optimizer clauses DONE (2026-08-22, `serve-real-rowlock`
+  5):** `FOR UPDATE [OF ...]`, `WITH LOCK [SKIP LOCKED]` and `OPTIMIZE FOR
+  ...` are stripped before planning - this single-snapshot server does not
+  act on them and their rows are the plain query's. FOR UPDATE / OPTIMIZE
+  are lenient (taken over a view, CTE, join or aggregate); WITH LOCK is
+  valid only over a single physical table with no aggregate (the engine's
+  -104 otherwise), so fc leaves it in - and thus refuses - in every other
+  shape rather than answer a row the engine never returns. (An explicit
+  `PLAN (...)` is still refused: an invalid plan is an engine error, so it
+  cannot be blindly stripped.)
 - **Selectable EXECUTE BLOCK RETURNS DONE (2026-08-22,
   `serve-real-execblock` 5):** `EXECUTE BLOCK RETURNS (...) AS ... SUSPEND
   ... END` runs as a statement whose SUSPENDed rows are the result set -
