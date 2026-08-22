@@ -388,6 +388,16 @@ pointer-page and TIP page numbers is the next step when it dominates.
 
 ## Next, in order
 
+- **NTILE(n) window function DONE (2026-08-22, `serve-real-ntile` 3):**
+  the ordered partition split into n buckets as equally as it divides
+  (the first `size % n` buckets get one extra row), each row its 1-based
+  bucket - byte-identical to the engine across bucket counts and with
+  PARTITION BY, an INT64 named NTILE. Joins the RankFn machinery
+  (ROW_NUMBER / RANK / DENSE_RANK). Boundary: an expression bucket count.
+  (Probed the same day and left: LIST/GROUP_CONCAT needs a COMPUTED BLOB
+  result fc cannot yet emit - `CAST(x AS BLOB)` refuses; CORR/regr and
+  PERCENTILE_CONT/DISC ordered-set aggregates; NTILE done, LAG/LEAD with
+  offset+default already worked.)
 - **EXECUTE STATEMENT positional + named parameters DONE (2026-08-22,
   `serve-real-execstmt` 4):** the `(sql) (v1, ...)` head binds its `?`
   placeholders, and the `(a := v, ...)` head its `:name` placeholders, at

@@ -8531,6 +8531,10 @@ enum RankFn {
     Rank,
     /// ties share a rank with NO gap (5,5,9 -> 1,1,2)
     DenseRank,
+    /// `NTILE(n)` - the ordered partition split into `n` buckets as
+    /// equally as it divides; the first `size % n` buckets get one extra
+    /// row. Each row answers its 1-based bucket number.
+    Ntile(i64),
 }
 
 /// A NAVIGATION window function - one whose value is another row's, read
@@ -36392,6 +36396,18 @@ fn compute_windows(
                             RankFn::RowNumber => pos as i64 + 1,
                             RankFn::Rank => rank,
                             RankFn::DenseRank => dense,
+                            RankFn::Ntile(n) => {
+                                let size = perm.len() as i64;
+                                let base = size / n;
+                                let rem = size % n;
+                                let big = rem * (base + 1);
+                                let pp = pos as i64;
+                                if pp < big {
+                                    pp / (base + 1) + 1
+                                } else {
+                                    rem + (pp - big) / base + 1
+                                }
+                            }
                         });
                     }
                 }
@@ -48815,13 +48831,23 @@ fn parse_window_item(
 fn parse_rank_call(call: &str) -> Option<RankFn> {
     let t = call.trim();
     let open = t.find('(')?;
-    if !t.ends_with(')') || t[open + 1..t.len() - 1].trim() != "" {
+    if !t.ends_with(')') {
         return None;
     }
-    match t[..open].trim().to_ascii_uppercase().as_str() {
-        "ROW_NUMBER" => Some(RankFn::RowNumber),
-        "RANK" => Some(RankFn::Rank),
-        "DENSE_RANK" => Some(RankFn::DenseRank),
+    let name = t[..open].trim().to_ascii_uppercase();
+    let inner = t[open + 1..t.len() - 1].trim();
+    match name.as_str() {
+        "ROW_NUMBER" | "RANK" | "DENSE_RANK" if inner.is_empty() => Some(match name.as_str() {
+            "ROW_NUMBER" => RankFn::RowNumber,
+            "RANK" => RankFn::Rank,
+            _ => RankFn::DenseRank,
+        }),
+        // NTILE(n) - a positive integer LITERAL bucket count (an
+        // expression count is a later slice)
+        "NTILE" => {
+            let n: i64 = inner.parse().ok()?;
+            (n >= 1).then_some(RankFn::Ntile(n))
+        }
         _ => None,
     }
 }
@@ -49176,6 +49202,7 @@ fn parse_projection(proj: &str) -> Option<Proj> {
                 WinFunc::Rank(RankFn::RowNumber) => "ROW_NUMBER",
                 WinFunc::Rank(RankFn::Rank) => "RANK",
                 WinFunc::Rank(RankFn::DenseRank) => "DENSE_RANK",
+                WinFunc::Rank(RankFn::Ntile(_)) => "NTILE",
                 WinFunc::Nav(NavFn::Lag, ..) => "LAG",
                 WinFunc::Nav(NavFn::Lead, ..) => "LEAD",
                 WinFunc::Val(ValFn::FirstValue, ..) => "FIRST_VALUE",
