@@ -691,15 +691,15 @@ pointer-page and TIP page numbers is the next step when it dominates.
   switch.
 - **NEXT**: the rest of the auth/restore-only DDL, each a separate effort
   with its own obstacle — `CREATE USER` writes the security database's
-  PLG$SRP (not this catalog); `CREATE COLLATION` carries per-charset id
-  allocation (descending from 126) and, for ICU charsets, version strings
-  in RDB$SPECIFIC_ATTRIBUTES, and this server keys binary so it cannot
-  honour CASE/ACCENT INSENSITIVE ordering; `CREATE PACKAGE` is a PSQL
-  module (header + body); `CREATE SHADOW` needs a physical shadow file
-  beside its RDB$FILES row. (`MAPPING` DONE 2026-08-22: CREATE / ALTER /
-  DROP write RDB$AUTH_MAPPING byte-for-byte with the engine's vectors;
-  serve-real-mapping 5. GLOBAL mapping refuses — the security database.)
-  (`DROP TABLE` dependency
+  PLG$SRP (not this catalog); `CREATE PACKAGE` is a PSQL module (header +
+  body); `CREATE SHADOW` needs a physical shadow file beside its RDB$FILES
+  row; and collation-aware ordering (this server keys binary). (`MAPPING`
+  and `COLLATION` DONE 2026-08-22: CREATE/ALTER/DROP MAPPING →
+  RDB$AUTH_MAPPING and CREATE/DROP COLLATION → RDB$COLLATIONS, both
+  byte-for-byte with the engine's catalog and vectors — serve-real-mapping
+  5, serve-real-collation 5. The collation SPEC's ICU version is copied
+  from the base collation; ids count down from 126 per charset. GLOBAL
+  mapping and FROM EXTERNAL collation refuse.) (`DROP TABLE` dependency
   enforcement is now complete for the common cases: views, procedures, and
   FK/PK back-references all block with the engine's exact vector and count.
   serve-real-dropdeps 7 — FK/PK is checked first and wins over a view; the
