@@ -689,8 +689,17 @@ pointer-page and TIP page numbers is the next step when it dominates.
   client round-tripped and isql rendered as `c000000:a000000` for the
   engine's `c:1e6`. All nine blob/array/batch gates green after the
   switch.
-- **NEXT**: the rest of `E` — the restore-only / auth DDL (packages,
-  collations, users, mappings, shadows). (`DROP TABLE` dependency
+- **NEXT**: the rest of the auth/restore-only DDL, each a separate effort
+  with its own obstacle — `CREATE USER` writes the security database's
+  PLG$SRP (not this catalog); `CREATE COLLATION` carries per-charset id
+  allocation (descending from 126) and, for ICU charsets, version strings
+  in RDB$SPECIFIC_ATTRIBUTES, and this server keys binary so it cannot
+  honour CASE/ACCENT INSENSITIVE ordering; `CREATE PACKAGE` is a PSQL
+  module (header + body); `CREATE SHADOW` needs a physical shadow file
+  beside its RDB$FILES row. (`MAPPING` DONE 2026-08-22: CREATE / ALTER /
+  DROP write RDB$AUTH_MAPPING byte-for-byte with the engine's vectors;
+  serve-real-mapping 5. GLOBAL mapping refuses — the security database.)
+  (`DROP TABLE` dependency
   enforcement is now complete for the common cases: views, procedures, and
   FK/PK back-references all block with the engine's exact vector and count.
   serve-real-dropdeps 7 — FK/PK is checked first and wins over a view; the
