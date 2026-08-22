@@ -9261,7 +9261,7 @@ pub fn create_procedure(
     blr: &[u8],
     package: Option<(&str, i64)>,
 ) -> Result<(), String> {
-    create_procedure_with_id(file, page_size, name, ins, outs, selectable, source, blr, package, None)
+    create_procedure_with_id(file, page_size, name, ins, outs, selectable, source, blr, package, None, false)
 }
 
 /// [create_procedure] keeping a given RDB$PROCEDURE_ID - what ALTER
@@ -9277,6 +9277,7 @@ pub fn create_procedure_with_id(
     blr: &[u8],
     package: Option<(&str, i64)>,
     keep_id: Option<i64>,
+    declaration: bool,
 ) -> Result<(), String> {
     let want = name.trim().trim_matches('"').to_ascii_uppercase();
     if want.is_empty() {
@@ -9324,25 +9325,26 @@ pub fn create_procedure_with_id(
         None => Some(next_security_class(file, page_size, ACL_SEQUENCE_OWNER)?),
         Some(_) => None,
     };
-    let src_blob =
-        dml::insert_blob_cs(file, page_size, prel, &[source.as_bytes().to_vec()], 1, 4)?;
-    let blr_blob = dml::insert_blob(file, page_size, prel, &[blr.to_vec()], 2)?;
     let mut pvals: Vec<(&str, SysVal<'_>)> = vec![
         ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
         ("RDB$PROCEDURE_NAME", SysVal::S(&want)),
         ("RDB$PROCEDURE_ID", SysVal::I(id)),
         ("RDB$PROCEDURE_INPUTS", SysVal::I(ins.len() as i64)),
         ("RDB$PROCEDURE_OUTPUTS", SysVal::I(outs.len() as i64)),
-        ("RDB$PROCEDURE_SOURCE", SysVal::B(blob_id_bytes(prel, src_blob))),
-        ("RDB$PROCEDURE_BLR", SysVal::B(blob_id_bytes(prel, blr_blob))),
         ("RDB$OWNER_NAME", SysVal::S(OWNER)),
         ("RDB$SYSTEM_FLAG", SysVal::I(0)),
-        (
-            "RDB$PROCEDURE_TYPE",
-            SysVal::I(if selectable { 1 } else { 2 }),
-        ),
-        ("RDB$VALID_BLR", SysVal::I(1)),
     ];
+    // a package-header DECLARATION carries no source, blr, type or valid
+    // flag (the body fills them); a real procedure carries them all.
+    if !declaration {
+        let src_blob =
+            dml::insert_blob_cs(file, page_size, prel, &[source.as_bytes().to_vec()], 1, 4)?;
+        let blr_blob = dml::insert_blob(file, page_size, prel, &[blr.to_vec()], 2)?;
+        pvals.push(("RDB$PROCEDURE_SOURCE", SysVal::B(blob_id_bytes(prel, src_blob))));
+        pvals.push(("RDB$PROCEDURE_BLR", SysVal::B(blob_id_bytes(prel, blr_blob))));
+        pvals.push(("RDB$PROCEDURE_TYPE", SysVal::I(if selectable { 1 } else { 2 })));
+        pvals.push(("RDB$VALID_BLR", SysVal::I(1)));
+    }
     if let Some(c) = &class {
         pvals.push(("RDB$SECURITY_CLASS", SysVal::S(c)));
     }
@@ -10107,6 +10109,7 @@ pub fn restore_carried_function(
     debug: Option<&[u8]>,
     package: Option<(&str, i64)>,
     external: Option<&ExternalFn>,
+    declaration: bool,
 ) -> Result<(), String> {
     let want = name.trim().trim_matches('"').to_ascii_uppercase();
     if want.is_empty() {
@@ -10150,7 +10153,7 @@ pub fn restore_carried_function(
     // an EXTERNAL function has NO blobs of its own - the names are
     // the whole declaration (measured: no blr, no source, VALID_BLR
     // null on the engine's rows)
-    let blobs = if external.is_some() {
+    let blobs = if external.is_some() || declaration {
         None
     } else {
         let src_blob =
@@ -10308,6 +10311,122 @@ pub fn restore_carried_function(
 /// EXECUTE grant with object type 18 (obj_package_header, measured).
 /// The members arrive separately through create_procedure /
 /// restore_carried_function with their package tag.
+/// One member of a package header (a declaration, no body).
+#[derive(Clone, Debug)]
+pub enum PackageMember {
+    Procedure { name: String, ins: Vec<ProcParamDef>, outs: Vec<ProcParamDef> },
+    Function { name: String, args: Vec<FnArgDef> },
+}
+
+/// `CREATE PACKAGE <name> AS BEGIN <decls> END` - the header. Writes the
+/// RDB$PACKAGES row (header source only, no body, VALID_BODY_FLAG null) and a
+/// DECLARATION row per member (no blr/type/valid). The body fills them later.
+pub fn create_package(
+    file: &mut crate::Image,
+    page_size: usize,
+    name: &str,
+    header_source: &str,
+    members: &[PackageMember],
+) -> Result<(), String> {
+    let want = name.trim().trim_matches('"').to_ascii_uppercase();
+    if want.is_empty() {
+        return Err("a package needs a name".into());
+    }
+    let prel = crate::resolve_relation(file, page_size, "RDB$PACKAGES").ok_or("no RDB$PACKAGES relation")?;
+    {
+        let fmts = system_relation_formats(file, page_size, "RDB$PACKAGES").ok_or("no RDB$PACKAGES format")?;
+        let (_, descs) = fmts.iter().max_by_key(|(n, _)| *n).ok_or("no RDB$PACKAGES format")?;
+        let nf = sys_fid(file, page_size, "RDB$PACKAGES", "RDB$PACKAGE_NAME")?;
+        let mut dup = false;
+        walk_rows(file, page_size, prel, descs, |v| { if text_eq(v.get(nf), &want) { dup = true; } });
+        if dup {
+            return Err(format!("Package {} already exists", want));
+        }
+    }
+    let class = next_security_class(file, page_size, ACL_SEQUENCE_OWNER)?;
+    let hdr_blob = dml::insert_blob_cs(file, page_size, prel, &[header_source.as_bytes().to_vec()], 1, 4)?;
+    sys_insert(file, page_size, "RDB$PACKAGES", prel, &[
+        ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
+        ("RDB$PACKAGE_NAME", SysVal::S(&want)),
+        ("RDB$PACKAGE_HEADER_SOURCE", SysVal::B(blob_id_bytes(prel, hdr_blob))),
+        ("RDB$SECURITY_CLASS", SysVal::S(&class)),
+        ("RDB$OWNER_NAME", SysVal::S(OWNER)),
+        ("RDB$SYSTEM_FLAG", SysVal::I(0)),
+    ])?;
+    store_privileges(file, page_size, &want, 18, &["X"])?;
+    for m in members {
+        match m {
+            PackageMember::Procedure { name, ins, outs } => {
+                create_procedure_with_id(file, page_size, name, ins, outs, false, "", &[], Some((&want, 0)), None, true)?;
+            }
+            PackageMember::Function { name, args } => {
+                restore_carried_function(file, page_size, name, args, 0, false, "", &[], None, Some((&want, 0)), None, true)?;
+            }
+        }
+    }
+    advance_oldest_transactions(file, page_size)
+}
+
+/// `DROP PACKAGE <name>` - the package row, every member procedure/function
+/// with this package tag, their parameters and auto-domains.
+pub fn drop_package(file: &mut crate::Image, page_size: usize, name: &str) -> Result<(), String> {
+    let want = name.trim().trim_matches('"').to_ascii_uppercase();
+    let prel = crate::resolve_relation(file, page_size, "RDB$PACKAGES").ok_or("no RDB$PACKAGES relation")?;
+    {
+        let fmts = system_relation_formats(file, page_size, "RDB$PACKAGES").ok_or("no format")?;
+        let (_, descs) = fmts.iter().max_by_key(|(n, _)| *n).ok_or("empty")?;
+        let nf = sys_fid(file, page_size, "RDB$PACKAGES", "RDB$PACKAGE_NAME")?;
+        let mut found = false;
+        walk_rows(file, page_size, prel, descs, |v| { if text_eq(v.get(nf), &want) { found = true; } });
+        if !found {
+            return Err(format!("Package {} not found", want));
+        }
+    }
+    // collect the member domains (RDB$FIELD_SOURCE of the members' params) so
+    // they can go with the rest.
+    let mut domains: Vec<String> = Vec::new();
+    for (tbl, pkgcol, srccol) in [
+        ("RDB$PROCEDURE_PARAMETERS", "RDB$PACKAGE_NAME", "RDB$FIELD_SOURCE"),
+        ("RDB$FUNCTION_ARGUMENTS", "RDB$PACKAGE_NAME", "RDB$FIELD_SOURCE"),
+    ] {
+        if let (Some(rel), Some(fmts)) = (crate::resolve_relation(file, page_size, tbl), system_relation_formats(file, page_size, tbl)) {
+            if let Some((_, descs)) = fmts.iter().max_by_key(|(n, _)| *n) {
+                if let (Ok(pf), Ok(sf)) = (sys_fid(file, page_size, tbl, pkgcol), sys_fid(file, page_size, tbl, srccol)) {
+                    walk_rows(file, page_size, rel, descs, |v| {
+                        if text_eq(v.get(pf), &want) {
+                            if let Some(Value::Text(t)) = v.get(sf) {
+                                let d = t.trim_end().to_string();
+                                if d.strip_prefix("RDB$").is_some_and(|x| x.parse::<u64>().is_ok()) {
+                                    domains.push(d);
+                                }
+                            }
+                        }
+                    });
+                }
+            }
+        }
+    }
+    let del_by_pkg = |file: &mut crate::Image, tbl: &str| -> Result<(), String> {
+        let pf = sys_fid(file, page_size, tbl, "RDB$PACKAGE_NAME")?;
+        let w = want.clone();
+        delete_catalog_rows(file, page_size, tbl, move |v| text_eq(v.get(pf), &w)).map(|_| ())
+    };
+    del_by_pkg(file, "RDB$PROCEDURE_PARAMETERS")?;
+    del_by_pkg(file, "RDB$FUNCTION_ARGUMENTS")?;
+    del_by_pkg(file, "RDB$PROCEDURES")?;
+    del_by_pkg(file, "RDB$FUNCTIONS")?;
+    for d in domains {
+        let nf = sys_fid(file, page_size, "RDB$FIELDS", "RDB$FIELD_NAME")?;
+        delete_catalog_rows(file, page_size, "RDB$FIELDS", move |v| text_eq(v.get(nf), &d))?;
+    }
+    {
+        let nf = sys_fid(file, page_size, "RDB$PACKAGES", "RDB$PACKAGE_NAME")?;
+        let w = want.clone();
+        delete_catalog_rows(file, page_size, "RDB$PACKAGES", move |v| text_eq(v.get(nf), &w))?;
+    }
+    advance_oldest_transactions(file, page_size)
+}
+
 pub fn restore_carried_package(
     file: &mut crate::Image,
     page_size: usize,
