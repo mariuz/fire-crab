@@ -54302,6 +54302,42 @@ fn bind_proc_args(name: &str, meta: &ProcMeta, args: &[Value]) -> Result<Vec<Val
                     Value::Text(t.clone())
                 }
             }
+            // CROSS-TYPE, the engine's CVT: a text argument into an
+            // INTEGER parameter parses (leading/trailing spaces trimmed;
+            // anything left over raises 22018 "conversion error from
+            // string"), and an integer into a text parameter renders as
+            // decimal, then obeys the parameter's width/pad like any text.
+            (Value::Text(t), Some(ColKind::Int)) => match t.trim().parse::<i64>() {
+                Ok(n) => Value::Int(n),
+                Err(_) => {
+                    return Err(ProcErr {
+                        text: format!("procedure {}: cannot convert {:?}", name, t),
+                        status: Some(EvalErr::ConversionError(Some(t.clone()))),
+                    })
+                }
+            },
+            (Value::Int(n), Some(ColKind::Text)) => {
+                let rendered = n.to_string();
+                // an integer whose decimal form does not fit the text
+                // parameter is a CONVERSION error, not a truncation
+                // (probed: `PS(123456789012)` into VARCHAR(10) raises
+                // 22018 "conversion error from string \"123456789012\"")
+                if rendered.chars().count() > declared_chars {
+                    return Err(ProcErr {
+                        text: format!("procedure {}: cannot convert {}", name, rendered),
+                        status: Some(EvalErr::ConversionError(Some(rendered))),
+                    });
+                }
+                if d.dtype == fire_crab_ods::format::dtype::TEXT {
+                    let mut padded = rendered;
+                    while padded.chars().count() < declared_chars {
+                        padded.push(' ');
+                    }
+                    Value::Text(padded)
+                } else {
+                    Value::Text(rendered)
+                }
+            }
             _ => {
                 return Err(ProcErr::from(format!(
                     "procedure {}: argument type does not match parameter {}",

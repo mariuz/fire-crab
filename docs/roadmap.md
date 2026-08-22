@@ -248,8 +248,7 @@ DDL was.
 `EXECUTE STATEMENT`, `SELECT INTO` — `server.rs:47089`);  `RDB$SET_CONTEXT`/`RDB$GET_CONTEXT`; `GEN_ID`
 inside an autonomous body; `INSERT … VALUES` without a column list in
 PSQL; `EXECUTE BLOCK` with parameters or `RETURNS`; `EXECUTE
-STATEMENT` with parameters, `ON EXTERNAL`, `AS USER`; cross-type
-procedure inputs where the engine converts; a bare aggregate over a
+STATEMENT` with parameters, `ON EXTERNAL`, `AS USER`; a bare aggregate over a
 comma join (42000 at prepare); `= ANY`/`= ALL` over the strict text
 key; PSQL literals held as i32 (`serve-real-psqlerrors`); the BLR
 compiler narrower than the interpreter (a bare `EXCEPTION;` in a
@@ -390,6 +389,15 @@ pointer-page and TIP page numbers is the next step when it dominates.
 
 ## Next, in order
 
+- **Cross-type procedure inputs DONE (2026-08-22, `serve-real-crosstype`
+  3):** the engine's CVT for a procedure argument whose literal type
+  differs from the parameter's - a text into an INTEGER (spaces trimmed,
+  leftover text a 22018 "conversion error from string"), an integer into
+  a text parameter (rendered decimal, then the width/CHAR-padding, an
+  over-long value a 22018 too). One place, bind_proc_args, so every call
+  path (EXECUTE PROCEDURE, a selectable FROM, the BLR fast path) converts
+  the same. fc's proc parameters are only INTEGER/TEXT, so those are the
+  pairs.
 - **Row-locking / optimizer clauses DONE (2026-08-22, `serve-real-rowlock`
   5):** `FOR UPDATE [OF ...]`, `WITH LOCK [SKIP LOCKED]` and `OPTIMIZE FOR
   ...` are stripped before planning - this single-snapshot server does not
