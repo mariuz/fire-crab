@@ -388,6 +388,23 @@ pointer-page and TIP page numbers is the next step when it dominates.
 
 ## Next, in order
 
+- **Statistical aggregates VAR_POP / VAR_SAMP / STDDEV_POP / STDDEV_SAMP
+  DONE (2026-08-22, `serve-real-statagg` 4):** a DOUBLE fold over the
+  non-null values, the naive sum-of-squares the engine uses
+  (`Sxx - Sx*Sx/n` over n or n-1, folded in f64) so the DOUBLE bits match
+  byte-for-byte over INTEGER, NUMERIC(9,2) and expression sources,
+  whole-table and grouped. Unlike SUM/AVG they are NOT nullable and NEVER
+  NULL: an empty, single-row or all-NULL group is 0, not NULL (probed
+  against FB6 - the describe carries no Nullable flag, like COUNT;
+  VAR_SAMP over one row and any fold over none are 0, not a divide by
+  zero). New `AggFn` variants computed only in `compute_group`; every
+  fast/scalar/subquery path declines to it. Boundaries (recorded, the
+  engine answers them, fc refuses cleanly): the OVER (window) form, a
+  HAVING comparison, a scalar subquery, DISTINCT - top-level select items
+  only for now; and a DOUBLE-column source is moot because fc cannot yet
+  INSERT into a DOUBLE column (a separate DML gap). No `VARIANCE`/`STDDEV`
+  synonym (FB6 has neither - probed -804).
+
 - **NTILE(n) window function DONE (2026-08-22, `serve-real-ntile` 3):**
   the ordered partition split into n buckets as equally as it divides
   (the first `size % n` buckets get one extra row), each row its 1-based

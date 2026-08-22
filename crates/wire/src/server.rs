@@ -8514,6 +8514,28 @@ enum AggFn {
     /// four NUMERIC(9,2) values summing 10.80 it is 2.70) - NULL over
     /// an empty or all-NULL input like the other folds
     Avg,
+    /// The statistical folds - population and sample VARIANCE and STANDARD
+    /// DEVIATION. All four answer a DOUBLE and, unlike SUM/AVG, are NOT
+    /// nullable: an empty, single-row or all-NULL group is 0, never NULL
+    /// (probed against FB6 - the describe carries no Nullable flag, like
+    /// COUNT). Folded in f64 by the naive sum-of-squares the engine uses
+    /// (Sxx - Sx*Sx/n over n or n-1), so the DOUBLE bits match; VAR_SAMP /
+    /// STDDEV_SAMP over one row and any fold over none are 0, not a divide
+    /// by zero.
+    VarPop,
+    VarSamp,
+    StddevPop,
+    StddevSamp,
+}
+
+impl AggFn {
+    /// the four DOUBLE-valued, never-NULL statistical folds
+    fn is_statistical(self) -> bool {
+        matches!(
+            self,
+            AggFn::VarPop | AggFn::VarSamp | AggFn::StddevPop | AggFn::StddevSamp
+        )
+    }
 }
 
 /// A RANKING window function - one whose value is the row's POSITION in
@@ -31189,6 +31211,10 @@ fn plan_query_inner_ctx(
                                     AggFn::Max => "MAX",
                                     AggFn::Sum => "SUM",
                                     AggFn::Avg => "AVG",
+                                    AggFn::VarPop => "VAR_POP",
+                                    AggFn::VarSamp => "VAR_SAMP",
+                                    AggFn::StddevPop => "STDDEV_POP",
+                                    AggFn::StddevSamp => "STDDEV_SAMP",
                                 }
                                 .to_string()
                             })),
@@ -32149,6 +32175,10 @@ fn plan_query_inner_ctx(
                         AggFn::Max => "MAX",
                         AggFn::Sum => "SUM",
                         AggFn::Avg => "AVG",
+                        AggFn::VarPop => "VAR_POP",
+                        AggFn::VarSamp => "VAR_SAMP",
+                        AggFn::StddevPop => "STDDEV_POP",
+                        AggFn::StddevSamp => "STDDEV_SAMP",
                     }
                     .to_string();
                     let name = alias.clone().unwrap_or_else(|| fname.clone());
@@ -32168,6 +32198,9 @@ fn plan_query_inner_ctx(
                             _ => ScalarTy::int64(),
                         },
                         AggFn::Sum | AggFn::Avg => ScalarTy::int64(),
+                        AggFn::VarPop | AggFn::VarSamp | AggFn::StddevPop | AggFn::StddevSamp => {
+                            ScalarTy::double()
+                        }
                     };
                     return Some(Plan::Scalar(
                         ScalarVal::Agg(Box::new(AggPlan {
@@ -32785,6 +32818,9 @@ fn agg_result_desc(
             },
             _ => return None,
         },
+        // the statistical folds are top-level select items only - VAR/STDDEV
+        // in a HAVING or a scalar subquery refuse (no scalar descriptor here)
+        AggFn::VarPop | AggFn::VarSamp | AggFn::StddevPop | AggFn::StddevSamp => return None,
     })
 }
 
@@ -33246,6 +33282,17 @@ fn build_group_items(
                         }
                         }
                     }
+                    AggFn::VarPop | AggFn::VarSamp | AggFn::StddevPop | AggFn::StddevSamp => {
+                        // VAR/STDDEV always answer a DOUBLE and are NOT
+                        // nullable (like COUNT): 0 over an empty, single-row
+                        // or all-NULL group, never NULL. Refuse a non-numeric
+                        // source the way SUM/AVG does.
+                        let (t, _sc, _rank) = src_shape?;
+                        if !matches!(t, ExprType::Int | ExprType::Numeric | ExprType::Approx) {
+                            return None;
+                        }
+                        (Wire::Double, 480, 8, 0, 0)
+                    }
                 };
                 // the engine titles aggregate output columns by function
                 // unless the item carries an alias - and the FUNCTION
@@ -33257,6 +33304,10 @@ fn build_group_items(
                     AggFn::Max => "MAX",
                     AggFn::Sum => "SUM",
                     AggFn::Avg => "AVG",
+                    AggFn::VarPop => "VAR_POP",
+                    AggFn::VarSamp => "VAR_SAMP",
+                    AggFn::StddevPop => "STDDEV_POP",
+                    AggFn::StddevSamp => "STDDEV_SAMP",
                 }
                 .to_string();
                 let name = agg_alias.clone().unwrap_or_else(|| fname.clone());
@@ -33269,7 +33320,14 @@ fn build_group_items(
                     rel_alias: None,
                     field_id: out_idx,
                     wire,
-                    sql_type: if matches!(func, AggFn::Count) {
+                    sql_type: if matches!(
+                        func,
+                        AggFn::Count
+                            | AggFn::VarPop
+                            | AggFn::VarSamp
+                            | AggFn::StddevPop
+                            | AggFn::StddevSamp
+                    ) {
                         sql_type // NOT nullable - the engine's own flag
                     } else {
                         nullable(sql_type)
@@ -33836,7 +33894,7 @@ fn aggregate(
     // source's scale; the group machinery already does that. Aggregate
     // SUBQUERIES no longer come through here at all - they build a
     // one-item, no-key group, which is what a scalar aggregate is.
-    if matches!(func, AggFn::Avg) {
+    if matches!(func, AggFn::Avg) || func.is_statistical() {
         return None;
     }
     let mut acc: Option<i64> = None;
@@ -33853,6 +33911,10 @@ fn aggregate(
             (AggFn::Max, Some(a)) => a.max(*i),
             (AggFn::Sum, Some(a)) => a + *i,
             (AggFn::Count | AggFn::Avg, _) => unreachable!(),
+            (
+                AggFn::VarPop | AggFn::VarSamp | AggFn::StddevPop | AggFn::StddevSamp,
+                _,
+            ) => unreachable!(),
         });
     });
     if hit != 0 {
@@ -36701,6 +36763,49 @@ fn compute_group(rows: &[Vec<Value>], gitems: &[GItem]) -> Result<Vec<Value>, Ev
                         scaled_value(sum / n as i128, scale.unwrap_or(0))
                     }
                 }
+                GItem::Agg(
+                    func @ (AggFn::VarPop
+                    | AggFn::VarSamp
+                    | AggFn::StddevPop
+                    | AggFn::StddevSamp),
+                    src,
+                    _,
+                ) => {
+                    // The naive sum-of-squares fold the engine uses, in
+                    // f64: n, Sx, Sxx over the non-null values, then
+                    // Sxx - Sx*Sx/n divided by n (population) or n-1
+                    // (sample). Never NULL - an empty/single/all-NULL group
+                    // is 0 (n==0 pop, n<=1 sample yield 0 rather than a
+                    // divide by zero); STDDEV is the square root, clamped
+                    // at 0 so f64 cancellation cannot sqrt a tiny negative.
+                    let (mut n, mut sx, mut sxx) = (0i64, 0f64, 0f64);
+                    for r in rows {
+                        let v = src_value(src, r)?;
+                        let x = match numeric_parts(&v) {
+                            Some((raw, sc)) => raw as f64 * 10f64.powi(sc as i32),
+                            None => match approx_of(&v) {
+                                Some(fx) => fx,
+                                None => continue, // NULL / non-numeric: skip
+                            },
+                        };
+                        n += 1;
+                        sx += x;
+                        sxx += x * x;
+                    }
+                    let ssd = if n == 0 { 0.0 } else { sxx - sx * sx / n as f64 };
+                    let var = match func {
+                        AggFn::VarPop | AggFn::StddevPop => {
+                            if n == 0 { 0.0 } else { ssd / n as f64 }
+                        }
+                        _ => {
+                            if n <= 1 { 0.0 } else { ssd / (n - 1) as f64 }
+                        }
+                    };
+                    Value::Double(match func {
+                        AggFn::VarPop | AggFn::VarSamp => var,
+                        _ => var.max(0.0).sqrt(),
+                    })
+                }
                 GItem::Const(v) => v.clone(), // a per-group constant slot
                 GItem::Agg(..) => Value::Null, // MIN/MAX/SUM(*): rejected at plan
             })
@@ -36886,6 +36991,11 @@ impl ScalarTy {
     /// COUNT's type: INT64, NOT nullable (580 even - measured)
     fn count() -> ScalarTy {
         ScalarTy { wire: Wire::Int64, sql_type: 580, length: 8 }
+    }
+    /// VAR/STDDEV: DOUBLE, NOT nullable (480 even) - 0, not NULL, over an
+    /// empty group
+    fn double() -> ScalarTy {
+        ScalarTy { wire: Wire::Double, sql_type: 480, length: 8 }
     }
     /// a MIN/MAX result: the SOURCE column's own type, nullable
     fn of_desc(d: &Descriptor) -> ScalarTy {
@@ -47265,6 +47375,10 @@ fn subquery_item_name(sub: &str) -> Option<(String, String)> {
                     AggFn::Max => "MAX",
                     AggFn::Sum => "SUM",
                     AggFn::Avg => "AVG",
+                    AggFn::VarPop => "VAR_POP",
+                    AggFn::VarSamp => "VAR_SAMP",
+                    AggFn::StddevPop => "STDDEV_POP",
+                    AggFn::StddevSamp => "STDDEV_SAMP",
                 }
                 .to_string();
                 Some((fname.clone(), alias.clone().unwrap_or(fname)))
@@ -47516,6 +47630,10 @@ fn build_correlated_lookup(
             // the same row).
             let absent = match func {
                 AggFn::Count => Value::Int(0),
+                // VAR/STDDEV over a key with no rows is 0, not NULL
+                AggFn::VarPop | AggFn::VarSamp | AggFn::StddevPop | AggFn::StddevSamp => {
+                    Value::Double(0.0)
+                }
                 _ => Value::Null,
             };
             (out, absent, d)
@@ -48146,6 +48264,11 @@ fn eval_subquery_rel(
     // a scalar aggregate is, so this is the same code the top-level
     // `SELECT AVG(NUM) FROM T` already runs.
     if let Some((func, target)) = agg {
+        // a statistical fold is a top-level select item only, not a scalar
+        // subquery value (a recorded boundary)
+        if func.is_statistical() {
+            return None;
+        }
         // the source is built exactly as the top-level group planner
         // builds it, so a subquery accepts the same arguments a SELECT
         // list does - a column, `COUNT(DISTINCT col)`, or an expression
@@ -48728,7 +48851,8 @@ fn split_query(
 fn agg_named(word: &str) -> bool {
     matches!(
         word.to_ascii_uppercase().as_str(),
-        "COUNT" | "MIN" | "MAX" | "SUM" | "AVG"
+        "COUNT" | "MIN" | "MAX" | "SUM" | "AVG" | "VAR_POP" | "VAR_SAMP" | "STDDEV_POP"
+            | "STDDEV_SAMP"
     )
 }
 
@@ -48803,6 +48927,12 @@ fn parse_window_item(
         let (f, target) = parse_agg_item(call)?;
         WinFunc::Agg(f, target)
     };
+    // the statistical folds are answered as ordinary aggregates only, not
+    // yet as a window - refuse the OVER form (drops to the failing path,
+    // the engine's own error for a shape this build does not answer)
+    if matches!(&func, WinFunc::Agg(f, _) if f.is_statistical()) {
+        return None;
+    }
     let spec = t[over_lp + 1..over_end].trim();
     let (part, order, frame) = parse_over_spec(spec)?;
     // a frame is answered only WITH an ORDER BY (it is relative to it). An
@@ -49118,6 +49248,10 @@ fn parse_agg_item(item: &str) -> Option<(AggFn, AggTarget)> {
         "MAX" => AggFn::Max,
         "SUM" => AggFn::Sum,
         "AVG" => AggFn::Avg,
+        "VAR_POP" => AggFn::VarPop,
+        "VAR_SAMP" => AggFn::VarSamp,
+        "STDDEV_POP" => AggFn::StddevPop,
+        "STDDEV_SAMP" => AggFn::StddevSamp,
         _ => return None,
     };
     let arg = t[open + 1..t.len() - 1].trim();
@@ -49199,6 +49333,10 @@ fn parse_projection(proj: &str) -> Option<Proj> {
                 WinFunc::Agg(AggFn::Max, _) => "MAX",
                 WinFunc::Agg(AggFn::Sum, _) => "SUM",
                 WinFunc::Agg(AggFn::Avg, _) => "AVG",
+                WinFunc::Agg(AggFn::VarPop, _) => "VAR_POP",
+                WinFunc::Agg(AggFn::VarSamp, _) => "VAR_SAMP",
+                WinFunc::Agg(AggFn::StddevPop, _) => "STDDEV_POP",
+                WinFunc::Agg(AggFn::StddevSamp, _) => "STDDEV_SAMP",
                 WinFunc::Rank(RankFn::RowNumber) => "ROW_NUMBER",
                 WinFunc::Rank(RankFn::Rank) => "RANK",
                 WinFunc::Rank(RankFn::DenseRank) => "DENSE_RANK",
@@ -49427,6 +49565,10 @@ fn default_expr_name(raw: &RawExpr) -> String {
         RawExpr::Agg(AggFn::Max, _) => "MAX",
         RawExpr::Agg(AggFn::Sum, _) => "SUM",
         RawExpr::Agg(AggFn::Avg, _) => "AVG",
+        RawExpr::Agg(AggFn::VarPop, _) => "VAR_POP",
+        RawExpr::Agg(AggFn::VarSamp, _) => "VAR_SAMP",
+        RawExpr::Agg(AggFn::StddevPop, _) => "STDDEV_POP",
+        RawExpr::Agg(AggFn::StddevSamp, _) => "STDDEV_SAMP",
         // the spelling names the column, parenthesised or not
         RawExpr::Gen { step: None, .. } => "NEXT_VALUE",
         RawExpr::Gen { step: Some(_), .. } => "GEN_ID",
@@ -56823,6 +56965,12 @@ fn resolve_having(
                     (idx, kind, Some(pdesc))
                 }
                 RawLhs::Agg(func, target) => {
+                    // the statistical folds are not answered in a HAVING
+                    // comparison (their DOUBLE fold has no integer/text
+                    // compare kind) - refuse, the engine's own path
+                    if func.is_statistical() {
+                        return None;
+                    }
                     // the aggregate's OUTPUT descriptor is what a `?` on
                     // the compared side describes as - INT64 for COUNT and
                     // integer/numeric folds (INT128 past precision 18),
