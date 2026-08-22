@@ -8,9 +8,9 @@
 # Both databases build the procedures; the SUSPENDed rows are compared,
 # and the ENGINE runs the BLR fc stored.
 #
-# Boundaries (recorded): a LABELLED leave/continue (`LEAVE lbl`) is not
-# taken - fc refuses where the engine builds it; a CONTINUE or LEAVE
-# outside every loop refuses on both.
+# Labelled leave/continue (`LEAVE lbl` / `CONTINUE lbl`) name an enclosing
+# loop, an OUTER one included (checked below). Boundary: a CONTINUE or
+# LEAVE outside every loop refuses on both.
 #
 #   qa/serve-real-loopctl.sh [port]
 set -u
@@ -49,6 +49,9 @@ CREATE PROCEDURE PWHILE RETURNS (N INTEGER) AS DECLARE I INTEGER; BEGIN I = 0; W
 CREATE PROCEDURE PFOR RETURNS (N INTEGER) AS BEGIN FOR SELECT ID FROM T ORDER BY ID INTO :N DO BEGIN IF (N = 2) THEN CONTINUE; IF (N = 4) THEN LEAVE; SUSPEND; END END^
 CREATE PROCEDURE PNEST RETURNS (A INTEGER, B INTEGER) AS DECLARE I INTEGER; DECLARE J INTEGER; BEGIN I = 0; WHILE (I < 3) DO BEGIN I = I + 1; J = 0; WHILE (J < 3) DO BEGIN J = J + 1; IF (J = 2) THEN CONTINUE; IF (I = 3) THEN LEAVE; A = I; B = J; SUSPEND; END END END^
 CREATE PROCEDURE PMIX RETURNS (N INTEGER) AS DECLARE K INTEGER; BEGIN FOR SELECT ID FROM T ORDER BY ID INTO :N DO BEGIN K = 0; WHILE (K < 2) DO BEGIN K = K + 1; IF (K = 1) THEN CONTINUE; END IF (N = 3) THEN CONTINUE; IF (N = 5) THEN LEAVE; SUSPEND; END END^
+CREATE PROCEDURE PLBL RETURNS (N INTEGER) AS DECLARE I INTEGER; BEGIN I = 0; LP: WHILE (I < 9) DO BEGIN I = I + 1; N = I; SUSPEND; IF (I = 2) THEN LEAVE LP; END END^
+CREATE PROCEDURE POUTR RETURNS (A INTEGER, B INTEGER) AS DECLARE I INTEGER; DECLARE J INTEGER; BEGIN I = 0; OUTR: WHILE (I < 3) DO BEGIN I = I + 1; J = 0; WHILE (J < 3) DO BEGIN J = J + 1; IF (I = 2 AND J = 2) THEN LEAVE OUTR; A = I; B = J; SUSPEND; END END END^
+CREATE PROCEDURE PCONTR RETURNS (A INTEGER, B INTEGER) AS DECLARE I INTEGER; DECLARE J INTEGER; BEGIN I = 0; OUTR: WHILE (I < 3) DO BEGIN I = I + 1; J = 0; WHILE (J < 3) DO BEGIN J = J + 1; IF (J = 2) THEN CONTINUE OUTR; A = I; B = J; SUSPEND; END END END^
 SET TERM ;^
 COMMIT;
 SQL
@@ -62,19 +65,21 @@ SELECT N FROM PWHILE;
 SELECT N FROM PFOR;
 SELECT A, B FROM PNEST;
 SELECT N FROM PMIX;
+SELECT N FROM PLBL;
+SELECT A, B FROM POUTR;
+SELECT A, B FROM PCONTR;
 SQL
 e=$("$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$REAL:$B" -i "$D/loopctl-run.sql" 2>&1 | norm)
 c=$("$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$A" -i "$D/loopctl-run.sql" 2>&1 | norm)
-check "CONTINUE / LEAVE over WHILE, FOR SELECT and nested loops" "$c" "$e"
+check "CONTINUE / LEAVE (bare and labelled, incl. an outer loop) over WHILE / FOR / nested" "$c" "$e"
 
 # the ENGINE runs the BLR fc stored (proves the compiled loop control is valid)
 e=$("$ISQL" -q -user "$U" -pas "$P" "$B" -i "$D/loopctl-run.sql" 2>&1 | norm)
 c=$("$ISQL" -q -user "$U" -pas "$P" "$A" -i "$D/loopctl-run.sql" 2>&1 | norm)
 check "the ENGINE runs the loop-control BLR fc stored" "$c" "$e"
 
-# Boundary: a labelled leave and out-of-loop control refuse on fc
-for q in "CREATE PROCEDURE PLBL RETURNS (N INTEGER) AS DECLARE I INTEGER; BEGIN I=0; LP: WHILE (I<3) DO BEGIN I=I+1; N=I; SUSPEND; IF (I=2) THEN LEAVE LP; END END" \
-         "CREATE PROCEDURE POUT RETURNS (N INTEGER) AS BEGIN CONTINUE; END" \
+# Boundary: CONTINUE/LEAVE outside every loop refuse on fc
+for q in "CREATE PROCEDURE POUT RETURNS (N INTEGER) AS BEGIN CONTINUE; END" \
          "CREATE PROCEDURE PLO RETURNS (N INTEGER) AS BEGIN LEAVE; END"; do
     printf 'SET TERM ^;\n%s^\nSET TERM ;^\nCOMMIT;\n' "$q" > "$D/loopctl-b.sql"
     c=$("$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$A" -i "$D/loopctl-b.sql" 2>&1 | grep -ci error)

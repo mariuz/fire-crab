@@ -246,7 +246,7 @@ DDL was.
 
 `INTERSECT`/`EXCEPT`; the named `WINDOW` clause; `WITH LOCK`, `FOR
 UPDATE`, an explicit `PLAN`; a `?` inside any PSQL query (loop, cursor,
-`EXECUTE STATEMENT`, `SELECT INTO` — `server.rs:47089`); labelled `LEAVE` / `CONTINUE` (the bare forms are done); `RDB$SET_CONTEXT`/`RDB$GET_CONTEXT`; `GEN_ID`
+`EXECUTE STATEMENT`, `SELECT INTO` — `server.rs:47089`);  `RDB$SET_CONTEXT`/`RDB$GET_CONTEXT`; `GEN_ID`
 inside an autonomous body; `INSERT … VALUES` without a column list in
 PSQL; `EXECUTE BLOCK` with parameters or `RETURNS`; `EXECUTE
 STATEMENT` with parameters, `ON EXTERNAL`, `AS USER`; cross-type
@@ -400,8 +400,11 @@ pointer-page and TIP page numbers is the next step when it dominates.
   SELECT / FOR EXECUTE loop catches PsqlStop::Continue). Works in WHILE,
   FOR SELECT and nested loops; the engine runs the BLR fc stored. Before,
   fc could interpret a bare LEAVE it read from an engine-built procedure
-  but its compiler refused both. Boundaries: a LABELLED `LEAVE lbl` still
-  refuses; CONTINUE/LEAVE outside every loop refuse (as the engine's do).
+  but its compiler refused both. LABELLED `LEAVE lbl` / `CONTINUE lbl`
+  followed (same day): a `<name>:` prefix names a loop, an OUTER one
+  included, resolved to that loop's label number - byte-for-byte with the
+  engine (pin TOL), and the interpreter propagates a labelled jump to the
+  matching loop. Boundary: CONTINUE/LEAVE outside every loop refuse.
 - **SQL-standard OFFSET / FETCH DONE (2026-08-22, `serve-real-offsetfetch`
   16):** `OFFSET <n> ROW|ROWS` and `FETCH {FIRST|NEXT} [<n>] ROW|ROWS
   ONLY`, alone or combined (OFFSET then FETCH -> skip then take), beside

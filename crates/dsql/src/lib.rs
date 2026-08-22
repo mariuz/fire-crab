@@ -1029,8 +1029,12 @@ struct P<'a> {
     /// the next free label number (0 is the body wrapper's)
     next_label: u8,
     /// labels of the loops enclosing the statement being parsed, innermost
-    /// last - a bare LEAVE / CONTINUE targets `loop_labels.last()`
-    loop_labels: Vec<u8>,
+    /// last - a bare LEAVE / CONTINUE targets `loop_labels.last()`, a
+    /// labelled one the entry whose name matches (an outer loop by name)
+    loop_labels: Vec<(Option<String>, u8)>,
+    /// a `<name>:` label seen just before a loop, consumed when the loop
+    /// pushes its entry
+    pending_loop_label: Option<String>,
     /// procedure-body mode: SUSPEND and (FOR) SELECT become
     /// statements; the number of output parameters shapes the sends
     proc: Option<usize>,
@@ -1101,6 +1105,7 @@ impl<'a> P<'a> {
             local_vars: Vec::new(),
             next_label: 1,
             loop_labels: Vec::new(),
+            pending_loop_label: None,
             proc: None,
             agg_fid_ctx: 1,
             domain_value: false,
@@ -3200,6 +3205,7 @@ pub fn compile_view_columns(sql: &str) -> Option<Vec<Option<Vec<u8>>>> {
         local_vars: Vec::new(),
         next_label: 1,
             loop_labels: Vec::new(),
+            pending_loop_label: None,
         proc: None,
         agg_fid_ctx: 1,
         domain_value: false,
@@ -3350,6 +3356,7 @@ pub fn compile_view_select(sql: &str) -> Option<Vec<u8>> {
         local_vars: Vec::new(),
         next_label: 1,
             loop_labels: Vec::new(),
+            pending_loop_label: None,
         proc: None,
         agg_fid_ctx: 1,
         domain_value: false,
@@ -6620,7 +6627,7 @@ impl<'a> P<'a> {
                 self.for_cursors
                     .push((cn.clone(), ctx, stream.name.clone()));
             }
-            self.loop_labels.push(label);
+            self.loop_labels.push((self.pending_loop_label.take(), label));
             let body_opt = self.trig_stmt();
             self.loop_labels.pop();
             let body = body_opt?;
@@ -7695,7 +7702,7 @@ impl<'a> P<'a> {
         if !self.kw("DO") {
             return None;
         }
-        self.loop_labels.push(label);
+        self.loop_labels.push((self.pending_loop_label.take(), label));
         let body_opt = self.trig_stmt();
         self.loop_labels.pop();
         let do_stmt = Some(Box::new(body_opt?));
@@ -7874,7 +7881,44 @@ impl<'a> P<'a> {
     }
 
     /// one trigger-body statement; self.i past any leading keyword
+    /// The label number a bare or labelled LEAVE/CONTINUE targets:
+    /// bare (`;` next) is the innermost loop; `<name>` names an enclosing
+    /// loop. Consumes the optional name and the terminating `;`.
+    fn loop_target(&mut self) -> Option<u8> {
+        let l = match self.t.get(self.i) {
+            Some(Tok::Semi) => self.loop_labels.last()?.1,
+            Some(Tok::Ident(name)) if !is_keyword(name) => {
+                let name = name.clone();
+                self.i += 1;
+                self.loop_labels
+                    .iter()
+                    .rev()
+                    .find(|(n, _)| n.as_deref() == Some(name.as_str()))?
+                    .1
+            }
+            _ => return None,
+        };
+        if !matches!(self.t.get(self.i), Some(Tok::Semi)) {
+            return None;
+        }
+        self.i += 1;
+        Some(l)
+    }
+
     fn trig_stmt(&mut self) -> Option<TrigStmt> {
+        // an optional loop label: `<name>: <WHILE|FOR ...>`
+        if let (Some(Tok::Ident(x)), Some(Tok::Colon)) = (self.t.get(self.i), self.t.get(self.i + 1)) {
+            if !is_keyword(x) {
+                let name = x.clone();
+                // a label may prefix only a loop
+                let after = self.t.get(self.i + 2);
+                let is_loop = matches!(after, Some(Tok::Ident(w)) if w == "WHILE" || w == "FOR");
+                if is_loop {
+                    self.i += 2;
+                    self.pending_loop_label = Some(name);
+                }
+            }
+        }
         if self.kw("BEGIN") {
             let mut stmts = Vec::new();
             loop {
@@ -8042,7 +8086,7 @@ impl<'a> P<'a> {
                 if !self.kw("DO") {
                     return None;
                 }
-                self.loop_labels.push(label);
+                self.loop_labels.push((self.pending_loop_label.take(), label));
                 let body_opt = self.trig_stmt();
                 self.loop_labels.pop();
                 let body = Box::new(body_opt?);
@@ -8286,19 +8330,11 @@ impl<'a> P<'a> {
         // identifier is a LABELLED form this surface does not take, and
         // either outside a loop has no label to target - both refuse.
         if self.kw("LEAVE") {
-            if !matches!(self.t.get(self.i), Some(Tok::Semi)) {
-                return None;
-            }
-            let l = *self.loop_labels.last()?;
-            self.i += 1;
+            let l = self.loop_target()?;
             return Some(TrigStmt::LeaveLoop(l));
         }
         if self.kw("CONTINUE") {
-            if !matches!(self.t.get(self.i), Some(Tok::Semi)) {
-                return None;
-            }
-            let l = *self.loop_labels.last()?;
-            self.i += 1;
+            let l = self.loop_target()?;
             return Some(TrigStmt::ContinueLoop(l));
         }
         if self.kw("IN") {
@@ -8459,7 +8495,7 @@ impl<'a> P<'a> {
             }
             let label = self.next_label;
             self.next_label += 1;
-            self.loop_labels.push(label);
+            self.loop_labels.push((self.pending_loop_label.take(), label));
             let body = match self.trig_stmt() {
                 Some(b) => Box::new(b),
                 None => {
@@ -9215,6 +9251,7 @@ pub fn compile_default(sql: &str) -> Option<Vec<u8>> {
         local_vars: Vec::new(),
         next_label: 1,
             loop_labels: Vec::new(),
+            pending_loop_label: None,
         proc: None,
         agg_fid_ctx: 1,
         domain_value: false,
@@ -9295,6 +9332,7 @@ pub fn compile_computed(sql: &str) -> Option<Vec<u8>> {
         local_vars: Vec::new(),
         next_label: 1,
             loop_labels: Vec::new(),
+            pending_loop_label: None,
         proc: None,
         agg_fid_ctx: 1,
         domain_value: false,
@@ -9370,6 +9408,7 @@ pub fn compile_check(sql: &str) -> Option<Vec<u8>> {
         local_vars: Vec::new(),
         next_label: 1,
             loop_labels: Vec::new(),
+            pending_loop_label: None,
         proc: None,
         agg_fid_ctx: 1,
         domain_value: false,
@@ -9446,6 +9485,7 @@ pub fn compile_validation(sql: &str) -> Option<Vec<u8>> {
         local_vars: Vec::new(),
         next_label: 1,
             loop_labels: Vec::new(),
+            pending_loop_label: None,
         proc: None,
         agg_fid_ctx: 1,
         domain_value: true,
@@ -9546,6 +9586,7 @@ pub fn compile_trigger(sql: &str) -> Option<Vec<u8>> {
         local_vars: Vec::new(),
         next_label: 1,
             loop_labels: Vec::new(),
+            pending_loop_label: None,
         proc: None,
         agg_fid_ctx: 1,
         domain_value: false,
@@ -10796,6 +10837,13 @@ mod tests {
         pin_trig(
             "CREATE TRIGGER QW_C FOR T BEFORE INSERT AS DECLARE V1 INTEGER; BEGIN V1 = 0; WHILE (V1 < 5) DO V1 = V1 + 1; NEW.A = V1; END",
             "05020300000800012D1A00001100020201150800000000001A00001101090208331A00001508000500000001221A0000150800010000001A00001201FF011A000017010141FFFFFF4C",
+        );
+        // labelled CONTINUE / LEAVE naming an OUTER loop: from the inner
+        // loop (label 2) they target OUTR (label 1) - blr_continue_loop 1,
+        // blr_leave 1 (probed, byte-identical to the engine)
+        pin_trig(
+            "CREATE TRIGGER TOL FOR T BEFORE INSERT AS DECLARE I INTEGER; DECLARE J INTEGER; BEGIN I=0; OUTR: WHILE (I<3) DO BEGIN I=I+1; J=0; WHILE (J<3) DO BEGIN J=J+1; IF (J=2) THEN CONTINUE OUTR; IF (I=3) THEN LEAVE OUTR; END END NEW.A=I; END",
+            "050203000008000301000800012D1A0000012D1A01001100020201150800000000001A00001101090208331A000015080003000000020201221A0000150800010000001A000001150800000000001A01001102090208331A010015080003000000020201221A0100150800010000001A0100082F1A010015080002000000C501FF082F1A0000150800030000001201FFFFFF1202FFFFFF1201FF011A000017010141FFFFFF4C",
         );
         // WHILE with CONTINUE and a bare LEAVE - blr_continue_loop 1 and
         // blr_leave 1 both target the loop label (probed)

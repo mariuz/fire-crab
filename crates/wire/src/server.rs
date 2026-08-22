@@ -13638,6 +13638,8 @@ enum TrigStmt {
     While {
         cond: fire_crab_ods::expr::Cond,
         body: Box<TrigStmt>,
+        /// an optional loop label (`LP: WHILE ...`), for a labelled LEAVE
+        label: Option<String>,
         src_off: usize,
     },
     /// `EXCEPTION <name>;` - blr_abort, condition 2 (exception), name
@@ -13666,10 +13668,10 @@ enum TrigStmt {
     Fetch { cursor: String, into: Vec<u16>, src_off: usize },
     /// `CLOSE <cursor>;`
     Close { cursor: String, src_off: usize },
-    /// `LEAVE;` - end the innermost loop.
-    Leave { src_off: usize },
-    /// `CONTINUE;` - jump to the innermost loop's next iteration.
-    Continue { src_off: usize },
+    /// `LEAVE [label];` - end the named loop (None = the innermost).
+    Leave { target: Option<String>, src_off: usize },
+    /// `CONTINUE [label];` - next iteration of the named loop (None = innermost).
+    Continue { target: Option<String>, src_off: usize },
     /// `EXIT;` - end the body. A selectable procedure keeps the rows it
     /// has already SUSPENDed.
     Exit { src_off: usize },
@@ -13734,6 +13736,7 @@ enum TrigStmt {
         query: String,
         into: Vec<u16>,
         body: Box<TrigStmt>,
+        label: Option<String>,
         src_off: usize,
     },
     /// `SUSPEND;` - emit the output parameters as a row and carry on.
@@ -13782,6 +13785,7 @@ enum TrigStmt {
         text: Vec<DynPart>,
         into: Vec<u16>,
         body: Box<TrigStmt>,
+        label: Option<String>,
         src_off: usize,
     },
     Block {
@@ -14441,6 +14445,28 @@ fn parse_trig_stmt(
     skip_trig_ws(s, pos, limit);
     let start = *pos;
     let word = peek_trig_word(s, start, limit)?;
+    // an optional loop label: `<name>: <WHILE|FOR ...>`. Attach it to the
+    // loop the recursive parse returns; a label on a non-loop refuses.
+    {
+        let mut q = start + word.len();
+        skip_trig_ws(s, &mut q, limit);
+        if s.get(q..).is_some_and(|r| r.starts_with(':')) && !word.is_empty() {
+            let mut r = q + 1;
+            skip_trig_ws(s, &mut r, limit);
+            if matches!(peek_trig_word(s, r, limit).as_deref(), Some("WHILE") | Some("FOR")) {
+                *pos = r;
+                let mut inner = parse_trig_stmt(s, pos, limit, vars)?;
+                let lbl = word.to_ascii_uppercase();
+                match &mut inner {
+                    TrigStmt::While { label, .. }
+                    | TrigStmt::ForSelect { label, .. }
+                    | TrigStmt::ForExecStmt { label, .. } => *label = Some(lbl),
+                    _ => return None,
+                }
+                return Some(inner);
+            }
+        }
+    }
     if word == "BEGIN" {
         *pos = start + "BEGIN".len();
         return parse_trig_block(s, pos, limit, vars, start);
@@ -14498,6 +14524,7 @@ fn parse_trig_stmt(
                 into,
                 body: Box::new(body),
                 src_off: start,
+                label: None,
             });
         }
         if find_word(&up_all, "SELECT", after_for)? != after_for + 1
@@ -14545,7 +14572,7 @@ fn parse_trig_stmt(
         }
         *pos = do_kw + "DO".len();
         let body = parse_trig_stmt(s, pos, limit, vars)?;
-        return Some(TrigStmt::ForSelect { query, into, body: Box::new(body), src_off: start });
+        return Some(TrigStmt::ForSelect { query, into, body: Box::new(body), label: None, src_off: start });
     }
     if word == "IF" || word == "WHILE" {
         *pos = start + word.len();
@@ -14584,7 +14611,7 @@ fn parse_trig_stmt(
         *pos += kw.len();
         let inner = parse_trig_stmt(s, pos, limit, vars)?;
         if word == "WHILE" {
-            return Some(TrigStmt::While { cond, body: Box::new(inner), src_off: start });
+            return Some(TrigStmt::While { cond, body: Box::new(inner), label: None, src_off: start });
         }
         // an optional ELSE branch
         let save = *pos;
@@ -14771,14 +14798,23 @@ fn parse_trig_stmt(
         }
         return Some(TrigStmt::Close { cursor: name, src_off: start });
     }
-    if find_word(&up, "LEAVE", 0) == Some(0) && text.trim().len() == "LEAVE".len() {
-        // a LABELLED leave (`LEAVE outer`) names a loop this surface
-        // does not have, so only the bare form is taken
-        return Some(TrigStmt::Leave { src_off: start });
+    if find_word(&up, "LEAVE", 0) == Some(0) {
+        let rest = text.trim()["LEAVE".len()..].trim();
+        if rest.is_empty() {
+            return Some(TrigStmt::Leave { target: None, src_off: start });
+        }
+        if ident_ok(rest) {
+            return Some(TrigStmt::Leave { target: Some(rest.to_ascii_uppercase()), src_off: start });
+        }
     }
-    if find_word(&up, "CONTINUE", 0) == Some(0) && text.trim().len() == "CONTINUE".len() {
-        // bare CONTINUE only, like LEAVE
-        return Some(TrigStmt::Continue { src_off: start });
+    if find_word(&up, "CONTINUE", 0) == Some(0) {
+        let rest = text.trim()["CONTINUE".len()..].trim();
+        if rest.is_empty() {
+            return Some(TrigStmt::Continue { target: None, src_off: start });
+        }
+        if ident_ok(rest) {
+            return Some(TrigStmt::Continue { target: Some(rest.to_ascii_uppercase()), src_off: start });
+        }
     }
     if find_word(&up, "EXIT", 0) == Some(0) && text.trim().len() == "EXIT".len() {
         return Some(TrigStmt::Exit { src_off: start });
@@ -15085,7 +15121,7 @@ fn emit_trigger_stmt(
                 None => b.push(255), // no else branch
             }
         }
-        TrigStmt::While { cond, body, src_off } => {
+        TrigStmt::While { cond, body, src_off, .. } => {
             // TWO debug entries at the WHILE's position: the label and
             // the if (probed)
             let n = *next_label;
@@ -51659,12 +51695,12 @@ enum PsqlStop {
     /// a raise - user exception or runtime error - carrying the
     /// identity the client is owed
     Raise(Thrown),
-    /// `LEAVE` - not a failure at all, a jump: the innermost loop
-    /// catches it and everything else passes it up.
-    Leave,
-    /// `CONTINUE` - a jump to the innermost loop's next iteration; the
-    /// loop catches it, everything else passes it up.
-    Continue,
+    /// `LEAVE [label]` - not a failure at all, a jump: the loop it names
+    /// (None = the innermost) catches it and everything else passes it up.
+    Leave(Option<String>),
+    /// `CONTINUE [label]` - a jump to the named loop's next iteration
+    /// (None = the innermost); that loop catches it, others pass it up.
+    Continue(Option<String>),
     /// `EXIT` - the same, caught by the body itself.
     Exit,
     /// a construct the interpreter does not implement; the statement
@@ -53178,14 +53214,14 @@ fn exec_psql_stmt_inner(
                 Ok(())
             }
         }
-        TrigStmt::While { cond, body, .. } => {
+        TrigStmt::While { cond, body, label, .. } => {
             while eval_psql_cond(cond, f)? == Some(true) {
                 // LEAVE ends THIS loop and nothing further: the
                 // innermost one catches it, an EXIT passes through
                 match exec_psql_stmt(body, f, steps, db, ctx) {
                     Ok(()) => {}
-                    Err(PsqlStop::Leave) => break,
-                    Err(PsqlStop::Continue) => {}
+                    Err(PsqlStop::Leave(t)) if t.is_none() || t.as_deref() == label.as_deref() => break,
+                    Err(PsqlStop::Continue(t)) if t.is_none() || t.as_deref() == label.as_deref() => {}
                     Err(e) => return Err(e),
                 }
                 *steps += 1;
@@ -53250,7 +53286,7 @@ fn exec_psql_stmt_inner(
         // values assigned into the INTO variables. Planning it the normal
         // way means a loop sees everything a client SELECT does - views,
         // subqueries, expressions - for free.
-        TrigStmt::ForSelect { query, into, body, .. } => {
+        TrigStmt::ForSelect { query, into, body, label, .. } => {
             // put each variable's current value into the query text
             let mut q = query.clone();
             for (i, v) in f.vars.iter().enumerate().rev() {
@@ -53283,8 +53319,8 @@ fn exec_psql_stmt_inner(
                 }
                 match exec_psql_stmt(body, f, steps, db, ctx) {
                     Ok(()) => {}
-                    Err(PsqlStop::Leave) => break,
-                    Err(PsqlStop::Continue) => {}
+                    Err(PsqlStop::Leave(t)) if t.is_none() || t.as_deref() == label.as_deref() => break,
+                    Err(PsqlStop::Continue(t)) if t.is_none() || t.as_deref() == label.as_deref() => {}
                     Err(e) => return Err(e),
                 }
                 *steps += 1;
@@ -53417,8 +53453,8 @@ fn exec_psql_stmt_inner(
                 Err(_) => Err(PsqlStop::Unsupported),
             }
         }
-        TrigStmt::Leave { .. } => Err(PsqlStop::Leave),
-        TrigStmt::Continue { .. } => Err(PsqlStop::Continue),
+        TrigStmt::Leave { target, .. } => Err(PsqlStop::Leave(target.clone())),
+        TrigStmt::Continue { target, .. } => Err(PsqlStop::Continue(target.clone())),
         TrigStmt::Exit { .. } => Err(PsqlStop::Exit),
         TrigStmt::Return { expr, .. } => {
             // a FUNCTION's RETURN: output 0 takes the value, the body ends
@@ -53633,7 +53669,7 @@ fn exec_psql_stmt_inner(
         }
         // FOR EXECUTE STATEMENT: the same loop the static FOR SELECT
         // runs, over a query built at runtime - LEAVE included.
-        TrigStmt::ForExecStmt { text, into, body, .. } => {
+        TrigStmt::ForExecStmt { text, into, body, label, .. } => {
             let sql = render_dyn_text(text, f)?.unwrap_or_default();
             let rows = run_dyn_statement(&sql, db, ctx)?
                 .ok_or_else(|| psql_raise(EvalErr::OutputParamsMismatch))?;
@@ -53641,8 +53677,8 @@ fn exec_psql_stmt_inner(
                 assign_into(f, into, row)?;
                 match exec_psql_stmt(body, f, steps, db, ctx) {
                     Ok(()) => {}
-                    Err(PsqlStop::Leave) => break,
-                    Err(PsqlStop::Continue) => {}
+                    Err(PsqlStop::Leave(t)) if t.is_none() || t.as_deref() == label.as_deref() => break,
+                    Err(PsqlStop::Continue(t)) if t.is_none() || t.as_deref() == label.as_deref() => {}
                     Err(e) => return Err(e),
                 }
                 *steps += 1;
@@ -54630,13 +54666,13 @@ fn run_body_source(
         // a LEAVE that reached here was outside every loop, which the
         // engine refuses to compile; refusing to run it is the honest
         // equivalent
-        Err(PsqlStop::Leave) => {
+        Err(PsqlStop::Leave(_)) => {
             return Err(ProcErr::from(format!(
                 "procedure {}: LEAVE outside a loop",
                 name
             )))
         }
-        Err(PsqlStop::Continue) => {
+        Err(PsqlStop::Continue(_)) => {
             return Err(ProcErr::from(format!(
                 "procedure {}: CONTINUE outside a loop",
                 name
