@@ -9299,9 +9299,23 @@ pub fn create_procedure_with_id(
             .find(|c| c.name == "RDB$PROCEDURE_NAME")
             .map(|c| c.field_id as usize)
             .ok_or("no RDB$PROCEDURE_NAME column")?;
+        // the name clashes ONLY within the same namespace: a plain
+        // procedure with a plain one, a packaged member with a member of
+        // the SAME package. A packaged PKG.PP and a plain PP coexist, the
+        // way the engine namespaces them (a pre-schema ODS has no package
+        // column, so the old name-only rule stands there).
+        let pkg_f = cols.iter().find(|c| c.name == "RDB$PACKAGE_NAME").map(|c| c.field_id as usize);
+        let want_pkg = package.map(|(p, _)| p.trim().trim_matches('"').to_ascii_uppercase());
         let mut dup = false;
         walk_rows(file, page_size, prel, descs, |v| {
-            if text_eq(v.get(name_f), &want) {
+            if !text_eq(v.get(name_f), &want) {
+                return;
+            }
+            let same_ns = match &want_pkg {
+                None => pkg_f.map_or(true, |i| matches!(v.get(i), None | Some(Value::Null))),
+                Some(pk) => pkg_f.is_some_and(|i| text_eq(v.get(i), pk)),
+            };
+            if same_ns {
                 dup = true;
             }
         });
@@ -10135,9 +10149,21 @@ pub fn restore_carried_function(
             .find(|c| c.name == "RDB$FUNCTION_NAME")
             .map(|c| c.field_id as usize)
             .ok_or("no RDB$FUNCTION_NAME column")?;
+        // same namespace rule as procedures: a packaged member and a
+        // plain function of the same name coexist (the engine namespaces
+        // members by their package)
+        let pkg_f = cols.iter().find(|c| c.name == "RDB$PACKAGE_NAME").map(|c| c.field_id as usize);
+        let want_pkg = package.map(|(p, _)| p.trim().trim_matches('"').to_ascii_uppercase());
         let mut dup = false;
         walk_rows(file, page_size, frel, descs, |v| {
-            if text_eq(v.get(name_f), &want) {
+            if !text_eq(v.get(name_f), &want) {
+                return;
+            }
+            let same_ns = match &want_pkg {
+                None => pkg_f.map_or(true, |i| matches!(v.get(i), None | Some(Value::Null))),
+                Some(pk) => pkg_f.is_some_and(|i| text_eq(v.get(i), pk)),
+            };
+            if same_ns {
                 dup = true;
             }
         });

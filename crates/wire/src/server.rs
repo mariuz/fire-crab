@@ -11890,7 +11890,29 @@ fn quoted_bare(name: &str) -> String {
     format!("\"{}\"", name.trim_matches('"').trim_end().to_ascii_uppercase())
 }
 fn quoted_qualified(name: &str) -> String {
+    // A plain object/relation/routine name is ONE identifier under the
+    // PUBLIC schema - taken whole, so a name that itself contains a dot
+    // (a quoted `"A.B"`) still renders as one part '"PUBLIC"."A.B"', the
+    // way the engine does. Packaged ROUTINE names, which arrive as a
+    // dotted `PKG.MEMBER` spelling, use quoted_qualified_pkg instead.
     format!("\"PUBLIC\".\"{}\"", name.trim_matches('"').trim_end().to_ascii_uppercase())
+}
+
+/// A packaged routine name rendered the engine's way, part by part:
+/// `PKG.PP` -> '"PUBLIC"."PKG"."PP"', `SCHEMA.PKG.PP` -> as spelled, and
+/// a bare name -> '"PUBLIC"."PP"' (identical to quoted_qualified). Used
+/// only where the name is a dotted routine spelling from a call, never a
+/// raw catalog object name.
+fn quoted_qualified_pkg(name: &str) -> String {
+    let parts: Vec<String> = name
+        .split('.')
+        .map(|p| p.trim_matches('"').trim_end().to_ascii_uppercase())
+        .collect();
+    match parts.as_slice() {
+        [n] => format!("\"PUBLIC\".\"{}\"", n),
+        [pk, n] => format!("\"PUBLIC\".\"{}\".\"{}\"", pk, n),
+        _ => parts.iter().map(|p| format!("\"{}\"", p)).collect::<Vec<_>>().join("."),
+    }
 }
 
 /// The 1-BASED line and column of a byte offset in a body's source -
@@ -28042,17 +28064,37 @@ fn plan_query(sql: &str, db: &Option<Database>) -> (Plan, Vec<Descriptor>) {
 /// an unqualified one always has (load_procedure decides).
 fn split_proc_call(table_s: &str) -> Option<(String, Option<String>)> {
     let t = table_s.trim();
-    match t.find('(') {
-        None => {
-            let n = public_object_name(t)?;
-            Some((n, None))
-        }
+    let (head, args) = match t.find('(') {
+        None => (t, None),
         Some(at) => {
-            let name = public_object_name(t[..at].trim())?;
             let rest = t[at + 1..].trim();
             let inner = rest.strip_suffix(')')?;
-            Some((name, Some(inner.trim().to_string())))
+            (t[..at].trim(), Some(inner.trim().to_string()))
         }
+    };
+    let name = proc_call_name(head)?;
+    Some((name, args))
+}
+
+/// Resolve a FROM/procedure-call spelling to the name load_procedure
+/// understands: a bare or `PUBLIC.`-qualified routine reduces to its
+/// bare name (the plain PUBLIC rule this always had); a non-PUBLIC
+/// two-part `PKG.MEMBER` is a PACKAGED call, kept dotted; three parts
+/// `SCHEMA.PKG.MEMBER` likewise. A foreign qualifier still resolves to
+/// nothing - the caller re-checks with load_procedure, so a name no
+/// package holds falls through to the relation handling as before.
+fn proc_call_name(head: &str) -> Option<String> {
+    let (parts, span) = split_name_parts(head, 3)?;
+    if !head[span..].trim().is_empty() {
+        return None; // trailing tokens - not a bare call spelling
+    }
+    let up = |p: &NamePart| if p.1 { p.0.to_string() } else { p.0.to_ascii_uppercase() };
+    match parts.as_slice() {
+        [n] => Some(up(n)),
+        [q, n] if up(q) == "PUBLIC" => Some(up(n)),
+        [q, n] => Some(format!("{}.{}", up(q), up(n))),
+        [sc, q, n] => Some(format!("{}.{}.{}", up(sc), up(q), up(n))),
+        _ => None,
     }
 }
 
@@ -31049,7 +31091,7 @@ fn plan_query_inner_ctx(
                     if meta.outs.is_empty() {
                         return Some(match text_line_col(sql, table_s) {
                             Some((line, col)) => Plan::RefusedEval(EvalErr::ProcNoOutputs {
-                                procedure: quoted_qualified(&pname),
+                                procedure: quoted_qualified_pkg(&pname),
                                 line,
                                 col,
                             }),
@@ -31066,7 +31108,7 @@ fn plan_query_inner_ctx(
                     // PSELP` with one declared input answer this, for
                     // selectable and non-selectable procedures alike)
                     if args.len() != meta.ins.len() {
-                        return Some(Plan::RefusedEval(EvalErr::ProcArgMismatch(quoted_qualified(
+                        return Some(Plan::RefusedEval(EvalErr::ProcArgMismatch(quoted_qualified_pkg(
                             &pname,
                         ))));
                     }
@@ -31132,7 +31174,7 @@ fn plan_query_inner_ctx(
                     // catalog_row_public tolerates them.
                     if meta.prc_type == Some(2) {
                         return Some(Plan::RefusedEval(EvalErr::NotSelectable {
-                            procedure: quoted_qualified(&pname),
+                            procedure: quoted_qualified_pkg(&pname),
                             offset: proc_blr_offset(&pname, picks.len(), &args),
                         }));
                     }
@@ -37087,7 +37129,14 @@ fn eval_status_items(w: &mut W, e: &EvalErr) {
                 .int(335544867);
         }
         EvalErr::FunctionUnknown(name) => {
-            // isc_dsql_error, sqlerr -804, isc_dsql_function_err, isc_random '"NAME"'
+            // isc_dsql_error, sqlerr -804, isc_dsql_function_err, isc_random
+            // '"NAME"' - a packaged/qualified name is quoted PART BY PART
+            // (`PKG.NOPE` -> '"PKG"."NOPE"'), the way the engine renders it
+            let disp = name
+                .split('.')
+                .map(|p| format!("\"{}\"", p))
+                .collect::<Vec<_>>()
+                .join(".");
             w.int(1)
                 .int(GDS_DSQL_ERROR)
                 .int(1)
@@ -37099,12 +37148,22 @@ fn eval_status_items(w: &mut W, e: &EvalErr) {
                 .int(1)
                 .int(335544382)
                 .int(2)
-                .bytes(format!("\"{}\"", name).as_bytes());
+                .bytes(disp.as_bytes());
         }
         EvalErr::FnArity { name, missing } => {
             // isc_fun_param_mismatch '"PUBLIC"."F"', then isc_wronumarg
-            // (too many) or the missing argument's name (probed)
-            w.int(1).int(335545101).int(2).bytes(format!("\"PUBLIC\".\"{}\"", name).as_bytes());
+            // (too many) or the missing argument's name (probed). A
+            // packaged name is fully qualified: `PKG.FF` -> the engine's
+            // '"PUBLIC"."PKG"."FF"' (schema, package, member).
+            let disp = {
+                let parts: Vec<&str> = name.split('.').collect();
+                match parts.as_slice() {
+                    [n] => format!("\"PUBLIC\".\"{}\"", n),
+                    [pk, n] => format!("\"PUBLIC\".\"{}\".\"{}\"", pk, n),
+                    _ => parts.iter().map(|p| format!("\"{}\"", p)).collect::<Vec<_>>().join("."),
+                }
+            };
+            w.int(1).int(335545101).int(2).bytes(disp.as_bytes());
             match missing {
                 None => {
                     w.int(1).int(335544380);
@@ -41507,9 +41566,20 @@ fn expr_atom(b: &[char], pos: &mut usize) -> Option<RawExpr> {
                 if !quoted && !word.is_empty() {
                     let mut p2 = *pos;
                     skip_ws(b, &mut p2);
-                    if b.get(p2) == Some(&'(') && !engine_builtin_word(&word.to_ascii_uppercase()) {
+                    let up = word.to_ascii_uppercase();
+                    // A DOTTED name followed by `(` that USER_FNS does not
+                    // hold is a packaged/qualified function the catalog
+                    // lacks: the engine's -804 "Function unknown" with the
+                    // name quoted part by part (`PKG.NOPE` ->
+                    // '"PKG"."NOPE"'). Its own SYSTEM packages and RDB$
+                    // built-ins are handled before this branch, so they
+                    // never reach here as an unknown.
+                    let dotted_unknown = up.contains('.')
+                        && !up.starts_with("RDB$")
+                        && !up.starts_with("SYSTEM.");
+                    if b.get(p2) == Some(&'(') && (dotted_unknown || !engine_builtin_word(&up)) {
                         PREPARE_REFUSAL.with(|r| {
-                            r.borrow_mut().get_or_insert(EvalErr::FunctionUnknown(word.to_ascii_uppercase()));
+                            r.borrow_mut().get_or_insert(EvalErr::FunctionUnknown(up));
                         });
                     }
                 }
@@ -53828,25 +53898,49 @@ fn user_function_sigs(db: &Database) -> std::collections::HashMap<String, (Descr
     let Some((fcols, fdescs)) = sys_rel(db, "RDB$FUNCTIONS") else { return out };
     let ffid = |n: &str| fcols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
     let Some(name_f) = ffid("RDB$FUNCTION_NAME") else { return out };
-    let (pkg_f, sys_f) = (ffid("RDB$PACKAGE_NAME"), ffid("RDB$SYSTEM_FLAG"));
+    let (pkg_f, sys_f, schema_f) = (ffid("RDB$PACKAGE_NAME"), ffid("RDB$SYSTEM_FLAG"), ffid("RDB$SCHEMA_NAME"));
     let ffmts = vec![(0u8, fdescs)];
-    let mut names: Vec<String> = Vec::new();
+    // (lookup key, schema-or-PUBLIC, package-or-None, member name); a
+    // packaged function is registered under BOTH `PKG.FF` (the search
+    // path spelling) and `SCHEMA.PKG.FF` (fully qualified), each mapping
+    // to the same signature - and load_function resolves either.
+    let mut keys: Vec<(String, String)> = Vec::new();
     for_each_record(db, 14, &ffmts, usize::MAX, |v| {
-        if matches!(pkg_f.and_then(|i| v.get(i)), Some(Value::Text(_))) {
-            return;
-        }
         if matches!(sys_f.and_then(|i| v.get(i)), Some(Value::Int(n)) if *n != 0) {
             return;
         }
-        if let Some(Value::Text(t)) = v.get(name_f) {
-            names.push(t.trim_end().to_ascii_uppercase());
+        let Some(Value::Text(t)) = v.get(name_f) else { return };
+        let member = t.trim_end().to_ascii_uppercase();
+        let sc = match schema_f.and_then(|i| v.get(i)) {
+            Some(Value::Text(s)) => s.trim_end().to_ascii_uppercase(),
+            _ => "PUBLIC".to_string(),
+        };
+        match pkg_f.and_then(|i| v.get(i)) {
+            Some(Value::Text(pk)) => {
+                let pk = pk.trim_end().to_ascii_uppercase();
+                // PKG.FF is the search-path spelling (load_function keys
+                // want_schema=None off PUBLIC/SYSTEM); SC.PKG.FF is fully
+                // qualified and MUST carry the 3-part load name so its own
+                // resolution constrains the schema (a 2-part load name
+                // would miss a non-PUBLIC schema and drop the key).
+                keys.push((format!("{}.{}", pk, member), format!("{}.{}", pk, member)));
+                keys.push((format!("{}.{}.{}", sc, pk, member), format!("{}.{}.{}", sc, pk, member)));
+            }
+            // a plain function answers to its bare name AND to its schema-
+            // qualified spelling (`PUBLIC.FN`), the way the FROM/procedure
+            // path reduces a `PUBLIC.`-qualified name - both load the bare
+            // function.
+            _ => {
+                keys.push((member.clone(), member.clone()));
+                keys.push((format!("{}.{}", sc, member), member.clone()));
+            }
         }
     });
-    for n in names {
-        if let Some(meta) = load_function(db, &n) {
+    for (key, load_name) in keys {
+        if let Some(meta) = load_function(db, &load_name) {
             if let Some(r) = meta.outs.first() {
                 let names = meta.ins.iter().map(|p| p.name.clone()).collect();
-                out.insert(n, (r.desc.clone(), names));
+                out.insert(key, (r.desc.clone(), names));
             }
         }
     }
@@ -53906,26 +54000,66 @@ fn materialise_user_fn_rows(
 
 fn load_function(db: &Database, name: &str) -> Option<ProcMeta> {
     use fire_crab_ods::format::Value;
+
+    // A DOTTED spelling names a PACKAGED function, exactly as it does for
+    // a procedure (see load_procedure): `PKG.MEMBER` finds package PKG
+    // down the search path (PUBLIC, then SYSTEM); `SCHEMA.PKG.MEMBER`
+    // constrains the schema; a bare name is the plain PUBLIC function.
+    // The dotted key is what USER_FNS stores, so the resolver, the BLR
+    // probe and the runtime all resolve the same member.
+    let parts: Vec<&str> = name.split('.').collect();
+    let (want_schema, want_pkg, name): (Option<&str>, Option<&str>, &str) =
+        match parts.as_slice() {
+            [n] => (None, None, *n),
+            // `PUBLIC.FN` is a PLAIN function in the PUBLIC schema, not a
+            // member of a package called PUBLIC (PUBLIC is a reserved
+            // schema, never a package) - the FROM/procedure path reduces
+            // the same spelling to a bare name.
+            [p, n] if p.eq_ignore_ascii_case("PUBLIC") => (None, None, *n),
+            [p, n] => (None, Some(*p), *n),
+            [sc, p, n] => (Some(*sc), Some(*p), *n),
+            _ => return None,
+        };
+    let row_visible = |v: &[Value], schema_f: Option<usize>, pkg_f: Option<usize>| -> bool {
+        match want_pkg {
+            None => catalog_row_public(v, schema_f, pkg_f),
+            Some(pk) => {
+                let pkg_ok = matches!(pkg_f.and_then(|i| v.get(i)),
+                    Some(Value::Text(t)) if t.trim_end().eq_ignore_ascii_case(pk));
+                let schema_ok = match schema_f.and_then(|i| v.get(i)) {
+                    Some(Value::Text(t)) => {
+                        let t = t.trim_end();
+                        match want_schema {
+                            Some(sc) => t.eq_ignore_ascii_case(sc),
+                            None => t == "PUBLIC" || t == "SYSTEM",
+                        }
+                    }
+                    _ => false,
+                };
+                pkg_ok && schema_ok
+            }
+        }
+    };
+
     let (fcols, fdescs) = sys_rel(db, "RDB$FUNCTIONS")?;
     let ffid = |n: &str| fcols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
     let (name_f, src_f) = (ffid("RDB$FUNCTION_NAME")?, ffid("RDB$FUNCTION_SOURCE")?);
-    let (pkg_f, sys_f, dbg_f) = (ffid("RDB$PACKAGE_NAME"), ffid("RDB$SYSTEM_FLAG"), ffid("RDB$DEBUG_INFO"));
+    let dbg_f = ffid("RDB$DEBUG_INFO");
+    let (schema_f, pkg_f) = (ffid("RDB$SCHEMA_NAME"), ffid("RDB$PACKAGE_NAME"));
     let ffmts = vec![(0u8, fdescs)];
     let mut source: Option<String> = None;
     let mut body_at: Option<(usize, usize)> = None;
     let mut found = false;
+    let mut found_schema: Option<String> = None;
     for_each_record(db, 14, &ffmts, usize::MAX, |v| {
         let hit = matches!(v.get(name_f), Some(Value::Text(t)) if t.trim_end().eq_ignore_ascii_case(name));
-        if !hit || found {
-            return;
-        }
-        if matches!(pkg_f.and_then(|i| v.get(i)), Some(Value::Text(_))) {
-            return;
-        }
-        if matches!(sys_f.and_then(|i| v.get(i)), Some(Value::Int(n)) if *n != 0) {
+        if !hit || found || !row_visible(v, schema_f, pkg_f) {
             return;
         }
         found = true;
+        if let Some(Value::Text(t)) = schema_f.and_then(|i| v.get(i)) {
+            found_schema = Some(t.trim_end().to_string());
+        }
         if let Some(Value::Blob(r, n)) = v.get(src_f) {
             if let Some(bytes) = fire_crab_blb::read_blob_content(&db.bytes(), db.page_size, *r, *n) {
                 source = Some(String::from_utf8_lossy(&bytes).into_owned());
@@ -53940,17 +54074,29 @@ fn load_function(db: &Database, name: &str) -> Option<ProcMeta> {
     if !found {
         return None;
     }
-    let source = source?;
+    // a PACKAGED function's text lives ONLY in the package BODY source -
+    // its own row carries a NULL blob (the same law as procedures)
+    let source = match source {
+        Some(sr) => sr,
+        None => match want_pkg {
+            Some(pk) => {
+                let schema = found_schema.as_deref().unwrap_or("PUBLIC");
+                let body = package_body_source(db, schema, pk)?;
+                package_member_source(&body, name)?
+            }
+            None => return None,
+        },
+    };
     let (acols, adescs) = sys_rel(db, "RDB$FUNCTION_ARGUMENTS")?;
     let afid = |n: &str| acols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
     let (an_f, pos_f, fs_f) = (afid("RDB$FUNCTION_NAME")?, afid("RDB$ARGUMENT_POSITION")?, afid("RDB$FIELD_SOURCE")?);
     let aname_f = afid("RDB$ARGUMENT_NAME");
-    let apkg_f = afid("RDB$PACKAGE_NAME");
+    let (aschema_f, apkg_f) = (afid("RDB$SCHEMA_NAME"), afid("RDB$PACKAGE_NAME"));
     let afmts = vec![(0u8, adescs)];
     let mut raw: Vec<(i64, String, String)> = Vec::new();
     for_each_record(db, 15, &afmts, usize::MAX, |v| {
         let hit = matches!(v.get(an_f), Some(Value::Text(t)) if t.trim_end().eq_ignore_ascii_case(name));
-        if !hit || matches!(apkg_f.and_then(|i| v.get(i)), Some(Value::Text(_))) {
+        if !hit || !row_visible(v, aschema_f, apkg_f) {
             return;
         }
         if let (Some(Value::Int(pos)), Some(Value::Text(fs))) = (v.get(pos_f), v.get(fs_f)) {
@@ -54177,7 +54323,7 @@ fn run_body_source(
                     } else {
                         format!(
                             "At procedure {} line: {}, col: {}",
-                            quoted_qualified(name),
+                            quoted_qualified_pkg(name),
                             line,
                             col
                         )
@@ -68449,8 +68595,12 @@ mod tests {
             split_proc_call("PUBLIC.ONEROW"),
             Some(("ONEROW".to_string(), None))
         );
-        // a foreign qualifier is not a callable this catalog holds
-        assert_eq!(split_proc_call("NOSCHEMA.PSEL(5)"), None);
+        // a non-PUBLIC two-part qualifier is a PACKAGED spelling now,
+        // kept dotted; whether it resolves is load_procedure's call
+        assert_eq!(
+            split_proc_call("NOSCHEMA.PSEL(5)"),
+            Some(("NOSCHEMA.PSEL".to_string(), Some("5".to_string())))
+        );
         // a derived table is not a call
         assert_eq!(split_proc_call("(SELECT 1 FROM RDB$DATABASE) X"), None);
     }
