@@ -1591,6 +1591,40 @@ fn respond_ddl_meta(
     // "DROP TABLE @1 failed" wrapper the engine adds isc_dsql_command_err
     // (-607, "Invalid command") and a "-Table @1 does not exist" string
     // - four items, not the three the others carry.
+    if let Plan::CreateMapping(m) | Plan::AlterMapping(m) = plan {
+        if lc.contains("already exists") {
+            let mut w = W::default();
+            w.int(OP_RESPONSE).int(0).int(0).int(0).int(0);
+            w.int(1).int(GDS_NO_META_UPDATE)
+                .int(1).int(336397322).int(2).bytes(m.name.as_bytes()).int(2).bytes(b"CREATE") // MAPPING @1 failed, @2
+                .int(1).int(335545079).int(2).bytes(m.name.as_bytes()) // Map @1 already exists
+                .int(0);
+            w.send(s, enc)?;
+            return Ok(true);
+        }
+        if lc.contains("not found") {
+            let mut w = W::default();
+            w.int(OP_RESPONSE).int(0).int(0).int(0).int(0);
+            w.int(1).int(GDS_NO_META_UPDATE)
+                .int(1).int(336397322).int(2).bytes(m.name.as_bytes()).int(2).bytes(b"ALTER")
+                .int(1).int(335545080).int(2).bytes(m.name.as_bytes()) // Map @1 not found
+                .int(0);
+            w.send(s, enc)?;
+            return Ok(true);
+        }
+    }
+    if let Plan::DropMapping { name } = plan {
+        if lc.contains("not found") {
+            let mut w = W::default();
+            w.int(OP_RESPONSE).int(0).int(0).int(0).int(0);
+            w.int(1).int(GDS_NO_META_UPDATE)
+                .int(1).int(336397322).int(2).bytes(name.as_bytes()).int(2).bytes(b"DROP")
+                .int(1).int(335545080).int(2).bytes(name.as_bytes())
+                .int(0);
+            w.send(s, enc)?;
+            return Ok(true);
+        }
+    }
     if lc.contains("cannot delete primary key") {
         // DROP TABLE whose PRIMARY KEY / UNIQUE is referenced by a FOREIGN
         // KEY in another table: "unsuccessful metadata update / DROP TABLE @1
@@ -7243,6 +7277,10 @@ enum Plan {
         contexts: Vec<fire_crab_ods::ddl::RestoredViewContext>,
     },
     DropView { name: String },
+    /// `CREATE`/`ALTER MAPPING` - a local (database) name mapping row.
+    CreateMapping(MappingSpec),
+    AlterMapping(MappingSpec),
+    DropMapping { name: String },
     /// `ALTER VIEW <name> AS <select>` - the view's definition is replaced
     /// but its relation id survives (the ods alter_view reuses it).
     AlterView {
@@ -16662,6 +16700,107 @@ fn plan_declare_filter(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
 /// a SELECT it cannot compile refuses the statement (no guessing - the
 /// engine runs that BLR when it reads this file). `WITH CHECK OPTION`
 /// is outside this slice.
+/// The pieces of a `CREATE`/`ALTER MAPPING` this server writes to
+/// RDB$AUTH_MAPPING (a local mapping; GLOBAL is refused).
+#[derive(Clone, Debug)]
+struct MappingSpec {
+    name: String,
+    using_: String,
+    plugin: Option<String>,
+    db: Option<String>,
+    from_type: String,
+    from: String,
+    to_type: i16,
+    to: Option<String>,
+}
+
+/// `<name> USING PLUGIN <p> [IN <db>] FROM (ANY <t> | <t> <n>) TO <t> [<n>]`
+fn parse_mapping_spec(rest: &str) -> Option<MappingSpec> {
+    let toks: Vec<&str> = rest.split_whitespace().collect();
+    if toks.len() < 6 {
+        return None;
+    }
+    let name = unquote_ident(toks[0])?;
+    let mut i = 1;
+    if !toks[i].eq_ignore_ascii_case("USING") {
+        return None;
+    }
+    i += 1;
+    // only USING PLUGIN <plugin> here; ANY PLUGIN / MAPPING / '*' refuse
+    if !toks.get(i)?.eq_ignore_ascii_case("PLUGIN") {
+        return None;
+    }
+    i += 1;
+    let plugin = Some(unquote_ident(toks.get(i)?)?);
+    i += 1;
+    let mut mdb = None;
+    if toks.get(i).is_some_and(|t| t.eq_ignore_ascii_case("IN")) {
+        mdb = Some(unquote_ident(toks.get(i + 1)?)?);
+        i += 2;
+    }
+    if !toks.get(i)?.eq_ignore_ascii_case("FROM") {
+        return None;
+    }
+    i += 1;
+    let (from_type, from) = if toks.get(i)?.eq_ignore_ascii_case("ANY") {
+        let t = toks.get(i + 1)?.to_ascii_uppercase();
+        i += 2;
+        (t, "*".to_string())
+    } else {
+        let t = toks.get(i)?.to_ascii_uppercase();
+        let n = unquote_ident(toks.get(i + 1)?)?;
+        i += 2;
+        (t, n)
+    };
+    if !matches!(from_type.as_str(), "USER" | "ROLE" | "GROUP") {
+        return None;
+    }
+    if !toks.get(i)?.eq_ignore_ascii_case("TO") {
+        return None;
+    }
+    i += 1;
+    let to_type = match toks.get(i)?.to_ascii_uppercase().as_str() {
+        "USER" => 0i16,
+        "ROLE" => 1,
+        _ => return None,
+    };
+    i += 1;
+    let to = match toks.get(i) {
+        Some(t) => Some(unquote_ident(t)?),
+        None => None,
+    };
+    Some(MappingSpec { name, using_: "P".into(), plugin, db: mdb, from_type, from, to_type, to })
+}
+
+/// `CREATE`/`ALTER [GLOBAL] MAPPING ...`. GLOBAL lives in the security
+/// database and is refused (kept generic).
+fn plan_mapping(sql: &str, alter: bool) -> Option<(Plan, Vec<Descriptor>)> {
+    let up = sql.trim_start().to_ascii_uppercase();
+    let verb = if alter { "ALTER" } else { "CREATE" };
+    if find_word(&up, verb, 0) != Some(0) {
+        return None;
+    }
+    let mk = find_word(&up, "MAPPING", verb.len())?;
+    let between = up[verb.len()..mk].trim();
+    if between == "GLOBAL" {
+        return None; // security-database, not this catalog
+    }
+    if !between.is_empty() {
+        return None;
+    }
+    let rest = sql.trim_start()[mk + "MAPPING".len()..].trim();
+    let spec = parse_mapping_spec(rest)?;
+    Some((if alter { Plan::AlterMapping(spec) } else { Plan::CreateMapping(spec) }, Vec::new()))
+}
+
+fn plan_drop_mapping(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
+    let toks: Vec<&str> = sql.split_whitespace().collect();
+    if toks.len() != 3 || !toks[0].eq_ignore_ascii_case("DROP") || !toks[1].eq_ignore_ascii_case("MAPPING") {
+        return None;
+    }
+    Some((Plan::DropMapping { name: unquote_ident(toks[2])? }, Vec::new()))
+}
+
 fn plan_create_view(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor>)> {
     let s = sql.trim().trim_end_matches(';').trim();
     let up = s.to_ascii_uppercase();
@@ -22643,6 +22782,22 @@ fn execute_dml_collecting_inner(
         }
         Plan::CreateView { name, blr, source, fields, contexts } => {
             fire_crab_ods::ddl::create_view(&mut work, db.page_size, name, blr, source, fields, contexts)?;
+            (0, 0, 0)
+        }
+        Plan::CreateMapping(m) | Plan::AlterMapping(m) => {
+            let f = if matches!(plan, Plan::AlterMapping(_)) {
+                fire_crab_ods::ddl::alter_mapping
+            } else {
+                fire_crab_ods::ddl::create_mapping
+            };
+            f(
+                &mut work, db.page_size, &m.name, &m.using_, m.plugin.as_deref(),
+                m.db.as_deref(), &m.from_type, &m.from, m.to_type as i64, m.to.as_deref(),
+            )?;
+            (0, 0, 0)
+        }
+        Plan::DropMapping { name } => {
+            fire_crab_ods::ddl::drop_mapping(&mut work, db.page_size, name)?;
             (0, 0, 0)
         }
         Plan::AlterView { name, blr, source, fields, contexts } => {
@@ -35597,7 +35752,7 @@ fn describe_for(plan: &Plan, params: &[Descriptor], att: AttCs) -> Vec<u8> {
         | Plan::DropIndex { .. }
         | Plan::CreateSequence { .. } | Plan::DropSequence { .. }
         | Plan::CreateException { .. } | Plan::CreateProcedure { .. } | Plan::DropProcedure { .. } | Plan::DropException { .. }
-        | Plan::DeclareFilter { .. } | Plan::DropFilter { .. } | Plan::CreateView { .. } | Plan::DropView { .. } | Plan::Recreate(_) | Plan::AlterView { .. }
+        | Plan::DeclareFilter { .. } | Plan::DropFilter { .. } | Plan::CreateView { .. } | Plan::DropView { .. } | Plan::Recreate(_) | Plan::AlterView { .. } | Plan::CreateMapping(_) | Plan::AlterMapping(_) | Plan::DropMapping { .. }
         | Plan::AlterTrigger { .. } | Plan::DropTrigger { .. } | Plan::CreateOrAlterTrigger { .. } | Plan::AlterProcedure { .. } | Plan::CreateOrAlterProcedure { .. }
         | Plan::CreateFunction { .. } | Plan::DropFunction { .. }
         | Plan::AlterException { .. } | Plan::CreateOrAlterException { .. }
@@ -35705,7 +35860,7 @@ fn stmt_type_of(plan: &Plan) -> i32 {
         | Plan::DropIndex { .. }
         | Plan::CreateSequence { .. } | Plan::DropSequence { .. }
         | Plan::CreateException { .. } | Plan::CreateProcedure { .. } | Plan::DropProcedure { .. } | Plan::DropException { .. }
-        | Plan::DeclareFilter { .. } | Plan::DropFilter { .. } | Plan::CreateView { .. } | Plan::DropView { .. } | Plan::Recreate(_) | Plan::AlterView { .. }
+        | Plan::DeclareFilter { .. } | Plan::DropFilter { .. } | Plan::CreateView { .. } | Plan::DropView { .. } | Plan::Recreate(_) | Plan::AlterView { .. } | Plan::CreateMapping(_) | Plan::AlterMapping(_) | Plan::DropMapping { .. }
         | Plan::AlterTrigger { .. } | Plan::DropTrigger { .. } | Plan::CreateOrAlterTrigger { .. } | Plan::AlterProcedure { .. } | Plan::CreateOrAlterProcedure { .. }
         | Plan::CreateFunction { .. } | Plan::DropFunction { .. }
         | Plan::AlterException { .. } | Plan::CreateOrAlterException { .. }
@@ -37168,7 +37323,7 @@ fn emit_rows_inner(
         | Plan::DropIndex { .. }
         | Plan::CreateSequence { .. } | Plan::DropSequence { .. }
         | Plan::CreateException { .. } | Plan::CreateProcedure { .. } | Plan::DropProcedure { .. } | Plan::DropException { .. }
-        | Plan::DeclareFilter { .. } | Plan::DropFilter { .. } | Plan::CreateView { .. } | Plan::DropView { .. } | Plan::Recreate(_) | Plan::AlterView { .. }
+        | Plan::DeclareFilter { .. } | Plan::DropFilter { .. } | Plan::CreateView { .. } | Plan::DropView { .. } | Plan::Recreate(_) | Plan::AlterView { .. } | Plan::CreateMapping(_) | Plan::AlterMapping(_) | Plan::DropMapping { .. }
         | Plan::AlterTrigger { .. } | Plan::DropTrigger { .. } | Plan::CreateOrAlterTrigger { .. } | Plan::AlterProcedure { .. } | Plan::CreateOrAlterProcedure { .. }
         | Plan::CreateFunction { .. } | Plan::DropFunction { .. }
         | Plan::AlterException { .. } | Plan::CreateOrAlterException { .. }
@@ -50960,6 +51115,9 @@ fn plan_immediate(text: &str, database: &Option<Database>) -> Option<(Plan, Vec<
                     .or_else(|| plan_create_exception(text))
                     .or_else(|| plan_declare_filter(text))
                     .or_else(|| plan_drop_filter(text))
+                    .or_else(|| plan_mapping(text, false))
+                    .or_else(|| plan_mapping(text, true))
+                    .or_else(|| plan_drop_mapping(text))
                     .or_else(|| plan_create_view(text, database))
                     .or_else(|| plan_alter_view(text, database))
                     .or_else(|| plan_drop_view(text))
@@ -56645,6 +56803,9 @@ fn after_auth(
                         .or_else(|| plan_create_exception(&stmt_sql))
                         .or_else(|| plan_declare_filter(&stmt_sql))
                         .or_else(|| plan_drop_filter(&stmt_sql))
+                        .or_else(|| plan_mapping(&stmt_sql, false))
+                        .or_else(|| plan_mapping(&stmt_sql, true))
+                        .or_else(|| plan_drop_mapping(&stmt_sql))
                         .or_else(|| plan_create_view(&stmt_sql, &database))
                         .or_else(|| plan_alter_view(&stmt_sql, &database))
                         .or_else(|| plan_drop_view(&stmt_sql))
@@ -56941,7 +57102,7 @@ fn after_auth(
                         | Plan::CreateSequence { .. }
                         | Plan::DropSequence { .. }
                         | Plan::CreateException { .. }
-                        | Plan::DeclareFilter { .. } | Plan::DropFilter { .. } | Plan::CreateView { .. } | Plan::DropView { .. } | Plan::Recreate(_) | Plan::AlterView { .. }
+                        | Plan::DeclareFilter { .. } | Plan::DropFilter { .. } | Plan::CreateView { .. } | Plan::DropView { .. } | Plan::Recreate(_) | Plan::AlterView { .. } | Plan::CreateMapping(_) | Plan::AlterMapping(_) | Plan::DropMapping { .. }
         | Plan::AlterTrigger { .. } | Plan::DropTrigger { .. } | Plan::CreateOrAlterTrigger { .. } | Plan::AlterProcedure { .. } | Plan::CreateOrAlterProcedure { .. }
         | Plan::CreateFunction { .. } | Plan::DropFunction { .. }
                         | Plan::CreateProcedure { .. }

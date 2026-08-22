@@ -9760,6 +9760,79 @@ pub fn restore_carried_mapping(
     advance_oldest_transactions(file, page_size)
 }
 
+/// Is there a RDB$AUTH_MAPPING row of this name?
+fn mapping_exists(file: &crate::Image, page_size: usize, name: &str) -> bool {
+    let Some(rel) = crate::resolve_relation(file, page_size, "RDB$AUTH_MAPPING") else { return false };
+    let Some(fmts) = system_relation_formats(file, page_size, "RDB$AUTH_MAPPING") else { return false };
+    let Some((_, descs)) = fmts.iter().max_by_key(|(n, _)| *n) else { return false };
+    let Ok(nf) = sys_fid(file, page_size, "RDB$AUTH_MAPPING", "RDB$MAP_NAME") else { return false };
+    let mut found = false;
+    walk_rows(file, page_size, rel, descs, |v| {
+        if text_eq(v.get(nf), name) {
+            found = true;
+        }
+    });
+    found
+}
+
+/// `CREATE MAPPING` - a local (database) name mapping: the RDB$AUTH_MAPPING
+/// row, the same one gbak restores ([restore_carried_mapping]). A GLOBAL
+/// mapping lives in the security database and is refused upstream.
+#[allow(clippy::too_many_arguments)]
+pub fn create_mapping(
+    file: &mut crate::Image,
+    page_size: usize,
+    name: &str,
+    using_: &str,
+    plugin: Option<&str>,
+    db: Option<&str>,
+    from_type: &str,
+    from: &str,
+    to_type: i64,
+    to: Option<&str>,
+) -> Result<(), String> {
+    if mapping_exists(file, page_size, name) {
+        return Err(format!("mapping {} already exists", name));
+    }
+    restore_carried_mapping(file, page_size, name, using_, plugin, db, from_type, from, to_type, to)
+}
+
+/// `DROP MAPPING` - remove the RDB$AUTH_MAPPING row.
+pub fn drop_mapping(file: &mut crate::Image, page_size: usize, name: &str) -> Result<(), String> {
+    if !mapping_exists(file, page_size, name) {
+        return Err(format!("mapping {} not found", name));
+    }
+    let nf = sys_fid(file, page_size, "RDB$AUTH_MAPPING", "RDB$MAP_NAME")?;
+    let want = name.to_string();
+    delete_catalog_rows(file, page_size, "RDB$AUTH_MAPPING", move |v| text_eq(v.get(nf), &want))?;
+    advance_oldest_transactions(file, page_size)
+}
+
+/// `ALTER MAPPING` - replace the row in place (delete then re-insert).
+#[allow(clippy::too_many_arguments)]
+pub fn alter_mapping(
+    file: &mut crate::Image,
+    page_size: usize,
+    name: &str,
+    using_: &str,
+    plugin: Option<&str>,
+    db: Option<&str>,
+    from_type: &str,
+    from: &str,
+    to_type: i64,
+    to: Option<&str>,
+) -> Result<(), String> {
+    if !mapping_exists(file, page_size, name) {
+        return Err(format!("mapping {} not found", name));
+    }
+    let nf = sys_fid(file, page_size, "RDB$AUTH_MAPPING", "RDB$MAP_NAME")?;
+    {
+        let want = name.to_string();
+        delete_catalog_rows(file, page_size, "RDB$AUTH_MAPPING", move |v| text_eq(v.get(nf), &want))?;
+    }
+    restore_carried_mapping(file, page_size, name, using_, plugin, db, from_type, from, to_type, to)
+}
+
 /// A relation's `RDB$EXTERNAL_FILE` path, if it is an EXTERNAL table.
 pub fn relation_external_file(
     file: &crate::Image,
