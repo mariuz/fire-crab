@@ -3138,6 +3138,13 @@ pub fn procedure_blr(file: &fire_crab_ods::Image, page_size: usize, name: &str) 
     };
     let name_f = fid("RDB$PROCEDURE_NAME").ok_or("no RDB$PROCEDURE_NAME column")?;
     let blr_f = fid("RDB$PROCEDURE_BLR").ok_or("no RDB$PROCEDURE_BLR column")?;
+    // This fast path serves a PLAIN procedure only: a packaged member's
+    // stored name is the bare member (RDB$PACKAGE_NAME set), so a dotted
+    // `PKG.PP` never matched here and packaged procedures fall to the
+    // source interpreter as before. Skipping a package-tagged row is
+    // what keeps a bare `PP` from grabbing a same-named packaged member's
+    // BLR when both exist (they would otherwise collide by name).
+    let pkg_f = fid("RDB$PACKAGE_NAME");
     for dp_no in relation_data_pages(file, page_size, rel) {
         let Some(dp) = fire_crab_ods::page_at(file, page_size, dp_no).and_then(DataPage::decode)
         else {
@@ -3153,6 +3160,10 @@ pub fn procedure_blr(file: &fire_crab_ods::Image, page_size: usize, name: &str) 
                 continue;
             };
             if t.trim_end() != name {
+                continue;
+            }
+            // a package-tagged row is a member, not this plain procedure
+            if matches!(pkg_f.and_then(|i| values.get(i)), Some(Value::Text(_))) {
                 continue;
             }
             return match values.get(blr_f) {

@@ -18,20 +18,15 @@
 #
 # A plain routine and a packaged member may share a short name - the
 # engine namespaces them by package, and so does fc: a plain FUNCTION FF
-# and a packaged PKG.FF coexist and each resolves to its own body.
+# and a packaged PKG.FF, a plain PROCEDURE PP and a packaged PKG.PP, all
+# coexist and each resolves to its own body (checked below). The member's
+# id is looked up by name AND package, so CREATE PACKAGE BODY does not
+# reuse a same-named plain routine's RDB$..._ID.
 #
-# Boundaries (recorded):
-#  - an unknown SELECTABLE procedure in the FROM clause refuses
-#    generically on fc where the engine raises -204 "Procedure unknown"
-#    (pre-existing, NOT package-specific - a plain `NOSUCHPROC(1)` is the
-#    same); the -204-in-FROM vector is a separate slice.
-#  - a plain PROCEDURE and a packaged procedure of the SAME name: the
-#    engine builds both, fc builds the header then refuses CREATE PACKAGE
-#    BODY (a stale system-index entry on the delete+recreate of the
-#    member, only when a same-named plain procedure exists). fc's failure
-#    is CLEAN - the statement rolls back, the plain procedure keeps
-#    working and gfix stays clean - so it is left as a boundary here. The
-#    same collision on FUNCTIONS works end to end (checked below).
+# Boundary (recorded): an unknown SELECTABLE procedure in the FROM clause
+# refuses generically on fc where the engine raises -204 "Procedure
+# unknown" (pre-existing, NOT package-specific - a plain `NOSUCHPROC(1)`
+# is the same); the -204-in-FROM vector is a separate slice.
 #
 #   qa/serve-real-callpkg.sh [port]
 set -u
@@ -134,14 +129,17 @@ check "EXECUTE PROCEDURE of a packaged procedure" "$c" "$e"
 cat > "$D/callpkg-collide.sql" <<'SQL'
 SET TERM ^;
 CREATE FUNCTION FF (A INTEGER) RETURNS INTEGER AS BEGIN RETURN A + 1000; END^
+CREATE PROCEDURE PP (A INTEGER) RETURNS (B INTEGER) AS BEGIN B = A + 500; SUSPEND; END^
 SET TERM ;^
 COMMIT;
 SET LIST ON;
 SELECT FF(7) AS PLAIN_FN, PKG.FF(7) AS PKG_FN, PUBLIC.FF(7) AS QUAL_PLAIN FROM RDB$DATABASE;
+SELECT B FROM PP(7);
+SELECT B FROM PKG.PP(7);
 SQL
 e=$("$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$REAL:$B" -i "$D/callpkg-collide.sql" 2>&1 | norm)
 c=$("$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$A" -i "$D/callpkg-collide.sql" 2>&1 | norm)
-check "a plain function (bare AND PUBLIC-qualified) and a packaged member of the same name each resolve" "$c" "$e"
+check "a plain FUNCTION and PROCEDURE coexist with same-named packaged members, each resolving" "$c" "$e"
 
 gf=$("$GFIX" -v -full -user "$U" -pas "$P" "$A" 2>&1)
 ran=$((ran + 1))

@@ -9097,6 +9097,29 @@ pub fn procedure_id(file: &crate::Image, page_size: usize, name: &str) -> Option
     out
 }
 
+/// The RDB$PROCEDURE_ID of a PACKAGED member - matched on name AND
+/// package, so a packaged `PKG.PP` is not confused with a same-named
+/// plain procedure (whose id create_package_body would otherwise reuse,
+/// colliding on the RDB$PROCEDURE_ID unique index). Mirrors function_id.
+fn procedure_id_in_package(file: &crate::Image, page_size: usize, name: &str, package: &str) -> Option<i64> {
+    let want = name.trim().trim_matches('"').to_ascii_uppercase();
+    let rel = crate::resolve_relation(file, page_size, "RDB$PROCEDURES")?;
+    let formats = system_relation_formats(file, page_size, "RDB$PROCEDURES")?;
+    let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
+    let cols = relation_columns(file, page_size, "RDB$PROCEDURES");
+    let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (name_f, id_f, pk_f) = (fid("RDB$PROCEDURE_NAME")?, fid("RDB$PROCEDURE_ID")?, fid("RDB$PACKAGE_NAME")?);
+    let mut out = None;
+    walk_rows(file, page_size, rel, descs, |v| {
+        if out.is_none() && text_eq(v.get(name_f), &want) && text_eq(v.get(pk_f), package) {
+            if let Some(Value::Int(i)) = v.get(id_f) {
+                out = Some(*i);
+            }
+        }
+    });
+    out
+}
+
 pub fn drop_procedure(file: &mut crate::Image, page_size: usize, name: &str) -> Result<(), String> {
     let want = name.trim().trim_matches('"').to_ascii_uppercase();
     // the row, and its parameter domains, gathered before anything is
@@ -10520,7 +10543,7 @@ pub fn create_package_body(
     for m in members {
         match m {
             PackageBodyMember::Procedure { name, ins, outs, selectable, blr } => {
-                let id = procedure_id(file, page_size, name).ok_or_else(|| format!("member {} not declared in the header", name))?;
+                let id = procedure_id_in_package(file, page_size, name, &want).ok_or_else(|| format!("member {} not declared in the header", name))?;
                 delete_package_member(file, page_size, true, name, &want)?;
                 create_procedure_with_id(file, page_size, name, ins, outs, *selectable, "", blr, Some((&want, 0)), Some(id), false)?;
             }
