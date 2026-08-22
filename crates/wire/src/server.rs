@@ -13668,6 +13668,8 @@ enum TrigStmt {
     Close { cursor: String, src_off: usize },
     /// `LEAVE;` - end the innermost loop.
     Leave { src_off: usize },
+    /// `CONTINUE;` - jump to the innermost loop's next iteration.
+    Continue { src_off: usize },
     /// `EXIT;` - end the body. A selectable procedure keeps the rows it
     /// has already SUSPENDed.
     Exit { src_off: usize },
@@ -14208,6 +14210,7 @@ fn body_has_uninterpretable_blr(st: &TrigStmt) -> bool {
         | TrigStmt::Fetch { .. }
         | TrigStmt::Close { .. }
         | TrigStmt::Leave { .. }
+        | TrigStmt::Continue { .. }
         | TrigStmt::Exit { .. }
         | TrigStmt::Return { .. }
         | TrigStmt::ReturnText { .. }
@@ -14773,6 +14776,10 @@ fn parse_trig_stmt(
         // does not have, so only the bare form is taken
         return Some(TrigStmt::Leave { src_off: start });
     }
+    if find_word(&up, "CONTINUE", 0) == Some(0) && text.trim().len() == "CONTINUE".len() {
+        // bare CONTINUE only, like LEAVE
+        return Some(TrigStmt::Continue { src_off: start });
+    }
     if find_word(&up, "EXIT", 0) == Some(0) && text.trim().len() == "EXIT".len() {
         return Some(TrigStmt::Exit { src_off: start });
     }
@@ -15041,6 +15048,7 @@ fn emit_trigger_stmt(
         | TrigStmt::Fetch { .. }
         | TrigStmt::Close { .. }
         | TrigStmt::Leave { .. }
+        | TrigStmt::Continue { .. }
         | TrigStmt::Exit { .. }
         | TrigStmt::Return { .. }
         | TrigStmt::ReturnText { .. }
@@ -15635,6 +15643,7 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
             | TrigStmt::Fetch { .. }
             | TrigStmt::Close { .. }
             | TrigStmt::Leave { .. }
+        | TrigStmt::Continue { .. }
             | TrigStmt::Exit { .. }
             | TrigStmt::Return { .. }
             | TrigStmt::ReturnText { .. }
@@ -15679,6 +15688,7 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
             | TrigStmt::Fetch { .. }
             | TrigStmt::Close { .. }
             | TrigStmt::Leave { .. }
+        | TrigStmt::Continue { .. }
             | TrigStmt::Exit { .. }
             | TrigStmt::Return { .. }
             | TrigStmt::ReturnText { .. }
@@ -15724,6 +15734,7 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
             | TrigStmt::Fetch { .. }
             | TrigStmt::Close { .. }
             | TrigStmt::Leave { .. }
+        | TrigStmt::Continue { .. }
             | TrigStmt::Exit { .. }
             | TrigStmt::Return { .. }
             | TrigStmt::ReturnText { .. }
@@ -51651,6 +51662,9 @@ enum PsqlStop {
     /// `LEAVE` - not a failure at all, a jump: the innermost loop
     /// catches it and everything else passes it up.
     Leave,
+    /// `CONTINUE` - a jump to the innermost loop's next iteration; the
+    /// loop catches it, everything else passes it up.
+    Continue,
     /// `EXIT` - the same, caught by the body itself.
     Exit,
     /// a construct the interpreter does not implement; the statement
@@ -53102,6 +53116,7 @@ fn stmt_src_off(s: &TrigStmt) -> usize {
         TrigStmt::Assign { src_off, .. }
         | TrigStmt::If { src_off, .. }
         | TrigStmt::While { src_off, .. }
+        | TrigStmt::Continue { src_off, .. }
         | TrigStmt::Raise { src_off, .. }
         | TrigStmt::Reraise { src_off, .. }
         | TrigStmt::PostEvent { src_off, .. }
@@ -53170,6 +53185,7 @@ fn exec_psql_stmt_inner(
                 match exec_psql_stmt(body, f, steps, db, ctx) {
                     Ok(()) => {}
                     Err(PsqlStop::Leave) => break,
+                    Err(PsqlStop::Continue) => {}
                     Err(e) => return Err(e),
                 }
                 *steps += 1;
@@ -53268,6 +53284,7 @@ fn exec_psql_stmt_inner(
                 match exec_psql_stmt(body, f, steps, db, ctx) {
                     Ok(()) => {}
                     Err(PsqlStop::Leave) => break,
+                    Err(PsqlStop::Continue) => {}
                     Err(e) => return Err(e),
                 }
                 *steps += 1;
@@ -53401,6 +53418,7 @@ fn exec_psql_stmt_inner(
             }
         }
         TrigStmt::Leave { .. } => Err(PsqlStop::Leave),
+        TrigStmt::Continue { .. } => Err(PsqlStop::Continue),
         TrigStmt::Exit { .. } => Err(PsqlStop::Exit),
         TrigStmt::Return { expr, .. } => {
             // a FUNCTION's RETURN: output 0 takes the value, the body ends
@@ -53624,6 +53642,7 @@ fn exec_psql_stmt_inner(
                 match exec_psql_stmt(body, f, steps, db, ctx) {
                     Ok(()) => {}
                     Err(PsqlStop::Leave) => break,
+                    Err(PsqlStop::Continue) => {}
                     Err(e) => return Err(e),
                 }
                 *steps += 1;
@@ -54614,6 +54633,12 @@ fn run_body_source(
         Err(PsqlStop::Leave) => {
             return Err(ProcErr::from(format!(
                 "procedure {}: LEAVE outside a loop",
+                name
+            )))
+        }
+        Err(PsqlStop::Continue) => {
+            return Err(ProcErr::from(format!(
+                "procedure {}: CONTINUE outside a loop",
                 name
             )))
         }

@@ -246,8 +246,7 @@ DDL was.
 
 `INTERSECT`/`EXCEPT`; the named `WINDOW` clause; `WITH LOCK`, `FOR
 UPDATE`, an explicit `PLAN`; a `?` inside any PSQL query (loop, cursor,
-`EXECUTE STATEMENT`, `SELECT INTO` — `server.rs:47089`); `CONTINUE`
-and labelled `LEAVE`; `RDB$SET_CONTEXT`/`RDB$GET_CONTEXT`; `GEN_ID`
+`EXECUTE STATEMENT`, `SELECT INTO` — `server.rs:47089`); labelled `LEAVE` / `CONTINUE` (the bare forms are done); `RDB$SET_CONTEXT`/`RDB$GET_CONTEXT`; `GEN_ID`
 inside an autonomous body; `INSERT … VALUES` without a column list in
 PSQL; `EXECUTE BLOCK` with parameters or `RETURNS`; `EXECUTE
 STATEMENT` with parameters, `ON EXTERNAL`, `AS USER`; cross-type
@@ -392,6 +391,17 @@ pointer-page and TIP page numbers is the next step when it dominates.
 
 ## Next, in order
 
+- **PSQL loop control CONTINUE / bare LEAVE DONE (2026-08-22,
+  `serve-real-loopctl` 7):** `CONTINUE` (next iteration) and bare `LEAVE`
+  (end the innermost loop) now COMPILE in fc's own dsql - a loop-label
+  stack in the body parser gives each a blr_leave / blr_continue_loop
+  (197) over the enclosing loop's label, byte-for-byte with the engine
+  (pin test QW_LC) - and the interpreter runs them (every WHILE / FOR
+  SELECT / FOR EXECUTE loop catches PsqlStop::Continue). Works in WHILE,
+  FOR SELECT and nested loops; the engine runs the BLR fc stored. Before,
+  fc could interpret a bare LEAVE it read from an engine-built procedure
+  but its compiler refused both. Boundaries: a LABELLED `LEAVE lbl` still
+  refuses; CONTINUE/LEAVE outside every loop refuse (as the engine's do).
 - **SQL-standard OFFSET / FETCH DONE (2026-08-22, `serve-real-offsetfetch`
   16):** `OFFSET <n> ROW|ROWS` and `FETCH {FIRST|NEXT} [<n>] ROW|ROWS
   ONLY`, alone or combined (OFFSET then FETCH -> skip then take), beside

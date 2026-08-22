@@ -266,6 +266,8 @@ mod blr {
     /// blr_leave N), end (probed)
     pub const LOOP: u8 = 0x09;
     pub const LEAVE: u8 = 0x12;
+    /// blr_continue_loop: label byte - `CONTINUE` to the loop's top (probed)
+    pub const CONTINUE_LOOP: u8 = 197;
     /// INSERTING/UPDATING/DELETING: eql(blr_internal_info(literal 6),
     /// literal 1/2/3) (probed)
     pub const INTERNAL_INFO: u8 = 0xB1;
@@ -1026,6 +1028,9 @@ struct P<'a> {
     local_vars: Vec<String>,
     /// the next free label number (0 is the body wrapper's)
     next_label: u8,
+    /// labels of the loops enclosing the statement being parsed, innermost
+    /// last - a bare LEAVE / CONTINUE targets `loop_labels.last()`
+    loop_labels: Vec<u8>,
     /// procedure-body mode: SUSPEND and (FOR) SELECT become
     /// statements; the number of output parameters shapes the sends
     proc: Option<usize>,
@@ -1095,6 +1100,7 @@ impl<'a> P<'a> {
             in_params: Vec::new(),
             local_vars: Vec::new(),
             next_label: 1,
+            loop_labels: Vec::new(),
             proc: None,
             agg_fid_ctx: 1,
             domain_value: false,
@@ -3193,6 +3199,7 @@ pub fn compile_view_columns(sql: &str) -> Option<Vec<Option<Vec<u8>>>> {
         in_params: Vec::new(),
         local_vars: Vec::new(),
         next_label: 1,
+            loop_labels: Vec::new(),
         proc: None,
         agg_fid_ctx: 1,
         domain_value: false,
@@ -3342,6 +3349,7 @@ pub fn compile_view_select(sql: &str) -> Option<Vec<u8>> {
         in_params: Vec::new(),
         local_vars: Vec::new(),
         next_label: 1,
+            loop_labels: Vec::new(),
         proc: None,
         agg_fid_ctx: 1,
         domain_value: false,
@@ -4301,6 +4309,11 @@ enum TrigStmt {
     ExceptionRaise(String),
     /// EXIT; - blr_leave 0: leaves the wrapper label
     Exit,
+    /// `LEAVE;` - bare, ends the innermost loop: blr_leave <loop label>
+    LeaveLoop(u8),
+    /// `CONTINUE;` - bare, next iteration of the innermost loop:
+    /// blr_continue_loop <loop label>
+    ContinueLoop(u8),
     /// POST_EVENT <value>; - blr_post
     PostEvent(Val),
     /// BEGIN ... WHEN <code> DO <stmt> ... END - blr_block with one
@@ -4729,6 +4742,14 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
         TrigStmt::Exit => {
             out.push(blr::LEAVE);
             out.push(0);
+        }
+        TrigStmt::LeaveLoop(l) => {
+            out.push(blr::LEAVE);
+            out.push(*l);
+        }
+        TrigStmt::ContinueLoop(l) => {
+            out.push(blr::CONTINUE_LOOP);
+            out.push(*l);
         }
         TrigStmt::PostEvent(v) => {
             out.push(blr::POST);
@@ -6599,7 +6620,10 @@ impl<'a> P<'a> {
                 self.for_cursors
                     .push((cn.clone(), ctx, stream.name.clone()));
             }
-            let body = self.trig_stmt()?;
+            self.loop_labels.push(label);
+            let body_opt = self.trig_stmt();
+            self.loop_labels.pop();
+            let body = body_opt?;
             if cursor.is_some() {
                 self.for_cursors.pop();
             }
@@ -7671,7 +7695,10 @@ impl<'a> P<'a> {
         if !self.kw("DO") {
             return None;
         }
-        let do_stmt = Some(Box::new(self.trig_stmt()?));
+        self.loop_labels.push(label);
+        let body_opt = self.trig_stmt();
+        self.loop_labels.pop();
+        let do_stmt = Some(Box::new(body_opt?));
         Some(TrigStmt::ForSel(Box::new(ForSel {
             label: Some(label),
             stream: Stream {
@@ -8015,7 +8042,10 @@ impl<'a> P<'a> {
                 if !self.kw("DO") {
                     return None;
                 }
-                let body = Box::new(self.trig_stmt()?);
+                self.loop_labels.push(label);
+                let body_opt = self.trig_stmt();
+                self.loop_labels.pop();
+                let body = Box::new(body_opt?);
                 return Some(if full {
                     TrigStmt::ExecStmtFull {
                         sql,
@@ -8252,6 +8282,25 @@ impl<'a> P<'a> {
             self.i += 1;
             return Some(TrigStmt::Exit);
         }
+        // bare LEAVE / CONTINUE (the innermost loop). A following
+        // identifier is a LABELLED form this surface does not take, and
+        // either outside a loop has no label to target - both refuse.
+        if self.kw("LEAVE") {
+            if !matches!(self.t.get(self.i), Some(Tok::Semi)) {
+                return None;
+            }
+            let l = *self.loop_labels.last()?;
+            self.i += 1;
+            return Some(TrigStmt::LeaveLoop(l));
+        }
+        if self.kw("CONTINUE") {
+            if !matches!(self.t.get(self.i), Some(Tok::Semi)) {
+                return None;
+            }
+            let l = *self.loop_labels.last()?;
+            self.i += 1;
+            return Some(TrigStmt::ContinueLoop(l));
+        }
         if self.kw("IN") {
             if !(self.kw("AUTONOMOUS") && self.kw("TRANSACTION") && self.kw("DO")) {
                 return None;
@@ -8410,7 +8459,15 @@ impl<'a> P<'a> {
             }
             let label = self.next_label;
             self.next_label += 1;
-            let body = Box::new(self.trig_stmt()?);
+            self.loop_labels.push(label);
+            let body = match self.trig_stmt() {
+                Some(b) => Box::new(b),
+                None => {
+                    self.loop_labels.pop();
+                    return None;
+                }
+            };
+            self.loop_labels.pop();
             return Some(TrigStmt::While(label, cond, body));
         }
         // <var> = <value>; - a local-variable assignment
@@ -9157,6 +9214,7 @@ pub fn compile_default(sql: &str) -> Option<Vec<u8>> {
         in_params: Vec::new(),
         local_vars: Vec::new(),
         next_label: 1,
+            loop_labels: Vec::new(),
         proc: None,
         agg_fid_ctx: 1,
         domain_value: false,
@@ -9236,6 +9294,7 @@ pub fn compile_computed(sql: &str) -> Option<Vec<u8>> {
         in_params: Vec::new(),
         local_vars: Vec::new(),
         next_label: 1,
+            loop_labels: Vec::new(),
         proc: None,
         agg_fid_ctx: 1,
         domain_value: false,
@@ -9310,6 +9369,7 @@ pub fn compile_check(sql: &str) -> Option<Vec<u8>> {
         in_params: Vec::new(),
         local_vars: Vec::new(),
         next_label: 1,
+            loop_labels: Vec::new(),
         proc: None,
         agg_fid_ctx: 1,
         domain_value: false,
@@ -9385,6 +9445,7 @@ pub fn compile_validation(sql: &str) -> Option<Vec<u8>> {
         in_params: Vec::new(),
         local_vars: Vec::new(),
         next_label: 1,
+            loop_labels: Vec::new(),
         proc: None,
         agg_fid_ctx: 1,
         domain_value: true,
@@ -9484,6 +9545,7 @@ pub fn compile_trigger(sql: &str) -> Option<Vec<u8>> {
         in_params: Vec::new(),
         local_vars: Vec::new(),
         next_label: 1,
+            loop_labels: Vec::new(),
         proc: None,
         agg_fid_ctx: 1,
         domain_value: false,
@@ -10734,6 +10796,12 @@ mod tests {
         pin_trig(
             "CREATE TRIGGER QW_C FOR T BEFORE INSERT AS DECLARE V1 INTEGER; BEGIN V1 = 0; WHILE (V1 < 5) DO V1 = V1 + 1; NEW.A = V1; END",
             "05020300000800012D1A00001100020201150800000000001A00001101090208331A00001508000500000001221A0000150800010000001A00001201FF011A000017010141FFFFFF4C",
+        );
+        // WHILE with CONTINUE and a bare LEAVE - blr_continue_loop 1 and
+        // blr_leave 1 both target the loop label (probed)
+        pin_trig(
+            "CREATE TRIGGER QW_LC FOR T BEFORE INSERT AS DECLARE V1 INTEGER; BEGIN V1 = 0; WHILE (V1 < 5) DO BEGIN V1 = V1 + 1; IF (V1 = 2) THEN CONTINUE; IF (V1 = 4) THEN LEAVE; END NEW.A = V1; END",
+            "05020300000800012D1A00001100020201150800000000001A00001101090208331A000015080005000000020201221A0000150800010000001A0000082F1A000015080002000000C501FF082F1A0000150800040000001201FFFFFF1201FF011A000017010141FFFFFF4C",
         );
         // nested WHILEs: outer label 1, inner label 2, leaves match
         pin_trig(
@@ -12114,8 +12182,6 @@ mod tests {
         for sql in [
             // an assignment to an undeclared name is not a variable
             "CREATE TRIGGER X FOR T BEFORE INSERT AS DECLARE V1 INTEGER; BEGIN V2 = 5; END",
-            // bare LEAVE/loop control: unconverted
-            "CREATE TRIGGER X FOR T BEFORE INSERT AS BEGIN WHILE (1 = 1) DO LEAVE; END",
         ] {
             assert!(compile_trigger(sql).is_none(), "{sql} was compiled");
         }
