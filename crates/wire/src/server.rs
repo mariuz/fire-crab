@@ -1591,6 +1591,42 @@ fn respond_ddl_meta(
     // "DROP TABLE @1 failed" wrapper the engine adds isc_dsql_command_err
     // (-607, "Invalid command") and a "-Table @1 does not exist" string
     // - four items, not the three the others carry.
+    if let Plan::CreateCollation { name, .. } = plan {
+        let qn = q(name);
+        if lc.contains("already exists") {
+            let mut w = W::default();
+            w.int(OP_RESPONSE).int(0).int(0).int(0).int(0);
+            w.int(1).int(GDS_NO_META_UPDATE)
+                .int(1).int(336397275).int(2).bytes(qn.as_bytes()) // CREATE COLLATION @1 failed
+                .int(1).int(336068920).int(2).bytes(qn.as_bytes()) // Collation @1 already exists
+                .int(0);
+            w.send(s, enc)?;
+            return Ok(true);
+        }
+        if lc.contains("invalid collation attributes") {
+            let mut w = W::default();
+            w.int(OP_RESPONSE).int(0).int(0).int(0).int(0);
+            w.int(1).int(GDS_NO_META_UPDATE)
+                .int(1).int(336397275).int(2).bytes(qn.as_bytes())
+                .int(1).int(336068830) // Invalid collation attributes (no name arg)
+                .int(0);
+            w.send(s, enc)?;
+            return Ok(true);
+        }
+    }
+    if let Plan::DropCollation { name } = plan {
+        if lc.contains("not found") {
+            let qn = q(name);
+            let mut w = W::default();
+            w.int(OP_RESPONSE).int(0).int(0).int(0).int(0);
+            w.int(1).int(GDS_NO_META_UPDATE)
+                .int(1).int(336397276).int(2).bytes(qn.as_bytes()) // DROP COLLATION @1 failed
+                .int(1).int(336068760).int(2).bytes(qn.as_bytes()) // Collation @1 not found
+                .int(0);
+            w.send(s, enc)?;
+            return Ok(true);
+        }
+    }
     if let Plan::CreateMapping(m) | Plan::AlterMapping(m) = plan {
         if lc.contains("already exists") {
             let mut w = W::default();
@@ -7281,6 +7317,9 @@ enum Plan {
     CreateMapping(MappingSpec),
     AlterMapping(MappingSpec),
     DropMapping { name: String },
+    /// `CREATE COLLATION <name> FOR <charset> FROM <base> [attrs]`.
+    CreateCollation { name: String, charset_id: i64, base: String, pad: bool, ci: bool, ai: bool },
+    DropCollation { name: String },
     /// `ALTER VIEW <name> AS <select>` - the view's definition is replaced
     /// but its relation id survives (the ods alter_view reuses it).
     AlterView {
@@ -16700,6 +16739,61 @@ fn plan_declare_filter(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
 /// a SELECT it cannot compile refuses the statement (no guessing - the
 /// engine runs that BLR when it reads this file). `WITH CHECK OPTION`
 /// is outside this slice.
+/// `CREATE COLLATION <name> FOR <charset> [FROM <base>] [NO PAD | PAD SPACE]
+/// [CASE [IN]SENSITIVE] [ACCENT [IN]SENSITIVE]`. FROM EXTERNAL and a
+/// specific-attributes string refuse (kept generic).
+fn plan_create_collation(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
+    let toks: Vec<&str> = sql.split_whitespace().collect();
+    if toks.len() < 5 || !toks[0].eq_ignore_ascii_case("CREATE") || !toks[1].eq_ignore_ascii_case("COLLATION") {
+        return None;
+    }
+    let name = unquote_ident(toks[2])?;
+    if !toks[3].eq_ignore_ascii_case("FOR") {
+        return None;
+    }
+    let charset_id = charset_name_id(&toks[4].trim_end_matches(';').to_ascii_uppercase())? as i64;
+    let mut i = 5;
+    let mut base = charset_upper(toks[4]); // default: the charset's own (default) collation
+    if toks.get(i).is_some_and(|t| t.eq_ignore_ascii_case("FROM")) {
+        let b = toks.get(i + 1)?;
+        if b.eq_ignore_ascii_case("EXTERNAL") {
+            return None; // an external collation module - out of surface
+        }
+        base = unquote_ident(b)?;
+        i += 2;
+    }
+    let (mut pad, mut ci, mut ai) = (true, false, false);
+    while let Some(t) = toks.get(i) {
+        let t = t.trim_end_matches(';');
+        let next = toks.get(i + 1).map(|x| x.trim_end_matches(';').to_ascii_uppercase());
+        match t.to_ascii_uppercase().as_str() {
+            "NO" if next.as_deref() == Some("PAD") => { pad = false; i += 2; }
+            "PAD" if next.as_deref() == Some("SPACE") => { pad = true; i += 2; }
+            "PAD" => { pad = true; i += 1; }
+            "CASE" if next.as_deref() == Some("INSENSITIVE") => { ci = true; i += 2; }
+            "CASE" if next.as_deref() == Some("SENSITIVE") => { ci = false; i += 2; }
+            "ACCENT" if next.as_deref() == Some("INSENSITIVE") => { ai = true; i += 2; }
+            "ACCENT" if next.as_deref() == Some("SENSITIVE") => { ai = false; i += 2; }
+            "" => { i += 1; }
+            _ => return None, // a specific-attributes string or unknown clause
+        }
+    }
+    Some((Plan::CreateCollation { name, charset_id, base, pad, ci, ai }, Vec::new()))
+}
+
+/// Uppercase an identifier token (a bare name), stripping a trailing `;`.
+fn charset_upper(t: &str) -> String {
+    t.trim_end_matches(';').trim_matches('"').to_ascii_uppercase()
+}
+
+fn plan_drop_collation(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
+    let toks: Vec<&str> = sql.split_whitespace().collect();
+    if toks.len() != 3 || !toks[0].eq_ignore_ascii_case("DROP") || !toks[1].eq_ignore_ascii_case("COLLATION") {
+        return None;
+    }
+    Some((Plan::DropCollation { name: unquote_ident(toks[2])? }, Vec::new()))
+}
+
 /// The pieces of a `CREATE`/`ALTER MAPPING` this server writes to
 /// RDB$AUTH_MAPPING (a local mapping; GLOBAL is refused).
 #[derive(Clone, Debug)]
@@ -22798,6 +22892,14 @@ fn execute_dml_collecting_inner(
         }
         Plan::DropMapping { name } => {
             fire_crab_ods::ddl::drop_mapping(&mut work, db.page_size, name)?;
+            (0, 0, 0)
+        }
+        Plan::CreateCollation { name, charset_id, base, pad, ci, ai } => {
+            fire_crab_ods::ddl::create_collation(&mut work, db.page_size, name, *charset_id, base, *pad, *ci, *ai)?;
+            (0, 0, 0)
+        }
+        Plan::DropCollation { name } => {
+            fire_crab_ods::ddl::drop_collation(&mut work, db.page_size, name)?;
             (0, 0, 0)
         }
         Plan::AlterView { name, blr, source, fields, contexts } => {
@@ -35752,7 +35854,7 @@ fn describe_for(plan: &Plan, params: &[Descriptor], att: AttCs) -> Vec<u8> {
         | Plan::DropIndex { .. }
         | Plan::CreateSequence { .. } | Plan::DropSequence { .. }
         | Plan::CreateException { .. } | Plan::CreateProcedure { .. } | Plan::DropProcedure { .. } | Plan::DropException { .. }
-        | Plan::DeclareFilter { .. } | Plan::DropFilter { .. } | Plan::CreateView { .. } | Plan::DropView { .. } | Plan::Recreate(_) | Plan::AlterView { .. } | Plan::CreateMapping(_) | Plan::AlterMapping(_) | Plan::DropMapping { .. }
+        | Plan::DeclareFilter { .. } | Plan::DropFilter { .. } | Plan::CreateView { .. } | Plan::DropView { .. } | Plan::Recreate(_) | Plan::AlterView { .. } | Plan::CreateMapping(_) | Plan::AlterMapping(_) | Plan::DropMapping { .. } | Plan::CreateCollation { .. } | Plan::DropCollation { .. }
         | Plan::AlterTrigger { .. } | Plan::DropTrigger { .. } | Plan::CreateOrAlterTrigger { .. } | Plan::AlterProcedure { .. } | Plan::CreateOrAlterProcedure { .. }
         | Plan::CreateFunction { .. } | Plan::DropFunction { .. }
         | Plan::AlterException { .. } | Plan::CreateOrAlterException { .. }
@@ -35860,7 +35962,7 @@ fn stmt_type_of(plan: &Plan) -> i32 {
         | Plan::DropIndex { .. }
         | Plan::CreateSequence { .. } | Plan::DropSequence { .. }
         | Plan::CreateException { .. } | Plan::CreateProcedure { .. } | Plan::DropProcedure { .. } | Plan::DropException { .. }
-        | Plan::DeclareFilter { .. } | Plan::DropFilter { .. } | Plan::CreateView { .. } | Plan::DropView { .. } | Plan::Recreate(_) | Plan::AlterView { .. } | Plan::CreateMapping(_) | Plan::AlterMapping(_) | Plan::DropMapping { .. }
+        | Plan::DeclareFilter { .. } | Plan::DropFilter { .. } | Plan::CreateView { .. } | Plan::DropView { .. } | Plan::Recreate(_) | Plan::AlterView { .. } | Plan::CreateMapping(_) | Plan::AlterMapping(_) | Plan::DropMapping { .. } | Plan::CreateCollation { .. } | Plan::DropCollation { .. }
         | Plan::AlterTrigger { .. } | Plan::DropTrigger { .. } | Plan::CreateOrAlterTrigger { .. } | Plan::AlterProcedure { .. } | Plan::CreateOrAlterProcedure { .. }
         | Plan::CreateFunction { .. } | Plan::DropFunction { .. }
         | Plan::AlterException { .. } | Plan::CreateOrAlterException { .. }
@@ -37323,7 +37425,7 @@ fn emit_rows_inner(
         | Plan::DropIndex { .. }
         | Plan::CreateSequence { .. } | Plan::DropSequence { .. }
         | Plan::CreateException { .. } | Plan::CreateProcedure { .. } | Plan::DropProcedure { .. } | Plan::DropException { .. }
-        | Plan::DeclareFilter { .. } | Plan::DropFilter { .. } | Plan::CreateView { .. } | Plan::DropView { .. } | Plan::Recreate(_) | Plan::AlterView { .. } | Plan::CreateMapping(_) | Plan::AlterMapping(_) | Plan::DropMapping { .. }
+        | Plan::DeclareFilter { .. } | Plan::DropFilter { .. } | Plan::CreateView { .. } | Plan::DropView { .. } | Plan::Recreate(_) | Plan::AlterView { .. } | Plan::CreateMapping(_) | Plan::AlterMapping(_) | Plan::DropMapping { .. } | Plan::CreateCollation { .. } | Plan::DropCollation { .. }
         | Plan::AlterTrigger { .. } | Plan::DropTrigger { .. } | Plan::CreateOrAlterTrigger { .. } | Plan::AlterProcedure { .. } | Plan::CreateOrAlterProcedure { .. }
         | Plan::CreateFunction { .. } | Plan::DropFunction { .. }
         | Plan::AlterException { .. } | Plan::CreateOrAlterException { .. }
@@ -51118,6 +51220,8 @@ fn plan_immediate(text: &str, database: &Option<Database>) -> Option<(Plan, Vec<
                     .or_else(|| plan_mapping(text, false))
                     .or_else(|| plan_mapping(text, true))
                     .or_else(|| plan_drop_mapping(text))
+                    .or_else(|| plan_create_collation(text))
+                    .or_else(|| plan_drop_collation(text))
                     .or_else(|| plan_create_view(text, database))
                     .or_else(|| plan_alter_view(text, database))
                     .or_else(|| plan_drop_view(text))
@@ -56806,6 +56910,8 @@ fn after_auth(
                         .or_else(|| plan_mapping(&stmt_sql, false))
                         .or_else(|| plan_mapping(&stmt_sql, true))
                         .or_else(|| plan_drop_mapping(&stmt_sql))
+                        .or_else(|| plan_create_collation(&stmt_sql))
+                        .or_else(|| plan_drop_collation(&stmt_sql))
                         .or_else(|| plan_create_view(&stmt_sql, &database))
                         .or_else(|| plan_alter_view(&stmt_sql, &database))
                         .or_else(|| plan_drop_view(&stmt_sql))
@@ -57102,7 +57208,7 @@ fn after_auth(
                         | Plan::CreateSequence { .. }
                         | Plan::DropSequence { .. }
                         | Plan::CreateException { .. }
-                        | Plan::DeclareFilter { .. } | Plan::DropFilter { .. } | Plan::CreateView { .. } | Plan::DropView { .. } | Plan::Recreate(_) | Plan::AlterView { .. } | Plan::CreateMapping(_) | Plan::AlterMapping(_) | Plan::DropMapping { .. }
+                        | Plan::DeclareFilter { .. } | Plan::DropFilter { .. } | Plan::CreateView { .. } | Plan::DropView { .. } | Plan::Recreate(_) | Plan::AlterView { .. } | Plan::CreateMapping(_) | Plan::AlterMapping(_) | Plan::DropMapping { .. } | Plan::CreateCollation { .. } | Plan::DropCollation { .. }
         | Plan::AlterTrigger { .. } | Plan::DropTrigger { .. } | Plan::CreateOrAlterTrigger { .. } | Plan::AlterProcedure { .. } | Plan::CreateOrAlterProcedure { .. }
         | Plan::CreateFunction { .. } | Plan::DropFunction { .. }
                         | Plan::CreateProcedure { .. }

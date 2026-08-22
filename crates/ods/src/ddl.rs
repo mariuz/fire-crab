@@ -9760,6 +9760,157 @@ pub fn restore_carried_mapping(
     advance_oldest_transactions(file, page_size)
 }
 
+/// Is there a RDB$COLLATIONS row of this name (any charset)?
+fn collation_exists(file: &crate::Image, page_size: usize, name: &str) -> bool {
+    let Some(rel) = crate::resolve_relation(file, page_size, "RDB$COLLATIONS") else { return false };
+    let Some(fmts) = system_relation_formats(file, page_size, "RDB$COLLATIONS") else { return false };
+    let Some((_, descs)) = fmts.iter().max_by_key(|(n, _)| *n) else { return false };
+    let Ok(nf) = sys_fid(file, page_size, "RDB$COLLATIONS", "RDB$COLLATION_NAME") else { return false };
+    let mut found = false;
+    walk_rows(file, page_size, rel, descs, |v| {
+        if text_eq(v.get(nf), name) {
+            found = true;
+        }
+    });
+    found
+}
+
+/// The base collation's SPECIFIC_ATTRIBUTES for a charset: outer None = the
+/// base is not defined for this charset; inner None = it has no specific
+/// attributes (a non-ICU base). A user collation copies the base's string
+/// (the ICU/collation version), which is what the engine stores.
+fn collation_base_spec(
+    file: &crate::Image,
+    page_size: usize,
+    charset_id: i64,
+    base: &str,
+) -> Option<Option<Vec<u8>>> {
+    let rel = crate::resolve_relation(file, page_size, "RDB$COLLATIONS")?;
+    let fmts = system_relation_formats(file, page_size, "RDB$COLLATIONS")?;
+    let (_, descs) = fmts.iter().max_by_key(|(n, _)| *n)?;
+    let nf = sys_fid(file, page_size, "RDB$COLLATIONS", "RDB$COLLATION_NAME").ok()?;
+    let csf = sys_fid(file, page_size, "RDB$COLLATIONS", "RDB$CHARACTER_SET_ID").ok()?;
+    let spf = sys_fid(file, page_size, "RDB$COLLATIONS", "RDB$SPECIFIC_ATTRIBUTES").ok()?;
+    let mut out: Option<Option<Vec<u8>>> = None;
+    walk_rows(file, page_size, rel, descs, |v| {
+        if text_eq(v.get(nf), base) && int_eq(v.get(csf), charset_id) {
+            let spec = match v.get(spf) {
+                Some(Value::Blob(r, n)) => crate::format::read_blob_content(file, page_size, *r, *n),
+                _ => None,
+            };
+            out = Some(spec);
+        }
+    });
+    out
+}
+
+/// The next user-collation id for a charset: the highest free id counting
+/// down from 126 (probed: user collations take 126, 125, 124 ... per
+/// charset, well above the built-ins).
+fn next_collation_id(file: &crate::Image, page_size: usize, charset_id: i64) -> i64 {
+    let mut used: Vec<i64> = Vec::new();
+    if let Some(rel) = crate::resolve_relation(file, page_size, "RDB$COLLATIONS") {
+        if let Some(fmts) = system_relation_formats(file, page_size, "RDB$COLLATIONS") {
+            if let Some((_, descs)) = fmts.iter().max_by_key(|(n, _)| *n) {
+                if let (Ok(csf), Ok(idf)) = (
+                    sys_fid(file, page_size, "RDB$COLLATIONS", "RDB$CHARACTER_SET_ID"),
+                    sys_fid(file, page_size, "RDB$COLLATIONS", "RDB$COLLATION_ID"),
+                ) {
+                    walk_rows(file, page_size, rel, descs, |v| {
+                        if int_eq(v.get(csf), charset_id) {
+                            if let Some(Value::Int(id)) = v.get(idf) {
+                                used.push(*id);
+                            }
+                        }
+                    });
+                }
+            }
+        }
+    }
+    (0..=126).rev().find(|id| !used.contains(id)).unwrap_or(126)
+}
+
+/// `CREATE COLLATION <name> FOR <charset> FROM <base> [attrs]`: the
+/// RDB$COLLATIONS row. The SPECIFIC_ATTRIBUTES blob is copied from the base
+/// collation (the ICU version); the id counts down from 126 per charset.
+/// This server keys BINARY, so a CASE/ACCENT INSENSITIVE collation orders as
+/// its base does - the catalog is faithful, the ordering is a boundary.
+#[allow(clippy::too_many_arguments)]
+pub fn create_collation(
+    file: &mut crate::Image,
+    page_size: usize,
+    name: &str,
+    charset_id: i64,
+    base: &str,
+    pad: bool,
+    case_insensitive: bool,
+    accent_insensitive: bool,
+) -> Result<(), String> {
+    if collation_exists(file, page_size, name) {
+        return Err(format!("collation {} already exists", name));
+    }
+    let base_spec = collation_base_spec(file, page_size, charset_id, base)
+        .ok_or_else(|| format!("base collation {} not found", base))?;
+    // CASE / ACCENT INSENSITIVE need an ICU base (one with specific
+    // attributes); ACCENT INSENSITIVE needs CASE INSENSITIVE too.
+    if (case_insensitive || accent_insensitive) && base_spec.is_none() {
+        return Err("Invalid collation attributes".into());
+    }
+    if accent_insensitive && !case_insensitive {
+        return Err("Invalid collation attributes".into());
+    }
+    let attr = i64::from(pad) | (i64::from(case_insensitive) << 1) | (i64::from(accent_insensitive) << 2);
+    let cid = next_collation_id(file, page_size, charset_id);
+    let rel = crate::resolve_relation(file, page_size, "RDB$COLLATIONS").ok_or("no RDB$COLLATIONS")?;
+    let spec_id = match &base_spec {
+        Some(bytes) => Some(blob_id_bytes(rel, dml::insert_blob_cs(file, page_size, rel, &[bytes.clone()], 1, 4)?)),
+        None => None,
+    };
+    let mut vals: Vec<(&str, SysVal<'_>)> = vec![
+        ("RDB$COLLATION_NAME", SysVal::S(name)),
+        ("RDB$COLLATION_ID", SysVal::I(cid)),
+        ("RDB$CHARACTER_SET_ID", SysVal::I(charset_id)),
+        ("RDB$COLLATION_ATTRIBUTES", SysVal::I(attr)),
+        ("RDB$SYSTEM_FLAG", SysVal::I(0)),
+        ("RDB$BASE_COLLATION_NAME", SysVal::S(base)),
+        ("RDB$OWNER_NAME", SysVal::S(OWNER)),
+        ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
+    ];
+    if let Some(id) = &spec_id {
+        vals.push(("RDB$SPECIFIC_ATTRIBUTES", SysVal::B(*id)));
+    }
+    sys_insert(file, page_size, "RDB$COLLATIONS", rel, &vals)?;
+    advance_oldest_transactions(file, page_size)
+}
+
+/// `DROP COLLATION` - remove the RDB$COLLATIONS row (a user collation).
+pub fn drop_collation(file: &mut crate::Image, page_size: usize, name: &str) -> Result<(), String> {
+    let rel = crate::resolve_relation(file, page_size, "RDB$COLLATIONS").ok_or("no RDB$COLLATIONS")?;
+    let nf = sys_fid(file, page_size, "RDB$COLLATIONS", "RDB$COLLATION_NAME")?;
+    let sysf = sys_fid(file, page_size, "RDB$COLLATIONS", "RDB$SYSTEM_FLAG")?;
+    let fmts = system_relation_formats(file, page_size, "RDB$COLLATIONS").ok_or("no format")?;
+    let (_, descs) = fmts.iter().max_by_key(|(n, _)| *n).ok_or("empty format")?;
+    let mut found = false;
+    let mut system = false;
+    walk_rows(file, page_size, rel, descs, |v| {
+        if text_eq(v.get(nf), name) {
+            found = true;
+            if !int_eq(v.get(sysf), 0) {
+                system = true;
+            }
+        }
+    });
+    if !found {
+        return Err(format!("collation {} not found", name));
+    }
+    if system {
+        return Err(format!("Cannot delete system collation {}", name));
+    }
+    let want = name.to_string();
+    delete_catalog_rows(file, page_size, "RDB$COLLATIONS", move |v| text_eq(v.get(nf), &want))?;
+    advance_oldest_transactions(file, page_size)
+}
+
 /// Is there a RDB$AUTH_MAPPING row of this name?
 fn mapping_exists(file: &crate::Image, page_size: usize, name: &str) -> bool {
     let Some(rel) = crate::resolve_relation(file, page_size, "RDB$AUTH_MAPPING") else { return false };
