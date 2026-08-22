@@ -247,8 +247,7 @@ DDL was.
 `INTERSECT`/`EXCEPT`; the named `WINDOW` clause; an explicit `PLAN` (WITH LOCK / FOR UPDATE / OPTIMIZE are done); a `?` inside any PSQL query (loop, cursor,
 `EXECUTE STATEMENT`, `SELECT INTO` — `server.rs:47089`);  `RDB$SET_CONTEXT`/`RDB$GET_CONTEXT`; `GEN_ID`
 inside an autonomous body; `INSERT … VALUES` without a column list in
-PSQL; `EXECUTE BLOCK` with parameters or `RETURNS`; `EXECUTE
-STATEMENT` with parameters, `ON EXTERNAL`, `AS USER`; a bare aggregate over a
+PSQL; `EXECUTE BLOCK` with parameters or `RETURNS`; `EXECUTE STATEMENT` with a parameter head `(sql)(vals)` or `USING` / `ON EXTERNAL` / `AS USER` (the dynamic-SQL operand - concat, variable, expression - is done); a bare aggregate over a
 comma join (42000 at prepare); `= ANY`/`= ALL` over the strict text
 key; PSQL literals held as i32 (`serve-real-psqlerrors`); the BLR
 compiler narrower than the interpreter (a bare `EXCEPTION;` in a
@@ -389,6 +388,14 @@ pointer-page and TIP page numbers is the next step when it dominates.
 
 ## Next, in order
 
+- **Dynamic EXECUTE STATEMENT operand DONE (2026-08-22,
+  `serve-real-execstmt` 4):** the SQL operand may now be any expression -
+  a `||` concatenation of literals and variables, or a bare variable -
+  not just a literal. dsql parses it as a Val and each form
+  (blr_exec_sql / blr_exec_into / blr_exec_stmt) emits the expression
+  byte-for-byte with the engine; the interpreter already rendered the
+  operand. Boundary: a parameter head `(sql)(vals)` and the USING / ON
+  EXTERNAL / AS USER modifiers are still a later slice.
 - **Cross-type procedure inputs DONE (2026-08-22, `serve-real-crosstype`
   3):** the engine's CVT for a procedure argument whose literal type
   differs from the parameter's - a text into an INTEGER (spaces trimmed,

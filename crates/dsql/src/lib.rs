@@ -4353,7 +4353,7 @@ enum TrigStmt {
     /// offset value (blr_null unless ABSOLUTE/RELATIVE), assigns
     CursorFetchDir(u16, u8, Option<i32>, Vec<(Val, u16)>),
     /// EXECUTE STATEMENT '<sql>'; - blr_exec_sql + the sql literal
-    ExecSql(String),
+    ExecSql(Val),
     /// RETURN <expr>; in a function body: begin(assign to the
     /// unnamed slot 0, the no-EOF send, blr_leave 0) end (probed)
     Return(Val),
@@ -4368,7 +4368,7 @@ enum TrigStmt {
     /// u16 out-count, the sql, then flag 1 (singleton) or flag 0 +
     /// the labeled loop's DO statement; the variables LAST (probed)
     ExecInto {
-        sql: String,
+        sql: Val,
         vars: Vec<u16>,
         run: Option<(u8, Box<TrigStmt>)>,
     },
@@ -4380,7 +4380,7 @@ enum TrigStmt {
     /// 11 positional / 12 named input values, 13 output variables,
     /// blr_end (probed; order from the engine's own genBlr)
     ExecStmtFull {
-        sql: String,
+        sql: Val,
         ins: Vec<(Option<String>, Val)>,
         vars: Vec<u16>,
         data_src: Option<Val>,
@@ -4855,7 +4855,7 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
         }
         TrigStmt::ExecSql(sql) => {
             out.push(blr::EXEC_SQL);
-            emit_val(out, &Val::Str(sql.clone()));
+            emit_val(out, sql);
         }
         TrigStmt::Return(v) => {
             out.push(blr::BEGIN);
@@ -4916,7 +4916,7 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
             }
             out.push(blr::EXEC_INTO);
             out.extend_from_slice(&(vars.len() as u16).to_le_bytes());
-            emit_val(out, &Val::Str(sql.clone()));
+            emit_val(out, sql);
             match run {
                 Some((_, body)) => {
                     out.push(0);
@@ -4953,7 +4953,7 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
                 out.extend_from_slice(&(vars.len() as u16).to_le_bytes());
             }
             out.push(3); // blr_exec_stmt_sql
-            emit_val(out, &Val::Str(sql.clone()));
+            emit_val(out, sql);
             if let Some((_, body)) = run {
                 out.push(4); // blr_exec_stmt_proc_block
                 emit_trig_stmt(out, body);
@@ -6712,6 +6712,22 @@ impl<'a> P<'a> {
     /// (val [, ...] | name := val [, ...]) - self.i at the opening
     /// paren of the sql. All parameters named or all unnamed (the
     /// two live under different tags - mixing refuses).
+    /// The SQL operand of an EXECUTE STATEMENT: a `(literal) (params)`
+    /// head, or - for the dynamic forms - any expression that yields the
+    /// text (a bare literal, or a `||` concatenation of literals and
+    /// variables). Returns the operand as a Val and the positional/named
+    /// input parameters (empty unless it was a params head).
+    fn exec_stmt_sql_arg(&mut self) -> Option<(Val, Vec<(Option<String>, Val)>)> {
+        if matches!(self.t.get(self.i), Some(Tok::LParen)) {
+            let save = self.i;
+            if let Some((sql, ins)) = self.exec_stmt_head() {
+                return Some((Val::Str(sql), ins));
+            }
+            self.i = save;
+        }
+        Some((self.val()?, Vec::new()))
+    }
+
     fn exec_stmt_head(
         &mut self,
     ) -> Option<(String, Vec<(Option<String>, Val)>)> {
@@ -8042,17 +8058,7 @@ impl<'a> P<'a> {
                 if !self.kw("STATEMENT") {
                     return None;
                 }
-                let (sql, ins) =
-                    if matches!(self.t.get(self.i), Some(Tok::LParen)) {
-                        self.exec_stmt_head()?
-                    } else {
-                        let Some(Tok::Str(sql)) = self.t.get(self.i) else {
-                            return None;
-                        };
-                        let sql = sql.clone();
-                        self.i += 1;
-                        (sql, Vec::new())
-                    };
+                let (sql, ins) = self.exec_stmt_sql_arg()?;
                 let (data_src, user, pwd, role) = self.exec_stmt_mods()?;
                 let full = !ins.is_empty()
                     || data_src.is_some()
@@ -8090,8 +8096,8 @@ impl<'a> P<'a> {
                 let body_opt = self.trig_stmt();
                 self.loop_labels.pop();
                 let body = Box::new(body_opt?);
-                return Some(if full {
-                    TrigStmt::ExecStmtFull {
+                if full {
+                    return Some(TrigStmt::ExecStmtFull {
                         sql,
                         ins,
                         vars,
@@ -8100,13 +8106,12 @@ impl<'a> P<'a> {
                         pwd,
                         role,
                         run: Some((label, body)),
-                    }
-                } else {
-                    TrigStmt::ExecInto {
-                        sql,
-                        vars,
-                        run: Some((label, body)),
-                    }
+                    });
+                }
+                return Some(TrigStmt::ExecInto {
+                    sql,
+                    vars,
+                    run: Some((label, body)),
                 });
             }
             // FOR WITH cte AS (...) SELECT ... - the cte expands as
@@ -8151,17 +8156,7 @@ impl<'a> P<'a> {
                 // sql: a bare literal or the parenthesized head with
                 // parameters; then the optional modifiers - either
                 // of which forces the FULL blr_exec_stmt form
-                let (sql, ins) =
-                    if matches!(self.t.get(self.i), Some(Tok::LParen)) {
-                        self.exec_stmt_head()?
-                    } else {
-                        let Some(Tok::Str(sql)) = self.t.get(self.i) else {
-                            return None;
-                        };
-                        let sql = sql.clone();
-                        self.i += 1;
-                        (sql, Vec::new())
-                    };
+                let (sql, ins) = self.exec_stmt_sql_arg()?;
                 let (data_src, user, pwd, role) = self.exec_stmt_mods()?;
                 let full = !ins.is_empty()
                     || data_src.is_some()
@@ -8199,8 +8194,8 @@ impl<'a> P<'a> {
                     return None;
                 }
                 self.i += 1;
-                return Some(if full {
-                    TrigStmt::ExecStmtFull {
+                if full {
+                    return Some(TrigStmt::ExecStmtFull {
                         sql,
                         ins,
                         vars,
@@ -8209,8 +8204,9 @@ impl<'a> P<'a> {
                         pwd,
                         role,
                         run: None,
-                    }
-                } else if vars.is_empty() {
+                    });
+                }
+                return Some(if vars.is_empty() {
                     TrigStmt::ExecSql(sql)
                 } else {
                     TrigStmt::ExecInto {
@@ -12149,8 +12145,6 @@ mod tests {
             "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS DECLARE CX CURSOR FOR (SELECT UID FROM U2); BEGIN OPEN CX; FETCH CX; DELETE FROM U2 WHERE CURRENT OF CX RETURNING UID INTO :R1; CLOSE CX; SUSPEND; END",
             // RETURNING expressions: unprobed (columns only)
             "CREATE PROCEDURE X (P1 INTEGER) RETURNS (R1 INTEGER) AS BEGIN INSERT INTO U2 (UID) VALUES (:P1) RETURNING UID * 2 INTO :R1; SUSPEND; END",
-            // EXECUTE STATEMENT with an expression sql: unprobed
-            "CREATE PROCEDURE X RETURNS (R1 INTEGER) AS DECLARE V1 VARCHAR(50); BEGIN EXECUTE STATEMENT V1 INTO :R1; SUSPEND; END",
             // EXECUTE STATEMENT USING: unprobed
             "CREATE PROCEDURE X (P1 INTEGER) AS BEGIN EXECUTE STATEMENT 'delete from t where id = ?' USING :P1; END",
         ] {
