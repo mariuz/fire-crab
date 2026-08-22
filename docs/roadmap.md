@@ -247,7 +247,7 @@ DDL was.
 `INTERSECT`/`EXCEPT`; the named `WINDOW` clause; an explicit `PLAN` (WITH LOCK / FOR UPDATE / OPTIMIZE are done); a `?` inside any PSQL query (loop, cursor,
 `EXECUTE STATEMENT`, `SELECT INTO` — `server.rs:47089`);  `RDB$SET_CONTEXT`/`RDB$GET_CONTEXT`; `GEN_ID`
 inside an autonomous body; `INSERT … VALUES` without a column list in
-PSQL; `EXECUTE BLOCK` with parameters or `RETURNS`; `EXECUTE STATEMENT` with a NAMED head `(a := v)` or `USING` / `ON EXTERNAL` / `AS USER` (the dynamic-SQL operand and POSITIONAL `?` parameters are done); a bare aggregate over a
+PSQL; `EXECUTE BLOCK` with parameters or `RETURNS`; `EXECUTE STATEMENT` with `USING` / `ON EXTERNAL` / `AS USER` (the dynamic operand and POSITIONAL + NAMED parameters are done); a bare aggregate over a
 comma join (42000 at prepare); `= ANY`/`= ALL` over the strict text
 key; PSQL literals held as i32 (`serve-real-psqlerrors`); the BLR
 compiler narrower than the interpreter (a bare `EXCEPTION;` in a
@@ -388,13 +388,14 @@ pointer-page and TIP page numbers is the next step when it dominates.
 
 ## Next, in order
 
-- **EXECUTE STATEMENT positional parameters DONE (2026-08-22,
-  `serve-real-execstmt` 4):** the `(sql) (v1, v2, ...)` head binds its
-  `?` placeholders at run time - the values evaluated in the frame and
-  substituted as SQL literals (a `?` inside the statement's own string
-  literal left alone), which answers the engine's rows for the common
-  types; the BLR (blr_exec_stmt with its input values) is byte-for-byte
-  the engine's. A NAMED head `(a := v)` still refuses.
+- **EXECUTE STATEMENT positional + named parameters DONE (2026-08-22,
+  `serve-real-execstmt` 4):** the `(sql) (v1, ...)` head binds its `?`
+  placeholders, and the `(a := v, ...)` head its `:name` placeholders, at
+  run time - the values evaluated in the frame and substituted as SQL
+  literals (a placeholder inside the statement's own string literal left
+  alone; a repeated `:name` filled each time), which answers the engine's
+  rows for the common types; the BLR is byte-for-byte the engine's.
+  Boundary: USING / ON EXTERNAL / AS USER.
 - **Dynamic EXECUTE STATEMENT operand DONE (2026-08-22,
   `serve-real-execstmt` 4):** the SQL operand may now be any expression -
   a `||` concatenation of literals and variables, or a bare variable -

@@ -13780,7 +13780,7 @@ enum TrigStmt {
     /// the first; and the number of INTO slots must equal the projected
     /// column count exactly - a mismatch, INCLUDING a query with no INTO
     /// at all, is "Output parameters mismatch".
-    ExecStmt { text: Vec<DynPart>, into: Vec<u16>, params: Vec<fire_crab_ods::expr::Expr>, src_off: usize },
+    ExecStmt { text: Vec<DynPart>, into: Vec<u16>, params: Vec<(Option<String>, fire_crab_ods::expr::Expr)>, src_off: usize },
     /// `SELECT ... INTO :v[, :v];` - the STATIC singleton. Same fetch
     /// contract as [TrigStmt::ExecStmt]'s INTO (one row assigns - NULLs
     /// included - none leaves the slots alone, several raise 21000) with
@@ -14328,7 +14328,7 @@ fn find_stmt_semi(s: &str, from: usize, limit: usize) -> Option<usize> {
 fn parse_exec_stmt_param_form(
     operand: &str,
     vars: &[String],
-) -> Option<(Vec<DynPart>, Vec<fire_crab_ods::expr::Expr>)> {
+) -> Option<(Vec<DynPart>, Vec<(Option<String>, fire_crab_ods::expr::Expr)>)> {
     let t = operand.trim();
     if !t.starts_with('(') {
         return None;
@@ -14359,17 +14359,30 @@ fn parse_exec_stmt_param_form(
     }
     let vals_inner = &rest[1..rest.len() - 1];
     let dyn_text = parse_dyn_text(sql_inner, vars)?;
-    let mut params = Vec::new();
+    let mut params: Vec<(Option<String>, fire_crab_ods::expr::Expr)> = Vec::new();
+    let (mut any_named, mut any_pos) = (false, false);
     for part in vals_inner.split(',') {
         let p = part.trim();
-        if p.is_empty() || p.contains(":=") {
-            return None; // empty, or a named (name := v) head - not this slice
+        if p.is_empty() {
+            return None;
         }
-        let e = parse_expr(p.trim_start_matches(':').trim())?;
-        params.push(expr_resolve_vars(&e, vars));
+        if let Some(eq) = p.find(":=") {
+            // named: `name := <value>`
+            let name = p[..eq].trim();
+            if !ident_ok(name) {
+                return None;
+            }
+            let e = parse_expr(p[eq + 2..].trim().trim_start_matches(':').trim())?;
+            params.push((Some(name.to_ascii_uppercase()), expr_resolve_vars(&e, vars)));
+            any_named = true;
+        } else {
+            let e = parse_expr(p.trim_start_matches(':').trim())?;
+            params.push((None, expr_resolve_vars(&e, vars)));
+            any_pos = true;
+        }
     }
-    if params.is_empty() {
-        return None;
+    if params.is_empty() || (any_named && any_pos) {
+        return None; // no mixing positional and named
     }
     Some((dyn_text, params))
 }
@@ -14380,6 +14393,52 @@ fn parse_exec_stmt_param_form(
 /// still answer the engine's rows. `?` inside the statement's own string
 /// literals is left alone. None when a value is a type this rendering
 /// does not cover, or the placeholder count does not match.
+/// Substitute the NAMED `:name` placeholders of a dynamic statement with
+/// its bound values as SQL literals (see bind_dyn_params). A `:name`
+/// inside a string literal is left alone; a `:name` with no bound value,
+/// or an unused binding, refuses.
+fn bind_dyn_named(sql: &str, binds: &[(String, Value)]) -> Option<String> {
+    let lit = |v: &Value| -> Option<String> {
+        Some(match v {
+            Value::Int(n) => n.to_string(),
+            Value::Text(t) => format!("'{}'", t.replace('\'', "''")),
+            Value::Null => "NULL".to_string(),
+            _ => return None,
+        })
+    };
+    let b = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len() + 16);
+    let mut used = vec![false; binds.len()];
+    let mut in_str = false;
+    let mut i = 0usize;
+    while i < b.len() {
+        let c = b[i] as char;
+        if c == '\'' {
+            in_str = !in_str;
+            out.push(c);
+            i += 1;
+        } else if c == ':' && !in_str && b.get(i + 1).is_some_and(|c| c.is_ascii_alphabetic() || *c == b'_') {
+            let start = i + 1;
+            let mut j = start;
+            while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
+                j += 1;
+            }
+            let name = &sql[start..j];
+            let k = binds.iter().position(|(n, _)| n.eq_ignore_ascii_case(name))?;
+            used[k] = true;
+            out.push_str(&lit(&binds[k].1)?);
+            i = j;
+        } else {
+            out.push(c);
+            i += 1;
+        }
+    }
+    if !used.iter().all(|u| *u) {
+        return None; // an unused binding
+    }
+    Some(out)
+}
+
 fn bind_dyn_params(sql: &str, vals: &[Value]) -> Option<String> {
     let lit = |v: &Value| -> Option<String> {
         Some(match v {
@@ -53826,9 +53885,17 @@ fn exec_psql_stmt_inner(
             let sql = render_dyn_text(text, f)?.unwrap_or_default();
             let sql = if params.is_empty() {
                 sql
+            } else if params[0].0.is_some() {
+                // named `:name` binding
+                let mut binds = Vec::with_capacity(params.len());
+                for (n, e) in params {
+                    binds.push((n.clone().unwrap_or_default(), eval_psql_expr(e, f)?));
+                }
+                bind_dyn_named(&sql, &binds).ok_or(PsqlStop::Unsupported)?
             } else {
+                // positional `?` binding
                 let mut vals = Vec::with_capacity(params.len());
-                for e in params {
+                for (_, e) in params {
                     vals.push(eval_psql_expr(e, f)?);
                 }
                 bind_dyn_params(&sql, &vals).ok_or(PsqlStop::Unsupported)?
