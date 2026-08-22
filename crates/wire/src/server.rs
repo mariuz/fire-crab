@@ -27977,6 +27977,117 @@ fn rewrite_named_windows(sql: &str) -> Option<String> {
     Some(rewritten)
 }
 
+/// `<name> AS (` at a word boundary in the (masked, uppercased) text
+/// marks a CTE definition - a derived table is `(...) alias` and a
+/// column alias is `expr AS name` with no following paren, so neither is
+/// confused for one. Used to keep a CTE name out of the unknown-relation
+/// scan.
+fn is_cte_name(masked_up: &str, name: &str) -> bool {
+    let b = masked_up.as_bytes();
+    let mut from = 0;
+    while let Some(k) = find_word(masked_up, name, from) {
+        from = k + name.len();
+        let mut i = from;
+        while i < b.len() && b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        // AS as a whole word
+        if masked_up[i..].starts_with("AS")
+            && b.get(i + 2).is_none_or(|c| !(c.is_ascii_alphanumeric() || *c == b'_' || *c == b'$'))
+        {
+            let mut j = i + 2;
+            while j < b.len() && b[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if b.get(j) == Some(&b'(') {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// The first FROM/JOIN item in `sql` naming a relation the catalog does
+/// not have - not a table, view, procedure or CTE. It is the fallback
+/// that lets a query refused generically still answer the engine's -204
+/// "Table unknown" for an unknown relation ANYWHERE in the statement (a
+/// subquery, a derived table's inner query, an IN/EXISTS body), the way
+/// the main FROM already does directly. BARE names only: a qualified
+/// reference and a procedure CALL (`NAME(...)`) keep the generic refusal.
+/// Returns the byte range in `sql` and whether the name was quoted.
+fn first_unknown_relation(sql: &str, db: &Database) -> Option<(usize, usize, bool)> {
+    let up = sql.to_ascii_uppercase();
+    let masked = mask_literals(&up);
+    let b = masked.as_bytes();
+    let is_ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$';
+    let mut best: Option<(usize, usize, bool)> = None;
+    for kw in ["FROM", "JOIN"] {
+        let mut from = 0;
+        while let Some(k) = find_word(&masked, kw, from) {
+            from = k + kw.len();
+            let mut i = from;
+            while i < b.len() && b[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            if i >= b.len() {
+                break;
+            }
+            // a derived table / subquery, not a name
+            if b[i] == b'(' {
+                continue;
+            }
+            let quoted = b[i] == b'"';
+            let (nstart, nend);
+            if quoted {
+                nstart = i + 1;
+                let mut j = nstart;
+                while j < b.len() && b[j] != b'"' {
+                    j += 1;
+                }
+                nend = j;
+                i = (j + 1).min(b.len());
+            } else {
+                nstart = i;
+                let mut j = i;
+                while j < b.len() && is_ident(b[j]) {
+                    j += 1;
+                }
+                nend = j;
+                i = j;
+            }
+            if nend <= nstart {
+                continue;
+            }
+            let mut aft = i;
+            while aft < b.len() && b[aft].is_ascii_whitespace() {
+                aft += 1;
+            }
+            // a qualified reference (NAME.something) or a procedure CALL
+            // (NAME(...)) is not this fallback's business
+            if matches!(b.get(aft), Some(&b'.') | Some(&b'(')) {
+                continue;
+            }
+            let name = &up[nstart..nend];
+            // a keyword that can follow FROM but is not a relation
+            if !quoted && name == "LATERAL" {
+                continue;
+            }
+            if is_cte_name(&masked, name) {
+                continue;
+            }
+            // a known relation (table/view/GTT/system/MON$) or procedure
+            if relation_schema(db, name).is_some() || procedure_defined(db, name) {
+                continue;
+            }
+            if best.is_none_or(|(bs, _, _)| nstart < bs) {
+                best = Some((nstart, nend - nstart, quoted));
+            }
+            from = i;
+        }
+    }
+    best
+}
+
 fn plan_query(sql: &str, db: &Option<Database>) -> (Plan, Vec<Descriptor>) {
     USER_FNS.with(|m| *m.borrow_mut() = db.as_ref().map(user_function_sigs).unwrap_or_default());
     FN_CALLS.with(|l| l.borrow_mut().clear());
@@ -28009,7 +28120,7 @@ fn plan_query(sql: &str, db: &Option<Database>) -> (Plan, Vec<Descriptor>) {
             );
         }
     }
-    match (planned, params.into_iter().collect::<Option<Vec<_>>>()) {
+    let outcome = match (planned, params.into_iter().collect::<Option<Vec<_>>>()) {
         (Some(p), Some(ps)) => (p, ps),
         // A QUERY THIS SERVER CANNOT PLAN RAISES. It used to answer
         // Plan::Scalar(FIXED_ANSWER) - one row, one column, 4242 - which
@@ -28027,7 +28138,27 @@ fn plan_query(sql: &str, db: &Option<Database>) -> (Plan, Vec<Descriptor>) {
             None => (Plan::Refused, Vec::new()),
         },
         _ => (Plan::Scalar(ScalarVal::Fixed(Some(FIXED_ANSWER)), "CONSTANT".into(), None, ScalarTy::int64()), Vec::new()),
+    };
+    // A GENERIC refusal over a statement that names an UNKNOWN RELATION
+    // anywhere (a subquery, a derived table, an IN/EXISTS body) becomes
+    // the engine's typed -204 "Table unknown" - the main FROM already
+    // answers it directly; this reaches the ones the sub-planners refuse
+    // without a vector. Only a bare, generic Plan::Refused is upgraded, so
+    // a specific refusal (a typed RefusedEval) is never overridden.
+    if let (Plan::Refused, Some(dbr)) = (&outcome.0, db.as_ref()) {
+        if let Some((start, len, quoted)) = first_unknown_relation(sql, dbr) {
+            let part = &sql[start..start + len];
+            if let Some((line, col)) = text_line_col(sql, part) {
+                let name = if quoted {
+                    format!("\"{}\"", part)
+                } else {
+                    format!("\"{}\"", part.to_ascii_uppercase())
+                };
+                return (Plan::RefusedEval(EvalErr::TableUnknown { name, line, col }), Vec::new());
+            }
+        }
     }
+    outcome
 }
 
 // ===================================================================

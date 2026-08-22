@@ -35,9 +35,14 @@
 # code / SQLSTATE); fc answers it too, in the main FROM, once the name is
 # shown to be no table, view, procedure or CTE (checked below).
 #
-# Boundary (recorded): an unknown table inside a SUBQUERY (`... WHERE x IN
-# (SELECT ... FROM NOSUCHTAB)`) still refuses generically - the subquery
-# planner does not surface the typed -204 yet.
+# An unknown relation ANYWHERE - a subquery, a derived table, an
+# IN/EXISTS body, a scalar subselect - also answers -204 "Table unknown"
+# (checked below): a fallback over a generically-refused statement finds
+# the first unknown FROM/JOIN name.
+#
+# Boundary (recorded): a QUALIFIED unknown reference or a procedure CALL
+# INSIDE a subquery keeps the generic refusal - the fallback takes bare
+# relation names only.
 #
 #   qa/serve-real-callpkg.sh [port]
 set -u
@@ -173,6 +178,16 @@ SQL
 e=$("$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$REAL:$B" -i "$D/callpkg-unknowntab.sql" 2>&1 | norm)
 c=$("$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$A" -i "$D/callpkg-unknowntab.sql" 2>&1 | norm)
 check "an unknown relation in FROM is -204 Table unknown (bare, star, count, quoted)" "$c" "$e"
+# an unknown relation inside a SUBQUERY / derived table / IN-EXISTS body
+cat > "$D/callpkg-unknownsub.sql" <<'SQL'
+SELECT B FROM PKG.PP(2) WHERE B IN (SELECT ID FROM NOSUCHTAB);
+SELECT X FROM (SELECT ID AS X FROM NOSUCHTAB) D;
+SELECT (SELECT ID FROM NOSUCHTAB) FROM RDB$DATABASE;
+SELECT 1 FROM RDB$DATABASE WHERE EXISTS (SELECT 1 FROM NOSUCHTAB);
+SQL
+e=$("$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$REAL:$B" -i "$D/callpkg-unknownsub.sql" 2>&1 | norm)
+c=$("$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$A" -i "$D/callpkg-unknownsub.sql" 2>&1 | norm)
+check "an unknown relation in a subquery / derived table / IN / EXISTS is -204 Table unknown" "$c" "$e"
 
 gf=$("$GFIX" -v -full -user "$U" -pas "$P" "$A" 2>&1)
 ran=$((ran + 1))
