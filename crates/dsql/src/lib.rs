@@ -1086,6 +1086,15 @@ struct P<'a> {
     /// (the innermost-scope-first rule; an outer reference must be
     /// qualified)
     sub: Option<usize>,
+    /// when compiling a PACKAGE BODY member: the package's own name, so an
+    /// UNQUALIFIED call to a sibling member (`DBL(...)` inside package PK)
+    /// compiles to blr_function2 with THIS package - what the engine emits
+    package: Option<String>,
+    /// the sibling FUNCTION members (uppercased name, input arity) an
+    /// unqualified value call may bind to inside a package body; empty
+    /// outside one. Procedures are NOT here - a bare `P(...)` in value
+    /// position is not a sibling function and refuses, as the engine does.
+    pkg_members: Vec<(String, usize)>,
 }
 
 impl<'a> P<'a> {
@@ -1105,6 +1114,8 @@ impl<'a> P<'a> {
             local_vars: Vec::new(),
             next_label: 1,
             loop_labels: Vec::new(),
+            package: None,
+            pkg_members: Vec::new(),
             pending_loop_label: None,
             proc: None,
             agg_fid_ctx: 1,
@@ -2122,6 +2133,41 @@ impl<'a> P<'a> {
                 return None;
             }
             return Some(Val::SubFn(name.to_string(), args));
+        }
+        // an UNQUALIFIED call to a SIBLING package member: inside a package
+        // body a bare `DBL(...)` names package member DBL, compiled to
+        // blr_function2 with the CURRENT package - byte-identical to the
+        // qualified `PK.DBL(...)` (probed against the engine's
+        // RDB$FUNCTION_BLR). Only a declared sibling binds this way; any
+        // other unknown name still refuses below.
+        if let Some(pkg) = self.package.clone() {
+            if let Some(&(_, arity)) =
+                self.pkg_members.iter().find(|(m, _)| m == name)
+            {
+                self.i += 1; // (
+                let mut args = Vec::new();
+                if matches!(self.t.get(self.i), Some(Tok::RParen)) {
+                    self.i += 1;
+                } else {
+                    loop {
+                        args.push(self.val()?);
+                        match self.t.get(self.i)? {
+                            Tok::Comma => self.i += 1,
+                            Tok::RParen => {
+                                self.i += 1;
+                                break;
+                            }
+                            _ => return None,
+                        }
+                    }
+                }
+                // the sibling's declared arity must match, as the engine
+                // checks at compile - a wrong count refuses the member
+                if args.len() != arity {
+                    return None;
+                }
+                return Some(Val::PkgFn(pkg, name.to_string(), args));
+            }
         }
         self.i += 1; // (
         let v = match name {
@@ -3205,6 +3251,8 @@ pub fn compile_view_columns(sql: &str) -> Option<Vec<Option<Vec<u8>>>> {
         local_vars: Vec::new(),
         next_label: 1,
             loop_labels: Vec::new(),
+            package: None,
+            pkg_members: Vec::new(),
             pending_loop_label: None,
         proc: None,
         agg_fid_ctx: 1,
@@ -3356,6 +3404,8 @@ pub fn compile_view_select(sql: &str) -> Option<Vec<u8>> {
         local_vars: Vec::new(),
         next_label: 1,
             loop_labels: Vec::new(),
+            package: None,
+            pkg_members: Vec::new(),
             pending_loop_label: None,
         proc: None,
         agg_fid_ctx: 1,
@@ -9247,6 +9297,8 @@ pub fn compile_default(sql: &str) -> Option<Vec<u8>> {
         local_vars: Vec::new(),
         next_label: 1,
             loop_labels: Vec::new(),
+            package: None,
+            pkg_members: Vec::new(),
             pending_loop_label: None,
         proc: None,
         agg_fid_ctx: 1,
@@ -9328,6 +9380,8 @@ pub fn compile_computed(sql: &str) -> Option<Vec<u8>> {
         local_vars: Vec::new(),
         next_label: 1,
             loop_labels: Vec::new(),
+            package: None,
+            pkg_members: Vec::new(),
             pending_loop_label: None,
         proc: None,
         agg_fid_ctx: 1,
@@ -9404,6 +9458,8 @@ pub fn compile_check(sql: &str) -> Option<Vec<u8>> {
         local_vars: Vec::new(),
         next_label: 1,
             loop_labels: Vec::new(),
+            package: None,
+            pkg_members: Vec::new(),
             pending_loop_label: None,
         proc: None,
         agg_fid_ctx: 1,
@@ -9481,6 +9537,8 @@ pub fn compile_validation(sql: &str) -> Option<Vec<u8>> {
         local_vars: Vec::new(),
         next_label: 1,
             loop_labels: Vec::new(),
+            package: None,
+            pkg_members: Vec::new(),
             pending_loop_label: None,
         proc: None,
         agg_fid_ctx: 1,
@@ -9582,6 +9640,8 @@ pub fn compile_trigger(sql: &str) -> Option<Vec<u8>> {
         local_vars: Vec::new(),
         next_label: 1,
             loop_labels: Vec::new(),
+            package: None,
+            pkg_members: Vec::new(),
             pending_loop_label: None,
         proc: None,
         agg_fid_ctx: 1,
@@ -9803,11 +9863,21 @@ pub struct ProcCompiled {
 /// [compile_procedure] with the catalog metadata kept - None exactly
 /// when compile_procedure refuses, so the DDL surface and the BLR
 /// oracle can never drift.
-pub fn compile_procedure_full(sql: &str) -> Option<ProcCompiled> {
+fn compile_routine_full(
+    sql: &str,
+    is_function: bool,
+    pkg: Option<(&str, &[(String, usize)])>,
+) -> Option<ProcCompiled> {
     let trimmed = sql.trim().trim_end_matches(';');
     let toks = lex(trimmed)?;
     let mut p = P::fresh(&toks);
-    if !(p.kw("CREATE") && p.kw("PROCEDURE")) {
+    if let Some((pkn, mems)) = pkg {
+        // a PACKAGE BODY member: sibling members resolve unqualified
+        p.package = Some(pkn.to_ascii_uppercase());
+        p.pkg_members = mems.iter().map(|(m, a)| (m.to_ascii_uppercase(), *a)).collect();
+    }
+    let kw2 = if is_function { "FUNCTION" } else { "PROCEDURE" };
+    if !(p.kw("CREATE") && p.kw(kw2)) {
         return None;
     }
     let name = match p.t.get(p.i)? {
@@ -9817,10 +9887,9 @@ pub fn compile_procedure_full(sql: &str) -> Option<ProcCompiled> {
         }
         _ => return None,
     };
-    let bo = body_compile(&mut p, false, false)?;
+    let bo = body_compile(&mut p, is_function, false)?;
     // the stored source is the text from AS onward, first non-space:
-    // the engine keeps the body (declares + BEGIN..END), which is also
-    // exactly what load-by-source interpreters expect
+    // exactly what the load-by-source interpreter expects
     let up = trimmed.to_ascii_uppercase();
     let bytes = up.as_bytes();
     let mut as_at = None;
@@ -9848,6 +9917,21 @@ pub fn compile_procedure_full(sql: &str) -> Option<ProcCompiled> {
     })
 }
 
+pub fn compile_procedure_full(sql: &str) -> Option<ProcCompiled> {
+    compile_routine_full(sql, false, None)
+}
+
+/// [compile_procedure_full] with the enclosing package's name and its
+/// sibling member names, so an unqualified sibling call in the body binds
+/// to the package (blr_function2 with THIS package).
+pub fn compile_procedure_full_in_package(
+    sql: &str,
+    package: &str,
+    members: &[(String, usize)],
+) -> Option<ProcCompiled> {
+    compile_routine_full(sql, false, Some((package, members)))
+}
+
 /// `compile_procedure` as uppercase hex.
 /// `CREATE FUNCTION <name> (<args>) RETURNS <type> [DETERMINISTIC] AS <body>`:
 /// the procedure compiler in FUNCTION mode (the one package functions
@@ -9856,45 +9940,17 @@ pub fn compile_procedure_full(sql: &str) -> Option<ProcCompiled> {
 /// final send without the EOS flag (probed byte for byte against the
 /// engine's RDB$FUNCTION_BLR).
 pub fn compile_function_full(sql: &str) -> Option<ProcCompiled> {
-    let trimmed = sql.trim().trim_end_matches(';');
-    let toks = lex(trimmed)?;
-    let mut p = P::fresh(&toks);
-    if !(p.kw("CREATE") && p.kw("FUNCTION")) {
-        return None;
-    }
-    let name = match p.t.get(p.i)? {
-        Tok::Ident(w) if !is_keyword(w) => {
-            p.i += 1;
-            w.to_ascii_uppercase()
-        }
-        _ => return None,
-    };
-    let bo = body_compile(&mut p, true, false)?;
-    let up = trimmed.to_ascii_uppercase();
-    let bytes = up.as_bytes();
-    let mut as_at = None;
-    let mut k = 0usize;
-    while let Some(rel) = up[k..].find("AS") {
-        let at = k + rel;
-        let before_ok = at == 0 || !bytes[at - 1].is_ascii_alphanumeric() && bytes[at - 1] != b'_' && bytes[at - 1] != b'$';
-        let after_ok = bytes
-            .get(at + 2)
-            .is_none_or(|c| !c.is_ascii_alphanumeric() && *c != b'_' && *c != b'$');
-        if before_ok && after_ok {
-            as_at = Some(at);
-            break;
-        }
-        k = at + 2;
-    }
-    let source = trimmed[as_at? + 2..].trim_start().to_string();
-    Some(ProcCompiled {
-        name,
-        blob: bo.blob,
-        ins: bo.ins.iter().map(|(n, d)| dsc_to_meta(n, d)).collect(),
-        outs: bo.outs.iter().map(|(n, d)| dsc_to_meta(n, d)).collect(),
-        selectable: bo.selectable,
-        source,
-    })
+    compile_routine_full(sql, true, None)
+}
+
+/// [compile_function_full] with the enclosing package's name and its
+/// sibling member names (see [compile_procedure_full_in_package]).
+pub fn compile_function_full_in_package(
+    sql: &str,
+    package: &str,
+    members: &[(String, usize)],
+) -> Option<ProcCompiled> {
+    compile_routine_full(sql, true, Some((package, members)))
 }
 
 pub fn compile_procedure_hex(sql: &str) -> Option<String> {
@@ -10505,6 +10561,47 @@ mod tests {
             Some(want_hex),
             "{sql}"
         );
+    }
+
+    #[test]
+    fn a_package_member_calls_a_sibling_unqualified() {
+        // inside a package body a bare `DBL(...)` names sibling member DBL,
+        // compiled to blr_function2 with THIS package (C2 <pkg> <name>
+        // <argcount>) - byte-identical to the engine's RDB$FUNCTION_BLR for
+        // the same package body (read back with blrdump).
+        let members = vec![("DBL".to_string(), 1usize), ("QUAD".to_string(), 1usize)];
+        let c = compile_function_full_in_package(
+            "CREATE FUNCTION QUAD(A INTEGER) RETURNS INTEGER AS BEGIN RETURN DBL(DBL(A)); END",
+            "PK",
+            &members,
+        )
+        .expect("QUAD compiles in package PK");
+        let hex: String = c.blob.iter().map(|b| format!("{:02X}", b)).collect();
+        assert_eq!(
+            hex,
+            "05020400020008000700040103000800070007000C00020300000800012D1A00009B110002020201C202504B0344424C01C202504B0344424C012900000001001A00000E0102011A0000290100000100FF1200FFFFFFFF0E0102011A0000290100000100FFFF4C"
+        );
+        // WITHOUT the package context (or when the name is no sibling) the
+        // same body still REFUSES - a bare unknown call is never silently
+        // turned into a field
+        assert!(compile_function_full(
+            "CREATE FUNCTION QUAD(A INTEGER) RETURNS INTEGER AS BEGIN RETURN DBL(DBL(A)); END"
+        )
+        .is_none());
+        assert!(compile_function_full_in_package(
+            "CREATE FUNCTION QUAD(A INTEGER) RETURNS INTEGER AS BEGIN RETURN NOPE(A); END",
+            "PK",
+            &members,
+        )
+        .is_none());
+        // a sibling call with the WRONG arg count refuses (the engine's
+        // parameter-mismatch at compile)
+        assert!(compile_function_full_in_package(
+            "CREATE FUNCTION QUAD(A INTEGER) RETURNS INTEGER AS BEGIN RETURN DBL(A, A); END",
+            "PK",
+            &members,
+        )
+        .is_none());
     }
 
     #[test]

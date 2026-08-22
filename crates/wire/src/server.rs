@@ -17119,16 +17119,73 @@ fn plan_create_package_body(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
     if starts.is_empty() {
         return None;
     }
+    // the member segment texts, and their names (uppercased) up front: a
+    // member body's UNQUALIFIED call to a SIBLING binds to these, compiled
+    // as a call into THIS package (the engine resolves the same way).
+    let segs: Vec<&str> = (0..starts.len())
+        .map(|k| {
+            if k + 1 < starts.len() {
+                inner[starts[k]..starts[k + 1]].trim()
+            } else {
+                inner[starts[k]..].trim()
+            }
+        })
+        .collect();
+    // only a FUNCTION member is callable in VALUE position, so a bare
+    // sibling call binds only to these (name, input arity). A sibling
+    // PROCEDURE is deliberately absent - a bare `P(...)` in an expression
+    // is not a value function and refuses, exactly as the engine's scalar
+    // resolution does; a wrong arg count refuses too.
+    let member_names: Vec<(String, usize)> = segs
+        .iter()
+        .filter_map(|seg| {
+            let su = seg.to_ascii_uppercase();
+            if find_word(&su, "FUNCTION", 0) != Some(0) {
+                return None;
+            }
+            let rest = seg["FUNCTION".len()..].trim_start();
+            let nend = rest
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$'))
+                .unwrap_or(rest.len());
+            let name = rest[..nend].to_ascii_uppercase();
+            // the input arity: the top-level params in the FIRST paren
+            // group of the SIGNATURE (before AS), 0 if none; a nested paren
+            // in a type (NUMERIC(9,2)) is skipped by the depth count
+            let header_end = find_word(&su, "AS", 0).unwrap_or(seg.len());
+            let header = &seg[..header_end];
+            let arity = header.find('(').map_or(0, |open| {
+                let b = header.as_bytes();
+                let (mut depth, mut count, mut any) = (0i32, 0usize, false);
+                let mut i = open;
+                while i < b.len() {
+                    match b[i] {
+                        b'(' => depth += 1,
+                        b')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        b',' if depth == 1 => count += 1,
+                        c if depth == 1 && !c.is_ascii_whitespace() => any = true,
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                if any { count + 1 } else { 0 }
+            });
+            Some((name, arity))
+        })
+        .collect();
     let mut members: Vec<fire_crab_ods::ddl::PackageBodyMember> = Vec::new();
-    for k in 0..starts.len() {
-        let seg = if k + 1 < starts.len() {
-            inner[starts[k]..starts[k + 1]].trim()
-        } else {
-            inner[starts[k]..].trim()
-        };
+    for seg in &segs {
         let su = seg.to_ascii_uppercase();
         if find_word(&su, "PROCEDURE", 0) == Some(0) {
-            let c = fire_crab_dsql::compile_procedure_full(&format!("CREATE {}", seg))?;
+            let c = fire_crab_dsql::compile_procedure_full_in_package(
+                &format!("CREATE {}", seg),
+                &name,
+                &member_names,
+            )?;
             members.push(fire_crab_ods::ddl::PackageBodyMember::Procedure {
                 name: c.name,
                 ins: c.ins.iter().map(proc_param_of).collect(),
@@ -17137,7 +17194,11 @@ fn plan_create_package_body(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
                 blr: c.blob,
             });
         } else if find_word(&su, "FUNCTION", 0) == Some(0) {
-            let c = fire_crab_dsql::compile_function_full(&format!("CREATE {}", seg))?;
+            let c = fire_crab_dsql::compile_function_full_in_package(
+                &format!("CREATE {}", seg),
+                &name,
+                &member_names,
+            )?;
             if c.outs.len() != 1 {
                 return None;
             }
@@ -49588,7 +49649,10 @@ fn default_expr_name(raw: &RawExpr) -> String {
         RawExpr::Iif(_, _, _) => "CASE",
         RawExpr::Case(..) => "CASE",
         RawExpr::Func(f, _) => return f.header().to_string(),
-        RawExpr::UserFn(n, _) => return n.clone(),
+        // a function call columns by the FUNCTION's own name - the bare
+        // member name even for a packaged call `PK.DBL(x)` (probed: the
+        // engine names the column DBL, not PK.DBL)
+        RawExpr::UserFn(n, _) => return n.rsplit('.').next().unwrap_or(n).to_string(),
         RawExpr::CurrentDate => "CURRENT_DATE",
         RawExpr::LocalTime => "LOCALTIME",
         RawExpr::LocalTimestamp => "LOCALTIMESTAMP",

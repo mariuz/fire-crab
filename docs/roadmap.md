@@ -388,6 +388,26 @@ pointer-page and TIP page numbers is the next step when it dominates.
 
 ## Next, in order
 
+- **CREATE PACKAGE BODY: a member that calls a sibling unqualified DONE
+  (2026-08-22, `serve-real-pkgsibling` 8):** inside a package body a bare
+  `DBL(...)` names sibling member DBL, compiled to `blr_function2` with THIS
+  package - byte-identical to the qualified `PK.DBL(...)` (probed against
+  the engine's RDB$FUNCTION_BLR). Before, the standalone per-member compile
+  refused the sibling call, so `CREATE PACKAGE BODY` fell through storing a
+  NULL body source - which made EVERY function in the package unknown
+  (-804) in later queries. Now the body compiles, its BLR is byte-exact,
+  and the engine runs fc's stored file for every member (the sibling-caller
+  included). The DSQL compiler gained a package context (name + sibling
+  FUNCTION signatures); a sibling call binds only to a FUNCTION and only at
+  the declared arity, so a wrong-arity call or a bare call to a sibling
+  PROCEDURE refuses on both (an adversarial review caught both). Also fixed:
+  a packaged function call columns by its BARE member name (DBL, not
+  PK.DBL), the engine's describe. Boundary (recorded): fc INTERPRETS bodies
+  from source and cannot yet run a user-function call from an interpreted
+  body, so a member that calls a sibling, queried through fc's OWN wire,
+  refuses (fc stores byte-exact BLR, so the engine runs it) - a broader gap
+  that holds for a plain function calling another function too.
+
 - **Statistical aggregates VAR_POP / VAR_SAMP / STDDEV_POP / STDDEV_SAMP
   DONE (2026-08-22, `serve-real-statagg` 4):** a DOUBLE fold over the
   non-null values, the naive sum-of-squares the engine uses
