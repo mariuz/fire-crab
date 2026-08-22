@@ -29463,7 +29463,57 @@ fn strip_modifiers(sql: &str) -> Option<(String, bool, usize, Option<usize>, boo
 
     // a trailing ROWS n [TO m] - one word, so find_word not find_kw_by
     let mut tail_end = s.len();
-    if let Some(kw) = find_word(&up, "ROWS", 0) {
+    // SQL-standard OFFSET / FETCH come FIRST: `FETCH NEXT 2 ROWS ONLY`
+    // contains the word ROWS, so the native `ROWS n [TO m]` scan below
+    // must not run when either keyword is present. Forms (literal counts
+    // only, like FIRST/SKIP): `OFFSET <n> ROW|ROWS`, `FETCH {FIRST|NEXT}
+    // [<n>] ROW|ROWS ONLY`, or both in that order (OFFSET then FETCH ->
+    // skip then take). WITH TIES and PERCENT are not this engine's (both
+    // -104); a `?` count is not this slice.
+    let off_kw = find_word(&up, "OFFSET", 0);
+    let fetch_kw = find_word(&up, "FETCH", 0);
+    if off_kw.is_some() || fetch_kw.is_some() {
+        if let (Some(o), Some(f)) = (off_kw, fetch_kw) {
+            if o > f {
+                return None; // OFFSET must precede FETCH
+            }
+        }
+        if let Some(o) = off_kw {
+            let mut it = up[o + "OFFSET".len()..].split_whitespace();
+            skip = it.next()?.parse().ok()?; // a literal count only
+            match it.next() {
+                Some(u) if u.eq_ignore_ascii_case("ROW") || u.eq_ignore_ascii_case("ROWS") => {}
+                _ => return None,
+            }
+        }
+        if let Some(f) = fetch_kw {
+            let mut it = up[f + "FETCH".len()..].split_whitespace();
+            match it.next() {
+                Some(w) if w.eq_ignore_ascii_case("FIRST") || w.eq_ignore_ascii_case("NEXT") => {}
+                _ => return None,
+            }
+            // an optional literal count, then ROW|ROWS, then ONLY
+            let nx = it.next()?;
+            let (cnt, unit) = if !nx.is_empty() && nx.bytes().all(|c| c.is_ascii_digit()) {
+                (nx.parse::<usize>().ok()?, it.next()?)
+            } else {
+                (1usize, nx) // `FETCH FIRST ROW ONLY` - no count is one row
+            };
+            if !(unit.eq_ignore_ascii_case("ROW") || unit.eq_ignore_ascii_case("ROWS")) {
+                return None;
+            }
+            match it.next() {
+                Some(o) if o.eq_ignore_ascii_case("ONLY") => {}
+                _ => return None, // WITH TIES / PERCENT / trailing -> not this
+            }
+            if it.next().is_some() {
+                return None;
+            }
+            take = Some(cnt);
+        }
+        found = true;
+        tail_end = off_kw.into_iter().chain(fetch_kw).min().unwrap_or(s.len());
+    } else if let Some(kw) = find_word(&up, "ROWS", 0) {
         let spec = s[kw + "ROWS".len()..].trim();
         let mut it = spec.split_whitespace();
         let n: usize = it.next()?.parse().ok()?;

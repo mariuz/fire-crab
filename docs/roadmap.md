@@ -392,6 +392,16 @@ pointer-page and TIP page numbers is the next step when it dominates.
 
 ## Next, in order
 
+- **SQL-standard OFFSET / FETCH DONE (2026-08-22, `serve-real-offsetfetch`
+  16):** `OFFSET <n> ROW|ROWS` and `FETCH {FIRST|NEXT} [<n>] ROW|ROWS
+  ONLY`, alone or combined (OFFSET then FETCH -> skip then take), beside
+  the native FIRST/SKIP/`ROWS n [TO m]`. Parsed in `strip_modifiers` as a
+  trailing clause, mapping to the same skip/take as the native forms;
+  literal counts only (like FIRST/SKIP). The native `ROWS n [TO m]` scan
+  is skipped when OFFSET/FETCH is present, since `FETCH NEXT 2 ROWS ONLY`
+  contains the word ROWS. Composes with DISTINCT and inside a derived
+  table. `WITH TIES` and `... PERCENT` are not this engine's syntax (both
+  -104) and stay refused.
 - **Dead-code cleanup DONE (2026-08-21):** `Database::image_undo` /
   `ddl_undo` were never set once DDL became the transaction's, so
   `restore_db`, the image branch of `undo_window` / `rollback_now`
