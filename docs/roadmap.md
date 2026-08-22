@@ -689,11 +689,15 @@ pointer-page and TIP page numbers is the next step when it dominates.
   client round-tripped and isql rendered as `c000000:a000000` for the
   engine's `c:1e6`. All nine blob/array/batch gates green after the
   switch.
-- **NEXT**: the rest of the auth/restore-only DDL, each a separate effort
-  with its own obstacle — `CREATE USER` writes the security database's
-  PLG$SRP (not this catalog); `CREATE PACKAGE` is a PSQL module (header +
-  body); `CREATE SHADOW` needs a physical shadow file beside its RDB$FILES
-  row; and collation-aware ordering (this server keys binary). (`MAPPING`
+- **NEXT**: the rest of the auth/restore-only DDL — `CREATE PACKAGE BODY`
+  (the member implementations, with per-member BLR compilation, on top of
+  the header now done); `CREATE USER` (the security database's PLG$SRP, not
+  this catalog); `CREATE SHADOW` (a physical shadow file beside its
+  RDB$FILES row); and collation-aware ordering (this server keys binary).
+  (`PACKAGE` headers DONE 2026-08-22: CREATE/DROP PACKAGE write RDB$PACKAGES
+  + declaration members + params, byte-for-byte; a `declaration` flag on
+  the procedure/function writers omits the BLR columns. serve-real-package
+  5; CREATE PACKAGE BODY refuses.) (`MAPPING`
   and `COLLATION` DONE 2026-08-22: CREATE/ALTER/DROP MAPPING →
   RDB$AUTH_MAPPING and CREATE/DROP COLLATION → RDB$COLLATIONS, both
   byte-for-byte with the engine's catalog and vectors — serve-real-mapping
