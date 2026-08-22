@@ -60,11 +60,32 @@ check "CREATE / DROP PACKAGE header, members and parameters" "$c" "$e"
 e=$("$D/sqlerr" "127.0.0.1/$REAL:$B" "CREATE PACKAGE PKG AS BEGIN PROCEDURE X (A INTEGER); END" "DROP PACKAGE NOPE" 2>&1 | norm)
 c=$("$D/sqlerr" "127.0.0.1/$PORT:$A" "CREATE PACKAGE PKG AS BEGIN PROCEDURE X (A INTEGER); END" "DROP PACKAGE NOPE" 2>&1 | norm)
 check "the duplicate / missing PACKAGE vectors" "$c" "$e"
-# Boundary: CREATE PACKAGE BODY is not taken here
-cb=$("$D/sqlerr" "127.0.0.1/$PORT:$A" "CREATE PACKAGE BODY PKG AS BEGIN PROCEDURE PP (A INTEGER) RETURNS (B INTEGER) AS BEGIN B = A; SUSPEND; END FUNCTION FF (A INTEGER) RETURNS INTEGER AS BEGIN RETURN A; END PROCEDURE P2 (X VARCHAR(5)) AS BEGIN EXIT; END END" 2>&1 | norm)
-ran=$((ran + 1))
-if [ "${cb#*gds}" != "$cb" ]; then echo "OK   boundary: CREATE PACKAGE BODY refuses (the implementations, a later slice)"
-else echo "DIFF boundary MOVED: PACKAGE BODY"; echo "     fc: $cb"; fail=1; fi
+# CREATE PACKAGE BODY - the implementations. Run on both, compare the catalog:
+# the body source + VALID_BODY_FLAG, each member's TYPE/VALID_BLR (SOURCE null),
+# and the rewritten parameters over their fresh domains.
+cat > "$D/pkg-body.sql" <<'SQL'
+SET TERM ^;
+CREATE PACKAGE BODY PKG AS BEGIN PROCEDURE PP (A INTEGER) RETURNS (B INTEGER) AS BEGIN B = A * 2; SUSPEND; END FUNCTION FF (A INTEGER) RETURNS INTEGER AS BEGIN RETURN A + 1; END PROCEDURE P2 (X VARCHAR(5)) AS BEGIN EXIT; END END^
+SET TERM ;^
+COMMIT;
+SET LIST ON;
+SELECT RDB$PACKAGE_NAME AS NM, CAST(RDB$PACKAGE_BODY_SOURCE AS VARCHAR(300)) AS BDY, RDB$VALID_BODY_FLAG AS VB FROM RDB$PACKAGES WHERE RDB$SYSTEM_FLAG = 0 ORDER BY 1;
+SELECT RDB$PROCEDURE_NAME AS PR, RDB$PROCEDURE_TYPE AS T, RDB$VALID_BLR AS VB, CAST(RDB$PROCEDURE_SOURCE AS VARCHAR(20)) AS SRC FROM RDB$PROCEDURES WHERE RDB$PACKAGE_NAME = 'PKG' ORDER BY 1;
+SELECT RDB$FUNCTION_NAME AS FN, RDB$VALID_BLR AS VB, CAST(RDB$FUNCTION_SOURCE AS VARCHAR(20)) AS SRC FROM RDB$FUNCTIONS WHERE RDB$PACKAGE_NAME = 'PKG' ORDER BY 1;
+SELECT pp.RDB$PROCEDURE_NAME AS PR, pp.RDB$PARAMETER_NAME AS PN, pp.RDB$PARAMETER_TYPE AS TY, f.RDB$FIELD_TYPE AS FT, f.RDB$CHARACTER_LENGTH AS CL FROM RDB$PROCEDURE_PARAMETERS pp JOIN RDB$FIELDS f ON f.RDB$FIELD_NAME = pp.RDB$FIELD_SOURCE WHERE pp.RDB$PACKAGE_NAME = 'PKG' ORDER BY 1, 3, pp.RDB$PARAMETER_NUMBER;
+SQL
+e=$("$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$REAL:$B" -i "$D/pkg-body.sql" 2>&1 | norm)
+c=$("$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$A" -i "$D/pkg-body.sql" 2>&1 | norm)
+check "CREATE PACKAGE BODY body source, member BLR/TYPE and rewritten params" "$c" "$e"
+# a second body refuses (already exists), and a body with no header refuses
+e=$("$D/sqlerr" "127.0.0.1/$REAL:$B" "CREATE PACKAGE BODY PKG AS BEGIN PROCEDURE PP (A INTEGER) RETURNS (B INTEGER) AS BEGIN B = A; SUSPEND; END FUNCTION FF (A INTEGER) RETURNS INTEGER AS BEGIN RETURN A; END PROCEDURE P2 (X VARCHAR(5)) AS BEGIN EXIT; END END" "CREATE PACKAGE BODY NOPKG AS BEGIN FUNCTION F (A INTEGER) RETURNS INTEGER AS BEGIN RETURN A; END END" 2>&1 | norm)
+c=$("$D/sqlerr" "127.0.0.1/$PORT:$A" "CREATE PACKAGE BODY PKG AS BEGIN PROCEDURE PP (A INTEGER) RETURNS (B INTEGER) AS BEGIN B = A; SUSPEND; END FUNCTION FF (A INTEGER) RETURNS INTEGER AS BEGIN RETURN A; END PROCEDURE P2 (X VARCHAR(5)) AS BEGIN EXIT; END END" "CREATE PACKAGE BODY NOPKG AS BEGIN FUNCTION F (A INTEGER) RETURNS INTEGER AS BEGIN RETURN A; END END" 2>&1 | norm)
+check "the duplicate-body / body-without-header vectors" "$c" "$e"
+# the ENGINE runs the BLR fc stored (proves the compiled member is valid)
+rc="SET LIST ON; SELECT PKG.FF(41) AS R FROM RDB\$DATABASE; SELECT B FROM PKG.PP(21);"
+e=$(printf '%s\n' "$rc" | "$ISQL" -q -user "$U" -pas "$P" "$B" 2>&1 | norm)
+c=$(printf '%s\n' "$rc" | "$ISQL" -q -user "$U" -pas "$P" "$A" 2>&1 | norm)
+check "the ENGINE runs fc's stored member BLR (FF -> 42, PP -> 42)" "$c" "$e"
 gf=$("$GFIX" -v -full -user "$U" -pas "$P" "$A" 2>&1)
 ran=$((ran + 1))
 if [ -z "$gf" ]; then echo "OK   gfix -v -full clean on fc's file"; else echo "DIFF gfix: $gf"; fail=1; fi

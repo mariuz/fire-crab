@@ -223,19 +223,24 @@ is answered (2026-08-21, see the slice list).
 
 ### E. DDL without planners
 
-Everything below falls to `Plan::Refused` (generic Dynamic SQL Error at
-prepare): `CREATE/ALTER/DROP VIEW` (views are read from restored
-metadata only), `ALTER/DROP TRIGGER`, `CREATE OR ALTER TRIGGER`,
-`ALTER PROCEDURE`, `CREATE OR ALTER PROCEDURE`, `CREATE/ALTER/DROP
-FUNCTION`, `CREATE PACKAGE` (restore-only), `CREATE COLLATION`,
-`CREATE/ALTER/DROP USER`, `CREATE/ALTER MAPPING`, `CREATE SHADOW`
-(restore-only), `RECREATE <anything>` (the verb gate admits it, no
-planner), `ALTER DATABASE` beyond `BEGIN/END BACKUP`, `CREATE ROLE …
-SET SYSTEM PRIVILEGES`. `CREATE TABLE`'s column types
-(`server.rs:11183`) lack BLOB, DECFLOAT, `TIME/TIMESTAMP WITH TIME
-ZONE`, NCHAR, arrays, and the `COLLATE` / `CHARACTER SET` clauses.
-Gates today build their procedures with the ENGINE, which is why the
-interpreter is well covered and the DDL is not.
+This section has largely closed. Planners now exist and are
+differentially gated for `CREATE/ALTER/DROP VIEW`, `RECREATE <anything>`,
+`ALTER/DROP TRIGGER`, `CREATE OR ALTER TRIGGER`, `ALTER PROCEDURE`,
+`CREATE OR ALTER PROCEDURE`, `CREATE/ALTER/DROP FUNCTION`,
+`CREATE/DROP PACKAGE` + `CREATE PACKAGE BODY`, `CREATE/DROP COLLATION`,
+`CREATE/ALTER/DROP MAPPING`, and the full `CREATE TABLE` column-type set
+(BLOB, DECFLOAT, `TIME/TIMESTAMP WITH TIME ZONE`, NCHAR, arrays, and the
+`COLLATE` / `CHARACTER SET` clauses). DROP-dependency enforcement (views,
+procedures, FK/PK back-references) refuses with the engine's exact vector.
+
+Still `Plan::Refused` (generic Dynamic SQL Error at prepare): `CREATE/
+ALTER/DROP USER` (the security database's PLG$SRP, a separate database,
+not this catalog), `CREATE SHADOW` (a physical shadow file beside its
+RDB$FILES row), `ALTER DATABASE` beyond `BEGIN/END BACKUP`, and `CREATE
+ROLE … SET SYSTEM PRIVILEGES`. The first two are outside fc's
+pure-catalog model by nature. Gates historically built their procedures
+with the ENGINE, which is why the interpreter was well covered before the
+DDL was.
 
 ### F. DML and PSQL gaps
 
@@ -689,15 +694,22 @@ pointer-page and TIP page numbers is the next step when it dominates.
   client round-tripped and isql rendered as `c000000:a000000` for the
   engine's `c:1e6`. All nine blob/array/batch gates green after the
   switch.
-- **NEXT**: the rest of the auth/restore-only DDL — `CREATE PACKAGE BODY`
-  (the member implementations, with per-member BLR compilation, on top of
-  the header now done); `CREATE USER` (the security database's PLG$SRP, not
-  this catalog); `CREATE SHADOW` (a physical shadow file beside its
-  RDB$FILES row); and collation-aware ordering (this server keys binary).
-  (`PACKAGE` headers DONE 2026-08-22: CREATE/DROP PACKAGE write RDB$PACKAGES
-  + declaration members + params, byte-for-byte; a `declaration` flag on
-  the procedure/function writers omits the BLR columns. serve-real-package
-  5; CREATE PACKAGE BODY refuses.) (`MAPPING`
+- **NEXT**: the tail of the auth/restore-only DDL — `CREATE USER` (the
+  security database's PLG$SRP, not this catalog); `CREATE SHADOW` (a
+  physical shadow file beside its RDB$FILES row); and collation-aware
+  ordering (this server keys binary). Both are outside fc's pure-catalog
+  model (a separate database / a physical file), so the DDL group is
+  effectively complete for the catalog cases.
+  (`PACKAGE` headers + BODY DONE 2026-08-22: CREATE/DROP PACKAGE write
+  RDB$PACKAGES + declaration members + params, byte-for-byte; a
+  `declaration` flag on the procedure/function writers omits the BLR
+  columns. CREATE PACKAGE BODY compiles each member's full body (a
+  BEGIN/END-depth splitter finds the PROCEDURE/FUNCTION boundaries),
+  fills its BLR/TYPE/VALID_BLR keeping the member id and rewriting the
+  params over fresh domains, leaves the member SOURCE null, and stamps
+  RDB$PACKAGES with the body source + VALID_BODY_FLAG. A second body or a
+  body with no header refuses with the engine's vector; the engine runs
+  the BLR fc stored. serve-real-package 7.) (`MAPPING`
   and `COLLATION` DONE 2026-08-22: CREATE/ALTER/DROP MAPPING →
   RDB$AUTH_MAPPING and CREATE/DROP COLLATION → RDB$COLLATIONS, both
   byte-for-byte with the engine's catalog and vectors — serve-real-mapping

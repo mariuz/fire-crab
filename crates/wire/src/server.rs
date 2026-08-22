@@ -1617,6 +1617,29 @@ fn respond_ddl_meta(
             return Ok(true);
         }
     }
+    if let Plan::CreatePackageBody { name, .. } = plan {
+        let qn = q(name);
+        if lc.contains("already exists") {
+            let mut w = W::default();
+            w.int(OP_RESPONSE).int(0).int(0).int(0).int(0);
+            w.int(1).int(GDS_NO_META_UPDATE)
+                .int(1).int(336397295).int(2).bytes(qn.as_bytes()) // CREATE PACKAGE BODY @1 failed
+                .int(1).int(336068877).int(2).bytes(qn.as_bytes()) // Package body @1 already exists
+                .int(0);
+            w.send(s, enc)?;
+            return Ok(true);
+        }
+        if lc.contains("not found") {
+            let mut w = W::default();
+            w.int(OP_RESPONSE).int(0).int(0).int(0).int(0);
+            w.int(1).int(GDS_NO_META_UPDATE)
+                .int(1).int(336397295).int(2).bytes(qn.as_bytes()) // CREATE PACKAGE BODY @1 failed
+                .int(1).int(336068864).int(2).bytes(qn.as_bytes()) // Package @1 not found
+                .int(0);
+            w.send(s, enc)?;
+            return Ok(true);
+        }
+    }
     if let Plan::CreateCollation { name, .. } = plan {
         let qn = q(name);
         if lc.contains("already exists") {
@@ -5461,6 +5484,7 @@ fn run_gbak_restore_core(
                 fu.package.as_ref().map(|(n, v)| (n.as_str(), *v)),
                 external.as_ref(),
                 false,
+                None,
             )?;
         }
         // the COMMENTS, last - every row they annotate exists now
@@ -7350,6 +7374,8 @@ enum Plan {
     /// `CREATE PACKAGE <name> AS BEGIN <decls> END` - the header.
     CreatePackage { name: String, source: String, members: Vec<fire_crab_ods::ddl::PackageMember> },
     DropPackage { name: String },
+    /// `CREATE PACKAGE BODY <name> AS BEGIN <impls> END`.
+    CreatePackageBody { name: String, source: String, members: Vec<fire_crab_ods::ddl::PackageBodyMember> },
     /// `ALTER VIEW <name> AS <select>` - the view's definition is replaced
     /// but its relation id survives (the ods alter_view reuses it).
     AlterView {
@@ -16769,6 +16795,116 @@ fn plan_declare_filter(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
 /// a SELECT it cannot compile refuses the statement (no guessing - the
 /// engine runs that BLR when it reads this file). `WITH CHECK OPTION`
 /// is outside this slice.
+/// `CREATE PACKAGE BODY <name> AS BEGIN <member impls> END`. Members are
+/// split on the PROCEDURE/FUNCTION keywords at BEGIN/END depth 0 (each
+/// member's own `AS BEGIN..END` and nested blocks/CASE raise the depth), then
+/// each is compiled through the standalone body compiler.
+fn plan_create_package_body(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
+    let up = sql.trim_start().to_ascii_uppercase();
+    if find_word(&up, "CREATE", 0) != Some(0) {
+        return None;
+    }
+    let pk = find_word(&up, "PACKAGE", "CREATE".len())?;
+    if up["CREATE".len()..pk].trim() != "" {
+        return None;
+    }
+    let after = sql.trim_start()[pk + "PACKAGE".len()..].trim_start();
+    let up_after = after.to_ascii_uppercase();
+    if find_word(&up_after, "BODY", 0) != Some(0) {
+        return None;
+    }
+    let after_body = after["BODY".len()..].trim_start();
+    let ab = after_body.to_ascii_uppercase();
+    let as_at = find_word(&ab, "AS", 0)?;
+    let name = unquote_ident(after_body[..as_at].trim())?;
+    let src = after_body[as_at + "AS".len()..].trim();
+    let sup = src.to_ascii_uppercase();
+    if find_word(&sup, "BEGIN", 0) != Some(0) {
+        return None;
+    }
+    let end_at = sup.rfind("END")?;
+    let source = src[..end_at + "END".len()].trim().to_string();
+    let inner = &src[find_word(&sup, "BEGIN", 0)? + "BEGIN".len()..end_at];
+    // word tokens with byte offsets, to slice member texts
+    let mut toks: Vec<(usize, &str)> = Vec::new();
+    let mut w_start: Option<usize> = None;
+    for (i, ch) in inner.char_indices() {
+        if ch.is_whitespace() {
+            if let Some(st) = w_start.take() {
+                toks.push((st, &inner[st..i]));
+            }
+        } else if w_start.is_none() {
+            w_start = Some(i);
+        }
+    }
+    if let Some(st) = w_start {
+        toks.push((st, &inner[st..]));
+    }
+    let kw = |w: &str| w.trim_end_matches([';', ',']).to_ascii_uppercase();
+    let mut depth = 0i32;
+    let mut starts: Vec<usize> = Vec::new();
+    for (off, w) in &toks {
+        match kw(w).as_str() {
+            "BEGIN" | "CASE" => depth += 1,
+            "END" => depth -= 1,
+            "PROCEDURE" | "FUNCTION" if depth == 0 => starts.push(*off),
+            _ => {}
+        }
+    }
+    if starts.is_empty() {
+        return None;
+    }
+    let mut members: Vec<fire_crab_ods::ddl::PackageBodyMember> = Vec::new();
+    for k in 0..starts.len() {
+        let seg = if k + 1 < starts.len() {
+            inner[starts[k]..starts[k + 1]].trim()
+        } else {
+            inner[starts[k]..].trim()
+        };
+        let su = seg.to_ascii_uppercase();
+        if find_word(&su, "PROCEDURE", 0) == Some(0) {
+            let c = fire_crab_dsql::compile_procedure_full(&format!("CREATE {}", seg))?;
+            members.push(fire_crab_ods::ddl::PackageBodyMember::Procedure {
+                name: c.name,
+                ins: c.ins.iter().map(proc_param_of).collect(),
+                outs: c.outs.iter().map(proc_param_of).collect(),
+                selectable: c.selectable,
+                blr: c.blob,
+            });
+        } else if find_word(&su, "FUNCTION", 0) == Some(0) {
+            let c = fire_crab_dsql::compile_function_full(&format!("CREATE {}", seg))?;
+            if c.outs.len() != 1 {
+                return None;
+            }
+            let deterministic = find_word(&su, "DETERMINISTIC", 0).is_some();
+            let mut args = vec![fn_arg_of(&c.outs[0], 0, false)];
+            for (i, m) in c.ins.iter().enumerate() {
+                args.push(fn_arg_of(m, (i + 1) as i64, true));
+            }
+            members.push(fire_crab_ods::ddl::PackageBodyMember::Function { name: c.name, args, deterministic, blr: c.blob });
+        } else {
+            return None;
+        }
+    }
+    Some((Plan::CreatePackageBody { name, source, members }, Vec::new()))
+}
+
+/// Shared converters for package members (mirror plan_create_procedure /
+/// plan_create_function).
+fn proc_param_of(m: &fire_crab_dsql::ProcParamMeta) -> fire_crab_ods::ddl::ProcParamDef {
+    fire_crab_ods::ddl::ProcParamDef {
+        default: None, name: m.name.clone(), field_type: m.field_type,
+        length: m.length, scale: m.scale, sub_type: m.sub_type,
+    }
+}
+fn fn_arg_of(m: &fire_crab_dsql::ProcParamMeta, position: i64, named: bool) -> fire_crab_ods::ddl::FnArgDef {
+    fire_crab_ods::ddl::FnArgDef {
+        name: if named { Some(m.name.to_ascii_uppercase()) } else { None },
+        position, field_type: m.field_type, length: m.length, scale: m.scale,
+        sub_type: m.sub_type, null_flag: false, default: None, inline: false, precision: None, mech: -1,
+    }
+}
+
 /// `CREATE PACKAGE <name> AS BEGIN <decls> END` - the header only. Each
 /// member declaration is compiled through the standalone procedure/function
 /// signature compiler by synthesising a `CREATE ... AS BEGIN END`. CREATE
@@ -23026,6 +23162,10 @@ fn execute_dml_collecting_inner(
             fire_crab_ods::ddl::drop_package(&mut work, db.page_size, name)?;
             (0, 0, 0)
         }
+        Plan::CreatePackageBody { name, source, members } => {
+            fire_crab_ods::ddl::create_package_body(&mut work, db.page_size, name, source, members)?;
+            (0, 0, 0)
+        }
         Plan::AlterView { name, blr, source, fields, contexts } => {
             fire_crab_ods::ddl::alter_view(&mut work, db.page_size, name, blr, source, fields, contexts)?;
             (0, 0, 0)
@@ -23035,7 +23175,7 @@ fn execute_dml_collecting_inner(
             (0, 0, 0)
         }
         Plan::CreateFunction { name, args, deterministic, source, blr } => {
-            fire_crab_ods::ddl::restore_carried_function(&mut work, db.page_size, name, args, 0, *deterministic, source, blr, None, None, None, false)?;
+            fire_crab_ods::ddl::restore_carried_function(&mut work, db.page_size, name, args, 0, *deterministic, source, blr, None, None, None, false, None)?;
             (0, 0, 0)
         }
         Plan::DropFunction { name } => {
@@ -35978,7 +36118,7 @@ fn describe_for(plan: &Plan, params: &[Descriptor], att: AttCs) -> Vec<u8> {
         | Plan::DropIndex { .. }
         | Plan::CreateSequence { .. } | Plan::DropSequence { .. }
         | Plan::CreateException { .. } | Plan::CreateProcedure { .. } | Plan::DropProcedure { .. } | Plan::DropException { .. }
-        | Plan::DeclareFilter { .. } | Plan::DropFilter { .. } | Plan::CreateView { .. } | Plan::DropView { .. } | Plan::Recreate(_) | Plan::AlterView { .. } | Plan::CreateMapping(_) | Plan::AlterMapping(_) | Plan::DropMapping { .. } | Plan::CreateCollation { .. } | Plan::DropCollation { .. } | Plan::CreatePackage { .. } | Plan::DropPackage { .. }
+        | Plan::DeclareFilter { .. } | Plan::DropFilter { .. } | Plan::CreateView { .. } | Plan::DropView { .. } | Plan::Recreate(_) | Plan::AlterView { .. } | Plan::CreateMapping(_) | Plan::AlterMapping(_) | Plan::DropMapping { .. } | Plan::CreateCollation { .. } | Plan::DropCollation { .. } | Plan::CreatePackage { .. } | Plan::DropPackage { .. } | Plan::CreatePackageBody { .. }
         | Plan::AlterTrigger { .. } | Plan::DropTrigger { .. } | Plan::CreateOrAlterTrigger { .. } | Plan::AlterProcedure { .. } | Plan::CreateOrAlterProcedure { .. }
         | Plan::CreateFunction { .. } | Plan::DropFunction { .. }
         | Plan::AlterException { .. } | Plan::CreateOrAlterException { .. }
@@ -36086,7 +36226,7 @@ fn stmt_type_of(plan: &Plan) -> i32 {
         | Plan::DropIndex { .. }
         | Plan::CreateSequence { .. } | Plan::DropSequence { .. }
         | Plan::CreateException { .. } | Plan::CreateProcedure { .. } | Plan::DropProcedure { .. } | Plan::DropException { .. }
-        | Plan::DeclareFilter { .. } | Plan::DropFilter { .. } | Plan::CreateView { .. } | Plan::DropView { .. } | Plan::Recreate(_) | Plan::AlterView { .. } | Plan::CreateMapping(_) | Plan::AlterMapping(_) | Plan::DropMapping { .. } | Plan::CreateCollation { .. } | Plan::DropCollation { .. } | Plan::CreatePackage { .. } | Plan::DropPackage { .. }
+        | Plan::DeclareFilter { .. } | Plan::DropFilter { .. } | Plan::CreateView { .. } | Plan::DropView { .. } | Plan::Recreate(_) | Plan::AlterView { .. } | Plan::CreateMapping(_) | Plan::AlterMapping(_) | Plan::DropMapping { .. } | Plan::CreateCollation { .. } | Plan::DropCollation { .. } | Plan::CreatePackage { .. } | Plan::DropPackage { .. } | Plan::CreatePackageBody { .. }
         | Plan::AlterTrigger { .. } | Plan::DropTrigger { .. } | Plan::CreateOrAlterTrigger { .. } | Plan::AlterProcedure { .. } | Plan::CreateOrAlterProcedure { .. }
         | Plan::CreateFunction { .. } | Plan::DropFunction { .. }
         | Plan::AlterException { .. } | Plan::CreateOrAlterException { .. }
@@ -37549,7 +37689,7 @@ fn emit_rows_inner(
         | Plan::DropIndex { .. }
         | Plan::CreateSequence { .. } | Plan::DropSequence { .. }
         | Plan::CreateException { .. } | Plan::CreateProcedure { .. } | Plan::DropProcedure { .. } | Plan::DropException { .. }
-        | Plan::DeclareFilter { .. } | Plan::DropFilter { .. } | Plan::CreateView { .. } | Plan::DropView { .. } | Plan::Recreate(_) | Plan::AlterView { .. } | Plan::CreateMapping(_) | Plan::AlterMapping(_) | Plan::DropMapping { .. } | Plan::CreateCollation { .. } | Plan::DropCollation { .. } | Plan::CreatePackage { .. } | Plan::DropPackage { .. }
+        | Plan::DeclareFilter { .. } | Plan::DropFilter { .. } | Plan::CreateView { .. } | Plan::DropView { .. } | Plan::Recreate(_) | Plan::AlterView { .. } | Plan::CreateMapping(_) | Plan::AlterMapping(_) | Plan::DropMapping { .. } | Plan::CreateCollation { .. } | Plan::DropCollation { .. } | Plan::CreatePackage { .. } | Plan::DropPackage { .. } | Plan::CreatePackageBody { .. }
         | Plan::AlterTrigger { .. } | Plan::DropTrigger { .. } | Plan::CreateOrAlterTrigger { .. } | Plan::AlterProcedure { .. } | Plan::CreateOrAlterProcedure { .. }
         | Plan::CreateFunction { .. } | Plan::DropFunction { .. }
         | Plan::AlterException { .. } | Plan::CreateOrAlterException { .. }
@@ -51346,6 +51486,7 @@ fn plan_immediate(text: &str, database: &Option<Database>) -> Option<(Plan, Vec<
                     .or_else(|| plan_drop_mapping(text))
                     .or_else(|| plan_create_collation(text))
                     .or_else(|| plan_drop_collation(text))
+                    .or_else(|| plan_create_package_body(text))
                     .or_else(|| plan_create_package(text))
                     .or_else(|| plan_drop_package(text))
                     .or_else(|| plan_create_view(text, database))
@@ -57038,6 +57179,7 @@ fn after_auth(
                         .or_else(|| plan_drop_mapping(&stmt_sql))
                         .or_else(|| plan_create_collation(&stmt_sql))
                         .or_else(|| plan_drop_collation(&stmt_sql))
+                        .or_else(|| plan_create_package_body(&stmt_sql))
                         .or_else(|| plan_create_package(&stmt_sql))
                         .or_else(|| plan_drop_package(&stmt_sql))
                         .or_else(|| plan_create_view(&stmt_sql, &database))
@@ -57336,7 +57478,7 @@ fn after_auth(
                         | Plan::CreateSequence { .. }
                         | Plan::DropSequence { .. }
                         | Plan::CreateException { .. }
-                        | Plan::DeclareFilter { .. } | Plan::DropFilter { .. } | Plan::CreateView { .. } | Plan::DropView { .. } | Plan::Recreate(_) | Plan::AlterView { .. } | Plan::CreateMapping(_) | Plan::AlterMapping(_) | Plan::DropMapping { .. } | Plan::CreateCollation { .. } | Plan::DropCollation { .. } | Plan::CreatePackage { .. } | Plan::DropPackage { .. }
+                        | Plan::DeclareFilter { .. } | Plan::DropFilter { .. } | Plan::CreateView { .. } | Plan::DropView { .. } | Plan::Recreate(_) | Plan::AlterView { .. } | Plan::CreateMapping(_) | Plan::AlterMapping(_) | Plan::DropMapping { .. } | Plan::CreateCollation { .. } | Plan::DropCollation { .. } | Plan::CreatePackage { .. } | Plan::DropPackage { .. } | Plan::CreatePackageBody { .. }
         | Plan::AlterTrigger { .. } | Plan::DropTrigger { .. } | Plan::CreateOrAlterTrigger { .. } | Plan::AlterProcedure { .. } | Plan::CreateOrAlterProcedure { .. }
         | Plan::CreateFunction { .. } | Plan::DropFunction { .. }
                         | Plan::CreateProcedure { .. }
