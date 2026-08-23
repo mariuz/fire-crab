@@ -14289,7 +14289,6 @@ fn body_has_uninterpretable_blr(st: &TrigStmt) -> bool {
     match st {
         TrigStmt::Suspend { .. }
         | TrigStmt::ForSelect { .. }
-        | TrigStmt::Reraise { .. }
         | TrigStmt::Open { .. }
         | TrigStmt::Fetch { .. }
         | TrigStmt::Close { .. }
@@ -15317,7 +15316,6 @@ fn emit_trigger_stmt(
         // its own source contains ([body_has_uninterpretable_blr]).
         TrigStmt::Suspend { .. }
         | TrigStmt::ForSelect { .. }
-        | TrigStmt::Reraise { .. }
         | TrigStmt::Open { .. }
         | TrigStmt::Fetch { .. }
         | TrigStmt::Close { .. }
@@ -15401,6 +15399,23 @@ fn emit_trigger_stmt(
             b.push(2); // condition kind: exception, by name
             b.push(name.len() as u8);
             b.extend_from_slice(name.as_bytes());
+            if bracket_raises {
+                b.push(135); // blr_end_savepoint
+                b.push(255); // end
+            }
+        }
+        TrigStmt::Reraise { src_off } => {
+            // a bare EXCEPTION; re-raise: blr_abort with condition 5
+            // (blr_raise), no name - the same savepoint bracket a named
+            // raise takes inside a handler-bearing block (probed: the
+            // engine's stored BLR for `WHEN ... DO EXCEPTION;`)
+            dbg.push((*src_off, b.len()));
+            if bracket_raises {
+                b.push(2);
+                b.push(134); // blr_start_savepoint
+            }
+            b.push(128); // blr_abort
+            b.push(5); // condition kind: re-raise (blr_raise)
             if bracket_raises {
                 b.push(135); // blr_end_savepoint
                 b.push(255); // end

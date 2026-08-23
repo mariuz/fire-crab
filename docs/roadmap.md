@@ -366,9 +366,20 @@ rather than re-raising the outer exception (probed: PN_AFTER answers 99),
 while a re-raise BEFORE any inner block still re-raises the outer one. The
 old code did the opposite (restored the outer) and its comment wrongly
 claimed the engine refuses a bare `EXCEPTION;` at compile — both corrected.
-Boundary (recorded): a TRIGGER body with a re-raise still refuses at CREATE
-— triggers compile through the server's own BLR emitter (not dsql), which
-does not emit the re-raise verb yet.
+A follow-up closed the trigger side too: `serve-real-trigreraise`
+(4 checks). A TRIGGER re-raise compiles through the server's OWN BLR
+emitter (`emit_trigger_stmt`, not dsql); `Reraise` was removed from both
+the `body_has_uninterpretable_blr` refusal list and the emitter's
+interpreted-only group, and a new arm emits `blr_abort, 5` with the same
+savepoint bracket a named raise takes in a handler-bearing block. fc does
+not itself execute user triggers (it refuses DML on a triggered table),
+so the check is compile parity plus the ENGINE firing fc's stored trigger
+BLR: a good INSERT succeeds, a bad one re-raises `E_NEG`, one row kept; a
+top-level `EXCEPTION;` (unbracketed) no-ops. The exception surface —
+raise, catch (all condition kinds, single/multi/nested/ANY-in-list),
+re-raise — is now closed for procedures, functions AND triggers, save the
+`EXCEPTION <name> <message-override>` form and the arithmetic-only
+body-expression gap (a user-function call in a statement).
 
 **The IF statement (blr_if) in exe DONE (2026-08-23, `serve-real-psqlif`
 5):** the executor could not convert an IF, so a body combining IF/ELSE
