@@ -43,6 +43,8 @@ mod blr {
     pub const RECEIVE: u8 = 12;
     pub const SEND: u8 = 14;
     pub const LABEL: u8 = 17;
+    pub const LOOP: u8 = 9;
+    pub const CONTINUE_LOOP: u8 = 197;
     pub const LEAVE: u8 = 18;
     pub const LITERAL: u8 = 21;
     pub const ADD: u8 = 34;
@@ -414,7 +416,10 @@ pub enum Stmt {
     /// blr_label: the number only matters to blr_leave, which slice 1
     /// does not execute - kept for the day it does
     Label(u8, Box<Stmt>),
-    For(Rse, Box<Stmt>),
+    /// blr_for over an rse, carrying an optional enclosing blr_label (a
+    /// FOR SELECT with LEAVE/CONTINUE is wrapped in one): a leave for that
+    /// label ends the loop, a continue moves to the next row.
+    For(Option<u8>, Rse, Box<Stmt>),
     /// blr_send: message number + the statement filling it
     Send(u8, Box<Stmt>),
     /// blr_assignment: source expression into a target
@@ -431,6 +436,14 @@ pub enum Stmt {
     /// missing else is a bare blr_end byte in the else slot). A NULL
     /// (UNKNOWN) condition takes the else, as the engine does.
     If(Bool, Box<Stmt>, Option<Box<Stmt>>),
+    /// blr_loop, carrying its enclosing blr_label's number: repeat the body
+    /// until a blr_leave for this label exits it (WHILE compiles to
+    /// label N / loop / begin{ if(cond, body, leave N) }). A
+    /// blr_continue_loop for this label restarts the next iteration.
+    Loop(u8, Box<Stmt>),
+    /// blr_continue_loop: label byte - skip to the next iteration of the
+    /// loop carrying that label.
+    Continue(u8),
 }
 
 /// An assignment target.
@@ -1206,11 +1219,23 @@ impl<'a> P<'a> {
             }
             blr::LABEL => {
                 let n = self.u8()?;
-                Ok(Stmt::Label(n, Box::new(self.stmt()?)))
+                // a label immediately wrapping a blr_loop names the loop -
+                // fold them so leave/continue for this label resolve here
+                if self.b.get(self.i) == Some(&blr::LOOP) {
+                    self.i += 1;
+                    Ok(Stmt::Loop(n, Box::new(self.stmt()?)))
+                } else if self.b.get(self.i) == Some(&blr::FOR) {
+                    self.i += 1;
+                    let rse = self.rse_entry()?;
+                    Ok(Stmt::For(Some(n), rse, Box::new(self.stmt()?)))
+                } else {
+                    Ok(Stmt::Label(n, Box::new(self.stmt()?)))
+                }
             }
+            blr::CONTINUE_LOOP => Ok(Stmt::Continue(self.u8()?)),
             blr::FOR => {
                 let rse = self.rse_entry()?;
-                Ok(Stmt::For(rse, Box::new(self.stmt()?)))
+                Ok(Stmt::For(None, rse, Box::new(self.stmt()?)))
             }
             blr::SEND => {
                 let msg = self.u8()?;
@@ -1528,6 +1553,9 @@ struct Exec<'a> {
     /// set by blr_leave to the target label; unwinds block/loop execution
     /// until the matching blr_label clears it
     leaving: Option<u8>,
+    /// set by blr_continue_loop to the target label; unwinds to that loop,
+    /// which clears it and starts the next iteration
+    continuing: Option<u8>,
 }
 
 /// The looper (`EXE_looper`): execute the statement tree synchronously,
@@ -1617,6 +1645,7 @@ pub fn bind_and_execute(
         frames: Vec::new(),
         sends: Vec::new(),
         leaving: None,
+        continuing: None,
     };
     ex.stmt(&request.body)?;
     Ok(ex.sends)
@@ -1628,8 +1657,8 @@ impl<'a> Exec<'a> {
             Stmt::Begin(list) => {
                 for s in list {
                     self.stmt(s)?;
-                    if self.leaving.is_some() {
-                        break; // unwinding to a leave's label
+                    if self.leaving.is_some() || self.continuing.is_some() {
+                        break; // unwinding to a leave/continue's target
                     }
                 }
             }
@@ -1706,7 +1735,7 @@ impl<'a> Exec<'a> {
                     }
                 }
             }
-            Stmt::For(rse, body) => {
+            Stmt::For(label, rse, body) => {
                 let bindings = self.open_rse(rse)?;
                 if rse.singular && bindings.len() > 1 {
                     // the engine's sing_err: a singleton select with
@@ -1719,11 +1748,43 @@ impl<'a> Exec<'a> {
                     let r = self.stmt(body);
                     self.frames.truncate(depth);
                     r?;
-                    if self.leaving.is_some() {
-                        break; // a leave inside the loop unwinds out of it
+                    if let Some(t) = self.leaving {
+                        if *label == Some(t) {
+                            self.leaving = None; // leave THIS loop: consume
+                        }
+                        break; // leave (this or outer) ends the FOR
+                    }
+                    if let Some(t) = self.continuing {
+                        if *label == Some(t) {
+                            self.continuing = None;
+                            continue; // continue THIS loop: next row
+                        }
+                        break; // continue targets an outer loop: propagate
                     }
                 }
             }
+            Stmt::Loop(label, body) => {
+                // blr_loop repeats until interrupted; WHILE's inner
+                // if(cond, body, leave) exits it when the condition is false
+                loop {
+                    self.stmt(body)?;
+                    if let Some(t) = self.leaving {
+                        if t == *label {
+                            self.leaving = None; // leave THIS loop: consume
+                        }
+                        break; // leave (this or an outer loop) exits here
+                    }
+                    if let Some(t) = self.continuing {
+                        if t == *label {
+                            self.continuing = None;
+                            continue; // continue THIS loop: next iteration
+                        }
+                        break; // continue targets an outer loop: propagate
+                    }
+                    // no interrupt: the loop body ran, repeat it
+                }
+            }
+            Stmt::Continue(n) => self.continuing = Some(*n),
             Stmt::If(cond, then, els) => {
                 // a TRUE condition runs the then; FALSE or UNKNOWN (a NULL
                 // condition) runs the else, as the engine does. A leave/
@@ -3635,7 +3696,7 @@ mod tests {
                 Stmt::Begin(list) => list.iter().find_map(find_agg),
                 Stmt::Label(_, i) | Stmt::Send(_, i) => find_agg(i),
                 Stmt::Leave(_) => None,
-                Stmt::For(rse, body) => match &rse.stream {
+                Stmt::For(_, rse, body) => match &rse.stream {
                     Stream::Aggregate(a) => Some(a),
                     _ => find_agg(body),
                 },

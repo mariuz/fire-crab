@@ -278,10 +278,23 @@ call, recursion) fell to the source path and refused. exe now runs blr_if
 condition takes the else, as the engine does). This unlocks recursive
 functions (`FACT` = IF base case + a sibling call), IF-guarded NUMERIC
 bodies, and IF inside a FOR loop with LEAVE. A clean review (no defects).
-Boundary: `WHILE` (blr_loop) and `CONTINUE` (blr_continue_loop) are still
-not converted, so a loop body needing exe falls back; and fc refuses
-recursion past its guard (48) where the engine handles ~1000 then raises
-54001 — the source interpreter's `psql_depth_guard` stand-in, unchanged.
+Boundary: fc refuses recursion past its guard (48) where the engine
+handles ~1000 then raises 54001 — the source interpreter's
+`psql_depth_guard` stand-in, unchanged.
+
+**WHILE loops (blr_loop / blr_continue_loop) in exe DONE (2026-08-23,
+`serve-real-psqlwhile` 5):** exe could not convert a loop, so a WHILE body
+combining loop control with an exe-only feature (a NUMERIC accumulator, a
+function call) fell to the source path and refused. exe now runs blr_loop
+and blr_continue_loop: a blr_label folds into the loop (or FOR) it wraps so
+LEAVE ends it and CONTINUE moves to the next iteration; a FOR SELECT
+loop's CONTINUE goes to the next row, not out of the loop (`Stmt::For`
+gained an optional label). Verified over WHILE+NUMERIC, WHILE+CONTINUE,
+nested WHILE with a labelled LEAVE/CONTINUE to an OUTER loop (3 levels),
+and a WHILE whose body calls a function — a clean review (no defects), and
+`serve-real-loopctl` now runs its bare/labelled control procedures through
+exe. Boundary: an infinite loop hangs, as it does on the engine (no
+iteration cap, consistent with the source interpreter).
 
 **Function calls inside a body (blr_function2) DONE (2026-08-23,
 `serve-real-fncall` 7):** exe gained the function-invoke verb, so a body
