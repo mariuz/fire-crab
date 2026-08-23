@@ -1855,6 +1855,7 @@ fn respond_ddl_meta(
             Plan::DropTrigger { name } => Some((336397273, q(name), 336068755, true)), // DROP TRIGGER @1 failed / Trigger @1 not found
             Plan::AlterTrigger { name, .. } => Some((336397271, q(name), 336068755, true)),
             Plan::DropFunction { name } => Some((336397263, q(name), 336068649, true)), // DROP FUNCTION @1 failed / Function @1 not found
+            Plan::AlterFunction { name, .. } => Some((336397261, q(name), 336068649, true)), // ALTER FUNCTION @1 failed / Function @1 not found
             _ => None,
         }
     } else {
@@ -7568,6 +7569,8 @@ AlterDomainRename {
     /// `ALTER PROCEDURE`: the row replaced, its RDB$PROCEDURE_ID kept (probed)
     AlterProcedure { name: String, ins: Vec<fire_crab_ods::ddl::ProcParamDef>, outs: Vec<fire_crab_ods::ddl::ProcParamDef>, selectable: bool, source: String, blr: Vec<u8> },
     CreateOrAlterProcedure { name: String, ins: Vec<fire_crab_ods::ddl::ProcParamDef>, outs: Vec<fire_crab_ods::ddl::ProcParamDef>, selectable: bool, source: String, blr: Vec<u8> },
+    AlterFunction { name: String, args: Vec<fire_crab_ods::ddl::FnArgDef>, deterministic: bool, source: String, blr: Vec<u8> },
+    CreateOrAlterFunction { name: String, args: Vec<fire_crab_ods::ddl::FnArgDef>, deterministic: bool, source: String, blr: Vec<u8> },
     /// `ALTER TABLE <t> ADD [CONSTRAINT <n>] CHECK (<cond>)`: the same
     /// trigger pair a CREATE-time CHECK writes, plus a runtime refresh.
     /// Existing rows are NOT validated (the engine's own rule).
@@ -15838,6 +15841,55 @@ fn plan_alter_procedure(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<D
     ))
 }
 
+/// `ALTER FUNCTION ...` / `CREATE OR ALTER FUNCTION ...`: the CREATE
+/// planner over the rewritten head (mirrors plan_alter_procedure).
+fn plan_alter_function(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor>)> {
+    let s = sql.trim();
+    let up = mask_literals(&s.to_ascii_uppercase());
+    let (create_or_alter, fk) = if find_word(&up, "ALTER", 0) == Some(0) {
+        let fk = find_word(&up, "FUNCTION", "ALTER".len())?;
+        if up["ALTER".len()..fk].trim() != "" {
+            return None;
+        }
+        (false, fk)
+    } else if find_word(&up, "CREATE", 0) == Some(0) {
+        let or_at = find_word(&up, "OR", "CREATE".len())?;
+        let alter_at = find_word(&up, "ALTER", or_at + "OR".len())?;
+        let fk = find_word(&up, "FUNCTION", alter_at + "ALTER".len())?;
+        if up["CREATE".len()..or_at].trim() != "" || up[or_at + "OR".len()..alter_at].trim() != "" || up[alter_at + "ALTER".len()..fk].trim() != "" {
+            return None;
+        }
+        (true, fk)
+    } else {
+        return None;
+    };
+    let synth = format!("CREATE {}", s[fk..].trim());
+    let Some((plan, _)) = plan_create_function(&synth, db) else {
+        // the engine checks the name first: a plain ALTER of a missing
+        // function answers "not found", a CREATE OR ALTER cannot know yet
+        // and a body outside this surface refuses generically
+        let name_raw = s[fk + "FUNCTION".len()..].trim().split(|c: char| c.is_whitespace() || c == '(').next()?;
+        let name = unquote_ident(name_raw)?;
+        return Some((
+            if create_or_alter {
+                return None;
+            } else {
+                Plan::AlterFunction { name, args: Vec::new(), deterministic: false, source: String::new(), blr: Vec::new() }
+            },
+            Vec::new(),
+        ));
+    };
+    let Plan::CreateFunction { name, args, deterministic, source, blr } = plan else { return None };
+    Some((
+        if create_or_alter {
+            Plan::CreateOrAlterFunction { name, args, deterministic, source, blr }
+        } else {
+            Plan::AlterFunction { name, args, deterministic, source, blr }
+        },
+        Vec::new(),
+    ))
+}
+
 fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor>)> {
     let s = sql.trim().trim_end_matches(';').trim();
     let up = s.to_ascii_uppercase();
@@ -24027,6 +24079,27 @@ fn execute_dml_collecting_inner(
                     fire_crab_ods::ddl::create_procedure_with_id(&mut work, db.page_size, name, ins, outs, *selectable, source, blr, None, Some(id), false)?;
                 }
                 None => fire_crab_ods::ddl::create_procedure(&mut work, db.page_size, name, ins, outs, *selectable, source, blr, None)?,
+            }
+            (0, 0, 0)
+        }
+        Plan::AlterFunction { name, args, deterministic, source, blr } => {
+            let Some(id) = fire_crab_ods::ddl::function_id_plain(&work, db.page_size, name) else {
+                return Err(format!("Function {} not found", name.trim().trim_matches('"').to_ascii_uppercase()).into());
+            };
+            if blr.is_empty() {
+                return Err("the function body is outside this server's surface".into());
+            }
+            fire_crab_ods::ddl::drop_function(&mut work, db.page_size, name)?;
+            fire_crab_ods::ddl::restore_carried_function(&mut work, db.page_size, name, args, 0, *deterministic, source, blr, None, None, None, false, Some(id))?;
+            (0, 0, 0)
+        }
+        Plan::CreateOrAlterFunction { name, args, deterministic, source, blr } => {
+            match fire_crab_ods::ddl::function_id_plain(&work, db.page_size, name) {
+                Some(id) => {
+                    fire_crab_ods::ddl::drop_function(&mut work, db.page_size, name)?;
+                    fire_crab_ods::ddl::restore_carried_function(&mut work, db.page_size, name, args, 0, *deterministic, source, blr, None, None, None, false, Some(id))?;
+                }
+                None => fire_crab_ods::ddl::restore_carried_function(&mut work, db.page_size, name, args, 0, *deterministic, source, blr, None, None, None, false, None)?,
             }
             (0, 0, 0)
         }
@@ -37159,7 +37232,7 @@ fn describe_for(plan: &Plan, params: &[Descriptor], att: AttCs) -> Vec<u8> {
         | Plan::CreateSequence { .. } | Plan::DropSequence { .. }
         | Plan::CreateException { .. } | Plan::CreateProcedure { .. } | Plan::DropProcedure { .. } | Plan::DropException { .. }
         | Plan::DeclareFilter { .. } | Plan::DropFilter { .. } | Plan::CreateView { .. } | Plan::DropView { .. } | Plan::Recreate(_) | Plan::AlterView { .. } | Plan::CreateMapping(_) | Plan::AlterMapping(_) | Plan::DropMapping { .. } | Plan::CreateCollation { .. } | Plan::DropCollation { .. } | Plan::CreatePackage { .. } | Plan::DropPackage { .. } | Plan::CreatePackageBody { .. }
-        | Plan::AlterTrigger { .. } | Plan::DropTrigger { .. } | Plan::CreateOrAlterTrigger { .. } | Plan::AlterProcedure { .. } | Plan::CreateOrAlterProcedure { .. }
+        | Plan::AlterTrigger { .. } | Plan::DropTrigger { .. } | Plan::CreateOrAlterTrigger { .. } | Plan::AlterProcedure { .. } | Plan::CreateOrAlterProcedure { .. } | Plan::AlterFunction { .. } | Plan::CreateOrAlterFunction { .. }
         | Plan::CreateFunction { .. } | Plan::DropFunction { .. }
         | Plan::AlterException { .. } | Plan::CreateOrAlterException { .. }
         | Plan::CreateRole { .. } | Plan::DropRole { .. }
@@ -37268,7 +37341,7 @@ fn stmt_type_of(plan: &Plan) -> i32 {
         | Plan::CreateSequence { .. } | Plan::DropSequence { .. }
         | Plan::CreateException { .. } | Plan::CreateProcedure { .. } | Plan::DropProcedure { .. } | Plan::DropException { .. }
         | Plan::DeclareFilter { .. } | Plan::DropFilter { .. } | Plan::CreateView { .. } | Plan::DropView { .. } | Plan::Recreate(_) | Plan::AlterView { .. } | Plan::CreateMapping(_) | Plan::AlterMapping(_) | Plan::DropMapping { .. } | Plan::CreateCollation { .. } | Plan::DropCollation { .. } | Plan::CreatePackage { .. } | Plan::DropPackage { .. } | Plan::CreatePackageBody { .. }
-        | Plan::AlterTrigger { .. } | Plan::DropTrigger { .. } | Plan::CreateOrAlterTrigger { .. } | Plan::AlterProcedure { .. } | Plan::CreateOrAlterProcedure { .. }
+        | Plan::AlterTrigger { .. } | Plan::DropTrigger { .. } | Plan::CreateOrAlterTrigger { .. } | Plan::AlterProcedure { .. } | Plan::CreateOrAlterProcedure { .. } | Plan::AlterFunction { .. } | Plan::CreateOrAlterFunction { .. }
         | Plan::CreateFunction { .. } | Plan::DropFunction { .. }
         | Plan::AlterException { .. } | Plan::CreateOrAlterException { .. }
         | Plan::CreateRole { .. } | Plan::DropRole { .. }
@@ -38779,7 +38852,7 @@ fn emit_rows_inner(
         | Plan::CreateSequence { .. } | Plan::DropSequence { .. }
         | Plan::CreateException { .. } | Plan::CreateProcedure { .. } | Plan::DropProcedure { .. } | Plan::DropException { .. }
         | Plan::DeclareFilter { .. } | Plan::DropFilter { .. } | Plan::CreateView { .. } | Plan::DropView { .. } | Plan::Recreate(_) | Plan::AlterView { .. } | Plan::CreateMapping(_) | Plan::AlterMapping(_) | Plan::DropMapping { .. } | Plan::CreateCollation { .. } | Plan::DropCollation { .. } | Plan::CreatePackage { .. } | Plan::DropPackage { .. } | Plan::CreatePackageBody { .. }
-        | Plan::AlterTrigger { .. } | Plan::DropTrigger { .. } | Plan::CreateOrAlterTrigger { .. } | Plan::AlterProcedure { .. } | Plan::CreateOrAlterProcedure { .. }
+        | Plan::AlterTrigger { .. } | Plan::DropTrigger { .. } | Plan::CreateOrAlterTrigger { .. } | Plan::AlterProcedure { .. } | Plan::CreateOrAlterProcedure { .. } | Plan::AlterFunction { .. } | Plan::CreateOrAlterFunction { .. }
         | Plan::CreateFunction { .. } | Plan::DropFunction { .. }
         | Plan::AlterException { .. } | Plan::CreateOrAlterException { .. }
         | Plan::CreateRole { .. } | Plan::DropRole { .. }
@@ -52680,6 +52753,7 @@ fn plan_immediate(text: &str, database: &Option<Database>) -> Option<(Plan, Vec<
                     .or_else(|| plan_drop_trigger(text))
                     .or_else(|| plan_create_or_alter_trigger(text, database))
                     .or_else(|| plan_alter_procedure(text, database))
+                    .or_else(|| plan_alter_function(text, database))
                     .or_else(|| plan_create_index(text))
                     .or_else(|| plan_drop_table(text))
                     .or_else(|| plan_drop_index(text))
@@ -58920,6 +58994,7 @@ fn after_auth(
                         .or_else(|| plan_drop_trigger(&stmt_sql))
                         .or_else(|| plan_create_or_alter_trigger(&stmt_sql, &database))
                         .or_else(|| plan_alter_procedure(&stmt_sql, &database))
+                        .or_else(|| plan_alter_function(&stmt_sql, &database))
                         .or_else(|| plan_create_index(&stmt_sql))
                         .or_else(|| plan_drop_table(&stmt_sql))
                         .or_else(|| plan_drop_index(&stmt_sql))
@@ -59235,7 +59310,7 @@ fn after_auth(
                         | Plan::DropSequence { .. }
                         | Plan::CreateException { .. }
                         | Plan::DeclareFilter { .. } | Plan::DropFilter { .. } | Plan::CreateView { .. } | Plan::DropView { .. } | Plan::Recreate(_) | Plan::AlterView { .. } | Plan::CreateMapping(_) | Plan::AlterMapping(_) | Plan::DropMapping { .. } | Plan::CreateCollation { .. } | Plan::DropCollation { .. } | Plan::CreatePackage { .. } | Plan::DropPackage { .. } | Plan::CreatePackageBody { .. }
-        | Plan::AlterTrigger { .. } | Plan::DropTrigger { .. } | Plan::CreateOrAlterTrigger { .. } | Plan::AlterProcedure { .. } | Plan::CreateOrAlterProcedure { .. }
+        | Plan::AlterTrigger { .. } | Plan::DropTrigger { .. } | Plan::CreateOrAlterTrigger { .. } | Plan::AlterProcedure { .. } | Plan::CreateOrAlterProcedure { .. } | Plan::AlterFunction { .. } | Plan::CreateOrAlterFunction { .. }
         | Plan::CreateFunction { .. } | Plan::DropFunction { .. }
                         | Plan::CreateProcedure { .. }
                         | Plan::DropProcedure { .. }

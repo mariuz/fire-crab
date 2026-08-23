@@ -423,6 +423,28 @@ changes a function's arity uses the new signature for a self-call, and
 engine goes ~1000 then 54001 — the recorded stand-in the function-call
 slices carry.
 
+**ALTER FUNCTION / CREATE OR ALTER FUNCTION DONE (2026-08-23,
+`serve-real-alterfunc` 6).** fc had `plan_alter_procedure` but no function
+equivalent, so both refused entirely while the engine accepts them.
+`plan_alter_function` mirrors the procedure planner — rewrite the head to
+CREATE, compile via `plan_create_function` (WITH the catalog, so a body
+function call resolves), repackage as `Plan::AlterFunction` /
+`CreateOrAlterFunction`; the execution drops the function and restores it
+with the same `RDB$FUNCTION_ID` preserved (`function_id_plain`), a CREATE
+OR ALTER of a new name just creates. The failed-DDL vector is byte-exact
+(`ALTER FUNCTION @1 failed` 336397261 / `Function @1 not found` 336068649).
+Verified: ALTER then CREATE OR ALTER an existing function, CREATE OR ALTER
+a new one, a body that calls another function, a recursive CREATE OR
+ALTER, and the not-found vector; the ENGINE runs fc's altered functions.
+Boundary carried from the body-call slice: a CREATE OR ALTER whose body
+BOTH calls a function AND draws a generator refuses at compile (`exe_can_run`
+fires through this path too). CREATE / RECREATE FUNCTION unaffected. An adversarial review
+caught a real high-severity bug: `drop_function` (shared with DROP FUNCTION)
+found the plain function package-aware but DELETED by name alone, so ALTER
+(or DROP) of a plain `F` clobbered a coexisting packaged `PKG.F`'s catalog
+rows. `drop_function`'s deletes are now package-aware (plain rows only),
+fixing the ALTER path AND the pre-existing DROP FUNCTION bug.
+
 **The IF statement (blr_if) in exe DONE (2026-08-23, `serve-real-psqlif`
 5):** the executor could not convert an IF, so a body combining IF/ELSE
 control flow with an exe-only feature (a NUMERIC computation, a function

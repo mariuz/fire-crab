@@ -1837,8 +1837,14 @@ pub fn drop_function(file: &mut crate::Image, page_size: usize, name: &str) -> R
         let rel = crate::resolve_relation(file, page_size, "RDB$FUNCTION_ARGUMENTS").ok_or("no RDB$FUNCTION_ARGUMENTS")?;
         let fn_f = sys_fid(file, page_size, "RDB$FUNCTION_ARGUMENTS", "RDB$FUNCTION_NAME")?;
         let src_f = sys_fid(file, page_size, "RDB$FUNCTION_ARGUMENTS", "RDB$FIELD_SOURCE")?;
+        // a PACKAGED member of the same bare name shares RDB$FUNCTION_NAME;
+        // its RDB$PACKAGE_NAME is Text where the plain function's is NULL, so
+        // gather (and below, delete) only the plain rows - never the member's
+        let apk_f = sys_fid(file, page_size, "RDB$FUNCTION_ARGUMENTS", "RDB$PACKAGE_NAME")?;
         walk_rows(file, page_size, rel, descs, |v| {
-            if text_eq(v.get(fn_f), &want) {
+            if text_eq(v.get(fn_f), &want)
+                && !matches!(v.get(apk_f), Some(Value::Text(_)))
+            {
                 if let Some(Value::Text(t)) = v.get(src_f) {
                     let t = t.trim_end();
                     if t.strip_prefix("RDB$").is_some_and(|x| x.parse::<u64>().is_ok()) {
@@ -1850,8 +1856,11 @@ pub fn drop_function(file: &mut crate::Image, page_size: usize, name: &str) -> R
     }
     {
         let fid = sys_fid(file, page_size, "RDB$FUNCTION_ARGUMENTS", "RDB$FUNCTION_NAME")?;
+        let pk = sys_fid(file, page_size, "RDB$FUNCTION_ARGUMENTS", "RDB$PACKAGE_NAME")?;
         let n = want.clone();
-        delete_catalog_rows(file, page_size, "RDB$FUNCTION_ARGUMENTS", move |v| text_eq(v.get(fid), &n))?;
+        delete_catalog_rows(file, page_size, "RDB$FUNCTION_ARGUMENTS", move |v| {
+            text_eq(v.get(fid), &n) && !matches!(v.get(pk), Some(Value::Text(_)))
+        })?;
     }
     {
         let fid = sys_fid(file, page_size, "RDB$FIELDS", "RDB$FIELD_NAME")?;
@@ -1860,8 +1869,11 @@ pub fn drop_function(file: &mut crate::Image, page_size: usize, name: &str) -> R
     }
     {
         let fid = sys_fid(file, page_size, "RDB$FUNCTIONS", "RDB$FUNCTION_NAME")?;
+        let pk = sys_fid(file, page_size, "RDB$FUNCTIONS", "RDB$PACKAGE_NAME")?;
         let n = want.clone();
-        delete_catalog_rows(file, page_size, "RDB$FUNCTIONS", move |v| text_eq(v.get(fid), &n))?;
+        delete_catalog_rows(file, page_size, "RDB$FUNCTIONS", move |v| {
+            text_eq(v.get(fid), &n) && !matches!(v.get(pk), Some(Value::Text(_)))
+        })?;
     }
     if let Some(class) = class {
         let fid = sys_fid(file, page_size, "RDB$SECURITY_CLASSES", "RDB$SECURITY_CLASS")?;
@@ -10435,6 +10447,30 @@ pub fn create_package(
 pub enum PackageBodyMember {
     Procedure { name: String, ins: Vec<ProcParamDef>, outs: Vec<ProcParamDef>, selectable: bool, blr: Vec<u8> },
     Function { name: String, args: Vec<FnArgDef>, deterministic: bool, blr: Vec<u8> },
+}
+
+/// The RDB$FUNCTION_ID of a PLAIN (non-packaged) function - matched on
+/// name where RDB$PACKAGE_NAME is NULL, so a standalone function is not
+/// confused with a same-named packaged member. Used by ALTER FUNCTION to
+/// preserve the id across a drop-and-recreate.
+pub fn function_id_plain(file: &crate::Image, page_size: usize, name: &str) -> Option<i64> {
+    let want = name.trim().trim_matches('"').to_ascii_uppercase();
+    let rel = crate::resolve_relation(file, page_size, "RDB$FUNCTIONS")?;
+    let formats = system_relation_formats(file, page_size, "RDB$FUNCTIONS")?;
+    let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
+    let cols = relation_columns(file, page_size, "RDB$FUNCTIONS");
+    let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (name_f, id_f, pk_f) = (fid("RDB$FUNCTION_NAME")?, fid("RDB$FUNCTION_ID")?, fid("RDB$PACKAGE_NAME")?);
+    let mut out = None;
+    walk_rows(file, page_size, rel, descs, |v| {
+        let plain = !matches!(v.get(pk_f), Some(Value::Text(_)));
+        if out.is_none() && plain && text_eq(v.get(name_f), &want) {
+            if let Some(Value::Int(i)) = v.get(id_f) {
+                out = Some(*i);
+            }
+        }
+    });
+    out
 }
 
 fn function_id(file: &crate::Image, page_size: usize, name: &str, package: &str) -> Option<i64> {
