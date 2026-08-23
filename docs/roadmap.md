@@ -270,6 +270,42 @@ FUNCTION DDL refuses it; DOUBLE/approx — the executor has no f64
 arithmetic. NUMERIC in a PROCEDURE signature is a follow-up
 (`load_procedure` unchanged; needs the proc output-column describe path).
 
+**NUMERIC in a PROCEDURE signature DONE (2026-08-23, `serve-real-numproc`
+8):** the follow-up above — a stored procedure with NUMERIC(p,s) params
+and/or RETURNS columns now loads, over both the selectable path
+(`SELECT ... FROM P(...)`) and `EXECUTE PROCEDURE`. The describe path
+(`proc_out_col` → `wire_for`) already emitted the exact dtype/scale/subtype,
+and `bind_proc_args` already rescaled a numeric argument to the parameter's
+scale (22003 past width); the two missing pieces were the `load_procedure`
+gate (relaxed to admit `is_numeric_col`, like `load_function`) and a
+decimal literal in the call arguments — `parse_call_args` read NULL /
+integer / `'text'` / `?` but a bare `10.55` fell through and refused the
+whole statement. It now parses a decimal literal through the engine's
+`text_number` grammar to a `Value::Scaled` (an over-i64 mantissa to
+`Value::Int128`); a scientific literal with a positive exponent (`1.5e2`
+= 150, which the engine accepts as an argument) folds the exponent into
+the mantissa at scale 0, and a hex literal is not taken here.
+Verified over numeric-literal / text / negative args, INT→NUMERIC, a
+NUMERIC SUSPEND loop, division widening the scale, EXECUTE PROCEDURE, the
+22003-past-width vector, and the subtype-1 describe — the ENGINE runs the
+BLR fc stored. Boundaries carried from the function slice: NUMERIC(19-38)
+/ INT128 in a signature refuses at the CREATE DDL; DOUBLE/approx has no
+exe f64 arithmetic.
+
+  `parse_call_args` is shared by every procedure-call site, so an
+  adversarial review flagged that the new decimal arm also carries a
+  decimal literal into an EXISTING INTEGER/TEXT-parameter procedure —
+  where fc used to refuse the whole statement at prepare, and where the
+  engine's CVT actually answers. Rather than restore the refusal, the
+  binding now MATCHES the engine: `bind_proc_args` rounds an exact-numeric
+  argument half-away into an INTEGER parameter (22003 past its width) and
+  renders it into a text parameter (`render_exact` — `|scale|` fractional
+  digits, trailing zeros kept, a leading `0`, no point at scale 0 — then
+  CHAR-padded), and `proc_blr_offset` counts a `<=9`-digit-mantissa decimal
+  literal as a LONG so the non-selectable-procedure `-104` offset stays
+  byte-exact. So `SELECT * FROM PI(1.5)` now answers `2` and `PT(1.50)`
+  answers `1.50`, as they do on the engine.
+
 **The IF statement (blr_if) in exe DONE (2026-08-23, `serve-real-psqlif`
 5):** the executor could not convert an IF, so a body combining IF/ELSE
 control flow with an exe-only feature (a NUMERIC computation, a function

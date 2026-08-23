@@ -12019,7 +12019,9 @@ fn ddl_position(meta: &ProcMeta, off: usize) -> Option<(usize, usize)> {
 /// blr_field per SELECTED column past the first (duplicates count -
 /// `SELECT X, X` costs the same as two distinct columns), `3` opens the
 /// argument list and each literal costs its own blr:
-/// blr_null = 1, blr_literal blr_long = 7, blr_literal blr_int64 = 11.
+/// blr_null = 1, blr_literal blr_long = 7, blr_literal blr_int64 = 11
+/// (a decimal literal follows its precision: <=9-digit mantissa is a
+/// LONG-backed NUMERIC and so also 7).
 ///
 /// Probed INVARIANT (all identical to the bare form): the select list's
 /// case, a `PUBLIC.`/`"PUBLIC"."..."` qualifier, an alias, WHERE, ORDER
@@ -12046,6 +12048,12 @@ fn proc_blr_offset(name: &str, n_cols: usize, args: &[Value]) -> i64 {
             off += match a {
                 Value::Null => 1,
                 Value::Int(v) if i32::try_from(*v).is_ok() => 7,
+                // a decimal literal is typed by its precision: a mantissa
+                // of nine digits or fewer is a NUMERIC backed by a LONG
+                // (blr_long, 7), ten to eighteen an INT64 (11) - probed:
+                // PE(1.5) answers offset 42, exactly the integer form
+                Value::Scaled(r, _) if (*r as i128).unsigned_abs().to_string().len() <= 9 => 7,
+                Value::Int128(r, _) if r.unsigned_abs().to_string().len() <= 9 => 7,
                 _ => 11,
             };
         }
@@ -28712,6 +28720,36 @@ fn parse_call_args(text: &str, allow_placeholder: bool) -> Option<Vec<Option<Val
                 Some(Some(Value::Null))
             } else if let Ok(n) = t.parse::<i64>() {
                 Some(Some(Value::Int(n)))
+            } else if let Some(TextNum::Dec { mantissa, exp }) =
+                (!t.starts_with('\'')).then(|| text_number(t)).flatten()
+            {
+                // a decimal / NUMERIC literal: value = mantissa x 10^exp.
+                // exp <= 0 is a scaled value (10.55 -> 1055 x 10^-2). A
+                // POSITIVE exponent (1.5e2 = 150) is an integer value the
+                // engine accepts as an argument, so fold the exponent into
+                // the mantissa at scale 0 rather than refuse. A hex literal
+                // is not taken here (text_number returns Hex, not Dec).
+                if exp > 0 {
+                    match u32::try_from(exp)
+                        .ok()
+                        .and_then(|e| 10i128.checked_pow(e))
+                        .and_then(|m| mantissa.checked_mul(m))
+                    {
+                        Some(v) => match i64::try_from(v) {
+                            Ok(n) => Some(Some(Value::Int(n))),
+                            Err(_) => Some(Some(Value::Int128(v, 0))),
+                        },
+                        None => None,
+                    }
+                } else {
+                    match i8::try_from(exp) {
+                        Ok(scale) => match i64::try_from(mantissa) {
+                            Ok(raw) => Some(Some(Value::Scaled(raw, scale))),
+                            Err(_) => Some(Some(Value::Int128(mantissa, scale))),
+                        },
+                        Err(_) => None,
+                    }
+                }
             } else if t.len() >= 2 && t.starts_with('\'') && t.ends_with('\'') {
                 // the '' escape undone; interior single quotes only ever
                 // arrive doubled (the split above kept them that way)
@@ -51843,14 +51881,12 @@ fn load_procedure(db: &Database, name: &str) -> Option<ProcMeta> {
             continue;
         }
         let desc = domain_desc(&fs)?;
-        // INTEGER and TEXT parameters, both directions: the frame's
-        // variables have been Value slots all along, the body assigns
-        // and compares text since the text increments, the describe
-        // carries the declared type (proc_out_col), and the ARGUMENT
-        // BINDING pads CHAR inputs, raises the truncation vector on
-        // overlength, and refuses cross-type rather than coercing
-        // (see run_body_source). Anything else stays refused.
-        if col_kind(&desc).is_none() {
+        // INT/TEXT the source path handles directly; NUMERIC (scaled or
+        // INT128) the BLR executor computes and describes (proc_out_col ->
+        // wire_for), so a procedure of these types is loadable now that it
+        // runs through try_procedure_blr. Approx (FLOAT/DOUBLE - no f64
+        // arithmetic in exe) and temporal stay refused.
+        if col_kind(&desc).is_none() && !is_numeric_col(&desc) {
             return None;
         }
         let p = ProcParam { name: pnm, desc };
@@ -54800,6 +54836,31 @@ fn text_in_nontext_output(row: &[Value], outs: &[ProcParam]) -> bool {
     })
 }
 
+/// Render an exact-numeric value as the engine's CVT does when a NUMERIC
+/// argument feeds a text parameter: exactly `|scale|` fractional digits
+/// (trailing zeros kept - `1.50` stays `1.50`), a leading `0` when the
+/// integer part is empty (`.5` -> `0.5`), the sign for a negative, and no
+/// point at all at scale 0 (`5.` -> `5`). Probed against Firebird 6.
+fn render_exact(raw: i128, scale: i8) -> String {
+    if scale >= 0 {
+        let mut s = raw.to_string();
+        for _ in 0..scale {
+            s.push('0');
+        }
+        return s;
+    }
+    let places = (-(scale as i32)) as usize;
+    let neg = raw < 0;
+    let mut digits = raw.unsigned_abs().to_string();
+    if digits.len() <= places {
+        // pad so at least one integer digit precedes the point
+        digits = format!("{}{}", "0".repeat(places - digits.len() + 1), digits);
+    }
+    let point = digits.len() - places;
+    let (int_part, frac_part) = digits.split_at(point);
+    format!("{}{}.{}", if neg { "-" } else { "" }, int_part, frac_part)
+}
+
 /// Bind a call's arguments to the DECLARED parameters - the same rules
 /// on BOTH executor paths (stored BLR and the source interpreter), or
 /// the two would disagree about the same call. Measured: a CHAR input
@@ -54865,6 +54926,70 @@ fn bind_proc_args(name: &str, meta: &ProcMeta, args: &[Value]) -> Result<Vec<Val
                 // parameter is a CONVERSION error, not a truncation
                 // (probed: `PS(123456789012)` into VARCHAR(10) raises
                 // 22018 "conversion error from string \"123456789012\"")
+                if rendered.chars().count() > declared_chars {
+                    return Err(ProcErr {
+                        text: format!("procedure {}: cannot convert {}", name, rendered),
+                        status: Some(EvalErr::ConversionError(Some(rendered))),
+                    });
+                }
+                if d.dtype == fire_crab_ods::format::dtype::TEXT {
+                    let mut padded = rendered;
+                    while padded.chars().count() < declared_chars {
+                        padded.push(' ');
+                    }
+                    Value::Text(padded)
+                } else {
+                    Value::Text(rendered)
+                }
+            }
+            // an exact-numeric argument into an INTEGER parameter: the
+            // engine's CVT rounds half-away to the integer and raises
+            // 22003 if the rounded value overflows the parameter's width
+            // (probed: PI(2.5)=3, PI(-1.5)=-2, PI(99999999999.5) -> 22003)
+            (Value::Scaled(..) | Value::Int128(..), Some(ColKind::Int)) => {
+                let (raw, from) = match arg {
+                    Value::Scaled(r, sc) => (*r as i128, *sc),
+                    Value::Int128(r, sc) => (*r, *sc),
+                    _ => unreachable!(),
+                };
+                match rescale(raw, from, 0) {
+                    Ok(r) => {
+                        use fire_crab_ods::format::dtype as dt;
+                        let fits = match d.dtype {
+                            dt::SHORT => i16::try_from(r).is_ok(),
+                            dt::LONG => i32::try_from(r).is_ok(),
+                            _ => i64::try_from(r).is_ok(),
+                        };
+                        if !fits {
+                            return Err(ProcErr {
+                                text: format!(
+                                    "procedure {}: {} out of range for {}",
+                                    name, raw, param.name
+                                ),
+                                status: Some(EvalErr::NumericOutOfRange),
+                            });
+                        }
+                        Value::Int(r as i64)
+                    }
+                    Err(ev) => {
+                        return Err(ProcErr {
+                            text: format!("procedure {}: conversion", name),
+                            status: Some(ev),
+                        })
+                    }
+                }
+            }
+            // an exact-numeric argument into a TEXT parameter: rendered as
+            // the engine renders it (render_exact), then obeying the
+            // parameter's width/pad exactly as the integer->text arm does
+            // (an over-width rendering is a 22018 conversion error)
+            (Value::Scaled(..) | Value::Int128(..), Some(ColKind::Text)) => {
+                let (raw, scale) = match arg {
+                    Value::Scaled(r, sc) => (*r as i128, *sc),
+                    Value::Int128(r, sc) => (*r, *sc),
+                    _ => unreachable!(),
+                };
+                let rendered = render_exact(raw, scale);
                 if rendered.chars().count() > declared_chars {
                     return Err(ProcErr {
                         text: format!("procedure {}: cannot convert {}", name, rendered),
