@@ -17244,6 +17244,25 @@ fn plain_function_arities(db: &Option<Database>) -> Vec<(String, usize)> {
     }
 }
 
+/// Turn a parameter's DEFAULT source (`DEFAULT 5`, `= 7`, `DEFAULT 'x'`,
+/// `DEFAULT NULL`) into the stored (RDB$DEFAULT_VALUE BLR, RDB$DEFAULT_SOURCE)
+/// pair, reusing the same literal-default BLR helpers a column default uses.
+/// The source is stored verbatim (the engine keeps the `DEFAULT` / `=` form).
+fn proc_default_of(src: &str) -> Option<(Vec<u8>, String)> {
+    let lit = src
+        .strip_prefix("DEFAULT")
+        .or_else(|| src.strip_prefix('='))
+        .map(str::trim)?;
+    let value_blr = if lit.starts_with('\'') {
+        fire_crab_ods::ddl::str_default_blr(&parse_string_literal(lit)?)
+    } else if lit.eq_ignore_ascii_case("NULL") {
+        fire_crab_ods::ddl::null_default_blr()
+    } else {
+        fire_crab_ods::ddl::int_default_blr(lit.parse::<i32>().ok()?)
+    };
+    Some((value_blr, src.to_string()))
+}
+
 fn plan_create_procedure(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor>)> {
     let up = sql.trim_start().to_ascii_uppercase();
     if find_word(&up, "CREATE", 0) != Some(0)
@@ -17256,8 +17275,16 @@ fn plan_create_procedure(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<
     if c.calls_user_fn && !exe_can_run(&c.blob) {
         return None; // stores BLR fc could not itself run - refuse instead
     }
+    // a parameter DEFAULT this server cannot encode (an integer outside
+    // i32, say) must REFUSE the whole CREATE, not be silently dropped -
+    // else the catalog diverges and an omitted-argument call splits. The
+    // column-default path refuses the same way.
+    if c.ins.iter().any(|m| m.default.as_deref().is_some_and(|src| proc_default_of(src).is_none())) {
+        return None;
+    }
     let conv = |m: &fire_crab_dsql::ProcParamMeta| fire_crab_ods::ddl::ProcParamDef {
-        default: None,
+        // an input parameter DEFAULT (procedures only); outputs carry none
+        default: m.default.as_deref().and_then(proc_default_of),
         name: m.name.clone(),
         field_type: m.field_type,
         length: m.length,
@@ -32039,6 +32066,9 @@ fn plan_query_inner_ctx(
                             None => Plan::Refused,
                         });
                     }
+                    // an omitted trailing argument takes its parameter's
+                    // DEFAULT before the arity is judged
+                    let args = with_proc_defaults(&meta, &args);
                     // ARITY beats the not-selectable refusal (probed:
                     // `SELECT * FROM P2_RET(1)` and `SELECT * FROM
                     // PSELP` with one declared input answer this, for
@@ -51841,6 +51871,10 @@ enum ColKind {
 struct ProcParam {
     name: String,
     desc: Descriptor,
+    /// an input parameter's DEFAULT value (decoded from RDB$DEFAULT_VALUE),
+    /// used to fill an omitted trailing argument at a call; None for a
+    /// parameter without a literal default this server can evaluate
+    default: Option<Value>,
 }
 
 /// A procedure as the catalog describes it.
@@ -51963,6 +51997,19 @@ fn procedure_defined(db: &Database, name: &str) -> bool {
         }
     });
     found
+}
+
+/// A literal [DefaultVal] as a [Value] for filling an omitted argument.
+/// Session/expression defaults (CURRENT_*, USER, ...) return None - this
+/// server does not evaluate a parameter default that is not a literal.
+fn default_val_to_value(d: DefaultVal) -> Option<Value> {
+    match d {
+        DefaultVal::Int(n, 0) => Some(Value::Int(n)),
+        DefaultVal::Int(n, sc) => Some(Value::Scaled(n, sc)),
+        DefaultVal::Text(t) => Some(Value::Text(t)),
+        DefaultVal::Null => Some(Value::Null),
+        _ => None,
+    }
 }
 
 fn load_procedure(db: &Database, name: &str) -> Option<ProcMeta> {
@@ -52094,10 +52141,12 @@ fn load_procedure(db: &Database, name: &str) -> Option<ProcMeta> {
         cfid("RDB$PARAMETER_TYPE")?,
         cfid("RDB$FIELD_SOURCE")?,
     );
-    // (parameter type 0=in/1=out, number, name, field source, defaulted)
-    let mut raw: Vec<(i64, i64, String, String, bool)> = Vec::new();
+    // (parameter type 0=in/1=out, number, name, field source, defaulted,
+    //  decoded default value)
+    let mut raw: Vec<(i64, i64, String, String, bool, Option<Value>)> = Vec::new();
     let pname_f = cfid("RDB$PARAMETER_NAME")?;
     let cdef_f = cfid("RDB$DEFAULT_SOURCE");
+    let cdefval_f = cfid("RDB$DEFAULT_VALUE");
     // the same schema/package filter as the source scan: FB6's packaged
     // SYSTEM parameters (RDB$PROFILER.FLUSH's among them) share this
     // relation, and merging them in was the probed arity error
@@ -52118,12 +52167,22 @@ fn load_procedure(db: &Database, name: &str) -> Option<ProcMeta> {
         {
             let defaulted =
                 matches!(cdef_f.and_then(|i| v.get(i)), Some(Value::Blob(..) | Value::Text(_)));
+            // decode the DEFAULT VALUE blr into a literal value, so an
+            // omitted argument can be filled at a call (a non-literal /
+            // session default decodes to None and the omit refuses)
+            let defval = match cdefval_f.and_then(|i| v.get(i)) {
+                Some(Value::Blob(r, n)) => fire_crab_blb::read_blob_content(&db.bytes(), db.page_size, *r, *n)
+                    .and_then(|b| decode_default_blr(&b))
+                    .and_then(default_val_to_value),
+                _ => None,
+            };
             raw.push((
                 *typ as i64,
                 *num as i64,
                 pnm.trim_end().to_string(),
                 fs.trim_end().to_string(),
                 defaulted,
+                defval,
             ));
         }
     });
@@ -52150,8 +52209,8 @@ fn load_procedure(db: &Database, name: &str) -> Option<ProcMeta> {
     };
     let mut ins: Vec<ProcParam> = Vec::new();
     let mut outs: Vec<ProcParam> = Vec::new();
-    raw.sort_by_key(|(t, n, _, _, _)| (*t, *n));
-    for (typ, _, pnm, fs, defaulted) in raw {
+    raw.sort_by_key(|(t, n, _, _, _, _)| (*t, *n));
+    for (typ, _, pnm, fs, defaulted, defval) in raw {
         // the native no-op body reads NOTHING, so its DEFAULTED inputs
         // are simply omittable - the engine binds their defaults
         // (ATTACHMENT_ID = the current one) and answers NONE [] either
@@ -52171,7 +52230,7 @@ fn load_procedure(db: &Database, name: &str) -> Option<ProcMeta> {
         if col_kind(&desc).is_none() && !is_numeric_col(&desc) {
             return None;
         }
-        let p = ProcParam { name: pnm, desc };
+        let p = ProcParam { name: pnm, desc, default: defval };
         if typ == 0 {
             ins.push(p)
         } else {
@@ -54927,11 +54986,21 @@ fn try_procedure_blr(
     // one call: the truncation raise is typed, everything else falls
     // to the source interpreter to refuse in its own words
     let bound_args = match load_procedure(db, name) {
-        Some(meta) => match bind_proc_args(name, &meta, args) {
-            Ok(b) => b,
-            Err(ProcErr { status: Some(ev), .. }) => return BlrProcOutcome::Runtime(ev),
-            Err(_) => return BlrProcOutcome::Outside,
-        },
+        Some(meta) => {
+            // fill omitted trailing defaults, then REQUIRE an exact arity -
+            // bind_proc_args zips and would otherwise silently drop extra
+            // arguments (an over-arity call the other paths reject). A
+            // mismatch falls to the source path, which answers the vector.
+            let filled = with_proc_defaults(&meta, args);
+            if filled.len() != meta.ins.len() {
+                return BlrProcOutcome::Outside;
+            }
+            match bind_proc_args(name, &meta, &filled) {
+                Ok(b) => b,
+                Err(ProcErr { status: Some(ev), .. }) => return BlrProcOutcome::Runtime(ev),
+                Err(_) => return BlrProcOutcome::Outside,
+            }
+        }
         None => return BlrProcOutcome::Outside,
     };
     let args = &bound_args[..];
@@ -55151,6 +55220,22 @@ fn render_exact(raw: i128, scale: i8) -> String {
     let point = digits.len() - places;
     let (int_part, frac_part) = digits.split_at(point);
     format!("{}{}.{}", if neg { "-" } else { "" }, int_part, frac_part)
+}
+
+/// Extend a procedure call's arguments with the DEFAULTs of the omitted
+/// TRAILING parameters - a call may leave defaulted trailing parameters
+/// out (EXECUTE PROCEDURE P(10) where P's second parameter has a default).
+/// Stops at the first omitted parameter WITHOUT a default this server can
+/// evaluate, leaving the arity check to reject a genuine mismatch.
+fn with_proc_defaults(meta: &ProcMeta, args: &[Value]) -> Vec<Value> {
+    let mut out = args.to_vec();
+    while out.len() < meta.ins.len() {
+        match &meta.ins[out.len()].default {
+            Some(v) => out.push(v.clone()),
+            None => break,
+        }
+    }
+    out
 }
 
 /// Bind a call's arguments to the DECLARED parameters - the same rules
@@ -55708,9 +55793,9 @@ fn load_function(db: &Database, name: &str) -> Option<ProcMeta> {
             return None;
         }
         if pos == 0 {
-            outs.push(ProcParam { name: "RETURN".into(), desc });
+            outs.push(ProcParam { name: "RETURN".into(), desc, default: None });
         } else {
-            ins.push(ProcParam { name: pname, desc });
+            ins.push(ProcParam { name: pname, desc, default: None });
         }
     }
     if outs.len() != 1 {
@@ -55822,6 +55907,9 @@ fn run_body_source(
     args: &[Value],
     ctx: &SessionCtx,
 ) -> Result<(Vec<Value>, Vec<Vec<Value>>), ProcErr> {
+    // omitted trailing arguments take their parameters' DEFAULTs
+    let args = with_proc_defaults(meta, args);
+    let args = &args[..];
     if args.len() != meta.ins.len() {
         return Err(ProcErr::from(format!(
             "procedure {} expects {} input parameter(s), got {}",
@@ -59636,7 +59724,7 @@ fn after_auth(
                         outs: out_names
                             .iter()
                             .zip(out_descs.iter())
-                            .map(|(n, d)| ProcParam { name: n.clone(), desc: *d })
+                            .map(|(n, d)| ProcParam { name: n.clone(), desc: *d, default: None })
                             .collect(),
                         source,
                         body_at: Some(body_at),

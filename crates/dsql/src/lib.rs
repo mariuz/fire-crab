@@ -4074,6 +4074,10 @@ pub fn compile_procedure(sql: &str) -> Option<Vec<u8>> {
 struct BodyOut {
     blob: Vec<u8>,
     ins: Vec<(String, Dsc)>,
+    /// parallel to `ins`: an input parameter's DEFAULT value SOURCE
+    /// (`5`, `'x'`, `NULL`), or None. Procedures only, literals only -
+    /// the wire turns the source into RDB$DEFAULT_SOURCE / VALUE.
+    in_defaults: Vec<Option<String>>,
     outs: Vec<(String, Dsc)>,
     selectable: bool,
     deterministic: bool,
@@ -4092,6 +4096,7 @@ fn body_compile(p: &mut P, func: bool, sub: bool) -> Option<BodyOut> {
     // optional INPUT parameters: message 0, one dsc + null-flag short
     // per parameter, NO EOF slot
     let mut inputs: Vec<(String, Dsc)> = Vec::new();
+    let mut in_defaults: Vec<Option<String>> = Vec::new();
     if matches!(p.t.get(p.i), Some(Tok::LParen)) {
         p.i += 1;
         // `()` - an EMPTY list, the same as none (a function may say it)
@@ -4108,7 +4113,34 @@ fn body_compile(p: &mut P, func: bool, sub: bool) -> Option<BodyOut> {
             let name = name.clone();
             p.i += 1;
             let dsc = p.cast_target()?;
+            // optional DEFAULT / = <literal>. Procedures only (a function
+            // parameter default is refused for now); a literal only
+            // (integer, optionally signed; string; NULL) - an expression
+            // default refuses. Defaults must be TRAILING, as the engine
+            // requires (a plain parameter after a defaulted one refuses).
+            // the engine PRESERVES the form in RDB$DEFAULT_SOURCE
+            // ("DEFAULT 5" vs "= 7"), so capture which one was written
+            let form = if p.kw("DEFAULT") {
+                Some("DEFAULT")
+            } else if matches!(p.t.get(p.i), Some(Tok::Cmp(CmpOp::Eql))) {
+                p.i += 1;
+                Some("=")
+            } else {
+                None
+            };
+            let default = if let Some(form) = form {
+                if func {
+                    return None; // a FUNCTION parameter default: not yet
+                }
+                Some(format!("{} {}", form, param_default_source(p)?))
+            } else {
+                if in_defaults.iter().any(|d| d.is_some()) {
+                    return None; // a plain parameter after a defaulted one
+                }
+                None
+            };
             inputs.push((name, dsc));
+            in_defaults.push(default);
             match p.t.get(p.i)? {
                 Tok::Comma => p.i += 1,
                 Tok::RParen => {
@@ -4366,10 +4398,40 @@ fn body_compile(p: &mut P, func: bool, sub: bool) -> Option<BodyOut> {
     Some(BodyOut {
         blob: out,
         ins: inputs,
+        in_defaults,
         outs: params,
         selectable: p.saw_suspend,
         deterministic,
     })
+}
+
+/// Read an input parameter's DEFAULT literal into its SOURCE text - an
+/// integer (optionally signed), a string literal, or NULL. Anything
+/// else (an expression, a context function) refuses (the wire turns this
+/// text into RDB$DEFAULT_SOURCE / VALUE with the same helpers a column
+/// default uses).
+fn param_default_source(p: &mut P) -> Option<String> {
+    let neg = matches!(p.t.get(p.i), Some(Tok::Minus));
+    if neg {
+        p.i += 1;
+    }
+    let src = match p.t.get(p.i)? {
+        Tok::Int(n) => {
+            p.i += 1;
+            if neg { format!("-{}", n) } else { format!("{}", n) }
+        }
+        Tok::Str(sv) if !neg => {
+            let sv = sv.clone();
+            p.i += 1;
+            format!("'{}'", sv.replace('\'', "''"))
+        }
+        Tok::Ident(w) if !neg && w.eq_ignore_ascii_case("NULL") => {
+            p.i += 1;
+            "NULL".to_string()
+        }
+        _ => return None,
+    };
+    Some(src)
 }
 
 /// A function body's row send: message 1, the ONE unnamed return
@@ -9947,6 +10009,10 @@ pub struct ProcParamMeta {
     pub length: u16,
     pub scale: i16,
     pub sub_type: i16,
+    /// an input parameter DEFAULT value SOURCE (`5`, `'x'`, `NULL`); None
+    /// for outputs and undefaulted inputs. The wire turns it into the
+    /// stored RDB$DEFAULT_SOURCE / VALUE.
+    pub default: Option<String>,
 }
 
 fn dsc_to_meta(name: &str, d: &Dsc) -> ProcParamMeta {
@@ -9969,6 +10035,7 @@ fn dsc_to_meta(name: &str, d: &Dsc) -> ProcParamMeta {
         // 1); a plain integer or a non-numeric type is 0. DECIMAL (2) is
         // not distinguished from NUMERIC by the Dsc here - a boundary.
         sub_type: if scale != 0 { 1 } else { 0 },
+        default: None,
     }
 }
 
@@ -10045,7 +10112,16 @@ fn compile_routine_full(
     Some(ProcCompiled {
         name,
         blob: bo.blob,
-        ins: bo.ins.iter().map(|(n, d)| dsc_to_meta(n, d)).collect(),
+        ins: bo
+            .ins
+            .iter()
+            .zip(bo.in_defaults.iter())
+            .map(|((n, d), def)| {
+                let mut m = dsc_to_meta(n, d);
+                m.default = def.clone();
+                m
+            })
+            .collect(),
         outs: bo.outs.iter().map(|(n, d)| dsc_to_meta(n, d)).collect(),
         selectable: bo.selectable,
         source,

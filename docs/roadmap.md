@@ -460,6 +460,23 @@ The gbak-restore path already mapped routine descriptions, so a comment
 survives a round-trip. Boundary (shared by ALL comment targets, pre-existing):
 the not-found vector is fc's generic refusal, not the engine's byte-exact one.
 
+**DEFAULT parameters on a PROCEDURE DONE (2026-08-23, `serve-real-procdefault`
+7).** `A INTEGER DEFAULT 5`, `A INTEGER = 7`, `A VARCHAR(5) DEFAULT 'hi'`,
+`DEFAULT -3`. dsql parses a LITERAL default (integer optionally signed,
+string, NULL) in the input list, keeping the exact `DEFAULT`/`=` form;
+`proc_default_of` turns it into the stored RDB$DEFAULT_SOURCE (verbatim) and
+RDB$DEFAULT_VALUE BLR (the column-default helpers - byte-exact vs the engine:
+`05 15 08 00 <i32> 4c` for an int, `blr_text2` for a string); load_procedure
+decodes RDB$DEFAULT_VALUE into ProcParam.default, and `with_proc_defaults`
+fills an omitted TRAILING argument at every call path (selectable,
+run_body_source, try_procedure_blr) before the arity check, the value flowing
+through bind coercion (an int default into a NUMERIC parameter rescales; a
+NULL default fills NULL). Defaults must be trailing (a plain parameter after a
+defaulted one refuses, as the engine does); a call missing a REQUIRED
+parameter gives the byte-exact `Parameter mismatch`. Boundaries (recorded): a
+FUNCTION parameter default and a non-literal / context default refuse at
+CREATE (the engine accepts both; procedures + literals only for now).
+
 **The IF statement (blr_if) in exe DONE (2026-08-23, `serve-real-psqlif`
 5):** the executor could not convert an IF, so a body combining IF/ELSE
 control flow with an exe-only feature (a NUMERIC computation, a function
