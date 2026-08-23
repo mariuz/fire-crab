@@ -43,6 +43,7 @@ mod blr {
     pub const RECEIVE: u8 = 12;
     pub const SEND: u8 = 14;
     pub const LABEL: u8 = 17;
+    pub const LEAVE: u8 = 18;
     pub const LITERAL: u8 = 21;
     pub const ADD: u8 = 34;
     pub const SUBTRACT: u8 = 35;
@@ -413,6 +414,11 @@ pub enum Stmt {
     /// blr_stall - the scheduling point between EXE_start and the
     /// first EXE_receive; a no-op for this synchronous executor
     Stall,
+    /// blr_leave: exit the enclosing block/loop carrying the given label.
+    /// A FUNCTION's `RETURN e` compiles to assign-var0, send message 1,
+    /// then `leave 0` out of the body wrapper - so running up to the leave
+    /// and unwinding to its label is exactly the return.
+    Leave(u8),
 }
 
 /// An assignment target.
@@ -1200,6 +1206,7 @@ impl<'a> P<'a> {
                 Ok(Stmt::Assign(from, to))
             }
             blr::STALL => Ok(Stmt::Stall),
+            blr::LEAVE => Ok(Stmt::Leave(self.u8()?)),
             other => Err(format!("statement verb {} unconverted", other)),
         }
     }
@@ -1324,6 +1331,9 @@ struct Exec<'a> {
     frames: Vec<StreamFrame>,
     /// every executed blr_send: (message number, buffer snapshot)
     sends: Vec<(u8, Vec<Value>)>,
+    /// set by blr_leave to the target label; unwinds block/loop execution
+    /// until the matching blr_label clears it
+    leaving: Option<u8>,
 }
 
 /// The looper (`EXE_looper`): execute the statement tree synchronously,
@@ -1411,6 +1421,7 @@ pub fn bind_and_execute(
         msg_slots,
         frames: Vec::new(),
         sends: Vec::new(),
+        leaving: None,
     };
     ex.stmt(&request.body)?;
     Ok(ex.sends)
@@ -1422,9 +1433,20 @@ impl<'a> Exec<'a> {
             Stmt::Begin(list) => {
                 for s in list {
                     self.stmt(s)?;
+                    if self.leaving.is_some() {
+                        break; // unwinding to a leave's label
+                    }
                 }
             }
-            Stmt::Label(_, inner) => self.stmt(inner)?,
+            Stmt::Label(n, inner) => {
+                self.stmt(inner)?;
+                // a leave targeting THIS label stops here; a higher one
+                // keeps unwinding
+                if self.leaving == Some(*n) {
+                    self.leaving = None;
+                }
+            }
+            Stmt::Leave(n) => self.leaving = Some(*n),
             Stmt::Stall => {}
             Stmt::Send(msg, filler) => {
                 self.stmt(filler)?;
@@ -1486,6 +1508,9 @@ impl<'a> Exec<'a> {
                     let r = self.stmt(body);
                     self.frames.truncate(depth);
                     r?;
+                    if self.leaving.is_some() {
+                        break; // a leave inside the loop unwinds out of it
+                    }
                 }
             }
         }
@@ -3178,6 +3203,61 @@ pub fn procedure_blr(file: &fire_crab_ods::Image, page_size: usize, name: &str) 
     Err(format!("procedure {} not found", name))
 }
 
+/// The stored `RDB$FUNCTION_BLR` of a PLAIN function - the mirror of
+/// [procedure_blr]. A packaged member's dotted name never matches the
+/// bare stored name, and a package-tagged row is skipped, so packaged
+/// functions fall to the source interpreter (their bodies may call
+/// siblings via blr_function2, which this executor does not run).
+pub fn function_blr(file: &fire_crab_ods::Image, page_size: usize, name: &str) -> Result<Vec<u8>, String> {
+    let rel = resolve_relation(file, page_size, "RDB$FUNCTIONS")
+        .ok_or("no RDB$FUNCTIONS relation")?;
+    let formats = system_relation_formats(file, page_size, "RDB$FUNCTIONS")
+        .ok_or("no RDB$FUNCTIONS format")?;
+    let (_, descs) = formats
+        .iter()
+        .max_by_key(|(n, _)| *n)
+        .ok_or("empty format list")?;
+    let cols = relation_columns(file, page_size, "RDB$FUNCTIONS");
+    let fid = |n: &str| {
+        cols.iter()
+            .find(|c| c.name == n)
+            .map(|c| c.field_id as usize)
+    };
+    let name_f = fid("RDB$FUNCTION_NAME").ok_or("no RDB$FUNCTION_NAME column")?;
+    let blr_f = fid("RDB$FUNCTION_BLR").ok_or("no RDB$FUNCTION_BLR column")?;
+    let pkg_f = fid("RDB$PACKAGE_NAME");
+    for dp_no in relation_data_pages(file, page_size, rel) {
+        let Some(dp) = fire_crab_ods::page_at(file, page_size, dp_no).and_then(DataPage::decode)
+        else {
+            continue;
+        };
+        for r in dp.records() {
+            if !r.is_primary_record() {
+                continue;
+            }
+            let Some(image) = fire_crab_ods::data::assembled_image(file, page_size, &r) else { continue };
+            let values = decode_record(&image, descs);
+            let Some(Value::Text(t)) = values.get(name_f) else {
+                continue;
+            };
+            if t.trim_end() != name {
+                continue;
+            }
+            if matches!(pkg_f.and_then(|i| values.get(i)), Some(Value::Text(_))) {
+                continue;
+            }
+            return match values.get(blr_f) {
+                Some(Value::Blob(brel, brec)) => {
+                    read_blob_content(file, page_size, *brel, *brec)
+                        .ok_or_else(|| "cannot read the BLR blob".into())
+                }
+                _ => Err(format!("function {} has no BLR", name)),
+            };
+        }
+    }
+    Err(format!("function {} not found", name))
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -3229,6 +3309,7 @@ mod tests {
             match s {
                 Stmt::Begin(list) => list.iter().find_map(find_agg),
                 Stmt::Label(_, i) | Stmt::Send(_, i) => find_agg(i),
+                Stmt::Leave(_) => None,
                 Stmt::For(rse, body) => match &rse.stream {
                     Stream::Aggregate(a) => Some(a),
                     _ => find_agg(body),

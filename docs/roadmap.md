@@ -388,6 +388,25 @@ pointer-page and TIP page numbers is the next step when it dominates.
 
 ## Next, in order
 
+- **PSQL functions run through the BLR executor — the full scalar surface
+  DONE (2026-08-23, `serve-real-funcbody` 5):** a plain function's body was
+  interpreted by an arithmetic-only path (a `RETURN` could only do
+  `+ - * /`); now it runs through the existing `crates/exe` BLR executor,
+  which reads `UPPER`/`LOWER`/`SUBSTRING`/`CAST`/`COALESCE`/`DECODE`/the
+  searched `CASE`/a scalar subquery/concatenation/`IF`/`WHILE`. `exe`
+  gained `blr_leave` (verb 18: a function's `RETURN` is assign-var0, send
+  message 1, then leave the body wrapper) via an `Exec.leaving` unwind, and
+  `exe::function_blr` (the mirror of `procedure_blr`, plain functions only).
+  `try_function_blr` (the mirror of `try_procedure_blr`) runs it and pulls
+  the one output from message 1; a divide-by-zero raises 22012 and a bad
+  `CAST` 22018 (before, any function runtime error was a generic refusal).
+  Boundaries (recorded): a PACKAGED function's rich body and a function that
+  calls another user function (`blr_function2`, no executor support) fall to
+  the source path and may refuse; NUMERIC in a function SIGNATURE is a
+  separate pre-existing gap (`load_function` refuses it, so such a function
+  is `-804` regardless); fc omits the engine's `-At function ... line/col`
+  stack frame on a runtime error.
+
 - **CREATE PACKAGE BODY: a member that calls a sibling unqualified DONE
   (2026-08-22, `serve-real-pkgsibling` 8):** inside a package body a bare
   `DBL(...)` names sibling member DBL, compiled to `blr_function2` with THIS

@@ -54510,6 +54510,19 @@ enum BlrProcOutcome {
     Runtime(EvalErr),
 }
 
+/// The single-value analogue of [BlrProcOutcome] for a FUNCTION run
+/// through the BLR executor.
+enum FnBlrOutcome {
+    /// outside the executor's surface (unknown/packaged function, a body
+    /// verb it does not run - e.g. a sibling blr_function2 call): the
+    /// source interpreter answers instead
+    Outside,
+    /// the function's one output value
+    Value(Value),
+    /// the body ran and raised a genuine runtime error
+    Runtime(EvalErr),
+}
+
 /// THE SAME RUNTIME ERROR, WITH THE POSITION IT WAS RAISED AT.
 ///
 /// There are two execution paths - `fire-crab-exe`'s BLR interpreter,
@@ -54650,6 +54663,94 @@ fn try_procedure_blr(
         }
     }
     BlrProcOutcome::Rows(rows, finals)
+}
+
+/// Run a PLAIN FUNCTION through the BLR executor - the mirror of
+/// [try_procedure_blr]. This gives a function body the executor's full
+/// expression surface (UPCASE/SUBSTRING/CAST/COALESCE/DECODE/a scalar
+/// subquery/concatenation, ...) that the arithmetic-only source path for
+/// RETURN cannot read. A function whose body the executor cannot run (a
+/// packaged member, a sibling blr_function2 call, a generator) returns
+/// Outside and the source interpreter answers as before.
+fn try_function_blr(database: &Option<Database>, name: &str, args: &[Value]) -> FnBlrOutcome {
+    let Some(db) = database.as_ref() else {
+        return FnBlrOutcome::Outside;
+    };
+    let Ok(blr) = fire_crab_exe::function_blr(&db.bytes(), db.page_size, name) else {
+        return FnBlrOutcome::Outside;
+    };
+    let Some(meta) = load_function(db, name) else {
+        return FnBlrOutcome::Outside;
+    };
+    // the SAME argument binding as the source path (typed CVT errors surface)
+    let bound_args = match bind_proc_args(name, &meta, args) {
+        Ok(b) => b,
+        Err(ProcErr { status: Some(ev), .. }) => return FnBlrOutcome::Runtime(ev),
+        Err(_) => return FnBlrOutcome::Outside,
+    };
+    let Ok(req) = fire_crab_exe::parse(&blr) else {
+        return FnBlrOutcome::Outside;
+    };
+    if req.uses_generators {
+        return FnBlrOutcome::Outside;
+    }
+    let sends = match fire_crab_exe::bind_and_execute(&db.bytes(), db.page_size, &req, &bound_args)
+    {
+        Ok(s) => s,
+        Err(e) => {
+            // the executor's runtime classes surface with the engine's own
+            // vectors; a conversion error carries the offending string
+            // between quotes; anything else falls back conservatively
+            return match e.as_str() {
+                "integer divide by zero" => FnBlrOutcome::Runtime(EvalErr::DivideByZero),
+                "integer overflow" => FnBlrOutcome::Runtime(EvalErr::IntegerOverflow),
+                m if m.starts_with("conversion error from string ") => {
+                    // the offending value sits between the FIRST and LAST
+                    // quote - it may itself contain a quote, so strip the
+                    // fixed prefix and the trailing quote rather than split
+                    let inner = m
+                        .strip_prefix("conversion error from string \"")
+                        .and_then(|r| r.strip_suffix('"'))
+                        .map(|x| x.to_string());
+                    FnBlrOutcome::Runtime(EvalErr::ConversionError(inner))
+                }
+                _ => FnBlrOutcome::Outside,
+            };
+        }
+    };
+    // a function's ONE output rides message 1: (value, null-flag, EOF short)
+    let Some(out_slots) = req.messages.iter().find(|(n, _)| *n == 1).map(|(_, s)| s.len()) else {
+        return FnBlrOutcome::Outside;
+    };
+    if out_slots != 3 {
+        return FnBlrOutcome::Outside;
+    }
+    let mut val: Option<Value> = None;
+    for (msg, buf) in &sends {
+        if *msg != 1 {
+            continue;
+        }
+        let null = matches!(buf.get(1), Some(Value::Int(fl)) if *fl != 0);
+        val = Some(if null {
+            Value::Null
+        } else {
+            buf.first().cloned().unwrap_or(Value::Null)
+        });
+    }
+    let Some(v) = val else {
+        return FnBlrOutcome::Outside;
+    };
+    // a TEXT value in a non-text output slot would render as 0 on the wire
+    // (the executor is untyped) - refuse and let the source path answer,
+    // exactly as try_procedure_blr does
+    if matches!(v, Value::Text(_)) {
+        if let Some(o) = meta.outs.first() {
+            if text_in_nontext_output(std::slice::from_ref(&v), std::slice::from_ref(o)) {
+                return FnBlrOutcome::Outside;
+            }
+        }
+    }
+    FnBlrOutcome::Value(v)
 }
 
 /// Would this row put a TEXT value where the procedure declares
@@ -54912,12 +55013,20 @@ fn materialise_user_fn_rows(
             for a in &c.args {
                 argv.push(a.eval(values)?);
             }
-            let v = run_function(database, &c.name, &argv, ctx).map_err(|e| {
-                if std::env::var("FC_SRV_TRACE").is_ok() {
-                    eprintln!("[srv] user function {}({:?}) failed: {}", c.name, argv, e);
+            // the BLR executor first (the full expression surface), then
+            // the arithmetic-only source interpreter for what it declines
+            let v = match try_function_blr(database, &c.name, &argv) {
+                FnBlrOutcome::Value(v) => v,
+                FnBlrOutcome::Runtime(ev) => return Err(ev),
+                FnBlrOutcome::Outside => {
+                    run_function(database, &c.name, &argv, ctx).map_err(|e| {
+                        if std::env::var("FC_SRV_TRACE").is_ok() {
+                            eprintln!("[srv] user function {}({:?}) failed: {}", c.name, argv, e);
+                        }
+                        EvalErr::Unsupported
+                    })?
                 }
-                EvalErr::Unsupported
-            })?;
+            };
             FN_VALS.with(|m| m.borrow_mut().insert(c.id, v));
         }
         let mut row = Vec::with_capacity(cols.len());
