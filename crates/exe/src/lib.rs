@@ -2712,7 +2712,11 @@ impl<'a> Exec<'a> {
                             Value::Text(t) => t
                                 .trim()
                                 .parse::<i64>()
-                                .map_err(|_| format!("conversion error from string \"{}\"", t.trim()))?,
+                                // the PARSE trims leading/trailing spaces, but
+                                // the 22018 message carries the RAW value -
+                                // CHAR padding included (the engine's, and
+                                // fc's own main-path, convention)
+                                .map_err(|_| format!("conversion error from string \"{}\"", t))?,
                             other => int_of(other)
                                 .ok_or("cast to integer unconverted for this value")?,
                         };
