@@ -267,12 +267,19 @@ now writes sub_type 1 for a scaled param; `run_function` coerces its
 result to the return scale (the source-interpreter fallback did not).
 Boundaries (recorded): NUMERIC(19-38)/INT128 in a signature — the CREATE
 FUNCTION DDL refuses it; DOUBLE/approx — the executor has no f64
-arithmetic; a PACKAGED numeric function whose body does scaled arithmetic
-or has a NUMERIC literal/param — packaged members bypass exe
-(`function_blr` skips them) and the arithmetic-only source interpreter
-refuses (a clean refusal, no wrong answer; the pure-integer-body → NUMERIC
-return case works). NUMERIC in a PROCEDURE signature is a follow-up
+arithmetic. NUMERIC in a PROCEDURE signature is a follow-up
 (`load_procedure` unchanged; needs the proc output-column describe path).
+
+**Packaged functions via exe DONE (2026-08-23, `serve-real-pkgfunc` 6):**
+`function_blr` is now package-aware (a dotted `PKG.F` resolves the
+packaged member's BLR, a bare name the plain function — the two stay
+distinct), so packaged functions run through the exe executor and get its
+full scalar surface (NUMERIC params/returns, scaled arithmetic, a NUMERIC
+literal, UPPER/CASE) instead of the arithmetic-only source path — closing
+the previous slice's packaged-numeric boundary. Boundary: a packaged
+member whose body CALLS A SIBLING (blr_function2) still refuses (exe has
+no blr_function2; a clean refusal, the engine answers) — needs
+blr_function2 in exe.
 
 Other gaps: an explicit `PLAN` (WITH LOCK / FOR UPDATE / OPTIMIZE are
 done); a `?` inside any PSQL query (loop, cursor, `EXECUTE STATEMENT`,

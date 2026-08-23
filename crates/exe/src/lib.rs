@@ -3363,6 +3363,18 @@ pub fn procedure_blr(file: &fire_crab_ods::Image, page_size: usize, name: &str) 
 /// functions fall to the source interpreter (their bodies may call
 /// siblings via blr_function2, which this executor does not run).
 pub fn function_blr(file: &fire_crab_ods::Image, page_size: usize, name: &str) -> Result<Vec<u8>, String> {
+    // A DOTTED name is a PACKAGED member (PKG.F, or SCHEMA.PKG.F); a bare
+    // name (or PUBLIC.F) is a plain function. A bare name matches only a
+    // row with NO package (so a plain call never grabs a packaged member's
+    // BLR); a dotted name matches the row with that package.
+    let parts: Vec<&str> = name.split('.').collect();
+    let (want_pkg, mname): (Option<&str>, &str) = match parts.as_slice() {
+        [n] => (None, *n),
+        [p, n] if p.eq_ignore_ascii_case("PUBLIC") => (None, *n),
+        [p, n] => (Some(*p), *n),
+        [_sc, p, n] => (Some(*p), *n),
+        _ => return Err(format!("function {} not found", name)),
+    };
     let rel = resolve_relation(file, page_size, "RDB$FUNCTIONS")
         .ok_or("no RDB$FUNCTIONS relation")?;
     let formats = system_relation_formats(file, page_size, "RDB$FUNCTIONS")
@@ -3394,10 +3406,17 @@ pub fn function_blr(file: &fire_crab_ods::Image, page_size: usize, name: &str) -
             let Some(Value::Text(t)) = values.get(name_f) else {
                 continue;
             };
-            if t.trim_end() != name {
+            if t.trim_end() != mname {
                 continue;
             }
-            if matches!(pkg_f.and_then(|i| values.get(i)), Some(Value::Text(_))) {
+            let row_pkg = pkg_f.and_then(|i| values.get(i));
+            let pkg_ok = match want_pkg {
+                None => !matches!(row_pkg, Some(Value::Text(_))),
+                Some(p) => {
+                    matches!(row_pkg, Some(Value::Text(rp)) if rp.trim_end().eq_ignore_ascii_case(p))
+                }
+            };
+            if !pkg_ok {
                 continue;
             }
             return match values.get(blr_f) {
