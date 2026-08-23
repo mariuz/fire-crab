@@ -111,6 +111,7 @@ mod blr {
     pub const PLAN: u8 = 139;
     pub const ANSI_ANY: u8 = 151;
     pub const WINDOW: u8 = 195;
+    pub const FUNCTION2: u8 = 194;
     pub const PARTITION_BY: u8 = 196;
     pub const AGG_FUNCTION: u8 = 199;
     pub const RECURSE: u8 = 185;
@@ -218,6 +219,10 @@ pub enum Expr {
     /// one row binds and the value evaluates, none and the else
     /// does, more than one is the engine's sing_err
     Via(Box<Rse>, Box<Expr>, Box<Expr>),
+    /// blr_function2: a call to another user FUNCTION - (package name
+    /// (empty for a plain function), function name, argument expressions).
+    /// Run by fetching the callee's BLR and executing it recursively.
+    Function(String, String, Vec<Expr>),
     /// blr_null
     Null,
 }
@@ -756,6 +761,18 @@ impl<'a> P<'a> {
                     }
                     other => return Err(format!("literal dtype {} unconverted", other)),
                 }))
+            }
+            blr::FUNCTION2 => {
+                // blr_function2: counted package + counted name, an argument
+                // COUNT BYTE, then that many argument expressions
+                let pkg = self.counted_name()?;
+                let name = self.counted_name()?;
+                let argc = self.u8()? as usize;
+                let mut args = Vec::with_capacity(argc);
+                for _ in 0..argc {
+                    args.push(self.expr()?);
+                }
+                Ok(Expr::Function(pkg, name, args))
             }
             other => Err(format!("value verb {} unconverted", other)),
         }
@@ -1300,6 +1317,38 @@ fn exe_numeric_bin(r1: i128, s1: i8, verb: u8, r2: i128, s2: i8) -> Result<(i128
 /// Coerce an exact-numeric value to a target message/variable slot's
 /// scale - the engine's implicit conversion on assignment. A non-numeric
 /// value or a non-numeric (or unknown) target slot passes through.
+/// Coerce a call ARGUMENT to a callee parameter slot - the numeric
+/// rescale/width of [coerce_num], then CHAR padding / VARCHAR width for a
+/// text parameter (the engine's implicit conversion at the call boundary;
+/// a single-byte width - multibyte CHAR padding in a nested call is a
+/// recorded boundary).
+fn coerce_arg(v: Value, slot: &MsgSlot) -> Result<Value, String> {
+    let v = coerce_num(v, Some(slot))?;
+    if let Value::Text(t) = &v {
+        let declared = slot.length as usize;
+        match slot.dtype {
+            blr::DT_TEXT | blr::DT_TEXT2 => {
+                if t.chars().count() > declared {
+                    return Err("string right truncation".into());
+                }
+                let mut s = t.clone();
+                while s.chars().count() < declared {
+                    s.push(' ');
+                }
+                return Ok(Value::Text(s));
+            }
+            blr::DT_VARYING | blr::DT_VARYING2 => {
+                if t.chars().count() > declared {
+                    return Err("string right truncation".into());
+                }
+                return Ok(v);
+            }
+            _ => {}
+        }
+    }
+    Ok(v)
+}
+
 fn coerce_num(v: Value, slot: Option<&MsgSlot>) -> Result<Value, String> {
     let (raw, from) = match num_parts(&v) {
         Some(p) => p,
@@ -1338,6 +1387,12 @@ fn coerce_num(v: Value, slot: Option<&MsgSlot>) -> Result<Value, String> {
 /// the CMP pass of `cmp.cpp`, reduced to the slice-1 wrapper: version,
 /// begin, messages, an inner begin holding declares + NULL-inits +
 /// stall + the labeled body, the trailing EOF send.
+thread_local! {
+    /// nested blr_function2 call depth, to bound recursion (each nested
+    /// call builds a FRESH Exec, so the guard cannot live on the struct)
+    static FN_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
 pub fn parse(blr_bytes: &[u8]) -> Result<Request, String> {
     let mut p = P { b: blr_bytes, i: 0, uses_generators: false };
     if p.u8()? != blr::VERSION5 {
@@ -2902,6 +2957,72 @@ impl<'a> Exec<'a> {
                     // the engine's sing_err, as everywhere singular
                     _ => return Err("multiple rows in singleton select".into()),
                 }
+            }
+            Expr::Function(pkg, name, args) => {
+                // a call to another user FUNCTION (a packaged sibling, or a
+                // qualified PKG.F): run the callee's stored BLR recursively.
+                // A depth guard prevents a runaway recursion from
+                // overflowing the stack (the fresh nested Exec would not
+                // otherwise share a counter).
+                // bound recursion well under the connection thread's 2 MB
+                // stack (each level is eval -> bind_and_execute -> stmt ->
+                // eval); real (non-recursive) nesting is tiny, and recursion
+                // via exe is not reachable today anyway (the IF statement is
+                // not converted), so a low ceiling is safe
+                const MAX_FN_DEPTH: u32 = 64;
+                let depth = FN_DEPTH.with(|c| c.get());
+                if depth >= MAX_FN_DEPTH {
+                    return Err("too many levels of function recursion".into());
+                }
+                let qname = if pkg.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{}.{}", pkg, name)
+                };
+                let mut argv = Vec::with_capacity(args.len());
+                for a in args {
+                    argv.push(self.eval(a)?);
+                }
+                let file = self.file;
+                let ps = self.page_size;
+                let blr = function_blr(file, ps, &qname)?;
+                let req = parse(&blr)?;
+                if req.uses_generators {
+                    // a generator advance must persist; the fresh nested Exec
+                    // would lose it - refuse so the source path answers
+                    return Err("nested function uses a generator".into());
+                }
+                // coerce each argument to the callee's PARAMETER scale/width
+                // (the engine's implicit conversion; bind_and_execute does
+                // not) - a value past the param width raises 22003
+                if let Some((_, slots)) = req.messages.iter().find(|(n, _)| *n == 0) {
+                    for (i, v) in argv.iter_mut().enumerate() {
+                        if let Some(slot) = slots.get(2 * i) {
+                            let cv = coerce_arg(std::mem::replace(v, Value::Null), slot)?;
+                            *v = cv;
+                        }
+                    }
+                }
+                FN_DEPTH.with(|c| c.set(depth + 1));
+                let sends = bind_and_execute(file, ps, &req, &argv);
+                FN_DEPTH.with(|c| c.set(depth));
+                let sends = sends?;
+                // the callee's ONE output rides message 1 (value, null-flag,
+                // EOF); the nested Exec already coerced it to the return
+                // scale on the send
+                let mut out = Value::Null;
+                for (msg, buf) in &sends {
+                    if *msg != 1 {
+                        continue;
+                    }
+                    let null = matches!(buf.get(1), Some(Value::Int(fl)) if *fl != 0);
+                    out = if null {
+                        Value::Null
+                    } else {
+                        buf.first().cloned().unwrap_or(Value::Null)
+                    };
+                }
+                out
             }
             Expr::Negate(inner) => match self.eval(inner)? {
                 Value::Null => Value::Null,

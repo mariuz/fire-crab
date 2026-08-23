@@ -270,6 +270,23 @@ FUNCTION DDL refuses it; DOUBLE/approx — the executor has no f64
 arithmetic. NUMERIC in a PROCEDURE signature is a follow-up
 (`load_procedure` unchanged; needs the proc output-column describe path).
 
+**Function calls inside a body (blr_function2) DONE (2026-08-23,
+`serve-real-fncall` 7):** exe gained the function-invoke verb, so a body
+that calls another user function - a packaged sibling (`QUAD = DBL(DBL(A))`),
+or a qualified `PK.F(x)` from any function/procedure - runs through the
+executor instead of refusing. exe fetches the callee's BLR (function_blr)
+and runs it recursively; each argument is coerced to the callee's
+parameter (numeric rescale + width → 22003, CHAR padding / VARCHAR width),
+and the result is coerced to the callee's return scale. A depth guard (64,
+safe on the 2 MiB connection-thread stack) turns a runaway recursion
+(`RETURN PK.F(N+1)`) into a clean error, never a crash. Boundaries: a
+nested callee that draws a GENERATOR refuses (its advance cannot persist
+through exe); a recursive/IF-controlled body refuses (exe does not convert
+the IF statement); a plain function calling another plain function by a
+BARE name still refuses at CREATE (dsql). An adversarial review confirmed
+three defects in the first cut - uncoerced args, a lost generator advance,
+and a too-high depth guard - all fixed here.
+
 **Packaged functions via exe DONE (2026-08-23, `serve-real-pkgfunc` 6):**
 `function_blr` is now package-aware (a dotted `PKG.F` resolves the
 packaged member's BLR, a bare name the plain function — the two stay
