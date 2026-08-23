@@ -53828,18 +53828,21 @@ fn exec_psql_stmt_inner(
                 trace: vec![*src_off],
             })))
         }
-        // a bare EXCEPTION; re-raises what the enclosing handler caught,
+        // a bare EXCEPTION; re-raises what the ENCLOSING handler caught,
         // IDENTITY INTACT - the client must see the original exception,
-        // not a new one. Outside a handler there is nothing to re-raise;
-        // the engine refuses that at compile time and this refuses it
-        // here rather than inventing an exception to throw.
+        // not a new one. Outside an active handler there is nothing to
+        // re-raise, and the engine makes it a NO-OP (probed: EXCEPTION;
+        // at the top of a body, or AFTER a handler has completed, simply
+        // continues - f.caught is handler-scoped, set for the handler
+        // body and restored afterwards, so None here means no live
+        // exception and execution falls through).
         TrigStmt::Reraise { src_off } => match &f.caught {
             Some(ex) => {
                 let mut again = ex.clone();
                 again.push_raise(*src_off);
                 Err(PsqlStop::Raise(again))
             }
-            None => Err(PsqlStop::Unsupported),
+            None => Ok(()),
         },
         // POST_EVENT: nothing happens NOW. The post is filed under this
         // transaction, and the COMMIT is what moves the counter - a
@@ -54092,11 +54095,15 @@ fn exec_psql_stmt_inner(
                     if let Some((_, body)) = chosen {
                         // the handler's body runs with what it caught in
                         // scope, so a bare EXCEPTION; inside it re-raises
-                        // THAT; nested handlers save and restore around
-                        // their own
-                        let outer = f.caught.replace(ex);
+                        // THAT. The engine does NOT restore an outer
+                        // exception afterwards: once a handler completes,
+                        // its in-flight exception is CLEARED, so a
+                        // re-raise reached AFTER a nested handler (or after
+                        // any handler) is a no-op, not a re-raise of the
+                        // outer one (probed against the live engine).
+                        f.caught = Some(ex);
                         let r = exec_psql_stmt(body, f, steps, db, ctx);
-                        f.caught = outer;
+                        f.caught = None;
                         return r;
                     }
                     Err(PsqlStop::Raise(ex))

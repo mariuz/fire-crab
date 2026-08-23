@@ -4364,6 +4364,10 @@ enum TrigStmt {
     ExecProc(String, Vec<Val>, Vec<u16>),
     /// EXCEPTION name; - blr_abort by name
     ExceptionRaise(String),
+    /// a bare `EXCEPTION;` inside a handler - RE-RAISE the caught
+    /// exception: blr_abort with condition 5 (blr_raise), no name
+    /// (probed from the engine's stored BLR for `WHEN ... DO EXCEPTION;`)
+    ExceptionReraise,
     /// EXIT; - blr_leave 0: leaves the wrapper label
     Exit,
     /// `LEAVE;` - bare, ends the innermost loop: blr_leave <loop label>
@@ -4795,6 +4799,11 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
             out.push(2);
             out.push(name.len() as u8);
             out.extend_from_slice(name.as_bytes());
+        }
+        TrigStmt::ExceptionReraise => {
+            // condition 5 = blr_raise: re-raise the caught exception
+            out.push(blr::ABORT);
+            out.push(5);
         }
         TrigStmt::Exit => {
             out.push(blr::LEAVE);
@@ -8369,6 +8378,11 @@ impl<'a> P<'a> {
             return Some(TrigStmt::ExecProc(name, ins, outs));
         }
         if self.kw("EXCEPTION") {
+            // a bare `EXCEPTION;` re-raises the caught exception
+            if matches!(self.t.get(self.i), Some(Tok::Semi)) {
+                self.i += 1;
+                return Some(TrigStmt::ExceptionReraise);
+            }
             let Some(Tok::Ident(name)) = self.t.get(self.i) else {
                 return None;
             };

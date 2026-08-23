@@ -345,11 +345,30 @@ catch-all — dsql compiled it (the engine even ran the BLR) but fc's own
 source interpreter refused it at fetch, so fc stored a procedure it could
 not itself run. The interpreter now treats `ANY` anywhere in the list as
 catch-all (an empty condition list), matching the engine (a raise of an
-exception NOT in the explicit list is still caught). Boundaries still refused at CREATE: a re-raise
-`EXCEPTION;` inside a handler (the interpreter has the node; the dsql
-compiler lacks the emit), and a user-function CALL in a body statement
-(`R = F(A)` — the body's expression surface is arithmetic-only, a
-separate pre-existing gap).
+exception NOT in the explicit list is still caught). Boundary still refused at CREATE: a user-function
+CALL in a body statement (`R = F(A)` — the body's expression surface is
+arithmetic-only, a separate pre-existing gap).
+
+**Re-raise `EXCEPTION;` inside a handler DONE (2026-08-23,
+`serve-real-reraise` 7).** A bare `EXCEPTION;` re-raises the caught
+exception, identity intact. The source interpreter already had the node,
+but the dsql compiler required a name after `EXCEPTION` and refused a bare
+one. Probed from the engine's stored BLR, a re-raise is `blr_abort, 5`
+(condition 5 = blr_raise, no name) where a named raise is `blr_abort, 2,
+len, name`; dsql now emits it and the ENGINE runs the BLR fc stored. Two
+engine semantics — each a create-then-run trap the moment CREATE started
+accepting the statement — were probed and matched: (1) a re-raise with
+NOTHING live (at the top of a body, or after a handler completed) is a
+NO-OP, not an error — the interpreter's `Reraise` None arm now returns
+`Ok(())`; (2) `f.caught` is CLEARED after a handler body, never restored to
+an outer level, so a re-raise reached after a NESTED inner handler no-ops
+rather than re-raising the outer exception (probed: PN_AFTER answers 99),
+while a re-raise BEFORE any inner block still re-raises the outer one. The
+old code did the opposite (restored the outer) and its comment wrongly
+claimed the engine refuses a bare `EXCEPTION;` at compile — both corrected.
+Boundary (recorded): a TRIGGER body with a re-raise still refuses at CREATE
+— triggers compile through the server's own BLR emitter (not dsql), which
+does not emit the re-raise verb yet.
 
 **The IF statement (blr_if) in exe DONE (2026-08-23, `serve-real-psqlif`
 5):** the executor could not convert an IF, so a body combining IF/ELSE
