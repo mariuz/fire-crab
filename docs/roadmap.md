@@ -320,9 +320,36 @@ A one-line change. Catching a raise inside a function (a `WHEN ANY` block)
 already worked — it happens inside the interpreter before the result
 returns. As with every fc raise, the per-level `At function` stack frame
 is omitted (the recorded fc-wide boundary; the exception identity is
-byte-exact). Boundaries still refused at CREATE (dsql does not compile
-them): `EXCEPTION <name> <message-override>` and `WHEN EXCEPTION <name>
-DO` (only `WHEN ANY` compiles in this context).
+byte-exact). Boundary still refused at CREATE (dsql does not
+compile it): `EXCEPTION <name> <message-override>`. (`WHEN EXCEPTION
+<name> DO` handlers DO compile and run — see the next entry.)
+
+**PSQL exception handlers, multi-condition compile DONE (2026-08-23,
+`serve-real-whenexc` 5).** A `BEGIN..END` block with `WHEN ... DO` handlers
+was already interpreted (the source interpreter's block AST carries a
+`Vec<HandlerCond>` per handler and splits the `WHEN` list on the comma) and
+single-condition handlers compiled fine — so `WHEN EXCEPTION <name>`,
+`WHEN GDSCODE`, `WHEN SQLCODE`, `WHEN ANY` and nested handlers all worked
+in procedures and functions (the fnexc entry's "only WHEN ANY compiles"
+note was wrong and is corrected above). The one lag was in the dsql
+COMPILER: it read a single condition per `WHEN` and emitted a hard-coded
+`blr_error_handler` code-count of 1, so a MULTI-CONDITION handler
+(`WHEN EXCEPTION A, EXCEPTION B DO`) refused at CREATE. dsql now parses the
+comma list and emits the real count with each code in order; the ENGINE
+runs the BLR fc stored (a handler mixing `EXCEPTION` and `GDSCODE` catches
+both). Gate serve-real-whenexc, 5 checks, byte-for-byte incl the
+engine-runs-fc's-BLR check. An adversarial review caught a real
+create-then-run inconsistency: `WHEN ANY` may also appear INSIDE a comma
+list (`WHEN ANY, EXCEPTION E`), which the engine accepts and runs as a
+catch-all — dsql compiled it (the engine even ran the BLR) but fc's own
+source interpreter refused it at fetch, so fc stored a procedure it could
+not itself run. The interpreter now treats `ANY` anywhere in the list as
+catch-all (an empty condition list), matching the engine (a raise of an
+exception NOT in the explicit list is still caught). Boundaries still refused at CREATE: a re-raise
+`EXCEPTION;` inside a handler (the interpreter has the node; the dsql
+compiler lacks the emit), and a user-function CALL in a body statement
+(`R = F(A)` — the body's expression surface is arithmetic-only, a
+separate pre-existing gap).
 
 **The IF statement (blr_if) in exe DONE (2026-08-23, `serve-real-psqlif`
 5):** the executor could not convert an IF, so a body combining IF/ELSE

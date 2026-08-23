@@ -16,9 +16,9 @@
 # per-level "At function/procedure" stack frame fc omits is stripped (a
 # recorded fc-wide boundary), so enorm drops it on both sides.
 #
-# Boundary (recorded): the EXCEPTION <name> <message-override> form and a
-# WHEN EXCEPTION <name> DO handler do not COMPILE in fc's dsql yet (refused
-# at CREATE); only the base raise and WHEN ANY are exercised here.
+# Boundary (recorded): the EXCEPTION <name> <message-override> form does
+# not COMPILE in fc's dsql yet (refused at CREATE). (WHEN EXCEPTION <name>
+# DO handlers DO compile and run - see serve-real-whenexc.)
 #
 #   qa/serve-real-fnexc.sh [port]
 set -u

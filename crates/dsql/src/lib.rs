@@ -4375,7 +4375,7 @@ enum TrigStmt {
     PostEvent(Val),
     /// BEGIN ... WHEN <code> DO <stmt> ... END - blr_block with one
     /// error-handler section PER WHEN (probed sequential)
-    HandledBlock(Vec<TrigStmt>, Vec<(HandlerCode, TrigStmt)>),
+    HandledBlock(Vec<TrigStmt>, Vec<(Vec<HandlerCode>, TrigStmt)>),
     /// UPDATE OR INSERT INTO rel (cols) VALUES (vals) MATCHING (m) -
     /// a begin holding a modify-loop (blr_equiv on the matching
     /// column) and a row_count==0-guarded store; contexts allocated
@@ -4819,30 +4819,35 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
                 emit_trig_stmt(out, st);
             }
             out.push(blr::END);
-            for (code, handler) in handlers {
+            for (codes, handler) in handlers {
                 out.push(blr::ERROR_HANDLER);
-                out.extend_from_slice(&1u16.to_le_bytes());
-                match code {
-                    HandlerCode::Any => out.push(blr::DEFAULT_CODE),
-                    HandlerCode::Exception(name) => {
-                        out.push(blr::EXCEPTION_CODE);
-                        out.push(0);
-                        out.push(name.len() as u8);
-                        out.extend_from_slice(name.as_bytes());
-                    }
-                    HandlerCode::Gds(name) => {
-                        out.push(blr::GDS_CODE);
-                        out.push(name.len() as u8);
-                        out.extend_from_slice(name.as_bytes());
-                    }
-                    HandlerCode::SqlCode(n) => {
-                        out.push(blr::SQLCODE_CODE);
-                        out.extend_from_slice(&n.to_le_bytes());
-                    }
-                    HandlerCode::SqlState(s) => {
-                        out.push(blr::SQLSTATE_CODE);
-                        out.push(s.len() as u8);
-                        out.extend_from_slice(s.as_bytes());
+                // one error-handler section may guard SEVERAL conditions
+                // (WHEN EXCEPTION A, EXCEPTION B DO ...): the u16 count is
+                // how many codes follow, then each code in order (probed)
+                out.extend_from_slice(&(codes.len() as u16).to_le_bytes());
+                for code in codes {
+                    match code {
+                        HandlerCode::Any => out.push(blr::DEFAULT_CODE),
+                        HandlerCode::Exception(name) => {
+                            out.push(blr::EXCEPTION_CODE);
+                            out.push(0);
+                            out.push(name.len() as u8);
+                            out.extend_from_slice(name.as_bytes());
+                        }
+                        HandlerCode::Gds(name) => {
+                            out.push(blr::GDS_CODE);
+                            out.push(name.len() as u8);
+                            out.extend_from_slice(name.as_bytes());
+                        }
+                        HandlerCode::SqlCode(n) => {
+                            out.push(blr::SQLCODE_CODE);
+                            out.extend_from_slice(&n.to_le_bytes());
+                        }
+                        HandlerCode::SqlState(s) => {
+                            out.push(blr::SQLSTATE_CODE);
+                            out.push(s.len() as u8);
+                            out.extend_from_slice(s.as_bytes());
+                        }
                     }
                 }
                 // a BLOCK as the handler's body nests blr_block AGAIN
@@ -7997,45 +8002,58 @@ impl<'a> P<'a> {
             // WHEN <code> DO <stmt>, repeatable: one error-handler
             // section per WHEN (probed sequential); a handler's body
             // may be a plain statement or a BEGIN..END block
-            let mut handlers: Vec<(HandlerCode, TrigStmt)> = Vec::new();
+            let mut handlers: Vec<(Vec<HandlerCode>, TrigStmt)> = Vec::new();
             while self.kw("WHEN") {
-                let code = if self.kw("ANY") {
-                    HandlerCode::Any
-                } else if self.kw("EXCEPTION") {
-                    let Some(Tok::Ident(n)) = self.t.get(self.i) else {
-                        return None;
-                    };
-                    let n = n.clone();
-                    self.i += 1;
-                    HandlerCode::Exception(n)
-                } else if self.kw("GDSCODE") {
-                    let Some(Tok::Ident(n)) = self.t.get(self.i) else {
-                        return None;
-                    };
-                    let n = n.clone();
-                    self.i += 1;
-                    HandlerCode::Gds(n)
-                } else if self.kw("SQLCODE") {
-                    let neg = matches!(self.t.get(self.i), Some(Tok::Minus));
-                    if neg {
+                // one WHEN may guard SEVERAL conditions, comma-separated
+                // (WHEN EXCEPTION A, EXCEPTION B DO ...); the server
+                // interpreter already splits on the comma, and the BLR
+                // carries them as one error-handler with a count
+                let mut codes: Vec<HandlerCode> = Vec::new();
+                loop {
+                    let code = if self.kw("ANY") {
+                        HandlerCode::Any
+                    } else if self.kw("EXCEPTION") {
+                        let Some(Tok::Ident(n)) = self.t.get(self.i) else {
+                            return None;
+                        };
+                        let n = n.clone();
                         self.i += 1;
+                        HandlerCode::Exception(n)
+                    } else if self.kw("GDSCODE") {
+                        let Some(Tok::Ident(n)) = self.t.get(self.i) else {
+                            return None;
+                        };
+                        let n = n.clone();
+                        self.i += 1;
+                        HandlerCode::Gds(n)
+                    } else if self.kw("SQLCODE") {
+                        let neg = matches!(self.t.get(self.i), Some(Tok::Minus));
+                        if neg {
+                            self.i += 1;
+                        }
+                        let Some(Tok::Int(v)) = self.t.get(self.i) else {
+                            return None;
+                        };
+                        let v = i16::try_from(*v).ok()?;
+                        self.i += 1;
+                        HandlerCode::SqlCode(if neg { -v } else { v })
+                    } else if self.kw("SQLSTATE") {
+                        let Some(Tok::Str(s)) = self.t.get(self.i) else {
+                            return None;
+                        };
+                        let s = s.clone();
+                        self.i += 1;
+                        HandlerCode::SqlState(s)
+                    } else {
+                        return None;
+                    };
+                    codes.push(code);
+                    if matches!(self.t.get(self.i), Some(Tok::Comma)) {
+                        self.i += 1;
+                        continue;
                     }
-                    let Some(Tok::Int(v)) = self.t.get(self.i) else {
-                        return None;
-                    };
-                    let v = i16::try_from(*v).ok()?;
-                    self.i += 1;
-                    HandlerCode::SqlCode(if neg { -v } else { v })
-                } else if self.kw("SQLSTATE") {
-                    let Some(Tok::Str(s)) = self.t.get(self.i) else {
-                        return None;
-                    };
-                    let s = s.clone();
-                    self.i += 1;
-                    HandlerCode::SqlState(s)
-                } else {
-                    return None;
-                };
+                    break;
+                }
                 if !self.kw("DO") {
                     return None;
                 }
@@ -8043,7 +8061,7 @@ impl<'a> P<'a> {
                 // nested block emits blr_block again, WITH its own
                 // error-handler section (probed)
                 let h = self.trig_stmt()?;
-                handlers.push((code, h));
+                handlers.push((codes, h));
             }
             if !self.kw("END") {
                 return None;

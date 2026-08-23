@@ -14214,15 +14214,23 @@ fn parse_trig_block(
             let conds_txt = up_rest[..do_kw].trim();
             let mut names: Vec<HandlerCond> = Vec::new();
             if conds_txt != "ANY" {
+                // ANY may also appear INSIDE a comma list (WHEN ANY,
+                // EXCEPTION E DO ...): the engine accepts and RUNS it as
+                // a catch-all (ANY dominates the listed codes). The dsql
+                // compiler still emits every code, but the runtime match
+                // must be unconditional - an empty condition list - or fc
+                // would store a procedure it could not itself run.
+                let mut catch_all = false;
                 for part in conds_txt.split(',') {
                     let words: Vec<&str> = part.split_whitespace().collect();
-                    names.push(match words.as_slice() {
+                    match words.as_slice() {
+                        ["ANY"] => catch_all = true,
                         ["EXCEPTION", n] => {
                             let n = n.trim_matches('"').to_string();
                             if !ident_ok(&n) {
                                 return None;
                             }
-                            HandlerCond::Exception(n)
+                            names.push(HandlerCond::Exception(n));
                         }
                         ["GDSCODE", n] => {
                             // the BLR stores the name UPPERCASED; an
@@ -14231,9 +14239,9 @@ fn parse_trig_block(
                             if !crate::gdscodes::is_gds_code(&n) {
                                 return None;
                             }
-                            HandlerCond::Gds(n)
+                            names.push(HandlerCond::Gds(n));
                         }
-                        ["SQLCODE", n] => HandlerCond::Sql(n.parse().ok()?),
+                        ["SQLCODE", n] => names.push(HandlerCond::Sql(n.parse().ok()?)),
                         // SQLSTATE '<5 chars>' - the engine takes a
                         // string literal, and the state is compared
                         // against the WHOLE vector's derived value
@@ -14242,12 +14250,15 @@ fn parse_trig_block(
                             if v.len() != 5 || !v.chars().all(|c| c.is_ascii_alphanumeric()) {
                                 return None;
                             }
-                            HandlerCond::SqlState(v)
+                            names.push(HandlerCond::SqlState(v));
                         }
                         _ => return None,
-                    });
+                    }
                 }
-                if names.is_empty() {
+                if catch_all {
+                    // ANY was in the list: catch-all wins, drop the codes
+                    names.clear();
+                } else if names.is_empty() {
                     return None;
                 }
             }
