@@ -39621,6 +39621,10 @@ fn encode_row_body(
         let raw_int = |v: &Value| match v {
             Value::Int(i) => *i,
             Value::Scaled(raw, _) => *raw,
+            // an INT128-backed numeric: render its value (an i64-overflowing
+            // one is caught as 22003 before it reaches an integer output
+            // slot, so a reachable one always fits) rather than a silent 0
+            Value::Int128(raw, _) => i64::try_from(*raw).unwrap_or(0),
             _ => 0,
         };
         match c.wire {
@@ -54601,6 +54605,9 @@ fn try_procedure_blr(
                     "integer overflow" => {
                         BlrProcOutcome::Runtime(EvalErr::IntegerOverflow)
                     }
+                    "numeric value is out of range" => {
+                        BlrProcOutcome::Runtime(EvalErr::NumericOutOfRange)
+                    }
                     _ => BlrProcOutcome::Outside,
                 };
             }
@@ -54704,6 +54711,9 @@ fn try_function_blr(database: &Option<Database>, name: &str, args: &[Value]) -> 
             return match e.as_str() {
                 "integer divide by zero" => FnBlrOutcome::Runtime(EvalErr::DivideByZero),
                 "integer overflow" => FnBlrOutcome::Runtime(EvalErr::IntegerOverflow),
+                "numeric value is out of range" => {
+                    FnBlrOutcome::Runtime(EvalErr::NumericOutOfRange)
+                }
                 m if m.starts_with("conversion error from string ") => {
                     // the offending value sits between the FIRST and LAST
                     // quote - it may itself contain a quote, so strip the

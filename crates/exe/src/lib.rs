@@ -141,6 +141,7 @@ mod blr {
     pub const DT_SHORT: u8 = 7;
     pub const DT_LONG: u8 = 8;
     pub const DT_INT64: u8 = 16;
+    pub const DT_INT128: u8 = 26;
     pub const DT_TEXT: u8 = 14;
     pub const DT_TEXT2: u8 = 15;
     pub const DT_VARYING: u8 = 37;
@@ -435,6 +436,11 @@ pub enum Target {
 pub struct Request {
     pub messages: Vec<(u8, Vec<MsgSlot>)>,
     pub declares: usize,
+    /// the declared descriptor of each PSQL variable (by number), so an
+    /// assignment can coerce its source to the variable's scale - the
+    /// engine's implicit conversion (a NUMERIC value into an INTEGER
+    /// variable rounds; into a finer NUMERIC rescales exactly)
+    pub var_slots: Vec<Option<MsgSlot>>,
     pub body: Stmt,
     /// GEN_ID / NEXT VALUE FOR appears in the body: executing this
     /// request ADVANCES generator state (in-memory here; a caller
@@ -1220,6 +1226,114 @@ fn scaled(raw: i64, scale: i8) -> Value {
     }
 }
 
+/// An exact-numeric value as (raw, scale) in i128 - Int/Scaled/Int128.
+fn num_parts(v: &Value) -> Option<(i128, i8)> {
+    match v {
+        Value::Int(n) => Some((*n as i128, 0)),
+        Value::Scaled(raw, s) => Some((*raw as i128, *s)),
+        Value::Int128(raw, s) => Some((*raw, *s)),
+        _ => None,
+    }
+}
+
+/// Build an exact-numeric Value from (raw, scale): INT64-backed
+/// (Int/Scaled) while it fits i64, INT128 past it.
+fn mk_num(raw: i128, scale: i8) -> Value {
+    match i64::try_from(raw) {
+        Ok(r) => scaled(r, scale),
+        Err(_) => Value::Int128(raw, scale),
+    }
+}
+
+/// Move an exact `(raw, scale)` value to `to`, rounding HALF AWAY FROM
+/// ZERO where digits are lost - the engine's implicit-conversion rule
+/// (the mirror of the wire server's `rescale`).
+fn exe_rescale(raw: i128, from: i8, to: i8) -> Option<i128> {
+    if from == to {
+        return Some(raw);
+    }
+    let shift = (from - to) as i32; // scales are NEGATIVE for decimals
+    if shift > 0 {
+        raw.checked_mul(10i128.checked_pow(shift as u32)?)
+    } else {
+        let pow = 10i128.checked_pow((-shift) as u32)?;
+        let q = raw / pow;
+        let r = raw % pow;
+        Some(if 2 * r.unsigned_abs() >= pow as u128 {
+            q + raw.signum()
+        } else {
+            q
+        })
+    }
+}
+
+/// Dialect-3 exact-numeric arithmetic, byte-identical to the wire
+/// server's `numeric_bin`: `+`/`-` align to the finer (more negative)
+/// scale, `*` adds scales, `/` scales the dividend up by `2*|s2|` and
+/// the result scale is `s1 + s2`. Every step is checked (a past-i128
+/// intermediate is the engine's integer overflow).
+fn exe_numeric_bin(r1: i128, s1: i8, verb: u8, r2: i128, s2: i8) -> Result<(i128, i8), String> {
+    let pow = |k: u32| 10i128.checked_pow(k).ok_or_else(|| "integer overflow".to_string());
+    let align = |r: i128, k: u32| -> Result<i128, String> {
+        r.checked_mul(pow(k)?).ok_or_else(|| "integer overflow".to_string())
+    };
+    Ok(match verb {
+        blr::ADD | blr::SUBTRACT => {
+            let sr = s1.min(s2);
+            let a = align(r1, (s1 - sr) as u32)?;
+            let b = align(r2, (s2 - sr) as u32)?;
+            let r = if verb == blr::ADD { a.checked_add(b) } else { a.checked_sub(b) };
+            (r.ok_or("integer overflow")?, sr)
+        }
+        blr::MULTIPLY => (r1.checked_mul(r2).ok_or("integer overflow")?, s1 + s2),
+        blr::DIVIDE => {
+            if r2 == 0 {
+                return Err("integer divide by zero".into());
+            }
+            let scaled = align(r1, (-2 * s2 as i32) as u32)?;
+            (scaled / r2, s1 + s2)
+        }
+        _ => return Err("unexpected arithmetic verb".into()),
+    })
+}
+
+/// Coerce an exact-numeric value to a target message/variable slot's
+/// scale - the engine's implicit conversion on assignment. A non-numeric
+/// value or a non-numeric (or unknown) target slot passes through.
+fn coerce_num(v: Value, slot: Option<&MsgSlot>) -> Result<Value, String> {
+    let (raw, from) = match num_parts(&v) {
+        Some(p) => p,
+        None => return Ok(v),
+    };
+    let slot = match slot {
+        Some(s) => s,
+        None => return Ok(v),
+    };
+    match slot.dtype {
+        blr::DT_SHORT | blr::DT_LONG | blr::DT_INT64 => {
+            let r = exe_rescale(raw, from, slot.scale).ok_or("integer overflow")?;
+            // the (rescaled) value must fit the target's storage width, or
+            // the engine's "numeric value is out of range" (22003) - a
+            // NUMERIC(9,2) is a LONG, so its raw must fit i32; INTEGER too
+            let fits = match slot.dtype {
+                blr::DT_SHORT => i16::try_from(r).is_ok(),
+                blr::DT_LONG => i32::try_from(r).is_ok(),
+                _ => i64::try_from(r).is_ok(),
+            };
+            if !fits {
+                return Err("numeric value is out of range".into());
+            }
+            Ok(mk_num(r, slot.scale))
+        }
+        blr::DT_INT128 => {
+            let r = exe_rescale(raw, from, slot.scale).ok_or("integer overflow")?;
+            Ok(Value::Int128(r, slot.scale))
+        }
+        // a text or other target: no exact-numeric coercion here
+        _ => Ok(v),
+    }
+}
+
 /// Parse a stored procedure-BLR blob into a runnable [Request] -
 /// the CMP pass of `cmp.cpp`, reduced to the slice-1 wrapper: version,
 /// begin, messages, an inner begin holding declares + NULL-inits +
@@ -1258,6 +1372,7 @@ pub fn parse(blr_bytes: &[u8]) -> Result<Request, String> {
         return Err("no inner blr_begin".into());
     }
     let mut declares = 0usize;
+    let mut var_slots: Vec<Option<MsgSlot>> = Vec::new();
     let mut body = Vec::new();
     loop {
         match p.b.get(p.i) {
@@ -1268,8 +1383,12 @@ pub fn parse(blr_bytes: &[u8]) -> Result<Request, String> {
             Some(&blr::DECLARE) => {
                 p.i += 1;
                 let var = p.u16()?;
-                let _slot = p.msg_slot()?;
+                let slot = p.msg_slot()?;
                 declares = declares.max(var as usize + 1);
+                if var as usize >= var_slots.len() {
+                    var_slots.resize(var as usize + 1, None);
+                }
+                var_slots[var as usize] = Some(slot);
             }
             None => return Err("BLR ends inside the body".into()),
             _ => body.push(p.stmt()?),
@@ -1298,6 +1417,7 @@ pub fn parse(blr_bytes: &[u8]) -> Result<Request, String> {
     Ok(Request {
         messages,
         declares,
+        var_slots,
         body: Stmt::Begin(all),
         uses_generators: p.uses_generators,
     })
@@ -1328,6 +1448,7 @@ struct Exec<'a> {
     /// per message number: the slot buffer
     msg_bufs: Vec<Vec<Value>>,
     msg_slots: Vec<Vec<MsgSlot>>,
+    var_slots: Vec<Option<MsgSlot>>,
     frames: Vec<StreamFrame>,
     /// every executed blr_send: (message number, buffer snapshot)
     sends: Vec<(u8, Vec<Value>)>,
@@ -1419,6 +1540,7 @@ pub fn bind_and_execute(
         variables: vec![Value::Null; request.declares],
         msg_bufs,
         msg_slots,
+        var_slots: request.var_slots.clone(),
         frames: Vec::new(),
         sends: Vec::new(),
         leaving: None,
@@ -1459,6 +1581,22 @@ impl<'a> Exec<'a> {
             }
             Stmt::Assign(from, to) => {
                 let v = self.eval(from)?;
+                // coerce an exact-numeric source to the TARGET's declared
+                // scale (the engine's implicit conversion: into an INTEGER
+                // slot it rounds half-away-from-zero, into a finer NUMERIC
+                // it rescales exactly). A non-numeric value, or a target
+                // whose descriptor is unknown/non-numeric, passes through.
+                let tslot = match to {
+                    Target::Variable(n) => {
+                        self.var_slots.get(*n as usize).and_then(|o| o.clone())
+                    }
+                    Target::Parameter(m, i) | Target::Parameter2(m, i, _) => self
+                        .msg_slots
+                        .get(*m as usize)
+                        .and_then(|slots| slots.get(*i as usize))
+                        .cloned(),
+                };
+                let v = coerce_num(v, tslot.as_ref())?;
                 match to {
                     Target::Variable(n) => {
                         let slot = self
@@ -2769,6 +2907,7 @@ impl<'a> Exec<'a> {
                 Value::Null => Value::Null,
                 Value::Int(n) => Value::Int(-n),
                 Value::Scaled(raw, sc) => Value::Scaled(-raw, sc),
+                Value::Int128(raw, sc) => Value::Int128(-raw, sc),
                 _ => return Err("negate over a non-numeric value".into()),
             },
             Expr::Arith(verb, l, r) => {
@@ -2784,24 +2923,35 @@ impl<'a> Exec<'a> {
                     };
                     return Ok(Value::Text(format!("{}{}", text(&lv)?, text(&rv)?)));
                 }
-                let (a, b) = match (int_of(&lv), int_of(&rv)) {
-                    (Some(a), Some(b)) => (a, b),
-                    _ => return Err("arithmetic over a non-integer value".into()),
-                };
-                Value::Int(match *verb {
-                    blr::ADD => a.checked_add(b).ok_or("integer overflow")?,
-                    blr::SUBTRACT => a.checked_sub(b).ok_or("integer overflow")?,
-                    blr::MULTIPLY => a.checked_mul(b).ok_or("integer overflow")?,
-                    // integer division truncates toward zero; zero
-                    // divisor is the engine's runtime error
-                    blr::DIVIDE => {
-                        if b == 0 {
-                            return Err("integer divide by zero".into());
+                // PURE INTEGER stays on the i64 path (byte-identical to
+                // before): INTEGER arithmetic is INTEGER, and an i64
+                // overflow is the engine's error, not a silent widen.
+                if let (Value::Int(a), Value::Int(b)) = (&lv, &rv) {
+                    let (a, b) = (*a, *b);
+                    Value::Int(match *verb {
+                        blr::ADD => a.checked_add(b).ok_or("integer overflow")?,
+                        blr::SUBTRACT => a.checked_sub(b).ok_or("integer overflow")?,
+                        blr::MULTIPLY => a.checked_mul(b).ok_or("integer overflow")?,
+                        // integer division truncates toward zero; zero
+                        // divisor is the engine's runtime error
+                        blr::DIVIDE => {
+                            if b == 0 {
+                                return Err("integer divide by zero".into());
+                            }
+                            a / b
                         }
-                        a / b
-                    }
-                    _ => unreachable!("parse admitted the verb"),
-                })
+                        _ => unreachable!("parse admitted the verb"),
+                    })
+                } else {
+                    // an exact-numeric operand: fold with the dialect-3
+                    // scale rules (the wire server's numeric_bin)
+                    let (r1, s1) = num_parts(&lv)
+                        .ok_or("arithmetic over a non-numeric value")?;
+                    let (r2, s2) = num_parts(&rv)
+                        .ok_or("arithmetic over a non-numeric value")?;
+                    let (raw, sc) = exe_numeric_bin(r1, s1, *verb, r2, s2)?;
+                    mk_num(raw, sc)
+                }
             }
             Expr::Variable(n) => self
                 .variables

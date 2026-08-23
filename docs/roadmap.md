@@ -244,16 +244,24 @@ DDL was.
 
 ### F. DML and PSQL gaps
 
-**Scaled arithmetic in the exe BLR interpreter** — `blr_add/subtract/
-multiply/divide/negate` over `Value::Scaled`/`Int128` with Firebird's
-scale-propagation rules (`+`/`-` align, `*` adds scales, `/` dialect-3);
-exe is INTEGER-ONLY today ("arithmetic over a non-integer value"). This
-is the blocker beneath **NUMERIC/approx in a FUNCTION signature** (a
+**Scaled arithmetic in the exe BLR interpreter DONE (2026-08-23,
+`serve-real-scaledarith` 6):** `+`/`-`/`*`/`/`/unary-minus over
+`Value::Scaled`/`Int128` with Firebird's scale rules (mirror of the wire
+server's `numeric_bin`), and an assignment coerces its source to the
+target's declared scale (rounds half-away into an INTEGER slot, rescales
+into a finer NUMERIC, raises 22003 past the slot width). Observable via
+INTEGER-signature routines whose bodies use decimal literals (`RETURN
+A*1.5`). Boundary: an intermediate that overflows i64 raises 22003
+"numeric value is out of range" where the engine may say "Integer
+overflow" (both 22003) — fc's i128 numeric model, consistent with the
+server's own `numeric_bin`.
+
+Still blocked on top of it: **NUMERIC/approx in a FUNCTION signature** (a
 function with a NUMERIC or DOUBLE param/return is `-804`: `load_function`
-gates on `col_kind` = Int/Text only; the other layers — the gate, a
-`build_expr_col_from` describe from the ret descriptor incl. `sub_type=1`,
-and `bind_proc_args` CVT for scaled args — are small once the arithmetic
-exists). Do the exe arithmetic first (it also lifts procedures run via exe).
+gates on `col_kind` = Int/Text only). The remaining layers are now small:
+relax the gate, a `build_expr_col_from` describe from the ret descriptor
+(incl. `sub_type=1`), and `bind_proc_args` CVT for scaled args — the
+arithmetic they feed now exists.
 
 Other gaps: an explicit `PLAN` (WITH LOCK / FOR UPDATE / OPTIMIZE are
 done); a `?` inside any PSQL query (loop, cursor, `EXECUTE STATEMENT`,
