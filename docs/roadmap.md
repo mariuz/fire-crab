@@ -443,7 +443,11 @@ caught a real high-severity bug: `drop_function` (shared with DROP FUNCTION)
 found the plain function package-aware but DELETED by name alone, so ALTER
 (or DROP) of a plain `F` clobbered a coexisting packaged `PKG.F`'s catalog
 rows. `drop_function`'s deletes are now package-aware (plain rows only),
-fixing the ALTER path AND the pre-existing DROP FUNCTION bug.
+fixing the ALTER path AND the pre-existing DROP FUNCTION bug. The same
+package-blind pattern was then found and fixed in `drop_procedure` /
+`procedure_id` (a targeted bug hunt): ALTER / DROP of a plain procedure had
+likewise clobbered a coexisting packaged member; both are now plain-only
+(gate `serve-real-plainpkgdrop`, covering procedures and functions).
 
 **The IF statement (blr_if) in exe DONE (2026-08-23, `serve-real-psqlif`
 5):** the executor could not convert an IF, so a body combining IF/ELSE

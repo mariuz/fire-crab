@@ -9098,9 +9098,14 @@ pub fn procedure_id(file: &crate::Image, page_size: usize, name: &str) -> Option
     let cols = relation_columns(file, page_size, "RDB$PROCEDURES");
     let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
     let (name_f, id_f) = (fid("RDB$PROCEDURE_NAME")?, fid("RDB$PROCEDURE_ID")?);
+    // a PLAIN procedure only: a packaged member shares the bare name but
+    // carries a Text RDB$PACKAGE_NAME (the plain one is NULL), and ALTER /
+    // CREATE OR ALTER PROCEDURE must never pick or drop the member's id
+    let pk_f = fid("RDB$PACKAGE_NAME");
     let mut out = None;
     walk_rows(file, page_size, rel, descs, |v| {
-        if out.is_none() && text_eq(v.get(name_f), &want) {
+        let plain = !matches!(pk_f.and_then(|f| v.get(f)), Some(Value::Text(_)));
+        if out.is_none() && plain && text_eq(v.get(name_f), &want) {
             if let Some(Value::Int(i)) = v.get(id_f) {
                 out = Some(*i);
             }
@@ -9151,12 +9156,23 @@ pub fn drop_procedure(file: &mut crate::Image, page_size: usize, name: &str) -> 
         .iter()
         .find(|c| c.name == "RDB$SECURITY_CLASS")
         .map(|c| c.field_id as usize);
+    // a packaged member shares the bare RDB$PROCEDURE_NAME; its
+    // RDB$PACKAGE_NAME is Text where the plain procedure's is NULL. DROP /
+    // ALTER of a plain procedure must touch ONLY the plain rows, never the
+    // member's (which belong to the package).
+    let ppkg_f = pcols
+        .iter()
+        .find(|c| c.name == "RDB$PACKAGE_NAME")
+        .map(|c| c.field_id as usize);
+    let is_plain = move |v: &[crate::format::Value]| {
+        !matches!(ppkg_f.and_then(|f| v.get(f)), Some(Value::Text(_)))
+    };
     let mut found = false;
     let mut class: Option<String> = None;
     {
         let want = want.clone();
         walk_rows(file, page_size, prel, pdescs, |v| {
-            if text_eq(v.get(pname_f), &want) {
+            if is_plain(v) && text_eq(v.get(pname_f), &want) {
                 found = true;
                 if let Some(cf) = pcls_f {
                     if let Some(Value::Text(t)) = v.get(cf) {
@@ -9214,9 +9230,14 @@ pub fn drop_procedure(file: &mut crate::Image, page_size: usize, name: &str) -> 
             .iter()
             .find(|c| c.name == "RDB$FIELD_SOURCE")
             .map(|c| c.field_id as usize);
+        let pp_pkg_f = ppcols
+            .iter()
+            .find(|c| c.name == "RDB$PACKAGE_NAME")
+            .map(|c| c.field_id as usize);
         let want = want.clone();
         walk_rows(file, page_size, pprel, ppdescs, |v| {
-            if text_eq(v.get(pp_name_f), &want) {
+            let plain = !matches!(pp_pkg_f.and_then(|f| v.get(f)), Some(Value::Text(_)));
+            if plain && text_eq(v.get(pp_name_f), &want) {
                 if let Some(sf) = pp_src_f {
                     if let Some(Value::Text(t)) = v.get(sf) {
                         domains.push(t.trim_end().to_string());
@@ -9230,13 +9251,16 @@ pub fn drop_procedure(file: &mut crate::Image, page_size: usize, name: &str) -> 
         let want = want.clone();
         delete_catalog_rows(file, page_size, "RDB$PROCEDURES", move |v| {
             text_eq(v.get(pname_f), &want)
+                && !matches!(ppkg_f.and_then(|f| v.get(f)), Some(Value::Text(_)))
         })?;
     }
     {
         let pp_name_f = sys_fid(file, page_size, "RDB$PROCEDURE_PARAMETERS", "RDB$PROCEDURE_NAME")?;
+        let pp_pkg_f = sys_fid(file, page_size, "RDB$PROCEDURE_PARAMETERS", "RDB$PACKAGE_NAME")?;
         let want = want.clone();
         delete_catalog_rows(file, page_size, "RDB$PROCEDURE_PARAMETERS", move |v| {
             text_eq(v.get(pp_name_f), &want)
+                && !matches!(v.get(pp_pkg_f), Some(Value::Text(_)))
         })?;
     }
     let fname_f = sys_fid(file, page_size, "RDB$FIELDS", "RDB$FIELD_NAME")?;
