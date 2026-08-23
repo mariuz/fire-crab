@@ -270,6 +270,19 @@ FUNCTION DDL refuses it; DOUBLE/approx — the executor has no f64
 arithmetic. NUMERIC in a PROCEDURE signature is a follow-up
 (`load_procedure` unchanged; needs the proc output-column describe path).
 
+**The IF statement (blr_if) in exe DONE (2026-08-23, `serve-real-psqlif`
+5):** the executor could not convert an IF, so a body combining IF/ELSE
+control flow with an exe-only feature (a NUMERIC computation, a function
+call, recursion) fell to the source path and refused. exe now runs blr_if
+(condition, then, optional else — a missing else is a bare blr_end; a NULL
+condition takes the else, as the engine does). This unlocks recursive
+functions (`FACT` = IF base case + a sibling call), IF-guarded NUMERIC
+bodies, and IF inside a FOR loop with LEAVE. A clean review (no defects).
+Boundary: `WHILE` (blr_loop) and `CONTINUE` (blr_continue_loop) are still
+not converted, so a loop body needing exe falls back; and fc refuses
+recursion past its guard (48) where the engine handles ~1000 then raises
+54001 — the source interpreter's `psql_depth_guard` stand-in, unchanged.
+
 **Function calls inside a body (blr_function2) DONE (2026-08-23,
 `serve-real-fncall` 7):** exe gained the function-invoke verb, so a body
 that calls another user function - a packaged sibling (`QUAD = DBL(DBL(A))`),

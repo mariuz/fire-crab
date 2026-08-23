@@ -78,6 +78,8 @@ mod blr {
     pub const BETWEEN: u8 = 56;
     pub const OR: u8 = 57;
     pub const AND: u8 = 58;
+    /// blr_if statement (verb 8, distinct from the DT_LONG dtype use)
+    pub const IF_STMT: u8 = 8;
     pub const NOT: u8 = 59;
     pub const ANY: u8 = 60;
     pub const MISSING: u8 = 61;
@@ -425,6 +427,10 @@ pub enum Stmt {
     /// then `leave 0` out of the body wrapper - so running up to the leave
     /// and unwinding to its label is exactly the return.
     Leave(u8),
+    /// blr_if: condition, then-statement, optional else-statement (a
+    /// missing else is a bare blr_end byte in the else slot). A NULL
+    /// (UNKNOWN) condition takes the else, as the engine does.
+    If(Bool, Box<Stmt>, Option<Box<Stmt>>),
 }
 
 /// An assignment target.
@@ -1230,6 +1236,18 @@ impl<'a> P<'a> {
             }
             blr::STALL => Ok(Stmt::Stall),
             blr::LEAVE => Ok(Stmt::Leave(self.u8()?)),
+            blr::IF_STMT => {
+                let cond = self.boolean()?;
+                let then = Box::new(self.stmt()?);
+                // a missing ELSE is a bare blr_end byte in the else slot
+                let els = if self.b.get(self.i) == Some(&blr::END) {
+                    self.i += 1;
+                    None
+                } else {
+                    Some(Box::new(self.stmt()?))
+                };
+                Ok(Stmt::If(cond, then, els))
+            }
             other => Err(format!("statement verb {} unconverted", other)),
         }
     }
@@ -1704,6 +1722,17 @@ impl<'a> Exec<'a> {
                     if self.leaving.is_some() {
                         break; // a leave inside the loop unwinds out of it
                     }
+                }
+            }
+            Stmt::If(cond, then, els) => {
+                // a TRUE condition runs the then; FALSE or UNKNOWN (a NULL
+                // condition) runs the else, as the engine does. A leave/
+                // RETURN inside a branch sets self.leaving, which the
+                // enclosing block/loop then observes.
+                if self.bool_eval(cond)? == Some(true) {
+                    self.stmt(then)?;
+                } else if let Some(e) = els {
+                    self.stmt(e)?;
                 }
             }
         }
@@ -2964,12 +2993,14 @@ impl<'a> Exec<'a> {
                 // A depth guard prevents a runaway recursion from
                 // overflowing the stack (the fresh nested Exec would not
                 // otherwise share a counter).
-                // bound recursion well under the connection thread's 2 MB
-                // stack (each level is eval -> bind_and_execute -> stmt ->
-                // eval); real (non-recursive) nesting is tiny, and recursion
-                // via exe is not reachable today anyway (the IF statement is
-                // not converted), so a low ceiling is safe
-                const MAX_FN_DEPTH: u32 = 64;
+                // bound recursion the way the source interpreter's
+                // psql_depth_guard (server.rs, LIMIT 48) does: fc REFUSES a
+                // body that recurses too deep rather than match the engine's
+                // ~1000-deep "Too many concurrent executions" (a recorded
+                // stand-in). 48 * ~5 KB/level sits well under the 2 MB
+                // connection-thread stack, so the guard fires before an
+                // overflow could abort the process.
+                const MAX_FN_DEPTH: u32 = 48;
                 let depth = FN_DEPTH.with(|c| c.get());
                 if depth >= MAX_FN_DEPTH {
                     return Err("too many levels of function recursion".into());
