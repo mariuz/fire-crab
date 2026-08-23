@@ -13711,8 +13711,11 @@ enum TrigStmt {
         label: Option<String>,
         src_off: usize,
     },
-    /// `EXCEPTION <name>;` - blr_abort, condition 2 (exception), name
-    Raise { name: String, src_off: usize },
+    /// `EXCEPTION <name>;` - blr_abort, condition 2 (exception), name.
+    /// `EXCEPTION <name> '<literal>';` overrides the message: condition 6
+    /// then a blr_literal blr_text2 (a runtime EXPRESSION message or a
+    /// USING clause is refused - literal only).
+    Raise { name: String, message: Option<String>, src_off: usize },
     /// `EXECUTE PROCEDURE <name> [(<args>)] [RETURNING_VALUES :v[, :v]];`
     /// - a NESTED CALL: its own frame, its own cursors, its own
     /// transaction-visible writes, and an error that the CALLER may
@@ -14881,11 +14884,57 @@ fn parse_trig_stmt(
         if rest.is_empty() {
             return Some(TrigStmt::Reraise { src_off: start });
         }
-        let name = rest.trim_matches('"').to_ascii_uppercase();
+        // the name, then an OPTIONAL quoted-literal message override
+        // (EXCEPTION E_NEG 'text'); a concatenation/expression message or
+        // a USING clause is not a lone literal and refuses here.
+        //
+        // The name ends where the engine's lexer ends an identifier: at
+        // the first character that cannot continue one - which is the
+        // opening quote of the message when NO space separates them
+        // (EXCEPTION E_NEG'text', which dsql and the engine both accept),
+        // not merely at whitespace. A "quoted name" runs to its close.
+        let name_end = if rest.starts_with('"') {
+            rest[1..].find('"').map(|i| i + 2).unwrap_or(rest.len())
+        } else {
+            rest.find(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$'))
+                .unwrap_or(rest.len())
+        };
+        let name_part = rest[..name_end].trim();
+        let msg_part = rest[name_end..].trim();
+        let name = name_part.trim_matches('"').to_ascii_uppercase();
         if !ident_ok(&name) {
             return None;
         }
-        return Some(TrigStmt::Raise { name, src_off: start });
+        let message = if msg_part.is_empty() {
+            None
+        } else if msg_part.len() >= 2 && msg_part.starts_with('\'') && msg_part.ends_with('\'') {
+            // undouble '' -> '; a LONE interior quote means the literal
+            // ended early and an expression follows - refuse that
+            let inner = &msg_part[1..msg_part.len() - 1];
+            let mut lit = String::new();
+            let mut cs = inner.chars().peekable();
+            let mut whole_literal = true;
+            while let Some(c) = cs.next() {
+                if c == '\'' {
+                    if cs.peek() == Some(&'\'') {
+                        cs.next();
+                        lit.push('\'');
+                    } else {
+                        whole_literal = false;
+                        break;
+                    }
+                } else {
+                    lit.push(c);
+                }
+            }
+            if !whole_literal {
+                return None;
+            }
+            Some(lit)
+        } else {
+            return None; // an expression, a USING clause, or a bare word
+        };
+        return Some(TrigStmt::Raise { name, message, src_off: start });
     }
     if find_word(&up, "SELECT", 0) == Some(0) {
         // SELECT ... INTO :v[, :v] - the STATIC singleton. The INTO
@@ -15386,7 +15435,7 @@ fn emit_trigger_stmt(
             b.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
             b.extend_from_slice(bytes);
         }
-        TrigStmt::Raise { name, src_off } => {
+        TrigStmt::Raise { name, message, src_off } => {
             dbg.push((*src_off, b.len()));
             if bracket_raises {
                 // begin / start_savepoint / abort / end_savepoint / end
@@ -15396,9 +15445,25 @@ fn emit_trigger_stmt(
                 b.push(134); // blr_start_savepoint
             }
             b.push(128); // blr_abort
-            b.push(2); // condition kind: exception, by name
-            b.push(name.len() as u8);
-            b.extend_from_slice(name.as_bytes());
+            match message {
+                None => {
+                    b.push(2); // condition kind: exception, by name
+                    b.push(name.len() as u8);
+                    b.extend_from_slice(name.as_bytes());
+                }
+                Some(msg) => {
+                    // condition 6: exception with a message override,
+                    // then a blr_literal blr_text2 (charset 0, u16 length)
+                    b.push(6);
+                    b.push(name.len() as u8);
+                    b.extend_from_slice(name.as_bytes());
+                    b.push(21); // blr_literal
+                    b.push(15); // blr_text2
+                    b.extend_from_slice(&0u16.to_le_bytes()); // charset
+                    b.extend_from_slice(&(msg.len() as u16).to_le_bytes());
+                    b.extend_from_slice(msg.as_bytes());
+                }
+            }
             if bracket_raises {
                 b.push(135); // blr_end_savepoint
                 b.push(255); // end
@@ -53832,10 +53897,12 @@ fn exec_psql_stmt_inner(
         // EXCEPTION <name>: the identity comes from the CATALOG, read
         // now rather than when the body was parsed, because that is
         // when the engine reads it too.
-        TrigStmt::Raise { name, src_off } => {
+        TrigStmt::Raise { name, message, src_off } => {
             let dbr = db.as_ref().ok_or(PsqlStop::Unsupported)?;
-            let (number, message) =
+            let (number, cat_msg) =
                 exception_identity(dbr, name).ok_or(PsqlStop::Unsupported)?;
+            // an `EXCEPTION <name> '<literal>'` overrides the catalog message
+            let message = message.clone().unwrap_or(cat_msg);
             Err(PsqlStop::Raise(Thrown::User(Raised {
                 name: name.clone(),
                 number,

@@ -377,9 +377,26 @@ so the check is compile parity plus the ENGINE firing fc's stored trigger
 BLR: a good INSERT succeeds, a bad one re-raises `E_NEG`, one row kept; a
 top-level `EXCEPTION;` (unbracketed) no-ops. The exception surface —
 raise, catch (all condition kinds, single/multi/nested/ANY-in-list),
-re-raise — is now closed for procedures, functions AND triggers, save the
-`EXCEPTION <name> <message-override>` form and the arithmetic-only
-body-expression gap (a user-function call in a statement).
+re-raise — is now closed for procedures, functions AND triggers.
+
+**EXCEPTION `<name>` `'<literal>'` message override DONE (2026-08-23,
+`serve-real-excmsg` 5).** A raise may override the exception's catalog
+message with a literal. Probed from the engine's stored BLR: a plain named
+raise is `blr_abort, 2, name`; an override is `blr_abort, 6, name` then a
+`blr_literal blr_text2` (charset 0, u16 length). Both the dsql compiler and
+the server's trigger emitter emit it; the source interpreter uses the
+literal in the raised vector (`message.unwrap_or(catalog_message)`), and the
+ENGINE runs the BLR fc stored — procedures, functions, a trigger fired on
+INSERT, and a doubled-quote message. Boundaries (recorded): an EXPRESSION
+(`'v='||A`) or `USING` message refuses (the body expression surface is
+arithmetic-only; the engine accepts them, fc will not guess); a message
+past fc's ~32000-byte string-literal cap refuses (pre-existing, below the
+engine's, so the u16 length field never overflows); a NON-ASCII message
+renders mojibake in fc's OWN execution — a pre-existing fc-wide
+exception-message encoding issue a plain catalog message shares, and fc
+stores the correct bytes so the engine reads it right. The remaining
+exception gap is the arithmetic-only body-expression one (a user-function
+call in a statement, `R = F(A)`).
 
 **The IF statement (blr_if) in exe DONE (2026-08-23, `serve-real-psqlif`
 5):** the executor could not convert an IF, so a body combining IF/ELSE

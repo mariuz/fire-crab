@@ -4363,7 +4363,7 @@ enum TrigStmt {
     /// EXECUTE PROCEDURE name [(inputs)] [RETURNING_VALUES :v, ...]
     ExecProc(String, Vec<Val>, Vec<u16>),
     /// EXCEPTION name; - blr_abort by name
-    ExceptionRaise(String),
+    ExceptionRaise(String, Option<String>),
     /// a bare `EXCEPTION;` inside a handler - RE-RAISE the caught
     /// exception: blr_abort with condition 5 (blr_raise), no name
     /// (probed from the engine's stored BLR for `WHEN ... DO EXCEPTION;`)
@@ -4794,11 +4794,27 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
                 out.extend_from_slice(&vi.to_le_bytes());
             }
         }
-        TrigStmt::ExceptionRaise(name) => {
+        TrigStmt::ExceptionRaise(name, message) => {
             out.push(blr::ABORT);
-            out.push(2);
-            out.push(name.len() as u8);
-            out.extend_from_slice(name.as_bytes());
+            match message {
+                None => {
+                    out.push(2); // condition 2: exception by name
+                    out.push(name.len() as u8);
+                    out.extend_from_slice(name.as_bytes());
+                }
+                Some(msg) => {
+                    // condition 6: exception with a message override,
+                    // then a blr_literal blr_text2 (charset 0, u16 length)
+                    out.push(6);
+                    out.push(name.len() as u8);
+                    out.extend_from_slice(name.as_bytes());
+                    out.push(21); // blr_literal
+                    out.push(15); // blr_text2
+                    out.extend_from_slice(&0u16.to_le_bytes());
+                    out.extend_from_slice(&(msg.len() as u16).to_le_bytes());
+                    out.extend_from_slice(msg.as_bytes());
+                }
+            }
         }
         TrigStmt::ExceptionReraise => {
             // condition 5 = blr_raise: re-raise the caught exception
@@ -8391,11 +8407,21 @@ impl<'a> P<'a> {
             }
             let name = name.clone();
             self.i += 1;
+            // an optional literal message override: EXCEPTION E_NEG 'text'.
+            // A concatenation/expression message or a USING clause leaves a
+            // non-semicolon token here and refuses (literal only).
+            let message = if let Some(Tok::Str(m)) = self.t.get(self.i) {
+                let m = m.clone();
+                self.i += 1;
+                Some(m)
+            } else {
+                None
+            };
             if !matches!(self.t.get(self.i), Some(Tok::Semi)) {
                 return None;
             }
             self.i += 1;
-            return Some(TrigStmt::ExceptionRaise(name));
+            return Some(TrigStmt::ExceptionRaise(name, message));
         }
         if self.kw("EXIT") {
             if !matches!(self.t.get(self.i), Some(Tok::Semi)) {
