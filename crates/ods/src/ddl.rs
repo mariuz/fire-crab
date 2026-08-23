@@ -5064,6 +5064,10 @@ pub enum CommentTarget {
     Role(String),
     /// `COMMENT ON DOMAIN <name>` - the `RDB$FIELDS` row
     Domain(String),
+    /// `COMMENT ON PROCEDURE <name>` - the plain `RDB$PROCEDURES` row
+    Procedure(String),
+    /// `COMMENT ON FUNCTION <name>` - the plain `RDB$FUNCTIONS` row
+    Function(String),
     /// `COMMENT ON DATABASE` - the single `RDB$DATABASE` row (no name)
     Database,
 }
@@ -5226,6 +5230,38 @@ pub fn comment_on(
             let nm = name.clone();
             patch_sys_row(file, page_size, "RDB$FIELDS", frel,
                 move |v| text_eq(v.get(name_fid), &nm),
+                &[("RDB$DESCRIPTION", value)])?;
+        }
+        CommentTarget::Procedure(name) => {
+            let name = name.trim().trim_matches('"').to_ascii_uppercase();
+            // the PLAIN procedure (RDB$PACKAGE_NAME NULL); a packaged member
+            // is commented via COMMENT ON PROCEDURE PKG.P, not this path
+            if procedure_id(file, page_size, &name).is_none() {
+                return Err(format!("Procedure {} not found", name));
+            }
+            let prel = crate::resolve_relation(file, page_size, "RDB$PROCEDURES")
+                .ok_or("RDB$PROCEDURES not found")?;
+            let value = description_blob(file, page_size, prel, text)?;
+            let name_fid = sys_fid(file, page_size, "RDB$PROCEDURES", "RDB$PROCEDURE_NAME")?;
+            let pkg_fid = sys_fid(file, page_size, "RDB$PROCEDURES", "RDB$PACKAGE_NAME")?;
+            let nm = name.clone();
+            patch_sys_row(file, page_size, "RDB$PROCEDURES", prel,
+                move |v| text_eq(v.get(name_fid), &nm) && !matches!(v.get(pkg_fid), Some(Value::Text(_))),
+                &[("RDB$DESCRIPTION", value)])?;
+        }
+        CommentTarget::Function(name) => {
+            let name = name.trim().trim_matches('"').to_ascii_uppercase();
+            if function_id_plain(file, page_size, &name).is_none() {
+                return Err(format!("Function {} not found", name));
+            }
+            let frel = crate::resolve_relation(file, page_size, "RDB$FUNCTIONS")
+                .ok_or("RDB$FUNCTIONS not found")?;
+            let value = description_blob(file, page_size, frel, text)?;
+            let name_fid = sys_fid(file, page_size, "RDB$FUNCTIONS", "RDB$FUNCTION_NAME")?;
+            let pkg_fid = sys_fid(file, page_size, "RDB$FUNCTIONS", "RDB$PACKAGE_NAME")?;
+            let nm = name.clone();
+            patch_sys_row(file, page_size, "RDB$FUNCTIONS", frel,
+                move |v| text_eq(v.get(name_fid), &nm) && !matches!(v.get(pkg_fid), Some(Value::Text(_))),
                 &[("RDB$DESCRIPTION", value)])?;
         }
         CommentTarget::Database => {

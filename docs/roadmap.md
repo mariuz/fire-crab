@@ -449,6 +449,17 @@ package-blind pattern was then found and fixed in `drop_procedure` /
 likewise clobbered a coexisting packaged member; both are now plain-only
 (gate `serve-real-plainpkgdrop`, covering procedures and functions).
 
+**COMMENT ON PROCEDURE / FUNCTION DONE (2026-08-23, `serve-real-commentroutine`
+6).** COMMENT ON handled TABLE/COLUMN/INDEX/SEQUENCE/EXCEPTION/ROLE/DOMAIN/
+DATABASE but not a routine; both refused while the engine accepts them. The
+planner's kind list and the ods `CommentTarget` gain Procedure/Function,
+writing (or clearing on `IS NULL`) the PLAIN routine's RDB$DESCRIPTION - the
+plain row only (RDB$PACKAGE_NAME NULL), never a packaged member of the same
+bare name (verified: the comment lands on plain F, the member stays NULL).
+The gbak-restore path already mapped routine descriptions, so a comment
+survives a round-trip. Boundary (shared by ALL comment targets, pre-existing):
+the not-found vector is fc's generic refusal, not the engine's byte-exact one.
+
 **The IF statement (blr_if) in exe DONE (2026-08-23, `serve-real-psqlif`
 5):** the executor could not convert an IF, so a body combining IF/ELSE
 control flow with an exe-only feature (a NUMERIC computation, a function

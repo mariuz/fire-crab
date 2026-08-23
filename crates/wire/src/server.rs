@@ -18712,7 +18712,7 @@ fn plan_comment(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
     let first = first_word_at(&masked, kind_start)?;
     let kind = [
         "TABLE", "COLUMN", "INDEX", "SEQUENCE", "GENERATOR", "EXCEPTION", "ROLE", "DOMAIN",
-        "DATABASE",
+        "PROCEDURE", "FUNCTION", "DATABASE",
     ]
     .into_iter()
     .find(|k| find_word(&masked, k, kind_start) == Some(first))?;
@@ -18753,6 +18753,14 @@ fn plan_comment(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
         "DOMAIN" => {
             let name = unquote_ident(target_str)?;
             fire_crab_ods::ddl::CommentTarget::Domain(name)
+        }
+        "PROCEDURE" => {
+            let name = unquote_ident(target_str)?;
+            fire_crab_ods::ddl::CommentTarget::Procedure(name)
+        }
+        "FUNCTION" => {
+            let name = unquote_ident(target_str)?;
+            fire_crab_ods::ddl::CommentTarget::Function(name)
         }
         "DATABASE" => {
             // COMMENT ON DATABASE has no object name
@@ -71667,7 +71675,19 @@ mod tests {
             }
             other => panic!("expected Comment DATABASE, got {:?}", other.is_some()),
         }
-        assert!(plan_comment("COMMENT ON PROCEDURE P IS 'x'").is_none());
+        // COMMENT ON PROCEDURE / FUNCTION are now implemented
+        match plan_comment("COMMENT ON PROCEDURE P IS 'x'") {
+            Some((Plan::Comment { target, .. }, _)) => {
+                assert!(matches!(target, fire_crab_ods::ddl::CommentTarget::Procedure(ref n) if n == "P"));
+            }
+            other => panic!("expected Comment PROCEDURE, got {:?}", other.is_some()),
+        }
+        match plan_comment("COMMENT ON FUNCTION F IS 'y'") {
+            Some((Plan::Comment { target, .. }, _)) => {
+                assert!(matches!(target, fire_crab_ods::ddl::CommentTarget::Function(ref n) if n == "F"));
+            }
+            other => panic!("expected Comment FUNCTION, got {:?}", other.is_some()),
+        }
         assert!(plan_comment("CREATE TABLE T (A INT)").is_none());
     }
 
