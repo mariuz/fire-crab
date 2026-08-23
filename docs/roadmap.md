@@ -244,15 +244,36 @@ DDL was.
 
 ### F. DML and PSQL gaps
 
-`INTERSECT`/`EXCEPT`; the named `WINDOW` clause; an explicit `PLAN` (WITH LOCK / FOR UPDATE / OPTIMIZE are done); a `?` inside any PSQL query (loop, cursor,
-`EXECUTE STATEMENT`, `SELECT INTO` — `server.rs:47089`);  `RDB$SET_CONTEXT`/`RDB$GET_CONTEXT`; `GEN_ID`
-inside an autonomous body; `INSERT … VALUES` without a column list in
-PSQL; `EXECUTE BLOCK` with parameters or `RETURNS`; `EXECUTE STATEMENT` with `USING` / `ON EXTERNAL` / `AS USER` (the dynamic operand and POSITIONAL + NAMED parameters are done); a bare aggregate over a
-comma join (42000 at prepare); `= ANY`/`= ALL` over the strict text
-key; PSQL literals held as i32 (`serve-real-psqlerrors`); the BLR
-compiler narrower than the interpreter (a bare `EXCEPTION;` in a
-`CREATE TRIGGER` body refuses, `server.rs:12764`); a read inside a
-PSQL body is read-committed regardless of the transaction's snapshot.
+**Scaled arithmetic in the exe BLR interpreter** — `blr_add/subtract/
+multiply/divide/negate` over `Value::Scaled`/`Int128` with Firebird's
+scale-propagation rules (`+`/`-` align, `*` adds scales, `/` dialect-3);
+exe is INTEGER-ONLY today ("arithmetic over a non-integer value"). This
+is the blocker beneath **NUMERIC/approx in a FUNCTION signature** (a
+function with a NUMERIC or DOUBLE param/return is `-804`: `load_function`
+gates on `col_kind` = Int/Text only; the other layers — the gate, a
+`build_expr_col_from` describe from the ret descriptor incl. `sub_type=1`,
+and `bind_proc_args` CVT for scaled args — are small once the arithmetic
+exists). Do the exe arithmetic first (it also lifts procedures run via exe).
+
+Other gaps: an explicit `PLAN` (WITH LOCK / FOR UPDATE / OPTIMIZE are
+done); a `?` inside any PSQL query (loop, cursor, `EXECUTE STATEMENT`,
+`SELECT INTO` — `server.rs:47089`); `GEN_ID` inside an autonomous body;
+`INSERT … VALUES` without a column list in PSQL; `EXECUTE BLOCK` with
+input parameters (RETURNS is done); `EXECUTE STATEMENT` with `USING` /
+`ON EXTERNAL` / `AS USER` (the dynamic operand and POSITIONAL + NAMED
+parameters are done); PSQL literals held as i32 (`serve-real-psqlerrors`);
+the BLR compiler narrower than the interpreter (a bare `EXCEPTION;` in a
+`CREATE TRIGGER` body refuses, `server.rs:12764`); `IF (c) THEN CONTINUE`
+(bare CONTINUE as an IF then-branch) refuses at CREATE (DSQL); a read
+inside a PSQL body is read-committed regardless of the transaction's
+snapshot.
+
+Not features (the engine's own `-104`, fc refuses too — an error-text
+parity gap only): `INTERSECT`/`EXCEPT`, `WITH TIES`, `PERCENT`,
+`MIN … KEEP`. Confirmed WORKING (were listed as gaps): the named
+`WINDOW` clause, `= ANY`/`= ALL` over a text subquery, a bare/grouped
+aggregate over a comma join, `RDB$SET_CONTEXT`/`RDB$GET_CONTEXT`, a
+selectable packaged procedure with arguments.
 
 ### G. Absent subsystems — the external sort, slice 1 DONE (2026-08-20)
 
