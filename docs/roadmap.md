@@ -394,9 +394,34 @@ past fc's ~32000-byte string-literal cap refuses (pre-existing, below the
 engine's, so the u16 length field never overflows); a NON-ASCII message
 renders mojibake in fc's OWN execution — a pre-existing fc-wide
 exception-message encoding issue a plain catalog message shares, and fc
-stores the correct bytes so the engine reads it right. The remaining
-exception gap is the arithmetic-only body-expression one (a user-function
-call in a statement, `R = F(A)`).
+stores the correct bytes so the engine reads it right. The last body-PSQL gap — a
+user-function call in a statement — is closed next.
+
+**A bare PLAIN user-function call in a body DONE (2026-08-23,
+`serve-real-bodyfn` 8).** `R = DBL(A)`, `RETURN F(A) + 1`. A plain call
+compiles to `blr_function` (0x64) — counted name, a u8 arg count, the
+arguments (probed from `RDB$FUNCTION_BLR`; distinct from the packaged
+`blr_function2`). exe gained `blr_function` (an empty package resolves the
+plain function, the slot a bare sibling takes, so its existing recursive
+executor runs it); dsql binds a bare name against the catalog's plain
+functions (passed from the server via `compile_*_with_funcs`), and a
+function's own signature is added so a RECURSIVE self-call resolves.
+Verified: call / nested (`DBL(DBL(A))`) / multi-arg / IF-condition /
+recursion (`FACT`), fc running its own and the ENGINE running fc's BLR;
+arity-mismatch and unknown-name refuse on both. Several create-then-run / create-mismatch
+issues were probed against the binary and fixed: a body that BOTH calls a
+function AND draws a GENERATOR is REFUSED at CREATE — the call needs exe,
+exe declines a generator, and the source interpreter cannot call a
+function, so fc refuses rather than store BLR it could not run (a clean
+boundary, not a create-then-run split; the engine accepts it, a deliberate
+divergence); an adversarial review then CONFIRMED a further one — `ALTER`
+and `CREATE OR ALTER PROCEDURE` compiled the body with no catalog
+(`&None`), so a function call refused there while a plain `CREATE` accepted
+it; `plan_alter_procedure` now threads the db through. A RECREATE that
+changes a function's arity uses the new signature for a self-call, and
+`function_self_sig` masks string literals when counting the arity. Boundary: recursion past fc's depth guard (48) refuses where the
+engine goes ~1000 then 54001 — the recorded stand-in the function-call
+slices carry.
 
 **The IF statement (blr_if) in exe DONE (2026-08-23, `serve-real-psqlif`
 5):** the executor could not convert an IF, so a body combining IF/ELSE

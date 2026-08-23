@@ -379,6 +379,7 @@ mod blr {
     /// blr_function2 - package, name, a count BYTE, the arguments
     /// (both probed)
     pub const EXEC_PROC2: u8 = 0xC1;
+    pub const FUNCTION: u8 = 0x64;
     pub const FUNCTION2: u8 = 0xC2;
     /// PLAN (tbl NATURAL): blr_plan, blr_retrieve, the stream
     /// re-emitted, blr_sequential - last in the rse (probed)
@@ -452,6 +453,9 @@ enum Val {
     /// a PACKAGED function call: blr_function2, counted package +
     /// name, a count BYTE, the arguments (probed)
     PkgFn(String, String, Vec<Val>),
+    /// a PLAIN (non-packaged) user function call: blr_function, counted
+    /// name, a count byte, the arguments
+    Fn(String, Vec<Val>),
     /// `:name` - an INPUT parameter, referenced straight out of
     /// message 0 as blr_parameter2 (value slot 2i, null slot 2i+1);
     /// no variable is declared for inputs (probed)
@@ -1095,6 +1099,16 @@ struct P<'a> {
     /// outside one. Procedures are NOT here - a bare `P(...)` in value
     /// position is not a sibling function and refuses, as the engine does.
     pkg_members: Vec<(String, usize)>,
+    /// plain (non-packaged) user functions visible to the body - name
+    /// (uppercased) and input arity - so a bare `F(...)` in value position
+    /// binds to blr_function. Passed from the catalog by the server; empty
+    /// when the caller has no catalog (the synthetic describe compiles).
+    plain_funcs: Vec<(String, usize)>,
+    /// set when the body binds a bare plain user-function call (Val::Fn) -
+    /// such a body must run through the exe executor (the arithmetic-only
+    /// source interpreter cannot call a function), so the server refuses it
+    /// if exe cannot convert the compiled BLR (a generator, etc.)
+    saw_user_fn: bool,
 }
 
 impl<'a> P<'a> {
@@ -1116,6 +1130,8 @@ impl<'a> P<'a> {
             loop_labels: Vec::new(),
             package: None,
             pkg_members: Vec::new(),
+            plain_funcs: Vec::new(),
+            saw_user_fn: false,
             pending_loop_label: None,
             proc: None,
             agg_fid_ctx: 1,
@@ -2169,6 +2185,33 @@ impl<'a> P<'a> {
                 return Some(Val::PkgFn(pkg, name.to_string(), args));
             }
         }
+        // a PLAIN user function the catalog knows: a bare `F(...)` binds to
+        // blr_function (an unknown name still falls through to the built-in
+        // dispatch and refuses there, as the engine does)
+        if let Some(&(_, arity)) = self.plain_funcs.iter().find(|(m, _)| m == name) {
+            self.i += 1; // (
+            let mut args = Vec::new();
+            if matches!(self.t.get(self.i), Some(Tok::RParen)) {
+                self.i += 1;
+            } else {
+                loop {
+                    args.push(self.val()?);
+                    match self.t.get(self.i)? {
+                        Tok::Comma => self.i += 1,
+                        Tok::RParen => {
+                            self.i += 1;
+                            break;
+                        }
+                        _ => return None,
+                    }
+                }
+            }
+            if args.len() != arity {
+                return None; // arity mismatch refuses, as the engine does
+            }
+            self.saw_user_fn = true;
+            return Some(Val::Fn(name.to_string(), args));
+        }
         self.i += 1; // (
         let v = match name {
             "UPPER" => Val::Upper(Box::new(self.val()?)),
@@ -2976,6 +3019,15 @@ fn emit_val(out: &mut Vec<u8>, v: &Val) {
             out.extend_from_slice(&(s.len() as u16).to_le_bytes());
             out.extend_from_slice(s.as_bytes());
         }
+        Val::Fn(name, args) => {
+            out.push(blr::FUNCTION);
+            out.push(name.len() as u8);
+            out.extend_from_slice(name.as_bytes());
+            out.push(args.len() as u8);
+            for a in args {
+                emit_val(out, a);
+            }
+        }
         Val::PkgFn(pkg, name, args) => {
             out.push(blr::FUNCTION2);
             out.push(pkg.len() as u8);
@@ -3253,6 +3305,8 @@ pub fn compile_view_columns(sql: &str) -> Option<Vec<Option<Vec<u8>>>> {
             loop_labels: Vec::new(),
             package: None,
             pkg_members: Vec::new(),
+            plain_funcs: Vec::new(),
+            saw_user_fn: false,
             pending_loop_label: None,
         proc: None,
         agg_fid_ctx: 1,
@@ -3406,6 +3460,8 @@ pub fn compile_view_select(sql: &str) -> Option<Vec<u8>> {
             loop_labels: Vec::new(),
             package: None,
             pkg_members: Vec::new(),
+            plain_funcs: Vec::new(),
+            saw_user_fn: false,
             pending_loop_label: None,
         proc: None,
         agg_fid_ctx: 1,
@@ -9357,6 +9413,8 @@ pub fn compile_default(sql: &str) -> Option<Vec<u8>> {
             loop_labels: Vec::new(),
             package: None,
             pkg_members: Vec::new(),
+            plain_funcs: Vec::new(),
+            saw_user_fn: false,
             pending_loop_label: None,
         proc: None,
         agg_fid_ctx: 1,
@@ -9440,6 +9498,8 @@ pub fn compile_computed(sql: &str) -> Option<Vec<u8>> {
             loop_labels: Vec::new(),
             package: None,
             pkg_members: Vec::new(),
+            plain_funcs: Vec::new(),
+            saw_user_fn: false,
             pending_loop_label: None,
         proc: None,
         agg_fid_ctx: 1,
@@ -9518,6 +9578,8 @@ pub fn compile_check(sql: &str) -> Option<Vec<u8>> {
             loop_labels: Vec::new(),
             package: None,
             pkg_members: Vec::new(),
+            plain_funcs: Vec::new(),
+            saw_user_fn: false,
             pending_loop_label: None,
         proc: None,
         agg_fid_ctx: 1,
@@ -9597,6 +9659,8 @@ pub fn compile_validation(sql: &str) -> Option<Vec<u8>> {
             loop_labels: Vec::new(),
             package: None,
             pkg_members: Vec::new(),
+            plain_funcs: Vec::new(),
+            saw_user_fn: false,
             pending_loop_label: None,
         proc: None,
         agg_fid_ctx: 1,
@@ -9700,6 +9764,8 @@ pub fn compile_trigger(sql: &str) -> Option<Vec<u8>> {
             loop_labels: Vec::new(),
             package: None,
             pkg_members: Vec::new(),
+            plain_funcs: Vec::new(),
+            saw_user_fn: false,
             pending_loop_label: None,
         proc: None,
         agg_fid_ctx: 1,
@@ -9919,6 +9985,9 @@ pub struct ProcCompiled {
     pub outs: Vec<ProcParamMeta>,
     pub selectable: bool,
     pub source: String,
+    /// the body binds a bare plain user-function call - it must run via
+    /// exe (see [P::saw_user_fn]); the server checks exe can convert the BLR
+    pub calls_user_fn: bool,
 }
 
 /// [compile_procedure] with the catalog metadata kept - None exactly
@@ -9928,6 +9997,7 @@ fn compile_routine_full(
     sql: &str,
     is_function: bool,
     pkg: Option<(&str, &[(String, usize)])>,
+    plain_funcs: &[(String, usize)],
 ) -> Option<ProcCompiled> {
     let trimmed = sql.trim().trim_end_matches(';');
     let toks = lex(trimmed)?;
@@ -9937,6 +10007,10 @@ fn compile_routine_full(
         p.package = Some(pkn.to_ascii_uppercase());
         p.pkg_members = mems.iter().map(|(m, a)| (m.to_ascii_uppercase(), *a)).collect();
     }
+    p.plain_funcs = plain_funcs
+        .iter()
+        .map(|(m, a)| (m.to_ascii_uppercase(), *a))
+        .collect();
     let kw2 = if is_function { "FUNCTION" } else { "PROCEDURE" };
     if !(p.kw("CREATE") && p.kw(kw2)) {
         return None;
@@ -9975,11 +10049,12 @@ fn compile_routine_full(
         outs: bo.outs.iter().map(|(n, d)| dsc_to_meta(n, d)).collect(),
         selectable: bo.selectable,
         source,
+        calls_user_fn: p.saw_user_fn,
     })
 }
 
 pub fn compile_procedure_full(sql: &str) -> Option<ProcCompiled> {
-    compile_routine_full(sql, false, None)
+    compile_routine_full(sql, false, None, &[])
 }
 
 /// [compile_procedure_full] with the enclosing package's name and its
@@ -9990,7 +10065,7 @@ pub fn compile_procedure_full_in_package(
     package: &str,
     members: &[(String, usize)],
 ) -> Option<ProcCompiled> {
-    compile_routine_full(sql, false, Some((package, members)))
+    compile_routine_full(sql, false, Some((package, members)), &[])
 }
 
 /// `compile_procedure` as uppercase hex.
@@ -10001,7 +10076,24 @@ pub fn compile_procedure_full_in_package(
 /// final send without the EOS flag (probed byte for byte against the
 /// engine's RDB$FUNCTION_BLR).
 pub fn compile_function_full(sql: &str) -> Option<ProcCompiled> {
-    compile_routine_full(sql, true, None)
+    compile_routine_full(sql, true, None, &[])
+}
+
+/// [compile_procedure_full] with the plain user functions the catalog
+/// holds, so a bare `F(...)` in the body binds to blr_function.
+pub fn compile_procedure_full_with_funcs(
+    sql: &str,
+    plain_funcs: &[(String, usize)],
+) -> Option<ProcCompiled> {
+    compile_routine_full(sql, false, None, plain_funcs)
+}
+
+/// [compile_function_full] with the plain user functions the catalog holds.
+pub fn compile_function_full_with_funcs(
+    sql: &str,
+    plain_funcs: &[(String, usize)],
+) -> Option<ProcCompiled> {
+    compile_routine_full(sql, true, None, plain_funcs)
 }
 
 /// [compile_function_full] with the enclosing package's name and its
@@ -10011,7 +10103,7 @@ pub fn compile_function_full_in_package(
     package: &str,
     members: &[(String, usize)],
 ) -> Option<ProcCompiled> {
-    compile_routine_full(sql, true, Some((package, members)))
+    compile_routine_full(sql, true, Some((package, members)), &[])
 }
 
 pub fn compile_procedure_hex(sql: &str) -> Option<String> {

@@ -115,6 +115,7 @@ mod blr {
     pub const PLAN: u8 = 139;
     pub const ANSI_ANY: u8 = 151;
     pub const WINDOW: u8 = 195;
+    pub const FUNCTION: u8 = 100;
     pub const FUNCTION2: u8 = 194;
     pub const PARTITION_BY: u8 = 196;
     pub const AGG_FUNCTION: u8 = 199;
@@ -780,6 +781,19 @@ impl<'a> P<'a> {
                     }
                     other => return Err(format!("literal dtype {} unconverted", other)),
                 }))
+            }
+            blr::FUNCTION => {
+                // blr_function: a PLAIN (non-packaged) user function -
+                // counted name, an argument COUNT BYTE, then the arguments.
+                // No package: an empty package string resolves the plain
+                // function, the same slot a bare sibling name would take.
+                let name = self.counted_name()?;
+                let argc = self.u8()? as usize;
+                let mut args = Vec::with_capacity(argc);
+                for _ in 0..argc {
+                    args.push(self.expr()?);
+                }
+                Ok(Expr::Function(String::new(), name, args))
             }
             blr::FUNCTION2 => {
                 // blr_function2: counted package + counted name, an argument

@@ -15790,7 +15790,7 @@ fn plan_create_or_alter_trigger(sql: &str, db: &Option<Database>) -> Option<(Pla
 
 /// `ALTER PROCEDURE ...` / `CREATE OR ALTER PROCEDURE ...`: the CREATE
 /// planner over the rewritten head.
-fn plan_alter_procedure(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
+fn plan_alter_procedure(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor>)> {
     let s = sql.trim();
     let up = mask_literals(&s.to_ascii_uppercase());
     let (create_or_alter, pk) = if find_word(&up, "ALTER", 0) == Some(0) {
@@ -15811,7 +15811,7 @@ fn plan_alter_procedure(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
         return None;
     };
     let synth = format!("CREATE {}", s[pk..].trim());
-    let Some((plan, _)) = plan_create_procedure(&synth) else {
+    let Some((plan, _)) = plan_create_procedure(&synth, db) else {
         // a body this planner cannot compile: the engine checks the NAME
         // first (probed: `ALTER PROCEDURE NOPE AS BEGIN END` is "not
         // found"), so the execute answers by existence - the vector for a
@@ -17099,14 +17099,111 @@ fn plan_drop_procedure(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
 /// Parse and COMPILE `CREATE PROCEDURE ...`: the dsql crate's
 /// engine-byte compiler decides the surface - what it cannot compile,
 /// this DDL refuses whole.
-fn plan_create_procedure(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
+/// Can the exe BLR executor run this body? A body that calls a plain user
+/// function MUST run through exe (the arithmetic-only source interpreter
+/// cannot call a function), and exe declines a body that draws a generator.
+/// A function-calling body exe cannot convert is refused at CREATE rather
+/// than stored and then failed at fetch (a create-then-run split).
+fn exe_can_run(blr: &[u8]) -> bool {
+    fire_crab_exe::parse(blr).map(|r| !r.uses_generators).unwrap_or(false)
+}
+
+/// The (name, input arity) of the function a `CREATE FUNCTION` defines,
+/// read from its header so a RECURSIVE self-call in the body resolves
+/// (the engine registers the signature before compiling the body). The
+/// arity is the count of top-level parameters between the first `(` and
+/// its matching `)`; a bare name or `()` is arity 0.
+fn function_self_sig(sql: &str) -> Option<(String, usize)> {
+    let up = sql.trim_start().to_ascii_uppercase();
+    let after = up.strip_prefix("CREATE")?.trim_start();
+    // CREATE OR ALTER / RECREATE headers reach here too via the create_sql
+    let after = after.strip_prefix("FUNCTION").or_else(|| {
+        after.strip_prefix("OR").map(|r| r.trim_start()).and_then(|r| r.strip_prefix("ALTER")).map(|r| r.trim_start()).and_then(|r| r.strip_prefix("FUNCTION"))
+    })?;
+    let after = after.trim_start();
+    // the name: an identifier up to whitespace or `(`
+    let nend = after.find(|c: char| c.is_whitespace() || c == '(').unwrap_or(after.len());
+    let name = after[..nend].trim_matches('"').to_string();
+    if name.is_empty() {
+        return None;
+    }
+    let rest = after[nend..].trim_start();
+    let arity = if let Some(inner) = rest.strip_prefix('(') {
+        // count top-level commas up to the matching close paren, IGNORING
+        // any inside a '...' string literal (a DEFAULT 'a,b' must not split
+        // the parameter) or nested parens (a NUMERIC(9,2) type)
+        let mut depth = 1i32;
+        let mut commas = 0usize;
+        let mut any = false;
+        let mut in_quote = false;
+        let mut chars = inner.chars().peekable();
+        while let Some(c) = chars.next() {
+            if in_quote {
+                any = true;
+                if c == '\'' {
+                    if chars.peek() == Some(&'\'') {
+                        chars.next(); // a doubled '' stays inside the literal
+                    } else {
+                        in_quote = false;
+                    }
+                }
+                continue;
+            }
+            match c {
+                '\'' => {
+                    in_quote = true;
+                    any = true;
+                }
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                ',' if depth == 1 => commas += 1,
+                c if !c.is_whitespace() => any = true,
+                _ => {}
+            }
+        }
+        if any {
+            commas + 1
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+    Some((name, arity))
+}
+
+/// The PLAIN (non-packaged) user functions the catalog holds, as
+/// (uppercased name, input arity) - what dsql binds a bare `F(...)` body
+/// call to (blr_function). A packaged function is keyed with a dotted
+/// name and is excluded here (it needs its qualifier). Empty with no db.
+fn plain_function_arities(db: &Option<Database>) -> Vec<(String, usize)> {
+    match db {
+        Some(d) => user_function_sigs(d)
+            .into_iter()
+            .filter(|(k, _)| !k.contains('.'))
+            .map(|(k, (_, args))| (k, args.len()))
+            .collect(),
+        None => Vec::new(),
+    }
+}
+
+fn plan_create_procedure(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor>)> {
     let up = sql.trim_start().to_ascii_uppercase();
     if find_word(&up, "CREATE", 0) != Some(0)
         || find_word(&up, "PROCEDURE", "CREATE".len()).is_none_or(|k| up["CREATE".len()..k].trim() != "")
     {
         return None;
     }
-    let c = fire_crab_dsql::compile_procedure_full(sql)?;
+    let plain_funcs = plain_function_arities(db);
+    let c = fire_crab_dsql::compile_procedure_full_with_funcs(sql, &plain_funcs)?;
+    if c.calls_user_fn && !exe_can_run(&c.blob) {
+        return None; // stores BLR fc could not itself run - refuse instead
+    }
     let conv = |m: &fire_crab_dsql::ProcParamMeta| fire_crab_ods::ddl::ProcParamDef {
         default: None,
         name: m.name.clone(),
@@ -17778,7 +17875,7 @@ fn projcol_to_coldef(c: &ProjCol, name: &str) -> Option<fire_crab_ods::ddl::Colu
 /// `CREATE FUNCTION ...`: the dsql crate's function compiler (byte for byte
 /// the engine's RDB$FUNCTION_BLR); the arguments become RDB$FUNCTION_ARGUMENTS
 /// rows on auto-domains, the return is position 0.
-fn plan_create_function(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
+fn plan_create_function(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor>)> {
     let s = sql.trim();
     let up = mask_literals(&s.to_ascii_uppercase());
     if find_word(&up, "CREATE", 0) != Some(0) {
@@ -17788,7 +17885,20 @@ fn plan_create_function(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
     if up["CREATE".len()..fk].trim() != "" {
         return None;
     }
-    let c = fire_crab_dsql::compile_function_full(s)?;
+    let mut __pf = plain_function_arities(db);
+    // a function may call ITSELF recursively; the catalog does not yet
+    // hold it, so add its own signature from the CREATE header
+    if let Some(sig) = function_self_sig(sql) {
+        // the body being compiled defines the CURRENT signature, so it
+        // overrides any stale catalog entry (a RECREATE that changes the
+        // arity) rather than deferring to the old one
+        __pf.retain(|(n, _)| *n != sig.0);
+        __pf.push(sig);
+    }
+    let c = fire_crab_dsql::compile_function_full_with_funcs(s, &__pf)?;
+    if c.calls_user_fn && !exe_can_run(&c.blob) {
+        return None; // stores BLR fc could not itself run - refuse instead
+    }
     if c.outs.len() != 1 {
         return None;
     }
@@ -52527,10 +52637,10 @@ fn plan_recreate(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descript
     let create_sql = format!("CREATE {}", s["RECREATE".len()..].trim_start());
     let (create, descs) = plan_create_table(&create_sql)
         .or_else(|| plan_create_view(&create_sql, db))
-        .or_else(|| plan_create_procedure(&create_sql))
+        .or_else(|| plan_create_procedure(&create_sql, db))
         .or_else(|| plan_create_exception(&create_sql))
         .or_else(|| plan_create_sequence(&create_sql))
-        .or_else(|| plan_create_function(&create_sql))?;
+        .or_else(|| plan_create_function(&create_sql, db))?;
     recreate_drop_plan(&create)?;
     Some((Plan::Recreate(Box::new(create)), descs))
 }
@@ -52569,12 +52679,12 @@ fn plan_immediate(text: &str, database: &Option<Database>) -> Option<(Plan, Vec<
                     .or_else(|| plan_alter_trigger(text, database))
                     .or_else(|| plan_drop_trigger(text))
                     .or_else(|| plan_create_or_alter_trigger(text, database))
-                    .or_else(|| plan_alter_procedure(text))
+                    .or_else(|| plan_alter_procedure(text, database))
                     .or_else(|| plan_create_index(text))
                     .or_else(|| plan_drop_table(text))
                     .or_else(|| plan_drop_index(text))
                     .or_else(|| plan_create_sequence(text))
-                    .or_else(|| plan_create_procedure(text))
+                    .or_else(|| plan_create_procedure(text, database))
                     .or_else(|| plan_drop_procedure(text))
                     .or_else(|| plan_drop_sequence(text))
                     .or_else(|| plan_create_exception(text))
@@ -52591,7 +52701,7 @@ fn plan_immediate(text: &str, database: &Option<Database>) -> Option<(Plan, Vec<
                     .or_else(|| plan_create_view(text, database))
                     .or_else(|| plan_alter_view(text, database))
                     .or_else(|| plan_drop_view(text))
-                    .or_else(|| plan_create_function(text))
+                    .or_else(|| plan_create_function(text, database))
                     .or_else(|| plan_drop_function(text))
                     .or_else(|| plan_drop_exception(text))
                     .or_else(|| plan_alter_exception(text))
@@ -58809,13 +58919,13 @@ fn after_auth(
                         .or_else(|| plan_alter_trigger(&stmt_sql, &database))
                         .or_else(|| plan_drop_trigger(&stmt_sql))
                         .or_else(|| plan_create_or_alter_trigger(&stmt_sql, &database))
-                        .or_else(|| plan_alter_procedure(&stmt_sql))
+                        .or_else(|| plan_alter_procedure(&stmt_sql, &database))
                         .or_else(|| plan_create_index(&stmt_sql))
                         .or_else(|| plan_drop_table(&stmt_sql))
                         .or_else(|| plan_drop_index(&stmt_sql))
                         .or_else(|| plan_create_sequence(&stmt_sql))
                         .or_else(|| plan_drop_sequence(&stmt_sql))
-                        .or_else(|| plan_create_procedure(&stmt_sql))
+                        .or_else(|| plan_create_procedure(&stmt_sql, &database))
                         .or_else(|| plan_drop_procedure(&stmt_sql))
                         .or_else(|| plan_create_exception(&stmt_sql))
                         .or_else(|| plan_declare_filter(&stmt_sql))
@@ -58831,7 +58941,7 @@ fn after_auth(
                         .or_else(|| plan_create_view(&stmt_sql, &database))
                         .or_else(|| plan_alter_view(&stmt_sql, &database))
                         .or_else(|| plan_drop_view(&stmt_sql))
-                        .or_else(|| plan_create_function(&stmt_sql))
+                        .or_else(|| plan_create_function(&stmt_sql, &database))
                         .or_else(|| plan_drop_function(&stmt_sql))
                         .or_else(|| plan_drop_exception(&stmt_sql))
                         .or_else(|| plan_alter_exception(&stmt_sql))
