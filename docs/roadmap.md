@@ -306,6 +306,24 @@ exe f64 arithmetic.
   byte-exact. So `SELECT * FROM PI(1.5)` now answers `2` and `PT(1.50)`
   answers `1.50`, as they do on the engine.
 
+**Raising a user EXCEPTION from a FUNCTION body DONE (2026-08-23,
+`serve-real-fnexc` 5).** A procedure body already raised a named exception
+byte-for-byte — the shared PSQL source interpreter (`run_body_source`)
+builds the engine's own vector (number, quoted name, message) — but a
+FUNCTION hit the same `EXCEPTION E_NEG` and the select-list caller
+collapsed EVERY error from the source fallback to `EvalErr::Unsupported`
+(a generic "Dynamic SQL Error"), discarding the `ProcErr`'s status. The
+caller now surfaces that status (`e.status.unwrap_or(Unsupported)`), so a
+raise from a function answers exactly what it answers from a procedure;
+only a genuine "cannot run this body" (status `None`) stays Unsupported.
+A one-line change. Catching a raise inside a function (a `WHEN ANY` block)
+already worked — it happens inside the interpreter before the result
+returns. As with every fc raise, the per-level `At function` stack frame
+is omitted (the recorded fc-wide boundary; the exception identity is
+byte-exact). Boundaries still refused at CREATE (dsql does not compile
+them): `EXCEPTION <name> <message-override>` and `WHEN EXCEPTION <name>
+DO` (only `WHEN ANY` compiles in this context).
+
 **The IF statement (blr_if) in exe DONE (2026-08-23, `serve-real-psqlif`
 5):** the executor could not convert an IF, so a body combining IF/ELSE
 control flow with an exe-only feature (a NUMERIC computation, a function

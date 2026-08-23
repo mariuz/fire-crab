@@ -55263,7 +55263,15 @@ fn materialise_user_fn_rows(
                         if std::env::var("FC_SRV_TRACE").is_ok() {
                             eprintln!("[srv] user function {}({:?}) failed: {}", c.name, argv, e);
                         }
-                        EvalErr::Unsupported
+                        // A RAISE (or any runtime error) inside the body is
+                        // NOT a refusal: the source interpreter already
+                        // built the engine's own vector - a user exception's
+                        // number/name/message, a divide-by-zero, a numeric
+                        // overflow - in the ProcErr's status. Surface it, so
+                        // `EXCEPTION E_NEG` from a function raises what it
+                        // does from a procedure. Only a genuine "cannot run
+                        // this body" (status None) stays Unsupported.
+                        e.status.unwrap_or(EvalErr::Unsupported)
                     })?
                 }
             };
