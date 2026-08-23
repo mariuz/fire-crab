@@ -256,12 +256,23 @@ A*1.5`). Boundary: an intermediate that overflows i64 raises 22003
 overflow" (both 22003) — fc's i128 numeric model, consistent with the
 server's own `numeric_bin`.
 
-Still blocked on top of it: **NUMERIC/approx in a FUNCTION signature** (a
-function with a NUMERIC or DOUBLE param/return is `-804`: `load_function`
-gates on `col_kind` = Int/Text only). The remaining layers are now small:
-relax the gate, a `build_expr_col_from` describe from the ret descriptor
-(incl. `sub_type=1`), and `bind_proc_args` CVT for scaled args — the
-arithmetic they feed now exists.
+**NUMERIC in a FUNCTION signature DONE (2026-08-23, `serve-real-numfunc`
+6):** a plain function with a NUMERIC(p,s) param and/or return now loads,
+describes from its return descriptor (exact dtype/scale, `RDB$FIELD_SUB_TYPE
+1`), binds a scaled/integer/text argument to the parameter's scale
+(rescaling half-away, raising 22003 past the width, 22018 on a bad text),
+computes through the exe scaled arithmetic, and coerces the result to the
+return. `load_function` gate relaxed to `is_numeric_col`; `dsc_to_meta`
+now writes sub_type 1 for a scaled param; `run_function` coerces its
+result to the return scale (the source-interpreter fallback did not).
+Boundaries (recorded): NUMERIC(19-38)/INT128 in a signature — the CREATE
+FUNCTION DDL refuses it; DOUBLE/approx — the executor has no f64
+arithmetic; a PACKAGED numeric function whose body does scaled arithmetic
+or has a NUMERIC literal/param — packaged members bypass exe
+(`function_blr` skips them) and the arithmetic-only source interpreter
+refuses (a clean refusal, no wrong answer; the pure-integer-body → NUMERIC
+return case works). NUMERIC in a PROCEDURE signature is a follow-up
+(`load_procedure` unchanged; needs the proc output-column describe path).
 
 Other gaps: an explicit `PLAN` (WITH LOCK / FOR UPDATE / OPTIMIZE are
 done); a `?` inside any PSQL query (loop, cursor, `EXECUTE STATEMENT`,

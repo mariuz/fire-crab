@@ -9841,7 +9841,10 @@ fn dsc_to_meta(name: &str, d: &Dsc) -> ProcParamMeta {
         field_type,
         length,
         scale,
-        sub_type: 0,
+        // a scaled exact-numeric parameter is NUMERIC (RDB$FIELD_SUB_TYPE
+        // 1); a plain integer or a non-numeric type is 0. DECIMAL (2) is
+        // not distinguished from NUMERIC by the Dsc here - a boundary.
+        sub_type: if scale != 0 { 1 } else { 0 },
     }
 }
 

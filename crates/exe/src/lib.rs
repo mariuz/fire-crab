@@ -484,7 +484,7 @@ impl<'a> P<'a> {
     fn msg_slot(&mut self) -> Result<MsgSlot, String> {
         let dtype = self.u8()?;
         Ok(match dtype {
-            blr::DT_SHORT | blr::DT_LONG | blr::DT_INT64 => MsgSlot {
+            blr::DT_SHORT | blr::DT_LONG | blr::DT_INT64 | blr::DT_INT128 => MsgSlot {
                 dtype,
                 length: 0,
                 scale: self.u8()? as i8,

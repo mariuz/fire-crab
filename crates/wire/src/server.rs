@@ -12607,6 +12607,30 @@ fn build_expr_col_from(e: Expr, name: &str, descs: &[Descriptor]) -> Option<Proj
             expr: Some(e),
         });
     }
+    // a function CALL describes DIRECTLY from its declared RETURN type: a
+    // NUMERIC (scaled or INT128) return cannot be typed by the arithmetic
+    // describe below (rank_of is None for a UserFn and the scale is the
+    // DECLARED one). The ret descriptor carries the exact dtype/scale/
+    // length/sub_type - use it.
+    if let Expr::UserFn { ret, .. } = &e {
+        if is_numeric_col(ret) {
+            let (wire, sql_type, length, scale, sub_type) = wire_for(ret);
+            return Some(ProjCol {
+                name: name.to_string(),
+                fname: None,
+                relation: None,
+                rel_alias: None,
+                field_id: 0,
+                wire,
+                sql_type: nullable(sql_type),
+                length,
+                oct_length: length,
+                scale,
+                sub_type,
+                expr: Some(e),
+            });
+        }
+    }
     // an exact-numeric result travels as a scaled integer - INT64-backed
     // (SQL_INT64, the raw integer on the wire, the client divides), or
     // INT128-backed (SQL_INT128, 16 bytes) when the engine's dtype rules
@@ -54857,6 +54881,87 @@ fn bind_proc_args(name: &str, meta: &ProcMeta, args: &[Value]) -> Result<Vec<Val
                     Value::Text(rendered)
                 }
             }
+            // a TEXT argument into a NUMERIC parameter: the engine's CVT
+            // parses the decimal and rescales to the parameter (a bad
+            // string is 22018; a value past the width is 22003; a hex
+            // literal is refused, as the text->INTEGER arm refuses it too)
+            (Value::Text(t), _) if is_numeric_col(d) => {
+                // text_number applies the engine's own space-only trim; a
+                // Rust .trim() here would wrongly accept a tab/newline
+                match text_number(t) {
+                    Some(n @ TextNum::Dec { .. }) => {
+                        match text_to_exact(n, d.dtype, d.scale) {
+                            Some(r) => {
+                                if d.dtype == fire_crab_ods::format::dtype::INT128 {
+                                    Value::Int128(r, d.scale)
+                                } else {
+                                    Value::Scaled(r as i64, d.scale)
+                                }
+                            }
+                            None => {
+                                return Err(ProcErr {
+                                    text: format!(
+                                        "procedure {}: {} out of range for {}",
+                                        name, t, param.name
+                                    ),
+                                    status: Some(EvalErr::NumericOutOfRange),
+                                })
+                            }
+                        }
+                    }
+                    _ => {
+                        return Err(ProcErr {
+                            text: format!("procedure {}: cannot convert {:?}", name, t),
+                            status: Some(EvalErr::ConversionError(Some(t.clone()))),
+                        })
+                    }
+                }
+            }
+            // an exact-numeric argument (a NUMERIC/scaled value, or an
+            // integer) into a NUMERIC parameter: rescale to the parameter's
+            // declared scale, exactly as the engine's implicit conversion
+            (Value::Scaled(..) | Value::Int128(..) | Value::Int(_), _) if is_numeric_col(d) => {
+                let (raw, from) = match arg {
+                    Value::Scaled(r, sc) => (*r as i128, *sc),
+                    Value::Int128(r, sc) => (*r, *sc),
+                    Value::Int(n) => (*n as i128, 0),
+                    _ => unreachable!(),
+                };
+                match rescale(raw, from, d.scale) {
+                    Ok(r) => {
+                        use fire_crab_ods::format::dtype as dt;
+                        // the rescaled value must fit the parameter's storage
+                        // width (a NUMERIC(9,2) is a LONG - i32), or the
+                        // engine's "numeric value is out of range" (22003)
+                        let fits = match d.dtype {
+                            dt::SHORT => i16::try_from(r).is_ok(),
+                            dt::LONG => i32::try_from(r).is_ok(),
+                            dt::INT128 => true,
+                            _ => i64::try_from(r).is_ok(),
+                        };
+                        if !fits {
+                            return Err(ProcErr {
+                                text: format!(
+                                    "procedure {}: {} out of range for {}",
+                                    name, raw, param.name
+                                ),
+                                status: Some(EvalErr::NumericOutOfRange),
+                            });
+                        }
+                        if d.dtype == dt::INT128 {
+                            Value::Int128(r, d.scale)
+                        } else {
+                            Value::Scaled(r as i64, d.scale)
+                        }
+                    }
+                    Err(ev) => {
+                        return Err(ProcErr {
+                            text: format!("procedure {}: conversion", name),
+                            status: Some(ev),
+                        })
+                    }
+                }
+            }
             _ => {
                 return Err(ProcErr::from(format!(
                     "procedure {}: argument type does not match parameter {}",
@@ -55169,7 +55274,12 @@ fn load_function(db: &Database, name: &str) -> Option<ProcMeta> {
     let mut outs: Vec<ProcParam> = Vec::new();
     for (pos, pname, fs) in raw {
         let desc = domain_desc(&fs)?;
-        if col_kind(&desc).is_none() {
+        // INT/TEXT the arithmetic source path handles; NUMERIC (scaled or
+        // INT128) the BLR executor computes, so a function of these types
+        // is loadable now that it runs through try_function_blr. Approx
+        // (FLOAT/DOUBLE - the executor has no f64 arithmetic) and temporal
+        // stay refused.
+        if col_kind(&desc).is_none() && !is_numeric_col(&desc) {
             return None;
         }
         if pos == 0 {
@@ -55195,7 +55305,44 @@ fn run_function(
     let meta = load_function(db, name)
         .ok_or_else(|| format!("function {} is not one this server can run", name))?;
     let (outs, _) = run_body_source(database, name, &meta, args, ctx)?;
-    Ok(outs.into_iter().next().unwrap_or(Value::Null))
+    let v = outs.into_iter().next().unwrap_or(Value::Null);
+    // COERCE the result to the declared RETURN scale. The source
+    // interpreter's RETURN stores the value uncoerced, so a scale-0 value
+    // (e.g. a generator) into a NUMERIC return would otherwise ship at the
+    // wrong scale. (The executor path coerces already; this is the
+    // fallback's mirror.) Non-numeric returns pass through.
+    if let Some(ret) = meta.outs.first() {
+        if is_numeric_col(&ret.desc) {
+            let parts = match &v {
+                Value::Int(n) => Some((*n as i128, 0i8)),
+                Value::Scaled(r, sc) => Some((*r as i128, *sc)),
+                Value::Int128(r, sc) => Some((*r, *sc)),
+                _ => None,
+            };
+            if let Some((raw, from)) = parts {
+                let r = rescale(raw, from, ret.desc.scale)
+                    .map_err(|e| ProcErr { text: format!("function {}", name), status: Some(e) })?;
+                let fits = match ret.desc.dtype {
+                    dtype::SHORT => i16::try_from(r).is_ok(),
+                    dtype::LONG => i32::try_from(r).is_ok(),
+                    dtype::INT128 => true,
+                    _ => i64::try_from(r).is_ok(),
+                };
+                if !fits {
+                    return Err(ProcErr {
+                        text: format!("function {}: numeric value is out of range", name),
+                        status: Some(EvalErr::NumericOutOfRange),
+                    });
+                }
+                return Ok(if ret.desc.dtype == dtype::INT128 {
+                    Value::Int128(r, ret.desc.scale)
+                } else {
+                    Value::Scaled(r as i64, ret.desc.scale)
+                });
+            }
+        }
+    }
+    Ok(v)
 }
 
 fn run_procedure(
