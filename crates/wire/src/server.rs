@@ -12304,6 +12304,7 @@ fn int_func_form(e: &Expr, descs: &[Descriptor]) -> Option<(Wire, i32, i32)> {
         SysFn::SetContext => Some(long), // INTEGER, probed
         SysFn::Sign => Some(short),
         SysFn::AsciiVal => Some(short), // SMALLINT (probed)
+        SysFn::Hash => Some(int64), // BIGINT (probed)
         SysFn::CharLength | SysFn::OctetLength | SysFn::OctetLengthCs(_) | SysFn::Position => Some(long),
         SysFn::BlobOctetLength => Some(int64), // a blob's length is a BIGINT (probed)
         SysFn::Mod => match src_dtype(0)? {
@@ -41548,6 +41549,9 @@ enum SysFn {
     /// ASCII_VAL(s) - the SMALLINT code of the first byte (0 for an
     /// empty string).
     AsciiVal,
+    /// HASH(s) - the engine's default WEAK 64-bit hash of the value's
+    /// bytes (an ELF-style rolling hash), a BIGINT.
+    Hash,
     Lpad,
     Rpad,
     /// `DATEADD(<n> <unit> TO <t>)` / `DATEADD(<unit>, <n>, <t>)` -
@@ -41643,6 +41647,7 @@ impl SysFn {
             SysFn::BinShl => "BIN_SHL",
             SysFn::BinShr => "BIN_SHR",
             SysFn::AsciiVal => "ASCII_VAL",
+            SysFn::Hash => "HASH",
             SysFn::Lpad => "LPAD",
             SysFn::Rpad => "RPAD",
             SysFn::Extract(_) => "EXTRACT",
@@ -43017,6 +43022,7 @@ fn sysfn_named(word: &str) -> Option<SysFn> {
         "BIN_SHL" => SysFn::BinShl,
         "BIN_SHR" => SysFn::BinShr,
         "ASCII_VAL" => SysFn::AsciiVal,
+        "HASH" => SysFn::Hash,
         "LPAD" => SysFn::Lpad,
         "RPAD" => SysFn::Rpad,
         // the part in the variant is a placeholder for the NAME check;
@@ -43235,7 +43241,7 @@ fn parse_sysfn_call(up: &str, b: &[char], pos: &mut usize) -> Option<RawExpr> {
         | SysFn::Abs
         | SysFn::Sign => (1, 1),
         SysFn::Left | SysFn::Right | SysFn::Mod | SysFn::BinShl | SysFn::BinShr => (2, 2),
-        SysFn::BinNot | SysFn::AsciiVal => (1, 1),
+        SysFn::BinNot | SysFn::AsciiVal | SysFn::Hash => (1, 1),
         SysFn::BinAnd | SysFn::BinOr | SysFn::BinXor => (2, usize::MAX),
         SysFn::Replace => (3, 3),
         SysFn::Lpad | SysFn::Rpad => (2, 3),
@@ -45793,6 +45799,24 @@ fn fn_text(v: &Value) -> String {
     v.render()
 }
 
+/// The engine's default HASH - `WeakHashContext` (Hash.cpp): a 64-bit
+/// ELF-style rolling hash over the bytes. Each byte does
+/// `h = (h << 4) + byte`, then the top nibble `n` (bits 60..63) is folded
+/// down by `h ^= n >> 56` (arithmetic shift) and cleared (`h &= ~n`). The
+/// shift/add wrap the way the engine's SINT64 arithmetic does.
+fn weak_hash(data: &[u8]) -> i64 {
+    let mut h: i64 = 0;
+    for &b in data {
+        h = h.wrapping_shl(4).wrapping_add(b as i64);
+        let n: i64 = h & (0xF000_0000_0000_0000u64 as i64);
+        if n != 0 {
+            h ^= n >> 56;
+        }
+        h &= !n;
+    }
+    h
+}
+
 /// A function argument as an integer - CVT the other way: a scaled
 /// numeric rounds half away from zero (MOD(12.50, 5) = 3, probed), a
 /// string trims and parses, a non-numeric string is the conversion error.
@@ -46190,6 +46214,16 @@ impl Expr {
                             None
                         }
                     }
+                    // HASH(text) -> BIGINT. A non-text operand would hash the
+                    // engine's string CONVERSION of it, which this server
+                    // does not pin - refuse it (text only for now).
+                    SysFn::Hash => {
+                        if ts[0] == ExprType::Text {
+                            Some(ExprType::Int)
+                        } else {
+                            None
+                        }
+                    }
                     // the bitwise functions take integer operands and
                     // answer an integer; a text operand refuses (the engine
                     // would string-convert - unpinned here)
@@ -46445,7 +46479,7 @@ impl Expr {
                 | SysFn::Sign
                 | SysFn::AsciiVal
                 | SysFn::Extract(_) => Some(NumRank::Long),
-                SysFn::BlobOctetLength => Some(NumRank::I64),
+                SysFn::BlobOctetLength | SysFn::Hash => Some(NumRank::I64),
                 _ => None, // the text-valued functions
             },
             Expr::Str(_)
@@ -47429,6 +47463,9 @@ impl Expr {
                         let s = fn_text(&vs[0]);
                         Value::Int(s.chars().next().map_or(0, |c| c as i64))
                     }
+                    // HASH(s): the engine's WeakHashContext over the string
+                    // bytes (Hash.cpp) - a 64-bit ELF-style rolling hash.
+                    SysFn::Hash => Value::Int(weak_hash(fn_text(&vs[0]).as_bytes())),
                     SysFn::Lpad | SysFn::Rpad => {
                         let pad = vs.get(2).map(fn_text).unwrap_or_else(|| " ".into());
                         Value::Text(pad_impl(
@@ -57724,7 +57761,7 @@ fn expr_no_raise(e: &Expr, descs: &[Descriptor]) -> bool {
                 SysFn::Abs => safe_num(&args[0]),
                 // ASCII_VAL never raises; ASCII_CHAR raises 22003 unless its
                 // operand is a literal visibly within 0..255
-                SysFn::AsciiVal => true,
+                SysFn::AsciiVal | SysFn::Hash => true,
             }
         }
     }
