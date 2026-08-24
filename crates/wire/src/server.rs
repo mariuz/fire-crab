@@ -22114,8 +22114,14 @@ fn encode_wire_value(d: &Descriptor, wp: &WireParam) -> Option<Option<Vec<u8>>> 
                 }
                 _ => return None,
             },
-            dtype::DOUBLE if *ws == 0 => (*v as f64).to_le_bytes().to_vec(),
-            dtype::REAL if *ws == 0 => (*v as f32).to_le_bytes().to_vec(),
+            // a scaled decimal literal (2.5 arrives as Int(25, ws=-1)) into
+            // an approximate column: convert the whole magnitude to f64 the
+            // way CVT does (exact_to_f64 matches the engine's scaled->double,
+            // as the DOUBLE math built-ins rely on). The former `ws == 0`
+            // guard refused every fractional literal, so a non-integer INSERT
+            // into a DOUBLE/FLOAT column silently stored no row.
+            dtype::DOUBLE => exact_to_f64(*v as i128, *ws as i32).to_le_bytes().to_vec(),
+            dtype::REAL => (exact_to_f64(*v as i128, *ws as i32) as f32).to_le_bytes().to_vec(),
             // an INTEGER parameter into a TEXT column: the engine
             // stores its decimal rendering ("42", "-7"), and REFUSES
             // rather than truncate when it does not fit
@@ -37962,6 +37968,11 @@ const GDS_DECFLOAT_DIVIDE_BY_ZERO: i32 = 335545139;
 const GDS_FLOAT_DIVIDE: i32 = 335544772;
 /// `isc_exception_float_overflow` - SQLSTATE 22003
 const GDS_FLOAT_OVERFLOW: i32 = 335544775;
+/// `isc_sysf_fp_overflow` - "Floating point overflow in built-in function
+/// @1" (SQLSTATE 42000). The std-math family (SINH / COSH) raises THIS on
+/// an infinite result, naming the function - distinct from EXP / POWER,
+/// which raise the plain exception_float_overflow above.
+const GDS_SYSF_FP_OVERFLOW: i32 = 335544981;
 /// isc_convert_error - the engine's "conversion error from string" for a
 /// CAST that cannot convert (SQLSTATE 22018).
 const GDS_CONVERT_ERROR: i32 = 335544334;
@@ -38089,6 +38100,27 @@ const GDS_INTEGER_OVERFLOW: i32 = 335544779;
 /// (probed: `CAST('32768' AS SMALLINT)`, `CAST(2147483648 AS INTEGER)`,
 /// `CAST(1.23e30 AS BIGINT)`).
 const GDS_NUMERIC_OUT_OF_RANGE: i32 = 335544916;
+
+/// isc_expression_eval_err - "expression evaluation not supported"
+/// (SQLSTATE 42000), the wrapper a system-function domain error carries.
+const GDS_EXPRESSION_EVAL_ERR: i32 = 335544606;
+/// sysf_argmustbe_nonneg - "Argument for @1 must be zero or positive" (SQRT)
+const GDS_SYSF_ARG_NONNEG: i32 = 335544967;
+/// sysf_argmustbe_positive - "Argument for @1 must be positive" (LN / LOG)
+const GDS_SYSF_ARG_POSITIVE: i32 = 335544960;
+/// sysf_basemustbe_positive - "Base for @1 must be positive" (LOG base)
+const GDS_SYSF_BASE_POSITIVE: i32 = 335544961;
+/// sysf_argmustbe_nonzero - "Argument for @1 must be different than zero" (COT)
+const GDS_SYSF_ARG_NONZERO: i32 = 335544976;
+/// sysf_argmustbe_range_inc1_1 - "Argument for @1 must be in the range
+/// [-1, 1]" (ASIN / ACOS)
+const GDS_SYSF_ARG_RANGE11: i32 = 335544977;
+/// sysf_invalid_zeropowneg - "Base for @1 cannot be zero if exponent is
+/// negative" (POWER)
+const GDS_SYSF_ZEROPOWNEG: i32 = 335544964;
+/// sysf_invalid_negpowfp - "Base for @1 cannot be negative if exponent is
+/// not an integral value" (POWER)
+const GDS_SYSF_NEGPOWFP: i32 = 335544965;
 
 /// isc_bad_substring_length - "Invalid length parameter @1 to SUBSTRING.
 /// Negative integers are not allowed." (SQLSTATE 22011, msg/jrd.h:534);
@@ -38331,6 +38363,22 @@ fn eval_status_items(w: &mut W, e: &EvalErr) {
                 .int(GDS_ARITH_EXCEPT)
                 .int(1) // isc_arg_gds - numeric value is out of range
                 .int(GDS_NUMERIC_OUT_OF_RANGE);
+        }
+        EvalErr::MathDomain { func, code } => {
+            w.int(1) // isc_arg_gds - expression evaluation not supported
+                .int(GDS_EXPRESSION_EVAL_ERR)
+                .int(1) // isc_arg_gds - "Argument for @1 must be ..."
+                .int(*code)
+                .int(2) // isc_arg_string - @1 = the function name
+                .bytes(func.as_bytes());
+        }
+        EvalErr::MathOverflow { func } => {
+            w.int(1) // isc_arg_gds - arithmetic exception, ...
+                .int(GDS_ARITH_EXCEPT)
+                .int(1) // isc_arg_gds - "Floating point overflow in ... @1"
+                .int(GDS_SYSF_FP_OVERFLOW)
+                .int(2) // isc_arg_string - @1 = the function name
+                .bytes(func.as_bytes());
         }
         EvalErr::ReadOnlyDatabase { dsql } => {
             if *dsql {
@@ -41552,6 +41600,26 @@ enum SysFn {
     /// HASH(s) - the engine's default WEAK 64-bit hash of the value's
     /// bytes (an ELF-style rolling hash), a BIGINT.
     Hash,
+    /// the DOUBLE-valued math functions - the operand(s) fold to f64 and
+    /// the result is DOUBLE PRECISION.
+    Sqrt,
+    Power,
+    Ln,
+    Log10,
+    Exp,
+    Pi,
+    Log,
+    Sin,
+    Cos,
+    Tan,
+    Cot,
+    Asin,
+    Acos,
+    Atan,
+    Atan2,
+    Sinh,
+    Cosh,
+    Tanh,
     Lpad,
     Rpad,
     /// `DATEADD(<n> <unit> TO <t>)` / `DATEADD(<unit>, <n>, <t>)` -
@@ -41648,6 +41716,24 @@ impl SysFn {
             SysFn::BinShr => "BIN_SHR",
             SysFn::AsciiVal => "ASCII_VAL",
             SysFn::Hash => "HASH",
+            SysFn::Sqrt => "SQRT",
+            SysFn::Power => "POWER",
+            SysFn::Ln => "LN",
+            SysFn::Log10 => "LOG10",
+            SysFn::Exp => "EXP",
+            SysFn::Pi => "PI",
+            SysFn::Log => "LOG",
+            SysFn::Sin => "SIN",
+            SysFn::Cos => "COS",
+            SysFn::Tan => "TAN",
+            SysFn::Cot => "COT",
+            SysFn::Asin => "ASIN",
+            SysFn::Acos => "ACOS",
+            SysFn::Atan => "ATAN",
+            SysFn::Atan2 => "ATAN2",
+            SysFn::Sinh => "SINH",
+            SysFn::Cosh => "COSH",
+            SysFn::Tanh => "TANH",
             SysFn::Lpad => "LPAD",
             SysFn::Rpad => "RPAD",
             SysFn::Extract(_) => "EXTRACT",
@@ -43023,6 +43109,24 @@ fn sysfn_named(word: &str) -> Option<SysFn> {
         "BIN_SHR" => SysFn::BinShr,
         "ASCII_VAL" => SysFn::AsciiVal,
         "HASH" => SysFn::Hash,
+        "SQRT" => SysFn::Sqrt,
+        "POWER" => SysFn::Power,
+        "LN" => SysFn::Ln,
+        "LOG10" => SysFn::Log10,
+        "EXP" => SysFn::Exp,
+        "PI" => SysFn::Pi,
+        "LOG" => SysFn::Log,
+        "SIN" => SysFn::Sin,
+        "COS" => SysFn::Cos,
+        "TAN" => SysFn::Tan,
+        "COT" => SysFn::Cot,
+        "ASIN" => SysFn::Asin,
+        "ACOS" => SysFn::Acos,
+        "ATAN" => SysFn::Atan,
+        "ATAN2" => SysFn::Atan2,
+        "SINH" => SysFn::Sinh,
+        "COSH" => SysFn::Cosh,
+        "TANH" => SysFn::Tanh,
         "LPAD" => SysFn::Lpad,
         "RPAD" => SysFn::Rpad,
         // the part in the variant is a placeholder for the NAME check;
@@ -43215,14 +43319,20 @@ fn parse_sysfn_call(up: &str, b: &[char], pos: &mut usize) -> Option<RawExpr> {
         }
         return Some(RawExpr::Func(SysFn::Position, args));
     }
-    // the comma-argument functions, arity checked
-    let mut args = vec![expr_add(b, pos)?];
-    while {
-        skip_ws(b, pos);
-        b.get(*pos) == Some(&',')
-    } {
-        *pos += 1;
+    // the comma-argument functions, arity checked. A niladic call - PI() -
+    // has an EMPTY argument list, so the first argument is only parsed when
+    // the parens are not immediately closed.
+    skip_ws(b, pos);
+    let mut args: Vec<RawExpr> = Vec::new();
+    if b.get(*pos) != Some(&')') {
         args.push(expr_add(b, pos)?);
+        while {
+            skip_ws(b, pos);
+            b.get(*pos) == Some(&',')
+        } {
+            *pos += 1;
+            args.push(expr_add(b, pos)?);
+        }
     }
     let (min, max) = match f {
         SysFn::GetContext => (2, 2),
@@ -43241,7 +43351,11 @@ fn parse_sysfn_call(up: &str, b: &[char], pos: &mut usize) -> Option<RawExpr> {
         | SysFn::Abs
         | SysFn::Sign => (1, 1),
         SysFn::Left | SysFn::Right | SysFn::Mod | SysFn::BinShl | SysFn::BinShr => (2, 2),
-        SysFn::BinNot | SysFn::AsciiVal | SysFn::Hash => (1, 1),
+        SysFn::BinNot | SysFn::AsciiVal | SysFn::Hash | SysFn::Sqrt | SysFn::Ln | SysFn::Log10 | SysFn::Exp
+        | SysFn::Sin | SysFn::Cos | SysFn::Tan | SysFn::Cot | SysFn::Asin | SysFn::Acos | SysFn::Atan
+        | SysFn::Sinh | SysFn::Cosh | SysFn::Tanh => (1, 1),
+        SysFn::Power | SysFn::Log | SysFn::Atan2 => (2, 2),
+        SysFn::Pi => (0, 0),
         SysFn::BinAnd | SysFn::BinOr | SysFn::BinXor => (2, usize::MAX),
         SysFn::Replace => (3, 3),
         SysFn::Lpad | SysFn::Rpad => (2, 3),
@@ -44177,6 +44291,14 @@ enum ArithOp {
 /// server would.
 #[derive(Debug, Clone, PartialEq)]
 enum EvalErr {
+    /// a DOUBLE math function whose operand left its domain (SQRT of a
+    /// negative, LN of <= 0, ...): `isc_expression_eval_err` +
+    /// the specific `sysf_argmustbe_*` message, whose `@1` is the function
+    /// name. `code` is the second vector item.
+    MathDomain { func: &'static str, code: i32 },
+    /// an infinite std-math result (SINH / COSH past the f64 range): the
+    /// engine's "Floating point overflow in built-in function @1"
+    MathOverflow { func: &'static str },
     /// integer divide by zero: `isc_arith_except` /
     /// `isc_exception_integer_divide_by_zero`
     DivideByZero,
@@ -45804,6 +45926,50 @@ fn fn_text(v: &Value) -> String {
 /// `h = (h << 4) + byte`, then the top nibble `n` (bits 60..63) is folded
 /// down by `h ^= n >> 56` (arithmetic shift) and cleared (`h &= ~n`). The
 /// shift/add wrap the way the engine's SINT64 arithmetic does.
+/// Fold a numeric operand to f64 for the DOUBLE math functions: an
+/// approximate value passes straight through, an exact numeric goes through
+/// `exact_to_f64` (raw / 10^scale). A non-numeric refuses.
+fn fn_f64(v: &Value) -> Result<f64, EvalErr> {
+    if let Some(d) = approx_of(v) {
+        return Ok(d);
+    }
+    // a TEXT operand: the engine converts it to double by its numeric
+    // grammar (SQRT('4') answers 2.0), and raises 22018 with the raw
+    // string when the text is not a number (SQRT('abc'))
+    if let Value::Text(s) = v {
+        return text_number(s)
+            .and_then(|n| text_to_approx(n, s))
+            .ok_or_else(|| EvalErr::ConversionError(Some(s.clone())));
+    }
+    let (raw, scale) = numeric_parts(v).ok_or(EvalErr::ConversionError(None))?;
+    Ok(exact_to_f64(raw, scale as i32))
+}
+
+/// Wrap a DOUBLE-precision math result: the engine's evlStdMath / evlExp /
+/// evlPower all check `isinf(rc)` after the libm call and raise
+/// `arith_except << exception_float_overflow` (SQLSTATE 22003) rather than
+/// answer an IEEE infinity - so EXP / POWER / SINH / COSH past the f64 range
+/// fail the way they do live. Functions that cannot overflow from a finite
+/// operand never trip the check.
+fn fin_dbl(x: f64) -> Result<Value, EvalErr> {
+    if x.is_infinite() {
+        Err(EvalErr::FloatOverflow)
+    } else {
+        Ok(Value::Double(x))
+    }
+}
+
+/// As [fin_dbl], but the std-math family (SINH / COSH) names the function
+/// in its overflow: "Floating point overflow in built-in function @1"
+/// (SQLSTATE 42000), distinct from EXP / POWER's plain float_overflow.
+fn fin_dbl_named(x: f64, func: &'static str) -> Result<Value, EvalErr> {
+    if x.is_infinite() {
+        Err(EvalErr::MathOverflow { func })
+    } else {
+        Ok(Value::Double(x))
+    }
+}
+
 fn weak_hash(data: &[u8]) -> i64 {
     let mut h: i64 = 0;
     for &b in data {
@@ -46220,6 +46386,44 @@ impl Expr {
                     SysFn::Hash => {
                         if ts[0] == ExprType::Text {
                             Some(ExprType::Int)
+                        } else {
+                            None
+                        }
+                    }
+                    // the DOUBLE math functions: PI takes no operand; the
+                    // rest fold NUMERIC/INTEGER/DOUBLE operands to f64 and
+                    // answer DOUBLE. A text operand refuses.
+                    SysFn::Pi => Some(ExprType::Approx),
+                    SysFn::Sqrt
+                    | SysFn::Power
+                    | SysFn::Ln
+                    | SysFn::Log10
+                    | SysFn::Exp
+                    | SysFn::Log
+                    | SysFn::Sin
+                    | SysFn::Cos
+                    | SysFn::Tan
+                    | SysFn::Cot
+                    | SysFn::Asin
+                    | SysFn::Acos
+                    | SysFn::Atan
+                    | SysFn::Atan2
+                    | SysFn::Sinh
+                    | SysFn::Cosh
+                    | SysFn::Tanh => {
+                        // the engine describes DOUBLE for a numeric OR a text
+                        // operand (a text operand string-converts to double at
+                        // run time, or raises 22018) - so Text is admitted
+                        if ts.iter().all(|t| {
+                            matches!(
+                                t,
+                                ExprType::Int
+                                    | ExprType::Numeric
+                                    | ExprType::Approx
+                                    | ExprType::Text
+                            )
+                        }) {
+                            Some(ExprType::Approx)
                         } else {
                             None
                         }
@@ -47466,6 +47670,130 @@ impl Expr {
                     // HASH(s): the engine's WeakHashContext over the string
                     // bytes (Hash.cpp) - a 64-bit ELF-style rolling hash.
                     SysFn::Hash => Value::Int(weak_hash(fn_text(&vs[0]).as_bytes())),
+                    // the DOUBLE math functions: each operand folds to f64
+                    // (fn_f64) and the libm result is announced DOUBLE. Rust
+                    // f64 shares the platform libm with the engine, so the
+                    // bits match.
+                    SysFn::Pi => Value::Double(std::f64::consts::PI),
+                    SysFn::Sqrt => {
+                        let x = fn_f64(&vs[0])?;
+                        if x < 0.0 {
+                            return Err(EvalErr::MathDomain {
+                                func: "SQRT",
+                                code: GDS_SYSF_ARG_NONNEG,
+                            });
+                        }
+                        Value::Double(x.sqrt())
+                    }
+                    SysFn::Ln => {
+                        let x = fn_f64(&vs[0])?;
+                        if x <= 0.0 {
+                            return Err(EvalErr::MathDomain {
+                                func: "LN",
+                                code: GDS_SYSF_ARG_POSITIVE,
+                            });
+                        }
+                        Value::Double(x.ln())
+                    }
+                    SysFn::Log10 => {
+                        let x = fn_f64(&vs[0])?;
+                        if x <= 0.0 {
+                            return Err(EvalErr::MathDomain {
+                                func: "LOG10",
+                                code: GDS_SYSF_ARG_POSITIVE,
+                            });
+                        }
+                        Value::Double(x.log10())
+                    }
+                    SysFn::Exp => fin_dbl(fn_f64(&vs[0])?.exp())?,
+                    SysFn::Power => {
+                        let base = fn_f64(&vs[0])?;
+                        let exp = fn_f64(&vs[1])?;
+                        // evlPower's two domain refusals, before the libm
+                        // call: a zero base with a negative exponent, and a
+                        // negative base with a non-integral exponent. The
+                        // engine treats an APPROXIMATE exponent as
+                        // non-integral (!isExact()), so a negative base with
+                        // a DOUBLE/FLOAT exponent refuses even when its value
+                        // is whole - mirrored by keying on the Value type.
+                        if base == 0.0 && exp < 0.0 {
+                            return Err(EvalErr::MathDomain {
+                                func: "POWER",
+                                code: GDS_SYSF_ZEROPOWNEG,
+                            });
+                        }
+                        let exp_exact = matches!(
+                            vs[1],
+                            Value::Int(_) | Value::Scaled(..) | Value::Int128(..)
+                        );
+                        if base < 0.0 && (!exp_exact || exp.fract() != 0.0) {
+                            return Err(EvalErr::MathDomain {
+                                func: "POWER",
+                                code: GDS_SYSF_NEGPOWFP,
+                            });
+                        }
+                        fin_dbl(base.powf(exp))?
+                    }
+                    SysFn::Log => {
+                        // LOG(base, value) = ln(value) / ln(base). The base
+                        // is checked first (the engine reports the base
+                        // before the value), then the value.
+                        let base = fn_f64(&vs[0])?;
+                        if base <= 0.0 {
+                            return Err(EvalErr::MathDomain {
+                                func: "LOG",
+                                code: GDS_SYSF_BASE_POSITIVE,
+                            });
+                        }
+                        let x = fn_f64(&vs[1])?;
+                        if x <= 0.0 {
+                            return Err(EvalErr::MathDomain {
+                                func: "LOG",
+                                code: GDS_SYSF_ARG_POSITIVE,
+                            });
+                        }
+                        Value::Double(x.log(base))
+                    }
+                    SysFn::Sin => Value::Double(fn_f64(&vs[0])?.sin()),
+                    SysFn::Cos => Value::Double(fn_f64(&vs[0])?.cos()),
+                    SysFn::Tan => Value::Double(fn_f64(&vs[0])?.tan()),
+                    SysFn::Cot => {
+                        let x = fn_f64(&vs[0])?;
+                        if x == 0.0 {
+                            return Err(EvalErr::MathDomain {
+                                func: "COT",
+                                code: GDS_SYSF_ARG_NONZERO,
+                            });
+                        }
+                        Value::Double(1.0 / x.tan())
+                    }
+                    SysFn::Asin => {
+                        let x = fn_f64(&vs[0])?;
+                        if !(-1.0..=1.0).contains(&x) {
+                            return Err(EvalErr::MathDomain {
+                                func: "ASIN",
+                                code: GDS_SYSF_ARG_RANGE11,
+                            });
+                        }
+                        Value::Double(x.asin())
+                    }
+                    SysFn::Acos => {
+                        let x = fn_f64(&vs[0])?;
+                        if !(-1.0..=1.0).contains(&x) {
+                            return Err(EvalErr::MathDomain {
+                                func: "ACOS",
+                                code: GDS_SYSF_ARG_RANGE11,
+                            });
+                        }
+                        Value::Double(x.acos())
+                    }
+                    SysFn::Atan => Value::Double(fn_f64(&vs[0])?.atan()),
+                    SysFn::Atan2 => {
+                        Value::Double(fn_f64(&vs[0])?.atan2(fn_f64(&vs[1])?))
+                    }
+                    SysFn::Sinh => fin_dbl_named(fn_f64(&vs[0])?.sinh(), "SINH")?,
+                    SysFn::Cosh => fin_dbl_named(fn_f64(&vs[0])?.cosh(), "COSH")?,
+                    SysFn::Tanh => Value::Double(fn_f64(&vs[0])?.tanh()),
                     SysFn::Lpad | SysFn::Rpad => {
                         let pad = vs.get(2).map(fn_text).unwrap_or_else(|| " ".into());
                         Value::Text(pad_impl(
@@ -57762,6 +58090,23 @@ fn expr_no_raise(e: &Expr, descs: &[Descriptor]) -> bool {
                 // ASCII_VAL never raises; ASCII_CHAR raises 22003 unless its
                 // operand is a literal visibly within 0..255
                 SysFn::AsciiVal | SysFn::Hash => true,
+                // PI never raises; the other DOUBLE math functions can leave
+                // their domain (SQRT of a negative, LN of <= 0, ...) - defer
+                // to the per-row eval rather than fold at prepare
+                SysFn::Pi => true,
+                SysFn::Sqrt | SysFn::Power | SysFn::Ln | SysFn::Log10 | SysFn::Exp => false,
+                SysFn::Log
+                | SysFn::Sin
+                | SysFn::Cos
+                | SysFn::Tan
+                | SysFn::Cot
+                | SysFn::Asin
+                | SysFn::Acos
+                | SysFn::Atan
+                | SysFn::Atan2
+                | SysFn::Sinh
+                | SysFn::Cosh
+                | SysFn::Tanh => false,
             }
         }
     }
