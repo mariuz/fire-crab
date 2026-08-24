@@ -13071,6 +13071,14 @@ enum InsVal {
     /// 11/23). A DEFAULT-valued column is therefore LISTED but not
     /// NAMED: it behaves exactly like an omitted column.
     Default,
+    /// the temporal values a VALUES item can carry: a `DATE '...'` /
+    /// `TIME '...'` / `TIMESTAMP '...'` literal, `CURRENT_DATE` and its
+    /// clock siblings (resolved at plan time, like the query side), or a
+    /// `CAST('...' AS <temporal>)` folded to its constant. Encoded by
+    /// the existing WireParam::Date/Time/Timestamp arms.
+    Date(i32),
+    Time(u32),
+    Timestamp(i32, u32),
 }
 
 /// The `OVERRIDING` clause of an INSERT, as written. Its meaning is the
@@ -20901,6 +20909,41 @@ fn plan_insert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
                 {
                     InsVal::GenId(name.trim_matches('"').to_string(), Some(*n))
                 }
+                // a TEMPORAL value: a DATE/TIME/TIMESTAMP literal,
+                // CURRENT_DATE and its clock siblings, or a CAST of a
+                // string to a temporal target - each one Tok::FnExpr the
+                // tokenizer already built. Resolved with no columns (all
+                // are constants; the clocks bind at plan time, the query
+                // side's own rule) and folded; a non-temporal constant
+                // keeps today's refusal.
+                [Tok::FnExpr(r)] => {
+                    match resolve_expr(r, &[], &[]).and_then(|e| e.eval(&[]).ok()) {
+                        Some(Value::Date(d)) => InsVal::Date(d),
+                        Some(Value::Time(t)) => InsVal::Time(t),
+                        Some(Value::Timestamp(d, t)) => InsVal::Timestamp(d, t),
+                        // a constant fold that answers NULL stores NULL -
+                        // CAST(NULL AS DATE), a CASE with no matching arm
+                        // (probed; review-caught)
+                        Some(Value::Null) => InsVal::Null,
+                        // CURRENT_TIME / CURRENT_TIMESTAMP answer WITH
+                        // TIME ZONE values; landing in a zone-less column
+                        // they become the SESSION-local time - and the
+                        // only TZ values reaching a VALUES list are those
+                        // clocks, whose zone IS the session's, so the
+                        // value's own displacement converts exactly
+                        Some(Value::TimeTz(utc, zone)) => match tz_local_time(utc, zone) {
+                            Some(t) => InsVal::Time(t),
+                            None => return None,
+                        },
+                        Some(Value::TimestampTz(dd, utc, zone)) => {
+                            match tz_local_timestamp(dd, utc, zone) {
+                                Some((d, t)) => InsVal::Timestamp(d, t),
+                                None => return None,
+                            }
+                        }
+                        _ => return None,
+                    }
+                }
                 _ => return None,
             });
         }
@@ -21316,6 +21359,12 @@ fn encode_set_value(d: &Descriptor, v: &InsVal) -> Option<Option<Vec<u8>>> {
         InsVal::Str(text) => WireParam::Text(text.clone()),
         InsVal::Octets(b) => WireParam::Text(String::from_utf8_lossy(b).into_owned()),
         InsVal::Bool(b) => WireParam::Bool(*b),
+        // the temporals ride their existing WireParam arms (a TIMESTAMP
+        // truncates into a DATE/TIME column, a DATE is midnight of a
+        // TIMESTAMP one, a TIME lands dated today - all probed)
+        InsVal::Date(dd) => WireParam::Date(*dd),
+        InsVal::Time(tt) => WireParam::Time(*tt),
+        InsVal::Timestamp(dd, tt) => WireParam::Timestamp(*dd, *tt),
         // parameters bind, generators advance, at execute - not here.
         // DEFAULT never reaches an encoder at all: plan_insert drops a
         // DEFAULT-valued column out of the image targets so the column
@@ -22349,6 +22398,25 @@ fn encode_wire_value(d: &Descriptor, wp: &WireParam) -> Option<Option<Vec<u8>>> 
                         .to_le_bytes()
                         .to_vec(),
                 ),
+                // a TEXT value into a temporal column: the engine's string
+                // coercion - the full CVT grammar, specials included
+                // (probed: '15-JAN-2020', '5.6.2020', 'TODAY', 'now' all
+                // store; '2020-02-30' and a five-digit fraction are its
+                // 22018, which this None answers with fc's generic INSERT
+                // conversion vector, the same shape 'abc' into an INTEGER
+                // already has)
+                dtype::SQL_DATE => Some(
+                    cvt_text_temporal(text, ExpectTemporal::Date)?.0.to_le_bytes().to_vec(),
+                ),
+                dtype::SQL_TIME => Some(
+                    cvt_text_temporal(text, ExpectTemporal::Time)?.1.to_le_bytes().to_vec(),
+                ),
+                dtype::TIMESTAMP => {
+                    let (dd, tt) = cvt_text_temporal(text, ExpectTemporal::Timestamp)?;
+                    let mut out = dd.to_le_bytes().to_vec();
+                    out.extend_from_slice(&tt.to_le_bytes());
+                    Some(out)
+                }
                 _ => return None,
             }
         }
@@ -22374,6 +22442,14 @@ fn encode_wire_value(d: &Descriptor, wp: &WireParam) -> Option<Option<Vec<u8>>> 
             }
             dtype::SQL_DATE => dd.to_le_bytes().to_vec(),
             dtype::SQL_TIME => tt.to_le_bytes().to_vec(),
+            // a temporal into a TEXT column renders (probed: the engine
+            // stores the value's own text form)
+            dtype::TEXT | dtype::VARYING => text_bytes_for(
+                &Value::Timestamp(*dd, *tt).render(),
+                fire_crab_ods::intl::CS_UTF8,
+                d,
+                flen,
+            )?,
             _ => return None,
         }),
         WireParam::Date(dd) => Some(match d.dtype {
@@ -22384,10 +22460,29 @@ fn encode_wire_value(d: &Descriptor, wp: &WireParam) -> Option<Option<Vec<u8>>> 
                 out.extend_from_slice(&0u32.to_le_bytes());
                 out
             }
+            dtype::TEXT | dtype::VARYING => text_bytes_for(
+                &Value::Date(*dd).render(),
+                fire_crab_ods::intl::CS_UTF8,
+                d,
+                flen,
+            )?,
             _ => return None,
         }),
         WireParam::Time(tt) => Some(match d.dtype {
             dtype::SQL_TIME => tt.to_le_bytes().to_vec(),
+            // time -> timestamp takes the CURRENT date (probed: a TIME
+            // literal lands in a TIMESTAMP column dated today)
+            dtype::TIMESTAMP => {
+                let mut out = now_date_time().0.to_le_bytes().to_vec();
+                out.extend_from_slice(&tt.to_le_bytes());
+                out
+            }
+            dtype::TEXT | dtype::VARYING => text_bytes_for(
+                &Value::Time(*tt).render(),
+                fire_crab_ods::intl::CS_UTF8,
+                d,
+                flen,
+            )?,
             _ => return None,
         }),
         WireParam::Bool(v) => Some(match d.dtype {
@@ -24960,6 +25055,27 @@ fn execute_dml_collecting_inner(
                             Value::Date(d) => WireParam::Date(*d),
                             Value::Time(t) => WireParam::Time(*t),
                             Value::Timestamp(d, t) => WireParam::Timestamp(*d, *t),
+                            // the WITH TIME ZONE clocks (CURRENT_TIME /
+                            // CURRENT_TIMESTAMP) land in a zone-less
+                            // column as the session-local time - their
+                            // zone IS the session's, so the value's own
+                            // displacement converts exactly
+                            Value::TimeTz(utc, zone) => match tz_local_time(*utc, *zone) {
+                                Some(t) => WireParam::Time(t),
+                                None => {
+                                    return Err("expression type cannot be stored".into())
+                                }
+                            },
+                            Value::TimestampTz(dd, utc, zone) => {
+                                match tz_local_timestamp(*dd, *utc, *zone) {
+                                    Some((d, t)) => WireParam::Timestamp(d, t),
+                                    None => {
+                                        return Err(
+                                            "expression type cannot be stored".into()
+                                        )
+                                    }
+                                }
+                            }
                             Value::Int128(r, sc) => match i64::try_from(*r) {
                                 Ok(n) => WireParam::Int(n, *sc),
                                 Err(_) => {
@@ -43745,8 +43861,10 @@ fn expr_atom(b: &[char], pos: &mut usize) -> Option<RawExpr> {
                 } else if word.eq_ignore_ascii_case("TIME") {
                     Some(RawExpr::TimeLit(parse_time_lit(&text)?))
                 } else {
-                    let (ds, ts) = text.trim().split_once(' ')?;
-                    Some(RawExpr::TsLit(parse_date_lit(ds)?, parse_time_lit(ts.trim())?))
+                    // the whole string through the grammar - a month name
+                    // carries spaces inside the date part
+                    let (d, t) = parse_ts_lit(&text)?;
+                    Some(RawExpr::TsLit(d, t))
                 }
             } else if !quoted && word.eq_ignore_ascii_case("TRUE") {
                 Some(RawExpr::Bool(true))
@@ -46920,51 +47038,336 @@ fn datediff_impl(
 
 /// Parse `yyyy-mm-dd` into an MJD day number. ISO form only - the
 /// engine accepts more spellings; anything else refuses at parse.
-fn parse_date_lit(s: &str) -> Option<i32> {
-    let parts: Vec<&str> = s.trim().split('-').collect();
-    if parts.len() != 3 {
-        return None;
-    }
-    let y: i32 = parts[0].parse().ok()?;
-    let m: u32 = parts[1].parse().ok()?;
-    let d: u32 = parts[2].parse().ok()?;
-    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
-        return None;
-    }
-    // round-trip to reject impossible dates (Feb 30)
-    let days = days_of_civil(y, m, d);
-    if civil_of(days) != (y, m, d) {
-        return None;
-    }
-    Some(days)
+/// What CVT_string_to_datetime is asked to produce.
+#[derive(Clone, Copy, PartialEq)]
+enum ExpectTemporal {
+    Date,
+    Time,
+    Timestamp,
 }
 
-/// Parse `hh:mm[:ss[.ffff]]` into 1/10000-second units since midnight.
-fn parse_time_lit(s: &str) -> Option<u32> {
-    let parts: Vec<&str> = s.trim().split(':').collect();
-    if parts.len() < 2 || parts.len() > 3 {
-        return None;
-    }
-    let h: u32 = parts[0].parse().ok()?;
-    let m: u32 = parts[1].parse().ok()?;
-    let (sec, frac) = match parts.get(2) {
-        None => (0u32, 0u32),
-        Some(sp) => match sp.split_once('.') {
-            None => (sp.parse().ok()?, 0),
-            Some((sw, fw)) => {
-                if fw.is_empty() || fw.len() > 4 || !fw.bytes().all(|b| b.is_ascii_digit()) {
-                    return None;
-                }
-                // pad the written fraction to 4 digits of 1/10000 s
-                let f: u32 = fw.parse().ok()?;
-                (sw.parse().ok()?, f * 10u32.pow(4 - fw.len() as u32))
+const CVT_MONTHS: [&str; 12] = [
+    "JANUARY", "FEBRUARY", "MARCH", "APRIL", "MAY", "JUNE", "JULY", "AUGUST", "SEPTEMBER",
+    "OCTOBER", "NOVEMBER", "DECEMBER",
+];
+
+/// The engine's arbitrary-string-to-datetime grammar
+/// (CVT_string_to_datetime, cvt.cpp:677), ported arm for arm and pinned
+/// against measured vectors: the three date components in any order
+/// decided by the first token's shape (4+ digits leads YMD, a leading
+/// English month M-D-Y, a middle one D-M-Y, a `.` separator D-M-Y, else
+/// the US M-D-Y); one CONSISTENT separator from `/ - .` or whitespace;
+/// month names by >=3-letter prefix in the first two positions only;
+/// 2-digit years slid into the nearest 50-year window and a missing year
+/// defaulting to the current one; the specials NOW / TODAY / TOMORROW /
+/// YESTERDAY (whole-string, case-insensitive - only where
+/// `allow_special`, and only NOW for a TIME); times as HH:MM[:SS[.ffff]]
+/// (minutes REQUIRED, the fraction at most 4 digits, `.` after minutes
+/// jumping straight to the fraction); a DATE refuses any time portion;
+/// impossible dates caught by round-trip (29-Feb-1995); years 1..9999.
+/// A trailing TIMEZONE the engine would parse is REFUSED here (recorded
+/// boundary - fc keeps no zone database on this path). `now` is the
+/// clock for the specials and the year default. None = the engine's
+/// 22018.
+fn string_to_datetime(
+    s: &str,
+    expect: ExpectTemporal,
+    now: (i32, u32),
+    allow_special: bool,
+) -> Option<(i32, u32)> {
+    let b = s.as_bytes();
+    let end = b.len();
+    let mut p = 0usize;
+
+    // component i: 0 Year, 1 Month, 2 Day, 3 Hours, 4 Minutes, 5 Seconds,
+    // 6 Thou. description[i]: digits counted, -1 an English month, 0 missing.
+    let mut components = [0u32; 7];
+    let mut description = [0i32; 7];
+    let start = if expect == ExpectTemporal::Time { 3 } else { 0 };
+    let mut have_english_month = false;
+    let mut date_sep: u8 = 0;
+
+    let mut i = start;
+    while i < 7 {
+        while p < end && (b[p] == b' ' || b[p] == b'\t') {
+            p += 1;
+        }
+        if p == end {
+            break;
+        }
+        let c = b[p].to_ascii_uppercase();
+        let n: u32;
+        if c.is_ascii_digit() {
+            let mut v: u32 = 0;
+            let mut precision = 0i32;
+            while p < end && b[p].is_ascii_digit() {
+                // the engine folds into a USHORT; the precision checks
+                // below refuse an overlong run before the wrap can matter
+                v = (v.wrapping_mul(10)).wrapping_add((b[p] - b'0') as u32) & 0xFFFF;
+                p += 1;
+                precision += 1;
             }
-        },
-    };
-    if h > 23 || m > 59 || sec > 59 {
+            description[i] = precision;
+            n = v;
+        } else if c.is_ascii_uppercase() && !have_english_month && i - start < 2 {
+            // collect up to sizeof(YESTERDAY) letters
+            let mut temp = String::new();
+            while p < end && temp.len() < 10 {
+                let c = b[p].to_ascii_uppercase();
+                if !c.is_ascii_uppercase() {
+                    break;
+                }
+                temp.push(c as char);
+                p += 1;
+            }
+            // at least 3 characters for a month name
+            if temp.len() < 3 {
+                return None;
+            }
+            // month names are only allowed in the first two positions
+            let month = if i < 2 {
+                CVT_MONTHS.iter().position(|m| m.starts_with(&temp))
+            } else {
+                None
+            };
+            match month {
+                Some(mi) => {
+                    description[i] = -1;
+                    have_english_month = true;
+                    n = mi as u32 + 1;
+                }
+                None => {
+                    // a special date verb: the WHOLE string, first position.
+                    // The engine's tail scan pre-increments past the char
+                    // that ENDED the letter run (cvt.cpp `while (++p <
+                    // end)`), so exactly ONE junk character rides free -
+                    // 'TODAY.' and 'NOW.  ' convert, 'TODAY..' and
+                    // 'NOW .' refuse (probed; review-caught)
+                    if !allow_special || i != start {
+                        return None;
+                    }
+                    p += 1;
+                    while p < end {
+                        if b[p] != b' ' && b[p] != b'\t' && b[p] != 0 {
+                            return None;
+                        }
+                        p += 1;
+                    }
+                    let (nd, nt) = now;
+                    if temp == "NOW" {
+                        return Some((nd, nt));
+                    }
+                    if expect == ExpectTemporal::Time {
+                        return None;
+                    }
+                    return match temp.as_str() {
+                        "TODAY" => Some((nd, 0)),
+                        "TOMORROW" => Some((nd + 1, 0)),
+                        "YESTERDAY" => Some((nd - 1, 0)),
+                        _ => None,
+                    };
+                }
+            }
+        } else {
+            // a non-digit, non-letter start: after a timestamp's date the
+            // engine reads a TIMEZONE here; fc refuses it below (boundary)
+            if expect == ExpectTemporal::Date || i != 3 {
+                return None;
+            }
+            break;
+        }
+        components[i] = n;
+
+        let mut had_space = false;
+        while p < end && (b[p] == b' ' || b[p] == b'\t') {
+            p += 1;
+            had_space = true;
+        }
+        if p == end {
+            i += 1; // this component was read
+            break;
+        }
+
+        if i <= 1 {
+            // the FIRST separator fixes the family; a mismatch refuses
+            let mut advanced = false;
+            if date_sep == 0
+                || (date_sep != b' ' && b[p] == date_sep)
+                || (date_sep == b' ' && had_space)
+            {
+                if date_sep != b' ' && matches!(b[p], b'/' | b'-' | b'.') {
+                    date_sep = b[p];
+                    p += 1;
+                    advanced = true;
+                } else if had_space {
+                    date_sep = b' ';
+                    advanced = true;
+                }
+            }
+            if !advanced {
+                return None;
+            }
+        } else if i == 2 {
+            // day to hours: the whitespace already skipped is the separator
+        } else if (3..=5).contains(&i) {
+            if b[p] == b':' {
+                p += 1;
+            } else if b[p] == b'.' {
+                p += 1;
+                i = 5; // the next component is 6, the fraction
+            } else {
+                i = 7;
+                break;
+            }
+        } else if i == 6 {
+            i += 1;
+            break;
+        }
+        i += 1;
+    }
+
+    // at least two components
+    if (i as i32) - (start as i32) - 1 < 1 {
         return None;
     }
-    Some(((h * 3600 + m * 60 + sec) * 10_000) + frac)
+    let last = i - 1; // the last component read
+    // dates cannot have a time portion
+    if expect == ExpectTemporal::Date && last > 2 {
+        return None;
+    }
+    // no random trash after the recognized string (a trailing timezone
+    // the engine would accept refuses here too - the recorded boundary)
+    while p < end {
+        if b[p] != b' ' && b[p] != b'\t' && b[p] != 0 {
+            return None;
+        }
+        p += 1;
+    }
+
+    let date_days: i32;
+    if expect != ExpectTemporal::Time {
+        // figure out what format the user typed the date in
+        let (py, pm, pd) = if description[0] >= 3 {
+            (0usize, 1usize, 2usize)
+        } else if description[0] == -1 {
+            (2, 0, 1)
+        } else if description[1] == -1 {
+            (2, 1, 0)
+        } else if date_sep == b'.' {
+            (2, 1, 0)
+        } else {
+            (2, 0, 1)
+        };
+        if description[py] > 4
+            || description[pm] > 2
+            || description[pm] == 0
+            || description[pd] > 2
+            || description[pd] <= 0
+        {
+            return None;
+        }
+        let mut year = components[py] as i32;
+        let month = components[pm];
+        let day = components[pd];
+        let (cur_y, _, _) = civil_of(now.0);
+        if description[py] == 0 {
+            year = cur_y;
+        } else if description[py] <= 2 {
+            // 2-digit years slide into the nearest 50-year window
+            let tm_year = cur_y - 1900;
+            if year < (tm_year - 50).rem_euclid(100) {
+                year += 2000;
+            } else {
+                year += 1900;
+            }
+        }
+        // round-trip to reject impossible dates (Feb 30, month 13), and
+        // the engine's own year range
+        if !(1..=12).contains(&month) || day == 0 || !(1..=9999).contains(&year) {
+            return None;
+        }
+        date_days = days_of_civil(year, month, day);
+        if civil_of(date_days) != (year, month, day) {
+            return None;
+        }
+    } else {
+        date_days = 0;
+    }
+
+    let mut time_units: u32 = 0;
+    if last > 2 {
+        let h = components[3];
+        let m = components[4];
+        let sec = components[5];
+        if h > 23
+            || m > 59
+            || sec > 59
+            || description[3] > 2
+            || description[3] == 0
+            || description[4] > 2
+            || description[4] == 0
+            || description[5] > 2
+            || description[6] > 4
+        {
+            return None;
+        }
+        let mut thou = components[6];
+        let mut d6 = description[6];
+        while d6 < 4 {
+            thou *= 10;
+            d6 += 1;
+        }
+        time_units = ((h * 60 + m) * 60 + sec) * 10000 + thou;
+    } else if expect == ExpectTemporal::Time {
+        return None;
+    }
+
+    Some((date_days, time_units))
+}
+
+/// A DATE literal's text - the full engine grammar WITHOUT the specials
+/// (probed: `DATE 'TODAY'` is the engine's 22018, `DATE '15-JAN-2020'`
+/// and `DATE '7-8'` are dates).
+fn parse_date_lit(s: &str) -> Option<i32> {
+    string_to_datetime(s, ExpectTemporal::Date, now_date_time(), false).map(|(d, _)| d)
+}
+
+/// A TIME literal's text - `hh:mm[:ss[.ffff]]`, no specials.
+fn parse_time_lit(s: &str) -> Option<u32> {
+    string_to_datetime(s, ExpectTemporal::Time, now_date_time(), false).map(|(_, t)| t)
+}
+
+/// A TIMESTAMP literal's text - the WHOLE string through the grammar
+/// (an English month name carries spaces inside the date), a date-only
+/// string at midnight, no specials.
+fn parse_ts_lit(s: &str) -> Option<(i32, u32)> {
+    string_to_datetime(s, ExpectTemporal::Timestamp, now_date_time(), false)
+}
+
+/// The engine's string COERCION into a temporal - CAST from text, a text
+/// literal against a temporal column, a string VALUE landing in a
+/// temporal column: the full grammar WITH the specials (probed:
+/// `WHERE D = 'TODAY'` matches, `INSERT ... VALUES ('now')` stores).
+fn cvt_text_temporal(s: &str, expect: ExpectTemporal) -> Option<(i32, u32)> {
+    string_to_datetime(s, expect, now_date_time(), true)
+}
+
+/// A TIME WITH TIME ZONE value's LOCAL wall time in its own zone - what
+/// the WITH TIME ZONE clocks store into a zone-less TIME column (their
+/// zone is the session's, so this is the engine's session-local
+/// conversion exactly). None for a zone without displacement rules.
+fn tz_local_time(utc: u32, zone: u16) -> Option<u32> {
+    const DAY_UNITS: i64 = 24 * 60 * 60 * 10_000;
+    let disp = fire_crab_ods::tz::displacement(zone)?;
+    Some((utc as i64 + disp as i64 * 600_000).rem_euclid(DAY_UNITS) as u32)
+}
+
+/// The TIMESTAMP twin, with the day carry.
+fn tz_local_timestamp(date: i32, utc: u32, zone: u16) -> Option<(i32, u32)> {
+    const DAY_UNITS: i64 = 24 * 60 * 60 * 10_000;
+    let disp = fire_crab_ods::tz::displacement(zone)?;
+    let t = utc as i64 + disp as i64 * 600_000;
+    Some(((date as i64 + t.div_euclid(DAY_UNITS)) as i32, t.rem_euclid(DAY_UNITS) as u32))
 }
 
 /// A function argument as text - the engine's CVT string coercion:
@@ -48493,25 +48896,26 @@ impl Expr {
                             }
                             (TKind::Timestamp, Value::Date(d)) => Value::Timestamp(*d, 0),
                             (_, Value::Text(t)) => {
+                                // the engine's string coercion: the full
+                                // CVT grammar, specials included (probed:
+                                // CAST('NOW' AS TIME), CAST('TODAY' AS
+                                // DATE), CAST('15-JAN-2020' AS DATE); a
+                                // date-only string is a midnight timestamp)
                                 let parse = || -> Option<Value> {
                                     Some(match k {
-                                        TKind::Date => Value::Date(parse_date_lit(t)?),
-                                        TKind::Time => Value::Time(parse_time_lit(t)?),
+                                        TKind::Date => Value::Date(
+                                            cvt_text_temporal(t, ExpectTemporal::Date)?.0,
+                                        ),
+                                        TKind::Time => Value::Time(
+                                            cvt_text_temporal(t, ExpectTemporal::Time)?.1,
+                                        ),
                                         TKind::TimeTz | TKind::TimestampTz => return None,
                                         TKind::Timestamp => {
-                                            // a date-only string is midnight, as
-                                            // for a DATE value cast up (probed:
-                                            // CAST('2020-06-15' AS TIMESTAMP) is
-                                            // that date at time 0)
-                                            match t.trim().split_once(' ') {
-                                                Some((ds, ts)) => Value::Timestamp(
-                                                    parse_date_lit(ds)?,
-                                                    parse_time_lit(ts.trim())?,
-                                                ),
-                                                None => {
-                                                    Value::Timestamp(parse_date_lit(t.trim())?, 0)
-                                                }
-                                            }
+                                            let (d, tm) = cvt_text_temporal(
+                                                t,
+                                                ExpectTemporal::Timestamp,
+                                            )?;
+                                            Value::Timestamp(d, tm)
                                         }
                                     })
                                 };
@@ -56028,6 +56432,19 @@ fn psql_literal(v: &Value) -> Option<String> {
         // '' doubles inside a SQL string literal
         Value::Text(t) => format!("'{}'", t.replace('\'', "''")),
         Value::Bool(b) => (if *b { "TRUE" } else { "FALSE" }).to_string(),
+        // a temporal value re-renders as its TYPED literal - the exact
+        // value survives the round trip (the render is the parse
+        // grammar's ISO form), which is what carries temporal columns
+        // through INSERT ... SELECT's per-row re-render and a PSQL
+        // variable's fold
+        Value::Date(_) | Value::Time(_) | Value::Timestamp(..) => {
+            let kw = match v {
+                Value::Date(_) => "DATE",
+                Value::Time(_) => "TIME",
+                _ => "TIMESTAMP",
+            };
+            format!("{} '{}'", kw, v.render())
+        }
         _ => return None,
     })
 }
@@ -59240,13 +59657,21 @@ fn cmp_sides(lhs: Expr, rhs: Expr, descs: &[Descriptor]) -> Option<(Expr, Expr)>
     let (lt, rt) = (lhs.type_of(descs)?, rhs.type_of(descs)?);
     let coerce = |k: TKind, e: &Expr| -> Option<Expr> {
         match e {
+            // the engine's string coercion against a temporal side: the
+            // full CVT grammar, specials included (probed: `WHERE D =
+            // 'TODAY'` matches, `WHERE D = '15-JAN-2020'` matches, a
+            // date-only string against a TIMESTAMP is midnight)
             Expr::Str(s) => Some(match k {
-                TKind::Date => Expr::DateLit(parse_date_lit(s)?),
-                TKind::Time => Expr::TimeLit(parse_time_lit(s)?),
+                TKind::Date => {
+                    Expr::DateLit(cvt_text_temporal(s, ExpectTemporal::Date)?.0)
+                }
+                TKind::Time => {
+                    Expr::TimeLit(cvt_text_temporal(s, ExpectTemporal::Time)?.1)
+                }
                 TKind::TimeTz | TKind::TimestampTz => return None,
                 TKind::Timestamp => {
-                    let (d, t) = s.trim().split_once(' ')?;
-                    Expr::TsLit(parse_date_lit(d)?, parse_time_lit(t.trim())?)
+                    let (d, t) = cvt_text_temporal(s, ExpectTemporal::Timestamp)?;
+                    Expr::TsLit(d, t)
                 }
             }),
             _ => None,
@@ -70728,12 +71153,15 @@ mod tests {
         assert_eq!(iso_week_of(d_1999_01_01), 53); // of 1998
         assert_eq!(iso_week_of(d_2001_09_09), 36);
 
-        // literal parsing: ISO forms only, impossible dates refused,
-        // written fractions pad to 1/10000 s
+        // literal parsing: the full engine grammar (dotted forms are
+        // D.M.Y - 29.02.2024 is the same leap day), impossible dates
+        // refused, written fractions pad to 1/10000 s
         assert_eq!(parse_date_lit("2024-02-29"), Some(d_2024_02_29));
         assert_eq!(parse_date_lit("2024-02-30"), None);
         assert_eq!(parse_date_lit("2024-13-01"), None);
-        assert_eq!(parse_date_lit("29.02.2024"), None);
+        assert_eq!(parse_date_lit("29.02.2024"), Some(d_2024_02_29));
+        assert_eq!(parse_date_lit("29-FEB-2024"), Some(d_2024_02_29));
+        assert_eq!(parse_date_lit("TODAY"), None); // a literal takes no specials
         assert_eq!(parse_time_lit("14:35:12.3456"), Some(((14 * 3600 + 35 * 60 + 12) * 10_000 + 3456)));
         assert_eq!(parse_time_lit("14:35"), Some((14 * 3600 + 35 * 60) * 10_000));
         assert_eq!(parse_time_lit("00:00:00.5"), Some(5000)); // .5 pads to 5000
@@ -75058,6 +75486,82 @@ mod tests {
         let (_, t) =
             parse_agg_item("LIST(DISTINCT S) FILTER (WHERE ID > 2)").expect("distinct filtered");
         assert!(matches!(t, AggTarget::List { distinct: true, .. }));
+    }
+
+    #[test]
+    fn cvt_string_to_datetime_measured_vectors() {
+        use ExpectTemporal::*;
+        // a fixed clock: 2026-08-24 12:00 - the probe session's, so the
+        // specials, 2-digit windows and year defaults are deterministic
+        let now = (days_of_civil(2026, 8, 24), 12 * 3600 * 10000);
+        let d = days_of_civil;
+        let date = |s: &str| string_to_datetime(s, Date, now, true);
+        let time = |s: &str| string_to_datetime(s, Time, now, true);
+        let ts = |s: &str| string_to_datetime(s, Timestamp, now, true);
+        // ISO, blanks, month-name prefixes and positions
+        assert_eq!(date("2020-01-15"), Some((d(2020, 1, 15), 0)));
+        assert_eq!(date("  2020-01-15  "), Some((d(2020, 1, 15), 0)));
+        assert_eq!(date("15-JAN-2020"), Some((d(2020, 1, 15), 0)));
+        assert_eq!(date("JAN 15 2020"), Some((d(2020, 1, 15), 0)));
+        assert_eq!(date("JANU 15 2020"), Some((d(2020, 1, 15), 0)));
+        assert_eq!(date("15 JANUARY 2020"), Some((d(2020, 1, 15), 0)));
+        assert_eq!(date("15.JAN.2020"), Some((d(2020, 1, 15), 0)));
+        assert_eq!(date("JAX 15 2020"), None);
+        // separators fix the family; `.` reads D.M.Y, default is M-D-Y
+        assert_eq!(date("2020/03/04"), Some((d(2020, 3, 4), 0)));
+        assert_eq!(date("03/04/2020"), Some((d(2020, 3, 4), 0)));
+        assert_eq!(date("5.6.2020"), Some((d(2020, 6, 5), 0)));
+        assert_eq!(date("2020.01.15"), Some((d(2020, 1, 15), 0)));
+        assert_eq!(date("5/6.2020"), None);
+        assert_eq!(date("15,JAN,2020"), None);
+        // 2-digit years slide, a missing year is the current one
+        assert_eq!(date("5-6-96"), Some((d(1996, 5, 6), 0)));
+        assert_eq!(date("5-6-45"), Some((d(2045, 5, 6), 0)));
+        assert_eq!(date("7-8"), Some((d(2026, 7, 8), 0)));
+        assert_eq!(date("1-2-100"), Some((d(100, 1, 2), 0)));
+        // range and leap validation, junk, a lone component
+        assert_eq!(date("9999-12-31"), Some((d(9999, 12, 31), 0)));
+        assert_eq!(date("10000-01-01"), None);
+        assert_eq!(date("2020-02-30"), None);
+        assert_eq!(date("2019-02-29"), None);
+        assert_eq!(date("nonsense"), None);
+        assert_eq!(date("2020"), None);
+        assert_eq!(date("2020-01-15 10:00"), None); // a DATE takes no time
+        // specials: whole-string, case-insensitive, never for a TIME
+        assert_eq!(date("TODAY"), Some((d(2026, 8, 24), 0)));
+        assert_eq!(date("tomorrow"), Some((d(2026, 8, 25), 0)));
+        assert_eq!(date("Yesterday"), Some((d(2026, 8, 23), 0)));
+        assert_eq!(date("now"), Some((d(2026, 8, 24), 12 * 3600 * 10000)));
+        assert_eq!(time("TODAY"), None);
+        assert_eq!(time("NOW"), Some((d(2026, 8, 24), 12 * 3600 * 10000)));
+        // the engine's tail scan skips ONE character after the verb
+        assert_eq!(date("TODAY."), Some((d(2026, 8, 24), 0)));
+        assert_eq!(date("NOW.  "), Some((d(2026, 8, 24), 12 * 3600 * 10000)));
+        assert_eq!(date("NOW ."), None);
+        assert_eq!(date("TODAY.."), None);
+        assert_eq!(date("TODAYX"), None);
+        assert_eq!(
+            string_to_datetime("TODAY", Date, now, false),
+            None,
+            "a typed literal takes no specials"
+        );
+        // times: minutes required, fractions cap at 4 digits and pad
+        assert_eq!(time("7:08"), Some((0, (7 * 60 + 8) * 60 * 10000)));
+        assert_eq!(time("12:34:56.78901"), None);
+        assert_eq!(time("7:8:9.12"), Some((0, (7 * 3600 + 8 * 60 + 9) * 10000 + 1200)));
+        assert_eq!(time("25:00"), None);
+        assert_eq!(time("12:60"), None);
+        assert_eq!(time("7"), None);
+        // timestamps: a date-only string is midnight; an hour needs minutes
+        assert_eq!(ts("2020-01-15"), Some((d(2020, 1, 15), 0)));
+        assert_eq!(
+            ts("2020-01-15 12:34:56.7890"),
+            Some((d(2020, 1, 15), (12 * 3600 + 34 * 60 + 56) * 10000 + 7890))
+        );
+        assert_eq!(ts("2020-1-5 7"), None);
+        assert_eq!(ts("2020-1-5 7:00"), Some((d(2020, 1, 5), 7 * 3600 * 10000)));
+        // a trailing zone the engine parses: refused here (boundary)
+        assert_eq!(ts("2020-01-15 10:00 America/New_York"), None);
     }
 
     #[test]

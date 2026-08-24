@@ -186,7 +186,23 @@ pub fn displacement(zone: u16) -> Option<i32> {
     } else if zone == 65535 {
         Some(0) // GMT
     } else {
-        None
+        // the UTC-equivalent NAMED zones: their displacement is 0 by
+        // definition, no tzdata rules needed (the fixed Etc/GMT+N
+        // offsets ride along - tzdata's sign convention is INVERTED,
+        // Etc/GMT+5 is UTC-5)
+        match zone_text(zone).as_str() {
+            "UTC" | "UCT" | "Universal" | "Zulu" | "GMT" | "GMT0" | "GMT+0" | "GMT-0"
+            | "Greenwich" | "Etc/UTC" | "Etc/UCT" | "Etc/Universal" | "Etc/Zulu"
+            | "Etc/GMT" | "Etc/GMT0" | "Etc/GMT+0" | "Etc/GMT-0" | "Etc/Greenwich" => Some(0),
+            n => match n.strip_prefix("Etc/GMT+") {
+                Some(h) => h.parse::<i32>().ok().filter(|h| *h <= 12).map(|h| -h * 60),
+                None => n
+                    .strip_prefix("Etc/GMT-")
+                    .and_then(|h| h.parse::<i32>().ok())
+                    .filter(|h| *h <= 14)
+                    .map(|h| h * 60),
+            },
+        }
     }
 }
 
