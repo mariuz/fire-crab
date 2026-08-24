@@ -256,6 +256,60 @@ A*1.5`). Boundary: an intermediate that overflows i64 raises 22003
 overflow" (both 22003) — fc's i128 numeric model, consistent with the
 server's own `numeric_bin`.
 
+**Temporal values in DML - and the engine's WHOLE string-to-datetime
+grammar - DONE (2026-08-24, `serve-real-temporaldml` 16):** until this
+slice fire-crab could not put a DATE/TIME/TIMESTAMP value into a column
+through its own wire in ANY form - typed literal, string, CAST,
+CURRENT_DATE, every one refused, and every temporal fixture had to be
+engine-built - while its text-to-temporal conversion knew ISO forms only.
+The encoder side had been complete all along (WireParam::Date/Time/
+Timestamp, record encode, index keys, wire parameters, column defaults);
+the holes were the two DML literal parsers and the grammar. Now: INSERT
+... VALUES takes temporal literals, strings, folded CAST constants, the
+clocks (CURRENT_DATE, and CURRENT_TIME / CURRENT_TIMESTAMP - WITH TIME
+ZONE values landing session-local through the zone's own displacement)
+and LOCALTIME / LOCALTIMESTAMP, via new InsVal variants and a VALUES arm
+that resolves a constant expression and accepts a temporal result; UPDATE
+SET's string tier converts through the same encoder arm and its
+expression tier gained the TZ clocks; INSERT ... SELECT carries temporal
+columns (its per-row re-render now spells them as typed literals, value
+exact); and `string_to_datetime` is CVT_string_to_datetime (cvt.cpp:677)
+ported arm for arm - the three date components in any order decided by
+the first token's shape (a 4-digit lead Y-M-D, a leading English month
+M-D-Y, a middle one D-M-Y, a `.` separator D-M-Y, else M-D-Y), one
+CONSISTENT separator from `/ - .` or whitespace, month names by
+>=3-letter prefix, 2-digit years slid into the 50-year window, a missing
+year defaulting to the current one, the specials NOW / TODAY / TOMORROW /
+YESTERDAY (string coercion only - a typed literal refuses them, probed),
+minutes-required times with at most 4 fraction digits, impossible dates
+by round-trip, years 1..9999 - pinned by a 60-assertion unit battery of
+measured vectors and shared by every consumer: DML strings, CAST from
+text, and a text literal against a temporal column in a WHERE (so
+`WHERE D = 'TODAY'` and `WHERE D = '15-JAN-2020'` now match, and a
+date-only string compares against a TIMESTAMP as midnight). The
+cross-type lattice is the engine's: TIMESTAMP truncates into DATE/TIME, a
+DATE is midnight of a TIMESTAMP, a TIME lands dated TODAY (a new encode
+arm); TIME-into-DATE and DATE-into-TIME refuse. `tz::displacement`
+learned the UTC-family named zones (Etc/UTC = 0) and the fixed Etc/GMT+N
+offsets (tzdata's inverted sign), which is what lets the session-zone
+clocks convert - and un-bracketed TZ rendering ride along. Boundaries
+(recorded): a bad string refuses with fc's GENERIC vector at INSERT where
+the engine spells 22018 with the string (the shape every fc INSERT
+conversion has - 'abc' into an INTEGER is the same; the CAST path is
+typed); a trailing TIMEZONE in a string refuses where the engine converts
+it (and junk after a fraction draws the engine's 22009 invalid-zone, fc's
+22018); TIME/TIMESTAMP WITH TIME ZONE columns still take no DML values;
+`DEFAULT DATE '...'` on a column refuses at CREATE TABLE (the string and
+CURRENT_DATE default forms work and fill value-exact) and its BLR remains
+undecodable at INSERT; a PSQL BODY's own INSERT of a temporal (an
+EXECUTE BLOCK or procedure statement, literal or variable) refuses - the
+body statement parser is the second parser the column-less-INSERT note
+already records - all pre-existing. The clocks FOLD AT PLAN (the
+query side's own model - CURRENT_DATE resolves to a literal): a PREPARED
+INSERT re-executed across midnight keeps its plan-time clock where the
+engine reads the clock per execute - the same recorded shape fc's
+SELECT CURRENT_DATE already has under the statement cache.
+
 **The LIST aggregate - and the first COMPUTED BLOB - DONE (2026-08-24,
 `serve-real-list` 33):** `LIST([DISTINCT] arg [, separator])`, the
 string-concatenation aggregate whose result is a TEXT BLOB the server itself
