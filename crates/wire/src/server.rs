@@ -12242,6 +12242,24 @@ fn result_width_bytes(e: &Expr, descs: &[Descriptor]) -> u8 {
             .chain(els.iter().map(|x| result_width_bytes(x, descs)))
             .max()
             .unwrap_or(8),
+        // a literal NULL operand: makeCeilFloor / makeRound / makeTrunc all
+        // answer INTEGER (makeLong) for it, whatever the function
+        Expr::Func(SysFn::Ceil | SysFn::Ceiling | SysFn::Floor | SysFn::Round | SysFn::Trunc, args)
+            if matches!(args.first(), Some(Expr::Null)) =>
+        {
+            4
+        }
+        // CEIL / FLOOR promote the operand's storage width one dtype step
+        // (SHORT->INTEGER, LONG/INT64->BIGINT, INT128 stays), the way
+        // makeCeilFloor does; ROUND / TRUNC KEEP the operand's width.
+        Expr::Func(SysFn::Ceil | SysFn::Ceiling | SysFn::Floor, args) => {
+            match result_width_bytes(&args[0], descs) {
+                2 => 4,
+                4 => 8,
+                w => w,
+            }
+        }
+        Expr::Func(SysFn::Round | SysFn::Trunc, args) => result_width_bytes(&args[0], descs),
         _ => {
             if e.is_wide(descs) {
                 16
@@ -12284,6 +12302,10 @@ fn numeric_subtype(e: &Expr, descs: &[Descriptor]) -> i16 {
         Expr::Coalesce(v) => v.iter().map(|x| numeric_subtype(x, descs)).max().unwrap_or(0),
         Expr::NullIf(a, b) => numeric_subtype(a, descs).max(numeric_subtype(b, descs)),
         Expr::Iif(_, a, b) => numeric_subtype(a, descs).max(numeric_subtype(b, descs)),
+        // ROUND / TRUNC copy the operand descriptor, its sub_type included
+        // (makeRound / makeTrunc `*result = *value`); CEIL / FLOOR drop it
+        // to 0 (makeLong / makeInt64), which is the default below.
+        Expr::Func(SysFn::Round | SysFn::Trunc, args) => numeric_subtype(&args[0], descs),
         _ => 0,
     }
 }
@@ -41620,6 +41642,11 @@ enum SysFn {
     Sinh,
     Cosh,
     Tanh,
+    Ceil,
+    Ceiling,
+    Floor,
+    Round,
+    Trunc,
     Lpad,
     Rpad,
     /// `DATEADD(<n> <unit> TO <t>)` / `DATEADD(<unit>, <n>, <t>)` -
@@ -41734,6 +41761,11 @@ impl SysFn {
             SysFn::Sinh => "SINH",
             SysFn::Cosh => "COSH",
             SysFn::Tanh => "TANH",
+            SysFn::Ceil => "CEIL",
+            SysFn::Ceiling => "CEILING",
+            SysFn::Floor => "FLOOR",
+            SysFn::Round => "ROUND",
+            SysFn::Trunc => "TRUNC",
             SysFn::Lpad => "LPAD",
             SysFn::Rpad => "RPAD",
             SysFn::Extract(_) => "EXTRACT",
@@ -43127,6 +43159,11 @@ fn sysfn_named(word: &str) -> Option<SysFn> {
         "SINH" => SysFn::Sinh,
         "COSH" => SysFn::Cosh,
         "TANH" => SysFn::Tanh,
+        "CEIL" => SysFn::Ceil,
+        "CEILING" => SysFn::Ceiling,
+        "FLOOR" => SysFn::Floor,
+        "ROUND" => SysFn::Round,
+        "TRUNC" => SysFn::Trunc,
         "LPAD" => SysFn::Lpad,
         "RPAD" => SysFn::Rpad,
         // the part in the variant is a placeholder for the NAME check;
@@ -43354,6 +43391,8 @@ fn parse_sysfn_call(up: &str, b: &[char], pos: &mut usize) -> Option<RawExpr> {
         SysFn::BinNot | SysFn::AsciiVal | SysFn::Hash | SysFn::Sqrt | SysFn::Ln | SysFn::Log10 | SysFn::Exp
         | SysFn::Sin | SysFn::Cos | SysFn::Tan | SysFn::Cot | SysFn::Asin | SysFn::Acos | SysFn::Atan
         | SysFn::Sinh | SysFn::Cosh | SysFn::Tanh => (1, 1),
+        SysFn::Ceil | SysFn::Ceiling | SysFn::Floor => (1, 1),
+        SysFn::Round | SysFn::Trunc => (1, 2),
         SysFn::Power | SysFn::Log | SysFn::Atan2 => (2, 2),
         SysFn::Pi => (0, 0),
         SysFn::BinAnd | SysFn::BinOr | SysFn::BinXor => (2, usize::MAX),
@@ -45970,6 +46009,91 @@ fn fin_dbl_named(x: f64, func: &'static str) -> Result<Value, EvalErr> {
     }
 }
 
+/// The four exact-rounding modes (CEIL / FLOOR / ROUND / TRUNC).
+#[derive(Clone, Copy, PartialEq)]
+enum RndMode {
+    Ceil,
+    Floor,
+    Round,
+    Trunc,
+}
+
+/// The places argument of ROUND/TRUNC, converted the way the engine's
+/// `MOV_get_long(scaleDsc, 0)` does - a fractional value rounds (2.7 -> 3);
+/// an absent argument means 0 (round/truncate to a whole number).
+fn round_places(nv: Option<&Value>) -> Result<i32, EvalErr> {
+    match nv {
+        None => Ok(0),
+        Some(v) => Ok(fn_f64(v)?.round() as i32),
+    }
+}
+
+/// ROUND of an APPROXIMATE operand: the engine's `CVT_get_int64` converts
+/// the double to an integer at scale `s` by `d * 10^-s`, adding `0.5 + eps`
+/// with the sign and truncating (eps = 1e-14 for double, 1e-5 for float -
+/// the fudge that recovers 1.005 -> 1.01 from its 1.00499.. binary form);
+/// the DOUBLE-typed result is that scaled integer converted back.
+fn round_double(mut d: f64, s: i32, eps: f64) -> Result<Value, EvalErr> {
+    if s > 0 {
+        d /= 10f64.powi(s);
+    } else if s < 0 {
+        d *= 10f64.powi(-s);
+    }
+    if d > 0.0 {
+        d += 0.5 + eps;
+    } else {
+        d -= 0.5 + eps;
+    }
+    if !d.is_finite() || d < i64::MIN as f64 || d >= 9.223372036854776e18 {
+        return Err(EvalErr::NumericOutOfRange);
+    }
+    Ok(Value::Double(exact_to_f64(d as i64 as i128, s)))
+}
+
+/// TRUNC of an APPROXIMATE operand: the engine's evlTrunc stays in the f64
+/// domain via `modf` - toward zero at `places` decimals (a negative
+/// `places` truncates whole tens/hundreds).
+fn trunc_double(d: f64, places: i32) -> Value {
+    let rs = -places;
+    let out = if rs > 0 {
+        let v = 10f64.powi(rs);
+        (d / v).trunc() * v
+    } else {
+        let ip = d.trunc();
+        if rs != 0 {
+            let v = 10f64.powi(-rs);
+            ip + ((d - ip) * v).trunc() / v
+        } else {
+            ip
+        }
+    };
+    Value::Double(out)
+}
+
+/// Round `raw / div` to an integer under `mode`: CEIL toward +inf, FLOOR
+/// toward -inf, TRUNC toward zero, ROUND half-away-from-zero (the engine's
+/// rule - ROUND(2.5)=3, ROUND(-2.5)=-3). Returns the adjusted quotient; the
+/// caller multiplies back by `div` for a two-argument ROUND/TRUNC that keeps
+/// the operand scale, or uses it directly (scale 0) for the one-argument
+/// integer form.
+fn rounded_q(raw: i128, div: i128, mode: RndMode) -> i128 {
+    let q = raw / div;
+    let r = raw % div;
+    match mode {
+        RndMode::Trunc => q,
+        RndMode::Ceil => q + i128::from(r > 0),
+        RndMode::Floor => q - i128::from(r < 0),
+        RndMode::Round => {
+            let half = r.unsigned_abs() * 2 >= div.unsigned_abs();
+            q + if half {
+                if raw < 0 { -1 } else { 1 }
+            } else {
+                0
+            }
+        }
+    }
+}
+
 fn weak_hash(data: &[u8]) -> i64 {
     let mut h: i64 = 0;
     for &b in data {
@@ -46451,6 +46575,43 @@ impl Expr {
                         ExprType::Approx => Some(ExprType::Approx),
                         ExprType::Text | ExprType::Temporal(_) | ExprType::Bool => None,
                     },
+                    // the EXACT-rounding family. An exact operand answers an
+                    // exact numeric (typed Numeric here; result_scale /
+                    // result_width_bytes / numeric_subtype carry the precise
+                    // form the engine derives from the operand). An
+                    // APPROXIMATE operand answers DOUBLE. CEIL / FLOOR / TRUNC
+                    // also string-convert a TEXT operand to DOUBLE
+                    // (CEIL('3.2') = 4.0); ROUND REFUSES a text operand. A
+                    // DECFLOAT / INT128 operand, which the engine computes in
+                    // the decimal128 domain, fc declines. A 2nd argument
+                    // (decimal places) may be any number - the engine's
+                    // MOV_get_long rounds it to a whole count.
+                    SysFn::Ceil | SysFn::Ceiling | SysFn::Floor | SysFn::Trunc => match ts[0] {
+                        ExprType::Int | ExprType::Numeric => Some(ExprType::Numeric),
+                        ExprType::Approx | ExprType::Text => Some(ExprType::Approx),
+                        _ => None,
+                    }
+                    .filter(|_| {
+                        ts.get(1).map_or(true, |t| {
+                            matches!(
+                                t,
+                                ExprType::Int | ExprType::Numeric | ExprType::Approx
+                            )
+                        })
+                    }),
+                    SysFn::Round => match ts[0] {
+                        ExprType::Int | ExprType::Numeric => Some(ExprType::Numeric),
+                        ExprType::Approx => Some(ExprType::Approx),
+                        _ => None,
+                    }
+                    .filter(|_| {
+                        ts.get(1).map_or(true, |t| {
+                            matches!(
+                                t,
+                                ExprType::Int | ExprType::Numeric | ExprType::Approx
+                            )
+                        })
+                    }),
                 }
             }
         }
@@ -46541,6 +46702,19 @@ impl Expr {
             Expr::Func(SysFn::Extract(ExtractPart::Second), _) => Some(-4),
             Expr::Func(SysFn::Extract(ExtractPart::Millisecond), _) => Some(-1),
             Expr::Func(SysFn::DateDiff(ExtractPart::Millisecond), _) => Some(-1),
+            // CEIL / FLOOR and the ONE-argument ROUND / TRUNC answer scale 0;
+            // a TWO-argument ROUND / TRUNC keeps the operand scale (the value
+            // rounds to n places but is stored at the operand's own scale -
+            // makeRound leaves dsc_scale untouched when argc > 1).
+            Expr::Func(SysFn::Ceil | SysFn::Ceiling | SysFn::Floor, _) => Some(0),
+            // a null-operand ROUND/TRUNC also collapses to INTEGER scale 0
+            Expr::Func(SysFn::Round | SysFn::Trunc, args) => {
+                if args.len() == 2 && !matches!(args.first(), Some(Expr::Null)) {
+                    args.first()?.result_scale(descs)
+                } else {
+                    Some(0)
+                }
+            }
             _ => None,
         }
     }
@@ -46684,6 +46858,15 @@ impl Expr {
                 | SysFn::AsciiVal
                 | SysFn::Extract(_) => Some(NumRank::Long),
                 SysFn::BlobOctetLength | SysFn::Hash => Some(NumRank::I64),
+                // the exact-rounding family ranks by its RESULT width (which
+                // matches the describe): CEIL/FLOOR promote, ROUND/TRUNC keep
+                SysFn::Ceil | SysFn::Ceiling | SysFn::Floor | SysFn::Round | SysFn::Trunc => {
+                    Some(match result_width_bytes(self, descs) {
+                        n if n <= 4 => NumRank::Long,
+                        8 => NumRank::I64,
+                        _ => NumRank::I128,
+                    })
+                }
                 _ => None, // the text-valued functions
             },
             Expr::Str(_)
@@ -47794,6 +47977,77 @@ impl Expr {
                     SysFn::Sinh => fin_dbl_named(fn_f64(&vs[0])?.sinh(), "SINH")?,
                     SysFn::Cosh => fin_dbl_named(fn_f64(&vs[0])?.cosh(), "COSH")?,
                     SysFn::Tanh => Value::Double(fn_f64(&vs[0])?.tanh()),
+                    // the EXACT-rounding family. An APPROXIMATE (or, for
+                    // CEIL/FLOOR/TRUNC, a text-converted) operand computes in
+                    // f64 and answers DOUBLE; an EXACT operand computes in
+                    // i128 and keeps the exact result form the describe
+                    // announced (CEIL/FLOOR/1-arg ROUND/TRUNC -> scale 0;
+                    // 2-arg ROUND/TRUNC -> the operand scale, rounded to n
+                    // places). ROUND half-away-from-zero, TRUNC toward zero.
+                    SysFn::Ceil | SysFn::Ceiling | SysFn::Floor | SysFn::Round | SysFn::Trunc => {
+                        let mode = match f {
+                            SysFn::Ceil => RndMode::Ceil,
+                            SysFn::Ceiling => RndMode::Ceil,
+                            SysFn::Floor => RndMode::Floor,
+                            SysFn::Round => RndMode::Round,
+                            _ => RndMode::Trunc,
+                        };
+                        let v = &vs[0];
+                        if matches!(v, Value::Double(_) | Value::Float(_) | Value::Text(_)) {
+                            // an approximate (or text-converted) operand: CEIL
+                            // / FLOOR are exact on the double, ROUND / TRUNC
+                            // follow the engine's evlRound / evlTrunc
+                            let x = fn_f64(v)?;
+                            match mode {
+                                RndMode::Ceil => Value::Double(x.ceil()),
+                                RndMode::Floor => Value::Double(x.floor()),
+                                RndMode::Round => {
+                                    let places = round_places(vs.get(1))?;
+                                    let eps = if matches!(v, Value::Float(_)) {
+                                        1e-5
+                                    } else {
+                                        1e-14
+                                    };
+                                    round_double(x, -places, eps)?
+                                }
+                                RndMode::Trunc => {
+                                    trunc_double(x, round_places(vs.get(1))?)
+                                }
+                            }
+                        } else {
+                            let (raw, scale) =
+                                numeric_parts(v).ok_or(EvalErr::ConversionError(None))?;
+                            let (rraw, rscale) = if vs.len() > 1 {
+                                // 2-arg: keep the operand scale, round n places
+                                let n = round_places(vs.get(1))?;
+                                let drop = (-(scale as i32)) - n;
+                                if drop <= 0 {
+                                    (raw, scale)
+                                } else {
+                                    let div = pow10_i128(drop as u32)
+                                        .ok_or(EvalErr::NumericOutOfRange)?;
+                                    (rounded_q(raw, div, mode) * div, scale)
+                                }
+                            } else {
+                                // 1-arg: to an integer (scale 0)
+                                let div = if scale < 0 {
+                                    pow10_i128((-scale) as u32)
+                                        .ok_or(EvalErr::NumericOutOfRange)?
+                                } else {
+                                    1
+                                };
+                                (rounded_q(raw, div, mode), 0)
+                            };
+                            // ROUND/TRUNC keep the operand width; a round-up
+                            // past that width is the engine's numeric overflow
+                            // (not the integer-overflow the encoder would raise
+                            // packing an i128 into the narrower slot)
+                            if !matches!(v, Value::Int128(..)) && i64::try_from(rraw).is_err() {
+                                return Err(EvalErr::NumericOutOfRange);
+                            }
+                            scaled_value(rraw, rscale)
+                        }
+                    }
                     SysFn::Lpad | SysFn::Rpad => {
                         let pad = vs.get(2).map(fn_text).unwrap_or_else(|| " ".into());
                         Value::Text(pad_impl(
@@ -58107,6 +58361,7 @@ fn expr_no_raise(e: &Expr, descs: &[Descriptor]) -> bool {
                 | SysFn::Sinh
                 | SysFn::Cosh
                 | SysFn::Tanh => false,
+                SysFn::Ceil | SysFn::Ceiling | SysFn::Floor | SysFn::Round | SysFn::Trunc => false,
             }
         }
     }
