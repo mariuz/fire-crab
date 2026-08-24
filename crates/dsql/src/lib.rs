@@ -4434,6 +4434,27 @@ fn param_default_source(p: &mut P) -> Option<String> {
             p.i += 1;
             "NULL".to_string()
         }
+        // a session / clock CONTEXT default keyword - captured verbatim
+        // (uppercased); the server stores the engine's keyword BLR and
+        // resolves it per call. Kept in step with the server's
+        // ctx_default_blr / eval_ctx_default: the forms it can fill.
+        Tok::Ident(w)
+            if !neg
+                && matches!(
+                    w.to_ascii_uppercase().as_str(),
+                    "CURRENT_USER"
+                        | "USER"
+                        | "CURRENT_ROLE"
+                        | "CURRENT_CONNECTION"
+                        | "CURRENT_DATE"
+                        | "CURRENT_TIME"
+                        | "CURRENT_TIMESTAMP"
+                ) =>
+        {
+            let s = w.to_ascii_uppercase();
+            p.i += 1;
+            s
+        }
         _ => return None,
     };
     Some(src)

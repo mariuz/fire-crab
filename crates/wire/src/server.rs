@@ -17271,10 +17271,27 @@ fn plain_function_arities(db: &Option<Database>) -> Vec<(String, usize, usize)> 
     }
 }
 
+/// The engine's keyword BLR for a session/clock CONTEXT default, but ONLY
+/// the forms `eval_ctx_default` can resolve at a call - the login, role,
+/// connection id and the clock. CURRENT_TRANSACTION (whose id this fill
+/// cannot reach) and the precision-carrying LOCAL* forms are left out, so a
+/// parameter default fc stores is always one it can also fill (no
+/// create-then-call split).
+fn ctx_default_blr(lit: &str) -> Option<Vec<u8>> {
+    match lit.trim().to_ascii_uppercase().as_str() {
+        "CURRENT_USER" | "USER" | "CURRENT_ROLE" | "CURRENT_CONNECTION"
+        | "CURRENT_DATE" | "CURRENT_TIME" | "CURRENT_TIMESTAMP" => {
+            fire_crab_ods::ddl::keyword_default_blr(lit)
+        }
+        _ => None,
+    }
+}
+
 /// Turn a parameter's DEFAULT source (`DEFAULT 5`, `= 7`, `DEFAULT 'x'`,
-/// `DEFAULT NULL`) into the stored (RDB$DEFAULT_VALUE BLR, RDB$DEFAULT_SOURCE)
-/// pair, reusing the same literal-default BLR helpers a column default uses.
-/// The source is stored verbatim (the engine keeps the `DEFAULT` / `=` form).
+/// `DEFAULT NULL`, `DEFAULT CURRENT_USER`) into the stored (RDB$DEFAULT_VALUE
+/// BLR, RDB$DEFAULT_SOURCE) pair, reusing the same BLR helpers a column
+/// default uses. The source is stored verbatim (the engine keeps the
+/// `DEFAULT` / `=` form).
 fn proc_default_of(src: &str) -> Option<(Vec<u8>, String)> {
     let lit = src
         .strip_prefix("DEFAULT")
@@ -17284,6 +17301,10 @@ fn proc_default_of(src: &str) -> Option<(Vec<u8>, String)> {
         fire_crab_ods::ddl::str_default_blr(&parse_string_literal(lit)?)
     } else if lit.eq_ignore_ascii_case("NULL") {
         fire_crab_ods::ddl::null_default_blr()
+    } else if let Some(kw) = ctx_default_blr(lit) {
+        // a session/clock CONTEXT default (CURRENT_USER, CURRENT_DATE, ...) -
+        // stored as the engine's own keyword BLR, resolved per call
+        kw
     } else {
         fire_crab_ods::ddl::int_default_blr(lit.parse::<i32>().ok()?)
     };
@@ -32149,13 +32170,21 @@ fn plan_query_inner_ctx(
                         });
                     }
                     // an omitted trailing argument takes its parameter's
-                    // DEFAULT before the arity is judged
-                    let args = with_proc_defaults(&meta, &args);
+                    // DEFAULT before the arity is judged. Literals fill here;
+                    // a CONTEXT default (CURRENT_USER, ...) needs the session
+                    // and is filled at EXECUTE (run_body_source, which has the
+                    // ctx), so it is left short here - accepted as long as
+                    // every remaining trailing parameter carries SOME default.
+                    let args = with_proc_defaults(&meta, &args, None);
                     // ARITY beats the not-selectable refusal (probed:
                     // `SELECT * FROM P2_RET(1)` and `SELECT * FROM
                     // PSELP` with one declared input answer this, for
                     // selectable and non-selectable procedures alike)
-                    if args.len() != meta.ins.len() {
+                    let tail_all_defaulted = meta
+                        .ins
+                        .get(args.len()..)
+                        .is_some_and(|tail| tail.iter().all(|p| p.default.is_some() || p.default_ctx.is_some()));
+                    if args.len() > meta.ins.len() || !tail_all_defaulted {
                         return Some(Plan::RefusedEval(EvalErr::ProcArgMismatch(quoted_qualified_pkg(
                             &pname,
                         ))));
@@ -51954,10 +51983,15 @@ enum ColKind {
 struct ProcParam {
     name: String,
     desc: Descriptor,
-    /// an input parameter's DEFAULT value (decoded from RDB$DEFAULT_VALUE),
-    /// used to fill an omitted trailing argument at a call; None for a
-    /// parameter without a literal default this server can evaluate
+    /// an input parameter's LITERAL DEFAULT value (decoded from
+    /// RDB$DEFAULT_VALUE), used to fill an omitted trailing argument at a
+    /// call; None for a parameter without a literal default
     default: Option<Value>,
+    /// a CONTEXT DEFAULT (CURRENT_USER, CURRENT_DATE, ...) - kept
+    /// UNEVALUATED because it must be resolved per call from the session
+    /// (with_proc_defaults evaluates it against the SessionCtx / clock).
+    /// A parameter has a default when EITHER field is Some.
+    default_ctx: Option<DefaultVal>,
 }
 
 /// A procedure as the catalog describes it.
@@ -52095,6 +52129,21 @@ fn default_val_to_value(d: DefaultVal) -> Option<Value> {
     }
 }
 
+/// Split a decoded parameter DEFAULT into a LITERAL value (ready to fill)
+/// and a CONTEXT default (resolved per call): a literal / NULL becomes the
+/// value, a session/clock form (CURRENT_USER, CURRENT_DATE, ...) is kept
+/// unevaluated for `with_proc_defaults`. A shape neither recognises (None
+/// in) carries no default.
+fn split_default(dv: Option<DefaultVal>) -> (Option<Value>, Option<DefaultVal>) {
+    match dv {
+        None => (None, None),
+        Some(d) => match default_val_to_value(d.clone()) {
+            Some(v) => (Some(v), None),
+            None => (None, Some(d)),
+        },
+    }
+}
+
 fn load_procedure(db: &Database, name: &str) -> Option<ProcMeta> {
     use fire_crab_ods::format::Value;
 
@@ -52226,7 +52275,7 @@ fn load_procedure(db: &Database, name: &str) -> Option<ProcMeta> {
     );
     // (parameter type 0=in/1=out, number, name, field source, defaulted,
     //  decoded default value)
-    let mut raw: Vec<(i64, i64, String, String, bool, Option<Value>)> = Vec::new();
+    let mut raw: Vec<(i64, i64, String, String, bool, Option<DefaultVal>)> = Vec::new();
     let pname_f = cfid("RDB$PARAMETER_NAME")?;
     let cdef_f = cfid("RDB$DEFAULT_SOURCE");
     let cdefval_f = cfid("RDB$DEFAULT_VALUE");
@@ -52255,8 +52304,7 @@ fn load_procedure(db: &Database, name: &str) -> Option<ProcMeta> {
             // session default decodes to None and the omit refuses)
             let defval = match cdefval_f.and_then(|i| v.get(i)) {
                 Some(Value::Blob(r, n)) => fire_crab_blb::read_blob_content(&db.bytes(), db.page_size, *r, *n)
-                    .and_then(|b| decode_default_blr(&b))
-                    .and_then(default_val_to_value),
+                    .and_then(|b| decode_default_blr(&b)),
                 _ => None,
             };
             raw.push((
@@ -52313,7 +52361,8 @@ fn load_procedure(db: &Database, name: &str) -> Option<ProcMeta> {
         if col_kind(&desc).is_none() && !is_numeric_col(&desc) {
             return None;
         }
-        let p = ProcParam { name: pnm, desc, default: defval };
+        let (default, default_ctx) = split_default(defval);
+        let p = ProcParam { name: pnm, desc, default, default_ctx };
         if typ == 0 {
             ins.push(p)
         } else {
@@ -55074,7 +55123,7 @@ fn try_procedure_blr(
             // bind_proc_args zips and would otherwise silently drop extra
             // arguments (an over-arity call the other paths reject). A
             // mismatch falls to the source path, which answers the vector.
-            let filled = with_proc_defaults(&meta, args);
+            let filled = with_proc_defaults(&meta, args, None);
             if filled.len() != meta.ins.len() {
                 return BlrProcOutcome::Outside;
             }
@@ -55195,7 +55244,7 @@ fn try_function_blr(database: &Option<Database>, name: &str, args: &[Value]) -> 
     };
     // fill omitted trailing defaults, then require exact arity (as the
     // procedure fast path does) - a mismatch falls to the source path
-    let filled = with_proc_defaults(&meta, args);
+    let filled = with_proc_defaults(&meta, args, None);
     if filled.len() != meta.ins.len() {
         return FnBlrOutcome::Outside;
     }
@@ -55317,12 +55366,44 @@ fn render_exact(raw: i128, scale: i8) -> String {
 /// out (EXECUTE PROCEDURE P(10) where P's second parameter has a default).
 /// Stops at the first omitted parameter WITHOUT a default this server can
 /// evaluate, leaving the arity check to reject a genuine mismatch.
-fn with_proc_defaults(meta: &ProcMeta, args: &[Value]) -> Vec<Value> {
+/// Evaluate a CONTEXT parameter default against the current session - the
+/// value the engine resolves at each call. `None` for a form this server
+/// cannot resolve here (CURRENT_TRANSACTION, whose id is not in reach), so
+/// the fill stops and a ctx-less fast path falls to the source path.
+fn eval_ctx_default(dv: &DefaultVal, ctx: &SessionCtx) -> Option<Value> {
+    Some(match dv {
+        DefaultVal::User => Value::Text(ctx.user.to_ascii_uppercase()),
+        DefaultVal::Role => Value::Text("NONE".into()),
+        DefaultVal::Connection => Value::Int(ctx.attach_id as i64),
+        DefaultVal::CurrentDate => Value::Date(now_date_time().0),
+        DefaultVal::CurrentTime => Value::Time(now_date_time().1),
+        DefaultVal::CurrentTimestamp => {
+            let (d, t) = now_date_time();
+            Value::Timestamp(d, t)
+        }
+        _ => return None,
+    })
+}
+
+/// Fill omitted TRAILING arguments from the parameters' DEFAULTs. A literal
+/// default is a ready [Value]; a CONTEXT default is resolved from `ctx` per
+/// call. `ctx` is `None` on the ctx-less fast paths (try_procedure_blr /
+/// try_function_blr): there, a context default cannot be resolved, so the
+/// fill stops short and the caller's arity check sends the call to the
+/// source path, which carries a `ctx`.
+fn with_proc_defaults(meta: &ProcMeta, args: &[Value], ctx: Option<&SessionCtx>) -> Vec<Value> {
     let mut out = args.to_vec();
     while out.len() < meta.ins.len() {
-        match &meta.ins[out.len()].default {
-            Some(v) => out.push(v.clone()),
-            None => break,
+        let p = &meta.ins[out.len()];
+        if let Some(v) = &p.default {
+            out.push(v.clone());
+        } else if let Some(dv) = &p.default_ctx {
+            match ctx.and_then(|c| eval_ctx_default(dv, c)) {
+                Some(v) => out.push(v),
+                None => break,
+            }
+        } else {
+            break;
         }
     }
     out
@@ -55682,7 +55763,7 @@ fn user_function_sigs(db: &Database) -> std::collections::HashMap<String, (Descr
                 let names = meta.ins.iter().map(|p| p.name.clone()).collect();
                 // required arity = the inputs WITHOUT a default (defaults
                 // are trailing), so a call may omit the defaulted tail
-                let required = meta.ins.iter().filter(|p| p.default.is_none()).count();
+                let required = meta.ins.iter().filter(|p| p.default.is_none() && p.default_ctx.is_none()).count();
                 out.insert(key, (r.desc.clone(), names, required));
             }
         }
@@ -55853,7 +55934,7 @@ fn load_function(db: &Database, name: &str) -> Option<ProcMeta> {
     let adefval_f = afid("RDB$DEFAULT_VALUE");
     let (aschema_f, apkg_f) = (afid("RDB$SCHEMA_NAME"), afid("RDB$PACKAGE_NAME"));
     let afmts = vec![(0u8, adescs)];
-    let mut raw: Vec<(i64, String, String, Option<Value>)> = Vec::new();
+    let mut raw: Vec<(i64, String, String, Option<DefaultVal>)> = Vec::new();
     for_each_record(db, 15, &afmts, usize::MAX, |v| {
         let hit = matches!(v.get(an_f), Some(Value::Text(t)) if t.trim_end().eq_ignore_ascii_case(name));
         if !hit || !row_visible(v, aschema_f, apkg_f) {
@@ -55866,8 +55947,7 @@ fn load_function(db: &Database, name: &str) -> Option<ProcMeta> {
             };
             let defval = match adefval_f.and_then(|i| v.get(i)) {
                 Some(Value::Blob(r, n)) => fire_crab_blb::read_blob_content(&db.bytes(), db.page_size, *r, *n)
-                    .and_then(|b| decode_default_blr(&b))
-                    .and_then(default_val_to_value),
+                    .and_then(|b| decode_default_blr(&b)),
                 _ => None,
             };
             raw.push((*pos, pname, fs.trim_end().to_string(), defval));
@@ -55893,9 +55973,10 @@ fn load_function(db: &Database, name: &str) -> Option<ProcMeta> {
             return None;
         }
         if pos == 0 {
-            outs.push(ProcParam { name: "RETURN".into(), desc, default: None });
+            outs.push(ProcParam { name: "RETURN".into(), desc, default: None, default_ctx: None });
         } else {
-            ins.push(ProcParam { name: pname, desc, default: defval });
+            let (default, default_ctx) = split_default(defval);
+            ins.push(ProcParam { name: pname, desc, default, default_ctx });
         }
     }
     if outs.len() != 1 {
@@ -56008,7 +56089,7 @@ fn run_body_source(
     ctx: &SessionCtx,
 ) -> Result<(Vec<Value>, Vec<Vec<Value>>), ProcErr> {
     // omitted trailing arguments take their parameters' DEFAULTs
-    let args = with_proc_defaults(meta, args);
+    let args = with_proc_defaults(meta, args, Some(ctx));
     let args = &args[..];
     if args.len() != meta.ins.len() {
         return Err(ProcErr::from(format!(
@@ -59824,7 +59905,7 @@ fn after_auth(
                         outs: out_names
                             .iter()
                             .zip(out_descs.iter())
-                            .map(|(n, d)| ProcParam { name: n.clone(), desc: *d, default: None })
+                            .map(|(n, d)| ProcParam { name: n.clone(), desc: *d, default: None, default_ctx: None })
                             .collect(),
                         source,
                         body_at: Some(body_at),
