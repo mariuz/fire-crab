@@ -4129,9 +4129,6 @@ fn body_compile(p: &mut P, func: bool, sub: bool) -> Option<BodyOut> {
                 None
             };
             let default = if let Some(form) = form {
-                if func {
-                    return None; // a FUNCTION parameter default: not yet
-                }
                 Some(format!("{} {}", form, param_default_source(p)?))
             } else {
                 if in_defaults.iter().any(|d| d.is_some()) {

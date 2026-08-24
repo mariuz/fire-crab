@@ -10636,6 +10636,28 @@ pub fn create_package_body(
             return Err(format!("Package body {} already exists", want));
         }
     }
+    // A parameter DEFAULT belongs on the package HEADER declaration, never
+    // on the BODY definition of a previously declared member: the engine
+    // rejects it with the DYN dyn_defvaldecl_package_{proc,func} vector
+    // ("Default values for parameters are not allowed in the definition of
+    // a previously declared packaged {procedure,function} @1.@2"). fc emits
+    // no header-declaration defaults yet, so ANY default here is a body one
+    // - refuse it fast, before writing, in member (source) order so the
+    // FIRST offending member is named, as the engine names it. The marker
+    // text is decoded by respond_ddl_meta into the byte-exact vector.
+    for m in members {
+        let bad = match m {
+            PackageBodyMember::Procedure { name, ins, .. } => {
+                ins.iter().any(|p| p.default.is_some()).then(|| ("procedure", name.clone()))
+            }
+            PackageBodyMember::Function { name, args, .. } => {
+                args.iter().any(|a| a.default.is_some()).then(|| ("function", name.clone()))
+            }
+        };
+        if let Some((kind, mem)) = bad {
+            return Err(format!("pkgdefault {} {}", kind, mem));
+        }
+    }
     for m in members {
         match m {
             PackageBodyMember::Procedure { name, ins, outs, selectable, blr } => {

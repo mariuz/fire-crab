@@ -1619,6 +1619,26 @@ fn respond_ddl_meta(
     }
     if let Plan::CreatePackageBody { name, .. } = plan {
         let qn = q(name);
+        // A parameter DEFAULT on a body member (create_package_body's
+        // "pkgdefault <kind> <member>" marker): the engine's DYN
+        // dyn_defvaldecl_package_{proc,func} vector - "CREATE PACKAGE BODY
+        // @1 failed" then "...previously declared packaged {procedure,
+        // function} @1.@2", @1 the package qn, @2 the quoted member.
+        if let Some(rest) = err_text.strip_prefix("pkgdefault ") {
+            let mut it = rest.splitn(2, ' ');
+            let kind = it.next().unwrap_or("");
+            let mem = it.next().unwrap_or("");
+            let dyn_code = if kind == "procedure" { 336068875 } else { 336068898 };
+            let memqn = format!("\"{}\"", mem.trim().trim_matches('"').to_ascii_uppercase());
+            let mut w = W::default();
+            w.int(OP_RESPONSE).int(0).int(0).int(0).int(0);
+            w.int(1).int(GDS_NO_META_UPDATE)
+                .int(1).int(336397295).int(2).bytes(qn.as_bytes()) // CREATE PACKAGE BODY @1 failed
+                .int(1).int(dyn_code).int(2).bytes(qn.as_bytes()).int(2).bytes(memqn.as_bytes())
+                .int(0);
+            w.send(s, enc)?;
+            return Ok(true);
+        }
         if lc.contains("already exists") {
             let mut w = W::default();
             w.int(OP_RESPONSE).int(0).int(0).int(0).int(0);
@@ -17238,7 +17258,7 @@ fn plain_function_arities(db: &Option<Database>) -> Vec<(String, usize)> {
         Some(d) => user_function_sigs(d)
             .into_iter()
             .filter(|(k, _)| !k.contains('.'))
-            .map(|(k, (_, args))| (k, args.len()))
+            .map(|(k, (_, args, _))| (k, args.len()))
             .collect(),
         None => Vec::new(),
     }
@@ -17516,9 +17536,23 @@ fn plan_create_package_body(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
 
 /// Shared converters for package members (mirror plan_create_procedure /
 /// plan_create_function).
+/// A packaged BODY member is compiled through proc_param_of / fn_arg_of and
+/// then REFUSED by create_package_body if any parameter carries a default -
+/// the engine forbids a default in a package body. The refusal keys on
+/// `default.is_some()`, so the SOURCE presence must ride through even when
+/// the literal is one fc cannot encode (a > i32 integer, which
+/// proc_default_of drops): a dropped-to-None default would slip past the
+/// guard and be silently accepted where the engine raises. Carry a
+/// bytes-empty sentinel for the un-encodable case - the guard refuses
+/// before any write, so the sentinel blr is never stored.
+fn param_default_marker(src: Option<&str>) -> Option<(Vec<u8>, String)> {
+    src.map(|s| proc_default_of(s).unwrap_or_else(|| (Vec::new(), s.to_string())))
+}
 fn proc_param_of(m: &fire_crab_dsql::ProcParamMeta) -> fire_crab_ods::ddl::ProcParamDef {
     fire_crab_ods::ddl::ProcParamDef {
-        default: None, name: m.name.clone(), field_type: m.field_type,
+        // an output param never has one (the parser captures input defaults only)
+        default: param_default_marker(m.default.as_deref()),
+        name: m.name.clone(), field_type: m.field_type,
         length: m.length, scale: m.scale, sub_type: m.sub_type,
     }
 }
@@ -17526,7 +17560,12 @@ fn fn_arg_of(m: &fire_crab_dsql::ProcParamMeta, position: i64, named: bool) -> f
     fire_crab_ods::ddl::FnArgDef {
         name: if named { Some(m.name.to_ascii_uppercase()) } else { None },
         position, field_type: m.field_type, length: m.length, scale: m.scale,
-        sub_type: m.sub_type, null_flag: false, default: None, inline: false, precision: None, mech: -1,
+        sub_type: m.sub_type, null_flag: false,
+        // a literal parameter DEFAULT (arguments only, never the return); the
+        // SOURCE presence rides through even when un-encodable so the
+        // create_package_body guard refuses a > i32 body default too
+        default: if named { param_default_marker(m.default.as_deref()) } else { None },
+        inline: false, precision: None, mech: -1,
     }
 }
 
@@ -17588,6 +17627,15 @@ fn plan_create_package(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
         let dup = d.to_ascii_uppercase();
         if find_word(&dup, "PROCEDURE", 0) == Some(0) {
             let c = fire_crab_dsql::compile_procedure_full(&format!("CREATE {} AS BEGIN EXIT; END", d))?;
+            // A parameter DEFAULT on a packaged routine's HEADER declaration
+            // is where the engine keeps it, but fc neither stores it here nor
+            // preserves it across the body re-write, so honouring the CREATE
+            // would leave the catalog without the default and split a later
+            // omitted-argument call. Refuse the whole header instead (the
+            // clean pre-defaults gap), until packaged defaults land whole.
+            if c.ins.iter().any(|m| m.default.is_some()) {
+                return None;
+            }
             members.push(fire_crab_ods::ddl::PackageMember::Procedure {
                 name: c.name, ins: c.ins.iter().map(&conv).collect(), outs: c.outs.iter().map(&conv).collect(),
             });
@@ -17595,6 +17643,9 @@ fn plan_create_package(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
             let c = fire_crab_dsql::compile_function_full(&format!("CREATE {} AS BEGIN RETURN NULL; END", d))?;
             if c.outs.len() != 1 {
                 return None;
+            }
+            if c.ins.iter().any(|m| m.default.is_some()) {
+                return None; // packaged header default - refused, see above
             }
             let mut args = vec![fnarg(&c.outs[0], 0, false)];
             for (i, m) in c.ins.iter().enumerate() {
@@ -17981,6 +18032,11 @@ fn plan_create_function(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<D
     if c.outs.len() != 1 {
         return None;
     }
+    // a parameter DEFAULT this server cannot encode refuses the CREATE
+    // (as the procedure and column paths do) rather than dropping it
+    if c.ins.iter().any(|m| m.default.as_deref().is_some_and(|src| proc_default_of(src).is_none())) {
+        return None;
+    }
     let as_at = find_word(&up, "AS", fk).unwrap_or(up.len());
     let deterministic = find_word(&up[..as_at], "DETERMINISTIC", fk).is_some();
     let arg = |m: &fire_crab_dsql::ProcParamMeta, position: i64, named: bool| fire_crab_ods::ddl::FnArgDef {
@@ -17991,7 +18047,8 @@ fn plan_create_function(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<D
         scale: m.scale,
         sub_type: m.sub_type,
         null_flag: false,
-        default: None,
+        // a literal argument DEFAULT (named arguments only, never the return)
+        default: if named { m.default.as_deref().and_then(proc_default_of) } else { None },
         inline: false,
         precision: None,
         mech: -1, // a PSQL function's RDB$MECHANISM is NULL (probed)
@@ -40244,7 +40301,7 @@ thread_local! {
     /// name, with each one's RETURN descriptor - loaded at every
     /// prepare ([user_function_sigs]) so the expression atom can tell a
     /// function call from a column
-    static USER_FNS: std::cell::RefCell<std::collections::HashMap<String, (Descriptor, Vec<String>)>> =
+    static USER_FNS: std::cell::RefCell<std::collections::HashMap<String, (Descriptor, Vec<String>, usize)>> =
         std::cell::RefCell::new(std::collections::HashMap::new());
     /// the user-function values of the row being projected, by call id
     static FN_VALS: std::cell::RefCell<std::collections::HashMap<u32, Value>> =
@@ -43679,11 +43736,12 @@ fn resolve_expr_inner(
             Expr::Func(f, resolved)
         }
         RawExpr::UserFn(name, args) => {
-            let (ret, params) = USER_FNS.with(|m| m.borrow().get(name).cloned())?;
-            if args.len() != params.len() {
-                // "Input parameter mismatch for function F" - with the
-                // first MISSING argument's name, or wronumarg when there
-                // are too many (probed)
+            let (ret, params, required) = USER_FNS.with(|m| m.borrow().get(name).cloned())?;
+            if args.len() < required || args.len() > params.len() {
+                // "Input parameter mismatch for function F" - the first
+                // MISSING (non-defaulted) argument's name when too few,
+                // or wronumarg when too many. A call may omit the trailing
+                // defaulted arguments (args.len() in [required, params.len()]).
                 let missing = params.get(args.len()).cloned();
                 PREPARE_REFUSAL.with(|r| {
                     r.borrow_mut().get_or_insert(EvalErr::FnArity { name: name.clone(), missing });
@@ -55110,6 +55168,13 @@ fn try_function_blr(database: &Option<Database>, name: &str, args: &[Value]) -> 
     let Some(meta) = load_function(db, name) else {
         return FnBlrOutcome::Outside;
     };
+    // fill omitted trailing defaults, then require exact arity (as the
+    // procedure fast path does) - a mismatch falls to the source path
+    let filled = with_proc_defaults(&meta, args);
+    if filled.len() != meta.ins.len() {
+        return FnBlrOutcome::Outside;
+    }
+    let args = &filled[..];
     // the SAME argument binding as the source path (typed CVT errors surface)
     let bound_args = match bind_proc_args(name, &meta, args) {
         Ok(b) => b,
@@ -55542,7 +55607,7 @@ fn sql_calls_name(up: &str, name: &str) -> bool {
 /// Every USER function the database holds (not a package's, not a
 /// system one) with its RETURN descriptor - what the expression atom
 /// and resolver need to type a call. Loaded at each prepare.
-fn user_function_sigs(db: &Database) -> std::collections::HashMap<String, (Descriptor, Vec<String>)> {
+fn user_function_sigs(db: &Database) -> std::collections::HashMap<String, (Descriptor, Vec<String>, usize)> {
     use fire_crab_ods::format::Value;
     let mut out = std::collections::HashMap::new();
     let Some((fcols, fdescs)) = sys_rel(db, "RDB$FUNCTIONS") else { return out };
@@ -55590,7 +55655,10 @@ fn user_function_sigs(db: &Database) -> std::collections::HashMap<String, (Descr
         if let Some(meta) = load_function(db, &load_name) {
             if let Some(r) = meta.outs.first() {
                 let names = meta.ins.iter().map(|p| p.name.clone()).collect();
-                out.insert(key, (r.desc.clone(), names));
+                // required arity = the inputs WITHOUT a default (defaults
+                // are trailing), so a call may omit the defaulted tail
+                let required = meta.ins.iter().filter(|p| p.default.is_none()).count();
+                out.insert(key, (r.desc.clone(), names, required));
             }
         }
     }
@@ -55757,9 +55825,10 @@ fn load_function(db: &Database, name: &str) -> Option<ProcMeta> {
     let afid = |n: &str| acols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
     let (an_f, pos_f, fs_f) = (afid("RDB$FUNCTION_NAME")?, afid("RDB$ARGUMENT_POSITION")?, afid("RDB$FIELD_SOURCE")?);
     let aname_f = afid("RDB$ARGUMENT_NAME");
+    let adefval_f = afid("RDB$DEFAULT_VALUE");
     let (aschema_f, apkg_f) = (afid("RDB$SCHEMA_NAME"), afid("RDB$PACKAGE_NAME"));
     let afmts = vec![(0u8, adescs)];
-    let mut raw: Vec<(i64, String, String)> = Vec::new();
+    let mut raw: Vec<(i64, String, String, Option<Value>)> = Vec::new();
     for_each_record(db, 15, &afmts, usize::MAX, |v| {
         let hit = matches!(v.get(an_f), Some(Value::Text(t)) if t.trim_end().eq_ignore_ascii_case(name));
         if !hit || !row_visible(v, aschema_f, apkg_f) {
@@ -55770,10 +55839,16 @@ fn load_function(db: &Database, name: &str) -> Option<ProcMeta> {
                 Some(Value::Text(t)) => t.trim_end().to_string(),
                 _ => String::new(),
             };
-            raw.push((*pos, pname, fs.trim_end().to_string()));
+            let defval = match adefval_f.and_then(|i| v.get(i)) {
+                Some(Value::Blob(r, n)) => fire_crab_blb::read_blob_content(&db.bytes(), db.page_size, *r, *n)
+                    .and_then(|b| decode_default_blr(&b))
+                    .and_then(default_val_to_value),
+                _ => None,
+            };
+            raw.push((*pos, pname, fs.trim_end().to_string(), defval));
         }
     });
-    raw.sort_by_key(|(p, _, _)| *p);
+    raw.sort_by_key(|(p, _, _, _)| *p);
     let domain_desc = |dom: &str| -> Option<Descriptor> {
         let (ft, len, scale, sub) = fire_crab_ods::ddl::domain_type_info(&db.bytes(), db.page_size, dom)?;
         let dtype = fire_crab_ods::ddl::field_type_to_dtype(ft)?;
@@ -55782,7 +55857,7 @@ fn load_function(db: &Database, name: &str) -> Option<ProcMeta> {
     };
     let mut ins: Vec<ProcParam> = Vec::new();
     let mut outs: Vec<ProcParam> = Vec::new();
-    for (pos, pname, fs) in raw {
+    for (pos, pname, fs, defval) in raw {
         let desc = domain_desc(&fs)?;
         // INT/TEXT the arithmetic source path handles; NUMERIC (scaled or
         // INT128) the BLR executor computes, so a function of these types
@@ -55795,7 +55870,7 @@ fn load_function(db: &Database, name: &str) -> Option<ProcMeta> {
         if pos == 0 {
             outs.push(ProcParam { name: "RETURN".into(), desc, default: None });
         } else {
-            ins.push(ProcParam { name: pname, desc, default: None });
+            ins.push(ProcParam { name: pname, desc, default: defval });
         }
     }
     if outs.len() != 1 {
