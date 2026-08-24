@@ -8526,6 +8526,9 @@ enum AggSrc {
     /// the two operands of a CORR / COVAR / REGR fold (Y, X), each
     /// evaluated per row; a pair folds only when NEITHER is null
     Pair(Expr, Expr),
+    /// a PERCENTILE fold: the fraction expression, the sort expression,
+    /// and whether the sort is descending
+    Percentile { frac: Expr, order: Expr, desc: bool },
 }
 
 /// A scalar-returning aggregate function.
@@ -8572,6 +8575,13 @@ enum AggFn {
     RegrSxx,
     RegrSyy,
     RegrSxy,
+    /// The ordered-set (inverse-distribution) aggregates
+    /// `PERCENTILE_CONT(f) WITHIN GROUP (ORDER BY x)` and PERCENTILE_DISC.
+    /// CONT interpolates between the two values bracketing the fractional
+    /// rank and answers a DOUBLE; DISC picks an actual ordered value and
+    /// keeps its type. Both are nullable (NULL over an empty group).
+    PercentileCont,
+    PercentileDisc,
 }
 
 impl AggFn {
@@ -8600,7 +8610,14 @@ impl AggFn {
             AggFn::RegrSxx => "REGR_SXX",
             AggFn::RegrSyy => "REGR_SYY",
             AggFn::RegrSxy => "REGR_SXY",
+            AggFn::PercentileCont => "PERCENTILE_CONT",
+            AggFn::PercentileDisc => "PERCENTILE_DISC",
         }
+    }
+
+    /// the two ordered-set percentile aggregates
+    fn is_percentile(self) -> bool {
+        matches!(self, AggFn::PercentileCont | AggFn::PercentileDisc)
     }
 
     /// the two-argument statistical folds (CORR / COVAR / REGR family) -
@@ -8752,6 +8769,13 @@ enum AggTarget {
     /// order (Y first). Both are evaluated per row and a pair is folded
     /// only when NEITHER is null.
     Pair(RawExpr, RawExpr),
+    /// `PERCENTILE_CONT/DISC(frac) WITHIN GROUP (ORDER BY order [DESC])` -
+    /// the fraction, the single sort expression, and its direction.
+    Percentile {
+        frac: RawExpr,
+        order: RawExpr,
+        desc: bool,
+    },
 }
 
 /// A comparison operator in a WHERE term.
@@ -32870,6 +32894,18 @@ fn plan_query_inner_ctx(
                         | AggFn::RegrSxx
                         | AggFn::RegrSyy
                         | AggFn::RegrSxy => ScalarTy::double(),
+                        // PERCENTILE_CONT answers a DOUBLE; PERCENTILE_DISC
+                        // keeps the ORDER BY value's own type (like MIN/MAX)
+                        AggFn::PercentileCont => ScalarTy::double(),
+                        AggFn::PercentileDisc => match target {
+                            AggTarget::Percentile { order: RawExpr::Col(cn), .. } => columns
+                                .iter()
+                                .find(|c| c.name.eq_ignore_ascii_case(cn))
+                                .and_then(|c| descs.get(c.field_id as usize))
+                                .map(ScalarTy::of_desc)
+                                .unwrap_or_else(ScalarTy::int64),
+                            _ => ScalarTy::int64(),
+                        },
                     };
                     return Some(Plan::Scalar(
                         ScalarVal::Agg(Box::new(AggPlan {
@@ -33491,6 +33527,7 @@ fn agg_result_desc(
         // in a HAVING or a scalar subquery refuse (no scalar descriptor here)
         AggFn::VarPop | AggFn::VarSamp | AggFn::StddevPop | AggFn::StddevSamp => return None,
         AggFn::Corr | AggFn::CovarPop | AggFn::CovarSamp | AggFn::RegrSlope | AggFn::RegrIntercept | AggFn::RegrCount | AggFn::RegrR2 | AggFn::RegrAvgx | AggFn::RegrAvgy | AggFn::RegrSxx | AggFn::RegrSyy | AggFn::RegrSxy => return None,
+        AggFn::PercentileCont | AggFn::PercentileDisc => return None,
     })
 }
 
@@ -33845,6 +33882,14 @@ fn build_group_items(
                         ),
                         false,
                     ),
+                    AggTarget::Percentile { frac, order, desc } => (
+                        AggSrc::Percentile {
+                            frac: resolve_expr(frac, columns, descs)?,
+                            order: resolve_expr(order, columns, descs)?,
+                            desc: *desc,
+                        },
+                        false,
+                    ),
                 };
                 if distinct && !matches!(func, AggFn::Count) {
                     return None; // only COUNT(DISTINCT) is answered
@@ -33859,11 +33904,15 @@ fn build_group_items(
                 // source's scale (the engine's NUMERIC(18,s) widening)
                 let field_desc = match &src {
                     AggSrc::Field(f) => descs.get(*f),
+                    // PERCENTILE_DISC keeps the ORDER BY value's own type -
+                    // over a bare column that is the column's descriptor
+                    AggSrc::Percentile { order: Expr::Col(f), .. } => descs.get(*f),
                     _ => None,
                 };
                 // (type, scale, rank) of the aggregate's input
                 let src_shape: Option<(ExprType, i8, NumRank)> = match (&src, field_desc) {
-                    (AggSrc::Field(_), Some(d)) => {
+                    (AggSrc::Field(_), Some(d))
+                    | (AggSrc::Percentile { .. }, Some(d)) => {
                         let t = if matches!(col_kind(d), Some(ColKind::Int)) {
                             ExprType::Int
                         } else if matches!(col_kind(d), Some(ColKind::Text)) {
@@ -33886,7 +33935,8 @@ fn build_group_items(
                         };
                         Some((t, d.scale, rank))
                     }
-                    (AggSrc::Expr(e), _) => {
+                    (AggSrc::Expr(e), _)
+                    | (AggSrc::Percentile { order: e, .. }, _) => {
                         let t = e.type_of(descs)?;
                         let sc = match t {
                             ExprType::Numeric => e.result_scale(descs)?,
@@ -33901,6 +33951,38 @@ fn build_group_items(
                     // announces NOT NULLABLE - the even 580 survives
                     // below because nullable() skips it
                     AggFn::Count => (Wire::Int64, 580, 8, 0, 0),
+                    // PERCENTILE_DISC picks an actual ordered value and keeps
+                    // its EXACT type (its make() copies the ORDER BY
+                    // descriptor) - over a column that is the column's own
+                    // wire form (a NUMERIC(9,2) stays LONG scale -2 sub_type
+                    // 1, not the INT64 MIN/MAX would widen a numeric to)
+                    AggFn::PercentileDisc => match field_desc {
+                        Some(d) => wire_for(d),
+                        None => {
+                            let (t, sc, rank) = src_shape?;
+                            // an EXPRESSION order keeps the expression's own
+                            // NUMERIC sub_type (a scaled `n92 + 1` stays
+                            // sub_type 1, as the engine keeps it)
+                            let sub = match &src {
+                                AggSrc::Percentile { order, .. } => {
+                                    numeric_subtype(order, descs) as i32
+                                }
+                                _ => 0,
+                            };
+                            match t {
+                                ExprType::Int => (Wire::Int64, 580, 8, 0, 0),
+                                ExprType::Numeric => {
+                                    if rank == NumRank::I128 {
+                                        (Wire::Int128, 32752, 16, sc as i32, sub)
+                                    } else {
+                                        (Wire::Int64, 580, 8, sc as i32, sub)
+                                    }
+                                }
+                                ExprType::Approx => (Wire::Double, 480, 8, 0, 0),
+                                _ => return None,
+                            }
+                        }
+                    },
                     AggFn::Min | AggFn::Max => {
                         let (t, sc, rank) = src_shape?;
                         match t {
@@ -34003,6 +34085,16 @@ fn build_group_items(
                         } else {
                             (Wire::Double, 480, 8, 0, 0)
                         }
+                    }
+                    // PERCENTILE_CONT interpolates and answers a DOUBLE; its
+                    // ORDER BY value must be numeric (the engine's
+                    // "must be numeric" otherwise)
+                    AggFn::PercentileCont => {
+                        let (t, _sc, _rank) = src_shape?;
+                        if !matches!(t, ExprType::Int | ExprType::Numeric | ExprType::Approx) {
+                            return None;
+                        }
+                        (Wire::Double, 480, 8, 0, 0)
                     }
                 };
                 // the engine titles aggregate output columns by function
@@ -34621,6 +34713,7 @@ fn aggregate(
                 _,
             ) => unreachable!(),
             (AggFn::Corr | AggFn::CovarPop | AggFn::CovarSamp | AggFn::RegrSlope | AggFn::RegrIntercept | AggFn::RegrCount | AggFn::RegrR2 | AggFn::RegrAvgx | AggFn::RegrAvgy | AggFn::RegrSxx | AggFn::RegrSyy | AggFn::RegrSxy, _) => unreachable!(),
+            (AggFn::PercentileCont | AggFn::PercentileDisc, _) => unreachable!(),
         });
     });
     if hit != 0 {
@@ -37419,6 +37512,45 @@ fn stat2_result(func: AggFn, n: i64, sx: f64, sx2: f64, sy: f64, sy2: f64, sxy: 
     }
 }
 
+/// The value of a PERCENTILE_CONT / PERCENTILE_DISC over the SORTED,
+/// non-null ordered set `vals` (already in the WITHIN GROUP direction) at
+/// fraction `frac`, computed the engine's way (PercentileAggNode). DISC
+/// picks the value at 1-based position ceil(frac*n) (at least 1), keeping
+/// its type; CONT interpolates between the values bracketing 1 + frac*(n-1)
+/// and answers a DOUBLE (the two weighted terms accumulated in stream
+/// order, as the engine does).
+fn percentile_result(func: AggFn, vals: &[Value], frac: f64) -> Result<Value, EvalErr> {
+    let n = vals.len() as i64;
+    if func == AggFn::PercentileDisc {
+        let crn = ((frac * n as f64).ceil() as i64).max(1);
+        let idx = (crn - 1).clamp(0, n - 1) as usize;
+        return Ok(vals[idx].clone());
+    }
+    // PERCENTILE_CONT - fold each sorted value to f64 the CVT way
+    let to_f64 = |v: &Value| -> f64 {
+        approx_of(v).unwrap_or_else(|| {
+            numeric_parts(v)
+                .map(|(raw, sc)| exact_to_f64(raw, sc as i32))
+                .unwrap_or(0.0)
+        })
+    };
+    // the engine (compiled -ffp-contract=fast) fuses the rank and the
+    // interpolation into multiply-adds - a single rounding each. Match with
+    // mul_add so the last bit agrees (as RegrIntercept already does).
+    let rn = frac.mul_add((n - 1) as f64, 1.0);
+    let frn = rn.floor() as i64;
+    let crn = rn.ceil() as i64;
+    let at = |pos: i64| -> f64 { to_f64(&vals[(pos - 1).clamp(0, n - 1) as usize]) };
+    let out = if frn == crn {
+        at(frn)
+    } else {
+        // acc = v[frn]*(crn-rn); acc = fma(v[crn], rn-frn, acc)
+        let acc = at(frn) * (crn as f64 - rn);
+        at(crn).mul_add(rn - frn as f64, acc)
+    };
+    Ok(Value::Double(out))
+}
+
 fn compute_group(rows: &[Vec<Value>], gitems: &[GItem]) -> Result<Vec<Value>, EvalErr> {
     // an aggregate's per-row input: the field's value, or the
     // expression evaluated against the row (whose error - divide by
@@ -37430,6 +37562,8 @@ fn compute_group(rows: &[Vec<Value>], gitems: &[GItem]) -> Result<Vec<Value>, Ev
             AggSrc::Expr(e) => e.eval(r)?,
             // a paired source folds through its own arm, never here
             AggSrc::Pair(y, _) => y.eval(r)?,
+            // a percentile folds through its own arm, never here
+            AggSrc::Percentile { order, .. } => order.eval(r)?,
         })
     }
     gitems
@@ -37622,6 +37756,62 @@ fn compute_group(rows: &[Vec<Value>], gitems: &[GItem]) -> Result<Vec<Value>, Ev
                         sxy += x * y;
                     }
                     stat2_result(*func, n, sx, sx2, sy, sy2, sxy)
+                }
+                // the ordered-set percentiles: collect the non-null ORDER BY
+                // values, sort them (DESC reverses), then interpolate
+                // (CONT) or pick (DISC) by the fractional rank
+                GItem::Agg(func, AggSrc::Percentile { frac, order, desc }, _)
+                    if func.is_percentile() =>
+                {
+                    // the fraction is a per-group constant; the engine
+                    // evaluates it once, propagates a NULL as a NULL result,
+                    // and rejects a non-null value outside [0, 1]
+                    let frac = match rows.first() {
+                        Some(r) => {
+                            let fv = frac.eval(r)?;
+                            if matches!(fv, Value::Null) {
+                                None // a NULL fraction -> the group is NULL
+                            } else {
+                                let f = approx_of(&fv).or_else(|| {
+                                    numeric_parts(&fv)
+                                        .map(|(raw, sc)| exact_to_f64(raw, sc as i32))
+                                });
+                                match f {
+                                    Some(f) if (0.0..=1.0).contains(&f) => Some(f),
+                                    Some(_) => {
+                                        return Err(EvalErr::DsqlDomain {
+                                            func: func.name(),
+                                            code: GDS_SYSF_ARG_RANGE01,
+                                        })
+                                    }
+                                    None => return Err(EvalErr::ConversionError(None)),
+                                }
+                            }
+                        }
+                        None => Some(0.0), // empty group - the value set is empty too
+                    };
+                    match frac {
+                        None => Value::Null,
+                        Some(frac) => {
+                            // collect + sort the non-null ORDER BY values
+                            let mut vals: Vec<Value> = Vec::new();
+                            for r in rows {
+                                let v = order.eval(r)?;
+                                if !matches!(v, Value::Null) {
+                                    vals.push(v);
+                                }
+                            }
+                            if vals.is_empty() {
+                                Value::Null
+                            } else {
+                                vals.sort_by(|a, b| value_cmp(a, b));
+                                if *desc {
+                                    vals.reverse();
+                                }
+                                percentile_result(*func, &vals, frac)?
+                            }
+                        }
+                    }
                 }
                 GItem::Const(v) => v.clone(), // a per-group constant slot
                 GItem::Agg(..) => Value::Null, // MIN/MAX/SUM(*): rejected at plan
@@ -38355,6 +38545,9 @@ const GDS_SYSF_ARG_NONZERO: i32 = 335544976;
 /// sysf_argmustbe_range_inc1_1 - "Argument for @1 must be in the range
 /// [-1, 1]" (ASIN / ACOS)
 const GDS_SYSF_ARG_RANGE11: i32 = 335544977;
+/// sysf_argmustbe_range_inc0_1 - "Argument for @1 must be in the range
+/// [0, 1]" (PERCENTILE_CONT / PERCENTILE_DISC fraction)
+const GDS_SYSF_ARG_RANGE01: i32 = 335545321;
 /// sysf_invalid_zeropowneg - "Base for @1 cannot be zero if exponent is
 /// negative" (POWER)
 const GDS_SYSF_ZEROPOWNEG: i32 = 335544964;
@@ -38607,6 +38800,17 @@ fn eval_status_items(w: &mut W, e: &EvalErr) {
         EvalErr::MathDomain { func, code } => {
             w.int(1) // isc_arg_gds - expression evaluation not supported
                 .int(GDS_EXPRESSION_EVAL_ERR)
+                .int(1) // isc_arg_gds - "Argument for @1 must be ..."
+                .int(*code)
+                .int(2) // isc_arg_string - @1 = the function name
+                .bytes(func.as_bytes());
+        }
+        // the percentile fraction range error is posted by the engine as a
+        // DSQL error (ERRD_post), so the primary is "Dynamic SQL Error", not
+        // the JRD expression_eval_err the math domains use
+        EvalErr::DsqlDomain { func, code } => {
+            w.int(1) // isc_arg_gds - Dynamic SQL Error
+                .int(GDS_DSQL_ERROR)
                 .int(1) // isc_arg_gds - "Argument for @1 must be ..."
                 .int(*code)
                 .int(2) // isc_arg_string - @1 = the function name
@@ -44553,6 +44757,9 @@ enum EvalErr {
     /// the specific `sysf_argmustbe_*` message, whose `@1` is the function
     /// name. `code` is the second vector item.
     MathDomain { func: &'static str, code: i32 },
+    /// a domain error posted as a DSQL error (primary "Dynamic SQL Error"),
+    /// as PERCENTILE_CONT/DISC's out-of-range fraction is
+    DsqlDomain { func: &'static str, code: i32 },
     /// an infinite std-math result (SINH / COSH past the f64 range): the
     /// engine's "Floating point overflow in built-in function @1"
     MathOverflow { func: &'static str },
@@ -49805,7 +50012,7 @@ fn eval_subquery_rel(
         // builds it, so a subquery accepts the same arguments a SELECT
         // list does - a column, `COUNT(DISTINCT col)`, or an expression
         let (src, distinct) = match &target {
-            AggTarget::Pair(..) => return None,
+            AggTarget::Pair(..) | AggTarget::Percentile { .. } => return None,
             AggTarget::Star => (AggSrc::Star, false),
             AggTarget::Col(name) | AggTarget::Distinct(name) => {
                 let c = columns.iter().find(|c| c.name.eq_ignore_ascii_case(name))?;
@@ -50398,6 +50605,8 @@ fn agg_named(word: &str) -> bool {
             | "REGR_SXX"
             | "REGR_SYY"
             | "REGR_SXY"
+            | "PERCENTILE_CONT"
+            | "PERCENTILE_DISC"
     )
 }
 
@@ -50791,6 +51000,68 @@ fn split_top_comma2(s: &str) -> Option<(&str, &str)> {
     at.map(|i| (&s[..i], &s[i + 1..]))
 }
 
+/// Parse `PERCENTILE_x(frac) WITHIN GROUP (ORDER BY expr [ASC|DESC])` -
+/// `t` is the whole item, `open` the index of the `(` after the function
+/// name. Only ONE sort item is accepted (the engine rejects more).
+fn parse_percentile_item(func: AggFn, t: &str, open: usize) -> Option<(AggFn, AggTarget)> {
+    // a leading keyword that stands as its own word (next is space or `(`)
+    fn strip_word<'a>(s: &'a str, kw: &str) -> Option<&'a str> {
+        let s = s.trim_start();
+        if s.len() >= kw.len()
+            && s[..kw.len()].eq_ignore_ascii_case(kw)
+            && s[kw.len()..]
+                .chars()
+                .next()
+                .map_or(true, |c| c.is_whitespace() || c == '(')
+        {
+            Some(&s[kw.len()..])
+        } else {
+            None
+        }
+    }
+    let b = t.as_bytes();
+    let close = matching_paren(b, open)?;
+    let frac = t.get(open + 1..close)?.trim();
+    if frac.is_empty() {
+        return None;
+    }
+    let after = strip_word(t.get(close + 1..)?, "WITHIN")?;
+    let after = strip_word(after, "GROUP")?.trim_start();
+    if !after.starts_with('(') {
+        return None;
+    }
+    let wg_open = t.len() - after.len();
+    let wg_close = matching_paren(b, wg_open)?;
+    if !t.get(wg_close + 1..)?.trim().is_empty() {
+        return None;
+    }
+    let inner = t.get(wg_open + 1..wg_close)?;
+    let inner = strip_word(inner, "ORDER")?;
+    let mut ob = strip_word(inner, "BY")?.trim();
+    // exactly one sort item (a top-level comma means more - the engine
+    // rejects it, fc refuses)
+    if split_top_comma2(ob).is_some() {
+        return None;
+    }
+    // a trailing ASC / DESC keyword (as its own word)
+    let mut desc = false;
+    let up = ob.to_ascii_uppercase();
+    if up.ends_with(" DESC") {
+        desc = true;
+        ob = ob[..ob.len() - 5].trim_end();
+    } else if up.ends_with(" ASC") {
+        ob = ob[..ob.len() - 4].trim_end();
+    }
+    Some((
+        func,
+        AggTarget::Percentile {
+            frac: parse_raw_expr_any(frac)?,
+            order: parse_raw_expr_any(ob)?,
+            desc,
+        },
+    ))
+}
+
 fn parse_agg_item(item: &str) -> Option<(AggFn, AggTarget)> {
     let t = item.trim();
     // `<agg>(arg) FILTER (WHERE c)` folds only the rows the condition
@@ -50873,8 +51144,17 @@ fn parse_agg_item(item: &str) -> Option<(AggFn, AggTarget)> {
         "REGR_SXX" => AggFn::RegrSxx,
         "REGR_SYY" => AggFn::RegrSyy,
         "REGR_SXY" => AggFn::RegrSxy,
+        "PERCENTILE_CONT" => AggFn::PercentileCont,
+        "PERCENTILE_DISC" => AggFn::PercentileDisc,
         _ => return None,
     };
+    // the ordered-set percentiles have their OWN shape:
+    // `PERCENTILE_x(frac) WITHIN GROUP (ORDER BY expr [ASC|DESC])` - the
+    // WITHIN GROUP clause sits OUTSIDE the (frac) parens, so the generic
+    // argument slice below does not apply
+    if func.is_percentile() {
+        return parse_percentile_item(func, t, open);
+    }
     let arg = t[open + 1..t.len() - 1].trim();
     // the two-argument statistical folds take `(Y, X)` - split on the
     // top-level comma and parse each side as an expression
@@ -59109,7 +59389,7 @@ fn resolve_having(
                         Text,
                     }
                     let (fid, src_expr, hkind, distinct) = match target {
-                        AggTarget::Pair(..) => return None,
+                        AggTarget::Pair(..) | AggTarget::Percentile { .. } => return None,
                         AggTarget::Star => (None, None, HKind::Int, false),
                         AggTarget::Col(name) | AggTarget::Distinct(name) => {
                             let rc =
