@@ -148,12 +148,15 @@ same "a DATEADD compared to a DATE column"  "SELECT ID FROM T WHERE DATEADD(1 DA
 sameh "header DATEADD"              "SELECT DATEADD(1 DAY TO D) FROM T WHERE ID = 1"
 sameh "header DATEDIFF"             "SELECT DATEDIFF(DAY, D, D) FROM T WHERE ID = 1"
 sameh "headers ADD/SUBTRACT"        "SELECT D + 1, D - DATE '1999-01-01' FROM T WHERE ID = 1"
+sameh "TIME + n is SECONDS, wrapped" "SELECT TM + 1, TM - 1, TM + 1.5 FROM T WHERE ID = 1"
 
 # --- refusals ----------------------------------------------------------
+# (SELECT TM + 1 left this list when TIME +/- n arrived - the amount is
+# SECONDS with the fraction kept, wrapping at midnight, and the
+# differential below pins it; the old refusal was a recorded divergence)
 for bad in "SELECT DATEADD(1 MONTH TO TM) FROM T" \
            "SELECT DATEDIFF(DAY, TM, D) FROM T" \
-           "SELECT DATEADD(1 WEEKDAY TO D) FROM T" \
-           "SELECT TM + 1 FROM T"; do
+           "SELECT DATEADD(1 WEEKDAY TO D) FROM T"; do
     out=$(printf '%s;\n' "$bad" |
           "$ISQL" -q -b -user "$U" -pas "$P" "127.0.0.1/$PORT:$DB" 2>&1 | tr -s ' \n' ' ')
     case "$out" in

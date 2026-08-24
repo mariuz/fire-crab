@@ -6224,7 +6224,10 @@ enum Wire {
     Time,
     /// date then time, 8 bytes
     Timestamp,
-    /// 4-byte int 0/1 (XDR pads the 1-byte boolean to a slot)
+    /// XDR OPAQUE: the value byte (0/1) FIRST, three pad bytes after -
+    /// xdr.cpp sends dtype_boolean via xdr_opaque(length 1), and
+    /// libfbclient reads byte 0 (a big-endian int form put the value
+    /// byte LAST and read every TRUE as false)
     Bool,
     /// 4-byte length + bytes + padding to 4
     /// CHAR: the bytes, space-padded to the declared byte width, no
@@ -13071,14 +13074,14 @@ enum InsVal {
     /// 11/23). A DEFAULT-valued column is therefore LISTED but not
     /// NAMED: it behaves exactly like an omitted column.
     Default,
-    /// the temporal values a VALUES item can carry: a `DATE '...'` /
-    /// `TIME '...'` / `TIMESTAMP '...'` literal, `CURRENT_DATE` and its
-    /// clock siblings (resolved at plan time, like the query side), or a
-    /// `CAST('...' AS <temporal>)` folded to its constant. Encoded by
-    /// the existing WireParam::Date/Time/Timestamp arms.
-    Date(i32),
-    Time(u32),
-    Timestamp(i32, u32),
+    /// a CONSTANT EXPRESSION's folded value, staged as its wire-parameter
+    /// form: `1+2`, `'A'||'B'`, `(5)`, `UPPER('x')`, `1e3`, a temporal
+    /// literal or `DATE '...' + 1`, a folded CASE/COALESCE/CAST, the
+    /// clocks (the WITH TIME ZONE ones landing session-local) - anything
+    /// the expression surface resolves WITHOUT columns and evaluates,
+    /// as the engine accepts any value expression here. Resolved at plan
+    /// time (the query side's own clock rule).
+    Wire(WireParam),
 }
 
 /// The `OVERRIDING` clause of an INSERT, as written. Its meaning is the
@@ -20873,11 +20876,20 @@ fn plan_insert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
         if !tail.starts_with('(') || !tail.ends_with(')') {
             return None;
         }
-        let toks = tokenize(&tail[1..tail.len() - 1])?;
-        // a comma inside GEN_ID(name, n) is not a value separator: split only
-        // on top-level (paren-depth-0) commas
-        for part in split_top_commas(&toks) {
-            vals.push(match part {
+        // split the VALUES list at TEXT level (paren- and quote-aware), so
+        // an item that is not one of the staged token shapes below can be
+        // handed WHOLE to the expression parser
+        let inner = &tail[1..tail.len() - 1];
+        let parts = split_set_list(inner);
+        // a trailing comma (`VALUES (1, 2,)`) leaves the splitter one
+        // item short of its commas - the engine's -104, refused here
+        // rather than silently storing (review-caught)
+        if parts.len() != count_top_commas(inner) + 1 {
+            return None;
+        }
+        for part_text in parts {
+            let toks = tokenize(&part_text)?;
+            vals.push(match &toks[..] {
                 [Tok::Int(n)] => InsVal::Int(*n),
                 [Tok::Int128(n)] => InsVal::Int128(*n),
                 [Tok::DecFloat34(b)] => InsVal::DecFloat34(*b),
@@ -20909,42 +20921,37 @@ fn plan_insert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
                 {
                     InsVal::GenId(name.trim_matches('"').to_string(), Some(*n))
                 }
-                // a TEMPORAL value: a DATE/TIME/TIMESTAMP literal,
-                // CURRENT_DATE and its clock siblings, or a CAST of a
-                // string to a temporal target - each one Tok::FnExpr the
-                // tokenizer already built. Resolved with no columns (all
-                // are constants; the clocks bind at plan time, the query
-                // side's own rule) and folded; a non-temporal constant
-                // keeps today's refusal.
-                [Tok::FnExpr(r)] => {
-                    match resolve_expr(r, &[], &[]).and_then(|e| e.eval(&[]).ok()) {
-                        Some(Value::Date(d)) => InsVal::Date(d),
-                        Some(Value::Time(t)) => InsVal::Time(t),
-                        Some(Value::Timestamp(d, t)) => InsVal::Timestamp(d, t),
-                        // a constant fold that answers NULL stores NULL -
-                        // CAST(NULL AS DATE), a CASE with no matching arm
-                        // (probed; review-caught)
-                        Some(Value::Null) => InsVal::Null,
-                        // CURRENT_TIME / CURRENT_TIMESTAMP answer WITH
-                        // TIME ZONE values; landing in a zone-less column
-                        // they become the SESSION-local time - and the
-                        // only TZ values reaching a VALUES list are those
-                        // clocks, whose zone IS the session's, so the
-                        // value's own displacement converts exactly
-                        Some(Value::TimeTz(utc, zone)) => match tz_local_time(utc, zone) {
-                            Some(t) => InsVal::Time(t),
-                            None => return None,
-                        },
-                        Some(Value::TimestampTz(dd, utc, zone)) => {
-                            match tz_local_timestamp(dd, utc, zone) {
-                                Some((d, t)) => InsVal::Timestamp(d, t),
-                                None => return None,
-                            }
-                        }
-                        _ => return None,
+                // ANY OTHER run: a CONSTANT EXPRESSION, as the engine
+                // accepts any value expression here - `1+2`, `'A'||'B'`,
+                // `(5)`, `UPPER('x')`, `1e3`, a temporal literal or its
+                // arithmetic, a folded CASE/COALESCE/CAST (one answering
+                // NULL stores NULL), the clocks (WITH TIME ZONE ones
+                // landing session-local). Resolved with NO columns and
+                // evaluated at plan (the query side's own clock rule); a
+                // shape that will not resolve or fold - a `?` inside an
+                // expression, a scalar subquery, a blob value - keeps
+                // the refusal.
+                _ => {
+                    // an UNTYPED expression whose fold is NULL is the
+                    // eval fallthrough talking (`'5' + 1` - the engine's
+                    // "Strings cannot be added"), not a value - storing
+                    // that NULL would be a silently wrong row, so it
+                    // refuses (review-caught). An untyped fold with a
+                    // REAL value, and a TYPED fold answering NULL (a
+                    // CASE whose ELSE is NULL types None but folds its
+                    // date arm; CAST(NULL AS ..)), both stay accepted.
+                    let e = parse_raw_expr_any(part_text.trim())
+                        .and_then(|r| resolve_expr(&r, &[], &[]))?;
+                    let typed = e.type_of(&[]).is_some();
+                    let v = e.eval(&[]).ok()?;
+                    if !typed && matches!(v, Value::Null) {
+                        return None;
                     }
+                    if std::env::var("FC_SRV_TRACE").is_ok() {
+                        eprintln!("[srv] insert const-expr {:?} -> {}", part_text, v.render());
+                    }
+                    InsVal::Wire(value_to_wireparam(&v)?)
                 }
-                _ => return None,
             });
         }
     }
@@ -21358,13 +21365,22 @@ fn encode_set_value(d: &Descriptor, v: &InsVal) -> Option<Option<Vec<u8>>> {
         InsVal::Dec(r, s) => WireParam::Int(*r, *s),
         InsVal::Str(text) => WireParam::Text(text.clone()),
         InsVal::Octets(b) => WireParam::Text(String::from_utf8_lossy(b).into_owned()),
+        // a SQL BOOLEAN - the bare TRUE/FALSE literal or a folded
+        // expression alike - into a text column spells TRUE/FALSE
+        // (probed; this arm must PRECEDE the generic Bool one) - the
+        // WireParam::Bool text arm's '1'/'0' is the CLIENT-BOUND-
+        // parameter rule and stays for params
+        InsVal::Wire(WireParam::Bool(b)) | InsVal::Bool(b)
+            if matches!(d.dtype, dtype::TEXT | dtype::VARYING) =>
+        {
+            WireParam::Text((if *b { "TRUE" } else { "FALSE" }).to_string())
+        }
         InsVal::Bool(b) => WireParam::Bool(*b),
-        // the temporals ride their existing WireParam arms (a TIMESTAMP
-        // truncates into a DATE/TIME column, a DATE is midnight of a
-        // TIMESTAMP one, a TIME lands dated today - all probed)
-        InsVal::Date(dd) => WireParam::Date(*dd),
-        InsVal::Time(tt) => WireParam::Time(*tt),
-        InsVal::Timestamp(dd, tt) => WireParam::Timestamp(*dd, *tt),
+        // a folded constant expression arrives already in wire form (a
+        // TIMESTAMP truncates into a DATE/TIME column, a DATE is
+        // midnight of a TIMESTAMP one, a TIME lands dated today, a
+        // temporal renders into a TEXT column - the encode arms' rules)
+        InsVal::Wire(wp) => wp.clone(),
         // parameters bind, generators advance, at execute - not here.
         // DEFAULT never reaches an encoder at all: plan_insert drops a
         // DEFAULT-valued column out of the image targets so the column
@@ -22285,6 +22301,29 @@ fn rescale_int(v: i128, from: i8, to: i8) -> Option<i128> {
     }
 }
 
+/// [rescale_int] with the engine's adjustForScale ROUNDING when digits
+/// drop: the quotient adjusts by one when the FIRST dropped digit is
+/// past 4 (half away from zero; digits beyond it are ignored, exactly
+/// as the engine's digit-at-a-time loop captures only the last
+/// division's remainder). Used where a VALUE lands in a column - the
+/// comparison paths keep the exact [rescale_int].
+fn rescale_int_round(v: i128, from: i8, to: i8) -> Option<i128> {
+    let e = from as i32 - to as i32;
+    if e >= 0 {
+        return v.checked_mul(pow10_i128(e as u32)?);
+    }
+    // drop all but one digit exactly, then divide once capturing the
+    // remainder - the digit the engine rounds on
+    let coarse = pow10_i128((-e - 1) as u32)?;
+    let q1 = v / coarse;
+    let digit = (q1 % 10).abs();
+    let mut q = q1 / 10;
+    if digit > 4 {
+        q += q1.signum();
+    }
+    Some(q)
+}
+
 /// Coerce one wire parameter to a column's stored bytes: `None` = the
 /// value cannot represent this column's type (the statement fails),
 /// `Some(None)` = SQL NULL, `Some(Some(bytes))` = the field bytes at
@@ -22320,7 +22359,12 @@ fn encode_wire_value(d: &Descriptor, wp: &WireParam) -> Option<Option<Vec<u8>>> 
         }),
         WireParam::Int(v, ws) => Some(match d.dtype {
             dtype::SHORT | dtype::LONG | dtype::INT64 | dtype::INT128 => {
-                int_bytes(rescale_int(*v as i128, *ws, d.scale)?)?
+                // an EXACT value with more fraction digits than the
+                // column ROUNDS on the first dropped digit, half away
+                // (the engine's adjustForScale - probed: 1.005 into a
+                // NUMERIC(9,2) stores 1.01, 1.0049 stores 1.00); an
+                // overflow past the width still refuses
+                int_bytes(rescale_int_round(*v as i128, *ws, d.scale)?)?
             }
             // an integer/decimal value into a DECFLOAT column: the exact
             // value `v * 10^ws` becomes a decimal128/64 (its scale IS the
@@ -22349,11 +22393,13 @@ fn encode_wire_value(d: &Descriptor, wp: &WireParam) -> Option<Option<Vec<u8>>> 
             // into a DOUBLE/FLOAT column silently stored no row.
             dtype::DOUBLE => exact_to_f64(*v as i128, *ws as i32).to_le_bytes().to_vec(),
             dtype::REAL => (exact_to_f64(*v as i128, *ws as i32) as f32).to_le_bytes().to_vec(),
-            // an INTEGER parameter into a TEXT column: the engine
-            // stores its decimal rendering ("42", "-7"), and REFUSES
-            // rather than truncate when it does not fit
-            dtype::TEXT | dtype::VARYING if *ws == 0 => {
-                text_bytes_for(&v.to_string(), fire_crab_ods::intl::CS_UTF8, d, flen)?
+            // an INTEGER or scaled value into a TEXT column: the engine
+            // stores its decimal rendering ("42", "-7", "2.50" with the
+            // scale's digits kept - probed), and REFUSES rather than
+            // truncate when it does not fit
+            dtype::TEXT | dtype::VARYING => {
+                let s = if *ws == 0 { v.to_string() } else { render_exact(*v as i128, *ws) };
+                text_bytes_for(&s, fire_crab_ods::intl::CS_UTF8, d, flen)?
             }
             _ => return None,
         }),
@@ -22425,12 +22471,30 @@ fn encode_wire_value(d: &Descriptor, wp: &WireParam) -> Option<Option<Vec<u8>>> 
             dtype::REAL => (*x as f32).to_le_bytes().to_vec(),
             dtype::SHORT | dtype::LONG | dtype::INT64 => {
                 // engine rounding: scale to the target, then half away
-                // from zero (CVT_get_int64 adds +/-0.5 and truncates)
+                // WITH the CVT epsilon (cvt.cpp: d += 0.5 + 1e-14, then
+                // truncate) - the fudge that lands the .xx5 binary-
+                // representation edge the decimal way (1.005e0 into a
+                // NUMERIC(9,2) is 1.01, not the 1.00 a bare .round()
+                // gives; the serve-real-rounding slice pinned the same
+                // constant for ROUND)
                 let scaled = x * 10f64.powi(-(d.scale as i32));
                 if !scaled.is_finite() || scaled.abs() >= i64::MAX as f64 {
                     return None;
                 }
-                int_bytes(scaled.round() as i128)?
+                let adjusted =
+                    if scaled > 0.0 { scaled + 0.5 + 1e-14 } else { scaled - 0.5 - 1e-14 };
+                int_bytes(adjusted.trunc() as i128)?
+            }
+            // an approximate value into a TEXT column renders the
+            // engine's 16-significant-digit form (probed: SQRT(2) into a
+            // VARCHAR is '1.414213562373095')
+            dtype::TEXT | dtype::VARYING => {
+                text_bytes_for(
+                    &Value::Double(*x).render(),
+                    fire_crab_ods::intl::CS_UTF8,
+                    d,
+                    flen,
+                )?
             }
             _ => return None,
         }),
@@ -22522,6 +22586,39 @@ fn sample_image_len(db: &Database, rel: u16, format_no: u8) -> Option<usize> {
 /// parentheses (a function call) or inside a string literal belongs to
 /// its part. Each part keeps its text verbatim, so the right-hand side
 /// can go to the expression parser unchanged.
+/// The number of TOP-LEVEL commas in a list text - the same paren- and
+/// quote-discipline as [split_set_list]. A well-formed list has exactly
+/// `commas + 1` items; a trailing comma leaves one fewer (the splitter
+/// drops the empty tail), which the engine refuses with -104 - callers
+/// compare the two so `VALUES (1, 2,)` and `SET A = 1, WHERE ...` refuse
+/// instead of silently executing (review-caught).
+fn count_top_commas(text: &str) -> usize {
+    let mut n = 0usize;
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if in_str {
+            if c == '\'' {
+                if chars.peek() == Some(&'\'') {
+                    chars.next();
+                } else {
+                    in_str = false;
+                }
+            }
+            continue;
+        }
+        match c {
+            '\'' => in_str = true,
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => n += 1,
+            _ => {}
+        }
+    }
+    n
+}
+
 fn split_set_list(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
@@ -22807,8 +22904,16 @@ fn plan_update(sql: &str, db_outer: &Option<Database>) -> Option<(Plan, Vec<Desc
     let mut sets: Vec<(usize, SetVal)> = Vec::new();
     // split on TOP-LEVEL commas in the text (not the token stream), so
     // each assignment keeps its right-hand side verbatim - an expression
-    // is parsed from that text by the same parser a select list uses
-    for part_text in split_set_list(set_text) {
+    // is parsed from that text by the same parser a select list uses.
+    // A trailing comma (`SET A = 1, WHERE ...`) leaves the splitter one
+    // item short of its commas - the engine's -104, refused here rather
+    // than silently updating (review-caught; this held before the
+    // VALUES list shared the splitter too)
+    let set_parts = split_set_list(set_text);
+    if set_parts.len() != count_top_commas(set_text) + 1 {
+        return None;
+    }
+    for part_text in set_parts {
         // the predicate tokenizer does not know `+`, `||` and friends, so
         // a failure to tokenize is itself a sign this is an expression -
         // it must NOT abort the whole statement
@@ -22884,6 +22989,15 @@ fn plan_update(sql: &str, db_outer: &Option<Database>) -> Option<(Plan, Vec<Desc
                 // `SET A = B, B = A`.
                 let raw = parse_raw_expr_any(rhs)?;
                 let e = resolve_expr(&raw, &columns, descs)?;
+                // the TYPE GATE, as the projection's own rule: an
+                // expression the type system refuses (`'5' + 1` - the
+                // engine's "Strings cannot be added") must not reach the
+                // per-row eval, whose fallthrough answers NULL - storing
+                // that NULL would be a silently wrong update
+                // (review-caught, the INSERT arm's twin)
+                if e.type_of(descs).is_none() {
+                    return None;
+                }
                 let fid = fid0;
                 if sets.iter().any(|(f, _)| *f == fid) {
                     return None;
@@ -25039,50 +25153,19 @@ fn execute_dml_collecting_inner(
                         // and flattening it here was the one place the
                         // two halves of an UPDATE disagreed.
                         let v = e.eval(&old_values).map_err(ExecErr::Eval)?;
-                        let wp = match &v {
-                            Value::Null => WireParam::Null,
-                            Value::Int(n) => WireParam::Int(*n, 0),
-                            Value::Scaled(r, sc) => WireParam::Int(*r, *sc),
-                            Value::Text(t) => WireParam::Text(t.clone()),
-                            Value::Double(_) | Value::Float(_) => {
-                                WireParam::Double(approx_of(&v).unwrap_or(0.0))
+                        // a folded SQL BOOLEAN into a text column spells
+                        // TRUE/FALSE (probed) - the parameter arm's
+                        // '1'/'0' is the client-bound rule
+                        let wp = match (&v, d.dtype) {
+                            (Value::Bool(b), dtype::TEXT | dtype::VARYING) => {
+                                WireParam::Text((if *b { "TRUE" } else { "FALSE" }).to_string())
                             }
-                            // the families the expression surface has
-                            // learned since this list was written: a
-                            // boolean (so `SET B = (ID > 2)` stores what
-                            // the condition answered) and the temporals
-                            Value::Bool(b) => WireParam::Bool(*b),
-                            Value::Date(d) => WireParam::Date(*d),
-                            Value::Time(t) => WireParam::Time(*t),
-                            Value::Timestamp(d, t) => WireParam::Timestamp(*d, *t),
-                            // the WITH TIME ZONE clocks (CURRENT_TIME /
-                            // CURRENT_TIMESTAMP) land in a zone-less
-                            // column as the session-local time - their
-                            // zone IS the session's, so the value's own
-                            // displacement converts exactly
-                            Value::TimeTz(utc, zone) => match tz_local_time(*utc, *zone) {
-                                Some(t) => WireParam::Time(t),
+                            _ => match value_to_wireparam(&v) {
+                                Some(wp) => wp,
                                 None => {
                                     return Err("expression type cannot be stored".into())
                                 }
                             },
-                            Value::TimestampTz(dd, utc, zone) => {
-                                match tz_local_timestamp(*dd, *utc, *zone) {
-                                    Some((d, t)) => WireParam::Timestamp(d, t),
-                                    None => {
-                                        return Err(
-                                            "expression type cannot be stored".into()
-                                        )
-                                    }
-                                }
-                            }
-                            Value::Int128(r, sc) => match i64::try_from(*r) {
-                                Ok(n) => WireParam::Int(n, *sc),
-                                Err(_) => {
-                                    return Err("expression result does not fit the column".into())
-                                }
-                            },
-                            _ => return Err("expression type cannot be stored".into()),
                         };
                         match encode_wire_value(d, &wp)
                             .ok_or("expression result does not fit the column")?
@@ -41246,7 +41329,13 @@ fn encode_row_body(
                 w.raw(&t.to_be_bytes());
             }
             Wire::Bool => {
-                w.int(if matches!(v, Value::Bool(true)) { 1 } else { 0 });
+                // a boolean travels as XDR OPAQUE: the value byte FIRST,
+                // three pad bytes after - libfbclient/isql read byte 0.
+                // The old form (a big-endian int, value byte LAST) made
+                // every boolean OUTPUT read false at a real client while
+                // WHERE/CAST were right - found when the constant-
+                // expression VALUES slice widened the surface
+                w.raw(&[u8::from(matches!(v, Value::Bool(true))), 0, 0, 0]);
             }
             Wire::Varying | Wire::Text => {
                 let s = v.render();
@@ -45830,7 +45919,23 @@ fn conditional_type<'a>(
     let mut temporal: Option<TKind> = None;
     let mut any_other = false;
     let mut any_approx = false;
-    for t in branches.filter_map(|e| e.type_of(descs)) {
+    // an explicit NULL branch is TRANSPARENT - it takes whatever type
+    // the other branches carry (the engine's rule; a bare Expr::Null
+    // types Int and used to poison a temporal/text mix - a `CASE ...
+    // ELSE NULL END` over a DATE refused where the engine answers). A
+    // CASE of ONLY null branches keeps the old integer describe.
+    let mut all_null = true;
+    for t in branches
+        .filter(|e| {
+            if matches!(e, Expr::Null) {
+                false
+            } else {
+                all_null = false;
+                true
+            }
+        })
+        .filter_map(|e| e.type_of(descs))
+    {
         if first.is_none() {
             first = Some(t);
         }
@@ -45868,6 +45973,9 @@ fn conditional_type<'a>(
     }
     if any_numeric && !any_text {
         return Some(ExprType::Numeric);
+    }
+    if first.is_none() && all_null {
+        return Some(ExprType::Int); // every branch NULL: the old describe
     }
     first
 }
@@ -46942,6 +47050,78 @@ const UNITS_PER_DAY: i128 = 864_000_000;
 /// back onto the operand's kind - a DATE drops the time (so +2 HOUR
 /// leaves the day, probed), a TIME drops the days (the midnight wrap,
 /// probed). Out of the engine's date range (0001..9999) raises.
+/// `temporal ± numeric` - the engine's dialect-3 rules, each probed: a
+/// DATE moves by WHOLE days (the amount rounded half away - D + 0.5
+/// moves a day); a TIMESTAMP keeps the day FRACTION (TS + 0.25 shifts
+/// six hours, exact for a scaled amount); a TIME takes SECONDS with the
+/// fraction kept, wrapping at midnight in both directions.
+fn temporal_shift(
+    d: i64,
+    u: i64,
+    k: TKind,
+    amount: &Value,
+    neg: bool,
+) -> Result<Value, EvalErr> {
+    const UPD: i128 = 24 * 60 * 60 * 10_000;
+    // the amount converted to 1/10000-second units, `per` units to one
+    // whole step - exact for integers and scaled decimals (a sub-unit
+    // remainder rounds half away from zero), f64 for approximates
+    let units = |per: i128| -> Result<i128, EvalErr> {
+        let exact = |raw: i128, sc: i8| -> i128 {
+            let den = 10i128.pow((-sc).max(0) as u32);
+            let num = raw * per;
+            let (s, a) = (num.signum(), num.unsigned_abs());
+            let den_u = den.unsigned_abs();
+            let mut q = a / den_u;
+            if (a % den_u) * 2 >= den_u {
+                q += 1;
+            }
+            s * q as i128
+        };
+        Ok(match amount {
+            Value::Int(n) => *n as i128 * per,
+            Value::Scaled(r, sc) => exact(*r as i128, *sc),
+            Value::Int128(r, sc) => exact(*r, *sc),
+            Value::Double(_) | Value::Float(_) => {
+                let f = approx_of(amount).ok_or(EvalErr::Unsupported)?;
+                if !f.is_finite() {
+                    return Err(EvalErr::Unsupported);
+                }
+                (f * per as f64).round() as i128
+            }
+            _ => return Err(EvalErr::Unsupported),
+        })
+    };
+    match k {
+        TKind::Date => {
+            let mut n = fn_int(amount)?;
+            if neg {
+                n = -n;
+            }
+            dateadd_impl(ExtractPart::Day, n, d as i32, u as u32, k)
+        }
+        TKind::Time => {
+            let mut delta = units(10_000)?;
+            if neg {
+                delta = -delta;
+            }
+            Ok(Value::Time((u as i128 + delta).rem_euclid(UPD) as u32))
+        }
+        TKind::Timestamp => {
+            let mut delta = units(UPD)?;
+            if neg {
+                delta = -delta;
+            }
+            let total = d as i128 * UPD + u as i128 + delta;
+            Ok(Value::Timestamp(
+                total.div_euclid(UPD) as i32,
+                total.rem_euclid(UPD) as u32,
+            ))
+        }
+        _ => Err(EvalErr::Unsupported),
+    }
+}
+
 fn dateadd_impl(
     unit: ExtractPart,
     amount: i64,
@@ -47352,6 +47532,34 @@ fn cvt_text_temporal(s: &str, expect: ExpectTemporal) -> Option<(i32, u32)> {
     string_to_datetime(s, expect, now_date_time(), true)
 }
 
+/// A computed [Value]'s wire-parameter form - what the UPDATE expression
+/// tier and the INSERT constant-expression arm stage for
+/// [encode_wire_value]. The WITH TIME ZONE clocks land in a zone-less
+/// column as the session-local time (their zone IS the session's, so
+/// the value's own displacement converts exactly). None: a value no
+/// wire parameter carries - a blob id, a DECFLOAT, an over-i64 INT128,
+/// an unconvertible zone.
+fn value_to_wireparam(v: &Value) -> Option<WireParam> {
+    Some(match v {
+        Value::Null => WireParam::Null,
+        Value::Int(n) => WireParam::Int(*n, 0),
+        Value::Scaled(r, sc) => WireParam::Int(*r, *sc),
+        Value::Text(t) => WireParam::Text(t.clone()),
+        Value::Double(_) | Value::Float(_) => WireParam::Double(approx_of(v)?),
+        Value::Bool(b) => WireParam::Bool(*b),
+        Value::Date(d) => WireParam::Date(*d),
+        Value::Time(t) => WireParam::Time(*t),
+        Value::Timestamp(d, t) => WireParam::Timestamp(*d, *t),
+        Value::TimeTz(utc, zone) => WireParam::Time(tz_local_time(*utc, *zone)?),
+        Value::TimestampTz(dd, utc, zone) => {
+            let (d, t) = tz_local_timestamp(*dd, *utc, *zone)?;
+            WireParam::Timestamp(d, t)
+        }
+        Value::Int128(r, sc) => WireParam::Int(i64::try_from(*r).ok()?, *sc),
+        _ => return None,
+    })
+}
+
 /// A TIME WITH TIME ZONE value's LOCAL wall time in its own zone - what
 /// the WITH TIME ZONE clocks store into a zone-less TIME column (their
 /// zone is the session's, so this is the engine's session-local
@@ -47745,19 +47953,37 @@ impl Expr {
                 | (ExprType::Int | ExprType::Numeric, ExprType::Approx) => {
                     Some(ExprType::Approx)
                 }
-                // DATE/TIMESTAMP plus-or-minus a number of days (the
-                // amount rounds half away, probed: D + 0.5 moves a
-                // day); a number + temporal commutes for Add
-                (ExprType::Temporal(k), ExprType::Int | ExprType::Numeric)
-                    if !matches!(k, TKind::Time)
-                        && matches!(op, ArithOp::Add | ArithOp::Sub) =>
+                // DATE plus-or-minus a number of DAYS (the amount rounds
+                // half away, probed: D + 0.5 moves a day); a TIMESTAMP
+                // keeps the day FRACTION (probed: TS + 0.25 shifts six
+                // hours); a TIME takes SECONDS, fraction kept, wrapping
+                // at midnight (probed: T + 1.5 is +1.5 s); a number +
+                // temporal commutes for Add, and an APPROXIMATE amount
+                // is taken like a numeric one
+                (
+                    ExprType::Temporal(k),
+                    ExprType::Int | ExprType::Numeric | ExprType::Approx,
+                ) if matches!(k, TKind::Date | TKind::Time | TKind::Timestamp)
+                    && matches!(op, ArithOp::Add | ArithOp::Sub) =>
                 {
                     Some(ExprType::Temporal(k))
                 }
-                (ExprType::Int | ExprType::Numeric, ExprType::Temporal(k))
-                    if !matches!(k, TKind::Time) && matches!(op, ArithOp::Add) =>
+                (
+                    ExprType::Int | ExprType::Numeric | ExprType::Approx,
+                    ExprType::Temporal(k),
+                ) if matches!(k, TKind::Date | TKind::Time | TKind::Timestamp)
+                    && matches!(op, ArithOp::Add) =>
                 {
                     Some(ExprType::Temporal(k))
+                }
+                // DATE + TIME (either order) is that day at that time
+                // (probed); every other temporal Add stays refused (the
+                // engine's "Adding two DATE values or two TIME values")
+                (ExprType::Temporal(TKind::Date), ExprType::Temporal(TKind::Time))
+                | (ExprType::Temporal(TKind::Time), ExprType::Temporal(TKind::Date))
+                    if matches!(op, ArithOp::Add) =>
+                {
+                    Some(ExprType::Temporal(TKind::Timestamp))
                 }
                 // temporal difference: DATE - DATE is integer days;
                 // TIME - TIME is seconds at scale -4; any pair with a
@@ -48635,34 +48861,50 @@ impl Expr {
                                 }
                             }
                         }
-                        // temporal ± number of days / number + temporal
-                        (Some((d, u, k)), None, ArithOp::Add | ArithOp::Sub)
-                            if !matches!(k, TKind::Time) =>
-                        {
-                            let mut n = fn_int(&vb)?;
-                            if matches!(op, ArithOp::Sub) {
-                                n = -n;
-                            }
-                            dateadd_impl(ExtractPart::Day, n, d as i32, u as u32, k)?
+                        // temporal ± number / number + temporal. A DATE
+                        // moves by WHOLE days, the amount rounded half
+                        // away (probed: D + 0.5 moves a day, D + 1.5
+                        // moves two); a TIMESTAMP keeps the day FRACTION
+                        // (probed: TS + 0.25 shifts six hours); a TIME
+                        // takes SECONDS, fraction kept, wrapping at
+                        // midnight (probed: T + 1.5 is +1.5 s, T
+                        // '23:59:59' + 2 wraps to 00:00:01)
+                        (Some((d, u, k)), None, ArithOp::Add | ArithOp::Sub) => {
+                            let neg = matches!(op, ArithOp::Sub);
+                            temporal_shift(d, u, k, &vb, neg)?
                         }
-                        (None, Some((d, u, k)), ArithOp::Add)
-                            if !matches!(k, TKind::Time) =>
-                        {
-                            dateadd_impl(
-                                ExtractPart::Day,
-                                fn_int(&va)?,
-                                d as i32,
-                                u as u32,
-                                k,
-                            )?
+                        (None, Some((d, u, k)), ArithOp::Add) => {
+                            temporal_shift(d, u, k, &va, false)?
                         }
+                        // DATE + TIME (either order): that day at that
+                        // time (probed); every other temporal Add is
+                        // untyped upstream and never evaluates
+                        (
+                            Some((d, _, TKind::Date)),
+                            Some((_, u, TKind::Time)),
+                            ArithOp::Add,
+                        )
+                        | (
+                            Some((_, u, TKind::Time)),
+                            Some((d, _, TKind::Date)),
+                            ArithOp::Add,
+                        ) => Value::Timestamp(d as i32, u as u32),
                         _ => Value::Null,
                     }
                 }
             }
             Expr::Concat(a, b) => match (a.eval(values)?, b.eval(values)?) {
                 (Value::Null, _) | (_, Value::Null) => Value::Null,
-                (x, y) => Value::Text(format!("{}{}", x.render(), y.render())),
+                (x, y) => {
+                    // a BOOLEAN coerces to the SQL surface's TRUE/FALSE
+                    // (probed: TRUE || '' is 'TRUE'), not the lowercase
+                    // display form
+                    let r = |v: &Value| match v {
+                        Value::Bool(b) => (if *b { "TRUE" } else { "FALSE" }).to_string(),
+                        _ => v.render(),
+                    };
+                    Value::Text(format!("{}{}", r(&x), r(&y)))
+                }
             },
             Expr::Cast(e, t, cs) => {
                 let v = e.eval(values)?;
@@ -67842,8 +68084,25 @@ mod tests {
             encode_wire_value(&desc(dtype::INT64, 8, -2), &WireParam::Int(50, 0)),
             Some(Some(5000i64.to_le_bytes().to_vec()))
         );
-        // an inexact down-scale is refused, not truncated
-        assert!(encode_wire_value(&desc(dtype::LONG, 4, 1), &WireParam::Int(15, 0)).is_none());
+        // an inexact down-scale ROUNDS on the first dropped digit, half
+        // away from zero (the engine's adjustForScale - probed: 1.005
+        // into a NUMERIC(9,2) stores 1.01, 1.0049 stores 1.00)
+        assert_eq!(
+            encode_wire_value(&desc(dtype::LONG, 4, 1), &WireParam::Int(15, 0)),
+            Some(Some(2i32.to_le_bytes().to_vec()))
+        );
+        assert_eq!(
+            encode_wire_value(&desc(dtype::LONG, 4, -2), &WireParam::Int(1005, -3)),
+            Some(Some(101i32.to_le_bytes().to_vec()))
+        );
+        assert_eq!(
+            encode_wire_value(&desc(dtype::LONG, 4, -2), &WireParam::Int(10049, -4)),
+            Some(Some(100i32.to_le_bytes().to_vec()))
+        );
+        assert_eq!(
+            encode_wire_value(&desc(dtype::LONG, 4, -2), &WireParam::Int(-1005, -3)),
+            Some(Some((-101i32).to_le_bytes().to_vec()))
+        );
         // doubles round half away from zero into scaled targets (CVT)
         assert_eq!(
             encode_wire_value(&desc(dtype::LONG, 4, -2), &WireParam::Double(100.25)),
@@ -69790,8 +70049,10 @@ mod tests {
         let ts = enc(pc(Wire::Timestamp, 510, 8, 0), Value::Timestamp(61234, 500_000));
         assert_eq!(&ts[0..4], &61234i32.to_be_bytes());
         assert_eq!(&ts[4..8], &500_000u32.to_be_bytes());
-        // boolean pads to a 4-byte slot; double is 8 IEEE bytes
-        assert_eq!(enc(pc(Wire::Bool, 32764, 1, 0), Value::Bool(true)), 1i32.to_be_bytes());
+        // boolean is XDR OPAQUE: value byte FIRST, three pad bytes (the
+        // int-form pin here was wrong - isql read every TRUE as false);
+        // double is 8 IEEE bytes
+        assert_eq!(enc(pc(Wire::Bool, 32764, 1, 0), Value::Bool(true)), [1u8, 0, 0, 0]);
         assert_eq!(enc(pc(Wire::Double, 480, 8, 0), Value::Double(2.5)), 2.5f64.to_be_bytes());
     }
 
