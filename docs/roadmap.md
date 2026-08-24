@@ -256,6 +256,40 @@ A*1.5`). Boundary: an intermediate that overflows i64 raises 22003
 overflow" (both 22003) — fc's i128 numeric model, consistent with the
 server's own `numeric_bin`.
 
+**The EXACT-rounding family CEIL / CEILING / FLOOR / ROUND / TRUNC DONE
+(2026-08-24, `serve-real-rounding` 28):** the last of the common numeric
+SysFns, and the first EXACT-numeric ones whose result FORM (dtype width,
+scale and NUMERIC sub_type) the engine DERIVES from the operand - the piece
+that had blocked them. CEIL / CEILING / FLOOR promote the operand's storage
+one dtype step (SMALLINT -> INTEGER, INTEGER / BIGINT -> BIGINT, INT128
+stays), scale 0, sub_type 0, the way makeCeilFloor's makeLong / makeInt64 /
+makeInt128 do. ROUND / TRUNC copy the operand descriptor (dtype AND sub_type
+kept); a one-argument call forces scale 0, a two-argument call keeps the
+operand scale and rounds to n decimal places (ROUND(3.14159,2) is INT64
+scale -5, value 3.14000; ROUND(1234.5,-2) is scale -1, 1200.0). A literal
+NULL operand answers INTEGER (makeLong). An APPROXIMATE operand answers
+DOUBLE: CEIL / FLOOR are exact on the double, ROUND follows evlRound's CVT
+(d * 10^-s, add 0.5 + eps with eps = 1e-14 double / 1e-5 float, truncate) so
+the .x05 binary-representation cases land the decimal way (ROUND(1.005e0,2)
+= 1.01), TRUNC follows evlTrunc's modf; CEIL / FLOOR / TRUNC additionally
+string-convert a TEXT operand to DOUBLE (CEIL('3.2') = 4.0), while ROUND
+refuses text. ROUND rounds half AWAY from zero, TRUNC toward zero; the exact
+arithmetic is in i128 (`rounded_q` + `RndMode`), so a NUMERIC(30) operand
+keeps its INT128 result. A non-integer places argument is accepted (rounded
+to a whole count, as MOV_get_long does). The describe was threaded through
+`result_width_bytes`, `result_scale`, `numeric_subtype` and `rank_of`, with
+a polymorphic `type_of`. An adversarial review (3 dimensions, each verified
+against the live engine) found FOUR defects, all fixed and re-verified: the
+double .x05 rounding (evlRound's eps), a non-integer places argument, a
+BIGINT round-up raising integer- rather than numeric-overflow, and CEILING
+folding its column name to CEIL (a distinct `SysFn::Ceiling`). Boundaries
+(recorded): a DECFLOAT / INT128 operand (engine computes it in the
+decimal128 domain), ROUND(text) and wrong-arity messages (fc refuses
+generically), and a FLOAT operand (engine keeps FLOAT; fc widens to DOUBLE,
+its general approximate-EXPRESSION policy). With this the common
+numeric-function surface (transcendental + bitwise + exact-rounding) is
+complete.
+
 **The DOUBLE-precision math cluster DONE (2026-08-24, `serve-real-math`
 39):** the transcendental built-ins that answer a 64-bit float join the
 SysFn machinery - SQRT, POWER, EXP, LN, LOG10, LOG(base,x), PI() (a
