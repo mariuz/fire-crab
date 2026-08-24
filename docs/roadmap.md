@@ -256,6 +256,32 @@ A*1.5`). Boundary: an intermediate that overflows i64 raises 22003
 overflow" (both 22003) — fc's i128 numeric model, consistent with the
 server's own `numeric_bin`.
 
+**The ordered-set aggregates PERCENTILE_CONT / PERCENTILE_DISC DONE
+(2026-08-24, `serve-real-percentile` 6):** the inverse-distribution
+aggregates `PERCENTILE_x(fraction) WITHIN GROUP (ORDER BY expr [ASC|DESC])`
+- fc's first WITHIN GROUP form. Each collects the non-null ORDER BY values,
+sorts them, then PERCENTILE_CONT interpolates between the two bracketing the
+rank 1 + fraction*(n-1) and answers a DOUBLE (the rank and each
+interpolation term fused into multiply-adds to match the engine's
+`-ffp-contract=fast` to the last bit), while PERCENTILE_DISC picks the value
+at 1-based position ceil(fraction*n) (at least 1), KEEPING its exact type
+(its `make()` copies the ORDER BY descriptor - a NUMERIC(9,2) result stays
+LONG scale -2 sub_type 1, a scaled expression keeps sub_type 1, a VARCHAR
+VARYING). Both are nullable - NULL over an empty / all-null group and for a
+NULL fraction; a NULL ORDER BY value drops from the set; DESC reverses. The
+WITHIN GROUP clause is parsed by `parse_percentile_item`, carried through new
+`AggTarget::Percentile` / `AggSrc::Percentile`, folded in `compute_group`
+(`percentile_result`). An out-of-range non-null fraction raises the engine's
+DSQL error ("... in the range [0, 1]", primary "Dynamic SQL Error" via a new
+`EvalErr::DsqlDomain`). An adversarial review found three byte-exactness
+defects, all fixed: the interpolation missed the FMA contraction (now
+`mul_add`); a scaled-NUMERIC EXPRESSION order described sub_type 0 not 1; and
+a NULL fraction erred instead of answering NULL. Boundaries (recorded): a
+DECFLOAT / INT128 ORDER BY; PERCENTILE_CONT over a NON-numeric ORDER BY (the
+engine oddly answers NULL, fc refuses); more than one sort item; the FILTER
+form and a percentile inside an expression. MODE is not an engine function;
+LIST needs a computed-BLOB result fc cannot emit.
+
 **The two-argument statistical aggregates CORR / COVAR / REGR family DONE
 (2026-08-24, `serve-real-statagg2` 8):** the linear-correlation, covariance
 and linear-regression aggregates - CORR, COVAR_POP, COVAR_SAMP, REGR_SLOPE,
