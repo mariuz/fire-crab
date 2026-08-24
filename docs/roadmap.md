@@ -256,6 +256,15 @@ A*1.5`). Boundary: an intermediate that overflows i64 raises 22003
 overflow" (both 22003) — fc's i128 numeric model, consistent with the
 server's own `numeric_bin`.
 
+**More SysFn scalar functions DONE (2026-08-24): ASCII_VAL(s)
+(`serve-real-asciival` 3, the SMALLINT first-byte code), HASH(s)
+(`serve-real-hash` 3, the engine's default WeakHashContext - a 64-bit
+ELF-style rolling hash, ported byte-for-byte), and a text BLOB's CHARACTER
+SET now reaching the catalog + describe (fixed `serve-real-blobfilter`).**
+Boundaries: ASCII_CHAR(128..255) and OVERLAY need fc's byte-carrier
+CHAR-width handling; the DOUBLE math functions (POWER / SQRT / LOG / ROUND /
+CEIL / FLOOR / TRUNC) need f64 arithmetic the executor lacks.
+
 **Bitwise functions BIN_AND / BIN_OR / BIN_XOR / BIN_NOT / BIN_SHL / BIN_SHR
 DONE (2026-08-24, `serve-real-bitwise` 6):** the bitwise built-ins in the
 SysFn scalar machinery - AND/OR/XOR variadic (2+), NOT unary, the shifts
