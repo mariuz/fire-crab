@@ -13449,7 +13449,17 @@ fn parse_column_def(item: &str) -> Option<(fire_crab_ods::ddl::ColumnDef, Option
             if !dims.is_empty() {
                 return None; // no arrays of blobs
             }
-            let (sub_type, seg, cs) = parse_blob_type(b)?;
+            let (sub_type, seg, blob_cs) = parse_blob_type(b)?;
+            // the column-level CHARACTER SET was stripped off `ty` into `cs`
+            // before this match, so parse_blob_type never saw it - take it
+            // here (a TEXT blob's charset lands in RDB$CHARACTER_SET_ID and,
+            // via col_field_of, the format descriptor's scale = the describe
+            // charset).
+            let cs = blob_cs.or(cs);
+            // a CHARACTER SET makes the blob a TEXT (sub_type 1) blob even
+            // when it was declared SUB_TYPE 0 (probed: the engine promotes
+            // `BLOB SUB_TYPE 0 CHARACTER SET UTF8` to subtype 1, charset 4)
+            let sub_type = if cs.is_some() { 1 } else { sub_type };
             Some(fire_crab_ods::ddl::ColumnDef {
                 name: name.to_ascii_uppercase(),
                 field_type: 261,
