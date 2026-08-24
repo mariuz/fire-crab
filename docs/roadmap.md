@@ -473,9 +473,39 @@ run_body_source, try_procedure_blr) before the arity check, the value flowing
 through bind coercion (an int default into a NUMERIC parameter rescales; a
 NULL default fills NULL). Defaults must be trailing (a plain parameter after a
 defaulted one refuses, as the engine does); a call missing a REQUIRED
-parameter gives the byte-exact `Parameter mismatch`. Boundaries (recorded): a
-FUNCTION parameter default and a non-literal / context default refuse at
-CREATE (the engine accepts both; procedures + literals only for now).
+parameter gives the byte-exact `Parameter mismatch`. Boundary (recorded): a
+non-literal / context default refuses at CREATE (the engine accepts it).
+
+**DEFAULT parameters on a FUNCTION DONE (2026-08-24, `serve-real-funcdefault`
+11).** The same literal defaults, now on `RDB$FUNCTION_ARGUMENTS`: the dsql
+func refusal is gone, `plan_create_function` stores RDB$DEFAULT_SOURCE /
+RDB$DEFAULT_VALUE (the same helpers), `load_function` reads it back, and -
+because a function in a select list is arity-checked at query-compile, not at
+runtime - `user_function_sigs` now reports the REQUIRED arity (inputs without
+a default) as a 3-tuple `(Descriptor, arg-names, required)`, so the
+`RawExpr::UserFn` check relaxes to `args.len() ∈ [required, params.len()]`
+and `try_function_blr` fills the omitted tail with `with_proc_defaults`. A
+missing required argument is the byte-exact `Parameter <n> has no default
+value`, a surplus is `wrong number of arguments`. A `> i32` default refuses
+at CREATE (as on the procedure/column paths). Removing the dsql refusal also
+let a PACKAGE member parse a default, so the package writers were reconciled
+with the engine's rule that a default lives on the header DECLARATION, never
+in the body DEFINITION of a previously declared member: `create_package_body`
+refuses ANY body-member default - procedure or function, encodable or not
+(the source presence rides `proc_param_of` / `fn_arg_of` through a sentinel
+so a `> i32` body default cannot slip past) - with the engine's byte-exact
+DYN `dyn_defvaldecl_package_{proc,func}` vector (SQLERR 336397295 "CREATE
+PACKAGE BODY @1 failed" then DYN 336068875/336068898 "...previously declared
+packaged {procedure,function} @1.@2"); and `plan_create_package` refuses a
+HEADER declaration carrying a default rather than store a catalog it cannot
+preserve. An adversarial-review workflow found three real defects pre-commit
+(the packaged-header wrong-catalog, the `> i32` body-default split, the
+packaged-body accept-where-engine-rejects) - all fixed and gated. Boundaries
+(recorded): packaged routine parameter defaults (header storage + preserving
+the default across the body re-write, both of which the live engine does) and
+a PSQL body call that OMITS a defaulted function's trailing argument (the
+engine fills it, the select-list call fills it, fc's body-call path refuses)
+await a dedicated slice; non-literal / context defaults still refuse.
 
 **The IF statement (blr_if) in exe DONE (2026-08-23, `serve-real-psqlif`
 5):** the executor could not convert an IF, so a body combining IF/ELSE
