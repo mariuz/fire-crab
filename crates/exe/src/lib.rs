@@ -3098,6 +3098,37 @@ impl<'a> Exec<'a> {
                     // would lose it - refuse so the source path answers
                     return Err("nested function uses a generator".into());
                 }
+                // A call may OMIT the callee's defaulted trailing arguments:
+                // the engine stores `blr_function` with only the passed args
+                // and fills the rest from the callee's catalog at run time.
+                // Message 0 holds the input params (a value + a null slot
+                // each), so its slot count / 2 is the full input arity; when
+                // fewer were passed, fill the tail from the stored defaults,
+                // evaluated in this context (a literal needs none).
+                let in_count = req
+                    .messages
+                    .iter()
+                    .find(|(n, _)| *n == 0)
+                    .map(|(_, s)| s.len() / 2)
+                    .unwrap_or(argv.len());
+                if argv.len() < in_count {
+                    let defs = function_arg_defaults(file, ps, &qname)?;
+                    for slot in defs.iter().skip(argv.len()) {
+                        match slot {
+                            Some(dblr) => {
+                                let dex = parse_default_expr(dblr)?;
+                                let dv = self.eval(&dex)?;
+                                argv.push(dv);
+                            }
+                            None => {
+                                return Err(format!(
+                                    "function {} called with too few arguments",
+                                    qname
+                                ))
+                            }
+                        }
+                    }
+                }
                 // coerce each argument to the callee's PARAMETER scale/width
                 // (the engine's implicit conversion; bind_and_execute does
                 // not) - a value past the param width raises 22003
@@ -3656,6 +3687,96 @@ pub fn function_blr(file: &fire_crab_ods::Image, page_size: usize, name: &str) -
         }
     }
     Err(format!("function {} not found", name))
+}
+
+/// The stored parameter DEFAULTs of a FUNCTION, one entry per INPUT
+/// argument in position order (the RETURN, position 0, is skipped): the
+/// raw `RDB$DEFAULT_VALUE` BLR when the argument has a default, `None`
+/// when it does not. A body call that omits a defaulted trailing argument
+/// stores only the arguments it passed (the engine emits `blr_function`
+/// with that count and resolves the rest from here at run time), so the
+/// executor fills the tail from this list. Name resolution mirrors
+/// `function_blr` (a bare / PUBLIC name is the plain function; a dotted
+/// name is the packaged member).
+pub fn function_arg_defaults(
+    file: &fire_crab_ods::Image,
+    page_size: usize,
+    name: &str,
+) -> Result<Vec<Option<Vec<u8>>>, String> {
+    let parts: Vec<&str> = name.split('.').collect();
+    let (want_pkg, mname): (Option<&str>, &str) = match parts.as_slice() {
+        [n] => (None, *n),
+        [p, n] if p.eq_ignore_ascii_case("PUBLIC") => (None, *n),
+        [p, n] => (Some(*p), *n),
+        [_sc, p, n] => (Some(*p), *n),
+        _ => return Err(format!("function {} not found", name)),
+    };
+    let rel = resolve_relation(file, page_size, "RDB$FUNCTION_ARGUMENTS")
+        .ok_or("no RDB$FUNCTION_ARGUMENTS relation")?;
+    let formats = system_relation_formats(file, page_size, "RDB$FUNCTION_ARGUMENTS")
+        .ok_or("no RDB$FUNCTION_ARGUMENTS format")?;
+    let (_, descs) = formats.iter().max_by_key(|(n, _)| *n).ok_or("empty format list")?;
+    let cols = relation_columns(file, page_size, "RDB$FUNCTION_ARGUMENTS");
+    let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let name_f = fid("RDB$FUNCTION_NAME").ok_or("no RDB$FUNCTION_NAME column")?;
+    let pos_f = fid("RDB$ARGUMENT_POSITION").ok_or("no RDB$ARGUMENT_POSITION column")?;
+    let dv_f = fid("RDB$DEFAULT_VALUE").ok_or("no RDB$DEFAULT_VALUE column")?;
+    let pkg_f = fid("RDB$PACKAGE_NAME");
+    // collect (position, default-blr) for every INPUT row of this function
+    let mut rows: Vec<(i64, Option<Vec<u8>>)> = Vec::new();
+    for dp_no in relation_data_pages(file, page_size, rel) {
+        let Some(dp) = fire_crab_ods::page_at(file, page_size, dp_no).and_then(DataPage::decode)
+        else {
+            continue;
+        };
+        for r in dp.records() {
+            if !r.is_primary_record() {
+                continue;
+            }
+            let Some(image) = fire_crab_ods::data::assembled_image(file, page_size, &r) else {
+                continue;
+            };
+            let values = decode_record(&image, descs);
+            let Some(Value::Text(t)) = values.get(name_f) else { continue };
+            if t.trim_end() != mname {
+                continue;
+            }
+            let row_pkg = pkg_f.and_then(|i| values.get(i));
+            let pkg_ok = match want_pkg {
+                None => !matches!(row_pkg, Some(Value::Text(_))),
+                Some(p) => matches!(row_pkg, Some(Value::Text(rp)) if rp.trim_end().eq_ignore_ascii_case(p)),
+            };
+            if !pkg_ok {
+                continue;
+            }
+            let pos = match values.get(pos_f) {
+                Some(Value::Int(p)) => *p,
+                _ => continue,
+            };
+            if pos < 1 {
+                continue; // position 0 is the RETURN value, not an input
+            }
+            let dflt = match values.get(dv_f) {
+                Some(Value::Blob(brel, brec)) => read_blob_content(file, page_size, *brel, *brec),
+                _ => None,
+            };
+            rows.push((pos, dflt));
+        }
+    }
+    rows.sort_by_key(|(p, _)| *p);
+    Ok(rows.into_iter().map(|(_, d)| d).collect())
+}
+
+/// Decode a stored `RDB$DEFAULT_VALUE` BLR (`blr_version5 <value> blr_eoc`)
+/// into an expression - a literal or `blr_null`, the forms fc stores. The
+/// caller evaluates it in the current context (so a keyword default such as
+/// CURRENT_DATE would resolve too, though only literals are stored today).
+fn parse_default_expr(blr: &[u8]) -> Result<Expr, String> {
+    let mut p = P { b: blr, i: 0, uses_generators: false };
+    if p.u8()? != blr::VERSION5 {
+        return Err("default value not blr_version5".into());
+    }
+    p.expr()
 }
 
 

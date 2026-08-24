@@ -17185,7 +17185,7 @@ fn exe_can_run(blr: &[u8]) -> bool {
 /// (the engine registers the signature before compiling the body). The
 /// arity is the count of top-level parameters between the first `(` and
 /// its matching `)`; a bare name or `()` is arity 0.
-fn function_self_sig(sql: &str) -> Option<(String, usize)> {
+fn function_self_sig(sql: &str) -> Option<(String, usize, usize)> {
     let up = sql.trim_start().to_ascii_uppercase();
     let after = up.strip_prefix("CREATE")?.trim_start();
     // CREATE OR ALTER / RECREATE headers reach here too via the create_sql
@@ -17246,19 +17246,26 @@ fn function_self_sig(sql: &str) -> Option<(String, usize)> {
     } else {
         0
     };
-    Some((name, arity))
+    // required is left equal to the total for a self-reference: a function
+    // that omits its OWN defaulted argument in a recursive call refuses
+    // (fail-safe, exotic) - the header's per-parameter default clauses are
+    // not parsed here; a call to ANOTHER defaulted function uses the
+    // catalog-accurate required from plain_function_arities.
+    Some((name, arity, arity))
 }
 
 /// The PLAIN (non-packaged) user functions the catalog holds, as
 /// (uppercased name, input arity) - what dsql binds a bare `F(...)` body
 /// call to (blr_function). A packaged function is keyed with a dotted
 /// name and is excluded here (it needs its qualifier). Empty with no db.
-fn plain_function_arities(db: &Option<Database>) -> Vec<(String, usize)> {
+fn plain_function_arities(db: &Option<Database>) -> Vec<(String, usize, usize)> {
     match db {
         Some(d) => user_function_sigs(d)
             .into_iter()
             .filter(|(k, _)| !k.contains('.'))
-            .map(|(k, (_, args, _))| (k, args.len()))
+            // (name, TOTAL arity, REQUIRED arity) - required = inputs without
+            // a default, so a body call may omit the defaulted trailing args
+            .map(|(k, (_, args, required))| (k, args.len(), required))
             .collect(),
         None => Vec::new(),
     }
@@ -18022,7 +18029,7 @@ fn plan_create_function(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<D
         // the body being compiled defines the CURRENT signature, so it
         // overrides any stale catalog entry (a RECREATE that changes the
         // arity) rather than deferring to the old one
-        __pf.retain(|(n, _)| *n != sig.0);
+        __pf.retain(|(n, _, _)| *n != sig.0);
         __pf.push(sig);
     }
     let c = fire_crab_dsql::compile_function_full_with_funcs(s, &__pf)?;

@@ -1103,7 +1103,9 @@ struct P<'a> {
     /// (uppercased) and input arity - so a bare `F(...)` in value position
     /// binds to blr_function. Passed from the catalog by the server; empty
     /// when the caller has no catalog (the synthetic describe compiles).
-    plain_funcs: Vec<(String, usize)>,
+    /// Each entry is (name, TOTAL arity, REQUIRED arity) - required is the
+    /// inputs without a DEFAULT, so a body call may omit the defaulted tail.
+    plain_funcs: Vec<(String, usize, usize)>,
     /// set when the body binds a bare plain user-function call (Val::Fn) -
     /// such a body must run through the exe executor (the arithmetic-only
     /// source interpreter cannot call a function), so the server refuses it
@@ -2188,7 +2190,7 @@ impl<'a> P<'a> {
         // a PLAIN user function the catalog knows: a bare `F(...)` binds to
         // blr_function (an unknown name still falls through to the built-in
         // dispatch and refuses there, as the engine does)
-        if let Some(&(_, arity)) = self.plain_funcs.iter().find(|(m, _)| m == name) {
+        if let Some(&(_, total, required)) = self.plain_funcs.iter().find(|(m, _, _)| m == name) {
             self.i += 1; // (
             let mut args = Vec::new();
             if matches!(self.t.get(self.i), Some(Tok::RParen)) {
@@ -2206,8 +2208,11 @@ impl<'a> P<'a> {
                     }
                 }
             }
-            if args.len() != arity {
-                return None; // arity mismatch refuses, as the engine does
+            if args.len() < required || args.len() > total {
+                // too few (a required argument is missing) or too many
+                // refuses, as the engine does; the omitted DEFAULTED tail is
+                // filled by the executor from the callee's catalog at run
+                return None;
             }
             self.saw_user_fn = true;
             return Some(Val::Fn(name.to_string(), args));
@@ -10061,7 +10066,7 @@ fn compile_routine_full(
     sql: &str,
     is_function: bool,
     pkg: Option<(&str, &[(String, usize)])>,
-    plain_funcs: &[(String, usize)],
+    plain_funcs: &[(String, usize, usize)],
 ) -> Option<ProcCompiled> {
     let trimmed = sql.trim().trim_end_matches(';');
     let toks = lex(trimmed)?;
@@ -10073,7 +10078,7 @@ fn compile_routine_full(
     }
     p.plain_funcs = plain_funcs
         .iter()
-        .map(|(m, a)| (m.to_ascii_uppercase(), *a))
+        .map(|(m, a, r)| (m.to_ascii_uppercase(), *a, *r))
         .collect();
     let kw2 = if is_function { "FUNCTION" } else { "PROCEDURE" };
     if !(p.kw("CREATE") && p.kw(kw2)) {
@@ -10156,7 +10161,7 @@ pub fn compile_function_full(sql: &str) -> Option<ProcCompiled> {
 /// holds, so a bare `F(...)` in the body binds to blr_function.
 pub fn compile_procedure_full_with_funcs(
     sql: &str,
-    plain_funcs: &[(String, usize)],
+    plain_funcs: &[(String, usize, usize)],
 ) -> Option<ProcCompiled> {
     compile_routine_full(sql, false, None, plain_funcs)
 }
@@ -10164,7 +10169,7 @@ pub fn compile_procedure_full_with_funcs(
 /// [compile_function_full] with the plain user functions the catalog holds.
 pub fn compile_function_full_with_funcs(
     sql: &str,
-    plain_funcs: &[(String, usize)],
+    plain_funcs: &[(String, usize, usize)],
 ) -> Option<ProcCompiled> {
     compile_routine_full(sql, true, None, plain_funcs)
 }
