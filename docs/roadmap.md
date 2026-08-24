@@ -256,6 +256,61 @@ A*1.5`). Boundary: an intermediate that overflows i64 raises 22003
 overflow" (both 22003) — fc's i128 numeric model, consistent with the
 server's own `numeric_bin`.
 
+**The LIST aggregate - and the first COMPUTED BLOB - DONE (2026-08-24,
+`serve-real-list` 33):** `LIST([DISTINCT] arg [, separator])`, the
+string-concatenation aggregate whose result is a TEXT BLOB the server itself
+CREATES - the "computed-blob result fc cannot emit" that had blocked it. The
+fold renders each non-null value to text (`Value::render`; a blob argument by
+CONTENT through the blobcast reader; TRUE/FALSE for booleans; a CHAR column
+padded to its declared CHARACTER count in the plain fold but to its full BYTE
+image under DISTINCT - both measured) and mints a temp blob through a
+thread-local mint context the connection loop arms per op and drains into
+`Database::temp_blobs` at the top of the next op, ids floored at 0x40000000
+so a client's own op_create_blob ids never collide; the row carries the
+relation-0 id, and op_open_blob2 / op_info_blob / op_get_segment already
+resolve those through temp_blobs, so the whole read side came free - the
+segment structure byte-exact (each value and each separator its OWN segment,
+an empty piece writing none, type 0 segmented, the engine's counts). The
+separator (default `,`) is evaluated PER ROW and appended before each value
+after the first; a NULL separator at any append - or a NULL constant - marks
+the WHOLE result NULL (aggPass: dsc_dtype = 0); DISTINCT sorts and dedupes
+the values, its separator evaluated with the group's last row current
+(measured). The describe: BLOB sub_type 1, Nullable, named LIST, charset =
+the ARGUMENT's (a text column its own, a text expression the first text
+column it references, a bare literal or numeric NONE - all measured).
+WITHIN A GROUP the tie order is the engine's grouping sort, which compares
+its WHOLE sort record (sort.cpp `quick(n, j, m_longs)` runs over every
+native ULONG of [diddled keys][per-field null flags][referenced fields in
+field order]): fc reproduces the measured grain - ties follow the OTHER
+REFERENCED fields in field order (a field referenced only in the WHERE
+included, an unreferenced one excluded), a NULL in a referenced field sinks
+its row, a VARYING value compares by its count word first ('b','c','aa') and
+then by 4-byte words whose LAST byte dominates ('ba','ca','ab'), an INTEGER
+value as one UNSIGNED word (1, 256, -5) - while over a JOIN the join's
+delivery order holds (measured; fc's join row order already matches), and a
+DERIVED table, CTE, UNION source or VIEW flattens into the SAME record (a
+bound fold with no join parts tie-orders; a real join's does not). An
+adversarial review (three lenses, every finding verified against the live
+engine) and the author's own probes caught SEVEN real divergences
+pre-commit, all fixed: the tie extension first sorted by ALL fields where
+the engine sorts by REFERENCED ones; CHAR padding was byte- where the plain
+fold is character-count; the NULL flags, unsigned-int words and vary count
+word of the tie grain; the derived/CTE/UNION/view fold left in delivery
+order; `LIST(DISTINCT <blob>)` deduped by CONTENT where the engine keys the
+DESCRIPTOR (equal content never dedupes, id order) - now refused;
+`LIST(DISTINCT <collated>)` deduped binary where the engine dedupes by the
+collation key - now refused; and the segment split was 65535 where
+BLB_put_data splits at 32768. Boundaries (recorded): LIST inside an
+EXPRESSION (`CHAR_LENGTH(LIST(..))`, a HAVING comparison), in a scalar
+SUBQUERY or a DERIVED-table projection, the window OVER () form, and
+`INSERT ... SELECT LIST(..)` refuse where the engine answers; the malformed
+shapes (three arguments, `LIST(*)`) refuse with fc's generic vector where
+the engine spells -104; the tie order's word-granular corners
+(multi-text-field packing, a derived source's own WHERE fields, a reordered
+or computed derived projection, a collated or blob-id tie field) are
+unpinned; a blob id opened after its transaction ends degrades to the empty
+blob rather than the engine's invalid-id error.
+
 **The ordered-set aggregates PERCENTILE_CONT / PERCENTILE_DISC DONE
 (2026-08-24, `serve-real-percentile` 6):** the inverse-distribution
 aggregates `PERCENTILE_x(fraction) WITHIN GROUP (ORDER BY expr [ASC|DESC])`
@@ -280,7 +335,7 @@ a NULL fraction erred instead of answering NULL. Boundaries (recorded): a
 DECFLOAT / INT128 ORDER BY; PERCENTILE_CONT over a NON-numeric ORDER BY (the
 engine oddly answers NULL, fc refuses); more than one sort item; the FILTER
 form and a percentile inside an expression. MODE is not an engine function;
-LIST needs a computed-BLOB result fc cannot emit.
+LIST arrived in the next slice (the computed blob with it).
 
 **The two-argument statistical aggregates CORR / COVAR / REGR family DONE
 (2026-08-24, `serve-real-statagg2` 8):** the linear-correlation, covariance
@@ -308,7 +363,7 @@ domain, fc refuses); these folds inside an EXPRESSION (CASE / COALESCE / a
 comparison / a scalar subquery / a window OVER) refuse, the same
 top-level-select-item limit VAR / STDDEV carry. MODE is not an engine
 function (probed -104); PERCENTILE_CONT / PERCENTILE_DISC (ordered-set) and
-LIST (a computed-BLOB result) remain separate slices.
+LIST (a computed-BLOB result) followed as their own slices - both done.
 
 **The EXACT-rounding family CEIL / CEILING / FLOOR / ROUND / TRUNC DONE
 (2026-08-24, `serve-real-rounding` 28):** the last of the common numeric
@@ -998,8 +1053,8 @@ pointer-page and TIP page numbers is the next step when it dominates.
   bucket - byte-identical to the engine across bucket counts and with
   PARTITION BY, an INT64 named NTILE. Joins the RankFn machinery
   (ROW_NUMBER / RANK / DENSE_RANK). Boundary: an expression bucket count.
-  (Probed the same day and left: LIST/GROUP_CONCAT needs a COMPUTED BLOB
-  result fc cannot yet emit - `CAST(x AS BLOB)` refuses; CORR/regr and
+  (Probed the same day and left: LIST/GROUP_CONCAT needed a COMPUTED BLOB
+  result - since arrived with the LIST slice, though `CAST(x AS BLOB)` still refuses; CORR/regr and
   PERCENTILE_CONT/DISC ordered-set aggregates; NTILE done, LAG/LEAD with
   offset+default already worked.)
 - **EXECUTE STATEMENT positional + named parameters DONE (2026-08-22,
