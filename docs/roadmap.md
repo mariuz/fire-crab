@@ -503,9 +503,29 @@ preserve. An adversarial-review workflow found three real defects pre-commit
 packaged-body accept-where-engine-rejects) - all fixed and gated. Boundaries
 (recorded): packaged routine parameter defaults (header storage + preserving
 the default across the body re-write, both of which the live engine does) and
-non-literal / context defaults still refuse; packaged routine parameter
-defaults (header storage + preserving it across the body re-write) await a
-dedicated slice.
+non-literal / context defaults still refuse.
+
+**Packaged routine HEADER parameter defaults DONE (2026-08-24,
+`serve-real-pkgdefault` 7).** A DEFAULT on a packaged routine's HEADER
+declaration - the canonical place the engine keeps it (a body default is the
+-607 error, already refused). `plan_create_package`'s conv/fnarg header
+closures now carry the literal default (the function return never gets one),
+an un-encodable `> i32` refuses the CREATE, and create_package's declaration
+writers store `RDB$DEFAULT_SOURCE/VALUE`. `create_package_body` PRESERVES it
+across the member re-write: the body re-declares members without a default,
+the re-write deletes and recreates each member's parameter rows, so new
+`carried_member_defaults` reads the header's stored defaults (package-aware,
+by parameter name) and re-applies them onto the fresh rows. The fill paths
+need nothing new - an external call (a packaged function in a select list or
+a body, a packaged procedure via EXECUTE PROCEDURE) resolves the default
+through the same catalog-driven, package-aware machinery a plain routine
+uses. Verified byte-for-byte incl the defaults surviving in BOTH catalogs,
+cross-member scoping (a same-named parameter on another member is not
+polluted), and all call forms. Boundary (recorded): a package body member's
+UNQUALIFIED sibling call cannot omit the sibling's defaulted tail - the
+header's required arity is not reliably visible at body-COMPILE (fc's
+plan-time catalog is stale for same-connection DDL, and a header-only
+declaration has no BLR for load_function); an external call fills fine.
 
 **Omitted-default body function calls DONE (2026-08-24, `serve-real-bodydefault`
 6).** `RETURN FA(X)` where `FA(B, A DEFAULT 5)` now works from inside a
