@@ -256,6 +256,62 @@ A*1.5`). Boundary: an intermediate that overflows i64 raises 22003
 overflow" (both 22003) — fc's i128 numeric model, consistent with the
 server's own `numeric_bin`.
 
+**Constant EXPRESSIONS in INSERT ... VALUES - and the boolean wire fix -
+DONE (2026-08-24, `serve-real-insertexpr` 8):** the engine accepts any
+value expression in a VALUES list; fire-crab's was a fixed set of token
+shapes, so `1e3`, `1+2`, `'A'||'B'`, `(5)`, `UPPER('x')`, `CAST('55' AS
+INTEGER)`, `DATE '..' + 1`, `2.5 * 2`, `1 > 0`, `COALESCE(NULL, 3.25)` -
+fourteen of sixteen probed engine-accepted forms - refused. The VALUES
+list now splits at TEXT level (the paren- and quote-aware
+`split_set_list`); the staged token shapes keep their arms (a parameter,
+DEFAULT, the generators, a blob-bound string), and ANY other item parses
+as an expression, resolves WITH NO COLUMNS, evaluates at plan (the query
+side's own clock rule) and stages as `InsVal::Wire` through
+`value_to_wireparam` - FACTORED OUT of the UPDATE expression tier, which
+now calls the same mapping, so the two DML halves cannot drift. Folded
+CASE/COALESCE/IIF/ABS/SQRT/TRIM, mixed `'a' || 5`, negative parens,
+scaled and DOUBLE arithmetic, boolean comparisons and temporal
+arithmetic all store what the engine stores, the engine reads fc's rows
+line for line, and a NULL-answering fold stores NULL. **Found on the
+way, fixed: the BOOLEAN WIRE ENCODING sent a big-endian int (value byte
+LAST) where XDR opaque puts the value byte FIRST - every boolean OUTPUT
+column read `<false>` at isql/libfbclient, `SELECT TRUE` included, while
+WHERE and CAST were right; the engine read fc's STORED booleans
+correctly all along (the writes were fine), and the patched node
+driver's metadata-directed decode masked it in the node gates. The old
+unit pin asserted the wrong form and was corrected; both dedicated
+boolean gates and the sweep stay green.** An adversarial review (three lenses, live-verified) plus the author's
+probes caught and fixed SEVEN more divergences: an UNTYPED fold whose
+eval answered NULL (`'5' + 1` - the engine's "Strings cannot be added")
+would have stored a silent NULL row - the INSERT arm refuses it, the
+UPDATE expression tier gained the same type gate, and a `CASE ... ELSE
+NULL END` stays typeable (an explicit NULL branch is now TRANSPARENT in
+the conditional type, the engine's rule); TIME ± n arrived (the amount
+is SECONDS, fraction kept, wrapping at midnight), DATE + TIME composes a
+timestamp, and a TIMESTAMP ± n keeps the day FRACTION (TS + 0.25 shifts
+six hours - fc's whole-day rounding there was a pre-existing wrong
+answer in queries too); `TRUE || ''` spells TRUE; a DOUBLE fold into a
+NUMERIC lands the .xx5 edge with the CVT epsilon (1.005e0 is 1.01); an
+exact fold with extra fraction digits ROUNDS on the first dropped digit
+half-away (the engine's adjustForScale - 1.005 into a NUMERIC(9,2) is
+1.01, 1.0049 is 1.00; every wire parameter shares the rule); scaled and
+approximate folds RENDER into text columns ('2.50', the 16-digit
+double); a bare TRUE/FALSE literal into a text column spells TRUE/FALSE
+(the '1'/'0' stays the client-bound-parameter rule); and a TRAILING
+COMMA in a VALUES or SET list refuses (-104 there; the splitter's
+dropped empty tail had it silently executing - the UPDATE side had that
+hole before the slice). The stale `SELECT TM + 1` refusal pin in
+serve-real-datemath was retired for a differential.
+Boundaries (recorded): a
+scalar-SUBQUERY value refuses (the engine answers it); a RAISING fold
+(`1/0`) refuses at plan where the engine raises its typed 22012 at
+execute, and an overflow/truncation fold the same way - the INSERT
+vector family; a `?` inside an expression refuses (engine 07002); hex
+literals and SQL COMMENTS inside a statement are pre-existing lexer
+gaps (fc refuses `SELECT 64 /* c */` too - a comment-stripping slice is
+a candidate); a blob-valued expression into a BLOB column refuses (the
+plain string form works).
+
 **Temporal values in DML - and the engine's WHOLE string-to-datetime
 grammar - DONE (2026-08-24, `serve-real-temporaldml` 16):** until this
 slice fire-crab could not put a DATE/TIME/TIMESTAMP value into a column
