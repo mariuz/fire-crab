@@ -256,6 +256,43 @@ A*1.5`). Boundary: an intermediate that overflows i64 raises 22003
 overflow" (both 22003) — fc's i128 numeric model, consistent with the
 server's own `numeric_bin`.
 
+**The DOUBLE-precision math cluster DONE (2026-08-24, `serve-real-math`
+39):** the transcendental built-ins that answer a 64-bit float join the
+SysFn machinery - SQRT, POWER, EXP, LN, LOG10, LOG(base,x), PI() (a
+zero-argument constant, needing an empty-parens parse), the trig SIN / COS
+/ TAN / COT / ASIN / ACOS / ATAN / ATAN2, and the hyperbolic SINH / COSH /
+TANH. Each folds its operands to f64 (`fn_f64`, `exact_to_f64` for exact
+operands) and calls Rust libm, which on this glibc host answers bit-for-bit
+what the engine's C libm answers - the 17-digit DOUBLE matches to the last
+place over literals, INTEGER / NUMERIC / DOUBLE columns, nesting and a WHERE
+predicate; result DOUBLE (sqltype 480, `ExprType::Approx`), NULL propagates.
+The domain / range / overflow errors match byte for byte: SQRT of a
+negative, LN / LOG10 / LOG-value <= 0, LOG base <= 0, ASIN / ACOS outside
+[-1,1], COT(0) raise `expression_eval_err` with the function name
+(`EvalErr::MathDomain`); POWER(0, negative) -> `sysf_invalid_zeropowneg`
+and POWER(negative, non-integral) -> `sysf_invalid_negpowfp` (an
+APPROXIMATE exponent counts as non-integral, mirroring evlPower's
+`!isExact()`); an infinite result raises float overflow - EXP / POWER the
+plain `exception_float_overflow` (22003), SINH / COSH the NAMED
+`sysf_fp_overflow` ("... in built-in function @1") via a new
+`EvalErr::MathOverflow`; a TEXT operand converts to double by the numeric
+grammar (SQRT('4') = 2.0), raising 22018 with the raw string when it is not
+a number. **A DOUBLE-store bug fixed beside them:** `encode_wire_value`'s
+WireParam::Int -> DOUBLE/REAL arm was guarded `if ws == 0`, so a fractional
+literal (2.5 arrives as Int(25, ws=-1)) refused and the INSERT silently
+stored NO row (found pre-existing on clean HEAD, `SELECT` of any stored
+DOUBLE returned only the NULL rows); it now converts the whole magnitude
+with `exact_to_f64`, byte-exact vs the engine for DOUBLE and FLOAT. An
+adversarial review (4 dimensions, each verified against the live engine)
+confirmed six defects - the POWER domains, the two overflow vectors and the
+text operand, all fixed - plus a sixth kept as a **boundary: a DECFLOAT or
+INT128 operand**, which the engine computes in the decimal128 domain to a
+34-digit DECFLOAT, is REFUSED (fc's decfloat module is add/sub/mul/div/round
+only - no decimal128 transcendentals; a separate slice). The exact-rounding
+family CEIL / CEILING / FLOOR / ROUND / TRUNC is also a separate slice (its
+result scale, integer width and NUMERIC sub-type the engine derives from the
+operand - `int_func_form` carries neither scale nor sub-type yet).
+
 **More SysFn scalar functions DONE (2026-08-24): ASCII_VAL(s)
 (`serve-real-asciival` 3, the SMALLINT first-byte code), HASH(s)
 (`serve-real-hash` 3, the engine's default WeakHashContext - a 64-bit
