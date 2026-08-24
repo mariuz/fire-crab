@@ -12316,6 +12316,19 @@ fn int_func_form(e: &Expr, descs: &[Descriptor]) -> Option<(Wire, i32, i32)> {
             dtype::LONG => Some(int64),
             _ => None,
         },
+        // the result takes the width of the widest operand, read off the
+        // function's own numeric rank: AND/OR/XOR/NOT floor at INTEGER, the
+        // shifts floor at BIGINT, and either widens to INT128
+        SysFn::BinShl
+        | SysFn::BinShr
+        | SysFn::BinAnd
+        | SysFn::BinOr
+        | SysFn::BinXor
+        | SysFn::BinNot => match e.rank_of(descs) {
+            Some(NumRank::Long) => Some(long),
+            Some(NumRank::I128) => Some((Wire::Int128, 32752, 16)),
+            _ => Some(int64),
+        },
         _ => None,
     }
 }
@@ -41509,6 +41522,18 @@ enum SysFn {
     /// (probed: MOD(12.50, 5) = 3), then a truncated `%`
     Mod,
     Sign,
+    /// BIN_AND / BIN_OR / BIN_XOR (variadic, 2+) - the bitwise fold over
+    /// integer operands. Result type is the WIDEST operand (never narrower
+    /// than INTEGER); BIN_AND(5000000000,3) is a BIGINT.
+    BinAnd,
+    BinOr,
+    BinXor,
+    /// BIN_NOT(a) - the one's complement (BIN_NOT(0) = -1).
+    BinNot,
+    /// BIN_SHL / BIN_SHR(a, n) - arithmetic shift (sign-preserving:
+    /// BIN_SHR(-8,1) = -4); the engine types the result BIGINT.
+    BinShl,
+    BinShr,
     Lpad,
     Rpad,
     /// `DATEADD(<n> <unit> TO <t>)` / `DATEADD(<unit>, <n>, <t>)` -
@@ -41597,6 +41622,12 @@ impl SysFn {
             SysFn::Abs => "ABS",
             SysFn::Mod => "MOD",
             SysFn::Sign => "SIGN",
+            SysFn::BinAnd => "BIN_AND",
+            SysFn::BinOr => "BIN_OR",
+            SysFn::BinXor => "BIN_XOR",
+            SysFn::BinNot => "BIN_NOT",
+            SysFn::BinShl => "BIN_SHL",
+            SysFn::BinShr => "BIN_SHR",
             SysFn::Lpad => "LPAD",
             SysFn::Rpad => "RPAD",
             SysFn::Extract(_) => "EXTRACT",
@@ -42964,6 +42995,12 @@ fn sysfn_named(word: &str) -> Option<SysFn> {
         "ABS" => SysFn::Abs,
         "MOD" => SysFn::Mod,
         "SIGN" => SysFn::Sign,
+        "BIN_AND" => SysFn::BinAnd,
+        "BIN_OR" => SysFn::BinOr,
+        "BIN_XOR" => SysFn::BinXor,
+        "BIN_NOT" => SysFn::BinNot,
+        "BIN_SHL" => SysFn::BinShl,
+        "BIN_SHR" => SysFn::BinShr,
         "LPAD" => SysFn::Lpad,
         "RPAD" => SysFn::Rpad,
         // the part in the variant is a placeholder for the NAME check;
@@ -43181,7 +43218,9 @@ fn parse_sysfn_call(up: &str, b: &[char], pos: &mut usize) -> Option<RawExpr> {
         | SysFn::Reverse
         | SysFn::Abs
         | SysFn::Sign => (1, 1),
-        SysFn::Left | SysFn::Right | SysFn::Mod => (2, 2),
+        SysFn::Left | SysFn::Right | SysFn::Mod | SysFn::BinShl | SysFn::BinShr => (2, 2),
+        SysFn::BinNot => (1, 1),
+        SysFn::BinAnd | SysFn::BinOr | SysFn::BinXor => (2, usize::MAX),
         SysFn::Replace => (3, 3),
         SysFn::Lpad | SysFn::Rpad => (2, 3),
         SysFn::Substring
@@ -46126,6 +46165,21 @@ impl Expr {
                             None
                         }
                     }
+                    // the bitwise functions take integer operands and
+                    // answer an integer; a text operand refuses (the engine
+                    // would string-convert - unpinned here)
+                    SysFn::BinAnd
+                    | SysFn::BinOr
+                    | SysFn::BinXor
+                    | SysFn::BinNot
+                    | SysFn::BinShl
+                    | SysFn::BinShr => {
+                        if ts.iter().all(|t| *t == ExprType::Int) {
+                            Some(ExprType::Int)
+                        } else {
+                            None
+                        }
+                    }
                     // ABS keeps its operand's numeric type (and scale:
                     // ABS(12.50) is 12.50, probed)
                     SysFn::Abs => match ts[0] {
@@ -46338,6 +46392,25 @@ impl Expr {
                 // a MOD result's magnitude is below its divisor's, but
                 // an INT128 divisor can still put it past i64
                 SysFn::Mod => args.iter().filter_map(|a| a.rank_of(descs)).max(),
+                // BIN_AND / BIN_OR / BIN_XOR / BIN_NOT rank as the widest
+                // operand, but never below INTEGER; the shifts always rank
+                // BIGINT (the engine types BIN_SHL / BIN_SHR INT64)
+                SysFn::BinAnd | SysFn::BinOr | SysFn::BinXor | SysFn::BinNot => Some(
+                    args.iter()
+                        .filter_map(|a| a.rank_of(descs))
+                        .max()
+                        .unwrap_or(NumRank::Long)
+                        .max(NumRank::Long),
+                ),
+                // a shift widens to its value operand's rank, floored at
+                // BIGINT (BIN_SHL(1,4) is BIGINT; BIN_SHL of an INT128 is
+                // INT128 - probed)
+                SysFn::BinShl | SysFn::BinShr => Some(
+                    args.first()
+                        .and_then(|a| a.rank_of(descs))
+                        .unwrap_or(NumRank::I64)
+                        .max(NumRank::I64),
+                ),
                 SysFn::CharLength
                 | SysFn::OctetLength
         | SysFn::OctetLengthCs(_)
@@ -47269,6 +47342,55 @@ impl Expr {
                             return Err(EvalErr::DivideByZero);
                         }
                         scaled_value(a % b, 0)
+                    }
+                    // the bitwise fold - each operand rounded to an integer
+                    // in i128 (so an INT128-wide operand keeps its magnitude,
+                    // as MOD does), AND/OR/XOR across all of them; NOT is the
+                    // one's complement. scaled_value picks the result's own
+                    // width (INTEGER/BIGINT/INT128), matching the describe.
+                    SysFn::BinAnd | SysFn::BinOr | SysFn::BinXor | SysFn::BinNot => {
+                        let to_int = |v: &Value| -> Result<i128, EvalErr> {
+                            let (raw, scale) =
+                                numeric_parts(v).ok_or(EvalErr::ConversionError(None))?;
+                            Ok(round_scaled_to_int(raw, scale))
+                        };
+                        let mut acc = to_int(&vs[0])?;
+                        if matches!(f, SysFn::BinNot) {
+                            acc = !acc;
+                        }
+                        for v in &vs[1..] {
+                            let x = to_int(v)?;
+                            acc = match f {
+                                SysFn::BinAnd => acc & x,
+                                SysFn::BinOr => acc | x,
+                                _ => acc ^ x,
+                            };
+                        }
+                        scaled_value(acc, 0)
+                    }
+                    // an arithmetic (sign-preserving) shift, the amount
+                    // taken modulo the result width. A value within i64
+                    // shifts in i64 (a BIGINT result, wrap at 64); a wider
+                    // value shifts in i128 (an INT128 result, wrap at 128).
+                    SysFn::BinShl | SysFn::BinShr => {
+                        let amt = fn_int(&vs[1])? as u32;
+                        let (raw, scale) =
+                            numeric_parts(&vs[0]).ok_or(EvalErr::ConversionError(None))?;
+                        let val = round_scaled_to_int(raw, scale);
+                        let shl = matches!(f, SysFn::BinShl);
+                        let result = match i64::try_from(val) {
+                            Ok(v) => {
+                                (if shl { v.wrapping_shl(amt) } else { v.wrapping_shr(amt) }) as i128
+                            }
+                            Err(_) => {
+                                if shl {
+                                    val.wrapping_shl(amt)
+                                } else {
+                                    val.wrapping_shr(amt)
+                                }
+                            }
+                        };
+                        scaled_value(result, 0)
                     }
                     SysFn::Sign => {
                         let (raw, _) =
@@ -57558,6 +57680,14 @@ fn expr_no_raise(e: &Expr, descs: &[Descriptor]) -> bool {
                     safe_num(&args[0]) && divisor_ok
                 }
                 SysFn::Sign => safe_num(&args[0]),
+                // the bitwise functions never raise (no divide, no overflow
+                // in the fold) as long as every operand is a safe number
+                SysFn::BinNot => safe_num(&args[0]),
+                SysFn::BinAnd
+                | SysFn::BinOr
+                | SysFn::BinXor
+                | SysFn::BinShl
+                | SysFn::BinShr => args.iter().all(safe_num),
                 // ABS of i128::MIN cannot negate - fence INT128 out
                 SysFn::Abs => safe_num(&args[0]),
             }
