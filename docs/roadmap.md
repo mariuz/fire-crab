@@ -631,15 +631,20 @@ blr_function2 in exe.
 Other gaps: an explicit `PLAN` (WITH LOCK / FOR UPDATE / OPTIMIZE are
 done); a `?` inside any PSQL query (loop, cursor, `EXECUTE STATEMENT`,
 `SELECT INTO` — `server.rs:47089`); `GEN_ID` inside an autonomous body;
-`INSERT … VALUES` without a column list in PSQL; `EXECUTE BLOCK` with
-input parameters (RETURNS is done); `EXECUTE STATEMENT` with `USING` /
-`ON EXTERNAL` / `AS USER` (the dynamic operand and POSITIONAL + NAMED
-parameters are done); PSQL literals held as i32 (`serve-real-psqlerrors`);
-the BLR compiler narrower than the interpreter (a bare `EXCEPTION;` in a
-`CREATE TRIGGER` body refuses, `server.rs:12764`); `IF (c) THEN CONTINUE`
-(bare CONTINUE as an IF then-branch) refuses at CREATE (DSQL); a read
-inside a PSQL body is read-committed regardless of the transaction's
-snapshot.
+`INSERT … VALUES` without a column list in PSQL (probed 2026-08-24: needs
+BOTH the dsql compiler AND the wire-local `parse_trig_block` interpreter
+taught, each with the target's non-computed columns threaded in from the
+catalog — dsql alone stores correct BLR but `run_body_source` still refuses,
+a create/serve split, so it is a two-parser slice); `EXECUTE BLOCK` with
+input parameters (RETURNS is done; not cleanly isql-gateable — isql passes no
+input SQLDA); `EXECUTE STATEMENT` with `USING` / `ON EXTERNAL` / `AS USER`
+(the dynamic operand and POSITIONAL + NAMED parameters are done); PSQL
+literals held as i32 (`serve-real-psqlerrors`); the BLR compiler narrower
+than the interpreter (a bare `EXCEPTION;` in a `CREATE TRIGGER` body refuses,
+`server.rs:12764`); a read inside a PSQL body is read-committed regardless of
+the transaction's snapshot. (Corrected 2026-08-24: `IF (c) THEN CONTINUE` /
+`THEN LEAVE` — bare control as an IF then-branch — ALREADY WORK, an earlier
+stale claim.)
 
 Not features (the engine's own `-104`, fc refuses too — an error-text
 parity gap only): `INTERSECT`/`EXCEPT`, `WITH TIES`, `PERCENT`,
