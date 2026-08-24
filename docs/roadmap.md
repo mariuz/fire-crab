@@ -256,6 +256,34 @@ A*1.5`). Boundary: an intermediate that overflows i64 raises 22003
 overflow" (both 22003) — fc's i128 numeric model, consistent with the
 server's own `numeric_bin`.
 
+**The two-argument statistical aggregates CORR / COVAR / REGR family DONE
+(2026-08-24, `serve-real-statagg2` 8):** the linear-correlation, covariance
+and linear-regression aggregates - CORR, COVAR_POP, COVAR_SAMP, REGR_SLOPE,
+REGR_INTERCEPT, REGR_COUNT, REGR_R2, REGR_AVGX, REGR_AVGY, REGR_SXX,
+REGR_SYY, REGR_SXY. Each folds n and the five paired sums (Sx / Sxx / Sy /
+Syy / Sxy) over the rows where BOTH arguments are non-null (the FIRST SQL
+argument is Y, the SECOND X, per the standard and the engine's CorrAggNode /
+RegrAggNode), then answers from the engine's closed formula (`stat2_result`)
+folded in f64 in the SAME operation order so the DOUBLE bits match - over
+DOUBLE, INTEGER and NUMERIC operands, whole-table and grouped, with the
+FILTER (WHERE ...) form. The result is DOUBLE (BIGINT for REGR_COUNT), and
+the engine DESCRIBES every one NOT nullable though they CAN be NULL at run
+time (an empty or single-row group, a zero variance) - a NULL travels on a
+not-nullable column and renders as 0; fc matches both. New plumbing:
+`AggTarget::Pair` / `AggSrc::Pair`, `split_top_comma2`, and the four
+duplicated inline aggregate-name matches folded into `AggFn::name()`. An
+adversarial review (each dimension verified against the live engine) found
+three byte-exactness defects, all fixed: a scaled-NUMERIC operand converted
+by multiply-by-reciprocal (raw * 0.01) where the engine's CVT DIVIDES (raw /
+100.0) - now `exact_to_f64`; and REGR_INTERCEPT's `avgY - slope*avgX`, which
+the engine compiles as a fused multiply-add - now `mul_add`, so the last bit
+agrees. Boundaries (recorded): a DECFLOAT / INT128 operand (decimal128
+domain, fc refuses); these folds inside an EXPRESSION (CASE / COALESCE / a
+comparison / a scalar subquery / a window OVER) refuse, the same
+top-level-select-item limit VAR / STDDEV carry. MODE is not an engine
+function (probed -104); PERCENTILE_CONT / PERCENTILE_DISC (ordered-set) and
+LIST (a computed-BLOB result) remain separate slices.
+
 **The EXACT-rounding family CEIL / CEILING / FLOOR / ROUND / TRUNC DONE
 (2026-08-24, `serve-real-rounding` 28):** the last of the common numeric
 SysFns, and the first EXACT-numeric ones whose result FORM (dtype width,
