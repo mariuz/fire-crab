@@ -8523,6 +8523,9 @@ enum AggSrc {
     /// zero in `SUM(A / 0)`) aborts the fetch with the engine's own
     /// status vector, which is why the group fold is fallible
     Expr(Expr),
+    /// the two operands of a CORR / COVAR / REGR fold (Y, X), each
+    /// evaluated per row; a pair folds only when NEITHER is null
+    Pair(Expr, Expr),
 }
 
 /// A scalar-returning aggregate function.
@@ -8549,9 +8552,77 @@ enum AggFn {
     VarSamp,
     StddevPop,
     StddevSamp,
+    /// The two-argument statistical folds - linear correlation, covariance
+    /// and the linear-regression family. Each folds n and the five sums
+    /// Sx / Sxx / Sy / Syy / Sxy over the pairs where BOTH arguments are
+    /// non-null (the FIRST SQL argument is Y, the SECOND is X, per the SQL
+    /// standard and the engine's CorrAggNode), then answers a DOUBLE (or a
+    /// BIGINT for REGR_COUNT) from a closed formula. They CAN be NULL at
+    /// run time (an empty / single-row group, a zero variance) yet the
+    /// engine DESCRIBES them not-nullable, like the one-argument folds.
+    Corr,
+    CovarPop,
+    CovarSamp,
+    RegrSlope,
+    RegrIntercept,
+    RegrCount,
+    RegrR2,
+    RegrAvgx,
+    RegrAvgy,
+    RegrSxx,
+    RegrSyy,
+    RegrSxy,
 }
 
 impl AggFn {
+    /// The function's own name - the column name of an un-aliased
+    /// aggregate (checked against the engine's SQLDA).
+    fn name(self) -> &'static str {
+        match self {
+            AggFn::Count => "COUNT",
+            AggFn::Min => "MIN",
+            AggFn::Max => "MAX",
+            AggFn::Sum => "SUM",
+            AggFn::Avg => "AVG",
+            AggFn::VarPop => "VAR_POP",
+            AggFn::VarSamp => "VAR_SAMP",
+            AggFn::StddevPop => "STDDEV_POP",
+            AggFn::StddevSamp => "STDDEV_SAMP",
+            AggFn::Corr => "CORR",
+            AggFn::CovarPop => "COVAR_POP",
+            AggFn::CovarSamp => "COVAR_SAMP",
+            AggFn::RegrSlope => "REGR_SLOPE",
+            AggFn::RegrIntercept => "REGR_INTERCEPT",
+            AggFn::RegrCount => "REGR_COUNT",
+            AggFn::RegrR2 => "REGR_R2",
+            AggFn::RegrAvgx => "REGR_AVGX",
+            AggFn::RegrAvgy => "REGR_AVGY",
+            AggFn::RegrSxx => "REGR_SXX",
+            AggFn::RegrSyy => "REGR_SYY",
+            AggFn::RegrSxy => "REGR_SXY",
+        }
+    }
+
+    /// the two-argument statistical folds (CORR / COVAR / REGR family) -
+    /// each answers from n + the five paired sums
+    fn is_statistical2(self) -> bool {
+        matches!(
+            self,
+            AggFn::Corr
+                | AggFn::CovarPop
+                | AggFn::CovarSamp
+                | AggFn::RegrSlope
+                | AggFn::RegrIntercept
+                | AggFn::RegrCount
+                | AggFn::RegrR2
+                | AggFn::RegrAvgx
+                | AggFn::RegrAvgy
+                | AggFn::RegrSxx
+                | AggFn::RegrSyy
+                | AggFn::RegrSxy
+        )
+    }
+
     /// the four DOUBLE-valued, never-NULL statistical folds
     fn is_statistical(self) -> bool {
         matches!(
@@ -8677,6 +8748,10 @@ enum AggTarget {
     /// an EXPRESSION argument - `SUM(A + B)`, `MIN(UPPER(S))`,
     /// `COUNT(NULLIF(G, 1))` - evaluated per row before the fold
     Expr(RawExpr),
+    /// the two arguments of a CORR / COVAR / REGR fold - `(Y, X)`, in SQL
+    /// order (Y first). Both are evaluated per row and a pair is folded
+    /// only when NEITHER is null.
+    Pair(RawExpr, RawExpr),
 }
 
 /// A comparison operator in a WHERE term.
@@ -31793,17 +31868,7 @@ fn plan_query_inner_ctx(
                                 c.rsplit('.').next().unwrap_or(c).to_string()
                             })),
                             SelItem::Agg(f, _, alias) => Some(alias.clone().unwrap_or_else(|| {
-                                match f {
-                                    AggFn::Count => "COUNT",
-                                    AggFn::Min => "MIN",
-                                    AggFn::Max => "MAX",
-                                    AggFn::Sum => "SUM",
-                                    AggFn::Avg => "AVG",
-                                    AggFn::VarPop => "VAR_POP",
-                                    AggFn::VarSamp => "VAR_SAMP",
-                                    AggFn::StddevPop => "STDDEV_POP",
-                                    AggFn::StddevSamp => "STDDEV_SAMP",
-                                }
+                                f.name()
                                 .to_string()
                             })),
                             SelItem::Expr(_, n, _) => Some(n.clone()),
@@ -32768,17 +32833,7 @@ fn plan_query_inner_ctx(
                     // the engine names a lone aggregate's column by its
                     // function (probed) - CONSTANT here was a standing
                     // difference the aggfn gate's header checks surfaced
-                    let fname = match func {
-                        AggFn::Count => "COUNT",
-                        AggFn::Min => "MIN",
-                        AggFn::Max => "MAX",
-                        AggFn::Sum => "SUM",
-                        AggFn::Avg => "AVG",
-                        AggFn::VarPop => "VAR_POP",
-                        AggFn::VarSamp => "VAR_SAMP",
-                        AggFn::StddevPop => "STDDEV_POP",
-                        AggFn::StddevSamp => "STDDEV_SAMP",
-                    }
+                    let fname = func.name()
                     .to_string();
                     let name = alias.clone().unwrap_or_else(|| fname.clone());
                     // MEASURED: MIN/MAX announce the SOURCE column's
@@ -32800,6 +32855,21 @@ fn plan_query_inner_ctx(
                         AggFn::VarPop | AggFn::VarSamp | AggFn::StddevPop | AggFn::StddevSamp => {
                             ScalarTy::double()
                         }
+                        // REGR_COUNT is a BIGINT and, like COUNT, NOT
+                        // nullable (0 over an empty group); every other
+                        // two-argument fold a DOUBLE (also not-nullable)
+                        AggFn::RegrCount => ScalarTy::count(),
+                        AggFn::Corr
+                        | AggFn::CovarPop
+                        | AggFn::CovarSamp
+                        | AggFn::RegrSlope
+                        | AggFn::RegrIntercept
+                        | AggFn::RegrR2
+                        | AggFn::RegrAvgx
+                        | AggFn::RegrAvgy
+                        | AggFn::RegrSxx
+                        | AggFn::RegrSyy
+                        | AggFn::RegrSxy => ScalarTy::double(),
                     };
                     return Some(Plan::Scalar(
                         ScalarVal::Agg(Box::new(AggPlan {
@@ -33420,6 +33490,7 @@ fn agg_result_desc(
         // the statistical folds are top-level select items only - VAR/STDDEV
         // in a HAVING or a scalar subquery refuse (no scalar descriptor here)
         AggFn::VarPop | AggFn::VarSamp | AggFn::StddevPop | AggFn::StddevSamp => return None,
+        AggFn::Corr | AggFn::CovarPop | AggFn::CovarSamp | AggFn::RegrSlope | AggFn::RegrIntercept | AggFn::RegrCount | AggFn::RegrR2 | AggFn::RegrAvgx | AggFn::RegrAvgy | AggFn::RegrSxx | AggFn::RegrSyy | AggFn::RegrSxy => return None,
     })
 }
 
@@ -33767,6 +33838,13 @@ fn build_group_items(
                     AggTarget::Expr(raw) => {
                         (AggSrc::Expr(resolve_expr(raw, columns, descs)?), false)
                     }
+                    AggTarget::Pair(y, x) => (
+                        AggSrc::Pair(
+                            resolve_expr(y, columns, descs)?,
+                            resolve_expr(x, columns, descs)?,
+                        ),
+                        false,
+                    ),
                 };
                 if distinct && !matches!(func, AggFn::Count) {
                     return None; // only COUNT(DISTINCT) is answered
@@ -33892,22 +33970,46 @@ fn build_group_items(
                         }
                         (Wire::Double, 480, 8, 0, 0)
                     }
+                    // the two-argument folds: REGR_COUNT is a BIGINT, the
+                    // rest a DOUBLE, and the engine describes ALL of them
+                    // NOT nullable though they CAN be null at run time. Both
+                    // operands must be numeric / approximate.
+                    AggFn::Corr
+                    | AggFn::CovarPop
+                    | AggFn::CovarSamp
+                    | AggFn::RegrSlope
+                    | AggFn::RegrIntercept
+                    | AggFn::RegrCount
+                    | AggFn::RegrR2
+                    | AggFn::RegrAvgx
+                    | AggFn::RegrAvgy
+                    | AggFn::RegrSxx
+                    | AggFn::RegrSyy
+                    | AggFn::RegrSxy => {
+                        if let AggSrc::Pair(y, x) = &src {
+                            for e in [y, x] {
+                                if !matches!(
+                                    e.type_of(descs),
+                                    Some(
+                                        ExprType::Int | ExprType::Numeric | ExprType::Approx
+                                    )
+                                ) {
+                                    return None;
+                                }
+                            }
+                        }
+                        if matches!(func, AggFn::RegrCount) {
+                            (Wire::Int64, 580, 8, 0, 0)
+                        } else {
+                            (Wire::Double, 480, 8, 0, 0)
+                        }
+                    }
                 };
                 // the engine titles aggregate output columns by function
                 // unless the item carries an alias - and the FUNCTION
                 // stays the field name either way (probed: COUNT(*) AS
                 // N is field COUNT, alias N)
-                let fname = match func {
-                    AggFn::Count => "COUNT",
-                    AggFn::Min => "MIN",
-                    AggFn::Max => "MAX",
-                    AggFn::Sum => "SUM",
-                    AggFn::Avg => "AVG",
-                    AggFn::VarPop => "VAR_POP",
-                    AggFn::VarSamp => "VAR_SAMP",
-                    AggFn::StddevPop => "STDDEV_POP",
-                    AggFn::StddevSamp => "STDDEV_SAMP",
-                }
+                let fname = func.name()
                 .to_string();
                 let name = agg_alias.clone().unwrap_or_else(|| fname.clone());
                 cols.push(ProjCol {
@@ -33926,8 +34028,12 @@ fn build_group_items(
                             | AggFn::VarSamp
                             | AggFn::StddevPop
                             | AggFn::StddevSamp
-                    ) {
-                        sql_type // NOT nullable - the engine's own flag
+                    ) || func.is_statistical2()
+                    {
+                        // NOT nullable - the engine's own flag. The
+                        // two-argument folds CAN be null at run time yet the
+                        // engine still describes them not-nullable.
+                        sql_type
                     } else {
                         nullable(sql_type)
                     },
@@ -34514,6 +34620,7 @@ fn aggregate(
                 AggFn::VarPop | AggFn::VarSamp | AggFn::StddevPop | AggFn::StddevSamp,
                 _,
             ) => unreachable!(),
+            (AggFn::Corr | AggFn::CovarPop | AggFn::CovarSamp | AggFn::RegrSlope | AggFn::RegrIntercept | AggFn::RegrCount | AggFn::RegrR2 | AggFn::RegrAvgx | AggFn::RegrAvgy | AggFn::RegrSxx | AggFn::RegrSyy | AggFn::RegrSxy, _) => unreachable!(),
         });
     });
     if hit != 0 {
@@ -37237,6 +37344,81 @@ fn group_rows(
 /// from the first row (all rows in the group share it); COUNT(*) counts
 /// rows, COUNT(col) non-null values; MIN/MAX/SUM fold the non-null
 /// integers, NULL if there are none.
+/// The closed-form value of a two-argument statistical fold from n and the
+/// five paired sums (Sx / Sxx / Sy / Syy / Sxy), computed byte-for-byte the
+/// way CorrAggNode / RegrAggNode do in f64. X is the SECOND SQL argument, Y
+/// the FIRST. Any of them may be NULL at run time (an empty / single-row
+/// group, a zero variance); REGR_COUNT is the pair count (0, never NULL).
+fn stat2_result(func: AggFn, n: i64, sx: f64, sx2: f64, sy: f64, sy2: f64, sxy: f64) -> Value {
+    if matches!(func, AggFn::RegrCount) {
+        return Value::Int(n);
+    }
+    let nf = n as f64;
+    if matches!(func, AggFn::CovarSamp) {
+        return if n < 2 {
+            Value::Null
+        } else {
+            Value::Double((sxy - sy * sx / nf) / (n - 1) as f64)
+        };
+    }
+    if n == 0 {
+        return Value::Null;
+    }
+    let var_pop_x = (sx2 - sx * sx / nf) / nf;
+    let var_pop_y = (sy2 - sy * sy / nf) / nf;
+    let covar_pop = (sxy - sy * sx / nf) / nf;
+    let avg_x = sx / nf;
+    let avg_y = sy / nf;
+    let slope = covar_pop / var_pop_x;
+    let sq = var_pop_x.sqrt() * var_pop_y.sqrt();
+    let corr = covar_pop / sq;
+    match func {
+        AggFn::CovarPop => Value::Double(covar_pop),
+        AggFn::Corr => {
+            if sq == 0.0 {
+                Value::Null
+            } else {
+                Value::Double(corr)
+            }
+        }
+        AggFn::RegrAvgx => Value::Double(avg_x),
+        AggFn::RegrAvgy => Value::Double(avg_y),
+        AggFn::RegrIntercept => {
+            if var_pop_x == 0.0 {
+                Value::Null
+            } else {
+                // the engine's `avgY - slope * avgX` is compiled with
+                // floating-point contraction (a fused multiply-add), a
+                // single rounding - matched here with mul_add so the last
+                // bit agrees (plain multiply-then-subtract is one ULP off)
+                Value::Double(slope.mul_add(-avg_x, avg_y))
+            }
+        }
+        AggFn::RegrR2 => {
+            if var_pop_x == 0.0 {
+                Value::Null
+            } else if var_pop_y == 0.0 {
+                Value::Double(1.0)
+            } else if sq == 0.0 {
+                Value::Null
+            } else {
+                Value::Double(corr * corr)
+            }
+        }
+        AggFn::RegrSlope => {
+            if var_pop_x == 0.0 {
+                Value::Null
+            } else {
+                Value::Double(covar_pop / var_pop_x)
+            }
+        }
+        AggFn::RegrSxx => Value::Double(nf * var_pop_x),
+        AggFn::RegrSxy => Value::Double(nf * covar_pop),
+        AggFn::RegrSyy => Value::Double(nf * var_pop_y),
+        _ => Value::Null, // RegrCount / CovarSamp handled above
+    }
+}
+
 fn compute_group(rows: &[Vec<Value>], gitems: &[GItem]) -> Result<Vec<Value>, EvalErr> {
     // an aggregate's per-row input: the field's value, or the
     // expression evaluated against the row (whose error - divide by
@@ -37246,6 +37428,8 @@ fn compute_group(rows: &[Vec<Value>], gitems: &[GItem]) -> Result<Vec<Value>, Ev
             AggSrc::Star => Value::Int(1),
             AggSrc::Field(fid) => r.get(*fid).cloned().unwrap_or(Value::Null),
             AggSrc::Expr(e) => e.eval(r)?,
+            // a paired source folds through its own arm, never here
+            AggSrc::Pair(y, _) => y.eval(r)?,
         })
     }
     gitems
@@ -37404,6 +37588,40 @@ fn compute_group(rows: &[Vec<Value>], gitems: &[GItem]) -> Result<Vec<Value>, Ev
                         AggFn::VarPop | AggFn::VarSamp => var,
                         _ => var.max(0.0).sqrt(),
                     })
+                }
+                // the two-argument CORR / COVAR / REGR folds: n + the five
+                // paired sums over the rows where BOTH operands are non-null,
+                // then the engine's closed formula (see stat2_result). The
+                // accumulation ORDER mirrors CorrAggNode::aggPass so the f64
+                // bits match.
+                GItem::Agg(func, AggSrc::Pair(ye, xe), _) if func.is_statistical2() => {
+                    let to_f64 = |v: &Value| -> Option<f64> {
+                        // the engine's CVT_get_double DIVIDES by the positive
+                        // power of ten for a scaled numeric (raw / 100.0), a
+                        // single correctly-rounded step - exact_to_f64 matches;
+                        // multiplying by 10^-scale would round twice
+                        if let Some((raw, sc)) = numeric_parts(v) {
+                            Some(exact_to_f64(raw, sc as i32))
+                        } else {
+                            approx_of(v)
+                        }
+                    };
+                    let (mut n, mut sx, mut sx2, mut sy, mut sy2, mut sxy) =
+                        (0i64, 0f64, 0f64, 0f64, 0f64, 0f64);
+                    for r in rows {
+                        // the FIRST SQL argument is Y, the second X
+                        let (yv, xv) = (ye.eval(r)?, xe.eval(r)?);
+                        let (Some(y), Some(x)) = (to_f64(&yv), to_f64(&xv)) else {
+                            continue; // either operand null / non-numeric: skip
+                        };
+                        n += 1;
+                        sx += x;
+                        sx2 += x * x;
+                        sy += y;
+                        sy2 += y * y;
+                        sxy += x * y;
+                    }
+                    stat2_result(*func, n, sx, sx2, sy, sy2, sxy)
                 }
                 GItem::Const(v) => v.clone(), // a per-group constant slot
                 GItem::Agg(..) => Value::Null, // MIN/MAX/SUM(*): rejected at plan
@@ -48693,17 +48911,7 @@ fn subquery_item_name(sub: &str) -> Option<(String, String)> {
                 Some((bare.clone(), alias.clone().unwrap_or(bare)))
             }
             SelItem::Agg(f, _, alias) => {
-                let fname = match f {
-                    AggFn::Count => "COUNT",
-                    AggFn::Min => "MIN",
-                    AggFn::Max => "MAX",
-                    AggFn::Sum => "SUM",
-                    AggFn::Avg => "AVG",
-                    AggFn::VarPop => "VAR_POP",
-                    AggFn::VarSamp => "VAR_SAMP",
-                    AggFn::StddevPop => "STDDEV_POP",
-                    AggFn::StddevSamp => "STDDEV_SAMP",
-                }
+                let fname = f.name()
                 .to_string();
                 Some((fname.clone(), alias.clone().unwrap_or(fname)))
             }
@@ -49597,6 +49805,7 @@ fn eval_subquery_rel(
         // builds it, so a subquery accepts the same arguments a SELECT
         // list does - a column, `COUNT(DISTINCT col)`, or an expression
         let (src, distinct) = match &target {
+            AggTarget::Pair(..) => return None,
             AggTarget::Star => (AggSrc::Star, false),
             AggTarget::Col(name) | AggTarget::Distinct(name) => {
                 let c = columns.iter().find(|c| c.name.eq_ignore_ascii_case(name))?;
@@ -50177,6 +50386,18 @@ fn agg_named(word: &str) -> bool {
         word.to_ascii_uppercase().as_str(),
         "COUNT" | "MIN" | "MAX" | "SUM" | "AVG" | "VAR_POP" | "VAR_SAMP" | "STDDEV_POP"
             | "STDDEV_SAMP"
+            | "CORR"
+            | "COVAR_POP"
+            | "COVAR_SAMP"
+            | "REGR_SLOPE"
+            | "REGR_INTERCEPT"
+            | "REGR_COUNT"
+            | "REGR_R2"
+            | "REGR_AVGX"
+            | "REGR_AVGY"
+            | "REGR_SXX"
+            | "REGR_SYY"
+            | "REGR_SXY"
     )
 }
 
@@ -50520,6 +50741,56 @@ fn split_agg_filter(t: &str) -> Option<(&str, &str)> {
     Some((t[..=call_end].trim(), cond))
 }
 
+/// TRUE for the name of a two-argument statistical fold (CORR / COVAR /
+/// REGR family), case-insensitively.
+fn is_stat2_name(name: &str) -> bool {
+    matches!(
+        name.to_ascii_uppercase().as_str(),
+        "CORR"
+            | "COVAR_POP"
+            | "COVAR_SAMP"
+            | "REGR_SLOPE"
+            | "REGR_INTERCEPT"
+            | "REGR_COUNT"
+            | "REGR_R2"
+            | "REGR_AVGX"
+            | "REGR_AVGY"
+            | "REGR_SXX"
+            | "REGR_SYY"
+            | "REGR_SXY"
+    )
+}
+
+/// Split a two-argument call's argument text on its ONE top-level comma
+/// (outside parens / brackets / string literals). `None` unless there is
+/// exactly one - a three-argument call or a bare column does not match.
+fn split_top_comma2(s: &str) -> Option<(&str, &str)> {
+    let (mut depth, mut quote) = (0i32, 0u8);
+    let b = s.as_bytes();
+    let mut at = None;
+    for (i, &c) in b.iter().enumerate() {
+        if quote != 0 {
+            if c == quote {
+                quote = 0;
+            }
+            continue;
+        }
+        match c {
+            b'\'' | b'"' => quote = c,
+            b'(' | b'[' => depth += 1,
+            b')' | b']' => depth -= 1,
+            b',' if depth == 0 => {
+                if at.is_some() {
+                    return None; // more than one top-level comma
+                }
+                at = Some(i);
+            }
+            _ => {}
+        }
+    }
+    at.map(|i| (&s[..i], &s[i + 1..]))
+}
+
 fn parse_agg_item(item: &str) -> Option<(AggFn, AggTarget)> {
     let t = item.trim();
     // `<agg>(arg) FILTER (WHERE c)` folds only the rows the condition
@@ -50558,6 +50829,20 @@ fn parse_agg_item(item: &str) -> Option<(AggFn, AggTarget)> {
                 format!("{}(DISTINCT CASE WHEN ({}) THEN {} END)", fname, cond, inner);
             return parse_agg_item(&rewritten);
         }
+        // a FILTERed two-argument fold drops a non-matching row from BOTH
+        // arguments (either becoming NULL skips the pair), so wrap each side
+        if is_stat2_name(fname) {
+            let (a, b) = split_top_comma2(arg)?;
+            let rewritten = format!(
+                "{}(CASE WHEN ({}) THEN {} END, CASE WHEN ({}) THEN {} END)",
+                fname,
+                cond,
+                a.trim(),
+                cond,
+                b.trim()
+            );
+            return parse_agg_item(&rewritten);
+        }
         let then = if arg == "*" { "1" } else { arg };
         let rewritten = format!("{}(CASE WHEN ({}) THEN {} END)", fname, cond, then);
         return parse_agg_item(&rewritten);
@@ -50576,9 +50861,30 @@ fn parse_agg_item(item: &str) -> Option<(AggFn, AggTarget)> {
         "VAR_SAMP" => AggFn::VarSamp,
         "STDDEV_POP" => AggFn::StddevPop,
         "STDDEV_SAMP" => AggFn::StddevSamp,
+        "CORR" => AggFn::Corr,
+        "COVAR_POP" => AggFn::CovarPop,
+        "COVAR_SAMP" => AggFn::CovarSamp,
+        "REGR_SLOPE" => AggFn::RegrSlope,
+        "REGR_INTERCEPT" => AggFn::RegrIntercept,
+        "REGR_COUNT" => AggFn::RegrCount,
+        "REGR_R2" => AggFn::RegrR2,
+        "REGR_AVGX" => AggFn::RegrAvgx,
+        "REGR_AVGY" => AggFn::RegrAvgy,
+        "REGR_SXX" => AggFn::RegrSxx,
+        "REGR_SYY" => AggFn::RegrSyy,
+        "REGR_SXY" => AggFn::RegrSxy,
         _ => return None,
     };
     let arg = t[open + 1..t.len() - 1].trim();
+    // the two-argument statistical folds take `(Y, X)` - split on the
+    // top-level comma and parse each side as an expression
+    if func.is_statistical2() {
+        let (a, b) = split_top_comma2(arg)?;
+        return Some((
+            func,
+            AggTarget::Pair(parse_raw_expr_any(a.trim())?, parse_raw_expr_any(b.trim())?),
+        ));
+    }
     // COUNT(DISTINCT col) - the keyword must stand as its own word
     if let Some(rest) = arg
         .get(..8)
@@ -50652,15 +50958,7 @@ fn parse_projection(proj: &str) -> Option<Proj> {
             // the engine titles a window column by its function unless
             // aliased (probed: COUNT/SUM/.../ROW_NUMBER/RANK/DENSE_RANK)
             let fname = match &func {
-                WinFunc::Agg(AggFn::Count, _) => "COUNT",
-                WinFunc::Agg(AggFn::Min, _) => "MIN",
-                WinFunc::Agg(AggFn::Max, _) => "MAX",
-                WinFunc::Agg(AggFn::Sum, _) => "SUM",
-                WinFunc::Agg(AggFn::Avg, _) => "AVG",
-                WinFunc::Agg(AggFn::VarPop, _) => "VAR_POP",
-                WinFunc::Agg(AggFn::VarSamp, _) => "VAR_SAMP",
-                WinFunc::Agg(AggFn::StddevPop, _) => "STDDEV_POP",
-                WinFunc::Agg(AggFn::StddevSamp, _) => "STDDEV_SAMP",
+                WinFunc::Agg(a, _) => a.name(),
                 WinFunc::Rank(RankFn::RowNumber) => "ROW_NUMBER",
                 WinFunc::Rank(RankFn::Rank) => "RANK",
                 WinFunc::Rank(RankFn::DenseRank) => "DENSE_RANK",
@@ -50884,15 +51182,7 @@ fn default_expr_name(raw: &RawExpr) -> String {
         RawExpr::Param(_) => "",
         // a lone aggregate is described by its FUNCTION name - the same
         // law the select list's own aggregate items follow
-        RawExpr::Agg(AggFn::Count, _) => "COUNT",
-        RawExpr::Agg(AggFn::Min, _) => "MIN",
-        RawExpr::Agg(AggFn::Max, _) => "MAX",
-        RawExpr::Agg(AggFn::Sum, _) => "SUM",
-        RawExpr::Agg(AggFn::Avg, _) => "AVG",
-        RawExpr::Agg(AggFn::VarPop, _) => "VAR_POP",
-        RawExpr::Agg(AggFn::VarSamp, _) => "VAR_SAMP",
-        RawExpr::Agg(AggFn::StddevPop, _) => "STDDEV_POP",
-        RawExpr::Agg(AggFn::StddevSamp, _) => "STDDEV_SAMP",
+        RawExpr::Agg(a, _) => a.name(),
         // the spelling names the column, parenthesised or not
         RawExpr::Gen { step: None, .. } => "NEXT_VALUE",
         RawExpr::Gen { step: Some(_), .. } => "GEN_ID",
@@ -58819,6 +59109,7 @@ fn resolve_having(
                         Text,
                     }
                     let (fid, src_expr, hkind, distinct) = match target {
+                        AggTarget::Pair(..) => return None,
                         AggTarget::Star => (None, None, HKind::Int, false),
                         AggTarget::Col(name) | AggTarget::Distinct(name) => {
                             let rc =
