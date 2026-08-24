@@ -473,8 +473,33 @@ run_body_source, try_procedure_blr) before the arity check, the value flowing
 through bind coercion (an int default into a NUMERIC parameter rescales; a
 NULL default fills NULL). Defaults must be trailing (a plain parameter after a
 defaulted one refuses, as the engine does); a call missing a REQUIRED
-parameter gives the byte-exact `Parameter mismatch`. Boundary (recorded): a
-non-literal / context default refuses at CREATE (the engine accepts it).
+parameter gives the byte-exact `Parameter mismatch`.
+
+**CONTEXT / keyword parameter defaults DONE (2026-08-24,
+`serve-real-ctxdefault` 9).** `DEFAULT CURRENT_USER` / `USER` /
+`CURRENT_ROLE` / `CURRENT_CONNECTION` / `CURRENT_DATE` / `CURRENT_TIME` /
+`CURRENT_TIMESTAMP` - resolved PER CALL, not a fixed literal. dsql's default
+parser takes the keyword, `proc_default_of` stores the engine's own keyword
+BLR (byte-identical incl the date/time forms) + verbatim source; a
+`ProcParam` carries the UNEVALUATED context form (`default_ctx`) apart from a
+literal value, and `with_proc_defaults(ctx)` resolves it per call from the
+session (`eval_ctx_default`: the login upper-cased, role NONE, the
+attachment id, the clock) wherever a ctx is in reach - the source path
+(EXECUTE PROCEDURE, a selectable procedure at execute) and the select-list
+function fill. The ctx-less BLR fast paths leave a context default short so
+the call falls to the source path; the selectable-procedure PLAN path accepts
+a context-default shortfall for the execute-time fill. `required` counts
+inputs with neither a literal nor a context default. Verified byte-for-byte
+incl the catalog + BLR, fc serving the login/role forms, provided-arg-wins,
+the byte-exact missing-required vector, the ENGINE running fc's file, and the
+literal->context->literal mix; a three-lens adversarial review found no
+defects. Boundaries (recorded): a DATE/TIME/TIMESTAMP-typed routine BODY is
+not one fc's arithmetic source interpreter runs (a pre-existing gap,
+orthogonal), so fc stores those context defaults and the ENGINE reads them
+but fc does not itself serve the fill; CURRENT_CONNECTION is self-referential
+(fc's own attach id); a PSQL BODY call omitting a context-defaulted argument
+refuses (exe has no context opcode); CURRENT_TRANSACTION and the LOCAL* forms
+refuse at CREATE.
 
 **DEFAULT parameters on a FUNCTION DONE (2026-08-24, `serve-real-funcdefault`
 11).** The same literal defaults, now on `RDB$FUNCTION_ARGUMENTS`: the dsql
