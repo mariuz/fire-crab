@@ -12303,6 +12303,7 @@ fn int_func_form(e: &Expr, descs: &[Descriptor]) -> Option<(Wire, i32, i32)> {
     match f {
         SysFn::SetContext => Some(long), // INTEGER, probed
         SysFn::Sign => Some(short),
+        SysFn::AsciiVal => Some(short), // SMALLINT (probed)
         SysFn::CharLength | SysFn::OctetLength | SysFn::OctetLengthCs(_) | SysFn::Position => Some(long),
         SysFn::BlobOctetLength => Some(int64), // a blob's length is a BIGINT (probed)
         SysFn::Mod => match src_dtype(0)? {
@@ -41534,6 +41535,9 @@ enum SysFn {
     /// BIN_SHR(-8,1) = -4); the engine types the result BIGINT.
     BinShl,
     BinShr,
+    /// ASCII_VAL(s) - the SMALLINT code of the first byte (0 for an
+    /// empty string).
+    AsciiVal,
     Lpad,
     Rpad,
     /// `DATEADD(<n> <unit> TO <t>)` / `DATEADD(<unit>, <n>, <t>)` -
@@ -41628,6 +41632,7 @@ impl SysFn {
             SysFn::BinNot => "BIN_NOT",
             SysFn::BinShl => "BIN_SHL",
             SysFn::BinShr => "BIN_SHR",
+            SysFn::AsciiVal => "ASCII_VAL",
             SysFn::Lpad => "LPAD",
             SysFn::Rpad => "RPAD",
             SysFn::Extract(_) => "EXTRACT",
@@ -43001,6 +43006,7 @@ fn sysfn_named(word: &str) -> Option<SysFn> {
         "BIN_NOT" => SysFn::BinNot,
         "BIN_SHL" => SysFn::BinShl,
         "BIN_SHR" => SysFn::BinShr,
+        "ASCII_VAL" => SysFn::AsciiVal,
         "LPAD" => SysFn::Lpad,
         "RPAD" => SysFn::Rpad,
         // the part in the variant is a placeholder for the NAME check;
@@ -43219,7 +43225,7 @@ fn parse_sysfn_call(up: &str, b: &[char], pos: &mut usize) -> Option<RawExpr> {
         | SysFn::Abs
         | SysFn::Sign => (1, 1),
         SysFn::Left | SysFn::Right | SysFn::Mod | SysFn::BinShl | SysFn::BinShr => (2, 2),
-        SysFn::BinNot => (1, 1),
+        SysFn::BinNot | SysFn::AsciiVal => (1, 1),
         SysFn::BinAnd | SysFn::BinOr | SysFn::BinXor => (2, usize::MAX),
         SysFn::Replace => (3, 3),
         SysFn::Lpad | SysFn::Rpad => (2, 3),
@@ -46165,6 +46171,15 @@ impl Expr {
                             None
                         }
                     }
+                    // ASCII_VAL(text) -> SMALLINT (an integer); a wrong-typed
+                    // operand refuses (an unpinned conversion).
+                    SysFn::AsciiVal => {
+                        if ts[0] == ExprType::Text {
+                            Some(ExprType::Int)
+                        } else {
+                            None
+                        }
+                    }
                     // the bitwise functions take integer operands and
                     // answer an integer; a text operand refuses (the engine
                     // would string-convert - unpinned here)
@@ -46418,6 +46433,7 @@ impl Expr {
         | SysFn::OctetLengthCs(_)
                 | SysFn::Position
                 | SysFn::Sign
+                | SysFn::AsciiVal
                 | SysFn::Extract(_) => Some(NumRank::Long),
                 SysFn::BlobOctetLength => Some(NumRank::I64),
                 _ => None, // the text-valued functions
@@ -47396,6 +47412,12 @@ impl Expr {
                         let (raw, _) =
                             numeric_parts(&vs[0]).ok_or(EvalErr::ConversionError(None))?;
                         Value::Int(raw.signum() as i64)
+                    }
+                    // ASCII_VAL(s): the code of the first character (a
+                    // carrier char's code IS its byte, 0..255), 0 for empty.
+                    SysFn::AsciiVal => {
+                        let s = fn_text(&vs[0]);
+                        Value::Int(s.chars().next().map_or(0, |c| c as i64))
                     }
                     SysFn::Lpad | SysFn::Rpad => {
                         let pad = vs.get(2).map(fn_text).unwrap_or_else(|| " ".into());
@@ -57690,6 +57712,9 @@ fn expr_no_raise(e: &Expr, descs: &[Descriptor]) -> bool {
                 | SysFn::BinShr => args.iter().all(safe_num),
                 // ABS of i128::MIN cannot negate - fence INT128 out
                 SysFn::Abs => safe_num(&args[0]),
+                // ASCII_VAL never raises; ASCII_CHAR raises 22003 unless its
+                // operand is a literal visibly within 0..255
+                SysFn::AsciiVal => true,
             }
         }
     }
