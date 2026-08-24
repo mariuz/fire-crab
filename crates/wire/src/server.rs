@@ -6380,6 +6380,12 @@ enum RowSource {
         key_exprs: Vec<Expr>,
         synth_base: usize,
         having: Option<Predicate>,
+        /// whether an ORDER-SENSITIVE fold (LIST) re-sorts each group's
+        /// ties by the engine's whole-record rule - true for a
+        /// single-relation or derived/CTE/view fold (the engine's sort
+        /// record carries the referenced fields), false over a real
+        /// JOIN (the join's delivery order holds there, measured)
+        tie_order: bool,
     },
 }
 
@@ -6845,14 +6851,30 @@ impl RowSource {
                 key_exprs,
                 synth_base,
                 having,
-            } => group_rows(
-                input.rows(db)?,
-                gitems,
-                key_fids,
-                key_exprs,
-                *synth_base,
-                having,
-            ),
+                tie_order,
+            } => {
+                // the filter below this fold, when there is one: its
+                // fields join the LIST tie order (the engine's grouping
+                // sort record carries every field the statement
+                // references - a field referenced only in the WHERE
+                // still orders the ties, measured). A pre-filtered input
+                // (a derived source's Rows) carries no Filter node; its
+                // WHERE fields are a recorded tie-order gap.
+                let filter = match input.as_ref() {
+                    RowSource::Filter { pred, .. } => pred.as_ref(),
+                    _ => None,
+                };
+                group_rows(
+                    input.rows(db)?,
+                    gitems,
+                    key_fids,
+                    key_exprs,
+                    *synth_base,
+                    having,
+                    filter,
+                    *tie_order,
+                )
+            }
             RowSource::Sort { input, keys } => {
                 let rows = input.rows(db)?;
                 Ok(sort_rows_spilling(rows, keys)?)
@@ -6866,6 +6888,7 @@ impl RowSource {
     /// rows already in hand - a join's combined rows today, a derived
     /// table's tomorrow.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn aggregate_sorted(
         input: RowSource,
         gitems: &[GItem],
@@ -6874,6 +6897,7 @@ impl RowSource {
         synth_base: usize,
         having: &Option<Predicate>,
         keys: &[OrderKey],
+        tie_order: bool,
     ) -> RowSource {
         RowSource::Sort {
             input: Box::new(RowSource::Aggregate {
@@ -6883,6 +6907,7 @@ impl RowSource {
                 key_exprs: key_exprs.to_vec(),
                 synth_base,
                 having: having.clone(),
+                tie_order,
             }),
             keys: keys.to_vec(),
         }
@@ -8529,6 +8554,17 @@ enum AggSrc {
     /// a PERCENTILE fold: the fraction expression, the sort expression,
     /// and whether the sort is descending
     Percentile { frac: Expr, order: Expr, desc: bool },
+    /// a LIST fold: the value expression (a blob column arrives as
+    /// [Expr::BlobText] so its CONTENT joins the list, as the engine's
+    /// MOV_make_string2 reads it), the separator (None = the default
+    /// `,`), the DISTINCT flag, and - for a plain CHAR column argument -
+    /// the byte width the engine's descriptor-image conversion pads a
+    /// value to (MOV_make_string2 hands over the CHAR slot's whole byte
+    /// image, trailing spaces included)
+    /// pad: a plain CHAR column argument's declared (characters, bytes)
+    /// - the plain fold pads a value to the CHARACTER count, the
+    /// DISTINCT fold to the full BYTE image (both measured)
+    List { arg: Expr, sep: Option<Expr>, distinct: bool, pad: Option<(usize, usize)> },
 }
 
 /// A scalar-returning aggregate function.
@@ -8582,6 +8618,16 @@ enum AggFn {
     /// keeps its type. Both are nullable (NULL over an empty group).
     PercentileCont,
     PercentileDisc,
+    /// `LIST([DISTINCT] arg [, separator])` - the values rendered to text
+    /// and joined into a TEXT BLOB the fold itself creates (the engine's
+    /// ListAggNode: blb::create on the transaction, MOV_make_string2 per
+    /// value, the separator appended BEFORE each value after the first -
+    /// so value and separator are each their own segment). NULL arguments
+    /// drop out; a NULL separator at any append (or a NULL constant
+    /// separator) marks the WHOLE result NULL (aggPass: vlu_desc.dsc_dtype
+    /// = 0); DISTINCT sorts and dedupes the values first. Nullable, NULL
+    /// over an empty / all-null group.
+    List,
 }
 
 impl AggFn {
@@ -8612,6 +8658,7 @@ impl AggFn {
             AggFn::RegrSxy => "REGR_SXY",
             AggFn::PercentileCont => "PERCENTILE_CONT",
             AggFn::PercentileDisc => "PERCENTILE_DISC",
+            AggFn::List => "LIST",
         }
     }
 
@@ -8775,6 +8822,16 @@ enum AggTarget {
         frac: RawExpr,
         order: RawExpr,
         desc: bool,
+    },
+    /// `LIST([DISTINCT] arg [, separator])` - the argument, the optional
+    /// separator expression (default `,`), and the DISTINCT flag. The
+    /// distinct rides HERE (not GItem's COUNT-only flag) because the
+    /// list's distinct is a sorted dedupe of the rendered set, its own
+    /// fold shape.
+    List {
+        arg: RawExpr,
+        sep: Option<RawExpr>,
+        distinct: bool,
     },
 }
 
@@ -30902,6 +30959,7 @@ fn branch_rows_res(
             *synth_base,
             &having,
             order_by,
+            true,
         )
         .rows(db)?;
         return rows
@@ -30983,6 +31041,10 @@ fn branch_rows_res(
             *synth_base,
             &having,
             order_by,
+            // a bound derived/CTE/view fold has NO join parts: its ties
+            // follow the engine's referenced-fields record; a real
+            // join's keep the delivery order (both measured)
+            parts.is_empty(),
         )
         .rows(db)?;
         return rows
@@ -32865,6 +32927,11 @@ fn plan_query_inner_ctx(
                     // and NOT nullable - the only aggregate without
                     // the flag
                     let sty = match func {
+                        // LIST answers a computed blob through the group
+                        // machinery; [aggregate] declines it, so this arm
+                        // never runs - a refusal beats a guess if it ever
+                        // does
+                        AggFn::List => return None,
                         AggFn::Count => ScalarTy::count(),
                         AggFn::Min | AggFn::Max => match target {
                             AggTarget::Col(cn) => columns
@@ -33497,6 +33564,9 @@ fn agg_result_desc(
         return None;
     }
     Some(match func {
+        // a LIST target is never AggTarget::Col (its own shape), so this
+        // arm is unreachable; a blob result has no descriptor here anyway
+        AggFn::List => return None,
         AggFn::Count => int64(0),
         AggFn::Min | AggFn::Max => d.clone(),
         AggFn::Sum => match d.dtype {
@@ -33890,6 +33960,84 @@ fn build_group_items(
                         },
                         false,
                     ),
+                    AggTarget::List { arg, sep, distinct } => {
+                        // a plain BLOB column argument joins by CONTENT
+                        // (the engine's MOV_make_string2 reads the blob) -
+                        // it resolves to the content reader the blob CAST
+                        // uses, since a bare blob column has no expression
+                        // type of its own
+                        let a = match arg {
+                            RawExpr::Col(n) => {
+                                let rc = columns
+                                    .iter()
+                                    .find(|c| c.name.eq_ignore_ascii_case(n.trim_matches('"')))?;
+                                let fid = rc.field_id as usize;
+                                let d = descs.get(fid)?;
+                                if d.dtype == dtype::BLOB {
+                                    // a user sub_type has no filter to text
+                                    if !matches!(d.sub_type, 0 | 1) {
+                                        return None;
+                                    }
+                                    // DISTINCT over a blob column: the
+                                    // engine's distinct machinery keys the
+                                    // DESCRIPTOR - the blob id - so equal
+                                    // CONTENT never dedupes and the set
+                                    // comes out in id order; a content
+                                    // dedupe here would answer wrong, so
+                                    // refuse (review-caught)
+                                    if *distinct {
+                                        return None;
+                                    }
+                                    Expr::BlobText(fid)
+                                } else {
+                                    resolve_expr(arg, columns, descs)?
+                                }
+                            }
+                            _ => resolve_expr(arg, columns, descs)?,
+                        };
+                        // the engine's DISTINCT dedupes by the argument's
+                        // COLLATION key; fc's value_cmp is binary - a
+                        // non-binary-collated text argument would dedupe
+                        // (and order) WRONG, so it refuses instead
+                        // (review-caught; fc's collation-aware ordering
+                        // is a recorded server-wide boundary)
+                        if *distinct
+                            && expr_reads(&a, &|f| {
+                                descs.get(f).is_some_and(|d| {
+                                    matches!(d.dtype, dtype::TEXT | dtype::VARYING)
+                                        && (d.sub_type as u16) >> 8 != 0
+                                })
+                            })
+                        {
+                            return None;
+                        }
+                        let s = match sep {
+                            Some(r) => Some(resolve_expr(r, columns, descs)?),
+                            None => None,
+                        };
+                        // a CHAR column's value travels padded to its
+                        // declared CHARACTER count (measured: a UTF8
+                        // CHAR(4) holding 'Ж' contributes 'Ж   ' - 4
+                        // characters, 5 bytes - not its 16-byte slot) -
+                        // the pad width, in characters, for the fold
+                        let pad = match arg {
+                            RawExpr::Col(n) => columns
+                                .iter()
+                                .find(|c| c.name.eq_ignore_ascii_case(n.trim_matches('"')))
+                                .and_then(|c| descs.get(c.field_id as usize))
+                                .filter(|d| d.dtype == dtype::TEXT)
+                                .map(|d| {
+                                    let chars = d.length as usize
+                                        / fire_crab_ods::intl::bytes_per_char(
+                                            fire_crab_ods::intl::charset_id(d.sub_type),
+                                        )
+                                        .max(1) as usize;
+                                    (chars, d.length as usize)
+                                }),
+                            _ => None,
+                        };
+                        (AggSrc::List { arg: a, sep: s, distinct: *distinct, pad }, false)
+                    }
                 };
                 if distinct && !matches!(func, AggFn::Count) {
                     return None; // only COUNT(DISTINCT) is answered
@@ -34095,6 +34243,20 @@ fn build_group_items(
                             return None;
                         }
                         (Wire::Double, 480, 8, 0, 0)
+                    }
+                    // LIST answers a TEXT BLOB (sub_type 1) whose character
+                    // set is the ARGUMENT's (ListAggNode::make copies the
+                    // arg's text type): a text column its charset, a text
+                    // EXPRESSION the first text column's it references, a
+                    // bare literal / numeric / temporal argument NONE
+                    // (measured). The scale slot carries the charset, the
+                    // blob describe convention.
+                    AggFn::List => {
+                        let cs = match &src {
+                            AggSrc::List { arg, .. } => list_arg_charset(arg, descs),
+                            _ => 0,
+                        };
+                        (Wire::Blob, 520, 8, cs, 1)
                     }
                 };
                 // the engine titles aggregate output columns by function
@@ -34691,7 +34853,7 @@ fn aggregate(
     // source's scale; the group machinery already does that. Aggregate
     // SUBQUERIES no longer come through here at all - they build a
     // one-item, no-key group, which is what a scalar aggregate is.
-    if matches!(func, AggFn::Avg) || func.is_statistical() {
+    if matches!(func, AggFn::Avg | AggFn::List) || func.is_statistical() {
         return None;
     }
     let mut acc: Option<i64> = None;
@@ -34714,6 +34876,7 @@ fn aggregate(
             ) => unreachable!(),
             (AggFn::Corr | AggFn::CovarPop | AggFn::CovarSamp | AggFn::RegrSlope | AggFn::RegrIntercept | AggFn::RegrCount | AggFn::RegrR2 | AggFn::RegrAvgx | AggFn::RegrAvgy | AggFn::RegrSxx | AggFn::RegrSyy | AggFn::RegrSxy, _) => unreachable!(),
             (AggFn::PercentileCont | AggFn::PercentileDisc, _) => unreachable!(),
+            (AggFn::List, _) => unreachable!(), // declined above
         });
     });
     if hit != 0 {
@@ -36802,6 +36965,7 @@ fn group_output(
         key_exprs: key_exprs.to_vec(),
         synth_base,
         having: having.clone(),
+        tie_order: true,
     }
     .rows(db)
 }
@@ -37379,6 +37543,7 @@ fn compute_windows(
     Ok(rows)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn group_rows(
     mut input: Vec<Vec<Value>>,
     gitems: &[GItem],
@@ -37386,6 +37551,8 @@ fn group_rows(
     key_exprs: &[Expr],
     synth_base: usize,
     having: &Option<Predicate>,
+    filter: Option<&Predicate>,
+    tie_order: bool,
 ) -> Result<Vec<Vec<Value>>, EvalErr> {
     // expression keys: evaluate each into its synthetic slot, so the
     // bucketing sort and the Key output items read it like a field.
@@ -37408,7 +37575,157 @@ fn group_rows(
             .iter()
             .map(|&f| OrderKey::field(f, false, NullsAt::Default))
             .collect();
-        let mut input = sort_rows_spilling(std::mem::take(&mut input), &keys)?;
+        // LIST is ORDER-SENSITIVE, and the engine's grouping sort
+        // compares its WHOLE sort record - the group keys, then every
+        // OTHER FIELD THE STATEMENT REFERENCES, in field order - so
+        // ties within a group come out in that order, which a LIST fold
+        // makes visible (measured: with LIST(V) the ties follow V, with
+        // LIST(W) they follow W, and a field referenced only in the
+        // WHERE still orders them; an UNREFERENCED field never does).
+        // The referenced set is collected from the fold sources, the
+        // expression keys, the filter below and the HAVING above,
+        // through the same [expr_reads]/[collect_term_fids] analysis
+        // the join splitter trusts. Group boundaries still compare on
+        // the ORIGINAL keys. Order-insensitive folds see no difference,
+        // and PERCENTILE sorts its own values. (A tie broken only
+        // through a BLOB column's id is unpinned - fc orders by the
+        // id's rendered form, the engine by its id bytes.)
+        let tie_fids = if tie_order
+            && gitems
+                .iter()
+                .any(|g| matches!(g, GItem::Agg(AggFn::List, ..)))
+        {
+            let refs = std::cell::RefCell::new(Vec::<usize>::new());
+            let mark = |f: usize| -> bool {
+                let mut r = refs.borrow_mut();
+                if !r.contains(&f) {
+                    r.push(f);
+                }
+                false // never "found": the reads-walk visits every field
+            };
+            for g in gitems {
+                match g {
+                    GItem::Key(_) | GItem::Const(_) => {}
+                    GItem::Agg(_, src, _) => match src {
+                        AggSrc::Star => {}
+                        AggSrc::Field(f) => {
+                            mark(*f);
+                        }
+                        AggSrc::Expr(e) => {
+                            expr_reads(e, &mark);
+                        }
+                        AggSrc::Pair(y, x) => {
+                            expr_reads(y, &mark);
+                            expr_reads(x, &mark);
+                        }
+                        AggSrc::Percentile { frac, order, .. } => {
+                            expr_reads(frac, &mark);
+                            expr_reads(order, &mark);
+                        }
+                        AggSrc::List { arg, sep, .. } => {
+                            expr_reads(arg, &mark);
+                            if let Some(s) = sep {
+                                expr_reads(s, &mark);
+                            }
+                        }
+                    },
+                }
+            }
+            for e in key_exprs {
+                expr_reads(e, &mark);
+            }
+            for p in [filter, having.as_ref()].into_iter().flatten() {
+                for g in &p.groups {
+                    for t in g {
+                        collect_term_fids(t, &mark);
+                    }
+                }
+            }
+            let mut extra = refs.into_inner();
+            extra.sort_unstable(); // the record lays fields out in field order
+            // key fields lead the record already; a synthetic
+            // expression-key slot duplicates fields marked through
+            // key_exprs (synth_base bounds the real slots only when
+            // expression keys exist)
+            extra.retain(|f| {
+                !key_fids.contains(f) && (key_exprs.is_empty() || *f < synth_base)
+            });
+            Some(extra)
+        } else {
+            None
+        };
+        let mut input = match tie_fids {
+            // the LIST tie sort: a STABLE in-memory sort (the rows are
+            // in hand already; ties the record leaves open stay in scan
+            // order, the record number's own effect) - the group keys,
+            // then the referenced fields' NULL FLAGS (a NULL row sinks
+            // below the non-null ones, measured for text and integer
+            // fields alike), then the TEXT values in field order, each
+            // by BYTE LENGTH first (the vary count word leads its data)
+            // and then 4-byte little-endian word groups (the engine's
+            // quick() compares the whole record as native ULONGs, so
+            // the LAST byte of each word dominates - measured:
+            // 'ba','ca','ab' in that order). Integer/temporal values do
+            // not drive (measured: they ride word-compared too, but at
+            // offsets the common shapes leave undecided - unpinned).
+            Some(extra) => {
+                let mut rows = std::mem::take(&mut input);
+                rows.sort_by(|a, b| {
+                    let c = order_cmp(a, b, &keys);
+                    if c != std::cmp::Ordering::Equal {
+                        return c;
+                    }
+                    for &f in &extra {
+                        let na = matches!(a.get(f), Some(Value::Null) | None);
+                        let nb = matches!(b.get(f), Some(Value::Null) | None);
+                        if na != nb {
+                            return na.cmp(&nb); // non-null first
+                        }
+                    }
+                    for &f in &extra {
+                        let c = match (a.get(f), b.get(f)) {
+                            (Some(Value::Text(x)), Some(Value::Text(y))) => {
+                                list_text_tie_cmp(x, y)
+                            }
+                            // an INTEGER-family value compares as its
+                            // native little-endian words, UNSIGNED, LOW
+                            // word first (measured: 1, 256, -5 in that
+                            // order; an INTEGER column has only the low
+                            // word, a BIGINT's high word breaks its low
+                            // word's ties); a scaled NUMERIC by its raw
+                            // words the same way, temporals by their
+                            // day/fraction words, a BOOLEAN by its byte
+                            (Some(Value::Int(x)), Some(Value::Int(y))) => {
+                                (*x as u32, (*x >> 32) as u32)
+                                    .cmp(&(*y as u32, (*y >> 32) as u32))
+                            }
+                            (Some(Value::Scaled(x, sx)), Some(Value::Scaled(y, sy)))
+                                if sx == sy =>
+                            {
+                                (*x as u32, (*x >> 32) as u32)
+                                    .cmp(&(*y as u32, (*y >> 32) as u32))
+                            }
+                            (Some(Value::Date(x)), Some(Value::Date(y))) => {
+                                (*x as u32).cmp(&(*y as u32))
+                            }
+                            (Some(Value::Time(x)), Some(Value::Time(y))) => x.cmp(y),
+                            (
+                                Some(Value::Timestamp(xd, xt)),
+                                Some(Value::Timestamp(yd, yt)),
+                            ) => (*xd as u32, *xt).cmp(&(*yd as u32, *yt)),
+                            (Some(Value::Bool(x)), Some(Value::Bool(y))) => x.cmp(y),
+                            _ => std::cmp::Ordering::Equal,
+                        };
+                        if c != std::cmp::Ordering::Equal {
+                            return c;
+                        }
+                    }
+                    std::cmp::Ordering::Equal
+                });
+                rows
+            }
+            None => sort_rows_spilling(std::mem::take(&mut input), &keys)?,
+        };
         let mut i = 0;
         while i < input.len() {
             let mut j = i + 1;
@@ -37519,6 +37836,156 @@ fn stat2_result(func: AggFn, n: i64, sx: f64, sx2: f64, sy: f64, sy2: f64, sxy: 
 /// its type; CONT interpolates between the values bracketing 1 + frac*(n-1)
 /// and answers a DOUBLE (the two weighted terms accumulated in stream
 /// order, as the engine does).
+/// The LIST tie order's text comparison - the engine's grouping sort
+/// compares its WHOLE record as native little-endian ULONGs
+/// (sort.cpp `quick(n, j, m_longs)`), so a VARYING field's COUNT WORD
+/// leads its data (shorter first - measured 'b','c','aa') and within
+/// each 4-byte group of the string the LAST byte dominates (measured
+/// 'ba','ca','ab' in that order). Reproduced as: byte length, then the
+/// bytes in zero-padded 4-byte groups compared as little-endian u32.
+/// The word grouping assumes the string starts word-aligned, the
+/// single-text-driver shape the gates pin; multi-field packing corners
+/// are recorded unpinned.
+fn list_text_tie_cmp(x: &str, y: &str) -> std::cmp::Ordering {
+    let (xb, yb) = (x.as_bytes(), y.as_bytes());
+    let c = xb.len().cmp(&yb.len());
+    if c != std::cmp::Ordering::Equal {
+        return c;
+    }
+    let word = |b: &[u8], i: usize| -> u32 {
+        let mut w = [0u8; 4];
+        let end = (i + 4).min(b.len());
+        w[..end - i].copy_from_slice(&b[i..end]);
+        u32::from_le_bytes(w)
+    };
+    let mut i = 0;
+    while i < xb.len() {
+        let c = word(xb, i).cmp(&word(yb, i));
+        if c != std::cmp::Ordering::Equal {
+            return c;
+        }
+        i += 4;
+    }
+    std::cmp::Ordering::Equal
+}
+
+/// The LIST fold - the engine's ListAggNode::aggPass over the group's
+/// rows in order: each non-null value rendered to text
+/// (MOV_make_string2 = [Value::render]; a blob argument by CONTENT, a
+/// CHAR column padded to its byte image), the separator appended BEFORE
+/// each value after the first, evaluated ON THAT ROW (a per-row
+/// separator expression is the engine's behaviour - measured: each
+/// appended row's own separator joins it on). A NULL separator at any
+/// append marks the WHOLE result NULL (aggPass: vlu_desc.dsc_dtype = 0
+/// - later rows still fold there, and here, the answer NULL either
+/// way); with no explicit separator the default is `,`. DISTINCT sorts
+/// the values ([value_cmp]) and dedupes them first - the engine's
+/// distinct machinery delivers them at aggExecute, where the separator
+/// evaluates with the group's LAST row current (measured).
+fn list_fold(
+    rows: &[Vec<Value>],
+    arg: &Expr,
+    sep: Option<&Expr>,
+    distinct: bool,
+    pad: Option<(usize, usize)>,
+) -> Result<Value, EvalErr> {
+    // a CHAR argument's value: the plain fold appends it padded to the
+    // declared CHARACTER count; the DISTINCT machinery sorts descriptor
+    // images and appends the full BYTE image (both measured - a UTF8
+    // CHAR(4) 'Ж' joins plain as 5 bytes 'Ж   ', distinct as 16)
+    let (pad, pad_bytes) = match pad {
+        Some((chars, bytes)) => {
+            if distinct {
+                (Some(bytes), true)
+            } else {
+                (Some(chars), false)
+            }
+        }
+        None => (None, false),
+    };
+    let sep_on = |row: &[Value]| -> Result<Option<Vec<u8>>, EvalErr> {
+        match sep {
+            None => Ok(Some(b",".to_vec())),
+            Some(e) => match e.eval(row)? {
+                Value::Null => Ok(None),
+                v => Ok(Some(list_render(&v, None, false)?)),
+            },
+        }
+    };
+    let mut pieces: Vec<Vec<u8>> = Vec::new();
+    let mut count = 0usize;
+    let mut poisoned = false;
+    if distinct {
+        let mut vals: Vec<Value> = Vec::new();
+        for row in rows {
+            let v = arg.eval(row)?;
+            if !matches!(v, Value::Null) {
+                vals.push(v);
+            }
+        }
+        vals.sort_by(value_cmp);
+        vals.dedup_by(|a, b| value_cmp(a, b) == std::cmp::Ordering::Equal);
+        count = vals.len();
+        if count > 0 {
+            let sep_bytes = match rows.last() {
+                Some(last) if count > 1 => match sep_on(last)? {
+                    Some(b) => b,
+                    None => {
+                        poisoned = true;
+                        Vec::new()
+                    }
+                },
+                _ => Vec::new(),
+            };
+            for (i, v) in vals.iter().enumerate() {
+                if i > 0 {
+                    pieces.push(sep_bytes.clone());
+                }
+                pieces.push(list_render(v, pad, pad_bytes)?);
+            }
+        }
+    } else {
+        for row in rows {
+            let v = arg.eval(row)?;
+            if matches!(v, Value::Null) {
+                continue;
+            }
+            if count > 0 {
+                match sep_on(row)? {
+                    Some(b) => pieces.push(b),
+                    None => poisoned = true,
+                }
+            }
+            count += 1;
+            pieces.push(list_render(&v, pad, pad_bytes)?);
+        }
+    }
+    if count == 0 || poisoned {
+        return Ok(Value::Null);
+    }
+    mint_computed_blob(&pieces)
+}
+
+/// One list value's text bytes - fc's MOV_get_string: [Value::render]
+/// with the CAST surface's TRUE/FALSE for booleans, a blob by content
+/// through [blob_text_of], and a CHAR column's value padded with spaces
+/// to its declared CHARACTER count (measured: a UTF8 CHAR(4) 'Ж' joins
+/// as 'Ж   ' - 4 characters, 5 bytes).
+fn list_render(v: &Value, pad: Option<usize>, pad_bytes: bool) -> Result<Vec<u8>, EvalErr> {
+    let mut s = match v {
+        Value::Blob(rel, num) => blob_text_of(*rel, *num)?,
+        Value::Bool(b) => (if *b { "TRUE" } else { "FALSE" }).to_string(),
+        other => other.render(),
+    };
+    if let Some(w) = pad {
+        let have = if pad_bytes { s.len() } else { s.chars().count() };
+        for _ in have..w {
+            s.push(' ');
+        }
+    }
+    Ok(s.into_bytes())
+}
+
 fn percentile_result(func: AggFn, vals: &[Value], frac: f64) -> Result<Value, EvalErr> {
     let n = vals.len() as i64;
     if func == AggFn::PercentileDisc {
@@ -37562,6 +38029,8 @@ fn compute_group(rows: &[Vec<Value>], gitems: &[GItem]) -> Result<Vec<Value>, Ev
             AggSrc::Expr(e) => e.eval(r)?,
             // a paired source folds through its own arm, never here
             AggSrc::Pair(y, _) => y.eval(r)?,
+            // a LIST folds through its own arm, never here
+            AggSrc::List { arg, .. } => arg.eval(r)?,
             // a percentile folds through its own arm, never here
             AggSrc::Percentile { order, .. } => order.eval(r)?,
         })
@@ -37814,6 +38283,9 @@ fn compute_group(rows: &[Vec<Value>], gitems: &[GItem]) -> Result<Vec<Value>, Ev
                     }
                 }
                 GItem::Const(v) => v.clone(), // a per-group constant slot
+                GItem::Agg(AggFn::List, AggSrc::List { arg, sep, distinct, pad }, _) => {
+                    list_fold(rows, arg, sep.as_ref(), *distinct, *pad)?
+                }
                 GItem::Agg(..) => Value::Null, // MIN/MAX/SUM(*): rejected at plan
             })
         })
@@ -40291,6 +40763,7 @@ fn emit_rows_inner(
                     *synth_base,
                     &having,
                     order_by,
+                    parts.is_empty(),
                 )
                 .rows(db)
                 .map_err(EmitErr::Eval)?;
@@ -40347,6 +40820,7 @@ fn emit_rows_inner(
                     *synth_base,
                     &having,
                     order_by,
+                    true,
                 )
                 .rows(db)
                 .map_err(EmitErr::Eval)?;
@@ -40920,6 +41394,121 @@ thread_local! {
     /// materialise a blob without the evaluator carrying a database.
     static BLOB_CTX: std::cell::RefCell<Option<(std::sync::Arc<fire_crab_ods::Image>, usize)>> =
         const { std::cell::RefCell::new(None) };
+}
+
+/// COMPUTED blobs - a fold that ANSWERS a blob (the LIST aggregate)
+/// creates it here, the way the engine's ListAggNode calls blb::create
+/// on the request's transaction. The evaluator carries no database
+/// handle (the BLOB_CTX reason), so the connection loop ARMS this
+/// context per op - seeding the id counter from the attachment's temp
+/// counter, floored at [COMPUTED_BLOB_BASE] so a client's own
+/// op_create_blob ids never collide - and DRAINS what was minted into
+/// `Database::temp_blobs` at the top of the NEXT op. The row only
+/// carries the 8-byte relation-0 id; the client OPENS it in a LATER op,
+/// and op_open_blob2 / op_info_blob / op_get_segment already resolve
+/// relation-0 ids through temp_blobs. Like every temp blob, a minted
+/// one lives until its transaction ends (temp_blobs.clear()), the
+/// engine's own blob lifetime.
+struct MintCtx {
+    next: u32,
+    minted: Vec<(u32, TempBlob)>,
+}
+const COMPUTED_BLOB_BASE: u32 = 0x4000_0000;
+thread_local! {
+    static BLOB_MINT: std::cell::RefCell<Option<MintCtx>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The character set the engine stamps on a LIST result - the
+/// ARGUMENT's text type (ListAggNode::make copies it): a text column's
+/// charset (its ttype low byte), a blob column's stored charset, the
+/// first text/blob column a text EXPRESSION references; NONE (0) for a
+/// bare literal or a non-text argument (measured: LIST('lit') and
+/// LIST(ID) describe charset 0, LIST(S) and LIST(S || 'x') the
+/// column's).
+fn list_arg_charset(e: &Expr, descs: &[Descriptor]) -> i32 {
+    fn walk(e: &Expr, descs: &[Descriptor]) -> Option<i32> {
+        match e {
+            Expr::Col(f) => descs.get(*f).and_then(|d| match d.dtype {
+                dtype::TEXT | dtype::VARYING => Some((d.sub_type as i32) & 0xFF),
+                _ => None,
+            }),
+            Expr::BlobText(f) => descs.get(*f).map(|d| d.scale as i32),
+            Expr::Neg(a) | Expr::Cast(a, ..) => walk(a, descs),
+            Expr::Bin(a, _, b) | Expr::Concat(a, b) | Expr::NullIf(a, b) => {
+                walk(a, descs).or_else(|| walk(b, descs))
+            }
+            Expr::Iif(_, a, b) => walk(a, descs).or_else(|| walk(b, descs)),
+            Expr::Coalesce(v) | Expr::Func(_, v) => v.iter().find_map(|x| walk(x, descs)),
+            Expr::UserFn { args, .. } => args.iter().find_map(|x| walk(x, descs)),
+            Expr::Case(arms, els) => arms
+                .iter()
+                .find_map(|(_, x)| walk(x, descs))
+                .or_else(|| els.as_deref().and_then(|x| walk(x, descs))),
+            _ => None,
+        }
+    }
+    walk(e, descs).unwrap_or(0)
+}
+
+fn arm_blob_mint(db: Option<&Database>) {
+    BLOB_MINT.with(|c| {
+        *c.borrow_mut() = db.map(|d| MintCtx {
+            next: d.next_temp_blob.max(COMPUTED_BLOB_BASE),
+            minted: Vec::new(),
+        })
+    });
+}
+
+/// Park the previous op's minted blobs where the blob ops resolve them,
+/// and advance the shared temp counter past them. Runs at the loop top,
+/// BEFORE the next op's handler - so a handler that allocates its own
+/// temp id (op_create_blob) always sees the advanced counter and the
+/// two ranges stay one sequence.
+fn drain_minted_blobs(db: &mut Option<Database>) {
+    BLOB_MINT.with(|c| {
+        if let (Some(ctx), Some(d)) = (c.borrow_mut().take(), db.as_mut()) {
+            if !ctx.minted.is_empty() {
+                d.next_temp_blob = d.next_temp_blob.max(ctx.next);
+                for (id, tb) in ctx.minted {
+                    d.temp_blobs.insert(id, tb);
+                }
+            }
+        }
+    });
+}
+
+/// Create one computed TEXT blob from its content pieces - each
+/// non-empty piece its own segment, the engine's BLB_put_data per value
+/// / separator (a zero-length put writes nothing - measured: an empty
+/// string in a list adds no segment; a piece past the u16 segment cap
+/// splits). Errors when no mint context is armed (a fold outside an op
+/// - nothing reaches a LIST fold that way).
+fn mint_computed_blob(pieces: &[Vec<u8>]) -> Result<Value, EvalErr> {
+    BLOB_MINT.with(|c| {
+        let mut b = c.borrow_mut();
+        let ctx = b.as_mut().ok_or(EvalErr::Unsupported)?;
+        let mut segments: Vec<Vec<u8>> = Vec::new();
+        for p in pieces {
+            // the engine writes each piece through BLB_put_data, which
+            // splits at 32768 bytes (blb.cpp ~1581 MIN(length, 32768)) -
+            // the segment counts and framing follow it (review-caught)
+            for chunk in p.chunks(32768) {
+                if !chunk.is_empty() {
+                    segments.push(chunk.to_vec());
+                }
+            }
+        }
+        let puts = segments.len() as u32;
+        let max_put = segments.iter().map(|s| s.len()).max().unwrap_or(0) as u16;
+        ctx.next += 1;
+        let id = ctx.next;
+        ctx.minted.push((
+            id,
+            TempBlob { segments, stream: false, puts, max_put, closed: true, materialised: None },
+        ));
+        Ok(Value::Blob(0, id as u64))
+    })
 }
 
 /// `CAST(<blob column> AS VARCHAR/CHAR)`: the field id when the operand
@@ -50012,7 +50601,9 @@ fn eval_subquery_rel(
         // builds it, so a subquery accepts the same arguments a SELECT
         // list does - a column, `COUNT(DISTINCT col)`, or an expression
         let (src, distinct) = match &target {
-            AggTarget::Pair(..) | AggTarget::Percentile { .. } => return None,
+            AggTarget::Pair(..) | AggTarget::Percentile { .. } | AggTarget::List { .. } => {
+                return None
+            }
             AggTarget::Star => (AggSrc::Star, false),
             AggTarget::Col(name) | AggTarget::Distinct(name) => {
                 let c = columns.iter().find(|c| c.name.eq_ignore_ascii_case(name))?;
@@ -50607,6 +51198,7 @@ fn agg_named(word: &str) -> bool {
             | "REGR_SXY"
             | "PERCENTILE_CONT"
             | "PERCENTILE_DISC"
+            | "LIST"
     )
 }
 
@@ -50683,8 +51275,10 @@ fn parse_window_item(
     };
     // the statistical folds are answered as ordinary aggregates only, not
     // yet as a window - refuse the OVER form (drops to the failing path,
-    // the engine's own error for a shape this build does not answer)
-    if matches!(&func, WinFunc::Agg(f, _) if f.is_statistical()) {
+    // the engine's own error for a shape this build does not answer).
+    // LIST too: its whole-partition window form (the engine refuses the
+    // ordered/framed ones itself) is a later slice.
+    if matches!(&func, WinFunc::Agg(f, _) if f.is_statistical() || matches!(f, AggFn::List)) {
         return None;
     }
     let spec = t[over_lp + 1..over_end].trim();
@@ -51080,6 +51674,32 @@ fn parse_agg_item(item: &str) -> Option<(AggFn, AggTarget)> {
         if arg.is_empty() {
             return None;
         }
+        // `LIST([DISTINCT] x [, sep]) FILTER (WHERE c)` wraps only the
+        // VALUE argument in the CASE - the separator stays a separate
+        // argument (the generic rewrite below would swallow it into the
+        // CASE and break the two-argument form)
+        if fname.eq_ignore_ascii_case("LIST") {
+            let (dkw, rest) = match arg
+                .get(..8)
+                .filter(|w| w.eq_ignore_ascii_case("DISTINCT"))
+                .and(arg.get(8..))
+                .filter(|r| r.starts_with(char::is_whitespace))
+            {
+                Some(r) => ("DISTINCT ", r.trim()),
+                None => ("", arg),
+            };
+            let rewritten = match split_top_comma2(rest) {
+                Some((a, s)) => format!(
+                    "LIST({}CASE WHEN ({}) THEN {} END, {})",
+                    dkw,
+                    cond,
+                    a.trim(),
+                    s.trim()
+                ),
+                None => format!("LIST({}CASE WHEN ({}) THEN {} END)", dkw, cond, rest),
+            };
+            return parse_agg_item(&rewritten);
+        }
         // `COUNT(DISTINCT x) FILTER (WHERE c)` filters the DISTINCT fold:
         // it counts the distinct non-NULL values of `x` among the rows the
         // condition accepts, which is exactly `COUNT(DISTINCT CASE WHEN c
@@ -51146,6 +51766,7 @@ fn parse_agg_item(item: &str) -> Option<(AggFn, AggTarget)> {
         "REGR_SXY" => AggFn::RegrSxy,
         "PERCENTILE_CONT" => AggFn::PercentileCont,
         "PERCENTILE_DISC" => AggFn::PercentileDisc,
+        "LIST" => AggFn::List,
         _ => return None,
     };
     // the ordered-set percentiles have their OWN shape:
@@ -51156,6 +51777,44 @@ fn parse_agg_item(item: &str) -> Option<(AggFn, AggTarget)> {
         return parse_percentile_item(func, t, open);
     }
     let arg = t[open + 1..t.len() - 1].trim();
+    // LIST([DISTINCT] arg [, separator]) - its own shape: an optional
+    // DISTINCT keyword, then the value expression, then an optional
+    // separator after the top-level comma (a third argument is the
+    // engine's -104, which the generic refusal answers)
+    if matches!(func, AggFn::List) {
+        let (distinct, rest) = match arg
+            .get(..8)
+            .filter(|w| w.eq_ignore_ascii_case("DISTINCT"))
+            .and(arg.get(8..))
+            .filter(|r| r.starts_with(char::is_whitespace))
+        {
+            Some(r) => (true, r.trim()),
+            None => (
+                false,
+                // `LIST(ALL x)` is the explicit spelling of the plain fold
+                arg.get(..4)
+                    .filter(|w| w.eq_ignore_ascii_case("ALL "))
+                    .and(arg.get(4..))
+                    .map(str::trim)
+                    .unwrap_or(arg),
+            ),
+        };
+        if rest.is_empty() || rest == "*" || rest.eq_ignore_ascii_case("DISTINCT") {
+            return None;
+        }
+        // split_top_comma2 answers None both for NO top-level comma and
+        // for MORE than one (the engine's third argument is -104): the
+        // None arm re-reads the whole text as one expression, which a
+        // bare comma list fails, refusing the three-argument form
+        let (a, sep) = match split_top_comma2(rest) {
+            Some((a, s)) => (a.trim().to_string(), Some(parse_raw_expr_any(s.trim())?)),
+            None => (rest.to_string(), None),
+        };
+        return Some((
+            func,
+            AggTarget::List { arg: parse_raw_expr_any(&a)?, sep, distinct },
+        ));
+    }
     // the two-argument statistical folds take `(Y, X)` - split on the
     // top-level comma and parse each side as an expression
     if func.is_statistical2() {
@@ -59389,7 +60048,9 @@ fn resolve_having(
                         Text,
                     }
                     let (fid, src_expr, hkind, distinct) = match target {
-                        AggTarget::Pair(..) | AggTarget::Percentile { .. } => return None,
+                        AggTarget::Pair(..)
+                        | AggTarget::Percentile { .. }
+                        | AggTarget::List { .. } => return None,
                         AggTarget::Star => (None, None, HKind::Int, false),
                         AggTarget::Col(name) | AggTarget::Distinct(name) => {
                             let rc =
@@ -60319,6 +60980,11 @@ fn after_auth(
         if std::env::var("FC_SRV_TRACE").is_ok() { eprintln!("[srv] op-loop got op = {}", op); }
         // the image this op's expressions read blobs from (see BLOB_CTX)
         BLOB_CTX.with(|c| *c.borrow_mut() = database.as_ref().map(|d| (d.bytes(), d.page_size)));
+        // the PREVIOUS op's computed blobs (a LIST result) become
+        // resolvable temp blobs before anything this op does can ask for
+        // them, and the mint re-arms for this op (see BLOB_MINT)
+        drain_minted_blobs(&mut database);
+        arm_blob_mint(database.as_ref());
         match op {
             x if x == OP_DETACH => {
                 read_int(&mut s, &mut dec)?; // handle
@@ -65179,6 +65845,7 @@ mod tests {
             8,
             &None,
             &[OrderKey::field(0, false, NullsAt::Default)],
+            false,
         )
         .rows(&db)
         .unwrap();
@@ -74356,6 +75023,66 @@ mod tests {
         // the ids reserved inside a block are the BLOCK's to end: the
         // transaction around it must not flip them at its own commit
         assert_eq!(db.all_tx(), vec![201]);
+    }
+
+    #[test]
+    fn parses_list_aggregate_shapes() {
+        // plain, separator, DISTINCT, DISTINCT + separator
+        let (f, t) = parse_agg_item("LIST(S)").expect("plain");
+        assert!(matches!(f, AggFn::List));
+        assert!(matches!(t, AggTarget::List { sep: None, distinct: false, .. }));
+        let (_, t) = parse_agg_item("LIST(S, ';')").expect("separator");
+        assert!(matches!(t, AggTarget::List { sep: Some(_), distinct: false, .. }));
+        let (_, t) = parse_agg_item("LIST(DISTINCT S)").expect("distinct");
+        assert!(matches!(t, AggTarget::List { sep: None, distinct: true, .. }));
+        let (_, t) = parse_agg_item("LIST(DISTINCT S, ';')").expect("distinct sep");
+        assert!(matches!(t, AggTarget::List { sep: Some(_), distinct: true, .. }));
+        // a separator holding a comma inside its quotes stays ONE argument
+        let (_, t) = parse_agg_item("LIST(S, ', ')").expect("comma-in-quotes");
+        assert!(matches!(t, AggTarget::List { sep: Some(_), .. }));
+        // the engine's -104 shapes refuse: three arguments, a star, empty
+        assert!(parse_agg_item("LIST(S, ',', 'x')").is_none());
+        assert!(parse_agg_item("LIST(*)").is_none());
+        assert!(parse_agg_item("LIST()").is_none());
+        assert!(parse_agg_item("LIST(DISTINCT)").is_none());
+        // FILTER wraps only the VALUE argument in the CASE
+        let (_, t) = parse_agg_item("LIST(S, ';') FILTER (WHERE ID > 2)").expect("filtered");
+        match t {
+            AggTarget::List { arg, sep, distinct } => {
+                assert!(matches!(arg, RawExpr::Case { .. }), "value arg CASE-wrapped");
+                assert!(sep.is_some(), "separator kept outside the CASE");
+                assert!(!distinct);
+            }
+            other => panic!("unexpected target {:?}", std::mem::discriminant(&other)),
+        }
+        let (_, t) =
+            parse_agg_item("LIST(DISTINCT S) FILTER (WHERE ID > 2)").expect("distinct filtered");
+        assert!(matches!(t, AggTarget::List { distinct: true, .. }));
+    }
+
+    #[test]
+    fn minted_blob_drains_into_temp_blobs() {
+        // the fold mints under an armed context; the drain parks the
+        // content where the blob ops resolve relation-0 ids, ADVANCING
+        // the shared temp counter past the computed range
+        let mut db = Some(bookkeeping_db("/nonexistent/fc-mint-test"));
+        arm_blob_mint(db.as_ref());
+        let v = mint_computed_blob(&[b"aa".to_vec(), Vec::new(), b",".to_vec(), b"bb".to_vec()])
+            .expect("armed mint");
+        let Value::Blob(0, num) = v else { panic!("a relation-0 id") };
+        assert!(num as u32 > COMPUTED_BLOB_BASE);
+        drain_minted_blobs(&mut db);
+        let d = db.as_ref().unwrap();
+        let tb = d.temp_blobs.get(&(num as u32)).expect("drained");
+        // the empty piece wrote no segment (measured on the engine)
+        assert_eq!(tb.segments.len(), 3);
+        assert_eq!(tb.puts, 3);
+        assert_eq!(tb.max_put, 2);
+        assert!(tb.closed);
+        assert!(d.next_temp_blob >= num as u32);
+        // unarmed (no database): the fold refuses rather than guesses
+        arm_blob_mint(None);
+        assert!(mint_computed_blob(&[b"x".to_vec()]).is_err());
     }
 }
 
