@@ -256,6 +256,21 @@ A*1.5`). Boundary: an intermediate that overflows i64 raises 22003
 overflow" (both 22003) — fc's i128 numeric model, consistent with the
 server's own `numeric_bin`.
 
+**Bitwise functions BIN_AND / BIN_OR / BIN_XOR / BIN_NOT / BIN_SHL / BIN_SHR
+DONE (2026-08-24, `serve-real-bitwise` 6):** the bitwise built-ins in the
+SysFn scalar machinery - AND/OR/XOR variadic (2+), NOT unary, the shifts
+arithmetic (sign-preserving). Integer in, integer out, folded in i128 so a
+wide operand keeps its magnitude. The result TYPE follows the engine off the
+expression's NumRank (AND/OR/XOR/NOT floor at INTEGER, the shifts at BIGINT,
+either widening to INT128), so the describe matches byte for byte over
+literals and columns. An adversarial review caught two INT128 defects (an
+i64-truncating fold and a BIGINT-capped describe) plus a shift case it missed
+- all fixed. Boundaries: a scaled-NUMERIC / text / NUMERIC(p,0) operand
+refuses (fc generic vs the engine's "must be integral types"); a call inside
+a PSQL body refuses at CREATE (query surface only). The DOUBLE-valued math
+functions (POWER / SQRT / LOG / PI / ROUND / CEIL / FLOOR / TRUNC) stay
+refused - the executor has no f64 arithmetic.
+
 **NUMERIC in a FUNCTION signature DONE (2026-08-23, `serve-real-numfunc`
 6):** a plain function with a NUMERIC(p,s) param and/or return now loads,
 describes from its return descriptor (exact dtype/scale, `RDB$FIELD_SUB_TYPE
