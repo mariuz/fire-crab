@@ -503,9 +503,31 @@ preserve. An adversarial-review workflow found three real defects pre-commit
 packaged-body accept-where-engine-rejects) - all fixed and gated. Boundaries
 (recorded): packaged routine parameter defaults (header storage + preserving
 the default across the body re-write, both of which the live engine does) and
-a PSQL body call that OMITS a defaulted function's trailing argument (the
-engine fills it, the select-list call fills it, fc's body-call path refuses)
-await a dedicated slice; non-literal / context defaults still refuse.
+non-literal / context defaults still refuse; packaged routine parameter
+defaults (header storage + preserving it across the body re-write) await a
+dedicated slice.
+
+**Omitted-default body function calls DONE (2026-08-24, `serve-real-bodydefault`
+6).** `RETURN FA(X)` where `FA(B, A DEFAULT 5)` now works from inside a
+routine body, as it already did in a select list. The engine LATE-BINDS - it
+stores `blr_function` with only the arguments passed (a 1-arg call for
+`FA(X)`) and fills the defaulted tail from the callee's catalog at run time,
+NOT inlining the default at compile time - so fc matches on both sides: dsql
+carries `plain_funcs` as `(name, total, required)` and relaxes the body-call
+arity to `[required, total]`, emitting a short call whose BLR is
+byte-IDENTICAL to the engine's; and exe's `Expr::Function` reads the callee's
+input arity from its parsed BLR (message 0, two slots per param) and, when
+the call passed fewer, fills the trailing args from
+`RDB$FUNCTION_ARGUMENTS.RDB$DEFAULT_VALUE` (`function_arg_defaults` +
+`parse_default_expr`, reusing the literal/blr_null parser), coerced like a
+passed arg. So fc SERVES the same answer and the ENGINE runs fc's file
+identically. Verified byte-for-byte incl the all-defaulted (0-arg),
+zero-input, nested-call, string- and two-default edges, and a procedure body.
+A three-lens adversarial review found no defects. Boundaries (recorded): a
+wrong-arity body call refuses GENERICALLY (Dynamic SQL Error) vs the engine's
+07001 Parameter mismatch (the pre-existing shape for all body-call arity
+failures, fail-safe); a function omitting its OWN defaulted argument in a
+recursive self-call refuses (self-sig required == total).
 
 **The IF statement (blr_if) in exe DONE (2026-08-23, `serve-real-psqlif`
 5):** the executor could not convert an IF, so a body combining IF/ELSE
