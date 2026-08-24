@@ -17462,6 +17462,15 @@ fn plan_create_package_body(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
     // PROCEDURE is deliberately absent - a bare `P(...)` in an expression
     // is not a value function and refuses, exactly as the engine's scalar
     // resolution does; a wrong arg count refuses too.
+    // A package body member's UNQUALIFIED sibling call is checked at exact
+    // arity: a sibling declared with a defaulted parameter cannot be called
+    // here with the tail omitted. The header's per-member REQUIRED arity is
+    // not reliably visible at body-COMPILE time - fc's plan-time catalog is
+    // stale for same-connection DDL (header + body in one isql script) and a
+    // header-only declaration carries no BLR for load_function to key on -
+    // so the sibling channel stays exact-arity (a recorded boundary). An
+    // EXTERNAL call to the same defaulted member (select list, another
+    // body, EXECUTE PROCEDURE) fills the default fine.
     let member_names: Vec<(String, usize)> = segs
         .iter()
         .filter_map(|seg| {
@@ -17621,26 +17630,35 @@ fn plan_create_package(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
     if !inner[start..].trim().is_empty() {
         decls.push(inner[start..].trim());
     }
+    // A parameter DEFAULT on a packaged routine's HEADER declaration is where
+    // the engine keeps it, and fc now stores it (create_package) and carries
+    // it across the body re-write (create_package_body). The default rides
+    // conv / fnarg the same way the standalone routine paths carry theirs;
+    // an output param never has one. `proc_default_of` drops a default fc
+    // cannot encode (a > i32 integer) to None, so the loop below refuses the
+    // whole CREATE for an un-encodable one, matching the standalone paths.
     let conv = |m: &fire_crab_dsql::ProcParamMeta| fire_crab_ods::ddl::ProcParamDef {
-        default: None, name: m.name.clone(), field_type: m.field_type,
+        default: m.default.as_deref().and_then(proc_default_of),
+        name: m.name.clone(), field_type: m.field_type,
         length: m.length, scale: m.scale, sub_type: m.sub_type,
     };
     let fnarg = |m: &fire_crab_dsql::ProcParamMeta, position: i64, named: bool| fire_crab_ods::ddl::FnArgDef {
         name: if named { Some(m.name.to_ascii_uppercase()) } else { None },
         position, field_type: m.field_type, length: m.length, scale: m.scale,
-        sub_type: m.sub_type, null_flag: false, default: None, inline: false, precision: None, mech: -1,
+        sub_type: m.sub_type, null_flag: false,
+        default: if named { m.default.as_deref().and_then(proc_default_of) } else { None },
+        inline: false, precision: None, mech: -1,
+    };
+    // refuse a header member whose default source cannot be encoded (a > i32
+    // integer), the way plan_create_function / plan_create_procedure do
+    let unencodable = |ins: &[fire_crab_dsql::ProcParamMeta]| {
+        ins.iter().any(|m| m.default.as_deref().is_some_and(|s| proc_default_of(s).is_none()))
     };
     for d in decls {
         let dup = d.to_ascii_uppercase();
         if find_word(&dup, "PROCEDURE", 0) == Some(0) {
             let c = fire_crab_dsql::compile_procedure_full(&format!("CREATE {} AS BEGIN EXIT; END", d))?;
-            // A parameter DEFAULT on a packaged routine's HEADER declaration
-            // is where the engine keeps it, but fc neither stores it here nor
-            // preserves it across the body re-write, so honouring the CREATE
-            // would leave the catalog without the default and split a later
-            // omitted-argument call. Refuse the whole header instead (the
-            // clean pre-defaults gap), until packaged defaults land whole.
-            if c.ins.iter().any(|m| m.default.is_some()) {
+            if unencodable(&c.ins) {
                 return None;
             }
             members.push(fire_crab_ods::ddl::PackageMember::Procedure {
@@ -17651,8 +17669,8 @@ fn plan_create_package(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
             if c.outs.len() != 1 {
                 return None;
             }
-            if c.ins.iter().any(|m| m.default.is_some()) {
-                return None; // packaged header default - refused, see above
+            if unencodable(&c.ins) {
+                return None;
             }
             let mut args = vec![fnarg(&c.outs[0], 0, false)];
             for (i, m) in c.ins.iter().enumerate() {

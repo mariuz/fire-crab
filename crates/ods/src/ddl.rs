@@ -10602,6 +10602,81 @@ fn delete_package_member(file: &mut crate::Image, page_size: usize, is_proc: boo
     Ok(())
 }
 
+/// The INPUT-parameter DEFAULTs a package HEADER declared for one member,
+/// keyed by uppercased parameter name: (value BLR, source text). A default
+/// belongs on the header declaration, and the engine PRESERVES it when the
+/// body is created even though the body re-declares the member without one;
+/// create_package_body re-writes the member's parameter rows, so it reads
+/// the header's defaults here first and carries them onto the fresh rows.
+/// `is_proc` selects RDB$PROCEDURE_PARAMETERS (input params, type 0) vs
+/// RDB$FUNCTION_ARGUMENTS (arguments, position >= 1 - position 0 is the
+/// return value).
+fn carried_member_defaults(
+    file: &crate::Image,
+    page_size: usize,
+    is_proc: bool,
+    member: &str,
+    package: &str,
+) -> std::collections::HashMap<String, (Vec<u8>, String)> {
+    let mut out = std::collections::HashMap::new();
+    let (rel_name, name_col, param_name_col, filt_col) = if is_proc {
+        ("RDB$PROCEDURE_PARAMETERS", "RDB$PROCEDURE_NAME", "RDB$PARAMETER_NAME", "RDB$PARAMETER_TYPE")
+    } else {
+        ("RDB$FUNCTION_ARGUMENTS", "RDB$FUNCTION_NAME", "RDB$ARGUMENT_NAME", "RDB$ARGUMENT_POSITION")
+    };
+    let Some(rel) = crate::resolve_relation(file, page_size, rel_name) else { return out };
+    let Some(formats) = system_relation_formats(file, page_size, rel_name) else { return out };
+    let Some((_, descs)) = formats.iter().max_by_key(|(n, _)| *n) else { return out };
+    let cols = relation_columns(file, page_size, rel_name);
+    let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (Some(name_f), Some(pn_f), Some(dv_f), Some(ds_f), Some(filt_f)) = (
+        fid(name_col),
+        fid(param_name_col),
+        fid("RDB$DEFAULT_VALUE"),
+        fid("RDB$DEFAULT_SOURCE"),
+        fid(filt_col),
+    ) else {
+        return out;
+    };
+    let pkg_f = fid("RDB$PACKAGE_NAME");
+    let want_m = member.trim().trim_matches('"').to_ascii_uppercase();
+    let want_p = package.trim().trim_matches('"').to_ascii_uppercase();
+    // collect (name, def-blob, src-blob) in the walk; read the blobs after,
+    // the way domain_type does (no blob read inside the row closure)
+    let mut hits: Vec<(String, (u16, u64), Option<(u16, u64)>)> = Vec::new();
+    walk_rows(file, page_size, rel, descs, |v| {
+        if !text_eq(v.get(name_f), &want_m) {
+            return;
+        }
+        let pkg_ok = matches!(pkg_f.map(|i| v.get(i)),
+            Some(Some(Value::Text(rp))) if rp.trim_end().eq_ignore_ascii_case(&want_p));
+        if !pkg_ok {
+            return;
+        }
+        // inputs only: procedure param type 0, function argument position >= 1
+        match v.get(filt_f) {
+            Some(Value::Int(x)) if (is_proc && *x == 0) || (!is_proc && *x >= 1) => {}
+            _ => return,
+        }
+        let Some(Value::Text(pn)) = v.get(pn_f) else { return };
+        let Some(Value::Blob(dr, dn)) = v.get(dv_f) else { return };
+        let src = match v.get(ds_f) {
+            Some(Value::Blob(sr, sn)) => Some((*sr, *sn)),
+            _ => None,
+        };
+        hits.push((pn.trim_end().to_ascii_uppercase(), (*dr, *dn), src));
+    });
+    for (nm, (dr, dn), src) in hits {
+        let Some(blr) = crate::format::read_blob_content(file, page_size, dr, dn) else { continue };
+        let src_txt = src
+            .and_then(|(sr, sn)| crate::format::read_blob_content(file, page_size, sr, sn))
+            .and_then(|b| String::from_utf8(b).ok())
+            .unwrap_or_default();
+        out.insert(nm, (blr, src_txt));
+    }
+    out
+}
+
 /// `CREATE PACKAGE BODY <name> AS BEGIN <impls> END` - fills the header's
 /// members with their compiled bodies. The engine re-writes each member (new
 /// param domains) keeping its RDB$PROCEDURE/FUNCTION_ID, then stamps the
@@ -10662,13 +10737,36 @@ pub fn create_package_body(
         match m {
             PackageBodyMember::Procedure { name, ins, outs, selectable, blr } => {
                 let id = procedure_id_in_package(file, page_size, name, &want).ok_or_else(|| format!("member {} not declared in the header", name))?;
+                // carry the header declaration's input defaults onto the
+                // re-written parameter rows (the body has none - guarded
+                // above; the engine keeps the header's)
+                let carried = carried_member_defaults(file, page_size, true, name, &want);
+                let mut ins = ins.clone();
+                for p in ins.iter_mut() {
+                    if p.default.is_none() {
+                        if let Some(d) = carried.get(&p.name.trim().trim_matches('"').to_ascii_uppercase()) {
+                            p.default = Some(d.clone());
+                        }
+                    }
+                }
                 delete_package_member(file, page_size, true, name, &want)?;
-                create_procedure_with_id(file, page_size, name, ins, outs, *selectable, "", blr, Some((&want, 0)), Some(id), false)?;
+                create_procedure_with_id(file, page_size, name, &ins, outs, *selectable, "", blr, Some((&want, 0)), Some(id), false)?;
             }
             PackageBodyMember::Function { name, args, deterministic, blr } => {
                 let id = function_id(file, page_size, name, &want).ok_or_else(|| format!("member {} not declared in the header", name))?;
+                let carried = carried_member_defaults(file, page_size, false, name, &want);
+                let mut args = args.clone();
+                for a in args.iter_mut() {
+                    if a.default.is_none() {
+                        if let Some(nm) = &a.name {
+                            if let Some(d) = carried.get(&nm.trim().trim_matches('"').to_ascii_uppercase()) {
+                                a.default = Some(d.clone());
+                            }
+                        }
+                    }
+                }
                 delete_package_member(file, page_size, false, name, &want)?;
-                restore_carried_function(file, page_size, name, args, 0, *deterministic, "", blr, None, Some((&want, 0)), None, false, Some(id))?;
+                restore_carried_function(file, page_size, name, &args, 0, *deterministic, "", blr, None, Some((&want, 0)), None, false, Some(id))?;
             }
         }
     }

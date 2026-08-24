@@ -2180,7 +2180,10 @@ impl<'a> P<'a> {
                     }
                 }
                 // the sibling's declared arity must match, as the engine
-                // checks at compile - a wrong count refuses the member
+                // checks at compile - a wrong count refuses the member. A
+                // sibling with a defaulted parameter cannot be called here
+                // with the tail omitted (a recorded boundary: the header's
+                // required arity is not reliably visible at body-compile).
                 if args.len() != arity {
                     return None;
                 }

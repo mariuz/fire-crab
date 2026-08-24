@@ -116,25 +116,31 @@ check "package PROCEDURE body default -> byte-exact -607" \
     "$(pkgbody BH 'PROCEDURE P(A INTEGER, B INTEGER) RETURNS (R INTEGER);' 'PROCEDURE P(A INTEGER, B INTEGER DEFAULT 8) RETURNS (R INTEGER) AS BEGIN R=A; SUSPEND; END' "127.0.0.1/$PORT:$A")" \
     "$(pkgbody BH 'PROCEDURE P(A INTEGER, B INTEGER) RETURNS (R INTEGER);' 'PROCEDURE P(A INTEGER, B INTEGER DEFAULT 8) RETURNS (R INTEGER) AS BEGIN R=A; SUSPEND; END' "127.0.0.1/$REAL:$B")"
 
-# Boundary (recorded): a packaged routine's HEADER declaration may carry a
-# default on the live engine (its canonical place), but fc neither stores
-# nor preserves it across the body re-write, so it REFUSES the header create
-# rather than accept a defaultless catalog. A PSQL body call that OMITS a
-# defaulted function's trailing argument also refuses (the select-list call
-# fills it) - both await a dedicated packaged/body-fill slice.
-ran=$((ran + 1))
-hdr=$("$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$A" <<'SQL' 2>&1
+# A packaged routine's HEADER declaration is the canonical place for a
+# parameter default: fc stores it (create_package), preserves it across the
+# body re-write (create_package_body carries it onto the fresh param rows),
+# and fills it at an external call. The default source survives, and an
+# omitted-argument call fills it, matching the engine.
+read -r -d '' PKGHDR <<'SQL'
 SET TERM ^;
 CREATE PACKAGE HDRD AS BEGIN FUNCTION F(A INTEGER, B INTEGER DEFAULT 10) RETURNS INTEGER; END^
+CREATE PACKAGE BODY HDRD AS BEGIN FUNCTION F(A INTEGER, B INTEGER) RETURNS INTEGER AS BEGIN RETURN A+B; END END^
 SET TERM ;^
 COMMIT;
-SELECT RDB$PACKAGE_NAME FROM RDB$PACKAGES WHERE RDB$PACKAGE_NAME = 'HDRD';
 SQL
-)
-if echo "$hdr" | grep -q "HDRD" ; then
-    echo "DIFF fc stored a header-default package it cannot honour: $hdr"; fail=1
-else
-    echo "OK   fc refuses a packaged header default (no bogus catalog)"; fi
+ce=$("$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$REAL:$B" <<< "$PKGHDR" 2>&1 | norm)
+cc=$("$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$A" <<< "$PKGHDR" 2>&1 | norm)
+check "a packaged HEADER default builds on both" "$cc" "$ce"
+cat > "$D/ph.sql" <<'SQL'
+SET LIST ON;
+SELECT CAST(RDB$DEFAULT_SOURCE AS VARCHAR(12)) S FROM RDB$FUNCTION_ARGUMENTS
+WHERE RDB$PACKAGE_NAME='HDRD' AND RDB$DEFAULT_SOURCE IS NOT NULL;
+SELECT HDRD.F(1) R FROM RDB$DATABASE;
+SELECT HDRD.F(1, 100) R FROM RDB$DATABASE;
+SQL
+phe=$("$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$REAL:$B" -i "$D/ph.sql" 2>&1 | norm)
+phc=$("$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$A" -i "$D/ph.sql" 2>&1 | norm)
+check "the packaged header default survives the body create and fills a call" "$phc" "$phe"
 
 # the ENGINE runs fc's stored function defaults
 kill $srv 2>/dev/null; wait $srv 2>/dev/null
