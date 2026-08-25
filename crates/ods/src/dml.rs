@@ -1042,6 +1042,15 @@ pub fn apply_ddl_deferred(
                     page[at + 20] = 6; // irt_drop (ods.h:456)
                 }
             }
+            crate::DdlDeferred::FreeBlob { rel, recno } => {
+                // the superseded catalog blob, now that the change is
+                // final (the caller has already held these back when
+                // another transaction was still active)
+                crate::gc::free_blob(file, page_size, rel, recno);
+            }
+            crate::DdlDeferred::PurgeRowChain { rel: _, page, slot } => {
+                crate::gc::purge_row_chain(file, page_size, page, slot);
+            }
         }
     }
     Ok(())

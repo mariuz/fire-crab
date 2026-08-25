@@ -1299,6 +1299,7 @@ pub fn alter_table_add_column(
         image[fid / 8] &= !(1 << (fid % 8)); // clear NULL bit (already set)
         Ok(())
     };
+    let old_rt = rel_field("RDB$RUNTIME").and_then(|f| old_blob_at(&rel_image, rel_descs, f));
     patch(&mut rel_image, "RDB$FORMAT", SysVal::I(new_format_no))?;
     patch(&mut rel_image, "RDB$FIELD_ID", SysVal::I((new_fid + 1) as i64))?;
     patch(&mut rel_image, "RDB$RUNTIME", SysVal::B(blob_id_bytes(6, runtime)))?;
@@ -1309,6 +1310,10 @@ pub fn alter_table_add_column(
         &[(rel_page, rel_slot, rel_image)],
         rec_format,
     )?;
+    if let Some((orel, onum)) = old_rt {
+        dispose_superseded_blob(file, page_size, orel, onum);
+        dispose_row_purge(file, page_size, 6, rel_page, rel_slot);
+    }
 
     advance_oldest_transactions(file, page_size)?;
     Ok(())
@@ -1580,9 +1585,14 @@ fn reformat_for_retype(
         image[fid / 8] &= !(1 << (fid % 8));
         Ok(())
     };
+    let old_rt = rel_field("RDB$RUNTIME").and_then(|f| old_blob_at(&rel_image, rel_descs, f));
     patch(&mut rel_image, "RDB$FORMAT", SysVal::I(new_format_no))?;
     patch(&mut rel_image, "RDB$RUNTIME", SysVal::B(blob_id_bytes(6, runtime)))?;
     dml::update_records(file, page_size, 6, &[(rel_page, rel_slot, rel_image)], rec_format)?;
+    if let Some((orel, onum)) = old_rt {
+        dispose_superseded_blob(file, page_size, orel, onum);
+        dispose_row_purge(file, page_size, 6, rel_page, rel_slot);
+    }
     Ok(())
 }
 
@@ -2610,9 +2620,14 @@ pub fn alter_table_drop_column(
         image[fid / 8] &= !(1 << (fid % 8));
         Ok(())
     };
+    let old_rt = rel_field("RDB$RUNTIME").and_then(|f| old_blob_at(&rel_image, rel_descs, f));
     patch(&mut rel_image, "RDB$FORMAT", SysVal::I(new_format_no))?;
     patch(&mut rel_image, "RDB$RUNTIME", SysVal::B(blob_id_bytes(6, runtime)))?;
     dml::update_records(file, page_size, 6, &[(rel_page, rel_slot, rel_image)], rec_format)?;
+    if let Some((orel, onum)) = old_rt {
+        dispose_superseded_blob(file, page_size, orel, onum);
+        dispose_row_purge(file, page_size, 6, rel_page, rel_slot);
+    }
 
     advance_oldest_transactions(file, page_size)?;
     Ok(())
@@ -2928,9 +2943,14 @@ pub fn alter_table_alter_column_type(
         image[fid / 8] &= !(1 << (fid % 8));
         Ok(())
     };
+    let old_rt = rel_field("RDB$RUNTIME").and_then(|f| old_blob_at(&rel_image, rel_descs, f));
     patch(&mut rel_image, "RDB$FORMAT", SysVal::I(new_format_no))?;
     patch(&mut rel_image, "RDB$RUNTIME", SysVal::B(blob_id_bytes(6, runtime)))?;
     dml::update_records(file, page_size, 6, &[(rel_page, rel_slot, rel_image)], rec_format)?;
+    if let Some((orel, onum)) = old_rt {
+        dispose_superseded_blob(file, page_size, orel, onum);
+        dispose_row_purge(file, page_size, 6, rel_page, rel_slot);
+    }
 
     advance_oldest_transactions(file, page_size)?;
     Ok(())
@@ -3375,6 +3395,7 @@ fn refresh_runtime(file: &mut crate::Image, page_size: usize, table: &str) -> Re
         .map(|c| c.field_id as usize)
         .ok_or("no RDB$RUNTIME")?;
     let d = rel_descs.get(fid).ok_or("field beyond format")?;
+    let old_rt = old_blob_at(&image, rel_descs, fid);
     let bytes = encode_sys_value(d, &SysVal::B(blob_id_bytes(6, runtime)))?;
     let at = d.offset as usize;
     image
@@ -3383,6 +3404,10 @@ fn refresh_runtime(file: &mut crate::Image, page_size: usize, table: &str) -> Re
         .copy_from_slice(&bytes);
     image[fid / 8] &= !(1 << (fid % 8));
     dml::update_records(file, page_size, 6, &[(page, slot, image)], rec_format)?;
+    if let Some((orel, onum)) = old_rt {
+        dispose_superseded_blob(file, page_size, orel, onum);
+        dispose_row_purge(file, page_size, 6, page, slot);
+    }
     Ok(())
 }
 
@@ -7385,6 +7410,59 @@ pub fn relation_head_owner(file: &crate::Image, page_size: usize, name: &str) ->
 /// and every index entry pointing at it, stay valid) - which is only
 /// safe for columns no index of the relation keys; a keyed column needs
 /// [maintain_indexes] afterwards, as the deferred index drop does.
+/// A blob-typed field's CURRENT id off a row image - the read half of
+/// superseded-catalog-blob GC, taken BEFORE the field is overwritten.
+/// None when the field is NULL, not blob-typed, or holds the zero id.
+fn old_blob_at(image: &[u8], descs: &[Descriptor], fid: usize) -> Option<(u16, u64)> {
+    use crate::format::dtype;
+    let d = descs.get(fid)?;
+    if d.dtype != dtype::BLOB && d.dtype != dtype::QUAD {
+        return None;
+    }
+    if d.offset == 0 || image.get(fid / 8).map(|b| b & (1 << (fid % 8)) != 0).unwrap_or(true) {
+        return None;
+    }
+    let at = d.offset as usize;
+    let f = image.get(at..at + 8)?;
+    let orel = u16_at(f, 0);
+    let onum = ((f[3] as u64) << 32) | u32_at(f, 4) as u64;
+    if onum == 0 {
+        return None;
+    }
+    Some((orel, onum))
+}
+
+/// Every blob id a row image still references - the "staying" half of
+/// the engine's BLB_garbage_collect diff (blb.cpp:424: identity is the
+/// id, not the field - a blob that moved fields is NOT superseded).
+fn image_blob_ids(image: &[u8], descs: &[Descriptor]) -> Vec<(u16, u64)> {
+    (0..descs.len()).filter_map(|fid| old_blob_at(image, descs, fid)).collect()
+}
+
+/// Dispose of a catalog blob a patch superseded: under a DDL
+/// transaction the free waits for COMMIT (a rollback must find the old
+/// row version's blob still there); the settled path (tools, restore)
+/// frees on the spot - the same two-arm shape as drop_table's storage
+/// (ddl.rs release_relation_storage branch).
+fn dispose_superseded_blob(file: &mut crate::Image, page_size: usize, rel: u16, recno: u64) {
+    if file.ddl_tx.is_some() {
+        file.ddl_deferred.push(crate::DdlDeferred::FreeBlob { rel, recno });
+    } else {
+        crate::gc::free_blob(file, page_size, rel, recno);
+    }
+}
+
+/// The other half of every free: no on-disk version may keep naming a
+/// freed blob (see [crate::DdlDeferred::PurgeRowChain]). Rides with
+/// [dispose_superseded_blob] on the patched row itself.
+fn dispose_row_purge(file: &mut crate::Image, page_size: usize, rel: u16, page: u32, slot: u16) {
+    if file.ddl_tx.is_some() {
+        file.ddl_deferred.push(crate::DdlDeferred::PurgeRowChain { rel, page, slot });
+    } else {
+        crate::gc::purge_row_chain(file, page_size, page, slot);
+    }
+}
+
 fn patch_sys_row(
     file: &mut crate::Image,
     page_size: usize,
@@ -7444,12 +7522,20 @@ fn patch_sys_row(
     // which byte ranges the loop below actually changes, so a fragmented
     // row can be patched by range instead of rewritten whole
     let mut touched: Vec<(usize, usize)> = Vec::new();
+    let mut superseded: Vec<(u16, u64)> = Vec::new();
     for (name, v) in values {
         let fid = columns
             .iter()
             .find(|c| c.name.eq_ignore_ascii_case(name))
             .ok_or_else(|| format!("unknown catalog column {}", name))?
             .field_id as usize;
+        // a blob id this write is about to bury: captured before the
+        // overwrite, freed only once the new row is down (and only if
+        // the final image no longer names it anywhere - the engine's
+        // going-minus-staying diff, blb.cpp:424)
+        if let Some(old) = old_blob_at(&image, &descs, fid) {
+            superseded.push(old);
+        }
         if let SysVal::Null = v {
             image[fid / 8] |= 1 << (fid % 8); // NULL
             continue;
@@ -7464,12 +7550,22 @@ fn patch_sys_row(
         touched.push((at, bytes.len()));
         image[fid / 8] &= !(1 << (fid % 8)); // not NULL
     }
-    if fragmented {
+    let staying = image_blob_ids(&image, &descs);
+    superseded.retain(|id| !staying.contains(id));
+    if fragmented && file.ddl_tx.is_none() {
         // Only the bytes that actually changed, as offsets into the
         // assembled image - which for a fragmented record begins with the
         // head's own bytes, so an offset inside the head is the same
         // offset either way. `patch_head_in_place` re-checks that every
         // range lands in the head and refuses otherwise.
+        //
+        // SETTLED PATH ONLY: an in-place poke leaves no version behind,
+        // so transaction-state rollback cannot see it (measured: a
+        // rolled-back ALTER DOMAIN on a fragmented RDB$FIELDS row kept
+        // the DROP half - the check vanished). Under `ddl_tx` the row
+        // goes through the versioned update below instead - a
+        // fragmented head CLONES as the back version, forward pointer
+        // and all, so the engine's undo-by-state works unchanged.
         let mut pokes: Vec<(usize, Vec<u8>)> = Vec::new();
         for (at, len) in touched {
             pokes.push((at, image[at..at + len].to_vec()));
@@ -7499,6 +7595,12 @@ fn patch_sys_row(
         let mut image = image;
         dml::trim_fill_tail(&mut image, fmt_len);
         dml::update_records(file, page_size, rel, &[(page, slot, image)], format_no)?;
+    }
+    if !superseded.is_empty() {
+        for (orel, onum) in superseded {
+            dispose_superseded_blob(file, page_size, orel, onum);
+        }
+        dispose_row_purge(file, page_size, rel, page, slot);
     }
     Ok(())
 }

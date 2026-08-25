@@ -233,11 +233,150 @@ struct Member {
 /// they are - `find_space` measures free space from the LIVE entries,
 /// so a zeroed slot is reusable room, which is also what the engine's
 /// own lazily-compacted pages look like.
-fn free_slot(file: &mut crate::Image, page_size: usize, page: u32, slot: u16) {
+pub(crate) fn free_slot(file: &mut crate::Image, page_size: usize, page: u32, slot: u16) {
     let p = crate::page_mut(file, page_size, page).expect("free_slot: page out of range");
     let dir = crate::data::DPG_RPT_OFFSET + slot as usize * 4;
     crate::dml::put_u16(p, dir, 0);
     crate::dml::put_u16(p, dir + 2, 0);
+}
+
+/// PURGE one row's back-version chain - the engine's `purge`
+/// (vio.cpp:6977) narrowed to a single catalog row at COMMIT: every
+/// version behind the head is freed (a fragmented member's tail pieces
+/// with it) and the head's back pointer cleared, so no on-disk version
+/// still names a blob the same commit is freeing. Without this, the
+/// ENGINE's own version GC (a gbak attach's cooperative purge, gfix,
+/// sweep) later collects the stale version and frees its blob ids -
+/// which by then may be someone else's recycled slots (measured: gbak
+/// freed a live RDB$RUNTIME minted into a recycled slot, then died on
+/// it with "BLOB not found").
+pub(crate) fn purge_row_chain(
+    file: &mut crate::Image,
+    page_size: usize,
+    page: u32,
+    slot: u16,
+) {
+    let head = {
+        let Some(dp) = crate::page_at(file, page_size, page).and_then(DataPage::decode) else {
+            return;
+        };
+        let Some(r) = dp.record(slot) else { return };
+        (r.back_page, r.back_line)
+    };
+    let (mut b_page, mut b_line) = head;
+    let mut hops = 0usize;
+    while b_page != 0 && hops < 10_000 {
+        hops += 1;
+        let (next, frag) = {
+            let Some(dp) = crate::page_at(file, page_size, b_page).and_then(DataPage::decode)
+            else {
+                break;
+            };
+            let Some(r) = dp.record(b_line) else { break };
+            ((r.back_page, r.back_line), r.frag_ptr)
+        };
+        // a fragmented member's tail pieces go with it
+        if let Some((mut f_page, mut f_line)) = frag {
+            let mut fhops = 0usize;
+            while f_page != 0 && fhops < 10_000 {
+                fhops += 1;
+                let next_f = {
+                    let Some(dp) =
+                        crate::page_at(file, page_size, f_page).and_then(DataPage::decode)
+                    else {
+                        break;
+                    };
+                    let Some(r) = dp.record(f_line) else { break };
+                    r.frag_ptr
+                };
+                free_slot(file, page_size, f_page, f_line);
+                match next_f {
+                    Some((np, nl)) => {
+                        f_page = np;
+                        f_line = nl;
+                    }
+                    None => break,
+                }
+            }
+        }
+        free_slot(file, page_size, b_page, b_line);
+        b_page = next.0;
+        b_line = next.1;
+    }
+    // the head stands alone now
+    if head.0 != 0 {
+        if let Some(p) = crate::page_mut(file, page_size, page) {
+            let dir = crate::data::DPG_RPT_OFFSET + slot as usize * 4;
+            let off = crate::u16_at(p, dir) as usize;
+            let len = crate::u16_at(p, dir + 2) as usize;
+            if len >= 10 && off + len <= p.len() {
+                crate::dml::put_u16(p, off + 4, 0); // rhd_b_page low
+                crate::dml::put_u16(p, off + 6, 0); // rhd_b_page high
+                crate::dml::put_u16(p, off + 8, 0); // rhd_b_line
+            }
+        }
+    }
+}
+
+/// Free ONE blob's storage by id - blb::delete_blob (blb.cpp:2174) +
+/// the slot purge DPM_delete does (dpm.epp:822): a level-0 blob is
+/// inline in its slot and frees nothing else; a level-1 blob's data
+/// pages (the u32 vector after the blh) go back to their PIP first.
+/// Level 2 is left alone (three-level blobs never come from the
+/// catalog writers - insert_blob_slot refuses anything bigger than a
+/// slot - and a partial free is worse than a leak). Returns whether
+/// the slot was freed.
+pub(crate) fn free_blob(
+    file: &mut crate::Image,
+    page_size: usize,
+    rel: u16,
+    recno: u64,
+) -> bool {
+    let recs = crate::format::max_recs_per_dp(page_size);
+    let dp_index = (recno / recs) as u64;
+    let line = (recno % recs) as u16;
+    // recnos are DPG_SEQUENCE-positional (insert_blob_slot mints from
+    // the page's own dpg_sequence, the engine from ppg_sequence *
+    // dp_per_pp) while relation_data_pages COMPACTS zero pointer slots
+    // away - after an interior hole (the engine's own GC zeroes a
+    // released page's slot and trims ppg_count only from the tail)
+    // positional indexing lands on the WRONG page (review-caught: it
+    // would free a live blob there). Resolve by the page's OWN sequence.
+    let pages = crate::relation_data_pages(file, page_size, rel);
+    let by_seq = |p: &u32| {
+        crate::page_at(file, page_size, *p)
+            .map(|b| crate::u32_at(b, 16) as u64 == dp_index)
+            .unwrap_or(false)
+    };
+    let candidate = pages.get(dp_index as usize).copied().filter(|p| by_seq(p));
+    let Some(dp_no) = candidate.or_else(|| pages.iter().find(|p| by_seq(p)).copied()) else {
+        return false;
+    };
+    let pages: Vec<u32> = {
+        let Some(dp) = crate::page_at(file, page_size, dp_no).and_then(DataPage::decode) else {
+            return false;
+        };
+        let Some(b) = dp.slot_bytes(line) else {
+            return false;
+        };
+        if b.len() < 28 || crate::u16_at(b, 10) & flags::BLOB == 0 {
+            return false; // not a blob (already freed, or reused): leave it
+        }
+        match b[27] {
+            0 => Vec::new(),
+            1 => b[28..]
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .filter(|p| *p != 0)
+                .collect(),
+            _ => return false, // level 2: never ours - leak, not corrupt
+        }
+    };
+    for p in pages {
+        let _ = crate::dml::release_page(file, page_size, p);
+    }
+    free_slot(file, page_size, dp_no, line);
+    true
 }
 
 /// Read one record's header fields straight off the page.

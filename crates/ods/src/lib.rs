@@ -119,6 +119,14 @@ pub enum DdlResidue {
     /// split into count too) released, the root slot zeroed
     IndexTree { irt_page: u32, rel: u16, slot: usize },
 }
+// NOTE deliberately ABSENT: a rolled-back DDL's own minted blobs are
+// NOT freed as residue. The dead row versions that name them stay on
+// the pages, and the ENGINE's version GC (a gbak attach's cooperative
+// purge, gfix, sweep) frees a dead version's blobs BY ID - if this
+// server had freed the slot and re-minted into it, the engine would
+// free the NEW occupant (measured: gbak freed a table's live
+// RDB$RUNTIME and then failed on it). Blob and referencing version
+// must always go TOGETHER; at rollback that means both stay.
 
 /// Deferred work of a DDL statement (see [Image::ddl_deferred]).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -129,6 +137,24 @@ pub enum DdlDeferred {
     /// an index root slot's state goes `irt_drop` - ods.h:456's
     /// irt_commit -> irt_drop step, taken when the drop is final
     DropIndexSlot { irt_page: u32, slot: usize },
+    /// a catalog blob a patch SUPERSEDED (the old RDB$RUNTIME, an ALTER
+    /// DOMAIN's replaced validation pair, a re-granted ACL): freed when
+    /// the change is final. The engine's shape differs only in timing -
+    /// a user-transaction catalog update leaves the old blob to the
+    /// version GC (vio.cpp:1694 purge -> BLB_garbage_collect:5649);
+    /// fire-crab's sweep skips blob-bearing relations, so commit is the
+    /// one moment this server can free it (guarded: not while another
+    /// transaction is active - a snapshot may still read the old row
+    /// version that names this blob)
+    FreeBlob { rel: u16, recno: u64 },
+    /// PURGE a patched catalog row's back-version chain when the patch
+    /// is final: the freed blobs above are named by those back
+    /// versions, and the engine's version GC frees a collected
+    /// version's blobs BY ID - a stale reference plus a recycled slot
+    /// makes it free the new occupant. The engine's own purge
+    /// (vio.cpp:6977) removes chain and blob references together; so
+    /// does this, at the same no-other-actives moment the frees run
+    PurgeRowChain { rel: u16, page: u32, slot: u16 },
 }
 
 impl Image {

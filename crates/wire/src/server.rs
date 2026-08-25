@@ -3446,6 +3446,32 @@ impl Database {
             deferred.append(&mut w.deferred);
         }
         if !deferred.is_empty() {
+            // superseded-blob frees need a QUIET moment: another live
+            // transaction may hold a snapshot that still steps to the
+            // old catalog row version naming the blob (the engine's
+            // purge gates on oldest_snapshot the same way,
+            // vio.cpp:1655). When anyone else is active the frees are
+            // dropped - the leak this GC closes, for one commit, is
+            // safer than a snapshot reading a freed slot.
+            let mine: Vec<u64> = self.all_tx().iter().map(|t| *t as u64).collect();
+            let others_active = {
+                let snap = fire_crab_ods::tra::Snapshot::capture(&work, self.page_size);
+                // the TIP alone is BLIND to a reader: fc reserves an id
+                // at first WRITE, so a read-only snapshot transaction in
+                // another attachment has no TIP entry (review-caught) -
+                // any OTHER live attachment counts as a possible reader
+                snap.active.iter().any(|tx| !mine.contains(tx))
+                    || self.attachments.attaches.load(std::sync::atomic::Ordering::SeqCst) > 1
+            };
+            if others_active {
+                deferred.retain(|d| {
+                    !matches!(
+                        d,
+                        fire_crab_ods::DdlDeferred::FreeBlob { .. }
+                            | fire_crab_ods::DdlDeferred::PurgeRowChain { .. }
+                    )
+                });
+            }
             fire_crab_ods::dml::apply_ddl_deferred(&mut work, self.page_size, &deferred)?;
             self.invalidate_meta();
         }
@@ -59264,19 +59290,47 @@ fn run_autonomous(
         if d.windows.len() <= mark {
             return Err(PsqlStop::Unsupported);
         }
-        let w = d.windows.remove(mark);
+        let mut w = d.windows.remove(mark);
         d.windows.truncate(mark);
         // its DDL: the residue undone if the block failed, the deferred
-        // work done if it commits - this block IS a transaction
+        // work done if it commits - this block IS a transaction.
+        // FreeBlob/PurgeRowChain do NOT run here: the ENCLOSING
+        // transaction (and any other attachment's snapshot) is still
+        // open and may step to the very versions they would free
+        // (review-caught) - they ride to the outer COMMIT, whose
+        // quiet-moment guard decides
         if outcome.is_err() {
             apply_ddl_residue(d, &w.residue);
         } else if !w.deferred.is_empty() {
-            if let Ok(mut work) = d.work_copy() {
-                if fire_crab_ods::dml::apply_ddl_deferred(&mut work, d.page_size, &w.deferred).is_ok() {
-                    d.install_dirty(work);
+            let held: Vec<fire_crab_ods::DdlDeferred> = {
+                let mut held = Vec::new();
+                w.deferred.retain(|e| {
+                    let keep = !matches!(
+                        e,
+                        fire_crab_ods::DdlDeferred::FreeBlob { .. }
+                            | fire_crab_ods::DdlDeferred::PurgeRowChain { .. }
+                    );
+                    if !keep {
+                        held.push(e.clone());
+                    }
+                    keep
+                });
+                held
+            };
+            if !w.deferred.is_empty() {
+                if let Ok(mut work) = d.work_copy() {
+                    if fire_crab_ods::dml::apply_ddl_deferred(&mut work, d.page_size, &w.deferred).is_ok() {
+                        d.install_dirty(work);
+                    }
+                }
+                d.invalidate_meta();
+            }
+            if !held.is_empty() {
+                match d.windows.last_mut() {
+                    Some(parent) => parent.deferred.extend(held),
+                    None => d.ddl_deferred.extend(held),
                 }
             }
-            d.invalidate_meta();
         }
         w.ids().collect()
     };
@@ -65747,7 +65801,17 @@ fn after_auth(
                 // MRK_commit -> MRK_drop waits for the commit and the
                 // OAT), and a promise kept by memory this process may not
                 // have when the limbo resolves is no promise. Refused.
-                if database.as_ref().is_some_and(|d| d.windows.iter().any(|w| !w.deferred.is_empty())) {
+                if database.as_ref().is_some_and(|d| {
+                    d.windows.iter().any(|w| {
+                        w.deferred.iter().any(|e| {
+                            !matches!(
+                                e,
+                                fire_crab_ods::DdlDeferred::FreeBlob { .. }
+                                    | fire_crab_ods::DdlDeferred::PurgeRowChain { .. }
+                            )
+                        })
+                    })
+                }) {
                     if std::env::var("FC_SRV_TRACE").is_ok() {
                         eprintln!("[srv] op_prepare on a transaction with a pending DROP refused");
                     }

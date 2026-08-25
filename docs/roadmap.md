@@ -417,6 +417,47 @@ exactly (met.epp's last-descriptor law; the sample only
 sanity-checks), the pad living solely at the record layer.
 serve-real-grow's growth threshold relaxed to +1 page: packed small
 rows fill ~6x denser, exactly as the engine stores them.
+
+**Catalog blob GC — DONE 2026-08-25.** The other half of the
+page-pressure class: a catalog patch that REPLACES or NULLs a blob
+field (the `RDB$RUNTIME` summary every ALTER rewrites, an ALTER
+DOMAIN's validation pair, a re-granted `RDB$ACL`, a re-COMMENTed
+`RDB$DESCRIPTION`) leaked the superseded blob forever — 2 slots per
+ALTER-DOMAIN cycle on `RDB$FIELDS`, one runtime per cycle on
+`RDB$RELATIONS`, and fc's sweep skips blob-bearing relations, so
+nothing ever reclaimed them. Now: `patch_sys_row` (and the five
+hand-rolled `RDB$RUNTIME` poke sites) captures the old id before the
+overwrite, keeps anything the final image still names (the engine's
+going-minus-staying diff, blb.cpp:424 — identity is the id, a blob
+that moved fields is kept), and the free rides as DEFERRED work
+(`DdlDeferred::FreeBlob`) applied at COMMIT with the other dfw.epp
+phases; the settled path (tools, restore) frees on the spot. **The
+law the hard way: blob and referencing version go TOGETHER.** The
+first cut freed the slot while back/dead row versions still named the
+id — the ENGINE's own version GC (a gbak attach's cooperative purge)
+later collected the stale version and freed the id's NEW occupant
+(gbak died on a live `RDB$RUNTIME`: "BLOB not found"). So every free
+is paired with `PurgeRowChain` — the engine's `purge` narrowed to the
+patched row: back chain freed (fragmented members' tails included),
+head's back pointer zeroed; and a ROLLED-BACK statement's own minted
+blobs deliberately STAY beside the dead versions that name them (the
+engine's sweep collects both together — gated). The 3-lens review
+confirmed four more: the commit guard was TIP-blind to READ-ONLY
+snapshot transactions (fc reserves ids at first write — a reader has
+no TIP entry; now any other live attachment holds the frees back),
+the autonomous-block epilogue applied frees unguarded mid-outer-
+transaction (they ride to the outer commit now), `free_blob` resolved
+recnos through the zero-compacted page list where ids are
+dpg_sequence-positional (resolved by the page's own sequence now),
+and `op_prepare` refused every superseding DDL (the pending-DROP
+guard now ignores free/purge entries). `serve-real-blobgc` 18 checks:
+40 cycles with gstat "Blobs:" flat at/below the engine's own lazy
+trail, rollback keeps the old check and the engine's sweep reclaims
+the mints, GRANT/REVOKE + COMMENT churn at engine parity, snapshot
+re-read under a concurrent COMMENT still answers the old value.
+Remaining recorded: blobs superseded via delete-then-recreate (ALTER
+VIEW/PROCEDURE/TRIGGER/FUNCTION, DROP TABLE stubs) still leak with
+their dead rows — engine-collectable, same law.
 The 13-agent adversarial review caught 8 real defects, all fixed and
 live-verified: two CRITICAL silent-wrongs — a case-blind
 RDB$FIELD_SOURCE join bound the WRONG domain's check when `"dm2"`
