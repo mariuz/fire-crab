@@ -66,11 +66,22 @@ rows_q="SELECT ID, D16, D34, D34B FROM CT ORDER BY ID;"
 e=$(printf '%s\n' "$rows_q" | "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$REAL:$B" 2>&1 | norm)
 c=$(printf '%s\n' "$rows_q" | "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$A" 2>&1 | norm)
 check "DECFLOAT values inserted through fc round-trip" "$c" "$e"
-# Boundary: a tz literal in an INSERT through fc refuses
-cb=$("$D/sqlerr" "127.0.0.1/$PORT:$A" "INSERT INTO CT VALUES (9, 1, 1, 1, TIME '10:20:30 +02:00', NULL)" 2>&1 | norm)
+# a tz literal in an INSERT works since the tzdml slice - run the SAME
+# insert on BOTH so the row batteries below stay twins (the refusal
+# this used to pin is CLOSED)
+"$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$A" <<'SQL' >/dev/null 2>&1
+INSERT INTO CT VALUES (9, 1, 1, 1, TIME '10:20:30 +02:00', NULL);
+COMMIT;
+SQL
+"$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$REAL:$B" <<'SQL' >/dev/null 2>&1
+INSERT INTO CT VALUES (9, 1, 1, 1, TIME '10:20:30 +02:00', NULL);
+COMMIT;
+SQL
 ran=$((ran + 1))
-if [ "${cb#*gds}" != "$cb" ]; then echo "OK   boundary: a WITH TIME ZONE literal in an fc INSERT refuses (a value-parser gap)"
-else echo "DIFF boundary MOVED: tz literal insert"; echo "     fc: $cb"; fail=1; fi
+tzr=$(printf 'SET LIST ON; SELECT TZ FROM CT WHERE ID = 9;\n' | "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$A" 2>&1 | norm)
+tze=$(printf 'SET LIST ON; SELECT TZ FROM CT WHERE ID = 9;\n' | "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$REAL:$B" 2>&1 | norm)
+if [ "$tzr" = "$tze" ]; then echo "OK   a WITH TIME ZONE literal INSERT through fc round-trips (the tzdml slice closed the old refusal)"
+else echo "DIFF tz literal insert: fc [$tzr] engine [$tze]"; fail=1; fi
 # the ENGINE writes tz values into fc's table (proving the record layout), then
 # BOTH engines read the same content back
 "$ISQL" -q -user "$U" -pas "$P" "$A" <<'SQL' >/dev/null 2>&1

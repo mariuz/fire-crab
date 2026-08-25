@@ -7100,6 +7100,13 @@ impl ProjCol {
                 // below would 22003 a Scaled/Int128 branch value the
                 // engine simply converts (review-caught live:
                 // COALESCE(D, 1.5) errored mid-fetch)
+                if let Value::TimestampTz(ud, _, _) = v {
+                    // the engine's 22008 read-side range check (see the
+                    // plain-column branch below)
+                    if !(-678_575..=2_973_483).contains(&ud) {
+                        return Err(EvalErr::DatetimeRange);
+                    }
+                }
                 if matches!(self.wire, Wire::Double) {
                     return Ok(match v {
                         Value::Int(n) => Value::Double(n as f64),
@@ -7137,6 +7144,15 @@ impl ProjCol {
             }
             None => {
                 let v = values.get(self.field_id).cloned().unwrap_or(Value::Null);
+                // a stored tz value whose UTC instant left the valid
+                // calendar (the wall clock was in range at store, both
+                // servers accept it) raises the engine's 22008 at READ
+                // (measured; fc used to serve the row)
+                if let Value::TimestampTz(ud, _, _) = v {
+                    if !(-678_575..=2_973_483).contains(&ud) {
+                        return Err(EvalErr::DatetimeRange);
+                    }
+                }
                 // same contract as above: a value wider than the
                 // announced wire form raises, never encodes wrong
                 if !matches!(self.wire, Wire::Int128) && matches!(v, Value::Int128(..)) {
@@ -22104,6 +22120,12 @@ enum WireParam {
     Timestamp(i32, u32),
     Date(i32),
     Time(u32),
+    /// a WITH TIME ZONE clock: the STORED form (UTC day units + zone
+    /// id) - encode writes it into a tz column verbatim, or converts
+    /// to the SESSION's wall time for a zone-less one
+    TimeTz(u32, u16),
+    /// the TIMESTAMP twin: UTC halves + zone id
+    TimestampTz(i32, u32, u16),
     Bool(bool),
 }
 
@@ -23127,6 +23149,32 @@ fn encode_wire_value(d: &Descriptor, wp: &WireParam) -> Option<Option<Vec<u8>>> 
                     out.extend_from_slice(&tt.to_le_bytes());
                     Some(out)
                 }
+                // the CVT string grammar into a tz column: a trailing
+                // zone rides; a zoneless string takes the SESSION zone
+                // (both measured). Named zones without rules refuse.
+                dtype::TIMESTAMP_TZ => {
+                    let (ud, ut, z) = match parse_ts_tz_lit(text) {
+                        Some(v) => v,
+                        None => {
+                            let (dd, tt) = cvt_text_temporal(text, ExpectTemporal::Timestamp)?;
+                            let z = session_zone_id();
+                            let (ud, ut) = wall_to_utc_timestamp(dd, tt, z)?;
+                            (ud, ut, z)
+                        }
+                    };
+                    Some(tz_ts_bytes(ud, ut, z, flen))
+                }
+                dtype::SQL_TIME_TZ => {
+                    let (ut, z) = match parse_time_tz_lit(text) {
+                        Some(v) => v,
+                        None => {
+                            let tt = cvt_text_temporal(text, ExpectTemporal::Time)?.1;
+                            let z = session_zone_id();
+                            (wall_to_utc_time(tt, z)?, z)
+                        }
+                    };
+                    Some(tz_time_bytes(ut, z, flen))
+                }
                 _ => return None,
             }
         }
@@ -23168,6 +23216,19 @@ fn encode_wire_value(d: &Descriptor, wp: &WireParam) -> Option<Option<Vec<u8>>> 
                 out.extend_from_slice(&tt.to_le_bytes());
                 out
             }
+            // a ZONELESS value into a WITH TIME ZONE column: the
+            // SESSION zone rides, permanently (measured) - the wall
+            // clock converts to UTC by the session's displacement;
+            // an unconvertible session zone refuses, never guesses
+            dtype::TIMESTAMP_TZ => {
+                let z = session_zone_id();
+                let (ud, ut) = wall_to_utc_timestamp(*dd, *tt, z)?;
+                tz_ts_bytes(ud, ut, z, flen)
+            }
+            dtype::SQL_TIME_TZ => {
+                let z = session_zone_id();
+                tz_time_bytes(wall_to_utc_time(*tt, z)?, z, flen)
+            }
             dtype::SQL_DATE => dd.to_le_bytes().to_vec(),
             dtype::SQL_TIME => tt.to_le_bytes().to_vec(),
             // a temporal into a TEXT column renders (probed: the engine
@@ -23198,6 +23259,11 @@ fn encode_wire_value(d: &Descriptor, wp: &WireParam) -> Option<Option<Vec<u8>>> 
         }),
         WireParam::Time(tt) => Some(match d.dtype {
             dtype::SQL_TIME => tt.to_le_bytes().to_vec(),
+            // session zone rides (measured law, as the TIMESTAMP arm)
+            dtype::SQL_TIME_TZ => {
+                let z = session_zone_id();
+                tz_time_bytes(wall_to_utc_time(*tt, z)?, z, flen)
+            }
             // time -> timestamp takes the CURRENT date (probed: a TIME
             // literal lands in a TIMESTAMP column dated today)
             dtype::TIMESTAMP => {
@@ -23211,6 +23277,27 @@ fn encode_wire_value(d: &Descriptor, wp: &WireParam) -> Option<Option<Vec<u8>>> 
                 d,
                 flen,
             )?,
+            _ => return None,
+        }),
+        WireParam::TimestampTz(ud, ut, zone) => Some(match d.dtype {
+            // verbatim: the value already holds the stored form
+            dtype::TIMESTAMP_TZ => tz_ts_bytes(*ud, *ut, *zone, flen),
+            // a tz value into a ZONE-LESS column converts to the
+            // SESSION's wall time (measured: '2024-07-05 10:00
+            // Europe/Paris' lands 08:00 under a UTC session)
+            dtype::TIMESTAMP => {
+                let (d2, t2) = tz_local_timestamp(*ud, *ut, session_zone_id())?;
+                let mut out = d2.to_le_bytes().to_vec();
+                out.extend_from_slice(&t2.to_le_bytes());
+                out
+            }
+            dtype::SQL_DATE => tz_local_timestamp(*ud, *ut, session_zone_id())?.0.to_le_bytes().to_vec(),
+            dtype::SQL_TIME => tz_local_timestamp(*ud, *ut, session_zone_id())?.1.to_le_bytes().to_vec(),
+            _ => return None,
+        }),
+        WireParam::TimeTz(ut, zone) => Some(match d.dtype {
+            dtype::SQL_TIME_TZ => tz_time_bytes(*ut, *zone, flen),
+            dtype::SQL_TIME => tz_local_time(*ut, session_zone_id())?.to_le_bytes().to_vec(),
             _ => return None,
         }),
         WireParam::Bool(v) => Some(match d.dtype {
@@ -30177,6 +30264,33 @@ fn with_lock_target_ok(sql: &str, db: &Option<Database>) -> bool {
     }
 }
 
+/// Does this plan DEDUPLICATE over a WITH TIME ZONE column - a GROUP BY
+/// key, a SELECT DISTINCT projection or a UNION's implicit distinct?
+/// The engine's tie representative there is an unstable sort artifact
+/// (measured flipping under a WHERE); refusing beats mis-representing.
+fn plan_tz_dedup(p: &Plan) -> bool {
+    let tz_col = |cols: &[ProjCol]| {
+        cols.iter().any(|c| matches!(c.wire, Wire::TimeTz | Wire::TimestampTz))
+    };
+    match p {
+        Plan::Group { cols, gitems, .. } => gitems.iter().enumerate().any(|(i, g)| {
+            matches!(g, GItem::Key(_))
+                && cols
+                    .get(i)
+                    .is_some_and(|c| matches!(c.wire, Wire::TimeTz | Wire::TimestampTz))
+        }),
+        Plan::Modified { inner, distinct, cols, .. } => {
+            (*distinct && tz_col(cols)) || plan_tz_dedup(inner)
+        }
+        Plan::Union { branches, distinct, cols, .. } => {
+            (*distinct && tz_col(cols)) || branches.iter().any(plan_tz_dedup)
+        }
+        Plan::Derived { inner, .. } => plan_tz_dedup(inner),
+        Plan::Returning { inner, .. } => plan_tz_dedup(inner),
+        _ => false,
+    }
+}
+
 fn plan_query(sql: &str, db: &Option<Database>) -> (Plan, Vec<Descriptor>) {
     USER_FNS.with(|m| *m.borrow_mut() = db.as_ref().map(user_function_sigs).unwrap_or_default());
     FN_CALLS.with(|l| l.borrow_mut().clear());
@@ -30231,6 +30345,15 @@ fn plan_query(sql: &str, db: &Option<Database>) -> (Plan, Vec<Descriptor>) {
         },
         _ => (Plan::Scalar(ScalarVal::Fixed(Some(FIXED_ANSWER)), "CONSTANT".into(), None, ScalarTy::int64()), Vec::new()),
     };
+    // A DEDUP over WITH TIME ZONE keys refuses: the engine's tie
+    // representative (same UTC instant, different zones) is an internal
+    // sort artifact this server cannot reproduce - it flipped between
+    // largest-zone-id and smallest under a WHERE during review - and a
+    // wrong representative is a wrong answer. GROUP BY tz keys,
+    // SELECT DISTINCT and UNION-dedup over tz columns all refuse.
+    if plan_tz_dedup(&outcome.0) {
+        return (Plan::Refused, Vec::new());
+    }
     // A GENERIC refusal over a statement that names an UNKNOWN RELATION
     // anywhere (a subquery, a derived table, an IN/EXISTS body) becomes
     // the engine's typed -204 "Table unknown" - the main FROM already
@@ -38037,6 +38160,34 @@ fn value_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
         // is presentation, not identity
         (Value::TimeTz(tx, _), Value::TimeTz(ty, _)) => tx.cmp(ty),
         (Value::TimestampTz(dx, tx, _), Value::TimestampTz(dy, ty, _)) => (dx, tx).cmp(&(dy, ty)),
+        // a ZONELESS side against a tz one: the engine reads the plain
+        // value as a SESSION-zone wall time and compares instants
+        // (measured: `tzcol = TIMESTAMP '2024-07-05 08:00:00'` under a
+        // UTC session matches the 10:00 Europe/Paris row). A session
+        // zone without rules falls through to the render compare - the
+        // pre-existing generic tail, unchanged
+        (Value::TimestampTz(dx, tx, _), Value::Timestamp(dy, ty))
+            if wall_utc_cmp_ok(*dy, *ty).is_some() =>
+        {
+            let (ud, ut) = wall_utc_cmp_ok(*dy, *ty).unwrap();
+            (*dx, *tx).cmp(&(ud, ut))
+        }
+        (Value::Timestamp(dx, tx), Value::TimestampTz(dy, ty, _))
+            if wall_utc_cmp_ok(*dx, *tx).is_some() =>
+        {
+            let (ud, ut) = wall_utc_cmp_ok(*dx, *tx).unwrap();
+            (ud, ut).cmp(&(*dy, *ty))
+        }
+        (Value::TimeTz(tx, _), Value::Time(ty))
+            if wall_to_utc_time(*ty, session_zone_id()).is_some() =>
+        {
+            tx.cmp(&wall_to_utc_time(*ty, session_zone_id()).unwrap())
+        }
+        (Value::Time(tx), Value::TimeTz(ty, _))
+            if wall_to_utc_time(*tx, session_zone_id()).is_some() =>
+        {
+            wall_to_utc_time(*tx, session_zone_id()).unwrap().cmp(ty)
+        }
         _ => a.render().cmp(&b.render()),
     }
 }
@@ -40875,6 +41026,22 @@ fn eval_status_items(w: &mut W, e: &EvalErr) {
                 w.int(1).int(GDS_IDX_KEY_VALUE).int(2).bytes(k.as_bytes());
             }
         }
+        EvalErr::InvalidTzOffset(text) => {
+            w.int(1) // isc_arg_gds
+                .int(335545213) // isc_invalid_timezone_offset (jrd 893)
+                .int(2) // isc_arg_string
+                .bytes(text.as_bytes());
+        }
+        EvalErr::InvalidTzRegion(text) => {
+            w.int(1) // isc_arg_gds
+                .int(335545214) // isc_invalid_timezone_region (jrd 894)
+                .int(2) // isc_arg_string
+                .bytes(text.as_bytes());
+        }
+        EvalErr::DatetimeRange => {
+            w.int(1) // isc_arg_gds
+                .int(335544913); // isc_datetime_range_exceeded (jrd 593)
+        }
         EvalErr::NotValid { column, value } => {
             w.int(1) // isc_arg_gds
                 .int(GDS_NOT_VALID)
@@ -41232,6 +41399,8 @@ fn param_to_expr(p: &WireParam) -> Option<Expr> {
         WireParam::Date(d) => Expr::DateLit(*d),
         WireParam::Time(t) => Expr::TimeLit(*t),
         WireParam::Timestamp(d, t) => Expr::TsLit(*d, *t),
+        WireParam::TimeTz(t, z) => Expr::TimeTzLit(*t, *z),
+        WireParam::TimestampTz(d, t, z) => Expr::TsTzLit(*d, *t, *z),
         WireParam::BlobId(_) => return None, // a blob is no literal
     })
 }
@@ -42900,12 +43069,21 @@ fn trunc_time_units(t: u32, p: u8) -> u32 {
 /// (probed: `Etc/UTC` on this box, from /etc/timezone); TZ in the
 /// environment first, GMT when nothing names one.
 fn session_zone_id() -> u16 {
-    let name = std::env::var("TZ")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .or_else(|| std::fs::read_to_string("/etc/timezone").ok().map(|s| s.trim().to_string()))
-        .unwrap_or_default();
-    fire_crab_ods::tz::zone_id(name.trim_start_matches(':')).unwrap_or(65535)
+    // CACHED: the mixed tz/plain comparison arms call this per row,
+    // and the uncached form read /etc/timezone from disk each time
+    // (review-caught). The host zone cannot change under a running
+    // server in any way this server tracks.
+    static ZONE: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
+    *ZONE.get_or_init(|| {
+        let name = std::env::var("TZ")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                std::fs::read_to_string("/etc/timezone").ok().map(|s| s.trim().to_string())
+            })
+            .unwrap_or_default();
+        fire_crab_ods::tz::zone_id(name.trim_start_matches(':')).unwrap_or(65535)
+    })
 }
 
 fn blob_col_cast(inner: &RawExpr, t: &CastTarget, columns: &[RelationColumn], descs: &[Descriptor]) -> Option<usize> {
@@ -43902,6 +44080,12 @@ enum RawExpr {
     TimeLit(u32),
     /// `TIMESTAMP '<date> <time>'`
     TsLit(i32, u32),
+    /// `TIME '... <zone>'` - the STORED form: UTC day units + zone id
+    /// (the literal's wall clock already converted by the zone's
+    /// displacement at parse; named zones without rules refuse there)
+    TimeTzLit(u32, u16),
+    /// `TIMESTAMP '... <zone>'` - UTC halves + zone id
+    TsTzLit(i32, u32, u16),
     /// `CURRENT_DATE` / `LOCALTIME` / `LOCALTIMESTAMP` - captured at
     /// PLAN time (the engine fixes them per statement execution; a
     /// prepare-once-execute-many client would see the plan's clock -
@@ -45118,12 +45302,26 @@ fn expr_atom(b: &[char], pos: &mut usize) -> Option<RawExpr> {
                 if word.eq_ignore_ascii_case("DATE") {
                     Some(RawExpr::DateLit(parse_date_lit(&text)?))
                 } else if word.eq_ignore_ascii_case("TIME") {
-                    Some(RawExpr::TimeLit(parse_time_lit(&text)?))
+                    // the WHOLE string first (no zone), then the
+                    // zone-tailed form - `TIME '10:00:00 -05:00'`
+                    match parse_time_lit(&text) {
+                        Some(t) => Some(RawExpr::TimeLit(t)),
+                        None => {
+                            let (t, z) = parse_time_tz_lit(&text)?;
+                            Some(RawExpr::TimeTzLit(t, z))
+                        }
+                    }
                 } else {
                     // the whole string through the grammar - a month name
-                    // carries spaces inside the date part
-                    let (d, t) = parse_ts_lit(&text)?;
-                    Some(RawExpr::TsLit(d, t))
+                    // carries spaces inside the date part; then the
+                    // zone-tailed form
+                    match parse_ts_lit(&text) {
+                        Some((d, t)) => Some(RawExpr::TsLit(d, t)),
+                        None => {
+                            let (d, t, z) = parse_ts_tz_lit(&text)?;
+                            Some(RawExpr::TsTzLit(d, t, z))
+                        }
+                    }
                 }
             } else if !quoted && word.eq_ignore_ascii_case("TRUE") {
                 Some(RawExpr::Bool(true))
@@ -45506,6 +45704,8 @@ fn raw_bad_substring_len(e: &RawExpr) -> Option<i64> {
         | RawExpr::DateLit(_)
         | RawExpr::TimeLit(_)
         | RawExpr::TsLit(..)
+        | RawExpr::TimeTzLit(..)
+        | RawExpr::TsTzLit(..)
         | RawExpr::CurrentDate
         | RawExpr::CurrentTime(_)
         | RawExpr::CurrentTimestamp(_)
@@ -46480,6 +46680,8 @@ fn resolve_expr_inner(
         RawExpr::DateLit(d) => Expr::DateLit(*d),
         RawExpr::TimeLit(t) => Expr::TimeLit(*t),
         RawExpr::TsLit(d, t) => Expr::TsLit(*d, *t),
+        RawExpr::TimeTzLit(t, z) => Expr::TimeTzLit(*t, *z),
+        RawExpr::TsTzLit(d, t, z) => Expr::TsTzLit(*d, *t, *z),
         // the plan-time clock capture (see the RawExpr variant docs);
         // LOCALTIME truncates the fractional second, as probed
         RawExpr::CurrentDate => Expr::DateLit(now_date_time().0),
@@ -46764,6 +46966,18 @@ enum ArithOp {
 /// server would.
 #[derive(Debug, Clone, PartialEq)]
 enum EvalErr {
+    /// a TIME ZONE literal/string whose offset part is malformed or out
+    /// of range: `isc_invalid_timezone_offset` (22009), the spelling as
+    /// the one argument
+    InvalidTzOffset(String),
+    /// an unknown zone REGION name: `isc_invalid_timezone_region`
+    /// (22009), the name as written
+    InvalidTzRegion(String),
+    /// a WITH TIME ZONE value whose UTC instant leaves the valid
+    /// 0001..9999 calendar: `isc_datetime_range_exceeded` (22008) -
+    /// the engine STORES such a value (the wall clock was in range)
+    /// and raises this READING it back (measured)
+    DatetimeRange,
     /// a DOUBLE math function whose operand left its domain (SQRT of a
     /// negative, LN of <= 0, ...): `isc_expression_eval_err` +
     /// the specific `sysf_argmustbe_*` message, whose `@1` is the function
@@ -47231,6 +47445,11 @@ fn temporal_kind(d: &Descriptor) -> Option<TKind> {
         dtype::SQL_DATE => Some(TKind::Date),
         dtype::SQL_TIME => Some(TKind::Time),
         dtype::TIMESTAMP => Some(TKind::Timestamp),
+        // the WITH TIME ZONE columns type now (the tzdml slice) - the
+        // compare surface converts by UTC instant, everything it
+        // cannot convert refuses downstream as before
+        dtype::SQL_TIME_TZ | dtype::EX_TIME_TZ => Some(TKind::TimeTz),
+        dtype::TIMESTAMP_TZ | dtype::EX_TIMESTAMP_TZ => Some(TKind::TimestampTz),
         _ => None,
     }
 }
@@ -48756,6 +48975,166 @@ fn cvt_text_temporal(s: &str, expect: ExpectTemporal) -> Option<(i32, u32)> {
     string_to_datetime(s, expect, now_date_time(), true)
 }
 
+/// Split a temporal string's trailing TIME ZONE - the engine's
+/// `TimeZoneUtil::parse` tail: whitespace, then `[+-]hh:mm` (an OFFSET
+/// zone) or a region name. Returns the HEAD (the wall-clock text) and
+/// the tail TEXT; the caller parses the head FIRST and only then
+/// resolves the tail ([resolve_zone_tail]), so a 22009 zone reason
+/// never masks a plain conversion error.
+fn split_zone_tail(s: &str) -> Option<(&str, &str)> {
+    let t = s.trim_end();
+    // the zone candidate is the FINAL whitespace-separated token; a
+    // temporal head always ends in a digit, so a tail starting with a
+    // sign or a letter is a zone (or the head's own last word - the
+    // caller decides by parsing the head)
+    let bytes = t.as_bytes();
+    let mut cut = None;
+    for i in (0..bytes.len()).rev() {
+        if bytes[i].is_ascii_whitespace() {
+            cut = Some(i);
+            break;
+        }
+        if !(bytes[i].is_ascii_alphanumeric()
+            || matches!(bytes[i], b'_' | b'/' | b'+' | b'-' | b':' | b'.'))
+        {
+            return None;
+        }
+    }
+    let cut = cut?;
+    let (head, tail) = (t[..cut].trim_end(), t[cut..].trim());
+    if head.is_empty() || tail.is_empty() {
+        return None;
+    }
+    let first = tail.as_bytes()[0];
+    if first == b'+' || first == b'-' || first.is_ascii_alphabetic() || first == b'_' {
+        Some((head, tail))
+    } else {
+        None
+    }
+}
+
+/// The zone TAIL of a temporal literal, resolved to its id - AFTER the
+/// head parsed as a valid wall time. A malformed/out-of-range offset or
+/// an unknown region sets [PREPARE_REFUSAL] with the engine's exact
+/// 22009 vector (measured verbatim); a KNOWN named zone answers its id
+/// (the caller then refuses generically if its rules are unknown - a
+/// wrong instant is worse than a refusal).
+fn resolve_zone_tail(tail: &str) -> Option<u16> {
+    let first = tail.as_bytes().first().copied()?;
+    if first == b'+' || first == b'-' {
+        let neg = first == b'-';
+        let body = &tail[1..];
+        let bad = || {
+            PREPARE_REFUSAL.with(|r| {
+                *r.borrow_mut() = Some(EvalErr::InvalidTzOffset(tail.to_string()))
+            });
+        };
+        let Some((h, m)) = body.split_once(':') else {
+            bad();
+            return None;
+        };
+        // BARE DIGITS only after the single leading sign - Rust's
+        // parse::<i32> takes an inner '+'/'-', and '-+2:00' stored a
+        // SIGN-FLIPPED instant (review-caught live; the engine 22009s
+        // every inner-sign spelling)
+        let (h, m) = (h.trim(), m.trim());
+        if h.is_empty()
+            || m.is_empty()
+            || !h.bytes().all(|b| b.is_ascii_digit())
+            || !m.bytes().all(|b| b.is_ascii_digit())
+        {
+            bad();
+            return None;
+        }
+        let (Ok(h), Ok(m)) = (h.parse::<i32>(), m.parse::<i32>()) else {
+            bad();
+            return None;
+        };
+        if m > 59 || h > 14 || (h == 14 && m > 0) {
+            bad();
+            return None;
+        }
+        let minutes = if neg { -(h * 60 + m) } else { h * 60 + m };
+        Some((1439 + minutes) as u16)
+    } else {
+        match fire_crab_ods::tz::zone_id(tail) {
+            Some(id) => Some(id),
+            None => {
+                PREPARE_REFUSAL.with(|r| {
+                    *r.borrow_mut() = Some(EvalErr::InvalidTzRegion(tail.to_string()))
+                });
+                None
+            }
+        }
+    }
+}
+
+/// A TIMESTAMP literal WITH a zone tail: the wall-clock head through
+/// the plain grammar, converted local -> UTC by the zone's
+/// displacement. None (a generic refusal) for a NAMED zone whose rules
+/// need tzdata - fire-crab has none, and a wrong instant is worse than
+/// a refusal; the offset zones and the UTC family convert exactly.
+fn parse_ts_tz_lit(s: &str) -> Option<(i32, u32, u16)> {
+    let (head, tail) = split_zone_tail(s)?;
+    let (d, t) = string_to_datetime(head, ExpectTemporal::Timestamp, now_date_time(), false)?;
+    let zone = resolve_zone_tail(tail)?;
+    let (ud, ut) = wall_to_utc_timestamp(d, t, zone)?;
+    Some((ud, ut, zone))
+}
+
+/// The TIME twin - the wall time converts on its own day circle.
+fn parse_time_tz_lit(s: &str) -> Option<(u32, u16)> {
+    let (head, tail) = split_zone_tail(s)?;
+    let t = string_to_datetime(head, ExpectTemporal::Time, now_date_time(), false)?.1;
+    let zone = resolve_zone_tail(tail)?;
+    Some((wall_to_utc_time(t, zone)?, zone))
+}
+
+/// A zone-less timestamp read as a SESSION-zone wall time, as its UTC
+/// halves - the mixed tz/plain comparison's conversion. None when the
+/// session zone has no displacement rules.
+fn wall_utc_cmp_ok(d: i32, t: u32) -> Option<(i32, u32)> {
+    wall_to_utc_timestamp(d, t, session_zone_id())
+}
+
+/// The stored bytes of a TIMESTAMP WITH TIME ZONE: LE UTC halves + LE
+/// zone id, zero-padded to the column's declared length (the record
+/// slot is 12 with the alignment pad; the decode reads 10).
+fn tz_ts_bytes(ud: i32, ut: u32, zone: u16, flen: usize) -> Vec<u8> {
+    let mut out = ud.to_le_bytes().to_vec();
+    out.extend_from_slice(&ut.to_le_bytes());
+    out.extend_from_slice(&zone.to_le_bytes());
+    while out.len() < flen {
+        out.push(0);
+    }
+    out
+}
+
+/// The TIME twin (slot 8, decode reads 6).
+fn tz_time_bytes(ut: u32, zone: u16, flen: usize) -> Vec<u8> {
+    let mut out = ut.to_le_bytes().to_vec();
+    out.extend_from_slice(&zone.to_le_bytes());
+    while out.len() < flen {
+        out.push(0);
+    }
+    out
+}
+
+/// Local wall time in `zone` -> the UTC halves a WITH TIME ZONE value
+/// stores. Only zones with a known displacement convert.
+fn wall_to_utc_timestamp(d: i32, t: u32, zone: u16) -> Option<(i32, u32)> {
+    const DAY_UNITS: i64 = 24 * 60 * 60 * 10_000;
+    let disp = fire_crab_ods::tz::displacement(zone)?;
+    let ut = t as i64 - disp as i64 * 600_000;
+    Some(((d as i64 + ut.div_euclid(DAY_UNITS)) as i32, ut.rem_euclid(DAY_UNITS) as u32))
+}
+
+fn wall_to_utc_time(t: u32, zone: u16) -> Option<u32> {
+    const DAY_UNITS: i64 = 24 * 60 * 60 * 10_000;
+    let disp = fire_crab_ods::tz::displacement(zone)?;
+    Some((t as i64 - disp as i64 * 600_000).rem_euclid(DAY_UNITS) as u32)
+}
+
 /// A computed [Value]'s wire-parameter form - what the UPDATE expression
 /// tier and the INSERT constant-expression arm stage for
 /// [encode_wire_value]. The WITH TIME ZONE clocks land in a zone-less
@@ -48774,11 +49153,11 @@ fn value_to_wireparam(v: &Value) -> Option<WireParam> {
         Value::Date(d) => WireParam::Date(*d),
         Value::Time(t) => WireParam::Time(*t),
         Value::Timestamp(d, t) => WireParam::Timestamp(*d, *t),
-        Value::TimeTz(utc, zone) => WireParam::Time(tz_local_time(*utc, *zone)?),
-        Value::TimestampTz(dd, utc, zone) => {
-            let (d, t) = tz_local_timestamp(*dd, *utc, *zone)?;
-            WireParam::Timestamp(d, t)
-        }
+        // pass-through: [encode_wire_value] converts per DESTINATION -
+        // verbatim into a tz column, the session's wall time into a
+        // zone-less one
+        Value::TimeTz(utc, zone) => WireParam::TimeTz(*utc, *zone),
+        Value::TimestampTz(dd, utc, zone) => WireParam::TimestampTz(*dd, *utc, *zone),
         Value::Int128(r, sc) => WireParam::Int(i64::try_from(*r).ok()?, *sc),
         _ => return None,
     })
@@ -49217,8 +49596,12 @@ impl Expr {
                 {
                     match (x, y) {
                         (TKind::Date, TKind::Date) => Some(ExprType::Int),
-                        (TKind::Time, TKind::Time) => Some(ExprType::Numeric),
-                        (TKind::Time, _) | (_, TKind::Time) => None,
+                        (
+                            TKind::Time | TKind::TimeTz,
+                            TKind::Time | TKind::TimeTz,
+                        ) => Some(ExprType::Numeric),
+                        (TKind::Time | TKind::TimeTz, _)
+                        | (_, TKind::Time | TKind::TimeTz) => None,
                         _ => Some(ExprType::Numeric),
                     }
                 }
@@ -49542,7 +49925,12 @@ impl Expr {
                         (a.type_of(descs), b.type_of(descs))
                     {
                         return match (x, y) {
-                            (TKind::Time, TKind::Time) => Some(-4),
+                            // a TIME-family pair (tz included) is
+                            // seconds at -4, like the plain pair
+                            (
+                                TKind::Time | TKind::TimeTz,
+                                TKind::Time | TKind::TimeTz,
+                            ) => Some(-4),
                             (TKind::Date, TKind::Date) => Some(0),
                             _ => Some(-9),
                         };
@@ -50056,10 +50444,31 @@ impl Expr {
                     // temporal arithmetic (all probed): date/timestamp
                     // plus-or-minus days (numbers round half away),
                     // and the temporal differences
+                    // a WITH TIME ZONE value differences on its UTC
+                    // instant (measured: same-instant TS - TS is 0
+                    // whatever the zones); a PLAIN side against a tz one
+                    // converts as a SESSION-zone wall time first
+                    let tz_involved = matches!(
+                        (&va, &vb),
+                        (Value::TimeTz(..) | Value::TimestampTz(..), _)
+                            | (_, Value::TimeTz(..) | Value::TimestampTz(..))
+                    );
                     let dt = |v: &Value| match v {
                         Value::Date(d) => Some((*d as i64, 0i64, TKind::Date)),
+                        Value::Time(t) if tz_involved => {
+                            let ut = wall_to_utc_time(*t, session_zone_id())?;
+                            Some((0, ut as i64, TKind::Time))
+                        }
                         Value::Time(t) => Some((0, *t as i64, TKind::Time)),
+                        Value::Timestamp(d, t) if tz_involved => {
+                            let (ud, ut) = wall_utc_cmp_ok(*d, *t)?;
+                            Some((ud as i64, ut as i64, TKind::Timestamp))
+                        }
                         Value::Timestamp(d, t) => {
+                            Some((*d as i64, *t as i64, TKind::Timestamp))
+                        }
+                        Value::TimeTz(t, _) => Some((0, *t as i64, TKind::Time)),
+                        Value::TimestampTz(d, t, _) => {
                             Some((*d as i64, *t as i64, TKind::Timestamp))
                         }
                         _ => None,
@@ -50119,6 +50528,17 @@ impl Expr {
             }
             Expr::Concat(a, b) => match (a.eval(values)?, b.eval(values)?) {
                 (Value::Null, _) | (_, Value::Null) => Value::Null,
+                // a NAMED zone without displacement rules has no engine
+                // text here (fc's own render is the visibly-unconverted
+                // `<tz ...>`) - refuse, as the CAST arm does
+                (Value::TimeTz(_, z), _)
+                | (Value::TimestampTz(_, _, z), _)
+                | (_, Value::TimeTz(_, z))
+                | (_, Value::TimestampTz(_, _, z))
+                    if fire_crab_ods::tz::displacement(z).is_none() =>
+                {
+                    return Err(EvalErr::Unsupported)
+                }
                 (x, y) => {
                     // a BOOLEAN coerces to the SQL surface's TRUE/FALSE
                     // (probed: TRUE || '' is 'TRUE'), not the lowercase
@@ -50258,6 +50678,17 @@ impl Expr {
                             Value::Bool(b) => {
                                 if b { "TRUE".to_string() } else { "FALSE".to_string() }
                             }
+                            // a NAMED zone without displacement rules
+                            // renders visibly-unconverted (`<tz ...>`) -
+                            // never a value the engine would print;
+                            // REFUSE the cast instead (the engine
+                            // converts via tzdata; review-caught live:
+                            // fc answered `<tz ... Europe/Paris>`)
+                            Value::TimeTz(_, z) | Value::TimestampTz(_, _, z)
+                                if fire_crab_ods::tz::displacement(z).is_none() =>
+                            {
+                                return Err(EvalErr::Unsupported)
+                            }
                             _ => v.render(),
                         };
                         let chars: Vec<char> = s.chars().collect();
@@ -50372,17 +50803,36 @@ impl Expr {
                                         TKind::Date => Value::Date(
                                             cvt_text_temporal(t, ExpectTemporal::Date)?.0,
                                         ),
-                                        TKind::Time => Value::Time(
-                                            cvt_text_temporal(t, ExpectTemporal::Time)?.1,
-                                        ),
+                                        // a zone-tailed string into a PLAIN
+                                        // temporal converts through the
+                                        // SESSION zone (measured: the CVT
+                                        // grammar takes the tail
+                                        // everywhere; fc answered 22018
+                                        // where the engine converts -
+                                        // review-caught)
+                                        TKind::Time => match cvt_text_temporal(t, ExpectTemporal::Time) {
+                                            Some((_, tm)) => Value::Time(tm),
+                                            None => {
+                                                let (ut, _) = parse_time_tz_lit(t)?;
+                                                Value::Time(tz_local_time(
+                                                    ut,
+                                                    session_zone_id(),
+                                                )?)
+                                            }
+                                        },
                                         TKind::TimeTz | TKind::TimestampTz => return None,
-                                        TKind::Timestamp => {
-                                            let (d, tm) = cvt_text_temporal(
-                                                t,
-                                                ExpectTemporal::Timestamp,
-                                            )?;
-                                            Value::Timestamp(d, tm)
-                                        }
+                                        TKind::Timestamp => match cvt_text_temporal(t, ExpectTemporal::Timestamp) {
+                                            Some((d, tm)) => Value::Timestamp(d, tm),
+                                            None => {
+                                                let (ud, ut, _) = parse_ts_tz_lit(t)?;
+                                                let (d, tm) = tz_local_timestamp(
+                                                    ud,
+                                                    ut,
+                                                    session_zone_id(),
+                                                )?;
+                                                Value::Timestamp(d, tm)
+                                            }
+                                        },
                                     })
                                 };
                                 parse().ok_or_else(|| {
@@ -54020,7 +54470,11 @@ fn default_expr_name(raw: &RawExpr) -> String {
         RawExpr::LocalTimestamp => "LOCALTIMESTAMP",
         RawExpr::CurrentTime(_) => "CURRENT_TIME",
         RawExpr::CurrentTimestamp(_) => "CURRENT_TIMESTAMP",
-        RawExpr::DateLit(_) | RawExpr::TimeLit(_) | RawExpr::TsLit(..) => "CONSTANT",
+        RawExpr::DateLit(_)
+        | RawExpr::TimeLit(_)
+        | RawExpr::TsLit(..)
+        | RawExpr::TimeTzLit(..)
+        | RawExpr::TsTzLit(..) => "CONSTANT",
         // the engine leaves a unary-minus column unnamed (blank header)
         // a NEGATED LITERAL is still a constant (probed: `-3` describes
         // as CONSTANT), while negating anything else describes BLANK
@@ -57948,6 +58402,16 @@ fn psql_literal(v: &Value) -> Option<String> {
             };
             format!("{} '{}'", kw, v.render())
         }
+        // a WITH TIME ZONE value with a CONVERTIBLE zone re-renders as
+        // its zoned literal (the same grammar the tzdml parse reads
+        // back); a ruleless named zone has no faithful text - refuse
+        Value::TimeTz(_, z) | Value::TimestampTz(_, _, z) => {
+            if fire_crab_ods::tz::displacement(*z).is_none() {
+                return None;
+            }
+            let kw = if matches!(v, Value::TimeTz(..)) { "TIME" } else { "TIMESTAMP" };
+            format!("{} '{}'", kw, v.render())
+        }
         _ => return None,
     })
 }
@@ -61175,7 +61639,27 @@ fn cmp_sides(lhs: Expr, rhs: Expr, descs: &[Descriptor]) -> Option<(Expr, Expr)>
                 TKind::Time => {
                     Expr::TimeLit(cvt_text_temporal(s, ExpectTemporal::Time)?.1)
                 }
-                TKind::TimeTz | TKind::TimestampTz => return None,
+                // the CVT string against a tz column: a trailing zone
+                // rides, a zoneless string takes the SESSION zone -
+                // exactly the store's conversion (both measured; the
+                // compare is then UTC-instant)
+                TKind::TimestampTz => match parse_ts_tz_lit(s) {
+                    Some((d, t, z)) => Expr::TsTzLit(d, t, z),
+                    None => {
+                        let (d, t) = cvt_text_temporal(s, ExpectTemporal::Timestamp)?;
+                        let z = session_zone_id();
+                        let (ud, ut) = wall_to_utc_timestamp(d, t, z)?;
+                        Expr::TsTzLit(ud, ut, z)
+                    }
+                },
+                TKind::TimeTz => match parse_time_tz_lit(s) {
+                    Some((t, z)) => Expr::TimeTzLit(t, z),
+                    None => {
+                        let t = cvt_text_temporal(s, ExpectTemporal::Time)?.1;
+                        let z = session_zone_id();
+                        Expr::TimeTzLit(wall_to_utc_time(t, z)?, z)
+                    }
+                },
                 TKind::Timestamp => {
                     let (d, t) = cvt_text_temporal(s, ExpectTemporal::Timestamp)?;
                     Expr::TsLit(d, t)
@@ -61184,9 +61668,22 @@ fn cmp_sides(lhs: Expr, rhs: Expr, descs: &[Descriptor]) -> Option<(Expr, Expr)>
             _ => None,
         }
     };
-    // a pair of temporal kinds: only the DATE/TIMESTAMP conversions
+    // a pair of temporal kinds: the DATE/TIMESTAMP conversions, and a
+    // WITH TIME ZONE side against its zone-less twin (the engine
+    // treats the zoneless one as a session-zone instant - value_cmp's
+    // mixed arms convert; measured: `tzcol = TIMESTAMP '...'
+    // (zoneless)` matches the session-equivalent rows)
     let compatible = |a: TKind, b: TKind| {
-        a == b || matches!((a, b), (TKind::Date, TKind::Timestamp) | (TKind::Timestamp, TKind::Date))
+        a == b
+            || matches!(
+                (a, b),
+                (TKind::Date, TKind::Timestamp)
+                    | (TKind::Timestamp, TKind::Date)
+                    | (TKind::TimestampTz, TKind::Timestamp)
+                    | (TKind::Timestamp, TKind::TimestampTz)
+                    | (TKind::TimeTz, TKind::Time)
+                    | (TKind::Time, TKind::TimeTz)
+            )
     };
     match (lt, rt) {
         (ExprType::Temporal(a), ExprType::Temporal(b)) if compatible(a, b) => Some((lhs, rhs)),
@@ -63420,6 +63917,20 @@ fn after_auth(
                     // through the statement cache, like the SELECT
                     // branch above - see [crate::stmc]
                     let gen = database.as_ref().map_or(0, |d| d.meta.generation());
+                    // a parse may leave a SPECIFIC refusal reason (a bad
+                    // TIME ZONE offset/region is the engine's 22009, not
+                    // the generic vector) - clear before, consume at the
+                    // refusal arm below. USER_FNS refreshes with it: the
+                    // reasons this branch now SERVES include -804
+                    // Function-unknown, which must be judged against the
+                    // CURRENT catalog, not whatever the last SELECT saw
+                    // (review-caught: a stale map called a fresh
+                    // function unknown)
+                    USER_FNS.with(|m| {
+                        *m.borrow_mut() =
+                            database.as_ref().map(user_function_sigs).unwrap_or_default()
+                    });
+                    PREPARE_REFUSAL.with(|r| *r.borrow_mut() = None);
                     let planned = timed("plan(dml)", || {
                         let build = || match kw {
                             "INSERT" => plan_insert(&dml_sql, &database),
@@ -63492,7 +64003,10 @@ fn after_auth(
                         None => {
                             plan = std::rc::Rc::new(Plan::Scalar(ScalarVal::Fixed(Some(FIXED_ANSWER)), "CONSTANT".to_string(), None, ScalarTy::int64()));
                             stmt_params = std::rc::Rc::new(Vec::new());
-                            respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
+                            match PREPARE_REFUSAL.with(|r| r.borrow_mut().take()) {
+                                Some(e) => respond_eval_error(&mut s, &mut enc, &e)?,
+                                None => respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?,
+                            }
                         }
                     }
                 } else {

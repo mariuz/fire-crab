@@ -244,6 +244,51 @@ DDL was.
 
 ### F. DML and PSQL gaps
 
+**TIME/TIMESTAMP WITH TIME ZONE values in DML DONE (2026-08-25,
+`serve-real-tzdml` 8):** fc could CREATE tz columns and read
+engine-written rows; every tz VALUE refused. Now: zone-tailed
+literals (`TIMESTAMP '... +02:00'`, `TIME '... UTC'`) parse
+(`split_zone_tail`/`resolve_zone_tail` beside the CVT grammar,
+BARE-digit offset fields — the engine 22009s every inner-sign
+spelling, and `'-+2:00'` briefly stored a SIGN-FLIPPED instant
+before review), the wall clock converts local→UTC by
+`tz::displacement` (offset zones id = minutes+1439 and the UTC
+family; NAMED zones with tzdata rules REFUSE — fc carries the
+id↔name table, tzdata 2026c names, no rules, and a wrong instant is
+worse than a refusal), and the stored form (UTC halves + USHORT
+zone id) flows through new `RawExpr::TimeTzLit/TsTzLit` and
+`WireParam::TimeTz/TimestampTz` into destination-aware
+`encode_wire_value` arms: tz column verbatim, zoneless value into a
+tz column takes the SESSION zone permanently (measured), tz value
+into a zone-less column converts to session wall, text with a zone
+tail everywhere the CVT grammar takes one. WHERE/ORDER BY compare
+by UTC INSTANT across spellings (`temporal_kind` types the tz
+dtypes; `value_cmp` mixed tz/plain arms read the zoneless side as a
+session instant; `session_zone_id` is cached — it read
+/etc/timezone per row). The 22009 vectors ride PREPARE_REFUSAL
+verbatim (`Invalid time zone region/offset`), the DML branch now
+clears+consumes it (and refreshes USER_FNS with it — a stale map
+briefly called fresh functions unknown). The 16-agent review's
+other catches, all fixed live-verified: the engine's 22008
+`value exceeds the range for valid timestamps` at READ of a stored
+instant past 0001..9999 (both servers ACCEPT the insert — the wall
+clock was in range; fc used to serve the row); tz-column
+SUBTRACTION (UTC-instant difference, TIME pairs at scale -4,
+tz-minus-plain via session — fc answered NULL and silently emptied
+filters); CAST of a zone-tailed STRING to plain temporals
+session-converts (fc raised an affirmative 22018); CAST/concat of a
+ruleless named-zone VALUE refuses (fc's own render is the
+visibly-unconverted `<tz ...>` — it leaked as output);
+INSERT..SELECT carries tz values via new psql_literal arms.
+GROUP BY/DISTINCT/UNION over tz keys REFUSE (`plan_tz_dedup`): the
+engine's tie representative is an unstable internal-sort artifact —
+it flipped between largest- and smallest-zone-id under a WHERE
+during review — and a wrong representative is a wrong answer.
+Boundaries recorded: ruled named zones in DML, TIME-TZ into
+TIMESTAMP (the 2020-01-01 base-date re-anchor law), EXTRACT/AT TIME
+ZONE, CREATE INDEX on tz columns, tz parameters, no-space zone
+tails, EXECUTE BLOCK tz literals (all clean refusals).
+
 **AGGREGATES IN EXPRESSIONS DONE (2026-08-25,
 `serve-real-statexpr` 8):** the statistical/ordered-set family
 (VAR_*/STDDEV_*, CORR/COVAR_*/REGR_*, PERCENTILE_CONT/DISC) and
