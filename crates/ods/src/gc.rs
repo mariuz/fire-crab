@@ -207,8 +207,11 @@ mod tests {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SweepOutcome {
     pub relations_swept: usize,
-    /// relations left alone because their pages carry blob records
+    /// always 0 since blob-aware sweeping: kept for the trace's shape
+    /// (blob-bearing relations used to be left whole)
     pub relations_skipped_blob: usize,
+    /// blob slots freed alongside their collected versions
+    pub blobs_removed: u64,
     /// chains left alone: fragmented members, limbo, no room to promote
     pub chains_skipped: u64,
     /// record versions physically freed
@@ -220,6 +223,7 @@ pub struct SweepOutcome {
 }
 
 /// One chain member as the walk sees it.
+#[derive(Clone)]
 struct Member {
     page: u32,
     slot: u16,
@@ -234,10 +238,48 @@ struct Member {
 /// so a zeroed slot is reusable room, which is also what the engine's
 /// own lazily-compacted pages look like.
 pub(crate) fn free_slot(file: &mut crate::Image, page_size: usize, page: u32, slot: u16) {
-    let p = crate::page_mut(file, page_size, page).expect("free_slot: page out of range");
+    // a pointer read off a record header can name a page outside the
+    // file on a damaged chain: nothing to free, and a panic here would
+    // take the server down (review-caught)
+    let Some(p) = crate::page_mut(file, page_size, page) else {
+        return;
+    };
     let dir = crate::data::DPG_RPT_OFFSET + slot as usize * 4;
+    if dir + 4 > p.len() {
+        return;
+    }
     crate::dml::put_u16(p, dir, 0);
     crate::dml::put_u16(p, dir + 2, 0);
+}
+
+/// Free ONE version slot and, when the version is fragmented
+/// (rhd_incomplete - a catalog patch's cloned head, or an engine
+/// fragmented back version), its tail pieces with it. The unit every
+/// chain collector frees by.
+pub(crate) fn free_version_slot(file: &mut crate::Image, page_size: usize, page: u32, slot: u16) {
+    let frag = crate::page_at(file, page_size, page)
+        .and_then(DataPage::decode)
+        .and_then(|dp| dp.record(slot))
+        .and_then(|r| r.frag_ptr);
+    if let Some((mut f_page, mut f_line)) = frag {
+        let mut fhops = 0usize;
+        while f_page != 0 && fhops < 10_000 {
+            fhops += 1;
+            let next_f = crate::page_at(file, page_size, f_page)
+                .and_then(DataPage::decode)
+                .and_then(|dp| dp.record(f_line))
+                .and_then(|r| r.frag_ptr);
+            free_slot(file, page_size, f_page, f_line);
+            match next_f {
+                Some((np, nl)) => {
+                    f_page = np;
+                    f_line = nl;
+                }
+                None => break,
+            }
+        }
+    }
+    free_slot(file, page_size, page, slot);
 }
 
 /// PURGE one row's back-version chain - the engine's `purge`
@@ -267,39 +309,15 @@ pub(crate) fn purge_row_chain(
     let mut hops = 0usize;
     while b_page != 0 && hops < 10_000 {
         hops += 1;
-        let (next, frag) = {
+        let next = {
             let Some(dp) = crate::page_at(file, page_size, b_page).and_then(DataPage::decode)
             else {
                 break;
             };
             let Some(r) = dp.record(b_line) else { break };
-            ((r.back_page, r.back_line), r.frag_ptr)
+            (r.back_page, r.back_line)
         };
-        // a fragmented member's tail pieces go with it
-        if let Some((mut f_page, mut f_line)) = frag {
-            let mut fhops = 0usize;
-            while f_page != 0 && fhops < 10_000 {
-                fhops += 1;
-                let next_f = {
-                    let Some(dp) =
-                        crate::page_at(file, page_size, f_page).and_then(DataPage::decode)
-                    else {
-                        break;
-                    };
-                    let Some(r) = dp.record(f_line) else { break };
-                    r.frag_ptr
-                };
-                free_slot(file, page_size, f_page, f_line);
-                match next_f {
-                    Some((np, nl)) => {
-                        f_page = np;
-                        f_line = nl;
-                    }
-                    None => break,
-                }
-            }
-        }
-        free_slot(file, page_size, b_page, b_line);
+        free_version_slot(file, page_size, b_page, b_line);
         b_page = next.0;
         b_line = next.1;
     }
@@ -394,7 +412,10 @@ fn member_at(file: &crate::Image, page_size: usize, page: u32, slot: u16) -> Opt
 }
 
 /// The whole back chain FROM (page, line), validated: every member
-/// present, none fragmented. `None` = the chain cannot be swept safely.
+/// present, none a bare tail piece. An INCOMPLETE (fragmented) member
+/// is fine - [free_version_slot] takes its pieces with it and
+/// `assembled_image` reads it whole. `None` = the chain cannot be
+/// swept safely.
 fn chain_members(
     file: &crate::Image,
     page_size: usize,
@@ -409,7 +430,7 @@ fn chain_members(
         }
         hops += 1;
         let m = member_at(file, page_size, page, line)?;
-        if m.flags & (flags::FRAGMENT | flags::INCOMPLETE) != 0 {
+        if m.flags & flags::FRAGMENT != 0 {
             return None;
         }
         page = m.back_page;
@@ -417,6 +438,104 @@ fn chain_members(
         out.push(m);
     }
     Some(out)
+}
+
+/// Each chain member's FULL image, reconstructing deltas as it walks
+/// newest-to-oldest.
+///
+/// `rhd_delta` says "PRIOR version is differences only" (ods.h:1012),
+/// so the flag that decides how a member is stored sits on the version
+/// IN FRONT of it - the head's for the first member, member i-1's for
+/// member i. Reading it off the member ITSELF (which this did at
+/// first) hands a raw delta stream to the field decoder on any
+/// engine-written chain: the blob ids come out garbage or missing, and
+/// a garbage id can name a LIVE blob (review-caught corruption; fc's
+/// own writer never deltafies, so only engine files reach it).
+/// `front_flags`/`prev` describe that version in front; `None` = some
+/// member cannot be read whole and the caller leaves the chain.
+fn chain_images(
+    file: &crate::Image,
+    page_size: usize,
+    members: &[Member],
+    front_flags: u16,
+    mut prev: Vec<u8>,
+) -> Option<Vec<Vec<u8>>> {
+    let mut out = Vec::with_capacity(members.len());
+    let mut front = front_flags;
+    for m in members {
+        let hdr = crate::page_at(file, page_size, m.page)
+            .and_then(DataPage::decode)?
+            .record(m.slot)?
+            .clone();
+        let raw = crate::data::assembled_image(file, page_size, &hdr)?;
+        let img = if front & flags::DELTA != 0 {
+            // a delta with nothing to apply it against (an empty front
+            // image - a data-less stub) cannot be reconstructed
+            if prev.is_empty() {
+                return None;
+            }
+            crate::tra::apply_differences(&raw, &prev)?
+        } else {
+            raw
+        };
+        out.push(img.clone());
+        front = m.flags;
+        prev = img;
+    }
+    Some(out)
+}
+
+/// The blob ids a version image names, under the relation's format for
+/// that version - the unit of the going-minus-staying diff
+/// (blb.cpp:424: identity is the (relation, recno) id). `None` when the
+/// format cannot be resolved - the caller must then LEAVE the chain
+/// rather than free blind.
+fn blob_ids_of(
+    file: &crate::Image,
+    page_size: usize,
+    rel: u16,
+    names: &std::collections::HashMap<u16, String>,
+    image: &[u8],
+    format: u8,
+) -> Option<Vec<(u16, u64)>> {
+    let descs = {
+        let fm = crate::relation_formats(file, page_size, rel);
+        match fm.iter().find(|(n, _)| *n == format) {
+            Some((_, d)) => Some(d.clone()),
+            None => {
+                // a system relation's formats are computed, not stored -
+                // but only the version's OWN format number will do: a
+                // near-enough format lays the blob fields at the wrong
+                // offsets, which is freeing blind by another name
+                let name = names.get(&rel)?;
+                let sf = crate::sysfmt::system_relation_formats(file, page_size, name)?;
+                sf.iter().find(|(n, _)| *n == format).map(|(_, d)| d.clone())
+            }
+        }
+    }?;
+    let vals = crate::format::decode_record(image, &descs);
+    Some(
+        vals.iter()
+            .filter_map(|v| match v {
+                // the empty bid is ALL zero (blb.h isEmpty) - recno 0
+                // alone is a legitimate id: slot 0 of sequence 0
+                // (review-cycle catch: row 1's original blob lives
+                // there and was never freed)
+                crate::format::Value::Blob(brel, num) if !(*brel == 0 && *num == 0) => {
+                    // AN ID THIS RELATION DOES NOT OWN IS IGNORED, the
+                    // engine's own rule (blb.cpp:474/513, hvlad's guard:
+                    // "not owned by relation ... ignored" - such ids DO
+                    // occur in real user data). Freeing one would free a
+                    // live blob of the relation it really names.
+                    if *brel != rel {
+                        return None;
+                    }
+                    Some((*brel, *num))
+                }
+                _ => None,
+            })
+            .collect(),
+    )
 }
 
 /// Every relation with a pointer page, straight off the pages - the
@@ -443,25 +562,21 @@ pub fn sweep(
 ) -> Result<SweepOutcome, String> {
     let mut out = SweepOutcome::default();
     let mut stale_marked: Vec<u64> = Vec::new();
+    // relation names, for resolving SYSTEM relations' computed formats
+    // when a version's blob fields need decoding
+    let names: std::collections::HashMap<u16, String> =
+        crate::list_relations(file, page_size).into_iter().collect();
     for rel in relations_of(file, page_size) {
         let pages = relation_data_pages(file, page_size, rel);
-        // a relation whose pages carry BLOB records is left whole
-        let mut has_blob = false;
-        'blobscan: for dp_no in &pages {
-            let Some(dp) = crate::page_at(file, page_size, *dp_no).and_then(DataPage::decode) else {
-                continue;
-            };
-            for r in dp.records() {
-                if r.flags & flags::BLOB != 0 {
-                    has_blob = true;
-                    break 'blobscan;
-                }
-            }
-        }
-        if has_blob {
-            out.relations_skipped_blob += 1;
-            continue;
-        }
+        // a relation with NO blob slots sweeps the fast way - no image
+        // decoding, exactly the pre-blob-aware behavior (this is every
+        // ordinary table, and the synthetic files unit tests build)
+        let rel_has_blobs = pages.iter().any(|dp_no| {
+            crate::page_at(file, page_size, *dp_no)
+                .and_then(DataPage::decode)
+                .map(|dp| dp.records().any(|r| r.flags & flags::BLOB != 0))
+                .unwrap_or(false)
+        });
         out.relations_swept += 1;
         for dp_no in pages {
             let Some(dp) = crate::page_at(file, page_size, dp_no).and_then(DataPage::decode) else {
@@ -513,8 +628,43 @@ pub fn sweep(
                         Some(TxState::Dead) => {
                             if head.back_page == 0 {
                                 // a rolled-back INSERT: the record was
-                                // never anything else
-                                free_slot(file, page_size, dp_no, slot);
+                                // never anything else - its blobs go
+                                // with it (VIO_backout's
+                                // BLB_garbage_collect: nothing stays)
+                                let going = if !rel_has_blobs {
+                                    Vec::new()
+                                } else {
+                                    let hdr = crate::page_at(file, page_size, dp_no)
+                                        .and_then(DataPage::decode)
+                                        .and_then(|dp| dp.record(slot).map(|r| r.clone()));
+                                    let Some(hdr) = hdr else {
+                                        out.chains_skipped += 1;
+                                        continue 'heads;
+                                    };
+                                    let img =
+                                        crate::data::assembled_image(file, page_size, &hdr);
+                                    let Some(img) = img else {
+                                        out.chains_skipped += 1;
+                                        continue 'heads;
+                                    };
+                                    let ids = blob_ids_of(
+                                        file, page_size, rel, &names, &img, hdr.format,
+                                    );
+                                    let Some(ids) = ids else {
+                                        // no format to decode by: leave
+                                        // the record whole, never free
+                                        // blind
+                                        out.chains_skipped += 1;
+                                        continue 'heads;
+                                    };
+                                    ids
+                                };
+                                free_version_slot(file, page_size, dp_no, slot);
+                                for (brel, num) in going {
+                                    if free_blob(file, page_size, brel, num) {
+                                        out.blobs_removed += 1;
+                                    }
+                                }
                                 out.versions_removed += 1;
                                 out.records_removed += 1;
                                 continue 'heads;
@@ -583,6 +733,81 @@ pub fn sweep(
                                 out.chains_skipped += 1;
                                 continue 'heads;
                             }
+                            // the DEAD head's blobs go with it - minus
+                            // anything the surviving versions still
+                            // name (BLB_garbage_collect's going-minus-
+                            // staying; identity is the id)
+                            let dead_going = if !rel_has_blobs {
+                                Vec::new()
+                            } else {
+                                let hdr = crate::page_at(file, page_size, dp_no)
+                                    .and_then(DataPage::decode)
+                                    .and_then(|dp| dp.record(slot).map(|r| r.clone()));
+                                let Some(hdr) = hdr else {
+                                    out.chains_skipped += 1;
+                                    continue 'heads;
+                                };
+                                let img = crate::data::assembled_image(file, page_size, &hdr);
+                                let Some(img) = img else {
+                                    out.chains_skipped += 1;
+                                    continue 'heads;
+                                };
+                                let going =
+                                    blob_ids_of(file, page_size, rel, &names, &img, hdr.format);
+                                let back_fmt2 = {
+                                    let dp2 = crate::page_at(file, page_size, head.back_page)
+                                        .and_then(DataPage::decode);
+                                    match dp2
+                                        .and_then(|d| d.record(head.back_line).map(|r| r.format))
+                                    {
+                                        Some(f) => f,
+                                        None => {
+                                            out.chains_skipped += 1;
+                                            continue 'heads;
+                                        }
+                                    }
+                                };
+                                let staying_promoted = blob_ids_of(
+                                    file, page_size, rel, &names, &image, back_fmt2,
+                                );
+                                let deeper: Option<Vec<(u16, u64)>> = (|| {
+                                    let members = chain_members(
+                                        file, page_size, back.back_page, back.back_line,
+                                    )?;
+                                    // the versions behind `back`: it
+                                    // is the one in front of them
+                                    let imgs = chain_images(
+                                        file, page_size, &members, back.flags, image.clone(),
+                                    )?;
+                                    let mut ids = Vec::new();
+                                    for (m, im) in members.iter().zip(imgs.iter()) {
+                                        if m.flags & flags::DELETED != 0 {
+                                            continue;
+                                        }
+                                        let fmt = crate::page_at(file, page_size, m.page)
+                                            .and_then(DataPage::decode)
+                                            .and_then(|d| d.record(m.slot).map(|r| r.format))?;
+                                        ids.extend(blob_ids_of(
+                                            file, page_size, rel, &names, im, fmt,
+                                        )?);
+                                    }
+                                    Some(ids)
+                                })();
+                                match (going, staying_promoted, deeper) {
+                                    (Some(g), Some(mut st), Some(deep)) => {
+                                        st.extend(deep);
+                                        g.into_iter()
+                                            .filter(|id| !st.contains(id))
+                                            .collect::<Vec<_>>()
+                                    }
+                                    _ => {
+                                        // formats unreadable: leave the
+                                        // chain whole, never free blind
+                                        out.chains_skipped += 1;
+                                        continue 'heads;
+                                    }
+                                }
+                            };
                             // rebuild the record: the back version's own
                             // identity, CHAIN dropped (it is the head
                             // now), DELTA dropped (the image is stored
@@ -655,23 +880,66 @@ pub fn sweep(
                                 out.chains_skipped += 1;
                                 continue 'heads;
                             }
-                            free_slot(file, page_size, head.back_page, head.back_line);
+                            free_version_slot(file, page_size, head.back_page, head.back_line);
+                            for (brel, num) in dead_going {
+                                if free_blob(file, page_size, brel, num) {
+                                    out.blobs_removed += 1;
+                                }
+                            }
                             out.versions_removed += 1;
                             // loop: judge the promoted head
                         }
                         Some(TxState::Committed) => {
                             if head.flags & flags::DELETED != 0 {
-                                // an expunge: the stub and its whole
-                                // chain go (no snapshot here can want
-                                // them)
+                                // an expunge: the stub, its whole chain,
+                                // and every blob any member names (no
+                                // snapshot here can want them - the
+                                // engine's expunge -> BLB_garbage_collect
+                                // with nothing staying)
                                 let Some(chain) =
                                     chain_members(file, page_size, dp_no, slot)
                                 else {
                                     out.chains_skipped += 1;
                                     continue 'heads;
                                 };
+                                let going: Option<Vec<(u16, u64)>> = if !rel_has_blobs {
+                                    Some(Vec::new())
+                                } else { (|| {
+                                    // the stub carries no data; images
+                                    // start at the first real member
+                                    let below = &chain[1..];
+                                    // the stub is in front of below[0]
+                                    // and carries no image: a delta
+                                    // there cannot be reconstructed and
+                                    // chain_images declines
+                                    let imgs = chain_images(
+                                        file, page_size, below, chain[0].flags, Vec::new(),
+                                    )?;
+                                    let mut ids = Vec::new();
+                                    for (m, im) in below.iter().zip(imgs.iter()) {
+                                        if m.flags & flags::DELETED != 0 {
+                                            continue;
+                                        }
+                                        let fmt = crate::page_at(file, page_size, m.page)
+                                            .and_then(DataPage::decode)
+                                            .and_then(|d| d.record(m.slot).map(|r| r.format))?;
+                                        ids.extend(blob_ids_of(
+                                            file, page_size, rel, &names, im, fmt,
+                                        )?);
+                                    }
+                                    Some(ids)
+                                })() };
+                                let Some(going) = going else {
+                                    out.chains_skipped += 1;
+                                    continue 'heads;
+                                };
                                 for m in &chain {
-                                    free_slot(file, page_size, m.page, m.slot);
+                                    free_version_slot(file, page_size, m.page, m.slot);
+                                }
+                                for (brel, num) in going {
+                                    if free_blob(file, page_size, brel, num) {
+                                        out.blobs_removed += 1;
+                                    }
                                 }
                                 out.versions_removed += chain.len() as u64;
                                 out.records_removed += 1;
@@ -679,8 +947,9 @@ pub fn sweep(
                             }
                             if head.back_page != 0 {
                                 // a live record's history: collect the
-                                // chain BELOW the head, then cut the
-                                // head's back pointer
+                                // chain BELOW the head, its blobs going
+                                // minus what the head still names, then
+                                // cut the head's back pointer
                                 let Some(chain) = chain_members(
                                     file,
                                     page_size,
@@ -690,8 +959,48 @@ pub fn sweep(
                                     out.chains_skipped += 1;
                                     continue 'heads;
                                 };
+                                let going: Option<Vec<(u16, u64)>> = if !rel_has_blobs {
+                                    Some(Vec::new())
+                                } else { (|| {
+                                    let hdr = crate::page_at(file, page_size, dp_no)
+                                        .and_then(DataPage::decode)?
+                                        .record(slot)?
+                                        .clone();
+                                    let head_img = crate::data::assembled_image(
+                                        file, page_size, &hdr,
+                                    )?;
+                                    let staying = blob_ids_of(
+                                        file, page_size, rel, &names, &head_img, hdr.format,
+                                    )?;
+                                    let imgs = chain_images(
+                                        file, page_size, &chain, hdr.flags, head_img,
+                                    )?;
+                                    let mut ids: Vec<(u16, u64)> = Vec::new();
+                                    for (m, im) in chain.iter().zip(imgs.iter()) {
+                                        if m.flags & flags::DELETED != 0 {
+                                            continue;
+                                        }
+                                        let fmt = crate::page_at(file, page_size, m.page)
+                                            .and_then(DataPage::decode)
+                                            .and_then(|d| d.record(m.slot).map(|r| r.format))?;
+                                        ids.extend(blob_ids_of(
+                                            file, page_size, rel, &names, im, fmt,
+                                        )?);
+                                    }
+                                    ids.retain(|id| !staying.contains(id));
+                                    Some(ids)
+                                })() };
+                                let Some(going) = going else {
+                                    out.chains_skipped += 1;
+                                    continue 'heads;
+                                };
                                 for m in &chain {
-                                    free_slot(file, page_size, m.page, m.slot);
+                                    free_version_slot(file, page_size, m.page, m.slot);
+                                }
+                                for (brel, num) in going {
+                                    if free_blob(file, page_size, brel, num) {
+                                        out.blobs_removed += 1;
+                                    }
                                 }
                                 out.versions_removed += chain.len() as u64;
                                 let page = crate::page_mut(file, page_size, dp_no)
@@ -768,6 +1077,45 @@ mod sweep_tests {
     }
 
     const NOBODY: &dyn Fn(u64) -> bool = &|_| false;
+
+    /// The DELTA flag sits on the version IN FRONT (ods.h:1012 "prior
+    /// version is differences only"), and a delta with no image in
+    /// front of it - a data-less delete stub - cannot be
+    /// reconstructed: [chain_images] declines rather than decoding a
+    /// raw delta stream as a record.
+    #[test]
+    fn a_delta_with_no_front_image_declines() {
+        let ps = 4096;
+        let mut f = scratch_file(ps);
+        let ins = insert_record(&mut f, ps, 42, 1, &[0u8, 3, 3, 3, 3, 3, 3, 3]).unwrap();
+        let m = member_at(&f, ps, ins.page_no, ins.slot).unwrap();
+        // no DELTA in front: the member reads whole
+        assert!(chain_images(&f, ps, &[m.clone()], 0, Vec::new()).is_some());
+        // DELTA in front, nothing to apply against: declined
+        assert!(chain_images(&f, ps, &[m], flags::DELTA, Vec::new()).is_none());
+    }
+
+    /// A relation CARRYING BLOBS whose formats cannot be resolved (a
+    /// scratch file with no catalog) is left WHOLE: the blob-aware
+    /// arms must never free what they cannot diff.
+    #[test]
+    fn a_blob_relation_without_formats_is_left_whole() {
+        let ps = 4096;
+        let mut f = scratch_file(ps);
+        // a dead insert head that WOULD be collected...
+        let tx = begin_active_tx(&mut f, ps).unwrap();
+        insert_record_under(&mut f, ps, 42, 1, &[0u8, 9, 9, 9, 9, 9, 9, 9, 9, 9], tx as u32)
+            .unwrap();
+        set_tx_state(&mut f, ps, tx, TxState::Dead).unwrap();
+        let before = version_count(&f, ps, 42);
+        // ...but a blob slot on the relation forces the blob-aware path
+        crate::dml::insert_blob(&mut f, ps, 42, &[b"seg".to_vec()], 1).unwrap();
+        let out = sweep(&mut f, ps, &|_| false).unwrap();
+        assert_eq!(out.records_removed, 0, "left whole - no formats to diff by");
+        assert!(out.chains_skipped >= 1);
+        assert_eq!(out.blobs_removed, 0);
+        assert_eq!(version_count(&f, ps, 42), before);
+    }
 
     /// THE FOUR SHAPES A SWEEP MEETS, on one file: a rolled-back insert
     /// vanishes whole; a rolled-back update is PROMOTED back to the

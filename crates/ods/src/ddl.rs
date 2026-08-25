@@ -7426,7 +7426,9 @@ fn old_blob_at(image: &[u8], descs: &[Descriptor], fid: usize) -> Option<(u16, u
     let f = image.get(at..at + 8)?;
     let orel = u16_at(f, 0);
     let onum = ((f[3] as u64) << 32) | u32_at(f, 4) as u64;
-    if onum == 0 {
+    // the empty bid is ALL zero (blb.h isEmpty); recno 0 alone is slot
+    // 0 of sequence 0, a legitimate blob
+    if orel == 0 && onum == 0 {
         return None;
     }
     Some((orel, onum))

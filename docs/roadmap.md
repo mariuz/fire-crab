@@ -458,6 +458,43 @@ re-read under a concurrent COMMENT still answers the old value.
 Remaining recorded: blobs superseded via delete-then-recreate (ALTER
 VIEW/PROCEDURE/TRIGGER/FUNCTION, DROP TABLE stubs) still leak with
 their dead rows — engine-collectable, same law.
+
+**Blob-aware sweeping — DONE 2026-08-25.** The last leak dimension.
+fire-crab's sweep SKIPPED any relation whose pages carry blob records
+("the blob walk is its own slice"), so a user table with a blob
+column never got version GC at all and the catalog's own blob
+relations kept every back version forever. Now every collected
+version takes its blobs with it, under the engine's law
+(`BLB_garbage_collect`, blb.cpp:424): going = the removed versions'
+blob ids, staying = the survivors', identity is the `(relation,
+recno)` id, and only the difference is freed. All four arms carry it
+— a rolled-back INSERT (everything goes), a PROMOTION (the dead
+head's ids minus the promoted image's and every deeper member's), an
+EXPUNGE (the whole chain, nothing stays), a live head's HISTORY (the
+chain's minus the head's). A relation with no blob slots keeps the
+old fast path; anything the walk cannot read whole — an unresolvable
+format, an unreadable member — leaves the chain UNTOUCHED (never
+free blind, unit-pinned).
+Three laws the review pinned, each a corruption class: `rhd_delta`
+says "the PRIOR version is differences only" (ods.h:1012), so the
+flag that decides how a member is stored sits on the version IN
+FRONT of it — reading it off the member itself handed raw delta
+streams to the field decoder on every engine-written chain (garbage
+blob ids, and a garbage id can name a LIVE blob); a blob id naming a
+FOREIGN relation is IGNORED, never freed (blb.cpp:474's own guard —
+such ids occur in real user data); and a version's own format number
+is the only one that may decode it (a near-enough system format lays
+the blob fields at the wrong offsets — freeing blind by another
+name). `free_slot` no longer panics on a pointer past the file.
+`serve-real-blobsweep` 18 checks: the same churn on twin databases,
+each server sweeping its own file to the SAME survivors (records,
+versions 0, live blob count, blob pages) with every row and a
+level-1 blob's bytes identical — plus fire-crab sweeping the
+ENGINE's own file, whose wide rows (`PAD CHAR(400)`, so the engine's
+difference stream beats the record — measured: 0 delta versions
+without it, 5 with) carry the delta chains fc's own writer never
+produces. `serve-real-gfixsweep`'s recorded boundary ("the blob
+relation is left whole") became the equality it always promised.
 The 13-agent adversarial review caught 8 real defects, all fixed and
 live-verified: two CRITICAL silent-wrongs — a case-blind
 RDB$FIELD_SOURCE join bound the WRONG domain's check when `"dm2"`

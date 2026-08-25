@@ -167,15 +167,16 @@ if [ "$fd" -ge 2 ] 2>/dev/null; then
 else
     echo "DIFF dead TIP entries: [$fd] - a sweep must not rewrite history"; fail=1
 fi
-# --- 4. RECORDED BOUNDARY: the blob table is left whole ---------------------
+# --- 4. the blob table sweeps like any other (blob-aware sweeping:
+# every collected version takes its blobs, serve-real-blobsweep.sh
+# carries the full story) - the old recorded boundary became this
+# equality exactly as it promised ------------------------------------
 eb=$("$FCSTAT" versions "$DBE" "$relB"); fb=$("$FCSTAT" versions "$DBF" "$relB")
 ran=$((ran + 1))
-if [ "$fb" -gt "$eb" ] 2>/dev/null; then
-    echo "OK   boundary: the blob relation is left whole (engine $eb, fc $fb)"
+if [ "$fb" = "$eb" ] 2>/dev/null; then
+    echo "OK   the blob relation sweeps to the engine's count (engine $eb, fc $fb)"
 else
-    echo "DIFF boundary MOVED: blob relation versions engine=$eb fc=$fb"
-    echo "     (if fire-crab collects blobs now, this check must become an equality)"
-    fail=1
+    echo "DIFF blob relation versions engine=$eb fc=$fb"; fail=1
 fi
 # ...but its ROWS are correct on both
 brows() { printf 'SET HEADING OFF;\nSELECT b.ID, CAST(b.S AS VARCHAR(20)) FROM B b;\n' |
