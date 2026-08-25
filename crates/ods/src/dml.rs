@@ -837,21 +837,22 @@ fn insert_record_fragmented(
     let mut next: Option<(u32, u16)> = None;
     for (i, piece) in frags.iter().enumerate().rev() {
         let last = i == frags.len() - 1;
-        let rec = if last {
-            rhd_bytes(tx, 0, 0, flags::FRAGMENT | flags::NOT_PACKED, format_no, piece)
+        let (pf, pdata) = packed_piece(piece);
+        let rec = fill_to_rhdf(if last {
+            rhd_bytes(tx, 0, 0, flags::FRAGMENT | pf, format_no, &pdata)
         } else {
             let (np, nl) = next.ok_or("fragment chain out of order")?;
             rhdf_bytes(
                 tx,
                 0,
                 0,
-                flags::FRAGMENT | flags::INCOMPLETE | flags::NOT_PACKED,
+                flags::FRAGMENT | flags::INCOMPLETE | pf,
                 format_no,
                 np,
                 nl,
-                piece,
+                &pdata,
             )
-        };
+        });
         let spot = match find_space(file, page_size, rel, rec.len()) {
             Some(s) => s,
             None => {
@@ -864,15 +865,16 @@ fn insert_record_fragmented(
         next = Some((spot.page_no, spot.slot));
     }
     let (np, nl) = next.ok_or("a fragmented record with no fragments")?;
+    let (hpf, hdata) = packed_piece(head_data);
     let head = rhdf_bytes(
         tx,
         0,
         0,
-        flags::INCOMPLETE | flags::NOT_PACKED,
+        flags::INCOMPLETE | hpf,
         format_no,
         np,
         nl,
-        head_data,
+        &hdata,
     );
     let spot = match find_space(file, page_size, rel, head.len()) {
         Some(s) => s,
@@ -899,17 +901,6 @@ fn insert_record_as(
     image: &[u8],
     fixed_tx: Option<u32>,
 ) -> Result<InsertOutcome, String> {
-    let rec_len = RHD_DATA_OFFSET + image.len();
-    let spot = match find_space(file, page_size, rel, rec_len) {
-        Some(s) => s,
-        None => {
-            // every existing page is full: grow the relation and retry
-            extend_relation(file, page_size, rel)?;
-            find_space(file, page_size, rel, rec_len)
-                .ok_or("no room even on a fresh data page")?
-        }
-    };
-
     let tx = match fixed_tx {
         Some(t) => t as u64,
         None => {
@@ -921,7 +912,24 @@ fn insert_record_as(
         }
     };
 
-    let rec = rhd_bytes(tx as u32, 0, 0, flags::NOT_PACKED, format_no, image);
+    // packed-when-smaller + the RHDF_SIZE fill, the engine's store law
+    // (this used to write every insert raw, which is what blew the
+    // catalog pages under repeated ALTERs - a packed RDB$FIELDS row is
+    // a fraction of its unpacked self). The record is BUILT FIRST and
+    // the spot found for its true stored length - a spot sized to the
+    // raw image while the fill pad writes past it clipped the
+    // transaction id of the record stored just below (review-cycle
+    // catch: every sweep then read the neighbour as tx 0)
+    let rec = packed_rhd(tx as u32, 0, 0, format_no, image);
+    let spot = match find_space(file, page_size, rel, rec.len()) {
+        Some(s) => s,
+        None => {
+            // every existing page is full: grow the relation and retry
+            extend_relation(file, page_size, rel)?;
+            find_space(file, page_size, rel, rec.len())
+                .ok_or("no room even on a fresh data page")?
+        }
+    };
     write_at_spot(file, page_size, &spot, &rec);
     // a primary record on the page contradicts dpg_secondary ("primary
     // record versions not stored on this page", ods.h:370) - the engine
@@ -1300,7 +1308,10 @@ fn push_back_version(
         }
         let format = rec[12];
         put_u16(&mut rec, 10, rflags | flags::CHAIN);
-        (rec, format)
+        // the chain copy is a store like any other - DPM_chain fills it
+        // to RHDF_SIZE too (dpm.epp:471); a pre-fill-law slot may be
+        // shorter than that
+        (crate::dml::fill_to_rhdf(rec), format)
     };
     let spot = match find_space(file, page_size, rel, rec.len()) {
         Some(s) => s,
@@ -1439,14 +1450,30 @@ pub fn update_record_under(
     format_no: u8,
 ) -> Result<(), String> {
     let (b_page, b_line, _) = push_back_version(file, page_size, rel, page_no, slot)?;
-    // a NEW image too large for one page becomes a fragment chain whose
-    // HEAD sits at the fixed primary slot (the record number is
-    // positional): the tail fragments are placed first, then the head -
-    // rhdf with BOTH the back pointer and the forward pointer - is
-    // rewritten in place. The head's data is sized to what the slot
-    // already held (every stored record is padded to RHDF_SIZE, so the
-    // old body always fits at least the bare header).
-    if RHD_DATA_OFFSET + image.len() + DPG_RPT_OFFSET + 4 > page_size {
+    // the whole-record rewrite first: it fits whenever the new version
+    // is no bigger than the old body or the page still has room
+    let oversize = RHD_DATA_OFFSET + image.len() + DPG_RPT_OFFSET + 4 > page_size;
+    if !oversize {
+        let rec = packed_rhd(tx, b_page, b_line, format_no, image);
+        match rewrite_primary(file, page_size, page_no, slot, &rec) {
+            // a FULL page is not a wall: the engine fragments the new
+            // version instead (dpm.epp DPM_update -> store_big_record),
+            // head in the fixed slot, tail elsewhere - fall through
+            Err(e) if e.starts_with("no room on page") => {}
+            other => return other,
+        }
+    }
+    // a NEW image too large for one page - or one a full page cannot
+    // take whole - becomes a fragment chain whose HEAD sits at the
+    // fixed primary slot (the record number is positional): the tail
+    // fragments are placed first, then the head - rhdf with BOTH the
+    // back pointer and the forward pointer - is rewritten in place.
+    // The head's data is sized to what the slot already held, so under
+    // the fill law (every slot >= RHDF_SIZE) it fits in place; a
+    // pre-fill-law slot shorter than the rhdf header can still refuse
+    // with "no room" on a genuinely full page - cleanly, the
+    // whole-file-flush model discards the copy.
+    {
         let old_len = {
             let page =
                 crate::page_at(file, page_size, page_no).ok_or("primary page out of range")?;
@@ -1469,21 +1496,22 @@ pub fn update_record_under(
         let mut next: Option<(u32, u16)> = None;
         for (i, piece) in frags.iter().enumerate().rev() {
             let last = i == frags.len() - 1;
-            let rec = if last {
-                rhd_bytes(tx, 0, 0, flags::FRAGMENT | flags::NOT_PACKED, format_no, piece)
+            let (pf, pdata) = packed_piece(piece);
+            let rec = fill_to_rhdf(if last {
+                rhd_bytes(tx, 0, 0, flags::FRAGMENT | pf, format_no, &pdata)
             } else {
                 let (np, nl) = next.ok_or("fragment chain out of order")?;
                 rhdf_bytes(
                     tx,
                     0,
                     0,
-                    flags::FRAGMENT | flags::INCOMPLETE | flags::NOT_PACKED,
+                    flags::FRAGMENT | flags::INCOMPLETE | pf,
                     format_no,
                     np,
                     nl,
-                    piece,
+                    &pdata,
                 )
-            };
+            });
             let spot = match find_space(file, page_size, rel, rec.len()) {
                 Some(s) => s,
                 None => {
@@ -1496,41 +1524,78 @@ pub fn update_record_under(
             next = Some((spot.page_no, spot.slot));
         }
         let (np, nl) = next.ok_or("a fragmented update with no fragments")?;
+        let (hpf, hdata) = packed_piece(head_data);
         let head = rhdf_bytes(
             tx,
             b_page,
             b_line,
-            flags::INCOMPLETE | flags::NOT_PACKED,
+            flags::INCOMPLETE | hpf,
             format_no,
             np,
             nl,
-            head_data,
+            &hdata,
         );
-        return rewrite_primary(file, page_size, page_no, slot, &head);
+        rewrite_primary(file, page_size, page_no, slot, &head)
     }
-    // RLE-pack the new version, as the engine stores records: the
-    // primary must stay at its positional slot, so a NOT_PACKED
-    // (uncompressed) image can overflow a tight page - packed, it is
-    // the same size class as the original the slot already held
-    let packed = crate::sqz::pack(image);
-    let mut rec = if packed.len() < image.len() {
-        rhd_bytes(tx, b_page, b_line, 0, format_no, &packed)
+}
+
+/// One fragment PIECE's encoding: packed when smaller (the engine
+/// compresses per piece - store_big_record builds a fresh Compressor
+/// per tail, dpm.epp:4061 - and NOT_PACKED is a property of the PIECE,
+/// data.rs's assembler law). Returns the extra flag and the bytes.
+fn packed_piece(piece: &[u8]) -> (u16, Vec<u8>) {
+    let packed = crate::sqz::pack(piece);
+    if packed.len() < piece.len() {
+        (0, packed)
     } else {
-        rhd_bytes(tx, b_page, b_line, flags::NOT_PACKED, format_no, image)
-    };
-    // dpm.epp's FILL: the engine zero-pads every stored record to
-    // RHDF_SIZE (`fill = (RHDF_SIZE - header_size) - size`, dpm.epp:471)
-    // so any slot can later become a fragment header in place. The pad
-    // is legal on both encodings - validation forgives a zero tail on a
-    // NOT_PACKED record, and a 0x00 control byte in an RLE stream is a
-    // zero-length literal, a no-op (the engine memsets the fill AFTER
-    // dcc.pack, so its own packed records carry the same tail). A
-    // single-INT record written here without it is byte-shorter than
-    // the engine's, harmless today but a gratuitous divergence.
+        (flags::NOT_PACKED, piece.to_vec())
+    }
+}
+
+/// dpm.epp's unconditional FILL law (471 / 2395 / 2628: "It is critical
+/// that the record be padded ... to the length of a fragmented record
+/// header"): EVERY stored record - packed or raw, head, piece, back
+/// version, stub - is zero-padded so its slot can later hold an rhdf
+/// header IN PLACE. The engine's fragment() writes a 22-byte header
+/// into the old slot assuming this; a shorter slot hands it negative
+/// space (review-caught: page corruption from a plain engine UPDATE
+/// over a short fc-written slot). On a PACKED record the pad bytes are
+/// skippable zero controls; on a RAW record they become part of the
+/// read-back image, which is why every re-store site trims the zero
+/// tail back to fmt_length ([trim_fill_tail]) - the engine's vio.cpp
+/// zero-tail forgiveness, applied at the write instead.
+pub(crate) fn fill_to_rhdf(mut rec: Vec<u8>) -> Vec<u8> {
     if rec.len() < RHDF_DATA_OFFSET {
         rec.resize(RHDF_DATA_OFFSET, 0);
     }
-    rewrite_primary(file, page_size, page_no, slot, &rec)
+    rec
+}
+
+/// Trim the FILL pad off an image about to be RE-STORED: a record read
+/// off a page can carry dpm.epp's zero pad as literal data (a raw
+/// record shorter than RHDF_SIZE); re-packing those extra zeros makes
+/// a PACKED record that unpacks past fmt_length - the engine reads it
+/// into a buffer of EXACTLY fmt_length and BUGCHECKs 179
+/// ("decompression overran buffer", measured live on the wire UPDATE
+/// path, which carries its own copy of this trim). Only an all-zero
+/// tail is trimmed; anything else is left for the refusal paths.
+pub(crate) fn trim_fill_tail(image: &mut Vec<u8>, fmt_len: usize) {
+    if fmt_len != 0 && fmt_len < image.len() && image[fmt_len..].iter().all(|b| *b == 0) {
+        image.truncate(fmt_len);
+    }
+}
+
+/// A record's stored bytes, RLE-packed WHEN SMALLER - the engine's own
+/// store law (sqz.cpp `m_allowUnpacked`: pack only when it shrinks,
+/// else raw with `rhd_not_packed`; every DPM store site does this) -
+/// and zero-FILLED to RHDF_SIZE (dpm.epp:471: the slot is never
+/// smaller than a fragment header, so any record can later become one
+/// in place; a 0x00 control byte is a no-op to the RLE decoder, and
+/// validation forgives a zero tail on a raw record). One helper so the
+/// INSERT, UPDATE and fragment writers cannot drift.
+fn packed_rhd(tx: u32, b_page: u32, b_line: u16, format_no: u8, image: &[u8]) -> Vec<u8> {
+    let (pf, pdata) = packed_piece(image);
+    fill_to_rhdf(rhd_bytes(tx, b_page, b_line, pf, format_no, &pdata))
 }
 
 /// Delete the primary record versions at `targets` under ONE freshly
@@ -1575,7 +1640,7 @@ pub fn delete_records_under(
     }
     for (page_no, slot) in targets {
         let (b_page, b_line, format) = push_back_version(file, page_size, rel, *page_no, *slot)?;
-        let stub = rhd_bytes(tx, b_page, b_line, flags::DELETED, format, &[]);
+        let stub = fill_to_rhdf(rhd_bytes(tx, b_page, b_line, flags::DELETED, format, &[]));
         rewrite_primary(file, page_size, *page_no, *slot, &stub)?;
     }
     Ok(DmlOutcome { tx_id: tx as u64, affected: targets.len() })
@@ -1733,12 +1798,42 @@ mod tests {
         assert_eq!(rec.format, 1);
         assert!(rec.flags & flags::NOT_PACKED != 0);
         assert!(rec.is_primary_record());
-        assert_eq!(rec.image().unwrap(), image);
-        // placed below the existing record, 4-aligned
+        // a raw record shorter than RHDF_SIZE carries the FILL pad as
+        // literal zero data - the image is the format prefix
+        let got = rec.image().unwrap();
+        assert!(got.starts_with(&image) && got[image.len()..].iter().all(|b| *b == 0));
+        // placed below the existing record, 4-aligned, FILLED to the
+        // fragmented-header size (dpm.epp:471)
         let (off, len) = dp.slot(1).unwrap();
-        assert_eq!(len as usize, RHD_DATA_OFFSET + image.len());
+        assert_eq!(len as usize, RHDF_DATA_OFFSET);
         assert_eq!(off % 4, 0);
         assert!((off as usize + len as usize) <= ps - 20);
+    }
+
+    #[test]
+    fn a_compressible_record_is_stored_packed_and_reads_back_whole() {
+        let ps = 4096;
+        let mut f = scratch_file(ps);
+        // a long run packs far below the raw length (and past the pad)
+        let mut image = vec![0u8; 60];
+        image.extend_from_slice(&[7u8, 9, 7, 9]);
+        let out = insert_record(&mut f, ps, 42, 1, &image).unwrap();
+        let dp = DataPage::decode(f.page(out.page_no).unwrap()).unwrap();
+        let rec = dp.record(out.slot).unwrap();
+        assert_eq!(rec.flags & flags::NOT_PACKED, 0, "stored packed");
+        let (_, len) = dp.slot(out.slot).unwrap();
+        assert!((len as usize) < RHD_DATA_OFFSET + image.len(), "smaller on page");
+        assert!((len as usize) >= RHDF_DATA_OFFSET, "FILL pad to RHDF_SIZE");
+        assert_eq!(rec.image().unwrap(), image, "unpacks to the exact image");
+        // an image whose packing cannot beat raw stays NOT_PACKED, unpadded
+        let raw: Vec<u8> = (0..24u8).collect();
+        let out2 = insert_record(&mut f, ps, 42, 1, &raw).unwrap();
+        let dp = DataPage::decode(f.page(out2.page_no).unwrap()).unwrap();
+        let rec2 = dp.record(out2.slot).unwrap();
+        assert!(rec2.flags & flags::NOT_PACKED != 0);
+        let (_, len2) = dp.slot(out2.slot).unwrap();
+        assert_eq!(len2 as usize, RHD_DATA_OFFSET + raw.len());
+        assert_eq!(rec2.image().unwrap(), raw);
     }
 
     #[test]
@@ -1752,8 +1847,9 @@ mod tests {
         let out = insert_record(&mut f, ps, 42, 1, &[0u8; 8]).unwrap();
         assert_eq!(out.slot, 1); // reused, not appended
         assert_eq!(DataPage::decode(f.page(3).unwrap()).unwrap().count, 2);
-        // an image too big for the remaining space fails cleanly
-        let huge = vec![0u8; ps];
+        // an image too big for the remaining space fails cleanly -
+        // incompressible bytes, so packing cannot rescue it
+        let huge: Vec<u8> = (0..ps).map(|i| (i * 37 % 251) as u8).collect();
         assert!(insert_record(&mut f, ps, 42, 1, &huge).is_err());
     }
 
@@ -1835,7 +1931,9 @@ mod tests {
         let mut f = crate::Image::from_bytes(&f, ps);
 
         // no room on page 4: the insert must allocate page 5
-        let image = vec![0u8; 64];
+        // (incompressible bytes - a packable image would now fit the
+        // 32-byte hole and stay on page 4)
+        let image: Vec<u8> = (0..64u8).collect();
         let out = insert_record(&mut f, ps, 42, 1, &image).unwrap();
         assert_eq!((out.page_no, out.slot), (5, 0));
         assert_eq!(f.byte_len(), ps * 6); // the FILE grew
@@ -1855,7 +1953,8 @@ mod tests {
         assert_eq!(pip.is_free(6), Some(true));
         assert_eq!((pip.min, pip.used), (6, 6));
         // a second insert too big for page 5's remaining space grows again
-        let big_img = vec![7u8; ps - 100];
+        // (incompressible for the same reason as above)
+        let big_img: Vec<u8> = (0..ps - 100).map(|i| (i * 31 % 251) as u8).collect();
         let out2 = insert_record(&mut f, ps, 42, 1, &big_img).unwrap();
         assert_eq!(out2.page_no, 6); // grew again
         assert_eq!(f.byte_len(), ps * 7);
@@ -1873,7 +1972,9 @@ mod tests {
         let stub = dp.record(ins.slot).unwrap();
         assert!(stub.flags & flags::DELETED != 0);
         assert!(!stub.is_primary_record()); // COUNT no longer sees it
-        assert!(stub.packed_data.is_empty()); // header-only, VIO_erase-style
+        // header-only, VIO_erase-style - plus the FILL pad to RHDF_SIZE
+        // every store gets (all zeros, no data of its own)
+        assert!(stub.packed_data.iter().all(|b| *b == 0));
         assert_eq!(stub.transaction, 12);
         assert_eq!(stub.format, 1);
         let back = dp.record(stub.back_line).unwrap();

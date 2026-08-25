@@ -35,9 +35,9 @@
 # creates; ENFORCEMENT of engine-built checks runs the full WHERE
 # surface (BETWEEN, IN, LIKE, functions). CAST(x AS domain) and PSQL
 # variables over a checked domain refuse (the engine validates with
-# its own 42000 vectors). A repeated ALTER cycle on a crowded catalog
-# page can refuse with "no room on the page" (the pre-existing
-# catalog-version limit) - cleanly, never corrupting.
+# its own 42000 vectors). The old "no room on the page" refusal on a
+# repeated ALTER cycle is CLOSED: records pack on write and a full
+# page fragments the new version (see serve-real-sqzpack.sh).
 #
 #   qa/serve-real-domaincheck.sh [port]
 set -u
@@ -50,10 +50,9 @@ D=/tmp/fbhandson
 A="$D/fc-domck-crab.fdb"; B="$D/fc-domck-engine.fdb"
 LOG="/tmp/fc-serve-domck-$PORT.log"
 mkdir -p "$D"; fail=0; ran=0
-# 32K pages: the ALTER cycle patches the same RDB$FIELDS row several
-# times, and every fc catalog write lands UNPACKED (no SQZ writer yet)
-# where the engine RLE-packs - a smaller page runs out of slack (the
-# recorded catalog-version limit)
+# 32K pages predate the SQZ pack-on-write writer (8K survives the
+# ALTER cycle now - serve-real-sqzpack.sh pins that); kept as-is so
+# this gate's pins stay byte-stable
 make_db() { rm -f "$1"; "$ISQL" -q -b -user "$U" -pas "$P" <<EOF >/dev/null 2>&1 || return 1
 CREATE DATABASE '$1' USER '$U' PASSWORD '$P' PAGE_SIZE 32768;
 COMMIT;

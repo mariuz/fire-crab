@@ -7430,6 +7430,16 @@ fn patch_sys_row(
         .find(|(n, _)| *n == format_no)
         .map(|(_, d)| d.clone())
         .ok_or("the row's format is not among the relation's computed formats")?;
+    // fmt_length as met.epp:1071 derives it (last stored descriptor's
+    // offset + length) - the assembled image can carry the FILL pad as
+    // literal zero data, and re-storing it unpadded is the law
+    // ([dml::trim_fill_tail]; engine BUGCHECK 179 otherwise)
+    let fmt_len = descs
+        .iter()
+        .filter(|d| d.offset != 0)
+        .last()
+        .map(|d| d.offset as usize + d.length as usize)
+        .unwrap_or(0);
     let columns = relation_columns(file, page_size, rel_name);
     // which byte ranges the loop below actually changes, so a fragmented
     // row can be patched by range instead of rewritten whole
@@ -7467,8 +7477,27 @@ fn patch_sys_row(
         // the null-flag bytes are at the very front, so they are always
         // in the head
         pokes.push((0, image[..crate::format::flag_bytes(descs.len())].to_vec()));
-        dml::patch_head_in_place(file, page_size, page, slot, &pokes)?;
+        match dml::patch_head_in_place(file, page_size, page, slot, &pokes) {
+            Ok(()) => {}
+            // a poke past the head (or one the head's slot cannot take
+            // back) rewrites the row whole instead: the old fragmented
+            // head is CLONED as the back version - forward pointer and
+            // all, so the tail pieces follow it - and the primary slot
+            // gets a fresh head ([dml::push_back_version] accepts an
+            // rhd_incomplete head for exactly this)
+            Err(e)
+                if e.starts_with("the field to patch lies past")
+                    || e.starts_with("the patched head no longer fits") =>
+            {
+                let mut image = image;
+                dml::trim_fill_tail(&mut image, fmt_len);
+                dml::update_records(file, page_size, rel, &[(page, slot, image)], format_no)?;
+            }
+            Err(e) => return Err(e),
+        }
     } else {
+        let mut image = image;
+        dml::trim_fill_tail(&mut image, fmt_len);
         dml::update_records(file, page_size, rel, &[(page, slot, image)], format_no)?;
     }
     Ok(())

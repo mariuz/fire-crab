@@ -448,6 +448,32 @@ pub fn sweep(
                             // identity, CHAIN dropped (it is the head
                             // now), DELTA dropped (the image is stored
                             // whole)
+                            // the assembled image can carry the FILL pad
+                            // as literal zero data (a raw record shorter
+                            // than RHDF_SIZE); re-packing it would make
+                            // a record that unpacks past fmt_length -
+                            // engine BUGCHECK 179 - so trim to the back
+                            // version's own format length first
+                            let mut image = image;
+                            {
+                                let back_fmt = {
+                                    let dp2 = crate::page_at(file, page_size, head.back_page)
+                                        .and_then(DataPage::decode)
+                                        .ok_or("back page undecodable mid-sweep")?;
+                                    dp2.record(head.back_line)
+                                        .ok_or("back slot gone mid-sweep")?
+                                        .format
+                                };
+                                let fmt_len = crate::relation_formats(file, page_size, rel)
+                                    .iter()
+                                    .find(|(n, _)| *n == back_fmt)
+                                    .and_then(|(_, descs)| {
+                                        descs.iter().filter(|d| d.offset != 0).last()
+                                    })
+                                    .map(|d| d.offset as usize + d.length as usize)
+                                    .unwrap_or(0);
+                                crate::dml::trim_fill_tail(&mut image, fmt_len);
+                            }
                             // pack the image the way dml stores records:
                             // RLE when it shrinks, raw + NOT_PACKED when
                             // it does not - the flag must match the bytes
@@ -479,6 +505,7 @@ pub fn sweep(
                                     .format
                             });
                             rec.extend_from_slice(body);
+                            let rec = crate::dml::fill_to_rhdf(rec);
                             // the ORDER is the fail-closed guarantee:
                             // rewrite first (nothing is freed if the
                             // page has no room), free the back slot only

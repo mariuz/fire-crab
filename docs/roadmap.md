@@ -378,10 +378,45 @@ AND/OR/NOT/IS NULL) — anything wider refuses the WHOLE statement
 (never a domain without its rule) where the engine creates;
 CAST(x AS domain) and PSQL vars over checked domains keep refusing
 (engine: 42000 `validation error for CAST/variable`); a repeated
-ALTER cycle can hit the pre-existing catalog page-full refusal — fc
-writes catalog versions UNPACKED (no SQZ run-length writer yet),
-so a patched RDB$FIELDS row blows out its RLE'd size. A SQZ writer
-is now a recorded candidate (it would shrink every fc-written row).
+ALTER cycle used to hit a catalog page-full refusal — CLOSED
+2026-08-25 by SQZ pack-on-write: every record fc stores (INSERT,
+UPDATE, fragment pieces, restore rows) is RLE-packed when smaller
+(the engine's sqz.cpp `m_allowUnpacked` law), the FILL pad to
+RHDF_SIZE lands on EVERY store — raw records included (dpm.epp:471
+"It is critical that the record be padded": the engine's `fragment()`
+writes an rhdf header into the old slot assuming it; the 3-lens
+review proved a short fc slot page-corrupts a plain engine UPDATE) —
+while every RE-STORE site trims the all-zero tail back to fmt_length
+(`trim_fill_tail`; re-packing the pad makes a record that unpacks
+past fmt_length — engine BUGCHECK 179, the wire UPDATE path's
+measured trim law now shared by `patch_sys_row` and the sweep's
+promotion), a new version a FULL page cannot take whole FRAGMENTS in
+place of refusing (dpm.epp `DPM_update` → `store_big_record`: head
+in the fixed slot, tail elsewhere), and a fragmented catalog row
+stays patchable — a poke past the head falls back to a whole-row
+update whose back version is the old head CLONED, forward pointer
+and all, so the old tail pieces follow it (`push_back_version`
+already accepted an `rhd_incomplete` head). 24 drop/add cycles on 8K
+now run clean where 3 used to die at "no room on page 112";
+`serve-real-sqzpack` 9 checks — the cycles differentially, packed
+USER rows written by fc and read byte-for-byte by the ENGINE, gfix
+-v -full silent, a gbak round trip. Known-safe leak: a collected
+fragmented back version's tail pieces are skipped by gc
+(`chains_skipped`), never freed — space, not correctness. The review
+also caught `insert_record_as` sizing `find_space` by the raw image
+while writing the padded record — every insert clipped the
+transaction id of the record stored just below it; the spot is now
+found for the built record's true length. The first full sweep then
+caught the last member of the class: `build_insert_image` /
+`upgrade_image` sized fresh images by a LIVE SAMPLE record — whose
+assembled length includes the engine's FILL pad — so every insert
+into a table with padded rows built the pad INTO the image, and the
+now-packed store unpacked past fmt_length (live BUGCHECK 179 in the
+nbackup/ddltx/growth gates). Images are now built at fmt_length
+exactly (met.epp's last-descriptor law; the sample only
+sanity-checks), the pad living solely at the record layer.
+serve-real-grow's growth threshold relaxed to +1 page: packed small
+rows fill ~6x denser, exactly as the engine stores them.
 The 13-agent adversarial review caught 8 real defects, all fixed and
 live-verified: two CRITICAL silent-wrongs — a case-blind
 RDB$FIELD_SOURCE join bound the WRONG domain's check when `"dm2"`

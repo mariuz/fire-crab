@@ -21860,8 +21860,8 @@ fn plan_insert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
 /// one: every field the two formats share (same id, same type, length
 /// and scale) keeps its bytes and its null bit; every other field of
 /// the new format is NULL. The image length follows the same rule an
-/// INSERT's does (a live sample of the newest format, else the stored
-/// end), so the stored record is indistinguishable from a fresh one.
+/// INSERT's does (fmt_length exactly; a live sample only sanity-checks
+/// it), so the stored record is indistinguishable from a fresh one.
 fn upgrade_image(
     image: &[u8],
     old: &[Descriptor],
@@ -21879,10 +21879,20 @@ fn upgrade_image(
     if stored_end == 0 {
         return None;
     }
-    let len = sample_image_len(db, rel, format_no).unwrap_or(stored_end);
-    if len < stored_end {
-        return None;
+    // the sampled length is a SANITY check only: a live record shorter
+    // than the computed fmt_length means the computed format is wrong -
+    // refuse rather than lay fields at bad offsets. The image itself is
+    // built at fmt_length EXACTLY: a sampled record can be longer only
+    // by the dpm FILL pad, which lives at the record layer
+    // (dml::fill_to_rhdf) and never in the image - building the pad in
+    // made the now-packed store unpack past fmt_length (BUGCHECK 179,
+    // the same law the UPDATE path's trim pins).
+    if let Some(sample) = sample_image_len(db, rel, format_no) {
+        if sample < stored_end {
+            return None;
+        }
     }
+    let len = stored_end;
     let mut out = vec![0u8; len];
     for i in 0..new.len() {
         out[i / 8] |= 1 << (i % 8);
@@ -21910,9 +21920,9 @@ fn upgrade_image(
 
 /// Build the record image: every field NULL except the provided ones,
 /// values validated against and laid at their descriptor offsets. The
-/// image length is taken from a live record of the same format when the
-/// table has one (the authoritative fmt_length); an empty table falls
-/// back to the aligned end of the last field.
+/// image is fmt_length exactly (met.epp's last-descriptor law); a live
+/// record of the same format, when the table has one, only
+/// sanity-checks that the computed format is not short.
 fn build_insert_image(
     landing: &[(&RelationColumn, &InsVal)],
     descs: &[Descriptor],
@@ -21947,10 +21957,20 @@ fn build_insert_image(
     if stored_end == 0 {
         return None;
     }
-    let len = sample_image_len(db, rel, format_no).unwrap_or(stored_end);
-    if len < stored_end {
-        return None;
+    // the sampled length is a SANITY check only: a live record shorter
+    // than the computed fmt_length means the computed format is wrong -
+    // refuse rather than lay fields at bad offsets. The image itself is
+    // built at fmt_length EXACTLY: a sampled record can be longer only
+    // by the dpm FILL pad, which lives at the record layer
+    // (dml::fill_to_rhdf) and never in the image - building the pad in
+    // made the now-packed store unpack past fmt_length (BUGCHECK 179,
+    // the same law the UPDATE path's trim pins).
+    if let Some(sample) = sample_image_len(db, rel, format_no) {
+        if sample < stored_end {
+            return None;
+        }
     }
+    let len = stored_end;
     let mut image = vec![0u8; len];
     // start all-NULL: descriptor index i's flag is bit i of the leading
     // null-flag bytes (the same bit decode_field reads)

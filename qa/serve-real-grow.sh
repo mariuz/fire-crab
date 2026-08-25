@@ -143,11 +143,14 @@ check "fire-crab reads all rows back" "$(node_run "SELECT COUNT(*) FROM G")" "25
 check "  ..spot row on a grown page" \
     "$(node_run "SELECT ID FROM G WHERE ID = 250")" "250"
 # growth teeth via gstat (the engine's own page accounting): the
-# relation must hold several more data pages than it started with -
-# whether the pages came from free bits below EOF (a gbak-restored
-# file keeps some) or extended the file
+# relation must hold more data pages than it started with - whether
+# the pages came from free bits below EOF (a gbak-restored file keeps
+# some) or extended the file. Since SQZ pack-on-write these small
+# rows RLE-pack ~6x denser (the engine packs them the same way), so
+# 250 inserts force only a page or two - the threshold is +1, the
+# machinery, not the byte count, is what this pins
 dp_after=$(dp_count "$WORK")
-if [ -n "$dp_after" ] && [ "$dp_after" -ge $(( ${dp_before:-0} + 5 )) ]; then
+if [ -n "$dp_after" ] && [ "$dp_after" -ge $(( ${dp_before:-0} + 1 )) ]; then
     echo "OK   the relation grew (data pages ${dp_before:-?} -> $dp_after per gstat)"
 else
     echo "DIFF the relation grew"; echo "     data pages ${dp_before:-?} -> ${dp_after:-?}"; fail=1
