@@ -218,14 +218,14 @@ both "ORDER BY a plain ALIAS" "SELECT ID AS X FROM EMP ORDER BY X"
 both "ORDER BY an aggregate's ordinal" \
      "SELECT DEPT_ID, COUNT(*) FROM EMP GROUP BY DEPT_ID ORDER BY 2 DESC"
 
-# --- 6. the refusals, each for a stated reason ------------------------
-# a DISTINCT or an expression ARGUMENT inside a folded aggregate is a
-# later slice: its result type is not derived here, and a guessed type
-# would decode as the wrong number rather than fail
-refuses "COUNT(DISTINCT c) inside an expression" \
-        "SELECT COUNT(DISTINCT DEPT_ID) + 1 FROM EMP"
-refuses "an EXPRESSION argument inside a folded aggregate" \
-        "SELECT SUM(SALARY + 1) + 1 FROM EMP"
+# --- 6. the once-refused shapes, landed by the statexpr slice ---------
+# DISTINCT and expression ARGUMENTS inside folded aggregates were "a
+# later slice" here until aggregates-in-expressions shipped - they
+# answer differentially now
+both "COUNT(DISTINCT c) inside an expression (the statexpr slice)" \
+     "SELECT COUNT(DISTINCT DEPT_ID) + 1 FROM EMP"
+both "an EXPRESSION argument inside a folded aggregate (the statexpr slice)" \
+     "SELECT SUM(SALARY + 1) + 1 FROM EMP"
 
 rm -f "$A" "$B"
 if [ "$ran" -lt 45 ]; then

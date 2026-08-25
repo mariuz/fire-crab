@@ -244,6 +244,58 @@ DDL was.
 
 ### F. DML and PSQL gaps
 
+**AGGREGATES IN EXPRESSIONS DONE (2026-08-25,
+`serve-real-statexpr` 8):** the statistical/ordered-set family
+(VAR_*/STDDEV_*, CORR/COVAR_*/REGR_*, PERCENTILE_CONT/DISC) and
+SUM/AVG-over-expressions now serve in every position the engine does:
+select-list arithmetic and wrappers (`STDDEV_SAMP(N)*2`,
+`ROUND(VAR_POP(N),2)`, `CAST/COALESCE/CASE/NULLIF/unary minus`,
+`SUM(N)*AVG(N)` → INT128:-4 subtype 1, `CORR(N,B)*100`,
+`SUM(A+B)*2`), HAVING (bare and expression LHS — `SUM(N)*2 > 10`,
+`STDDEV_POP(N)*2 > 3`, percentiles), and ORDER BY (bare aggregates,
+aggregate expressions, aliases of both). The machinery was already
+half-built: `RawExpr::Agg` leaves + slot substitution existed for
+the five plain functions over bare columns; the slice factored
+`resolve_agg_src` out of the bare select-item arm, taught
+`agg_result_desc` the family's descriptors (DOUBLE; REGR_COUNT
+BIGINT; PERCENTILE_DISC = the order column's), extended the WHERE
+tokenizer's aggregate lexing to the whole family (with the `WITHIN
+GROUP` tail swallowed, in both the token- and char-level parsers),
+gave `texpr`/`parse_leaf` aggregate expression leaves, rebuilt
+HAVING's `resolve_having` around a parallel `slot_descs` and an
+expression route over the extracted `synth_group_view`, and hung an
+aggregate-expression resolver on the grouped `parse_order_by_expr`.
+DESCRIBE follows the engine's measured dsc rules: family expressions
+NOT nullable yet NULL-capable on the wire (isql renders that NULL
+`0.000...`; PERCENTILE stays nullable; COALESCE nullability is
+ALL-branches), SQLDA name = top operator, CASE text at literal
+length. THE FOLD FIX the wrap exposed: VAR/STDDEV of an empty/all-
+NULL group (and the SAMPLE forms over one row) are NULL, not 0.0 —
+invisible in bare renders for years, `COALESCE(VAR_SAMP(..), -1)`
+told the truth. The 16-agent adversarial review caught 8 more, all
+fixed + live-verified: the DOUBLE-describe coercion must run BEFORE
+`value_of`'s exact-contract guards (a `COALESCE(D, 1.5)` branch
+value 22003'd mid-fetch where the engine converts — reachable on
+PLAIN rows too); **`ORDER BY X` where X aliases `0 - SUM(N)`
+silently sorted by the bare SUM slot (pre-existing wrong order,
+now the alias sorts by its expression)**; **exact-vs-DOUBLE
+comparisons and the f64 folds converted scaled values by MULTIPLY
+where the engine's CVT divides — `WHERE N = 35.8e0` picked the
+WRONG ROWS silently (pre-existing), and VAR/STDDEV's last digit
+drifted**; HAVING's Pair/Percentile route now runs the operand
+gates (a text CORR fed the numeric fold silently) and
+PERCENTILE_DISC compares text orders as text; MIN/MAX-over-
+expression and SUM/AVG slots carry the NUMERIC sub_type; DOUBLE
+describes never leak subtype 1. Boundaries recorded: LIST in
+expressions (computed-blob concat), DISTINCT inside the family
+(engine -104 Token unknown), aggregates in WHERE (engine's specific
+-104 vs fc generic), windows/NTILE in expressions, family
+expressions over GROUP-BY-expression keys, derived tables/views/
+INSERT..SELECT wrapping family expressions (clean refusals), the
+engine's 42702 ambiguous-ORDER-BY refusal that fc still serves, and
+bare MIN/MAX over CAST announcing INT64 where the engine keeps LONG
+(both pre-existing describe/refusal-shape divergences, candidates).
+
 **DOMAIN CHECK constraints DONE (2026-08-25,
 `serve-real-domaincheck` 6):** the silent-wrong class closed — fc used
 to WRITE rows the engine refuses (RDB$VALIDATION_* had no consumer).

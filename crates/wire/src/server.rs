@@ -7090,6 +7090,26 @@ impl ProjCol {
                 // branch's scale decodes WRONG (0.5 announced at -2 read
                 // as 0.05) - align it exactly here. The announced scale
                 // is the min, so alignment only ever multiplies.
+                // a DOUBLE-announced expression can hand back an EXACT
+                // value (the literal/exact branch of a COALESCE/CASE
+                // whose other branch is a DOUBLE aggregate) - convert
+                // it to the double the describe promised, exactly as
+                // the engine's assignment does (COALESCE(VAR_SAMP(N),
+                // -9) over an empty set answers -9.000000000000000,
+                // measured). This runs FIRST: the exact-contract guards
+                // below would 22003 a Scaled/Int128 branch value the
+                // engine simply converts (review-caught live:
+                // COALESCE(D, 1.5) errored mid-fetch)
+                if matches!(self.wire, Wire::Double) {
+                    return Ok(match v {
+                        Value::Int(n) => Value::Double(n as f64),
+                        Value::Scaled(raw, sc) => {
+                            Value::Double(exact_to_f64(raw as i128, sc as i32))
+                        }
+                        Value::Int128(raw, sc) => Value::Double(exact_to_f64(raw, sc as i32)),
+                        other => other,
+                    });
+                }
                 if let Some((raw, vs)) = numeric_parts(&v) {
                     let announced = self.scale as i8;
                     if vs != announced && !matches!(v, Value::Null) {
@@ -9409,8 +9429,9 @@ impl Predicate {
                 (ColKind::Bool, WireParam::Bool(b)) => Some(Expr::Bool(*b)),
                 // an exact value for an approximate slot converts, the
                 // way an exact literal in the SQL text would
+                // (exact_to_f64: divide-not-multiply, the CVT step)
                 (ColKind::Approx, WireParam::Int(v, sc)) => {
-                    Some(Expr::Double(*v as f64 * 10f64.powi(*sc as i32)))
+                    Some(Expr::Double(exact_to_f64(*v as i128, *sc as i32)))
                 }
                 // the same two text conversions the store path learned,
                 // reaching the filter side: a text value into an
@@ -13251,6 +13272,11 @@ fn build_expr_col_from(e: Expr, name: &str, descs: &[Descriptor]) -> Option<Proj
             // the 32765 catch-all stays NONE: its cap never fires
             None => 0,
         }
+    } else if matches!(e.type_of(descs), Some(ExprType::Approx)) {
+        // a DOUBLE result is subtype 0 whatever its exact-numeric
+        // operands carried (review-caught: VAR_SAMP(N) + SUM(N)
+        // announced subtype 1 where the engine says 0)
+        0
     } else {
         // the MAX sub_type of the exact-numeric leaves (1 NUMERIC, 2
         // DECIMAL), propagated through arithmetic, negation and the
@@ -29526,7 +29552,7 @@ fn plan_join_bound(
             None => (Vec::new(), Vec::new()),
             Some(g) => parse_group_by(g, &items, &comb_cols, &comb_descs, synth_base)?,
         };
-        let (mut cols, mut gitems) =
+        let (mut cols, mut gitems, _slot_descs) =
             build_group_items(&items, &comb_cols, &comb_descs, &key_fids, &key_exprs, synth_base, params)?;
         // a PLAIN group key reads from the side it came from (probed:
         // `GROUP BY T.B` keys answer relation T, and the side's alias);
@@ -29561,7 +29587,19 @@ fn plan_join_bound(
                 tokenize(hs)
                     .and_then(|t| parse_predicate(&t, &mut having_np))
                     .and_then(|raw| {
-                        resolve_having(raw, &mut gitems, &key_fids, &comb_cols, &comb_descs, params)
+                        {
+                            let gl = gitems.len();
+                            resolve_having(
+                                raw,
+                                &mut gitems,
+                                &mut vec![None; gl],
+                                usize::MAX,
+                                &key_fids,
+                                &comb_cols,
+                                &comb_descs,
+                                params,
+                            )
+                        }
                     })?,
             ),
         };
@@ -30680,7 +30718,7 @@ fn plan_over_source(
             None => (Vec::new(), Vec::new()),
             Some(g) => parse_group_by(g, &items, &columns, &descs, synth_base)?,
         };
-        let (mut gcols, mut gitems) =
+        let (mut gcols, mut gitems, _slot_descs) =
             build_group_items(&items, &columns, &descs, &key_fids, &key_exprs, synth_base, params)?;
         // a grouped KEY over the derived rows keeps the INNER column's
         // field name, exactly as the ungrouped read does (probed:
@@ -30717,7 +30755,19 @@ fn plan_over_source(
             Some(hs) => Some(
                 tokenize(hs)
                     .and_then(|t| parse_predicate(&t, &mut np))
-                    .and_then(|raw| resolve_having(raw, &mut gitems, &key_fids, &columns, &descs, params))?,
+                    .and_then(|raw| {
+                        let gl = gitems.len();
+                        resolve_having(
+                            raw,
+                            &mut gitems,
+                            &mut vec![None; gl],
+                            usize::MAX,
+                            &key_fids,
+                            &columns,
+                            &descs,
+                            params,
+                        )
+                    })?,
             ),
         };
         if np != dgroup_params {
@@ -34520,6 +34570,132 @@ fn parse_derived_table(from_s: &str) -> Option<(String, String, Vec<String>)> {
     Some((inner, alias.to_ascii_uppercase(), cols))
 }
 
+/// Resolve an aggregate's TARGET into the fold source the group
+/// machinery runs - every shape the bare select-list arm supports
+/// (Star, Col, DISTINCT, expressions, the two-argument Pair, the
+/// ordered-set Percentile, LIST), factored out so an aggregate INSIDE
+/// AN EXPRESSION, a HAVING and an ORDER BY resolve targets through the
+/// SAME rules. The bool is DISTINCT (only COUNT folds it - callers
+/// gate).
+fn resolve_agg_src(
+    target: &AggTarget,
+    columns: &[RelationColumn],
+    descs: &[Descriptor],
+) -> Option<(AggSrc, bool)> {
+    let out = match target {
+        AggTarget::Star => (AggSrc::Star, false), // COUNT(*) - parse guarantees Count
+        AggTarget::Col(name) | AggTarget::Distinct(name) => {
+            let rc = columns.iter().find(|c| c.name.eq_ignore_ascii_case(name))?;
+            let fid = rc.field_id as usize;
+            // no record bytes to aggregate over
+            if is_computed_fid(descs, fid) {
+                return None;
+            }
+            (AggSrc::Field(fid), matches!(target, AggTarget::Distinct(_)))
+        }
+        AggTarget::DistinctExpr(raw) => {
+            (AggSrc::Expr(resolve_expr(raw, columns, descs)?), true)
+        }
+        AggTarget::Expr(raw) => {
+            (AggSrc::Expr(resolve_expr(raw, columns, descs)?), false)
+        }
+        AggTarget::Pair(y, x) => (
+            AggSrc::Pair(
+                resolve_expr(y, columns, descs)?,
+                resolve_expr(x, columns, descs)?,
+            ),
+            false,
+        ),
+        AggTarget::Percentile { frac, order, desc } => (
+            AggSrc::Percentile {
+                frac: resolve_expr(frac, columns, descs)?,
+                order: resolve_expr(order, columns, descs)?,
+                desc: *desc,
+            },
+            false,
+        ),
+        AggTarget::List { arg, sep, distinct } => {
+            // a plain BLOB column argument joins by CONTENT
+            // (the engine's MOV_make_string2 reads the blob) -
+            // it resolves to the content reader the blob CAST
+            // uses, since a bare blob column has no expression
+            // type of its own
+            let a = match arg {
+                RawExpr::Col(n) => {
+                    let rc = columns
+                        .iter()
+                        .find(|c| c.name.eq_ignore_ascii_case(n.trim_matches('"')))?;
+                    let fid = rc.field_id as usize;
+                    let d = descs.get(fid)?;
+                    if d.dtype == dtype::BLOB {
+                        // a user sub_type has no filter to text
+                        if !matches!(d.sub_type, 0 | 1) {
+                            return None;
+                        }
+                        // DISTINCT over a blob column: the
+                        // engine's distinct machinery keys the
+                        // DESCRIPTOR - the blob id - so equal
+                        // CONTENT never dedupes and the set
+                        // comes out in id order; a content
+                        // dedupe here would answer wrong, so
+                        // refuse (review-caught)
+                        if *distinct {
+                            return None;
+                        }
+                        Expr::BlobText(fid)
+                    } else {
+                        resolve_expr(arg, columns, descs)?
+                    }
+                }
+                _ => resolve_expr(arg, columns, descs)?,
+            };
+            // the engine's DISTINCT dedupes by the argument's
+            // COLLATION key; fc's value_cmp is binary - a
+            // non-binary-collated text argument would dedupe
+            // (and order) WRONG, so it refuses instead
+            // (review-caught; fc's collation-aware ordering
+            // is a recorded server-wide boundary)
+            if *distinct
+                && expr_reads(&a, &|f| {
+                    descs.get(f).is_some_and(|d| {
+                        matches!(d.dtype, dtype::TEXT | dtype::VARYING)
+                            && (d.sub_type as u16) >> 8 != 0
+                    })
+                })
+            {
+                return None;
+            }
+            let s = match sep {
+                Some(r) => Some(resolve_expr(r, columns, descs)?),
+                None => None,
+            };
+            // a CHAR column's value travels padded to its
+            // declared CHARACTER count (measured: a UTF8
+            // CHAR(4) holding 'Ж' contributes 'Ж   ' - 4
+            // characters, 5 bytes - not its 16-byte slot) -
+            // the pad width, in characters, for the fold
+            let pad = match arg {
+                RawExpr::Col(n) => columns
+                    .iter()
+                    .find(|c| c.name.eq_ignore_ascii_case(n.trim_matches('"')))
+                    .and_then(|c| descs.get(c.field_id as usize))
+                    .filter(|d| d.dtype == dtype::TEXT)
+                    .map(|d| {
+                        let chars = d.length as usize
+                            / fire_crab_ods::intl::bytes_per_char(
+                                fire_crab_ods::intl::charset_id(d.sub_type),
+                            )
+                            .max(1) as usize;
+                        (chars, d.length as usize)
+                    }),
+                _ => None,
+            };
+            (AggSrc::List { arg: a, sep: s, distinct: *distinct, pad }, false)
+        }
+    };
+    Some(out)
+}
+
 /// The DESCRIPTOR of an aggregate's result - what the group row holds in
 /// that slot, so an expression built over it types like any column.
 ///
@@ -34548,57 +34724,253 @@ fn agg_result_desc(
         flags: 0,
         offset: 1,
     };
+    let double_d = || Descriptor {
+        dtype: dtype::DOUBLE,
+        scale: 0,
+        length: 8,
+        sub_type: 0,
+        flags: 0,
+        offset: 1,
+    };
+    // a cloned COLUMN descriptor keeps its real offset unless that is 0
+    // (field 0), which `is_computed_fid` would misread as a computed
+    // column - the offset is never used for a slot, so 1 says "real"
+    let synth = |d: &Descriptor| {
+        let mut c = d.clone();
+        if c.offset == 0 {
+            c.offset = 1;
+        }
+        c
+    };
     if matches!(func, AggFn::Count) {
         return Some(int64(0));
     }
-    // only a plain column source is folded inside an expression; a
-    // DISTINCT or an expression argument there is a later slice, and a
-    // refusal beats a guess at its type
-    let name = match target {
-        AggTarget::Col(n) => n,
-        _ => return None,
+    // the shape of the fold's INPUT - a column's descriptor route or an
+    // expression's typing route ([resolve_agg_src]'s own split); the
+    // numeric-ish gate matches the bare select-item arm's
+    let col_desc = |n: &str| -> Option<Descriptor> {
+        let rc = columns.iter().find(|c| c.name.eq_ignore_ascii_case(n))?;
+        if is_computed_fid(descs, rc.field_id as usize) {
+            return None;
+        }
+        descs.get(rc.field_id as usize).cloned()
     };
-    let rc = columns.iter().find(|c| c.name.eq_ignore_ascii_case(name))?;
-    let d = descs.get(rc.field_id as usize)?;
-    if is_computed_fid(descs, rc.field_id as usize) {
-        return None;
-    }
-    Some(match func {
-        // a LIST target is never AggTarget::Col (its own shape), so this
-        // arm is unreachable; a blob result has no descriptor here anyway
-        AggFn::List => return None,
-        AggFn::Count => int64(0),
-        AggFn::Min | AggFn::Max => d.clone(),
-        AggFn::Sum => match d.dtype {
-            dtype::SHORT | dtype::LONG => int64(d.scale),
-            dtype::INT64 | dtype::INT128 => Descriptor {
-                dtype: dtype::INT128,
-                scale: d.scale,
-                length: 16,
-                sub_type: 0,
-                flags: 0,
-                offset: 1,
-            },
-            _ => return None, // approximate and temporal folds: not here
-        },
-        AggFn::Avg => match d.dtype {
-            dtype::SHORT | dtype::LONG | dtype::INT64 => int64(d.scale),
-            dtype::INT128 => Descriptor {
-                dtype: dtype::INT128,
-                scale: d.scale,
-                length: 16,
-                sub_type: 0,
-                flags: 0,
-                offset: 1,
+    let numericish_expr = |raw: &RawExpr| -> Option<bool> {
+        let e = resolve_expr(raw, columns, descs)?;
+        Some(matches!(
+            e.type_of(descs)?,
+            ExprType::Int | ExprType::Numeric | ExprType::Approx
+        ))
+    };
+    let numericish_desc =
+        |d: &Descriptor| matches!(col_kind(d), Some(ColKind::Int)) || is_numeric_col(d) || is_approx_col(d);
+    // the single-operand numeric gate, per target shape
+    let operand_numericish = |target: &AggTarget| -> Option<bool> {
+        Some(match target {
+            AggTarget::Col(n) => numericish_desc(&col_desc(n)?),
+            AggTarget::Expr(raw) => numericish_expr(raw)?,
+            AggTarget::Percentile { order, .. } => match order {
+                RawExpr::Col(n) => numericish_desc(&col_desc(n)?),
+                other => numericish_expr(other)?,
             },
             _ => return None,
+        })
+    };
+    Some(match func {
+        // a LIST result is a computed BLOB: no scalar slot descriptor -
+        // LIST inside an expression stays refused (recorded boundary)
+        AggFn::List => return None,
+        AggFn::Count => int64(0),
+        AggFn::Min | AggFn::Max => match target {
+            AggTarget::Col(n) => synth(&col_desc(n)?),
+            // an expression source folds at the expression's own shape
+            AggTarget::Expr(raw) => {
+                let e = resolve_expr(raw, columns, descs)?;
+                match e.type_of(descs)? {
+                    ExprType::Int => int64(0),
+                    ExprType::Numeric => {
+                        // the NUMERIC sub_type rides along (review-
+                        // caught: MAX(N*2)+0 announced subtype 0 where
+                        // the engine says 1)
+                        let sub = numeric_subtype(&e, descs) as i16;
+                        match e.rank_of(descs).unwrap_or(NumRank::Long) {
+                            NumRank::I128 => Descriptor {
+                                dtype: dtype::INT128,
+                                scale: e.result_scale(descs)?,
+                                length: 16,
+                                sub_type: sub,
+                                flags: 0,
+                                offset: 1,
+                            },
+                            _ => {
+                                let mut d = int64(e.result_scale(descs)?);
+                                d.sub_type = sub;
+                                d
+                            }
+                        }
+                    }
+                    _ => return None,
+                }
+            }
+            _ => return None,
         },
-        // the statistical folds are top-level select items only - VAR/STDDEV
-        // in a HAVING or a scalar subquery refuse (no scalar descriptor here)
-        AggFn::VarPop | AggFn::VarSamp | AggFn::StddevPop | AggFn::StddevSamp => return None,
-        AggFn::Corr | AggFn::CovarPop | AggFn::CovarSamp | AggFn::RegrSlope | AggFn::RegrIntercept | AggFn::RegrCount | AggFn::RegrR2 | AggFn::RegrAvgx | AggFn::RegrAvgy | AggFn::RegrSxx | AggFn::RegrSyy | AggFn::RegrSxy => return None,
-        AggFn::PercentileCont | AggFn::PercentileDisc => return None,
+        AggFn::Sum | AggFn::Avg => {
+            // (dtype-rank, scale, NUMERIC sub_type) of the operand,
+            // both routes - the sub_type rides the slot so a wrapping
+            // expression announces NUMERIC where the engine does
+            // (measured: SUM(N)*AVG(N) over NUMERIC(9,2) is INT128
+            // scale -4 SUBTYPE 1)
+            let (rank, scale, sub, approx) = match target {
+                AggTarget::Col(n) => {
+                    let d = col_desc(n)?;
+                    if is_approx_col(&d) {
+                        (NumRank::Long, 0, 0, true)
+                    } else {
+                        match d.dtype {
+                            dtype::SHORT | dtype::LONG => {
+                                (NumRank::Long, d.scale, d.sub_type, false)
+                            }
+                            dtype::INT64 => (NumRank::I64, d.scale, d.sub_type, false),
+                            dtype::INT128 => (NumRank::I128, d.scale, d.sub_type, false),
+                            _ => return None,
+                        }
+                    }
+                }
+                AggTarget::Expr(raw) => {
+                    let e = resolve_expr(raw, columns, descs)?;
+                    match e.type_of(descs)? {
+                        ExprType::Approx => (NumRank::Long, 0, 0, true),
+                        ExprType::Int => {
+                            (e.rank_of(descs).unwrap_or(NumRank::Long), 0, 0, false)
+                        }
+                        ExprType::Numeric => (
+                            e.rank_of(descs).unwrap_or(NumRank::Long),
+                            e.result_scale(descs)?,
+                            numeric_subtype(&e, descs) as i16,
+                            false,
+                        ),
+                        _ => return None,
+                    }
+                }
+                _ => return None,
+            };
+            if approx {
+                double_d()
+            } else {
+                let widen = match func {
+                    AggFn::Sum => rank >= NumRank::I64, // SUM widens one step
+                    _ => rank == NumRank::I128,         // AVG keeps width
+                };
+                if widen {
+                    Descriptor {
+                        dtype: dtype::INT128,
+                        scale,
+                        length: 16,
+                        sub_type: sub,
+                        flags: 0,
+                        offset: 1,
+                    }
+                } else {
+                    let mut d = int64(scale);
+                    d.sub_type = sub;
+                    d
+                }
+            }
+        }
+        // the statistical folds answer DOUBLE, over any numeric-ish
+        // operand (the bare arm's own gate)
+        AggFn::VarPop | AggFn::VarSamp | AggFn::StddevPop | AggFn::StddevSamp => {
+            if !operand_numericish(target)? {
+                return None;
+            }
+            double_d()
+        }
+        // the two-argument folds: both operands numeric-ish;
+        // REGR_COUNT is a BIGINT, the rest DOUBLE
+        AggFn::Corr
+        | AggFn::CovarPop
+        | AggFn::CovarSamp
+        | AggFn::RegrSlope
+        | AggFn::RegrIntercept
+        | AggFn::RegrCount
+        | AggFn::RegrR2
+        | AggFn::RegrAvgx
+        | AggFn::RegrAvgy
+        | AggFn::RegrSxx
+        | AggFn::RegrSyy
+        | AggFn::RegrSxy => {
+            let AggTarget::Pair(y, x) = target else { return None };
+            for raw in [y, x] {
+                if !numericish_expr(raw)? {
+                    return None;
+                }
+            }
+            if matches!(func, AggFn::RegrCount) {
+                int64(0)
+            } else {
+                double_d()
+            }
+        }
+        // PERCENTILE_CONT interpolates to DOUBLE; PERCENTILE_DISC picks
+        // an ordered VALUE and keeps its exact type - a column order
+        // keeps the column's own descriptor
+        AggFn::PercentileCont => {
+            if !operand_numericish(target)? {
+                return None;
+            }
+            double_d()
+        }
+        AggFn::PercentileDisc => match target {
+            AggTarget::Percentile { order: RawExpr::Col(n), .. } => synth(&col_desc(n)?),
+            _ => return None,
+        },
     })
+}
+
+/// The SYNTHETIC single-relation view of the GROUP ROW: each gitem
+/// slot is a column - aggregates under generated names
+/// ([agg_slot_name]) and grouped keys under their own - with the
+/// slot's descriptor. It is the same trick the join uses to run the
+/// ordinary expression resolver over a combined row; HAVING and ORDER
+/// BY expressions over aggregates resolve against the same view.
+fn synth_group_view(
+    gitems: &[GItem],
+    slot_descs: &[Option<Descriptor>],
+    columns: &[RelationColumn],
+    synth_base: usize,
+) -> (Vec<RelationColumn>, Vec<Descriptor>) {
+    let mut synth_cols: Vec<RelationColumn> = Vec::new();
+    let mut synth_descs: Vec<Descriptor> = Vec::new();
+    for (slot, gi) in gitems.iter().enumerate() {
+        let d = slot_descs.get(slot).cloned().flatten().unwrap_or(Descriptor {
+            dtype: 0,
+            scale: 0,
+            length: 0,
+            sub_type: 0,
+            flags: 0,
+            offset: 0,
+        });
+        if synth_descs.len() <= slot {
+            synth_descs.resize(slot + 1, d.clone());
+        }
+        synth_descs[slot] = d;
+        let nm = match gi {
+            GItem::Key(f) if *f < synth_base => columns
+                .iter()
+                .find(|c| c.field_id as usize == *f)
+                .map(|c| c.name.clone()),
+            GItem::Agg(..) => Some(agg_slot_name(slot)),
+            _ => None,
+        };
+        if let Some(nm) = nm {
+            synth_cols.push(RelationColumn {
+                name: nm,
+                field_id: slot as u16,
+                position: slot as u16,
+            });
+        }
+    }
+    (synth_cols, synth_descs)
 }
 
 /// The name an aggregate's group-row slot answers to while an expression
@@ -34611,6 +34983,51 @@ fn agg_slot_name(slot: usize) -> String {
 /// Does this expression contain an AGGREGATE anywhere?
 fn raw_has_agg(e: &RawExpr) -> bool {
     !collect_aggs(e).is_empty()
+}
+
+/// Is an expression OVER AGGREGATES described NOT NULLABLE - the
+/// engine's dsc propagation, measured: an expression is not-nullable
+/// when every value leaf is (a COUNT/REGR_COUNT/VAR/STDDEV/two-argument
+/// statistical fold, or a literal); a SUM/AVG/MIN/MAX/PERCENTILE leaf,
+/// a column, a parameter or an ELSE-less CASE keeps it nullable, and
+/// NULLIF can always answer NULL. Conditions do not count (measured:
+/// CASE WHEN VAR_POP(N) > 1 THEN 'hi' ELSE 'lo' END is not-nullable).
+fn raw_described_not_null(e: &RawExpr) -> bool {
+    match e {
+        RawExpr::Agg(f, _) => matches!(
+            f,
+            AggFn::Count
+                | AggFn::VarPop
+                | AggFn::VarSamp
+                | AggFn::StddevPop
+                | AggFn::StddevSamp
+        ) || f.is_statistical2(),
+        RawExpr::Int(_)
+        | RawExpr::Int128(_)
+        | RawExpr::Dec(..)
+        | RawExpr::Double(_)
+        | RawExpr::Str(_)
+        | RawExpr::Bool(_)
+        | RawExpr::DecFloat34(_)
+        | RawExpr::BareTrue => true,
+        RawExpr::Null => false,
+        RawExpr::Neg(a) | RawExpr::Cast(a, _) => raw_described_not_null(a),
+        RawExpr::Bin(a, _, b) | RawExpr::Concat(a, b) => {
+            raw_described_not_null(a) && raw_described_not_null(b)
+        }
+        RawExpr::NullIf(..) => false,
+        // ALL branches must be not-null (review-caught live:
+        // COALESCE(SUM(N), 0) describes Nullable on the engine - the
+        // dsc propagation is per-branch, not first-non-null)
+        RawExpr::Coalesce(v) => v.iter().all(raw_described_not_null),
+        RawExpr::Func(_, v) => v.iter().all(raw_described_not_null),
+        RawExpr::Iif(_, a, b) => raw_described_not_null(a) && raw_described_not_null(b),
+        RawExpr::Case(branches, else_) => {
+            else_.as_deref().is_some_and(raw_described_not_null)
+                && branches.iter().all(|(_, t)| raw_described_not_null(t))
+        }
+        _ => false,
+    }
 }
 
 /// Every AGGREGATE in an expression, in left-to-right order, with
@@ -34753,7 +35170,7 @@ fn build_group_items(
     // does on the plain path. The caller must have renumbered the
     // projection's params first.
     sink: &mut Vec<Option<Descriptor>>,
-) -> Option<(Vec<ProjCol>, Vec<GItem>)> {
+) -> Option<(Vec<ProjCol>, Vec<GItem>, Vec<Option<Descriptor>>)> {
     let mut gitems = Vec::new();
     let mut cols = Vec::new();
     // the descriptor each group-row slot holds, so a second pass can
@@ -34776,17 +35193,13 @@ fn build_group_items(
                 let aggs = collect_aggs(raw);
                 let (f, t) = aggs.first()?.clone();
                 let d = agg_result_desc(f, &t, columns, descs)?;
-                let src = match &t {
-                    AggTarget::Star => AggSrc::Star,
-                    AggTarget::Col(n) => {
-                        let rc = columns.iter().find(|c| c.name.eq_ignore_ascii_case(n))?;
-                        AggSrc::Field(rc.field_id as usize)
-                    }
-                    _ => return None,
-                };
+                let (src, distinct) = resolve_agg_src(&t, columns, descs)?;
+                if distinct && !matches!(f, AggFn::Count) {
+                    return None; // only COUNT(DISTINCT) is answered
+                }
                 // the item's OWN slot holds its first aggregate; any
                 // further ones are appended after the loop
-                gitems.push(GItem::Agg(f, src, false));
+                gitems.push(GItem::Agg(f, src, distinct));
                 slot_descs.push(Some(d));
                 deferred.push((out_idx, raw.clone(), name.clone()));
                 cols.push(ProjCol {
@@ -34928,117 +35341,8 @@ fn build_group_items(
                 slot_descs.push(descs.get(fid).cloned());
             }
             SelItem::Agg(func, target, agg_alias) => {
-                let (src, distinct) = match target {
-                    AggTarget::Star => (AggSrc::Star, false), // COUNT(*) - parse guarantees Count
-                    AggTarget::Col(name) | AggTarget::Distinct(name) => {
-                        let rc = columns.iter().find(|c| c.name.eq_ignore_ascii_case(name))?;
-                        let fid = rc.field_id as usize;
-                        // no record bytes to aggregate over
-                        if is_computed_fid(descs, fid) {
-                            return None;
-                        }
-                        (AggSrc::Field(fid), matches!(target, AggTarget::Distinct(_)))
-                    }
-                    AggTarget::DistinctExpr(raw) => {
-                        (AggSrc::Expr(resolve_expr(raw, columns, descs)?), true)
-                    }
-                    AggTarget::Expr(raw) => {
-                        (AggSrc::Expr(resolve_expr(raw, columns, descs)?), false)
-                    }
-                    AggTarget::Pair(y, x) => (
-                        AggSrc::Pair(
-                            resolve_expr(y, columns, descs)?,
-                            resolve_expr(x, columns, descs)?,
-                        ),
-                        false,
-                    ),
-                    AggTarget::Percentile { frac, order, desc } => (
-                        AggSrc::Percentile {
-                            frac: resolve_expr(frac, columns, descs)?,
-                            order: resolve_expr(order, columns, descs)?,
-                            desc: *desc,
-                        },
-                        false,
-                    ),
-                    AggTarget::List { arg, sep, distinct } => {
-                        // a plain BLOB column argument joins by CONTENT
-                        // (the engine's MOV_make_string2 reads the blob) -
-                        // it resolves to the content reader the blob CAST
-                        // uses, since a bare blob column has no expression
-                        // type of its own
-                        let a = match arg {
-                            RawExpr::Col(n) => {
-                                let rc = columns
-                                    .iter()
-                                    .find(|c| c.name.eq_ignore_ascii_case(n.trim_matches('"')))?;
-                                let fid = rc.field_id as usize;
-                                let d = descs.get(fid)?;
-                                if d.dtype == dtype::BLOB {
-                                    // a user sub_type has no filter to text
-                                    if !matches!(d.sub_type, 0 | 1) {
-                                        return None;
-                                    }
-                                    // DISTINCT over a blob column: the
-                                    // engine's distinct machinery keys the
-                                    // DESCRIPTOR - the blob id - so equal
-                                    // CONTENT never dedupes and the set
-                                    // comes out in id order; a content
-                                    // dedupe here would answer wrong, so
-                                    // refuse (review-caught)
-                                    if *distinct {
-                                        return None;
-                                    }
-                                    Expr::BlobText(fid)
-                                } else {
-                                    resolve_expr(arg, columns, descs)?
-                                }
-                            }
-                            _ => resolve_expr(arg, columns, descs)?,
-                        };
-                        // the engine's DISTINCT dedupes by the argument's
-                        // COLLATION key; fc's value_cmp is binary - a
-                        // non-binary-collated text argument would dedupe
-                        // (and order) WRONG, so it refuses instead
-                        // (review-caught; fc's collation-aware ordering
-                        // is a recorded server-wide boundary)
-                        if *distinct
-                            && expr_reads(&a, &|f| {
-                                descs.get(f).is_some_and(|d| {
-                                    matches!(d.dtype, dtype::TEXT | dtype::VARYING)
-                                        && (d.sub_type as u16) >> 8 != 0
-                                })
-                            })
-                        {
-                            return None;
-                        }
-                        let s = match sep {
-                            Some(r) => Some(resolve_expr(r, columns, descs)?),
-                            None => None,
-                        };
-                        // a CHAR column's value travels padded to its
-                        // declared CHARACTER count (measured: a UTF8
-                        // CHAR(4) holding 'Ж' contributes 'Ж   ' - 4
-                        // characters, 5 bytes - not its 16-byte slot) -
-                        // the pad width, in characters, for the fold
-                        let pad = match arg {
-                            RawExpr::Col(n) => columns
-                                .iter()
-                                .find(|c| c.name.eq_ignore_ascii_case(n.trim_matches('"')))
-                                .and_then(|c| descs.get(c.field_id as usize))
-                                .filter(|d| d.dtype == dtype::TEXT)
-                                .map(|d| {
-                                    let chars = d.length as usize
-                                        / fire_crab_ods::intl::bytes_per_char(
-                                            fire_crab_ods::intl::charset_id(d.sub_type),
-                                        )
-                                        .max(1) as usize;
-                                    (chars, d.length as usize)
-                                }),
-                            _ => None,
-                        };
-                        (AggSrc::List { arg: a, sep: s, distinct: *distinct, pad }, false)
-                    }
-                };
+                let (src, distinct) = resolve_agg_src(target, columns, descs)?;
+
                 if distinct && !matches!(func, AggFn::Count) {
                     return None; // only COUNT(DISTINCT) is answered
                 }
@@ -35335,56 +35639,18 @@ fn build_group_items(
                     *out_idx
                 } else {
                     let d = agg_result_desc(*f, t, columns, descs)?;
-                    let src = match t {
-                        AggTarget::Star => AggSrc::Star,
-                        AggTarget::Col(n) => {
-                            let rc = columns.iter().find(|c| c.name.eq_ignore_ascii_case(n))?;
-                            AggSrc::Field(rc.field_id as usize)
-                        }
-                        _ => return None,
-                    };
-                    gitems.push(GItem::Agg(*f, src, false));
+                    let (src, distinct) = resolve_agg_src(t, columns, descs)?;
+                    if distinct && !matches!(f, AggFn::Count) {
+                        return None;
+                    }
+                    gitems.push(GItem::Agg(*f, src, distinct));
                     slot_descs.push(Some(d));
                     gitems.len() - 1
                 };
                 names.push((*f, t.clone(), agg_slot_name(slot)));
             }
-            // a SYNTHETIC single-relation view of the GROUP ROW: each
-            // slot is a column, aggregates under generated names and
-            // grouped keys under their own. It is the same trick the
-            // join uses to run the ordinary expression resolver over a
-            // combined row.
-            let mut synth_cols: Vec<RelationColumn> = Vec::new();
-            let mut synth_descs: Vec<Descriptor> = Vec::new();
-            for (slot, gi) in gitems.iter().enumerate() {
-                let d = slot_descs.get(slot).cloned().flatten().unwrap_or(Descriptor {
-                    dtype: 0,
-                    scale: 0,
-                    length: 0,
-                    sub_type: 0,
-                    flags: 0,
-                    offset: 0,
-                });
-                if synth_descs.len() <= slot {
-                    synth_descs.resize(slot + 1, d.clone());
-                }
-                synth_descs[slot] = d;
-                let nm = match gi {
-                    GItem::Key(f) if *f < synth_base => columns
-                        .iter()
-                        .find(|c| c.field_id as usize == *f)
-                        .map(|c| c.name.clone()),
-                    GItem::Agg(..) => Some(agg_slot_name(slot)),
-                    _ => None,
-                };
-                if let Some(nm) = nm {
-                    synth_cols.push(RelationColumn {
-                        name: nm,
-                        field_id: slot as u16,
-                        position: slot as u16,
-                    });
-                }
-            }
+            let (synth_cols, synth_descs) =
+                synth_group_view(&gitems, &slot_descs, columns, synth_base);
             let subbed = substitute_aggs(raw, &|f: &AggFn, t: &AggTarget| {
                 names
                     .iter()
@@ -35395,15 +35661,29 @@ fn build_group_items(
             let col = cols.get_mut(*out_idx)?;
             col.name = pc.name;
             col.wire = pc.wire;
-            col.sql_type = pc.sql_type;
+            // the announced NULLABILITY propagates from the leaves, the
+            // engine's dsc rule (measured: STDDEV_SAMP(N)*2 and
+            // VAR_SAMP(N)+COUNT(*) describe NOT nullable - only the
+            // family's own flag survives the wrap - while SUM(N)*AVG(N)
+            // and PERCENTILE_CONT(...)*2 stay nullable)
+            col.sql_type = if raw_described_not_null(raw) {
+                pc.sql_type & !1
+            } else {
+                pc.sql_type
+            };
             col.length = pc.length;
+            // the OCTET length rides along - the attachment-charset
+            // describe scales text widths from it, and the stale Int64
+            // placeholder's 8 announced a CASE of CHAR(2) literals as
+            // len 8 (measured: the engine says TEXT len 2)
+            col.oct_length = pc.oct_length;
             col.scale = pc.scale;
             col.sub_type = pc.sub_type;
             // the VALUE is computed from the group row by this expression
             col.expr = Some(resolve_expr(&subbed, &synth_cols, &synth_descs)?);
         }
     }
-    Some((cols, gitems))
+    Some((cols, gitems, slot_descs))
 }
 
 
@@ -35452,7 +35732,7 @@ fn plan_group(
         None => (Vec::new(), Vec::new()),
         Some(g) => parse_group_by(g, items, columns, descs, synth_base)?,
     };
-    let (mut cols, mut gitems) =
+    let (mut cols, mut gitems, mut slot_descs) =
         build_group_items(items, columns, descs, &key_fids, &key_exprs, synth_base, params)?;
     // a PLAIN group key reads from the grouped relation (probed:
     // `SELECT B, COUNT(*) ... GROUP BY B` answers relation T on the
@@ -35479,7 +35759,18 @@ fn plan_group(
         Some(hs) => Some(
             tokenize(hs)
                 .and_then(|t| parse_predicate(&t, &mut having_np))
-                .and_then(|raw| resolve_having(raw, &mut gitems, &key_fids, columns, descs, params))?,
+                .and_then(|raw| {
+                    resolve_having(
+                        raw,
+                        &mut gitems,
+                        &mut slot_descs,
+                        synth_base,
+                        &key_fids,
+                        columns,
+                        descs,
+                        params,
+                    )
+                })?,
         ),
     };
     // ORDER BY sorts the OUTPUT rows: names resolve to output columns
@@ -35490,28 +35781,83 @@ fn plan_group(
     // sorts by the key, which the engine allows and which only looks
     // exotic until a VIEW does the renaming - `ORDER BY DID` over a view
     // whose DID is the base table's DEPT_ID becomes exactly this.
+    // ORDER BY over an AGGREGATE (or an expression of aggregates) -
+    // `ORDER BY SUM(N) DESC`, `ORDER BY STDDEV_SAMP(N)`, `ORDER BY
+    // VAR_POP(N) * 2` (all engine-served, measured): each aggregate
+    // folds into an appended hidden slot and the key becomes an
+    // EXPRESSION over the group row, evaluated by the sort exactly as
+    // a plain ORDER BY expression is over a record. RefCell because
+    // the resolver closure runs under parse_order_by's shared borrow.
+    let gitems_cell = std::cell::RefCell::new(&mut gitems);
+    let slot_descs_cell = std::cell::RefCell::new(&mut slot_descs);
     let order_by = match order_s {
         None => Vec::new(),
-        Some(os) => parse_order_by(os, &cols, &[], |n| {
-            if let Some(c) = cols.iter().find(|c| c.name.eq_ignore_ascii_case(n)) {
-                return Some(c.field_id);
-            }
-            // The key's own column name - for an output column the select
-            // list renamed, and for a key that has a group-row SLOT but
-            // no output column at all (an expression item over an
-            // aggregate makes such hidden slots). An order key indexes
-            // the GROUP ROW, so the answer is the slot's own index; the
-            // earlier form paired `cols` with `gitems`, which cannot
-            // reach a slot past the last output column.
-            gitems.iter().enumerate().find_map(|(slot, g)| match g {
-                GItem::Key(fid) => columns
-                    .iter()
-                    .find(|rc| rc.field_id as usize == *fid && rc.name.eq_ignore_ascii_case(n))
-                    .map(|_| slot),
-                _ => None,
-            })
-        })?,
+        Some(os) => parse_order_by_expr(
+            os,
+            &cols,
+            &[],
+            |n| {
+                if let Some(c) = cols.iter().find(|c| c.name.eq_ignore_ascii_case(n)) {
+                    // an EXPRESSION output (an aggregate expression's
+                    // item) has no field of its own - its field_id is
+                    // the FIRST aggregate's slot, and sorting by that
+                    // sorted `0 - SUM(N) AS X ORDER BY X` by the bare
+                    // SUM (review-caught live). None here lets the
+                    // caller's alias fallback take the column's OWN
+                    // expression as the key.
+                    if c.expr.is_some() {
+                        return None;
+                    }
+                    return Some(c.field_id);
+                }
+                // The key's own column name - for an output column the select
+                // list renamed, and for a key that has a group-row SLOT but
+                // no output column at all (an expression item over an
+                // aggregate makes such hidden slots). An order key indexes
+                // the GROUP ROW, so the answer is the slot's own index; the
+                // earlier form paired `cols` with `gitems`, which cannot
+                // reach a slot past the last output column.
+                gitems_cell.borrow().iter().enumerate().find_map(|(slot, g)| match g {
+                    GItem::Key(fid) => columns
+                        .iter()
+                        .find(|rc| rc.field_id as usize == *fid && rc.name.eq_ignore_ascii_case(n))
+                        .map(|_| slot),
+                    _ => None,
+                })
+            },
+            |text| {
+                let raw = parse_raw_expr_any(text)?;
+                if !raw_has_agg(&raw) {
+                    return None; // non-aggregate order expressions keep refusing here
+                }
+                let mut gitems = gitems_cell.borrow_mut();
+                let mut slot_descs = slot_descs_cell.borrow_mut();
+                let aggs = collect_aggs(&raw);
+                let mut names: Vec<(AggFn, AggTarget, String)> = Vec::new();
+                for (f, t) in &aggs {
+                    let d = agg_result_desc(*f, t, columns, descs)?;
+                    let (src, distinct) = resolve_agg_src(t, columns, descs)?;
+                    if distinct && !matches!(f, AggFn::Count) {
+                        return None;
+                    }
+                    gitems.push(GItem::Agg(*f, src, distinct));
+                    slot_descs.push(Some(d));
+                    names.push((*f, t.clone(), agg_slot_name(gitems.len() - 1)));
+                }
+                let subbed = substitute_aggs(&raw, &|f: &AggFn, t: &AggTarget| {
+                    names
+                        .iter()
+                        .find(|(nf, nt, _)| nf == f && nt == t)
+                        .map(|(_, _, n)| n.clone())
+                })?;
+                let (synth_cols, synth_descs) =
+                    synth_group_view(&gitems, &slot_descs, columns, synth_base);
+                resolve_expr(&subbed, &synth_cols, &synth_descs)
+            },
+        )?,
     };
+    drop(gitems_cell);
+    drop(slot_descs_cell);
     Some(Plan::Group {
         rel,
         formats,
@@ -37664,10 +38010,15 @@ fn value_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
         // rendered-text fallback below and `DP > 1` compared "1.5"
         // against "1" as strings.
         _ if approx_of(a).is_some() || approx_of(b).is_some() => {
+            // exact_to_f64 DIVIDES for a scaled value - the engine's
+            // CVT_get_double, one correctly-rounded step. The multiply
+            // form here silently picked the WRONG ROWS (review-caught
+            // live: `WHERE N = 35.8e0` over NUMERIC(9,2) answered 0 -
+            // 3580 * 0.01 is 35.800000000000004, off the literal's
+            // 35.8; the divide lands exactly on it, as the engine does)
             let f = |v: &Value| {
-                approx_of(v).or_else(|| {
-                    numeric_parts(v).map(|(raw, sc)| raw as f64 * 10f64.powi(sc as i32))
-                })
+                approx_of(v)
+                    .or_else(|| numeric_parts(v).map(|(raw, sc)| exact_to_f64(raw, sc as i32)))
             };
             match (f(a), f(b)) {
                 (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(Equal),
@@ -38057,7 +38408,7 @@ fn plan_win_item(
                 }
             }
             let mut sink: Vec<Option<Descriptor>> = Vec::new();
-            let (wc, wg) = build_group_items(
+            let (wc, wg, _wd) = build_group_items(
                 std::slice::from_ref(&SelItem::Agg(
                     *f,
                     target.clone(),
@@ -39124,7 +39475,10 @@ fn compute_group(rows: &[Vec<Value>], gitems: &[GItem]) -> Result<Vec<Value>, Ev
                                 // one source, one scale - the first pins it
                                 scale.get_or_insert(sc);
                                 sum = sum.saturating_add(raw);
-                                fsum += raw as f64 * 10f64.powi(sc as i32);
+                                // divide-not-multiply (exact_to_f64):
+                                // the mixed-approx fold's f64 leg takes
+                                // the engine's CVT conversion
+                                fsum += exact_to_f64(raw, sc as i32);
                                 n += 1;
                             }
                             (v, None) if approx_of(v).is_some() => {
@@ -39160,15 +39514,25 @@ fn compute_group(rows: &[Vec<Value>], gitems: &[GItem]) -> Result<Vec<Value>, Ev
                     // The naive sum-of-squares fold the engine uses, in
                     // f64: n, Sx, Sxx over the non-null values, then
                     // Sxx - Sx*Sx/n divided by n (population) or n-1
-                    // (sample). Never NULL - an empty/single/all-NULL group
-                    // is 0 (n==0 pop, n<=1 sample yield 0 rather than a
-                    // divide by zero); STDDEV is the square root, clamped
-                    // at 0 so f64 cancellation cannot sqrt a tiny negative.
+                    // (sample). The VALUE is NULL over an empty/all-NULL
+                    // group, and for the SAMPLE forms over a single row
+                    // (the engine's own: the fold is DESCRIBED not-null,
+                    // so isql renders that NULL as 0.000... - which is
+                    // why the old never-NULL 0.0 here matched every bare
+                    // gate while COALESCE(VAR_SAMP(...), -1) exposed it,
+                    // measured live: the engine answers -1). STDDEV is
+                    // the square root, clamped at 0 so f64 cancellation
+                    // cannot sqrt a tiny negative.
                     let (mut n, mut sx, mut sxx) = (0i64, 0f64, 0f64);
                     for r in rows {
                         let v = src_value(src, r)?;
+                        // exact_to_f64 DIVIDES by the positive power for
+                        // a scaled value - one correctly-rounded step,
+                        // the engine's CVT_get_double (review-caught:
+                        // the multiply form drifted the last digit of
+                        // VAR_SAMP over NUMERIC sources)
                         let x = match numeric_parts(&v) {
-                            Some((raw, sc)) => raw as f64 * 10f64.powi(sc as i32),
+                            Some((raw, sc)) => exact_to_f64(raw, sc as i32),
                             None => match approx_of(&v) {
                                 Some(fx) => fx,
                                 None => continue, // NULL / non-numeric: skip
@@ -39178,19 +39542,21 @@ fn compute_group(rows: &[Vec<Value>], gitems: &[GItem]) -> Result<Vec<Value>, Ev
                         sx += x;
                         sxx += x * x;
                     }
-                    let ssd = if n == 0 { 0.0 } else { sxx - sx * sx / n as f64 };
-                    let var = match func {
-                        AggFn::VarPop | AggFn::StddevPop => {
-                            if n == 0 { 0.0 } else { ssd / n as f64 }
-                        }
-                        _ => {
-                            if n <= 1 { 0.0 } else { ssd / (n - 1) as f64 }
-                        }
-                    };
-                    Value::Double(match func {
-                        AggFn::VarPop | AggFn::VarSamp => var,
-                        _ => var.max(0.0).sqrt(),
-                    })
+                    let sample = matches!(func, AggFn::VarSamp | AggFn::StddevSamp);
+                    if n == 0 || (sample && n < 2) {
+                        Value::Null
+                    } else {
+                        let ssd = sxx - sx * sx / n as f64;
+                        let var = if sample {
+                            ssd / (n - 1) as f64
+                        } else {
+                            ssd / n as f64
+                        };
+                        Value::Double(match func {
+                            AggFn::VarPop | AggFn::VarSamp => var,
+                            _ => var.max(0.0).sqrt(),
+                        })
+                    }
                 }
                 // the two-argument CORR / COVAR / REGR folds: n + the five
                 // paired sums over the rows where BOTH operands are non-null,
@@ -44960,7 +45326,53 @@ fn expr_atom(b: &[char], pos: &mut usize) -> Option<RawExpr> {
                         _ => {}
                     }
                 }
-                let end = end?;
+                let mut end = end?;
+                // an ordered-set aggregate's `WITHIN GROUP (ORDER BY
+                // ...)` tail sits OUTSIDE the parens - swallow it into
+                // the span so `PERCENTILE_CONT(0.5) WITHIN GROUP
+                // (ORDER BY N) * 2` parses as an expression leaf (the
+                // engine serves it, measured)
+                {
+                    let mut j = end + 1;
+                    while b.get(j).is_some_and(|c| c.is_ascii_whitespace()) {
+                        j += 1;
+                    }
+                    let word_at = |at: usize, w: &str| -> bool {
+                        w.chars().enumerate().all(|(k, wc)| {
+                            b.get(at + k).is_some_and(|c| c.eq_ignore_ascii_case(&wc))
+                        })
+                    };
+                    if word_at(j, "WITHIN") {
+                        let mut m = j + 6;
+                        while b.get(m).is_some_and(|c| c.is_ascii_whitespace()) {
+                            m += 1;
+                        }
+                        if word_at(m, "GROUP") {
+                            m += 5;
+                            while b.get(m).is_some_and(|c| c.is_ascii_whitespace()) {
+                                m += 1;
+                            }
+                            if b.get(m) == Some(&'(') {
+                                let mut d = 0i32;
+                                let mut k = m;
+                                while k < b.len() {
+                                    match b[k] {
+                                        '(' => d += 1,
+                                        ')' => {
+                                            d -= 1;
+                                            if d == 0 {
+                                                end = k;
+                                                break;
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                    k += 1;
+                                }
+                            }
+                        }
+                    }
+                }
                 let text: String = b[open..=end].iter().collect();
                 let (func, target) = parse_agg_item(&format!("{}{}", word, text))?;
                 *pos = end + 1;
@@ -46723,6 +47135,7 @@ fn conditional_type<'a>(
     let mut temporal: Option<TKind> = None;
     let mut any_other = false;
     let mut any_approx = false;
+    let mut any_bool = false;
     // an explicit NULL branch is TRANSPARENT - it takes whatever type
     // the other branches carry (the engine's rule; a bare Expr::Null
     // types Int and used to poison a temporal/text mix - a `CASE ...
@@ -46747,10 +47160,11 @@ fn conditional_type<'a>(
             ExprType::Numeric => any_numeric = true,
             ExprType::Text => any_text = true,
             ExprType::Int => any_other = true,
-            // an approximate or boolean branch does not share a describe
-            // with any other family - refuse the mix
             ExprType::Approx => any_approx = true,
-            ExprType::Bool => any_approx = true,
+            // a boolean branch does not share a describe with any other
+            // family - the bool flag rides the approx one below but is
+            // tested FIRST, keeping the strict refusal
+            ExprType::Bool => any_bool = true,
             ExprType::Temporal(k) => match temporal {
                 None => temporal = Some(k),
                 // two different temporal kinds cannot share a describe
@@ -46768,12 +47182,18 @@ fn conditional_type<'a>(
             first
         };
     }
-    if any_approx {
-        return if any_numeric || any_text || any_other {
+    if any_bool {
+        return if any_numeric || any_text || any_other || any_approx {
             None
         } else {
             first
         };
+    }
+    if any_approx {
+        // an approximate branch UNIFIES with the exact-numeric families
+        // - the engine describes the mix DOUBLE (measured:
+        // COALESCE(VAR_SAMP(N), 0) is 480) - but never with text
+        return if any_text { None } else { Some(ExprType::Approx) };
     }
     if any_numeric && !any_text {
         return Some(ExprType::Numeric);
@@ -54106,8 +54526,11 @@ fn tokenize(s: &str) -> Option<Vec<Tok>> {
                 let word = &s[start..i];
                 let upper = word.to_ascii_uppercase();
                 // an aggregate name followed by `(...)` lexes as one
-                // aggregate-call token (spacing-tolerant, no nesting)
-                if matches!(upper.as_str(), "COUNT" | "MIN" | "MAX" | "SUM" | "AVG") {
+                // aggregate-call token (spacing-tolerant, no nesting) -
+                // the WHOLE family ([agg_named]), so a HAVING over
+                // VAR_SAMP/CORR/PERCENTILE parses; a WHERE keeps
+                // refusing downstream, as it did for SUM
+                if agg_named(&upper) {
                     let mut j = i;
                     while j < b.len() && b[j].is_ascii_whitespace() {
                         j += 1;
@@ -54121,6 +54544,8 @@ fn tokenize(s: &str) -> Option<Vec<Tok>> {
                         // slice through the FILTER's close paren so
                         // parse_agg_item does the FILTER -> CASE rewrite,
                         // exactly as a filtered select-list aggregate does.
+                        // A PERCENTILE's `WITHIN GROUP (ORDER BY ...)`
+                        // tail extends the slice the same way.
                         let mut hi = close;
                         let mut k = close + 1;
                         while k < b.len() && b[k].is_ascii_whitespace() {
@@ -54128,6 +54553,23 @@ fn tokenize(s: &str) -> Option<Vec<Tok>> {
                         }
                         if s[k..].get(..6).is_some_and(|w| w.eq_ignore_ascii_case("FILTER")) {
                             let mut m = k + 6;
+                            while m < b.len() && b[m].is_ascii_whitespace() {
+                                m += 1;
+                            }
+                            if m >= b.len() || b[m] != b'(' {
+                                return None;
+                            }
+                            hi = matching_paren(b, m)?;
+                        } else if s[k..].get(..6).is_some_and(|w| w.eq_ignore_ascii_case("WITHIN"))
+                        {
+                            let mut m = k + 6;
+                            while m < b.len() && b[m].is_ascii_whitespace() {
+                                m += 1;
+                            }
+                            if !s[m..].get(..5).is_some_and(|w| w.eq_ignore_ascii_case("GROUP")) {
+                                return None;
+                            }
+                            m += 5;
                             while m < b.len() && b[m].is_ascii_whitespace() {
                                 m += 1;
                             }
@@ -54618,6 +55060,12 @@ fn texpr_atom(t: &[Tok], pos: &mut usize) -> Option<RawExpr> {
         Tok::Null => RawExpr::Null,
         Tok::Ident(c) => RawExpr::Col(c.clone()),
         Tok::FnExpr(e) => e.clone(),
+        // an aggregate call inside an ARITHMETIC side - `HAVING
+        // SUM(N) * 2 > 10`, `HAVING STDDEV_POP(N) * 2 > 3` (both
+        // engine-served, measured): the leaf the group planner later
+        // rewrites to its slot. A WHERE carrying one still refuses at
+        // resolution, exactly as the bare aggregate does.
+        Tok::Agg(f, target) => RawExpr::Agg(*f, Box::new(target.clone())),
         Tok::LParen => {
             *pos += 1;
             let inner = texpr(t, pos)?;
@@ -54938,7 +55386,15 @@ fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
         }
     }
     let lhs = match t.get(*pos)? {
-        Tok::Agg(f, target) => {
+        // a LONE aggregate keeps the classic slot-compare path; one
+        // followed by an operator is the head of an EXPRESSION side
+        // (`HAVING SUM(N) * 2 > 10`) and parses as texpr's Agg leaf
+        Tok::Agg(f, target)
+            if !matches!(
+                t.get(*pos + 1),
+                Some(Tok::Plus | Tok::Minus | Tok::Star | Tok::Slash | Tok::Concat)
+            ) =>
+        {
             let l = RawLhs::Agg(*f, target.clone());
             *pos += 1;
             l
@@ -61456,6 +61912,10 @@ fn param_or_typed_term(
 fn resolve_having(
     raw: (Vec<Vec<RawTerm>>, Vec<Vec<u32>>),
     gitems: &mut Vec<GItem>,
+    // parallel to gitems - every fold appended here pushes its result
+    // descriptor too, so the synthetic group-row view stays typed
+    slot_descs: &mut Vec<Option<Descriptor>>,
+    synth_base: usize,
     key_fids: &[usize],
     columns: &[RelationColumn],
     descs: &[Descriptor],
@@ -61473,8 +61933,41 @@ fn resolve_having(
                 terms.push(Term::Const(b));
                 continue;
             }
+            // an EXPRESSION OVER AGGREGATES as the tested side - `HAVING
+            // SUM(N) * 2 > 10`, `HAVING STDDEV_POP(N) * 2 > 3` (both
+            // engine-served, measured): each aggregate folds into an
+            // appended slot and the comparison resolves as an ordinary
+            // expression term over the synthetic group-row view, exactly
+            // as a select-list expression over aggregates evaluates
+            if let RawLhs::Expr(raw_e) = &rt.lhs {
+                if raw_has_agg(raw_e) {
+                    let aggs = collect_aggs(raw_e);
+                    let mut names: Vec<(AggFn, AggTarget, String)> = Vec::new();
+                    for (f, t) in &aggs {
+                        let d = agg_result_desc(*f, t, columns, descs)?;
+                        let (src, distinct) = resolve_agg_src(t, columns, descs)?;
+                        if distinct && !matches!(f, AggFn::Count) {
+                            return None;
+                        }
+                        gitems.push(GItem::Agg(*f, src, distinct));
+                        slot_descs.push(Some(d));
+                        names.push((*f, t.clone(), agg_slot_name(gitems.len() - 1)));
+                    }
+                    let subbed = substitute_aggs(raw_e, &|f: &AggFn, t: &AggTarget| {
+                        names
+                            .iter()
+                            .find(|(nf, nt, _)| nf == f && nt == t)
+                            .map(|(_, _, n)| n.clone())
+                    })?;
+                    let (synth_cols, synth_descs) =
+                        synth_group_view(gitems, slot_descs, columns, synth_base);
+                    let rt2 = RawTerm { lhs: RawLhs::Expr(subbed), kind: rt.kind.clone() };
+                    terms.push(resolve_expr_term(&rt2, &synth_cols, &synth_descs, params)?);
+                    continue;
+                }
+            }
             let (idx, kind, pdesc): (usize, ColKind, Option<Descriptor>) = match &rt.lhs {
-                // a function call in HAVING is a later slice - refuse
+                // a function call (no aggregate) in HAVING - a later slice
                 RawLhs::Expr(_) => return None,
                 // a `?` as the tested side of a HAVING: unprobed - refuse
                 RawLhs::Param(_) => return None,
@@ -61491,17 +61984,12 @@ fn resolve_having(
                         .position(|gi| matches!(gi, GItem::Key(f) if *f == fid))
                         .unwrap_or_else(|| {
                             gitems.push(GItem::Key(fid));
+                            slot_descs.push(descs.get(fid).cloned());
                             gitems.len() - 1
                         });
                     (idx, kind, Some(pdesc))
                 }
                 RawLhs::Agg(func, target) => {
-                    // the statistical folds are not answered in a HAVING
-                    // comparison (their DOUBLE fold has no integer/text
-                    // compare kind) - refuse, the engine's own path
-                    if func.is_statistical() {
-                        return None;
-                    }
                     // the aggregate's OUTPUT descriptor is what a `?` on
                     // the compared side describes as - INT64 for COUNT and
                     // integer/numeric folds (INT128 past precision 18),
@@ -61523,11 +62011,61 @@ fn resolve_having(
                         Numeric,
                         Text,
                     }
-                    let (fid, src_expr, hkind, distinct) = match target {
-                        AggTarget::Pair(..)
-                        | AggTarget::Percentile { .. }
-                        | AggTarget::List { .. } => return None,
-                        AggTarget::Star => (None, None, HKind::Int, false),
+                    // the statistical family folds DOUBLE whatever its
+                    // source kind (an INT column's VAR_SAMP is still a
+                    // double) - its comparisons always take the numeric
+                    // alignment; REGR_COUNT is the BIGINT exception
+                    let family_kind = if func.is_statistical()
+                        || func.is_statistical2()
+                        || matches!(func, AggFn::PercentileCont)
+                    {
+                        Some(if matches!(func, AggFn::RegrCount) {
+                            HKind::Int
+                        } else {
+                            HKind::Numeric
+                        })
+                    } else {
+                        None
+                    };
+                    let (fid, src_expr, pre_src, hkind, distinct) = match target {
+                        // the two-argument and ordered-set folds carry
+                        // their own source shapes - resolve and append.
+                        // agg_result_desc's operand gates run FIRST
+                        // (review-caught: a text CORR operand fed the
+                        // numeric fold silently, and a text
+                        // PERCENTILE_CONT answered zero rows where the
+                        // engine refuses at prepare)
+                        AggTarget::Pair(..) | AggTarget::Percentile { .. } => {
+                            let d = agg_result_desc(*func, target, columns, descs)?;
+                            let (src, _) = resolve_agg_src(target, columns, descs)?;
+                            let hk = match family_kind {
+                                Some(k) => k,
+                                // PERCENTILE_DISC keeps the order VALUE's
+                                // own type - a text order compares as
+                                // text (engine-served, measured:
+                                // `... WITHIN GROUP (ORDER BY S) = 'ann'`
+                                // answers rows)
+                                None => {
+                                    if matches!(col_kind(&d), Some(ColKind::Text)) {
+                                        HKind::Text
+                                    } else if matches!(col_kind(&d), Some(ColKind::Int))
+                                        && d.scale == 0
+                                        && d.sub_type == 0
+                                    {
+                                        HKind::Int
+                                    } else if is_numeric_col(&d) || is_approx_col(&d)
+                                        || matches!(col_kind(&d), Some(ColKind::Int))
+                                    {
+                                        HKind::Numeric
+                                    } else {
+                                        return None;
+                                    }
+                                }
+                            };
+                            (None, None, Some(src), hk, false)
+                        }
+                        AggTarget::List { .. } => return None,
+                        AggTarget::Star => (None, None, None, HKind::Int, false),
                         AggTarget::Col(name) | AggTarget::Distinct(name) => {
                             let rc =
                                 columns.iter().find(|c| c.name.eq_ignore_ascii_case(name))?;
@@ -61552,7 +62090,13 @@ fn resolve_having(
                             } else {
                                 return None;
                             };
-                            (Some(fid), None, hk, matches!(target, AggTarget::Distinct(_)))
+                            (
+                                Some(fid),
+                                None,
+                                None,
+                                family_kind.unwrap_or(hk),
+                                matches!(target, AggTarget::Distinct(_)),
+                            )
                         }
                         // an EXPRESSION aggregate: resolve it, type it,
                         // and fold it as a HIDDEN output item
@@ -61572,7 +62116,7 @@ fn resolve_having(
                                     _ => return None,
                                 }
                             };
-                            (None, Some(e), hk, false)
+                            (None, Some(e), None, family_kind.unwrap_or(hk), false)
                         }
                         // COUNT(DISTINCT <expr>) in HAVING - COUNT-only, so
                         // its comparison kind is always integer
@@ -61581,13 +62125,18 @@ fn resolve_having(
                                 return None;
                             }
                             let e = resolve_expr(raw, columns, descs)?;
-                            (None, Some(e), HKind::Int, true)
+                            (None, Some(e), None, HKind::Int, true)
                         }
                     };
                     if distinct && !matches!(func, AggFn::Count) {
                         return None;
                     }
-                    let idx = match (&src_expr, fid) {
+                    let idx = if let Some(src) = pre_src {
+                        gitems.push(GItem::Agg(*func, src, false));
+                        slot_descs.push(agg_result_desc(*func, target, columns, descs));
+                        gitems.len() - 1
+                    } else {
+                        match (&src_expr, fid) {
                         // field/star aggregates dedup against existing
                         // output items; expression ones always append
                         // (structural identity is not tracked past
@@ -61609,6 +62158,7 @@ fn resolve_having(
                                     None => AggSrc::Star,
                                 };
                                 gitems.push(GItem::Agg(*func, src, distinct));
+                                slot_descs.push(agg_result_desc(*func, target, columns, descs));
                                 gitems.len() - 1
                             }),
                         (Some(_), _) => {
@@ -61617,7 +62167,9 @@ fn resolve_having(
                                 AggSrc::Expr(src_expr.clone()?),
                                 distinct,
                             ));
+                            slot_descs.push(agg_result_desc(*func, target, columns, descs));
                             gitems.len() - 1
+                        }
                         }
                     };
                     // numeric aggregates compare through the exact
@@ -70510,7 +71062,7 @@ mod tests {
         // COUNT(*) resolves to the EXISTING item 1; SUM(SALARY) and the
         // grouped key DEPT_ID... COUNT(*) again must not duplicate
         let raw = parse_predicate(&tokenize("COUNT(*) > 3 AND SUM(SALARY) > 100 OR DEPT_ID IS NULL").unwrap(), &mut 0).unwrap();
-        let p = resolve_having(raw, &mut gitems, &key_fids, &columns, &descs, &mut Vec::new()).unwrap();
+        let p = { let gl = gitems.len(); resolve_having(raw, &mut gitems, &mut vec![None; gl], 100, &key_fids, &columns, &descs, &mut Vec::new()) }.unwrap();
         assert_eq!(gitems.len(), 3); // one hidden item appended: SUM(SALARY)
         assert!(matches!(gitems[2], GItem::Agg(AggFn::Sum, AggSrc::Field(5), false)));
         // output rows: [key, count, hidden sum]
@@ -70519,11 +71071,11 @@ mod tests {
         assert!(p.matches(&[Value::Null, Value::Int(1), Value::Null]).unwrap()); // the OR arm
         // a non-grouped column in HAVING is invalid
         let raw = parse_predicate(&tokenize("SALARY > 1").unwrap(), &mut 0).unwrap();
-        assert!(resolve_having(raw, &mut gitems, &key_fids, &columns, &descs, &mut Vec::new()).is_none());
+        assert!({ let gl = gitems.len(); resolve_having(raw, &mut gitems, &mut vec![None; gl], 100, &key_fids, &columns, &descs, &mut Vec::new()) }.is_none());
         // MIN over a text column resolves now (a hidden text item) -
         // and its comparison is the pad-trimming text compare
         let raw = parse_predicate(&tokenize("MIN(NAME) = 'ann'").unwrap(), &mut 0).unwrap();
-        let p = resolve_having(raw, &mut gitems, &key_fids, &columns, &descs, &mut Vec::new()).unwrap();
+        let p = { let gl = gitems.len(); resolve_having(raw, &mut gitems, &mut vec![None; gl], 100, &key_fids, &columns, &descs, &mut Vec::new()) }.unwrap();
         assert_eq!(gitems.len(), 4);
         assert!(matches!(gitems[3], GItem::Agg(AggFn::Min, AggSrc::Field(1), false)));
         assert!(p.matches(&[Value::Null, Value::Null, Value::Null, Value::Text("ann  ".into())]).unwrap());
@@ -70534,13 +71086,13 @@ mod tests {
         // table); a convertible one compares exactly (probed:
         // `HAVING SUM(N92) = '0.5'` answers the 0.50 group)
         let raw = parse_predicate(&tokenize("COUNT(*) = 'x'").unwrap(), &mut 0).unwrap();
-        let p = resolve_having(raw, &mut gitems, &key_fids, &columns, &descs, &mut Vec::new()).unwrap();
+        let p = { let gl = gitems.len(); resolve_having(raw, &mut gitems, &mut vec![None; gl], 100, &key_fids, &columns, &descs, &mut Vec::new()) }.unwrap();
         assert_eq!(
             p.matches(&[Value::Int(1), Value::Int(4)]),
             Err(EvalErr::ConversionError(Some("x".into())))
         );
         let raw = parse_predicate(&tokenize("SUM(SALARY) = '200'").unwrap(), &mut 0).unwrap();
-        let p = resolve_having(raw, &mut gitems, &key_fids, &columns, &descs, &mut Vec::new()).unwrap();
+        let p = { let gl = gitems.len(); resolve_having(raw, &mut gitems, &mut vec![None; gl], 100, &key_fids, &columns, &descs, &mut Vec::new()) }.unwrap();
         assert!(p.matches(&[Value::Int(1), Value::Int(4), Value::Int(200)]).unwrap());
         // ...and WHERE resolution rejects aggregates outright
         let raw = parse_predicate(&tokenize("COUNT(*) > 3").unwrap(), &mut 0).unwrap();
@@ -75205,6 +75757,22 @@ mod tests {
         let sql = "CREATE TRIGGER TH FOR T1 BEFORE INSERT POSITION 4 AS DECLARE VARIABLE S SMALLINT; BEGIN S = 3; END";
         let (blr, _) = compile(sql, &[v("S", 7, 53)]);
         assert_eq!(blr, hex("05020300000700012D1A00001100020201150800030000001A0000FFFFFF4C"));
+    }
+
+    #[test]
+    fn var_stddev_fold_null_semantics() {
+        use fire_crab_ods::format::Value;
+        let one_row = vec![vec![Value::Int(5)]];
+        let empty: Vec<Vec<Value>> = Vec::new();
+        let gi = |f: AggFn| vec![GItem::Agg(f, AggSrc::Field(0), false)];
+        // engine-measured: VAR_SAMP/STDDEV_SAMP of a single row = NULL,
+        // VAR_POP/STDDEV_POP of a single row = 0.0; ALL are NULL over
+        // an empty group (COALESCE exposes it; bare renders 0.000...)
+        assert!(matches!(compute_group(&one_row, &gi(AggFn::VarSamp)).unwrap()[0], Value::Null));
+        assert!(matches!(compute_group(&one_row, &gi(AggFn::StddevSamp)).unwrap()[0], Value::Null));
+        assert!(matches!(compute_group(&one_row, &gi(AggFn::VarPop)).unwrap()[0], Value::Double(v) if v == 0.0));
+        assert!(matches!(compute_group(&empty, &gi(AggFn::VarSamp)).unwrap()[0], Value::Null));
+        assert!(matches!(compute_group(&empty, &gi(AggFn::VarPop)).unwrap()[0], Value::Null));
     }
 
     /// Engine-DUMPED golden bytes: a DOMAIN CHECK compiles to the bare
