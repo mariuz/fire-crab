@@ -244,7 +244,72 @@ DDL was.
 
 ### F. DML and PSQL gaps
 
-**Scaled arithmetic in the exe BLR interpreter DONE (2026-08-23,
+**DOMAIN CHECK constraints DONE (2026-08-25,
+`serve-real-domaincheck` 6):** the silent-wrong class closed — fc used
+to WRITE rows the engine refuses (RDB$VALIDATION_* had no consumer).
+Three legs. (1) ENFORCEMENT: `domain_check_predicates` joins each
+column's RDB$FIELD_SOURCE to RDB$FIELDS.RDB$VALIDATION_SOURCE and
+re-parses `NOT (<cond>)` through the WHERE machinery with the `VALUE`
+token text-substituted by the bare column name — so engine-built
+BETWEEN/IN/LIKE/function checks all enforce; `validate_row_fields`
+runs at INSERT and UPDATE on the FINAL row image in the engine's
+measured order (table CHECK triggers first, then per-field in FIELD
+order, domain check then NOT NULL — one walk, earliest field wins),
+over EVERY validated column (an UPDATE re-validates untouched
+columns; measured). Violations are byte-exact `isc_not_valid` 23000
+(`validation error for column "S"."T"."C", value "v"`): NULL renders
+`*** null ***`, text raw, scaled with its scale, DATE ISO — and
+TIMESTAMP in the LEGACY `07-JUN-2019 8:09:10.5000` form (measured;
+unlike every other render). FALSE fails, UNKNOWN passes. (2) CREATE
+DOMAIN ... CHECK compiles the engine's stored form — the bare
+POSITIVE boolean `blr_version5 <cond> blr_eoc`, `VALUE` = `blr_fid
+0,0,0` (new `Expr::DomainValue`), a written NOT normalized into
+inverted comparisons (`Cond::normalized`), IS NOT NULL keeping
+`blr_not blr_missing` — dump-pinned in
+`domain_checks_compile_to_engine_validation_blr`; source verbatim;
+the ENGINE enforces fc-written checks (via the RSR 7 runtime segment
+create_table already emits). (3) ALTER DOMAIN ADD [CONSTRAINT] CHECK
+/ DROP CONSTRAINT: compile-at-execute (the domain's type read off the
+live file), the second ADD refuses with the engine's three-item
+vector (`ALTER DOMAIN @1 failed` 336397278 + dyn 160 336068768, the
+message text carrying its own quotes), DROP nulls both columns
+(no-op when none), no re-scan of existing rows, and
+`update_relation_runtime` for every table using the domain so the
+engine picks the change up. Boundaries: fc's DDL compile surface is
+the table-CHECK surface (int + NONE-charset text comparisons,
+AND/OR/NOT/IS NULL) — anything wider refuses the WHOLE statement
+(never a domain without its rule) where the engine creates;
+CAST(x AS domain) and PSQL vars over checked domains keep refusing
+(engine: 42000 `validation error for CAST/variable`); a repeated
+ALTER cycle can hit the pre-existing catalog page-full refusal — fc
+writes catalog versions UNPACKED (no SQZ run-length writer yet),
+so a patched RDB$FIELDS row blows out its RLE'd size. A SQZ writer
+is now a recorded candidate (it would shrink every fc-written row).
+The 13-agent adversarial review caught 8 real defects, all fixed and
+live-verified: two CRITICAL silent-wrongs — a case-blind
+RDB$FIELD_SOURCE join bound the WRONG domain's check when `"dm2"`
+and `DM2` coexist (fixed EXACT in domain checks, `not_null_fids` and
+both domain-default joins — the same latent class), and the engine's
+LOSSY source transliteration (`'né'` stored as `'n??'` while the
+BLR keeps the real bytes) made fc enforce a wrong rule (a `?` inside
+a string literal of a stored check source now refuses that table's
+DML); a standalone TIME message renders PADDED (`08:09:10.5000` —
+only TIMESTAMP is legacy-unpadded); `CHECK (...) DEFAULT` clause
+order refuses (engine -104s it; `CHECK (...) NOT NULL` is legal both
+sides); a multibyte byte-boundary panic in the CHECK splitter; a
+SOURCE-without-BLR row is now SKIPPED (the engine enforces only from
+the BLR's runtime segment); the duplicate-constraint test moved
+BEFORE the new check's compile (an out-of-surface second ADD gets
+the engine vector); and — pre-existing, review-surfaced — `ALTER
+TABLE ADD <col> <domain>` used to write the UNRESOLVED zero-typed
+column under a fresh carrier (length-0 garbage the engine chokes
+on): it now resolves the domain like create_table, points
+RDB$FIELD_SOURCE at it, mints no carrier, and the engine enforces
+the domain's check on the added column (NOT NULL domains refuse —
+the re-scan story is unproven). Two review findings stand as
+designed fail-safes: one unevaluatable domain check refuses ALL DML
+on tables using it (the table-check law), and fc's refusal SHAPES
+for out-of-surface DDL stay generic.
 `serve-real-scaledarith` 6):** `+`/`-`/`*`/`/`/unary-minus over
 `Value::Scaled`/`Int128` with Firebird's scale rules (mirror of the wire
 server's `numeric_bin`), and an assignment coerces its source to the
@@ -294,10 +359,8 @@ luck). The nested-comment and comment-split-operator refusals wear
 fc's generic vector where the engine spells -104. Pre-existing gaps the
 review surfaced for the candidate list: q'{...}' alternative quoting
 (refused entirely), the doubled-quote identifier rendering (fc shows
-a""b where the engine undoubles), and - notable - DOMAIN CHECK
-validation is never evaluated by fc (RDB$VALIDATION_SOURCE has no
-consumer: an INSERT violating a domain CHECK writes silently where the
-engine raises 23000).
+a""b where the engine undoubles), and DOMAIN CHECK validation — the
+latter CLOSED by the 2026-08-25 domain-check slice above.
 
 **Constant EXPRESSIONS in INSERT ... VALUES - and the boolean wire fix -
 DONE (2026-08-24, `serve-real-insertexpr` 8):** the engine accepts any

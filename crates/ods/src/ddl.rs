@@ -1085,6 +1085,41 @@ pub fn alter_table_add_column(
     }
     let new_fid = existing.iter().map(|c| c.field_id + 1).max().unwrap_or(0);
 
+    // a DOMAIN-typed column resolves its storage off the domain's row,
+    // exactly as create_table does, and its RDB$FIELD_SOURCE is the
+    // DOMAIN - no RDB$<n> carrier is minted. (This used to fall through
+    // with the UNRESOLVED zero-typed ColumnDef under a fresh carrier -
+    // a column the engine reads as length-0 garbage, and every later
+    // DML on the table refused; review-caught.)
+    let resolved_col: ColumnDef;
+    let (col, domain_source): (&ColumnDef, Option<String>) = match &col.domain {
+        Some(dname) => {
+            let dname = dname.trim().trim_matches('"').to_ascii_uppercase();
+            let dt = resolve_domain_type(file, page_size, &dname)
+                .ok_or_else(|| format!("Domain {} is not defined", dname))?;
+            // the domain's own NOT NULL would need existing rows
+            // re-checked and an RSR not-null segment sourced from the
+            // domain - outside this writer's proven surface
+            if dt.not_null {
+                return Err(format!(
+                    "domain {} is NOT NULL - outside this ALTER surface",
+                    dname
+                ));
+            }
+            let mut rc = col.clone();
+            rc.field_type = dt.field_type;
+            rc.dtype = dt.dtype;
+            rc.length = dt.length;
+            rc.scale = dt.scale;
+            rc.sub_type = dt.sub_type;
+            rc.char_len = dt.char_len;
+            rc.dims = dt.dims.clone();
+            resolved_col = rc;
+            (&resolved_col, Some(dname))
+        }
+        None => (col, None),
+    };
+
     // the new full format: existing descriptors + the new field, offsets
     // recomputed by the same ini.epp walk (append-stable, so the existing
     // fields keep their offsets and the new one lands at the end)
@@ -1151,8 +1186,13 @@ pub fn alter_table_add_column(
     )?;
 
     // --- the new column's domain, RDB$FIELDS and RDB$RELATION_FIELDS --
-    let domain_num = next_domain_number(file, page_size)?;
-    let dom = format!("RDB${}", domain_num);
+    // a USER-domain column points at the domain itself; only a plain
+    // column mints an auto-carrier RDB$<n> row
+    let dom = match &domain_source {
+        Some(d) => d.clone(),
+        None => format!("RDB${}", next_domain_number(file, page_size)?),
+    };
+    if domain_source.is_none() {
     let mut field_vals: Vec<(&str, SysVal<'_>)> = vec![
         ("RDB$FIELD_NAME", SysVal::S(&dom)),
         ("RDB$FIELD_TYPE", SysVal::I(col.field_type as i64)),
@@ -1222,6 +1262,7 @@ pub fn alter_table_add_column(
             ],
         )?;
     }
+    } // domain_source.is_none() - a user domain's row already exists
 
     let rf_vals: Vec<(&str, SysVal<'_>)> = vec![
         ("RDB$FIELD_NAME", SysVal::S(&col.name)),
@@ -2127,6 +2168,29 @@ fn field_dimensions(file: &crate::Image, page_size: usize, fname: &str) -> Vec<(
     });
     dims.sort_by_key(|d| d.0);
     dims.into_iter().map(|d| (d.1, d.2)).collect()
+}
+
+/// A domain's `RDB$CHARACTER_SET_ID` (None when SQL NULL - non-text
+/// types) - the one type fact [domain_type_info] does not carry, needed
+/// to gate a text-domain CHECK compile to the NONE charset the stored
+/// literal shape is pinned for.
+pub fn domain_charset_id(file: &crate::Image, page_size: usize, name: &str) -> Option<i64> {
+    let rel = crate::resolve_relation(file, page_size, "RDB$FIELDS")?;
+    let formats = system_relation_formats(file, page_size, "RDB$FIELDS")?;
+    let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
+    let cols = relation_columns(file, page_size, "RDB$FIELDS");
+    let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let name_f = fid("RDB$FIELD_NAME")?;
+    let cs_f = fid("RDB$CHARACTER_SET_ID")?;
+    let mut out = None;
+    walk_rows(file, page_size, rel, descs, |v| {
+        if text_eq(v.get(name_f), name) {
+            if let Some(Value::Int(i)) = v.get(cs_f) {
+                out = Some(*i);
+            }
+        }
+    });
+    out
 }
 
 fn resolve_domain_type(file: &crate::Image, page_size: usize, dname: &str) -> Option<DomainType> {
@@ -9626,6 +9690,113 @@ pub fn set_domain_validation(
             ("RDB$VALIDATION_SOURCE", SysVal::B(blob_id_bytes(rel, src_blob))),
         ],
     )
+}
+
+/// Does the domain's `RDB$FIELDS` row carry a validation BLR? Public so
+/// the wire's ALTER executor can answer "Only one constraint allowed
+/// for a domain" BEFORE compiling the new check - the engine's refusal
+/// order (an out-of-surface second check must still get the engine
+/// vector, not a compile refusal).
+pub fn domain_validation_present(file: &crate::Image, page_size: usize, name: &str) -> bool {
+    let want = name.trim().trim_matches('"').to_ascii_uppercase();
+    let (Some(rel), Some(formats)) = (
+        crate::resolve_relation(file, page_size, "RDB$FIELDS"),
+        system_relation_formats(file, page_size, "RDB$FIELDS"),
+    ) else {
+        return false;
+    };
+    let Some((_, descs)) = formats.iter().max_by_key(|(n, _)| *n) else {
+        return false;
+    };
+    let cols = relation_columns(file, page_size, "RDB$FIELDS");
+    let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (Some(name_f), Some(vblr_f)) = (fid("RDB$FIELD_NAME"), fid("RDB$VALIDATION_BLR")) else {
+        return false;
+    };
+    let mut has = false;
+    walk_rows(file, page_size, rel, descs, |v| {
+        if text_eq(v.get(name_f), &want) && matches!(v.get(vblr_f), Some(Value::Blob(..))) {
+            has = true;
+        }
+    });
+    has
+}
+
+/// `ALTER DOMAIN <name> ADD [CONSTRAINT] CHECK (...)` (`check` carries
+/// the compiled validation BLR + verbatim source) / `DROP CONSTRAINT`
+/// (`check` is None). ADD refuses when a check already exists - the
+/// engine's "Only one constraint allowed for a domain" (DdlNodes.epp
+/// dyn 160); DROP nulls both validation columns and is a no-op when
+/// none exists (measured). Existing rows are NOT re-scanned - the
+/// engine posts no deferred work for a CHECK change (measured: a
+/// violating row survives ADD CONSTRAINT). Every table using the
+/// domain gets its runtime summary rebuilt, because the engine
+/// enforces from the summary's RSR_validation_blr segment, not from
+/// the domain's own row.
+pub fn alter_domain_check(
+    file: &mut crate::Image,
+    page_size: usize,
+    name: &str,
+    check: Option<(&[u8], &str)>,
+) -> Result<(), String> {
+    let want = name.trim().trim_matches('"').to_ascii_uppercase();
+    if want.starts_with("RDB$") || want.starts_with("SQL$") {
+        return Err("system domains are read-only".into());
+    }
+    if !domain_exists(file, page_size, &want) {
+        return Err(format!("Domain {} not found", want));
+    }
+    match check {
+        Some((blr, source)) => {
+            // one constraint per domain - the ADD path's only refusal
+            if domain_validation_present(file, page_size, &want) {
+                return Err("Only one constraint allowed for a domain".into());
+            }
+            set_domain_validation(file, page_size, &want, blr, source)?;
+        }
+        None => {
+            let name_f = sys_fid(file, page_size, "RDB$FIELDS", "RDB$FIELD_NAME")?;
+            let nm = want.clone();
+            patch_sys_row(
+                file,
+                page_size,
+                "RDB$FIELDS",
+                2,
+                move |v| text_eq(v.get(name_f), &nm),
+                &[
+                    ("RDB$VALIDATION_BLR", SysVal::Null),
+                    ("RDB$VALIDATION_SOURCE", SysVal::Null),
+                ],
+            )?;
+        }
+    }
+    // the tables whose columns use the domain, for the summary rebuild
+    let rf_formats = system_relation_formats(file, page_size, "RDB$RELATION_FIELDS")
+        .ok_or("no RDB$RELATION_FIELDS format")?;
+    let (_, rf_descs) = rf_formats
+        .iter()
+        .max_by_key(|(n, _)| *n)
+        .ok_or("empty format")?;
+    let rf_cols = relation_columns(file, page_size, "RDB$RELATION_FIELDS");
+    let rf_fid = |n: &str| rf_cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let src_fid = rf_fid("RDB$FIELD_SOURCE").ok_or("no RDB$FIELD_SOURCE")?;
+    let rel_fid = rf_fid("RDB$RELATION_NAME").ok_or("no RDB$RELATION_NAME")?;
+    let mut tables: Vec<String> = Vec::new();
+    walk_rows(file, page_size, 5, rf_descs, |v| {
+        if !text_eq(v.get(src_fid), &want) {
+            return;
+        }
+        if let Some(Value::Text(t)) = v.get(rel_fid) {
+            let t = t.trim_end().to_string();
+            if !tables.contains(&t) {
+                tables.push(t);
+            }
+        }
+    });
+    for t in &tables {
+        update_relation_runtime(file, page_size, t)?;
+    }
+    advance_oldest_transactions(file, page_size)
 }
 
 /// Store a COMMENT: write `text` as a subtype-1 blob into the

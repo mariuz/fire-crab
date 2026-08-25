@@ -233,12 +233,17 @@ boundary() { # <label> <sql> <engine-substring>
         fail=1
     fi
 }
-# CREATE VIEW is not in this server's DDL surface at all - it READS views
-# the engine created - so its refusal is the generic one whether the
-# database is read-only or not. Asserted, so that the day CREATE VIEW
-# lands this gate says the read-only vector has to come with it.
-boundary "CREATE VIEW is outside the DDL surface, so the refusal is generic" \
-    "CREATE VIEW VW AS SELECT ID FROM T;" "attempted update on read-only database"
+# CREATE VIEW landed (the createview slice), and the read-only vector
+# came with it: both servers refuse identically now - the boundary this
+# check used to assert (fc generic vs engine wrapped) is CLOSED.
+ran=$((ran + 1))
+e=$(sql "$ECONN" "CREATE VIEW VW AS SELECT ID FROM T;")
+c=$(sql "$FCONN" "CREATE VIEW VW AS SELECT ID FROM T;")
+if [ "$e" = "$c" ] && [ "${e#*attempted update on read-only database}" != "$e" ]; then
+    echo "OK   CREATE VIEW refuses read-only with the engine's own vector"
+else
+    echo "DIFF CREATE VIEW read-only vector (engine [$e], fc [$c])"; fail=1
+fi
 boundary "ALTER TABLE carries the no_meta_update wrapper" \
     "ALTER TABLE T ADD Z INTEGER;" "unsuccessful metadata update"
 boundary "DROP TABLE carries it AND the Dynamic SQL Error" \

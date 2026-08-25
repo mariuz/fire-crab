@@ -133,10 +133,9 @@ check "...and immediately on the EXECUTE PROCEDURE shape" \
     "$(run "$F" "EXECUTE PROCEDURE PSHOW('far-too-long-for-five');")" \
     "$(run "$E" "EXECUTE PROCEDURE PSHOW('far-too-long-for-five');")"
 # the engine CONVERTS a text argument into an integer parameter ('12'
-# becomes 12); a conversion this surface has not measured refuses
-out=$(run "$F" "SELECT N FROM PTIN2('12');" | head -2 | tr -s ' \n' ' ')
-check "boundary: a cross-type argument refuses rather than coerces" \
-    "$out" "Statement failed, SQLSTATE = 42000 Dynamic SQL Error "
+# becomes 12) - and since the crosstype slice, so does fire-crab
+check "a cross-type text argument coerces into the integer parameter" \
+    "$(run "$F" "SELECT N FROM PTIN2('12');")" "$(run "$E" "SELECT N FROM PTIN2('12');")"
 
 echo "ran $ran checks"
 exit $fail

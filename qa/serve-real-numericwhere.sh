@@ -539,15 +539,15 @@ check "fc UPDATE SET a decimal through a scaled WHERE" \
       "$(node_run 'UPDATE T SET N = 9.25 WHERE N = 2.00')" "OK"
 check "fc DELETE through a fine-scale WHERE" \
       "$(node_run 'DELETE FROM T WHERE M = 0.0001')" "OK"
-case "$(node_run 'INSERT INTO T (ID, A) VALUES (9, 1.5)')" in
-    ERR*) echo "OK   an inexact decimal into INTEGER refuses (the engine would round)" ;;
-    *) echo "DIFF inexact-decimal refusal"; fail=1 ;; esac
+check "an inexact decimal into INTEGER rounds half-away, as the engine does" \
+      "$(node_run 'INSERT INTO T (ID, A) VALUES (9, 1.5)')" "OK"
 kill $srv 2>/dev/null; wait $srv 2>/dev/null
 
 "$ISQL" -q -user "$U" -pas "$P" "$REF" >/dev/null 2>&1 <<'SQL'
 INSERT INTO T (ID, A, N, M, I) VALUES (5, 1, 3.75, 2.5, 9);
 UPDATE T SET N = 9.25 WHERE N = 2.00;
 DELETE FROM T WHERE M = 0.0001;
+INSERT INTO T (ID, A) VALUES (9, 1.5);
 COMMIT;
 SQL
 dump() { # <file>

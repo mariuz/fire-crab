@@ -66,6 +66,13 @@ pub enum Expr {
     Subtract(Box<Expr>, Box<Expr>),
     Multiply(Box<Expr>, Box<Expr>),
     Divide(Box<Expr>, Box<Expr>),
+    /// `blr_fid 0, 0,0`: the `VALUE` keyword of a DOMAIN CHECK - the
+    /// engine reserves context 0 / field id 0 for it in the stored
+    /// validation BLR (dumped: `CHECK (VALUE > 100)` is `blr_gtr,
+    /// blr_fid 0 0,0, blr_literal ...`), remapping it to the real
+    /// column at statement compile. Only [domain_validation_blr]
+    /// emits it; it never appears in a trigger or computed column.
+    DomainValue,
 }
 
 impl Expr {
@@ -113,6 +120,11 @@ impl Expr {
             Expr::Subtract(l, r) => Self::binop(out, BLR_SUBTRACT, l, r),
             Expr::Multiply(l, r) => Self::binop(out, BLR_MULTIPLY, l, r),
             Expr::Divide(l, r) => Self::binop(out, BLR_DIVIDE, l, r),
+            Expr::DomainValue => {
+                out.push(24); // blr_fid
+                out.push(0); // context 0 - reserved for VALUE
+                out.extend_from_slice(&0u16.to_le_bytes()); // field id 0
+            }
         }
     }
 
@@ -150,7 +162,8 @@ impl Expr {
             | Expr::Int64Literal(_)
             | Expr::TextLiteral(_)
             | Expr::NullLiteral
-            | Expr::Variable(_) => {}
+            | Expr::Variable(_)
+            | Expr::DomainValue => {}
             Expr::Add(l, r)
             | Expr::Subtract(l, r)
             | Expr::Multiply(l, r)
@@ -346,6 +359,22 @@ pub fn check_trigger_blr(cond: &Cond) -> Vec<u8> {
     out.push(code.len() as u8);
     out.extend_from_slice(code);
     out.extend_from_slice(&[BLR_END, BLR_END, BLR_END, BLR_EOC]);
+    out
+}
+
+/// The BLR of a DOMAIN CHECK, stored in `RDB$FIELDS.RDB$VALIDATION_BLR`:
+/// the bare boolean condition POSITIVELY (unlike a table CHECK's
+/// negated trigger), `blr_version5, <cond>, blr_eoc` - no wrapper
+/// opcode. `VALUE` is [Expr::DomainValue] (`blr_fid 0, 0,0`). The
+/// engine NORMALIZES a written NOT at CREATE, pushing it into inverted
+/// comparisons (dumped: `CHECK (NOT (VALUE > 5))` stores `blr_leq`,
+/// no blr_not; only IS NOT NULL keeps one, as `blr_not blr_missing` -
+/// dumped from `CHECK (VALUE IS NOT NULL)`), which is exactly
+/// [Cond::normalized].
+pub fn domain_validation_blr(cond: &Cond) -> Vec<u8> {
+    let mut out = vec![BLR_VERSION5];
+    cond.normalized().emit(&mut out);
+    out.push(BLR_EOC);
     out
 }
 

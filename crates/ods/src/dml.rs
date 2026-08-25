@@ -1370,7 +1370,12 @@ pub(crate) fn rewrite_primary(
     };
     let dir_top = DPG_RPT_OFFSET + count * 4;
     if bottom < dir_top + aligned {
-        return Err("no room on the page for the new record version".into());
+        return Err(format!(
+            "no room on page {} for the new record version ({} B, {} free)",
+            page_no,
+            aligned,
+            bottom.saturating_sub(dir_top)
+        ));
     }
     let offset = (bottom - aligned) & !3;
     write_at_spot(

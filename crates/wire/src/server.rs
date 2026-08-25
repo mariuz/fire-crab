@@ -1591,6 +1591,23 @@ fn respond_ddl_meta(
     // "DROP TABLE @1 failed" wrapper the engine adds isc_dsql_command_err
     // (-607, "Invalid command") and a "-Table @1 does not exist" string
     // - four items, not the three the others carry.
+    if let Plan::AlterDomainCheck { domain, .. } = plan {
+        // ADD CONSTRAINT over an existing one: "unsuccessful metadata
+        // update / ALTER DOMAIN @1 failed / "Only one constraint
+        // allowed for a domain"" (the dyn 160 text carries its own
+        // quotes - measured)
+        if lc.contains("only one constraint") {
+            let qn = q(domain);
+            let mut w = W::default();
+            w.int(OP_RESPONSE).int(0).int(0).int(0).int(0);
+            w.int(1).int(GDS_NO_META_UPDATE)
+                .int(1).int(336397278).int(2).bytes(qn.as_bytes()) // ALTER DOMAIN @1 failed
+                .int(1).int(336068768) // "Only one constraint allowed for a domain"
+                .int(0);
+            w.send(s, enc)?;
+            return Ok(true);
+        }
+    }
     if let Plan::CreatePackage { name, .. } = plan {
         if lc.contains("already exists") {
             let qn = q(name);
@@ -7489,9 +7506,17 @@ enum Plan {
     AlterDatabaseBackup { begin: bool },
     /// `DROP ROLE <name>`: the row and its security class go
     DropRole { name: String },
-    /// `CREATE DOMAIN <name> [AS] <type> [NOT NULL]`: a standalone
-    /// RDB$FIELDS row named by the user
-    CreateDomain { col: fire_crab_ods::ddl::ColumnDef },
+    /// `CREATE DOMAIN <name> [AS] <type> [NOT NULL] [CHECK (...)]`: a
+    /// standalone RDB$FIELDS row named by the user; `check` carries the
+    /// compiled validation BLR + the verbatim `CHECK (...)` source
+    CreateDomain {
+        col: fire_crab_ods::ddl::ColumnDef,
+        check: Option<(Vec<u8>, String)>,
+    },
+    /// `ALTER DOMAIN <name> ADD [CONSTRAINT] CHECK (...)` (`check` is
+    /// the verbatim `CHECK (...)` source, compiled at execute where the
+    /// domain's type is readable) / `DROP CONSTRAINT` (None)
+    AlterDomainCheck { domain: String, check: Option<String> },
     /// `DROP DOMAIN <name>`: delete the RDB$FIELDS row (refused while in use)
     DropDomain { name: String },
     /// `ALTER DOMAIN <name> SET DEFAULT <lit>` / `DROP DEFAULT`: write (or
@@ -7710,6 +7735,9 @@ AlterDomainRename {
         /// the table's CHECK constraints as NEGATED predicates - a match
         /// on the final row is a violation ([check_predicates])
         checks: Vec<TableCheck>,
+        /// the columns' DOMAIN CHECKs as NEGATED predicates, in field
+        /// order ([domain_check_predicates])
+        domain_checks: Vec<DomainCheck>,
         /// the FOREIGN KEYS on this table: the bound row's key must
         /// reference an existing parent row ([fk_check_child_row])
         fk_refs: Vec<FkPartner>,
@@ -7738,6 +7766,10 @@ AlterDomainRename {
         not_null: Vec<usize>,
         /// NEGATED check predicates, evaluated on each PATCHED row
         checks: Vec<TableCheck>,
+        /// the columns' DOMAIN CHECKs, evaluated on each PATCHED row -
+        /// every validated column, not just the assigned ones (the
+        /// engine's rule, measured)
+        domain_checks: Vec<DomainCheck>,
         /// FKs ON this table whose columns the SET list touches - the
         /// patched row's key must still reference an existing parent
         fk_refs: Vec<FkPartner>,
@@ -10996,7 +11028,10 @@ fn not_null_fids_uncached(db: &Database, table: &str) -> Vec<usize> {
                         if let Some(Value::Text(n)) = values.get(fname) {
                             let n = n.trim_end();
                             for (id, src) in &by_source {
-                                if src.eq_ignore_ascii_case(n) {
+                                // EXACT: "dm2" and DM2 are different
+                                // domains (the domain-check review's
+                                // wrong-binding class)
+                                if src == n {
                                     out.push(*id);
                                 }
                             }
@@ -11151,7 +11186,8 @@ fn computed_sources_uncached(
         let Some(Value::Text(fname)) = values.get(name_f) else { return };
         let fname = fname.trim_end();
         for (id, src) in &members {
-            if src.eq_ignore_ascii_case(fname) {
+            // EXACT: a case-blind match binds the wrong domain
+            if src == fname {
                 if let Some(Value::Blob(r, n)) = values.get(csrc_f) {
                     blobs.push((*id, *r, *n));
                 }
@@ -11466,7 +11502,8 @@ fn table_defaults(
             let Some(Value::Text(fname)) = values.get(fname_f) else { return };
             let fname = fname.trim_end();
             for (fid, src) in &pending {
-                if src.eq_ignore_ascii_case(fname) {
+                // EXACT: a case-blind match binds the wrong domain
+                if src == fname {
                     if let Some(Value::Blob(r, n)) = values.get(fdef_f) {
                         blobs.push((*fid, *r, *n));
                     }
@@ -12048,6 +12085,277 @@ struct TableCheck {
     constraint: String,
     trigger: Option<String>,
     pred: Predicate,
+}
+
+/// One column's DOMAIN CHECK, as a NEGATED predicate over the table's
+/// own columns: the domain's `RDB$VALIDATION_SOURCE` (`CHECK (VALUE >
+/// 10)`) re-parsed by the WHERE machinery as `NOT (<cond>)` with
+/// `VALUE` rewritten to the column, so `matches == true` is a
+/// VIOLATION and an UNKNOWN (NULL-operand) check passes - the engine's
+/// own rule (a NULL value stores unless the check evaluates to
+/// explicit FALSE, e.g. `CHECK (VALUE IS NOT NULL)`; measured).
+#[derive(Clone)]
+struct DomainCheck {
+    fid: usize,
+    column: String,
+    pred: Predicate,
+}
+
+/// The domain CHECKs binding a table's columns, in FIELD ORDER - the
+/// order the engine's validation walk reports the first violation in
+/// (measured: field 0's NOT NULL beats field 1's domain check).
+/// Returns None when a column's domain carries a validation this
+/// server cannot evaluate (an unparsable source, or a validation BLR
+/// with no source at all) - DML must then refuse, never write a row
+/// the engine would reject. An INSERT and an UPDATE evaluate the SAME
+/// list: the engine validates every column of the stored/merged row,
+/// not just the assigned ones (measured: `UPDATE T SET A = 2` refuses
+/// on an untouched column B whose check its old value now violates).
+/// [domain_check_predicates_uncached], held in the metadata cache.
+fn domain_check_predicates(
+    db: &Database,
+    table: &str,
+    columns: &[RelationColumn],
+    descs: &[Descriptor],
+) -> Option<Vec<DomainCheck>> {
+    db.meta_memo("domain-checks", table, || {
+        domain_check_predicates_uncached(db, table, columns, descs)
+    })
+    .as_ref()
+    .clone()
+}
+
+fn domain_check_predicates_uncached(
+    db: &Database,
+    table: &str,
+    columns: &[RelationColumn],
+    descs: &[Descriptor],
+) -> Option<Vec<DomainCheck>> {
+    use fire_crab_ods::format::Value;
+    // leg 1: this table's columns -> their field sources
+    let rf_formats = fire_crab_ods::sysfmt::system_relation_formats(
+        &db.bytes(),
+        db.page_size,
+        "RDB$RELATION_FIELDS",
+    )?;
+    let (_, rf_descs) = rf_formats.iter().max_by_key(|(n, _)| *n)?;
+    let rf_cols = relation_columns(&db.bytes(), db.page_size, "RDB$RELATION_FIELDS");
+    let rf_fid = |n: &str| rf_cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (rel_f, id_f, src_f) = (
+        rf_fid("RDB$RELATION_NAME")?,
+        rf_fid("RDB$FIELD_ID")?,
+        rf_fid("RDB$FIELD_SOURCE")?,
+    );
+    let mut by_source: Vec<(usize, String)> = Vec::new(); // (fid, field source)
+    let fmts = vec![(0u8, rf_descs.clone())];
+    for_each_record(db, 5, &fmts, usize::MAX, |values| {
+        let is_rel = matches!(values.get(rel_f), Some(Value::Text(t)) if t.trim_end().eq_ignore_ascii_case(table));
+        if !is_rel {
+            return;
+        }
+        let Some(Value::Int(id)) = values.get(id_f) else { return };
+        if let Some(Value::Text(src)) = values.get(src_f) {
+            by_source.push((*id as usize, src.trim_end().to_string()));
+        }
+    });
+    if by_source.is_empty() {
+        return Some(Vec::new());
+    }
+    // leg 2: which of those sources carry a validation
+    let f_formats =
+        fire_crab_ods::sysfmt::system_relation_formats(&db.bytes(), db.page_size, "RDB$FIELDS")?;
+    let (_, f_descs) = f_formats.iter().max_by_key(|(n, _)| *n)?;
+    let f_cols = relation_columns(&db.bytes(), db.page_size, "RDB$FIELDS");
+    let ffid = |n: &str| f_cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (fname_f, vsrc_f, vblr_f) = (
+        ffid("RDB$FIELD_NAME")?,
+        ffid("RDB$VALIDATION_SOURCE")?,
+        ffid("RDB$VALIDATION_BLR")?,
+    );
+    // (source name, check source blob, blr present)
+    let mut validated: Vec<(String, Option<(u16, u64)>, bool)> = Vec::new();
+    let ffmts = vec![(0u8, f_descs.clone())];
+    // EXACT name matching, both legs: RDB$FIELD_SOURCE stores the
+    // domain's name verbatim, and "dm2" and DM2 are DIFFERENT domains -
+    // a case-blind find bound the wrong domain's check (review-caught:
+    // fc stored rows the engine refuses)
+    for_each_record(db, 2, &ffmts, usize::MAX, |values| {
+        let Some(Value::Text(n)) = values.get(fname_f) else { return };
+        let n = n.trim_end();
+        if !by_source.iter().any(|(_, s)| s == n) {
+            return;
+        }
+        let src = match values.get(vsrc_f) {
+            Some(Value::Blob(r, num)) => Some((*r, *num)),
+            _ => None,
+        };
+        let blr = matches!(values.get(vblr_f), Some(Value::Blob(..)));
+        if src.is_some() || blr {
+            validated.push((n.to_string(), src, blr));
+        }
+    });
+    let mut out: Vec<DomainCheck> = Vec::new();
+    for (fid, src_name) in &by_source {
+        let Some((_, vsrc, has_blr)) = validated.iter().find(|(n, ..)| n == src_name) else {
+            continue;
+        };
+        // the ENGINE enforces from the BLR (the RSR_validation_blr
+        // runtime segment): a row carrying SOURCE but no BLR is not
+        // enforced there - skip it, as the engine would (review-caught)
+        if !*has_blr {
+            continue;
+        }
+        // a validation BLR with no readable source: the rule exists but
+        // cannot be known here - refuse the statement, never bypass
+        let (r, n) = (*vsrc)?;
+        let bytes = fire_crab_blb::read_blob_content(&db.bytes(), db.page_size, r, n)?;
+        let text = strip_sql_comments(&String::from_utf8(bytes).ok()?);
+        // the engine TRANSLITERATES the source to the DDL connection's
+        // charset LOSSILY ('?' for an unmappable character) while its
+        // BLR keeps the real bytes and is what it enforces: a '?'
+        // inside a string literal may be a lossy marker for a rule this
+        // re-parse cannot recover - refuse rather than enforce a wrong
+        // comparison (review-caught: CHECK (VALUE <> 'né') stored as
+        // 'n??' let fc store the very rows the engine refuses)
+        if string_literal_has_question(&text) {
+            return None;
+        }
+        let t = text.trim_start();
+        if !t.get(..5).is_some_and(|h| h.eq_ignore_ascii_case("CHECK")) {
+            return None;
+        }
+        let column = columns
+            .iter()
+            .find(|c| c.field_id as usize == *fid)?
+            .name
+            .clone();
+        // VALUE -> the column, at TEXT level (quote-aware), so a VALUE
+        // inside a function argument substitutes too. The WHERE
+        // tokenizer takes no quoted identifiers, so the name goes in
+        // BARE - a column whose name cannot stand bare refuses
+        let bare = column.trim_end();
+        let plain_ident = bare.bytes().next().is_some_and(|c| c.is_ascii_alphabetic())
+            && bare
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'$');
+        if !plain_ident {
+            return None;
+        }
+        let cond = substitute_value_word(&t[5..], bare);
+        let negated = format!("NOT {}", cond);
+        let toks = tokenize(&negated)?;
+        let mut np = 0usize;
+        let raw = parse_predicate(&toks, &mut np)?;
+        if np != 0 {
+            return None;
+        }
+        let mut params: Vec<Option<Descriptor>> = Vec::new();
+        let p = resolve_predicate(raw, columns, descs, &mut params)?;
+        if !params.is_empty() {
+            return None;
+        }
+        out.push(DomainCheck { fid: *fid, column, pred: p });
+    }
+    out.sort_by_key(|c| c.fid);
+    Some(out)
+}
+
+/// Does any `'...'` string literal of this SQL text contain a `?` byte?
+/// The lossy-transliteration tripwire for stored domain-check sources.
+fn string_literal_has_question(s: &str) -> bool {
+    let b = s.as_bytes();
+    let mut i = 0usize;
+    while i < b.len() {
+        match b[i] {
+            b'\'' => {
+                i += 1;
+                while i < b.len() {
+                    match b[i] {
+                        b'\'' if b.get(i + 1) == Some(&b'\'') => i += 2,
+                        b'\'' => {
+                            i += 1;
+                            break;
+                        }
+                        b'?' => return true,
+                        _ => i += 1,
+                    }
+                }
+            }
+            b'"' => {
+                // a quoted identifier is not a literal - skip it whole
+                i += 1;
+                while i < b.len() {
+                    if b[i] == b'"' {
+                        if b.get(i + 1) == Some(&b'"') {
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    false
+}
+
+/// Replace every bare `VALUE` word of a check source with `with`,
+/// skipping `'` strings and `"` identifiers - the domain-check
+/// re-parse's only text rewrite. (A quoted "VALUE" identifier cannot
+/// occur: the engine refuses it at CREATE, so no stored source
+/// carries one.)
+fn substitute_value_word(s: &str, with: &str) -> String {
+    let b = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(s.len());
+    let mut i = 0usize;
+    while i < b.len() {
+        match b[i] {
+            b'\'' | b'"' => {
+                let q = b[i];
+                let start = i;
+                i += 1;
+                while i < b.len() {
+                    if b[i] == q {
+                        if i + 1 < b.len() && b[i + 1] == q {
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+                out.extend_from_slice(&b[start..i]);
+            }
+            c if c == b'V' || c == b'v' => {
+                let word_start = i == 0
+                    || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_' || b[i - 1] == b'$');
+                let is_value = word_start
+                    && b.len() - i >= 5
+                    && b[i..i + 5].eq_ignore_ascii_case(b"VALUE")
+                    && !b
+                        .get(i + 5)
+                        .is_some_and(|n| n.is_ascii_alphanumeric() || *n == b'_' || *n == b'$');
+                if is_value {
+                    out.extend_from_slice(with.as_bytes());
+                    i += 5;
+                } else {
+                    out.push(c);
+                    i += 1;
+                }
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    // only ASCII spans were spliced, so the bytes are valid UTF-8
+    // whenever the input was; a malformed source falls back unchanged
+    String::from_utf8(out).unwrap_or_else(|_| s.to_string())
 }
 
 /// RDB$CHECK_CONSTRAINTS rows as (trigger name, constraint name) - the
@@ -13204,6 +13512,7 @@ fn infer_int_rank(
         Expr::Int64Literal(_) => Some(IntRank::Int64),
         Expr::TextLiteral(_) => None, // the CHECK surface is INT-ONLY
         Expr::NullLiteral => None,    // ...and NULL comparisons stay refused there
+        Expr::DomainValue => None,    // typed before the VALUE rewrite - never here
 
         Expr::Add(l, r) | Expr::Subtract(l, r) => {
             let (lr, rr) = (infer_int_rank(l, field_rank)?, infer_int_rank(r, field_rank)?);
@@ -14129,7 +14438,8 @@ fn expr_resolve_vars(
         | Expr::IntLiteral(_)
         | Expr::Int64Literal(_)
         | Expr::TextLiteral(_)
-        | Expr::NullLiteral => e.clone(),
+        | Expr::NullLiteral
+        | Expr::DomainValue => e.clone(),
         Expr::Add(l, r) => Expr::Add(
             Box::new(expr_resolve_vars(l, vars)),
             Box::new(expr_resolve_vars(r, vars)),
@@ -14250,7 +14560,8 @@ fn expr_plain_ctx(e: &fire_crab_ods::expr::Expr, ctx: u8) -> fire_crab_ods::expr
         | Expr::IntLiteral(_)
         | Expr::Int64Literal(_)
         | Expr::TextLiteral(_)
-        | Expr::NullLiteral => e.clone(),
+        | Expr::NullLiteral
+        | Expr::DomainValue => e.clone(),
         Expr::Add(l, r) => Expr::Add(
             Box::new(expr_plain_ctx(l, ctx)),
             Box::new(expr_plain_ctx(r, ctx)),
@@ -14309,7 +14620,8 @@ fn expr_resolve_marked(
         | Expr::IntLiteral(_)
         | Expr::Int64Literal(_)
         | Expr::TextLiteral(_)
-        | Expr::NullLiteral => e.clone(),
+        | Expr::NullLiteral
+        | Expr::DomainValue => e.clone(),
         Expr::Add(l, r) => Expr::Add(
             Box::new(expr_resolve_marked(l, vars, marked)),
             Box::new(expr_resolve_marked(r, vars, marked)),
@@ -14587,7 +14899,8 @@ fn expr_has_text(e: &fire_crab_ods::expr::Expr) -> bool {
         | Expr::Variable(_)
         | Expr::IntLiteral(_)
         | Expr::Int64Literal(_)
-        | Expr::NullLiteral => false,
+        | Expr::NullLiteral
+        | Expr::DomainValue => false,
         Expr::Add(l, r) | Expr::Subtract(l, r) | Expr::Multiply(l, r) | Expr::Divide(l, r) => {
             expr_has_text(l) || expr_has_text(r)
         }
@@ -16511,7 +16824,8 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
             | Expr::IntLiteral(_)
             | Expr::Int64Literal(_)
             | Expr::TextLiteral(_)
-            | Expr::NullLiteral => {}
+            | Expr::NullLiteral
+            | Expr::DomainValue => {}
             Expr::Add(l, r) | Expr::Subtract(l, r) | Expr::Multiply(l, r) | Expr::Divide(l, r) => {
                 expr_fields(l, out);
                 expr_fields(r, out);
@@ -18800,6 +19114,7 @@ fn expr_with_context(e: &fire_crab_ods::expr::Expr, context: u8) -> fire_crab_od
         Expr::TextLiteral(t) => Expr::TextLiteral(t.clone()),
         Expr::Int64Literal(v) => Expr::Int64Literal(*v),
         Expr::NullLiteral => Expr::NullLiteral,
+        Expr::DomainValue => Expr::DomainValue,
         Expr::Add(l, r) => Expr::Add(
             Box::new(expr_with_context(l, context)),
             Box::new(expr_with_context(r, context)),
@@ -18849,6 +19164,7 @@ fn expr_all_plain(e: &fire_crab_ods::expr::Expr) -> bool {
     match e {
         Expr::Field { context, .. } => *context == CTX_PLAIN,
         Expr::Variable(_) => false, // only a trigger body has variables
+        Expr::DomainValue => false, // checked before the VALUE rewrite - never here
         Expr::IntLiteral(_) => true,
         Expr::Int64Literal(_) => true,
         Expr::TextLiteral(_) => true,
@@ -19022,9 +19338,10 @@ fn blr_expr_factor(t: &[ETok], p: &mut usize) -> Option<fire_crab_ods::expr::Exp
 }
 
 /// Parse the modelled `ALTER DOMAIN` forms: `SET DEFAULT <literal>` /
-/// `DROP DEFAULT` (the default on the domain's `RDB$FIELDS` row) and
-/// `SET NOT NULL` / `DROP NOT NULL` (its `RDB$NULL_FLAG`). Other forms
-/// (TYPE, rename, ADD CHECK) fall back to None.
+/// `DROP DEFAULT` (the default on the domain's `RDB$FIELDS` row),
+/// `SET NOT NULL` / `DROP NOT NULL` (its `RDB$NULL_FLAG`), `TO` /
+/// `TYPE`, and `ADD [CONSTRAINT] CHECK (...)` / `DROP CONSTRAINT`
+/// (its validation blobs). Other forms fall back to None.
 fn plan_alter_domain(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
     let s = sql.trim().trim_end_matches(';').trim();
     let up = s.to_ascii_uppercase();
@@ -19072,16 +19389,229 @@ fn plan_alter_domain(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
             return None;
         }
         Some((Plan::AlterDomainType { domain: name, new_col: col }, Vec::new()))
+    } else if norm == "DROP CONSTRAINT" {
+        Some((Plan::AlterDomainCheck { domain: name, check: None }, Vec::new()))
+    } else if norm.starts_with("ADD ") {
+        // ADD [CONSTRAINT] CHECK (...) - the check compiles at execute,
+        // where the domain's type is readable off the live file
+        let (rest, src) = split_domain_check(tail);
+        let (src, _) = src?;
+        let restn = rest
+            .to_ascii_uppercase()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        if restn != "ADD" && restn != "ADD CONSTRAINT" {
+            return None;
+        }
+        Some((Plan::AlterDomainCheck { domain: name, check: Some(src) }, Vec::new()))
     } else {
         None // other ALTER DOMAIN forms not modelled
     }
 }
 
-/// Parse `CREATE DOMAIN <name> [AS] <type> [NOT NULL]` - a standalone type
-/// definition. The type is parsed by the same [parse_column_def] a table
-/// column uses (a domain carries no key, so a PRIMARY KEY / UNIQUE tail
-/// falls back). A `DEFAULT` clause is carried on the ColumnDef; CHECK and
-/// COLLATE clauses (which the engine stores as BLR/source) parse to None.
+/// Split a domain definition tail at its `CHECK (...)` clause: the
+/// definition with the clause removed, plus the clause VERBATIM
+/// (`CHECK (...)`, original spelling - the engine stores the source as
+/// written). The scan is quote-aware (`'` strings, `"` identifiers)
+/// and depth-aware, so a CHECK word inside a literal or a DEFAULT's
+/// parentheses is not one. None in the second slot when there is no
+/// CHECK clause; the usize is the clause's byte offset in `tail`, for
+/// the caller's clause-ORDER check (the engine's grammar puts DEFAULT
+/// before CHECK - review-caught: fc accepted `CHECK (...) DEFAULT 5`
+/// where the engine -104s).
+fn split_domain_check(tail: &str) -> (String, Option<(String, usize)>) {
+    let b = tail.as_bytes();
+    let mut i = 0usize;
+    let mut depth = 0i32;
+    while i < b.len() {
+        match b[i] {
+            b'\'' | b'"' => {
+                let q = b[i];
+                i += 1;
+                while i < b.len() {
+                    if b[i] == q {
+                        if i + 1 < b.len() && b[i + 1] == q {
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'(' => {
+                depth += 1;
+                i += 1;
+            }
+            b')' => {
+                depth -= 1;
+                i += 1;
+            }
+            c if depth == 0 && (c == b'C' || c == b'c') => {
+                let word_start = i == 0 || !b[i - 1].is_ascii_alphanumeric() && b[i - 1] != b'_' && b[i - 1] != b'$';
+                // BYTE comparison - a &str slice at i+5 panics when a
+                // multibyte character straddles it (review-caught)
+                if word_start
+                    && b.len() - i >= 5
+                    && b[i..i + 5].eq_ignore_ascii_case(b"CHECK")
+                    && !b
+                        .get(i + 5)
+                        .is_some_and(|n| n.is_ascii_alphanumeric() || *n == b'_' || *n == b'$')
+                {
+                    // the balanced group after the keyword
+                    let after = &tail[i + 5..];
+                    let ws = after.len() - after.trim_start().len();
+                    if after.trim_start().starts_with('(') {
+                        let open = i + 5 + ws;
+                        let mut d = 0i32;
+                        let mut j = open;
+                        let jb = tail.as_bytes();
+                        while j < jb.len() {
+                            match jb[j] {
+                                b'\'' | b'"' => {
+                                    let q = jb[j];
+                                    j += 1;
+                                    while j < jb.len() {
+                                        if jb[j] == q {
+                                            if j + 1 < jb.len() && jb[j + 1] == q {
+                                                j += 2;
+                                                continue;
+                                            }
+                                            break;
+                                        }
+                                        j += 1;
+                                    }
+                                }
+                                b'(' => d += 1,
+                                b')' => {
+                                    d -= 1;
+                                    if d == 0 {
+                                        let src = tail[i..=j].to_string();
+                                        let rest =
+                                            format!("{} {}", &tail[..i], &tail[j + 1..]);
+                                        return (rest.trim().to_string(), Some((src, i)));
+                                    }
+                                }
+                                _ => {}
+                            }
+                            j += 1;
+                        }
+                        // unbalanced: leave it in place - the caller's
+                        // type parse refuses the malformed tail
+                        return (tail.to_string(), None);
+                    }
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    (tail.to_string(), None)
+}
+
+/// Rewrite every `VALUE` reference of a domain-check condition to
+/// [fire_crab_ods::expr::Expr::DomainValue] (`blr_fid 0, 0,0`). None
+/// when the condition references any OTHER field name - only `VALUE`
+/// exists inside a domain check, so anything else must refuse.
+fn cond_value_to_fid(c: &fire_crab_ods::expr::Cond) -> Option<fire_crab_ods::expr::Cond> {
+    use fire_crab_ods::expr::Cond;
+    Some(match c {
+        Cond::Cmp(op, l, r) => Cond::Cmp(*op, expr_value_to_fid(l)?, expr_value_to_fid(r)?),
+        Cond::And(a, b) => Cond::And(
+            Box::new(cond_value_to_fid(a)?),
+            Box::new(cond_value_to_fid(b)?),
+        ),
+        Cond::Or(a, b) => Cond::Or(
+            Box::new(cond_value_to_fid(a)?),
+            Box::new(cond_value_to_fid(b)?),
+        ),
+        Cond::Not(i) => Cond::Not(Box::new(cond_value_to_fid(i)?)),
+        Cond::Missing(e) => Cond::Missing(expr_value_to_fid(e)?),
+        Cond::NotMissing(e) => Cond::NotMissing(expr_value_to_fid(e)?),
+    })
+}
+
+fn expr_value_to_fid(e: &fire_crab_ods::expr::Expr) -> Option<fire_crab_ods::expr::Expr> {
+    use fire_crab_ods::expr::Expr;
+    Some(match e {
+        Expr::Field { name, .. } if name.eq_ignore_ascii_case("VALUE") => Expr::DomainValue,
+        Expr::Field { .. } | Expr::Variable(_) | Expr::DomainValue => return None,
+        Expr::IntLiteral(_) | Expr::Int64Literal(_) | Expr::TextLiteral(_) | Expr::NullLiteral => {
+            e.clone()
+        }
+        Expr::Add(l, r) => Expr::Add(
+            Box::new(expr_value_to_fid(l)?),
+            Box::new(expr_value_to_fid(r)?),
+        ),
+        Expr::Subtract(l, r) => Expr::Subtract(
+            Box::new(expr_value_to_fid(l)?),
+            Box::new(expr_value_to_fid(r)?),
+        ),
+        Expr::Multiply(l, r) => Expr::Multiply(
+            Box::new(expr_value_to_fid(l)?),
+            Box::new(expr_value_to_fid(r)?),
+        ),
+        Expr::Divide(l, r) => Expr::Divide(
+            Box::new(expr_value_to_fid(l)?),
+            Box::new(expr_value_to_fid(r)?),
+        ),
+    })
+}
+
+/// Compile a domain `CHECK`'s search condition to the engine's stored
+/// validation BLR. `inner` is the source after the CHECK keyword
+/// (`" (VALUE > 10)"`); the type facts are the DOMAIN's own - `VALUE`
+/// types as a column of that type would ([check_cond_typechecks]'s int
+/// + NONE-charset-text surface, the same pinned literal shapes the
+/// table-CHECK compiler stores). None refuses the statement - never a
+/// domain silently created without its check.
+fn compile_domain_check(inner: &str, dtype: u8, scale: i8, sub_type: i16) -> Option<Vec<u8>> {
+    let cond = parse_cond(inner)?;
+    let field_rank = |name: &str| {
+        if !name.eq_ignore_ascii_case("VALUE") {
+            return None;
+        }
+        // NUMERIC/DECIMAL (sub_type 1/2, or any scale) stays outside the
+        // int surface, exactly as the table-CHECK compiler's closure
+        if scale != 0 || sub_type != 0 {
+            return None;
+        }
+        if dtype == fire_crab_ods::format::dtype::INT128 {
+            return Some(IntRank::Int128);
+        }
+        dtype_rank(dtype)
+    };
+    let field_is_text = |name: &str| {
+        // sub_type is the ttype for a text column - only the NONE
+        // charset meets the pinned blr_text2 literal shape
+        name.eq_ignore_ascii_case("VALUE")
+            && sub_type == 0
+            && matches!(
+                dtype,
+                fire_crab_ods::format::dtype::TEXT | fire_crab_ods::format::dtype::VARYING
+            )
+    };
+    if !check_cond_typechecks(&cond, &field_rank, &field_is_text) {
+        return None;
+    }
+    for e in cond.operands() {
+        if !expr_all_plain(e) {
+            return None;
+        }
+    }
+    let cond = cond_value_to_fid(&cond)?;
+    Some(fire_crab_ods::expr::domain_validation_blr(&cond))
+}
+
+/// Parse `CREATE DOMAIN <name> [AS] <type> [NOT NULL] [CHECK (...)]` - a
+/// standalone type definition. The type is parsed by the same
+/// [parse_column_def] a table column uses (a domain carries no key, so a
+/// PRIMARY KEY / UNIQUE tail falls back). A `DEFAULT` clause is carried
+/// on the ColumnDef; a CHECK clause compiles to the engine's validation
+/// BLR (or refuses the whole statement - never a domain without its
+/// check); COLLATE still parses to None.
 fn plan_create_domain(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
     let s = sql.trim().trim_end_matches(';').trim();
     let up = s.to_ascii_uppercase();
@@ -19101,11 +19631,29 @@ fn plan_create_domain(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
     if up_tail == "AS" || up_tail.starts_with("AS ") {
         tail = tail[2..].trim();
     }
-    let (col, key) = parse_column_def(&format!("{} {}", name, tail))?;
+    let (tail_wo_check, check_src) = split_domain_check(tail);
+    let (col, key) = parse_column_def(&format!("{} {}", name, tail_wo_check))?;
     if key.is_some() {
         return None; // a domain has no PRIMARY KEY / UNIQUE
     }
-    Some((Plan::CreateDomain { col }, Vec::new()))
+    let check = match &check_src {
+        None => None,
+        Some((src, check_at)) => {
+            // the engine's clause order is DEFAULT [NOT NULL] CHECK: a
+            // DEFAULT after the CHECK clause is a -104 there - refuse
+            // rather than create what the engine cannot parse
+            let masked_tail = mask_literals(&tail.to_ascii_uppercase());
+            if find_word(&masked_tail, "DEFAULT", *check_at).is_some() {
+                return None;
+            }
+            if !col.dims.is_empty() {
+                return None; // an ARRAY domain's check is outside this surface
+            }
+            let blr = compile_domain_check(&src["CHECK".len()..], col.dtype, col.scale, col.sub_type)?;
+            Some((blr, src.clone()))
+        }
+    };
+    Some((Plan::CreateDomain { col, check }, Vec::new()))
 }
 
 /// Parse `DROP DOMAIN <name>`.
@@ -21226,6 +21774,11 @@ fn plan_insert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
         check_predicates(db, table, &columns, descs, DmlGuard::Insert)
     });
     let checks = checks?;
+    // the columns' DOMAIN CHECKs; an unevaluatable one refuses the
+    // whole statement, exactly as a table check does
+    let domain_checks = timed("plan:domain-checks", || {
+        domain_check_predicates(db, table, &columns, descs)
+    })?;
     let descs = descs.clone();
     let not_null = timed("plan:not-null", || not_null_fids(db, table));
     // the FKs on this table: the stored row must reference existing
@@ -21251,6 +21804,7 @@ fn plan_insert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
             param_fields,
             gen_fields,
             checks,
+            domain_checks,
             not_null,
             fk_refs,
             default_fields,
@@ -23237,6 +23791,10 @@ fn plan_update(sql: &str, db_outer: &Option<Database>) -> Option<(Plan, Vec<Desc
         })
         .collect();
     let checks = check_predicates(db, table, &columns, descs, DmlGuard::Update(&set_names))?;
+    // DOMAIN CHECKs: the engine validates EVERY validated column of the
+    // patched row, not just the SET list's (measured), so the list does
+    // not narrow by assignment
+    let domain_checks = domain_check_predicates(db, table, &columns, descs)?;
     let format_no = *format_no;
     let not_null = not_null_fids(db, table);
     // the FK partner checks, both directions, narrowed to the FKs whose
@@ -23282,6 +23840,7 @@ fn plan_update(sql: &str, db_outer: &Option<Database>) -> Option<(Plan, Vec<Desc
             index_ops,
             not_null,
             checks,
+            domain_checks,
             fk_refs,
             fk_children,
             index,
@@ -24512,8 +25071,59 @@ fn execute_dml_collecting_inner(
             fire_crab_ods::ddl::drop_role(&mut work, db.page_size, name)?;
             (0, 0, 0)
         }
-        Plan::CreateDomain { col } => {
+        Plan::CreateDomain { col, check } => {
             fire_crab_ods::ddl::create_domain(&mut work, db.page_size, col)?;
+            if let Some((blr, src)) = check {
+                fire_crab_ods::ddl::set_domain_validation(
+                    &mut work,
+                    db.page_size,
+                    &col.name,
+                    blr,
+                    src,
+                )?;
+            }
+            (0, 0, 0)
+        }
+        Plan::AlterDomainCheck { domain, check } => {
+            let payload = match check {
+                None => None,
+                Some(src) => {
+                    let want = domain.trim().trim_matches('"').to_ascii_uppercase();
+                    // the DUPLICATE refusal comes FIRST, before the new
+                    // check is even compiled - an out-of-surface second
+                    // check still gets the engine's "Only one
+                    // constraint" vector (review-caught)
+                    if fire_crab_ods::ddl::domain_validation_present(&work, db.page_size, &want) {
+                        return Err("Only one constraint allowed for a domain".into());
+                    }
+                    let (ft, _, scale, sub) =
+                        fire_crab_ods::ddl::domain_type_info(&work, db.page_size, &want)
+                            .ok_or_else(|| format!("Domain {} not found", want))?;
+                    let dt = fire_crab_ods::ddl::field_type_to_dtype(ft)
+                        .ok_or("this domain's type is outside the CHECK surface")?;
+                    // the catalog's RDB$FIELD_SUB_TYPE is 1/2 for
+                    // NUMERIC/DECIMAL; for text the charset gates the
+                    // pinned NONE-charset literal shape instead
+                    let eff_sub = if matches!(
+                        dt,
+                        fire_crab_ods::format::dtype::TEXT | fire_crab_ods::format::dtype::VARYING
+                    ) {
+                        fire_crab_ods::ddl::domain_charset_id(&work, db.page_size, &want)
+                            .unwrap_or(0) as i16
+                    } else {
+                        sub
+                    };
+                    let blr = compile_domain_check(&src["CHECK".len()..], dt, scale, eff_sub)
+                        .ok_or("this ALTER DOMAIN check is outside this server's surface")?;
+                    Some((blr, src.clone()))
+                }
+            };
+            fire_crab_ods::ddl::alter_domain_check(
+                &mut work,
+                db.page_size,
+                domain,
+                payload.as_ref().map(|(b, s)| (b.as_slice(), s.as_str())),
+            )?;
             (0, 0, 0)
         }
         Plan::DropDomain { name } => {
@@ -24816,7 +25426,7 @@ fn execute_dml_collecting_inner(
             )?;
             (0, 0, 0)
         }
-        Plan::Insert { rel, table, format_no, image, descs, index_ops, param_fields, gen_fields, not_null, checks, fk_refs, default_fields, blob_lits } => {
+        Plan::Insert { rel, table, format_no, image, descs, index_ops, param_fields, gen_fields, not_null, checks, domain_checks, fk_refs, default_fields, blob_lits } => {
             let mut image = image.clone();
             // MATERIALISE the temporary blobs the parameters name (blb::move):
             // the closed temp blob's segments land in THIS relation's pages
@@ -24923,15 +25533,12 @@ fn execute_dml_collecting_inner(
                     }
                 }
             }
-            // NOT NULL validation, where the engine validates: at store
-            for fid in not_null {
-                if image[fid / 8] & (1 << (fid % 8)) != 0 {
-                    return Err(not_valid_err(db, table, *fid));
-                }
-            }
-            // CHECK constraints, where the engine's triggers fire: the
-            // stored predicate is the NEGATED condition, so a match is a
-            // violation; an UNKNOWN (NULL-operand) check passes
+            // CHECK constraints FIRST - the engine's PRE-STORE check
+            // triggers fire before the per-field validations (measured:
+            // a NULL NOT NULL column beside a violated table CHECK
+            // reports the CHECK). The stored predicate is the NEGATED
+            // condition, so a match is a violation; an UNKNOWN
+            // (NULL-operand) check passes
             if !checks.is_empty() {
                 let values = decode_record(&image, descs);
                 for c in checks {
@@ -24942,6 +25549,12 @@ fn execute_dml_collecting_inner(
                     }
                 }
             }
+            // the VALIDATIONS - domain CHECKs and NOT NULL - in FIELD
+            // ORDER, where the engine validates: at store, one walk
+            // over the fields, so an earlier field's violation wins
+            // regardless of kind (measured: field 0's NOT NULL beats
+            // field 1's domain check)
+            validate_row_fields(db, table, &image, descs, domain_checks, not_null)?;
             // FOREIGN KEY child-side partner check, where the engine
             // checks at store: the bound row's key must reference an
             // existing parent row (a NULL component passes)
@@ -24983,7 +25596,7 @@ fn execute_dml_collecting_inner(
             }
             (1, 0, 0)
         }
-        Plan::Update { rel, table, format_no, formats, sets, filter, index_ops, not_null, checks, fk_refs, fk_children, index, defer, gen_filter } => {
+        Plan::Update { rel, table, format_no, formats, sets, filter, index_ops, not_null, checks, domain_checks, fk_refs, fk_children, index, defer, gen_filter } => {
             let descs = formats
                 .iter()
                 .find(|(n, _)| n == format_no)
@@ -25266,13 +25879,11 @@ fn execute_dml_collecting_inner(
                         }
                     }
                 }
-                for fid in not_null {
-                    if img[fid / 8] & (1 << (fid % 8)) != 0 {
-                        return Err(not_valid_err(db, table, *fid));
-                    }
-                }
-                // CHECK constraints on the PATCHED row (negated - a
-                // match is a violation, an UNKNOWN check passes)
+                // CHECK constraints on the PATCHED row FIRST (negated -
+                // a match is a violation, an UNKNOWN check passes; the
+                // engine's PRE-UPDATE check triggers fire before its
+                // per-field validations - measured on INSERT, same
+                // trigger order here)
                 if !checks.is_empty() {
                     let new_values = decode_record(&img, descs);
                     for c in checks {
@@ -25283,6 +25894,10 @@ fn execute_dml_collecting_inner(
                         }
                     }
                 }
+                // the VALIDATIONS - domain CHECKs and NOT NULL - in
+                // field order over the MERGED row: every validated
+                // column re-validates, assigned or not (measured)
+                validate_row_fields(db, table, &img, descs, domain_checks, not_null)?;
                 // FOREIGN KEY partner checks, both directions: the
                 // patched row's own FK key must still have a parent,
                 // and a changed key of THIS row must not strand
@@ -26610,6 +27225,106 @@ fn entry_err_to_exec(
         },
         EntryErr::Ods(s) => ExecErr::Text(s),
     }
+}
+
+/// The per-field VALIDATION walk of a row about to store: for each
+/// field in FIELD ORDER, its domain CHECK (a match on the negated
+/// predicate is a violation), then its NOT NULL - one walk, so the
+/// earliest field's violation is the one reported, whatever its kind
+/// (the engine's makeValidation order, measured). Runs on the final
+/// image - defaults filled, SETs applied - exactly where the engine
+/// validates.
+fn validate_row_fields(
+    db: &Database,
+    table: &str,
+    image: &[u8],
+    descs: &[Descriptor],
+    domain_checks: &[DomainCheck],
+    not_null: &[usize],
+) -> Result<(), ExecErr> {
+    if domain_checks.is_empty() && not_null.is_empty() {
+        return Ok(());
+    }
+    let mut fids: Vec<usize> = domain_checks
+        .iter()
+        .map(|c| c.fid)
+        .chain(not_null.iter().copied())
+        .collect();
+    fids.sort_unstable();
+    fids.dedup();
+    let values = if domain_checks.is_empty() {
+        None
+    } else {
+        Some(decode_record(image, descs))
+    };
+    for fid in fids {
+        if let Some(c) = domain_checks.iter().find(|c| c.fid == fid) {
+            let vals = values.as_deref().unwrap_or(&[]);
+            match c.pred.matches(vals) {
+                Ok(true) => {
+                    return Err(ExecErr::Eval(EvalErr::NotValid {
+                        column: format!(
+                            "\"PUBLIC\".\"{}\".\"{}\"",
+                            table.trim_matches('"').to_ascii_uppercase(),
+                            c.column.trim_end()
+                        ),
+                        value: validation_value_text(vals.get(c.fid).unwrap_or(&Value::Null)),
+                    }))
+                }
+                Ok(false) => {}
+                Err(e) => return Err(ExecErr::Eval(e)),
+            }
+        }
+        if not_null.contains(&fid) && image[fid / 8] & (1 << (fid % 8)) != 0 {
+            return Err(not_valid_err(db, table, fid));
+        }
+    }
+    Ok(())
+}
+
+/// The offending value as the engine's `isc_not_valid` message renders
+/// it (`MOV_make_string`): NULL is the `*** null ***` marker, text is
+/// its raw self, exact numerics print with their scale, a DATE is ISO -
+/// and a TIMESTAMP is the LEGACY form `07-JUN-2019 8:09:10.5000`
+/// (measured: day zero-padded, month 3-letter uppercase, hour
+/// UNPADDED, 4-digit fraction), unlike every other render in this
+/// server.
+fn validation_value_text(v: &Value) -> String {
+    match v {
+        Value::Null => "*** null ***".into(),
+        Value::Text(t) => t.clone(),
+        Value::Bool(b) => (if *b { "TRUE" } else { "FALSE" }).into(),
+        // a standalone TIME keeps the PADDED hour (engine "08:09:10.5000"
+        // - review-caught: only the TIMESTAMP render is legacy-unpadded)
+        Value::Timestamp(d, t) => {
+            format!("{} {}", legacy_date_text(*d), legacy_time_text(*t))
+        }
+        _ => v.render(),
+    }
+}
+
+/// `07-JUN-2019` - the engine's internal date-to-text form, used only
+/// by status-vector value rendering here.
+fn legacy_date_text(days: i32) -> String {
+    // the ISO render already solves civil-from-days; re-split it
+    let iso = Value::Date(days).render();
+    let mut parts = iso.split('-');
+    let (y, m, d) = (
+        parts.next().unwrap_or(""),
+        parts.next().unwrap_or("01"),
+        parts.next().unwrap_or("01"),
+    );
+    const MON: [&str; 12] = [
+        "JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC",
+    ];
+    let mi = m.parse::<usize>().unwrap_or(1).clamp(1, 12);
+    format!("{}-{}-{}", d, MON[mi - 1], y)
+}
+
+/// `8:09:10.5000` - hour unpadded, the rest 2-digit, 4-digit fraction.
+fn legacy_time_text(t: u32) -> String {
+    let s = t / 10_000;
+    format!("{}:{:02}:{:02}.{:04}", s / 3600, (s / 60) % 60, s % 60, t % 10_000)
 }
 
 /// The engine's NOT NULL refusal: `isc_not_valid` with the quoted
@@ -38607,6 +39322,7 @@ fn describe_for(plan: &Plan, params: &[Descriptor], att: AttCs) -> Vec<u8> {
         | Plan::CreateDomain { .. } | Plan::DropDomain { .. }
         | Plan::AlterDomainDefault { .. } | Plan::AlterDomainRename { .. }
         | Plan::AlterDomainNotNull { .. }
+        | Plan::AlterDomainCheck { .. }
         | Plan::AlterDomainType { .. }
         | Plan::AlterIndex { .. }
         | Plan::SetStatistics { .. }
@@ -38716,6 +39432,7 @@ fn stmt_type_of(plan: &Plan) -> i32 {
         | Plan::CreateDomain { .. } | Plan::DropDomain { .. }
         | Plan::AlterDomainDefault { .. } | Plan::AlterDomainRename { .. }
         | Plan::AlterDomainNotNull { .. }
+        | Plan::AlterDomainCheck { .. }
         | Plan::AlterDomainType { .. }
         | Plan::AlterIndex { .. }
         | Plan::SetStatistics { .. }
@@ -40283,6 +41000,7 @@ fn emit_rows_inner(
         | Plan::CreateDomain { .. } | Plan::DropDomain { .. }
         | Plan::AlterDomainDefault { .. } | Plan::AlterDomainRename { .. }
         | Plan::AlterDomainNotNull { .. }
+        | Plan::AlterDomainCheck { .. }
         | Plan::AlterDomainType { .. }
         | Plan::AlterIndex { .. }
         | Plan::SetStatistics { .. }
@@ -55521,6 +56239,7 @@ fn eval_psql_expr(e: &fire_crab_ods::expr::Expr, f: &PsqlFrame) -> Result<Value,
         E::Variable(n) => Ok(f.vars.get(*n as usize).cloned().unwrap_or(Value::Null)),
         // a bare column reference has no row to read inside a procedure
         E::Field { .. } => Err(PsqlStop::Unsupported),
+        E::DomainValue => Err(PsqlStop::Unsupported),
         E::Add(a, b) => bin(a, b, |x, y| x.checked_add(y)),
         E::Subtract(a, b) => bin(a, b, |x, y| x.checked_sub(y)),
         E::Multiply(a, b) => bin(a, b, |x, y| x.checked_mul(y)),
@@ -56801,6 +57520,7 @@ fn render_psql_expr(e: &fire_crab_ods::expr::Expr, f: &PsqlFrame) -> Option<Stri
         E::NullLiteral => "NULL".to_string(),
         E::Variable(n) => psql_literal(f.vars.get(*n as usize).unwrap_or(&Value::Null))?,
         E::Field { name, .. } => name.clone(),
+        E::DomainValue => return None, // never appears in a PSQL body
         E::Add(a, b) => format!("({} + {})", render_psql_expr(a, f)?, render_psql_expr(b, f)?),
         E::Subtract(a, b) => format!("({} - {})", render_psql_expr(a, f)?, render_psql_expr(b, f)?),
         E::Multiply(a, b) => format!("({} * {})", render_psql_expr(a, f)?, render_psql_expr(b, f)?),
@@ -62396,6 +63116,7 @@ fn after_auth(
                         | Plan::DropDomain { .. }
                         | Plan::AlterDomainDefault { .. } | Plan::AlterDomainRename { .. }
                         | Plan::AlterDomainNotNull { .. }
+                        | Plan::AlterDomainCheck { .. }
                         | Plan::AlterDomainType { .. }
                         | Plan::AlterIndex { .. }
                         | Plan::SetStatistics { .. }
@@ -66210,13 +66931,15 @@ fn encode_request_message(fields: &[BField], vals: &[Value]) -> Vec<u8> {
                 m.extend_from_slice(&n.to_be_bytes());
             }
             BField::Quad => {
-                // a blob id: the 8-byte on-disk bid layout (encode_blob_id) -
-                // the SAME bytes the row encoder sends and op_open_blob
-                // decodes, so a client that opens the id reaches the blob's
-                // content (SHOW PROCEDURE's source). A NULL/absent blob is a
-                // zero id the client leaves unopened.
+                // a blob id crosses the wire as an XDR_QUAD - each 32-bit
+                // half big-endian ([quad_wire]), exactly as the DSQL fetch
+                // path sends it and op_open_blob2 decodes it back. This
+                // used to ship the RAW on-disk bid layout, and isql's SHOW
+                // PROCEDURE opened a byte-garbled id and printed an EMPTY
+                // body (caught by serve-real-show after the fact). A
+                // NULL/absent blob is a zero id the client leaves unopened.
                 let id = match v {
-                    Value::Blob(rel, num) => encode_blob_id(rel, num),
+                    Value::Blob(rel, num) => quad_wire(&encode_blob_id(rel, num)),
                     _ => [0u8; 8],
                 };
                 m.extend_from_slice(&id);
@@ -72826,11 +73549,12 @@ mod tests {
         assert_eq!(m2, vec![0, 0, 0, 0]);
         // a quad is 8 zero bytes for a NULL blob; a bool is one byte padded
         assert_eq!(encode_request_message(&[BField::Quad], &[Value::Null]).len(), 8);
-        // a non-NULL blob travels as the on-disk bid layout (encode_blob_id),
-        // the id op_open_blob decodes back - SHOW PROCEDURE's source
+        // a non-NULL blob travels as the XDR_QUAD wire form (each half
+        // big-endian - quad_wire over the on-disk bid layout), the id
+        // op_open_blob2 decodes back - SHOW PROCEDURE's source
         assert_eq!(
             encode_request_message(&[BField::Quad], &[Value::Blob(5, 0x2a)]),
-            encode_blob_id(5, 0x2a).to_vec()
+            quad_wire(&encode_blob_id(5, 0x2a)).to_vec()
         );
         assert_eq!(
             encode_request_message(&[BField::Bool], &[Value::Bool(true)]),
@@ -73492,6 +74216,7 @@ mod tests {
             gen_fields: Vec::new(),
             not_null: Vec::new(),
             checks: Vec::new(),
+            domain_checks: Vec::new(),
             fk_refs: Vec::new(),
             default_fields: Vec::new(),
             blob_lits: Vec::new(),
@@ -73586,6 +74311,7 @@ mod tests {
                 gen_fields: Vec::new(),
                 not_null: Vec::new(),
                 checks: Vec::new(),
+                domain_checks: Vec::new(),
                 fk_refs: Vec::new(),
                 default_fields: Vec::new(),
                 blob_lits: Vec::new(),
@@ -73602,6 +74328,7 @@ mod tests {
                 index_ops: Vec::new(),
                 not_null: Vec::new(),
                 checks: Vec::new(),
+                domain_checks: Vec::new(),
                 fk_refs: Vec::new(),
                 fk_children: Vec::new(),
                 index: None,
@@ -74480,6 +75207,85 @@ mod tests {
         assert_eq!(blr, hex("05020300000700012D1A00001100020201150800030000001A0000FFFFFF4C"));
     }
 
+    /// Engine-DUMPED golden bytes: a DOMAIN CHECK compiles to the bare
+    /// POSITIVE boolean (`blr_version5, <cond>, blr_eoc` - no trigger
+    /// wrapper, no negation), `VALUE` as `blr_fid 0, 0,0`; a written
+    /// NOT normalizes into the inverted comparison; IS NOT NULL keeps
+    /// its `blr_not blr_missing`; a text literal is `blr_text2` with
+    /// the NONE charset.
+    #[test]
+    fn domain_checks_compile_to_engine_validation_blr() {
+        use fire_crab_ods::format::dtype;
+        // CHECK (VALUE > 100) on INTEGER - blobdumped from the engine
+        assert_eq!(
+            compile_domain_check(" (VALUE > 100)", dtype::LONG, 0, 0).unwrap(),
+            vec![5, 49, 24, 0, 0, 0, 21, 8, 0, 100, 0, 0, 0, 76]
+        );
+        // CHECK (NOT (VALUE > 5)) stores blr_leq - no blr_not (dumped)
+        assert_eq!(
+            compile_domain_check(" (NOT (VALUE > 5))", dtype::LONG, 0, 0).unwrap(),
+            vec![5, 52, 24, 0, 0, 0, 21, 8, 0, 5, 0, 0, 0, 76]
+        );
+        // CHECK (VALUE IS NOT NULL) keeps blr_not blr_missing (dumped)
+        assert_eq!(
+            compile_domain_check(" (VALUE IS NOT NULL)", dtype::LONG, 0, 0).unwrap(),
+            vec![5, 59, 61, 24, 0, 0, 0, 76]
+        );
+        // CHECK (VALUE <> 'no') on VARCHAR(7), charset NONE (dumped)
+        assert_eq!(
+            compile_domain_check(" (VALUE <> 'no')", dtype::VARYING, 0, 0).unwrap(),
+            vec![5, 48, 24, 0, 0, 0, 21, 15, 0, 0, 2, 0, b'n', b'o', 76]
+        );
+        // refusals: a foreign field name, a scaled/NUMERIC type, a
+        // tabled-charset text domain, a class-crossing comparison
+        assert!(compile_domain_check(" (X > 1)", dtype::LONG, 0, 0).is_none());
+        assert!(compile_domain_check(" (VALUE > 1)", dtype::LONG, -2, 1).is_none());
+        assert!(compile_domain_check(" (VALUE <> 'a')", dtype::VARYING, 0, 4).is_none());
+        assert!(compile_domain_check(" (VALUE > 'x')", dtype::LONG, 0, 0).is_none());
+        // the CREATE DOMAIN planner carries the compiled pair verbatim
+        match plan_create_domain("CREATE DOMAIN DP AS INTEGER CHECK (VALUE > 100)") {
+            Some((Plan::CreateDomain { check: Some((blr, src)), .. }, _)) => {
+                assert_eq!(blr, vec![5, 49, 24, 0, 0, 0, 21, 8, 0, 100, 0, 0, 0, 76]);
+                assert_eq!(src, "CHECK (VALUE > 100)");
+            }
+            other => panic!("expected CreateDomain with check, got {:?}", other.is_some()),
+        }
+        // DEFAULT survives beside the check; the check clause is gone
+        // from the type parse
+        match plan_create_domain("CREATE DOMAIN DP AS INTEGER DEFAULT 5 CHECK (VALUE > 0)") {
+            Some((Plan::CreateDomain { col, check: Some(_) }, _)) => {
+                assert!(col.default.is_some());
+            }
+            other => panic!("expected CreateDomain, got {:?}", other.is_some()),
+        }
+        // an unsupported check refuses the WHOLE statement - never a
+        // domain silently created without its rule
+        assert!(plan_create_domain("CREATE DOMAIN DP AS NUMERIC(9,2) CHECK (VALUE > 0)").is_none());
+        // ALTER DOMAIN: both constraint forms parse; the check text
+        // rides to execute verbatim
+        match plan_alter_domain("ALTER DOMAIN D ADD CONSTRAINT CHECK (VALUE > 3)") {
+            Some((Plan::AlterDomainCheck { check: Some(src), .. }, _)) => {
+                assert_eq!(src, "CHECK (VALUE > 3)");
+            }
+            other => panic!("expected AlterDomainCheck ADD, got {:?}", other.is_some()),
+        }
+        assert!(matches!(
+            plan_alter_domain("ALTER DOMAIN D ADD CHECK (VALUE > 3)"),
+            Some((Plan::AlterDomainCheck { check: Some(_), .. }, _))
+        ));
+        assert!(matches!(
+            plan_alter_domain("ALTER DOMAIN D DROP CONSTRAINT"),
+            Some((Plan::AlterDomainCheck { check: None, .. }, _))
+        ));
+        // the VALUE substitution: quote-aware, word-boundary, function args
+        assert_eq!(substitute_value_word("VALUE > 10", "V"), "V > 10");
+        assert_eq!(
+            substitute_value_word("value IN ('VALUE', 'x') OR F(VALUE)", "V"),
+            "V IN ('VALUE', 'x') OR F(V)"
+        );
+        assert_eq!(substitute_value_word("XVALUE + VALUES", "V"), "XVALUE + VALUES");
+    }
+
     /// Engine-probed golden facts (inc 111): a CHECK constraint compiles
     /// to the if-failed-raise trigger BLR with the NEGATED condition
     /// (fields in context 1), keeps its verbatim source, and slots into
@@ -74938,7 +75744,7 @@ mod tests {
     #[test]
     fn parses_create_drop_domain() {
         match plan_create_domain("CREATE DOMAIN D_INT AS INTEGER") {
-            Some((Plan::CreateDomain { col }, _)) => {
+            Some((Plan::CreateDomain { col, .. }, _)) => {
                 assert_eq!(col.name, "D_INT");
                 assert_eq!(col.field_type, 8);
                 assert!(!col.not_null);
@@ -74947,7 +75753,7 @@ mod tests {
         }
         // the AS is optional; NOT NULL sets the flag; VARCHAR keeps char_len
         match plan_create_domain("create domain d_name varchar(20) not null") {
-            Some((Plan::CreateDomain { col }, _)) => {
+            Some((Plan::CreateDomain { col, .. }, _)) => {
                 assert_eq!(col.name, "D_NAME");
                 assert_eq!(col.field_type, 37);
                 assert_eq!(col.char_len, Some(20));
@@ -75188,7 +75994,8 @@ mod tests {
             other => panic!("expected AlterDomainType varchar, got {:?}", other.is_some()),
         }
         // unmodelled ALTER DOMAIN forms, and non-domains, fall back
-        assert!(plan_alter_domain("ALTER DOMAIN DOM_A DROP CONSTRAINT").is_none());
+        // (DROP CONSTRAINT is modelled now - the domain-check slice)
+        assert!(plan_alter_domain("ALTER DOMAIN DOM_A SET SOMETHING").is_none());
         assert!(plan_alter_domain("ALTER TABLE T ADD A INT").is_none());
     }
 
