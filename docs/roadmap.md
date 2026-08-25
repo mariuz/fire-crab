@@ -256,6 +256,49 @@ A*1.5`). Boundary: an intermediate that overflows i64 raises 22003
 overflow" (both 22003) — fc's i128 numeric model, consistent with the
 server's own `numeric_bin`.
 
+**SQL COMMENTS accepted everywhere DONE (2026-08-25,
+`serve-real-comments` 7):** `/* ... */` and `-- to end of line` in any
+statement, as the engine's lexer treats them - whitespace. fire-crab
+refused a comment ANYWHERE outside a PSQL body (`SELECT 1 /* c */` was a
+generic 42000), which kept every real-world script off the server.
+`strip_sql_comments` was rewritten as a POSITION-PRESERVING blanker -
+every comment byte becomes one space, so byte length and every offset
+(the error line/col mapping included) match the original; quote-aware
+for `'` strings and `"` identifiers with doubled-quote escapes; block
+comments unnested (the first `*/` closes, and the engine -104s the
+leftover of a "nested" one); a comment separates tokens
+(`SELECT/*t*/2`); unterminated blanks to the end - and applied at the
+FOUR statement entries: the three wire decode sites (op_exec_immediate,
+op_exec_immediate2, op_prepare) and PSQL's EXECUTE STATEMENT dynamic
+text. The PSQL body parser's own two strip calls became the same
+function, which also retired its latent Latin-1 mangling of non-ASCII
+bodies (the old byte-through-`as char` copy). Commented DDL now
+compiles and the ENGINE runs what fc stored - procedures, triggers,
+views, CHECK constraints (re-parsed at every DML from stored source)
+and COMPUTED columns, value- and vector-exact. Boundaries (recorded): a
+routine/view/check created THROUGH fc's wire stores its RDB$SOURCE with
+the comments BLANKED to spaces - same length, same line/col coordinates
+- where the engine stores them verbatim (fc's RDB$DEFAULT_SOURCE was
+already re-rendered, the precedent; gbak-carried and engine-built
+sources keep their comments, and EVERY stored-source re-parser now
+strips at read time - the adversarial review caught the three that did
+not (the view re-plan, computed columns and the CHECK predicate parser
+read engine-built sources raw: a '--' comment there parsed as DOUBLE
+NEGATION, a '/*' refused DML the engine serves - all three fixed and
+gated on an engine-built file), plus two more port misses fixed: an
+UNTERMINATED block comment was silently swallowed where the engine
+-104s (the entries now pass the original through and refuse), and
+block-comment NEWLINES were blanked where the engine counts lines
+through a comment (the 'At ... line:' frames kept their numbers only by
+luck). The nested-comment and comment-split-operator refusals wear
+fc's generic vector where the engine spells -104. Pre-existing gaps the
+review surfaced for the candidate list: q'{...}' alternative quoting
+(refused entirely), the doubled-quote identifier rendering (fc shows
+a""b where the engine undoubles), and - notable - DOMAIN CHECK
+validation is never evaluated by fc (RDB$VALIDATION_SOURCE has no
+consumer: an INSERT violating a domain CHECK writes silently where the
+engine raises 23000).
+
 **Constant EXPRESSIONS in INSERT ... VALUES - and the boolean wire fix -
 DONE (2026-08-24, `serve-real-insertexpr` 8):** the engine accepts any
 value expression in a VALUES list; fire-crab's was a fixed set of token

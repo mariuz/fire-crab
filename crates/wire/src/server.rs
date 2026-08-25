@@ -11161,7 +11161,10 @@ fn computed_sources_uncached(
     for (id, r, n) in blobs {
         if let Some(bytes) = fire_crab_blb::read_blob_content(&db.bytes(), db.page_size, r, n) {
             if let Ok(text) = String::from_utf8(bytes) {
-                out.insert(id, text);
+                // a stored COMPUTED source from an ENGINE-BUILT file may
+                // carry comments; the expression parser does not know
+                // them (review-caught: '--' read as double negation)
+                out.insert(id, strip_sql_comments(&text));
             }
         }
     }
@@ -11990,7 +11993,9 @@ fn check_predicates_uncached(
     let mut sources: Vec<(String, String)> = Vec::new(); // (source, trigger)
     for (trig, ttype, r, n) in blobs {
         let bytes = fire_crab_blb::read_blob_content(&db.bytes(), db.page_size, r, n)?;
-        let text = String::from_utf8(bytes).ok()?;
+        // an engine-built CHECK source may carry comments the predicate
+        // parser does not know (review-caught)
+        let text = strip_sql_comments(&String::from_utf8(bytes).ok()?);
         match sources.iter_mut().find(|(s, _)| *s == text) {
             Some(entry) => {
                 if ttype == want_type {
@@ -14859,22 +14864,90 @@ fn parse_dyn_text(t: &str, vars: &[String]) -> Option<Vec<DynPart>> {
 /// Replace SQL comments with a single space, OUTSIDE string literals
 /// and quoted identifiers: `/* ... */` (unnested, as the engine reads
 /// them) and `-- to end of line`. A quoted comment-opener is data.
+/// SQL comments blanked to SPACES, byte for byte - the POSITION-
+/// PRESERVING form every parser can share: each comment byte becomes
+/// one `b' '`, so every byte offset into the result equals the
+/// original's (error line/col mapping included), the result is always
+/// valid UTF-8 (comment delimiters are ASCII), and a comment separates
+/// tokens the way the engine's lexer treats it as whitespace (probed:
+/// `SELECT/*t*/2` answers). Block comments do NOT nest (the first `*/`
+/// closes - the engine -104s the leftover); `--` runs to end of line,
+/// the newline kept; both markers are inert inside `'` strings and `"`
+/// quoted identifiers (doubled quotes stay inside); an unterminated
+/// block blanks to the end. The predecessor collapsed each comment to
+/// ONE byte (offset-shifting) and pushed non-ASCII bytes through
+/// `as char` (Latin-1 mangling of UTF-8 literals) - both gone.
 fn strip_sql_comments(text: &str) -> String {
     let b = text.as_bytes();
-    let mut out = String::with_capacity(text.len());
+    let mut out = b.to_vec();
     let mut i = 0usize;
     while i < b.len() {
         match b[i] {
             b'\'' | b'"' => {
                 let q = b[i];
-                out.push(q as char);
                 i += 1;
                 while i < b.len() {
-                    out.push(b[i] as char);
                     if b[i] == q {
-                        // a doubled quote stays inside the literal
                         if b.get(i + 1) == Some(&q) {
-                            out.push(q as char);
+                            i += 2; // a doubled quote stays inside
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'-' if b.get(i + 1) == Some(&b'-') => {
+                while i < b.len() && b[i] != b'\n' {
+                    out[i] = b' ';
+                    i += 1;
+                }
+            }
+            b'/' if b.get(i + 1) == Some(&b'*') => {
+                out[i] = b' ';
+                out[i + 1] = b' ';
+                i += 2;
+                while i < b.len() {
+                    if b[i] == b'*' && b.get(i + 1) == Some(&b'/') {
+                        out[i] = b' ';
+                        out[i + 1] = b' ';
+                        i += 2;
+                        break;
+                    }
+                    // NEWLINES inside a block comment survive - the
+                    // engine counts lines THROUGH a comment, so the
+                    // 'At ... line:' frames after a multi-line comment
+                    // keep their numbers (review-caught)
+                    if b[i] != b'\n' {
+                        out[i] = b' ';
+                    }
+                    i += 1;
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    // the input was valid UTF-8 and only ASCII bytes were replaced
+    String::from_utf8(out).unwrap_or_else(|_| text.to_string())
+}
+
+/// Whether the text ends inside an UNTERMINATED block comment - the
+/// engine refuses such a statement with -104 'Unexpected end of
+/// command', so the entry transform must not silently swallow the tail
+/// and answer (review-caught): the entries pass the ORIGINAL text
+/// through instead, and the parsers refuse it.
+fn sql_comment_unterminated(text: &str) -> bool {
+    let b = text.as_bytes();
+    let mut i = 0usize;
+    while i < b.len() {
+        match b[i] {
+            b'\'' | b'"' => {
+                let q = b[i];
+                i += 1;
+                while i < b.len() {
+                    if b[i] == q {
+                        if b.get(i + 1) == Some(&q) {
                             i += 2;
                             continue;
                         }
@@ -14884,27 +14957,38 @@ fn strip_sql_comments(text: &str) -> String {
                     i += 1;
                 }
             }
-            b'/' if b.get(i + 1) == Some(&b'*') => {
-                i += 2;
-                while i < b.len() && !(b[i] == b'*' && b.get(i + 1) == Some(&b'/')) {
-                    i += 1;
-                }
-                i = (i + 2).min(b.len());
-                out.push(' ');
-            }
             b'-' if b.get(i + 1) == Some(&b'-') => {
                 while i < b.len() && b[i] != b'\n' {
                     i += 1;
                 }
-                out.push(' ');
             }
-            c => {
-                out.push(c as char);
-                i += 1;
+            b'/' if b.get(i + 1) == Some(&b'*') => {
+                i += 2;
+                loop {
+                    if i >= b.len() {
+                        return true;
+                    }
+                    if b[i] == b'*' && b.get(i + 1) == Some(&b'/') {
+                        i += 2;
+                        break;
+                    }
+                    i += 1;
+                }
             }
+            _ => i += 1,
         }
     }
-    out
+    false
+}
+
+/// The entry transform: comments blanked - unless one is UNTERMINATED,
+/// in which case the original text passes through and the parsers
+/// refuse it, as the engine's -104 does.
+fn entry_strip_comments(text: &str) -> String {
+    if sql_comment_unterminated(text) {
+        return text.to_string();
+    }
+    strip_sql_comments(text)
 }
 
 fn parse_trig_stmt(
@@ -30255,7 +30339,9 @@ fn view_of(db: &Database, name: &str) -> Option<ViewDef> {
         }
         if let Some(Value::Blob(r, n)) = v.get(src_f) {
             if let Some(b) = fire_crab_blb::read_blob_content(&db.bytes(), db.page_size, *r, *n) {
-                source = Some(String::from_utf8_lossy(&b).into_owned());
+                // an engine-built VIEW source may carry comments the
+                // re-planner does not know (review-caught)
+                source = Some(strip_sql_comments(&String::from_utf8_lossy(&b)));
             }
         }
     });
@@ -57632,6 +57718,9 @@ fn run_dyn_statement(
     if std::env::var("FC_SRV_TRACE").is_ok() {
         eprintln!("[srv] psql execute statement: {:?}", sql);
     }
+    // a DYNAMIC statement carries user comments like a wire one - the
+    // fourth entry beside the three wire decode sites
+    let sql = entry_strip_comments(sql);
     let sql = sql.trim();
     if sql.is_empty() {
         return Err(psql_raise(EvalErr::EmptyStatementText));
@@ -61748,7 +61837,7 @@ fn after_auth(
                 if best >= 20 {
                     read_int(&mut s, &mut dec)?; // p_sqlst_flags
                 }
-                let text = String::from_utf8_lossy(&sql).into_owned();
+                let text = entry_strip_comments(&String::from_utf8_lossy(&sql));
                 // kicked by a forced shutdown: the engine's vector, no work
                 if database.as_ref().is_some_and(|d| d.kicked()) {
                     respond_kicked(&mut s, &mut enc)?;
@@ -61842,7 +61931,7 @@ fn after_auth(
                 if best >= 20 {
                     read_int(&mut s, &mut dec)?; // p_sqlst_flags
                 }
-                let text = String::from_utf8_lossy(&sql).into_owned();
+                let text = entry_strip_comments(&String::from_utf8_lossy(&sql));
                 // kicked by a forced shutdown: the engine's vector, no work
                 if database.as_ref().is_some_and(|d| d.kicked()) {
                     respond_kicked(&mut s, &mut enc)?;
@@ -61925,7 +62014,7 @@ fn after_auth(
                 if best >= 20 {
                     read_int(&mut s, &mut dec)?; // p_sqlst_flags (FB6/proto 20+)
                 }
-                stmt_sql = String::from_utf8_lossy(&sql).into_owned();
+                stmt_sql = entry_strip_comments(&String::from_utf8_lossy(&sql));
                 if std::env::var("FC_SRV_TRACE").is_ok() {
                     eprintln!("[srv] prepare sql = {:?}", stmt_sql);
                 }
