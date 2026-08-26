@@ -136,6 +136,32 @@ impl<P, D> DbStatements<P, D> {
     where
         F: FnOnce() -> Option<(P, Vec<D>)>,
     {
+        self.plan_if(generation, sql, plan, || true)
+    }
+
+    /// The same, with the plan itself deciding whether it may be KEPT.
+    ///
+    /// `cacheable` is asked AFTER the build, because what a plan read is
+    /// not always visible in its text: a subquery folded into a literal,
+    /// an IN list or a correlated lookup table reads ROW DATA, and a
+    /// view body can hide one from a statement whose own text carries no
+    /// SELECT of its own. Such a plan is not a function of (schema,
+    /// text) - keeping it freezes the rows it read, which is the one
+    /// thing a cache must never do (measured: `WHERE ID IN (SELECT ID
+    /// FROM P)` answered the FIRST execution's set for ever). A plan
+    /// that is not kept is simply re-planned every time, as it was
+    /// before this cache existed.
+    pub fn plan_if<F, C>(
+        &self,
+        generation: u64,
+        sql: &str,
+        plan: F,
+        cacheable: C,
+    ) -> Option<(Rc<P>, Rc<Vec<D>>)>
+    where
+        F: FnOnce() -> Option<(P, Vec<D>)>,
+        C: FnOnce() -> bool,
+    {
         if !enabled() {
             let (p, d) = plan()?;
             return Some((Rc::new(p), Rc::new(d)));
@@ -148,6 +174,9 @@ impl<P, D> DbStatements<P, D> {
         stats().misses.fetch_add(1, Ordering::Relaxed);
         let (p, d) = plan()?;
         let built = (Rc::new(p), Rc::new(d));
+        if !cacheable() {
+            return Some(built);
+        }
         let mut c = self.cache.borrow_mut();
         if c.len() >= CAPACITY {
             // full: everything here was planned against some generation,
@@ -203,6 +232,22 @@ mod tests {
         // ...and so is a different text
         assert!(c.plan(1, "SELECT 2", &mut once).is_some());
         assert_eq!(planned.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn a_plan_that_read_rows_is_not_kept() {
+        let c: DbStatements<String, u8> = DbStatements::default();
+        let planned = AtomicUsize::new(0);
+        let mut once = || {
+            planned.fetch_add(1, Ordering::Relaxed);
+            Some(("PLAN".to_string(), vec![1u8]))
+        };
+        // the same text, twice, with the plan declaring it read rows:
+        // every execution re-plans and nothing is remembered
+        assert!(c.plan_if(0, "SELECT (SELECT 1 FROM T)", &mut once, || false).is_some());
+        assert!(c.plan_if(0, "SELECT (SELECT 1 FROM T)", &mut once, || false).is_some());
+        assert_eq!(planned.load(Ordering::Relaxed), 2);
+        assert!(c.is_empty());
     }
 
     #[test]

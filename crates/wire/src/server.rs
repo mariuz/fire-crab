@@ -22282,6 +22282,35 @@ fn plan_insert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
         // an item that is not one of the staged token shapes below can be
         // handed WHOLE to the expression parser
         let inner = &tail[1..tail.len() - 1];
+        // A SUBQUERY AS A VALUE - `VALUES (1, (SELECT MAX(V) FROM P))`.
+        // A value list has no outer row, so every subquery here is a
+        // CONSTANT for the statement: it is answered once and folded
+        // back into the text as the literal it computed, and the whole
+        // expression surface below then works over it (an item that IS
+        // the subquery, one wrapped in arithmetic, one inside a CAST).
+        let folded_inner;
+        let mut subq_raise: Option<EvalErr> = None;
+        let inner = match db.as_ref() {
+            // the uppercase+mask pass costs two allocations, so it is
+            // asked only of a text that could hold a subquery at all
+            Some(dbr)
+                if inner.contains('(')
+                    && find_word(&mask_literals(&inner.to_ascii_uppercase()), "SELECT", 0)
+                        .is_some() =>
+            {
+                match fold_dml_subqueries(inner, dbr, db) {
+                    Some((t, raise)) => {
+                        folded_inner = t;
+                        subq_raise = raise;
+                        folded_inner.as_str()
+                    }
+                    // not foldable: the value arms below keep the
+                    // refusal rather than storing a guess
+                    None => inner,
+                }
+            }
+            _ => inner,
+        };
         let parts = split_set_list(inner);
         // a trailing comma (`VALUES (1, 2,)`) leaves the splitter one
         // item short of its commas - the engine's -104, refused here
@@ -22355,6 +22384,12 @@ fn plan_insert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
                     InsVal::Wire(expr_value_to_wireparam(&e, &v, &[])?)
                 }
             });
+        }
+        // the whole value list parsed, so a subquery's raise is this
+        // statement's answer rather than a syntax error waiting to be
+        // found ([fold_dml_subqueries])
+        if let Some(e) = subq_raise {
+            return Some((Plan::RefusedEval(e), Vec::new()));
         }
     }
 
@@ -24429,7 +24464,12 @@ fn plan_update(sql: &str, db_outer: &Option<Database>) -> Option<(Plan, Vec<Desc
     }
     let set_kw = find_word(&masked, "SET", "UPDATE".len())?;
     let (schema, table) = dml_target_name(&s["UPDATE".len()..set_kw])?;
-    let where_kw = find_word(&masked, "WHERE", set_kw + "SET".len());
+    // THE STATEMENT'S OWN `WHERE`, at paren depth zero. A SET value may
+    // be a SUBQUERY with a WHERE of its own (`SET N = (SELECT V FROM P
+    // WHERE P.ID = D.ID)`), and taking the first WHERE cut the SET list
+    // in half - the assignment lost its closing paren and the whole
+    // statement refused
+    let where_kw = find_word_depth0(&masked, "WHERE", set_kw + "SET".len());
 
     let db = db.as_ref()?;
     if !relation_qualifier_ok(db, schema, table) {
@@ -24507,6 +24547,28 @@ fn plan_update(sql: &str, db_outer: &Option<Database>) -> Option<(Plan, Vec<Desc
                 if rhs.contains('?') {
                     return None;
                 }
+                // A SUBQUERY AS THE ASSIGNED VALUE. One that names no
+                // outer column is a CONSTANT for the whole statement -
+                // answered once and folded into the text as its literal,
+                // exactly as the select list and the WHERE already do.
+                // A CORRELATED one has no single value to fold and is
+                // taken further down, as a per-row lookup.
+                let rhs_folded;
+                let mut subq_raise: Option<EvalErr> = None;
+                let rhs = if rhs.contains('(')
+                    && find_word(&mask_literals(&rhs.to_ascii_uppercase()), "SELECT", 0).is_some()
+                {
+                    match fold_dml_subqueries(rhs, db, db_outer) {
+                        Some((t, raise)) => {
+                            rhs_folded = t;
+                            subq_raise = raise;
+                            rhs_folded.trim()
+                        }
+                        None => rhs,
+                    }
+                } else {
+                    rhs
+                };
                 let rc0 = columns.iter().find(|c| c.name.eq_ignore_ascii_case(&col))?;
                 let fid0 = rc0.field_id as usize;
                 // `SET <col> = GEN_ID(g,n)` / `= NEXT VALUE FOR g`: a
@@ -24528,6 +24590,43 @@ fn plan_update(sql: &str, db_outer: &Option<Database>) -> Option<(Plan, Vec<Desc
                         return None;
                     }
                     sets.push((fid0, SetVal::Gen(gen, step)));
+                    continue;
+                }
+                // A CORRELATED subquery as the assigned value -
+                // `SET N = (SELECT V FROM P WHERE P.ID = D.ID)`. There
+                // is no value to fold: it answers once per TARGET row,
+                // out of the same LOOKUP TABLE a correlated select-list
+                // item builds ([Expr::Lookup]), keyed by the outer
+                // column the correlation names. Only a whole-RHS
+                // subquery takes this route - one buried in a larger
+                // expression would need the lookup spliced into a tree
+                // the expression parser has already refused.
+                if let Some(sub) = whole_subquery(rhs) {
+                    if trace_on() {
+                        eprintln!("[srv] update SET correlated sub {:?}", sub);
+                    }
+                    // the binding a correlated reference must spell: a
+                    // DML target takes no alias in this grammar, so the
+                    // relation name is the key (as the WHERE's own
+                    // subquery lift builds it)
+                    let bind = ColBinding {
+                        key: table,
+                        qual: rhs
+                            .contains('.')
+                            .then(|| relation_schema(db, table).map(|q| (q, table)))
+                            .flatten(),
+                    };
+                    let (e, _d) = build_correlated_lookup(&sub, db, &columns, &bind, descs)?;
+                    if e.type_of(descs).is_none() {
+                        return None;
+                    }
+                    if sets.iter().any(|(f, _)| *f == fid0) {
+                        return None;
+                    }
+                    if is_computed_fid(descs, fid0) {
+                        return None;
+                    }
+                    sets.push((fid0, SetVal::Expr(e)));
                     continue;
                 }
                 // `_any` also accepts a BARE column reference, which
@@ -24552,6 +24651,11 @@ fn plan_update(sql: &str, db_outer: &Option<Database>) -> Option<(Plan, Vec<Desc
                 }
                 if is_computed_fid(descs, fid) {
                     return None;
+                }
+                // this assignment parsed, so a subquery's raise inside
+                // it is the statement's answer ([fold_dml_subqueries])
+                if let Some(err) = subq_raise {
+                    return Some((Plan::RefusedEval(err), Vec::new()));
                 }
                 sets.push((fid, SetVal::Expr(e)));
                 continue;
@@ -53727,6 +53831,120 @@ fn value_literal(v: &Value) -> Option<String> {
     })
 }
 
+thread_local! {
+    /// Set while PLANNING reads ROW DATA - a subquery folded into the
+    /// literal it answered, into an IN list, or into a correlated
+    /// lookup table. Such a plan is not a function of (schema, text):
+    /// keeping it in the statement cache freezes the rows it read, and
+    /// the next execution of the same text answers the FIRST one's
+    /// data. Measured before this flag existed: `WHERE ID IN (SELECT ID
+    /// FROM P)` counted 1 for ever after a row joined P, and an
+    /// `UPDATE ... SET N = (SELECT MAX(V) FROM P)` stored the value the
+    /// first execution computed.
+    ///
+    /// Cleared before each top-level plan and read after it
+    /// ([stmc::DbStatements::plan_if]). A flag rather than a scan of
+    /// the text, because a VIEW BODY can carry the subquery a
+    /// statement's own text does not show.
+    static PLAN_READ_ROWS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Planning just read row data - see [PLAN_READ_ROWS].
+fn note_plan_read_rows() {
+    PLAN_READ_ROWS.with(|f| f.set(true));
+}
+
+/// Did the plan just built read row data? Clears the flag.
+fn took_plan_read_rows() -> bool {
+    PLAN_READ_ROWS.with(|f| f.replace(false))
+}
+
+/// Forget whatever the LAST plan read - called immediately before a
+/// top-level build, so [took_plan_read_rows] afterwards answers about
+/// this plan alone.
+fn clear_plan_read_rows() {
+    PLAN_READ_ROWS.with(|f| f.set(false));
+}
+
+/// The SQL literal a DML value fold splices back in - [value_literal]'s
+/// spellings plus the TYPED temporal ones a column can hold, since a
+/// subquery over a DATE column is as ordinary as one over an INTEGER.
+/// A shape with no literal that round-trips exactly (a DOUBLE, a blob
+/// id) answers None and the statement keeps its refusal.
+fn dml_subq_literal(v: &Value) -> Option<String> {
+    // A DOUBLE has no literal SPELLING that keeps its type - `1.5`
+    // reads back as a scaled numeric - so it travels as a cast over
+    // its SHORTEST ROUND-TRIPPING text, which is the one rendering
+    // that names the same f64 the subquery computed (the engine's own
+    // 16-significant-digit display does not always). An infinity or a
+    // NaN has no text the CVT grammar takes.
+    if let Value::Double(d) = v {
+        if !d.is_finite() {
+            return None;
+        }
+        return Some(format!("CAST('{}' AS DOUBLE PRECISION)", d));
+    }
+    psql_literal(v).or_else(|| value_literal(v))
+}
+
+/// The SELECT body when `text` is EXACTLY one parenthesised subquery -
+/// `(SELECT V FROM P WHERE P.ID = D.ID)` - and nothing else. Anything
+/// around it (arithmetic, a CAST, a second subquery) answers None.
+fn whole_subquery(text: &str) -> Option<String> {
+    let (folded, subs) = extract_subqueries(text)?;
+    (subs.len() == 1 && folded.trim() == format!("{}0", SUBQ_MARK))
+        .then(|| subs.into_iter().next())
+        .flatten()
+}
+
+/// Fold every UNCORRELATED scalar subquery in a DML value text - an
+/// `INSERT`'s VALUES list, an `UPDATE`'s SET right-hand side - into the
+/// literal it answers, so the expression surface those two planners
+/// already have works over a subquery for free.
+///
+/// This is the select list's own fold, applied where a value is
+/// STORED rather than projected, and it carries the same probed laws:
+/// no row answers NULL (not an empty result), and MORE THAN ONE ROW is
+/// the engine's `isc_sing_select_err` rather than the first row.
+///
+/// `None` means "not foldable here" - the text is left alone and the
+/// caller decides (an `UPDATE` tries the CORRELATED reading, an
+/// `INSERT` refuses, since a value list has no outer row to correlate
+/// to).
+///
+/// A subquery that RAISES is folded as NULL and its error travels
+/// beside the text, for the caller to surface only once the rest of the
+/// statement has parsed. Raising here instead would answer a SYNTAX
+/// error with a runtime one: `SET N = (SELECT ...) FROM D` is the
+/// engine's -104, and a statement this server cannot parse must keep
+/// its generic refusal whatever its subqueries would have done.
+fn fold_dml_subqueries(
+    text: &str,
+    db: &Database,
+    db_opt: &Option<Database>,
+) -> Option<(String, Option<EvalErr>)> {
+    let (folded, subs) = extract_subqueries(text)?;
+    if subs.is_empty() {
+        return Some((text.to_string(), None));
+    }
+    let mut out = folded;
+    let mut raise = None;
+    // HIGHEST INDEX FIRST: `FC$SUBQ1` is a prefix of `FC$SUBQ10`, and a
+    // forward walk would rewrite the second one's head
+    for (i, sub) in subs.iter().enumerate().rev() {
+        let rows = eval_subquery(sub, db, db_opt, None, None, false)?;
+        let lit = if rows.values.len() > 1 {
+            raise.get_or_insert(EvalErr::SingletonSelect);
+            "NULL".to_string()
+        } else {
+            let v = rows.values.first().cloned().unwrap_or(Value::Null);
+            dml_subq_literal(&v)?
+        };
+        out = out.replace(&format!("{}{}", SUBQ_MARK, i), &lit);
+    }
+    Some((out, raise))
+}
+
 /// Render a residual WHERE token stream back to SQL text - the form
 /// `fire_crab_opt::plan_query` accepts. The text feeds ONLY the
 /// gatekeeper: the bands are built from the already-resolved
@@ -54103,6 +54321,9 @@ fn build_correlated_lookup(
     outer_bind: &ColBinding<'_>,
     outer_descs: &[Descriptor],
 ) -> Option<(Expr, Descriptor)> {
+    // the lookup table below is built from the inner table's ROWS
+    // ([PLAN_READ_ROWS])
+    note_plan_read_rows();
     let (proj_s, table_s, where_s, group_s, having_s, order_s) = split_query(sub)?;
     if group_s.is_some() || having_s.is_some() || order_s.is_some() {
         return None;
@@ -54540,6 +54761,9 @@ fn eval_subquery(
     outer_bind: Option<&ColBinding<'_>>,
     existence_only: bool,
 ) -> Option<SubqRows> {
+    // whatever it answers, this READ ROWS at plan time - the plan it
+    // ends up in cannot be kept ([PLAN_READ_ROWS])
+    note_plan_read_rows();
     if let Some(r) = eval_subquery_rel(sql, db, corr, outer_bind, existence_only) {
         return Some(r);
     }
@@ -66288,7 +66512,15 @@ fn after_auth(
                             _ => plan_delete(&dml_sql, &database),
                         };
                         match database.as_ref() {
-                            Some(db) => db.stmts.plan(gen, &dml_sql, build),
+                            Some(db) => db.stmts.plan_if(
+                                gen,
+                                &dml_sql,
+                                || {
+                                    clear_plan_read_rows();
+                                    build()
+                                },
+                                || !took_plan_read_rows(),
+                            ),
                             None => build().map(|(p, d)| {
                                 (std::rc::Rc::new(p), std::rc::Rc::new(d))
                             }),
@@ -66377,7 +66609,15 @@ fn after_auth(
                     let (p, ps) = timed("plan(select)", || match database.as_ref() {
                         Some(db) if !calls_fn => db
                             .stmts
-                            .plan(gen, &stmt_sql, || Some(plan_query(&stmt_sql, &database)))
+                            .plan_if(
+                                gen,
+                                &stmt_sql,
+                                || {
+                                    clear_plan_read_rows();
+                                    Some(plan_query(&stmt_sql, &database))
+                                },
+                                || !took_plan_read_rows(),
+                            )
                             .expect("the planner answers every text"),
                         _ => {
                             let (p, ps) = plan_query(&stmt_sql, &database);

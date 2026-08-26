@@ -537,6 +537,111 @@ inside a DERIVED TABLE, and — the next slice — every blob VALUE in
 DML: `INSERT ... SELECT` of a blob column, an `UPDATE` whose `SET`
 reads one, and `CAST(<v> AS BLOB)`.
 
+**BLOB VALUES IN DML AND `CAST(<v> AS BLOB)` — DONE 2026-08-26
+(`serve-real-blobexpr` 30).** The other half of the slice above: a blob
+column could be READ by an expression and never WRITTEN by one. Now a
+blob column takes ANY value as a blob, under the engine's own two laws.
+An expression that answered another blob is COPIED, never shared
+(`BLB_move`, blb.cpp:1183 — aliasing would leave two versions pointing
+at one id, and the collector frees a collected version's blobs BY ID),
+and the DESTINATION's subtype and character set decide the new blob's
+(blb.cpp:1262), not the source's. A SCALAR stores its RENDERING (probed:
+42 lands `'42'`, 3.14 `'3.14'`, a DATE its ISO day, a TIMESTAMP its full
+`…10:20:30.0000`, TRUE the word in capitals) — the same spellings a CAST
+to text produces, gathered in `wireparam_text`. `CAST(<v> AS BLOB
+[SUB_TYPE TEXT|BINARY|<n>] [CHARACTER SET <cs>] [SEGMENT SIZE <n>])`
+names the blob's own type, a `CHARACTER SET` clause promoting the
+spelling to TEXT exactly as in a column declaration, `SEGMENT SIZE`
+deciding nothing, a user sub_type refusing (`isc_nofilter`). The value
+is minted through the LIST path, so a statement that MINTS AND STORES
+inside ONE op — `INSERT … SELECT <blob expression>` — needed
+`flush_minted_blobs`: the mint context is drained at the TOP of the next
+op, too late for a store in the middle of this one. **A charset bug fell
+out beside it:** `store_blob_param` hard-coded a text blob's charset to
+UTF8, so a blob copied or created into a WIN1252 or NONE column was
+labelled UTF8 in its header and read back through the wrong table.
+Boundaries recorded: a blob-valued SCALAR SUBQUERY as the source (the
+pre-existing scalar-subquery gap) and `RETURNING <expression>` (a
+general RETURNING limit — a bare `RETURNING B` answers).
+
+**A SUBQUERY AS A VALUE IN DML — AND THE STATEMENT CACHE'S FIRST LAW —
+DONE 2026-08-26 (`serve-real-subqval` 33).** The read side has answered
+subqueries for many increments; the WRITE side refused every one, so the
+value a statement stored could never be looked up. `INSERT … VALUES (…,
+(SELECT …))` and `UPDATE … SET <col> = (SELECT …)` serve now:
+
+* an UNCORRELATED subquery is a CONSTANT for the statement — answered
+  once by `eval_subquery` and folded back in as the literal it computed
+  (`fold_dml_subqueries`), which hands the whole existing value surface
+  to it for free: the item alone, arithmetic around it, a CAST, a
+  COALESCE, several in one list, a source that is a VIEW or a DERIVED
+  TABLE, the `FIRST 1 … ORDER BY` idiom, the TARGET table read at its
+  own starting state, and a MERGE's `UPDATE SET`.
+* an UPDATE's SET may CORRELATE to the target row (`SET N = (SELECT
+  SUM(V) FROM P WHERE P.ID = D.ID)`): the same LOOKUP TABLE a correlated
+  select-list item builds, keyed by the outer column, with the engine's
+  absent-key law (COUNT 0, every other function NULL).
+* the singleton laws travel with it: NO ROW is NULL (not an empty
+  result, not a skipped assignment) and MORE THAN ONE ROW is
+  `isc_sing_select_err` 21000. A raise is carried BESIDE the folded text
+  and surfaced only once the rest of the statement has parsed — folding
+  happens before the SET list is read, and a statement this server
+  cannot parse must keep its generic syntax refusal (`SET N = (SELECT …)
+  FROM D` is the engine's -104, not a runtime raise).
+* the fold spells every type it can spell exactly: INTEGER, NUMERIC,
+  VARCHAR (quotes doubled), DATE/TIME/TIMESTAMP as typed literals, and
+  DOUBLE as a cast over its SHORTEST ROUND-TRIPPING text (the engine's
+  16-digit display does not always name the same f64).
+
+**A CLAUSE-SPLIT BUG fell out of it:** the statement's own `WHERE` is
+the one at PAREN DEPTH ZERO. A SET value's subquery carries a WHERE of
+its own, and `find_word` took the first one — cutting the SET list in
+half, so the assignment lost its closing paren and the whole statement
+refused (`find_word_depth0` now, as every other clause split already
+used).
+
+**AND THE REAL FIND: A FOLDED SUBQUERY IS NOT A PLAN THE STATEMENT CACHE
+MAY KEEP** — a PRE-EXISTING silent wrong answer in the READ path, older
+than this slice. The cache is keyed by (schema, text), so everything a
+plan holds must be derivable from those two; a folded subquery is a
+value read from ROWS. Measured before the fix:
+
+```sql
+SELECT COUNT(*) FROM D WHERE ID IN (SELECT ID FROM P);   -- 1
+INSERT INTO P VALUES (2, 200); COMMIT;
+SELECT COUNT(*) FROM D WHERE ID IN (SELECT ID FROM P);   -- 1; the engine says 2
+```
+
+The outer rows were read fresh every time and only the folded inner list
+was frozen, so the query looked alive while answering from the first
+preparation. The same held for a select-list subquery
+(`SELECT (SELECT MAX(V) FROM P)` answered 100 for ever) and would have
+held for every DML fold this slice adds. Fixed by a thread-local
+`PLAN_READ_ROWS`, set inside `eval_subquery` and `build_correlated_lookup`
+— the two places planning reads rows — cleared before each top-level
+plan and read after it by the new `stmc::DbStatements::plan_if`, which
+builds the plan and then declines to KEEP it. A FLAG rather than a scan
+of the text, because a VIEW BODY can carry the subquery a statement's
+own text does not show (gated). The stmc module's own question — *what
+did the planner READ that the schema does not decide?* — now has a
+mechanism behind it. The unfiltered `COUNT(*)`/`MAX` folds it warned
+about were already per-execute; re-measured clean.
+
+Boundaries recorded: a CORRELATED subquery inside a larger expression
+(the lookup would have to be spliced into a tree the expression parser
+has already refused), a correlated subquery in an INSERT's value list
+(no outer row to name), a correlated BARE COLUMN whose source holds two
+rows for one key (the lookup is built for every key at prepare, where
+the engine raises only if that key is reached), a `?` inside a subquery,
+and a blob-valued subquery (the blob boundary above). And one that is
+inherent to folding at all: the fold reads at PREPARE, where the engine
+reads at EXECUTE — a client that prepares under one transaction and
+executes under another (isql does exactly that) takes the prepare-time
+visibility. The plan is no longer KEPT, so every execution re-prepares
+and the window is one op wide rather than for ever; closing it entirely
+means executing the subquery as a row source, which is the nested
+`blr_rse` the engine compiles.
+
 **AGGREGATES IN EXPRESSIONS DONE (2026-08-25,
 `serve-real-statexpr` 8):** the statistical/ordered-set family
 (VAR_*/STDDEV_*, CORR/COVAR_*/REGR_*, PERCENTILE_CONT/DISC) and

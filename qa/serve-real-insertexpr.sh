@@ -18,8 +18,7 @@
 # the patched node driver's metadata-directed decoding masked it in the
 # node gates. The old unit pin asserted the wrong form and was corrected.
 #
-# Boundaries (recorded): a scalar SUBQUERY value refuses (the engine
-# answers it); an expression that RAISES folds at plan into fc's generic
+# Boundaries (recorded): an expression that RAISES folds at plan into fc's generic
 # refusal where the engine raises its typed vector at execute (1/0 -
 # 22012 there); a `?` inside an expression refuses (engine: 07002); a hex
 # literal (0x1F) is a pre-existing lexer gap; a blob-valued expression
@@ -156,7 +155,12 @@ bref() { ran=$((ran + 1))
         *) echo "DIFF $1 answered: [$c]"; fail=1;; esac
 }
 bref "a typeless fold refuses rather than storing NULL ('5' + 1)" "INSERT INTO TE (ID) VALUES ('5' + 1);"
-bref "a scalar subquery value refuses" "INSERT INTO TE (ID, S) VALUES (90, (SELECT 'q' FROM RDB\$DATABASE));"
+# a scalar subquery IS a value now (serve-real-subqval.sh): answered once
+# and folded in as the literal it computed
+sqv="INSERT INTO TE (ID, S) VALUES (90, (SELECT 'q' FROM RDB\$DATABASE)); COMMIT; SET LIST ON; SELECT ID, S FROM TE WHERE ID = 90;"
+check "a scalar subquery is a value" \
+    "$(printf '%s\n' "$sqv" | "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$A" 2>&1 | norm)" \
+    "$(printf '%s\n' "$sqv" | "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$REAL:$B" 2>&1 | norm)"
 bref "a raising fold refuses at plan (engine: 22012 at execute)" "INSERT INTO TE (ID) VALUES (1/0);"
 bref "a parameter inside an expression refuses (engine: 07002)" "INSERT INTO TE (ID) VALUES (? + 1);"
 
