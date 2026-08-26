@@ -8060,6 +8060,19 @@ AlterDomainRename {
         mode: GenWrite,
         stmt_type: i32,
     },
+    /// `SET TIME ZONE '<zone>'` / `SET TIME ZONE LOCAL` - the session
+    /// zone every zoneless temporal is read in (StmtNodes.cpp:10980;
+    /// `None` restores the attachment's original, the engine's LOCAL).
+    /// Reported as isc_info_sql_stmt_ddl, as the engine reports every
+    /// session-management statement (dsql.cpp:887 "Any better choice ?").
+    SetTimeZone {
+        zone: Option<u16>,
+    },
+    /// `SET TIME ZONE` whose zone this server will not sit in - the
+    /// statement is RECOGNISED, so it must answer with a vector rather
+    /// than fall through to the unknown-statement path (which the
+    /// execute-immediate route acknowledges as success)
+    SetTimeZoneRefused(EvalErr),
 }
 
 /// One JOIN in a FROM chain: the side being added, and the ON condition
@@ -10057,6 +10070,13 @@ fn expr_reads(e: &Expr, f: &dyn Fn(usize) -> bool) -> bool {
                 || else_.as_deref().is_some_and(|e| expr_reads(e, f))
         }
         Expr::Lookup { key, .. } => expr_reads(key, f),
+        // BOTH sides read: the zone is an expression too, and a term
+        // whose row-dependence is missed here is evaluated against an
+        // EMPTY row - the column arrives NULL and the predicate
+        // silently drops every row (measured)
+        Expr::AtTimeZone(a, z) => {
+            expr_reads(a, f) || z.as_deref().is_some_and(|z| expr_reads(z, f))
+        }
         _ => false,
     }
 }
@@ -11427,6 +11447,16 @@ fn decode_default_blr(b: &[u8]) -> Option<DefaultVal> {
 /// The system clock as engine values: the Modified-Julian day number
 /// and the 1/10000-second time units a DATE/TIME/TIMESTAMP field
 /// stores - what the CURRENT_* defaults evaluate to.
+/// NOW, as a wall clock in the SESSION zone - what the zoneless clock
+/// keywords answer (LOCALTIME / LOCALTIMESTAMP / CURRENT_DATE render
+/// the request's instant in `att_current_timezone`). A zone whose
+/// offset this server cannot compute leaves the UTC reading, which is
+/// the only honest answer it has.
+fn session_now() -> (i32, u32) {
+    let (d, t) = now_date_time();
+    tz_local_timestamp(d, t, session_zone_id()).unwrap_or((d, t))
+}
+
 fn now_date_time() -> (i32, u32) {
     let d = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -12763,6 +12793,17 @@ fn result_width_bytes(e: &Expr, descs: &[Descriptor]) -> u8 {
         // (probed: 2147483647 -> 496, 2147483648 -> 580; never SMALLINT)
         Expr::Int(n) => if i32::try_from(*n).is_ok() { 4 } else { 8 },
         Expr::Int128(_) => 16,
+        // EXTRACT: SMALLINT for the integer parts, INTEGER at scale
+        // -4/-1 for SECOND/MILLISECOND (ExprNodes.cpp:5644-5659
+        // makeShort / makeLong). It lives HERE as well as in
+        // int_func_form because a wrapped EXTRACT (-X, COALESCE, CASE,
+        // IIF, NULLIF) takes its width from this walk, and the
+        // top-level-only fix left every wrapper announcing BIGINT
+        // (review-caught)
+        Expr::Func(SysFn::Extract(part), _) => match part {
+            ExtractPart::Second | ExtractPart::Millisecond => 4,
+            _ => 2,
+        },
         Expr::UserFn { ret, .. } => exact_dtype_bytes(ret.dtype).unwrap_or(8),
         Expr::Neg(a) => result_width_bytes(a, descs),
         // a conditional takes its WIDEST branch (probed: CASE S/2 -> LONG,
@@ -12859,6 +12900,14 @@ fn int_func_form(e: &Expr, descs: &[Descriptor]) -> Option<(Wire, i32, i32)> {
     };
     match f {
         SysFn::SetContext => Some(long), // INTEGER, probed
+        // EXTRACT: SMALLINT for every integer part, INTEGER for the
+        // scaled SECOND/MILLISECOND (ExprNodes.cpp:5644-5669
+        // makeShort(0) / makeLong(scale)) - this used to fall through
+        // to the 8-byte default and announce BIGINT for all of them
+        SysFn::Extract(part) => Some(match part {
+            ExtractPart::Second | ExtractPart::Millisecond => long,
+            _ => short,
+        }),
         SysFn::Sign => Some(short),
         SysFn::AsciiVal => Some(short), // SMALLINT (probed)
         SysFn::Hash => Some(int64), // BIGINT (probed)
@@ -20826,6 +20875,61 @@ fn unquote_ident(t: &str) -> Option<String> {
 
 /// Parse `SET GENERATOR <name> TO <n>` - set a generator to an absolute
 /// value. The value may be signed. None for any other statement.
+/// `SET TIME ZONE {'<zone>' | LOCAL}` - the session zone
+/// (StmtNodes.cpp:10980). An unresolvable zone answers the engine's own
+/// 22009 through the ordinary refusal channel.
+fn plan_set_time_zone(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
+    let s = sql.trim().trim_end_matches(';').trim();
+    let up = s.to_ascii_uppercase();
+    // THE WORDS MUST BE WORDS. Peeling with bare `strip_prefix` +
+    // `trim_start` accepted `SETTIME ZONE`, `SET TIMEZONE` and
+    // `SETTIMEZONE` - each of which the engine rejects with -104 -
+    // and really applied them (review-caught).
+    let mut it = up.split_whitespace();
+    if it.next() != Some("SET") || it.next() != Some("TIME") || it.next() != Some("ZONE") {
+        return None;
+    }
+    // ...and the argument keeps its ORIGINAL case: a region name is
+    // matched case-insensitively, but a refusal echoes the text as
+    // written. Take it as everything after the third word.
+    let arg = {
+        let mut rest = s.trim_start();
+        for _ in 0..3 {
+            let cut = rest.find(char::is_whitespace)?;
+            rest = rest[cut..].trim_start();
+        }
+        rest.trim()
+    };
+    if arg.eq_ignore_ascii_case("LOCAL") {
+        return Some((Plan::SetTimeZone { zone: None }, Vec::new()));
+    }
+    // a quoted zone name or offset
+    let inner = arg.strip_prefix('\'').and_then(|r| r.strip_suffix('\''))?;
+    // THE STATEMENT IS RECOGNISED FROM HERE ON: a bad zone must ANSWER
+    // (the engine's 22009 at execute), never fall through to the
+    // "unknown statement" path - which on op_exec_immediate is
+    // acknowledged as SUCCESS with the zone left unset (review-caught).
+    let zone = match resolve_zone_tail(inner.trim()) {
+        Some(z) => z,
+        None => {
+            let e = PREPARE_REFUSAL.with(|c| c.borrow_mut().take());
+            return Some((
+                Plan::SetTimeZoneRefused(
+                    e.unwrap_or_else(|| EvalErr::InvalidTzRegion(inner.trim().to_string())),
+                ),
+                Vec::new(),
+            ));
+        }
+    };
+    if fire_crab_ods::tz::displacement(zone).is_none() {
+        // a ruled region: fc has no rules to read it by, so it cannot
+        // sit in that session at all - a clean refusal, never a session
+        // whose zoneless values convert wrongly
+        return Some((Plan::SetTimeZoneRefused(EvalErr::Unsupported), Vec::new()));
+    }
+    Some((Plan::SetTimeZone { zone: Some(zone) }, Vec::new()))
+}
+
 fn plan_set_generator(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
     let s = sql.trim().trim_end_matches(';');
     let toks: Vec<&str> = s.split_whitespace().collect();
@@ -24655,6 +24759,15 @@ fn execute_dml(
     args: &[WireParam],
     ctx: &SessionCtx,
 ) -> Result<(i32, i32, i32), ExecErr> {
+    // SET TIME ZONE touches no page - it is the session's own state
+    // (att_current_timezone), and every execute route lands here
+    if let Plan::SetTimeZone { zone } = plan {
+        SESSION_ZONE.with(|c| c.set(*zone));
+        return Ok((0, 0, 0));
+    }
+    if let Plan::SetTimeZoneRefused(e) = plan {
+        return Err(ExecErr::Eval(e.clone()));
+    }
     reserve_dml_relation(plan, database)?;
     with_conflict_wait(database, |db| execute_dml_collecting(plan, db, args, ctx, None))
 }
@@ -34585,7 +34698,19 @@ fn expr_nullable(e: &Expr, is_nn: &dyn Fn(usize) -> bool) -> bool {
         | Expr::TextNumKey(a, _)
         | Expr::TextBool(a, _) => expr_nullable(a, is_nn),
         Expr::Bin(a, _, b) | Expr::Concat(a, b) => expr_nullable(a, is_nn) || expr_nullable(b, is_nn),
+        // AtNode::make (ExprNodes.cpp:3328): nullable iff the datetime
+        // or the zone is - two literals give a NOT NULL column
+        Expr::AtTimeZone(a, z) => {
+            expr_nullable(a, is_nn) || z.as_deref().map_or(false, |z| expr_nullable(z, is_nn))
+        }
         Expr::Iif(_, a, b) => expr_nullable(a, is_nn) || expr_nullable(b, is_nn),
+        // COALESCE is nullable if ANY argument is - the engine's list
+        // rule (DataTypeUtil.cpp makeFromList: `nullable |=
+        // arg->isNullable()`), which is also why COALESCE(<not null>,
+        // <literal>) describes NOT NULL. Without this arm it fell to
+        // the `_ => true` default and every COALESCE announced nullable
+        // (review-caught, pre-existing)
+        Expr::Coalesce(args) => args.iter().any(|a| expr_nullable(a, is_nn)),
         Expr::Case(arms, els) => {
             arms.iter().any(|(_, x)| expr_nullable(x, is_nn))
                 || els.as_ref().map_or(true, |x| expr_nullable(x, is_nn))
@@ -34661,6 +34786,12 @@ fn desc_of_projcol(c: &ProjCol) -> Descriptor {
         570 => (dtype::SQL_DATE, 4),
         560 => (dtype::SQL_TIME, 4),
         510 => (dtype::TIMESTAMP, 8),
+        // the WITH TIME ZONE forms: without these a NAMED tz column out
+        // of a derived table or CTE fell to the INT64 default and every
+        // row answered 0 (review-caught; `SELECT *` kept its ProjCol
+        // whole and was right, which is what hid it)
+        32756 => (dtype::SQL_TIME_TZ, 8),
+        32754 => (dtype::TIMESTAMP_TZ, 12),
         32764 => (dtype::BOOLEAN, 1),
         520 => (dtype::BLOB, 8),
         _ => (dtype::INT64, 8),
@@ -39920,7 +40051,10 @@ fn describe_for(plan: &Plan, params: &[Descriptor], att: AttCs) -> Vec<u8> {
         // isc_info_sql_stmt_commit (?) - no columns either way
         // a block projects nothing: no cursor, no columns
         Plan::ExecBlock { .. } => build_describe(&[], params, att),
-        Plan::TxControl { .. } | Plan::Savepoint { .. } => build_describe(&[], params, att),
+        Plan::TxControl { .. }
+        | Plan::Savepoint { .. }
+        | Plan::SetTimeZone { .. }
+        | Plan::SetTimeZoneRefused(_) => build_describe(&[], params, att),
     }
 }
 
@@ -39945,6 +40079,9 @@ fn stmt_type_of(plan: &Plan) -> i32 {
         // isql abandon the statement and issue a real op_rollback, which
         // silently threw the whole transaction away.
         Plan::TxControl { rollback, .. } => if *rollback { 11 } else { 10 },
+        // isc_info_sql_stmt_ddl: what the engine reports for EVERY
+        // session-management statement (dsql.cpp:887)
+        Plan::SetTimeZone { .. } | Plan::SetTimeZoneRefused(_) => 5,
         Plan::Savepoint { .. } => 14,
         Plan::Union { .. }
         | Plan::ProcSelect { .. }
@@ -40834,6 +40971,15 @@ fn eval_status_items(w: &mut W, e: &EvalErr) {
                 .int(1) // isc_arg_gds - numeric value is out of range
                 .int(GDS_NUMERIC_OUT_OF_RANGE);
         }
+        EvalErr::ExpressionEval => {
+            // posted by ERRD_post at PREPARE (AtNode::make), so the
+            // PRIMARY is the DSQL error and the eval err is its detail -
+            // the same shape the percentile domain error carries
+            w.int(1) // isc_arg_gds - Dynamic SQL Error
+                .int(GDS_DSQL_ERROR)
+                .int(1) // isc_arg_gds - expression evaluation not supported
+                .int(GDS_EXPRESSION_EVAL_ERR);
+        }
         EvalErr::MathDomain { func, code } => {
             w.int(1) // isc_arg_gds - expression evaluation not supported
                 .int(GDS_EXPRESSION_EVAL_ERR)
@@ -41565,6 +41711,8 @@ fn emit_rows_inner(
         Plan::TxControl { .. }
         | Plan::ExecBlock { .. }
         | Plan::Savepoint { .. }
+        | Plan::SetTimeZone { .. }
+        | Plan::SetTimeZoneRefused(_)
         | Plan::InsertSelect { .. }
         | Plan::Insert { .. } | Plan::UpdateOrInsert { .. } | Plan::Merge { .. }
         | Plan::Update { .. } | Plan::Delete { .. }
@@ -43114,7 +43262,17 @@ fn trunc_time_units(t: u32, p: u8) -> u32 {
 /// The session time zone - the engine's default is the server's OS zone
 /// (probed: `Etc/UTC` on this box, from /etc/timezone); TZ in the
 /// environment first, GMT when nothing names one.
+thread_local! {
+    /// What `SET TIME ZONE` put in front of the host's zone for THIS
+    /// connection (`att_current_timezone`); `None` = the attachment's
+    /// original, which is what `SET TIME ZONE LOCAL` restores.
+    static SESSION_ZONE: std::cell::Cell<Option<u16>> = const { std::cell::Cell::new(None) };
+}
+
 fn session_zone_id() -> u16 {
+    if let Some(z) = SESSION_ZONE.with(|c| c.get()) {
+        return z;
+    }
     // CACHED: the mixed tz/plain comparison arms call this per row,
     // and the uncached form read /etc/timezone from disk each time
     // (review-caught). The host zone cannot change under a running
@@ -44126,6 +44284,12 @@ enum RawExpr {
     TimeLit(u32),
     /// `TIMESTAMP '<date> <time>'`
     TsLit(i32, u32),
+    /// `<value> AT TIME ZONE <zone>` / `<value> AT LOCAL` (`None` zone
+    /// = the session's). The result is ALWAYS a WITH TIME ZONE value
+    /// (parse.y:8561, AtNode): a zoneless operand is read as a wall
+    /// time in the SESSION zone and converted, a zoned one keeps its
+    /// instant and is re-labelled.
+    AtTimeZone(Box<RawExpr>, Option<Box<RawExpr>>),
     /// `TIME '... <zone>'` - the STORED form: UTC day units + zone id
     /// (the literal's wall clock already converted by the zone's
     /// displacement at parse; named zones without rules refuse there)
@@ -44304,6 +44468,11 @@ enum ExtractPart {
     Minute,
     Second,
     Millisecond,
+    /// the value's own offset from UTC, SIGNED on BOTH parts: -03:30
+    /// gives -3 and -30 (ExprNodes.cpp:5860 `tzSign * tzh` /
+    /// `tzSign * tzm`)
+    TimezoneHour,
+    TimezoneMinute,
 }
 
 impl ExtractPart {
@@ -44313,11 +44482,22 @@ impl ExtractPart {
         use ExtractPart::*;
         match self {
             Year | Month | Day | Weekday | Yearday | Week => {
-                matches!(k, TKind::Date | TKind::Timestamp)
+                matches!(k, TKind::Date | TKind::Timestamp | TKind::TimestampTz)
             }
             Hour | Minute | Second | Millisecond => {
-                matches!(k, TKind::Time | TKind::Timestamp)
+                matches!(
+                    k,
+                    TKind::Time | TKind::Timestamp | TKind::TimeTz | TKind::TimestampTz
+                )
             }
+            // a ZONELESS operand is legal too - it answers the SESSION
+            // zone's offset (ExprNodes.cpp:5806: the value is moved to
+            // the tz type with the session zone first), so every
+            // clock-bearing kind carries these
+            TimezoneHour | TimezoneMinute => matches!(
+                k,
+                TKind::Time | TKind::Timestamp | TKind::TimeTz | TKind::TimestampTz
+            ),
         }
     }
 }
@@ -45143,16 +45323,44 @@ fn expr_unary(b: &[char], pos: &mut usize) -> Option<RawExpr> {
 /// arithmetic operators (parse.y:745), left-associative. `a || b || c`
 /// groups as `(a || b) || c`.
 fn expr_concat(b: &[char], pos: &mut usize) -> Option<RawExpr> {
-    let mut left = expr_atom(b, pos)?;
+    let mut left = expr_at_tz(b, pos)?;
     loop {
         skip_ws(b, pos);
         if b.get(*pos) == Some(&'|') && b.get(*pos + 1) == Some(&'|') {
             *pos += 2;
-            let right = expr_atom(b, pos)?;
+            let right = expr_at_tz(b, pos)?;
             left = RawExpr::Concat(Box::new(left), Box::new(right));
         } else {
             break;
         }
+    }
+    Some(left)
+}
+
+/// The `AT TIME ZONE` / `AT LOCAL` postfix (parse.y:8561-8564, `%left
+/// AT`): binds tighter than `||` and chains left, so
+/// `t AT TIME ZONE 'a' AT TIME ZONE 'b'` re-labels twice. The zone is a
+/// full expression on the engine, and evaluated PER ROW.
+fn expr_at_tz(b: &[char], pos: &mut usize) -> Option<RawExpr> {
+    let mut left = expr_atom(b, pos)?;
+    loop {
+        let save = *pos;
+        if !take_keyword(b, pos, "AT") {
+            *pos = save;
+            break;
+        }
+        if take_keyword(b, pos, "LOCAL") {
+            left = RawExpr::AtTimeZone(Box::new(left), None);
+            continue;
+        }
+        if !take_keyword(b, pos, "TIME") || !take_keyword(b, pos, "ZONE") {
+            // `AT` that starts something else (an alias, a keyword):
+            // give the text back untouched
+            *pos = save;
+            break;
+        }
+        let zone = expr_atom(b, pos)?;
+        left = RawExpr::AtTimeZone(Box::new(left), Some(Box::new(zone)));
     }
     Some(left)
 }
@@ -45757,6 +45965,8 @@ fn raw_bad_substring_len(e: &RawExpr) -> Option<i64> {
         | RawExpr::CurrentTimestamp(_)
         | RawExpr::LocalTime
         | RawExpr::LocalTimestamp => None,
+        RawExpr::AtTimeZone(a, z) => raw_bad_substring_len(a)
+            .or_else(|| z.as_deref().and_then(raw_bad_substring_len)),
     }
 }
 
@@ -45964,7 +46174,11 @@ fn parse_sysfn_call(up: &str, b: &[char], pos: &mut usize) -> Option<RawExpr> {
             "MINUTE" => ExtractPart::Minute,
             "SECOND" => ExtractPart::Second,
             "MILLISECOND" => ExtractPart::Millisecond,
-            _ => return None, // TIMEZONE_HOUR etc.: refuse
+            "TIMEZONE_HOUR" => ExtractPart::TimezoneHour,
+            "TIMEZONE_MINUTE" => ExtractPart::TimezoneMinute,
+            // TIMEZONE_NAME needs the region catalogue fc does not
+            // carry (it renders through ICU): refused
+            _ => return None,
         };
         if !take_keyword(b, pos, "FROM") {
             return None;
@@ -46728,9 +46942,42 @@ fn resolve_expr_inner(
         RawExpr::TsLit(d, t) => Expr::TsLit(*d, *t),
         RawExpr::TimeTzLit(t, z) => Expr::TimeTzLit(*t, *z),
         RawExpr::TsTzLit(d, t, z) => Expr::TsTzLit(*d, *t, *z),
+        RawExpr::AtTimeZone(a, z) => {
+            let inner = resolve_expr_inner(a, columns, descs)?;
+            // AtNode::make (ExprNodes.cpp:3326) posts
+            // isc_expression_eval_err at PREPARE for an operand that is
+            // neither a TIME nor a TIMESTAMP - a DATE, a number, text
+            if !matches!(
+                inner.type_of(descs),
+                Some(ExprType::Temporal(
+                    TKind::Time | TKind::TimeTz | TKind::Timestamp | TKind::TimestampTz
+                )) | None
+            ) {
+                PREPARE_REFUSAL.with(|c| {
+                    let mut c = c.borrow_mut();
+                    if c.is_none() {
+                        *c = Some(EvalErr::ExpressionEval);
+                    }
+                });
+                return None;
+            }
+            Expr::AtTimeZone(
+                Box::new(inner),
+                match z {
+                    Some(z) => Some(Box::new(resolve_expr_inner(z, columns, descs)?)),
+                    None => None,
+                },
+            )
+        }
         // the plan-time clock capture (see the RawExpr variant docs);
         // LOCALTIME truncates the fractional second, as probed
-        RawExpr::CurrentDate => Expr::DateLit(now_date_time().0),
+        // THE ZONELESS CLOCKS READ THE SESSION'S WALL CLOCK, not the
+        // host's: LocalTimeStampNode/LocalTimeNode render the request's
+        // instant in att_current_timezone (ExprNodes.cpp:8419), and
+        // CURRENT_DATE is that day. The UTC-only fold answered the host
+        // zone, so `SET TIME ZONE` moved the tz clocks and left these
+        // behind (review-caught).
+        RawExpr::CurrentDate => Expr::DateLit(session_now().0),
         RawExpr::CurrentTime(p) => {
             let (_, t) = now_date_time();
             Expr::TimeTzLit(trunc_time_units(t, *p), session_zone_id())
@@ -46740,11 +46987,11 @@ fn resolve_expr_inner(
             Expr::TsTzLit(d, trunc_time_units(t, *p), session_zone_id())
         }
         RawExpr::LocalTime => {
-            let (_, t) = now_date_time();
+            let (_, t) = session_now();
             Expr::TimeLit(t - t % 10_000)
         }
         RawExpr::LocalTimestamp => {
-            let (d, t) = now_date_time();
+            let (d, t) = session_now();
             Expr::TsLit(d, t)
         }
     })
@@ -46863,6 +47110,9 @@ enum Expr {
     TimeTzLit(u32, u16),
     /// CURRENT_TIMESTAMP: (days, UTC time units, zone id)
     TsTzLit(i32, u32, u16),
+    /// `<value> AT TIME ZONE <zone>` / `<value> AT LOCAL` (None zone =
+    /// the session's) - see [RawExpr::AtTimeZone]
+    AtTimeZone(Box<Expr>, Option<Box<Expr>>),
     /// A TEXT side of a comparison whose OTHER side is numeric,
     /// wrapped by [cmp_sides]: the engine coerces the TEXT side to a
     /// number PER ROW with the lenient compare grammar
@@ -47032,6 +47282,10 @@ enum EvalErr {
     /// a domain error posted as a DSQL error (primary "Dynamic SQL Error"),
     /// as PERCENTILE_CONT/DISC's out-of-range fraction is
     DsqlDomain { func: &'static str, code: i32 },
+    /// `isc_expression_eval_err` on its own - AtNode::make's refusal for
+    /// an `AT TIME ZONE` operand that is not a TIME or a TIMESTAMP
+    /// (ExprNodes.cpp:3326), posted at PREPARE
+    ExpressionEval,
     /// an infinite std-math result (SINH / COSH past the f64 range): the
     /// engine's "Floating point overflow in built-in function @1"
     MathOverflow { func: &'static str },
@@ -48643,7 +48897,10 @@ fn dateadd_impl(
             d = total.div_euclid(UNITS_PER_DAY) as i64;
             u = total.rem_euclid(UNITS_PER_DAY) as i64;
         }
-        Weekday | Yearday => return Err(EvalErr::ConversionError(None)), // parse refuses
+        // DATEADD's own unit parser never yields these
+        Weekday | Yearday | TimezoneHour | TimezoneMinute => {
+            return Err(EvalErr::ConversionError(None))
+        }
     }
     // the engine's valid date range
     if !matches!(kind, TKind::Time) {
@@ -48701,7 +48958,8 @@ fn datediff_impl(
             // its 0.1-ms digit (10 units per ms)
             Value::Scaled((total(b) - total(a)) as i64, -1)
         }
-        Weekday | Yearday => return None,
+        // DATEDIFF's own unit parser never yields these
+        Weekday | Yearday | TimezoneHour | TimezoneMinute => return None,
     })
 }
 
@@ -49493,6 +49751,21 @@ impl Expr {
     /// then falls back rather than answering wrong).
     fn type_of(&self, descs: &[Descriptor]) -> Option<ExprType> {
         match self {
+            // AT TIME ZONE always answers a WITH TIME ZONE value, of
+            // the operand's own family (AtNode::make, ExprNodes.cpp:
+            // 3309: isTime -> makeTimeTz, isTimeStamp -> makeTimestampTz;
+            // a DATE or anything else is the engine's prepare-time
+            // -833, which is fc's None -> refusal)
+            Expr::AtTimeZone(a, _) => match a.type_of(descs)? {
+                ExprType::Temporal(TKind::Time) | ExprType::Temporal(TKind::TimeTz) => {
+                    Some(ExprType::Temporal(TKind::TimeTz))
+                }
+                ExprType::Temporal(TKind::Timestamp)
+                | ExprType::Temporal(TKind::TimestampTz) => {
+                    Some(ExprType::Temporal(TKind::TimestampTz))
+                }
+                _ => None,
+            },
             Expr::BlobText(_) => Some(ExprType::Text),
             // a `?` is untyped on its own - it is always wrapped by the
             // CAST that gives it a type, so type_of never reaches it
@@ -50031,7 +50304,10 @@ impl Expr {
     /// engine's getDesc copies the non-null side. None = not numeric.
     fn rank_of(&self, descs: &[Descriptor]) -> Option<NumRank> {
         match self {
-            Expr::BlobText(_) | Expr::TimeTzLit(..) | Expr::TsTzLit(..) => None,
+            Expr::BlobText(_)
+            | Expr::TimeTzLit(..)
+            | Expr::TsTzLit(..)
+            | Expr::AtTimeZone(..) => None,
             Expr::Param(_) => None,
             // a folded lookup answers within i64: its values came from
             // the inner table's own columns and folds
@@ -50191,6 +50467,64 @@ impl Expr {
     /// `Err(EvalErr)` is a per-row arithmetic exception (divide by zero).
     fn eval(&self, values: &[Value]) -> Result<Value, EvalErr> {
         Ok(match self {
+            // AT TIME ZONE: CONVERT, then RE-LABEL (AtNode::execute,
+            // ExprNodes.cpp:3368 - MOV_move to the tz type normalises to
+            // a UTC instant, then only the zone id is overwritten). So a
+            // ZONELESS operand is a wall time in the SESSION zone, and a
+            // zoned one keeps its instant. NULL in either operand (the
+            // datetime first, short-circuit) answers NULL.
+            Expr::AtTimeZone(a, z) => {
+                let v = a.eval(values)?;
+                if matches!(v, Value::Null) {
+                    return Ok(Value::Null);
+                }
+                let zone = match z {
+                    None => session_zone_id(), // AT LOCAL
+                    Some(z) => match z.eval(values)? {
+                        Value::Null => return Ok(Value::Null),
+                        zv => {
+                            let text = fn_text(&zv);
+                            let t = text.trim();
+                            match resolve_zone_tail(t) {
+                                Some(id) => id,
+                                // resolve_zone_tail parks its reason in
+                                // PREPARE_REFUSAL; here the error is per
+                                // ROW (the engine raises at EXECUTE too,
+                                // TimeZoneUtil::parse in AtNode::execute)
+                                None => {
+                                    let e = PREPARE_REFUSAL.with(|c| c.borrow_mut().take());
+                                    return Err(e.unwrap_or_else(|| {
+                                        EvalErr::InvalidTzRegion(t.to_string())
+                                    }));
+                                }
+                            }
+                        }
+                    },
+                };
+                // fc can only place a value in a zone whose offset it
+                // knows: a ruled region refuses rather than guessing
+                if fire_crab_ods::tz::displacement(zone).is_none() {
+                    return Err(EvalErr::Unsupported);
+                }
+                match v {
+                    // already an instant: pure re-label
+                    Value::TimestampTz(d, t, _) => Value::TimestampTz(d, t, zone),
+                    Value::TimeTz(t, _) => Value::TimeTz(t, zone),
+                    // zoneless: read as SESSION-zone wall time, converted
+                    Value::Timestamp(d, t) => {
+                        match wall_to_utc_timestamp(d, t, session_zone_id()) {
+                            Some((ud, ut)) => Value::TimestampTz(ud, ut, zone),
+                            None => return Err(EvalErr::Unsupported),
+                        }
+                    }
+                    Value::Time(t) => match wall_to_utc_time(t, session_zone_id()) {
+                        Some(ut) => Value::TimeTz(ut, zone),
+                        None => return Err(EvalErr::Unsupported),
+                    },
+                    // a DATE or a non-temporal never types (type_of)
+                    _ => return Err(EvalErr::Unsupported),
+                }
+            }
             // a parameter is substituted to a literal before the row
             // loop ([bind_proj_params]); reaching eval means it was not,
             // which is an internal error, not a wrong answer
@@ -50936,13 +51270,49 @@ impl Expr {
                     // helpers (WEEKDAY 0=Sunday, YEARDAY 0-based, ISO
                     // week, SECOND at scale -4, MILLISECOND at -1)
                     SysFn::Extract(part) => {
+                        use ExtractPart::*;
+                        // THE ZONE FIRST: TIMEZONE_HOUR/MINUTE read the
+                        // value's own offset - SIGNED on BOTH parts
+                        // (ExprNodes.cpp:5860 `tzSign * tzh` /
+                        // `tzSign * tzm`, so -03:30 gives -3 and -30) -
+                        // and a ZONELESS operand answers the SESSION
+                        // zone's (ExprNodes.cpp:5806 moves it to the tz
+                        // type with the session zone first)
+                        if matches!(part, TimezoneHour | TimezoneMinute) {
+                            let zone = match vs[0] {
+                                Value::TimeTz(_, z) | Value::TimestampTz(_, _, z) => z,
+                                Value::Time(_) | Value::Timestamp(..) => session_zone_id(),
+                                _ => return Ok(Value::Null), // type-checked away
+                            };
+                            // a ruled zone has no offset fc can compute
+                            let Some(mins) = fire_crab_ods::tz::displacement(zone) else {
+                                return Err(EvalErr::Unsupported);
+                            };
+                            let sign = if mins < 0 { -1 } else { 1 };
+                            let (h, m) = (mins.abs() / 60, mins.abs() % 60);
+                            return Ok(Value::Int(
+                                (sign * if matches!(part, TimezoneHour) { h } else { m }) as i64,
+                            ));
+                        }
+                        // an ordinary part of a WITH TIME ZONE value is
+                        // read off the LOCAL WALL CLOCK in the value's
+                        // own zone (ExprNodes.cpp:5825 decodeTimeStamp
+                        // adds the displacement before decoding), not
+                        // off the stored UTC instant
                         let (days, units) = match vs[0] {
                             Value::Date(d) => (Some(d), None),
                             Value::Time(t) => (None, Some(t)),
                             Value::Timestamp(d, t) => (Some(d), Some(t)),
+                            Value::TimeTz(t, z) => match tz_local_time(t, z) {
+                                Some(lt) => (None, Some(lt)),
+                                None => return Err(EvalErr::Unsupported),
+                            },
+                            Value::TimestampTz(d, t, z) => match tz_local_timestamp(d, t, z) {
+                                Some((ld, lt)) => (Some(ld), Some(lt)),
+                                None => return Err(EvalErr::Unsupported),
+                            },
                             _ => return Ok(Value::Null), // type-checked away
                         };
-                        use ExtractPart::*;
                         match (part, days, units) {
                             (Year, Some(d), _) => Value::Int(civil_of(d).0 as i64),
                             (Month, Some(d), _) => Value::Int(civil_of(d).1 as i64),
@@ -54521,6 +54891,9 @@ fn default_expr_name(raw: &RawExpr) -> String {
         | RawExpr::TsLit(..)
         | RawExpr::TimeTzLit(..)
         | RawExpr::TsTzLit(..) => "CONSTANT",
+        // AtNode::setParameterName (ExprNodes.cpp:3274): name and alias
+        // are both "AT"
+        RawExpr::AtTimeZone(..) => "AT",
         // the engine leaves a unary-minus column unnamed (blank header)
         // a NEGATED LITERAL is still a constant (probed: `-3` describes
         // as CONSTANT), while negating anything else describes BLANK
@@ -55543,10 +55916,36 @@ fn texpr_unary(t: &[Tok], pos: &mut usize) -> Option<RawExpr> {
 /// arithmetic operators, left-associative, mirroring the char-level
 /// [expr_concat] the select-list parser uses.
 fn texpr_concat(t: &[Tok], pos: &mut usize) -> Option<RawExpr> {
-    let mut left = texpr_atom(t, pos)?;
+    let mut left = texpr_at_tz(t, pos)?;
     while matches!(t.get(*pos), Some(Tok::Concat)) {
         *pos += 1;
-        left = RawExpr::Concat(Box::new(left), Box::new(texpr_atom(t, pos)?));
+        left = RawExpr::Concat(Box::new(left), Box::new(texpr_at_tz(t, pos)?));
+    }
+    Some(left)
+}
+
+/// The token twin of [expr_at_tz]: `AT TIME ZONE` / `AT LOCAL` arrive
+/// as bare identifier tokens here.
+fn texpr_at_tz(t: &[Tok], pos: &mut usize) -> Option<RawExpr> {
+    let mut left = texpr_atom(t, pos)?;
+    loop {
+        let word = |i: usize, w: &str| {
+            matches!(t.get(i), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case(w))
+        };
+        if !word(*pos, "AT") {
+            break;
+        }
+        if word(*pos + 1, "LOCAL") {
+            *pos += 2;
+            left = RawExpr::AtTimeZone(Box::new(left), None);
+            continue;
+        }
+        if !(word(*pos + 1, "TIME") && word(*pos + 2, "ZONE")) {
+            break;
+        }
+        *pos += 3;
+        let zone = texpr_atom(t, pos)?;
+        left = RawExpr::AtTimeZone(Box::new(left), Some(Box::new(zone)));
     }
     Some(left)
 }
@@ -57346,6 +57745,7 @@ fn plan_immediate(text: &str, database: &Option<Database>) -> Option<(Plan, Vec<
     // SET GENERATOR / ALTER SEQUENCE RESTART are generator writes; the
     // ALTER form also begins with a DDL verb.
     plan_set_generator(text)
+        .or_else(|| plan_set_time_zone(text))
         .or_else(|| plan_set_statistics(text))
         .or_else(|| {
             if ddl_kw {
@@ -61969,6 +62369,9 @@ fn expr_no_raise(e: &Expr, descs: &[Descriptor]) -> bool {
             && a.rank_of(descs) != Some(NumRank::I128)
     };
     match e {
+        // an unparsable or ruleless zone raises per row (22009), so this
+        // is never raise-free
+        Expr::AtTimeZone(..) => false,
         // a parameter's value is substituted before eval; the CAST above
         // it may still raise, so it is not raise-free
         Expr::Param(_) => false,
@@ -63884,6 +64287,7 @@ fn after_auth(
                     .into_iter()
                     .find(|k| find_word(&up, k, 0) == Some(0));
                 if let Some((p, ps)) = plan_set_generator(&stmt_sql)
+                    .or_else(|| plan_set_time_zone(&stmt_sql))
                     .or_else(|| plan_set_statistics(&stmt_sql))
                     .map(|(p, ps)| (std::rc::Rc::new(p), std::rc::Rc::new(ps)))
                 {
@@ -64280,6 +64684,8 @@ fn after_auth(
                         | Plan::AlterColumnDropIdentity { .. }
                         | Plan::AlterColumnPosition { .. }
                         | Plan::SetGenerator { .. }
+                        | Plan::SetTimeZone { .. }
+                        | Plan::SetTimeZoneRefused(_)
                 ) {
                     // DML and DDL execute here (not at fetch): write the
                     // new versions (or the new catalog) into a copy of
@@ -73457,14 +73863,18 @@ mod tests {
         ));
 
         // the announces: temporal results use the stored-column wire
-        // forms; EXTRACT ints are INT64-backed, SECOND is scale -4
+        // forms; EXTRACT integer parts are SMALLINT and SECOND /
+        // MILLISECOND INTEGER at scale -4 / -1 (ExprNodes.cpp:5644
+        // makeShort / makeLong - fc announced BIGINT for all of them
+        // until the AT TIME ZONE slice)
         let pc = |s: &str| {
             build_expr_col(&parse_raw_expr_any(s).unwrap(), "X", &columns, &descs).unwrap()
         };
         assert_eq!(pc("COALESCE(D, DATE '2000-01-01')").sql_type, 571); // DATE nullable
         assert_eq!(pc("COALESCE(TM, TIME '09:00:00')").sql_type, 561);
-        assert_eq!((pc("EXTRACT(SECOND FROM TM)").sql_type, pc("EXTRACT(SECOND FROM TM)").scale), (581, -4));
+        assert_eq!((pc("EXTRACT(SECOND FROM TM)").sql_type, pc("EXTRACT(SECOND FROM TM)").scale), (497, -4));
         assert_eq!(pc("EXTRACT(MILLISECOND FROM TM)").scale, -1);
+        assert_eq!(pc("EXTRACT(YEAR FROM D)").sql_type, 501); // SMALLINT nullable
         assert_eq!(pc("DATE '2000-01-01'").sql_type, 571);
 
         // a part that does not exist in the operand's kind fails the

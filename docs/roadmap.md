@@ -285,9 +285,50 @@ engine's tie representative is an unstable internal-sort artifact —
 it flipped between largest- and smallest-zone-id under a WHERE
 during review — and a wrong representative is a wrong answer.
 Boundaries recorded: ruled named zones in DML, TIME-TZ into
-TIMESTAMP (the 2020-01-01 base-date re-anchor law), EXTRACT/AT TIME
-ZONE, CREATE INDEX on tz columns, tz parameters, no-space zone
-tails, EXECUTE BLOCK tz literals (all clean refusals).
+TIMESTAMP (the 2020-01-01 base-date re-anchor law), CREATE INDEX on
+tz columns, tz parameters, no-space zone tails, EXECUTE BLOCK tz
+literals (all clean refusals). *(`EXTRACT`/`AT TIME ZONE` were on
+that list until the slice below closed them.)*
+
+**AT TIME ZONE, the time-zone EXTRACT parts and SET TIME ZONE DONE
+(2026-08-26, `serve-real-attimezone` 49):** `<value> AT TIME ZONE
+<zone>` and `<value> AT LOCAL` — a left-chaining postfix operator in
+both front-ends (`expr_at_tz`, `texpr_at_tz`) — CONVERT AND THEN
+RE-LABEL, the engine's own shape (AtNode::execute, ExprNodes.cpp:
+3368: `MOV_move` to the WITH TIME ZONE type normalises to a UTC
+instant, then only the zone id is overwritten). So a ZONELESS
+operand is a wall time in the SESSION zone (12:00 under a UTC
+session is 14:00 +02:00, 11:00 +02:00 under a +03:00 one — the
+standard's reading, the opposite of PostgreSQL's re-anchoring) and a
+ZONED one keeps its instant. The result is always a WITH TIME ZONE
+value of the operand's family, described 32754/12 and 32756/8, named
+`AT`, nullable iff either operand is; the zone is any expression,
+evaluated per row, and a bad one raises the engine's 22009 at
+EXECUTE. `EXTRACT` gains `TIMEZONE_HOUR`/`TIMEZONE_MINUTE`, SIGNED on
+BOTH parts (`-03:30` gives −3 and −30), answering the SESSION
+offset for a zoneless operand; its ordinary parts now read a zoned
+value's LOCAL wall clock where they used to refuse. `SET TIME ZONE
+'<zone>' | LOCAL` sets the session zone (`Plan::SetTimeZone`,
+reported `isc_info_sql_stmt_ddl` as the engine reports every
+session-management statement) and the zoneless clocks
+(LOCALTIME/LOCALTIMESTAMP/CURRENT_DATE) move with it.
+Four pre-existing divergences fell out with it: EXTRACT announced
+BIGINT where the engine announces SMALLINT (and INTEGER at scale
+−4/−1 for SECOND/MILLISECOND) — top level AND under every wrapper; a
+WITH TIME ZONE column named out of a DERIVED TABLE or CTE decoded as
+a BIGINT and answered **0** (`desc_of_projcol` had no tz arm);
+COALESCE announced nullable always (the engine's list rule is
+"nullable if ANY argument is"); and `expr_reads` — the walker that
+decides whether a term is row-dependent — had a catch-all that
+judged `<column> AT TIME ZONE '…'` row-INDEPENDENT, evaluated it
+against an empty row and SILENTLY DROPPED EVERY ROW of a WHERE.
+Boundaries: a ruled region still refuses everywhere (no tzdata
+rules), `TIMEZONE_NAME` refuses (ICU-rendered), and — recorded, not
+introduced — under isql's autocommit a statement typed
+`isc_info_sql_stmt_ddl` commits the caller's pending DML, because
+this server hands every transaction the same handle (a plain CREATE
+TABLE in the same position diverges identically; the fix is distinct
+transaction handles).
 
 **AGGREGATES IN EXPRESSIONS DONE (2026-08-25,
 `serve-real-statexpr` 8):** the statistical/ordered-set family
