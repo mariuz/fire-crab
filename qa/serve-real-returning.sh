@@ -250,16 +250,13 @@ for NP in "$N211" "$N214"; do
 done
 
 # --- refusals ----------------------------------------------------------
-# an expression in the RETURNING list is not converted; the statement must
-# be REFUSED at prepare rather than run with an empty cursor - a write
-# that happened while the client saw nothing is the worst outcome here
-r=$(query "INSERT INTO T VALUES (20, 200, 'e') RETURNING AMT * 2" "$PORT" "$A")
-after=$(query "SELECT COUNT(*) FROM T WHERE ID = 20" "$PORT" "$A")
-case "$r:$after" in
-    ERR*:*'"COUNT":0'*)
-        echo "OK   an expression in RETURNING is refused, and nothing was written" ;;
-    *) echo "DIFF expression RETURNING: [$r] table after: [$after]"; fail=1 ;;
-esac
+# an EXPRESSION in the RETURNING list is served now (see
+# serve-real-returningexpr.sh) - both servers answer the computed value
+# and both write the row, which is what this pair pins
+both "an expression in RETURNING answers on both, and both wrote the row" \
+     "INSERT INTO T VALUES (20, 200, 'e') RETURNING AMT * 2"
+both "... the row it wrote" \
+     "SELECT ID, AMT FROM T WHERE ID = 20"
 
 # ... and NEW./OLD. do NOT exist in DSQL - they are the PSQL trigger
 # contexts. The engine answers `Column unknown, "NEW"."ID"`, so fire-crab

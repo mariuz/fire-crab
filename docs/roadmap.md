@@ -642,6 +642,49 @@ and the window is one op wide rather than for ever; closing it entirely
 means executing the subquery as a row source, which is the nested
 `blr_rse` the engine compiles.
 
+**`RETURNING <EXPRESSION>` — DONE 2026-08-26
+(`serve-real-returningexpr` 24).** The other direction of a DML value:
+the RETURNING list took plain column references only, so `RETURNING ID +
+1`, `RETURNING UPPER(S) AS U`, `RETURNING CAST(B AS VARCHAR(30))` and
+even `RETURNING 1` refused. Any value expression serves now, built by
+the SELECT LIST'S OWN `build_expr_col`, so the type, the width, the
+charset and the un-aliased name are decided in one place and cannot
+drift from the projection's: `MULTIPLY`, `ADD`, `CONCATENATION`, `CAST`,
+`CASE`, `""` for a unary minus. Every family measured against the engine
+over the written row — arithmetic, concatenation, CAST, COALESCE, CASE,
+temporal arithmetic, the text functions, a BLOB-valued expression
+(minted through the LIST path, as in a projection), a constant, a
+literal keyword, a qualified column — for INSERT, UPDATE (the NEW row),
+DELETE (the row as it WAS) and UPDATE OR INSERT, over the cursor path
+AND the type-8 singleton path a driver takes for `INSERT ... RETURNING`.
+
+The spelled/expression split is made on the TEXT and not by trying the
+column route first: a quoted `RETURNING "id"` must stay `Column unknown`
+(the engine's exact compare), where an expression resolver — which folds
+case like every other resolver here — would have answered it. That
+decision needed the select list's own literal rules with it: an unquoted
+identifier CANNOT START WITH A DIGIT (`RETURNING 1` had been looked up
+as a column named "1" and refused, while `'lit'` always worked because
+it is not spelled like a name), and `NULL`/`TRUE`/`FALSE`/`UNKNOWN` and
+the clock keywords look exactly like names and are values.
+
+TWO PRE-EXISTING DESCRIBE DIVERGENCES fell out of it, both measured:
+**every RETURNING column is nullable**, even one the table declares NOT
+NULL (`RETURNING ID` over `ID INTEGER NOT NULL` describes Nullable where
+the same column in a SELECT does not) — this server passed the column's
+own flag through; and **a bare NULL literal describes as CHAR(1)
+CHARACTER SET NONE**, in a select list as much as in a RETURNING, where
+this server announced INT64. The second is a describe-only fix:
+`Expr::type_of` still answers Int for a NULL, which is the arithmetic
+default an all-NULL conditional leans on.
+
+Boundaries recorded: an expression over a COMPUTED column (these rows
+are decoded from the STORED image, where a computed column's descriptor
+sits over the null flags — the bare column already refused for that
+reason, and `RETURNING CC + 0` now refuses with it), an aggregate, a
+subquery, a parameter, and a MERGE's RETURNING (two contexts, and an
+expression would have to name which one it reads).
+
 **AGGREGATES IN EXPRESSIONS DONE (2026-08-25,
 `serve-real-statexpr` 8):** the statistical/ordered-set family
 (VAR_*/STDDEV_*, CORR/COVAR_*/REGR_*, PERCENTILE_CONT/DISC) and

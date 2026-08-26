@@ -13740,6 +13740,29 @@ fn build_expr_col(
 /// through [resolve_proj_expr] (collecting the `?` slots) and hand the
 /// result here without a second resolution.
 fn build_expr_col_from(e: Expr, name: &str, descs: &[Descriptor]) -> Option<ProjCol> {
+    // A BARE NULL LITERAL DESCRIBES AS CHAR(1) CHARACTER SET NONE
+    // (probed: `SELECT NULL`, `SELECT NULL AS X` and `... RETURNING
+    // NULL` all announce sqltype 452, len 1, charset 0 - this server
+    // announced INT64). [Expr::type_of] answers Int for a NULL and must
+    // keep doing so: that is the ARITHMETIC default an all-NULL
+    // conditional leans on. Only the top-level describe differs, which
+    // is what this arm says.
+    if matches!(e, Expr::Null) {
+        return Some(ProjCol {
+            name: name.to_string(),
+            fname: None,
+            relation: None,
+            rel_alias: None,
+            field_id: 0,
+            wire: Wire::Text,
+            sql_type: nullable(452),
+            length: 1,
+            oct_length: 1,
+            scale: 0,
+            sub_type: 0,
+            expr: Some(Expr::Null),
+        });
+    }
     // A BLOB RESULT describes as a blob and travels as an id: len 8,
     // sqltype 520, the sub_type and (for a text blob) the charset in
     // the scale slot - the blob describe convention ([wire_for]). The
@@ -21638,11 +21661,14 @@ fn returning_ident(s: &str) -> Option<(String, bool, &str)> {
 
 /// Wrap a planned DML in its `RETURNING` clause.
 ///
-/// Only plain column references are converted - `RETURNING ID, AMT`, with
-/// an optional `NEW.`/`OLD.` qualifier, which is how the engine's own
-/// contexts are named. An expression there (`RETURNING AMT * 2`) is
-/// refused rather than guessed: the value would look right and the type
-/// in the describe would not.
+/// Two kinds of item. A plain column reference - `RETURNING ID, AMT`,
+/// optionally qualified by the target table - projects the stored field
+/// and carries the target as its source relation. Anything else is a
+/// VALUE EXPRESSION over the row the statement wrote (`RETURNING N * 2`,
+/// `RETURNING UPPER(S) AS U`, `RETURNING CAST(B AS VARCHAR(10))`), built
+/// by the select list's own [build_expr_col] so the type, the width and
+/// the un-aliased name (`MULTIPLY`, `CAST`, ...) are decided in ONE
+/// place, and evaluated per returned row.
 ///
 /// Identifier matching is the engine's (probed): a QUOTED name compares
 /// EXACTLY against the catalog - `RETURNING "id"` is `Column unknown,
@@ -21686,19 +21712,111 @@ fn wrap_returning(
         }
         _ => None,
     };
-    for item in list.split(',') {
+    // TOP-LEVEL commas: an item may be an expression now, and
+    // `SUBSTRING(S FROM 1 FOR 2)` carries commas of its own inside its
+    // parens for other functions
+    for item in split_top_level_commas(list) {
         let item = item.trim();
-        let (first, first_q, rest) = returning_ident(item)?;
-        let rest = rest.trim_start();
-        let (qual, bare, bare_q) = if rest.is_empty() {
-            (None, first, first_q)
-        } else {
+        // Does the item SPELL a plain, optionally qualified, column
+        // name? That decision is made here and not by trying the column
+        // route and falling back, because the two routes disagree about
+        // a name the catalog does not carry: a quoted `RETURNING "id"`
+        // must stay `Column unknown` (the engine's exact compare) where
+        // the expression resolver, which folds case like every other
+        // resolver in this file, would happily answer it.
+        let spelled = (|| -> Option<(Option<(String, bool)>, String, bool)> {
+            // AN UNQUOTED IDENTIFIER CANNOT START WITH A DIGIT, so `1`
+            // is a literal and not a column named "1" - the select
+            // list's own rule, and without it `RETURNING 1` looked up a
+            // column and refused (`'lit'` never did: it is not spelled
+            // like a name at all). The literal and clock KEYWORDS look
+            // exactly like names and are values too.
+            let head = item.trim();
+            if head.starts_with(|c: char| c.is_ascii_digit()) {
+                return None;
+            }
+            if matches!(
+                head.to_ascii_uppercase().as_str(),
+                "TRUE" | "FALSE" | "UNKNOWN" | "NULL" | "CURRENT_DATE" | "CURRENT_TIME"
+                    | "CURRENT_TIMESTAMP" | "LOCALTIME" | "LOCALTIMESTAMP"
+            ) {
+                return None;
+            }
+            let (first, first_q, rest) = returning_ident(item)?;
+            let rest = rest.trim_start();
+            if rest.is_empty() {
+                return Some((None, first, first_q));
+            }
             let rest = rest.strip_prefix('.')?;
             let (second, second_q, tail) = returning_ident(rest)?;
             if !tail.trim().is_empty() {
                 return None; // an expression, or a three-part name
             }
-            (Some((first, first_q)), second, second_q)
+            Some((Some((first, first_q)), second, second_q))
+        })();
+        let Some((qual, bare, bare_q)) = spelled else {
+            // AN EXPRESSION - `RETURNING N * 2`, `RETURNING UPPER(S) AS
+            // U`, `RETURNING CAST(B AS VARCHAR(10))`. The engine takes
+            // any value expression here and describes it exactly as it
+            // describes the same expression in a select list (probed:
+            // an un-aliased `N * 2` columns as MULTIPLY), so the select
+            // list's own builder decides the type, the width and the
+            // name, and the value is computed per returned row from the
+            // stored image the DML left behind ([ProjCol::value_of]).
+            //
+            // A MERGE keeps its recorded refusal: its RETURNING already
+            // resolves two contexts, and an expression over them would
+            // have to name which one it reads.
+            if merge.is_some() {
+                return None;
+            }
+            let (body, alias) = split_alias(item);
+            let raw = parse_raw_expr_any(body.trim())?;
+            // the engine sets BOTH names from the expression and lets an
+            // alias overwrite only the ALIAS (probed: `RETURNING N * 2
+            // AS DOUBLED` is name MULTIPLY, alias DOUBLED) - the select
+            // list's rule, and the same [default_expr_name] behind it
+            let fname = default_expr_name(&raw);
+            let name = match alias {
+                Some(a) => {
+                    let a = a.trim();
+                    if let Some(q) = a.strip_prefix('"') {
+                        q.strip_suffix('"')?.replace("\"\"", "\"")
+                    } else {
+                        if !ident_ok(a) {
+                            return None;
+                        }
+                        a.to_ascii_uppercase()
+                    }
+                }
+                None => fname.clone(),
+            };
+            let mut pc = build_expr_col(&raw, &name, &columns, descs)?;
+            pc.fname = Some(fname);
+            // a plain column reached through the expression parser is
+            // the spelled route's business, not this one's - and it
+            // would lose the exact-compare rule above
+            let e = pc.expr.as_ref()?;
+            // A COMPUTED COLUMN HAS NO STORED BYTES: its descriptor
+            // sits at offset 0, over the null flags, and these rows are
+            // decoded from the STORED image - so `RETURNING C + 0` over
+            // a computed C would read the FLAG BYTES as a number and
+            // answer them. The spelled route refuses a bare computed
+            // column for the same reason; an expression that reads one
+            // refuses here.
+            if expr_reads(e, &|fid| is_computed_fid(descs, fid)) {
+                return None;
+            }
+            // probed, and the select list's own rule: an expression
+            // carries NO source relation, where a plain RETURNING column
+            // carries the target table
+            pc.relation = None;
+            pc.rel_alias = None;
+            cols.push(pc);
+            // vestigial beside an expression column, which reads the
+            // whole record rather than one field
+            fields.push(0);
+            continue;
         };
         // A qualifier is allowed only when it names the TARGET TABLE
         // (`RETURNING T.ID` works); `NEW.`/`OLD.` do NOT exist in DSQL -
@@ -21761,7 +21879,14 @@ fn wrap_returning(
             rel_alias: None,
             field_id: fid,
             wire,
-            sql_type,
+            // EVERY RETURNING COLUMN IS NULLABLE, even one the table
+            // declares NOT NULL (probed: `RETURNING ID` over an
+            // `ID INTEGER NOT NULL` describes Nullable where the same
+            // column in a SELECT does not). The clause answers the row a
+            // statement touched, and a statement that touched none
+            // answers nothing at all - so the client is warned the same
+            // way a subquery's describe warns it
+            sql_type: nullable(sql_type),
             length,
             oct_length: length,
             scale,
@@ -22362,6 +22487,11 @@ fn plan_insert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
                 // shape that will not resolve or fold - a `?` inside an
                 // expression, a scalar subquery, a blob value - keeps
                 // the refusal.
+                // AN EXPRESSION CARRYING `?` - `VALUES (? + 1)`. It
+                // cannot be folded (its value arrives at execute) and it
+                // cannot be typed yet (the destination column types the
+                // parameter, and the target list is resolved below), so
+                // the numbered raw tree is carried through.
                 _ => {
                     // an UNTYPED expression whose fold is NULL is the
                     // eval fallthrough talking (`'5' + 1` - the engine's
@@ -69510,11 +69640,13 @@ fn after_auth(
                             // answered from last_dml
                             last_dml = counts;
                             // the ONE stored row, decoded whole: each
-                            // ProjCol projects the full record by its
-                            // own field_id (wrap_returning refuses
-                            // expression columns at prepare, so
-                            // value_of cannot raise here - kept as a
-                            // Result all the same)
+                            // ProjCol reads the full record - by its own
+                            // field_id for a plain column, and by
+                            // EVALUATING its expression for a computed
+                            // one (`RETURNING N * 2`), which is why the
+                            // projection is a Result: an expression can
+                            // raise here, at execute, exactly as it
+                            // would mid-fetch
                             let record = affected
                                 .images
                                 .first()
@@ -78289,6 +78421,7 @@ mod tests {
                 descs: Vec::new(),
                 index_ops: Vec::new(),
                 param_fields: Vec::new(),
+            param_exprs: Vec::new(),
                 gen_fields: Vec::new(),
                 not_null: Vec::new(),
                 checks: Vec::new(),
