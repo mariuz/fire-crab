@@ -2180,6 +2180,33 @@ fn field_dimensions(file: &crate::Image, page_size: usize, fname: &str) -> Vec<(
     dims.into_iter().map(|d| (d.1, d.2)).collect()
 }
 
+/// The database's DEFAULT CHARACTER SET, by name, out of RDB$DATABASE
+/// (`RDB$CHARACTER_SET_NAME`). It is what every text or text-blob
+/// column declared WITHOUT a `CHARACTER SET` clause takes - the engine
+/// resolves the default at CREATE time and writes the resolved id into
+/// the column's catalog row, so a file created in a UTF8 database has
+/// UTF8 columns and four times the declared byte length.
+pub fn database_charset_name(file: &crate::Image, page_size: usize) -> Option<String> {
+    let rel = crate::resolve_relation(file, page_size, "RDB$DATABASE")?;
+    let formats = system_relation_formats(file, page_size, "RDB$DATABASE")?;
+    let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
+    let cols = relation_columns(file, page_size, "RDB$DATABASE");
+    let cs_f = cols
+        .iter()
+        .find(|c| c.name == "RDB$CHARACTER_SET_NAME")
+        .map(|c| c.field_id as usize)?;
+    let mut out = None;
+    walk_rows(file, page_size, rel, descs, |v| {
+        if let Some(Value::Text(t)) = v.get(cs_f) {
+            let t = t.trim();
+            if !t.is_empty() {
+                out = Some(t.to_string());
+            }
+        }
+    });
+    out
+}
+
 /// A domain's `RDB$CHARACTER_SET_ID` (None when SQL NULL - non-text
 /// types) - the one type fact [domain_type_info] does not carry, needed
 /// to gate a text-domain CHECK compile to the NONE charset the stored

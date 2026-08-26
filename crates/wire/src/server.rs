@@ -10431,7 +10431,8 @@ fn expr_has_col(e: &Expr) -> bool {
 fn expr_reads(e: &Expr, f: &dyn Fn(usize) -> bool) -> bool {
     match e {
         Expr::Col(fid) => f(*fid),
-        Expr::BlobText(fid) => f(*fid),
+        Expr::BlobText(fid, _) => f(*fid),
+        Expr::BlobOf(a, _) => expr_reads(a, f),
         Expr::GenVal(_) => true,
         // the per-row coercion wrappers read whatever they wrap - a
         // wrapped COLUMN must keep its term row-DEPENDENT, or the
@@ -13297,6 +13298,14 @@ fn int_func_form(e: &Expr, descs: &[Descriptor]) -> Option<(Wire, i32, i32)> {
         SysFn::Sign => Some(short),
         SysFn::AsciiVal => Some(short), // SMALLINT (probed)
         SysFn::Hash => Some(int64), // BIGINT (probed)
+        // ... but over a BLOB argument both lengths are BIGINT
+        // (probed: CHAR_LENGTH(<blob>) describes INT64 where
+        // CHAR_LENGTH(<varchar>) describes INTEGER)
+        SysFn::CharLength | SysFn::OctetLength | SysFn::OctetLengthCs(_)
+            if matches!(args.first(), Some(Expr::BlobText(..))) =>
+        {
+            Some(int64)
+        }
         SysFn::CharLength | SysFn::OctetLength | SysFn::OctetLengthCs(_) | SysFn::Position => Some(long),
         SysFn::BlobOctetLength => Some(int64), // a blob's length is a BIGINT (probed)
         SysFn::Mod => match src_dtype(0)? {
@@ -13474,6 +13483,11 @@ fn text_form_m(
         // a BINARY literal is CHAR of exactly its BYTES, at OCTETS -
         // never the attachment's charset and never a character count
         Expr::Hex(b) => Some((false, b.len() as i32, TfCs::Ttype(1))),
+        // a BLOB operand carries its column's character set into the
+        // expression's text type (what decides a blob RESULT's charset,
+        // [blob_result]); it has no declared width of its own - a blob
+        // describes len 8 whatever it holds
+        Expr::BlobText(_, cs) => Some((true, 0, TfCs::Ttype(*cs as i32))),
         // a column's descriptor length is BYTES; the width here is
         // CHARACTERS, so a multibyte charset divides by its
         // bytes-per-character (CHAR(6) UTF8 stores 24 bytes, is 6 wide)
@@ -13631,6 +13645,81 @@ fn text_form_m(
     }
 }
 
+/// `(sub_type, charset)` when this expression's RESULT IS A BLOB.
+///
+/// The engine's rule, probed shape by shape: a BLOB OPERAND makes the
+/// whole text operation a blob - concatenation, the text functions, a
+/// conditional with a blob branch - and the result's TEXT TYPE is the
+/// operands' joined one, the first real charset winning (`S || B` is
+/// UTF8 from S, `W || B` WIN1252 from W, `B || W` UTF8 from B). One
+/// BINARY blob operand (sub_type 0) makes the whole result binary, and
+/// a binary blob result carries no charset at all.
+///
+/// A CAST is NOT here: its target names the type, including
+/// `CAST(<v> AS BLOB)`, and `CAST(<blob> AS VARCHAR)` is text.
+fn blob_result(e: &Expr, descs: &[Descriptor]) -> Option<(i16, u8)> {
+    // the operands that are themselves blobs decide the sub_type
+    fn walk(e: &Expr, descs: &[Descriptor], sub: &mut i16, found: &mut bool) {
+        match e {
+            Expr::BlobText(fid, _) => {
+                *found = true;
+                if descs.get(*fid).map_or(0, |d| d.sub_type) == 0 {
+                    *sub = 0;
+                }
+            }
+            Expr::Concat(a, b) | Expr::NullIf(a, b) => {
+                walk(a, descs, sub, found);
+                walk(b, descs, sub, found);
+            }
+            Expr::Iif(_, a, b) => {
+                walk(a, descs, sub, found);
+                walk(b, descs, sub, found);
+            }
+            Expr::Coalesce(v) => v.iter().for_each(|x| walk(x, descs, sub, found)),
+            Expr::Case(arms, els) => {
+                arms.iter().for_each(|(_, x)| walk(x, descs, sub, found));
+                if let Some(x) = els {
+                    walk(x, descs, sub, found);
+                }
+            }
+            // a function's result is a blob only where the function
+            // ANSWERS TEXT: the lengths, POSITION and the numeric
+            // family answer scalars over a blob argument just as they
+            // do over a string
+            Expr::Func(f, args) if fn_answers_text(f) => {
+                args.iter().for_each(|x| walk(x, descs, sub, found))
+            }
+            _ => {}
+        }
+    }
+    let (mut sub, mut found) = (1i16, false);
+    walk(e, descs, &mut sub, &mut found);
+    if !found {
+        return None;
+    }
+    let cs = match text_form(e, descs) {
+        Some((_, _, TfCs::Ttype(t))) => (t & 0xFF) as u8,
+        _ => 0,
+    };
+    Some((sub, if sub == 0 { 0 } else { cs }))
+}
+
+/// Does this built-in answer TEXT (as opposed to a number, a boolean or
+/// a temporal)? The blob-result rule turns on it: `UPPER(<blob>)` is a
+/// blob where `CHAR_LENGTH(<blob>)` is a BIGINT.
+fn fn_answers_text(f: &SysFn) -> bool {
+    !matches!(
+        f,
+        SysFn::CharLength
+            | SysFn::OctetLength
+            | SysFn::OctetLengthCs(_)
+            | SysFn::BlobOctetLength
+            | SysFn::Position
+            | SysFn::Hash
+            | SysFn::AsciiVal
+    )
+}
+
 fn build_expr_col(
     raw: &RawExpr,
     name: &str,
@@ -13647,6 +13736,26 @@ fn build_expr_col(
 /// through [resolve_proj_expr] (collecting the `?` slots) and hand the
 /// result here without a second resolution.
 fn build_expr_col_from(e: Expr, name: &str, descs: &[Descriptor]) -> Option<ProjCol> {
+    // A BLOB RESULT describes as a blob and travels as an id: len 8,
+    // sqltype 520, the sub_type and (for a text blob) the charset in
+    // the scale slot - the blob describe convention ([wire_for]). The
+    // value is minted at eval ([Expr::BlobOf]).
+    if let Some((sub_type, cs)) = blob_result(&e, descs) {
+        return Some(ProjCol {
+            name: name.to_string(),
+            fname: None,
+            relation: None,
+            rel_alias: None,
+            field_id: 0,
+            wire: Wire::Blob,
+            sql_type: nullable(520),
+            length: 8,
+            oct_length: 8,
+            scale: cs as i32,
+            sub_type: sub_type as i32,
+            expr: Some(Expr::BlobOf(Box::new(e), cs)),
+        });
+    }
     // a DECFLOAT(34) literal (an integer magnitude past i128::MAX) rides
     // its own wire form - not an exact-numeric width, so it short-circuits
     // the scaled-integer describe below. `type_of` deliberately declines a
@@ -14198,6 +14307,54 @@ fn charset_name_id(name: &str) -> Option<u8> {
     })
 }
 
+/// Fill in the DATABASE's default character set on every column that
+/// declared none - the engine resolves `DEFAULT CHARACTER SET` at
+/// CREATE time and writes the resolved id into the column's catalog
+/// row, so in a UTF8 database a plain `VARCHAR(10)` is charset 4 and
+/// FORTY bytes long. Without this fire-crab wrote charset 0 columns of
+/// the declared byte length into such a database - a layout the engine
+/// would never have written, and a describe (`charset: 0 SYSTEM.NONE`)
+/// the engine disagrees with column by column.
+///
+/// A column that NAMES a character set, a NONE database, and every
+/// non-text column are left exactly as parsed.
+fn apply_db_charset(cols: &mut [fire_crab_ods::ddl::ColumnDef], cs: u8) {
+    if cs == 0 {
+        return;
+    }
+    let bpc = fire_crab_ods::intl::bytes_per_char(cs) as u16;
+    for c in cols.iter_mut() {
+        if c.charset_id.is_some() {
+            continue;
+        }
+        match c.dtype {
+            dtype::TEXT | dtype::VARYING => {
+                let Some(chars) = c.char_len else { continue };
+                c.charset_id = Some(cs);
+                // the ttype's low byte is the charset; a COLLATE parsed
+                // against no charset left the high byte zero
+                c.sub_type = (c.sub_type & !0xFF) | cs as i16;
+                let bytes = chars.saturating_mul(bpc);
+                c.length = if c.dtype == dtype::VARYING { bytes + 2 } else { bytes };
+            }
+            // a TEXT blob (sub_type 1) takes it too; a binary one has
+            // no character set at all
+            dtype::BLOB if c.sub_type == 1 => c.charset_id = Some(cs),
+            _ => {}
+        }
+    }
+}
+
+/// The database's default character set as an id - [
+/// `fire_crab_ods::ddl::database_charset_name`] resolved through the
+/// catalogue's name table. NONE (0) when the name is one this server
+/// does not carry, which leaves every column exactly as declared.
+fn db_default_charset(image: &fire_crab_ods::Image, page_size: usize) -> u8 {
+    fire_crab_ods::ddl::database_charset_name(image, page_size)
+        .and_then(|n| engine_charset_id(&n))
+        .unwrap_or(0)
+}
+
 /// A COLLATE name to its RDB$COLLATION_ID for a given charset. The default
 /// collation shares the charset's name (id 0). Only the built-in UTF8 family
 /// is carried here; another collation is a later slice (it needs the full
@@ -14474,7 +14631,11 @@ fn parse_column_def(item: &str) -> Option<(fire_crab_ods::ddl::ColumnDef, Option
             char_len: Some(char_len),
             dims: dims.clone(),
             segment_length: None,
-            charset_id: Some(charset),
+            // the DECLARED character set, `None` when the column named
+            // none - which is what lets [apply_db_charset] fill in the
+            // DATABASE's default before the row is written. An explicit
+            // `CHARACTER SET NONE` is `Some(0)` and stays NONE.
+            charset_id: cs,
             precision: None,
             not_null,
             not_null_constraint: not_null,
@@ -25605,11 +25766,13 @@ fn execute_dml_collecting_inner(
     };
     let counts = match plan {
         Plan::CreateTable { name, cols, constraints, fks, relation_type } => {
+            let mut cols = cols.clone();
+            apply_db_charset(&mut cols, db_default_charset(&work, db.page_size));
             fire_crab_ods::ddl::create_table(
                 &mut work,
                 db.page_size,
                 name,
-                cols,
+                &cols,
                 constraints,
                 fks,
                 *relation_type,
@@ -25788,6 +25951,9 @@ fn execute_dml_collecting_inner(
             (0, 0, 0)
         }
         Plan::CreateDomain { col, check } => {
+            let mut col = col.clone();
+            apply_db_charset(std::slice::from_mut(&mut col), db_default_charset(&work, db.page_size));
+            let col = &col;
             fire_crab_ods::ddl::create_domain(&mut work, db.page_size, col)?;
             if let Some((blr, src)) = check {
                 fire_crab_ods::ddl::set_domain_validation(
@@ -25864,7 +26030,9 @@ fn execute_dml_collecting_inner(
             (0, 0, 0)
         }
         Plan::AlterDomainType { domain, new_col } => {
-            fire_crab_ods::ddl::alter_domain_type(&mut work, db.page_size, domain, new_col)?;
+            let mut new_col = new_col.clone();
+            apply_db_charset(std::slice::from_mut(&mut new_col), db_default_charset(&work, db.page_size));
+            fire_crab_ods::ddl::alter_domain_type(&mut work, db.page_size, domain, &new_col)?;
             (0, 0, 0)
         }
         Plan::AlterIndex { name, active } => {
@@ -25974,7 +26142,9 @@ fn execute_dml_collecting_inner(
             (0, 0, 0)
         }
         Plan::AlterTableAdd { table, col } => {
-            fire_crab_ods::ddl::alter_table_add_column(&mut work, db.page_size, table, col)?;
+            let mut col = col.clone();
+            apply_db_charset(std::slice::from_mut(&mut col), db_default_charset(&work, db.page_size));
+            fire_crab_ods::ddl::alter_table_add_column(&mut work, db.page_size, table, &col)?;
             (0, 0, 0)
         }
         Plan::AlterTableAddFk { table, fk } => {
@@ -26078,8 +26248,10 @@ fn execute_dml_collecting_inner(
             (0, 0, 0)
         }
         Plan::AlterColumnType { table, column, col } => {
+            let mut col = col.clone();
+            apply_db_charset(std::slice::from_mut(&mut col), db_default_charset(&work, db.page_size));
             fire_crab_ods::ddl::alter_table_alter_column_type(
-                &mut work, db.page_size, table, column, col,
+                &mut work, db.page_size, table, column, &col,
             )?;
             (0, 0, 0)
         }
@@ -35168,7 +35340,8 @@ fn mark_not_null_cols(cols: &mut [ProjCol], db: &Database, table: &str) {
 /// not know stays nullable - the bit is only ever CLEARED when certain.
 fn expr_nullable(e: &Expr, is_nn: &dyn Fn(usize) -> bool) -> bool {
     match e {
-        Expr::Col(f) | Expr::BlobText(f) => !is_nn(*f),
+        Expr::BlobOf(a, _) => expr_nullable(a, is_nn),
+        Expr::Col(f) | Expr::BlobText(f, _) => !is_nn(*f),
         Expr::Int(_)
         | Expr::Int128(_)
         | Expr::DecFloat34(_)
@@ -35433,7 +35606,7 @@ fn resolve_agg_src(
                         if *distinct {
                             return None;
                         }
-                        Expr::BlobText(fid)
+                        Expr::BlobText(fid, blob_charset(descs, fid))
                     } else {
                         resolve_expr(arg, columns, descs)?
                     }
@@ -40176,7 +40349,11 @@ fn list_fold(
 /// as 'Ж   ' - 4 characters, 5 bytes).
 fn list_render(v: &Value, pad: Option<usize>, pad_bytes: bool) -> Result<Vec<u8>, EvalErr> {
     let mut s = match v {
-        Value::Blob(rel, num) => blob_text_of(*rel, *num)?,
+        // a raw blob VALUE reaching the fold carries no descriptor of
+        // its own; read it as UTF8, the charset every path that hands
+        // one here resolves to (a blob OPERAND arrives as
+        // [Expr::BlobText], which does carry its column's)
+        Value::Blob(rel, num) => blob_text_of(*rel, *num, fire_crab_ods::intl::CS_UTF8)?,
         Value::Bool(b) => (if *b { "TRUE" } else { "FALSE" }).to_string(),
         other => other.render(),
     };
@@ -43917,7 +44094,7 @@ fn list_arg_charset(e: &Expr, descs: &[Descriptor]) -> i32 {
                 dtype::TEXT | dtype::VARYING => Some((d.sub_type as i32) & 0xFF),
                 _ => None,
             }),
-            Expr::BlobText(f) => descs.get(*f).map(|d| d.scale as i32),
+            Expr::BlobText(f, _) => descs.get(*f).map(|d| d.scale as i32),
             Expr::Neg(a) | Expr::Cast(a, ..) => walk(a, descs),
             Expr::Bin(a, _, b) | Expr::Concat(a, b) | Expr::NullIf(a, b) => {
                 walk(a, descs).or_else(|| walk(b, descs))
@@ -44048,7 +44225,14 @@ fn blob_col_cast(inner: &RawExpr, t: &CastTarget, columns: &[RelationColumn], de
 /// `CAST(<blob> AS VARCHAR)`. A temp blob (relation 0) of this very
 /// transaction is not reachable here; a user sub_type (not 0 / 1) has
 /// no filter to TEXT - the engine's isc_nofilter(sub_type, 1).
-fn blob_text_of(rel: u16, num: u64) -> Result<String, EvalErr> {
+/// A BLOB column's own character set, out of its descriptor: a blob
+/// keeps it in `scale` (the describe convention - [wire_for] ships it
+/// there). Zero (NONE) for anything that is not a blob column.
+fn blob_charset(descs: &[Descriptor], fid: usize) -> u8 {
+    descs.get(fid).map_or(0, |d| d.scale as u8)
+}
+
+fn blob_text_of(rel: u16, num: u64, cs: u8) -> Result<String, EvalErr> {
     let ctx = BLOB_CTX.with(|c| c.borrow().clone());
     let Some((image, page_size)) = ctx else {
         return Err(EvalErr::Unsupported);
@@ -44061,7 +44245,19 @@ fn blob_text_of(rel: u16, num: u64) -> Result<String, EvalErr> {
     if !matches!(st, 0 | 1) {
         return Err(EvalErr::NoFilter(st, 1));
     }
-    Ok(String::from_utf8_lossy(&b.content()).into_owned())
+    // the stored bytes are in the COLUMN's character set: a byte
+    // carrier's are its carrier chars (one per octet), a tabled
+    // single-byte page's go through its table, and UTF8's are read as
+    // UTF-8. Reading every blob as UTF-8 destroyed a WIN1252 or NONE
+    // blob's high bytes.
+    let bytes = b.content();
+    Ok(if fire_crab_ods::intl::byte_carrier(cs) {
+        fire_crab_ods::intl::carrier_decode(&bytes)
+    } else if let Some(t) = fire_crab_ods::intl::decode_text(cs, &bytes) {
+        t
+    } else {
+        String::from_utf8_lossy(&bytes).into_owned()
+    })
 }
 
 fn store_blob_literal(
@@ -47617,7 +47813,11 @@ fn resolve_proj_expr(
                 Expr::Cast(Box::new(Expr::Param(*i)), *t, fire_crab_ods::intl::CS_UTF8)
             } else {
                 if let Some(fid) = blob_col_cast(inner, t, columns, descs) {
-                    Expr::Cast(Box::new(Expr::BlobText(fid)), *t, fire_crab_ods::intl::CS_UTF8)
+                    Expr::Cast(
+                        Box::new(Expr::BlobText(fid, blob_charset(descs, fid))),
+                        *t,
+                        blob_charset(descs, fid),
+                    )
                 } else {
                     let e = resolve_proj_expr(inner, columns, descs, sink)?;
                     let cs = cast_source_charset(&e, t, descs);
@@ -47679,10 +47879,18 @@ fn resolve_expr_inner(
                 return None;
             }
             let d = descs.get(fid)?;
-            // an int, text, scaled-numeric, DECFLOAT, temporal or
-            // approximate column (type_of/eval decide what each may do; a
-            // DECFLOAT one is usable only inside decimal arithmetic, which
-            // the describe short-circuit picks up)
+            // a BLOB column is a TEXT OPERAND: every predicate and text
+            // function over one reads its CONTENT (the engine filters
+            // the blob to a string and runs the ordinary text law over
+            // it), so it resolves to [Expr::BlobText]. Only sub_type 0
+            // and 1 have that filter - a user sub_type is isc_nofilter.
+            // A bare blob column in a SELECT list never comes through
+            // here: [build_projcols] describes it from its descriptor
+            // and ships the stored id.
+            if d.dtype == dtype::BLOB {
+                return matches!(d.sub_type, 0 | 1)
+                    .then(|| Expr::BlobText(fid, blob_charset(descs, fid)));
+            }
             if col_kind(d).is_none()
                 && !is_numeric_col(d)
                 && !is_decfloat_col(d)
@@ -47720,7 +47928,11 @@ fn resolve_expr_inner(
         ),
         RawExpr::Cast(e, t) => {
             if let Some(fid) = blob_col_cast(e, t, columns, descs) {
-                return Some(Expr::Cast(Box::new(Expr::BlobText(fid)), *t, fire_crab_ods::intl::CS_UTF8));
+                return Some(Expr::Cast(
+                    Box::new(Expr::BlobText(fid, blob_charset(descs, fid))),
+                    *t,
+                    blob_charset(descs, fid),
+                ));
             }
             let inner = resolve_expr(e, columns, descs)?;
             let cs = cast_source_charset(&inner, t, descs);
@@ -47959,11 +48171,32 @@ fn resolve_expr_inner(
 /// operand propagates (SQL three-valued arithmetic).
 #[derive(Clone)]
 enum Expr {
-    /// a BLOB column read as TEXT - `CAST(<blob> AS VARCHAR/CHAR)`: the
-    /// blob's bytes, fetched through the statement's [BLOB_CTX] at
-    /// evaluation (the evaluator itself holds no database); a user
-    /// sub_type has no filter to text (isc_nofilter)
-    BlobText(usize),
+    /// a BLOB column read as TEXT - the operand form of a blob: what
+    /// `CAST(<blob> AS VARCHAR)` reads, and what every text predicate
+    /// and length function over a blob column reads. The bytes are
+    /// fetched through the statement's [BLOB_CTX] at evaluation (the
+    /// evaluator itself holds no database) and decoded in the column's
+    /// own CHARACTER SET, which the second field carries (a blob
+    /// descriptor keeps its charset in `scale`, the describe
+    /// convention). A user sub_type has no filter to text
+    /// (isc_nofilter).
+    BlobText(usize, u8),
+    /// An expression whose RESULT IS A BLOB: any text operation with a
+    /// blob operand (`<blob> || 'x'`, `UPPER(<blob>)`, a CONDITIONAL
+    /// with a blob branch) and `CAST(<v> AS BLOB)`. The engine's rule
+    /// is that a blob operand makes the whole expression a blob
+    /// (`DataTypeUtil::makeConcatenate` and the text functions'
+    /// makeXxx keep the blob dtype), so the result travels as a blob
+    /// ID and the client opens it.
+    ///
+    /// Eval: NULL stays NULL, a value that is ALREADY a blob passes
+    /// through, and TEXT is MINTED into a temp blob
+    /// ([mint_computed_blob], the LIST path) in the charset this
+    /// carries. Note the divergence recorded with the slice: where the
+    /// engine hands back the STORED id for a pass-through
+    /// (`COALESCE(<blob>, 'x')` answers the column's own blob), this
+    /// mints a copy - same content, a temp id.
+    BlobOf(Box<Expr>, u8),
     /// a scale-0 integer column, by field id
     Col(usize),
     /// a `?` parameter in a projection, by input-SQLDA index. It carries
@@ -50772,6 +51005,10 @@ impl Expr {
     /// then falls back rather than answering wrong).
     fn type_of(&self, descs: &[Descriptor]) -> Option<ExprType> {
         match self {
+            // a BLOB result is not one of the scalar families: it
+            // describes from [build_expr_col_from]'s own blob arm and
+            // may not be nested in arithmetic or a comparison
+            Expr::BlobOf(..) => None,
             // AT TIME ZONE always answers a WITH TIME ZONE value, of
             // the operand's own family (AtNode::make, ExprNodes.cpp:
             // 3309: isTime -> makeTimeTz, isTimeStamp -> makeTimestampTz;
@@ -50787,7 +51024,7 @@ impl Expr {
                 }
                 _ => None,
             },
-            Expr::BlobText(_) => Some(ExprType::Text),
+            Expr::BlobText(..) => Some(ExprType::Text),
             // a BINARY literal is TEXT, at charset OCTETS
             Expr::Hex(_) => Some(ExprType::Text),
             // a `?` is untyped on its own - it is always wrapped by the
@@ -51327,7 +51564,8 @@ impl Expr {
     /// engine's getDesc copies the non-null side. None = not numeric.
     fn rank_of(&self, descs: &[Descriptor]) -> Option<NumRank> {
         match self {
-            Expr::BlobText(_)
+            Expr::BlobOf(..) => None,
+            Expr::BlobText(..)
             | Expr::Hex(_)
             | Expr::TimeTzLit(..)
             | Expr::TsTzLit(..)
@@ -51632,8 +51870,29 @@ impl Expr {
                 }
             }
             Expr::Col(fid) => values.get(*fid).cloned().unwrap_or(Value::Null),
-            Expr::BlobText(fid) => match values.get(*fid) {
-                Some(Value::Blob(rel, num)) => Value::Text(blob_text_of(*rel, *num)?),
+            Expr::BlobOf(inner, cs) => match inner.eval(values)? {
+                Value::Null => Value::Null,
+                // already a blob (a bare column reached through a
+                // conditional): the id travels as it is
+                v @ Value::Blob(..) => v,
+                v => {
+                    let text = match v {
+                        Value::Text(t) => t,
+                        other => other.render(),
+                    };
+                    let bytes = if fire_crab_ods::intl::byte_carrier(*cs) {
+                        fire_crab_ods::intl::carrier_encode(&text)
+                            .unwrap_or_else(|| text.as_bytes().to_vec())
+                    } else {
+                        fire_crab_ods::intl::encode_text(*cs, &text)
+                            .map_err(|_| EvalErr::TransliterationFailed)?
+                            .unwrap_or_else(|| text.as_bytes().to_vec())
+                    };
+                    mint_computed_blob(&[bytes])?
+                }
+            },
+            Expr::BlobText(fid, cs) => match values.get(*fid) {
+                Some(Value::Blob(rel, num)) => Value::Text(blob_text_of(*rel, *num, *cs)?),
                 _ => Value::Null,
             },
             Expr::GenVal(i) => values.get(*i).cloned().unwrap_or(Value::Null),
@@ -52129,7 +52388,7 @@ impl Expr {
                                 // a BLOB source's transliteration failure
                                 // carries no arith wrapper (see the vector)
                                 match (err, &**e) {
-                                    (EvalErr::TransliterationFailed, Expr::BlobText(_)) => {
+                                    (EvalErr::TransliterationFailed, Expr::BlobText(..)) => {
                                         EvalErr::TransliterationFailedBare
                                     }
                                     (err, _) => err,
@@ -62860,6 +63119,18 @@ fn resolve_predicate(
                 });
                 continue;
             }
+            // a BLOB column takes the EXPRESSION path: every predicate
+            // over one reads the blob's CONTENT (the engine filters it
+            // to a string and runs the ordinary text law), which is
+            // what [Expr::BlobText] does. Only sub_type 0 and 1 have
+            // that filter - a user sub_type is isc_nofilter.
+            if d.dtype == dtype::BLOB {
+                if !matches!(d.sub_type, 0 | 1) {
+                    return None;
+                }
+                terms.push(resolve_expr_term(&rt, columns, descs, params)?);
+                continue;
+            }
             // a BINARY pattern (`LIKE x'…'`) takes the expression path
             // whatever the column is: only there are its bytes read
             // against the left operand's charset
@@ -63648,13 +63919,16 @@ fn expr_no_raise(e: &Expr, descs: &[Descriptor]) -> bool {
         // an unparsable or ruleless zone raises per row (22009), so this
         // is never raise-free
         Expr::AtTimeZone(..) => false,
+        // minting a blob reads its operand's blob and can raise (a user
+        // sub_type has no filter to text)
+        Expr::BlobOf(..) => false,
         // a literal never raises
         Expr::Hex(_) => true,
         // a parameter's value is substituted before eval; the CAST above
         // it may still raise, so it is not raise-free
         Expr::Param(_) => false,
         // a blob read can raise (no filter to text for a user sub_type)
-        Expr::BlobText(_) => false,
+        Expr::BlobText(..) => false,
         // the fold already happened at prepare; a lookup only compares
         Expr::Lookup { key, .. } => expr_no_raise(key, descs),
         Expr::Col(_)
@@ -71282,6 +71556,102 @@ mod tests {
         Descriptor { dtype: dt, scale, length: len, sub_type: 0, flags: 0, offset: 4 }
     }
 
+    #[test]
+    fn a_blob_operand_makes_the_expression_a_blob() {
+        // a UTF8 text blob (charset in `scale`, the describe convention)
+        // and a BINARY one beside it
+        let mut text_blob = desc(dtype::BLOB, 8, 4);
+        text_blob.sub_type = 1;
+        let mut bin_blob = desc(dtype::BLOB, 8, 0);
+        bin_blob.sub_type = 0;
+        let descs = vec![text_blob, bin_blob, desc(dtype::VARYING, 22, 0)];
+        let b = || Expr::BlobText(0, fire_crab_ods::intl::CS_UTF8);
+        let n = || Expr::BlobText(1, 0);
+
+        // a text function and a concatenation over a blob ARE blobs, in
+        // the blob's own character set
+        assert_eq!(
+            blob_result(&Expr::Func(SysFn::Upper, vec![b()]), &descs),
+            Some((1, fire_crab_ods::intl::CS_UTF8))
+        );
+        assert_eq!(
+            blob_result(&Expr::Concat(Box::new(b()), Box::new(Expr::Str("x".into()))), &descs),
+            Some((1, fire_crab_ods::intl::CS_UTF8))
+        );
+        // ... and so is a conditional with a blob branch
+        assert_eq!(
+            blob_result(&Expr::Coalesce(vec![b(), Expr::Str("x".into())]), &descs),
+            Some((1, fire_crab_ods::intl::CS_UTF8))
+        );
+        // ONE binary operand makes the whole result binary, charsetless
+        assert_eq!(
+            blob_result(&Expr::Concat(Box::new(b()), Box::new(n())), &descs),
+            Some((0, 0))
+        );
+        // the LENGTHS answer a scalar over a blob, not a blob
+        assert_eq!(blob_result(&Expr::Func(SysFn::CharLength, vec![b()]), &descs), None);
+        assert_eq!(blob_result(&Expr::Func(SysFn::OctetLength, vec![b()]), &descs), None);
+        // and an expression with no blob in it at all is not a blob
+        assert_eq!(
+            blob_result(&Expr::Func(SysFn::Upper, vec![Expr::Col(2)]), &descs),
+            None
+        );
+    }
+
+    #[test]
+    fn the_database_default_charset_fills_in_at_create() {
+        use fire_crab_ods::ddl::ColumnDef;
+        let col = |name: &str, dt: u8, len: u16, chars: Option<u16>, cs: Option<u8>, sub: i16| ColumnDef {
+            name: name.into(),
+            field_type: 0,
+            dtype: dt,
+            length: len,
+            scale: 0,
+            sub_type: sub,
+            dims: Vec::new(),
+            segment_length: None,
+            charset_id: cs,
+            char_len: chars,
+            precision: None,
+            not_null: false,
+            not_null_constraint: false,
+            default: None,
+            domain: None,
+            identity: None,
+            computed: None,
+        };
+        let mut cols = vec![
+            col("V", dtype::VARYING, 12, Some(10), None, 0),      // declared none
+            col("C", dtype::TEXT, 3, Some(3), None, 0),           // declared none
+            col("N", dtype::VARYING, 12, Some(10), Some(0), 0),   // CHARACTER SET NONE
+            col("W", dtype::VARYING, 12, Some(10), Some(53), 53), // CHARACTER SET WIN1252
+            col("B", dtype::BLOB, 8, None, None, 1),              // a TEXT blob
+            col("K", dtype::BLOB, 8, None, None, 0),              // a BINARY blob
+            col("I", dtype::LONG, 4, None, None, 0),              // not text at all
+        ];
+        apply_db_charset(&mut cols, fire_crab_ods::intl::CS_UTF8);
+        // the DECLARED-NONE text columns take the default, and their
+        // byte length grows with it (ten characters, forty bytes)
+        assert_eq!(cols[0].charset_id, Some(4));
+        assert_eq!(cols[0].length, 42); // VARYING carries its count word
+        assert_eq!(cols[0].sub_type, 4);
+        assert_eq!(cols[1].charset_id, Some(4));
+        assert_eq!(cols[1].length, 12);
+        // an EXPLICIT charset is left exactly as declared - NONE included
+        assert_eq!(cols[2].charset_id, Some(0));
+        assert_eq!(cols[2].length, 12);
+        assert_eq!(cols[3].charset_id, Some(53));
+        // a TEXT blob takes it; a binary blob and a non-text column do not
+        assert_eq!(cols[4].charset_id, Some(4));
+        assert_eq!(cols[5].charset_id, None);
+        assert_eq!(cols[6].charset_id, None);
+        // and a NONE database changes nothing at all
+        let mut none_db = vec![col("V", dtype::VARYING, 12, Some(10), None, 0)];
+        apply_db_charset(&mut none_db, 0);
+        assert_eq!(none_db[0].charset_id, None);
+        assert_eq!(none_db[0].length, 12);
+    }
+
     // Every expectation below is a measured engine answer, not a
     // guess: 495 INSERT ... RETURNING probes (54 spellings x 9 numeric
     // column types) against Firebird 6, plus a focused hex sweep.
@@ -72063,11 +72433,24 @@ mod tests {
             .bind(&[WireParam::Int(7, 0), WireParam::Text("q".into())])
             .unwrap();
         assert!(b.matches(&[Value::Int(7), Value::Text("q".into())]).unwrap());
-        // a parameter on an unbindable column type refuses the plan
+        // A BLOB column takes the EXPRESSION path now (its predicates
+        // read the blob's content), so a parameter against one resolves
+        // and claims a slot - where it used to refuse the whole plan.
         let toks = tokenize("A = ?").unwrap();
         let raw = parse_predicate(&toks, &mut 0).unwrap();
         let blob_descs = vec![desc(dtype::BLOB, 8, 0)];
-        assert!(resolve_predicate(raw, &columns, &blob_descs, &mut Vec::new()).is_none());
+        let mut blob_params = Vec::new();
+        assert!(resolve_predicate(raw, &columns, &blob_descs, &mut blob_params).is_some());
+        assert_eq!(blob_params.len(), 1);
+        // ... and a blob of a USER sub_type has no filter to text, so
+        // that one still refuses
+        let toks = tokenize("A = ?").unwrap();
+        let raw = parse_predicate(&toks, &mut 0).unwrap();
+        let mut user_blob = desc(dtype::BLOB, 8, 0);
+        user_blob.sub_type = 7;
+        assert!(
+            resolve_predicate(raw, &columns, &[user_blob], &mut Vec::new()).is_none()
+        );
     }
 
     #[test]

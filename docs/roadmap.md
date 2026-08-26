@@ -484,6 +484,59 @@ check is exact — so the gate reaches a UTF8 attachment through
 connection string as isql's argument) is unaffected, which is why this
 went unseen.
 
+**BLOB OPERANDS IN EXPRESSIONS — DONE 2026-08-26
+(`serve-real-blobexpr` 26).** A blob column was an operand of nothing:
+every predicate and every text function over one refused, which is a
+large part of what people actually do with a text blob. It is a TEXT
+OPERAND now — the engine filters the blob to a string and runs the
+ordinary text law over it, and so does this server
+(`Expr::BlobText`, which carries the column's own CHARACTER SET so a
+WIN1252 or NONE blob's high bytes survive the read):
+
+* the comparison family (`=`, `<>`, ordering, `BETWEEN`, `IN`), `LIKE`
+  with an `ESCAPE`, `STARTING WITH`, `SIMILAR TO`, a blob against
+  another blob, and a blob operand inside a JOIN's `ON` or a `CASE`
+  condition — all by CONTENT, which is what the engine compares.
+* the LENGTHS answer a **BIGINT** over a blob where they answer an
+  INTEGER over a string (`CHAR_LENGTH(<blob>)` describes INT64).
+* **a blob operand makes the whole expression a BLOB** — concatenation,
+  `UPPER`/`LOWER`/`TRIM`/`SUBSTRING`/`LEFT`/`RIGHT`/`REPLACE`/`LPAD`,
+  and a conditional with a blob branch. The result's text type is the
+  operands' joined one, the FIRST real charset winning (`S || B` is
+  UTF8 from S, `W || B` WIN1252 from W, `B || W` UTF8 from B), and ONE
+  binary blob operand makes the whole result binary with no charset at
+  all. The value is MINTED as a temp blob through the LIST path
+  (`Expr::BlobOf`); the id is this server's own, the content is the
+  engine's.
+* `ORDER BY` / `GROUP BY` / `DISTINCT` over a blob key the **BLOB ID**,
+  not the content — four rows spelling `zzz, aaa, zzz, mmm` come out in
+  ID order and group into FOUR groups (measured). Both servers answer
+  that, which the gate pins: a server that keyed the content would
+  answer `2,4,1,3` and three groups.
+
+**And a pre-existing DDL bug fell out of it: fire-crab ignored the
+database's DEFAULT CHARACTER SET.** In a `DEFAULT CHARACTER SET UTF8`
+database a plain `VARCHAR(10)` is charset 4 and FORTY bytes to the
+engine; this server wrote charset 0 and ten. Every text and text-blob
+column it created in such a database had the wrong charset in its
+catalog row, the wrong byte length in its format, and a describe
+(`charset: 0 SYSTEM.NONE`) the engine disagreed with column by column
+— and a non-ASCII literal stored into one landed as mangled carrier
+bytes. `apply_db_charset` now resolves the default at CREATE TABLE,
+CREATE DOMAIN, ALTER TABLE ADD, ALTER COLUMN TYPE and ALTER DOMAIN
+TYPE, exactly where the engine resolves it; an explicit `CHARACTER SET
+NONE` still means NONE (the parser now keeps "declared none" and "NONE"
+apart). Verified end to end: the engine reads an fc-created UTF8 table
+with the same describe, the same OCTET_LENGTH/CHAR_LENGTH and the same
+values, `gfix -v -full` clean.
+
+Boundaries, recorded and refused: `MIN`/`MAX` over a blob (the engine
+compares CONTENT and answers the winning row's stored id), a blob in
+arithmetic, a blob-valued SCALAR SUBQUERY, a blob-valued expression
+inside a DERIVED TABLE, and — the next slice — every blob VALUE in
+DML: `INSERT ... SELECT` of a blob column, an `UPDATE` whose `SET`
+reads one, and `CAST(<v> AS BLOB)`.
+
 **AGGREGATES IN EXPRESSIONS DONE (2026-08-25,
 `serve-real-statexpr` 8):** the statistical/ordered-set family
 (VAR_*/STDDEV_*, CORR/COVAR_*/REGR_*, PERCENTILE_CONT/DISC) and
