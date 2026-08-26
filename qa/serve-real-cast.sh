@@ -214,12 +214,17 @@ case "$r" in
     ERR*) echo "OK   TIME to TIMESTAMP is refused (the engine uses the current date)" ;;
     *) echo "DIFF TIME to TIMESTAMP answered: [$r]"; fail=1 ;;
 esac
-# a target this parser does not know must refuse rather than fall back to
-# some other conversion
-r=$(query "SELECT CAST(I AS BLOB) FROM T WHERE ID = 1" "$PORT" "$A")
+# a BLOB target is a conversion like any other now - the value's own
+# rendering, read back through a cast to text so the comparison is the
+# CONTENT and not each server's own blob id
+cast "CAST(CAST(I AS BLOB SUB_TYPE TEXT) AS VARCHAR(20))"
+cast "CAST(CAST(N AS BLOB SUB_TYPE TEXT) AS VARCHAR(20))"
+# a target this parser does not know must still refuse rather than fall
+# back to some other conversion
+r=$(query "SELECT CAST(I AS SOMETHING) FROM T WHERE ID = 1" "$PORT" "$A")
 case "$r" in
     ERR*) echo "OK   an unsupported CAST target is refused, not approximated" ;;
-    *) echo "DIFF CAST AS BLOB answered: [$r]"; fail=1 ;;
+    *) echo "DIFF CAST AS SOMETHING answered: [$r]"; fail=1 ;;
 esac
 
 rm -f "$A" "$B"

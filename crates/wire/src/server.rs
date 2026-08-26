@@ -13692,6 +13692,10 @@ fn blob_result(e: &Expr, descs: &[Descriptor]) -> Option<(i16, u8)> {
             _ => {}
         }
     }
+    // a CAST names the type outright - including a cast TO a blob
+    if let Expr::Cast(_, CastTarget::Blob { sub_type, cs }, _) = e {
+        return Some((*sub_type, *cs));
+    }
     let (mut sub, mut found) = (1i16, false);
     walk(e, descs, &mut sub, &mut found);
     if !found {
@@ -22452,9 +22456,32 @@ fn plan_insert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
             if !matches!(descs.get(fid).map(|d| d.dtype), Some(dtype::BLOB)) {
                 return None;
             }
+            // the bytes a LITERAL takes in the column's character set:
+            // a tabled single-byte page gets its codepage bytes, and
+            // every other set the literal's own (a carrier stores the
+            // client's bytes verbatim - the UTF-8 the SQL text arrived
+            // as, which is what the engine stores through a NONE
+            // attachment)
+            let cs = descs.get(fid).map_or(0, |d| d.scale as u8);
+            let lit = |t: &str| -> Vec<u8> {
+                fire_crab_ods::intl::encode_text(cs, t)
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| t.as_bytes().to_vec())
+            };
             match v {
-                InsVal::Str(t) => Some((fid, t.as_bytes().to_vec(), 1)),
+                InsVal::Str(t) => Some((fid, lit(t), 1)),
                 InsVal::Octets(b) => Some((fid, b.clone(), 0)),
+                // a CONSTANT EXPRESSION folded to text, and a plain
+                // number: the engine stores the RENDERING (probed:
+                // `VALUES (42)` into a blob column reads back '42')
+                InsVal::Wire(wp) => wireparam_text(wp).map(|t| (fid, lit(&t), 1)),
+                InsVal::Int(n) => Some((fid, lit(&n.to_string()), 1)),
+                InsVal::Bool(b) => {
+                    Some((fid, lit(if *b { "TRUE" } else { "FALSE" }), 1))
+                }
+                InsVal::Int128(n) => Some((fid, lit(&n.to_string()), 1)),
+                InsVal::Dec(r, sc) => Some((fid, lit(&render_exact(*r as i128, *sc)), 1)),
                 _ => None,
             }
         })
@@ -22711,8 +22738,23 @@ fn build_insert_image(
         }
         let fid = rc.field_id as usize;
         let d = descs.get(fid)?;
-        if d.dtype == dtype::BLOB && matches!(v, InsVal::Str(_) | InsVal::Octets(_)) {
-            continue; // a blob literal: stored at execute (stays NULL-flagged until then)
+        // every value a BLOB column takes is stored at execute (it has
+        // to become a blob first), so the image keeps its NULL flag
+        // here: a literal, a folded constant expression, and the
+        // numeric/temporal renderings the engine writes into a blob
+        if d.dtype == dtype::BLOB
+            && matches!(
+                v,
+                InsVal::Str(_)
+                    | InsVal::Octets(_)
+                    | InsVal::Int(_)
+                    | InsVal::Int128(_)
+                    | InsVal::Dec(..)
+                    | InsVal::Bool(_)
+            ) || (d.dtype == dtype::BLOB
+                && matches!(v, InsVal::Wire(wp) if wireparam_text(wp).is_some()))
+        {
+            continue;
         }
         match encode_set_value(d, v)? {
             None => continue, // NULL - flag already set
@@ -26741,6 +26783,50 @@ fn execute_dml_collecting_inner(
                         // a folded SQL BOOLEAN into a text column spells
                         // TRUE/FALSE (probed) - the parameter arm's
                         // '1'/'0' is the client-bound rule
+                        // A BLOB COLUMN takes the value as a BLOB: an
+                        // expression that answered another blob is
+                        // COPIED (the engine's assignment copies, it
+                        // never shares the id - blb.cpp:1183), and one
+                        // that answered text is stored as a new blob in
+                        // the column's own character set.
+                        if d.dtype == dtype::BLOB {
+                            let at = d.offset as usize;
+                            match &v {
+                                Value::Null => {
+                                    img[*fid / 8] |= 1 << (*fid % 8);
+                                }
+                                Value::Blob(r, n) => {
+                                    let id = store_blob_param(
+                                        db,
+                                        &mut work,
+                                        *rel,
+                                        d,
+                                        &encode_blob_id(*r, *n),
+                                    )?;
+                                    img[at..at + 8].copy_from_slice(&id);
+                                    img[*fid / 8] &= !(1 << (*fid % 8));
+                                }
+                                other => {
+                                    let text = match other {
+                                        Value::Text(t) => t.clone(),
+                                        o => o.render(),
+                                    };
+                                    let bytes = blob_bytes_in(&text, d.scale as u8)
+                                        .map_err(ExecErr::Eval)?;
+                                    let id = store_blob_literal(
+                                        db,
+                                        &mut work,
+                                        *rel,
+                                        d,
+                                        &bytes,
+                                        if d.sub_type == 1 { 1 } else { 0 },
+                                    )?;
+                                    img[at..at + 8].copy_from_slice(&id);
+                                    img[*fid / 8] &= !(1 << (*fid % 8));
+                                }
+                            }
+                            continue;
+                        }
                         let wp = match (&v, d.dtype) {
                             (Value::Bool(b), dtype::TEXT | dtype::VARYING) => {
                                 WireParam::Text((if *b { "TRUE" } else { "FALSE" }).to_string())
@@ -44126,6 +44212,22 @@ fn arm_blob_mint(db: Option<&Database>) {
 /// BEFORE the next op's handler - so a handler that allocates its own
 /// temp id (op_create_blob) always sees the advanced counter and the
 /// two ranges stay one sequence.
+/// Park what has been minted SO FAR where the store resolves it, and
+/// keep the mint context armed. [drain_minted_blobs] does this at the
+/// top of the next op; a statement that MINTS AND STORES inside one op
+/// - `INSERT ... SELECT <blob expression>` - needs it in the middle of
+/// its own.
+fn flush_minted_blobs(db: &mut Database) {
+    BLOB_MINT.with(|c| {
+        if let Some(ctx) = c.borrow_mut().as_mut() {
+            db.next_temp_blob = db.next_temp_blob.max(ctx.next);
+            for (id, tb) in ctx.minted.drain(..) {
+                db.temp_blobs.insert(id, tb);
+            }
+        }
+    });
+}
+
 fn drain_minted_blobs(db: &mut Option<Database>) {
     BLOB_MINT.with(|c| {
         if let (Some(ctx), Some(d)) = (c.borrow_mut().take(), db.as_mut()) {
@@ -44260,6 +44362,44 @@ fn blob_text_of(rel: u16, num: u64, cs: u8) -> Result<String, EvalErr> {
     })
 }
 
+/// The BYTES a text value occupies in a blob column's character set -
+/// a carrier's own octets, a tabled page's codepage bytes, UTF-8 for
+/// everything else. `Err` is the engine's transliteration failure.
+fn blob_bytes_in(text: &str, cs: u8) -> Result<Vec<u8>, EvalErr> {
+    use fire_crab_ods::intl;
+    Ok(if intl::byte_carrier(cs) {
+        intl::carrier_encode(text).unwrap_or_else(|| text.as_bytes().to_vec())
+    } else {
+        intl::encode_text(cs, text)
+            .map_err(|_| EvalErr::TransliterationFailed)?
+            .unwrap_or_else(|| text.as_bytes().to_vec())
+    })
+}
+
+/// The TEXT the engine writes into a blob column when a scalar value is
+/// assigned to it - the value's own rendering (probed: 42 lands '42',
+/// 3.14 lands '3.14', DATE'2020-06-15' lands '2020-06-15', a TIMESTAMP
+/// its full '…10:20:30.0000', TRUE the word in capitals, 1.5e2
+/// '150.0000000000000'). None for a value that is no scalar - a blob id
+/// is not assigned this way.
+fn wireparam_text(wp: &WireParam) -> Option<String> {
+    Some(match wp {
+        WireParam::Text(t) | WireParam::TextCs(t, _) => t.clone(),
+        WireParam::Int(n, 0) => n.to_string(),
+        WireParam::Int(r, sc) => render_exact(*r as i128, *sc),
+        WireParam::Double(d) => Value::Double(*d).render(),
+        WireParam::Date(d) => Value::Date(*d).render(),
+        WireParam::Time(t) => Value::Time(*t).render(),
+        WireParam::Timestamp(d, t) => Value::Timestamp(*d, *t).render(),
+        WireParam::TimeTz(t, z) => Value::TimeTz(*t, *z).render(),
+        WireParam::TimestampTz(d, t, z) => Value::TimestampTz(*d, *t, *z).render(),
+        // the CAST surface's spelling, which is what an assignment
+        // writes (probed: TRUE lands the word in capitals)
+        WireParam::Bool(b) => (if *b { "TRUE" } else { "FALSE" }).to_string(),
+        WireParam::Null | WireParam::BlobId(_) => return None,
+    })
+}
+
 fn store_blob_literal(
     db: &mut Database,
     work: &mut fire_crab_ods::Image,
@@ -44289,7 +44429,7 @@ fn store_blob_param(
     let (mut src_rel, mut num) = decode_blob_id(b);
     if src_rel == 0 {
         if num == 0 {
-            let charset = if sub_type == 1 { 4 } else { 0 };
+            let charset = if sub_type == 1 { d.scale as u8 } else { 0 };
             let recno = fire_crab_blb::create_blob(work, db.page_size, rel, &[], sub_type, charset)?;
             return Ok(encode_blob_id(rel, recno));
         }
@@ -44308,7 +44448,7 @@ fn store_blob_param(
     // (blb.cpp:1262 `blob->blb_sub_type = to_desc->getBlobSubType()`),
     // not the source's: a binary blob copied into a text column reads
     // back as text
-    let charset = if sub_type == 1 { 4 } else { 0 };
+    let charset = if sub_type == 1 { d.scale as u8 } else { 0 };
     let recno = if src.header.is_stream() {
         fire_crab_blb::create_stream_blob_counted(
             work,
@@ -45545,7 +45685,7 @@ enum RawCond {
 /// (SMALLINT/INTEGER/BIGINT) collapses to one target: fire-crab computes
 /// the value at full `i64` width and announces BIGINT, exactly as the
 /// select-list arithmetic already does - the displayed value is identical.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum CastTarget {
     /// an integer-family target. `bytes` is the STORAGE WIDTH the
     /// keyword names - 2 SMALLINT, 4 INTEGER, 8 BIGINT - and it decides
@@ -45576,6 +45716,13 @@ enum CastTarget {
     Approx,
     /// `DATE` / `TIME` / `TIMESTAMP`
     Temporal(TKind),
+    /// `CAST(<v> AS BLOB [SUB_TYPE <n>|TEXT|BINARY] [CHARACTER SET <cs>]
+    /// [SEGMENT SIZE <n>])` - the target names the blob's own type:
+    /// plain `BLOB` is sub_type 0, `SUB_TYPE TEXT` is 1 at CHARACTER
+    /// SET NONE, and a `CHARACTER SET` clause promotes a binary
+    /// spelling to text the way it does in a column declaration
+    /// (probed). `SEGMENT SIZE` parses and changes nothing.
+    Blob { sub_type: i16, cs: u8 },
     /// `DECFLOAT [(16|34)]` - `wide` is DECFLOAT(34) (decimal128, 16 bytes,
     /// sqltype 32762); false is DECFLOAT(16) (decimal64, 8 bytes, 32760).
     /// `DECFLOAT` with no precision defaults to 34.
@@ -45633,7 +45780,7 @@ impl CastTarget {
             CastTarget::Approx | CastTarget::Temporal(_) => Some(130),
             // a DECFLOAT text conversion is capped by decNumber's own
             // grammar (text_to_dec128), not a fixed buffer here
-            CastTarget::Text { .. } | CastTarget::DecFloat { .. } => None,
+            CastTarget::Text { .. } | CastTarget::DecFloat { .. } | CastTarget::Blob { .. } => None,
         }
     }
 }
@@ -47376,6 +47523,70 @@ fn parse_cast_target(b: &[char], pos: &mut usize) -> Option<CastTarget> {
     if ku == "FLOAT" {
         return Some(CastTarget::Approx);
     }
+    if ku == "BLOB" {
+        let mut sub_type = 0i16;
+        let mut cs: Option<u8> = None;
+        loop {
+            skip_ws(b, pos);
+            if word_is(b, *pos, "SUB_TYPE") {
+                let mut p = *pos + "SUB_TYPE".len();
+                skip_ws(b, &mut p);
+                sub_type = if word_is(b, p, "TEXT") {
+                    p += "TEXT".len();
+                    1
+                } else if word_is(b, p, "BINARY") {
+                    p += "BINARY".len();
+                    0
+                } else {
+                    let n = parse_uint(b, &mut p)?;
+                    // only the two sub_types with a filter to text are
+                    // served; a user sub_type has none (isc_nofilter)
+                    match n {
+                        0 => 0,
+                        1 => 1,
+                        _ => return None,
+                    }
+                };
+                *pos = p;
+                continue;
+            }
+            if word_is(b, *pos, "CHARACTER") {
+                let mut p = *pos + "CHARACTER".len();
+                skip_ws(b, &mut p);
+                if !word_is(b, p, "SET") {
+                    return None;
+                }
+                p += "SET".len();
+                skip_ws(b, &mut p);
+                let name = read_ident(b, &mut p)?;
+                cs = Some(cast_charset_id(&name)?);
+                // a CHARACTER SET makes the blob a TEXT blob, exactly as
+                // in a column declaration (probed: `BLOB CHARACTER SET
+                // UTF8` describes subtype 1 charset 4)
+                sub_type = 1;
+                *pos = p;
+                continue;
+            }
+            // `SEGMENT SIZE <n>` parses and decides nothing (probed)
+            if word_is(b, *pos, "SEGMENT") {
+                let mut p = *pos + "SEGMENT".len();
+                skip_ws(b, &mut p);
+                if !word_is(b, p, "SIZE") {
+                    return None;
+                }
+                p += "SIZE".len();
+                skip_ws(b, &mut p);
+                parse_uint(b, &mut p)?;
+                *pos = p;
+                continue;
+            }
+            break;
+        }
+        return Some(CastTarget::Blob {
+            sub_type,
+            cs: if sub_type == 1 { cs.unwrap_or(0) } else { 0 },
+        });
+    }
     // `DECFLOAT [(16|34)]` - no precision defaults to 34; only 16 and 34
     // are legal precisions (probed: any other is a -842 at prepare)
     if ku == "DECFLOAT" {
@@ -47732,6 +47943,16 @@ fn cast_target_descriptor(t: &CastTarget) -> Option<Descriptor> {
         _ => None,
     };
     Some(match t {
+        // a BLOB target: the id's 8 bytes, the sub_type in its own slot
+        // (the charset rides `scale`, the blob describe convention)
+        CastTarget::Blob { sub_type, cs } => Descriptor {
+            dtype: dtype::BLOB,
+            scale: *cs as i8,
+            length: 8,
+            sub_type: *sub_type,
+            flags: 0,
+            offset: 0,
+        },
         CastTarget::Int { bytes } => d(int_dtype(*bytes)?, 0, *bytes as u16, 0),
         CastTarget::Numeric { scale, bytes, sub_type } => {
             d(int_dtype(*bytes)?, *scale, *bytes as u16, *sub_type)
@@ -51204,6 +51425,10 @@ impl Expr {
                 Some(match t {
                     CastTarget::Int { .. } => ExprType::Int,
                     CastTarget::Text { .. } => ExprType::Text,
+                    // a cast to BLOB has no scalar type: it describes
+                    // through [build_expr_col_from]'s blob arm, and a
+                    // DML value stores its text
+                    CastTarget::Blob { .. } => ExprType::Text,
                     CastTarget::Numeric { .. } => ExprType::Numeric,
                     CastTarget::Approx => ExprType::Approx,
                     CastTarget::Temporal(k) => ExprType::Temporal(*k),
@@ -51650,6 +51875,8 @@ impl Expr {
                 })
             }
             Expr::Cast(_, t, _) => match t {
+                // a blob is no number
+                CastTarget::Blob { .. } => None,
                 // BIGINT ranks I64; a NUMERIC past precision 18 is stored
                 // as INT128 and must announce that width, or the value
                 // travels in a slot too narrow to hold it
@@ -52250,6 +52477,24 @@ impl Expr {
                     cvt_cap_check(s, t.cvt_cap())?;
                 }
                 match t {
+                    // to a BLOB: the value's TEXT in the blob's own
+                    // character set. The blob itself is created by the
+                    // projection's mint ([Expr::BlobOf]) or by the store
+                    // that takes this value - one minting site, not two.
+                    CastTarget::Blob { sub_type, cs: blob_cs } => {
+                        let text = match v {
+                            Value::Text(t) => t,
+                            other => other.render(),
+                        };
+                        // `cs` on the Cast itself is the SOURCE's
+                        // character set ([cast_source_charset]); the
+                        // target's is the blob's own
+                        Value::Text(if *sub_type == 1 && *blob_cs != 0 {
+                            transcode_text(*cs, *blob_cs, text)?
+                        } else {
+                            text
+                        })
+                    }
                     // to DECFLOAT: promote the value to a Dec - an exact
                     // numeric or a stored DECFLOAT through value_as_dec, a
                     // string through the decNumber grammar - then encode as
@@ -59539,6 +59784,14 @@ fn insert_select(
                 .iter()
                 .enumerate()
                 .map(|(i, v)| {
+                    // A BLOB VALUE is no literal: it binds as its ID and
+                    // the store COPIES it (a stored blob) or materialises
+                    // it (one this statement computed) - the same path a
+                    // client's own blob parameter takes
+                    if let Value::Blob(r, n) = v {
+                        bound.push(WireParam::BlobId(encode_blob_id(*r, *n)));
+                        return Some("?".to_string());
+                    }
                     let cs = src_cs.get(i).copied().unwrap_or(fire_crab_ods::intl::CS_UTF8);
                     if cs != fire_crab_ods::intl::CS_UTF8 {
                         if let Value::Text(t) = v {
@@ -59564,6 +59817,12 @@ fn insert_select(
                 ov.sql(),
                 vals.join(", ")
             );
+            // a blob this row's expressions MINTED lives in the mint
+            // context until the next op; park it where the store
+            // resolves it before the insert runs
+            if let Some(d) = database.as_mut() {
+                flush_minted_blobs(d);
+            }
             let (plan, _) = plan_insert(&sql, database).ok_or("row insert refused")?;
             // an OVERRIDING / identity refusal ships its OWN vector, not
             // a flattened generic 42000. Unreachable after prepare took
@@ -76519,7 +76778,24 @@ mod tests {
         // precision is not one either - refuse rather than guess
         assert!(target("DOUBLE").is_none());
         assert!(target("NUMERIC(2,5)").is_none());
-        assert!(target("BLOB").is_none());
+        // a BLOB target names the blob's own type: plain BLOB is binary,
+        // a CHARACTER SET promotes the spelling to text the way it does
+        // in a column declaration, and SEGMENT SIZE decides nothing
+        assert_eq!(target("BLOB"), Some(CastTarget::Blob { sub_type: 0, cs: 0 }));
+        assert_eq!(
+            target("BLOB SUB_TYPE TEXT"),
+            Some(CastTarget::Blob { sub_type: 1, cs: 0 })
+        );
+        assert_eq!(
+            target("BLOB SUB_TYPE 1 CHARACTER SET UTF8 SEGMENT SIZE 80"),
+            Some(CastTarget::Blob { sub_type: 1, cs: 4 })
+        );
+        assert_eq!(
+            target("BLOB CHARACTER SET WIN1252"),
+            Some(CastTarget::Blob { sub_type: 1, cs: 53 })
+        );
+        // a user sub_type has no filter to text (isc_nofilter)
+        assert!(target("BLOB SUB_TYPE 3").is_none());
 
         // the rounding: HALF AWAY FROM ZERO, at the target scale.
         // Truncation and banker's rounding agree with it on 12.54 and

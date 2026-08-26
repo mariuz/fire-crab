@@ -131,12 +131,6 @@ both "the text of a blob through CAST stays text" \
 both "a blob-valued expression through a UNION" \
   "SELECT UPPER(B) FROM T WHERE ID=1 UNION ALL SELECT LOWER(B) FROM T WHERE ID=1;"
 
-# ---- the ENGINE reads what fire-crab's blob expressions answer ----------
-eng_q="SET LIST ON; SELECT ID, CHAR_LENGTH(B) AS CL, CAST(UPPER(B) AS VARCHAR(20)) AS U FROM T ORDER BY ID;"
-e=$(printf '%s\n' "$eng_q" | "$ISQL" -q -user "$U" -pas "$P" "$B" 2>&1 | norm)
-c=$(printf '%s\n' "$eng_q" | "$ISQL" -q -user "$U" -pas "$P" "$A" 2>&1 | norm)
-check "the ENGINE answers the same over fire-crab's own file" "$c" "$e"
-
 # ---- the ID is the key, not the content --------------------------------
 # T3 holds 'zzz','aaa','zzz','mmm' at ids 1..4, so CONTENT order and BLOB
 # ID order disagree: the engine answers ID order and groups four rows into
@@ -144,6 +138,28 @@ check "the ENGINE answers the same over fire-crab's own file" "$c" "$e"
 # and three groups. Both servers must give the same answer here.
 both "ORDER BY / GROUP BY / DISTINCT over a blob key the ID, not the content" \
   "SELECT ID FROM T3 ORDER BY B; SELECT ID FROM T3 ORDER BY B DESC; SELECT COUNT(*) FROM T3 GROUP BY B; SELECT DISTINCT B FROM T3;"
+
+# ---- the ENGINE reads what fire-crab's blob expressions answer ----------
+eng_q="SET LIST ON; SELECT ID, CHAR_LENGTH(B) AS CL, CAST(UPPER(B) AS VARCHAR(20)) AS U FROM T ORDER BY ID; SELECT ID, CAST(B AS VARCHAR(30)) AS V, CHAR_LENGTH(B) AS L FROM E ORDER BY ID;"
+e=$(printf '%s\n' "$eng_q" | "$ISQL" -q -user "$U" -pas "$P" "$B" 2>&1 | norm)
+c=$(printf '%s\n' "$eng_q" | "$ISQL" -q -user "$U" -pas "$P" "$A" 2>&1 | norm)
+check "the ENGINE answers the same over fire-crab's own file" "$c" "$e"
+
+# ---- blob VALUES in DML ------------------------------------------------
+both "UPDATE SET a blob from an expression, another blob, a string column" \
+  "CREATE TABLE D (ID INTEGER, B BLOB SUB_TYPE TEXT, C BLOB SUB_TYPE TEXT, S VARCHAR(20)); COMMIT; INSERT INTO D VALUES (1, 'one', NULL, 'sss'); INSERT INTO D VALUES (2, 'two', NULL, 'ttt'); COMMIT; UPDATE D SET B = B || ' more' WHERE ID=1; UPDATE D SET C = B WHERE ID=1; UPDATE D SET C = S WHERE ID=2; COMMIT; SELECT ID, CAST(B AS VARCHAR(30)), CAST(C AS VARCHAR(30)) FROM D ORDER BY ID;"
+both "... and back to NULL, and from a function" \
+  "UPDATE D SET C = NULL WHERE ID=1; UPDATE D SET B = UPPER(S) WHERE ID=2; COMMIT; SELECT ID, CAST(B AS VARCHAR(30)), C FROM D ORDER BY ID;"
+both "INSERT ... SELECT copies a blob column and stores a computed one" \
+  "CREATE TABLE E (ID INTEGER, B BLOB SUB_TYPE TEXT); COMMIT; INSERT INTO E SELECT ID, B FROM D; INSERT INTO E SELECT ID + 10, UPPER(B) || '!' FROM D; INSERT INTO E SELECT 30, S FROM D WHERE ID=1; COMMIT; SELECT ID, CAST(B AS VARCHAR(30)) FROM E ORDER BY ID;"
+both "INSERT ... VALUES stores every scalar the engine renders into a blob" \
+  "INSERT INTO E VALUES (40, UPPER('made') || '-up'); INSERT INTO E VALUES (41, 42); INSERT INTO E VALUES (42, 3.14); INSERT INTO E VALUES (43, DATE'2020-06-15'); INSERT INTO E VALUES (44, TIMESTAMP'2020-06-15 10:20:30'); INSERT INTO E VALUES (45, TRUE); COMMIT; SELECT ID, CAST(B AS VARCHAR(30)) FROM E WHERE ID >= 40 ORDER BY ID;"
+
+# ---- CAST ... AS BLOB ---------------------------------------------------
+bothd "the cast target names the blob's own type" \
+  "SELECT CAST('x' AS BLOB), CAST('x' AS BLOB SUB_TYPE TEXT), CAST('x' AS BLOB SUB_TYPE 1), CAST('x' AS BLOB SUB_TYPE BINARY), CAST('x' AS BLOB SUB_TYPE TEXT CHARACTER SET WIN1252), CAST('x' AS BLOB CHARACTER SET UTF8), CAST('x' AS BLOB SUB_TYPE TEXT SEGMENT SIZE 100) FROM RDB\$DATABASE;"
+both "... and its value, in a select list and as a stored value" \
+  "SELECT CAST('abc' AS BLOB SUB_TYPE TEXT), CAST(42 AS BLOB SUB_TYPE TEXT), CAST(CAST(B AS BLOB SUB_TYPE TEXT) AS VARCHAR(30)) FROM D WHERE ID=1; INSERT INTO E VALUES (50, CAST('casted' AS BLOB SUB_TYPE TEXT)); COMMIT; SELECT CAST(B AS VARCHAR(30)) FROM E WHERE ID=50;"
 
 # ---- boundaries ---------------------------------------------------------
 refuses() { # <label> <sql>
@@ -162,10 +178,6 @@ refuses "a blob-valued SCALAR SUBQUERY refuses" \
   "SELECT ID FROM T WHERE B = (SELECT B FROM T WHERE ID=1);"
 refuses "a blob-valued expression inside a DERIVED TABLE refuses" \
   "SELECT X FROM (SELECT B || '!' AS X FROM T WHERE ID=1);"
-refuses "a blob VALUE in DML refuses (INSERT..SELECT of a blob, UPDATE from one)" \
-  "INSERT INTO T (ID, B) SELECT 9, B || '!' FROM T WHERE ID=1;"
-refuses "... and an UPDATE whose SET reads a blob" \
-  "UPDATE T SET B = B || ' more' WHERE ID=1;"
 gf=$("$GFIX" -v -full -user "$U" -pas "$P" "$A" 2>&1)
 ran=$((ran + 1))
 if [ -z "$gf" ]; then echo "OK   gfix -v -full clean on fc's file"; else echo "DIFF gfix: $gf"; fail=1; fi

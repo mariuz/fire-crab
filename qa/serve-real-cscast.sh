@@ -199,8 +199,9 @@ refuses "a COLLATE with no CHARACTER SET refuses" \
   "SELECT CAST('AB' AS VARCHAR(3) COLLATE UNICODE_CI) FROM RDB\$DATABASE;"
 refuses "a COLLATE other than the set's own refuses" \
   "SELECT CAST('AB' AS VARCHAR(3) CHARACTER SET UTF8 COLLATE UNICODE_CI) FROM RDB\$DATABASE;"
-refuses "a BLOB target refuses" \
-  "SELECT CAST('ab' AS BLOB SUB_TYPE TEXT CHARACTER SET UTF8) FROM RDB\$DATABASE;"
+# (a BLOB target is served - see serve-real-blobexpr.sh; a cast to a
+# blob names the blob's OWN character set, not a transliteration of the
+# result the way a CHAR target does)
 refuses "the character-set introducer refuses" \
   "SELECT _WIN1252 'ab' FROM RDB\$DATABASE;"
 refuses "a parameter under the cast refuses" \
