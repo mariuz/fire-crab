@@ -366,6 +366,63 @@ Recorded: two transactions of ONE attachment do not conflict with
 each other (they share no lock arbitration), and fetches bind to the
 transaction live at fetch time (`op_fetch` carries no handle).
 
+**BINARY LITERALS AND THE OCTETS LAWS — DONE 2026-08-26
+(`serve-real-octets` 32).** `x'…'` is not a string with a funny
+spelling: it is CHAR(n) CHARACTER SET OCTETS, and OCTETS is the one
+character set whose *space* is a NUL byte. Getting the literal in was
+half a day's parsing; the other half was that every string law bends
+around that pad byte, and fire-crab had them all on the blank —
+including for OCTETS **columns**, which is where the wrong answers
+were:
+
+* a `CHAR(4) CHARACTER SET OCTETS` holding `x'6162'` reads back
+  `61620000`. fire-crab wrote `61622020`, so its file and the
+  engine's disagreed byte-for-byte on data the engine could read.
+* comparison pads the shorter side with 0x00 as soon as EITHER side
+  is binary, and transliterates neither (`CVT2_compare`,
+  cvt2.cpp:438): `x'4100' = 'A'` is TRUE where `x'4120' = 'A'` is
+  FALSE. Both sides now wrap in `Expr::OctKey`, the byte-string twin
+  of the collation key — the same trick, for the one charset whose
+  padding rule the ordinary compare cannot express.
+* `UPPER`/`LOWER` over OCTETS are IDENTITY. The binary texttype
+  installs `internal_str_copy` for both directions
+  (intl_builtin.cpp:1025) where NONE and ASCII, which share
+  `FAMILY_INTERNAL`, upcase the ASCII range.
+* `TRIM`'s default character is the charset's space — one 0x00 — so a
+  0x20 survives a `TRIM` and a 0x00 does not. `LPAD`/`RPAD` fill with
+  the same byte. The default form now carries ONE argument through
+  the raw tree and resolution fills the pad in, where the descriptors
+  are; a written-out character is still used as written.
+* **`LIKE` over a binary left operand has no wildcards at all.** The
+  wildcard bytes are `%` and `_` converted FROM UNICODE into the left
+  operand's charset (Collation.cpp:1025), and the binary charset's
+  converter is a UTF-16 byte dump (intl_builtin.cpp:926), so each
+  arrives as `{0x00,0x25}` / `{0x00,0x5F}`; the matcher reads the
+  first byte only, and its `sql_match_any &&` guard (evl_string.h:352)
+  reads a zero as "no wildcard". What is left is a literal byte match
+  over the FULL padded value — a `CHAR(4)` holding `61620000` matches
+  `x'61620000'` and NOT `x'6162'`. A CHAR left operand keeps its
+  wildcards even when the pattern is binary, and `SIMILAR TO`, a
+  different engine entirely, keeps them for binary too.
+* the result charset ABSORBS: one OCTETS operand makes the whole
+  concatenation, CASE, COALESCE or MIN binary
+  (`getResultTextType`, DataTypeUtil.cpp:59, now `cs_join`'s rule) —
+  and a high byte then travels as ONE octet instead of its UTF-8
+  pair, which also fixed a spurious string-truncation raise.
+
+An OCTETS column now takes the EXPRESSION predicate path, the way a
+temporal one does, because that is where these laws live. A binary
+LIKE/STARTING pattern travels as `Rhs::Oct` so the LEFT operand can
+decide whether its bytes are a value or a text pattern. The store
+path carries the charset too (`expr_value_to_wireparam`), or
+`x'41FF'` landed as its UTF-8 three bytes. `REPLACE` gained the
+describe width the engine computes (source + how much longer the
+replacement is, once per possible occurrence) — it was announcing
+32765 for every call. Boundaries, both recorded and refused rather
+than answered: a LIKE pattern that is not a literal (a parameter or
+an expression) against a binary side, and `CAST(… AS … CHARACTER SET
+…)`, which this server does not parse in any charset yet.
+
 **AGGREGATES IN EXPRESSIONS DONE (2026-08-25,
 `serve-real-statexpr` 8):** the statistical/ordered-set family
 (VAR_*/STDDEV_*, CORR/COVAR_*/REGR_*, PERCENTILE_CONT/DISC) and

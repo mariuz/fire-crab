@@ -481,6 +481,21 @@ pub fn byte_carrier(charset: u8) -> bool {
     matches!(charset, CS_NONE | CS_OCTETS | CS_ASCII)
 }
 
+/// The character set's PAD BYTE - what a CHAR slot is filled to its
+/// declared length with, and what a comparison pads the shorter side
+/// with. Every set's is the blank except OCTETS, whose "space" is a
+/// single ZERO byte (`CharSet::getSpace` over the binary charset): a
+/// `CHAR(4) CHARACTER SET OCTETS` holding `x'6162'` reads back
+/// `61620000`, and `x'4100' = 'A'` is TRUE where `x'4120' = 'A'` is
+/// FALSE - both measured against the engine.
+pub fn pad_byte(charset: u8) -> u8 {
+    if charset == CS_OCTETS {
+        0
+    } else {
+        b' '
+    }
+}
+
 /// Decode a byte-carrier value: one char per byte.
 pub fn carrier_decode(bytes: &[u8]) -> String {
     bytes.iter().map(|&b| b as char).collect()

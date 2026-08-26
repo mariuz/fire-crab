@@ -1476,6 +1476,71 @@ const GDS_REQ_NO_TRANS: i32 = 335544363;
 /// the slot is freed at that moment (server.cpp:3464).
 const GDS_BAD_TRANS_HANDLE: i32 = 335544332;
 
+/// `x'…'` / `X'…'` - the BINARY literal's bytes, or None when this is
+/// not one. The engine's rules exactly (Parser.cpp:598-688): the quote
+/// must be adjacent to the x; SPACES inside are ignored and do not
+/// break nibble pairing; anything else that is not a hex digit ends it
+/// as an error; the digit count must be EVEN PER SEGMENT; and several
+/// quoted segments concatenate when SOMETHING (whitespace or a comment)
+/// separates them - `x'41' '42'` is two bytes while `x'41''42'` is not
+/// a literal at all.
+///
+/// On any error this answers None and consumes nothing, which is the
+/// engine's own recovery: it backtracks and re-lexes the `x` as an
+/// identifier, so the refusal lands on the string that follows.
+fn take_hex_literal(b: &[char], pos: &mut usize) -> Option<Vec<u8>> {
+    let start = *pos;
+    if !matches!(b.get(*pos), Some('x') | Some('X')) || b.get(*pos + 1) != Some(&'\'') {
+        return None;
+    }
+    *pos += 1; // the x
+    let mut out: Vec<u8> = Vec::new();
+    loop {
+        // one segment
+        if b.get(*pos) != Some(&'\'') {
+            break;
+        }
+        *pos += 1;
+        let mut nibbles: Vec<u8> = Vec::new();
+        let mut closed = false;
+        while let Some(&c) = b.get(*pos) {
+            *pos += 1;
+            if c == '\'' {
+                closed = true;
+                break;
+            }
+            if c == ' ' {
+                continue; // ignored, pairing included
+            }
+            match c.to_digit(16) {
+                Some(v) => nibbles.push(v as u8),
+                None => {
+                    *pos = start;
+                    return None;
+                }
+            }
+        }
+        if !closed || nibbles.len() % 2 != 0 {
+            *pos = start;
+            return None;
+        }
+        for pair in nibbles.chunks(2) {
+            out.push(pair[0] << 4 | pair[1]);
+        }
+        // a further segment continues the literal only when something
+        // separates the quotes
+        let after = *pos;
+        let mut p2 = *pos;
+        skip_ws(b, &mut p2);
+        if p2 == after || b.get(p2) != Some(&'\'') {
+            *pos = after;
+            break;
+        }
+        *pos = p2;
+    }
+    Some(out)
+}
+
 /// Does this statement text START a transaction? `SET TRANSACTION` is
 /// the one that does (parse.y's TYPE_START_TRANS), and a client that
 /// executes it with no transaction handle is asking for a new one.
@@ -5992,10 +6057,13 @@ fn restore_row_image(
         match *v {
             RVal::Null => {
                 img[i / 8] |= 1 << (i % 8);
-                // a TEXT slot under a null still holds blanks, as the
-                // engine leaves it
+                // a TEXT slot under a null still holds its charset's
+                // PAD, as the engine leaves it (0x00 for OCTETS)
                 if d.dtype == fire_crab_ods::format::dtype::TEXT {
-                    img[off..off + d.length as usize].fill(b' ');
+                    let pad = fire_crab_ods::intl::pad_byte(
+                        fire_crab_ods::intl::charset_id(d.sub_type),
+                    );
+                    img[off..off + d.length as usize].fill(pad);
                 }
             }
             RVal::Int(n) => match d.dtype {
@@ -6024,7 +6092,12 @@ fn restore_row_image(
                     if bts.len() > n {
                         return Err("a char longer than its slot".into());
                     }
-                    img[off..off + n].fill(b' ');
+                    // CHAR fills to its declared length with the
+                    // CHARSET's pad (CVT_move, cvt.cpp:2069): a blank
+                    // everywhere but OCTETS, which fills with 0x00
+                    img[off..off + n].fill(fire_crab_ods::intl::pad_byte(
+                        fire_crab_ods::intl::charset_id(d.sub_type),
+                    ));
                     img[off..off + bts.len()].copy_from_slice(bts);
                 }
                 _ => return Err("text into a non-text column".into()),
@@ -6676,6 +6749,10 @@ enum RowSource {
         /// record carries the referenced fields), false over a real
         /// JOIN (the join's delivery order holds there, measured)
         tie_order: bool,
+        /// per key field: does it hold a BYTE STRING, whose buckets
+        /// divide on the 0x00 pad rather than the blank
+        /// ([octets_key_mask])
+        key_oct: Vec<bool>,
     },
 }
 
@@ -7142,6 +7219,7 @@ impl RowSource {
                 synth_base,
                 having,
                 tie_order,
+                key_oct,
             } => {
                 // the filter below this fold, when there is one: its
                 // fields join the LIST tie order (the engine's grouping
@@ -7163,6 +7241,7 @@ impl RowSource {
                     having,
                     filter,
                     *tie_order,
+                    key_oct,
                 )
             }
             RowSource::Sort { input, keys } => {
@@ -7188,6 +7267,7 @@ impl RowSource {
         having: &Option<Predicate>,
         keys: &[OrderKey],
         tie_order: bool,
+        key_oct: Vec<bool>,
     ) -> RowSource {
         RowSource::Sort {
             input: Box::new(RowSource::Aggregate {
@@ -7198,6 +7278,7 @@ impl RowSource {
                 synth_base,
                 having: having.clone(),
                 tie_order,
+                key_oct,
             }),
             keys: keys.to_vec(),
         }
@@ -9279,6 +9360,14 @@ enum Rhs {
     /// into an ordinary [Rhs] or into [Term::KeyConvErr], so no
     /// evaluator ever meets one.
     StrKey(String),
+    /// A BINARY pattern - `x'…'` in a LIKE/STARTING/CONTAINING
+    /// position, the one place a hex literal is not an expression.
+    /// It keeps its BYTES rather than becoming [Rhs::Str] because the
+    /// left operand decides how they are read: against an OCTETS side
+    /// they are the value's own bytes, against any other they are a
+    /// text pattern. Only those three shapes produce one; every other
+    /// consumer refuses, which fails closed.
+    Oct(Vec<u8>),
     Null,
     Param(usize, ColKind),
 }
@@ -9807,6 +9896,9 @@ impl Predicate {
                     // literal path is for the TEXT-param shape and never
                     // meets one; refuse
                     Some(Rhs::Int128(_) | Rhs::DecFloat34(_)) => None,
+                    // a BINARY pattern lives only in LIKE/STARTING and
+                    // never binds as a comparison literal
+                    Some(Rhs::Oct(_)) => None,
                 },
             })
         };
@@ -10344,7 +10436,11 @@ fn expr_reads(e: &Expr, f: &dyn Fn(usize) -> bool) -> bool {
         // the per-row coercion wrappers read whatever they wrap - a
         // wrapped COLUMN must keep its term row-DEPENDENT, or the
         // invariant pass would raise a value-gated 22018 over no row
-        Expr::TextNum(a, _) | Expr::TextNumKey(a, _) | Expr::TextBool(a, _) | Expr::CollKey(a, _) => expr_reads(a, f),
+        Expr::TextNum(a, _)
+        | Expr::TextNumKey(a, _)
+        | Expr::TextBool(a, _)
+        | Expr::CollKey(a, _)
+        | Expr::OctKey(a, _) => expr_reads(a, f),
         Expr::Neg(a) | Expr::Cast(a, _, _) => expr_reads(a, f),
         Expr::Bin(a, _, b) | Expr::Concat(a, b) | Expr::NullIf(a, b) => {
             expr_reads(a, f) || expr_reads(b, f)
@@ -10633,6 +10729,9 @@ impl Term {
             // resolution turns StrKey into a plain term or a
             // KeyConvErr; one reaching a Term is unreachable-defensive
             Term::Cmp(_, _, Rhs::StrKey(_)) => None,
+            // a BINARY pattern never reaches a Cmp term (LIKE and
+            // STARTING resolve it away) - unreachable-defensive
+            Term::Cmp(_, _, Rhs::Oct(_)) => None,
             Term::Cmp(_, _, Rhs::Dbl(_)) => None, // Dbl in TextNumCmp only
             // the value gate: NULL (or a missing slot) is UNKNOWN with
             // no raise; ANY value raises the engine's conversion error,
@@ -13292,10 +13391,19 @@ fn cs_join(a: TfCs, b: TfCs) -> TfCs {
         TfCs::Att => -1,
         TfCs::Ttype(t) => t & 0xFF,
     };
+    const OCT: i32 = fire_crab_ods::intl::CS_OCTETS as i32;
+    const ASCII: i32 = fire_crab_ods::intl::CS_ASCII as i32;
     match (id(a), id(b)) {
         (x, y) if x == y => a,
+        // DataTypeUtilBase::getResultTextType (DataTypeUtil.cpp:59):
+        // OCTETS ABSORBS - it wins over every other set from either
+        // side, so `x'41' || 'B'` and `'B' || x'41'` are both OCTETS.
+        // NONE is the weakest and ASCII yields to anything but NONE.
+        (OCT, _) => a,
+        (_, OCT) => b,
         (0, _) => b,
         (_, 0) => a,
+        (ASCII, _) => b,
         (-1, _) => b,
         (_, -1) => a,
         _ => a,
@@ -13363,6 +13471,9 @@ fn text_form_m(
     };
     match e {
         Expr::Str(s) => Some((false, lit_w(s), TfCs::Att)),
+        // a BINARY literal is CHAR of exactly its BYTES, at OCTETS -
+        // never the attachment's charset and never a character count
+        Expr::Hex(b) => Some((false, b.len() as i32, TfCs::Ttype(1))),
         // a column's descriptor length is BYTES; the width here is
         // CHARACTERS, so a multibyte charset divides by its
         // bytes-per-character (CHAR(6) UTF8 stores 24 bytes, is 6 wide)
@@ -13400,9 +13511,14 @@ fn text_form_m(
             }
             Some((!*pad, *len as i32, TfCs::Att))
         }
-        // a conditional is as wide as its widest branch
+        // a conditional is as wide as its widest branch. A bare NULL
+        // branch has no form of its own and contributes none
+        // (DataTypeUtil::makeFromList skips it), where letting its
+        // None poison the fold cost the whole expression its charset:
+        // `COALESCE(NULL, x'4142')` is OCTETS, not the attachment's
         Expr::Coalesce(v) => v
             .iter()
+            .filter(|x| !matches!(x, Expr::Null))
             .map(|x| text_form(x, descs))
             .reduce(widen)
             .flatten(),
@@ -13455,6 +13571,23 @@ fn text_form_m(
                     // VARCHAR(6) describes 6 characters, not 100 - and
                     // the FROM offset does not shrink it)
                     (Some((_, w, c)), Some(n)) => Some((true, n.min(w), c)),
+                    _ => None,
+                },
+                // REPLACE is VARYING at the width the engine computes
+                // from how much longer each replacement is than what it
+                // replaces (probed: VARCHAR(4) with 'a'->'zz' is 8,
+                // x'414243' with x'42'->x'FF' is 3), and its charset is
+                // the three operands negotiated the usual way - so a
+                // binary operand makes the whole result binary
+                SysFn::Replace => match (arg(0), arg(1), arg(2)) {
+                    (Some((_, ws, cs)), Some((_, wf, _)), Some((_, wr, _))) => {
+                        let grow = (wr - wf).max(0) * (ws / wf.max(1));
+                        Some((
+                            true,
+                            ws.saturating_add(grow),
+                            cs_join(cs_join(cs, arg(1)?.2), arg(2)?.2),
+                        ))
+                    }
                     _ => None,
                 },
                 SysFn::Lpad | SysFn::Rpad => lit(1).map(|n| {
@@ -22041,7 +22174,7 @@ fn plan_insert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
                     if std::env::var("FC_SRV_TRACE").is_ok() {
                         eprintln!("[srv] insert const-expr {:?} -> {}", part_text, v.render());
                     }
-                    InsVal::Wire(value_to_wireparam(&v)?)
+                    InsVal::Wire(expr_value_to_wireparam(&e, &v, &[])?)
                 }
             });
         }
@@ -26416,7 +26549,7 @@ fn execute_dml_collecting_inner(
                             (Value::Bool(b), dtype::TEXT | dtype::VARYING) => {
                                 WireParam::Text((if *b { "TRUE" } else { "FALSE" }).to_string())
                             }
-                            _ => match value_to_wireparam(&v) {
+                            _ => match expr_value_to_wireparam(e, &v, descs) {
                                 Some(wp) => wp,
                                 None => {
                                     return Err("expression type cannot be stored".into())
@@ -26845,7 +26978,9 @@ fn text_bytes_for(text: &str, src_cs: u8, d: &Descriptor, flen: usize) -> Option
                 return None;
             }
             let mut out = b.to_vec();
-            out.resize(flen, b' '); // CHAR blank padding
+            // CHAR pads to its declared length with the CHARSET's own
+            // space - 0x00 for OCTETS (cvt.cpp:2069)
+            out.resize(flen, fire_crab_ods::intl::pad_byte(dest_cs));
             Some(out)
         }
         _ => None,
@@ -32486,7 +32621,7 @@ fn branch_rows_res(
             rows.append(&mut branch_rows_res(b, db, args)?);
         }
         if *distinct {
-            distinct_rows(&mut rows, order_by.is_some());
+            distinct_rows(&mut rows, order_by.is_some(), &octets_cols(&output_cols_of(plan)));
         }
         if let Some(key) = order_by {
             let keys = [key.clone()];
@@ -32534,7 +32669,7 @@ fn branch_rows_res(
         }
         let mut rows = branch_rows_res(inner, db, args)?;
         if *distinct {
-            distinct_rows(&mut rows, plan_is_ordered(inner));
+            distinct_rows(&mut rows, plan_is_ordered(inner), &octets_cols(&output_cols_of(inner)));
         }
         return Ok(rows.into_iter().skip(*skip).take(take.unwrap_or(usize::MAX)).collect());
     }
@@ -32579,6 +32714,7 @@ fn branch_rows_res(
             &having,
             order_by,
             true,
+            octets_key_mask(cols, key_fids),
         )
         .rows(db)?;
         return rows
@@ -32664,6 +32800,7 @@ fn branch_rows_res(
             // follow the engine's referenced-fields record; a real
             // join's keep the delivery order (both measured)
             parts.is_empty(),
+            octets_key_mask(cols, key_fids),
         )
         .rows(db)?;
         return rows
@@ -32784,13 +32921,48 @@ fn branch_rows_each(
 /// Two projected rows are the same row for UNION's set semantics -
 /// compared column by column, with NULL equal to NULL (a set operation
 /// treats them as the same value, unlike `= NULL` in a predicate).
-fn rows_equal(a: &[Value], b: &[Value]) -> bool {
+fn rows_equal(a: &[Value], b: &[Value], oct: &[bool]) -> bool {
     a.len() == b.len()
-        && a.iter().zip(b.iter()).all(|(x, y)| match (x, y) {
+        && a.iter().zip(b.iter()).enumerate().all(|(i, (x, y))| match (x, y) {
             (Value::Null, Value::Null) => true,
             (Value::Null, _) | (_, Value::Null) => false,
+            // a BINARY column is the same value under the 0x00 pad, not
+            // the blank one: `x'61'` and `x'6100'` are ONE row to a set
+            _ if oct.get(i).copied().unwrap_or(false) => {
+                octets_value_cmp(x, y) == std::cmp::Ordering::Equal
+            }
             _ => value_cmp(x, y) == std::cmp::Ordering::Equal,
         })
+}
+
+/// The octets-ness of a fold's KEY FIELDS, read off the projection
+/// (`ProjCol` carries both the field id and the described sub_type).
+/// A key that no output column reads keeps `false` - the blank-padded
+/// bucketing - which is the pre-existing answer, never a new one.
+fn octets_key_mask(cols: &[ProjCol], key_fids: &[usize]) -> Vec<bool> {
+    let oct = |fid: usize| {
+        cols.iter().any(|c| {
+            c.field_id == fid
+                && c.expr.is_none()
+                && (0..=i16::MAX as i32).contains(&c.sub_type)
+                && fire_crab_ods::intl::charset_id(c.sub_type as i16)
+                    == fire_crab_ods::intl::CS_OCTETS
+        })
+    };
+    key_fids.iter().map(|f| oct(*f)).collect()
+}
+
+/// Which output columns answer OCTETS - the mask the set and sort
+/// machinery needs, read off the projection the describe already
+/// announces.
+fn octets_cols(cols: &[ProjCol]) -> Vec<bool> {
+    cols.iter()
+        .map(|c| {
+            (0..=i16::MAX as i32).contains(&c.sub_type)
+                && fire_crab_ods::intl::charset_id(c.sub_type as i16)
+                    == fire_crab_ods::intl::CS_OCTETS
+        })
+        .collect()
 }
 
 /// Reduce projected rows to a SET - and leave them in the order the
@@ -32814,7 +32986,7 @@ fn rows_equal(a: &[Value], b: &[Value]) -> bool {
 /// answers descending, so `ordered` says whether something else has
 /// already decided the row order; only when nothing has does the set's
 /// own ascending order show through.
-fn distinct_rows(rows: &mut Vec<Vec<Value>>, ordered: bool) {
+fn distinct_rows(rows: &mut Vec<Vec<Value>>, ordered: bool, oct: &[bool]) {
     // SORT, THEN DROP ADJACENT EQUALS (the engine's SORT_unique over a
     // projection) - in place of the quadratic seen-list this was. Each
     // row carries its input position as a trailing key, so the stable
@@ -32832,7 +33004,13 @@ fn distinct_rows(rows: &mut Vec<Vec<Value>>, ordered: bool) {
         })
         .collect();
     let mut keys: Vec<OrderKey> = (0..width)
-        .map(|i| OrderKey::field(i, false, NullsAt::Default))
+        .map(|i| {
+            let mut k = OrderKey::field(i, false, NullsAt::Default);
+            if oct.get(i).copied().unwrap_or(false) {
+                k.coll = fire_crab_ods::intl::CS_OCTETS as u16;
+            }
+            k
+        })
         .collect();
     let sorted = match sort_rows_spilling(decorated, &keys) {
         Ok(s) => s,
@@ -32841,7 +33019,7 @@ fn distinct_rows(rows: &mut Vec<Vec<Value>>, ordered: bool) {
     let mut kept: Vec<Vec<Value>> = Vec::new();
     for r in sorted {
         if let Some(last) = kept.last() {
-            if rows_equal(&last[..width], &r[..width]) {
+            if rows_equal(&last[..width], &r[..width], oct) {
                 continue;
             }
         }
@@ -34974,6 +35152,7 @@ fn expr_nullable(e: &Expr, is_nn: &dyn Fn(usize) -> bool) -> bool {
         | Expr::Double(_)
         | Expr::Bool(_)
         | Expr::Str(_)
+        | Expr::Hex(_)
         | Expr::DateLit(_)
         | Expr::TimeLit(_)
         | Expr::TsLit(..)
@@ -34983,6 +35162,7 @@ fn expr_nullable(e: &Expr, is_nn: &dyn Fn(usize) -> bool) -> bool {
         | Expr::Cast(a, ..)
         | Expr::TextNum(a, _)
         | Expr::TextNumKey(a, _)
+        | Expr::OctKey(a, _)
         | Expr::TextBool(a, _) => expr_nullable(a, is_nn),
         Expr::Bin(a, _, b) | Expr::Concat(a, b) => expr_nullable(a, is_nn) || expr_nullable(b, is_nn),
         // AtNode::make (ExprNodes.cpp:3328): nullable iff the datetime
@@ -38547,6 +38727,27 @@ fn join_step(
 /// ascending puts NULLs first), matching the engine's default; integers,
 /// scaled numerics, doubles and date/time types compare numerically,
 /// text ignoring trailing blanks, anything else by its rendered text.
+/// The OCTETS order: a byte string is padded with 0x00, never the
+/// blank (`CVT2_compare`, cvt2.cpp:438), so `x'6120' > x'6100'` and
+/// `x'61' = x'6100'`. Trimming the pad byte off both sides is the same
+/// relation - and it is NOT what [value_cmp] does, which strips
+/// trailing BLANKS because that is the law for every other charset.
+fn octets_value_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
+    match (a, b) {
+        (Value::Text(x), Value::Text(y)) => {
+            x.trim_end_matches('\0').cmp(y.trim_end_matches('\0'))
+        }
+        _ => value_cmp(a, b),
+    }
+}
+
+/// Does this key's ttype name the binary charset? ([OrderKey::coll]
+/// carries the ttype, and OCTETS lives in its low byte.)
+fn coll_is_octets(coll: u16) -> bool {
+    coll != 0
+        && fire_crab_ods::intl::charset_id(coll as i16) == fire_crab_ods::intl::CS_OCTETS
+}
+
 fn value_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
     use std::cmp::Ordering::*;
     match (a, b) {
@@ -38880,6 +39081,8 @@ fn order_cmp(a: &[Value], b: &[Value], keys: &[OrderKey]) -> std::cmp::Ordering 
         } else {
             let o = if key.coll == fire_crab_ods::coll::TTYPE_PXW_INTL {
                 collated_text_cmp(va, vb).unwrap_or_else(|| value_cmp(va, vb))
+            } else if coll_is_octets(key.coll) {
+                octets_value_cmp(va, vb)
             } else {
                 value_cmp(va, vb)
             };
@@ -38932,6 +39135,7 @@ fn group_output(
         synth_base,
         having: having.clone(),
         tie_order: true,
+        key_oct: Vec::new(),
     }
     .rows(db)
 }
@@ -39519,6 +39723,7 @@ fn group_rows(
     having: &Option<Predicate>,
     filter: Option<&Predicate>,
     tie_order: bool,
+    key_oct: &[bool],
 ) -> Result<Vec<Vec<Value>>, EvalErr> {
     // expression keys: evaluate each into its synthetic slot, so the
     // bucketing sort and the Key output items read it like a field.
@@ -39539,7 +39744,15 @@ fn group_rows(
     } else {
         let keys: Vec<OrderKey> = key_fids
             .iter()
-            .map(|&f| OrderKey::field(f, false, NullsAt::Default))
+            .enumerate()
+            .map(|(i, &f)| {
+                let mut k = OrderKey::field(f, false, NullsAt::Default);
+                // a BINARY key buckets on the 0x00 pad
+                if key_oct.get(i).copied().unwrap_or(false) {
+                    k.coll = fire_crab_ods::intl::CS_OCTETS as u16;
+                }
+                k
+            })
             .collect();
         // LIST is ORDER-SENSITIVE, and the engine's grouping sort
         // compares its WHOLE sort record - the group keys, then every
@@ -40906,6 +41119,22 @@ fn simple_case(t: &str, upper: bool) -> String {
     out
 }
 
+/// Does this expression answer OCTETS? The width machinery already
+/// negotiates a result charset the engine's way ([cs_join] is
+/// `getResultTextType`), so the octets question is just its answer:
+/// a hex literal, a byte-string column, and anything they propagate
+/// through (concatenation, CASE, COALESCE, TRIM, SUBSTRING, UPPER).
+/// A shape with no computable form answers false and keeps the
+/// blank-padded text laws, which is where every other charset lives.
+fn expr_is_octets(e: &Expr, descs: &[Descriptor]) -> bool {
+    matches!(
+        text_form(e, descs),
+        Some((_, _, TfCs::Ttype(tt)))
+            if fire_crab_ods::intl::charset_id(tt as i16)
+                == fire_crab_ods::intl::CS_OCTETS
+    )
+}
+
 fn conversion_error_arg(text: &str) -> String {
     conversion_error_arg_bytes(text.as_bytes())
 }
@@ -40942,7 +41171,12 @@ fn conversion_error_arg_bytes(bytes: &[u8]) -> String {
 /// fire-crab does not track) answers `CS_UTF8`, which [conv_err]
 /// spells as the String's UTF-8 bytes, the pre-existing behaviour.
 fn err_spell_charset(e: &Expr, descs: &[Descriptor]) -> u8 {
-    use fire_crab_ods::intl::{byte_carrier, charset_id, tabled, CS_UTF8};
+    use fire_crab_ods::intl::{byte_carrier, charset_id, tabled, CS_OCTETS, CS_UTF8};
+    // a hex literal IS OCTETS, so its 22018 spells the raw bytes:
+    // `CAST(x'ff' AS SMALLINT)` says `#xff`, not the UTF-8 `#xc3#xbf`
+    if let Expr::Hex(_) = e {
+        return CS_OCTETS;
+    }
     if let Expr::Col(fid) = e {
         if let Some(d) = descs.get(*fid) {
             if matches!(d.dtype, dtype::TEXT | dtype::VARYING) {
@@ -42204,7 +42438,7 @@ fn emit_rows_inner(
                             }
                             rows_v.push(row);
                         }
-                        distinct_rows(&mut rows_v, !order_by.is_empty());
+                        distinct_rows(&mut rows_v, !order_by.is_empty(), &octets_cols(icols));
                         for r in rows_v.iter().skip(*skip).take(take.unwrap_or(usize::MAX)) {
                             encode_row(w, cols, r, out)?;
                         }
@@ -42294,7 +42528,7 @@ fn emit_rows_inner(
                 // DISTINCT compares whole projected rows with NULL equal
                 // to NULL - the same set semantics UNION uses
                 if *distinct {
-                    distinct_rows(&mut rows, plan_is_ordered(inner));
+                    distinct_rows(&mut rows, plan_is_ordered(inner), &octets_cols(&output_cols_of(inner)));
                 }
                 for r in rows.iter().skip(*skip).take(take.unwrap_or(usize::MAX)) {
                     encode_row(w, cols, r, out)?;
@@ -42342,7 +42576,7 @@ fn emit_rows_inner(
                 // duplicates of each other here (SQL's set semantics),
                 // unlike `= NULL` in a predicate.
                 if *distinct {
-                    distinct_rows(&mut rows, order_by.is_some());
+                    distinct_rows(&mut rows, order_by.is_some(), &octets_cols(cols));
                 }
                 if let Some(key) = order_by {
                     let keys = [key.clone()];
@@ -42783,6 +43017,7 @@ fn emit_rows_inner(
                     &having,
                     order_by,
                     parts.is_empty(),
+                    octets_key_mask(cols, key_fids),
                 )
                 .rows(db)
                 .map_err(EmitErr::Eval)?;
@@ -42840,6 +43075,7 @@ fn emit_rows_inner(
                     &having,
                     order_by,
                     true,
+                    octets_key_mask(cols, key_fids),
                 )
                 .rows(db)
                 .map_err(EmitErr::Eval)?;
@@ -42927,7 +43163,28 @@ fn enforce_out_capacity(
         // the re-fit below lands on the engine's own answer: a CHAR
         // conditional padded to its CHARACTER width comes back trimmed
         // and re-padded to its byte width.
-        let count = |x: &str| if dest.bpc == 1 { x.len() } else { x.chars().count() };
+        // ... except a BYTE-CARRIER source, whose chars ARE its octets
+        // (`carrier_encode` is what the emit ships): counting its UTF-8
+        // spelling made a high byte look like two, and `REPLACE(x'414243',
+        // x'42', x'FF')` - three bytes, four in UTF-8 - raised a
+        // truncation the engine does not
+        // The condition is the EMIT's own, not the resolved charset: only
+        // a column whose descriptor names a real byte-carrier ttype ships
+        // through `carrier_encode` (one octet per char). An expression
+        // described in the ATTACHMENT's charset ships its UTF-8 bytes
+        // even when that attachment is NONE, so it must keep counting
+        // OCTETS or a value could be written past the slot.
+        let carrier_src = (0..=i16::MAX as i32).contains(&c.sub_type)
+            && fire_crab_ods::intl::byte_carrier(fire_crab_ods::intl::charset_id(
+                c.sub_type as i16,
+            ));
+        let count = |x: &str| {
+            if dest.bpc == 1 && !carrier_src {
+                x.len()
+            } else {
+                x.chars().count()
+            }
+        };
         let src_chars = count(&s);
         if src_chars <= dest_chars {
             continue;
@@ -43188,7 +43445,20 @@ fn encode_row_body(
                     }
                     if fixed_out {
                         let mut fb = b.to_vec();
-                        fb.resize(fixed_width, b' ');
+                        // a CHAR result fills to its declared width with
+                        // the ANNOUNCED charset's pad - 0x00 when that is
+                        // OCTETS. The stored column reads back right
+                        // either way (its page image already carries the
+                        // fill), but a COMPUTED CHAR OCTETS value -
+                        // COALESCE, CASE, a UNION branch - is padded HERE
+                        let pad = if (0..=i16::MAX as i32).contains(&c.sub_type) {
+                            fire_crab_ods::intl::pad_byte(
+                                fire_crab_ods::intl::charset_id(c.sub_type as i16),
+                            )
+                        } else {
+                            b' '
+                        };
+                        fb.resize(fixed_width, pad);
                         w.raw(&fb);
                         for _ in 0..(4 - fb.len() % 4) % 4 {
                             w.raw(&[0u8]);
@@ -44577,6 +44847,10 @@ enum RawExpr {
     TimeLit(u32),
     /// `TIMESTAMP '<date> <time>'`
     TsLit(i32, u32),
+    /// `x'48656C6C6F'` - a BINARY literal: CHAR(n) CHARACTER SET OCTETS
+    /// whose n is the BYTE count (Parser.cpp:682 tags it BINARY, the
+    /// seeded alias of OCTETS)
+    Hex(Vec<u8>),
     /// `<value> AT TIME ZONE <zone>` / `<value> AT LOCAL` (`None` zone
     /// = the session's). The result is ALWAYS a WITH TIME ZONE value
     /// (parse.y:8561, AtNode): a zoneless operand is read as a wall
@@ -45660,6 +45934,11 @@ fn expr_at_tz(b: &[char], pos: &mut usize) -> Option<RawExpr> {
 
 fn expr_atom(b: &[char], pos: &mut usize) -> Option<RawExpr> {
     skip_ws(b, pos);
+    // a BINARY literal comes before the identifier path: `x` is a legal
+    // column name, and only the adjacent quote makes it a literal
+    if let Some(bytes) = take_hex_literal(b, pos) {
+        return Some(RawExpr::Hex(bytes));
+    }
     match b.get(*pos)? {
         // a `?` parameter placeholder - the index is assigned in source
         // order later, and only along the projection path; every other
@@ -46251,6 +46530,7 @@ fn raw_bad_substring_len(e: &RawExpr) -> Option<i64> {
         | RawExpr::DateLit(_)
         | RawExpr::TimeLit(_)
         | RawExpr::TsLit(..)
+        | RawExpr::Hex(_)
         | RawExpr::TimeTzLit(..)
         | RawExpr::TsTzLit(..)
         | RawExpr::CurrentDate
@@ -46503,11 +46783,15 @@ fn parse_sysfn_call(up: &str, b: &[char], pos: &mut usize) -> Option<RawExpr> {
         } else {
             None
         };
-        let space = RawExpr::Str(" ".into());
-        // `TRIM(<side> FROM s)` - no <what>, the default single space
+        // `TRIM(<side> FROM s)` - no <what>, so the trim character is
+        // the SOURCE CHARSET's own space (TrimNode::execute,
+        // ExprNodes.cpp:12896), which is a NUL byte for OCTETS. The
+        // default form carries ONE argument and resolution - where the
+        // charset is known - fills the pad in; a written-out character
+        // always arrives as two, and is used as written.
         if side.is_some() && take_keyword(b, pos, "FROM") {
             let src = expr_add(b, pos)?;
-            return Some(RawExpr::Func(SysFn::Trim(side?), vec![space, src]));
+            return Some(RawExpr::Func(SysFn::Trim(side?), vec![src]));
         }
         let first = expr_add(b, pos)?;
         if take_keyword(b, pos, "FROM") {
@@ -46521,7 +46805,7 @@ fn parse_sysfn_call(up: &str, b: &[char], pos: &mut usize) -> Option<RawExpr> {
         if side.is_some() {
             return None;
         }
-        return Some(RawExpr::Func(SysFn::Trim(TrimSide::Both), vec![space, first]));
+        return Some(RawExpr::Func(SysFn::Trim(TrimSide::Both), vec![first]));
     }
     // POSITION(<sub> IN <s>), or the comma form with an optional start
     if matches!(f, SysFn::Position) {
@@ -47139,7 +47423,47 @@ fn resolve_expr_inner(
             // counts the COLUMN's stored bytes (WIN1252 'café' is 4,
             // probed), not the decoded text's UTF-8 bytes - the charset
             // is only knowable here, where the descriptor is
+            // the default TRIM character, filled in HERE because it is
+            // the source charset's space and only the descriptors know
+            // which charset that is: the blank everywhere, a single
+            // 0x00 for OCTETS (intl_builtin.cpp:1516 sets the binary
+            // charset's space character to a NUL)
+            // LPAD/RPAD's default fill is the same charset space
+            // (SysFunction.cpp): 0x00 pads a byte string, so
+            // `LPAD(x'41', 3)` is `000041` and not `202041`
+            if let (SysFn::Lpad | SysFn::Rpad, [src, n]) = (f, resolved.as_slice()) {
+                if expr_is_octets(src, descs) {
+                    return Some(Expr::Func(
+                        *f,
+                        vec![src.clone(), n.clone(), Expr::Hex(vec![0])],
+                    ));
+                }
+            }
+            if let (SysFn::Trim(_), [src]) = (f, resolved.as_slice()) {
+                let pad = if expr_is_octets(src, descs) {
+                    Expr::Hex(vec![0])
+                } else {
+                    Expr::Str(" ".into())
+                };
+                return Some(Expr::Func(*f, vec![pad, src.clone()]));
+            }
             let f = match (f, resolved.as_slice()) {
+                // an OCTETS ARGUMENT of any shape - a hex literal, a
+                // byte-string column, a concatenation of them - takes
+                // the charset arms below: its octets ARE its carrier
+                // chars (never their UTF-8 spelling), and it has no
+                // case law at all (intl_builtin.cpp:1025)
+                (SysFn::OctetLength | SysFn::Upper | SysFn::Lower, [a])
+                    if expr_is_octets(a, descs) =>
+                {
+                    match f {
+                        SysFn::OctetLength => {
+                            SysFn::OctetLengthCs(fire_crab_ods::intl::CS_OCTETS)
+                        }
+                        SysFn::Upper => SysFn::UpperCs(fire_crab_ods::intl::CS_OCTETS),
+                        _ => SysFn::LowerCs(fire_crab_ods::intl::CS_OCTETS),
+                    }
+                }
                 (SysFn::OctetLength, [Expr::Col(fid)]) => {
                     let cs = descs
                         .get(*fid)
@@ -47235,6 +47559,7 @@ fn resolve_expr_inner(
         RawExpr::TsLit(d, t) => Expr::TsLit(*d, *t),
         RawExpr::TimeTzLit(t, z) => Expr::TimeTzLit(*t, *z),
         RawExpr::TsTzLit(d, t, z) => Expr::TsTzLit(*d, *t, *z),
+        RawExpr::Hex(b) => Expr::Hex(b.clone()),
         RawExpr::AtTimeZone(a, z) => {
             let inner = resolve_expr_inner(a, columns, descs)?;
             // AtNode::make (ExprNodes.cpp:3326) posts
@@ -47403,6 +47728,10 @@ enum Expr {
     TimeTzLit(u32, u16),
     /// CURRENT_TIMESTAMP: (days, UTC time units, zone id)
     TsTzLit(i32, u32, u16),
+    /// `x'…'` - see [RawExpr::Hex]. The bytes ride in a String through
+    /// the byte-carrier convention (one char per octet), which is how
+    /// every OCTETS value travels in this server.
+    Hex(Vec<u8>),
     /// `<value> AT TIME ZONE <zone>` / `<value> AT LOCAL` (None zone =
     /// the session's) - see [RawExpr::AtTimeZone]
     AtTimeZone(Box<Expr>, Option<Box<Expr>>),
@@ -47455,6 +47784,20 @@ enum Expr {
     /// detection) simply MISS and keep their lenient path - a safe
     /// degradation, not a wrong answer.
     CollKey(Box<Expr>, u16),
+    /// A comparison side under OCTETS - the same KEY idea as
+    /// [Expr::CollKey], for the one character set whose pad byte is
+    /// not the blank. `CVT2_compare` (cvt2.cpp:438) pads the shorter
+    /// side with 0x00 as soon as EITHER side is binary, and converts
+    /// neither; the key is the value with its trailing 0x00 dropped
+    /// and a single 0x00 appended, so the ordinary [value_cmp] -
+    /// which strips trailing BLANKS, and must not here - answers the
+    /// engine's order over two wrapped sides.
+    ///
+    /// `exact` keeps the value whole instead (nothing trimmed, the
+    /// terminator still appended): what LIKE compares over an OCTETS
+    /// operand, where the padded bytes ARE part of the value
+    /// (`x'6162'` does not match a `CHAR(4)` holding `61620000`).
+    OctKey(Box<Expr>, bool),
 }
 
 /// A resolved [RawCond].
@@ -48263,6 +48606,7 @@ fn text_to_dec128(s: &str) -> Option<u128> {
 fn rhs_to_dec128(rhs: &Rhs) -> Option<u128> {
     use fire_crab_ods::decfloat::{encode_dec128, round_to_dec34, Dec};
     let dec = match rhs {
+        Rhs::Oct(_) => return None, // a BINARY pattern is not a number
         Rhs::Int(n) => round_to_dec34(*n < 0, (*n as i128).unsigned_abs(), 0),
         // Rhs::Num carries (raw, scale) = raw * 10^scale; the exponent IS
         // the scale (`1.5` is (15, -1))
@@ -49739,6 +50083,20 @@ fn wall_to_utc_time(t: u32, zone: u16) -> Option<u32> {
 /// the value's own displacement converts exactly). None: a value no
 /// wire parameter carries - a blob id, a DECFLOAT, an over-i64 INT128,
 /// an unconvertible zone.
+/// [value_to_wireparam] for a value that came from an EXPRESSION: a
+/// binary one carries its charset with it, so the store path encodes
+/// the carrier's bytes rather than their UTF-8 spelling (`x'41FF'`
+/// into an OCTETS column is `41 FF`, not `41 C3 BF`).
+fn expr_value_to_wireparam(e: &Expr, v: &Value, descs: &[Descriptor]) -> Option<WireParam> {
+    match value_to_wireparam(v)? {
+        WireParam::Text(t) if expr_is_octets(e, descs) => Some(WireParam::TextCs(
+            t,
+            fire_crab_ods::intl::CS_OCTETS,
+        )),
+        wp => Some(wp),
+    }
+}
+
 fn value_to_wireparam(v: &Value) -> Option<WireParam> {
     Some(match v {
         Value::Null => WireParam::Null,
@@ -50060,6 +50418,8 @@ impl Expr {
                 _ => None,
             },
             Expr::BlobText(_) => Some(ExprType::Text),
+            // a BINARY literal is TEXT, at charset OCTETS
+            Expr::Hex(_) => Some(ExprType::Text),
             // a `?` is untyped on its own - it is always wrapped by the
             // CAST that gives it a type, so type_of never reaches it
             Expr::Param(_) => None,
@@ -50136,7 +50496,7 @@ impl Expr {
                 e.type_of(descs).map(|_| ExprType::Numeric)
             }
             Expr::TextBool(e, _) => e.type_of(descs).map(|_| ExprType::Bool),
-            Expr::CollKey(e, _) => e.type_of(descs),
+            Expr::CollKey(e, _) | Expr::OctKey(e, _) => e.type_of(descs),
             Expr::Null => Some(ExprType::Int),
             Expr::DateLit(_) => Some(ExprType::Temporal(TKind::Date)),
             Expr::TimeTzLit(..) => Some(ExprType::Temporal(TKind::TimeTz)),
@@ -50598,6 +50958,7 @@ impl Expr {
     fn rank_of(&self, descs: &[Descriptor]) -> Option<NumRank> {
         match self {
             Expr::BlobText(_)
+            | Expr::Hex(_)
             | Expr::TimeTzLit(..)
             | Expr::TsTzLit(..)
             | Expr::AtTimeZone(..) => None,
@@ -50614,7 +50975,11 @@ impl Expr {
             // the per-row coercion wrappers have no STATIC rank - the
             // value's width is decided by each row's text. They live
             // only inside WHERE comparisons, never in a describe.
-            Expr::TextNum(_, _) | Expr::TextNumKey(_, _) | Expr::TextBool(_, _) | Expr::CollKey(_, _) => None,
+            Expr::TextNum(_, _)
+            | Expr::TextNumKey(_, _)
+            | Expr::TextBool(_, _)
+            | Expr::CollKey(_, _)
+            | Expr::OctKey(_, _) => None,
             Expr::Coalesce(args) => args.iter().filter_map(|a| a.rank_of(descs)).max(),
             Expr::Case(branches, else_) => branches
                 .iter()
@@ -50924,6 +51289,23 @@ impl Expr {
                 }
                 v => v,
             },
+            // the OCTETS comparison key (see the variant): trailing
+            // 0x00 is the PAD and drops, everything else is the value,
+            // and the appended 0x00 keeps [value_cmp]'s blank-strip -
+            // right for every other charset - off a byte string
+            Expr::OctKey(e, exact) => match e.eval(values)? {
+                Value::Null => Value::Null,
+                Value::Text(s) => {
+                    let mut k = if *exact {
+                        s
+                    } else {
+                        s.trim_end_matches('\0').to_string()
+                    };
+                    k.push('\0');
+                    Value::Text(k)
+                }
+                v => v,
+            },
             Expr::TextNum(e, cs) => match e.eval(values)? {
                 Value::Null => Value::Null,
                 Value::Text(s) => match text_col_num(&s) {
@@ -50985,6 +51367,7 @@ impl Expr {
             Expr::DateLit(d) => Value::Date(*d),
             Expr::TimeTzLit(t, z) => Value::TimeTz(*t, *z),
             Expr::TsTzLit(d, t, z) => Value::TimestampTz(*d, *t, *z),
+            Expr::Hex(b) => Value::Text(fire_crab_ods::intl::carrier_decode(b)),
             Expr::TimeLit(t) => Value::Time(*t),
             Expr::TsLit(d, t) => Value::Timestamp(*d, *t),
             // NEGATION OVERFLOWS AT EXACTLY ONE VALUE, and it wrapped
@@ -51714,8 +52097,18 @@ impl Expr {
                     SysFn::UpperCs(cs) | SysFn::LowerCs(cs) => {
                         let up = matches!(f, SysFn::UpperCs(_));
                         let t = fn_text(&vs[0]);
+                        // OCTETS has NO case law: its texttype installs
+                        // internal_str_copy for both directions
+                        // (intl_builtin.cpp:1025), so UPPER over a byte
+                        // string copies it - where NONE and ASCII, whose
+                        // texttype is the shared FAMILY_INTERNAL one,
+                        // upcase the ASCII range
                         let mut out = String::with_capacity(t.len());
                         for c in t.chars() {
+                            if *cs == fire_crab_ods::intl::CS_OCTETS {
+                                out.push(c);
+                                continue;
+                            }
                             match fire_crab_ods::intl::case_char(*cs, c, up) {
                                 Some(Ok(m)) => out.push(m),
                                 Some(Err(())) => {
@@ -55182,6 +55575,7 @@ fn default_expr_name(raw: &RawExpr) -> String {
         RawExpr::DateLit(_)
         | RawExpr::TimeLit(_)
         | RawExpr::TsLit(..)
+        | RawExpr::Hex(_)
         | RawExpr::TimeTzLit(..)
         | RawExpr::TsTzLit(..) => "CONSTANT",
         // AtNode::setParameterName (ExprNodes.cpp:3274): name and alias
@@ -55249,11 +55643,24 @@ fn parse_order_by_expr(
     // a FIELD key over a COLLATED column sorts by that collation - the
     // ttype rides the key ([OrderKey::coll]; PXW_INTL is the one driven)
     let stamp = |mut k: OrderKey| -> OrderKey {
-        if k.expr.is_none()
-            && descs.get(k.field).map(|d| d.sub_type as u16)
-                == Some(fire_crab_ods::coll::TTYPE_PXW_INTL)
-        {
-            k.coll = fire_crab_ods::coll::TTYPE_PXW_INTL;
+        match &k.expr {
+            None => {
+                let tt = descs.get(k.field).map(|d| d.sub_type as u16);
+                // a COLLATED column sorts by its collation; a BINARY one
+                // by the 0x00-padded byte order, which is not the
+                // blank-padded text order [octets_value_cmp]
+                if tt == Some(fire_crab_ods::coll::TTYPE_PXW_INTL) {
+                    k.coll = fire_crab_ods::coll::TTYPE_PXW_INTL;
+                } else if tt.map_or(false, coll_is_octets) {
+                    k.coll = fire_crab_ods::intl::CS_OCTETS as u16;
+                }
+            }
+            // an EXPRESSION key sorts binary when its RESULT is binary
+            Some(e) => {
+                if expr_is_octets(e, descs) {
+                    k.coll = fire_crab_ods::intl::CS_OCTETS as u16;
+                }
+            }
         }
         k
     };
@@ -55514,6 +55921,18 @@ fn numeric_tok(s: &str, b: &[u8], start: usize, i: &mut usize) -> Option<Tok> {
 /// so an unsupported predicate falls back rather than answering wrong.
 fn tokenize(s: &str) -> Option<Vec<Tok>> {
     let b = s.as_bytes();
+    let chars: Vec<char> = s.chars().collect();
+    // byte offset -> char index, so the shared char-based literal
+    // scanners can be used from this byte-based tokenizer
+    let mut at_char: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    {
+        let mut ci = 0usize;
+        for (bi, _) in s.char_indices() {
+            at_char.insert(bi, ci);
+            ci += 1;
+        }
+        at_char.insert(s.len(), ci);
+    }
     let mut i = 0;
     let mut out = Vec::new();
     while i < b.len() {
@@ -55521,6 +55940,18 @@ fn tokenize(s: &str) -> Option<Vec<Tok>> {
         if c.is_ascii_whitespace() {
             i += 1;
             continue;
+        }
+        // a BINARY literal, the same scan the select-list parser uses
+        if matches!(c, b'x' | b'X') && b.get(i + 1) == Some(&b'\'') {
+            if let Some(ci) = at_char.get(&i).copied() {
+                let mut p = ci;
+                if let Some(bytes) = take_hex_literal(&chars, &mut p) {
+                    out.push(Tok::FnExpr(RawExpr::Hex(bytes)));
+                    // back to a byte offset
+                    i = chars[..p].iter().map(|ch| ch.len_utf8()).sum();
+                    continue;
+                }
+            }
         }
         match c {
             b'\'' => {
@@ -56130,6 +56561,17 @@ fn parse_unary(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
 
 /// One value position in a predicate: a literal, NULL, or a `?` that
 /// claims the next parameter slot.
+/// A LIKE/STARTING/CONTAINING pattern: [parse_value], plus the one
+/// literal that is not an expression there - `x'…'`, which keeps its
+/// bytes ([Rhs::Oct]) for the left operand's charset to interpret.
+fn parse_pattern(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Rhs> {
+    if let Some(Tok::FnExpr(RawExpr::Hex(b))) = t.get(*pos) {
+        *pos += 1;
+        return Some(Rhs::Oct(b.clone()));
+    }
+    parse_value(t, pos, np)
+}
+
 fn parse_value(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Rhs> {
     let v = match t.get(*pos)? {
         Tok::Int(n) => Rhs::Int(*n),
@@ -56413,6 +56855,7 @@ fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
             // desugars whose leaves mirror `<literal> <op> ?`
             let raw_of = |r: &Rhs| -> Option<RawExpr> {
                 Some(match r {
+                    Rhs::Oct(b) => RawExpr::Hex(b.clone()),
                     Rhs::Int(n) => RawExpr::Int(*n),
                     Rhs::Num(v, s) => RawExpr::Dec(*v, *s),
                     Rhs::Str(s) => RawExpr::Str(s.clone()),
@@ -56768,7 +57211,7 @@ fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
         }
         Tok::Like => {
             *pos += 1;
-            let pattern = parse_value(t, pos, np)?;
+            let pattern = parse_pattern(t, pos, np)?;
             if matches!(pattern, Rhs::Int(_)) {
                 return None; // a numeric LIKE pattern is not a shape we answer
             }
@@ -56852,7 +57295,7 @@ fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
                 return None; // a bare `SIMILAR` is a column, handled elsewhere
             }
             *pos += 2; // past SIMILAR TO
-            let pattern = parse_value(t, pos, np)?;
+            let pattern = parse_pattern(t, pos, np)?;
             if matches!(pattern, Rhs::Int(_)) {
                 return None; // a numeric SIMILAR pattern is not answered
             }
@@ -56878,7 +57321,7 @@ fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
             if matches!(t.get(*pos), Some(Tok::Ident(w2)) if w2.eq_ignore_ascii_case("WITH")) {
                 *pos += 1; // WITH is optional sugar (the PSQL parser agrees)
             }
-            let prefix = parse_value(t, pos, np)?;
+            let prefix = parse_pattern(t, pos, np)?;
             if matches!(prefix, Rhs::Int(_) | Rhs::Num(..)) {
                 // a numeric prefix literal is legal (the engine renders
                 // it to text) but unprobed through every scale shape -
@@ -61824,6 +62267,10 @@ fn typed_term(idx: usize, kind: ColKind, raw: RawKind) -> Option<Term> {
         // the resolvers answer a decided subquery leaf before they get
         // here; reaching this arm at all would mean one slipped past
         RawKind::Const(b) => Term::Const(b),
+        // a BINARY pattern belongs to the expression path, which reads
+        // its bytes against the left operand's charset
+        RawKind::Like(Rhs::Oct(_), ..) | RawKind::Starting(Rhs::Oct(_), _)
+        | RawKind::Cmp(_, Rhs::Oct(_)) | RawKind::Similar(Rhs::Oct(_), ..) => return None,
         // an expression right side is resolve_expr_term's business - a
         // resolver without that path (HAVING, joins) refuses it
         RawKind::CmpExpr(..) => return None,
@@ -62013,6 +62460,30 @@ fn resolve_predicate(
                 });
                 continue;
             }
+            // a BINARY pattern (`LIKE x'…'`) takes the expression path
+            // whatever the column is: only there are its bytes read
+            // against the left operand's charset
+            if matches!(
+                rt.kind,
+                RawKind::Like(Rhs::Oct(_), ..)
+                    | RawKind::Starting(Rhs::Oct(_), _)
+                    | RawKind::Similar(Rhs::Oct(_), ..)
+            ) {
+                terms.push(resolve_expr_term(&rt, columns, descs, params)?);
+                continue;
+            }
+            // an OCTETS column takes the EXPRESSION path for the same
+            // reason a temporal one does: its laws are all there. A
+            // byte string pads with 0x00 rather than the blank, and
+            // its LIKE has no wildcards - neither is expressible in
+            // the literal fast path's trimmed text compare
+            if matches!(d.dtype, dtype::TEXT | dtype::VARYING)
+                && fire_crab_ods::intl::charset_id(d.sub_type)
+                    == fire_crab_ods::intl::CS_OCTETS
+            {
+                terms.push(resolve_expr_term(&rt, columns, descs, params)?);
+                continue;
+            }
             let term = match col_kind(d) {
                 Some(kind) => param_or_typed_term(fid, kind, rt.kind, d, params)?,
                 // scaled NUMERIC/DECIMAL and INT128 columns: the exact
@@ -62145,6 +62616,22 @@ fn resolve_param_lhs(
 /// alignment, pad-insensitive text. A `?` against the expression side
 /// claims its slot with a descriptor SYNTHESIZED from the expression's
 /// own type - what the client builds its encoder from.
+/// LIKE over an OCTETS operand: a literal byte match over the FULL
+/// padded value, both sides read as byte strings ([Expr::OctKey]'s
+/// exact form). See the call site for why the wildcards are dead.
+fn octets_like_term(lhs: Expr, pattern: &str, negated: bool) -> Term {
+    let eq = Cond2::Cmp(
+        Box::new(Expr::OctKey(Box::new(lhs), true)),
+        Cmp::Eq,
+        Box::new(Expr::OctKey(Box::new(Expr::Str(pattern.to_string())), true)),
+    );
+    Term::ExprCond(Box::new(if negated {
+        Cond2::Not(Box::new(eq))
+    } else {
+        eq
+    }))
+}
+
 fn resolve_expr_term(
     rt: &RawTerm,
     columns: &[RelationColumn],
@@ -62173,6 +62660,10 @@ fn resolve_expr_term(
             // literal against an EXPRESSION side refuses (its own slice, as
             // the INT128 expression-compare was after its column compare)
             Rhs::Dbl(_) | Rhs::Param(..) | Rhs::StrKey(_) | Rhs::DecFloat34(_) => return None,
+            // a BINARY literal reaches a comparison as an EXPRESSION
+            // (Tok::FnExpr), never as an Rhs - only the pattern
+            // positions build one, and they resolve it themselves
+            Rhs::Oct(_) => return None,
         })
     };
     let term = match &rt.kind {
@@ -62240,7 +62731,55 @@ fn resolve_expr_term(
         }
         RawKind::IsNull => Term::ExprCond(Box::new(Cond2::IsNull(Box::new(lhs)))),
         RawKind::IsNotNull => Term::ExprCond(Box::new(Cond2::IsNotNull(Box::new(lhs)))),
+        // a BINARY pattern: its bytes ARE the pattern against an
+        // OCTETS side (the arm below reads them as carrier chars), and
+        // an ordinary text pattern against any other side, where the
+        // left operand's charset keeps its wildcards alive
+        RawKind::Like(Rhs::Oct(b), escape, negated) => {
+            // against an OCTETS side the bytes are the pattern as they
+            // stand (the wildcard-free match below); against any other
+            // they are an ordinary text pattern, whose wildcards the
+            // LEFT operand's charset keeps alive
+            let p = fire_crab_ods::intl::carrier_decode(b);
+            if expr_is_octets(&lhs, descs) {
+                return Some(octets_like_term(lhs, &p, *negated));
+            }
+            return resolve_expr_term(
+                &RawTerm { lhs: rt.lhs.clone(), kind: RawKind::Like(Rhs::Str(p), *escape, *negated) },
+                columns,
+                descs,
+                params,
+            );
+        }
+        RawKind::Starting(Rhs::Oct(b), negated) => {
+            let p = fire_crab_ods::intl::carrier_decode(b);
+            return resolve_expr_term(
+                &RawTerm { lhs: rt.lhs.clone(), kind: RawKind::Starting(Rhs::Str(p), *negated) },
+                columns,
+                descs,
+                params,
+            );
+        }
         RawKind::Like(Rhs::Str(p), escape, negated) => {
+            // LIKE over an OCTETS operand has NO WILDCARDS. The
+            // wildcard bytes are `%`/`_` CONVERTED FROM UNICODE into
+            // the LEFT side's charset (Collation.cpp:1025 through
+            // CharSet.h:61), and the binary charset's converter is a
+            // UTF-16 byte dump (intl_builtin.cpp:926), so each comes
+            // out as {0x00,0x25}/{0x00,0x5F} and the matcher reads only
+            // the first byte - a zero, which its `sql_match_any &&`
+            // guard (evl_string.h:352) treats as "no wildcard at all".
+            // Escape dies the same way. What is left is a literal byte
+            // match over the FULL padded value: a CHAR(4) holding
+            // `61620000` matches `x'61620000'` and NOT `x'6162'`.
+            if expr_is_octets(&lhs, descs) {
+                // a TEXT pattern against a binary side is BYTE-COPIED
+                // into it (INTL_convert_bytes, intl.cpp:465: nothing
+                // transliterates to or from binary), so the pattern's
+                // own UTF-8 bytes are what the match sees
+                let p = fire_crab_ods::intl::to_carrier(p);
+                octets_like_term(lhs, &p, *negated)
+            } else
             // a TEXT-typed side with a literal bad-escape pattern takes
             // the lenient-prefix gate exactly like a text column
             // (probed: `UPPER(NAME) LIKE 'zz!a' ESCAPE '!'` answers []
@@ -62261,6 +62800,12 @@ fn resolve_expr_term(
         // the literal STARTING arm carries; the slot claims the
         // synthesized text descriptor.
         RawKind::Like(Rhs::Param(slot, _), escape, negated) => {
+            // a BOUND pattern against an OCTETS side would need the
+            // wildcard-free match above over a value known only at
+            // bind: refused rather than answered with wildcards live
+            if expr_is_octets(&lhs, descs) {
+                return None;
+            }
             // the pattern slot describes as the LHS expression's own result
             // text width (probed): a numeric expression renders to the fixed
             // 30, a text one to its computed width - UPPER(VC10) is 10,
@@ -62290,6 +62835,19 @@ fn resolve_expr_term(
             Term::ExprLikeParam(Box::new(lhs), *slot, *escape, *negated)
         }
         RawKind::Like(..) => return None, // NULL pattern
+        // SIMILAR TO is a DIFFERENT matcher from LIKE and keeps its
+        // wildcards over a binary operand (Re2SimilarMatcher parses its
+        // own grammar in Latin-1, Collation.cpp:127), so a binary
+        // pattern is simply a text one - its bytes are its characters
+        RawKind::Similar(Rhs::Oct(b), escape, negated) => {
+            let p = fire_crab_ods::intl::carrier_decode(b);
+            return resolve_expr_term(
+                &RawTerm { lhs: rt.lhs.clone(), kind: RawKind::Similar(Rhs::Str(p), *escape, *negated) },
+                columns,
+                descs,
+                params,
+            );
+        }
         RawKind::Similar(Rhs::Str(p), escape, negated) => {
             // a TEXT-typed expression against a literal pattern, compiled
             // once (malformed refuses at prepare). A non-text side, or a
@@ -62297,6 +62855,12 @@ fn resolve_expr_term(
             if !matches!(lhs.type_of(descs), Some(ExprType::Text)) {
                 return None;
             }
+            // a text pattern against a binary side is byte-copied into it
+            let p = &if expr_is_octets(&lhs, descs) {
+                fire_crab_ods::intl::to_carrier(p)
+            } else {
+                p.clone()
+            };
             match sim_compile(p, *escape) {
                 Some(re) => Term::ExprSimilar(Box::new(lhs), re, *negated),
                 None => return None,
@@ -62309,7 +62873,14 @@ fn resolve_expr_term(
             if !matches!(lhs.type_of(descs)?, ExprType::Text | ExprType::Int) {
                 return None;
             }
-            Term::ExprStarting(Box::new(lhs), p.clone(), *negated)
+            // a text prefix against a BINARY side is byte-copied into
+            // it, like a LIKE pattern (intl.cpp:465)
+            let p = if expr_is_octets(&lhs, descs) {
+                fire_crab_ods::intl::to_carrier(p)
+            } else {
+                p.clone()
+            };
+            Term::ExprStarting(Box::new(lhs), p, *negated)
         }
         RawKind::Starting(Rhs::Null, _) => Term::Never,
         RawKind::Starting(..) => return None, // non-literal prefix
@@ -62563,6 +63134,18 @@ fn cmp_sides(lhs: Expr, rhs: Expr, descs: &[Descriptor]) -> Option<(Expr, Expr)>
             }
         }
         (ExprType::Text, ExprType::Text) => {
+            // an OCTETS side on EITHER hand takes the whole comparison
+            // binary: 0x00 pads the shorter value and neither side is
+            // transliterated (CVT2_compare, cvt2.cpp:422-439). Both
+            // sides wrap so the ordinary value compare runs over
+            // byte-string KEYS - and this comes FIRST, because a
+            // binary side also bypasses the collation path
+            if expr_is_octets(&lhs, descs) || expr_is_octets(&rhs, descs) {
+                return Some((
+                    Expr::OctKey(Box::new(lhs), false),
+                    Expr::OctKey(Box::new(rhs), false),
+                ));
+            }
             // a comparison against a COLLATED column compares by that
             // collation, and a literal or plain-text side ADOPTS it
             // (the engine's rule); both sides wrap so the ordinary
@@ -62665,6 +63248,8 @@ fn expr_no_raise(e: &Expr, descs: &[Descriptor]) -> bool {
         // an unparsable or ruleless zone raises per row (22009), so this
         // is never raise-free
         Expr::AtTimeZone(..) => false,
+        // a literal never raises
+        Expr::Hex(_) => true,
         // a parameter's value is substituted before eval; the CAST above
         // it may still raise, so it is not raise-free
         Expr::Param(_) => false,
@@ -62694,7 +63279,7 @@ fn expr_no_raise(e: &Expr, descs: &[Descriptor]) -> bool {
         // error-propagating term paths, never admitted where a raise
         // cannot travel
         Expr::TextNum(_, _) | Expr::TextNumKey(_, _) | Expr::TextBool(_, _) => false,
-        Expr::CollKey(a, _) => expr_no_raise(a, descs),
+        Expr::CollKey(a, _) | Expr::OctKey(a, _) => expr_no_raise(a, descs),
         Expr::Neg(x) => expr_no_raise(x, descs),
         // arithmetic can overflow / divide by zero; CAST can fail
         Expr::Bin(..) | Expr::Cast(..) => false,
@@ -62853,6 +63438,10 @@ fn numeric_term(
     Some(match raw {
         RawKind::Const(b) => Term::Const(b),
         RawKind::CmpExpr(..) => return None, // see typed_term
+        // a BINARY pattern against a DECFLOAT column: refused, as
+        // every other text-shaped pattern is here
+        RawKind::Like(Rhs::Oct(_), ..) | RawKind::Starting(Rhs::Oct(_), _)
+        | RawKind::Cmp(_, Rhs::Oct(_)) | RawKind::Similar(Rhs::Oct(_), ..) => return None,
         RawKind::Cmp(op, Rhs::Int(n)) => Term::NumCmp(idx, op, Rhs::Num(n, 0)),
         RawKind::Cmp(op, Rhs::Num(r, s)) => Term::NumCmp(idx, op, Rhs::Num(r, s)),
         // an integer literal too wide for i64: a NUMERIC(38,0)/INT128
@@ -69364,6 +69953,7 @@ mod tests {
             &None,
             &[OrderKey::field(0, false, NullsAt::Default)],
             false,
+            Vec::new(),
         )
         .rows(&db)
         .unwrap();
@@ -69531,10 +70121,14 @@ mod tests {
         );
         // LPAD takes its pad length
         assert_eq!(f(SysFn::Lpad, vec![Expr::Col(1), Expr::Int(9)]), Some((true, 9, TfCs::Ttype(0))));
-        // and REPLACE is deliberately unsized: one probe is not a law
+        // REPLACE grows by how much longer the replacement is than
+        // what it replaces, once per possible occurrence - probed
+        // across all four shapes: VARCHAR(4) 'a'->'zz' is 8,
+        // 'ab'->'xyz' is 6, 'a'->'' is 4, and x'414243' x'42'->x'FF'
+        // is 3 (which also keeps OCTETS)
         assert_eq!(
             f(SysFn::Replace, vec![Expr::Col(1), lit("a"), lit("bb")]),
-            None
+            Some((true, 12, TfCs::Att))
         );
         // CONCATENATION is VARYING at the SUM of its operands
         assert_eq!(
@@ -71805,7 +72399,7 @@ mod tests {
             vec![Value::Int(20)],
             vec![Value::Null],
         ];
-        distinct_rows(&mut rows, false);
+        distinct_rows(&mut rows, false, &[]);
         assert_eq!(
             rows,
             vec![
@@ -71822,7 +72416,7 @@ mod tests {
             vec![Value::Int(2), Value::Int(1)],
             vec![Value::Int(1), Value::Int(5)],
         ];
-        distinct_rows(&mut two, false);
+        distinct_rows(&mut two, false, &[]);
         assert_eq!(
             two,
             vec![
@@ -71845,7 +72439,7 @@ mod tests {
             vec![Value::Int(20)],
             vec![Value::Int(10)],
         ];
-        distinct_rows(&mut rows, true);
+        distinct_rows(&mut rows, true, &[]);
         assert_eq!(
             rows,
             vec![vec![Value::Int(30)], vec![Value::Int(20)], vec![Value::Int(10)]]
