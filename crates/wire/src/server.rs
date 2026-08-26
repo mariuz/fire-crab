@@ -1315,9 +1315,12 @@ fn send_request_batch(
     cursor: &mut usize,
     req_msgno: i32,
     _batch: i32,
+    // the transaction the request runs under - the frame carries it,
+    // and a handle the client does not hold leaves it parsing the
+    // stream as something else
+    tx: i32,
 ) -> std::io::Result<()> {
     let mut w = W::default();
-    let tx = TX_HANDLE;
     if let Some((msgno, msg)) = queue.get(*cursor) {
         *cursor += 1;
         w.int(OP_SEND)
@@ -1465,6 +1468,49 @@ const GDS_NO_RECON: i32 = 335544353;
 const GDS_TRA_STATE: i32 = 335544468;
 /// "no transaction for request" - a statement under a PREPARED transaction
 const GDS_REQ_NO_TRANS: i32 = 335544363;
+
+/// `isc_bad_trans_handle` - "invalid transaction handle (expecting
+/// explicit transaction start)". What a handle that names no live
+/// transaction of this connection answers (remote.h:1576), including
+/// one whose transaction has already been committed or rolled back:
+/// the slot is freed at that moment (server.cpp:3464).
+const GDS_BAD_TRANS_HANDLE: i32 = 335544332;
+
+/// Does this statement text START a transaction? `SET TRANSACTION` is
+/// the one that does (parse.y's TYPE_START_TRANS), and a client that
+/// executes it with no transaction handle is asking for a new one.
+fn starts_transaction(text: &str) -> bool {
+    let mut it = text.trim_start().split_whitespace();
+    matches!(it.next().map(|w| w.to_ascii_uppercase()).as_deref(), Some("SET"))
+        && matches!(
+            it.next().map(|w| w.trim_end_matches(';').to_ascii_uppercase()).as_deref(),
+            Some("TRANSACTION")
+        )
+}
+
+/// Make the transaction an op NAMES the live one, or answer
+/// `isc_bad_trans_handle` and let the caller skip the op. Handle 0 is
+/// the client saying "no transaction" (the engine accepts it only for
+/// SET TRANSACTION and session management, dsql.cpp:165) and is left
+/// alone here - the statement paths refuse what needs one on their own.
+/// Called only AFTER an op's payload has been read: answering early
+/// would desync the stream.
+fn switch_named_tx(
+    database: &mut Option<Database>,
+    handle: i32,
+    s: &mut TcpStream,
+    enc: &mut Option<Rc4>,
+) -> std::io::Result<bool> {
+    if handle == 0 {
+        return Ok(true);
+    }
+    let Some(db) = database.as_mut() else { return Ok(true) };
+    if db.switch_tx(handle).is_err() {
+        respond_error(s, enc, GDS_BAD_TRANS_HANDLE)?;
+        return Ok(false);
+    }
+    Ok(true)
+}
 /// "record from transaction @1 is stuck in limbo" - the reader's law
 const GDS_REC_IN_LIMBO: i32 = 335544459;
 /// "count of column list and variable list do not match" (JRD 349,
@@ -2326,6 +2372,19 @@ static ATTACH_COUNTER: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI
 /// transaction's rtr_id - the OO client reads it as the live
 /// transaction and nulls its ITransaction on a 0).
 const TX_HANDLE: i32 = 2;
+
+/// The first handle a transaction of this connection is given. Kept
+/// clear of the attachment (1), the statement handles (2 and up, one
+/// per op_allocate_statement) and the blob handles (7000 and up) - each
+/// of which climbs by one per object, so a long session really does
+/// reach three digits and a base of 100 would eventually hand the same
+/// number to two kinds of object (review-caught).
+///
+/// It cannot simply be made enormous: the protocol's object field is an
+/// OBJCT - SIXTEEN BITS (protocol.h) - so a handle past 65535 arrives
+/// back truncated and names nothing (measured: every op answered
+/// "invalid transaction handle" with a base of 1_000_000).
+const FIRST_TX_HANDLE: i32 = 100;
 /// the attachment handle this server answers op_attach with, and the one
 /// an `op_event` frame names
 const DB_HANDLE: i32 = 1;
@@ -2466,6 +2525,30 @@ struct Database {
     /// [GenWindow] for why a generator record has to be scoped to a
     /// window and not to the transaction.
     windows: Vec<UndoWindow>,
+    /// EVERY TRANSACTION THIS ATTACHMENT HOLDS OPEN, except the one
+    /// whose state is live in the fields above. A client may open
+    /// several on one attachment - isql itself holds three (its user
+    /// transaction, its DDL/autocommit one, and a frontend one,
+    /// isql.epp:479-480) - and every op that carries a transaction
+    /// handle names WHICH one it means. The op loop switches this
+    /// server to the named transaction before doing anything else
+    /// ([Database::switch_tx]), so the whole body of the server keeps
+    /// reading one transaction's state out of the fields it always
+    /// did; only the switch points know there are others.
+    txns: std::collections::HashMap<i32, TxSlot>,
+    /// which handle the live fields belong to (0 = no transaction)
+    cur_handle: i32,
+    /// the savepoint names standing over the live transaction's
+    /// windows - per TRANSACTION (each has its own savepoint stack),
+    /// which is why it lives here and not beside the connection's
+    /// statement handles
+    savepoints: Vec<String>,
+    /// the live transaction is PREPARED (2PC phase 1): it takes no more
+    /// work, while its siblings are untouched (exe.cpp:986)
+    prepared: bool,
+    /// unused: transaction handles are allocated as the lowest free
+    /// number from [FIRST_TX_HANDLE] ([Database::open_tx])
+    next_tx_handle: i32,
     /// this transaction's SNAPSHOT, captured at op_transaction when the
     /// TPB asks for concurrency (the engine's and isql's default) -
     /// None under read committed, or before a transaction starts. A
@@ -3201,6 +3284,162 @@ impl Database {
     /// reason: another attachment can change it while this one is open.
     fn shutdown_mode(&self) -> u8 {
         self.bytes().page(0).and_then(|p| p.get(25).copied()).unwrap_or(0)
+    }
+
+    /// Lift the live transaction's state out of the fields into a slot.
+    fn take_tx_slot(&mut self) -> TxSlot {
+        TxSlot {
+            tx: self.tx.take(),
+            nested_tx: std::mem::take(&mut self.nested_tx),
+            windows: std::mem::replace(
+                &mut self.windows,
+                vec![UndoWindow::new(WindowKind::Transaction)],
+            ),
+            snapshot: self.snapshot.take(),
+            autonomous_ids: std::mem::take(&mut self.autonomous_ids),
+            lock_owner: self.lock_owner,
+            gen_cache: std::mem::take(&mut self.gen_cache),
+            temp_blobs: std::mem::take(&mut self.temp_blobs),
+            // NOT reset: a temp blob id must be unique across the
+            // whole attachment, because op_put_segment and its friends
+            // carry no transaction handle and index by id alone
+            next_temp_blob: self.next_temp_blob,
+            touched: std::mem::replace(&mut self.touched, false),
+            did_ddl: std::mem::replace(&mut self.did_ddl, false),
+            ddl_deferred: std::mem::take(&mut self.ddl_deferred),
+            counted_tx: std::mem::replace(&mut self.counted_tx, false),
+            wait: self.wait,
+            lock_timeout: self.lock_timeout,
+            consistency: self.consistency,
+            read_only: self.read_only,
+            posted: std::mem::take(&mut self.posted.borrow_mut()),
+            savepoints: std::mem::take(&mut self.savepoints),
+            prepared: std::mem::replace(&mut self.prepared, false),
+        }
+    }
+
+    /// ...and put one back.
+    fn put_tx_slot(&mut self, slot: TxSlot) {
+        self.tx = slot.tx;
+        self.nested_tx = slot.nested_tx;
+        self.windows = slot.windows;
+        self.snapshot = slot.snapshot;
+        self.autonomous_ids = slot.autonomous_ids;
+        self.lock_owner = slot.lock_owner;
+        self.gen_cache = slot.gen_cache;
+        self.temp_blobs = slot.temp_blobs;
+        self.next_temp_blob = slot.next_temp_blob;
+        self.touched = slot.touched;
+        self.did_ddl = slot.did_ddl;
+        self.ddl_deferred = slot.ddl_deferred;
+        self.counted_tx = slot.counted_tx;
+        self.wait = slot.wait;
+        self.lock_timeout = slot.lock_timeout;
+        self.consistency = slot.consistency;
+        self.read_only = slot.read_only;
+        *self.posted.borrow_mut() = slot.posted;
+        self.savepoints = slot.savepoints;
+        self.prepared = slot.prepared;
+    }
+
+    /// A fresh transaction: its handle, with an empty slot behind it.
+    ///
+    /// THE LOWEST FREE NUMBER, not the next one ever used: the client
+    /// keeps its objects in an ARRAY indexed by the handle
+    /// (remote.h's port_objects), so handles must stay small and dense -
+    /// a monotonic counter that climbed away was rejected outright
+    /// (measured: every op answered "invalid transaction handle" once
+    /// the numbers grew). The engine allocates the same way
+    /// (server.cpp make_object: the first free slot).
+    fn open_tx(&mut self) -> i32 {
+        let mut h = FIRST_TX_HANDLE;
+        while h == self.cur_handle || self.txns.contains_key(&h) {
+            h += 1;
+        }
+        // the live fields become the new transaction's; whatever was
+        // live goes to its own slot
+        self.park_current();
+        self.reset_tx_fields();
+        self.cur_handle = h;
+        self.refresh_reader_view();
+        h
+    }
+
+    /// Park the live transaction (if any) in the table, leaving the
+    /// fields to be reset or replaced.
+    fn park_current(&mut self) {
+        if self.cur_handle != 0 {
+            let slot = self.take_tx_slot();
+            let h = self.cur_handle;
+            self.txns.insert(h, slot);
+            self.cur_handle = 0;
+        }
+    }
+
+    /// The fields as a transaction that has done nothing yet - with a
+    /// lock owner of its own, so what it takes is released when IT ends.
+    fn reset_tx_fields(&mut self) {
+        let empty = TxSlot {
+            tx: None,
+            nested_tx: Vec::new(),
+            windows: vec![UndoWindow::new(WindowKind::Transaction)],
+            snapshot: None,
+            autonomous_ids: Vec::new(),
+            lock_owner: self.locks.owner(),
+            gen_cache: Default::default(),
+            temp_blobs: Default::default(),
+            next_temp_blob: self.next_temp_blob,
+            touched: false,
+            did_ddl: false,
+            ddl_deferred: Vec::new(),
+            counted_tx: false,
+            wait: true,
+            lock_timeout: None,
+            consistency: false,
+            read_only: false,
+            posted: Vec::new(),
+            savepoints: Vec::new(),
+            prepared: false,
+        };
+        self.put_tx_slot(empty);
+    }
+
+    /// MAKE THE NAMED TRANSACTION THE LIVE ONE. Every op that carries a
+    /// transaction handle calls this first; the rest of the server then
+    /// reads one transaction's state out of the fields, exactly as it
+    /// did when there was only ever one. A handle that names nothing is
+    /// the engine's `isc_bad_trans_handle` (remote.h:1576).
+    fn switch_tx(&mut self, handle: i32) -> Result<(), ()> {
+        if handle == self.cur_handle {
+            return Ok(());
+        }
+        if !self.txns.contains_key(&handle) {
+            return Err(());
+        }
+        self.park_current();
+        let slot = self.txns.remove(&handle).expect("checked above");
+        self.put_tx_slot(slot);
+        self.cur_handle = handle;
+        // the per-request catalog view was installed from whichever
+        // transaction was live when the op arrived - this op names
+        // another, so it is re-read from THIS one
+        self.refresh_reader_view();
+        Ok(())
+    }
+
+    /// The live transaction is over: its slot goes, and the fields are
+    /// left as a transaction that never started (the next op that names
+    /// a handle switches to it; one that names none works on this).
+    fn close_tx(&mut self) {
+        self.txns.remove(&self.cur_handle);
+        self.cur_handle = 0;
+        self.reset_tx_fields();
+        self.refresh_reader_view();
+    }
+
+    /// Is this handle one of ours - live or parked?
+    fn knows_tx(&self, handle: i32) -> bool {
+        handle == self.cur_handle || self.txns.contains_key(&handle)
     }
 
     /// This attachment's transaction became real - count it where
@@ -4214,6 +4453,11 @@ fn load_database(path: &str) -> Option<Database> {
         ods_major: h.ods_major(),
         ods_minor: h.ods_minor,
         windows: vec![UndoWindow::new(WindowKind::Transaction)],
+        txns: std::collections::HashMap::new(),
+        cur_handle: 0,
+        savepoints: Vec::new(),
+        prepared: false,
+        next_tx_handle: FIRST_TX_HANDLE,
         snapshot: None,
         autonomous_ids: Vec::new(),
         wait: true,
@@ -8073,6 +8317,49 @@ AlterDomainRename {
     /// than fall through to the unknown-statement path (which the
     /// execute-immediate route acknowledges as success)
     SetTimeZoneRefused(EvalErr),
+}
+
+/// One SUSPENDED transaction's whole state - everything in [Database]
+/// that belongs to a transaction rather than to the attachment. The
+/// live transaction keeps these in `Database`'s own fields; the others
+/// wait here until an op names them.
+///
+/// What is deliberately NOT here (it belongs to the ATTACHMENT): the
+/// shared image and its write token, the metadata and statement
+/// caches, the lock owner, the event registration, the file's own
+/// facts. What is per-transaction and here: its id and nested ids, its
+/// undo windows, its snapshot, its generator cache, its temp blobs, the
+/// DDL work it deferred to its own commit, its TPB settings, and the
+/// savepoint names that stand over its windows.
+struct TxSlot {
+    tx: Option<u32>,
+    nested_tx: Vec<u32>,
+    windows: Vec<UndoWindow>,
+    snapshot: Option<fire_crab_ods::tra::Snapshot>,
+    autonomous_ids: Vec<u32>,
+    /// this transaction's OWN lock owner: its transaction lock and its
+    /// relation reservations are released when IT ends, and a sibling's
+    /// are left alone (one owner per attachment let a commit purge the
+    /// locks of a transaction that was still running - and a sweep then
+    /// treated its rows as abandoned)
+    lock_owner: fire_crab_lck::OwnerId,
+    gen_cache: std::collections::HashMap<String, i64>,
+    temp_blobs: std::collections::HashMap<u32, TempBlob>,
+    next_temp_blob: u32,
+    touched: bool,
+    did_ddl: bool,
+    ddl_deferred: Vec<fire_crab_ods::DdlDeferred>,
+    counted_tx: bool,
+    wait: bool,
+    lock_timeout: Option<u32>,
+    consistency: bool,
+    read_only: bool,
+    posted: Vec<String>,
+    /// the savepoint names standing over this transaction's windows
+    savepoints: Vec<String>,
+    /// this transaction is PREPARED (2PC phase 1): it takes no more
+    /// work, but its siblings are untouched (exe.cpp:986)
+    prepared: bool,
 }
 
 /// One JOIN in a FROM chain: the side being added, and the ON condition
@@ -42795,7 +43082,13 @@ fn inline_blob_packet(w: &mut W, db: &Database, rel: u16, num: u64, max: u32) {
     }
     // the SAME 8 bytes the row encoder ships: the client decodes both
     // with xdr_quad, and matches the cached copy by that value
-    w.int(OP_INLINE_BLOB).int(TX_HANDLE).raw(&quad_wire(&id)).bytes(&info).bytes(&data);
+    // THE TRANSACTION THIS BLOB BELONGS TO, not a fixed number: the
+    // client caches an inline blob keyed by (transaction, quad) and
+    // reads the next packet by that key, so a handle it does not hold
+    // leaves it parsing the stream as something else - under wire
+    // encryption an unrecoverable desync, which is what sank the first
+    // attempt at real handles.
+    w.int(OP_INLINE_BLOB).int(db.cur_handle).raw(&quad_wire(&id)).bytes(&info).bytes(&data);
 }
 
 /// The message itself - null bitmap then values - with no framing op in
@@ -63855,11 +64148,13 @@ fn after_auth(
     // the window's ids and
     // KEEPS the mark; RELEASE forgets the mark but keeps the work. Both
     // discard the marks made AFTER the named one.
-    let mut savepoints: Vec<String> = Vec::new();
+    // savepoints and the 2PC prepared flag live on the TRANSACTION now
+    // (Database::savepoints / ::prepared) - each transaction of this
+    // attachment has its own stack and its own limbo state
     // TWO-PHASE COMMIT state: this connection's transaction has been
     // PREPARED (limbo on disk; only commit/rollback may follow), or
     // this connection RECONNECTED somebody else's limbo id to resolve
-    let mut prepared = false;
+
     let mut reconnected: Option<u64> = None;
     // THE AUXILIARY CONNECTION, in the two halves it arrives in: the
     // listener `op_connect_request` opens and hands the client a port
@@ -64041,6 +64336,11 @@ fn after_auth(
                     respond_error(&mut s, &mut enc, 335545252)?; // isc_tra_snapshot_does_not_exist
                     continue;
                 }
+                // THE NEW TRANSACTION FIRST: its TPB settings and its
+                // snapshot belong to IT, so the handle is taken before
+                // any of them are written (taking it after put this
+                // TPB on the transaction that happened to be live)
+                let new_handle = database.as_mut().map(|d| d.open_tx());
                 if let Some(db) = database.as_mut() {
                     db.wait = !nowait;
                     db.lock_timeout = lock_timeout;
@@ -64068,13 +64368,20 @@ fn after_auth(
                     respond_kicked(&mut s, &mut enc)?;
                     continue;
                 }
-                respond(&mut s, &mut enc, TX_HANDLE)?; // transaction handle (distinct from attach 1)
+                // A HANDLE OF ITS OWN. The client may hold several
+                // transactions on this attachment (isql holds three),
+                // and every later op names the one it means.
+                let h = new_handle.unwrap_or(TX_HANDLE);
+                if std::env::var("FC_SRV_TRACE").is_ok() {
+                    eprintln!("[srv] op_transaction -> handle {}", h);
+                }
+                respond(&mut s, &mut enc, h)?;
             }
             x if x == OP_EXEC_IMMEDIATE => {
                 // prepare-and-execute in one round-trip, no cursor - what
                 // isql uses for SET and DDL/DML statements it does not
                 // fetch from. Shares op_prepare's wire layout (no message).
-                read_int(&mut s, &mut dec)?; // tr
+                let op_tr = read_int(&mut s, &mut dec)?;
                 read_int(&mut s, &mut dec)?; // db handle
                 read_int(&mut s, &mut dec)?; // dialect
                 let sql = read_wire_bytes(&mut s, &mut dec)?;
@@ -64092,7 +64399,22 @@ fn after_auth(
                 // a PREPARED transaction takes no more statements - only
                 // its commit or rollback (measured: "no transaction for
                 // request", and the limbo entry survives the refusal)
-                if prepared {
+                // THE STATEMENT RUNS UNDER THE TRANSACTION IT NAMES -
+                // every execute rebinds (dsql.cpp:193), which is how a
+                // client prepares on one and executes on another
+                if !switch_named_tx(&mut database, op_tr, &mut s, &mut enc)? {
+                    continue;
+                }
+                // ...and a statement may START one: `SET TRANSACTION`
+                // with handle 0 is how isql opens its user transaction
+                // (isql.epp:754), and the answer carries the new handle
+                // (server.cpp:3594)
+                let started_tx = if op_tr == 0 && starts_transaction(&text) {
+                    database.as_mut().map(|d| d.open_tx())
+                } else {
+                    None
+                };
+                if database.as_ref().is_some_and(|d| d.prepared) {
                     respond_error(&mut s, &mut enc, GDS_REQ_NO_TRANS)?;
                     continue;
                 }
@@ -64102,6 +64424,13 @@ fn after_auth(
                     respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
                     continue;
                 }
+                // WHAT THE ANSWER'S OBJECT FIELD CARRIES: the handle
+                // the transaction has after this statement - the new one
+                // when the statement started it, otherwise the one the
+                // client named (the OO client takes this field as its
+                // live transaction and drops the object on a 0,
+                // client/interface.cpp:3802)
+                let resp_tx = started_tx.unwrap_or(op_tr);
                 let (ddl_kw, dml_kw) = immediate_verb(&text);
                 let planned = plan_immediate(&text, &database);
                 match planned {
@@ -64111,7 +64440,7 @@ fn after_auth(
                         match execute_dml(&p, &mut database, &[], &SessionCtx { user, attach_id }) {
                             Ok(counts) => {
                                 last_dml = counts;
-                                respond(&mut s, &mut enc, TX_HANDLE)?;
+                                respond(&mut s, &mut enc, resp_tx)?;
                             }
                             Err(ExecErr::Eval(ev)) => {
                                 respond_eval_error(&mut s, &mut enc, &ev)?
@@ -64136,7 +64465,7 @@ fn after_auth(
                     None => {
                         // SET / other non-row statements: acknowledge so the
                         // client (isql) continues rather than desyncing
-                        respond(&mut s, &mut enc, TX_HANDLE)?;
+                        respond(&mut s, &mut enc, resp_tx)?;
                     }
                 }
             }
@@ -64166,7 +64495,7 @@ fn after_auth(
                 if best >= 20 {
                     read_int(&mut s, &mut dec)?; // p_sqlst_inline_blob_size
                 }
-                read_int(&mut s, &mut dec)?; // tr
+                let op_tr = read_int(&mut s, &mut dec)?;
                 read_int(&mut s, &mut dec)?; // stmt handle
                 read_int(&mut s, &mut dec)?; // dialect
                 let sql = read_wire_bytes(&mut s, &mut dec)?;
@@ -64184,7 +64513,13 @@ fn after_auth(
                     continue;
                 }
                 // a PREPARED transaction takes no more statements
-                if prepared {
+                // THE STATEMENT RUNS UNDER THE TRANSACTION IT NAMES -
+                // every execute rebinds (dsql.cpp:193), which is how a
+                // client prepares on one and executes on another
+                if !switch_named_tx(&mut database, op_tr, &mut s, &mut enc)? {
+                    continue;
+                }
+                if database.as_ref().is_some_and(|d| d.prepared) {
                     respond_error(&mut s, &mut enc, GDS_REQ_NO_TRANS)?;
                     continue;
                 }
@@ -64242,12 +64577,25 @@ fn after_auth(
             x if x == OP_ALLOCATE_STATEMENT => {
                 read_int(&mut s, &mut dec)?; // db handle
                 // a FRESH handle per allocation (3, 4, 5, ...) - one
-                // handle for every statement the client keeps open
-                next_stmt_handle += 1;
+                // handle for every statement the client keeps open,
+                // STEPPING OVER any number a live transaction holds:
+                // handles name one kind of object each, and this
+                // counter climbs with every statement of the session
+                loop {
+                    next_stmt_handle += 1;
+                    if !database.as_ref().is_some_and(|d| d.knows_tx(next_stmt_handle)) {
+                        break;
+                    }
+                }
                 respond(&mut s, &mut enc, next_stmt_handle)?;
             }
             x if x == OP_PREPARE_STATEMENT => {
-                read_int(&mut s, &mut dec)?; // tr
+                // the PREPARE transaction is only the one whose metadata
+                // the engine looks through (isql prepares on its DDL
+                // transaction and executes on the user's, isql.epp:8425);
+                // the statement is rebound at execute, so nothing here
+                // switches
+                let _prep_tr = read_int(&mut s, &mut dec)?;
                 let h = read_int(&mut s, &mut dec)?; // stmt
                 use_stmt!(h);
                 read_int(&mut s, &mut dec)?; // dialect
@@ -64552,7 +64900,7 @@ fn after_auth(
                 use_stmt!(h);
                 cursors.remove(&h); // a fresh execute opens a fresh cursor
                 scroll.remove(&h);
-                read_int(&mut s, &mut dec)?; // tr
+                let op_tr = read_int(&mut s, &mut dec)?;
                 let in_blr = read_wire_bytes(&mut s, &mut dec)?; // input blr
                 read_int(&mut s, &mut dec)?; // msg number
                 let messages = read_int(&mut s, &mut dec)?; // message count
@@ -64612,7 +64960,21 @@ fn after_auth(
                     continue;
                 }
                 // a PREPARED transaction takes no more statements
-                if prepared {
+                // THE STATEMENT RUNS UNDER THE TRANSACTION IT NAMES -
+                // every execute rebinds (dsql.cpp:193), which is how a
+                // client prepares on one and executes on another
+                if !switch_named_tx(&mut database, op_tr, &mut s, &mut enc)? {
+                    continue;
+                }
+                // what the answer's object field carries: the
+                // transaction the client named - the OO client reads it
+                // back as its live transaction (client/interface.cpp:3802)
+                let resp_tx = if op_tr != 0 {
+                    op_tr
+                } else {
+                    database.as_ref().map_or(0, |d| d.cur_handle)
+                };
+                if database.as_ref().is_some_and(|d| d.prepared) {
                     respond_error(&mut s, &mut enc, GDS_REQ_NO_TRANS)?;
                     continue;
                 }
@@ -64695,7 +65057,7 @@ fn after_auth(
                     // materialises the query's rows and re-enters per
                     // row, so bare and RETURNING forms share one path.
                     if let Plan::Savepoint { kind, name } = &*plan {
-                        let pos = savepoints.iter().position(|n| n.eq_ignore_ascii_case(name));
+                        let pos = database.as_ref().map_or(None, |d| d.savepoints.iter().position(|n| n.eq_ignore_ascii_case(name)));
                         if std::env::var("FC_SRV_TRACE").is_ok() {
                             eprintln!("[srv] savepoint op on {:?}, known={:?}", name, pos);
                         }
@@ -64711,19 +65073,19 @@ fn after_auth(
                                     // transaction id and its pending
                                     // undo records fold into the
                                     // enclosing window
-                                    savepoints.remove(i);
+                                    if let Some(d) = database.as_mut() { d.savepoints.remove(i); }
                                     undo_window_collapse(&mut database, i + 1);
                                 }
                                 // A MARK IS A TRANSACTION: the rows
                                 // written after it carry an id of their
                                 // own and ROLLBACK TO kills it
-                                savepoints.push(name.clone());
+                                if let Some(d) = database.as_mut() { d.savepoints.push(name.clone()); }
                                 undo_window_push(&mut database, WindowKind::Nested);
                                 true
                             }
                             SavepointOp::RollbackTo => match pos {
                                 Some(i) => {
-                                    savepoints.truncate(i + 1);
+                                    if let Some(d) = database.as_mut() { d.savepoints.truncate(i + 1); }
                                     undo_window(&mut database, i + 1);
                                     // ROLLBACK TO KEEPS THE MARK, so the
                                     // window it names reopens empty: a
@@ -64736,7 +65098,7 @@ fn after_auth(
                             },
                             SavepointOp::Release => match pos {
                                 Some(i) => {
-                                    savepoints.truncate(i);
+                                    if let Some(d) = database.as_mut() { d.savepoints.truncate(i); }
                                     undo_window_unwind(&mut database, i + 1, false);
                                     true
                                 }
@@ -64745,7 +65107,7 @@ fn after_auth(
                         };
                         last_dml = (0, 0, 0);
                         if ok {
-                            respond(&mut s, &mut enc, TX_HANDLE)?;
+                            respond(&mut s, &mut enc, resp_tx)?;
                         } else if matches!(kind, SavepointOp::RollbackTo | SavepointOp::Release) {
                             // isc_invalid_savepoint (jrd.h 500, SQLSTATE 3B000):
                             // "Unable to find savepoint with name @1 in
@@ -64760,7 +65122,7 @@ fn after_auth(
                         }
                     } else if let Plan::TxControl { rollback, retain } = &*plan {
                         // ending the transaction discards every mark
-                        savepoints.clear();
+                        if let Some(d) = database.as_mut() { d.savepoints.clear(); }
                         let kept = if *retain { Some(retain_begin(&database)) } else { None };
                         let outcome = if *rollback {
                             let (outcome, undone) = rollback_now(&database);
@@ -64789,7 +65151,7 @@ fn after_auth(
                             retain_end(&mut database, kept, matches!(outcome, TxEnd::Commit));
                         }
                         last_dml = (0, 0, 0);
-                        respond(&mut s, &mut enc, TX_HANDLE)?;
+                        respond(&mut s, &mut enc, resp_tx)?;
                     } else if let Plan::Returning { inner, cols, fields } = &*plan {
                         // the DML runs HERE, like every other write, and
                         // the rows it touched become the cursor the client
@@ -64828,7 +65190,7 @@ fn after_auth(
                                 // finds the cursor empty rather than
                                 // running the write again
                                 plan = std::rc::Rc::new(Plan::Rows { cols, rows });
-                                respond(&mut s, &mut enc, TX_HANDLE)?;
+                                respond(&mut s, &mut enc, resp_tx)?;
                             }
                             Err(e) => {
                                 last_dml = (0, 0, 0);
@@ -64862,7 +65224,7 @@ fn after_auth(
                                     counts.0, counts.1, counts.2
                                 );
                             }
-                            respond(&mut s, &mut enc, TX_HANDLE)?;
+                            respond(&mut s, &mut enc, resp_tx)?;
                         }
                         Err(e) => {
                             last_dml = (0, 0, 0);
@@ -64933,7 +65295,7 @@ fn after_auth(
                                 skip,
                                 take,
                             });
-                            respond(&mut s, &mut enc, TX_HANDLE)?;
+                            respond(&mut s, &mut enc, resp_tx)?;
                         }
                         Err(e) => {
                             if std::env::var("FC_SRV_TRACE").is_ok() {
@@ -64976,12 +65338,12 @@ fn after_auth(
                     match run_body_source(&mut database, ANONYMOUS_BLOCK, &meta, &[], &ctx) {
                         Ok((_, suspended)) => {
                             plan = std::rc::Rc::new(Plan::ProcRows { cols: bcols, rows: suspended });
-                            respond(&mut s, &mut enc, TX_HANDLE)?;
+                            respond(&mut s, &mut enc, resp_tx)?;
                         }
                         Err(e) => match e.status {
                             Some(ev) => {
                                 plan = std::rc::Rc::new(Plan::RefusedEval(ev));
-                                respond(&mut s, &mut enc, TX_HANDLE)?;
+                                respond(&mut s, &mut enc, resp_tx)?;
                             }
                             None => respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?,
                         },
@@ -65015,7 +65377,7 @@ fn after_auth(
                                 })
                                 .collect();
                             plan = std::rc::Rc::new(Plan::ProcRows { cols: pcols, rows });
-                            respond(&mut s, &mut enc, TX_HANDLE)?;
+                            respond(&mut s, &mut enc, resp_tx)?;
                             continue;
                         }
                         BlrProcOutcome::Runtime(e) => {
@@ -65026,7 +65388,7 @@ fn after_auth(
                                 &mut database, &pname, &pargs, &ctx, e,
                             );
                             plan = std::rc::Rc::new(Plan::RefusedEval(e));
-                            respond(&mut s, &mut enc, TX_HANDLE)?;
+                            respond(&mut s, &mut enc, resp_tx)?;
                             continue;
                         }
                         BlrProcOutcome::Outside => {}
@@ -65045,7 +65407,7 @@ fn after_auth(
                                 })
                                 .collect();
                             plan = std::rc::Rc::new(Plan::ProcRows { cols: pcols, rows });
-                            respond(&mut s, &mut enc, TX_HANDLE)?;
+                            respond(&mut s, &mut enc, resp_tx)?;
                         }
                         Err(e) => {
                             if std::env::var("FC_SRV_TRACE").is_ok() {
@@ -65061,7 +65423,7 @@ fn after_auth(
                                 Some(ev) => {
                                     plan =
                                         std::rc::Rc::new(Plan::RefusedEval(ev.clone()));
-                                    respond(&mut s, &mut enc, TX_HANDLE)?;
+                                    respond(&mut s, &mut enc, resp_tx)?;
                                 }
                                 None => respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?,
                             }
@@ -65078,7 +65440,7 @@ fn after_auth(
                     };
                     let ctx = SessionCtx { user, attach_id };
                     match run_execute_block(&mut database, &source, body_at, &ctx) {
-                        Ok(()) => respond(&mut s, &mut enc, TX_HANDLE)?,
+                        Ok(()) => respond(&mut s, &mut enc, resp_tx)?,
                         Err(e) => {
                             if std::env::var("FC_SRV_TRACE").is_ok() {
                                 eprintln!("[srv] execute block failed: {}", e);
@@ -65109,7 +65471,7 @@ fn after_auth(
                             let values =
                                 rows.into_iter().next().unwrap_or(finals);
                             plan = std::rc::Rc::new(Plan::ProcCall { cols: pcols, values });
-                            respond(&mut s, &mut enc, TX_HANDLE)?;
+                            respond(&mut s, &mut enc, resp_tx)?;
                             continue;
                         }
                         BlrProcOutcome::Runtime(e) => {
@@ -65124,7 +65486,7 @@ fn after_auth(
                     match run_procedure(&mut database, &pname, &pargs, &ctx) {
                         Ok((values, _rows)) => {
                             plan = std::rc::Rc::new(Plan::ProcCall { cols: pcols, values });
-                            respond(&mut s, &mut enc, TX_HANDLE)?;
+                            respond(&mut s, &mut enc, resp_tx)?;
                         }
                         Err(e) => {
                             if std::env::var("FC_SRV_TRACE").is_ok() {
@@ -65150,7 +65512,7 @@ fn after_auth(
                         Ok(new_val) => {
                             let n = if step.is_none() { "NEXT_VALUE" } else { "GEN_ID" };
                             plan = std::rc::Rc::new(Plan::Scalar(ScalarVal::Fixed(Some(new_val)), n.to_string(), None, ScalarTy::int64()));
-                            respond(&mut s, &mut enc, TX_HANDLE)?;
+                            respond(&mut s, &mut enc, resp_tx)?;
                         }
                         Err(e) => {
                             if std::env::var("FC_SRV_TRACE").is_ok() {
@@ -65193,7 +65555,7 @@ fn after_auth(
                         ExecErr::Eval(ev) => respond_eval_error(&mut s, &mut enc, &ev)?,
                     }
                 } else {
-                    respond(&mut s, &mut enc, TX_HANDLE)?;
+                    respond(&mut s, &mut enc, resp_tx)?;
                 }
             }
             x if x == OP_INFO_SQL => {
@@ -65400,7 +65762,13 @@ fn after_auth(
             }
             x if x == OP_BATCH_EXEC => {
                 let h = read_int(&mut s, &mut dec)?;
-                read_int(&mut s, &mut dec)?; // transaction handle
+                let op_tr = read_int(&mut s, &mut dec)?;
+                // this op acts on the transaction it NAMES: its temp
+                // blobs, its own info, its request - none of which
+                // belong to whichever transaction happened to be live
+                if !switch_named_tx(&mut database, op_tr, &mut s, &mut enc)? {
+                    continue;
+                }
                 use_stmt!(h);
                 let Some(b) = batches.get_mut(&h) else {
                     respond_error(&mut s, &mut enc, GDS_BAD_BATCH_HANDLE)?;
@@ -66194,12 +66562,18 @@ fn after_auth(
                 respond(&mut s, &mut enc, 0)?;
             }
             x if x == OP_PREPARE_TX || x == OP_PREPARE2 => {
-                read_int(&mut s, &mut dec)?; // tr
+                let op_tr = read_int(&mut s, &mut dec)?;
                 let msg = if x == OP_PREPARE2 {
                     read_wire_bytes(&mut s, &mut dec)?
                 } else {
                     Vec::new()
                 };
+                // phase one names ITS transaction: the limbo bit belongs
+                // to that one alone, and its siblings go on working
+                // (server.cpp:4927 sets rtr_limbo on the named Rtr)
+                if !switch_named_tx(&mut database, op_tr, &mut s, &mut enc)? {
+                    continue;
+                }
                 // A DDL transaction PREPARES (the engine runs its deferred
                 // work at TRA_prepare, tra.cpp:1085, and limbo holds the
                 // catalog rows like any others) - except one with a DROP
@@ -66237,7 +66611,10 @@ fn after_auth(
                                 msg.len()
                             );
                         }
-                        prepared = true;
+                        if let Some(d) = database.as_mut() { d.prepared = true; }
+                        // op_prepare NEVER changes a handle: the
+                        // transaction stays live, in limbo
+                        // (server.cpp:4930 answers 0)
                         respond(&mut s, &mut enc, 0)?;
                     }
                     Some(Err(e)) => {
@@ -66284,7 +66661,7 @@ fn after_auth(
                 respond(&mut s, &mut enc, 1)?; // the reconnected handle
             }
             x if x == OP_COMMIT || x == OP_ROLLBACK || x == OP_COMMIT_RETAINING || x == OP_ROLLBACK_RETAINING => {
-                read_int(&mut s, &mut dec)?; // tr
+                let tr = read_int(&mut s, &mut dec)?;
                 let retain = x == OP_COMMIT_RETAINING || x == OP_ROLLBACK_RETAINING;
                 let rollback = x == OP_ROLLBACK || x == OP_ROLLBACK_RETAINING;
                 if !retain {
@@ -66309,12 +66686,27 @@ fn after_auth(
                     }
                     continue;
                 }
-                prepared = false;
+                // THE HANDLE NAMES WHICH ONE ENDS. A handle this
+                // connection does not hold - one already committed or
+                // rolled back, whose slot went with it - is the
+                // engine's isc_bad_trans_handle (server.cpp:3464 frees
+                // the slot, remote.h:1576 refuses the next use).
+                if let Some(d) = database.as_mut() {
+                    if tr != 0 && !d.knows_tx(tr) {
+                        respond_error(&mut s, &mut enc, GDS_BAD_TRANS_HANDLE)?;
+                        continue;
+                    }
+                    if tr != 0 && d.switch_tx(tr).is_err() {
+                        respond_error(&mut s, &mut enc, GDS_BAD_TRANS_HANDLE)?;
+                        continue;
+                    }
+                }
+                if let Some(d) = database.as_mut() { d.prepared = false; }
                 // ending the transaction discards every mark, the same
                 // way the `COMMIT`/`ROLLBACK` statements do - and the
                 // generator windows are stacked one per mark, so the two
                 // lists have to end together
-                savepoints.clear();
+                if let Some(d) = database.as_mut() { d.savepoints.clear(); }
                 let kept = if retain { Some(retain_begin(&database)) } else { None };
                 let outcome = if rollback {
                     let (outcome, undone) = rollback_now(&database);
@@ -66335,6 +66727,16 @@ fn after_auth(
                 if let Some(kept) = kept {
                     retain_end(&mut database, kept, matches!(outcome, TxEnd::Commit));
                 }
+                // A RETAINING form keeps its handle - the transaction
+                // goes on with the same one (server.cpp:3466 releases
+                // the slot only for op_commit / op_rollback). A plain
+                // commit or rollback FREES it, and the next use of that
+                // number is isc_bad_trans_handle.
+                if !retain {
+                    if let Some(d) = database.as_mut() {
+                        d.close_tx();
+                    }
+                }
                 respond(&mut s, &mut enc, 0)?;
             }
             x if x == OP_CANCEL => {
@@ -66350,7 +66752,13 @@ fn after_auth(
                 // p_blob: [bpb (blob2 only)], transaction, a zero quad
                 // (protocol.cpp:465 - create carries the id field too)
                 let bpb = if x == OP_CREATE_BLOB2 { read_wire_bytes(&mut s, &mut dec)? } else { Vec::new() };
-                read_int(&mut s, &mut dec)?; // transaction handle
+                let op_tr = read_int(&mut s, &mut dec)?;
+                // this op acts on the transaction it NAMES: its temp
+                // blobs, its own info, its request - none of which
+                // belong to whichever transaction happened to be live
+                if !switch_named_tx(&mut database, op_tr, &mut s, &mut enc)? {
+                    continue;
+                }
                 read_n(&mut s, &mut dec, 8)?; // the quad the client sends (zero)
                 // isc_bpb_type (1) = 1 is a STREAM blob (blb.cpp:331); the
                 // rest of the bpb (source/target type, charsets) is not read
@@ -66431,7 +66839,13 @@ fn after_auth(
                 } else {
                     Vec::new()
                 };
-                read_int(&mut s, &mut dec)?; // transaction handle
+                let op_tr = read_int(&mut s, &mut dec)?;
+                // this op acts on the transaction it NAMES: its temp
+                // blobs, its own info, its request - none of which
+                // belong to whichever transaction happened to be live
+                if !switch_named_tx(&mut database, op_tr, &mut s, &mut enc)? {
+                    continue;
+                }
                 let id = quad_wire(&read_n(&mut s, &mut dec, 8)?).to_vec();
                 let (rel, num) = decode_blob_id(&id);
                 // a bpb naming a SOURCE / TARGET sub_type asks for a
@@ -66535,7 +66949,13 @@ fn after_auth(
                 // the parameters (xdr_longs: a counted byte string of
                 // longs), then the slice itself (length, and for a put the
                 // elements xdr'd by type - empty for a get)
-                read_int(&mut s, &mut dec)?; // transaction
+                let op_tr = read_int(&mut s, &mut dec)?;
+                // this op acts on the transaction it NAMES: its temp
+                // blobs, its own info, its request - none of which
+                // belong to whichever transaction happened to be live
+                if !switch_named_tx(&mut database, op_tr, &mut s, &mut enc)? {
+                    continue;
+                }
                 let id = quad_wire(&read_n(&mut s, &mut dec, 8)?).to_vec();
                 let slice_len = read_int(&mut s, &mut dec)?.max(0) as usize;
                 let sdl_bytes = read_wire_bytes(&mut s, &mut dec)?;
@@ -66825,10 +67245,16 @@ fn after_auth(
                 // isc_info_truncated. The arm exists so an info request
                 // never ends the connection - libfbclient SEGFAULTS on
                 // that.
-                read_int(&mut s, &mut dec)?; // tr handle
+                let op_tr = read_int(&mut s, &mut dec)?;
                 read_int(&mut s, &mut dec)?; // incarnation
                 let items = read_wire_bytes(&mut s, &mut dec)?;
                 let buf_len = read_int(&mut s, &mut dec)?.max(0) as usize;
+                // this op acts on the transaction it NAMES: its temp
+                // blobs, its own info, its request - none of which
+                // belong to whichever transaction happened to be live
+                if !switch_named_tx(&mut database, op_tr, &mut s, &mut enc)? {
+                    continue;
+                }
                 if std::env::var("FC_SRV_TRACE").is_ok() {
                     eprintln!("[srv] op_info_transaction items: {:?}", items);
                 }
@@ -66937,7 +67363,7 @@ fn after_auth(
                 // op_transact_response with one output message (the first
                 // message 1 the program sent), or none.
                 read_int(&mut s, &mut dec)?; // db handle
-                read_int(&mut s, &mut dec)?; // transaction
+                let op_tr = read_int(&mut s, &mut dec)?;
                 let blr = read_wire_bytes(&mut s, &mut dec)?;
                 // THE BLR TRAVELS TWICE: protocol.cpp's op_transact case
                 // runs xdr_trrq_blr (which xdr's the cstring to parse the
@@ -66946,6 +67372,12 @@ fn after_auth(
                 // has shipped since; the second copy is read and dropped
                 read_wire_bytes(&mut s, &mut dec)?;
                 let messages = read_int(&mut s, &mut dec)?;
+                // this op acts on the transaction it NAMES: its temp
+                // blobs, its own info, its request - none of which
+                // belong to whichever transaction happened to be live
+                if !switch_named_tx(&mut database, op_tr, &mut s, &mut enc)? {
+                    continue;
+                }
                 let req = parse_blr_request(&blr);
                 let input = if messages > 0 {
                     let fields = req.as_ref().and_then(|r| r.msgs.first().cloned()).unwrap_or_default();
@@ -67014,9 +67446,15 @@ fn after_auth(
                 // when op_receive arrives.
                 let handle = read_int(&mut s, &mut dec)?; // request handle
                 read_int(&mut s, &mut dec)?; // incarnation
-                read_int(&mut s, &mut dec)?; // transaction
+                let op_tr = read_int(&mut s, &mut dec)?;
                 read_int(&mut s, &mut dec)?; // message number
                 read_int(&mut s, &mut dec)?; // message count
+                // this op acts on the transaction it NAMES: its temp
+                // blobs, its own info, its request - none of which
+                // belong to whichever transaction happened to be live
+                if !switch_named_tx(&mut database, op_tr, &mut s, &mut enc)? {
+                    continue;
+                }
                 let fields = blr_slots
                     .get(&handle)
                     .and_then(|slot| slot.req.msgs.first().cloned())
@@ -67034,9 +67472,15 @@ fn after_auth(
             x if x == OP_START || x == OP_START_AND_RECEIVE => {
                 let handle = read_int(&mut s, &mut dec)?; // request handle
                 read_int(&mut s, &mut dec)?; // incarnation
-                read_int(&mut s, &mut dec)?; // transaction
+                let op_tr = read_int(&mut s, &mut dec)?;
                 read_int(&mut s, &mut dec)?; // message number
                 read_int(&mut s, &mut dec)?; // message count
+                // this op acts on the transaction it NAMES: its temp
+                // blobs, its own info, its request - none of which
+                // belong to whichever transaction happened to be live
+                if !switch_named_tx(&mut database, op_tr, &mut s, &mut enc)? {
+                    continue;
+                }
                 match (blr_slots.get_mut(&handle), &database) {
                     (Some(slot), Some(db)) => {
                         slot.queue = exec_blr_request(&slot.req, &[], db);
@@ -67049,16 +67493,19 @@ fn after_auth(
             x if x == OP_RECEIVE => {
                 let handle = read_int(&mut s, &mut dec)?; // request handle
                 read_int(&mut s, &mut dec)?; // incarnation
-                read_int(&mut s, &mut dec)?; // transaction
+                let op_tr = read_int(&mut s, &mut dec)?; // transaction
                 let msgno = read_int(&mut s, &mut dec)?; // message number
                 let batch = read_int(&mut s, &mut dec)?; // messages the client will take
+                // the frame echoes the transaction the client named, so
+                // the answer belongs to the request it asked about
+                let tx = if op_tr != 0 { op_tr } else { database.as_ref().map_or(0, |d| d.cur_handle) };
                 match blr_slots.get_mut(&handle) {
                     Some(slot) => send_request_batch(
-                        &mut s, &mut enc, handle, &slot.queue, &mut slot.cursor, msgno, batch,
+                        &mut s, &mut enc, handle, &slot.queue, &mut slot.cursor, msgno, batch, tx,
                     )?,
                     None => {
                         let mut c = 0;
-                        send_request_batch(&mut s, &mut enc, handle, &[], &mut c, msgno, batch)?;
+                        send_request_batch(&mut s, &mut enc, handle, &[], &mut c, msgno, batch, tx)?;
                     }
                 }
             }
@@ -67090,7 +67537,7 @@ fn after_auth(
                 use_stmt!(h);
                 cursors.remove(&h); // a fresh execute opens a fresh cursor
                 scroll.remove(&h);
-                read_int(&mut s, &mut dec)?; // tr
+                let op_tr = read_int(&mut s, &mut dec)?;
                 let in_blr = read_wire_bytes(&mut s, &mut dec)?; // input blr
                 read_int(&mut s, &mut dec)?; // msg number
                 let messages = read_int(&mut s, &mut dec)?; // message count
@@ -67148,7 +67595,21 @@ fn after_auth(
                     continue;
                 }
                 // a PREPARED transaction takes no more statements
-                if prepared {
+                // THE STATEMENT RUNS UNDER THE TRANSACTION IT NAMES -
+                // every execute rebinds (dsql.cpp:193), which is how a
+                // client prepares on one and executes on another
+                if !switch_named_tx(&mut database, op_tr, &mut s, &mut enc)? {
+                    continue;
+                }
+                // what the answer's object field carries: the
+                // transaction the client named - the OO client reads it
+                // back as its live transaction (client/interface.cpp:3802)
+                let resp_tx = if op_tr != 0 {
+                    op_tr
+                } else {
+                    database.as_ref().map_or(0, |d| d.cur_handle)
+                };
+                if database.as_ref().is_some_and(|d| d.prepared) {
                     respond_error(&mut s, &mut enc, GDS_REQ_NO_TRANS)?;
                     continue;
                 }
@@ -67432,24 +67893,41 @@ fn after_auth(
         // limbo state is already on the disk, and killing it here
         // would resolve a transaction whose resolution belongs to
         // whoever reconnects it (gfix -commit/-rollback).
-        if prepared {
-            if std::env::var("FC_SRV_TRACE").is_ok() {
-                eprintln!("[srv] detach with a PREPARED transaction - left in limbo");
+        // EVERY transaction this attachment still holds, not just the
+        // live one: the engine walks its whole list at detach and
+        // treats each on its own - a prepared one is DISCONNECTED (left
+        // in limbo for whoever reconnects it), any other is ROLLED BACK
+        // (server.cpp:3080-3100, jrd.cpp:8371 purgeTransactions)
+        let mut handles: Vec<i32> = db.txns.keys().copied().collect();
+        if db.cur_handle != 0 {
+            handles.push(db.cur_handle);
+        }
+        if handles.is_empty() {
+            handles.push(0); // a connection that never opened one
+        }
+        for h in handles {
+            if h != 0 && db.switch_tx(h).is_err() {
+                continue;
             }
-            // the TIP already says limbo; what goes back is only the
-            // in-memory side - the write right and the row locks, which
-            // die with the process anyway and must not outlive it here
-            db.end_write();
-        } else if !db.all_tx().is_empty() {
-            if std::env::var("FC_SRV_TRACE").is_ok() {
-                eprintln!("[srv] detach with an open transaction - marking it dead");
-            }
-            if let Err(e) = db.kill_tx() {
+            if db.prepared {
                 if std::env::var("FC_SRV_TRACE").is_ok() {
-                    eprintln!("[srv] ...could not: {}", e);
+                    eprintln!("[srv] detach with a PREPARED transaction - left in limbo");
                 }
+                // the TIP already says limbo; what goes back is only the
+                // in-memory side - the write right and the row locks, which
+                // die with the process anyway and must not outlive it here
+                db.end_write();
+            } else if !db.all_tx().is_empty() {
+                if std::env::var("FC_SRV_TRACE").is_ok() {
+                    eprintln!("[srv] detach with an open transaction - marking it dead");
+                }
+                if let Err(e) = db.kill_tx() {
+                    if std::env::var("FC_SRV_TRACE").is_ok() {
+                        eprintln!("[srv] ...could not: {}", e);
+                    }
+                }
+                db.end_write();
             }
-            db.end_write();
         }
     }
     Ok(())
@@ -68837,6 +69315,11 @@ mod tests {
             ods_major: 0,
             ods_minor: 0,
             windows: vec![UndoWindow::new(WindowKind::Transaction)],
+            txns: std::collections::HashMap::new(),
+            cur_handle: 0,
+            savepoints: Vec::new(),
+            prepared: false,
+            next_tx_handle: FIRST_TX_HANDLE,
             snapshot: None,
             autonomous_ids: Vec::new(),
             wait: true,
@@ -71795,6 +72278,11 @@ mod tests {
             ods_major: 14,
             ods_minor: 0,
             windows: Vec::new(),
+            txns: std::collections::HashMap::new(),
+            cur_handle: 0,
+            savepoints: Vec::new(),
+            prepared: false,
+            next_tx_handle: FIRST_TX_HANDLE,
             snapshot: None,
             autonomous_ids: Vec::new(),
             wait: true,
@@ -78113,6 +78601,11 @@ mod tests {
             ods_major: 14,
             ods_minor: 0,
             windows: vec![UndoWindow::new(WindowKind::Transaction)],
+            txns: std::collections::HashMap::new(),
+            cur_handle: 0,
+            savepoints: Vec::new(),
+            prepared: false,
+            next_tx_handle: FIRST_TX_HANDLE,
             snapshot: None,
             autonomous_ids: Vec::new(),
             wait: true,

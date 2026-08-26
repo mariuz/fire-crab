@@ -323,12 +323,48 @@ decides whether a term is row-dependent — had a catch-all that
 judged `<column> AT TIME ZONE '…'` row-INDEPENDENT, evaluated it
 against an empty row and SILENTLY DROPPED EVERY ROW of a WHERE.
 Boundaries: a ruled region still refuses everywhere (no tzdata
-rules), `TIMEZONE_NAME` refuses (ICU-rendered), and — recorded, not
-introduced — under isql's autocommit a statement typed
-`isc_info_sql_stmt_ddl` commits the caller's pending DML, because
-this server hands every transaction the same handle (a plain CREATE
-TABLE in the same position diverges identically; the fix is distinct
-transaction handles).
+rules) and `TIMEZONE_NAME` refuses (ICU-rendered). *(The
+isql-autocommit boundary recorded here — a `stmt_ddl` statement
+committing the caller's pending DML — is CLOSED by the slice below.)*
+
+**REAL PER-TRANSACTION WIRE HANDLES — DONE 2026-08-26
+(`serve-real-txhandle` 10).** One attachment may hold several
+transactions, and every op that carries a transaction handle names
+WHICH one it means. fire-crab answered one fixed handle for all of
+them and threw the incoming handle away, so a commit of one committed
+them all: isql's autocommit of a DDL statement committed the user's
+pending DML and the ROLLBACK that followed restored nothing, and two
+explicit transactions on one attachment both survived when only one
+was committed. **A rollback that does not roll back was the last
+known wrong-answer class in this server.**
+The model is a CONTEXT SWITCH: `Database` still holds ONE
+transaction's state in its own fields, every other open transaction
+is parked in a `TxSlot`, and `switch_tx` swaps them so the whole body
+of the server keeps reading one transaction out of the fields it
+always did — only the switch points know there are others. What is
+per transaction: its id and nested ids, undo windows, snapshot,
+generator cache, temp blobs, deferred DDL, TPB settings, savepoint
+names, the 2PC limbo bit — and, after review, **its lock owner**.
+`op_transaction` allocates the LOWEST FREE handle (the client indexes
+its objects by handle, so they must stay small and dense — a
+monotonic counter that climbed away was rejected outright, and the
+protocol's object field is only sixteen bits); `op_commit` /
+`op_rollback` resolve the named handle and free the slot, the
+retaining forms keep it, and a handle that names nothing is
+`isc_bad_trans_handle`. `SET TRANSACTION` executed with handle 0
+opens one and the response carries the new handle. Statement handles
+now step over live transaction handles.
+Two corruption classes the review caught, both fixed and gated:
+ending one transaction released the WHOLE attachment's locks, so a
+concurrent `gfix -sweep` read a still-live sibling as abandoned and
+backed its committed rows out; and temp-blob ids restarted at 2 in
+every transaction while `op_put_segment` carries no handle, so a
+segment landed in the sibling's blob. The earlier attempt at this
+change died on `op_inline_blob`, which stamps the transaction the
+client caches the blob under — it carries the live handle now.
+Recorded: two transactions of ONE attachment do not conflict with
+each other (they share no lock arbitration), and fetches bind to the
+transaction live at fetch time (`op_fetch` carries no handle).
 
 **AGGREGATES IN EXPRESSIONS DONE (2026-08-25,
 `serve-real-statexpr` 8):** the statistical/ordered-set family
