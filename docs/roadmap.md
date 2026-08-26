@@ -421,7 +421,68 @@ replacement is, once per possible occurrence) — it was announcing
 32765 for every call. Boundaries, both recorded and refused rather
 than answered: a LIKE pattern that is not a literal (a parameter or
 an expression) against a binary side, and `CAST(… AS … CHARACTER SET
-…)`, which this server does not parse in any charset yet.
+…)`, which the slice below closed.
+
+**THE CHARACTER-SET CAST — DONE 2026-08-26 (`serve-real-cscast`
+40).** `CAST(<v> AS CHAR|VARCHAR(n) CHARACTER SET <cs>)` is how a
+value crosses between character sets, and it was refused in every
+set. Now it converts, with the three error classes the engine
+separates — and the separation is the feature: which one a value
+earns says *where it came from*.
+
+* **to a byte carrier** (NONE, OCTETS) the OCTETS travel, whatever
+  they are: a UTF8 `'café'` cast to NONE is its five UTF-8 bytes, a
+  WIN1252 one its four codepage bytes.
+* **from a byte carrier into a real set** the bytes must SPELL that
+  set or it is `isc_malformed_string` (22000): `x'41FF'` into UTF8, or
+  any byte past 0x7F into ASCII. A single-byte destination has an
+  image for every octet, so `x'8182'` into WIN1252 answers.
+* **between two real sets** the CHARACTERS travel and one with no
+  image is `isc_transliteration_failed` (22018) — the *other* vector
+  for the same bytes. Out of a BLOB source that failure carries no
+  arithmetic-exception wrapper where its truncation does (measured,
+  and now a vector of its own).
+* transliteration comes **before** the width: five untranslatable
+  characters into a `VARCHAR(2)` is the 22018, never the 22001.
+* the width is counted in CHARACTERS OF THE TARGET, and the overflow
+  that may silently drop is the target set's **pad**: `x'41202020'`
+  into a `VARCHAR(2) CHARACTER SET OCTETS` raises where `x'41000000'`
+  fits, because OCTETS pads with a NUL. A CHAR target fills with the
+  same byte.
+
+The result is a first-class value OF that set, so the OCTETS laws of
+the slice above apply to it: `CAST('A' AS CHAR(2) CHARACTER SET
+OCTETS) = x'4100'` is TRUE, its LIKE has no wildcards, and one such
+operand makes a whole concatenation binary. Three seams had to learn
+the same lesson, and each was a wrong answer before it: the STORE
+path now binds a value with its own character set (a cast to NONE
+landed as the UTF-8 of the characters it had decoded to), the
+out-capacity check counts the bytes the EMIT will actually ship (a
+tabled destination ships one byte per character, so a WIN1252 result
+whose UTF-8 spelling is longer than the slot still fits), and
+`OCTET_LENGTH` reads any expression's own set rather than only a
+column's.
+
+Refusals kept honest: a character set the engine has that fire-crab
+carries no table for (UNICODE_FSS, the DOS pages, the multibyte
+pages), a `COLLATE` naming anything but the set's own collation (its
+ordering is a different answer, not a different spelling), a quoted
+name in the wrong case (`"win1252"` is undefined — the engine matches
+a quoted name as written), a zero or over-long width (the engine's
+-842 / -204 name the number, this refusal is generic), and the two
+places the BLR compiler would have to carry a charset'd cast
+descriptor: a PSQL body and a VIEW body. An undefined character set
+NAME answers the engine's own -204 vector, `CHARACTER SET
+"PUBLIC"."NOSUCH" is not defined`.
+
+Recorded beside it, found while gating and NOT this slice's: isql's
+`CONNECT '<host>/<port>:<db>' USER 'SYSDBA' PASSWORD '...'` is rejected
+by this server's auth. The client passes the login through **with its
+quotes** (`'SYSDBA'`), the engine dequotes it and this server's identity
+check is exact — so the gate reaches a UTF8 attachment through
+`isql -ch UTF8` instead. Every gate that connects the ordinary way (the
+connection string as isql's argument) is unaffected, which is why this
+went unseen.
 
 **AGGREGATES IN EXPRESSIONS DONE (2026-08-25,
 `serve-real-statexpr` 8):** the statistical/ordered-set family

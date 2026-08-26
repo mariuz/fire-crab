@@ -13352,7 +13352,7 @@ fn pad_conditional(e: Expr, descs: &[Descriptor]) -> Expr {
         Some((false, w, _)) if w > 0 => {
             Expr::Cast(
                 Box::new(e),
-                CastTarget::Text { len: w as usize, pad: true, synthetic: true },
+                CastTarget::Text { len: w as usize, pad: true, synthetic: true, cs: None },
                 fire_crab_ods::intl::CS_UTF8,
             )
         }
@@ -13495,7 +13495,7 @@ fn text_form_m(
                 _ => None,
             }
         }
-        Expr::Cast(inner, CastTarget::Text { len, pad, synthetic }, _) => {
+        Expr::Cast(inner, CastTarget::Text { len, pad, synthetic, cs }, _) => {
             // a USER cast is typed in the attachment charset and declares
             // its own width, in characters of it either way.
             //
@@ -13509,7 +13509,20 @@ fn text_form_m(
             if *synthetic {
                 return text_form(inner, descs).map(|(_, w, c)| (!*pad, w, c));
             }
-            Some((!*pad, *len as i32, TfCs::Att))
+            // a NAMED character set types the result in itself, where
+            // the plain spelling takes the attachment's. Announced as a
+            // real ttype, which is what makes a cast to OCTETS keep its
+            // charset under a UTF8 attachment where a WIN1252 one is
+            // re-announced in the attachment's ([resolve_text_cs],
+            // both measured)
+            Some((
+                !*pad,
+                *len as i32,
+                match cs {
+                    Some(c) => TfCs::Ttype(*c as i32),
+                    None => TfCs::Att,
+                },
+            ))
         }
         // a conditional is as wide as its widest branch. A bare NULL
         // branch has no form of its own and contributes none
@@ -23017,6 +23030,70 @@ struct AttCs {
     multibyte: bool,
 }
 
+
+/// Every character set the ENGINE carries, by name, as RDB$CHARACTER_SETS
+/// lists them (52 rows on a live FB6 server) plus the aliases the parser
+/// accepts. `None` is a name that is no character set at all - which is
+/// what separates a boundary this server records from the engine's own
+/// "is not defined" refusal ([cast_charset_id]).
+fn engine_charset_id(name: &str) -> Option<u8> {
+    Some(match name.trim().trim_matches('"').to_ascii_uppercase().as_str() {
+        "NONE" => 0,
+        "OCTETS" | "BINARY" => 1,
+        "ASCII" => 2,
+        "UNICODE_FSS" => 3,
+        "UTF8" => 4,
+        "SJIS_0208" => 5,
+        "EUCJ_0208" => 6,
+        "DOS737" => 9,
+        "DOS437" => 10,
+        "DOS850" => 11,
+        "DOS865" => 12,
+        "DOS860" => 13,
+        "DOS863" => 14,
+        "DOS775" => 15,
+        "DOS858" => 16,
+        "DOS862" => 17,
+        "DOS864" => 18,
+        "NEXT" => 19,
+        "ISO8859_1" | "LATIN1" => 21,
+        "ISO8859_2" | "LATIN2" => 22,
+        "ISO8859_3" => 23,
+        "ISO8859_4" => 34,
+        "ISO8859_5" => 35,
+        "ISO8859_6" => 36,
+        "ISO8859_7" => 37,
+        "ISO8859_8" => 38,
+        "ISO8859_9" => 39,
+        "ISO8859_13" => 40,
+        "KSC_5601" => 44,
+        "DOS852" => 45,
+        "DOS857" => 46,
+        "DOS861" => 47,
+        "DOS866" => 48,
+        "DOS869" => 49,
+        "CYRL" => 50,
+        "WIN1250" => 51,
+        "WIN1251" => 52,
+        "WIN1252" => 53,
+        "WIN1253" => 54,
+        "WIN1254" => 55,
+        "BIG_5" => 56,
+        "GB_2312" => 57,
+        "WIN1255" => 58,
+        "WIN1256" => 59,
+        "WIN1257" => 60,
+        "KOI8R" => 63,
+        "KOI8U" => 64,
+        "WIN1258" => 65,
+        "TIS620" => 66,
+        "GBK" => 67,
+        "CP943C" => 68,
+        "GB18030" => 69,
+        _ => return None,
+    })
+}
+
 impl AttCs {
     /// No `isc_dpb_lc_ctype` in the dpb = CHARACTER SET NONE.
     const NONE: AttCs = AttCs { id: 0, bpc: 1, multibyte: false };
@@ -23032,61 +23109,8 @@ impl AttCs {
     /// destination degrades the capacity rule to byte-overflow-only -
     /// engine-like for every single-byte set.
     fn by_name(name: &str) -> AttCs {
-        let id: u8 = match name.to_ascii_uppercase().as_str() {
-            "NONE" => 0,
-            "OCTETS" | "BINARY" => 1,
-            "ASCII" => 2,
-            "UNICODE_FSS" => 3,
-            "UTF8" => 4,
-            "SJIS_0208" => 5,
-            "EUCJ_0208" => 6,
-            "DOS737" => 9,
-            "DOS437" => 10,
-            "DOS850" => 11,
-            "DOS865" => 12,
-            "DOS860" => 13,
-            "DOS863" => 14,
-            "DOS775" => 15,
-            "DOS858" => 16,
-            "DOS862" => 17,
-            "DOS864" => 18,
-            "NEXT" => 19,
-            "ISO8859_1" | "LATIN1" => 21,
-            "ISO8859_2" | "LATIN2" => 22,
-            "ISO8859_3" => 23,
-            "ISO8859_4" => 34,
-            "ISO8859_5" => 35,
-            "ISO8859_6" => 36,
-            "ISO8859_7" => 37,
-            "ISO8859_8" => 38,
-            "ISO8859_9" => 39,
-            "ISO8859_13" => 40,
-            "KSC_5601" => 44,
-            "DOS852" => 45,
-            "DOS857" => 46,
-            "DOS861" => 47,
-            "DOS866" => 48,
-            "DOS869" => 49,
-            "CYRL" => 50,
-            "WIN1250" => 51,
-            "WIN1251" => 52,
-            "WIN1252" => 53,
-            "WIN1253" => 54,
-            "WIN1254" => 55,
-            "BIG_5" => 56,
-            "GB_2312" => 57,
-            "WIN1255" => 58,
-            "WIN1256" => 59,
-            "WIN1257" => 60,
-            "KOI8R" => 63,
-            "KOI8U" => 64,
-            "WIN1258" => 65,
-            "TIS620" => 66,
-            "GBK" => 67,
-            "CP943C" => 68,
-            "GB18030" => 69,
-            _ => 255,
-        };
+        // an unknown name maps to id 255 / single-byte, as documented
+        let id: u8 = engine_charset_id(name).unwrap_or(255);
         AttCs::by_id(id)
     }
 }
@@ -41060,6 +41084,17 @@ const GDS_ARITH_EXCEPT: i32 = 335544321;
 /// isc_transliteration_failed - "Cannot transliterate character between
 /// character sets" (SQLSTATE 22018)
 const GDS_TRANSLITERATION_FAILED: i32 = 335544565;
+/// `isc_malformed_string` (jrd.h:530, JRD 529): SQLSTATE 22000, raised
+/// where BYTES are read as a character set they do not spell - a NONE
+/// or OCTETS value cast into UTF8 or ASCII (measured)
+const GDS_MALFORMED_STRING: i32 = 335544849;
+/// `isc_dsql_datatype_err` (jrd.h:254, JRD 253): "Data type unknown",
+/// SQLSTATE HY004 - the wrapper the engine's -204 for an undefined
+/// character set carries
+const GDS_DSQL_DATATYPE_ERR: i32 = 335544573;
+/// `isc_charset_not_found` (jrd.h:190, JRD 189): "CHARACTER SET @1 is
+/// not defined"
+const GDS_CHARSET_NOT_FOUND: i32 = 335544509;
 const GDS_INTEGER_DIVIDE: i32 = 335544778;
 /// `isc_decfloat_invalid_operation` - SQLSTATE 22000, emitted ALONE (not
 /// under arith_except): the engine's per-row trap when a comparison meets
@@ -41188,6 +41223,108 @@ fn err_spell_charset(e: &Expr, descs: &[Descriptor]) -> u8 {
         }
     }
     CS_UTF8
+}
+
+/// Move a text value from the character set it is IN into the one a
+/// `CAST ... CHARACTER SET` names - the engine's `CVT_move` rule, and
+/// the three error classes it can raise.
+///
+/// Inside this server a value of a BYTE-CARRIER set (NONE, OCTETS,
+/// ASCII) travels as one char per octet and a value of a real set
+/// travels as its characters, so the conversion is always "spell the
+/// source as bytes, then read those bytes as the destination asks":
+///
+///   * to a byte carrier - the bytes travel, whatever they are. A UTF8
+///     `'café'` cast to NONE is its five UTF-8 octets (probed), a
+///     WIN1252 one is its four WIN1252 octets.
+///   * from a byte carrier to a REAL set - the bytes must SPELL that
+///     set, or it is `isc_malformed_string` (22000): an OCTETS `x'41FF'`
+///     into UTF8, or any byte past 0x7F into ASCII, both measured. A
+///     single-byte destination takes every byte (a table maps all 256),
+///     which is why OCTETS `x'8182'` into WIN1252 answers.
+///   * between two REAL sets - the CHARACTERS travel, and one with no
+///     image in the destination is `isc_transliteration_failed` (22018,
+///     *Cannot transliterate character between character sets*): UTF8
+///     `'Ω'` into WIN1252, or `'é'` into ASCII (both measured - note
+///     that the same value arriving from OCTETS earns the OTHER vector).
+fn transcode_text(src: u8, dst: u8, s: String) -> Result<String, EvalErr> {
+    use fire_crab_ods::intl;
+    if src == dst {
+        return Ok(s);
+    }
+    let carrier_src = intl::byte_carrier(src);
+    // the source's own octets
+    let bytes = || -> Vec<u8> {
+        if carrier_src {
+            intl::carrier_encode(&s).unwrap_or_else(|| s.as_bytes().to_vec())
+        } else {
+            intl::encode_text(src, &s)
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| s.as_bytes().to_vec())
+        }
+    };
+    if dst == intl::CS_ASCII {
+        // ASCII is a byte carrier here and a real set in the engine: it
+        // holds bytes, but only the seven-bit ones. Which vector the
+        // eighth bit earns turns on where the value CAME from
+        return if carrier_src {
+            let b = bytes();
+            if b.iter().any(|&c| c > 0x7F) {
+                Err(EvalErr::MalformedString)
+            } else {
+                Ok(intl::carrier_decode(&b))
+            }
+        } else if s.chars().any(|c| c > '\u{7F}') {
+            Err(EvalErr::TransliterationFailed)
+        } else {
+            Ok(s)
+        };
+    }
+    if intl::byte_carrier(dst) {
+        return Ok(intl::carrier_decode(&bytes()));
+    }
+    if carrier_src {
+        let b = bytes();
+        return if dst == intl::CS_UTF8 {
+            match std::str::from_utf8(&b) {
+                Ok(t) => Ok(t.to_string()),
+                Err(_) => Err(EvalErr::MalformedString),
+            }
+        } else {
+            // a tabled single-byte destination spells every octet
+            intl::decode_text(dst, &b).ok_or(EvalErr::MalformedString)
+        };
+    }
+    // real to real: the characters survive if the destination has them
+    match intl::encode_text(dst, &s) {
+        Ok(_) => Ok(s),
+        Err(_) => Err(EvalErr::TransliterationFailed),
+    }
+}
+
+/// The character set a CAST reads its source in - the third field of
+/// [Expr::Cast].
+///
+/// For every target it is the set the 22018 SPELLS the offending value
+/// in ([err_spell_charset]). Where the target NAMES a character set it
+/// is also what [transcode_text] converts FROM, and then a source whose
+/// charset only the WHOLE EXPRESSION knows - a concatenation of two
+/// OCTETS values, a COALESCE of them - must be read too, which
+/// `err_spell_charset` (a literal-and-column rule) does not do. The
+/// wider reading is confined to that case so no existing error message
+/// moves.
+fn cast_source_charset(e: &Expr, t: &CastTarget, descs: &[Descriptor]) -> u8 {
+    use fire_crab_ods::intl::{byte_carrier, charset_id, tabled, CS_UTF8};
+    if matches!(t, CastTarget::Text { cs: Some(_), .. }) {
+        if let Some((_, _, TfCs::Ttype(tt))) = text_form(e, descs) {
+            let cs = charset_id(tt as i16);
+            if byte_carrier(cs) || tabled(cs) || cs == CS_UTF8 {
+                return cs;
+            }
+        }
+    }
+    err_spell_charset(e, descs)
 }
 
 fn conv_err(cs: u8, s: String) -> EvalErr {
@@ -41404,6 +41541,16 @@ fn eval_status_items(w: &mut W, e: &EvalErr) {
             w.int(1) // isc_arg_gds
                 .int(GDS_ARITH_EXCEPT)
                 .int(1) // isc_arg_gds
+                .int(GDS_TRANSLITERATION_FAILED);
+        }
+        EvalErr::TransliterationFailedBare => {
+            // a BLOB source raises the SAME failure WITHOUT the
+            // arithmetic-exception wrapper (measured: casting a text
+            // blob holding 'Ω' to WIN1252 prints the one line, where
+            // casting a VARCHAR holding it prints the wrapper too -
+            // the blob move raises out of blb.cpp, not out of the
+            // string conversion). Its TRUNCATION keeps the wrapper.
+            w.int(1) // isc_arg_gds
                 .int(GDS_TRANSLITERATION_FAILED);
         }
         EvalErr::DecfloatInvalidOperation => {
@@ -41833,6 +41980,26 @@ fn eval_status_items(w: &mut W, e: &EvalErr) {
                 .int(*line as i32)
                 .int(ISC_ARG_NUMBER)
                 .int(*col as i32);
+        }
+        EvalErr::MalformedString => {
+            // one gds item, no wrapper (measured: isql prints the bare
+            // "Malformed string" under SQLSTATE 22000)
+            w.int(1) // isc_arg_gds
+                .int(GDS_MALFORMED_STRING);
+        }
+        EvalErr::CharsetNotDefined(name) => {
+            w.int(1) // isc_arg_gds
+                .int(GDS_DSQL_ERROR)
+                .int(1) // isc_arg_gds
+                .int(GDS_SQLERR)
+                .int(ISC_ARG_NUMBER)
+                .int(-204)
+                .int(1) // isc_arg_gds
+                .int(GDS_DSQL_DATATYPE_ERR)
+                .int(1) // isc_arg_gds
+                .int(GDS_CHARSET_NOT_FOUND)
+                .int(2) // isc_arg_string - PRE-QUOTED "SCHEMA"."NAME"
+                .bytes(name.as_bytes());
         }
         EvalErr::TableUnknown { name, line, col } => {
             w.int(1) // isc_arg_gds
@@ -43145,6 +43312,17 @@ fn enforce_out_capacity(
         } else {
             fire_crab_ods::intl::charset_id(c.sub_type as i16)
         };
+        // the EMIT re-points a NONE destination at the value's OWN real
+        // character set, and where that set is TABLED it ships one byte
+        // per character (`encode_text`) rather than the UTF-8 spelling -
+        // so the capacity is measured over the same bytes. Only the
+        // tabled sets move: a UTF8-typed expression still ships its
+        // UTF-8 bytes into a NONE slot and is still counted in them.
+        let dest = if dest.id == 0 && fire_crab_ods::intl::tabled(src_id) {
+            AttCs::by_id(src_id)
+        } else {
+            dest
+        };
         if src_id != dest.id && src_id > 1 && dest.id > 1 {
             continue; // transliterate path: no length enforcement
         }
@@ -43178,8 +43356,13 @@ fn enforce_out_capacity(
             && fire_crab_ods::intl::byte_carrier(fire_crab_ods::intl::charset_id(
                 c.sub_type as i16,
             ));
+        // ... and a TABLED single-byte destination ships one byte per
+        // CHARACTER too (`encode_text` is what the emit calls), so a
+        // WIN1252 result whose UTF-8 spelling is longer than the slot
+        // still fits: `CAST(x'8182' AS VARCHAR(4) CHARACTER SET
+        // WIN1252)` is two bytes, five UTF-8
         let count = |x: &str| {
-            if dest.bpc == 1 && !carrier_src {
+            if dest.bpc == 1 && !carrier_src && !fire_crab_ods::intl::tabled(dest.id) {
                 x.len()
             } else {
                 x.chars().count()
@@ -45180,7 +45363,10 @@ enum CastTarget {
     /// where a USER cast to text is typed in the ATTACHMENT charset
     /// (probed: CAST('ab' AS VARCHAR(6)) is 24 bytes UTF8 under a UTF8
     /// attachment)
-    Text { len: usize, pad: bool, synthetic: bool },
+    /// `cs` is the character set the target NAMES - `CAST(<v> AS
+    /// VARCHAR(3) CHARACTER SET WIN1252)`. `None` is the plain
+    /// spelling, whose result is typed in the ATTACHMENT charset.
+    Text { len: usize, pad: bool, synthetic: bool, cs: Option<u8> },
     /// `NUMERIC(p, s)` / `DECIMAL(p, s)` - the declared SCALE is what the
     /// value is rounded to (half away from zero, probed: 12.55 to scale
     /// -1 is 12.6 and -12.55 is -12.6); `bytes` is the storage width the
@@ -47089,7 +47275,143 @@ fn parse_cast_target(b: &[char], pos: &mut usize) -> Option<CastTarget> {
         return None;
     }
     *pos += 1;
-    Some(CastTarget::Text { len, pad, synthetic: false })
+    // `CHARACTER SET <name>` and, after it, `COLLATE <name>` - the two
+    // optional tails a TEXT cast target takes. Both are read here so a
+    // spelling this server cannot serve REFUSES rather than answering
+    // in the wrong character set.
+    let mut cs = None;
+    skip_ws(b, pos);
+    if word_is(b, *pos, "CHARACTER") {
+        let mut p = *pos + "CHARACTER".len();
+        skip_ws(b, &mut p);
+        if !word_is(b, p, "SET") {
+            return None;
+        }
+        p += "SET".len();
+        skip_ws(b, &mut p);
+        let name = read_ident(b, &mut p)?;
+        cs = Some(cast_charset_id(&name)?);
+        *pos = p;
+        skip_ws(b, pos);
+    }
+    if word_is(b, *pos, "COLLATE") {
+        let mut p = *pos + "COLLATE".len();
+        skip_ws(b, &mut p);
+        let name = read_ident(b, &mut p)?;
+        // a COLLATE with no CHARACTER SET names a collation OF THE
+        // ATTACHMENT's set, which this parse does not know: refused
+        // (recorded boundary - the engine resolves it, and under a NONE
+        // attachment refuses it as this does)
+        cs?;
+        // only the character set's OWN collation - its default, id 0 -
+        // is served; a named one orders and compares by rules this
+        // server does not carry, and answering with the default's
+        // ordering would be a wrong answer (`CAST('AB' AS VARCHAR(3)
+        // CHARACTER SET UTF8 COLLATE UNICODE_CI) = 'ab'` is TRUE on the
+        // engine, FALSE under the default). Recorded boundary.
+        if collation_name_id(cs.unwrap_or(fire_crab_ods::intl::CS_UTF8), &name) != Some(0) {
+            return None;
+        }
+        *pos = p;
+    }
+    // the width the engine will accept. Zero is its -842 "Positive
+    // value expected" and a count past a SSHORT its -842 too; a
+    // declared width whose BYTES pass the text limit - 32767 for CHAR,
+    // 32765 for VARCHAR, which a multibyte character set reaches at a
+    // quarter of the count - is its -204 "Implementation limit
+    // exceeded" (all probed). Refused here so this server never answers
+    // where the engine will not.
+    if len == 0 || len > 32767 {
+        return None;
+    }
+    if let Some(c) = cs {
+        let bytes = len * fire_crab_ods::intl::bytes_per_char(c) as usize;
+        if bytes > if pad { 32767 } else { 32765 } {
+            return None;
+        }
+    }
+    Some(CastTarget::Text { len, pad, synthetic: false, cs })
+}
+
+/// Is the word at `at` this keyword, as a WHOLE word?
+fn word_is(b: &[char], at: usize, kw: &str) -> bool {
+    let k: Vec<char> = kw.chars().collect();
+    if at + k.len() > b.len() {
+        return false;
+    }
+    if !b[at..at + k.len()]
+        .iter()
+        .zip(k.iter())
+        .all(|(a, c)| a.to_ascii_uppercase() == *c)
+    {
+        return false;
+    }
+    match b.get(at + k.len()) {
+        Some(c) => !(c.is_alphanumeric() || *c == '_'),
+        None => true,
+    }
+}
+
+/// One identifier: a bare name (folded to upper case, as the engine
+/// folds an unquoted one) or a `"quoted"` one, kept as written.
+fn read_ident(b: &[char], pos: &mut usize) -> Option<String> {
+    skip_ws(b, pos);
+    if b.get(*pos) == Some(&'"') {
+        *pos += 1;
+        let start = *pos;
+        while *pos < b.len() && b[*pos] != '"' {
+            *pos += 1;
+        }
+        if b.get(*pos) != Some(&'"') {
+            return None;
+        }
+        let name: String = b[start..*pos].iter().collect();
+        *pos += 1;
+        return Some(name);
+    }
+    let start = *pos;
+    while *pos < b.len() && (b[*pos].is_alphanumeric() || b[*pos] == '_') {
+        *pos += 1;
+    }
+    if *pos == start {
+        return None;
+    }
+    Some(b[start..*pos].iter().collect::<String>().to_ascii_uppercase())
+}
+
+/// The id of a character set a CAST target may name, or None when this
+/// server will not serve it.
+///
+/// Three answers, and the difference is visible to the client: a set
+/// this server CONVERTS answers its id; a set the ENGINE has that this
+/// server has no table for (BIG_5, the DOS pages, ...) refuses
+/// generically - a recorded boundary; and a name that is no character
+/// set at all sets [PREPARE_REFUSAL] to the engine's own -204 vector
+/// (`CHARACTER SET "PUBLIC"."NOSUCH" is not defined`, measured).
+fn cast_charset_id(name: &str) -> Option<u8> {
+    use fire_crab_ods::intl;
+    // a QUOTED name is matched AS WRITTEN - `"win1252"` is not the
+    // catalogue's `WIN1252` and the engine calls it undefined (measured).
+    // [read_ident] folds an unquoted name, so a lower-case letter here
+    // means it arrived quoted.
+    let quoted_other_case = name.chars().any(|c| c.is_lowercase());
+    let id = match if quoted_other_case { None } else { engine_charset_id(name) } {
+        Some(id) => id,
+        None => {
+            PREPARE_REFUSAL.with(|r| {
+                *r.borrow_mut() =
+                    Some(EvalErr::CharsetNotDefined(format!("\"PUBLIC\".\"{}\"", name)))
+            });
+            return None;
+        }
+    };
+    // what this server can actually convert: the byte carriers, UTF8,
+    // and the tabled single-byte sets ([fire_crab_ods::intl::tabled])
+    if intl::byte_carrier(id) || intl::tabled(id) || id == intl::CS_UTF8 {
+        Some(id)
+    } else {
+        None
+    }
 }
 
 /// Resolve a raw expression's column names to field ids against the
@@ -47239,14 +47561,33 @@ fn cast_target_descriptor(t: &CastTarget) -> Option<Descriptor> {
         // renders both text dtypes as 448 VARYING on the wire, a
         // server-wide convention the engine's CHAR-as-452 SQL_TEXT
         // diverges from - a describe boundary, not a value one.)
-        CastTarget::Text { len, pad: true, .. } => d(dtype::TEXT, 0, *len as u16, 0),
-        CastTarget::Text { len, pad: false, .. } => {
-            d(dtype::VARYING, 0, (*len as u16).saturating_add(2), 0)
+        // a NAMED character set announces ITS bytes (the declared
+        // character count times its bytes per character) and its ttype
+        CastTarget::Text { len, pad: true, cs, .. } => {
+            let (bytes, sub) = cast_text_bytes(*len, *cs);
+            d(dtype::TEXT, 0, bytes, sub)
+        }
+        CastTarget::Text { len, pad: false, cs, .. } => {
+            let (bytes, sub) = cast_text_bytes(*len, *cs);
+            d(dtype::VARYING, 0, bytes.saturating_add(2), sub)
         }
         // DECFLOAT(34) is decimal128 (16 bytes), DECFLOAT(16) decimal64 (8)
         CastTarget::DecFloat { wide: true } => d(dtype::DEC128, 0, 16, 0),
         CastTarget::DecFloat { wide: false } => d(dtype::DEC64, 0, 8, 0),
     })
+}
+
+/// The BYTE width and ttype a text cast target declares: a character
+/// count times the named character set's bytes per character, or the
+/// plain count when the target names none (the attachment resolves it).
+fn cast_text_bytes(len: usize, cs: Option<u8>) -> (u16, i16) {
+    match cs {
+        Some(c) => (
+            (len as u16).saturating_mul(fire_crab_ods::intl::bytes_per_char(c) as u16),
+            c as i16,
+        ),
+        None => (len as u16, 0),
+    }
 }
 
 /// Resolve a PROJECTION expression that may carry `?` parameters,
@@ -47279,7 +47620,7 @@ fn resolve_proj_expr(
                     Expr::Cast(Box::new(Expr::BlobText(fid)), *t, fire_crab_ods::intl::CS_UTF8)
                 } else {
                     let e = resolve_proj_expr(inner, columns, descs, sink)?;
-                    let cs = err_spell_charset(&e, descs);
+                    let cs = cast_source_charset(&e, t, descs);
                     Expr::Cast(Box::new(e), *t, cs)
                 }
             }
@@ -47382,7 +47723,7 @@ fn resolve_expr_inner(
                 return Some(Expr::Cast(Box::new(Expr::BlobText(fid)), *t, fire_crab_ods::intl::CS_UTF8));
             }
             let inner = resolve_expr(e, columns, descs)?;
-            let cs = err_spell_charset(&inner, descs);
+            let cs = cast_source_charset(&inner, t, descs);
             Expr::Cast(Box::new(inner), *t, cs)
         }
         RawExpr::Coalesce(args) => Expr::Coalesce(
@@ -47464,19 +47805,15 @@ fn resolve_expr_inner(
                         _ => SysFn::LowerCs(fire_crab_ods::intl::CS_OCTETS),
                     }
                 }
-                (SysFn::OctetLength, [Expr::Col(fid)]) => {
-                    let cs = descs
-                        .get(*fid)
-                        .map_or(0, |d| fire_crab_ods::intl::charset_id(d.sub_type));
-                    // ... and a BYTE-CARRIER column's octets are its
-                    // carrier bytes, not the carrier's UTF-8 spelling
-                    if fire_crab_ods::intl::tabled(cs) || fire_crab_ods::intl::byte_carrier(cs)
-                    {
-                        SysFn::OctetLengthCs(cs)
-                    } else {
-                        *f
-                    }
-                }
+                // a column - or ANY expression, a CAST to a named
+                // character set among them - whose value is carried in
+                // its own set's bytes counts THOSE (a WIN1252 'caf\u{e9}'
+                // is 4 octets, not the 5 its UTF-8 spelling would give;
+                // a cast to NONE counts the octets it converted to)
+                (SysFn::OctetLength, [a]) => match expr_value_charset(a, descs) {
+                    Some(cs) => SysFn::OctetLengthCs(cs),
+                    None => *f,
+                },
                 // UPPER/LOWER over such a column takes the CHARSET's
                 // case law (intl::case_char, engine-generated tables;
                 // a carrier cases ASCII only) - same seam, same reason.
@@ -47948,6 +48285,19 @@ enum EvalErr {
     /// sum past `i64`, or an operation past `i128`:
     /// `isc_exception_integer_overflow` (SQLSTATE 22003)
     IntegerOverflow,
+    /// BYTES that do not spell a character of the set they are being
+    /// read as: `isc_malformed_string` (SQLSTATE 22000, *Malformed
+    /// string*). The engine's byte-level well-formedness test, which is
+    /// a DIFFERENT vector from the transliteration failure below: an
+    /// OCTETS value cast to UTF8 or ASCII raises this where a UTF8
+    /// value cast to WIN1252 raises that (both measured)
+    MalformedString,
+    /// a `CHARACTER SET <name>` naming no character set: -204 under
+    /// "Data type unknown", the name PRE-QUOTED `"SCHEMA"."NAME"`
+    CharsetNotDefined(String),
+    /// the same failure raised out of a BLOB move: no arithmetic
+    /// exception wrapping it (measured - see the vector)
+    TransliterationFailedBare,
     /// a value with no image in the destination character set:
     /// `isc_arith_except` / `isc_transliteration_failed` (SQLSTATE 22018,
     /// *Cannot transliterate character between character sets*) - probed
@@ -50089,11 +50439,31 @@ fn wall_to_utc_time(t: u32, zone: u16) -> Option<u32> {
 /// into an OCTETS column is `41 FF`, not `41 C3 BF`).
 fn expr_value_to_wireparam(e: &Expr, v: &Value, descs: &[Descriptor]) -> Option<WireParam> {
     match value_to_wireparam(v)? {
-        WireParam::Text(t) if expr_is_octets(e, descs) => Some(WireParam::TextCs(
-            t,
-            fire_crab_ods::intl::CS_OCTETS,
-        )),
+        // the value travels with the character set it IS in, so the
+        // store encodes its own bytes ([text_bytes_for]): an OCTETS
+        // value's octets, a NONE one's, a WIN1252 one's codepage bytes -
+        // never the UTF-8 spelling of the characters they decoded to
+        WireParam::Text(t) => Some(match expr_value_charset(e, descs) {
+            Some(cs) => WireParam::TextCs(t, cs),
+            None => WireParam::Text(t),
+        }),
         wp => Some(wp),
+    }
+}
+
+/// The character set a text expression's VALUE is in, where this server
+/// carries that set's bytes rather than the UTF-8 of its characters: a
+/// byte carrier (NONE / OCTETS / ASCII) or a tabled single-byte page.
+/// None for everything else - the attachment charset and UTF8, whose
+/// values ARE their Rust characters.
+fn expr_value_charset(e: &Expr, descs: &[Descriptor]) -> Option<u8> {
+    use fire_crab_ods::intl::{byte_carrier, charset_id, tabled};
+    match text_form(e, descs) {
+        Some((_, _, TfCs::Ttype(t))) => {
+            let cs = charset_id(t as i16);
+            (byte_carrier(cs) || tabled(cs)).then_some(cs)
+        }
+        _ => None,
     }
 }
 
@@ -51711,7 +52081,7 @@ impl Expr {
                     }
                     // to a text width: render the value, refuse if it does
                     // not fit (the engine's convert error), pad for CHAR
-                    CastTarget::Text { len, pad, .. } => {
+                    CastTarget::Text { len, pad, cs: target_cs, .. } => {
                         // A BOOLEAN casts to the WORD IN CAPITALS -
                         // `CAST(B AS VARCHAR(6))` is 'TRUE', while isql
                         // DISPLAYS the same column as `<true>`. Two
@@ -51747,6 +52117,36 @@ impl Expr {
                             }
                             _ => v.render(),
                         };
+                        // A NAMED character set CONVERTS FIRST: the
+                        // engine's CVT_move transliterates into the
+                        // target's set before the width is looked at, so
+                        // five untranslatable characters into a
+                        // VARCHAR(2) is the 22018 transliteration error
+                        // and never the 22001 the width would have
+                        // earned (probed).
+                        let s = match target_cs {
+                            Some(d) => transcode_text(*cs, *d, s).map_err(|err| {
+                                // a BLOB source's transliteration failure
+                                // carries no arith wrapper (see the vector)
+                                match (err, &**e) {
+                                    (EvalErr::TransliterationFailed, Expr::BlobText(_)) => {
+                                        EvalErr::TransliterationFailedBare
+                                    }
+                                    (err, _) => err,
+                                }
+                            })?,
+                            None => s,
+                        };
+                        // and the PAD is the target character set's
+                        // space - a NUL for OCTETS ([intl::pad_byte]),
+                        // which decides both what a CHAR fills with and
+                        // which overflow may be dropped: `CAST(x'41202020'
+                        // AS VARCHAR(2) CHARACTER SET OCTETS)` RAISES
+                        // where `x'41000000'` fits (probed)
+                        let padc = match target_cs {
+                            Some(d) => fire_crab_ods::intl::pad_byte(*d) as char,
+                            None => ' ',
+                        };
                         let chars: Vec<char> = s.chars().collect();
                         // FIT to the declared width. The engine keeps the
                         // first `len` characters and drops overflow that is
@@ -51757,7 +52157,7 @@ impl Expr {
                         // NUMERIC / temporal source earns (probed:
                         // CAST(12345 AS VARCHAR(3)) is 22018 "...12345").
                         let mut out = if chars.len() > *len {
-                            if chars[*len..].iter().any(|&c| c != ' ') {
+                            if chars[*len..].iter().any(|&c| c != padc) {
                                 return Err(if is_numeric_src {
                                     EvalErr::ConversionError(Some(s.clone()))
                                 } else {
@@ -51774,7 +52174,7 @@ impl Expr {
                         // CHAR pads the survivor to the declared width
                         if *pad {
                             while out.chars().count() < *len {
-                                out.push(' ');
+                                out.push(padc);
                             }
                         }
                         Value::Text(out)
@@ -70261,7 +70661,7 @@ mod tests {
         // a USER cast declares its own width in either measure
         let cast = Expr::Cast(
             Box::new(lit(three)),
-            CastTarget::Text { len: 10, pad: false, synthetic: false },
+            CastTarget::Text { len: 10, pad: false, synthetic: false, cs: None },
             fire_crab_ods::intl::CS_UTF8,
         );
         assert_eq!(text_form(&cast, &descs), Some((true, 10, TfCs::Att)));
@@ -75622,6 +76022,46 @@ mod tests {
         assert!(matches!(target("INTEGER"), Some(CastTarget::Int { bytes: 4 })));
         assert!(matches!(target("BIGINT"), Some(CastTarget::Int { bytes: 8 })));
         assert!(matches!(target("VARCHAR(10)"), Some(CastTarget::Text { len: 10, pad: false, .. })));
+        // the character-set tail, and the two widths the engine refuses
+        assert!(matches!(
+            target("VARCHAR(3) CHARACTER SET WIN1252"),
+            Some(CastTarget::Text { len: 3, pad: false, cs: Some(53), .. })
+        ));
+        assert!(matches!(
+            target("CHAR(3) CHARACTER SET \"OCTETS\""),
+            Some(CastTarget::Text { len: 3, pad: true, cs: Some(1), .. })
+        ));
+        assert!(matches!(
+            target("VARCHAR(3) CHARACTER SET utf8 COLLATE UTF8"),
+            Some(CastTarget::Text { cs: Some(4), .. })
+        ));
+        // a collation other than the set's own, a set with no table
+        // here, and the width bounds all REFUSE
+        assert!(target("VARCHAR(3) CHARACTER SET UTF8 COLLATE UNICODE_CI").is_none());
+        assert!(target("VARCHAR(3) CHARACTER SET DOS437").is_none());
+        assert!(target("VARCHAR(0) CHARACTER SET UTF8").is_none());
+        assert!(target("VARCHAR(8192) CHARACTER SET UTF8").is_none());
+        assert!(target("CHAR(32767) CHARACTER SET NONE").is_some());
+        assert!(target("VARCHAR(32766) CHARACTER SET NONE").is_none());
+
+        // the conversion itself, each rule measured on the engine
+        use fire_crab_ods::intl::{CS_ASCII, CS_NONE, CS_OCTETS, CS_UTF8, CS_WIN1252};
+        let tc = |src: u8, dst: u8, v: &str| transcode_text(src, dst, v.to_string());
+        // a real set into a byte carrier: the OCTETS of the source
+        assert_eq!(tc(CS_UTF8, CS_NONE, "café").map(|s| s.chars().count()), Ok(5));
+        assert_eq!(tc(CS_WIN1252, CS_OCTETS, "é"), Ok("\u{e9}".to_string()));
+        // a byte carrier into UTF8: the bytes must spell it
+        assert_eq!(tc(CS_OCTETS, CS_UTF8, "\u{41}\u{42}"), Ok("AB".to_string()));
+        assert_eq!(tc(CS_OCTETS, CS_UTF8, "\u{41}\u{ff}"), Err(EvalErr::MalformedString));
+        // ... and into ASCII, where the eighth bit is malformed too
+        assert_eq!(tc(CS_OCTETS, CS_ASCII, "\u{41}\u{ff}"), Err(EvalErr::MalformedString));
+        // between two real sets the CHARACTERS travel, and one with no
+        // image is the OTHER vector
+        assert_eq!(tc(CS_UTF8, CS_WIN1252, "é"), Ok("é".to_string()));
+        assert_eq!(tc(CS_UTF8, CS_WIN1252, "Ω"), Err(EvalErr::TransliterationFailed));
+        assert_eq!(tc(CS_UTF8, CS_ASCII, "é"), Err(EvalErr::TransliterationFailed));
+        // every octet has an image in a tabled single-byte set
+        assert_eq!(tc(CS_OCTETS, CS_WIN1252, "\u{81}\u{82}").map(|s| s.chars().count()), Ok(2));
         assert!(matches!(target("CHAR(5)"), Some(CastTarget::Text { len: 5, pad: true, .. })));
         assert!(matches!(target("DOUBLE PRECISION"), Some(CastTarget::Approx)));
         assert!(matches!(target("FLOAT"), Some(CastTarget::Approx)));

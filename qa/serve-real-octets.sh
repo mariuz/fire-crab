@@ -30,10 +30,10 @@
 #
 # Boundaries (recorded, all refuse rather than answer): a LIKE pattern against
 # a binary side that is not a literal - a parameter or an expression, where the
-# engine answers - `CAST(<x> AS … CHARACTER SET OCTETS)`, which this server does
-# not parse yet in any charset - a hex literal as a column DEFAULT - and a hex
-# literal inside a PSQL body, which needs the BLR compiler to emit an OCTETS
-# literal descriptor.
+# engine answers - a hex literal as a column DEFAULT - and a hex literal inside
+# a PSQL body, which needs the BLR compiler to emit an OCTETS literal
+# descriptor. (`CAST(<x> AS … CHARACTER SET …)` was on this list until
+# qa/serve-real-cscast.sh closed it.)
 #
 #   qa/serve-real-octets.sh [port]
 set -u
@@ -194,8 +194,8 @@ refuses() { # <label> <sql>
 }
 refuses "a LIKE pattern that is not a LITERAL against a binary side refuses" \
   "SELECT ID FROM OC WHERE P LIKE 'a' || '';"
-refuses "CAST … CHARACTER SET refuses" \
-  "SELECT CAST(P AS VARCHAR(6) CHARACTER SET OCTETS) FROM OC;"
+both "a cast INTO the binary set keeps the padded bytes" \
+  "SELECT CAST(P AS VARCHAR(6) CHARACTER SET OCTETS), CAST(U AS CHAR(4) CHARACTER SET OCTETS) FROM OC ORDER BY ID;"
 refuses "a hex literal as a column DEFAULT refuses (the DDL parser's own slice)" \
   "CREATE TABLE HD (ID INTEGER, P CHAR(2) CHARACTER SET OCTETS DEFAULT x'FFFE');"
 refuses "a hex literal inside a PSQL body refuses (the BLR compiler's own slice)" \
