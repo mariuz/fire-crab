@@ -822,6 +822,150 @@ nothing is decided), its LENGTHS and CASTS, the whole default-collation
 surface, and every PXW_INTL comparison and ordering, which keys as
 before.
 
+**...AND THEN IT ANSWERED THEM: THE ICU COLLATIONS, FROM THE UCA ITSELF
+— DONE 2026-08-27 (`serve-real-icucoll` 25 refusals → 61 checks).** The
+refusal above was honest but small; the table it lacked is a published
+one, and there is a Rust implementation of it. **`icu_collator` is now
+the ONE dependency in this workspace** (in `fire-crab-ods`; the release
+binary grew 8.53 MB → 9.91 MB, all of it baked UCA data). It buys a
+thing no amount of conversion can: the Unicode Collation Algorithm's own
+order.
+
+TWO LAWS, probed off the live engine over `apple/APPLE/Ápple/ápple` in
+three columns:
+
+1. **A SORT IS FULL STRENGTH whatever the column's collation is.**
+   `ORDER BY <UNICODE>`, `ORDER BY <UNICODE_CI>` and
+   `ORDER BY <UNICODE_CI_AI>` all answered `1 2 4 3`. A CI collation
+   makes an EQUALITY loose; it does not make a SORT unstable. So an
+   ordering key rides as `coll::TTYPE_UTF8_UNICODE` — not a fudge, a
+   statement of that law.
+2. **EQUALITY AND GROUPING READ THE COLLATION'S OWN STRENGTH.**
+   `= 'APPLE'` took one row under UNICODE, two under UNICODE_CI, four
+   under UNICODE_CI_AI.
+
+Both are the same sort key cut at a different level, so one builder
+answers both: `coll::icu_key(text, strength)` over a cached
+`CollatorBorrowed` per strength, keyed through the existing
+`Expr::CollKey` carrier (UCA key bytes are never zero, so a `0x00`
+terminator makes a PREFIX key compare right and keeps the key out of
+reach of the blank-stripping every text compare here does). Trailing
+blanks are the pad and are not keyed (`texttype_pad_option`); a LEADING
+blank is a real collation element (`' apple' < 'app le'`, measured —
+the root table's non-ignorable variable weighting, which is ICU4X's
+default).
+
+WHAT NOW ANSWERS: ORDER BY (a column key, an ORDINAL, an EXPRESSION key,
+DESC, NULLS FIRST/LAST, inside a derived table, under FIRST/SKIP and
+under a JOIN), the whole comparison family (`=`, `<>`, the four ranges,
+BETWEEN, an IN list, NOT IN, inside a CASE, through a derived table's
+own name), the SEMI-JOIN rewrites (`IN (SELECT …)`, `= ANY`, correlated
+`EXISTS`/`NOT EXISTS`, `NOT IN (SELECT …)`), a scalar subquery on the
+other side, and UPDATE/DELETE `WHERE`.
+
+TWO SILENT WRONG ANSWERS FELL OUT ON THE WAY, both pre-existing:
+
+* **A semi-join's values travel as HASH KEYS** (`Rhs::StrKey`, the
+  strict grammar's spelling) and that arm compared BYTES — so
+  `CI IN (SELECT …)` answered ONE row where the literal
+  `CI IN ('APPLE')` beside it answered two. The key arm now takes the
+  collation like the literal one.
+* **The BLR executor compares values, not descriptors**, and text values
+  do not carry their collation — so a procedure body's
+  `SELECT COUNT(*) … WHERE CI = 'APPLE'` answered 1 where the same
+  statement typed at the prompt answered 2. `blr_reads_collated_relation`
+  now stands the fast path aside for ANY non-default collation,
+  PXW_INTL included, and the SOURCE interpreter re-plans the statement
+  through the descriptor-aware planner. **The question is asked the way
+  round that PROVES an answer**: the COLLATED RELATION SET is read from
+  the catalog first (one walk per generation, memoised), and an empty
+  set — every database in this suite but two — answers without decoding
+  a byte. The first draft asked it of the BLR's own relation names and
+  treated anything it could not resolve as collated; the sweep caught
+  it refusing every recursive CTE in a procedure body (the recursion's
+  name is no relation) and, through the decode-failure arm, every
+  WINDOW one (`serve-real-exeproc`, `serve-real-funcbody`). Only a
+  database that HAS a collation now pays for an undecodable body.
+
+WHAT STILL REFUSES, each for a measured reason: `LIKE` / `STARTING WITH`
+/ `CONTAINING` / `SIMILAR TO` (they match through the collation's own
+MATCHER prefix by prefix, and a UCA key is not built prefix-wise — the
+key of 'app' is no prefix of the key of 'apple'; measured,
+`CI STARTING WITH 'APP'` takes 'apple' too); `GROUP BY` / `DISTINCT` /
+a distinct UNION (not the COUNT — the surviving SPELLING, which follows
+the engine's own sort's internal order and no rule this server could
+reproduce. Measured three ways: over {apple, APPLE} `GROUP BY CI` kept
+whichever was inserted SECOND — 'APPLE' one way round, 'apple' the
+other; over four spellings {aPPle, APPLE, apple, ApPlE} it kept 'apple',
+which is neither the first nor the last record, and stayed on 'apple'
+after that row was deleted and re-inserted LAST; and `SELECT DISTINCT`
+answers a different survivor from `GROUP BY` over the same rows);
+`MIN`/`MAX`/`COUNT(DISTINCT)` (the fold, as before, PXW included); an
+EXPRESSION over such a column inside a comparison (`UPPER(ci) =` — the
+collation travels into a result there is no key for, so `cmp_sides`
+refuses it rather than comparing bytes, which is what it silently did
+before); a JOIN keyed on one; two DIFFERENT collations meeting in one
+comparison; and an explicit `COLLATE` clause.
+
+**...AND THEN THE FOLD AND THE GROUP KEYED IT TOO — DONE 2026-08-27
+(`serve-real-icucoll` 61 → 74 checks).** Three of the refusals above
+turned out to be two different questions wearing one coat, and only one
+of them is unanswerable.
+
+**THE FOLD.** `MIN`/`MAX` pick by the collation's ORDER and
+`COUNT(DISTINCT)` buckets by its EQUALITY — and both read the
+collation's OWN strength, not the full-strength order a SORT uses.
+Measured: `MIN(<UNICODE_CI col>)` over {APPLE, apple} answered whichever
+row came FIRST, both ways round — so to the fold the two are EQUAL and
+`compute_group`'s keep-unless-strictly-less rule decides, where a sort
+would have answered 'apple' either way. New `AggSrc::CollField(fid,
+ttype)` carries the ttype into the fold (`agg_field_src` builds it at
+all four planner sites, `agg_src_fid` reads through it), and a new
+`fold_cmp` runs `coll_value_cmp` — PXW_INTL through its converted key
+tables, the ICU family through `coll::icu_key`. **This closes the
+PXW_INTL fold too**, which had answered `MIN(W)` = 'APPLE' where the
+engine answers 'apple'. What still refuses is what has no key: a
+tailored/narrow ICU collation, and an EXPRESSION source that READS a
+collated column (`MIN(UPPER(ci))` carries the collation into a result
+there is no key for — that one was a SILENT byte fold before, since the
+old check looked only at `AggSrc::Field`).
+
+**THE GROUP.** A collation that never calls two DIFFERENT strings equal
+asks no "which spelling survives" question at all — so `UNICODE` (and
+`PXW_INTL`, and every charset default) now GROUPs and DEDUPLICATEs,
+while `UNICODE_CI`/`UNICODE_CI_AI` keep refusing for the reason above.
+`coll_groupable_ttype` draws that line; the octets-only masks became
+TTYPE masks (`coll_key_mask`, `coll_cols`, `rows_equal`,
+`distinct_rows`, `group_rows`), so a group's buckets AND its ORDER come
+from the collation.
+
+TWO MORE PRE-EXISTING DEFECTS FELL OUT:
+
+* **`coll_key_mask` read the PROJECTION**, matching `ProjCol::field_id`
+  against a key's field id — but in a GROUPED plan a ProjCol's
+  `field_id` is its OUTPUT SLOT, not a record field. `GROUP BY <col>`
+  looked up key field 1 among output slots 0 and 1 and took slot 1, the
+  COUNT, whose ttype is 0. It reads the RECORD descriptors now, and
+  `Plan::JoinGroup` carries the mask from PLAN time because execute has
+  the joined rows but not their descriptors.
+* **A grouped ORDER BY was parsed with NO descriptors** (`&[]`), so a
+  key over a collated group key came back `coll: 0` and sorted the
+  groups by BYTES — `GROUP BY <PXW col> ORDER BY 1` answered byte order
+  where the engine answers 'ae', 'ä', 'apple', 'APPLE', … The new
+  `stamp_group_order_coll` stamps those keys from the group row's SLOT
+  descriptors, in all three grouped planners.
+
+WHAT IS NOT CLAIMED: only the three ROOT collations over UTF8
+(`UNICODE` = tertiary, `UNICODE_CI` = secondary, `UNICODE_CI_AI` =
+primary, by their fixed built-in ids 2/3/4). A language-TAILORED
+collation (`DE_DE`, `ES_ES_CI_AI`) is a tailoring of the root table and
+would need its locale threaded through; an ICU collation over a NARROW
+charset would need its byte-carrier values decoded to real text first.
+Both keep refusing. An INDEX over a collated column is still not used
+for retrieval (its itype is unknown to the index-op reader) and an
+INSERT into a table carrying one still refuses — pre-existing, and the
+reason the gate's fixture has no index.
+
 **FIRING USER TRIGGERS ON THIS SERVER'S OWN DML — DONE 2026-08-27
 (`serve-real-trigfire` 16, then 22).** `serve-real-trigger` has covered
 CREATE TRIGGER for a long time — the PSQL-to-BLR compile, the catalog

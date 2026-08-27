@@ -109,10 +109,13 @@ pub const TTYPE_PXW_INTL: u16 = 0x0135;
 /// one real collation converted (the key builder above). Everything
 /// else is ICU-backed in the engine - `UNICODE`, `UNICODE_CI`,
 /// `UNICODE_CI_AI`, the language-specific WIN1252/ISO8859 collations -
-/// and its order is the Unicode Collation Algorithm's, which this
-/// server has no table for: `'apple' < 'Ápple' < 'banana'` under
-/// UNICODE where the bytes say otherwise, and `'apple' = 'APPLE'` under
-/// UNICODE_CI where the bytes say they differ.
+/// and its order is the Unicode Collation Algorithm's:
+/// `'apple' < 'Ápple' < 'banana'` under UNICODE where the bytes say
+/// otherwise, and `'apple' = 'APPLE'` under UNICODE_CI where the bytes
+/// say they differ. The THREE ROOT ones over UTF8 are answered from
+/// the UCA itself ([icu_key], [icu_strength_of_ttype]); a
+/// language-tailored one, and every ICU collation over a narrow
+/// charset, still has no table here.
 ///
 /// A caller that ORDERS, GROUPS, DEDUPLICATES or COMPARES text asks
 /// this first and REFUSES when the answer is false. Answering by bytes
@@ -476,5 +479,243 @@ mod case_tests {
         // plain ASCII is plain case
         assert_eq!(pxw_intl_case(b'a', true), b'A');
         assert_eq!(pxw_intl_case(b'Z', false), b'z');
+    }
+}
+
+// ---------------------------------------------------------------------
+// THE ICU-BACKED COLLATIONS
+//
+// `UNICODE`, `UNICODE_CI` and `UNICODE_CI_AI` are the engine's
+// ICU-backed collations over the root locale, and their order is the
+// Unicode Collation Algorithm's. There is no way to convert that: it is
+// a data table (`allkeys_CLDR.txt`, tailored) that the engine gets from
+// libicu and this server gets from `icu_collator` - the one dependency
+// in the workspace, and the reason these three stopped being refusals.
+//
+// TWO LAWS, both probed against the live engine (2026-08-27, over
+// `apple/APPLE/Ápple/ápple` in three columns):
+//
+//   1. ORDER BY is FULL STRENGTH for all three. `ORDER BY <UNICODE>`,
+//      `ORDER BY <UNICODE_CI>` and `ORDER BY <UNICODE_CI_AI>` all
+//      answered the same `1 2 4 3` - the tertiary order. A CI collation
+//      does not make a sort unstable; it makes an EQUALITY loose.
+//   2. EQUALITY and GROUPING follow the collation's own strength.
+//      `= 'APPLE'` took one row under UNICODE, two under UNICODE_CI,
+//      four under UNICODE_CI_AI; `GROUP BY` made four / two / one
+//      groups over the same four rows.
+//
+// So a caller keys with [Strength::Tertiary] when it is ORDERING and
+// with the collation's own strength when it is COMPARING, GROUPING or
+// DEDUPLICATING - and both are the same sort key, cut at a different
+// level.
+
+/// How deep a collation looks before it calls two strings equal.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Strength {
+    /// Base letters only: `a` = `A` = `á` = `Á` (UNICODE_CI_AI).
+    Primary,
+    /// Accents count, case does not: `a` = `A`, `a` < `á` (UNICODE_CI).
+    Secondary,
+    /// Case counts too: `a` < `A` < `á` < `Á` (UNICODE, and the order
+    /// every one of the three SORTS by).
+    Tertiary,
+}
+
+/// The strength of a named ICU collation, or `None` when this server
+/// has no table for it.
+///
+/// Only the three ROOT-locale collations are answered. A
+/// language-specific one (`DE_DE`, `ES_ES_CI_AI`, `PT_BR`) is a
+/// TAILORING of the root table and would need its locale data threaded
+/// through, and a `CREATE COLLATION ... 'NUMERIC-SORT=1'` changes the
+/// table again - both keep refusing, which is this file's rule when it
+/// cannot reproduce an order exactly.
+pub fn icu_strength(name: &str) -> Option<Strength> {
+    match name {
+        "UNICODE" => Some(Strength::Tertiary),
+        "UNICODE_CI" => Some(Strength::Secondary),
+        "UNICODE_CI_AI" => Some(Strength::Primary),
+        _ => None,
+    }
+}
+
+/// The ttype every UTF8 ICU collation SORTS by: `UNICODE` over UTF8
+/// (collation 2, charset 4). Not a fudge - the measured law is that a
+/// sort is FULL STRENGTH whatever the column's own collation is, so
+/// ordering under `UNICODE_CI` IS ordering under `UNICODE`, and a sort
+/// key stamped with this ttype says exactly that.
+pub const TTYPE_UTF8_UNICODE: u16 = 0x0204;
+
+/// The strength of the collation a TTYPE names, or `None` when this
+/// server cannot reproduce it.
+///
+/// The ids are the engine's BUILT-IN UTF8 collations, fixed in
+/// `RDB$COLLATIONS` at database creation and never renumbered (the
+/// same table [crate::intl] and the DDL writer already spell the other
+/// way round): 0 `UTF8`, 1 `UCS_BASIC`, 2 `UNICODE`, 3 `UNICODE_CI`,
+/// 4 `UNICODE_CI_AI`.
+///
+/// Only UTF8 is claimed. A narrow charset (`WIN1252`, `ISO8859_1`)
+/// carries its ICU collations too, but its values live in this
+/// server's byte-carrier spelling and would have to be decoded to
+/// real text before a UCA key means anything - a later slice, and a
+/// refusal until then.
+pub fn icu_strength_of_ttype(ttype: u16) -> Option<Strength> {
+    if crate::intl::charset_id(ttype as i16) != crate::intl::CS_UTF8 {
+        return None;
+    }
+    match crate::intl::collation_id(ttype as i16) {
+        2 => Some(Strength::Tertiary),
+        3 => Some(Strength::Secondary),
+        4 => Some(Strength::Primary),
+        _ => None,
+    }
+}
+
+fn collator(strength: Strength) -> &'static icu_collator::CollatorBorrowed<'static> {
+    use icu_collator::{options::CollatorOptions, options::Strength as IcuStrength, CollatorBorrowed};
+    use std::sync::OnceLock;
+    static SLOTS: [OnceLock<CollatorBorrowed<'static>>; 3] =
+        [OnceLock::new(), OnceLock::new(), OnceLock::new()];
+    let (slot, s) = match strength {
+        Strength::Primary => (0usize, IcuStrength::Primary),
+        Strength::Secondary => (1, IcuStrength::Secondary),
+        Strength::Tertiary => (2, IcuStrength::Tertiary),
+    };
+    SLOTS[slot].get_or_init(|| {
+        let mut o = CollatorOptions::default();
+        o.strength = Some(s);
+        CollatorBorrowed::try_new(Default::default(), o).expect("compiled ICU collation data")
+    })
+}
+
+/// `INTL_string_to_key` for the ICU family: the UCA sort key, whose
+/// MEMCMP order is the collation's order - the same contract
+/// [pxw_intl_key] has, which is why every caller wraps both the same
+/// way.
+///
+/// TRAILING BLANKS ARE NOT KEYED (`texttype_pad_option`, probed:
+/// `'apple' = 'apple '` and the two land in ONE group). Everything
+/// else is the value, LEADING blanks included - a leading space is a
+/// real collation element under the root table's non-ignorable
+/// variable weighting, and `' apple'` sorted before `'app le'` on the
+/// live engine, which is what ICU4X's default gives.
+/// A `0x00` TERMINATOR closes the key. UCA key bytes are never zero
+/// (asserted below), so appending the same byte to both sides keeps
+/// the order right where one key is a PREFIX of the other - and it
+/// keeps the key out of reach of the blank-stripping every ordinary
+/// text compare in this server does, which would otherwise eat a
+/// trailing `0x20` weight.
+pub fn icu_key(text: &str, strength: Strength) -> Vec<u8> {
+    let trimmed = text.trim_end_matches(' ');
+    let mut out: Vec<u8> = Vec::new();
+    let _ = collator(strength).write_sort_key_to(trimmed, &mut out);
+    out.push(0x00);
+    out
+}
+
+#[cfg(test)]
+mod icu_tests {
+    use super::*;
+
+    fn order(strength: Strength, mut v: Vec<(i32, &str)>) -> Vec<i32> {
+        v.sort_by(|a, b| icu_key(a.1, strength).cmp(&icu_key(b.1, strength)).then(a.0.cmp(&b.0)));
+        v.into_iter().map(|x| x.0).collect()
+    }
+
+    /// The live engine's `ORDER BY U, ID` over the probe fixture.
+    #[test]
+    fn tertiary_key_order_matches_the_engine() {
+        let rows = vec![
+            (1, "apple"),
+            (2, "apple "),
+            (3, "app le"),
+            (4, "appl"),
+            (5, ""),
+            (6, " apple"),
+            (7, "APPLE "),
+        ];
+        assert_eq!(order(Strength::Tertiary, rows), vec![5, 6, 3, 4, 1, 2, 7]);
+    }
+
+    /// The engine's `ORDER BY <any of the three>, ID` over
+    /// apple/APPLE/Ápple/ápple: `1 2 4 3` at EVERY strength, because a
+    /// sort is always full-strength.
+    #[test]
+    fn every_icu_collation_sorts_at_full_strength() {
+        let rows = vec![(1, "apple"), (2, "APPLE"), (3, "Ápple"), (4, "ápple")];
+        assert_eq!(order(Strength::Tertiary, rows), vec![1, 2, 4, 3]);
+    }
+
+    /// ...but EQUALITY is cut at the collation's own strength.
+    #[test]
+    fn equality_follows_the_collations_strength() {
+        let k = |s: &str, st| icu_key(s, st);
+        // UNICODE: only the exact one
+        assert_ne!(k("apple", Strength::Tertiary), k("APPLE", Strength::Tertiary));
+        // UNICODE_CI: case folds, the accent does not
+        assert_eq!(k("apple", Strength::Secondary), k("APPLE", Strength::Secondary));
+        assert_ne!(k("apple", Strength::Secondary), k("ápple", Strength::Secondary));
+        // UNICODE_CI_AI: both fold
+        assert_eq!(k("apple", Strength::Primary), k("Ápple", Strength::Primary));
+    }
+
+    /// Trailing blanks are the PAD and are not keyed; a leading one is
+    /// part of the value.
+    #[test]
+    fn trailing_blanks_are_the_pad() {
+        assert_eq!(icu_key("apple", Strength::Tertiary), icu_key("apple   ", Strength::Tertiary));
+        assert_ne!(icu_key("apple", Strength::Tertiary), icu_key(" apple", Strength::Tertiary));
+    }
+
+    /// The terminator is only sound because no WEIGHT byte is zero.
+    #[test]
+    fn key_bytes_are_never_zero() {
+        for s in ["", " ", "apple", "Ápple", "ß", "æ", "日本語", "a\u{0}b", "\u{10FFFF}"] {
+            for st in [Strength::Primary, Strength::Secondary, Strength::Tertiary] {
+                let k = icu_key(s, st);
+                assert_eq!(k.last(), Some(&0u8), "{s:?}");
+                assert!(!k[..k.len() - 1].contains(&0u8), "{s:?} {st:?} {k:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn only_the_three_root_collations_are_claimed() {
+        assert_eq!(icu_strength("UNICODE"), Some(Strength::Tertiary));
+        assert_eq!(icu_strength("UNICODE_CI"), Some(Strength::Secondary));
+        assert_eq!(icu_strength("UNICODE_CI_AI"), Some(Strength::Primary));
+        assert_eq!(icu_strength("DE_DE"), None);
+        assert_eq!(icu_strength("UCS_BASIC"), None);
+    }
+}
+
+#[cfg(test)]
+mod icu_ttype_tests {
+    use super::*;
+
+    #[test]
+    fn the_utf8_builtin_ids_map_to_their_strengths() {
+        assert_eq!(icu_strength_of_ttype(0x0004), None); // UTF8 (default)
+        assert_eq!(icu_strength_of_ttype(0x0104), None); // UCS_BASIC
+        assert_eq!(icu_strength_of_ttype(0x0204), Some(Strength::Tertiary));
+        assert_eq!(icu_strength_of_ttype(0x0304), Some(Strength::Secondary));
+        assert_eq!(icu_strength_of_ttype(0x0404), Some(Strength::Primary));
+        // a narrow charset's ICU collation is not claimed
+        assert_eq!(icu_strength_of_ttype(0x0235), None);
+        assert_eq!(icu_strength_of_ttype(TTYPE_PXW_INTL), None);
+        // ...and the sort ttype is UNICODE itself
+        assert_eq!(icu_strength_of_ttype(TTYPE_UTF8_UNICODE), Some(Strength::Tertiary));
+    }
+
+    /// An ICU collation is NOT byte-keyable: grouping and deduplication
+    /// still refuse (the surviving SPELLING of a merged group is the
+    /// engine's unstable sort's pick - measured, unpinnable).
+    #[test]
+    fn icu_is_not_byte_keyable() {
+        assert!(keyable_ttype(0x0004));
+        assert!(keyable_ttype(TTYPE_PXW_INTL));
+        assert!(!keyable_ttype(0x0204));
+        assert!(!keyable_ttype(0x0304));
     }
 }

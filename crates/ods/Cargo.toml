@@ -7,3 +7,16 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+# THE ONE DEPENDENCY IN THIS WORKSPACE, and it buys a thing no amount of
+# conversion can: the Unicode Collation Algorithm's own order. Firebird's
+# UNICODE / UNICODE_CI / UNICODE_CI_AI collations are ICU-backed, so
+# without UCA data this server could only REFUSE to order, group or
+# compare text under them (it did). ICU4X's sort keys compare bytewise,
+# which is the same shape the converted PXW_INTL key builder produces.
+# PINNED EXACTLY, and it has to be: the answers this crate gives are
+# the UCA's own table, and a table is data. A minor release carrying a
+# new CLDR root collation would change an ORDER BY, silently, in a
+# project whose whole claim is that its answers match the engine's
+# byte for byte. Bump it deliberately, with a sweep.
+icu_collator = "=2.3.1"
+

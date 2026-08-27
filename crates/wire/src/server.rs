@@ -6773,8 +6773,8 @@ enum RowSource {
         tie_order: bool,
         /// per key field: does it hold a BYTE STRING, whose buckets
         /// divide on the 0x00 pad rather than the blank
-        /// ([octets_key_mask])
-        key_oct: Vec<bool>,
+        /// ([coll_key_mask])
+        key_coll: Vec<u16>,
     },
 }
 
@@ -7241,7 +7241,7 @@ impl RowSource {
                 synth_base,
                 having,
                 tie_order,
-                key_oct,
+                key_coll,
             } => {
                 // the filter below this fold, when there is one: its
                 // fields join the LIST tie order (the engine's grouping
@@ -7263,7 +7263,7 @@ impl RowSource {
                     having,
                     filter,
                     *tie_order,
-                    key_oct,
+                    key_coll,
                 )
             }
             RowSource::Sort { input, keys } => {
@@ -7289,7 +7289,7 @@ impl RowSource {
         having: &Option<Predicate>,
         keys: &[OrderKey],
         tie_order: bool,
-        key_oct: Vec<bool>,
+        key_coll: Vec<u16>,
     ) -> RowSource {
         RowSource::Sort {
             input: Box::new(RowSource::Aggregate {
@@ -7300,7 +7300,7 @@ impl RowSource {
                 synth_base,
                 having: having.clone(),
                 tie_order,
-                key_oct,
+                key_coll,
             }),
             keys: keys.to_vec(),
         }
@@ -8392,6 +8392,10 @@ AlterDomainRename {
         filter: Option<Predicate>,
         having: Option<Predicate>,
         order_by: Vec<OrderKey>,
+        /// the TTYPE of each key field in the COMBINED row
+        /// ([coll_key_mask]) - computed at PLAN time, because execute
+        /// has the joined rows but not their descriptors
+        key_coll: Vec<u16>,
         /// a deferred DRIVER band, as in [Plan::Join] - a grouped join
         /// keys its driver at execute for a parameterised WHERE too
         defer: Option<DeferredAccess>,
@@ -9067,6 +9071,16 @@ enum AggSrc {
     Star,
     /// a record field
     Field(usize),
+    /// a record field whose COLLATION decides the fold, carrying its
+    /// ttype. `MIN`/`MAX` pick by the collation's order and
+    /// `COUNT(DISTINCT)` buckets by its equality - both at the
+    /// collation's OWN strength, which is what a fold reads (measured:
+    /// `MIN(<UNICODE_CI col>)` over {APPLE, apple} answered whichever
+    /// row came FIRST, so the two are EQUAL to the fold and the
+    /// keep-unless-strictly-less rule decides - not the full-strength
+    /// order a SORT would use, which would have answered 'apple' both
+    /// ways round).
+    CollField(usize, u16),
     /// an expression evaluated per row - its eval error (divide by
     /// zero in `SUM(A / 0)`) aborts the fetch with the engine's own
     /// status vector, which is why the group fold is fallible
@@ -31660,7 +31674,7 @@ fn plan_join_bound(
             None => (Vec::new(), Vec::new()),
             Some(g) => parse_group_by(g, &items, &comb_cols, &comb_descs, synth_base)?,
         };
-        let (mut cols, mut gitems, _slot_descs) =
+        let (mut cols, mut gitems, slot_descs) =
             build_group_items(&items, &comb_cols, &comb_descs, &key_fids, &key_exprs, synth_base, params)?;
         // a PLAIN group key reads from the side it came from (probed:
         // `GROUP BY T.B` keys answer relation T, and the side's alias);
@@ -31713,7 +31727,7 @@ fn plan_join_bound(
         };
         // ORDER BY sorts the OUTPUT rows, so its names are the output
         // columns' - the same rule the single-relation grouping follows
-        let order_by = match order_s {
+        let mut order_by = match order_s {
             None => Vec::new(),
             Some(os) => parse_order_by(os, &cols, &[], |n| {
                 let bare = n.rsplit('.').next().unwrap_or(n);
@@ -31722,11 +31736,16 @@ fn plan_join_bound(
                     .filter(|&p| matches!(gitems.get(p), Some(GItem::Key(_))))
             })?,
         };
+        // ...and its keys read the GROUP ROW, whose slots carry the
+        // collation the sort needs ([stamp_group_order_coll])
+        stamp_group_order_coll(&mut order_by, &slot_descs);
         // AN ICU COLLATION DECIDES WHICH ROWS ARE ONE GROUP, and this
         // server has no table for it: `UNICODE_CI` puts 'apple' and
         // 'APPLE' in ONE bucket where the bytes make two. Refuse
         // ([coll_keyable]).
-        if key_fids.iter().any(|f| comb_descs.get(*f).is_some_and(|d| !coll_keyable(d))) {
+        if key_fids.iter().any(|f| comb_descs.get(*f).is_some_and(|d| !coll_groupable(d)))
+            || agg_needs_unkeyable_coll(&gitems, &comb_descs)
+        {
             return Some(Plan::Refused);
         }
         return Some(Plan::JoinGroup {
@@ -31734,6 +31753,7 @@ fn plan_join_bound(
             base_width: sides[0].descs.len(),
             parts,
             cols,
+            key_coll: coll_key_mask(&comb_descs, &key_fids),
             gitems,
             key_fids,
             key_exprs: key_exprs.into_iter().map(|(_, e)| e).collect(),
@@ -32869,7 +32889,7 @@ fn plan_over_source(
             None => (Vec::new(), Vec::new()),
             Some(g) => parse_group_by(g, &items, &columns, &descs, synth_base)?,
         };
-        let (mut gcols, mut gitems, _slot_descs) =
+        let (mut gcols, mut gitems, slot_descs) =
             build_group_items(&items, &columns, &descs, &key_fids, &key_exprs, synth_base, params)?;
         // a grouped KEY over the derived rows keeps the INNER column's
         // field name, exactly as the ungrouped read does (probed:
@@ -32924,7 +32944,7 @@ fn plan_over_source(
         if np != dgroup_params {
             return None;
         }
-        let order_by = match order_s {
+        let mut order_by = match order_s {
             None => Vec::new(),
             Some(os) => parse_order_by(os, &gcols, &[], |n| {
                 let bare = n.rsplit('.').next().unwrap_or(n);
@@ -32934,8 +32954,15 @@ fn plan_over_source(
                     .filter(|&p| matches!(gitems.get(p), Some(GItem::Key(_))))
             })?,
         };
-        // an ICU collation decides which rows are one group ([coll_keyable])
-        if key_fids.iter().any(|f| descs.get(*f).is_some_and(|d| !coll_keyable(d))) {
+        stamp_group_order_coll(&mut order_by, &slot_descs);
+        // a collation decides which rows are one group, and which value
+        // a MIN/MAX or a COUNT(DISTINCT) folds to ([coll_groupable],
+        // [agg_needs_unkeyable_coll]) - the fold check was missing here
+        // and in the join planner above, so a collation with no key
+        // reached them and folded by BYTES
+        if key_fids.iter().any(|f| descs.get(*f).is_some_and(|d| !coll_groupable(d)))
+            || agg_needs_unkeyable_coll(&gitems, &descs)
+        {
             return Some(Plan::Refused);
         }
         return Some(Plan::JoinGroup {
@@ -32943,6 +32970,7 @@ fn plan_over_source(
             base_width: descs.len(),
             parts: Vec::new(),
             cols: gcols,
+            key_coll: coll_key_mask(&descs, &key_fids),
             gitems,
             key_fids,
             key_exprs: key_exprs.into_iter().map(|(_, e)| e).collect(),
@@ -34072,7 +34100,7 @@ fn branch_rows_res(
             rows.append(&mut branch_rows_res(b, db, args)?);
         }
         if *distinct {
-            distinct_rows(&mut rows, order_by.is_some(), &octets_cols(&output_cols_of(plan)));
+            distinct_rows(&mut rows, order_by.is_some(), &coll_cols(&output_cols_of(plan)));
         }
         if let Some(key) = order_by {
             let keys = [key.clone()];
@@ -34120,7 +34148,7 @@ fn branch_rows_res(
         }
         let mut rows = branch_rows_res(inner, db, args)?;
         if *distinct {
-            distinct_rows(&mut rows, plan_is_ordered(inner), &octets_cols(&output_cols_of(inner)));
+            distinct_rows(&mut rows, plan_is_ordered(inner), &coll_cols(&output_cols_of(inner)));
         }
         return Ok(rows.into_iter().skip(*skip).take(take.unwrap_or(usize::MAX)).collect());
     }
@@ -34165,7 +34193,7 @@ fn branch_rows_res(
             &having,
             order_by,
             true,
-            octets_key_mask(cols, key_fids),
+            coll_key_mask(&descs_now, key_fids),
         )
         .rows(db)?;
         return rows
@@ -34230,6 +34258,7 @@ fn branch_rows_res(
         filter,
         having,
         order_by,
+        key_coll,
         defer,
     } = plan
     {
@@ -34251,7 +34280,7 @@ fn branch_rows_res(
             // follow the engine's referenced-fields record; a real
             // join's keep the delivery order (both measured)
             parts.is_empty(),
-            octets_key_mask(cols, key_fids),
+            key_coll.clone(),
         )
         .rows(db)?;
         return rows
@@ -34372,60 +34401,137 @@ fn branch_rows_each(
 /// Two projected rows are the same row for UNION's set semantics -
 /// compared column by column, with NULL equal to NULL (a set operation
 /// treats them as the same value, unlike `= NULL` in a predicate).
-fn rows_equal(a: &[Value], b: &[Value], oct: &[bool]) -> bool {
+fn rows_equal(a: &[Value], b: &[Value], coll: &[u16]) -> bool {
     a.len() == b.len()
-        && a.iter().zip(b.iter()).enumerate().all(|(i, (x, y))| match (x, y) {
-            (Value::Null, Value::Null) => true,
-            (Value::Null, _) | (_, Value::Null) => false,
-            // a BINARY column is the same value under the 0x00 pad, not
-            // the blank one: `x'61'` and `x'6100'` are ONE row to a set
-            _ if oct.get(i).copied().unwrap_or(false) => {
-                octets_value_cmp(x, y) == std::cmp::Ordering::Equal
+        && a.iter().zip(b.iter()).enumerate().all(|(i, (x, y))| {
+            let tt = coll.get(i).copied().unwrap_or(0);
+            match (x, y) {
+                (Value::Null, Value::Null) => true,
+                (Value::Null, _) | (_, Value::Null) => false,
+                // a BINARY column is the same value under the 0x00 pad,
+                // not the blank one: `x'61'` and `x'6100'` are ONE row
+                // to a set
+                _ if coll_is_octets(tt) => {
+                    octets_value_cmp(x, y) == std::cmp::Ordering::Equal
+                }
+                // a COLLATED one is the same value when its collation
+                // says so - the key decides, not the bytes
+                _ => match coll_value_cmp(x, y, tt) {
+                    Some(o) => o == std::cmp::Ordering::Equal,
+                    None => value_cmp(x, y) == std::cmp::Ordering::Equal,
+                },
             }
-            _ => value_cmp(x, y) == std::cmp::Ordering::Equal,
         })
 }
 
-/// The octets-ness of a fold's KEY FIELDS, read off the projection
-/// (`ProjCol` carries both the field id and the described sub_type).
-/// A key that no output column reads keeps `false` - the blank-padded
-/// bucketing - which is the pre-existing answer, never a new one.
-fn octets_key_mask(cols: &[ProjCol], key_fids: &[usize]) -> Vec<bool> {
-    let oct = |fid: usize| {
-        cols.iter().any(|c| {
-            c.field_id == fid
-                && c.expr.is_none()
-                && (0..=i16::MAX as i32).contains(&c.sub_type)
-                && fire_crab_ods::intl::charset_id(c.sub_type as i16)
-                    == fire_crab_ods::intl::CS_OCTETS
+/// The TTYPE of a fold's KEY FIELDS: the charset and collation that
+/// decide which rows are ONE GROUP, and in what ORDER the groups come
+/// back. Read off the RECORD descriptors, which is where a key's
+/// collation lives - a SYNTHETIC key slot (an expression key, past
+/// `synth_base`) has no descriptor and keeps `0`, the blank-padded byte
+/// bucketing.
+///
+/// It used to be read off the PROJECTION, matching `ProjCol::field_id`
+/// against the key's field id - and in a GROUPED plan a ProjCol's
+/// `field_id` is its OUTPUT SLOT, not a record field, so the match hit
+/// the wrong column or none at all (measured: `GROUP BY <UNICODE col>`
+/// looked up key field 1 among output slots 0 and 1 and took slot 1,
+/// the COUNT, whose ttype is 0 - so the groups came back in byte
+/// order).
+/// The ttype an ORDER key carries for a descriptor: the collation (or
+/// the binary charset) that decides its order, `0` for the plain value
+/// ordering. An ICU collation rides as UNICODE's ttype because a SORT
+/// is FULL STRENGTH whatever the column's own strength is (measured).
+fn order_key_ttype(d: &Descriptor) -> u16 {
+    let tt = d.sub_type as u16;
+    if d.sub_type < 0 {
+        0
+    } else if tt == fire_crab_ods::coll::TTYPE_PXW_INTL {
+        tt
+    } else if fire_crab_ods::coll::icu_strength_of_ttype(tt).is_some() {
+        fire_crab_ods::coll::TTYPE_UTF8_UNICODE
+    } else if coll_is_octets(tt) {
+        fire_crab_ods::intl::CS_OCTETS as u16
+    } else {
+        0
+    }
+}
+
+/// Stamp a GROUPED statement's ORDER BY keys with the collation of the
+/// group-row SLOT each one reads.
+///
+/// The parse above them has no descriptors to stamp from - an order key
+/// over a grouped output indexes the GROUP ROW, not a record - so a key
+/// over a COLLATED group key came back with `coll: 0` and sorted the
+/// groups by BYTES (measured: `GROUP BY <UNICODE col> ORDER BY 1`
+/// answered byte order where the engine answers the collation's).
+fn stamp_group_order_coll(keys: &mut [OrderKey], slot_descs: &[Option<Descriptor>]) {
+    for k in keys.iter_mut() {
+        if k.expr.is_none() {
+            if let Some(Some(d)) = slot_descs.get(k.field) {
+                k.coll = order_key_ttype(d);
+            }
+        }
+    }
+}
+
+fn coll_key_mask(descs: &[Descriptor], key_fids: &[usize]) -> Vec<u16> {
+    key_fids
+        .iter()
+        .map(|f| match descs.get(*f) {
+            Some(d) if d.sub_type >= 0 => d.sub_type as u16,
+            _ => 0,
         })
-    };
-    key_fids.iter().map(|f| oct(*f)).collect()
+        .collect()
 }
 
 /// Which output columns answer OCTETS - the mask the set and sort
 /// machinery needs, read off the projection the describe already
 /// announces.
-/// Does this PROJECTION carry a column whose ICU collation would decide
-/// a dedup - `DISTINCT`, a distinct `UNION` - that this server cannot
+/// Does this PROJECTION carry a column whose collation would decide a
+/// dedup - `DISTINCT`, a distinct `UNION` - that this server cannot
 /// make? A text ProjCol's `sub_type` is the ttype (charset low byte,
-/// collation high), which is all [coll::keyable_ttype] needs; an
-/// EXPRESSION column carries a negative sentinel and is skipped by the
-/// range test, as a non-text one is by the wire form.
+/// collation high); an EXPRESSION column carries a negative sentinel
+/// and is skipped by the range test, as a non-text one is by the wire
+/// form.
 fn cols_unkeyable_coll(cols: &[ProjCol]) -> bool {
     cols.iter().any(|c| {
         matches!(c.wire, Wire::Text | Wire::Varying)
             && (0..=i16::MAX as i32).contains(&c.sub_type)
-            && !fire_crab_ods::coll::keyable_ttype(c.sub_type as u16)
+            && !coll_groupable_ttype(c.sub_type as u16)
     })
 }
 
-fn octets_cols(cols: &[ProjCol]) -> Vec<bool> {
+/// Can this server say which rows are ONE VALUE under this ttype's
+/// collation, AND which SPELLING of them survives?
+///
+/// The first half is a key ([coll::keyable_ttype] for byte order,
+/// [coll_value_cmp] for a keyed collation). The second half is what
+/// rules out a CASE- or ACCENT-INSENSITIVE collation: it calls two
+/// DIFFERENT strings one value, and the engine's pick between them
+/// follows its own sort's internal order - measured three ways, no rule
+/// between them (`GROUP BY <CI>` over {apple, APPLE} kept whichever was
+/// inserted SECOND; over four spellings it kept one that was neither
+/// first nor last; and `DISTINCT` answers a different survivor from
+/// `GROUP BY` over the same rows). A FULL-STRENGTH collation asks no
+/// such question: strings it calls equal are the same string.
+fn coll_groupable_ttype(ttype: u16) -> bool {
+    fire_crab_ods::coll::keyable_ttype(ttype)
+        || ttype == fire_crab_ods::coll::TTYPE_PXW_INTL
+        || fire_crab_ods::coll::icu_strength_of_ttype(ttype)
+            == Some(fire_crab_ods::coll::Strength::Tertiary)
+}
+
+/// The same for a whole PROJECTION - what a `DISTINCT` or a distinct
+/// `UNION` deduplicates by, column for column.
+fn coll_cols(cols: &[ProjCol]) -> Vec<u16> {
     cols.iter()
         .map(|c| {
-            (0..=i16::MAX as i32).contains(&c.sub_type)
-                && fire_crab_ods::intl::charset_id(c.sub_type as i16)
-                    == fire_crab_ods::intl::CS_OCTETS
+            if (0..=i16::MAX as i32).contains(&c.sub_type) {
+                c.sub_type as u16
+            } else {
+                0
+            }
         })
         .collect()
 }
@@ -34451,7 +34557,7 @@ fn octets_cols(cols: &[ProjCol]) -> Vec<bool> {
 /// answers descending, so `ordered` says whether something else has
 /// already decided the row order; only when nothing has does the set's
 /// own ascending order show through.
-fn distinct_rows(rows: &mut Vec<Vec<Value>>, ordered: bool, oct: &[bool]) {
+fn distinct_rows(rows: &mut Vec<Vec<Value>>, ordered: bool, coll: &[u16]) {
     // SORT, THEN DROP ADJACENT EQUALS (the engine's SORT_unique over a
     // projection) - in place of the quadratic seen-list this was. Each
     // row carries its input position as a trailing key, so the stable
@@ -34471,9 +34577,7 @@ fn distinct_rows(rows: &mut Vec<Vec<Value>>, ordered: bool, oct: &[bool]) {
     let mut keys: Vec<OrderKey> = (0..width)
         .map(|i| {
             let mut k = OrderKey::field(i, false, NullsAt::Default);
-            if oct.get(i).copied().unwrap_or(false) {
-                k.coll = fire_crab_ods::intl::CS_OCTETS as u16;
-            }
+            k.coll = coll.get(i).copied().unwrap_or(0);
             k
         })
         .collect();
@@ -34484,7 +34588,7 @@ fn distinct_rows(rows: &mut Vec<Vec<Value>>, ordered: bool, oct: &[bool]) {
     let mut kept: Vec<Vec<Value>> = Vec::new();
     for r in sorted {
         if let Some(last) = kept.last() {
-            if rows_equal(&last[..width], &r[..width], oct) {
+            if rows_equal(&last[..width], &r[..width], coll) {
                 continue;
             }
         }
@@ -36838,7 +36942,7 @@ fn resolve_agg_src(
             if is_computed_fid(descs, fid) {
                 return None;
             }
-            (AggSrc::Field(fid), matches!(target, AggTarget::Distinct(_)))
+            (agg_field_src(fid, descs), matches!(target, AggTarget::Distinct(_)))
         }
         AggTarget::DistinctExpr(raw) => {
             (AggSrc::Expr(resolve_expr(raw, columns, descs)?), true)
@@ -37602,7 +37706,7 @@ fn build_group_items(
                 // unless the source is already INT128; both keep the
                 // source's scale (the engine's NUMERIC(18,s) widening)
                 let field_desc = match &src {
-                    AggSrc::Field(f) => descs.get(*f),
+                    AggSrc::Field(f) | AggSrc::CollField(f, _) => descs.get(*f),
                     // PERCENTILE_DISC keeps the ORDER BY value's own type -
                     // over a bare column that is the column's descriptor
                     AggSrc::Percentile { order: Expr::Col(f), .. } => descs.get(*f),
@@ -37610,7 +37714,7 @@ fn build_group_items(
                 };
                 // (type, scale, rank) of the aggregate's input
                 let src_shape: Option<(ExprType, i8, NumRank)> = match (&src, field_desc) {
-                    (AggSrc::Field(_), Some(d))
+                    (AggSrc::Field(_) | AggSrc::CollField(..), Some(d))
                     | (AggSrc::Percentile { .. }, Some(d)) => {
                         let t = if matches!(col_kind(d), Some(ColKind::Int)) {
                             ExprType::Int
@@ -38105,11 +38209,13 @@ fn plan_group(
     };
     drop(gitems_cell);
     drop(slot_descs_cell);
+    let mut order_by = order_by;
+    stamp_group_order_coll(&mut order_by, &slot_descs);
     // AN ICU COLLATION DECIDES WHICH ROWS ARE ONE GROUP - `UNICODE_CI`
     // buckets 'apple' with 'APPLE' where the bytes make two groups - and
     // this server has no table for it ([coll_keyable]); MIN/MAX over
     // such a column picks by that order too
-    if key_fids.iter().any(|f| descs.get(*f).is_some_and(|d| !coll_keyable(d)))
+    if key_fids.iter().any(|f| descs.get(*f).is_some_and(|d| !coll_groupable(d)))
         || agg_needs_unkeyable_coll(&gitems, descs)
     {
         return Some(Plan::Refused);
@@ -40377,7 +40483,10 @@ struct OrderKey {
     nulls: NullsAt,
     /// The ttype whose COLLATION orders this key's text - `0` = none
     /// (the plain value ordering). Stamped at resolution off the
-    /// column descriptor; only `coll::TTYPE_PXW_INTL` is driven so far.
+    /// column descriptor: `coll::TTYPE_PXW_INTL`, the OCTETS charset,
+    /// or `coll::TTYPE_UTF8_UNICODE` for any of the three ICU
+    /// collations (a sort is full strength whatever the column's own
+    /// strength is - measured).
     coll: u16,
 }
 
@@ -40543,6 +40652,33 @@ fn collated_text_cmp(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
     Some(fire_crab_ods::coll::pxw_intl_compare(&bx, &by))
 }
 
+/// Compare two text values under an ICU collation: the UCA sort keys
+/// compare bytewise, which IS the collation's order (`coll::icu_key`).
+/// A non-text value keeps the plain ordering.
+/// Compare two values under the COLLATION a ttype names - `PXW_INTL`
+/// through its converted key tables, the ICU family through the UCA
+/// key at the collation's own strength. `None` when the ttype names no
+/// collation this server keys, or the values are not text.
+fn coll_value_cmp(a: &Value, b: &Value, ttype: u16) -> Option<std::cmp::Ordering> {
+    if ttype == fire_crab_ods::coll::TTYPE_PXW_INTL {
+        return collated_text_cmp(a, b);
+    }
+    let st = fire_crab_ods::coll::icu_strength_of_ttype(ttype)?;
+    icu_text_cmp(a, b, st)
+}
+
+fn icu_text_cmp(
+    a: &Value,
+    b: &Value,
+    strength: fire_crab_ods::coll::Strength,
+) -> Option<std::cmp::Ordering> {
+    let (Value::Text(x), Value::Text(y)) = (a, b) else { return None };
+    Some(
+        fire_crab_ods::coll::icu_key(x, strength)
+            .cmp(&fire_crab_ods::coll::icu_key(y, strength)),
+    )
+}
+
 fn order_cmp(a: &[Value], b: &[Value], keys: &[OrderKey]) -> std::cmp::Ordering {
     use std::cmp::Ordering::{Equal, Greater, Less};
     let nullv = Value::Null;
@@ -40570,6 +40706,10 @@ fn order_cmp(a: &[Value], b: &[Value], keys: &[OrderKey]) -> std::cmp::Ordering 
         } else {
             let o = if key.coll == fire_crab_ods::coll::TTYPE_PXW_INTL {
                 collated_text_cmp(va, vb).unwrap_or_else(|| value_cmp(va, vb))
+            } else if let Some(st) =
+                fire_crab_ods::coll::icu_strength_of_ttype(key.coll)
+            {
+                icu_text_cmp(va, vb, st).unwrap_or_else(|| value_cmp(va, vb))
             } else if coll_is_octets(key.coll) {
                 octets_value_cmp(va, vb)
             } else {
@@ -40624,7 +40764,7 @@ fn group_output(
         synth_base,
         having: having.clone(),
         tie_order: true,
-        key_oct: Vec::new(),
+        key_coll: Vec::new(),
     }
     .rows(db)
 }
@@ -41212,7 +41352,7 @@ fn group_rows(
     having: &Option<Predicate>,
     filter: Option<&Predicate>,
     tie_order: bool,
-    key_oct: &[bool],
+    key_coll: &[u16],
 ) -> Result<Vec<Vec<Value>>, EvalErr> {
     // expression keys: evaluate each into its synthetic slot, so the
     // bucketing sort and the Key output items read it like a field.
@@ -41236,10 +41376,13 @@ fn group_rows(
             .enumerate()
             .map(|(i, &f)| {
                 let mut k = OrderKey::field(f, false, NullsAt::Default);
-                // a BINARY key buckets on the 0x00 pad
-                if key_oct.get(i).copied().unwrap_or(false) {
-                    k.coll = fire_crab_ods::intl::CS_OCTETS as u16;
-                }
+                // a BINARY key buckets on the 0x00 pad, a COLLATED
+                // one on its collation's key - and the groups then come
+                // back in the COLLATION's order, which is the order the
+                // engine answers them in (measured: `GROUP BY <PXW col>`
+                // answered ae, ä, apple, APPLE, Ápple, banana - its
+                // collation's order, not the bytes')
+                k.coll = key_coll.get(i).copied().unwrap_or(0);
                 k
             })
             .collect();
@@ -41276,7 +41419,7 @@ fn group_rows(
                     GItem::Key(_) | GItem::Const(_) => {}
                     GItem::Agg(_, src, _) => match src {
                         AggSrc::Star => {}
-                        AggSrc::Field(f) => {
+                        AggSrc::Field(f) | AggSrc::CollField(f, _) => {
                             mark(*f);
                         }
                         AggSrc::Expr(e) => {
@@ -41697,7 +41840,9 @@ fn compute_group(rows: &[Vec<Value>], gitems: &[GItem]) -> Result<Vec<Value>, Ev
     fn src_value(src: &AggSrc, r: &[Value]) -> Result<Value, EvalErr> {
         Ok(match src {
             AggSrc::Star => Value::Int(1),
-            AggSrc::Field(fid) => r.get(*fid).cloned().unwrap_or(Value::Null),
+            AggSrc::Field(fid) | AggSrc::CollField(fid, _) => {
+                r.get(*fid).cloned().unwrap_or(Value::Null)
+            }
             AggSrc::Expr(e) => e.eval(r)?,
             // a paired source folds through its own arm, never here
             AggSrc::Pair(y, _) => y.eval(r)?,
@@ -41706,6 +41851,20 @@ fn compute_group(rows: &[Vec<Value>], gitems: &[GItem]) -> Result<Vec<Value>, Ev
             // a percentile folds through its own arm, never here
             AggSrc::Percentile { order, .. } => order.eval(r)?,
         })
+    }
+    // THE COMPARISON A FOLD MAKES. A collated source compares by its
+    // COLLATION - `MIN(<UNICODE_CI col>)` over {'APPLE', 'apple'} finds
+    // them EQUAL, and the keep-unless-strictly-less rule below then
+    // answers whichever row came first, which is what the engine
+    // answers (measured both ways round). Everything else keeps the one
+    // comparison rule every other fold has used.
+    fn fold_cmp(a: &Value, b: &Value, src: &AggSrc) -> std::cmp::Ordering {
+        if let AggSrc::CollField(_, tt) = src {
+            if let Some(o) = coll_value_cmp(a, b, *tt) {
+                return o;
+            }
+        }
+        num_cmp(a, b).unwrap_or_else(|| value_cmp(a, b))
     }
     gitems
         .iter()
@@ -41737,11 +41896,9 @@ fn compute_group(rows: &[Vec<Value>], gitems: &[GItem]) -> Result<Vec<Value>, Ev
                         if matches!(v, Value::Null) {
                             continue;
                         }
-                        let dup = seen.iter().any(|s| {
-                            num_cmp(s, &v)
-                                .unwrap_or_else(|| value_cmp(s, &v))
-                                == std::cmp::Ordering::Equal
-                        });
+                        let dup = seen
+                            .iter()
+                            .any(|s| fold_cmp(s, &v, src) == std::cmp::Ordering::Equal);
                         if !dup {
                             seen.push(v);
                         }
@@ -41761,8 +41918,7 @@ fn compute_group(rows: &[Vec<Value>], gitems: &[GItem]) -> Result<Vec<Value>, Ev
                         best = Some(match best {
                             None => v,
                             Some(b) => {
-                                let ord =
-                                    num_cmp(&b, &v).unwrap_or_else(|| value_cmp(&b, &v));
+                                let ord = fold_cmp(&b, &v, src);
                                 let keep_b = if matches!(func, AggFn::Min) {
                                     ord != std::cmp::Ordering::Greater
                                 } else {
@@ -44107,7 +44263,7 @@ fn emit_rows_inner(
                             }
                             rows_v.push(row);
                         }
-                        distinct_rows(&mut rows_v, !order_by.is_empty(), &octets_cols(icols));
+                        distinct_rows(&mut rows_v, !order_by.is_empty(), &coll_cols(icols));
                         for r in rows_v.iter().skip(*skip).take(take.unwrap_or(usize::MAX)) {
                             encode_row(w, cols, r, out)?;
                         }
@@ -44197,7 +44353,7 @@ fn emit_rows_inner(
                 // DISTINCT compares whole projected rows with NULL equal
                 // to NULL - the same set semantics UNION uses
                 if *distinct {
-                    distinct_rows(&mut rows, plan_is_ordered(inner), &octets_cols(&output_cols_of(inner)));
+                    distinct_rows(&mut rows, plan_is_ordered(inner), &coll_cols(&output_cols_of(inner)));
                 }
                 for r in rows.iter().skip(*skip).take(take.unwrap_or(usize::MAX)) {
                     encode_row(w, cols, r, out)?;
@@ -44245,7 +44401,7 @@ fn emit_rows_inner(
                 // duplicates of each other here (SQL's set semantics),
                 // unlike `= NULL` in a predicate.
                 if *distinct {
-                    distinct_rows(&mut rows, order_by.is_some(), &octets_cols(cols));
+                    distinct_rows(&mut rows, order_by.is_some(), &coll_cols(cols));
                 }
                 if let Some(key) = order_by {
                     let keys = [key.clone()];
@@ -44668,6 +44824,7 @@ fn emit_rows_inner(
             filter,
             having,
             order_by,
+            key_coll,
             defer,
         } => {
             if let Some(db) = db {
@@ -44686,7 +44843,7 @@ fn emit_rows_inner(
                     &having,
                     order_by,
                     parts.is_empty(),
-                    octets_key_mask(cols, key_fids),
+                    key_coll.clone(),
                 )
                 .rows(db)
                 .map_err(EmitErr::Eval)?;
@@ -44744,7 +44901,7 @@ fn emit_rows_inner(
                     &having,
                     order_by,
                     true,
-                    octets_key_mask(cols, key_fids),
+                    coll_key_mask(&descs_now, key_fids),
                 )
                 .rows(db)
                 .map_err(EmitErr::Eval)?;
@@ -53624,8 +53781,21 @@ impl Expr {
             // exactly through num_cmp, a double one through the
             // approx promotion, and a bad one raises 22018 carrying
             // the raw (CHAR-padded) value
-            Expr::CollKey(e, _tt) => match e.eval(values)? {
+            Expr::CollKey(e, tt) => match e.eval(values)? {
                 Value::Null => Value::Null,
+                // an ICU collation: the UCA sort key, cut at the
+                // collation's own strength, carried as a byte-per-char
+                // string so the ordinary value compare runs over it
+                Value::Text(s)
+                    if fire_crab_ods::coll::icu_strength_of_ttype(*tt).is_some() =>
+                {
+                    let Some(st) = fire_crab_ods::coll::icu_strength_of_ttype(*tt) else {
+                        return Ok(Value::Text(s)); // the guard above says otherwise
+                    };
+                    Value::Text(fire_crab_ods::intl::carrier_decode(
+                        &fire_crab_ods::coll::icu_key(&s, st),
+                    ))
+                }
                 Value::Text(s) => {
                     match fire_crab_ods::intl::encode_text(
                         fire_crab_ods::intl::CS_WIN1252,
@@ -55874,11 +56044,12 @@ fn build_correlated_lookup(
             let d = agg_result_desc(*func, &target, &columns, &descs)?;
             let src = match &target {
                 AggTarget::Star => AggSrc::Star,
-                AggTarget::Col(n) => AggSrc::Field(
+                AggTarget::Col(n) => agg_field_src(
                     columns
                         .iter()
                         .find(|c| c.name.eq_ignore_ascii_case(n))?
                         .field_id as usize,
+                    &descs,
                 ),
                 _ => return None,
             };
@@ -56567,7 +56738,7 @@ fn eval_subquery_rel(
                 {
                     return None;
                 }
-                (AggSrc::Field(fid), matches!(target, AggTarget::Distinct(_)))
+                (agg_field_src(fid, &descs), matches!(target, AggTarget::Distinct(_)))
             }
             AggTarget::DistinctExpr(raw) => {
                 // COUNT-only (checked below), so no SUM/AVG type guard
@@ -58161,7 +58332,7 @@ fn parse_order_by_expr(
     resolve_expression: impl Fn(&str) -> Option<Expr>,
 ) -> Option<Vec<OrderKey>> {
     // a FIELD key over a COLLATED column sorts by that collation - the
-    // ttype rides the key ([OrderKey::coll]; PXW_INTL is the one driven)
+    // ttype rides the key ([OrderKey::coll])
     let stamp = |mut k: OrderKey| -> OrderKey {
         match &k.expr {
             None => {
@@ -58170,9 +58341,18 @@ fn parse_order_by_expr(
                 // by the 0x00-padded byte order, which is not the
                 // blank-padded text order [octets_value_cmp]
                 if tt == Some(fire_crab_ods::coll::TTYPE_PXW_INTL) {
-                    // (an ICU collation never reaches here - the caller
-                    // refuses the whole ORDER BY, see below)
                     k.coll = fire_crab_ods::coll::TTYPE_PXW_INTL;
+                } else if tt.is_some_and(|t| {
+                    fire_crab_ods::coll::icu_strength_of_ttype(t).is_some()
+                }) {
+                    // AN ICU COLLATION SORTS AT FULL STRENGTH whatever
+                    // its own is - measured: `ORDER BY <UNICODE>`,
+                    // `ORDER BY <UNICODE_CI>` and
+                    // `ORDER BY <UNICODE_CI_AI>` all answered the same
+                    // 1 2 4 3 over apple/APPLE/Ápple/ápple. A CI
+                    // collation makes an EQUALITY loose, not a sort
+                    // unstable - so the key rides as UNICODE's ttype
+                    k.coll = fire_crab_ods::coll::TTYPE_UTF8_UNICODE;
                 } else if tt.map_or(false, coll_is_octets) {
                     k.coll = fire_crab_ods::intl::CS_OCTETS as u16;
                 }
@@ -58181,6 +58361,11 @@ fn parse_order_by_expr(
             Some(e) => {
                 if expr_is_octets(e, descs) {
                     k.coll = fire_crab_ods::intl::CS_OCTETS as u16;
+                } else if expr_reads_icu(e, descs) {
+                    // the collation travels into the result -
+                    // `ORDER BY CI || 'x'` is the collation's order -
+                    // and a sort reads it at full strength
+                    k.coll = fire_crab_ods::coll::TTYPE_UTF8_UNICODE;
                 }
             }
         }
@@ -58192,7 +58377,7 @@ fn parse_order_by_expr(
     // last, and a wrong ORDER is a wrong answer with nothing to show
     // for it ([coll_keyable]).
     let unkeyable = |k: &OrderKey| -> bool {
-        let bad = |fid: usize| descs.get(fid).is_some_and(|d| !coll_keyable(d));
+        let bad = |fid: usize| descs.get(fid).is_some_and(|d| !coll_orderable(d));
         match &k.expr {
             None => bad(k.field),
             // an EXPRESSION over such a column carries its collation
@@ -58256,7 +58441,7 @@ fn parse_order_by_expr(
             // EXPRESSION key, computed per row
             match resolve_expression(head) {
                 Some(e) => {
-                    keys.push(OrderKey { field: 0, expr: Some(e), desc, nulls, coll: 0 });
+                    keys.push(stamp(OrderKey { field: 0, expr: Some(e), desc, nulls, coll: 0 }));
                     continue;
                 }
                 None => return None,
@@ -58277,7 +58462,7 @@ fn parse_order_by_expr(
             // `sort_rows`. This used to refuse, which was right only
             // while nothing evaluated expression keys.
             if let Some(e) = &cols[ord - 1].expr {
-                keys.push(OrderKey { field: 0, expr: Some(e.clone()), desc, nulls, coll: 0 });
+                keys.push(stamp(OrderKey { field: 0, expr: Some(e.clone()), desc, nulls, coll: 0 }));
                 continue;
             }
             cols[ord - 1].field_id
@@ -58293,7 +58478,7 @@ fn parse_order_by_expr(
                     // the same rule as the ordinal above: an aliased
                     // EXPRESSION sorts by the expression it names
                     if let Some(e) = &c.expr {
-                        keys.push(OrderKey { field: 0, expr: Some(e.clone()), desc, nulls, coll: 0 });
+                        keys.push(stamp(OrderKey { field: 0, expr: Some(e.clone()), desc, nulls, coll: 0 }));
                         continue;
                     }
                     c.field_id
@@ -63601,6 +63786,71 @@ fn runtime_with_position(
     }
 }
 
+/// The relations whose text carries a COLLATION other than its
+/// charset's default, by name - one catalog walk per generation.
+///
+/// EMPTY IS THE COMMON CASE and the reason this is computed at all:
+/// with no collated column anywhere in the database, no BLR in it can
+/// let a collation decide anything, and [blr_reads_collated_relation]
+/// answers without decoding a byte.
+fn collated_relations(db: &Database) -> std::sync::Arc<Vec<String>> {
+    db.meta_memo("collated-relations", "", || {
+        let image = db.bytes();
+        let ps = db.page_size;
+        fire_crab_ods::catalog::list_relations(&image, ps)
+            .into_iter()
+            .filter(|(id, _)| {
+                fire_crab_ods::format::relation_formats(&image, ps, *id)
+                    .iter()
+                    .any(|(_, descs)| {
+                        descs.iter().any(|d| {
+                            matches!(col_kind(d), Some(ColKind::Text))
+                                && d.sub_type >= 0
+                                && fire_crab_ods::intl::collation_id(d.sub_type) != 0
+                        })
+                    })
+            })
+            .map(|(_, name)| name.trim_end().to_ascii_uppercase())
+            .collect()
+    })
+}
+
+/// Does this BLR read a relation that carries a COLLATED text column?
+///
+/// The BLR executor compares text with no descriptor in reach - it
+/// compares the VALUES, blank-padded - so a collation cannot decide
+/// anything there: measured, a procedure whose body is
+/// `SELECT COUNT(*) FROM T WHERE CI = 'APPLE'` over a `UNICODE_CI`
+/// column answered ONE where the engine answers two, while the same
+/// statement typed at the prompt answered two. The fast path therefore
+/// stands aside for such a relation and the SOURCE interpreter serves
+/// the call, re-planning the statement through the collation-aware
+/// planner. This covers PXW_INTL as much as the ICU family: any
+/// collation but the charset's default.
+///
+/// The question is asked the way round that PROVES an answer. A first
+/// draft asked it of the BLR's own relation names and treated anything
+/// it could not resolve as collated - which refused every recursive
+/// CTE in a procedure body (the recursion's name is no relation) and,
+/// through the decode-failure arm, every WINDOW one. Reading the
+/// COLLATED SET first inverts that: nothing collated in the database
+/// means nothing to decide, whatever the BLR contains, and only a
+/// database that HAS a collation pays for an undecodable body.
+fn blr_reads_collated_relation(db: &Database, blr: &[u8]) -> bool {
+    let collated = collated_relations(db);
+    if collated.is_empty() {
+        return false;
+    }
+    match fire_crab_ods::blr::decode(blr) {
+        // it cannot be read, and this database has a collation in it
+        Err(_) => true,
+        Ok(decoded) => decoded
+            .relations
+            .iter()
+            .any(|n| collated.iter().any(|c| c.eq_ignore_ascii_case(n.trim_end()))),
+    }
+}
+
 fn try_procedure_blr(
     database: &Option<Database>,
     name: &str,
@@ -63612,6 +63862,9 @@ fn try_procedure_blr(
     let Ok(blr) = fire_crab_exe::procedure_blr(&db.bytes(), db.page_size, name) else {
         return BlrProcOutcome::Outside;
     };
+    if *db.meta_memo("blrcoll-proc", name, || blr_reads_collated_relation(db, &blr)) {
+        return BlrProcOutcome::Outside; // a COLLATION decides in there
+    }
     // THE SAME BINDING AS THE SOURCE PATH, or the two disagree about
     // one call: the truncation raise is typed, everything else falls
     // to the source interpreter to refuse in its own words
@@ -63737,6 +63990,15 @@ fn try_function_blr(database: &Option<Database>, name: &str, args: &[Value]) -> 
     let Ok(blr) = fire_crab_exe::function_blr(&db.bytes(), db.page_size, name) else {
         return FnBlrOutcome::Outside;
     };
+    // memoised by name: a scalar FUNCTION is asked once PER ROW, and
+    // decoding the BLR each time would be a real cost for a guard whose
+    // answer only DDL can change
+    // ...and a FUNCTION keyed apart from a PROCEDURE: the two name
+    // spaces overlap, and one memo for both would answer a same-named
+    // pair from whichever BLR was decoded first
+    if *db.meta_memo("blrcoll-fn", name, || blr_reads_collated_relation(db, &blr)) {
+        return FnBlrOutcome::Outside; // a COLLATION decides in there
+    }
     let Some(meta) = load_function(db, name) else {
         return FnBlrOutcome::Outside;
     };
@@ -65310,24 +65572,62 @@ fn split_qualified_parts(s: &str, max: usize) -> Option<Vec<String>> {
     }
 }
 
+/// The aggregate source for a record FIELD: a collated text field
+/// carries its ttype so the fold compares by the collation
+/// ([AggSrc::CollField]); everything else is the plain field source.
+///
+/// A collation with no key here still produces the plain source, and
+/// [agg_needs_unkeyable_coll] refuses the statement before the fold
+/// ever runs.
+fn agg_field_src(fid: usize, descs: &[Descriptor]) -> AggSrc {
+    match descs.get(fid).and_then(coll_key_ttype) {
+        Some(tt) if fire_crab_ods::intl::collation_id(tt as i16) != 0 => {
+            AggSrc::CollField(fid, tt)
+        }
+        _ => AggSrc::Field(fid),
+    }
+}
+
+/// The field an aggregate source reads, collated or not.
+fn agg_src_fid(src: &AggSrc) -> Option<usize> {
+    match src {
+        AggSrc::Field(f) | AggSrc::CollField(f, _) => Some(*f),
+        _ => None,
+    }
+}
+
 /// Does this aggregate list let a COLLATION decide an answer this
 /// server's fold does not ask about?
 ///
 /// `MIN`/`MAX` over text pick by the collation's ORDER and `COUNT
-/// DISTINCT` buckets by its EQUALITY - and the fold ([compute_group])
-/// compares plain values, with no collation in reach. So ANY declared
-/// collation refuses here, not only an ICU one: even `PXW_INTL`, whose
-/// keys this server does have, answered `MIN(W)` by bytes (measured -
-/// 'APPLE' where the engine answers 'apple'). Keying the fold is a
-/// slice of its own; until then the refusal is the honest answer.
+/// DISTINCT` buckets by its EQUALITY. The fold KEYS both now
+/// ([AggSrc::CollField]), so what refuses here is what it cannot key:
+/// a collation with no table (a language-tailored ICU one, an ICU one
+/// over a narrow charset), and an EXPRESSION source that READS a
+/// collated column - `MIN(UPPER(ci))` carries the collation into a
+/// result there is no key for, and folding it by bytes would be a
+/// wrong answer with nothing to show for it.
 fn agg_needs_unkeyable_coll(gitems: &[GItem], descs: &[Descriptor]) -> bool {
+    let collated = |d: &Descriptor| {
+        matches!(col_kind(d), Some(ColKind::Text))
+            && d.sub_type >= 0
+            && fire_crab_ods::intl::collation_id(d.sub_type) != 0
+    };
     gitems.iter().any(|g| match g {
-        GItem::Agg(f, AggSrc::Field(fid), distinct) => {
-            (matches!(f, AggFn::Min | AggFn::Max) || *distinct)
-                && descs.get(*fid).is_some_and(|d| {
-                    matches!(col_kind(d), Some(ColKind::Text))
-                        && fire_crab_ods::intl::collation_id(d.sub_type) != 0
-                })
+        GItem::Agg(f, src, distinct) if matches!(f, AggFn::Min | AggFn::Max) || *distinct => {
+            match src {
+                // a field whose collation has no key here
+                AggSrc::Field(fid) => {
+                    descs.get(*fid).is_some_and(|d| collated(d) && coll_key_ttype(d).is_none())
+                }
+                // keyed by the fold itself
+                AggSrc::CollField(..) => false,
+                // an expression carrying a collation into its result
+                AggSrc::Expr(e) => {
+                    expr_reads(e, &|fid| descs.get(fid).is_some_and(collated))
+                }
+                _ => false,
+            }
         }
         _ => false,
     })
@@ -65344,6 +65644,63 @@ fn agg_needs_unkeyable_coll(gitems: &[GItem], descs: &[Descriptor]) -> bool {
 /// answers the wrong ROWS (`WHERE ci = 'APPLE'` misses `'apple'`) or the
 /// wrong ORDER. Every site that lets a collation decide an answer asks
 /// this and refuses when it is false ([coll::keyable_ttype]).
+/// The ttype whose COLLATION KEY this server can build for a
+/// descriptor's text - `PXW_INTL` (converted key tables) or one of the
+/// three root ICU collations over UTF8 (`coll::icu_key`). `None` for
+/// plain byte-ordered text, and for a collation with no table here.
+fn coll_key_ttype(d: &Descriptor) -> Option<u16> {
+    if !matches!(col_kind(d), Some(ColKind::Text)) || d.sub_type < 0 {
+        return None;
+    }
+    let tt = d.sub_type as u16;
+    if tt == fire_crab_ods::coll::TTYPE_PXW_INTL
+        || fire_crab_ods::coll::icu_strength_of_ttype(tt).is_some()
+    {
+        Some(tt)
+    } else {
+        None
+    }
+}
+
+/// Can this server ORDER and COMPARE this descriptor's text the way its
+/// collation does - by comparing bytes, or by building the collation's
+/// KEY?
+///
+/// This is the widened test, and the one every ORDERING and COMPARING
+/// site asks. GROUPING and DEDUPLICATION ask the narrower
+/// [coll_keyable] instead: they must also answer WHICH SPELLING
+/// survives a merged group, and under a case- or accent-insensitive
+/// collation the engine's pick is its own unstable sort's (measured
+/// 2026-08-27: `SELECT DISTINCT CI` kept 'apple' out of
+/// {apple, APPLE} but 'ápple' out of {Ápple, ápple}, and `GROUP BY CI`
+/// kept 'APPLE' out of the FIRST of those two - three different rules,
+/// which is no rule).
+/// The same question [coll_groupable_ttype] asks, of a descriptor: can
+/// this server say which rows are ONE GROUP under its collation, and
+/// which SPELLING of them survives?
+fn coll_groupable(d: &Descriptor) -> bool {
+    !matches!(col_kind(d), Some(ColKind::Text))
+        || d.sub_type < 0
+        || coll_groupable_ttype(d.sub_type as u16)
+}
+
+fn coll_orderable(d: &Descriptor) -> bool {
+    coll_keyable(d) || coll_key_ttype(d).is_some()
+}
+
+/// Does this expression READ a column whose ICU collation would decide
+/// the answer? Such a value carries the collation into the RESULT -
+/// `UPPER(ci) = 'APPLE'` matches 'apple' on the engine - and only a
+/// BARE column is wrapped in a key here, so anything else refuses.
+fn expr_reads_icu(e: &Expr, descs: &[Descriptor]) -> bool {
+    expr_reads(e, &|fid| {
+        descs.get(fid).is_some_and(|d| {
+            (0..=i16::MAX as i32).contains(&(d.sub_type as i32))
+                && fire_crab_ods::coll::icu_strength_of_ttype(d.sub_type as u16).is_some()
+        })
+    })
+}
+
 fn coll_keyable(d: &Descriptor) -> bool {
     // a NEGATIVE sub_type is a SENTINEL, not a ttype: a synthesised
     // descriptor for a view's or a derived table's EXPRESSION column
@@ -65768,9 +66125,13 @@ fn resolve_expr_term(
         // resolve_predicate routes a param lhs before this runs
         RawLhs::Param(_) => return None,
     };
-    // AN ICU COLLATION DECIDES THIS COMPARISON - a JOIN's `a.CI = b.CI`
-    // pairs 'apple' with 'APPLE' where the bytes pair neither - and this
-    // server has no table for it ([coll_keyable])
+    // A COLLATION DECIDES THIS COMPARISON - a JOIN's `a.CI = b.CI` pairs
+    // 'apple' with 'APPLE' where the bytes pair neither - and THIS path
+    // compares values, with no key wrapped round either side. So it asks
+    // the narrow question ([coll_keyable]: byte order, or PXW_INTL) and
+    // refuses the rest, the ICU family included. Keying a column-vs-
+    // column comparison is a slice of its own; answering it by bytes
+    // because the ORDER is now keyable elsewhere would be a wrong answer.
     if expr_reads(&lhs, &|fid| descs.get(fid).is_some_and(|d| !coll_keyable(d))) {
         return None;
     }
@@ -66276,19 +66637,28 @@ fn cmp_sides(lhs: Expr, rhs: Expr, descs: &[Descriptor]) -> Option<(Expr, Expr)>
             // a comparison against a COLLATED column compares by that
             // collation, and a literal or plain-text side ADOPTS it
             // (the engine's rule); both sides wrap so the ordinary
-            // value compare runs over collation KEYS
-            let tt = fire_crab_ods::coll::TTYPE_PXW_INTL;
-            let collated = |e: &Expr| {
-                matches!(e, Expr::Col(fid)
-                    if descs.get(*fid).map(|d| d.sub_type as u16) == Some(tt))
+            // value compare runs over collation KEYS. The key is cut at
+            // the collation's OWN strength, which is what an EQUALITY
+            // reads (measured: `= 'APPLE'` took one row under UNICODE,
+            // two under UNICODE_CI, four under UNICODE_CI_AI).
+            let collated = |e: &Expr| match e {
+                Expr::Col(fid) => descs.get(*fid).and_then(coll_key_ttype),
+                _ => None,
             };
-            if collated(&lhs) || collated(&rhs) {
-                Some((
+            match (collated(&lhs), collated(&rhs)) {
+                // two DIFFERENT collations meet: the engine raises
+                // "cannot mix collations", and guessing one of them
+                // would answer the wrong rows - refuse
+                (Some(a), Some(b)) if a != b => None,
+                (Some(tt), _) | (_, Some(tt)) => Some((
                     Expr::CollKey(Box::new(lhs), tt),
                     Expr::CollKey(Box::new(rhs), tt),
-                ))
-            } else {
-                Some((lhs, rhs))
+                )),
+                // NEITHER side is a bare collated column - but an
+                // EXPRESSION over one carries its collation into the
+                // result, and there is no key to wrap it in
+                _ if expr_reads_icu(&lhs, descs) || expr_reads_icu(&rhs, descs) => None,
+                _ => Some((lhs, rhs)),
             }
         }
         _ => Some((lhs, rhs)),
@@ -66742,7 +67112,25 @@ fn param_or_typed_term(
     // too, and a byte comparison silently answers FEWER ROWS. Refuse
     // ([coll_keyable]).
     if !coll_keyable(d) {
-        return None;
+        // ...unless a KEY answers it. An ICU collation's sort key
+        // decides a COMPARISON exactly (`coll::icu_key`), and nothing
+        // else: `LIKE`, `STARTING WITH`, `SIMILAR TO` and `CONTAINING`
+        // match through the collation's own MATCHER, where a prefix of
+        // the pattern must match a prefix of the value - and a UCA key
+        // is not built prefix-wise (its levels are concatenated, so the
+        // key of 'app' is no prefix of the key of 'apple'). Measured:
+        // `CI STARTING WITH 'APP'` takes 'apple' too, which a byte
+        // match misses - so those keep refusing.
+        let keyed_cmp = coll_key_ttype(d).is_some()
+            && matches!(
+                raw,
+                RawKind::Cmp(_, Rhs::Str(_) | Rhs::StrKey(_) | Rhs::Param(..) | Rhs::Null)
+                    | RawKind::IsNull
+                    | RawKind::IsNotNull
+            );
+        if !keyed_cmp {
+            return None;
+        }
     }
     // A COLLATED column compares by its COLLATION, and a literal
     // against it adopts that collation (the engine's rule): the term
@@ -66752,11 +67140,15 @@ fn param_or_typed_term(
     // ExprCond is never banded, which is the right conservatism while
     // no collated index is accepted. (A bound `?` against such a
     // column still takes the plain path - recorded, not driven yet.)
-    if matches!(kind, ColKind::Text)
-        && d.sub_type as u16 == fire_crab_ods::coll::TTYPE_PXW_INTL
-    {
-        if let RawKind::Cmp(op, Rhs::Str(lit)) = &raw {
-            let tt = fire_crab_ods::coll::TTYPE_PXW_INTL;
+    if let Some(tt) = coll_key_ttype(d).filter(|_| matches!(kind, ColKind::Text)) {
+        // `Rhs::StrKey` is the SAME text arriving as a SEMI-JOIN's hash
+        // key (a rewritten `IN (SELECT ...)`, `= ANY`, correlated
+        // `EXISTS`). It must take the collation too: without this arm it
+        // fell through to the strict-grammar arm below, which compares
+        // BYTES - `CI IN (SELECT ...)` answered ONE row where the engine
+        // answers two, while the literal `CI IN ('APPLE')` beside it
+        // answered both.
+        if let RawKind::Cmp(op, Rhs::Str(lit) | Rhs::StrKey(lit)) = &raw {
             return Some(Term::ExprCond(Box::new(Cond2::Cmp(
                 Box::new(Expr::CollKey(Box::new(Expr::Col(idx)), tt)),
                 *op,
@@ -66805,10 +67197,9 @@ fn param_or_typed_term(
             // collation like a literal does: the ExprParam's lhs is
             // already the CollKey wrap, and the BIND arm wraps the
             // arriving text value to match ([Term::ExprParam])
-            if matches!(kind, ColKind::Text)
-                && d.sub_type as u16 == fire_crab_ods::coll::TTYPE_PXW_INTL
+            if let Some(tt) =
+                coll_key_ttype(d).filter(|_| matches!(kind, ColKind::Text))
             {
-                let tt = fire_crab_ods::coll::TTYPE_PXW_INTL;
                 return Some(Term::ExprParam(
                     Box::new(Expr::CollKey(Box::new(Expr::Col(idx)), tt)),
                     op,
@@ -67140,14 +67531,14 @@ fn resolve_having(
                                 GItem::Agg(f, AggSrc::Star, dq) => {
                                     f == func && fid.is_none() && *dq == distinct
                                 }
-                                GItem::Agg(f, AggSrc::Field(t), dq) => {
-                                    f == func && Some(*t) == fid && *dq == distinct
+                                GItem::Agg(f, src, dq) => {
+                                    f == func && agg_src_fid(src) == fid && *dq == distinct
                                 }
                                 _ => false,
                             })
                             .unwrap_or_else(|| {
                                 let src = match fid {
-                                    Some(f) => AggSrc::Field(f),
+                                    Some(f) => agg_field_src(f, descs),
                                     None => AggSrc::Star,
                                 };
                                 gitems.push(GItem::Agg(*func, src, distinct));
