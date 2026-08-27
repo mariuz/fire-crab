@@ -100,6 +100,29 @@ const PXW_INTL_EXPAND: [(u8, u8, u8); 11] = [(228, 97, 101), (196, 65, 69), (246
 /// high byte, charset 53 in the low (probed off a live descriptor).
 pub const TTYPE_PXW_INTL: u16 = 0x0135;
 
+/// Can this server reproduce the ORDER and the EQUALITY the collation
+/// in this ttype defines?
+///
+/// A charset's DEFAULT collation (id 0 - `UCS_BASIC` for UTF8,
+/// `WIN1252` for WIN1252, and so on) orders by the stored bytes, which
+/// is what every plain comparison here already does. `PXW_INTL` is the
+/// one real collation converted (the key builder above). Everything
+/// else is ICU-backed in the engine - `UNICODE`, `UNICODE_CI`,
+/// `UNICODE_CI_AI`, the language-specific WIN1252/ISO8859 collations -
+/// and its order is the Unicode Collation Algorithm's, which this
+/// server has no table for: `'apple' < 'Ápple' < 'banana'` under
+/// UNICODE where the bytes say otherwise, and `'apple' = 'APPLE'` under
+/// UNICODE_CI where the bytes say they differ.
+///
+/// A caller that ORDERS, GROUPS, DEDUPLICATES or COMPARES text asks
+/// this first and REFUSES when the answer is false. Answering by bytes
+/// would be a wrong answer with no sign of it - the rows come back in
+/// the wrong order, or a row is missing from a filter - and this file's
+/// rule is that a refusal is better than a guess.
+pub fn keyable_ttype(ttype: u16) -> bool {
+    crate::intl::collation_id(ttype as i16) == 0 || ttype == TTYPE_PXW_INTL
+}
+
 fn expand_of(b: u8) -> (u8, u8) {
     for &(c, e1, e2) in PXW_INTL_EXPAND.iter() {
         if c == b {

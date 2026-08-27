@@ -31019,6 +31019,13 @@ fn plan_join_bound(
                     .filter(|&p| matches!(gitems.get(p), Some(GItem::Key(_))))
             })?,
         };
+        // AN ICU COLLATION DECIDES WHICH ROWS ARE ONE GROUP, and this
+        // server has no table for it: `UNICODE_CI` puts 'apple' and
+        // 'APPLE' in ONE bucket where the bytes make two. Refuse
+        // ([coll_keyable]).
+        if key_fids.iter().any(|f| comb_descs.get(*f).is_some_and(|d| !coll_keyable(d))) {
+            return Some(Plan::Refused);
+        }
         return Some(Plan::JoinGroup {
             base: sides[0].src.clone(),
             base_width: sides[0].descs.len(),
@@ -32224,6 +32231,10 @@ fn plan_over_source(
                     .filter(|&p| matches!(gitems.get(p), Some(GItem::Key(_))))
             })?,
         };
+        // an ICU collation decides which rows are one group ([coll_keyable])
+        if key_fids.iter().any(|f| descs.get(*f).is_some_and(|d| !coll_keyable(d))) {
+            return Some(Plan::Refused);
+        }
         return Some(Plan::JoinGroup {
             base: src.into_row_source(),
             base_width: descs.len(),
@@ -33692,6 +33703,20 @@ fn octets_key_mask(cols: &[ProjCol], key_fids: &[usize]) -> Vec<bool> {
 /// Which output columns answer OCTETS - the mask the set and sort
 /// machinery needs, read off the projection the describe already
 /// announces.
+/// Does this PROJECTION carry a column whose ICU collation would decide
+/// a dedup - `DISTINCT`, a distinct `UNION` - that this server cannot
+/// make? A text ProjCol's `sub_type` is the ttype (charset low byte,
+/// collation high), which is all [coll::keyable_ttype] needs; an
+/// EXPRESSION column carries a negative sentinel and is skipped by the
+/// range test, as a non-text one is by the wire form.
+fn cols_unkeyable_coll(cols: &[ProjCol]) -> bool {
+    cols.iter().any(|c| {
+        matches!(c.wire, Wire::Text | Wire::Varying)
+            && (0..=i16::MAX as i32).contains(&c.sub_type)
+            && !fire_crab_ods::coll::keyable_ttype(c.sub_type as u16)
+    })
+}
+
 fn octets_cols(cols: &[ProjCol]) -> Vec<bool> {
     cols.iter()
         .map(|c| {
@@ -33928,6 +33953,10 @@ fn plan_union(
         }
     }
     params.clear();
+    // a distinct UNION deduplicates by the collation too ([coll_keyable])
+    if !all && cols_unkeyable_coll(&cols) {
+        return Some(Plan::Refused);
+    }
     Some(Plan::Union { cols, branches, distinct: !all, order_by: order_ordinal })
 }
 
@@ -34148,6 +34177,12 @@ fn plan_query_inner_ctx(
                     .enumerate()
                     .map(|(i, c)| ProjCol { field_id: i, expr: None, ..c.clone() })
                     .collect();
+                // a DISTINCT over an ICU-collated column buckets by
+                // that collation ('apple' and 'APPLE' are ONE row under
+                // UNICODE_CI); by bytes they are two ([coll_keyable])
+                if distinct && cols_unkeyable_coll(&mcols) {
+                    return Some(Plan::Refused);
+                }
                 return Some(Plan::Modified {
                     inner: Box::new(plan),
                     cols: mcols,
@@ -34321,6 +34356,10 @@ fn plan_query_inner_ctx(
             .map(|(i, c)| ProjCol { field_id: i, expr: None, ..c.clone() })
             .collect();
         if cols.is_empty() {
+            return Some(Plan::Refused);
+        }
+        // an ICU collation decides a DISTINCT's buckets ([coll_keyable])
+        if distinct && cols_unkeyable_coll(&cols) {
             return Some(Plan::Refused);
         }
         return Some(Plan::Modified { inner: Box::new(plan), cols, distinct, skip, take });
@@ -37363,6 +37402,15 @@ fn plan_group(
     };
     drop(gitems_cell);
     drop(slot_descs_cell);
+    // AN ICU COLLATION DECIDES WHICH ROWS ARE ONE GROUP - `UNICODE_CI`
+    // buckets 'apple' with 'APPLE' where the bytes make two groups - and
+    // this server has no table for it ([coll_keyable]); MIN/MAX over
+    // such a column picks by that order too
+    if key_fids.iter().any(|f| descs.get(*f).is_some_and(|d| !coll_keyable(d)))
+        || agg_needs_unkeyable_coll(&gitems, descs)
+    {
+        return Some(Plan::Refused);
+    }
     Some(Plan::Group {
         rel,
         formats,
@@ -57419,6 +57467,8 @@ fn parse_order_by_expr(
                 // by the 0x00-padded byte order, which is not the
                 // blank-padded text order [octets_value_cmp]
                 if tt == Some(fire_crab_ods::coll::TTYPE_PXW_INTL) {
+                    // (an ICU collation never reaches here - the caller
+                    // refuses the whole ORDER BY, see below)
                     k.coll = fire_crab_ods::coll::TTYPE_PXW_INTL;
                 } else if tt.map_or(false, coll_is_octets) {
                     k.coll = fire_crab_ods::intl::CS_OCTETS as u16;
@@ -57432,6 +57482,21 @@ fn parse_order_by_expr(
             }
         }
         k
+    };
+    // A COLLATION THIS SERVER CANNOT KEY DECIDES THIS ORDER, so the
+    // statement refuses rather than sorting by bytes: an ICU collation
+    // puts `'apple' < 'Ápple' < 'banana'` where the bytes put `'Ápple'`
+    // last, and a wrong ORDER is a wrong answer with nothing to show
+    // for it ([coll_keyable]).
+    let unkeyable = |k: &OrderKey| -> bool {
+        let bad = |fid: usize| descs.get(fid).is_some_and(|d| !coll_keyable(d));
+        match &k.expr {
+            None => bad(k.field),
+            // an EXPRESSION over such a column carries its collation
+            // into the result - `ORDER BY CI || 'x'` is the CI order -
+            // so reading one anywhere in the key is enough to refuse
+            Some(e) => expr_reads(e, &bad),
+        }
     };
     let mut keys = Vec::new();
     // an ORDER BY list is split on commas - but an expression may CONTAIN
@@ -57534,7 +57599,7 @@ fn parse_order_by_expr(
         };
         keys.push(stamp(OrderKey::field(fid, desc, nulls)));
     }
-    if keys.is_empty() {
+    if keys.is_empty() || keys.iter().any(unkeyable) {
         None
     } else {
         Some(keys)
@@ -64296,6 +64361,52 @@ fn split_qualified_parts(s: &str, max: usize) -> Option<Vec<String>> {
     }
 }
 
+/// Does this aggregate list let a COLLATION decide an answer this
+/// server's fold does not ask about?
+///
+/// `MIN`/`MAX` over text pick by the collation's ORDER and `COUNT
+/// DISTINCT` buckets by its EQUALITY - and the fold ([compute_group])
+/// compares plain values, with no collation in reach. So ANY declared
+/// collation refuses here, not only an ICU one: even `PXW_INTL`, whose
+/// keys this server does have, answered `MIN(W)` by bytes (measured -
+/// 'APPLE' where the engine answers 'apple'). Keying the fold is a
+/// slice of its own; until then the refusal is the honest answer.
+fn agg_needs_unkeyable_coll(gitems: &[GItem], descs: &[Descriptor]) -> bool {
+    gitems.iter().any(|g| match g {
+        GItem::Agg(f, AggSrc::Field(fid), distinct) => {
+            (matches!(f, AggFn::Min | AggFn::Max) || *distinct)
+                && descs.get(*fid).is_some_and(|d| {
+                    matches!(col_kind(d), Some(ColKind::Text))
+                        && fire_crab_ods::intl::collation_id(d.sub_type) != 0
+                })
+        }
+        _ => false,
+    })
+}
+
+/// Is this descriptor's text ordered and compared the way this server
+/// orders and compares text?
+///
+/// A non-text descriptor always is. A text one is when its collation is
+/// the charset's DEFAULT (byte order) or `PXW_INTL` (the one real
+/// collation converted). An ICU-backed collation - `UNICODE`,
+/// `UNICODE_CI`, a language-specific one - is NOT: its order is the
+/// Unicode Collation Algorithm's, and a byte comparison silently
+/// answers the wrong ROWS (`WHERE ci = 'APPLE'` misses `'apple'`) or the
+/// wrong ORDER. Every site that lets a collation decide an answer asks
+/// this and refuses when it is false ([coll::keyable_ttype]).
+fn coll_keyable(d: &Descriptor) -> bool {
+    // a NEGATIVE sub_type is a SENTINEL, not a ttype: a synthesised
+    // descriptor for a view's or a derived table's EXPRESSION column
+    // carries the attachment-charset marker there ([resolve_text_cs]),
+    // and reading it as a ttype made its collation byte 0xFF - every
+    // filter over such a column refused (caught by serve-real-createview
+    // on `WHERE <view expr col> = 'bx'`)
+    !matches!(col_kind(d), Some(ColKind::Text))
+        || d.sub_type < 0
+        || fire_crab_ods::coll::keyable_ttype(d.sub_type as u16)
+}
+
 fn col_kind(d: &Descriptor) -> Option<ColKind> {
     if matches!(d.dtype, dtype::SHORT | dtype::LONG | dtype::INT64) && d.scale == 0 {
         Some(ColKind::Int)
@@ -64708,6 +64819,12 @@ fn resolve_expr_term(
         // resolve_predicate routes a param lhs before this runs
         RawLhs::Param(_) => return None,
     };
+    // AN ICU COLLATION DECIDES THIS COMPARISON - a JOIN's `a.CI = b.CI`
+    // pairs 'apple' with 'APPLE' where the bytes pair neither - and this
+    // server has no table for it ([coll_keyable])
+    if expr_reads(&lhs, &|fid| descs.get(fid).is_some_and(|d| !coll_keyable(d))) {
+        return None;
+    }
     // a literal right side becomes the matching literal expression
     let rhs_expr = |rhs: &Rhs| -> Option<Expr> {
         Some(match rhs {
@@ -65671,6 +65788,13 @@ fn param_or_typed_term(
     d: &Descriptor,
     params: &mut Vec<Option<Descriptor>>,
 ) -> Option<Term> {
+    // AN ICU COLLATION DECIDES THIS COMPARISON, and this server has no
+    // table for it: under `UNICODE_CI`, `= 'APPLE'` matches `'apple'`
+    // too, and a byte comparison silently answers FEWER ROWS. Refuse
+    // ([coll_keyable]).
+    if !coll_keyable(d) {
+        return None;
+    }
     // A COLLATED column compares by its COLLATION, and a literal
     // against it adopts that collation (the engine's rule): the term
     // becomes an ordinary per-row comparison over [Expr::CollKey]

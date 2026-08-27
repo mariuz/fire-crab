@@ -785,6 +785,47 @@ partial `Records affected` (the engine reports the rows it moved before
 the raise; fc reports 0), and a trigger-bearing target (refused by the
 per-row planners at execute, not at prepare).
 
+**AN ICU COLLATION DECIDES THE ANSWER, AND THIS SERVER REFUSES RATHER
+THAN ANSWERING BY BYTES — DONE 2026-08-27 (`serve-real-icucoll` 25).**
+The roadmap's own line "collation-aware ordering (server keys binary)"
+understated it: this was a SILENT WRONG-ANSWER class, and a broad one.
+Firebird's `UNICODE`, `UNICODE_CI` and the language-specific collations
+are ICU-backed — their order is the Unicode Collation Algorithm's, where
+`'apple' < 'Ápple' < 'banana'`, and under CI `'apple' = 'APPLE'`. This
+server compared and ordered the BYTES. Measured over one six-row
+fixture: `ORDER BY <ci col>` answered 5,2,1,6,3,4 where the engine
+answers 1,5,4,6,2,3; `WHERE CI = 'APPLE'` found ONE row where the engine
+finds two; `GROUP BY CI` made SIX groups where the engine makes four;
+`DISTINCT`, `MIN`/`MAX`, a join keyed on such a column and an
+index-driven range were all wrong the same way.
+
+There is no honest way to answer them here: the UCA's order is a table
+this server does not have (and these crates carry no dependencies), so
+every site where a collation decides now asks
+`coll::keyable_ttype` — true for a charset's DEFAULT collation (byte
+order: `UCS_BASIC` for UTF8) and for `PXW_INTL`, the one real collation
+converted — and REFUSES when the answer is false. The sites: ORDER BY (a
+column key and an EXPRESSION key, since the collation travels into the
+result), the whole comparison family through `param_or_typed_term`, a
+column-vs-column comparison through `resolve_expr_term` (which is what a
+JOIN's ON is), GROUP BY in all three group planners, DISTINCT and a
+distinct UNION (over the projection's own ttype — a text ProjCol's
+`sub_type` IS the ttype), and MIN/MAX/COUNT DISTINCT.
+
+**MIN/MAX refuses over `PXW_INTL` too**, which is not an ICU collation:
+the fold ([compute_group]) compares plain values with no collation in
+reach, and it answered `MIN(W)` = 'APPLE' where the engine answers
+'apple'. Keying the fold is a slice of its own.
+
+What is untouched: SELECTING such a column (bytes in, bytes out —
+nothing is decided), its LENGTHS and CASTS, the whole default-collation
+surface, and every PXW_INTL comparison and ordering, which keys as
+before. The WRITE side needed nothing: an index whose type is not
+`PXW_INTL` was already unmaintainable here, so an INSERT that would
+break a `UNIQUE` CI index refuses instead of storing a duplicate the
+engine rejects (measured), and an FK over a CI key refuses rather than
+accepting a case-variant parent.
+
 **AGGREGATES IN EXPRESSIONS DONE (2026-08-25,
 `serve-real-statexpr` 8):** the statistical/ordered-set family
 (VAR_*/STDDEV_*, CORR/COVAR_*/REGR_*, PERCENTILE_CONT/DISC) and
