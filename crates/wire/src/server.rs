@@ -10501,7 +10501,7 @@ fn expr_reads(e: &Expr, f: &dyn Fn(usize) -> bool) -> bool {
         | Expr::TextBool(a, _)
         | Expr::CollKey(a, _)
         | Expr::Collate(a, _)
-        | Expr::CollCanon(a, _)
+        | Expr::CollCanon(a, _, _)
         | Expr::OctKey(a, _) => expr_reads(a, f),
         Expr::Neg(a) | Expr::Cast(a, _, _) => expr_reads(a, f),
         Expr::Bin(a, _, b) | Expr::Concat(a, b) | Expr::NullIf(a, b) => {
@@ -13954,7 +13954,7 @@ fn text_form_m(
         // `S COLLATE UNICODE_CI` over a VARCHAR(20) UTF8 column
         // describes VARYING len 80 charset 4, exactly as S does; only
         // its NAME changes, to CAST)
-        Expr::Collate(inner, _) | Expr::CollCanon(inner, _) => text_form(inner, descs),
+        Expr::Collate(inner, _) | Expr::CollCanon(inner, _, _) => text_form(inner, descs),
         // a BINARY literal is CHAR of exactly its BYTES, at OCTETS -
         // never the attachment's charset and never a character count
         Expr::Hex(b) => Some((false, b.len() as i32, TfCs::Ttype(1))),
@@ -50526,7 +50526,7 @@ enum Expr {
     /// the value per row through this. Identity for a non-text value
     /// and for a collation whose canonical form is the string itself
     /// (`UNICODE` has neither attribute).
-    CollCanon(Box<Expr>, u16),
+    CollCanon(Box<Expr>, u16, bool),
     /// An EXPLICIT collation written on an operand
     /// (`<value> COLLATE <name>`), carrying the resolved ttype. It is
     /// an IDENTITY at eval - a projected `S COLLATE UNICODE_CI`
@@ -53299,7 +53299,7 @@ impl Expr {
             Expr::CollKey(e, _)
             | Expr::OctKey(e, _)
             | Expr::Collate(e, _)
-            | Expr::CollCanon(e, _) => e.type_of(descs),
+            | Expr::CollCanon(e, _, _) => e.type_of(descs),
             Expr::Null => Some(ExprType::Int),
             Expr::DateLit(_) => Some(ExprType::Temporal(TKind::Date)),
             Expr::TimeTzLit(..) => Some(ExprType::Temporal(TKind::TimeTz)),
@@ -53788,7 +53788,7 @@ impl Expr {
             | Expr::TextBool(_, _)
             | Expr::CollKey(_, _)
             | Expr::Collate(_, _)
-            | Expr::CollCanon(_, _)
+            | Expr::CollCanon(_, _, _)
             | Expr::OctKey(_, _) => None,
             Expr::Coalesce(args) => args.iter().filter_map(|a| a.rank_of(descs)).max(),
             Expr::Case(branches, else_) => branches
@@ -54112,8 +54112,16 @@ impl Expr {
             // ...while the CANONICAL wrap really does rewrite the value
             // - it exists only under a pattern match, whose other side
             // was canonicalised at prepare
-            Expr::CollCanon(e, tt) => match e.eval(values)? {
+            Expr::CollCanon(e, tt, upcase) => match e.eval(values)? {
                 Value::Text(s) => {
+                    // CONTAINING upper-cases FIRST, on every character
+                    // set (`UpcaseConverter`, jrd/intl_classes.h:83);
+                    // LIKE and STARTING WITH do not, and pass `false`
+                    let s = if *upcase {
+                        upcase_cs(fire_crab_ods::intl::charset_id(*tt as i16), &s)
+                    } else {
+                        s
+                    };
                     match fire_crab_ods::coll::icu_strength_of_ttype(*tt) {
                         Some(st) => {
                             Value::Text(fire_crab_ods::coll::icu_canonical(&s, st))
@@ -54121,6 +54129,8 @@ impl Expr {
                         None => Value::Text(s),
                     }
                 }
+                // a NUMERIC operand renders to its decimal text inside
+                // the matcher, where there is no case to fold
                 v => v,
             },
             Expr::CollKey(e, tt) => match e.eval(values)? {
@@ -59504,6 +59514,14 @@ enum RawKind {
     /// `[NOT] STARTING [WITH] <prefix>` - a per-byte text prefix test
     /// (blr_starting); no ESCAPE clause exists for it
     Starting(Rhs, bool),
+    /// `<x> CONTAINING <p>` - a LITERAL substring test, and the one
+    /// predicate that is case-insensitive on EVERY character set: its
+    /// matcher upper-cases both sides first
+    /// (`ContainsMatcher<UCHAR, UpcaseConverter<>>`, Collation.cpp:1075,
+    /// and `CanonicalConverter<UpcaseConverter<>>` for a collation with
+    /// a canonical form, Collation.cpp:527). The pattern has NO
+    /// wildcards.
+    Containing(Rhs, bool),
     /// A leaf whose truth is already decided and does not depend on the
     /// row: what a subquery collapses to once it has been evaluated
     /// (`EXISTS` over an uncorrelated inner query, or an `IN` whose
@@ -59951,7 +59969,9 @@ fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
             let mut p3 = p2;
             let negated = if matches!(t.get(p3), Some(Tok::Not))
                 && (matches!(t.get(p3 + 1), Some(Tok::Like | Tok::Between | Tok::In))
-                    || matches!(t.get(p3 + 1), Some(Tok::Ident(w)) if w.eq_ignore_ascii_case("STARTING") || w.eq_ignore_ascii_case("SIMILAR")))
+                    || matches!(t.get(p3 + 1), Some(Tok::Ident(w)) if w.eq_ignore_ascii_case("STARTING")
+                        || w.eq_ignore_ascii_case("SIMILAR")
+                        || w.eq_ignore_ascii_case("CONTAINING")))
             {
                 p3 += 1;
                 true
@@ -60150,13 +60170,16 @@ fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
         },
     };
     let leaf = |kind: RawKind| Ast::Leaf(RawTerm { lhs: lhs.clone(), kind });
-    // an optional NOT immediately before LIKE/BETWEEN/IN/STARTING
-    // (STARTING lexes as an Ident - it is a usable column name, probed:
-    // CREATE TABLE T2 (STARTING INT) succeeds - so it is recognized by
-    // text here, the IS [NOT] DISTINCT FROM precedent)
+    // an optional NOT immediately before LIKE/BETWEEN/IN/STARTING/
+    // CONTAINING (the last three lex as Idents - each is a usable
+    // column name, probed: CREATE TABLE T2 (STARTING INT) succeeds -
+    // so they are recognized by text here, the IS [NOT] DISTINCT FROM
+    // precedent)
     let negated = if matches!(t.get(*pos), Some(Tok::Not))
         && (matches!(t.get(*pos + 1), Some(Tok::Like | Tok::Between | Tok::In))
-            || matches!(t.get(*pos + 1), Some(Tok::Ident(w)) if w.eq_ignore_ascii_case("STARTING") || w.eq_ignore_ascii_case("SIMILAR")))
+            || matches!(t.get(*pos + 1), Some(Tok::Ident(w)) if w.eq_ignore_ascii_case("STARTING")
+                        || w.eq_ignore_ascii_case("SIMILAR")
+                        || w.eq_ignore_ascii_case("CONTAINING")))
     {
         *pos += 1;
         true
@@ -60421,6 +60444,15 @@ fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
             };
             Some(leaf(RawKind::Similar(pattern, escape, negated)))
         }
+        // CONTAINING - by Ident text, like STARTING below
+        Tok::Ident(w) if w.eq_ignore_ascii_case("CONTAINING") => {
+            *pos += 1;
+            let pattern = parse_pattern(t, pos, np)?;
+            if matches!(pattern, Rhs::Int(_) | Rhs::Num(..)) {
+                return None; // a numeric pattern literal: unprobed, as LIKE
+            }
+            Some(leaf(RawKind::Containing(pattern, negated)))
+        }
         // STARTING [WITH] - by Ident text, so a column NAMED "STARTING"
         // still parses everywhere else exactly as before
         Tok::Ident(w) if w.eq_ignore_ascii_case("STARTING") => {
@@ -60531,6 +60563,7 @@ fn negate_term(t: &RawTerm) -> Option<RawTerm> {
         RawKind::CmpExpr(op, e) => RawKind::CmpExpr(inverse_cmp(op), e.clone()),
         RawKind::IsNull => RawKind::IsNotNull,
         RawKind::IsNotNull => RawKind::IsNull,
+        RawKind::Containing(p, n) => RawKind::Containing(p.clone(), !n),
         RawKind::Like(p, e, negated) => RawKind::Like(p.clone(), *e, !negated),
         RawKind::Similar(p, e, negated) => RawKind::Similar(p.clone(), *e, !negated),
         // flipped like LIKE - sound in 3VL (probed: NULL operand rows
@@ -66137,6 +66170,82 @@ fn collate_canon_of(
     }
 }
 
+/// The TTYPE an expression's text carries, when it has one - the
+/// character set and collation that decide its case law.
+fn expr_text_ttype(e: &Expr, descs: &[Descriptor]) -> Option<u16> {
+    match text_form(e, descs) {
+        Some((_, _, TfCs::Ttype(t))) if (0..=i32::from(i16::MAX)).contains(&t) => {
+            Some(t as u16)
+        }
+        _ => None,
+    }
+}
+
+/// A string upper-cased the way its CHARACTER SET does it - the
+/// `UpcaseConverter` step every `CONTAINING` runs, and the reason that
+/// predicate is case-insensitive on every character set
+/// (`ContainsMatcher<UCHAR, UpcaseConverter<>>`, Collation.cpp:1075).
+///
+/// `OCTETS` has no case law at all (its texttype installs
+/// `internal_str_copy` both ways, intl_builtin.cpp:1025); a TABLED
+/// single-byte set has its own table; everything else - UTF8 included -
+/// takes Unicode's SIMPLE mapping, which is what the engine's
+/// `u_toupper` walk gives ([intl::simple_case]).
+fn upcase_cs(cs: u8, t: &str) -> String {
+    use fire_crab_ods::intl;
+    if cs == intl::CS_OCTETS {
+        return t.to_string();
+    }
+    if intl::tabled(cs) || intl::byte_carrier(cs) {
+        return t
+            .chars()
+            .map(|c| match intl::case_char(cs, c, true) {
+                Some(Ok(m)) => m,
+                // a character not of this set: a MATCH does not raise
+                // where a conversion would - leave it alone
+                Some(Err(())) => c,
+                None => c.to_ascii_uppercase(),
+            })
+            .collect();
+    }
+    intl::simple_case(t, true)
+}
+
+/// The escape character the CONTAINING desugar uses. It has to survive
+/// upper-casing and canonicalisation unchanged, and be something a
+/// pattern can still contain - which the escaping below handles.
+const CONTAINING_ESCAPE: char = '\\';
+
+/// `<x> CONTAINING <p>` as a LIKE over the upper-cased (and, under a
+/// collation with a canonical form, canonicalised) value.
+///
+/// CONTAINING has NO wildcards - measured, `S CONTAINING '%'` takes
+/// only the row holding a literal `%` - so the pattern's own `%`, `_`
+/// and escape character are escaped before the `%…%` wrap. An EMPTY
+/// pattern becomes `%%`, which matches every non-NULL row, as the
+/// engine does.
+fn containing_term(value: Expr, ttype: u16, pattern: &str, negated: bool) -> Term {
+    let cs = fire_crab_ods::intl::charset_id(ttype as i16);
+    let up = upcase_cs(cs, pattern);
+    let canon = match fire_crab_ods::coll::icu_strength_of_ttype(ttype) {
+        Some(st) => fire_crab_ods::coll::icu_canonical(&up, st),
+        None => up,
+    };
+    let mut escaped = String::with_capacity(canon.len() + 2);
+    for c in canon.chars() {
+        if c == CONTAINING_ESCAPE || c == '%' || c == '_' {
+            escaped.push(CONTAINING_ESCAPE);
+        }
+        escaped.push(c);
+    }
+    Term::ExprLike(
+        Box::new(Expr::CollCanon(Box::new(value), ttype, true)),
+        format!("%{escaped}%"),
+        Some(CONTAINING_ESCAPE),
+        negated,
+    )
+}
+
 /// An ESCAPE character in the collation's canonical form. The matcher
 /// sees canonical text on both sides, so the escape has to be canonical
 /// too - and one that canonicalises to anything but a SINGLE character
@@ -66202,6 +66311,10 @@ fn col_kind(d: &Descriptor) -> Option<ColKind> {
 /// themselves (HAVING does not, so a `?` there lands on the None).
 fn typed_term(idx: usize, kind: ColKind, raw: RawKind) -> Option<Term> {
     Some(match raw {
+        // CONTAINING needs the operand's CHARACTER SET to upper-case by,
+        // and this resolver has no descriptors - [param_or_typed_term]
+        // and [resolve_expr_term], which do, answer it
+        RawKind::Containing(..) => return None,
         // the resolvers answer a decided subquery leaf before they get
         // here; reaching this arm at all would mean one slipped past
         RawKind::Const(b) => Term::Const(b),
@@ -66773,7 +66886,7 @@ fn resolve_expr_term(
                 // CANONICAL form, not its key
                 let esc = canon_escape(*escape, st)?;
                 Term::ExprLike(
-                    Box::new(Expr::CollCanon(Box::new(inner), tt)),
+                    Box::new(Expr::CollCanon(Box::new(inner), tt, false)),
                     fire_crab_ods::coll::icu_canonical(p, st),
                     esc,
                     *negated,
@@ -66855,6 +66968,31 @@ fn resolve_expr_term(
             }
         }
         RawKind::Similar(..) => return None, // NULL or parameter pattern
+        // `<expr> CONTAINING <p>` - the upper-cased substring test. The
+        // operand's own ttype decides the case law and the canonical
+        // form; an explicit COLLATE on it replaces that ttype, as it
+        // does everywhere else.
+        RawKind::Containing(Rhs::Str(p), negated) => {
+            if !matches!(lhs.type_of(descs)?, ExprType::Text | ExprType::Int) {
+                return None;
+            }
+            let (value, tt) = match &lhs {
+                Expr::Collate(inner, tt) => ((**inner).clone(), *tt),
+                other => (
+                    other.clone(),
+                    match expr_text_ttype(other, descs) {
+                        Some(tt) => tt,
+                        // no ttype in reach (an INTEGER operand, or an
+                        // expression this server cannot type): the
+                        // rendered decimal has no case to fold
+                        None => 0,
+                    },
+                ),
+            };
+            containing_term(value, tt, p, *negated)
+        }
+        RawKind::Containing(Rhs::Null, _) => Term::Never,
+        RawKind::Containing(..) => return None, // a non-literal pattern
         RawKind::Starting(Rhs::Str(p), negated) => {
             // temporal/approx/bool/numeric rendering under a prefix test
             // is unprobed - refuse those, answer text and integer sides
@@ -66872,7 +67010,7 @@ fn resolve_expr_term(
                 // the WRITTEN collation decides the prefix test, and it
                 // reads the CANONICAL form of both sides
                 Some((inner, tt, st)) => Term::ExprStarting(
-                    Box::new(Expr::CollCanon(Box::new(inner), tt)),
+                    Box::new(Expr::CollCanon(Box::new(inner), tt, false)),
                     fire_crab_ods::coll::icu_canonical(&p, st),
                     *negated,
                 ),
@@ -67355,7 +67493,7 @@ fn expr_no_raise(e: &Expr, descs: &[Descriptor]) -> bool {
         Expr::CollKey(a, _)
         | Expr::OctKey(a, _)
         | Expr::Collate(a, _)
-        | Expr::CollCanon(a, _) => expr_no_raise(a, descs),
+        | Expr::CollCanon(a, _, _) => expr_no_raise(a, descs),
         Expr::Neg(x) => expr_no_raise(x, descs),
         // arithmetic can overflow / divide by zero; CAST can fail
         Expr::Bin(..) | Expr::Cast(..) => false,
@@ -67514,6 +67652,9 @@ fn numeric_term(
     Some(match raw {
         RawKind::Const(b) => Term::Const(b),
         RawKind::CmpExpr(..) => return None, // see typed_term
+        // a numeric operand's CONTAINING renders it to decimal text -
+        // the shape [resolve_expr_term] answers, not this one
+        RawKind::Containing(..) => return None,
         // a BINARY pattern against a DECFLOAT column: refused, as
         // every other text-shaped pattern is here
         RawKind::Like(Rhs::Oct(_), ..) | RawKind::Starting(Rhs::Oct(_), _)
@@ -67621,6 +67762,9 @@ fn decfloat_term(
         });
     };
     Some(match raw {
+        // CONTAINING over a DECFLOAT column: the rendered text has no
+        // case to fold, but its rendering is unprobed here - refuse
+        RawKind::Containing(..) => return None,
         RawKind::Const(b) => Term::Const(b),
         RawKind::Cmp(_, Rhs::Null) => Term::Unknown,
         // a `?` against a DECFLOAT column: the input slot describes as the
@@ -67683,6 +67827,33 @@ fn param_or_typed_term(
     d: &Descriptor,
     params: &mut Vec<Option<Descriptor>>,
 ) -> Option<Term> {
+    // `<col> CONTAINING <p>` - the upper-cased substring test, and the
+    // one predicate that folds case on EVERY character set. It comes
+    // FIRST because it is answerable under a collation this server
+    // could not otherwise key: the case law is the CHARACTER SET's.
+    if let RawKind::Containing(Rhs::Str(p), negated) = &raw {
+        let tt = if d.sub_type >= 0 { d.sub_type as u16 } else { 0 };
+        let coll = fire_crab_ods::intl::collation_id(d.sub_type);
+        // a collation whose CANONICAL form this server does not have -
+        // a narrow one's table, a language tailoring - would leave the
+        // match at the upper-case alone, which is not what the engine
+        // compares (`CanonicalConverter<UpcaseConverter<>>`,
+        // Collation.cpp:527). Only the charset defaults (whose
+        // canonical form IS the string) and the ICU family answer.
+        let canonical_known =
+            coll == 0 || fire_crab_ods::coll::icu_strength_of_ttype(tt).is_some();
+        if canonical_known && matches!(kind, ColKind::Text | ColKind::Int) {
+            return Some(containing_term(Expr::Col(idx), tt, p, *negated));
+        }
+        return None;
+    }
+    // a NULL pattern is UNKNOWN for every row, negated or not
+    if matches!(raw, RawKind::Containing(Rhs::Null, _)) {
+        return Some(Term::Never);
+    }
+    if matches!(raw, RawKind::Containing(..)) {
+        return None; // a `?` or a binary pattern: not driven here
+    }
     // AN ICU COLLATION DECIDES THIS COMPARISON, and this server has no
     // table for it: under `UNICODE_CI`, `= 'APPLE'` matches `'apple'`
     // too, and a byte comparison silently answers FEWER ROWS. Refuse
@@ -67738,7 +67909,7 @@ fn param_or_typed_term(
                     None => return None,
                 };
                 return Some(Term::ExprLike(
-                    Box::new(Expr::CollCanon(Box::new(Expr::Col(idx)), tt)),
+                    Box::new(Expr::CollCanon(Box::new(Expr::Col(idx)), tt, false)),
                     canon(p),
                     esc,
                     *negated,
@@ -67746,7 +67917,7 @@ fn param_or_typed_term(
             }
             RawKind::Starting(Rhs::Str(p), negated) => {
                 return Some(Term::ExprStarting(
-                    Box::new(Expr::CollCanon(Box::new(Expr::Col(idx)), tt)),
+                    Box::new(Expr::CollCanon(Box::new(Expr::Col(idx)), tt, false)),
                     canon(p),
                     *negated,
                 ));

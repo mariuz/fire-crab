@@ -353,8 +353,18 @@ both "UPPER / LOWER of one, PROJECTED" \
 # ---- what is STILL refused, each for its own measured reason ------------
 # (LIKE and STARTING WITH moved out of this list - they answer now,
 # through the collation's CANONICAL form; see below)
-refuses "CONTAINING - not a collation limit, this server has no CONTAINING" \
-  "SELECT ID FROM T WHERE CI CONTAINING 'PPL' ORDER BY ID;"
+# (CONTAINING answers now - see qa/serve-real-containing.sh, which
+# holds its own laws; here it only has to agree under each collation)
+both "CONTAINING under each ICU collation" \
+  "SELECT ID FROM T WHERE CI CONTAINING 'PPL' ORDER BY ID;
+   SELECT ID FROM T WHERE UC CONTAINING 'PPL' ORDER BY ID;
+   SELECT ID FROM T WHERE AI CONTAINING 'PPL' ORDER BY ID;"
+# ...but not under PXW_INTL: CONTAINING reads the collation's CANONICAL
+# form after the upcase, and a NARROW collation's canonical is its own
+# table, which this server has not converted. Upper-casing alone would
+# be a guess about what that table says.
+refuses "CONTAINING under PXW_INTL - its canonical table is not converted" \
+  "SELECT ID FROM T WHERE W CONTAINING 'PPL' ORDER BY ID;"
 refuses "SIMILAR TO" "SELECT ID FROM T WHERE CI SIMILAR TO 'A.*' ORDER BY ID;"
 refuses "GROUP BY under CI - the surviving SPELLING is unpinnable" \
   "SELECT CI, COUNT(*) FROM T GROUP BY CI;"

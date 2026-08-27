@@ -1071,6 +1071,47 @@ canonicalising a character class is not the same operation), and
 `CONTAINING` — which is not a collation limit at all: this server has
 never implemented it.
 
+**...AND `CONTAINING`, WHICH THIS SERVER HAD NEVER IMPLEMENTED AT ALL —
+DONE 2026-08-27 (`serve-real-containing` 28, new).** The collation
+chunks kept recording it as a refusal beside `LIKE`; reading the engine
+showed it is not a collation limit at all — `CONTAINING` appeared in
+one keyword list here and nowhere else, for ANY character set.
+
+THE LAW, from the matcher's own type: `ContainsMatcher<UCHAR,
+UpcaseConverter<>>` for a direct collation (Collation.cpp:1075) and
+`CanonicalConverter<UpcaseConverter<>>` for one with a canonical form
+(:527). So **CONTAINING upper-cases FIRST — on every character set,
+whatever the column's collation — then canonicalises, then searches for
+a substring**, which is why it is the one predicate that folds case
+everywhere. Its sibling `STARTING WITH` takes `NullStrConverter` for a
+direct collation (no conversion at all: case-SENSITIVE) and the
+canonical converter WITHOUT the upcase for the rest — the difference
+the new gate exists to hold still.
+
+Implemented as a DESUGAR onto the machinery the pattern chunk just
+built: `x CONTAINING p` becomes
+`CollCanon(x, ttype, upcase) LIKE '%' || escaped(upcase_canon(p)) || '%'
+ESCAPE '\'`, with the pattern's own `%`, `_` and backslash escaped
+first — CONTAINING has NO wildcards (measured: `S CONTAINING '%'` takes
+only the row holding a literal per-cent). `Expr::CollCanon` gained the
+upcase flag; new `upcase_cs` folds by the CHARACTER SET's own law
+(OCTETS has none, a tabled single-byte set has its table, everything
+else takes `intl::simple_case`).
+
+Measured and pinned: an EMPTY pattern matches every non-NULL row; NULL
+on either side is UNKNOWN negated or not (`Term::Never` both ways); an
+INTEGER operand renders to its decimal text; a CHAR operand's padding
+is irrelevant (a substring test, not a comparison); `NOT CONTAINING`
+needed the keyword added to the two NOT-lookahead lists, since it lexes
+as an Ident like STARTING and SIMILAR.
+
+REFUSED: under `PXW_INTL` — a NARROW collation's canonical is its own
+table, which this server has not converted, and upper-casing alone
+would be a guess about what that table says; a `?` or binary pattern;
+and CONTAINING (or STARTING WITH) as a boolean VALUE in the SELECT
+list, which is a different grammar that knows only LIKE — a
+pre-existing gap this predicate inherits rather than one it adds.
+
 TWO CLEANUPS the ICU chunks recorded, done here: `stamp` and
 `order_key_ttype` were the same rule written twice (unified — the
 shared one also handles the negative-sentinel sub_type the other read
