@@ -747,6 +747,44 @@ COALESCE whose arguments are ALL parameters (the engine's −804), a
 parameter expression into a BLOB column, and a bare `?` in a select list
 (−804 on the engine too, generic here).
 
+**THE MERGE TAILS: PARAMETERS AND RETURNING EXPRESSIONS — DONE
+2026-08-26 (`serve-real-mergeparam` 26).** Section D's executor has been
+wired since the MERGE slice; these were its two recorded refusals.
+
+A MERGE executes by DESUGARING each source row into ordinary
+INSERT/UPDATE/DELETE statements built as TEXT, so a `?` could not ride
+through as a slot — by the time the per-row statement is planned its
+position in the original text is gone, and `plan_merge` refused the
+moment the statement carried one. Each `?` becomes a numbered
+`FC$P<n>` marker at prepare instead (text order, which is the order the
+engine's input SQLDA is in), typed there, and written as its bound
+literal at execute by `merge_subst`, beside the source row's own values.
+The typing follows the slice above: a marker in a SET or an INSERT value
+list takes its DESTINATION COLUMN's descriptor, one compared in the ON
+clause or a branch's AND takes the column it is compared with, and
+anything else — a parameter in the USING query, one compared with the
+SOURCE, one standing outside a comparison — keeps the refusal.
+
+`RETURNING <expression>` over a MERGE now goes through the select
+list's own builder like every other RETURNING, with the TWO-CONTEXT rule
+kept: the target's alias (or `NEW.`) qualifies a column and is stripped
+before resolution, a BARE name the SOURCE also carries stays the
+engine's 42702 rather than a silent pick, and a name the writer
+qualified with the target is exempt from that check. A source column
+inside the expression refuses — this path reads the target's
+after-image, and the source is not in it.
+
+Found while gating it: the INSERT ... SELECT re-render refused a DOUBLE
+value ("a selected value cannot be written as a literal"), which a
+MERGE branch carrying a double-bound parameter reaches — it renders
+through `dml_subq_literal` now, the cast-over-shortest-round-trip form.
+
+Still absent in D: `RETURNING OLD.x` and the source's columns in
+RETURNING, `OVERRIDING`, `PLAN` / `ORDER BY`, the failed statement's
+partial `Records affected` (the engine reports the rows it moved before
+the raise; fc reports 0), and a trigger-bearing target (refused by the
+per-row planners at execute, not at prepare).
+
 **AGGREGATES IN EXPRESSIONS DONE (2026-08-25,
 `serve-real-statexpr` 8):** the statistical/ordered-set family
 (VAR_*/STDDEV_*, CORR/COVAR_*/REGR_*, PERCENTILE_CONT/DISC) and

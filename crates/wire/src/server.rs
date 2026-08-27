@@ -21822,14 +21822,53 @@ fn wrap_returning(
             // name, and the value is computed per returned row from the
             // stored image the DML left behind ([ProjCol::value_of]).
             //
-            // A MERGE keeps its recorded refusal: its RETURNING already
-            // resolves two contexts, and an expression over them would
-            // have to name which one it reads.
-            if merge.is_some() {
-                return None;
-            }
             let (body, alias) = split_alias(item);
+            // a MERGE names its target by an ALIAS, and this route
+            // resolves against the target's own column names - so the
+            // qualifier comes off first (`NEW.` is that same image)
+            let stripped;
+            let mut qualified: Vec<String> = Vec::new();
+            let body = match &merge {
+                Some((alias_t, _)) => {
+                    let once = strip_qual_prefix(body, alias_t, &mut qualified);
+                    stripped = strip_qual_prefix(&once, "NEW", &mut qualified);
+                    stripped.as_str()
+                }
+                None => body,
+            };
             let raw = parse_raw_expr_any(body.trim())?;
+            // A MERGE's RETURNING resolves TWO contexts, and this route
+            // reads only the target's after-image - so every column the
+            // expression names must be the TARGET's and unambiguously
+            // so: a qualifier must be the target's alias (or `NEW.`,
+            // which is that same image), and a BARE name the source also
+            // carries is the engine's 42702 rather than a silent pick.
+            if let Some((alias_t, src)) = &merge {
+                let mut names = Vec::new();
+                raw_expr_col_names(&raw, &mut names);
+                for n in &names {
+                    match n.split_once('.') {
+                        Some((q, _)) => {
+                            let q = q.trim().trim_matches('"');
+                            if !(q.eq_ignore_ascii_case(alias_t) || q.eq_ignore_ascii_case("NEW")) {
+                                return None;
+                            }
+                        }
+                        None => {
+                            let bare = n.trim().trim_matches('"');
+                            // a name the writer QUALIFIED with the
+                            // target is unambiguous; only a truly bare
+                            // one meets the 42702 rule
+                            if qualified.iter().any(|q| q.eq_ignore_ascii_case(bare)) {
+                                continue;
+                            }
+                            if src.iter().any(|s| s.eq_ignore_ascii_case(bare)) {
+                                return None;
+                            }
+                        }
+                    }
+                }
+            }
             // the engine sets BOTH names from the expression and lets an
             // alias overwrite only the ALIAS (probed: `RETURNING N * 2
             // AS DOUBLED` is name MULTIPLY, alias DOUBLED) - the select
@@ -48355,6 +48394,138 @@ fn resolve_expr(
 }
 
 /// Does this expression carry a `?` parameter anywhere?
+/// Drop a leading `<alias>.` from every identifier in a clause, quotes
+/// and string literals honoured - the same strip [merge_subst] makes
+/// for the target's own alias, asked of a text that has no row yet (a
+/// MERGE's RETURNING expression, which resolves against the target's
+/// columns by their bare names).
+fn strip_qual_prefix(text: &str, alias: &str, taken: &mut Vec<String>) -> String {
+    let b = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0usize;
+    let ident_char = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$';
+    while i < b.len() {
+        let c = b[i];
+        if c == b'\'' {
+            let start = i;
+            i += 1;
+            while i < b.len() {
+                if b[i] == b'\'' {
+                    if i + 1 < b.len() && b[i + 1] == b'\'' {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            out.push_str(&text[start..i]);
+            continue;
+        }
+        if c.is_ascii_alphabetic() || c == b'_' || c == b'"' {
+            let start = i;
+            if c == b'"' {
+                i += 1;
+                while i < b.len() && b[i] != b'"' {
+                    i += 1;
+                }
+                i = (i + 1).min(b.len());
+            } else {
+                while i < b.len() && ident_char(b[i]) {
+                    i += 1;
+                }
+            }
+            let word = text[start..i].trim_matches('"');
+            if i < b.len() && b[i] == b'.' && word.eq_ignore_ascii_case(alias) {
+                i += 1; // the qualifier and its dot both go
+                // the name it qualified is UNAMBIGUOUS by construction -
+                // the caller must not judge it against the source
+                let ns = i;
+                if i < b.len() && b[i] == b'"' {
+                    i += 1;
+                    while i < b.len() && b[i] != b'"' {
+                        i += 1;
+                    }
+                    i = (i + 1).min(b.len());
+                } else {
+                    while i < b.len() && ident_char(b[i]) {
+                        i += 1;
+                    }
+                }
+                let name = text[ns..i].trim_matches('"').to_string();
+                out.push_str(&text[ns..i]);
+                taken.push(name);
+                continue;
+            }
+            out.push_str(&text[start..i]);
+            continue;
+        }
+        out.push(c as char);
+        i += 1;
+    }
+    out
+}
+
+/// Every COLUMN NAME a raw expression reads, as spelled (a qualifier
+/// kept). Used where a name's OWNER decides whether the expression may
+/// be served at all - a MERGE's RETURNING, where the target and the
+/// source both have columns and a bare name both carry is the engine's
+/// 42702.
+fn raw_expr_col_names(e: &RawExpr, out: &mut Vec<String>) {
+    match e {
+        RawExpr::Col(n) => out.push(n.clone()),
+        RawExpr::Neg(a) | RawExpr::Cast(a, _) => raw_expr_col_names(a, out),
+        RawExpr::Bin(a, _, b) | RawExpr::Concat(a, b) | RawExpr::NullIf(a, b) => {
+            raw_expr_col_names(a, out);
+            raw_expr_col_names(b, out);
+        }
+        RawExpr::Coalesce(v) | RawExpr::Func(_, v) | RawExpr::UserFn(_, v) => {
+            for x in v {
+                raw_expr_col_names(x, out);
+            }
+        }
+        RawExpr::Iif(c, a, b) => {
+            raw_cond_col_names(c, out);
+            raw_expr_col_names(a, out);
+            raw_expr_col_names(b, out);
+        }
+        RawExpr::Case(branches, else_) => {
+            for (c, t) in branches {
+                raw_cond_col_names(c, out);
+                raw_expr_col_names(t, out);
+            }
+            if let Some(x) = else_ {
+                raw_expr_col_names(x, out);
+            }
+        }
+        RawExpr::Cond(c) => raw_cond_col_names(c, out),
+        RawExpr::Agg(_, t) => {
+            if let AggTarget::Col(n) = &**t {
+                out.push(n.clone());
+            }
+        }
+        _ => {}
+    }
+}
+
+fn raw_cond_col_names(c: &RawCond, out: &mut Vec<String>) {
+    match c {
+        RawCond::Cmp(a, _, b) => {
+            raw_expr_col_names(a, out);
+            raw_expr_col_names(b, out);
+        }
+        RawCond::IsNull(a) => raw_expr_col_names(a, out),
+        RawCond::Not(inner) => raw_cond_col_names(inner, out),
+        RawCond::And(v) | RawCond::Or(v) => {
+            for x in v {
+                raw_cond_col_names(x, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn raw_has_param(e: &RawExpr) -> bool {
     match e {
         RawExpr::Param(_) => true,
@@ -60493,7 +60664,12 @@ fn insert_select(
                             return Some("?".to_string());
                         }
                     }
-                    psql_literal(v)
+                    // a DOUBLE has no literal spelling that keeps its
+                    // type - it travels as a cast over its shortest
+                    // round-tripping text ([dml_subq_literal]), which is
+                    // how a MERGE branch carrying a double-bound
+                    // parameter reaches the INSERT planner
+                    dml_subq_literal(v)
                 })
                 .collect::<Option<Vec<_>>>()
                 .ok_or("a selected value cannot be written as a literal")?;
@@ -60559,6 +60735,11 @@ fn insert_select(
 /// ([wrap_returning]).
 fn plan_merge(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor>)> {
     let text = sql.trim().trim_end_matches(';').trim();
+    // THE PARAMETERS, NUMBERED IN TEXT ORDER, before anything is split:
+    // each `?` becomes an `FC$P<n>` marker that rides inside the clause
+    // texts and is bound at execute ([MERGE_PARAM_MARK])
+    let (marked, nparams) = mark_merge_params(text);
+    let text = marked.as_str();
     let up = text.to_ascii_uppercase();
     if find_word(&up, "MERGE", 0) != Some(0) {
         return None;
@@ -60572,7 +60753,7 @@ fn plan_merge(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor>
             return None;
         }
     }
-    if up.contains('?') || find_word(&up, "ORDER", when0).is_some() {
+    if find_word(&up, "ORDER", when0).is_some() {
         return None;
     }
     // target [AS] alias
@@ -60723,7 +60904,40 @@ fn plan_merge(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor>
     }
     // the target must be a table this server writes
     let d = db.as_ref()?;
-    d.relation_meta(&target)?;
+    let meta = d.relation_meta(&target)?;
+    // EVERY MARKER MUST EARN A DESCRIPTOR, or the describe would
+    // announce a parameter with no type. A SET value and an INSERT
+    // value take the destination COLUMN's descriptor; a parameter
+    // compared in the ON clause or a branch's AND takes the column it
+    // is compared with. Anything else keeps the old refusal.
+    let params: Vec<Descriptor> = if nparams == 0 {
+        Vec::new()
+    } else {
+        let columns = meta.columns.as_ref().clone();
+        let (_, descs) = meta.formats.iter().max_by_key(|(n, _)| *n)?;
+        let mut slots: Vec<Option<Descriptor>> = vec![None; nparams];
+        type_markers_in_cond(&on, &columns, descs, &tgt_alias, &mut slots)?;
+        for (cond, act) in matched.iter().chain(by_source.iter()) {
+            if let Some(c) = cond {
+                type_markers_in_cond(c, &columns, descs, &tgt_alias, &mut slots)?;
+            }
+            match act {
+                MergeAction::Update(sets) => {
+                    type_markers_in_sets(sets, &columns, descs, &tgt_alias, &mut slots)?
+                }
+                MergeAction::Delete => {}
+            }
+        }
+        for (cond, cols, vals) in &not_matched {
+            if let Some(c) = cond {
+                type_markers_in_cond(c, &columns, descs, &tgt_alias, &mut slots)?;
+            }
+            type_markers_in_values(cols.as_ref(), vals, &columns, descs, &mut slots)?;
+        }
+        // a marker in the SOURCE query - or anywhere else this walk did
+        // not reach - has no type here
+        slots.into_iter().collect::<Option<_>>()?
+    };
     Some((
         Plan::Merge {
             target,
@@ -60735,8 +60949,214 @@ fn plan_merge(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor>
             not_matched,
             by_source,
         },
-        Vec::new(),
+        params,
     ))
+}
+
+/// The placeholder a MERGE's `?` becomes at prepare.
+///
+/// A MERGE is executed by DESUGARING each source row into ordinary
+/// INSERT/UPDATE/DELETE statements built as TEXT, so a `?` cannot ride
+/// through as a parameter slot - by the time the per-row statement is
+/// planned, its position in the original text is gone. It becomes a
+/// numbered marker instead: `FC$P0`, `FC$P1`, ... in TEXT ORDER, which
+/// is the order the engine's input SQLDA is in, and [merge_subst]
+/// replaces each with its bound value at execute, beside the source
+/// row's own values.
+const MERGE_PARAM_MARK: &str = "FC$P";
+
+/// Replace every `?` outside a string literal with its numbered marker.
+/// Returns the rewritten text and how many there were.
+fn mark_merge_params(text: &str) -> (String, usize) {
+    let b = text.as_bytes();
+    let mut out = String::with_capacity(text.len() + 8);
+    let mut i = 0usize;
+    let mut in_str = false;
+    let mut n = 0usize;
+    while i < b.len() {
+        let c = b[i] as char;
+        if c == '\'' {
+            in_str = !in_str;
+            out.push(c);
+        } else if c == '?' && !in_str {
+            out.push_str(&format!("{}{}", MERGE_PARAM_MARK, n));
+            n += 1;
+        } else {
+            out.push(c);
+        }
+        i += 1;
+    }
+    (out, n)
+}
+
+/// The slot numbers the markers in this clause carry, in text order.
+fn marker_slots(text: &str) -> Vec<usize> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(at) = rest.find(MERGE_PARAM_MARK) {
+        let tail = &rest[at + MERGE_PARAM_MARK.len()..];
+        let end = tail.find(|c: char| !c.is_ascii_digit()).unwrap_or(tail.len());
+        if let Ok(n) = tail[..end].parse::<usize>() {
+            out.push(n);
+        }
+        rest = &tail[end..];
+    }
+    out
+}
+
+/// Record a marker's descriptor - the type the DESCRIBE announces for
+/// that parameter. A slot typed twice with different descriptors is a
+/// shape this does not understand, and refuses.
+fn set_marker_desc(
+    params: &mut [Option<Descriptor>],
+    slot: usize,
+    d: Descriptor,
+) -> Option<()> {
+    let same = |a: &Descriptor, b: &Descriptor| {
+        a.dtype == b.dtype && a.length == b.length && a.scale == b.scale && a.sub_type == b.sub_type
+    };
+    let cell = params.get_mut(slot)?;
+    match cell {
+        Some(prev) if !same(prev, &d) => return None,
+        _ => *cell = Some(d),
+    }
+    Some(())
+}
+
+/// The target column a name refers to inside a MERGE clause: bare, or
+/// qualified by the TARGET's alias. A qualifier naming anything else -
+/// the source - answers None, and its parameter refuses (the source's
+/// type is the source query's business, not the target's).
+fn merge_target_col<'a>(
+    name: &str,
+    columns: &'a [RelationColumn],
+    tgt_alias: &str,
+) -> Option<&'a RelationColumn> {
+    let (qual, bare) = match name.split_once('.') {
+        Some((q, c)) => (Some(q.trim().trim_matches('"')), c.trim().trim_matches('"')),
+        None => (None, name.trim().trim_matches('"')),
+    };
+    if let Some(q) = qual {
+        if !q.eq_ignore_ascii_case(tgt_alias) {
+            return None;
+        }
+    }
+    columns.iter().find(|c| c.name.eq_ignore_ascii_case(bare))
+}
+
+/// Type every marker in a `SET` list: each takes its DESTINATION
+/// COLUMN's descriptor, which is the same law an ordinary UPDATE's
+/// parameter follows ([resolve_dest_param_expr]).
+fn type_markers_in_sets(
+    sets: &str,
+    columns: &[RelationColumn],
+    descs: &[Descriptor],
+    tgt_alias: &str,
+    params: &mut [Option<Descriptor>],
+) -> Option<()> {
+    for part in split_set_list(sets) {
+        let eq = part.find('=')?;
+        let slots = marker_slots(&part[eq + 1..]);
+        if slots.is_empty() {
+            continue;
+        }
+        // a marker on the LEFT of the assignment is not a value
+        if !marker_slots(&part[..eq]).is_empty() {
+            return None;
+        }
+        let col = merge_target_col(part[..eq].trim(), columns, tgt_alias)?;
+        let d = descs.get(col.field_id as usize)?.clone();
+        for slot in slots {
+            set_marker_desc(params, slot, d.clone())?;
+        }
+    }
+    Some(())
+}
+
+/// Type every marker in an `INSERT` branch's value list: by POSITION
+/// against the branch's column list, or the relation's own column order
+/// when the branch names none.
+fn type_markers_in_values(
+    cols: Option<&String>,
+    vals: &str,
+    columns: &[RelationColumn],
+    descs: &[Descriptor],
+    params: &mut [Option<Descriptor>],
+) -> Option<()> {
+    let items = split_set_list(vals);
+    let targets: Vec<&RelationColumn> = match cols {
+        Some(c) => split_set_list(c)
+            .iter()
+            .map(|n| {
+                let n = n.trim().trim_matches('"');
+                columns.iter().find(|c| c.name.eq_ignore_ascii_case(n))
+            })
+            .collect::<Option<Vec<_>>>()?,
+        None => columns
+            .iter()
+            .filter(|c| !is_computed_fid(descs, c.field_id as usize))
+            .collect(),
+    };
+    if targets.len() != items.len() {
+        return None;
+    }
+    for (item, col) in items.iter().zip(targets) {
+        let slots = marker_slots(item);
+        if slots.is_empty() {
+            continue;
+        }
+        let d = descs.get(col.field_id as usize)?.clone();
+        for slot in slots {
+            set_marker_desc(params, slot, d.clone())?;
+        }
+    }
+    Some(())
+}
+
+/// Type every marker in an `ON` clause or a branch's `AND` condition: a
+/// parameter COMPARED with a target column takes that column's
+/// descriptor (the engine types a comparison's parameter from the other
+/// side). Any other shape - a parameter compared with the source, with
+/// another parameter, or standing outside a comparison - refuses.
+fn type_markers_in_cond(
+    cond: &str,
+    columns: &[RelationColumn],
+    descs: &[Descriptor],
+    tgt_alias: &str,
+    params: &mut [Option<Descriptor>],
+) -> Option<()> {
+    let b = cond.as_bytes();
+    let ident_byte = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$' || c == b'.' || c == b'"';
+    for slot in marker_slots(cond) {
+        let needle = format!("{}{}", MERGE_PARAM_MARK, slot);
+        let at = cond.find(&needle)?;
+        // BACKWARD: `<col> <cmp> FC$Pn`
+        let mut i = at;
+        while i > 0 && (b[i - 1] as char).is_whitespace() {
+            i -= 1;
+        }
+        let cmp_end = i;
+        while i > 0 && matches!(b[i - 1], b'=' | b'<' | b'>' | b'!') {
+            i -= 1;
+        }
+        if i == cmp_end {
+            return None; // no comparison operator before it
+        }
+        while i > 0 && (b[i - 1] as char).is_whitespace() {
+            i -= 1;
+        }
+        let name_end = i;
+        while i > 0 && ident_byte(b[i - 1]) {
+            i -= 1;
+        }
+        if i == name_end {
+            return None;
+        }
+        let col = merge_target_col(&cond[i..name_end], columns, tgt_alias)?;
+        let d = descs.get(col.field_id as usize)?.clone();
+        set_marker_desc(params, slot, d)?;
+    }
+    Some(())
 }
 
 /// Does a clause carry a `<alias>.<column>` reference? The same token
@@ -60796,6 +61216,7 @@ fn merge_subst(
     src_cols: &[String],
     row: &[Value],
     tgt_alias: &str,
+    args: &[WireParam],
 ) -> Result<String, String> {
     let b = text.as_bytes();
     let mut out = String::with_capacity(text.len());
@@ -60836,6 +61257,22 @@ fn merge_subst(
                 }
             }
             let first = text[start..i].trim_matches('"').to_ascii_uppercase();
+            // A BOUND PARAMETER, as its literal: the marker plan_merge
+            // left in place of a `?` ([MERGE_PARAM_MARK]). It is written
+            // here, beside the source row's own values, because the
+            // per-row statement is planned from this text
+            if let Some(n) = first.strip_prefix(MERGE_PARAM_MARK).and_then(|d| d.parse::<usize>().ok())
+            {
+                let wp = args.get(n).ok_or("missing parameter value")?;
+                let v = param_to_expr(wp)
+                    .and_then(|e| e.eval(&[]).ok())
+                    .ok_or("a parameter this MERGE cannot write as a literal")?;
+                out.push_str(
+                    &dml_subq_literal(&v)
+                        .ok_or("a parameter this MERGE cannot write as a literal")?,
+                );
+                continue;
+            }
             if i < b.len() && b[i] == b'.' {
                 let mut j = i + 1;
                 let cstart = j;
@@ -60919,7 +61356,7 @@ fn merge_exec(
     let mut pairs: Vec<(String, Vec<(u64, Vec<u8>, u8)>)> = Vec::new();
     let mut touched: std::collections::HashSet<u64> = std::collections::HashSet::new();
     for row in &rows {
-        let sub = |t: &str| merge_subst(t, src_alias, &src_cols, row, tgt_alias);
+        let sub = |t: &str| merge_subst(t, src_alias, &src_cols, row, tgt_alias, args);
         let on_s = sub(on)?;
         let probe = format!("DELETE FROM {} WHERE {}", target, on_s);
         let (dplan, _) = plan_delete(&probe, database)
@@ -61013,7 +61450,7 @@ fn merge_exec(
     let null_row: Vec<Value> = vec![Value::Null; src_cols.len()];
     for identity in &orphans {
         let step = (|| -> Result<(), ExecErr> {
-            let sub = |t: &str| merge_subst(t, src_alias, &src_cols, &null_row, tgt_alias);
+            let sub = |t: &str| merge_subst(t, src_alias, &src_cols, &null_row, tgt_alias, args);
             for (cond, action) in by_source {
                 let mut where_ = identity.clone();
                 if let Some(c) = cond {
@@ -61049,7 +61486,7 @@ fn merge_exec(
     }
     for (row, (on_s, targets)) in rows.iter().zip(pairs) {
         let step = (|| -> Result<(), ExecErr> {
-            let sub = |t: &str| merge_subst(t, src_alias, &src_cols, row, tgt_alias);
+            let sub = |t: &str| merge_subst(t, src_alias, &src_cols, row, tgt_alias, args);
             if targets.is_empty() {
                 for (cond, cols, vals) in not_matched {
                     // INSERT ... SELECT <values> FROM RDB$DATABASE [WHERE <cond>]:

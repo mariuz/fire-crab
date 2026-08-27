@@ -25,8 +25,7 @@
 # over a COMPUTED column (these rows are decoded from the STORED image,
 # where a computed column's descriptor sits over the null flags - the
 # bare column already refused for that reason), an aggregate, a
-# subquery, a parameter, and a MERGE's RETURNING (two contexts, and an
-# expression would have to name which one it reads).
+# subquery, and a parameter.
 #
 #   qa/serve-real-returningexpr.sh [port]
 set -u
@@ -163,8 +162,8 @@ refuses "a quoted name in the wrong case is still Column unknown" \
   "UPDATE T SET N = 1 WHERE ID = 1 RETURNING \"n\";"
 refuses "a parameter in RETURNING refuses" \
   "UPDATE T SET N = 1 WHERE ID = 1 RETURNING ?;"
-refuses "a MERGE's RETURNING keeps its expression refusal (two contexts)" \
-  "MERGE INTO T tg USING (SELECT 1 AS K FROM RDB\$DATABASE) s ON tg.ID = 1 WHEN MATCHED THEN UPDATE SET N = 2 RETURNING tg.N * 2;"
+# (a MERGE's RETURNING takes expressions too - see
+# serve-real-mergeparam.sh, where the two-context rule is pinned)
 gf=$("$GFIX" -v -full -user "$U" -pas "$P" "$A" 2>&1)
 ran=$((ran + 1))
 if [ -z "$gf" ]; then echo "OK   gfix -v -full clean on fc's file"; else echo "DIFF gfix: $gf"; fail=1; fi
