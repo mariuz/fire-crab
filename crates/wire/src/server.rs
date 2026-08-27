@@ -12433,22 +12433,7 @@ fn fk_check_parent_row(
 /// operator outside the WHERE surface) - DML must then refuse, never
 /// bypass the constraint.
 ///
-/// The three action predicates a universal trigger's body may read, in/// The frame's variable slots for a trigger body: every declared
-/// variable NULL, and the three action predicates set for the event
-/// that is firing (1 for the one, 0 for the others) - which is what
-/// makes `IF (INSERTING)` answer inside a universal trigger.
-fn trig_frame_vars(names: &[String], action: u8) -> Vec<Value> {
-    let mut vars = vec![Value::Null; names.len()];
-    let base = names.len().saturating_sub(TRIG_ACTION_NAMES.len());
-    for (i, _) in TRIG_ACTION_NAMES.iter().enumerate() {
-        if let Some(slot) = vars.get_mut(base + i) {
-            *slot = Value::Int(if action as usize == i + 1 { 1 } else { 0 });
-        }
-    }
-    vars
-}
-
-/// The three action predicates a universal trigger's body may read, in
+/// The three action predicates a universal trigger's body may read, in/// The three action predicates a universal trigger's body may read, in
 /// the order their synthetic slots are appended ([trig_body_of]).
 const TRIG_ACTION_NAMES: [&str; 3] = ["INSERTING", "UPDATING", "DELETING"];
 
@@ -12809,14 +12794,7 @@ fn trig_body_of(t: &TrigDef) -> Option<(TrigStmt, Vec<String>)> {
     let begin_at = find_word(&up, "BEGIN", 0)?;
     // a trigger declares its variables between AS and BEGIN, exactly
     // where a procedure's header declares them
-    let mut names = declared_var_names(&t.source[..begin_at]);
-    // INSERTING / UPDATING / DELETING are not variables, but they READ
-    // like them: a universal trigger's body asks which action fired it.
-    // Giving them slots at the end of the name list lets the ordinary
-    // resolution turn them into `Expr::Variable`s, and the frame fills
-    // the three with 1/0 for the event actually firing
-    // ([TRIG_ACTION_NAMES]).
-    names.extend(TRIG_ACTION_NAMES.iter().map(|n| n.to_string()));
+    let names = declared_var_names(&t.source[..begin_at]);
     let body = parse_trigger_body(&t.source, begin_at, t.source.trim_end().len(), &names)?;
     let inits = declared_var_inits(&t.source[..begin_at], &names).ok()?;
     let body = if inits.is_empty() {
@@ -14681,6 +14659,9 @@ fn infer_int_rank(
         Expr::TextLiteral(_) => None, // the CHECK surface is INT-ONLY
         Expr::NullLiteral => None,    // ...and NULL comparisons stay refused there
         Expr::DomainValue => None,    // typed before the VALUE rewrite - never here
+        // the firing action is a plain number (1/2/3), the rank an
+        // integer literal has - which is what lets `INSERTING` compare
+        Expr::TriggerAction => Some(IntRank::Long),
 
         Expr::Add(l, r) | Expr::Subtract(l, r) => {
             let (lr, rr) = (infer_int_rank(l, field_rank)?, infer_int_rank(r, field_rank)?);
@@ -15660,6 +15641,7 @@ fn expr_resolve_vars(
         | Expr::TextLiteral(_)
         | Expr::NullLiteral
         | Expr::DomainValue => e.clone(),
+        | Expr::TriggerAction => e.clone(),
         Expr::Add(l, r) => Expr::Add(
             Box::new(expr_resolve_vars(l, vars)),
             Box::new(expr_resolve_vars(r, vars)),
@@ -15782,6 +15764,7 @@ fn expr_plain_ctx(e: &fire_crab_ods::expr::Expr, ctx: u8) -> fire_crab_ods::expr
         | Expr::TextLiteral(_)
         | Expr::NullLiteral
         | Expr::DomainValue => e.clone(),
+        | Expr::TriggerAction => e.clone(),
         Expr::Add(l, r) => Expr::Add(
             Box::new(expr_plain_ctx(l, ctx)),
             Box::new(expr_plain_ctx(r, ctx)),
@@ -15842,6 +15825,7 @@ fn expr_resolve_marked(
         | Expr::TextLiteral(_)
         | Expr::NullLiteral
         | Expr::DomainValue => e.clone(),
+        | Expr::TriggerAction => e.clone(),
         Expr::Add(l, r) => Expr::Add(
             Box::new(expr_resolve_marked(l, vars, marked)),
             Box::new(expr_resolve_marked(r, vars, marked)),
@@ -16121,6 +16105,7 @@ fn expr_has_text(e: &fire_crab_ods::expr::Expr) -> bool {
         | Expr::Int64Literal(_)
         | Expr::NullLiteral
         | Expr::DomainValue => false,
+        | Expr::TriggerAction => false,
         Expr::Add(l, r) | Expr::Subtract(l, r) | Expr::Multiply(l, r) | Expr::Divide(l, r) => {
             expr_has_text(l) || expr_has_text(r)
         }
@@ -18046,6 +18031,7 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
             | Expr::TextLiteral(_)
             | Expr::NullLiteral
             | Expr::DomainValue => {}
+            | Expr::TriggerAction => {}
             Expr::Add(l, r) | Expr::Subtract(l, r) | Expr::Multiply(l, r) | Expr::Divide(l, r) => {
                 expr_fields(l, out);
                 expr_fields(r, out);
@@ -20289,13 +20275,14 @@ fn cond_unary(t: &[ETok], p: &mut usize) -> Option<fire_crab_ods::expr::Cond> {
     // condition belongs is not a Firebird boolean, and accepting one
     // would let this server COMPILE a trigger the engine refuses.
     if let Some(ETok::Id(w)) = t.get(*p) {
-        if TRIG_ACTION_NAMES.iter().any(|n| n.eq_ignore_ascii_case(w)) {
-            let name = w.clone();
+        if let Some(action) = TRIG_ACTION_NAMES.iter().position(|n| n.eq_ignore_ascii_case(w)) {
             *p += 1;
+            // the engine's own shape: `blr_eql(blr_internal_info(6),
+            // <1|2|3>)` (parse.y's trigger_action_predicate)
             return Some(Cond::Cmp(
-                fire_crab_ods::expr::CmpOp::Neq,
-                fire_crab_ods::expr::Expr::Field { context: CTX_PLAIN, name },
-                fire_crab_ods::expr::Expr::IntLiteral(0),
+                fire_crab_ods::expr::CmpOp::Eql,
+                fire_crab_ods::expr::Expr::TriggerAction,
+                fire_crab_ods::expr::Expr::IntLiteral(action as i32 + 1),
             ));
         }
     }
@@ -20351,6 +20338,7 @@ fn expr_with_context(e: &fire_crab_ods::expr::Expr, context: u8) -> fire_crab_od
         Expr::Int64Literal(v) => Expr::Int64Literal(*v),
         Expr::NullLiteral => Expr::NullLiteral,
         Expr::DomainValue => Expr::DomainValue,
+        Expr::TriggerAction => Expr::TriggerAction,
         Expr::Add(l, r) => Expr::Add(
             Box::new(expr_with_context(l, context)),
             Box::new(expr_with_context(r, context)),
@@ -20401,6 +20389,7 @@ fn expr_all_plain(e: &fire_crab_ods::expr::Expr) -> bool {
         Expr::Field { context, .. } => *context == CTX_PLAIN,
         Expr::Variable(_) => false, // only a trigger body has variables
         Expr::DomainValue => false, // checked before the VALUE rewrite - never here
+        Expr::TriggerAction => false, // checked before the VALUE rewrite - never here
         Expr::IntLiteral(_) => true,
         Expr::Int64Literal(_) => true,
         Expr::TextLiteral(_) => true,
@@ -20773,7 +20762,11 @@ fn expr_value_to_fid(e: &fire_crab_ods::expr::Expr) -> Option<fire_crab_ods::exp
     use fire_crab_ods::expr::Expr;
     Some(match e {
         Expr::Field { name, .. } if name.eq_ignore_ascii_case("VALUE") => Expr::DomainValue,
-        Expr::Field { .. } | Expr::Variable(_) | Expr::DomainValue => return None,
+        // a DOMAIN's CHECK has no trigger firing it, and no variables
+        Expr::Field { .. }
+        | Expr::Variable(_)
+        | Expr::DomainValue
+        | Expr::TriggerAction => return None,
         Expr::IntLiteral(_) | Expr::Int64Literal(_) | Expr::TextLiteral(_) | Expr::NullLiteral => {
             e.clone()
         }
@@ -26513,7 +26506,7 @@ fn fire_deferred_triggers(
                 ExecErr::Text(format!("trigger {} is outside this server's PSQL surface", d.name))
             })?;
             let mut frame = PsqlFrame {
-                vars: trig_frame_vars(&names, action),
+                vars: vec![Value::Null; names.len()],
                 out_at: names.len(),
                 out_len: 0,
                 suspended: Vec::new(),
@@ -26526,6 +26519,7 @@ fn fire_deferred_triggers(
                     old: old.clone(),
                     new: new.clone(),
                     writable: false,
+                    action,
                 }),
             };
             let mut steps = 0u32;
@@ -60712,6 +60706,10 @@ struct TrigCtx {
     old: Option<Vec<Value>>,
     new: Option<Vec<Value>>,
     writable: bool,
+    /// which DML action is firing - 1 INSERT, 2 UPDATE, 3 DELETE - the
+    /// number `INSERTING`/`UPDATING`/`DELETING` compare against
+    /// ([Expr::TriggerAction])
+    action: u8,
 }
 
 impl TrigCtx {
@@ -60916,6 +60914,13 @@ fn eval_psql_expr(e: &fire_crab_ods::expr::Expr, f: &PsqlFrame) -> Result<Value,
             None => Err(PsqlStop::Unsupported),
         },
         E::DomainValue => Err(PsqlStop::Unsupported),
+        // INSERTING / UPDATING / DELETING: the ACTION firing this
+        // trigger, as the number the comparison beside it expects.
+        // Outside a trigger there is none, and the reference refuses
+        E::TriggerAction => match f.trig.as_ref() {
+            Some(t) => Ok(Value::Int(t.action as i64)),
+            None => Err(PsqlStop::Unsupported),
+        },
         E::Add(a, b) => bin(a, b, |x, y| x.checked_add(y)),
         E::Subtract(a, b) => bin(a, b, |x, y| x.checked_sub(y)),
         E::Multiply(a, b) => bin(a, b, |x, y| x.checked_mul(y)),
@@ -62488,6 +62493,7 @@ fn render_psql_expr(e: &fire_crab_ods::expr::Expr, f: &PsqlFrame) -> Option<Stri
         E::Variable(n) => psql_literal(f.vars.get(*n as usize).unwrap_or(&Value::Null))?,
         E::Field { name, .. } => name.clone(),
         E::DomainValue => return None, // never appears in a PSQL body
+        E::TriggerAction => return None, // never appears in a PSQL body
         E::Add(a, b) => format!("({} + {})", render_psql_expr(a, f)?, render_psql_expr(b, f)?),
         E::Subtract(a, b) => format!("({} - {})", render_psql_expr(a, f)?, render_psql_expr(b, f)?),
         E::Multiply(a, b) => format!("({} * {})", render_psql_expr(a, f)?, render_psql_expr(b, f)?),
@@ -64629,7 +64635,7 @@ fn fire_triggers(
             ExecErr::Text(format!("trigger {} is outside this server's PSQL surface", d.name))
         })?;
         let mut frame = PsqlFrame {
-            vars: trig_frame_vars(&names, action),
+            vars: vec![Value::Null; names.len()],
             out_at: names.len(),
             out_len: 0,
             suspended: Vec::new(),
@@ -64642,6 +64648,7 @@ fn fire_triggers(
                 old: old.cloned(),
                 new: new_row.as_deref().cloned(),
                 writable: before,
+                action,
             }),
         };
         let mut steps = 0u32;

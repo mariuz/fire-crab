@@ -906,9 +906,34 @@ pieces, small because the machinery around them now exists:
   boolean, and accepting one would let this server COMPILE a trigger the
   engine refuses.
 
-Boundary recorded: this server RUNS a universal trigger the engine
-created; its own CREATE TRIGGER still refuses to compile one (the
-composed type and the action predicates have no probed BLR here yet). The WRITE side needed nothing: an index whose type is not
+**THE ACTION PREDICATE IS A NODE, NOT A TRICK — DONE 2026-08-27
+(`serve-real-trigger`, TR5).** The synthetic slots above answer
+INSERTING/UPDATING/DELETING while a body RUNS, and that is all they can
+do: the same parser feeds CREATE TRIGGER, where a predicate resolved as
+a plain name would have been emitted as an ordinary FIELD REFERENCE -
+wrong BLR, written into the catalog with no error to show for it. (Two
+probes corrected the record here: this server's CREATE TRIGGER has
+handled the COMPOSED TYPE for a long time - `BEFORE INSERT OR UPDATE =
+17`, the triple 113, written order preserved - and the boundary recorded
+above, "CREATE for a universal trigger still refuses", was measuring a
+malformed probe: an isql script with no `SET TERM`, so the body's
+semicolon split the statement into a -104 on BOTH servers.)
+
+`ods::expr::Expr::TriggerAction` is the engine's own half of the
+predicate: `parse.y`'s `trigger_action_predicate` builds
+`blr_eql(blr_internal_info(<const 6 = INFO_TYPE_TRIGGER_ACTION>),
+<const 1|2|3>)`, so the node emits `blr_internal_info` followed by the
+info type as an ordinary long literal, and the literal beside it says
+which action was asked about. One representation now serves both paths -
+the interpreter answers it from `TrigCtx.action`, the compiler emits it -
+and `serve-real-trigger` pins the bytes: a universal trigger's BLR and
+debug info come back byte-for-byte identical to the engine's, the
+composed type with them.
+
+Adding a variant to that shared enum surfaced fifteen exhaustive matches
+across `ods` and `wire`; each carries an arm saying what a trigger
+action IS in that context (no column reference, not text, never inside a
+domain CHECK) rather than a copied default. The WRITE side needed nothing: an index whose type is not
 `PXW_INTL` was already unmaintainable here, so an INSERT that would
 break a `UNIQUE` CI index refuses instead of storing a duplicate the
 engine rejects (measured), and an FK over a CI key refuses rather than

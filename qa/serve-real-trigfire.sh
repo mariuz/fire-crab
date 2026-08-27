@@ -36,10 +36,9 @@
 #
 # Boundaries (recorded): a BEFORE body that touches the database (it
 # must decide what is stored, and the statement is holding the working
-# copy of the file), a DEFERRED body that names the table it fires for
-# (by then that table holds every row the statement wrote), and this
-# server's own CREATE TRIGGER for a universal trigger - it RUNS one the
-# engine created, it does not yet compile one.
+# copy of the file), and a DEFERRED body that names the table it fires
+# for (by then that table holds every row the statement wrote, where the
+# engine's per-row firing would have shown it a prefix).
 #
 #   qa/serve-real-trigfire.sh [port]
 set -u
@@ -204,11 +203,8 @@ refuses "a deferred AFTER trigger that names ITS OWN table refuses" \
   "INSERT INTO D (ID, A) VALUES (30, 1);"
 refuses "a universal trigger whose BEFORE body writes another table refuses too" \
   "INSERT INTO M (ID, A) VALUES (30, 1);"
-# fire-crab RUNS a universal trigger the engine created; its own CREATE
-# TRIGGER still refuses to compile one (recorded - the composed type and
-# the action predicates have no probed BLR here yet)
-refuses "CREATE TRIGGER for a universal trigger still refuses" \
-  "CREATE TRIGGER V_X FOR V BEFORE INSERT OR UPDATE AS BEGIN NEW.A = 1; END;"
+# (fire-crab COMPILES a universal trigger too, action predicates and
+# all, byte for byte - serve-real-trigger.sh pins those bytes)
 gf=$("$GFIX" -v -full -user "$U" -pas "$P" "$A" 2>&1)
 ran=$((ran + 1))
 if [ -z "$gf" ]; then echo "OK   gfix -v -full clean on fc's file"; else echo "DIFF gfix: $gf"; fail=1; fi

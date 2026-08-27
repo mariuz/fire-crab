@@ -47,11 +47,23 @@ FBK="$D/fc-trig-work.fbk"; RST="$D/fc-trig-rst.fdb"
 command -v node >/dev/null 2>&1 || { echo "SKIP node not found"; exit 0; }
 mkdir -p "$D"; rm -f "$WORK" "$REF" "$FBK" "$RST"
 
-T="CREATE TABLE T1 (A INTEGER, B INTEGER)"
+# C is TR5's column: a universal trigger writing B would move the
+# values the vacuous guard below reads off B
+T="CREATE TABLE T1 (A INTEGER, B INTEGER, C INTEGER)"
 TR1="CREATE TRIGGER TR1 FOR T1 BEFORE INSERT AS BEGIN NEW.B = NEW.A * 2; END"
 TR2="CREATE TRIGGER TR2 FOR T1 BEFORE UPDATE POSITION 5 AS BEGIN NEW.B = OLD.B + 1; END"
 TR3="CREATE TRIGGER TR3 FOR T1 BEFORE INSERT POSITION 1 AS BEGIN IF (NEW.A > 10) THEN NEW.B = 0; END"
 TR4="CREATE TRIGGER TR4 FOR T1 BEFORE INSERT POSITION 7 AS BEGIN IF (NOT (NEW.A > 1)) THEN NEW.B = 0; END"
+# a UNIVERSAL trigger, and the action predicate inside it: the engine
+# compiles INSERTING as `blr_eql(blr_internal_info(6), 1)`
+# (parse.y's trigger_action_predicate), and the type packs both actions
+# (BEFORE INSERT OR UPDATE = 17). Both are byte-compared below.
+# What this gate pins about TR5 is its BYTES - the composed type and the
+# `blr_eql(blr_internal_info(6), 1)` the engine compiles INSERTING to;
+# serve-real-trigfire.sh is where a universal trigger's runtime
+# behaviour is measured. It writes C so the values the vacuous guard
+# reads off B are untouched.
+TR5="CREATE TRIGGER TR5 FOR T1 BEFORE INSERT OR UPDATE AS BEGIN IF (INSERTING) THEN NEW.C = 1; ELSE NEW.C = 2; END"
 
 "$ISQL" -q -b -user "$U" -pas "$P" <<EOF || { echo "FAIL ref db"; exit 1; }
 CREATE DATABASE '$REF' USER '$U' PASSWORD '$P' PAGE_SIZE 8192;
@@ -62,6 +74,7 @@ $TR1^
 $TR2^
 $TR3^
 $TR4^
+$TR5^
 SET TERM ; ^
 COMMIT;
 EOF
@@ -119,6 +132,7 @@ check "fire-crab: the table" "$(node_run "$T")" "OK"
 check "fire-crab: BEFORE INSERT trigger (NEW.B = NEW.A * 2)" "$(node_run "$TR1")" "OK"
 check "fire-crab: BEFORE UPDATE trigger reading OLD, POSITION 5" "$(node_run "$TR2")" "OK"
 check "fire-crab: IF (cond) THEN body, POSITION 1" "$(node_run "$TR3")" "OK"
+check "fire-crab: a UNIVERSAL trigger with an action predicate" "$(node_run "$TR5")" "OK"
 case "$(node_run 'CREATE TRIGGER TX FOR T1 AFTER INSERT AS BEGIN NEW.B = 1; END')" in
     ERR*) echo "OK   AFTER triggers refuse (outside the slice)" ;;
     *) echo "DIFF after refusal"; fail=1 ;; esac
@@ -197,7 +211,7 @@ case "$insw" in *[Ee]rror*|*SQLSTATE*) echo "DIFF engine DML through fc's trigge
 
 valq() { "$ISQL" -q -b -user "$U" -pas "$P" "$1" 2>&1 <<'SQL' | strip | grep -v '^$'
 SET HEADING OFF;
-SELECT A, B FROM T1 ORDER BY A;
+SELECT A, B, C FROM T1 ORDER BY A;
 SQL
 }
 work_v=$(valq "$WORK")

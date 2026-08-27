@@ -33,6 +33,11 @@ const BLR_LEQ: u8 = 52;
 const BLR_OR: u8 = 57;
 const BLR_AND: u8 = 58;
 const BLR_VARIABLE: u8 = 26;
+/// `blr_internal_info` (blr.h:325) - the engine's "ask the runtime" node
+const BLR_INTERNAL_INFO: u8 = 177;
+/// `INFO_TYPE_TRIGGER_ACTION` (constants.h:320) - which DML action is
+/// firing the trigger this body belongs to
+const INFO_TYPE_TRIGGER_ACTION: i32 = 6;
 const BLR_ABORT: u8 = 128;
 const BLR_GDS_CODE: u8 = 0;
 const BLR_END: u8 = 255;
@@ -73,6 +78,16 @@ pub enum Expr {
     /// column at statement compile. Only [domain_validation_blr]
     /// emits it; it never appears in a trigger or computed column.
     DomainValue,
+    /// `INSERTING` / `UPDATING` / `DELETING` inside a trigger body: the
+    /// ACTION firing it, as the number the engine compares against (1
+    /// INSERT, 2 UPDATE, 3 DELETE).
+    ///
+    /// The engine has no boolean node for these - `parse.y`'s
+    /// `trigger_action_predicate` builds `blr_eql(blr_internal_info(6),
+    /// <1|2|3>)`, where 6 is `INFO_TYPE_TRIGGER_ACTION` - so this is the
+    /// INTERNAL INFO half of that comparison and the literal beside it
+    /// says which action the body asked about.
+    TriggerAction,
 }
 
 impl Expr {
@@ -125,6 +140,13 @@ impl Expr {
                 out.push(0); // context 0 - reserved for VALUE
                 out.extend_from_slice(&0u16.to_le_bytes()); // field id 0
             }
+            // blr_internal_info, then its operand: the info TYPE as an
+            // ordinary long literal (parse.y builds it with
+            // MAKE_const_slong(INFO_TYPE_TRIGGER_ACTION))
+            Expr::TriggerAction => {
+                out.push(BLR_INTERNAL_INFO);
+                Expr::IntLiteral(INFO_TYPE_TRIGGER_ACTION).emit(out);
+            }
         }
     }
 
@@ -163,7 +185,10 @@ impl Expr {
             | Expr::TextLiteral(_)
             | Expr::NullLiteral
             | Expr::Variable(_)
-            | Expr::DomainValue => {}
+            | Expr::DomainValue
+            // it names no column - it asks the runtime which action
+            // is firing
+            | Expr::TriggerAction => {}
             Expr::Add(l, r)
             | Expr::Subtract(l, r)
             | Expr::Multiply(l, r)
