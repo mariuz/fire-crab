@@ -150,13 +150,29 @@ both "an EXPRESSION operand" \
 both "an explicit COLLATE on the operand" \
   "SELECT ID FROM K WHERE S COLLATE UNICODE_CI_AI CONTAINING 'app' ORDER BY ID;
    SELECT ID FROM K WHERE AI COLLATE UCS_BASIC CONTAINING 'app' ORDER BY ID;"
-# ...but NOT as a boolean VALUE in the select list: that is a different
-# grammar, and it knows LIKE and neither of the other two - a
-# pre-existing gap this predicate inherits rather than one it adds
-refuses "CONTAINING as a select-list boolean" \
+# ---- EVERY PREDICATE IS ALSO A VALUE -----------------------------------
+# In Firebird a predicate is a BOOLEAN expression, usable anywhere a
+# value is. This server's condition grammar knew only LIKE, so the same
+# test answered in a WHERE and refused in a CASE. All three now parse
+# there, and each keeps the collation law it has as a predicate.
+both "CONTAINING as a select-list boolean" \
   "SELECT ID, CASE WHEN S CONTAINING 'PPL' THEN 1 ELSE 0 END X FROM K ORDER BY ID;"
-refuses "...and STARTING WITH is refused there too, as it always was" \
+both "STARTING WITH as one" \
   "SELECT ID, CASE WHEN S STARTING WITH 'a' THEN 1 ELSE 0 END X FROM K ORDER BY ID;"
+both "SIMILAR TO as one, with and without ESCAPE" \
+  "SELECT ID, CASE WHEN S SIMILAR TO 'a%' THEN 1 ELSE 0 END X FROM K ORDER BY ID;
+   SELECT ID, CASE WHEN S SIMILAR TO 'a#%b_c' ESCAPE '#' THEN 1 ELSE 0 END X FROM K ORDER BY ID;"
+both "negated, as values" \
+  "SELECT ID, CASE WHEN S NOT CONTAINING 'PPL' THEN 1 ELSE 0 END X FROM K ORDER BY ID;
+   SELECT ID, CASE WHEN S NOT STARTING WITH 'a' THEN 1 ELSE 0 END X FROM K ORDER BY ID;"
+both "a BARE boolean projection, no CASE around it" \
+  "SELECT ID, (S STARTING WITH 'a') X, (S CONTAINING 'PPL') Y FROM K ORDER BY ID;"
+both "...and each keeps its collation law as a value" \
+  "SELECT ID, CASE WHEN CI CONTAINING 'PPL' THEN 1 ELSE 0 END X FROM K ORDER BY ID;
+   SELECT ID, CASE WHEN AI STARTING WITH 'app' THEN 1 ELSE 0 END Y FROM K ORDER BY ID;
+   SELECT ID, CASE WHEN UC STARTING WITH 'app' THEN 1 ELSE 0 END Z FROM K ORDER BY ID;"
+both "in a WHERE over the value form" \
+  "SELECT ID FROM K WHERE (S CONTAINING 'PPL') = TRUE ORDER BY ID;"
 both "in a DML WHERE" \
   "UPDATE K SET N = 99 WHERE S CONTAINING 'BAN'; COMMIT;
    SELECT ID, N FROM K ORDER BY ID;"

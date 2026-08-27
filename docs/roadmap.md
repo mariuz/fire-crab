@@ -1112,6 +1112,32 @@ and CONTAINING (or STARTING WITH) as a boolean VALUE in the SELECT
 list, which is a different grammar that knows only LIKE — a
 pre-existing gap this predicate inherits rather than one it adds.
 
+**...AND THE LAST THREE PREDICATES THAT WERE NOT ALSO VALUES — DONE
+2026-08-27 (`serve-real-containing` 28 → 33).** In Firebird a predicate
+is a BOOLEAN expression, usable anywhere a value is. This server has
+TWO expression grammars — a TOKEN one for predicates and a CHARACTER
+one for the select list and the DML value surface — and the character
+one's condition parser knew only `LIKE`. So the same test answered in a
+`WHERE` and refused in a `CASE`.
+
+Probed which predicates could already be values: comparisons, `LIKE`,
+`BETWEEN`, `IN`, `IS NULL`, `AND`/`OR`, `EXISTS` and `IS DISTINCT FROM`
+all could; exactly three could not — `STARTING WITH`, `CONTAINING` and
+`SIMILAR TO`. All three parse there now (each keyword lexes as an
+Ident, so each is matched by text, and each takes a LITERAL pattern
+only — the restriction `LIKE` already had on that side; `read_quoted`
+declines a `?` or an expression pattern rather than mis-reading it).
+
+`Cond2` gained `Starting` and `Similar`, mirroring `Term::ExprStarting`
+and `Term::ExprSimilar` exactly — render, then the prefix test or the
+prepare-compiled regex. `CONTAINING` needed no variant: it desugars to
+`Cond2::Like` through the SAME `containing_term` the predicate path
+uses, so the upcase-then-canonical rule has one implementation rather
+than two. Each keeps its collation law as a value: `starting_canon`
+canonicalises both sides under an ICU collation and refuses a collation
+with no canonical form here, and `SIMILAR TO` refuses a collated
+operand as it does in a `WHERE`.
+
 TWO CLEANUPS the ICU chunks recorded, done here: `stamp` and
 `order_key_ttype` were the same rule written twice (unified — the
 shared one also handles the negative-sentinel sub_type the other read
