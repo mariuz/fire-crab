@@ -135,11 +135,18 @@ case "$(node_run "$TR4")" in
 case "$(node_run 'CREATE TRIGGER TX FOR T1 BEFORE INSERT AS BEGIN NEW.NOPE = 1; END')" in
     ERR*) echo "OK   an unknown target column refuses" ;;
     *) echo "DIFF unknown-col refusal"; fail=1 ;; esac
-# fire-crab does not execute trigger BLR - its own DML on this table
-# must REFUSE rather than silently skip the triggers
+# fire-crab FIRES the triggers it compiled: its own DML on this table is
+# served now (serve-real-trigfire.sh is the whole of that). The row it
+# writes must be the row the engine writes - the value comparison at the
+# end of this gate is what proves it, so the ENGINE makes the same
+# insert into the reference file here
 case "$(node_run 'INSERT INTO T1 (A) VALUES (1)')" in
-    ERR*) echo "OK   fire-crab REFUSES its own DML on a user-trigger table" ;;
-    *) echo "DIFF fc dml refusal"; fail=1 ;; esac
+    ERR*) echo "DIFF fc dml on a user-trigger table refused"; fail=1 ;;
+    *) echo "OK   fire-crab fires its own triggers on its own DML" ;; esac
+"$ISQL" -q -b -user "$U" -pas "$P" "$REF" >/dev/null 2>&1 <<'SQL'
+INSERT INTO T1 (A) VALUES (1);
+COMMIT;
+SQL
 kill $srv 2>/dev/null; wait $srv 2>/dev/null
 
 catq() { "$ISQL" -q -b -user "$U" -pas "$P" "$1" 2>&1 <<'SQL' | strip | grep -v '^$'

@@ -820,7 +820,95 @@ reach, and it answered `MIN(W)` = 'APPLE' where the engine answers
 What is untouched: SELECTING such a column (bytes in, bytes out —
 nothing is decided), its LENGTHS and CASTS, the whole default-collation
 surface, and every PXW_INTL comparison and ordering, which keys as
-before. The WRITE side needed nothing: an index whose type is not
+before.
+
+**FIRING USER TRIGGERS ON THIS SERVER'S OWN DML — DONE 2026-08-27
+(`serve-real-trigfire` 16, then 22).** `serve-real-trigger` has covered
+CREATE TRIGGER for a long time — the PSQL-to-BLR compile, the catalog
+rows, the debug blob, with the ENGINE executing what this server wrote.
+The other half was missing: this server never FIRED one, so **any** user
+trigger on a table made every INSERT, UPDATE and DELETE against it
+refuse (the coarse `user_trigger` flag in `check_predicates_uncached`).
+A table with an audit or a compute-a-column trigger could not be written
+at all.
+
+It fires them now, and the runnable surface is exactly the one CREATE
+TRIGGER compiles: assignments over `NEW.`/`OLD.`, variables, literals,
+integer arithmetic, IF, WHILE, EXCEPTION, and blocks with their WHEN
+handlers. Measured against the engine: a BEFORE trigger COMPUTES a
+column and what it assigns to `NEW.<col>` is what gets stored (over a
+client's value too); several fire in RDB$TRIGGER_SEQUENCE order, each
+seeing the last one's result; a BEFORE UPDATE body reads OLD and NEW and
+a BEFORE DELETE one reads OLD; an INACTIVE trigger does not fire; an
+AFTER trigger fires with the row written and NEW read-only there.
+
+**An EXCEPTION inside a body stops the statement with the ENGINE'S OWN
+vector**, stack item included: `At trigger "PUBLIC"."T_BI3" line: 1,
+col: 82`. That line and column count the ORIGINAL `CREATE TRIGGER` text,
+not the stored source — so they are read back from the `RDB$DEBUG_INFO`
+blob this server already writes (`debug_info_anchor` takes its first
+source entry, the body's BEGIN, and the interpreter's own offset does
+the rest). The exception's NUMBER and MESSAGE are resolved at PREPARE
+(`TrigDef::excs`): a trigger fires while the statement holds the working
+copy of the file, with no catalog in reach.
+
+Two mechanisms, one seam: `PsqlFrame` grew a `TrigCtx` (the relation's
+columns, the OLD and NEW rows, and whether NEW is writable), which is
+what turned `Expr::Field` and `TrigTarget::Field` from
+`PsqlStop::Unsupported` into the trigger contexts they always described.
+
+**AND THE OTHER HALF: AN AFTER TRIGGER MAY TOUCH THE DATABASE — DONE
+2026-08-27 (same gate).** The most common trigger of all - `AFTER INSERT
+... INSERT INTO LOG ...` - was still refused, because a trigger fires
+while the statement holds its working copy and a nested write would be
+lost under it. An AFTER trigger has nothing left to decide, so such a
+body now runs DEFERRED: after the statement's own writes are applied,
+with the database in reach, and still inside the statement's undo window
+(`fire_deferred_triggers`, called from `execute_dml_collecting` between
+the inner run and the unwind) - so a raise takes the whole statement
+back, its own rows included. The rows come from the `Affected` collector
+the statement already fills for RETURNING, extended with `old_images` so
+a deferred AFTER UPDATE body reads a real OLD.
+
+Boundaries recorded, both stated rather than guessed: a BEFORE trigger
+whose body touches the database keeps the refusal (it must decide what
+gets stored, and by the time the database is free the row is already
+there), and a deferred body that NAMES THE TABLE IT FIRES FOR refuses -
+by then that table holds every row the statement wrote, where the
+engine's per-row firing would have shown it a prefix. A multi-event
+trigger (`BEFORE INSERT OR UPDATE`) refuses whole: its composed type
+carries the INSERTING/UPDATING/DELETING predicates with it.
+
+`serve-real-trigger` and `serve-real-trigger2` unrecorded their
+"fire-crab REFUSES its own DML on a user-trigger table" boundaries, and
+`serve-real-fkguard` its two (a USER trigger no longer refuses the
+statement; the FK ACTION triggers it exists for still do).
+
+**UNIVERSAL (MULTI-EVENT) TRIGGERS — DONE 2026-08-27 (same gate, 25).**
+`BEFORE INSERT OR UPDATE [OR DELETE]` packs up to three actions into one
+trigger type, and the slice above refused every one of them. Three small
+pieces, small because the machinery around them now exists:
+
+* the COMPOSED TYPE is decoded rather than special-cased. This server
+  already spells it for SHOW (`trigger_type_words`: bit 0 is BEFORE,
+  then three action slots carrying 1 INSERT / 2 UPDATE / 3 DELETE), so
+  `dml_trigger_events` reads the same arithmetic the other way - and a
+  single-event trigger is simply the one-slot case, so the six original
+  types needed no arm of their own.
+* `INSERTING` / `UPDATING` / `DELETING` take SYNTHETIC VARIABLE SLOTS
+  appended to the body's name list (`TRIG_ACTION_NAMES`), so the
+  ordinary name resolution turns them into `Expr::Variable`s and
+  `trig_frame_vars` fills the three with 1/0 for the action actually
+  firing. No parser surgery at all.
+* a BARE ACTION PREDICATE is a condition: `IF (INSERTING) THEN ...`.
+  That path is restricted to exactly those three names - an integer
+  expression standing where a condition belongs is not a Firebird
+  boolean, and accepting one would let this server COMPILE a trigger the
+  engine refuses.
+
+Boundary recorded: this server RUNS a universal trigger the engine
+created; its own CREATE TRIGGER still refuses to compile one (the
+composed type and the action predicates have no probed BLR here yet). The WRITE side needed nothing: an index whose type is not
 `PXW_INTL` was already unmaintainable here, so an INSERT that would
 break a `UNIQUE` CI index refuses instead of storing a duplicate the
 engine rejects (measured), and an FK over a CI key refuses rather than

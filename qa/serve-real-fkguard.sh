@@ -11,8 +11,9 @@
 #     key guard is false) - allowed, and must match the engine's result;
 #   - UPDATE touching a referenced KEY column would cascade - refused;
 #   - DELETE of a parent row would cascade/SET NULL - refused;
-#   - DELETE on a USER-trigger table (system_flag 0) - refused too (the
-#     coarse rule plan_insert/plan_update already applied).
+#   - DML on a USER-trigger table (system_flag 0) is ALLOWED now: this
+#     server fires the triggers it can run (serve-real-trigfire.sh), and
+#     refuses only a body outside that surface.
 # The guard reads the CATALOG (trigger rows + their RDB$DEPENDENCIES key
 # columns), so it must hold on a database the ENGINE created.
 #
@@ -60,6 +61,7 @@ INSERT INTO DETAIL VALUES (20, 2);
 INSERT INTO P2 VALUES (1);
 INSERT INTO C2 VALUES (1);
 INSERT INTO TD VALUES (1, 2);
+INSERT INTO TD VALUES (2, 3);
 COMMIT;"
 
 for f in "$REF" "$WORK"; do
@@ -137,10 +139,13 @@ refuse "SET NULL parent key UPDATE refuses (guard is action-agnostic)" \
        "$(node_run 'UPDATE P2 SET A = 5 WHERE A = 1')"
 refuse "SET NULL parent DELETE refuses" \
        "$(node_run 'DELETE FROM P2 WHERE A = 1')"
-refuse "DELETE on a user-trigger table refuses (flag-0 guard now on DELETE too)" \
-       "$(node_run 'DELETE FROM TD WHERE ID = 1')"
-refuse "UPDATE on a user-trigger table still refuses" \
-       "$(node_run 'UPDATE TD SET B = 9 WHERE ID = 1')"
+# a USER trigger no longer refuses the statement: this server FIRES the
+# ones it can run (serve-real-trigfire.sh), and TD's AFTER DELETE body -
+# a variable assignment over OLD - is one of them
+check  "DELETE on a user-trigger table is allowed (the trigger fires)" \
+       "$(node_run 'DELETE FROM TD WHERE ID = 1')" "OK"
+check  "UPDATE on a user-trigger table is allowed (no UPDATE trigger there)" \
+       "$(node_run 'UPDATE TD SET B = 9 WHERE ID = 2')" "OK"
 kill $srv 2>/dev/null; wait $srv 2>/dev/null
 
 # --- 2. the engine mirrors the ALLOWED statements on the ref -----------
@@ -148,6 +153,8 @@ kill $srv 2>/dev/null; wait $srv 2>/dev/null
 INSERT INTO MASTER (ID, VAL) VALUES (4, 40);
 UPDATE MASTER SET VAL = 7 WHERE ID = 2;
 DELETE FROM DETAIL WHERE CID = 20;
+DELETE FROM TD WHERE ID = 1;
+UPDATE TD SET B = 9 WHERE ID = 2;
 COMMIT;
 SQL
 dump() { # <file>

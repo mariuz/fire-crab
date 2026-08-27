@@ -143,9 +143,16 @@ case "$(node_run 'CREATE TRIGGER TX FOR T1 BEFORE INSERT AS DECLARE VARIABLE V V
 case "$(node_run 'CREATE TRIGGER TX FOR T1 BEFORE INSERT AS BEGIN ELSE NEW.B = 1; END')" in
     ERR*) echo "OK   ELSE without an IF refuses" ;;
     *) echo "DIFF else refusal"; fail=1 ;; esac
+# fire-crab FIRES its own triggers now (serve-real-trigfire.sh); the
+# ENGINE makes the same insert into the reference file, so the value
+# comparison below still compares like with like
 case "$(node_run 'INSERT INTO T1 (A) VALUES (1)')" in
-    ERR*) echo "OK   fire-crab still refuses its own DML on a user-trigger table" ;;
-    *) echo "DIFF fc dml refusal"; fail=1 ;; esac
+    ERR*) echo "DIFF fc dml on a user-trigger table refused"; fail=1 ;;
+    *) echo "OK   fire-crab fires its own triggers on its own DML" ;; esac
+"$ISQL" -q -b -user "$U" -pas "$P" "$REF" >/dev/null 2>&1 <<'SQL'
+INSERT INTO T1 (A) VALUES (1);
+COMMIT;
+SQL
 kill $srv 2>/dev/null; wait $srv 2>/dev/null
 
 catq() { "$ISQL" -q -b -user "$U" -pas "$P" "$1" 2>&1 <<'SQL' | strip | grep -v '^$'
