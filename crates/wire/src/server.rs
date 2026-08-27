@@ -2233,6 +2233,21 @@ impl CryptOffer {
 /// targets, described exactly like an output column). Clients build
 /// their parameter encoders from this - node-firebird picks
 /// SQLParamDate/Bool/etc by these types.
+/// A private bit on a PARAMETER's descriptor: this parameter's
+/// destination is a NOT NULL column, so the describe announces it NOT
+/// nullable.
+///
+/// The engine derives a parameter's nullability from the metadata -
+/// `DSC_nullable` is explicitly "not stored" (dsc_pub.h:39) - and an
+/// input parameter is announced NULLABLE unless the column it is
+/// assigned to forbids it (measured both ways: every parameter over a
+/// nullable column is `Nullable`, and one binding an identity column's
+/// value is not). fire-crab announced EVERY parameter not-nullable,
+/// because [wire_for] hands back the bare type and this section never
+/// added the bit. The on-disk `dsc_flags` has no consumer here, so the
+/// planners overwrite it on the COPY they register.
+const PARAM_NOT_NULL: u16 = 8;
+
 fn append_bind_section(d: &mut Vec<u8>, params: &[Descriptor]) {
     fn int_item(d: &mut Vec<u8>, code: u8, val: i32) {
         d.push(code);
@@ -2243,6 +2258,9 @@ fn append_bind_section(d: &mut Vec<u8>, params: &[Descriptor]) {
     int_item(d, 7, params.len() as i32); // describe_vars
     for (i, pd) in params.iter().enumerate() {
         let (_, sql_type, length, scale, sub_type) = wire_for(pd);
+        // NULLABLE unless the planner marked the destination NOT NULL
+        let sql_type =
+            if pd.flags & PARAM_NOT_NULL != 0 { sql_type } else { nullable(sql_type) };
         int_item(d, 9, (i + 1) as i32); // sqlda_seq
         int_item(d, 11, sql_type);
         int_item(d, 12, sub_type);
@@ -3026,10 +3044,12 @@ impl Database {
             if fire_crab_ods::ddl::relation_external_file(&image, ps, table).is_some() {
                 return None;
             }
+            let mut formats = relation_formats(&image, ps, id);
+            stamp_param_nullability(&mut formats, &not_null_fids_uncached(self, table));
             return Some(std::sync::Arc::new(crate::mdc::Relation {
                 id,
                 columns: std::sync::Arc::new(relation_columns(&image, ps, table)),
-                formats: std::sync::Arc::new(relation_formats(&image, ps, id)),
+                formats: std::sync::Arc::new(formats),
             }));
         }
         self.meta.relation(table, || {
@@ -3042,10 +3062,12 @@ impl Database {
             if fire_crab_ods::ddl::relation_external_file(&image, ps, table).is_some() {
                 return None;
             }
+            let mut formats = relation_formats(&image, ps, id);
+            stamp_param_nullability(&mut formats, &not_null_fids_uncached(self, table));
             Some(crate::mdc::Relation {
                 id,
                 columns: std::sync::Arc::new(relation_columns(&image, ps, table)),
-                formats: std::sync::Arc::new(relation_formats(&image, ps, id)),
+                formats: std::sync::Arc::new(formats),
             })
         })
     }
@@ -8112,6 +8134,10 @@ AlterDomainRename {
         descs: Vec<Descriptor>,
         index_ops: Vec<IndexOp>,
         param_fields: Vec<(usize, usize)>,
+        /// VALUE EXPRESSIONS carrying `?`: (field id, the resolved
+        /// expression). Bound and evaluated at execute, where a plain
+        /// parameter field is merely encoded - `VALUES (? + 1)`
+        param_exprs: Vec<(usize, Expr)>,
         /// `NEXT VALUE FOR` / `GEN_ID` fields: (field id, generator name,
         /// step). Each bumps its generator at execute and stores the new
         /// value into the field.
@@ -11433,6 +11459,31 @@ fn wire_for(d: &Descriptor) -> (Wire, i32, i32, i32, i32) {
 /// execute.
 /// [not_null_fids_uncached], held in the metadata cache: which fields
 /// a table refuses NULL in cannot change without DDL.
+/// Stamp a relation's formats with the nullability the CATALOG holds,
+/// so a parameter typed from one of these descriptors is described the
+/// way the engine describes it.
+///
+/// The engine derives a descriptor's nullability from metadata -
+/// `DSC_nullable` is explicitly "not stored" (dsc_pub.h:39) - and a
+/// parameter INHERITS the nullability of the column that types it:
+/// `WHERE ID = ?` over an `ID INTEGER NOT NULL` announces the parameter
+/// NOT NULL, `SET V = ?` over a nullable column announces it nullable
+/// (both measured). Stamping the formats once, where they are built,
+/// gives every consumer the answer - the predicate resolver, the SET
+/// list and the value list all copy a column's descriptor when they
+/// type a `?`.
+fn stamp_param_nullability(formats: &mut [(u8, Vec<Descriptor>)], nn: &[usize]) {
+    for (_, descs) in formats.iter_mut() {
+        for (fid, d) in descs.iter_mut().enumerate() {
+            if nn.contains(&fid) {
+                d.flags |= PARAM_NOT_NULL;
+            } else {
+                d.flags &= !PARAM_NOT_NULL;
+            }
+        }
+    }
+}
+
 fn not_null_fids(db: &Database, table: &str) -> Vec<usize> {
     db.meta_memo("not-null", table, || not_null_fids_uncached(db, table))
         .as_ref()
@@ -14061,6 +14112,13 @@ enum InsVal {
     Bool(bool),
     Null,
     Param(usize),
+    /// A VALUE EXPRESSION carrying `?` placeholders - `VALUES (? + 1)`,
+    /// `VALUES (CAST(? AS INTEGER))`, `VALUES (UPPER(?))`. Kept RAW
+    /// here because a parameter is typed by its DESTINATION COLUMN
+    /// ([resolve_dest_param_expr]) and the target list is resolved after
+    /// the value list is parsed; the slots are already numbered, in
+    /// source order.
+    ParamExpr(RawExpr),
     /// `GenId(name, step)`: `None` step = `NEXT VALUE FOR` (use the
     /// sequence's own increment), `Some(n)` = `GEN_ID(name, n)`.
     GenId(String, Option<i64>),
@@ -22492,6 +22550,18 @@ fn plan_insert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
                 // cannot be typed yet (the destination column types the
                 // parameter, and the target list is resolved below), so
                 // the numbered raw tree is carried through.
+                // the `?` must be OUTSIDE a string literal: `VALUES
+                // ('a?b' || 'c')` is a constant expression, not a
+                // parameter, and diverting it here would refuse a shape
+                // that has always worked
+                _ if mask_literals(&part_text).contains('?') => {
+                    let mut raw = parse_raw_expr_any(part_text.trim())?;
+                    if !raw_has_param(&raw) {
+                        return None; // a `?` the parser read as something else
+                    }
+                    renumber_raw_params(&mut raw, &mut nparams);
+                    InsVal::ParamExpr(raw)
+                }
                 _ => {
                     // an UNTYPED expression whose fold is NULL is the
                     // eval fallthrough talking (`'5' + 1` - the engine's
@@ -22654,6 +22724,9 @@ fn plan_insert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
     // parameter targets in VALUES (= slot) order, each a bindable type;
     // generator targets, each a bump evaluated at execute
     let mut param_fields = Vec::new();
+    // VALUE EXPRESSIONS carrying `?`, resolved HERE - where the target
+    // column is known, because the column types the parameter
+    let mut param_exprs: Vec<(usize, Expr)> = Vec::new();
     let mut gen_fields = Vec::new();
     let mut params = vec![None; nparams];
     for (rc, v) in targets.iter().zip(&vals) {
@@ -22677,6 +22750,23 @@ fn plan_insert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
                     param_fields.push((fid, *slot));
                 }
                 params[*slot] = Some(d.clone());
+            }
+            InsVal::ParamExpr(raw) => {
+                let d = descs.get(fid)?.clone();
+                if !param_target_ok(&d) {
+                    return None;
+                }
+                // a BLOB destination takes its value through the
+                // blob-store path at execute, which this arm does not
+                // walk - refuse rather than write eight bytes of text
+                // over an id
+                if d.dtype == dtype::BLOB || d.dtype == dtype::ARRAY {
+                    return None;
+                }
+                let e = resolve_dest_param_expr(raw, &d, &[], &[], &mut params)?;
+                if !discarded {
+                    param_exprs.push((fid, e));
+                }
             }
             // an explicit generator advance into a column OVERRIDING
             // USER VALUE is about to discard: whether the engine still
@@ -22760,6 +22850,7 @@ fn plan_insert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
             descs,
             index_ops,
             param_fields,
+            param_exprs,
             gen_fields,
             checks,
             domain_checks,
@@ -22898,7 +22989,7 @@ fn build_insert_image(
     // ones OVERRIDING USER VALUE discards, so those stay NULL-flagged
     // here and are filled by insert_defaults / the generator at execute.
     for &(rc, v) in landing {
-        if matches!(v, InsVal::Param(_) | InsVal::GenId(..)) {
+        if matches!(v, InsVal::Param(_) | InsVal::ParamExpr(_) | InsVal::GenId(..)) {
             continue; // stays NULL-flagged; execute binds/advances the value
         }
         let fid = rc.field_id as usize;
@@ -23017,7 +23108,9 @@ fn encode_set_value(d: &Descriptor, v: &InsVal) -> Option<Option<Vec<u8>>> {
         // DEFAULT-valued column out of the image targets so the column
         // falls to insert_defaults / the identity generator. This arm is
         // the belt-and-braces refusal if it ever did.
-        InsVal::Param(_) | InsVal::GenId(..) | InsVal::Default => return None,
+        InsVal::Param(_) | InsVal::ParamExpr(_) | InsVal::GenId(..) | InsVal::Default => {
+            return None
+        }
     };
     encode_wire_value(d, &wp)
 }
@@ -24672,11 +24765,6 @@ fn plan_update(sql: &str, db_outer: &Option<Database>) -> Option<(Plan, Vec<Desc
                     return None;
                 }
                 let rhs = part_text[eq + 1..].trim();
-                // a `?` inside an expression would need a slot bound
-                // mid-evaluation; refuse rather than mis-number
-                if rhs.contains('?') {
-                    return None;
-                }
                 // A SUBQUERY AS THE ASSIGNED VALUE. One that names no
                 // outer column is a CONSTANT for the whole statement -
                 // answered once and folded into the text as its literal,
@@ -24764,7 +24852,37 @@ fn plan_update(sql: &str, db_outer: &Option<Database>) -> Option<(Plan, Vec<Desc
                 // expressions, where a bare column is a plain column).
                 // `SET A = B` needs it - and so does the swap
                 // `SET A = B, B = A`.
-                let raw = parse_raw_expr_any(rhs)?;
+                let mut raw = parse_raw_expr_any(rhs)?;
+                // A `?` INSIDE THE EXPRESSION. The placeholders are
+                // numbered in SOURCE ORDER, continuing the count this
+                // SET list has reached (the WHERE picks up after it), and
+                // each takes the type the engine gives it - see
+                // [resolve_dest_param_expr] for the law.
+                if raw_has_param(&raw) {
+                    let mut next = params.len();
+                    renumber_raw_params(&mut raw, &mut next);
+                    let dest = descs.get(fid0)?.clone();
+                    let e = resolve_dest_param_expr(&raw, &dest, &columns, descs, &mut params)?;
+                    // NO type gate here: a `?` has no type until it is
+                    // bound (`? * 2` types None at prepare), and the
+                    // BOUND tree is gated at execute instead - where the
+                    // value exists
+                    if sets.iter().any(|(f, _)| *f == fid0) || is_computed_fid(descs, fid0) {
+                        return None;
+                    }
+                    // every slot this expression opened must have earned
+                    // a descriptor, or the describe would announce a
+                    // parameter the client cannot bind
+                    if params.len() != next || params.iter().any(Option::is_none) {
+                        return None;
+                    }
+                    if let Some(err) = subq_raise {
+                        return Some((Plan::RefusedEval(err), Vec::new()));
+                    }
+                    sets.push((fid0, SetVal::Expr(e)));
+                    continue;
+                }
+                let raw = raw;
                 let e = resolve_expr(&raw, &columns, descs)?;
                 // the TYPE GATE, as the projection's own rule: an
                 // expression the type system refuses (`'5' + 1` - the
@@ -24941,6 +25059,8 @@ fn plan_update(sql: &str, db_outer: &Option<Database>) -> Option<(Plan, Vec<Desc
     let domain_checks = domain_check_predicates(db, table, &columns, descs)?;
     let format_no = *format_no;
     let not_null = not_null_fids(db, table);
+    // a parameter assigned STRAIGHT INTO a NOT NULL column is announced
+    // not-nullable; every other one is nullable ([PARAM_NOT_NULL])
     // the FK partner checks, both directions, narrowed to the FKs whose
     // key columns this SET list touches - an update leaving a key
     // untouched can violate nothing
@@ -25017,7 +25137,10 @@ fn plan_delete(sql: &str, db_outer: &Option<Database>) -> Option<(Plan, Vec<Desc
     // VIO_erase does not either (entries outlive their records until
     // garbage collection removes both)
     let columns = db.columns(table);
-    let formats = relation_formats(&db.bytes(), db.page_size, rel);
+    let mut formats = relation_formats(&db.bytes(), db.page_size, rel);
+    // the catalog's NOT NULL on the descriptors a WHERE `?` is typed
+    // from ([stamp_param_nullability])
+    stamp_param_nullability(&mut formats, &not_null_fids(db, table));
     // a relation with no RDB$FORMATS entry (a system relation) cannot
     // be walked by format - refuse rather than silently delete nothing
     let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
@@ -26590,7 +26713,7 @@ fn execute_dml_collecting_inner(
             )?;
             (0, 0, 0)
         }
-        Plan::Insert { rel, table, format_no, image, descs, index_ops, param_fields, gen_fields, not_null, checks, domain_checks, fk_refs, default_fields, blob_lits } => {
+        Plan::Insert { rel, table, format_no, image, descs, index_ops, param_fields, param_exprs, gen_fields, not_null, checks, domain_checks, fk_refs, default_fields, blob_lits } => {
             let mut image = image.clone();
             // MATERIALISE the temporary blobs the parameters name (blb::move):
             // the closed temp blob's segments land in THIS relation's pages
@@ -26612,6 +26735,35 @@ fn execute_dml_collecting_inner(
                 let d = descs.get(*fid).ok_or("field beyond format")?;
                 let arg = args.get(*slot).ok_or("missing parameter value")?;
                 match encode_wire_value(d, arg)
+                    .ok_or("parameter type does not match its column")?
+                {
+                    None => {} // NULL: the flag is already set
+                    Some(bytes) => {
+                        let at = d.offset as usize;
+                        image[at..at + bytes.len()].copy_from_slice(&bytes);
+                        image[fid / 8] &= !(1 << (fid % 8));
+                    }
+                }
+            }
+            // VALUE EXPRESSIONS carrying `?`: bind, then evaluate. The
+            // expression has no row to read - a VALUES list names no
+            // column - so it folds over the empty row exactly as a
+            // constant expression does at prepare, and a raise carries
+            // the engine's own vector.
+            for (fid, e) in param_exprs {
+                let d = descs.get(*fid).ok_or("field beyond format")?;
+                let bound = subst_params_expr(e, args).ok_or("missing parameter value")?;
+                // the bound tree must still TYPE, or the eval
+                // fallthrough would answer NULL and store it silently -
+                // the same gate the constant-expression arm makes at
+                // prepare, made here because the value arrives now
+                if bound.type_of(&[]).is_none() {
+                    return Err("parameter type does not match its column".into());
+                }
+                let v = bound.eval(&[]).map_err(ExecErr::Eval)?;
+                let wp = expr_value_to_wireparam(&bound, &v, &[])
+                    .ok_or("parameter type does not match its column")?;
+                match encode_wire_value(d, &wp)
                     .ok_or("parameter type does not match its column")?
                 {
                     None => {} // NULL: the flag is already set
@@ -26771,7 +26923,12 @@ fn execute_dml_collecting_inner(
             // depends on the row it is replacing, so it is evaluated
             // inside the scan instead
             let mut bound_sets: Vec<(usize, Option<Vec<u8>>)> = Vec::new();
-            let mut expr_sets: Vec<(usize, &Expr)> = Vec::new();
+            // Cow, because a SET expression carrying a `?` is BOUND
+            // here - once, before the row loop, exactly as a
+            // parameterised WHERE binds ([subst_params_expr]) - and the
+            // bound copy is owned where a parameterless one is borrowed
+            // straight out of the plan
+            let mut expr_sets: Vec<(usize, std::borrow::Cow<'_, Expr>)> = Vec::new();
             // a blr_quad parameter is bound AFTER the target walk and
             // the conflict check: storing it writes this relation's
             // pages into `work` ([store_blob_param]), and `work` is
@@ -26813,7 +26970,27 @@ fn execute_dml_collecting_inner(
                             .ok_or("parameter type does not match its column")?
                     }
                     SetVal::Expr(e) => {
-                        expr_sets.push((*fid, e));
+                        expr_sets.push((
+                            *fid,
+                            if expr_has_param(e) {
+                                let bound = subst_params_expr(e, args)
+                                    .ok_or("missing parameter value")?;
+                                // the BOUND tree must still type: the
+                                // eval fallthrough answers NULL, and
+                                // storing that would be a silently wrong
+                                // row (the prepare-time gate every other
+                                // SET expression passes, made here
+                                // because this value arrives now)
+                                if bound.type_of(descs).is_none() {
+                                    return Err(ExecErr::Text(
+                                        "parameter type does not match its column".into(),
+                                    ));
+                                }
+                                std::borrow::Cow::Owned(bound)
+                            } else {
+                                std::borrow::Cow::Borrowed(e)
+                            },
+                        ));
                         continue;
                     }
                     SetVal::Gen(name, step) => {
@@ -28707,11 +28884,16 @@ fn recno_of(work: &fire_crab_ods::Image, page_size: usize, page_no: u32, slot: u
 /// bootstrap walk is the expensive half, and both halves are catalog.
 fn select_formats(db: &Database, table: &str, rel: u16) -> Vec<(u8, Vec<Descriptor>)> {
     db.meta_memo("select-formats", table, || {
-        let formats = relation_formats(&db.bytes(), db.page_size, rel);
-        if !formats.is_empty() {
-            return formats;
+        let mut formats = relation_formats(&db.bytes(), db.page_size, rel);
+        if formats.is_empty() {
+            formats = fire_crab_ods::system_relation_formats(&db.bytes(), db.page_size, table)
+                .unwrap_or_default();
         }
-        fire_crab_ods::system_relation_formats(&db.bytes(), db.page_size, table).unwrap_or_default()
+        // the catalog's NOT NULL, carried on the descriptors a `?` is
+        // typed from ([stamp_param_nullability]); uncached, because this
+        // IS the cache being filled
+        stamp_param_nullability(&mut formats, &not_null_fids_uncached(db, table));
+        formats
     })
     .as_ref()
     .clone()
@@ -41370,6 +41552,11 @@ fn answer_prepare(items: &[u8], plan: &Plan, params: &[Descriptor], att: AttCs) 
         .iter()
         .map(|pd| {
             let (_, sql_type, length, scale, sub_type) = wire_for(pd);
+            // an input parameter is NULLABLE unless its destination
+            // column forbids it ([PARAM_NOT_NULL]) - the same rule
+            // [append_bind_section] follows for the other describe shape
+            let sql_type =
+                if pd.flags & PARAM_NOT_NULL != 0 { sql_type } else { nullable(sql_type) };
             Var {
                 sql_type,
                 sub_type,
@@ -42790,7 +42977,16 @@ fn expr_has_param(e: &Expr) -> bool {
         Expr::Bin(a, _, b) | Expr::Concat(a, b) | Expr::NullIf(a, b) => {
             expr_has_param(a) || expr_has_param(b)
         }
-        Expr::Coalesce(v) => v.iter().any(expr_has_param),
+        Expr::Coalesce(v) | Expr::Func(_, v) => v.iter().any(expr_has_param),
+        // a DML value expression can carry a parameter in a function
+        // argument or a conditional BRANCH (never in a condition - that
+        // is typed from the other side of the compare and refuses at
+        // resolution)
+        Expr::Iif(_, a, b) => expr_has_param(a) || expr_has_param(b),
+        Expr::Case(branches, else_) => {
+            branches.iter().any(|(_, t)| expr_has_param(t))
+                || else_.as_deref().is_some_and(expr_has_param)
+        }
         _ => false,
     }
 }
@@ -42817,6 +43013,25 @@ fn subst_params_expr(e: &Expr, args: &[WireParam]) -> Option<Expr> {
         Expr::Coalesce(v) => {
             Expr::Coalesce(v.iter().map(|x| subst_params_expr(x, args)).collect::<Option<Vec<_>>>()?)
         }
+        Expr::Func(f, v) => Expr::Func(
+            *f,
+            v.iter().map(|x| subst_params_expr(x, args)).collect::<Option<Vec<_>>>()?,
+        ),
+        Expr::Iif(c, a, b) => Expr::Iif(
+            c.clone(),
+            Box::new(subst_params_expr(a, args)?),
+            Box::new(subst_params_expr(b, args)?),
+        ),
+        Expr::Case(branches, else_) => Expr::Case(
+            branches
+                .iter()
+                .map(|(c, t)| Some((c.clone(), subst_params_expr(t, args)?)))
+                .collect::<Option<Vec<_>>>()?,
+            match else_ {
+                Some(e) => Some(Box::new(subst_params_expr(e, args)?)),
+                None => None,
+            },
+        ),
         Expr::NullIf(a, b) => Expr::NullIf(
             Box::new(subst_params_expr(a, args)?),
             Box::new(subst_params_expr(b, args)?),
@@ -48149,6 +48364,14 @@ fn raw_has_param(e: &RawExpr) -> bool {
         }
         RawExpr::Coalesce(v) | RawExpr::Func(_, v) => v.iter().any(raw_has_param),
         RawExpr::Iif(_, a, b) => raw_has_param(a) || raw_has_param(b),
+        // a CASE's BRANCHES carry values like any other node - without
+        // this arm a `CASE WHEN ... THEN ? END` looked parameterless,
+        // took the ordinary resolver and refused there (IIF, which is
+        // the same shape, answered - the asymmetry is what found it)
+        RawExpr::Case(branches, else_) => {
+            branches.iter().any(|(_, t)| raw_has_param(t))
+                || else_.as_deref().is_some_and(raw_has_param)
+        }
         _ => false,
     }
 }
@@ -48246,6 +48469,123 @@ fn cast_text_bytes(len: usize, cs: Option<u8>) -> (u16, i16) {
 /// with no parameter takes the ordinary [resolve_expr]; only the
 /// param-bearing shapes are handled here, and a `?` that no CAST gives a
 /// type refuses, as the engine's prepare-time "Data type unknown" does.
+/// Resolve a DML VALUE expression that carries `?` placeholders, typing
+/// each one the way the engine types it.
+///
+/// THE LAW, read off the engine's own input SQLDA (`SET SQLDA_DISPLAY
+/// ON` prints it even for a statement isql cannot then execute): **a
+/// parameter inside an assignment takes the DESTINATION COLUMN's own
+/// descriptor**, whatever operators stand between them. `SET NM = ? * 2`
+/// over a `NUMERIC(9,2)` describes the parameter as that NUMERIC (LONG
+/// scale -2 subtype 1) and NOT as the literal 2's INTEGER; `SET D = ? +
+/// 1` is a DATE; `SET S = SUBSTRING(? FROM 1 FOR 2)` is S's VARCHAR(20);
+/// `SET N = -?`, `(? + 1) * 2 - 3`, and a CASE branch all take it too.
+/// This is `PASS1_set_parameter_type` pushing the assignment's
+/// destination down the tree.
+///
+/// Two nodes override what is pushed into them:
+///
+///   * a **CAST** types its own operand - `SET NM = CAST(? AS
+///     VARCHAR(5))` describes VARYING(5), not the NUMERIC;
+///   * **COALESCE** types its parameter from its OTHER ARGUMENTS, and
+///     only from them - `SET NM = COALESCE(?, 0)` is a plain INTEGER
+///     where `SET NM = CASE WHEN ... THEN ? ELSE 0 END` is NM's NUMERIC
+///     (CoalesceNode makes the descriptor itself; CaseNode and
+///     ValueIfNode pass down what they were given). Measured both ways.
+///
+/// `sink` collects each slot's descriptor, so the caller's parameter
+/// list comes out in slot order. A parameter inside a CONDITION (`CASE
+/// WHEN ID > ? THEN ...`) refuses here - it is typed from the other side
+/// of the comparison, which is a different rule and its own slice.
+fn resolve_dest_param_expr(
+    raw: &RawExpr,
+    dest: &Descriptor,
+    columns: &[RelationColumn],
+    descs: &[Descriptor],
+    sink: &mut Vec<Option<Descriptor>>,
+) -> Option<Expr> {
+    if !raw_has_param(raw) {
+        return resolve_expr(raw, columns, descs);
+    }
+    fn set(sink: &mut Vec<Option<Descriptor>>, i: usize, d: Descriptor) {
+        if sink.len() <= i {
+            sink.resize(i + 1, None);
+        }
+        sink[i] = Some(d);
+    }
+    Some(match raw {
+        RawExpr::Param(i) => {
+            set(sink, *i, dest.clone());
+            Expr::Param(*i)
+        }
+        RawExpr::Cast(inner, t) => {
+            let td = cast_target_descriptor(t)?;
+            let e = resolve_dest_param_expr(inner, &td, columns, descs, sink)?;
+            let cs = cast_source_charset(&e, t, descs);
+            Expr::Cast(Box::new(e), *t, cs)
+        }
+        RawExpr::Neg(a) => {
+            Expr::Neg(Box::new(resolve_dest_param_expr(a, dest, columns, descs, sink)?))
+        }
+        RawExpr::Bin(a, op, b) => Expr::Bin(
+            Box::new(resolve_dest_param_expr(a, dest, columns, descs, sink)?),
+            *op,
+            Box::new(resolve_dest_param_expr(b, dest, columns, descs, sink)?),
+        ),
+        RawExpr::Concat(a, b) => Expr::Concat(
+            Box::new(resolve_dest_param_expr(a, dest, columns, descs, sink)?),
+            Box::new(resolve_dest_param_expr(b, dest, columns, descs, sink)?),
+        ),
+        RawExpr::NullIf(a, b) => Expr::NullIf(
+            Box::new(resolve_dest_param_expr(a, dest, columns, descs, sink)?),
+            Box::new(resolve_dest_param_expr(b, dest, columns, descs, sink)?),
+        ),
+        RawExpr::Coalesce(v) => {
+            // the node's OWN descriptor, built from the arguments that
+            // are not parameters - all-parameter is the engine's -804
+            // "Data type unknown", refused here
+            let sib = v.iter().find(|a| !raw_has_param(a))?;
+            let sd = desc_of_projcol(&build_expr_col(sib, "", columns, descs)?);
+            Expr::Coalesce(
+                v.iter()
+                    .map(|a| resolve_dest_param_expr(a, &sd, columns, descs, sink))
+                    .collect::<Option<Vec<_>>>()?,
+            )
+        }
+        RawExpr::Func(f, args) => Expr::Func(
+            *f,
+            args.iter()
+                .map(|a| resolve_dest_param_expr(a, dest, columns, descs, sink))
+                .collect::<Option<Vec<_>>>()?,
+        ),
+        // a CONDITION carrying a parameter refuses inside
+        // [resolve_raw_cond] on its own - only the VALUE arms below
+        // carry the destination down
+        RawExpr::Iif(c, a, b) => Expr::Iif(
+            Box::new(resolve_raw_cond(c, columns, descs)?),
+            Box::new(resolve_dest_param_expr(a, dest, columns, descs, sink)?),
+            Box::new(resolve_dest_param_expr(b, dest, columns, descs, sink)?),
+        ),
+        RawExpr::Case(branches, else_) => Expr::Case(
+            branches
+                .iter()
+                .map(|(c, t)| {
+                    Some((
+                        resolve_raw_cond(c, columns, descs)?,
+                        resolve_dest_param_expr(t, dest, columns, descs, sink)?,
+                    ))
+                })
+                .collect::<Option<Vec<_>>>()?,
+            match else_ {
+                Some(e) => Some(Box::new(resolve_dest_param_expr(e, dest, columns, descs, sink)?)),
+                None => None,
+            },
+        ),
+        // every other shape carrying a `?` keeps its refusal
+        _ => return None,
+    })
+}
+
 fn resolve_proj_expr(
     raw: &RawExpr,
     columns: &[RelationColumn],
@@ -73492,9 +73832,11 @@ mod tests {
         assert_eq!(&d[..7], &[5, 7, 4, 0, 2, 0, 0]);
         // both sqlda_seq items present, each var closed with describe_end
         assert_eq!(d.iter().filter(|&&b| b == 8).count(), 2);
-        // SQL_LONG (496) and SQL_VARYING (448) both announced
-        assert!(d.windows(7).any(|w| w == [11, 4, 0, 240, 1, 0, 0]));
-        assert!(d.windows(7).any(|w| w == [11, 4, 0, 192, 1, 0, 0]));
+        // SQL_LONG (496) and SQL_VARYING (448) both announced, each
+        // NULLABLE (+1) - an input parameter is nullable unless its
+        // destination column forbids it ([PARAM_NOT_NULL])
+        assert!(d.windows(7).any(|w| w == [11, 4, 0, 241, 1, 0, 0]));
+        assert!(d.windows(7).any(|w| w == [11, 4, 0, 193, 1, 0, 0]));
     }
 
     fn proj_cols(p: &Proj) -> Vec<String> {
@@ -78326,6 +78668,7 @@ mod tests {
             descs: Vec::new(),
             index_ops: Vec::new(),
             param_fields: Vec::new(),
+            param_exprs: Vec::new(),
             gen_fields: Vec::new(),
             not_null: Vec::new(),
             checks: Vec::new(),
@@ -78421,7 +78764,7 @@ mod tests {
                 descs: Vec::new(),
                 index_ops: Vec::new(),
                 param_fields: Vec::new(),
-            param_exprs: Vec::new(),
+                param_exprs: Vec::new(),
                 gen_fields: Vec::new(),
                 not_null: Vec::new(),
                 checks: Vec::new(),

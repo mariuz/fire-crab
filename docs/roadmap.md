@@ -682,8 +682,70 @@ Boundaries recorded: an expression over a COMPUTED column (these rows
 are decoded from the STORED image, where a computed column's descriptor
 sits over the null flags — the bare column already refused for that
 reason, and `RETURNING CC + 0` now refuses with it), an aggregate, a
-subquery, a parameter, and a MERGE's RETURNING (two contexts, and an
-expression would have to name which one it reads).
+subquery and a parameter. *(A MERGE's RETURNING was on that list until
+the slice below took it.)*
+
+**A `?` INSIDE A DML VALUE EXPRESSION — DONE 2026-08-26
+(`serve-real-dmlparamexpr` 25).** A parameter standing ALONE has always
+worked; one inside an expression refused — `INSERT ... VALUES (? + 1)`,
+`UPDATE ... SET N = ? * 2`, `SET S = 'x' || ?`, `SET N = CAST(? AS
+INTEGER)` — which is most of what a prepared statement does with
+arithmetic. The feature is really the TYPE the parameter is described
+with, and the engine's rule is not the obvious one. Read off its own
+input SQLDA (`SET SQLDA_DISPLAY ON` prints the input message even for a
+statement isql cannot then execute):
+
+* **the DESTINATION COLUMN types the parameter**, whatever operators
+  stand between them: `SET NM = ? * 2` over a `NUMERIC(9,2)` describes
+  the parameter as that NUMERIC (LONG scale −2 subtype 1), NOT as the
+  literal 2's INTEGER; `SET D = ? + 1` is a DATE; `SET S = SUBSTRING(?
+  FROM 1 FOR 2)` is S's VARCHAR(20); `-?`, `(? + 1) * 2 - 3` and a CASE
+  branch take it too. That is `PASS1_set_parameter_type` pushing the
+  assignment's destination down the tree.
+* a **CAST** types its own operand instead (`CAST(? AS VARCHAR(5))` is
+  VARYING(5)), and **COALESCE** types its parameter from its OTHER
+  ARGUMENTS and only from them — `SET NM = COALESCE(?, 0)` is a plain
+  INTEGER where `SET NM = CASE WHEN … THEN ? ELSE 0 END` is NM's
+  NUMERIC (CoalesceNode makes the descriptor itself; CaseNode and
+  ValueIfNode pass down what they were given). Measured both ways.
+* the slots are numbered in SOURCE order: the SET list left to right,
+  then the WHERE.
+
+`resolve_dest_param_expr` is that law; `InsVal::ParamExpr` carries the
+numbered raw tree until the target column is known (a VALUES list is
+parsed before the target list is resolved); `Plan::Insert.param_exprs`
+binds and evaluates at execute, and an UPDATE's `SetVal::Expr` is bound
+once before the row loop (a `Cow`, borrowed when parameterless). Both
+sides re-check that the BOUND tree still types, because a `?` types None
+at prepare and the eval fallthrough would otherwise store a silent NULL.
+
+**A PRE-EXISTING DESCRIBE DIVERGENCE fell out of it: A PARAMETER
+INHERITS THE NULLABILITY OF THE COLUMN THAT TYPES IT.** `WHERE ID = ?`
+over an `ID INTEGER NOT NULL` announces the parameter NOT NULL; `SET V =
+?` over a nullable column announces it nullable; a parameter typed by a
+CAST or a COALESCE — by no column at all — is nullable. This server
+announced EVERY parameter not-nullable, in both describe shapes
+(`append_bind_section` and `answer_prepare`'s bind vars), which was
+right by accident wherever the column happened to be NOT NULL and wrong
+everywhere else. The engine derives it from the metadata — `DSC_nullable`
+is explicitly "not stored" (dsc_pub.h:39) — so this server does the same
+where the formats are BUILT: `stamp_param_nullability` writes the
+catalog's NOT NULL onto the descriptors in the metadata cache
+(`relation_meta`, `select_formats`, and the DELETE planner's own read),
+and every consumer that types a `?` by copying a column's descriptor —
+the predicate resolver, the SET list, the value list — inherits it. A
+gate found the first draft of this (parameters made nullable
+unconditionally): `serve-real-notnulldesc` pins exactly the NOT NULL
+comparison. **And a second, smaller
+one:** `raw_has_param` had no CASE arm, so `CASE WHEN … THEN ? END`
+looked parameterless, took the ordinary resolver and refused — while
+IIF, the same shape, answered. The asymmetry is what found it.
+
+Boundaries recorded: a parameter in a CASE/IIF CONDITION (typed from the
+other side of the compare — a different rule and its own slice), a
+COALESCE whose arguments are ALL parameters (the engine's −804), a
+parameter expression into a BLOB column, and a bare `?` in a select list
+(−804 on the engine too, generic here).
 
 **AGGREGATES IN EXPRESSIONS DONE (2026-08-25,
 `serve-real-statexpr` 8):** the statistical/ordered-set family
