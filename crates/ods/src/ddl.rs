@@ -11567,3 +11567,39 @@ mod tests {
 
 
 
+
+/// A collation by NAME, wherever it lives: `(charset id, collation id,
+/// is a SYSTEM collation)`.
+///
+/// A collation belongs to ONE character set, so a caller that meant it
+/// for another operand has to tell "no such collation" from "not that
+/// character set's" - and the two spell their error differently (the
+/// schema in the message is `SYSTEM` for a built-in, `PUBLIC` for a
+/// user one).
+pub fn collation_lookup(
+    file: &crate::Image,
+    page_size: usize,
+    name: &str,
+) -> Option<(i64, i64, bool)> {
+    let rel = crate::resolve_relation(file, page_size, "RDB$COLLATIONS")?;
+    let fmts = system_relation_formats(file, page_size, "RDB$COLLATIONS")?;
+    let (_, descs) = fmts.iter().max_by_key(|(n, _)| *n)?;
+    let nf = sys_fid(file, page_size, "RDB$COLLATIONS", "RDB$COLLATION_NAME").ok()?;
+    let csf = sys_fid(file, page_size, "RDB$COLLATIONS", "RDB$CHARACTER_SET_ID").ok()?;
+    let idf = sys_fid(file, page_size, "RDB$COLLATIONS", "RDB$COLLATION_ID").ok()?;
+    let sysf = sys_fid(file, page_size, "RDB$COLLATIONS", "RDB$SYSTEM_FLAG").ok()?;
+    let mut out = None;
+    walk_rows(file, page_size, rel, descs, |v| {
+        if !text_eq(v.get(nf), name) {
+            return;
+        }
+        let int_of = |x: Option<&Value>| match x {
+            Some(Value::Int(n)) => Some(*n),
+            _ => None,
+        };
+        if let (Some(cs), Some(id)) = (int_of(v.get(csf)), int_of(v.get(idf))) {
+            out = Some((cs, id, int_of(v.get(sysf)).unwrap_or(0) != 0));
+        }
+    });
+    out
+}

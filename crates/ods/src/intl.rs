@@ -795,6 +795,34 @@ fn case_table(charset: u8) -> Option<&'static [(char, char); 128]> {
 /// Case-map one character by a TABLED set's own law. `None` = the set
 /// is not tabled (the caller keeps its own rule); `Some(Err(()))` = the
 /// engine raises 22018 for this mapping (the CASE_ERR cell).
+/// Unicode SIMPLE case mapping: a character whose FULL mapping is more
+/// than one character (`ß` -> "SS", the ligatures) has no simple pair
+/// and stays itself.
+///
+/// This is the engine's rule, not a shortcut: `UnicodeUtil::
+/// utf16UpperCase` maps code point by code point through ICU's
+/// `u_toupper` (common/unicode_util.cpp:691), with the full
+/// `Any-Upper` transliterator commented out beside it - "this is more
+/// correct but we don't support completely yet". So `UPPER('ß')`
+/// answers 'ß' on a UTF8 value (probed live), and so does the UPPER
+/// step inside a collation's canonical form.
+pub fn simple_case(t: &str, upper: bool) -> String {
+    let mut out = String::with_capacity(t.len());
+    for c in t.chars() {
+        // a character with no ONE-character mapping keeps itself
+        if upper {
+            let mut it = c.to_uppercase();
+            let first = it.next().unwrap_or(c);
+            out.push(if it.next().is_some() { c } else { first });
+        } else {
+            let mut it = c.to_lowercase();
+            let first = it.next().unwrap_or(c);
+            out.push(if it.next().is_some() { c } else { first });
+        }
+    }
+    out
+}
+
 pub fn case_char(charset: u8, c: char, upper: bool) -> Option<Result<char, ()>> {
     let t = case_table(charset)?;
     if u32::from(c) < 0x80 {

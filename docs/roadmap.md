@@ -955,6 +955,128 @@ TWO MORE PRE-EXISTING DEFECTS FELL OUT:
   `stamp_group_order_coll` stamps those keys from the group row's SLOT
   descriptors, in all three grouped planners.
 
+**...AND THE COLLATION A STATEMENT WRITES FOR ITSELF — DONE 2026-08-27
+(`serve-real-collclause` 30).** `COLLATE <name>` on an OPERAND, which is
+what lets a statement ask a COLLATED column for the BYTE answer
+(`CI COLLATE UCS_BASIC`) and an UNCOLLATED one for a collation's — the
+half of the collation story that is not in the DDL.
+
+Two grammars needed it, because a `COLLATE` can be written on either
+side of the same statement: the TOKEN one (predicates) and the
+CHARACTER one (the select list and the DML value surface). In both it is
+a POSTFIX ON THE ATOM, the tightest binding SQL gives it — `A || B
+COLLATE X` collates B. It resolves to `Expr::Collate(inner, ttype)`, an
+IDENTITY at eval (a projected `S COLLATE X` answers S) that the
+deciding sites read: `cmp_sides` wraps BOTH sides in `Expr::CollKey` of
+that ttype, an ORDER key takes it instead of the operand's own
+(`OrderKey::coll_explicit` keeps a grouped re-stamp off it), and
+`agg_expr_src` folds `MIN/MAX/COUNT(DISTINCT)(<col> COLLATE <name>)`
+into `AggSrc::CollField`. `UCS_BASIC` and a charset's own name resolve
+to the ttype with collation byte ZERO - both order by the codepoint,
+which over every charset here IS the stored byte order - so every site
+downstream reads them as "no collation decides this".
+
+DESCRIBE: the engine builds a CastNode for the clause, so the column is
+named **CAST** (name and alias) and describes as its OPERAND — same
+type, same width, same charset (`strip_collate_target` reads the
+aggregate describe through it, which also stopped `MIN(S COLLATE X)`
+inheriting the pre-existing "MIN over a TEXT expression" refusal).
+
+THREE ERROR VECTORS, byte for byte: a name that is no collation of the
+operand's charset is -204 / SQLSTATE 22021 `COLLATION "PUBLIC"."NOSUCH"
+for CHARACTER SET "SYSTEM"."UTF8" is not defined`; a REAL collation of
+ANOTHER charset answers the same with `"SYSTEM"` as its schema (a
+collation belongs to ONE charset, and the name IS a built-in), told
+apart by reading `RDB$COLLATIONS` (new `ods::ddl::collation_lookup`,
+reached through the new `PLAN_IMAGE` thread-local — the same shape
+`USER_FNS` uses, since the resolver is far from any `db`); and a
+`COLLATE` on a non-TEXT operand is -204 / HY004 `Data type unknown` +
+`Invalid use of CHARACTER SET or COLLATE`, which the engine answers
+BEFORE it ever looks the name up.
+
+REFUSED: `GROUP BY` / `DISTINCT` under a written collation. Grouping
+keys off the RECORD descriptors here and a synthetic expression slot
+carries no ttype, so the buckets AND the group order would be the
+bytes' (measured: four groups where the engine makes three). A
+statement-wide `EXPLICIT_COLL_SEEN` flag refuses them — a FLAG rather
+than a walk of the resolved tree, because a walk that misses one
+container variant misses a wrong answer and this cannot; the cost is
+over-refusal (a `COLLATE` in the WHERE of a grouped query refuses it
+too), and a GLOBAL aggregate is exempt since it buckets nothing. Also
+refused: a collation with no table here, and a `COLLATE` on a literal
+beside a collated column (the engine has a precedence rule between
+them — measured that a column's CI beats a literal's explicit
+`COLLATE UNICODE` — but not one this server has pinned).
+
+**...AND THE LAST COLLATION REFUSAL: TWO COLLATIONS IN ONE COMPARISON —
+DONE 2026-08-27 (`serve-real-icucoll` 74 → 77).** A JOIN keyed on a
+collated column, and a column-vs-column comparison generally, were the
+last shapes refused outright. **The engine does not raise on mixed
+collations: it compares under `MAX(t1, t2)`, the numerically larger
+TTYPE** (`INTL_compare`, `src/jrd/intl.cpp:380`, marked "YYY" in the
+engine's own source with the comment that SQL II would have wanted the
+collation written explicitly). A ttype is `(collation << 8) | charset`,
+so within one character set that is the higher COLLATION id — read off
+the source AFTER six probes had suggested the same shape, which is the
+right order to trust them in.
+
+`cmp_sides` now keys both sides at `MAX(t1, t2)` when the two bare
+columns disagree, and the same rule already covered the one-sided case
+(a literal or a plain column adopts the collated one's). ACROSS two
+character sets the engine transliterates the other side first, which
+this comparison does not do — refused. `resolve_expr_term`'s early
+guard, which had refused any comparison reading a collated column
+before `cmp_sides` ever saw it, now steps aside for a COMPARISON and
+keeps refusing for `LIKE`/`STARTING WITH`/`CONTAINING`/`SIMILAR TO`,
+which match through the collation's own matcher. And the fallback guard
+that catches an EXPRESSION over a collated column widened from ICU-only
+to ANY declared collation: `PXW_INTL` expands `ä` to `ae`, so its
+compare is not the bytes' either, and `UPPER(<PXW col>) = 'x'` had been
+answering by bytes.
+
+**...AND THE PATTERN FAMILY, WHICH READS A DIFFERENT FORM ENTIRELY —
+DONE 2026-08-27 (`serve-real-icucoll` 77 → 88).** `LIKE` and
+`STARTING WITH` were refused on the grounds that a UCA sort key is not
+built prefix-wise. True, and beside the point: **the engine does not
+match patterns with the sort key at all.** It converts BOTH the value
+and the pattern to the collation's CANONICAL FORM and runs the ordinary
+matcher over that (`CanonicalConverter`, jrd/intl_classes.h:112 →
+`TextType::canonical`), and for the ICU family that conversion is six
+lines (`Utf16Collation::normalize`, common/unicode_util.cpp:2077):
+
+* `UNICODE` has neither attribute, so **the canonical form IS the
+  string** — its `LIKE` is the plain code-point match every uncollated
+  column already got, and lifting the refusal was the whole change;
+* `UNICODE_CI` UPPER-CASES (ICU's `u_strToUpper` at the root locale =
+  Unicode's full uppercase, so `ß` becomes `SS`);
+* `UNICODE_CI_AI` upper-cases and then transliterates by a rule the
+  engine spells out in full (unicode_util.cpp:326):
+  `::NFD; ::[:Nonspacing Mark:] Remove; ::NFC;` plus `Ð>D Ø>O Ŀ>L Ł>L`,
+  the four letters whose accent is not a combining mark (CORE-4136).
+
+New `coll::icu_canonical` implements exactly that — `icu_normalizer`
+and `icu_properties` became direct dependencies for the NFD/NFC and the
+Nonspacing-Mark test, both already in the graph under `icu_collator`,
+so nothing new was downloaded or linked. New `Expr::CollCanon(inner,
+ttype)` canonicalises the VALUE per row while the PATTERN is
+canonicalised ONCE at prepare, which is what makes this cheap; the
+ESCAPE character is canonicalised too, and one that canonicalises to
+more than a single character (an upper-cased `ß`) refuses. Both the
+bare form (`ci LIKE 'A%'`) and the written one (`s COLLATE UNICODE_CI
+LIKE 'A%'`) take it.
+
+STILL REFUSED: a `?` pattern (no value at prepare, and canonicalising
+at bind is its own slice), `SIMILAR TO` (its pattern is a grammar, and
+canonicalising a character class is not the same operation), and
+`CONTAINING` — which is not a collation limit at all: this server has
+never implemented it.
+
+TWO CLEANUPS the ICU chunks recorded, done here: `stamp` and
+`order_key_ttype` were the same rule written twice (unified — the
+shared one also handles the negative-sentinel sub_type the other read
+as a huge u16), and `coll_groupable_ttype`'s PXW_INTL clause was
+already covered by `keyable_ttype`.
+
 WHAT IS NOT CLAIMED: only the three ROOT collations over UTF8
 (`UNICODE` = tertiary, `UNICODE_CI` = secondary, `UNICODE_CI_AI` =
 primary, by their fixed built-in ids 2/3/4). A language-TAILORED

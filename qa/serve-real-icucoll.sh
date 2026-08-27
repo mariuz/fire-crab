@@ -80,6 +80,7 @@ INSERT INTO T VALUES (8, NULL, NULL, NULL, NULL, NULL, NULL);
 INSERT INTO T VALUES (9, 'ä', 'ä', 'ä', 'ä', 'ä', 'ä');
 INSERT INTO T VALUES (10, 'ae', 'ae', 'ae', 'ae', 'ae', 'ae');
 INSERT INTO T VALUES (11, 'Cherry', 'Cherry', 'Cherry', 'Cherry', 'Cherry', 'Cherry');
+INSERT INTO T VALUES (12, 'Straße', 'Straße', 'Straße', 'Straße', 'Straße', 'Strasse');
 COMMIT;
 SET TERM ^;
 CREATE PROCEDURE PCOUNT RETURNS (N INTEGER) AS
@@ -201,6 +202,62 @@ both "the comparison under a DERIVED TABLE's own name" \
   "SELECT ID FROM (SELECT ID, CI FROM T) V WHERE V.CI = 'APPLE' ORDER BY ID;"
 both "COUNT over the collated filter" "SELECT COUNT(*) N FROM T WHERE AI = 'apple';"
 
+# ---- A PATTERN MATCH READS THE CANONICAL FORM, not the key -------------
+# The engine converts BOTH sides to the collation's canonical form and
+# runs the ordinary matcher over that (`CanonicalConverter`,
+# jrd/intl_classes.h:112). For the ICU family that is
+# `Utf16Collation::normalize`: nothing at all under UNICODE, an
+# UPPER-CASE under UNICODE_CI, and an upper-case with the combining
+# marks removed under UNICODE_CI_AI - so `CI STARTING WITH 'APP'` takes
+# 'apple', which no byte match and no sort key gives.
+both "LIKE under UNICODE - the plain code-point match" \
+  "SELECT ID FROM T WHERE UC LIKE 'a%' ORDER BY ID;
+   SELECT ID FROM T WHERE UC LIKE 'A%' ORDER BY ID;"
+both "LIKE under UNICODE_CI - case folds, the accent does not" \
+  "SELECT ID FROM T WHERE CI LIKE 'A%' ORDER BY ID;
+   SELECT ID FROM T WHERE CI LIKE 'a%' ORDER BY ID;"
+both "LIKE under UNICODE_CI_AI - the accent folds too" \
+  "SELECT ID FROM T WHERE AI LIKE 'A%' ORDER BY ID;"
+both "the single-character wildcard, over canonical characters" \
+  "SELECT ID FROM T WHERE CI LIKE '_PPLE' ORDER BY ID;
+   SELECT ID FROM T WHERE AI LIKE '_PPLE' ORDER BY ID;"
+both "NOT LIKE is its complement" \
+  "SELECT ID FROM T WHERE CI NOT LIKE 'A%' ORDER BY ID;"
+both "an ESCAPE travels canonical too" \
+  "SELECT ID FROM T WHERE CI LIKE 'A!%%' ESCAPE '!' ORDER BY ID;
+   SELECT ID FROM T WHERE CI LIKE 'APPLE' ESCAPE '!' ORDER BY ID;"
+both "STARTING WITH under each of the three" \
+  "SELECT ID FROM T WHERE UC STARTING WITH 'APP' ORDER BY ID;
+   SELECT ID FROM T WHERE CI STARTING WITH 'APP' ORDER BY ID;
+   SELECT ID FROM T WHERE AI STARTING WITH 'APP' ORDER BY ID;"
+both "NOT STARTING WITH" \
+  "SELECT ID FROM T WHERE CI NOT STARTING WITH 'APP' ORDER BY ID;"
+# THE UPPER-CASE INSIDE THE CANONICAL FORM IS THE SIMPLE MAPPING, code
+# point by code point through ICU's `u_toupper`
+# (`UnicodeUtil::utf16UpperCase`, unicode_util.cpp:691 - the full
+# `Any-Upper` transliterator sits commented out beside it, "more correct
+# but we don't support completely yet"). So 'ß', whose FULL mapping is
+# "SS", stays itself: `CI LIKE 'STRASSE'` matches NOTHING and
+# `LIKE 'STRAßE'` matches. Rust's own to_uppercase is the FULL mapping
+# and would have answered the other way round.
+both "the canonical UPPER is the SIMPLE mapping, so ß stays ß" \
+  "SELECT ID FROM T WHERE CI LIKE 'STRASSE' ORDER BY ID;
+   SELECT ID FROM T WHERE CI LIKE 'STRAßE' ORDER BY ID;
+   SELECT ID FROM T WHERE CI LIKE 'STRA%' ORDER BY ID;
+   SELECT ID FROM T WHERE AI LIKE 'STRAßE' ORDER BY ID;
+   SELECT ID FROM T WHERE CI STARTING WITH 'STRAß' ORDER BY ID;"
+both "...and UPPER() answers the same mapping" \
+  "SELECT UPPER(CI) FROM T WHERE ID = 12;"
+both "a pattern that matches NOTHING still matches nothing" \
+  "SELECT ID FROM T WHERE CI LIKE 'Z%' ORDER BY ID;"
+both "the CHAR column keeps its padding under the match" \
+  "SELECT ID FROM T WHERE CC LIKE 'APPLE' ORDER BY ID;
+   SELECT ID FROM T WHERE CC LIKE 'APPLE%' ORDER BY ID;"
+both "an EXPLICIT collation decides a pattern match as well" \
+  "SELECT ID FROM T WHERE S COLLATE UNICODE_CI LIKE 'A%' ORDER BY ID;
+   SELECT ID FROM T WHERE S COLLATE UNICODE_CI_AI STARTING WITH 'APP' ORDER BY ID;
+   SELECT ID FROM T WHERE CI COLLATE UCS_BASIC LIKE 'A%' ORDER BY ID;"
+
 # ---- the SEMI-JOIN rewrites take the collation too ----------------------
 # a rewritten `IN (SELECT ...)` carries its values as HASH KEYS, a
 # spelling the strict grammar reads - and that arm compared BYTES, so
@@ -294,10 +351,10 @@ both "UPPER / LOWER of one, PROJECTED" \
   "SELECT ID, UPPER(CI), LOWER(CI) FROM T WHERE ID IN (1, 4) ORDER BY ID;"
 
 # ---- what is STILL refused, each for its own measured reason ------------
-refuses "LIKE - the matcher, not the key" "SELECT ID FROM T WHERE CI LIKE 'A%' ORDER BY ID;"
-refuses "STARTING WITH - a UCA key has no prefix" \
-  "SELECT ID FROM T WHERE CI STARTING WITH 'A' ORDER BY ID;"
-refuses "CONTAINING" "SELECT ID FROM T WHERE CI CONTAINING 'PPL' ORDER BY ID;"
+# (LIKE and STARTING WITH moved out of this list - they answer now,
+# through the collation's CANONICAL form; see below)
+refuses "CONTAINING - not a collation limit, this server has no CONTAINING" \
+  "SELECT ID FROM T WHERE CI CONTAINING 'PPL' ORDER BY ID;"
 refuses "SIMILAR TO" "SELECT ID FROM T WHERE CI SIMILAR TO 'A.*' ORDER BY ID;"
 refuses "GROUP BY under CI - the surviving SPELLING is unpinnable" \
   "SELECT CI, COUNT(*) FROM T GROUP BY CI;"
@@ -306,12 +363,31 @@ refuses "DISTINCT under CI - the same question" "SELECT DISTINCT CI FROM T;"
 refuses "a distinct UNION over one" "SELECT CI FROM T UNION SELECT CI FROM T;"
 refuses "MIN over an EXPRESSION reading a collated column" \
   "SELECT MIN(UPPER(CI)) FROM T;"
-refuses "a JOIN keyed on it" "SELECT a.ID, b.ID FROM T a JOIN T b ON a.CI = b.CI;"
+both "a JOIN keyed on it" \
+  "SELECT a.ID, b.ID FROM T a JOIN T b ON a.CI = b.CI ORDER BY 1, 2;"
 refuses "an EXPRESSION over one in a COMPARISON" \
   "SELECT ID FROM T WHERE UPPER(CI) = 'APPLE' ORDER BY ID;"
-refuses "two DIFFERENT collations meeting in one comparison" \
-  "SELECT ID FROM T WHERE CI = UC ORDER BY ID;"
-refuses "an explicit COLLATE clause" "SELECT ID FROM T ORDER BY S COLLATE UNICODE_CI;"
+# TWO COLLATIONS MEET AND THE ENGINE DOES NOT RAISE - it compares under
+# MAX(t1, t2), the numerically larger TTYPE (INTL_compare, intl.cpp:380,
+# marked "YYY" in the engine's own source). Within one character set
+# that is the higher COLLATION id, so UNICODE_CI (3) decides against
+# UNICODE (2) from either side, and either decides against a charset's
+# own default (0).
+both "two DIFFERENT collations in one comparison: MAX(t1, t2) decides" \
+  "SELECT ID FROM T WHERE CI = UC ORDER BY ID;
+   SELECT a.ID FROM T a JOIN T b ON a.CI = b.UC WHERE b.ID = 5 ORDER BY 1;
+   SELECT a.ID FROM T a JOIN T b ON a.UC = b.CI WHERE b.ID = 5 ORDER BY 1;
+   SELECT a.ID FROM T a JOIN T b ON a.S = b.UC WHERE b.ID = 5 ORDER BY 1;
+   SELECT a.ID FROM T a JOIN T b ON a.S = b.CI WHERE b.ID = 5 ORDER BY 1;
+   SELECT a.ID FROM T a JOIN T b ON a.AI = b.CI WHERE b.ID = 5 ORDER BY 1;"
+refuses "...but ACROSS two character sets, which transliterates first" \
+  "SELECT a.ID FROM T a JOIN T b ON a.CI = b.W WHERE b.ID = 5 ORDER BY 1;"
+# (an explicit COLLATE moved from this list to its own gate,
+# qa/serve-real-collclause.sh - it answers now)
+both "an explicit COLLATE clause on an UNCOLLATED column" \
+  "SELECT ID FROM T ORDER BY S COLLATE UNICODE_CI, ID;"
+both "...and one asking a COLLATED column for the BYTES" \
+  "SELECT ID FROM T ORDER BY CI COLLATE UCS_BASIC, ID;"
 
 # ---- the engine still reads fire-crab's file ----------------------------
 eng_q="SET LIST ON; SELECT ID, S, CI, AI, UC, CC, W FROM T ORDER BY ID;"

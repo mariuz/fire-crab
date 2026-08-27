@@ -719,3 +719,140 @@ mod icu_ttype_tests {
         assert!(!keyable_ttype(0x0304));
     }
 }
+
+// ---------------------------------------------------------------------
+// THE CANONICAL FORM - what a PATTERN MATCH runs over
+//
+// A collation decides `LIKE`, `STARTING WITH`, `CONTAINING` and
+// `SIMILAR TO` too, and NOT through its sort key: the engine converts
+// both the value and the pattern to the collation's CANONICAL FORM and
+// runs the ordinary matcher over that (`CanonicalConverter`,
+// jrd/intl_classes.h:112 -> `TextType::canonical`). For the ICU family
+// that conversion is `Utf16Collation::normalize`
+// (common/unicode_util.cpp:2077), and it is short enough to quote:
+//
+//   if (attributes & TEXTTYPE_ATTR_CASE_INSENSITIVE)
+//   {
+//       upper-case the string;
+//       if (attributes & TEXTTYPE_ATTR_ACCENT_INSENSITIVE)
+//           run the CiAi transliterator;
+//   }
+//
+// So the three root collations canonicalise three ways, and the first
+// of them costs nothing at all:
+//
+//   * `UNICODE` has neither attribute - the canonical form IS the
+//     string, so its LIKE is the plain code-point match every
+//     uncollated column already gets;
+//   * `UNICODE_CI` upper-cases (ICU's `u_strToUpper` at the root
+//     locale, which is Unicode's full uppercase - `ß` becomes `SS`);
+//   * `UNICODE_CI_AI` upper-cases and then transliterates, by a rule
+//     the engine spells out (unicode_util.cpp:326):
+//         ::NFD; ::[:Nonspacing Mark:] Remove; ::NFC;
+//         Ð > D;  Ø > O;  Ŀ > L;  Ł > L;
+//     - the four specials being the letters whose accent is not a
+//     combining mark (Ð, Ø, Ŀ, Ł), added for CORE-4136/CORE-4739.
+
+/// The four letters the engine's CiAi transliterator maps by hand,
+/// because stripping combining marks cannot reach them.
+const CIAI_SPECIALS: [(char, char); 4] =
+    [('\u{00d0}', 'D'), ('\u{00d8}', 'O'), ('\u{013f}', 'L'), ('\u{0141}', 'L')];
+
+/// `TextType::canonical` for the ICU family: the form a PATTERN MATCH
+/// compares, for both the value and the pattern.
+///
+/// A pattern's wildcards survive it - `%` and `_` are unchanged by
+/// upper-casing, by decomposition and by mark removal - which is what
+/// lets the caller canonicalise the pattern once at prepare and match
+/// per row. The LENGTH may change (`ß` upper-cases to two characters),
+/// and it changes the same way on both sides, so `_` matches one
+/// CANONICAL character - the engine's behaviour too.
+pub fn icu_canonical(text: &str, strength: Strength) -> String {
+    match strength {
+        // no attributes: the canonical form is the string itself
+        Strength::Tertiary => text.to_string(),
+        Strength::Secondary => crate::intl::simple_case(text, true),
+        Strength::Primary => ciai(&crate::intl::simple_case(text, true)),
+    }
+}
+
+fn ciai(upper: &str) -> String {
+    use icu_normalizer::{ComposingNormalizerBorrowed, DecomposingNormalizerBorrowed};
+    use icu_properties::{props::GeneralCategory, CodePointMapData};
+    let nfd = DecomposingNormalizerBorrowed::new_nfd().normalize(upper);
+    let gc = CodePointMapData::<GeneralCategory>::new();
+    let stripped: String = nfd
+        .chars()
+        .filter(|c| gc.get(*c) != GeneralCategory::NonspacingMark)
+        .collect();
+    let nfc = ComposingNormalizerBorrowed::new_nfc().normalize(&stripped);
+    if nfc.chars().any(|c| CIAI_SPECIALS.iter().any(|(from, _)| *from == c)) {
+        nfc.chars()
+            .map(|c| {
+                CIAI_SPECIALS
+                    .iter()
+                    .find(|(from, _)| *from == c)
+                    .map_or(c, |(_, to)| *to)
+            })
+            .collect()
+    } else {
+        nfc.into_owned()
+    }
+}
+
+#[cfg(test)]
+mod canonical_tests {
+    use super::*;
+
+    #[test]
+    fn unicode_canonicalises_to_itself() {
+        for s in ["apple", "Ápple", "ß", "ﬁ"] {
+            assert_eq!(icu_canonical(s, Strength::Tertiary), s);
+        }
+    }
+
+    #[test]
+    fn ci_upper_cases() {
+        assert_eq!(icu_canonical("apple", Strength::Secondary), "APPLE");
+        assert_eq!(icu_canonical("Ápple", Strength::Secondary), "ÁPPLE");
+        // the SIMPLE mapping, which is the engine's: `u_toupper` code
+        // point by code point (unicode_util.cpp:691), so 'ß' - whose
+        // full mapping is two characters - stays itself
+        assert_eq!(icu_canonical("straße", Strength::Secondary), "STRAßE");
+        assert_eq!(icu_canonical("ﬁx", Strength::Secondary), "ﬁX");
+        // ...while a character WITH a one-to-one pair maps
+        assert_eq!(icu_canonical("ς", Strength::Secondary), "Σ");
+    }
+
+    #[test]
+    fn ci_ai_strips_the_marks_too() {
+        assert_eq!(icu_canonical("Ápple", Strength::Primary), "APPLE");
+        assert_eq!(icu_canonical("ápple", Strength::Primary), "APPLE");
+        assert_eq!(icu_canonical("çedilla", Strength::Primary), "CEDILLA");
+        // a decomposed spelling reaches the same place as a composed one
+        assert_eq!(
+            icu_canonical("A\u{0301}pple", Strength::Primary),
+            icu_canonical("Ápple", Strength::Primary)
+        );
+    }
+
+    /// The four the transliterator maps by hand: their accent is part
+    /// of the letter, not a combining mark, so NFD leaves it alone.
+    #[test]
+    fn the_four_specials() {
+        assert_eq!(icu_canonical("Ð", Strength::Primary), "D");
+        assert_eq!(icu_canonical("ø", Strength::Primary), "O");
+        assert_eq!(icu_canonical("Ŀ", Strength::Primary), "L");
+        assert_eq!(icu_canonical("ł", Strength::Primary), "L");
+        // ...and at CI they keep their own identity
+        assert_eq!(icu_canonical("ø", Strength::Secondary), "Ø");
+    }
+
+    /// A pattern's wildcards are not letters and survive every step.
+    #[test]
+    fn wildcards_survive() {
+        for st in [Strength::Secondary, Strength::Primary] {
+            assert_eq!(icu_canonical("a%_b", st), "A%_B");
+        }
+    }
+}

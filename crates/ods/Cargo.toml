@@ -19,4 +19,11 @@ repository.workspace = true
 # project whose whole claim is that its answers match the engine's
 # byte for byte. Bump it deliberately, with a sweep.
 icu_collator = "=2.3.1"
+# ...and the two crates it already pulls in transitively, made direct
+# because the PATTERN matcher needs them: an accent-insensitive
+# collation canonicalises `NFD -> remove every Nonspacing Mark -> NFC`
+# before it matches (`unicode_util.cpp:326`, the engine's own
+# transliterator rule). Pinned for the same reason the collator is.
+icu_normalizer = "=2.3.0"
+icu_properties = "=2.3.0"
 
