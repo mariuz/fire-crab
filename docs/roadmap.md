@@ -1238,6 +1238,64 @@ for retrieval (its itype is unknown to the index-op reader) and an
 INSERT into a table carrying one still refuses — pre-existing, and the
 reason the gate's fixture has no index.
 
+**DATABASE TRIGGERS — DONE 2026-08-28 (`serve-real-dbtrigger` 10,
+new).** The trigger class that belongs to the ATTACHMENT rather than to
+a table: `ON CONNECT` (8192), `ON DISCONNECT` (8193) and `ON
+TRANSACTION START`/`COMMIT`/`ROLLBACK` (8194/8195/8196). This server
+read them from the catalog and IGNORED them, so a database configured
+with an `ON CONNECT` trigger behaved through fire-crab as though it had
+none — silently, which is the outcome this project does not allow.
+
+They fire where NO STATEMENT IS RUNNING, so nothing is holding a working
+copy and there is nothing to publish: the bodies go down the ordinary
+path with the database already in reach. There is no row either, so the
+frame carries no `TrigCtx` and a body naming `NEW.`/`OLD.` refuses.
+
+THE LAWS, measured first:
+
+- `ON CONNECT` fires once per attachment, BEFORE the client's first
+  transaction, in a transaction OF ITS OWN — and an internal transaction
+  fires nothing itself, so no `tx-start` row appears for it.
+- **That transaction has to be COMMITTED.** Work left under an id
+  nothing commits is invisible to every later reader, which is exactly
+  how this first behaved: the body ran, wrote its row, and the row was
+  never there.
+- `ON TRANSACTION COMMIT` and `ROLLBACK` fire INSIDE the transaction
+  that is ending, which is visible: a ROLLBACK body's own rows GO BACK
+  WITH THE ROLLBACK while the generator it drew from HAS moved, a draw
+  not being transactional. (It is why Firebird's own documentation tells
+  you to write rollback auditing in an autonomous transaction.)
+- An `ON CONNECT` that RAISES REFUSES THE ATTACH, with the body's own
+  message — the trigger is a gate, not a notification.
+- `ON DISCONNECT` fires at the detach AND at every other way a session
+  ends (a closed socket, a failed read); a body that audits
+  disconnections must not be able to miss one by crashing the client.
+
+A DEFECT IN THE RENDERER CAME OUT OF IT. A body's own statement is
+rendered back to SQL, and a generator draw had no rendering at all
+("rendering it into a statement's text would draw twice") — so the
+CANONICAL database trigger, `INSERT INTO LOG VALUES (NEXT VALUE FOR S,
+...)`, refused. The fold runs FIRST and answers wherever the frame can
+draw (a BEFORE trigger's replay pass), so that arm is only reached when
+the draw belongs to the NESTED STATEMENT, where rendering it as itself
+draws exactly once, down the ordinary path.
+
+THE GATE ITSELF NEEDED A DIFFERENT CLIENT. isql does not issue the same
+ops to both servers — it opened two transactions against the engine
+where it opened one against this server for the same script — and that
+client-behaviour difference drowned the thing under test. The acting
+connection is the node driver, which makes exactly the same calls to
+both: one attach, one transaction, the log read back over the SAME
+connection.
+
+RECORDED BOUNDARIES: `CREATE TRIGGER ... ON CONNECT` refuses cleanly
+(nothing is stored — checked), so the gate's triggers are made by the
+engine on both files; whether a file carries database triggers at all is
+read ONCE at the attach, so one another attachment creates afterwards is
+not seen until this one reconnects; and a body expression has no
+CONCATENATION, so `'sum=' || :N` refuses rather than storing something
+else.
+
 **A TRIGGER BODY THAT LOOPS, AND ONE THAT CALLS — DONE 2026-08-28
 (`serve-real-trigloop` 12, new).** The rest of the surface the chunk
 below opened: `FOR SELECT ... INTO ... DO`, a declared CURSOR with

@@ -2593,6 +2593,11 @@ struct Database {
     /// whether this transaction has run a DDL statement - recorded for
     /// the trace and the gates; its rows are its own now
     did_ddl: bool,
+    /// does this file carry ANY database trigger (`ON CONNECT`, `ON
+    /// DISCONNECT`, a transaction event)? Read once, at the attach, so
+    /// that the far commoner file with none pays nothing per commit -
+    /// and re-read whenever DDL could have created one.
+    has_db_triggers: bool,
     /// the DDL work the windows deferred to COMMIT, stashed here when the
     /// window stack is reset ahead of the commit ([reset_gen_windows])
     ddl_deferred: Vec<fire_crab_ods::DdlDeferred>,
@@ -4533,6 +4538,7 @@ fn load_database(path: &str) -> Option<Database> {
         locks,
         lock_owner,
             did_ddl: false,
+            has_db_triggers: false,
             ddl_deferred: Vec::new(),
         nested_tx: Vec::new(),
         page_size,
@@ -12559,6 +12565,306 @@ fn debug_info_anchor(b: &[u8]) -> Option<(u32, u32)> {
 /// 2), UPDATE (3, 4), DELETE (5, 6). A multi-event trigger (`BEFORE
 /// INSERT OR UPDATE`) carries a composed type and the
 /// INSERTING/UPDATING/DELETING predicates with it; it refuses, whole.
+/// The DATABASE TRIGGERS of one event, in firing order.
+///
+/// A database trigger belongs to no relation (`RDB$RELATION_NAME` is
+/// NULL) and its type is an EVENT rather than a composed DML word:
+/// 8192 `ON CONNECT`, 8193 `ON DISCONNECT`, 8194/8195/8196 transaction
+/// `START`/`COMMIT`/`ROLLBACK`. They fire in `RDB$TRIGGER_SEQUENCE`
+/// order and then by name, the way a relation's do.
+///
+/// `None` means REFUSE: a trigger of this event exists that this server
+/// cannot run, and an attachment that silently skipped it would not be
+/// the database the writer configured.
+fn db_triggers(db: &Database, event: i64) -> Option<Vec<TrigDef>> {
+    use fire_crab_ods::format::Value;
+    let t_formats =
+        fire_crab_ods::sysfmt::system_relation_formats(&db.bytes(), db.page_size, "RDB$TRIGGERS")?;
+    let (_, t_descs) = t_formats.iter().max_by_key(|(n, _)| *n)?;
+    let tcols = relation_columns(&db.bytes(), db.page_size, "RDB$TRIGGERS");
+    let tfid = |n: &str| tcols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (rel_f, src_f, sys_f, name_f, typ_f, seq_f, inact_f, dbg_f) = (
+        tfid("RDB$RELATION_NAME")?,
+        tfid("RDB$TRIGGER_SOURCE")?,
+        tfid("RDB$SYSTEM_FLAG")?,
+        tfid("RDB$TRIGGER_NAME")?,
+        tfid("RDB$TRIGGER_TYPE")?,
+        tfid("RDB$TRIGGER_SEQUENCE")?,
+        tfid("RDB$TRIGGER_INACTIVE")?,
+        tfid("RDB$DEBUG_INFO")?,
+    );
+    let trel = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, "RDB$TRIGGERS")?;
+    let fmts = vec![(0u8, t_descs.clone())];
+    let mut out: Vec<TrigDef> = Vec::new();
+    let mut refuse = false;
+    for_each_record(db, trel, &fmts, usize::MAX, |values| {
+        if refuse {
+            return;
+        }
+        // a DATABASE trigger names no relation
+        if !matches!(values.get(rel_f), Some(Value::Null) | None) {
+            return;
+        }
+        if !matches!(values.get(sys_f), Some(Value::Int(0))) {
+            return;
+        }
+        if !matches!(values.get(typ_f), Some(Value::Int(t)) if *t == event) {
+            return;
+        }
+        if matches!(values.get(inact_f), Some(Value::Int(1))) {
+            return; // INACTIVE never fires
+        }
+        let (Some(Value::Blob(r, n)), Some(Value::Text(name))) =
+            (values.get(src_f), values.get(name_f))
+        else {
+            refuse = true;
+            return;
+        };
+        let Some(source) = fire_crab_blb::read_blob_content(&db.bytes(), db.page_size, *r, *n)
+            .and_then(|b| String::from_utf8(b).ok())
+        else {
+            refuse = true;
+            return;
+        };
+        out.push(TrigDef {
+            name: name.trim_end().to_string(),
+            before: false,
+            seq: match values.get(seq_f) {
+                Some(Value::Int(v)) => *v,
+                _ => 0,
+            },
+            source,
+            excs: Vec::new(),
+            needs_db: true,
+            draws: false,
+            anchor: values
+                .get(dbg_f)
+                .and_then(|v| match v {
+                    Value::Blob(r, n) => {
+                        fire_crab_blb::read_blob_content(&db.bytes(), db.page_size, *r, *n)
+                    }
+                    _ => None,
+                })
+                .as_deref()
+                .and_then(debug_info_anchor),
+        });
+    });
+    if refuse {
+        return None;
+    }
+    out.sort_by(|a, b| a.seq.cmp(&b.seq).then_with(|| a.name.cmp(&b.name)));
+    // every body must be one this server can RUN, and the exceptions it
+    // names resolved while the catalog is in reach - the same two things
+    // [user_triggers] settles for a relation's
+    for t in out.iter_mut() {
+        let (body, _) = trig_body_of(t)?;
+        // no row fired this, so the table a DML trigger may not name has
+        // no counterpart here: any relation is another one
+        if !trig_body_inlineable(&body, "") {
+            return None;
+        }
+        let mut names: Vec<&String> = Vec::new();
+        collect_raise_names(&body, &mut names);
+        for n in names {
+            let (number, message) = exception_identity(db, n)?;
+            if !t.excs.iter().any(|(e, ..)| e == n) {
+                t.excs.push((n.clone(), number, message));
+            }
+        }
+    }
+    Some(out)
+}
+
+/// Fire the DATABASE TRIGGERS of one event.
+///
+/// Unlike a relation's, these fire where NO STATEMENT IS RUNNING - at
+/// an attach, a detach, or the start or end of a transaction - so
+/// nothing is holding a working copy and there is nothing to publish:
+/// the body's own statements go down the ordinary path with the
+/// database already in reach.
+///
+/// There is no row, so the frame carries no [TrigCtx]: `NEW.`/`OLD.`
+/// resolve to nothing and a body naming them refuses, as it must.
+///
+/// A raise propagates to the caller, which decides what that means for
+/// the event it is firing (an `ON CONNECT` that raises refuses the
+/// ATTACH; a transaction trigger's raise stops that verb).
+fn fire_db_triggers(
+    database: &mut Option<Database>,
+    ctx: &SessionCtx,
+    event: i64,
+) -> Result<(), ExecErr> {
+    let defs = {
+        let Some(db) = database.as_ref() else { return Ok(()) };
+        // the catalog is only worth reading when this file HAS one of
+        // these at all; the scan is per event and this is the fast exit
+        if !db.has_db_triggers {
+            return Ok(());
+        }
+        db_triggers(db, event)
+            .ok_or_else(|| ExecErr::Text("a database trigger is outside this server's PSQL surface".into()))?
+    };
+    if defs.is_empty() {
+        return Ok(());
+    }
+    // THE TRIGGER'S OWN WORK IS NOT THE USER'S TRANSACTION at an attach
+    // or a detach - there is no user transaction there yet, or any more
+    // - so those two run inside one of their own, committed when the
+    // body ends. A TRANSACTION trigger runs in the transaction it is
+    // firing for, which is what makes an `ON TRANSACTION ROLLBACK`
+    // body's writes go back with the rollback (measured: its rows are
+    // absent afterwards while its generator draw stands, a draw not
+    // being transactional).
+    let own_tx = event == DB_TRIG_CONNECT || event == DB_TRIG_DISCONNECT;
+    for d in &defs {
+        let (body, names) = trig_body_of(d)
+            .ok_or_else(|| ExecErr::Text(format!("trigger {} is outside this server's PSQL surface", d.name)))?;
+        let mut frame = PsqlFrame {
+            vars: vec![Value::Null; names.len()],
+            out_at: names.len(),
+            out_len: 0,
+            suspended: Vec::new(),
+            caught: None,
+            cursors: trig_cursor_states(&d.source),
+            row_count_slot: None,
+            trig_excs: d.excs.clone(),
+            trig: None,
+            gen: Default::default(),
+        };
+        let mut steps = 0u32;
+        // an INTERNAL transaction fires nothing itself: the engine's
+        // `ON CONNECT` body runs in a transaction that does NOT fire
+        // `ON TRANSACTION START` (measured - the connect row lands
+        // before the user's first start row, with no start of its own)
+        let r = IN_DB_TRIGGER.with(|f| {
+            let was = f.get();
+            f.set(true);
+            let r = if own_tx {
+                // A TRANSACTION OF ITS OWN, AND IT IS COMMITTED HERE.
+                // There is no user transaction at an attach or a detach
+                // to carry the body's work, and work left under an id
+                // nothing commits is invisible to every later reader -
+                // which is exactly how this first behaved: the body ran,
+                // wrote its row, and the row was never there.
+                let mark = undo_window_push(database, WindowKind::Nested);
+                let r = exec_psql_stmt(&body, &mut frame, &mut steps, database, ctx);
+                undo_window_unwind(database, mark, r.is_err());
+                if r.is_ok() {
+                    end_transaction(database, TxEnd::Commit);
+                } else {
+                    end_transaction(database, TxEnd::RollbackNoImage);
+                }
+                r
+            } else {
+                exec_psql_stmt(&body, &mut frame, &mut steps, database, ctx)
+            };
+            f.set(was);
+            r
+        });
+        match r {
+            Ok(()) | Err(PsqlStop::Exit) => {}
+            Err(PsqlStop::Raise(ex)) => {
+                let at: Vec<String> = ex
+                    .trace()
+                    .iter()
+                    .filter_map(|off| trig_position(d, *off))
+                    .map(|(line, col)| {
+                        format!("At trigger {} line: {}, col: {}", quoted_qualified(&d.name), line, col)
+                    })
+                    .collect();
+                return Err(ExecErr::Eval(wrap_at_procedure(ex.as_eval_err(), at)));
+            }
+            Err(PsqlStop::Failed(e)) => return Err(ExecErr::Text(e)),
+            Err(_) => {
+                return Err(ExecErr::Text(format!(
+                    "trigger {} uses PSQL this server does not interpret",
+                    d.name
+                )))
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Is a DATABASE TRIGGER's own body running? Its statements must not
+/// fire the transaction triggers again - see [fire_db_triggers].
+thread_local! {
+    static IN_DB_TRIGGER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// has this session's `ON DISCONNECT` already run? The orderly
+    /// `op_detach` fires it; the session teardown fires it for every
+    /// other way out, and must not fire it twice.
+    static DISCONNECT_FIRED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Re-read whether this file carries any database trigger.
+///
+/// Cheap and worth doing only where it can CHANGE: at the attach, and
+/// after DDL (a `CREATE TRIGGER ... ON CONNECT` in this very session
+/// must fire for the next transaction, and a DROP must stop firing).
+fn refresh_db_trigger_flag(database: &mut Option<Database>) {
+    let Some(db) = database.as_ref() else { return };
+    let any = [
+        DB_TRIG_CONNECT,
+        DB_TRIG_DISCONNECT,
+        DB_TRIG_TX_START,
+        DB_TRIG_TX_COMMIT,
+        DB_TRIG_TX_ROLLBACK,
+    ]
+    .iter()
+    .any(|e| db_triggers_present(db, *e));
+    if let Some(db) = database.as_mut() {
+        db.has_db_triggers = any;
+    }
+}
+
+/// Is there a database trigger of this event? The existence half of
+/// [db_triggers], which does not read a body or refuse.
+fn db_triggers_present(db: &Database, event: i64) -> bool {
+    use fire_crab_ods::format::Value;
+    let Some(t_formats) =
+        fire_crab_ods::sysfmt::system_relation_formats(&db.bytes(), db.page_size, "RDB$TRIGGERS")
+    else {
+        return false;
+    };
+    let Some((_, t_descs)) = t_formats.iter().max_by_key(|(n, _)| *n) else { return false };
+    let tcols = relation_columns(&db.bytes(), db.page_size, "RDB$TRIGGERS");
+    let tfid = |n: &str| tcols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (Some(rel_f), Some(sys_f), Some(typ_f), Some(inact_f)) = (
+        tfid("RDB$RELATION_NAME"),
+        tfid("RDB$SYSTEM_FLAG"),
+        tfid("RDB$TRIGGER_TYPE"),
+        tfid("RDB$TRIGGER_INACTIVE"),
+    ) else {
+        return false;
+    };
+    let Some(trel) = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, "RDB$TRIGGERS")
+    else {
+        return false;
+    };
+    let fmts = vec![(0u8, t_descs.clone())];
+    let mut found = false;
+    for_each_record(db, trel, &fmts, usize::MAX, |values| {
+        if found
+            || !matches!(values.get(rel_f), Some(Value::Null) | None)
+            || !matches!(values.get(sys_f), Some(Value::Int(0)))
+            || matches!(values.get(inact_f), Some(Value::Int(1)))
+        {
+            return;
+        }
+        if matches!(values.get(typ_f), Some(Value::Int(t)) if *t == event) {
+            found = true;
+        }
+    });
+    found
+}
+
+/// The five database events, by their `RDB$TRIGGER_TYPE`.
+const DB_TRIG_CONNECT: i64 = 8192;
+const DB_TRIG_DISCONNECT: i64 = 8193;
+const DB_TRIG_TX_START: i64 = 8194;
+const DB_TRIG_TX_COMMIT: i64 = 8195;
+const DB_TRIG_TX_ROLLBACK: i64 = 8196;
+
 fn user_triggers(db: &Database, table: &str, dml: &DmlGuard) -> Option<Vec<TrigDef>> {
     use fire_crab_ods::format::Value;
     // 1 INSERT, 2 UPDATE, 3 DELETE - the action slots' own numbering
@@ -64202,9 +64508,18 @@ fn render_psql_expr(e: &fire_crab_ods::expr::Expr, f: &PsqlFrame) -> Option<Stri
     }
     Some(match e {
         E::IntLiteral(v) => v.to_string(),
-        // a DRAW has no literal form: it is a side effect, and rendering
-        // it into a statement's text would draw twice
-        E::GenId { .. } | E::GenId2 { .. } => return None,
+        // A DRAW HAS NO LITERAL FORM - it is a side effect - so it is
+        // rendered AS ITSELF and the statement this text becomes draws
+        // it, exactly once, down the ordinary path. (The fold above ran
+        // first: where the frame CAN draw - a BEFORE trigger's replay
+        // pass - it already answered with the drawn value, so this arm
+        // is only reached where the draw belongs to the nested
+        // statement. That is the canonical database trigger: `INSERT
+        // INTO LOG VALUES (NEXT VALUE FOR S, ...)`.)
+        E::GenId2 { name } => format!("NEXT VALUE FOR {}", name),
+        E::GenId { name, step } => {
+            format!("GEN_ID({}, {})", name, render_psql_expr(step, f)?)
+        }
         // re-quoted the way the lexer unquoted it
         E::TextLiteral(t) => format!("'{}'", t.replace('\'', "''")),
         E::Int64Literal(v) => v.to_string(),
@@ -70513,6 +70828,27 @@ fn after_auth(
     let mut blr_slots: std::collections::HashMap<i32, BlrSlot> = std::collections::HashMap::new();
     let mut next_blr_handle: i32 = BLR_REQ_HANDLE;
 
+    // DOES THIS FILE CARRY DATABASE TRIGGERS AT ALL? Read once, here,
+    // so a file with none - which is nearly every file - pays nothing
+    // per commit. DDL re-reads it ([note_db_trigger_ddl]).
+    refresh_db_trigger_flag(&mut database);
+    // ON CONNECT, the first thing the attachment does. A raise here
+    // REFUSES THE ATTACH: the engine answers the body's own exception
+    // and the connection does not open, which is what makes an
+    // ON CONNECT trigger a gate rather than a notification.
+    if let Err(e) = fire_db_triggers(&mut database, &SessionCtx { user, attach_id }, DB_TRIG_CONNECT)
+    {
+        if std::env::var("FC_SRV_TRACE").is_ok() {
+            eprintln!("[srv] ON CONNECT refused the attach");
+        }
+        let mut w = W::default();
+        w.int(OP_RESPONSE).int(0).int(0).int(0).int(0);
+        exec_err_items(&mut w, &e);
+        w.int(0); // isc_arg_end
+        w.send(&mut s, &mut enc)?;
+        return Ok(());
+    }
+
     // --- the op loop (encrypted) ---
     loop {
         // BETWEEN REQUESTS, THE DATABASE IS NOT HELD. The write side
@@ -70564,6 +70900,18 @@ fn after_auth(
         match op {
             x if x == OP_DETACH => {
                 read_int(&mut s, &mut dec)?; // handle
+                // ON DISCONNECT, the attachment's last act. Its raise
+                // does NOT hold the detach open - the connection is
+                // going either way - so it is logged and dropped, which
+                // is the engine's own behaviour for a detach in flight.
+                DISCONNECT_FIRED.with(|f| f.set(true));
+                if let Err(e) =
+                    fire_db_triggers(&mut database, &SessionCtx { user, attach_id }, DB_TRIG_DISCONNECT)
+                {
+                    if std::env::var("FC_SRV_TRACE").is_ok() {
+                        eprintln!("[srv] ON DISCONNECT raised, detaching anyway: {:?}", std::mem::discriminant(&e));
+                    }
+                }
                 respond(&mut s, &mut enc, 0)?;
                 break;
             }
@@ -70653,6 +71001,24 @@ fn after_auth(
                 let h = new_handle.unwrap_or(TX_HANDLE);
                 if std::env::var("FC_SRV_TRACE").is_ok() {
                     eprintln!("[srv] op_transaction -> handle {}", h);
+                }
+                // ON TRANSACTION START, inside the transaction that just
+                // started - so what the body writes is that
+                // transaction's, and a raise here takes the transaction
+                // with it rather than leaving a half-started one
+                if !IN_DB_TRIGGER.with(|f| f.get()) {
+                    if let Err(e) = fire_db_triggers(
+                        &mut database,
+                        &SessionCtx { user, attach_id },
+                        DB_TRIG_TX_START,
+                    ) {
+                        let mut w = W::default();
+                        w.int(OP_RESPONSE).int(0).int(0).int(0).int(0);
+                        exec_err_items(&mut w, &e);
+                        w.int(0);
+                        w.send(&mut s, &mut enc)?;
+                        continue;
+                    }
                 }
                 respond(&mut s, &mut enc, h)?;
             }
@@ -73032,6 +73398,31 @@ fn after_auth(
                         continue;
                     }
                 }
+                // ON TRANSACTION COMMIT / ROLLBACK, fired INSIDE the
+                // transaction that is ending - which is what makes a
+                // rollback trigger's own writes go back with it
+                // (measured: its rows are absent afterwards, while the
+                // generator it drew from has still moved, a draw not
+                // being transactional). A commit trigger's raise stops
+                // the COMMIT; the transaction stays open, as the
+                // engine's does.
+                if !IN_DB_TRIGGER.with(|f| f.get()) {
+                    let event = if rollback { DB_TRIG_TX_ROLLBACK } else { DB_TRIG_TX_COMMIT };
+                    match fire_db_triggers(&mut database, &SessionCtx { user, attach_id }, event) {
+                        Ok(()) => {}
+                        Err(e) if !rollback => {
+                            let mut w = W::default();
+                            w.int(OP_RESPONSE).int(0).int(0).int(0).int(0);
+                            exec_err_items(&mut w, &e);
+                            w.int(0);
+                            w.send(&mut s, &mut enc)?;
+                            continue;
+                        }
+                        // a ROLLBACK cannot be refused - everything the
+                        // body did goes back with the transaction anyway
+                        Err(_) => {}
+                    }
+                }
                 if let Some(d) = database.as_mut() { d.prepared = false; }
                 // ending the transaction discards every mark, the same
                 // way the `COMMIT`/`ROLLBACK` statements do - and the
@@ -74214,6 +74605,21 @@ fn after_auth(
         eprintln!("[srv] locks: {}", crate::dblocks::stats_line());
         eprintln!("[srv] mdc: {}", crate::mdc::stats_line());
     }
+    // ON DISCONNECT, WHEREVER THE SESSION ENDED. The op_detach arm
+    // fires it for an orderly goodbye; this catches every other way out
+    // - a client that closed its socket, a read that failed - because
+    // the engine fires the trigger for those too, and a body that
+    // audits disconnections must not be able to miss one by crashing
+    // the client. It is a no-op when the detach arm already fired
+    // ([DISCONNECT_FIRED]).
+    if !DISCONNECT_FIRED.with(|f| f.get()) {
+        let _ = fire_db_triggers(
+            &mut database,
+            &SessionCtx { user, attach_id },
+            DB_TRIG_DISCONNECT,
+        );
+    }
+
     if let Some(db) = database.as_mut() {
         // ...AND A TRANSACTION WHOSE ONLY WRITES WENT THROUGH AN UNDO
         // WINDOW HAS NO `tx` OF ITS OWN - a PSQL body's rows carry the
@@ -75633,6 +76039,7 @@ mod tests {
             locks: crate::dblocks::for_path("/nonexistent/fc-rowsource-test"),
             lock_owner: 0,
             did_ddl: false,
+            has_db_triggers: false,
             ddl_deferred: Vec::new(),
             attachments: {
                 let g = std::sync::Arc::new(DbGate::default());
@@ -78713,6 +79120,7 @@ mod tests {
             locks: crate::dblocks::for_path("/nonexistent/fc-rowsource-test"),
             lock_owner: 0,
             did_ddl: false,
+            has_db_triggers: false,
             ddl_deferred: Vec::new(),
             attachments: {
                 let g = std::sync::Arc::new(DbGate::default());
@@ -85108,6 +85516,7 @@ mod tests {
             locks: crate::dblocks::for_path(tag),
             lock_owner: 0,
             did_ddl: false,
+            has_db_triggers: false,
             ddl_deferred: Vec::new(),
             attachments: {
                 let g = std::sync::Arc::new(DbGate::default());
