@@ -17751,6 +17751,12 @@ fn emit_trigger_blr(
     body: &TrigStmt,
     declares: &[(String, u8, usize)], // (name, blr dtype, DECLARE src offset)
     dbg: &mut Vec<(usize, usize)>,
+    // WHERE THE RELATION CONTEXTS START. A relation trigger's 0 and 1
+    // are OLD and NEW, so its first `blr_store` takes 2; a DATABASE
+    // trigger has neither row and its first store takes 0 (measured
+    // against the engine's own BLR, which differed from this server's
+    // in exactly that byte).
+    first_ctx: u8,
 ) -> Vec<u8> {
     let mut b = vec![5u8, 2]; // version5, begin
     for (i, (_, dtype, _)) in declares.iter().enumerate() {
@@ -17770,7 +17776,7 @@ fn emit_trigger_blr(
     // WHILE labels number from 1 (0 is the body's own); each blr_store
     // takes the next relation context after OLD (0) and NEW (1)
     let mut next_label = 1u8;
-    let mut next_ctx = 2u8;
+    let mut next_ctx = first_ctx;
     emit_trigger_stmt(body, &mut b, dbg, &mut next_label, &mut next_ctx, false);
     b.extend_from_slice(&[255, 76]); // end (the version5 begin), eoc
     b
@@ -18315,6 +18321,32 @@ fn plan_alter_function(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
     ))
 }
 
+/// A [Plan::CreateTrigger]'s relation, or `None` for a DATABASE trigger.
+///
+/// The plan carries the empty string for one, which no identifier can
+/// be - see the two shapes in [plan_create_trigger].
+/// Every GENERATOR a body draws, in tree order - the dependency rows
+/// the engine writes beside a trigger that carries a `NEXT VALUE FOR`.
+fn collect_gen_names(e: &fire_crab_ods::expr::Expr, out: &mut Vec<String>) {
+    use fire_crab_ods::expr::Expr as E;
+    match e {
+        E::GenId2 { name } => out.push(name.clone()),
+        E::GenId { name, step } => {
+            out.push(name.clone());
+            collect_gen_names(step, out);
+        }
+        E::Add(a, b) | E::Subtract(a, b) | E::Multiply(a, b) | E::Divide(a, b) => {
+            collect_gen_names(a, out);
+            collect_gen_names(b, out);
+        }
+        _ => {}
+    }
+}
+
+fn plan_trigger_table(table: &str) -> Option<&str> {
+    (!table.is_empty()).then_some(table)
+}
+
 fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor>)> {
     let s = sql.trim().trim_end_matches(';').trim();
     let up = s.to_ascii_uppercase();
@@ -18326,37 +18358,102 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
     if masked[..trig_kw].trim() != "CREATE" {
         return None;
     }
-    let for_kw = find_word(&masked, "FOR", trig_kw + "TRIGGER".len())?;
-    let name = s[trig_kw + "TRIGGER".len()..for_kw].trim().trim_matches('"');
+    // TWO SHAPES SHARE THIS STATEMENT. A RELATION trigger names its
+    // table - `CREATE TRIGGER T FOR TBL BEFORE INSERT AS` - and a
+    // DATABASE trigger names an EVENT instead: `CREATE TRIGGER T ON
+    // CONNECT AS`, whose catalog row carries a NULL relation and an
+    // event type of its own (8192..8196). Everything after `AS` is the
+    // same body in both.
+    // THE HEADER ENDS AT `AS`, and the keywords are looked for INSIDE
+    // it: a body carrying `NEXT VALUE FOR S` has a `FOR` of its own,
+    // and searching the whole statement for one took that as the
+    // relation clause and read the trigger's name as everything before
+    // it.
+    let as_kw = find_word(&masked, "AS", trig_kw + "TRIGGER".len())?;
+    let for_kw = find_word(&masked[..as_kw], "FOR", trig_kw + "TRIGGER".len());
+    let head_kw = match for_kw {
+        Some(k) => k,
+        // an ON-form trigger: the head starts at the event keyword
+        None => find_word(&masked[..as_kw], "ON", trig_kw + "TRIGGER".len())?,
+    };
+    let name = s[trig_kw + "TRIGGER".len()..head_kw].trim().trim_matches('"');
     if !ident_ok(name) {
         return None;
     }
-    let as_kw = find_word(&masked, "AS", for_kw + "FOR".len())?;
-    // between the table name and AS: [ACTIVE] BEFORE INSERT|UPDATE
-    // [POSITION <n>]
-    let head = &masked[for_kw + "FOR".len()..as_kw];
+    let head_at = match for_kw {
+        Some(k) => k + "FOR".len(),
+        None => head_kw,
+    };
+    let head = &masked[head_at..as_kw];
     let words: Vec<&str> = head.split_whitespace().collect();
     if words.is_empty() {
         return None;
     }
-    let table = s[for_kw + "FOR".len()..as_kw]
-        .trim_start()
-        .split_whitespace()
-        .next()?
-        .trim_matches('"');
-    if !ident_ok(table) {
+    // a DATABASE trigger's "table" is the empty string, which no
+    // identifier can be - see [db_triggers] for the firing side
+    let (table, mut w) = match for_kw {
+        Some(_) => {
+            let t = s[head_at..as_kw].trim_start().split_whitespace().next()?.trim_matches('"');
+            if !ident_ok(t) {
+                return None;
+            }
+            (t, 1usize)
+        }
+        None => ("", 0usize),
+    };
+    let mut inactive = false;
+    match words.get(w) {
+        Some(&"ACTIVE") => w += 1,
+        Some(&"INACTIVE") => {
+            inactive = true;
+            w += 1;
+        }
+        _ => {}
+    }
+    // THE DATABASE EVENTS, in the order the engine numbers them
+    let db_event: Option<i64> = if words.get(w) == Some(&"ON") {
+        let e = match (words.get(w + 1), words.get(w + 2)) {
+            (Some(&"CONNECT"), _) => {
+                w += 2;
+                DB_TRIG_CONNECT
+            }
+            (Some(&"DISCONNECT"), _) => {
+                w += 2;
+                DB_TRIG_DISCONNECT
+            }
+            (Some(&"TRANSACTION"), Some(&"START")) => {
+                w += 3;
+                DB_TRIG_TX_START
+            }
+            (Some(&"TRANSACTION"), Some(&"COMMIT")) => {
+                w += 3;
+                DB_TRIG_TX_COMMIT
+            }
+            (Some(&"TRANSACTION"), Some(&"ROLLBACK")) => {
+                w += 3;
+                DB_TRIG_TX_ROLLBACK
+            }
+            _ => return None,
+        };
+        Some(e)
+    } else {
+        None
+    };
+    // the two shapes must not be mixed: a relation trigger has no event
+    // and a database trigger has no table
+    if db_event.is_some() != table.is_empty() {
         return None;
     }
-    let mut w = 1usize;
-    if words.get(w) == Some(&"ACTIVE") {
-        w += 1;
-    }
-    let before = match words.get(w) {
-        Some(&"BEFORE") => true,
-        Some(&"AFTER") => false,
+    let before = match (db_event, words.get(w)) {
+        // a database trigger is neither BEFORE nor AFTER
+        (Some(_), _) => false,
+        (None, Some(&"BEFORE")) => true,
+        (None, Some(&"AFTER")) => false,
         _ => return None,
     };
-    w += 1;
+    if db_event.is_none() {
+        w += 1;
+    }
     // events: <EVT> [OR <EVT> [OR <EVT>]]. RDB$TRIGGER_TYPE encodes the
     // WRITTEN order (probed: BEFORE UPDATE OR INSERT = 11, not 17): the
     // first event's single-event code (BI 1, AI 2, BU 3, AU 4, BD 5,
@@ -18371,19 +18468,25 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
             _ => None,
         }
     };
-    let mut evts: Vec<i64> = vec![evt_code(words.get(w))?];
-    w += 1;
-    while words.get(w) == Some(&"OR") {
-        let e = evt_code(words.get(w + 1))?;
-        if evts.contains(&e) || evts.len() == 3 {
-            return None;
+    let mut evts: Vec<i64> = Vec::new();
+    let trigger_type: i64 = match db_event {
+        Some(e) => e,
+        None => {
+            evts.push(evt_code(words.get(w))?);
+            w += 1;
+            while words.get(w) == Some(&"OR") {
+                let e = evt_code(words.get(w + 1))?;
+                if evts.contains(&e) || evts.len() == 3 {
+                    return None;
+                }
+                evts.push(e);
+                w += 2;
+            }
+            (2 * evts[0] - 1 + if before { 0 } else { 1 })
+                + evts.get(1).copied().unwrap_or(0) * 8
+                + evts.get(2).copied().unwrap_or(0) * 32
         }
-        evts.push(e);
-        w += 2;
-    }
-    let trigger_type: i64 = (2 * evts[0] - 1 + if before { 0 } else { 1 })
-        + evts.get(1).copied().unwrap_or(0) * 8
-        + evts.get(2).copied().unwrap_or(0) * 32;
+    };
     let sequence: i64 = if words.get(w) == Some(&"POSITION") {
         let n = words.get(w + 1)?.parse().ok()?;
         w += 2;
@@ -18446,11 +18549,23 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
     // OLD row, a DELETE trigger no NEW, and only a BEFORE INSERT/UPDATE
     // may ASSIGN to NEW (the engine's rules)
     let db = db.as_ref()?;
-    let columns = db.columns(table);
-    let meta = db.relation_meta(table)?; // see [crate::mdc]
-    let rel = meta.id;
-    let formats = meta.formats.as_ref().clone();
-    let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
+    // A DATABASE TRIGGER HAS NO RELATION to check names against - no
+    // row fired it - so the column checks below have nothing to find
+    // and every `NEW.`/`OLD.` reference refuses. Its body may still
+    // name OTHER tables; those are checked against their own catalogs
+    // further down, exactly as a relation trigger's are.
+    let columns: Vec<RelationColumn> =
+        if table.is_empty() { Vec::new() } else { db.columns(table).as_ref().clone() };
+    let formats = if table.is_empty() {
+        Vec::new()
+    } else {
+        db.relation_meta(table)?.formats.as_ref().clone()
+    };
+    let descs: &[Descriptor] = formats
+        .iter()
+        .max_by_key(|(n, _)| *n)
+        .map(|(_, d)| d.as_slice())
+        .unwrap_or(&[]);
     let col_ok = |n: &str| {
         let rc = columns.iter().find(|c| c.name.eq_ignore_ascii_case(n))?;
         let d = descs.get(rc.field_id as usize)?;
@@ -18638,6 +18753,9 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
     // trigger keeps both if ANY of its events carries them - probed:
     // BEFORE INSERT OR UPDATE OR DELETE assigns NEW)
     let has_evt = |e: i64| evts.contains(&e);
+    // A DATABASE TRIGGER HAS NEITHER ROW: `evts` is empty, so both are
+    // false and any `NEW.`/`OLD.` reference in such a body refuses -
+    // which is what the engine does too
     let (old_ok, new_ok) = (has_evt(2) || has_evt(3), has_evt(1) || has_evt(2));
     for (ctx, fname) in &refs {
         if *ctx == CTX_PLAIN {
@@ -18783,8 +18901,25 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
 
     fields.sort();
 
+    // the generators the body draws, each one dependency row
+    let mut generators: Vec<String> = Vec::new();
+    {
+        let mut exprs: Vec<&fire_crab_ods::expr::Expr> = Vec::new();
+        stmt_exprs(&body, &mut exprs);
+        let mut names: Vec<String> = Vec::new();
+        for e in &exprs {
+            collect_gen_names(e, &mut names);
+        }
+        for n in names {
+            let n = n.to_ascii_uppercase();
+            if !generators.iter().any(|g| *g == n) {
+                generators.push(n);
+            }
+        }
+    }
+
     let mut dbg_entries = Vec::new();
-    let blr = emit_trigger_blr(&body, &declares, &mut dbg_entries);
+    let blr = emit_trigger_blr(&body, &declares, &mut dbg_entries, if table.is_empty() { 0 } else { 2 });
     let debug = trigger_debug_blob(s, &declares, &dbg_entries);
     Some((
         Plan::CreateTrigger {
@@ -18800,6 +18935,7 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
                 fields,
                 store_deps,
                 exceptions,
+                generators,
             },
         },
         Vec::new(),
@@ -28121,7 +28257,7 @@ fn execute_dml_collecting_inner(
             (0, 0, 0)
         }
         Plan::CreateTrigger { table, def } => {
-            fire_crab_ods::ddl::create_user_trigger(&mut work, db.page_size, table, def)?;
+            fire_crab_ods::ddl::create_user_trigger(&mut work, db.page_size, plan_trigger_table(table), def)?;
             (0, 0, 0)
         }
         Plan::AlterTrigger { name, inactive, sequence, redefine } => {
@@ -28129,7 +28265,7 @@ fn execute_dml_collecting_inner(
                 None => fire_crab_ods::ddl::alter_trigger_attrs(&mut work, db.page_size, name, *inactive, *sequence)?,
                 Some((table, def)) => {
                     fire_crab_ods::ddl::drop_trigger(&mut work, db.page_size, name)?;
-                    fire_crab_ods::ddl::create_user_trigger(&mut work, db.page_size, table, def)?;
+                    fire_crab_ods::ddl::create_user_trigger(&mut work, db.page_size, plan_trigger_table(table), def)?;
                 }
             }
             (0, 0, 0)
@@ -28140,7 +28276,7 @@ fn execute_dml_collecting_inner(
         }
         Plan::CreateOrAlterTrigger { table, def, explicit_active, explicit_position } => {
             match fire_crab_ods::ddl::trigger_info(&work, db.page_size, &def.name) {
-                None => fire_crab_ods::ddl::create_user_trigger(&mut work, db.page_size, table, def)?,
+                None => fire_crab_ods::ddl::create_user_trigger(&mut work, db.page_size, plan_trigger_table(table), def)?,
                 Some((_, _, seq, ina)) => {
                     // the stored flag and sequence survive an unspoken one (probed)
                     let mut d = def.clone();
@@ -28151,7 +28287,7 @@ fn execute_dml_collecting_inner(
                         d.sequence = seq;
                     }
                     fire_crab_ods::ddl::drop_trigger(&mut work, db.page_size, &def.name)?;
-                    fire_crab_ods::ddl::create_user_trigger(&mut work, db.page_size, table, &d)?;
+                    fire_crab_ods::ddl::create_user_trigger(&mut work, db.page_size, plan_trigger_table(table), &d)?;
                 }
             }
             (0, 0, 0)
@@ -70716,6 +70852,31 @@ fn after_auth(
         eprintln!("[srv] mdc: {}", crate::mdc::stats_line());
     }
     let attach_id = ATTACH_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // DOES THIS FILE CARRY DATABASE TRIGGERS AT ALL? Read once, here,
+    // so a file with none - which is nearly every file - pays nothing
+    // per commit.
+    refresh_db_trigger_flag(&mut database);
+    // ON CONNECT, BEFORE THE ATTACH IS ANSWERED. A raise here REFUSES
+    // THE ATTACH - the engine answers the body's own exception and the
+    // connection does not open, which is what makes an ON CONNECT
+    // trigger a gate rather than a notification - and the refusal has
+    // to REPLACE the attach's reply, not follow it. Answering the
+    // attach first and then sending the error told the client its
+    // attach had SUCCEEDED, so it went on to send a statement and got
+    // the exception as that statement's failure, followed by a broken
+    // connection (`08006`) when this end hung up.
+    if let Err(e) = fire_db_triggers(&mut database, &SessionCtx { user, attach_id }, DB_TRIG_CONNECT)
+    {
+        if std::env::var("FC_SRV_TRACE").is_ok() {
+            eprintln!("[srv] ON CONNECT refused the attach");
+        }
+        let mut w = W::default();
+        w.int(OP_RESPONSE).int(0).int(0).int(0).int(0);
+        exec_err_items(&mut w, &e);
+        w.int(0); // isc_arg_end
+        w.send(&mut s, &mut enc)?;
+        return Ok(());
+    }
     respond(&mut s, &mut enc, 1)?; // attachment handle 1
 
     // The SQL text of the most recently prepared statement, the plan it
@@ -70827,27 +70988,6 @@ fn after_auth(
     }
     let mut blr_slots: std::collections::HashMap<i32, BlrSlot> = std::collections::HashMap::new();
     let mut next_blr_handle: i32 = BLR_REQ_HANDLE;
-
-    // DOES THIS FILE CARRY DATABASE TRIGGERS AT ALL? Read once, here,
-    // so a file with none - which is nearly every file - pays nothing
-    // per commit. DDL re-reads it ([note_db_trigger_ddl]).
-    refresh_db_trigger_flag(&mut database);
-    // ON CONNECT, the first thing the attachment does. A raise here
-    // REFUSES THE ATTACH: the engine answers the body's own exception
-    // and the connection does not open, which is what makes an
-    // ON CONNECT trigger a gate rather than a notification.
-    if let Err(e) = fire_db_triggers(&mut database, &SessionCtx { user, attach_id }, DB_TRIG_CONNECT)
-    {
-        if std::env::var("FC_SRV_TRACE").is_ok() {
-            eprintln!("[srv] ON CONNECT refused the attach");
-        }
-        let mut w = W::default();
-        w.int(OP_RESPONSE).int(0).int(0).int(0).int(0);
-        exec_err_items(&mut w, &e);
-        w.int(0); // isc_arg_end
-        w.send(&mut s, &mut enc)?;
-        return Ok(());
-    }
 
     // --- the op loop (encrypted) ---
     loop {
@@ -80111,7 +80251,7 @@ mod tests {
             let vars: Vec<String> = declares.iter().map(|(n, _, _)| n.clone()).collect();
             let body = parse_trigger_body(sql, begin, end + "END".len(), &vars).unwrap();
             let mut dbg = Vec::new();
-            let blr = emit_trigger_blr(&body, declares, &mut dbg);
+            let blr = emit_trigger_blr(&body, declares, &mut dbg, 2);
             (blr, trigger_debug_blob(sql, declares, &dbg))
         };
         // U1: DELETE with a WHERE against NEW
@@ -80166,7 +80306,7 @@ mod tests {
             let vars: Vec<String> = declares.iter().map(|(n, _, _)| n.clone()).collect();
             let body = parse_trigger_body(sql, begin, end + "END".len(), &vars).unwrap();
             let mut dbg = Vec::new();
-            let blr = emit_trigger_blr(&body, declares, &mut dbg);
+            let blr = emit_trigger_blr(&body, declares, &mut dbg, 2);
             (blr, trigger_debug_blob(sql, declares, &dbg))
         };
         // N1: IF THEN BEGIN two statements END
@@ -80216,7 +80356,7 @@ mod tests {
             let end = up.rfind("END").unwrap();
             let body = parse_trigger_body(sql, begin, end + "END".len(), &[]).unwrap();
             let mut dbg = Vec::new();
-            let blr = emit_trigger_blr(&body, &[], &mut dbg);
+            let blr = emit_trigger_blr(&body, &[], &mut dbg, 2);
             (blr, trigger_debug_blob(sql, &[], &dbg))
         };
         // W1: raise inside IF, one NAMED handler
@@ -84083,7 +84223,7 @@ mod tests {
             let end = up.rfind("END").unwrap();
             let body = parse_trigger_body(sql, begin, end + "END".len(), &[]).unwrap();
             let mut dbg = Vec::new();
-            let blr = emit_trigger_blr(&body, &[], &mut dbg);
+            let blr = emit_trigger_blr(&body, &[], &mut dbg, 2);
             (blr, trigger_debug_blob(sql, &[], &dbg))
         };
         // TR1: NEW.B = NEW.A * 2
@@ -84119,7 +84259,7 @@ mod tests {
         let body =
             parse_trigger_body(up, begin, up.rfind("END").unwrap() + "END".len(), &[]).unwrap();
         let mut dbg = Vec::new();
-        let blr = emit_trigger_blr(&body, &[], &mut dbg);
+        let blr = emit_trigger_blr(&body, &[], &mut dbg, 2);
         let hex = |h: &str| -> Vec<u8> {
             (0..h.len()).step_by(2).map(|i| u8::from_str_radix(&h[i..i + 2], 16).unwrap()).collect()
         };
@@ -84147,7 +84287,7 @@ mod tests {
             let vars: Vec<String> = declares.iter().map(|(n, _, _)| n.clone()).collect();
             let body = parse_trigger_body(sql, begin, end + "END".len(), &vars).unwrap();
             let mut dbg = Vec::new();
-            let blr = emit_trigger_blr(&body, declares, &mut dbg);
+            let blr = emit_trigger_blr(&body, declares, &mut dbg, 2);
             (blr, trigger_debug_blob(sql, declares, &dbg))
         };
         let v = |name: &str, dtype: u8, off: usize| (name.to_string(), dtype, off);

@@ -70,7 +70,7 @@ e=$("$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$REAL:$B" <<< "$SETUP" 2>&1 | nor
 c=$("$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$A" <<< "$SETUP" 2>&1 | norm)
 check "the body-callers build on both (omitted + full, function + procedure)" "$c" "$e"
 
-cat > "$D/q.sql" <<'SQL'
+cat > "$D/q-$PORT.sql" <<'SQL'
 SET LIST ON;
 SELECT G(10) R FROM RDB$DATABASE;
 SELECT GFULL(10) R FROM RDB$DATABASE;
@@ -79,7 +79,7 @@ SELECT G2A(100) R FROM RDB$DATABASE;
 SELECT G2B(100) R FROM RDB$DATABASE;
 SELECT R FROM PG(10);
 SQL
-rows_of() { "$ISQL" -q -user "$U" -pas "$P" "$1" -i "$D/q.sql" 2>&1 | norm; }
+rows_of() { "$ISQL" -q -user "$U" -pas "$P" "$1" -i "$D/q-$PORT.sql" 2>&1 | norm; }
 check "body calls fill the omitted default (int/string/two-defaults; proc body too)" \
     "$(rows_of "127.0.0.1/$PORT:$A")" "$(rows_of "127.0.0.1/$REAL:$B")"
 
@@ -99,13 +99,13 @@ else echo "DIFF missing-required body call was NOT refused: [$bad]"; fail=1; fi
 # the ENGINE runs fc's stored body-call BLR (proving fc emits the same
 # short blr_function the engine fills)
 kill $srv 2>/dev/null; wait $srv 2>/dev/null
-cat > "$D/q.sql" <<'SQL'
+cat > "$D/q-$PORT.sql" <<'SQL'
 SET LIST ON;
 SELECT G(6) R, G2A(6) R2, GS(0) R3 FROM RDB$DATABASE;
 SELECT R FROM PG(6);
 SQL
-efile=$("$ISQL" -q -user "$U" -pas "$P" "$B" -i "$D/q.sql" 2>&1 | norm)
-cfile=$("$ISQL" -q -user "$U" -pas "$P" "$A" -i "$D/q.sql" 2>&1 | norm)
+efile=$("$ISQL" -q -user "$U" -pas "$P" "$B" -i "$D/q-$PORT.sql" 2>&1 | norm)
+cfile=$("$ISQL" -q -user "$U" -pas "$P" "$A" -i "$D/q-$PORT.sql" 2>&1 | norm)
 check "the ENGINE runs fc's stored omitted-default body calls" "$cfile" "$efile"
 ran=$((ran + 1))
 if echo "$cfile" | grep -q "R 11"; then echo "OK   G(6)=11 (FA default 5 filled) via fc's file"; else

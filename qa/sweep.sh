@@ -20,7 +20,10 @@
 # file and is appended whole when it finishes, so nothing interleaves.
 #
 # WHAT STAYS SERIAL, and why - see SERIAL below. Two kinds: gates that
-# MEASURE TIME or contention (a parallel sweep makes a loaded box, and a
+# MEASURE TIME or contention (`idxcost` compares an index plan's
+# milliseconds against a scan's, and a box running four gates at once
+# made the index side look 2x SLOWER than the scan - it passes alone at
+# the same load average, so what it was reporting was the sweep) (a parallel sweep makes a loaded box, and a
 # gate that waits on a lock or compares a service's line-buffered output
 # starts reporting the load instead of the server), and the four gates
 # that share scratch-database NAMES with another gate. Those run alone,
@@ -63,7 +66,7 @@ done
 #     mid-line (diagnosed 2026-08-28 - the mangling is the engine's)
 #   fetchbatch/textwidth2: each shares its scratch DB NAMES with another
 #     gate (batch, temporalwhere)
-SERIAL="concurrency carefulflush gbakverbose gencomp gendurable fetchbatch textwidth2"
+SERIAL="concurrency carefulflush gbakverbose gencomp gendurable fetchbatch textwidth2 idxcost"
 
 is_serial() { case " $SERIAL " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
 

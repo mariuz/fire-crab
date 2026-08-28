@@ -58,14 +58,14 @@ e=$("$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$REAL:$B" <<< "$SETUP" 2>&1 | nor
 c=$("$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$A" <<< "$SETUP" 2>&1 | norm)
 check "plain + packaged coexist; ALTER of the plain ones builds" "$c" "$e"
 
-cat > "$D/q.sql" <<'SQL'
+cat > "$D/q-$PORT.sql" <<'SQL'
 SET LIST ON;
 SELECT PF.F(2) M FROM RDB$DATABASE;
 SELECT F(2) P FROM RDB$DATABASE;
 SELECT R FROM PP.PR(2);
 SELECT R FROM PR(2);
 SQL
-rows_of() { "$ISQL" -q -user "$U" -pas "$P" "$1" -i "$D/q.sql" 2>&1 | norm; }
+rows_of() { "$ISQL" -q -user "$U" -pas "$P" "$1" -i "$D/q-$PORT.sql" 2>&1 | norm; }
 check "after ALTER: packaged PF.F / PP.PR survive, plain F / PR altered" \
     "$(rows_of "127.0.0.1/$PORT:$A")" "$(rows_of "127.0.0.1/$REAL:$B")"
 

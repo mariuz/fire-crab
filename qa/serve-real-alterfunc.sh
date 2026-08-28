@@ -57,14 +57,14 @@ e=$("$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$REAL:$B" <<< "$SETUP" 2>&1 | nor
 c=$("$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$A" <<< "$SETUP" 2>&1 | norm)
 check "ALTER / CREATE OR ALTER FUNCTION build on both" "$c" "$e"
 
-cat > "$D/q.sql" <<'SQL'
+cat > "$D/q-$PORT.sql" <<'SQL'
 SET LIST ON;
 SELECT F(10) R FROM RDB$DATABASE;
 SELECT G(10) R FROM RDB$DATABASE;
 SELECT H(4) R FROM RDB$DATABASE;
 SELECT FACT(5) R FROM RDB$DATABASE;
 SQL
-rows_of() { "$ISQL" -q -user "$U" -pas "$P" "$1" -i "$D/q.sql" 2>&1 | norm; }
+rows_of() { "$ISQL" -q -user "$U" -pas "$P" "$1" -i "$D/q-$PORT.sql" 2>&1 | norm; }
 check "the altered / created-or-altered functions answer" \
     "$(rows_of "127.0.0.1/$PORT:$A")" "$(rows_of "127.0.0.1/$REAL:$B")"
 
@@ -103,8 +103,8 @@ check "ALTER FUNCTION of a missing name: byte-exact not-found vector" "$nfc" "$n
 
 # the ENGINE runs fc's altered functions
 kill $srv 2>/dev/null; wait $srv 2>/dev/null
-efile=$("$ISQL" -q -user "$U" -pas "$P" "$B" -i "$D/q.sql" 2>&1 | norm)
-cfile=$("$ISQL" -q -user "$U" -pas "$P" "$A" -i "$D/q.sql" 2>&1 | norm)
+efile=$("$ISQL" -q -user "$U" -pas "$P" "$B" -i "$D/q-$PORT.sql" 2>&1 | norm)
+cfile=$("$ISQL" -q -user "$U" -pas "$P" "$A" -i "$D/q-$PORT.sql" 2>&1 | norm)
 check "the ENGINE runs fc's altered functions" "$cfile" "$efile"
 ran=$((ran + 1))
 if echo "$cfile" | grep -q "R 30"; then echo "OK   F(10)=30 after ALTER+CREATE OR ALTER via fc's file"; else

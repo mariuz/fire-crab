@@ -72,7 +72,7 @@ srcs() { "$ISQL" -q -user "$U" -pas "$P" "$1" -i "$D/src.sql" 2>&1 | norm; }
 check "RDB\$DEFAULT_SOURCE stored verbatim (DEFAULT / = / string / negative)" \
     "$(srcs "127.0.0.1/$PORT:$A")" "$(srcs "127.0.0.1/$REAL:$B")"
 
-cat > "$D/q.sql" <<'SQL'
+cat > "$D/q-$PORT.sql" <<'SQL'
 SET LIST ON;
 SELECT R FROM PA(10);
 SELECT R FROM PA(10, 99);
@@ -84,7 +84,7 @@ SELECT R FROM P2(100);
 SELECT R FROM P2(100, 10);
 SELECT R FROM P2(100, 10, 20);
 SQL
-rows_of() { "$ISQL" -q -user "$U" -pas "$P" "$1" -i "$D/q.sql" 2>&1 | norm; }
+rows_of() { "$ISQL" -q -user "$U" -pas "$P" "$1" -i "$D/q-$PORT.sql" 2>&1 | norm; }
 check "omitted defaults filled; provided ones used; string / negative / multi" \
     "$(rows_of "127.0.0.1/$PORT:$A")" "$(rows_of "127.0.0.1/$REAL:$B")"
 
@@ -119,8 +119,8 @@ if echo "$over" | grep -qiE 'error|failed|mismatch'; then echo "OK   an over-ari
 
 # the ENGINE runs fc's stored defaults
 kill $srv 2>/dev/null; wait $srv 2>/dev/null
-efile=$("$ISQL" -q -user "$U" -pas "$P" "$B" -i "$D/q.sql" 2>&1 | norm)
-cfile=$("$ISQL" -q -user "$U" -pas "$P" "$A" -i "$D/q.sql" 2>&1 | norm)
+efile=$("$ISQL" -q -user "$U" -pas "$P" "$B" -i "$D/q-$PORT.sql" 2>&1 | norm)
+cfile=$("$ISQL" -q -user "$U" -pas "$P" "$A" -i "$D/q-$PORT.sql" 2>&1 | norm)
 check "the ENGINE runs fc's stored defaulted procedures" "$cfile" "$efile"
 ran=$((ran + 1))
 if echo "$cfile" | grep -q "R 15"; then echo "OK   PA(10)=15 (default filled) via fc's file"; else

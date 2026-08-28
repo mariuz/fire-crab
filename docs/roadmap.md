@@ -1238,6 +1238,60 @@ for retrieval (its itype is unknown to the index-op reader) and an
 INSERT into a table carrying one still refuses — pre-existing, and the
 reason the gate's fixture has no index.
 
+**WRITING A DATABASE TRIGGER — DONE 2026-08-28 (`serve-real-dbtrigger`
+10 → 12).** The other half of the entry below: `CREATE TRIGGER ... ON
+CONNECT` (and its four siblings) compiles HERE now, and its catalog row,
+BLR and debug info are the engine's BYTE FOR BYTE — after which the
+ENGINE RUNS what this server compiled, which is the check that matters.
+
+`CREATE TRIGGER` has two shapes: a relation trigger names its table
+(`FOR TBL BEFORE INSERT`), a database trigger names an EVENT (`ON
+CONNECT`, `ON TRANSACTION COMMIT`). The row is written with
+`RDB$RELATION_NAME` left NULL — `sys_insert` starts every field NULL, so
+it is simply not written — and its name must be unique across ALL
+triggers rather than within one relation's.
+
+THREE DEFECTS, each measured against the engine's own bytes:
+
+1. **The header keywords were searched for in the WHOLE statement.** A
+   body carrying `NEXT VALUE FOR S` has a `FOR` of its own, and the
+   parser took that as the relation clause and read the trigger's name
+   as everything before it. The search is bounded to the header — the
+   text before `AS` — which is what it always meant.
+2. **The relation contexts start at 0, not 2.** A relation trigger's 0
+   and 1 are OLD and NEW, so its first `blr_store` takes context 2; a
+   database trigger has neither row and its first store takes 0. The BLR
+   differed from the engine's in exactly that byte, in every place it
+   appeared.
+3. **A generator the body draws is a DEPENDENCY** (`RDB$DEPENDENCIES`,
+   object type 14). The engine writes one; this server wrote the
+   relation and column rows and not that one. Fixed for relation
+   triggers too, which had the same gap.
+
+A database trigger's body is validated with no relation to check names
+against, so `NEW.`/`OLD.` in one refuses — the engine's rule — while the
+OTHER tables it names are checked against their own catalogs exactly as a
+relation trigger's are.
+
+A FOURTH DEFECT came out of the sweep rather than the gate, and it is
+the one worth remembering: **the ON CONNECT refusal has to REPLACE the
+attach's reply, not follow it.** Answering the attach first and then
+sending the exception told the client its attach had SUCCEEDED, so it
+went on to send a statement, got the exception as THAT statement's
+failure, and then a broken connection (`08006`) when this end hung up.
+The gate had passed on it — the message was there, in the right order,
+with the right stack item — and only a run under load, where the client
+retried, showed the extra line.
+
+TWO QA-HARNESS BUGS were found by the same sweep and are worth recording
+because both read exactly like regressions. Six gates all wrote
+`/tmp/fbhandson/q.sql`, so a parallel run had one overwriting another's
+script — the failure looked like a package's function vanishing. And
+`serve-real-idxcost` compares an index plan's milliseconds against a
+scan's: four gates at once made the index side look 2x SLOWER, though it
+passes alone at the same load average. It is SERIAL now. The scratch
+names were swept for others; `q.sql` was the only one shared.
+
 **DATABASE TRIGGERS — DONE 2026-08-28 (`serve-real-dbtrigger` 10,
 new).** The trigger class that belongs to the ATTACHMENT rather than to
 a table: `ON CONNECT` (8192), `ON DISCONNECT` (8193) and `ON

@@ -4788,6 +4788,10 @@ pub struct UserTriggerDef {
     pub store_deps: Vec<(String, Vec<String>)>,
     /// raised EXCEPTIONs: one dependency row each, object type 7
     pub exceptions: Vec<String>,
+    /// GENERATORS the body draws (`NEXT VALUE FOR` / `GEN_ID`): one
+    /// dependency row each, object type 14 (measured against the
+    /// engine's own rows for the same source)
+    pub generators: Vec<String>,
 }
 
 /// `CREATE TRIGGER <name> FOR <table> ...`: the RDB$TRIGGERS row (user
@@ -4795,23 +4799,39 @@ pub struct UserTriggerDef {
 /// (the last with the declared sub_type 9), one RDB$DEPENDENCIES row per
 /// referenced field, and a refresh of the relation's RDB$RUNTIME - a
 /// trigger absent from the summary never fires.
+/// Write a trigger's catalog rows.
+///
+/// `table` is the relation a DML trigger belongs to. A DATABASE trigger
+/// (`ON CONNECT` and its siblings) belongs to none: it is written with
+/// `RDB$RELATION_NAME` left NULL, which is what the firing side reads it
+/// by, and its name must be unique across ALL triggers rather than
+/// within one relation's.
 pub fn create_user_trigger(
     file: &mut crate::Image,
     page_size: usize,
-    table: &str,
+    table: Option<&str>,
     def: &UserTriggerDef,
 ) -> Result<(), String> {
-    let table = table.trim().to_ascii_uppercase();
-    let rel = crate::resolve_relation(file, page_size, &table)
-        .ok_or_else(|| format!("table {} not found", table))?;
-    if rel < 128 {
-        return Err("system relations are read-only".into());
-    }
-    if relation_trigger_names(file, page_size, &table)
-        .iter()
-        .any(|t| t.eq_ignore_ascii_case(&def.name))
-    {
-        return Err(format!("trigger {} already exists", def.name));
+    let table = table.map(|t| t.trim().to_ascii_uppercase());
+    match table.as_deref() {
+        Some(t) => {
+            let rel = crate::resolve_relation(file, page_size, t)
+                .ok_or_else(|| format!("table {} not found", t))?;
+            if rel < 128 {
+                return Err("system relations are read-only".into());
+            }
+            if relation_trigger_names(file, page_size, t)
+                .iter()
+                .any(|n| n.eq_ignore_ascii_case(&def.name))
+            {
+                return Err(format!("trigger {} already exists", def.name));
+            }
+        }
+        None => {
+            if trigger_info(file, page_size, &def.name).is_some() {
+                return Err(format!("trigger {} already exists", def.name));
+            }
+        }
     }
     let trel = crate::resolve_relation(file, page_size, "RDB$TRIGGERS")
         .ok_or("no RDB$TRIGGERS relation")?;
@@ -4823,9 +4843,14 @@ pub fn create_user_trigger(
         page_size,
         "RDB$TRIGGERS",
         trel,
-        &[
-            ("RDB$TRIGGER_NAME", SysVal::S(&def.name)),
-            ("RDB$RELATION_NAME", SysVal::S(&table)),
+        &{
+            // sys_insert starts every field NULL, so a database
+            // trigger's relation column is simply not written
+            let mut row = vec![("RDB$TRIGGER_NAME", SysVal::S(&def.name))];
+            if let Some(t) = table.as_deref() {
+                row.push(("RDB$RELATION_NAME", SysVal::S(t)));
+            }
+            row.extend([
             ("RDB$TRIGGER_SEQUENCE", SysVal::I(def.sequence)),
             ("RDB$TRIGGER_TYPE", SysVal::I(def.trigger_type)),
             ("RDB$TRIGGER_SOURCE", SysVal::B(blob_id_bytes(trel, src))),
@@ -4836,7 +4861,9 @@ pub fn create_user_trigger(
             ("RDB$FLAGS", SysVal::I(1)),
             ("RDB$VALID_BLR", SysVal::I(1)),
             ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
-        ],
+            ]);
+            row
+        },
     )?;
     let dep = |file: &mut crate::Image, on: &str, field: Option<&str>, otype: i64| -> Result<(), String> {
         let drel = crate::resolve_relation(file, page_size, "RDB$DEPENDENCIES")
@@ -4854,8 +4881,11 @@ pub fn create_user_trigger(
         }
         sys_insert(file, page_size, "RDB$DEPENDENCIES", drel, &row)
     };
-    for f in &def.fields {
-        dep(file, &table, Some(f), 0)?;
+    // a database trigger has no row, so it names no column of its own
+    if let Some(t) = table.as_deref() {
+        for f in &def.fields {
+            dep(file, t, Some(f), 0)?;
+        }
     }
     // a blr_store's target: the relation itself plus each stored column
     for (srel_name, scols) in &def.store_deps {
@@ -4868,7 +4898,15 @@ pub fn create_user_trigger(
     for e in &def.exceptions {
         dep(file, e, None, 7)?;
     }
-    update_relation_runtime(file, page_size, &table)?;
+    // a generator the body draws: object type 14 (measured)
+    for g in &def.generators {
+        dep(file, g, None, 14)?;
+    }
+    // a database trigger belongs to no relation, so no relation's
+    // runtime summary changes with it
+    if let Some(t) = table.as_deref() {
+        update_relation_runtime(file, page_size, t)?;
+    }
     advance_oldest_transactions(file, page_size)?;
     Ok(())
 }

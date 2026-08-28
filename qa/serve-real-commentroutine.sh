@@ -57,12 +57,12 @@ e=$("$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$REAL:$B" <<< "$SETUP" 2>&1 | nor
 c=$("$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$A" <<< "$SETUP" 2>&1 | norm)
 check "COMMENT ON PROCEDURE / FUNCTION build on both" "$c" "$e"
 
-cat > "$D/q.sql" <<'SQL'
+cat > "$D/q-$PORT.sql" <<'SQL'
 SET LIST ON;
 SELECT CAST(RDB$DESCRIPTION AS VARCHAR(60)) D FROM RDB$PROCEDURES WHERE RDB$PROCEDURE_NAME='P';
 SELECT CAST(RDB$DESCRIPTION AS VARCHAR(60)) D FROM RDB$FUNCTIONS WHERE RDB$FUNCTION_NAME='F';
 SQL
-rd() { "$ISQL" -q -user "$U" -pas "$P" "$1" -i "$D/q.sql" 2>&1 | norm; }
+rd() { "$ISQL" -q -user "$U" -pas "$P" "$1" -i "$D/q-$PORT.sql" 2>&1 | norm; }
 check "the descriptions read back" "$(rd "127.0.0.1/$PORT:$A")" "$(rd "127.0.0.1/$REAL:$B")"
 
 # clear the procedure comment with IS NULL

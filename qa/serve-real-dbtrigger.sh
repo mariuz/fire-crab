@@ -204,6 +204,63 @@ wipe
 run_both "a START body that READS a table, in POSITION order after the first" \
   commit "INSERT INTO C (ID, A) VALUES (3, 30)"
 
+# ---- ...AND THIS SERVER WRITES ONE --------------------------------------
+# the other half of the surface: CREATE TRIGGER ... ON CONNECT compiled
+# HERE, its catalog row and BLR compared BYTE FOR BYTE with the one the
+# engine writes for the same source, and then the ENGINE RUNS IT
+CA="$D/fc-dbtrig-mk-crab.fdb"
+CB="$D/fc-dbtrig-mk-engine.fdb"
+mk_plain() { # <file>
+    rm -f "$1"
+    "$ISQL" -q -b -user "$U" -pas "$P" >/dev/null 2>&1 <<SQL
+CREATE DATABASE '$1' USER '$U' PASSWORD '$P' PAGE_SIZE 8192;
+COMMIT;
+CREATE TABLE L (ID INTEGER, N INTEGER);
+CREATE SEQUENCE SQ;
+COMMIT;
+SQL
+    chmod 666 "$1"
+}
+mk_plain "$CA"; mk_plain "$CB"
+# the DDL itself: through THIS server for one file, the engine for the other
+ddl='SET TERM ^ ;
+CREATE TRIGGER DBC ON CONNECT AS BEGIN INSERT INTO L (ID, N) VALUES (NEXT VALUE FOR SQ, 1); END^
+CREATE TRIGGER DBTC ON TRANSACTION COMMIT POSITION 3 AS
+DECLARE VARIABLE V INTEGER;
+BEGIN
+  V = 2;
+  INSERT INTO L (ID, N) VALUES (NEXT VALUE FOR SQ, :V);
+END^
+SET TERM ; ^
+COMMIT;'
+printf '%s\n' "$ddl" | "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$CA" >/dev/null 2>&1
+printf '%s\n' "$ddl" | "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$REAL:$CB" >/dev/null 2>&1
+catq() { "$ISQL" -q -b -user "$U" -pas "$P" "$1" 2>&1 <<'SQL' | norm
+SET HEADING OFF;
+SELECT TRIM(t.RDB$TRIGGER_NAME)||'|'||COALESCE(TRIM(t.RDB$RELATION_NAME),'<null>')||'|'||t.RDB$TRIGGER_TYPE||'|'||t.RDB$TRIGGER_SEQUENCE||'|'||t.RDB$TRIGGER_INACTIVE||'|'||t.RDB$SYSTEM_FLAG||'|'||t.RDB$FLAGS||'|'||t.RDB$VALID_BLR
+FROM RDB$TRIGGERS t WHERE t.RDB$SYSTEM_FLAG = 0 ORDER BY t.RDB$TRIGGER_NAME;
+SELECT TRIM(t.RDB$TRIGGER_NAME)||'#'||CAST(CAST(t.RDB$TRIGGER_BLR AS BLOB SUB_TYPE 0) AS VARCHAR(300) CHARACTER SET OCTETS)||'#'||CAST(CAST(t.RDB$DEBUG_INFO AS BLOB SUB_TYPE 0) AS VARCHAR(300) CHARACTER SET OCTETS)
+FROM RDB$TRIGGERS t WHERE t.RDB$SYSTEM_FLAG = 0 ORDER BY t.RDB$TRIGGER_NAME;
+SELECT TRIM(d.RDB$DEPENDENT_NAME)||'|'||TRIM(d.RDB$DEPENDED_ON_NAME)||'|'||COALESCE(TRIM(d.RDB$FIELD_NAME),'-')||'|'||d.RDB$DEPENDENT_TYPE||'|'||d.RDB$DEPENDED_ON_TYPE
+FROM RDB$DEPENDENCIES d WHERE d.RDB$DEPENDENT_NAME STARTING WITH 'DB' ORDER BY 1;
+SQL
+}
+check "the catalog row, the BLR and the debug info are the engine's, byte for byte" \
+    "$(catq "$CA")" "$(catq "$CB")"
+# ...and the engine RUNS what this server compiled. The two files have
+# seen different DDL paths, so the counts are levelled first: the log is
+# emptied on both, then EXACTLY ONE attachment is made to each.
+for f in "$CA" "$CB"; do
+    printf 'DELETE FROM L; COMMIT;\n' | "$ISQL" -q -user "$U" -pas "$P" "$f" >/dev/null 2>&1
+done
+for f in "$CA" "$CB"; do
+    printf 'SELECT 1 FROM RDB$DATABASE;\n' | "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$REAL:$f" >/dev/null 2>&1
+done
+ea=$(printf 'SET LIST ON; SELECT N, COUNT(*) AS C FROM L GROUP BY N ORDER BY N;\n' | "$ISQL" -q -user "$U" -pas "$P" "$CB" 2>&1 | norm)
+ca=$(printf 'SET LIST ON; SELECT N, COUNT(*) AS C FROM L GROUP BY N ORDER BY N;\n' | "$ISQL" -q -user "$U" -pas "$P" "$CA" 2>&1 | norm)
+check "the ENGINE fires the database trigger THIS server compiled" "$ca" "$ea"
+rm -f "$CA" "$CB"
+
 # ---- ON CONNECT IS A GATE, not a notification --------------------------
 # a raise in an ON CONNECT body REFUSES THE ATTACH on both servers: the
 # connection does not open and the exception is what the client is told
