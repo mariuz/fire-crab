@@ -119,6 +119,19 @@ run_one() { # <index> <name>
     if grep -qF 'PORT="${1:' "$f"; then
         timeout 900 bash "$f" "$(port_of "$i")" >"$out" 2>&1
         rc=$?
+    elif fixture=$(fixture_for "$n"); then
+        # A GATE WHOSE `$1` IS A DATABASE, not a port. Thirteen of them
+        # read a prepared scratch database instead of building one, and
+        # for want of it they had never run in ANY sweep - 171 checks
+        # over the core query surface (joins, grouping, HAVING,
+        # projection, the system catalogue, the type matrix) that
+        # nothing was watching. Each gets its OWN COPY, because they
+        # write, and its port after it.
+        mine="$D_SCRATCH/sweep-$n.fdb"
+        cp "$fixture" "$mine" 2>/dev/null && chmod 666 "$mine"
+        timeout 900 bash "$f" "$mine" "$(port_of "$i")" >"$out" 2>&1
+        rc=$?
+        rm -f "$mine"
     else
         timeout 900 bash "$f" >"$out" 2>&1
         rc=$?
@@ -131,6 +144,25 @@ run_one() { # <index> <name>
     echo "$((t1 - t0)) $n" >>"$TIMES"
     rm -f "$out"
 }
+
+D_SCRATCH=/tmp/fbhandson
+# WHICH PREPARED DATABASE a `$1`-is-a-database gate wants. Twelve read
+# the JOIN scratch (qa/mkjoindb.sh builds it); the type matrix reads its
+# own (qa/mktypesdb.sh). A gate not named here is one that takes no
+# argument at all.
+fixture_for() {
+    case "$1" in
+        join|outerjoin|project|insert|syscat|joinchain|joingroup|orderagg|groupby|having|query|where)
+            echo "$D_SCRATCH/joindb_clean.fdb" ;;
+        types) echo "$D_SCRATCH/wiretypes_clean.fdb" ;;
+        *) return 1 ;;
+    esac
+}
+# built ONCE, here, so a first run on a fresh box has them
+for spec in "joindb_clean.fdb:qa/mkjoindb.sh" "wiretypes_clean.fdb:qa/mktypesdb.sh"; do
+    fdb="$D_SCRATCH/${spec%%:*}"
+    [ -f "$fdb" ] || bash "${spec##*:}" >/dev/null 2>&1
+done
 
 echo "sweep: ${#gates[@]} gates, -j $JOBS, log $LOG"
 start=$(date +%s)
@@ -159,8 +191,17 @@ done
 end=$(date +%s)
 echo "SWEEP DONE" >>"$LOG"
 ok=$(grep -c '^OK' "$LOG"); bad=$(grep -cE '^DIFF|^FAIL' "$LOG")
-echo "sweep: $((end - start))s  gates=$(grep -c '^=== ' "$LOG")  OK=$ok  DIFF/FAIL=$bad"
-[ "$bad" -eq 0 ] || grep -E '^DIFF|^FAIL' "$LOG" | head -20
+# ...AND A GATE THAT DIED WITHOUT SAYING SO. Counting only DIFF/FAIL
+# LINES made a gate that exits non-zero invisible: the thirteen gates
+# whose `$1` is a database printed a usage line and exited 1 in every
+# sweep, and the summary called it a clean run. An `rc` is a failure
+# whether or not the gate got as far as printing one.
+died=$(grep -E '^--- rc=[^0]' "$LOG" | grep -cv '^--- rc=0 ')
+echo "sweep: $((end - start))s  gates=$(grep -c '^=== ' "$LOG")  OK=$ok  DIFF/FAIL=$bad  rc!=0=$died"
+if [ "$bad" -ne 0 ] || [ "$died" -ne 0 ]; then
+    grep -E '^DIFF|^FAIL' "$LOG" | head -20
+    grep -E '^--- rc=[^0]' "$LOG" | head -20
+fi
 # keep the record for the next run's ordering (a FULL sweep only: a
 # filtered one would drop every gate it did not run)
 if [ ${#PATS[@]} -eq 0 ]; then

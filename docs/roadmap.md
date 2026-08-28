@@ -3309,6 +3309,23 @@ confidence. And before believing a gate that fails is a regression,
 run the OLD binary: a server that improved past a recorded refusal
 reads exactly like one that broke.
 
+**THE THIRTEEN GATES NOBODY WAS RUNNING — WIRED IN 2026-08-28.** Their
+`$1` is a prepared DATABASE rather than a port, and the runner had
+nothing to give them, so in every sweep each printed a usage line and
+exited 1: `join`, `outerjoin`, `project`, `insert`, `syscat`,
+`joinchain`, `joingroup`, `orderagg`, `groupby`, `having`, `query`,
+`where` and `types` — **171 checks over the core query surface** (joins,
+grouping, HAVING, projection, the system catalogue, the type matrix)
+that nothing was watching. They pass, so nothing had rotted; but a gate
+nobody runs is a gate that has stopped telling the truth. The runner
+builds the two fixtures once (`qa/mkjoindb.sh`, `qa/mktypesdb.sh`) and
+hands each gate its OWN COPY, because they write.
+
+**AND THE SUMMARY WAS BLIND TO THEM.** It counted DIFF and FAIL LINES,
+so a gate that dies without printing one was invisible — which is
+exactly how thirteen gates could fail in every sweep while the summary
+said 0. A non-zero `rc` is now counted and reported beside them.
+
 **RUNNING THEM ALL: `qa/sweep.sh`.** The suite is 340 gates and was
 45-60 minutes serially, which is long enough that it stops being run.
 A gate is mostly WAITING — on its own `fcwire`, on the engine at 3050,
