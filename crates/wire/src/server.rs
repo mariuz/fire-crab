@@ -13174,6 +13174,61 @@ fn ddl_trigger_matches(ttype: i64, event: u32, before: bool) -> bool {
     t & (1u64 << event) != 0
 }
 
+/// `ANY DDL STATEMENT`: every event bit, without the family bits and
+/// without the after-bit (`jrd/constants.h`'s `DDL_TRIGGER_ANY`).
+const DDL_TRIGGER_ANY: u64 = 0x7FFF_FFFF_FFFF_FFFF & !TRIGGER_TYPE_MASK & !1u64;
+
+/// One event in a DDL trigger's list, as WORDS: the verb, the object
+/// kind, and (for `PACKAGE BODY`) a third word. Answers the event's bit
+/// and how many words it consumed.
+fn ddl_event_words(verb: &str, obj: &str, third: Option<&str>) -> Option<(u32, usize)> {
+    if obj == "PACKAGE" && third == Some("BODY") {
+        return match verb {
+            "CREATE" => Some((DDL_CREATE_PACKAGE_BODY, 3)),
+            _ => None,
+        };
+    }
+    let e = match (verb, obj) {
+        ("CREATE", "TABLE") => DDL_CREATE_TABLE,
+        ("ALTER", "TABLE") => DDL_ALTER_TABLE,
+        ("DROP", "TABLE") => DDL_DROP_TABLE,
+        ("CREATE", "PROCEDURE") => DDL_CREATE_PROCEDURE,
+        ("ALTER", "PROCEDURE") => DDL_ALTER_PROCEDURE,
+        ("DROP", "PROCEDURE") => DDL_DROP_PROCEDURE,
+        ("CREATE", "FUNCTION") => DDL_CREATE_FUNCTION,
+        ("ALTER", "FUNCTION") => DDL_ALTER_FUNCTION,
+        ("DROP", "FUNCTION") => DDL_DROP_FUNCTION,
+        ("CREATE", "TRIGGER") => DDL_CREATE_TRIGGER,
+        ("ALTER", "TRIGGER") => DDL_ALTER_TRIGGER,
+        ("DROP", "TRIGGER") => DDL_DROP_TRIGGER,
+        ("CREATE", "EXCEPTION") => DDL_CREATE_EXCEPTION,
+        ("ALTER", "EXCEPTION") => DDL_ALTER_EXCEPTION,
+        ("DROP", "EXCEPTION") => DDL_DROP_EXCEPTION,
+        ("CREATE", "VIEW") => DDL_CREATE_VIEW,
+        ("ALTER", "VIEW") => DDL_ALTER_VIEW,
+        ("DROP", "VIEW") => DDL_DROP_VIEW,
+        ("CREATE", "DOMAIN") => DDL_CREATE_DOMAIN,
+        ("ALTER", "DOMAIN") => DDL_ALTER_DOMAIN,
+        ("DROP", "DOMAIN") => DDL_DROP_DOMAIN,
+        ("CREATE", "ROLE") => DDL_CREATE_ROLE,
+        ("DROP", "ROLE") => DDL_DROP_ROLE,
+        ("CREATE", "INDEX") => DDL_CREATE_INDEX,
+        ("ALTER", "INDEX") => DDL_ALTER_INDEX,
+        ("DROP", "INDEX") => DDL_DROP_INDEX,
+        ("CREATE", "SEQUENCE") | ("CREATE", "GENERATOR") => DDL_CREATE_SEQUENCE,
+        ("DROP", "SEQUENCE") | ("DROP", "GENERATOR") => DDL_DROP_SEQUENCE,
+        ("CREATE", "COLLATION") => DDL_CREATE_COLLATION,
+        ("DROP", "COLLATION") => DDL_DROP_COLLATION,
+        ("CREATE", "PACKAGE") => DDL_CREATE_PACKAGE,
+        ("DROP", "PACKAGE") => DDL_DROP_PACKAGE,
+        ("CREATE", "MAPPING") => DDL_CREATE_MAPPING,
+        ("ALTER", "MAPPING") => DDL_ALTER_MAPPING,
+        ("DROP", "MAPPING") => DDL_DROP_MAPPING,
+        _ => return None,
+    };
+    Some((e, 2))
+}
+
 /// The DDL events this server can name, by their bit
 /// (`jrd/constants.h`:435). The numbering has a GAP at 13..15, where
 /// the family bits sit.
@@ -18871,8 +18926,14 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
     let for_kw = find_word(&masked[..as_kw], "FOR", trig_kw + "TRIGGER".len());
     let head_kw = match for_kw {
         Some(k) => k,
-        // an ON-form trigger: the head starts at the event keyword
-        None => find_word(&masked[..as_kw], "ON", trig_kw + "TRIGGER".len())?,
+        // NO `FOR`: the head starts at whichever keyword comes first -
+        // `ON` for a database trigger, or the ACTIVE/INACTIVE or
+        // BEFORE/AFTER of a DDL one, whose events need no `ON` at all
+        // (`CREATE TRIGGER T BEFORE ANY DDL STATEMENT AS`)
+        None => ["ON", "ACTIVE", "INACTIVE", "BEFORE", "AFTER"]
+            .iter()
+            .filter_map(|k| find_word(&masked[..as_kw], k, trig_kw + "TRIGGER".len()))
+            .min()?,
     };
     let name = s[trig_kw + "TRIGGER".len()..head_kw].trim().trim_matches('"');
     if !ident_ok(name) {
@@ -18937,9 +18998,9 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
     } else {
         None
     };
-    // the two shapes must not be mixed: a relation trigger has no event
-    // and a database trigger has no table
-    if db_event.is_some() != table.is_empty() {
+    // a database trigger has no table, and a relation trigger has no
+    // `ON` event; a DDL trigger has neither, and says so with a verb
+    if db_event.is_some() && !table.is_empty() {
         return None;
     }
     let before = match (db_event, words.get(w)) {
@@ -18949,7 +19010,41 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
         (None, Some(&"AFTER")) => false,
         _ => return None,
     };
-    if db_event.is_none() {
+    // A DDL TRIGGER: no table, and its events are DDL verbs rather than
+    // INSERT/UPDATE/DELETE. Its type is the family, the after-bit and a
+    // BIT PER EVENT, so one trigger fires for many - and `ANY DDL
+    // STATEMENT` is every event bit at once.
+    let ddl_type: Option<i64> = if db_event.is_none() && table.is_empty() {
+        let mut at = w + 1;
+        let mut bits: u64 = 0;
+        loop {
+            match (words.get(at), words.get(at + 1), words.get(at + 2)) {
+                (Some(&"ANY"), Some(&"DDL"), Some(&"STATEMENT")) => {
+                    bits |= DDL_TRIGGER_ANY;
+                    at += 3;
+                }
+                (Some(verb), Some(obj), rest) => {
+                    let (e, used) = ddl_event_words(verb, obj, rest.copied())?;
+                    if bits & (1u64 << e) != 0 {
+                        return None; // the same event twice
+                    }
+                    bits |= 1u64 << e;
+                    at += used;
+                }
+                _ => return None,
+            }
+            if words.get(at) == Some(&"OR") {
+                at += 1;
+                continue;
+            }
+            break;
+        }
+        w = at;
+        Some((TRIGGER_TYPE_DDL | if before { 0 } else { 1 } | bits) as i64)
+    } else {
+        None
+    };
+    if db_event.is_none() && ddl_type.is_none() {
         w += 1;
     }
     // events: <EVT> [OR <EVT> [OR <EVT>]]. RDB$TRIGGER_TYPE encodes the
@@ -18967,9 +19062,10 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
         }
     };
     let mut evts: Vec<i64> = Vec::new();
-    let trigger_type: i64 = match db_event {
-        Some(e) => e,
-        None => {
+    let trigger_type: i64 = match (db_event, ddl_type) {
+        (Some(e), _) => e,
+        (_, Some(t)) => t,
+        _ => {
             evts.push(evt_code(words.get(w))?);
             w += 1;
             while words.get(w) == Some(&"OR") {

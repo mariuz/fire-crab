@@ -1238,6 +1238,25 @@ for retrieval (its itype is unknown to the index-op reader) and an
 INSERT into a table carrying one still refuses — pre-existing, and the
 reason the gate's fixture has no index.
 
+**WRITING A DDL TRIGGER — DONE 2026-08-28 (`serve-real-ddltrigger` 13
+→ 14).** The other half, and the last piece of the trigger taxonomy:
+`CREATE TRIGGER ... BEFORE ANY DDL STATEMENT`, `AFTER CREATE TABLE OR
+DROP TABLE`, a single event with a `POSITION` — all compiled HERE, with
+the catalog row, the BLR and the debug info the engine's BYTE FOR BYTE,
+after which the ENGINE RUNS what this server compiled.
+
+`CREATE TRIGGER` now has THREE shapes and one parser: a relation trigger
+names its table (`FOR TBL BEFORE INSERT`), a database trigger names an
+event after `ON`, and a DDL trigger names DDL VERBS after `BEFORE` or
+`AFTER` with no `ON` at all. With no `FOR`, the head starts at whichever
+keyword comes first — `ON`, `ACTIVE`, `INACTIVE`, `BEFORE` or `AFTER` —
+which is what tells the last two apart.
+
+The type is the family, the after-bit and a BIT PER EVENT, so an `OR`
+list is a bitwise OR and `ANY DDL STATEMENT` is every bit at once:
+`AFTER CREATE TABLE OR DROP TABLE` is 16395 = `16384 | 1 | (1 << 1) |
+(1 << 3)`, which fire-crab and the engine now write identically.
+
 **DDL TRIGGERS — DONE 2026-08-28 (`serve-real-ddltrigger` 13, new).**
 The third trigger class, and the one a schema is POLICED with: `BEFORE
 ANY DDL STATEMENT` to audit or forbid, `AFTER CREATE TABLE` to react,

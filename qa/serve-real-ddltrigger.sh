@@ -23,9 +23,10 @@
 # running unwatched. A trigger that did not fire is a policy that did
 # not run, and nothing else would say so.
 #
-# The triggers are made by the ENGINE on both files - this server does
-# not compile a DDL trigger yet (recorded below) - and what is under
-# test is FIRING them.
+# The FIRING half is tested over triggers the ENGINE made on both files;
+# the WRITING half is tested by compiling them HERE and comparing the
+# catalog row, the BLR and the debug info byte for byte - after which
+# the ENGINE runs what this server compiled.
 #
 #   qa/serve-real-ddltrigger.sh [port]
 set -u
@@ -189,13 +190,62 @@ case "$r" in
     *) echo "DIFF boundary MOVED: a function call in a body condition"; echo "     [$r]"; fail=1 ;;
 esac
 
-# ---- the boundary: this server does not COMPILE one --------------------
-ran=$((ran + 1))
-r=$(printf "SET TERM ^ ;\nCREATE TRIGGER D_NEW BEFORE ANY DDL STATEMENT AS BEGIN INSERT INTO L (ID) VALUES (1); END^\nSET TERM ; ^\n" \
-    | "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$A" 2>&1)
-case "$r" in
-    *"Dynamic SQL Error"*) echo "OK   boundary: this server will not COMPILE a DDL trigger" ;;
-    *) echo "DIFF boundary MOVED: compiling a DDL trigger"; echo "     [$r]"; fail=1 ;;
-esac
+# ---- ...AND THIS SERVER WRITES ONE --------------------------------------
+# the other half: CREATE TRIGGER for a DDL trigger compiled HERE, its
+# catalog row and BLR compared BYTE FOR BYTE with the engine's for the
+# same source, and then the ENGINE RUNS what this server compiled
+CA="$D/fc-ddltrig-mk-crab.fdb"
+CB="$D/fc-ddltrig-mk-engine.fdb"
+mk_plain() { # <file>
+    rm -f "$1"
+    "$ISQL" -q -b -user "$U" -pas "$P" >/dev/null 2>&1 <<SQL
+CREATE DATABASE '$1' USER '$U' PASSWORD '$P' PAGE_SIZE 8192;
+COMMIT;
+CREATE TABLE L (ID INTEGER, N INTEGER);
+CREATE SEQUENCE SQ;
+COMMIT;
+SQL
+    chmod 666 "$1"
+}
+mk_plain "$CA"; mk_plain "$CB"
+# ANY, a two-event list, and a single event with a POSITION - the three
+# shapes the type packs differently
+ddl='SET TERM ^ ;
+CREATE TRIGGER DA BEFORE ANY DDL STATEMENT AS BEGIN INSERT INTO L (ID, N) VALUES (NEXT VALUE FOR SQ, 1); END^
+CREATE TRIGGER DB AFTER CREATE TABLE OR DROP TABLE POSITION 4 AS BEGIN INSERT INTO L (ID, N) VALUES (NEXT VALUE FOR SQ, 2); END^
+CREATE TRIGGER DC BEFORE CREATE SEQUENCE POSITION 7 AS
+DECLARE VARIABLE V INTEGER;
+BEGIN
+  V = 3;
+  INSERT INTO L (ID, N) VALUES (NEXT VALUE FOR SQ, :V);
+END^
+SET TERM ; ^
+COMMIT;'
+printf '%s\n' "$ddl" | "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$CA" >/dev/null 2>&1
+printf '%s\n' "$ddl" | "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$REAL:$CB" >/dev/null 2>&1
+catq() { "$ISQL" -q -b -user "$U" -pas "$P" "$1" 2>&1 <<'SQL' | norm
+SET HEADING OFF;
+SELECT TRIM(t.RDB$TRIGGER_NAME)||'|'||COALESCE(TRIM(t.RDB$RELATION_NAME),'<null>')||'|'||t.RDB$TRIGGER_TYPE||'|'||t.RDB$TRIGGER_SEQUENCE||'|'||t.RDB$TRIGGER_INACTIVE||'|'||t.RDB$SYSTEM_FLAG||'|'||t.RDB$FLAGS||'|'||t.RDB$VALID_BLR
+FROM RDB$TRIGGERS t WHERE t.RDB$SYSTEM_FLAG = 0 ORDER BY t.RDB$TRIGGER_NAME;
+SELECT TRIM(t.RDB$TRIGGER_NAME)||'#'||CAST(CAST(t.RDB$TRIGGER_BLR AS BLOB SUB_TYPE 0) AS VARCHAR(300) CHARACTER SET OCTETS)||'#'||CAST(CAST(t.RDB$DEBUG_INFO AS BLOB SUB_TYPE 0) AS VARCHAR(300) CHARACTER SET OCTETS)
+FROM RDB$TRIGGERS t WHERE t.RDB$SYSTEM_FLAG = 0 ORDER BY t.RDB$TRIGGER_NAME;
+SELECT TRIM(d.RDB$DEPENDENT_NAME)||'|'||TRIM(d.RDB$DEPENDED_ON_NAME)||'|'||COALESCE(TRIM(d.RDB$FIELD_NAME),'-')||'|'||d.RDB$DEPENDENT_TYPE||'|'||d.RDB$DEPENDED_ON_TYPE
+FROM RDB$DEPENDENCIES d WHERE d.RDB$DEPENDENT_NAME STARTING WITH 'D' ORDER BY 1;
+SQL
+}
+check "a DDL trigger's row, BLR and debug info are the engine's, byte for byte" \
+    "$(catq "$CA")" "$(catq "$CB")"
+# ...and the ENGINE runs what this server compiled: level the logs, then
+# one identical DDL statement against each file
+for f in "$CA" "$CB"; do
+    printf 'DELETE FROM L; COMMIT;\n' | "$ISQL" -q -user "$U" -pas "$P" "$f" >/dev/null 2>&1
+done
+for f in "$CA" "$CB"; do
+    printf 'CREATE TABLE Z (A INTEGER); COMMIT;\n' | "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$REAL:$f" >/dev/null 2>&1
+done
+ea=$(printf 'SET LIST ON; SELECT N, COUNT(*) AS C FROM L GROUP BY N ORDER BY N;\n' | "$ISQL" -q -user "$U" -pas "$P" "$CB" 2>&1 | norm)
+ca=$(printf 'SET LIST ON; SELECT N, COUNT(*) AS C FROM L GROUP BY N ORDER BY N;\n' | "$ISQL" -q -user "$U" -pas "$P" "$CA" 2>&1 | norm)
+check "the ENGINE fires the DDL trigger THIS server compiled" "$ca" "$ea"
+rm -f "$CA" "$CB"
 echo "ran $ran checks"
 exit $fail
