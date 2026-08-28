@@ -1189,6 +1189,38 @@ statement, and **a generator draw is not transactional** - so a refused
 trigger must not share a sequence with anything the gate compares, or
 the two files drift by one and every later check DIFFs.
 
+**THE ROW CONTEXTS OF `RETURNING` — DONE 2026-08-28
+(`serve-real-returnold` 25, new).** This one started as a WRONG LAW in
+this file's own source: "`NEW.`/`OLD.` do NOT exist in DSQL - they are
+the PSQL trigger contexts, and the engine answers `Column unknown,
+"NEW"."ID"`". That was probed on an INSERT, where it is true, and
+generalised to all DML, where it is not.
+
+**An UPDATE has TWO rows and names them**: `OLD.<col>` is the
+before-image, `NEW.<col>` the after-image, and a BARE name is NEW
+(measured: `RETURNING OLD.N, NEW.N, N` over `SET N = N + 1` answers
+10, 11, 11). An INSERT and a DELETE have ONE row and no contexts at all
+- there the engine's -206 stands.
+
+The before-image is APPENDED to each returned row at `width` (the
+`Affected` collector has carried `old_images` since the trigger chunk),
+and an `OLD.` reference resolves there: as a plain column it becomes an
+expression column over `Expr::Col(width + fid)` described exactly as the
+column it names, and INSIDE an expression it is rewritten to a synthetic
+`OLD$<col>` first (`rewrite_old_refs`, which walks the MASKED text so
+`RETURNING 'OLD.N' AS L, OLD.N` keeps its string literal). `NEW.` comes
+off entirely - that image is the row this route already read.
+
+RECORDED BOUNDARIES: `INSERT`/`DELETE` with either qualifier refuse on
+both servers, but the engine's is `-206 Column unknown "NEW"."ID"` and
+this server has no -206 machinery, so the gate asserts BOTH REFUSE
+without comparing vectors and says so in its own output. `RETURNING *`
+is not implemented here at all, so `OLD.*` rides on it. And an ALIASED
+DML TARGET (`UPDATE T t SET ...`) is refused by the planner outright -
+the alias-as-qualifier support is wired (`dml_target_alias`) but
+unreachable until that lands, and the gate pins the refusal so it cannot
+be mistaken for this chunk's doing.
+
 TWO CLEANUPS the ICU chunks recorded, done here: `stamp` and
 `order_key_ttype` were the same rule written twice (unified — the
 shared one also handles the negative-sentinel sub_type the other read

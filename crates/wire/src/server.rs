@@ -22452,6 +22452,9 @@ fn wrap_returning(
     params: Vec<Descriptor>,
     list: &str,
     table: &str,
+    // the target's own ALIAS, when the statement gave it one - a legal
+    // RETURNING qualifier (`UPDATE T t ... RETURNING t.N`, probed)
+    alias: Option<&str>,
     db: &Option<Database>,
 ) -> Option<(Plan, Vec<Descriptor>)> {
     let dbr = db.as_ref()?;
@@ -22483,6 +22486,24 @@ fn wrap_returning(
         }
         _ => None,
     };
+    // THE ROW CONTEXTS OF `RETURNING`, measured on Firebird 6:
+    //
+    //   * an UPDATE has TWO rows, and names them: `OLD.<col>` is the
+    //     before-image, `NEW.<col>` the after-image, a BARE name is NEW,
+    //     and so is the target's own alias (`RETURNING t.N`);
+    //   * an INSERT and a DELETE have ONE row and NO contexts - the
+    //     engine answers -206 `Column unknown "NEW"."ID"` there, even
+    //     for a column that exists.
+    //
+    // The previous reading here - "NEW./OLD. do not exist in DSQL" - was
+    // right for the INSERT it was probed on and wrong for UPDATE.
+    let two_rows = matches!(&plan, Plan::Update { .. })
+        || matches!(&plan, Plan::Returning { inner, .. } if matches!(inner.as_ref(), Plan::Update { .. }));
+    // the OLD row is appended to each returned row at `width`
+    let width = descs.len();
+    // ...so an expression that names it resolves against a DOUBLED
+    // descriptor list, the second half being the before-image
+    let ext_descs: Vec<Descriptor> = descs.iter().chain(descs.iter()).cloned().collect();
     // TOP-LEVEL commas: an item may be an expression now, and
     // `SUBSTRING(S FROM 1 FOR 2)` carries commas of its own inside its
     // parens for other functions
@@ -22549,6 +22570,35 @@ fn wrap_returning(
                 }
                 None => body,
             };
+            // `OLD.<col>` INSIDE an expression - `RETURNING NEW.N -
+            // OLD.N`. The before-image is appended to each returned row
+            // at `width`, so the reference is rewritten to a SYNTHETIC
+            // column that resolves there, the way this file's other
+            // two-context resolvers mark a name they mean to bind
+            // elsewhere. `NEW.` comes off entirely: that image is the
+            // row this route already reads.
+            let ext_body;
+            let body = if two_rows {
+                let mut qq: Vec<String> = Vec::new();
+                let once = strip_qual_prefix(body, "NEW", &mut qq);
+                ext_body = rewrite_old_refs(&once);
+                ext_body.as_str()
+            } else {
+                body
+            };
+            let (columns, descs): (Vec<RelationColumn>, &[Descriptor]) = if two_rows {
+                let mut ext: Vec<RelationColumn> = columns.as_ref().clone();
+                for c in columns.iter() {
+                    let mut o = c.clone();
+                    o.name = format!("{OLD_REF_PREFIX}{}", c.name);
+                    o.field_id = (width + c.field_id as usize) as u16;
+                    ext.push(o);
+                }
+                (ext, ext_descs.as_slice())
+            } else {
+                (columns.as_ref().clone(), descs)
+            };
+            let columns = columns.as_slice();
             let raw = parse_raw_expr_any(body.trim())?;
             // A MERGE's RETURNING resolves TWO contexts, and this route
             // reads only the target's after-image - so every column the
@@ -22636,21 +22686,45 @@ fn wrap_returning(
         // wrote (probed, and caught by the gate's twin-database check).
         // A QUOTED qualifier compares exactly against the catalog name
         // (probed: `RETURNING "rt".ID` is `Column unknown "rt"."ID"`).
+        // `OLD.<col>` on a statement that HAS a before-image: the same
+        // column, read out of the appended old row
+        let mut old_ctx = false;
         if let Some((q, quoted)) = &qual {
-            let ok = match &merge {
-                Some((alias, _)) => {
-                    (if *quoted { *q == *alias } else { q.eq_ignore_ascii_case(alias) })
-                        || (!*quoted && q.eq_ignore_ascii_case("NEW"))
+            if !*quoted && q.eq_ignore_ascii_case("OLD") {
+                if !two_rows {
+                    // AN INSERT AND A DELETE HAVE NO SECOND ROW, and the
+                    // engine says so with -206 `Column unknown
+                    // "OLD"."N"` - a vector this server has no -206
+                    // machinery for, so the refusal is generic
+                    // (recorded).
+                    return None;
                 }
-                None => {
-                    if *quoted {
-                        *q == canon
-                    } else {
-                        q.eq_ignore_ascii_case(table)
+                old_ctx = true;
+            }
+        }
+        if let Some((q, quoted)) = &qual {
+            let ok = old_ctx
+                || match &merge {
+                    Some((alias_t, _)) => {
+                        (if *quoted { *q == *alias_t } else { q.eq_ignore_ascii_case(alias_t) })
+                            || (!*quoted && q.eq_ignore_ascii_case("NEW"))
                     }
-                }
-            };
+                    None => {
+                        if *quoted {
+                            *q == canon
+                        } else {
+                            q.eq_ignore_ascii_case(table)
+                                // the statement's own alias, and the
+                                // after-image context - both name the
+                                // row this route already reads
+                                || alias.is_some_and(|a| q.eq_ignore_ascii_case(a))
+                                || (two_rows && q.eq_ignore_ascii_case("NEW"))
+                        }
+                    }
+                };
             if !ok {
+                // a `NEW.` on a one-row statement lands here, and is the
+                // same -206 on the engine as `OLD.` above - generic here
                 return None;
             }
         } else if let Some((_, src)) = &merge {
@@ -22701,9 +22775,12 @@ fn wrap_returning(
             oct_length: length,
             scale,
             sub_type,
-            expr: None,
+            // `OLD.<col>` reads the BEFORE image, appended to each
+            // returned row at `width` - an expression column over that
+            // slot, described exactly as the column it names
+            expr: old_ctx.then(|| Expr::Col(width + fid)),
         });
-        fields.push(fid);
+        fields.push(if old_ctx { 0 } else { fid });
     }
     if cols.is_empty() {
         return None;
@@ -22716,6 +22793,58 @@ fn wrap_returning(
         },
         params,
     ))
+}
+
+/// The synthetic column-name prefix an `OLD.<col>` reference takes
+/// inside a RETURNING expression - a name no catalog column can carry
+/// (`$` is legal in an identifier, but a leading `OLD$` collides only
+/// with a column somebody deliberately named that, and such a column
+/// would have to be qualified to be reached anyway).
+const OLD_REF_PREFIX: &str = "OLD$";
+
+/// Rewrite every `OLD.<ident>` in an expression to `OLD$<ident>`, at
+/// paren depth or not - the reference means the same thing anywhere -
+/// but never inside a string literal.
+fn rewrite_old_refs(text: &str) -> String {
+    let up = text.to_ascii_uppercase();
+    let masked = mask_literals(&up);
+    let b = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0usize;
+    while i < b.len() {
+        let is_word_start = i == 0
+            || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_' || b[i - 1] == b'$'
+                || b[i - 1] == b'.' || b[i - 1] == b'"');
+        if is_word_start && masked[i..].starts_with("OLD") {
+            let after = i + 3;
+            // `OLD` then optional blanks then `.` then an identifier
+            let mut j = after;
+            while j < b.len() && (b[j] as char).is_whitespace() {
+                j += 1;
+            }
+            if b.get(j) == Some(&b'.') {
+                let mut k = j + 1;
+                while k < b.len() && (b[k] as char).is_whitespace() {
+                    k += 1;
+                }
+                let start = k;
+                while k < b.len()
+                    && (b[k].is_ascii_alphanumeric() || b[k] == b'_' || b[k] == b'$')
+                {
+                    k += 1;
+                }
+                if k > start {
+                    out.push_str(OLD_REF_PREFIX);
+                    out.push_str(&text[start..k]);
+                    i = k;
+                    continue;
+                }
+            }
+        }
+        out.push(text[i..].chars().next().unwrap_or(' '));
+        i += text[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+    }
+    out
 }
 
 /// A DML target's (schema, BARE name). The head span is taken with
@@ -22802,6 +22931,37 @@ fn dml_target(sql: &str) -> Option<(Option<NamePart<'_>>, &str)> {
 /// (a refused plan never reaches `wrap_returning`).
 fn dml_table_name(sql: &str) -> Option<String> {
     dml_target(sql).map(|(_, n)| n.to_string())
+}
+
+/// The ALIAS a DML statement gave its target, when it gave one -
+/// `UPDATE T t SET ...`, `DELETE FROM T t WHERE ...`. A legal
+/// `RETURNING` qualifier (probed: `RETURNING t.N` answers where the
+/// bare table name also does).
+///
+/// Read off the text after the target name: an identifier that is not a
+/// clause keyword. `AS` is not legal for a DML target in Firebird, so
+/// the alias is simply the next word.
+fn dml_target_alias(sql: &str) -> Option<String> {
+    let (_, name) = dml_target(sql)?;
+    let up = sql.to_ascii_uppercase();
+    let masked = mask_literals(&up);
+    let at = find_word(&masked, &name.to_ascii_uppercase(), 0)?;
+    let rest = sql[at + name.len()..].trim_start();
+    let end = rest
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$'))
+        .unwrap_or(rest.len());
+    if end == 0 {
+        return None;
+    }
+    let word = &rest[..end];
+    if matches!(
+        word.to_ascii_uppercase().as_str(),
+        "SET" | "WHERE" | "RETURNING" | "VALUES" | "SELECT" | "AS" | "DEFAULT" | "ORDER"
+            | "ROWS" | "PLAN" | "MATCHING" | "USING" | "ON" | "INTO"
+    ) {
+        return None;
+    }
+    Some(word.to_string())
 }
 
 /// Strip a DML statement's 3-part column references before its planner
@@ -70328,6 +70488,7 @@ fn after_auth(
                                     (*ps).clone(),
                                     list,
                                     &t,
+                                    dml_target_alias(&dml_sql).as_deref(),
                                     &database,
                                 )
                             })
@@ -70715,10 +70876,25 @@ fn after_auth(
                                 // pre-projecting here would shift every
                                 // column past the first
                                 let _ = &fields;
+                                // ...and the BEFORE image APPENDED, when
+                                // there is one: `RETURNING OLD.<col>`
+                                // reads it at `width + fid`, the same
+                                // trick a join's combined row uses
+                                // ([wrap_returning]). A column that does
+                                // not ask for it never indexes that far.
+                                let width = affected.descs.len();
                                 let rows: Vec<Vec<Value>> = affected
                                     .images
                                     .iter()
-                                    .map(|img| decode_record(img, &affected.descs))
+                                    .enumerate()
+                                    .map(|(i, img)| {
+                                        let mut r = decode_record(img, &affected.descs);
+                                        if let Some(o) = affected.old_images.get(i) {
+                                            r.resize(width, Value::Null);
+                                            r.extend(decode_record(o, &affected.descs));
+                                        }
+                                        r
+                                    })
                                     .collect();
                                 if std::env::var("FC_SRV_TRACE").is_ok() {
                                     eprintln!(
