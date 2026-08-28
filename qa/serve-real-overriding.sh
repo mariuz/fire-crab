@@ -556,8 +556,10 @@ bound "CAST(? AS SMALLINT) in the select list (engine: 500 SHORT len 2)" \
       "INSERT INTO BND (A,B) SELECT CAST(? AS SMALLINT), Y FROM SRC" '[1]'
 bound "MERGE ... WHEN NOT MATCHED THEN INSERT ... OVERRIDING (no MERGE surface at all)" \
       "MERGE INTO BID USING SRC ON BID.ID = SRC.X WHEN NOT MATCHED THEN INSERT (ID,B) OVERRIDING SYSTEM VALUE VALUES (SRC.X, SRC.Y)"
-bound "RETURNING * (returning_ident cannot parse '*')" \
-      "INSERT INTO BND DEFAULT VALUES RETURNING *"
+# (RETURNING * moved out of the boundary list - it answers now; the
+# star's own laws live in qa/serve-real-returnold.sh)
+both "RETURNING * over DEFAULT VALUES" \
+     "INSERT INTO BND DEFAULT VALUES RETURNING *"
 bound "RETURNING a COMPUTED column (engine evaluates it; fc would answer null-flag bytes)" \
       "INSERT INTO BCMP DEFAULT VALUES RETURNING A, C"
 # both error, different vector: fire-crab has no -804 surface

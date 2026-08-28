@@ -22479,10 +22479,12 @@ fn wrap_returning(
     // - so a bare name is accepted only when the source has no column
     // of that name
     let merge = match &plan {
-        Plan::Merge { tgt_alias, source_sql, .. } => {
+        Plan::Merge { tgt_alias, src_alias, source_sql, .. } => {
             let (sp, _) = plan_query(source_sql, db);
-            let src: Vec<String> = output_cols_of(&sp).iter().map(|c| c.name.to_ascii_uppercase()).collect();
-            Some((tgt_alias.clone(), src))
+            let scols: Vec<ProjCol> = output_cols_of(&sp);
+            let src: Vec<String> =
+                scols.iter().map(|c| c.name.to_ascii_uppercase()).collect();
+            Some((tgt_alias.clone(), src, src_alias.clone(), scols))
         }
         _ => None,
     };
@@ -22497,8 +22499,12 @@ fn wrap_returning(
     //
     // The previous reading here - "NEW./OLD. do not exist in DSQL" - was
     // right for the INSERT it was probed on and wrong for UPDATE.
-    let two_rows = matches!(&plan, Plan::Update { .. })
-        || matches!(&plan, Plan::Returning { inner, .. } if matches!(inner.as_ref(), Plan::Update { .. }));
+    // ...and a MERGE has both images as well: its matched branch is an
+    // UPDATE, and on the INSERT branch the engine answers OLD as NULL
+    // (probed) rather than refusing the statement.
+    let two_rows = matches!(&plan, Plan::Update { .. } | Plan::Merge { .. })
+        || matches!(&plan, Plan::Returning { inner, .. }
+            if matches!(inner.as_ref(), Plan::Update { .. } | Plan::Merge { .. }));
     // the OLD row is appended to each returned row at `width`
     let width = descs.len();
     // ...so an expression that names it resolves against a DOUBLED
@@ -22507,8 +22513,62 @@ fn wrap_returning(
     // TOP-LEVEL commas: an item may be an expression now, and
     // `SUBSTRING(S FROM 1 FOR 2)` carries commas of its own inside its
     // parens for other functions
+    // A BARE `*` IS THE WHOLE CLAUSE. The engine's grammar takes it as
+    // its own production, so `RETURNING *, OLD.N` is -104 `Token
+    // unknown` at the comma - while a QUALIFIED star is an ordinary
+    // list element and `RETURNING OLD.*, NEW.*` answers (both probed).
+    {
+        let items = split_top_level_commas(list);
+        if items.len() > 1 && items.iter().any(|i| i.trim() == "*") {
+            return None;
+        }
+    }
     for item in split_top_level_commas(list) {
         let item = item.trim();
+        // `*`, `<target>.*`, `NEW.*`, `OLD.*` - every column of the row,
+        // in DECLARATION order (probed: `RETURNING *` over T(ID, N, S)
+        // answers ID, N, S). A star is not a name, so it is taken before
+        // the spelled/expression split below.
+        if let Some(star_ctx) = returning_star(item, table, &canon, alias, two_rows, &merge) {
+            if star_ctx == StarCtx::Source {
+                let (_, _, _, scols) = merge.as_ref()?;
+                for (pos, sc) in scols.iter().enumerate() {
+                    let mut pc = sc.clone();
+                    pc.field_id = 0;
+                    pc.rel_alias = None;
+                    pc.sql_type = nullable(pc.sql_type);
+                    pc.expr = Some(Expr::Col(width * 2 + pos));
+                    cols.push(pc);
+                    fields.push(0);
+                }
+                continue;
+            }
+            let old_star = star_ctx == StarCtx::Old;
+            for c in columns.iter() {
+                let fid = c.field_id as usize;
+                if is_computed_fid(descs, fid) {
+                    return None; // as the spelled route refuses one
+                }
+                let d = descs.get(fid)?;
+                let (wire, sql_type, length, scale, sub_type) = wire_for(d);
+                cols.push(ProjCol {
+                    name: c.name.clone(),
+                    fname: None,
+                    relation: Some(table.to_string()),
+                    rel_alias: None,
+                    field_id: fid,
+                    wire,
+                    sql_type: nullable(sql_type),
+                    length,
+                    oct_length: length,
+                    scale,
+                    sub_type,
+                    expr: old_star.then(|| Expr::Col(width + fid)),
+                });
+                fields.push(if old_star { 0 } else { fid });
+            }
+            continue;
+        }
         // Does the item SPELL a plain, optionally qualified, column
         // name? That decision is made here and not by trying the column
         // route and falling back, because the two routes disagree about
@@ -22563,7 +22623,7 @@ fn wrap_returning(
             let stripped;
             let mut qualified: Vec<String> = Vec::new();
             let body = match &merge {
-                Some((alias_t, _)) => {
+                Some((alias_t, _, _, _)) => {
                     let once = strip_qual_prefix(body, alias_t, &mut qualified);
                     stripped = strip_qual_prefix(&once, "NEW", &mut qualified);
                     stripped.as_str()
@@ -22606,7 +22666,7 @@ fn wrap_returning(
             // so: a qualifier must be the target's alias (or `NEW.`,
             // which is that same image), and a BARE name the source also
             // carries is the engine's 42702 rather than a silent pick.
-            if let Some((alias_t, src)) = &merge {
+            if let Some((alias_t, src, _, _)) = &merge {
                 let mut names = Vec::new();
                 raw_expr_col_names(&raw, &mut names);
                 for n in &names {
@@ -22686,6 +22746,32 @@ fn wrap_returning(
         // wrote (probed, and caught by the gate's twin-database check).
         // A QUOTED qualifier compares exactly against the catalog name
         // (probed: `RETURNING "rt".ID` is `Column unknown "rt"."ID"`).
+        // `<source alias>.<col>` in a MERGE: the SOURCE row is appended
+        // after the before-image, so the reference reads `2*width + fid`
+        // and describes as the SOURCE's own column (the engine names its
+        // table SRC, not the target - probed).
+        if let (Some((_, _, src_alias, scols)), Some((q, quoted))) = (&merge, &qual) {
+            let names_src = if *quoted {
+                *q == *src_alias
+            } else {
+                q.eq_ignore_ascii_case(src_alias)
+            };
+            if names_src {
+                let pos = scols.iter().position(|c| {
+                    if bare_q { c.name == bare } else { c.name.eq_ignore_ascii_case(&bare) }
+                })?;
+                let mut pc = scols[pos].clone();
+                pc.field_id = 0;
+                // the SOURCE's own relation rides the describe: the
+                // engine names table SRC there, not the target (probed)
+                pc.rel_alias = None;
+                pc.sql_type = nullable(pc.sql_type);
+                pc.expr = Some(Expr::Col(width * 2 + pos));
+                cols.push(pc);
+                fields.push(0);
+                continue;
+            }
+        }
         // `OLD.<col>` on a statement that HAS a before-image: the same
         // column, read out of the appended old row
         let mut old_ctx = false;
@@ -22705,7 +22791,7 @@ fn wrap_returning(
         if let Some((q, quoted)) = &qual {
             let ok = old_ctx
                 || match &merge {
-                    Some((alias_t, _)) => {
+                    Some((alias_t, _, _, _)) => {
                         (if *quoted { *q == *alias_t } else { q.eq_ignore_ascii_case(alias_t) })
                             || (!*quoted && q.eq_ignore_ascii_case("NEW"))
                     }
@@ -22727,7 +22813,7 @@ fn wrap_returning(
                 // same -206 on the engine as `OLD.` above - generic here
                 return None;
             }
-        } else if let Some((_, src)) = &merge {
+        } else if let Some((_, src, _, _)) = &merge {
             if src.iter().any(|n| if bare_q { *n == bare } else { n.eq_ignore_ascii_case(&bare) }) {
                 return None; // ambiguous between the source and the target
             }
@@ -22793,6 +22879,73 @@ fn wrap_returning(
         },
         params,
     ))
+}
+
+/// Is this RETURNING item a STAR, and if so does it name the BEFORE
+/// image? `Some(true)` is `OLD.*`, `Some(false)` every other accepted
+/// spelling (`*`, `<target>.*`, `<alias>.*`, `NEW.*`), `None` when the
+/// item is not a star at all - or is one this server may not answer,
+/// which refuses through the ordinary path.
+fn returning_star(
+    item: &str,
+    table: &str,
+    canon: &str,
+    alias: Option<&str>,
+    two_rows: bool,
+    merge: &Option<(String, Vec<String>, String, Vec<ProjCol>)>,
+) -> Option<StarCtx> {
+    let t = item.trim();
+    if t == "*" {
+        // IN A MERGE A BARE STAR NAMES BOTH CONTEXTS, and the engine
+        // proves it by raising 42702 `Ambiguous field name between
+        // table SRC and table TGT` on the column they share (probed).
+        // This server has only the target's columns to expand it with,
+        // and no 42702 vector to answer with - so it refuses rather
+        // than answer half the row.
+        return merge.is_none().then_some(StarCtx::New);
+    }
+    let (q, rest) = t.split_once('.')?;
+    if rest.trim() != "*" {
+        return None;
+    }
+    let q = q.trim();
+    let (name, quoted) = match q.strip_prefix('"').and_then(|r| r.strip_suffix('"')) {
+        Some(inner) => (inner.to_string(), true),
+        None => (q.to_string(), false),
+    };
+    if !quoted && name.eq_ignore_ascii_case("OLD") {
+        return two_rows.then_some(StarCtx::Old);
+    }
+    if !quoted && name.eq_ignore_ascii_case("NEW") {
+        return (two_rows || merge.is_some()).then_some(StarCtx::New);
+    }
+    // a MERGE's SOURCE, starred: its own columns, not the target's
+    if let Some((_, _, src_alias, _)) = merge {
+        let names_src =
+            if quoted { name == *src_alias } else { name.eq_ignore_ascii_case(src_alias) };
+        if names_src {
+            return Some(StarCtx::Source);
+        }
+    }
+    let names_target = if quoted {
+        name == *canon || merge.as_ref().is_some_and(|(a, ..)| name == *a)
+    } else {
+        name.eq_ignore_ascii_case(table)
+            || alias.is_some_and(|a| name.eq_ignore_ascii_case(a))
+            || merge.as_ref().is_some_and(|(a, ..)| name.eq_ignore_ascii_case(a))
+    };
+    names_target.then_some(StarCtx::New)
+}
+
+/// Which row a star names.
+#[derive(PartialEq, Clone, Copy)]
+enum StarCtx {
+    /// the row the statement wrote - `*`, `<target>.*`, `NEW.*`
+    New,
+    /// its before-image - `OLD.*`
+    Old,
+    /// a MERGE's source row - `<source alias>.*`
+    Source,
 }
 
 /// The synthetic column-name prefix an `OLD.<col>` reference takes
@@ -22933,6 +23086,58 @@ fn dml_table_name(sql: &str) -> Option<String> {
     dml_target(sql).map(|(_, n)| n.to_string())
 }
 
+/// Take a DML target's ALIAS off the statement, rewriting every
+/// `<alias>.` reference to the bare column name.
+///
+/// `UPDATE T t SET t.N = t.N + 1 WHERE t.ID = 1 RETURNING t.N` becomes
+/// `UPDATE T SET N = N + 1 WHERE ID = 1 RETURNING N` - the shape every
+/// resolver here already handles, so the alias costs one text pass
+/// instead of a second name-resolution path. `AS` is optional and comes
+/// off with it.
+///
+/// REFUSES (returns None, which leaves the statement to refuse) when
+/// the alias token appears anywhere as a BARE word rather than a
+/// qualifier: that is how a nested `FROM O t` declares the same alias
+/// for a different table, and rewriting through it would answer the
+/// wrong rows. A correlated subquery that merely READS `t.<col>` is
+/// rewritten like any other reference, which is what the engine
+/// resolves it to.
+fn strip_dml_alias(sql: &str) -> Option<String> {
+    let (alias, def_at) = dml_target_alias(sql)?;
+    let up = sql.to_ascii_uppercase();
+    let masked = mask_literals(&up);
+    let b = masked.as_bytes();
+    let ualias = alias.to_ascii_uppercase();
+    // the DEFINITION comes off with the `AS` that may introduce it
+    let head_end = {
+        let head = sql[..def_at].trim_end();
+        let head = match head.rsplit_once(char::is_whitespace) {
+            Some((before, w)) if w.eq_ignore_ascii_case("AS") => before.trim_end(),
+            _ => head,
+        };
+        head.len()
+    };
+    let mut out = String::with_capacity(sql.len());
+    out.push_str(&sql[..head_end]);
+    out.push(' ');
+    let mut cut = def_at + alias.len();
+    // every LATER standalone occurrence must be a QUALIFIER: a bare one
+    // is how a nested `FROM O t` declares the same alias for another
+    // table, and rewriting through it would answer the wrong rows
+    let mut from = cut;
+    while let Some(p) = find_word(&masked, &ualias, from) {
+        let after = p + ualias.len();
+        if b.get(after).copied() != Some(b'.') {
+            return None;
+        }
+        out.push_str(&sql[cut..p]);
+        cut = after + 1; // the qualifier AND its dot
+        from = after;
+    }
+    out.push_str(&sql[cut..]);
+    Some(out)
+}
+
 /// The ALIAS a DML statement gave its target, when it gave one -
 /// `UPDATE T t SET ...`, `DELETE FROM T t WHERE ...`. A legal
 /// `RETURNING` qualifier (probed: `RETURNING t.N` answers where the
@@ -22941,12 +23146,34 @@ fn dml_table_name(sql: &str) -> Option<String> {
 /// Read off the text after the target name: an identifier that is not a
 /// clause keyword. `AS` is not legal for a DML target in Firebird, so
 /// the alias is simply the next word.
-fn dml_target_alias(sql: &str) -> Option<String> {
-    let (_, name) = dml_target(sql)?;
+fn dml_target_alias(sql: &str) -> Option<(String, usize)> {
     let up = sql.to_ascii_uppercase();
     let masked = mask_literals(&up);
+    // ONLY `UPDATE` AND `DELETE` TAKE ONE. An `INSERT INTO T t (...)` is
+    // -104 `Token unknown, t` on the engine (probed), and a MERGE names
+    // both its tables through aliases its own planner reads - neither
+    // may be rewritten here.
+    let update = find_word(&masked, "UPDATE", 0) == Some(0)
+        && find_word(&masked, "OR", "UPDATE".len())
+            .filter(|&or| masked["UPDATE".len()..or].trim().is_empty())
+            .is_none();
+    if !update && find_word(&masked, "DELETE", 0) != Some(0) {
+        return None;
+    }
+    let (_, name) = dml_target(sql)?;
     let at = find_word(&masked, &name.to_ascii_uppercase(), 0)?;
-    let rest = sql[at + name.len()..].trim_start();
+    let after_name = at + name.len();
+    let rest = sql[after_name..].trim_start();
+    let mut word_at = after_name + (sql[after_name..].len() - rest.len());
+    // `AS` is optional sugar before the alias
+    let rest = match rest.split_once(char::is_whitespace) {
+        Some((w, tail)) if w.eq_ignore_ascii_case("AS") => {
+            let t = tail.trim_start();
+            word_at = sql.len() - t.len();
+            t
+        }
+        _ => rest,
+    };
     let end = rest
         .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$'))
         .unwrap_or(rest.len());
@@ -22961,7 +23188,7 @@ fn dml_target_alias(sql: &str) -> Option<String> {
     ) {
         return None;
     }
-    Some(word.to_string())
+    Some((word.to_string(), word_at))
 }
 
 /// Strip a DML statement's 3-part column references before its planner
@@ -26638,11 +26865,18 @@ impl std::fmt::Display for ExecErr {
 struct Affected {
     descs: Vec<Descriptor>,
     images: Vec<Vec<u8>>,
-    /// the rows as they stood BEFORE an UPDATE, in the same order as
+    /// the rows as they stood BEFORE the statement, PARALLEL to
     /// `images` - what a deferred AFTER UPDATE trigger reads as `OLD`
-    /// ([fire_deferred_triggers]). Empty for an INSERT (there is no
-    /// OLD) and for a DELETE (its `images` ARE the old rows).
+    /// ([fire_deferred_triggers]) and what `RETURNING OLD.<col>`
+    /// projects. An EMPTY slot means the row HAS no before-image (an
+    /// inserted one): the trigger's OLD is None there, and RETURNING's
+    /// is NULL - which is what the engine answers for the insert branch
+    /// of a MERGE.
     old_images: Vec<Vec<u8>>,
+    /// A MERGE's SOURCE row for each affected row, parallel to `images`
+    /// - what `RETURNING <source alias>.<col>` projects. Empty for
+    /// every other statement, which has no second table.
+    src_rows: Vec<Vec<Value>>,
 }
 
 /// The relation a DML statement writes, through the wrappers that carry
@@ -26933,7 +27167,13 @@ fn fire_deferred_triggers(
     for (i, img) in aff.images.iter().enumerate() {
         let row = decode_record(img, &aff.descs);
         let old = if has_old {
-            aff.old_images.get(i).map(|o| decode_record(o, &aff.descs))
+            // an EMPTY slot is the parallel-shape marker for a row that
+            // HAS no before-image (an inserted one) - the trigger's OLD
+            // is None there, as it always was
+            aff.old_images
+                .get(i)
+                .filter(|o| !o.is_empty())
+                .map(|o| decode_record(o, &aff.descs))
         } else if delete {
             // a DELETE's image IS the old row
             Some(row.clone())
@@ -28001,6 +28241,13 @@ fn execute_dml_collecting_inner(
             if let Some(a) = affected.as_deref_mut() {
                 a.descs = descs.clone();
                 a.images.push(image.clone());
+                // ...and an EMPTY before-image beside it, so the two
+                // vectors stay parallel. An INSERT has no OLD row -
+                // `RETURNING OLD.x` refuses on one - but a MERGE mixes
+                // inserted and updated rows in ONE answer, where the
+                // engine's OLD is NULL for the inserted ones
+                // ([wrap_returning]'s two_rows).
+                a.old_images.push(Vec::new());
             }
             let out = {
                 // timed as a SCOPE, so the error the write returns is
@@ -28643,6 +28890,9 @@ fn execute_dml_collecting_inner(
                         .ok_or("no format for a matching record")?;
                     a.descs = d.clone();
                     a.images.push(image.clone());
+                    // a DELETE's `images` ARE the old rows; the parallel
+                    // slot keeps every consumer's indexing uniform
+                    a.old_images.push(image.clone());
                 }
                 if triggers.iter().any(|t| !t.before) {
                     deleted_images.push(image.clone());
@@ -63400,6 +63650,21 @@ fn merge_subst(
 }
 
 /// [Plan::Merge] at execute - see the variant's doc for the law.
+/// Keep [Affected::src_rows] parallel to `images` after one of a
+/// MERGE's per-row statements has run: every row it touched carries the
+/// SOURCE row that produced it, which is what
+/// `RETURNING <source alias>.<col>` projects.
+fn merge_note_source(affected: &mut Option<&mut Affected>, before: usize, row: &[Value]) {
+    if let Some(a) = affected.as_deref_mut() {
+        while a.src_rows.len() < before {
+            a.src_rows.push(Vec::new());
+        }
+        while a.src_rows.len() < a.images.len() {
+            a.src_rows.push(row.to_vec());
+        }
+    }
+}
+
 fn merge_exec(
     plan: &Plan,
     database: &mut Option<Database>,
@@ -63555,7 +63820,9 @@ fn merge_exec(
                 if let Plan::RefusedEval(e) = &aplan {
                     return Err(ExecErr::Eval(e.clone()));
                 }
+                let before = affected.as_deref().map_or(0, |a| a.images.len());
                 let (_, u, d) = execute_dml_collecting(&aplan, database, &[], ctx, affected.as_deref_mut())?;
+                merge_note_source(&mut affected, before, &null_row);
                 if u + d > 0 {
                     upd += u;
                     del += d;
@@ -63592,7 +63859,9 @@ fn merge_exec(
                     if let Plan::RefusedEval(e) = &iplan {
                         return Err(ExecErr::Eval(e.clone()));
                     }
+                    let before = affected.as_deref().map_or(0, |a| a.images.len());
                     let (i, _, _) = execute_dml_collecting(&iplan, database, &[], ctx, affected.as_deref_mut())?;
+                    merge_note_source(&mut affected, before, row);
                     if i > 0 {
                         ins += i;
                         break; // the first branch whose condition held
@@ -63647,7 +63916,9 @@ fn merge_exec(
                     if let Plan::RefusedEval(e) = &aplan {
                         return Err(ExecErr::Eval(e.clone()));
                     }
-                    let (_, u, d) = execute_dml_collecting(&aplan, database, &[], ctx, affected.as_deref_mut())?;
+                    let before = affected.as_deref().map_or(0, |a| a.images.len());
+                let (_, u, d) = execute_dml_collecting(&aplan, database, &[], ctx, affected.as_deref_mut())?;
+                merge_note_source(&mut affected, before, row);
                     if u + d > 0 {
                         upd += u;
                         del += d;
@@ -70423,6 +70694,11 @@ fn after_auth(
                     // `WHERE PUBLIC.T.C =` and `RETURNING PUBLIC.T.C`
                     // work at once. The target's own `SCHEMA.` prefix
                     // survives it - see [unqualify_dml].
+                    // ...and the TARGET'S OWN ALIAS comes off first, so
+                    // every resolver below sees the plain form it has
+                    // always seen ([strip_dml_alias])
+                    let stmt_sql =
+                        strip_dml_alias(&stmt_sql).unwrap_or_else(|| stmt_sql.clone());
                     let stmt_sql =
                         unqualify_dml(&stmt_sql, &database).unwrap_or_else(|| stmt_sql.clone());
                     let (dml_sql, returning) = split_returning(&stmt_sql);
@@ -70488,7 +70764,7 @@ fn after_auth(
                                     (*ps).clone(),
                                     list,
                                     &t,
-                                    dml_target_alias(&dml_sql).as_deref(),
+                                    dml_target_alias(&dml_sql).map(|(a, _)| a).as_deref(),
                                     &database,
                                 )
                             })
@@ -70889,9 +71165,24 @@ fn after_auth(
                                     .enumerate()
                                     .map(|(i, img)| {
                                         let mut r = decode_record(img, &affected.descs);
-                                        if let Some(o) = affected.old_images.get(i) {
-                                            r.resize(width, Value::Null);
-                                            r.extend(decode_record(o, &affected.descs));
+                                        match affected.old_images.get(i) {
+                                            Some(o) if !o.is_empty() => {
+                                                r.resize(width, Value::Null);
+                                                r.extend(decode_record(o, &affected.descs));
+                                            }
+                                            // no before-image (an
+                                            // inserted row): OLD is
+                                            // NULL, which is what the
+                                            // engine answers for a
+                                            // MERGE's insert branch
+                                            _ => r.resize(width * 2, Value::Null),
+                                        }
+                                        // ...and a MERGE's SOURCE row
+                                        // after that, for
+                                        // `RETURNING <src>.<col>`
+                                        if let Some(sr) = affected.src_rows.get(i) {
+                                            r.resize(width * 2, Value::Null);
+                                            r.extend(sr.iter().cloned());
                                         }
                                         r
                                     })

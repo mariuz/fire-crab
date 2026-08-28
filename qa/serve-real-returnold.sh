@@ -30,7 +30,9 @@ make_db() { rm -f "$1"; "$ISQL" -q -b -ch UTF8 -user "$U" -pas "$P" <<EOF >/dev/
 CREATE DATABASE '$1' USER '$U' PASSWORD '$P' PAGE_SIZE 8192 DEFAULT CHARACTER SET UTF8;
 COMMIT;
 CREATE TABLE T (ID INTEGER NOT NULL, N INTEGER, S VARCHAR(20), D DATE);
+CREATE TABLE O (ID INTEGER, K INTEGER);
 COMMIT;
+INSERT INTO O VALUES (1, 100);
 INSERT INTO T VALUES (1, 10, 'a', DATE '2020-01-01');
 INSERT INTO T VALUES (2, 20, 'b', DATE '2021-06-30');
 INSERT INTO T VALUES (3, NULL, NULL, NULL);
@@ -126,13 +128,95 @@ both "...while an INSERT's and a DELETE's PLAIN returning still answer" \
   "INSERT INTO T (ID, N) VALUES (9, 9) RETURNING ID, N; ROLLBACK;
    DELETE FROM T WHERE ID = 2 RETURNING ID, N; ROLLBACK;"
 
-# ---- recorded boundaries ------------------------------------------------
-refuses "RETURNING * - this server has no star there at all" \
-  "UPDATE T SET N = N + 1 WHERE ID = 1 RETURNING *; ROLLBACK;"
-refuses "...so OLD.* rides on it" \
+# ---- the star, and what may stand beside it -----------------------------
+both "RETURNING * over each verb" \
+  "UPDATE T SET N = N + 1 WHERE ID = 1 RETURNING *; ROLLBACK;
+   INSERT INTO T (ID, N) VALUES (9, 9) RETURNING *; ROLLBACK;
+   DELETE FROM T WHERE ID = 2 RETURNING *; ROLLBACK;"
+both "the target's own name, and NEW., star the same row" \
+  "UPDATE T SET N = N + 1 WHERE ID = 1 RETURNING T.*; ROLLBACK;
+   UPDATE T SET N = N + 1 WHERE ID = 1 RETURNING NEW.*; ROLLBACK;"
+both "OLD.* is the before-image" \
   "UPDATE T SET N = N + 1 WHERE ID = 1 RETURNING OLD.*; ROLLBACK;"
-refuses "an ALIASED DML target (the alias is a legal qualifier there)" \
+both "...and the two stars together, in that order" \
+  "UPDATE T SET N = N + 1 WHERE ID = 1 RETURNING OLD.*, NEW.*; ROLLBACK;"
+both "a QUALIFIED star may share the list with a column" \
+  "UPDATE T SET N = N + 1 WHERE ID = 1 RETURNING OLD.*, N; ROLLBACK;"
+both "the describe of a star" \
+  "SET SQLDA_DISPLAY ON; UPDATE T SET N = N + 1 WHERE ID = 1 RETURNING *; ROLLBACK;"
+# ...but a BARE star is a whole clause of its own: the engine's grammar
+# takes it as one production, so a comma after (or before) it is -104
+both_refuse "a BARE star may not share the list" \
+  "UPDATE T SET N = N + 1 WHERE ID = 1 RETURNING *, OLD.N; ROLLBACK;"
+both_refuse "...in either order" \
+  "UPDATE T SET N = N + 1 WHERE ID = 1 RETURNING OLD.N, *; ROLLBACK;"
+both_refuse "and a one-row statement has no OLD star either" \
+  "INSERT INTO T (ID) VALUES (5) RETURNING OLD.*; ROLLBACK;"
+
+# ---- the target's own ALIAS ---------------------------------------------
+# `UPDATE T t SET t.N = ...` - the alias replaces the table name as the
+# qualifier, and this server takes it off the statement text before any
+# resolver sees it, so every shape below is the plain form it already
+# handled
+both "an aliased UPDATE, qualified throughout" \
   "UPDATE T t SET t.N = t.N + 1 WHERE t.ID = 1 RETURNING t.N; ROLLBACK;"
+both "...with the optional AS" \
+  "UPDATE T AS t SET t.N = 5 WHERE t.ID = 1 RETURNING t.N; ROLLBACK;"
+both "an alias that is not the table's own letter" \
+  "UPDATE T x SET x.N = x.N + 2 WHERE x.ID = 1 RETURNING x.N, x.S; ROLLBACK;"
+both "an alias declared and then not used" \
+  "UPDATE T t SET N = N + 1 WHERE ID = 1 RETURNING N; ROLLBACK;"
+both "an aliased DELETE" "DELETE FROM T t WHERE t.ID = 2 RETURNING t.ID; ROLLBACK;"
+both "the alias beside OLD. and NEW." \
+  "UPDATE T t SET t.N = t.N + 1 WHERE t.ID = 1 RETURNING OLD.N, NEW.N, t.N; ROLLBACK;"
+both "the alias inside a CORRELATED subquery" \
+  "UPDATE T x SET x.N = (SELECT o.K FROM O o WHERE o.ID = x.ID) WHERE x.ID = 1
+   RETURNING x.N; ROLLBACK;"
+both "an alias-starred RETURNING" \
+  "UPDATE T x SET x.N = 3 WHERE x.ID = 1 RETURNING x.*; ROLLBACK;"
+both "a STRING that spells the alias is left alone" \
+  "UPDATE T x SET x.S = 'x.N' WHERE x.ID = 1 RETURNING x.S; ROLLBACK;"
+both "an identifier that merely BEGINS with it" \
+  "UPDATE T x SET x.N = 1 WHERE x.ID = 1 AND x.S <> 'xx' RETURNING x.N; ROLLBACK;"
+both_refuse "an INSERT still takes no alias, on either" \
+  "INSERT INTO T t (ID) VALUES (9); ROLLBACK;"
+both "...and an unaliased statement is untouched" \
+  "UPDATE T SET N = (SELECT COUNT(*) FROM T) WHERE ID = 1 RETURNING N; ROLLBACK;"
+# the one shape the text pass may not take: a NESTED FROM that declares
+# the SAME alias for another table. Rewriting through it would answer
+# the wrong rows, so the statement refuses.
+refuses "a nested FROM reusing the alias" \
+  "UPDATE T x SET x.N = 1 WHERE EXISTS (SELECT 1 FROM O x WHERE x.ID = 1); ROLLBACK;"
+
+# ---- a MERGE has THREE rows to name ------------------------------------
+# the target's after-image, its before-image, and the SOURCE row - and
+# the engine names all three: OLD./NEW. for the target (OLD is NULL on
+# an inserted row, not an error) and the source's own alias for the
+# third, describing against the SOURCE's table rather than the target's
+MG="MERGE INTO T t USING O o ON t.ID = o.ID"
+both "OLD and NEW on the matched branch" \
+  "$MG WHEN MATCHED THEN UPDATE SET t.N = o.K RETURNING OLD.N, NEW.N; ROLLBACK;"
+both "the SOURCE's columns beside the target's" \
+  "$MG WHEN MATCHED THEN UPDATE SET t.N = o.K RETURNING o.ID, o.K, t.N; ROLLBACK;"
+both "the source alias, starred" \
+  "$MG WHEN MATCHED THEN UPDATE SET t.N = o.K RETURNING o.*; ROLLBACK;"
+both "...and the target's star is still the target's" \
+  "$MG WHEN MATCHED THEN UPDATE SET t.N = o.K RETURNING t.*; ROLLBACK;"
+both "an INSERTED row answers OLD as NULL" \
+  "$MG WHEN MATCHED THEN UPDATE SET t.N = o.K
+   WHEN NOT MATCHED THEN INSERT (ID, N) VALUES (o.ID, o.K)
+   RETURNING OLD.N, NEW.N; ROLLBACK;"
+both "the DESCRIBE names the source's own table" \
+  "SET SQLDA_DISPLAY ON; $MG WHEN MATCHED THEN UPDATE SET t.N = o.K
+   RETURNING o.K; ROLLBACK;"
+both "...and the target's names the target's" \
+  "SET SQLDA_DISPLAY ON; $MG WHEN MATCHED THEN UPDATE SET t.N = o.K
+   RETURNING t.N; ROLLBACK;"
+# a BARE star in a MERGE names BOTH contexts, and the engine proves it
+# by raising 42702 on the column they share - this server has only the
+# target's columns to expand it with, and no 42702 to answer with
+refuses "a BARE star in a MERGE (the engine's 42702 is not reproduced)" \
+  "$MG WHEN MATCHED THEN UPDATE SET t.N = o.K RETURNING *; ROLLBACK;"
 
 # ---- the engine still reads fire-crab's file ----------------------------
 eng_q="SET LIST ON; SELECT ID, N, S, D FROM T ORDER BY ID;"

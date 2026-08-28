@@ -1238,6 +1238,47 @@ for retrieval (its itype is unknown to the index-op reader) and an
 INSERT into a table carrying one still refuses — pre-existing, and the
 reason the gate's fixture has no index.
 
+**THE STAR IN `RETURNING`, AN ALIASED DML TARGET, AND A MERGE'S THIRD
+ROW — DONE 2026-08-28 (`serve-real-returnold` 25 → 52).** The three
+boundaries the entry above recorded, closed together, because they are
+one question: WHICH ROWS does a DML statement have to name, and what may
+name them.
+
+`RETURNING *` answers now, and so does every qualified star: `T.*` (the
+target's own name), `NEW.*`, `OLD.*`, an alias's `x.*`, and `OLD.*,
+NEW.*` together in that order. A qualified star may share the list with
+ordinary columns; a BARE one may not — the engine's grammar takes `*` as
+a whole production, so a comma beside it is -104, and the gate pins that
+both servers refuse it. `StarCtx::{New,Old,Source}` says which image a
+star expands over and `returning_star` does the expanding, against the
+same descriptors the plain column route already had.
+
+An ALIASED TARGET (`UPDATE T x SET x.N = ... RETURNING x.N`) is a text
+pass, `strip_dml_alias`, and two mistakes are worth keeping: it first
+scanned from offset 0, which found the TABLE name `T` before the alias
+`t` and stripped that (`dml_target_alias` returns the alias's byte
+OFFSET now, not just its text), and it was applied to INSERT as well,
+where it made this server ACCEPT `INSERT INTO T t (...)` that the engine
+answers -104 — restricted to UPDATE and DELETE, MERGE excluded, and the
+gate holds a check for each. A string that merely SPELLS the alias, and
+an identifier that merely begins with it, are left alone. The one shape
+the pass may not take is a nested FROM re-declaring the SAME alias for
+another table: rewriting through it would answer the wrong rows, so it
+refuses.
+
+A MERGE has THREE rows to name — the target's after-image, its
+before-image, and the SOURCE row — and the engine names all three.
+`Affected` carries the third in a new `src_rows`, parallel to
+`old_images`, and a returned row is built in three blocks: the image at
+0, the before-image at `width` (an inserted row leaves it NULL rather
+than erroring), the source row at `2 * width`. The DESCRIBE of a source
+column names the SOURCE's table, not the target's — the source
+`ProjCol`'s relation is kept rather than blanked, which was a real
+defect found by the gate. RECORDED BOUNDARY: a BARE `*` in a MERGE names
+BOTH contexts and the engine proves it by raising 42702 on the column
+they share; this server has only the target's columns to expand with and
+no 42702 to answer with, so it refuses.
+
 **FIRING USER TRIGGERS ON THIS SERVER'S OWN DML — DONE 2026-08-27
 (`serve-real-trigfire` 16, then 22).** `serve-real-trigger` has covered
 CREATE TRIGGER for a long time — the PSQL-to-BLR compile, the catalog
@@ -3029,3 +3070,32 @@ gate that cannot fail is not a weaker check; it is a source of false
 confidence. And before believing a gate that fails is a regression,
 run the OLD binary: a server that improved past a recorded refusal
 reads exactly like one that broke.
+
+**RUNNING THEM ALL: `qa/sweep.sh`.** The suite is 340 gates and was
+45-60 minutes serially, which is long enough that it stops being run.
+A gate is mostly WAITING — on its own `fcwire`, on the engine at 3050,
+on fsync — so it is latency-bound before it is CPU-bound, and a few at
+once shortens the wall clock well past the core count: **1659s at -j 4,
+340 gates, 9321 checks, 0 DIFF**. What makes it safe is that a gate
+already takes its port as `$1` and builds its own scratch databases, so
+each gets a private one. Three things it must get right, each learned
+by getting it wrong: the log keeps the SERIAL `=== gate` / `--- rc=`
+format and buffers each gate whole, because every habit built around a
+sweep greps for those; gates that MEASURE TIME or contention run alone
+afterwards, since a parallel sweep makes a loaded box and such a gate
+starts reporting the load instead of the server; and `$1` is a PORT for
+327 gates but a DATABASE PATH for 13, which does not error — it fails
+eleven checks with an I/O error naming a file called "20676".
+
+Ordering the slow gates first (`qa/sweep-times.txt`, kept in the repo)
+measured NO gain here — 1659s either way. At -j 4 this two-core box is
+saturated, so the wall clock is total work over parallelism and no
+schedule changes total work; the ordering is kept because it costs
+nothing and does pay on a wider box or a filtered run. The remaining
+lever is the slow gates themselves: `textcolcmp` alone is 291s of the
+1659.
+
+Those 13 database-path gates (`join`, `groupby`, `having`, `query`,
+`project`, `where`, `insert`, `syscat`, `types`, `outerjoin`,
+`joinchain`, `joingroup`, `orderagg`) have never run in ANY sweep,
+serial or parallel. Wiring their fixtures in is real uncovered surface.
