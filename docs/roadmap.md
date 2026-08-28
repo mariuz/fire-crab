@@ -1238,6 +1238,93 @@ for retrieval (its itype is unknown to the index-op reader) and an
 INSERT into a table carrying one still refuses — pre-existing, and the
 reason the gate's fixture has no index.
 
+**DDL TRIGGERS — DONE 2026-08-28 (`serve-real-ddltrigger` 13, new).**
+The third trigger class, and the one a schema is POLICED with: `BEFORE
+ANY DDL STATEMENT` to audit or forbid, `AFTER CREATE TABLE` to react,
+with a context namespace of its own — `RDB$GET_CONTEXT('DDL_TRIGGER',
+'DDL_EVENT' | 'OBJECT_NAME' | 'SQL_TEXT')`. This server read them from
+the catalog and IGNORED them, so a database that forbids `DROP TABLE`
+let one through.
+
+HOW A TRIGGER'S TYPE SAYS WHAT IT IS (`jrd/constants.h`:362, then
+measured against the engine's own rows): `RDB$TRIGGER_TYPE >> 13 & 3` is
+the FAMILY — 0 a relation's DML trigger, 1 a database trigger, 2 a DDL
+trigger — and a DDL trigger's type is `TRIGGER_TYPE_DDL | (AFTER ? 1 :
+0) | (1 << event)` for EVERY event it names, so one trigger may fire for
+many. `AFTER CREATE TABLE` is 16387 = `16384 | 1 | (1 << 1)`; `BEFORE
+ANY DDL STATEMENT` is 9223372036854767614, every event bit with the
+family bits and the after-bit cleared and the family put back.
+
+THE REFUSAL THAT MATTERS: a DDL statement whose event this server cannot
+NAME, in a file that carries a DDL trigger, refuses rather than running
+unwatched. A trigger that did not fire is a policy that did not run, and
+nothing else would say so. The same rule catches a body this server
+cannot RUN — a policy written as `IF (RDB$GET_CONTEXT('DDL_TRIGGER',
+'OBJECT_NAME') = 'X')` is outside the body-condition grammar, so the
+statement it would police refuses (recorded, and gated).
+
+TWO DEFECTS THE GATE FOUND, both already-learned laws in a new place:
+
+1. **The engine WRAPS every DDL failure**, its triggers' raises
+   included: `unsuccessful metadata update` / `-DROP VIEW
+   "PUBLIC"."VG" failed` / then the exception. This server answered the
+   exception alone. `EvalErr::DdlFailed` carries the wrapper, and
+   `ddl_verb_gds` the per-verb message (`sqlerr.h`; the code is
+   `0x14000000 | (13 << 16) | <number>`).
+2. **A DDL statement whose triggers write needs a `Nested` window** —
+   the same law the DML-trigger chunk learned. Their rows are installed
+   by statements of their own, which dropping a working copy cannot take
+   back: the audit row of a REFUSED `DROP VIEW` survived here where the
+   engine has none.
+
+RECORDED BOUNDARY: this server does not COMPILE a DDL trigger yet, so
+the gate's triggers are made by the engine on both files and what is
+under test is FIRING them — the same order the database-trigger pair
+went in.
+
+**A TRIGGER BODY THAT BUILDS A STRING — DONE 2026-08-28
+(`serve-real-trigtext` 10, new).** Writing a message is the commonest
+thing a PSQL body does — an audit row saying what changed, a log line
+carrying the key — and every one of them refused: a body's values were
+parsed into an ARITHMETIC grammar (`+ - * /` over integers) and a
+concatenation is not in it. `INSERT INTO LOG VALUES (NEW.ID, 'set to '
+|| NEW.A)` was outside the surface, and so was the two-step form that
+builds the string in a variable first.
+
+THE FIX IS NOT A BIGGER EXPRESSION GRAMMAR. A body's own statement is
+already rendered back to SQL and run by the ORDINARY planner, which
+knows the whole value grammar — so when a value will not fit the
+arithmetic form, `TrigStmt::Store` keeps the VALUES TEXT AS WRITTEN and
+substitutes the frame into it (`subst_body_query`: `:var`, `NEW.<col>`,
+`OLD.<col>`). Concatenation arrives with everything else the planner can
+do — the gate pins `UPPER`, `CASE`, `CAST` and `SUBSTRING` in a body's
+`VALUES` — and nothing that parsed before takes the new path, because
+the raw form is kept only when the arithmetic parse declines.
+`DynPart::Row` does the same for the two-step form, where the string is
+built in a variable first.
+
+THE LAW THAT COST A WRONG ANSWER: **trailing blanks belong to a value
+and not to a statement.** A CHAR variable holding a whole statement is
+padded to its declared width and that padding is no part of the SQL
+(probed long ago: a CHAR(40) holding a SELECT runs) — but a
+CONCATENATION keeps every blank: measured, `'[' || <a CHAR(6) holding
+'ab'> || ']'` is `[ab    ]` on the engine. One renderer served both and
+trimmed for both, so the first cut of this slice answered `[ab]`. It
+trims only where the whole value IS the statement now, and the gate
+reads every row back inside `<>` so a trailing blank is visible.
+
+A SECOND, smaller one: a substituted NEGATIVE number has to be
+PARENTHESISED. `'set to ' || NEW.A` over `A = -3` became `'set to ' ||
+-3`, where the leading minus reads as an operator and the statement
+refuses; `(-3)` is the same value in every position.
+
+RECORDED BOUNDARY: this server will not COMPILE such a body to BLR — it
+has no probed byte shape for a text expression — so `CREATE TRIGGER`
+refuses to STORE one, exactly as it already refused a body carrying a
+text literal. The gate's triggers are made by the engine on both files;
+what is under test is RUNNING them. (`serve-real-dbtrigger`'s recorded
+concatenation refusal became an answer and is now compared.)
+
 **WRITING A DATABASE TRIGGER — DONE 2026-08-28 (`serve-real-dbtrigger`
 10 → 12).** The other half of the entry below: `CREATE TRIGGER ... ON
 CONNECT` (and its four siblings) compiles HERE now, and its catalog row,

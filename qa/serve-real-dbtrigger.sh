@@ -41,9 +41,6 @@
 #     the attach, so that the far commoner file with none pays nothing
 #     per transaction. A trigger another attachment creates AFTER this
 #     one began is therefore not seen by it until it reconnects.
-#   * a body's own statement is rendered back to SQL, and that renderer
-#     has no CONCATENATION - `'sum=' || :N` refuses (last boundary
-#     below) rather than storing something else.
 #
 #   qa/serve-real-dbtrigger.sh [port]
 set -u
@@ -291,12 +288,13 @@ else
 fi
 rm -f "$G"
 
-# ---- a boundary: the body expression grammar ---------------------------
+# ---- a body that BUILDS A STRING ---------------------------------------
 # a body's own statement is rendered back to SQL with the frame's values
-# written in, and that renderer has no CONCATENATION - so a body writing
-# `'sum=' || :N` refuses rather than storing something else. The engine
-# runs it; this is a recorded gap, not a difference in the firing.
-"$ISQL" -q -user "$U" -pas "$P" "$A" >/dev/null 2>&1 <<'SQL'
+# written in, and the value grammar it may use is the PLANNER's - a
+# concatenation included. This was a recorded refusal until the text
+# slice; it answers now, so it is compared instead.
+for db in "$A" "$B"; do
+"$ISQL" -q -user "$U" -pas "$P" "$db" >/dev/null 2>&1 <<'SQL'
 SET TERM ^ ;
 CREATE TRIGGER DB_TXS3 ON TRANSACTION START POSITION 9 AS
 DECLARE VARIABLE N INTEGER;
@@ -307,12 +305,9 @@ END^
 SET TERM ; ^
 COMMIT;
 SQL
-ran=$((ran + 1))
-r=$(session "$PORT" "$A" commit "SELECT 1 AS X FROM RDB\$DATABASE")
-case "$r" in
-    CONN_ERR|ERR*) echo "OK   boundary: a body expression with concatenation refuses" ;;
-    *) echo "DIFF boundary MOVED: concatenation in a body expression"; echo "     [$r]"; fail=1 ;;
-esac
+done
+wipe
+run_both "a body that CONCATENATES a value it read" commit "SELECT 1 AS X FROM RDB\$DATABASE"
 
 # ---- the engine reads what fire-crab wrote -----------------------------
 eng_q="SET LIST ON; SELECT ID, A FROM T ORDER BY ID; SELECT ID, A FROM C ORDER BY ID;"

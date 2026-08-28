@@ -2598,6 +2598,10 @@ struct Database {
     /// that the far commoner file with none pays nothing per commit -
     /// and re-read whenever DDL could have created one.
     has_db_triggers: bool,
+    /// ...and any DDL trigger. Read at the same moment and for the same
+    /// reason: a file with none must not pay a catalog scan per DDL
+    /// statement.
+    has_ddl_triggers: bool,
     /// the DDL work the windows deferred to COMMIT, stashed here when the
     /// window stack is reset ahead of the commit ([reset_gen_windows])
     ddl_deferred: Vec<fire_crab_ods::DdlDeferred>,
@@ -4539,6 +4543,7 @@ fn load_database(path: &str) -> Option<Database> {
         lock_owner,
             did_ddl: false,
             has_db_triggers: false,
+            has_ddl_triggers: false,
             ddl_deferred: Vec::new(),
         nested_tx: Vec::new(),
         page_size,
@@ -12675,6 +12680,246 @@ fn db_triggers(db: &Database, event: i64) -> Option<Vec<TrigDef>> {
     Some(out)
 }
 
+/// The engine's `<VERB> @1 failed` message for a DDL event
+/// (`sqlerr.h`; the code is `0x14000000 | (13 << 16) | <number>`, the
+/// SQLERR facility). Only the events this server names have one - a
+/// statement it cannot name never gets this far ([ddl_firing_for]).
+fn ddl_verb_gds(event: u32) -> Option<i32> {
+    let n: i32 = match event {
+        DDL_CREATE_TABLE => 998,
+        DDL_ALTER_TABLE => 999,
+        DDL_DROP_TABLE => 1000,
+        DDL_CREATE_VIEW => 1010,
+        DDL_ALTER_VIEW => 1011,
+        DDL_DROP_VIEW => 1014,
+        DDL_CREATE_PROCEDURE => 985,
+        DDL_ALTER_PROCEDURE => 986,
+        DDL_DROP_PROCEDURE => 988,
+        DDL_CREATE_FUNCTION => 980,
+        DDL_ALTER_FUNCTION => 981,
+        DDL_DROP_FUNCTION => 983,
+        DDL_CREATE_TRIGGER => 973,
+        DDL_ALTER_TRIGGER => 974,
+        DDL_DROP_TRIGGER => 976,
+        DDL_CREATE_EXCEPTION => 992,
+        DDL_ALTER_EXCEPTION => 993,
+        DDL_DROP_EXCEPTION => 996,
+        DDL_CREATE_DOMAIN => 989,
+        DDL_ALTER_DOMAIN => 990,
+        DDL_DROP_DOMAIN => 991,
+        DDL_CREATE_SEQUENCE => 997,
+        DDL_DROP_SEQUENCE => 1015,
+        DDL_CREATE_INDEX => 1028,
+        DDL_ALTER_INDEX => 1024,
+        DDL_DROP_INDEX => 1017,
+        DDL_CREATE_ROLE => 1022,
+        DDL_DROP_ROLE => 1020,
+        DDL_CREATE_PACKAGE => 1002,
+        DDL_DROP_PACKAGE => 1005,
+        DDL_CREATE_PACKAGE_BODY => 1007,
+        _ => return None,
+    };
+    Some(0x14000000 | (13 << 16) | n)
+}
+
+/// The DDL TRIGGERS that fire for one event, in firing order.
+///
+/// Read exactly as [db_triggers] reads the database ones - they share
+/// the NULL relation and the same catalog - but selected by the DDL
+/// mask ([ddl_trigger_matches]), which one trigger may satisfy for many
+/// events at once (`ANY DDL STATEMENT` satisfies every one).
+fn ddl_triggers(db: &Database, event: u32, before: bool) -> Option<Vec<TrigDef>> {
+    use fire_crab_ods::format::Value;
+    let t_formats =
+        fire_crab_ods::sysfmt::system_relation_formats(&db.bytes(), db.page_size, "RDB$TRIGGERS")?;
+    let (_, t_descs) = t_formats.iter().max_by_key(|(n, _)| *n)?;
+    let tcols = relation_columns(&db.bytes(), db.page_size, "RDB$TRIGGERS");
+    let tfid = |n: &str| tcols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (rel_f, src_f, sys_f, name_f, typ_f, seq_f, inact_f, dbg_f) = (
+        tfid("RDB$RELATION_NAME")?,
+        tfid("RDB$TRIGGER_SOURCE")?,
+        tfid("RDB$SYSTEM_FLAG")?,
+        tfid("RDB$TRIGGER_NAME")?,
+        tfid("RDB$TRIGGER_TYPE")?,
+        tfid("RDB$TRIGGER_SEQUENCE")?,
+        tfid("RDB$TRIGGER_INACTIVE")?,
+        tfid("RDB$DEBUG_INFO")?,
+    );
+    let trel = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, "RDB$TRIGGERS")?;
+    let fmts = vec![(0u8, t_descs.clone())];
+    let mut out: Vec<TrigDef> = Vec::new();
+    let mut refuse = false;
+    for_each_record(db, trel, &fmts, usize::MAX, |values| {
+        if refuse
+            || !matches!(values.get(rel_f), Some(Value::Null) | None)
+            || !matches!(values.get(sys_f), Some(Value::Int(0)))
+            || matches!(values.get(inact_f), Some(Value::Int(1)))
+        {
+            return;
+        }
+        let Some(Value::Int(ttype)) = values.get(typ_f) else { return };
+        if !ddl_trigger_matches(*ttype, event, before) {
+            return;
+        }
+        let (Some(Value::Blob(r, n)), Some(Value::Text(name))) =
+            (values.get(src_f), values.get(name_f))
+        else {
+            refuse = true;
+            return;
+        };
+        let Some(source) = fire_crab_blb::read_blob_content(&db.bytes(), db.page_size, *r, *n)
+            .and_then(|b| String::from_utf8(b).ok())
+        else {
+            refuse = true;
+            return;
+        };
+        out.push(TrigDef {
+            name: name.trim_end().to_string(),
+            before,
+            seq: match values.get(seq_f) {
+                Some(Value::Int(v)) => *v,
+                _ => 0,
+            },
+            source,
+            excs: Vec::new(),
+            needs_db: true,
+            draws: false,
+            anchor: values
+                .get(dbg_f)
+                .and_then(|v| match v {
+                    Value::Blob(r, n) => {
+                        fire_crab_blb::read_blob_content(&db.bytes(), db.page_size, *r, *n)
+                    }
+                    _ => None,
+                })
+                .as_deref()
+                .and_then(debug_info_anchor),
+        });
+    });
+    if refuse {
+        return None;
+    }
+    out.sort_by(|a, b| a.seq.cmp(&b.seq).then_with(|| a.name.cmp(&b.name)));
+    for t in out.iter_mut() {
+        let (body, _) = trig_body_of(t)?;
+        if !trig_body_inlineable(&body, "") {
+            return None;
+        }
+        let mut names: Vec<&String> = Vec::new();
+        collect_raise_names(&body, &mut names);
+        for n in names {
+            let (number, message) = exception_identity(db, n)?;
+            if !t.excs.iter().any(|(e, ..)| e == n) {
+                t.excs.push((n.clone(), number, message));
+            }
+        }
+    }
+    Some(out)
+}
+
+/// THE STATEMENT TEXT AS THE CLIENT SENT IT, for a DDL trigger's
+/// `SQL_TEXT`. Set where a statement is prepared or executed
+/// immediately; a body that reads it outside a DDL trigger gets NULL
+/// through [DDL_CTX], not this.
+thread_local! {
+    static CURRENT_SQL: std::cell::RefCell<String> =
+        const { std::cell::RefCell::new(String::new()) };
+}
+
+/// What the `DDL_TRIGGER` context answers while one is firing:
+/// `(DDL_EVENT, OBJECT_NAME, SQL_TEXT)`. `None` everywhere else, which
+/// is what the engine answers outside such a body.
+thread_local! {
+    static DDL_CTX: std::cell::RefCell<Option<(String, String, String)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Fire the DDL triggers of one event, around a DDL statement.
+///
+/// The bodies run with the database in reach, like a database
+/// trigger's, and INSIDE the statement's own transaction - so what an
+/// AFTER body writes goes back if the statement is undone, and a BEFORE
+/// body's raise stops the statement before it runs.
+fn fire_ddl_triggers(
+    database: &mut Option<Database>,
+    ctx: &SessionCtx,
+    event: u32,
+    before: bool,
+    ddl_ctx: (String, String, String),
+) -> Result<(), ExecErr> {
+    let defs = {
+        let Some(db) = database.as_ref() else { return Ok(()) };
+        if !db.has_ddl_triggers {
+            return Ok(());
+        }
+        ddl_triggers(db, event, before).ok_or_else(|| {
+            ExecErr::Text("a DDL trigger is outside this server's PSQL surface".into())
+        })?
+    };
+    if defs.is_empty() {
+        return Ok(());
+    }
+    DDL_CTX.with(|c| *c.borrow_mut() = Some(ddl_ctx));
+    let r = (|| -> Result<(), ExecErr> {
+        for d in &defs {
+            let (body, names) = trig_body_of(d).ok_or_else(|| {
+                ExecErr::Text(format!("trigger {} is outside this server's PSQL surface", d.name))
+            })?;
+            let mut frame = PsqlFrame {
+                vars: vec![Value::Null; names.len()],
+                out_at: names.len(),
+                out_len: 0,
+                suspended: Vec::new(),
+                caught: None,
+                cursors: trig_cursor_states(&d.source),
+                row_count_slot: None,
+                trig_excs: d.excs.clone(),
+                trig: None,
+                gen: Default::default(),
+            };
+            let mut steps = 0u32;
+            // a DDL trigger's own body may run DDL; it must not fire
+            // this same set again
+            let r = IN_DB_TRIGGER.with(|f| {
+                let was = f.get();
+                f.set(true);
+                let r = exec_psql_stmt(&body, &mut frame, &mut steps, database, ctx);
+                f.set(was);
+                r
+            });
+            match r {
+                Ok(()) | Err(PsqlStop::Exit) => {}
+                Err(PsqlStop::Raise(ex)) => {
+                    let at: Vec<String> = ex
+                        .trace()
+                        .iter()
+                        .filter_map(|off| trig_position(d, *off))
+                        .map(|(line, col)| {
+                            format!(
+                                "At trigger {} line: {}, col: {}",
+                                quoted_qualified(&d.name),
+                                line,
+                                col
+                            )
+                        })
+                        .collect();
+                    return Err(ExecErr::Eval(wrap_at_procedure(ex.as_eval_err(), at)));
+                }
+                Err(PsqlStop::Failed(e)) => return Err(ExecErr::Text(e)),
+                Err(_) => {
+                    return Err(ExecErr::Text(format!(
+                        "trigger {} uses PSQL this server does not interpret",
+                        d.name
+                    )))
+                }
+            }
+        }
+        Ok(())
+    })();
+    DDL_CTX.with(|c| *c.borrow_mut() = None);
+    r
+}
+
 /// Fire the DATABASE TRIGGERS of one event.
 ///
 /// Unlike a relation's, these fire where NO STATEMENT IS RUNNING - at
@@ -12812,9 +13057,53 @@ fn refresh_db_trigger_flag(database: &mut Option<Database>) {
     ]
     .iter()
     .any(|e| db_triggers_present(db, *e));
+    let any_ddl = db_ddl_triggers_present(db);
     if let Some(db) = database.as_mut() {
         db.has_db_triggers = any;
+        db.has_ddl_triggers = any_ddl;
     }
+}
+
+/// Is there any DDL trigger at all? The existence half of
+/// [ddl_triggers], which reads no body and refuses nothing.
+fn db_ddl_triggers_present(db: &Database) -> bool {
+    use fire_crab_ods::format::Value;
+    let Some(t_formats) =
+        fire_crab_ods::sysfmt::system_relation_formats(&db.bytes(), db.page_size, "RDB$TRIGGERS")
+    else {
+        return false;
+    };
+    let Some((_, t_descs)) = t_formats.iter().max_by_key(|(n, _)| *n) else { return false };
+    let tcols = relation_columns(&db.bytes(), db.page_size, "RDB$TRIGGERS");
+    let tfid = |n: &str| tcols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (Some(rel_f), Some(sys_f), Some(typ_f), Some(inact_f)) = (
+        tfid("RDB$RELATION_NAME"),
+        tfid("RDB$SYSTEM_FLAG"),
+        tfid("RDB$TRIGGER_TYPE"),
+        tfid("RDB$TRIGGER_INACTIVE"),
+    ) else {
+        return false;
+    };
+    let Some(trel) = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, "RDB$TRIGGERS")
+    else {
+        return false;
+    };
+    let fmts = vec![(0u8, t_descs.clone())];
+    let mut found = false;
+    for_each_record(db, trel, &fmts, usize::MAX, |values| {
+        if found
+            || !matches!(values.get(rel_f), Some(Value::Null) | None)
+            || !matches!(values.get(sys_f), Some(Value::Int(0)))
+            || matches!(values.get(inact_f), Some(Value::Int(1)))
+        {
+            return;
+        }
+        if matches!(values.get(typ_f), Some(Value::Int(t)) if (*t as u64) & TRIGGER_TYPE_MASK == TRIGGER_TYPE_DDL)
+        {
+            found = true;
+        }
+    });
+    found
 }
 
 /// Is there a database trigger of this event? The existence half of
@@ -12856,6 +13145,150 @@ fn db_triggers_present(db: &Database, event: i64) -> bool {
         }
     });
     found
+}
+
+/// HOW A TRIGGER'S TYPE SAYS WHAT IT IS (`jrd/constants.h`:362).
+/// `RDB$TRIGGER_TYPE >> 13 & 3` is the FAMILY - 0 a relation's DML
+/// trigger, 1 a database trigger, 2 a DDL trigger - and the rest of the
+/// number means something different in each.
+const TRIGGER_TYPE_SHIFT: u32 = 13;
+const TRIGGER_TYPE_MASK: u64 = 3 << TRIGGER_TYPE_SHIFT;
+const TRIGGER_TYPE_DDL: u64 = 2 << TRIGGER_TYPE_SHIFT;
+
+/// A DDL trigger's type is `TRIGGER_TYPE_DDL | (AFTER ? 1 : 0) | (1 <<
+/// event)` for every event it fires for, so ONE trigger may name many.
+/// `ANY DDL STATEMENT` is every event bit at once
+/// (`DDL_TRIGGER_ANY`: `0x7FFF..FF` without the family bits and without
+/// the after-bit). Verified against the engine's own rows: `AFTER
+/// CREATE TABLE` is 16387 = 16384 | 1 | (1 << 1), and `BEFORE ANY DDL
+/// STATEMENT` is 9223372036854767614.
+fn ddl_trigger_matches(ttype: i64, event: u32, before: bool) -> bool {
+    let t = ttype as u64;
+    if t & TRIGGER_TYPE_MASK != TRIGGER_TYPE_DDL {
+        return false;
+    }
+    let is_after = t & 1 == 1;
+    if is_after == before {
+        return false;
+    }
+    t & (1u64 << event) != 0
+}
+
+/// The DDL events this server can name, by their bit
+/// (`jrd/constants.h`:435). The numbering has a GAP at 13..15, where
+/// the family bits sit.
+const DDL_CREATE_TABLE: u32 = 1;
+const DDL_ALTER_TABLE: u32 = 2;
+const DDL_DROP_TABLE: u32 = 3;
+const DDL_CREATE_PROCEDURE: u32 = 4;
+const DDL_ALTER_PROCEDURE: u32 = 5;
+const DDL_DROP_PROCEDURE: u32 = 6;
+const DDL_CREATE_FUNCTION: u32 = 7;
+const DDL_ALTER_FUNCTION: u32 = 8;
+const DDL_DROP_FUNCTION: u32 = 9;
+const DDL_CREATE_TRIGGER: u32 = 10;
+const DDL_ALTER_TRIGGER: u32 = 11;
+const DDL_DROP_TRIGGER: u32 = 12;
+const DDL_CREATE_EXCEPTION: u32 = 16;
+const DDL_ALTER_EXCEPTION: u32 = 17;
+const DDL_DROP_EXCEPTION: u32 = 18;
+const DDL_CREATE_VIEW: u32 = 19;
+const DDL_ALTER_VIEW: u32 = 20;
+const DDL_DROP_VIEW: u32 = 21;
+const DDL_CREATE_DOMAIN: u32 = 22;
+const DDL_ALTER_DOMAIN: u32 = 23;
+const DDL_DROP_DOMAIN: u32 = 24;
+const DDL_CREATE_ROLE: u32 = 25;
+const DDL_DROP_ROLE: u32 = 27;
+const DDL_CREATE_INDEX: u32 = 28;
+const DDL_ALTER_INDEX: u32 = 29;
+const DDL_DROP_INDEX: u32 = 30;
+const DDL_CREATE_SEQUENCE: u32 = 31;
+const DDL_DROP_SEQUENCE: u32 = 33;
+const DDL_CREATE_COLLATION: u32 = 37;
+const DDL_DROP_COLLATION: u32 = 38;
+const DDL_CREATE_PACKAGE: u32 = 40;
+const DDL_DROP_PACKAGE: u32 = 42;
+const DDL_CREATE_PACKAGE_BODY: u32 = 43;
+const DDL_CREATE_MAPPING: u32 = 45;
+const DDL_ALTER_MAPPING: u32 = 46;
+const DDL_DROP_MAPPING: u32 = 47;
+
+/// WHICH DDL EVENT a plan is, and the object it names - the two things
+/// a DDL trigger fires on and reads (`DDL_EVENT` and `OBJECT_NAME` in
+/// the `DDL_TRIGGER` context).
+///
+/// `None` for a statement whose event this server cannot name. That is
+/// a REFUSAL when the file carries any DDL trigger at all, never a
+/// silent skip: a trigger that did not fire is a policy that did not
+/// run.
+fn ddl_event_of(plan: &Plan) -> Option<(u32, String, &'static str)> {
+    use Plan as P;
+    Some(match plan {
+        P::CreateTable { name, .. } => (DDL_CREATE_TABLE, name.clone(), "CREATE TABLE"),
+        P::DropTable { name } => (DDL_DROP_TABLE, name.clone(), "DROP TABLE"),
+        P::AlterTableAdd { table, .. }
+        | P::AlterTableAddFk { table, .. }
+        | P::AlterTableAddCheck { table, .. }
+        | P::AlterTableAddKey { table, .. }
+        | P::AlterTableDropConstraint { table, .. }
+        | P::AlterTableDrop { table, .. }
+        | P::AlterColumnType { table, .. }
+        | P::AlterColumnNull { table, .. }
+        | P::AlterColumnDefault { table, .. }
+        | P::AlterColumnRestart { table, .. }
+        | P::AlterColumnGenerated { table, .. }
+        | P::AlterColumnDropIdentity { table, .. }
+        | P::AlterColumnPosition { table, .. } => {
+            (DDL_ALTER_TABLE, table.clone(), "ALTER TABLE")
+        }
+        P::CreateView { name, .. } => (DDL_CREATE_VIEW, name.clone(), "CREATE VIEW"),
+        P::AlterView { name, .. } => (DDL_ALTER_VIEW, name.clone(), "ALTER VIEW"),
+        P::DropView { name, .. } => (DDL_DROP_VIEW, name.clone(), "DROP VIEW"),
+        P::CreateTrigger { def, .. } => (DDL_CREATE_TRIGGER, def.name.clone(), "CREATE TRIGGER"),
+        P::AlterTrigger { name, .. } => (DDL_ALTER_TRIGGER, name.clone(), "ALTER TRIGGER"),
+        P::DropTrigger { name } => (DDL_DROP_TRIGGER, name.clone(), "DROP TRIGGER"),
+        P::CreateProcedure { name, .. } => {
+            (DDL_CREATE_PROCEDURE, name.clone(), "CREATE PROCEDURE")
+        }
+        P::AlterProcedure { name, .. } => (DDL_ALTER_PROCEDURE, name.clone(), "ALTER PROCEDURE"),
+        P::DropProcedure { name } => (DDL_DROP_PROCEDURE, name.clone(), "DROP PROCEDURE"),
+        P::CreateFunction { name, .. } => (DDL_CREATE_FUNCTION, name.clone(), "CREATE FUNCTION"),
+        P::AlterFunction { name, .. } => (DDL_ALTER_FUNCTION, name.clone(), "ALTER FUNCTION"),
+        P::DropFunction { name } => (DDL_DROP_FUNCTION, name.clone(), "DROP FUNCTION"),
+        P::CreateException { name, .. } => {
+            (DDL_CREATE_EXCEPTION, name.clone(), "CREATE EXCEPTION")
+        }
+        P::AlterException { name, .. } => (DDL_ALTER_EXCEPTION, name.clone(), "ALTER EXCEPTION"),
+        P::DropException { name } => (DDL_DROP_EXCEPTION, name.clone(), "DROP EXCEPTION"),
+        P::CreateDomain { col, .. } => (DDL_CREATE_DOMAIN, col.name.clone(), "CREATE DOMAIN"),
+        P::AlterDomainCheck { domain, .. }
+        | P::AlterDomainNotNull { domain, .. }
+        | P::AlterDomainType { domain, .. } => {
+            (DDL_ALTER_DOMAIN, domain.clone(), "ALTER DOMAIN")
+        }
+        P::DropDomain { name } => (DDL_DROP_DOMAIN, name.clone(), "DROP DOMAIN"),
+        P::CreateIndex { name, .. } => (DDL_CREATE_INDEX, name.clone(), "CREATE INDEX"),
+        P::AlterIndex { name, .. } => (DDL_ALTER_INDEX, name.clone(), "ALTER INDEX"),
+        P::DropIndex { name } => (DDL_DROP_INDEX, name.clone(), "DROP INDEX"),
+        P::CreateSequence { name, .. } => (DDL_CREATE_SEQUENCE, name.clone(), "CREATE SEQUENCE"),
+        P::DropSequence { name } => (DDL_DROP_SEQUENCE, name.clone(), "DROP SEQUENCE"),
+        P::CreateRole { name } => (DDL_CREATE_ROLE, name.clone(), "CREATE ROLE"),
+        P::DropRole { name } => (DDL_DROP_ROLE, name.clone(), "DROP ROLE"),
+        P::CreateCollation { name, .. } => {
+            (DDL_CREATE_COLLATION, name.clone(), "CREATE COLLATION")
+        }
+        P::DropCollation { name } => (DDL_DROP_COLLATION, name.clone(), "DROP COLLATION"),
+        P::CreatePackage { name, .. } => (DDL_CREATE_PACKAGE, name.clone(), "CREATE PACKAGE"),
+        P::CreatePackageBody { name, .. } => {
+            (DDL_CREATE_PACKAGE_BODY, name.clone(), "CREATE PACKAGE BODY")
+        }
+        P::DropPackage { name, .. } => (DDL_DROP_PACKAGE, name.clone(), "DROP PACKAGE"),
+        P::CreateMapping(m) => (DDL_CREATE_MAPPING, m.name.clone(), "CREATE MAPPING"),
+        P::AlterMapping(m) => (DDL_ALTER_MAPPING, m.name.clone(), "ALTER MAPPING"),
+        P::DropMapping { name, .. } => (DDL_DROP_MAPPING, name.clone(), "DROP MAPPING"),
+        _ => return None,
+    })
 }
 
 /// The five database events, by their `RDB$TRIGGER_TYPE`.
@@ -15831,6 +16264,12 @@ enum HandlerCond {
 enum DynPart {
     Lit(String),
     Var(u16),
+    /// a `NEW.<col>` / `OLD.<col>` reference - context 1 or 0 and the
+    /// column's name, resolved against the row when the text is built.
+    /// A trigger body concatenates the row it fired over as readily as
+    /// it concatenates its own variables, and without this every such
+    /// body refused whole.
+    Row(u8, String),
 }
 
 enum TrigStmt {
@@ -15912,6 +16351,16 @@ enum TrigStmt {
         table: String,
         cols: Vec<String>,
         exprs: Vec<fire_crab_ods::expr::Expr>,
+        /// THE VALUES AS WRITTEN, kept when the arithmetic `Expr`
+        /// grammar cannot hold them - a concatenation, a function call,
+        /// a `CASE`. The statement is rendered from this text with the
+        /// frame's values written in ([subst_body_query]) and run by the
+        /// ORDINARY planner, which knows the whole value grammar. `None`
+        /// whenever every value parsed, so nothing that worked before
+        /// takes a different path - and a body carrying one cannot be
+        /// COMPILED to BLR ([body_has_uninterpretable_blr]), exactly as
+        /// a body carrying a text literal already could not.
+        raw: Option<(String, Vec<(String, u16)>)>,
         src_off: usize,
     },
     /// `UPDATE <t> SET <col> = <expr>[, ...] [WHERE <cond>];` -
@@ -16515,7 +16964,11 @@ fn body_has_uninterpretable_blr(st: &TrigStmt) -> bool {
         // engine's - so a body carrying one is interpreted, never
         // stored, exactly as an AssignText body always was
         TrigStmt::Assign { expr, .. } => expr_has_text(expr),
-        TrigStmt::Store { exprs, .. } => exprs.iter().any(expr_has_text),
+        // ...and a store whose VALUES were kept as text: there is no
+        // `Expr` to emit, and storing the trigger with the statement
+        // silently missing would be a trigger that does not do what its
+        // own source says
+        TrigStmt::Store { exprs, raw, .. } => raw.is_some() || exprs.iter().any(expr_has_text),
         TrigStmt::Block { stmts, handlers, .. } => {
             stmts.iter().any(body_has_uninterpretable_blr)
                 || handlers.iter().any(|(conds, h)| {
@@ -16944,6 +17397,26 @@ fn parse_dyn_text(t: &str, vars: &[String]) -> Option<Vec<DynPart>> {
                 return None;
             }
             out.push(DynPart::Lit(inner.replace("''", "'")));
+        } else if let Some(col) = p
+            .strip_prefix("NEW.")
+            .or_else(|| p.strip_prefix("new."))
+            .or_else(|| p.strip_prefix("New."))
+        {
+            let col = col.trim().trim_matches('"').to_ascii_uppercase();
+            if !ident_ok(&col) {
+                return None;
+            }
+            out.push(DynPart::Row(1, col));
+        } else if let Some(col) = p
+            .strip_prefix("OLD.")
+            .or_else(|| p.strip_prefix("old.")
+            .or_else(|| p.strip_prefix("Old.")))
+        {
+            let col = col.trim().trim_matches('"').to_ascii_uppercase();
+            if !ident_ok(&col) {
+                return None;
+            }
+            out.push(DynPart::Row(0, col));
         } else {
             let name = p.trim_start_matches(':').trim().trim_matches('"');
             let slot = vars.iter().position(|v| v.eq_ignore_ascii_case(name))?;
@@ -17691,11 +18164,33 @@ fn parse_trig_stmt(
                 _ => {}
             }
         }
-        exprs.push(parse_store_expr(body[seg..].trim(), vars)?);
-        if exprs.len() != cols.len() {
-            return None;
+        // THE LAST VALUE, and with it the decision: if every value fits
+        // the arithmetic grammar the statement is built from those
+        // (unchanged), and if any does not the VALUES TEXT is kept
+        // whole for the planner to read.
+        let last = parse_store_expr(body[seg..].trim(), vars);
+        let all_parsed = last.is_some() && exprs.len() + 1 == cols.len();
+        if all_parsed {
+            exprs.push(last?);
+            return Some(TrigStmt::Store { table, cols, exprs, raw: None, src_off: start });
         }
-        return Some(TrigStmt::Store { table, cols, exprs, src_off: start });
+        let mut binds: Vec<(String, u16)> = Vec::new();
+        for name in named_refs(body) {
+            let slot = vars.iter().position(|v| v.eq_ignore_ascii_case(&name))? as u16;
+            if !binds.iter().any(|(n, _)| n.eq_ignore_ascii_case(&name)) {
+                binds.push((name, slot));
+            }
+        }
+        if body.split(',').count() < cols.len() {
+            return None; // fewer values than columns, however they read
+        }
+        return Some(TrigStmt::Store {
+            table,
+            cols,
+            exprs: Vec::new(),
+            raw: Some((body.to_string(), binds)),
+            src_off: start,
+        });
     }
     // NEW.<col> = <expr>  or  <var> = <expr>
     if find_word(&up, "RETURN", 0) == Some(0) {
@@ -17920,7 +18415,10 @@ fn emit_trigger_stmt(
                 b.push(255); // end
             }
         }
-        TrigStmt::Store { table, cols, exprs, src_off } => {
+        // a RAW-values store never reaches here: a body carrying one
+        // cannot be compiled ([body_has_uninterpretable_blr]), so this
+        // emitter only ever sees the parsed form
+        TrigStmt::Store { table, cols, exprs, src_off, .. } => {
             dbg.push((*src_off, b.len()));
             let ctx = *next_ctx;
             *next_ctx += 1;
@@ -27622,6 +28120,60 @@ fn plan_publishing_triggers(plan: &Plan) -> bool {
     t.iter().any(|d| d.needs_db)
 }
 
+/// Does this statement fire DDL triggers, and for what?
+///
+/// `Ok(None)` is the common answer - not a DDL statement, or a file
+/// with no DDL trigger in it. `Err` is the honest one: a DDL statement
+/// whose event this server cannot NAME, in a file that has a DDL
+/// trigger, must refuse rather than run unwatched. A trigger that did
+/// not fire is a policy that did not run, and nothing would say so.
+fn ddl_firing_for(
+    plan: &Plan,
+    database: &Option<Database>,
+) -> Result<Option<(u32, String, &'static str)>, ExecErr> {
+    let Some(db) = database.as_ref() else { return Ok(None) };
+    if !db.has_ddl_triggers || IN_DB_TRIGGER.with(|f| f.get()) {
+        return Ok(None);
+    }
+    if matches!(
+        plan,
+        Plan::Insert { .. }
+            | Plan::Update { .. }
+            | Plan::Delete { .. }
+            | Plan::SetGenerator { .. }
+            | Plan::Returning { .. }
+    ) {
+        return Ok(None);
+    }
+    // a RECREATE is the drop and the create of ITS OWN kind; the event
+    // it fires for is the inner statement's
+    let inner = match plan {
+        Plan::Recreate(i) => i.as_ref(),
+        other => other,
+    };
+    match ddl_event_of(inner) {
+        Some(e) => Ok(Some(e)),
+        None if plan_is_ddl(inner) => Err(ExecErr::Text(
+            "this server cannot name the DDL event a trigger would fire for".into(),
+        )),
+        None => Ok(None),
+    }
+}
+
+/// Is this plan a DDL statement at all? The same test the executor makes
+/// when it decides whether the statement writes catalog rows.
+fn plan_is_ddl(plan: &Plan) -> bool {
+    !matches!(
+        plan,
+        Plan::Insert { .. }
+            | Plan::Update { .. }
+            | Plan::Delete { .. }
+            | Plan::SetGenerator { .. }
+            | Plan::Returning { .. }
+            | Plan::Scalar(..)
+    )
+}
+
 fn execute_dml_collecting(
     plan: &Plan,
     database: &mut Option<Database>,
@@ -27641,7 +28193,17 @@ fn execute_dml_collecting(
     // those rows carry, exactly as a row-by-row statement is.
     let mark = undo_window_push(
         database,
-        if plan_publishing_triggers(plan) { WindowKind::Nested } else { WindowKind::Statement },
+        // ...and so does a DDL statement whose triggers write: their
+        // rows are installed by statements of their own, which dropping
+        // a working copy cannot take back (measured: the audit row of a
+        // REFUSED `DROP VIEW` survived, where the engine has none)
+        if plan_publishing_triggers(plan)
+            || matches!(ddl_firing_for(plan, database), Ok(Some(_)))
+        {
+            WindowKind::Nested
+        } else {
+            WindowKind::Statement
+        },
     );
     // the temp blobs NOT yet materialised as this statement starts: the
     // ones it materialises are exactly those that flip
@@ -27649,7 +28211,39 @@ fn execute_dml_collecting(
         .as_ref()
         .map(|d| d.temp_blobs.iter().filter(|(_, tb)| tb.materialised.is_none()).map(|(k, _)| *k).collect())
         .unwrap_or_default();
-    let out = execute_dml_collecting_inner(plan, database, args, ctx, affected);
+    // DDL TRIGGERS fire AROUND the statement, inside its own undo
+    // window: a BEFORE body's raise stops the statement before it runs,
+    // and what an AFTER body writes goes back if the statement is
+    // undone. `sql_text` is what the client sent, which the body reads
+    // as `RDB$GET_CONTEXT('DDL_TRIGGER', 'SQL_TEXT')`.
+    let out = match ddl_firing_for(plan, database) {
+        Err(e) => Err(e),
+        Ok(None) => execute_dml_collecting_inner(plan, database, args, ctx, affected),
+        Ok(Some((event, object, verb))) => {
+            let ctxv =
+                || (verb.to_string(), object.clone(), CURRENT_SQL.with(|c| c.borrow().clone()));
+            let wrap = |e: ExecErr| match (e, ddl_verb_gds(event)) {
+                // the engine wraps EVERY DDL failure, its triggers' own
+                // raises included
+                (ExecErr::Eval(inner), Some(verb)) => ExecErr::Eval(EvalErr::DdlFailed {
+                    verb,
+                    object: quoted_qualified(&object),
+                    inner: Box::new(inner),
+                }),
+                (e, _) => e,
+            };
+            match fire_ddl_triggers(database, ctx, event, true, ctxv()) {
+                Err(e) => Err(wrap(e)),
+                Ok(()) => match execute_dml_collecting_inner(plan, database, args, ctx, affected) {
+                    Err(e) => Err(e),
+                    Ok(counts) => match fire_ddl_triggers(database, ctx, event, false, ctxv()) {
+                        Ok(()) => Ok(counts),
+                        Err(e) => Err(wrap(e)),
+                    },
+                },
+            }
+        }
+    };
     if out.is_err() {
         // the working copy that held the pages THIS statement
         // materialised is gone with it: a later store of the same temp
@@ -45004,6 +45598,15 @@ fn eval_status_items(w: &mut W, e: &EvalErr) {
                 .int(2) // isc_arg_string
                 .bytes(table.as_bytes());
         }
+        EvalErr::DdlFailed { verb, object, inner } => {
+            w.int(1) // isc_arg_gds
+                .int(GDS_NO_META_UPDATE)
+                .int(1)
+                .int(*verb)
+                .int(2) // isc_arg_string - the object, quoted and qualified
+                .bytes(object.as_bytes());
+            eval_status_items(w, inner);
+        }
         EvalErr::CheckViolation { constraint, table, trigger } => {
             w.int(1) // isc_arg_gds
                 .int(GDS_CHECK_CONSTRAINT)
@@ -52268,6 +52871,14 @@ enum EvalErr {
     /// `isc_stack_trace` "At trigger ..." item naming the check trigger
     /// that fired (omitted when the trigger name is unknown)
     CheckViolation { constraint: String, table: String, trigger: Option<String> },
+    /// A DDL STATEMENT THAT FAILED, wrapped the way the engine wraps
+    /// every one: `isc_no_meta_update`, then the verb's own
+    /// `<VERB> @1 failed` naming the object, then whatever actually went
+    /// wrong. A DDL trigger's raise arrives inside this - measured: a
+    /// `BEFORE DROP VIEW` body that raises answers `unsuccessful
+    /// metadata update / -DROP VIEW "PUBLIC"."VG" failed / -exception 1
+    /// ...`, where this server had been answering the exception alone.
+    DdlFailed { verb: i32, object: String, inner: Box<EvalErr> },
     /// a NON-SELECTABLE procedure (RDB$PROCEDURE_TYPE = 2) that HAS
     /// output parameters, used as a FROM item: `isc_invalid_blr` +
     /// `isc_illegal_prc_type` (SQLCODE -104, SQLSTATE 42000). NO
@@ -56299,6 +56910,22 @@ impl Expr {
                                 let c = c.borrow();
                                 let m = if ns == "USER_SESSION" { &c.0 } else { &c.1 };
                                 m.get(&name).map(|v| Value::Text(v.clone())).unwrap_or(Value::Null)
+                            }),
+                            // THE STATEMENT A DDL TRIGGER IS FIRING FOR.
+                            // Only inside such a body is it anything but
+                            // NULL, which is the engine's own answer
+                            // elsewhere.
+                            "DDL_TRIGGER" => DDL_CTX.with(|c| {
+                                let c = c.borrow();
+                                let Some((event, object, sql)) = c.as_ref() else {
+                                    return Value::Null;
+                                };
+                                match name.to_ascii_uppercase().as_str() {
+                                    "DDL_EVENT" => Value::Text(event.clone()),
+                                    "OBJECT_NAME" => Value::Text(object.clone()),
+                                    "SQL_TEXT" => Value::Text(sql.clone()),
+                                    _ => Value::Null,
+                                }
                             }),
                             "SYSTEM" => match name.to_ascii_uppercase().as_str() {
                                 "SEARCH_PATH" => Value::Text("\"PUBLIC\", \"SYSTEM\"".into()),
@@ -64467,6 +65094,17 @@ fn restore_ref_action(rule: &str) -> Result<fire_crab_ods::ddl::RefAction, Strin
 /// A value as the SQL literal that names it. Types this server cannot
 /// write as a literal refuse, so a DML statement is never built around
 /// an invented value.
+/// A frame value written into a statement's text.
+///
+/// A NEGATIVE number is PARENTHESISED: substituting one bare turns
+/// `'set to ' || NEW.A` into `'set to ' || -3`, where the leading minus
+/// reads as an operator rather than part of the value and the statement
+/// refuses. `(-3)` is the same value in every position.
+fn subst_literal(v: &Value) -> Option<String> {
+    let lit = psql_literal(v)?;
+    Some(if lit.starts_with('-') { format!("({})", lit) } else { lit })
+}
+
 /// Every `:name` in a statement's text, outside its string literals.
 fn named_refs(sql: &str) -> Vec<String> {
     let b = sql.as_bytes();
@@ -64531,7 +65169,7 @@ fn subst_body_query(sql: &str, binds: &[(String, u16)], f: &PsqlFrame) -> Option
             let name = &sql[start..j];
             match binds.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)) {
                 Some((_, slot)) => {
-                    out.push_str(&psql_literal(
+                    out.push_str(&subst_literal(
                         f.vars.get(*slot as usize).unwrap_or(&Value::Null),
                     )?);
                 }
@@ -64570,7 +65208,7 @@ fn subst_body_query(sql: &str, binds: &[(String, u16)], f: &PsqlFrame) -> Option
             }
             let name = &sql[start..j];
             let v = f.trig.as_ref().and_then(|t| t.read(ctx, name))?;
-            out.push_str(&psql_literal(&v)?);
+            out.push_str(&subst_literal(&v)?);
             i = j;
             continue;
         }
@@ -65240,20 +65878,31 @@ fn exec_psql_stmt_inner(
         // maintenance, column defaults, NOT NULL, CHECK constraints and
         // FK enforcement all apply, with no second write path to keep in
         // step.
-        TrigStmt::Store { table, cols, exprs, .. } => {
-            if cols.len() != exprs.len() {
-                return Err(PsqlStop::Unsupported);
-            }
-            let vals = exprs
-                .iter()
-                .map(|e| render_psql_expr(e, f))
-                .collect::<Option<Vec<_>>>()
-                .ok_or(PsqlStop::Unsupported)?;
+        TrigStmt::Store { table, cols, exprs, raw, .. } => {
+            let values = match raw {
+                // the values AS WRITTEN, with everything only the frame
+                // knows written into them - a concatenation, a function
+                // call, a CASE, all read by the ordinary planner
+                Some((text, binds)) => {
+                    subst_body_query(text, binds, f).ok_or(PsqlStop::Unsupported)?
+                }
+                None => {
+                    if cols.len() != exprs.len() {
+                        return Err(PsqlStop::Unsupported);
+                    }
+                    exprs
+                        .iter()
+                        .map(|e| render_psql_expr(e, f))
+                        .collect::<Option<Vec<_>>>()
+                        .ok_or(PsqlStop::Unsupported)?
+                        .join(", ")
+                }
+            };
             let sql = format!(
                 "INSERT INTO {} ({}) VALUES ({})",
                 table,
                 cols.join(", "),
-                vals.join(", ")
+                values
             );
             run_body_dml(&sql, db, ctx, DmlKind::Insert).map(|n| set_row_count(f, n))
         }
@@ -65619,15 +66268,31 @@ fn assign_into(f: &mut PsqlFrame, into: &[u16], row: Vec<Value>) -> Result<(), P
 /// to prepare exactly as it fails on `''` - so both arrive here as an
 /// empty string and raise the same vector.
 fn render_dyn_text(parts: &[DynPart], f: &PsqlFrame) -> Result<Option<String>, PsqlStop> {
+    // TRAILING BLANKS BELONG TO A VALUE AND NOT TO A STATEMENT. A CHAR
+    // variable holding a whole statement is padded to its declared
+    // width and that padding is no part of the SQL (probed: a CHAR(40)
+    // holding a SELECT runs) - but a CONCATENATION keeps every blank,
+    // because the padding is part of the operand: measured, `'[' || <a
+    // CHAR(6) holding 'ab'> || ']'` is `[ab    ]` on the engine, and a
+    // renderer that trimmed for both would answer `[ab]`.
+    let whole = parts.len() == 1;
+    let text_of = |t: &str| if whole { t.trim_end().to_string() } else { t.to_string() };
     let mut out = String::new();
     for p in parts {
         match p {
             DynPart::Lit(t) => out.push_str(t),
+            DynPart::Row(ctx, col) => {
+                match f.trig.as_ref().and_then(|t| t.read(*ctx, col)) {
+                    Some(Value::Text(t)) => out.push_str(&text_of(&t)),
+                    Some(Value::Int(v)) => out.push_str(&v.to_string()),
+                    Some(Value::Null) => return Ok(None),
+                    // no row at all (a database trigger), or a value
+                    // whose engine rendering has not been probed
+                    _ => return Err(PsqlStop::Unsupported),
+                }
+            }
             DynPart::Var(n) => match f.vars.get(*n as usize) {
-                // a CHAR variable arrives blank-padded and the padding is
-                // no part of the statement (probed: a CHAR(40) holding a
-                // SELECT runs)
-                Some(Value::Text(t)) => out.push_str(t.trim_end()),
+                Some(Value::Text(t)) => out.push_str(&text_of(t)),
                 Some(Value::Int(v)) => out.push_str(&v.to_string()),
                 // NULL || anything is NULL
                 Some(Value::Null) | None => return Ok(None),
@@ -71175,6 +71840,7 @@ fn after_auth(
                 if best >= 20 {
                     read_int(&mut s, &mut dec)?; // p_sqlst_flags
                 }
+                CURRENT_SQL.with(|c| *c.borrow_mut() = String::from_utf8_lossy(&sql).into_owned());
                 let text = entry_strip_comments(&String::from_utf8_lossy(&sql));
                 // kicked by a forced shutdown: the engine's vector, no work
                 if database.as_ref().is_some_and(|d| d.kicked()) {
@@ -71394,6 +72060,8 @@ fn after_auth(
                     read_int(&mut s, &mut dec)?; // p_sqlst_flags (FB6/proto 20+)
                 }
                 stmt_sql = entry_strip_comments(&String::from_utf8_lossy(&sql));
+                // ...and the text a DDL trigger reads as SQL_TEXT
+                CURRENT_SQL.with(|c| *c.borrow_mut() = String::from_utf8_lossy(&sql).into_owned());
                 if std::env::var("FC_SRV_TRACE").is_ok() {
                     eprintln!("[srv] prepare sql = {:?}", stmt_sql);
                 }
@@ -76180,6 +76848,7 @@ mod tests {
             lock_owner: 0,
             did_ddl: false,
             has_db_triggers: false,
+            has_ddl_triggers: false,
             ddl_deferred: Vec::new(),
             attachments: {
                 let g = std::sync::Arc::new(DbGate::default());
@@ -79261,6 +79930,7 @@ mod tests {
             lock_owner: 0,
             did_ddl: false,
             has_db_triggers: false,
+            has_ddl_triggers: false,
             ddl_deferred: Vec::new(),
             attachments: {
                 let g = std::sync::Arc::new(DbGate::default());
@@ -85657,6 +86327,7 @@ mod tests {
             lock_owner: 0,
             did_ddl: false,
             has_db_triggers: false,
+            has_ddl_triggers: false,
             ddl_deferred: Vec::new(),
             attachments: {
                 let g = std::sync::Arc::new(DbGate::default());
