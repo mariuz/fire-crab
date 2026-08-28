@@ -12505,6 +12505,11 @@ struct TrigDef {
     /// an AFTER trigger may: a BEFORE one must decide what gets stored,
     /// and by the time the database is free the row is already there.
     deferred: bool,
+    /// This body DRAWS a generator, so it fires in TWO PASSES - see
+    /// [PsqlFrame::gen]. The draw is a page write, and the statement
+    /// firing this trigger is holding the working copy of that page, so
+    /// the draw belongs to the caller.
+    draws: bool,
     /// where the body's `BEGIN` sits in the ORIGINAL `CREATE TRIGGER`
     /// text, as `RDB$DEBUG_INFO`'s first source entry records it.
     ///
@@ -12632,6 +12637,7 @@ fn user_triggers(db: &Database, table: &str, dml: &DmlGuard) -> Option<Vec<TrigD
             source,
             excs: Vec::new(),
             deferred: false,
+            draws: false,
             anchor: values
                 .get(dbg_f)
                 .and_then(|v| match v {
@@ -12666,6 +12672,20 @@ fn user_triggers(db: &Database, table: &str, dml: &DmlGuard) -> Option<Vec<TrigD
                 return None;
             }
             t.deferred = true;
+        }
+        // A GENERATOR DRAW is the one side effect a BEFORE body may
+        // have: it is a page write, so the CALLER performs it (it holds
+        // the working copy) and the body runs twice around it
+        // ([PsqlFrame::gen]). Only an otherwise-PURE body qualifies -
+        // one that also touches the database is deferred or refused
+        // above - and a body whose CONTROL FLOW would read a drawn
+        // value refuses, because the two passes could then take
+        // different branches.
+        if body_draws(&body) {
+            if t.deferred || body_draw_decides_flow(&body) {
+                return None;
+            }
+            t.draws = true;
         }
         // the exceptions the body names, resolved while a database is
         // still in reach
@@ -14688,6 +14708,9 @@ fn infer_int_rank(
         // the firing action is a plain number (1/2/3), the rank an
         // integer literal has - which is what lets `INSERTING` compare
         Expr::TriggerAction => Some(IntRank::Long),
+        // a generator is a BIGINT on the engine, whatever the column
+        // it lands in
+        Expr::GenId { .. } | Expr::GenId2 { .. } => Some(IntRank::Int64),
 
         Expr::Add(l, r) | Expr::Subtract(l, r) => {
             let (lr, rr) = (infer_int_rank(l, field_rank)?, infer_int_rank(r, field_rank)?);
@@ -15448,6 +15471,7 @@ fn numeric_col(
 
 /// An assignment target in a trigger body: a NEW-row column, or a
 /// DECLAREd local variable by slot.
+#[derive(Clone)]
 enum TrigTarget {
     Field(String),
     Var(u16),
@@ -15675,6 +15699,13 @@ fn expr_resolve_vars(
 ) -> fire_crab_ods::expr::Expr {
     use fire_crab_ods::expr::Expr;
     match e {
+        // a DRAW names a generator, not a column; its step may still
+        // hold one
+        Expr::GenId2 { name } => Expr::GenId2 { name: name.clone() },
+        Expr::GenId { name, step } => Expr::GenId {
+            name: name.clone(),
+            step: Box::new(expr_resolve_vars(step, vars)),
+        },
         Expr::Field { context, name } if *context == CTX_PLAIN => {
             match vars.iter().position(|v| v == name) {
                 Some(i) => Expr::Variable(i as u16),
@@ -15801,6 +15832,13 @@ fn cond_resolve_marked(
 fn expr_plain_ctx(e: &fire_crab_ods::expr::Expr, ctx: u8) -> fire_crab_ods::expr::Expr {
     use fire_crab_ods::expr::Expr;
     match e {
+        // a DRAW names a generator, not a column; its step may still
+        // hold one
+        Expr::GenId2 { name } => Expr::GenId2 { name: name.clone() },
+        Expr::GenId { name, step } => Expr::GenId {
+            name: name.clone(),
+            step: Box::new(expr_plain_ctx(step, ctx)),
+        },
         Expr::Field { context, name } if *context == CTX_PLAIN => {
             Expr::Field { context: ctx, name: name.clone() }
         }
@@ -15859,6 +15897,13 @@ fn expr_resolve_marked(
 ) -> fire_crab_ods::expr::Expr {
     use fire_crab_ods::expr::Expr;
     match e {
+        // a DRAW names a generator, not a column; its step may still
+        // hold one
+        Expr::GenId2 { name } => Expr::GenId2 { name: name.clone() },
+        Expr::GenId { name, step } => Expr::GenId {
+            name: name.clone(),
+            step: Box::new(expr_resolve_marked(step, vars, marked)),
+        },
         Expr::Field { context, name } if *context == CTX_PLAIN && marked.contains(name) => {
             match vars.iter().position(|v| v == name) {
                 Some(i) => Expr::Variable(i as u16),
@@ -16146,6 +16191,10 @@ fn expr_has_text(e: &fire_crab_ods::expr::Expr) -> bool {
     use fire_crab_ods::expr::Expr;
     match e {
         Expr::TextLiteral(_) => true,
+        // a generator NAME rides the verb as counted bytes, not as a
+        // text literal - the BLR for a draw is probed and storable
+        Expr::GenId2 { .. } => false,
+        Expr::GenId { step, .. } => expr_has_text(step),
         Expr::Field { .. }
         | Expr::Variable(_)
         | Expr::IntLiteral(_)
@@ -16160,6 +16209,143 @@ fn expr_has_text(e: &fire_crab_ods::expr::Expr) -> bool {
 }
 
 /// [expr_has_text] over a whole condition.
+/// Does this expression DRAW a generator?
+fn expr_draws(e: &fire_crab_ods::expr::Expr) -> bool {
+    use fire_crab_ods::expr::Expr;
+    match e {
+        Expr::GenId { .. } | Expr::GenId2 { .. } => true,
+        Expr::Add(l, r) | Expr::Subtract(l, r) | Expr::Multiply(l, r) | Expr::Divide(l, r) => {
+            expr_draws(l) || expr_draws(r)
+        }
+        _ => false,
+    }
+}
+
+fn cond_draws(c: &fire_crab_ods::expr::Cond) -> bool {
+    use fire_crab_ods::expr::Cond;
+    match c {
+        Cond::Cmp(_, l, r) => expr_draws(l) || expr_draws(r),
+        Cond::And(a, b) | Cond::Or(a, b) => cond_draws(a) || cond_draws(b),
+        Cond::Not(i) => cond_draws(i),
+        Cond::Missing(e) | Cond::NotMissing(e) => expr_draws(e),
+    }
+}
+
+/// Does this body's CONTROL FLOW depend on a value a draw produced?
+///
+/// The two-pass firing ([PsqlFrame::gen]) is sound only while the
+/// SECOND pass takes the same branches as the first. Pass one answers 0
+/// for every draw and runs over a COPY of the row, so pass two starts
+/// from the same state and branches identically - UNLESS a condition
+/// reads a value a draw produced EARLIER IN THE SAME RUN. That is what
+/// this looks for, in statement order:
+///
+///   * a draw inside a condition (its value decides the branch
+///     directly);
+///   * a condition that reads a target some EARLIER statement assigned
+///     a draw to;
+///   * a loop whose condition reads a target its own BODY assigns a
+///     draw to - the next iteration's test sees the previous one's
+///     value.
+///
+/// The classic trigger passes: `IF (NEW.ID IS NULL) THEN NEW.ID =
+/// GEN_ID(G, 1)` reads NEW.ID BEFORE anything assigns it, so both
+/// passes take the same branch.
+fn body_draw_decides_flow(st: &TrigStmt) -> bool {
+    fn reads(e: &fire_crab_ods::expr::Expr, t: &[TrigTarget]) -> bool {
+        use fire_crab_ods::expr::Expr;
+        match e {
+            Expr::Field { name, .. } => {
+                t.iter().any(|x| matches!(x, TrigTarget::Field(f) if f == name))
+            }
+            Expr::Variable(n) => t.iter().any(|x| matches!(x, TrigTarget::Var(v) if v == n)),
+            Expr::Add(l, r)
+            | Expr::Subtract(l, r)
+            | Expr::Multiply(l, r)
+            | Expr::Divide(l, r) => reads(l, t) || reads(r, t),
+            Expr::GenId { step, .. } => reads(step, t),
+            _ => false,
+        }
+    }
+    fn cond_reads(c: &fire_crab_ods::expr::Cond, t: &[TrigTarget]) -> bool {
+        use fire_crab_ods::expr::Cond;
+        match c {
+            Cond::Cmp(_, l, r) => reads(l, t) || reads(r, t),
+            Cond::And(a, b) | Cond::Or(a, b) => cond_reads(a, t) || cond_reads(b, t),
+            Cond::Not(i) => cond_reads(i, t),
+            Cond::Missing(e) | Cond::NotMissing(e) => reads(e, t),
+        }
+    }
+    // `seen` is what a draw has assigned to SO FAR, in statement order
+    fn walk(st: &TrigStmt, seen: &mut Vec<TrigTarget>) -> bool {
+        match st {
+            TrigStmt::Assign { target, expr, .. } => {
+                if expr_draws(expr) {
+                    seen.push(target.clone());
+                }
+                false
+            }
+            TrigStmt::If { cond, then, otherwise, .. } => {
+                if cond_draws(cond) || cond_reads(cond, seen) {
+                    return true;
+                }
+                let mut a = seen.clone();
+                let mut b = seen.clone();
+                let bad = walk(then, &mut a)
+                    || otherwise.as_ref().is_some_and(|e| walk(e, &mut b));
+                // either branch may have run: both sets are possible
+                seen.extend(a.into_iter().skip(seen.len()));
+                seen.extend(b.into_iter().skip(seen.len()));
+                bad
+            }
+            TrigStmt::While { cond, body, .. } => {
+                if cond_draws(cond) || cond_reads(cond, seen) {
+                    return true;
+                }
+                let mut inner = seen.clone();
+                let bad = walk(body, &mut inner);
+                // the NEXT iteration's test sees what the body assigned
+                if cond_reads(cond, &inner) {
+                    return true;
+                }
+                seen.extend(inner.into_iter().skip(seen.len()));
+                bad
+            }
+            TrigStmt::Block { stmts, handlers, .. } => {
+                for s in stmts {
+                    if walk(s, seen) {
+                        return true;
+                    }
+                }
+                handlers.iter().any(|(_, h)| {
+                    let mut hs = seen.clone();
+                    walk(h, &mut hs)
+                })
+            }
+            _ => false,
+        }
+    }
+    let mut seen = Vec::new();
+    walk(st, &mut seen)
+}
+
+/// Does this body draw a generator anywhere?
+fn body_draws(st: &TrigStmt) -> bool {
+    match st {
+        TrigStmt::Assign { expr, .. } => expr_draws(expr),
+        TrigStmt::If { cond, then, otherwise, .. } => {
+            cond_draws(cond)
+                || body_draws(then)
+                || otherwise.as_ref().is_some_and(|e| body_draws(e))
+        }
+        TrigStmt::While { cond, body, .. } => cond_draws(cond) || body_draws(body),
+        TrigStmt::Block { stmts, handlers, .. } => {
+            stmts.iter().any(body_draws) || handlers.iter().any(|(_, h)| body_draws(h))
+        }
+        _ => false,
+    }
+}
+
 fn cond_has_text(c: &fire_crab_ods::expr::Cond) -> bool {
     use fire_crab_ods::expr::Cond;
     match c {
@@ -18072,6 +18258,8 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
         use fire_crab_ods::expr::Expr;
         match e {
             Expr::Field { context, name } => out.push((*context, name.clone())),
+            Expr::GenId { step, .. } => expr_fields(step, out),
+            Expr::GenId2 { .. } => {}
             Expr::Variable(_)
             | Expr::IntLiteral(_)
             | Expr::Int64Literal(_)
@@ -20146,6 +20334,8 @@ enum ETok {
     /// `.` - only NEW.<col> / OLD.<col> qualified references (trigger
     /// bodies) accept it
     Dot,
+    /// `,` - only `GEN_ID(<name>, <step>)` accepts it
+    Comma,
 }
 
 /// The parse-time context of an UNQUALIFIED field reference. The caller
@@ -20195,6 +20385,7 @@ fn tokenize_expr(s: &str) -> Option<Vec<ETok>> {
                 i += adv;
             }
             b'.' => out.push(ETok::Dot),
+            b',' => out.push(ETok::Comma),
             b'0'..=b'9' => {
                 let st = i;
                 while i < b.len() && b[i].is_ascii_digit() {
@@ -20379,6 +20570,11 @@ fn expr_with_context(e: &fire_crab_ods::expr::Expr, context: u8) -> fire_crab_od
     use fire_crab_ods::expr::Expr;
     match e {
         Expr::Field { name, .. } => Expr::Field { context, name: name.clone() },
+        Expr::GenId { name, step } => Expr::GenId {
+            name: name.clone(),
+            step: Box::new(expr_with_context(step, context)),
+        },
+        Expr::GenId2 { name } => Expr::GenId2 { name: name.clone() },
         Expr::Variable(n) => Expr::Variable(*n),
         Expr::IntLiteral(v) => Expr::IntLiteral(*v),
         Expr::TextLiteral(t) => Expr::TextLiteral(t.clone()),
@@ -20434,6 +20630,9 @@ fn expr_all_plain(e: &fire_crab_ods::expr::Expr) -> bool {
     use fire_crab_ods::expr::Expr;
     match e {
         Expr::Field { context, .. } => *context == CTX_PLAIN,
+        // a draw belongs to a trigger BODY - a computed column or a
+        // CHECK carrying one is refused before it reaches here
+        Expr::GenId { .. } | Expr::GenId2 { .. } => false,
         Expr::Variable(_) => false, // only a trigger body has variables
         Expr::DomainValue => false, // checked before the VALUE rewrite - never here
         Expr::TriggerAction => false, // checked before the VALUE rewrite - never here
@@ -20575,6 +20774,37 @@ fn blr_expr_factor(t: &[ETok], p: &mut usize) -> Option<fire_crab_ods::expr::Exp
         ETok::Id(name) if name == "NULL" => {
             *p += 1;
             Some(Expr::NullLiteral)
+        }
+        // `GEN_ID(<generator>, <step>)` - a counted name and a step
+        // expression ([expr::Expr::GenId])
+        ETok::Id(name) if name == "GEN_ID" && matches!(t.get(*p + 1), Some(ETok::LParen)) => {
+            *p += 2;
+            let ETok::Id(gen) = t.get(*p)? else { return None };
+            let gen = gen.clone();
+            *p += 1;
+            if !matches!(t.get(*p)?, ETok::Comma) {
+                return None;
+            }
+            *p += 1;
+            let step = blr_expr_add(t, p)?;
+            if !matches!(t.get(*p)?, ETok::RParen) {
+                return None;
+            }
+            *p += 1;
+            Some(Expr::GenId { name: gen, step: Box::new(step) })
+        }
+        // `NEXT VALUE FOR <generator>` - a DIFFERENT verb, the name
+        // alone ([expr::Expr::GenId2]), not sugar for GEN_ID(g, 1)
+        ETok::Id(name)
+            if name == "NEXT"
+                && matches!(t.get(*p + 1), Some(ETok::Id(v)) if v == "VALUE")
+                && matches!(t.get(*p + 2), Some(ETok::Id(f)) if f == "FOR") =>
+        {
+            *p += 3;
+            let ETok::Id(gen) = t.get(*p)? else { return None };
+            let gen = gen.clone();
+            *p += 1;
+            Some(Expr::GenId2 { name: gen })
         }
         ETok::Id(name) => {
             let name = name.clone();
@@ -20809,6 +21039,9 @@ fn expr_value_to_fid(e: &fire_crab_ods::expr::Expr) -> Option<fire_crab_ods::exp
     use fire_crab_ods::expr::Expr;
     Some(match e {
         Expr::Field { name, .. } if name.eq_ignore_ascii_case("VALUE") => Expr::DomainValue,
+        // a DOMAIN's CHECK draws no generator (the engine refuses one
+        // there too - a CHECK must be deterministic)
+        Expr::GenId { .. } | Expr::GenId2 { .. } => return None,
         // a DOMAIN's CHECK has no trigger firing it, and no variables
         Expr::Field { .. }
         | Expr::Variable(_)
@@ -26568,6 +26801,7 @@ fn fire_deferred_triggers(
                     writable: false,
                     action,
                 }),
+                gen: Default::default(),
             };
             let mut steps = 0u32;
             match exec_psql_stmt(&body, &mut frame, &mut steps, database, ctx) {
@@ -27547,7 +27781,31 @@ fn execute_dml_collecting_inner(
                 // NO DATABASE: a runnable trigger body reads and writes
                 // only the row ([trig_body_pure]), and this statement is
                 // already holding the working copy of the file
-                fire_triggers(&mut None, ctx, trig_cols, triggers, true, 1, Some(&mut row), None)?;
+                // THE DRAWER: a BEFORE body's generator draw lands in the
+                // same working copy this statement is building, through
+                // the same path the statement's own `NEXT VALUE FOR`
+                // columns take ([gen_bump_through_cache])
+                let mut drew: Result<(), ExecErr> = Ok(());
+                {
+                    let mut drawer = |name: &str, step: Option<i64>| -> Result<i64, ExecErr> {
+                        let (id, incr) = generator_info(db, name)
+                            .ok_or_else(|| ExecErr::Text("no such generator".into()))?;
+                        gen_bump_through_cache(db, &mut work, name, id, step.unwrap_or(incr))
+                            .map_err(ExecErr::Text)
+                    };
+                    drew = fire_triggers(
+                        &mut None,
+                        ctx,
+                        trig_cols,
+                        triggers,
+                        true,
+                        1,
+                        Some(&mut row),
+                        None,
+                        Some(&mut drawer),
+                    );
+                }
+                drew?;
                 apply_row_changes(&mut image, descs, &before_row, &row)?;
             }
             // CHECK constraints FIRST - the engine's PRE-STORE check
@@ -27620,7 +27878,16 @@ fn execute_dml_collecting_inner(
                 // OLD context at all - and `fire_triggers` makes it
                 // read-only for an AFTER trigger
                 let mut row = decode_record(image, descs);
-                fire_triggers(&mut None, ctx, trig_cols, triggers, false, 1, Some(&mut row), None)?;
+                let mut drawer = |name: &str, step: Option<i64>| -> Result<i64, ExecErr> {
+                    let (id, incr) = generator_info(db, name)
+                        .ok_or_else(|| ExecErr::Text("no such generator".into()))?;
+                    gen_bump_through_cache(db, &mut work, name, id, step.unwrap_or(incr))
+                        .map_err(ExecErr::Text)
+                };
+                fire_triggers(
+                    &mut None, ctx, trig_cols, triggers, false, 1, Some(&mut row), None,
+                    Some(&mut drawer),
+                )?;
             }
             (1, 0, 0)
         }
@@ -27984,6 +28251,12 @@ fn execute_dml_collecting_inner(
                     let old_row = decode_record(&image, descs);
                     let before_row = decode_record(&img, descs);
                     let mut new_row = before_row.clone();
+                    let mut drawer = |name: &str, step: Option<i64>| -> Result<i64, ExecErr> {
+                        let (id, incr) = generator_info(db, name)
+                            .ok_or_else(|| ExecErr::Text("no such generator".into()))?;
+                        gen_bump_through_cache(db, &mut work, name, id, step.unwrap_or(incr))
+                            .map_err(ExecErr::Text)
+                    };
                     fire_triggers(
                         &mut None,
                         ctx,
@@ -27993,6 +28266,7 @@ fn execute_dml_collecting_inner(
                         2,
                         Some(&mut new_row),
                         Some(&old_row),
+                        Some(&mut drawer),
                     )?;
                     apply_row_changes(&mut img, descs, &before_row, &new_row)?;
                 }
@@ -28099,15 +28373,15 @@ fn execute_dml_collecting_inner(
                 for ((_, _, new_img), old_img) in targets.iter().zip(&old_images) {
                     let mut new_row = decode_record(new_img, descs);
                     let old_row = decode_record(old_img, descs);
+                    let mut drawer = |name: &str, step: Option<i64>| -> Result<i64, ExecErr> {
+                        let (id, incr) = generator_info(db, name)
+                            .ok_or_else(|| ExecErr::Text("no such generator".into()))?;
+                        gen_bump_through_cache(db, &mut work, name, id, step.unwrap_or(incr))
+                            .map_err(ExecErr::Text)
+                    };
                     fire_triggers(
-                        &mut None,
-                        ctx,
-                        trig_cols,
-                        triggers,
-                        false,
-                        2,
-                        Some(&mut new_row),
-                        Some(&old_row),
+                        &mut None, ctx, trig_cols, triggers, false, 2, Some(&mut new_row),
+                        Some(&old_row), Some(&mut drawer),
                     )?;
                 }
             }
@@ -28167,7 +28441,23 @@ fn execute_dml_collecting_inner(
                         .map(|(_, d)| d)
                         .ok_or("no format for a matching record")?;
                     let old_row = decode_record(&image, descs);
-                    fire_triggers(&mut None, ctx, trig_cols, triggers, true, 3, None, Some(&old_row))?;
+                    let mut drawer = |name: &str, step: Option<i64>| -> Result<i64, ExecErr> {
+                        let (id, incr) = generator_info(db, name)
+                            .ok_or_else(|| ExecErr::Text("no such generator".into()))?;
+                        gen_bump_through_cache(db, &mut work, name, id, step.unwrap_or(incr))
+                            .map_err(ExecErr::Text)
+                    };
+                    fire_triggers(
+                        &mut None,
+                        ctx,
+                        trig_cols,
+                        triggers,
+                        true,
+                        3,
+                        None,
+                        Some(&old_row),
+                        Some(&mut drawer),
+                    )?;
                 }
                 // NO ACTION partner check, per deleted row: its key
                 // must not be referenced by any child (the row's own
@@ -28216,7 +28506,16 @@ fn execute_dml_collecting_inner(
                 &mut work, db.page_size, *rel, &targets, dml_tx(stmt_tx)?,
             )?;
             for row in &after_rows {
-                fire_triggers(&mut None, ctx, trig_cols, triggers, false, 3, None, Some(row))?;
+                let mut drawer = |name: &str, step: Option<i64>| -> Result<i64, ExecErr> {
+                    let (id, incr) = generator_info(db, name)
+                        .ok_or_else(|| ExecErr::Text("no such generator".into()))?;
+                    gen_bump_through_cache(db, &mut work, name, id, step.unwrap_or(incr))
+                        .map_err(ExecErr::Text)
+                };
+                    fire_triggers(
+                    &mut None, ctx, trig_cols, triggers, false, 3, None, Some(row),
+                    Some(&mut drawer),
+                )?;
             }
             (0, 0, out.affected as i32)
         }
@@ -61396,6 +61695,30 @@ fn first_debug_position(blob: &[u8]) -> Option<(usize, usize)> {
 
 /// The interpreter's variable frame: one slot per parameter, in the
 /// order the body's parser numbered them (inputs then outputs).
+/// The two-pass generator sink of a body - see [PsqlFrame::gen].
+#[derive(Default)]
+struct GenDraws {
+    mode: GenMode,
+    /// pass one's record: (generator, explicit step), in execution
+    /// order. `None` is `NEXT VALUE FOR`, which advances by the
+    /// SEQUENCE'S OWN increment - the same `step.unwrap_or(incr)` rule
+    /// the DML draw path follows.
+    recorded: Vec<(String, Option<i64>)>,
+    /// pass two's values, drawn by the caller from `recorded`
+    values: Vec<i64>,
+    next: usize,
+}
+
+#[derive(Default, PartialEq, Clone, Copy)]
+enum GenMode {
+    /// no caller can perform a draw here (a procedure, an EXECUTE
+    /// BLOCK): a body that draws refuses, as it always did
+    #[default]
+    Refuse,
+    Record,
+    Replay,
+}
+
 struct PsqlFrame {
     vars: Vec<Value>,
     /// where the output parameters start in `vars` (inputs come first)
@@ -61417,9 +61740,44 @@ struct PsqlFrame {
     /// A TRIGGER's row contexts - `None` in a procedure or an EXECUTE
     /// BLOCK, where `NEW.`/`OLD.` name nothing.
     trig: Option<TrigCtx>,
+    /// The GENERATOR DRAWS this body makes, in execution order.
+    ///
+    /// A draw is a SIDE EFFECT on a page, and this interpreter runs
+    /// inside a statement that is holding the working copy of the file -
+    /// so the draw belongs to the CALLER, which has that copy. The body
+    /// therefore runs TWICE: pass one RECORDS what it would draw (every
+    /// draw answering 0), the caller performs exactly those draws, and
+    /// pass two REPLAYS the values in the same order. Two passes are
+    /// sound because a body is otherwise pure, is re-run from the same
+    /// starting row, and may not let a drawn VALUE decide control flow
+    /// ([body_draw_decides_flow] refuses that at prepare) - so the
+    /// second pass makes the same draws in the same order, and a body
+    /// that raises AFTER drawing still consumes what the engine
+    /// consumes.
+    gen: std::cell::RefCell<GenDraws>,
     /// the exceptions a TRIGGER body may raise, resolved at prepare
     /// ([TrigDef::excs]) - a trigger runs with no database in reach
     trig_excs: Vec<(String, i64, String)>,
+}
+
+impl PsqlFrame {
+    /// One generator draw, in whichever pass this frame is running -
+    /// see [PsqlFrame::gen].
+    fn gen_draw(&self, name: &str, step: Option<i64>) -> Result<Value, PsqlStop> {
+        let mut g = self.gen.borrow_mut();
+        match g.mode {
+            GenMode::Refuse => Err(PsqlStop::Unsupported),
+            GenMode::Record => {
+                g.recorded.push((name.to_string(), step));
+                Ok(Value::Int(0))
+            }
+            GenMode::Replay => {
+                let v = *g.values.get(g.next).ok_or(PsqlStop::Unsupported)?;
+                g.next += 1;
+                Ok(Value::Int(v))
+            }
+        }
+    }
 }
 
 /// The `NEW.` and `OLD.` rows a trigger body reads, and writes in a
@@ -61432,6 +61790,7 @@ struct PsqlFrame {
 /// trigger - assigning `NEW.<col>` there is how a trigger changes what
 /// gets stored, and the engine refuses the same assignment in an AFTER
 /// one (the row is already written).
+#[derive(Clone)]
 struct TrigCtx {
     cols: Vec<RelationColumn>,
     old: Option<Vec<Value>>,
@@ -61636,6 +61995,20 @@ fn eval_psql_expr(e: &fire_crab_ods::expr::Expr, f: &PsqlFrame) -> Result<Value,
         E::Int64Literal(v) => Ok(Value::Int(*v)),
         E::TextLiteral(t) => Ok(Value::Text(t.clone())),
         E::NullLiteral => Ok(Value::Null),
+        // A GENERATOR DRAW IS A SIDE EFFECT, and this interpreter runs
+        // inside a statement that is holding the working copy of the
+        // file - so the draw itself belongs to the CALLER, which has it.
+        // [GenDraws] carries the two passes: the first records what the
+        // body would draw, the caller draws them, the second replays the
+        // values in the same order.
+        E::GenId { name, step } => {
+            let step = match eval_psql_expr(step, f)? {
+                Value::Int(n) => n,
+                _ => return Err(PsqlStop::Unsupported),
+            };
+            f.gen_draw(name, Some(step))
+        }
+        E::GenId2 { name } => f.gen_draw(name, None),
         E::Variable(n) => Ok(f.vars.get(*n as usize).cloned().unwrap_or(Value::Null)),
         // `NEW.<col>` / `OLD.<col>` inside a TRIGGER body read that
         // event's row; anywhere else (a procedure, an EXECUTE BLOCK)
@@ -63217,6 +63590,9 @@ fn render_psql_expr(e: &fire_crab_ods::expr::Expr, f: &PsqlFrame) -> Option<Stri
     }
     Some(match e {
         E::IntLiteral(v) => v.to_string(),
+        // a DRAW has no literal form: it is a side effect, and rendering
+        // it into a statement's text would draw twice
+        E::GenId { .. } | E::GenId2 { .. } => return None,
         // re-quoted the way the lexer unquoted it
         E::TextLiteral(t) => format!("'{}'", t.replace('\'', "''")),
         E::Int64Literal(v) => v.to_string(),
@@ -65433,6 +65809,11 @@ fn fire_triggers(
     action: u8,
     new: Option<&mut Vec<Value>>,
     old: Option<&Vec<Value>>,
+    // performs one generator draw for a body that makes them - the
+    // caller holds the working copy of the page ([PsqlFrame::gen]).
+    // `None` where no caller can (a path with no work image in reach):
+    // a drawing body then refuses, as it did before.
+    mut draw: Option<&mut dyn FnMut(&str, Option<i64>) -> Result<i64, ExecErr>>,
 ) -> Result<(), ExecErr> {
     if !defs.iter().any(|d| d.before == before && !d.deferred) {
         return Ok(());
@@ -65458,8 +65839,47 @@ fn fire_triggers(
                 writable: before,
                 action,
             }),
+            gen: Default::default(),
         };
         let mut steps = 0u32;
+        // PASS ONE, for a body that draws: the same body over a COPY of
+        // the row, every draw answering 0 and recording itself. Its
+        // outcome is discarded - including a RAISE, which pass two makes
+        // again at the same point - but the draws it recorded are
+        // performed, exactly as the engine consumes a generator before
+        // raising.
+        if d.draws {
+            let Some(drawer) = draw.as_deref_mut() else {
+                return Err(ExecErr::Text(format!(
+                    "trigger {} draws a generator where this statement cannot",
+                    d.name
+                )));
+            };
+            let mut scout = PsqlFrame {
+                vars: vec![Value::Null; names.len()],
+                out_at: names.len(),
+                out_len: 0,
+                suspended: Vec::new(),
+                caught: None,
+                cursors: std::collections::HashMap::new(),
+                row_count_slot: None,
+                trig_excs: d.excs.clone(),
+                trig: frame.trig.clone(),
+                gen: std::cell::RefCell::new(GenDraws {
+                    mode: GenMode::Record,
+                    ..Default::default()
+                }),
+            };
+            let mut scout_steps = 0u32;
+            let _ = exec_psql_stmt(&body, &mut scout, &mut scout_steps, database, ctx);
+            let recorded = std::mem::take(&mut scout.gen.borrow_mut().recorded);
+            let mut values = Vec::with_capacity(recorded.len());
+            for (name, step) in &recorded {
+                values.push(drawer(name, *step)?);
+            }
+            *frame.gen.borrow_mut() =
+                GenDraws { mode: GenMode::Replay, values, ..Default::default() };
+        }
         let r = exec_psql_stmt(&body, &mut frame, &mut steps, database, ctx);
         // whatever the body did to NEW is what the next trigger sees and
         // what the write stores
@@ -65625,6 +66045,7 @@ fn run_body_source(
         cursors: cursor_states,
         row_count_slot,
         trig: None,
+        gen: Default::default(),
         trig_excs: Vec::new(),
     };
     let bound = bind_proc_args(name, meta, args)?;
@@ -81072,6 +81493,7 @@ mod tests {
                 cursors: std::collections::HashMap::new(),
                 row_count_slot: None,
                 trig: None,
+                gen: Default::default(),
                 trig_excs: Vec::new(),
             };
             render_dyn_text(parts, &f).ok().expect("the text renders")

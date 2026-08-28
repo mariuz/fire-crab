@@ -1138,6 +1138,57 @@ canonicalises both sides under an ICU collation and refuses a collation
 with no canonical form here, and `SIMILAR TO` refuses a collated
 operand as it does in a `WHERE`.
 
+**A BEFORE TRIGGER THAT DRAWS A GENERATOR — DONE 2026-08-28
+(`serve-real-triggen` 15, new).** The classic Firebird auto-increment
+(`IF (NEW.ID IS NULL) THEN NEW.ID = GEN_ID(G, 1)`) refused at CREATE
+TRIGGER, and a table carrying such a trigger then refused every INSERT.
+Both halves are done.
+
+THE BLR: `ods::expr::Expr` gained `GenId { name, step }` and
+`GenId2 { name }`, emitting `blr_gen_id` (a COUNTED name then the step
+as an ordinary expression) and `blr_gen_id2` (the counted name ALONE).
+`NEXT VALUE FOR` is a DIFFERENT VERB, not sugar for `GEN_ID(g, 1)`
+(probed both ways), and it advances by the SEQUENCE'S OWN increment -
+the `step.unwrap_or(incr)` rule the DML draw path already followed. The
+engine reads back what this server writes, byte for byte.
+
+THE RUN, and the reason it needed a design at all: a draw is a PAGE
+WRITE, and a trigger fires inside a statement that is already holding
+the working copy of that page - the comment at [trig_body_pure] has said
+so since the trigger chunk. So the draw belongs to the CALLER, and the
+body runs TWICE around it ([PsqlFrame::gen]): pass one RECORDS what it
+would draw (every draw answering 0, over a COPY of the row), the caller
+performs exactly those draws through the same `gen_bump_through_cache`
+the statement's own `NEXT VALUE FOR` columns take, and pass two REPLAYS
+the values in order. All six firing sites carry a drawer now.
+
+Two passes are sound because a runnable body is otherwise PURE and both
+start from the same row - and the design was chosen for the two cases
+that decide it:
+
+* a CONDITIONAL draw consumes nothing when its branch is skipped (an
+  INSERT that supplies its own ID leaves the generator alone - measured
+  against the engine, and the case a "pre-draw the values" design gets
+  WRONG);
+* a body that RAISES after drawing still consumes the value, because
+  pass one's recorded draws are performed even though its outcome is
+  discarded. The generator is not transactional, and that is what the
+  engine does.
+
+REFUSED, at prepare: a body whose CONTROL FLOW would read a value a draw
+produced ([body_draw_decides_flow]), since pass one answers 0 for every
+draw and the two passes could then take different branches. The check is
+ORDER-AWARE - the classic trigger reads `NEW.ID` BEFORE anything assigns
+it and passes, while `NEW.ID = GEN_ID(G,1); IF (NEW.ID > 100) ...`
+refuses, and so does a loop whose condition reads what its own body
+draws. Also refused: a draw in a DEFERRED (database-touching) body, and
+a draw in a computed column or a CHECK.
+
+GATE LESSON worth keeping: the ENGINE side of a `refuses` check RUNS the
+statement, and **a generator draw is not transactional** - so a refused
+trigger must not share a sequence with anything the gate compares, or
+the two files drift by one and every later check DIFFs.
+
 TWO CLEANUPS the ICU chunks recorded, done here: `stamp` and
 `order_key_ttype` were the same rule written twice (unified — the
 shared one also handles the negative-sentinel sub_type the other read

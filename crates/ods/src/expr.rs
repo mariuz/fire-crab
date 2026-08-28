@@ -35,6 +35,10 @@ const BLR_AND: u8 = 58;
 const BLR_VARIABLE: u8 = 26;
 /// `blr_internal_info` (blr.h:325) - the engine's "ask the runtime" node
 const BLR_INTERNAL_INFO: u8 = 177;
+/// `GEN_ID(name, step)`: counted name, then the step expression
+const BLR_GEN_ID: u8 = 101;
+/// `NEXT VALUE FOR name`: the counted name alone
+const BLR_GEN_ID2: u8 = 210;
 /// `INFO_TYPE_TRIGGER_ACTION` (constants.h:320) - which DML action is
 /// firing the trigger this body belongs to
 const INFO_TYPE_TRIGGER_ACTION: i32 = 6;
@@ -88,6 +92,15 @@ pub enum Expr {
     /// INTERNAL INFO half of that comparison and the literal beside it
     /// says which action the body asked about.
     TriggerAction,
+    /// `GEN_ID(<name>, <step>)` - `blr_gen_id`, a COUNTED name, then
+    /// the step as an ordinary expression. The engine's own dump of
+    /// `NEW.ID = GEN_ID(G, 1)`:
+    /// `blr_gen_id, 1, 'G', blr_literal, blr_long, 0, 1,0,0,0`.
+    GenId { name: String, step: Box<Expr> },
+    /// `NEXT VALUE FOR <name>` - `blr_gen_id2`, the counted name ALONE.
+    /// A separate verb, not sugar for `GEN_ID(name, 1)`: the engine
+    /// emits `blr_gen_id2, 1, 'G'` and nothing else (probed).
+    GenId2 { name: String },
 }
 
 impl Expr {
@@ -147,6 +160,17 @@ impl Expr {
                 out.push(BLR_INTERNAL_INFO);
                 Expr::IntLiteral(INFO_TYPE_TRIGGER_ACTION).emit(out);
             }
+            Expr::GenId { name, step } => {
+                out.push(BLR_GEN_ID);
+                out.push(name.len() as u8);
+                out.extend_from_slice(name.as_bytes());
+                step.emit(out);
+            }
+            Expr::GenId2 { name } => {
+                out.push(BLR_GEN_ID2);
+                out.push(name.len() as u8);
+                out.extend_from_slice(name.as_bytes());
+            }
         }
     }
 
@@ -188,7 +212,10 @@ impl Expr {
             | Expr::DomainValue
             // it names no column - it asks the runtime which action
             // is firing
-            | Expr::TriggerAction => {}
+            | Expr::TriggerAction
+            // a draw names a GENERATOR, not a column
+            | Expr::GenId2 { .. } => {}
+            Expr::GenId { step, .. } => step.collect_refs(refs),
             Expr::Add(l, r)
             | Expr::Subtract(l, r)
             | Expr::Multiply(l, r)
@@ -579,5 +606,39 @@ mod tests {
         // a literal that is not blr_long
         assert_eq!(field_names_of_blr(&[5, 21, 15, 0, 0, 1, 0, 65, 76]), None);
         assert_eq!(field_names_of_blr(&[]), None);
+    }
+}
+
+#[cfg(test)]
+mod gen_blr_tests {
+    use super::*;
+
+    /// The engine's own dump of `NEW.ID = GEN_ID(G, 1)` in a trigger
+    /// body: `blr_gen_id, 1, 'G', blr_literal, blr_long, 0, 1,0,0,0`.
+    #[test]
+    fn gen_id_is_a_counted_name_then_the_step() {
+        let mut out = Vec::new();
+        Expr::GenId { name: "G".into(), step: Box::new(Expr::IntLiteral(1)) }.emit(&mut out);
+        assert_eq!(out, vec![101, 1, b'G', 21, 8, 0, 1, 0, 0, 0]);
+    }
+
+    /// ...and `NEXT VALUE FOR G` is a DIFFERENT verb with no step at
+    /// all - `blr_gen_id2, 1, 'G'` (probed).
+    #[test]
+    fn next_value_for_is_the_name_alone() {
+        let mut out = Vec::new();
+        Expr::GenId2 { name: "G".into() }.emit(&mut out);
+        assert_eq!(out, vec![210, 1, b'G']);
+    }
+
+    /// A draw names no COLUMN; a step that does is still walked.
+    #[test]
+    fn a_draw_names_no_column() {
+        let mut refs = Vec::new();
+        Expr::GenId2 { name: "G".into() }.collect_refs(&mut refs);
+        assert!(refs.is_empty());
+        Expr::GenId { name: "G".into(), step: Box::new(Expr::IntLiteral(1)) }
+            .collect_refs(&mut refs);
+        assert!(refs.is_empty());
     }
 }
