@@ -34,11 +34,11 @@
 #     for each of its actions, and its body asks which one with
 #     INSERTING / UPDATING / DELETING
 #
-# Boundaries (recorded): a BEFORE body that touches the database (it
-# must decide what is stored, and the statement is holding the working
-# copy of the file), and a DEFERRED body that names the table it fires
-# for (by then that table holds every row the statement wrote, where the
-# engine's per-row firing would have shown it a prefix).
+# A body that READS OR WRITES THE DATABASE has its own gate,
+# qa/serve-real-trigdb.sh: it fires inline, with this statement's
+# working copy published around it. What still refuses here is a body
+# naming the table it fires FOR - the engine recurses there, and each
+# level of this server's recursion is a whole executor frame.
 #
 #   qa/serve-real-trigfire.sh [port]
 set -u
@@ -177,17 +177,10 @@ refuses() { # <label> <sql>
         *) echo "DIFF boundary MOVED: $1"; echo "     [$r]"; fail=1 ;;
     esac
 }
-# a trigger whose body WRITES another table: the statement holds the
-# working copy of the file, and a nested write would be lost under it
-"$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$REAL:$B" >/dev/null 2>&1 <<'SQL'
-CREATE TABLE LOGT (ID INTEGER, W VARCHAR(20));
-COMMIT;
-SET TERM ^ ;
-CREATE TRIGGER T_BLOG FOR T BEFORE INSERT POSITION 12 AS BEGIN INSERT INTO LOGT (ID, W) VALUES (NEW.ID, 'ins'); END^
-SET TERM ; ^
-COMMIT;
-SQL
-"$ISQL" -q -user "$U" -pas "$P" "$A" >/dev/null 2>&1 <<'SQL'
+# A BODY THAT WRITES ANOTHER TABLE, added to BOTH databases so the two
+# can be compared: it answers now, firing where the engine fires it.
+for db in "127.0.0.1/$REAL:$B" "$A"; do
+"$ISQL" -q -user "$U" -pas "$P" "$db" >/dev/null 2>&1 <<'SQL'
 CREATE TABLE LOGT (ID INTEGER, W VARCHAR(20));
 COMMIT;
 SET TERM ^ ;
@@ -197,12 +190,18 @@ CREATE TRIGGER D_ASELF FOR D AFTER INSERT POSITION 7 AS BEGIN UPDATE D SET A = A
 SET TERM ; ^
 COMMIT;
 SQL
-refuses "a BEFORE trigger that writes another table refuses (it must decide the row)" \
-  "INSERT INTO T (ID, A) VALUES (30, 1);"
-refuses "a deferred AFTER trigger that names ITS OWN table refuses" \
+done
+both "a BEFORE trigger that writes another table" \
+  "INSERT INTO T (ID, A) VALUES (30, 1); COMMIT;
+   SELECT ID, A, B, C FROM T WHERE ID = 30; SELECT ID, W FROM LOGT ORDER BY ID, W;"
+both "a universal trigger whose BEFORE body writes another table" \
+  "INSERT INTO M (ID, A) VALUES (30, 1); COMMIT;
+   SELECT ID, A FROM M WHERE ID = 30; SELECT ID, W FROM LOGT ORDER BY ID, W;"
+# ...but a body naming the table it fires FOR still refuses: the engine
+# RECURSES there, to Statement::MAX_CLONES = 1000, and each level of
+# this server's recursion is a whole executor frame
+refuses "an AFTER trigger that names ITS OWN table refuses (the engine recurses)" \
   "INSERT INTO D (ID, A) VALUES (30, 1);"
-refuses "a universal trigger whose BEFORE body writes another table refuses too" \
-  "INSERT INTO M (ID, A) VALUES (30, 1);"
 # (fire-crab COMPILES a universal trigger too, action predicates and
 # all, byte for byte - serve-real-trigger.sh pins those bytes)
 gf=$("$GFIX" -v -full -user "$U" -pas "$P" "$A" 2>&1)

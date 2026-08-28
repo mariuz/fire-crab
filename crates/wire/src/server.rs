@@ -12500,11 +12500,13 @@ struct TrigDef {
     /// catalog, and a trigger fires while the statement already holds
     /// the working copy of the file, with no database to hand
     excs: Vec<(String, i64, String)>,
-    /// This body TOUCHES THE DATABASE and runs after the statement's
-    /// own writes rather than inline ([fire_deferred_triggers]). Only
-    /// an AFTER trigger may: a BEFORE one must decide what gets stored,
-    /// and by the time the database is free the row is already there.
-    deferred: bool,
+    /// This body READS OR WRITES THE DATABASE and fires INLINE, where
+    /// the engine fires it, with the statement's working copy PUBLISHED
+    /// first so the body sees exactly the file the engine would show it:
+    /// a BEFORE body sees the table without this row (and with every
+    /// earlier row of the same statement), an AFTER body sees it with.
+    /// See the publish-and-retake at each firing point.
+    needs_db: bool,
     /// This body DRAWS a generator, so it fires in TWO PASSES - see
     /// [PsqlFrame::gen]. The draw is a page write, and the statement
     /// firing this trigger is holding the working copy of that page, so
@@ -12636,7 +12638,7 @@ fn user_triggers(db: &Database, table: &str, dml: &DmlGuard) -> Option<Vec<TrigD
             },
             source,
             excs: Vec::new(),
-            deferred: false,
+            needs_db: false,
             draws: false,
             anchor: values
                 .get(dbg_f)
@@ -12661,28 +12663,37 @@ fn user_triggers(db: &Database, table: &str, dml: &DmlGuard) -> Option<Vec<TrigD
     for t in out.iter_mut() {
         let (body, _) = trig_body_of(t)?;
         if !trig_body_pure(&body) {
-            // A BODY THAT TOUCHES THE DATABASE cannot run inline: the
-            // statement is holding the working copy of the file, and a
-            // nested write would be lost under it. An AFTER trigger can
-            // wait - its row is written either way - so it runs once the
-            // statement's own writes are applied, inside the same undo
-            // window. A BEFORE one decides what gets stored and has
-            // nowhere to wait, so it keeps the refusal.
-            if t.before || !trig_body_deferrable(&body, table) {
+            // A BODY THAT TOUCHES THE DATABASE fires WHERE THE ENGINE
+            // FIRES IT - inline, around the row - with the statement's
+            // working copy PUBLISHED first and taken again after. That
+            // is what makes the body see the file the engine shows it:
+            // a BEFORE body reads the table WITHOUT this row and WITH
+            // every earlier row of the same statement (measured: the
+            // per-row `SELECT COUNT(*) FROM T` under an `INSERT ...
+            // SELECT` of three rows answers 0, 1, 2), an AFTER body
+            // reads it with the row in. Running such a body after the
+            // whole statement instead - which is what this server did
+            // while it had no way to publish - answers the FINAL count
+            // to every row, so that path is gone.
+            if !trig_body_inlineable(&body, table) {
+                if std::env::var("FC_SRV_TRACE").is_ok() {
+                    eprintln!("[srv] trigger {} body not inlineable", t.name);
+                }
                 return None;
             }
-            t.deferred = true;
+            t.needs_db = true;
         }
-        // A GENERATOR DRAW is the one side effect a BEFORE body may
-        // have: it is a page write, so the CALLER performs it (it holds
-        // the working copy) and the body runs twice around it
+        // A GENERATOR DRAW is the one side effect a PURE body may have:
+        // it is a page write, so the CALLER performs it (it holds the
+        // working copy) and the body runs twice around it
         // ([PsqlFrame::gen]). Only an otherwise-PURE body qualifies -
-        // one that also touches the database is deferred or refused
-        // above - and a body whose CONTROL FLOW would read a drawn
-        // value refuses, because the two passes could then take
-        // different branches.
+        // one that also touches the database fires down the published
+        // path, where the caller has handed its working copy back and
+        // has nothing to draw from - and a body whose CONTROL FLOW would
+        // read a drawn value refuses, because the two passes could then
+        // take different branches.
         if body_draws(&body) {
-            if t.deferred || body_draw_decides_flow(&body) {
+            if t.needs_db || body_draw_decides_flow(&body) {
                 return None;
             }
             t.draws = true;
@@ -12697,6 +12708,14 @@ fn user_triggers(db: &Database, table: &str, dml: &DmlGuard) -> Option<Vec<TrigD
                 t.excs.push((n.clone(), number, message));
             }
         }
+    }
+    // A DRAWING BODY BESIDE ONE THAT NEEDS THE DATABASE: they fire
+    // together, and the published path hands the working copy back
+    // before the first of them runs, so there is nothing left for the
+    // caller to draw from. The whole set refuses rather than half of it
+    // firing down a path that cannot draw.
+    if out.iter().any(|t| t.needs_db) && out.iter().any(|t| t.draws) {
+        return None;
     }
     Some(out)
 }
@@ -12735,50 +12754,26 @@ fn trig_body_pure(s: &TrigStmt) -> bool {
     }
 }
 
-/// Every RELATION a body names in a statement of its own - what it
-/// stores into, updates, deletes from, or selects from.
+/// Can this body run INLINE with the database in reach - fired where
+/// the engine fires it, around the row, with the statement's working
+/// copy published first?
 ///
-/// A deferred AFTER trigger (one whose body touches the database, run
-/// once the statement's own writes are applied) must not name the table
-/// it fires FOR: by then that table holds every row the statement
-/// wrote, where the engine's per-row firing would have shown it a
-/// prefix. Naming it keeps the refusal.
-fn body_relations<'a>(s: &'a TrigStmt, out: &mut Vec<&'a str>) {
-    match s {
-        TrigStmt::Store { table, .. }
-        | TrigStmt::Update { table, .. }
-        | TrigStmt::Delete { table, .. } => out.push(table),
-        TrigStmt::If { then, otherwise, .. } => {
-            body_relations(then, out);
-            if let Some(e) = otherwise {
-                body_relations(e, out);
-            }
-        }
-        TrigStmt::While { body, .. } => body_relations(body, out),
-        TrigStmt::Autonomous { body, .. } => body_relations(body, out),
-        TrigStmt::Block { stmts, handlers, .. } => {
-            for st in stmts {
-                body_relations(st, out);
-            }
-            for (_, h) in handlers {
-                body_relations(h, out);
-            }
-        }
-        // a query's text is not parsed here: a body that READS the
-        // database at all is deferred, and [trig_body_deferrable] takes
-        // the conservative half of that
-        _ => {}
-    }
-}
-
-/// Can this body run DEFERRED - after the statement's own writes, with
-/// the database in reach?
+/// Everything the interpreter can run over a published file qualifies:
+/// a nested `INSERT`/`UPDATE`/`DELETE` into ANOTHER table, a `SELECT
+/// INTO` reading any table (its own included - that is the whole point
+/// of firing inline), and the pure statements around them.
 ///
-/// A SELECT-shaped statement inside it (`SELECT INTO`, `FOR SELECT`, a
-/// cursor, `EXECUTE STATEMENT`) reads a table this walk cannot name, so
-/// it is refused rather than deferred blind; the DML statements are
-/// checked against the trigger's own relation by name.
-fn trig_body_deferrable(s: &TrigStmt, table: &str) -> bool {
+/// WHAT DOES NOT: a body that WRITES THE TABLE IT FIRES FOR. The engine
+/// recurses there - a `BEFORE INSERT` body inserting into its own table
+/// fires itself again, to a depth of `Statement::MAX_CLONES` = 1000
+/// before `isc_req_max_clones_exceeded` - and each level of this
+/// server's recursion is a whole executor frame, so the depth is not
+/// reachable and the answer would be a stack overflow rather than the
+/// engine's 54001. `EXECUTE STATEMENT` and an autonomous block keep the
+/// refusal too: the first builds its statement at runtime, where this
+/// walk can see no table name to judge, and the second is a transaction
+/// of its own around a published copy, which has never been measured.
+fn trig_body_inlineable(s: &TrigStmt, table: &str) -> bool {
     match s {
         TrigStmt::Assign { .. }
         | TrigStmt::AssignText { .. }
@@ -12787,18 +12782,29 @@ fn trig_body_deferrable(s: &TrigStmt, table: &str) -> bool {
         | TrigStmt::Leave { .. }
         | TrigStmt::Continue { .. }
         | TrigStmt::Exit { .. }
-        | TrigStmt::PostEvent { .. } => true,
+        | TrigStmt::PostEvent { .. }
+        | TrigStmt::SelectInto { .. }
+        // the READING statements: each takes its rows once, when it
+        // starts, which is the engine's own answer (measured: a `FOR
+        // SELECT` whose body INSERTS into the table it is iterating
+        // still walks only the rows that were there when it opened)
+        | TrigStmt::Open { .. }
+        | TrigStmt::Fetch { .. }
+        | TrigStmt::Close { .. }
+        // a CALL is another body, with its own depth guard
+        | TrigStmt::CallProc { .. } => true,
         TrigStmt::Store { table: t, .. }
         | TrigStmt::Update { table: t, .. }
         | TrigStmt::Delete { table: t, .. } => !t.eq_ignore_ascii_case(table),
+        TrigStmt::ForSelect { body, .. } => trig_body_inlineable(body, table),
         TrigStmt::If { then, otherwise, .. } => {
-            trig_body_deferrable(then, table)
-                && otherwise.as_deref().is_none_or(|e| trig_body_deferrable(e, table))
+            trig_body_inlineable(then, table)
+                && otherwise.as_deref().is_none_or(|e| trig_body_inlineable(e, table))
         }
-        TrigStmt::While { body, .. } => trig_body_deferrable(body, table),
+        TrigStmt::While { body, .. } => trig_body_inlineable(body, table),
         TrigStmt::Block { stmts, handlers, .. } => {
-            stmts.iter().all(|st| trig_body_deferrable(st, table))
-                && handlers.iter().all(|(_, h)| trig_body_deferrable(h, table))
+            stmts.iter().all(|st| trig_body_inlineable(st, table))
+                && handlers.iter().all(|(_, h)| trig_body_inlineable(h, table))
         }
         _ => false,
     }
@@ -12835,7 +12841,15 @@ fn trig_body_of(t: &TrigDef) -> Option<(TrigStmt, Vec<String>)> {
     // a trigger declares its variables between AS and BEGIN, exactly
     // where a procedure's header declares them
     let names = declared_var_names(&t.source[..begin_at]);
-    let body = parse_trigger_body(&t.source, begin_at, t.source.trim_end().len(), &names)?;
+    let body = match parse_trigger_body(&t.source, begin_at, t.source.trim_end().len(), &names) {
+        Some(b) => b,
+        None => {
+            if std::env::var("FC_SRV_TRACE").is_ok() {
+                eprintln!("[srv] trigger {} body PARSE failed: {:?}", t.name, t.source);
+            }
+            return None;
+        }
+    };
     let inits = declared_var_inits(&t.source[..begin_at], &names).ok()?;
     let body = if inits.is_empty() {
         body
@@ -15672,7 +15686,7 @@ enum TrigStmt {
     /// (1 on a match, 0 on none) where the dynamic form leaves it, and
     /// an arity mismatch is the -313 "count of column list and variable
     /// list do not match" vector, not the dynamic 42000.
-    SelectInto { sql: String, into: Vec<u16>, src_off: usize },
+    SelectInto { sql: String, into: Vec<u16>, binds: Vec<(String, u16)>, src_off: usize },
     /// `FOR EXECUTE STATEMENT <text> INTO :v[, ...] DO <stmt>;` - the
     /// loop over a dynamic query, LEAVE and all, exactly as the
     /// [TrigStmt::ForSelect] loop runs over a static one.
@@ -15749,6 +15763,31 @@ fn parse_store_expr(text: &str, vars: &[String]) -> Option<fire_crab_ods::expr::
     let (cleaned, marked) = colon_clean(text, vars)?;
     let e = parse_expr(cleaned.trim())?;
     Some(expr_resolve_marked(&e, vars, &marked))
+}
+
+/// A PLAIN PSQL EXPRESSION - an assignment's right-hand side, a
+/// `RETURN`, an `IF`/`WHILE` condition - where a variable may be
+/// written EITHER WAY.
+///
+/// The engine takes both `V` and `:V` in every one of these positions,
+/// and the colon form is the one anybody writes beside a query that
+/// uses it: a body reading a value with `SELECT ... INTO :M` and then
+/// testing `IF (:M IS NOT NULL)`. Only the embedded-DML positions ran
+/// the marker pass ([colon_clean]), so the plain ones refused the
+/// WHOLE BODY over a colon - which is what a lookup trigger is written
+/// with. Both forms resolve to the same slot here; a `:name` that is
+/// not a declared variable still refuses.
+fn parse_body_expr(text: &str, vars: &[String]) -> Option<fire_crab_ods::expr::Expr> {
+    let (cleaned, _marked) = colon_clean(text, vars)?;
+    let e = parse_expr(cleaned.trim())?;
+    Some(expr_resolve_vars(&e, vars))
+}
+
+/// [parse_body_expr] for a condition.
+fn parse_body_cond(text: &str, vars: &[String]) -> Option<fire_crab_ods::expr::Cond> {
+    let (cleaned, _marked) = colon_clean(text, vars)?;
+    let c = parse_cond(cleaned.trim())?;
+    Some(cond_resolve_vars(&c, vars))
 }
 
 /// The `:variable` marker pass shared by every expression position
@@ -16906,7 +16945,7 @@ fn parse_trig_stmt(
         // fold NOT exactly as the engine's DSQL pass does: inverted
         // comparisons and De Morgan; IS NULL keeps its blr_not form
         let cond =
-            cond_resolve_vars(&parse_cond(&strip_sql_comments(&s[open..=close]))?, vars)
+            parse_body_cond(&strip_sql_comments(&s[open..=close]), vars)?
                 .normalized();
         *pos = close + 1;
         skip_trig_ws(s, pos, limit);
@@ -17048,7 +17087,20 @@ fn parse_trig_stmt(
         if into.is_empty() {
             return None;
         }
-        return Some(TrigStmt::SelectInto { sql, into, src_off: start });
+        // THE VALUES THE QUERY NAMES, resolved to slots HERE, where the
+        // declared variables are still in scope: a body query is text,
+        // and the planner that runs it knows nothing of a frame. Every
+        // `:name` in it must name a variable - one that does not is
+        // refused rather than passed to a planner that would read it as
+        // a column ([subst_body_query]).
+        let mut binds: Vec<(String, u16)> = Vec::new();
+        for name in named_refs(&sql) {
+            let slot = vars.iter().position(|v| v.eq_ignore_ascii_case(&name))? as u16;
+            if !binds.iter().any(|(n, _)| n.eq_ignore_ascii_case(&name)) {
+                binds.push((name, slot));
+            }
+        }
+        return Some(TrigStmt::SelectInto { sql, into, binds, src_off: start });
     }
     if find_word(&up, "EXECUTE", 0) == Some(0)
         && find_word(&mask_literals(&up), "STATEMENT", "EXECUTE".len())
@@ -17342,8 +17394,8 @@ fn parse_trig_stmt(
     // NEW.<col> = <expr>  or  <var> = <expr>
     if find_word(&up, "RETURN", 0) == Some(0) {
         let rhs = text["RETURN".len()..].trim();
-        return match parse_expr(rhs) {
-            Some(e) => Some(TrigStmt::Return { expr: expr_resolve_vars(&e, vars), src_off: start }),
+        return match parse_body_expr(rhs, vars) {
+            Some(e) => Some(TrigStmt::Return { expr: e, src_off: start }),
             None => Some(TrigStmt::ReturnText { text: parse_dyn_text(rhs, vars)?, src_off: start }),
         };
     }
@@ -17362,10 +17414,8 @@ fn parse_trig_stmt(
         TrigTarget::Var(slot as u16)
     };
     let rhs = text[eq + 1..].trim();
-    match parse_expr(rhs) {
-        Some(e) => {
-            Some(TrigStmt::Assign { target, expr: expr_resolve_vars(&e, vars), src_off: start })
-        }
+    match parse_body_expr(rhs, vars) {
+        Some(e) => Some(TrigStmt::Assign { target, expr: e, src_off: start }),
         // A TEXT ASSIGNMENT. `Expr` is arithmetic - it has no string
         // literal - so `S = 'SELECT ...'` used to refuse the whole body,
         // and with it the CANONICAL EXECUTE STATEMENT: build the
@@ -27117,123 +27167,17 @@ where
 /// failure (see [GenWindow]).
 /// The DEFERRED AFTER triggers a plan carries, with the columns their
 /// contexts read - see [TrigDef::deferred].
-fn plan_deferred_triggers(plan: &Plan) -> Option<(&[TrigDef], &[RelationColumn], bool)> {
-    // the bool is "this DML has an OLD row": an UPDATE has both, a
-    // DELETE's own images ARE the old rows, an INSERT has none
-    let (t, c, upd) = match plan {
-        Plan::Insert { triggers, trig_cols, .. } => (triggers, trig_cols, false),
-        Plan::Update { triggers, trig_cols, .. } => (triggers, trig_cols, true),
-        Plan::Delete { triggers, trig_cols, .. } => (triggers, trig_cols, false),
-        Plan::Returning { inner, .. } => return plan_deferred_triggers(inner),
-        _ => return None,
+/// Does this plan fire a trigger whose body needs the database - one
+/// that will PUBLISH the statement's working copy mid-way?
+fn plan_publishing_triggers(plan: &Plan) -> bool {
+    let t = match plan {
+        Plan::Insert { triggers, .. }
+        | Plan::Update { triggers, .. }
+        | Plan::Delete { triggers, .. } => triggers,
+        Plan::Returning { inner, .. } => return plan_publishing_triggers(inner),
+        _ => return false,
     };
-    t.iter().any(|d| d.deferred).then_some((t.as_slice(), c.as_slice(), upd))
-}
-
-/// Fire the DEFERRED AFTER triggers over the rows a statement touched.
-///
-/// They run HERE - after the statement's own writes are applied and
-/// with the database in reach - because their bodies write and read it,
-/// and a nested write made while the statement still held its working
-/// copy would be lost under it. The statement's undo window is still
-/// open ([execute_dml_collecting]), so a raise takes the whole
-/// statement back, its own rows included.
-///
-/// The one thing this ordering cannot reproduce is a body that reads
-/// the table it fires FOR: by now that table holds every row the
-/// statement wrote, where the engine's per-row firing would have shown
-/// it a prefix. Such a body is refused at prepare
-/// ([trig_body_deferrable]), never answered differently.
-fn fire_deferred_triggers(
-    plan: &Plan,
-    database: &mut Option<Database>,
-    ctx: &SessionCtx,
-    aff: &Affected,
-) -> Result<(), ExecErr> {
-    let Some((defs, cols, has_old)) = plan_deferred_triggers(plan) else {
-        return Ok(());
-    };
-    let delete = matches!(plan, Plan::Delete { .. })
-        || matches!(plan, Plan::Returning { inner, .. } if matches!(inner.as_ref(), Plan::Delete { .. }));
-    // 1 INSERT, 2 UPDATE, 3 DELETE - the action a universal trigger's
-    // predicates answer for
-    let action: u8 = if delete {
-        3
-    } else if has_old {
-        2
-    } else {
-        1
-    };
-    for (i, img) in aff.images.iter().enumerate() {
-        let row = decode_record(img, &aff.descs);
-        let old = if has_old {
-            // an EMPTY slot is the parallel-shape marker for a row that
-            // HAS no before-image (an inserted one) - the trigger's OLD
-            // is None there, as it always was
-            aff.old_images
-                .get(i)
-                .filter(|o| !o.is_empty())
-                .map(|o| decode_record(o, &aff.descs))
-        } else if delete {
-            // a DELETE's image IS the old row
-            Some(row.clone())
-        } else {
-            None
-        };
-        let new = if delete { None } else { Some(row) };
-        for d in defs.iter().filter(|d| d.deferred) {
-            let (body, names) = trig_body_of(d).ok_or_else(|| {
-                ExecErr::Text(format!("trigger {} is outside this server's PSQL surface", d.name))
-            })?;
-            let mut frame = PsqlFrame {
-                vars: vec![Value::Null; names.len()],
-                out_at: names.len(),
-                out_len: 0,
-                suspended: Vec::new(),
-                caught: None,
-                cursors: std::collections::HashMap::new(),
-                row_count_slot: None,
-                trig_excs: d.excs.clone(),
-                trig: Some(TrigCtx {
-                    cols: cols.to_vec(),
-                    old: old.clone(),
-                    new: new.clone(),
-                    writable: false,
-                    action,
-                }),
-                gen: Default::default(),
-            };
-            let mut steps = 0u32;
-            match exec_psql_stmt(&body, &mut frame, &mut steps, database, ctx) {
-                Ok(()) | Err(PsqlStop::Exit) => {}
-                Err(PsqlStop::Raise(ex)) => {
-                    let at: Vec<String> = ex
-                        .trace()
-                        .iter()
-                        .filter_map(|off| trig_position(d, *off))
-                        .map(|(line, col)| {
-                            format!(
-                                "At trigger {} line: {}, col: {}",
-                                quoted_qualified(&d.name),
-                                line,
-                                col
-                            )
-                        })
-                        .collect();
-                    return Err(ExecErr::Eval(wrap_at_procedure(ex.as_eval_err(), at)));
-                }
-                Err(PsqlStop::Failed(e)) => return Err(ExecErr::Text(e)),
-                Err(PsqlStop::Unsupported) => {
-                    return Err(ExecErr::Text(format!(
-                        "trigger {} uses PSQL this server does not interpret",
-                        d.name
-                    )))
-                }
-                Err(PsqlStop::Leave(_)) | Err(PsqlStop::Continue(_)) => {}
-            }
-        }
-    }
-    Ok(())
+    t.iter().any(|d| d.needs_db)
 }
 
 fn execute_dml_collecting(
@@ -27246,37 +27190,24 @@ fn execute_dml_collecting(
     // ONE STATEMENT IS ITS OWN UNDO WINDOW, and it needs no id: its
     // records live in a working copy that is dropped whole if any part
     // of it fails (see [WindowKind::Statement]).
-    let mark = undo_window_push(database, WindowKind::Statement);
+    //
+    // UNLESS IT PUBLISHES MID-WAY. A statement that fires a trigger
+    // body needing the database hands its working copy back around the
+    // body ([fire_triggers_published]), so its earlier rows ARE
+    // installed and dropping a copy no longer undoes them - it takes a
+    // [WindowKind::Nested] window instead, undone by killing the id
+    // those rows carry, exactly as a row-by-row statement is.
+    let mark = undo_window_push(
+        database,
+        if plan_publishing_triggers(plan) { WindowKind::Nested } else { WindowKind::Statement },
+    );
     // the temp blobs NOT yet materialised as this statement starts: the
     // ones it materialises are exactly those that flip
     let fresh: Vec<u32> = database
         .as_ref()
         .map(|d| d.temp_blobs.iter().filter(|(_, tb)| tb.materialised.is_none()).map(|(k, _)| *k).collect())
         .unwrap_or_default();
-    // a DEFERRED AFTER trigger reads the rows the statement touched, so
-    // they must be COLLECTED even when the caller wants none
-    let mut own = Affected::default();
-    let deferred = plan_deferred_triggers(plan).is_some();
-    let (out, aff_used): (Result<(i32, i32, i32), ExecErr>, Option<&Affected>) = match affected {
-        Some(a) if deferred => {
-            let r = execute_dml_collecting_inner(plan, database, args, ctx, Some(a));
-            (r, Some(&*a))
-        }
-        Some(a) => (execute_dml_collecting_inner(plan, database, args, ctx, Some(a)), None),
-        None if deferred => {
-            let r = execute_dml_collecting_inner(plan, database, args, ctx, Some(&mut own));
-            (r, Some(&own))
-        }
-        None => (execute_dml_collecting_inner(plan, database, args, ctx, None), None),
-    };
-    // the statement's own writes are in; its deferred triggers run now,
-    // still inside this window
-    let out = match (out, aff_used) {
-        (Ok(counts), Some(a)) => {
-            fire_deferred_triggers(plan, database, ctx, a).map(|()| counts)
-        }
-        (other, _) => other,
-    };
+    let out = execute_dml_collecting_inner(plan, database, args, ctx, affected);
     if out.is_err() {
         // the working copy that held the pages THIS statement
         // materialised is gone with it: a later store of the same temp
@@ -27371,7 +27302,10 @@ fn execute_dml_collecting_inner(
     if let Plan::RefusedEval(e) = plan {
         return Err(ExecErr::Eval(e.clone()));
     }
-    let db = database.as_mut().ok_or("no database attached")?;
+    // REASSIGNABLE: a statement that fires a trigger body needing the
+    // database hands its working copy back for the length of the body
+    // ([fire_triggers_published]) and takes this borrow again after
+    let mut db = database.as_mut().ok_or("no database attached")?;
     // A READ-ONLY DATABASE REFUSES EVERY STATEMENT THAT WOULD WRITE, and
     // in the ENGINE'S OWN TWO SHAPES: a DML statement gets the code
     // alone, a DDL statement gets it behind `isc_dsql_error` because the
@@ -28185,27 +28119,39 @@ fn execute_dml_collecting_inner(
                 // same working copy this statement is building, through
                 // the same path the statement's own `NEXT VALUE FOR`
                 // columns take ([gen_bump_through_cache])
-                let mut drew: Result<(), ExecErr> = Ok(());
-                {
-                    let mut drawer = |name: &str, step: Option<i64>| -> Result<i64, ExecErr> {
-                        let (id, incr) = generator_info(db, name)
-                            .ok_or_else(|| ExecErr::Text("no such generator".into()))?;
-                        gen_bump_through_cache(db, &mut work, name, id, step.unwrap_or(incr))
-                            .map_err(ExecErr::Text)
-                    };
-                    drew = fire_triggers(
-                        &mut None,
-                        ctx,
-                        trig_cols,
-                        triggers,
-                        true,
-                        1,
-                        Some(&mut row),
-                        None,
-                        Some(&mut drawer),
-                    );
+                if triggers.iter().any(|t| t.needs_db) {
+                    // A BODY THAT READS OR WRITES THE DATABASE: the
+                    // working copy is published so the body sees the
+                    // table WITHOUT this row (and with every earlier row
+                    // of this statement), and a fresh one comes back
+                    work = fire_triggers_published(
+                        database, work, stmt_tx, ctx, trig_cols, triggers, true, 1,
+                        Some(&mut row), None,
+                    )?;
+                    db = database.as_mut().ok_or("no database attached")?;
+                } else {
+                    let mut drew: Result<(), ExecErr> = Ok(());
+                    {
+                        let mut drawer = |name: &str, step: Option<i64>| -> Result<i64, ExecErr> {
+                            let (id, incr) = generator_info(db, name)
+                                .ok_or_else(|| ExecErr::Text("no such generator".into()))?;
+                            gen_bump_through_cache(db, &mut work, name, id, step.unwrap_or(incr))
+                                .map_err(ExecErr::Text)
+                        };
+                        drew = fire_triggers(
+                            &mut None,
+                            ctx,
+                            trig_cols,
+                            triggers,
+                            true,
+                            1,
+                            Some(&mut row),
+                            None,
+                            Some(&mut drawer),
+                        );
+                    }
+                    drew?;
                 }
-                drew?;
                 apply_row_changes(&mut image, descs, &before_row, &row)?;
             }
             // CHECK constraints FIRST - the engine's PRE-STORE check
@@ -28285,20 +28231,35 @@ fn execute_dml_collecting_inner(
                 // OLD context at all - and `fire_triggers` makes it
                 // read-only for an AFTER trigger
                 let mut row = decode_record(image, descs);
-                let mut drawer = |name: &str, step: Option<i64>| -> Result<i64, ExecErr> {
-                    let (id, incr) = generator_info(db, name)
-                        .ok_or_else(|| ExecErr::Text("no such generator".into()))?;
-                    gen_bump_through_cache(db, &mut work, name, id, step.unwrap_or(incr))
-                        .map_err(ExecErr::Text)
-                };
-                fire_triggers(
-                    &mut None, ctx, trig_cols, triggers, false, 1, Some(&mut row), None,
-                    Some(&mut drawer),
-                )?;
+                if triggers.iter().any(|t| t.needs_db) {
+                    // the row is STORED in the copy being published, so
+                    // an AFTER body reads the table WITH it - measured
+                    work = fire_triggers_published(
+                        database, work, stmt_tx, ctx, trig_cols, triggers, false, 1,
+                        Some(&mut row), None,
+                    )?;
+                    db = database.as_mut().ok_or("no database attached")?;
+                } else {
+                    let mut drawer = |name: &str, step: Option<i64>| -> Result<i64, ExecErr> {
+                        let (id, incr) = generator_info(db, name)
+                            .ok_or_else(|| ExecErr::Text("no such generator".into()))?;
+                        gen_bump_through_cache(db, &mut work, name, id, step.unwrap_or(incr))
+                            .map_err(ExecErr::Text)
+                    };
+                    fire_triggers(
+                        &mut None, ctx, trig_cols, triggers, false, 1, Some(&mut row), None,
+                        Some(&mut drawer),
+                    )?;
+                }
             }
             (1, 0, 0)
         }
         Plan::Update { rel, triggers, trig_cols, table, format_no, formats, sets, filter, index_ops, not_null, checks, domain_checks, fk_refs, fk_children, index, defer, gen_filter } => {
+            // A TRIGGER BODY THAT READS OR WRITES THE DATABASE fires
+            // with this statement's working copy PUBLISHED, and the
+            // rows are then written one at a time as they are read -
+            // see [write_updated_row]
+            let publishing = triggers.iter().any(|t| t.needs_db);
             let descs = formats
                 .iter()
                 .find(|(n, _)| n == format_no)
@@ -28658,23 +28619,35 @@ fn execute_dml_collecting_inner(
                     let old_row = decode_record(&image, descs);
                     let before_row = decode_record(&img, descs);
                     let mut new_row = before_row.clone();
-                    let mut drawer = |name: &str, step: Option<i64>| -> Result<i64, ExecErr> {
-                        let (id, incr) = generator_info(db, name)
-                            .ok_or_else(|| ExecErr::Text("no such generator".into()))?;
-                        gen_bump_through_cache(db, &mut work, name, id, step.unwrap_or(incr))
-                            .map_err(ExecErr::Text)
-                    };
-                    fire_triggers(
-                        &mut None,
-                        ctx,
-                        trig_cols,
-                        triggers,
-                        true,
-                        2,
-                        Some(&mut new_row),
-                        Some(&old_row),
-                        Some(&mut drawer),
-                    )?;
+                    if triggers.iter().any(|t| t.needs_db) {
+                        // the row is UNPATCHED in the published copy, so
+                        // a BEFORE body reads the table as it stands -
+                        // measured: `SELECT SUM(A)` answers the sum
+                        // BEFORE this update, not after
+                        work = fire_triggers_published(
+                            database, work, stmt_tx, ctx, trig_cols, triggers, true, 2,
+                            Some(&mut new_row), Some(&old_row),
+                        )?;
+                        db = database.as_mut().ok_or("no database attached")?;
+                    } else {
+                        let mut drawer = |name: &str, step: Option<i64>| -> Result<i64, ExecErr> {
+                            let (id, incr) = generator_info(db, name)
+                                .ok_or_else(|| ExecErr::Text("no such generator".into()))?;
+                            gen_bump_through_cache(db, &mut work, name, id, step.unwrap_or(incr))
+                                .map_err(ExecErr::Text)
+                        };
+                        fire_triggers(
+                            &mut None,
+                            ctx,
+                            trig_cols,
+                            triggers,
+                            true,
+                            2,
+                            Some(&mut new_row),
+                            Some(&old_row),
+                            Some(&mut drawer),
+                        )?;
+                    }
                     apply_row_changes(&mut img, descs, &before_row, &new_row)?;
                 }
                 // CHECK constraints on the PATCHED row FIRST (negated -
@@ -28725,6 +28698,27 @@ fn execute_dml_collecting_inner(
                     a.old_images.push(old_images.last().cloned().unwrap_or_default());
                 }
                 targets.push((page, slot, img));
+                // THE ROW IS WRITTEN HERE when a body reads the
+                // database: the next row's BEFORE trigger must see this
+                // one in the table, and its own AFTER trigger must see
+                // it too. Same write, same order - only sooner.
+                if publishing {
+                    let (page, slot, new_img) = targets.last().ok_or("no row to write")?;
+                    let old_img = old_images.last().ok_or("no old image")?;
+                    write_updated_row(
+                        &mut work, db, *rel, dml_tx(stmt_tx)?, *page, *slot, new_img, old_img,
+                        *format_no, index_ops, &stmt_own, descs, table,
+                    )?;
+                    if triggers.iter().any(|t| !t.before) {
+                        let mut new_row = decode_record(new_img, descs);
+                        let old_row = decode_record(old_img, descs);
+                        work = fire_triggers_published(
+                            database, work, stmt_tx, ctx, trig_cols, triggers, false, 2,
+                            Some(&mut new_row), Some(&old_row),
+                        )?;
+                        db = database.as_mut().ok_or("no database attached")?;
+                    }
+                }
             }
             // THE WRITE WALK ENFORCES UNIQUENESS ROW AT A TIME, IN
             // RECORD-NUMBER ORDER (probed P1-P4/P10): each row is
@@ -28742,41 +28736,20 @@ fn execute_dml_collecting_inner(
             // the engine-refused `SET ID = ID + 1` shift. Statement
             // rollback is unchanged: `work` is discarded on Err.
             let affected = targets.len();
-            if !targets.is_empty() {
+            // ...unless the rows were written AS THEY WERE READ, which
+            // is what a trigger body that reads the database needs
+            if !targets.is_empty() && !publishing {
                 let tx = dml_tx(stmt_tx)?;
                 for ((page, slot, new_img), old_img) in targets.iter().zip(&old_images) {
-                    fire_crab_ods::update_record_under(
-                        &mut work, db.page_size, *rel, tx, *page, *slot, new_img, *format_no,
+                    write_updated_row(
+                        &mut work, db, *rel, tx, *page, *slot, new_img, old_img, *format_no,
+                        index_ops, &stmt_own, descs, table,
                     )?;
-                    // IDX_modify: an entry is ADDED for every key the
-                    // update changed; the old one stays until GC
-                    if !index_ops.is_empty() {
-                        let recno = recno_of(&work, db.page_size, *page, *slot)?;
-                        let old_values = decode_record(old_img, descs);
-                        let new_values = decode_record(new_img, descs);
-                        for op in index_ops {
-                            let (old_key, _) = op
-                                .key_for(&old_values)
-                                .ok_or("unsupported value for an index key")?;
-                            let (new_key, all_null) = op
-                                .key_for(&new_values)
-                                .ok_or("unsupported value for an index key")?;
-                            if new_key != old_key {
-                                insert_entry_verified(
-                                    &mut work, db.page_size, *rel, op, &new_key, recno, all_null,
-                                    &stmt_own,
-                                )
-                                .map_err(|e| {
-                                    entry_err_to_exec(db, table, op, &new_values, e)
-                                })?;
-                            }
-                        }
-                    }
                 }
             }
             // AFTER UPDATE TRIGGERS, once the rows are written: NEW is
             // read-only there, and a RAISE still stops the statement
-            if triggers.iter().any(|t| !t.before) {
+            if triggers.iter().any(|t| !t.before) && !publishing {
                 for ((_, _, new_img), old_img) in targets.iter().zip(&old_images) {
                     let mut new_row = decode_record(new_img, descs);
                     let old_row = decode_record(old_img, descs);
@@ -28795,6 +28768,9 @@ fn execute_dml_collecting_inner(
             (0, affected as i32, 0)
         }
         Plan::Delete { rel, triggers, trig_cols, formats, filter, fk_children, index, defer, gen_filter } => {
+            // as in the UPDATE arm: a body that reads the database sees
+            // each row go before the next one's trigger fires
+            let publishing = triggers.iter().any(|t| t.needs_db);
             let filter = &bind_filter(filter, args)?;
             // a parameterised WHERE keys at EXECUTE, as in the UPDATE arm
             let descs_now: Vec<Descriptor> = formats
@@ -28812,6 +28788,9 @@ fn execute_dml_collecting_inner(
             // the rows an AFTER DELETE trigger will read, kept while
             // they still exist
             let mut deleted_images: Vec<Vec<u8>> = Vec::new();
+            // how many rows actually went - counted in whichever order
+            // this statement writes in
+            let mut deleted = 0usize;
             // a generator drawn in the WHERE advances ONCE PER ROW
             // COMPARED, matching or not - see [collect_dml_targets_drawing]
             let found = match gen_filter {
@@ -28848,23 +28827,34 @@ fn execute_dml_collecting_inner(
                         .map(|(_, d)| d)
                         .ok_or("no format for a matching record")?;
                     let old_row = decode_record(&image, descs);
-                    let mut drawer = |name: &str, step: Option<i64>| -> Result<i64, ExecErr> {
-                        let (id, incr) = generator_info(db, name)
-                            .ok_or_else(|| ExecErr::Text("no such generator".into()))?;
-                        gen_bump_through_cache(db, &mut work, name, id, step.unwrap_or(incr))
-                            .map_err(ExecErr::Text)
-                    };
-                    fire_triggers(
-                        &mut None,
-                        ctx,
-                        trig_cols,
-                        triggers,
-                        true,
-                        3,
-                        None,
-                        Some(&old_row),
-                        Some(&mut drawer),
-                    )?;
+                    if triggers.iter().any(|t| t.needs_db) {
+                        // the row is STILL THERE in the published copy -
+                        // measured: a BEFORE DELETE body counting its own
+                        // table counts the row it is about to remove
+                        work = fire_triggers_published(
+                            database, work, stmt_tx, ctx, trig_cols, triggers, true, 3,
+                            None, Some(&old_row),
+                        )?;
+                        db = database.as_mut().ok_or("no database attached")?;
+                    } else {
+                        let mut drawer = |name: &str, step: Option<i64>| -> Result<i64, ExecErr> {
+                            let (id, incr) = generator_info(db, name)
+                                .ok_or_else(|| ExecErr::Text("no such generator".into()))?;
+                            gen_bump_through_cache(db, &mut work, name, id, step.unwrap_or(incr))
+                                .map_err(ExecErr::Text)
+                        };
+                        fire_triggers(
+                            &mut None,
+                            ctx,
+                            trig_cols,
+                            triggers,
+                            true,
+                            3,
+                            None,
+                            Some(&old_row),
+                            Some(&mut drawer),
+                        )?;
+                    }
                 }
                 // NO ACTION partner check, per deleted row: its key
                 // must not be referenced by any child (the row's own
@@ -28898,6 +28888,29 @@ fn execute_dml_collecting_inner(
                     deleted_images.push(image.clone());
                 }
                 targets.push((page, slot));
+                // THE ROW GOES HERE when a body reads the database: the
+                // next row's BEFORE trigger must not still count it
+                if publishing {
+                    let last = targets.len() - 1;
+                    let out1 = fire_crab_ods::delete_records_under(
+                        &mut work, db.page_size, *rel, &targets[last..], dml_tx(stmt_tx)?,
+                    )?;
+                    deleted += out1.affected;
+                    if triggers.iter().any(|t| !t.before) {
+                        let descs = formats
+                            .iter()
+                            .find(|(n, _)| *n == fmt)
+                            .or_else(|| formats.iter().max_by_key(|(n, _)| *n))
+                            .map(|(_, d)| d)
+                            .ok_or("no format for a matching record")?;
+                        let row = decode_record(&image, descs);
+                        work = fire_triggers_published(
+                            database, work, stmt_tx, ctx, trig_cols, triggers, false, 3, None,
+                            Some(&row),
+                        )?;
+                        db = database.as_mut().ok_or("no database attached")?;
+                    }
+                }
             }
             // AFTER DELETE TRIGGERS run once the rows are gone; OLD is
             // what they read (an assignment refuses - the row is
@@ -28912,22 +28925,25 @@ fn execute_dml_collecting_inner(
             } else {
                 Vec::new()
             };
-            let out = fire_crab_ods::delete_records_under(
-                &mut work, db.page_size, *rel, &targets, dml_tx(stmt_tx)?,
-            )?;
-            for row in &after_rows {
-                let mut drawer = |name: &str, step: Option<i64>| -> Result<i64, ExecErr> {
-                    let (id, incr) = generator_info(db, name)
-                        .ok_or_else(|| ExecErr::Text("no such generator".into()))?;
-                    gen_bump_through_cache(db, &mut work, name, id, step.unwrap_or(incr))
-                        .map_err(ExecErr::Text)
-                };
-                    fire_triggers(
-                    &mut None, ctx, trig_cols, triggers, false, 3, None, Some(row),
-                    Some(&mut drawer),
+            if !publishing {
+                let out = fire_crab_ods::delete_records_under(
+                    &mut work, db.page_size, *rel, &targets, dml_tx(stmt_tx)?,
                 )?;
+                deleted += out.affected;
+                for row in &after_rows {
+                    let mut drawer = |name: &str, step: Option<i64>| -> Result<i64, ExecErr> {
+                        let (id, incr) = generator_info(db, name)
+                            .ok_or_else(|| ExecErr::Text("no such generator".into()))?;
+                        gen_bump_through_cache(db, &mut work, name, id, step.unwrap_or(incr))
+                            .map_err(ExecErr::Text)
+                    };
+                    fire_triggers(
+                        &mut None, ctx, trig_cols, triggers, false, 3, None, Some(row),
+                        Some(&mut drawer),
+                    )?;
+                }
             }
-            (0, 0, out.affected as i32)
+            (0, 0, deleted as i32)
         }
         Plan::SetGenerator { name, mode, .. } => {
             // the generator's id locates its slot; its increment turns a
@@ -30042,6 +30058,55 @@ fn validate_select_bind(plan: &Plan, args: &[WireParam]) -> Result<(), ExecErr> 
 /// is re-examined, so a duplicate this cannot disprove is still a
 /// duplicate.
 #[allow(clippy::too_many_arguments)]
+/// Write ONE updated row and maintain its indexes - the body of the
+/// UPDATE write walk, extracted so the two orders that need it share
+/// one path.
+///
+/// The walk normally runs after every row has been read and validated.
+/// A statement whose trigger bodies READ THE DATABASE cannot wait: the
+/// engine writes each row before the next row's BEFORE trigger looks at
+/// the table (measured: an `UPDATE` over three rows answers a sum that
+/// walks up as it goes), so that path calls this from inside the scan
+/// loop instead. Same function, same order, different moment.
+#[allow(clippy::too_many_arguments)]
+fn write_updated_row(
+    work: &mut fire_crab_ods::Image,
+    db: &Database,
+    rel: u16,
+    tx: u32,
+    page: u32,
+    slot: u16,
+    new_img: &[u8],
+    old_img: &[u8],
+    format_no: u8,
+    index_ops: &[IndexOp],
+    stmt_own: &fire_crab_ods::tra::OwnTx,
+    descs: &[Descriptor],
+    table: &str,
+) -> Result<(), ExecErr> {
+    fire_crab_ods::update_record_under(
+        work, db.page_size, rel, tx, page, slot, new_img, format_no,
+    )?;
+    // IDX_modify: an entry is ADDED for every key the update changed;
+    // the old one stays until GC
+    if index_ops.is_empty() {
+        return Ok(());
+    }
+    let recno = recno_of(work, db.page_size, page, slot)?;
+    let old_values = decode_record(old_img, descs);
+    let new_values = decode_record(new_img, descs);
+    for op in index_ops {
+        let (old_key, _) = op.key_for(&old_values).ok_or("unsupported value for an index key")?;
+        let (new_key, all_null) =
+            op.key_for(&new_values).ok_or("unsupported value for an index key")?;
+        if new_key != old_key {
+            insert_entry_verified(work, db.page_size, rel, op, &new_key, recno, all_null, stmt_own)
+                .map_err(|e| entry_err_to_exec(db, table, op, &new_values, e))?;
+        }
+    }
+    Ok(())
+}
+
 fn insert_entry_verified(
     work: &mut fire_crab_ods::Image,
     page_size: usize,
@@ -63960,6 +64025,122 @@ fn restore_ref_action(rule: &str) -> Result<fire_crab_ods::ddl::RefAction, Strin
 /// A value as the SQL literal that names it. Types this server cannot
 /// write as a literal refuse, so a DML statement is never built around
 /// an invented value.
+/// Every `:name` in a statement's text, outside its string literals.
+fn named_refs(sql: &str) -> Vec<String> {
+    let b = sql.as_bytes();
+    let mut out = Vec::new();
+    let mut in_str = false;
+    let mut i = 0usize;
+    while i < b.len() {
+        if b[i] == b'\'' {
+            in_str = !in_str;
+            i += 1;
+        } else if b[i] == b':'
+            && !in_str
+            && b.get(i + 1).is_some_and(|c| c.is_ascii_alphabetic() || *c == b'_')
+        {
+            let start = i + 1;
+            let mut j = start;
+            while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
+                j += 1;
+            }
+            out.push(sql[start..j].to_string());
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// A BODY QUERY, with everything only the FRAME knows written into it as
+/// literals: `:var` from the declared variables, `NEW.<col>` and
+/// `OLD.<col>` from the row the trigger fired over.
+///
+/// A body's query is text and goes down the ordinary planner, which
+/// knows nothing of a frame - so `SELECT MULT FROM RATE WHERE K =
+/// NEW.K` has to become `... WHERE K = 2` before it is planned. That is
+/// the same substitution the body's own DML already makes through
+/// [render_psql_expr], done at the level a query is kept at.
+///
+/// A value with no literal form (a blob, a timestamp this server cannot
+/// spell) refuses rather than being dropped or guessed at, and so does
+/// a `NEW.`/`OLD.` reference the row has no column for.
+fn subst_body_query(sql: &str, binds: &[(String, u16)], f: &PsqlFrame) -> Option<String> {
+    let b = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len() + 16);
+    let mut in_str = false;
+    let mut i = 0usize;
+    while i < b.len() {
+        let c = b[i];
+        if c == b'\'' {
+            in_str = !in_str;
+            out.push('\'');
+            i += 1;
+            continue;
+        }
+        if !in_str && c == b':' && b.get(i + 1).is_some_and(|c| c.is_ascii_alphabetic() || *c == b'_')
+        {
+            let start = i + 1;
+            let mut j = start;
+            while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
+                j += 1;
+            }
+            let name = &sql[start..j];
+            match binds.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)) {
+                Some((_, slot)) => {
+                    out.push_str(&psql_literal(
+                        f.vars.get(*slot as usize).unwrap_or(&Value::Null),
+                    )?);
+                }
+                // NOT THIS ARM'S TO SUBSTITUTE. A `FOR SELECT`'s and a
+                // cursor's variables are marked by the PARSER instead
+                // ([PSQL_VAR_MARK]), so those arms pass an empty binds
+                // list and only the row references below are written in.
+                None => out.push_str(&sql[i..j]),
+            }
+            i = j;
+            continue;
+        }
+        // NEW. / OLD. - only where a name could START, so a column
+        // called RENEW.X or a qualified NEW."X" is left alone
+        if !in_str
+            && (c == b'N' || c == b'n' || c == b'O' || c == b'o')
+            && (i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_' || b[i - 1] == b'$' || b[i - 1] == b'.'))
+        {
+            let up = sql[i..].to_ascii_uppercase();
+            let ctx = if up.starts_with("NEW.") {
+                1u8
+            } else if up.starts_with("OLD.") {
+                2u8
+            } else {
+                out.push(c as char);
+                i += 1;
+                continue;
+            };
+            let start = i + 4;
+            let mut j = start;
+            while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_' || b[j] == b'$') {
+                j += 1;
+            }
+            if j == start {
+                return None;
+            }
+            let name = &sql[start..j];
+            let v = f.trig.as_ref().and_then(|t| t.read(ctx, name))?;
+            out.push_str(&psql_literal(&v)?);
+            i = j;
+            continue;
+        }
+        out.push(c as char);
+        i += 1;
+    }
+    if in_str {
+        return None;
+    }
+    Some(out)
+}
+
 fn psql_literal(v: &Value) -> Option<String> {
     Some(match v {
         Value::Null => "NULL".to_string(),
@@ -64148,6 +64329,22 @@ fn wrap_at_procedure(inner: EvalErr, at: Vec<String>) -> EvalErr {
             }
             below.extend(lines);
             EvalErr::AtProcedure { inner, at: below }
+        }
+        // A CHECK CONSTRAINT'S OWN VECTOR ALREADY ENDS IN ONE. Its
+        // `isc_stack_trace` item names the check trigger, and a body
+        // whose write violates it continues THAT item rather than
+        // adding a second: the whole stack is one status element with
+        // newlines in it, which is why isql prints a `-` before the
+        // first line and nothing before the rest (measured against a
+        // body that raised from inside a nested INSERT, and again over
+        // the engine's own trigger-recursion stack, where every line
+        // after the first is bare).
+        EvalErr::CheckViolation { constraint, table, trigger: Some(mut t) } => {
+            for line in at {
+                t.push('\n');
+                t.push_str(&line);
+            }
+            EvalErr::CheckViolation { constraint, table, trigger: Some(t) }
         }
         inner => EvalErr::AtProcedure { inner: Box::new(inner), at },
     }
@@ -64352,6 +64549,9 @@ fn exec_psql_stmt_inner(
                     q = q.replace(&mark, &lit);
                 }
             }
+            // ...and the ROW the trigger fired over, for a loop query
+            // that reads by it (`FOR SELECT ... WHERE K = NEW.K`)
+            let q = subst_body_query(&q, &[], f).ok_or(PsqlStop::Unsupported)?;
             let rows = {
                 let mut sink: Vec<Option<Descriptor>> = Vec::new();
                 let plan = plan_query_inner(&q, &*db, &mut sink)
@@ -64407,6 +64607,7 @@ fn exec_psql_stmt_inner(
                 return Err(PsqlStop::Unsupported); // already open
             }
             let query = state.query.clone();
+            let query = subst_body_query(&query, &[], f).ok_or(PsqlStop::Unsupported)?;
             let rows = {
                 let mut sink: Vec<Option<Descriptor>> = Vec::new();
                 let plan = plan_query_inner(&query, &*db, &mut sink)
@@ -64712,10 +64913,11 @@ fn exec_psql_stmt_inner(
         // it, and the arity is judged against the PLAN's projection
         // (so an empty result still refuses a mismatched list, the
         // -313 the engine raises at prepare).
-        TrigStmt::SelectInto { sql, into, .. } => {
+        TrigStmt::SelectInto { sql, into, binds, .. } => {
+            let sql = subst_body_query(sql, binds, f).ok_or(PsqlStop::Unsupported)?;
             let mut sink: Vec<Option<Descriptor>> = Vec::new();
             let plan =
-                plan_query_inner(sql, &*db, &mut sink).ok_or(PsqlStop::Unsupported)?;
+                plan_query_inner(&sql, &*db, &mut sink).ok_or(PsqlStop::Unsupported)?;
             if !sink.is_empty() {
                 return Err(PsqlStop::Unsupported); // a `?` this surface cannot bind
             }
@@ -66201,14 +66403,33 @@ fn apply_row_changes(
 /// `BEGIN` plus the offset's own position inside the source gives the
 /// engine's line and column. Without an anchor there is no honest
 /// number, and the item is left off rather than invented.
+/// The point in a body's source that [debug_info_anchor]'s line and
+/// column MEASURE.
+///
+/// The engine's first `RDB$DEBUG_INFO` source entry is the DECLARATION
+/// SECTION when the body has one and the body's `BEGIN` when it does
+/// not (measured: a trigger declaring `V` on its own line has entries
+/// at the DECLARE's line, then `BEGIN`'s, then each statement's; one
+/// declaring nothing starts at `BEGIN`). Anchoring on `BEGIN` either
+/// way put every stack item ONE LINE SHORT for a body whose header sits
+/// on a line of its own - invisible for as long as every gated trigger
+/// wrote `AS DECLARE ... BEGIN` on ONE line, where the two are the same
+/// line.
+fn anchor_base(source: &str) -> Option<usize> {
+    let up = source.to_ascii_uppercase();
+    let begin_at = find_word(&up, "BEGIN", 0)?;
+    // a DECLARE inside the body is another statement's; only the
+    // HEADER's declaration section is what the engine anchored on
+    Some(find_word(&up[..begin_at], "DECLARE", 0).unwrap_or(begin_at))
+}
+
 fn trig_position(d: &TrigDef, off: usize) -> Option<(u32, u32)> {
     let (aline, acol) = d.anchor?;
-    let up = d.source.to_ascii_uppercase();
-    let begin_at = find_word(&up, "BEGIN", 0)?;
-    if off < begin_at || off > d.source.len() {
+    let base = anchor_base(&d.source)?;
+    if off < base || off > d.source.len() {
         return None;
     }
-    let between = &d.source.as_bytes()[begin_at..off];
+    let between = &d.source.as_bytes()[base..off];
     let newlines = between.iter().filter(|&&c| c == b'\n').count() as u32;
     if newlines == 0 {
         return Some((aline, acol + between.len() as u32));
@@ -66229,6 +66450,107 @@ fn trig_position(d: &TrigDef, off: usize) -> Option<(u32, u32)> {
 /// vector, wrapped in the trigger's name the way the engine wraps it
 /// ("At trigger ..."). Nothing is half-applied: the caller's undo
 /// window takes the whole statement back.
+/// Fire a set of triggers whose bodies READ OR WRITE the database,
+/// where the engine fires them, and hand the statement a fresh working
+/// copy to carry on with.
+///
+/// The statement is holding its working copy when a trigger fires, and
+/// a body's own statement goes down the ORDINARY path - it takes a copy
+/// of its own and installs it. Two writers cloning the same base both
+/// install a whole image and the second silently drops the first's
+/// rows, so the copy is PUBLISHED first ([Database::install_dirty]) and
+/// taken again after. That is not a concession: publishing is what puts
+/// the body's read on the file the engine would show it - every row the
+/// statement has stored so far, and not the one it is storing now.
+///
+/// The statement's undo window covers all of it. A statement that
+/// publishes mid-way is undone the way a row-by-row one is, by killing
+/// the id its rows carry rather than by dropping a copy, which is why
+/// [execute_dml_collecting] opens a [WindowKind::Nested] window for a
+/// plan that fires one of these (measured: an `INSERT` whose BEFORE
+/// trigger logged a row, failing its own CHECK afterwards, leaves the
+/// log EMPTY).
+/// The CURSORS a trigger declares, as frame state.
+///
+/// A procedure's are built from its header when it is loaded; a trigger
+/// declares them in the same place - between `AS` and `BEGIN` - and its
+/// frame was built with an empty map, so `OPEN CU` in a trigger body had
+/// no cursor to find.
+fn trig_cursor_states(source: &str) -> std::collections::HashMap<String, CursorState> {
+    let up = source.to_ascii_uppercase();
+    let Some(begin_at) = find_word(&up, "BEGIN", 0) else {
+        return std::collections::HashMap::new();
+    };
+    declared_cursors(&source[..begin_at])
+        .into_iter()
+        .map(|(name, query)| (name, CursorState { query, rows: None, at: 0 }))
+        .collect()
+}
+
+fn fire_triggers_published(
+    database: &mut Option<Database>,
+    work: fire_crab_ods::Image,
+    // the id this statement's records carry, ADOPTED as the copy is
+    // published - see below
+    stmt_tx: Option<u32>,
+    ctx: &SessionCtx,
+    cols: &[RelationColumn],
+    defs: &[TrigDef],
+    before: bool,
+    action: u8,
+    new: Option<&mut Vec<Value>>,
+    old: Option<&Vec<Value>>,
+) -> Result<fire_crab_ods::Image, ExecErr> {
+    if let Some(d) = database.as_mut() {
+        d.install_dirty(work);
+        // ...AND THE TRANSACTION OWNS ITS ID FROM HERE. A statement
+        // reserves an id in its working copy and only ADOPTS it when it
+        // installs ([Database::work_copy_with_tx]), which is what makes
+        // a failed statement burn nothing. A statement that publishes
+        // mid-way HAS installed - and until the id is adopted, the rows
+        // it carries are another transaction's uncommitted work to
+        // every reader, this body's included. Un-adopted, an AFTER
+        // INSERT body does not count the row it fired for, an AFTER
+        // UPDATE body reads the value before the update and a BEFORE
+        // DELETE body's `AFTER` twin still sees the row: all three
+        // measured wrong before this line. The id is undone with the
+        // rows if the statement fails - that is what the window around
+        // it is for.
+        if let Some(tx) = stmt_tx {
+            d.adopt_tx(tx);
+        }
+        d.refresh_reader_view();
+    }
+    let depth = TRIGGER_DEPTH.with(|d| {
+        let n = d.get() + 1;
+        d.set(n);
+        n
+    });
+    let r = if depth > MAX_TRIGGER_DEPTH {
+        // TWO TABLES WHOSE TRIGGERS WRITE EACH OTHER recurse the way a
+        // self-writing body would, and a body naming its own table is
+        // the only cycle the planner can see. The engine runs to
+        // `Statement::MAX_CLONES` = 1000 and answers 54001; each level
+        // here is a whole executor frame, so this refuses long before
+        // the stack does rather than answering by crashing.
+        Err(ExecErr::Text("trigger bodies are nested too deeply".into()))
+    } else {
+        fire_triggers(database, ctx, cols, defs, before, action, new, old, None)
+    };
+    TRIGGER_DEPTH.with(|d| d.set(d.get() - 1));
+    r?;
+    let d = database.as_mut().ok_or("no database attached")?;
+    d.work_copy().map_err(ExecErr::Text)
+}
+
+/// How deep a chain of trigger bodies may fire before this server
+/// refuses - see [fire_triggers_published].
+const MAX_TRIGGER_DEPTH: u32 = 16;
+
+thread_local! {
+    static TRIGGER_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
 fn fire_triggers(
     database: &mut Option<Database>,
     ctx: &SessionCtx,
@@ -66246,11 +66568,11 @@ fn fire_triggers(
     // a drawing body then refuses, as it did before.
     mut draw: Option<&mut dyn FnMut(&str, Option<i64>) -> Result<i64, ExecErr>>,
 ) -> Result<(), ExecErr> {
-    if !defs.iter().any(|d| d.before == before && !d.deferred) {
+    if !defs.iter().any(|d| d.before == before) {
         return Ok(());
     }
     let mut new_row = new;
-    for d in defs.iter().filter(|d| d.before == before && !d.deferred) {
+    for d in defs.iter().filter(|d| d.before == before) {
         let (body, names) = trig_body_of(d).ok_or_else(|| {
             ExecErr::Text(format!("trigger {} is outside this server's PSQL surface", d.name))
         })?;
@@ -66260,7 +66582,7 @@ fn fire_triggers(
             out_len: 0,
             suspended: Vec::new(),
             caught: None,
-            cursors: std::collections::HashMap::new(),
+            cursors: trig_cursor_states(&d.source),
             row_count_slot: None,
             trig_excs: d.excs.clone(),
             trig: Some(TrigCtx {
@@ -66292,7 +66614,7 @@ fn fire_triggers(
                 out_len: 0,
                 suspended: Vec::new(),
                 caught: None,
-                cursors: std::collections::HashMap::new(),
+                cursors: trig_cursor_states(&d.source),
                 row_count_slot: None,
                 trig_excs: d.excs.clone(),
                 trig: frame.trig.clone(),
@@ -85014,5 +85336,6 @@ mod tests {
         arm_blob_mint(None);
         assert!(mint_computed_blob(&[b"x".to_vec()]).is_err());
     }
+
 }
 

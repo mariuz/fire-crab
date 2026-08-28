@@ -237,7 +237,13 @@ P2=$((PORT + 1))
 LOG2="/tmp/fc-serve-carefulflush-off-$PORT.log"
 FC_NO_CAREFUL=1 FC_SRV_TRACE=1 "$FCWIRE" serve "127.0.0.1:$P2" "$U" "$P" >"$LOG2" 2>&1 &
 srv2=$!
-trap 'kill $srv $srv2 2>/dev/null' EXIT
+# EVERY server this gate started, including the async one above: an
+# earlier version of this line listed only $srv and $srv2 and LEAKED the
+# async server on every successful run, so the NEXT run of this gate at
+# the same port found PORT+2 taken and reported "the async server is not
+# running" - a QA leak that reads exactly like a regression (it failed a
+# full sweep that way, the leak having come from the sweep before it)
+trap 'kill $srv $srv2 $srv3 2>/dev/null' EXIT
 i=0; while [ $i -lt 20 ]; do
     command -v nc >/dev/null 2>&1 && nc -z 127.0.0.1 "$P2" 2>/dev/null && break
     i=$((i + 1)); sleep 0.1

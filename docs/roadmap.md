@@ -1238,6 +1238,132 @@ for retrieval (its itype is unknown to the index-op reader) and an
 INSERT into a table carrying one still refuses — pre-existing, and the
 reason the gate's fixture has no index.
 
+**A TRIGGER BODY THAT LOOPS, AND ONE THAT CALLS — DONE 2026-08-28
+(`serve-real-trigloop` 12, new).** The rest of the surface the chunk
+below opened: `FOR SELECT ... INTO ... DO`, a declared CURSOR with
+`OPEN`/`FETCH`/`CLOSE`, and `EXECUTE PROCEDURE` in both its forms
+(arguments, and `RETURNING_VALUES`).
+
+THE LAW THAT DECIDES IT, probed first: **a loop takes its rows when it
+starts.** A `FOR SELECT` over a table whose own loop body INSERTS into
+that same table still walks only the rows that were there when it
+opened — measured on a two-row table inserting one row per iteration:
+the loop runs TWICE and leaves four rows. A cursor behaves the same
+between its `OPEN` and its `CLOSE`. This server's `ForSelect` already
+materialised its rows through `branch_rows` before the loop, so it
+inherits the engine's answer; an implementation that re-read the table
+per iteration would not terminate on the engine's own fixture.
+
+Three things were missing rather than wrong. A loop's and a cursor's
+query substituted VARIABLES but not the ROW — the same defect
+`SELECT INTO` had — so `FOR SELECT ... WHERE K = NEW.K` could not be
+planned; both go through `subst_body_query` now, with an empty bind list
+because their variables were already marked by the parser. Trigger
+frames were built with an EMPTY cursor map (only procedures ever
+populated one from their header), so `OPEN CU` in a trigger body had no
+cursor to find — `trig_cursor_states` reads the trigger's own header the
+same way. And `trig_body_inlineable` was widened to let these run.
+
+A REAL DEFECT CAME OUT OF IT, in the stack item this project has pinned
+since the trigger chunk. The engine's first `RDB$DEBUG_INFO` source
+entry is the DECLARATION SECTION when a body has one and the body's
+`BEGIN` when it does not (measured, entry by entry: a trigger declaring
+`V` on its own line has entries at the DECLARE's line, then `BEGIN`'s,
+then each statement's). This server anchored on `BEGIN` either way, so
+every stack item from a body whose header sits on a line of ITS OWN was
+**one line short** — `line: 7` where the engine says `line: 8`. It was
+invisible for as long as every gated trigger wrote `AS DECLARE ...
+BEGIN` on one line, where the two are the same line. `anchor_base`
+measures from whichever point the engine anchored on.
+
+RECORDED BOUNDARIES: `EXECUTE STATEMENT` in such a body (it builds its
+statement at runtime, where the prepare-time walk can see no table name
+to judge, and the self-write refusal below depends on that walk) and an
+autonomous block (a transaction of its own around a published working
+copy, never measured).
+
+**A TRIGGER BODY THAT READS AND WRITES THE DATABASE — DONE 2026-08-28
+(`serve-real-trigdb` 24, new; `serve-real-trigfire` two boundaries
+became answers).** The classic triggers work now: an AUDIT trigger that
+writes another table from a `BEFORE` body, and a LOOKUP trigger that
+reads one to decide a column. Until this, a body that touched the
+database at all made every `INSERT`, `UPDATE` and `DELETE` against its
+table refuse — a table with an audit trigger could not be written.
+
+THE MECHANISM IS ONE LINE OF REASONING. A trigger fires inside a
+statement that is holding its working copy of the file, and a body's own
+statement goes down the ORDINARY path — taking a copy and installing it.
+Two writers cloning the same base both install a whole image and the
+second silently drops the first's rows, which is why such a body was
+refused. So the statement PUBLISHES its copy around the body
+(`fire_triggers_published`) and takes a fresh one after. Publishing is
+not a concession to the mechanism: it is what puts the body's read on
+exactly the file the engine shows it.
+
+WHAT THE ENGINE SHOWS IT, all measured first:
+
+- A `BEFORE` body reads its own table WITHOUT the row being written and
+  WITH every earlier row of the same statement. Under an `INSERT ...
+  SELECT` of three rows the per-row `SELECT COUNT(*)` answers 0, 1, 2 —
+  so the body can be run neither after the statement (3, 3, 3) nor
+  before it. The AFTER-the-statement ordering is what this server used
+  to do for the one body shape it could defer, and it is gone with the
+  whole `deferred` path.
+- An `AFTER` body reads the table WITH the row.
+- A `BEFORE UPDATE` body reads the sum BEFORE this row's update; a
+  `BEFORE DELETE` body still counts the row it is about to remove.
+- A statement that fails takes the body's writes with it, however far
+  the body got: a trigger that logged a row whose own `INSERT` then
+  violates a `CHECK` leaves the log EMPTY.
+- A body's write fires the triggers of what it writes, and those fire on.
+
+THREE THINGS HAD TO CHANGE UNDERNEATH, each found by the gate:
+
+1. **The window kind.** A statement whose writes are installed as it
+   goes cannot be undone by dropping a copy. It takes a
+   `WindowKind::Nested` window — undone by killing the id its rows carry
+   — exactly as a row-by-row statement already did.
+2. **The transaction id is adopted AT THE PUBLISH.** A statement
+   reserves an id in its copy and adopts it only when it installs, which
+   is what makes a failed statement burn nothing. Un-adopted, the rows
+   it has written are another transaction's uncommitted work to every
+   reader — including this body. An `AFTER INSERT` body did not count
+   the row it fired for, an `AFTER UPDATE` body read the value before
+   the update, and a `BEFORE DELETE` body's `AFTER` twin still saw the
+   row: three wrong answers from one missing line.
+3. **The rows are written AS THEY ARE READ.** The `UPDATE` and `DELETE`
+   arms read and validate every row, then write them all. That is
+   invisible until a body reads the table: all three bodies then see the
+   same state, where the engine's answer walks. The write walk's body is
+   now `write_updated_row`, called either from the walk or from inside
+   the scan loop — same function, same order, different moment — and the
+   gate pins it with a log table read WITH NO `ORDER BY`, so the
+   physical order of the rows the bodies wrote is compared too.
+
+TWO PRE-EXISTING DEFECTS SURFACED BESIDE IT. `:VAR` was accepted only in
+the embedded-DML positions (`colon_clean`), never in a plain PSQL one —
+so `IF (:M IS NOT NULL)` refused the whole body, which is how a lookup
+trigger is written; both forms resolve to the same slot now. And a body
+query was planned as raw text, so `SELECT MULT FROM RATE WHERE K =
+NEW.K` could not be planned at all; `subst_body_query` writes the
+frame's values in as literals, the same substitution the body's own DML
+already made.
+
+The status vector gained a law too: a `CHECK` constraint's vector
+already ENDS in an `isc_stack_trace` item, and a body whose write
+violates it CONTINUES that item rather than adding a second — the whole
+stack is one element with newlines in it, which is why isql prints a `-`
+before the first line and nothing before the rest.
+
+RECORDED BOUNDARIES: a body that WRITES THE TABLE IT FIRES FOR (the
+engine recurses to `Statement::MAX_CLONES` = 1000 and answers 54001;
+each level here is a whole executor frame, so it refuses rather than
+answering by crashing — a cross-table cycle is caught at depth 16), a
+cursor / `FOR SELECT` / `EXECUTE STATEMENT` / autonomous block in such a
+body, and a body that DRAWS A GENERATOR beside one that needs the
+database (the draw belongs to the caller, which has handed its working
+copy back).
+
 **THE STAR IN `RETURNING`, AN ALIASED DML TARGET, AND A MERGE'S THIRD
 ROW — DONE 2026-08-28 (`serve-real-returnold` 25 → 52).** The three
 boundaries the entry above recorded, closed together, because they are
