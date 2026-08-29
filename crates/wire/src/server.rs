@@ -15466,7 +15466,30 @@ fn text_form_m(
         Expr::Concat(a, b) => {
             let (_, wa, ca) = text_form(a, descs)?;
             let (_, wb, cb) = text_form(b, descs)?;
-            Some((true, wa + wb, cs_join(ca, cb)))
+            let joined = cs_join(ca, cb);
+            // A BYTE-CARRIER RESULT COUNTS BYTES, not characters. Every
+            // other charset announces `width x bytes-per-char` at
+            // emission, but a carrier is one byte per character, so an
+            // operand that is WIDER than one byte per character has to
+            // contribute its BYTE width here or it is announced short:
+            // `<UTF8 VARCHAR(32)> || <OCTETS VARCHAR(32)>` is 160 bytes
+            // on the engine (32x4 + 32) where summing characters said
+            // 64. An announced width that disagrees with the shipped
+            // bytes is the wire desync this server has paid for before.
+            let carrier = matches!(joined, TfCs::Ttype(t)
+                if fire_crab_ods::intl::byte_carrier(fire_crab_ods::intl::charset_id(t as i16)));
+            if carrier {
+                let bytes = |w: i32, c: TfCs| match c {
+                    TfCs::Ttype(t) => {
+                        w * fire_crab_ods::intl::bytes_per_char(
+                            fire_crab_ods::intl::charset_id(t as i16),
+                        ) as i32
+                    }
+                    TfCs::Att => w,
+                };
+                return Some((true, bytes(wa, ca) + bytes(wb, cb), joined));
+            }
+            Some((true, wa + wb, joined))
         }
         // Text-returning FUNCTIONS, each rule probed with SQLDA_DISPLAY:
         //
@@ -52876,7 +52899,95 @@ fn resolve_expr(
     // appears: inside a concatenation, a comparison, an aggregate's
     // source or the select list
     let e = align_conditional(resolve_expr_inner(raw, columns, descs)?, descs);
-    Some(pad_conditional(e, descs))
+    Some(pad_conditional(recode_concat(e, descs), descs))
+}
+
+/// EACH CONCATENATION OPERAND IS CONVERTED TO THE RESULT'S CHARACTER
+/// SET before it is joined.
+///
+/// `eval` joins two rendered strings and has no descriptors to convert
+/// against, so an operand whose charset differs from the result's was
+/// simply spliced in as-is. Everything then went wrong at once, because
+/// a `String` in this server means different things for different
+/// charsets: a byte-carrier column's octets are carried one char per
+/// byte, while a UTF8 column's are real characters.
+///
+/// `<NONE> || <WIN1252>` was the worst of it. The NONE octets were
+/// carried as chars U+0073.. U+009F.., the result announced WIN1252,
+/// and the emit path then tried to TRANSLITERATE those chars into
+/// WIN1252 - where U+009F has no image, since WIN1252 maps 0x9F to
+/// U+0178. The transliteration failed MID-ROW, after bytes were already
+/// on the wire, and the client got SQLSTATE 08006 and a dropped
+/// connection. Not a wrong answer: a broken session.
+///
+/// The engine's law, probed: a byte carrier is BYTES. Converting to or
+/// from one is a BYTE COPY, never a transliteration - so `<NONE> ||
+/// <WIN1252>` is simply the two operands' stored octets, one after the
+/// other, read back in WIN1252. [transcode_text] already implements
+/// exactly that (carrier source to tabled destination re-spells each
+/// octet; a carrier destination copies bytes); nothing called it from
+/// here. The vehicle is the synthetic text CAST, which is what invokes
+/// it.
+///
+/// Only operands whose charset is STATICALLY KNOWN are wrapped. A
+/// literal carries the attachment's charset, which is not known until
+/// emission, and guessing it here would convert against the wrong set -
+/// those keep today's path.
+fn recode_concat(e: Expr, descs: &[Descriptor]) -> Expr {
+    use fire_crab_ods::intl::{byte_carrier, bytes_per_char, charset_id};
+    let Expr::Concat(a, b) = e else { return e };
+    // A BLOB CONCATENATION IS LEFT ALONE. Its result type is found by
+    // walking the expression for a `BlobText` node ([blob_result]), and
+    // that walk does not descend through a CAST - so wrapping an
+    // operand here HID the blob and a binary one started describing as
+    // a text blob, sub_type 1 charset UTF8 where the engine says 0
+    // (caught by serve-real-blobexpr before this shipped). Blob
+    // operands carry their own charset rules anyway.
+    if blob_result(&Expr::Concat(a.clone(), b.clone()), descs).is_some() {
+        return Expr::Concat(a, b);
+    }
+    let (Some((_, wa, ca)), Some((_, wb, cb))) =
+        (text_form(&a, descs), text_form(&b, descs))
+    else {
+        return Expr::Concat(a, b);
+    };
+    let TfCs::Ttype(dt) = cs_join(ca, cb) else { return Expr::Concat(a, b) };
+    let dst = charset_id(dt as i16);
+    // ONLY a destination [transcode_text] actually implements. It knows
+    // byte carriers, the tabled single-byte sets and UTF8; for anything
+    // else - UNICODE_FSS, which is what the CATALOG columns carry - a
+    // carrier source falls through to `decode_text`, which answers None
+    // for an untabled set and raises `Malformed string`. That turned
+    // `RDB$FUNCTION_NAME || RDB$MODULE_NAME` (two catalog columns of
+    // DIFFERENT sets) into an error where the engine answers, and
+    // serve-real-blobfilter caught it in the sweep. Leaving those pairs
+    // on the previous path is the conservative half of the fix: they
+    // were not among the defects this addresses.
+    if !(byte_carrier(dst) || fire_crab_ods::intl::tabled(dst) || dst == fire_crab_ods::intl::CS_UTF8) {
+        return Expr::Concat(a, b);
+    }
+    let wrap = |x: Box<Expr>, c: TfCs, w: i32| -> Box<Expr> {
+        let TfCs::Ttype(t) = c else { return x };
+        let src = charset_id(t as i16);
+        if src == dst {
+            return x;
+        }
+        // the target width is in the DESTINATION's characters, and a
+        // byte carrier's are octets - so a wider source has to be given
+        // room for its bytes or the cast would truncate it
+        let len = if byte_carrier(dst) { w * bytes_per_char(src) as i32 } else { w };
+        Box::new(Expr::Cast(
+            x,
+            CastTarget::Text {
+                len: len.max(0) as usize,
+                pad: false,
+                synthetic: true,
+                cs: Some(dst),
+            },
+            src,
+        ))
+    };
+    Expr::Concat(wrap(a, ca, wa), wrap(b, cb, wb))
 }
 
 /// A NUMERIC-formed conditional must ANSWER AT THE SCALE IT ANNOUNCES.

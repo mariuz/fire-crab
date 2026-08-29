@@ -3041,6 +3041,69 @@ pointer-page and TIP page numbers is the next step when it dominates.
 
 ## Next, in order
 
+- **CONCATENATING ACROSS CHARACTER SETS DONE (2026-08-29,
+  `serve-real-concatcs` 44):** `eval` joins two rendered strings and has
+  no descriptors to convert against, so an operand whose charset
+  differed from the result's was spliced in as it stood. A `String`
+  means different things per charset here - a byte carrier's octets ride
+  one char per byte, a UTF8 column's are real characters - so this was
+  not a rounding difference.
+  **THE WORST OF IT WAS NOT A WRONG ANSWER.** `<NONE> || <WIN1252>`
+  carried the NONE octets as chars U+0073.. U+009F.., announced the
+  result WIN1252, and the emit path then tried to TRANSLITERATE those
+  chars into WIN1252 - where U+009F has no image, WIN1252 mapping 0x9F
+  to U+0178. It failed MID-ROW, after bytes were already on the wire:
+  SQLSTATE 08006 and a DROPPED CONNECTION. The gate therefore asserts
+  the session answers a SECOND question afterwards, not merely that the
+  bytes agree.
+  THE LAW (probed): a byte carrier is BYTES; a conversion to or from one
+  is a BYTE COPY, never a transliteration. `transcode_text` already
+  implemented exactly that - carrier source to tabled destination
+  re-spells each octet, a carrier destination copies bytes - and nothing
+  called it from the concatenation path. Each operand whose charset is
+  STATICALLY KNOWN is now converted to the result's set before joining,
+  through the synthetic text CAST that invokes it.
+  Also fixed: a BYTE-CARRIER RESULT counts BYTES, not characters.
+  `<UTF8 VARCHAR(32)> || <OCTETS VARCHAR(32)>` is 160 bytes on the
+  engine (32x4 + 32) where summing characters announced 64 - and an
+  announced width that disagrees with the shipped bytes is the same wire
+  desync as above. (`cs_join` itself was already right: OCTETS absorbs
+  from either side, NONE is weakest, ASCII yields to all but NONE.)
+  TWO REGRESSIONS CAUGHT BEFORE SHIPPING, both by adjacent gates rather
+  than by the sweep summary. The second is the more instructive: the
+  wrap fired for CATALOG columns, which carry UNICODE_FSS, and
+  `transcode_text` implements byte carriers, the tabled single-byte sets
+  and UTF8 - nothing else. A carrier source into UNICODE_FSS falls
+  through to `decode_text`, which answers None for an untabled set and
+  raises `Malformed string`, so `RDB$FUNCTION_NAME || RDB$MODULE_NAME`
+  became an ERROR where the engine answers (`serve-real-blobfilter`).
+  The wrap is now restricted to destinations `transcode_text` actually
+  implements - the same predicate `cast_source_charset` already uses.
+  What pointed at the cause: `TRIM(<same col>) || TRIM(<same col>)`
+  worked while two DIFFERENT columns failed, which ruled out the TRIM
+  and the CAST and left the charset PAIR. It was then confirmed as ours
+  by rebuilding the committed binary and re-running the query - the same
+  check that had earlier established the gbakverbose flake was NOT ours.
+  And the first: the first cut wrapped BLOB operands too. A
+  blob concatenation's result type is found by WALKING for a `BlobText`
+  node, and that walk does not descend through a CAST - so the wrapper
+  HID the blob and a binary one described as a text blob, sub_type 1
+  charset UTF8 where the engine says 0. `serve-real-blobexpr` caught it;
+  blob concatenations are now left alone.
+  DIVERGENCES (recorded, and ASSERTED in the gate as known-different so
+  that FIXING them trips it): a **`<NONE column> || <literal>`** still
+  splices the carrier's octets as UTF-8, because a literal's charset is
+  the ATTACHMENT's and the join is therefore the attachment sentinel -
+  no static conversion is possible, and the eval path has no attachment
+  at all. Fixing it needs the conversion DEFERRED to emission. Note
+  `<OCTETS> || <literal>` is CORRECT, since OCTETS absorbs and the join
+  is statically known. Second: **`CAST(<literal> AS ... CHARACTER SET
+  WIN1252)` under a NONE attachment** - the engine byte-copies the
+  literal's octets where this transliterates; under UTF8 it agrees. Both
+  answer with the wrong bytes rather than refusing.
+  Closes hunt findings 11 and 12, and the column half of 10; the literal
+  halves of 10 and 30 remain, precisely characterised above.
+
 - **A NARROWING NUMERIC CAST RAISES 22003 DONE (2026-08-29,
   `serve-real-castint` 42 -> 58):** `CAST(<value> AS NUMERIC(p,s))`
   checked only the i64 edge, so a value that overflowed a NARROWER
