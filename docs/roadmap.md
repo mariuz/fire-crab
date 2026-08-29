@@ -1338,8 +1338,27 @@ host, its OS user, its library version - are not retained by this
 server, so they answer NULL rather than a guess, and the gate asserts
 that too.
 
+**AND `MON$TRANSACTIONS` WITH IT (`serve-real-monitoring` 13 → 17).**
+Every attachment's live transactions, published by the sessions that own
+them. A `SNAPSHOT` transaction reports mode 1 and ACTIVE on BOTH
+servers, which is the comparison that can be made — and every
+transaction joins an attachment this server also names.
+
+WHICH ONE IS ACTIVE MOVES WITH THE STATEMENT, which is why the publish
+is once per REQUEST rather than only where a transaction starts or ends:
+a client may prepare on one handle and execute on another (isql does),
+so a flag written at `SET TRANSACTION` is stale by the time anybody
+asks. It named the snapshot transaction idle and isql's spare one
+active, exactly backwards from the engine, until the refresh moved to
+the top of the op loop.
+
+A DIVERGENCE IN WHAT THE SERVERS DO, not in what they report, recorded
+and gated: the engine's default read committed is READ CONSISTENCY (mode
+4) and this server reads the latest committed version (mode 2). Each
+answers what it actually does — which is the point of the column.
+
 RECORDED DIVERGENCE, still, asserted by the gate so a change shows: the
-engine lists live TRANSACTIONS and STATEMENTS; this server answers none.
+engine lists live STATEMENTS; this server answers none.
 An empty relation of the right shape is something a client can read —
 the all-NULL row was not. The one thing that row bought, a firebird-qa
 bootstrap whose projection uses `COUNT(DISTINCT ...)` and `IIF(...)`,

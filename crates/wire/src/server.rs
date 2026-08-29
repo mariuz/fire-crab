@@ -2889,6 +2889,28 @@ fn attachments_for(path: &str) -> std::sync::Arc<DbGate> {
 /// its DPB - its process id and name, its host, its OS user, its
 /// library version - are not retained here, so they answer NULL rather
 /// than a guess; the same rule `MON$DATABASE` follows.
+/// One live TRANSACTION of an attachment, as `MON$TRANSACTIONS`
+/// reports it. Published by the session that owns it, at the moments it
+/// changes - a transaction starting, committing or rolling back.
+#[derive(Clone)]
+struct TxRow {
+    /// the handle the client names it by
+    handle: i32,
+    /// is this the transaction the attachment's statements run under?
+    active: bool,
+    /// the id its records carry, once it has one
+    id: Option<u32>,
+    /// `MON$ISOLATION_MODE`: 0 consistency, 1 concurrency (SNAPSHOT),
+    /// 2 read committed reading the latest version. The engine answers
+    /// 4 for its own default (read committed READ CONSISTENCY), which
+    /// is a mode this server does not implement and does not claim.
+    isolation: i64,
+    read_only: bool,
+    /// `MON$LOCK_TIMEOUT`: -1 waits for ever, 0 does not wait
+    lock_timeout: i64,
+    at: std::time::SystemTime,
+}
+
 #[derive(Clone)]
 struct AttachRow {
     id: i32,
@@ -2903,6 +2925,8 @@ struct AttachRow {
     encrypted: bool,
     /// the protocol version agreed at connect, as `P<n>`
     protocol: Option<String>,
+    /// the transactions this attachment has open right now
+    txs: Vec<TxRow>,
 }
 
 #[derive(Default)]
@@ -6951,9 +6975,120 @@ enum RowSource {
 /// record headers that a computed relation has none of.
 fn mon_computed_relation(db: &Database, rel: u16) -> bool {
     let image = db.bytes();
-    ["MON$DATABASE", "MON$ATTACHMENTS"]
+    ["MON$DATABASE", "MON$ATTACHMENTS", "MON$TRANSACTIONS"]
         .iter()
         .any(|n| fire_crab_ods::resolve_relation(&image, db.page_size, n) == Some(rel))
+}
+
+/// Publish this attachment's live transactions into the registry, so
+/// `MON$TRANSACTIONS` can name them.
+///
+/// Called where the set CHANGES - a transaction starting, committing or
+/// rolling back - rather than on a timer: the registry is a mirror of
+/// the session's own state, and a mirror that is only refreshed when
+/// somebody looks would be answering yesterday's question.
+fn publish_txs(database: &Option<Database>, attach_id: i32) {
+    let Some(db) = database.as_ref() else { return };
+    let mut rows: Vec<TxRow> = Vec::new();
+    let mut handles: Vec<i32> = db.txns.keys().copied().collect();
+    if db.cur_handle != 0 {
+        handles.push(db.cur_handle);
+    }
+    handles.sort_unstable();
+    for h in handles {
+        // the LIVE transaction's settings are the database's own; a
+        // parked one carries its settings in its slot
+        let (iso, ro, lt, id) = if h == db.cur_handle {
+            (
+                // what this transaction actually does: a snapshot is
+                // CONCURRENCY, and without one it reads the latest
+                // committed version
+                if db.consistency {
+                    0
+                } else if db.snapshot.is_some() {
+                    1
+                } else {
+                    2
+                },
+                db.read_only,
+                db.lock_timeout,
+                db.tx,
+            )
+        } else {
+            match db.txns.get(&h) {
+                Some(sl) => (
+                    if sl.snapshot.is_some() { 1 } else { 2 },
+                    sl.read_only,
+                    sl.lock_timeout,
+                    sl.tx,
+                ),
+                None => continue,
+            }
+        };
+        rows.push(TxRow {
+            handle: h,
+            // ACTIVE is the one this attachment's statements run under;
+            // the others it holds are IDLE, which is the engine's own
+            // distinction (measured: isql's spare transaction reports 0
+            // beside the one doing the work)
+            active: h == db.cur_handle,
+            id,
+            isolation: iso,
+            read_only: ro,
+            lock_timeout: lt.map(|n| n as i64).unwrap_or(-1),
+            at: std::time::SystemTime::now(),
+        });
+    }
+    let mut reg = db.attachments.attached.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(a) = reg.iter_mut().find(|a| a.id == attach_id) {
+        a.txs = rows;
+    }
+}
+
+/// The `MON$TRANSACTIONS` rows: every live transaction of every
+/// attachment on this file, as the sessions that own them published
+/// them ([publish_txs]).
+fn mon_transaction_rows(db: &Database, formats: &[(u8, Vec<Descriptor>)]) -> Vec<Vec<Value>> {
+    let image = db.bytes();
+    let Some((_, descs)) = formats.iter().max_by_key(|(n, _)| *n) else { return Vec::new() };
+    let cols = relation_columns(&image, db.page_size, "MON$TRANSACTIONS");
+    let head = image.page(0).and_then(fire_crab_ods::header::HeaderPage::decode);
+    let live = db.attachments.attached.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let mut out = Vec::new();
+    for a in &live {
+        for t in &a.txs {
+            let mut row = vec![Value::Null; descs.len()];
+            let mut put = |col: &str, v: Value| {
+                if let Some(c) = cols.iter().find(|c| c.name.eq_ignore_ascii_case(col)) {
+                    if let Some(slot) = row.get_mut(c.field_id as usize) {
+                        *slot = v;
+                    }
+                }
+            };
+            // a transaction that has written has an id; one that has not
+            // yet reserved one is named by its handle, which is what the
+            // client knows it by
+            let id = t.id.map(|n| n as i64).unwrap_or(t.handle as i64);
+            put("MON$TRANSACTION_ID", Value::Int(id));
+            put("MON$TOP_TRANSACTION", Value::Int(id));
+            put("MON$ATTACHMENT_ID", Value::Int(a.id as i64));
+            put("MON$STATE", Value::Int(t.active as i64));
+            put("MON$ISOLATION_MODE", Value::Int(t.isolation));
+            put("MON$READ_ONLY", Value::Int(t.read_only as i64));
+            put("MON$LOCK_TIMEOUT", Value::Int(t.lock_timeout));
+            put("MON$AUTO_COMMIT", Value::Int(0));
+            put("MON$AUTO_UNDO", Value::Int(1));
+            put("MON$AUTO_RELEASE_TEMP_BLOBID", Value::Int(0));
+            put("MON$STAT_ID", Value::Int(a.id as i64));
+            if let Some(h) = &head {
+                put("MON$OLDEST_TRANSACTION", Value::Int(h.oldest_transaction as i64));
+                put("MON$OLDEST_ACTIVE", Value::Int(h.oldest_active as i64));
+            }
+            let _ = t.at;
+            out.push(row);
+        }
+    }
+    out
 }
 
 /// The `MON$ATTACHMENTS` rows: every attachment this server has open on
@@ -7037,6 +7172,11 @@ fn mon_rows(
     // the sessions keep ([AttachRow]).
     if fire_crab_ods::resolve_relation(&image, db.page_size, "MON$ATTACHMENTS") == Some(rel) {
         return Some(mon_attachment_rows(db, formats));
+    }
+    // MON$TRANSACTIONS: every attachment's live transactions, as their
+    // own sessions published them
+    if fire_crab_ods::resolve_relation(&image, db.page_size, "MON$TRANSACTIONS") == Some(rel) {
+        return Some(mon_transaction_rows(db, formats));
     }
     if fire_crab_ods::resolve_relation(&image, db.page_size, "MON$DATABASE") != Some(rel) {
         return None;
@@ -72219,6 +72359,7 @@ fn after_auth(
             charset: db_default_charset(&db.bytes(), db.page_size),
             encrypted: enc.is_some(),
             protocol: Some(format!("P{}", best)),
+            txs: Vec::new(),
         };
         db.attachments.attached.lock().unwrap_or_else(|e| e.into_inner()).push(row);
     }
@@ -72373,6 +72514,15 @@ fn after_auth(
         // open savepoint - keeps it, because that image must not be put
         // back over anybody else's committed work.
         release_write_side(&mut database);
+        // ...AND THIS ATTACHMENT'S TRANSACTIONS ARE REPUBLISHED, once
+        // per request, for `MON$TRANSACTIONS`. It has to be here rather
+        // than only where a transaction starts or ends, because WHICH
+        // ONE IS ACTIVE moves with the statement: a client may prepare
+        // on one handle and execute on another (isql does), so a flag
+        // written at `SET TRANSACTION` is stale by the time anybody
+        // asks - it named the snapshot transaction idle and isql's
+        // spare one active, exactly backwards from the engine.
+        publish_txs(&database, attach_id);
         // THE READER'S VIEW OF THE CATALOG for this request: the
         // attachment's own transaction ids, owner-only - another
         // transaction's uncommitted CREATE TABLE is "Table unknown" here,
@@ -72512,6 +72662,7 @@ fn after_auth(
                 if std::env::var("FC_SRV_TRACE").is_ok() {
                     eprintln!("[srv] op_transaction -> handle {}", h);
                 }
+                publish_txs(&database, attach_id);
                 // ON TRANSACTION START, inside the transaction that just
                 // started - so what the body writes is that
                 // transaction's, and a raise here takes the transaction
@@ -72591,6 +72742,7 @@ fn after_auth(
                             ))
                         };
                     }
+                    publish_txs(&database, attach_id);
                     h
                 } else {
                     None
@@ -74997,6 +75149,9 @@ fn after_auth(
                         d.close_tx();
                     }
                 }
+                // the set changed: one fewer, or the same one retained
+                // under a new id
+                publish_txs(&database, attach_id);
                 respond(&mut s, &mut enc, 0)?;
             }
             x if x == OP_CANCEL => {

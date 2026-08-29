@@ -18,6 +18,8 @@
 #   * `MON$ATTACHMENTS` is COMPUTED too - one row per live attachment,
 #     from a registry each session keeps: who attached, from what
 #     address, over what protocol, and whether the wire is encrypted;
+#   * `MON$TRANSACTIONS` too - every attachment's live transactions,
+#     with the one its statements run under marked ACTIVE;
 #   * every other MON$ table scans its own (empty) storage and answers
 #     NO ROWS, with the right shape and the right column names.
 #
@@ -131,22 +133,56 @@ case "$r" in
     "N 1|") echo "OK   the DPB-sent columns answer NULL, not a guess" ;;
     *) echo "DIFF DPB columns: [$r]"; fail=1 ;;
 esac
+# ---- MON$TRANSACTIONS names the live transactions ----------------------
+# a SNAPSHOT transaction is mode 1 and ACTIVE on BOTH servers - which is
+# the comparison that can be made, because the DEFAULT isolation is not
+# the same thing on the two (below)
+both "a SNAPSHOT transaction: mode, state and read-only" \
+  "SET TRANSACTION SNAPSHOT;
+   SELECT MON\$ISOLATION_MODE AS ISO, MON\$STATE AS ST, MON\$READ_ONLY AS RO
+   FROM MON\$TRANSACTIONS WHERE MON\$ISOLATION_MODE = 1;
+   COMMIT;"
+both "...and a READ ONLY one says so" \
+  "SET TRANSACTION READ ONLY SNAPSHOT;
+   SELECT MON\$READ_ONLY AS RO FROM MON\$TRANSACTIONS WHERE MON\$ISOLATION_MODE = 1;
+   COMMIT;"
+# every transaction belongs to an attachment this server also names
+ran=$((ran + 1))
+r=$(fc "SELECT COUNT(*) AS N FROM MON\$TRANSACTIONS t
+        JOIN MON\$ATTACHMENTS a ON a.MON\$ATTACHMENT_ID = t.MON\$ATTACHMENT_ID;")
+case "$r" in
+    "N 0|") echo "DIFF no transaction joined an attachment: [$r]"; fail=1 ;;
+    *) echo "OK   every transaction names an attachment this server lists ($r)" ;;
+esac
+# THE RECORDED DIVERGENCE IN WHAT THE SERVERS DO, not in what they
+# report: the engine's default read committed is READ CONSISTENCY (mode
+# 4) and this server reads the latest committed version (mode 2). Each
+# reports what it actually does.
+ran=$((ran + 1))
+c=$(fc "SELECT MON\$ISOLATION_MODE AS ISO FROM MON\$TRANSACTIONS WHERE MON\$STATE = 0;")
+e=$(printf 'SET LIST ON;\nSELECT MON$ISOLATION_MODE AS ISO FROM MON$TRANSACTIONS WHERE MON$STATE = 0;\n' \
+    | "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$REAL:$A" 2>&1 | norm)
+case "$c/$e" in
+    "ISO 2|/ISO 4|") echo "OK   divergence recorded: read committed is mode 2 here, 4 (read consistency) there" ;;
+    *) echo "DIFF isolation modes moved: fc [$c] engine [$e]"; fail=1 ;;
+esac
+
 # the tables this server still does not fill keep the right SHAPE:
 # COUNT over an empty relation is 0, never the NULL the all-NULL row gave
 ran=$((ran + 1))
-r=$(fc "SELECT COUNT(*) AS N FROM MON\$TRANSACTIONS;")
+r=$(fc "SELECT COUNT(*) AS N FROM MON\$STATEMENTS;")
 case "$r" in
     "N 0|") echo "OK   COUNT over an unfilled MON\$ table is 0, not NULL" ;;
-    *) echo "DIFF COUNT over MON\$TRANSACTIONS: [$r]"; fail=1 ;;
+    *) echo "DIFF COUNT over MON\$STATEMENTS: [$r]"; fail=1 ;;
 esac
 # the RECORDED DIVERGENCE that is LEFT: the engine lists transactions
 # and statements, this server none. Asserted so a change shows.
 ran=$((ran + 1))
-e=$(printf 'SET LIST ON;\nSELECT COUNT(*) AS N FROM MON$TRANSACTIONS;\n' \
+e=$(printf 'SET LIST ON;\nSELECT COUNT(*) AS N FROM MON$STATEMENTS;\n' \
     | "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$REAL:$A" 2>&1 | norm)
 case "$e" in
-    "N 0|") echo "DIFF the engine reports no transactions either - divergence gone?"; fail=1 ;;
-    *) echo "OK   divergence recorded: the engine lists transactions ($e), this server none" ;;
+    "N 0|") echo "DIFF the engine reports no statements either - divergence gone?"; fail=1 ;;
+    *) echo "OK   divergence recorded: the engine lists statements ($e), this server none" ;;
 esac
 
 # ---- the engine still reads the file ------------------------------------
