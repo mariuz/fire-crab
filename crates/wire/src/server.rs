@@ -58134,6 +58134,37 @@ impl Expr {
                                 .ok_or(EvalErr::ConversionError(None))?,
                         };
                         let out = rescale(raw, from, *scale)?;
+                        // THE TARGET'S STORAGE WIDTH IS THE LIMIT, and it
+                        // is checked HERE - a narrowing cast that does not
+                        // fit raises 22003 rather than wrapping. Only the
+                        // i64 edge was checked before, so a NUMERIC(18,2)
+                        // cast down to NUMERIC(9,2) wrapped modulo 2^32
+                        // and answered a plausible WRONG NUMBER:
+                        // 123456789012.34 came back as 19428925.30.
+                        //
+                        // It is the WIDTH, not the declared precision:
+                        // the engine accepts `CAST(15000000.00 AS
+                        // NUMERIC(9,2))` although 9 digits at scale 2 top
+                        // out at 9999999.99, and refuses only past the
+                        // 4-byte slot. The boundaries land exactly on the
+                        // integer limits (all probed): 327.67 / 327.68
+                        // for a 2-byte NUMERIC(4,2), 21474836.47 /
+                        // 21474836.48 for a 4-byte NUMERIC(9,2), and
+                        // 922337203685477.5807 / ...5808 for an 8-byte
+                        // NUMERIC(18,4), negatives included.
+                        let fits = match *bytes {
+                            2 => i16::try_from(out).is_ok(),
+                            4 => i32::try_from(out).is_ok(),
+                            8 => i64::try_from(out).is_ok(),
+                            _ => true, // 16 bytes: an i128 by construction
+                        };
+                        if !fits {
+                            // the CAST vector, not the integer-operation
+                            // one: `isc_arith_except` + `numeric value is
+                            // out of range`, the same pair a cast to an
+                            // INTEGER target already raises
+                            return Err(EvalErr::NumericOutOfRange);
+                        }
                         if *bytes == 16 {
                             Value::Int128(out, *scale)
                         } else {

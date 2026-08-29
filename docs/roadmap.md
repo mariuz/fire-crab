@@ -3041,6 +3041,30 @@ pointer-page and TIP page numbers is the next step when it dominates.
 
 ## Next, in order
 
+- **A NARROWING NUMERIC CAST RAISES 22003 DONE (2026-08-29,
+  `serve-real-castint` 42 -> 58):** `CAST(<value> AS NUMERIC(p,s))`
+  checked only the i64 edge, so a value that overflowed a NARROWER
+  target wrapped silently: `CAST(123456789012.34 AS NUMERIC(9,2))`
+  answered **19428925.30** - the raw scaled integer taken modulo 2^32 -
+  where the engine raises `numeric value is out of range`. A plausible
+  wrong number, which is the worst kind. The INTEGER family already had
+  the check; the SCALED family did not.
+  THE LAW, and it is not the obvious one: the engine checks the TARGET'S
+  STORAGE WIDTH, **not the declared precision**. It ACCEPTS
+  `CAST(15000000.00 AS NUMERIC(9,2))` although nine digits at scale 2
+  top out at 9999999.99, and refuses only past the 4-byte slot. The
+  boundaries land exactly on the integer limits, probed in both
+  directions: 327.67 / 327.68 for a 2-byte NUMERIC(4,2), 21474836.47 /
+  21474836.48 for a 4-byte NUMERIC(9,2), 922337203685477.5807 / ...5808
+  for an 8-byte NUMERIC(18,4). Guessing "precision" here would have
+  refused a pile of statements the engine answers.
+  The vector matters too: this raises `EvalErr::NumericOutOfRange`
+  (`isc_arith_except` + `numeric value is out of range`), the pair a cast
+  to an INTEGER target already used - not `IntegerOverflow`, which is the
+  same SQLSTATE 22003 with a different message and was what a first cut
+  emitted.
+  Closes hunt finding 9.
+
 - **A SCALAR SUBQUERY ANSWERS UNDER ITS INNER COLUMN'S DESCRIPTION DONE
   (2026-08-29, `serve-real-subqdesc` 40):** a whole-item
   `(SELECT <col> FROM T WHERE ...)` is folded here by EXECUTING the
@@ -3841,6 +3865,40 @@ below every wrong answer.
 - **LOW** (common table expressions) — Recursive CTE tree walk is emitted breadth-first; Firebird emits it depth-first
 - **LOW** (common table expressions) — Recursive-CTE columns leak the anchor expression's node kind into the describe `name:` field (CONSTANT); the engine leaves it empty
 - **LOW** (date/time arithmetic) — UNION DISTINCT with a CAST branch blanks the field name and table origin in the describe
+
+### The charset cluster (hunt findings 10, 11, 12, 30) - law established, not yet implemented
+
+All four reproduce, and probing them established ONE law that explains
+every case: **NONE and OCTETS are BYTE CARRIERS. A conversion to or from
+one is a BYTE COPY - never a transliteration through Latin-1.** The
+carrier machinery (`intl::carrier_decode` / `carrier_encode`) already
+exists and is correct; it is the concatenation and emit paths that do
+not reach for it.
+
+Measured, under a NONE attachment, over a NONE column holding
+`73 74 72 61 C3 9F 65`:
+
+- `N || ''` - the engine passes the NONE bytes through unchanged;
+  fire-crab decodes them as Latin-1 and re-encodes to UTF-8, shipping
+  `73 74 72 61 C3 83 C2 9F 65`. The emit path HAS a byte-carrier branch,
+  but it is gated on `c.sub_type` being a positive ttype, and an
+  EXPRESSION carries its charset as a negative sentinel - so the branch
+  never fires for a concatenation.
+- `U || O` (UTF8 with OCTETS) - the engine answers OCTETS len 160
+  (32*4 + 32) and takes the UTF8 operand's RAW STORAGE bytes `C3 9F`;
+  fire-crab announces len 64 and transliterates to `DF`. Note OCTETS
+  DOMINATES here, where NONE yields.
+- `N || W` - the engine concatenates the raw NONE bytes and the raw
+  WIN1252 bytes; fire-crab returns an essentially EMPTY value, which is
+  worse than the reported "wrong bytes" and needs its own diagnosis.
+- `CAST('<multi-byte>' AS VARCHAR(4) CHARACTER SET WIN1252)` - under a
+  NONE attachment the literal arrives as raw bytes and the engine
+  BYTE-COPIES them; fire-crab transliterates.
+
+The reason this is a chunk and not a patch: the result of `N || W` is
+the two operands' OWN stored bytes concatenated, so the conversion is
+PER OPERAND at concat time, not a single fix-up at emit. That is the
+shape the implementation has to take.
 
 ### Refusal boundaries recorded (fire-crab refuses, the engine answers)
 

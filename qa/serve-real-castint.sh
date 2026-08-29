@@ -97,6 +97,36 @@ both "CAST(2.5 AS INTEGER)"
 both "CAST('abc' AS INTEGER)"
 both "CAST('1 2' AS INTEGER)"
 
+# --- and the SCALED family obeys the same width check -------------------------
+# Only the i64 edge used to be checked, so a value that overflowed a
+# NARROWER target wrapped silently: CAST(123456789012.34 AS NUMERIC(9,2))
+# answered 19428925.30, a plausible wrong number where the engine raises.
+#
+# It is the STORAGE WIDTH, not the declared precision. The engine ACCEPTS
+# CAST(15000000.00 AS NUMERIC(9,2)) although 9 digits at scale 2 top out
+# at 9999999.99 - the 4-byte slot is what it checks - and the boundaries
+# land exactly on the integer limits, negatives included.
+both "CAST(327.67 AS NUMERIC(4,2))"
+both "CAST(327.68 AS NUMERIC(4,2))"
+both "CAST(-327.68 AS NUMERIC(4,2))"
+both "CAST(-327.69 AS NUMERIC(4,2))"
+both "CAST(21474836.47 AS NUMERIC(9,2))"
+both "CAST(21474836.48 AS NUMERIC(9,2))"
+both "CAST(-21474836.48 AS NUMERIC(9,2))"
+both "CAST(-21474836.49 AS NUMERIC(9,2))"
+both "CAST(922337203685477.5807 AS NUMERIC(18,4))"
+both "CAST(123456789012.34 AS NUMERIC(9,2))"
+both "CAST(123456789012.34 AS NUMERIC(4,2))"
+# the PRECISION is deliberately NOT the limit - these must be accepted
+both "CAST(15000000.00 AS NUMERIC(9,2))"
+both "CAST(10000000.00 AS NUMERIC(9,2))"
+both "CAST(100.00 AS NUMERIC(4,2))"
+# and the ordinary cases must not have moved
+both "CAST(1.50 AS NUMERIC(9,2))"
+both "CAST(9999999.996 AS NUMERIC(9,2))"
+both "CAST(123456789012.34 AS NUMERIC(18,2))"
+both "CAST(1.5 AS DECIMAL(4,2))"
+
 # --- the OUTPUT describe: a CAST to an integer type announces THAT type,
 #     not the INT64 an arithmetic expression takes (probed: SMALLINT is
 #     500 SHORT len 2, INTEGER 496 LONG len 4, BIGINT 580 INT64 len 8).
