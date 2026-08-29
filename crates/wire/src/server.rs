@@ -2883,10 +2883,38 @@ fn attachments_for(path: &str) -> std::sync::Arc<DbGate> {
 /// been told to go, and its next statement answers the engine's own
 /// vector (`isc_att_shutdown` / "Database is shutdown.") - measured on a
 /// held isql whose next SELECT got exactly that, SQLSTATE 08003.
+/// One live attachment, as `MON$ATTACHMENTS` reports it.
+///
+/// Only what this server KNOWS is kept. The columns a client sends in
+/// its DPB - its process id and name, its host, its OS user, its
+/// library version - are not retained here, so they answer NULL rather
+/// than a guess; the same rule `MON$DATABASE` follows.
+#[derive(Clone)]
+struct AttachRow {
+    id: i32,
+    user: String,
+    /// the file this attachment opened, as the client named it
+    name: String,
+    /// `127.0.0.1/52346` - the peer, spelled the engine's way
+    address: Option<String>,
+    /// seconds since the epoch at the attach, rendered on demand
+    at: std::time::SystemTime,
+    charset: u8,
+    encrypted: bool,
+    /// the protocol version agreed at connect, as `P<n>`
+    protocol: Option<String>,
+}
+
 #[derive(Default)]
 struct DbGate {
     /// live attachments to this file, this process
     attaches: std::sync::atomic::AtomicUsize,
+    /// ...and WHO they are, for `MON$ATTACHMENTS`. The count alone
+    /// could say how many; a monitoring table has to name them. One
+    /// row per live attachment, added at the attach and removed
+    /// wherever the session ends - the orderly detach and every other
+    /// way out, the same two places `ON DISCONNECT` fires from.
+    attached: std::sync::Mutex<Vec<AttachRow>>,
     /// how many of them hold an open transaction right now - what
     /// `gfix -shut -tran N` waits on
     active_tx: std::sync::atomic::AtomicUsize,
@@ -6922,7 +6950,62 @@ enum RowSource {
 /// and stream fast paths both have to ask, because both work from
 /// record headers that a computed relation has none of.
 fn mon_computed_relation(db: &Database, rel: u16) -> bool {
-    fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, "MON$DATABASE") == Some(rel)
+    let image = db.bytes();
+    ["MON$DATABASE", "MON$ATTACHMENTS"]
+        .iter()
+        .any(|n| fire_crab_ods::resolve_relation(&image, db.page_size, n) == Some(rel))
+}
+
+/// The `MON$ATTACHMENTS` rows: every attachment this server has open on
+/// the file, as its own session recorded it at the attach.
+///
+/// The columns a client sends in its DPB - its process id and name, its
+/// host, its OS user, its library version - are NOT retained by this
+/// server, so they answer NULL rather than a guess. What is answered is
+/// what the server itself knows: who attached, over what, when, and
+/// whether the wire is encrypted.
+fn mon_attachment_rows(db: &Database, formats: &[(u8, Vec<Descriptor>)]) -> Vec<Vec<Value>> {
+    let image = db.bytes();
+    let Some((_, descs)) = formats.iter().max_by_key(|(n, _)| *n) else { return Vec::new() };
+    let cols = relation_columns(&image, db.page_size, "MON$ATTACHMENTS");
+    let live = db.attachments.attached.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    live.iter()
+        .map(|a| {
+            let mut row = vec![Value::Null; descs.len()];
+            let mut put = |col: &str, v: Value| {
+                if let Some(c) = cols.iter().find(|c| c.name.eq_ignore_ascii_case(col)) {
+                    if let Some(slot) = row.get_mut(c.field_id as usize) {
+                        *slot = v;
+                    }
+                }
+            };
+            put("MON$ATTACHMENT_ID", Value::Int(a.id as i64));
+            put("MON$SERVER_PID", Value::Int(std::process::id() as i64));
+            // 1 = active. This server has no idle bookkeeping, and an
+            // attachment it is answering FROM is active by definition.
+            put("MON$STATE", Value::Int(1));
+            put("MON$ATTACHMENT_NAME", Value::Text(a.name.clone()));
+            put("MON$USER", Value::Text(a.user.clone()));
+            put("MON$ROLE", Value::Text("NONE".into()));
+            put("MON$CHARACTER_SET_ID", Value::Int(a.charset as i64));
+            put("MON$GARBAGE_COLLECTION", Value::Int(1));
+            put("MON$SYSTEM_FLAG", Value::Int(0));
+            put("MON$STAT_ID", Value::Int(a.id as i64));
+            put("MON$IDLE_TIMEOUT", Value::Int(0));
+            put("MON$STATEMENT_TIMEOUT", Value::Int(0));
+            put("MON$WIRE_COMPRESSED", Value::Bool(false));
+            put("MON$WIRE_ENCRYPTED", Value::Bool(a.encrypted));
+            if let Some(addr) = &a.address {
+                put("MON$REMOTE_ADDRESS", Value::Text(addr.clone()));
+                put("MON$REMOTE_PROTOCOL", Value::Text("TCPv4".into()));
+            }
+            if let Some(p) = &a.protocol {
+                put("MON$REMOTE_VERSION", Value::Text(p.clone()));
+            }
+            let _ = a.at;
+            row
+        })
+        .collect()
 }
 
 /// The rows of a MONITORING table this server can answer TRUTHFULLY.
@@ -6950,6 +7033,11 @@ fn mon_rows(
     // the relation is named by its ID here, so the name is resolved the
     // other way round - one lookup, and only for a file that HAS the
     // relation at all
+    // MON$ATTACHMENTS: one row per live attachment, from the registry
+    // the sessions keep ([AttachRow]).
+    if fire_crab_ods::resolve_relation(&image, db.page_size, "MON$ATTACHMENTS") == Some(rel) {
+        return Some(mon_attachment_rows(db, formats));
+    }
     if fire_crab_ods::resolve_relation(&image, db.page_size, "MON$DATABASE") != Some(rel) {
         return None;
     }
@@ -72119,6 +72207,21 @@ fn after_auth(
         eprintln!("[srv] mdc: {}", crate::mdc::stats_line());
     }
     let attach_id = ATTACH_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // THIS ATTACHMENT IS ON THE RECORD from here, so `MON$ATTACHMENTS`
+    // can name it. Removed wherever the session ends - see the teardown.
+    if let Some(db) = database.as_ref() {
+        let row = AttachRow {
+            id: attach_id,
+            user: user.to_string(),
+            name: db.path.clone(),
+            address: s.peer_addr().ok().map(|a| format!("{}/{}", a.ip(), a.port())),
+            at: std::time::SystemTime::now(),
+            charset: db_default_charset(&db.bytes(), db.page_size),
+            encrypted: enc.is_some(),
+            protocol: Some(format!("P{}", best)),
+        };
+        db.attachments.attached.lock().unwrap_or_else(|e| e.into_inner()).push(row);
+    }
     // DOES THIS FILE CARRY DATABASE TRIGGERS AT ALL? Read once, here,
     // so a file with none - which is nearly every file - pays nothing
     // per commit.
@@ -76039,6 +76142,16 @@ fn after_auth(
         eprintln!("[srv] pool: {}", fire_crab_cch::pool::stats_line());
         eprintln!("[srv] locks: {}", crate::dblocks::stats_line());
         eprintln!("[srv] mdc: {}", crate::mdc::stats_line());
+    }
+    // ...AND OFF THE RECORD AGAIN. Every way out passes here, so this
+    // is where `MON$ATTACHMENTS` stops naming this attachment - the
+    // orderly detach and the closed socket alike.
+    if let Some(db) = database.as_ref() {
+        db.attachments
+            .attached
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|a| a.id != attach_id);
     }
     // ON DISCONNECT, WHEREVER THE SESSION ENDED. The op_detach arm
     // fires it for an orderly goodbye; this catches every other way out

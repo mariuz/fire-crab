@@ -1322,10 +1322,26 @@ RUNTIME cache size, and this server's cache is not that), `MON$OWNER`,
 a guess, and a guess in a monitoring table is an answer nobody can act
 on.
 
-RECORDED DIVERGENCE, asserted by the gate so a change shows: the engine
-lists live attachments and statements; this server answers none. An
-empty relation of the right shape is something a client can read — the
-all-NULL row was not. The one thing that row bought, a firebird-qa
+**AND THEN `MON$ATTACHMENTS` (same day, `serve-real-monitoring` 10 →
+13).** The divergence above, closed for the table an operator actually
+opens: one row per live attachment, from a registry each session keeps
+on the file's `DbGate` — added at the attach, removed wherever the
+session ends, which is the same pair of places `ON DISCONNECT` fires
+from. It answers who attached, the file they opened, the PEER address
+(which only the server can know), the protocol, the state and whether
+the wire is encrypted; and the gate holds the property that matters -
+**the count follows the connections**, 1 then 2 then 1 as a second
+session opens and goes.
+
+The columns a CLIENT sends in its DPB - its process id and name, its
+host, its OS user, its library version - are not retained by this
+server, so they answer NULL rather than a guess, and the gate asserts
+that too.
+
+RECORDED DIVERGENCE, still, asserted by the gate so a change shows: the
+engine lists live TRANSACTIONS and STATEMENTS; this server answers none.
+An empty relation of the right shape is something a client can read —
+the all-NULL row was not. The one thing that row bought, a firebird-qa
 bootstrap whose projection uses `COUNT(DISTINCT ...)` and `IIF(...)`,
 is a REFUSAL now: the honest answer to a query this server cannot read.
 

@@ -15,6 +15,9 @@
 #   * `MON$DATABASE` is COMPUTED - one row of what this server knows for
 #     certain about the file it has open, read through the same header
 #     decoder gstat and gfix use;
+#   * `MON$ATTACHMENTS` is COMPUTED too - one row per live attachment,
+#     from a registry each session keeps: who attached, from what
+#     address, over what protocol, and whether the wire is encrypted;
 #   * every other MON$ table scans its own (empty) storage and answers
 #     NO ROWS, with the right shape and the right column names.
 #
@@ -89,29 +92,61 @@ both "...and the ordinary clauses work over it" \
 both "...and a WHERE that matches nothing answers nothing" \
   "SELECT MON\$PAGE_SIZE AS PS FROM MON\$DATABASE WHERE MON\$PAGE_SIZE = 1;"
 
-# ---- the shape of the tables this server does not fill ------------------
-# COUNT over an empty relation is 0 - never NULL, which is what the
-# all-NULL row used to answer
+# ---- MON$ATTACHMENTS names the live attachments -------------------------
+# what the SERVER knows about each: who attached, from where, over what,
+# and whether the wire is encrypted
 ran=$((ran + 1))
-r=$(fc "SELECT COUNT(*) AS N FROM MON\$ATTACHMENTS;")
+r=$(fc "SELECT MON\$USER AS U, MON\$ATTACHMENT_NAME AS NM, MON\$STATE AS ST,
+        MON\$WIRE_ENCRYPTED AS ENC, MON\$ROLE AS RO, MON\$REMOTE_PROTOCOL AS PR
+        FROM MON\$ATTACHMENTS;")
+case "$r" in
+    "U SYSDBA|NM $A|ST 1|ENC <true>|RO NONE|PR TCPv4|")
+        echo "OK   an attachment names itself: user, file, state, wire, protocol" ;;
+    *) echo "DIFF MON\$ATTACHMENTS row: [$r]"; fail=1 ;;
+esac
+# ...and the address is the PEER, which only the server can know
+ran=$((ran + 1))
+r=$(fc "SELECT MON\$REMOTE_ADDRESS AS ADDR FROM MON\$ATTACHMENTS;")
+case "$r" in
+    "ADDR 127.0.0.1/"*) echo "OK   ...and its remote address is the peer" ;;
+    *) echo "DIFF remote address: [$r]"; fail=1 ;;
+esac
+# THE COUNT FOLLOWS THE CONNECTIONS. One held open makes two; when it
+# goes, one again - which is the whole point of a monitoring table.
+alone=$(fc "SELECT COUNT(*) AS N FROM MON\$ATTACHMENTS;")
+( printf 'SELECT 1 FROM RDB\$DATABASE;\n'; sleep 4 ) \
+    | timeout 25 "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$A" >/dev/null 2>&1 &
+sleep 1.5
+held=$(fc "SELECT COUNT(*) AS N FROM MON\$ATTACHMENTS;")
+sleep 5
+after=$(fc "SELECT COUNT(*) AS N FROM MON\$ATTACHMENTS;")
+check "the count follows the connections (1, then 2, then 1)" \
+    "$alone/$held/$after" "N 1|/N 2|/N 1|"
+# the columns a CLIENT sends and this server does not retain answer
+# NULL rather than a guess
+ran=$((ran + 1))
+r=$(fc "SELECT COUNT(*) AS N FROM MON\$ATTACHMENTS
+        WHERE MON\$REMOTE_PID IS NULL AND MON\$REMOTE_PROCESS IS NULL;")
+case "$r" in
+    "N 1|") echo "OK   the DPB-sent columns answer NULL, not a guess" ;;
+    *) echo "DIFF DPB columns: [$r]"; fail=1 ;;
+esac
+# the tables this server still does not fill keep the right SHAPE:
+# COUNT over an empty relation is 0, never the NULL the all-NULL row gave
+ran=$((ran + 1))
+r=$(fc "SELECT COUNT(*) AS N FROM MON\$TRANSACTIONS;")
 case "$r" in
     "N 0|") echo "OK   COUNT over an unfilled MON\$ table is 0, not NULL" ;;
-    *) echo "DIFF COUNT over MON\$ATTACHMENTS: [$r]"; fail=1 ;;
+    *) echo "DIFF COUNT over MON\$TRANSACTIONS: [$r]"; fail=1 ;;
 esac
+# the RECORDED DIVERGENCE that is LEFT: the engine lists transactions
+# and statements, this server none. Asserted so a change shows.
 ran=$((ran + 1))
-r=$(fc "SELECT MON\$ATTACHMENT_ID AS I FROM MON\$ATTACHMENTS;")
-case "$r" in
-    "") echo "OK   ...and selecting from one answers no rows, by name" ;;
-    *) echo "DIFF MON\$ATTACHMENTS rows: [$r]"; fail=1 ;;
-esac
-# the RECORDED DIVERGENCE: the engine has attachments to list, this
-# server answers none. Asserted so a change shows.
-ran=$((ran + 1))
-e=$(printf 'SET LIST ON;\nSELECT COUNT(*) AS N FROM MON$ATTACHMENTS;\n' \
+e=$(printf 'SET LIST ON;\nSELECT COUNT(*) AS N FROM MON$TRANSACTIONS;\n' \
     | "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$REAL:$A" 2>&1 | norm)
 case "$e" in
-    "N 0|") echo "DIFF the engine reports no attachments either - divergence gone?"; fail=1 ;;
-    *) echo "OK   divergence recorded: the engine lists attachments ($e), this server none" ;;
+    "N 0|") echo "DIFF the engine reports no transactions either - divergence gone?"; fail=1 ;;
+    *) echo "OK   divergence recorded: the engine lists transactions ($e), this server none" ;;
 esac
 
 # ---- the engine still reads the file ------------------------------------
