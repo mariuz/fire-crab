@@ -1286,6 +1286,49 @@ A parser trap worth keeping: `VARCHAR(60)` is ONE word to
 also matched it and returned before the text arm was ever reached. The
 arms are one now, with the length split off inside.
 
+**THE MONITORING TABLES, AND THE ALL-NULL ROW — DONE 2026-08-29
+(`serve-real-monitoring` 10, new).** `MON$` queries were answered by ONE
+ALL-NULL ROW whatever they asked. `SELECT COUNT(*) FROM
+MON$ATTACHMENTS` answered NULL — which COUNT never does — under a column
+called `C0` rather than the name the query gave it. The relation was
+never consulted at all: a `MON$` prefix short-circuited to
+`Plan::VirtualEmpty { ncols }`, with the column count taken from the
+top-level commas rather than a parse.
+
+They are REAL CATALOG RELATIONS (`MON$DATABASE` is relation 33 with 28
+fields), so they go down the ORDINARY path now and are described from
+the catalog like anything else. `MON$DATABASE` is COMPUTED — one row of
+what this server knows for certain about the file, read through the same
+`HeaderPage` decoder gstat and gfix use. Every other `MON$` table scans
+its own empty storage and answers NO ROWS, with the right shape and the
+right names.
+
+TWO FAST PATHS HAD TO LEARN THE SAME WORD. A computed relation has no
+record headers, so `StreamCursor::open` (which walks data pages) and the
+`COUNT(*)` fast path (which counts headers without decoding) both
+DECLINE for one and leave it to the materialising scan — the count
+answered 0 where the scan answers 1 until it did.
+
+AND THE HEADER IS DECODED, NOT INDEXED. The first cut read the offsets
+by hand and had ODS at **-32754** and the sweep interval at nonsense:
+`ods_major` strips a flag bit, `page_buffers` sits where the guess put
+`oldest_transaction`, and the sweep interval is not a field at all but a
+CLUMPLET in the variable header, defaulting to 20000 when absent.
+`HeaderPage` knew all of it.
+
+WHAT IS LEFT NULL, deliberately: `MON$PAGE_BUFFERS` (the engine's
+RUNTIME cache size, and this server's cache is not that), `MON$OWNER`,
+`MON$FILE_ID`, `MON$CREATION_DATE`, `MON$NEXT_STATEMENT`. Each would be
+a guess, and a guess in a monitoring table is an answer nobody can act
+on.
+
+RECORDED DIVERGENCE, asserted by the gate so a change shows: the engine
+lists live attachments and statements; this server answers none. An
+empty relation of the right shape is something a client can read — the
+all-NULL row was not. The one thing that row bought, a firebird-qa
+bootstrap whose projection uses `COUNT(DISTINCT ...)` and `IIF(...)`,
+is a REFUSAL now: the honest answer to a query this server cannot read.
+
 **A BODY CONDITION THE PLANNER ANSWERS — DONE 2026-08-29
 (`serve-real-trigtext` 10 → 14, `serve-real-ddltrigger`'s recorded
 policy refusal became a comparison).** The other half of the body

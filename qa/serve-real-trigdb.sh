@@ -252,25 +252,29 @@ both "PER ROW: an UPDATE over three rows walks the sum up" \
   "DELETE FROM LOGT; COMMIT;
    UPDATE P SET A = A + 1; COMMIT;
    SELECT ID, W, N FROM LOGT ORDER BY ID, W; SELECT ID, A FROM P ORDER BY ID;"
-both "...and the log rows in the ORDER the statement wrote them" \
-  "SELECT ID, W, N FROM LOGT;"
 
 # ---- DELETE: the row is still there for BEFORE, gone for AFTER ---------
 both "a BEFORE DELETE body counts the row it is about to remove" \
   "DELETE FROM LOGT; COMMIT;
    DELETE FROM Q WHERE ID = 1; COMMIT;
    SELECT ID, W, N FROM LOGT ORDER BY ID, W; SELECT ID, A FROM Q ORDER BY ID;"
-# QD's rows were written ONCE, at build, so both files lay them out
-# identically and the DELETE walks them in the same order. (An earlier
-# version of this check deleted and re-inserted first, which left the
-# placement to free-slot reuse and made the order - and so the check -
-# unstable: it failed about one run in three.)
+# QD's rows were written ONCE, at build, so both files delete them in
+# the same order.
+#
+# WHAT PROVES THE INTERLEAVING is the COUNT each body read - 4,3 / 3,2 /
+# 2,1 / 1,0 is only possible if each row's triggers ran around its own
+# delete, and a batched implementation answers the same number to every
+# row. Two checks used to compare the LOG TABLE's physical order as
+# well, and that was never sound: the log is emptied and refilled all
+# through this gate, so where its rows land is free-slot reuse, which
+# the two files need not agree on. (The first fix made the DELETED rows
+# stable and missed that the LOG was the unstable table - the check
+# failed again, in a later sweep, for the same reason in a different
+# place.)
 both "PER ROW: a multi-row DELETE walks the count down as it goes" \
   "DELETE FROM LOGT; COMMIT;
    DELETE FROM QD; COMMIT;
    SELECT ID, W, N FROM LOGT ORDER BY ID, W; SELECT COUNT(*) AS QN FROM QD;"
-both "...and the log rows in the ORDER the statement wrote them" \
-  "SELECT ID, W, N FROM LOGT;"
 
 # ---- a MULTI-ROW statement that fails PART WAY -------------------------
 # the body logged the rows it got to; the CHECK the third row violates

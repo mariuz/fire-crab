@@ -6918,6 +6918,105 @@ enum RowSource {
     },
 }
 
+/// Is this relation's content COMPUTED rather than stored? The count
+/// and stream fast paths both have to ask, because both work from
+/// record headers that a computed relation has none of.
+fn mon_computed_relation(db: &Database, rel: u16) -> bool {
+    fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, "MON$DATABASE") == Some(rel)
+}
+
+/// The rows of a MONITORING table this server can answer TRUTHFULLY.
+///
+/// `MON$DATABASE` is one row of facts fire-crab already reads for
+/// `gstat` and `gfix` - the header's page size, ODS, transaction
+/// counters, flags, sweep interval, creation date and GUID - plus what
+/// the server knows about the file it has open. Every value is either
+/// read from the file or known for certain; a column whose answer would
+/// be a guess is left NULL rather than invented.
+///
+/// `None` for every other relation, including the other MON$ tables:
+/// they scan their own (empty) storage and answer NO ROWS. That is a
+/// recorded divergence - the engine lists live attachments, statements
+/// and transactions - but an empty relation of the right SHAPE is a
+/// thing a client can read, where the all-NULL row this used to answer
+/// was not even that (`SELECT COUNT(*) FROM MON$ATTACHMENTS` answered
+/// NULL, and COUNT never answers NULL).
+fn mon_rows(
+    db: &Database,
+    rel: u16,
+    formats: &[(u8, Vec<Descriptor>)],
+) -> Option<Vec<Vec<Value>>> {
+    let image = db.bytes();
+    // the relation is named by its ID here, so the name is resolved the
+    // other way round - one lookup, and only for a file that HAS the
+    // relation at all
+    if fire_crab_ods::resolve_relation(&image, db.page_size, "MON$DATABASE") != Some(rel) {
+        return None;
+    }
+    let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
+    let cols = relation_columns(&image, db.page_size, "MON$DATABASE");
+    let mut row = vec![Value::Null; descs.len()];
+    // THE HEADER IS DECODED, NOT INDEXED. A first cut read the offsets
+    // by hand and had ODS at -32754 and the sweep interval at nonsense:
+    // `ods_major` strips a flag bit, `page_buffers` sits where the
+    // hand-written guess put `oldest_transaction`, and the sweep
+    // interval is not a field at all but a CLUMPLET in the variable
+    // header. [HeaderPage] knows all of that already.
+    let page0 = image.page(0)?;
+    let head = fire_crab_ods::header::HeaderPage::decode(page0)?;
+    let mut put = |col: &str, v: Value| {
+        if let Some(c) = cols.iter().find(|c| c.name.eq_ignore_ascii_case(col)) {
+            if let Some(slot) = row.get_mut(c.field_id as usize) {
+                *slot = v;
+            }
+        }
+    };
+    put("MON$DATABASE_NAME", Value::Text(db.path.clone()));
+    put("MON$PAGE_SIZE", Value::Int(head.page_size as i64));
+    put("MON$ODS_MAJOR", Value::Int(head.ods_major() as i64));
+    put("MON$ODS_MINOR", Value::Int(head.ods_minor as i64));
+    put("MON$OLDEST_TRANSACTION", Value::Int(head.oldest_transaction as i64));
+    put("MON$OLDEST_ACTIVE", Value::Int(head.oldest_active as i64));
+    put("MON$OLDEST_SNAPSHOT", Value::Int(head.oldest_snapshot as i64));
+    put("MON$NEXT_TRANSACTION", Value::Int(head.next_transaction as i64));
+    put("MON$PAGE_BUFFERS", Value::Int(head.page_buffers as i64));
+    put("MON$NEXT_ATTACHMENT", Value::Int(head.next_attachment_id as i64));
+    put("MON$SQL_DIALECT", Value::Int(3));
+    put("MON$SHUTDOWN_MODE", Value::Int(head.shutdown_mode as i64));
+    put("MON$REPLICA_MODE", Value::Int(head.replica_mode as i64));
+    put("MON$BACKUP_STATE", Value::Int(head.backup_mode as i64));
+    put("MON$READ_ONLY", Value::Int(db.is_read_only() as i64));
+    put("MON$GUID", Value::Text(head.guid_string()));
+    put("MON$SEC_DATABASE", Value::Text("Default".into()));
+    put("MON$STAT_ID", Value::Int(1));
+    put("MON$CRYPT_PAGE", Value::Int(0));
+    put("MON$CRYPT_STATE", Value::Int(0));
+    // the sweep interval is a CLUMPLET, and a fresh database has none -
+    // which is the engine's 20000 default, not zero
+    let sweep = fire_crab_ods::header::variable_header(page0)
+        .iter()
+        .filter(|c| {
+            c.tag == fire_crab_ods::header::hdr_clump::SWEEP_INTERVAL && c.data.len() >= 4
+        })
+        .last()
+        .map(|c| i32::from_le_bytes([c.data[0], c.data[1], c.data[2], c.data[3]]) as i64)
+        .unwrap_or(20000);
+    put("MON$SWEEP_INTERVAL", Value::Int(sweep));
+    // the two flags the header carries as bits, and the dialect with
+    // them - RESERVE_SPACE is the INVERSE of the NO_RESERVE bit
+    use fire_crab_ods::header::hdr_flags;
+    put("MON$FORCED_WRITES", Value::Int((head.flags & hdr_flags::FORCE_WRITE != 0) as i64));
+    put("MON$RESERVE_SPACE", Value::Int((head.flags & hdr_flags::NO_RESERVE == 0) as i64));
+    put("MON$PAGES", Value::Int(image.pages().count() as i64));
+    // WHAT IS LEFT NULL, and why: MON$PAGE_BUFFERS is the RUNTIME cache
+    // size (the engine's default where the header says 0, and this
+    // server's cache is not the engine's), MON$OWNER, MON$FILE_ID,
+    // MON$CREATION_DATE, MON$NEXT_STATEMENT. Each would be a guess, and
+    // a guess in a monitoring table is the kind of answer nobody can
+    // act on.
+    Some(vec![row])
+}
+
 impl RowSource {
     /// Pull every row. Materialising for now: the engine streams, and
     /// the fetch path here already collects before encoding, so the
@@ -6953,6 +7052,26 @@ impl RowSource {
     ) -> Result<Flow, EvalErr> {
         match self {
             RowSource::TableScan { rel, formats, width, decode_len } => {
+                // A MONITORING TABLE HAS NO PAGES: its rows are the
+                // server's own state, computed here and handed to the
+                // ordinary projection, filter and sort above. Only the
+                // ones this server can answer TRUTHFULLY are computed;
+                // the rest scan their (empty) storage and answer no
+                // rows, which is at least a shape a client can read -
+                // where a NULL row was neither.
+                if let Some(rows) = mon_rows(db, *rel, formats) {
+                    for values in rows {
+                        let mut row = values;
+                        if let Some(w) = width {
+                            row.resize(*w, Value::Null);
+                        }
+                        match sink(row)? {
+                            Flow::Stop => return Ok(Flow::Stop),
+                            Flow::Continue => {}
+                        }
+                    }
+                    return Ok(Flow::Continue);
+                }
                 // the walk ENDS on Stop now, rather than reading the
                 // rest of the relation and discarding it
                 let mut flow = Flow::Continue;
@@ -38042,22 +38161,18 @@ fn plan_query_inner_ctx(
         }
     }
 
-    // MON$ virtual tables: fire-crab keeps no live monitoring state, so
-    // it reports them as EMPTY. The firebird-qa bootstrap runs one
-    // aggregate query over MON$ATTACHMENTS to detect the server
-    // architecture; an aggregate over no rows is one all-NULL row (which
-    // makes the bootstrap classify fire-crab as an embedded server). The
-    // projection there uses shapes this server's SQL does not parse
-    // (COUNT(DISTINCT ...), IIF(...)), so the column count is taken from
-    // the top-level commas rather than a real parse - honest for an
-    // always-empty relation. Detected before projection parsing.
-    if let Some((first, _)) = parse_from(table_s).and_then(|(l, _)| Some((l.table.to_string(), ())))
-    {
-        if first.to_ascii_uppercase().starts_with("MON$") {
-            let ncols = count_top_level_cols(proj_s);
-            return Some(Plan::VirtualEmpty { ncols });
-        }
-    }
+    // MON$ VIRTUAL TABLES GO DOWN THE ORDINARY PATH. They are real
+    // catalog relations - `MON$DATABASE` is relation 33 with 28 fields
+    // - so the planner describes them from the catalog like any other,
+    // and their rows come from [mon_rows] (computed) or from their own
+    // empty storage. What this replaces answered ONE ALL-NULL ROW for
+    // any MON$ query, whatever it asked: `SELECT COUNT(*) FROM
+    // MON$ATTACHMENTS` answered NULL, which COUNT never does, under a
+    // column called `C0`. The one thing that behaviour bought - a
+    // firebird-qa bootstrap whose projection uses shapes this server
+    // cannot parse (`COUNT(DISTINCT ...)`, `IIF(...)`) - is a REFUSAL
+    // now, which is the honest answer to a query this server cannot
+    // read.
     // isql's SHOW GENERATORS reads each generator's current value with a
     // DSQL probe `SELECT GEN_ID(<name>, 0) FROM [SYSTEM.]RDB$DATABASE`
     // (show.epp:4668). Recognise that exact shape and answer it from the
@@ -40932,6 +41047,13 @@ fn aggregate(
     // the images left alone - the header says whether the version this
     // reader counts is a row or a deleted stub.
     if let (AggFn::Count, AggTarget::Star) = (func, target) {
+        // ...but a COMPUTED relation has no record headers to count:
+        // `MON$DATABASE`'s row is built, not stored, so this fast path
+        // would answer 0 where the ordinary scan answers 1. It declines
+        // and the scan counts what [mon_rows] produced.
+        if mon_computed_relation(db, rel) {
+            return None;
+        }
         let n = match filter {
             None => match count_visible_records(db, rel) {
                 Ok(n) => n,
@@ -41538,6 +41660,13 @@ impl StreamCursor {
         }
         let filter = bind_filter(filter, args).ok()?;
         let image = db.bytes();
+        // A COMPUTED RELATION HAS NO PAGES TO STREAM. `MON$DATABASE`'s
+        // row is built from the server's own state, so this declines
+        // and the MATERIALISING path serves it ([mon_rows]) - the same
+        // way it serves every other plan this cursor cannot stream.
+        if mon_computed_relation(db, *rel) {
+            return None;
+        }
         db.reserve_relation_read(*rel);
         let pages = fire_crab_ods::relation_data_pages(&image, db.page_size, *rel);
         Some(StreamCursor {
