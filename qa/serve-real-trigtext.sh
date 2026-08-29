@@ -52,6 +52,8 @@ CREATE TABLE T (ID INTEGER, A INTEGER, C CHAR(6), V VARCHAR(10));
 CREATE TABLE U (ID INTEGER, A INTEGER);
 CREATE TABLE F (ID INTEGER, A INTEGER, V VARCHAR(10));
 CREATE TABLE N (ID INTEGER, V VARCHAR(10));
+CREATE TABLE CN (ID INTEGER, A INTEGER, V VARCHAR(10));
+CREATE TABLE CW (ID INTEGER);
 CREATE TABLE L (ID INTEGER, W VARCHAR(60));
 COMMIT;
 SET TERM ^ ;
@@ -81,6 +83,28 @@ BEGIN
   INSERT INTO L (ID, W) VALUES (NEW.ID, CASE WHEN NEW.A > 5 THEN 'big' ELSE 'small' END);
   INSERT INTO L (ID, W) VALUES (NEW.ID, CAST(NEW.A * 2 AS VARCHAR(10)) || '!');
   INSERT INTO L (ID, W) VALUES (NEW.ID, SUBSTRING(NEW.V FROM 1 FOR 3));
+END^
+/* 6. CONDITIONS the arithmetic grammar cannot hold: a function call, a
+      LIKE, an IS NULL over an expression, a comparison of two strings */
+CREATE TRIGGER C_BI FOR CN BEFORE INSERT AS
+BEGIN
+  IF (UPPER(NEW.V) = 'AB') THEN INSERT INTO L (ID, W) VALUES (NEW.ID, 'upper');
+  IF (NEW.V LIKE 'a%') THEN INSERT INTO L (ID, W) VALUES (NEW.ID, 'like');
+  IF (NEW.V IS NULL) THEN INSERT INTO L (ID, W) VALUES (NEW.ID, 'isnull');
+  IF (SUBSTRING(NEW.V FROM 1 FOR 1) = 'a') THEN INSERT INTO L (ID, W) VALUES (NEW.ID, 'substr');
+  IF (NEW.V = 'ab' AND NEW.A > 0) THEN INSERT INTO L (ID, W) VALUES (NEW.ID, 'and');
+  IF (NEW.V CONTAINING 'B') THEN INSERT INTO L (ID, W) VALUES (NEW.ID, 'containing');
+END^
+/* ...and a WHILE whose test is one of them */
+CREATE TRIGGER CW_BI FOR CW BEFORE INSERT AS
+DECLARE VARIABLE I INTEGER;
+BEGIN
+  I = 0;
+  WHILE (CAST(:I AS VARCHAR(4)) <> '3') DO
+  BEGIN
+    I = I + 1;
+    INSERT INTO L (ID, W) VALUES (NEW.ID, 'loop');
+  END
 END^
 /* 5. NULL travels through a concatenation */
 CREATE TRIGGER N_BI FOR N BEFORE INSERT AS
@@ -148,6 +172,28 @@ both "NULL joined to anything is NULL" \
    INSERT INTO N (ID, V) VALUES (1, NULL);
    INSERT INTO N (ID, V) VALUES (2, 'q'); COMMIT;
    SELECT ID, W, W IS NULL AS ISN FROM L ORDER BY ID;"
+
+# ---- CONDITIONS, the other half of the body grammar --------------------
+# an `IF` the arithmetic grammar cannot hold is kept AS WRITTEN too, and
+# answered by the planner. Only TRUE takes the branch: a condition that
+# is UNKNOWN (a NULL operand) takes the ELSE, which is the engine's own
+# three-valued rule.
+both "a function call, LIKE, IS NULL, SUBSTRING, AND and CONTAINING in an IF" \
+  "DELETE FROM L; COMMIT;
+   INSERT INTO CN (ID, A, V) VALUES (1, 5, 'ab'); COMMIT;
+   SELECT ID, W FROM L ORDER BY W;"
+both "...and the same tests over a NULL, where every one is UNKNOWN" \
+  "DELETE FROM L; COMMIT;
+   INSERT INTO CN (ID, A, V) VALUES (2, 5, NULL); COMMIT;
+   SELECT ID, W FROM L ORDER BY W;"
+both "...and over a value that matches none of them" \
+  "DELETE FROM L; COMMIT;
+   INSERT INTO CN (ID, A, V) VALUES (3, 5, 'zz'); COMMIT;
+   SELECT ID, W FROM L ORDER BY W;"
+both "a WHILE whose test the planner answers" \
+  "DELETE FROM L; COMMIT;
+   INSERT INTO CW (ID) VALUES (1); COMMIT;
+   SELECT ID, W FROM L ORDER BY ID;"
 
 # ---- the engine reads what fire-crab wrote -----------------------------
 eng_q="SET LIST ON; SELECT ID, '<' || W || '>' AS R FROM L ORDER BY ID, W; SELECT ID, A FROM U ORDER BY ID;"

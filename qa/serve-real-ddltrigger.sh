@@ -48,6 +48,7 @@ COMMIT;
 CREATE TABLE L (ID INTEGER, W VARCHAR(80));
 CREATE TABLE KEEP (ID INTEGER, A INTEGER);
 CREATE TABLE GOES (ID INTEGER);
+CREATE TABLE PROTECTED (ID INTEGER);
 CREATE SEQUENCE S;
 COMMIT;
 SET TERM ^ ;
@@ -69,17 +70,16 @@ CREATE TRIGGER D_GUARD BEFORE DROP VIEW POSITION 9 AS
 BEGIN
   EXCEPTION EXD;
 END^
-/* ...and a policy whose CONDITION calls a function: this server cannot
-   evaluate one in a body condition, so it refuses the whole statement
-   rather than skipping the policy (checked as a boundary below) */
-CREATE TRIGGER D_COND BEFORE CREATE ROLE POSITION 9 AS
+/* THE POLICY AS ANYBODY WRITES ONE: guard by the object's NAME. Its
+   condition calls a function, which the body grammar keeps as written
+   and the planner answers. */
+CREATE TRIGGER D_COND BEFORE DROP TABLE POSITION 9 AS
 BEGIN
-  IF (RDB$GET_CONTEXT('DDL_TRIGGER','OBJECT_NAME') = 'FORBIDDEN') THEN
+  IF (RDB$GET_CONTEXT('DDL_TRIGGER','OBJECT_NAME') = 'PROTECTED') THEN
     EXCEPTION EXD;
 END^
 SET TERM ; ^
 COMMIT;
-CREATE TABLE PROTECTED (ID INTEGER);
 COMMIT;
 DELETE FROM L;
 COMMIT;
@@ -178,17 +178,14 @@ gf=$("$GFIX" -v -full -user "$U" -pas "$P" "$A" 2>&1)
 ran=$((ran + 1))
 if [ -z "$gf" ]; then echo "OK   gfix -v -full clean on fc's file"; else echo "DIFF gfix: $gf"; fail=1; fi
 
-# ---- the boundary: a body CONDITION that calls a function --------------
-# `IF (RDB$GET_CONTEXT(...) = 'X')` is outside this server's body
-# grammar, so the statement it would police REFUSES - the honest answer,
-# because running it unpoliced is the one thing a policy trigger must
-# never allow
-ran=$((ran + 1))
-r=$(printf 'CREATE ROLE R1;\n' | "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$A" 2>&1)
-case "$r" in
-    *"Dynamic SQL Error"*) echo "OK   boundary: a policy this server cannot evaluate refuses the statement" ;;
-    *) echo "DIFF boundary MOVED: a function call in a body condition"; echo "     [$r]"; fail=1 ;;
-esac
+# ---- THE POLICY, guarded by the object's own name ----------------------
+# what anybody actually writes: `IF (RDB$GET_CONTEXT('DDL_TRIGGER',
+# 'OBJECT_NAME') = 'X')`. The condition calls a function, which the body
+# grammar keeps as written and the planner answers.
+wipe
+both "a policy that guards ONE object refuses only that one" \
+  "DROP TABLE PROTECTED;
+   SELECT COUNT(*) AS STILL FROM RDB\$RELATIONS WHERE RDB\$RELATION_NAME = 'PROTECTED';"
 
 # ---- ...AND THIS SERVER WRITES ONE --------------------------------------
 # the other half: CREATE TRIGGER for a DDL trigger compiled HERE, its

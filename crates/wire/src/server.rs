@@ -16336,6 +16336,11 @@ enum TrigStmt {
         cond: fire_crab_ods::expr::Cond,
         then: Box<TrigStmt>,
         otherwise: Option<Box<TrigStmt>>,
+        /// THE CONDITION AS WRITTEN, kept when the arithmetic `Cond`
+        /// grammar cannot hold it - a function call, a `LIKE`, an `IS
+        /// NULL` over an expression. It is answered by the ORDINARY
+        /// planner ([eval_raw_cond]), the same way a body's values are.
+        raw: Option<(String, Vec<(String, u16)>)>,
         src_off: usize,
     },
     /// `WHILE (<cond>) DO <stmt>` - blr_label n, blr_loop, begin,
@@ -16346,6 +16351,8 @@ enum TrigStmt {
         body: Box<TrigStmt>,
         /// an optional loop label (`LP: WHILE ...`), for a labelled LEAVE
         label: Option<String>,
+        /// as [TrigStmt::If]'s
+        raw: Option<(String, Vec<(String, u16)>)>,
         src_off: usize,
     },
     /// `EXCEPTION <name>;` - blr_abort, condition 2 (exception), name.
@@ -17005,13 +17012,17 @@ fn body_has_uninterpretable_blr(st: &TrigStmt) -> bool {
         | TrigStmt::SelectInto { .. }
         | TrigStmt::ForExecStmt { .. }
         | TrigStmt::CallProc { .. } => true,
-        TrigStmt::If { cond, then, otherwise, .. } => {
-            cond_has_text(cond)
+        // ...and a condition kept AS WRITTEN: there is no `Cond` to
+        // emit, and storing the trigger with the test silently missing
+        // would be a trigger that does not do what its own source says
+        TrigStmt::If { cond, then, otherwise, raw, .. } => {
+            raw.is_some()
+                || cond_has_text(cond)
                 || body_has_uninterpretable_blr(then)
                 || otherwise.as_ref().is_some_and(|e| body_has_uninterpretable_blr(e))
         }
-        TrigStmt::While { cond, body, .. } => {
-            cond_has_text(cond) || body_has_uninterpretable_blr(body)
+        TrigStmt::While { cond, body, raw, .. } => {
+            raw.is_some() || cond_has_text(cond) || body_has_uninterpretable_blr(body)
         }
         // A TEXT LITERAL HAS NO PROBED BLR: the interpreter compares
         // and assigns it (PAD SPACE, measured), but the emitter's shape
@@ -17778,9 +17789,29 @@ fn parse_trig_stmt(
         let close = close?;
         // fold NOT exactly as the engine's DSQL pass does: inverted
         // comparisons and De Morgan; IS NULL keeps its blr_not form
-        let cond =
-            parse_body_cond(&strip_sql_comments(&s[open..=close]), vars)?
-                .normalized();
+        let cond_text = strip_sql_comments(&s[open..=close]);
+        // ...and when the arithmetic grammar cannot hold the condition -
+        // a function call, a LIKE, an IS NULL over an expression - it is
+        // KEPT AS WRITTEN for the planner to answer, exactly as a body's
+        // values are ([TrigStmt::Store]'s `raw`). This is what a policy
+        // is written with: `IF (RDB$GET_CONTEXT('DDL_TRIGGER',
+        // 'OBJECT_NAME') = 'X')`.
+        let (cond, raw) = match parse_body_cond(&cond_text, vars) {
+            Some(c) => (c.normalized(), None),
+            None => {
+                let mut binds: Vec<(String, u16)> = Vec::new();
+                for name in named_refs(&cond_text) {
+                    let slot = vars.iter().position(|v| v.eq_ignore_ascii_case(&name))? as u16;
+                    if !binds.iter().any(|(n, _)| n.eq_ignore_ascii_case(&name)) {
+                        binds.push((name, slot));
+                    }
+                }
+                (
+                    fire_crab_ods::expr::Cond::Missing(fire_crab_ods::expr::Expr::NullLiteral),
+                    Some((cond_text.clone(), binds)),
+                )
+            }
+        };
         *pos = close + 1;
         skip_trig_ws(s, pos, limit);
         let kw = if word == "IF" { "THEN" } else { "DO" };
@@ -17790,7 +17821,13 @@ fn parse_trig_stmt(
         *pos += kw.len();
         let inner = parse_trig_stmt(s, pos, limit, vars)?;
         if word == "WHILE" {
-            return Some(TrigStmt::While { cond, body: Box::new(inner), label: None, src_off: start });
+            return Some(TrigStmt::While {
+                cond,
+                body: Box::new(inner),
+                label: None,
+                raw,
+                src_off: start,
+            });
         }
         // an optional ELSE branch
         let save = *pos;
@@ -17802,7 +17839,7 @@ fn parse_trig_stmt(
             *pos = save;
             None
         };
-        return Some(TrigStmt::If { cond, then: Box::new(inner), otherwise, src_off: start });
+        return Some(TrigStmt::If { cond, then: Box::new(inner), otherwise, raw, src_off: start });
     }
     // simple statements run to the next semicolon OUTSIDE a literal
     let semi = find_stmt_semi(s, start, limit)?;
@@ -18380,7 +18417,9 @@ fn emit_trigger_stmt(
                 }
             }
         }
-        TrigStmt::If { cond, then, otherwise, src_off } => {
+        // a RAW-condition If never reaches here: a body carrying one
+        // cannot be compiled ([body_has_uninterpretable_blr])
+        TrigStmt::If { cond, then, otherwise, src_off, .. } => {
             dbg.push((*src_off, b.len()));
             b.push(8); // blr_if
             cond.emit_positive(b);
@@ -65632,8 +65671,12 @@ fn exec_psql_stmt_inner(
                 }
             }
         }
-        TrigStmt::If { cond, then, otherwise, .. } => {
-            if eval_psql_cond(cond, f)? == Some(true) {
+        TrigStmt::If { cond, then, otherwise, raw, .. } => {
+            let yes = match raw {
+                Some((text, binds)) => eval_raw_cond(text, binds, f, db)?,
+                None => eval_psql_cond(cond, f)? == Some(true),
+            };
+            if yes {
                 exec_psql_stmt(then, f, steps, db, ctx)
             } else if let Some(e) = otherwise {
                 exec_psql_stmt(e, f, steps, db, ctx)
@@ -65641,8 +65684,11 @@ fn exec_psql_stmt_inner(
                 Ok(())
             }
         }
-        TrigStmt::While { cond, body, label, .. } => {
-            while eval_psql_cond(cond, f)? == Some(true) {
+        TrigStmt::While { cond, body, label, raw, .. } => {
+            while match raw {
+                Some((text, binds)) => eval_raw_cond(text, binds, f, db)?,
+                None => eval_psql_cond(cond, f)? == Some(true),
+            } {
                 // LEAVE ends THIS loop and nothing further: the
                 // innermost one catches it, an EXIT passes through
                 match exec_psql_stmt(body, f, steps, db, ctx) {
@@ -66363,6 +66409,35 @@ fn assign_into(f: &mut PsqlFrame, into: &[u16], row: Vec<Value>) -> Result<(), P
 /// concatenation makes the whole text NULL, which the engine then fails
 /// to prepare exactly as it fails on `''` - so both arrive here as an
 /// empty string and raise the same vector.
+/// Answer a condition this server kept AS WRITTEN, by asking the
+/// ORDINARY planner - the one that knows the whole value grammar.
+///
+/// `SELECT COUNT(*) FROM RDB$DATABASE WHERE (<cond>)` is 1 for TRUE and
+/// 0 for FALSE **or UNKNOWN**, which is exactly `IF`'s own rule: only
+/// TRUE takes the THEN branch (measured: `WHERE (NULL = 1)` counts 0).
+/// The frame is written in first, so `NEW.<col>` and `:var` are values
+/// by the time the planner sees them.
+fn eval_raw_cond(
+    text: &str,
+    binds: &[(String, u16)],
+    f: &PsqlFrame,
+    db: &mut Option<Database>,
+) -> Result<bool, PsqlStop> {
+    let cond = subst_body_query(text, binds, f).ok_or(PsqlStop::Unsupported)?;
+    let sql = format!("SELECT COUNT(*) FROM RDB$DATABASE WHERE {}", cond);
+    let mut sink: Vec<Option<Descriptor>> = Vec::new();
+    let plan = plan_query_inner(&sql, &*db, &mut sink).ok_or(PsqlStop::Unsupported)?;
+    if !sink.is_empty() {
+        return Err(PsqlStop::Unsupported);
+    }
+    let dbr = db.as_ref().ok_or(PsqlStop::Unsupported)?;
+    let rows = branch_rows(&plan, dbr, &[]).ok_or(PsqlStop::Unsupported)?;
+    match rows.first().and_then(|r| r.first()) {
+        Some(Value::Int(n)) => Ok(*n != 0),
+        _ => Err(PsqlStop::Unsupported),
+    }
+}
+
 fn render_dyn_text(parts: &[DynPart], f: &PsqlFrame) -> Result<Option<String>, PsqlStop> {
     // TRAILING BLANKS BELONG TO A VALUE AND NOT TO A STATEMENT. A CHAR
     // variable holding a whole statement is padded to its declared

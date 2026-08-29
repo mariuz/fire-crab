@@ -1238,6 +1238,31 @@ for retrieval (its itype is unknown to the index-op reader) and an
 INSERT into a table carrying one still refuses — pre-existing, and the
 reason the gate's fixture has no index.
 
+**A BODY CONDITION THE PLANNER ANSWERS — DONE 2026-08-29
+(`serve-real-trigtext` 10 → 14, `serve-real-ddltrigger`'s recorded
+policy refusal became a comparison).** The other half of the body
+grammar. Values were freed in the text slice; a CONDITION was still the
+arithmetic `Cond` — so `IF (UPPER(NEW.V) = 'AB')`, `IF (NEW.V LIKE
+'a%')`, `IF (NEW.V IS NULL)` and above all `IF
+(RDB$GET_CONTEXT('DDL_TRIGGER', 'OBJECT_NAME') = 'X')` were outside it.
+That last one is how ANY DDL policy is written, so the chunk that made
+DDL triggers fire could not run the trigger anybody would actually
+write; the statement refused instead, honestly but uselessly.
+
+Same mechanism as the values, and the same reason it is right: when the
+arithmetic parse declines, the CONDITION TEXT is kept as written and the
+frame substituted into it, then the ORDINARY planner answers it —
+`SELECT COUNT(*) FROM RDB$DATABASE WHERE (<cond>)`, which is 1 for TRUE
+and 0 for FALSE **or UNKNOWN**. That is exactly `IF`'s own three-valued
+rule: only TRUE takes the branch (measured: `WHERE (NULL = 1)` counts
+0), and the gate runs every test over a NULL to hold it there.
+
+A `WHILE` takes the same path, so a loop may be driven by a test the
+planner answers. Nothing that parsed before changes: the raw form is
+kept only where the arithmetic parse declines, and a body carrying one
+cannot be COMPILED to BLR (`body_has_uninterpretable_blr`), exactly as a
+body carrying a text literal or a raw-values `INSERT` could not.
+
 **WRITING A DDL TRIGGER — DONE 2026-08-28 (`serve-real-ddltrigger` 13
 → 14).** The other half, and the last piece of the trigger taxonomy:
 `CREATE TRIGGER ... BEFORE ANY DDL STATEMENT`, `AFTER CREATE TABLE OR
