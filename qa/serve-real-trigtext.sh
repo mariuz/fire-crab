@@ -226,9 +226,21 @@ ddl='SET TERM ^ ;
 CREATE TRIGGER T_LIT FOR T BEFORE INSERT AS BEGIN INSERT INTO L (ID, W) VALUES (NEW.ID, (a)); END^
 CREATE TRIGGER T_CAT FOR T BEFORE INSERT POSITION 3 AS BEGIN INSERT INTO L (ID, W) VALUES (NEW.ID, (b) || NEW.V); END^
 CREATE TRIGGER T_CH FOR T BEFORE INSERT POSITION 5 AS BEGIN INSERT INTO L (ID, W) VALUES (NEW.ID, NEW.C || (c) || NEW.V); END^
+CREATE TRIGGER T_ASN FOR T BEFORE INSERT POSITION 7 AS
+DECLARE VARIABLE S VARCHAR(60);
+BEGIN
+  S = (d) || NEW.V;
+  INSERT INTO L (ID, W) VALUES (NEW.ID, :S);
+END^
+CREATE TRIGGER T_DCH FOR T BEFORE INSERT POSITION 9 AS
+DECLARE VARIABLE C CHAR(5);
+BEGIN
+  C = (a);
+  INSERT INTO L (ID, W) VALUES (NEW.ID, :C);
+END^
 SET TERM ; ^
 COMMIT;'
-ddl=$(printf '%s' "$ddl" | sed "s/(a)/'ab'/; s/(b)/'a'/; s/(c)/'-'/")
+ddl=$(printf '%s' "$ddl" | sed "s/(a)/'ab'/g; s/(b)/'a'/; s/(c)/'-'/; s/(d)/'two '/")
 printf '%s\n' "$ddl" | "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$CA" >/dev/null 2>&1
 printf '%s\n' "$ddl" | "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$REAL:$CB" >/dev/null 2>&1
 catq() { "$ISQL" -q -b -user "$U" -pas "$P" "$1" 2>&1 <<'SQL' | norm
@@ -251,18 +263,13 @@ done
 ea=$(printf "SET LIST ON; SELECT '<' || W || '>' AS R FROM L ORDER BY W;\n" | "$ISQL" -q -user "$U" -pas "$P" "$CB" 2>&1 | norm)
 ca=$(printf "SET LIST ON; SELECT '<' || W || '>' AS R FROM L ORDER BY W;\n" | "$ISQL" -q -user "$U" -pas "$P" "$CA" 2>&1 | norm)
 check "the ENGINE runs the text trigger THIS server compiled" "$ca" "$ea"
-# THE BOUNDARY THAT IS LEFT: a body DECLARING a text variable. The
-# declaration itself needs a shape this server has not probed (the
-# engine also writes a dependency row on the CHARACTER SET for one), so
-# CREATE refuses - while a body that declares none compiles, above, and
-# one the ENGINE created runs, at the top of this gate.
-ran=$((ran + 1))
-r=$(printf "SET TERM ^ ;\nCREATE TRIGGER T_ASN FOR T BEFORE INSERT POSITION 7 AS DECLARE VARIABLE S VARCHAR(60); BEGIN S = 'x'; INSERT INTO L (ID, W) VALUES (NEW.ID, :S); END^\nSET TERM ; ^\n" \
-    | "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$CA" 2>&1)
-case "$r" in
-    *"Dynamic SQL Error"*) echo "OK   boundary: a body DECLARING a text variable is not compiled" ;;
-    *) echo "DIFF boundary MOVED: declaring a text variable"; echo "     [$r]"; fail=1 ;;
-esac
+# A DECLARED TEXT VARIABLE is compiled too, and its shapes were probed
+# the same way: `DECLARE VARIABLE S VARCHAR(60)` in a UTF8 database is
+# `03 <id u16> 26 0400 F000` - blr_varying2, charset 4, 240 = 60 x 4
+# BYTES - and a `CHAR(5)` is `03 <id u16> 0F 0400 1400`, blr_text2 over
+# 20. The engine writes ONE dependency row on the CHARACTER SET for a
+# body that declares any, whatever the count (object type 17), and the
+# comparison above covers it.
 rm -f "$CA" "$CB"
 gf=$("$GFIX" -v -full -user "$U" -pas "$P" "$A" 2>&1)
 ran=$((ran + 1))

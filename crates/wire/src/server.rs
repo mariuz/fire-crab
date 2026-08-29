@@ -1193,6 +1193,11 @@ fn exec_err_items(w: &mut W, e: &ExecErr) {
         ExecErr::Gds(code, _) => {
             w.int(1).int(*code);
         }
+        // the one TEXT refusal with a vector of its own: a write inside
+        // a read-only transaction ([READ_ONLY_TX_MARK])
+        ExecErr::Text(t) if t == READ_ONLY_TX_MARK => {
+            w.int(1).int(GDS_READ_ONLY_TRANS);
+        }
         ExecErr::Text(_) | ExecErr::Conflict(_) => {
             w.int(1).int(GDS_DSQL_ERROR);
         }
@@ -1541,6 +1546,109 @@ fn take_hex_literal(b: &[char], pos: &mut usize) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// What a `SET TRANSACTION` STATEMENT asks for.
+///
+/// The TPB path has always read its isolation; the STATEMENT form did
+/// not - it opened a transaction and left every setting at the
+/// attachment's default, so `SET TRANSACTION SNAPSHOT` ran READ
+/// COMMITTED and every read in it saw other connections' commits as
+/// they landed. That is a wrong answer for the whole transaction, not
+/// only for the PSQL bodies inside it (measured against the engine: a
+/// count repeated across a concurrent commit answers 1 then 1 there,
+/// and answered 1 then 2 here).
+///
+/// The grammar, and the DEFAULTS, are the engine's own: `SET
+/// TRANSACTION [READ WRITE | READ ONLY] [WAIT | NO WAIT] [LOCK TIMEOUT
+/// n] [ISOLATION LEVEL] {SNAPSHOT [TABLE STABILITY] | READ COMMITTED
+/// [...]}` - and a bare `SET TRANSACTION` is SNAPSHOT, WAIT, READ
+/// WRITE, which is why the default here is a snapshot rather than none.
+struct SetTxSpec {
+    read_committed: bool,
+    consistency: bool,
+    read_only: bool,
+    nowait: bool,
+    lock_timeout: Option<u32>,
+}
+
+fn parse_set_transaction(text: &str) -> Option<SetTxSpec> {
+    let up = text.trim().trim_end_matches(';').to_ascii_uppercase();
+    let w: Vec<&str> = up.split_whitespace().collect();
+    if w.len() < 2 || w[0] != "SET" || w[1] != "TRANSACTION" {
+        return None;
+    }
+    let mut spec = SetTxSpec {
+        read_committed: false, // the engine's default isolation is SNAPSHOT
+        consistency: false,
+        read_only: false,
+        nowait: false,
+        lock_timeout: None,
+    };
+    let mut i = 2usize;
+    while i < w.len() {
+        match w[i..] {
+            [a, b, ..] if a == "READ" && b == "COMMITTED" => {
+                spec.read_committed = true;
+                i += 2;
+                // RECORD_VERSION / NO RECORD_VERSION pick WHICH committed
+                // version is read; this server reads the latest either
+                // way, so the words are consumed and not acted on
+                if w.get(i) == Some(&"RECORD_VERSION") {
+                    i += 1;
+                } else if w.get(i) == Some(&"NO") && w.get(i + 1) == Some(&"RECORD_VERSION") {
+                    i += 2;
+                }
+            }
+            [a, b, ..] if a == "READ" && b == "ONLY" => {
+                spec.read_only = true;
+                i += 2;
+            }
+            [a, b, ..] if a == "READ" && b == "WRITE" => {
+                spec.read_only = false;
+                i += 2;
+            }
+            [a, b, ..] if a == "NO" && b == "WAIT" => {
+                spec.nowait = true;
+                i += 2;
+            }
+            [a, b, c, ..] if a == "TABLE" && b == "STABILITY" && c == "" => {
+                spec.consistency = true;
+                i += 2;
+            }
+            [a, b] if a == "TABLE" && b == "STABILITY" => {
+                spec.consistency = true;
+                i += 2;
+            }
+            [a, ..] if a == "SNAPSHOT" => {
+                spec.read_committed = false;
+                i += 1;
+                if w.get(i) == Some(&"TABLE") && w.get(i + 1) == Some(&"STABILITY") {
+                    spec.consistency = true;
+                    i += 2;
+                }
+            }
+            [a, ..] if a == "WAIT" => {
+                spec.nowait = false;
+                i += 1;
+            }
+            [a, b, ..] if a == "LOCK" && b == "TIMEOUT" => {
+                spec.lock_timeout = w.get(i + 2).and_then(|n| n.parse().ok());
+                if spec.lock_timeout.is_none() {
+                    return None;
+                }
+                i += 3;
+            }
+            [a, b, ..] if a == "ISOLATION" && b == "LEVEL" => i += 2,
+            [a, b, c, ..] if a == "NO" && b == "AUTO" && c == "UNDO" => i += 3,
+            // a clause this server does not read - RESERVING, NAME,
+            // anything else - leaves the isolation unjudged, so the
+            // statement is refused rather than run under a transaction
+            // the client did not ask for
+            _ => return None,
+        }
+    }
+    Some(spec)
+}
+
 /// Does this statement text START a transaction? `SET TRANSACTION` is
 /// the one that does (parse.y's TYPE_START_TRANS), and a client that
 /// executes it with no transaction handle is asking for a new one.
@@ -1578,6 +1686,16 @@ fn switch_named_tx(
 }
 /// "record from transaction @1 is stuck in limbo" - the reader's law
 const GDS_REC_IN_LIMBO: i32 = 335544459;
+
+/// `isc_read_only_trans` - "attempted update during read-only
+/// transaction" (SQLSTATE 25006), what a write inside a `SET
+/// TRANSACTION READ ONLY` answers.
+const GDS_READ_ONLY_TRANS: i32 = 335544361;
+
+/// The text [Database::work_copy] returns for a read-only TRANSACTION,
+/// recognised on the way out and turned into the engine's own vector.
+/// A string is how that funnel already reports every other refusal.
+const READ_ONLY_TX_MARK: &str = "attempted update during read-only transaction";
 /// "count of column list and variable list do not match" (JRD 349,
 /// SQLCODE -313) - a static SELECT INTO whose lists disagree
 const GDS_DSQL_COUNT_MISMATCH: i32 = 335544669;
@@ -3139,6 +3257,17 @@ impl Database {
     /// write side is held, or two writers clone the same base and the
     /// second install silently drops the first's rows.
     fn work_copy(&mut self) -> Result<fire_crab_ods::Image, String> {
+        // A READ-ONLY TRANSACTION WRITES NOTHING EITHER. The FILE's
+        // read-only mode is checked below; this is the TRANSACTION's,
+        // which `SET TRANSACTION READ ONLY` (and isc_tpb_read) asks
+        // for. The flag was stored and never consulted, so such a
+        // transaction inserted rows the engine refuses with
+        // `isc_read_only_trans` - measured: the engine answers 25006
+        // "attempted update during read-only transaction" and this
+        // server wrote the row.
+        if self.read_only {
+            return Err(READ_ONLY_TX_MARK.to_string());
+        }
         // A READ-ONLY DATABASE HAS NO WRITE PATH AT ALL, and this is the
         // one funnel every write goes through - records, catalog rows,
         // generators, index pages, the header's own clumplets. Refusing
@@ -18375,7 +18504,7 @@ fn parse_trig_stmt(
 /// inside), `end, eoc`.
 fn emit_trigger_blr(
     body: &TrigStmt,
-    declares: &[(String, u8, usize)], // (name, blr dtype, DECLARE src offset)
+    declares: &[(String, DeclType, usize)], // (name, type, DECLARE src offset)
     dbg: &mut Vec<(usize, usize)>,
     // WHERE THE RELATION CONTEXTS START. A relation trigger's 0 and 1
     // are OLD and NEW, so its first `blr_store` takes 2; a DATABASE
@@ -18388,8 +18517,7 @@ fn emit_trigger_blr(
     for (i, (_, dtype, _)) in declares.iter().enumerate() {
         b.push(3); // blr_dcl_variable
         b.extend_from_slice(&(i as u16).to_le_bytes());
-        b.push(*dtype);
-        b.push(0); // scale
+        dtype.emit(&mut b);
     }
     for (i, (_, _, src_off)) in declares.iter().enumerate() {
         dbg.push((*src_off, b.len()));
@@ -18690,7 +18818,7 @@ fn emit_trigger_stmt(
 /// statement text.
 fn trigger_debug_blob(
     sql: &str,
-    vars: &[(String, u8, usize)],
+    vars: &[(String, DeclType, usize)],
     entries: &[(usize, usize)],
 ) -> Vec<u8> {
     let mut d = vec![1u8, 2];
@@ -18974,6 +19102,42 @@ fn collect_gen_names(e: &fire_crab_ods::expr::Expr, out: &mut Vec<String>) {
     }
 }
 
+/// A DECLARED VARIABLE's type, as the BLR spells it.
+///
+/// An integer is one byte and a scale; a TEXT one carries its CHARACTER
+/// SET and a length IN BYTES - probed from engine-written trigger BLR:
+/// `DECLARE VARIABLE S VARCHAR(60)` in a UTF8 database is `03 <id u16>
+/// 26 0400 F000` (blr_varying2, charset 4, 240 = 60 x 4 bytes) and a
+/// `CHAR(5)` is `03 <id u16> 0F 0400 1400` (blr_text2, 20 bytes).
+#[derive(Clone, Copy, PartialEq)]
+enum DeclType {
+    /// blr_short / blr_long / blr_int64, scale 0
+    Int(u8),
+    /// blr_text2 (15) or blr_varying2 (38), with a charset and a
+    /// BYTE length
+    Text { varying: bool, charset: u16, bytes: u16 },
+}
+
+impl DeclType {
+    /// The declaration's bytes, after `blr_dcl_variable` and the id.
+    fn emit(&self, out: &mut Vec<u8>) {
+        match self {
+            DeclType::Int(dt) => {
+                out.push(*dt);
+                out.push(0); // scale
+            }
+            DeclType::Text { varying, charset, bytes } => {
+                out.push(if *varying { 38 } else { 15 }); // blr_varying2 / blr_text2
+                out.extend_from_slice(&charset.to_le_bytes());
+                out.extend_from_slice(&bytes.to_le_bytes());
+            }
+        }
+    }
+    fn is_text(&self) -> bool {
+        matches!(self, DeclType::Text { .. })
+    }
+}
+
 fn plan_trigger_table(table: &str) -> Option<&str> {
     (!table.is_empty()).then_some(table)
 }
@@ -19174,7 +19338,7 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
     let begin_kw = find_word(&masked, "BEGIN", as_kw + "AS".len())?;
     // between AS and BEGIN: `DECLARE VARIABLE <name> <int type>;`*
     // (name, blr dtype, DECLARE keyword offset) in slot order
-    let mut declares: Vec<(String, u8, usize)> = Vec::new();
+    let mut declares: Vec<(String, DeclType, usize)> = Vec::new();
     let mut dpos = as_kw + "AS".len();
     loop {
         let rest = masked[dpos..begin_kw].trim_start();
@@ -19187,13 +19351,35 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
         }
         let semi = s[at..begin_kw].find(';')? + at;
         let words: Vec<&str> = masked[at..semi].split_whitespace().collect();
-        let dtype = match words.as_slice() {
-            ["DECLARE", "VARIABLE", _, ty] => match *ty {
-                "SMALLINT" => 7u8,       // blr_short
-                "INTEGER" | "INT" => 8,  // blr_long
-                "BIGINT" => 16,          // blr_int64
+        // `DECLARE VARIABLE <name> <type>` - the integer family, or a
+        // TEXT one whose length is written in CHARACTERS and stored in
+        // BYTES (the database's default charset decides the factor)
+        let text_decl = |ty: &str, rest: &str| -> Option<DeclType> {
+            let varying = match ty {
+                "VARCHAR" | "CHAR" => ty == "VARCHAR",
                 _ => return None,
+            };
+            let n: u32 = rest.trim().strip_prefix('(')?.strip_suffix(')')?.trim().parse().ok()?;
+            let cs = db_default_charset(&db.as_ref()?.bytes(), db.as_ref()?.page_size);
+            let bytes = n.checked_mul(fire_crab_ods::intl::bytes_per_char(cs) as u32)?;
+            if n == 0 || bytes > u16::MAX as u32 {
+                return None;
+            }
+            Some(DeclType::Text { varying, charset: cs as u16, bytes: bytes as u16 })
+        };
+        let dtype = match words.as_slice() {
+            // the integer family is one word; a TEXT type carries a
+            // length, which may arrive as `VARCHAR(60)` or `VARCHAR (60)`
+            ["DECLARE", "VARIABLE", _, ty] => match *ty {
+                "SMALLINT" => DeclType::Int(7),        // blr_short
+                "INTEGER" | "INT" => DeclType::Int(8), // blr_long
+                "BIGINT" => DeclType::Int(16),         // blr_int64
+                _ => {
+                    let open = ty.find('(')?;
+                    text_decl(&ty[..open], &ty[open..])?
+                }
             },
+            ["DECLARE", "VARIABLE", _, ty, size] => text_decl(ty, size)?,
             _ => return None,
         };
         let name = s[at..semi].split_whitespace().nth(2)?.trim_matches('"').to_ascii_uppercase();
@@ -19604,6 +19790,19 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
                 store_deps,
                 exceptions,
                 generators,
+                // ONE row for the whole trigger, whatever the count -
+                // and only when a text variable is declared at all
+                charset: declares
+                    .iter()
+                    .any(|(_, t, _)| t.is_text())
+                    .then(|| {
+                        charset_id_name(db_default_charset(
+                            &db.bytes(),
+                            db.page_size,
+                        ))
+                        .map(|n| n.to_string())
+                    })
+                    .flatten(),
             },
         },
         Vec::new(),
@@ -28556,6 +28755,12 @@ fn execute_dml_collecting_inner(
             Plan::Insert { .. } | Plan::Update { .. } | Plan::Delete { .. }
         );
         return Err(ExecErr::Eval(EvalErr::ReadOnlyDatabase { dsql }));
+    }
+    // ...and the TRANSACTION's own read-only mode, beside the file's.
+    // [Database::work_copy] refuses underneath this as the floor; what
+    // this adds is the vector, which is what a client acts on.
+    if db.read_only {
+        return Err(ExecErr::Eval(EvalErr::ReadOnlyTransaction));
     }
     // THE WRITE SIDE COMES FIRST, and the working copy is taken under
     // it: two writers that clone the same base both install a whole
@@ -45543,6 +45748,9 @@ fn eval_status_items(w: &mut W, e: &EvalErr) {
             }
             w.int(1).int(GDS_READ_ONLY_DATABASE);
         }
+        EvalErr::ReadOnlyTransaction => {
+            w.int(1).int(GDS_READ_ONLY_TRANS);
+        }
         EvalErr::AtProcedure { inner, at } => {
             eval_status_items(w, inner);
             for line in at {
@@ -52949,6 +53157,13 @@ enum EvalErr {
     /// failure yet, so those two shapes are a boundary rather than a
     /// guess.
     ReadOnlyDatabase { dsql: bool },
+    /// A write inside a READ-ONLY TRANSACTION - `isc_read_only_trans`,
+    /// SQLSTATE 25006 "attempted update during read-only transaction".
+    /// Distinct from [EvalErr::ReadOnlyDatabase], which is the FILE's
+    /// mode: this one is what `SET TRANSACTION READ ONLY` (and
+    /// isc_tpb_read) asks for, and the flag was stored and never
+    /// consulted until the statement form of SET TRANSACTION was read.
+    ReadOnlyTransaction,
     /// a static `SELECT ... INTO` whose select list and variable list
     /// disagree: `isc_dsql_error` + `isc_sqlerr`(-313) +
     /// `isc_dsql_count_mismatch` (SQLSTATE 07002) - the engine raises
@@ -72119,7 +72334,32 @@ fn after_auth(
                 // (isql.epp:754), and the answer carries the new handle
                 // (server.cpp:3594)
                 let started_tx = if op_tr == 0 && starts_transaction(&text) {
-                    database.as_mut().map(|d| d.open_tx())
+                    // ...AND IT RUNS UNDER THE ISOLATION IT NAMES. The
+                    // statement's own words were read by nobody before
+                    // this: `SET TRANSACTION SNAPSHOT` opened a
+                    // READ COMMITTED transaction and every read in it -
+                    // a plain SELECT as much as a PSQL body's - saw
+                    // other connections' commits as they landed.
+                    let Some(spec) = parse_set_transaction(&text) else {
+                        respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
+                        continue;
+                    };
+                    let h = database.as_mut().map(|d| d.open_tx());
+                    if let Some(db) = database.as_mut() {
+                        db.wait = !spec.nowait;
+                        db.lock_timeout = spec.lock_timeout;
+                        db.consistency = spec.consistency;
+                        db.read_only = spec.read_only;
+                        db.snapshot = if spec.read_committed {
+                            None
+                        } else {
+                            Some(fire_crab_ods::tra::Snapshot::capture(
+                                &db.bytes(),
+                                db.page_size,
+                            ))
+                        };
+                    }
+                    h
                 } else {
                     None
                 };
@@ -81172,7 +81412,7 @@ mod tests {
         let hex = |h: &str| -> Vec<u8> {
             (0..h.len()).step_by(2).map(|i| u8::from_str_radix(&h[i..i + 2], 16).unwrap()).collect()
         };
-        let compile = |sql: &str, declares: &[(String, u8, usize)]| {
+        let compile = |sql: &str, declares: &[(String, DeclType, usize)]| {
             let up = sql.to_ascii_uppercase();
             let begin = find_word(&up, "BEGIN", 0).unwrap();
             let end = up.rfind("END").unwrap();

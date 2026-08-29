@@ -137,8 +137,18 @@ case "$(node_run 'CREATE TRIGGER TX FOR T1 BEFORE DELETE AS DECLARE VARIABLE V I
 case "$(node_run 'CREATE TRIGGER TX FOR T1 BEFORE INSERT AS BEGIN V = 1; END')" in
     ERR*) echo "OK   an undeclared variable target refuses" ;;
     *) echo "DIFF undeclared refusal"; fail=1 ;; esac
+# A TEXT VARIABLE COMPILES NOW (its blr_varying2/blr_text2 shapes are
+# probed - qa/serve-real-trigtext.sh holds them byte for byte against
+# the engine), so what was a refusal here is an ANSWER. The trigger is
+# dropped again: every check after this one compares this file's WHOLE
+# trigger set with the engine's, and a trigger only one side has would
+# fail them for the wrong reason.
 case "$(node_run 'CREATE TRIGGER TX FOR T1 BEFORE INSERT AS DECLARE VARIABLE V VARCHAR(5); BEGIN NEW.B = 1; END')" in
-    ERR*) echo "OK   a non-integer variable type refuses" ;;
+    ERR*) echo "DIFF vartype: a text variable should compile now"; fail=1 ;;
+    *) echo "OK   a text variable type compiles"; node_run 'DROP TRIGGER TX' >/dev/null 2>&1 ;; esac
+# ...while a type whose BLR shape is still unprobed refuses
+case "$(node_run 'CREATE TRIGGER TX FOR T1 BEFORE INSERT AS DECLARE VARIABLE V TIMESTAMP; BEGIN NEW.B = 1; END')" in
+    ERR*) echo "OK   a variable type with no probed shape still refuses" ;;
     *) echo "DIFF vartype refusal"; fail=1 ;; esac
 case "$(node_run 'CREATE TRIGGER TX FOR T1 BEFORE INSERT AS BEGIN ELSE NEW.B = 1; END')" in
     ERR*) echo "OK   ELSE without an IF refuses" ;;

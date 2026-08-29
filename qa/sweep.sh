@@ -66,7 +66,7 @@ done
 #     mid-line (diagnosed 2026-08-28 - the mangling is the engine's)
 #   fetchbatch/textwidth2: each shares its scratch DB NAMES with another
 #     gate (batch, temporalwhere)
-SERIAL="concurrency carefulflush gbakverbose gencomp gendurable fetchbatch textwidth2 idxcost"
+SERIAL="concurrency carefulflush gbakverbose gencomp gendurable fetchbatch textwidth2 idxcost settransaction"
 
 is_serial() { case " $SERIAL " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
 

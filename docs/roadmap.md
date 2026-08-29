@@ -1270,10 +1270,21 @@ integer rank (so the INT-ONLY surfaces keep refusing one), it IS text
 whatever its operands are, it walks both sides like the arithmetic
 nodes, and it evaluates with NULL-on-either-side-is-NULL.
 
-RECORDED BOUNDARY: a body that DECLARES a text variable is still not
-compiled — the declaration needs a shape this server has not probed, and
-the engine writes a dependency row on the CHARACTER SET for one. Such a
-body still RUNS when the engine created it.
+AND THE DECLARATION WITH IT (same day, `serve-real-trigtext` 16 → 15
+checks — one boundary became part of a comparison). A body may DECLARE
+the variable it builds its message in: `DECLARE VARIABLE S VARCHAR(60)`
+in a UTF8 database is `03 <id u16> 26 0400 F000` — `blr_varying2`,
+charset 4, 240 = 60 x 4 BYTES — and a `CHAR(5)` is `03 <id u16> 0F 0400
+1400`, `blr_text2` over 20. `DeclType` carries the two shapes where a
+single dtype byte used to, the length is written in BYTES from the
+database's default charset, and the engine's ONE dependency row on the
+CHARACTER SET (object type 17, whatever the count of such variables) is
+written beside it. Both compile byte-identically.
+
+A parser trap worth keeping: `VARCHAR(60)` is ONE word to
+`split_whitespace`, so the four-word arm that matched the integer names
+also matched it and returned before the text arm was ever reached. The
+arms are one now, with the length split off inside.
 
 **A BODY CONDITION THE PLANNER ANSWERS — DONE 2026-08-29
 (`serve-real-trigtext` 10 → 14, `serve-real-ddltrigger`'s recorded

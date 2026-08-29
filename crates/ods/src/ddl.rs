@@ -4792,6 +4792,10 @@ pub struct UserTriggerDef {
     /// dependency row each, object type 14 (measured against the
     /// engine's own rows for the same source)
     pub generators: Vec<String>,
+    /// the CHARACTER SET a body's declared TEXT variables carry: ONE
+    /// dependency row, object type 17, however many such variables
+    /// there are (measured)
+    pub charset: Option<String>,
 }
 
 /// `CREATE TRIGGER <name> FOR <table> ...`: the RDB$TRIGGERS row (user
@@ -4902,6 +4906,11 @@ pub fn create_user_trigger(
     for g in &def.generators {
         dep(file, g, None, 14)?;
     }
+    // the character set of a declared TEXT variable: object type 17,
+    // one row whatever the count (measured)
+    if let Some(cs) = &def.charset {
+        dep(file, cs, None, 17)?;
+    }
     // a database trigger belongs to no relation, so no relation's
     // runtime summary changes with it
     if let Some(t) = table.as_deref() {
@@ -4982,9 +4991,20 @@ pub fn alter_trigger_attrs(
 /// `DROP TRIGGER <name>`: the row and the trigger's dependency rows go.
 pub fn drop_trigger(file: &mut crate::Image, page_size: usize, name: &str) -> Result<(), String> {
     let want = name.trim().trim_matches('"').to_ascii_uppercase();
-    if trigger_info(file, page_size, &want).is_none() {
-        return Err(format!("Trigger {} not found", want));
-    }
+    // THE RELATION IS READ BEFORE THE ROW GOES, because its runtime
+    // summary has to be rebuilt afterwards and the name is only in the
+    // row. Dropping a trigger left its name in `RDB$RUNTIME` - CREATE
+    // rebuilt the summary and DROP did not - so the engine reading this
+    // file was still told the relation had a trigger that is gone.
+    // (Found by a gate that compares the summary byte for byte, once a
+    // check began creating and dropping one.)
+    let table = match trigger_info(file, page_size, &want) {
+        None => return Err(format!("Trigger {} not found", want)),
+        // a DATABASE or DDL trigger belongs to no relation, so there is
+        // no summary to rebuild
+        Some((t, ..)) if t.trim().is_empty() => None,
+        Some((t, ..)) => Some(t.trim().to_string()),
+    };
     {
         let fid = sys_fid(file, page_size, "RDB$TRIGGERS", "RDB$TRIGGER_NAME")?;
         let n = want.clone();
@@ -4997,6 +5017,9 @@ pub fn drop_trigger(file: &mut crate::Image, page_size: usize, name: &str) -> Re
         delete_catalog_rows(file, page_size, "RDB$DEPENDENCIES", move |v| {
             text_eq(v.get(dn_f), &n) && int_eq(v.get(dt_f), 2)
         })?;
+    }
+    if let Some(t) = table {
+        update_relation_runtime(file, page_size, &t)?;
     }
     advance_oldest_transactions(file, page_size)
 }
