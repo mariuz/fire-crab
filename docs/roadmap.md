@@ -3041,6 +3041,79 @@ pointer-page and TIP page numbers is the next step when it dominates.
 
 ## Next, in order
 
+- **BRANCH RECONCILIATION BEYOND UNION DONE (2026-08-29,
+  `serve-real-branchtype` 51):** a UNION describes one column per
+  position and decodes every branch's value under it - and so does a
+  CASE, a COALESCE, an IIF, a DECODE and the anchor/recursive pair of a
+  recursive CTE. The law has two halves: the description is RECONCILED
+  from every branch, and every branch's VALUE is then brought to it.
+  fire-crab had the first half and not the second, which is the worst
+  possible split - the describe looks right, a row comes back, and the
+  number in it is wrong.
+  **THE FLAGSHIP:** `SUM(CASE WHEN <false> THEN CAST(1.50 AS
+  NUMERIC(9,2)) ELSE 100 END)` answered **2.00** where the engine
+  answers 200.00. The integer branch handed back a raw 100 where the
+  announced scale of -2 wanted 10000, so every row contributed 1.00.
+  `SUM(CASE WHEN ... THEN <amount> ELSE 0 END)` is a workhorse idiom and
+  it was returning money short by a factor of 100. What hid it: the
+  DIRECT projection of the same conditional is CORRECT on both servers,
+  because the encoder renders the value's own scale - the defect only
+  appears once an aggregate or a `CAST` to text CONSUMES the datum, so a
+  value-only check of the expression sees nothing. Fixed by
+  `align_conditional`, which wraps a scaled conditional in the CAST that
+  already implements rounding, at the same single resolution point
+  `pad_conditional` uses - so the aggregate's source, the cast's source
+  and the select list are all covered at once, and `eval` (which has no
+  descriptors to reconcile against) is left alone.
+  Same law, four more places:
+  (a) a conditional's **sub_type** is the MAX family code of its
+  branches; CASE had no arm in `numeric_subtype` at all and announced 0
+  for every one. NULLIF instead takes its **FIRST** operand's alone -
+  its value IS that operand.
+  (b) **MIN/MAX describe what their SOURCE describes**, expression
+  sources included. Reading `MAX(ID+0)` is INT64 as "an expression
+  source stays the fold's INT64" was the wrong lesson: `ID+0` is itself
+  INT64, the arithmetic having widened it before the fold saw it, while
+  `MAX(CASE ... <INTEGER> ... END)` is a 4-byte LONG.
+  (c) **an 8-byte NUMERIC RANKS as I64** - what makes SUM widen it to
+  INT128 and a multiplication around it promote. `CastTarget::Numeric`
+  mapped everything below 16 bytes to Long, so neither fired (probed:
+  `SUM(CAST(1.5 AS NUMERIC(18,4)))` is INT128 where the NUMERIC(9,2)
+  one stays INT64).
+  (d) a **UNION of TEXT branches** takes the widest length, VARYING wins
+  over the fixed form, and the charset follows the concatenation join
+  (a real charset beats a literal's attachment sentinel and beats NONE;
+  of two reals the FIRST branch's wins). This was a gap in the union
+  chunk two commits back: that reconciliation compared type, scale and
+  sub_type but NOT length, so two CHAR branches looked identical, kept
+  the first branch's width, and `'a' UNION ALL 'bb'` announced one
+  character and died mid-cursor with a 22001. The width is maxed in
+  CHARACTERS, not the branches' own units - a plain column carries its
+  width in the bytes of ITS OWN charset, so the same six-character union
+  is 6 bytes under WIN1252 and 24 under UTF8.
+  BOUNDARY (recorded, gated): a **recursive CTE whose recursive member
+  answers at a different SCALE from the anchor** now REFUSES. It used to
+  answer **15** - the raw of 1.5 read as a scale-0 integer - and 15 then
+  failed the loop's own `X < 3` guard, truncating the result set as
+  well. The engine keeps the recursion in FULL PRECISION and renders
+  only at the anchor's description (`SELECT 1 UNION ALL SELECT X + 0.5`
+  answers 1, 2, 2, 3, 3 - the values 1, 1.5, 2.0, 2.5, 3.0 each rounded
+  at output), which needs two column sets this planner does not carry.
+  The first version of the check compared the announced TYPE too and
+  refused the ordinary integer generator, since `X + 1` widens to INT64
+  against a LONG anchor while the values are identical - caught before
+  commit; only the SCALE is compared.
+  KNOWN DIVERGENCE (recorded, not gated): a **simple CASE (`CASE x WHEN
+  ...`) and DECODE are announced NOT NULL where the engine says
+  Nullable**, even with an ELSE - a searched CASE with an ELSE correctly
+  is not. Both lower to the same `Expr::Case` node as a searched one, so
+  telling them apart needs a flag on it and a dozen match sites updated.
+  The VALUES are identical; this is the describe's nullable bit alone.
+  Found by a 12-agent differential hunt across six SQL surfaces, which
+  confirmed 37 wrong answers and 26 refusal boundaries in all; this
+  entry closes the branch-reconciliation cluster. The rest are listed
+  under "What the hunt found" below.
+
 - **THE DESCRIBE OF A COMPUTED COLUMN DONE (2026-08-29,
   `serve-real-exprshape` 54):** four wrong-answer classes, all of them
   live and none of them a refusal, in the description a projected
@@ -3641,6 +3714,79 @@ pointer-page and TIP page numbers is the next step when it dominates.
 - **G, the external sort** — every sort and hash build is bounded by
   RAM today; after the growth walls this is the next scalability
   ceiling a real database reaches.
+
+## What the hunt found (2026-08-29)
+
+A 12-agent differential hunt probed six SQL surfaces against the live
+engine with twin databases, each finding then re-run from scratch by an
+independent verifier told to REFUTE it. It confirmed 37 wrong answers
+and 26 refusal boundaries. The branch-reconciliation cluster (8 of them)
+is fixed above; what follows is the rest, ranked, as the standing
+backlog. A `wrong answer` means BOTH servers answer and differ - the
+prize. A `refusal` means fire-crab errors where the engine answers: a
+recorded boundary under this project's law, not a defect, and ranked
+below every wrong answer.
+
+### Confirmed WRONG ANSWERS still open
+
+- **HIGH** (scalar subqueries) — Scalar subquery over a CHAR/VARCHAR column drops the column's CHARACTER SET: a WIN1252 value comes back double-encoded (Ã©Ã  instead of éà) and CHAR pads to the wrong width
+- **HIGH** (window functions) — RANGE BETWEEN UNBOUNDED PRECEDING AND <offset> FOLLOWING excludes the NULL ordering-key peer group from every later row's frame
+- **HIGH** (date/time arithmetic) — DATEADD on any TIMESTAMP WITH TIME ZONE returns a fixed zeroed buffer (1858-11-16 00:01:00.0000 -23:59) for every part
+- **HIGH** (date/time arithmetic) — DATEDIFF between two TIMESTAMP WITH TIME ZONE values always returns 0
+- **HIGH** (the CAST matrix and string functions a) — CAST to a narrower NUMERIC silently wraps modulo 2^32 / 2^16 instead of raising 22003 "numeric value is out of range"
+- **HIGH** (the CAST matrix and string functions a) — Implicit CHARACTER SET NONE widening decodes NONE bytes as Latin-1 instead of treating them transparently, corrupting concatenation, REPLACE, POSITION and equality
+- **HIGH** (the CAST matrix and string functions a) — UTF8 -> OCTETS implicit conversion transliterates to Latin-1 instead of taking raw storage bytes, and announces len 64 where the engine announces 160
+- **HIGH** (the CAST matrix and string functions a) — NONE || WIN1252 resolves the NONE bytes through Latin-1 instead of WIN1252 (0x9F becomes U+009F, not U+0178)
+- **MEDIUM** (scalar subqueries) — Scalar subquery describes from the executed VALUE, not the inner column: SMALLINT and small BIGINT both come back LONG, a large BIGINT comes back INT64 — the same statement describes differently depending on the data
+- **MEDIUM** (scalar subqueries) — Scalar subquery over NUMERIC/DECIMAL announces sub_type 0, erasing the NUMERIC(1) vs DECIMAL(2) discriminator, and widens the storage type
+- **MEDIUM** (scalar subqueries) — Scalar subquery that matches no rows describes as TEXT(1) CHARACTER SET NONE instead of the inner column's SMALLINT
+- **MEDIUM** (scalar subqueries) — Subquery-bearing select-list expressions lose the Nullable flag and propagate the non-nullable claim through arithmetic, CHAR_LENGTH and CASE
+- **MEDIUM** (window functions) — RANGE BETWEEN <offset> PRECEDING AND UNBOUNDED FOLLOWING gives a NULL ordering-key row only its own peer group instead of the tail of the partition
+- **MEDIUM** (common table expressions) — A CTE whose name shadows a real table and self-references is answered with PostgreSQL-style scoping; the engine refuses it as cyclic
+- **MEDIUM** (common table expressions) — String expression over a CTE/derived literal column is described with charset 255 CS_dynamic where the engine says charset 0 SYSTEM.NONE
+- **MEDIUM** (date/time arithmetic) — DATE - DATE describes as INT64 len 8 where the engine says LONG len 4, and the wrong width cascades to INT128 in further arithmetic
+- **MEDIUM** (date/time arithmetic) — TIME - TIME describes as INT64 subtype 0 len 8 where the engine says LONG subtype 1 (NUMERIC) len 4
+- **MEDIUM** (date/time arithmetic) — TIMESTAMP - TIMESTAMP describes sub_type 0 where the engine says 1 (NUMERIC), and marks the all-literal form Nullable where the engine does not
+- **MEDIUM** (date/time arithmetic) — Implicit temporal-to-string conversion in concatenation describes VARCHAR(32765) instead of the natural width (DATE 10, TIME 13, TIMESTAMP 25)
+- **MEDIUM** (the CAST matrix and string functions a) — ASCII_VAL over a non-ASCII character returns the code point where the engine raises 22018 "Cannot transliterate character between character sets"
+- **MEDIUM** (the CAST matrix and string functions a) — LPAD/RPAD with a non-literal length argument announces double the engine's maximum length (65532), above the 32765-byte VARCHAR limit
+- **LOW** (CASE / COALESCE / NULLIF / IIF / DECOD) — CAST of a literal to CHARACTER SET WIN1252 transliterates where the engine byte-copies, so a CASE branch carrying it ships 1 byte instead of 2
+- **LOW** (scalar subqueries) — EXISTS in the select list describes non-nullable and names the column CONSTANT instead of BOOL
+- **LOW** (scalar subqueries) — Derived table + GROUP BY: fire-crab marks the grouping column Nullable where the engine keeps the base primary key's NOT NULL
+- **LOW** (scalar subqueries) — Scalar aggregate subquery inside a derived table reports RDB$FIELD_NAME 'MAX' where the engine leaves it blank
+- **LOW** (common table expressions) — Any expression over a CTE (or derived-table) column is announced Nullable; the engine announces it NOT NULL
+- **LOW** (common table expressions) — Recursive CTE tree walk is emitted breadth-first; Firebird emits it depth-first
+- **LOW** (common table expressions) — Recursive-CTE columns leak the anchor expression's node kind into the describe `name:` field (CONSTANT); the engine leaves it empty
+- **LOW** (date/time arithmetic) — UNION DISTINCT with a CAST branch blanks the field name and table origin in the describe
+
+### Refusal boundaries recorded (fire-crab refuses, the engine answers)
+
+- medium — REFUSAL: scalar subquery over FLOAT, DOUBLE PRECISION, DATE, TIME, TIMESTAMP or DECFLOAT fails to prepare
+- medium — A CTE containing a window function PREPAREs with a byte-identical correct SQLDA, then fails at EXECUTE
+- low — Introducer-prefixed literal (_WIN1252 'x') is refused, in a CASE branch and on its own
+- low — REFUSAL: a scalar subquery as the LEFT operand of a comparison in WHERE fails to prepare
+- low — REFUSAL: a CORRELATED EXISTS / NOT EXISTS used as a select-list value fails to prepare
+- low — Multiple-row scalar subquery: fire-crab raises SQLSTATE 21000 at PREPARE, the engine emits the output SQLDA first and raises the identical error at fetch
+- low — PERCENT_RANK() and CUME_DIST() are not implemented
+- low — RANGE frames whose bounds are keyword-only (UNBOUNDED / CURRENT ROW) fail to parse, though the semantically identical default frame works
+- low — RANGE offset frames are refused unless the ORDER BY key is a scale-0 integer
+- low — A window function nested inside any expression (arithmetic, CASE, COALESCE) is refused; only a bare top-level select-list window is accepted
+- low — Window functions cannot be combined with GROUP BY, SELECT DISTINCT, or a frame clause on an ORDER BY-less window
+- low — Windowed LIST() and non-constant LAG/LEAD offsets are refused
+- low — REFUSAL: window function with OVER (ORDER BY ...) inside a CTE or derived table prepares, then fails at fetch
+- low — REFUSAL: a CTE cannot be referenced from a subquery, a union branch of the main query, or a scalar subselect
+- low — REFUSAL: forward reference to a CTE declared later in the same WITH list
+- low — REFUSAL: CTE over a UNION mixing a UTF8 VARCHAR column with a longer literal fails to prepare, and with no diagnostic detail lines
+- low — REFUSAL: a recursive CTE with more than one recursive member
+- low — Arithmetic between a TIMESTAMP WITH TIME ZONE and a number is refused at prepare time
+- low — CAST from TIME, or from TIMESTAMP WITH TIME ZONE, to DATE/TIMESTAMP is refused with a conversion error (includes CAST(CURRENT_TIMESTAMP AS DATE))
+- low — LOCALTIME(n) and LOCALTIMESTAMP(n) with an explicit precision are rejected at prepare
+- low — A bare NULL literal as either DATEDIFF operand is rejected, and the FROM/TO form misparses it as a table reference
+- low — OVERLAY is not parsed: fire-crab reports "Table unknown" on the FROM keyword inside OVERLAY
+- low — BIT_LENGTH is unknown to fire-crab (CHAR_LENGTH and OCTET_LENGTH work)
+- low — ASCII_CHAR is unknown to fire-crab
+- low — CAST(... AS BOOLEAN) is unsupported
+- low — The _CHARSET introducer on a literal (_WIN1252 X'809F', _UTF8 '€') is unsupported
 
 ## How these slices are gated
 

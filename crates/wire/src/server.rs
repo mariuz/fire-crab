@@ -15153,8 +15153,23 @@ fn numeric_subtype(e: &Expr, descs: &[Descriptor]) -> i16 {
         Expr::Neg(a) => numeric_subtype(a, descs),
         Expr::Bin(a, _, b) => numeric_subtype(a, descs).max(numeric_subtype(b, descs)),
         Expr::Coalesce(v) => v.iter().map(|x| numeric_subtype(x, descs)).max().unwrap_or(0),
-        Expr::NullIf(a, b) => numeric_subtype(a, descs).max(numeric_subtype(b, descs)),
+        // NULLIF's value IS its first operand - the second one only
+        // decides whether the answer is NULL - so the family code comes
+        // from the FIRST alone (probed: NULLIF(<INTEGER>, <DECIMAL>)
+        // describes sub_type 0, where taking the max announced 2)
+        Expr::NullIf(a, _) => numeric_subtype(a, descs),
         Expr::Iif(_, a, b) => numeric_subtype(a, descs).max(numeric_subtype(b, descs)),
+        // CASE had no arm at all and fell to the 0 below, so every
+        // conditional over NUMERIC or DECIMAL branches announced itself
+        // a plain scaled integer. Same MAX-of-the-branches rule as
+        // COALESCE and a UNION column; a missing ELSE is an untyped
+        // NULL branch and contributes nothing.
+        Expr::Case(branches, else_) => branches
+            .iter()
+            .map(|(_, t)| numeric_subtype(t, descs))
+            .chain(else_.iter().map(|e| numeric_subtype(e, descs)))
+            .max()
+            .unwrap_or(0),
         // ROUND / TRUNC copy the operand descriptor, its sub_type included
         // (makeRound / makeTrunc `*result = *value`); CEIL / FLOOR drop it
         // to 0 (makeLong / makeInt64), which is the default below.
@@ -37669,9 +37684,13 @@ fn plan_union(
     for (i, c) in cols.iter_mut().enumerate() {
         // Every branch's (type, scale, sub_type) at this position.
         let mut shapes = Vec::with_capacity(branches.len());
+        let mut widths = Vec::with_capacity(branches.len());
         for b in &branches {
             match output_cols_of(b).get(i) {
-                Some(bc) => shapes.push((bc.sql_type & !1, bc.scale, bc.sub_type)),
+                Some(bc) => {
+                    shapes.push((bc.sql_type & !1, bc.scale, bc.sub_type));
+                    widths.push((bc.length, bc.oct_length));
+                }
                 // a branch that does not reach this far cannot be
                 // reconciled against
                 None => return Some(Plan::Refused),
@@ -37679,8 +37698,84 @@ fn plan_union(
         }
         // identical in every branch: there is nothing to reconcile, and
         // this is the path every non-numeric union takes
-        if shapes.iter().all(|s| *s == (c.sql_type & !1, c.scale, c.sub_type)) {
+        let same_shape = shapes.iter().all(|s| *s == (c.sql_type & !1, c.scale, c.sub_type));
+        let same_width = widths.iter().all(|w| *w == (c.length, c.oct_length));
+        if same_shape && same_width {
             continue;
+        }
+        // TEXT: the reconciled length is the WIDEST branch's and the
+        // VARYING form wins over the fixed one (probed: 'a' UNION ALL
+        // 'bb' describes TEXT len 2 either way round and pads the short
+        // value, a CHAR(5) beside a VARCHAR(10) describes VARYING at the
+        // longer width, and a CHAR beside a literal stays TEXT). Only
+        // the WIDTH was missed before - the shapes agree on everything
+        // else, so this fell through the "identical" check above and
+        // kept the FIRST branch's length: the describe announced 1
+        // character and the second row died mid-cursor with a string
+        // right truncation. The encoder pads a fixed-text column to its
+        // declared width, so announcing the right length fixes the
+        // values with it.
+        //
+        // Branches whose CHARSETS differ are left to refuse below: the
+        // charset rides the sub_type here, and picking one operand's
+        // over another's is a guess about transliteration.
+        let is_text = |t: i32| matches!(t, 448 | 452);
+        if shapes.iter().all(|(t, ..)| is_text(*t)) {
+            // THE CHARSET FOLLOWS THE SAME JOIN AS A CONCATENATION
+            // ([cs_join]): a REAL charset beats the attachment sentinel
+            // a literal carries and beats NONE, and of two different
+            // real ones the FIRST branch's wins - probed both ways
+            // round on every pairing (a UTF8 column beside a literal is
+            // UTF8 whichever comes first; W6 UNION U6 is WIN1252 while
+            // U6 UNION W6 is UTF8; NONE yields to either). The byte
+            // width then follows the WINNER at emission, which is why
+            // the same 6-character union is 6 bytes under WIN1252 and
+            // 24 under UTF8.
+            let real = |st: i32| {
+                st <= -2 || (st >= 0 && fire_crab_ods::intl::charset_id(st as i16) > 1)
+            };
+            if let Some((_, _, st)) = shapes.iter().find(|(_, _, st)| real(*st)) {
+                c.sub_type = *st;
+            }
+            let varying = shapes.iter().any(|(t, ..)| *t == 448);
+            c.sql_type = (if varying { 448 } else { 452 }) | (c.sql_type & 1);
+            c.wire = if varying { Wire::Varying } else { Wire::Text };
+            // THE WIDTH IS MAXED IN CHARACTERS, NOT IN THE BRANCHES' OWN
+            // UNITS. A plain column carries its width in the BYTES OF ITS
+            // OWN CHARSET, so a WIN1252 VARCHAR(6) is 6 and a UTF8 one is
+            // 24 - taking the raw maximum of those announced a
+            // six-character WIN1252 union as 24 bytes. Normalise each
+            // branch to characters, take the widest, and express it in
+            // the WINNING charset's bytes, which is what makes the same
+            // union 6 under WIN1252 and 24 under UTF8 (both probed).
+            let bpc = |st: i32| -> i32 {
+                let n = if st <= ATT_SUBTYPE {
+                    if st == ATT_SUBTYPE {
+                        1 // the attachment sentinel already counts characters
+                    } else {
+                        fire_crab_ods::intl::bytes_per_char((-2 - st) as u8) as i32
+                    }
+                } else {
+                    fire_crab_ods::intl::bytes_per_char(
+                        fire_crab_ods::intl::charset_id(st as i16),
+                    ) as i32
+                };
+                n.max(1)
+            };
+            let chars = shapes
+                .iter()
+                .zip(widths.iter())
+                .map(|((_, _, st), (l, _))| *l / bpc(*st))
+                .max()
+                .unwrap_or(c.length);
+            c.length = chars * bpc(c.sub_type);
+            c.oct_length = widths.iter().map(|(_, o)| *o).max().unwrap_or(c.oct_length);
+            continue;
+        }
+        if same_shape {
+            // a non-text column whose branches differ only in announced
+            // width: nothing here knows how to reconcile that
+            return Some(Plan::Refused);
         }
         // Anything outside the numeric families is left alone and
         // REFUSES. A number beside TEXT does reconcile in the engine -
@@ -38014,6 +38109,36 @@ fn plan_query_inner_ctx(
                     let Some(step) = step.filter(|_| rec_params.is_empty()) else {
                         return Some({ if trace { eprintln!("[srv] recursive CTE refused: the recursive branch does not plan over the accumulated rows"); } Plan::Refused });
                     };
+                    // THE RECURSIVE MEMBER MUST ANSWER IN THE ANCHOR'S
+                    // SHAPE. The CTE column is described from the SEED
+                    // and each frontier row is read back under those
+                    // descriptors, so a step that answers at a different
+                    // scale has its RAW integer read as the anchor's:
+                    // `SELECT 1 X ... UNION ALL SELECT X + 0.5 FROM N`
+                    // answered 1 then **15** - the raw of 1.5 at scale
+                    // -1 read as a scale-0 integer - and 15 then failed
+                    // the `X < 3` guard, truncating the result set too.
+                    //
+                    // The engine's own rule, probed: it keeps the
+                    // recursion in FULL PRECISION and only RENDERS at
+                    // the anchor's description, so that query answers
+                    // 1, 2, 2, 3, 3 - the values 1, 1.5, 2.0, 2.5, 3.0
+                    // each rounded at output. Reproducing that needs two
+                    // column sets (a reconciled one to recurse on, the
+                    // anchor's to announce) which this planner does not
+                    // yet carry, so the shape-changing case REFUSES
+                    // rather than answering 15. A same-shape recursion -
+                    // the ordinary integer generator and every tree walk
+                    // - is untouched.
+                    // Only the SCALE is checked, not the announced
+                    // width: `SELECT X + 1` widens to INT64 where the
+                    // anchor is a LONG and the values are identical
+                    // either way, so comparing the type too refused the
+                    // ordinary integer generator - the shape every
+                    // recursive CTE in practice has.
+                    if output_cols_of(&step).iter().zip(cols.iter()).any(|(sc, ac)| sc.scale != ac.scale) {
+                        return Some({ if trace { eprintln!("[srv] recursive CTE refused: the recursive member's column shape differs from the anchor's"); } Plan::Refused });
+                    }
                     let Some(next) = branch_rows(&step, dbr, &[]) else {
                         return Some({ if trace { eprintln!("[srv] recursive CTE refused: the recursive branch does not materialise"); } Plan::Refused });
                     };
@@ -40858,6 +40983,12 @@ fn build_group_items(
                 // wrapping expression - `SUM(N92*2)` is INT128 scale -2
                 // sub_type 1). Announcing 0 told every client that a
                 // folded NUMERIC(9,2) was a plain scaled integer.
+                // ... and the source expression's OWN WIDTH, for the
+                // folds that keep a value rather than accumulate one
+                let src_bytes: Option<u8> = match &src {
+                    AggSrc::Expr(e) => Some(result_width_bytes(e, descs)),
+                    _ => None,
+                };
                 let src_sub: i32 = match (&src, field_desc) {
                     (AggSrc::Field(_) | AggSrc::CollField(..), Some(d))
                         if exact_dtype_bytes(d.dtype).is_some() =>
@@ -40905,32 +41036,30 @@ fn build_group_items(
                         }
                     },
                     AggFn::Min | AggFn::Max => {
-                        let (t, sc, rank) = src_shape?;
+                        let (t, sc, _rank) = src_shape?;
                         match t {
-                            // MIN/MAX keep the SOURCE column's own type
-                            // (measured: grouped MAX over an INTEGER
-                            // describes 496 LONG, over a SMALLINT 500) -
-                            // an expression source stays the fold's INT64
-                            ExprType::Int => match field_desc {
+                            // MIN/MAX DESCRIBE WHAT THEIR SOURCE
+                            // DESCRIBES. They select an existing value
+                            // rather than accumulating one, so there is
+                            // nothing to widen - and this holds for an
+                            // EXPRESSION source exactly as for a column
+                            // (probed: MAX over a NUMERIC(9,2) column is
+                            // LONG len 4, over a CASE of them also LONG
+                            // len 4, over a CASE of NUMERIC(15,4) INT64,
+                            // over a CASE of INTEGERs LONG - while
+                            // MAX(ID+0) is INT64 only because `ID+0`
+                            // ITSELF describes INT64, the arithmetic
+                            // having widened it before the fold saw it).
+                            // Reading that last case as "an expression
+                            // source stays the fold's INT64" is what
+                            // made every folded conditional 8 bytes.
+                            ExprType::Int | ExprType::Numeric => match field_desc {
                                 Some(d) => wire_for(d),
-                                None => (Wire::Int64, 580, 8, 0, 0),
-                            },
-                            // ... and a SCALED column is no different:
-                            // MIN/MAX select an existing value rather
-                            // than accumulating one, so there is nothing
-                            // to widen (measured: MIN over a NUMERIC(9,2)
-                            // describes 496 LONG len 4 sub_type 1, where
-                            // this used to answer the fold's own INT64)
-                            ExprType::Numeric if field_desc.is_some() => {
-                                wire_for(field_desc?)
-                            }
-                            ExprType::Numeric => {
-                                if rank == NumRank::I128 {
-                                    (Wire::Int128, 32752, 16, sc as i32, src_sub)
-                                } else {
-                                    (Wire::Int64, 580, 8, sc as i32, src_sub)
+                                None => {
+                                    let (w, ty, l) = exact_width_form(src_bytes.unwrap_or(8));
+                                    (w, ty, l, sc as i32, src_sub)
                                 }
-                            }
+                            },
                             ExprType::Text => match field_desc {
                                 // a text COLUMN keeps its own describe
                                 Some(d) => wire_for(d),
@@ -52634,9 +52763,66 @@ fn resolve_expr(
     descs: &[Descriptor],
 ) -> Option<Expr> {
     // every level of resolution goes through here, so a CHAR-formed
-    // conditional is padded wherever it appears - inside a concatenation
-    // or a comparison as much as in the select list
-    Some(pad_conditional(resolve_expr_inner(raw, columns, descs)?, descs))
+    // conditional is padded - and a scaled one ALIGNED - wherever it
+    // appears: inside a concatenation, a comparison, an aggregate's
+    // source or the select list
+    let e = align_conditional(resolve_expr_inner(raw, columns, descs)?, descs);
+    Some(pad_conditional(e, descs))
+}
+
+/// A NUMERIC-formed conditional must ANSWER AT THE SCALE IT ANNOUNCES.
+///
+/// [Expr::result_scale] already reconciles a conditional's scale to its
+/// widest branch - that is what the describe carries - but `eval` hands
+/// back the chosen branch's value UNTOUCHED, at whatever scale that
+/// branch happened to have. The two disagree the moment a branch is
+/// narrower than the reconciled scale, and the disagreement is a silent
+/// wrong answer rather than an error:
+///
+/// ```text
+/// SELECT SUM(CASE WHEN <false> THEN CAST(1.50 AS NUMERIC(9,2)) ELSE 100 END)
+///   engine 200.00      fire-crab 2.00
+/// ```
+///
+/// The integer branch answered a raw 100 where the announced scale of
+/// -2 wanted 10000, so every row contributed 1.00. `SUM(CASE WHEN ...
+/// THEN <amount> ELSE 0 END)` is a workhorse idiom, and it was
+/// returning money short by a factor of 100.
+///
+/// What made it hide: the DIRECT projection of the same conditional is
+/// correct on both servers, because the encoder renders the value's own
+/// scale. The defect only surfaces once something CONSUMES the datum -
+/// an aggregate, or a CAST to text, which reads the raw number. So a
+/// value-only check of the expression itself sees nothing.
+///
+/// The alignment belongs where the node is BUILT rather than in `eval`,
+/// which has no descriptors to reconcile against - the same reasoning
+/// (and the same CAST vehicle) as [pad_conditional]. Wrapping in the
+/// cast that already implements rounding also makes the announced
+/// SUB_TYPE explicit, since [numeric_subtype] reads a cast's target.
+///
+/// NULLIF is deliberately absent: its value IS its first operand, so
+/// there is nothing to reconcile.
+fn align_conditional(e: Expr, descs: &[Descriptor]) -> Expr {
+    if !matches!(e, Expr::Case(..) | Expr::Coalesce(_) | Expr::Iif(..)) {
+        return e;
+    }
+    if !matches!(e.type_of(descs), Some(ExprType::Numeric)) {
+        return e;
+    }
+    // a scale of 0 needs no alignment: every branch already answers as
+    // a plain integer
+    let scale = match e.result_scale(descs) {
+        Some(s) if s < 0 => s,
+        _ => return e,
+    };
+    let bytes = result_width_bytes(&e, descs);
+    let sub_type = numeric_subtype(&e, descs);
+    Expr::Cast(
+        Box::new(e),
+        CastTarget::Numeric { scale, bytes, sub_type },
+        fire_crab_ods::intl::CS_UTF8,
+    )
 }
 
 /// Does this expression carry a `?` parameter anywhere?
@@ -56964,9 +57150,20 @@ impl Expr {
                 CastTarget::Int { bytes } => {
                     Some(if *bytes == 8 { NumRank::I64 } else { NumRank::Long })
                 }
-                CastTarget::Numeric { bytes, .. } => {
-                    Some(if *bytes == 16 { NumRank::I128 } else { NumRank::Long })
-                }
+                // ... and the 8-byte rung is I64, not Long: a NUMERIC of
+                // precision 10..18 is stored as an INT64 and RANKS as one,
+                // which is what makes SUM widen it to INT128 and a
+                // multiplication around it promote (probed: SUM(CAST(1.5 AS
+                // NUMERIC(18,4))) is INT128 where SUM(CAST(.. AS
+                // NUMERIC(9,2))) stays INT64, and CAST(18,4) * CAST(18,4)
+                // is INT128 where CAST(9,2) * CAST(9,2) is INT64). Mapping
+                // everything below 16 to Long made an 8-byte cast rank as
+                // a 4-byte one, so neither promotion fired.
+                CastTarget::Numeric { bytes, .. } => Some(match *bytes {
+                    16 => NumRank::I128,
+                    8 => NumRank::I64,
+                    _ => NumRank::Long,
+                }),
                 CastTarget::Text { .. }
                 | CastTarget::Approx
                 | CastTarget::Temporal(_)
