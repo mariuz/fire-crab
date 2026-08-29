@@ -7926,6 +7926,12 @@ impl RowSource {
 /// ttype is never negative.
 const ATT_SUBTYPE: i32 = -1;
 
+/// The widest VARCHAR the engine admits, in BYTES. A text expression
+/// whose width cannot be computed statically is announced at this many
+/// CHARACTERS and capped to the charset's own maximum at emission
+/// ([resolve_text_cs]).
+const MAX_VARCHAR_BYTES: i32 = 65533;
+
 /// A REAL-charset text EXPRESSION column's sub_type sentinel: the
 /// charset id `cs` (>= 2) encoded as `-2 - cs`, with [ProjCol::length]
 /// holding a CHARACTER count. Probed with SQLDA_DISPLAY across UTF8,
@@ -7955,14 +7961,22 @@ fn resolve_text_cs(sub: i32, len: i32, oct: i32, att: &AttCs) -> (i32, i32) {
     // only an EXPRESSION carries the second width; a plain column's
     // declared length is already the one the engine announces
     let len = if att.bpc == 1 && sub < 0 { oct } else { len };
+    // an expression whose width is not statically known is carried as
+    // MAX_VARCHAR_BYTES CHARACTERS and lands here to be resolved: the
+    // widest VARCHAR a charset admits is that many BYTES, so the
+    // character count caps at bytes-per-character below it (probed on
+    // the computed-length pad: 65533 for NONE and WIN1252, 65532 - i.e.
+    // 16383 characters - for UTF8). Capping the characters rather than
+    // the product is what puts the byte width on the engine's multiple.
+    let cap = |bpc: i32| (len.min(MAX_VARCHAR_BYTES / bpc.max(1))) * bpc;
     if sub == ATT_SUBTYPE {
-        (att.id as i32, len * att.bpc as i32)
+        (att.id as i32, cap(att.bpc as i32))
     } else if sub <= -2 {
         let cs = (-2 - sub) as u8;
         if att.id != 0 {
-            (att.id as i32, len * att.bpc as i32)
+            (att.id as i32, cap(att.bpc as i32))
         } else {
-            (cs as i32, len * fire_crab_ods::intl::bytes_per_char(cs) as i32)
+            (cs as i32, cap(fire_crab_ods::intl::bytes_per_char(cs) as i32))
         }
     } else if sub >= 0 && att.id != 0 {
         // a PLAIN column of a REAL charset (anything but the byte carriers
@@ -15474,7 +15488,14 @@ fn text_form_m(
                     arg(0).map(|(_, w, c)| (true, w, c))
                 }
                 SysFn::Substring => match (arg(0), lit(2)) {
-                    (Some((_, w, c)), None) if args.len() == 2 => Some((true, w, c)),
+                    // no literal FOR count to narrow by - either because
+                    // there is no FOR at all or because it is COMPUTED -
+                    // leaves the source's own width, which the result can
+                    // never exceed (probed: over a UTF8 VARCHAR(20),
+                    // `FOR 5` describes 20 bytes but `FOR 5+0`, `FOR ID`
+                    // and `FROM 1+0` all describe 80, the column's own;
+                    // a CHAR(6) source gives 24, VARYING)
+                    (Some((_, w, c)), None) => Some((true, w, c)),
                     // the literal FOR count, CAPPED at the source's own
                     // width (probed: SUBSTRING(U6 FROM 1 FOR 100) over a
                     // VARCHAR(6) describes 6 characters, not 100 - and
@@ -15499,11 +15520,21 @@ fn text_form_m(
                     }
                     _ => None,
                 },
-                SysFn::Lpad | SysFn::Rpad => lit(1).map(|n| {
+                SysFn::Lpad | SysFn::Rpad => {
                     // the pad keeps the SOURCE's charset (a padded NONE
-                    // column stays NONE)
-                    (true, n, arg(0).map(|(_, _, c)| c).unwrap_or(TfCs::Att))
-                }),
+                    // column stays NONE). A COMPUTED length cannot be
+                    // narrowed statically and - unlike SUBSTRING, which
+                    // can only shrink its source - a pad can GROW past
+                    // it, so the engine falls back to the widest VARCHAR
+                    // the charset admits: probed, `LPAD(V,10+0)` and
+                    // `RPAD(V,ID)` describe 65533 bytes over a NONE or
+                    // WIN1252 source and 65532 over a UTF8 one, i.e.
+                    // MAX_VARCHAR_BYTES / bytes-per-character characters.
+                    // The division happens at emission, where the
+                    // charset is finally known ([resolve_text_cs]).
+                    let cs = arg(0).map(|(_, _, c)| c).unwrap_or(TfCs::Att);
+                    Some((true, lit(1).unwrap_or(MAX_VARCHAR_BYTES), cs))
+                }
                 _ => None,
             }
         }
@@ -36828,10 +36859,27 @@ fn branch_rows_res(
     // recurses. Everything that materialises rows (INSERT ... SELECT, a
     // FOR SELECT loop, a union branch) goes through here, so they all
     // gain the same sources at once.
-    if let Plan::Union { branches, distinct, order_by, .. } = plan {
+    if let Plan::Union { branches, distinct, order_by, cols } = plan {
         let mut rows: Vec<Vec<Value>> = Vec::new();
         for b in branches {
-            rows.append(&mut branch_rows_res(b, db, args)?);
+            let mut got = branch_rows_res(b, db, args)?;
+            // ...each value under the column the UNION announces, not
+            // the one its own branch would have announced
+            for r in got.iter_mut() {
+                for (i, v) in r.iter_mut().enumerate() {
+                    // every column, not just the scaled ones: an
+                    // APPROXIMATE union announces scale 0 and still has
+                    // to turn each exact branch's scaled integer into a
+                    // double (a `NUMERIC(9,2) UNION ALL <DOUBLE>` whose
+                    // exact branch skipped this answered 0.0, because
+                    // the encoder's approx_of does not know the exact
+                    // forms and writes 0.0 for what it cannot read)
+                    if let Some(c) = cols.get(i) {
+                        *v = union_coerce_value(std::mem::replace(v, Value::Null), c.sql_type & !1, c.scale);
+                    }
+                }
+            }
+            rows.append(&mut got);
         }
         if *distinct {
             distinct_rows(&mut rows, order_by.is_some(), &coll_cols(&output_cols_of(plan)));
@@ -37611,7 +37659,189 @@ fn plan_union(
     if !all && cols_unkeyable_coll(&cols) {
         return Some(Plan::Refused);
     }
+    // EVERY BRANCH ANSWERS UNDER ONE DESCRIPTION, so the branches have
+    // to be reconciled - see [union_numeric_scale]. A column whose
+    // branches already agree is untouched; an exact-numeric column
+    // takes the widest scale; anything this server cannot reconcile
+    // REFUSES rather than letting the later branches ride the first
+    // one's type.
+    let mut cols = cols;
+    for (i, c) in cols.iter_mut().enumerate() {
+        // Every branch's (type, scale, sub_type) at this position.
+        let mut shapes = Vec::with_capacity(branches.len());
+        for b in &branches {
+            match output_cols_of(b).get(i) {
+                Some(bc) => shapes.push((bc.sql_type & !1, bc.scale, bc.sub_type)),
+                // a branch that does not reach this far cannot be
+                // reconciled against
+                None => return Some(Plan::Refused),
+            }
+        }
+        // identical in every branch: there is nothing to reconcile, and
+        // this is the path every non-numeric union takes
+        if shapes.iter().all(|s| *s == (c.sql_type & !1, c.scale, c.sub_type)) {
+            continue;
+        }
+        // Anything outside the numeric families is left alone and
+        // REFUSES. A number beside TEXT does reconcile in the engine -
+        // to the TEXT, by rendering the number - but that needs the
+        // value side to render as the engine does, so it is a boundary
+        // here rather than a guess.
+        if !shapes.iter().all(|(t, ..)| exact_numeric_rank(*t).is_some() || is_approx_sqltype(*t)) {
+            return Some(Plan::Refused);
+        }
+        if shapes.iter().any(|(t, ..)| is_approx_sqltype(*t)) {
+            // one approximate branch makes the whole column a DOUBLE,
+            // scale 0 sub_type 0, whatever the exact branches carried
+            // (probed: NUMERIC(9,2) beside a DOUBLE, and INTEGER beside
+            // one, both answer 480 len 8 scale 0)
+            c.wire = Wire::Double;
+            c.sql_type = 480 | (c.sql_type & 1);
+            c.length = 8;
+            c.scale = 0;
+            c.sub_type = 0;
+        } else {
+            // THE WIDEST BRANCH WINS, on all three axes independently:
+            // the TYPE is the widest rank (probed: SMALLINT with
+            // INTEGER answers LONG whichever comes first, INTEGER with
+            // BIGINT answers INT64, NUMERIC(9,2) with NUMERIC(30,4)
+            // answers INT128), the SCALE is the widest (INTEGER with
+            // NUMERIC(15,4) answers scale -4), and the SUB_TYPE is the
+            // MAX family code - 0 plain integer, 1 NUMERIC, 2 DECIMAL -
+            // which is a genuinely separate rule, since an INTEGER
+            // beside a NUMERIC(9,0) agrees on type AND scale and still
+            // announces sub_type 1.
+            //
+            // THE WIRE FORM MOVES WITH THE ANNOUNCED TYPE. Announcing a
+            // width the encoder does not then write is worse than
+            // refusing: a first attempt that set sql_type and length
+            // but left `wire` alone answered 6442450944.66 for 1.50 -
+            // the 4-byte value landing in the high half of an 8-byte
+            // slot. `wire`, `sql_type` and `length` are set together
+            // here for exactly that reason.
+            let rank = match shapes.iter().filter_map(|(t, ..)| exact_numeric_rank(*t)).max() {
+                Some(r) => r,
+                None => return Some(Plan::Refused),
+            };
+            let (w, t, l) = exact_numeric_form(rank);
+            c.wire = w;
+            c.sql_type = t | (c.sql_type & 1);
+            c.length = l;
+            // scales are NEGATIVE here (12.50 is scale -2), so the
+            // widest is the SMALLEST number
+            c.scale = shapes.iter().map(|(_, sc, _)| *sc).min().unwrap_or(c.scale);
+            c.sub_type = shapes.iter().map(|(_, _, st)| *st).max().unwrap_or(c.sub_type);
+        }
+    }
     Some(Plan::Union { cols, branches, distinct: !all, order_by: order_ordinal })
+}
+
+/// WHERE AN EXACT-NUMERIC DESCRIBE TYPE SITS ON THE WIDTH LADDER, or
+/// `None` for anything off it.
+///
+/// A UNION describes ONE column per position and the client decodes
+/// every branch's value under it, so the branches have to AGREE. Taking
+/// the first branch's type and letting the others ride was a silent
+/// wrong answer, not a rounding difference: `SELECT CAST(1.50 AS
+/// NUMERIC(9,2)) UNION ALL SELECT 100` answered **1.00** where the
+/// engine answers 100.00 - the integer 100 read under scale 2 - and the
+/// error propagates into `SUM` and into the row count of a `UNION`
+/// (measured; found by a differential probe, not by a gate).
+fn exact_numeric_rank(t: i32) -> Option<u8> {
+    match t {
+        500 => Some(0),  // SHORT
+        496 => Some(1),  // LONG
+        580 => Some(2),  // INT64
+        32752 => Some(3), // INT128
+        _ => None,
+    }
+}
+
+/// The wire form, describe type and byte width of an exact-numeric
+/// rank. Kept beside [exact_numeric_rank] so the three can never drift
+/// apart - see the note in the union reconciliation about announcing a
+/// width the encoder does not write.
+fn exact_numeric_form(rank: u8) -> (Wire, i32, i32) {
+    match rank {
+        0 => (Wire::Int32, 500, 2),
+        1 => (Wire::Int32, 496, 4),
+        2 => (Wire::Int64, 580, 8),
+        _ => (Wire::Int128, 32752, 16),
+    }
+}
+
+/// Is this describe type an APPROXIMATE numeric? One such branch makes
+/// a whole union column a DOUBLE.
+fn is_approx_sqltype(t: i32) -> bool {
+    matches!(t, 480 | 482) // DOUBLE, FLOAT
+}
+
+/// Is this describe type an EXACT numeric - one whose value is a scaled
+/// integer? Those are the types a union can reconcile by scale alone.
+fn is_exact_numeric_sqltype(t: i32) -> bool {
+    matches!(t, 500 | 496 | 580 | 32752) // SHORT, LONG, INT64, INT128
+}
+
+/// Bring one branch's value to the union column's reconciled scale.
+/// A value already at that scale is untouched; an integer becomes a
+/// scaled one; a value at a NARROWER scale is widened. Nothing else is
+/// converted - the planner refuses those before a row is read.
+fn union_coerce_value(v: Value, sql_type: i32, scale: i32) -> Value {
+    if is_approx_sqltype(sql_type) {
+        // an approximate union answers every branch as a DOUBLE, so an
+        // exact branch's scaled integer has to BECOME one here - the
+        // encoder's `approx_of` only knows the approximate forms, and a
+        // value it does not know writes 0.0
+        return match v {
+            Value::Int(n) => Value::Double(n as f64),
+            Value::Scaled(raw, sc) => Value::Double(raw as f64 * 10f64.powi(sc as i32)),
+            Value::Int128(raw, sc) => Value::Double(raw as f64 * 10f64.powi(sc as i32)),
+            Value::Float(f) => Value::Double(f as f64),
+            other => other,
+        };
+    }
+    if sql_type == 32752 && scale < 0 {
+        // the 128-bit slot: shift in i128 so a widening that overflows
+        // an i64 still answers the number rather than giving up on it
+        let want = (-scale) as u32;
+        let (raw, from) = match v {
+            Value::Int(n) => (n as i128, 0u32),
+            Value::Scaled(r, sc) => (r as i128, (-sc) as u32),
+            Value::Int128(r, sc) => (r, (-sc) as u32),
+            other => return other,
+        };
+        return match want
+            .checked_sub(from)
+            .and_then(|d| 10i128.checked_pow(d))
+            .and_then(|m| raw.checked_mul(m))
+        {
+            Some(n) => Value::Int128(n, -(want as i8)),
+            None => Value::Int128(raw, -(from as i8)),
+        };
+    }
+    union_scale_value(v, scale)
+}
+
+/// Bring one branch's value to the union column's reconciled SCALE,
+/// within the 64-bit forms.
+fn union_scale_value(v: Value, scale: i32) -> Value {
+    if scale >= 0 {
+        return v;
+    }
+    let want = (-scale) as u32;
+    let shift = |raw: i64, from: u32| -> Value {
+        match want.checked_sub(from).and_then(|d| 10i64.checked_pow(d)).and_then(|m| raw.checked_mul(m)) {
+            Some(n) => Value::Scaled(n, -(want as i8)),
+            // it does not fit: leave the value alone rather than answer
+            // a wrong number - the describe still says what it is
+            None => Value::Scaled(raw, -(from as i8)),
+        }
+    };
+    match v {
+        Value::Int(n) => shift(n, 0),
+        Value::Scaled(raw, sc) if (-sc as u32) < want => shift(raw, (-sc) as u32),
+        other => other,
+    }
 }
 
 fn plan_query_inner(
@@ -40621,6 +40851,22 @@ fn build_group_items(
                     }
                     _ => None, // COUNT(*)
                 };
+                // THE SOURCE'S NUMERIC SUB_TYPE, which every fold that
+                // keeps a value carries through: SUM/AVG/MIN/MAX over a
+                // NUMERIC answer sub_type 1 and over a DECIMAL 2
+                // (probed, grouped and ungrouped alike, and through a
+                // wrapping expression - `SUM(N92*2)` is INT128 scale -2
+                // sub_type 1). Announcing 0 told every client that a
+                // folded NUMERIC(9,2) was a plain scaled integer.
+                let src_sub: i32 = match (&src, field_desc) {
+                    (AggSrc::Field(_) | AggSrc::CollField(..), Some(d))
+                        if exact_dtype_bytes(d.dtype).is_some() =>
+                    {
+                        d.sub_type as i32
+                    }
+                    (AggSrc::Expr(e), _) => numeric_subtype(e, descs) as i32,
+                    _ => 0,
+                };
                 let (wire, sql_type, length, scale, sub_type) = match func {
                     // COUNT is INT64 and the ONE aggregate the engine
                     // announces NOT NULLABLE - the even 580 survives
@@ -40669,11 +40915,20 @@ fn build_group_items(
                                 Some(d) => wire_for(d),
                                 None => (Wire::Int64, 580, 8, 0, 0),
                             },
+                            // ... and a SCALED column is no different:
+                            // MIN/MAX select an existing value rather
+                            // than accumulating one, so there is nothing
+                            // to widen (measured: MIN over a NUMERIC(9,2)
+                            // describes 496 LONG len 4 sub_type 1, where
+                            // this used to answer the fold's own INT64)
+                            ExprType::Numeric if field_desc.is_some() => {
+                                wire_for(field_desc?)
+                            }
                             ExprType::Numeric => {
                                 if rank == NumRank::I128 {
-                                    (Wire::Int128, 32752, 16, sc as i32, 0)
+                                    (Wire::Int128, 32752, 16, sc as i32, src_sub)
                                 } else {
-                                    (Wire::Int64, 580, 8, sc as i32, 0)
+                                    (Wire::Int64, 580, 8, sc as i32, src_sub)
                                 }
                             }
                             ExprType::Text => match field_desc {
@@ -40710,9 +40965,9 @@ fn build_group_items(
                             _ => rank == NumRank::I128,
                         };
                         if widen {
-                            (Wire::Int128, 32752, 16, sc as i32, 0)
+                            (Wire::Int128, 32752, 16, sc as i32, src_sub)
                         } else {
-                            (Wire::Int64, 580, 8, sc as i32, 0)
+                            (Wire::Int64, 580, 8, sc as i32, src_sub)
                         }
                         }
                     }
@@ -61690,22 +61945,30 @@ fn parse_order_by_expr(
             }
             cols[ord - 1].field_id
         } else {
-            // a name may be a COLUMN or one of the select list's ALIASES
-            // (`SELECT ID AS X ... ORDER BY X`) - the engine resolves the
-            // alias, and an alias that shadows nothing has only the
-            // projection to be found in
-            match resolve_name(name) {
-                Some(fid) => fid,
-                None => {
-                    let c = cols.iter().find(|c| c.name.eq_ignore_ascii_case(name))?;
-                    // the same rule as the ordinal above: an aliased
-                    // EXPRESSION sorts by the expression it names
+            // A NAME IS LOOKED FOR IN THE SELECT LIST FIRST, and only
+            // then in the table. An alias SHADOWS a base column of the
+            // same name: `SELECT ID AS QTY FROM T ORDER BY QTY` sorts
+            // by ID, not by the table's own QTY (measured against the
+            // engine, along with three neighbours: an alias over an
+            // EXPRESSION sorts by the expression, a name that is only a
+            // table column still finds it, and an unaliased column
+            // resolves to itself either way).
+            //
+            // Looking in the table first is a WRONG ANSWER, not a
+            // refusal: the rows come back in a different order with
+            // nothing to say so. It was found by a differential probe,
+            // not by a gate.
+            match cols.iter().find(|c| c.name.eq_ignore_ascii_case(name)) {
+                Some(c) => {
+                    // an aliased EXPRESSION sorts by the expression it
+                    // names, as the ordinal form above does
                     if let Some(e) = &c.expr {
                         keys.push(stamp(OrderKey { field: 0, expr: Some(e.clone()), desc, nulls, coll: 0, coll_explicit: false }));
                         continue;
                     }
                     c.field_id
                 }
+                None => resolve_name(name)?,
             }
         };
         keys.push(stamp(OrderKey::field(fid, desc, nulls)));
@@ -81962,7 +82225,7 @@ mod tests {
         );
         assert_eq!(blr, hex("05021100020207D9010443014A034C4F4703FF0A0302020122170101411508000100000017020158011508000200000017020159FFFFFFFF4C"));
         // U5: ':' variables in the SET and the WHERE
-        let v = ("V".to_string(), 8u8, 43usize);
+        let v = ("V".to_string(), DeclType::Int(8), 43usize);
         let (blr, _) = compile(
             "CREATE TRIGGER U5 FOR T1 AFTER INSERT AS DECLARE VARIABLE V INTEGER; BEGIN V = NEW.A; UPDATE LOG SET Y = :V WHERE X > :V; END",
             &[v],
@@ -81987,7 +82250,7 @@ mod tests {
         let hex = |h: &str| -> Vec<u8> {
             (0..h.len()).step_by(2).map(|i| u8::from_str_radix(&h[i..i + 2], 16).unwrap()).collect()
         };
-        let compile = |sql: &str, declares: &[(String, u8, usize)]| {
+        let compile = |sql: &str, declares: &[(String, DeclType, usize)]| {
             let up = sql.to_ascii_uppercase();
             let begin = find_word(&up, "BEGIN", 0).unwrap();
             let end = up.rfind("END").unwrap();
@@ -82005,7 +82268,7 @@ mod tests {
         assert_eq!(blr, hex("050211000202083117010141150800010000000202011508000100000017010142011508000200000017010143FFFFFFFFFFFF4C"));
         assert_eq!(dbg, hex("40010202010000002B00000004000000020100000031000000060000000201000000450000001300000002010000004B0000001500000002010000005600000021000000FF".trim_start_matches("40")));
         // N3: WHILE DO BEGIN..END with a statement after the block
-        let v = ("V".to_string(), 8u8, 41usize);
+        let v = ("V".to_string(), DeclType::Int(8), 41usize);
         let (blr, _) = compile(
             "CREATE TRIGGER N3 FOR T1 BEFORE INSERT AS DECLARE VARIABLE V INTEGER; BEGIN V = 0; WHILE (V < NEW.A) DO BEGIN V = V + 1; NEW.B = V; END NEW.C = 9; END",
             &[v],
@@ -85968,7 +86231,7 @@ mod tests {
         let hex = |h: &str| -> Vec<u8> {
             (0..h.len()).step_by(2).map(|i| u8::from_str_radix(&h[i..i + 2], 16).unwrap()).collect()
         };
-        let compile = |sql: &str, declares: &[(String, u8, usize)]| {
+        let compile = |sql: &str, declares: &[(String, DeclType, usize)]| {
             let up = sql.to_ascii_uppercase();
             let begin = find_word(&up, "BEGIN", 0).unwrap();
             let end = up.rfind("END").unwrap();
@@ -85978,7 +86241,7 @@ mod tests {
             let blr = emit_trigger_blr(&body, declares, &mut dbg, 2);
             (blr, trigger_debug_blob(sql, declares, &dbg))
         };
-        let v = |name: &str, dtype: u8, off: usize| (name.to_string(), dtype, off);
+        let v = |name: &str, dtype: u8, off: usize| (name.to_string(), DeclType::Int(dtype), off);
         // TA: AFTER INSERT, one INTEGER variable, V = NEW.A
         let sql = "CREATE TRIGGER TA FOR T1 AFTER INSERT AS DECLARE VARIABLE V INTEGER; BEGIN V = NEW.A; END";
         let (blr, dbg) = compile(sql, &[v("V", 8, 41)]);

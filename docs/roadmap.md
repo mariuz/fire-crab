@@ -3041,6 +3041,72 @@ pointer-page and TIP page numbers is the next step when it dominates.
 
 ## Next, in order
 
+- **THE DESCRIBE OF A COMPUTED COLUMN DONE (2026-08-29,
+  `serve-real-exprshape` 54):** four wrong-answer classes, all of them
+  live and none of them a refusal, in the description a projected
+  expression travels under.
+  (1) A **computed length** on `SUBSTRING`/`LPAD`/`RPAD` had no static
+  width and fell into the catch-all that announces the maximum — and
+  `CHARACTER SET NONE` with it, so a UTF8 `straße` shipped one byte per
+  character and rendered `stra\xDF`. The engine's fallbacks, probed:
+  `SUBSTRING` keeps the SOURCE's own width (it can only shrink its
+  source — `FOR 5+0`, `FOR ID` and a computed `FROM` all describe the
+  column's own 80 bytes where `FOR 5` describes 20), while a PAD can
+  grow past its source and falls back to the widest VARCHAR the charset
+  admits: 65533 bytes for NONE/WIN1252, 65532 for UTF8. The cap is on
+  the CHARACTER count (`MAX_VARCHAR_BYTES / bytes-per-char`, applied in
+  `resolve_text_cs` where the charset is finally known), which is what
+  puts the byte width on the engine's multiple.
+  (2) A **UNION took the first branch's description** and let the other
+  branches ride it: `SELECT CAST(1.50 AS NUMERIC(9,2)) UNION ALL SELECT
+  100` answered **1.00**, and the error propagated into `SUM` over the
+  union and into the row count of a `UNION DISTINCT`. The engine's rule,
+  probed: **the widest branch wins on each axis independently** - type up
+  the ladder SHORT < LONG < INT64 < INT128 (`SMALLINT UNION INTEGER` is
+  LONG whichever comes first, `NUMERIC(9,2) UNION NUMERIC(30,4)` is
+  INT128), scale the widest, and ONE approximate branch makes the whole
+  column a DOUBLE whatever the exact branches carried. Every branch's
+  value is then converted to that column (`union_coerce_value`).
+  (3) The union's **sub_type** is reconciled by a different rule — the
+  MAX of the family codes (0 int, 1 NUMERIC, 2 DECIMAL), regardless of
+  branch order and independent of whether anything else needed
+  reconciling: an INTEGER beside a `NUMERIC(9,0)` agrees on type AND
+  scale and still announces sub_type 1.
+  (4) Found by the gate written for (3), with no union in sight: **every
+  fold dropped its source's family.** `SUM`/`AVG`/`MIN`/`MAX` over a
+  NUMERIC answer sub_type 1 and over a DECIMAL 2, grouped or not and
+  through a wrapping expression (`SUM(N92*2)` is INT128 scale -2 sub_type
+  1); fc announced 0 for all of them. `MIN`/`MAX` keep the source's
+  WIDTH too — they select an existing value rather than accumulating one,
+  so `MIN` over a `NUMERIC(9,2)` stays a 4-byte LONG where `SUM` widens
+  to INT64.
+  Also fixed alongside: **`ORDER BY` an output alias that shadows a base
+  column** sorted by the table's column instead of the projection.
+  THE TRAP, and it is not in the arithmetic: the ANNOUNCED type and the
+  WIRE FORM THE ENCODER WRITES are two pieces of state and must move
+  together. A first attempt set `sql_type` and `length` and left `wire`
+  alone — it answered **6442450944.66** for 1.50, the 4-byte value
+  landing in the high half of an 8-byte slot (1.5 × 2^32). The quiet
+  version of the same trap: an approximate union announces scale 0, so
+  an exact branch that skipped conversion handed the encoder a scaled
+  integer it cannot read as a float and the column answered **0.0**.
+  `wire`/`sql_type`/`length` are now set in one place ([exact_numeric_form]).
+  BOUNDARY (recorded, gated): a number beside TEXT, which the engine
+  reconciles by RENDERING the number, refuses — that needs the value
+  side to render digit-for-digit as the engine does. The gate asserts
+  the engine ANSWERS it, so the boundary cannot rot into a vacuous pass.
+  A FIRST, TOO-CONSERVATIVE VERSION of this fix refused every union whose
+  branches differed in wire type, which broke `SELECT X UNION ALL SELECT
+  X+1` — caught by `serve-real-describe` in the sweep, three checks. A
+  refusal where the engine answers is a regression, not a safe default;
+  the sweep was killed and the ladder implemented rather than shipping
+  it.
+  The gate also stopped being flaky the honest way: its `CREATE DATABASE`
+  raced with the previous run's file being closed by the engine, so it
+  now DROPs through the engine before unlinking and retries the create —
+  an intermittent "FAIL create" is otherwise indistinguishable from a
+  real one.
+
 - **PSQL functions run through the BLR executor — the full scalar surface
   DONE (2026-08-23, `serve-real-funcbody` 5):** a plain function's body was
   interpreted by an arithmetic-only path (a `RETURN` could only do
