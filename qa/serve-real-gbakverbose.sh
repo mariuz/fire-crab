@@ -44,8 +44,20 @@ mkdir -p "$D"
 # the probe fixture: two tables so the reverse data order shows, a PK
 # so the constraint and deferred-index lines show, two user indexes
 rm -f "$SRC" "$D"/fc-gbakv-*.fbk "$D"/fc-gbakv-r*.fdb
+# CREATED THROUGH THE SERVER, not as a bare path. A bare path attaches
+# the EMBEDDED engine, which creates the file as THIS user, while every
+# consumer below reaches it through `localhost:service_mgr` - a service
+# running as the `firebird` user. That mixed-mode access is the whole of
+# this gate's long-standing flakiness: intermittently the service's open
+# lost the race with the embedded process still releasing the file and
+# answered `I/O error during "open" operation`, which surfaced as
+# `both -v backups run (rc)` want 0/0 got 1/0 - the ENGINE's own gbak
+# failing, on a gate whose subject is fire-crab. Diagnosed 2026-08-29
+# after it broke two consecutive sweeps; it reproduced 1-in-3 STANDALONE
+# on an idle box, which is what ruled out load and ruled out the change
+# under test. Same law as everywhere else here: hold the transport fixed.
 "$ISQL" -q -b -user "$U" -pas "$P" <<EOF >/dev/null 2>&1 || { echo "FAIL create $SRC"; exit 1; }
-CREATE DATABASE '$SRC' USER '$U' PASSWORD '$P' PAGE_SIZE 8192;
+CREATE DATABASE '127.0.0.1/${FC_REAL_PORT:-3050}:$SRC' USER '$U' PASSWORD '$P' PAGE_SIZE 8192;
 CREATE TABLE A (ID INTEGER NOT NULL PRIMARY KEY, V VARCHAR(10));
 CREATE TABLE B (X INTEGER, W VARCHAR(5));
 CREATE INDEX IDX_W ON B (W);
@@ -84,8 +96,25 @@ frc=$?
 check "both -v backups run (rc)" "$erc/$frc" "0/0"
 # the two RECORDED differences: the engine's privilege lines, and the
 # closing line's byte count (the files legitimately differ in size)
+# RE-SPLIT THE STREAM ON ITS OWN RECORD MARKER before comparing. A
+# verbose service stream is a sequence of `gbak:` records, and WHERE THE
+# NEWLINES FALL IN IT IS NOT THE SUBJECT OF THIS GATE: the engine
+# re-chunks its own output mid-line under load (diagnosed 2026-08-28),
+# which made a line-based diff report a difference that is not in the
+# content. Splitting on the marker instead of on newlines absorbs that
+# and weakens nothing - every character is still compared, in order.
+records() { tr -d '\r' <"$1" | tr '\n' ' ' | sed 's/gbak:/\ngbak:/g' | sed 's/  */ /g; s/ $//'; }
+# ...and the privilege filter matches a TRUNCATED record too. The
+# engine's stream does not merely re-chunk, it sometimes cuts a record
+# off mid-word - a captured failing run held `gbak: writing privile`,
+# which `writing privilege` does not match, so the fragment survived the
+# filter and misaligned every following line. Privilege records are
+# EXCLUDED BY DESIGN here (the engine writes them and fire-crab does
+# not, a recorded difference), so matching their prefix excludes the
+# fragments too and weakens nothing. This is why the gate broke two
+# sweeps running while passing when re-run.
 norm_b() {
-    grep -v "writing privilege" "$1" |
+    records "$1" | grep -v "writing privil" |
         sed "s/[0-9][0-9]* bytes written/N bytes written/; s|fc-gbakv-[ef]\.fbk|FBK|"
 }
 check "the backup streams are byte-equal (privileges filtered, count normalized)" \
@@ -108,7 +137,7 @@ check "both -v restores of the engine's fbk run (rc)" "$erc/$frc" "0/0"
 # ONE recorded difference: the engine restores its privilege records,
 # fire-crab sets them aside (counted in the trace). "adding missing
 # privileges" is an UNCONDITIONAL phase marker and must ride BOTH.
-norm_r() { grep -v "restoring privilege" "$1" | sed "s|fc-gbakv-r[ef]\.fdb|FDB|"; }
+norm_r() { records "$1" | grep -v "restoring privil" | sed "s|fc-gbakv-r[ef]\.fdb|FDB|"; }
 check "the restore streams are byte-equal (privilege records filtered)" \
     "$(norm_r "$D/fc-gbakv-cf.txt")" "$(norm_r "$D/fc-gbakv-ce.txt")"
 check "the phase marker 'adding missing privileges' rides both streams" \
@@ -128,7 +157,7 @@ check "...and those streams are BYTE-IDENTICAL, nothing filtered" \
 grab "$D/fc-gbakv-re.fdb"; grab "$D/fc-gbakv-rf.fdb"
 rows() {
     printf 'SET HEADING OFF;\nSELECT ID, V FROM A ORDER BY ID;\nSELECT X, W FROM B ORDER BY X;\n' |
-        "$ISQL" -q -b -user "$U" -pas "$P" "$1" 2>&1 | tr -s ' \n' ' '
+        "$ISQL" -q -b -user "$U" -pas "$P" "127.0.0.1/${FC_REAL_PORT:-3050}:$1" 2>&1 | tr -s ' \n' ' '
 }
 check "...and the restored databases read identically" \
     "$(rows "$D/fc-gbakv-rf.fdb")" "$(rows "$D/fc-gbakv-re.fdb")"

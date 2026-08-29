@@ -3041,6 +3041,89 @@ pointer-page and TIP page numbers is the next step when it dominates.
 
 ## Next, in order
 
+- **A SCALAR SUBQUERY ANSWERS UNDER ITS INNER COLUMN'S DESCRIPTION DONE
+  (2026-08-29, `serve-real-subqdesc` 40):** a whole-item
+  `(SELECT <col> FROM T WHERE ...)` is folded here by EXECUTING the
+  subquery at plan time and splicing its value back as a literal. The
+  fold is fine; the describe was then taken FROM THAT LITERAL - from the
+  row that happened to be read. The inner plan was already computed at
+  the fold site and thrown away unless it folded to a `Plan::Scalar`,
+  which a plain-column subquery never does (the code said so in a
+  comment three lines below). Five defects from that one cause:
+  (1) **THE DESCRIBE DEPENDED ON THE DATA** - `(SELECT <BIGINT>)`
+  announced LONG len 4 for a small stored value and INT64 len 8 for a
+  large one. A protocol violation on its own, since a client caches what
+  PREPARE told it, and the one law here no value comparison can catch:
+  both describes render the right number.
+  (2) a SMALLINT came back LONG; (3) a NUMERIC lost its scale and family
+  code and was widened to INT64; (4) a subquery matching NO ROWS
+  described as TEXT(1) CHARACTER SET NONE, the literal being the word
+  NULL; (5) TEXT lost its CHARACTER SET and that CORRUPTED THE VALUE -
+  under a NONE attachment a WIN1252 column shipped the UTF-8 spelling
+  C3 A9 under a describe saying CHARACTER SET NONE, which the client
+  re-expanded to C3 83 C2 A9.
+  Fixed by not discarding the inner plan: `ScalarTy::from_col` takes the
+  inner ProjCol's whole announced shape. `ScalarTy` gained `scale`,
+  `sub_type` and `oct_length` - three fields could not express
+  `(SELECT MAX(<NUMERIC(9,2)>))`, which is LONG len 4 scale -2 sub_type
+  1 (probed; the DECIMAL twin is 2). That is not cosmetic:
+  `ProjCol::value_of` raises IntegerOverflow when a value's scale is
+  FINER than the announced one, so a carrier defaulting to scale 0 over
+  a `Scaled(raw, -2)` would turn a working query into an ERROR rather
+  than a wrong number.
+  MEASURED FIRST, as the plan required: the engine describes a subquery
+  EXACTLY as its inner column - CHAR(10) UTF8 stays 452 TEXT len 40 like
+  the bare column, VARCHAR stays 448, OCTETS stays charset 1, WIN1252
+  keeps charset 53 under a NONE attachment and rescales to the
+  attachment under UTF8. The decisive probe was the value BYTES under
+  each attachment: under UTF8 and WIN1252 fire-crab's bytes were ALREADY
+  correct and only the padding width was wrong, which is what proved the
+  fold's value round trip is clean and the whole defect was the lost
+  description. (One of the three analysis passes had speculated the text
+  was mangled on the round trip; the probe refuted it.)
+  ALSO FIXED, found while testing the above: **`SELECT NULL X`** - a bare
+  NULL with a bare, no-AS alias - was refused. `split_alias` treats a
+  trailing NULL in the head as the tail of an `IS NULL` (which must keep
+  refusing, since a projected boolean is not answered correctly here); a
+  head that IS exactly NULL is the literal. It surfaced through this
+  construct because a no-row subquery with a bare alias folds to
+  precisely `NULL X`.
+  AND: **any select item CARRYING a subquery is nullable**, not just a
+  whole-item one. `(SELECT <col> ...) + 1` folds to two constants and
+  described NOT NULL where the engine says Nullable - the subquery might
+  have matched no row - and `EXISTS(<sub>)` is BOOLEAN Nullable on the
+  engine too. The law already lived at the whole-item patch site; it now
+  covers every item containing a marker.
+  This closes hunt findings 3, 16, 17, 18, 19 and 31.
+
+- **`serve-real-gbakverbose` REPAIRED (2026-08-29):** it had broken two
+  consecutive sweeps and passed on every retry, which is the most
+  dangerous shape a gate can have - it trains you to wave the failure
+  through. Reproduced 1-in-3 STANDALONE on an idle box, which ruled out
+  both load and the change under test, and then diagnosed to TWO real
+  defects in the gate itself.
+  (1) Its fixture was created with a BARE PATH, so the EMBEDDED engine
+  made the file as the invoking user, while every consumer reached it
+  through `localhost:service_mgr` - a service running as the `firebird`
+  user. That mixed-mode access intermittently lost the race with the
+  embedded process still releasing the file and answered `I/O error
+  during "open" operation`, surfacing as `both -v backups run (rc)` want
+  0/0 got 1/0 - THE ENGINE'S OWN gbak failing, on a gate whose subject is
+  fire-crab. Now created through the server, the same law the rest of the
+  suite follows.
+  (2) The stream comparison was newline-based, and the engine's verbose
+  service output does not merely re-chunk mid-line (known since
+  2026-08-28) - it sometimes CUTS A RECORD OFF MID-WORD. A captured
+  failing run held `gbak: writing privile`, which the `writing privilege`
+  filter did not match, so the fragment survived and misaligned every
+  line after it. The comparison now splits the stream on its own `gbak:`
+  record marker rather than on newlines, and the privilege filter matches
+  the truncated prefix. Privilege records are excluded by design (the
+  engine writes them, fire-crab does not), so excluding their fragments
+  weakens nothing.
+  10 consecutive clean standalone runs after the fix, where before it
+  failed 1-in-3.
+
 - **BRANCH RECONCILIATION BEYOND UNION DONE (2026-08-29,
   `serve-real-branchtype` 51):** a UNION describes one column per
   position and decodes every branch's value under it - and so does a

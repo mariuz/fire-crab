@@ -38593,9 +38593,44 @@ fn plan_query_inner_ctx(
                         // describes (SELECT MAX(I) FROM T) by MAX's own
                         // source-typed answer, and the fold to a
                         // literal would otherwise widen it to INT64
+                        // ... AND SO DOES A PLAIN-COLUMN ONE. The inner
+                        // plan was already being computed here and then
+                        // THROWN AWAY unless it folded to a Scalar - and
+                        // a plain-column sub never does (it becomes a
+                        // literal projection over the outer FROM, as the
+                        // comment further down says). So its describe
+                        // fell back to the FOLDED LITERAL, i.e. to the
+                        // row that happened to be read, which is four
+                        // defects at once: `(SELECT <BIGINT>)` announced
+                        // LONG for a small stored value and INT64 for a
+                        // large one - the same statement describing
+                        // differently per DATA, which breaks the
+                        // protocol's promise that a PREPARE can be
+                        // cached; a SMALLINT came back LONG; a NUMERIC
+                        // lost its scale and family code; a no-row
+                        // subquery described as TEXT(1) NONE because the
+                        // literal was the word NULL; and text lost its
+                        // charset, so under a NONE attachment a WIN1252
+                        // column shipped the UTF-8 spelling C3 A9 under
+                        // a describe that said CHARACTER SET NONE - the
+                        // client re-expanded that to C3 83 C2 A9 and
+                        // rendered mojibake (measured: under a UTF8 or
+                        // WIN1252 attachment the BYTES were already
+                        // right and only the padding width was wrong,
+                        // which is what proves the value round trip
+                        // through the folded literal is clean and the
+                        // whole defect is the lost description).
+                        //
+                        // `output_cols_of` answers an empty vector for a
+                        // refused or unrecognised plan, so `.first()` is
+                        // None there and the describe falls back to
+                        // today's literal-derived one. This can only
+                        // ever ADD a correct description; it never turns
+                        // an answer into a refusal.
                         let sty = match plan_query_inner(sub, db, &mut Vec::new()) {
                             Some(Plan::Scalar(_, _, _, ty)) => Some(ty),
-                            _ => None,
+                            Some(p) => output_cols_of(&p).first().map(ScalarTy::from_col),
+                            None => None,
                         };
                         Some((idx, subquery_item_name(sub)?.0, rel, ralias, sty))
                     })
@@ -38711,6 +38746,38 @@ fn plan_query_inner_ctx(
                 // folded text: the FROM item has moved, so a positional
                 // refusal from it is downgraded ([downgrade_rewritten])
                 let mut plan = downgrade_rewritten(plan_query_inner(&out, db, params)?);
+                // ANY SELECT ITEM CARRYING A SUBQUERY IS NULLABLE, even
+                // when the fold leaves behind something that plainly is
+                // not: `(SELECT <col> FROM T WHERE ...) + 1` folds to
+                // `11 + 1`, two constants, and described NOT NULL where
+                // the engine says Nullable - the subquery might have
+                // matched no row. The whole-item case already carried
+                // this law at the patch site above; it belongs to every
+                // item that contains a marker, `EXISTS <sub>` (BOOLEAN
+                // Nullable on the engine) and a subquery buried in an
+                // expression alike.
+                let subq_items: Vec<usize> = split_top_level_commas(&folded)
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, item)| item.contains(SUBQ_MARK))
+                    .map(|(i, _)| i)
+                    .collect();
+                if !subq_items.is_empty() {
+                    if let Plan::Project { cols, .. }
+                    | Plan::Join { cols, .. }
+                    | Plan::JoinGroup { cols, .. }
+                    | Plan::Group { cols, .. }
+                    | Plan::Union { cols, .. }
+                    | Plan::Derived { cols, .. }
+                    | Plan::Rows { cols, .. } = &mut plan
+                    {
+                        for i in &subq_items {
+                            if let Some(c) = cols.get_mut(*i) {
+                                c.sql_type = nullable(c.sql_type);
+                            }
+                        }
+                    }
+                }
                 for (idx, fname, rel, ralias, sty) in &fname_patches {
                     match &mut plan {
                         Plan::Project { cols, .. }
@@ -38729,10 +38796,16 @@ fn plan_query_inner_ctx(
                                     // ALWAYS NULLABLE as a subquery: no
                                     // row answers NULL, so even COUNT -
                                     // not-nullable standalone - carries
-                                    // the flag here (measured)
+                                    // the flag here (measured). This is
+                                    // also why the inner column's own
+                                    // nullable bit is not copied: it can
+                                    // have been CLEARED by
+                                    // `mark_not_null_cols`.
                                     c.sql_type = nullable(ty.sql_type);
                                     c.length = ty.length;
-                                    c.oct_length = ty.length;
+                                    c.oct_length = ty.oct_length;
+                                    c.scale = ty.scale;
+                                    c.sub_type = ty.sub_type;
                                 }
                             }
                         }
@@ -45593,26 +45666,62 @@ struct ScalarTy {
     wire: Wire,
     sql_type: i32,
     length: i32,
+    /// the BYTE width beside the announced (character) one - they differ
+    /// for text, and `resolve_text_cs` needs both
+    oct_length: i32,
+    /// carried because a scalar subquery answers under its SOURCE's
+    /// description, and a source can be scaled: `(SELECT MAX(<NUMERIC
+    /// (9,2)>) FROM T)` describes LONG len 4 scale -2 SUB_TYPE 1
+    /// (probed), where three fields could only say INT64 len 8 scale 0
+    /// sub_type 0. Announcing scale 0 over a value that is `Scaled(raw,
+    /// -2)` is not merely cosmetic either - `ProjCol::value_of` raises
+    /// IntegerOverflow when the value's scale is FINER than the
+    /// announced one, so it would turn a working query into an error.
+    scale: i32,
+    sub_type: i32,
 }
 
 impl ScalarTy {
     /// nullable INT64 - the fold's own type, and the old blanket answer
     fn int64() -> ScalarTy {
-        ScalarTy { wire: Wire::Int64, sql_type: 581, length: 8 }
+        ScalarTy { wire: Wire::Int64, sql_type: 581, length: 8, oct_length: 8, scale: 0, sub_type: 0 }
     }
     /// COUNT's type: INT64, NOT nullable (580 even - measured)
     fn count() -> ScalarTy {
-        ScalarTy { wire: Wire::Int64, sql_type: 580, length: 8 }
+        ScalarTy { wire: Wire::Int64, sql_type: 580, length: 8, oct_length: 8, scale: 0, sub_type: 0 }
     }
     /// VAR/STDDEV: DOUBLE, NOT nullable (480 even) - 0, not NULL, over an
     /// empty group
     fn double() -> ScalarTy {
-        ScalarTy { wire: Wire::Double, sql_type: 480, length: 8 }
+        ScalarTy { wire: Wire::Double, sql_type: 480, length: 8, oct_length: 8, scale: 0, sub_type: 0 }
     }
-    /// a MIN/MAX result: the SOURCE column's own type, nullable
+    /// a MIN/MAX result: the SOURCE column's own type, nullable - with
+    /// its SCALE and SUB_TYPE, which `wire_for` has always returned and
+    /// this discarded
     fn of_desc(d: &Descriptor) -> ScalarTy {
-        let (wire, sql_type, length, _, _) = wire_for(d);
-        ScalarTy { wire, sql_type: nullable(sql_type), length }
+        let (wire, sql_type, length, scale, sub_type) = wire_for(d);
+        ScalarTy { wire, sql_type: nullable(sql_type), length, oct_length: length, scale, sub_type }
+    }
+    /// THE ANSWER OF A WHOLE-ITEM SUBQUERY IS ITS INNER COLUMN'S. Taken
+    /// from the inner plan's own ProjCol, so a plain-column subquery
+    /// announces exactly what the column announces - which is what the
+    /// engine does (probed: a CHAR(10) UTF8 through the wrapper is 452
+    /// TEXT len 40 like the bare column, a VARCHAR stays 448, a WIN1252
+    /// column keeps charset 53 under a NONE attachment and rescales to
+    /// the attachment under UTF8, an OCTETS column stays charset 1).
+    /// The nullable bit is NOT taken from here: an inner column can
+    /// arrive with it cleared by `mark_not_null_cols`, and a subquery is
+    /// always nullable (no row answers NULL) - the patch site re-applies
+    /// it.
+    fn from_col(c: &ProjCol) -> ScalarTy {
+        ScalarTy {
+            wire: c.wire,
+            sql_type: c.sql_type,
+            length: c.length,
+            oct_length: c.oct_length,
+            scale: c.scale,
+            sub_type: c.sub_type,
+        }
     }
 }
 
@@ -45627,9 +45736,9 @@ fn scalar_col(name: &str, fname: &Option<String>, ty: ScalarTy) -> ProjCol {
         wire: ty.wire,
         sql_type: ty.sql_type,
         length: ty.length,
-        oct_length: ty.length,
-        scale: 0,
-        sub_type: 0,
+        oct_length: ty.oct_length,
+        scale: ty.scale,
+        sub_type: ty.sub_type,
         expr: None,
     }
 }
@@ -61871,7 +61980,16 @@ fn split_alias(item: &str) -> (&str, Option<&str>) {
     // answer correctly - a refusal beats a wrong answer.
     let head_keyword = |w: &str| keyword(w) && !w.eq_ignore_ascii_case("END");
     let last_word = head.rsplit(|c: char| c.is_whitespace()).next().unwrap_or("");
-    if head_keyword(last_word) || (!quoted && keyword(tail)) {
+    // ... and a head that is EXACTLY `NULL` is the LITERAL, not the tail
+    // of an `IS NULL`, so the token after it is an ordinary alias.
+    // `SELECT NULL X` is legal and the engine answers it; refusing it
+    // also made a folded whole-item subquery refuse whenever it matched
+    // no row and was spelled with a bare alias - `(SELECT c FROM t WHERE
+    // <no match>) X` folds to `NULL X`, which is how a pre-existing gap
+    // in this splitter surfaced as a subquery defect. `S IS NULL X`
+    // keeps refusing: its head ENDS in NULL without BEING it.
+    let bare_null_literal = head.trim().eq_ignore_ascii_case("NULL");
+    if (head_keyword(last_word) && !bare_null_literal) || (!quoted && keyword(tail)) {
         return (item, None);
     }
     // an alias cannot be a keyword that continues the statement, and the
@@ -61884,7 +62002,8 @@ fn split_alias(item: &str) -> (&str, Option<&str>) {
     // (`ID + 1 X`). `SELECT ID NAME AMT` fails every one of those - its
     // head `ID NAME` is not an expression - so it keeps refusing rather
     // than quietly dropping a token.
-    let body_ok = ident_ok(head.trim_matches('"'))
+    let body_ok = bare_null_literal
+        || ident_ok(head.trim_matches('"'))
         || is_qualified_col(head)
         || head.ends_with(')')
         || parse_raw_expr_any(head).is_some();
