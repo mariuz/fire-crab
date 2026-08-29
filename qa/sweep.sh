@@ -103,7 +103,32 @@ TIMES="$TMP/times"
 # A private port per gate. Well clear of the engine's 3050 and of every
 # gate's own default; the stride leaves room for the gates that start a
 # second and third server of their own (PORT+1, PORT+2).
-port_of() { echo $((20000 + $1 * 4)); }
+# A GATE'S PORT, and it has to be FREE. The arithmetic alone gave a
+# distinct number per gate, which is not the same thing: a server
+# leaked by an earlier run - or anything else on the box - can be
+# sitting on it, and a gate that cannot bind FAILS THE SWEEP for a
+# reason that has nothing to do with the server under test (measured:
+# `gendurable` failed on 60004 while the port was momentarily held, and
+# passed standalone on the same port minutes later). So the number is a
+# STARTING POINT and this walks up to one nobody is listening on.
+port_free() {
+    if command -v ss >/dev/null 2>&1; then
+        ! ss -ltn 2>/dev/null | grep -q ":$1 "
+    elif command -v nc >/dev/null 2>&1; then
+        ! nc -z 127.0.0.1 "$1" 2>/dev/null
+    else
+        true
+    fi
+}
+port_of() {
+    local p=$((20000 + $1 * 4)) tries=0
+    while [ $tries -lt 64 ]; do
+        port_free "$p" && { echo "$p"; return; }
+        p=$((p + 1))
+        tries=$((tries + 1))
+    done
+    echo "$p"
+}
 
 run_one() { # <index> <name>
     local i="$1" n="$2" f="qa/serve-real-$2.sh" out="$TMP/$2.out"

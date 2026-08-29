@@ -2911,6 +2911,19 @@ struct TxRow {
     at: std::time::SystemTime,
 }
 
+/// One PREPARED STATEMENT of an attachment, as `MON$STATEMENTS`
+/// reports it. Published beside the transactions, from the same place
+/// and for the same reason: which one is live moves as the client
+/// works.
+#[derive(Clone)]
+struct StmtRow {
+    /// the handle the client names it by
+    handle: i32,
+    sql: String,
+    /// is this the statement the attachment is working on?
+    active: bool,
+}
+
 #[derive(Clone)]
 struct AttachRow {
     id: i32,
@@ -2927,6 +2940,8 @@ struct AttachRow {
     protocol: Option<String>,
     /// the transactions this attachment has open right now
     txs: Vec<TxRow>,
+    /// ...and the statements it has prepared
+    stmts: Vec<StmtRow>,
 }
 
 #[derive(Default)]
@@ -6975,9 +6990,44 @@ enum RowSource {
 /// record headers that a computed relation has none of.
 fn mon_computed_relation(db: &Database, rel: u16) -> bool {
     let image = db.bytes();
-    ["MON$DATABASE", "MON$ATTACHMENTS", "MON$TRANSACTIONS"]
+    ["MON$DATABASE", "MON$ATTACHMENTS", "MON$TRANSACTIONS", "MON$STATEMENTS"]
         .iter()
         .any(|n| fire_crab_ods::resolve_relation(&image, db.page_size, n) == Some(rel))
+}
+
+/// Publish this attachment's prepared statements, for
+/// `MON$STATEMENTS`. Called from the same place as [publish_txs] and
+/// for the same reason: which statement is LIVE moves as the client
+/// works, so a set written when one was prepared is stale by the time
+/// anybody asks.
+fn publish_stmts(
+    database: &Option<Database>,
+    attach_id: i32,
+    cur_stmt: i32,
+    cur_sql: &str,
+    parked: &std::collections::HashMap<i32, StmtSlot>,
+) {
+    let Some(db) = database.as_ref() else { return };
+    let mut rows: Vec<StmtRow> = Vec::new();
+    if !cur_sql.is_empty() {
+        rows.push(StmtRow { handle: cur_stmt, sql: cur_sql.to_string(), active: true });
+    }
+    let mut handles: Vec<i32> = parked.keys().copied().collect();
+    handles.sort_unstable();
+    for h in handles {
+        if h == cur_stmt {
+            continue;
+        }
+        if let Some(sl) = parked.get(&h) {
+            if !sl.sql.is_empty() {
+                rows.push(StmtRow { handle: h, sql: sl.sql.clone(), active: false });
+            }
+        }
+    }
+    let mut reg = db.attachments.attached.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(a) = reg.iter_mut().find(|a| a.id == attach_id) {
+        a.stmts = rows;
+    }
 }
 
 /// Publish this attachment's live transactions into the registry, so
@@ -7043,6 +7093,50 @@ fn publish_txs(database: &Option<Database>, attach_id: i32) {
     if let Some(a) = reg.iter_mut().find(|a| a.id == attach_id) {
         a.txs = rows;
     }
+}
+
+/// The `MON$STATEMENTS` rows: every attachment's prepared statements.
+///
+/// `MON$SQL_TEXT` is a BLOB, and these rows are computed, so the text is
+/// MINTED - the same machinery `LIST()` uses for a computed blob. If the
+/// mint is not armed (a path that never expects one), the text answers
+/// NULL rather than failing the query: the row still names the
+/// statement, which is what a monitoring table is for.
+fn mon_statement_rows(db: &Database, formats: &[(u8, Vec<Descriptor>)]) -> Vec<Vec<Value>> {
+    let image = db.bytes();
+    let Some((_, descs)) = formats.iter().max_by_key(|(n, _)| *n) else { return Vec::new() };
+    let cols = relation_columns(&image, db.page_size, "MON$STATEMENTS");
+    let live = db.attachments.attached.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let mut out = Vec::new();
+    for a in &live {
+        // the transaction a statement runs under is the attachment's
+        // ACTIVE one - this server binds every execute to it
+        let tx = a.txs.iter().find(|t| t.active).map(|t| t.id.map(|n| n as i64).unwrap_or(t.handle as i64));
+        for st in &a.stmts {
+            let mut row = vec![Value::Null; descs.len()];
+            let mut put = |col: &str, v: Value| {
+                if let Some(c) = cols.iter().find(|c| c.name.eq_ignore_ascii_case(col)) {
+                    if let Some(slot) = row.get_mut(c.field_id as usize) {
+                        *slot = v;
+                    }
+                }
+            };
+            put("MON$STATEMENT_ID", Value::Int(st.handle as i64));
+            put("MON$COMPILED_STATEMENT_ID", Value::Int(st.handle as i64));
+            put("MON$ATTACHMENT_ID", Value::Int(a.id as i64));
+            put("MON$STATE", Value::Int(st.active as i64));
+            put("MON$STAT_ID", Value::Int(a.id as i64));
+            put("MON$STATEMENT_TIMEOUT", Value::Int(0));
+            if let Some(t) = tx {
+                put("MON$TRANSACTION_ID", Value::Int(t));
+            }
+            if let Ok(v) = mint_computed_blob(&[st.sql.as_bytes().to_vec()]) {
+                put("MON$SQL_TEXT", v);
+            }
+            out.push(row);
+        }
+    }
+    out
 }
 
 /// The `MON$TRANSACTIONS` rows: every live transaction of every
@@ -7177,6 +7271,11 @@ fn mon_rows(
     // own sessions published them
     if fire_crab_ods::resolve_relation(&image, db.page_size, "MON$TRANSACTIONS") == Some(rel) {
         return Some(mon_transaction_rows(db, formats));
+    }
+    // MON$STATEMENTS: what each attachment has prepared, its text as a
+    // COMPUTED BLOB (the machinery LIST() brought)
+    if fire_crab_ods::resolve_relation(&image, db.page_size, "MON$STATEMENTS") == Some(rel) {
+        return Some(mon_statement_rows(db, formats));
     }
     if fire_crab_ods::resolve_relation(&image, db.page_size, "MON$DATABASE") != Some(rel) {
         return None;
@@ -48564,13 +48663,35 @@ fn blob_charset(descs: &[Descriptor], fid: usize) -> u8 {
 }
 
 fn blob_text_of(rel: u16, num: u64, cs: u8) -> Result<String, EvalErr> {
+    // A COMPUTED BLOB IS READABLE BY THE STATEMENT THAT MADE IT. One
+    // carries relation 0 and lives in the mint context until the op
+    // ends ([flush_minted_blobs]), so reading it out of the file cannot
+    // work - and refusing left the row it belonged to SILENTLY MISSING:
+    // `CAST(<a computed blob> AS VARCHAR(n))` answered no rows at all,
+    // where the engine answers the text. (Found on MON$SQL_TEXT; the
+    // same held for `CAST(LIST(x) AS VARCHAR(n))`.)
+    if rel == 0 {
+        let minted = BLOB_MINT.with(|c| {
+            c.borrow().as_ref().and_then(|ctx| {
+                ctx.minted
+                    .iter()
+                    .find(|(id, _)| u64::from(*id) == num)
+                    .map(|(_, tb)| tb.segments.concat())
+            })
+        });
+        let Some(bytes) = minted else {
+            return Err(EvalErr::Unsupported);
+        };
+        return Ok(if fire_crab_ods::intl::byte_carrier(cs) {
+            fire_crab_ods::intl::carrier_decode(&bytes)
+        } else {
+            String::from_utf8_lossy(&bytes).into_owned()
+        });
+    }
     let ctx = BLOB_CTX.with(|c| c.borrow().clone());
     let Some((image, page_size)) = ctx else {
         return Err(EvalErr::Unsupported);
     };
-    if rel == 0 {
-        return Err(EvalErr::Unsupported);
-    }
     let b = fire_crab_blb::read_blob(&image, page_size, rel, num).map_err(|_| EvalErr::Unsupported)?;
     let st = b.header.sub_type as i16 as i32;
     if !matches!(st, 0 | 1) {
@@ -72360,6 +72481,7 @@ fn after_auth(
             encrypted: enc.is_some(),
             protocol: Some(format!("P{}", best)),
             txs: Vec::new(),
+            stmts: Vec::new(),
         };
         db.attachments.attached.lock().unwrap_or_else(|e| e.into_inner()).push(row);
     }
@@ -72523,6 +72645,7 @@ fn after_auth(
         // asks - it named the snapshot transaction idle and isql's
         // spare one active, exactly backwards from the engine.
         publish_txs(&database, attach_id);
+        publish_stmts(&database, attach_id, cur_stmt, &stmt_sql, &stmts);
         // THE READER'S VIEW OF THE CATALOG for this request: the
         // attachment's own transaction ids, owner-only - another
         // transaction's uncommitted CREATE TABLE is "Table unknown" here,

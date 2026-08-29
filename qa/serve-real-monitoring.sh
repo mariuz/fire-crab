@@ -20,6 +20,9 @@
 #     address, over what protocol, and whether the wire is encrypted;
 #   * `MON$TRANSACTIONS` too - every attachment's live transactions,
 #     with the one its statements run under marked ACTIVE;
+#   * `MON$STATEMENTS` too, with its SQL text as a COMPUTED BLOB - the
+#     machinery LIST() brought - so the statement a server reports as
+#     running is the query asking, and both must answer the same text;
 #   * every other MON$ table scans its own (empty) storage and answers
 #     NO ROWS, with the right shape and the right column names.
 #
@@ -167,22 +170,38 @@ case "$c/$e" in
     *) echo "DIFF isolation modes moved: fc [$c] engine [$e]"; fail=1 ;;
 esac
 
+# ---- MON$STATEMENTS names what is being asked --------------------------
+# the strongest comparison on this surface: the statement a server
+# reports as running IS the query asking, so both must answer the same
+# TEXT - and MON$SQL_TEXT is a BLOB, minted for a computed row
+# CAST, so the TEXT is compared and not the blob's id: a computed blob
+# is minted from this server's own range (0:40000001) where the engine
+# hands out 0:1, and neither number is a fact about the statement
+both "the running statement, its state and its SQL text" \
+  "SELECT MON\$STATE AS ST, CAST(MON\$SQL_TEXT AS VARCHAR(200)) AS SQLT FROM MON\$STATEMENTS;"
+# ...and it belongs to an attachment and a transaction this server also
+# names, which is what makes the four tables one picture
+ran=$((ran + 1))
+r=$(fc "SELECT COUNT(*) AS N FROM MON\$STATEMENTS s
+        JOIN MON\$ATTACHMENTS a ON a.MON\$ATTACHMENT_ID = s.MON\$ATTACHMENT_ID
+        JOIN MON\$TRANSACTIONS t ON t.MON\$TRANSACTION_ID = s.MON\$TRANSACTION_ID;")
+case "$r" in
+    "N 0|") echo "DIFF the statement joined no attachment and transaction: [$r]"; fail=1 ;;
+    *) echo "OK   a statement joins the attachment and transaction it runs in ($r)" ;;
+esac
 # the tables this server still does not fill keep the right SHAPE:
 # COUNT over an empty relation is 0, never the NULL the all-NULL row gave
 ran=$((ran + 1))
-r=$(fc "SELECT COUNT(*) AS N FROM MON\$STATEMENTS;")
+r=$(fc "SELECT COUNT(*) AS N FROM MON\$CALL_STACK;")
 case "$r" in
     "N 0|") echo "OK   COUNT over an unfilled MON\$ table is 0, not NULL" ;;
-    *) echo "DIFF COUNT over MON\$STATEMENTS: [$r]"; fail=1 ;;
+    *) echo "DIFF COUNT over MON\$CALL_STACK: [$r]"; fail=1 ;;
 esac
-# the RECORDED DIVERGENCE that is LEFT: the engine lists transactions
-# and statements, this server none. Asserted so a change shows.
 ran=$((ran + 1))
-e=$(printf 'SET LIST ON;\nSELECT COUNT(*) AS N FROM MON$STATEMENTS;\n' \
-    | "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$REAL:$A" 2>&1 | norm)
-case "$e" in
-    "N 0|") echo "DIFF the engine reports no statements either - divergence gone?"; fail=1 ;;
-    *) echo "OK   divergence recorded: the engine lists statements ($e), this server none" ;;
+r=$(fc "SELECT COUNT(*) AS N FROM MON\$IO_STATS;")
+case "$r" in
+    "N 0|") echo "OK   ...and over the statistics tables too" ;;
+    *) echo "DIFF COUNT over MON\$IO_STATS: [$r]"; fail=1 ;;
 esac
 
 # ---- the engine still reads the file ------------------------------------

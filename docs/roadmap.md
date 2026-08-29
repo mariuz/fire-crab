@@ -1357,8 +1357,30 @@ and gated: the engine's default read committed is READ CONSISTENCY (mode
 4) and this server reads the latest committed version (mode 2). Each
 answers what it actually does — which is the point of the column.
 
-RECORDED DIVERGENCE, still, asserted by the gate so a change shows: the
-engine lists live STATEMENTS; this server answers none.
+**AND `MON$STATEMENTS` CLOSES IT (`serve-real-monitoring` 17 → 19).**
+What each attachment has prepared, with the one it is working on marked
+ACTIVE and its text as a COMPUTED BLOB - the machinery `LIST()` brought.
+The comparison this allows is the strongest on the surface: **the
+statement a server reports as running IS the query asking**, so both
+must answer the same TEXT. They do.
+
+A REAL DEFECT FELL OUT OF IT, and it was not in the monitoring code. A
+computed blob carries relation 0 and lives in the mint context until the
+op ends, so the blob reader - which reads out of the FILE - refused it,
+and `CAST(<a computed blob> AS VARCHAR(n))` answered NO ROWS AT ALL
+where the engine answers the text. Silently: no error, no row, nothing
+to act on. `blob_text_of` serves relation 0 from the mint now, which
+fixes the same shape for `CAST(LIST(x) AS VARCHAR(n))`.
+
+The gate compares the TEXT and not the blob's ID: a computed blob is
+minted from this server's own range (`0:40000001`) where the engine
+hands out `0:1`, and neither number is a fact about the statement.
+
+THE SURFACE IS NOW: `MON$DATABASE`, `MON$ATTACHMENTS`,
+`MON$TRANSACTIONS` and `MON$STATEMENTS` answered from live state, and
+every remaining `MON$` table honestly empty with the right shape and
+names - `MON$CALL_STACK` and the statistics tables among them, each
+asserted at 0 rather than NULL.
 An empty relation of the right shape is something a client can read —
 the all-NULL row was not. The one thing that row bought, a firebird-qa
 bootstrap whose projection uses `COUNT(DISTINCT ...)` and `IIF(...)`,
