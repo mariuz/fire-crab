@@ -25,11 +25,11 @@
 # ']'` is `[ab    ]`, not `[ab]`. One renderer served both and trimmed
 # for both; it now trims only where the whole value IS the statement.
 #
-# Boundaries: this server cannot COMPILE such a body to BLR - it has no
-# probed byte shape for a text expression - so CREATE TRIGGER refuses to
-# STORE one, exactly as it already refused a body carrying a text
-# literal. The triggers here are made by the ENGINE on both files; what
-# is under test is RUNNING them.
+# The RUNNING half is tested over triggers the ENGINE made on both files.
+# The COMPILING half is tested at the end: a text body is storable now -
+# the shapes were probed against engine-written trigger BLR - so the
+# catalog row, the BLR and the debug info are compared byte for byte and
+# the ENGINE runs what this server compiled.
 #
 #   qa/serve-real-trigtext.sh [port]
 set -u
@@ -201,14 +201,69 @@ e=$(printf '%s\n' "$eng_q" | "$ISQL" -q -user "$U" -pas "$P" "$B" 2>&1 | norm)
 c=$(printf '%s\n' "$eng_q" | "$ISQL" -q -user "$U" -pas "$P" "$A" 2>&1 | norm)
 check "the ENGINE answers the same over fire-crab's own file" "$c" "$e"
 
-# ---- the boundary: such a body cannot be STORED ------------------------
+# ---- ...AND THIS SERVER COMPILES ONE ------------------------------------
+# a text body is STORABLE now: the shapes were probed against
+# engine-written trigger BLR - a literal is `blr_literal blr_text2
+# <charset u16> <len u16> <bytes>` with charset NONE, a concatenation is
+# `blr_concatenate` (39) in prefix form - so the catalog row, the BLR and
+# the debug info are compared BYTE FOR BYTE, and then the ENGINE RUNS
+# what this server compiled
+CA="$D/fc-trigtext-mk-crab.fdb"
+CB="$D/fc-trigtext-mk-engine.fdb"
+mk_plain() { # <file>
+    rm -f "$1"
+    "$ISQL" -q -b -user "$U" -pas "$P" >/dev/null 2>&1 <<SQL
+CREATE DATABASE '$1' USER '$U' PASSWORD '$P' PAGE_SIZE 8192 DEFAULT CHARACTER SET UTF8;
+COMMIT;
+CREATE TABLE T (ID INTEGER, A INTEGER, V VARCHAR(20), C CHAR(6));
+CREATE TABLE L (ID INTEGER, W VARCHAR(60));
+COMMIT;
+SQL
+    chmod 666 "$1"
+}
+mk_plain "$CA"; mk_plain "$CB"
+ddl='SET TERM ^ ;
+CREATE TRIGGER T_LIT FOR T BEFORE INSERT AS BEGIN INSERT INTO L (ID, W) VALUES (NEW.ID, (a)); END^
+CREATE TRIGGER T_CAT FOR T BEFORE INSERT POSITION 3 AS BEGIN INSERT INTO L (ID, W) VALUES (NEW.ID, (b) || NEW.V); END^
+CREATE TRIGGER T_CH FOR T BEFORE INSERT POSITION 5 AS BEGIN INSERT INTO L (ID, W) VALUES (NEW.ID, NEW.C || (c) || NEW.V); END^
+SET TERM ; ^
+COMMIT;'
+ddl=$(printf '%s' "$ddl" | sed "s/(a)/'ab'/; s/(b)/'a'/; s/(c)/'-'/")
+printf '%s\n' "$ddl" | "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$CA" >/dev/null 2>&1
+printf '%s\n' "$ddl" | "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$REAL:$CB" >/dev/null 2>&1
+catq() { "$ISQL" -q -b -user "$U" -pas "$P" "$1" 2>&1 <<'SQL' | norm
+SET HEADING OFF;
+SELECT TRIM(t.RDB$TRIGGER_NAME)||'|'||TRIM(t.RDB$RELATION_NAME)||'|'||t.RDB$TRIGGER_TYPE||'|'||t.RDB$TRIGGER_SEQUENCE||'|'||t.RDB$VALID_BLR
+FROM RDB$TRIGGERS t WHERE t.RDB$SYSTEM_FLAG = 0 ORDER BY t.RDB$TRIGGER_NAME;
+SELECT TRIM(t.RDB$TRIGGER_NAME)||'#'||CAST(CAST(t.RDB$TRIGGER_BLR AS BLOB SUB_TYPE 0) AS VARCHAR(400) CHARACTER SET OCTETS)||'#'||CAST(CAST(t.RDB$DEBUG_INFO AS BLOB SUB_TYPE 0) AS VARCHAR(400) CHARACTER SET OCTETS)
+FROM RDB$TRIGGERS t WHERE t.RDB$SYSTEM_FLAG = 0 ORDER BY t.RDB$TRIGGER_NAME;
+SELECT TRIM(d.RDB$DEPENDENT_NAME)||'|'||TRIM(d.RDB$DEPENDED_ON_NAME)||'|'||COALESCE(TRIM(d.RDB$FIELD_NAME),'-')
+FROM RDB$DEPENDENCIES d WHERE d.RDB$DEPENDENT_NAME STARTING WITH 'T_' ORDER BY 1;
+SQL
+}
+check "a TEXT body's row, BLR and debug info are the engine's, byte for byte" \
+    "$(catq "$CA")" "$(catq "$CB")"
+# ...and the ENGINE runs what this server compiled
+for f in "$CA" "$CB"; do
+    printf "INSERT INTO T (ID, A, V, C) VALUES (1, 7, 'zz', 'xy'); COMMIT;\n" \
+        | "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$REAL:$f" >/dev/null 2>&1
+done
+ea=$(printf "SET LIST ON; SELECT '<' || W || '>' AS R FROM L ORDER BY W;\n" | "$ISQL" -q -user "$U" -pas "$P" "$CB" 2>&1 | norm)
+ca=$(printf "SET LIST ON; SELECT '<' || W || '>' AS R FROM L ORDER BY W;\n" | "$ISQL" -q -user "$U" -pas "$P" "$CA" 2>&1 | norm)
+check "the ENGINE runs the text trigger THIS server compiled" "$ca" "$ea"
+# THE BOUNDARY THAT IS LEFT: a body DECLARING a text variable. The
+# declaration itself needs a shape this server has not probed (the
+# engine also writes a dependency row on the CHARACTER SET for one), so
+# CREATE refuses - while a body that declares none compiles, above, and
+# one the ENGINE created runs, at the top of this gate.
 ran=$((ran + 1))
-r=$(printf "SET TERM ^ ;\nCREATE TRIGGER T_TXT FOR T BEFORE INSERT POSITION 9 AS BEGIN INSERT INTO L (ID, W) VALUES (NEW.ID, 'a' || NEW.A); END^\nSET TERM ; ^\n" \
-    | "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$A" 2>&1)
+r=$(printf "SET TERM ^ ;\nCREATE TRIGGER T_ASN FOR T BEFORE INSERT POSITION 7 AS DECLARE VARIABLE S VARCHAR(60); BEGIN S = 'x'; INSERT INTO L (ID, W) VALUES (NEW.ID, :S); END^\nSET TERM ; ^\n" \
+    | "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$CA" 2>&1)
 case "$r" in
-    *"Dynamic SQL Error"*) echo "OK   boundary: this server will not COMPILE a text body to BLR" ;;
-    *) echo "DIFF boundary MOVED: compiling a text body"; echo "     [$r]"; fail=1 ;;
+    *"Dynamic SQL Error"*) echo "OK   boundary: a body DECLARING a text variable is not compiled" ;;
+    *) echo "DIFF boundary MOVED: declaring a text variable"; echo "     [$r]"; fail=1 ;;
 esac
+rm -f "$CA" "$CB"
 gf=$("$GFIX" -v -full -user "$U" -pas "$P" "$A" 2>&1)
 ran=$((ran + 1))
 if [ -z "$gf" ]; then echo "OK   gfix -v -full clean on fc's file"; else echo "DIFF gfix: $gf"; fail=1; fi

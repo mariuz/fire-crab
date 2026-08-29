@@ -15508,6 +15508,10 @@ fn infer_int_rank(
     match e {
         Expr::Field { name, .. } => field_rank(name),
         Expr::Variable(_) => None, // no variables outside a trigger body
+        // a CONCATENATION is text: it has no integer rank at all, which
+        // is what keeps the INT-ONLY surfaces (a CHECK, a computed
+        // column) refusing one exactly as they refused a text literal
+        Expr::Concat(..) => None,
         Expr::IntLiteral(_) => Some(IntRank::Long),
         Expr::Int64Literal(_) => Some(IntRank::Int64),
         Expr::TextLiteral(_) => None, // the CHECK surface is INT-ONLY
@@ -15541,6 +15545,28 @@ fn infer_int_rank(
 
 /// The exact-integer rank of a plain stored dsc dtype (no NUMERIC
 /// scale/sub_type - the caller checks those).
+/// Is this column one a TRIGGER BODY may name - and what class is it?
+///
+/// The body surface was INT-ONLY: a plain SMALLINT/INTEGER/BIGINT with
+/// no scale and no charset. It takes TEXT columns too now, because the
+/// BLR that references one is the same `blr_field` either way and the
+/// VALUE shapes around it are probed (`blr_literal blr_text2` for a
+/// literal, `blr_concatenate` for a join). Everything else - a scaled
+/// numeric, a date, a blob - still refuses, so a body naming one is
+/// interpreted or refused rather than stored under BLR nobody has held
+/// against the engine's.
+fn body_col_class(d: &Descriptor) -> Option<()> {
+    use fire_crab_ods::format::dtype;
+    if (d.offset == 0 && d.length != 0) || d.scale != 0 {
+        return None;
+    }
+    match d.dtype {
+        dtype::SHORT | dtype::LONG | dtype::INT64 if d.sub_type == 0 => Some(()),
+        dtype::TEXT | dtype::VARYING => Some(()),
+        _ => None,
+    }
+}
+
 fn dtype_rank(dt: u8) -> Option<IntRank> {
     use fire_crab_ods::format::dtype;
     match dt {
@@ -16551,6 +16577,10 @@ fn expr_resolve_vars(
         | Expr::NullLiteral
         | Expr::DomainValue => e.clone(),
         | Expr::TriggerAction => e.clone(),
+        Expr::Concat(l, r) => Expr::Concat(
+            Box::new(expr_resolve_vars(l, vars)),
+            Box::new(expr_resolve_vars(r, vars)),
+        ),
         Expr::Add(l, r) => Expr::Add(
             Box::new(expr_resolve_vars(l, vars)),
             Box::new(expr_resolve_vars(r, vars)),
@@ -16706,6 +16736,10 @@ fn expr_plain_ctx(e: &fire_crab_ods::expr::Expr, ctx: u8) -> fire_crab_ods::expr
         | Expr::NullLiteral
         | Expr::DomainValue => e.clone(),
         | Expr::TriggerAction => e.clone(),
+        Expr::Concat(l, r) => Expr::Concat(
+            Box::new(expr_plain_ctx(l, ctx)),
+            Box::new(expr_plain_ctx(r, ctx)),
+        ),
         Expr::Add(l, r) => Expr::Add(
             Box::new(expr_plain_ctx(l, ctx)),
             Box::new(expr_plain_ctx(r, ctx)),
@@ -16774,6 +16808,10 @@ fn expr_resolve_marked(
         | Expr::NullLiteral
         | Expr::DomainValue => e.clone(),
         | Expr::TriggerAction => e.clone(),
+        Expr::Concat(l, r) => Expr::Concat(
+            Box::new(expr_resolve_marked(l, vars, marked)),
+            Box::new(expr_resolve_marked(r, vars, marked)),
+        ),
         Expr::Add(l, r) => Expr::Add(
             Box::new(expr_resolve_marked(l, vars, marked)),
             Box::new(expr_resolve_marked(r, vars, marked)),
@@ -17015,26 +17053,25 @@ fn body_has_uninterpretable_blr(st: &TrigStmt) -> bool {
         // ...and a condition kept AS WRITTEN: there is no `Cond` to
         // emit, and storing the trigger with the test silently missing
         // would be a trigger that does not do what its own source says
-        TrigStmt::If { cond, then, otherwise, raw, .. } => {
+        TrigStmt::If { then, otherwise, raw, .. } => {
             raw.is_some()
-                || cond_has_text(cond)
                 || body_has_uninterpretable_blr(then)
                 || otherwise.as_ref().is_some_and(|e| body_has_uninterpretable_blr(e))
         }
-        TrigStmt::While { cond, body, raw, .. } => {
-            raw.is_some() || cond_has_text(cond) || body_has_uninterpretable_blr(body)
-        }
-        // A TEXT LITERAL HAS NO PROBED BLR: the interpreter compares
-        // and assigns it (PAD SPACE, measured), but the emitter's shape
-        // for `blr_literal blr_text` has never been held against the
-        // engine's - so a body carrying one is interpreted, never
-        // stored, exactly as an AssignText body always was
-        TrigStmt::Assign { expr, .. } => expr_has_text(expr),
+        TrigStmt::While { body, raw, .. } => raw.is_some() || body_has_uninterpretable_blr(body),
+        // A TEXT LITERAL AND A CONCATENATION ARE STORABLE NOW. The
+        // shapes were probed against engine-written trigger BLR - a
+        // literal is `blr_literal blr_text2 <charset u16> <len u16>
+        // <bytes>` with charset NONE, a concatenation is
+        // `blr_concatenate` (39) in prefix form - and the gate holds
+        // both byte for byte. What still cannot be stored is a value
+        // KEPT AS WRITTEN (`raw`), which has no `Expr` to emit at all.
+        TrigStmt::Assign { .. } => false,
         // ...and a store whose VALUES were kept as text: there is no
         // `Expr` to emit, and storing the trigger with the statement
         // silently missing would be a trigger that does not do what its
         // own source says
-        TrigStmt::Store { exprs, raw, .. } => raw.is_some() || exprs.iter().any(expr_has_text),
+        TrigStmt::Store { raw, .. } => raw.is_some(),
         TrigStmt::Block { stmts, handlers, .. } => {
             stmts.iter().any(body_has_uninterpretable_blr)
                 || handlers.iter().any(|(conds, h)| {
@@ -17066,6 +17103,8 @@ fn expr_has_text(e: &fire_crab_ods::expr::Expr) -> bool {
         | Expr::NullLiteral
         | Expr::DomainValue => false,
         | Expr::TriggerAction => false,
+        // a CONCATENATION is text whatever its operands are
+        Expr::Concat(..) => true,
         Expr::Add(l, r) | Expr::Subtract(l, r) | Expr::Multiply(l, r) | Expr::Divide(l, r) => {
             expr_has_text(l) || expr_has_text(r)
         }
@@ -19199,13 +19238,10 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
         .max_by_key(|(n, _)| *n)
         .map(|(_, d)| d.as_slice())
         .unwrap_or(&[]);
-    let col_ok = |n: &str| {
+    let col_ok = |n: &str| -> Option<()> {
         let rc = columns.iter().find(|c| c.name.eq_ignore_ascii_case(n))?;
         let d = descs.get(rc.field_id as usize)?;
-        if (d.offset == 0 && d.length != 0) || d.scale != 0 || d.sub_type != 0 {
-            return None;
-        }
-        dtype_rank(d.dtype)
+        body_col_class(d)
     };
     let mut fields: Vec<String> = Vec::new();
     let mut add_field = |n: &str| {
@@ -19371,7 +19407,11 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
             | Expr::NullLiteral
             | Expr::DomainValue => {}
             | Expr::TriggerAction => {}
-            Expr::Add(l, r) | Expr::Subtract(l, r) | Expr::Multiply(l, r) | Expr::Divide(l, r) => {
+            Expr::Concat(l, r)
+            | Expr::Add(l, r)
+            | Expr::Subtract(l, r)
+            | Expr::Multiply(l, r)
+            | Expr::Divide(l, r) => {
                 expr_fields(l, out);
                 expr_fields(r, out);
             }
@@ -19416,8 +19456,9 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
         }
     }
     // blr_store targets: the table and every stored column must exist,
-    // the columns plain integer-family ones (the value surface); each
-    // store contributes its dependency rows
+    // and be a column a body may write ([body_col_class] - the integer
+    // family, and TEXT now that the value shapes around it are probed);
+    // each store contributes its dependency rows
     let mut store_deps: Vec<(String, Vec<String>)> = Vec::new();
     for st in &stores {
         let TrigStmt::Store { table: stab, cols, .. } = st else { continue };
@@ -19431,10 +19472,7 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
         for c in cols {
             let rc = scols.iter().find(|rc| rc.name.eq_ignore_ascii_case(c))?;
             let d = sdescs.get(rc.field_id as usize)?;
-            if (d.offset == 0 && d.length != 0) || d.scale != 0 || d.sub_type != 0 {
-                return None;
-            }
-            dtype_rank(d.dtype)?;
+            body_col_class(d)?;
         }
         match store_deps.iter_mut().find(|(t, _)| t == stab) {
             Some((_, cs)) => {
@@ -19468,10 +19506,7 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
         let target_col_ok = |n: &str| -> Option<()> {
             let rc = dcols.iter().find(|rc| rc.name.eq_ignore_ascii_case(n))?;
             let d = ddescs.get(rc.field_id as usize)?;
-            if (d.offset == 0 && d.length != 0) || d.scale != 0 || d.sub_type != 0 {
-                return None;
-            }
-            dtype_rank(d.dtype)?;
+            body_col_class(d)?;
             Some(())
         };
         let mut tcols: Vec<String> = Vec::new();
@@ -21461,6 +21496,9 @@ enum ETok {
     Dot,
     /// `,` - only `GEN_ID(<name>, <step>)` accepts it
     Comma,
+    /// `||` - concatenation, the one operator BELOW `+ -` in this
+    /// grammar (`'a' || 1 + 2` is `'a' || 3`, the engine's precedence)
+    Concat,
 }
 
 /// The parse-time context of an UNQUALIFIED field reference. The caller
@@ -21489,6 +21527,10 @@ fn tokenize_expr(s: &str) -> Option<Vec<ETok>> {
             b'-' => out.push(ETok::Minus),
             b'*' => out.push(ETok::Star),
             b'/' => out.push(ETok::Slash),
+            b'|' if b.get(i + 1) == Some(&b'|') => {
+                out.push(ETok::Concat);
+                i += 1;
+            }
             b'(' => out.push(ETok::LParen),
             b')' => out.push(ETok::RParen),
             b'=' => out.push(ETok::Cmp(fire_crab_ods::expr::CmpOp::Eql)),
@@ -21575,7 +21617,7 @@ fn tokenize_expr(s: &str) -> Option<Vec<ETok>> {
 fn parse_expr(s: &str) -> Option<fire_crab_ods::expr::Expr> {
     let toks = tokenize_expr(s)?;
     let mut p = 0;
-    let e = blr_expr_add(&toks, &mut p)?;
+    let e = blr_expr_concat(&toks, &mut p)?;
     if p != toks.len() {
         return None; // trailing tokens
     }
@@ -21663,7 +21705,7 @@ fn cond_unary(t: &[ETok], p: &mut usize) -> Option<fire_crab_ods::expr::Cond> {
 
 fn cond_cmp(t: &[ETok], p: &mut usize) -> Option<fire_crab_ods::expr::Cond> {
     use fire_crab_ods::expr::Cond;
-    let l = blr_expr_add(t, p)?;
+    let l = blr_expr_concat(t, p)?;
     // `<expr> IS [NOT] NULL` - blr_missing / blr_not(blr_missing)
     if matches!(t.get(*p), Some(ETok::Id(w)) if w == "IS") {
         *p += 1;
@@ -21684,7 +21726,7 @@ fn cond_cmp(t: &[ETok], p: &mut usize) -> Option<fire_crab_ods::expr::Cond> {
     };
     let op = *op;
     *p += 1;
-    let r = blr_expr_add(t, p)?;
+    let r = blr_expr_concat(t, p)?;
     Some(Cond::Cmp(op, l, r))
 }
 
@@ -21707,6 +21749,10 @@ fn expr_with_context(e: &fire_crab_ods::expr::Expr, context: u8) -> fire_crab_od
         Expr::NullLiteral => Expr::NullLiteral,
         Expr::DomainValue => Expr::DomainValue,
         Expr::TriggerAction => Expr::TriggerAction,
+        Expr::Concat(l, r) => Expr::Concat(
+            Box::new(expr_with_context(l, context)),
+            Box::new(expr_with_context(r, context)),
+        ),
         Expr::Add(l, r) => Expr::Add(
             Box::new(expr_with_context(l, context)),
             Box::new(expr_with_context(r, context)),
@@ -21765,9 +21811,11 @@ fn expr_all_plain(e: &fire_crab_ods::expr::Expr) -> bool {
         Expr::Int64Literal(_) => true,
         Expr::TextLiteral(_) => true,
         Expr::NullLiteral => true,
-        Expr::Add(l, r) | Expr::Subtract(l, r) | Expr::Multiply(l, r) | Expr::Divide(l, r) => {
-            expr_all_plain(l) && expr_all_plain(r)
-        }
+        Expr::Concat(l, r)
+        | Expr::Add(l, r)
+        | Expr::Subtract(l, r)
+        | Expr::Multiply(l, r)
+        | Expr::Divide(l, r) => expr_all_plain(l) && expr_all_plain(r),
     }
 }
 
@@ -21820,6 +21868,20 @@ fn parse_check_clause(item: &str) -> Option<(String, String)> {
         }
     }
     None
+}
+
+/// CONCATENATION binds LOOSER than `+ -`, so `'a' || 1 + 2` is
+/// `'a' || 3` - the engine's own precedence. Everything that parsed
+/// before still parses: a text operand was already a node, and an
+/// expression with no `||` never enters the loop.
+fn blr_expr_concat(t: &[ETok], p: &mut usize) -> Option<fire_crab_ods::expr::Expr> {
+    use fire_crab_ods::expr::Expr;
+    let mut left = blr_expr_add(t, p)?;
+    while matches!(t.get(*p), Some(ETok::Concat)) {
+        *p += 1;
+        left = Expr::Concat(Box::new(left), Box::new(blr_expr_add(t, p)?));
+    }
+    Some(left)
 }
 
 fn blr_expr_add(t: &[ETok], p: &mut usize) -> Option<fire_crab_ods::expr::Expr> {
@@ -22175,6 +22237,10 @@ fn expr_value_to_fid(e: &fire_crab_ods::expr::Expr) -> Option<fire_crab_ods::exp
         Expr::IntLiteral(_) | Expr::Int64Literal(_) | Expr::TextLiteral(_) | Expr::NullLiteral => {
             e.clone()
         }
+        Expr::Concat(l, r) => Expr::Concat(
+            Box::new(expr_value_to_fid(l)?),
+            Box::new(expr_value_to_fid(r)?),
+        ),
         Expr::Add(l, r) => Expr::Add(
             Box::new(expr_value_to_fid(l)?),
             Box::new(expr_value_to_fid(r)?),
@@ -63704,6 +63770,24 @@ fn eval_psql_expr(e: &fire_crab_ods::expr::Expr, f: &PsqlFrame) -> Result<Value,
             Some(t) => Ok(Value::Int(t.action as i64)),
             None => Err(PsqlStop::Unsupported),
         },
+        // A CONCATENATION, evaluated the way the engine evaluates one:
+        // NULL on either side is NULL, and a CHAR operand keeps its
+        // blank padding (that padding is part of the value - see
+        // [render_dyn_text]).
+        E::Concat(a, b) => match (eval_psql_expr(a, f)?, eval_psql_expr(b, f)?) {
+            (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+            (x, y) => {
+                let part = |v: &Value| match v {
+                    Value::Text(t) => Some(t.clone()),
+                    Value::Int(n) => Some(n.to_string()),
+                    _ => None,
+                };
+                match (part(&x), part(&y)) {
+                    (Some(l), Some(r)) => Ok(Value::Text(format!("{}{}", l, r))),
+                    _ => Err(PsqlStop::Unsupported),
+                }
+            }
+        },
         E::Add(a, b) => bin(a, b, |x, y| x.checked_add(y)),
         E::Subtract(a, b) => bin(a, b, |x, y| x.checked_sub(y)),
         E::Multiply(a, b) => bin(a, b, |x, y| x.checked_mul(y)),
@@ -65437,6 +65521,9 @@ fn render_psql_expr(e: &fire_crab_ods::expr::Expr, f: &PsqlFrame) -> Option<Stri
         E::Field { name, .. } => name.clone(),
         E::DomainValue => return None, // never appears in a PSQL body
         E::TriggerAction => return None, // never appears in a PSQL body
+        E::Concat(a, b) => {
+            format!("({} || {})", render_psql_expr(a, f)?, render_psql_expr(b, f)?)
+        }
         E::Add(a, b) => format!("({} + {})", render_psql_expr(a, f)?, render_psql_expr(b, f)?),
         E::Subtract(a, b) => format!("({} - {})", render_psql_expr(a, f)?, render_psql_expr(b, f)?),
         E::Multiply(a, b) => format!("({} * {})", render_psql_expr(a, f)?, render_psql_expr(b, f)?),

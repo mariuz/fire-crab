@@ -17,6 +17,8 @@ const BLR_LITERAL: u8 = 21;
 const BLR_LONG: u8 = 8;
 const BLR_FIELD: u8 = 23;
 const BLR_ADD: u8 = 34;
+/// `blr_concatenate` - probed from the engine's own trigger BLR
+const BLR_CONCATENATE: u8 = 39;
 const BLR_SUBTRACT: u8 = 35;
 const BLR_MULTIPLY: u8 = 36;
 const BLR_DIVIDE: u8 = 37;
@@ -71,6 +73,11 @@ pub enum Expr {
     /// answers None for this node, so a CHECK carrying one refuses as
     /// it always did, and the BLR below is never stored.
     TextLiteral(String),
+    /// `blr_concatenate` (39), prefix and binary - GOLD-PINNED from an
+    /// engine-created trigger (`'a' || NEW.V` is `01 27 15 0F 0000 0100
+    /// 61 17 01 01 56 ...`: assignment, concatenate, the text literal,
+    /// then the field).
+    Concat(Box<Expr>, Box<Expr>),
     Add(Box<Expr>, Box<Expr>),
     Subtract(Box<Expr>, Box<Expr>),
     Multiply(Box<Expr>, Box<Expr>),
@@ -144,6 +151,7 @@ impl Expr {
                 out.extend_from_slice(&(t.len() as u16).to_le_bytes());
                 out.extend_from_slice(t.as_bytes());
             }
+            Expr::Concat(l, r) => Self::binop(out, BLR_CONCATENATE, l, r),
             Expr::Add(l, r) => Self::binop(out, BLR_ADD, l, r),
             Expr::Subtract(l, r) => Self::binop(out, BLR_SUBTRACT, l, r),
             Expr::Multiply(l, r) => Self::binop(out, BLR_MULTIPLY, l, r),
@@ -216,7 +224,8 @@ impl Expr {
             // a draw names a GENERATOR, not a column
             | Expr::GenId2 { .. } => {}
             Expr::GenId { step, .. } => step.collect_refs(refs),
-            Expr::Add(l, r)
+            Expr::Concat(l, r)
+            | Expr::Add(l, r)
             | Expr::Subtract(l, r)
             | Expr::Multiply(l, r)
             | Expr::Divide(l, r) => {

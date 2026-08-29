@@ -1238,6 +1238,43 @@ for retrieval (its itype is unknown to the index-op reader) and an
 INSERT into a table carrying one still refuses — pre-existing, and the
 reason the gate's fixture has no index.
 
+**COMPILING A TEXT BODY — DONE 2026-08-29 (`serve-real-trigtext` 14 →
+16).** The asymmetry the two slices before this one left: a body that
+builds a string RAN here but could not be CREATED here, and creating
+triggers is what a client does. `CREATE TRIGGER` refused every body
+carrying a text literal, on a comment that had gone stale — "the
+emitter's shape for `blr_literal blr_text` has never been held against
+the engine's".
+
+It has now. Probed out of engine-written TRIGGER BLR, not reasoned
+about: a literal is `blr_literal blr_text2 <charset u16> <len u16>
+<bytes>` with charset NONE (which is what `ods` had emitted all along,
+gold-pinned from a CHECK), and a concatenation is `blr_concatenate`
+(39) in prefix form. `Expr::Concat` carries it, `||` lexes and parses
+BELOW `+ -` (the engine's precedence, so `'a' || 1 + 2` is `'a' || 3`),
+and the gate compares fire-crab's stored bytes with the engine's for a
+literal, a concatenation, and a three-way join over a CHAR column: all
+byte-identical, and the ENGINE RUNS what this server compiled.
+
+The column gate moved with it. A trigger body's references were INT-ONLY
+— a plain SMALLINT/INTEGER/BIGINT — which is why a text body refused
+even once the value shapes were right; `body_col_class` takes the
+integer family and TEXT now, and still refuses a scaled numeric, a date
+or a blob, so a body naming one is interpreted or refused rather than
+stored under BLR nobody has held against the engine's.
+
+Adding a variant to the shared `Expr` enum surfaced TWELVE exhaustive
+matches across `ods` and `wire`, each answered with what a
+CONCATENATION IS in that context rather than a copied default: it has no
+integer rank (so the INT-ONLY surfaces keep refusing one), it IS text
+whatever its operands are, it walks both sides like the arithmetic
+nodes, and it evaluates with NULL-on-either-side-is-NULL.
+
+RECORDED BOUNDARY: a body that DECLARES a text variable is still not
+compiled — the declaration needs a shape this server has not probed, and
+the engine writes a dependency row on the CHARACTER SET for one. Such a
+body still RUNS when the engine created it.
+
 **A BODY CONDITION THE PLANNER ANSWERS — DONE 2026-08-29
 (`serve-real-trigtext` 10 → 14, `serve-real-ddltrigger`'s recorded
 policy refusal became a comparison).** The other half of the body
