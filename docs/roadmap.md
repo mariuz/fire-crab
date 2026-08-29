@@ -3041,6 +3041,68 @@ pointer-page and TIP page numbers is the next step when it dominates.
 
 ## Next, in order
 
+- **THE TEMPORAL CLUSTER DONE (2026-08-29, `serve-real-temporal2` 69):**
+  five defects, two of them the worst kind - a value that LOOKS right.
+  **DATEADD OVER A ZONED OPERAND ANSWERED A PLAUSIBLE LIE.** `eval`'s
+  DateAdd arm decomposed Date/Time/Timestamp and sent everything else to
+  `_ => Ok(Value::Null)` under the comment "type-checked away" - but
+  `type_of` accepts EVERY TKind, the zoned ones included. The NULL then
+  travelled under a NOT NULL describe: the encoder omitted the bytes and
+  the client decoded their absence as `1858-11-16 00:01:00.0000 -23:59`,
+  the Modified Julian Day epoch with zone id 0. It reads as a timestamp
+  rather than as a missing value, which is exactly why it survived -
+  EVERY DATEADD over a TIMESTAMP WITH TIME ZONE answered it, for every
+  part and every amount. DATEDIFF over a zoned pair answered a constant
+  0 from the same omission.
+  THE LAWS, measured: DATEADD's result is the operand's own type, the
+  arithmetic runs on the STORED UTC halves under ordinary zoneless
+  calendar rules, and the zone id rides through UNCHANGED. DATEDIFF
+  measures the UTC INSTANT and never the wall clock - the same wall
+  clock under different offsets is NONZERO (-3 HOUR between +02:00 and
+  +05:00) while the same instant under different zones is 0, which is
+  the pair of checks that distinguishes the two models. The decisive
+  evidence for DATEADD is on a RULED zone, where the models differ:
+  `DATEADD(DAY, 1, '2024-03-30 12:00 Europe/Berlin')` is 03-31 13:00,
+  twenty-four hours of INSTANT across the DST step, which local-field
+  arithmetic cannot produce. (fire-crab refuses ruled-zone literals, so
+  that one is the engine's measurement alone; every fixed-offset probe
+  passes under either hypothesis and the implementation follows the
+  measured law. Recorded as such.)
+  The part-legality corollaries had to land in the SAME change: a TIME
+  WITH TIME ZONE takes only the clock parts, exactly as a zoneless TIME
+  does, and without widening those tests the new arms would have
+  answered a WRONG VALUE for `DATEADD(DAY, .., <ttz>)` rather than the
+  NULL they used to - a strictly worse outcome.
+  **THE SHAPE OF A TEMPORAL DIFFERENCE.** `result_scale` already knew
+  it; the width, the rank and the sub_type did not. `DATE - DATE`
+  announced INT64 len 8 for a 4-byte LONG, and both scaled differences
+  announced sub_type 0 where the engine says NUMERIC's 1. The width
+  error CASCADED - `rank_of` found no numeric rank on either operand,
+  fell to its `(None, None)` default of Long, Sub widened to I64, and
+  `* 2` promoted to INT128 where the engine stays INT64. All four now
+  read ONE classifier (`temporal_diff_shape`) so they cannot drift apart
+  again.
+  **A TEMPORAL RENDERED AS TEXT HAS A NATURAL WIDTH** - DATE 10, TIME
+  13, TIMESTAMP 25 - where every implicit conversion fell into the 32765
+  catch-all. It contributes a WIDTH but NO CHARSET; the text operand
+  alone decides that. Mid-fix, adding it as a trailing catch-all fixed
+  the LITERALS and left every COLUMN at 32765, because a temporal column
+  has its own earlier `Expr::Col` arm - so the test is now the FIRST
+  thing `text_form` does. The string functions then split, and not the
+  way one would guess: UPPER, LOWER, TRIM and SUBSTRING over a temporal
+  announce charset ASCII (re-announced as the attachment's under a real
+  one), while LEFT, RIGHT, REVERSE, LPAD and REPLACE announce NONE and
+  STAY NONE under UTF8. Both families are gated, since the rule is not
+  uniform and the second was already right.
+  Closes hunt findings 7, 8, 23, 24, 26 and the sub_type half of 25.
+  SPLIT OUT DELIBERATELY: the Nullable half of finding 25 is NOT
+  temporal. `SELECT 1 FROM T GROUP BY 1` and `SELECT ID+1 FROM T GROUP
+  BY 1` are Nullable here and not on the engine, while a grouped plain
+  FIELD is correct on both - `plan_group` never calls
+  `mark_not_null_cols`, unlike every Project and Join site. That moves
+  the describe of EVERY grouped statement and wants its own change and
+  its own sweep.
+
 - **CONCATENATING ACROSS CHARACTER SETS DONE (2026-08-29,
   `serve-real-concatcs` 44):** `eval` joins two rendered strings and has
   no descriptors to convert against, so an operand whose charset

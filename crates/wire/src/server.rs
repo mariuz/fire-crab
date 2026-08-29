@@ -15113,6 +15113,10 @@ fn result_width_bytes(e: &Expr, descs: &[Descriptor]) -> u8 {
             }
         }
         Expr::Func(SysFn::Round | SysFn::Trunc, args) => result_width_bytes(&args[0], descs),
+        // a temporal difference's own width - see [temporal_diff_shape]
+        _ if temporal_diff_shape(e, descs).is_some() => {
+            temporal_diff_shape(e, descs).map_or(8, |(w, _)| w)
+        }
         _ => {
             if e.is_wide(descs) {
                 16
@@ -15125,6 +15129,38 @@ fn result_width_bytes(e: &Expr, descs: &[Descriptor]) -> u8 {
 
 /// The (wire, sql_type, length) an exact-numeric width in bytes travels
 /// as - a SHORT rides a 32-bit slot, as `Wire::Int32` does for SMALLINT.
+/// A TEMPORAL DIFFERENCE's shape, or `None` when this is not one.
+///
+/// `<temporal> - <temporal>` is an exact numeric whose width, scale,
+/// rank and sub_type all follow from WHICH temporals: a DATE pair
+/// answers days as a 4-byte LONG at scale 0 sub_type 0, a TIME-family
+/// pair seconds as a 4-byte LONG at scale -4 sub_type 1 (NUMERIC), and
+/// any pair containing a TIMESTAMP days as an 8-byte INT64 at scale -9
+/// sub_type 1 (all measured; the shape does not depend on where the
+/// operands came from - literals, columns, CASTs, CURRENT_*, MAX()-MIN()
+/// all give it).
+///
+/// [Expr::result_scale] already had this rule and the other three did
+/// not, so a DATE difference announced INT64 len 8 instead of LONG len 4
+/// and both scaled differences announced sub_type 0. The width error
+/// CASCADED - rank_of saw no temporal operands, fell to its (None, None)
+/// default, and `(DATE - DATE) * 2` promoted to INT128 where the engine
+/// stays INT64 - which is why all four now read this one classifier.
+fn temporal_diff_shape(e: &Expr, descs: &[Descriptor]) -> Option<(u8, i16)> {
+    let Expr::Bin(a, ArithOp::Sub, b) = e else { return None };
+    let (Some(ExprType::Temporal(x)), Some(ExprType::Temporal(y))) =
+        (a.type_of(descs), b.type_of(descs))
+    else {
+        return None;
+    };
+    let timey = |k| matches!(k, TKind::Time | TKind::TimeTz);
+    Some(match (x, y) {
+        (TKind::Date, TKind::Date) => (4, 0),
+        (p, q) if timey(p) && timey(q) => (4, 1),
+        _ => (8, 1),
+    })
+}
+
 fn exact_width_form(bytes: u8) -> (Wire, i32, i32) {
     match bytes {
         2 => (Wire::Int32, 500, 2),
@@ -15151,6 +15187,13 @@ fn numeric_subtype(e: &Expr, descs: &[Descriptor]) -> i16 {
             .filter(|d| exact_dtype_bytes(d.dtype).is_some())
             .map_or(0, |d| d.sub_type),
         Expr::Neg(a) => numeric_subtype(a, descs),
+        // a temporal difference carries its own family code, and it is
+        // NOT a blanket 1: a DATE pair is 0, and this function is called
+        // for Int-typed expressions too - which is exactly the path a
+        // DATE difference takes
+        _ if temporal_diff_shape(e, descs).is_some() => {
+            temporal_diff_shape(e, descs).map_or(0, |(_, st)| st)
+        }
         Expr::Bin(a, _, b) => numeric_subtype(a, descs).max(numeric_subtype(b, descs)),
         Expr::Coalesce(v) => v.iter().map(|x| numeric_subtype(x, descs)).max().unwrap_or(0),
         // NULLIF's value IS its first operand - the second one only
@@ -15383,6 +15426,38 @@ fn text_form_m(
         }
         _ => None,
     };
+    // A TEMPORAL CONVERTED TO TEXT HAS A NATURAL WIDTH. Without one,
+    // every implicit conversion fell into the 32765 catch-all: `<DATE>
+    // || ''` announced a 32765-byte column for ten characters. The
+    // widths are the RENDERED forms (measured): DATE 10, TIME 13,
+    // TIMESTAMP 25, and the zoned forms are the base plus a space plus
+    // the widest zone name - TIME WITH TIME ZONE 46, TIMESTAMP WITH TIME
+    // ZONE 58. That TIMESTAMP is 25 and not the 24 it renders is a
+    // DECLARED width one greater, which `CAST(<ts> AS CHAR(25))` padding
+    // with a single blank confirms.
+    //
+    // The temporal contributes a WIDTH but NO CHARSET - it announces
+    // NONE and the text operand alone decides the result's, so `<DATE>
+    // || <UTF8 col>` is UTF8 while `<DATE> || ''` under a NONE
+    // attachment is NONE (both measured).
+    //
+    // THIS TEST COMES FIRST because a temporal COLUMN has its own
+    // `Expr::Col` arm below, which answers None for a non-text
+    // descriptor; as a trailing catch-all this fixed the literals and
+    // left every column still announcing 32765 (measured, mid-fix).
+    if let Some(ExprType::Temporal(k)) = e.type_of(descs) {
+        return Some((
+            true,
+            match k {
+                TKind::Date => 10,
+                TKind::Time => 13,
+                TKind::Timestamp => 25,
+                TKind::TimeTz => 46,
+                TKind::TimestampTz => 58,
+            },
+            TfCs::Ttype(0),
+        ));
+    }
     match e {
         Expr::Str(s) => Some((false, lit_w(s), TfCs::Att)),
         // an EXPLICIT collation changes no VALUE and no WIDTH - the
@@ -15518,10 +15593,32 @@ fn text_form_m(
                 Some(Expr::Int(n)) if *n >= 0 => Some(*n as i32),
                 _ => None,
             };
+            // A TEMPORAL operand keeps its natural WIDTH through these
+            // functions but is announced ASCII, not NONE - and only
+            // through SOME of them. Measured, over a DATE and a
+            // TIMESTAMP: UPPER, LOWER, TRIM and SUBSTRING answer charset
+            // 2 SYSTEM.ASCII (re-announced as the attachment's under a
+            // real one - UPPER(<date>) is 40/UTF8 under -ch UTF8), while
+            // LEFT, RIGHT, REVERSE, LPAD and REPLACE answer charset 0
+            // NONE and STAY NONE under UTF8. Not a uniform rule, so it
+            // is applied only to the four that were measured to take it.
+            let ascii_over_temporal = |i: usize, r: Option<(bool, i32, TfCs)>| {
+                let temporal = args
+                    .get(i)
+                    .is_some_and(|a| matches!(a.type_of(descs), Some(ExprType::Temporal(_))));
+                match (temporal, r) {
+                    (true, Some((v, w, _))) => {
+                        Some((v, w, TfCs::Ttype(fire_crab_ods::intl::CS_ASCII as i32)))
+                    }
+                    (_, r) => r,
+                }
+            };
             match f {
                 SysFn::GetContext => Some((true, 255, TfCs::Att)), // VARCHAR(255), probed
-                SysFn::Upper | SysFn::Lower | SysFn::UpperCs(_) | SysFn::LowerCs(_) | SysFn::UpperColl(_) | SysFn::LowerColl(_) => arg(0),
-                SysFn::Trim(_) => arg(1).map(|(_, w, c)| (true, w, c)),
+                SysFn::Upper | SysFn::Lower | SysFn::UpperCs(_) | SysFn::LowerCs(_) | SysFn::UpperColl(_) | SysFn::LowerColl(_) => {
+                    ascii_over_temporal(0, arg(0))
+                }
+                SysFn::Trim(_) => ascii_over_temporal(1, arg(1).map(|(_, w, c)| (true, w, c))),
                 SysFn::Left | SysFn::Right | SysFn::Reverse => {
                     arg(0).map(|(_, w, c)| (true, w, c))
                 }
@@ -15540,7 +15637,8 @@ fn text_form_m(
                     // the FROM offset does not shrink it)
                     (Some((_, w, c)), Some(n)) => Some((true, n.min(w), c)),
                     _ => None,
-                },
+                }
+                .and_then(|r| ascii_over_temporal(0, Some(r))),
                 // REPLACE is VARYING at the width the engine computes
                 // from how much longer each replacement is than what it
                 // replaces (probed: VARCHAR(4) with 'a'->'zz' is 8,
@@ -55764,7 +55862,8 @@ fn temporal_shift(
             if neg {
                 n = -n;
             }
-            dateadd_impl(ExtractPart::Day, n, d as i32, u as u32, k)
+            // a DATE +/- <number>: zoneless by construction
+            dateadd_impl(ExtractPart::Day, n, d as i32, u as u32, k, 0)
         }
         TKind::Time => {
             let mut delta = units(10_000)?;
@@ -55794,6 +55893,7 @@ fn dateadd_impl(
     days: i32,
     units: u32,
     kind: TKind,
+    zone: u16,
 ) -> Result<Value, EvalErr> {
     use ExtractPart::*;
     let (mut d, mut u) = (days as i64, units as i64);
@@ -55825,8 +55925,11 @@ fn dateadd_impl(
             return Err(EvalErr::ConversionError(None))
         }
     }
-    // the engine's valid date range
-    if !matches!(kind, TKind::Time) {
+    // the engine's valid date range. A TIME-FAMILY value has no date
+    // to range-check - zoned or not - while a zoned TIMESTAMP must
+    // still raise when the result leaves the range, so the exemption is
+    // on the TIME-ness and not on the zone-ness.
+    if !matches!(kind, TKind::Time | TKind::TimeTz) {
         let (y, _, _) = civil_of(d as i32);
         if !(1..=9999).contains(&y) || i32::try_from(d).is_err() {
             return Err(EvalErr::ConversionError(None));
@@ -55836,7 +55939,9 @@ fn dateadd_impl(
         TKind::Date => Value::Date(d as i32),
         TKind::Time => Value::Time(u as u32),
         TKind::Timestamp => Value::Timestamp(d as i32, u as u32),
-        TKind::TimeTz | TKind::TimestampTz => return Err(EvalErr::Unsupported),
+        // the zone rides through unchanged - see the note at the call
+        TKind::TimeTz => Value::TimeTz(u as u32, zone),
+        TKind::TimestampTz => Value::TimestampTz(d as i32, u as u32, zone),
     })
 }
 
@@ -56948,8 +57053,17 @@ impl Expr {
                             ExprType::Temporal(k),
                         ) => {
                             use ExtractPart::*;
+                            // a TIME-family operand takes ONLY the clock
+                            // parts, zoned or not (measured: the engine
+                            // raises 42000 "Only HOUR, MINUTE, SECOND and
+                            // MILLISECOND can be added to TIME values in
+                            // DATEADD" for a TIME WITH TIME ZONE too).
+                            // Without TimeTz here the tz arms above would
+                            // have answered a WRONG VALUE for DATEADD(DAY,
+                            // .., <ttz>) rather than the NULL they used to
+                            // - the fix has to land with them.
                             let ok = match k {
-                                TKind::Time => {
+                                TKind::Time | TKind::TimeTz => {
                                     matches!(unit, Hour | Minute | Second | Millisecond)
                                 }
                                 _ => !matches!(unit, Weekday | Yearday),
@@ -56963,9 +57077,17 @@ impl Expr {
                     SysFn::DateDiff(unit) => match (ts[0], ts[1]) {
                         (ExprType::Temporal(a), ExprType::Temporal(b)) => {
                             use ExtractPart::*;
-                            let time_pair =
-                                matches!(a, TKind::Time) && matches!(b, TKind::Time);
-                            let datey = |k| !matches!(k, TKind::Time);
+                            // ... and the same for DATEDIFF: a TIME pair,
+                            // zoned or not, expresses only the clock parts
+                            // (the engine's 42000 "The result of
+                            // TIME-<value> in DATEDIFF cannot be expressed
+                            // in YEAR, MONTH, DAY or WEEK"). The clock
+                            // parts MUST stay legal on a zoned pair - the
+                            // engine answers them - so this widens the
+                            // pair test rather than narrowing it.
+                            let timey = |k| matches!(k, TKind::Time | TKind::TimeTz);
+                            let time_pair = timey(a) && timey(b);
+                            let datey = |k| !timey(k);
                             let valid = if time_pair {
                                 matches!(unit, Hour | Minute | Second | Millisecond)
                             } else if datey(a) && datey(b) {
@@ -57338,6 +57460,21 @@ impl Expr {
             }),
             Expr::Null => None, // takes the sibling's rank in Bin below
             Expr::Neg(e) => e.rank_of(descs),
+            // A TEMPORAL DIFFERENCE HAS ITS OWN RANK, and getting it
+            // from the operands is impossible - a temporal has no
+            // numeric rank, so both sides answered None, the
+            // `(None, None)` line below assumed Long, Sub widened it to
+            // I64 and an enclosing `* 2` promoted to INT128 where the
+            // engine stays INT64. The rank has to come from the same
+            // classifier as the width ([temporal_diff_shape]), or the
+            // cascade contradicts the seed.
+            _ if temporal_diff_shape(self, descs).is_some() => {
+                temporal_diff_shape(self, descs).map(|(w, _)| match w {
+                    4 => NumRank::Long,
+                    8 => NumRank::I64,
+                    _ => NumRank::I128,
+                })
+            }
             Expr::Bin(a, op, b) => {
                 let (ra, rb) = match (a.rank_of(descs), b.rank_of(descs)) {
                     (Some(x), Some(y)) => (x, y),
@@ -58393,19 +58530,52 @@ impl Expr {
                 match f {
                     SysFn::DateAdd(unit) => {
                         let amount = fn_int(&vs[0])?;
-                        let (d, u, kind) = match vs[1] {
-                            Value::Date(d) => (d, 0, TKind::Date),
-                            Value::Time(t) => (0, t, TKind::Time),
-                            Value::Timestamp(d, t) => (d, t, TKind::Timestamp),
-                            _ => return Ok(Value::Null), // type-checked away
+                        // The tz variants were NOT "type-checked away":
+                        // `type_of` accepts every TKind, the zoned ones
+                        // included, so this default answered NULL under a
+                        // NOT-NULL describe. The row encoder then omitted
+                        // the bytes and the client decoded the absence as
+                        // 1858-11-16 00:01:00.0000 -23:59 - the Modified
+                        // Julian Day epoch with zone id 0 - which reads
+                        // as a plausible timestamp rather than as the
+                        // missing value it is. Every DATEADD over a
+                        // TIMESTAMP WITH TIME ZONE answered that.
+                        //
+                        // The STORED UTC halves go straight in, exactly as
+                        // the zoneless arms do, and the zone id rides
+                        // through UNCHANGED: the engine's arithmetic is on
+                        // the instant, not on the local fields (measured
+                        // on a ruled zone, where the two differ -
+                        // DATEADD(DAY, 1, '2024-03-30 12:00 Europe/Berlin')
+                        // is 03-31 13:00, i.e. 24 hours of instant across
+                        // the DST step, which local-field arithmetic
+                        // cannot produce).
+                        let (d, u, kind, zone) = match vs[1] {
+                            Value::Date(d) => (d, 0, TKind::Date, 0),
+                            Value::Time(t) => (0, t, TKind::Time, 0),
+                            Value::Timestamp(d, t) => (d, t, TKind::Timestamp, 0),
+                            Value::TimeTz(t, z) => (0, t, TKind::TimeTz, z),
+                            Value::TimestampTz(d, t, z) => (d, t, TKind::TimestampTz, z),
+                            _ => return Ok(Value::Null),
                         };
-                        dateadd_impl(*unit, amount, d, u, kind)?
+                        dateadd_impl(*unit, amount, d, u, kind, zone)?
                     }
                     SysFn::DateDiff(unit) => {
+                        // ... and the same omission here answered a
+                        // constant 0 for every zoned pair. The zone id is
+                        // DISCARDED on purpose: DATEDIFF measures the UTC
+                        // INSTANT, never the wall clock (measured: the
+                        // same wall clock under different offsets is
+                        // NONZERO - '12:00 +02:00' to '12:00 +05:00' is
+                        // -3 HOUR - while the same instant under different
+                        // zones is 0), and the stored halves already ARE
+                        // the UTC ones.
                         let dt = |v: &Value| match v {
                             Value::Date(d) => Some((*d as i64, 0i64)),
                             Value::Time(t) => Some((0, *t as i64)),
                             Value::Timestamp(d, t) => Some((*d as i64, *t as i64)),
+                            Value::TimeTz(t, _) => Some((0, *t as i64)),
+                            Value::TimestampTz(d, t, _) => Some((*d as i64, *t as i64)),
                             _ => None,
                         };
                         match (dt(&vs[0]), dt(&vs[1])) {
@@ -83515,29 +83685,29 @@ mod tests {
         // month-end clamping (probed): +1 MONTH on Jan 31 lands on the
         // leap day; +1 YEAR on the leap day clamps to Feb 28
         assert!(matches!(
-            dateadd_impl(ExtractPart::Month, 1, day(2024, 1, 31), 0, TKind::Date),
+            dateadd_impl(ExtractPart::Month, 1, day(2024, 1, 31), 0, TKind::Date, 0),
             Ok(Value::Date(d)) if d == day(2024, 2, 29)
         ));
         assert!(matches!(
-            dateadd_impl(ExtractPart::Year, 1, day(2024, 2, 29), 0, TKind::Date),
+            dateadd_impl(ExtractPart::Year, 1, day(2024, 2, 29), 0, TKind::Date, 0),
             Ok(Value::Date(d)) if d == day(2025, 2, 28)
         ));
         assert!(matches!(
-            dateadd_impl(ExtractPart::Day, -1, day(2024, 3, 1), 0, TKind::Date),
+            dateadd_impl(ExtractPart::Day, -1, day(2024, 3, 1), 0, TKind::Date, 0),
             Ok(Value::Date(d)) if d == day(2024, 2, 29)
         ));
         // a TIME wraps around midnight; a DATE absorbs clock units by
         // truncation (25 hours moves one day)
         assert!(matches!(
-            dateadd_impl(ExtractPart::Hour, 2, 0, 23 * 3_600 * 10_000 + 30 * 60 * 10_000, TKind::Time),
+            dateadd_impl(ExtractPart::Hour, 2, 0, 23 * 3_600 * 10_000 + 30 * 60 * 10_000, TKind::Time, 0),
             Ok(Value::Time(t)) if t == 3_600 * 10_000 + 30 * 60 * 10_000
         ));
         assert!(matches!(
-            dateadd_impl(ExtractPart::Hour, 25, day(2024, 1, 1), 0, TKind::Date),
+            dateadd_impl(ExtractPart::Hour, 25, day(2024, 1, 1), 0, TKind::Date, 0),
             Ok(Value::Date(d)) if d == day(2024, 1, 2)
         ));
         // out of the engine's date range raises
-        assert!(dateadd_impl(ExtractPart::Year, 9000, day(2024, 1, 1), 0, TKind::Date).is_err());
+        assert!(dateadd_impl(ExtractPart::Year, 9000, day(2024, 1, 1), 0, TKind::Date, 0).is_err());
 
         // DATEDIFF: calendar components for YEAR/MONTH, truncating
         // day-diff/7 for WEEK, boundary crossings for the clock units,
