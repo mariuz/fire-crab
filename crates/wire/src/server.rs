@@ -40044,6 +40044,90 @@ fn plan_query_inner_ctx(
                         }
                     }
                 }
+                // ... AND AN EXPRESSION COLUMN FOLLOWS THE ORDINARY RULE,
+                // which nothing here was applying. Every Project and Join
+                // site calls `mark_not_null_cols`; this one had only the
+                // plain-key rule above, so a grouped select list marked
+                // every EXPRESSION nullable - `SELECT 1 FROM T GROUP BY 1`
+                // and `SELECT ID+1 FROM T GROUP BY 1` both described
+                // Nullable where the engine does not, while a grouped
+                // plain FIELD was already right. It surfaced as the
+                // "all-literal temporal difference" half of a temporal
+                // report and is not temporal at all.
+                //
+                // Only the columns carrying an EXPRESSION are touched: a
+                // grouped plan's `field_id` can be a synthetic slot past
+                // the real fields (the gen_base convention), so the
+                // plain-column half of `mark_not_null_cols` cannot be
+                // reused here - the key rule above is what covers those,
+                // and the folds keep their own (COUNT never null, the
+                // rest nullable).
+                let is_nn = |fid: usize| nn.contains(&fid);
+                // ... but ONLY for an expression that reads no FOLD.
+                // A fold's output lives in a SYNTHETIC SLOT past
+                // `synth_base`, which is not a real field and so is
+                // absent from `not_null_fids` - `expr_nullable` therefore
+                // calls it nullable, which is wrong for the folds that
+                // never answer NULL. COUNT is one; so is the whole
+                // VAR/STDDEV/REGR family, which answers 0 over an empty
+                // or single-row group. Marking those Nullable did not
+                // merely mis-describe them: `VAR_SAMP` over one row
+                // started answering <null> where the engine answers
+                // 0.000000000000000 (serve-real-statexpr). The folds keep
+                // their own rule, which is what the key-only pass above
+                // was protecting.
+                // A FOLD'S SLOT IS POSITIONAL - `GItem::Agg` carries no
+                // field id, it is indexed by its place in `gitems` - so
+                // it is NOT always past `synth_base` (which is the base
+                // for expression KEYS). Testing only against synth_base
+                // let `VAR_SAMP(N) + 1` through and re-broke statexpr.
+                let agg_slots: std::collections::HashSet<usize> = gitems
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, gi)| matches!(gi, GItem::Agg(..)))
+                    .map(|(i, _)| i)
+                    .collect();
+                let reads_fold =
+                    |e: &Expr| expr_reads(e, &|fid| fid >= synth_base || agg_slots.contains(&fid));
+                for c in cols.iter_mut() {
+                    if let Some(e) = &c.expr {
+                        if reads_fold(e) {
+                            continue;
+                        }
+                        if expr_nullable(e, &is_nn) {
+                            c.sql_type |= 1;
+                        } else {
+                            c.sql_type &= !1;
+                        }
+                    }
+                }
+                // An EXPRESSION GROUP KEY needs the same rule but cannot
+                // be reached the same way: `build_group_items` builds its
+                // column through `build_expr_col` and then deliberately
+                // clears `expr`, so the output column "reads plainly"
+                // from the synthetic slot the group row carries. The
+                // expression itself survives in `key_exprs`, indexed by
+                // the slot's offset past `synth_base` - which is how
+                // `SELECT 1 ... GROUP BY 1` and `SELECT ID+1 ... GROUP BY
+                // 1`, the two shapes that exposed this, get their bit.
+                for (pos, gi) in gitems.iter().enumerate() {
+                    if let GItem::Key(fid) = gi {
+                        if *fid >= synth_base {
+                            if let (Some(c), Some(e)) =
+                                (cols.get_mut(pos), key_exprs.get(*fid - synth_base))
+                            {
+                                if reads_fold(e) {
+                                    continue;
+                                }
+                                if expr_nullable(e, &is_nn) {
+                                    c.sql_type |= 1;
+                                } else {
+                                    c.sql_type &= !1;
+                                }
+                            }
+                        }
+                    }
+                }
             }
             Some(Plan::Group {
                 rel,

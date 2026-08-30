@@ -3041,6 +3041,36 @@ pointer-page and TIP page numbers is the next step when it dominates.
 
 ## Next, in order
 
+- **A GROUPED SELECT LIST'S EXPRESSIONS GET THE ORDINARY NULLABLE RULE
+  DONE (2026-08-30, `serve-real-groupconst` 11 -> 29):** `plan_group`
+  had a nullability pass covering only the plain group KEYS, so every
+  grouped EXPRESSION kept the bit `build_expr_col_from` stamped and came
+  back Nullable - `SELECT 1 FROM T GROUP BY 1` and `SELECT <NOT NULL> +
+  1 FROM T GROUP BY 1` both, while a grouped plain FIELD was already
+  right. Every Project and Join site calls `mark_not_null_cols`; this
+  one never did. Reported as the "all-literal temporal difference" half
+  of a temporal finding, and not temporal at all - two non-temporal
+  controls are what identified it.
+  TWO LAYERS. An expression column takes `expr_nullable` directly. An
+  expression GROUP KEY cannot: `build_group_items` builds its column
+  through `build_expr_col` and then deliberately CLEARS `expr`, so the
+  output column reads plainly from the group row's synthetic slot - the
+  expression survives only in `key_exprs`, indexed past `synth_base`.
+  THE REGRESSION THIS CAUSED, and it was not cosmetic. The statistical
+  folds answer 0 rather than NULL and the engine describes them NOT
+  NULL; marking them Nullable made `VAR_SAMP(N) + 1` over an empty set
+  answer **<null>** where the engine answers 0.0, because the announced
+  bit decides whether the bytes are shipped at all. Caught by
+  `serve-real-statexpr` in the sweep.
+  THE FIRST GUARD WAS ALSO WRONG: it skipped expressions reading a slot
+  past `synth_base`, on the assumption that is where folds live.
+  `GItem::Agg` carries no field id at all - a fold's slot is POSITIONAL,
+  its index in `gitems` - so it can sit BELOW `synth_base` and
+  `VAR_SAMP(N) + 1` went straight through. `synth_base` is the base for
+  expression KEYS, which is not the same thing as "everything
+  synthetic". The guard now tests the actual fold positions.
+  Closes the Nullable half of hunt finding 25.
+
 - **THE TEMPORAL CLUSTER DONE (2026-08-29, `serve-real-temporal2` 69):**
   five defects, two of them the worst kind - a value that LOOKS right.
   **DATEADD OVER A ZONED OPERAND ANSWERED A PLAUSIBLE LIE.** `eval`'s
