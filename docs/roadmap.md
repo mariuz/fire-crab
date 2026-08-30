@@ -3041,6 +3041,45 @@ pointer-page and TIP page numbers is the next step when it dominates.
 
 ## Next, in order
 
+- **A CURSOR IS CONSUMED BY ITS FETCH DONE (2026-08-30,
+  `serve-real-fetchdup` NEW, 17):** **ANY result of 500 rows or more was
+  delivered TWICE.** Not a window, not a join, not a sort: a plain
+  `SELECT ID FROM T` with no WHERE and no ORDER BY. Row 1 came back
+  twice and so did row 600; 1200 rows where the engine sends 600.
+  TWO SEPARATE PATHS, and the first fix caught only one.
+  (a) `emit_rows` walks the WHOLE plan and ignores the count the client
+  asked for, but only `Plan::Rows` was emptied afterwards - so a
+  STREAMING plan was re-walked from the start on the next op_fetch.
+  (b) The resumable-cursor route REMOVES the cursor when it reports
+  end-of-cursor, which loses the difference between "never started" and
+  "already drained". fbclient sends one more op_fetch after the end
+  status - it does so from 500 rows up - and, finding no cursor, the
+  server opened a FRESH one and served the entire result again.
+  A JOIN was already safe because it sets `keep_on_done` and therefore
+  RESUMES an exhausted cursor. That asymmetry is the tell: a self-join
+  agreed while the plain scan did not.
+  Both now mark the plan spent on completion, so the extra fetch drains
+  nothing and repeats the end-of-cursor status. Safe across re-execute
+  because `plan` is reassigned then - keeping the CURSOR instead would
+  have broken re-execution, since nothing removes cursors on execute.
+  WHY NOTHING CAUGHT IT, and it is the same reason the windowed
+  six-fold duplication hid: under ONE fetch the answer is correct, and
+  one fetch is every hand-written test in the suite. It is wrong only
+  from the SECOND fetch on. PRE-EXISTING - reproduced on the binary two
+  commits back, so it predates the window work entirely.
+  A METHOD ERROR WORTH RECORDING: I saw this duplication days-of-work
+  earlier, checked it with node-firebird, got the correct row count, and
+  concluded it was an isql rendering artifact. **node-firebird does not
+  send the extra op_fetch, so it cannot observe this defect at all.**
+  Verifying with a client that does not exercise the path is not
+  verification. What settled it was counting occurrences of SPECIFIC
+  rows rather than lines, then instrumenting the server to count fetch
+  invocations: 499 rows is one fetch, 500 is two.
+  The first fix was also verified too narrowly - only on `FIRST n`
+  shapes, which are served by the path it changed - and the gate written
+  afterwards caught the plain scan immediately. Write the gate before
+  declaring the fix done.
+
 - **THE NULLABLE BIT THROUGH A VIEW AND A GROUPED JOIN DONE
   (2026-08-30, `serve-real-nullbit` NEW, 27):** two describe defects,
   and in this server a describe defect of this kind is a VALUE defect -

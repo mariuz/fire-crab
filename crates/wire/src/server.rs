@@ -75912,6 +75912,42 @@ fn after_auth(
                                             if !keep_on_done {
                                                 cursors.remove(&cur_stmt);
                                             }
+                                            // ...AND REMEMBER THAT IT
+                                            // FINISHED. Removing the cursor
+                                            // loses the difference between
+                                            // "never started" and "already
+                                            // drained": a client that sends
+                                            // one more op_fetch after the
+                                            // end-of-cursor status - which
+                                            // fbclient does, from 500 rows
+                                            // upwards - found no cursor,
+                                            // opened a FRESH one, and was
+                                            // served the ENTIRE RESULT A
+                                            // SECOND TIME. Measured on a
+                                            // plain `SELECT ID FROM T` with
+                                            // no WHERE, no ORDER BY and no
+                                            // window: 1200 rows for 600,
+                                            // every row twice. A JOIN was
+                                            // already safe because it sets
+                                            // `keep_on_done` and so resumes
+                                            // an exhausted cursor - which is
+                                            // exactly why a self-join agreed
+                                            // while the plain scan did not.
+                                            //
+                                            // Emptying the plan makes the
+                                            // next fetch take the
+                                            // `Plan::Rows` branch, which
+                                            // drains nothing and answers the
+                                            // end-of-cursor status again.
+                                            // `plan` is reassigned when the
+                                            // statement is executed, so a
+                                            // re-execute still scans.
+                                            if !enc_cols.is_empty() {
+                                                plan = std::rc::Rc::new(Plan::Rows {
+                                                    cols: enc_cols.clone(),
+                                                    rows: Vec::new(),
+                                                });
+                                            }
                                         }
                                         // end of BATCH, rows still to come
                                         None => {
@@ -76222,11 +76258,30 @@ fn after_auth(
                     continue;
                 }
                 emit_rows(&mut w, &*plan, &database, &bound_args, &mut gen_writes, out_fmt.as_ref());
-                // a materialised cursor is CONSUMED by its fetch: the rows
-                // exist once. Re-emitting them on the next fetch is what a
-                // driver's fetch-until-empty loop turns into duplicates.
-                if let Plan::Rows { cols, .. } = &*plan {
-                    plan = std::rc::Rc::new(Plan::Rows { cols: cols.clone(), rows: Vec::new() });
+                // EVERY cursor is CONSUMED by its fetch, not only a
+                // materialised one. `emit_rows` walks the WHOLE plan and
+                // ignores `want`, so after it runs there is nothing left
+                // to deliver - but only `Plan::Rows` was being emptied,
+                // so a STREAMING plan was re-walked from the start on the
+                // next op_fetch and the client received the entire result
+                // A SECOND TIME.
+                //
+                // It needed a result of 500 rows or more to show, because
+                // that is where fbclient stops trusting one response and
+                // sends another op_fetch: 499 rows is one fetch and one
+                // copy, 500 is two fetches and two copies, and every row
+                // is duplicated - measured on `SELECT ID FROM T` with no
+                // WHERE, no ORDER BY and no window anywhere. It predates
+                // the window work entirely (reproduced on the binary two
+                // commits back) and no gate saw it because gates use
+                // small fixtures.
+                //
+                // Emptying the plan makes the next fetch take the
+                // `Plan::Rows` branch above, which drains zero rows and
+                // sends the end-of-cursor status.
+                let spent: Vec<ProjCol> = output_cols_of(&*plan);
+                if !spent.is_empty() {
+                    plan = std::rc::Rc::new(Plan::Rows { cols: spent, rows: Vec::new() });
                 }
                 // a generator-advancing SELECT (NEXT VALUE FOR / GEN_ID in
                 // the select list) writes its generators' final values as
