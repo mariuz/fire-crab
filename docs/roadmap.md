@@ -3041,6 +3041,45 @@ pointer-page and TIP page numbers is the next step when it dominates.
 
 ## Next, in order
 
+- **THE NULLABLE BIT THROUGH A VIEW AND A GROUPED JOIN DONE
+  (2026-08-30, `serve-real-nullbit` NEW, 27):** two describe defects,
+  and in this server a describe defect of this kind is a VALUE defect -
+  the announced bit decides whether a value's bytes go on the wire.
+  (1) **EVERY COLUMN OF A VIEW IS NULLABLE**, whatever its body says.
+  `plan_view` took the body's columns verbatim (`output_cols_of` is a
+  clone) and touched `sql_type` NOWHERE, so a view over a NOT NULL
+  column announced NOT NULL. The engine's rule is UNCONDITIONAL -
+  measured over a plain NOT NULL column, a DOMAIN-typed one, an
+  expression, through a WHERE, view-over-view, aliased, and nested in a
+  derived table - and it agrees with the catalogue, where a view's
+  RDB$RELATION_FIELDS row carries no RDB$NULL_FLAG at all.
+  (2) **A GROUPED JOIN WAS NEVER MARKED AT ALL.** The grouped branch of
+  the join planner returns ~230 lines BEFORE the only
+  `mark_not_null_join` call, so a NOT NULL key came back Nullable while
+  the same query WITHOUT the join was correct. No nested source is
+  needed; plain base tables show it.
+  MEASUREMENT REFUTED THE REPORT, and that is the main lesson. The brief
+  named four "lost bit" shapes - a CAST through a derived table, `N + 0`,
+  a derived joined to a base table, and the CTE form. ALL FOUR AGREE
+  with the engine today. No fix was written for them; they are gated as
+  CONTROLS instead, so a future change that breaks them is caught. A
+  read-only code analysis had traced a plausible mechanism for them and
+  it did not survive contact with the engine.
+  TWO SELF-INFLICTED ERRORS, both caught by the gate's own fences rather
+  than by the sweep. Passing the grouped columns straight to
+  `mark_not_null_join` is wrong: a grouped column's `field_id` indexes
+  the GROUP ROW, not the joined record, so the side lookup is
+  meaningless - right for an INNER join by luck and wrong for an OUTER
+  one, which is precisely the shape that would have shipped a wrong bit.
+  The fix builds a probe from `gitems`, where a plain key's fid IS a
+  combined-record id. Expression keys then needed the same treatment,
+  carried as `key_exprs` so the marker can evaluate them against the
+  join's own predicate.
+  THE INTERACTION, gated: `<view> JOIN <base>` agreed BEFORE either fix
+  and still agrees, because the join side discards a column's bit at the
+  boundary - a fix that made the side CARRY the bit without fixing the
+  view would have broken it.
+
 - **A WINDOWED RESULT LARGER THAN ONE FETCH BATCH DONE (2026-08-30,
   `serve-real-winbatch` NEW, 15):** a bare top-level `SELECT ID,
   ROW_NUMBER() OVER (ORDER BY ID) FROM T` over 5000 rows came back **SIX

@@ -34614,6 +34614,58 @@ fn plan_join_bound(
         {
             return Some(Plan::Refused);
         }
+        // A GROUPED JOIN GETS THE SAME NOT-NULL MARKING AN UNGROUPED
+        // ONE DOES. This branch returns 200-odd lines before the
+        // `mark_not_null_join` call the plain join path makes, so a
+        // grouped join was never marked AT ALL - not even over plain
+        // base tables with no nested source anywhere: `SELECT W.NN,
+        // COUNT(*) FROM W JOIN W2 ... GROUP BY W.NN` announced a NOT
+        // NULL key as Nullable, while the same query without the join
+        // was correct. The marker already honours outer joins (a
+        // LEFT-joined side's key stays Nullable, measured), so it is
+        // the right thing to call rather than a bespoke rule.
+        // The marker reads a column's `field_id` as an index into the
+        // JOINED RECORD, but a grouped column's field_id is a slot in
+        // the GROUP ROW - so it must be asked about the KEY's source
+        // field, which `gitems` carries. A plain key's fid is already a
+        // combined-record id (`synth_base` is where the synthetic
+        // expression slots begin), so a probe column per key is all the
+        // marker needs; the bits then come back by position. Passing
+        // the grouped cols directly happened to be right for an inner
+        // join and wrong for an outer one - a LEFT-joined side's key
+        // must stay Nullable, and the marker only knows that when it is
+        // given the field the key actually reads.
+        let mut cols = cols;
+        {
+            let mut probe: Vec<ProjCol> = cols.clone();
+            for (pos, gi) in gitems.iter().enumerate() {
+                if let (Some(c), GItem::Key(fid)) = (probe.get_mut(pos), gi) {
+                    if *fid < synth_base {
+                        c.field_id = *fid;
+                        c.expr = None;
+                    } else if let Some((_, e)) = key_exprs.get(*fid - synth_base) {
+                        // an EXPRESSION key: the marker already knows how
+                        // to answer for one - it runs `expr_nullable`
+                        // against the join's own not-null predicate - and
+                        // the expression reads combined-record fields,
+                        // which is exactly what that predicate indexes.
+                        // `build_group_items` had stamped it Nullable
+                        // unconditionally, so `<NOT NULL> + 0` grouped
+                        // over a join announced Nullable where the same
+                        // expression grouped without one did not.
+                        c.expr = Some(e.clone());
+                    }
+                }
+            }
+            mark_not_null_join(&mut probe, db, &sides, &parts);
+            for (pos, gi) in gitems.iter().enumerate() {
+                if let GItem::Key(_) = gi {
+                    if let (Some(c), Some(pc)) = (cols.get_mut(pos), probe.get(pos)) {
+                        c.sql_type = (c.sql_type & !1) | (pc.sql_type & 1);
+                    }
+                }
+            }
+        }
         return Some(Plan::JoinGroup {
             base: sides[0].src.clone(),
             base_width: sides[0].descs.len(),
@@ -35654,6 +35706,17 @@ fn plan_view(db: &Option<Database>, dbr: &Database, name: &str) -> Option<(Plan,
     for c in cols.iter_mut() {
         c.relation = Some(name.to_string());
         c.rel_alias = None;
+        // EVERY COLUMN OF A VIEW IS NULLABLE, whatever its body says.
+        // This function took the body's columns verbatim
+        // (`output_cols_of` is a clone) and touched `sql_type` nowhere,
+        // so a view over a NOT NULL column announced NOT NULL where the
+        // engine announces Nullable. Measured unconditional: over a
+        // plain NOT NULL column, over a DOMAIN-typed one, over an
+        // expression, through a WHERE, view-over-view, aliased, and
+        // nested inside a derived table - Nullable in every one. It
+        // matches the catalogue too, since a view's
+        // RDB$RELATION_FIELDS row carries no RDB$NULL_FLAG at all.
+        c.sql_type |= 1;
     }
     // A view NAMES its own columns - `CREATE VIEW V (A, B) AS SELECT
     // ID, SALARY ...` - and the catalog holds those names whether they
