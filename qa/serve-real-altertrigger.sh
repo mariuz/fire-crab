@@ -30,7 +30,7 @@ FBINC="${FBINC:-/opt/firebird/include}"; FBLIB="${FBLIB:-/opt/firebird/lib}"
 mkdir -p "$D"
 fail=0; ran=0
 command -v gcc >/dev/null 2>&1 || { echo "SKIP gcc not found"; exit 0; }
-gcc -O0 -o "$D/sqlerr" "$(dirname "$0")/c/sqlerr.c" -I"$FBINC" -L"$FBLIB" -lfbclient -Wl,-rpath,"$FBLIB" 2>/dev/null || { echo "FAIL compile sqlerr"; exit 1; }
+gcc -O0 -o "$D/sqlerr-$(basename "$0" .sh)" "$(dirname "$0")/c/sqlerr.c" -I"$FBINC" -L"$FBLIB" -lfbclient -Wl,-rpath,"$FBLIB" 2>/dev/null || { echo "FAIL compile sqlerr"; exit 1; }
 make_db() {
     rm -f "$1"
     "$ISQL" -q -b -user "$U" -pas "$P" <<EOF >/dev/null 2>&1 || return 1
@@ -95,8 +95,8 @@ SQL
 e=$(script | "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$REAL:$B" 2>&1 | norm)
 c=$(script | "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$A" 2>&1 | norm)
 check "the DDL and the catalog through each server" "$c" "$e"
-e=$("$D/sqlerr" "127.0.0.1/$REAL:$B" "ALTER TRIGGER NOPE INACTIVE" "DROP TRIGGER NOPE" "ALTER PROCEDURE NOPE AS BEGIN END" "DROP PROCEDURE NOPE" 2>&1 | norm)
-c=$("$D/sqlerr" "127.0.0.1/$PORT:$A" "ALTER TRIGGER NOPE INACTIVE" "DROP TRIGGER NOPE" "ALTER PROCEDURE NOPE AS BEGIN END" "DROP PROCEDURE NOPE" 2>&1 | norm)
+e=$("$D/sqlerr-$(basename "$0" .sh)" "127.0.0.1/$REAL:$B" "ALTER TRIGGER NOPE INACTIVE" "DROP TRIGGER NOPE" "ALTER PROCEDURE NOPE AS BEGIN END" "DROP PROCEDURE NOPE" 2>&1 | norm)
+c=$("$D/sqlerr-$(basename "$0" .sh)" "127.0.0.1/$PORT:$A" "ALTER TRIGGER NOPE INACTIVE" "DROP TRIGGER NOPE" "ALTER PROCEDURE NOPE AS BEGIN END" "DROP PROCEDURE NOPE" 2>&1 | norm)
 check "the missing-object vectors" "$c" "$e"
 # the ENGINE reads fc's catalog: TR2 and the procedures as the engine left its own
 script2() { cat <<'SQL'

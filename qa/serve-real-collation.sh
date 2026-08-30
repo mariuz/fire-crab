@@ -26,7 +26,7 @@ LOG="/tmp/fc-serve-collation-$PORT.log"
 FBINC="${FBINC:-/opt/firebird/include}"; FBLIB="${FBLIB:-/opt/firebird/lib}"
 mkdir -p "$D"; fail=0; ran=0
 command -v gcc >/dev/null 2>&1 || { echo "SKIP gcc not found"; exit 0; }
-gcc -O0 -o "$D/sqlerr" "$(dirname "$0")/c/sqlerr.c" -I"$FBINC" -L"$FBLIB" -lfbclient -Wl,-rpath,"$FBLIB" 2>/dev/null || { echo "FAIL compile sqlerr"; exit 1; }
+gcc -O0 -o "$D/sqlerr-$(basename "$0" .sh)" "$(dirname "$0")/c/sqlerr.c" -I"$FBINC" -L"$FBLIB" -lfbclient -Wl,-rpath,"$FBLIB" 2>/dev/null || { echo "FAIL compile sqlerr"; exit 1; }
 make_db() { rm -f "$1"; "$ISQL" -q -b -user "$U" -pas "$P" <<EOF >/dev/null 2>&1 || return 1
 CREATE DATABASE '$1' USER '$U' PASSWORD '$P' PAGE_SIZE 8192;
 COMMIT;
@@ -59,11 +59,11 @@ SQL
 e=$(script | "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$REAL:$B" 2>&1 | norm)
 c=$(script | "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$A" 2>&1 | norm)
 check "CREATE / DROP COLLATION and the RDB\$COLLATIONS catalog (id, attributes, specific)" "$c" "$e"
-e=$("$D/sqlerr" "127.0.0.1/$REAL:$B" "CREATE COLLATION UCI FOR UTF8 FROM UNICODE" "DROP COLLATION NOPE" "CREATE COLLATION BAD FOR WIN1252 FROM WIN1252 CASE INSENSITIVE" 2>&1 | norm)
-c=$("$D/sqlerr" "127.0.0.1/$PORT:$A" "CREATE COLLATION UCI FOR UTF8 FROM UNICODE" "DROP COLLATION NOPE" "CREATE COLLATION BAD FOR WIN1252 FROM WIN1252 CASE INSENSITIVE" 2>&1 | norm)
+e=$("$D/sqlerr-$(basename "$0" .sh)" "127.0.0.1/$REAL:$B" "CREATE COLLATION UCI FOR UTF8 FROM UNICODE" "DROP COLLATION NOPE" "CREATE COLLATION BAD FOR WIN1252 FROM WIN1252 CASE INSENSITIVE" 2>&1 | norm)
+c=$("$D/sqlerr-$(basename "$0" .sh)" "127.0.0.1/$PORT:$A" "CREATE COLLATION UCI FOR UTF8 FROM UNICODE" "DROP COLLATION NOPE" "CREATE COLLATION BAD FOR WIN1252 FROM WIN1252 CASE INSENSITIVE" 2>&1 | norm)
 check "the duplicate / missing / invalid-attribute vectors" "$c" "$e"
 # Boundary: FROM EXTERNAL (a collation module) refuses
-cb=$("$D/sqlerr" "127.0.0.1/$PORT:$A" "CREATE COLLATION EXT FOR UTF8 FROM EXTERNAL ('x')" 2>&1 | norm)
+cb=$("$D/sqlerr-$(basename "$0" .sh)" "127.0.0.1/$PORT:$A" "CREATE COLLATION EXT FOR UTF8 FROM EXTERNAL ('x')" 2>&1 | norm)
 ran=$((ran + 1))
 if [ "${cb#*gds}" != "$cb" ]; then echo "OK   boundary: CREATE COLLATION FROM EXTERNAL refuses"
 else echo "DIFF boundary MOVED: FROM EXTERNAL"; echo "     fc: $cb"; fail=1; fi

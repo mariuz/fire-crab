@@ -25,7 +25,7 @@ LOG="/tmp/fc-serve-mapping-$PORT.log"
 FBINC="${FBINC:-/opt/firebird/include}"; FBLIB="${FBLIB:-/opt/firebird/lib}"
 mkdir -p "$D"; fail=0; ran=0
 command -v gcc >/dev/null 2>&1 || { echo "SKIP gcc not found"; exit 0; }
-gcc -O0 -o "$D/sqlerr" "$(dirname "$0")/c/sqlerr.c" -I"$FBINC" -L"$FBLIB" -lfbclient -Wl,-rpath,"$FBLIB" 2>/dev/null || { echo "FAIL compile sqlerr"; exit 1; }
+gcc -O0 -o "$D/sqlerr-$(basename "$0" .sh)" "$(dirname "$0")/c/sqlerr.c" -I"$FBINC" -L"$FBLIB" -lfbclient -Wl,-rpath,"$FBLIB" 2>/dev/null || { echo "FAIL compile sqlerr"; exit 1; }
 make_db() { rm -f "$1"; "$ISQL" -q -b -user "$U" -pas "$P" <<EOF >/dev/null 2>&1 || return 1
 CREATE DATABASE '$1' USER '$U' PASSWORD '$P' PAGE_SIZE 8192;
 COMMIT;
@@ -58,11 +58,11 @@ SQL
 e=$(script | "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$REAL:$B" 2>&1 | norm)
 c=$(script | "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$A" 2>&1 | norm)
 check "CREATE / ALTER / DROP MAPPING and the RDB\$AUTH_MAPPING catalog" "$c" "$e"
-e=$("$D/sqlerr" "127.0.0.1/$REAL:$B" "CREATE MAPPING M_USER USING PLUGIN SRP FROM USER X TO USER Y" "DROP MAPPING NOPE" "ALTER MAPPING NOPE USING PLUGIN SRP FROM USER X TO USER Y" 2>&1 | norm)
-c=$("$D/sqlerr" "127.0.0.1/$PORT:$A" "CREATE MAPPING M_USER USING PLUGIN SRP FROM USER X TO USER Y" "DROP MAPPING NOPE" "ALTER MAPPING NOPE USING PLUGIN SRP FROM USER X TO USER Y" 2>&1 | norm)
+e=$("$D/sqlerr-$(basename "$0" .sh)" "127.0.0.1/$REAL:$B" "CREATE MAPPING M_USER USING PLUGIN SRP FROM USER X TO USER Y" "DROP MAPPING NOPE" "ALTER MAPPING NOPE USING PLUGIN SRP FROM USER X TO USER Y" 2>&1 | norm)
+c=$("$D/sqlerr-$(basename "$0" .sh)" "127.0.0.1/$PORT:$A" "CREATE MAPPING M_USER USING PLUGIN SRP FROM USER X TO USER Y" "DROP MAPPING NOPE" "ALTER MAPPING NOPE USING PLUGIN SRP FROM USER X TO USER Y" 2>&1 | norm)
 check "the duplicate / missing MAPPING vectors" "$c" "$e"
 # Boundary: GLOBAL mapping is the security database, refused here
-cb=$("$D/sqlerr" "127.0.0.1/$PORT:$A" "CREATE GLOBAL MAPPING GM USING PLUGIN SRP FROM USER A TO USER B" 2>&1 | norm)
+cb=$("$D/sqlerr-$(basename "$0" .sh)" "127.0.0.1/$PORT:$A" "CREATE GLOBAL MAPPING GM USING PLUGIN SRP FROM USER A TO USER B" 2>&1 | norm)
 ran=$((ran + 1))
 if [ "${cb#*gds}" != "$cb" ]; then echo "OK   boundary: CREATE GLOBAL MAPPING refuses (the security database)"
 else echo "DIFF boundary MOVED: GLOBAL MAPPING"; echo "     fc: $cb"; fail=1; fi

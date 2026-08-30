@@ -46077,6 +46077,60 @@ fn cast_target_of_col(pc: &ProjCol) -> Option<CastTarget> {
     }
 }
 
+/// FOLD A WINDOWED PROJECTION INTO ITS ROWS - the one implementation of
+/// the window fold, shared by the streaming emit path and the batched
+/// fetch path.
+///
+/// The order is load-bearing and is the reason this is a function rather
+/// than two copies: SCAN with an EMPTY sort key, FOLD each window over
+/// its partition, and only THEN sort into output order. A window folds
+/// over the whole partition, so folding after the sort - or per batch -
+/// gives a different answer; and `ROW_NUMBER`'s tie order is pinned to
+/// SCAN order, which a pre-sort would move.
+///
+/// It exists because the fetch path had no fold at all: `branch_rows`
+/// answered None for a windowed Project, the plan was therefore never
+/// materialised into `Plan::Rows`, and control fell through to a path
+/// that ignores the client's requested batch size and re-emits the whole
+/// result on EVERY fetch. A 5000-row `SELECT ID, ROW_NUMBER() OVER
+/// (ORDER BY ID) FROM T` came back SIX TIMES over - 30000 rows, five of
+/// the six blocks byte-identical - with no error, and a driver that
+/// respects the protocol's flow control hung instead.
+#[allow(clippy::too_many_arguments)]
+fn fold_project_windows(
+    rel: u16,
+    formats: &[(u8, Vec<Descriptor>)],
+    filter: &Option<Predicate>,
+    order_by: &[OrderKey],
+    index: &Option<IndexAccess>,
+    defer: &Option<DeferredAccess>,
+    windows: &[WinSpec],
+    win_base: usize,
+    db: &Database,
+    args: &[WireParam],
+) -> Result<Vec<Vec<Value>>, EvalErr> {
+    let filter = bind_filter(filter, args).map_err(|_| EvalErr::Unsupported)?;
+    let descs_now: Vec<Descriptor> = formats
+        .iter()
+        .max_by_key(|(n, _)| *n)
+        .map(|(_, d)| d.clone())
+        .unwrap_or_default();
+    let access = resolve_access(index, defer, db, rel, &descs_now, &filter, order_by);
+    let base = RowSource::scan_filter_sort(
+        rel,
+        formats.to_vec(),
+        filter,
+        Vec::new(),
+        access,
+    )
+    .rows(db)?;
+    let mut rows = compute_windows(base, windows, win_base)?;
+    if !order_by.is_empty() {
+        sort_rows(&mut rows, order_by)?;
+    }
+    Ok(rows)
+}
+
 /// The [ProjCol] a [Plan::Scalar] projects.
 fn scalar_col(name: &str, fname: &Option<String>, ty: ScalarTy) -> ProjCol {
     ProjCol {
@@ -48275,17 +48329,24 @@ fn emit_rows_inner(
                     // The scan and filter are the same row-source leaf the
                     // ordinary fetch uses; only the fold and the append are
                     // new. gen_cols is empty here (the mix refuses at plan).
-                    let base = RowSource::scan_filter_sort(
-                        *rel,
-                        formats.clone(),
-                        filter.clone(),
-                        Vec::new(),
-                        index.clone(),
+                    // one implementation, shared with the fetch path
+                    // ([fold_project_windows]) - the filter and access
+                    // are already bound above, so they are handed in
+                    // rather than resolved twice
+                    let mut rows = compute_windows(
+                        RowSource::scan_filter_sort(
+                            *rel,
+                            formats.clone(),
+                            filter.clone(),
+                            Vec::new(),
+                            index.clone(),
+                        )
+                        .rows(db)
+                        .map_err(EmitErr::Eval)?,
+                        windows,
+                        *win_base,
                     )
-                    .rows(db)
                     .map_err(EmitErr::Eval)?;
-                    let mut rows =
-                        compute_windows(base, windows, *win_base).map_err(EmitErr::Eval)?;
                     if !order_by.is_empty() {
                         sort_rows(&mut rows, order_by).map_err(EmitErr::Eval)?;
                     }
@@ -75976,6 +76037,63 @@ fn after_auth(
                 // `take` (or a bare SKIP) still materialises and drains.
                 let small_first = matches!(&*plan,
                     Plan::Modified { take: Some(t), distinct: false, .. } if *t <= want as usize);
+                // A WINDOWED PROJECTION MATERIALISES HERE, and it must do
+                // so BEFORE the `branch_rows` attempt below. `branch_rows`
+                // answers None for one, so the plan was never turned into
+                // `Plan::Rows`, and control fell past the batching code to
+                // a path that ignores `want` entirely: the whole result
+                // was re-emitted on EVERY fetch. A 5000-row `SELECT ID,
+                // ROW_NUMBER() OVER (ORDER BY ID) FROM T` came back SIX
+                // TIMES over - 30000 rows, five blocks byte-identical to
+                // each other - with no error at all, and a driver that
+                // honours the protocol's flow control hung rather than
+                // returning. Placing this ahead of `branch_rows` also
+                // keeps the fold on ONE implementation
+                // ([fold_project_windows]) instead of letting the generic
+                // row-source path grow a second one.
+                if want > 0 && !matches!(&*plan, Plan::Rows { .. }) {
+                    if let (
+                        Plan::Project {
+                            rel, formats, cols, filter, order_by, index, defer, windows, win_base, ..
+                        },
+                        Some(db),
+                    ) = (&*plan, database.as_ref())
+                    {
+                        if !windows.is_empty() {
+                            if let Ok(records) = fold_project_windows(
+                                *rel, formats, filter, order_by, index, defer, windows,
+                                *win_base, db, &bound_args,
+                            ) {
+                                // the fold hands back RECORDS - the window
+                                // values appended at `win_base` - so they
+                                // are projected down here exactly as
+                                // `branch_rows_res` does, and the columns
+                                // are then re-indexed POSITIONALLY. Keeping
+                                // the original field ids would make each
+                                // column read a record it no longer has and
+                                // every value would come back NULL.
+                                let projected: Result<Vec<Vec<Value>>, EvalErr> = records
+                                    .iter()
+                                    .map(|values| {
+                                        cols.iter().map(|c| c.value_of(values)).collect()
+                                    })
+                                    .collect();
+                                if let Ok(rows) = projected {
+                                    let cols: Vec<ProjCol> = cols
+                                        .iter()
+                                        .enumerate()
+                                        .map(|(i, c)| ProjCol {
+                                            field_id: i,
+                                            expr: None,
+                                            ..c.clone()
+                                        })
+                                        .collect();
+                                    plan = std::rc::Rc::new(Plan::Rows { cols, rows });
+                                }
+                            }
+                        }
+                    }
+                }
                 if want > 0 && !matches!(&*plan, Plan::Rows { .. }) && !small_first {
                     if let Some(db) = database.as_ref() {
                         if let Some(rows) = branch_rows(&*plan, db, &bound_args) {

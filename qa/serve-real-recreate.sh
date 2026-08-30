@@ -27,7 +27,7 @@ FBINC="${FBINC:-/opt/firebird/include}"; FBLIB="${FBLIB:-/opt/firebird/lib}"
 mkdir -p "$D"
 fail=0; ran=0
 command -v gcc >/dev/null 2>&1 || { echo "SKIP gcc not found"; exit 0; }
-gcc -O0 -o "$D/sqlerr" "$(dirname "$0")/c/sqlerr.c" -I"$FBINC" -L"$FBLIB" -lfbclient -Wl,-rpath,"$FBLIB" 2>/dev/null || { echo "FAIL compile sqlerr"; exit 1; }
+gcc -O0 -o "$D/sqlerr-$(basename "$0" .sh)" "$(dirname "$0")/c/sqlerr.c" -I"$FBINC" -L"$FBLIB" -lfbclient -Wl,-rpath,"$FBLIB" 2>/dev/null || { echo "FAIL compile sqlerr"; exit 1; }
 make_db() {
     rm -f "$1"
     "$ISQL" -q -b -user "$U" -pas "$P" <<EOF >/dev/null 2>&1 || return 1
@@ -96,12 +96,12 @@ e=$(script | "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$REAL:$B" 2>&1 | norm)
 c=$(script | "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$A" 2>&1 | norm)
 check "RECREATE across TABLE / EXCEPTION / VIEW / PROCEDURE / FUNCTION / SEQUENCE" "$c" "$e"
 # RECREATE of a name that does not exist is a plain CREATE - the vectors agree
-e=$("$D/sqlerr" "127.0.0.1/$REAL:$B" "RECREATE TABLE FRESH (A INTEGER)" "RECREATE EXCEPTION FRESHX 'hi'" "RECREATE SEQUENCE FRESHSQ" 2>&1 | norm)
-c=$("$D/sqlerr" "127.0.0.1/$PORT:$A" "RECREATE TABLE FRESH (A INTEGER)" "RECREATE EXCEPTION FRESHX 'hi'" "RECREATE SEQUENCE FRESHSQ" 2>&1 | norm)
+e=$("$D/sqlerr-$(basename "$0" .sh)" "127.0.0.1/$REAL:$B" "RECREATE TABLE FRESH (A INTEGER)" "RECREATE EXCEPTION FRESHX 'hi'" "RECREATE SEQUENCE FRESHSQ" 2>&1 | norm)
+c=$("$D/sqlerr-$(basename "$0" .sh)" "127.0.0.1/$PORT:$A" "RECREATE TABLE FRESH (A INTEGER)" "RECREATE EXCEPTION FRESHX 'hi'" "RECREATE SEQUENCE FRESHSQ" 2>&1 | norm)
 check "RECREATE of a new name is a plain CREATE (vectors)" "$c" "$e"
 # Boundary: a view SELECT this server cannot compile refuses generically
-eb=$("$D/sqlerr" "127.0.0.1/$REAL:$B" "RECREATE VIEW VW AS SELECT NOPE FROM T" 2>&1 | norm)
-cb=$("$D/sqlerr" "127.0.0.1/$PORT:$A" "RECREATE VIEW VW AS SELECT NOPE FROM T" 2>&1 | norm)
+eb=$("$D/sqlerr-$(basename "$0" .sh)" "127.0.0.1/$REAL:$B" "RECREATE VIEW VW AS SELECT NOPE FROM T" 2>&1 | norm)
+cb=$("$D/sqlerr-$(basename "$0" .sh)" "127.0.0.1/$PORT:$A" "RECREATE VIEW VW AS SELECT NOPE FROM T" 2>&1 | norm)
 ran=$((ran + 1))
 if [ "$eb" != "$cb" ] && [ "${eb#*336397301}" != "$eb" ] && [ "${cb#*335544569}" != "$cb" ]; then
     echo "OK   boundary: an uncompilable view SELECT refuses generically (engine RECREATE VIEW failed / -206)"

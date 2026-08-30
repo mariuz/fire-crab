@@ -26,7 +26,7 @@ FBINC="${FBINC:-/opt/firebird/include}"; FBLIB="${FBLIB:-/opt/firebird/lib}"
 mkdir -p "$D"
 fail=0; ran=0
 command -v gcc >/dev/null 2>&1 || { echo "SKIP gcc not found"; exit 0; }
-gcc -O0 -o "$D/sqlerr" "$(dirname "$0")/c/sqlerr.c" -I"$FBINC" -L"$FBLIB" -lfbclient -Wl,-rpath,"$FBLIB" 2>/dev/null || { echo "FAIL compile sqlerr"; exit 1; }
+gcc -O0 -o "$D/sqlerr-$(basename "$0" .sh)" "$(dirname "$0")/c/sqlerr.c" -I"$FBINC" -L"$FBLIB" -lfbclient -Wl,-rpath,"$FBLIB" 2>/dev/null || { echo "FAIL compile sqlerr"; exit 1; }
 make_db() { rm -f "$1"; "$ISQL" -q -b -user "$U" -pas "$P" <<EOF >/dev/null 2>&1 || return 1
 CREATE DATABASE '$1' USER '$U' PASSWORD '$P' PAGE_SIZE 8192 DEFAULT CHARACTER SET NONE;
 COMMIT;
@@ -84,7 +84,7 @@ c=$(printf '%s\n' "$eng_q" | "$ISQL" -q -ch UTF8 -user "$U" -pas "$P" "$A" 2>&1 
 check "the ENGINE reads fc's UTF8 table (multibyte content in fc's own layout)" "$c" "$e"
 # Boundary: a collation this server does not carry (a language collation)
 # refuses; the built-in UTF8 family (tested above) is supported.
-cb=$("$D/sqlerr" "127.0.0.1/$PORT:$A" "CREATE TABLE C2 (X VARCHAR(5) CHARACTER SET ISO8859_1 COLLATE DE_DE)" 2>&1 | norm)
+cb=$("$D/sqlerr-$(basename "$0" .sh)" "127.0.0.1/$PORT:$A" "CREATE TABLE C2 (X VARCHAR(5) CHARACTER SET ISO8859_1 COLLATE DE_DE)" 2>&1 | norm)
 ran=$((ran + 1))
 if [ "${cb#*gds}" != "$cb" ]; then echo "OK   boundary: a language collation (DE_DE) refuses; the UTF8 family is in"
 else echo "DIFF boundary MOVED: unknown COLLATE"; echo "     fc: $cb"; fail=1; fi

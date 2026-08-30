@@ -23,7 +23,7 @@ LOG="/tmp/fc-serve-package-$PORT.log"
 FBINC="${FBINC:-/opt/firebird/include}"; FBLIB="${FBLIB:-/opt/firebird/lib}"
 mkdir -p "$D"; fail=0; ran=0
 command -v gcc >/dev/null 2>&1 || { echo "SKIP gcc not found"; exit 0; }
-gcc -O0 -o "$D/sqlerr" "$(dirname "$0")/c/sqlerr.c" -I"$FBINC" -L"$FBLIB" -lfbclient -Wl,-rpath,"$FBLIB" 2>/dev/null || { echo "FAIL compile sqlerr"; exit 1; }
+gcc -O0 -o "$D/sqlerr-$(basename "$0" .sh)" "$(dirname "$0")/c/sqlerr.c" -I"$FBINC" -L"$FBLIB" -lfbclient -Wl,-rpath,"$FBLIB" 2>/dev/null || { echo "FAIL compile sqlerr"; exit 1; }
 make_db() { rm -f "$1"; "$ISQL" -q -b -user "$U" -pas "$P" <<EOF >/dev/null 2>&1 || return 1
 CREATE DATABASE '$1' USER '$U' PASSWORD '$P' PAGE_SIZE 8192;
 COMMIT;
@@ -57,8 +57,8 @@ SQL
 e=$("$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$REAL:$B" -i "$D/pkg-script.sql" 2>&1 | norm)
 c=$("$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$A" -i "$D/pkg-script.sql" 2>&1 | norm)
 check "CREATE / DROP PACKAGE header, members and parameters" "$c" "$e"
-e=$("$D/sqlerr" "127.0.0.1/$REAL:$B" "CREATE PACKAGE PKG AS BEGIN PROCEDURE X (A INTEGER); END" "DROP PACKAGE NOPE" 2>&1 | norm)
-c=$("$D/sqlerr" "127.0.0.1/$PORT:$A" "CREATE PACKAGE PKG AS BEGIN PROCEDURE X (A INTEGER); END" "DROP PACKAGE NOPE" 2>&1 | norm)
+e=$("$D/sqlerr-$(basename "$0" .sh)" "127.0.0.1/$REAL:$B" "CREATE PACKAGE PKG AS BEGIN PROCEDURE X (A INTEGER); END" "DROP PACKAGE NOPE" 2>&1 | norm)
+c=$("$D/sqlerr-$(basename "$0" .sh)" "127.0.0.1/$PORT:$A" "CREATE PACKAGE PKG AS BEGIN PROCEDURE X (A INTEGER); END" "DROP PACKAGE NOPE" 2>&1 | norm)
 check "the duplicate / missing PACKAGE vectors" "$c" "$e"
 # CREATE PACKAGE BODY - the implementations. Run on both, compare the catalog:
 # the body source + VALID_BODY_FLAG, each member's TYPE/VALID_BLR (SOURCE null),
@@ -78,8 +78,8 @@ e=$("$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$REAL:$B" -i "$D/pkg-body.sql" 2>
 c=$("$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$A" -i "$D/pkg-body.sql" 2>&1 | norm)
 check "CREATE PACKAGE BODY body source, member BLR/TYPE and rewritten params" "$c" "$e"
 # a second body refuses (already exists), and a body with no header refuses
-e=$("$D/sqlerr" "127.0.0.1/$REAL:$B" "CREATE PACKAGE BODY PKG AS BEGIN PROCEDURE PP (A INTEGER) RETURNS (B INTEGER) AS BEGIN B = A; SUSPEND; END FUNCTION FF (A INTEGER) RETURNS INTEGER AS BEGIN RETURN A; END PROCEDURE P2 (X VARCHAR(5)) AS BEGIN EXIT; END END" "CREATE PACKAGE BODY NOPKG AS BEGIN FUNCTION F (A INTEGER) RETURNS INTEGER AS BEGIN RETURN A; END END" 2>&1 | norm)
-c=$("$D/sqlerr" "127.0.0.1/$PORT:$A" "CREATE PACKAGE BODY PKG AS BEGIN PROCEDURE PP (A INTEGER) RETURNS (B INTEGER) AS BEGIN B = A; SUSPEND; END FUNCTION FF (A INTEGER) RETURNS INTEGER AS BEGIN RETURN A; END PROCEDURE P2 (X VARCHAR(5)) AS BEGIN EXIT; END END" "CREATE PACKAGE BODY NOPKG AS BEGIN FUNCTION F (A INTEGER) RETURNS INTEGER AS BEGIN RETURN A; END END" 2>&1 | norm)
+e=$("$D/sqlerr-$(basename "$0" .sh)" "127.0.0.1/$REAL:$B" "CREATE PACKAGE BODY PKG AS BEGIN PROCEDURE PP (A INTEGER) RETURNS (B INTEGER) AS BEGIN B = A; SUSPEND; END FUNCTION FF (A INTEGER) RETURNS INTEGER AS BEGIN RETURN A; END PROCEDURE P2 (X VARCHAR(5)) AS BEGIN EXIT; END END" "CREATE PACKAGE BODY NOPKG AS BEGIN FUNCTION F (A INTEGER) RETURNS INTEGER AS BEGIN RETURN A; END END" 2>&1 | norm)
+c=$("$D/sqlerr-$(basename "$0" .sh)" "127.0.0.1/$PORT:$A" "CREATE PACKAGE BODY PKG AS BEGIN PROCEDURE PP (A INTEGER) RETURNS (B INTEGER) AS BEGIN B = A; SUSPEND; END FUNCTION FF (A INTEGER) RETURNS INTEGER AS BEGIN RETURN A; END PROCEDURE P2 (X VARCHAR(5)) AS BEGIN EXIT; END END" "CREATE PACKAGE BODY NOPKG AS BEGIN FUNCTION F (A INTEGER) RETURNS INTEGER AS BEGIN RETURN A; END END" 2>&1 | norm)
 check "the duplicate-body / body-without-header vectors" "$c" "$e"
 # the ENGINE runs the BLR fc stored (proves the compiled member is valid)
 rc="SET LIST ON; SELECT PKG.FF(41) AS R FROM RDB\$DATABASE; SELECT B FROM PKG.PP(21);"

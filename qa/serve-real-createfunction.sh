@@ -35,7 +35,7 @@ FBINC="${FBINC:-/opt/firebird/include}"; FBLIB="${FBLIB:-/opt/firebird/lib}"
 mkdir -p "$D"
 fail=0; ran=0
 command -v gcc >/dev/null 2>&1 || { echo "SKIP gcc not found"; exit 0; }
-gcc -O0 -o "$D/sqlerr" "$(dirname "$0")/c/sqlerr.c" -I"$FBINC" -L"$FBLIB" -lfbclient -Wl,-rpath,"$FBLIB" 2>/dev/null || { echo "FAIL compile sqlerr"; exit 1; }
+gcc -O0 -o "$D/sqlerr-$(basename "$0" .sh)" "$(dirname "$0")/c/sqlerr.c" -I"$FBINC" -L"$FBLIB" -lfbclient -Wl,-rpath,"$FBLIB" 2>/dev/null || { echo "FAIL compile sqlerr"; exit 1; }
 make_db() {
     rm -f "$1"
     "$ISQL" -q -b -user "$U" -pas "$P" <<EOF >/dev/null 2>&1 || return 1
@@ -116,8 +116,8 @@ qcheck "no leftover dependencies" "$q_deps"
 printf 'DROP FUNCTION K; COMMIT;\n' | "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$REAL:$B" >/dev/null 2>&1
 printf 'DROP FUNCTION K; COMMIT;\n' | "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$A" >/dev/null 2>&1
 qcheck "DROP FUNCTION K removes its rows and calling K is -804" "SET LIST ON; SELECT COUNT(*) AS FN FROM RDB\$FUNCTIONS WHERE RDB\$FUNCTION_NAME = 'K'; SELECT COUNT(*) AS ARG FROM RDB\$FUNCTION_ARGUMENTS WHERE RDB\$FUNCTION_NAME = 'K'; SET LIST OFF; SELECT K(1) FROM RDB\$DATABASE;"
-e=$("$D/sqlerr" "127.0.0.1/$REAL:$B" "CREATE FUNCTION F (A INTEGER) RETURNS INTEGER AS BEGIN RETURN 1; END" "DROP FUNCTION NOPE" "DROP FUNCTION K" 2>&1 | norm)
-c=$("$D/sqlerr" "127.0.0.1/$PORT:$A" "CREATE FUNCTION F (A INTEGER) RETURNS INTEGER AS BEGIN RETURN 1; END" "DROP FUNCTION NOPE" "DROP FUNCTION K" 2>&1 | norm)
+e=$("$D/sqlerr-$(basename "$0" .sh)" "127.0.0.1/$REAL:$B" "CREATE FUNCTION F (A INTEGER) RETURNS INTEGER AS BEGIN RETURN 1; END" "DROP FUNCTION NOPE" "DROP FUNCTION K" 2>&1 | norm)
+c=$("$D/sqlerr-$(basename "$0" .sh)" "127.0.0.1/$PORT:$A" "CREATE FUNCTION F (A INTEGER) RETURNS INTEGER AS BEGIN RETURN 1; END" "DROP FUNCTION NOPE" "DROP FUNCTION K" 2>&1 | norm)
 check "the duplicate / missing DDL vectors" "$c" "$e"
 # the ENGINE runs fc's functions on fc's file
 script2() { cat <<'SQL'

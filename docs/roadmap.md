@@ -3041,6 +3041,45 @@ pointer-page and TIP page numbers is the next step when it dominates.
 
 ## Next, in order
 
+- **A WINDOWED RESULT LARGER THAN ONE FETCH BATCH DONE (2026-08-30,
+  `serve-real-winbatch` NEW, 15):** a bare top-level `SELECT ID,
+  ROW_NUMBER() OVER (ORDER BY ID) FROM T` over 5000 rows came back **SIX
+  TIMES OVER** - 30000 rows, row 1 at line offsets 2, 5002, 10002,
+  15002, 20002 and 25002, five of the six blocks byte-identical. No
+  error. And node-firebird, which honours the protocol's flow control,
+  HUNG and never returned.
+  `branch_rows` answers None for a windowed Project, so the plan was
+  never materialised into `Plan::Rows` and control fell PAST the
+  batching code to a path that ignores the client's requested batch size
+  and re-emits the whole result every time it is asked. Under ONE batch
+  the answer is correct - which is every hand-written test, including
+  all 83 checks the window gate had - so it is wrong only from the
+  SECOND fetch onwards. That is why a 353-gate suite never saw it, and
+  why the new gate builds 5000 rows on purpose and asserts the
+  MULTIPLICITY of individual rows: a row-count check alone passes the
+  broken server on its first batch.
+  Fixed by materialising a windowed projection in the fetch path BEFORE
+  the generic `branch_rows` attempt, through the SAME fold the streaming
+  emit path uses (`fold_project_windows`) rather than a second copy. The
+  order is load-bearing and is why it is a shared function: scan with an
+  EMPTY sort key, fold each window over its whole partition, and only
+  THEN sort. A window folds over the partition, so a per-batch fold
+  would be wrong exactly past the first batch boundary, and
+  ROW_NUMBER's tie order is pinned to SCAN order, which a pre-sort would
+  move.
+  Found by a workflow sent to investigate something else entirely (the
+  nested prepare-then-fail cluster), which is a fair argument for
+  probing the paths ADJACENT to a defect and not only the defect.
+
+- **`sqlerr` GATE COLLISION REPAIRED (2026-08-30):** eleven DDL gates
+  compiled their `sqlerr` helper to ONE shared path,
+  `/tmp/fbhandson/sqlerr`. Under `-j 4` a gate recompiling it while
+  another executed it gets `Permission denied` (ETXTBSY), which surfaces
+  as a DIFF whose two sides are IDENTICAL but for the isql line number
+  that reported it - a failure that looks like a real divergence and is
+  not. Each gate now compiles to `sqlerr-<gate>`; all eleven pass when
+  run concurrently, which is the condition that produced it.
+
 - **WINDOW FRAMES OVER A NULL KEY, AND LAG/LEAD'S DEFAULT DONE
   (2026-08-30, `serve-real-window` 83 -> 119):** two silent wrong-answer
   classes, both with a byte-identical SQLDA.

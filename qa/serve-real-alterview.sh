@@ -27,7 +27,7 @@ FBINC="${FBINC:-/opt/firebird/include}"; FBLIB="${FBLIB:-/opt/firebird/lib}"
 mkdir -p "$D"
 fail=0; ran=0
 command -v gcc >/dev/null 2>&1 || { echo "SKIP gcc not found"; exit 0; }
-gcc -O0 -o "$D/sqlerr" "$(dirname "$0")/c/sqlerr.c" -I"$FBINC" -L"$FBLIB" -lfbclient -Wl,-rpath,"$FBLIB" 2>/dev/null || { echo "FAIL compile sqlerr"; exit 1; }
+gcc -O0 -o "$D/sqlerr-$(basename "$0" .sh)" "$(dirname "$0")/c/sqlerr.c" -I"$FBINC" -L"$FBLIB" -lfbclient -Wl,-rpath,"$FBLIB" 2>/dev/null || { echo "FAIL compile sqlerr"; exit 1; }
 make_db() {
     rm -f "$1"
     "$ISQL" -q -b -user "$U" -pas "$P" <<EOF >/dev/null 2>&1 || return 1
@@ -76,13 +76,13 @@ SQL
 e=$(script | "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$REAL:$B" 2>&1 | norm)
 c=$(script | "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$A" 2>&1 | norm)
 check "ALTER VIEW replaces the definition, the relation id survives" "$c" "$e"
-e=$("$D/sqlerr" "127.0.0.1/$REAL:$B" "ALTER VIEW NOPE AS SELECT ID FROM T" 2>&1 | norm)
-c=$("$D/sqlerr" "127.0.0.1/$PORT:$A" "ALTER VIEW NOPE AS SELECT ID FROM T" 2>&1 | norm)
+e=$("$D/sqlerr-$(basename "$0" .sh)" "127.0.0.1/$REAL:$B" "ALTER VIEW NOPE AS SELECT ID FROM T" 2>&1 | norm)
+c=$("$D/sqlerr-$(basename "$0" .sh)" "127.0.0.1/$PORT:$A" "ALTER VIEW NOPE AS SELECT ID FROM T" 2>&1 | norm)
 check "ALTER VIEW of a missing view: ALTER VIEW failed / view not found" "$c" "$e"
 # Boundary: ALTER VIEW of a TABLE - engine compiles the definition and fails
 # -206, fc refuses generically
-eb=$("$D/sqlerr" "127.0.0.1/$REAL:$B" "ALTER VIEW T AS SELECT ID FROM T" 2>&1 | norm)
-cb=$("$D/sqlerr" "127.0.0.1/$PORT:$A" "ALTER VIEW T AS SELECT ID FROM T" 2>&1 | norm)
+eb=$("$D/sqlerr-$(basename "$0" .sh)" "127.0.0.1/$REAL:$B" "ALTER VIEW T AS SELECT ID FROM T" 2>&1 | norm)
+cb=$("$D/sqlerr-$(basename "$0" .sh)" "127.0.0.1/$PORT:$A" "ALTER VIEW T AS SELECT ID FROM T" 2>&1 | norm)
 ran=$((ran + 1))
 if [ "$eb" != "$cb" ] && [ "${eb#*-206}" != "$eb" ] && [ "${cb#*336068662}" != "$cb" ]; then
     echo "OK   boundary: ALTER VIEW of a table - fc answers view-not-found where the engine compiles and fails -206"
