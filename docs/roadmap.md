@@ -3041,6 +3041,43 @@ pointer-page and TIP page numbers is the next step when it dominates.
 
 ## Next, in order
 
+- **RE-EXECUTING A PREPARED STATEMENT DONE (2026-08-30,
+  `serve-real-reexec` NEW, 15):** a second execute of a prepared handle
+  answered **ZERO ROWS**, silently. A FETCH MUTATES THE LIVE PLAN - it
+  materialises into `Plan::Rows`, drains those rows as it delivers them,
+  and (since the cursor-exhaustion fix) marks the plan spent when the
+  cursor finishes - so the plan a second execute would run is the
+  wreckage of the first run. `OP_EXECUTE` clears the cursor maps and
+  never rebuilds the plan.
+  I INTRODUCED HALF OF THIS. The cursor-exhaustion commit justified the
+  spent-marking with "safe across re-execute because `plan` is
+  reassigned then". It is not, and I asserted the property instead of
+  testing it - the exact mirror-image error the paper section written
+  minutes earlier had described. Bisected: a plain scan's second run was
+  3 rows before that commit and 0 after. `SELECT COUNT(*)` was ALREADY 0
+  beforehand, because its materialised row had been drained, so the
+  other half is long-standing.
+  Fixed by recording the PRISTINE prepared plan per statement handle and
+  restoring it on every execute - in BOTH `OP_EXECUTE` and
+  `OP_EXECUTE2`, which is easy to miss since the two handlers open
+  identically. Dropped on re-prepare of the same handle and on
+  DROP-mode free.
+  WHY NO GATE COULD SEE IT: **isql RE-PREPARES every statement text**, so
+  it never reuses a prepared handle and cannot reach a second execute.
+  All 355 gates went through isql or a node client with no statement
+  cache. An entire class of defect sat behind that door with no key. The
+  new gate uses node-firebird with `statementCacheSize` and runs every
+  plan shape THREE times; its header says why it must not be
+  "simplified" onto isql.
+  THIS IS THE SECOND DEFECT IN A ROW that survived because the probe
+  used a client which cannot exercise the path - the 500-row duplication
+  was invisible to node-firebird for the opposite reason. The pattern is
+  worth more than either fix: **when a defect is about a protocol
+  SEQUENCE, the client is part of the experiment.**
+  Found by an audit of the fetch/cursor state machine that was
+  commissioned precisely because two silent defects had just been found
+  in it; its first predicted case was this one.
+
 - **A CURSOR IS CONSUMED BY ITS FETCH DONE (2026-08-30,
   `serve-real-fetchdup` NEW, 17):** **ANY result of 500 rows or more was
   delivered TWICE.** Not a window, not a join, not a sort: a plain

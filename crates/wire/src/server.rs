@@ -73773,6 +73773,18 @@ fn after_auth(
     ScalarTy::int64(),
     ));
     let mut stmt_params: std::rc::Rc<Vec<Descriptor>> = std::rc::Rc::new(Vec::new());
+    // THE PRISTINE PREPARED PLAN, per statement handle. A FETCH MUTATES
+    // THE LIVE PLAN - it materialises into `Plan::Rows`, drains those
+    // rows, and marks the plan spent when the cursor finishes - so by the
+    // time a statement is executed a SECOND time, the plan it would run
+    // is the wreckage of the first run. Without this, re-executing a
+    // prepared statement answered ZERO ROWS: `SELECT COUNT(*)` did so
+    // even before the spent-marking (its materialised rows had been
+    // drained), and a plain scan began to once the marking was added.
+    // Only a client that REUSES a prepared handle can see it - isql
+    // re-prepares every statement text, which is why no gate did.
+    let mut prepared_plans: std::collections::HashMap<i32, std::rc::Rc<Plan>> =
+        std::collections::HashMap::new();
     let mut bound_args: Vec<WireParam> = Vec::new();
     let mut last_dml = (0i32, 0i32, 0i32); // (inserted, updated, deleted)
     // The five locals above are the LIVE statement's working set;
@@ -74300,6 +74312,10 @@ fn after_auth(
                 let _prep_tr = read_int(&mut s, &mut dec)?;
                 let h = read_int(&mut s, &mut dec)?; // stmt
                 use_stmt!(h);
+                // this handle is being prepared as something else now, so
+                // the recorded plan is stale: the next execute must record
+                // the NEW one rather than restore the old
+                prepared_plans.remove(&h);
                 read_int(&mut s, &mut dec)?; // dialect
                 let sql = read_wire_bytes(&mut s, &mut dec)?; // sql
                 let prep_items = read_wire_bytes(&mut s, &mut dec)?; // items
@@ -74626,6 +74642,16 @@ fn after_auth(
                 use_stmt!(h);
                 cursors.remove(&h); // a fresh execute opens a fresh cursor
                 scroll.remove(&h);
+                // ...and a fresh execute runs the PREPARED plan, not what
+                // the last fetch left of it. The first execute of a handle
+                // records the plan; every later one restores it. `Rc`, so
+                // this costs a refcount rather than a copy.
+                match prepared_plans.get(&h) {
+                    Some(p) => plan = p.clone(),
+                    None => {
+                        prepared_plans.insert(h, plan.clone());
+                    }
+                }
                 let op_tr = read_int(&mut s, &mut dec)?;
                 let in_blr = read_wire_bytes(&mut s, &mut dec)?; // input blr
                 read_int(&mut s, &mut dec)?; // msg number
@@ -76302,6 +76328,7 @@ fn after_auth(
                 // execute, so its working set must survive.
                 if how == 2 {
                     stmts.remove(&h);
+                    prepared_plans.remove(&h);
                     if h == cur_stmt {
                         stmt_sql.clear();
                         plan = std::rc::Rc::new(Plan::Scalar(ScalarVal::Fixed(Some(FIXED_ANSWER)), "CONSTANT".to_string(), None, ScalarTy::int64()));
@@ -77433,6 +77460,16 @@ fn after_auth(
                 use_stmt!(h);
                 cursors.remove(&h); // a fresh execute opens a fresh cursor
                 scroll.remove(&h);
+                // ...and a fresh execute runs the PREPARED plan, not what
+                // the last fetch left of it. The first execute of a handle
+                // records the plan; every later one restores it. `Rc`, so
+                // this costs a refcount rather than a copy.
+                match prepared_plans.get(&h) {
+                    Some(p) => plan = p.clone(),
+                    None => {
+                        prepared_plans.insert(h, plan.clone());
+                    }
+                }
                 let op_tr = read_int(&mut s, &mut dec)?;
                 let in_blr = read_wire_bytes(&mut s, &mut dec)?; // input blr
                 read_int(&mut s, &mut dec)?; // msg number
