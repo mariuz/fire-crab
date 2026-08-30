@@ -44476,10 +44476,6 @@ fn plan_win_item(
                 return None; // navigation with no order is unpinned
             }
             let arg = resolve_expr(arg_raw, &columns, &descs)?;
-            let default = match def_raw {
-                None => None,
-                Some(d) => Some(resolve_expr(d, &columns, &descs)?),
-            };
             // the argument's describe, through the same
             // expression-column builder every scalar
             // uses (it announces NULLABLE, which LAG/LEAD
@@ -44487,6 +44483,40 @@ fn plan_win_item(
             // window's
             let mut pc =
                 build_expr_col_from(arg.clone(), &fname, &descs)?;
+            // THE DEFAULT IS CAST TO THE ARGUMENT'S TYPE, and
+            // it never widens the result - `LAG(K, 1, CAST(9 AS
+            // BIGINT))` still describes LONG len 4 (probed). It
+            // was being handed to the evaluator RAW, so the
+            // announced descriptor was stamped onto whatever
+            // the literal happened to be and the client read
+            // the mantissa: `LAG(<INTEGER>, 1, 2.5)` answered
+            // **25** where the engine answers 3, `LAG(<NUMERIC
+            // (9,2)>, 1, 7)` answered 0.07 for 7.00, and
+            // `LAG(<INTEGER>, 1, '12')` answered 0 for 12. The
+            // describe was byte-identical throughout, so only
+            // the number was wrong.
+            //
+            // Ordinary CAST semantics, which the existing cast
+            // machinery already implements: an exact numeric
+            // rounds half away from zero into an integer target
+            // (2.4 -> 2, 2.5 -> 3, -2.5 -> -3), an integer
+            // rescales up into a scaled one (7 -> 7.00), a
+            // parsable string parses, and an unparsable one is
+            // a RUNTIME conversion error rather than a silent 0.
+            let default = match def_raw {
+                None => None,
+                Some(d) => {
+                    let e = resolve_expr(d, &columns, &descs)?;
+                    Some(match cast_target_of_col(&pc) {
+                        Some(t) => Expr::Cast(
+                            Box::new(e),
+                            t,
+                            fire_crab_ods::intl::CS_UTF8,
+                        ),
+                        None => e,
+                    })
+                }
+            };
             pc.name = alias.clone().unwrap_or_else(|| fname.to_string());
             pc.fname = Some(fname.to_string());
             pc.relation = None;
@@ -44637,71 +44667,151 @@ fn compute_windows(
                     } else if let Some(fr) =
                         frame.as_ref().filter(|f| f.mode == FrameMode::Range)
                     {
-                        // EXPLICIT RANGE FRAME: the bounds are offsets in the
-                        // single INTEGER order key's VALUES (checked at
-                        // plan), so a row's frame is every partition row
-                        // whose key lies in the value interval - peers fall
-                        // in naturally. `desc` flips the offset direction and
-                        // the "before/after in sort order" test.
+                        // EXPLICIT RANGE FRAME, as a POSITION INTERVAL over
+                        // the sorted partition - not as a filter on key
+                        // VALUES, which is what this was and which got the
+                        // NULL key wrong twice over. The old filter dropped
+                        // every NULL-key row from every other row's frame
+                        // (`keyi(ri)?`) even when that side's bound was
+                        // UNBOUNDED, and hard-wired a NULL-key row's own
+                        // frame to its NULL peers without ever consulting
+                        // the bounds. `RANGE BETWEEN UNBOUNDED PRECEDING AND
+                        // UNBOUNDED FOLLOWING` - the whole partition by
+                        // definition - answered 2,2,7,7,7,7,7,7,7 over a
+                        // nine-row partition with a two-row NULL peer group
+                        // where every row is 9, and the SUMs were corrupted
+                        // with them, not merely the counts.
+                        //
+                        // The measured laws this implements:
+                        //   * UNBOUNDED IS ABSOLUTE - the partition's first
+                        //     or last position, whatever the NULLness. There
+                        //     is no NULL/non-NULL barrier.
+                        //   * a NULL key never satisfies a VALUE bound of a
+                        //     non-NULL row.
+                        //   * an OFFSET bound on a NULL CURRENT key
+                        //     degenerates BY SIDE to that row's peer group -
+                        //     start to its first peer, end to its last -
+                        //     while an UNBOUNDED bound on the same row does
+                        //     NOT degenerate. (Probed: `RANGE BETWEEN 1
+                        //     FOLLOWING AND 3 FOLLOWING` gives a NULL row its
+                        //     whole peer group, neither 0 rows nor 1.)
+                        //   * peers are equality on the ORDER BY tuple with
+                        //     NULL not distinct from NULL, and CURRENT ROW
+                        //     under RANGE reaches through the LAST peer.
+                        //
+                        // The implicit-frame arm below already worked
+                        // positionally, which is why `OVER (ORDER BY K)`
+                        // agreed while the spelt-out `RANGE BETWEEN
+                        // UNBOUNDED PRECEDING AND CURRENT ROW` did not.
                         let desc = spec.order.first().is_some_and(|k| k.desc);
-                        // this row's integer key (scale 0), or None for a
-                        // NULL key
-                        let keyi = |ri: usize| -> Option<i128> {
-                            numeric_parts(&ordrows[ri][0]).map(|(raw, _)| raw)
+                        let mut perm: Vec<usize> = (0..idxs.len()).collect();
+                        perm.sort_by(|&a, &b| {
+                            order_cmp(&ordrows[idxs[a]], &ordrows[idxs[b]], &okeys)
+                        });
+                        let len = perm.len();
+                        // the key at a POSITION, None for a NULL key
+                        let keyat = |pos: usize| -> Option<i128> {
+                            numeric_parts(&ordrows[idxs[perm[pos]]][0]).map(|(raw, _)| raw)
                         };
-                        // the bound's value as a delta applied to the key kc,
-                        // or None for an UNBOUNDED edge
-                        let bval = |b: &FrameBound, kc: i128| -> Option<i128> {
+                        let same_peer = |a: usize, b: usize| {
+                            order_cmp(
+                                &ordrows[idxs[perm[a]]],
+                                &ordrows[idxs[perm[b]]],
+                                &okeys,
+                            ) == std::cmp::Ordering::Equal
+                        };
+                        let peer_start = |pos: usize| {
+                            let mut i = pos;
+                            while i > 0 && same_peer(i - 1, pos) {
+                                i -= 1;
+                            }
+                            i
+                        };
+                        let peer_end = |pos: usize| {
+                            let mut i = pos;
+                            while i + 1 < len && same_peer(i + 1, pos) {
+                                i += 1;
+                            }
+                            i
+                        };
+                        // the key value an offset bound resolves to
+                        let bval = |b: &FrameBound, kc: i128| -> i128 {
                             match b {
-                                FrameBound::UnboundedPreceding
-                                | FrameBound::UnboundedFollowing => None,
-                                FrameBound::CurrentRow => Some(kc),
                                 FrameBound::Preceding(x) => {
-                                    Some(if desc { kc + *x as i128 } else { kc - *x as i128 })
+                                    if desc { kc + *x as i128 } else { kc - *x as i128 }
                                 }
                                 FrameBound::Following(x) => {
-                                    Some(if desc { kc - *x as i128 } else { kc + *x as i128 })
+                                    if desc { kc - *x as i128 } else { kc + *x as i128 }
                                 }
+                                _ => kc,
                             }
                         };
-                        for &cur in &idxs {
-                            let v = match keyi(cur) {
-                                // a NULL-key row's frame is its NULL peers
-                                // (RANGE groups NULLs); scanned by key too
-                                None => {
-                                    let win: Vec<Vec<Value>> = idxs
-                                        .iter()
-                                        .filter(|&&ri| keyi(ri).is_none())
-                                        .map(|&ri| rows[ri].clone())
-                                        .collect();
-                                    compute_group(&win, &gi)?
-                                        .into_iter()
-                                        .next()
-                                        .unwrap_or(Value::Null)
-                                }
-                                Some(kc) => {
-                                    let sv = bval(&fr.start, kc);
-                                    let ev = bval(&fr.end, kc);
-                                    let win: Vec<Vec<Value>> = idxs
-                                        .iter()
-                                        .filter_map(|&ri| {
-                                            let rk = keyi(ri)?; // NULL key: out
-                                            let after = sv.is_none_or(|s| {
-                                                if desc { rk <= s } else { rk >= s }
-                                            });
-                                            let before = ev.is_none_or(|e| {
-                                                if desc { rk >= e } else { rk <= e }
-                                            });
-                                            (after && before).then(|| rows[ri].clone())
-                                        })
-                                        .collect();
-                                    compute_group(&win, &gi)?
-                                        .into_iter()
-                                        .next()
-                                        .unwrap_or(Value::Null)
-                                }
+                        for pos in 0..len {
+                            let k = keyat(pos);
+                            // the FIRST position at or after the start bound
+                            let lo = match &fr.start {
+                                FrameBound::UnboundedPreceding => 0,
+                                FrameBound::UnboundedFollowing => len, // empty
+                                FrameBound::CurrentRow => peer_start(pos),
+                                b => match k {
+                                    None => peer_start(pos),
+                                    Some(kc) => {
+                                        let s = bval(b, kc);
+                                        (0..len)
+                                            .find(|&p| {
+                                                keyat(p).is_some_and(|rk| {
+                                                    if desc { rk <= s } else { rk >= s }
+                                                })
+                                            })
+                                            .unwrap_or(len)
+                                    }
+                                },
                             };
-                            vals[cur][wi] = v;
+                            // ... and the LAST at or before the end bound
+                            let hi = match &fr.end {
+                                FrameBound::UnboundedFollowing => len.saturating_sub(1),
+                                FrameBound::UnboundedPreceding => 0, // empty unless lo == 0
+                                FrameBound::CurrentRow => peer_end(pos),
+                                b => match k {
+                                    None => peer_end(pos),
+                                    Some(kc) => {
+                                        let e = bval(b, kc);
+                                        match (0..len).rev().find(|&p| {
+                                            keyat(p).is_some_and(|rk| {
+                                                if desc { rk >= e } else { rk <= e }
+                                            })
+                                        }) {
+                                            Some(p) => p,
+                                            // nothing qualifies: an empty frame
+                                            None => {
+                                                vals[idxs[perm[pos]]][wi] = compute_group(&[], &gi)?
+                                                    .into_iter()
+                                                    .next()
+                                                    .unwrap_or(Value::Null);
+                                                continue;
+                                            }
+                                        }
+                                    }
+                                },
+                            };
+                            let v = if lo >= len || lo > hi {
+                                // an empty frame folds no rows at all -
+                                // COUNT 0, every other fold NULL
+                                compute_group(&[], &gi)?
+                                    .into_iter()
+                                    .next()
+                                    .unwrap_or(Value::Null)
+                            } else {
+                                let win: Vec<Vec<Value>> = perm[lo..=hi]
+                                    .iter()
+                                    .map(|&p| rows[idxs[p]].clone())
+                                    .collect();
+                                compute_group(&win, &gi)?
+                                    .into_iter()
+                                    .next()
+                                    .unwrap_or(Value::Null)
+                            };
+                            vals[idxs[perm[pos]]][wi] = v;
                         }
                     } else if spec.order.is_empty() {
                         // WHOLE-PARTITION frame: one fold for every row
@@ -45927,6 +46037,43 @@ impl ScalarTy {
             scale: c.scale,
             sub_type: c.sub_type,
         }
+    }
+}
+
+/// The CAST TARGET that reproduces a described column's own type - what
+/// a value must be converted to in order to travel under that describe.
+///
+/// Used where a value reaches a slot typed by something ELSE: LAG/LEAD's
+/// DEFAULT argument, which the engine casts to argument #1's type rather
+/// than widening the result to fit it. `None` for the describes that no
+/// cast target names (a blob, a boolean, the time-zone temporals), whose
+/// callers then leave the value alone.
+fn cast_target_of_col(pc: &ProjCol) -> Option<CastTarget> {
+    let bytes = |n: i32| u8::try_from(n).ok();
+    match pc.sql_type & !1 {
+        500 | 496 | 580 | 32752 => {
+            let b = bytes(pc.length)?;
+            if pc.scale == 0 {
+                Some(CastTarget::Int { bytes: b })
+            } else {
+                Some(CastTarget::Numeric {
+                    scale: i8::try_from(pc.scale).ok()?,
+                    bytes: b,
+                    sub_type: i16::try_from(pc.sub_type).unwrap_or(0),
+                })
+            }
+        }
+        480 | 482 => Some(CastTarget::Approx),
+        452 | 448 => Some(CastTarget::Text {
+            len: usize::try_from(pc.length).ok()?,
+            pad: pc.sql_type & !1 == 452,
+            synthetic: true,
+            cs: None,
+        }),
+        570 => Some(CastTarget::Temporal(TKind::Date)),
+        560 => Some(CastTarget::Temporal(TKind::Time)),
+        510 => Some(CastTarget::Temporal(TKind::Timestamp)),
+        _ => None,
     }
 }
 

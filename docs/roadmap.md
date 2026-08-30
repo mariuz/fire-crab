@@ -3041,6 +3041,60 @@ pointer-page and TIP page numbers is the next step when it dominates.
 
 ## Next, in order
 
+- **WINDOW FRAMES OVER A NULL KEY, AND LAG/LEAD'S DEFAULT DONE
+  (2026-08-30, `serve-real-window` 83 -> 119):** two silent wrong-answer
+  classes, both with a byte-identical SQLDA.
+  **THE EXPLICIT RANGE FRAME WAS A VALUE FILTER**, and it got the NULL
+  ordering key wrong twice over: `keyi(ri)?` dropped every NULL-key row
+  from every OTHER row's frame even when that side's bound was
+  UNBOUNDED, and the `None =>` arm hard-wired a NULL-key row's own frame
+  to its NULL peers without ever consulting the bounds. The reported
+  symptom was two offset shapes; the real extent is wider - `RANGE
+  BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING`, the whole
+  partition BY DEFINITION, answered 2,2,7,7,7,7,7,7,7 over a nine-row
+  partition with a two-row NULL peer group where every row is 9, and the
+  SUMs were corrupted with the counts (200 vs 30 at one row), so this was
+  wrong DATA and not a miscount.
+  Now a POSITION INTERVAL over the sorted partition, which is how the
+  IMPLICIT frame arm always worked - and that asymmetry is what localised
+  it: `OVER (ORDER BY K)` agreed while the semantically identical `RANGE
+  BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` did not. Both are gated
+  now so the two paths cannot drift.
+  The measured laws: UNBOUNDED IS ABSOLUTE (the partition edge, whatever
+  the NULLness - there is no NULL/non-NULL barrier); a NULL key never
+  satisfies a VALUE bound of a non-NULL row; an OFFSET bound on a NULL
+  CURRENT key degenerates BY SIDE to that row's peer group while an
+  UNBOUNDED bound on the same row does NOT (proved side-based by `RANGE
+  BETWEEN 1 FOLLOWING AND 3 FOLLOWING` giving a NULL row its whole peer
+  group, neither 0 rows nor 1); peers are equality on the ORDER BY tuple
+  with NULL not distinct from NULL; CURRENT ROW under RANGE reaches
+  through the LAST peer.
+  **LAG/LEAD'S DEFAULT WAS NEVER CAST** to argument #1's type - it was
+  handed to the evaluator raw and the announced descriptor was stamped
+  onto whatever the literal happened to be, so the client read the
+  MANTISSA: `LAG(<INTEGER>, 1, 2.5)` answered **25** where the engine
+  answers 3, `LAG(<NUMERIC(9,2)>, 1, 7)` answered 0.07 for 7.00, and
+  `LAG(<INTEGER>, 1, '12')` answered 0 for 12. Not in the original hunt;
+  found by the measurement pass. Ordinary CAST semantics now apply
+  (`cast_target_of_col` rebuilds the argument's own type as a target),
+  and the default never widens the result - `LAG(K, 1, CAST(9 AS
+  BIGINT))` still describes LONG len 4.
+  Closes hunt findings 4 and 20 and this new one.
+  NOT ATTEMPTED HERE, and the natural next chunk: the **28
+  PREPARE-THEN-FAIL** shapes the measurement pass found - a window inside
+  a CTE, a derived table, a UNION branch, a view body or an INSERT ...
+  SELECT source PREPAREs with a byte-identical correct SQLDA and then
+  dies, and in the UNION ALL case DELIVERS NINE CORRECT ROWS before
+  failing mid-stream. Those are protocol violations rather than
+  boundaries: the client has been told the statement is valid and has
+  cached its description. The real fix is to make `branch_rows_res`
+  window-aware (fold before sort, mirroring emit's Project arm) and must
+  ship with a full SQLDA re-diff of the nested shapes; it also re-routes
+  the batch-fetch and scrollable-cursor paths, which are unprobed. A
+  cheaper way-station - refusing them at PREPARE - is honest but refuses
+  shapes the engine answers, so it is only defensible as a step on the
+  way.
+
 - **A GROUPED SELECT LIST'S EXPRESSIONS GET THE ORDINARY NULLABLE RULE
   DONE (2026-08-30, `serve-real-groupconst` 11 -> 29):** `plan_group`
   had a nullability pass covering only the plain group KEYS, so every

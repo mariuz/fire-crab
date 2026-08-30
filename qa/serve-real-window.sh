@@ -85,6 +85,8 @@ INSERT INTO T VALUES (1,10,1,5,1.50,'aa'); INSERT INTO T VALUES (2,10,1,3,2.50,'
 INSERT INTO T VALUES (3,20,1,9,5.00,'cc'); INSERT INTO T VALUES (4,20,2,9,1.00,'dd');
 INSERT INTO T VALUES (5,30,2,1,2.00,'ee'); INSERT INTO T VALUES (6,30,2,7,3.00,NULL);
 INSERT INTO T VALUES (7,NULL,NULL,4,NULL,'gg');
+INSERT INTO T VALUES (8,NULL,3,6,4.00,'hh');
+INSERT INTO T VALUES (9,40,3,9,6.00,'ii');
 COMMIT;
 EOF
     chmod 666 "$1" 2>/dev/null
@@ -212,6 +214,76 @@ both "FILTER OVER ()"          "SELECT ID, SUM(V) FILTER (WHERE V>5) OVER () S F
 both "FILTER running"          "SELECT ID, SUM(V) FILTER (WHERE V>3) OVER (ORDER BY V, ID) S FROM T ORDER BY V, ID"
 both "FILTER ROWS frame"       "SELECT ID, SUM(V) FILTER (WHERE V>3) OVER (ORDER BY V, ID ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) S FROM T ORDER BY V, ID"
 both "FILTER named window"     "SELECT ID, SUM(V) FILTER (WHERE V>5) OVER w S FROM T WINDOW w AS (PARTITION BY G) ORDER BY ID"
+
+
+# --- EXPLICIT RANGE FRAMES AND THE NULL ORDERING KEY -------------------------
+# The explicit-RANGE arm built each row's frame by FILTERING the partition
+# on key VALUE, and got the NULL key wrong twice over: it dropped every
+# NULL-key row from every other row's frame even when that side's bound
+# was UNBOUNDED, and hard-wired a NULL-key row's own frame to its NULL
+# peers without ever consulting the bounds. `RANGE BETWEEN UNBOUNDED
+# PRECEDING AND UNBOUNDED FOLLOWING` - the whole partition by definition -
+# answered 2,2,7,7,7,7,7,7,7 over a nine-row partition holding a two-row
+# NULL peer group, where every row is 9. The SUMs went with the counts, so
+# this was corrupted DATA and not merely a miscount.
+#
+# The engine's laws, measured: UNBOUNDED is ABSOLUTE (the partition edge,
+# whatever the NULLness - there is no NULL/non-NULL barrier); a NULL key
+# never satisfies a VALUE bound of a non-NULL row; an OFFSET bound on a
+# NULL CURRENT key degenerates BY SIDE to that row's peer group, while an
+# UNBOUNDED bound on the same row does not; peers are equality on the
+# ORDER BY tuple with NULL not distinct from NULL, and CURRENT ROW under
+# RANGE reaches through the LAST peer.
+#
+# The tell that localised it: `OVER (ORDER BY G)` - the implicit default
+# frame, which is positional - AGREED, while the semantically identical
+# `OVER (ORDER BY G RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)`
+# did not. Both are checked below so the two paths cannot drift apart.
+for f in "UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING" \
+         "UNBOUNDED PRECEDING AND CURRENT ROW" \
+         "UNBOUNDED PRECEDING AND 2 FOLLOWING" \
+         "2 PRECEDING AND UNBOUNDED FOLLOWING" \
+         "CURRENT ROW AND UNBOUNDED FOLLOWING" \
+         "1 PRECEDING AND 1 FOLLOWING" \
+         "CURRENT ROW AND CURRENT ROW" \
+         "1 FOLLOWING AND 3 FOLLOWING" \
+         "3 PRECEDING AND 1 PRECEDING"; do
+    both "COUNT RANGE $f" "SELECT ID, COUNT(*) OVER (ORDER BY G RANGE BETWEEN $f) C FROM T ORDER BY ID"
+    both "SUM   RANGE $f" "SELECT ID, SUM(V) OVER (ORDER BY G RANGE BETWEEN $f) S FROM T ORDER BY ID"
+done
+both "RANGE over a DESC key" \
+    "SELECT ID, COUNT(*) OVER (ORDER BY G DESC RANGE BETWEEN UNBOUNDED PRECEDING AND 2 FOLLOWING) C FROM T ORDER BY ID"
+both "RANGE inside a PARTITION" \
+    "SELECT ID, COUNT(*) OVER (PARTITION BY H ORDER BY G RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) C FROM T ORDER BY ID"
+# the two controls that must keep agreeing with each other
+both "the implicit default frame"  "SELECT ID, COUNT(*) OVER (ORDER BY G) C FROM T ORDER BY ID"
+both "the ROWS frame, untouched"   "SELECT ID, COUNT(*) OVER (ORDER BY G ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) C FROM T ORDER BY ID"
+
+# --- LAG/LEAD's DEFAULT IS CAST TO THE ARGUMENT'S TYPE ------------------------
+# The default was handed to the evaluator RAW, so the announced descriptor
+# was stamped onto whatever the literal happened to be and the client read
+# the MANTISSA: LAG(<INTEGER>, 1, 2.5) answered 25 where the engine
+# answers 3, LAG(<NUMERIC(9,2)>, 1, 7) answered 0.07 for 7.00, and
+# LAG(<INTEGER>, 1, '12') answered 0 for 12. The describe was
+# byte-identical throughout - only the number was wrong, which is why a
+# describe comparison alone would have passed it.
+#
+# Ordinary CAST semantics, all measured: half away from zero into an
+# integer target, rescale up into a scaled one, a parsable string parses,
+# and the default NEVER widens the result.
+both "default 2.5 into INTEGER"  "SELECT ID, LAG(V,1,2.5) OVER (ORDER BY ID) L FROM T ORDER BY ID"
+both "default 2.4 rounds down"   "SELECT ID, LAG(V,1,2.4) OVER (ORDER BY ID) L FROM T ORDER BY ID"
+both "default 3.5 rounds up"     "SELECT ID, LAG(V,1,3.5) OVER (ORDER BY ID) L FROM T ORDER BY ID"
+both "default -2.5 away from zero" "SELECT ID, LAG(V,1,-2.5) OVER (ORDER BY ID) L FROM T ORDER BY ID"
+both "default 0.125 truncates to 0" "SELECT ID, LAG(V,1,0.125) OVER (ORDER BY ID) L FROM T ORDER BY ID"
+both "a parsable string default" "SELECT ID, LAG(V,1,'12') OVER (ORDER BY ID) L FROM T ORDER BY ID"
+both "an approximate default"    "SELECT ID, LAG(V,1,1.9e0) OVER (ORDER BY ID) L FROM T ORDER BY ID"
+both "integer default into NUMERIC(9,2)" "SELECT ID, LAG(N92,1,7) OVER (ORDER BY ID) L FROM T ORDER BY ID"
+both "scaled default into NUMERIC(9,2)"  "SELECT ID, LAG(N92,1,7.125) OVER (ORDER BY ID) L FROM T ORDER BY ID"
+both "a text argument and default" "SELECT ID, LAG(NM,1,'zz') OVER (ORDER BY ID) L FROM T ORDER BY ID"
+both "the default must NOT widen"  "SELECT ID, LAG(V,1,CAST(9 AS BIGINT)) OVER (ORDER BY ID) L FROM T ORDER BY ID"
+both "no default, the control"     "SELECT ID, LAG(V,1) OVER (ORDER BY ID) L FROM T ORDER BY ID"
+both "LEAD takes the same rule"    "SELECT ID, LEAD(V,1,2.5) OVER (ORDER BY ID) L FROM T ORDER BY ID"
 
 echo "ran $ran checks"
 exit $fail
