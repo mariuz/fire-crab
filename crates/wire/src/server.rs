@@ -61450,6 +61450,46 @@ fn strip_inner_all(text: &str, names: &[&str]) -> String {
 /// `EXISTS (SELECT 1 FROM U WHERE U.C = T.C)` is a -206 and not a
 /// correlation. Without it this pass read every unrecognised qualifier
 /// as "the outer one" and ANSWERED where the engine raises.
+/// Does this subquery's WHERE name the OUTER scope?
+///
+/// A correlated subquery whose correlation this server can express is
+/// answered as a semi-join; one it cannot must REFUSE. The path that
+/// mattered is the fallback: when the correlated reading declines, the
+/// caller used to re-evaluate the subquery as UNCORRELATED and push a
+/// single verdict for every row - which is a silent wrong answer to
+/// everyday SQL. `SELECT id FROM t WHERE NOT EXISTS (SELECT 1 FROM t x
+/// WHERE x.id > t.id)` answered EVERY row instead of the last one, and
+/// `(SELECT COUNT(*) FROM t x WHERE x.id < t.id)` answered 0 for every
+/// row, because the correlation is an INEQUALITY and only equality pairs
+/// are recognised as one.
+///
+/// The test is scope, not shape: a qualifier that the OUTER binding
+/// answers to and that does NOT name the inner FROM item is an outer
+/// reference, whatever operator it appears under. An ALIAS REPLACES THE
+/// TABLE NAME, so `FROM t x` makes the inner relation answer to `x`
+/// alone and a `t.` qualifier there belongs to the outer query.
+fn subquery_names_outer(sql: &str, outer_bind: &ColBinding<'_>) -> bool {
+    let Some((_, table_s, where_s, _, _, _)) = split_query(sql) else {
+        return false;
+    };
+    let Some(w) = where_s else { return false };
+    let Some((from, _)) = parse_from(table_s) else { return false };
+    let inner: Vec<String> = match from.alias {
+        Some(a) => vec![a.to_string()],
+        None => vec![from.table.to_string()],
+    };
+    let Some(toks) = tokenize(w) else { return false };
+    toks.iter().any(|t| match t {
+        Tok::Ident(n) => match n.rsplitn(2, '.').nth(1) {
+            Some(q) => {
+                !inner.iter().any(|i| i.eq_ignore_ascii_case(q)) && outer_bind.answers_to(q)
+            }
+            None => false,
+        },
+        _ => false,
+    })
+}
+
 fn split_correlation(
     toks: &[Tok],
     table: &str,
@@ -61474,13 +61514,26 @@ fn split_correlation(
             // `FROM EMP E ... WHERE E.DEPT_ID = D.ID` qualifies by E,
             // and reading only the table name found no correlation at
             // all - which made every aliased correlated subquery refuse
+            // AN ALIAS REPLACES THE TABLE NAME. `FROM EMP E` makes that
+            // relation answer to `E` and to nothing else, so a qualifier
+            // spelling the BASE TABLE NAME belongs to an outer scope -
+            // which is the whole of how a self-referencing correlated
+            // subquery works:
+            //
+            //   SELECT id FROM t WHERE NOT EXISTS
+            //       (SELECT 1 FROM t x WHERE x.id > t.id)
+            //
+            // Reading `t.id` as the INNER relation turned that into
+            // `x.id > x.id` - always false - so the anti-join answered
+            // EVERY row instead of the last one, and the running-count
+            // idiom `(SELECT COUNT(*) FROM t x WHERE x.id < t.id)`
+            // answered 0 for every row. Both are silent wrong answers to
+            // everyday SQL.
             let in_tbl = |q: &str| -> bool {
-                match qual_of(q) {
-                    Some(t) => {
-                        t.eq_ignore_ascii_case(table)
-                            || alias.map_or(false, |a| t.eq_ignore_ascii_case(a))
-                    }
-                    None => false,
+                match (qual_of(q), alias) {
+                    (Some(t), Some(a)) => t.eq_ignore_ascii_case(a),
+                    (Some(t), None) => t.eq_ignore_ascii_case(table),
+                    (None, _) => false,
                 }
             };
             // A QUALIFIER THAT NAMES NEITHER SCOPE RESOLVES NOWHERE.
@@ -62238,6 +62291,17 @@ fn resolve_subqueries(
                     }
                     // uncorrelated: the verdict is the same for every row
                     None => {
+                        // ...but only if it really is uncorrelated. A
+                        // subquery that names the outer scope through a
+                        // correlation this server cannot express must
+                        // REFUSE: evaluating it as uncorrelated pushes ONE
+                        // verdict for every row, which turned the
+                        // anti-join idiom into "every row" and the
+                        // running-count idiom into zero
+                        // ([subquery_names_outer]).
+                        if subquery_names_outer(sql, outer_bind) {
+                            return None;
+                        }
                         let rows = eval_subquery(sql, db, db_opt, None, Some(outer_bind), true)?;
                         out.push(Tok::Const(rows.any != negated));
                     }
@@ -65298,6 +65362,29 @@ fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
                     _ => None,
                 };
                 let side = parse_side(t, pos, np)?;
+                // ...AND A PARENTHESISED OR CAST NULL IS STILL NULL. Only a
+                // BARE `Tok::Null` was recognised above, so `A IS DISTINCT
+                // FROM (NULL)` and `A IS DISTINCT FROM CAST(NULL AS
+                // INTEGER)` fell through to the value comparison below and
+                // came back EXACTLY INVERTED - `IS DISTINCT FROM` returning
+                // the NULL rows and `IS NOT DISTINCT FROM` returning none.
+                // The quiet kind: any query builder that parenthesises its
+                // operands got its NULL-matching silently reversed.
+                let side_is_null = match &side {
+                    Side::Val(Rhs::Null) => true,
+                    Side::Expr(RawExpr::Null) => true,
+                    Side::Expr(RawExpr::Cast(inner, _)) => {
+                        matches!(**inner, RawExpr::Null)
+                    }
+                    _ => false,
+                };
+                if side_is_null {
+                    return Some(if not {
+                        leaf(RawKind::IsNull)
+                    } else {
+                        leaf(RawKind::IsNotNull)
+                    });
+                }
                 let cmp_leaf = |op: Cmp| -> Ast {
                     match &side {
                         Side::Val(v) => Ast::Leaf(RawTerm {

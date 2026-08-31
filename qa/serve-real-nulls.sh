@@ -167,5 +167,73 @@ case "$r" in
     *) echo "DIFF unknown ORDER BY function answered: [$r]"; fail=1 ;;
 esac
 
+# --- a NULL-valued RIGHT SIDE is NULL however it is spelled -------------
+# `IS [NOT] DISTINCT FROM` was desugared to IS NULL / IS NOT NULL only for
+# a BARE NULL token. Parenthesise it - `IS DISTINCT FROM (NULL)` - or cast
+# it, and the rewrite did not fire; the predicate fell through to the
+# ordinary value comparison and came back EXACTLY INVERTED, returning the
+# NULL rows where the engine returns the others. That is the quiet kind of
+# wrong answer: any query builder that wraps its operands in parentheses
+# had its NULL-matching silently reversed, with no error anywhere.
+both "IS DISTINCT FROM (NULL)" \
+    "SELECT ID FROM T WHERE AMT IS DISTINCT FROM (NULL) ORDER BY ID"
+both "IS NOT DISTINCT FROM (NULL)" \
+    "SELECT ID FROM T WHERE AMT IS NOT DISTINCT FROM (NULL) ORDER BY ID"
+both "IS DISTINCT FROM a CAST NULL" \
+    "SELECT ID FROM T WHERE AMT IS DISTINCT FROM CAST(NULL AS INTEGER) ORDER BY ID"
+both "IS NOT DISTINCT FROM a parenthesised CAST NULL" \
+    "SELECT ID FROM T WHERE AMT IS NOT DISTINCT FROM (CAST(NULL AS INTEGER)) ORDER BY ID"
+both "a text CAST NULL" \
+    "SELECT ID FROM T WHERE NAME IS NOT DISTINCT FROM CAST(NULL AS VARCHAR(10)) ORDER BY ID"
+# the controls: neither parentheses alone nor a NULL alone is the trigger
+both "control: a bare NULL" \
+    "SELECT ID FROM T WHERE AMT IS DISTINCT FROM NULL ORDER BY ID"
+both "control: a bare NULL under NOT" \
+    "SELECT ID FROM T WHERE AMT IS NOT DISTINCT FROM NULL ORDER BY ID"
+both "control: parenthesised NON-null" \
+    "SELECT ID FROM T WHERE AMT IS DISTINCT FROM (5) ORDER BY ID"
+both "control: parenthesised NON-null under NOT" \
+    "SELECT ID FROM T WHERE AMT IS NOT DISTINCT FROM (5) ORDER BY ID"
+
+# --- a correlated subquery answers per OUTER ROW, or it refuses ---------
+# An EXISTS whose correlation this server cannot express used to fall back
+# to evaluating the subquery as UNCORRELATED and pushing ONE verdict for
+# every row. Only EQUALITY pairs are recognised as a correlation, so the
+# two commonest inequality idioms answered nonsense with no error:
+#
+#   NOT EXISTS (SELECT 1 FROM t x WHERE x.id > t.id)   -- "the last row"
+#       answered EVERY row instead of one
+#   (SELECT COUNT(*) FROM t x WHERE x.id < t.id)       -- a running count
+#       answered 0 for every row
+#
+# They REFUSE now, which is a boundary rather than a wrong answer. The
+# equality forms below must keep ANSWERING - the refusal must not have
+# been bought by giving up the shapes that worked.
+both "correlated EXISTS on equality" \
+    "SELECT ID FROM T WHERE EXISTS (SELECT 1 FROM T X WHERE X.AMT = T.AMT) ORDER BY ID"
+both "correlated NOT EXISTS on equality" \
+    "SELECT ID FROM T WHERE NOT EXISTS (SELECT 1 FROM T X WHERE X.ID = T.ID) ORDER BY ID"
+both "an uncorrelated EXISTS still folds" \
+    "SELECT ID FROM T WHERE EXISTS (SELECT 1 FROM T WHERE AMT = 10) ORDER BY ID"
+both "an uncorrelated NOT EXISTS over no rows" \
+    "SELECT ID FROM T WHERE NOT EXISTS (SELECT 1 FROM T WHERE AMT = 999) ORDER BY ID"
+
+# the recorded boundary: it must REFUSE, and must never answer a constant
+ran_boundary() { # <label> <sql>
+    local r
+    r=$(query "$2" "$PORT" "$A")
+    case "$r" in
+        ERR*) echo "OK   refuses cleanly (recorded boundary): $1" ;;
+        *) echo "DIFF $1 ANSWERED [$r] - an unexpressible correlation must refuse,"
+           echo "     never fold to one verdict for every row. If this now answers,"
+           echo "     check it against the engine and move it into the block above."
+           fail=1 ;;
+    esac
+}
+ran_boundary "NOT EXISTS with an inequality correlation" \
+    "SELECT ID FROM T WHERE NOT EXISTS (SELECT 1 FROM T X WHERE X.ID > T.ID) ORDER BY ID"
+ran_boundary "EXISTS with an inequality correlation" \
+    "SELECT ID FROM T WHERE EXISTS (SELECT 1 FROM T X WHERE X.ID > T.ID) ORDER BY ID"
+
 rm -f "$A" "$B"
 exit $fail

@@ -52,6 +52,8 @@ One line each; the gate is the proof.
 | one per-connection object id space | a compiled BLR request and a prepared statement are different KINDS over ONE client-side id space (fbclient's `port_objects` is a single untagged union array); minting them from separate counters collided at id 5 and KILLED THE CONNECTION | `serve-real-objid` 14 |
 | a folded subquery carries its column's charset | a select-list scalar subquery is erased at prepare - its value is spliced back into the statement TEXT and re-planned - so the spliced literal was typed like any literal, in the ATTACHMENT's charset, and the inner column's set was lost the moment the subquery became an OPERAND. Now spliced as `CAST(x'..' AS VARCHAR(n) CHARACTER SET <set>)` | `serve-real-subqdesc` 70 |
 | a window is a value and composes | each window call is LIFTED out of its expression, folded as its own column, and replaced by a reference to it - so `ROW_NUMBER() OVER (...) + 1`, COALESCE/CASE/CAST/function/concat over a window, and two windows in one expression all work; plus PERCENT_RANK and CUME_DIST | `serve-real-window` 139 |
+| a NULL side is NULL however spelled | `IS [NOT] DISTINCT FROM` desugared to IS NULL only for a BARE NULL token, so a parenthesised or CAST NULL fell through to a value comparison and came back EXACTLY INVERTED | `serve-real-nulls` 40 |
+| a correlated subquery answers per row or refuses | only EQUALITY pairs counted as a correlation; anything else was re-evaluated as UNCORRELATED and folded to ONE verdict for every row, so the anti-join idiom answered every row and the running-count idiom answered 0 | `serve-real-nulls` 40 |
 
 ## Stale claims retired
 
@@ -4189,6 +4191,67 @@ pointer-page and TIP page numbers is the next step when it dominates.
 - **G, the external sort** — every sort and hash build is bounded by
   RAM today; after the growth walls this is the next scalability
   ceiling a real database reaches.
+
+## Found by HUNTING outside the gates (2026-08-31) - still open
+
+A six-surface differential hunt, run because the recorded backlog held no
+wrong answers left, found these. Two were fixed the same day (the
+correlated-subquery fold and the parenthesised-NULL inversion); what
+follows survived refutation and is NOT yet implemented.
+
+- **HIGH (describe)** — an untyped NULL branch poisons the unified type of
+  CASE / COALESCE / IIF / NULLIF. fire-crab types a bare NULL as INT64 and
+  lets it win: `CASE WHEN 1=0 THEN NULL ELSE <VARCHAR(10) UTF8> END` is
+  announced `448 VARYING len 32765 charset 0 NONE` where the engine says
+  `len 40 charset 4 UTF8` - an 819x width inflation on a per-row wire
+  buffer AND a lost character set. `COALESCE(NULL, <INTEGER>)` is
+  announced INT64 len 8 where the engine says LONG len 4. The VALUES
+  agree (checked as bytes), so this is describe-only - but a client sizes
+  its buffer from the describe. The engine's rule: the other branch's
+  type wins, and with nothing to unify against a bare NULL is CHAR(1)
+  NONE (`SELECT NULL FROM RDB$DATABASE` already agrees on both).
+
+  THE ENGINE'S RULE, from primary source - `DataTypeUtilBase::makeFromList`
+  (jrd/DataTypeUtil.cpp:99), which COALESCE (ExprNodes.cpp:3927), CASE
+  (:5062) and LIST (:611) all call:
+
+  ```cpp
+  allNulls &= arg->isNull();
+  // Ignore NULL and parameter value from walking.
+  if (arg->isNull() || arg->isUnknown())
+  {
+      nullable = true;
+      continue;
+  }
+  ...
+  if (allNulls)
+      result->makeNullString();
+  ```
+
+  So a NULL argument is IGNORED for unification and only forces nullable;
+  when EVERY argument is NULL the result is `makeNullString()` - CHAR(1)
+  NONE, which is what fire-crab already answers for a standalone
+  `SELECT NULL`.
+
+  WHERE FIRE-CRAB DIVERGES, all three in server.rs: `result_width_bytes`
+  takes a plain `max` over branches for `Expr::Coalesce` (:15209) and
+  `Expr::Case` (:15212), so a NULL branch contributes the 8-byte default
+  and WINS against a LONG's 4; and `type_of` has `Expr::Null =>
+  Some(ExprType::Int)` (:58019). The TEXT width path ALREADY implements
+  the law for Coalesce (:15670, filtering `Expr::Null` with the
+  makeFromList citation in its comment) - it was simply never applied to
+  CASE or to the numeric width. `rank_of` also already does it
+  (`Expr::Null => None, // takes the sibling's rank`, :58562). So this is
+  one law applied consistently, not a new mechanism.
+- **MEDIUM (describe)** — COUNT(*) inside a CORRELATED scalar subquery is
+  announced `496 LONG len 4` where the engine says `580 INT64 len 8`.
+  This is the NARROWER, riskier direction. The non-correlated form agrees
+  on both, so it is specific to the correlated rewrite.
+- **REFUSAL** — a quantified predicate (ALL / ANY / SOME) is usable only
+  as a bare top-level WHERE conjunct; as a select-list value, under NOT,
+  under IS NOT TRUE or under OR it refuses. The engine answers all of
+  them. (Compare the window chunk: the same "a predicate is a value"
+  shape, one layer over.)
 
 ## THE RECORDED BACKLOG IS STALE - RE-MEASURE BEFORE PLANNING (2026-08-31)
 
