@@ -52,7 +52,24 @@ const OP_RELEASE: i32 = 28;
 const OP_SEND: i32 = 25; // the op the server replies to op_receive with
 const OP_START_AND_RECEIVE: i32 = 73;
 const OP_START_SEND_AND_RECEIVE: i32 = 74;
-const BLR_REQ_HANDLE: i32 = 5;
+// NO SEPARATE BLR-REQUEST HANDLE RANGE. A compiled BLR request and a
+// prepared DSQL statement are DIFFERENT KINDS OF OBJECT that share ONE
+// client-side id space: fbclient keeps a single `port_objects` array of
+// an untagged union (remote.h:1356, RemoteObject at remote.h:813), and
+// the engine allocates every id by scanning that one array
+// (`get_id()`, remote.h:1600), so two kinds can never collide there.
+// fire-crab minted request ids from their own counter starting at 5
+// while statements ran 3, 4, 5, ... - so the THIRD statement of a
+// session and a compiled request took the same id, the compile response
+// overwrote `port_objects[5]` with the request, and the next
+// `op_execute` for statement 5 failed `checkHandle()`. That raises
+// inside `xdr_sql_blr` (protocol.cpp:1922) AFTER the blr length has
+// already been written, so the CLIENT abandons its own half-written
+// packet - which is why the error is `send_packet/send` (08006) and why
+// every later statement on the connection died too.
+//
+// Requests now mint from the statement counter, which already steps over
+// live transaction handles for exactly this reason.
 const OP_COND_ACCEPT: i32 = 98;
 /// op_accept_data (94): the accept that carries the authentication
 /// outcome (plugin, authenticated flag, keys) - protocol 13+
@@ -74488,7 +74505,6 @@ fn after_auth(
         cursor: usize,
     }
     let mut blr_slots: std::collections::HashMap<i32, BlrSlot> = std::collections::HashMap::new();
-    let mut next_blr_handle: i32 = BLR_REQ_HANDLE;
 
     // --- the op loop (encrypted) ---
     loop {
@@ -77989,8 +78005,14 @@ fn after_auth(
                 }
                 match parse_blr_request(&blr) {
                     Some(req) => {
-                        let handle = next_blr_handle;
-                        next_blr_handle += 1;
+                        // one id space with statements and transactions
+                        // (see the note on the retired BLR_REQ_HANDLE)
+                        let handle = loop {
+                            next_stmt_handle += 1;
+                            if !database.as_ref().is_some_and(|d| d.knows_tx(next_stmt_handle)) {
+                                break next_stmt_handle;
+                            }
+                        };
                         blr_slots.insert(handle, BlrSlot { req, queue: Vec::new(), cursor: 0 });
                         respond(&mut s, &mut enc, handle)?;
                     }
