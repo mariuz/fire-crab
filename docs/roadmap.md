@@ -47,6 +47,7 @@ One line each; the gate is the proof.
 | blob writes + RETAIN | temp blobs over the wire materialised at the store; COMMIT/ROLLBACK RETAIN keep the transaction with its snapshot | `serve-real-blobwrite` 8, `retain` 8 |
 | transactional DDL | catalog rows under the user transaction's id, undo by state + journaled residue, deferred drops; first-updater-wins on a relation with the engine's vector; owner-only schema visibility | `serve-real-ddltx` 32 |
 | the file grows the engine's way | pointer-page chain, PIP chain, SCN pages at every `pagesPerSCN·N`, TIP chain — each crossed by fc and read by the engine (count, `gfix -v -full`, a write of its own on the new structure, a level-1 nbackup over fc's late pages), and the reverse | `serve-real-growth` 32 |
+| LATERAL is an ordinary source | a LATERAL materialises before anything above it runs, so DISTINCT / FIRST / SKIP / ROWS, an outer WHERE or ORDER BY, a derived table over it and COUNT/SUM/GROUP BY/HAVING over that derived table all work; the fetch batch is honoured (it hung any flow-control-honouring client past ~2340 rows); the comma form carries the inner column's nullability, the LEFT form is always nullable | `serve-real-lateral` 36 |
 
 ## Stale claims retired
 
@@ -4228,6 +4229,7 @@ below every wrong answer.
 - **LOW** (common table expressions) — Recursive CTE tree walk is emitted breadth-first; Firebird emits it depth-first
 - **LOW** (common table expressions) — Recursive-CTE columns leak the anchor expression's node kind into the describe `name:` field (CONSTANT); the engine leaves it empty
 - **LOW** (date/time arithmetic) — UNION DISTINCT with a CAST branch blanks the field name and table origin in the describe
+- **LOW** (LATERAL) — an OUTER column that is NOT NULL, used inside the lateral subquery's own expression (`FROM NN a, LATERAL (SELECT a.W * 2 AS Z FROM RDB$DATABASE) x`), is announced Nullable; the engine announces it fixed. Mechanism: the describe stand-in renders every outer reference as `CAST(NULL AS <type>)`, which is nullable by construction, so `inner_cols` cannot see that the outer column was fixed. Fixing it needs a NOT NULL stand-in of the same type and WIDTH per type (a bare literal would move the described width of text expressions), not a one-line change. The divergence is in the SAFE direction - a bit announced set that is never used - unlike announcing NOT NULL where a NULL can arrive, which desynchronises the wire
 
 ### The charset cluster (hunt findings 10, 11, 12, 30) - law established, not yet implemented
 
@@ -4291,6 +4293,7 @@ shape the implementation has to take.
 - low — ASCII_CHAR is unknown to fire-crab
 - low — CAST(... AS BOOLEAN) is unsupported
 - low — The _CHARSET introducer on a literal (_WIN1252 X'809F', _UTF8 '€') is unsupported
+- low — REFUSAL: an aggregate applied DIRECTLY to a lateral join (`SELECT COUNT(*) FROM T a, LATERAL (...) l`) refuses at prepare. `plan_lateral` delegates to the join planner and keeps only a `Plan::Join`; an aggregate makes that a `Plan::JoinGroup`, whose grouping columns index the COMBINED joined record, so the lateral cannot simply be substituted underneath it. The same query written with an explicit derived table IS served, which is what makes this a boundary rather than a hole
 
 ## How these slices are gated
 

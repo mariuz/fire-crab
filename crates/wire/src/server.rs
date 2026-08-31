@@ -33439,6 +33439,12 @@ fn plan_lateral(
     let planned = plan_join(
         proj, &from, &join, where_s, None, None, order_s, db, db_all, proj_params, params,
     )?;
+    // what the SUBQUERY itself announces, which is what the comma form
+    // carries through (see [mark_not_null_lateral])
+    let mut ip: Vec<Option<Descriptor>> = Vec::new();
+    let inner_cols = plan_query_inner(&null_sub, db_all, &mut ip)
+        .map(|p| output_cols_of(&p))
+        .unwrap_or_default();
     let Plan::Join { base, base_width, parts, cols, filter, order_by, .. } = planned else {
         return None;
     };
@@ -33450,6 +33456,8 @@ fn plan_lateral(
     if !matches!(&base, RowSource::TableScan { .. }) {
         return None;
     }
+    let mut cols = cols;
+    mark_not_null_lateral(&mut cols, db, bref.table, base_width, &inner_cols, left);
     Some(Plan::Lateral {
         base: base.clone(),
         base_width,
@@ -36906,6 +36914,241 @@ fn split_union(sql: &str) -> Option<(Vec<String>, bool)> {
 /// Collect a planned branch's rows as PROJECTED values - one Value per
 /// output column, in output order. Only a single-table projection is
 /// supported (what a union branch is allowed to be here).
+/// Every row a LATERAL produces, combined, filtered and ordered - but NOT
+/// yet projected through the plan's columns.
+///
+/// Extracted so the streaming emit and the fetch path share ONE
+/// implementation. The emit path alone was enough while the only client
+/// we watched was isql, which buffers whatever a response carries; it
+/// ignores the row count `op_fetch` asks for, so a LATERAL wider than one
+/// batch handed a driver that HONOURS that count a single oversized
+/// block, and the driver then waited forever for a second batch whose
+/// rows had already been spent. The fetch path materialises this into
+/// `Plan::Rows` and the ordinary batching takes over from there.
+fn lateral_rows(
+    base: &RowSource,
+    base_width: usize,
+    outer_alias: &str,
+    outer_cols: &[RelationColumn],
+    outer_descs: &[Descriptor],
+    subquery: &str,
+    left: bool,
+    lat_width: usize,
+    filter: &Option<Predicate>,
+    order_by: &[OrderKey],
+    db: &Option<Database>,
+    args: &[WireParam],
+) -> Result<Vec<Vec<Value>>, EvalErr> {
+    // no attached database is Unsupported, not "no rows": the emit arm
+    // this was lifted out of quietly emitted an EMPTY result there, which
+    // is a wrong answer wearing a plausible shape
+    let Some(dbr) = db.as_ref() else { return Err(EvalErr::Unsupported) };
+    // scan the outer (base) rows once; for each, substitute its columns'
+    // literals into the subquery, plan+run that now-uncorrelated query,
+    // and combine (comma drops an empty lateral, LEFT pads it).
+    let outer = base.rows(dbr)?;
+    let mut combined: Vec<Vec<Value>> = Vec::new();
+    for orow in &outer {
+        let sub_sql = subst_lateral(subquery, outer_alias, outer_cols, outer_descs, Some(orow))
+            .ok_or(EvalErr::Unsupported)?;
+        let mut ip: Vec<Option<Descriptor>> = Vec::new();
+        let iplan = plan_query_inner(&sub_sql, db, &mut ip).ok_or(EvalErr::Unsupported)?;
+        let lat_rows = branch_rows_res(&iplan, dbr, &[])?;
+        let mut prefix = orow.clone();
+        prefix.resize(base_width, Value::Null);
+        if lat_rows.is_empty() {
+            if left {
+                let mut r = prefix;
+                r.resize(base_width + lat_width, Value::Null);
+                combined.push(r);
+            }
+        } else {
+            for lr in lat_rows {
+                let mut r = prefix.clone();
+                r.extend(lr);
+                r.resize(base_width + lat_width, Value::Null);
+                combined.push(r);
+            }
+        }
+    }
+    // filter / sort the combined rows through the ordinary
+    // Rows -> Filter -> Sort tree
+    let pred = bind_filter(filter, args).map_err(|_| EvalErr::Unsupported)?;
+    RowSource::Sort {
+        input: Box::new(RowSource::Filter { input: Box::new(RowSource::Rows(combined)), pred }),
+        keys: order_by.to_vec(),
+    }
+    .rows(dbr)
+}
+
+/// Replace every [Plan::Lateral] in a plan tree with the rows it
+/// produces, so that everything ABOVE it - a derived table, DISTINCT,
+/// FIRST/SKIP, a union branch - can then run on the ordinary machinery.
+///
+/// The generic row-source path ([branch_rows_res]) cannot host a LATERAL:
+/// re-planning the subquery per outer row needs the `Option<Database>`
+/// that the whole planner threads, and that path holds only a
+/// `&Database`. So the substitution happens HERE, at the one place that
+/// still has both - and it is why `SELECT COUNT(*) FROM (SELECT a.ID,
+/// l.V FROM T a, LATERAL (...) l) x` used to PREPARE (handing the client
+/// a valid SQLDA it caches) and only then die at fetch. A prepare that
+/// describes a statement the server cannot run is worse than a refusal.
+///
+/// Returns `None` when there was no LATERAL anywhere - the caller then
+/// keeps the plan it had, untouched.
+/// [materialise_laterals] for a [RowSource]: a derived side reaches the
+/// JOIN and GROUP planners wrapped as `RowSource::PlanRows`, so an
+/// aggregate over a LATERAL hides one below the plan tree entirely.
+fn materialise_laterals_src(
+    src: &RowSource,
+    db: &Option<Database>,
+    args: &[WireParam],
+) -> Option<RowSource> {
+    match src {
+        RowSource::PlanRows(plan) => match materialise_laterals(plan, db, args)? {
+            // the walk hands back rows already projected through the
+            // inner plan's columns, which is exactly what a row source
+            // holding a materialised buffer carries
+            Plan::Rows { rows, .. } => Some(RowSource::Rows(rows)),
+            other => Some(RowSource::PlanRows(std::rc::Rc::new(other))),
+        },
+        RowSource::Filter { input, pred } => Some(RowSource::Filter {
+            input: Box::new(materialise_laterals_src(input, db, args)?),
+            pred: pred.clone(),
+        }),
+        RowSource::Sort { input, keys } => Some(RowSource::Sort {
+            input: Box::new(materialise_laterals_src(input, db, args)?),
+            keys: keys.clone(),
+        }),
+        _ => None,
+    }
+}
+
+fn materialise_laterals(
+    plan: &Plan,
+    db: &Option<Database>,
+    args: &[WireParam],
+) -> Option<Plan> {
+    match plan {
+        Plan::Lateral {
+            base, base_width, outer_alias, outer_cols, outer_descs, subquery, left, lat_width,
+            cols, filter, order_by,
+        } => {
+            let rows = match lateral_rows(
+                base, *base_width, outer_alias, outer_cols, outer_descs, subquery, *left,
+                *lat_width, filter, order_by, db, args,
+            ) {
+                Ok(r) => r,
+                Err(e) => {
+                    if std::env::var("FC_SRV_TRACE").is_ok() {
+                        eprintln!("[srv] lateral rows failed: {:?}", e);
+                    }
+                    return None;
+                }
+            };
+            // project through the plan's own columns, then re-index them
+            // POSITIONALLY: a projected row no longer carries the record
+            // the original field ids named, and every consumer of
+            // `Plan::Rows` reads it by position.
+            let rows: Vec<Vec<Value>> = rows
+                .iter()
+                .map(|values| cols.iter().map(|c| c.value_of(values)).collect())
+                .collect::<Result<_, _>>()
+                .ok()?;
+            let cols: Vec<ProjCol> = cols
+                .iter()
+                .enumerate()
+                .map(|(i, c)| ProjCol { field_id: i, expr: None, ..c.clone() })
+                .collect();
+            Some(Plan::Rows { cols, rows })
+        }
+        Plan::Derived { inner, cols, filter, windows, win_base, order_by } => {
+            let inner = materialise_laterals(inner, db, args)?;
+            Some(Plan::Derived {
+                inner: Box::new(inner),
+                cols: cols.clone(),
+                filter: filter.clone(),
+                windows: windows.clone(),
+                win_base: *win_base,
+                order_by: order_by.clone(),
+            })
+        }
+        Plan::Modified { inner, cols, distinct, skip, take } => {
+            let inner = materialise_laterals(inner, db, args)?;
+            Some(Plan::Modified {
+                inner: Box::new(inner),
+                cols: cols.clone(),
+                distinct: *distinct,
+                skip: *skip,
+                take: *take,
+            })
+        }
+        Plan::JoinGroup {
+            base, base_width, parts, cols, gitems, key_fids, key_exprs, synth_base, filter,
+            having, order_by, key_coll, defer,
+        } => {
+            let base = materialise_laterals_src(base, db, args)?;
+            Some(Plan::JoinGroup {
+                base,
+                base_width: *base_width,
+                parts: parts.clone(),
+                cols: cols.clone(),
+                gitems: gitems.clone(),
+                key_fids: key_fids.clone(),
+                key_exprs: key_exprs.clone(),
+                synth_base: *synth_base,
+                filter: filter.clone(),
+                having: having.clone(),
+                order_by: order_by.clone(),
+                key_coll: key_coll.clone(),
+                defer: defer.clone(),
+            })
+        }
+        Plan::Union { cols, branches, distinct, order_by } => {
+            // only rebuild if SOME branch carried one; a union of plain
+            // branches must stay exactly as it was
+            let done: Vec<Option<Plan>> =
+                branches.iter().map(|b| materialise_laterals(b, db, args)).collect();
+            if done.iter().all(|d| d.is_none()) {
+                return None;
+            }
+            let branches: Vec<Plan> = done
+                .into_iter()
+                .zip(branches.iter())
+                .map(|(d, orig)| d.unwrap_or_else(|| orig.clone()))
+                .collect();
+            Some(Plan::Union {
+                cols: cols.clone(),
+                branches,
+                distinct: *distinct,
+                order_by: order_by.clone(),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// The plan variant a statement resolved to, for `FC_SRV_TRACE`. Which
+/// node the fetch path is actually holding is the first thing worth
+/// knowing when a shape prepares and then fails.
+fn plan_kind(p: &Plan) -> String {
+    match p {
+        Plan::Lateral { .. } => "Lateral".to_string(),
+        Plan::Derived { inner, .. } => format!("Derived({})", plan_kind(inner)),
+        Plan::Modified { inner, .. } => format!("Modified({})", plan_kind(inner)),
+        Plan::Rows { rows, .. } => format!("Rows[{}]", rows.len()),
+        Plan::Union { branches, .. } => format!(
+            "Union({})",
+            branches.iter().map(plan_kind).collect::<Vec<_>>().join(",")
+        ),
+        Plan::Join { .. } => "Join".to_string(),
+        Plan::JoinGroup { .. } => "JoinGroup".to_string(),
+        Plan::Project { .. } => "Project".to_string(),
+        Plan::Refused => "Refused".to_string(),
+        _ => "other".to_string(),
+    }
+}
+
 fn branch_rows(
     plan: &Plan,
     db: &Database,
@@ -37094,6 +37337,19 @@ fn branch_rows_res(
     }
     if let Plan::ProcRows { rows, .. } = plan {
         return Ok(rows.clone());
+    }
+    // ROWS ALREADY IN HAND are a row source. Nothing produced this plan
+    // until [materialise_laterals] began rewriting a LATERAL into one, and
+    // a `Plan::Rows` under a derived table then fell all the way through
+    // to Unsupported - the rows existed, correctly, and no arm would read
+    // them. Projecting through `cols` rather than returning the rows
+    // verbatim keeps this consistent with every other arm: the column list
+    // is what decides the output shape.
+    if let Plan::Rows { cols, rows } = plan {
+        return rows
+            .iter()
+            .map(|values| cols.iter().map(|c| c.value_of(values)).collect())
+            .collect();
     }
     // A SCALAR is a row source too - one row of one column. It is what a
     // lone aggregate plans to (`SELECT MIN(ID) FROM T`), so without this
@@ -38525,6 +38781,12 @@ fn plan_query_inner_ctx(
                 | Plan::Join { .. }
                 | Plan::JoinGroup { .. }
                 | Plan::Derived { .. }
+                // a LATERAL may carry a modifier now that
+                // [materialise_laterals] turns one into rows at fetch.
+                // Before that it was correctly excluded: wrapping a plan
+                // the row-source path could not read would have refused
+                // at fetch instead - AFTER a successful prepare.
+                | Plan::Lateral { .. }
         ) {
             return Some(Plan::Refused);
         }
@@ -40310,6 +40572,55 @@ fn expr_nullable(e: &Expr, is_nn: &dyn Fn(usize) -> bool) -> bool {
         // a function's RETURN is always nullable (probed)
         Expr::UserFn { .. } => true,
         _ => true,
+    }
+}
+
+/// Clear the NULLABLE bit on the columns a LATERAL cannot produce a NULL
+/// for.
+///
+/// [mark_not_null_join] cannot judge the lateral side: it decides from
+/// `sides[k].rels`, the TABLE behind each field, and a lateral side has
+/// no table - it has a subquery. Every field there fell to "nullable",
+/// so a comma lateral over a NOT NULL column announced a nullable
+/// column where the engine announces a fixed one.
+///
+/// The law, probed against the engine: the COMMA (cross) form carries
+/// the INNER column's own nullability through unchanged - a NOT NULL
+/// column stays NOT NULL, and so does a literal - while the LEFT form is
+/// always nullable, because an outer row with no lateral match is padded
+/// with NULLs. That is the whole difference between the two forms, and
+/// it lives entirely in the describe.
+///
+/// Only ever CLEARS bits, so whatever [mark_not_null_join] already
+/// settled about the base side stands.
+fn mark_not_null_lateral(
+    cols: &mut [ProjCol],
+    db: &Database,
+    base_table: &str,
+    base_width: usize,
+    inner_cols: &[ProjCol],
+    left: bool,
+) {
+    let base_nn = not_null_fids(db, base_table);
+    let is_nn = |fid: usize| -> bool {
+        if fid < base_width {
+            return base_nn.contains(&fid);
+        }
+        // a LEFT lateral pads the unmatched outer row, so nothing on
+        // that side can be announced fixed
+        if left {
+            return false;
+        }
+        inner_cols.get(fid - base_width).is_some_and(|c| c.sql_type & 1 == 0)
+    };
+    for c in cols.iter_mut() {
+        let nullable = match &c.expr {
+            None => !is_nn(c.field_id),
+            Some(e) => expr_nullable(e, &is_nn),
+        };
+        if !nullable {
+            c.sql_type &= !1;
+        }
     }
 }
 
@@ -48638,53 +48949,13 @@ fn emit_rows_inner(
             filter,
             order_by,
         } => {
-            if let Some(dbr) = db {
-                // scan the outer (base) rows once; for each, substitute its
-                // columns' literals into the subquery, plan+run that
-                // uncorrelated query, and combine (comma drops an empty
-                // lateral, LEFT pads it).
-                let outer = base.rows(dbr).map_err(EmitErr::Eval)?;
-                let mut combined: Vec<Vec<Value>> = Vec::new();
-                for orow in &outer {
-                    let sub_sql =
-                        subst_lateral(subquery, outer_alias, outer_cols, outer_descs, Some(orow))
-                            .ok_or(EmitErr::Eval(EvalErr::Unsupported))?;
-                    let mut ip: Vec<Option<Descriptor>> = Vec::new();
-                    let iplan = plan_query_inner(&sub_sql, db, &mut ip)
-                        .ok_or(EmitErr::Eval(EvalErr::Unsupported))?;
-                    let lat_rows = branch_rows_res(&iplan, dbr, &[]).map_err(EmitErr::Eval)?;
-                    let mut prefix = orow.clone();
-                    prefix.resize(*base_width, Value::Null);
-                    if lat_rows.is_empty() {
-                        if *left {
-                            let mut r = prefix;
-                            r.resize(*base_width + *lat_width, Value::Null);
-                            combined.push(r);
-                        }
-                    } else {
-                        for lr in lat_rows {
-                            let mut r = prefix.clone();
-                            r.extend(lr);
-                            r.resize(*base_width + *lat_width, Value::Null);
-                            combined.push(r);
-                        }
-                    }
-                }
-                // filter / sort / project the combined rows through the
-                // ordinary Rows -> Filter -> Sort tree
-                let pred = bind_filter(filter, args)?;
-                let sorted = RowSource::Sort {
-                    input: Box::new(RowSource::Filter {
-                        input: Box::new(RowSource::Rows(combined)),
-                        pred,
-                    }),
-                    keys: order_by.clone(),
-                }
-                .rows(dbr)
-                .map_err(EmitErr::Eval)?;
-                for values in &sorted {
-                    encode_row(w, cols, values, out)?;
-                }
+            let sorted = lateral_rows(
+                base, *base_width, outer_alias, outer_cols, outer_descs, subquery, *left,
+                *lat_width, filter, order_by, db, args,
+            )
+            .map_err(EmitErr::Eval)?;
+            for values in &sorted {
+                encode_row(w, cols, values, out)?;
             }
         }
         Plan::Join {
@@ -76217,6 +76488,26 @@ fn after_auth(
                                 }
                             }
                         }
+                    }
+                }
+                // A LATERAL MATERIALISES HERE for the same reason, and
+                // likewise BEFORE the `branch_rows` attempt below: that
+                // generic row-source path has no Lateral arm, so the plan
+                // stayed un-materialised and control fell through to the
+                // streaming emit, which writes every row it has into ONE
+                // response and never consults `want`. isql is blind to it
+                // (it buffers whatever arrives), so the shape reads green
+                // under the client we test with most; node-firebird, which
+                // honours the count, returned 2340 rows and then hung at
+                // 2370 - one batch boundary later. The walk is RECURSIVE
+                // because a LATERAL under a derived table, a DISTINCT or a
+                // FIRST prepared happily and only died here.
+                if std::env::var("FC_SRV_TRACE").is_ok() {
+                    eprintln!("[srv] fetch plan = {}", plan_kind(&plan));
+                }
+                if want > 0 && !matches!(&*plan, Plan::Rows { .. }) {
+                    if let Some(m) = materialise_laterals(&plan, &database, &bound_args) {
+                        plan = std::rc::Rc::new(m);
                     }
                 }
                 if want > 0 && !matches!(&*plan, Plan::Rows { .. }) && !small_first {
