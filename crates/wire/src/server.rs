@@ -13413,6 +13413,100 @@ fn ddl_triggers(db: &Database, event: u32, before: bool) -> Option<Vec<TrigDef>>
 thread_local! {
     static CURRENT_SQL: std::cell::RefCell<String> =
         const { std::cell::RefCell::new(String::new()) };
+    /// The attachment's `lc_ctype`, as the STATEMENT TEXT path needs it.
+    /// A string literal in the statement is `CHARACTER SET <lc_ctype>` and
+    /// its BYTES are the attachment's bytes - the engine's rule - so under
+    /// a byte-carrier attachment a literal's chars ARE its bytes, and the
+    /// value paths must tag it CS_NONE rather than read it as Unicode.
+    /// Kept as a thread-local for the same reason [CURRENT_SQL] is: the
+    /// planner threads its database handle through 49 signatures already,
+    /// and this is one connection-wide fact, not a per-call argument.
+    static CURRENT_ATT_CS: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+/// Decode STATEMENT TEXT by the attachment character set.
+///
+/// The parameter path already obeys this law ([wire_text_param]); the
+/// statement-text path did not, and ran every byte through
+/// `from_utf8_lossy`. A literal is not Unicode text that happens to be
+/// encoded - it is BYTES whose meaning the attachment's charset fixes -
+/// so under a NONE attachment a lone `0xE9` is data. Lossy decoding
+/// replaced it with U+FFFD BEFORE the tokenizer ever saw the literal,
+/// which is why `CAST('a<E9>b' AS ... WIN1252)` answered a
+/// transliteration error where the engine byte-copies `61E962`, and why
+/// an INSERT of that byte stored the replacement character instead of
+/// refusing or storing it verbatim.
+/// Does this statement's bytes fail to decode in the attachment's
+/// character set?
+///
+/// A byte-carrier attachment has no such failure - every byte is a
+/// character there - and a tabled single-byte set decodes every octet
+/// too. Only a MULTI-BYTE attachment can be handed bytes that are not a
+/// string in it, and the engine refuses that statement at prepare:
+/// `SELECT CAST('a<E9>b' ...)` sent to a UTF8 attachment answers
+/// SQLSTATE 22000, `Dynamic SQL Error / -SQL error code = -104 /
+/// -Malformed string`. fire-crab used to decode it lossily and ANSWER,
+/// storing U+FFFD where the engine had refused the statement outright -
+/// accepting data the engine rejects, the same failure direction as the
+/// truncation check this slice also fixed.
+/// The engine's vector for a statement whose BYTES are not a string in
+/// the attachment's charset, measured under a UTF8 attachment:
+///
+/// ```text
+/// SQLSTATE = 22000
+/// Dynamic SQL Error
+/// -SQL error code = -104
+/// -Malformed string
+/// ```
+///
+/// This is a DSQL-level refusal of the whole statement, not the
+/// value-level [EvalErr::MalformedString] (which carries no wrapper and
+/// prints the bare message), so it gets its own vector rather than
+/// reusing that one.
+fn respond_malformed_statement(
+    s: &mut TcpStream,
+    enc: &mut Option<Rc4>,
+) -> std::io::Result<()> {
+    let mut w = W::default();
+    w.int(OP_RESPONSE)
+        .int(0)
+        .int(0)
+        .int(0) // blob id
+        .int(0) // response data length
+        .int(1) // isc_arg_gds
+        .int(GDS_DSQL_ERROR)
+        .int(1) // isc_arg_gds
+        .int(GDS_SQLERR)
+        .int(ISC_ARG_NUMBER)
+        .int(-104)
+        .int(1) // isc_arg_gds
+        .int(GDS_MALFORMED_STRING)
+        .int(0); // isc_arg_end
+    w.send(s, enc)
+}
+
+fn stmt_text_malformed(bytes: &[u8], att_id: u8) -> bool {
+    use fire_crab_ods::intl;
+    if bytes.is_ascii() || intl::byte_carrier(att_id) || intl::tabled(att_id) {
+        return false;
+    }
+    std::str::from_utf8(bytes).is_err()
+}
+
+fn stmt_text_decode(bytes: &[u8], att_id: u8) -> String {
+    use fire_crab_ods::intl;
+    // ASCII is identical under every charset, and it is almost all SQL
+    if bytes.is_ascii() {
+        return String::from_utf8_lossy(bytes).into_owned();
+    }
+    if intl::byte_carrier(att_id) {
+        // one char per byte: the literal's chars ARE its bytes
+        return intl::carrier_decode(bytes);
+    }
+    if let Some(t) = intl::decode_text(att_id, bytes) {
+        return t;
+    }
+    String::from_utf8_lossy(bytes).into_owned()
 }
 
 /// What the `DDL_TRIGGER` context answers while one is firing:
@@ -15411,7 +15505,25 @@ fn text_form(e: &Expr, descs: &[Descriptor]) -> Option<(bool, i32, TfCs)> {
 /// Every other leaf measures identically under both: a column's width is
 /// already a character count and a CAST's is its declared one.
 fn text_form_oct(e: &Expr, descs: &[Descriptor]) -> Option<(bool, i32, TfCs)> {
-    text_form_m(e, descs, |s| s.len() as i32)
+    // THE LITERAL'S OWN BYTES, not the UTF-8 spelling of them. Once
+    // statement text began decoding by the attachment charset, a literal
+    // under a byte-carrier attachment holds ONE CHAR PER BYTE - so
+    // `s.len()`, which is the UTF-8 length, counted every high byte
+    // twice and announced a 6-octet literal as 12. `carrier_encode`
+    // answers None for text that never came from a carrier (a real
+    // multi-byte char), and there the UTF-8 length is the right one.
+    text_form_m(e, descs, |s| {
+        // under a BYTE-CARRIER attachment the literal already holds one
+        // char per byte ([stmt_text_decode]), so its octet count is that
+        // char count - `s.len()`, the UTF-8 length, counts every high
+        // byte twice. Under a real attachment the literal holds real
+        // characters and the UTF-8 length is the octet count.
+        if fire_crab_ods::intl::byte_carrier(CURRENT_ATT_CS.with(|c| c.get())) {
+            fire_crab_ods::intl::carrier_encode(s).map_or(s.len() as i32, |b| b.len() as i32)
+        } else {
+            s.len() as i32
+        }
+    })
 }
 
 fn text_form_m(
@@ -25833,14 +25945,34 @@ fn plan_insert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
             if !matches!(descs.get(fid).map(|d| d.dtype), Some(dtype::BLOB)) {
                 return None;
             }
-            // the bytes a LITERAL takes in the column's character set:
-            // a tabled single-byte page gets its codepage bytes, and
-            // every other set the literal's own (a carrier stores the
-            // client's bytes verbatim - the UTF-8 the SQL text arrived
-            // as, which is what the engine stores through a NONE
-            // attachment)
+            // THE BYTES A LITERAL TAKES IN THE COLUMN'S CHARACTER SET,
+            // starting from the charset the literal IS - the attachment's
+            // ([stmt_text_decode]), not UTF-8. Under a byte carrier its
+            // chars ARE its bytes, and a move into a real set is a BYTE
+            // COPY, so the conversion runs through [transcode_text] first
+            // and only then encodes. This comment used to say a carrier
+            // stores "the UTF-8 the SQL text arrived as", which was true
+            // only while the SQL text was decoded as UTF-8 whatever the
+            // client asked for: `INSERT INTO T VALUES ('caf<C3 A9>')`
+            // into a UTF8 text blob stored SEVEN bytes where the engine
+            // stores five.
             let cs = descs.get(fid).map_or(0, |d| d.scale as u8);
+            let att = CURRENT_ATT_CS.with(|c| c.get());
             let lit = |t: &str| -> Vec<u8> {
+                let owned;
+                let t = if att != cs && !t.is_ascii() {
+                    match transcode_text(att, cs, t.to_string()) {
+                        Ok(x) => {
+                            owned = x;
+                            owned.as_str()
+                        }
+                        // an unconvertible value keeps the old path and
+                        // fails where it always did
+                        Err(_) => t,
+                    }
+                } else {
+                    t
+                };
                 fire_crab_ods::intl::encode_text(cs, t)
                     .ok()
                     .flatten()
@@ -26234,6 +26366,24 @@ fn encode_set_value(d: &Descriptor, v: &InsVal) -> Option<Option<Vec<u8>>> {
         InsVal::Int(n) => WireParam::Int(*n, 0),
         InsVal::Int128(_) | InsVal::DecFloat34(_) => unreachable!("handled above"),
         InsVal::Dec(r, s) => WireParam::Int(*r, *s),
+        // A LITERAL CARRIES THE ATTACHMENT'S CHARSET INTO THE STORE, the
+        // same law [wire_text_param] applies to a wire parameter. Under a
+        // byte-carrier attachment its chars ARE its bytes, so an untagged
+        // Text made the store spell them as UTF-8: `INSERT INTO T (N)
+        // VALUES ('a<E9>b')` under a NONE attachment stored 61C3A962
+        // where the engine stores 61E962 - four bytes announced as three.
+        // ASCII is identical under every charset and keeps the plain
+        // shape, which is almost every literal there is.
+        InsVal::Str(text) if !text.is_ascii() => {
+            let att = CURRENT_ATT_CS.with(|c| c.get());
+            if fire_crab_ods::intl::byte_carrier(att) {
+                WireParam::TextCs(text.clone(), fire_crab_ods::intl::CS_NONE)
+            } else if fire_crab_ods::intl::tabled(att) {
+                WireParam::TextCs(text.clone(), att)
+            } else {
+                WireParam::Text(text.clone())
+            }
+        }
         InsVal::Str(text) => WireParam::Text(text.clone()),
         InsVal::Octets(b) => WireParam::Text(String::from_utf8_lossy(b).into_owned()),
         // a SQL BOOLEAN - the bare TRUE/FALSE literal or a folded
@@ -28085,7 +28235,29 @@ fn plan_update(sql: &str, db_outer: &Option<Database>) -> Option<(Plan, Vec<Desc
                 params.push(Some(d.clone()));
                 SetVal::Param(params.len() - 1)
             }
-            InsVal::Str(t) if d.dtype == dtype::BLOB => SetVal::BlobLit(t.into_bytes(), 1),
+            // A TEXT BLOB LITERAL CARRIES THE ATTACHMENT'S BYTES, like
+            // every other literal ([wire_text_param]'s law). `into_bytes`
+            // is the UTF-8 spelling, so under a byte-carrier attachment a
+            // literal's chars - which ARE its bytes - were written twice
+            // as wide: `INSERT INTO T VALUES ('caf<C3 A9>')` into a UTF8
+            // text blob stored 7 bytes where the engine stores 5, and the
+            // damage was invisible until something READ the blob back.
+            InsVal::Str(t) if d.dtype == dtype::BLOB => {
+                let att = CURRENT_ATT_CS.with(|c| c.get());
+                let bytes = if t.is_ascii() {
+                    t.as_bytes().to_vec()
+                } else if fire_crab_ods::intl::byte_carrier(att) {
+                    fire_crab_ods::intl::carrier_encode(&t).unwrap_or_else(|| t.as_bytes().to_vec())
+                } else if fire_crab_ods::intl::tabled(att) {
+                    fire_crab_ods::intl::encode_text(att, &t)
+                        .ok()
+                        .flatten()
+                        .unwrap_or_else(|| t.as_bytes().to_vec())
+                } else {
+                    t.as_bytes().to_vec()
+                };
+                SetVal::BlobLit(bytes, 1)
+            }
             InsVal::Octets(b) if d.dtype == dtype::BLOB => SetVal::BlobLit(b, 0),
             lit => SetVal::Lit(encode_set_value(d, &lit)?),
         };
@@ -30624,7 +30796,39 @@ fn execute_dml_collecting_inner(
                                         Value::Text(t) => t.clone(),
                                         o => o.render(),
                                     };
-                                    let bytes = blob_bytes_in(&text, d.scale as u8)
+                                    // WHERE THE TEXT CAME FROM DECIDES ITS
+                                    // BYTES. A literal is typed in the
+                                    // ATTACHMENT's charset, so under a byte
+                                    // carrier its chars ARE its bytes and the
+                                    // move into the blob's set is a BYTE COPY;
+                                    // a UTF8 column's value is real characters
+                                    // and must be encoded. Both arrive here as
+                                    // an untagged `Value::Text`, which is why
+                                    // this asks the EXPRESSION rather than the
+                                    // value: blanket carrier semantics would
+                                    // corrupt `INSERT ... SELECT` from a real
+                                    // column. Without it, `INSERT INTO T
+                                    // VALUES ('caf<C3 A9>')` into a UTF8 text
+                                    // blob stored 7 bytes where the engine
+                                    // stores 5.
+                                    let dst_cs = d.scale as u8;
+                                    let src_cs = match text_form(e, descs) {
+                                        Some((_, _, TfCs::Att)) => {
+                                            Some(CURRENT_ATT_CS.with(|c| c.get()))
+                                        }
+                                        Some((_, _, TfCs::Ttype(t))) => {
+                                            Some(fire_crab_ods::intl::charset_id(t as i16))
+                                        }
+                                        None => None,
+                                    };
+                                    let text = match src_cs {
+                                        Some(src) if src != dst_cs => {
+                                            transcode_text(src, dst_cs, text)
+                                                .map_err(ExecErr::Eval)?
+                                        }
+                                        _ => text,
+                                    };
+                                    let bytes = blob_bytes_in(&text, dst_cs)
                                         .map_err(ExecErr::Eval)?;
                                     let id = store_blob_literal(
                                         db,
@@ -46619,6 +46823,27 @@ fn answer_prepare(items: &[u8], plan: &Plan, params: &[Descriptor], att: AttCs) 
         d.extend_from_slice(&4u16.to_le_bytes());
         d.extend_from_slice(&val.to_le_bytes());
     }
+    // A NAME TRAVELS IN THE ATTACHMENT'S CHARACTER SET, like every other
+    // text the client is handed. Under a byte-carrier attachment an
+    // identifier decoded from the statement text holds ONE CHAR PER
+    // BYTE, so writing its UTF-8 spelling doubled every high byte and a
+    // quoted alias came back mangled: `"<C4 83 C3 AE>"` was announced as
+    // C3 84 C2 83 C3 83 C2 AE. The value paths learned this first; the
+    // describe's own names are the same law.
+    fn name_bytes(s: &str, att: AttCs) -> Vec<u8> {
+        if fire_crab_ods::intl::byte_carrier(att.id) && !s.is_ascii() {
+            if let Some(b) = fire_crab_ods::intl::carrier_encode(s) {
+                return b;
+            }
+        }
+        s.as_bytes().to_vec()
+    }
+    fn str_item_cs(d: &mut Vec<u8>, code: u8, s: &str, att: AttCs) {
+        let b = name_bytes(s, att);
+        d.push(code);
+        d.extend_from_slice(&(b.len() as u16).to_le_bytes());
+        d.extend_from_slice(&b);
+    }
     fn str_item(d: &mut Vec<u8>, code: u8, s: &str) {
         d.push(code);
         d.extend_from_slice(&(s.len() as u16).to_le_bytes());
@@ -46730,8 +46955,8 @@ fn answer_prepare(items: &[u8], plan: &Plan, params: &[Descriptor], att: AttCs) 
                             13 => int_item(&mut d, 13, v.scale),
                             14 => int_item(&mut d, 14, v.length),
                             15 => int_item(&mut d, 15, 0), // null_ind
-                            16 => str_item(&mut d, 16, &v.fname), // field
-                            17 => str_item(&mut d, 17, &v.relation),
+                            16 => str_item_cs(&mut d, 16, &v.fname, att), // field
+                            17 => str_item_cs(&mut d, 17, &v.relation, att),
                             // probed: owner is SYSDBA exactly when a
                             // relation is answered - uniformly, RDB$
                             // tables included (a non-SYSDBA-owned
@@ -46743,11 +46968,11 @@ fn answer_prepare(items: &[u8], plan: &Plan, params: &[Descriptor], att: AttCs) 
                                 18,
                                 if v.relation.is_empty() { "" } else { "SYSDBA" },
                             ),
-                            19 => str_item(&mut d, 19, &v.name), // alias
+                            19 => str_item_cs(&mut d, 19, &v.name, att), // alias
                             // relation_alias is 25 (inf_pub.h); the
                             // engine ANSWERS it for every variable,
                             // empty payload when there is no alias
-                            25 => str_item(&mut d, 25, &v.rel_alias),
+                            25 => str_item_cs(&mut d, 25, &v.rel_alias, att),
                             // schema (FB6): SYSTEM for system tables,
                             // PUBLIC for user relations, "" when the
                             // variable reads from no relation (probed
@@ -47113,11 +47338,31 @@ fn transcode_text(src: u8, dst: u8, s: String) -> Result<String, EvalErr> {
 fn cast_source_charset(e: &Expr, t: &CastTarget, descs: &[Descriptor]) -> u8 {
     use fire_crab_ods::intl::{byte_carrier, charset_id, tabled, CS_UTF8};
     if matches!(t, CastTarget::Text { cs: Some(_), .. }) {
-        if let Some((_, _, TfCs::Ttype(tt))) = text_form(e, descs) {
-            let cs = charset_id(tt as i16);
-            if byte_carrier(cs) || tabled(cs) || cs == CS_UTF8 {
-                return cs;
+        match text_form(e, descs) {
+            Some((_, _, TfCs::Ttype(tt))) => {
+                let cs = charset_id(tt as i16);
+                if byte_carrier(cs) || tabled(cs) || cs == CS_UTF8 {
+                    return cs;
+                }
             }
+            // ...and a source typed in the ATTACHMENT's charset - a bare
+            // literal, or a concatenation that a CHARACTER SET NONE
+            // operand yielded to - is the attachment's, not UTF-8. Without
+            // this the CAST re-encoded a byte carrier's chars as UTF-8:
+            // `CAST('a<E9>b' AS ... OCTETS)` under a NONE attachment
+            // shipped 61C3A962 for the engine's 61E962, and the same miss
+            // made `N || ''` nine bytes where the engine writes seven -
+            // while OCTET_LENGTH of the very same expression already
+            // answered 7, because the length path DID consult the carrier.
+            // Two paths disagreeing about one value's bytes is the shape
+            // this whole slice is about.
+            Some((_, _, TfCs::Att)) => {
+                let cs = CURRENT_ATT_CS.with(|c| c.get());
+                if byte_carrier(cs) || tabled(cs) || cs == CS_UTF8 {
+                    return cs;
+                }
+            }
+            _ => {}
         }
     }
     err_spell_charset(e, descs)
@@ -49177,16 +49422,18 @@ fn enforce_out_capacity(
         // spelling made a high byte look like two, and `REPLACE(x'414243',
         // x'42', x'FF')` - three bytes, four in UTF-8 - raised a
         // truncation the engine does not
-        // The condition is the EMIT's own, not the resolved charset: only
-        // a column whose descriptor names a real byte-carrier ttype ships
-        // through `carrier_encode` (one octet per char). An expression
-        // described in the ATTACHMENT's charset ships its UTF-8 bytes
-        // even when that attachment is NONE, so it must keep counting
-        // OCTETS or a value could be written past the slot.
-        let carrier_src = (0..=i16::MAX as i32).contains(&c.sub_type)
-            && fire_crab_ods::intl::byte_carrier(fire_crab_ods::intl::charset_id(
-                c.sub_type as i16,
-            ));
+        // The condition is the EMIT's own, and it is now the RESOLVED
+        // charset, because the emit resolves the negative sentinels too:
+        // a value typed in the attachment's charset ships through
+        // `carrier_encode` when that attachment is a byte carrier. This
+        // used to test a positive ttype only, matching an emit that
+        // shipped UTF-8 bytes for every expression. The moment the emit
+        // learned the sentinel, keeping the old test here counted a
+        // literal's high bytes twice and raised a 22001 truncation on a
+        // value the engine returns - the two MUST be read from the same
+        // `src_id` or they drift apart silently, one announcing what the
+        // other does not write.
+        let carrier_src = fire_crab_ods::intl::byte_carrier(src_id);
         // ... and a TABLED single-byte destination ships one byte per
         // CHARACTER too (`encode_text` is what the emit calls), so a
         // WIN1252 result whose UTF-8 spelling is longer than the slot
@@ -49489,11 +49736,26 @@ fn encode_row_body(
                 // never transliterated: its raw stored bytes travel to
                 // EVERY attachment (measured: a NONE column's 0xE9
                 // reaches a UTF8 attachment as the one byte 0xE9)
-                if (0..=i16::MAX as i32).contains(&c.sub_type)
-                    && fire_crab_ods::intl::byte_carrier(fire_crab_ods::intl::charset_id(
-                        c.sub_type as i16,
-                    ))
-                {
+                // ...and so is a value typed in the ATTACHMENT's charset
+                // when THAT is a byte carrier. This branch used to test
+                // only a positive ttype, so it never fired for a literal
+                // or any expression, whose charset travels as a NEGATIVE
+                // sentinel ([ATT_SUBTYPE]) resolved at emission. Once
+                // statement text began decoding by the attachment charset,
+                // a literal's chars ARE its bytes, and encoding them as
+                // UTF-8 here doubled every high byte: `'<C3 80>'` under a
+                // NONE attachment shipped C3 83 C2 80. The sentinel
+                // resolves exactly as the capacity check resolves it, so
+                // the two cannot drift.
+                let emit_cs = if c.sub_type == ATT_SUBTYPE {
+                    out.map(|o| o.att.id)
+                } else if c.sub_type <= -2 {
+                    let cs = (-2 - c.sub_type) as u8;
+                    out.map(|o| if o.att.id != 0 { o.att.id } else { cs })
+                } else {
+                    Some(fire_crab_ods::intl::charset_id(c.sub_type as i16))
+                };
+                if emit_cs.is_some_and(fire_crab_ods::intl::byte_carrier) {
                     if let Some(b) = fire_crab_ods::intl::carrier_encode(&s) {
                         emit(w, &b);
                         continue;
@@ -53623,7 +53885,7 @@ fn resolve_expr(
     // appears: inside a concatenation, a comparison, an aggregate's
     // source or the select list
     let e = align_conditional(resolve_expr_inner(raw, columns, descs)?, descs);
-    Some(pad_conditional(recode_concat(e, descs), descs))
+    Some(pad_conditional(recode_conditional(recode_concat(e, descs), descs), descs))
 }
 
 /// EACH CONCATENATION OPERAND IS CONVERTED TO THE RESULT'S CHARACTER
@@ -53675,8 +53937,19 @@ fn recode_concat(e: Expr, descs: &[Descriptor]) -> Expr {
     else {
         return Expr::Concat(a, b);
     };
-    let TfCs::Ttype(dt) = cs_join(ca, cb) else { return Expr::Concat(a, b) };
-    let dst = charset_id(dt as i16);
+    // THE ATTACHMENT SENTINEL IS A CHARACTER SET at emission, and
+    // resolving it HERE is what routes a byte-carrier operand through
+    // the byte-copy law ([transcode_text], which already implements it)
+    // instead of leaving it to be re-encoded as UTF-8 on the way out.
+    // `N || 'x'` over a CHARACTER SET NONE column joins to the
+    // sentinel - NONE is the weakest set and yields to the other side -
+    // so this bailed, and the carrier's chars were encoded as UTF-8:
+    // 73747261C383C29F65 for the engine's 73747261C39F65. NONE yields
+    // its TAG to the other side; it never yields its BYTES.
+    let dst = match cs_join(ca, cb) {
+        TfCs::Ttype(dt) => charset_id(dt as i16),
+        TfCs::Att => CURRENT_ATT_CS.with(|c| c.get()),
+    };
     // ONLY a destination [transcode_text] actually implements. It knows
     // byte carriers, the tabled single-byte sets and UTF8; for anything
     // else - UNICODE_FSS, which is what the CATALOG columns carry - a
@@ -53747,6 +54020,59 @@ fn recode_concat(e: Expr, descs: &[Descriptor]) -> Expr {
 ///
 /// NULLIF is deliberately absent: its value IS its first operand, so
 /// there is nothing to reconcile.
+/// Convert a CONDITIONAL's byte-carrier branches by the BYTE-COPY law.
+///
+/// [recode_concat] does this for `||`; a conditional needs it for the
+/// same reason and could not borrow it. Under a byte-carrier attachment
+/// a literal's chars ARE its bytes, so when the conditional's joined
+/// charset is a REAL set - `COALESCE(<UTF8 column>, '<literal>')` types
+/// as UTF8 - the literal's bytes have to be REINTERPRETED in that set,
+/// not re-encoded from its chars. Re-encoding shipped `C3 83 C2 80` for
+/// the two bytes `C3 80`, the same doubling this whole slice is about.
+///
+/// Only the branches actually typed in the attachment's charset are
+/// wrapped: a branch that is a real UTF8 column is already in the
+/// destination and must not be touched. Which branch runs is a RUNTIME
+/// choice, so the conversion cannot be hoisted onto the whole node.
+fn recode_conditional(e: Expr, descs: &[Descriptor]) -> Expr {
+    use fire_crab_ods::intl::{byte_carrier, charset_id};
+    if !matches!(e, Expr::Case(..) | Expr::Coalesce(_) | Expr::Iif(..)) {
+        return e;
+    }
+    // only a byte-carrier attachment puts a branch in carrier form
+    let att = CURRENT_ATT_CS.with(|c| c.get());
+    if !byte_carrier(att) {
+        return e;
+    }
+    let Some((_, _, joined)) = text_form(&e, descs) else { return e };
+    let TfCs::Ttype(dt) = joined else { return e };
+    let dst = charset_id(dt as i16);
+    // a carrier destination keeps the carrier bytes as they are
+    if byte_carrier(dst) {
+        return e;
+    }
+    let wrap = |x: Expr| -> Expr {
+        match text_form(&x, descs) {
+            // an attachment-typed branch: its bytes are the carrier's
+            Some((_, w, TfCs::Att)) => Expr::Cast(
+                Box::new(x),
+                CastTarget::Text { len: w.max(0) as usize, pad: false, synthetic: true, cs: Some(dst) },
+                att,
+            ),
+            _ => x,
+        }
+    };
+    match e {
+        Expr::Coalesce(xs) => Expr::Coalesce(xs.into_iter().map(wrap).collect()),
+        Expr::Iif(c, a, b) => Expr::Iif(c, Box::new(wrap(*a)), Box::new(wrap(*b))),
+        Expr::Case(arms, els) => Expr::Case(
+            arms.into_iter().map(|(c, x)| (c, wrap(x))).collect(),
+            els.map(|x| Box::new(wrap(*x))),
+        ),
+        other => other,
+    }
+}
+
 fn align_conditional(e: Expr, descs: &[Descriptor]) -> Expr {
     if !matches!(e, Expr::Case(..) | Expr::Coalesce(_) | Expr::Iif(..)) {
         return e;
@@ -57128,6 +57454,19 @@ fn expr_value_charset(e: &Expr, descs: &[Descriptor]) -> Option<u8> {
     match text_form(e, descs) {
         Some((_, _, TfCs::Ttype(t))) => {
             let cs = charset_id(t as i16);
+            (byte_carrier(cs) || tabled(cs)).then_some(cs)
+        }
+        // A LITERAL IS TYPED IN THE ATTACHMENT'S CHARSET, and under a
+        // byte-carrier attachment its chars ARE its bytes. Dropping this
+        // arm made every literal fall through to UTF-8 semantics, so
+        // `OCTET_LENGTH('a<E9>b')` under a NONE attachment counted the
+        // UTF-8 spelling of the carrier chars (6) where the engine counts
+        // the literal's own bytes (4), and a CAST to OCTETS shipped
+        // `61C3A962` for `61E962`. The width machinery already carries
+        // the distinction ([TfCs::Att], resolved at emission); only the
+        // VALUE side was still guessing.
+        Some((_, _, TfCs::Att)) => {
+            let cs = CURRENT_ATT_CS.with(|c| c.get());
             (byte_carrier(cs) || tabled(cs)).then_some(cs)
         }
         _ => None,
@@ -74348,8 +74687,9 @@ fn after_auth(
                 if best >= 20 {
                     read_int(&mut s, &mut dec)?; // p_sqlst_flags
                 }
-                CURRENT_SQL.with(|c| *c.borrow_mut() = String::from_utf8_lossy(&sql).into_owned());
-                let text = entry_strip_comments(&String::from_utf8_lossy(&sql));
+                CURRENT_ATT_CS.with(|c| c.set(att_cs.id));
+                CURRENT_SQL.with(|c| *c.borrow_mut() = stmt_text_decode(&sql, att_cs.id));
+                let text = entry_strip_comments(&stmt_text_decode(&sql, att_cs.id));
                 // kicked by a forced shutdown: the engine's vector, no work
                 if database.as_ref().is_some_and(|d| d.kicked()) {
                     respond_kicked(&mut s, &mut enc)?;
@@ -74491,7 +74831,8 @@ fn after_auth(
                 if best >= 20 {
                     read_int(&mut s, &mut dec)?; // p_sqlst_flags
                 }
-                let text = entry_strip_comments(&String::from_utf8_lossy(&sql));
+                CURRENT_ATT_CS.with(|c| c.set(att_cs.id));
+                let text = entry_strip_comments(&stmt_text_decode(&sql, att_cs.id));
                 // kicked by a forced shutdown: the engine's vector, no work
                 if database.as_ref().is_some_and(|d| d.kicked()) {
                     respond_kicked(&mut s, &mut enc)?;
@@ -74597,9 +74938,10 @@ fn after_auth(
                 if best >= 20 {
                     read_int(&mut s, &mut dec)?; // p_sqlst_flags (FB6/proto 20+)
                 }
-                stmt_sql = entry_strip_comments(&String::from_utf8_lossy(&sql));
+                CURRENT_ATT_CS.with(|c| c.set(att_cs.id));
+                stmt_sql = entry_strip_comments(&stmt_text_decode(&sql, att_cs.id));
                 // ...and the text a DDL trigger reads as SQL_TEXT
-                CURRENT_SQL.with(|c| *c.borrow_mut() = String::from_utf8_lossy(&sql).into_owned());
+                CURRENT_SQL.with(|c| *c.borrow_mut() = stmt_text_decode(&sql, att_cs.id));
                 if std::env::var("FC_SRV_TRACE").is_ok() {
                     eprintln!("[srv] prepare sql = {:?}", stmt_sql);
                 }
@@ -74610,6 +74952,14 @@ fn after_auth(
                 }
                 last_dml = (0, 0, 0);
                 bound_args.clear();
+                // ...and so does a statement whose BYTES are not a string
+                // in the attachment's charset (see [stmt_text_malformed])
+                if stmt_text_malformed(&sql, att_cs.id) {
+                    plan = std::rc::Rc::new(Plan::Refused);
+                    stmt_params = std::rc::Rc::new(Vec::new());
+                    respond_malformed_statement(&mut s, &mut enc)?;
+                    continue;
+                }
                 // the lexer refuses before anything is planned or written
                 // (see [has_unknown_space])
                 if has_unknown_space(&stmt_sql) {
@@ -79883,6 +80233,13 @@ mod tests {
 
     #[test]
     fn a_literal_carries_both_of_its_widths() {
+        // THE OCTET MEASURE FOLLOWS THE ATTACHMENT, because the literal's
+        // own representation does ([stmt_text_decode]): under a real
+        // multi-byte attachment it holds CHARACTERS and its octets are
+        // the UTF-8 spelling, which is what the rest of this test asserts.
+        // The byte-carrier case, where the literal already holds one char
+        // per byte, is asserted at the end.
+        CURRENT_ATT_CS.with(|c| c.set(fire_crab_ods::intl::CS_UTF8));
         // one column: VARCHAR(10) UTF8 - 10 x 4 payload bytes + the
         // 2-byte count
         let descs = vec![Descriptor {
@@ -79930,6 +80287,18 @@ mod tests {
         );
         assert_eq!(text_form(&cast, &descs), Some((true, 10, TfCs::Att)));
         assert_eq!(text_form_oct(&cast, &descs), Some((true, 10, TfCs::Att)));
+
+        // ...and under a BYTE-CARRIER attachment the same three letters
+        // arrive as the SIX bytes they were sent as, so both measures
+        // answer 6. Announcing 12 here - the UTF-8 spelling of six
+        // carrier chars - is what made a NONE attachment declare a
+        // 6-octet literal as 12 and then raise a truncation on its own
+        // value.
+        CURRENT_ATT_CS.with(|c| c.set(fire_crab_ods::intl::CS_NONE));
+        let carried = "\u{c3}\u{80}\u{c3}\u{80}\u{c3}\u{80}";
+        assert_eq!(text_form(&lit(carried), &descs), Some((false, 6, TfCs::Att)));
+        assert_eq!(text_form_oct(&lit(carried), &descs), Some((false, 6, TfCs::Att)));
+        CURRENT_ATT_CS.with(|c| c.set(0));
     }
 
     #[test]

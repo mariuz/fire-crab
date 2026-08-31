@@ -390,13 +390,16 @@ for CH in "" UTF8; do
     mb_val  "a multi-byte literal through a column" \
         "SELECT COALESCE(C5, '$A3') AS X FROM T WHERE ID = 3"
 done
-# The residual, stated rather than hidden: fire-crab reads a literal as
-# UTF8 CHARACTERS whatever lc_ctype asked for, so a NONE attachment gets
-# UTF8 answers from UPPER / CHAR_LENGTH / SUBSTRING where the engine
-# treats the same literal as octets (the engine leaves a two-byte letter
-# alone; fire-crab upper-cases it). The WIDTH is right either way, which
-# is what the fix above was about, so what this asserts is that the
-# divergence stays a VALUE difference and never a dead connection.
+# THE RESIDUAL THIS ONCE RECORDED IS CLOSED (2026-08-31). fire-crab used
+# to read a literal as UTF8 CHARACTERS whatever lc_ctype asked for, so a
+# NONE attachment got UTF8 answers from UPPER / CHAR_LENGTH / SUBSTRING
+# where the engine treats the same literal as octets - it upper-cased a
+# two-byte letter the engine leaves alone. Statement text now decodes by
+# the attachment charset, so the two AGREE, and this check was inverted
+# to assert that: it used to fail when the outputs MATCHED, as a tripwire
+# to retire itself, and that tripwire is what fired. The connection-death
+# guard is kept, because a value that disagrees with its announced width
+# is how this surface kills a connection (08006).
 CH=""
 ran=$((ran + 1))
 u_fc=$(printf "SELECT UPPER('%s') AS X FROM RDB\$DATABASE;\n" "$(printf '\xc3\xa0\xc3\xa0')" \
@@ -410,10 +413,12 @@ elif ! alive; then
     echo "DIFF the connection died on UPPER over a multi-byte literal"
     fail=1
 elif [ "$u_fc" = "$u_re" ]; then
-    echo "DIFF the NONE-attachment UPPER residual is GONE - retire this check"
-    fail=1
+    echo "OK   UPPER over a multi-byte literal now AGREES under a NONE attachment"
 else
-    echo "OK   the UTF8-literal residual is a value difference, not a dropped connection"
+    echo "DIFF UPPER over a multi-byte literal diverges again under a NONE attachment"
+    echo "     fcwire: $(printf '%.90s' "$u_fc")"
+    echo "     engine: $(printf '%.90s' "$u_re")"
+    fail=1
 fi
 
 kill $srv 2>/dev/null; srv=""

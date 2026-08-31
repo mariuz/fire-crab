@@ -160,10 +160,17 @@ both "CAST an OCTETS column to UTF8"  "SELECT CAST(O AS VARCHAR(32) CHARACTER SE
 both "CAST a literal to WIN1252 under UTF8" \
     "SELECT CAST('x' AS VARCHAR(4) CHARACTER SET WIN1252) AS X FROM RDB\$DATABASE" "-ch UTF8"
 
-echo "--- 4. the recorded divergences --------------------------------------"
-known_diff "a NONE column concatenated with a literal" \
+echo "--- 4. what were the recorded divergences, now CLOSED -----------------"
+# These two were `known_diff` until 2026-08-31: a CHARACTER SET NONE
+# column concatenated with a literal came back with every high byte
+# doubled (73747261C39F65 shipped as 73747261C383C29F65), because the
+# carrier's chars were re-encoded as UTF-8 instead of travelling as the
+# bytes they are. NONE yields its TAG to the other operand and never its
+# BYTES. They are ordinary `both` checks now - the tripwire fired, which
+# is what a recorded divergence is for.
+both "a NONE column concatenated with a literal" \
     "SELECT N || '' AS R FROM TX WHERE ID=1"
-known_diff "... and with a non-empty one"  \
+both "... and with a non-empty one"  \
     "SELECT N || 'x' AS R FROM TX WHERE ID=1"
 
 echo "----------------------------------------------------------------------"

@@ -48,6 +48,7 @@ One line each; the gate is the proof.
 | transactional DDL | catalog rows under the user transaction's id, undo by state + journaled residue, deferred drops; first-updater-wins on a relation with the engine's vector; owner-only schema visibility | `serve-real-ddltx` 32 |
 | the file grows the engine's way | pointer-page chain, PIP chain, SCN pages at every `pagesPerSCN·N`, TIP chain — each crossed by fc and read by the engine (count, `gfix -v -full`, a write of its own on the new structure, a level-1 nbackup over fc's late pages), and the reverse | `serve-real-growth` 32 |
 | LATERAL is an ordinary source | a LATERAL materialises before anything above it runs, so DISTINCT / FIRST / SKIP / ROWS, an outer WHERE or ORDER BY, a derived table over it and COUNT/SUM/GROUP BY/HAVING over that derived table all work; the fetch batch is honoured (it hung any flow-control-honouring client past ~2340 rows); the comma form carries the inner column's nullability, the LEFT form is always nullable | `serve-real-lateral` 36 |
+| a literal is bytes in the attachment's charset | statement text is decoded by `lc_ctype` instead of `from_utf8_lossy`, so a lone `0xE9` under a NONE attachment is data; a literal's charset tags the value, the CAST source and the store; and a byte carrier yields its TAG to the other operand but never its BYTES | `serve-real-litcs` 60+ |
 
 ## Stale claims retired
 
@@ -4231,7 +4232,57 @@ below every wrong answer.
 - **LOW** (date/time arithmetic) — UNION DISTINCT with a CAST branch blanks the field name and table origin in the describe
 - **LOW** (LATERAL) — an OUTER column that is NOT NULL, used inside the lateral subquery's own expression (`FROM NN a, LATERAL (SELECT a.W * 2 AS Z FROM RDB$DATABASE) x`), is announced Nullable; the engine announces it fixed. Mechanism: the describe stand-in renders every outer reference as `CAST(NULL AS <type>)`, which is nullable by construction, so `inner_cols` cannot see that the outer column was fixed. Fixing it needs a NOT NULL stand-in of the same type and WIDTH per type (a bare literal would move the described width of text expressions), not a one-line change. The divergence is in the SAFE direction - a bit announced set that is never used - unlike announcing NOT NULL where a NULL can arrive, which desynchronises the wire
 
-### The charset cluster (hunt findings 10, 11, 12, 30) - law established, not yet implemented
+### The charset cluster (hunt findings 10, 11, 12, 30) - DONE (2026-08-31)
+
+Implemented as "a literal is bytes in the attachment's charset, and a
+byte carrier is never transliterated". The roadmap framed this as a
+CONCATENATION problem; re-measuring against the engine showed the concat
+symptom is DOWNSTREAM of the literal's charset, and that the same miss
+also corrupted data at rest and inverted a truncation check. What the
+implementation actually needed, in the order the measurements forced:
+
+- `stmt_text_decode` at the three statement entry points (op_prepare and
+  both exec_immediate forms) - `from_utf8_lossy` destroyed a lone `0xE9`
+  into U+FFFD BEFORE the tokenizer saw the literal.
+- the `TfCs::Att` arm in `expr_value_charset` and in
+  `cast_source_charset` - the width machinery already carried the
+  attachment sentinel; only the VALUE side was guessing UTF-8. Two paths
+  disagreed about one value: `OCTET_LENGTH(N||'')` answered 7 while the
+  CAST of the same expression shipped 9 bytes.
+- resolving the sentinel in `recode_concat`, which is what routes a
+  carrier operand through `transcode_text` - that function already
+  implemented the byte-copy law correctly and was simply never reached.
+- the literal's charset on the STORE path (`InsVal::Str`), the same law
+  `wire_text_param` already applied to a wire parameter.
+- `respond_malformed_statement`, the engine's DSQL `-104` vector, for
+  statement bytes that are not a string in a multi-byte attachment.
+  fire-crab had been ACCEPTING those and storing U+FFFD.
+- the EMIT path and its capacity check, together: the emit's byte-carrier
+  branch tested a POSITIVE ttype only, so it never fired for a literal or
+  any expression (whose charset travels as a negative sentinel). The
+  capacity check's own comment said "the condition is the EMIT's own" -
+  changing one without the other raised a 22001 on a value the engine
+  returns. Both now read the same resolved `src_id`.
+- `recode_conditional`, the byte-copy law for CASE / COALESCE / IIF,
+  which the concat recoder cannot cover. Branches wrap individually,
+  because WHICH branch runs is a runtime choice.
+- the INSERT blob-literal path, whose comment recorded the old assumption
+  in as many words ("a carrier stores the client's bytes verbatim - the
+  UTF-8 the SQL text arrived as"). A literal into a UTF8 text blob stored
+  SEVEN bytes where the engine stores five.
+- `answer_prepare`'s NAME items: an identifier travels in the
+  attachment's charset like any other text, so a quoted alias came back
+  doubled (`ăî` announced as `ÄÃ®`).
+
+Two gates recorded these divergences as `known_diff` - a check that FAILS
+when a recorded divergence starts agreeing, so that fixing it trips the
+gate instead of passing silently. Both fired and are ordinary assertions
+now. That convention is worth keeping: a recorded divergence nobody
+re-checks is just a bug with better manners.
+
+The old text is kept below for the record.
+
+### The charset cluster, as originally recorded
 
 All four reproduce, and probing them established ONE law that explains
 every case: **NONE and OCTETS are BYTE CARRIERS. A conversion to or from
@@ -4293,6 +4344,7 @@ shape the implementation has to take.
 - low — ASCII_CHAR is unknown to fire-crab
 - low — CAST(... AS BOOLEAN) is unsupported
 - low — The _CHARSET introducer on a literal (_WIN1252 X'809F', _UTF8 '€') is unsupported
+- **HIGH, NEW (2026-08-31, measured)** — CONNECTION KILL: with `SET SQLDA_DISPLAY ON`, a CHARACTER-typed result as the THIRD statement of a connection kills fire-crab's connection - `SQLSTATE 08006`, `-send_packet/send` - and EVERY later statement on it returns 08006. Bisected: position 1 or 2 is fine, three character statements in a row are fine, four integer statements are fine, a character COLUMN triggers it as well as a literal, and with SQLDA_DISPLAY off it never fires. Traced: on the first character-typed result fbclient opens a SECOND transaction and walks `RDB$CHARACTER_SETS` through the LEGACY BLR request API (`op_compile`, then `op_start_and_receive` and 53 `op_receive`) to resolve the charset NAME for the describe. That walk SUCCEEDS; the failure is the NEXT `op_execute`'s row send, over an encrypted (ChaCha64) connection - so it is state the legacy request path leaves behind, not a framing loss. Its own chunk. NOTE FOR ANY GATE: a charset or describe gate is by nature a stream of character-typed statements, so this can poison a whole run and a diff-counter can read the dead tail as agreement - put describe checks in their own connections, one statement each (`serve-real-litcs` does)
 - low — REFUSAL: an aggregate applied DIRECTLY to a lateral join (`SELECT COUNT(*) FROM T a, LATERAL (...) l`) refuses at prepare. `plan_lateral` delegates to the join planner and keeps only a `Plan::Join`; an aggregate makes that a `Plan::JoinGroup`, whose grouping columns index the COMBINED joined record, so the lateral cannot simply be substituted underneath it. The same query written with an explicit derived table IS served, which is what makes this a boundary rather than a hole
 
 ## How these slices are gated
