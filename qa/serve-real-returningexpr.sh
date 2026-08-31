@@ -163,6 +163,62 @@ refuses "a quoted name in the wrong case is still Column unknown" \
 refuses "a parameter in RETURNING refuses" \
   "UPDATE T SET N = 1 WHERE ID = 1 RETURNING ?;"
 # (a MERGE's RETURNING takes expressions too - see
+# --- a fixed-width CHAR result must be WRITTEN at its ANNOUNCED width ---
+# The singleton path (op_execute2, which is how an INSERT ... RETURNING is
+# answered) emitted the row with NO OUTPUT FORMAT, so it had no attachment
+# charset and wrote a CHAR result in the value's OWN bytes while the
+# describe announced the attachment's. Under -ch UTF8 `RETURNING 'ok'`
+# announced len 8 and wrote 2 bytes padded to the 4-byte XDR boundary; the
+# client desynchronised and the CONNECTION DIED - 08006, and every later
+# statement on it dead.
+#
+# Two things make this easy to miss:
+#   - it is ATTACHMENT-DEPENDENT. Under -ch NONE the announced length IS
+#     the byte length, so the same statement is correct. A gate that runs
+#     isql's default attachment sees nothing.
+#   - it is INSERT-SPECIFIC. UPDATE/DELETE/MERGE ... RETURNING answer
+#     through the ordinary fetch path, which HAS the format, so the
+#     identical expression is correct there. The contrast is the evidence.
+# The describes agreed on both servers throughout - only the bytes differed.
+retmb() { # <label> <sql> ; runs under UTF8 and asserts the connection lives
+    ran=$((ran + 1))
+    local e c
+    e=$(printf '%s\nSELECT 9 FROM RDB$DATABASE;\n' "$2" |
+        "$ISQL" -q -ch UTF8 -user "$U" -pas "$P" "127.0.0.1/$REAL:$B" 2>&1 | norm)
+    c=$(printf '%s\nSELECT 9 FROM RDB$DATABASE;\n' "$2" |
+        "$ISQL" -q -ch UTF8 -user "$U" -pas "$P" "127.0.0.1/$PORT:$A" 2>&1 | norm)
+    if printf '%s' "$c" | grep -q '08006'; then
+        echo "DIFF $1: THE CONNECTION DIED (08006) - a CHAR result was written"
+        echo "     at a width other than the one announced"
+        fail=1
+    elif [ "$c" = "$e" ]; then
+        echo "OK   $1"
+    else
+        echo "DIFF $1"; echo "     got:  [$c]"; echo "     want: [$e]"; fail=1
+    fi
+}
+retmb "INSERT RETURNING a literal" \
+    "INSERT INTO T (ID) VALUES (901) RETURNING 'ok';"
+retmb "INSERT RETURNING a CAST to CHAR" \
+    "INSERT INTO T (ID) VALUES (902) RETURNING CAST('abc' AS CHAR(3));"
+retmb "INSERT RETURNING a CASE over literals" \
+    "INSERT INTO T (ID) VALUES (903) RETURNING CASE WHEN 1=1 THEN 'yes' ELSE 'no' END;"
+retmb "INSERT RETURNING COALESCE over text" \
+    "INSERT INTO T (ID,S) VALUES (904,'zz') RETURNING COALESCE(S,'xx');"
+retmb "INSERT RETURNING a CHAR in another charset" \
+    "INSERT INTO T (ID) VALUES (905) RETURNING CAST('ab' AS CHAR(2) CHARACTER SET WIN1252);"
+retmb "INSERT RETURNING a one-character literal (the lucky case)" \
+    "INSERT INTO T (ID) VALUES (906) RETURNING 'a';"
+# the contrasts that localise it: same expression, other statements
+retmb "UPDATE RETURNING the same literal" \
+    "UPDATE T SET N=N WHERE ID=901 RETURNING 'ok';"
+retmb "DELETE RETURNING the same literal" \
+    "DELETE FROM T WHERE ID=906 RETURNING 'ok';"
+retmb "INSERT RETURNING a bare column (control)" \
+    "INSERT INTO T (ID,S) VALUES (907,'qq') RETURNING S;"
+retmb "INSERT RETURNING an integer (control)" \
+    "INSERT INTO T (ID) VALUES (908) RETURNING ID;"
+
 # serve-real-mergeparam.sh, where the two-context rule is pinned)
 gf=$("$GFIX" -v -full -user "$U" -pas "$P" "$A" 2>&1)
 ran=$((ran + 1))

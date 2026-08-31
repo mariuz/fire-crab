@@ -15206,13 +15206,34 @@ fn result_width_bytes(e: &Expr, descs: &[Descriptor]) -> u8 {
         // a conditional takes its WIDEST branch (probed: CASE S/2 -> LONG,
         // CASE S/S -> SHORT, COALESCE(S, B) -> INT64); NULLIF takes its
         // FIRST argument's type (probed: NULLIF(S, 1) -> SHORT, NULLIF(1, S) -> LONG)
-        Expr::Coalesce(v) => v.iter().map(|x| result_width_bytes(x, descs)).max().unwrap_or(8),
+        // A BARE NULL BRANCH CONTRIBUTES NO WIDTH, the same rule
+        // [conditional_type] already applies to the TYPE and the text
+        // path already applies to the character width:
+        // `DataTypeUtilBase::makeFromList` (jrd/DataTypeUtil.cpp:99)
+        // says "Ignore NULL and parameter value from walking". Left in,
+        // a NULL fell to the 8-byte default and WON the max, so
+        // `COALESCE(NULL, <INTEGER>)` was announced INT64 len 8 where the
+        // engine says LONG len 4. Only when EVERY branch is NULL does the
+        // default stand.
+        Expr::Coalesce(v) => v
+            .iter()
+            .filter(|x| !matches!(x, Expr::Null))
+            .map(|x| result_width_bytes(x, descs))
+            .max()
+            .unwrap_or(8),
         Expr::NullIf(a, _) => result_width_bytes(a, descs),
-        Expr::Iif(_, a, b) => result_width_bytes(a, descs).max(result_width_bytes(b, descs)),
+        Expr::Iif(_, a, b) => match (matches!(**a, Expr::Null), matches!(**b, Expr::Null)) {
+            (true, true) => 8,
+            (true, false) => result_width_bytes(b, descs),
+            (false, true) => result_width_bytes(a, descs),
+            (false, false) => result_width_bytes(a, descs).max(result_width_bytes(b, descs)),
+        },
         Expr::Case(arms, els) => arms
             .iter()
-            .map(|(_, x)| result_width_bytes(x, descs))
-            .chain(els.iter().map(|x| result_width_bytes(x, descs)))
+            .map(|(_, x)| x)
+            .chain(els.iter().map(|x| &**x))
+            .filter(|x| !matches!(x, Expr::Null))
+            .map(|x| result_width_bytes(x, descs))
             .max()
             .unwrap_or(8),
         // a literal NULL operand: makeCeilFloor / makeRound / makeTrunc all
@@ -15552,6 +15573,14 @@ fn text_form_oct(e: &Expr, descs: &[Descriptor]) -> Option<(bool, i32, TfCs)> {
     })
 }
 
+/// The text form of a conditional whose branches are ALL bare NULLs:
+/// CHAR(1) CHARACTER SET NONE. `makeFromList` ends with
+/// `if (allNulls) result->makeNullString();` (jrd/DataTypeUtil.cpp), and
+/// a standalone `SELECT NULL` already describes that way on both servers.
+fn all_null_form() -> (bool, i32, TfCs) {
+    (false, 1, TfCs::Ttype(fire_crab_ods::intl::CS_NONE as i32))
+}
+
 fn text_form_m(
     e: &Expr,
     descs: &[Descriptor],
@@ -15672,7 +15701,11 @@ fn text_form_m(
             .filter(|x| !matches!(x, Expr::Null))
             .map(|x| text_form(x, descs))
             .reduce(widen)
-            .flatten(),
+            .flatten()
+            // ...and with every branch filtered away there is nothing to
+            // unify against: CHAR(1) NONE ([ALL_NULL_FORM])
+            .or_else(|| v.iter().all(|x| matches!(x, Expr::Null)).then(all_null_form)),
+        Expr::NullIf(a, _) if matches!(**a, Expr::Null) => Some(all_null_form()),
         Expr::NullIf(a, _) => text_form(a, descs),
         // CONCATENATION is always VARYING and as wide as the SUM of its
         // operands (probed: CHAR(6) || VARCHAR(6) is VARYING(12))
@@ -15812,20 +15845,48 @@ fn text_form_m(
                 _ => None,
             }
         }
-        Expr::Iif(_, a, b) => widen(text_form(a, descs), text_form(b, descs)),
+        // ...and an IIF arm that is a bare NULL contributes nothing
+        Expr::Iif(_, a, b) => match (matches!(**a, Expr::Null), matches!(**b, Expr::Null)) {
+            (true, true) => Some(all_null_form()),
+            (true, false) => text_form(b, descs),
+            (false, true) => text_form(a, descs),
+            (false, false) => widen(text_form(a, descs), text_form(b, descs)),
+        },
         Expr::Case(branches, else_) => {
             let mut acc: Option<(bool, i32, TfCs)> = None;
-            for (_, t) in branches {
+            // AN EXPLICIT `THEN NULL` DOES NOT WIDEN EITHER. The missing
+            // ELSE below was already treated as the untyped branch it is;
+            // a NULL written OUT was still folded in, and since a bare
+            // NULL has no text form the fold collapsed to the 32765-byte
+            // catch-all and lost the charset with it: `CASE WHEN 1=0 THEN
+            // NULL ELSE <VARCHAR(10) UTF8> END` was announced len 32765
+            // charset NONE where the engine says len 40 charset UTF8.
+            for (_, t) in branches.iter().filter(|(_, t)| !matches!(t, Expr::Null)) {
                 acc = match acc {
                     None => text_form(t, descs),
                     some => widen(some, text_form(t, descs)),
                 };
             }
+            let all_null = branches.iter().all(|(_, t)| matches!(t, Expr::Null))
+                && else_.as_ref().is_none_or(|x| matches!(**x, Expr::Null));
+            if all_null {
+                return Some(all_null_form());
+            }
             match else_ {
                 // no ELSE means a NULL branch, which is untyped and does
                 // not widen
                 None => acc,
-                Some(x) => widen(acc, text_form(x, descs)),
+                Some(x) if matches!(**x, Expr::Null) => acc,
+                // `widen` answers None if EITHER side is None, so once the
+                // NULL branches are filtered out the accumulator may be
+                // empty and must simply take this branch's form - the same
+                // shape the loop above uses for its first branch. Widening
+                // an empty accumulator collapsed the whole fold and put
+                // the 32765-byte catch-all back.
+                Some(x) => match acc {
+                    None => text_form(x, descs),
+                    some => widen(some, text_form(x, descs)),
+                },
             }
         }
         _ => None,
@@ -55821,7 +55882,13 @@ fn conditional_type<'a>(
         return Some(ExprType::Numeric);
     }
     if first.is_none() && all_null {
-        return Some(ExprType::Int); // every branch NULL: the old describe
+        // EVERY BRANCH NULL: `makeFromList` ends with
+        // `if (allNulls) result->makeNullString();`
+        // (jrd/DataTypeUtil.cpp), which is CHAR(1) CHARACTER SET NONE -
+        // the same thing a standalone `SELECT NULL` already describes as
+        // on both servers. It used to answer Int here, so
+        // `COALESCE(NULL, NULL)` was announced INT64 len 8.
+        return Some(ExprType::Text);
     }
     first
 }
@@ -57959,6 +58026,13 @@ impl Expr {
             ),
             // NULLIF only ever ANSWERS its first operand (or NULL), so
             // its type is the first operand's - no cross-branch widening
+            // NULLIF answers its FIRST argument or NULL, so its type is
+            // that argument's - except a bare NULL there has no type of
+            // its own and falls to the all-NULL rule, CHAR(1) NONE
+            // (`makeFromList`'s `if (allNulls) result->makeNullString()`).
+            // Reading it through `Expr::Null`'s Int made `NULLIF(NULL, 1)`
+            // announce INT64 len 8 where the engine says TEXT len 1.
+            Expr::NullIf(a, _) if matches!(**a, Expr::Null) => Some(ExprType::Text),
             Expr::NullIf(a, b) => a.type_of(descs).or_else(|| b.type_of(descs)),
             Expr::Iif(_, a, b) => {
                 conditional_type([&**a, &**b].into_iter(), descs)
@@ -78773,7 +78847,21 @@ fn after_auth(
                                     } else {
                                         inline_singleton_blobs(&mut w, database.as_ref(), &values, inline_sizes.get(&cur_stmt).copied());
                                         w.int(OP_SQL_RESPONSE).int(1);
-                                        encode_row_body(&mut w, &rcols, &values, None).ok();
+                                        // THE OUTPUT FORMAT MUST TRAVEL WITH THE
+                                        // ROW. Without it this emit has no
+                                        // attachment charset, so a fixed-width
+                                        // CHAR result was written in the value's
+                                        // OWN bytes while the describe announced
+                                        // the attachment's - `INSERT ... RETURNING
+                                        // 'ok'` under a UTF8 attachment announced
+                                        // len 8 and wrote 2 bytes (padded to the
+                                        // 4-byte XDR boundary), and the client
+                                        // desynchronised: 08006, connection gone,
+                                        // every later statement on it dead. The
+                                        // UPDATE/DELETE/MERGE forms never hit this
+                                        // because they answer through the ordinary
+                                        // fetch path, which has the format.
+                                        encode_row_body(&mut w, &rcols, &values, out_fmt.as_ref()).ok();
                                     }
                                     w.int(OP_RESPONSE)
                                         .int(TX_HANDLE)

@@ -54,6 +54,8 @@ One line each; the gate is the proof.
 | a window is a value and composes | each window call is LIFTED out of its expression, folded as its own column, and replaced by a reference to it - so `ROW_NUMBER() OVER (...) + 1`, COALESCE/CASE/CAST/function/concat over a window, and two windows in one expression all work; plus PERCENT_RANK and CUME_DIST | `serve-real-window` 139 |
 | a NULL side is NULL however spelled | `IS [NOT] DISTINCT FROM` desugared to IS NULL only for a BARE NULL token, so a parenthesised or CAST NULL fell through to a value comparison and came back EXACTLY INVERTED | `serve-real-nulls` 40 |
 | a correlated subquery answers per row or refuses | only EQUALITY pairs counted as a correlation; anything else was re-evaluated as UNCORRELATED and folded to ONE verdict for every row, so the anti-join idiom answered every row and the running-count idiom answered 0 | `serve-real-nulls` 40 |
+| a bare NULL branch contributes nothing | `makeFromList` ignores a NULL argument for unification and falls back to CHAR(1) NONE only when EVERY argument is NULL; fire-crab typed a bare NULL as INT64 and let it WIN, announcing a VARCHAR(10) UTF8 as len 32765 charset NONE | `serve-real-branchtype` 69 |
+| the output format travels with the row | the singleton path (`op_execute2`, how an INSERT ... RETURNING is answered) emitted with NO OutFmt, so a CHAR result was written in the value's own bytes while the describe announced the attachment's - under -ch UTF8 `RETURNING 'ok'` announced len 8, wrote 2, and KILLED THE CONNECTION | `serve-real-returningexpr` 33 |
 
 ## Stale claims retired
 
@@ -4192,14 +4194,53 @@ pointer-page and TIP page numbers is the next step when it dominates.
   RAM today; after the growth walls this is the next scalability
   ceiling a real database reaches.
 
-## Found by HUNTING outside the gates (2026-08-31) - still open
+## Found by the SECOND hunt (2026-08-31) - still open
+
+- **HIGH (wrong answer)** — `MERGE ... WHEN MATCHED THEN DELETE ...
+  RETURNING NEW.<col>` answers the DELETED row's values; the engine
+  answers NULL, because a DELETE branch has no NEW record.
+
+  ```
+  MERGE INTO T USING (SELECT 2 AS K FROM RDB$DATABASE) S ON T.ID=S.K
+    WHEN MATCHED THEN DELETE RETURNING T.ID, OLD.V, NEW.V;
+      engine    2 | 20 | <null>          fire-crab   2 | 20 | 20
+  MERGE ... DELETE RETURNING NEW.ID, NEW.D;
+      engine    <null> | <null>          fire-crab   2 | 42
+  ```
+
+  The whole NEW record is wrong, not one column. `OLD.*` is correct
+  everywhere, and a plain `DELETE ... RETURNING <col>` is correct on both
+  (the engine DOES answer the deleted values there) - so the rule is
+  specifically that `NEW.` has nothing to read on a delete branch.
+
+  WHY IT IS NOT A ONE-LINE FIX: the delete path pushes the deleted row as
+  the AFTER image ON PURPOSE - "a DELETE's `images` ARE the old rows; the
+  parallel slot keeps every consumer's indexing uniform"
+  (server.rs, the delete arm of execute_dml_collecting) - and
+  `wrap_returning` resolves `NEW.<col>` to that same after-image. In a
+  MIXED merge (some rows updated, some deleted) the distinction is
+  PER ROW: measured, the update-branch row agrees and only the
+  delete-branch row diverges. So it needs per-row branch provenance in
+  `Affected`, not a plan-time decision.
+
+- **MEDIUM (describe)** — the same shape's describe: `NEW.<col>` over a
+  MERGE DELETE branch is announced as the base column (`496 LONG len 4`,
+  table T) where the engine folds it to a constant (`452 TEXT len 1
+  charset NONE`, no table). fire-crab announces the WIDER field, so a
+  client laying out its buffer from the describe mis-parses.
+
+- **MEDIUM (refusal)** — `ROWS` and `ORDER BY` on searched `UPDATE` /
+  `DELETE` are not supported at all, with or without RETURNING. A widely
+  used Firebird extension; the largest single gap that hunt found.
+
+## Found by the FIRST hunt (2026-08-31) - still open
 
 A six-surface differential hunt, run because the recorded backlog held no
 wrong answers left, found these. Two were fixed the same day (the
 correlated-subquery fold and the parenthesised-NULL inversion); what
 follows survived refutation and is NOT yet implemented.
 
-- **HIGH (describe)** — an untyped NULL branch poisons the unified type of
+- ~~**HIGH (describe)** — an untyped NULL branch poisons the unified type of~~ **DONE 2026-08-31.** Original report:
   CASE / COALESCE / IIF / NULLIF. fire-crab types a bare NULL as INT64 and
   lets it win: `CASE WHEN 1=0 THEN NULL ELSE <VARCHAR(10) UTF8> END` is
   announced `448 VARYING len 32765 charset 0 NONE` where the engine says

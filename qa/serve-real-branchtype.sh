@@ -255,7 +255,67 @@ both "a BIGINT anchor"  \
 refuses "a recursive member that changes the column's scale" \
     "WITH RECURSIVE N AS (SELECT 1 X FROM RDB\$DATABASE UNION ALL SELECT X + 0.5 FROM N WHERE X < 3) SELECT * FROM N"
 
+# --- a bare NULL branch has NO TYPE and contributes none ----------------
+# DataTypeUtilBase::makeFromList (jrd/DataTypeUtil.cpp:99), which COALESCE
+# (ExprNodes.cpp:3927), CASE (:5062) and LIST (:611) all call, says it in
+# as many words:
+#
+#     allNulls &= arg->isNull();
+#     // Ignore NULL and parameter value from walking.
+#     if (arg->isNull() || arg->isUnknown()) { nullable = true; continue; }
+#     ...
+#     if (allNulls) result->makeNullString();
+#
+# So a NULL argument is IGNORED for unification and only forces
+# nullability; when EVERY argument is NULL the result is CHAR(1) NONE.
+#
+# fire-crab typed a bare NULL as INT64 and let it WIN, so the NULL branch
+# decided the whole expression: a VARCHAR(10) UTF8 was announced VARYING
+# len 32765 charset NONE (an 819x width inflation on a per-row wire
+# buffer, plus a lost character set), and an INTEGER became INT64 len 8.
+# The VALUES agreed throughout - which is exactly why this survived: it is
+# only visible to a client that sizes its buffer from the describe, or
+# decodes text by the announced charset.
+both "NULL branch vs a VARCHAR column" \
+    "SELECT CASE WHEN 1=0 THEN NULL ELSE V10 END Q FROM T WHERE ID=1"
+both "NULL branch vs a UTF8 column" \
+    "SELECT CASE WHEN 1=0 THEN NULL ELSE U6 END Q FROM T WHERE ID=1"
+both "NULL branch vs a WIN1252 column" \
+    "SELECT CASE WHEN 1=0 THEN NULL ELSE W6 END Q FROM T WHERE ID=1"
+both "NULL branch vs a CHAR column" \
+    "SELECT CASE WHEN 1=0 THEN NULL ELSE C5 END Q FROM T WHERE ID=1"
+both "NULL branch vs an INTEGER" \
+    "SELECT CASE WHEN 1=0 THEN NULL ELSE ID END Q FROM T WHERE ID=1"
+both "NULL branch vs a NUMERIC(9,2)" \
+    "SELECT CASE WHEN 1=0 THEN NULL ELSE N92 END Q FROM T WHERE ID=1"
+both "the NULL branch TAKEN, not just present" \
+    "SELECT CASE WHEN 1=1 THEN NULL ELSE ID END Q FROM T WHERE ID=1"
+both "COALESCE with the NULL first" \
+    "SELECT COALESCE(NULL, ID) Q FROM T WHERE ID=1"
+both "COALESCE with the NULL last" \
+    "SELECT COALESCE(ID, NULL) Q FROM T WHERE ID=1"
+both "COALESCE, NULL against text" \
+    "SELECT COALESCE(NULL, V10) Q FROM T WHERE ID=1"
+both "IIF with a NULL arm" \
+    "SELECT IIF(1=1, NULL, ID) Q FROM T WHERE ID=1"
+both "NULLIF answering NULL" \
+    "SELECT NULLIF(NULL, 1) Q FROM RDB\$DATABASE"
+both "two NULL branches and one typed" \
+    "SELECT CASE WHEN 1=0 THEN NULL WHEN 1=0 THEN NULL ELSE N92 END Q FROM T WHERE ID=1"
+# ...and with NOTHING to unify against, the result is CHAR(1) NONE
+both "every branch NULL: COALESCE" \
+    "SELECT COALESCE(NULL, NULL) Q FROM RDB\$DATABASE"
+both "every branch NULL: CASE" \
+    "SELECT CASE WHEN 1=0 THEN NULL ELSE NULL END Q FROM RDB\$DATABASE"
+both "control: a standalone NULL" \
+    "SELECT NULL Q FROM RDB\$DATABASE"
+# the controls that must not move: no NULL branch anywhere
+both "control: two typed branches" \
+    "SELECT CASE WHEN 1=0 THEN ID ELSE N92 END Q FROM T WHERE ID=1"
+both "control: COALESCE of two typed" \
+    "SELECT COALESCE(V3, V10) Q FROM T WHERE ID=1"
+
 echo "----------------------------------------------------------------------"
-[ "$ran" -ge 46 ] || { echo "FAIL only $ran checks ran"; fail=1; }
+[ "$ran" -ge 64 ] || { echo "FAIL only $ran checks ran"; fail=1; }
 [ $fail -eq 0 ] && echo "PASS $ran checks" || echo "FAIL"
 exit $fail
