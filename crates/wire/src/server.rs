@@ -39370,8 +39370,14 @@ fn plan_query_inner_ctx(
                         return Some(Plan::RefusedEval(EvalErr::SingletonSelect));
                     }
                     let v = rows.values.first().cloned().unwrap_or(Value::Null);
-                    let Some(lit) = value_literal(&v) else {
-                        return Some(Plan::Refused);
+                    // a TEXT answer keeps its column's character set (see
+                    // [subq_text_literal]); everything else folds as before
+                    let lit = match subq_text_literal(&v, sub, db) {
+                        Some(l) => l,
+                        None => match value_literal(&v) {
+                            Some(l) => l,
+                            None => return Some(Plan::Refused),
+                        },
                     };
                     let repl = match (alone.get(i), subq_name(sub)) {
                         (Some(true), Some(n)) => format!("{} AS {}", lit, n),
@@ -60437,6 +60443,54 @@ struct SubqRows {
 /// parser reads back the same scale), text (quotes doubled) and NULL.
 /// Anything else refuses rather than risk a literal that means a
 /// slightly different value than the one computed.
+/// The folded literal for a TEXT scalar subquery, carrying the inner
+/// column's CHARACTER SET.
+///
+/// A select-list scalar subquery is erased at prepare: its value is
+/// spliced back into the statement TEXT and the statement re-planned
+/// ([extract_subqueries]). That is why the describe follows the value -
+/// the value IS the statement by then. A bare `'...'` literal is typed
+/// like any other literal, i.e. in the ATTACHMENT's character set, so
+/// the inner column's set was lost the moment the subquery became an
+/// OPERAND of anything: `OCTET_LENGTH((SELECT <WIN1252 col> FROM T))`
+/// answered the UTF-8 length of those characters, and the answer moved
+/// with `-ch` while the engine's stayed put.
+///
+/// Splicing `CAST(x'<bytes>' AS VARCHAR(n) CHARACTER SET <set>)` instead
+/// carries BOTH the exact bytes and the set through the re-plan, so
+/// every context types it correctly - inside an expression, a CAST, a
+/// concatenation or a function - not only the whole-select-item case the
+/// `fname_patches` pass already repaired. A hex literal is OCTETS, and
+/// OCTETS -> anything is a byte copy, so the bytes survive exactly.
+///
+/// None whenever the shape is not a text value of a REAL character set,
+/// and the caller keeps the plain literal it used before.
+fn subq_text_literal(v: &Value, sub: &str, db: &Option<Database>) -> Option<String> {
+    let Value::Text(t) = v else { return None };
+    let ty = match plan_query_inner(sub, db, &mut Vec::new())? {
+        Plan::Scalar(_, _, _, ty) => ty,
+        p => ScalarTy::from_col(output_cols_of(&p).first()?),
+    };
+    // a real ttype only: an expression carries its charset as a negative
+    // sentinel, and that resolves against the attachment by design
+    if !(0..=i16::MAX as i32).contains(&ty.sub_type) {
+        return None;
+    }
+    let cs = fire_crab_ods::intl::charset_id(ty.sub_type as i16);
+    let name = charset_id_name(cs)?;
+    let bytes = blob_bytes_in(t, cs).ok()?;
+    // the declared width is the COLUMN's, in its own characters - what
+    // the engine announces for the combination too (a WIN1252 VARCHAR(10)
+    // concatenated with one character describes len 11, not the width of
+    // this particular value)
+    let width = if ty.length > 0 { ty.length } else { 1 };
+    let mut hex = String::with_capacity(bytes.len() * 2);
+    for b in &bytes {
+        hex.push_str(&format!("{:02X}", b));
+    }
+    Some(format!("CAST(x'{}' AS VARCHAR({}) CHARACTER SET {})", hex, width, name))
+}
+
 fn value_literal(v: &Value) -> Option<String> {
     Some(match v {
         Value::Null => "NULL".to_string(),

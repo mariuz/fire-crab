@@ -50,6 +50,7 @@ One line each; the gate is the proof.
 | LATERAL is an ordinary source | a LATERAL materialises before anything above it runs, so DISTINCT / FIRST / SKIP / ROWS, an outer WHERE or ORDER BY, a derived table over it and COUNT/SUM/GROUP BY/HAVING over that derived table all work; the fetch batch is honoured (it hung any flow-control-honouring client past ~2340 rows); the comma form carries the inner column's nullability, the LEFT form is always nullable | `serve-real-lateral` 36 |
 | a literal is bytes in the attachment's charset | statement text is decoded by `lc_ctype` instead of `from_utf8_lossy`, so a lone `0xE9` under a NONE attachment is data; a literal's charset tags the value, the CAST source and the store; and a byte carrier yields its TAG to the other operand but never its BYTES | `serve-real-litcs` 60+ |
 | one per-connection object id space | a compiled BLR request and a prepared statement are different KINDS over ONE client-side id space (fbclient's `port_objects` is a single untagged union array); minting them from separate counters collided at id 5 and KILLED THE CONNECTION | `serve-real-objid` 14 |
+| a folded subquery carries its column's charset | a select-list scalar subquery is erased at prepare - its value is spliced back into the statement TEXT and re-planned - so the spliced literal was typed like any literal, in the ATTACHMENT's charset, and the inner column's set was lost the moment the subquery became an OPERAND. Now spliced as `CAST(x'..' AS VARCHAR(n) CHARACTER SET <set>)` | `serve-real-subqdesc` 70 |
 
 ## Stale claims retired
 
@@ -4232,6 +4233,23 @@ below every wrong answer.
 - **LOW** (common table expressions) — Recursive-CTE columns leak the anchor expression's node kind into the describe `name:` field (CONSTANT); the engine leaves it empty
 - **LOW** (date/time arithmetic) — UNION DISTINCT with a CAST branch blanks the field name and table origin in the describe
 - **LOW** (LATERAL) — an OUTER column that is NOT NULL, used inside the lateral subquery's own expression (`FROM NN a, LATERAL (SELECT a.W * 2 AS Z FROM RDB$DATABASE) x`), is announced Nullable; the engine announces it fixed. Mechanism: the describe stand-in renders every outer reference as `CAST(NULL AS <type>)`, which is nullable by construction, so `inner_cols` cannot see that the outer column was fixed. Fixing it needs a NOT NULL stand-in of the same type and WIDTH per type (a bare literal would move the described width of text expressions), not a one-line change. The divergence is in the SAFE direction - a bit announced set that is never used - unlike announcing NOT NULL where a NULL can arrive, which desynchronises the wire
+
+### A REGRESSION THAT CHUNK CAUSED, found and fixed 2026-08-31
+
+Making a literal type in the attachment's charset also retyped the
+LITERAL A SCALAR SUBQUERY IS FOLDED INTO. Measured against the binary
+from before that chunk (df5520e), on `OCTET_LENGTH((SELECT <col>))`:
+
+| via a scalar subquery | pre-chunk | after the chunk | engine |
+|---|---|---|---|
+| a WIN1252 column | 27, every attachment | 27 / 27 / 10 | 10 |
+| a UTF8 column | **5 - correct** | **4 / 5 / 4** | 5 |
+
+The WIN1252 half was already broken; the UTF8 half WORKED and the chunk
+broke it, and the 358-gate sweep stayed green because no gate covered a
+subquery used as an OPERAND rather than as a whole select item. Fixed by
+splicing a charset-carrying literal; `serve-real-subqdesc` 40 -> 70 now
+covers the operand shapes under all three attachments.
 
 ### The charset cluster (hunt findings 10, 11, 12, 30) - DONE (2026-08-31)
 

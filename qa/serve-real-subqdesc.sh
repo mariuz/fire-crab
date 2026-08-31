@@ -81,6 +81,18 @@ INSERT INTO T1 VALUES (2, 22, 9000000000000000000, 1.50, 1.50, 'xy', 'world', 'c
 COMMIT;
 UPDATE T1 SET W = _WIN1252 x'E9E0' WHERE ID = 1;
 COMMIT;
+/* T2 exists for the IN-EXPRESSION charset vectors and is deliberately
+   separate from T1, whose rows several aggregate checks above depend on.
+   W2's bytes 80 82 83 ... are NOT valid latin-1 characters, so a value
+   that survived a latin-1 round trip cannot masquerade as correct here -
+   which x'E9E0' (e-acute, a-grave) would. */
+CREATE TABLE T2 (ID INTEGER, W2 VARCHAR(10) CHARACTER SET WIN1252,
+                 U2 VARCHAR(10) CHARACTER SET UTF8,
+                 N2 VARCHAR(10) CHARACTER SET NONE,
+                 C2 CHAR(10) CHARACTER SET WIN1252);
+COMMIT;
+INSERT INTO T2 VALUES (1, x'8082838485868788898A', x'41C3A9425A', x'41E9425A', x'80828384');
+COMMIT;
 EOF
 }
 for f in "$A" "$B"; do
@@ -210,7 +222,43 @@ both "a subquery INSIDE an expression takes the expression's rules" \
 both "a subquery in a WHERE clause"  "SELECT ID FROM T1 WHERE ID = (SELECT MIN(ID) FROM T1)"
 both "a plain column, unwrapped"     "SELECT W AS X FROM T1 WHERE ID = 1"
 
+echo "--- 7. a subquery that is an OPERAND keeps its column's charset -------"
+# The fold splices the subquery's VALUE back into the statement text, so
+# without care the spliced literal is typed like any other literal - in
+# the ATTACHMENT's character set - and the inner column's set is lost the
+# moment the subquery becomes an operand of anything. The bare form was
+# already repaired by the describe patch pass, which only fires when the
+# marker IS the whole select item; these are the shapes that pass had no
+# reach over. Every one runs under all three attachments, because the
+# defect's signature was that the ANSWER MOVED with -ch while the
+# engine's stayed put.
+for CH in "" "-ch UTF8" "-ch WIN1252"; do
+    l="${CH:--ch NONE}"
+    both "OCTET_LENGTH over a WIN1252 subquery $l" \
+        "SELECT OCTET_LENGTH((SELECT W2 FROM T2 WHERE ID=1)) AS X FROM RDB\$DATABASE" "$CH"
+    both "OCTET_LENGTH over a UTF8 subquery $l" \
+        "SELECT OCTET_LENGTH((SELECT U2 FROM T2 WHERE ID=1)) AS X FROM RDB\$DATABASE" "$CH"
+    both "CHAR_LENGTH over a WIN1252 subquery $l" \
+        "SELECT CHAR_LENGTH((SELECT W2 FROM T2 WHERE ID=1)) AS X FROM RDB\$DATABASE" "$CH"
+    both "the subquery CAST to its own set $l" \
+        "SELECT CAST(CAST((SELECT W2 FROM T2 WHERE ID=1) AS VARCHAR(10) CHARACTER SET WIN1252) AS VARCHAR(40) CHARACTER SET OCTETS) AS X FROM RDB\$DATABASE" "$CH"
+    both "the subquery concatenated $l" \
+        "SELECT CAST((SELECT W2 FROM T2 WHERE ID=1) || '!' AS VARCHAR(40) CHARACTER SET OCTETS) AS X FROM RDB\$DATABASE" "$CH"
+    both "the concatenation's DESCRIBE $l" \
+        "SELECT (SELECT W2 FROM T2 WHERE ID=1) || '!' AS X FROM RDB\$DATABASE" "$CH"
+    both "TRIM over a subquery $l" \
+        "SELECT CAST(TRIM((SELECT U2 FROM T2 WHERE ID=1)) AS VARCHAR(40) CHARACTER SET OCTETS) AS X FROM RDB\$DATABASE" "$CH"
+    both "a CHAR subquery pads in ITS OWN characters $l" \
+        "SELECT CAST(CAST((SELECT C2 FROM T2 WHERE ID=1) AS CHAR(10) CHARACTER SET WIN1252) AS VARCHAR(60) CHARACTER SET OCTETS) AS X FROM RDB\$DATABASE" "$CH"
+    both "a NONE subquery as an operand $l" \
+        "SELECT OCTET_LENGTH((SELECT N2 FROM T2 WHERE ID=1)) AS X FROM RDB\$DATABASE" "$CH"
+    # controls: the same expressions over the COLUMN, which must agree
+    # whatever happens to subqueries
+    both "control, the column not a subquery $l" \
+        "SELECT OCTET_LENGTH(W2), CHAR_LENGTH(W2) FROM T2 WHERE ID=1" "$CH"
+done
+
 echo "----------------------------------------------------------------------"
-[ "$ran" -ge 38 ] || { echo "FAIL only $ran checks ran"; fail=1; }
+[ "$ran" -ge 68 ] || { echo "FAIL only $ran checks ran"; fail=1; }
 [ $fail -eq 0 ] && echo "PASS $ran checks" || echo "FAIL"
 exit $fail
