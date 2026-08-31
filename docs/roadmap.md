@@ -51,6 +51,7 @@ One line each; the gate is the proof.
 | a literal is bytes in the attachment's charset | statement text is decoded by `lc_ctype` instead of `from_utf8_lossy`, so a lone `0xE9` under a NONE attachment is data; a literal's charset tags the value, the CAST source and the store; and a byte carrier yields its TAG to the other operand but never its BYTES | `serve-real-litcs` 60+ |
 | one per-connection object id space | a compiled BLR request and a prepared statement are different KINDS over ONE client-side id space (fbclient's `port_objects` is a single untagged union array); minting them from separate counters collided at id 5 and KILLED THE CONNECTION | `serve-real-objid` 14 |
 | a folded subquery carries its column's charset | a select-list scalar subquery is erased at prepare - its value is spliced back into the statement TEXT and re-planned - so the spliced literal was typed like any literal, in the ATTACHMENT's charset, and the inner column's set was lost the moment the subquery became an OPERAND. Now spliced as `CAST(x'..' AS VARCHAR(n) CHARACTER SET <set>)` | `serve-real-subqdesc` 70 |
+| a window is a value and composes | each window call is LIFTED out of its expression, folded as its own column, and replaced by a reference to it - so `ROW_NUMBER() OVER (...) + 1`, COALESCE/CASE/CAST/function/concat over a window, and two windows in one expression all work; plus PERCENT_RANK and CUME_DIST | `serve-real-window` 139 |
 
 ## Stale claims retired
 
@@ -4189,6 +4190,21 @@ pointer-page and TIP page numbers is the next step when it dominates.
   RAM today; after the growth walls this is the next scalability
   ceiling a real database reaches.
 
+## THE RECORDED BACKLOG IS STALE - RE-MEASURE BEFORE PLANNING (2026-08-31)
+
+Re-measuring 15 recorded findings against the current binary found EIGHT
+already fixed by later chunks, including both TIMESTAMP WITH TIME ZONE
+HIGH items (DATEADD returning a zeroed buffer, DATEDIFF always 0) and the
+narrowing-CAST HIGH (now raises 22003 exactly where the engine does).
+Planning a chunk from the list below without re-measuring would have
+spent it on defects that no longer exist.
+
+What was still live, all of it REFUSALS rather than wrong answers:
+PERCENT_RANK, CUME_DIST and windows nested in expressions (all three
+fixed 2026-08-31); and BIT_LENGTH, ASCII_CHAR, OVERLAY and CAST AS
+BOOLEAN, which remain - four unimplemented scalar functions, the
+next coherent slice.
+
 ## What the hunt found (2026-08-29)
 
 A 12-agent differential hunt probed six SQL surfaces against the live
@@ -4343,10 +4359,10 @@ shape the implementation has to take.
 - low — REFUSAL: a scalar subquery as the LEFT operand of a comparison in WHERE fails to prepare
 - low — REFUSAL: a CORRELATED EXISTS / NOT EXISTS used as a select-list value fails to prepare
 - low — Multiple-row scalar subquery: fire-crab raises SQLSTATE 21000 at PREPARE, the engine emits the output SQLDA first and raises the identical error at fetch
-- low — PERCENT_RANK() and CUME_DIST() are not implemented
+- ~~low — PERCENT_RANK() and CUME_DIST() are not implemented~~ **DONE 2026-08-31**: both answer, defined over the PEER GROUP (ties share a value) and described as DOUBLE
 - low — RANGE frames whose bounds are keyword-only (UNBOUNDED / CURRENT ROW) fail to parse, though the semantically identical default frame works
 - low — RANGE offset frames are refused unless the ORDER BY key is a scale-0 integer
-- low — A window function nested inside any expression (arithmetic, CASE, COALESCE) is refused; only a bare top-level select-list window is accepted
+- ~~low — A window function nested inside any expression~~ **DONE 2026-08-31**: calls are lifted out and folded as their own columns. Note the two traps: the `OVER` of `COALESCE(SUM(V) OVER (...), 0)` sits at paren DEPTH 1, so a depth-0 search silently declines it; and `split_alias` accepts a bare alias only if the head ends with `)` or PARSES, which a head containing OVER does not - so `... + 1 AS R` worked while `... + 1 R` refused
 - low — Window functions cannot be combined with GROUP BY, SELECT DISTINCT, or a frame clause on an ORDER BY-less window
 - low — Windowed LIST() and non-constant LAG/LEAD offsets are refused
 - low — REFUSAL: window function with OVER (ORDER BY ...) inside a CTE or derived table prepares, then fails at fetch

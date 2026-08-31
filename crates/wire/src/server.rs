@@ -9865,6 +9865,15 @@ enum RankFn {
     Rank,
     /// ties share a rank with NO gap (5,5,9 -> 1,1,2)
     DenseRank,
+    /// `PERCENT_RANK()` - `(rank - 1) / (rows - 1)` over the partition,
+    /// and 0 for a partition of one row (the engine answers a DOUBLE, and
+    /// the first row of any partition is always 0)
+    PercentRank,
+    /// `CUME_DIST()` - the share of the partition at or before this row's
+    /// PEER GROUP: `(last position of the peer group) / rows`. Peers all
+    /// answer the same value, which is what makes it a distribution
+    /// rather than a position
+    CumeDist,
     /// `NTILE(n)` - the ordered partition split into `n` buckets as
     /// equally as it divides; the first `size % n` buckets get one extra
     /// row. Each row answers its 1-based bucket number.
@@ -35861,9 +35870,9 @@ fn splice_ctes(sql: &str, ctes: &[(String, ViewDef)]) -> Option<String> {
                                 .unwrap_or_else(|| c.rsplit('.').next().unwrap_or(c).to_string())
                                 .to_ascii_uppercase(),
                         ),
-                        SelItem::Expr(_, n, _) | SelItem::Gen(_, _, n) => {
-                            Some(n.to_ascii_uppercase())
-                        }
+                        SelItem::Expr(_, n, _)
+                        | SelItem::WinExpr(_, _, n, _)
+                        | SelItem::Gen(_, _, n) => Some(n.to_ascii_uppercase()),
                         SelItem::Agg(_, _, alias) => alias.clone().map(|a| a.to_ascii_uppercase()),
                         SelItem::Win(_, _, _, _, alias, fname) => Some(
                             alias.clone().unwrap_or_else(|| fname.clone()).to_ascii_uppercase(),
@@ -36431,9 +36440,9 @@ fn parse_with(sql: &str) -> Option<(Vec<(String, ViewDef)>, String, bool)> {
                                     })
                                     .to_ascii_uppercase(),
                             ),
-                            SelItem::Expr(_, n, _) | SelItem::Gen(_, _, n) => {
-                                Some(n.to_ascii_uppercase())
-                            }
+                            SelItem::Expr(_, n, _)
+                            | SelItem::WinExpr(_, _, n, _)
+                            | SelItem::Gen(_, _, n) => Some(n.to_ascii_uppercase()),
                             SelItem::Agg(_, _, alias) => {
                                 alias.clone().map(|a| a.to_ascii_uppercase())
                             }
@@ -39206,7 +39215,9 @@ fn plan_query_inner_ctx(
                                 f.name()
                                 .to_string()
                             })),
-                            SelItem::Expr(_, n, _) => Some(n.clone()),
+                            SelItem::Expr(_, n, _) | SelItem::WinExpr(_, _, n, _) => {
+                                Some(n.clone())
+                            }
                             SelItem::Gen(_, _, n) => Some(n.clone()),
                             SelItem::Win(_, _, _, _, alias, fname) => {
                                 Some(alias.clone().unwrap_or_else(|| fname.clone()))
@@ -40179,7 +40190,7 @@ fn plan_query_inner_ctx(
         SelItem::Expr(raw, ..) => raw_contains_gen(raw),
         _ => false,
     });
-    let has_win = items.iter().any(|i| matches!(i, SelItem::Win(..)));
+    let has_win = items.iter().any(|i| matches!(i, SelItem::Win(..) | SelItem::WinExpr(..)));
     // a generator advance in the select list needs the row-by-row Project
     // path; a grouped/aggregated query with one is not a shape we answer
     // (the engine's grouped-bump behavior is measured and MESSY - 19
@@ -40328,7 +40339,8 @@ fn plan_query_inner_ctx(
         // If every item is a bare column, `*`-expansion and the native
         // per-column wire types come from build_projcols; a select list
         // containing a scalar expression is built item by item.
-        let has_expr = items.iter().any(|i| matches!(i, SelItem::Expr(..)));
+        let has_expr =
+            items.iter().any(|i| matches!(i, SelItem::Expr(..) | SelItem::WinExpr(..)));
         // synthetic value slots for generator columns start past every
         // format's real fields, so a decoded row never collides with them
         let gen_base = formats.iter().map(|(_, d)| d.len()).max().unwrap_or(0).max(descs.len());
@@ -40446,6 +40458,40 @@ fn plan_query_inner_ctx(
                             &columns, &descs, win_base, windows.len(),
                         )?;
                         windows.push(spec);
+                        out.push(pc);
+                    }
+                    // A WINDOW NESTED IN AN EXPRESSION. Each lifted call
+                    // becomes its own folded window column exactly as a
+                    // bare one does; the expression then resolves against
+                    // a column list EXTENDED with a synthetic name per
+                    // call, so `ROW_NUMBER() OVER (...) + 1` is an
+                    // ordinary addition over a column that happens to be
+                    // computed by the window fold. Nothing below this
+                    // point knows a window was involved.
+                    SelItem::WinExpr(raw, calls, alias, fname) => {
+                        let mut cols2: Vec<fire_crab_ods::catalog::RelationColumn> = columns.to_vec();
+                        let mut descs2 = descs.clone();
+                        for (n, (func, part_raw, order_raw, frame)) in calls.iter().enumerate() {
+                            let (pc, spec) = plan_win_item(
+                                func, part_raw, order_raw, frame, &None,
+                                "", &columns, &descs, win_base, windows.len(),
+                            )?;
+                            // the synthetic column reads the slot this
+                            // window will be folded into
+                            cols2.push(fire_crab_ods::catalog::RelationColumn {
+                                name: format!("{}{}", WIN_PLACEHOLDER, n),
+                                field_id: u16::try_from(pc.field_id).ok()?,
+                                position: u16::try_from(descs2.len()).ok()?,
+                            });
+                            descs2.push(desc_of_projcol(&pc));
+                            windows.push(spec);
+                        }
+                        let e = resolve_expr(&raw, &cols2, &descs2)?;
+                        let mut pc = build_expr_col_from(e, &fname, &descs2)?;
+                        pc.name = alias.clone();
+                        pc.fname = Some(fname.clone());
+                        pc.relation = None;
+                        pc.rel_alias = None;
                         out.push(pc);
                     }
                 }
@@ -41646,6 +41692,9 @@ fn build_group_items(
             // ordinary expression OVER that row. Deferred to a second
             // pass, because the row's shape is not known until every
             // item has claimed its slot.
+            // a WINDOW inside an expression is not answerable under a
+            // GROUP BY either - the same boundary a bare window has here
+            SelItem::WinExpr(..) => return None,
             SelItem::Expr(raw, name, fname) if raw_has_agg(raw) => {
                 let aggs = collect_aggs(raw);
                 let (f, t) = aggs.first()?.clone();
@@ -45052,14 +45101,17 @@ fn plan_win_item(
         // flag) - the row's position in the ordered
         // partition, computed at fetch
         WinFunc::Rank(rk) => {
+            // PERCENT_RANK and CUME_DIST answer a DOUBLE (probed: 480
+            // len 8, not nullable); every other ranking is a whole number
+            let dbl = matches!(rk, RankFn::PercentRank | RankFn::CumeDist);
             let pc = ProjCol {
                 name: alias.clone().unwrap_or_else(|| fname.to_string()),
                 fname: Some(fname.to_string()),
                 relation: None,
                 rel_alias: None,
                 field_id: win_base + nwin,
-                wire: Wire::Int64,
-                sql_type: 580,
+                wire: if dbl { Wire::Double } else { Wire::Int64 },
+                sql_type: if dbl { 480 } else { 580 },
                 length: 8,
                 oct_length: 8,
                 scale: 0,
@@ -45474,6 +45526,36 @@ fn compute_windows(
                             order_cmp(&ordrows[idxs[a]], &ordrows[idxs[b]], &okeys)
                         });
                     }
+                    // PEER-GROUP EXTENTS, for the two distribution
+                    // rankings: `group_end[pos]` is the 1-based position
+                    // of the LAST row tying with `pos`. PERCENT_RANK and
+                    // CUME_DIST are defined over the peer group, not the
+                    // row, so every tie answers the same value - which is
+                    // the whole difference between them and ROW_NUMBER.
+                    // With no ORDER BY the partition is ONE peer group,
+                    // matching how RANK already reads it here.
+                    let n = perm.len();
+                    let mut group_end = vec![0usize; n];
+                    {
+                        let mut i = 0;
+                        while i < n {
+                            let mut j = i + 1;
+                            while j < n
+                                && (okeys.is_empty()
+                                    || order_cmp(
+                                        &ordrows[idxs[perm[j - 1]]],
+                                        &ordrows[idxs[perm[j]]],
+                                        &okeys,
+                                    ) == Equal)
+                            {
+                                j += 1;
+                            }
+                            for slot in group_end.iter_mut().take(j).skip(i) {
+                                *slot = j;
+                            }
+                            i = j;
+                        }
+                    }
                     let mut rank = 0i64;
                     let mut dense = 0i64;
                     for (pos, &p) in perm.iter().enumerate() {
@@ -45487,9 +45569,26 @@ fn compute_windows(
                             rank = pos as i64 + 1;
                             dense += 1;
                         }
+                        // the two DOUBLE rankings answer before the
+                        // integer ones share a Value::Int
+                        if let RankFn::PercentRank | RankFn::CumeDist = rk {
+                            let d = match rk {
+                                RankFn::PercentRank => {
+                                    if n <= 1 {
+                                        0.0
+                                    } else {
+                                        (rank - 1) as f64 / (n - 1) as f64
+                                    }
+                                }
+                                _ => group_end[pos] as f64 / n as f64,
+                            };
+                            vals[idxs[p]][wi] = Value::Double(d);
+                            continue;
+                        }
                         vals[idxs[p]][wi] = Value::Int(match rk {
                             RankFn::RowNumber => pos as i64 + 1,
                             RankFn::Rank => rank,
+                            RankFn::PercentRank | RankFn::CumeDist => unreachable!("handled above"),
                             RankFn::DenseRank => dense,
                             RankFn::Ntile(n) => {
                                 let size = perm.len() as i64;
@@ -51051,6 +51150,11 @@ fn strip_gen_name(arg: &str) -> String {
     public_object_name(arg).unwrap_or_default()
 }
 
+/// One lifted WINDOW call: what [parse_window_item] answers - the
+/// function, its PARTITION BY expressions, the OVER's ORDER BY as raw
+/// text, and an explicit frame.
+type WinCall = (WinFunc, Vec<RawExpr>, Option<String>, Option<Frame>);
+
 #[derive(Clone)]
 enum SelItem {
     /// a column, and the ALIAS it is described by when it has one -
@@ -51066,6 +51170,15 @@ enum SelItem {
     /// from parse because DECODE desugars to CASE and the symbol cannot
     /// be recomputed later
     Expr(RawExpr, String, String),
+    /// a scalar expression that CONTAINS one or more WINDOW calls -
+    /// `ROW_NUMBER() OVER (ORDER BY ID) + 1`, `COALESCE(SUM(V) OVER (), 0)`.
+    /// Each call is LIFTED OUT at parse ([window_call_span]) and replaced
+    /// in the expression by a reference to `FCWINCOL<n>`
+    /// ([WIN_PLACEHOLDER]); at plan time each becomes its own folded
+    /// window column and the synthetic name resolves to that column's
+    /// slot, so the expression itself is ordinary and knows nothing about
+    /// windows. Carries the lifted calls in placeholder order.
+    WinExpr(RawExpr, Vec<WinCall>, String, String),
     /// a generator advance in the select list - `NEXT VALUE FOR <seq>`
     /// (step None) or `GEN_ID(<name>, <n>)` (step Some(n)) - evaluated
     /// once per emitted row (see [GenCol]), with its output column name
@@ -60943,7 +61056,9 @@ fn subquery_item_name(sub: &str) -> Option<(String, String)> {
                 .to_string();
                 Some((fname.clone(), alias.clone().unwrap_or(fname)))
             }
-            SelItem::Expr(_, n, f) => Some((f.clone(), n.clone())),
+            SelItem::Expr(_, n, f) | SelItem::WinExpr(_, _, n, f) => {
+                Some((f.clone(), n.clone()))
+            }
             SelItem::Gen(_, step, n) => Some((
                 if step.is_none() { "NEXT_VALUE" } else { "GEN_ID" }.to_string(),
                 n.clone(),
@@ -62454,6 +62569,109 @@ fn agg_named(word: &str) -> bool {
 /// (LAG/LEAD) refuse - later slices. A refusal drops the item to the
 /// ordinary paths, which fail the projection - the engine's "not a valid
 /// expression" for a shape this build does not answer.
+/// The byte range of a WINDOW CALL - `<func>(args) OVER (<spec>)` - that
+/// sits INSIDE a larger expression, searching from `from`.
+///
+/// [parse_window_item] deliberately requires the OVER's parentheses to
+/// close at the very end of what it is given, which is what made a window
+/// legal only as a WHOLE select item: `ROW_NUMBER() OVER (ORDER BY ID)`
+/// worked and `ROW_NUMBER() OVER (ORDER BY ID) + 1` - an everyday idiom -
+/// refused. This finds the call so it can be lifted OUT of the
+/// expression, folded as its own column, and replaced by a reference to
+/// that column ([WIN_PLACEHOLDER]), after which the ordinary expression
+/// machinery handles the rest and knows nothing about windows.
+fn window_call_span(body: &str, from: usize) -> Option<(usize, usize)> {
+    let masked = mask_literals(&body.to_ascii_uppercase());
+    let b = body.as_bytes();
+    // ANY depth: the call may sit inside an enclosing one -
+    // `COALESCE(SUM(V) OVER (...), 0)` puts OVER at depth 1, and a
+    // depth-0 search silently declined to see it
+    let o = find_word(&masked, "OVER", from)?;
+    // ...the spec's parentheses close the call
+    let after = masked[o + 4..].len() - masked[o + 4..].trim_start().len();
+    let lp = o + 4 + after;
+    if b.get(lp) != Some(&b'(') {
+        return None;
+    }
+    let end = matching_paren(b, lp)?;
+    // ...and to the LEFT sit the function call's own parentheses, then
+    // its name
+    let mut i = o;
+    while i > 0 && b[i - 1].is_ascii_whitespace() {
+        i -= 1;
+    }
+    if i == 0 || b[i - 1] != b')' {
+        return None;
+    }
+    // walk back to the matching open paren
+    let mut depth = 0i32;
+    let mut j = i - 1;
+    let open = loop {
+        match b[j] {
+            b')' => depth += 1,
+            b'(' => {
+                depth -= 1;
+                if depth == 0 {
+                    break j;
+                }
+            }
+            _ => {}
+        }
+        if j == 0 {
+            return None;
+        }
+        j -= 1;
+    };
+    // ...then the function NAME immediately before it
+    let mut k = open;
+    while k > 0 && b[k - 1].is_ascii_whitespace() {
+        k -= 1;
+    }
+    let name_end = k;
+    while k > 0 && (b[k - 1].is_ascii_alphanumeric() || b[k - 1] == b'_') {
+        k -= 1;
+    }
+    if k == name_end {
+        return None;
+    }
+    Some((k, end))
+}
+
+/// The synthetic column name a lifted window is referenced by. Plain
+/// alphanumerics so every identifier tokenizer in this file reads it as
+/// one word, and a shape no real column is spelled with.
+const WIN_PLACEHOLDER: &str = "FCWINCOL";
+
+/// Lift every WINDOW call out of an expression body, replacing each with
+/// a reference to the column it will be folded into
+/// ([WIN_PLACEHOLDER]`<n>`). Answers the rewritten text and the calls in
+/// placeholder order, or None when the body holds no window.
+///
+/// Shared by the projection parser and by [split_alias], which must be
+/// able to tell that `ROW_NUMBER() OVER (ORDER BY ID) + 1 R` has a body
+/// and an alias. Its test for that is "the head parses as an expression",
+/// and a head containing OVER parses as nothing - so a BARE alias
+/// refused while `AS R` and no alias worked, which is a difference no
+/// user would guess at.
+fn lift_window_calls(body: &str) -> Option<(String, Vec<WinCall>)> {
+    if find_word(&mask_literals(&body.to_ascii_uppercase()), "OVER", 0).is_none() {
+        return None;
+    }
+    let mut rewritten = body.to_string();
+    let mut calls: Vec<WinCall> = Vec::new();
+    let mut at = 0usize;
+    while let Some((lo, hi)) = window_call_span(&rewritten, at) {
+        let Some(call) = parse_window_item(&rewritten[lo..=hi]) else {
+            break;
+        };
+        let name = format!("{}{}", WIN_PLACEHOLDER, calls.len());
+        calls.push(call);
+        rewritten.replace_range(lo..=hi, &name);
+        at = lo + name.len();
+    }
+    (!calls.is_empty()).then_some((rewritten, calls))
+}
+
 fn parse_window_item(
     body: &str,
 ) -> Option<(WinFunc, Vec<RawExpr>, Option<String>, Option<Frame>)> {
@@ -62554,11 +62772,17 @@ fn parse_rank_call(call: &str) -> Option<RankFn> {
     let name = t[..open].trim().to_ascii_uppercase();
     let inner = t[open + 1..t.len() - 1].trim();
     match name.as_str() {
-        "ROW_NUMBER" | "RANK" | "DENSE_RANK" if inner.is_empty() => Some(match name.as_str() {
-            "ROW_NUMBER" => RankFn::RowNumber,
-            "RANK" => RankFn::Rank,
-            _ => RankFn::DenseRank,
-        }),
+        "ROW_NUMBER" | "RANK" | "DENSE_RANK" | "PERCENT_RANK" | "CUME_DIST"
+            if inner.is_empty() =>
+        {
+            Some(match name.as_str() {
+                "ROW_NUMBER" => RankFn::RowNumber,
+                "RANK" => RankFn::Rank,
+                "PERCENT_RANK" => RankFn::PercentRank,
+                "CUME_DIST" => RankFn::CumeDist,
+                _ => RankFn::DenseRank,
+            })
+        }
         // NTILE(n) - a positive integer LITERAL bucket count (an
         // expression count is a later slice)
         "NTILE" => {
@@ -63140,6 +63364,8 @@ fn parse_projection(proj: &str) -> Option<Proj> {
                 WinFunc::Rank(RankFn::RowNumber) => "ROW_NUMBER",
                 WinFunc::Rank(RankFn::Rank) => "RANK",
                 WinFunc::Rank(RankFn::DenseRank) => "DENSE_RANK",
+                WinFunc::Rank(RankFn::PercentRank) => "PERCENT_RANK",
+                WinFunc::Rank(RankFn::CumeDist) => "CUME_DIST",
                 WinFunc::Rank(RankFn::Ntile(_)) => "NTILE",
                 WinFunc::Nav(NavFn::Lag, ..) => "LAG",
                 WinFunc::Nav(NavFn::Lead, ..) => "LEAD",
@@ -63150,6 +63376,16 @@ fn parse_projection(proj: &str) -> Option<Proj> {
             .to_string();
             items.push(SelItem::Win(func, part, order, frame, alias_owned, fname));
             continue;
+        }
+        // ...and a window NESTED in an expression: lift every call out,
+        // leaving a reference to the column each will be folded into
+        if let Some((rewritten, calls)) = lift_window_calls(body) {
+            if let Some(raw) = parse_raw_expr_any(rewritten.trim()) {
+                let fname = default_expr_name(&raw);
+                let nm = alias_owned.clone().unwrap_or_else(|| fname.clone());
+                items.push(SelItem::WinExpr(raw, calls, nm, fname));
+                continue;
+            }
         }
         if let Some((func, target)) = parse_agg_item(body) {
             items.push(SelItem::Agg(func, target, alias_owned));
@@ -63354,7 +63590,9 @@ fn split_alias(item: &str) -> (&str, Option<&str>) {
         || ident_ok(head.trim_matches('"'))
         || is_qualified_col(head)
         || head.ends_with(')')
-        || parse_raw_expr_any(head).is_some();
+        || parse_raw_expr_any(head).is_some()
+        // ...or an expression whose windows have to come out first
+        || lift_window_calls(head).is_some_and(|(r, _)| parse_raw_expr_any(r.trim()).is_some());
     if !body_ok {
         return (item, None);
     }
@@ -82315,6 +82553,7 @@ mod tests {
                     SelItem::Expr(_, name, _) => format!("<expr:{}>", name),
                     SelItem::Gen(n, s, _) => format!("<gen:{}:{:?}>", n, s),
                     SelItem::Win(_, _, _, _, _, f) => format!("<win:{}>", f),
+                    SelItem::WinExpr(_, c, n, _) => format!("<winexpr:{}:{}>", n, c.len()),
                 })
                 .collect(),
         }
@@ -85454,6 +85693,7 @@ mod tests {
                         format!("agg:{}", a.clone().unwrap_or_else(|| "-".into()))
                     }
                     SelItem::Expr(_, n, _) => format!("expr:{n}"),
+                    SelItem::WinExpr(_, c, n, _) => format!("winexpr:{n}:{}", c.len()),
                     SelItem::Gen(_, _, n) => format!("gen:{n}"),
                     SelItem::Win(_, _, _, _, _, f) => format!("win:{f}"),
                 })
@@ -86386,6 +86626,7 @@ mod tests {
                     SelItem::Agg(..) => "agg".into(),
                     SelItem::Gen(n, s, _) => format!("gen:{}:{:?}", n, s),
                     SelItem::Win(_, _, _, _, _, f) => format!("win:{}", f),
+                    SelItem::WinExpr(_, c, n, _) => format!("winexpr:{}:{}", n, c.len()),
                 })
                 .collect::<Vec<_>>(),
             Proj::Star => vec!["*".into()],

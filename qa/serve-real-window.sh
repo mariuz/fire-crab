@@ -285,5 +285,46 @@ both "the default must NOT widen"  "SELECT ID, LAG(V,1,CAST(9 AS BIGINT)) OVER (
 both "no default, the control"     "SELECT ID, LAG(V,1) OVER (ORDER BY ID) L FROM T ORDER BY ID"
 both "LEAD takes the same rule"    "SELECT ID, LEAD(V,1,2.5) OVER (ORDER BY ID) L FROM T ORDER BY ID"
 
+# --- a window is a VALUE, and composes like one -------------------------
+# parse_window_item deliberately requires the OVER's parentheses to close
+# at the very end of what it is given, which made a window legal ONLY as
+# a whole select item: `ROW_NUMBER() OVER (ORDER BY ID)` worked and
+# `... + 1` - an everyday idiom - refused. Each call is now lifted out of
+# the expression, folded as its own column, and replaced by a reference
+# to that column, so the expression is ordinary and knows nothing about
+# windows. Note the enclosing-call shapes (COALESCE/CAST/ABS): the OVER
+# sits at paren depth 1 there, and a depth-0 search silently declines to
+# see it - which is exactly how the first cut of this failed.
+both "window + 1"              "SELECT ID, ROW_NUMBER() OVER (ORDER BY ID) + 1 R FROM T ORDER BY ID"
+both "window * 2"              "SELECT ID, ROW_NUMBER() OVER (ORDER BY ID) * 2 R FROM T ORDER BY ID"
+both "a negated window"        "SELECT ID, -ROW_NUMBER() OVER (ORDER BY ID) R FROM T ORDER BY ID"
+both "COALESCE over a window"  "SELECT ID, COALESCE(SUM(V) OVER (PARTITION BY G), 0) R FROM T ORDER BY ID"
+both "CASE over a window"      "SELECT ID, CASE WHEN ROW_NUMBER() OVER (ORDER BY ID) > 2 THEN 1 ELSE 0 END R FROM T ORDER BY ID"
+both "CAST of a window"        "SELECT ID, CAST(ROW_NUMBER() OVER (ORDER BY ID) AS VARCHAR(4)) R FROM T ORDER BY ID"
+both "a function over a window" "SELECT ID, ABS(-ROW_NUMBER() OVER (ORDER BY ID)) R FROM T ORDER BY ID"
+both "a window concatenated"   "SELECT ID, ROW_NUMBER() OVER (ORDER BY ID) || 'x' R FROM T ORDER BY ID"
+both "TWO windows in one expression" \
+    "SELECT ID, ROW_NUMBER() OVER (ORDER BY ID) - ROW_NUMBER() OVER (ORDER BY V) R FROM T ORDER BY ID"
+both "a window beside a plain column" \
+    "SELECT ID, V + 1 P, SUM(V) OVER () S FROM T ORDER BY ID"
+both "control: the bare window still works" \
+    "SELECT ID, ROW_NUMBER() OVER (ORDER BY ID) R FROM T ORDER BY ID"
+
+# --- the distribution rankings ------------------------------------------
+# Both are defined over the PEER GROUP rather than the row, so every tie
+# answers the same value - which is what separates them from ROW_NUMBER
+# and is why the tie cases below are the ones that matter. Both describe
+# as DOUBLE (480 len 8), not as the whole numbers the other rankings give.
+both "PERCENT_RANK"            "SELECT ID, PERCENT_RANK() OVER (ORDER BY V) R FROM T ORDER BY ID"
+both "CUME_DIST"               "SELECT ID, CUME_DIST() OVER (ORDER BY V) R FROM T ORDER BY ID"
+both "PERCENT_RANK, partitioned" "SELECT ID, PERCENT_RANK() OVER (PARTITION BY G ORDER BY V) R FROM T ORDER BY ID"
+both "CUME_DIST, partitioned"  "SELECT ID, CUME_DIST() OVER (PARTITION BY G ORDER BY V) R FROM T ORDER BY ID"
+both "PERCENT_RANK over TIES"  "SELECT ID, PERCENT_RANK() OVER (ORDER BY G) R FROM T ORDER BY ID"
+both "CUME_DIST over TIES"     "SELECT ID, CUME_DIST() OVER (ORDER BY G) R FROM T ORDER BY ID"
+both "PERCENT_RANK, no ORDER BY" "SELECT ID, PERCENT_RANK() OVER () R FROM T ORDER BY ID"
+both "CUME_DIST, no ORDER BY"  "SELECT ID, CUME_DIST() OVER () R FROM T ORDER BY ID"
+both "a distribution ranking composed" \
+    "SELECT ID, CUME_DIST() OVER (ORDER BY V) * 100 R FROM T ORDER BY ID"
+
 echo "ran $ran checks"
 exit $fail
