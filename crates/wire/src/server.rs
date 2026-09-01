@@ -17577,6 +17577,14 @@ enum TrigStmt {
 /// Rewrite unqualified field references that name a DECLAREd variable
 /// into [fire_crab_ods::expr::Expr::Variable] slots; other references
 /// keep their contexts for the caller's validation.
+/// The slot a [PSQL_VAR_MARK] name carries, if it is one. `FC$V3` is
+/// the third declared variable, written `:NAME` in the source and
+/// marked by [colon_clean] so the parse cannot confuse it with a column
+/// of the same name.
+fn marked_var_slot(name: &str) -> Option<u16> {
+    name.strip_prefix(PSQL_VAR_MARK)?.parse::<u16>().ok()
+}
+
 fn expr_resolve_vars(
     e: &fire_crab_ods::expr::Expr,
     vars: &[String],
@@ -17591,8 +17599,8 @@ fn expr_resolve_vars(
             step: Box::new(expr_resolve_vars(step, vars)),
         },
         Expr::Field { context, name } if *context == CTX_PLAIN => {
-            match vars.iter().position(|v| v == name) {
-                Some(i) => Expr::Variable(i as u16),
+            match marked_var_slot(name).or_else(|| vars.iter().position(|v| v == name).map(|i| i as u16)) {
+                Some(i) => Expr::Variable(i),
                 None => e.clone(),
             }
         }
@@ -17686,14 +17694,28 @@ fn colon_clean(text: &str, vars: &[String]) -> Option<(String, Vec<String>)> {
                 return None;
             }
             let name = text[start..j].to_ascii_uppercase();
-            if !vars.contains(&name) {
+            let Some(slot) = vars.iter().position(|v| *v == name) else {
                 return None; // `:x` must name a DECLAREd variable
-            }
+            };
             if !marked.contains(&name) {
                 marked.push(name);
             }
+            // THE COLON IS REPLACED BY A MARKER, not blanked. Blanking
+            // it made `:ID` parse as the bare identifier `ID`, and
+            // resolution then matched BY NAME - so in
+            // `DELETE FROM LG WHERE ID = :ID` with a variable also
+            // called ID, BOTH sides became the variable and the
+            // statement rendered `WHERE 2 = 2`, emptying the table.
+            // The two occurrences are different things and have to stay
+            // distinguishable through the parse, which is what
+            // [PSQL_VAR_MARK] already does for a FOR SELECT's and a
+            // cursor's variables. A name a body writes with a colon
+            // MUST be a declared variable (checked here), and a name it
+            // writes bare is the statement's own column - which is the
+            // engine's rule and the reason the colon exists.
             cleaned.push(' ');
-            cleaned.push_str(&text[start..j]);
+            cleaned.push_str(PSQL_VAR_MARK);
+            cleaned.push_str(&slot.to_string());
             i = j;
         } else {
             cleaned.push(bytes[i] as char);
@@ -17821,9 +17843,12 @@ fn expr_resolve_marked(
             name: name.clone(),
             step: Box::new(expr_resolve_marked(step, vars, marked)),
         },
-        Expr::Field { context, name } if *context == CTX_PLAIN && marked.contains(name) => {
-            match vars.iter().position(|v| v == name) {
-                Some(i) => Expr::Variable(i as u16),
+        // ONLY a marked name is a variable here. Matching by NAME
+        // instead was the collision: a bare column and a `:variable`
+        // spelled alike became the same thing.
+        Expr::Field { context, name } if *context == CTX_PLAIN => {
+            match marked_var_slot(name) {
+                Some(i) => Expr::Variable(i),
                 None => e.clone(),
             }
         }
@@ -19262,30 +19287,60 @@ fn parse_trig_stmt(
         return Some(TrigStmt::Delete { table, wher, src_off: start });
     }
     if find_word(&up, "INSERT", 0) == Some(0) {
-        // INSERT INTO <t> (<cols>) VALUES (<exprs>)
+        // INSERT INTO <t> [(<cols>)] VALUES (<exprs>)
+        //
+        // THE COLUMN LIST IS OPTIONAL, as it is everywhere else in SQL:
+        // without one the values land in the relation's own column
+        // order. This used to take `text.find('(')` as the start of the
+        // list, so `INSERT INTO LG VALUES (1, 1)` read its table name as
+        // `LG VALUES`, failed [ident_ok], and returned None for the
+        // WHOLE body - which made the trigger unrunnable and refused
+        // every statement on its table. The engine compiles the form
+        // happily (StmtNodes.cpp builds one assignment per column), so
+        // a trigger carrying it can only have arrived from the engine,
+        // and refusing the statement it fires for is the worst way to
+        // meet it. VALUES is found FIRST now, and it is the keyword -
+        // not a paren - that says where the table name ends.
         let into_kw = find_word(&up, "INTO", "INSERT".len())?;
         if !up["INSERT".len()..into_kw].trim().is_empty() {
             return None;
         }
-        let open = text.find('(')?;
-        let table = text[into_kw + "INTO".len()..open].trim().trim_matches('"').to_ascii_uppercase();
+        let values_kw = find_word(&up, "VALUES", into_kw + "INTO".len())?;
+        let paren = text.find('(');
+        let listed = matches!(paren, Some(o) if o < values_kw);
+        let (head_end, tail_start, cols) = if listed {
+            let open = paren?;
+            let close = text[open..].find(')')? + open;
+            if close > values_kw {
+                return None; // an unclosed list, or a paren from elsewhere
+            }
+            let cols: Vec<String> = text[open + 1..close]
+                .split(',')
+                .map(|c| c.trim().trim_matches('"').to_ascii_uppercase())
+                .collect();
+            if cols.is_empty() || cols.iter().any(|c| !ident_ok(c)) {
+                return None;
+            }
+            (open, close + 1, cols)
+        } else {
+            // no list: the name runs to VALUES, and an EMPTY `cols`
+            // carries "every column, in the relation's order" through to
+            // the render. Such a store keeps its values as TEXT (`raw`),
+            // so [body_has_uninterpretable_blr] already refuses to emit
+            // BLR for it and this server's own CREATE TRIGGER still
+            // declines the form rather than guessing a column list into
+            // the catalog.
+            (values_kw, values_kw, Vec::new())
+        };
+        let table =
+            text[into_kw + "INTO".len()..head_end].trim().trim_matches('"').to_ascii_uppercase();
         if !ident_ok(&table) {
             return None;
         }
-        let close = text[open..].find(')')? + open;
-        let cols: Vec<String> = text[open + 1..close]
-            .split(',')
-            .map(|c| c.trim().trim_matches('"').to_ascii_uppercase())
-            .collect();
-        if cols.is_empty() || cols.iter().any(|c| !ident_ok(c)) {
+        if !up[tail_start..values_kw].trim().is_empty() {
             return None;
         }
-        let after = &up[close + 1..];
-        let values_kw = find_word(after, "VALUES", 0)?;
-        if !after[..values_kw].trim().is_empty() {
-            return None;
-        }
-        let vopen = text[close + 1 + values_kw..].find('(')? + close + 1 + values_kw;
+        let vopen = text[values_kw + "VALUES".len()..].find('(')? + values_kw + "VALUES".len();
         // the matching close paren (the value exprs may nest parens)
         let mut depth = 0i32;
         let mut vclose = None;
@@ -68717,10 +68772,21 @@ fn subst_body_query(sql: &str, binds: &[(String, u16)], f: &PsqlFrame) -> Option
             && (i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_' || b[i - 1] == b'$' || b[i - 1] == b'.'))
         {
             let up = sql[i..].to_ascii_uppercase();
+            // 0 IS OLD AND 1 IS NEW, the numbering [TrigCtx::read] and
+            // the whole expression grammar use. This arm used to say 2
+            // for OLD, which worked only because the reader was
+            // `if context == 1 { new } else { old }` - so 2, 7 and 255
+            // all landed on OLD. The moment that reader was tightened to
+            // name its contexts (a bare column, CTX_PLAIN, was being
+            // answered from the fired row), this line's private
+            // numbering became a refusal for every `OLD.` reference that
+            // travels through the TEXT path: a body query's WHERE, and
+            // a store whose values were kept as written. Two encodings
+            // of one law, and only one of them was updated.
             let ctx = if up.starts_with("NEW.") {
                 1u8
             } else if up.starts_with("OLD.") {
-                2u8
+                0u8
             } else {
                 out.push(c as char);
                 i += 1;
@@ -69480,12 +69546,14 @@ fn exec_psql_stmt_inner(
                         .join(", ")
                 }
             };
-            let sql = format!(
-                "INSERT INTO {} ({}) VALUES ({})",
-                table,
-                cols.join(", "),
-                values
-            );
+            // no column list means the statement had none - the values
+            // go in the relation's own order, and re-adding a list here
+            // would mean inventing one
+            let sql = if cols.is_empty() {
+                format!("INSERT INTO {} VALUES ({})", table, values)
+            } else {
+                format!("INSERT INTO {} ({}) VALUES ({})", table, cols.join(", "), values)
+            };
             run_body_dml(&sql, db, ctx, DmlKind::Insert).map(|n| set_row_count(f, n))
         }
         TrigStmt::Update { table, sets, wher, .. } => {

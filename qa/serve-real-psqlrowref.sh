@@ -66,6 +66,19 @@ CREATE TABLE AP  (ID INTEGER, D DOUBLE PRECISION, F FLOAT);
 CREATE TABLE LAP (ID INTEGER, D DOUBLE PRECISION, F FLOAT);
 CREATE TABLE NB  (ID INTEGER, N NUMERIC(38,4));
 CREATE TABLE LNB (ID INTEGER, N NUMERIC(38,4));
+CREATE TABLE TX  (ID INTEGER, V INTEGER);
+CREATE TABLE LI1 (ID INTEGER, V INTEGER);
+CREATE TABLE LI2 (ID INTEGER, V INTEGER);
+CREATE TABLE LI3 (ID INTEGER, V INTEGER);
+CREATE TABLE RT  (K INTEGER, MULT INTEGER);
+CREATE TABLE TQ  (ID INTEGER, V INTEGER);
+CREATE TABLE LQ  (ID INTEGER, V INTEGER);
+CREATE TABLE TV  (ID INTEGER, V INTEGER);
+CREATE TABLE LV1 (ID INTEGER, V INTEGER);
+CREATE TABLE LV2 (ID INTEGER, V INTEGER);
+CREATE TABLE LV3 (ID INTEGER, V INTEGER);
+CREATE TABLE LV4 (ID INTEGER, V INTEGER);
+CREATE TABLE LV5 (ID INTEGER, V INTEGER);
 COMMIT;
 INSERT INTO T VALUES (2, 20);
 INSERT INTO U VALUES (2, 20);
@@ -85,6 +98,14 @@ INSERT INTO AP VALUES (2, 1e300, 3.4e38);
 INSERT INTO LAP VALUES (1, 0, 0); INSERT INTO LAP VALUES (2, 0, 0); INSERT INTO LAP VALUES (9, 42, 42);
 INSERT INTO NB VALUES (1, 12.3456);
 INSERT INTO LNB VALUES (1, 0); INSERT INTO LNB VALUES (2, 5);
+INSERT INTO TX VALUES (3, 30);
+INSERT INTO TQ VALUES (3, 30);
+INSERT INTO RT VALUES (3, 7); INSERT INTO RT VALUES (4, 9);
+INSERT INTO TV VALUES (2, 20);
+INSERT INTO LV1 VALUES (1,10); INSERT INTO LV1 VALUES (2,20); INSERT INTO LV1 VALUES (3,30);
+INSERT INTO LV2 VALUES (1,10); INSERT INTO LV2 VALUES (2,20); INSERT INTO LV2 VALUES (3,30);
+INSERT INTO LV3 VALUES (1,10); INSERT INTO LV3 VALUES (2,20); INSERT INTO LV3 VALUES (3,30);
+INSERT INTO LV5 VALUES (1,10); INSERT INTO LV5 VALUES (2,20); INSERT INTO LV5 VALUES (3,30);
 COMMIT;
 SET TERM ^ ;
 CREATE TRIGGER T_AU FOR T AFTER UPDATE AS
@@ -107,6 +128,41 @@ CREATE TRIGGER AP_AU FOR AP AFTER UPDATE AS
 BEGIN UPDATE LAP SET D = NEW.D, F = NEW.F WHERE ID = OLD.ID; END^
 CREATE TRIGGER NB_AU FOR NB AFTER UPDATE AS
 BEGIN UPDATE LNB SET N = NEW.N WHERE ID = OLD.ID; END^
+CREATE TRIGGER TX_A1 FOR TX AFTER UPDATE POSITION 1 AS
+BEGIN INSERT INTO LI1 VALUES (OLD.ID, NEW.V); END^
+CREATE TRIGGER TX_A2 FOR TX AFTER UPDATE POSITION 2 AS
+BEGIN INSERT INTO LI2 VALUES (7, 8); END^
+CREATE TRIGGER TX_A3 FOR TX AFTER UPDATE POSITION 3 AS
+BEGIN INSERT INTO LI3 (ID, V) VALUES (OLD.ID, CASE WHEN OLD.V > 5 THEN NEW.V + 1 ELSE 0 END); END^
+CREATE TRIGGER TV_A1 FOR TV AFTER UPDATE POSITION 1 AS
+DECLARE VARIABLE ID INTEGER;
+BEGIN ID = OLD.ID; DELETE FROM LV1 WHERE ID = :ID; END^
+CREATE TRIGGER TV_A2 FOR TV AFTER UPDATE POSITION 2 AS
+DECLARE VARIABLE OID INTEGER;
+BEGIN OID = OLD.ID; DELETE FROM LV2 WHERE ID = :OID; END^
+CREATE TRIGGER TV_A3 FOR TV AFTER UPDATE POSITION 3 AS
+DECLARE VARIABLE ID INTEGER;
+DECLARE VARIABLE V INTEGER;
+BEGIN ID = OLD.ID; V = NEW.V + 1; UPDATE LV3 SET V = :V WHERE ID = :ID; END^
+CREATE TRIGGER TV_A4 FOR TV AFTER UPDATE POSITION 4 AS
+DECLARE VARIABLE ID INTEGER;
+DECLARE VARIABLE V INTEGER;
+BEGIN
+  ID = OLD.ID;
+  V = 0;
+  IF (:ID > 0) THEN V = :ID * 10;
+  IF (V > 0) THEN V = V + 1;
+  INSERT INTO LV4 (ID, V) VALUES (:ID, :V);
+END^
+CREATE TRIGGER TV_A5 FOR TV AFTER UPDATE POSITION 5 AS
+DECLARE VARIABLE ID INTEGER;
+BEGIN ID = OLD.ID; DELETE FROM LV5 WHERE ID > :ID; END^
+CREATE TRIGGER TQ_AU FOR TQ AFTER UPDATE AS
+DECLARE VARIABLE M INTEGER;
+BEGIN
+  SELECT MULT FROM RT WHERE K = OLD.ID INTO :M;
+  INSERT INTO LQ (ID, V) VALUES (OLD.ID, :M);
+END^
 SET TERM ; ^
 COMMIT;
 EOF
@@ -198,6 +254,51 @@ both "G4 committed"                 "UPDATE AP SET ID = ID; COMMIT; SELECT ID, D
 c=$(printf 'SET LIST ON;\nUPDATE NB SET ID = ID;\nCOMMIT;\nSELECT ID, N FROM LNB ORDER BY ID;\n' \
     | "$ISQL" -q -ch UTF8 -user "$U" -pas "$P" "127.0.0.1/$PORT:$A" 2>&1 | norm)
 check "H1 int128 refuses, no write" "$c" "Statement failed, SQLSTATE = 42000|Dynamic SQL Error|ID 1|N 0.0000|ID 2|N 5.0000|"
+
+# ---------------------------------------------------------------- I
+# THE TEXT PATH. Not every nested statement is rebuilt from a parsed
+# expression tree: values the body grammar cannot hold (a CASE, a
+# concatenation, a function call) are kept AS WRITTEN and the row
+# references are substituted into that TEXT, and a body query's WHERE
+# is substituted the same way. That substitution had its OWN numbering
+# for the row contexts - 1 for NEW and 2 for OLD - which worked only
+# while the reader treated everything that was not 1 as OLD. Tightening
+# the reader (section A) turned this path's every `OLD.` into a
+# refusal, and no gate saw it: one law, two encodings, and the sweep
+# stayed green. These checks are the coverage that was missing.
+both "I1 listless insert, OLD/NEW"  "UPDATE TX SET V = 99 WHERE ID = 3; SELECT ID, V FROM LI1; ROLLBACK;"
+both "I2 listless insert, constant" "UPDATE TX SET V = 99 WHERE ID = 3; SELECT ID, V FROM LI2; ROLLBACK;"
+both "I3 values kept as written"    "UPDATE TX SET V = 99 WHERE ID = 3; SELECT ID, V FROM LI3; ROLLBACK;"
+both "I4 all three, committed"      "UPDATE TX SET V = 99 WHERE ID = 3; COMMIT; SELECT ID, V FROM LI1; SELECT ID, V FROM LI2; SELECT ID, V FROM LI3;"
+both "I5 body query reads OLD."     "UPDATE TQ SET V = 99 WHERE ID = 3; SELECT ID, V FROM LQ; ROLLBACK;"
+both "I6 body query, no match"      "UPDATE TQ SET ID = 8 WHERE ID = 3; SELECT ID, V FROM LQ; ROLLBACK;"
+
+# ---------------------------------------------------------------- J
+# A VARIABLE THAT SHARES A COLUMN'S NAME. `DELETE FROM LG WHERE ID =
+# :ID` names two different things with one word: the column on the
+# left, the declared variable on the right. That is precisely why PSQL
+# gives the variable a colon.
+#
+# The colon was BLANKED before parsing - `:ID` became the bare `ID` -
+# and resolution then matched by NAME, so both sides became the
+# variable and the statement rendered `WHERE 2 = 2`. Another table
+# emptied, by another spelling of the same mistake. The colon is a
+# MARKER through the parse now, so the two occurrences stay distinct.
+#
+# J5/J6 are the other half: in a PLAIN PSQL position the engine takes a
+# variable EITHER way, so marking the colon must not cost the colon
+# form its meaning there.
+both "J1 variable named like a col"  "UPDATE TV SET V = 99 WHERE ID = 2; SELECT ID, V FROM LV1 ORDER BY ID; ROLLBACK;"
+both "J2 control, no collision"      "UPDATE TV SET V = 99 WHERE ID = 2; SELECT ID, V FROM LV2 ORDER BY ID; ROLLBACK;"
+both "J3 collision in SET and WHERE" "UPDATE TV SET V = 99 WHERE ID = 2; SELECT ID, V FROM LV3 ORDER BY ID; ROLLBACK;"
+both "J4 collision in an INSERT"     "UPDATE TV SET V = 99 WHERE ID = 2; SELECT ID, V FROM LV4 ORDER BY ID; ROLLBACK;"
+both "J5 all four, committed"        "UPDATE TV SET V = 99 WHERE ID = 2; COMMIT; SELECT ID, V FROM LV1 ORDER BY ID; SELECT ID, V FROM LV3 ORDER BY ID; SELECT ID, V FROM LV4 ORDER BY ID;"
+# the collision does not always widen: `col > :var` degenerates to
+# `2 > 2` and hits ZERO rows where the engine hits one, so the SAME
+# defect deletes everything or nothing depending on the operator
+both "J7 collision under >"          "UPDATE TV SET V = 99 WHERE ID = 2; SELECT ID, V FROM LV5 ORDER BY ID; ROLLBACK;"
+both "J8 collision under >, commit"  "UPDATE TV SET V = 99 WHERE ID = 2; COMMIT; SELECT ID, V FROM LV5 ORDER BY ID;"
+both "J6 no row matches"             "UPDATE TV SET V = 99 WHERE ID = 77; SELECT ID, V FROM LV1 ORDER BY ID; ROLLBACK;"
 
 echo "psqlrowref: $ran checks"
 exit $fail
