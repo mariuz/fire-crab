@@ -59,6 +59,7 @@ One line each; the gate is the proof.
 | a MERGE's DELETE branch has no NEW record | `RETURNING NEW.<col>` over a deleted row is NULL, PER ROW (a mixed merge answers the update branch's values and the delete branch's NULLs in one result); and the describe follows a three-way rule - every branch deletes = the null constant, some branch deletes = named CONSTANT with the column's type, none deletes = the column itself | `serve-real-returnold` 59 |
 | a text blob is delivered in the attachment's charset | the engine transliterates blob content on the way out and ANNOUNCES the attachment's charset; fc announced the STORAGE charset and shipped the stored bytes, handing a UTF8 client invalid UTF-8. Both halves had to move together - announcing the attachment's charset while framing the stored bytes is worse than the self-consistent original | `serve-real-blobexpr` 53 |
 | a record is read through the format it was WRITTEN under | `ALTER TABLE` mints a format and rewrites no row, so a maintained table holds several shapes at once. fc upgraded the image it PATCHED and read the raw before-image with the NEWEST descriptors everywhere else - SET expressions' old values, BEFORE/AFTER trigger OLD, the FK parent check, RETURNING OLD and the old index key. `UPDATE T SET B = B+1` after one `ALTER ... TYPE BIGINT` returned 0/0 for a stored 1/7 and COMMITTED (NULL, NULL) over the row: silent destruction of committed data, no error. The upgrade also DROPPED any field whose descriptor changed - the byte-copy law one step too far, where ALTER TYPE only ever widens and the value converts | `serve-real-stalefmt` 43 |
+| an unqualified column in a body's nested DML is that STATEMENT'S own | a bare name is a column of the table the nested statement targets, resolved per row; `OLD.`/`NEW.` are the fired row. `TrigCtx::read` was `if context == 1 { new } else { old }`, so CTX_PLAIN read the FIRED row and the fold baked it in as a constant: `DELETE FROM LG WHERE ID = OLD.ID` rendered `WHERE 2 = 2` and emptied the table, `SET V = V + 1` wrote the fired row's value over every row, `WHERE V > 1000` never consulted the target. Plain INTEGER reaches all three. Second half: a value the fold could not SPELL fell through to the bare NAME, so `SET AMT = NEW.AMT` became `SET AMT = AMT` - stores nothing, reports success; DOUBLE and FLOAT now render in shortest-round-trip exponent form (measured bit-exact against the engine), INT128/DECFLOAT/blob refuse | `serve-real-psqlrowref` 21 |
 
 ## Stale claims retired
 
@@ -4253,27 +4254,17 @@ STILL OPEN:
   call site so the next reader does not re-derive it. A sibling site
   sharing a shape is a place to LOOK, not a defect.
 
-- **OPEN (gap, found writing `serve-real-stalefmt`) - NARROWER THAN IT
-  FIRST LOOKED, cause not yet measured.** MEASURED: `CREATE TRIGGER TA FOR
-  T2 BEFORE UPDATE AS BEGIN INSERT INTO LG VALUES (1, 1); END` (created by
-  the ENGINE through embedded isql, LG a DIFFERENT table) stores fine, and
-  then `UPDATE T2 SET B = B + 1` answers 42000 Dynamic SQL Error on fc
-  where the engine runs it. Reproduces on an UNALTERED table, so it has
-  nothing to do with record formats.
-  NOT the gap I first wrote down: nested DML in a trigger body IS
-  implemented - `trig_body_inlineable` (server.rs:14338) admits an
-  INSERT/UPDATE/DELETE into ANOTHER table and a SELECT INTO, fired inline
-  over the published working copy, and `run_body_dml` (:67302) runs it,
-  carrying constraint violations out as real SQLSTATEs. So the refusal is
-  something narrower. READ (not yet measured, so not yet a fix): the body
-  parser at server.rs:19264 requires the COLUMN LIST. For `INSERT INTO LG
-  VALUES (1,1)` it takes `text.find('(')` - which is VALUES' own paren -
-  and reads the table name as `LG VALUES`, fails `ident_ok`, and returns
-  None for the whole body, so the trigger is not runnable and the
-  triggering statement refuses. The engine accepts the positional form
-  (every column, in ordinal order). PREDICTION TO TEST, both halves:
-  `INSERT INTO LG (K, V) VALUES (1,1)` in a body must WORK today, and only
-  the list-less form must refuse. Measure before implementing.
+- **RESOLVED, and it was not what the bullet said.** The measured symptom
+  (`INSERT INTO LG VALUES (1,1)` in an engine-created trigger body making
+  the triggering UPDATE answer 42000) is real and its cause is confirmed:
+  the body parser at server.rs:19264 requires the COLUMN LIST, takes
+  `text.find('(')` - VALUES' own paren - and reads the table name as `LG
+  VALUES`. Still open as a PARSE-SURFACE gap; the engine accepts the
+  positional form.
+  But hunting it found something far worse in the same machinery, now
+  fixed: see `serve-real-psqlrowref` in Done. Nested DML in a body was
+  never missing - it was WRONG, and the ordinary audit-trigger text
+  `DELETE FROM LG WHERE ID = OLD.ID` emptied the log table.
 
 - **OPEN (gap, same gate)** - `UPDATE OR INSERT ... RETURNING OLD.<col>`
   and `RETURNING NEW.<col>` refuse with 42000 where the engine answers;

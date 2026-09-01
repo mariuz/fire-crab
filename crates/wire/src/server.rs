@@ -66840,9 +66840,32 @@ impl TrigCtx {
             .find(|c| c.name.eq_ignore_ascii_case(name))
             .map(|c| c.field_id as usize)
     }
+    /// ONLY CONTEXT 0 AND 1 ARE THIS EVENT'S ROWS - `OLD.` and `NEW.`.
+    /// Everything else, and CTX_PLAIN in particular, is an UNQUALIFIED
+    /// column of some OTHER statement, and this row knows nothing about
+    /// it. Reading it here was the widest wrong answer this server has
+    /// had: `else { self.old }` handed the trigger's OLD row to every
+    /// plain column reference in a body's nested DML, and the fold in
+    /// [render_psql_expr] then baked it into the statement text as a
+    /// LITERAL. `DELETE FROM LG WHERE ID = OLD.ID` rendered
+    /// `DELETE FROM LG WHERE 2 = 2` and emptied the table; `UPDATE LG
+    /// SET V = V + 1 WHERE ID = OLD.ID` rendered `SET V = 21 WHERE
+    /// 2 = 2` and wrote the trigger row's value over every row. Both
+    /// are ordinary audit-trigger text, both were silent, and neither
+    /// needed an exotic column type to reach.
+    ///
+    /// The rest of this file already knows the law - the parser and the
+    /// context rewriter both test `context == CTX_PLAIN` explicitly
+    /// (:17593, :17755). This reader is where it was missing, so a
+    /// refusal here is what puts a plain column back in the statement
+    /// TEXT for the nested statement's own planner to resolve.
     fn read(&self, context: u8, name: &str) -> Option<Value> {
+        let row = match context {
+            0 => self.old.as_ref(),
+            1 => self.new.as_ref(),
+            _ => return None,
+        }?;
         let fid = self.fid(name)?;
-        let row = if context == 1 { self.new.as_ref() } else { self.old.as_ref() }?;
         Some(row.get(fid).cloned().unwrap_or(Value::Null))
     }
 }
@@ -68765,6 +68788,37 @@ fn psql_literal(v: &Value) -> Option<String> {
             let kw = if matches!(v, Value::TimeTz(..)) { "TIME" } else { "TIMESTAMP" };
             format!("{} '{}'", kw, v.render())
         }
+        // AN APPROXIMATE NUMERIC IN ITS EXPONENT FORM, which is the
+        // spelling that makes the round trip EXACT and the type right.
+        //
+        // Not [render_double]: that is the DISPLAY renderer, sixteen
+        // significant digits the way %g prints them, and a f64 needs
+        // seventeen in the worst case - a literal built from it would
+        // store a value one ulp from the one it came from, silently.
+        // Rust's `{:e}` writes the SHORTEST text that parses back to
+        // the identical bits, and an exponent is also what makes SQL
+        // read the literal as DOUBLE PRECISION rather than as an exact
+        // NUMERIC with a scale. Measured, against the engine, through
+        // this server's own parser: `1.0000000000000002e0` stored and
+        // read back gives (AMT - 1) * 1e16 = 2.220446049250313 on BOTH
+        // servers, and `1e300` survives whole.
+        //
+        // A f32 renders from the f32, so the text is the shortest for
+        // ITS width; widening to f64 to parse and narrowing back to
+        // store is lossless. NaN and the infinities have no literal
+        // form and keep the refusal.
+        Value::Double(d) => {
+            if !d.is_finite() {
+                return None;
+            }
+            format!("{:e}", d)
+        }
+        Value::Float(f) => {
+            if !f.is_finite() {
+                return None;
+            }
+            format!("{:e}", f)
+        }
         _ => return None,
     })
 }
@@ -68804,7 +68858,20 @@ fn render_psql_expr(e: &fire_crab_ods::expr::Expr, f: &PsqlFrame) -> Option<Stri
         E::Int64Literal(v) => v.to_string(),
         E::NullLiteral => "NULL".to_string(),
         E::Variable(n) => psql_literal(f.vars.get(*n as usize).unwrap_or(&Value::Null))?,
-        E::Field { name, .. } => name.clone(),
+        // AN UNQUALIFIED COLUMN IS THE NESTED STATEMENT'S OWN, and
+        // rendering it as itself is the whole point: `UPDATE LG SET V =
+        // V + 1` has to reach LG's planner with `V` still in it, so the
+        // per-row arithmetic happens per LG row.
+        E::Field { context, name } if *context == CTX_PLAIN => name.clone(),
+        // ...but an `OLD.`/`NEW.` reference that reached this arm is one
+        // the fold above could NOT spell as a literal - [psql_literal]
+        // has no form for a DOUBLE, a FLOAT, an INT128, a DECFLOAT or a
+        // blob - and writing its bare NAME into a statement aimed at
+        // another table silently turns a row reference into that
+        // table's own column: `UPDATE LG SET AMT = NEW.AMT` became `SET
+        // AMT = AMT` and stored nothing while reporting success. A
+        // refusal is the honest answer until the literal exists.
+        E::Field { .. } => return None,
         E::DomainValue => return None, // never appears in a PSQL body
         E::TriggerAction => return None, // never appears in a PSQL body
         E::Concat(a, b) => {
