@@ -56,6 +56,7 @@ One line each; the gate is the proof.
 | a correlated subquery answers per row or refuses | only EQUALITY pairs counted as a correlation; anything else was re-evaluated as UNCORRELATED and folded to ONE verdict for every row, so the anti-join idiom answered every row and the running-count idiom answered 0 | `serve-real-nulls` 40 |
 | a bare NULL branch contributes nothing | `makeFromList` ignores a NULL argument for unification and falls back to CHAR(1) NONE only when EVERY argument is NULL; fire-crab typed a bare NULL as INT64 and let it WIN, announcing a VARCHAR(10) UTF8 as len 32765 charset NONE | `serve-real-branchtype` 69 |
 | the output format travels with the row | the singleton path (`op_execute2`, how an INSERT ... RETURNING is answered) emitted with NO OutFmt, so a CHAR result was written in the value's own bytes while the describe announced the attachment's - under -ch UTF8 `RETURNING 'ok'` announced len 8, wrote 2, and KILLED THE CONNECTION | `serve-real-returningexpr` 33 |
+| a MERGE's DELETE branch has no NEW record | `RETURNING NEW.<col>` over a deleted row is NULL, PER ROW (a mixed merge answers the update branch's values and the delete branch's NULLs in one result); and the describe follows a three-way rule - every branch deletes = the null constant, some branch deletes = named CONSTANT with the column's type, none deletes = the column itself | `serve-real-returnold` 59 |
 
 ## Stale claims retired
 
@@ -4196,9 +4197,7 @@ pointer-page and TIP page numbers is the next step when it dominates.
 
 ## Found by the SECOND hunt (2026-08-31) - still open
 
-- **HIGH (wrong answer)** — `MERGE ... WHEN MATCHED THEN DELETE ...
-  RETURNING NEW.<col>` answers the DELETED row's values; the engine
-  answers NULL, because a DELETE branch has no NEW record.
+- ~~**HIGH (wrong answer)** — `MERGE ... DELETE ... RETURNING NEW.<col>`~~ **DONE 2026-09-01**, with the describe half. Original report:
 
   ```
   MERGE INTO T USING (SELECT 2 AS K FROM RDB$DATABASE) S ON T.ID=S.K

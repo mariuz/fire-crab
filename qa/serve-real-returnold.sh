@@ -223,6 +223,42 @@ eng_q="SET LIST ON; SELECT ID, N, S, D FROM T ORDER BY ID;"
 e=$(printf '%s\n' "$eng_q" | "$ISQL" -q -ch UTF8 -user "$U" -pas "$P" "$B" 2>&1 | norm)
 c=$(printf '%s\n' "$eng_q" | "$ISQL" -q -ch UTF8 -user "$U" -pas "$P" "$A" 2>&1 | norm)
 check "the ENGINE answers the same over fire-crab's own file" "$c" "$e"
+# --- a MERGE's DELETE branch has no NEW record --------------------------
+# `NEW.<col>` names the after-image. A DELETE branch has none, so the
+# engine answers NULL there - while a BARE or target-qualified column
+# still answers the deleted row, which is why the delete path records
+# that row at all. fire-crab answered the deleted values for NEW too.
+#
+# The distinction is PER ROW, not per statement: in a mixed merge the
+# update branch's row answers its new values and the delete branch's
+# answers NULL, in ONE result. That is why the mixed case below is the
+# one that matters - a plan-time decision cannot express it.
+#
+# The DESCRIBE follows the same three-way rule, probed:
+#   every branch deletes -> NEW.<col> is the null CONSTANT, CHAR(1) NONE
+#   some branch deletes  -> named CONSTANT, no table origin, column type
+#   no branch deletes    -> the column itself, with `table:` set
+both "MERGE DELETE: NEW is NULL, OLD and the target are not" \
+    "MERGE INTO T USING (SELECT 2 AS K FROM RDB\$DATABASE) S ON T.ID=S.K WHEN MATCHED THEN DELETE RETURNING T.ID, OLD.N, NEW.N; ROLLBACK;"
+both "MERGE DELETE: several NEW columns" \
+    "MERGE INTO T USING (SELECT 2 AS K FROM RDB\$DATABASE) S ON T.ID=S.K WHEN MATCHED THEN DELETE RETURNING NEW.ID, NEW.N, NEW.S; ROLLBACK;"
+both "MERGE MIXED: per-row, update keeps values and delete NULLs" \
+    "MERGE INTO T USING (SELECT 1 AS K, 111 AS W FROM RDB\$DATABASE UNION ALL SELECT 2, 222 FROM RDB\$DATABASE) S ON T.ID=S.K WHEN MATCHED AND S.K=2 THEN DELETE WHEN MATCHED THEN UPDATE SET N=S.W RETURNING T.ID, OLD.N, NEW.N; ROLLBACK;"
+both "MERGE NOT MATCHED BY SOURCE ... DELETE" \
+    "MERGE INTO T USING (SELECT 1 AS K FROM RDB\$DATABASE) S ON T.ID=S.K WHEN NOT MATCHED BY SOURCE THEN DELETE RETURNING T.ID, NEW.N; ROLLBACK;"
+bothd "the delete-only describe folds NEW to the null constant" \
+    "MERGE INTO T USING (SELECT 2 AS K FROM RDB\$DATABASE) S ON T.ID=S.K WHEN MATCHED THEN DELETE RETURNING NEW.N; ROLLBACK;"
+bothd "the MIXED describe keeps the column type, named CONSTANT" \
+    "MERGE INTO T USING (SELECT 1 AS K, 111 AS W FROM RDB\$DATABASE) S ON T.ID=S.K WHEN MATCHED AND S.K=2 THEN DELETE WHEN MATCHED THEN UPDATE SET N=S.W RETURNING NEW.N; ROLLBACK;"
+bothd "control: a merge with NO delete branch names the COLUMN" \
+    "MERGE INTO T USING (SELECT 1 AS K, 111 AS W FROM RDB\$DATABASE) S ON T.ID=S.K WHEN MATCHED THEN UPDATE SET N=S.W RETURNING NEW.N; ROLLBACK;"
+both "control: the update branch is untouched" \
+    "MERGE INTO T USING (SELECT 1 AS K, 111 AS W FROM RDB\$DATABASE) S ON T.ID=S.K WHEN MATCHED THEN UPDATE SET N=S.W RETURNING T.ID, OLD.N, NEW.N; ROLLBACK;"
+both "control: the insert branch is untouched" \
+    "MERGE INTO T USING (SELECT 77 AS K FROM RDB\$DATABASE) S ON T.ID=S.K WHEN NOT MATCHED THEN INSERT (ID,N) VALUES (77,7) RETURNING T.ID, NEW.N; ROLLBACK;"
+both "control: a plain DELETE still answers the deleted row" \
+    "DELETE FROM T WHERE ID=2 RETURNING ID, N; ROLLBACK;"
+
 gf=$("$GFIX" -v -full -user "$U" -pas "$P" "$A" 2>&1)
 ran=$((ran + 1))
 if [ -z "$gf" ]; then echo "OK   gfix -v -full clean on fc's file"; else echo "DIFF gfix: $gf"; fail=1; fi

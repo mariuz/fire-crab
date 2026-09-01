@@ -8406,6 +8406,13 @@ enum Plan {
         cols: Vec<ProjCol>,
         /// field ids into the table's newest format, one per column
         fields: Vec<usize>,
+        /// output positions that were written `NEW.<col>`. A MERGE's
+        /// DELETE branch has no after-image, so those answer NULL for a
+        /// row that branch produced ([Affected::deleted]) - while a bare
+        /// or target-qualified column still answers the deleted row.
+        /// Only a MERGE can spell `NEW.` at all: a plain INSERT or
+        /// DELETE refuses it on both servers (probed).
+        new_cols: Vec<usize>,
     },
     /// `CREATE TABLE <name> (<col defs>)`: catalog rows, format and
     /// runtime blobs, pointer/root pages, NOT NULL/PRIMARY KEY
@@ -24666,6 +24673,8 @@ fn wrap_returning(
     let columns = dbr.columns(table);
     let mut cols = Vec::new();
     let mut fields = Vec::new();
+    // output positions written `NEW.<col>` (a MERGE only)
+    let mut new_cols: Vec<usize> = Vec::new();
     // the CATALOG's spelling of the target table, for the quoted
     // qualifier's exact compare (`table` is the statement's spelling,
     // whose case a bare identifier does not preserve)
@@ -24689,6 +24698,36 @@ fn wrap_returning(
             Some((tgt_alias.clone(), src, src_alias.clone(), scols))
         }
         _ => None,
+    };
+    // CAN ANY BRANCH OF THIS MERGE PRODUCE AN AFTER-IMAGE? If none can -
+    // every WHEN is a DELETE and there is no INSERT branch - then
+    // `NEW.<col>` is STATICALLY NULL, and the engine describes it as the
+    // null constant rather than as the column: CHAR(1) CHARACTER SET
+    // NONE, `makeNullString()` again. Probed both ways: a delete-only
+    // merge announces `452 TEXT len 1 charset 0`, and a MIXED merge -
+    // where some row may still have an after-image - announces the
+    // column's own `496 LONG len 4`, which is what this already did.
+    let merge_no_new = match &plan {
+        Plan::Merge { matched, not_matched, by_source, .. } => {
+            not_matched.is_empty()
+                && matched.iter().all(|(_, a)| matches!(a, MergeAction::Delete))
+                && by_source.iter().all(|(_, a)| matches!(a, MergeAction::Delete))
+        }
+        _ => false,
+    };
+    // ...and if ANY branch deletes, `NEW.<col>` stops being a COLUMN even
+    // where it keeps the column's type: the engine folds it to an
+    // expression that is NULL on a deleted row, so the describe names it
+    // CONSTANT with NO table origin. Probed three ways - a delete-only
+    // merge names CONSTANT and types CHAR(1) NONE, a MIXED merge names
+    // CONSTANT and types the column, and a merge with NO delete branch
+    // names the column itself with `table: T`.
+    let merge_any_delete = match &plan {
+        Plan::Merge { matched, by_source, .. } => {
+            matched.iter().any(|(_, a)| matches!(a, MergeAction::Delete))
+                || by_source.iter().any(|(_, a)| matches!(a, MergeAction::Delete))
+        }
+        _ => false,
     };
     // THE ROW CONTEXTS OF `RETURNING`, measured on Firebird 6:
     //
@@ -24990,7 +25029,35 @@ fn wrap_returning(
                 old_ctx = true;
             }
         }
+        let mut new_qual = false;
         if let Some((q, quoted)) = &qual {
+            // a MERGE's `NEW.<col>` names the after-image, which a DELETE
+            // branch does not have - remember the position so the execute
+            // can answer NULL there for a row that branch produced
+            new_qual = merge.is_some() && !*quoted && q.eq_ignore_ascii_case("NEW");
+            if new_qual {
+                new_cols.push(cols.len());
+                // ...and when NO branch can produce one, it is the null
+                // constant rather than the column (see [merge_no_new])
+                if merge_no_new {
+                    cols.push(ProjCol {
+                        name: "CONSTANT".to_string(),
+                        fname: Some("CONSTANT".to_string()),
+                        relation: None,
+                        rel_alias: None,
+                        field_id: 0,
+                        wire: Wire::Text,
+                        sql_type: nullable(452),
+                        length: 1,
+                        oct_length: 1,
+                        scale: 0,
+                        sub_type: fire_crab_ods::intl::CS_NONE as i32,
+                        expr: Some(Expr::Null),
+                    });
+                    fields.push(0);
+                    continue;
+                }
+            }
             let ok = old_ctx
                 || match &merge {
                     Some((alias_t, _, _, _)) => {
@@ -25041,13 +25108,18 @@ fn wrap_returning(
         }
         let d = descs.get(fid)?;
         let (wire, sql_type, length, scale, sub_type) = wire_for(d);
+        // A `NEW.<col>` UNDER A MERGE THAT CAN DELETE IS AN EXPRESSION,
+        // not that column: the engine names it CONSTANT and gives it no
+        // table origin, because on a deleted row it answers NULL rather
+        // than the column's value (see [merge_any_delete]).
+        let new_expr = new_qual && merge_any_delete;
         cols.push(ProjCol {
-            name: c.name.clone(),
-            fname: None,
+            name: if new_expr { "CONSTANT".to_string() } else { c.name.clone() },
+            fname: if new_expr { Some("CONSTANT".to_string()) } else { None },
             // probed: INSERT/UPDATE/DELETE RETURNING all answer the
             // target table as the relation, and NO binding alias -
             // even for a qualified `RETURNING T.A`
-            relation: Some(table.to_string()),
+            relation: if new_expr { None } else { Some(table.to_string()) },
             rel_alias: None,
             field_id: fid,
             wire,
@@ -25075,6 +25147,7 @@ fn wrap_returning(
     }
     Some((
         Plan::Returning {
+            new_cols,
             inner: Box::new(plan),
             cols,
             fields,
@@ -29135,6 +29208,15 @@ struct Affected {
     /// is NULL - which is what the engine answers for the insert branch
     /// of a MERGE.
     old_images: Vec<Vec<u8>>,
+    /// Was this row produced by a DELETE branch? Parallel to `images`.
+    /// A MERGE's delete branch has NO after-image, so `RETURNING
+    /// NEW.<col>` over it is NULL - while a bare or target-qualified
+    /// column still answers the deleted row, which is why the delete arm
+    /// pushes that row into `images` at all. In a MIXED merge the
+    /// distinction is PER ROW: the update branch's row answers its new
+    /// values and the delete branch's answers NULL for NEW, in one
+    /// statement.
+    deleted: Vec<bool>,
     /// A MERGE's SOURCE row for each affected row, parallel to `images`
     /// - what `RETURNING <source alias>.<col>` projects. Empty for
     /// every other statement, which has no second table.
@@ -30508,6 +30590,7 @@ fn execute_dml_collecting_inner(
                 // engine's OLD is NULL for the inserted ones
                 // ([wrap_returning]'s two_rows).
                 a.old_images.push(Vec::new());
+                a.deleted.push(false);
             }
             let out = {
                 // timed as a SCOPE, so the error the write returns is
@@ -31039,6 +31122,7 @@ fn execute_dml_collecting_inner(
                 if let Some(a) = affected.as_deref_mut() {
                     a.descs = descs.clone();
                     a.images.push(img.clone());
+                    a.deleted.push(false);
                     // ...and the row as it stood, for a deferred AFTER
                     // trigger's OLD context
                     a.old_images.push(old_images.last().cloned().unwrap_or_default());
@@ -31229,6 +31313,7 @@ fn execute_dml_collecting_inner(
                     // a DELETE's `images` ARE the old rows; the parallel
                     // slot keeps every consumer's indexing uniform
                     a.old_images.push(image.clone());
+                    a.deleted.push(true);
                 }
                 if triggers.iter().any(|t| !t.before) {
                     deleted_images.push(image.clone());
@@ -75994,7 +76079,7 @@ fn after_auth(
                         }
                         last_dml = (0, 0, 0);
                         respond(&mut s, &mut enc, resp_tx)?;
-                    } else if let Plan::Returning { inner, cols, fields } = &*plan {
+                    } else if let Plan::Returning { inner, cols, fields, new_cols } = &*plan {
                         // the DML runs HERE, like every other write, and
                         // the rows it touched become the cursor the client
                         // fetches next
@@ -76003,6 +76088,7 @@ fn after_auth(
                         let inner = inner.clone();
                         let cols = cols.clone();
                         let fields = fields.clone();
+                        let new_cols = new_cols.clone();
                         // RETURNING waits and re-reads too - the write
                         // inside it is the same write
                         match with_conflict_wait(&mut database, |db| {
@@ -76061,6 +76147,60 @@ fn after_auth(
                                 // a fetch serves them, and a second fetch
                                 // finds the cursor empty rather than
                                 // running the write again
+                                // A MERGE'S DELETE BRANCH HAS NO
+                                // AFTER-IMAGE, so `RETURNING NEW.<col>`
+                                // over a row it produced is NULL - while
+                                // a bare or target-qualified column still
+                                // answers the deleted row, which is why
+                                // the delete arm records that row at all.
+                                // The distinction is PER ROW: a mixed
+                                // merge answers the update branch's new
+                                // values and the delete branch's NULLs in
+                                // ONE result. Projecting here (rather than
+                                // at fetch) is what makes that reachable,
+                                // so the columns are re-indexed
+                                // POSITIONALLY like every other
+                                // materialised plan.
+                                let (cols, rows) = if new_cols.is_empty()
+                                    || !affected.deleted.iter().any(|d| *d)
+                                {
+                                    (cols, rows)
+                                } else {
+                                    let del = &affected.deleted;
+                                    let projected: Result<Vec<Vec<Value>>, EvalErr> = rows
+                                        .iter()
+                                        .enumerate()
+                                        .map(|(i, r)| {
+                                            cols.iter()
+                                                .enumerate()
+                                                .map(|(ci, c)| {
+                                                    if del.get(i) == Some(&true)
+                                                        && new_cols.contains(&ci)
+                                                    {
+                                                        Ok(Value::Null)
+                                                    } else {
+                                                        c.value_of(r)
+                                                    }
+                                                })
+                                                .collect()
+                                        })
+                                        .collect();
+                                    match projected {
+                                        Ok(p) => {
+                                            let pc = cols
+                                                .iter()
+                                                .enumerate()
+                                                .map(|(i, c)| ProjCol {
+                                                    field_id: i,
+                                                    expr: None,
+                                                    ..c.clone()
+                                                })
+                                                .collect();
+                                            (pc, p)
+                                        }
+                                        Err(_) => (cols, rows),
+                                    }
+                                };
                                 plan = std::rc::Rc::new(Plan::Rows { cols, rows });
                                 respond(&mut s, &mut enc, resp_tx)?;
                             }
@@ -87577,6 +87717,7 @@ mod tests {
             gen_filter: None,
         };
         let wrap = |p: Plan| Plan::Returning {
+            new_cols: Vec::new(),
             inner: Box::new(p),
             cols: Vec::new(),
             fields: Vec::new(),
@@ -87699,6 +87840,7 @@ mod tests {
         assert_eq!(stmt_type_of(&upsert), 2);
         assert_eq!(stmt_type_of(&insel), 2);
         let wrap = |p: Plan| Plan::Returning {
+            new_cols: Vec::new(),
             inner: Box::new(p),
             cols: Vec::new(),
             fields: Vec::new(),
