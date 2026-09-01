@@ -179,6 +179,57 @@ refuses "a blob-valued SCALAR SUBQUERY refuses" \
 refuses "a blob-valued expression inside a DERIVED TABLE refuses" \
   "SELECT X FROM (SELECT B || '!' AS X FROM T WHERE ID=1);"
 gf=$("$GFIX" -v -full -user "$U" -pas "$P" "$A" 2>&1)
+# --- a blob LENGTH is a BIGINT, however the blob is spelled -------------
+# CHAR_LENGTH/OCTET_LENGTH over a blob describe INT64 len 8, not the
+# INTEGER len 4 a VARCHAR gets. That rule was gated on the argument being
+# a BARE blob column, so every blob EXPRESSION narrowed to LONG len 4 -
+# the risky direction, since a client whose buffers were laid out from the
+# engine's describe reads the wrong width. The VALUES agreed throughout,
+# so only a describe comparison catches it.
+bothd "OCTET_LENGTH over a bare blob column" \
+    "SELECT OCTET_LENGTH(B) FROM T WHERE ID = 1;"
+bothd "OCTET_LENGTH over a blob CONCATENATION" \
+    "SELECT OCTET_LENGTH(B || 'x') FROM T WHERE ID = 1;"
+bothd "CHAR_LENGTH over a blob concatenation" \
+    "SELECT CHAR_LENGTH(B || 'x') FROM T WHERE ID = 1;"
+bothd "OCTET_LENGTH over COALESCE of a blob" \
+    "SELECT OCTET_LENGTH(COALESCE(B, 'zz')) FROM T WHERE ID = 1;"
+bothd "OCTET_LENGTH over a CASE yielding a blob" \
+    "SELECT OCTET_LENGTH(CASE WHEN 1=1 THEN B ELSE NULL END) FROM T WHERE ID = 1;"
+bothd "control: the same lengths over VARCHAR stay INTEGER" \
+    "SELECT OCTET_LENGTH(S), CHAR_LENGTH(S), OCTET_LENGTH(S || 'x') FROM T WHERE ID = 1;"
+both "and the length VALUES agree" \
+    "SELECT OCTET_LENGTH(B), OCTET_LENGTH(B || 'x'), CHAR_LENGTH(B || 'x') FROM T WHERE ID = 1;"
+
+# --- MIN/MAX over a blob compares CONTENT, or refuses -------------------
+# The fold compares Value::Blob(relation, recno) - a blob ID, not its
+# content - so MAX answered the LAST-inserted blob and MIN the first,
+# whatever they held: over 'zzz','mmm','aaa' the engine answers zzz/aaa
+# and this answered aaa/zzz, EXACTLY INVERTED, with no error. Comparing
+# content needs the blob READ during the fold, and compute_group has no
+# database (ten call sites, most of them window folds), so this refuses
+# until the fold can resolve a blob. A refusal beats a silently wrong row.
+ran=$((ran + 1))
+mm=$(printf 'SET LIST ON;\nSELECT CAST(MAX(B) AS VARCHAR(20)) M FROM T;\n' |
+    "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$A" 2>&1)
+me=$(printf 'SET LIST ON;\nSELECT CAST(MAX(B) AS VARCHAR(20)) M FROM T;\n' |
+    "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$REAL:$B" 2>&1)
+if printf '%s' "$me" | grep -q 'SQLSTATE'; then
+    echo "DIFF the ENGINE refused MAX over a blob - this check assumes it answers"
+    fail=1
+elif printf '%s' "$mm" | grep -q 'SQLSTATE'; then
+    echo "OK   MAX over a blob refuses cleanly (recorded boundary)"
+else
+    echo "DIFF MAX over a blob ANSWERED [$mm] - it must compare CONTENT or refuse,"
+    echo "     never fold on the blob ID. If this now answers, check it against the"
+    echo "     engine and turn it into a value comparison."
+    fail=1
+fi
+both "control: MIN/MAX over the VARCHAR twin still answer" \
+    "SELECT MAX(S) MS, MIN(S) NS FROM T;"
+both "control: COUNT over a blob column still answers" \
+    "SELECT COUNT(B) FROM T;"
+
 ran=$((ran + 1))
 if [ -z "$gf" ]; then echo "OK   gfix -v -full clean on fc's file"; else echo "DIFF gfix: $gf"; fail=1; fi
 echo "ran $ran checks"

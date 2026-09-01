@@ -15397,8 +15397,16 @@ fn int_func_form(e: &Expr, descs: &[Descriptor]) -> Option<(Wire, i32, i32)> {
         // ... but over a BLOB argument both lengths are BIGINT
         // (probed: CHAR_LENGTH(<blob>) describes INT64 where
         // CHAR_LENGTH(<varchar>) describes INTEGER)
+        // ...over ANY blob-typed argument, not only a bare blob column:
+        // `OCTET_LENGTH(<blob> || 'x')`, over a COALESCE, a CASE or a
+        // CAST to blob is a BIGINT too. Gating on `Expr::BlobText` alone
+        // announced LONG len 4 for every one of those where the engine
+        // says INT64 len 8 - the NARROWER direction, so a client whose
+        // buffers were laid out from the engine's describe reads the
+        // wrong width. [blob_result] is the walk that already answers
+        // "is this expression a blob".
         SysFn::CharLength | SysFn::OctetLength | SysFn::OctetLengthCs(_)
-            if matches!(args.first(), Some(Expr::BlobText(..))) =>
+            if args.first().is_some_and(|a| blob_result(a, descs).is_some()) =>
         {
             Some(int64)
         }
@@ -41425,6 +41433,20 @@ fn agg_result_desc(
         AggFn::List => return None,
         AggFn::Count => int64(0),
         AggFn::Min | AggFn::Max => match target {
+            // MIN/MAX OVER A BLOB REFUSES rather than answering the wrong
+            // row. The fold compares `Value::Blob(relation, recno)` - a
+            // blob ID, not its content - so `MAX(<blob>)` answered the
+            // LAST-inserted blob and `MIN` the first, whatever they hold:
+            // over 'zzz','mmm','aaa' the engine answers zzz/aaa and this
+            // answered aaa/zzz, exactly inverted, with no error. Comparing
+            // content needs the blob READ during the fold, and
+            // `compute_group` has no database (ten call sites, most of
+            // them window folds) - so this is a boundary until the fold
+            // can resolve a blob, not a patch. A refusal beats a silently
+            // wrong row.
+            AggTarget::Col(n) if col_desc(n).is_some_and(|d| d.dtype == dtype::BLOB) => {
+                return None;
+            }
             AggTarget::Col(n) => synth(&col_desc(n)?),
             // an expression source folds at the expression's own shape
             AggTarget::Expr(raw) => {

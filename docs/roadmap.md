@@ -4195,6 +4195,48 @@ pointer-page and TIP page numbers is the next step when it dominates.
   RAM today; after the growth walls this is the next scalability
   ceiling a real database reaches.
 
+## Found by the THIRD hunt (2026-09-01)
+
+FIXED the same day: `OCTET_LENGTH`/`CHAR_LENGTH` over a blob EXPRESSION
+(announced LONG len 4 where the engine says INT64 len 8 - the narrower,
+riskier direction), and `MIN`/`MAX` over a blob, which compared blob IDs
+and answered EXACTLY THE WRONG ROW (over 'zzz','mmm','aaa' the engine
+answers zzz/aaa, fire-crab answered aaa/zzz) - now a clean refusal.
+
+STILL OPEN:
+
+- **HIGH (wrong answer + describe)** — a text BLOB in a charset OTHER than
+  the attachment's is delivered UNTRANSLATED and announced in its STORAGE
+  charset. Over a `BLOB SUB_TYPE TEXT CHARACTER SET WIN1252` holding
+  `636166E9`, under `-ch UTF8`: the engine announces `charset: 4
+  SYSTEM.UTF8` and ships `caf` + `C3 A9`; fire-crab announces `charset: 53
+  SYSTEM.WIN1252` and ships the raw `E9`, which is not valid UTF-8 for the
+  client that asked for UTF8. A VARCHAR WIN1252 column in the SAME ROW is
+  transliterated correctly by both, so this is blob-specific rather than a
+  general charset gap. Under `-ch WIN1252` the two agree, so a
+  single-attachment test sees nothing. The describe direction is the
+  dangerous one: it names a charset whose bytes are not what gets written.
+
+- **MEDIUM (refusal)** — `CREATE VIEW` selecting a BLOB column is refused;
+  a view over VARCHAR columns in the same script succeeds.
+
+- **REPORTED BUT DID NOT REPRODUCE** — "a blob grown by two `UPDATE ... ||`
+  appends cannot be read at all". Measured on a clean fixture built exactly
+  as described (empty blob, two 4000-char appends, both twins built through
+  the engine): BOTH servers answer `OCTET_LENGTH` 8000, and a single-write
+  control agrees too. No independent refutation ran on this one, and my own
+  check does not reproduce it, so it is NOT being fixed. The mechanism the
+  reporter located is worth keeping in case a fixture that actually creates
+  a pointer-page HOLE reproduces it: `relation_data_pages()`
+  (crates/ods/src/pointer.rs) flattens `PointerPage::data_pages()`, which
+  SKIPS zero (unallocated) slots - its own unit test asserts
+  `[200,0,201] -> [200,201]` - while `blob_slot()` (crates/blb/src/lib.rs)
+  indexes that compacted vector with `recno / max_recs_per_dp`, and
+  Firebird numbers records by the pointer-page slot index INCLUDING holes.
+  One hole would shift every blob after it. Reproducing that needs an
+  allocation history with a freed page, which a fresh two-append fixture
+  does not have.
+
 ## Found by the SECOND hunt (2026-08-31) - still open
 
 - ~~**HIGH (wrong answer)** — `MERGE ... DELETE ... RETURNING NEW.<col>`~~ **DONE 2026-09-01**, with the describe half. Original report:
