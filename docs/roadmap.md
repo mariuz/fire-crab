@@ -57,6 +57,7 @@ One line each; the gate is the proof.
 | a bare NULL branch contributes nothing | `makeFromList` ignores a NULL argument for unification and falls back to CHAR(1) NONE only when EVERY argument is NULL; fire-crab typed a bare NULL as INT64 and let it WIN, announcing a VARCHAR(10) UTF8 as len 32765 charset NONE | `serve-real-branchtype` 69 |
 | the output format travels with the row | the singleton path (`op_execute2`, how an INSERT ... RETURNING is answered) emitted with NO OutFmt, so a CHAR result was written in the value's own bytes while the describe announced the attachment's - under -ch UTF8 `RETURNING 'ok'` announced len 8, wrote 2, and KILLED THE CONNECTION | `serve-real-returningexpr` 33 |
 | a MERGE's DELETE branch has no NEW record | `RETURNING NEW.<col>` over a deleted row is NULL, PER ROW (a mixed merge answers the update branch's values and the delete branch's NULLs in one result); and the describe follows a three-way rule - every branch deletes = the null constant, some branch deletes = named CONSTANT with the column's type, none deletes = the column itself | `serve-real-returnold` 59 |
+| a text blob is delivered in the attachment's charset | the engine transliterates blob content on the way out and ANNOUNCES the attachment's charset; fc announced the STORAGE charset and shipped the stored bytes, handing a UTF8 client invalid UTF-8. Both halves had to move together - announcing the attachment's charset while framing the stored bytes is worse than the self-consistent original | `serve-real-blobexpr` 53 |
 
 ## Stale claims retired
 
@@ -4205,7 +4206,7 @@ answers zzz/aaa, fire-crab answered aaa/zzz) - now a clean refusal.
 
 STILL OPEN:
 
-- **HIGH (wrong answer + describe)** — a text BLOB in a charset OTHER than
+- ~~**HIGH (wrong answer + describe)** — a text BLOB in a non-attachment charset~~ **DONE 2026-09-01**. Original report:
   the attachment's is delivered UNTRANSLATED and announced in its STORAGE
   charset. Over a `BLOB SUB_TYPE TEXT CHARACTER SET WIN1252` holding
   `636166E9`, under `-ch UTF8`: the engine announces `charset: 4

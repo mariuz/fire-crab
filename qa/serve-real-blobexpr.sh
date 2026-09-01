@@ -81,7 +81,17 @@ INSERT INTO T VALUES (2, 'xyz', 'second value', 'w2', 'more');
 INSERT INTO T VALUES (3, 'nul', NULL, NULL, NULL);
 COMMIT;
 CREATE TABLE T3 (ID INTEGER, B BLOB SUB_TYPE TEXT);
+/* a text blob in a charset OTHER than the attachment's - the only shape
+   that can show a missing transliteration on delivery */
+CREATE TABLE TCS (ID INTEGER, BW BLOB SUB_TYPE TEXT CHARACTER SET WIN1252,
+                  VW VARCHAR(10) CHARACTER SET WIN1252);
 COMMIT;
+/* a NON-ASCII WIN1252 value, spelled with a bare hex literal and a CAST
+   because this fixture is built on BOTH servers - a _WIN1252 introducer
+   is refused by one of them and would leave NULL on that side, which
+   would then compare equal to NULL and prove nothing */
+INSERT INTO TCS VALUES (1, CAST(x'636166E9' AS BLOB SUB_TYPE TEXT CHARACTER SET WIN1252),
+                           CAST(x'636166E9' AS VARCHAR(10) CHARACTER SET WIN1252));
 INSERT INTO T3 VALUES (1, 'zzz');
 INSERT INTO T3 VALUES (2, 'aaa');
 INSERT INTO T3 VALUES (3, 'zzz');
@@ -229,6 +239,76 @@ both "control: MIN/MAX over the VARCHAR twin still answer" \
     "SELECT MAX(S) MS, MIN(S) NS FROM T;"
 both "control: COUNT over a blob column still answers" \
     "SELECT COUNT(B) FROM T;"
+
+# --- a text blob is DELIVERED in the attachment's charset ---------------
+# The engine transliterates blob content on the way out exactly as it does
+# a VARCHAR's, and announces the ATTACHMENT's charset for it. fire-crab
+# announced the STORAGE charset and shipped the stored bytes: a WIN1252
+# blob holding `63 61 66 E9` reached a UTF8 client as `63 61 66 E9`, which
+# is not valid UTF-8, under a describe saying charset 53.
+#
+# THE TWO HALVES MUST MOVE TOGETHER. Announcing the attachment's charset
+# while framing the stored bytes is WORSE than the original, which was at
+# least self-consistent - so the checks below assert the describe AND the
+# bytes, under every attachment.
+#
+# Under -ch WIN1252 and -ch NONE the two servers agree whatever happens
+# here, because no conversion is called for: a single-attachment gate sees
+# nothing. That is why each check runs three times.
+# isql prints each blob's ID before its content, and the two servers
+# allocate ids independently - so the id is normalised away before the
+# bytes are compared, exactly as this gate's `norm` already does for
+# every other blob check - and its WIDTH is squeezed away too, since
+# isql right-aligns the id and the two servers' ids differ in length.
+# What is being compared is the CONTENT.
+bcs() { # <label> <sql>
+    for CH in UTF8 WIN1252 NONE; do
+        ran=$((ran + 1))
+        local e c ed cd
+        e=$(printf 'SET BLOBDISPLAY ALL;\nSET HEADING OFF;\n%s\n' "$2" |
+            timeout 25 "$ISQL" -q -ch "$CH" -user "$U" -pas "$P" "127.0.0.1/$REAL:$B" 2>&1 |
+            grep -av '^[[:space:]]*$' | grep -av '^=' |
+            sed 's/[0-9a-f][0-9a-f]*:[0-9a-f][0-9a-f]*/BLOBID/g; s/^ *//; s/  */ /g' |
+            od -An -tx1 | tr -s ' \n' ' ')
+        c=$(printf 'SET BLOBDISPLAY ALL;\nSET HEADING OFF;\n%s\n' "$2" |
+            timeout 25 "$ISQL" -q -ch "$CH" -user "$U" -pas "$P" "127.0.0.1/$PORT:$A" 2>&1 |
+            grep -av '^[[:space:]]*$' | grep -av '^=' |
+            sed 's/[0-9a-f][0-9a-f]*:[0-9a-f][0-9a-f]*/BLOBID/g; s/^ *//; s/  */ /g' |
+            od -An -tx1 | tr -s ' \n' ' ')
+        ed=$(printf 'SET SQLDA_DISPLAY ON;\nSET HEADING OFF;\n%s\n' "$2" |
+            timeout 25 "$ISQL" -q -ch "$CH" -user "$U" -pas "$P" "127.0.0.1/$REAL:$B" 2>&1 |
+            grep -aE '^ *0[0-9]: sqltype' | norm)
+        cd=$(printf 'SET SQLDA_DISPLAY ON;\nSET HEADING OFF;\n%s\n' "$2" |
+            timeout 25 "$ISQL" -q -ch "$CH" -user "$U" -pas "$P" "127.0.0.1/$PORT:$A" 2>&1 |
+            grep -aE '^ *0[0-9]: sqltype' | norm)
+        if [ "$c" = "$e" ] && [ "$cd" = "$ed" ] && [ -n "$e" ]; then
+            echo "OK   [-ch $CH] $1"
+        else
+            echo "DIFF [-ch $CH] $1"
+            [ "$cd" = "$ed" ] || { echo "     describe engine: $ed"; echo "     describe fcwire: $cd"; }
+            [ "$c" = "$e" ] || { echo "     bytes engine: $e"; echo "     bytes fcwire: $c"; }
+            fail=1
+        fi
+    done
+}
+# the fixture must hold the SAME BYTES on both servers, or every check
+# below compares two different values (or two NULLs) and proves nothing
+ran=$((ran + 1))
+fx_e=$(printf 'SET HEADING OFF;\nSELECT OCTET_LENGTH(BW), OCTET_LENGTH(VW) FROM TCS WHERE ID=1;\n' |
+    timeout 25 "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$REAL:$B" 2>&1 | norm)
+fx_c=$(printf 'SET HEADING OFF;\nSELECT OCTET_LENGTH(BW), OCTET_LENGTH(VW) FROM TCS WHERE ID=1;\n' |
+    timeout 25 "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$A" 2>&1 | norm)
+if [ "$fx_e" = "$fx_c" ] && printf '%s' "$fx_e" | grep -q '4'; then
+    echo "OK   the WIN1252 blob fixture is identical on both servers ($fx_e)"
+else
+    echo "DIFF the WIN1252 blob fixture DIFFERS - the charset checks below are void"
+    echo "     engine: $fx_e"; echo "     fcwire: $fx_c"; fail=1
+fi
+bcs "a WIN1252 text blob, describe and bytes" "SELECT BW FROM TCS WHERE ID=1;"
+bcs "control: the VARCHAR twin in the same row" "SELECT VW FROM TCS WHERE ID=1;"
+bcs "control: a blob in the database default charset" "SELECT B FROM T WHERE ID=1;"
+bcs "control: the same blob cast to OCTETS" \
+    "SELECT CAST(BW AS VARCHAR(10) CHARACTER SET OCTETS) FROM TCS WHERE ID=1;"
 
 ran=$((ran + 1))
 if [ -z "$gf" ]; then echo "OK   gfix -v -full clean on fc's file"; else echo "DIFF gfix: $gf"; fail=1; fi

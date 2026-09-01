@@ -2515,10 +2515,17 @@ fn build_describe(cols: &[ProjCol], params: &[Descriptor], att: AttCs) -> Vec<u8
         } else {
             resolve_text_cs(c.sub_type, c.length, c.oct_length, &att)
         };
+        // A TEXT BLOB IS ANNOUNCED IN THE ATTACHMENT'S CHARSET, like
+        // every other text value: the engine transliterates its content
+        // on the way out, so naming the STORAGE charset would describe
+        // bytes the client is not going to receive. A blob carries its
+        // charset in `scale` ([wire_for]), and a BINARY blob (sub_type
+        // 0) has none to convert.
+        let scale = blob_out_charset(c, &att);
         int_item(&mut d, 9, (i + 1) as i32); // sqlda_seq
         int_item(&mut d, 11, c.sql_type); // type
         int_item(&mut d, 12, sub_type); // sub_type (blob text/binary, text ttype)
-        int_item(&mut d, 13, c.scale); // scale (client divides scaled ints)
+        int_item(&mut d, 13, scale); // scale (client divides scaled ints)
         int_item(&mut d, 14, length); // length
         str_item(&mut d, 16, c.fname.as_deref().unwrap_or(&c.name)); // field name
         str_item(&mut d, 19, &c.name); // alias (the client's column key)
@@ -12060,6 +12067,27 @@ fn proc_out_col(
         sub_type,
         expr: None,
     }
+}
+
+/// The character set a column is ANNOUNCED in, for a blob.
+///
+/// A text blob's charset rides in `scale` ([wire_for] puts it there), and
+/// the engine announces the ATTACHMENT's charset rather than the storage
+/// one because it transliterates the content on the way out. Announcing
+/// the storage charset described bytes the client was never going to
+/// receive: a `BLOB SUB_TYPE TEXT CHARACTER SET WIN1252` read under a
+/// UTF8 attachment was announced `charset: 53` where the engine says
+/// `charset: 4`. Everything that is not a TEXT blob keeps its own scale.
+fn blob_out_charset(c: &ProjCol, att: &AttCs) -> i32 {
+    if !matches!(c.wire, Wire::Blob) || c.sub_type != 1 {
+        return c.scale;
+    }
+    // a byte-carrier attachment converts nothing, so the stored set
+    // stands - the same rule the text paths follow
+    if fire_crab_ods::intl::byte_carrier(att.id) {
+        return c.scale;
+    }
+    att.id as i32
 }
 
 fn wire_for(d: &Descriptor) -> (Wire, i32, i32, i32, i32) {
@@ -47168,10 +47196,15 @@ fn answer_prepare(items: &[u8], plan: &Plan, params: &[Descriptor], att: AttCs) 
             } else {
                 resolve_text_cs(c.sub_type, c.length, c.oct_length, &att)
             };
+            // a TEXT blob is announced in the ATTACHMENT's charset
+            // ([blob_out_charset]) - the content is transliterated on
+            // the way out, so the storage charset would name bytes the
+            // client never receives
+            let scale = blob_out_charset(&c, &att);
             Var {
                 sql_type: c.sql_type,
                 sub_type,
-                scale: c.scale,
+                scale,
                 length,
                 fname: c.fname.clone().unwrap_or_else(|| c.name.clone()),
                 name: c.name,
@@ -49848,31 +49881,38 @@ fn inline_blob_packet(w: &mut W, db: &Database, rel: u16, num: u64, max: u32) {
         return;
     };
     let stream = b.header.is_stream();
-    let total = b.header.length;
     let max_segment = u64::from(b.header.max_segment);
-    let segments = if stream {
-        if max_segment == 0 { 0 } else { total.div_ceil(max_segment) }
+    // THE FRAMES CARRY THE ATTACHMENT'S BYTES. An inline blob is the
+    // SAME delivery as op_get_segment, just riding with the row, so a
+    // text blob is transliterated here too ([blob_segs_out]) - and the
+    // lengths have to be recomputed FROM THE CONVERTED BYTES, since
+    // `caf<E9>` in WIN1252 is four bytes and five in UTF-8. Announcing
+    // the attachment's charset (which the describe now does) while
+    // framing the stored bytes would be the worse of both.
+    let raw: Vec<Vec<u8>> = if b.header.length == 0 {
+        Vec::new()
+    } else if stream {
+        let content = b.content();
+        if max_segment == 0 {
+            vec![content]
+        } else {
+            content.chunks(max_segment as usize).map(|c| c.to_vec()).collect()
+        }
     } else {
-        u64::from(b.header.count)
+        b.segments().map(|x| x.to_vec()).collect()
     };
+    let att = AttCs::by_id(CURRENT_ATT_CS.with(|c| c.get()));
+    let frames = blob_segs_out(raw, b.header.sub_type, b.header.charset, att);
+    let total: u64 = frames.iter().map(|f| f.len() as u64).sum();
+    let segments = frames.len() as u64;
     let framed = total + 2 * segments;
     if framed > u64::from(max.min(u16::MAX as u32)) {
         return;
     }
     let mut data: Vec<u8> = Vec::with_capacity(framed as usize);
-    if total > 0 {
-        if stream {
-            let content = b.content();
-            for chunk in content.chunks(max_segment as usize) {
-                data.extend_from_slice(&(chunk.len() as u16).to_le_bytes());
-                data.extend_from_slice(chunk);
-            }
-        } else {
-            for seg in b.segments() {
-                data.extend_from_slice(&(seg.len() as u16).to_le_bytes());
-                data.extend_from_slice(seg);
-            }
-        }
+    for f in &frames {
+        data.extend_from_slice(&(f.len() as u16).to_le_bytes());
+        data.extend_from_slice(f);
     }
     let rb = ReadBlob {
         segs: Vec::new(),
@@ -50450,6 +50490,33 @@ fn blob_col_cast(inner: &RawExpr, t: &CastTarget, columns: &[RelationColumn], de
 /// A BLOB column's own character set, out of its descriptor: a blob
 /// keeps it in `scale` (the describe convention - [wire_for] ships it
 /// there). Zero (NONE) for anything that is not a blob column.
+/// Transliterate a text blob's segments from their STORED charset into
+/// the attachment's, the way the engine delivers blob content.
+///
+/// Only a TEXT blob (sub_type 1) converts, and only between two real
+/// charsets: a byte carrier on either side passes its bytes through, the
+/// same rule every other text path in this file follows. A segment that
+/// will not decode is left exactly as it was rather than being dropped or
+/// replaced - a blob whose stored bytes disagree with its declared
+/// charset is a pre-existing condition, and mangling it here would turn a
+/// readable-if-odd value into a wrong one.
+fn blob_segs_out(segs: Vec<Vec<u8>>, sub_type: u16, src: u8, att: AttCs) -> Vec<Vec<u8>> {
+    use fire_crab_ods::intl;
+    if sub_type != 1 || src == att.id || intl::byte_carrier(src) || intl::byte_carrier(att.id) {
+        return segs;
+    }
+    segs.into_iter()
+        .map(|seg| {
+            match intl::decode_text(src, &seg)
+                .and_then(|t| blob_bytes_in(&t, att.id).ok())
+            {
+                Some(b) => b,
+                None => seg,
+            }
+        })
+        .collect()
+}
+
 fn blob_charset(descs: &[Descriptor], fid: usize) -> u8 {
     descs.get(fid).map_or(0, |d| d.scale as u8)
 }
@@ -78084,11 +78151,24 @@ fn after_auth(
                     database.as_ref().and_then(|db| {
                         fire_crab_blb::read_blob(&db.bytes(), db.page_size, rel, num).ok().map(|b| {
                             let stream = b.header.is_stream();
-                            let segs = if stream {
+                            let segs: Vec<Vec<u8>> = if stream {
                                 vec![b.content()]
                             } else {
                                 b.segments().map(|s| s.to_vec()).collect()
                             };
+                            // A TEXT BLOB IS DELIVERED IN THE ATTACHMENT'S
+                            // CHARSET. The engine transliterates blob
+                            // content on the way out exactly as it does a
+                            // VARCHAR's, so a `BLOB SUB_TYPE TEXT
+                            // CHARACTER SET WIN1252` read under a UTF8
+                            // attachment arrives as `63 61 66 C3 A9`;
+                            // shipping the stored `63 61 66 E9` hands a
+                            // UTF8 client bytes that are not valid UTF-8.
+                            // The describe already names the attachment's
+                            // charset ([blob_out_charset]), so this is
+                            // what keeps the announcement and the payload
+                            // agreeing - the two must move together.
+                            let segs = blob_segs_out(segs, b.header.sub_type, b.header.charset, att_cs);
                             ReadBlob {
                                 segs,
                                 stream,
