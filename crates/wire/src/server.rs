@@ -26525,6 +26525,31 @@ fn upgrade_image(
         out[to..to + n].copy_from_slice(&image[from..from + n]);
         out[fid / 8] &= !(1 << (fid % 8));
     }
+    // A FIELD THE OLD FORMAT NEVER HAD takes this format's stored
+    // DEFAULT, which is where `ALTER TABLE ... ADD <col> DEFAULT <x> NOT
+    // NULL` put it rather than rewriting every row. Without this the
+    // upgraded image carries NULL there, and the patched row then fails
+    // its own NOT NULL: `UPDATE T SET <other> = ...` on a row older than
+    // the ALTER answered 23000 `validation error ... value "*** null
+    // ***"` for a column the statement never touched, and the engine
+    // updates it happily.
+    for (fid, v) in newest_format_defaults(db, rel) {
+        if fid < old.len() {
+            continue; // the record's own format had this field
+        }
+        let Some(d) = new.get(fid) else { continue };
+        if d.offset == 0 {
+            continue;
+        }
+        let Some(wp) = value_to_wireparam(&v) else { continue };
+        let Some(Some(b)) = encode_wire_value(d, &wp) else { continue };
+        let at = d.offset as usize;
+        if b.len() > d.length as usize || at + b.len() > out.len() {
+            continue;
+        }
+        out[at..at + b.len()].copy_from_slice(&b);
+        out[fid / 8] &= !(1 << (fid % 8));
+    }
     Some(out)
 }
 
@@ -28893,6 +28918,7 @@ fn dml_targets_at(
     filter: &Option<Predicate>,
     access: &IndexAccess,
 ) -> Result<Vec<(u32, u16, u8, Vec<u8>)>, EvalErr> {
+    let fc_defaults = newest_format_defaults(db, rel);
     let per_page = fire_crab_ods::format::max_recs_per_dp(db.page_size);
     if per_page == 0 {
         return Ok(Vec::new());
@@ -28972,7 +28998,7 @@ fn dml_targets_at(
             .find(|(n, _)| *n == format)
             .or_else(|| formats.iter().max_by_key(|(n, _)| *n));
         let Some((_, descs)) = descs else { continue };
-        let values = decode_record(&image, descs);
+        let values = decode_stored(&image, descs, formats, &fc_defaults);
         if filter.as_ref().map_or(Ok(true), |p| p.matches(&values))? {
             // a snapshot cannot write over a concurrent commit
             if let Some(tx) = view.snapshot_conflict(&r) {
@@ -29158,6 +29184,7 @@ fn collect_dml_targets_drawing(
     formats: &[(u8, Vec<Descriptor>)],
     g: &GenFilter,
 ) -> Result<(Vec<(u32, u16, u8, Vec<u8>)>, Option<i64>), ExecErr> {
+    let fc_defaults = newest_format_defaults(db, rel);
     let (id, incr) = generator_info(db, &g.name).ok_or("no such generator")?;
     let step = g.step.unwrap_or(incr);
     // a cached name draws in the cache, never in `work` - the caller
@@ -29182,7 +29209,7 @@ fn collect_dml_targets_drawing(
                 .find(|(n, _)| *n == format)
                 .or_else(|| formats.iter().max_by_key(|(n, _)| *n));
             let Some((_, descs)) = descs else { continue };
-            let values = decode_record(&image, descs);
+            let values = decode_stored(&image, descs, formats, &fc_defaults);
             let drawn = match cached {
                 Some(c) => {
                     let v = c.wrapping_add(step);
@@ -29248,6 +29275,7 @@ fn collect_dml_targets(
     filter: &Option<Predicate>,
     index: &Option<IndexAccess>,
 ) -> Result<Vec<(u32, u16, u8, Vec<u8>)>, EvalErr> {
+    let fc_defaults = newest_format_defaults(db, rel);
     // A WRITE READS FIRST, and that read is a retrieval like any other:
     // `DELETE FROM T WHERE ID = 5` had been walking every page of T. The
     // index names candidates and the same filter still decides which of
@@ -29281,7 +29309,7 @@ fn collect_dml_targets(
                 .find(|(n, _)| *n == format)
                 .or_else(|| formats.iter().max_by_key(|(n, _)| *n));
             let Some((_, descs)) = descs else { continue };
-            let values = decode_record(&image, descs);
+            let values = decode_stored(&image, descs, formats, &fc_defaults);
             // a WHERE eval error (divide by zero) aborts the DML like
             // the engine's - never a partial row set
             if filter.as_ref().map_or(Ok(true), |p| p.matches(&values))? {
@@ -31428,6 +31456,7 @@ fn execute_dml_collecting_inner(
             if let Some(other) = blocking_transaction(db, &found) {
                 return Err(ExecErr::Conflict(other));
             }
+            let fc_defaults = newest_format_defaults(db, *rel);
             for (page, slot, fmt, image) in found {
                 // BEFORE DELETE TRIGGERS, where the engine fires them:
                 // over the row as it stands (OLD), before it goes. A
@@ -31440,7 +31469,7 @@ fn execute_dml_collecting_inner(
                         .or_else(|| formats.iter().max_by_key(|(n, _)| *n))
                         .map(|(_, d)| d)
                         .ok_or("no format for a matching record")?;
-                    let old_row = decode_record(&image, descs);
+                    let old_row = decode_stored(&image, descs, formats, &fc_defaults);
                     if triggers.iter().any(|t| t.needs_db) {
                         // the row is STILL THERE in the published copy -
                         // measured: a BEFORE DELETE body counting its own
@@ -31480,23 +31509,42 @@ fn execute_dml_collecting_inner(
                         .or_else(|| formats.iter().max_by_key(|(n, _)| *n))
                         .map(|(_, d)| d)
                         .ok_or("no format for a matching record")?;
-                    let values = decode_record(&image, descs);
+                    let values = decode_stored(&image, descs, formats, &fc_defaults);
                     fk_check_parent_row(db, fk_children, &values, None)
                         .map_err(ExecErr::Eval)?;
                 }
                 // a DELETE returns the row AS IT WAS
                 if let Some(a) = affected.as_deref_mut() {
-                    let d = formats
+                    // RETURNING SPEAKS THE NEWEST FORMAT, always: the
+                    // client was described in it, and a record older
+                    // than the relation is re-laid on the way out - so a
+                    // field its own format never had comes back as that
+                    // format's stored DEFAULT rather than as the bytes
+                    // living at the new offset. Handing back the
+                    // record's OWN descriptors instead answered `B 2`
+                    // for a column added after the row was stored -
+                    // which is the ID beside it, read at B's offset.
+                    let (newest_no, newest) = formats
                         .iter()
-                        .find(|(n, _)| *n == fmt)
-                        .or_else(|| formats.iter().max_by_key(|(n, _)| *n))
-                        .map(|(_, d)| d)
+                        .max_by_key(|(n, _)| *n)
+                        .map(|(n, d)| (*n, d))
                         .ok_or("no format for a matching record")?;
-                    a.descs = d.clone();
-                    a.images.push(image.clone());
+                    let img = if fmt == newest_no {
+                        image.clone()
+                    } else {
+                        let old = formats
+                            .iter()
+                            .find(|(n, _)| *n == fmt)
+                            .map(|(_, d)| d)
+                            .ok_or("no format for a matching record")?;
+                        upgrade_image(&image, old, newest, db, *rel, newest_no)
+                            .ok_or("a matching record is in an older format")?
+                    };
+                    a.descs = newest.clone();
+                    a.images.push(img.clone());
                     // a DELETE's `images` ARE the old rows; the parallel
                     // slot keeps every consumer's indexing uniform
-                    a.old_images.push(image.clone());
+                    a.old_images.push(img);
                     a.deleted.push(true);
                 }
                 if triggers.iter().any(|t| !t.before) {
@@ -31518,7 +31566,7 @@ fn execute_dml_collecting_inner(
                             .or_else(|| formats.iter().max_by_key(|(n, _)| *n))
                             .map(|(_, d)| d)
                             .ok_or("no format for a matching record")?;
-                        let row = decode_record(&image, descs);
+                        let row = decode_stored(&image, descs, formats, &fc_defaults);
                         work = fire_triggers_published(
                             database, work, stmt_tx, ctx, trig_cols, triggers, false, 3, None,
                             Some(&row),
@@ -32746,7 +32794,15 @@ fn insert_entry_verified(
             // format, and decoding it with the newest one is how a
             // verification becomes a second bug
             let formats = fire_crab_ods::relation_formats(work, page_size, rel);
-            if !unique_conflict(work, page_size, rel, op, &formats, key, recno, own) {
+            // the defaults come off the SAME working image, so a record
+            // stored before a defaulted column existed keys on the value
+            // the engine shows for it rather than on NULL
+            let defaults = fire_crab_ods::relation_format_defaults(work, page_size, rel)
+                .into_iter()
+                .max_by_key(|(n, _)| *n)
+                .map(|(_, d)| d)
+                .unwrap_or_default();
+            if !unique_conflict(work, page_size, rel, op, &formats, &defaults, key, recno, own) {
                 // every entry holding this key names a record that is
                 // gone, or no longer carries it
                 fire_crab_ods::btw::insert_index_entry(
@@ -33014,6 +33070,7 @@ fn unique_conflict(
     rel: u16,
     op: &IndexOp,
     formats: &[(u8, Vec<Descriptor>)],
+    defaults: &[(usize, Value)],
     key: &[u8],
     recno: u64,
     own: &fire_crab_ods::tra::OwnTx,
@@ -33037,7 +33094,7 @@ fn unique_conflict(
     // may have written them), and a row left behind by a transaction
     // that never committed does not.
     let view = ReadView::over(work, page_size, own.clone());
-    records_at_in(work, page_size, rel, formats, &others, &view)
+    records_at_in(work, page_size, rel, formats, defaults, &others, &view)
         .iter()
         .any(|values| op.key_for(values).is_some_and(|(k, _)| k == key))
 }
@@ -33060,6 +33117,72 @@ fn recno_of(work: &fire_crab_ods::Image, page_size: usize, page_no: u32, slot: u
 /// system relation whose formats are not in `RDB$FORMATS`, the ones the
 /// engine's bootstrap walk computes. Held in the metadata cache: that
 /// bootstrap walk is the expensive half, and both halves are catalog.
+/// THE DEFAULTS the relation's formats carry, memoised beside
+/// [select_formats] and read from the same catalog rows.
+///
+/// `ALTER TABLE T ADD B INTEGER DEFAULT 7 NOT NULL` rewrites no row: the
+/// value lives in the FORMAT, and every record stored behind that format
+/// reads it from there. Measured on an engine-built database - the old
+/// rows answer 7, while a NULLABLE `ADD C INTEGER DEFAULT 5` (which
+/// writes no entry into the section) answers NULL on the same rows.
+/// Decode a STORED record and materialise the defaults for the fields
+/// its own format never had - the read-side half of
+/// [fill_format_defaults], for the DML walks.
+fn decode_stored(
+    image: &[u8],
+    descs: &[Descriptor],
+    formats: &[(u8, Vec<Descriptor>)],
+    defaults: &[(usize, Value)],
+) -> Vec<Value> {
+    let newest = formats.iter().max_by_key(|(n, _)| *n).map(|(_, d)| d.len()).unwrap_or(0);
+    fill_format_defaults(decode_record(image, descs), newest, defaults)
+}
+
+fn select_format_defaults(db: &Database, rel: u16) -> Vec<(u8, Vec<(usize, Value)>)> {
+    db.meta_memo("format-defaults", &rel.to_string(), || {
+        fire_crab_ods::relation_format_defaults(&db.bytes(), db.page_size, rel)
+    })
+    .as_ref()
+    .clone()
+}
+
+/// The newest format's defaults - the only ones a read needs, since a
+/// record is always presented through the newest format.
+fn newest_format_defaults(db: &Database, rel: u16) -> Vec<(usize, Value)> {
+    select_format_defaults(db, rel)
+        .into_iter()
+        .max_by_key(|(n, _)| *n)
+        .map(|(_, d)| d)
+        .unwrap_or_default()
+}
+
+/// The values a record STORED IN `stored` must show when it is presented
+/// through `newest`: everything the record itself carries, then - for
+/// each field the newest format has and the record's own format did not
+/// - that format's stored DEFAULT, or NULL where it lists none.
+///
+/// A field id is never reused once dropped (measured: `DROP X` leaves a
+/// ZEROED descriptor in its slot and the next `ADD` takes the NEXT id),
+/// so a field the old format lacks is always one PAST its end, and this
+/// is an extend rather than a merge.
+fn fill_format_defaults(
+    mut values: Vec<Value>,
+    newest_len: usize,
+    defaults: &[(usize, Value)],
+) -> Vec<Value> {
+    while values.len() < newest_len {
+        let fid = values.len();
+        values.push(
+            defaults
+                .iter()
+                .find(|(i, _)| *i == fid)
+                .map(|(_, v)| v.clone())
+                .unwrap_or(Value::Null),
+        );
+    }
+    values
+}
+
 fn select_formats(db: &Database, table: &str, rel: u16) -> Vec<(u8, Vec<Descriptor>)> {
     db.meta_memo("select-formats", table, || {
         let mut formats = relation_formats(&db.bytes(), db.page_size, rel);
@@ -43158,7 +43281,8 @@ fn records_at(
 ) -> Vec<Vec<Value>> {
     db.reserve_relation_read(rel);
     let image = db.bytes();
-    records_at_in(&image, db.page_size, rel, formats, recnos, &ReadView::of(db, &image))
+    let defaults = newest_format_defaults(db, rel);
+    records_at_in(&image, db.page_size, rel, formats, &defaults, recnos, &ReadView::of(db, &image))
 }
 
 /// The records a PICK's candidates name, with every candidate whose
@@ -43210,7 +43334,10 @@ fn for_each_2pc(
     let image = db.bytes();
     let view = ReadView::of(db, &image);
     let pages = page_sequence_map(&image, db.page_size, rel);
-    for_each_2pc_on(&image, &view, db.page_size, &pages, per_page, rel, formats, access, sink)
+    let defaults = newest_format_defaults(db, rel);
+    for_each_2pc_on(
+        &image, &view, db.page_size, &pages, per_page, rel, formats, &defaults, access, sink,
+    )
 }
 
 /// [for_each_2pc] against an ALREADY-FROZEN image: the walk itself, with the
@@ -43228,6 +43355,7 @@ fn for_each_2pc_on(
     per_page: u64,
     rel: u16,
     formats: &[(u8, Vec<Descriptor>)],
+    defaults: &[(usize, Value)],
     access: &IndexAccess,
     sink: &mut dyn FnMut(Vec<Value>) -> Result<Flow, EvalErr>,
 ) -> Result<(Flow, u64), EvalErr> {
@@ -43270,7 +43398,7 @@ fn for_each_2pc_on(
                 return true;
             }
             for values in
-                records_at_in_with(image, page_size, formats, pages, per_page, &[recno], view)
+                records_at_in_with(image, page_size, formats, defaults, pages, per_page, &[recno], view)
             {
                 // verify is always true under navigation - the stale-entry
                 // check that keeps a moved row out of its old key's slot
@@ -43317,7 +43445,7 @@ fn for_each_2pc_on(
             continue;
         }
         for values in
-            records_at_in_with(image, page_size, formats, pages, per_page, &[recno], view)
+            records_at_in_with(image, page_size, formats, defaults, pages, per_page, &[recno], view)
         {
             if !verify || pick.entry_is_current(&entry_key, &values) {
                 seen.insert(recno);
@@ -43404,6 +43532,7 @@ fn records_at_in(
     page_size: usize,
     rel: u16,
     formats: &[(u8, Vec<Descriptor>)],
+    defaults: &[(usize, Value)],
     recnos: &[u64],
     view: &ReadView,
 ) -> Vec<Vec<Value>> {
@@ -43412,7 +43541,7 @@ fn records_at_in(
         return Vec::new();
     }
     let pages = page_sequence_map(bytes, page_size, rel);
-    records_at_in_with(bytes, page_size, formats, &pages, per_page, recnos, view)
+    records_at_in_with(bytes, page_size, formats, defaults, &pages, per_page, recnos, view)
 }
 
 /// WHAT THIS ATTACHMENT COUNTS AS A ROW.
@@ -43561,6 +43690,7 @@ impl<'a> ReadView<'a> {
         bytes: &fire_crab_ods::Image,
         page_size: usize,
         formats: &[(u8, Vec<Descriptor>)],
+        defaults: &[(usize, Value)],
         r: &fire_crab_ods::RecordHeader,
     ) -> Option<Vec<Value>> {
         let (image, format) = self.version(bytes, page_size, r)?;
@@ -43568,7 +43698,15 @@ impl<'a> ReadView<'a> {
             .iter()
             .find(|(n, _)| *n == format)
             .or_else(|| formats.iter().max_by_key(|(n, _)| *n))?;
-        Some(decode_record(&image, &descs.1))
+        let values = decode_record(&image, &descs.1);
+        // ...and a field the record's format did not have yet reads the
+        // NEWEST format's stored DEFAULT, which is where `ALTER TABLE
+        // ... ADD <col> DEFAULT <x> NOT NULL` put it instead of
+        // rewriting every row ([fill_format_defaults]). `defaults` is
+        // the newest format's section; an empty one leaves the short
+        // vector exactly as it was.
+        let newest = formats.iter().max_by_key(|(n, _)| *n).map(|(_, d)| d.len()).unwrap_or(0);
+        Some(fill_format_defaults(values, newest, defaults))
     }
 }
 
@@ -43598,6 +43736,9 @@ struct StreamCursor {
     image: std::sync::Arc<fire_crab_ods::Image>,
     rel: u16,
     formats: Vec<(u8, Vec<Descriptor>)>,
+    /// the newest format's stored defaults, for the fields a record
+    /// older than it does not carry ([fill_format_defaults])
+    defaults: Vec<(usize, Value)>,
     /// the BOUND predicate (any `?` already substituted)
     filter: Option<Predicate>,
     /// partial-decompression read length, as the materialising scan uses
@@ -43656,6 +43797,7 @@ impl StreamCursor {
             image,
             rel: *rel,
             formats: formats.clone(),
+            defaults: newest_format_defaults(db, *rel),
             filter,
             read_len: project_read_len(plan),
             pages,
@@ -43692,7 +43834,7 @@ impl StreamCursor {
             while self.si < recs.len() {
                 let r = &recs[self.si];
                 self.si += 1;
-                let Some(values) = view.values(&self.image, db.page_size, &self.formats, r) else {
+                let Some(values) = view.values(&self.image, db.page_size, &self.formats, &self.defaults, r) else {
                     if view.limbo.get() != 0 {
                         let e = EvalErr::RecInLimbo(view.limbo.get());
                         if out.is_empty() {
@@ -44166,7 +44308,14 @@ impl JoinCursor {
                         match probe.band(db, &row) {
                             Band::Index(access) => {
                                 let rrows = frozen_probe_rows(
-                                    image, view, db.page_size, ps, probe, &access, part.width,
+                                    image,
+                                    view,
+                                    db.page_size,
+                                    &newest_format_defaults(db, probe.src.rel),
+                                    ps,
+                                    probe,
+                                    &access,
+                                    part.width,
                                 )?;
                                 next.extend(join_step(vec![row], w, &rrows, part, above)?);
                             }
@@ -44184,6 +44333,7 @@ impl JoinCursor {
                                         view,
                                         db.page_size,
                                         &probe.src.formats,
+                                        &newest_format_defaults(db, probe.src.rel),
                                         &ps.data_pages,
                                         part.width,
                                     )?);
@@ -44324,6 +44474,7 @@ fn frozen_probe_rows(
     image: &fire_crab_ods::Image,
     view: &ReadView,
     page_size: usize,
+    defaults: &[(usize, Value)],
     ps: &ProbedSide,
     probe: &JoinProbe,
     access: &IndexAccess,
@@ -44338,6 +44489,7 @@ fn frozen_probe_rows(
         ps.per_page,
         probe.src.rel,
         &probe.src.formats,
+        defaults,
         access,
         &mut |mut row| {
             row.resize(width, Value::Null);
@@ -44362,6 +44514,7 @@ fn frozen_side_rows(
     view: &ReadView,
     page_size: usize,
     formats: &[(u8, Vec<Descriptor>)],
+    defaults: &[(usize, Value)],
     data_pages: &[u32],
     width: usize,
 ) -> Result<Vec<Vec<Value>>, EvalErr> {
@@ -44372,7 +44525,7 @@ fn frozen_side_rows(
             continue;
         };
         for r in dp.records() {
-            let Some(mut values) = view.values(image, page_size, formats, &r) else {
+            let Some(mut values) = view.values(image, page_size, formats, defaults, &r) else {
                 if view.limbo.get() != 0 {
                     return Err(EvalErr::RecInLimbo(view.limbo.get()));
                 }
@@ -44532,6 +44685,7 @@ fn records_at_in_with(
     bytes: &fire_crab_ods::Image,
     page_size: usize,
     formats: &[(u8, Vec<Descriptor>)],
+    defaults: &[(usize, Value)],
     pages: &std::collections::HashMap<u32, u32>,
     per_page: u64,
     recnos: &[u64],
@@ -44549,7 +44703,7 @@ fn records_at_in_with(
         // `records()` skips released slots, so nth() shifts after a
         // garbage collection and fetches the wrong record entirely.
         let Some(r) = dp.record(slot as u16) else { continue };
-        let Some(values) = view.values(bytes, page_size, formats, &r) else { continue };
+        let Some(values) = view.values(bytes, page_size, formats, defaults, &r) else { continue };
         out.push(values);
     }
     out
@@ -44608,6 +44762,7 @@ fn for_each_record_while<F: FnMut(&[Value]) -> Flow>(
     mut f: F,
 ) -> u64 {
     let db_image = db.bytes();
+    let defaults = newest_format_defaults(db, rel);
     let mut view = ReadView::of(db, &db_image);
     view.decode_len = decode_len;
     for dp_no in relation_data_pages(&db_image, db.page_size, rel) {
@@ -44617,7 +44772,7 @@ fn for_each_record_while<F: FnMut(&[Value]) -> Flow>(
             continue;
         };
         for r in dp.records() {
-            let Some(values) = view.values(&db_image, db.page_size, formats, &r) else {
+            let Some(values) = view.values(&db_image, db.page_size, formats, &defaults, &r) else {
                 if view.limbo.get() != 0 {
                     return view.limbo.get();
                 }
@@ -44677,6 +44832,7 @@ fn for_each_record<F: FnMut(&[Value])>(
 ) -> u64 {
     db.reserve_relation_read(rel);
     let db_image = db.bytes();
+    let defaults = newest_format_defaults(db, rel);
     let mut view = ReadView::of(db, &db_image);
     view.decode_len = decode_len;
     for dp_no in relation_data_pages(&db_image, db.page_size, rel) {
@@ -44686,7 +44842,7 @@ fn for_each_record<F: FnMut(&[Value])>(
             continue;
         };
         for r in dp.records() {
-            let Some(values) = view.values(&db_image, db.page_size, formats, &r) else {
+            let Some(values) = view.values(&db_image, db.page_size, formats, &defaults, &r) else {
                 if view.limbo.get() != 0 {
                     return view.limbo.get();
                 }

@@ -76,8 +76,11 @@ impl Descriptor {
 }
 
 /// Parse an RDB$DESCRIPTOR format blob: `u16 count` then `count`
-/// descriptors (met.epp:1057-1064; the trailing default-value section
-/// is ignored, as are defaults by the engine's readers of old rows).
+/// descriptors (met.epp:1057-1064). The trailing default-value section
+/// is [parse_format_defaults] - it is NOT ignorable, and the comment
+/// that used to say so here ("as are defaults by the engine's readers
+/// of old rows") was wrong: the engine materialises those defaults for
+/// every record stored before the field existed.
 pub fn parse_format_blob(b: &[u8]) -> Option<Vec<Descriptor>> {
     if b.len() < 2 {
         return None;
@@ -88,6 +91,113 @@ pub fn parse_format_blob(b: &[u8]) -> Option<Vec<Descriptor>> {
         descs.push(Descriptor::decode(b.get(2 + i * 12..2 + i * 12 + 12)?)?);
     }
     Some(descs)
+}
+
+/// THE DEFAULTS A FORMAT CARRIES, for the fields a record older than it
+/// does not have at all.
+///
+/// `ALTER TABLE T ADD B INTEGER DEFAULT 7 NOT NULL` rewrites NOT ONE
+/// ROW. It mints a format, and it writes the default INTO that format
+/// so every record still stored behind it reads 7 rather than NULL -
+/// which is what a NOT NULL column added to a populated table has to
+/// mean, since there is nowhere else the value could come from.
+///
+/// The section sits after the descriptors and describes itself:
+///
+/// ```text
+///   u16 count, count * 12 descriptor bytes,      <- [parse_format_blob]
+///   u16 default_count,
+///   per default:  u16 field_index
+///                 12 bytes of Descriptor         <- the DEFAULT's own
+///                 descriptor.length bytes of value
+/// ```
+///
+/// Measured, from an engine-built database (`ALTER TABLE MIN1 ADD B
+/// INTEGER DEFAULT 7 NOT NULL` over a two-row table, format 2, the
+/// whole 46-byte blob):
+///
+/// ```text
+///   0200                          two fields
+///   0900 0400 0000 0000 0400 0000   ID  LONG len 4 at offset 4
+///   0900 0400 0000 0000 0800 0000   B   LONG len 4 at offset 8
+///   0100                          ONE default
+///   0100                            for field 1
+///   0900 0400 0000 0000 0000 0000   its own descriptor: LONG len 4
+///   0700 0000                       the value: 7
+/// ```
+///
+/// THE DEFAULT'S DESCRIPTOR IS ITS OWN and need not match the field's:
+/// a `VARCHAR(5) DEFAULT 'zz'` field is VARYING len 22 while its
+/// default is TEXT len 2, so the value must be CONVERTED into the
+/// field, never copied over it.
+///
+/// A NULLABLE `ADD C INTEGER DEFAULT 5` contributes NO entry - measured
+/// on the same table, where the format carrying both B and C still says
+/// `default_count = 1` - and the engine duly reads NULL for C on the old
+/// rows. So the law is exactly "apply what the section lists", with no
+/// NOT NULL special case anywhere.
+pub fn parse_format_defaults(b: &[u8]) -> Vec<(usize, Value)> {
+    let mut out = Vec::new();
+    if b.len() < 2 {
+        return out;
+    }
+    let count = u16_at(b, 0) as usize;
+    let descs = parse_format_blob(b).unwrap_or_default();
+    let mut at = 2 + count * 12;
+    if b.len() < at + 2 {
+        return out; // a format with no section at all
+    }
+    let defaults = u16_at(b, at) as usize;
+    at += 2;
+    for _ in 0..defaults {
+        if b.len() < at + 14 {
+            return out;
+        }
+        let field = u16_at(b, at) as usize;
+        at += 2;
+        let Some(desc) = Descriptor::decode(&b[at..at + 12]) else {
+            return out;
+        };
+        at += 12;
+        let len = desc.length as usize;
+        let Some(bytes) = b.get(at..at + len) else {
+            return out;
+        };
+        at += len;
+        // decoded through [decode_field] rather than a second copy of
+        // the type rules: the value is laid behind a zeroed null bitmap
+        // so field 0 reads NOT NULL, and the descriptor is moved to sit
+        // on top of it
+        let head = flag_bytes(1);
+        let mut image = vec![0u8; head];
+        image.extend_from_slice(bytes);
+        let mut d = desc;
+        d.offset = head as u32;
+        // A TEXT DEFAULT IS AS LONG AS ITS VALUE, and the CHAR rule
+        // must not be applied to it: `VARCHAR(5) CHARACTER SET UTF8
+        // DEFAULT 'zz'` stores its default as TEXT of TWO bytes, and
+        // reading two bytes as a UTF8 CHAR column divides by four
+        // bytes-per-character and yields the EMPTY STRING. The width
+        // rule belongs to the FIELD, not to the default: a CHAR field's
+        // default IS padded to the field's byte width (measured), so
+        // there the division is right and here it is not. Decide by the
+        // field's own dtype.
+        let is_char_field = descs.get(field).map(|f| f.dtype) == Some(dtype::TEXT);
+        let v = if d.dtype == dtype::TEXT && !is_char_field {
+            let cs = crate::intl::charset_id(d.sub_type);
+            let text = if crate::intl::byte_carrier(cs) {
+                crate::intl::carrier_decode(bytes)
+            } else {
+                crate::intl::decode_text(cs, bytes)
+                    .unwrap_or_else(|| String::from_utf8_lossy(bytes).into_owned())
+            };
+            Value::Text(text)
+        } else {
+            decode_field(&image, &d, 0)
+        };
+        out.push((field, v));
+    }
+    out
 }
 
 /// `FLAG_BYTES(n)` (val.h:42) with BITS_PER_LONG = 32: size of the
@@ -581,11 +691,39 @@ pub fn read_blob_content(
 /// Bootstrap: read every (relation_id, format#, descriptors) row from
 /// RDB$FORMATS using its hardcoded system format, then parse each
 /// descriptor blob. Returns matches for `relation`.
+/// THE DEFAULTS EACH OF A RELATION'S FORMATS CARRIES - the sibling of
+/// [relation_formats], reading the same catalog rows for the section
+/// [parse_format_defaults] describes. Kept apart rather than widening
+/// that function's return type, which nearly two hundred call sites
+/// destructure.
+pub fn relation_format_defaults(
+    file: &crate::Image,
+    page_size: usize,
+    relation: u16,
+) -> Vec<(u8, Vec<(usize, Value)>)> {
+    scan_formats(file, page_size, relation, true)
+        .into_iter()
+        .map(|(n, _, d)| (n, d))
+        .collect()
+}
+
 pub fn relation_formats(
     file: &crate::Image,
     page_size: usize,
     relation: u16,
 ) -> Vec<(u8, Vec<Descriptor>)> {
+    scan_formats(file, page_size, relation, false)
+        .into_iter()
+        .map(|(n, descs, _)| (n, descs))
+        .collect()
+}
+
+fn scan_formats(
+    file: &crate::Image,
+    page_size: usize,
+    relation: u16,
+    want_defaults: bool,
+) -> Vec<(u8, Vec<Descriptor>, Vec<(usize, Value)>)> {
     let sys = formats_table_format();
     let mut found = Vec::new();
     let tips = crate::tra::TipChain::read(file, page_size);
@@ -610,7 +748,9 @@ pub fn relation_formats(
             }
             if let Some(blob) = read_blob(file, page_size, REL_FORMATS, *blob_recno, true) {
                 if let Some(descs) = parse_format_blob(&blob) {
-                    found.push((*fmt_no as u8, descs));
+                    let defs =
+                        if want_defaults { parse_format_defaults(&blob) } else { Vec::new() };
+                    found.push((*fmt_no as u8, descs, defs));
                 }
             }
         }
@@ -620,6 +760,43 @@ pub fn relation_formats(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn reads_the_default_section_the_engine_wrote() {
+        use super::Value;
+        // VERBATIM from an engine-built database (isql BLOBDUMP of
+        // RDB$FORMATS.RDB$DESCRIPTOR):
+        //   CREATE TABLE MIN1 (ID INTEGER);  two rows;
+        //   ALTER TABLE MIN1 ADD B INTEGER DEFAULT 7 NOT NULL;
+        //   ALTER TABLE MIN1 ADD C INTEGER DEFAULT 5;        -- NULLABLE
+        let fmt1: &[u8] = &[
+            0x01, 0x00, 0x09, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00,
+        ];
+        let fmt2: &[u8] = &[
+            0x02, 0x00, 0x09, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00,
+            0x09, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x01, 0x00,
+            0x01, 0x00, 0x09, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x07, 0x00, 0x00, 0x00,
+        ];
+        let fmt3: &[u8] = &[
+            0x03, 0x00, 0x09, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00,
+            0x09, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x09, 0x00,
+            0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0c, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00,
+            0x09, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0x00,
+            0x00, 0x00,
+        ];
+        // the ORIGINAL format has no section at all
+        assert_eq!(super::parse_format_blob(fmt1).unwrap().len(), 1);
+        assert!(super::parse_format_defaults(fmt1).is_empty());
+        // ...the ALTER's format carries one, for field 1, holding 7
+        assert_eq!(super::parse_format_blob(fmt2).unwrap().len(), 2);
+        assert_eq!(super::parse_format_defaults(fmt2), vec![(1usize, Value::Int(7))]);
+        // ...and adding a NULLABLE defaulted column adds NO entry, which
+        // is exactly why the engine reads 7 for B and NULL for C on a
+        // row stored before either existed
+        assert_eq!(super::parse_format_blob(fmt3).unwrap().len(), 3);
+        assert_eq!(super::parse_format_defaults(fmt3), vec![(1usize, Value::Int(7))]);
+    }
 
     #[test]
     fn renders_doubles_the_way_the_engine_prints_them() {

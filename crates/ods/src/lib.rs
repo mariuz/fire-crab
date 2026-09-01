@@ -58,7 +58,8 @@ pub use data::{DataPage, RecordHeader};
 pub use dml::{allocate_page, begin_active_tx, begin_committed_tx, delete_records, delete_records_under, insert_blob_slot, insert_record, insert_record_under, set_tx_state, update_record_under, update_records, DmlOutcome, InsertOutcome};
 pub use header::{header_report, variable_header, HeaderClumplet};
 pub use format::{
-    decode_record, field_bytes, read_blob_content, relation_formats, Descriptor, Value,
+    decode_record, field_bytes, read_blob_content, relation_format_defaults, relation_formats,
+    Descriptor, Value,
 };
 pub use gc::{analyze as gc_analyze, version_count, GcReport};
 pub use header::HeaderPage;
