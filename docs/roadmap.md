@@ -58,6 +58,7 @@ One line each; the gate is the proof.
 | the output format travels with the row | the singleton path (`op_execute2`, how an INSERT ... RETURNING is answered) emitted with NO OutFmt, so a CHAR result was written in the value's own bytes while the describe announced the attachment's - under -ch UTF8 `RETURNING 'ok'` announced len 8, wrote 2, and KILLED THE CONNECTION | `serve-real-returningexpr` 33 |
 | a MERGE's DELETE branch has no NEW record | `RETURNING NEW.<col>` over a deleted row is NULL, PER ROW (a mixed merge answers the update branch's values and the delete branch's NULLs in one result); and the describe follows a three-way rule - every branch deletes = the null constant, some branch deletes = named CONSTANT with the column's type, none deletes = the column itself | `serve-real-returnold` 59 |
 | a text blob is delivered in the attachment's charset | the engine transliterates blob content on the way out and ANNOUNCES the attachment's charset; fc announced the STORAGE charset and shipped the stored bytes, handing a UTF8 client invalid UTF-8. Both halves had to move together - announcing the attachment's charset while framing the stored bytes is worse than the self-consistent original | `serve-real-blobexpr` 53 |
+| a record is read through the format it was WRITTEN under | `ALTER TABLE` mints a format and rewrites no row, so a maintained table holds several shapes at once. fc upgraded the image it PATCHED and read the raw before-image with the NEWEST descriptors everywhere else - SET expressions' old values, BEFORE/AFTER trigger OLD, the FK parent check, RETURNING OLD and the old index key. `UPDATE T SET B = B+1` after one `ALTER ... TYPE BIGINT` returned 0/0 for a stored 1/7 and COMMITTED (NULL, NULL) over the row: silent destruction of committed data, no error. The upgrade also DROPPED any field whose descriptor changed - the byte-copy law one step too far, where ALTER TYPE only ever widens and the value converts | `serve-real-stalefmt` 43 |
 
 ## Stale claims retired
 
@@ -4237,6 +4238,48 @@ STILL OPEN:
   One hole would shift every blob after it. Reproducing that needs an
   allocation history with a freed page, which a fresh two-append fixture
   does not have.
+
+- **REPORTED BUT DID NOT REPRODUCE** - "the `op_execute2` procedure emit
+  passes no OutFmt, so an EXECUTE PROCEDURE output parameter whose charset
+  differs from the attachment's is written at its STORED width while the
+  describe announces the attachment's, and the connection desynchronises
+  (08006)". This is the exact law that WAS true one line below, for the
+  INSERT ... RETURNING singleton (`serve-real-returningexpr`), which is why
+  it read as obvious. Measured on the pre-change binary: `CHAR(3)` UTF8 and
+  `CHAR(5)` WIN1252 output parameters under `-ch UTF8`, `-ch WIN1252` and
+  `-ch NONE` - all six answer IDENTICALLY to the engine, with the format
+  and without it. The change was written from the code reading BEFORE the
+  measurement and has been REVERTED, with the measurement recorded at the
+  call site so the next reader does not re-derive it. A sibling site
+  sharing a shape is a place to LOOK, not a defect.
+
+- **OPEN (gap, found writing `serve-real-stalefmt`) - NARROWER THAN IT
+  FIRST LOOKED, cause not yet measured.** MEASURED: `CREATE TRIGGER TA FOR
+  T2 BEFORE UPDATE AS BEGIN INSERT INTO LG VALUES (1, 1); END` (created by
+  the ENGINE through embedded isql, LG a DIFFERENT table) stores fine, and
+  then `UPDATE T2 SET B = B + 1` answers 42000 Dynamic SQL Error on fc
+  where the engine runs it. Reproduces on an UNALTERED table, so it has
+  nothing to do with record formats.
+  NOT the gap I first wrote down: nested DML in a trigger body IS
+  implemented - `trig_body_inlineable` (server.rs:14338) admits an
+  INSERT/UPDATE/DELETE into ANOTHER table and a SELECT INTO, fired inline
+  over the published working copy, and `run_body_dml` (:67302) runs it,
+  carrying constraint violations out as real SQLSTATEs. So the refusal is
+  something narrower. READ (not yet measured, so not yet a fix): the body
+  parser at server.rs:19264 requires the COLUMN LIST. For `INSERT INTO LG
+  VALUES (1,1)` it takes `text.find('(')` - which is VALUES' own paren -
+  and reads the table name as `LG VALUES`, fails `ident_ok`, and returns
+  None for the whole body, so the trigger is not runnable and the
+  triggering statement refuses. The engine accepts the positional form
+  (every column, in ordinal order). PREDICTION TO TEST, both halves:
+  `INSERT INTO LG (K, V) VALUES (1,1)` in a body must WORK today, and only
+  the list-less form must refuse. Measure before implementing.
+
+- **OPEN (gap, same gate)** - `UPDATE OR INSERT ... RETURNING OLD.<col>`
+  and `RETURNING NEW.<col>` refuse with 42000 where the engine answers;
+  the BARE `RETURNING <col>` form is correct. The OLD./NEW. contexts landed
+  for UPDATE and MERGE (`serve-real-returnold`) and were never wired to
+  UPDATE OR INSERT's update half.
 
 ## Found by the SECOND hunt (2026-08-31) - still open
 

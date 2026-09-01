@@ -26421,6 +26421,9 @@ fn upgrade_image(
     }
     let len = stored_end;
     let mut out = vec![0u8; len];
+    // decoded lazily and at most once: only a field whose DESCRIPTOR
+    // changed needs converting, and most upgrades change one
+    let mut old_vals: Option<Vec<Value>> = None;
     for i in 0..new.len() {
         out[i / 8] |= 1 << (i % 8);
     }
@@ -26429,11 +26432,36 @@ fn upgrade_image(
         if d.offset == 0 || o.offset == 0 {
             continue; // a computed field has no stored bytes
         }
-        if o.dtype != d.dtype || o.length != d.length || o.scale != d.scale {
-            continue; // a type change keeps nothing: NULL
-        }
         if image.len() <= fid / 8 || image[fid / 8] & (1 << (fid % 8)) != 0 {
             continue; // NULL stays NULL
+        }
+        if o.dtype != d.dtype || o.length != d.length || o.scale != d.scale {
+            // A TYPE CHANGE CONVERTS THE VALUE, it does not drop it.
+            // This branch used to `continue` - the byte-copy law taken
+            // one step too far. The engine never copies bytes across a
+            // format change at all: it reads the field through the
+            // record's OWN format and MOV_moves it into the new one
+            // (jrd/vio.cpp's update path), so `ALTER TABLE T ALTER A
+            // TYPE BIGINT` over a stored 1 gives 1, not NULL - and
+            // ALTER TYPE only ever WIDENS, so the conversion cannot
+            // lose anything. Decode with the old descriptor, re-encode
+            // under the new one: exactly the pair an INSERT already
+            // runs, so every widening the store accepts is accepted
+            // here for free. A shape neither side can carry (a blob,
+            // an array) still falls through to NULL rather than
+            // guessing at bytes.
+            let vals = old_vals.get_or_insert_with(|| decode_record(image, old));
+            let Some(wp) = vals.get(fid).and_then(value_to_wireparam) else {
+                continue;
+            };
+            let Some(Some(b)) = encode_wire_value(d, &wp) else { continue };
+            let to = d.offset as usize;
+            if b.len() > d.length as usize || to + b.len() > out.len() {
+                continue;
+            }
+            out[to..to + b.len()].copy_from_slice(&b);
+            out[fid / 8] &= !(1 << (fid % 8));
+            continue;
         }
         let (from, to, n) = (o.offset as usize, d.offset as usize, d.length as usize);
         if image.len() < from + n {
@@ -30908,7 +30936,28 @@ fn execute_dml_collecting_inner(
                 // format does not carry, or carries differently, stays
                 // NULL), exactly what the engine's upgrade at the store
                 // does for a record whose format is behind the relation's
-                let mut img = if fmt != *format_no {
+                //
+                // AND THE BEFORE IMAGE NEEDS THE VERY SAME UPGRADE. The
+                // upgrade above was written for the row being PATCHED,
+                // and every other reader of this record went on decoding
+                // the RAW bytes with the NEWEST descriptors: the SET
+                // expressions' old values, a BEFORE trigger's OLD, the
+                // foreign-key parent check, RETURNING OLD, an AFTER
+                // trigger's OLD and the old index key. In a record still
+                // stored behind the relation - `ALTER TABLE T ALTER A
+                // TYPE BIGINT` mints a format and does NOT rewrite the
+                // rows - the newest offsets fall in the wrong places, so
+                // `RETURNING OLD` answered 0/0 for 1/7 and `SET B = B+1`
+                // read a neighbouring field's bytes. Worse: the patch
+                // was laid over the UPGRADED image while `targets` and
+                // the write went their own way, and the committed row
+                // came back (NULL, NULL). A silent loss of committed
+                // data is the worst thing this server can do, and it
+                // took one stale ALTER to reach it. One upgrade, at the
+                // top, and every reader below sees the row in the format
+                // its offsets were resolved in - which is what
+                // [Plan::Delete] and [collect_dml_targets] already did.
+                let upgraded: Vec<u8> = if fmt != *format_no {
                     let old = formats
                         .iter()
                         .find(|(n, _)| *n == fmt)
@@ -30917,8 +30966,9 @@ fn execute_dml_collecting_inner(
                     upgrade_image(&image, old, descs, db, *rel, *format_no)
                         .ok_or("a matching record is in an older format")?
                 } else {
-                    image.clone()
+                    image
                 };
+                let mut img = upgraded.clone();
                 for (fid, bytes, lit_st) in &blob_lits {
                     let d = descs.get(*fid).ok_or("field beyond format")?;
                     let id = store_blob_literal(db, &mut work, *rel, d, bytes, *lit_st)?;
@@ -31002,7 +31052,7 @@ fn execute_dml_collecting_inner(
                 // N it replaces, and two assignments in one SET list
                 // both see the old row (SQL's simultaneous assignment)
                 if !expr_sets.is_empty() {
-                    let old_values = decode_record(&image, descs);
+                    let old_values = decode_record(&upgraded, descs);
                     for (fid, e) in &expr_sets {
                         let d = descs.get(*fid).ok_or("field beyond format")?;
                         // THE SET LIST RAISES WHAT THE WHERE RAISES. A
@@ -31124,7 +31174,7 @@ fn execute_dml_collecting_inner(
                 // (OLD) beside it, before any validation. What the body
                 // assigns to `NEW.<col>` is what gets written.
                 if !triggers.is_empty() {
-                    let old_row = decode_record(&image, descs);
+                    let old_row = decode_record(&upgraded, descs);
                     let before_row = decode_record(&img, descs);
                     let mut new_row = before_row.clone();
                     if triggers.iter().any(|t| t.needs_db) {
@@ -31182,7 +31232,7 @@ fn execute_dml_collecting_inner(
                 // and a changed key of THIS row must not strand
                 // children pointing at the old value
                 if !fk_refs.is_empty() || !fk_children.is_empty() {
-                    let old_values = decode_record(&image, descs);
+                    let old_values = decode_record(&upgraded, descs);
                     let new_values = decode_record(&img, descs);
                     fk_check_child_row(db, fk_refs, &new_values).map_err(ExecErr::Eval)?;
                     fk_check_parent_row(db, fk_children, &old_values, Some(&new_values))
@@ -31195,7 +31245,7 @@ fn execute_dml_collecting_inner(
                 {
                     img.truncate(fmt_len);
                 }
-                old_images.push(image);
+                old_images.push(upgraded);
                 // the PATCHED row is what RETURNING gives back for an
                 // UPDATE (probed: the values AFTER the update)
                 if let Some(a) = affected.as_deref_mut() {
@@ -79027,6 +79077,21 @@ fn after_auth(
                             } else {
                                 inline_singleton_blobs(&mut w, database.as_ref(), &values, inline_sizes.get(&cur_stmt).copied());
                                 w.int(OP_SQL_RESPONSE).int(1);
+                                // NOTE: a source audit predicted that this
+                                // needs `out_fmt.as_ref()` like the
+                                // INSERT ... RETURNING singleton below, and
+                                // that passing None here desynchronises the
+                                // connection for an output parameter whose
+                                // charset differs from the attachment's.
+                                // MEASURED, and it does not: EXECUTE
+                                // PROCEDURE over CHAR(3) UTF8 and CHAR(5)
+                                // WIN1252 answers identically to the engine
+                                // under -ch UTF8, WIN1252 and NONE, with or
+                                // without the format. Left as it is rather
+                                // than changed on a reading alone - an
+                                // unmeasured edit to an emit path is exactly
+                                // the risk this project's own law warns
+                                // about.
                                 encode_row_body(&mut w, &pcols, &values, None).ok();
                             }
                             w.int(OP_RESPONSE)
@@ -79067,6 +79132,21 @@ fn after_auth(
                             } else {
                                 inline_singleton_blobs(&mut w, database.as_ref(), &values, inline_sizes.get(&cur_stmt).copied());
                                 w.int(OP_SQL_RESPONSE).int(1);
+                                // NOTE: a source audit predicted that this
+                                // needs `out_fmt.as_ref()` like the
+                                // INSERT ... RETURNING singleton below, and
+                                // that passing None here desynchronises the
+                                // connection for an output parameter whose
+                                // charset differs from the attachment's.
+                                // MEASURED, and it does not: EXECUTE
+                                // PROCEDURE over CHAR(3) UTF8 and CHAR(5)
+                                // WIN1252 answers identically to the engine
+                                // under -ch UTF8, WIN1252 and NONE, with or
+                                // without the format. Left as it is rather
+                                // than changed on a reading alone - an
+                                // unmeasured edit to an emit path is exactly
+                                // the risk this project's own law warns
+                                // about.
                                 encode_row_body(&mut w, &pcols, &values, None).ok();
                             }
                             // the op_response that closes the execute
