@@ -13546,6 +13546,49 @@ fn respond_malformed_statement(
     w.send(s, enc)
 }
 
+/// Is this statement text deep enough to threaten the planner's
+/// recursion?
+///
+/// Planning is recursive descent over a parsed expression, so a long
+/// chain of binary operators or deep parenthesis nesting costs stack in
+/// proportion to its length. Past a point that overflowed the thread
+/// stack, and a Rust stack overflow ABORTS THE PROCESS - one client
+/// statement took the whole server down and left every other connection
+/// hanging. A refusal is a boundary; a crash is not survivable, so this
+/// fails closed WELL BEFORE the depth that actually overflows (measured:
+/// 800 operands fine, 1000 fatal on a 2 MiB stack; connection threads now
+/// get 16 MiB, and this bound sits under what that comfortably survives).
+///
+/// The engine answers these shapes - it handles 2000 operands - so this
+/// is a recorded boundary rather than a match. It is deliberately far
+/// above anything a person writes: the deepest expression in this
+/// project's own gates is nowhere near it.
+fn stmt_too_deep(sql: &str) -> bool {
+    const MAX_OPS: usize = 2500;
+    const MAX_PAREN: i32 = 400;
+    let b = mask_literals(&sql.to_ascii_uppercase());
+    let bytes = b.as_bytes();
+    let (mut depth, mut max_depth, mut ops) = (0i32, 0i32, 0usize);
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => {
+                depth += 1;
+                max_depth = max_depth.max(depth);
+            }
+            b')' => depth -= 1,
+            b'|' if bytes.get(i + 1) == Some(&b'|') => {
+                ops += 1;
+                i += 1;
+            }
+            b'+' | b'-' | b'*' | b'/' => ops += 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    ops > MAX_OPS || max_depth > MAX_PAREN
+}
+
 fn stmt_text_malformed(bytes: &[u8], att_id: u8) -> bool {
     use fire_crab_ods::intl;
     if bytes.is_ascii() || intl::byte_carrier(att_id) || intl::tabled(att_id) {
@@ -75333,6 +75376,25 @@ fn after_auth(
                 CURRENT_ATT_CS.with(|c| c.set(att_cs.id));
                 CURRENT_SQL.with(|c| *c.borrow_mut() = stmt_text_decode(&sql, att_cs.id));
                 let text = entry_strip_comments(&stmt_text_decode(&sql, att_cs.id));
+                // THE SAME TWO GUARDS THE PREPARE PATH APPLIES. These
+                // are properties of the STATEMENT TEXT, so every entry
+                // point that accepts text owes them: a deep expression
+                // aborts the PROCESS wherever it is planned
+                // ([stmt_too_deep]), and bytes that are not a string in
+                // the attachment's charset are refused by the engine
+                // whichever call carries them ([stmt_text_malformed]).
+                // isql prepares everything, so only a client using
+                // isc_dsql_execute_immediate - a common driver path for
+                // DDL - reaches here; that is precisely why it was
+                // missed.
+                if stmt_too_deep(&text) {
+                    respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
+                    continue;
+                }
+                if stmt_text_malformed(&sql, att_cs.id) {
+                    respond_malformed_statement(&mut s, &mut enc)?;
+                    continue;
+                }
                 // kicked by a forced shutdown: the engine's vector, no work
                 if database.as_ref().is_some_and(|d| d.kicked()) {
                     respond_kicked(&mut s, &mut enc)?;
@@ -75476,6 +75538,25 @@ fn after_auth(
                 }
                 CURRENT_ATT_CS.with(|c| c.set(att_cs.id));
                 let text = entry_strip_comments(&stmt_text_decode(&sql, att_cs.id));
+                // THE SAME TWO GUARDS THE PREPARE PATH APPLIES. These
+                // are properties of the STATEMENT TEXT, so every entry
+                // point that accepts text owes them: a deep expression
+                // aborts the PROCESS wherever it is planned
+                // ([stmt_too_deep]), and bytes that are not a string in
+                // the attachment's charset are refused by the engine
+                // whichever call carries them ([stmt_text_malformed]).
+                // isql prepares everything, so only a client using
+                // isc_dsql_execute_immediate - a common driver path for
+                // DDL - reaches here; that is precisely why it was
+                // missed.
+                if stmt_too_deep(&text) {
+                    respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
+                    continue;
+                }
+                if stmt_text_malformed(&sql, att_cs.id) {
+                    respond_malformed_statement(&mut s, &mut enc)?;
+                    continue;
+                }
                 // kicked by a forced shutdown: the engine's vector, no work
                 if database.as_ref().is_some_and(|d| d.kicked()) {
                     respond_kicked(&mut s, &mut enc)?;
@@ -75597,6 +75678,15 @@ fn after_auth(
                 bound_args.clear();
                 // ...and so does a statement whose BYTES are not a string
                 // in the attachment's charset (see [stmt_text_malformed])
+                // ...and a statement deep enough to overflow the
+                // planner's recursion refuses rather than aborting the
+                // PROCESS (see [stmt_too_deep])
+                if stmt_too_deep(&stmt_sql) {
+                    plan = std::rc::Rc::new(Plan::Refused);
+                    stmt_params = std::rc::Rc::new(Vec::new());
+                    respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
+                    continue;
+                }
                 if stmt_text_malformed(&sql, att_cs.id) {
                     plan = std::rc::Rc::new(Plan::Refused);
                     stmt_params = std::rc::Rc::new(Vec::new());
@@ -80513,9 +80603,21 @@ pub fn serve(addr: &str, user: &str, password: &str) -> std::io::Result<()> {
                 // one thread per connection so clients that reconnect in
                 // quick succession are not serialized behind each other
                 let (u, p) = (user.to_string(), password.to_string());
-                std::thread::spawn(move || {
-                    let _ = handle(s, &u, &p);
-                });
+                // A BIGGER STACK THAN THE 2 MiB DEFAULT. Planning walks a
+                // parsed expression recursively, and a chain of ~1000
+                // binary operators overflowed a default thread stack -
+                // which in Rust ABORTS THE WHOLE PROCESS, taking every
+                // other connection down with it (measured: one client
+                // sending `SELECT 'a'||'a'||...` 1000 times killed the
+                // server and left an idle second connection hanging).
+                // The stack raises the ceiling; [stmt_too_deep] is what
+                // makes the crash unreachable, because no stack size
+                // makes unbounded recursion safe.
+                let _ = std::thread::Builder::new()
+                    .stack_size(16 * 1024 * 1024)
+                    .spawn(move || {
+                        let _ = handle(s, &u, &p);
+                    });
             }
             Err(e) => eprintln!("accept error: {}", e),
         }
