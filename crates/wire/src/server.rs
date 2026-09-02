@@ -7527,59 +7527,62 @@ impl RowSource {
                 // both sides of the inner stream are built at most ONCE,
                 // lazily: a per-row materialisation would make one
                 // unbuildable key cost a full scan for every outer row
-                let mut whole: Option<Vec<Vec<Value>>> = None;
                 let mut fallback: Option<Vec<Vec<Value>>> = None;
                 let mut key_hash: Option<KeyHash> = None;
                 let mut scan_buf: Vec<Vec<Value>> = Vec::new();
                 left.for_each(db, &mut |row| {
-                    let paired = match part.probe.as_ref() {
-                        None => {
-                            if whole.is_none() {
-                                whole = Some(right.rows(db)?);
+                    let paired = match part.probe.as_ref().map(|p| (p, p.band(db, &row, &part.keys))) {
+                        Some((probe, Band::Index(access))) => {
+                            // the band reads the BASE relation; a
+                            // FLATTENED side's row is its select list
+                            // read out of that record, never the record
+                            // at the side's own positions
+                            let rrows: Vec<Vec<Value>> = RowSource::IndexScan {
+                                rel: probe.src.rel,
+                                formats: probe.src.formats.clone(),
+                                access,
+                                width: probe.fetch_width(part.width),
                             }
-                            let r = whole.as_deref().unwrap_or(&[]);
-                            join_step(vec![row], *left_width, r, part, above)?
+                            .rows(db)?
+                            .into_iter()
+                            .map(|r| probe.base_as_side(r, part.width))
+                            .collect();
+                            join_step(vec![row], *left_width, &rrows, part, above)?
                         }
-                        Some(probe) => match probe.band(db, &row) {
-                            Band::Index(access) => {
-                                let rrows = RowSource::IndexScan {
-                                    rel: probe.src.rel,
-                                    formats: probe.src.formats.clone(),
-                                    access,
-                                    width: Some(part.width),
+                        Some((_, Band::Nothing)) => {
+                            join_step(vec![row], *left_width, &[], part, above)?
+                        }
+                        // NO INDEX on the inner key - or NO BASE RECORD to
+                        // index at all, which is a derived table or view
+                        // the flatten refused. Either way, rather than walk
+                        // the whole inner PER DRIVER (O(N x M), what the
+                        // engine avoids with a HASH), group it ONCE by the
+                        // key and look up the driver's bucket - O(N + M).
+                        // The keys are the SIDE's own output columns, so a
+                        // materialised side hashes exactly like a scanned
+                        // one; the bucket holds the same rows in the same
+                        // order the scan would have kept, so nothing moves.
+                        // A key the hash cannot serve (a non-integer, an
+                        // OR) - or no key at all - leaves `key_hash` None
+                        // and the whole side is read once and scanned, as
+                        // before, with the ON deciding either way.
+                        None | Some((_, Band::Scan)) => {
+                            if fallback.is_none() && key_hash.is_none() {
+                                key_hash = build_join_key_hash(right, db, &part.keys)?;
+                                if key_hash.is_none() {
+                                    fallback = Some(right.rows(db)?);
                                 }
-                                .rows(db)?;
-                                join_step(vec![row], *left_width, &rrows, part, above)?
                             }
-                            Band::Nothing => {
-                                join_step(vec![row], *left_width, &[], part, above)?
-                            }
-                            // NO INDEX on the inner key. Rather than walk the
-                            // whole inner PER DRIVER (O(N x M), what the engine
-                            // avoids with a HASH), group it ONCE by the key and
-                            // look up the driver's bucket - O(N + M). The bucket
-                            // holds the same rows in the same order the scan
-                            // would have kept, so nothing moves; a key the hash
-                            // cannot serve (a non-integer, an OR) scans, as
-                            // before, and the ON decides either way.
-                            Band::Scan => {
-                                if fallback.is_none() && key_hash.is_none() {
-                                    key_hash = build_join_key_hash(right, db, probe)?;
-                                    if key_hash.is_none() {
-                                        fallback = Some(right.rows(db)?);
-                                    }
-                                }
-                                let inner = fallback.as_deref().unwrap_or(&[]);
-                                let matched = join_scan_rows(
-                                    &row,
-                                    probe,
-                                    inner,
-                                    key_hash.as_ref(),
-                                    &mut scan_buf,
-                                );
-                                join_step(vec![row], *left_width, matched, part, above)?
-                            }
-                        },
+                            let inner = fallback.as_deref().unwrap_or(&[]);
+                            let matched = join_scan_rows(
+                                &row,
+                                &part.keys,
+                                inner,
+                                key_hash.as_ref(),
+                                &mut scan_buf,
+                            );
+                            join_step(vec![row], *left_width, matched, part, above)?
+                        }
                     };
                     for out_row in paired {
                         if matches!(sink(out_row)?, Flow::Stop) {
@@ -7609,7 +7612,7 @@ impl RowSource {
                     && part.probe.as_ref().map_or(true, |p| p.index.is_none()) =>
             {
                 let rrows = right.rows(db)?;
-                let rhash = part.probe.as_ref().and_then(|p| index_hash(&rrows, p));
+                let rhash = index_hash(&rrows, &part.keys);
                 let mut cand: Vec<usize> = Vec::new();
                 let mut right_matched = vec![false; rrows.len()];
                 let lgate = side_filter(above, 0..*left_width);
@@ -7626,7 +7629,7 @@ impl RowSource {
                 let mut stopped = false;
                 let flow = left.for_each(db, &mut |l| {
                     let mut matched = false;
-                    for &ri in mirror_candidates(rhash.as_ref(), part.probe.as_ref(), &l, rrows.len(), &mut cand) {
+                    for &ri in mirror_candidates(rhash.as_ref(), &part.keys, &l, rrows.len(), &mut cand) {
                         let r = &rrows[ri];
                         let mut row = l.clone();
                         row.extend(r.iter().cloned());
@@ -7792,14 +7795,13 @@ impl RowSource {
             RowSource::Rows(rows) => Ok(rows.clone()),
             RowSource::NestedLoopJoin { left, left_width, right, part, above } => {
                 let l = left.rows(db)?;
-                // a RIGHT/FULL part's probe is the KEY alone (for the
-                // mirror's hash inside join_step), never a per-driver read
-                let Some(probe) =
-                    part.probe.as_ref().filter(|_| matches!(part.kind, JoinKind::Left | JoinKind::Inner))
-                else {
+                // a RIGHT/FULL part is handed its WHOLE side - its mirror
+                // needs every row, and join_step hashes it there
+                if !matches!(part.kind, JoinKind::Left | JoinKind::Inner) {
                     let r = right.rows(db)?;
                     return join_step(l, *left_width, &r, part, above);
-                };
+                }
+                let probe = part.probe.as_ref();
                 // ONE BAND PER OUTER ROW, and [join_step] called with a
                 // ONE-ROW accumulated side so the padded row, the
                 // partnerless ON evaluation and the row order stay
@@ -7812,32 +7814,39 @@ impl RowSource {
                 let mut scan_buf: Vec<Vec<Value>> = Vec::new();
                 let mut out = Vec::new();
                 for row in l {
-                    match probe.band(db, &row) {
-                        Band::Index(access) => {
+                    match probe.map(|p| (p, p.band(db, &row, &part.keys))) {
+                        Some((probe, Band::Index(access))) => {
                             // through IndexScan rather than records_for
                             // directly: the width resize the scanned
                             // side applies is applied here too, from
-                            // one place
-                            let rrows = RowSource::IndexScan {
+                            // one place. A FLATTENED side reads the WHOLE
+                            // base record and maps it onto its own select
+                            // list ([JoinProbe::base_as_side]).
+                            let rrows: Vec<Vec<Value>> = RowSource::IndexScan {
                                 rel: probe.src.rel,
                                 formats: probe.src.formats.clone(),
                                 access,
-                                width: Some(part.width),
+                                width: probe.fetch_width(part.width),
                             }
-                            .rows(db)?;
+                            .rows(db)?
+                            .into_iter()
+                            .map(|r| probe.base_as_side(r, part.width))
+                            .collect();
                             out.extend(join_step(vec![row], *left_width, &rrows, part, above)?);
                         }
-                        Band::Nothing => {
+                        Some((_, Band::Nothing)) => {
                             out.extend(join_step(vec![row], *left_width, &[], part, above)?);
                         }
-                        Band::Scan => {
-                            // ONCE per join node, lazily, and GROUPED BY KEY
-                            // so a driver reads its bucket, not the whole
-                            // inner - the same O(N + M) hash the streaming arm
-                            // uses (a non-integer key or an OR scans, the ON
-                            // deciding either way).
+                        // no index, or NO BASE RECORD at all (a
+                        // materialised derived table or view): ONCE per
+                        // join node, lazily, and GROUPED BY THE SIDE'S OWN
+                        // KEY COLUMN so a driver reads its bucket, not the
+                        // whole inner - the same O(N + M) hash the
+                        // streaming arm uses (a non-integer key, an OR or
+                        // no key at all scans, the ON deciding either way).
+                        None | Some((_, Band::Scan)) => {
                             if fallback.is_none() && key_hash.is_none() {
-                                key_hash = build_join_key_hash(right, db, probe)?;
+                                key_hash = build_join_key_hash(right, db, &part.keys)?;
                                 if key_hash.is_none() {
                                     fallback = Some(right.rows(db)?);
                                 }
@@ -7845,7 +7854,7 @@ impl RowSource {
                             let inner = fallback.as_deref().unwrap_or(&[]);
                             let matched = join_scan_rows(
                                 &row,
-                                probe,
+                                &part.keys,
                                 inner,
                                 key_hash.as_ref(),
                                 &mut scan_buf,
@@ -9197,9 +9206,17 @@ struct JoinPart {
     src: RowSource,
     width: usize,
     on: Predicate,
-    /// the inner side's INDEX PROBE, when the optimizer blessed one -
-    /// see [JoinProbe]. None is today's materialised scan of `src`.
+    /// the inner side's BASE-RECORD probe, when it has one and the
+    /// optimizer blessed an index for it - see [JoinProbe]. `None` for a
+    /// MATERIALISED side (a derived table or view the flatten refused),
+    /// which is read from its plan and never as records.
     probe: Option<JoinProbe>,
+    /// the ON's boundary equality per DNF branch, BY THIS SIDE'S OWN
+    /// OUTPUT COLUMN ([ProbeKey]) - empty when the ON has none this
+    /// executor can serve. Independent of `probe`: hashing a side needs
+    /// only its own rows, so a materialised side is hashed O(N + M)
+    /// where it used to be scanned once per driver row.
+    keys: Vec<ProbeKey>,
 }
 
 /// What a plain-relation join side would need to be probed by record
@@ -9218,17 +9235,31 @@ struct ProbeSrc {
 /// plain projection of a single table, no WHERE/DISTINCT/aggregate/join,
 /// so its rows ARE the table's and an index on it can be keyed. Carries
 /// everything a probe of the BASE table needs (its [ProbeSrc], its own
-/// descriptors and columns, laid out by base field id), plus a map from
-/// each of the side's OUTPUT columns to the base field id it projects -
-/// `None` for an output that is not a plain base column (an expression, a
-/// literal), which cannot be keyed. A side with a filter or transform is
-/// NOT flattenable and keeps its materialised plan.
+/// descriptors and columns, laid out by base field id), plus `out_map`.
+///
+/// `out_map` IS THE FLATTEN. A derived table and a view are row sources
+/// whose columns are their OWN select list, so a side's output column i
+/// is `out_map[i]` OF THE BASE RECORD - a rename, a reordering, a subset
+/// or a repeat all move it, and only a list that is the base's columns in
+/// base order leaves it the identity. Reading the base record BY OUTPUT
+/// POSITION instead (what this map replaces) answered `J1.A` for a
+/// `(SELECT ID, G AS S FROM J1) d`'s `d.S` - measured wrong against the
+/// engine on the read, the ON, the GROUP BY and, through a joined row
+/// source under DML, on the WRITE.
+///
+/// The map is TOTAL by construction: an output column that is NOT a plain
+/// base field (an expression, a literal, a computed column, a subquery)
+/// makes [build_flatten] answer `None` and the side keeps its
+/// MATERIALISED derived plan - the slower path that is already correct.
+/// A flatten that guessed such a column would be a wrong answer, and a
+/// flatten that read it from the wrong place is exactly the defect.
 #[derive(Clone)]
 struct FlatSrc {
     src: ProbeSrc,
     descs: Vec<Descriptor>,
     columns: Vec<RelationColumn>,
-    base_fid: Vec<Option<usize>>,
+    /// per OUTPUT column of the side, the BASE field id it projects
+    out_map: Vec<usize>,
 }
 
 /// The index probe for a LEFT join's inner side: everything the
@@ -9243,34 +9274,52 @@ struct FlatSrc {
 /// where it does pick JOIN it swaps the driver to the side this
 /// executor loops as the outer, so they stay a materialised scan.
 ///
-/// `keys` carries one boundary equality per DNF branch of the ON: a
-/// plain `PAR.K = CHI.K` is one key, an `OR` is one per branch, and the
-/// per-outer-row band is their UNION (deduplicated on acceptance by
-/// `records_for_2pc`, which already handles a row named by two branches).
-/// Every branch must be servable - a single one that is not declines the
-/// whole probe to a scan, because a PARTIAL union is a missing set of
-/// rows.
+/// THIS IS ONLY THE BASE-RECORD HALF of what a step can do with its
+/// inner side. The other half - the ON's equi-keys - lives on
+/// [JoinPart::keys], because it needs nothing but the side's own rows
+/// and is therefore available to a side that has NO base record to read
+/// (see [JoinAccess]). The band itself is built per DNF branch of the ON
+/// and the per-outer-row answer is their UNION (deduplicated on
+/// acceptance by `records_for_2pc`, which already handles a row named by
+/// two branches); every branch must be servable, since a PARTIAL union
+/// is a missing set of rows.
 #[derive(Clone)]
 struct JoinProbe {
     src: ProbeSrc,
     descs: Vec<Descriptor>,
-    keys: Vec<ProbeKey>,
     /// the index the gatekeeper blessed for the FIRST branch `(id, column)`,
     /// for the trace only - the real bands are rebuilt per outer row. `None`
-    /// when NO branch has an index: the keys are still carried, but the inner
-    /// is HASHED by them per [build_join_key_hash] rather than index-probed.
+    /// when NO branch has an index: the side is then HASHED by
+    /// [JoinPart::keys] per [build_join_key_hash] rather than index-probed.
     index: Option<(u8, String)>,
+    /// [FlatSrc::out_map] when this side is a FLATTENED view or derived
+    /// table: the band reads BASE records, and this is what turns one into
+    /// the SIDE's row - output column i is base field `out_map[i]`. `None`
+    /// for a plain relation, whose output IS the base record.
+    out_map: Option<Vec<usize>>,
 }
 
-/// One boundary equality of the ON. `outer` is the driver-side,
-/// evaluated against the COMBINED accumulated row per driving row - a
-/// plain `Expr::Col` in the common case, an expression like `A.K + 0` or
-/// a constant like the `0` in `PAR.K = CHI.K OR PAR.K = 0`. `inner_fid`
-/// is this side's OWN field id, because the band is built against the
-/// relation, not the combined row.
+/// One boundary equality of the ON, BY THE SIDE'S OWN OUTPUT COLUMN.
+/// `outer` is the driver-side, evaluated against the COMBINED
+/// accumulated row per driving row - a plain `Expr::Col` in the common
+/// case, an expression like `A.K + 0`, or a constant like the `0` in
+/// `PAR.K = CHI.K OR PAR.K = 0`.
+///
+/// ONE NUMBER, ONE MEANING. `out_pos` is the SIDE's output column, which
+/// is what the side's OWN rows are indexed by ([build_join_key_hash],
+/// [IndexHashBuilder], the mirror's [index_hash]) - and it needs nothing
+/// but those rows, which is why a MATERIALISED derived table or view has
+/// a key too and is HASHED rather than scanned once per driver row. An
+/// INDEX band is built against the BASE RELATION instead, so
+/// [JoinProbe::band] translates the output column through
+/// [JoinProbe::out_map] at the one place that wants the base's
+/// numbering. Carrying BOTH numbers in the key is how a base field id
+/// came to read a derived row in the first place (measured: `VIEW VR (S,
+/// ID) AS SELECT G, ID FROM J1` joined `ON v.ID = t.ID` hashed the view
+/// rows by their `S`).
 #[derive(Clone)]
 struct ProbeKey {
-    inner_fid: usize,
+    out_pos: usize,
     outer: Expr,
 }
 
@@ -9290,12 +9339,38 @@ enum Band {
 }
 
 impl JoinProbe {
-    /// The band this outer row names on the inner side.
-    fn band(&self, db: &Database, row: &[Value]) -> Band {
+    /// The width an index fetch of the BASE relation must keep before
+    /// [Self::base_as_side] maps it: the whole decoded record for a
+    /// FLATTENED side (its columns are read out of it by base field id,
+    /// which a resize to the side's narrower width would have cut off),
+    /// and the side's own width for a plain relation, whose output IS the
+    /// base record and whose fetch has always been resized here.
+    fn fetch_width(&self, side_width: usize) -> Option<usize> {
+        self.out_map.is_none().then_some(side_width)
+    }
+
+    /// One BASE record as this SIDE's row. A plain relation's record
+    /// already is one (resized by [Self::fetch_width]); a FLATTENED view
+    /// or derived side's row is its select list read out of the record -
+    /// output column i from base field `out_map[i]`, which is the whole
+    /// of what the flatten was missing. A base field the record does not
+    /// carry (an older format, a field past its end) reads NULL, exactly
+    /// as the materialised projection's own decode leaves it.
+    fn base_as_side(&self, row: Vec<Value>, side_width: usize) -> Vec<Value> {
+        let Some(map) = &self.out_map else { return row };
+        let mut out: Vec<Value> =
+            map.iter().map(|&f| row.get(f).cloned().unwrap_or(Value::Null)).collect();
+        out.resize(side_width, Value::Null);
+        out
+    }
+
+    /// The band this outer row names on the inner side, from the step's
+    /// own [JoinPart::keys].
+    fn band(&self, db: &Database, row: &[Value], keys: &[ProbeKey]) -> Band {
         // NO branch has an index: the inner is hashed by the keys instead of
         // probed, so every row scans (the hash intercepts the Scan) - and
         // asking the gatekeeper per row would just re-derive that.
-        if self.index.is_none() {
+        if self.index.is_none() || keys.is_empty() {
             return Band::Scan;
         }
         // one band per ON branch; the answer is their UNION. A branch
@@ -9303,8 +9378,8 @@ impl JoinProbe {
         // for every inner row) and simply drops out of the union; a
         // branch the key builder cannot serve declines the WHOLE probe to
         // a scan, because a partial union would be a missing set of rows.
-        let mut picks = Vec::with_capacity(self.keys.len());
-        for key in &self.keys {
+        let mut picks = Vec::with_capacity(keys.len());
+        for key in keys {
             // the outer key is the driver-side expression over the
             // accumulated row - a plain column in the common case, `A.K
             // + 0` and its like when the ON writes one. An evaluation
@@ -9328,6 +9403,19 @@ impl JoinProbe {
                 },
                 _ => return Band::Scan,
             };
+            // THE BAND IS BUILT AGAINST THE BASE RELATION, so the key's
+            // OUTPUT column is translated to the base's field id here -
+            // the one place in the executor that wants the base's
+            // numbering, and the reason [ProbeKey] no longer carries it
+            // ([JoinProbe::out_map] is the same map the rows are read
+            // through).
+            let inner_fid = match &self.out_map {
+                Some(m) => match m.get(key.out_pos) {
+                    Some(f) => *f,
+                    None => return Band::Scan,
+                },
+                None => key.out_pos,
+            };
             // REUSED VERBATIM, not re-implemented: every guard in it
             // (ascending only, keyable itypes only, scale 0, i64::MIN
             // refused) is a measured missed row, and a second key encoder
@@ -9337,7 +9425,7 @@ impl JoinProbe {
                 self.src.rel,
                 &self.src.table,
                 &self.descs,
-                &[Term::Cmp(key.inner_fid, Cmp::Eq, rhs)],
+                &[Term::Cmp(inner_fid, Cmp::Eq, rhs)],
                 &[],
             ) {
                 Some(p) => picks.push(p),
@@ -9534,9 +9622,11 @@ struct KeyHash {
 /// dropped: it never matches, which is the equi-join answer, not a lost row.
 /// [build_join_key_hash] over rows already in hand (the join cursor's
 /// materialised inner): the same store, the same buckets.
-fn build_join_key_hash_from_rows(rows: &[Vec<Value>], probe: &JoinProbe) -> Option<KeyHash> {
-    let [key] = probe.keys.as_slice() else { return None };
-    let fid = key.inner_fid;
+fn build_join_key_hash_from_rows(rows: &[Vec<Value>], keys: &[ProbeKey]) -> Option<KeyHash> {
+    let [key] = keys else { return None };
+    // the rows are the SIDE's, so the key is its OUTPUT column - the
+    // only number a [ProbeKey] carries
+    let fid = key.out_pos;
     let mut buckets: std::collections::HashMap<JoinKey, Vec<u64>> = std::collections::HashMap::new();
     let mut store = crate::extsort::RowStore::new();
     let mut kind: Option<KeyKind> = None;
@@ -9559,9 +9649,12 @@ fn build_join_key_hash_from_rows(rows: &[Vec<Value>], probe: &JoinProbe) -> Opti
     Some(KeyHash { kind: kind.unwrap_or(KeyKind::Int), buckets, store })
 }
 
-fn build_join_key_hash(right: &RowSource, db: &Database, probe: &JoinProbe) -> Result<Option<KeyHash>, EvalErr> {
-    let [key] = probe.keys.as_slice() else { return Ok(None) };
-    let fid = key.inner_fid;
+fn build_join_key_hash(right: &RowSource, db: &Database, keys: &[ProbeKey]) -> Result<Option<KeyHash>, EvalErr> {
+    let [key] = keys else { return Ok(None) };
+    // `right` yields the SIDE's rows - a derived side's are its select
+    // list's, materialised from its own plan - so the key is its OUTPUT
+    // column, and nothing about the base is needed to hash them
+    let fid = key.out_pos;
     let mut buckets: std::collections::HashMap<JoinKey, Vec<u64>> =
         std::collections::HashMap::new();
     let mut store = crate::extsort::RowStore::new();
@@ -9623,12 +9716,12 @@ fn build_join_key_hash(right: &RowSource, db: &Database, probe: &JoinProbe) -> R
 /// gathered rows and is reused across drivers.
 fn join_scan_rows<'a>(
     driver: &[Value],
-    probe: &JoinProbe,
+    keys: &[ProbeKey],
     inner: &'a [Vec<Value>],
     hash: Option<&KeyHash>,
     buf: &'a mut Vec<Vec<Value>>,
 ) -> &'a [Vec<Value>] {
-    let (Some(h), [key]) = (hash, probe.keys.as_slice()) else {
+    let (Some(h), [key]) = (hash, keys) else {
         return inner;
     };
     match key.outer.eval(driver) {
@@ -34347,6 +34440,16 @@ struct JoinSide {
     /// `descs`: one name for a whole table or view side, per-column for
     /// a derived or bound side (whose inner query names its own)
     rels: Vec<Option<String>>,
+    /// per OUTPUT column, the BASE FIELD ID it reads in `rels`'s table -
+    /// `None` where the column has none (an expression) or where the
+    /// side's shape cannot name one ([side_base_fids]).
+    ///
+    /// AN OUTPUT POSITION IS NOT A BASE FIELD ID. For a plain table side
+    /// the two coincide, which is why one number served for both; for a
+    /// derived table, a view or a CTE they are exactly the two orders
+    /// [FlatSrc::out_map] keeps apart on the VALUES, and the DESCRIBE's
+    /// NOT NULL marking ([mark_not_null_join]) needs the same map.
+    base_fids: Vec<Option<usize>>,
     /// the FIELD NAME (describe item 16) each column carries out of a
     /// derived/bound side - the inner item's symbol, which the engine
     /// lets shine through a rename (probed: `(SELECT X AS C FROM T) D`
@@ -35101,9 +35204,17 @@ fn mark_hash_keys(on: &mut Predicate, offset: usize, part_width: usize) {
 /// order, generator or window, each of which is a transform the flatten
 /// keeps but a base-table probe would silently drop. The base relation,
 /// its formats and (for the plain path's own reasons) the base column
-/// names come straight off the `Plan::Project`; `base_fid` maps each
-/// output column to the base field id it projects, `None` where the
-/// output is an expression rather than a plain column.
+/// names come straight off the `Plan::Project`; [FlatSrc::out_map] maps
+/// each output column to the base field id it projects.
+///
+/// THE MAP MUST BE TOTAL. The side's rows are read out of the base record
+/// through it, so an output column that is not a plain base field - an
+/// expression, a literal, a COMPUTED column (which the projection also
+/// carries as an expression), a scalar subquery - has nothing to read and
+/// REFUSES THE WHOLE FLATTEN: the side keeps its materialised derived
+/// plan, which evaluates that column where the evaluator's per-statement
+/// state (blob context, user-function values, subquery lookups) actually
+/// lives. A correct slower answer, never a guessed column.
 fn build_flatten(db: &Database, inner: &Plan) -> Option<FlatSrc> {
     let Plan::Project {
         rel,
@@ -35148,10 +35259,20 @@ fn build_flatten(db: &Database, inner: &Plan) -> Option<FlatSrc> {
     if descs.is_empty() {
         return None;
     }
-    let base_fid = cols
-        .iter()
-        .map(|c| c.expr.is_none().then_some(c.field_id))
-        .collect();
+    // the TOTAL output -> base map, or no flatten at all: one expression
+    // column and the side goes back to its materialised plan
+    let mut out_map: Vec<usize> = Vec::with_capacity(cols.len());
+    for c in cols {
+        if c.expr.is_some() {
+            return None;
+        }
+        // a field the newest format does not describe cannot be read back
+        // out of a decoded record by id
+        if c.field_id >= descs.len() {
+            return None;
+        }
+        out_map.push(c.field_id);
+    }
     Some(FlatSrc {
         src: ProbeSrc {
             rel: *rel,
@@ -35160,17 +35281,46 @@ fn build_flatten(db: &Database, inner: &Plan) -> Option<FlatSrc> {
         },
         descs,
         columns: db.columns(&table).as_ref().clone(),
-        base_fid,
+        out_map,
     })
 }
 
-fn build_join_probe(
+/// What one join step can do with its inner side, in TWO INDEPENDENT
+/// halves.
+///
+/// `keys` is the ON's boundary equality per DNF branch, BY THE SIDE'S
+/// OWN OUTPUT COLUMN ([ProbeKey]). Hashing a side needs nothing but the
+/// side's own rows, so EVERY side with a servable equi-key gets one: a
+/// plain table, a FLATTENED view or derived table, and equally a derived
+/// table or view the flatten REFUSED, whose rows come from a
+/// materialised plan.
+///
+/// `probe` is the other half: the BASE RELATION this side's rows can be
+/// read out of, which only a plain table or a flattened (mapped) view or
+/// derived side has - and what an INDEX band is built against.
+///
+/// SEPARATING THEM IS THE POINT. While they were one, refusing the
+/// flatten (which one expression column does, and must - the map has to
+/// be total) dropped the keys with it, and the step fell all the way to
+/// a per-driver-row scan of the whole side: measured 5000x5000, a
+/// derived side carrying one literal column went 0.42 s -> 3.53 s,
+/// quadratic in the row count, where the correct O(N + M) hash needs no
+/// base mapping at all - the rows it groups are the side's own.
+struct JoinAccess {
+    keys: Vec<ProbeKey>,
+    probe: Option<JoinProbe>,
+}
+
+fn build_join_access(
     db: &Database,
     kind: JoinKind,
     on: &Predicate,
     side: &JoinSide,
     outer_descs: &[Descriptor],
-) -> Option<JoinProbe> {
+) -> JoinAccess {
+    // no servable key on some branch means no hash and no band: the ON
+    // decides over the whole side, which is what a theta join is
+    let none = JoinAccess { keys: Vec::new(), probe: None };
     // LEFT and INNER both DRIVE the outer and read one accumulated row at a
     // time, so a per-driver index probe of the inner concatenates to the
     // whole result (the identity the streaming for_each already relies on for
@@ -35183,28 +35333,22 @@ fn build_join_probe(
     // needs the whole other side materialised, and the key then hashes it
     // by row ([index_hash]) instead of scanning it per driver row.
     let index_allowed = matches!(kind, JoinKind::Left | JoinKind::Inner);
-    // the base table to KEY, this side's descriptors and columns laid out
-    // by base field id, and how its OUTPUT columns map to that base. A
-    // plain relation is the identity through `probe_src`; a view or
-    // derived side the engine flattens maps through its `FlatSrc`.
-    let (src, base_descs, base_cols, base_map): (
-        ProbeSrc,
-        Vec<Descriptor>,
-        Vec<RelationColumn>,
-        Option<Vec<Option<usize>>>,
-    ) = if let Some(f) = &side.flatten {
-        (f.src.clone(), f.descs.clone(), f.columns.clone(), Some(f.base_fid.clone()))
-    } else {
-        if !matches!(side.src, RowSource::TableScan { .. }) {
-            return None;
-        }
-        (
-            side.probe_src.clone()?,
-            side.descs.clone(),
-            side.columns.clone(),
-            None,
-        )
-    };
+    // THE BASE-RECORD HALF: the base table to KEY, this side's
+    // descriptors and columns laid out by base field id, and how its
+    // OUTPUT columns map onto that base. A plain relation is the
+    // identity through `probe_src`; a view or derived side the engine
+    // flattens maps through its `FlatSrc`; a MATERIALISED side has none
+    // - and still keeps the key half below.
+    let base: Option<(ProbeSrc, Vec<Descriptor>, Vec<RelationColumn>, Option<Vec<usize>>)> =
+        if let Some(f) = &side.flatten {
+            Some((f.src.clone(), f.descs.clone(), f.columns.clone(), Some(f.out_map.clone())))
+        } else if matches!(side.src, RowSource::TableScan { .. }) {
+            side.probe_src
+                .clone()
+                .map(|s| (s, side.descs.clone(), side.columns.clone(), None))
+        } else {
+            None
+        };
     // where this side's fields begin in the combined row - the same sum
     // `join_rows` accumulates into `left_width`, step by step
     let offset = side.offset;
@@ -35216,6 +35360,13 @@ fn build_join_probe(
     // reaches PAST the boundary (an inner column, a not-yet-joined side,
     // or a generator) is not evaluable at probe time and is not a
     // boundary equality the engine indexes this way.
+    // an UNQUOTED identifier is stored folded up, so a name carrying a
+    // lower-case letter was quoted and cannot be re-spelt bare - fcopt
+    // takes only bare names, so such a table cannot be BANDED. It can
+    // still be hashed by its own rows, so this disqualifies the BASE
+    // half alone.
+    let bare = |s: &str| ident_ok(s) && !s.chars().any(|c| c.is_ascii_lowercase());
+    let base = base.filter(|(src, ..)| bare(&src.table));
     let inner_col = |e: &Expr| match e {
         Expr::Col(fid) if *fid >= offset => Some(*fid - offset),
         _ => None,
@@ -35256,12 +35407,6 @@ fn build_join_probe(
             _ => None,
         }
     };
-    // an UNQUOTED identifier is stored folded up, so a name carrying a
-    // lower-case letter was quoted and cannot be re-spelt bare
-    let bare = |s: &str| ident_ok(s) && !s.chars().any(|c| c.is_ascii_lowercase());
-    if !bare(&src.table) {
-        return None;
-    }
     // Translate one of this side's OUTPUT columns to the BASE field id it
     // keys (identity for a plain table, the flatten's map for a view) and
     // ask the gatekeeper whether it has a single-column index for it.
@@ -35284,8 +35429,9 @@ fn build_join_probe(
     // name (identity for a plain table, the flatten's map for a view) - a
     // key even with NO index, since the hash join keys by it too.
     let inner_of = |out_pos: usize| -> Option<(usize, String)> {
-        let inner_fid = match &base_map {
-            Some(m) => m.get(out_pos).copied().flatten()?,
+        let (_, _, base_cols, base_map) = base.as_ref()?;
+        let inner_fid = match base_map {
+            Some(m) => m.get(out_pos).copied()?,
             None => out_pos,
         };
         let col = base_cols.iter().find(|c| c.field_id as usize == inner_fid)?;
@@ -35299,10 +35445,11 @@ fn build_join_probe(
     // sound because fcopt's answer for the equality shape is
     // VALUE-INDEPENDENT (probed: `K = 0` and `K = 12345678` plan alike).
     let bless = |inner_fid: usize, col: &str| -> Option<u8> {
+        let (src, base_descs, ..) = base.as_ref()?;
         let opt_sql = format!("SELECT 1 FROM {} WHERE {} = 0", render_canon_ref(&src.table), render_canon_ref(&col));
         let filter = Predicate::dnf(vec![vec![Term::Cmp(inner_fid, Cmp::Eq, Rhs::Int(0))]]);
         let index =
-            choose_index(db, src.rel, &src.table, &base_descs, &Some(filter), &opt_sql, &[])?;
+            choose_index(db, src.rel, &src.table, base_descs, &Some(filter), &opt_sql, &[])?;
         let [pick] = index.picks.as_slice() else { return None };
         Some(pick.op.id)
     };
@@ -35325,14 +35472,25 @@ fn build_join_probe(
         let mut hashable: Option<ProbeKey> = None;
         for t in terms {
             let Some((outer_expr, out_pos)) = as_key(t) else { continue };
-            let Some((inner_fid, name)) = inner_of(out_pos) else { continue };
+            // the BASE field this output column reads, when the side has
+            // a base at all - only such a side can be index-banded
+            let based = inner_of(out_pos);
             // a HASHABLE key is an INTEGER inner column at scale 0, or a TEXT
             // one (the shapes `join_key` groups by exactly), AND an outer of
             // the SAME family - a numeric driver against a text inner hashes
             // neither, since `value_cmp` renders and compares that pair. When
             // the outer is a plain column its family is checked; an expression
             // is trusted (the runtime kind-check still guards a mismatch).
-            let inner_family = base_descs.get(inner_fid).and_then(desc_family);
+            // the inner key's FAMILY: from the BASE's descriptors in the
+            // base's numbering when there is one, and from the SIDE's own
+            // descriptors otherwise - a materialised side's rows are its
+            // own, and so are their types
+            let inner_family = match (&base, &based) {
+                (Some((_, base_descs, ..)), Some((inner_fid, _))) => {
+                    base_descs.get(*inner_fid).and_then(desc_family)
+                }
+                _ => side.descs.get(out_pos).and_then(desc_family),
+            };
             // the outer's family when it can be TOLD - a plain column (from
             // the accumulated descriptors), an integer or a text literal; an
             // expression or a coercion is None (unknown).
@@ -35352,22 +35510,40 @@ fn build_join_probe(
                 _ => false,
             };
             if hashable.is_none() && outer_ok {
-                hashable = Some(ProbeKey { inner_fid, outer: outer_expr.clone() });
+                hashable = Some(ProbeKey { out_pos, outer: outer_expr.clone() });
             }
+            let Some((inner_fid, name)) = based else { continue };
             if let Some(id) = bless(inner_fid, &name) {
                 if index.is_none() {
                     index = Some((id, name));
                 }
-                indexed = Some(ProbeKey { inner_fid, outer: outer_expr });
+                indexed = Some(ProbeKey { out_pos, outer: outer_expr });
                 break;
             }
         }
-        keys.push(indexed.or(hashable)?);
+        match indexed.or(hashable) {
+            // A PARTIAL union is a missing set of rows, and a partial
+            // hash the same: one branch with no servable key and the ON
+            // goes back to deciding over the whole side.
+            None => return none,
+            Some(k) => keys.push(k),
+        }
     }
     if keys.is_empty() {
-        return None;
+        return none;
     }
-    Some(JoinProbe { index: if index_allowed { index } else { None }, descs: base_descs, src, keys })
+    JoinAccess {
+        keys,
+        probe: base.map(|(src, base_descs, _, base_map)| JoinProbe {
+            index: if index_allowed { index } else { None },
+            descs: base_descs,
+            src,
+            // a flattened side's band reads BASE records; this is what
+            // turns one back into the side's own row
+            // ([JoinProbe::base_as_side])
+            out_map: base_map,
+        }),
+    }
 }
 
 /// A materialised side hashed by one equi-key BY ROW INDEX - the shape
@@ -35380,8 +35556,8 @@ struct IndexHash {
     buckets: std::collections::HashMap<JoinKey, Vec<usize>>,
 }
 
-fn index_hash(rows: &[Vec<Value>], probe: &JoinProbe) -> Option<IndexHash> {
-    let mut b = IndexHashBuilder::new(probe);
+fn index_hash(rows: &[Vec<Value>], keys: &[ProbeKey]) -> Option<IndexHash> {
+    let mut b = IndexHashBuilder::new(keys);
     for (i, r) in rows.iter().enumerate() {
         b.add(i, r);
     }
@@ -35398,9 +35574,11 @@ struct IndexHashBuilder {
 }
 
 impl IndexHashBuilder {
-    fn new(probe: &JoinProbe) -> IndexHashBuilder {
-        let fid = match probe.keys.as_slice() {
-            [key] => Some(key.inner_fid),
+    fn new(keys: &[ProbeKey]) -> IndexHashBuilder {
+        // the mirror hashes the SIDE's own rows by row index, so the key
+        // is its OUTPUT column - see [ProbeKey]
+        let fid = match keys {
+            [key] => Some(key.out_pos),
             _ => None,
         };
         IndexHashBuilder { declined: fid.is_none(), fid, kind: None, buckets: std::collections::HashMap::new() }
@@ -35464,7 +35642,7 @@ impl MirrorSide {
 /// exactly as the unhashed loop did). `all` is the side's row count.
 fn mirror_candidates<'a>(
     hash: Option<&IndexHash>,
-    probe: Option<&JoinProbe>,
+    keys: &[ProbeKey],
     driver: &[Value],
     all: usize,
     buf: &'a mut Vec<usize>,
@@ -35474,8 +35652,8 @@ fn mirror_candidates<'a>(
         buf.extend(0..all);
         buf
     };
-    let (Some(h), Some(pr)) = (hash, probe) else { return everything(buf) };
-    let [key] = pr.keys.as_slice() else { return everything(buf) };
+    let Some(h) = hash else { return everything(buf) };
+    let [key] = keys else { return everything(buf) };
     match key.outer.eval(driver) {
         Ok(v) if matches!(v, Value::Null) => buf,
         Ok(v) => match join_key(&v) {
@@ -35556,6 +35734,9 @@ fn plan_join_bound(
             let (columns, descs) = derived_view(&inner_cols);
             let offset: usize = sides.iter().map(|s: &JoinSide| s.descs.len()).sum();
             let flatten = build_flatten(db, &inner);
+            // carried off the INNER PLAN, before it is moved into the
+            // row source: the side's own columns cannot answer it
+            let base_fids = side_base_fids(Some(&inner), &inner_cols);
             sides.push(JoinSide {
                 key: tr.alias.clone()?,
                 // a DERIVED side has no relation and so no schema: its
@@ -35568,6 +35749,7 @@ fn plan_join_bound(
                 // the inner columns' own relations shine through; the
                 // derived table's alias (mandatory here) binds them
                 rels: inner_cols.iter().map(|c| c.relation.clone()).collect(),
+                base_fids,
                 fnames: inner_cols
                     .iter()
                     .map(|c| Some(c.fname.clone().unwrap_or_else(|| c.name.clone())))
@@ -35596,6 +35778,7 @@ fn plan_join_bound(
             let (columns, descs) = derived_view(&view_cols);
             let offset: usize = sides.iter().map(|s: &JoinSide| s.descs.len()).sum();
             let flatten = build_flatten(db, &inner);
+            let base_fids = side_base_fids(Some(&inner), &view_cols);
             sides.push(JoinSide {
                 key: tr.key().to_string(),
                 // a view is a relation like any other, and an ALIAS
@@ -35608,6 +35791,7 @@ fn plan_join_bound(
                 // plan_view stamped the view's name on every column;
                 // its OWN name never doubles as the binding alias
                 rels: view_cols.iter().map(|c| c.relation.clone()).collect(),
+                base_fids,
                 fnames: view_cols
                     .iter()
                     .map(|c| Some(c.fname.clone().unwrap_or_else(|| c.name.clone())))
@@ -35637,6 +35821,15 @@ fn plan_join_bound(
                     // a CTE's name IS a binding alias, unlike a view's
                     // (probed: a bare recursive CTE R answers R)
                     rels: bcols.iter().map(|c| c.relation.clone()).collect(),
+                    // a CTE's rows arrive as a row source; only a
+                    // plan-backed one can name its base fields
+                    base_fids: side_base_fids(
+                        match bsrc {
+                            RowSource::PlanRows(pl) => Some(pl.as_ref()),
+                            _ => None,
+                        },
+                        bcols,
+                    ),
                     fnames: bcols
                         .iter()
                         .map(|c| Some(c.fname.clone().unwrap_or_else(|| c.name.clone())))
@@ -35648,6 +35841,32 @@ fn plan_join_bound(
                 });
                 continue;
             }
+        }
+        // A VIEW WHOSE BODY THIS SERVER CANNOT RE-PLAN IS A REFUSAL, NOT
+        // A SIDE. The view arm above has already had its turn; falling
+        // past it leaves the name to `resolve_relation`, and a view IS a
+        // relation - one with an id and NO RECORDS OF ITS OWN - so the
+        // side would scan empty storage and the JOIN would answer ZERO
+        // ROWS with no error, a wrong answer wearing an empty result's
+        // clothes. That is strictly worse than what the same view gets in
+        // a lone FROM, which refuses. Measured: `CREATE VIEW VSTAR AS
+        // SELECT * FROM STARB`, then `ALTER TABLE STARB ADD ...` -
+        // `plan_view` re-expands the `*` to the base's CURRENT columns
+        // while the catalog froze the view's own, its length guard
+        // declines, and `SELECT t.ID, v.A FROM TQ t JOIN VSTAR v ON
+        // v.ID = t.ID` answered 0 rows where the engine answers 3.
+        // `from_names_view` at the caller turns this None into the
+        // Plan::Refused the lone-FROM and nested-FROM cases already give.
+        //
+        // THE QUESTION IS ABOUT THIS SIDE'S OWN RELATION. The qualifier
+        // has already been checked against the schema the name resolves
+        // to (`relation_qualifier_ok`, above), and [is_view] answers
+        // about THAT relation - the first row of the name - not about
+        // any relation sharing it, so `JOIN PUBLIC.T` on a table stays a
+        // table even when an `S2.T` view exists (review-caught: it
+        // refused, and the refusal propagated into DML as a lost write).
+        if is_view(db, &tr.table) {
+            return None;
         }
         let rel = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, &tr.table)?;
         let columns = db.columns(&tr.table);
@@ -35667,6 +35886,9 @@ fn plan_join_bound(
         // side's columns landed on top of the second's.
         let offset: usize = sides.iter().map(|s: &JoinSide| s.descs.len()).sum();
         let rels = vec![Some(tr.table.to_string()); descs.len()];
+        // a plain relation's OUTPUT IS its record: the identity, and the
+        // one case where an output position IS the base field id
+        let base_fids: Vec<Option<usize>> = (0..descs.len()).map(Some).collect();
         let fnames = vec![None; descs.len()];
         // the BARE table name, not `key`: `key` is the ALIAS when there
         // is one, and fcopt refuses an aliased single-table FROM
@@ -35690,6 +35912,7 @@ fn plan_join_bound(
             offset,
             fnames,
             rels,
+            base_fids,
             rel_alias: tr.alias.clone(),
             merged_away: Vec::new(),
             probe_src,
@@ -35759,16 +35982,22 @@ fn plan_join_bound(
         // the outer's family and refuse to hash a cross-family key
         let outer_descs: Vec<Descriptor> =
             sides[..=k].iter().flat_map(|s| s.descs.iter().cloned()).collect();
-        let probe = build_join_probe(db, *kind, &on, &sides[k + 1], &outer_descs);
+        let access = build_join_access(db, *kind, &on, &sides[k + 1], &outer_descs);
         if trace_on() {
-            match probe.as_ref().map(|p| (p, &p.index)) {
-                Some((p, Some((id, col)))) => {
-                    eprintln!("[srv] join index: rel={} index={} col={}", p.src.rel, id, col)
-                }
-                // a keyed but UNINDEXED inner: hashed, not probed, not scanned
-                // whole - a distinct line so the coverage counters stay apart
-                Some((p, None)) => eprintln!("[srv] join hash: rel={}", p.src.rel),
-                None => eprintln!("[srv] join natural: side={}", sides[k + 1].key),
+            match (access.keys.is_empty(), access.probe.as_ref()) {
+                (false, Some(p)) => match &p.index {
+                    Some((id, col)) => {
+                        eprintln!("[srv] join index: rel={} index={} col={}", p.src.rel, id, col)
+                    }
+                    // a keyed but UNINDEXED inner: hashed, not probed, not
+                    // scanned whole - a distinct line so the coverage
+                    // counters stay apart
+                    None => eprintln!("[srv] join hash: rel={}", p.src.rel),
+                },
+                // keyed with NO base record at all: a materialised derived
+                // table or view, hashed by its own output column
+                (false, None) => eprintln!("[srv] join hash: side={}", sides[k + 1].key),
+                (true, _) => eprintln!("[srv] join natural: side={}", sides[k + 1].key),
             }
         }
         parts.push(JoinPart {
@@ -35776,7 +36005,8 @@ fn plan_join_bound(
             src: sides[k + 1].src.clone(),
             width: sides[k + 1].descs.len(),
             on,
-            probe,
+            probe: access.probe,
+            keys: access.keys,
         });
     }
     // The merged names are hidden on the side that was joined IN: they
@@ -37745,8 +37975,38 @@ fn parse_with(sql: &str) -> Option<(Vec<(String, ViewDef)>, String, bool)> {
     Some((ctes, main, recursive))
 }
 
+/// THE RELATION NAME RESOLUTION RULE, as a per-row question a catalog
+/// walk can ask: does THIS `RDB$RELATIONS` row decide what `want`
+/// names? `seen` says a row of that name has already gone by.
+///
+/// A name resolves to the FIRST row that carries it and to NO OTHER.
+/// That is already the rule [fire_crab_ods::resolve_relation] (which
+/// takes `list_relations().find(...)`) and [relation_schema] follow, and
+/// the walks are the same page-and-record order, so every one of them
+/// answers about the SAME relation. RDB$RELATIONS is keyed by (schema,
+/// name), so a schema-ful database can hold `PUBLIC.T` a TABLE beside
+/// `S2.T` a VIEW; a walk that keeps looking after the first `T` answers
+/// about whichever row happens to suit it, and the server contradicts
+/// itself about what one name means.
+fn decides_relation(seen: bool, row_name: Option<&str>, want: &str) -> bool {
+    !seen && row_name.is_some_and(|n| n.trim_end() == want)
+}
+
 /// Read `<name>` as a view. None when it is an ordinary table (no
 /// RDB$VIEW_SOURCE) or the blob cannot be read.
+///
+/// IT ANSWERS ABOUT THE RELATION THE NAME RESOLVES TO, not about any
+/// relation that happens to share the name. RDB$RELATIONS is keyed by
+/// (schema, name), so a schema-ful database can hold `PUBLIC.T` a TABLE
+/// beside `S2.T` a VIEW; [fire_crab_ods::resolve_relation] and
+/// [relation_schema] both answer with the FIRST row of that name, and
+/// this has to answer about the SAME row or the server disagrees with
+/// itself. It used to walk PAST a name-matching row with no
+/// RDB$VIEW_SOURCE and keep looking, which made it "is ANY relation of
+/// this name a view" - and that turned `JOIN PUBLIC.T` (a table) into a
+/// refusal the moment an unrelated `S2.T` view existed, losing the
+/// write of an `UPDATE ... WHERE ID IN (SELECT ... JOIN PUBLIC.T ...)`
+/// (review-caught). The first row of the name decides, view or not.
 fn view_of(db: &Database, name: &str) -> Option<ViewDef> {
     let want_rel = rel_row_name(db, name);
     let (rcols, rdescs) = sys_rel(db, "RDB$RELATIONS")?;
@@ -37754,12 +38014,18 @@ fn view_of(db: &Database, name: &str) -> Option<ViewDef> {
     let (name_f, src_f) = (fid("RDB$RELATION_NAME")?, fid("RDB$VIEW_SOURCE")?);
     let fmts = vec![(0u8, rdescs)];
     let mut source: Option<String> = None;
+    // the name is RESOLVED once: the first row that carries it is the
+    // relation, and whether THAT row has a view source is the answer
+    let mut resolved = false;
     for_each_record(db, 6, &fmts, usize::MAX, |v| {
-        let hit = matches!(v.get(name_f),
-            Some(Value::Text(t)) if t.trim_end() == want_rel);
-        if !hit || source.is_some() {
+        let row_name = match v.get(name_f) {
+            Some(Value::Text(t)) => Some(t.as_str()),
+            _ => None,
+        };
+        if !decides_relation(resolved, row_name, &want_rel) {
             return;
         }
+        resolved = true;
         if let Some(Value::Blob(r, n)) = v.get(src_f) {
             if let Some(b) = fire_crab_blb::read_blob_content(&db.bytes(), db.page_size, *r, *n) {
                 // an engine-built VIEW source may carry comments the
@@ -37898,9 +38164,11 @@ fn view_dml_target(db: &Database, name: &str, event: u8) -> ViewDml {
         .clone()
 }
 
-/// Is `name` a view at all? Memoised. The belt-and-braces guard every
-/// DML planner applies after its view hook: a view must never be
-/// planned as a table.
+/// Is the relation `name` resolves to a view? Memoised. The
+/// belt-and-braces guard every DML planner applies after its view hook:
+/// a view must never be planned as a table. It is [view_of]'s question,
+/// so it inherits its resolution rule - the FIRST relation of that name,
+/// never any relation sharing it.
 fn is_view(db: &Database, name: &str) -> bool {
     let key = name.trim_end().to_string();
     *db.meta_memo("is-view", &key, || view_of(db, name).is_some())
@@ -44662,8 +44930,20 @@ fn expr_nullable(e: &Expr, is_nn: &dyn Fn(usize) -> bool) -> bool {
 /// with NULLs. That is the whole difference between the two forms, and
 /// it lives entirely in the describe.
 ///
-/// Only ever CLEARS bits, so whatever [mark_not_null_join] already
-/// settled about the base side stands.
+/// AUTHORITATIVE for this shape, in BOTH directions. Its `is_nn` covers
+/// the WHOLE combined row - the base table's fields below `base_width`
+/// and the subquery's own announced columns above it - so it is the
+/// complete truth here, and it must SET the nullable bit as well as
+/// clear it. It used to only clear, on the reasoning that whatever
+/// [mark_not_null_join] settled stood; but that marker plans the COMMA
+/// stand-in (a `LEFT JOIN LATERAL` is described through the comma form,
+/// which differs only in whether an empty lateral pads or drops the
+/// row), so it knows nothing about `left` and cannot null-extend the
+/// lateral side. While it read a derived side's NOT NULL by output
+/// position it happened not to clear those bits; once it read them
+/// correctly, a `LEFT JOIN LATERAL` over a NOT NULL column came out
+/// announced NOT NULL, where the engine - and the row an unmatched
+/// outer pads - says Nullable.
 fn mark_not_null_lateral(
     cols: &mut [ProjCol],
     db: &Database,
@@ -44689,9 +44969,89 @@ fn mark_not_null_lateral(
             None => !is_nn(c.field_id),
             Some(e) => expr_nullable(e, &is_nn),
         };
-        if !nullable {
+        if nullable {
+            c.sql_type |= 1;
+        } else {
             c.sql_type &= !1;
         }
+    }
+}
+
+/// Per OUTPUT column of a nested join side - a derived table, a view or
+/// a CTE - the BASE FIELD ID it reads. `None` where the column has none
+/// (an expression, a literal, a scalar subquery) and `None` for EVERY
+/// column of a side whose shape does not number its columns by base
+/// field id at all.
+///
+/// AN OUTPUT POSITION IS NEVER A BASE FIELD ID. [derived_view] stamps
+/// `field_id: i as u16` - the output position - on the side's own
+/// `RelationColumn`s, so the base id cannot be recovered downstream; it
+/// has to be carried from the inner plan, which is what this does.
+/// Asking a base table's NOT-NULL FIELD IDS about an output position is
+/// the same two-orders-one-number defect [FlatSrc::out_map] closed for
+/// the VALUES, one layer up in the DESCRIBE - and not a cosmetic one:
+/// this server announces a column NOT NULL only when it is certain,
+/// because libfbclient IGNORES the row's null indicator for a column
+/// announced NOT NULL and renders the raw buffer instead, so a wrongly
+/// fixed column delivers a NULL to the client as 0.
+///
+/// Only a PLAIN PROJECTION of ONE relation numbers its `ProjCol`s by
+/// base field id. A join, an aggregate, a union, a CTE bound to rows
+/// that are not a projection - each numbers them by its own combined-row
+/// or slot position, where the same integer means something else
+/// entirely. Those announce NOTHING, which is the safe direction and
+/// what the engine does for a derived column it cannot trace to a fixed
+/// one.
+///
+/// A LAYER OVER A LAYER COMPOSES rather than gives up. A derived table
+/// over a derived table plans as a [Plan::Derived] whose `cols` number
+/// themselves by the INNER source's OUTPUT positions - a third order,
+/// and one this can follow: resolve the inner side's own mapping and
+/// read it at that position. Stopping at the first non-`Project`
+/// announced every column of `(SELECT x.V AS A1, x.ID AS B1 FROM (SELECT
+/// ID, V FROM K1) x)` nullable, where the engine keeps `B1` NOT NULL
+/// because it is a plain read of `K1.ID` two layers down (review-caught).
+/// Composition is exact, never a guess: a layer that cannot map a column
+/// - an expression, a window slot, a source that is not a projection -
+/// still answers `None` for it, and `None` composed with anything is
+/// `None`.
+fn side_base_fids(inner: Option<&Plan>, cols: &[ProjCol]) -> Vec<Option<usize>> {
+    let unknown = || vec![None; cols.len()];
+    match inner {
+        Some(Plan::Project { cols: pcols, gen_cols, windows, .. }) => {
+            // a GENERATOR or WINDOW output column's `field_id` is a SLOT
+            // past the end of every format, not a field of the base -
+            // one of those in the list and no column's number can be
+            // trusted to be a field id
+            if !gen_cols.is_empty() || !windows.is_empty() || pcols.len() != cols.len() {
+                return unknown();
+            }
+            cols.iter().map(|c| c.expr.is_none().then_some(c.field_id)).collect()
+        }
+        Some(Plan::Derived { inner: nested, cols: dcols, windows, win_base, .. }) => {
+            if dcols.len() != cols.len() {
+                return unknown();
+            }
+            // the layer below, in ITS OWN terms; a `Derived`'s `cols`
+            // index that layer's output, so this is the map to read
+            let nested_cols = output_cols_of(nested);
+            let below = side_base_fids(Some(nested), &nested_cols);
+            cols.iter()
+                .zip(dcols.iter())
+                .map(|(c, d)| {
+                    if c.expr.is_some() || d.expr.is_some() {
+                        return None;
+                    }
+                    // a WINDOW value is appended PAST the bound row, so
+                    // its number is a slot and not a position below
+                    if !windows.is_empty() && d.field_id >= *win_base {
+                        return None;
+                    }
+                    below.get(d.field_id).copied().flatten()
+                })
+                .collect()
+        }
+        _ => unknown(),
     }
 }
 
@@ -44721,7 +45081,17 @@ fn mark_not_null_join(cols: &mut [ProjCol], db: &Database, sides: &[JoinSide], p
         }
         let local = fid - sides[k].offset;
         let Some(Some(table)) = sides[k].rels.get(local) else { return false };
-        not_null_fids(db, table).contains(&local)
+        // `local` is where the column sits in THIS SIDE's row;
+        // `not_null_fids` answers about the BASE table's FIELD IDS. The
+        // two are one number only for a plain table side - for a derived
+        // table, a view or a CTE they are the orders [FlatSrc::out_map]
+        // keeps apart, and reading one as the other announced `d.S` of
+        // `(SELECT G AS S, ID FROM J1) d` NOT NULL (base field 1 is
+        // `J1.A`) while announcing its `ID` nullable, the engine's
+        // answer exactly reversed. A side that cannot name its base
+        // field claims nothing ([side_base_fids]).
+        let Some(Some(base)) = sides[k].base_fids.get(local) else { return false };
+        not_null_fids(db, table).contains(base)
     };
     for c in cols.iter_mut() {
         let nullable = match &c.expr {
@@ -47503,16 +47873,14 @@ impl JoinCursor {
                 // the way for the mirror ([mirror_candidates])
                 let mut store = crate::extsort::RowStore::new();
                 let mut offs: Vec<u64> = Vec::new();
-                let mut hb = p.probe.as_ref().map(IndexHashBuilder::new);
+                let mut hb = IndexHashBuilder::new(&p.keys);
                 p.src
                     .for_each(db, &mut |r| {
                         let off = store.push(&r).map_err(|e| {
                             eprintln!("[srv] join mirror store: {}", e);
                             EvalErr::Unsupported
                         })?;
-                        if let Some(b) = hb.as_mut() {
-                            b.add(offs.len(), &r);
-                        }
+                        hb.add(offs.len(), &r);
                         offs.push(off);
                         Ok(Flow::Continue)
                     })
@@ -47520,7 +47888,7 @@ impl JoinCursor {
                 if std::env::var("FC_SRV_TRACE").is_ok() {
                     eprintln!("[srv] join mirror store: rows={} spilled={}", offs.len(), store.spilled_bytes());
                 }
-                mirror_hash = hb.and_then(|b| b.finish());
+                mirror_hash = hb.finish();
                 mirror_side = Some(MirrorSide { store, offs });
                 parts_data.push(PartData { part: p.clone(), inner: Vec::new(), key_hash: None, probed: None });
                 continue;
@@ -47529,7 +47897,7 @@ impl JoinCursor {
             // an unindexed equi part hashes its inner by the ON's key; a theta
             // part (no probe, or a key the hash declines) leaves it `None` and
             // the ON scans the whole inner
-            let key_hash = p.probe.as_ref().and_then(|pr| build_join_key_hash_from_rows(&inner, pr));
+            let key_hash = build_join_key_hash_from_rows(&inner, &p.keys);
             parts_data.push(PartData { part: p.clone(), inner, key_hash, probed: None });
         }
         // a RIGHT/FULL last part needs the mirror machinery: the match bitmap
@@ -47701,7 +48069,7 @@ impl JoinCursor {
                 (Some(ps), Some(probe)) => {
                     let mut next = Vec::new();
                     for row in acc {
-                        match probe.band(db, &row) {
+                        match probe.band(db, &row, &part.keys) {
                             Band::Index(access) => {
                                 let rrows = frozen_probe_rows(
                                     image,
@@ -47741,15 +48109,19 @@ impl JoinCursor {
                     }
                     next
                 }
-                // a theta part (or a key the hash declined): the ON decides
-                // over the whole side, for every accumulated row at once
-                (None, None) => join_step(acc, w, inner, part, above)?,
-                // an unindexed equi part: each accumulated row pairs with its
-                // hash bucket (the whole side when the key's family differs)
-                (None, Some(probe)) => {
+                // a theta part (no key, or one the hash declined): the ON
+                // decides over the whole side, for every accumulated row
+                // at once
+                (None, _) if part.keys.is_empty() => join_step(acc, w, inner, part, above)?,
+                // an unindexed equi part - including a MATERIALISED derived
+                // table or view, which has no base-record probe but hashes
+                // by its own output column all the same: each accumulated
+                // row pairs with its hash bucket (the whole side when the
+                // key's family differs)
+                (None, _) => {
                     let mut next = Vec::new();
                     for row in acc {
-                        let matched = join_scan_rows(&row, probe, inner, key_hash.as_ref(), scan_buf);
+                        let matched = join_scan_rows(&row, &part.keys, inner, key_hash.as_ref(), scan_buf);
                         next.extend(join_step(vec![row], w, matched, part, above)?);
                     }
                     next
@@ -47780,7 +48152,7 @@ impl JoinCursor {
         let mut out = Vec::new();
         for acc_row in acc {
             let mut matched = false;
-            for &ri in mirror_candidates(mirror_hash.as_ref(), part.probe.as_ref(), &acc_row, side.len(), mirror_cand) {
+            for &ri in mirror_candidates(mirror_hash.as_ref(), &part.keys, &acc_row, side.len(), mirror_cand) {
                 let r = side.get(ri)?;
                 let mut row = acc_row.clone();
                 row.extend(r);
@@ -47887,7 +48259,14 @@ fn frozen_probe_rows(
         &probe.src.formats,
         defaults,
         access,
-        &mut |mut row| {
+        &mut |row| {
+            // the walk yields BASE records; a FLATTENED side's row is its
+            // select list read out of one. (Today [JoinCursor::open_inner]
+            // leaves a flattened index-probed side to the materialising
+            // path, so `out_map` is None here - the mapping is kept local
+            // to the read so the invariant does not live in a distant
+            // guard.)
+            let mut row = probe.base_as_side(row, width);
             row.resize(width, Value::Null);
             out.push(row);
             Ok(Flow::Continue)
@@ -48341,7 +48720,7 @@ fn join_step(
     // hashed by the ON's equi-key when it has one, so each accumulated
     // row tries its bucket, not the side. LEFT/INNER arrive narrowed.
     let rhash = if matches!(part.kind, JoinKind::Right | JoinKind::Full) {
-        part.probe.as_ref().and_then(|p| index_hash(rrows, p))
+        index_hash(rrows, &part.keys)
     } else {
         None
     };
@@ -48349,7 +48728,7 @@ fn join_step(
     for l in &acc {
         let mut matched = false;
         let ix: &[usize] = if rhash.is_some() {
-            mirror_candidates(rhash.as_ref(), part.probe.as_ref(), l, rrows.len(), &mut cand)
+            mirror_candidates(rhash.as_ref(), &part.keys, l, rrows.len(), &mut cand)
         } else {
             cand.clear();
             cand.extend(0..rrows.len());
@@ -87159,6 +87538,7 @@ mod tests {
                 src: RowSource::Rows(Vec::new()),
                 width: 2,
                 probe: None,
+                keys: Vec::new(),
                 on: Predicate::dnf(vec![vec![Term::Const(on)]]),
             })
         };
@@ -90029,6 +90409,7 @@ mod tests {
                 descs: vec![d(dtype::LONG), d(dtype::LONG), d(dtype::VARYING)],
                 offset: 0,
                 rels: vec![Some("EMP".into()); 3],
+                base_fids: (0..3).map(Some).collect(),
                 fnames: vec![None; 3],
                 rel_alias: Some("E".into()),
                 merged_away: Vec::new(),
@@ -90046,6 +90427,7 @@ mod tests {
                 descs: vec![d(dtype::LONG), d(dtype::VARYING)],
                 offset: 3,
                 rels: vec![Some("DEPT".into()); 2],
+                base_fids: (0..2).map(Some).collect(),
                 fnames: vec![None; 2],
                 rel_alias: Some("D".into()),
                 merged_away: Vec::new(),
@@ -90123,6 +90505,7 @@ mod tests {
             src: RowSource::Rows(Vec::new()),
             width: 1,
             probe: None,
+            keys: Vec::new(),
             // ON acc[1] = new[0] - index 2 is the new side's only column
             on: Predicate::dnf(vec![vec![Term::ExprCond(Box::new(Cond2::Cmp(
                 Box::new(Expr::Col(1)),
@@ -90244,6 +90627,7 @@ mod tests {
             src: RowSource::Rows(Vec::new()),
             width: 1,
             probe: None,
+            keys: Vec::new(),
             on: Predicate::dnf(vec![vec![Term::ExprCond(Box::new(Cond2::Cmp(
                 Box::new(Expr::Col(1)),
                 Cmp::Eq,
@@ -90286,6 +90670,7 @@ mod tests {
             src: RowSource::Rows(Vec::new()),
             width: 1,
             probe: None,
+            keys: Vec::new(),
             on: Predicate::dnf(vec![vec![
                 Term::ExprCond(Box::new(Cond2::Cmp(
                     Box::new(Expr::Col(1)),
@@ -90321,6 +90706,7 @@ mod tests {
             src: RowSource::Rows(Vec::new()),
             width: 1,
             probe: None,
+            keys: Vec::new(),
             on: Predicate::dnf(vec![vec![
                 Term::ExprCond(Box::new(Cond2::Cmp(
                     Box::new(Expr::Col(0)),
@@ -90339,6 +90725,7 @@ mod tests {
             src: RowSource::Rows(Vec::new()),
             width: 1,
             probe: None,
+            keys: Vec::new(),
             on: Predicate::dnf(vec![vec![Term::CmpConvErr(2, Cmp::Eq, "x".into(), None)]]),
         };
         let rrows = vec![vec![Value::Int(7)]];
@@ -90359,6 +90746,7 @@ mod tests {
             src: RowSource::Rows(Vec::new()),
             width: 1,
             probe: None,
+            keys: Vec::new(),
             on: Predicate::dnf(vec![vec![
                 Term::ExprCond(Box::new(Cond2::Cmp(
                     Box::new(Expr::Col(1)),
@@ -90391,6 +90779,318 @@ mod tests {
         // ... and a conjunct naming the OTHER side gates nothing
         let other = Predicate::dnf(vec![vec![Term::IsNotNull(2)]]);
         assert!(join_step(acc, 2, &rrows, &raiser_part(JoinKind::Left), &Some(other)).is_err());
+    }
+
+    /// A synthetic FLATTENED side: base `J1(ID, A, G, N)` at field ids
+    /// 0..3, and a derived select list `(ID, G AS S, ID AS S2)` whose
+    /// output order is NOT the base's. `out_map` is what says so.
+    fn flat_probe(out_map: Option<Vec<usize>>) -> JoinProbe {
+        let d = |dtype| Descriptor { dtype, scale: 0, length: 0, sub_type: 0, flags: 0, offset: 0 };
+        JoinProbe {
+            src: ProbeSrc { rel: 40, table: "J1".into(), formats: Vec::new() },
+            descs: vec![d(dtype::LONG), d(dtype::LONG), d(dtype::VARYING), d(dtype::LONG)],
+            index: None,
+            out_map,
+        }
+    }
+
+    /// One BASE record `J1(1, 10, 'g1', 111)`.
+    fn j1_record() -> Vec<Value> {
+        vec![Value::Int(1), Value::Int(10), Value::Text("g1".into()), Value::Int(111)]
+    }
+
+    #[test]
+    fn flattened_side_reads_its_own_columns_not_the_base_at_that_position() {
+        // `(SELECT ID, G AS S FROM J1) d`: output 0 is base ID, output 1
+        // is base G. Reading the base record BY OUTPUT POSITION answered
+        // `A` (10) for `d.S`; through `out_map` it answers 'g1'.
+        let p = flat_probe(Some(vec![0, 2]));
+        assert_eq!(p.fetch_width(2), None); // the WHOLE base record is fetched
+        assert_eq!(
+            p.base_as_side(j1_record(), 2),
+            vec![Value::Int(1), Value::Text("g1".into())]
+        );
+        // a REORDERING: `(SELECT G AS S, ID FROM J1)` - output 0 is G
+        let p = flat_probe(Some(vec![2, 0]));
+        assert_eq!(
+            p.base_as_side(j1_record(), 2),
+            vec![Value::Text("g1".into()), Value::Int(1)]
+        );
+        // a SUBSET that skips the base's own second field
+        let p = flat_probe(Some(vec![0, 3]));
+        assert_eq!(p.base_as_side(j1_record(), 2), vec![Value::Int(1), Value::Int(111)]);
+        // a REPEATED base column: `(SELECT ID, ID AS S FROM J1)`
+        let p = flat_probe(Some(vec![0, 0]));
+        assert_eq!(p.base_as_side(j1_record(), 2), vec![Value::Int(1), Value::Int(1)]);
+        // EVERY base column, in base order - the identity case that was
+        // always right, and stays right (and still flattens, so still fast)
+        let p = flat_probe(Some(vec![0, 1, 2, 3]));
+        assert_eq!(p.base_as_side(j1_record(), 4), j1_record());
+        // a base field the record does not carry pads NULL rather than
+        // shifting every column after it
+        let p = flat_probe(Some(vec![0, 9]));
+        assert_eq!(p.base_as_side(j1_record(), 2), vec![Value::Int(1), Value::Null]);
+        // a PLAIN RELATION side is the identity: no map, and the fetch
+        // resizes to the side's width exactly as it always did
+        let p = flat_probe(None);
+        assert_eq!(p.fetch_width(4), Some(4));
+        assert_eq!(p.base_as_side(j1_record(), 4), j1_record());
+    }
+
+    /// The SIDE's rows for `(SELECT G AS S, ID FROM J1)`: output 0 is G,
+    /// output 1 is ID.
+    fn side_rows() -> Vec<Vec<Value>> {
+        vec![
+            vec![Value::Text("g1".into()), Value::Int(1)],
+            vec![Value::Text("g1".into()), Value::Int(2)],
+            vec![Value::Text("g2".into()), Value::Int(3)],
+        ]
+    }
+
+    #[test]
+    fn flattened_side_hashes_by_its_output_column() {
+        // The ON `d.ID = t.ID` keys the side's output column 1, which is
+        // BASE field 0 - the two numbers differ, and the hash must use the
+        // OUTPUT one, because it indexes the side's own rows.
+        let rows = side_rows();
+        let keys = vec![ProbeKey { out_pos: 1, outer: Expr::Col(0) }];
+        let h = build_join_key_hash_from_rows(&rows, &keys).expect("hashes by the output column");
+        assert!(matches!(h.kind, KeyKind::Int));
+        // three DISTINCT integer keys - keying by base field 0 would have
+        // read the TEXT column and answered two
+        assert_eq!(h.buckets.len(), 3);
+        assert_eq!(h.buckets.get(&JoinKey::Int(2)).map(|b| b.len()), Some(1));
+        // the mirror's by-row-index hash reads the same column
+        let ih = index_hash(&rows, &keys).expect("mirror hash");
+        assert_eq!(ih.buckets.get(&JoinKey::Int(3)).cloned(), Some(vec![2]));
+        // and the band translates that output column BACK to the base's
+        // field id, which is the one place the base numbering is wanted
+        let base = flat_probe(Some(vec![2, 0]));
+        assert_eq!(base.out_map.as_ref().map(|m| m[keys[0].out_pos]), Some(0));
+    }
+
+    #[test]
+    fn a_side_with_no_base_record_still_supplies_a_hash_key() {
+        // A derived side the flatten REFUSED - one expression column and
+        // the map cannot be total, so there is no `JoinProbe` at all.
+        // Hashing it needs none: the rows are the side's own, and the key
+        // is the side's own output column. This is what keeps an
+        // unflattenable side an O(N + M) hash instead of the O(N x M)
+        // per-driver scan it fell to when the two decisions were one.
+        let rows = side_rows();
+        let keys = vec![ProbeKey { out_pos: 1, outer: Expr::Col(0) }];
+        let part = JoinPart {
+            kind: JoinKind::Inner,
+            src: RowSource::Rows(rows.clone()),
+            width: 2,
+            probe: None, // NO base record to read or band
+            keys: keys.clone(),
+            on: Predicate::dnf(vec![vec![Term::ExprCond(Box::new(Cond2::Cmp(
+                Box::new(Expr::Col(0)),
+                Cmp::Eq,
+                Box::new(Expr::Col(2)),
+            )))]]),
+        };
+        let h = build_join_key_hash_from_rows(&rows, &part.keys)
+            .expect("a probe-less side hashes by its own key");
+        assert_eq!(h.buckets.len(), 3);
+        // ...and a driver row reads ONE bucket, not the whole side
+        let mut buf: Vec<Vec<Value>> = Vec::new();
+        let picked = join_scan_rows(&[Value::Int(2)], &part.keys, &rows, Some(&h), &mut buf);
+        assert_eq!(picked, &[vec![Value::Text("g1".into()), Value::Int(2)]]);
+        // a driver key OUTSIDE the hash's family falls back to the whole
+        // side, where the ON decides - never to a silently empty bucket
+        let picked = join_scan_rows(&[Value::Text("x".into())], &part.keys, &rows, Some(&h), &mut buf);
+        assert_eq!(picked.len(), 3);
+        // a side with NO key at all keeps the theta scan
+        assert!(build_join_key_hash_from_rows(&rows, &[]).is_none());
+    }
+
+    #[test]
+    fn a_nested_side_names_its_base_field_only_when_the_plan_can() {
+        // `(SELECT G AS S, ID FROM J1)`: output 0 reads base field 2,
+        // output 1 reads base field 0. Announcing NOT NULL by OUTPUT
+        // POSITION would have asked the base about fields 0 and 1.
+        let col = |name: &str, fid: usize, expr: Option<Expr>| ProjCol {
+            name: name.into(),
+            fname: None,
+            relation: Some("J1".into()),
+            rel_alias: None,
+            field_id: fid,
+            wire: Wire::Int64,
+            sql_type: 581,
+            length: 8,
+            oct_length: 8,
+            scale: 0,
+            sub_type: 0,
+            expr,
+        };
+        let project = |cols: Vec<ProjCol>, windows: Vec<WinSpec>| Plan::Project {
+            rel: 40,
+            formats: Vec::new(),
+            cols,
+            filter: None,
+            order_by: Vec::new(),
+            gen_cols: Vec::new(),
+            index: None,
+            defer: None,
+            windows,
+            win_base: 0,
+        };
+        let cols = vec![col("S", 2, None), col("ID", 0, None)];
+        let plan = project(cols.clone(), Vec::new());
+        assert_eq!(side_base_fids(Some(&plan), &cols), vec![Some(2), Some(0)]);
+        // an EXPRESSION column has no base field - it announces nothing,
+        // and its neighbours still announce their own
+        let cols = vec![col("ID", 0, None), col("L", 0, Some(Expr::Int(7)))];
+        let plan = project(cols.clone(), Vec::new());
+        assert_eq!(side_base_fids(Some(&plan), &cols), vec![Some(0), None]);
+        // a WINDOW column's field_id is a SLOT past the record, so no
+        // column of that projection can be trusted to be a field id
+        let cols = vec![col("ID", 0, None)];
+        let plan = project(
+            cols.clone(),
+            vec![WinSpec { kind: WinKind::Rank(RankFn::RowNumber), part: Vec::new(), order: Vec::new() }],
+        );
+        assert_eq!(side_base_fids(Some(&plan), &cols), vec![None]);
+        // a side whose rows are NOT a plain projection of one relation -
+        // a join, an aggregate, a CTE bound to something else - numbers
+        // its columns by its own combined row, so it announces NOTHING
+        let cols = vec![col("S", 2, None), col("ID", 0, None)];
+        assert_eq!(side_base_fids(None, &cols), vec![None, None]);
+        let other = Plan::Rows { rows: Vec::new(), cols: cols.clone() };
+        assert_eq!(side_base_fids(Some(&other), &cols), vec![None, None]);
+    }
+
+    #[test]
+    fn a_nested_side_composes_its_mapping_through_the_layer_below() {
+        // `(SELECT x.V AS A1, x.ID AS B1 FROM (SELECT ID, V FROM K1) x)`
+        // over `K1 (V, ID NOT NULL)`. THREE orders, not two: K1's fields
+        // are (V=0, ID=1); the inner derived table's OUTPUT is (ID, V);
+        // the outer one's is (A1=inner 1, B1=inner 0). Only the
+        // composition says B1 reads K1.ID. Giving up at the first
+        // non-`Project` announced BOTH columns nullable, where the
+        // engine keeps B1 NOT NULL.
+        let col = |name: &str, fid: usize, expr: Option<Expr>| ProjCol {
+            name: name.into(),
+            fname: None,
+            relation: Some("K1".into()),
+            rel_alias: None,
+            field_id: fid,
+            wire: Wire::Int64,
+            sql_type: 497,
+            length: 4,
+            oct_length: 4,
+            scale: 0,
+            sub_type: 0,
+            expr,
+        };
+        let project = |cols: Vec<ProjCol>| Plan::Project {
+            rel: 41,
+            formats: Vec::new(),
+            cols,
+            filter: None,
+            order_by: Vec::new(),
+            gen_cols: Vec::new(),
+            index: None,
+            defer: None,
+            windows: Vec::new(),
+            win_base: 0,
+        };
+        let derived = |inner: Plan, cols: Vec<ProjCol>, windows: Vec<WinSpec>, win_base: usize| {
+            Plan::Derived {
+                inner: Box::new(inner),
+                cols,
+                filter: None,
+                windows,
+                win_base,
+                order_by: Vec::new(),
+            }
+        };
+        // the inner layer: output (ID, V) = base fields (1, 0)
+        let inner_cols = vec![col("ID", 1, None), col("V", 0, None)];
+        let inner = project(inner_cols.clone());
+        assert_eq!(side_base_fids(Some(&inner), &inner_cols), vec![Some(1), Some(0)]);
+        // the outer layer numbers itself by the INNER's output
+        // positions: A1 reads inner 1 (base 0), B1 reads inner 0 (base 1)
+        let outer_cols = vec![col("A1", 1, None), col("B1", 0, None)];
+        let outer = derived(inner.clone(), outer_cols.clone(), Vec::new(), 2);
+        assert_eq!(side_base_fids(Some(&outer), &outer_cols), vec![Some(0), Some(1)]);
+        // THREE layers compose the same way
+        let top_cols = vec![col("Z", 1, None), col("Y", 0, None)];
+        let top = derived(outer.clone(), top_cols.clone(), Vec::new(), 2);
+        assert_eq!(side_base_fids(Some(&top), &top_cols), vec![Some(1), Some(0)]);
+        // an EXPRESSION at EITHER layer stops at that column and only
+        // that column - `None` composed with anything stays `None`
+        let expr_inner_cols = vec![col("ID", 1, None), col("L", 0, Some(Expr::Int(7)))];
+        let expr_inner = project(expr_inner_cols.clone());
+        let over = derived(expr_inner, outer_cols.clone(), Vec::new(), 2);
+        assert_eq!(side_base_fids(Some(&over), &outer_cols), vec![None, Some(1)]);
+        let expr_outer = vec![col("A1", 1, None), col("K", 0, Some(Expr::Int(1)))];
+        let over = derived(inner.clone(), expr_outer.clone(), Vec::new(), 2);
+        assert_eq!(side_base_fids(Some(&over), &expr_outer), vec![Some(0), None]);
+        // a WINDOW value is appended PAST the bound row, so its number
+        // is a SLOT and names no position below
+        let win_cols = vec![col("B1", 0, None), col("RN", 2, None)];
+        let win = derived(
+            inner.clone(),
+            win_cols.clone(),
+            vec![WinSpec { kind: WinKind::Rank(RankFn::RowNumber), part: Vec::new(), order: Vec::new() }],
+            2,
+        );
+        assert_eq!(side_base_fids(Some(&win), &win_cols), vec![Some(1), None]);
+        // a layer over rows that are NOT a projection maps nothing, and
+        // the layer above it maps nothing either
+        let rows = Plan::Rows { rows: Vec::new(), cols: inner_cols.clone() };
+        let over_rows = derived(rows, outer_cols.clone(), Vec::new(), 2);
+        assert_eq!(side_base_fids(Some(&over_rows), &outer_cols), vec![None, None]);
+    }
+
+    #[test]
+    fn a_relation_name_resolves_to_the_first_row_that_carries_it() {
+        // RDB$RELATIONS is keyed by (schema, name), so `PUBLIC.T` a
+        // TABLE can sit beside `S2.T` a VIEW. `view_of` folds this
+        // predicate over the catalog walk; `resolve_relation` and
+        // `relation_schema` take the first row of the name too, so all
+        // three must land on the SAME row. Asking "is ANY relation of
+        // this name a view" refused a join against the plain table -
+        // and the refusal propagated into DML as a LOST WRITE.
+        // (schema, name, is a view) in catalog walk order
+        let catalog: &[(&str, &str, bool)] = &[
+            ("PUBLIC", "T ", false),
+            ("PUBLIC", "TQ", false),
+            ("S2", "T", true),
+        ];
+        // exactly `view_of`'s fold: the first deciding row, and no other
+        let resolves_to_view = |cat: &[(&str, &str, bool)], want: &str| -> bool {
+            let mut seen = false;
+            let mut is_view = false;
+            for (_, name, view) in cat {
+                if !decides_relation(seen, Some(name), want) {
+                    continue;
+                }
+                seen = true;
+                is_view = *view;
+            }
+            is_view
+        };
+        // the TABLE is the relation `T` names - trailing blanks and all,
+        // since a catalog name is stored padded
+        assert!(!resolves_to_view(catalog, "T"));
+        assert!(!resolves_to_view(catalog, "TQ"));
+        // ...and a name only the view carries is still a view
+        let vstar: &[(&str, &str, bool)] = &[("PUBLIC", "TQ", false), ("PUBLIC", "VSTAR", true)];
+        assert!(resolves_to_view(vstar, "VSTAR"));
+        // the rule is POSITIONAL, not "prefer the table": if the view's
+        // row comes first it is what the name resolves to, which is what
+        // keeps this walk agreeing with `resolve_relation`
+        let flipped: &[(&str, &str, bool)] = &[("S2", "T", true), ("PUBLIC", "T", false)];
+        assert!(resolves_to_view(flipped, "T"));
+        // the predicate itself: only an unseen, matching row decides
+        assert!(decides_relation(false, Some("T"), "T"));
+        assert!(!decides_relation(true, Some("T"), "T"));
+        assert!(!decides_relation(false, Some("TQ"), "T"));
+        assert!(!decides_relation(false, None, "T"));
     }
 
     #[test]

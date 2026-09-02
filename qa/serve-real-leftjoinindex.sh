@@ -269,10 +269,12 @@ join_hashed() { # <label> <sql> - answers alike AND the inner side was HASHED
     # than scan the whole inner per driver, this server groups it once by the
     # key and looks up the bucket (the engine's own HASH plan). A distinct
     # "join hash:" trace line, so it counts apart from an index probe and a
-    # whole-inner scan.
-    bh=$(count_line "join hash: rel=")
+    # whole-inner scan. Two spellings: `rel=` when the hashed side is a
+    # base relation, `side=` when it is a materialised derived side (which
+    # has no relation of its own to name) - both are the hash path.
+    bh=$(count_line "join hash: ")
     same "$1" "$2"
-    ah=$(count_line "join hash: rel=")
+    ah=$(count_line "join hash: ")
     ran=$((ran + 1))
     if [ "$ah" -gt "$bh" ]; then
         echo "OK   ... and the inner side was HASHED (keyed in one pass, no index)"
@@ -466,9 +468,13 @@ join_indexed "a VIEW inner side, flattened to its base table" \
 join_indexed "a DERIVED inner side, flattened the same" \
     "SELECT CHI.ID, DD.N FROM CHI LEFT JOIN (SELECT K, N FROM PAR) DD ON DD.K = CHI.K ORDER BY CHI.ID" 1
 # but a FILTER is a transform the flatten would DROP - a derived side
-# with its own WHERE keeps its materialised plan and SCANS (rows still
-# agree, because the inner plan applies the filter the probe cannot).
-join_natural "a DERIVED inner with a WHERE does NOT flatten" \
+# with its own WHERE keeps its materialised plan. It is not therefore
+# scanned per driving row: the two decisions are separate, so a side
+# that cannot be read as base records is still materialised ONCE and
+# HASHED on its own output column. (Until 2026-09-02 it fell all the way
+# to a per-driver scan, which is quadratic; the rows agreed either way,
+# because the inner plan applies the filter the probe cannot.)
+join_hashed "a DERIVED inner with a WHERE does NOT flatten" \
     "SELECT CHI.ID, DW.N FROM CHI LEFT JOIN (SELECT K, N FROM PAR WHERE K > 30) DW ON DW.K = CHI.K ORDER BY CHI.ID"
 # ...and the last of section 5. TWO indexed ON columns (`BAND.K1 = CHI.K
 # AND BAND.K2 = CHI.K`) is the engine's BITMAP AND of two indexes. This
