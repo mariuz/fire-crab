@@ -62,6 +62,7 @@ One line each; the gate is the proof.
 | an unqualified column in a body's nested DML is that STATEMENT'S own | a bare name is a column of the table the nested statement targets, resolved per row; `OLD.`/`NEW.` are the fired row. `TrigCtx::read` was `if context == 1 { new } else { old }`, so CTX_PLAIN read the FIRED row and the fold baked it in as a constant: `DELETE FROM LG WHERE ID = OLD.ID` rendered `WHERE 2 = 2` and emptied the table, `SET V = V + 1` wrote the fired row's value over every row, `WHERE V > 1000` never consulted the target. Plain INTEGER reaches all three. Second half: a value the fold could not SPELL fell through to the bare NAME, so `SET AMT = NEW.AMT` became `SET AMT = AMT` - stores nothing, reports success; DOUBLE and FLOAT now render in shortest-round-trip exponent form (measured bit-exact against the engine), INT128/DECFLOAT/blob refuse | `serve-real-psqlrowref` 21 |
 | one law, one encoding: the row contexts | the substitution that writes row values into a body's statement TEXT had its OWN numbering - 1 for NEW, **2** for OLD - which worked only while the reader was `if context == 1 { new } else { old }`. Tightening that reader (the row above) turned every `OLD.` on the TEXT path into a refusal: a body query's WHERE (`SELECT ... WHERE K = OLD.ID INTO :M`) and a store whose values were kept as written (a CASE, a concatenation). A 361-gate sweep stayed GREEN through it - nothing covered that path. Now 0/1 everywhere, with the coverage that was missing. Also here: a body's `INSERT INTO T VALUES (...)` with NO column list parsed the table name as `T VALUES` and made the whole trigger unrunnable, so every statement on its table refused | `serve-real-psqlrowref` 27 |
 | a record missing a field carries that FORMAT'S STORED DEFAULT | `ALTER TABLE T ADD B INTEGER DEFAULT 7 NOT NULL` rewrites no row - the value goes into the FORMAT, and every record behind it reads 7 from there. fc's format parser stopped at the descriptors, with a comment calling the trailing section ignorable "as are defaults by the engine's readers of old rows"; the second clause was false. Every historical row read NULL for the new column: SELECT wrong, `INSERT ... SELECT` PERSISTING the wrong value, and `UPDATE T SET <anything else>` answering a false 23000 for a NOT NULL column it never touched. Layout read off engine-built blobs (BLOBDUMP): after the descriptors, `u16 default_count`, then per default `u16 field_index` + a 12-byte descriptor + that many value bytes; the default's descriptor is ITS OWN (a VARCHAR(5) field is VARYING 22 while its default is TEXT 2), so the value CONVERTS. A NULLABLE `ADD ... DEFAULT` writes NO entry, which is the discriminating case | `serve-real-fmtdefault` 24 |
+| DML through a VIEW acts on what the view stands for | a view has a relation id and NO records, so `UPDATE V ...` / `DELETE FROM V ...` planned as a walk of the view's storage were SILENT NO-OPS ("Records affected: 0", base untouched) and `INSERT INTO V` a bare Dynamic SQL Error. The engine's laws, measured: a NATURALLY UPDATABLE view (one plain relation; no join, DISTINCT, GROUP BY, aggregate, UNION, FIRST/SKIP/ROWS, ORDER BY, window or derived table - ORDER BY alone makes it read-only; a subquery in its WHERE is fine) forwards INSERT/UPDATE/DELETE to its base table with the view's column renames (RDB$BASE_FIELD) applied and its WHERE ANDed in, recursively through a view over a view; RETURNING answers the base row but DESCRIBES the view (name, `table: V`, nullable, an expression column typed from its expression). Any other shape is `cannot update read-only view` (bare 335544362 + the quoted name) at PREPARE; assigning an EXPRESSION column is `attempted update of read-only column <unknown>` (bare 335544359 + the literal `<unknown>`). WITH CHECK OPTION is the engine's system triggers CHECK_n (RDB$SYSTEM_FLAG 5, BLR only, a GLOBAL name sequence read from RDB$TRIGGERS: type 3 update, type 1 insert): the new row must SATISFY the view's WHERE - NULL is a violation, unlike a table CHECK - each level of a chain testing its OWN where, outer first; the vector is 335544558 with an EMPTY constraint name, the VIEW's name and the `At trigger` stack item. A view with a USER trigger for the event runs ONLY its triggers - no base write even when naturally updatable; the count is the number of view rows, OLD/NEW are view rows, a BEFORE trigger's `NEW.x` shows in RETURNING, a multi-action type counts per event, and the CHECK fires before the trigger. An INSERT through a view that supplies the identity value itself still DRAWS the base's generator (the same statement on the table does not). MERGE, UPDATE OR INSERT, INSERT ... SELECT and PSQL bodies inherit because they re-plan text. The rewrite is a single-pass simultaneous rename (a swapping view `(A, ID) AS SELECT ID, A` is right); a hidden base column named in the statement, a base-qualified reference, or an ambiguous view-qualified reference inside a subquery over the base REFUSE rather than answer wrong (the engine's -206 has no fc vector); a body fc cannot parse is Unplannable - never the typed read-only vector, and never the silent no-op again (every planner refuses a view it did not rewrite). Two reviews of 3 and 2 agents VERIFIED every finding by running it - four HIGHs (hidden columns leaking through the rename, subquery scope, a view over a trigger view bypassing the guard, CHECK OPTION passing NULL) and the resolver's fall-through to the old no-op were all caught that way. Recorded, not mirrored: the engine's RETURNING through a CHECK OPTION view answers zeros/no row (its trigger does the write) | `serve-real-viewdml` 61; `serve-real-overriding` 11b flipped from a recorded refusal to twin equalities |
 
 ## Stale claims retired
 
@@ -4199,6 +4200,85 @@ pointer-page and TIP page numbers is the next step when it dominates.
 - **G, the external sort** — every sort and hash build is bounded by
   RAM today; after the growth walls this is the next scalability
   ceiling a real database reaches.
+
+## Found while converting DML through a VIEW (2026-09-01/02) - still open
+
+Every item below was REPRODUCED by a reviewer on a plain-table twin (or
+on the HEAD binary), so none is a regression of the view chunk; they are
+the base planner's own, surfaced because the view rewrite renders
+statements the gates had never written.
+
+- **HIGH (silent wrong write, plain table)** - a correlated scalar
+  subquery with an ALIASED FROM in a SET value loses its correlation:
+  `UPDATE T SET A = (SELECT MAX(x.A) FROM T x WHERE x.ID < T.ID) WHERE
+  ID = 3 RETURNING ID, A` writes NULL (engine 3|20). The view form now
+  renders the correlation correctly and is REFUSED by the same planner.
+  Related: `UPDATE T t SET S = (SELECT NM FROM D WHERE D.ID = t.ID)` -
+  `strip_dml_alias` drops `t.` inside the subquery, which then binds to
+  D (21000 "multiple rows in singleton select"; with a one-row D it
+  would write the wrong value silently). The view target keeps the
+  qualifier; a table target still strips it.
+- **HIGH (silent wrong answer, SELECT side)** - a correlated scalar
+  subquery in the PROJECTION answers ZERO ROWS: `SELECT ID, A, (SELECT A
+  FROM D WHERE D.ID = T.ID) FROM T WHERE ID = 2` -> no row (engine
+  `2|20|222`); the same over a view. A trigger-view statement carrying
+  such a subquery is refused rather than run through it.
+- **HIGH (silent wrong write, plain table)** - a quoted lower-case
+  column `"a"` on a table that also has `A` is written to A: `UPDATE TQ
+  SET "a" = 5 ... RETURNING ID, "a", A` -> fc `1|1|5` (engine `1|5|100`);
+  `INSERT INTO TQ (ID, "a") VALUES (3, 3)` lands in A. Same family: a
+  quoted lower-case VIEW `"v"` beside `V` folds onto the same memo and
+  catalog match. Case folding of quoted identifiers across the catalog.
+- **MEDIUM (wrong value, bound params)** - a `?` inside SET arithmetic
+  is bound as the client's own value type, not coerced to the DESCRIBED
+  type: node-firebird sends 1.25 as a double for `SET A = ? * 2` and fc
+  answers 3 where the engine (INPUT described `LONG scale -2`) answers 2;
+  `SET N = ? * 2` -> 2.5 vs 2. Identical through a trigger view.
+- **MEDIUM (reservation)** - a SELECT over a VIEW under SNAPSHOT TABLE
+  STABILITY does not reserve the base table (a concurrent NO WAIT writer
+  succeeds; engine raises 40001). A trigger-view statement inherits it.
+  INSERT ... SELECT / MERGE through a natural view DO reserve the base
+  now (`view_base_rel`).
+- **MEDIUM (DDL refusal)** - `CREATE VIEW ... WITH CHECK OPTION` is
+  refused (`plan_create_view`, "a later slice"): the CHECK OPTION
+  runtime works only over an engine-built catalog (the CHECK_n system
+  triggers). Creating them means writing two RDB$TRIGGERS rows with
+  BLR the engine would accept.
+- **MEDIUM (refusal)** - `MERGE INTO <trigger-backed view>`: merge_exec
+  probes the target with a base DELETE plan and a `Plan::ViewTrig`
+  fails it. UPDATE OR INSERT through the same view works.
+- **LOW (refusals, SELECT planner)** - through a trigger view the
+  statement's SET/WHERE become a SELECT, so the SELECT planner's gaps
+  apply: `CAST(? AS BOOLEAN)`, `UPPER(?)` / `ABS(?)` over a param,
+  `CASE WHEN ? > 0 ...`, `INSERT ... SELECT ?, ? FROM RDB$DATABASE`,
+  `WHERE ID IN (SELECT ...)` / `EXISTS (...)` over a VIEW, `EXECUTE
+  BLOCK (X INTEGER = ?)`. Each refuses at prepare; the table twins of
+  the param shapes refuse too.
+- **LOW (refusals, trigger bodies)** - `COALESCE` in a NEW assignment,
+  NUMERIC arithmetic in a NEW assignment (`NEW.N = NEW.N + 1`),
+  `EXCEPTION E 'msg' || expr`, and self-recursive DML are "not
+  inlineable" - a view whose engine-created trigger has one makes every
+  statement through it refuse.
+- **LOW (error shapes)** - the engine's `-206 Column unknown`, `-804`,
+  `22001 string right truncation`, `22018`, `22003` all answer a bare
+  Dynamic SQL Error; `UPDATE VJ ... WHERE NOPE = 1` gets the read-only
+  view vector where the engine reports -206 first; fbclient's
+  `isc_dsql_execute` + `isc_dsql_fetch` over a RETURNING statement gets
+  -504 (isql and node use paths that work); a text param's INPUT
+  describe under a WIN1252 attachment names the column's charset where
+  the engine names the attachment's; the engine reports `select=N` in
+  isc_info_sql_records for every DML.
+- **LOW (recorded boundaries of the view chunk itself)** - a hidden base
+  column or base-qualified reference in a view statement refuses (no
+  -206 vector); `RETURNING OLD.<expression column>` refuses (engine
+  answers); a view-qualified reference inside a subquery over the base
+  refuses (ambiguous); a body fc cannot parse (a CTE, a scalar subquery
+  the RETURNING planner cannot evaluate) refuses generically where the
+  engine says read-only or answers; a trigger view whose CHECK OPTION
+  WHERE names a column outside its column list refuses at prepare; the
+  engine's RETURNING through a CHECK OPTION view answers zeros/no row
+  (its trigger does the write) and fc answers the real values - a BOUND
+  line, not mirrored.
 
 ## Found by the THIRD hunt (2026-09-01)
 

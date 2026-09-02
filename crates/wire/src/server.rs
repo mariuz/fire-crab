@@ -8781,6 +8781,15 @@ AlterDomainRename {
         /// step). Each bumps its generator at execute and stores the new
         /// value into the field.
         gen_fields: Vec<(usize, String, Option<i64>)>,
+        /// generator draws WASTED: a base table's IDENTITY column whose
+        /// value an INSERT THROUGH A VIEW supplied itself still draws the
+        /// base generator, and discards the draw (measured 2026-09-01:
+        /// `INSERT INTO VTA (ID,B) OVERRIDING SYSTEM VALUE VALUES
+        /// (4444,'v9')` moves RDB$6 from 0 to 1 where the same INSERT on
+        /// the TABLE does not; a BY DEFAULT column given an explicit
+        /// value through the view likewise). Filled only by the view
+        /// path ([plan_insert_view_inner]).
+        wasted_gens: Vec<String>,
         /// field ids under a NOT NULL constraint - checked after
         /// binding, exactly where the engine validates
         not_null: Vec<usize>,
@@ -8912,6 +8921,45 @@ AlterDomainRename {
         /// draw: the walk must ADVANCE the generator once per row it
         /// compares, which the [Predicate] machinery cannot do
         gen_filter: Option<GenFilter>,
+    },
+    /// A statement through a VIEW that has a USER TRIGGER for the event:
+    /// the engine runs ONLY the triggers - no base write - whatever the
+    /// body shape (measured: VT2 naturally updatable, VJ a join). `rows`
+    /// is a SELECT yielding, per view row the statement touches, the
+    /// view's columns in `cols` order and then the assigned values
+    /// (`assigned` names their field ids); an INSERT's `rows` yields
+    /// only the assigned values. OLD / NEW are view rows under the view's
+    /// own format (`descs`); `checks` is the view's own CHECK OPTION,
+    /// which fires FIRST. See [plan_view_trig].
+    ViewTrig {
+        view: String,
+        /// 1 INSERT, 2 UPDATE, 3 DELETE
+        action: u8,
+        rows: Box<Plan>,
+        cols: Vec<RelationColumn>,
+        descs: Vec<Descriptor>,
+        assigned: Vec<usize>,
+        triggers: Vec<TrigDef>,
+        checks: Vec<TableCheck>,
+        /// the CHECK OPTIONs of the views ABOVE this one (a view over a
+        /// trigger view carrying WITH CHECK OPTION): each is that
+        /// level's own BEFORE trigger, which fires - and tests the NEW
+        /// as the statement wrote it - BEFORE the statement cascades
+        /// down to this view's user triggers (measured: VVCT over VT2
+        /// whose BEFORE INSERT adds 1 rejects `(703, 25)` under `A >
+        /// 25`, review-caught when the outer test moved after the
+        /// triggers with the own-level one)
+        outer_checks: Vec<TableCheck>,
+        /// `SELECT <every view column> FROM <view>` - the SELECT whose
+        /// describe TYPES the view's columns (`descs` is laid out from
+        /// it, never from the view's own RDB$FORMATS row, which types a
+        /// UTF8 VARCHAR(5) as 18 bytes of NONE - review-caught), and the
+        /// RE-READ an UPDATE's CHECK OPTION locates OLD through after
+        /// the BEFORE triggers ran
+        reread: Box<Plan>,
+        /// `INSERT ... VALUES` / `DEFAULT VALUES`: its RETURNING is the
+        /// engine's exec_procedure singleton (type 8), as a table's is
+        singleton: bool,
     },
     Project {
         rel: u16,
@@ -14639,7 +14687,7 @@ fn check_predicates_uncached(
             .map(|(_, cn)| cn.clone())
             .unwrap_or_else(|| trig.clone());
         let trigger = if trig.is_empty() { None } else { Some(trig) };
-        out.push(TableCheck { constraint, trigger, pred: p });
+        out.push(TableCheck { constraint, trigger, pred: p, view: None });
     }
     Some(out)
 }
@@ -14653,6 +14701,26 @@ struct TableCheck {
     constraint: String,
     trigger: Option<String>,
     pred: Predicate,
+    /// a view's WITH CHECK OPTION ([view_check_table_check]): the
+    /// vector names the VIEW and an EMPTY constraint (measured:
+    /// `Operation violates CHECK constraint  on view or table
+    /// "PUBLIC"."VC"` - two spaces), and `pred` is the POSITIVE view
+    /// condition the row must satisfy
+    view: Option<String>,
+}
+
+impl TableCheck {
+    /// Does the row VIOLATE this check? A table CHECK holds its NEGATED
+    /// predicate: a match is the violation and an UNKNOWN (NULL
+    /// operand) passes. A view's CHECK OPTION holds the POSITIVE view
+    /// condition and the row must SATISFY it: anything but TRUE - an
+    /// UNKNOWN included - is the violation (measured: `UPDATE VC SET A
+    /// = NULL` and `INSERT INTO VC (ID, A) VALUES (50, NULL)` raise
+    /// CHECK_1 / CHECK_2 where a table CHECK would let NULL through).
+    fn violated(&self, values: &[Value]) -> Result<bool, EvalErr> {
+        let m = self.pred.matches(values)?;
+        Ok(if self.view.is_some() { !m } else { m })
+    }
 }
 
 /// One column's DOMAIN CHECK, as a NEGATED predicate over the table's
@@ -24801,10 +24869,48 @@ fn wrap_returning(
     db: &Option<Database>,
 ) -> Option<(Plan, Vec<Descriptor>)> {
     let dbr = db.as_ref()?;
+    // A TRIGGER-BACKED VIEW named by the statement itself
+    // ([Plan::ViewTrig]) resolves against the VIEW's own columns and
+    // format - its rows ARE view rows. A view ABOVE it takes the
+    // rewrite below, which lands on the trigger view's name.
+    let trig_view: Option<String> = match &plan {
+        Plan::ViewTrig { view, .. } => Some(view.clone()),
+        _ => None,
+    };
+    let direct = trig_view
+        .as_ref()
+        .is_some_and(|v| canon_relation_name(dbr, table).as_deref() == Some(v.as_str()));
+    if !direct {
+        // A VIEW target: the list is rewritten onto the base table and the
+        // describe re-stamped with the view ([wrap_returning_view]). A
+        // MERGE into a view keeps its own aliases and is not served
+        match view_dml_target(dbr, table, view_event_of(&plan)) {
+            ViewDml::NotAView => {}
+            ViewDml::Unplannable => return None,
+            ViewDml::Target(vt) => {
+                if matches!(&plan, Plan::Merge { .. }) {
+                    return None;
+                }
+                return wrap_returning_view(plan, params, list, &vt, db);
+            }
+        }
+        if is_view(dbr, table) {
+            return None;
+        }
+    }
     let rel = fire_crab_ods::resolve_relation(&dbr.bytes(), dbr.page_size, table)?;
-    let formats = fire_crab_ods::relation_formats(&dbr.bytes(), dbr.page_size, rel);
-    let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
-    let columns = dbr.columns(table);
+    // a TRIGGER VIEW's rows are typed by its SELECT's describe (the
+    // plan's `descs`), never by the view's stored format row - which
+    // carries a UTF8 VARCHAR(5) as 18 bytes of NONE (review-caught)
+    let (descs_own, columns): (Vec<Descriptor>, std::sync::Arc<Vec<RelationColumn>>) = match &plan {
+        Plan::ViewTrig { descs, cols, .. } if direct => (descs.clone(), std::sync::Arc::new(cols.clone())),
+        _ => {
+            let formats = fire_crab_ods::relation_formats(&dbr.bytes(), dbr.page_size, rel);
+            let (_, d) = formats.iter().max_by_key(|(n, _)| *n)?;
+            (d.clone(), dbr.columns(table))
+        }
+    };
+    let descs: &Vec<Descriptor> = &descs_own;
     let mut cols = Vec::new();
     let mut fields = Vec::new();
     // output positions written `NEW.<col>` (a MERGE only)
@@ -24877,9 +24983,9 @@ fn wrap_returning(
     // ...and a MERGE has both images as well: its matched branch is an
     // UPDATE, and on the INSERT branch the engine answers OLD as NULL
     // (probed) rather than refusing the statement.
-    let two_rows = matches!(&plan, Plan::Update { .. } | Plan::Merge { .. })
+    let two_rows = matches!(&plan, Plan::Update { .. } | Plan::Merge { .. } | Plan::ViewTrig { action: 2, .. })
         || matches!(&plan, Plan::Returning { inner, .. }
-            if matches!(inner.as_ref(), Plan::Update { .. } | Plan::Merge { .. }));
+            if matches!(inner.as_ref(), Plan::Update { .. } | Plan::Merge { .. } | Plan::ViewTrig { action: 2, .. }));
     // the OLD row is appended to each returned row at `width`
     let width = descs.len();
     // ...so an expression that names it resolves against a DOUBLED
@@ -25279,6 +25385,14 @@ fn wrap_returning(
     if cols.is_empty() {
         return None;
     }
+    if let (true, Some(v)) = (direct, &trig_view) {
+        // the VIEW's catalog spelling is the origin (measured: `table: VT2`)
+        for c in cols.iter_mut() {
+            if c.relation.is_some() {
+                c.relation = Some(v.clone());
+            }
+        }
+    }
     Some((
         Plan::Returning {
             new_cols,
@@ -25511,8 +25625,10 @@ fn dml_table_name(sql: &str) -> Option<String> {
 /// wrong rows. A correlated subquery that merely READS `t.<col>` is
 /// rewritten like any other reference, which is what the engine
 /// resolves it to.
-fn strip_dml_alias(sql: &str) -> Option<String> {
+fn strip_dml_alias(sql: &str, view_target: bool) -> Option<String> {
     let (alias, def_at) = dml_target_alias(sql)?;
+    let (_, target) = dml_target(sql)?;
+    let target = target.to_string();
     let up = sql.to_ascii_uppercase();
     let masked = mask_literals(&up);
     let b = masked.as_bytes();
@@ -25540,11 +25656,50 @@ fn strip_dml_alias(sql: &str) -> Option<String> {
             return None;
         }
         out.push_str(&sql[cut..p]);
+        // Through a VIEW, a qualifier INSIDE A SUBQUERY becomes the
+        // view's own name, which the view rewrite then binds to the
+        // base row ([rename_view_idents]) - bare, it would be the
+        // subquery's own column (review-caught: `DELETE FROM VAL v
+        // WHERE EXISTS (SELECT 1 FROM D WHERE D.ID = v.I)` refused).
+        // A subquery whose FROM names the view itself cannot tell the
+        // two apart: the statement keeps its alias and refuses
+        if view_target && paren_depth_at(&masked, p) > 0 {
+            if dml_alias_subquery_names(&masked, p, &target) {
+                return None;
+            }
+            out.push_str(&target);
+            out.push('.');
+            cut = after + 1;
+            from = after;
+            continue;
+        }
         cut = after + 1; // the qualifier AND its dot
         from = after;
     }
     out.push_str(&sql[cut..]);
     Some(out)
+}
+
+/// Does a SUBQUERY enclosing byte `at` of `masked` name `target` in
+/// its own FROM list?
+fn dml_alias_subquery_names(masked: &str, at: usize, target: &str) -> bool {
+    let b = masked.as_bytes();
+    let mut opens: Vec<usize> = Vec::new();
+    for (i, &c) in b.iter().enumerate().take(at) {
+        match c {
+            b'(' => opens.push(i),
+            b')' => {
+                opens.pop();
+            }
+            _ => {}
+        }
+    }
+    opens.iter().any(|&o| {
+        let word = masked[o + 1..].trim_start();
+        word.starts_with("SELECT")
+            && !word[6..].starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+            && view_group_from_names(masked, o).iter().any(|n| n.eq_ignore_ascii_case(target))
+    })
 }
 
 /// The ALIAS a DML statement gave its target, when it gave one -
@@ -25961,6 +26116,14 @@ fn plan_insert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
         return None;
     }
     let into = find_word(&masked, "INTO", "INSERT".len())?;
+    // A VIEW target: rewritten onto its base table and re-planned
+    // ([plan_insert_view]) - BEFORE the INSERT ... SELECT split, so
+    // that form inherits it
+    if let Some(dbr) = db.as_ref() {
+        if let Some(planned) = plan_insert_view(s, &masked, into, dbr, db) {
+            return planned;
+        }
+    }
     // `INSERT ... SELECT` instead of `INSERT ... VALUES`
     if let Some(sel) = find_word(&masked, "SELECT", into + "INTO".len()) {
         let vals = find_word(&masked, "VALUES", into + "INTO".len());
@@ -26427,6 +26590,7 @@ fn plan_insert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
             triggers: insert_triggers,
             trig_cols: columns.clone(),
             gen_fields,
+            wasted_gens: Vec::new(),
             checks,
             domain_checks,
             not_null,
@@ -28344,6 +28508,18 @@ fn plan_update(sql: &str, db_outer: &Option<Database>) -> Option<(Plan, Vec<Desc
     if !relation_qualifier_ok(db, schema, table) {
         return None;
     }
+    // A VIEW: rewritten onto its base table and re-planned
+    // ([plan_update_view]); a non-updatable one refuses with the
+    // engine's own vector; one the rewrite cannot plan refuses
+    // generically - NEVER a table plan over the view's empty storage
+    match view_dml_target(db, table, 2) {
+        ViewDml::NotAView => {}
+        ViewDml::Unplannable => return None,
+        ViewDml::Target(vt) => return plan_update_view(s, set_kw, where_kw, &vt, db, db_outer),
+    }
+    if is_view(db, table) {
+        return None;
+    }
     // THROUGH THE METADATA CACHE - the id, the columns and the
     // formats are what the catalog says about this table, and
     // only DDL changes that (see [crate::mdc]). Reading them
@@ -28801,6 +28977,17 @@ fn plan_delete(sql: &str, db_outer: &Option<Database>) -> Option<(Plan, Vec<Desc
     let (schema, table) = dml_target_name(&s[from_kw + "FROM".len()..where_kw.unwrap_or(s.len())])?;
     let db = db.as_ref()?;
     if !relation_qualifier_ok(db, schema, table) {
+        return None;
+    }
+    // A VIEW: rewritten onto its base table ([plan_delete_view]); one
+    // the rewrite cannot plan refuses generically - never a table plan
+    // over the view's empty storage
+    match view_dml_target(db, table, 3) {
+        ViewDml::NotAView => {}
+        ViewDml::Unplannable => return None,
+        ViewDml::Target(vt) => return plan_delete_view(s, where_kw, &vt, db, db_outer),
+    }
+    if is_view(db, table) {
         return None;
     }
     let rel = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, table)?;
@@ -29423,10 +29610,25 @@ fn dml_target_rel(plan: &Plan, db: &Database) -> Option<u16> {
         }
         Plan::Returning { inner, .. } => dml_target_rel(inner, db),
         Plan::UpdateOrInsert { update, .. } => dml_target_rel(update, db),
-        Plan::Merge { target, .. } => db.relation_meta(target).map(|r| r.id),
-        Plan::InsertSelect { table, .. } => db.relation_meta(table).map(|r| r.id),
+        // a VIEW target names its BASE table's id: the reservation is
+        // the base's (review-caught: INSERT ... SELECT through a view
+        // reserved the view's id, and a consistency transaction no
+        // longer blocked a concurrent writer of the base table)
+        Plan::Merge { target, .. } => view_base_rel(db, target, 2),
+        Plan::InsertSelect { table, .. } => view_base_rel(db, table, 1),
         _ => None,
     }
+}
+
+/// The relation id a DML target reserves: the BASE table's when the
+/// name is a view the rewrite resolves, else the relation's own.
+fn view_base_rel(db: &Database, name: &str, event: u8) -> Option<u16> {
+    if let ViewDml::Target(vt) = view_dml_target(db, name, event) {
+        if !vt.read_only && !vt.base_is_view {
+            return db.relation_meta(&vt.base).map(|r| r.id);
+        }
+    }
+    db.relation_meta(name).map(|r| r.id)
 }
 
 /// TABLE STABILITY, at the write. A CONSISTENCY transaction reserves the
@@ -29657,7 +29859,8 @@ fn plan_publishing_triggers(plan: &Plan) -> bool {
     let t = match plan {
         Plan::Insert { triggers, .. }
         | Plan::Update { triggers, .. }
-        | Plan::Delete { triggers, .. } => triggers,
+        | Plan::Delete { triggers, .. }
+        | Plan::ViewTrig { triggers, .. } => triggers,
         Plan::Returning { inner, .. } => return plan_publishing_triggers(inner),
         _ => return false,
     };
@@ -29684,6 +29887,7 @@ fn ddl_firing_for(
         Plan::Insert { .. }
             | Plan::Update { .. }
             | Plan::Delete { .. }
+            | Plan::ViewTrig { .. }
             | Plan::SetGenerator { .. }
             | Plan::Returning { .. }
     ) {
@@ -29712,6 +29916,7 @@ fn plan_is_ddl(plan: &Plan) -> bool {
         Plan::Insert { .. }
             | Plan::Update { .. }
             | Plan::Delete { .. }
+            | Plan::ViewTrig { .. }
             | Plan::SetGenerator { .. }
             | Plan::Returning { .. }
             | Plan::Scalar(..)
@@ -29896,7 +30101,7 @@ fn execute_dml_collecting_inner(
     if db.is_read_only() {
         let dsql = !matches!(
             plan,
-            Plan::Insert { .. } | Plan::Update { .. } | Plan::Delete { .. }
+            Plan::Insert { .. } | Plan::Update { .. } | Plan::Delete { .. } | Plan::ViewTrig { .. }
         );
         return Err(ExecErr::Eval(EvalErr::ReadOnlyDatabase { dsql }));
     }
@@ -29919,7 +30124,7 @@ fn execute_dml_collecting_inner(
     // server's DDL is not transactional - so only the three verbs ask,
     // and only they burn an id.
     let (mut work, stmt_tx) = match plan {
-        Plan::Insert { .. } | Plan::Update { .. } | Plan::Delete { .. } => {
+        Plan::Insert { .. } | Plan::Update { .. } | Plan::Delete { .. } | Plan::ViewTrig { .. } => {
             let (w, tx) = db.work_copy_with_tx()?;
             (w, Some(tx))
         }
@@ -30553,7 +30758,7 @@ fn execute_dml_collecting_inner(
             )?;
             (0, 0, 0)
         }
-        Plan::Insert { rel, table, format_no, image, descs, index_ops, param_fields, param_exprs, triggers, trig_cols, gen_fields, not_null, checks, domain_checks, fk_refs, default_fields, blob_lits } => {
+        Plan::Insert { rel, table, format_no, image, descs, index_ops, param_fields, param_exprs, triggers, trig_cols, gen_fields, wasted_gens, not_null, checks, domain_checks, fk_refs, default_fields, blob_lits } => {
             let mut image = image.clone();
             // MATERIALISE the temporary blobs the parameters name (blb::move):
             // the closed temp blob's segments land in THIS relation's pages
@@ -30624,6 +30829,15 @@ fn execute_dml_collecting_inner(
                 let at = d.offset as usize;
                 image[at..at + 8].copy_from_slice(&id);
                 image[fid / 8] &= !(1 << (fid % 8));
+            }
+            // an identity draw the engine makes and THROWS AWAY (an
+            // INSERT through a view that supplied the column's value, or
+            // wrote DEFAULT for it) - BEFORE the real draw: the row holds
+            // the later value (measured: `VALUES (DEFAULT, ...)` through
+            // the view moves the generator 11 -> 13 and stores 13)
+            for name in wasted_gens {
+                let (id, incr) = generator_info(db, name).ok_or("no such generator")?;
+                gen_bump_through_cache(db, &mut work, name, id, incr)?;
             }
             for (fid, name, step) in gen_fields {
                 let (id, incr) = generator_info(db, name).ok_or("no such generator")?;
@@ -30749,7 +30963,7 @@ fn execute_dml_collecting_inner(
             if !checks.is_empty() {
                 let values = decode_record(&image, descs);
                 for c in checks {
-                    match c.pred.matches(&values) {
+                    match c.violated(&values) {
                         Ok(true) => return Err(check_violation_err(table, c)),
                         Ok(false) => {}
                         Err(e) => return Err(ExecErr::Eval(e)),
@@ -31299,7 +31513,7 @@ fn execute_dml_collecting_inner(
                 if !checks.is_empty() {
                     let new_values = decode_record(&img, descs);
                     for c in checks {
-                        match c.pred.matches(&new_values) {
+                        match c.violated(&new_values) {
                             Ok(true) => return Err(check_violation_err(table, c)),
                             Ok(false) => {}
                             Err(e) => return Err(ExecErr::Eval(e)),
@@ -31607,6 +31821,188 @@ fn execute_dml_collecting_inner(
                 }
             }
             (0, 0, deleted as i32)
+        }
+        Plan::ViewTrig { view, action, rows, cols, descs, assigned, triggers, checks, outer_checks, reread, singleton: _ } => {
+            // A VIEW WITH A USER TRIGGER FOR THE EVENT: only the triggers
+            // run, over the VIEW's rows - no base write (measured, section
+            // 9 of qa/serve-real-viewdml.sh). ALL the rows come first: a
+            // body may write the very tables the view reads.
+            //
+            // The row SELECT's PROJECTION `?`s (a SET value, a VALUES
+            // item) are bound here, exactly as op_execute binds a
+            // cursor's ([bind_plan_params]) - the statement's plan is the
+            // ViewTrig, so that pass never reached this inner one, and
+            // an `Expr::Param` reached eval: every bound SET / VALUES
+            // failed at execute (review-caught). The WHERE's `?`s bind
+            // through `args` as any filter's do.
+            let bound_rows: Plan;
+            let rows: &Plan = if plan_has_proj_param(rows) {
+                bound_rows = bind_plan_params(rows, args)
+                    .ok_or("a parameter of this view statement cannot be bound")?;
+                &bound_rows
+            } else {
+                rows
+            };
+            let found: Vec<Vec<Value>> = branch_rows(rows, db, args)
+                .ok_or("the SELECT behind this view statement is not one this server can run")?;
+            let n = cols.len();
+            let width = descs.len();
+            let place = |vals: &[Value]| -> Vec<Value> {
+                let mut row = vec![Value::Null; width];
+                for (c, v) in cols.iter().zip(vals) {
+                    if let Some(slot) = row.get_mut(c.field_id as usize) {
+                        *slot = v.clone();
+                    }
+                }
+                row
+            };
+            let mut count = 0usize;
+            for r in found {
+                let (old, mut new): (Option<Vec<Value>>, Option<Vec<Value>>) = match *action {
+                    1 => {
+                        let mut nw = vec![Value::Null; width];
+                        for (k, fid) in assigned.iter().enumerate() {
+                            if let Some(slot) = nw.get_mut(*fid) {
+                                *slot = r.get(k).cloned().unwrap_or(Value::Null);
+                            }
+                        }
+                        (None, Some(nw))
+                    }
+                    2 => {
+                        let o = place(&r[..n.min(r.len())]);
+                        let mut nw = o.clone();
+                        for (k, fid) in assigned.iter().enumerate() {
+                            if let Some(slot) = nw.get_mut(*fid) {
+                                *slot = r.get(n + k).cloned().unwrap_or(Value::Null);
+                            }
+                        }
+                        (Some(o), Some(nw))
+                    }
+                    _ => (Some(place(&r)), None),
+                };
+                if let Some(nw) = new.as_mut() {
+                    // NEW typed by the view's columns: through the view's
+                    // own format and back (a literal 140 becomes the
+                    // column's INTEGER before a body adds to it)
+                    let img = view_row_image(descs, nw)?;
+                    *nw = decode_record(&img, descs);
+                    // a CHECK OPTION at a level ABOVE this view is that
+                    // level's own BEFORE trigger: it tests the NEW as the
+                    // statement wrote it, before anything cascades down
+                    for c in outer_checks {
+                        match c.violated(nw) {
+                            Ok(true) => return Err(check_violation_err(view, c)),
+                            Ok(false) => {}
+                            Err(e) => return Err(ExecErr::Eval(e)),
+                        }
+                    }
+                }
+                // BEFORE triggers (NEW writable): the same publish-or-draw
+                // shape the table arms use
+                if triggers.iter().any(|t| t.before) {
+                    if triggers.iter().any(|t| t.needs_db) {
+                        work = fire_triggers_published(
+                            database, work, stmt_tx, ctx, cols, triggers, true, *action,
+                            new.as_mut(), old.as_ref(),
+                        )?;
+                        db = database.as_mut().ok_or("no database attached")?;
+                    } else {
+                        let mut drawer = |name: &str, step: Option<i64>| -> Result<i64, ExecErr> {
+                            let (id, incr) = generator_info(db, name)
+                                .ok_or_else(|| ExecErr::Text("no such generator".into()))?;
+                            gen_bump_through_cache(db, &mut work, name, id, step.unwrap_or(incr))
+                                .map_err(ExecErr::Text)
+                        };
+                        fire_triggers(
+                            &mut None, ctx, cols, triggers, true, *action, new.as_mut(),
+                            old.as_ref(), Some(&mut drawer),
+                        )?;
+                    }
+                }
+                // THE VIEW'S CHECK OPTION, AFTER the user BEFORE triggers
+                // and on the POST-trigger NEW (measured with a generator
+                // that survives the undo: a log-only trigger's sequence
+                // advances before the violation raises; a trigger that
+                // assigns NEW.A back into the view passes). For an UPDATE
+                // the engine's check trigger first LOCATES OLD - a view
+                // row equal to OLD on every view column - and a
+                // write-through trigger that already moved the base row
+                // leaves it nothing to test: the statement passes
+                // (review-caught; qa/serve-real-viewdml.sh section 9,
+                // VCT / VCW / VCN). A trigger that raises wins: the check
+                // never runs.
+                if !checks.is_empty() {
+                    if let Some(nw) = new.as_ref() {
+                        let located = match (old.as_ref(), *action) {
+                            (Some(o), 2) => {
+                                let now: Vec<Vec<Value>> = branch_rows(reread, db, &[])
+                                    .ok_or("the view behind this CHECK OPTION cannot be re-read")?;
+                                now.iter().any(|r| {
+                                    r.len() == cols.len()
+                                        && cols.iter().zip(r).all(|(c, v)| o.get(c.field_id as usize) == Some(v))
+                                })
+                            }
+                            _ => true,
+                        };
+                        if located {
+                            // the post-trigger NEW through the format,
+                            // as a body's assignment types it
+                            let img = view_row_image(descs, nw)?;
+                            let typed = decode_record(&img, descs);
+                            for c in checks {
+                                match c.violated(&typed) {
+                                    Ok(true) => return Err(check_violation_err(view, c)),
+                                    Ok(false) => {}
+                                    Err(e) => return Err(ExecErr::Eval(e)),
+                                }
+                            }
+                        }
+                    }
+                }
+                // RETURNING: NEW after the BEFORE triggers (OLD for a
+                // DELETE), under the VIEW's format
+                if let Some(a) = affected.as_deref_mut() {
+                    a.descs = descs.clone();
+                    let old_img = match old.as_ref() {
+                        Some(o) => view_row_image(descs, o)?,
+                        None => Vec::new(),
+                    };
+                    let new_img = match new.as_ref() {
+                        Some(nw) => view_row_image(descs, nw)?,
+                        None => old_img.clone(),
+                    };
+                    a.images.push(new_img);
+                    a.old_images.push(old_img);
+                    a.deleted.push(false);
+                }
+                // AFTER triggers: NEW read-only
+                if triggers.iter().any(|t| !t.before) {
+                    if triggers.iter().any(|t| t.needs_db) {
+                        work = fire_triggers_published(
+                            database, work, stmt_tx, ctx, cols, triggers, false, *action,
+                            new.as_mut(), old.as_ref(),
+                        )?;
+                        db = database.as_mut().ok_or("no database attached")?;
+                    } else {
+                        let mut drawer = |name: &str, step: Option<i64>| -> Result<i64, ExecErr> {
+                            let (id, incr) = generator_info(db, name)
+                                .ok_or_else(|| ExecErr::Text("no such generator".into()))?;
+                            gen_bump_through_cache(db, &mut work, name, id, step.unwrap_or(incr))
+                                .map_err(ExecErr::Text)
+                        };
+                        fire_triggers(
+                            &mut None, ctx, cols, triggers, false, *action, new.as_mut(),
+                            old.as_ref(), Some(&mut drawer),
+                        )?;
+                    }
+                }
+                count += 1;
+            }
+            match *action {
+                1 => (count as i32, 0, 0),
+                2 => (0, count as i32, 0),
+                _ => (0, 0, count as i32),
+            }
         }
         Plan::SetGenerator { name, mode, .. } => {
             // the generator's id locates its slot; its increment turns a
@@ -32976,8 +33372,10 @@ fn not_valid_err(db: &Database, table: &str, fid: usize) -> ExecErr {
 /// derive the 23000 from the first item either way).
 fn check_violation_err(table: &str, c: &TableCheck) -> ExecErr {
     ExecErr::Eval(EvalErr::CheckViolation {
-        constraint: quoted_bare(&c.constraint),
-        table: quoted_qualified(table),
+        // a view's CHECK OPTION ships an EMPTY constraint name and the
+        // VIEW as the relation (measured)
+        constraint: if c.view.is_some() { String::new() } else { quoted_bare(&c.constraint) },
+        table: quoted_qualified(c.view.as_deref().unwrap_or(table)),
         trigger: c.trigger.as_deref().map(quoted_qualified),
     })
 }
@@ -36379,9 +36777,12 @@ fn splice_ctes(sql: &str, ctes: &[(String, ViewDef)]) -> Option<String> {
 fn plan_view(db: &Option<Database>, dbr: &Database, name: &str) -> Option<(Plan, Vec<ProjCol>)> {
     let vd = view_of(dbr, name)?;
     let mut vparams: Vec<Option<Descriptor>> = Vec::new();
+    // a trailing WITH CHECK OPTION is a DML rule, not part of the query
+    // (review-caught: `SELECT COUNT(*) FROM VC` refused)
+    let (body, _) = strip_check_option(&vd.source);
     // the body is a VIEW's, so its semi-joins are NOT hashed - see
     // [plan_query_inner_ctx]
-    let inner = plan_query_inner_ctx(&vd.source, db, &mut vparams, true)?;
+    let inner = plan_query_inner_ctx(body, db, &mut vparams, true)?;
     if !vparams.is_empty() || matches!(inner, Plan::Refused) {
         return None;
     }
@@ -36956,6 +37357,2284 @@ fn view_of(db: &Database, name: &str) -> Option<ViewDef> {
         .collect();
     cols.sort_by_key(|(f, _)| *f);
     Some(ViewDef { source, cols: cols.into_iter().map(|(_, n)| n).collect() })
+}
+
+
+// ---------------------------------------------------------------------
+// DML THROUGH A NATURALLY UPDATABLE VIEW
+//
+// The engine (measured 2026-09-01, scratchpad/viewdml-laws.md) lets an
+// UPDATE / DELETE / INSERT name a view whose body is `SELECT <items>
+// FROM <one relation> [alias] [WHERE ...]` - no join, DISTINCT, GROUP
+// BY/HAVING, aggregate, UNION, FIRST/SKIP/ROWS, ORDER BY, window,
+// derived table - and acts on the BASE TABLE: the view's WHERE is ANDed
+// into the statement's, its column renames are applied, and the one
+// relation may itself be such a view (resolved recursively). A view of
+// any other shape is `isc_read_only_view` at PREPARE; assigning an
+// EXPRESSION column is `isc_read_only_field` at PREPARE; WITH CHECK
+// OPTION re-checks the view's WHERE on the written row through the
+// CHECK_n system triggers the engine generated for it.
+//
+// fire-crab does this as a TEXT REWRITE onto the base table, so every
+// constraint, index, trigger and RETURNING path is the base table's
+// own - the planners below recurse into themselves with the rewritten
+// statement. A view carrying a USER trigger for the event is PART 2
+// (the trigger REPLACES the base write) and refuses generically here -
+// at ANY level of the chain: a view over a trigger-backed view stops
+// resolving AT that view (review-caught: VVT2 over VT2 was rewritten
+// down to T and wrote where the engine ran VT2's triggers).
+//
+// A view the rewrite cannot plan is REFUSED, never handed to the base
+// planners: a view's own storage is empty, and a table plan over it is
+// the silent no-op this work removes (review-caught: a chain deeper
+// than the old cap answered "Records affected: 0").
+// ---------------------------------------------------------------------
+
+/// Where one column of a view comes from, in the BASE table's terms.
+#[derive(Clone, Debug, PartialEq)]
+enum ViewColSrc {
+    /// a plain base column (its catalog name)
+    Base(String),
+    /// an expression column (`A*2 AS A2`, `1 AS ONE`) as text over the
+    /// base table's columns. Readable; assigning it is the engine's
+    /// `attempted update of read-only column <unknown>`.
+    Expr(String),
+}
+
+/// One level's WITH CHECK OPTION: the CHECK_n system triggers
+/// (RDB$SYSTEM_FLAG 5) the engine generated for it - their NAMES are a
+/// global sequence and are read from RDB$TRIGGERS, never derived. Each
+/// level's trigger tests ONLY that level's own WHERE (measured: VCV
+/// over VC - a row failing VC's condition alone is attributed to VC and
+/// CHECK_2, one failing VCV's own to VCV).
+#[derive(Clone, Debug)]
+struct ViewCheck {
+    /// the view carrying the option - the 23000 vector names it
+    view: String,
+    /// THIS level's own WHERE, in base-column terms (empty when the
+    /// level has none - nothing to test)
+    wheres: Vec<String>,
+    /// RDB$TRIGGER_TYPE 3 (BEFORE UPDATE) - `UPDATE` violations cite it
+    update_trigger: Option<String>,
+    /// RDB$TRIGGER_TYPE 1 (BEFORE INSERT) - `INSERT` violations cite it
+    insert_trigger: Option<String>,
+}
+
+/// A view resolved down to the real table at the bottom of its chain,
+/// with everything a DML rewrite needs.
+#[derive(Clone, Debug)]
+struct ViewDmlTarget {
+    /// the view's canonical (catalog) name
+    view: String,
+    /// the relation at the bottom of the chain (canonical name): the
+    /// real TABLE, or the first VIEW below this one that carries a USER
+    /// trigger for the event (`base_is_view`)
+    base: String,
+    /// `base` is a trigger-backed VIEW: the chain stops there because
+    /// the trigger replaces every write below it (PART 2 plans it; the
+    /// rewritten statement refuses generically until then)
+    base_is_view: bool,
+    /// the view's columns in RDB$FIELD_ID order (the order [view_of]
+    /// lists them in), each mapped into base terms
+    cols: Vec<(String, ViewColSrc)>,
+    /// the base relation's own column names: a bare name the view does
+    /// not expose but the base has is the engine's -206 Column unknown,
+    /// never a silent write against the hidden column (review-caught)
+    base_cols: Vec<String>,
+    /// every level's WHERE, rewritten into base column names with no
+    /// alias qualifiers at depth 0 - ANDed into the statement's
+    wheres: Vec<String>,
+    /// the WITH CHECK OPTION levels, OUTERMOST FIRST - the order the
+    /// engine's triggers test in
+    checks: Vec<ViewCheck>,
+    /// the body shape is not naturally updatable - DML is
+    /// `isc_read_only_view` unless a trigger takes the event
+    read_only: bool,
+}
+
+/// The three outcomes of resolving a DML target as a view.
+#[derive(Clone, Debug)]
+enum ViewDml {
+    /// an ordinary table: the base planners take it
+    NotAView,
+    /// a view this rewrite cannot plan (a body it cannot split, a chain
+    /// deeper than the cap, a column map that does not line up, an
+    /// unreadable catalog row): the statement REFUSES generically. It
+    /// must never reach a base-table plan - a view's storage is empty
+    /// and such a plan is a silent no-op
+    Unplannable,
+    Target(ViewDmlTarget),
+}
+
+/// [view_dml_target_at], held in the metadata cache: it costs an
+/// RDB$RELATIONS, an RDB$RELATION_FIELDS and (with CHECK OPTION) an
+/// RDB$TRIGGERS walk per level, and only DDL changes the answer. The
+/// EVENT (1 INSERT, 2 UPDATE, 3 DELETE) is part of the key: the chain
+/// stops at a view whose USER trigger takes that event.
+fn view_dml_target(db: &Database, name: &str, event: u8) -> ViewDml {
+    let key = format!("{}#{}", name.trim_matches('"').trim_end().to_ascii_uppercase(), event);
+    db.meta_memo("view-dml", &key, || view_dml_target_at(db, name, event, 0))
+        .as_ref()
+        .clone()
+}
+
+/// Is `name` a view at all? Memoised. The belt-and-braces guard every
+/// DML planner applies after its view hook: a view must never be
+/// planned as a table.
+fn is_view(db: &Database, name: &str) -> bool {
+    let key = name.trim_matches('"').trim_end().to_ascii_uppercase();
+    *db.meta_memo("is-view", &key, || view_of(db, name).is_some())
+}
+
+/// The event a plan writes, in [view_dml_target]'s numbering.
+fn view_event_of(plan: &Plan) -> u8 {
+    match plan {
+        Plan::Insert { .. } | Plan::InsertSelect { .. } => 1,
+        Plan::Delete { .. } => 3,
+        Plan::ViewTrig { action, .. } => *action,
+        Plan::Returning { inner, .. } => view_event_of(inner),
+        _ => 2,
+    }
+}
+
+/// The trigger guard for an event number.
+fn view_event_guard(event: u8) -> DmlGuard<'static> {
+    match event {
+        1 => DmlGuard::Insert,
+        3 => DmlGuard::Delete,
+        _ => DmlGuard::Update(&[]),
+    }
+}
+
+/// The catalog's spelling of a relation named in a statement.
+fn canon_relation_name(db: &Database, name: &str) -> Option<String> {
+    let rel = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, name)?;
+    fire_crab_ods::list_relations(&db.bytes(), db.page_size)
+        .into_iter()
+        .find(|(id, _)| *id == rel)
+        .map(|(_, n)| n.trim_end().to_string())
+}
+
+/// A column name as DML text: bare when it is a plain upper-case
+/// identifier that is not a reserved word, delimited otherwise
+/// (review-caught: a base column named SELECT / COUNT rendered bare).
+fn view_ident_text(name: &str) -> String {
+    let plain = name.starts_with(|c: char| c.is_ascii_uppercase())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_' || c == '$');
+    if plain && !view_is_keyword(name) {
+        name.to_string()
+    } else {
+        format!("\"{}\"", name.replace('"', "\"\""))
+    }
+}
+
+/// Take a trailing `WITH CHECK OPTION` off a view body. Returns the
+/// body and whether the clause was there.
+fn strip_check_option(src: &str) -> (&str, bool) {
+    let src = src.trim().trim_end_matches(';').trim_end();
+    let up = src.to_ascii_uppercase();
+    let masked = mask_literals(&up);
+    let mut from = 0usize;
+    while let Some(w) = find_word_depth0(&masked, "WITH", from) {
+        let tail = masked[w + "WITH".len()..].trim();
+        if tail == "CHECK OPTION" || tail.split_whitespace().collect::<Vec<_>>() == ["CHECK", "OPTION"]
+        {
+            return (src[..w].trim_end(), true);
+        }
+        from = w + "WITH".len();
+    }
+    (src, false)
+}
+
+/// Take a trailing `PLAN (...)` off a view body: it steers the engine's
+/// optimizer and has no place in a rewritten WHERE (review-caught:
+/// VPLAN's clause was pasted into the base statement's condition).
+fn strip_plan_clause(body: &str) -> &str {
+    let up = body.to_ascii_uppercase();
+    let masked = mask_literals(&up);
+    let mut from = 0usize;
+    let mut last: Option<usize> = None;
+    while let Some(p) = find_word_depth0(&masked, "PLAN", from) {
+        last = Some(p);
+        from = p + "PLAN".len();
+    }
+    match last {
+        Some(p) if masked[p + "PLAN".len()..].trim_start().starts_with('(') => body[..p].trim_end(),
+        _ => body,
+    }
+}
+
+/// Split on TOP-LEVEL commas - outside parentheses AND outside string
+/// literals (review-caught: `SELECT ID, 'a,b' AS S2, A` split inside
+/// the literal and the item count no longer matched the catalog).
+fn view_split_commas(s: &str) -> Vec<&str> {
+    let masked = mask_literals(&s.to_ascii_uppercase());
+    let b = masked.as_bytes();
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    for (i, &c) in b.iter().enumerate() {
+        match c {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            b',' if depth == 0 => {
+                out.push(&s[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(&s[start..]);
+    out
+}
+
+/// Does a projection item carry an AGGREGATE or a WINDOW at its own
+/// level (not inside a subquery of its own)? Such an item makes the
+/// view read-only; a parser failure on the item does NOT (the engine
+/// updates through a view fc merely cannot parse - the refusal for
+/// that is generic, never the typed read-only vector).
+fn view_item_is_aggregate(text: &str) -> bool {
+    let b: Vec<char> = text.chars().collect();
+    let mut stack: Vec<bool> = Vec::new();
+    let mut subq = 0usize;
+    let mut i = 0usize;
+    while i < b.len() {
+        let c = b[i];
+        if c == '\'' {
+            let mut sink = String::new();
+            i = view_copy_literal(&b, i, &mut sink);
+            continue;
+        }
+        if c == '(' {
+            let sub = view_paren_is_subquery(&b, i);
+            stack.push(sub);
+            if sub {
+                subq += 1;
+            }
+            i += 1;
+            continue;
+        }
+        if c == ')' {
+            if stack.pop() == Some(true) {
+                subq -= 1;
+            }
+            i += 1;
+            continue;
+        }
+        if c == '"' {
+            i = view_scan_ident(&b, i).map_or(i + 1, |(_, _, next)| next);
+            continue;
+        }
+        if c.is_alphabetic() || c == '_' {
+            let Some((name, _, next)) = view_scan_ident(&b, i) else {
+                i += 1;
+                continue;
+            };
+            if subq == 0 {
+                let mut j = next;
+                while j < b.len() && b[j].is_whitespace() {
+                    j += 1;
+                }
+                let call = j < b.len() && b[j] == '(';
+                let up = name.to_ascii_uppercase();
+                if call && up == "OVER" {
+                    return true;
+                }
+                if call
+                    && matches!(
+                        up.as_str(),
+                        "COUNT" | "SUM" | "MIN" | "MAX" | "AVG" | "LIST" | "STDDEV_SAMP"
+                            | "STDDEV_POP" | "VAR_SAMP" | "VAR_POP" | "COVAR_SAMP"
+                            | "COVAR_POP" | "CORR" | "REGR_AVGX" | "REGR_AVGY" | "REGR_COUNT"
+                            | "REGR_INTERCEPT" | "REGR_R2" | "REGR_SLOPE" | "REGR_SXX"
+                            | "REGR_SXY" | "REGR_SYY"
+                    )
+                {
+                    return true;
+                }
+            }
+            i = next;
+            continue;
+        }
+        if c.is_ascii_digit() {
+            while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == '.' || b[i] == '_') {
+                i += 1;
+            }
+            continue;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// The view's columns in RDB$FIELD_ID order, each with its
+/// RDB$BASE_FIELD (None = an expression column, RDB$UPDATE_FLAG 0).
+fn view_field_bases(db: &Database, view: &str) -> Option<Vec<(String, Option<String>)>> {
+    use fire_crab_ods::format::Value;
+    let (cols, descs) = sys_rel(db, "RDB$RELATION_FIELDS")?;
+    let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (rel_f, name_f, base_f, id_f) = (
+        fid("RDB$RELATION_NAME")?,
+        fid("RDB$FIELD_NAME")?,
+        fid("RDB$BASE_FIELD")?,
+        fid("RDB$FIELD_ID")?,
+    );
+    let fmts = vec![(0u8, descs)];
+    let mut out: Vec<(i64, String, Option<String>)> = Vec::new();
+    for_each_record(db, 5, &fmts, usize::MAX, |v| {
+        let is_rel = matches!(v.get(rel_f),
+            Some(Value::Text(t)) if t.trim_end().eq_ignore_ascii_case(view));
+        if !is_rel {
+            return;
+        }
+        let Some(Value::Text(name)) = v.get(name_f) else { return };
+        let id = match v.get(id_f) {
+            Some(Value::Int(i)) => *i,
+            _ => 0,
+        };
+        let base = match v.get(base_f) {
+            Some(Value::Text(b)) if !b.trim_end().is_empty() => Some(b.trim_end().to_string()),
+            _ => None,
+        };
+        out.push((id, name.trim_end().to_string(), base));
+    });
+    out.sort_by_key(|(id, _, _)| *id);
+    Some(out.into_iter().map(|(_, n, b)| (n, b)).collect())
+}
+
+/// The CHECK OPTION system triggers of a view: (BEFORE UPDATE name,
+/// BEFORE INSERT name) - RDB$SYSTEM_FLAG 5, types 3 and 1.
+fn view_check_triggers(db: &Database, view: &str) -> Option<(Option<String>, Option<String>)> {
+    use fire_crab_ods::format::Value;
+    let (cols, descs) = sys_rel(db, "RDB$TRIGGERS")?;
+    let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (rel_f, sys_f, name_f, typ_f) = (
+        fid("RDB$RELATION_NAME")?,
+        fid("RDB$SYSTEM_FLAG")?,
+        fid("RDB$TRIGGER_NAME")?,
+        fid("RDB$TRIGGER_TYPE")?,
+    );
+    let trel = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, "RDB$TRIGGERS")?;
+    let fmts = vec![(0u8, descs)];
+    let mut upd: Option<String> = None;
+    let mut ins: Option<String> = None;
+    for_each_record(db, trel, &fmts, usize::MAX, |v| {
+        let is_rel = matches!(v.get(rel_f),
+            Some(Value::Text(t)) if t.trim_end().eq_ignore_ascii_case(view));
+        if !is_rel || !matches!(v.get(sys_f), Some(Value::Int(5))) {
+            return;
+        }
+        let Some(Value::Text(name)) = v.get(name_f) else { return };
+        match v.get(typ_f) {
+            Some(Value::Int(3)) => upd = Some(name.trim_end().to_string()),
+            Some(Value::Int(1)) => ins = Some(name.trim_end().to_string()),
+            _ => {}
+        }
+    });
+    Some((upd, ins))
+}
+
+/// Normalise a view body's own qualifiers. `quals` are the spellings
+/// that name the body's FROM item (its alias, its bare name, and the
+/// name with a schema in front); at subquery depth 0 the qualifier is
+/// DROPPED (the base planners resolve bare names), inside a subquery it
+/// becomes `rel.` - the spelling [resolve_subqueries] binds a
+/// correlated reference under.
+fn requalify_view_body(text: &str, quals: &[&str], rel: &str) -> String {
+    let b: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut stack: Vec<bool> = Vec::new();
+    let mut subq = 0usize;
+    let mut i = 0usize;
+    let is_qual = |n: &str| quals.iter().any(|q| q.eq_ignore_ascii_case(n));
+    while i < b.len() {
+        let c = b[i];
+        if c == '\'' {
+            let end = view_copy_literal(&b, i, &mut out);
+            i = end;
+            continue;
+        }
+        if c == '(' {
+            let sub = view_paren_is_subquery(&b, i);
+            stack.push(sub);
+            if sub {
+                subq += 1;
+            }
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        if c == ')' {
+            if stack.pop() == Some(true) {
+                subq -= 1;
+            }
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        if c.is_alphabetic() || c == '_' || c == '"' {
+            let mut parts: Vec<(String, bool, usize, usize)> = Vec::new();
+            let mut k = i;
+            loop {
+                let Some((name, quoted, next)) = view_scan_ident(&b, k) else {
+                    out.push(c);
+                    i += 1;
+                    break;
+                };
+                parts.push((name, quoted, k, next));
+                if next + 1 < b.len()
+                    && b[next] == '.'
+                    && (b[next + 1].is_alphabetic() || b[next + 1] == '_' || b[next + 1] == '"')
+                {
+                    k = next + 1;
+                    continue;
+                }
+                break;
+            }
+            if parts.is_empty() {
+                continue;
+            }
+            let end = parts.last().unwrap().3;
+            // `alias.col` or `schema.rel.col`: the head that names the
+            // FROM item comes off (or turns into the relation)
+            let strip_to = match parts.as_slice() {
+                [(q, _, _, _), _] if is_qual(q) => Some(parts[1].2),
+                [_, (r, _, _, _), _] if is_qual(r) => Some(parts[2].2),
+                _ => None,
+            };
+            match strip_to {
+                Some(col_at) => {
+                    if subq > 0 {
+                        out.push_str(rel);
+                        out.push('.');
+                    }
+                    out.extend(b[col_at..end].iter());
+                }
+                None => out.extend(b[i..end].iter()),
+            }
+            i = end;
+            continue;
+        }
+        if c.is_ascii_digit() {
+            let start = i;
+            while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == '.' || b[i] == '_') {
+                i += 1;
+            }
+            out.extend(b[start..i].iter());
+            continue;
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
+/// Copy a `'...'` literal (with `''` escapes) starting at `at` into
+/// `out`; returns the index after it.
+fn view_copy_literal(b: &[char], at: usize, out: &mut String) -> usize {
+    let mut i = at;
+    out.push(b[i]);
+    i += 1;
+    while i < b.len() {
+        out.push(b[i]);
+        if b[i] == '\'' {
+            if i + 1 < b.len() && b[i + 1] == '\'' {
+                out.push(b[i + 1]);
+                i += 2;
+                continue;
+            }
+            return i + 1;
+        }
+        i += 1;
+    }
+    i
+}
+
+/// Is the parenthesised group opening at `at` a SUBQUERY (its first
+/// word is SELECT)?
+fn view_paren_is_subquery(b: &[char], at: usize) -> bool {
+    let mut j = at + 1;
+    while j < b.len() && b[j].is_whitespace() {
+        j += 1;
+    }
+    let word: String = b[j..(j + 6).min(b.len())].iter().collect();
+    word.eq_ignore_ascii_case("SELECT")
+        && b.get(j + 6).map_or(true, |c| !(c.is_alphanumeric() || *c == '_' || *c == '$'))
+}
+
+/// Scan one identifier at `at`: (name with quotes removed and `""`
+/// unescaped, was it quoted, index after it). None for an unterminated
+/// quote.
+fn view_scan_ident(b: &[char], at: usize) -> Option<(String, bool, usize)> {
+    if b[at] == '"' {
+        let mut i = at + 1;
+        let mut name = String::new();
+        while i < b.len() {
+            if b[i] == '"' {
+                if i + 1 < b.len() && b[i + 1] == '"' {
+                    name.push('"');
+                    i += 2;
+                    continue;
+                }
+                return Some((name, true, i + 1));
+            }
+            name.push(b[i]);
+            i += 1;
+        }
+        None
+    } else {
+        let mut i = at;
+        while i < b.len() && (b[i].is_alphanumeric() || b[i] == '_' || b[i] == '$') {
+            i += 1;
+        }
+        Some((b[at..i].iter().collect(), false, i))
+    }
+}
+
+/// The relation names a SUBQUERY's own FROM list binds - the group
+/// opening at byte `open` of `masked_up` (upper-cased, literal-masked
+/// text). The word after FROM, after each JOIN and after each depth-0
+/// comma of the FROM clause, without a schema prefix or quotes. A
+/// reference qualified by one of these names is the subquery's own.
+fn view_group_from_names(masked_up: &str, open: usize) -> Vec<String> {
+    let b = masked_up.as_bytes();
+    let mut depth = 0i32;
+    let mut close = b.len();
+    for (i, &c) in b.iter().enumerate().skip(open) {
+        match c {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    close = i;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    if close <= open + 1 {
+        return Vec::new();
+    }
+    let inner = &masked_up[open + 1..close];
+    let Some(from) = find_word_depth0(inner, "FROM", 0) else { return Vec::new() };
+    let mut end = inner.len();
+    for kw in ["WHERE", "GROUP", "HAVING", "ORDER", "UNION", "ROWS", "PLAN", "FETCH", "OFFSET"] {
+        if let Some(p) = find_word_depth0(inner, kw, from + "FROM".len()) {
+            end = end.min(p);
+        }
+    }
+    let clause = &inner[from + "FROM".len()..end];
+    let cb = clause.as_bytes();
+    let mut names: Vec<String> = Vec::new();
+    let mut expect = true;
+    // the word just pushed may turn out to be ALIASED by the next one
+    let mut just_named = false;
+    let mut depth = 0i32;
+    let mut i = 0usize;
+    while i < cb.len() {
+        let c = cb[i];
+        if c == b'(' {
+            depth += 1;
+            i += 1;
+            continue;
+        }
+        if c == b')' {
+            depth -= 1;
+            i += 1;
+            continue;
+        }
+        if depth > 0 {
+            i += 1;
+            continue;
+        }
+        if c == b',' {
+            expect = true;
+            just_named = false;
+            i += 1;
+            continue;
+        }
+        if is_ident_byte(c) || c == b'"' {
+            // a possibly dotted name: keep its LAST part
+            let mut last = String::new();
+            let mut bare_word = false;
+            loop {
+                let start = i;
+                if cb[i] == b'"' {
+                    i += 1;
+                    while i < cb.len() && cb[i] != b'"' {
+                        i += 1;
+                    }
+                    last = clause[start + 1..i].to_string();
+                    i = (i + 1).min(cb.len());
+                    bare_word = false;
+                } else {
+                    while i < cb.len() && is_ident_byte(cb[i]) {
+                        i += 1;
+                    }
+                    last = clause[start..i].to_string();
+                    bare_word = true;
+                }
+                if i + 1 < cb.len() && cb[i] == b'.' {
+                    i += 1;
+                    continue;
+                }
+                break;
+            }
+            if expect {
+                names.push(last);
+                expect = false;
+                just_named = true;
+            } else if bare_word && last == "JOIN" {
+                expect = true;
+                just_named = false;
+            } else if just_named {
+                // the word right after a FROM item that is no join
+                // keyword is its ALIAS (`FROM VR x`, `FROM VR AS x`): the
+                // item's own name is then NOT in scope (review-caught:
+                // `VR.K` beside `FROM VR x` is the OUTER row)
+                let join_kw = bare_word
+                    && matches!(
+                        last.as_str(),
+                        "INNER" | "LEFT" | "RIGHT" | "FULL" | "OUTER" | "CROSS" | "NATURAL" | "ON" | "USING"
+                    );
+                if !join_kw {
+                    names.pop();
+                }
+                just_named = false;
+            }
+            continue;
+        }
+        i += 1;
+    }
+    names
+}
+
+/// A word that can never be a column reference in DML text.
+fn view_is_keyword(w: &str) -> bool {
+    matches!(
+        w.to_ascii_uppercase().as_str(),
+        "NULL" | "AND" | "OR" | "NOT" | "IN" | "IS" | "LIKE" | "BETWEEN" | "CASE" | "WHEN"
+            | "THEN" | "ELSE" | "END" | "SELECT" | "FROM" | "WHERE" | "EXISTS" | "DEFAULT"
+            | "TRUE" | "FALSE" | "UNKNOWN" | "AS" | "ESCAPE" | "DISTINCT" | "ALL" | "ANY"
+            | "SOME" | "VALUES" | "SET" | "OLD" | "NEW" | "CURRENT_DATE" | "CURRENT_TIME"
+            | "CURRENT_TIMESTAMP" | "CURRENT_USER" | "CURRENT_ROLE" | "USER" | "ROW_COUNT"
+            | "SIMILAR" | "TO" | "STARTING" | "WITH" | "CONTAINING" | "SINGULAR" | "NEXT"
+            | "VALUE" | "FOR" | "GEN_ID" | "COLLATE" | "ASC" | "DESC" | "BY" | "ORDER"
+            | "GROUP" | "HAVING" | "RETURNING" | "INTO" | "INSERT" | "UPDATE" | "DELETE"
+            | "MATCHING" | "ON" | "JOIN" | "INNER" | "LEFT" | "RIGHT" | "FULL" | "OUTER"
+            | "CROSS" | "NATURAL" | "USING" | "UNION" | "EXCEPT" | "INTERSECT" | "FIRST"
+            | "SKIP" | "ROWS" | "CAST" | "INTEGER" | "INT" | "SMALLINT" | "BIGINT"
+            | "VARCHAR" | "CHAR" | "CHARACTER" | "VARYING" | "NUMERIC" | "DECIMAL" | "FLOAT"
+            | "DOUBLE" | "PRECISION" | "DATE" | "TIME" | "TIMESTAMP" | "BLOB" | "BOOLEAN"
+            | "YEAR" | "MONTH" | "DAY" | "HOUR" | "MINUTE" | "SECOND" | "WEEKDAY" | "YEARDAY"
+            | "LEADING" | "TRAILING" | "BOTH" | "LOCAL" | "ZONE" | "AT" | "SUBSTRING"
+            | "OCTETS" | "UNICODE_FSS" | "UTF8" | "NONE" | "WIN1252" | "ISO8859_1"
+            | "COUNT" | "SUM" | "MIN" | "MAX" | "AVG" | "UPPER" | "LOWER" | "TRIM"
+            | "EXTRACT" | "POSITION" | "TABLE" | "VIEW" | "INDEX" | "CREATE" | "DROP"
+            | "ALTER" | "COLUMN" | "PRIMARY" | "FOREIGN" | "UNIQUE" | "CHECK" | "CONSTRAINT"
+            | "BEGIN" | "EXECUTE" | "PROCEDURE" | "TRIGGER" | "FUNCTION" | "RETURNS" | "OVER"
+            | "WINDOW" | "FETCH" | "OFFSET" | "PLAN" | "MERGE" | "ROW" | "LATERAL" | "FILTER"
+            | "ONLY" | "OF" | "NO" | "ADD" | "GRANT" | "REVOKE" | "COMMIT" | "ROLLBACK"
+            | "SAVEPOINT" | "DECLARE" | "CURSOR" | "OPEN" | "CLOSE" | "WHILE" | "RETURN"
+            | "SQLCODE" | "SQLSTATE" | "GDSCODE" | "REAL" | "LONG" | "DEC" | "DECFLOAT"
+            | "INT128" | "BINARY" | "VARBINARY" | "NCHAR" | "NATIONAL" | "CHAR_LENGTH"
+            | "CHARACTER_LENGTH" | "OCTET_LENGTH" | "BIT_LENGTH" | "LOCALTIME"
+            | "LOCALTIMESTAMP" | "CURRENT_CONNECTION" | "CURRENT_TRANSACTION" | "CURRENT"
+            | "INSERTING" | "UPDATING" | "DELETING" | "RECURSIVE" | "GLOBAL" | "EXTERNAL"
+            | "START" | "RELEASE" | "REFERENCES" | "SENSITIVE" | "INSENSITIVE" | "SCROLL"
+            | "UNBOUNDED" | "WITHOUT" | "VARIABLE" | "PARAMETER" | "POST_EVENT" | "SCHEMA"
+            | "DETERMINISTIC" | "COMMENT" | "CONNECT" | "DISCONNECT" | "ADMIN" | "RECREATE"
+            | "RECORD_VERSION" | "TIMEZONE_HOUR" | "TIMEZONE_MINUTE" | "RESETTING"
+            | "RETURNING_VALUES" | "PUBLICATION" | "CORR" | "COVAR_POP" | "COVAR_SAMP"
+            | "STDDEV_POP" | "STDDEV_SAMP" | "VAR_POP" | "VAR_SAMP" | "RDB$DB_KEY"
+    )
+}
+
+/// Rewrite DML text written in a VIEW's column names into its BASE
+/// table's, in ONE simultaneous pass (so a swapping view `(A, ID) AS
+/// SELECT ID, A` comes out right).
+///
+/// String literals are copied verbatim; a `"quoted"` identifier matches
+/// a view column exactly, a bare one case-insensitively; an identifier
+/// followed by `(` is a function call and is never renamed, nor is the
+/// sequence named in `GEN_ID(<seq>, n)` / `NEXT VALUE FOR <seq>`.
+///
+/// At subquery depth 0 every unqualified view column is renamed and a
+/// `<view>.<col>` qualifier comes off. A bare name that is NOT a view
+/// column but IS a base column is the engine's -206 (the base column is
+/// hidden behind the view): None - fc has no -206 vector, the generic
+/// refusal is the recorded boundary. `OLD.` / `NEW.` are kept and the
+/// column renamed; `NEW.<expr col>` is the expression itself (the
+/// engine recomputes it over the written row), `OLD.<expr col>` has no
+/// text: None.
+///
+/// Inside a subquery the subquery's own names are its own scope: a bare
+/// name is left alone - unless it is a view column whose base name
+/// DIFFERS (the engine may bind it to the outer view row; fc cannot
+/// tell): None, except when the subquery's own FROM names the view (the
+/// name is the inner view's). A `<view>.<col>` inside a subquery: the
+/// inner view's own when the subquery's FROM names the view (untouched);
+/// ambiguous when it names the BASE table (None - review-caught:
+/// `T.ID <> V.ID` rewritten to `T.ID <> T.ID` bound to the inner T);
+/// otherwise `<base>.<col>`, which [resolve_subqueries] binds to the
+/// outer row.
+fn rename_view_idents(
+    text: &str,
+    map: &[(String, ViewColSrc)],
+    view: &str,
+    base: &str,
+    base_cols: &[String],
+) -> Option<String> {
+    let b: Vec<char> = text.chars().collect();
+    let byte_at: Vec<usize> = text
+        .char_indices()
+        .map(|(i, _)| i)
+        .chain(std::iter::once(text.len()))
+        .collect();
+    let masked_up = mask_literals(&text.to_ascii_uppercase());
+    let mut out = String::with_capacity(text.len() + 16);
+    // per open paren: None for a plain group, the FROM names of a
+    // subquery
+    let mut stack: Vec<Option<Vec<String>>> = Vec::new();
+    let mut subq = 0usize;
+    // the last three tokens copied out, upper-cased - for the GEN_ID( /
+    // NEXT VALUE FOR sequence slots
+    let mut recent: Vec<String> = Vec::new();
+    let mut i = 0usize;
+    let lookup = |name: &str, quoted: bool| -> Option<&ViewColSrc> {
+        map.iter()
+            .find(|(n, _)| if quoted { n == name } else { n.eq_ignore_ascii_case(name) })
+            .map(|(_, s)| s)
+    };
+    let names_view = |q: &str, quoted: bool| {
+        if quoted {
+            q == view
+        } else {
+            q.eq_ignore_ascii_case(view)
+        }
+    };
+    let is_base_col = |n: &str, quoted: bool| {
+        base_cols.iter().any(|c| if quoted { c == n } else { c.eq_ignore_ascii_case(n) })
+    };
+    let scope_names = |stack: &Vec<Option<Vec<String>>>, n: &str| {
+        stack.iter().flatten().any(|l| l.iter().any(|x| x.eq_ignore_ascii_case(n)))
+    };
+    fn note(recent: &mut Vec<String>, t: &str) {
+        recent.push(t.to_ascii_uppercase());
+        if recent.len() > 3 {
+            recent.remove(0);
+        }
+    }
+    let render = |src: &ViewColSrc| match src {
+        ViewColSrc::Base(bn) => view_ident_text(bn),
+        ViewColSrc::Expr(e) => format!("({})", e),
+    };
+    while i < b.len() {
+        let c = b[i];
+        if c == '\'' {
+            i = view_copy_literal(&b, i, &mut out);
+            note(&mut recent, "'");
+            continue;
+        }
+        if c == '(' {
+            let sub = view_paren_is_subquery(&b, i);
+            if sub {
+                subq += 1;
+                stack.push(Some(view_group_from_names(&masked_up, byte_at[i])));
+            } else {
+                stack.push(None);
+            }
+            out.push(c);
+            note(&mut recent, "(");
+            i += 1;
+            continue;
+        }
+        if c == ')' {
+            if matches!(stack.pop(), Some(Some(_))) {
+                subq -= 1;
+            }
+            out.push(c);
+            note(&mut recent, ")");
+            i += 1;
+            continue;
+        }
+        if c.is_ascii_digit() {
+            let start = i;
+            while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == '.' || b[i] == '_') {
+                i += 1;
+            }
+            out.extend(b[start..i].iter());
+            note(&mut recent, "0");
+            continue;
+        }
+        if c.is_alphabetic() || c == '_' || c == '"' {
+            let mut parts: Vec<(String, bool)> = Vec::new();
+            let mut k = i;
+            loop {
+                let (name, quoted, next) = view_scan_ident(&b, k)?;
+                parts.push((name, quoted));
+                if next + 1 < b.len()
+                    && b[next] == '.'
+                    && (b[next + 1].is_alphabetic() || b[next + 1] == '_' || b[next + 1] == '"')
+                {
+                    k = next + 1;
+                    continue;
+                }
+                k = next;
+                break;
+            }
+            let end = k;
+            let raw: String = b[i..end].iter().collect();
+            // a FUNCTION CALL: the name is never a column
+            let mut j = end;
+            while j < b.len() && b[j].is_whitespace() {
+                j += 1;
+            }
+            if parts.len() == 1 && j < b.len() && b[j] == '(' {
+                out.push_str(&raw);
+                note(&mut recent, &parts[0].0);
+                i = end;
+                continue;
+            }
+            // the SEQUENCE in `GEN_ID(<seq>, n)` / `NEXT VALUE FOR
+            // <seq>` is never a column (review-caught: a sequence
+            // named like a view column was renamed)
+            let n_recent = recent.len();
+            let seq_slot = parts.len() == 1
+                && ((n_recent >= 2 && recent[n_recent - 1] == "(" && recent[n_recent - 2] == "GEN_ID")
+                    || (n_recent >= 3
+                        && recent[n_recent - 1] == "FOR"
+                        && recent[n_recent - 2] == "VALUE"
+                        && recent[n_recent - 3] == "NEXT"));
+            if seq_slot {
+                out.push_str(&raw);
+                note(&mut recent, &parts[0].0);
+                i = end;
+                continue;
+            }
+            match parts.as_slice() {
+                // a BARE keyword is never a column, whatever the view
+                // calls its columns (review-caught: a quoted column named
+                // "INTEGER" renamed the type in `CAST(K AS INTEGER)`) -
+                // only the QUOTED spelling names such a column
+                [(n, q)] if !*q && view_is_keyword(n) => out.push_str(&raw),
+                [(n, q)] => match lookup(n, *q) {
+                    Some(src) => {
+                        if subq == 0 {
+                            out.push_str(&render(src));
+                        } else if scope_names(&stack, view) {
+                            // the inner view's own column
+                            out.push_str(&raw);
+                        } else {
+                            match src {
+                                ViewColSrc::Base(bn) if bn.eq_ignore_ascii_case(n) => {
+                                    out.push_str(&raw)
+                                }
+                                // a renamed (or expression) view column
+                                // named bare inside a subquery: the
+                                // engine may bind it to the outer view
+                                // row - refuse rather than answer wrong
+                                _ => return None,
+                            }
+                        }
+                    }
+                    None => {
+                        if subq == 0 && (*q || !view_is_keyword(n)) && is_base_col(n, *q) {
+                            // a base column the view HIDES: -206 on the
+                            // engine, never a write against it
+                            return None;
+                        }
+                        out.push_str(&raw);
+                    }
+                },
+                [(qual, qq), (n, q)]
+                    if !*qq && (qual.eq_ignore_ascii_case("OLD") || qual.eq_ignore_ascii_case("NEW")) =>
+                {
+                    match lookup(n, *q) {
+                        Some(ViewColSrc::Base(bn)) if subq == 0 => {
+                            out.push_str(&qual.to_ascii_uppercase());
+                            out.push('.');
+                            out.push_str(&view_ident_text(bn));
+                        }
+                        Some(ViewColSrc::Expr(e)) if subq == 0 => {
+                            if qual.eq_ignore_ascii_case("NEW") {
+                                // recomputed over the written row (measured)
+                                out.push('(');
+                                out.push_str(e);
+                                out.push(')');
+                            } else {
+                                return None; // no before-image text for it
+                            }
+                        }
+                        None if subq == 0 && is_base_col(n, *q) => return None,
+                        _ => out.push_str(&raw),
+                    }
+                }
+                [(qual, qq), (n, q)] | [_, (qual, qq), (n, q)] if names_view(qual, *qq) => {
+                    let src = lookup(n, *q);
+                    if subq == 0 {
+                        match src {
+                            Some(ViewColSrc::Base(bn)) => out.push_str(&view_ident_text(bn)),
+                            Some(ViewColSrc::Expr(e)) => {
+                                out.push('(');
+                                out.push_str(e);
+                                out.push(')');
+                            }
+                            None => return None, // Column unknown on the engine
+                        }
+                    } else if scope_names(&stack, view) {
+                        out.push_str(&raw); // the inner view's own
+                    } else if scope_names(&stack, base) {
+                        return None; // would bind to the inner base table
+                    } else {
+                        match src {
+                            Some(ViewColSrc::Base(bn)) => {
+                                out.push_str(&view_ident_text(base));
+                                out.push('.');
+                                out.push_str(&view_ident_text(bn));
+                            }
+                            _ => return None, // no scope-safe text for it
+                        }
+                    }
+                }
+                // the BASE table as a qualifier at depth 0 (`RETURNING
+                // T.A`, `PUBLIC.T.A`): the base is not in scope behind
+                // the view - the engine's -206 (review-caught: it
+                // answered a HIDDEN column and wrote). Inside a subquery
+                // it is that subquery's own scope.
+                [(qual, qq), _] | [_, (qual, qq), _]
+                    if subq == 0
+                        && (if *qq { qual == base } else { qual.eq_ignore_ascii_case(base) }) =>
+                {
+                    return None
+                }
+                _ => out.push_str(&raw),
+            }
+            note(&mut recent, &parts.last().map(|(n, _)| n.as_str()).unwrap_or(""));
+            i = end;
+            continue;
+        }
+        if !c.is_whitespace() {
+            note(&mut recent, &c.to_string());
+        }
+        out.push(c);
+        i += 1;
+    }
+    Some(out)
+}
+
+/// Resolve a view for DML, `depth` levels down its chain.
+fn view_dml_target_at(db: &Database, name: &str, event: u8, depth: usize) -> ViewDml {
+    if depth > 32 {
+        return ViewDml::Unplannable;
+    }
+    let Some(vd) = view_of(db, name) else { return ViewDml::NotAView };
+    let Some(view) = canon_relation_name(db, name) else { return ViewDml::Unplannable };
+    let read_only_target = |view: String| {
+        ViewDml::Target(ViewDmlTarget {
+            view,
+            base: String::new(),
+            base_is_view: false,
+            cols: Vec::new(),
+            base_cols: Vec::new(),
+            wheres: Vec::new(),
+            checks: Vec::new(),
+            read_only: true,
+        })
+    };
+    let src = vd.source.trim().trim_end_matches(';').trim();
+    let (body, has_check) = strip_check_option(src);
+    let body = strip_plan_clause(body);
+    let up = body.to_ascii_uppercase();
+    let masked = mask_literals(&up);
+    // THE SHAPE RULE (measured: VJ join, VG group, VD distinct, VU
+    // union, VF first, VO order by, VWIN window, VDT derived table are
+    // read-only; a subquery INSIDE the WHERE is fine). ONLY a shape the
+    // engine calls read-only sets it - a body fc cannot parse is
+    // Unplannable (generic), never the typed vector (review-caught)
+    let mut read_only = ["UNION", "ROWS", "ORDER", "GROUP", "HAVING", "JOIN"]
+        .iter()
+        .any(|kw| find_word_depth0(&masked, kw, 0).is_some());
+    let Some((proj_s, from_s, where_s, group_s, having_s, order_s)) = split_query(body) else {
+        return if read_only { read_only_target(view) } else { ViewDml::Unplannable };
+    };
+    if group_s.is_some() || having_s.is_some() || order_s.is_some() {
+        read_only = true;
+    }
+    let proj_up = proj_s.trim().to_ascii_uppercase();
+    for kw in ["DISTINCT", "FIRST", "SKIP"] {
+        if proj_up.starts_with(kw)
+            && !proj_up[kw.len()..]
+                .starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+        {
+            read_only = true;
+        }
+    }
+    if from_s.trim_start().starts_with('(') {
+        read_only = true;
+    }
+    if read_only {
+        return read_only_target(view);
+    }
+    let Some((tr, steps)) = parse_from(from_s) else { return ViewDml::Unplannable };
+    if !steps.is_empty() {
+        return read_only_target(view);
+    }
+    let mut quals: Vec<&str> = vec![tr.table];
+    if let Some(a) = tr.alias {
+        quals.push(a);
+    }
+    // `*` and `<from item>.*` alike: every base column, in order
+    let proj_t = proj_s.trim();
+    let star = proj_t == "*"
+        || proj_t.strip_suffix(".*").is_some_and(|q| {
+            let q = q.trim().trim_matches('"');
+            quals.iter().any(|x| x.eq_ignore_ascii_case(q))
+        });
+    let raw_items: Vec<String> = if star {
+        Vec::new()
+    } else {
+        view_split_commas(proj_s)
+            .iter()
+            .map(|p| split_alias(p.trim()).0.trim().to_string())
+            .collect()
+    };
+    if raw_items.iter().any(|it| view_item_is_aggregate(it)) {
+        return read_only_target(view);
+    }
+    if let Some(Proj::Items(items)) = parse_projection(proj_s) {
+        if items.iter().any(|it| {
+            matches!(it, SelItem::Agg(..) | SelItem::Win(..) | SelItem::WinExpr(..))
+        }) {
+            return read_only_target(view);
+        }
+    }
+    // the FROM item: a table, or a view resolved first - unless THAT
+    // view carries a USER trigger for the event: the trigger replaces
+    // every write below it, so the chain stops there (PART 2 plans the
+    // trigger; the rewritten statement refuses generically until then)
+    let inner_is_view = view_of(db, tr.table).is_some();
+    let stop_here = inner_is_view && view_has_user_trigger(db, tr.table, &view_event_guard(event));
+    let inner = if inner_is_view && !stop_here {
+        match view_dml_target_at(db, tr.table, event, depth + 1) {
+            ViewDml::Target(it) => {
+                if it.read_only {
+                    return read_only_target(view);
+                }
+                Some(it)
+            }
+            _ => return ViewDml::Unplannable,
+        }
+    } else {
+        None
+    };
+    let Some(rel_name) = canon_relation_name(db, tr.table) else { return ViewDml::Unplannable };
+    let (base, base_is_view) = match &inner {
+        Some(it) => (it.base.clone(), it.base_is_view),
+        None => (rel_name.clone(), stop_here),
+    };
+    let base_cols: Vec<String> = match &inner {
+        Some(it) => it.base_cols.clone(),
+        None => db.columns(&base).iter().map(|c| c.name.clone()).collect(),
+    };
+    // the body's own qualifiers come off ([requalify_view_body]) and,
+    // under a view, the inner level's renames apply
+    let into_base = |text: &str| -> Option<String> {
+        let t = requalify_view_body(text, &quals, &rel_name);
+        match &inner {
+            Some(it) => rename_view_idents(&t, &it.cols, &it.view, &it.base, &it.base_cols),
+            None => Some(t),
+        }
+    };
+    // the columns: RDB$BASE_FIELD names a base column, NULL is an
+    // expression column whose text is the positionally matching
+    // projection item
+    let Some(fields) = view_field_bases(db, &view) else { return ViewDml::Unplannable };
+    if !star && raw_items.len() != fields.len() {
+        return ViewDml::Unplannable;
+    }
+    let mut cols: Vec<(String, ViewColSrc)> = Vec::new();
+    for (i, (vname, base_field)) in fields.iter().enumerate() {
+        let src = match base_field {
+            Some(bf) => match &inner {
+                None => ViewColSrc::Base(bf.clone()),
+                Some(it) => {
+                    match it.cols.iter().find(|(n, _)| n.eq_ignore_ascii_case(bf)) {
+                        Some((_, s)) => s.clone(),
+                        None => return ViewDml::Unplannable,
+                    }
+                }
+            },
+            None => {
+                if star {
+                    return ViewDml::Unplannable;
+                }
+                match into_base(&raw_items[i]) {
+                    Some(t) => ViewColSrc::Expr(t),
+                    None => return ViewDml::Unplannable,
+                }
+            }
+        };
+        cols.push((vname.clone(), src));
+    }
+    let mut wheres: Vec<String> = inner.as_ref().map(|it| it.wheres.clone()).unwrap_or_default();
+    let mut own_where: Vec<String> = Vec::new();
+    if let Some(w) = where_s {
+        match into_base(strip_plan_clause(w.trim())) {
+            Some(t) => {
+                wheres.push(t.clone());
+                own_where.push(t);
+            }
+            None => return ViewDml::Unplannable,
+        }
+    }
+    // the CHECK OPTION levels, outermost first
+    let mut checks: Vec<ViewCheck> = Vec::new();
+    if has_check {
+        let Some((update_trigger, insert_trigger)) = view_check_triggers(db, &view) else {
+            return ViewDml::Unplannable;
+        };
+        checks.push(ViewCheck { view: view.clone(), wheres: own_where, update_trigger, insert_trigger });
+    }
+    if let Some(it) = &inner {
+        checks.extend(it.checks.iter().cloned());
+    }
+    ViewDml::Target(ViewDmlTarget {
+        view,
+        base,
+        base_is_view,
+        cols,
+        base_cols,
+        wheres,
+        checks,
+        read_only: false,
+    })
+}
+
+/// One level's WITH CHECK OPTION as a [TableCheck] over the BASE table.
+/// Unlike a table CHECK (held NEGATED, an UNKNOWN passes), the view's
+/// CHECK_n trigger demands the written row SATISFY the view's WHERE -
+/// an UNKNOWN is a violation (measured: `UPDATE VC SET A = NULL` raises
+/// CHECK_1). So the POSITIVE condition is held and
+/// [TableCheck::violated] flips the test for a view check. None when
+/// the WHERE is not one the predicate machinery evaluates (a subquery)
+/// - the statement then refuses rather than skipping the check.
+fn view_check_table_check(
+    db: &Database,
+    vc: &ViewCheck,
+    trigger: &str,
+    base: &str,
+) -> Option<TableCheck> {
+    let meta = db.relation_meta(base)?;
+    let columns = meta.columns.as_ref();
+    let (_, descs) = meta.formats.iter().max_by_key(|(n, _)| *n)?;
+    let cond: Vec<String> = vc.wheres.iter().map(|w| format!("({})", w)).collect();
+    let positive = cond.join(" AND ");
+    let toks = tokenize(&positive)?;
+    let mut np = 0usize;
+    let raw = parse_predicate(&toks, &mut np)?;
+    if np != 0 {
+        return None;
+    }
+    let mut params: Vec<Option<Descriptor>> = Vec::new();
+    let p = resolve_predicate(raw, columns, descs, &mut params)?;
+    if !params.is_empty() {
+        return None;
+    }
+    Some(TableCheck {
+        constraint: String::new(),
+        trigger: Some(trigger.to_string()),
+        pred: p,
+        view: Some(vc.view.clone()),
+    })
+}
+
+/// The CHECK OPTION levels of a target as [TableCheck]s for one event,
+/// outermost first. None when a level cannot be evaluated.
+fn view_check_list(db: &Database, vt: &ViewDmlTarget, insert: bool) -> Option<Vec<TableCheck>> {
+    let mut out = Vec::new();
+    for vc in &vt.checks {
+        let trig = if insert { &vc.insert_trigger } else { &vc.update_trigger };
+        if let Some(t) = trig {
+            if !vc.wheres.is_empty() {
+                out.push(view_check_table_check(db, vc, t, &vt.base)?);
+            }
+        }
+    }
+    Some(out)
+}
+
+/// Every INPUT parameter of a statement through a view describes
+/// NULLABLE (measured: `UPDATE V SET A = ? WHERE ID = ?` announces its
+/// second `?` Nullable where the same statement on T announces it NOT
+/// NULL - the view column is nullable even over a NOT NULL base one,
+/// as the RETURNING side already applies)
+fn view_params_nullable(mut params: Vec<Descriptor>) -> Vec<Descriptor> {
+    for d in params.iter_mut() {
+        d.flags &= !PARAM_NOT_NULL;
+    }
+    params
+}
+
+/// Does the view have a USER trigger for this event? The trigger
+/// REPLACES the base write ([plan_view_trig]). An unreadable trigger
+/// counts (the statement then refuses generically).
+fn view_has_user_trigger(db: &Database, view: &str, guard: &DmlGuard) -> bool {
+    !matches!(user_triggers(db, view, guard), Some(t) if t.is_empty())
+}
+
+// ---------------------------------------------------------------------
+// A VIEW WITH A USER TRIGGER FOR THE EVENT runs ONLY its triggers
+// (measured, qa/serve-real-viewdml.sh section 9): no base write,
+// whatever the body shape - VT2 is naturally updatable, VJ is a join.
+// The rows are the VIEW's own rows (a SELECT over the view): OLD is the
+// view row, NEW is OLD with the SET applied (an expression column keeps
+// its OLD value unless assigned - and assigning one is ALLOWED here),
+// an INSERT's NEW is the VALUES row over the view's columns. Count =
+// the rows the triggers ran for; RETURNING = NEW (after the BEFORE
+// triggers) / OLD. A CHECK OPTION at that view fires FIRST. What
+// changes data is the bodies' own DML.
+// ---------------------------------------------------------------------
+
+/// The text pieces of a statement through a trigger-backed view, as
+/// [view_trig_rows_sql] renders them into the row SELECT.
+enum ViewTrigShape<'a> {
+    /// `alias`: the target's own alias when the statement gave it one
+    /// (`UPDATE V v SET v.A = ... WHERE v.ID = ...`) - it names the view
+    /// in the row SELECT's FROM, and qualifies a SET column
+    Update { set_text: &'a str, where_text: Option<&'a str>, alias: Option<&'a str> },
+    Delete { where_text: Option<&'a str>, alias: Option<&'a str> },
+    Insert { collist: Option<Vec<String>>, body: ViewTrigBody<'a> },
+}
+
+enum ViewTrigBody<'a> {
+    /// the text inside `VALUES ( ... )`
+    Values(&'a str),
+    /// the `SELECT ...` feeding the insert, verbatim
+    Select(&'a str),
+    DefaultValues,
+}
+
+/// The SELECT that yields, per view row the statement touches, the
+/// view's columns in `cols` order and then the assigned values (an
+/// UPDATE's SET values, an INSERT's supplied values - an INSERT yields
+/// ONLY those). `cols` is (view column name, its SQL type text): a `?`
+/// in a value is wrapped in `CAST(? AS <type>)` ([view_trig_type_params]
+/// - a select list cannot type a bare parameter, and the destination
+/// column's type is what the table planner gives a SET's `?` too), a
+/// `DEFAULT` item is `CAST(NULL AS <type>)` (a view column has no
+/// default: the engine hands the triggers NULL), and the `?`s number in
+/// TEXT ORDER (SET first, then WHERE), which is the order the client
+/// binds. Returns the SQL and the assigned columns as indexes into
+/// `cols`.
+fn view_trig_rows_sql(
+    view: &str,
+    cols: &[(String, String)],
+    shape: &ViewTrigShape<'_>,
+) -> Option<(String, Vec<usize>)> {
+    let names: Vec<String> = cols.iter().map(|(n, _)| view_ident_text(n)).collect();
+    let alias: Option<&str> = match shape {
+        ViewTrigShape::Update { alias, .. } | ViewTrigShape::Delete { alias, .. } => *alias,
+        ViewTrigShape::Insert { .. } => None,
+    };
+    let lookup = |spelled: &str| -> Option<usize> {
+        let mut s = spelled.trim();
+        // `v.A` / `V.A`: the statement's alias or the view's own name
+        // qualifying a SET column (both legal on the engine)
+        if let Some(dot) = s.rfind('.') {
+            let q = s[..dot].trim().trim_matches('"');
+            let ok = alias.is_some_and(|a| a.eq_ignore_ascii_case(q)) || view.eq_ignore_ascii_case(q);
+            if !ok {
+                return None;
+            }
+            s = s[dot + 1..].trim();
+        }
+        if let Some(q) = s.strip_prefix('"') {
+            let name = q.strip_suffix('"')?.replace("\"\"", "\"");
+            cols.iter().position(|(n, _)| *n == name)
+        } else {
+            if !bare_ident_ok(s) {
+                return None;
+            }
+            cols.iter().position(|(n, _)| n.eq_ignore_ascii_case(s))
+        }
+    };
+    let value_text = |v: &str, ix: usize| -> Option<String> {
+        let v = v.trim();
+        if v.is_empty() {
+            return None;
+        }
+        if v.eq_ignore_ascii_case("DEFAULT") {
+            return Some(format!("CAST(NULL AS {})", cols[ix].1));
+        }
+        Some(view_trig_type_params(v, &cols[ix].1))
+    };
+    let where_sql = |w: Option<&str>| match w {
+        Some(w) if !w.trim().is_empty() => format!(" WHERE {}", w.trim()),
+        _ => String::new(),
+    };
+    let from_sql = || match alias {
+        Some(a) => format!("{} {}", view_ident_text(view), a),
+        None => view_ident_text(view),
+    };
+    match shape {
+        ViewTrigShape::Update { set_text, where_text, .. } => {
+            let parts = split_set_list(set_text);
+            if parts.is_empty() || parts.len() != count_top_commas(set_text) + 1 {
+                return None;
+            }
+            let mut assigned: Vec<usize> = Vec::new();
+            let mut vals: Vec<String> = Vec::new();
+            for part in &parts {
+                let eq = part.find('=')?;
+                let ix = lookup(&part[..eq])?;
+                if assigned.contains(&ix) {
+                    return None;
+                }
+                vals.push(value_text(&part[eq + 1..], ix)?);
+                assigned.push(ix);
+            }
+            Some((
+                format!(
+                    "SELECT {}, {} FROM {}{}",
+                    names.join(", "),
+                    vals.join(", "),
+                    from_sql(),
+                    where_sql(*where_text)
+                ),
+                assigned,
+            ))
+        }
+        ViewTrigShape::Delete { where_text, .. } => Some((
+            format!("SELECT {} FROM {}{}", names.join(", "), from_sql(), where_sql(*where_text)),
+            Vec::new(),
+        )),
+        ViewTrigShape::Insert { collist, body } => {
+            let assigned: Vec<usize> = match collist {
+                Some(list) => {
+                    let mut out = Vec::new();
+                    for n in list {
+                        let ix = lookup(n).or_else(|| cols.iter().position(|(c, _)| c.eq_ignore_ascii_case(n)))?;
+                        if out.contains(&ix) {
+                            return None;
+                        }
+                        out.push(ix);
+                    }
+                    out
+                }
+                None => (0..cols.len()).collect(),
+            };
+            match body {
+                ViewTrigBody::Values(inside) => {
+                    if inside.trim().is_empty() {
+                        return None;
+                    }
+                    let items = view_split_commas(inside);
+                    if items.len() != assigned.len() {
+                        return None;
+                    }
+                    let vals: Vec<String> = items
+                        .iter()
+                        .zip(&assigned)
+                        .map(|(v, ix)| value_text(v, *ix))
+                        .collect::<Option<_>>()?;
+                    Some((format!("SELECT {} FROM RDB$DATABASE", vals.join(", ")), assigned))
+                }
+                ViewTrigBody::Select(sel) => Some((sel.trim().to_string(), assigned)),
+                // one row, nothing supplied: every column NULL
+                ViewTrigBody::DefaultValues => {
+                    Some(("SELECT 1 FROM RDB$DATABASE".to_string(), Vec::new()))
+                }
+            }
+        }
+    }
+}
+
+/// A view row (values indexed by field id) as a record image under the
+/// view's own format - what RETURNING decodes, and what types the
+/// values the bodies see (an INSERT's literal 140 becomes the column's
+/// INTEGER, a NUMERIC column's value its scaled form). Blank fields
+/// are NULL.
+fn view_row_image(descs: &[Descriptor], row: &[Value]) -> Result<Vec<u8>, ExecErr> {
+    let mut end = 0usize;
+    for d in descs {
+        if d.offset != 0 {
+            end = d.offset as usize + d.length as usize;
+        }
+    }
+    if end == 0 {
+        return Err("the view has no stored format".into());
+    }
+    let mut image = vec![0u8; end];
+    for i in 0..descs.len() {
+        image[i / 8] |= 1 << (i % 8);
+    }
+    let blank = vec![Value::Null; descs.len()];
+    let mut after = row.to_vec();
+    after.resize(descs.len(), Value::Null);
+    apply_row_changes(&mut image, descs, &blank, &after)?;
+    Ok(image)
+}
+
+/// The statement type a trigger-backed view statement describes as:
+/// the verb's own (isc_info_sql_stmt_insert / update / delete).
+fn view_trig_stmt_type(action: u8) -> i32 {
+    match action {
+        1 => 2,
+        2 => 3,
+        _ => 4,
+    }
+}
+
+/// A value's `?`s wrapped as `CAST(? AS <ty>)` - `ty` being the
+/// DESTINATION column's type, the table planner's own law for a `?`
+/// anywhere in a SET value ([resolve_dest_param_expr]: `A + ?` types
+/// the `?` as the column being assigned). A `?` that is already the
+/// operand of a CAST keeps its cast; one inside a `(SELECT ...)` is
+/// that subquery's own (the query planner types it from what it
+/// compares against); every other `?` takes `ty`. String literals are
+/// left alone.
+fn view_trig_type_params(value: &str, ty: &str) -> String {
+    let masked = mask_literals(&value.to_ascii_uppercase());
+    let m = masked.as_bytes();
+    let mut out = String::with_capacity(value.len() + 32);
+    // paren groups open at this point; true = a subquery
+    let mut stack: Vec<bool> = Vec::new();
+    let mut i = 0usize;
+    while i < value.len() {
+        let c = m[i];
+        match c {
+            b'(' => {
+                let mut j = i + 1;
+                while j < m.len() && m[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                stack.push(word_is_at(&masked, j, "SELECT"));
+                out.push('(');
+            }
+            b')' => {
+                stack.pop();
+                out.push(')');
+            }
+            b'?' => {
+                let in_subquery = stack.iter().any(|s| *s);
+                let head = masked[..i].trim_end();
+                let cast_operand = head
+                    .strip_suffix('(')
+                    .map(|h| h.trim_end())
+                    .and_then(|h| h.strip_suffix("CAST"))
+                    .is_some_and(|h| !h.ends_with(|ch: char| ch.is_ascii_alphanumeric() || ch == '_'));
+                if in_subquery || cast_operand {
+                    out.push('?');
+                } else {
+                    out.push_str(&format!("CAST(? AS {})", ty));
+                }
+            }
+            _ => {
+                let ch_len = utf8_len_at(value, i);
+                out.push_str(&value[i..i + ch_len]);
+                i += ch_len;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// The byte length of the UTF-8 character starting at `at`.
+fn utf8_len_at(s: &str, at: usize) -> usize {
+    let b = s.as_bytes()[at];
+    if b < 0x80 {
+        1
+    } else if b >= 0xF0 {
+        4
+    } else if b >= 0xE0 {
+        3
+    } else {
+        2
+    }
+}
+
+/// Is `word` at byte `at` of `up` (uppercased), as a whole word?
+fn word_is_at(up: &str, at: usize, word: &str) -> bool {
+    let b = up.as_bytes();
+    let end = at + word.len();
+    b.len() >= end
+        && &b[at..end] == word.as_bytes()
+        && !b.get(end).is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_')
+}
+
+/// Does a SET value or a WHERE of a trigger-view statement CORRELATE a
+/// subquery to the view - qualify a column with the view's name (or
+/// the statement's alias) inside a `(SELECT ...)`? The SELECT-over-view
+/// planner answers such a projection with ZERO rows (a pre-existing
+/// defect of the read path: `SELECT ID, (SELECT A FROM D WHERE D.ID =
+/// V.ID) FROM V` is empty where the engine answers the row), which
+/// would make the statement a SILENT no-op - no trigger runs, count 0
+/// (review-caught). Such a statement refuses instead. A subquery that
+/// merely reads FROM the view, or one correlated to another table, is
+/// not this.
+fn view_trig_correlated(text: &str, view: &str, alias: Option<&str>) -> bool {
+    let masked = mask_literals(&text.to_ascii_uppercase());
+    let m = masked.as_bytes();
+    let mut stack: Vec<bool> = Vec::new();
+    let mut i = 0usize;
+    while i < m.len() {
+        match m[i] {
+            b'(' => {
+                let mut j = i + 1;
+                while j < m.len() && m[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                stack.push(word_is_at(&masked, j, "SELECT"));
+                i += 1;
+            }
+            b')' => {
+                stack.pop();
+                i += 1;
+            }
+            b'"' => {
+                // a quoted identifier: exact compare
+                let start = i + 1;
+                let mut j = start;
+                while j < m.len() && m[j] != b'"' {
+                    j += 1;
+                }
+                let name = &text[start..j.min(text.len())];
+                i = j + 1;
+                let mut k = i;
+                while k < m.len() && m[k].is_ascii_whitespace() {
+                    k += 1;
+                }
+                if k < m.len() && m[k] == b'.' && stack.iter().any(|s| *s) {
+                    if name == view || alias.is_some_and(|a| a.trim_matches('"') == name) {
+                        return true;
+                    }
+                }
+            }
+            c if c.is_ascii_alphabetic() || c == b'_' => {
+                let start = i;
+                let mut j = i;
+                while j < m.len() && (m[j].is_ascii_alphanumeric() || m[j] == b'_' || m[j] == b'$') {
+                    j += 1;
+                }
+                let prev_dot = masked[..start].trim_end().ends_with('.');
+                let name = &masked[start..j];
+                i = j;
+                let mut k = j;
+                while k < m.len() && m[k].is_ascii_whitespace() {
+                    k += 1;
+                }
+                // `X.Y` where X is the view or its alias - but not the
+                // `.Y` half, nor a schema-qualified `PUBLIC.V` FROM item
+                // (which is followed by no dot)
+                if !prev_dot && k < m.len() && m[k] == b'.' && stack.iter().any(|s| *s) {
+                    if name.eq_ignore_ascii_case(view)
+                        || alias.is_some_and(|a| a.trim_matches('"').eq_ignore_ascii_case(name))
+                    {
+                        return true;
+                    }
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    false
+}
+
+/// [desc_type_sql] with the CHARACTER SET a text descriptor carries:
+/// the width in CHARACTERS and the set's name, so a `CAST(? AS ...)`
+/// types exactly as the SELECT describes the column (a UTF8 VARCHAR(5)
+/// is 20 bytes; `VARCHAR(20)` alone would be a column of the
+/// attachment's set and another width). A set this server has no name
+/// for keeps the plain spelling.
+fn desc_type_sql_cs(d: &Descriptor) -> String {
+    let cs = fire_crab_ods::intl::charset_id(d.sub_type);
+    match d.dtype {
+        dtype::VARYING | dtype::TEXT if cs != 0 => match charset_sql_name(cs) {
+            Some(name) => {
+                let chars = fire_crab_ods::intl::char_length(d.dtype, d.length, d.sub_type).max(1);
+                let kw = if d.dtype == dtype::VARYING { "VARCHAR" } else { "CHAR" };
+                format!("{}({}) CHARACTER SET {}", kw, chars, name)
+            }
+            None => desc_type_sql(d),
+        },
+        _ => desc_type_sql(d),
+    }
+}
+
+/// The catalogue name of a character set id ([charset_id_of]'s inverse).
+fn charset_sql_name(id: u8) -> Option<&'static str> {
+    Some(match id {
+        0 => "NONE",
+        1 => "OCTETS",
+        2 => "ASCII",
+        3 => "UNICODE_FSS",
+        4 => "UTF8",
+        21 => "ISO8859_1",
+        51 => "WIN1250",
+        52 => "WIN1251",
+        53 => "WIN1252",
+        _ => return None,
+    })
+}
+
+/// A SELECT's output columns as a laid-out RECORD FORMAT indexed by the
+/// view columns' field ids - offsets assigned the way the engine's
+/// MET_align does ([fire_crab_ods::sysfmt::compute_format]) - so a
+/// view row typed by its SELECT's describe can be encoded as an image
+/// ([view_row_image]) and decoded back. A field id no column carries
+/// (a gap) holds an inert SMALLINT.
+fn laid_out_descs(cols: &[RelationColumn], pcols: &[ProjCol]) -> Option<Vec<Descriptor>> {
+    if cols.len() != pcols.len() {
+        return None;
+    }
+    let (_, raw) = derived_view(pcols);
+    let n = cols.iter().map(|c| c.field_id as usize + 1).max()?;
+    let mut fields: Vec<(u8, u16, i8, i16)> = vec![(dtype::SHORT, 2, 0, 0); n];
+    for (c, d) in cols.iter().zip(raw.iter()) {
+        let gfld_length = if d.dtype == dtype::VARYING { d.length.saturating_sub(2) } else { d.length };
+        fields[c.field_id as usize] = (d.dtype, gfld_length, d.scale, d.sub_type);
+    }
+    Some(fire_crab_ods::sysfmt::compute_format(&fields))
+}
+
+/// Plan a statement through a view that has a USER trigger for the
+/// event as [Plan::ViewTrig]: the row SELECT, the view's columns and
+/// their format (typed by the view's own SELECT - see `reread`), the
+/// assigned field ids, the triggers, and the view's own CHECK OPTION
+/// (over the VIEW's columns - NEW is a view row here). None refuses
+/// generically: an unreadable trigger, a projection the query planner
+/// cannot plan, an untyped `?`, a subquery correlated to the view
+/// ([view_trig_correlated]), a CHECK the predicate machinery cannot
+/// evaluate.
+fn plan_view_trig(
+    vt: &ViewDmlTarget,
+    db: &Database,
+    db_outer: &Option<Database>,
+    shape: ViewTrigShape<'_>,
+) -> Option<(Plan, Vec<Descriptor>)> {
+    let action: u8 = match &shape {
+        ViewTrigShape::Insert { .. } => 1,
+        ViewTrigShape::Update { .. } => 2,
+        ViewTrigShape::Delete { .. } => 3,
+    };
+    let triggers = user_triggers(db, &vt.view, &view_event_guard(action))?;
+    if triggers.is_empty() {
+        return None;
+    }
+    let meta = db.relation_meta(&vt.view)?;
+    let cols: Vec<RelationColumn> = meta.columns.as_ref().clone();
+    // a subquery correlated to the view would run as a silent no-op
+    let (alias, texts): (Option<&str>, Vec<&str>) = match &shape {
+        ViewTrigShape::Update { set_text, where_text, alias } => {
+            (*alias, [Some(*set_text), *where_text].into_iter().flatten().collect())
+        }
+        ViewTrigShape::Delete { where_text, alias } => (*alias, where_text.into_iter().copied().collect()),
+        ViewTrigShape::Insert { .. } => (None, Vec::new()),
+    };
+    if texts.iter().any(|t| view_trig_correlated(t, &vt.view, alias)) {
+        return None;
+    }
+    // THE VIEW'S COLUMNS ARE TYPED BY ITS SELECT, not by its stored
+    // format row: the view's RDB$FORMATS entry carries a UTF8
+    // VARCHAR(5) as 18 bytes of NONE, and typing NEW/OLD, the `?`s and
+    // RETURNING from it described the wrong width and charset and
+    // delivered mojibake (review-caught). The same plan is the re-read
+    // an UPDATE's CHECK OPTION locates OLD through.
+    let names_sql: Vec<String> = cols.iter().map(|c| view_ident_text(&c.name)).collect();
+    let all_sql = format!("SELECT {} FROM {}", names_sql.join(", "), view_ident_text(&vt.view));
+    let mut no_params: Vec<Option<Descriptor>> = Vec::new();
+    let reread = plan_query_inner(&all_sql, db_outer, &mut no_params)?;
+    if !no_params.is_empty() {
+        return None;
+    }
+    let descs: Vec<Descriptor> = laid_out_descs(&cols, &output_cols_of(&reread))?;
+    let typed: Vec<(String, String)> = cols
+        .iter()
+        .map(|c| {
+            let ty = descs
+                .get(c.field_id as usize)
+                .map(desc_type_sql_cs)
+                .unwrap_or_else(|| "VARCHAR(32000)".to_string());
+            (c.name.clone(), ty)
+        })
+        .collect();
+    let (sql, assigned_ix) = view_trig_rows_sql(&vt.view, &typed, &shape)?;
+    if trace_on() {
+        eprintln!("[srv] view dml: {}", sql);
+    }
+    let mut params: Vec<Option<Descriptor>> = Vec::new();
+    let rows = plan_query_inner(&sql, db_outer, &mut params)?;
+    let default_values = matches!(
+        &shape,
+        ViewTrigShape::Insert { body: ViewTrigBody::DefaultValues, .. }
+    );
+    if !default_values {
+        let expect = if action == 1 { assigned_ix.len() } else { cols.len() + assigned_ix.len() };
+        if output_cols_of(&rows).len() != expect {
+            return None;
+        }
+    }
+    // every `?` must have earned a descriptor (the describe announces it)
+    let params: Vec<Descriptor> = params.into_iter().collect::<Option<_>>()?;
+    let assigned: Vec<usize> = assigned_ix.iter().map(|i| cols[*i].field_id as usize).collect();
+    // THIS view's CHECK OPTION, over the VIEW's own columns: its WHERE
+    // in view names (part 1 holds it in base names) - a rename through
+    // the INVERTED column map. A level the rename or the predicate
+    // machinery cannot express refuses the statement, never skips it.
+    let mut checks: Vec<TableCheck> = Vec::new();
+    if action != 3 {
+        if let Some(vc) = vt.checks.iter().find(|c| c.view == vt.view) {
+            let trig = if action == 1 { &vc.insert_trigger } else { &vc.update_trigger };
+            if let Some(t) = trig {
+                if !vc.wheres.is_empty() {
+                    let inv: Vec<(String, ViewColSrc)> = vt
+                        .cols
+                        .iter()
+                        .filter_map(|(n, s)| match s {
+                            ViewColSrc::Base(b) => Some((b.clone(), ViewColSrc::Base(n.clone()))),
+                            ViewColSrc::Expr(_) => None,
+                        })
+                        .collect();
+                    let names: Vec<String> = vt.cols.iter().map(|(n, _)| n.clone()).collect();
+                    let mut wheres = Vec::new();
+                    for w in &vc.wheres {
+                        wheres.push(rename_view_idents(w, &inv, &vt.base, &vt.view, &names)?);
+                    }
+                    let own = ViewCheck {
+                        view: vt.view.clone(),
+                        wheres,
+                        update_trigger: vc.update_trigger.clone(),
+                        insert_trigger: vc.insert_trigger.clone(),
+                    };
+                    checks.push(view_check_table_check(db, &own, t, &vt.view)?);
+                }
+            }
+        }
+    }
+    let singleton = matches!(
+        &shape,
+        ViewTrigShape::Insert { body: ViewTrigBody::Values(_) | ViewTrigBody::DefaultValues, .. }
+    );
+    Some((
+        Plan::ViewTrig {
+            view: vt.view.clone(),
+            action,
+            rows: Box::new(rows),
+            cols,
+            descs,
+            assigned,
+            triggers,
+            checks,
+            outer_checks: Vec::new(),
+            reread: Box::new(reread),
+            singleton,
+        },
+        view_params_nullable(params),
+    ))
+}
+
+/// The INSERT tail after its column list, as a [ViewTrigBody]:
+/// `VALUES ( ... )` gives the text inside the parens, `SELECT ...` the
+/// query verbatim. None for anything else.
+fn view_trig_insert_body(tail: &str) -> Option<ViewTrigBody<'_>> {
+    let t = tail.trim();
+    let up = t.to_ascii_uppercase();
+    if up.starts_with("VALUES") && !up["VALUES".len()..].starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_') {
+        let inner = t["VALUES".len()..].trim();
+        let inner = inner.strip_prefix('(')?.strip_suffix(')')?;
+        // the parens must be ONE group: `(1), (2)` is not a VALUES list
+        let masked = mask_literals(&inner.to_ascii_uppercase());
+        let mut depth = 0i32;
+        for c in masked.bytes() {
+            match c {
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth < 0 {
+                        return None;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if depth != 0 {
+            return None;
+        }
+        return Some(ViewTrigBody::Values(inner));
+    }
+    if up.starts_with("SELECT") {
+        return Some(ViewTrigBody::Select(t));
+    }
+    None
+}
+
+/// A view column named in a SET list / column list: the map entry it
+/// resolves to. `"quoted"` compares exactly, bare folds.
+fn view_col_lookup<'a>(vt: &'a ViewDmlTarget, spelled: &str) -> Option<&'a (String, ViewColSrc)> {
+    let s = spelled.trim();
+    if let Some(q) = s.strip_prefix('"') {
+        let name = q.strip_suffix('"')?.replace("\"\"", "\"");
+        vt.cols.iter().find(|(n, _)| *n == name)
+    } else {
+        if !bare_ident_ok(s) {
+            return None;
+        }
+        vt.cols.iter().find(|(n, _)| n.eq_ignore_ascii_case(s))
+    }
+}
+
+/// `UPDATE <view> SET ... [WHERE ...]` rewritten onto the base table
+/// and re-planned. `s` is the trimmed statement, `set_kw` / `where_kw`
+/// the clause positions [plan_update] found.
+fn plan_update_view(
+    s: &str,
+    set_kw: usize,
+    where_kw: Option<usize>,
+    vt: &ViewDmlTarget,
+    db: &Database,
+    db_outer: &Option<Database>,
+) -> Option<(Plan, Vec<Descriptor>)> {
+    // a USER trigger for the event REPLACES the base write
+    // ([plan_view_trig])
+    if view_has_user_trigger(db, &vt.view, &DmlGuard::Update(&[])) {
+        let set_text = &s[set_kw + "SET".len()..where_kw.unwrap_or(s.len())];
+        let where_text = where_kw.map(|w| s[w + "WHERE".len()..].trim());
+        let alias = dml_target_alias(s).map(|(a, _)| a);
+        return plan_view_trig(
+            vt,
+            db,
+            db_outer,
+            ViewTrigShape::Update { set_text, where_text, alias: alias.as_deref() },
+        );
+    }
+    if vt.read_only {
+        return Some((
+            Plan::RefusedEval(EvalErr::ReadOnlyView(quoted_qualified(&vt.view))),
+            Vec::new(),
+        ));
+    }
+    let set_text = &s[set_kw + "SET".len()..where_kw.unwrap_or(s.len())];
+    let parts = split_set_list(set_text);
+    if parts.len() != count_top_commas(set_text) + 1 {
+        return None;
+    }
+    let mut sets: Vec<(String, String)> = Vec::new();
+    for part in parts {
+        let eq = part.find('=')?;
+        let (lhs, rhs) = (part[..eq].trim(), part[eq + 1..].trim());
+        let (_, src) = view_col_lookup(vt, lhs)?;
+        let base_col = match src {
+            ViewColSrc::Base(b) => b.clone(),
+            // an EXPRESSION column: the engine's `attempted update of
+            // read-only column <unknown>` (measured: the literal text)
+            ViewColSrc::Expr(_) => {
+                return Some((
+                    Plan::RefusedEval(EvalErr::ReadOnlyField("<unknown>".into())),
+                    Vec::new(),
+                ))
+            }
+        };
+        let rhs = rename_view_idents(rhs, &vt.cols, &vt.view, &vt.base, &vt.base_cols)?;
+        // two view columns over ONE base column: the LAST assignment
+        // wins (measured: `UPDATE VDUP SET X=1, Y=2` stores A=2)
+        sets.retain(|(c, _)| !c.eq_ignore_ascii_case(&base_col));
+        sets.push((base_col, rhs));
+    }
+    if sets.is_empty() {
+        return None;
+    }
+    let mut conds: Vec<String> = Vec::new();
+    if let Some(w) = where_kw {
+        let ws = s[w + "WHERE".len()..].trim();
+        conds.push(format!(
+            "({})",
+            rename_view_idents(ws, &vt.cols, &vt.view, &vt.base, &vt.base_cols)?
+        ));
+    }
+    conds.extend(vt.wheres.iter().map(|w| format!("({})", w)));
+    let mut sql = format!(
+        "UPDATE {} SET {}",
+        view_ident_text(&vt.base),
+        sets.iter()
+            .map(|(c, r)| format!("{} = {}", view_ident_text(c), r))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    if !conds.is_empty() {
+        sql.push_str(" WHERE ");
+        sql.push_str(&conds.join(" AND "));
+    }
+    if trace_on() {
+        eprintln!("[srv] view dml: {}", sql);
+    }
+    let (mut plan, params) = plan_update(&sql, db_outer)?;
+    match &mut plan {
+        // a CHECK OPTION at an OUTER level still applies over a
+        // trigger-backed view below it (its checks are over that view's
+        // columns - the chain's `base`)
+        Plan::Update { checks, .. } => {
+            checks.extend(view_check_list(db, vt, false)?);
+        }
+        // ...and fires BEFORE the trigger view's own triggers
+        Plan::ViewTrig { outer_checks, .. } => {
+            outer_checks.extend(view_check_list(db, vt, false)?);
+        }
+        _ => {}
+    }
+    Some((plan, view_params_nullable(params)))
+}
+
+/// `DELETE FROM <view> [WHERE ...]` rewritten onto the base table and
+/// re-planned. A CHECK OPTION does not apply to a delete.
+fn plan_delete_view(
+    s: &str,
+    where_kw: Option<usize>,
+    vt: &ViewDmlTarget,
+    db: &Database,
+    db_outer: &Option<Database>,
+) -> Option<(Plan, Vec<Descriptor>)> {
+    // a USER trigger for the event REPLACES the base write
+    // ([plan_view_trig])
+    if view_has_user_trigger(db, &vt.view, &DmlGuard::Delete) {
+        let where_text = where_kw.map(|w| s[w + "WHERE".len()..].trim());
+        let alias = dml_target_alias(s).map(|(a, _)| a);
+        return plan_view_trig(vt, db, db_outer, ViewTrigShape::Delete { where_text, alias: alias.as_deref() });
+    }
+    if vt.read_only {
+        return Some((
+            Plan::RefusedEval(EvalErr::ReadOnlyView(quoted_qualified(&vt.view))),
+            Vec::new(),
+        ));
+    }
+    let mut conds: Vec<String> = Vec::new();
+    if let Some(w) = where_kw {
+        let ws = s[w + "WHERE".len()..].trim();
+        conds.push(format!(
+            "({})",
+            rename_view_idents(ws, &vt.cols, &vt.view, &vt.base, &vt.base_cols)?
+        ));
+    }
+    conds.extend(vt.wheres.iter().map(|w| format!("({})", w)));
+    let mut sql = format!("DELETE FROM {}", view_ident_text(&vt.base));
+    if !conds.is_empty() {
+        sql.push_str(" WHERE ");
+        sql.push_str(&conds.join(" AND "));
+    }
+    if trace_on() {
+        eprintln!("[srv] view dml: {}", sql);
+    }
+    let (plan, params) = plan_delete(&sql, db_outer)?;
+    Some((plan, view_params_nullable(params)))
+}
+
+/// `INSERT INTO <view> ...` when the target IS a view: rewritten onto
+/// the base table and re-planned. Outer None = not a view target (the
+/// caller carries on); inner None = the statement refuses.
+fn plan_insert_view(
+    s: &str,
+    masked: &str,
+    into: usize,
+    db: &Database,
+    db_opt: &Option<Database>,
+) -> Option<Option<(Plan, Vec<Descriptor>)>> {
+    let after = into + "INTO".len();
+    let sel = find_word(masked, "SELECT", after);
+    let vals = find_word(masked, "VALUES", after);
+    let kw_end = match (sel, vals) {
+        (Some(a), Some(b)) => a.min(b),
+        (Some(a), None) | (None, Some(a)) => a,
+        (None, None) => return None,
+    };
+    let default_values = find_word(masked, "DEFAULT", after).filter(|&d| {
+        d < kw_end
+            && Some(kw_end) == vals
+            && masked[d + "DEFAULT".len()..kw_end].trim().is_empty()
+            && s[kw_end + "VALUES".len()..].trim().is_empty()
+    });
+    let head = s[after..default_values.unwrap_or(kw_end)].trim();
+    let (schema, table, collist, ov) = match default_values {
+        Some(_) => {
+            let (q, t) = dml_target_name(head)?;
+            (q, t, None, Overriding::None)
+        }
+        None => split_insert_head(head)?,
+    };
+    if !relation_qualifier_ok(db, schema, table) {
+        return None;
+    }
+    match view_dml_target(db, table, 1) {
+        ViewDml::NotAView => {
+            // a view must never be planned as a table
+            if is_view(db, table) {
+                return Some(None);
+            }
+            None
+        }
+        ViewDml::Unplannable => Some(None),
+        ViewDml::Target(vt) => Some(plan_insert_view_inner(
+            s,
+            kw_end,
+            default_values.is_some(),
+            collist,
+            ov,
+            &vt,
+            db,
+            db_opt,
+        )),
+    }
+}
+
+fn plan_insert_view_inner(
+    s: &str,
+    kw_end: usize,
+    default_values: bool,
+    collist: Option<Vec<String>>,
+    ov: Overriding,
+    vt: &ViewDmlTarget,
+    db: &Database,
+    db_opt: &Option<Database>,
+) -> Option<(Plan, Vec<Descriptor>)> {
+    // a USER trigger for the event REPLACES the base write
+    // ([plan_view_trig])
+    if view_has_user_trigger(db, &vt.view, &DmlGuard::Insert) {
+        let body = if default_values {
+            ViewTrigBody::DefaultValues
+        } else {
+            view_trig_insert_body(&s[kw_end..])?
+        };
+        return plan_view_trig(vt, db, db_opt, ViewTrigShape::Insert { collist, body });
+    }
+    if vt.read_only {
+        return Some((
+            Plan::RefusedEval(EvalErr::ReadOnlyView(quoted_qualified(&vt.view))),
+            Vec::new(),
+        ));
+    }
+    // the field list, or the view's own columns in order (a positional
+    // `INSERT INTO VR VALUES (...)` follows the VIEW's column order)
+    let view_names: Vec<String> = match &collist {
+        Some(names) => names.clone(),
+        None => vt.cols.iter().map(|(n, _)| n.clone()).collect(),
+    };
+    let mut base_cols: Vec<String> = Vec::new();
+    let mut base_raw: Vec<String> = Vec::new();
+    for n in &view_names {
+        match vt.cols.iter().find(|(c, _)| c.eq_ignore_ascii_case(n)) {
+            Some((_, ViewColSrc::Base(b))) => {
+                base_cols.push(view_ident_text(b));
+                base_raw.push(b.clone());
+            }
+            Some((_, ViewColSrc::Expr(_))) => {
+                return Some((
+                    Plan::RefusedEval(EvalErr::ReadOnlyField("<unknown>".into())),
+                    Vec::new(),
+                ))
+            }
+            None => return None,
+        }
+    }
+    let sql = if default_values {
+        format!("INSERT INTO {} DEFAULT VALUES", view_ident_text(&vt.base))
+    } else {
+        format!(
+            "INSERT INTO {} ({}){} {}",
+            view_ident_text(&vt.base),
+            base_cols.join(", "),
+            ov.sql(),
+            s[kw_end..].trim()
+        )
+    };
+    if trace_on() {
+        eprintln!("[srv] view dml: {}", sql);
+    }
+    let (mut plan, params) = plan_insert(&sql, db_opt)?;
+    match &mut plan {
+        Plan::Insert { checks, gen_fields, wasted_gens, .. } => {
+            checks.extend(view_check_list(db, vt, true)?);
+            // IDENTITY THROUGH A VIEW (measured 2026-09-01): a base
+            // identity column the statement SUPPLIES a value for still
+            // draws the base generator, and the draw is discarded -
+            // where the same INSERT on the table leaves it alone. Under
+            // OVERRIDING USER VALUE the draw is the ordinary one
+            // (gen_fields uses it); a refused INSERT never executes.
+            //
+            // ...and the `DEFAULT` keyword as the identity column's
+            // VALUES item draws TWICE through the view - the wasted draw
+            // plus the real one (measured: GEN_ID 11 -> 13, the row
+            // holds 13), where `gen_fields` alone would draw once
+            // (review-caught)
+            if ov != Overriding::User {
+                let defaulted: Vec<String> = if default_values {
+                    Vec::new()
+                } else {
+                    match view_trig_insert_body(&s[kw_end..]) {
+                        Some(ViewTrigBody::Values(inside)) => view_split_commas(inside)
+                            .iter()
+                            .zip(base_raw.iter())
+                            .filter(|(it, _)| it.trim().eq_ignore_ascii_case("DEFAULT"))
+                            .map(|(_, b)| b.clone())
+                            .collect(),
+                        _ => Vec::new(),
+                    }
+                };
+                if let Some(bm) = db.relation_meta(&vt.base) {
+                    for (fid, gen, _) in identity_columns(db, &vt.base) {
+                        let listed = bm.columns.iter().any(|c| {
+                            c.field_id as usize == fid
+                                && base_raw.iter().any(|b| b.eq_ignore_ascii_case(&c.name))
+                        });
+                        let listed_default = bm.columns.iter().any(|c| {
+                            c.field_id as usize == fid
+                                && defaulted.iter().any(|b| b.eq_ignore_ascii_case(&c.name))
+                        });
+                        if (listed && !gen_fields.iter().any(|(f, _, _)| *f == fid)) || listed_default {
+                            wasted_gens.push(gen.clone());
+                        }
+                    }
+                }
+            }
+        }
+        // an OUTER level's CHECK OPTION fires BEFORE the trigger view's
+        // own triggers
+        Plan::ViewTrig { outer_checks, .. } => {
+            outer_checks.extend(view_check_list(db, vt, true)?);
+        }
+        // INSERT ... SELECT re-plans one `INSERT INTO <table> (<cols>)
+        // VALUES (...)` per source row ([insert_select]): keep the VIEW
+        // as that target so each row comes back through this rewrite
+        // (and its CHECK OPTION). The table-stability reservation
+        // resolves the view back to its base ([dml_target_rel])
+        Plan::InsertSelect { table, cols, .. } => {
+            *table = vt.view.clone();
+            *cols = view_names.iter().map(|n| view_ident_text(n)).collect();
+        }
+        _ => {}
+    }
+    Some((plan, view_params_nullable(params)))
+}
+
+/// One RETURNING item through a view: the expression part renamed, an
+/// explicit alias kept verbatim (review-caught: `RETURNING K AS VAL`
+/// had its alias renamed too).
+fn view_returning_item(item: &str, vt: &ViewDmlTarget) -> Option<String> {
+    let (body, alias) = split_alias(item);
+    let text = rename_view_idents(body.trim(), &vt.cols, &vt.view, &vt.base, &vt.base_cols)?;
+    Some(match alias {
+        Some(a) => format!("{} AS {}", text, a),
+        None => text,
+    })
+}
+
+/// `RETURNING` through a view: the values are the BASE row's, the
+/// describe announces the VIEW (measured: `name: K alias: K table: VR`,
+/// every column Nullable, an expression column `RETURNING A2` under its
+/// own name and its expression's type).
+fn wrap_returning_view(
+    plan: Plan,
+    params: Vec<Descriptor>,
+    list: &str,
+    vt: &ViewDmlTarget,
+    db: &Option<Database>,
+) -> Option<(Plan, Vec<Descriptor>)> {
+    if vt.read_only {
+        return None;
+    }
+    let mut items: Vec<String> = Vec::new();
+    // the view column an item IS (bare, or OLD./NEW./view-qualified,
+    // without an alias) - its name and origin are patched below
+    let mut origin: Vec<Option<usize>> = Vec::new();
+    for item in view_split_commas(list) {
+        let item = item.trim();
+        // `*`, `<view>.*`, `NEW.*`, `OLD.*`: every view column in order
+        let star = if item == "*" {
+            Some("")
+        } else {
+            item.strip_suffix(".*").map(|q| q.trim())
+        };
+        if let Some(q) = star {
+            let ctx = q.eq_ignore_ascii_case("OLD") || q.eq_ignore_ascii_case("NEW");
+            if !(ctx || q.is_empty() || q.trim_matches('"').eq_ignore_ascii_case(&vt.view)) {
+                return None;
+            }
+            for (i, (_, src)) in vt.cols.iter().enumerate() {
+                let text = match src {
+                    ViewColSrc::Base(b) => {
+                        if ctx {
+                            format!("{}.{}", q.to_ascii_uppercase(), view_ident_text(b))
+                        } else {
+                            view_ident_text(b)
+                        }
+                    }
+                    ViewColSrc::Expr(e) => {
+                        if q.eq_ignore_ascii_case("OLD") {
+                            return None; // no before-image text for it
+                        }
+                        format!("({})", e)
+                    }
+                };
+                items.push(text);
+                origin.push(Some(i));
+            }
+            continue;
+        }
+        let bare = (|| -> Option<usize> {
+            if split_alias(item).1.is_some() {
+                return None;
+            }
+            let (first, first_q, rest) = returning_ident(item)?;
+            let rest = rest.trim();
+            let (name, quoted) = if rest.is_empty() {
+                (first, first_q)
+            } else {
+                let rest = rest.strip_prefix('.')?;
+                let qual_ok = if first_q {
+                    first == vt.view
+                } else {
+                    first.eq_ignore_ascii_case(&vt.view)
+                        || first.eq_ignore_ascii_case("OLD")
+                        || first.eq_ignore_ascii_case("NEW")
+                };
+                if !qual_ok {
+                    return None;
+                }
+                let (second, second_q, tail) = returning_ident(rest)?;
+                if !tail.trim().is_empty() {
+                    return None;
+                }
+                (second, second_q)
+            };
+            vt.cols.iter().position(|(n, _)| {
+                if quoted { *n == name } else { n.eq_ignore_ascii_case(&name) }
+            })
+        })();
+        items.push(view_returning_item(item, vt)?);
+        origin.push(bare);
+    }
+    let rewritten = items.join(", ");
+    let (plan, params) = wrap_returning(plan, params, &rewritten, &vt.base, None, db)?;
+    let Plan::Returning { inner, mut cols, fields, new_cols } = plan else {
+        return None;
+    };
+    if cols.len() != origin.len() {
+        return None;
+    }
+    for (c, o) in cols.iter_mut().zip(&origin) {
+        c.sql_type = nullable(c.sql_type);
+        if let Some(i) = o {
+            let n = &vt.cols[*i].0;
+            c.name = n.clone();
+            c.fname = Some(n.clone());
+            c.relation = Some(vt.view.clone());
+            c.rel_alias = None;
+        }
+    }
+    Some((Plan::Returning { inner, cols, fields, new_cols }, params))
 }
 
 /// The schema a relation ACTUALLY lives in, read out of RDB$RELATIONS
@@ -47058,6 +49737,7 @@ fn describe_for(plan: &Plan, params: &[Descriptor], att: AttCs) -> Vec<u8> {
         Plan::Merge { .. } => describe_dml(2, params),
         Plan::Update { .. } => describe_dml(3, params), // isc_info_sql_stmt_update
         Plan::Delete { .. } => describe_dml(4, params), // isc_info_sql_stmt_delete
+        Plan::ViewTrig { action, .. } => describe_dml(view_trig_stmt_type(*action), params),
         Plan::Project { cols, .. } => build_describe(cols, params, att),
         Plan::Join { cols, .. } | Plan::JoinGroup { cols, .. } => build_describe(cols, params, att),
         Plan::Lateral { cols, .. } => build_describe(cols, params, att),
@@ -47133,11 +49813,19 @@ fn stmt_type_of(plan: &Plan) -> i32 {
         // VALUES flavor; InsertSelect is its own plan and wrap_returning
         // can wrap it - that combination stays 1, matching the engine.
         Plan::Returning { inner, .. } => {
-            if matches!(inner.as_ref(), Plan::Insert { .. }) { 8 } else { 1 }
+            if matches!(
+                inner.as_ref(),
+                Plan::Insert { .. } | Plan::ViewTrig { action: 1, singleton: true, .. }
+            ) {
+                8
+            } else {
+                1
+            }
         }
         Plan::Insert { .. } | Plan::UpdateOrInsert { .. } | Plan::Merge { .. } => 2,
         Plan::Update { .. } => 3,
         Plan::Delete { .. } => 4,
+        Plan::ViewTrig { action, .. } => view_trig_stmt_type(*action),
         Plan::CreateTable { .. } | Plan::CreateIndex { .. } | Plan::DropTable { .. }
         | Plan::DropIndex { .. }
         | Plan::CreateSequence { .. } | Plan::DropSequence { .. }
@@ -48154,6 +50842,12 @@ const GDS_OVERRIDING_WITHOUT_IDENTITY: i32 = 335545134;
 const GDS_OVERRIDING_SYSTEM_INVALID: i32 = 335545135;
 const GDS_CHECK_CONSTRAINT: i32 = 335544558;
 const GDS_STACK_TRACE: i32 = 335544842;
+/// `isc_read_only_view` (jrd.h msg 42, -150, 42000): "cannot update
+/// read-only view @1". NOT 335544360 - that is `isc_read_only_rel`.
+const GDS_READ_ONLY_VIEW: i32 = 335544362;
+/// `isc_read_only_field` (jrd.h msg 39, -151, 42000): "attempted update
+/// of read-only column @1"
+const GDS_READ_ONLY_FIELD: i32 = 335544359;
 /// `isc_except`, "exception @1" - the head of every raised user
 /// exception's status vector (Firebird.pas:5241).
 const GDS_EXCEPT: i32 = 335544517;
@@ -48607,6 +51301,19 @@ fn eval_status_items(w: &mut W, e: &EvalErr) {
                 .int(GDS_OVERRIDING_SYSTEM_INVALID)
                 .int(2) // isc_arg_string
                 .bytes(table.as_bytes());
+        }
+        // the two view refusals: one gds code, one string, no wrapper
+        EvalErr::ReadOnlyView(name) => {
+            w.int(1) // isc_arg_gds
+                .int(GDS_READ_ONLY_VIEW)
+                .int(2) // isc_arg_string
+                .bytes(name.as_bytes());
+        }
+        EvalErr::ReadOnlyField(name) => {
+            w.int(1) // isc_arg_gds
+                .int(GDS_READ_ONLY_FIELD)
+                .int(2) // isc_arg_string
+                .bytes(name.as_bytes());
         }
         EvalErr::DdlFailed { verb, object, inner } => {
             w.int(1) // isc_arg_gds
@@ -49137,7 +51844,7 @@ fn emit_rows_inner(
         | Plan::SetTimeZoneRefused(_)
         | Plan::InsertSelect { .. }
         | Plan::Insert { .. } | Plan::UpdateOrInsert { .. } | Plan::Merge { .. }
-        | Plan::Update { .. } | Plan::Delete { .. }
+        | Plan::Update { .. } | Plan::Delete { .. } | Plan::ViewTrig { .. }
         | Plan::CreateTable { .. } | Plan::CreateIndex { .. } | Plan::DropTable { .. }
         | Plan::DropIndex { .. }
         | Plan::CreateSequence { .. } | Plan::DropSequence { .. }
@@ -56151,6 +58858,17 @@ enum EvalErr {
     /// `isc_stack_trace` "At trigger ..." item naming the check trigger
     /// that fired (omitted when the trigger name is unknown)
     CheckViolation { constraint: String, table: String, trigger: Option<String> },
+    /// DML against a view that is not naturally updatable and has no
+    /// trigger for the event: `isc_read_only_view` (335544362, SQLCODE
+    /// -150, SQLSTATE 42000) with the pre-quoted `"SCHEMA"."VIEW"`, no
+    /// `isc_dsql_error` wrapper (measured with qa/c/sqlerr.c). Raised
+    /// at PREPARE for UPDATE, DELETE and INSERT alike.
+    ReadOnlyView(String),
+    /// assigning a view's EXPRESSION column (SET or an INSERT field
+    /// list): `isc_read_only_field` (335544359, SQLCODE -151, SQLSTATE
+    /// 42000) whose one argument the engine spells as the literal
+    /// `<unknown>` (measured). Bare, at PREPARE.
+    ReadOnlyField(String),
     /// A DDL STATEMENT THAT FAILED, wrapped the way the engine wraps
     /// every one: `isc_no_meta_update`, then the verb's own
     /// `<VERB> @1 failed` naming the object, then whatever actually went
@@ -76155,8 +78873,12 @@ fn after_auth(
                     // ...and the TARGET'S OWN ALIAS comes off first, so
                     // every resolver below sees the plain form it has
                     // always seen ([strip_dml_alias])
-                    let stmt_sql =
-                        strip_dml_alias(&stmt_sql).unwrap_or_else(|| stmt_sql.clone());
+                    let alias_view = database
+                        .as_ref()
+                        .and_then(|d| dml_target(&stmt_sql).map(|(_, n)| is_view(d, n)))
+                        .unwrap_or(false);
+                    let stmt_sql = strip_dml_alias(&stmt_sql, alias_view)
+                        .unwrap_or_else(|| stmt_sql.clone());
                     let stmt_sql =
                         unqualify_dml(&stmt_sql, &database).unwrap_or_else(|| stmt_sql.clone());
                     let (dml_sql, returning) = split_returning(&stmt_sql);
@@ -76447,6 +79169,7 @@ fn after_auth(
                         | Plan::Savepoint { .. }
                         | Plan::Update { .. }
                         | Plan::Delete { .. }
+                        | Plan::ViewTrig { .. }
                         | Plan::CreateTable { .. }
                         | Plan::CreateIndex { .. }
                         | Plan::DropTable { .. }
@@ -79464,7 +82187,7 @@ fn after_auth(
                         }
                     }
                 } else if matches!(&*plan, Plan::Returning { inner, .. }
-                    if matches!(inner.as_ref(), Plan::Insert { .. }))
+                    if matches!(inner.as_ref(), Plan::Insert { .. } | Plan::ViewTrig { action: 1, singleton: true, .. }))
                 {
                     // `INSERT ... VALUES ... RETURNING` announces stmt
                     // type 8 (exec_procedure - probed against FB6), so a
@@ -88272,7 +90995,7 @@ mod tests {
             index_ops: Vec::new(),
             param_fields: Vec::new(),
             param_exprs: Vec::new(),
-            gen_fields: Vec::new(),
+            gen_fields: Vec::new(), wasted_gens: Vec::new(),
             not_null: Vec::new(),
             checks: Vec::new(),
             domain_checks: Vec::new(),
@@ -88375,7 +91098,7 @@ mod tests {
                 index_ops: Vec::new(),
                 param_fields: Vec::new(),
                 param_exprs: Vec::new(),
-                gen_fields: Vec::new(),
+                gen_fields: Vec::new(), wasted_gens: Vec::new(),
                 not_null: Vec::new(),
                 checks: Vec::new(),
                 domain_checks: Vec::new(),
@@ -90839,5 +93562,473 @@ mod tests {
         assert!(mint_computed_blob(&[b"x".to_vec()]).is_err());
     }
 
-}
 
+    // ---- DML through a view: [rename_view_idents] ----
+
+    fn vr_map() -> Vec<(String, ViewColSrc)> {
+        vec![
+            ("K".to_string(), ViewColSrc::Base("ID".to_string())),
+            ("VAL".to_string(), ViewColSrc::Base("A".to_string())),
+        ]
+    }
+
+    fn t_cols() -> Vec<String> {
+        ["ID", "A", "S", "N"].iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn view_rename_plain_columns() {
+        assert_eq!(
+            rename_view_idents("VAL * 2 + val WHERE K = 5", &vr_map(), "VR", "T", &t_cols()).unwrap(),
+            "A * 2 + A WHERE ID = 5"
+        );
+    }
+
+    #[test]
+    fn view_rename_refuses_a_hidden_base_column() {
+        // VR exposes K, VAL over T(ID, A, S, N): a bare A / S is the
+        // engine's -206, never a write against the hidden column
+        assert_eq!(rename_view_idents("A > 50", &vr_map(), "VR", "T", &t_cols()), None);
+        assert_eq!(rename_view_idents("VAL = 1 WHERE K = 3", &vr_map(), "VR", "T", &t_cols()).as_deref(), Some("A = 1 WHERE ID = 3"));
+        assert_eq!(rename_view_idents("OLD.A", &vr_map(), "VR", "T", &t_cols()), None);
+        assert_eq!(rename_view_idents("VR.S", &vr_map(), "VR", "T", &t_cols()), None);
+        assert_eq!(rename_view_idents("\"A\"", &vr_map(), "VR", "T", &t_cols()), None);
+        // a name neither side has passes through (the base planner decides)
+        assert_eq!(rename_view_idents("NOPE = 1", &vr_map(), "VR", "T", &t_cols()).as_deref(), Some("NOPE = 1"));
+        // inside a subquery a bare base-column name is the subquery's own
+        assert_eq!(
+            rename_view_idents("K IN (SELECT ID FROM D WHERE A > 1)", &vr_map(), "VR", "T", &t_cols()).as_deref(),
+            Some("ID IN (SELECT ID FROM D WHERE A > 1)")
+        );
+        // ...but a RENAMED view column named bare inside one may be the outer row's: refused
+        assert_eq!(
+            rename_view_idents("EXISTS (SELECT 1 FROM D WHERE D.ID = K)", &vr_map(), "VR", "T", &t_cols()),
+            None
+        );
+        // unless the subquery is over the view itself (then it is the inner's)
+        assert_eq!(
+            rename_view_idents("K IN (SELECT K FROM VR WHERE VAL > 50)", &vr_map(), "VR", "T", &t_cols()).as_deref(),
+            Some("ID IN (SELECT K FROM VR WHERE VAL > 50)")
+        );
+    }
+
+    #[test]
+    fn view_rename_binds_a_view_qualified_reference_inside_a_subquery() {
+        let v = vec![
+            ("ID".to_string(), ViewColSrc::Base("ID".to_string())),
+            ("A".to_string(), ViewColSrc::Base("A".to_string())),
+        ];
+        // the subquery's FROM names the BASE table: `V.ID` would bind to the inner T - refused
+        assert_eq!(
+            rename_view_idents("A >= (SELECT MAX(T.A) FROM T WHERE T.ID <> V.ID)", &v, "V", "T", &t_cols()),
+            None
+        );
+        // the subquery's FROM names the VIEW: the reference is the inner view's, untouched
+        assert_eq!(
+            rename_view_idents("ID = (SELECT MAX(V.ID) FROM V)", &v, "V", "T", &t_cols()).as_deref(),
+            Some("ID = (SELECT MAX(V.ID) FROM V)")
+        );
+        // neither: the outer row, spelled by the base
+        assert_eq!(
+            rename_view_idents("EXISTS (SELECT 1 FROM D WHERE D.ID = V.ID)", &v, "V", "T", &t_cols()).as_deref(),
+            Some("EXISTS (SELECT 1 FROM D WHERE D.ID = T.ID)")
+        );
+        assert_eq!(
+            view_group_from_names("(SELECT 1 FROM PUBLIC.D JOIN X ON X.I = D.ID, \"Q\" WHERE 1 = 1)", 0),
+            vec!["D".to_string(), "X".to_string(), "Q".to_string()]
+        );
+    }
+
+    #[test]
+    fn view_rename_leaves_a_sequence_alone() {
+        assert_eq!(
+            rename_view_idents("GEN_ID(VAL, 1) + GEN_ID (VAL, VAL)", &vr_map(), "VR", "T", &t_cols()).as_deref(),
+            Some("GEN_ID(VAL, 1) + GEN_ID (VAL, A)")
+        );
+        assert_eq!(
+            rename_view_idents("NEXT VALUE FOR VAL + VAL", &vr_map(), "VR", "T", &t_cols()).as_deref(),
+            Some("NEXT VALUE FOR VAL + A")
+        );
+    }
+
+    #[test]
+    fn view_returning_alias_is_kept_verbatim() {
+        let vt = ViewDmlTarget {
+            view: "VR".into(),
+            base: "T".into(),
+            base_is_view: false,
+            cols: vr_map(),
+            base_cols: t_cols(),
+            wheres: Vec::new(),
+            checks: Vec::new(),
+            read_only: false,
+        };
+        assert_eq!(view_returning_item("K AS VAL", &vt).as_deref(), Some("ID AS VAL"));
+        assert_eq!(view_returning_item("K + 1 AS VAL", &vt).as_deref(), Some("ID + 1 AS VAL"));
+        assert_eq!(view_returning_item("VAL", &vt).as_deref(), Some("A"));
+    }
+
+    #[test]
+    fn view_body_shape_helpers() {
+        assert_eq!(view_split_commas("ID, 'a,b' AS S2, (SELECT 1, 2 FROM D) X, A").len(), 4);
+        assert_eq!(strip_plan_clause("SELECT ID FROM T WHERE A > 15 PLAN (T NATURAL)"), "SELECT ID FROM T WHERE A > 15");
+        assert_eq!(strip_plan_clause("SELECT ID FROM T WHERE A > 15"), "SELECT ID FROM T WHERE A > 15");
+        assert!(view_item_is_aggregate("COUNT(*)"));
+        assert!(view_item_is_aggregate("SUM (A) OVER (ORDER BY ID)"));
+        assert!(!view_item_is_aggregate("(SELECT MAX(A) FROM T)"));
+        assert!(!view_item_is_aggregate("COALESCE(A, 0)"));
+        assert_eq!(strip_check_option("SELECT ID FROM T WHERE A > 1 WITH CHECK OPTION;"), ("SELECT ID FROM T WHERE A > 1", true));
+    }
+
+    #[test]
+    fn view_rename_is_simultaneous_for_a_swapping_view() {
+        let map = vec![
+            ("A".to_string(), ViewColSrc::Base("ID".to_string())),
+            ("ID".to_string(), ViewColSrc::Base("A".to_string())),
+        ];
+        assert_eq!(rename_view_idents("A + ID", &map, "VS", "T", &t_cols()).unwrap(), "ID + A");
+    }
+
+    #[test]
+    fn view_rename_quoted_identifier_compares_exactly() {
+        let map = vec![("k".to_string(), ViewColSrc::Base("ID".to_string()))];
+        assert_eq!(rename_view_idents("\"k\" = 1", &map, "V", "T", &t_cols()).unwrap(), "ID = 1");
+        // a quoted spelling of another case is NOT that column
+        assert_eq!(rename_view_idents("\"K\" = 1", &map, "V", "T", &t_cols()).unwrap(), "\"K\" = 1");
+        // ...while a bare one folds
+        assert_eq!(rename_view_idents("K = 1", &map, "V", "T", &t_cols()).unwrap(), "ID = 1");
+    }
+
+    #[test]
+    fn view_rename_leaves_string_literals_alone() {
+        assert_eq!(
+            rename_view_idents("VAL = 'VAL' || 'it''s K'", &vr_map(), "VR", "T", &t_cols()).unwrap(),
+            "A = 'VAL' || 'it''s K'"
+        );
+    }
+
+    #[test]
+    fn view_rename_scopes_a_subquery() {
+        // the subquery's own names are its own - a subquery over the
+        // view keeps every reference, view-qualified ones included
+        assert_eq!(
+            rename_view_idents(
+                "VAL = (SELECT MAX(VAL) FROM VR WHERE VR.K = K) AND K IN (SELECT ID FROM D)",
+                &vr_map(),
+                "VR",
+                "T",
+                &t_cols()
+            )
+            .unwrap(),
+            "A = (SELECT MAX(VAL) FROM VR WHERE VR.K = K) AND ID IN (SELECT ID FROM D)"
+        );
+        // a depth-0 view qualifier comes off
+        assert_eq!(rename_view_idents("VR.K = 1", &vr_map(), "VR", "T", &t_cols()).unwrap(), "ID = 1");
+    }
+
+    #[test]
+    fn view_rename_keeps_the_old_and_new_contexts() {
+        assert_eq!(
+            rename_view_idents("OLD.VAL, new.K", &vr_map(), "VR", "T", &t_cols()).unwrap(),
+            "OLD.A, NEW.ID"
+        );
+        let map = vec![("A2".to_string(), ViewColSrc::Expr("A*2".to_string()))];
+        assert_eq!(rename_view_idents("OLD.A2", &map, "VX", "T", &t_cols()), None);
+        // NEW.<expression column> is the expression over the written row
+        assert_eq!(rename_view_idents("NEW.A2", &map, "VX", "T", &t_cols()).as_deref(), Some("(A*2)"));
+    }
+
+    #[test]
+    fn view_rename_never_renames_a_function_name() {
+        let map = vec![
+            ("UPPER".to_string(), ViewColSrc::Base("X".to_string())),
+            ("S".to_string(), ViewColSrc::Base("S2".to_string())),
+        ];
+        assert_eq!(
+            rename_view_idents("UPPER(S) = UPPER (S)", &map, "V", "T", &[]).unwrap(),
+            "UPPER(S2) = UPPER (S2)"
+        );
+    }
+
+    #[test]
+    fn view_rename_substitutes_an_expression_column() {
+        let map = vec![
+            ("ID".to_string(), ViewColSrc::Base("ID".to_string())),
+            ("A2".to_string(), ViewColSrc::Expr("A*2".to_string())),
+        ];
+        assert_eq!(
+            rename_view_idents("A2 + 1 WHERE A2 = 14 AND ID = 7", &map, "VX", "T", &t_cols()).unwrap(),
+            "(A*2) + 1 WHERE (A*2) = 14 AND ID = 7"
+        );
+    }
+
+    #[test]
+    fn view_body_qualifiers_come_off_at_depth_zero_and_bind_in_a_subquery() {
+        assert_eq!(
+            requalify_view_body("X.A > 15 AND PUBLIC.T.ID IN (SELECT D.ID FROM D WHERE D.ID = X.ID)", &["T", "X"], "T"),
+            "A > 15 AND ID IN (SELECT D.ID FROM D WHERE D.ID = T.ID)"
+        );
+        assert_eq!(strip_check_option("SELECT ID FROM T WHERE A > 1 WITH CHECK OPTION"), ("SELECT ID FROM T WHERE A > 1", true));
+        assert_eq!(strip_check_option("SELECT ID FROM T"), ("SELECT ID FROM T", false));
+    }
+
+    #[test]
+    fn the_view_refusal_vectors_are_bare() {
+        fn vec_of(e: &EvalErr) -> Vec<u8> {
+            let mut w = W::default();
+            eval_status_vector(&mut w, e);
+            w.buf
+        }
+        fn int(b: &mut Vec<u8>, v: i32) {
+            b.extend_from_slice(&v.to_be_bytes());
+        }
+        fn arg(b: &mut Vec<u8>, t: &str) {
+            int(b, t.len() as i32);
+            b.extend_from_slice(t.as_bytes());
+            b.extend(std::iter::repeat(0).take((4 - t.len() % 4) % 4));
+        }
+        let mut want = Vec::new();
+        int(&mut want, 1);
+        int(&mut want, 335544362);
+        int(&mut want, 2);
+        arg(&mut want, "\"PUBLIC\".\"VJ\"");
+        int(&mut want, 0);
+        assert_eq!(vec_of(&EvalErr::ReadOnlyView("\"PUBLIC\".\"VJ\"".into())), want);
+        let mut want = Vec::new();
+        int(&mut want, 1);
+        int(&mut want, 335544359);
+        int(&mut want, 2);
+        arg(&mut want, "<unknown>");
+        int(&mut want, 0);
+        assert_eq!(vec_of(&EvalErr::ReadOnlyField("<unknown>".into())), want);
+        assert_eq!(eval_identity(&EvalErr::ReadOnlyView("x".into())).2, "42000");
+        assert_eq!(eval_identity(&EvalErr::ReadOnlyField("x".into())).1, Some(-151));
+    }
+
+
+    #[test]
+    fn view_trig_rows_sql_renders_the_three_shapes() {
+        let cols = vec![
+            ("ID".to_string(), "INTEGER".to_string()),
+            ("A".to_string(), "INTEGER".to_string()),
+            ("A2".to_string(), "BIGINT".to_string()),
+        ];
+        // UPDATE: every view column, then the SET values in SET order -
+        // an expression column may be assigned; a bare `?` is CAST to
+        // the column's type; the `?`s keep TEXT order (SET, then WHERE)
+        let (sql, assigned) = view_trig_rows_sql(
+            "VX",
+            &cols,
+            &ViewTrigShape::Update {
+                set_text: " A2 = ?, A = A + 1 ",
+                where_text: Some("ID = ? AND A > 0"),
+                alias: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(sql, "SELECT ID, A, A2, CAST(? AS BIGINT), A + 1 FROM VX WHERE ID = ? AND A > 0");
+        assert_eq!(assigned, vec![2, 1]);
+        assert!(view_trig_rows_sql(
+            "VX",
+            &cols,
+            &ViewTrigShape::Update { set_text: "A = 1, a = 2", where_text: None, alias: None }
+        )
+        .is_none());
+        // a `?` INSIDE a SET expression takes the DESTINATION column's
+        // type (the table planner's law for `A + ?`); one that is a
+        // CAST's operand keeps its cast; a subquery's is its own. The
+        // `?`s keep TEXT order: SET first, then WHERE - the bind order
+        let (sql, assigned) = view_trig_rows_sql(
+            "VX",
+            &cols,
+            &ViewTrigShape::Update {
+                set_text: "A = A + ?, A2 = CAST(? AS SMALLINT) * (SELECT MAX(A) FROM VX WHERE A > ?)",
+                where_text: Some("ID = ?"),
+                alias: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            sql,
+            "SELECT ID, A, A2, A + CAST(? AS INTEGER), CAST(? AS SMALLINT) * (SELECT MAX(A) FROM VX WHERE A > ?) FROM VX WHERE ID = ?"
+        );
+        assert_eq!(assigned, vec![1, 2]);
+        // the statement's alias names the view in the FROM and may
+        // qualify a SET column
+        let (sql, _) = view_trig_rows_sql(
+            "VX",
+            &cols,
+            &ViewTrigShape::Update { set_text: "v.A = 7", where_text: Some("v.ID = 3"), alias: Some("v") },
+        )
+        .unwrap();
+        assert_eq!(sql, "SELECT ID, A, A2, 7 FROM VX v WHERE v.ID = 3");
+        assert!(view_trig_rows_sql(
+            "VX",
+            &cols,
+            &ViewTrigShape::Update { set_text: "w.A = 7", where_text: None, alias: Some("v") }
+        )
+        .is_none());
+        // DELETE: the view's columns
+        let (sql, assigned) = view_trig_rows_sql(
+            "VX",
+            &cols,
+            &ViewTrigShape::Delete { where_text: Some("ID > 0"), alias: None },
+        )
+        .unwrap();
+        assert_eq!(sql, "SELECT ID, A, A2 FROM VX WHERE ID > 0");
+        assert!(assigned.is_empty());
+        // INSERT ... VALUES: the values over RDB$DATABASE, in the list's order
+        let (sql, assigned) = view_trig_rows_sql(
+            "VX",
+            &cols,
+            &ViewTrigShape::Insert {
+                collist: Some(vec!["A".into(), "ID".into()]),
+                body: ViewTrigBody::Values("?, 14"),
+            },
+        )
+        .unwrap();
+        assert_eq!(sql, "SELECT CAST(? AS INTEGER), 14 FROM RDB$DATABASE");
+        assert_eq!(assigned, vec![1, 0]);
+        // a DEFAULT item is a typed NULL (a view column has no default)
+        let (sql, assigned) = view_trig_rows_sql(
+            "VX",
+            &cols,
+            &ViewTrigShape::Insert {
+                collist: Some(vec!["ID".into(), "A".into()]),
+                body: ViewTrigBody::Values("101, DEFAULT"),
+            },
+        )
+        .unwrap();
+        assert_eq!(sql, "SELECT 101, CAST(NULL AS INTEGER) FROM RDB$DATABASE");
+        assert_eq!(assigned, vec![0, 1]);
+        // positional over the VIEW's columns; a count mismatch refuses
+        let (sql, assigned) = view_trig_rows_sql(
+            "VX",
+            &cols,
+            &ViewTrigShape::Insert { collist: None, body: ViewTrigBody::Values("1, 2, 3") },
+        )
+        .unwrap();
+        assert_eq!(sql, "SELECT 1, 2, 3 FROM RDB$DATABASE");
+        assert_eq!(assigned, vec![0, 1, 2]);
+        assert!(view_trig_rows_sql(
+            "VX",
+            &cols,
+            &ViewTrigShape::Insert { collist: None, body: ViewTrigBody::Values("1, 2") }
+        )
+        .is_none());
+        // INSERT ... SELECT: the query verbatim
+        let (sql, assigned) = view_trig_rows_sql(
+            "VX",
+            &cols,
+            &ViewTrigShape::Insert {
+                collist: Some(vec!["ID".into(), "A".into()]),
+                body: ViewTrigBody::Select("SELECT ID + 100, A FROM T"),
+            },
+        )
+        .unwrap();
+        assert_eq!(sql, "SELECT ID + 100, A FROM T");
+        assert_eq!(assigned, vec![0, 1]);
+        // DEFAULT VALUES: one row, nothing assigned
+        let (_, assigned) = view_trig_rows_sql(
+            "VX",
+            &cols,
+            &ViewTrigShape::Insert { collist: None, body: ViewTrigBody::DefaultValues },
+        )
+        .unwrap();
+        assert!(assigned.is_empty());
+        // the INSERT tail
+        assert!(matches!(view_trig_insert_body("VALUES (1, 'a,b')"), Some(ViewTrigBody::Values("1, 'a,b'"))));
+        assert!(matches!(view_trig_insert_body("SELECT 1 FROM RDB$DATABASE"), Some(ViewTrigBody::Select(_))));
+        assert!(view_trig_insert_body("VALUES (1), (2)").is_none());
+    }
+
+    #[test]
+    fn view_trig_type_params_types_every_free_placeholder_by_the_destination() {
+        assert_eq!(view_trig_type_params("?", "INTEGER"), "CAST(? AS INTEGER)");
+        assert_eq!(view_trig_type_params("A + ?", "INTEGER"), "A + CAST(? AS INTEGER)");
+        assert_eq!(view_trig_type_params("? * 2 + ?", "NUMERIC(9,2)"), "CAST(? AS NUMERIC(9,2)) * 2 + CAST(? AS NUMERIC(9,2))");
+        assert_eq!(view_trig_type_params("CAST(? AS BIGINT)", "INTEGER"), "CAST(? AS BIGINT)");
+        assert_eq!(view_trig_type_params("cast ( ? as bigint)", "INTEGER"), "cast ( ? as bigint)");
+        assert_eq!(view_trig_type_params("XCAST(?)", "INTEGER"), "XCAST(CAST(? AS INTEGER))");
+        assert_eq!(view_trig_type_params("'a?b' || ?", "VARCHAR(5) CHARACTER SET UTF8"), "'a?b' || CAST(? AS VARCHAR(5) CHARACTER SET UTF8)");
+        assert_eq!(view_trig_type_params("(SELECT A FROM D WHERE ID = ?) + ?", "INTEGER"), "(SELECT A FROM D WHERE ID = ?) + CAST(? AS INTEGER)");
+        assert_eq!(view_trig_type_params("(? + 1)", "INTEGER"), "(CAST(? AS INTEGER) + 1)");
+        assert_eq!(view_trig_type_params("'é' || ?", "VARCHAR(5)"), "'é' || CAST(? AS VARCHAR(5))");
+    }
+
+    #[test]
+    fn view_trig_correlated_finds_the_view_qualifying_a_column_in_a_subquery() {
+        assert!(view_trig_correlated("(SELECT A FROM D WHERE D.ID = VSQ.ID)", "VSQ", None));
+        assert!(view_trig_correlated("(SELECT A FROM D WHERE D.ID = vsq.ID)", "VSQ", None));
+        assert!(view_trig_correlated("EXISTS (SELECT 1 FROM D WHERE D.ID = v.ID)", "VSQ", Some("v")));
+        assert!(view_trig_correlated("(SELECT A FROM D WHERE D.ID = \"VSQ\".ID)", "VSQ", None));
+        assert!(view_trig_correlated("1 + (SELECT MAX(A) FROM D WHERE (D.ID < VSQ . ID))", "VSQ", None));
+        // reading FROM the view, or correlating to another table, is not this
+        assert!(!view_trig_correlated("(SELECT MAX(A) FROM VSQ) + 1", "VSQ", None));
+        assert!(!view_trig_correlated("(SELECT MAX(A) FROM PUBLIC.VSQ)", "VSQ", None));
+        assert!(!view_trig_correlated("(SELECT A FROM D WHERE D.ID = T.ID)", "VSQ", None));
+        assert!(!view_trig_correlated("VSQ.A + 1", "VSQ", None));
+        assert!(!view_trig_correlated("'VSQ.A' || (SELECT 'x' FROM D WHERE D.S = 'VSQ.ID')", "VSQ", None));
+        assert!(!view_trig_correlated("ID IN (SELECT ID FROM D)", "VSQ", Some("v")));
+    }
+
+    #[test]
+    fn view_rename_refuses_a_base_qualifier_at_depth_zero() {
+        assert_eq!(rename_view_idents("T.A", &vr_map(), "VR", "T", &t_cols()), None);
+        assert_eq!(rename_view_idents("K = 1 AND PUBLIC.T.A > 1", &vr_map(), "VR", "T", &t_cols()), None);
+        assert_eq!(rename_view_idents("t.a", &vr_map(), "VR", "T", &t_cols()), None);
+        // inside a subquery it is that subquery's own T
+        assert_eq!(
+            rename_view_idents("K IN (SELECT T.ID FROM T WHERE T.A > 1)", &vr_map(), "VR", "T", &t_cols())
+                .unwrap(),
+            "ID IN (SELECT T.ID FROM T WHERE T.A > 1)"
+        );
+    }
+
+    #[test]
+    fn view_rename_never_renames_a_bare_keyword() {
+        let map = vec![
+            ("K".to_string(), ViewColSrc::Base("ID".to_string())),
+            ("INTEGER".to_string(), ViewColSrc::Base("A".to_string())),
+            ("DAY".to_string(), ViewColSrc::Base("A".to_string())),
+        ];
+        assert_eq!(
+            rename_view_idents("CAST(K AS INTEGER) + 1", &map, "VTY", "T", &t_cols()).unwrap(),
+            "CAST(ID AS INTEGER) + 1"
+        );
+        assert_eq!(
+            rename_view_idents("EXTRACT(DAY FROM DATE '2024-03-05')", &map, "VTY", "T", &t_cols()).unwrap(),
+            "EXTRACT(DAY FROM DATE '2024-03-05')"
+        );
+        // only the QUOTED spelling names such a column
+        assert_eq!(rename_view_idents("\"INTEGER\" = \"DAY\"", &map, "VTY", "T", &t_cols()).unwrap(), "A = A");
+    }
+
+    #[test]
+    fn view_ident_text_quotes_a_reserved_word() {
+        assert_eq!(view_ident_text("SELECT"), "\"SELECT\"");
+        assert_eq!(view_ident_text("COUNT"), "\"COUNT\"");
+        assert_eq!(view_ident_text("DATE"), "\"DATE\"");
+        assert_eq!(view_ident_text("OLD"), "\"OLD\"");
+        assert_eq!(view_ident_text("ID"), "ID");
+        assert_eq!(view_ident_text("lower"), "\"lower\"");
+    }
+
+    #[test]
+    fn view_group_from_names_skips_an_aliased_item() {
+        let n = |s: &str| view_group_from_names(&mask_literals(&s.to_ascii_uppercase()), 0);
+        assert_eq!(n("(SELECT 1 FROM VR)"), vec!["VR".to_string()]);
+        assert_eq!(n("(SELECT MAX(X.VAL) FROM VR X WHERE X.K < VR.K)"), Vec::<String>::new());
+        assert_eq!(n("(SELECT 1 FROM VR AS X)"), Vec::<String>::new());
+        assert_eq!(n("(SELECT 1 FROM VR JOIN D ON D.ID = VR.K)"), vec!["VR".to_string(), "D".to_string()]);
+        assert_eq!(n("(SELECT 1 FROM VR, D X)"), vec!["VR".to_string()]);
+        assert_eq!(n("(SELECT 1 FROM VR LEFT JOIN D X ON X.ID = VR.K)"), vec!["VR".to_string()]);
+        // ...so a view-qualified reference beside an ALIASED inner FROM
+        // is the OUTER row (review-caught)
+        assert_eq!(
+            rename_view_idents("(SELECT MAX(x.VAL) FROM VR x WHERE x.K < VR.K)", &vr_map(), "VR", "T", &t_cols())
+                .unwrap(),
+            "(SELECT MAX(x.VAL) FROM VR x WHERE x.K < T.ID)"
+        );
+    }
+}

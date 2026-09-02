@@ -79,8 +79,8 @@ mkdir -p "$D"; rm -f "$WORK" "$REF" "$FBK" "$RST"
 #
 # S1.TA2/S1.TZ3 are the same ALWAYS / BY DEFAULT pair in a NON-PUBLIC
 # schema - the vectors' qualifier must be READ from the catalog, not
-# assumed. VTA is a view over VBASE: an INSERT there has no identity
-# metadata of its own to judge. The identity tables are created in this
+# assumed. VTA is a view over VBASE: an INSERT there is merged into
+# VBASE, whose identity rules and generator apply. The identity tables are created in this
 # order and the RDB$<n> counter is GLOBAL across schemas, so the backing
 # generators are RDB$1 (TA), RDB$2 (TD), RDB$3 (BID), S1.RDB$4 (S1.TA2),
 # S1.RDB$5 (S1.TZ3) and RDB$6 (VBASE).
@@ -567,29 +567,27 @@ both "? = ? in the source refuses on BOTH (engine -804/HY004, fc generic)" \
      "INSERT INTO BND (A,B) SELECT X, Y FROM SRC WHERE ? = ?" '[1,1]' 1
 
 # ======================================================================
-# 11b. A VIEW target. fire-crab has no view-INSERT surface - a priced
-#      boundary. What it must NOT do is answer the identity check first:
-#      a view carries no identity column of its own, so the metadata rule
-#      would confidently ship 335545134 naming the VIEW, where the engine
-#      merges the view and writes the BASE table. And when the engine DOES
-#      refuse through a view it names the BASE table, so even the argument
-#      would be wrong. The typed verdict is therefore a TABLE verdict; a
-#      view target falls through to the generic refusal below. VBASE is
-#      deliberately absent from the final content dump - the engine
-#      ANSWERS these, so the twins part company here.
+# 11b. A VIEW target. The engine merges the view into its BASE table:
+#      the identity verdicts name "PUBLIC"."VBASE" (never the view), an
+#      OSV literal lands in VBASE, an omitted identity draws VBASE's own
+#      generator, and RETURNING describes the VIEW's columns. Until
+#      2026-09-01 fire-crab had no view-INSERT surface at all and this
+#      section recorded the refusal; DML through a view is now a law of
+#      its own (qa/serve-real-viewdml.sh), so the twins must agree here.
 # ======================================================================
-echo "--- 11b. a view target ships no typed identity verdict"
-bound "OSV into a view (engine merges and writes VBASE; fc has no view-INSERT surface)" \
-      "INSERT INTO VTA (ID,B) OVERRIDING SYSTEM VALUE VALUES (4444,'v9')"
-bound "a plain view INSERT naming the identity (the engine's 335545137 names \"PUBLIC\".\"VBASE\")" \
-      "INSERT INTO VTA (ID,B) VALUES (3007,'v1')"
-bound "a view INSERT omitting the identity (engine: the base generator draws)" \
-      "INSERT INTO VTA (B) VALUES ('v2')"
-vview=$(run "$PORT" "$WORK" "INSERT INTO VTA (ID,B) OVERRIDING SYSTEM VALUE VALUES (4445,'v10')")
-check "the refusal is GENERIC - it used to fabricate 335545134 \"PUBLIC\".\"VTA\"" \
-      "$vview" 'ERR [{"gdscode":335544569}]'
-check "and the view's BASE table is untouched on fire-crab's side" \
-      "$(col "$WORK" "SELECT COUNT(*) FROM VBASE")" "0"
+echo "--- 11b. a view target merges into its base table"
+both "OSV into a view: the engine merges the view and writes VBASE" \
+     "INSERT INTO VTA (ID,B) OVERRIDING SYSTEM VALUE VALUES (4444,'v9')"
+both "a plain view INSERT naming the identity: the 335545137 names the BASE table" \
+     "INSERT INTO VTA (ID,B) VALUES (3007,'v1')"
+both "a view INSERT omitting the identity: the base generator draws" \
+     "INSERT INTO VTA (B) VALUES ('v2')"
+both "RETURNING through the view answers the drawn identity" \
+     "INSERT INTO VTA (B) VALUES ('v3') RETURNING ID, B"
+both "OSV through the view again, then the view reads every row back" \
+     "INSERT INTO VTA (ID,B) OVERRIDING SYSTEM VALUE VALUES (4445,'v10')"
+check "the view's BASE table holds the merged rows on fire-crab's side" \
+      "$(col "$WORK" "SELECT COUNT(*) FROM VBASE")" "$(col "$REF" "SELECT COUNT(*) FROM VBASE")"
 
 # ======================================================================
 # 12. Epilogue: the two files must be identical table by table, then
@@ -615,7 +613,8 @@ SELECT 'DCOMP|'||A||'|'||C FROM D_COMP ORDER BY 1;
 SELECT 'DPK|'||A FROM D_PK ORDER BY 1;
 SELECT 'CMP|'||A||'|'||C||'|'||TRIM(B) FROM CMP ORDER BY 1;
 SELECT 'POSN|'||P1||'|'||P2||'|'||P3 FROM POSN;
-SELECT 'GEN|'||GEN_ID(RDB$1,0)||'|'||GEN_ID(RDB$2,0) FROM RDB$DATABASE;
+SELECT 'VBASE|'||ID||'|'||COALESCE(TRIM(B),'~') FROM VBASE ORDER BY ID;
+SELECT 'GEN|'||GEN_ID(RDB$1,0)||'|'||GEN_ID(RDB$2,0)||'|'||GEN_ID(RDB$6,0) FROM RDB$DATABASE;
 SELECT 'S1GEN|'||GEN_ID(S1.RDB$4,0)||'|'||GEN_ID(S1.RDB$5,0) FROM RDB$DATABASE;
 SQL
 }
