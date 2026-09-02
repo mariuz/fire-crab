@@ -156,7 +156,9 @@ refuses "... and the bare computed column still refuses" \
   "UPDATE C SET A = 5 WHERE ID = 1 RETURNING CC;"
 refuses "an aggregate in RETURNING refuses" \
   "UPDATE T SET N = 1 WHERE ID = 1 RETURNING MAX(N);"
-refuses "a subquery in RETURNING refuses" \
+# (was a recorded refusal; the subquery lift in RETURNING answers it now -
+# measured equal to the engine, value and describe: MAX 496 LONG Nullable)
+both "a subquery in RETURNING answers, as the engine does" \
   "UPDATE T SET N = 1 WHERE ID = 1 RETURNING (SELECT MAX(N) FROM T);"
 refuses "a quoted name in the wrong case is still Column unknown" \
   "UPDATE T SET N = 1 WHERE ID = 1 RETURNING \"n\";"

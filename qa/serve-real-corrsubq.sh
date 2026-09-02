@@ -222,9 +222,10 @@ both "ORDER BY an outer expression" \
 
 # --- 6. the refusals, each for a stated reason ------------------------
 # a NON-EQUALITY correlation cannot be a keyed table: the engine answers
-# it by re-running the subquery per row, which this fold does not do
-refuses "a NON-EQUALITY correlation" \
-        "SELECT D.ID, (SELECT COUNT(*) FROM EMP E WHERE E.SALARY > D.ID * 100) FROM DEPT D"
+# it by re-running the subquery per row - and so does this server since
+# 2026-09-02 (Expr::CorrSub), where the fold used to refuse
+both "a NON-EQUALITY correlation is answered per row" \
+     "SELECT D.ID, (SELECT COUNT(*) FROM EMP E WHERE E.SALARY > D.ID * 100) FROM DEPT D ORDER BY D.ID"
 # an inner GROUP BY would need a second level of folding
 refuses "a GROUP BY inside the subquery" \
         "SELECT D.ID, (SELECT COUNT(*) FROM EMP E WHERE E.DEPT_ID = D.ID GROUP BY E.ID)

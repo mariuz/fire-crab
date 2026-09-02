@@ -195,16 +195,20 @@ refuses() { # <label> <sql>
         *) echo "DIFF boundary MOVED: $1"; echo "     [$r]"; fail=1 ;;
     esac
 }
-refuses "a CORRELATED subquery inside a larger expression refuses" \
-  "UPDATE D SET N = (SELECT V FROM P WHERE P.ID = D.ID) + 1 WHERE ID = 1;"
+# a correlated subquery INSIDE A LARGER EXPRESSION, and a correlated bare
+# column whose source has two rows for ANOTHER key: both were recorded
+# refusals of the prepare-time lookup table; since 2026-09-02 they are
+# evaluated PER TARGET ROW (Expr::CorrSub), so the 21000 for the two-row
+# key is raised only when that key is reached - which is when the
+# engine raises it
+both "a CORRELATED subquery inside a larger expression" \
+  "UPDATE D SET N = (SELECT V FROM P WHERE P.ID = D.ID) + 1 WHERE ID = 1 RETURNING ID, N; ROLLBACK;"
+both "a correlated bare column whose source has two rows for a key NOT reached" \
+  "UPDATE D SET S = (SELECT T FROM P WHERE P.ID = D.ID) WHERE ID = 1 RETURNING ID, S; ROLLBACK;"
+both "... and the two-row key, when reached, is the engine's 21000" \
+  "UPDATE D SET S = (SELECT T FROM P WHERE P.ID = D.ID) WHERE ID = 2; ROLLBACK;"
 refuses "a correlated subquery in an INSERT's value list refuses" \
   "INSERT INTO D (ID, N) VALUES (20, (SELECT V FROM P WHERE P.ID = D.ID));"
-# the lookup table is built for EVERY key at prepare, so a source with
-# two rows for one key has no single value to park there - even when the
-# statement's WHERE would never reach that key. The engine raises only if
-# it is reached; this server refuses the statement (recorded)
-refuses "a correlated bare column whose source has two rows for a key refuses" \
-  "UPDATE D SET S = (SELECT T FROM P WHERE P.ID = D.ID) WHERE ID = 1;"
 gf=$("$GFIX" -v -full -user "$U" -pas "$P" "$A" 2>&1)
 ran=$((ran + 1))
 if [ -z "$gf" ]; then echo "OK   gfix -v -full clean on fc's file"; else echo "DIFF gfix: $gf"; fail=1; fi

@@ -206,34 +206,22 @@ both "control: parenthesised NON-null under NOT" \
 #   (SELECT COUNT(*) FROM t x WHERE x.id < t.id)       -- a running count
 #       answered 0 for every row
 #
-# They REFUSE now, which is a boundary rather than a wrong answer. The
-# equality forms below must keep ANSWERING - the refusal must not have
-# been bought by giving up the shapes that worked.
+# They refused for a while (a boundary rather than a wrong answer); since
+# 2026-09-02 an inequality correlation is evaluated PER OUTER ROW
+# ([Expr::CorrSub] in the server) and both idioms answer what the engine
+# answers. The equality forms keep their semi-join fold.
 both "correlated EXISTS on equality" \
     "SELECT ID FROM T WHERE EXISTS (SELECT 1 FROM T X WHERE X.AMT = T.AMT) ORDER BY ID"
 both "correlated NOT EXISTS on equality" \
     "SELECT ID FROM T WHERE NOT EXISTS (SELECT 1 FROM T X WHERE X.ID = T.ID) ORDER BY ID"
+both "NOT EXISTS with an inequality correlation (the last row)" \
+    "SELECT ID FROM T WHERE NOT EXISTS (SELECT 1 FROM T X WHERE X.ID > T.ID) ORDER BY ID"
+both "EXISTS with an inequality correlation (every row but the last)" \
+    "SELECT ID FROM T WHERE EXISTS (SELECT 1 FROM T X WHERE X.ID > T.ID) ORDER BY ID"
 both "an uncorrelated EXISTS still folds" \
     "SELECT ID FROM T WHERE EXISTS (SELECT 1 FROM T WHERE AMT = 10) ORDER BY ID"
 both "an uncorrelated NOT EXISTS over no rows" \
     "SELECT ID FROM T WHERE NOT EXISTS (SELECT 1 FROM T WHERE AMT = 999) ORDER BY ID"
-
-# the recorded boundary: it must REFUSE, and must never answer a constant
-ran_boundary() { # <label> <sql>
-    local r
-    r=$(query "$2" "$PORT" "$A")
-    case "$r" in
-        ERR*) echo "OK   refuses cleanly (recorded boundary): $1" ;;
-        *) echo "DIFF $1 ANSWERED [$r] - an unexpressible correlation must refuse,"
-           echo "     never fold to one verdict for every row. If this now answers,"
-           echo "     check it against the engine and move it into the block above."
-           fail=1 ;;
-    esac
-}
-ran_boundary "NOT EXISTS with an inequality correlation" \
-    "SELECT ID FROM T WHERE NOT EXISTS (SELECT 1 FROM T X WHERE X.ID > T.ID) ORDER BY ID"
-ran_boundary "EXISTS with an inequality correlation" \
-    "SELECT ID FROM T WHERE EXISTS (SELECT 1 FROM T X WHERE X.ID > T.ID) ORDER BY ID"
 
 rm -f "$A" "$B"
 exit $fail

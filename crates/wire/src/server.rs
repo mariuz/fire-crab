@@ -3339,6 +3339,11 @@ impl Database {
     /// without holding a lock, and a writer installing a new image
     /// never changes one out from under a read in progress.
     fn bytes(&self) -> std::sync::Arc<fire_crab_ods::Image> {
+        // a RETURNING projection reads the image its statement started
+        // from ([SUBQ_IMAGE]); everything else the published pages
+        if let Some(img) = SUBQ_IMAGE.with(|c| c.borrow().clone()) {
+            return img;
+        }
         self.shared.image()
     }
 
@@ -11148,6 +11153,24 @@ fn bind_filter(
     }
 }
 
+/// [bind_filter] on a ROW-SOURCE path, whose failures are [EvalErr]s:
+/// an EVAL-shaped bind failure - the invariant pass or the key
+/// conversion raising - KEEPS its status vector, so a per-row inner
+/// that raises (`EXISTS (SELECT MAX(V) FROM E WHERE E.TID = 3 AND
+/// 1/(3-3) > 0)`) raises the outer statement exactly as the engine's
+/// does, where mapping every failure to Unsupported turned the 22012
+/// into a refusal (review-caught); any other failure stays the path's
+/// refusal.
+fn bind_filter_eval(
+    filter: &Option<Predicate>,
+    args: &[WireParam],
+) -> Result<Option<Predicate>, EvalErr> {
+    bind_filter(filter, args).map_err(|e| match e {
+        ExecErr::Eval(ev) => ev,
+        _ => EvalErr::Unsupported,
+    })
+}
+
 /// May this term's verdict depend on the row? The invariant pass in
 /// [Predicate::bind] walks exactly the terms this clears: constants,
 /// the invariant unknown, and expression terms whose expressions read
@@ -11203,6 +11226,13 @@ fn expr_reads(e: &Expr, f: &dyn Fn(usize) -> bool) -> bool {
                 || else_.as_deref().is_some_and(|e| expr_reads(e, f))
         }
         Expr::Lookup { key, .. } => expr_reads(key, f),
+        Expr::CorrSub { outer, kind, .. } => {
+            outer.iter().any(|(_, e, _)| expr_reads(e, f))
+                || match kind.as_ref() {
+                    CorrKind::In { lhs, .. } | CorrKind::Quant { lhs, .. } => expr_reads(lhs, f),
+                    _ => false,
+                }
+        }
         // BOTH sides read: the zone is an expression too, and a term
         // whose row-dependence is missed here is evaluated against an
         // EMPTY row - the column arrives NULL and the predicate
@@ -15348,6 +15378,16 @@ fn result_width_bytes(e: &Expr, descs: &[Descriptor]) -> u8 {
             _ => 2,
         },
         Expr::UserFn { ret, .. } => exact_dtype_bytes(ret.dtype).unwrap_or(8),
+        // a subquery's value keeps ITS column's width through a
+        // conditional: COALESCE((SELECT MAX(V) ...), 0) over an INTEGER
+        // is LONG on the engine, and INT64 here before (review-caught)
+        Expr::CorrSub { desc: Some(pc), .. } => match pc.sql_type & !1 {
+            500 => 2,
+            496 => 4,
+            32752 => 16,
+            _ => 8,
+        },
+        Expr::Lookup { bytes, .. } => *bytes,
         Expr::Neg(a) => result_width_bytes(a, descs),
         // a conditional takes its WIDEST branch (probed: CASE S/2 -> LONG,
         // CASE S/S -> SHORT, COALESCE(S, B) -> INT64); NULLIF takes its
@@ -15798,6 +15838,7 @@ fn text_form_m(
         // a column's descriptor length is BYTES; the width here is
         // CHARACTERS, so a multibyte charset divides by its
         // bytes-per-character (CHAR(6) UTF8 stores 24 bytes, is 6 wide)
+        Expr::CorrSub { desc: Some(pc), .. } => corr_text_form(pc),
         Expr::Col(fid) => {
             let d = descs.get(*fid)?;
             let bpc = fire_crab_ods::intl::bytes_per_char(
@@ -16164,6 +16205,17 @@ fn build_expr_col_from(e: Expr, name: &str, descs: &[Descriptor]) -> Option<Proj
             sub_type: 0,
             expr: Some(Expr::Null),
         });
+    }
+    // A CORRELATED SCALAR SUBQUERY DESCRIBES AS ITS INNER STATEMENT DOES:
+    // the type, width, charset and field naming its one column announces
+    // (probed: `(SELECT A FROM D ...)` is 496 LONG name A table D, COUNT
+    // is 580 INT64 name COUNT, MAX over an INTEGER is LONG) - always
+    // nullable, since no row answers NULL
+    if let Expr::CorrSub { desc: Some(pc), .. } = &e {
+        let mut c = (**pc).clone();
+        c.name = name.to_string();
+        c.expr = Some(e);
+        return Some(c);
     }
     // A BLOB RESULT describes as a blob and travels as an id: len 8,
     // sqltype 520, the sub_type and (for a text blob) the charset in
@@ -25118,11 +25170,13 @@ fn wrap_returning(
             // two-context resolvers mark a name they mean to bind
             // elsewhere. `NEW.` comes off entirely: that image is the
             // row this route already reads.
+            // (the `NEW.` strip itself comes AFTER the subquery lift
+            // below: stripped first, `NEW.ID` inside a subquery became a
+            // bare ID that innermost-first bound to the INNER table - a
+            // silent wrong count, review-caught)
             let ext_body;
             let body = if two_rows {
-                let mut qq: Vec<String> = Vec::new();
-                let once = strip_qual_prefix(body, "NEW", &mut qq);
-                ext_body = rewrite_old_refs(&once);
+                ext_body = rewrite_old_refs(body);
                 ext_body.as_str()
             } else {
                 body
@@ -25140,6 +25194,41 @@ fn wrap_returning(
                 (columns.as_ref().clone(), descs)
             };
             let columns = columns.as_slice();
+            // a SUBQUERY in the item - `RETURNING ID, (SELECT NM FROM D
+            // WHERE D.ID = T.ID)` - is evaluated per returned row over the
+            // stored image ([lift_corr_text]); a MERGE's two contexts are
+            // not a scope this lift binds
+            let lifted;
+            let body = if merge.is_none()
+                && body.contains('(')
+                && find_word(&mask_literals(&body.to_ascii_uppercase()), "SELECT", 0).is_some()
+            {
+                let mut scope = CorrScope::single(table, None, Some(table), columns, descs);
+                if two_rows {
+                    // `NEW.<col>` inside the subquery is the after-image
+                    // too - the row this route reads - as a QUALIFIED-ONLY
+                    // second name for it, so a bare name stays
+                    // unambiguous; `OLD.<col>` is already its synthetic
+                    // column (measured: E.TID = NEW.ID counts 2, as T.ID)
+                    let mut new_rel = scope.rels[0].clone();
+                    new_rel.key = "NEW".to_string();
+                    new_rel.schema = None;
+                    new_rel.qual_only = true;
+                    scope.rels.push(new_rel);
+                }
+                lifted = lift_corr_text(body, &scope, dbr, db, false)?;
+                lifted.as_str()
+            } else {
+                body
+            };
+            let new_stripped;
+            let body = if two_rows {
+                let mut qq: Vec<String> = Vec::new();
+                new_stripped = strip_qual_prefix(body, "NEW", &mut qq);
+                new_stripped.as_str()
+            } else {
+                body
+            };
             let raw = parse_raw_expr_any(body.trim())?;
             // A MERGE's RETURNING resolves TWO contexts, and this route
             // reads only the target's after-image - so every column the
@@ -25210,9 +25299,12 @@ fn wrap_returning(
             }
             // probed, and the select list's own rule: an expression
             // carries NO source relation, where a plain RETURNING column
-            // carries the target table
-            pc.relation = None;
-            pc.rel_alias = None;
+            // carries the target table - and a SUBQUERY standing alone
+            // keeps its inner column's (`table: D`, probed)
+            if !matches!(raw, RawExpr::Subq(_)) {
+                pc.relation = None;
+                pc.rel_alias = None;
+            }
             cols.push(pc);
             // vestigial beside an expression column, which reads the
             // whole record rather than one field
@@ -25618,14 +25710,24 @@ fn dml_table_name(sql: &str) -> Option<String> {
 /// instead of a second name-resolution path. `AS` is optional and comes
 /// off with it.
 ///
+/// INSIDE A SUBQUERY the qualifier becomes the TARGET's own name
+/// instead of coming off: there it is the OUTER ROW (a correlated
+/// reference), and bare it would bind to the subquery's own relation -
+/// measured: `UPDATE T t SET S = (SELECT NM FROM D WHERE D.ID = t.ID)`
+/// read `ID` as D's and raised 21000.
+///
 /// REFUSES (returns None, which leaves the statement to refuse) when
-/// the alias token appears anywhere as a BARE word rather than a
-/// qualifier: that is how a nested `FROM O t` declares the same alias
+/// the alias token appears as a BARE word outside a FROM / JOIN
+/// position: that is how a nested `FROM O t` declares the same alias
 /// for a different table, and rewriting through it would answer the
-/// wrong rows. A correlated subquery that merely READS `t.<col>` is
-/// rewritten like any other reference, which is what the engine
-/// resolves it to.
-fn strip_dml_alias(sql: &str, view_target: bool) -> Option<String> {
+/// wrong rows (a bare `T` right after FROM or JOIN is a relation name,
+/// as in `DELETE FROM T t WHERE ... (SELECT ... FROM T x ...)`); when a
+/// subquery's own FROM names the target UNALIASED, so the rewritten
+/// qualifier could not be told from the inner one; and when the BASE
+/// NAME qualifies a column inside a subquery whose FROM does not name
+/// it - after `DELETE FROM T AS Q` that is the engine's -206, not the
+/// outer row.
+fn strip_dml_alias(sql: &str, _view_target: bool) -> Option<String> {
     let (alias, def_at) = dml_target_alias(sql)?;
     let (_, target) = dml_target(sql)?;
     let target = target.to_string();
@@ -25653,18 +25755,30 @@ fn strip_dml_alias(sql: &str, view_target: bool) -> Option<String> {
     while let Some(p) = find_word(&masked, &ualias, from) {
         let after = p + ualias.len();
         if b.get(after).copied() != Some(b'.') {
+            // a bare occurrence that is a RELATION NAME in a nested FROM
+            // / JOIN position is legal and common (`DELETE FROM T t
+            // WHERE ... (SELECT ... FROM T x ...)`); anywhere else it is
+            // how a nested `FROM O t` declares the same alias for another
+            // table, and rewriting through it would answer the wrong rows
+            if dml_alias_relation_position(&masked, p) {
+                from = after;
+                continue;
+            }
             return None;
         }
         out.push_str(&sql[cut..p]);
-        // Through a VIEW, a qualifier INSIDE A SUBQUERY becomes the
-        // view's own name, which the view rewrite then binds to the
-        // base row ([rename_view_idents]) - bare, it would be the
-        // subquery's own column (review-caught: `DELETE FROM VAL v
-        // WHERE EXISTS (SELECT 1 FROM D WHERE D.ID = v.I)` refused).
-        // A subquery whose FROM names the view itself cannot tell the
-        // two apart: the statement keeps its alias and refuses
-        if view_target && paren_depth_at(&masked, p) > 0 {
-            if dml_alias_subquery_names(&masked, p, &target) {
+        // INSIDE A SUBQUERY the qualifier becomes the target's own name:
+        // that is the OUTER ROW there (a correlated reference), and bare
+        // it would be the subquery's own column - measured: `UPDATE T t
+        // SET S = (SELECT NM FROM D WHERE D.ID = t.ID)` bound ID to D
+        // and raised 21000. Through a VIEW the view rewrite then binds
+        // the name to the base row ([rename_view_idents]). A subquery
+        // whose own FROM names the target UNALIASED cannot tell the two
+        // apart: the statement keeps its alias and refuses
+        if inside_select_span(&masked, p) {
+            if dml_alias_subquery_names(&masked, p, &target)
+                || subquery_from_names_unaliased(&masked, p, &target)
+            {
                 return None;
             }
             out.push_str(&target);
@@ -25677,7 +25791,118 @@ fn strip_dml_alias(sql: &str, view_target: bool) -> Option<String> {
         from = after;
     }
     out.push_str(&sql[cut..]);
+    // AN ALIAS REPLACES THE TABLE NAME: after `DELETE FROM T AS Q` a
+    // `T.C` inside a subquery is the engine's -206 unless that subquery's
+    // own FROM names T. Rewritten to the bare alias-less statement it
+    // would have READ as the outer row, so the statement keeps its alias
+    // (and refuses) instead
+    let utarget = target.to_ascii_uppercase();
+    let mut at = def_at + alias.len();
+    // ...unless the alias IS the base name (`UPDATE T t`): then every
+    // occurrence was the alias, rewritten above
+    if utarget == ualias {
+        at = masked.len();
+    }
+    while let Some(p) = find_word(&masked, &utarget, at) {
+        at = p + utarget.len();
+        if b.get(at).copied() == Some(b'.')
+            && inside_select_span(&masked, p)
+            && !subquery_from_names_unaliased(&masked, p, &target)
+        {
+            return None;
+        }
+    }
     Some(out)
+}
+
+/// Is byte `at` of `masked` inside a `( SELECT ... )` span?
+fn inside_select_span(masked: &str, at: usize) -> bool {
+    let b = masked.as_bytes();
+    let mut opens: Vec<usize> = Vec::new();
+    for (i, &c) in b.iter().enumerate().take(at) {
+        match c {
+            b'(' => opens.push(i),
+            b')' => {
+                opens.pop();
+            }
+            _ => {}
+        }
+    }
+    opens.iter().any(|&o| {
+        let word = masked[o + 1..].trim_start();
+        word.starts_with("SELECT")
+            && !word[6..].starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+    })
+}
+
+/// Is the word at byte `at` of `masked` a RELATION in a FROM / JOIN
+/// position (the word right after FROM, JOIN, or a comma inside a FROM
+/// list)?
+fn dml_alias_relation_position(masked: &str, at: usize) -> bool {
+    let b = masked.as_bytes();
+    let mut e = at;
+    while e > 0 && b[e - 1].is_ascii_whitespace() {
+        e -= 1;
+    }
+    let mut s = e;
+    while s > 0 && is_ident_byte(b[s - 1]) {
+        s -= 1;
+    }
+    matches!(&masked[s..e], "FROM" | "JOIN")
+}
+
+/// Does a SUBQUERY enclosing byte `at` of `masked` name `target`
+/// UNALIASED in its own FROM list? Then a `<target>.<col>` inside it
+/// would be that FROM item's, not the outer row's.
+fn subquery_from_names_unaliased(masked: &str, at: usize, target: &str) -> bool {
+    let b = masked.as_bytes();
+    let mut opens: Vec<usize> = Vec::new();
+    for (i, &c) in b.iter().enumerate().take(at) {
+        match c {
+            b'(' => opens.push(i),
+            b')' => {
+                opens.pop();
+            }
+            _ => {}
+        }
+    }
+    opens.iter().any(|&o| {
+        let Some(close) = matching_paren(b, o) else { return false };
+        let inner = &masked[o + 1..close];
+        let Some((_, table_s, ..)) = split_query(inner) else { return false };
+        let Some((left, joins)) = parse_from(table_s) else { return false };
+        std::iter::once(&left)
+            .chain(joins.iter().map(|(_, r, _, _)| r))
+            .any(|tr| tr.alias.is_none() && tr.table.eq_ignore_ascii_case(target))
+    })
+}
+
+/// Does a SUBQUERY enclosing byte `at` of `masked` BIND `key` in its own
+/// FROM list - a relation named `key` unaliased, or any item aliased as
+/// `key`? Then a `<key>.<col>` inside it is that item's, innermost-first
+/// (a MERGE's source or target alias of the same spelling is shadowed).
+fn subquery_from_binds(masked: &str, at: usize, key: &str) -> bool {
+    let b = masked.as_bytes();
+    let mut opens: Vec<usize> = Vec::new();
+    for (i, &c) in b.iter().enumerate().take(at) {
+        match c {
+            b'(' => opens.push(i),
+            b')' => {
+                opens.pop();
+            }
+            _ => {}
+        }
+    }
+    opens.iter().any(|&o| {
+        let Some(close) = matching_paren(b, o) else { return false };
+        let inner = &masked[o + 1..close];
+        let Some((_, table_s, ..)) = split_query(inner) else { return false };
+        let Some((left, joins)) = parse_from(table_s) else { return false };
+        std::iter::once(&left).chain(joins.iter().map(|(_, r, _, _)| r)).any(|tr| match tr.alias {
+            Some(a) => a.eq_ignore_ascii_case(key),
+            None => tr.table.eq_ignore_ascii_case(key),
+        })
+    })
 }
 
 /// Does a SUBQUERY enclosing byte `at` of `masked` name `target` in
@@ -26192,7 +26417,7 @@ fn plan_insert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
                     && find_word(&mask_literals(&inner.to_ascii_uppercase()), "SELECT", 0)
                         .is_some() =>
             {
-                match fold_dml_subqueries(inner, dbr, db) {
+                match fold_dml_subqueries(inner, dbr, db, None) {
                     Some((t, raise)) => {
                         folded_inner = t;
                         subq_raise = raise;
@@ -28535,6 +28760,12 @@ fn plan_update(sql: &str, db_outer: &Option<Database>) -> Option<(Plan, Vec<Desc
     let set_text = &s[set_kw + "SET".len()..set_end];
     let mut params: Vec<Option<Descriptor>> = Vec::new();
     let mut sets: Vec<(usize, SetVal)> = Vec::new();
+    // the target row as the scope a SET value's subquery may name: a DML
+    // target takes no alias in this grammar (the strip rewrote one to the
+    // table's own name inside its subqueries), so the relation name is
+    // the key
+    let set_scope =
+        CorrScope::single(table, relation_schema(db, table).as_deref(), Some(table), &columns, descs);
     // split on TOP-LEVEL commas in the text (not the token stream), so
     // each assignment keeps its right-hand side verbatim - an expression
     // is parsed from that text by the same parser a select list uses.
@@ -28598,7 +28829,7 @@ fn plan_update(sql: &str, db_outer: &Option<Database>) -> Option<(Plan, Vec<Desc
                 let rhs = if rhs.contains('(')
                     && find_word(&mask_literals(&rhs.to_ascii_uppercase()), "SELECT", 0).is_some()
                 {
-                    match fold_dml_subqueries(rhs, db, db_outer) {
+                    match fold_dml_subqueries(rhs, db, db_outer, Some(&set_scope)) {
                         Some((t, raise)) => {
                             rhs_folded = t;
                             subq_raise = raise;
@@ -28656,19 +28887,37 @@ fn plan_update(sql: &str, db_outer: &Option<Database>) -> Option<(Plan, Vec<Desc
                             .then(|| relation_schema(db, table).map(|q| (q, table)))
                             .flatten(),
                     };
-                    let (e, _d) = build_correlated_lookup(&sub, db, &columns, &bind, descs)?;
-                    if e.type_of(descs).is_none() {
-                        return None;
+                    if let Some((e, _d)) = build_correlated_lookup(&sub, db, &columns, &bind, descs, false) {
+                        if e.type_of(descs).is_none() {
+                            return None;
+                        }
+                        if sets.iter().any(|(f, _)| *f == fid0) {
+                            return None;
+                        }
+                        if is_computed_fid(descs, fid0) {
+                            return None;
+                        }
+                        sets.push((fid0, SetVal::Expr(e)));
+                        continue;
                     }
-                    if sets.iter().any(|(f, _)| *f == fid0) {
-                        return None;
-                    }
-                    if is_computed_fid(descs, fid0) {
-                        return None;
-                    }
-                    sets.push((fid0, SetVal::Expr(e)));
-                    continue;
                 }
+                // A subquery the lookup table cannot express - an
+                // inequality or a second correlated predicate, a nested
+                // level, one inside a larger expression - is evaluated
+                // PER TARGET ROW ([Expr::CorrSub]) through a marker the
+                // expression parser takes
+                let rhs_lifted;
+                let rhs = if rhs.contains('(')
+                    && find_word(&mask_literals(&rhs.to_ascii_uppercase()), "SELECT", 0).is_some()
+                {
+                    rhs_lifted = lift_corr_text(rhs, &set_scope, db, db_outer, false)?;
+                    if trace_on() {
+                        eprintln!("[srv] update SET per-row sub {:?}", rhs_lifted);
+                    }
+                    rhs_lifted.as_str()
+                } else {
+                    rhs
+                };
                 // `_any` also accepts a BARE column reference, which
                 // `parse_raw_expr` refuses (it exists for select-list
                 // expressions, where a bare column is a plain column).
@@ -28847,7 +29096,7 @@ fn plan_update(sql: &str, db_outer: &Option<Database>) -> Option<(Plan, Vec<Desc
                                     .then(|| relation_schema(db, table).map(|s| (s, table)))
                                     .flatten(),
                             };
-                            resolve_subqueries(&toks, &subs, db, db_outer, &columns, &bind, true)?
+                            resolve_subqueries(&toks, &subs, db, db_outer, &columns, &bind, descs, true)?
                         };
                         folded_where = render_toks(&folded);
                         Some(folded)
@@ -29032,7 +29281,7 @@ fn plan_delete(sql: &str, db_outer: &Option<Database>) -> Option<(Plan, Vec<Desc
                                     .then(|| relation_schema(db, table).map(|s| (s, table)))
                                     .flatten(),
                             };
-                            resolve_subqueries(&toks, &subs, db, db_outer, &columns, &bind, true)?
+                            resolve_subqueries(&toks, &subs, db, db_outer, &columns, &bind, descs, true)?
                         };
                         folded_where = render_toks(&folded);
                         Some(folded)
@@ -29192,6 +29441,7 @@ fn dml_targets_at(
                 return Err(EvalErr::UpdateConflict(tx));
             }
             out.push((recno, dp_no, r.slot, format, image));
+            dml_progress_set(out.len());
         }
     }
     sort_targets_recno(&mut out);
@@ -29505,10 +29755,38 @@ fn collect_dml_targets(
                     return Err(EvalErr::UpdateConflict(tx));
                 }
                 out.push((dp_no, r.slot, format, image));
+                dml_progress_set(out.len());
             }
         }
     }
     Ok(out)
+}
+
+thread_local! {
+    /// How many rows the RUNNING DML statement has decided or written
+    /// so far - the count a statement that RAISES reports. The engine
+    /// writes as it scans, and its `isc_info_sql_records` after a
+    /// raise counts the rows already written (probed: `UPDATE T SET A =
+    /// A + 100 WHERE EXISTS (SELECT MAX(V) FROM E WHERE E.TID = T.ID
+    /// AND 1/(T.ID-3) > 0)` raises 22012 at row 3 and reports 2 updated,
+    /// `DELETE` the same 2, `UPDATE T SET A = 1 WHERE ID = 1 OR 1/0 > 0`
+    /// reports 1 - none of it kept, the statement is undone whole).
+    /// This server collects every target before it writes one, so the
+    /// number is the rows MATCHED before a WHERE raise, or the rows
+    /// WRITTEN before a store-time one ([dml_progress_set]); reset at
+    /// [execute_dml] and read by the responder on an eval-shaped
+    /// failure only.
+    static DML_PROGRESS: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
+}
+
+/// Record how far the running DML has got ([DML_PROGRESS]).
+fn dml_progress_set(n: usize) {
+    DML_PROGRESS.with(|c| c.set(i32::try_from(n).unwrap_or(i32::MAX)));
+}
+
+/// The rows the running DML touched before it raised ([DML_PROGRESS]).
+fn dml_progress() -> i32 {
+    DML_PROGRESS.with(|c| c.get())
 }
 
 /// Execute a DML plan against a WORKING COPY of the database bytes - a
@@ -29675,6 +29953,7 @@ fn execute_dml(
     args: &[WireParam],
     ctx: &SessionCtx,
 ) -> Result<(i32, i32, i32), ExecErr> {
+    dml_progress_set(0);
     // SET TIME ZONE touches no page - it is the session's own state
     // (att_current_timezone), and every execute route lands here
     if let Plan::SetTimeZone { zone } = plan {
@@ -30023,6 +30302,11 @@ fn execute_dml_collecting_inner(
     ctx: &SessionCtx,
     mut affected: Option<&mut Affected>,
 ) -> Result<(i32, i32, i32), ExecErr> {
+    // a per-row subquery in a SET value, a WHERE or a RETURNING item reads
+    // the database this statement holds - the PUBLISHED one, so the
+    // statement's own writes stay invisible to it (the engine's stable
+    // cursor)
+    let _subq_db = SubqDbGuard::arm(&*database);
     // RETURNING wraps a DML: run the inner statement, keeping the rows it
     // touched
     if let Plan::Returning { inner, .. } = plan {
@@ -31224,7 +31508,10 @@ fn execute_dml_collecting_inner(
             // itself).
             let mut first_perm: Vec<Option<[u8; 8]>> = vec![None; blob_sets.len()];
             let sets = &bound_sets;
-            for (page, slot, fmt, image) in found {
+            for (done, (page, slot, fmt, image)) in found.into_iter().enumerate() {
+                // the rows WRITTEN before a raise in this loop
+                // ([DML_PROGRESS])
+                dml_progress_set(done);
                 // the SET offsets were resolved in the NEWEST format; a
                 // record still stored in an older one would patch wrong
                 // bytes - refuse the whole statement instead
@@ -31671,7 +31958,8 @@ fn execute_dml_collecting_inner(
                 return Err(ExecErr::Conflict(other));
             }
             let fc_defaults = newest_format_defaults(db, *rel);
-            for (page, slot, fmt, image) in found {
+            for (done, (page, slot, fmt, image)) in found.into_iter().enumerate() {
+                dml_progress_set(done); // see the UPDATE loop
                 // BEFORE DELETE TRIGGERS, where the engine fires them:
                 // over the row as it stands (OLD), before it goes. A
                 // body that raises stops the statement whole - nothing
@@ -33089,16 +33377,27 @@ fn resolve_index_ops_uncached(db: &Database, rel: u16, descs: &[Descriptor]) -> 
 /// Check a parameterised SELECT's values against its plan by binding
 /// every filter now: the answer is an error at op_execute, not a wrong
 /// row set at fetch. Plans without parameters validate trivially.
+///
+/// An EVAL-shaped failure - the invariant pass or the open-time key
+/// conversion raising - is NOT reported here: the engine raises it from
+/// the CURSOR, at the first fetch, never from op_execute (probed with
+/// isql, whose `Records affected: 0` prints only after a fetch-time
+/// error and printed for `WHERE 1/0 > 0` over an empty table and for
+/// `WHERE ID = 'zz'` over a keyed column alike). The fetch binds again
+/// and carries the vector there ([EmitErr]).
 fn validate_select_bind(plan: &Plan, args: &[WireParam]) -> Result<(), ExecErr> {
-    match plan {
+    let r = match plan {
         Plan::Group { filter, having, .. } | Plan::JoinGroup { filter, having, .. } => {
-            bind_filter(filter, args)?;
-            bind_filter(having, args).map(|_| ())
+            bind_filter(filter, args).and_then(|_| bind_filter(having, args)).map(|_| ())
         }
         Plan::Project { filter, .. } | Plan::Join { filter, .. } => {
             bind_filter(filter, args).map(|_| ())
         }
         _ => Ok(()),
+    };
+    match r {
+        Err(ExecErr::Eval(_)) => Ok(()),
+        other => other,
     }
 }
 
@@ -34336,8 +34635,18 @@ fn desc_type_sql(d: &Descriptor) -> String {
         dtype::SHORT => if d.scale < 0 { format!("NUMERIC(4,{})", s) } else { "SMALLINT".into() },
         dtype::LONG => if d.scale < 0 { format!("NUMERIC(9,{})", s) } else { "INTEGER".into() },
         dtype::INT64 => if d.scale < 0 { format!("NUMERIC(18,{})", s) } else { "BIGINT".into() },
-        dtype::INT128 => if d.scale < 0 { format!("NUMERIC(38,{})", s) } else { "DECIMAL(38)".into() },
+        // (NUMERIC(38), not the INT128 keyword, which this server's CAST
+        // does not read; both describe INT128 len 16)
+        dtype::INT128 => if d.scale < 0 { format!("NUMERIC(38,{})", s) } else { "NUMERIC(38)".into() },
         dtype::DOUBLE => "DOUBLE PRECISION".into(),
+        // the stand-in must announce EXACTLY what the column does: a
+        // FLOAT / DECFLOAT / WITH TIME ZONE column that fell to the wide
+        // VARCHAR below was described as text on the wire (review-caught)
+        dtype::REAL => "FLOAT".into(),
+        dtype::DEC64 => "DECFLOAT(16)".into(),
+        dtype::DEC128 => "DECFLOAT(34)".into(),
+        dtype::SQL_TIME_TZ => "TIME WITH TIME ZONE".into(),
+        dtype::TIMESTAMP_TZ => "TIMESTAMP WITH TIME ZONE".into(),
         dtype::SQL_DATE => "DATE".into(),
         dtype::SQL_TIME => "TIME".into(),
         dtype::TIMESTAMP => "TIMESTAMP".into(),
@@ -36382,6 +36691,7 @@ fn plan_query(sql: &str, db: &Option<Database>) -> (Plan, Vec<Descriptor>) {
         *c.borrow_mut() = db.as_ref().map(|d| (d.bytes(), d.page_size));
     });
     FN_CALLS.with(|l| l.borrow_mut().clear());
+    clear_corr_registry();
     PREPARE_REFUSAL.with(|r| *r.borrow_mut() = None);
     EXPLICIT_COLL_SEEN.with(|c| c.set(false));
     // the two system-SQL pieces libfbclient's array helpers lean on,
@@ -36914,6 +37224,39 @@ fn plan_over_source(
     let bind_alias: Option<String> =
         from.alias.or(rel_alias).map(str::to_string);
     let (columns, descs) = derived_view(cols);
+    // SUBQUERIES over a bound source (a derived table, a view standing in
+    // for itself): each is lifted into a per-row marker resolved against
+    // the source's own columns ([lift_corr_text]); a correlated one names
+    // the source by its binding alias
+    let corr_scope = CorrScope::single(alias, None, None, &columns, &descs);
+    let lift = |t: &str, sel: bool| -> Option<String> {
+        match db.as_ref() {
+            Some(dbr)
+                if t.contains('(')
+                    && find_word(&mask_literals(&t.to_ascii_uppercase()), "SELECT", 0).is_some() =>
+            {
+                lift_corr_text(t, &corr_scope, dbr, db, sel)
+            }
+            _ => Some(t.to_string()),
+        }
+    };
+    let proj_l = lift(proj_s, true)?;
+    let where_l = match where_s {
+        Some(w) => Some(lift(w, false)?),
+        None => None,
+    };
+    let having_l = match having_s {
+        Some(h) => Some(lift(h, false)?),
+        None => None,
+    };
+    let order_l = match order_s {
+        Some(o) => Some(lift(o, false)?),
+        None => None,
+    };
+    let proj_s = proj_l.as_str();
+    let where_s = where_l.as_deref();
+    let having_s = having_l.as_deref();
+    let order_s = order_l.as_deref();
     // AGGREGATING the bound rows - `SELECT COUNT(*) FROM C`. A grouped
     // JOIN is already "fold this row source", so the same node serves
     // here with NO parts: the bound rows are the base and the fold sits
@@ -38955,7 +39298,10 @@ fn view_trig_correlated(text: &str, view: &str, alias: Option<&str>) -> bool {
 fn desc_type_sql_cs(d: &Descriptor) -> String {
     let cs = fire_crab_ods::intl::charset_id(d.sub_type);
     match d.dtype {
-        dtype::VARYING | dtype::TEXT if cs != 0 => match charset_sql_name(cs) {
+        // CHARACTER SET NONE is spelled too: left off, the stand-in took
+        // the attachment's set and a CHAR(5) NONE column described as
+        // 20 bytes of UTF8 (review-caught)
+        dtype::VARYING | dtype::TEXT => match charset_sql_name(cs) {
             Some(name) => {
                 let chars = fire_crab_ods::intl::char_length(d.dtype, d.length, d.sub_type).max(1);
                 let kw = if d.dtype == dtype::VARYING { "VARCHAR" } else { "CHAR" };
@@ -40335,7 +40681,7 @@ fn lateral_rows(
     }
     // filter / sort the combined rows through the ordinary
     // Rows -> Filter -> Sort tree
-    let pred = bind_filter(filter, args).map_err(|_| EvalErr::Unsupported)?;
+    let pred = bind_filter_eval(filter, args)?;
     RowSource::Sort {
         input: Box::new(RowSource::Filter { input: Box::new(RowSource::Rows(combined)), pred }),
         keys: order_by.to_vec(),
@@ -40576,7 +40922,7 @@ fn stream_first_n(
         Plan::Project { rel, formats, cols, filter, order_by, gen_cols, index, windows, .. }
             if gen_cols.is_empty() && windows.is_empty() =>
         {
-            let filter = bind_filter(filter, args).map_err(|_| EvalErr::Unsupported)?;
+            let filter = bind_filter_eval(filter, args)?;
             let mut src = RowSource::scan_filter_sort(
                 *rel,
                 formats.clone(),
@@ -40605,7 +40951,7 @@ fn stream_first_n(
         // two rows where projecting the whole sorted result raised on a row
         // past the limit.
         Plan::Join { base, base_width, parts, cols, filter, order_by, defer } => {
-            let bound = bind_filter(filter, args).map_err(|_| EvalErr::Unsupported)?;
+            let bound = bind_filter_eval(filter, args)?;
             let base = resolve_driver_base(db, base, defer, &bound);
             let src = join_rowsource(&base, *base_width, parts, &bound);
             let mut out: Vec<Vec<Value>> = Vec::new();
@@ -40770,8 +41116,8 @@ fn branch_rows_res(
         defer,
     } = plan
     {
-        let having = bind_filter(having, args).map_err(|_| EvalErr::Unsupported)?;
-        let filter = bind_filter(filter, args).map_err(|_| EvalErr::Unsupported)?;
+        let having = bind_filter_eval(having, args)?;
+        let filter = bind_filter_eval(filter, args)?;
         // a parameterised WHERE builds its band here from the bound
         // predicate - a grouped derived table or CTE looks up too
         let descs_now: Vec<Descriptor> = formats
@@ -40806,7 +41152,7 @@ fn branch_rows_res(
         let rows = branch_rows_res(inner, db, args)?;
         let filtered = RowSource::Filter {
             input: Box::new(RowSource::Rows(rows)),
-            pred: bind_filter(filter, args).map_err(|_| EvalErr::Unsupported)?,
+            pred: bind_filter_eval(filter, args)?,
         }
         .rows(db)?;
         // a window folds over the FILTERED rows and is appended to each
@@ -40831,7 +41177,7 @@ fn branch_rows_res(
     // ORDER BY indexes it, not the projection) and then projected, the
     // same two steps `Plan::Project` takes below.
     if let Plan::Join { base, base_width, parts, cols, filter, order_by, defer } = plan {
-        let filter = bind_filter(filter, args).map_err(|_| EvalErr::Unsupported)?;
+        let filter = bind_filter_eval(filter, args)?;
         let base = resolve_driver_base(db, base, defer, &filter);
         let mut rows =
             join_rows(db, &base, *base_width, parts, &filter)?;
@@ -40861,8 +41207,8 @@ fn branch_rows_res(
         defer,
     } = plan
     {
-        let filter = bind_filter(filter, args).map_err(|_| EvalErr::Unsupported)?;
-        let having = bind_filter(having, args).map_err(|_| EvalErr::Unsupported)?;
+        let filter = bind_filter_eval(filter, args)?;
+        let having = bind_filter_eval(having, args)?;
         let base = resolve_driver_base(db, base, defer, &filter);
         let input = join_rows(db, &base, *base_width, parts, &filter)?;
         // the joined rows are a materialised leaf; the fold and the sort
@@ -40892,7 +41238,7 @@ fn branch_rows_res(
     let Plan::Project { rel, formats, cols, filter, .. } = plan else {
         return Err(EvalErr::Unsupported);
     };
-    let filter = bind_filter(filter, args).map_err(|_| EvalErr::Unsupported)?;
+    let filter = bind_filter_eval(filter, args)?;
     // The ROW SOURCE TREE does the scan, the filter and the sort - the
     // three nodes this function used to spell out by hand. THE SORT
     // BELONGS INSIDE IT because ORDER BY indexes the RECORD's fields and
@@ -40970,7 +41316,7 @@ fn branch_rows_each(
         return Err(EvalErr::Unsupported);
     }
     if let Plan::Project { rel, formats, cols, filter, order_by, index, .. } = plan {
-        let filter = bind_filter(filter, args).map_err(|_| EvalErr::Unsupported)?;
+        let filter = bind_filter_eval(filter, args)?;
         let mut src = RowSource::scan_filter_sort(
             *rel,
             formats.clone(),
@@ -42314,6 +42660,66 @@ fn plan_query_inner_ctx(
         }
     }
 
+    // A SUBQUERY IN THE OTHER CLAUSES - ORDER BY, HAVING, a JOIN's ON,
+    // and a join's WHERE (the single-relation WHERE lifts its own, below,
+    // where an equality correlation still folds to a semi-join). Each is
+    // lifted into a per-row marker ([lift_corr_text]) and the statement
+    // re-planned over the rewritten text, the way the select list's fold
+    // re-plans. Measured: every one of these REFUSED before.
+    if let Some(dbr) = db.as_ref() {
+        let has_sub = |t: Option<&str>| {
+            t.is_some_and(|x| {
+                x.contains('(') && find_word(&mask_literals(&x.to_ascii_uppercase()), "SELECT", 0).is_some()
+            })
+        };
+        let parsed = parse_from(table_s);
+        let joined = parsed.as_ref().is_some_and(|(_, j)| !j.is_empty());
+        let on_sub = parsed.as_ref().is_some_and(|(_, j)| j.iter().any(|(_, _, on_s, _)| has_sub(Some(on_s))));
+        if has_sub(order_s) || has_sub(having_s) || (joined && has_sub(where_s)) || on_sub {
+            if let Some(scope) = CorrScope::of_from(table_s, dbr, db) {
+                let lift = |t: &str| lift_corr_text(t, &scope, dbr, db, false);
+                // ON conditions, spliced back into the FROM text from the
+                // end so earlier offsets stay valid
+                let mut from_out = table_s.to_string();
+                if let Some((_, joins)) = parsed.as_ref() {
+                    let base = table_s.as_ptr() as usize;
+                    for (_, _, on_s, _) in joins.iter().rev() {
+                        let os = on_s.as_ptr() as usize;
+                        if os < base || os + on_s.len() > base + table_s.len() || !has_sub(Some(on_s)) {
+                            continue;
+                        }
+                        let Some(l) = lift(on_s) else {
+                            if trace { eprintln!("[srv] plan: ON subquery not lifted {:?}", on_s); }
+                            return None;
+                        };
+                        let o = os - base;
+                        from_out = format!("{}{}{}", &from_out[..o], l, &from_out[o + on_s.len()..]);
+                    }
+                }
+                let mut out = format!("SELECT {} FROM {}", proj_s, from_out);
+                if let Some(w) = where_s {
+                    let w = if joined && has_sub(Some(w)) { lift(w)? } else { w.to_string() };
+                    out.push_str(&format!(" WHERE {}", w));
+                }
+                if let Some(g) = group_s {
+                    out.push_str(&format!(" GROUP BY {}", g));
+                }
+                if let Some(h) = having_s {
+                    let h = if has_sub(Some(h)) { lift(h)? } else { h.to_string() };
+                    out.push_str(&format!(" HAVING {}", h));
+                }
+                if let Some(o) = order_s {
+                    let o = if has_sub(Some(o)) { lift(o)? } else { o.to_string() };
+                    out.push_str(&format!(" ORDER BY {}", o));
+                }
+                if trace {
+                    eprintln!("[srv] plan: clause subqueries lifted to {:?}", out);
+                }
+                params.clear();
+                return plan_query_inner_ctx(&out, db, params, in_view).map(downgrade_rewritten);
+            }
+        }
+    }
     // A SUBQUERY IN THE SELECT LIST - `SELECT ID, (SELECT COUNT(*) FROM
     // D) FROM T`. A subquery that names no outer column is a CONSTANT for
     // the whole statement, so it is evaluated once here and FOLDED BACK
@@ -42397,7 +42803,21 @@ fn plan_query_inner_ctx(
                             let (body, _) = split_alias(item);
                             body.trim() == mark
                         })?;
-                        let (rel, ralias) = subquery_source(sub);
+                        // a PROJECTED OUTER COLUMN names ITS table
+                        // (probed: `(SELECT TY.S FROM TY2 y ...)` is
+                        // table TY, not the inner FROM)
+                        let outer_col_rel = parse_from(table_s).and_then(|(from, joins)| {
+                            if !joins.is_empty() {
+                                return None;
+                            }
+                            let key = from.alias.unwrap_or(from.table);
+                            let (p, ..) = split_query(sub)?;
+                            let (body, _) = split_alias(p.trim());
+                            let (q, c) = body.trim().split_once('.')?;
+                            (q.trim().trim_matches('"').eq_ignore_ascii_case(key) && ident_ok(c.trim()))
+                                .then(|| (Some(from.table.to_string()), from.alias.map(str::to_string)))
+                        });
+                        let (rel, ralias) = outer_col_rel.unwrap_or_else(|| subquery_source(sub));
                         // a WHOLE-ITEM subquery also lends the outer
                         // column its ANNOUNCED TYPE - the engine
                         // describes (SELECT MAX(I) FROM T) by MAX's own
@@ -42437,41 +42857,88 @@ fn plan_query_inner_ctx(
                         // today's literal-derived one. This can only
                         // ever ADD a correct description; it never turns
                         // an answer into a refusal.
-                        let sty = match plan_query_inner(sub, db, &mut Vec::new()) {
-                            Some(Plan::Scalar(_, _, _, ty)) => Some(ty),
-                            Some(p) => output_cols_of(&p).first().map(ScalarTy::from_col),
-                            None => None,
+                        // a CORRELATED sub announces what its marker
+                        // describes ([corr_describe], through the
+                        // projection builder) - a stand-in plan here
+                        // would override it with this server's CAST
+                        // describe (an INT128 at 64 bytes, a FLOAT as
+                        // DOUBLE; review-caught)
+                        let correlated = CorrScope::of_from(table_s, dbr, db)
+                            .and_then(|sc| corr_scan(sub, &sc, dbr, db))
+                            .is_some_and(|sc| !sc.refs.is_empty());
+                        let sty = if correlated {
+                            None
+                        } else {
+                            match plan_query_inner(sub, db, &mut Vec::new()) {
+                                Some(Plan::Scalar(_, _, _, ty)) => Some(ty),
+                                Some(p) => output_cols_of(&p).first().map(ScalarTy::from_col),
+                                None => None,
+                            }
                         };
                         Some((idx, subquery_item_name(sub)?.0, rel, ralias, sty))
                     })
                     .collect();
                 let mut proj_out = folded.clone();
+                // THE ENCLOSING SCOPE, for deciding whether a subquery
+                // names the outer row ([corr_scan]) - and the outer
+                // relation's columns, for the per-key LOOKUP TABLE an
+                // equality correlation on a single table still folds to
+                let scope = CorrScope::of_from(table_s, dbr, db);
+                let single = parse_from(table_s).and_then(|(from, join)| {
+                    if !join.is_empty() || from.table.starts_with('(') || view_of(dbr, from.table).is_some() {
+                        return None;
+                    }
+                    let rel = fire_crab_ods::resolve_relation(&dbr.bytes(), dbr.page_size, from.table)?;
+                    let columns = dbr.columns(from.table);
+                    let descs: Vec<Descriptor> = select_formats(dbr, from.table, rel)
+                        .iter()
+                        .max_by_key(|(n, _)| *n)
+                        .map(|(_, d)| d.clone())
+                        .unwrap_or_default();
+                    if descs.is_empty() {
+                        return None;
+                    }
+                    Some((from, columns, descs))
+                });
                 // a CORRELATED subquery cannot be folded into the text:
-                // its value differs per outer row. It is left for the
-                // projection builder, which turns it into a lookup.
-                let mut correlated: Vec<(usize, String)> = Vec::new();
+                // its value differs per outer row. An EQUALITY
+                // correlation over one table becomes a lookup table
+                // ([build_correlated_lookup]); every other correlation
+                // is evaluated per row ([Expr::CorrSub]) through a
+                // marker the projection builder resolves.
+                #[allow(clippy::type_complexity)]
+                let mut correlated: Vec<(usize, String, Expr, Descriptor)> = Vec::new();
                 for (i, sub) in subs.iter().enumerate() {
+                    let mark = format!("{}{}", SUBQ_MARK, i);
+                    let scan = scope.as_ref().and_then(|sc| corr_scan(sub, sc, dbr, db));
+                    if scan.is_none() && corr_hard_refused() {
+                        if trace {
+                            eprintln!("[srv] plan: select-list subquery {:?} is the engine's -104", sub);
+                        }
+                        return Some(Plan::Refused);
+                    }
+                    let is_corr = scan.as_ref().is_some_and(|s| !s.refs.is_empty());
                     // `EXISTS (SELECT ...)` lifts as a subquery too - the
                     // paren belongs to EXISTS, not to a scalar - so the
                     // marker is preceded by the keyword. It asks only
                     // whether a row survives, and folds to TRUE or FALSE.
-                    let mark = format!("{}{}", SUBQ_MARK, i);
                     let exists_at = proj_out.find(&mark).and_then(|at| {
                         let head = proj_out[..at].trim_end();
                         let up = head.to_ascii_uppercase();
                         up.ends_with("EXISTS").then(|| head.len() - "EXISTS".len())
                     });
                     if let Some(cut) = exists_at {
-                        let Some(rows) = eval_subquery(sub, dbr, db, None, None, true) else {
-                            if trace {
-                                eprintln!("[srv] plan: EXISTS subquery {:?} not answerable", sub);
+                        // a NOT in front belongs to the EXISTS
+                        let (cut, negated) = {
+                            let head = proj_out[..cut].trim_end();
+                            if head.to_ascii_uppercase().ends_with("NOT")
+                                && !head[..head.len() - 3].ends_with(|c: char| c.is_alphanumeric() || c == '_')
+                            {
+                                (head.len() - 3, true)
+                            } else {
+                                (cut, false)
                             }
-                            return Some(Plan::Refused);
                         };
-                        let lit = if rows.any { "TRUE" } else { "FALSE" };
-                        // the whole `EXISTS <marker>` span becomes the
-                        // literal, and the engine names such a column
-                        // BOOL like every other boolean-valued expression
                         let span = &proj_out[cut..];
                         let end = span.find(&mark)? + mark.len();
                         // `split_alias` would read the MARKER as a
@@ -42481,7 +42948,50 @@ fn plan_query_inner_ctx(
                         let alone = split_top_level_commas(&proj_out).iter().any(|item| {
                             let squashed: String = item.split_whitespace().collect::<Vec<_>>().join(" ");
                             squashed.eq_ignore_ascii_case(&format!("EXISTS {}", mark))
+                                || squashed.eq_ignore_ascii_case(&format!("NOT EXISTS {}", mark))
                         });
+                        // the WHERE arm's law ([corr_exists_per_row]): a
+                        // limited head and a lone aggregate run per row
+                        let per_row = corr_exists_per_row(sub, scan.is_some());
+                        // an inner that does not plan is never folded
+                        // ([corr_inner_plans]; the per-row route plans it
+                        // at registration)
+                        if let Some(sc) = scan.as_ref().filter(|_| !is_corr && !per_row) {
+                            if !corr_inner_plans(sc, db) {
+                                if trace {
+                                    eprintln!("[srv] plan: EXISTS subquery {:?} does not plan", sub);
+                                }
+                                return Some(Plan::Refused);
+                            }
+                        }
+                        let folded_v = if is_corr || per_row {
+                            None
+                        } else {
+                            eval_subquery(sub, dbr, db, None, None, true)
+                        };
+                        let lit = match folded_v {
+                            Some(rows) => (if rows.any != negated { "TRUE" } else { "FALSE" }).to_string(),
+                            None => {
+                                let Some(scan) = scan else {
+                                    if trace {
+                                        eprintln!("[srv] plan: EXISTS subquery {:?} not answerable", sub);
+                                    }
+                                    return Some(Plan::Refused);
+                                };
+                                let Some(id) = corr_register(
+                                    sub, scan, CorrKindRaw::Exists { negated }, scope.as_ref()?, db,
+                                ) else {
+                                    if trace {
+                                        eprintln!("[srv] plan: EXISTS subquery {:?} not answerable", sub);
+                                    }
+                                    return Some(Plan::Refused);
+                                };
+                                format!("FC$CORR({})", id)
+                            }
+                        };
+                        // the whole `EXISTS <marker>` span becomes the
+                        // value, and the engine names such a column
+                        // BOOL like every other boolean-valued expression
                         let repl = if alone {
                             format!("{} AS BOOL", lit)
                         } else {
@@ -42490,24 +43000,58 @@ fn plan_query_inner_ctx(
                         proj_out = format!("{}{}{}", &proj_out[..cut], repl, &span[end..]);
                         continue;
                     }
-                    // `corr: None` - a CORRELATED subquery cannot resolve
-                    // its outer column here and refuses, since its value
-                    // differs per row and this fold is once per statement
-                    let Some(rows) = eval_subquery(sub, dbr, db, None, None, false) else {
-                        // not a constant - it may be CORRELATED, which
-                        // is answered per row from a lookup table rather
-                        // than folded into the text
-                        if split_top_level_commas(&folded).iter().any(|item| {
+                    // `corr: None` - a subquery naming the outer row is
+                    // never read as a constant ([corr_scan] decides)
+                    let folded_v = if is_corr { None } else { eval_subquery(sub, dbr, db, None, None, false) };
+                    let Some(rows) = folded_v else {
+                        let whole = split_top_level_commas(&folded).iter().any(|item| {
                             let (body, _) = split_alias(item);
-                            body.trim() == format!("{}{}", SUBQ_MARK, i)
-                        }) {
-                            correlated.push((i, sub.clone()));
-                            continue;
+                            body.trim() == mark
+                        });
+                        // the per-key lookup table: a whole item over a
+                        // single outer table, one equality correlation
+                        // (a WHERE carrying a subquery of its own goes with the
+                        // marker re-plan below, whose WHERE path resolves it;
+                        // the lookup plan's WHERE parser does not - a
+                        // refusal before, review-caught)
+                        let where_has_sub = where_s.is_some_and(|w| {
+                            w.contains('(') && find_word(&mask_literals(&w.to_ascii_uppercase()), "SELECT", 0).is_some()
+                        });
+                        if whole && is_corr && group_s.is_none() && having_s.is_none() && !where_has_sub {
+                            if let Some((from, columns, descs)) = single.as_ref() {
+                                let bind = ColBinding {
+                                    key: from.alias.unwrap_or(from.table),
+                                    qual: match from.alias {
+                                        None if sub.contains('.') => {
+                                            relation_schema(dbr, from.table).map(|s| (s, from.table))
+                                        }
+                                        _ => None,
+                                    },
+                                };
+                                if let Some((e, d)) = build_correlated_lookup(sub, dbr, columns, &bind, descs, false) {
+                                    correlated.push((i, sub.clone(), e, d));
+                                    continue;
+                                }
+                            }
                         }
-                        if trace {
-                            eprintln!("[srv] plan: select-list subquery {:?} not answerable", sub);
-                        }
-                        return Some(Plan::Refused);
+                        let Some(scan) = scan else {
+                            if trace {
+                                eprintln!("[srv] plan: select-list subquery {:?} not answerable", sub);
+                            }
+                            return Some(Plan::Refused);
+                        };
+                        let Some(id) = corr_register(sub, scan, CorrKindRaw::Scalar, scope.as_ref()?, db) else {
+                            if trace {
+                                eprintln!("[srv] plan: select-list subquery {:?} not answerable", sub);
+                            }
+                            return Some(Plan::Refused);
+                        };
+                        let repl = match (alone.get(i), subq_name(sub)) {
+                            (Some(true), Some(n)) => format!("FC$CORR({}) AS \"{}\"", id, n.replace('"', "\"\"")),
+                            _ => format!("FC$CORR({})", id),
+                        };
+                        proj_out = proj_out.replace(&mark, &repl);
+                        continue;
                     };
                     if rows.values.len() > 1 {
                         return Some(Plan::RefusedEval(EvalErr::SingletonSelect));
@@ -42527,6 +43071,36 @@ fn plan_query_inner_ctx(
                         _ => lit,
                     };
                     proj_out = proj_out.replace(&format!("{}{}", SUBQ_MARK, i), &repl);
+                }
+                // GROUP BY over a per-row subquery item - by its ordinal,
+                // its alias or its text - is the engine's -104 (probed;
+                // it answered here before, review-caught). Grouping by
+                // ANOTHER column beside such an item is fine.
+                if let Some(g) = group_s {
+                    let items = split_top_level_commas(&proj_out);
+                    let is_corr = |it: &str| it.contains("FC$CORR(");
+                    for k in split_top_level_commas(g) {
+                        let k = k.trim();
+                        let hit = if is_corr(k) {
+                            true
+                        } else if let Ok(n) = k.parse::<usize>() {
+                            n >= 1 && items.get(n - 1).is_some_and(|it| is_corr(it))
+                        } else {
+                            items.iter().any(|it| {
+                                let (body, alias) = split_alias(it);
+                                is_corr(body)
+                                    && alias.is_some_and(|a| {
+                                        a.trim().trim_matches('"').eq_ignore_ascii_case(k.trim_matches('"'))
+                                    })
+                            })
+                        };
+                        if hit {
+                            if trace {
+                                eprintln!("[srv] plan: GROUP BY over a correlated select item refused");
+                            }
+                            return Some(Plan::Refused);
+                        }
+                    }
                 }
                 let mut out = format!("SELECT {} FROM {}", proj_out, table_s);
                 if let Some(w) = where_s {
@@ -43074,7 +43648,9 @@ fn plan_query_inner_ctx(
         // aggregate shape folds the joined rows at fetch.
         if let Proj::Items(items) = &proj {
             if let [SelItem::Agg(AggFn::Count, AggTarget::Star, None)] = items.as_slice() {
-                if group_s.is_some() || having_s.is_some() {
+                // a lifted per-row subquery in the WHERE counts at fetch
+                let where_corr = where_s.is_some_and(|w| w.contains("FC$CORR("));
+                if group_s.is_some() || having_s.is_some() || where_corr {
                     return plan_join(
                         &proj, &left, &join, where_s, group_s, having_s, order_s, db,
                         &db_all, proj_params, params,
@@ -43194,6 +43770,8 @@ fn plan_query_inner_ctx(
     // costs the index (None -> the original text -> a scan), never a
     // row.
     let mut folded_where: Option<String> = None;
+    // does resolving this WHERE build a per-row subquery? ([CORR_BUILT])
+    let corr_before = corr_built_count();
     let filter = match where_s {
         None => None,
         // a WHERE may carry subqueries: lift them out of the text, then
@@ -43215,7 +43793,7 @@ fn plan_query_inner_ctx(
                             _ => None,
                         },
                     };
-                    let folded = resolve_subqueries(&toks, &subs, db, db_all, &columns, &bind, !in_view)?;
+                    let folded = resolve_subqueries(&toks, &subs, db, db_all, &columns, &bind, &descs, !in_view)?;
                     folded_where = render_toks(&folded);
                     Some(folded)
                 }
@@ -43287,7 +43865,7 @@ fn plan_query_inner_ctx(
                 )?,
             };
             let index = choose_index(db, rel, table, &descs, &filter, &opt_sql, &order_by);
-            if trace {
+            if trace && !corr_probing() {
                 match &index {
                     Some(p) => eprintln!("[srv] index scan: rel={} {}", rel, p.describe()),
                     None => eprintln!("[srv] natural scan: rel={}", rel),
@@ -43345,7 +43923,13 @@ fn plan_query_inner_ctx(
     // parameters in the WHERE the value is not computable at prepare,
     // so the query drops through to the group machinery instead (which
     // computes at fetch, after the values arrive).
-    if group_s.is_none() && having_s.is_none() && items.len() == 1 && params.is_empty() {
+    // A PER-ROW SUBQUERY IN THE WHERE keeps the aggregate off this
+    // prepare-time probe altogether: the probe ran every inner
+    // statement once at prepare and the fetch ran them again (2x the
+    // work, review-caught); the group machinery below computes once, at
+    // fetch, and raises there
+    let where_corr = corr_built_count() != corr_before;
+    if group_s.is_none() && having_s.is_none() && items.len() == 1 && params.is_empty() && !where_corr {
         if let SelItem::Agg(func, target, alias) = &items[0] {
             // ORDER BY on a single-row aggregate is meaningless; reject it
             if order_s.is_some() {
@@ -43356,7 +43940,7 @@ fn plan_query_inner_ctx(
             // scaled numerics, COUNT(DISTINCT)) fall THROUGH to the
             // group machinery, which types and computes them at fetch
             let agg_index = choose_index(db, rel, table, &descs, &filter, &opt_sql, &[]);
-            if trace {
+            if trace && !corr_probing() {
                 match &agg_index {
                     Some(p) => eprintln!("[srv] index scan: rel={} {}", rel, p.describe()),
                     None => eprintln!("[srv] natural scan: rel={}", rel),
@@ -43704,7 +44288,7 @@ fn plan_query_inner_ctx(
             return None;
         }
         let index = choose_index(db, rel, table, &descs, &filter, &opt_sql, &order_by);
-        if trace {
+        if trace && !corr_probing() {
             match &index {
                 Some(p) => eprintln!("[srv] index scan: rel={} {}", rel, p.describe()),
                 None => eprintln!("[srv] natural scan: rel={}", rel),
@@ -43746,7 +44330,7 @@ fn plan_query_inner_ctx(
             // the same choice the projection makes, at the same moment:
             // a fold reads its input through a retrieval like any other
             let index = choose_index(db, rel, table, &descs, &filter, &opt_sql, &[]);
-            if trace {
+            if trace && !corr_probing() {
                 match &index {
                     Some(p) => eprintln!("[srv] index scan: rel={} {}", rel, p.describe()),
                     None => eprintln!("[srv] natural scan: rel={}", rel),
@@ -45811,6 +46395,24 @@ fn aggregate(
     // machinery, which computes at fetch and raises the error there -
     // exactly where the engine raises it
     let ferr = std::cell::Cell::new(false);
+    // THE INVARIANT PASS RUNS FIRST, over no row at all: a conjunct with
+    // no column reference is evaluated ONCE whatever the scan finds
+    // (probed: `SELECT MAX(V) FROM E WHERE TID = 3 AND 1/(3-3) > 0`
+    // raises 22012 over the zero rows TID = 3 selects), where the
+    // per-row walk below never reached the division and answered NULL -
+    // which an EXISTS over the aggregate read as TRUE, and an UPDATE /
+    // DELETE with that WHERE then wrote every row (review-caught).
+    // [Predicate::bind] is that pass (and the open-time key
+    // conversion); a raise declines this path exactly as a per-row one
+    // does, and the group machinery raises it at fetch.
+    let bound = match filter {
+        Some(p) => match p.bind(&[]) {
+            Ok(b) => Some(b),
+            Err(_) => return None,
+        },
+        None => None,
+    };
+    let filter = &bound;
     let matches = |vals: &[Value]| match filter.as_ref().map_or(Ok(true), |p| p.matches(vals)) {
         Ok(b) => b,
         Err(_) => {
@@ -49997,7 +50599,7 @@ fn fold_project_windows(
     db: &Database,
     args: &[WireParam],
 ) -> Result<Vec<Vec<Value>>, EvalErr> {
-    let filter = bind_filter(filter, args).map_err(|_| EvalErr::Unsupported)?;
+    let filter = bind_filter_eval(filter, args)?;
     let descs_now: Vec<Descriptor> = formats
         .iter()
         .max_by_key(|(n, _)| *n)
@@ -54019,6 +54621,13 @@ fn expr_contains_genval(e: &Expr) -> bool {
                 || else_.as_deref().is_some_and(expr_contains_genval)
         }
         Expr::Lookup { key, .. } => expr_contains_genval(key),
+        Expr::CorrSub { outer, kind, .. } => {
+            outer.iter().any(|(_, e, _)| expr_contains_genval(e))
+                || match kind.as_ref() {
+                    CorrKind::In { lhs, .. } | CorrKind::Quant { lhs, .. } => expr_contains_genval(lhs),
+                    _ => false,
+                }
+        }
         _ => false,
     }
 }
@@ -54510,6 +55119,10 @@ enum RawExpr {
     /// comparison, a sort or a fold does with it.
     Collate(Box<RawExpr>, String),
     Col(String),
+    /// a registered CORRELATED SUBQUERY, by id ([CorrTemplate]) - what
+    /// the `FC$CORR(<id>)` marker a clause lifts into parses as; the
+    /// resolver binds its outer references in the enclosing columns
+    Subq(usize),
     /// a call of a USER function (`F(A, B)`): the name is one the
     /// catalog holds ([USER_FNS], loaded per prepare), upper-cased
     UserFn(String, Vec<RawExpr>),
@@ -54978,6 +55591,15 @@ enum CastTarget {
     /// sqltype 32762); false is DECFLOAT(16) (decimal64, 8 bytes, 32760).
     /// `DECFLOAT` with no precision defaults to 34.
     DecFloat { wide: bool },
+    /// `BOOLEAN` - the one-byte boolean slot (sqltype 32764). A text
+    /// source reads the words `true` / `false` case-blind with any
+    /// whitespace around them (probed: `' true '` and a tab-led `true`
+    /// are TRUE); anything else is the engine's 22018 carrying the
+    /// SOURCE's own text (probed: `CAST(1 AS BOOLEAN)` is *conversion
+    /// error from string "1"*, `' yes '` keeps its blanks). The first
+    /// use is a correlated subquery's stand-in for a BOOLEAN outer
+    /// column (`CAST(NULL AS BOOLEAN)`), which planned nowhere before.
+    Bool,
 }
 
 impl CastTarget {
@@ -55031,7 +55653,10 @@ impl CastTarget {
             CastTarget::Approx | CastTarget::Temporal(_) => Some(130),
             // a DECFLOAT text conversion is capped by decNumber's own
             // grammar (text_to_dec128), not a fixed buffer here
-            CastTarget::Text { .. } | CastTarget::DecFloat { .. } | CastTarget::Blob { .. } => None,
+            CastTarget::Text { .. }
+            | CastTarget::DecFloat { .. }
+            | CastTarget::Blob { .. }
+            | CastTarget::Bool => None,
         }
     }
 }
@@ -55917,6 +56542,24 @@ fn expr_atom_bare(b: &[char], pos: &mut usize) -> Option<RawExpr> {
                 }
                 *pos += 1;
             }
+            // the correlated-subquery marker a clause was lifted into
+            if !quoted && word.eq_ignore_ascii_case("FC$CORR") {
+                skip_ws(b, pos);
+                if b.get(*pos) != Some(&'(') {
+                    return None;
+                }
+                *pos += 1;
+                let ds = *pos;
+                while *pos < b.len() && b[*pos].is_ascii_digit() {
+                    *pos += 1;
+                }
+                let id: usize = b[ds..*pos].iter().collect::<String>().parse().ok()?;
+                if b.get(*pos) != Some(&')') {
+                    return None;
+                }
+                *pos += 1;
+                return Some(RawExpr::Subq(id));
+            }
             if word.eq_ignore_ascii_case("NULL") {
                 Some(RawExpr::Null)
             } else if !quoted && word.eq_ignore_ascii_case("CURRENT_DATE") {
@@ -56341,7 +56984,7 @@ fn raw_bad_substring_len(e: &RawExpr) -> Option<i64> {
     };
     let walk_all = |args: &[RawExpr]| args.iter().find_map(raw_bad_substring_len);
     match e {
-        RawExpr::Param(_) => None,
+        RawExpr::Param(_) | RawExpr::Subq(_) => None,
         // the wrapper decides nothing about literals; walk through it
         RawExpr::Collate(inner, _) => raw_bad_substring_len(inner),
         RawExpr::UserFn(_, args) => walk_all(args),
@@ -56850,6 +57493,9 @@ fn parse_cast_target(b: &[char], pos: &mut usize) -> Option<CastTarget> {
     }
     if ku == "FLOAT" {
         return Some(CastTarget::Approx);
+    }
+    if ku == "BOOLEAN" {
+        return Some(CastTarget::Bool);
     }
     if ku == "BLOB" {
         let mut sub_type = 0i16;
@@ -57703,6 +58349,8 @@ fn cast_target_descriptor(t: &CastTarget) -> Option<Descriptor> {
         // DECFLOAT(34) is decimal128 (16 bytes), DECFLOAT(16) decimal64 (8)
         CastTarget::DecFloat { wide: true } => d(dtype::DEC128, 0, 16, 0),
         CastTarget::DecFloat { wide: false } => d(dtype::DEC64, 0, 8, 0),
+        // (probed: the `?` of CAST(? AS BOOLEAN) describes 32764 len 1)
+        CastTarget::Bool => d(dtype::BOOLEAN, 0, 1, 0),
     })
 }
 
@@ -57941,6 +58589,9 @@ fn resolve_expr_inner(
         // only on the Project select list) refuses the statement
         RawExpr::Gen { slot: Some(i), .. } => Expr::GenVal(*i),
         RawExpr::Gen { slot: None, .. } => return None,
+        // a correlated subquery: its outer references bind HERE, in the
+        // enclosing row's columns ([resolve_corr_sub])
+        RawExpr::Subq(id) => resolve_corr_sub(*id, columns, descs)?,
         RawExpr::Col(name) => {
             let rc = columns.iter().find(|c| c.name.eq_ignore_ascii_case(name))?;
             let fid = rc.field_id as usize;
@@ -58347,7 +58998,9 @@ enum Expr {
     /// maxes NULL in the same row).
     Lookup {
         key: Box<Expr>,
-        /// (outer key value, the subquery's answer for it)
+        /// (outer key value, the subquery's answer for it) - the table
+        /// as built at PREPARE; a later execution reads the one
+        /// [LazyLookup] rebuilds for its own epoch
         pairs: Vec<(Value, Value)>,
         absent: Value,
         /// the result's announced type and scale, decided at prepare
@@ -58355,6 +59008,37 @@ enum Expr {
         /// empty table has no value to read a type from)
         ty: ExprType,
         scale: i8,
+        /// the result's exact-numeric width in bytes (the inner
+        /// column's own), so a conditional around it keeps it
+        bytes: u8,
+        /// how to rebuild the table for a later execution epoch
+        lazy: Option<std::sync::Arc<LazyLookup>>,
+    },
+    /// A CORRELATED subquery evaluated PER OUTER ROW - the general form,
+    /// for everything the lookup table above cannot express (an
+    /// inequality correlation, two correlated predicates, IN / ANY / ALL,
+    /// a nested level, a subquery in CASE / ORDER BY / HAVING / ON /
+    /// RETURNING, over a view or a derived table). `text` is the inner
+    /// statement with each outer reference replaced by an `FC$OUT<i>`
+    /// marker; `outer` says how to read each from the enclosing row and
+    /// what type it is. Per row the values are substituted as literals,
+    /// the now-uncorrelated statement is planned and run against the
+    /// database in [SUBQ_DB] (the LATERAL precedent), and the rows are
+    /// memoised per distinct literal tuple for the execution
+    /// ([CorrCache]). A scalar answers its one column: no row is NULL,
+    /// more than one row is the engine's 21000 - raised only when that
+    /// row is reached, which is exactly when the engine raises it.
+    CorrSub {
+        text: String,
+        outer: Vec<(usize, Expr, Descriptor)>,
+        kind: Box<CorrKind>,
+        ty: ExprType,
+        scale: i8,
+        rank: Option<NumRank>,
+        /// what the inner statement DESCRIBES (a scalar only): the type,
+        /// width, charset and naming its column announces
+        desc: Option<Box<ProjCol>>,
+        cache: std::sync::Arc<std::sync::Mutex<CorrCache>>,
     },
     /// `CASE`: the first branch whose condition is TRUE answers; false
     /// and UNKNOWN move on; no branch -> ELSE, no ELSE -> NULL
@@ -59537,9 +60221,14 @@ fn text_number(s: &str) -> Option<TextNum> {
         return None;
     }
     let digits: String = format!("{}{}", int_part, frac);
-    let raw: i128 = digits.parse().ok()?;
+    // the magnitude is read UNSIGNED so that the sign can pull exactly
+    // i128::MIN back into range: '-170141183460469231731687303715884105728'
+    // is a value an INT128 column holds, and a CAST over that text
+    // failed mid-fetch as a conversion error (review-caught)
+    let mag: u128 = digits.parse().ok()?;
+    let mantissa = if neg { 0i128.checked_sub_unsigned(mag)? } else { i128::try_from(mag).ok()? };
     Some(TextNum::Dec {
-        mantissa: if neg { -raw } else { raw },
+        mantissa,
         exp: exp10 - frac.len() as i32,
     })
 }
@@ -60045,8 +60734,14 @@ fn decimal_parts(s: &str) -> Option<(i128, i8)> {
         return None;
     }
     let digits: String = format!("{}{}", int_part, frac);
-    let raw: i128 = digits.parse().ok()?;
-    Some((if neg { -raw } else { raw }, -(frac.len() as i8)))
+    // the magnitude is read UNSIGNED so the sign can pull exactly
+    // i128::MIN back into range - `CAST('-1701...728' AS NUMERIC(38))`
+    // is a value an INT128 column holds (the engine answers it; here it
+    // was a conversion error, review-caught through a correlated outer
+    // value of that column)
+    let mag: u128 = digits.parse().ok()?;
+    let raw = if neg { 0i128.checked_sub_unsigned(mag)? } else { i128::try_from(mag).ok()? };
+    Some((raw, -(frac.len() as i8)))
 }
 
 /// so it covers `INT128`-backed numerics; the caller narrows to `i64`.
@@ -61206,6 +61901,7 @@ impl Expr {
             // cannot say, since an empty inner table has no value to
             // read a type from
             Expr::Lookup { ty, .. } => Some(*ty),
+            Expr::CorrSub { ty, .. } => Some(*ty),
             // a generator's value is a plain INT64, whatever wraps it
             Expr::GenVal(_) => Some(ExprType::Int),
             // a conditional's type comes from its branches TOGETHER: a
@@ -61398,6 +62094,7 @@ impl Expr {
                     // fail-closes any attempt to nest it where a type is
                     // needed (a conditional branch)
                     CastTarget::DecFloat { .. } => return None,
+                    CastTarget::Bool => ExprType::Bool,
                 })
             }
             Expr::Func(f, args) => {
@@ -61657,6 +62354,7 @@ impl Expr {
     fn result_scale(&self, descs: &[Descriptor]) -> Option<i8> {
         match self {
             Expr::Lookup { scale, .. } => Some(*scale),
+            Expr::CorrSub { scale, .. } => Some(*scale),
             Expr::GenVal(_) => Some(0),
             Expr::Col(fid) => {
                 let d = descs.get(*fid)?;
@@ -61777,6 +62475,7 @@ impl Expr {
             // a folded lookup answers within i64: its values came from
             // the inner table's own columns and folds
             Expr::Lookup { .. } => Some(NumRank::I64),
+            Expr::CorrSub { rank, .. } => *rank,
             Expr::GenVal(_) => Some(NumRank::I64),
             // the widest branch decides the width, so a value from any
             // branch fits the announced column
@@ -61895,7 +62594,8 @@ impl Expr {
                 CastTarget::Text { .. }
                 | CastTarget::Approx
                 | CastTarget::Temporal(_)
-                | CastTarget::DecFloat { .. } => None,
+                | CastTarget::DecFloat { .. }
+                | CastTarget::Bool => None,
             },
             Expr::UserFn { .. } => None,
             Expr::Func(f, args) => match f {
@@ -62028,18 +62728,48 @@ impl Expr {
             // loop ([bind_proj_params]); reaching eval means it was not,
             // which is an internal error, not a wrong answer
             Expr::Param(_) => return Err(EvalErr::Unsupported),
-            Expr::Lookup { key, pairs, absent, .. } => {
+            Expr::Lookup { key, pairs, absent, lazy, .. } => {
                 let k = key.eval(values)?;
                 // a NULL key matches nothing - `NULL = NULL` is UNKNOWN,
                 // so the row has no partner and takes the absent answer
                 if matches!(k, Value::Null) {
                     absent.clone()
                 } else {
-                    pairs
+                    // the table of THIS execution ([LazyLookup]); the
+                    // prepare-time one only where no database is in scope
+                    let cur = match lazy {
+                        Some(l) => l.current()?,
+                        None => None,
+                    };
+                    let table: &[(Value, Value)] = match &cur {
+                        Some(t) => t.as_slice(),
+                        None => pairs.as_slice(),
+                    };
+                    table
                         .iter()
-                        .find(|(pk, _)| *pk == k)
+                        .find(|(pk, _)| lookup_key_eq(pk, &k))
                         .map(|(_, v)| v.clone())
                         .unwrap_or_else(|| absent.clone())
+                }
+            }
+            Expr::CorrSub { text, outer, kind, cache, .. } => {
+                let rows = corr_rows(text, outer, cache, values)?;
+                match kind.as_ref() {
+                    CorrKind::Scalar => {
+                        if rows.len() > 1 {
+                            return Err(EvalErr::SingletonSelect);
+                        }
+                        rows.first().cloned().unwrap_or(Value::Null)
+                    }
+                    CorrKind::Exists { negated } => Value::Bool(!rows.is_empty() != *negated),
+                    CorrKind::In { lhs, negated } => {
+                        let l = lhs.eval(values)?;
+                        corr_quantified(&l, Cmp::Eq, false, *negated, &rows)
+                    }
+                    CorrKind::Quant { lhs, op, all, negated } => {
+                        let l = lhs.eval(values)?;
+                        corr_quantified(&l, *op, *all, *negated, &rows)
+                    }
                 }
             }
             Expr::Double(d) => Value::Double(*d),
@@ -62524,6 +63254,26 @@ impl Expr {
                     cvt_cap_check(s, t.cvt_cap())?;
                 }
                 match t {
+                    // to BOOLEAN: a boolean passes; a text is the word
+                    // TRUE / FALSE case-blind with whitespace around it
+                    // allowed (probed: `' true '`, a tab-led `true`);
+                    // every other spelling and every other type is the
+                    // 22018 whose argument is the source's own text
+                    // (probed: `' yes '` names " yes ", `1` names "1")
+                    CastTarget::Bool => match v {
+                        Value::Bool(b) => Value::Bool(b),
+                        Value::Text(s) => {
+                            let w = s.trim();
+                            if w.eq_ignore_ascii_case("TRUE") {
+                                Value::Bool(true)
+                            } else if w.eq_ignore_ascii_case("FALSE") {
+                                Value::Bool(false)
+                            } else {
+                                return Err(conv_err(*cs, s));
+                            }
+                        }
+                        other => return Err(EvalErr::ConversionError(Some(other.render()))),
+                    },
                     // to a BLOB: the value's TEXT in the blob's own
                     // character set. The blob itself is created by the
                     // projection's mint ([Expr::BlobOf]) or by the store
@@ -63968,6 +64718,1703 @@ fn whole_subquery(text: &str) -> Option<String> {
         .flatten()
 }
 
+// ===========================================================================
+// CORRELATED SUBQUERIES - a name inside a subquery resolves INNERMOST-FIRST,
+// and an outer reference is the OUTER ROW's value, re-evaluated per row.
+//
+// Measured 2026-09-02 (qa/serve-real-corrsub.sh). The plan-time folds above
+// (a constant, an IN list, a per-key lookup table) stay for what they can
+// express exactly; everything else - an inequality correlation, a second
+// correlated predicate, IN / ANY / ALL, CASE / COALESCE, ORDER BY, HAVING, a
+// JOIN's ON, RETURNING, two levels deep, over a view or a derived table -
+// becomes an [Expr::CorrSub]: the inner text with each outer reference
+// replaced by a marker, planned and run PER OUTER ROW with that row's values
+// substituted as literals (the LATERAL precedent, generalised to an
+// expression node).
+//
+// Two pieces decide WHICH names are outer references: [corr_scan], the scope
+// scanner (innermost-first for a bare name, alias-exclusive for a qualified
+// one, a scope stack across nested spans), and the [CorrScope] each planning
+// site builds for the row its expressions see.
+// ===========================================================================
+
+thread_local! {
+    /// The database a per-row subquery plans and runs against. `Expr::eval`
+    /// carries no database (the BLOB_CTX reason), so every executor entry
+    /// that evaluates expressions with one in hand ARMS this through
+    /// [SubqDbGuard]; an evaluation that finds it unarmed RAISES rather than
+    /// answering NULL.
+    static SUBQ_DB: std::cell::Cell<Option<*const Option<Database>>> =
+        const { std::cell::Cell::new(None) };
+    /// Bumped at every op: a [CorrCache] memo from an earlier execution of
+    /// the same (cached) plan is stale once the data may have changed.
+    static EXEC_EPOCH: std::cell::Cell<u64> = const { std::cell::Cell::new(1) };
+    /// The registered templates, by id - what a `FC$CORR(<id>)` marker in a
+    /// clause's text resolves through ([RawExpr::Subq]). Cleared at each
+    /// top-level plan.
+    static CORR_REG: std::cell::RefCell<Vec<CorrTemplate>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// An IMAGE that stands in for the database's published one on this
+    /// thread while armed ([SubqImageGuard]): what [Database::bytes]
+    /// answers, so a subquery run under it reads THAT state. Armed around
+    /// the projection of a RETURNING list whose items carry a subquery,
+    /// with the image the statement STARTED from - the engine evaluates
+    /// RETURNING against the pre-statement image (`UPDATE T SET A = A + 1
+    /// ... RETURNING (SELECT SUM(x.A) FROM T x)` answers the OLD sum,
+    /// probed), while the projection here runs after the write has been
+    /// installed (review-caught).
+    static SUBQ_IMAGE: std::cell::RefCell<Option<std::sync::Arc<fire_crab_ods::Image>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// RAII scope for [SUBQ_IMAGE]: every [Database::bytes] on this thread
+/// answers `img` until the guard drops.
+struct SubqImageGuard(Option<std::sync::Arc<fire_crab_ods::Image>>);
+
+impl SubqImageGuard {
+    fn arm(img: std::sync::Arc<fire_crab_ods::Image>) -> SubqImageGuard {
+        SubqImageGuard(SUBQ_IMAGE.with(|c| c.replace(Some(img))))
+    }
+}
+
+impl Drop for SubqImageGuard {
+    fn drop(&mut self) {
+        let prev = self.0.take();
+        SUBQ_IMAGE.with(|c| *c.borrow_mut() = prev);
+    }
+}
+
+/// Does this expression run a subquery at evaluation - a per-row
+/// [Expr::CorrSub], or a [Expr::Lookup] that rebuilds its table per
+/// execution? Such a RETURNING item is projected under the
+/// pre-statement image ([SubqImageGuard]).
+fn expr_has_corr(e: &Expr) -> bool {
+    fn cond(c: &Cond2) -> bool {
+        match c {
+            Cond2::Cmp(a, _, b) => expr_has_corr(a) || expr_has_corr(b),
+            Cond2::IsNull(a)
+            | Cond2::IsNotNull(a)
+            | Cond2::Like(a, ..)
+            | Cond2::Starting(a, ..)
+            | Cond2::Similar(a, ..) => expr_has_corr(a),
+            Cond2::Not(inner) => cond(inner),
+            Cond2::And(parts) | Cond2::Or(parts) => parts.iter().any(cond),
+        }
+    }
+    match e {
+        Expr::CorrSub { .. } => true,
+        Expr::Lookup { key, lazy, .. } => lazy.is_some() || expr_has_corr(key),
+        Expr::Neg(a) | Expr::Cast(a, _, _) => expr_has_corr(a),
+        Expr::Bin(a, _, b) | Expr::Concat(a, b) | Expr::NullIf(a, b) => expr_has_corr(a) || expr_has_corr(b),
+        Expr::Coalesce(args) | Expr::Func(_, args) | Expr::UserFn { args, .. } => args.iter().any(expr_has_corr),
+        Expr::Cond(c) => cond(c),
+        Expr::Iif(c, a, b) => cond(c) || expr_has_corr(a) || expr_has_corr(b),
+        Expr::Case(branches, else_) => {
+            branches.iter().any(|(c, t)| cond(c) || expr_has_corr(t))
+                || else_.as_deref().is_some_and(expr_has_corr)
+        }
+        _ => false,
+    }
+}
+
+/// RAII scope for [SUBQ_DB]: arms the database an executor holds for the
+/// per-row subqueries its expressions may run, restoring the previous one
+/// when the executor returns.
+struct SubqDbGuard(Option<*const Option<Database>>);
+
+impl SubqDbGuard {
+    fn arm(db: &Option<Database>) -> SubqDbGuard {
+        let prev = SUBQ_DB.with(|c| c.replace(Some(db as *const Option<Database>)));
+        SubqDbGuard(prev)
+    }
+}
+
+impl Drop for SubqDbGuard {
+    fn drop(&mut self) {
+        SUBQ_DB.with(|c| c.set(self.0));
+    }
+}
+
+/// A new op begins: the memo epoch moves on, and the memos the previous
+/// op filled are emptied ([clear_corr_caches]).
+fn bump_exec_epoch() {
+    EXEC_EPOCH.with(|c| c.set(c.get().wrapping_add(1)));
+    clear_corr_caches();
+}
+
+/// Forget every registered template - the start of a top-level plan.
+fn clear_corr_registry() {
+    CORR_REG.with(|r| r.borrow_mut().clear());
+}
+
+/// One relation a scope makes visible: the key it answers to (its alias,
+/// else its bare name - AN ALIAS IS EXCLUSIVE), the schema it lives in
+/// (unaliased only, for a 3-part reference) and its columns, each with the
+/// descriptor an outer reference substitutes (None for a scope that is only
+/// consulted for shadowing).
+#[derive(Clone)]
+struct ScopeRel {
+    key: String,
+    /// the catalog RELATION behind the key (a table or a view; None for
+    /// a derived table or a pseudo-relation) - what the describe of a
+    /// projected outer column names as its table
+    relation: Option<String>,
+    schema: Option<String>,
+    cols: Vec<(String, Option<Descriptor>)>,
+    /// reached by a QUALIFIED reference only - a second name for a row
+    /// another relation of the scope already binds bare (`NEW.` in a
+    /// RETURNING item), so it never makes a bare name ambiguous
+    qual_only: bool,
+}
+
+/// The relations one level of scope makes visible.
+#[derive(Clone, Default)]
+struct CorrScope {
+    rels: Vec<ScopeRel>,
+}
+
+impl CorrScope {
+    /// One relation, bound under `key`, its columns with their descriptors
+    /// by field id.
+    fn single(
+        key: &str,
+        schema: Option<&str>,
+        relation: Option<&str>,
+        cols: &[RelationColumn],
+        descs: &[Descriptor],
+    ) -> CorrScope {
+        CorrScope {
+            rels: vec![ScopeRel {
+                key: key.to_string(),
+                relation: relation.map(str::to_string),
+                schema: schema.map(str::to_string),
+                cols: cols
+                    .iter()
+                    .map(|c| (c.name.clone(), descs.get(c.field_id as usize).cloned()))
+                    .collect(),
+                qual_only: false,
+            }],
+        }
+    }
+
+    /// The scope a FROM clause opens, read through the catalog: every item
+    /// (a table, a view, a derived table) under its own key. None when an
+    /// item is not something whose columns can be read here.
+    fn of_from(table_s: &str, db: &Database, db_opt: &Option<Database>) -> Option<CorrScope> {
+        let (left, joins) = parse_from(table_s)?;
+        let mut rels = Vec::new();
+        for tr in std::iter::once(&left).chain(joins.iter().map(|(_, r, _, _)| r)) {
+            rels.push(scope_rel_of(tr, db, db_opt)?);
+        }
+        Some(CorrScope { rels })
+    }
+
+    /// Does the scope hold a column of this name in exactly one relation?
+    /// `Some(rel index)`; None when absent; `Some(usize::MAX)` when
+    /// ambiguous.
+    fn bare(&self, name: &str, quoted: bool) -> Option<usize> {
+        let mut found = None;
+        for (i, r) in self.rels.iter().enumerate() {
+            if r.qual_only {
+                continue;
+            }
+            if r.cols.iter().any(|(c, _)| name_matches(c, name, quoted)) {
+                if found.is_some() {
+                    return Some(usize::MAX);
+                }
+                found = Some(i);
+            }
+        }
+        found
+    }
+
+    /// The relation a qualifier names, alias-exclusively.
+    fn qualified(&self, schema: Option<(&str, bool)>, key: &str, key_quoted: bool) -> Option<usize> {
+        self.rels.iter().position(|r| {
+            name_matches(&r.key, key, key_quoted)
+                && match schema {
+                    None => true,
+                    Some((s, sq)) => r.schema.as_deref().is_some_and(|rs| name_matches(rs, s, sq)),
+                }
+        })
+    }
+}
+
+/// A catalog spelling against a name as written: quoted compares exactly,
+/// bare compares case-insensitively.
+fn name_matches(catalog: &str, written: &str, quoted: bool) -> bool {
+    if quoted {
+        catalog == written
+    } else {
+        catalog.eq_ignore_ascii_case(written)
+    }
+}
+
+/// The scope relation one FROM item opens.
+fn scope_rel_of(tr: &TableRef<'_>, db: &Database, db_opt: &Option<Database>) -> Option<ScopeRel> {
+    if tr.table.starts_with('(') {
+        // a derived table: its columns are what it announces, or the
+        // declared list; nothing outside it is visible inside it
+        // the span holds `(SELECT ...) X (A, B)` whole when a column list
+        // was written, and just the query when not
+        let alias = tr.alias?;
+        let (inner_sql, dalias, declared) = parse_derived_table(tr.table)
+            .or_else(|| parse_derived_table(&format!("{} {}", tr.table, alias)))?;
+        let mut ip: Vec<Option<Descriptor>> = Vec::new();
+        let plan = plan_query_inner(&inner_sql, db_opt, &mut ip)?;
+        if matches!(plan, Plan::Refused | Plan::RefusedEval(_)) {
+            return None;
+        }
+        let mut pcols = output_cols_of(&plan);
+        if !declared.is_empty() {
+            if declared.len() != pcols.len() {
+                return None;
+            }
+            for (c, n) in pcols.iter_mut().zip(declared.iter()) {
+                c.name = n.clone();
+            }
+        }
+        let (columns, descs) = derived_view(&pcols);
+        return Some(ScopeRel {
+            key: dalias,
+            relation: None,
+            schema: None,
+            cols: columns
+                .iter()
+                .map(|c| (c.name.clone(), descs.get(c.field_id as usize).cloned()))
+                .collect(),
+            qual_only: false,
+        });
+    }
+    let key = tr.alias.unwrap_or(tr.table).trim_matches('"').to_string();
+    let relation = canon_relation_name(db, tr.table);
+    let schema = match tr.alias {
+        None => relation_schema(db, tr.table),
+        Some(_) => None,
+    };
+    // a VIEW's columns are what its body announces, typed by it
+    if view_of(db, tr.table).is_some() {
+        let (_, vcols) = plan_view(db_opt, db, tr.table)?;
+        let (columns, descs) = derived_view(&vcols);
+        return Some(ScopeRel {
+            key,
+            relation,
+            schema,
+            cols: columns
+                .iter()
+                .map(|c| (c.name.clone(), descs.get(c.field_id as usize).cloned()))
+                .collect(),
+            qual_only: false,
+        });
+    }
+    let columns = db.columns(tr.table);
+    if columns.is_empty() {
+        return None;
+    }
+    // a table's columns carry their stored descriptors, by field id
+    let rel = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, tr.table)?;
+    let descs: Vec<Descriptor> = select_formats(db, tr.table, rel)
+        .iter()
+        .max_by_key(|(n, _)| *n)
+        .map(|(_, d)| d.clone())
+        .unwrap_or_default();
+    Some(ScopeRel {
+        key,
+        relation,
+        schema,
+        cols: columns
+            .iter()
+            .map(|c| (c.name.clone(), descs.get(c.field_id as usize).cloned()))
+            .collect(),
+        qual_only: false,
+    })
+}
+
+/// One outer reference a subquery's text carries: which relation of the
+/// enclosing scope, which column, and the descriptor to substitute by.
+#[derive(Clone)]
+struct OuterRef {
+    rel: usize,
+    col: String,
+    desc: Option<Descriptor>,
+}
+
+/// A subquery's text with every reference to the ENCLOSING scope replaced
+/// by a `FC$OUT<i>` marker, and what each marker stands for.
+#[derive(Clone)]
+struct CorrScan {
+    text: String,
+    refs: Vec<OuterRef>,
+}
+
+/// Scan a subquery body for references to the enclosing scope `outer`.
+///
+/// THE LAW, measured: a bare name that an inner FROM relation has is that
+/// relation's; only a name no inner relation supplies reaches the enclosing
+/// scope (then the next one out). A qualifier is looked up alias-exclusively
+/// at each level: after `FROM T x` the name `T` is not in that scope. A
+/// nested `(SELECT ...)` span opens a scope of its own on the stack, so a
+/// name it shadows is left alone. Refs to the enclosing scope only - a
+/// nested span's references to ITS enclosing subquery are resolved when
+/// that subquery is planned.
+///
+/// None when the text cannot be scanned (a FROM item whose columns cannot be
+/// read, an outer-qualified column the outer relation lacks, an ambiguous
+/// bare name) - the caller must then REFUSE, never fold.
+fn corr_scan(
+    sub: &str,
+    outer: &CorrScope,
+    db: &Database,
+    db_opt: &Option<Database>,
+) -> Option<CorrScan> {
+    corr_scan_with(sub, outer, &|tr| scope_rel_of(tr, db, db_opt))
+}
+
+/// The scope a FROM item opens, as the scanner asks for it - the catalog
+/// read ([scope_rel_of]) in the server, a fixed table in a unit test.
+type ScopeLook<'a> = dyn Fn(&TableRef<'_>) -> Option<ScopeRel> + 'a;
+
+/// [corr_scan] over a caller-supplied catalog.
+fn corr_scan_with(sub: &str, outer: &CorrScope, look: &ScopeLook<'_>) -> Option<CorrScan> {
+    CORR_HARD_REFUSE.with(|c| c.set(false));
+    let mut refs: Vec<OuterRef> = Vec::new();
+    let mut stack: Vec<CorrScope> = vec![outer.clone()];
+    let text = corr_scan_span(sub, &mut stack, &mut refs, look)?;
+    Some(CorrScan { text, refs })
+}
+
+/// [corr_scan] over one `SELECT` span: opens the span's own scope, then
+/// scans its clauses - the FROM list itself is copied (relation names and
+/// aliases are not column references; a derived table is a closed scope),
+/// except the ON conditions inside it.
+fn corr_scan_span(
+    body: &str,
+    stack: &mut Vec<CorrScope>,
+    refs: &mut Vec<OuterRef>,
+    look: &ScopeLook<'_>,
+) -> Option<String> {
+    let (proj_s, table_s, _w, _g, _h, _o) = split_query(body)?;
+    let (left, joins) = parse_from(table_s)?;
+    let mut scope = CorrScope::default();
+    for tr in std::iter::once(&left).chain(joins.iter().map(|(_, r, _, _)| r)) {
+        scope.rels.push(look(tr)?);
+    }
+    // the span's own select-list aliases are names of its own too
+    // (`ORDER BY MX` names the item, not an outer column)
+    let base = body.as_ptr() as usize;
+    let off = |s: &str| s.as_ptr() as usize - base;
+    let mut alias_offs: Vec<usize> = Vec::new();
+    let mut alias_cols: Vec<(String, Option<Descriptor>)> = Vec::new();
+    for item in split_top_level_commas(proj_s) {
+        let (_, a) = split_alias(item);
+        if let Some(a) = a {
+            let a = a.trim();
+            if !a.is_empty() {
+                alias_offs.push(off(a));
+                let bare = a.trim_matches('"');
+                alias_cols.push((
+                    if a.starts_with('"') { bare.to_string() } else { bare.to_ascii_uppercase() },
+                    None,
+                ));
+            }
+        }
+    }
+    if !alias_cols.is_empty() {
+        scope.rels.push(ScopeRel {
+            key: "\u{0}alias".to_string(),
+            relation: None,
+            schema: None,
+            cols: alias_cols,
+            qual_only: false,
+        });
+    }
+    stack.push(scope);
+    let from_start = off(table_s);
+    let from_end = from_start + table_s.len();
+    let mut out = String::with_capacity(body.len() + 16);
+    let head = corr_scan_text(&body[..from_start], 0, &alias_offs, stack, refs, look);
+    let Some(head) = head else {
+        stack.pop();
+        return None;
+    };
+    out.push_str(&head);
+    // the FROM list: relation names verbatim, ON conditions scanned
+    let mut cur = from_start;
+    for (_, _, on_s, _) in &joins {
+        let os = on_s.as_ptr() as usize;
+        if os < base + cur || os + on_s.len() > base + from_end {
+            continue; // a sentinel (CROSS / NATURAL), not a slice of the text
+        }
+        let os = os - base;
+        out.push_str(&body[cur..os]);
+        match corr_scan_text(on_s, os, &alias_offs, stack, refs, look) {
+            Some(t) => out.push_str(&t),
+            None => {
+                stack.pop();
+                return None;
+            }
+        }
+        cur = os + on_s.len();
+    }
+    out.push_str(&body[cur..from_end]);
+    let tail = corr_scan_text(&body[from_end..], from_end, &alias_offs, stack, refs, look);
+    stack.pop();
+    out.push_str(&tail?);
+    // an outer reference as a GROUP BY key of the inner select is the
+    // engine's -104 "Cannot use an aggregate or window function in a
+    // GROUP BY clause" (probed): refused, never grouped
+    if let Some((_, _, _, Some(g), _, _)) = split_query(&out) {
+        if split_top_level_commas(g).iter().any(|k| corr_is_out_marker(k.trim())) {
+            CORR_HARD_REFUSE.with(|c| c.set(true));
+            return None;
+        }
+    }
+    Some(out)
+}
+
+/// Is this word an aggregate function's name?
+fn corr_agg_name(up: &str) -> bool {
+    matches!(
+        up,
+        "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "LIST" | "STDDEV_POP" | "STDDEV_SAMP" | "VAR_POP"
+            | "VAR_SAMP" | "COVAR_POP" | "COVAR_SAMP" | "CORR" | "REGR_AVGX" | "REGR_AVGY"
+            | "REGR_COUNT" | "REGR_INTERCEPT" | "REGR_R2" | "REGR_SLOPE" | "REGR_SXX" | "REGR_SXY"
+            | "REGR_SYY"
+    )
+}
+
+thread_local! {
+    /// Set when the scanner met a shape the ENGINE rejects outright (an
+    /// outer reference as an aggregate's whole argument, or as an inner
+    /// GROUP BY key): the statement must REFUSE, and a caller that would
+    /// otherwise fall back to the uncorrelated fold on an unscannable
+    /// text must not (that fold answered 21000 for `GROUP BY T.ID`,
+    /// review-caught). Cleared at every [corr_scan_with].
+    static CORR_HARD_REFUSE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Did the last scan meet a shape the engine rejects? ([CORR_HARD_REFUSE])
+fn corr_hard_refused() -> bool {
+    CORR_HARD_REFUSE.with(|c| c.get())
+}
+
+/// Is this text exactly one outer-reference marker?
+fn corr_is_out_marker(t: &str) -> bool {
+    t.strip_prefix("FC$OUT").is_some_and(|d| !d.is_empty() && d.bytes().all(|c| c.is_ascii_digit()))
+}
+
+/// Words that are never a column reference where they stand.
+fn corr_keyword(up: &str) -> bool {
+    matches!(
+        up,
+        "SELECT" | "FROM" | "WHERE" | "GROUP" | "BY" | "HAVING" | "ORDER" | "ASC" | "DESC"
+            | "NULLS" | "FIRST" | "LAST" | "SKIP" | "DISTINCT" | "AND" | "OR" | "NOT" | "IN"
+            | "EXISTS" | "IS" | "NULL" | "LIKE" | "ESCAPE" | "BETWEEN" | "CASE" | "WHEN"
+            | "THEN" | "ELSE" | "END" | "AS" | "ANY" | "SOME" | "ALL" | "TRUE" | "FALSE"
+            | "UNKNOWN" | "STARTING" | "WITH" | "SIMILAR" | "TO" | "CONTAINING" | "CHARACTER"
+            | "SET" | "COLLATE" | "JOIN" | "INNER" | "LEFT" | "RIGHT" | "FULL" | "OUTER"
+            | "CROSS" | "NATURAL" | "ON" | "USING" | "UNION" | "ROWS" | "OVER" | "PARTITION"
+            | "CURRENT" | "ROW" | "UNBOUNDED" | "PRECEDING" | "FOLLOWING" | "RANGE"
+            | "LEADING" | "TRAILING" | "BOTH" | "YEAR" | "MONTH" | "DAY" | "HOUR" | "MINUTE"
+            | "SECOND" | "WEEK" | "WEEKDAY" | "YEARDAY" | "MILLISECOND" | "AT" | "LOCAL"
+            | "ZONE" | "FOR" | "VALUE" | "NEXT" | "PLAN" | "INDEX" | "MERGE" | "SORT"
+            | "INTEGER" | "INT" | "SMALLINT" | "BIGINT" | "VARCHAR" | "CHAR" | "NUMERIC"
+            | "DECIMAL" | "DOUBLE" | "PRECISION" | "FLOAT" | "DATE" | "TIME" | "TIMESTAMP"
+            | "BOOLEAN" | "BLOB" | "INT128" | "DECFLOAT" | "VARYING" | "SUB_TYPE" | "SEGMENT"
+            | "SIZE" | "CURRENT_DATE" | "CURRENT_TIME" | "CURRENT_TIMESTAMP" | "LOCALTIME"
+            | "LOCALTIMESTAMP" | "CURRENT_USER" | "CURRENT_ROLE" | "CURRENT_CONNECTION"
+            | "CURRENT_TRANSACTION" | "ROW_COUNT" | "SQLCODE" | "GDSCODE" | "RETURNING"
+            | "INTO" | "VALUES" | "OFFSET" | "FETCH" | "ONLY" | "TIES" | "PERCENT" | "WITHIN"
+            | "FILTER" | "RESPECT" | "IGNORE" | "INTERSECT" | "EXCEPT" | "DEFAULT"
+            | "TIMEZONE_HOUR" | "TIMEZONE_MINUTE" | "BINARY" | "VARBINARY" | "NCHAR"
+            | "NATIONAL" | "OCTETS" | "OTHERS" | "DECODE" | "CAST" | "EXTRACT" | "SUBSTRING"
+            | "TRIM" | "POSITION" | "OVERLAY" | "IIF" | "COALESCE" | "NULLIF" | "MATCHING"
+            | "USER" | "ROLE" | "SESSION_USER" | "SYSTEM_USER"
+    )
+}
+
+/// [corr_scan] over one clause's text (no FROM list in it).
+fn corr_scan_text(
+    text: &str,
+    abs: usize,
+    alias_offs: &[usize],
+    stack: &mut Vec<CorrScope>,
+    refs: &mut Vec<OuterRef>,
+    look: &ScopeLook<'_>,
+) -> Option<String> {
+    let b = text.as_bytes();
+    let mut out = String::with_capacity(text.len() + 16);
+    let mut i = 0usize;
+    // the last bare word copied, upper-cased: the word after AS / SET /
+    // COLLATE is an alias, a type or a name - never a column reference
+    let mut prev_word: Option<String> = None;
+    // AN OUTER REFERENCE AS AN AGGREGATE'S WHOLE ARGUMENT - `SUM(T.A)`,
+    // `COUNT(T.A)` in the inner select - is the engine's -104 (probed:
+    // `SUM(E.V * T.A)` and `SUM(E.V) + T.A` answer, the bare one does
+    // not); it answered here before (review-caught). Tracked by paren
+    // depth: the aggregate's name, then its `(`, then its `)`.
+    let mut depth = 0usize;
+    let mut pending_agg = false;
+    let mut agg_open: Option<(usize, usize)> = None;
+    while i < b.len() {
+        let c = b[i];
+        if c == b'\'' {
+            let start = i;
+            i += 1;
+            while i < b.len() {
+                if b[i] == b'\'' {
+                    if i + 1 < b.len() && b[i + 1] == b'\'' {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            out.push_str(&text[start..i]);
+            prev_word = None;
+            continue;
+        }
+        if c == b'(' {
+            // a nested query is a scope of its own
+            let mut j = i + 1;
+            while j < b.len() && b[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            let is_select = text[j..]
+                .get(..6)
+                .map(|w| w.eq_ignore_ascii_case("SELECT"))
+                .unwrap_or(false)
+                && b.get(j + 6).map(|c| c.is_ascii_whitespace() || *c == b'(').unwrap_or(false);
+            if is_select {
+                let close = matching_paren(b, i)?;
+                let inner = &text[i + 1..close];
+                let scanned = corr_scan_span(inner, stack, refs, look)?;
+                out.push('(');
+                out.push_str(&scanned);
+                out.push(')');
+                i = close + 1;
+                prev_word = None;
+                continue;
+            }
+            out.push('(');
+            depth += 1;
+            if pending_agg {
+                agg_open = Some((depth, out.len()));
+                pending_agg = false;
+            }
+            i += 1;
+            prev_word = None;
+            continue;
+        }
+        let ident_start = c == b'"' || c.is_ascii_alphabetic() || c == b'_';
+        if !ident_start {
+            // a number (which may carry dots and an exponent) is copied as
+            // one run so its letters never read as identifiers
+            if c.is_ascii_digit() {
+                let start = i;
+                while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'.' || b[i] == b'_' || b[i] == b'$') {
+                    i += 1;
+                }
+                out.push_str(&text[start..i]);
+                prev_word = None;
+                continue;
+            }
+            if c == b')' {
+                if let Some((d, pos)) = agg_open {
+                    if d == depth {
+                        let arg = out[pos..].trim();
+                        let arg = ["DISTINCT ", "ALL "]
+                            .iter()
+                            .find_map(|kw| {
+                                (arg.len() > kw.len() && arg[..kw.len()].eq_ignore_ascii_case(kw))
+                                    .then(|| arg[kw.len()..].trim())
+                            })
+                            .unwrap_or(arg);
+                        if corr_is_out_marker(arg) {
+                            CORR_HARD_REFUSE.with(|c| c.set(true));
+                            return None;
+                        }
+                        agg_open = None;
+                    }
+                }
+                depth = depth.saturating_sub(1);
+            }
+            out.push(c as char);
+            i += 1;
+            if !c.is_ascii_whitespace() {
+                prev_word = None;
+            }
+            continue;
+        }
+        // a (possibly dotted, possibly quoted) name chain
+        let start = i;
+        let mut parts: Vec<(String, bool)> = Vec::new();
+        loop {
+            if i < b.len() && b[i] == b'"' {
+                let qs = i + 1;
+                i += 1;
+                let mut name = String::new();
+                loop {
+                    if i >= b.len() {
+                        return None; // unterminated quoted name
+                    }
+                    if b[i] == b'"' {
+                        if i + 1 < b.len() && b[i + 1] == b'"' {
+                            name.push('"');
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+                if name.is_empty() {
+                    name = text[qs..i - 1].replace("\"\"", "\"");
+                }
+                parts.push((name, true));
+            } else if i < b.len() && (b[i].is_ascii_alphabetic() || b[i] == b'_') {
+                let ws = i;
+                while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] == b'$') {
+                    i += 1;
+                }
+                parts.push((text[ws..i].to_string(), false));
+            } else {
+                break;
+            }
+            if i < b.len()
+                && b[i] == b'.'
+                && b.get(i + 1).is_some_and(|n| n.is_ascii_alphabetic() || *n == b'_' || *n == b'"')
+            {
+                i += 1;
+                continue;
+            }
+            break;
+        }
+        let spelled = &text[start..i];
+        // a function name: the word before a `(`
+        let mut j = i;
+        while j < b.len() && b[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        let is_call = j < b.len() && b[j] == b'(';
+        let up_first = parts[0].0.to_ascii_uppercase();
+        let after_binding_word =
+            matches!(prev_word.as_deref(), Some("AS") | Some("SET") | Some("COLLATE"));
+        let at_alias = alias_offs.contains(&(abs + start));
+        let bare_keyword = parts.len() == 1 && !parts[0].1 && corr_keyword(&up_first);
+        if is_call || after_binding_word || at_alias || bare_keyword {
+            if is_call && parts.len() == 1 && !parts[0].1 && agg_open.is_none() && corr_agg_name(&up_first) {
+                pending_agg = true;
+            }
+            out.push_str(spelled);
+            prev_word = (parts.len() == 1 && !parts[0].1).then(|| up_first.clone());
+            continue;
+        }
+        prev_word = None;
+        let innermost = stack.len() - 1;
+        match parts.as_slice() {
+            [(name, quoted)] => {
+                // innermost-first: the first level that has the name owns it
+                let mut owner: Option<(usize, usize)> = None;
+                for level in (0..=innermost).rev() {
+                    match stack[level].bare(name, *quoted) {
+                        None => continue,
+                        Some(usize::MAX) => {
+                            if level == innermost {
+                                // the inner query's own ambiguity is its
+                                // planner's to refuse
+                                owner = Some((level, usize::MAX));
+                                break;
+                            }
+                            return None; // ambiguous in the scope that owns it
+                        }
+                        Some(r) => {
+                            owner = Some((level, r));
+                            break;
+                        }
+                    }
+                }
+                match owner {
+                    Some((0, r)) if innermost > 0 => {
+                        let idx = push_ref(refs, &stack[0], r, name, *quoted)?;
+                        out.push_str(&format!("FC$OUT{}", idx));
+                    }
+                    _ => out.push_str(spelled),
+                }
+            }
+            [(q, qq), (name, quoted)] => {
+                let mut owner: Option<(usize, usize)> = None;
+                for level in (0..=innermost).rev() {
+                    if let Some(r) = stack[level].qualified(None, q, *qq) {
+                        owner = Some((level, r));
+                        break;
+                    }
+                }
+                match owner {
+                    Some((0, r)) if innermost > 0 => {
+                        let idx = push_ref(refs, &stack[0], r, name, *quoted)?;
+                        out.push_str(&format!("FC$OUT{}", idx));
+                    }
+                    _ => out.push_str(spelled),
+                }
+            }
+            [(s, sq), (q, qq), (name, quoted)] => {
+                let mut owner: Option<(usize, usize)> = None;
+                for level in (0..=innermost).rev() {
+                    if let Some(r) = stack[level].qualified(Some((s, *sq)), q, *qq) {
+                        owner = Some((level, r));
+                        break;
+                    }
+                }
+                match owner {
+                    Some((0, r)) if innermost > 0 => {
+                        let idx = push_ref(refs, &stack[0], r, name, *quoted)?;
+                        out.push_str(&format!("FC$OUT{}", idx));
+                    }
+                    _ => out.push_str(spelled),
+                }
+            }
+            _ => out.push_str(spelled),
+        }
+    }
+    Some(out)
+}
+
+/// Record an outer reference (deduplicated), answering its marker index.
+/// None when the outer relation has no such column: the engine's -206,
+/// and a refusal here.
+fn push_ref(refs: &mut Vec<OuterRef>, outer: &CorrScope, rel: usize, col: &str, quoted: bool) -> Option<usize> {
+    let r = outer.rels.get(rel)?;
+    let (cname, desc) = r.cols.iter().find(|(c, _)| name_matches(c, col, quoted))?;
+    if let Some(i) = refs.iter().position(|x| x.rel == rel && x.col == *cname) {
+        return Some(i);
+    }
+    refs.push(OuterRef { rel, col: cname.clone(), desc: desc.clone() });
+    Some(refs.len() - 1)
+}
+
+/// Replace every `FC$OUT<i>` marker in `text` by `lit(i)`.
+fn subst_out_markers(text: &str, lit: &dyn Fn(usize) -> Option<String>) -> Option<String> {
+    let mut out = String::with_capacity(text.len() + 32);
+    let mut rest = text;
+    while let Some(p) = rest.find("FC$OUT") {
+        out.push_str(&rest[..p]);
+        let after = &rest[p + 6..];
+        let n: usize = after.bytes().take_while(|c| c.is_ascii_digit()).count();
+        if n == 0 {
+            return None;
+        }
+        let idx: usize = after[..n].parse().ok()?;
+        out.push_str(&lit(idx)?);
+        rest = &after[n..];
+    }
+    out.push_str(rest);
+    Some(out)
+}
+
+/// The SQL literal an outer row's value substitutes as. NULL is typed
+/// (`CAST(NULL AS <type>)`) so the inner comparison keeps its type rather
+/// than folding away; a temporal spells its typed literal; an approximate
+/// travels as a cast over its exact text.
+fn corr_literal(v: &Value, d: &Descriptor) -> Option<String> {
+    Some(match v {
+        // a WITH TIME ZONE type is one this server's CAST does not spell:
+        // a bare NULL compares UNKNOWN and projects NULL all the same
+        Value::Null if matches!(d.dtype, dtype::SQL_TIME_TZ | dtype::TIMESTAMP_TZ) => "NULL".to_string(),
+        Value::Null => format!("CAST(NULL AS {})", desc_type_sql_cs(d)),
+        Value::Double(x) => {
+            if !x.is_finite() {
+                return None;
+            }
+            format!("CAST('{:e}' AS DOUBLE PRECISION)", x)
+        }
+        Value::Float(x) => {
+            if !x.is_finite() {
+                return None;
+            }
+            format!("CAST('{:e}' AS FLOAT)", x)
+        }
+        // an INT128 magnitude or a scaled one has no literal spelling of
+        // its own that every parser reads at its width: it travels as a
+        // CAST over its exact text (a NUMERIC(38,4) value failed
+        // MID-FETCH here before - review-caught)
+        Value::Int128(i, 0) if i64::try_from(*i).is_ok() => i.to_string(),
+        Value::Int128(_, 0) => format!("CAST('{}' AS NUMERIC(38))", v.render()),
+        Value::Int128(_, sc) => format!("CAST('{}' AS NUMERIC(38,{}))", v.render(), -(*sc as i32)),
+        // a DECFLOAT travels as a CAST over its exact decimal text; NaN
+        // and the infinities have no literal here
+        Value::DecFloat16(_) | Value::DecFloat34(_) => {
+            let t = v.render();
+            if t.contains("NaN") || t.contains("Inf") || t.contains("nan") || t.contains("inf") {
+                return None;
+            }
+            let w = if matches!(v, Value::DecFloat16(_)) { 16 } else { 34 };
+            format!("CAST('{}' AS DECFLOAT({}))", t, w)
+        }
+        Value::Text(t) if matches!(d.dtype, dtype::TEXT | dtype::VARYING) => {
+            // EVERY text value travels in the typed BYTE form of its own
+            // column: `CAST(x'..' AS VARCHAR(n) CHARACTER SET cs)`. A bare
+            // '...' literal is a value of the ATTACHMENT's set, and the
+            // inner statement then measured it there - OCTET_LENGTH of a
+            // WIN1252 'café' answered 5 under a UTF8 attachment where the
+            // engine says 4 (review-caught). The hex cast keeps the
+            // column's bytes and its set; the width is the column's own.
+            let cs = fire_crab_ods::intl::charset_id(d.sub_type);
+            let name = charset_sql_name(cs)?;
+            let chars = fire_crab_ods::intl::char_length(d.dtype, d.length, d.sub_type).max(1);
+            let kw = if d.dtype == dtype::VARYING { "VARCHAR" } else { "CHAR" };
+            if t.is_empty() {
+                format!("CAST('' AS {}({}) CHARACTER SET {})", kw, chars, name)
+            } else {
+                let bytes = blob_bytes_in(t, cs).ok()?;
+                let mut hex = String::with_capacity(bytes.len() * 2);
+                for b in &bytes {
+                    hex.push_str(&format!("{:02X}", b));
+                }
+                format!("CAST(x'{}' AS {}({}) CHARACTER SET {})", hex, kw, chars, name)
+            }
+        }
+        Value::Text(t) => format!("'{}'", t.replace('\'', "''")),
+        other => psql_literal(other)?,
+    })
+}
+
+/// Can EVERY value of a column with this descriptor be spelled by
+/// [corr_literal]? Decided at REGISTRATION so a statement over a column
+/// with no literal form refuses at prepare, never after delivering a row
+/// (a DECFLOAT outer value has no exact literal here).
+fn corr_literal_form_ok(d: &Descriptor) -> bool {
+    match d.dtype {
+        dtype::SHORT | dtype::LONG | dtype::INT64 | dtype::INT128 | dtype::REAL | dtype::DOUBLE
+        | dtype::SQL_DATE | dtype::SQL_TIME | dtype::TIMESTAMP | dtype::BOOLEAN
+        | dtype::SQL_TIME_TZ | dtype::TIMESTAMP_TZ | dtype::DEC64 | dtype::DEC128 => true,
+        dtype::TEXT | dtype::VARYING => charset_sql_name(fire_crab_ods::intl::charset_id(d.sub_type)).is_some(),
+        _ => false,
+    }
+}
+
+/// How a subquery is used, before its operands are resolved.
+#[derive(Clone)]
+enum CorrKindRaw {
+    Scalar,
+    Exists { negated: bool },
+    In { lhs: RawExpr, negated: bool },
+    Quant { lhs: RawExpr, op: Cmp, all: bool, negated: bool },
+}
+
+/// A registered correlated subquery: what a `FC$CORR(<id>)` marker stands
+/// for until the enclosing resolver binds its outer references.
+#[derive(Clone)]
+struct CorrTemplate {
+    /// the original text, for the trace
+    source: String,
+    /// the inner text with `FC$OUT<i>` markers
+    text: String,
+    /// per marker: (index, `KEY.COL` spelling, bare column name)
+    refs: Vec<(usize, String, String)>,
+    kind: CorrKindRaw,
+    /// the inner statement's DESCRIBE over `CAST(NULL AS <type>)`
+    /// stand-ins: its one output column, nullable
+    desc: ProjCol,
+}
+
+fn corr_template(id: usize) -> Option<CorrTemplate> {
+    CORR_REG.with(|r| r.borrow().get(id).cloned())
+}
+
+/// Plan the inner text with typed NULL stand-ins to learn what it
+/// announces. None when it does not plan - the statement then refuses.
+fn corr_describe(scan: &CorrScan, scope: &CorrScope, db_opt: &Option<Database>) -> Option<ProjCol> {
+    // A PROJECTED OUTER COLUMN describes as that column itself - its own
+    // type and width (an INT128 / DECFLOAT / TIME ZONE column exactly,
+    // where a CAST(NULL) stand-in planned by this server described
+    // another width), its name, and ITS table (probed: `(SELECT TY.S
+    // FROM TY2 y ...)` names table TY, not the inner FROM)
+    if let Some((proj_s, ..)) = split_query(&scan.text) {
+        let (body, alias) = split_alias(proj_s.trim());
+        if let Some(i) = body.trim().strip_prefix("FC$OUT").and_then(|d| d.parse::<usize>().ok()) {
+            if let Some((r, d)) = scan.refs.get(i).and_then(|r| r.desc.as_ref().map(|d| (r, d))) {
+                let (wire, sql_type, length, scale, sub_type) = wire_for(d);
+                let rel = scope.rels.get(r.rel);
+                let name = match alias {
+                    Some(a) if a.starts_with('"') => a.trim_matches('"').replace("\"\"", "\""),
+                    Some(a) => a.trim().to_ascii_uppercase(),
+                    None => r.col.clone(),
+                };
+                return Some(ProjCol {
+                    name,
+                    fname: Some(r.col.clone()),
+                    relation: rel.and_then(|x| x.relation.clone()),
+                    rel_alias: rel.and_then(|x| {
+                        (x.relation.as_deref() != Some(x.key.as_str())).then(|| x.key.clone())
+                    }),
+                    field_id: 0,
+                    wire,
+                    sql_type: nullable(sql_type),
+                    length,
+                    oct_length: length,
+                    scale,
+                    sub_type,
+                    expr: None,
+                });
+            }
+        }
+    }
+    let text = corr_standin_text(scan)?;
+    let mut ip: Vec<Option<Descriptor>> = Vec::new();
+    let plan = plan_query_inner(&text, db_opt, &mut ip)?;
+    if !ip.is_empty() || matches!(plan, Plan::Refused | Plan::RefusedEval(_)) {
+        return None;
+    }
+    let mut col = output_cols_of(&plan).into_iter().next()?;
+    // THE ANNOUNCED WIDTH MUST BE THE TYPE'S: an INT128 described at 64
+    // bytes while its value is encoded at 16 was a malformed wire row
+    // (isql "message length error", review-caught) - refuse instead
+    let fixed = match col.sql_type & !1 {
+        500 => Some(2),
+        496 | 482 | 570 | 560 => Some(4),
+        580 | 480 | 510 | 32760 | 32756 => Some(8),
+        32754 => Some(12),
+        32752 | 32762 => Some(16),
+        32764 => Some(1),
+        _ => None,
+    };
+    if fixed.is_some_and(|w| col.length != w) {
+        return None;
+    }
+    col.sql_type = nullable(col.sql_type);
+    col.expr = None;
+    Some(col)
+}
+
+/// The inner text with every outer reference stood in for by a typed
+/// NULL (`CAST(NULL AS <type>)`): what the inner is PLANNED as at
+/// prepare, so that it types as the run will. None for a reference with
+/// no descriptor.
+fn corr_standin_text(scan: &CorrScan) -> Option<String> {
+    subst_out_markers(&scan.text, &|i| {
+        scan.refs.get(i).and_then(|r| r.desc.as_ref()).map(|d| format!("CAST(NULL AS {})", desc_type_sql_cs(d)))
+    })
+}
+
+/// Can this outer column be STOOD IN FOR - does this server's own CAST
+/// grammar read the type [desc_type_sql_cs] spells for it, whole? A
+/// stand-in it cannot read (`TIME WITH TIME ZONE`, `VARCHAR(5)
+/// CHARACTER SET OCTETS`) plans nowhere, and a plan probe over it
+/// would REFUSE a statement that answered before the probe existed
+/// (review-caught: a BOOLEAN outer column, before `CAST(.. AS BOOLEAN)`
+/// was read at all) - so the probe is SKIPPED for it instead.
+fn corr_standin_spellable(d: &Descriptor) -> bool {
+    let text: Vec<char> = desc_type_sql_cs(d).chars().collect();
+    let mut pos = 0usize;
+    parse_cast_target(&text, &mut pos).is_some() && {
+        skip_ws(&text, &mut pos);
+        pos == text.len()
+    }
+}
+
+/// Is an EXISTS inner answered PER ROW rather than by a fold? A
+/// HEAD-LIMITED inner (FIRST 0, SKIP n, ROWS ...) is - neither fold
+/// honours the limit ([corr_head_limited]); and so is a LONE AGGREGATE
+/// (an aggregate with no GROUP BY, [corr_lone_aggregate]) whenever the
+/// text scanned: it is one row whatever the key, where the semi-join
+/// answered FALSE for a key with no inner rows - but that one row is the
+/// RESULT of a run, never a shortcut past it. Folding it to TRUE at
+/// prepare answered every row over an inner naming an unknown column
+/// (the engine's -206), let `UPDATE`/`DELETE ... WHERE EXISTS` over such
+/// an inner write every row, and swallowed a conversion error inside
+/// (review-caught): planned at prepare over the stand-ins and run per
+/// outer row, the same inner refuses and raises where the engine does.
+fn corr_exists_per_row(text: &str, scanned: bool) -> bool {
+    corr_head_limited(text) || (scanned && corr_lone_aggregate(text))
+}
+
+/// Does the inner text PLAN over typed NULL stand-ins for its outer
+/// references? A fold of EXISTS - to a constant, or to a membership list
+/// from the semi-join reading - is only ever the RESULT of a run over an
+/// inner the planner accepts: an inner it refuses (an unknown column, an
+/// unbound qualifier, a syntax error) refuses the STATEMENT, the engine's
+/// -206 / -104, and never folds (review-caught: `... AND)` answered
+/// every row; a literal the inner cannot convert is an eval refusal the
+/// per-row path raises at execute, so it does not plan here either).
+/// An outer reference with no descriptor cannot be stood in for: the
+/// question is left to the reading that follows.
+fn corr_inner_plans(scan: &CorrScan, db_opt: &Option<Database>) -> bool {
+    // ... and neither can one whose type the stand-in cannot spell
+    // ([corr_standin_spellable]): the probe is skipped, never a refusal
+    if scan.refs.iter().any(|r| r.desc.as_ref().is_none_or(|d| !corr_standin_spellable(d))) {
+        return true;
+    }
+    let Some(text) = corr_standin_text(scan) else {
+        return false;
+    };
+    let mut ip: Vec<Option<Descriptor>> = Vec::new();
+    // a PROBE: its access-path choice is not the statement's plan of
+    // record, so the scan trace stays quiet ([corr_probing])
+    let prev = CORR_PROBE.with(|c| c.replace(true));
+    let plan = plan_query_inner(&text, db_opt, &mut ip);
+    CORR_PROBE.with(|c| c.set(prev));
+    match plan {
+        None | Some(Plan::Refused) | Some(Plan::RefusedEval(_)) => false,
+        Some(_) => ip.is_empty(),
+    }
+}
+
+thread_local! {
+    /// Set while [corr_inner_plans] plans an inner text to learn whether
+    /// it plans at all: the access path it picks is a probe's, not the
+    /// statement's, and the `index scan:` / `natural scan:` trace lines
+    /// the gates count as the OUTER walk stay quiet for it (the
+    /// subqindex gate read a probe's inner index as an outer index,
+    /// review-caught).
+    static CORR_PROBE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Is a plan probe running? ([CORR_PROBE])
+fn corr_probing() -> bool {
+    CORR_PROBE.with(|c| c.get())
+}
+
+/// Is there a `?` outside string literals?
+fn text_has_param(text: &str) -> bool {
+    mask_literals(text).contains('?')
+}
+
+/// Register a scanned subquery under a fresh id.
+fn corr_register(
+    source: &str,
+    scan: CorrScan,
+    kind: CorrKindRaw,
+    scope: &CorrScope,
+    db_opt: &Option<Database>,
+) -> Option<usize> {
+    if text_has_param(&scan.text) {
+        return None; // a `?` inside a correlated subquery: recorded refusal
+    }
+    if scan.refs.iter().any(|r| r.desc.as_ref().is_none_or(|d| !corr_literal_form_ok(d))) {
+        return None; // an outer column with no literal form: refused at prepare
+    }
+    let desc = corr_describe(&scan, scope, db_opt)?;
+    if matches!(kind, CorrKindRaw::Scalar) && desc.sql_type & !1 == 520 {
+        return None; // a blob-valued scalar: recorded refusal
+    }
+    let refs: Vec<(usize, String, String)> = scan
+        .refs
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let key = scope.rels.get(r.rel).map(|x| x.key.as_str()).unwrap_or("");
+            (i, format!("{}.{}", key, r.col), r.col.clone())
+        })
+        .collect();
+    if trace_on() {
+        eprintln!(
+            "[srv] corrsub: {:?} -> {:?} outer=[{}]",
+            source,
+            scan.text,
+            refs.iter().map(|(i, q, _)| format!("{}={}", i, q)).collect::<Vec<_>>().join(", ")
+        );
+    }
+    let t = CorrTemplate { source: source.to_string(), text: scan.text, refs, kind, desc };
+    CORR_REG.with(|r| {
+        let mut reg = r.borrow_mut();
+        reg.push(t);
+        Some(reg.len() - 1)
+    })
+}
+
+/// The left operand of `<lhs> IN / <cmp> ANY (...)` as text: one token
+/// before `at` - a name, a number or a string literal. None for anything
+/// else (an arithmetic left side is a later slice).
+fn corr_lhs_before(text: &str, at: usize) -> Option<(usize, &str)> {
+    let b = text.as_bytes();
+    let mut e = at;
+    while e > 0 && b[e - 1].is_ascii_whitespace() {
+        e -= 1;
+    }
+    if e == 0 {
+        return None;
+    }
+    let mut s = e;
+    if b[e - 1] == b'\'' {
+        s -= 1;
+        loop {
+            if s == 0 {
+                return None;
+            }
+            s -= 1;
+            if b[s] == b'\'' {
+                if s > 0 && b[s - 1] == b'\'' {
+                    s -= 1;
+                    continue;
+                }
+                break;
+            }
+        }
+    } else if b[e - 1] == b'"' || is_ident_byte(b[e - 1]) || b[e - 1] == b'.' {
+        while s > 0 && (is_ident_byte(b[s - 1]) || b[s - 1] == b'.' || b[s - 1] == b'"') {
+            s -= 1;
+        }
+    } else {
+        return None;
+    }
+    let lhs = text[s..e].trim();
+    if lhs.is_empty() {
+        return None;
+    }
+    Some((s, lhs))
+}
+
+/// The word ending just before `at` (whitespace skipped), upper-cased, and
+/// where it starts.
+fn corr_word_before(text: &str, at: usize) -> Option<(usize, String)> {
+    let b = text.as_bytes();
+    let mut e = at;
+    while e > 0 && b[e - 1].is_ascii_whitespace() {
+        e -= 1;
+    }
+    let mut s = e;
+    while s > 0 && is_ident_byte(b[s - 1]) {
+        s -= 1;
+    }
+    if s == e {
+        return None;
+    }
+    Some((s, text[s..e].to_ascii_uppercase()))
+}
+
+/// A comparison operator ending just before `at`.
+fn corr_cmp_before(text: &str, at: usize) -> Option<(usize, Cmp)> {
+    let b = text.as_bytes();
+    let mut e = at;
+    while e > 0 && b[e - 1].is_ascii_whitespace() {
+        e -= 1;
+    }
+    let ops: [(&str, Cmp); 11] = [
+        ("<>", Cmp::Ne), ("!=", Cmp::Ne), ("~=", Cmp::Ne), ("^=", Cmp::Ne), ("<=", Cmp::Le),
+        (">=", Cmp::Ge), ("!>", Cmp::Le), ("!<", Cmp::Ge), ("=", Cmp::Eq), ("<", Cmp::Lt),
+        (">", Cmp::Gt),
+    ];
+    for (sp, op) in ops {
+        if text[..e].ends_with(sp) {
+            return Some((e - sp.len(), op));
+        }
+    }
+    None
+}
+
+/// Lift every `(SELECT ...)` in a clause's text into a registered
+/// correlated-subquery marker: a scalar becomes `FC$CORR(<id>)`, and the
+/// predicate forms - `[NOT] EXISTS (...)`, `<x> [NOT] IN (...)`, `<x> <cmp>
+/// ANY|SOME|ALL (...)` - become `FC$CORR(<id>) = TRUE`, the three-valued
+/// result compared as a BOOLEAN so a NOT around it still works.
+///
+/// `select_list`: a subquery standing alone as a select item is named by
+/// its own item (`... AS <name>`), the way the constant fold names one.
+/// The text comes back unchanged when it holds no subquery; None when one
+/// cannot be lifted (the statement then keeps its refusal).
+fn lift_corr_text(
+    text: &str,
+    scope: &CorrScope,
+    db: &Database,
+    db_opt: &Option<Database>,
+    select_list: bool,
+) -> Option<String> {
+    let (folded, subs) = extract_subqueries(text)?;
+    if subs.is_empty() {
+        return Some(text.to_string());
+    }
+    // which markers stand alone (no alias) as a select item
+    let alone: Vec<bool> = if select_list {
+        (0..subs.len())
+            .map(|i| {
+                split_top_level_commas(&folded).iter().any(|item| {
+                    let (body, alias) = split_alias(item);
+                    alias.is_none() && body.trim() == format!("{}{}", SUBQ_MARK, i)
+                })
+            })
+            .collect()
+    } else {
+        vec![false; subs.len()]
+    };
+    let mut out = folded;
+    for (i, sub) in subs.iter().enumerate().rev() {
+        let mark = format!("{}{}", SUBQ_MARK, i);
+        let at = out.find(&mark)?;
+        let end = at + mark.len();
+        let scan = corr_scan(sub, scope, db, db_opt)?;
+        // the shape, read off the words before the marker
+        let (cut, kind, wrap) = match corr_word_before(&out, at) {
+            Some((ws, w)) if w == "EXISTS" => match corr_word_before(&out, ws) {
+                Some((ns, n)) if n == "NOT" => (ns, CorrKindRaw::Exists { negated: true }, true),
+                _ => (ws, CorrKindRaw::Exists { negated: false }, true),
+            },
+            Some((ws, w)) if w == "IN" => {
+                let (ns, negated) = match corr_word_before(&out, ws) {
+                    Some((ns, n)) if n == "NOT" => (ns, true),
+                    _ => (ws, false),
+                };
+                let (ls, lhs) = corr_lhs_before(&out, ns)?;
+                let lhs = parse_raw_expr_any(lhs)?;
+                (ls, CorrKindRaw::In { lhs, negated }, true)
+            }
+            Some((ws, w)) if matches!(w.as_str(), "ANY" | "SOME" | "ALL") => {
+                let all = w == "ALL";
+                let (cs, op) = corr_cmp_before(&out, ws)?;
+                let (ls, lhs) = corr_lhs_before(&out, cs)?;
+                let lhs = parse_raw_expr_any(lhs)?;
+                (ls, CorrKindRaw::Quant { lhs, op, all, negated: false }, true)
+            }
+            _ => (at, CorrKindRaw::Scalar, false),
+        };
+        let id = corr_register(sub, scan, kind, scope, db_opt)?;
+        let repl = if wrap {
+            format!("FC$CORR({}) = TRUE", id)
+        } else if select_list && alone[i] {
+            let name = corr_template(id)?.desc.name;
+            format!("FC$CORR({}) AS \"{}\"", id, name.replace('"', "\"\""))
+        } else {
+            format!("FC$CORR({})", id)
+        };
+        out = format!("{}{}{}", &out[..cut], repl, &out[end..]);
+    }
+    Some(out)
+}
+
+/// How a per-row subquery is used, operands resolved.
+#[derive(Clone)]
+enum CorrKind {
+    Scalar,
+    Exists { negated: bool },
+    In { lhs: Expr, negated: bool },
+    Quant { lhs: Expr, op: Cmp, all: bool, negated: bool },
+}
+
+/// The memo of one [Expr::CorrSub]: the inner rows' first column per
+/// distinct tuple of outer literals, valid for one execution epoch.
+///
+/// BOUNDED: a 5000-row self-EXISTS memoised 2500 rows per outer row and
+/// peaked the server at 420 MB (review-caught). The memo now holds at
+/// most [CORR_MEMO_MAX_ENTRIES] tuples / [CORR_MEMO_MAX_BYTES] of
+/// values and is CLEARED on overflow - a miss costs one inner run, an
+/// overflow costs nothing more than the misses it lets through - and
+/// every live memo is emptied when the op ends ([bump_exec_epoch]), so
+/// the memory is given back rather than kept by the cached plan.
+#[derive(Default)]
+struct CorrCache {
+    epoch: u64,
+    bytes: usize,
+    rows: std::collections::HashMap<Vec<String>, std::sync::Arc<Vec<Value>>>,
+}
+
+const CORR_MEMO_MAX_ENTRIES: usize = 10_000;
+const CORR_MEMO_MAX_BYTES: usize = 4 << 20;
+
+impl CorrCache {
+    /// Remember one tuple's answer, within the bound.
+    fn insert(&mut self, key: Vec<String>, rows: std::sync::Arc<Vec<Value>>) {
+        let cost = key.iter().map(|k| k.len() + 24).sum::<usize>()
+            + rows.iter().map(|v| 32 + match v { Value::Text(t) => t.len(), _ => 0 }).sum::<usize>()
+            + 64;
+        if self.rows.len() >= CORR_MEMO_MAX_ENTRIES || self.bytes + cost > CORR_MEMO_MAX_BYTES {
+            self.rows.clear();
+            self.bytes = 0;
+        }
+        self.bytes += cost;
+        self.rows.insert(key, rows);
+    }
+    fn clear(&mut self) {
+        self.rows.clear();
+        self.bytes = 0;
+    }
+}
+
+thread_local! {
+    /// every memo built on this thread, weakly: the op-end sweep empties
+    /// the ones still alive inside cached plans
+    static CORR_CACHES: std::cell::RefCell<Vec<std::sync::Weak<std::sync::Mutex<CorrCache>>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// A fresh memo, registered for the op-end sweep.
+fn corr_cache_new() -> std::sync::Arc<std::sync::Mutex<CorrCache>> {
+    let c = std::sync::Arc::new(std::sync::Mutex::new(CorrCache::default()));
+    CORR_CACHES.with(|r| r.borrow_mut().push(std::sync::Arc::downgrade(&c)));
+    c
+}
+
+/// Empty every live memo and forget the dead ones.
+fn clear_corr_caches() {
+    CORR_CACHES.with(|r| {
+        let mut v = r.borrow_mut();
+        v.retain(|w| match w.upgrade() {
+            Some(c) => {
+                if let Ok(mut g) = c.lock() {
+                    g.clear();
+                }
+                true
+            }
+            None => false,
+        });
+    });
+}
+
+/// `SELECT FIRST n ...` over an inner text that carries no FIRST of its
+/// own: an EXISTS asks only whether a row survives (n = 1), a scalar only
+/// whether MORE THAN ONE does (n = 2), so the inner walk stops there
+/// instead of materialising every matching row per outer row
+/// ([stream_first_n]). A UNION takes the limit on its first branch,
+/// which changes neither answer. Any other head is left alone.
+/// Does the inner select's HEAD limit its rows - `FIRST n` / `SKIP n`
+/// after SELECT, or a `ROWS` / `OFFSET` / `FETCH` clause? EXISTS over
+/// such an inner is answered PER ROW ([corr_inject_first] keeps the
+/// head): the equality semi-join reads every row and answered TRUE for
+/// `FIRST 0` and for the row `SKIP 1` skips (review-caught).
+fn corr_head_limited(text: &str) -> bool {
+    let t = text.trim_start();
+    let masked = mask_literals(&t.to_ascii_uppercase());
+    if masked.len() > 7 && masked.starts_with("SELECT") && masked.as_bytes()[6].is_ascii_whitespace() {
+        let rest = masked[6..].trim_start();
+        let word: String = rest.chars().take_while(|c| c.is_ascii_alphabetic()).collect();
+        if word == "FIRST" || word == "SKIP" {
+            return true;
+        }
+    }
+    ["ROWS", "OFFSET", "FETCH"].iter().any(|w| find_word_depth0(&masked, w, 0).is_some())
+}
+
+/// Is the inner select ONE AGGREGATE ROW - an aggregate function in its
+/// projection (at any depth outside a nested `(SELECT`), and no GROUP BY
+/// / HAVING, UNION or window? Such a select yields exactly one row
+/// whatever the data (`SELECT MAX(V) FROM E WHERE E.TID = 99` is one
+/// NULL row), so EXISTS over it is TRUE for every outer row and NOT
+/// EXISTS FALSE - where the semi-join answered FALSE for a key with no
+/// inner rows (review-caught; probed for MAX, COUNT, SUM and
+/// CAST(MAX(..))).
+fn corr_lone_aggregate(text: &str) -> bool {
+    let t = text.trim_start();
+    let masked = mask_literals(&t.to_ascii_uppercase());
+    if find_word_depth0(&masked, "UNION", 0).is_some() || find_word(&masked, "OVER", 0).is_some() {
+        return false;
+    }
+    let Some((proj_s, _, _, g, h, _)) = split_query(t) else { return false };
+    if g.is_some() || h.is_some() {
+        return false;
+    }
+    let pm = mask_literals(&proj_s.to_ascii_uppercase());
+    let pb = pm.as_bytes();
+    let mut i = 0usize;
+    while i < pb.len() {
+        if pb[i] == b'(' {
+            // a nested subselect's own aggregate is its own row count
+            if pm[i + 1..].trim_start().starts_with("SELECT") {
+                match matching_paren(pb, i) {
+                    Some(close) => {
+                        i = close + 1;
+                        continue;
+                    }
+                    None => return false,
+                }
+            }
+            i += 1;
+            continue;
+        }
+        if pb[i].is_ascii_alphabetic() || pb[i] == b'_' {
+            let ws = i;
+            while i < pb.len() && (pb[i].is_ascii_alphanumeric() || pb[i] == b'_' || pb[i] == b'$') {
+                i += 1;
+            }
+            let mut j = i;
+            while j < pb.len() && pb[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j < pb.len() && pb[j] == b'(' && corr_agg_name(&pm[ws..i]) {
+                return true;
+            }
+            continue;
+        }
+        i += 1;
+    }
+    false
+}
+
+fn corr_inject_first(text: &str, n: usize) -> String {
+    let t = text.trim_start();
+    let lead = text.len() - t.len();
+    // an AGGREGATE answers one row whatever the limit, and this server
+    // plans a lone aggregate without a FIRST; a UNION and a window are
+    // left alone too
+    let masked = mask_literals(&t.to_ascii_uppercase());
+    if find_word_depth0(&masked, "UNION", 0).is_some() || find_word(&masked, "OVER", 0).is_some() {
+        return text.to_string();
+    }
+    if let Some((proj_s, _, _, g, h, _)) = split_query(t) {
+        if g.is_some() || h.is_some() {
+            return text.to_string();
+        }
+        let pm = mask_literals(&proj_s.to_ascii_uppercase());
+        let pb = pm.as_bytes();
+        let mut i = 0usize;
+        while i < pb.len() {
+            if pb[i].is_ascii_alphabetic() || pb[i] == b'_' {
+                let ws = i;
+                while i < pb.len() && (pb[i].is_ascii_alphanumeric() || pb[i] == b'_' || pb[i] == b'$') {
+                    i += 1;
+                }
+                let mut j = i;
+                while j < pb.len() && pb[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                if j < pb.len() && pb[j] == b'(' && corr_agg_name(&pm[ws..i]) {
+                    return text.to_string();
+                }
+                continue;
+            }
+            i += 1;
+        }
+    }
+    if t.len() > 7 && t[..6].eq_ignore_ascii_case("SELECT") && t.as_bytes()[6].is_ascii_whitespace() {
+        let rest = t[6..].trim_start();
+        let word: String = rest.chars().take_while(|c| c.is_ascii_alphabetic()).collect();
+        if !word.eq_ignore_ascii_case("FIRST") {
+            return format!("{}SELECT FIRST {} {}", &text[..lead], n, rest);
+        }
+    }
+    text.to_string()
+}
+
+/// The value type, scale and rank a described column announces, for an
+/// expression that carries its describe rather than computing one.
+fn corr_result_type(pc: &ProjCol) -> Option<(ExprType, i8, Option<NumRank>)> {
+    let scale = pc.scale as i8;
+    Some(match pc.sql_type & !1 {
+        500 | 496 => {
+            if scale != 0 { (ExprType::Numeric, scale, Some(NumRank::Long)) } else { (ExprType::Int, 0, Some(NumRank::Long)) }
+        }
+        580 => {
+            if scale != 0 { (ExprType::Numeric, scale, Some(NumRank::I64)) } else { (ExprType::Int, 0, Some(NumRank::I64)) }
+        }
+        32752 => {
+            if scale != 0 { (ExprType::Numeric, scale, Some(NumRank::I128)) } else { (ExprType::Int, 0, Some(NumRank::I128)) }
+        }
+        480 | 482 => (ExprType::Approx, 0, None),
+        448 | 452 => (ExprType::Text, 0, None),
+        570 => (ExprType::Temporal(TKind::Date), 0, None),
+        560 => (ExprType::Temporal(TKind::Time), 0, None),
+        510 => (ExprType::Temporal(TKind::Timestamp), 0, None),
+        32756 => (ExprType::Temporal(TKind::TimeTz), 0, None),
+        32754 => (ExprType::Temporal(TKind::TimestampTz), 0, None),
+        32764 => (ExprType::Bool, 0, None),
+        _ => return None,
+    })
+}
+
+/// Build the per-row expression a registered template stands for, its
+/// outer references bound in the enclosing resolver's columns.
+fn resolve_corr_sub(id: usize, columns: &[RelationColumn], descs: &[Descriptor]) -> Option<Expr> {
+    let t = corr_template(id)?;
+    let mut outer: Vec<(usize, Expr, Descriptor)> = Vec::new();
+    for (i, qualified, bare) in &t.refs {
+        let rc = columns
+            .iter()
+            .find(|c| c.name == *qualified)
+            .or_else(|| columns.iter().find(|c| c.name.eq_ignore_ascii_case(qualified)))
+            .or_else(|| columns.iter().find(|c| c.name == *bare))
+            .or_else(|| columns.iter().find(|c| c.name.eq_ignore_ascii_case(bare)))?;
+        let fid = rc.field_id as usize;
+        if is_computed_fid(descs, fid) {
+            return None;
+        }
+        let d = descs.get(fid)?.clone();
+        if d.dtype == dtype::BLOB || d.dtype == dtype::ARRAY {
+            return None;
+        }
+        outer.push((*i, Expr::Col(fid), d));
+    }
+    let kind = match &t.kind {
+        CorrKindRaw::Scalar => CorrKind::Scalar,
+        CorrKindRaw::Exists { negated } => CorrKind::Exists { negated: *negated },
+        CorrKindRaw::In { lhs, negated } => {
+            CorrKind::In { lhs: resolve_expr_inner(lhs, columns, descs)?, negated: *negated }
+        }
+        CorrKindRaw::Quant { lhs, op, all, negated } => CorrKind::Quant {
+            lhs: resolve_expr_inner(lhs, columns, descs)?,
+            op: *op,
+            all: *all,
+            negated: *negated,
+        },
+    };
+    let (ty, scale, rank, desc) = match kind {
+        CorrKind::Scalar => {
+            let (ty, scale, rank) = corr_result_type(&t.desc)?;
+            (ty, scale, rank, Some(Box::new(t.desc.clone())))
+        }
+        _ => (ExprType::Bool, 0, None, None),
+    };
+    // the inner walk stops as early as the question allows
+    let text = match kind {
+        CorrKind::Exists { .. } => corr_inject_first(&t.text, 1),
+        CorrKind::Scalar => corr_inject_first(&t.text, 2),
+        _ => t.text.clone(),
+    };
+    CORR_BUILT.with(|c| c.set(c.get().wrapping_add(1)));
+    Some(Expr::CorrSub {
+        text,
+        outer,
+        kind: Box::new(kind),
+        ty,
+        scale,
+        rank,
+        desc,
+        cache: corr_cache_new(),
+    })
+}
+
+thread_local! {
+    /// how many per-row subquery expressions this thread has built: a
+    /// planner reads it before and after resolving a clause to learn
+    /// whether the clause carries one ([Expr::CorrSub])
+    static CORR_BUILT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The [CORR_BUILT] count now.
+fn corr_built_count() -> u64 {
+    CORR_BUILT.with(|c| c.get())
+}
+
+/// A quantified comparison over a materialised set, three-valued
+/// (measured laws, see [resolve_subqueries]): an EMPTY set makes ALL
+/// vacuously TRUE and ANY FALSE - NULL left side included; otherwise a
+/// NULL on either side of a comparison is UNKNOWN, which ANY ignores when
+/// another element answers TRUE and ALL ignores when another answers
+/// FALSE; a NOT flips TRUE and FALSE and leaves UNKNOWN.
+fn corr_quantified(lhs: &Value, op: Cmp, all: bool, negated: bool, set: &[Value]) -> Value {
+    let verdict: Option<bool> = if set.is_empty() {
+        Some(all)
+    } else {
+        let mut unknown = false;
+        let mut decided = false;
+        for v in set {
+            if matches!(lhs, Value::Null) || matches!(v, Value::Null) {
+                unknown = true;
+                continue;
+            }
+            let o = num_cmp(lhs, v).unwrap_or_else(|| value_cmp(lhs, v));
+            let t = match op {
+                Cmp::Eq => o == std::cmp::Ordering::Equal,
+                Cmp::Ne => o != std::cmp::Ordering::Equal,
+                Cmp::Lt => o == std::cmp::Ordering::Less,
+                Cmp::Le => o != std::cmp::Ordering::Greater,
+                Cmp::Gt => o == std::cmp::Ordering::Greater,
+                Cmp::Ge => o != std::cmp::Ordering::Less,
+            };
+            if all && !t {
+                decided = true;
+                break;
+            }
+            if !all && t {
+                decided = true;
+                break;
+            }
+        }
+        if decided {
+            Some(!all)
+        } else if unknown {
+            None
+        } else {
+            Some(all)
+        }
+    };
+    match verdict {
+        None => Value::Null,
+        Some(b) => Value::Bool(b != negated),
+    }
+}
+
+/// Run a per-row subquery for one outer row: substitute, plan, materialise
+/// (memoised per distinct tuple of literals within the execution epoch).
+fn corr_rows(
+    text: &str,
+    outer: &[(usize, Expr, Descriptor)],
+    cache: &std::sync::Arc<std::sync::Mutex<CorrCache>>,
+    values: &[Value],
+) -> Result<std::sync::Arc<Vec<Value>>, EvalErr> {
+    let Some(ptr) = SUBQ_DB.with(|c| c.get()) else {
+        // no database in scope: an internal error, never a silent NULL
+        return Err(EvalErr::Unsupported);
+    };
+    // SAFETY: the pointer was armed by a [SubqDbGuard] over a database the
+    // executor still holds for as long as this evaluation runs; the guard
+    // restores the previous pointer when that executor returns
+    let db_opt: &Option<Database> = unsafe { &*ptr };
+    let Some(dbr) = db_opt.as_ref() else { return Err(EvalErr::Unsupported) };
+    let mut lits: Vec<(usize, String)> = Vec::with_capacity(outer.len());
+    for (i, e, d) in outer {
+        let v = e.eval(values)?;
+        let lit = corr_literal(&v, d).ok_or(EvalErr::Unsupported)?;
+        lits.push((*i, lit));
+    }
+    let key: Vec<String> = lits.iter().map(|(_, l)| l.clone()).collect();
+    let epoch = EXEC_EPOCH.with(|c| c.get());
+    {
+        let mut c = cache.lock().map_err(|_| EvalErr::Unsupported)?;
+        if c.epoch != epoch {
+            c.epoch = epoch;
+            c.clear();
+        }
+        if let Some(r) = c.rows.get(&key) {
+            return Ok(r.clone());
+        }
+    }
+    let sql = subst_out_markers(text, &|i| lits.iter().find(|(k, _)| *k == i).map(|(_, l)| l.clone()))
+        .ok_or(EvalErr::Unsupported)?;
+    if trace_on() {
+        eprintln!("[srv] corrsub run: {:?}", sql);
+    }
+    let mut ip: Vec<Option<Descriptor>> = Vec::new();
+    let plan = plan_query_inner(&sql, db_opt, &mut ip).ok_or(EvalErr::Unsupported)?;
+    if !ip.is_empty() {
+        return Err(EvalErr::Unsupported);
+    }
+    match &plan {
+        Plan::Refused => return Err(EvalErr::Unsupported),
+        Plan::RefusedEval(e) => return Err(e.clone()),
+        _ => {}
+    }
+    let rows = branch_rows_res(&plan, dbr, &[])?;
+    let col0: Vec<Value> = rows.into_iter().map(|r| r.into_iter().next().unwrap_or(Value::Null)).collect();
+    let rc = std::sync::Arc::new(col0);
+    if let Ok(mut c) = cache.lock() {
+        c.insert(key, rc.clone());
+    }
+    Ok(rc)
+}
+
+/// The text form ([text_form_m]) a described text column announces.
+fn corr_text_form(pc: &ProjCol) -> Option<(bool, i32, TfCs)> {
+    match pc.sql_type & !1 {
+        448 | 452 => {
+            let chars = if pc.sub_type < 0 {
+                pc.length
+            } else {
+                let bpc = fire_crab_ods::intl::bytes_per_char(
+                    fire_crab_ods::intl::charset_id(pc.sub_type as i16),
+                ) as i32;
+                pc.length / bpc.max(1)
+            };
+            Some((
+                pc.sql_type & !1 == 448,
+                chars,
+                if pc.sub_type < 0 { TfCs::Att } else { TfCs::Ttype(pc.sub_type) },
+            ))
+        }
+        _ => None,
+    }
+}
+
 /// Fold every UNCORRELATED scalar subquery in a DML value text - an
 /// `INSERT`'s VALUES list, an `UPDATE`'s SET right-hand side - into the
 /// literal it answers, so the expression surface those two planners
@@ -63993,6 +66440,9 @@ fn fold_dml_subqueries(
     text: &str,
     db: &Database,
     db_opt: &Option<Database>,
+    // the target row's scope, when there is one (an UPDATE): a subquery
+    // that names it is NOT a constant and must not fold ([corr_scan])
+    scope: Option<&CorrScope>,
 ) -> Option<(String, Option<EvalErr>)> {
     let (folded, subs) = extract_subqueries(text)?;
     if subs.is_empty() {
@@ -64003,6 +66453,12 @@ fn fold_dml_subqueries(
     // HIGHEST INDEX FIRST: `FC$SUBQ1` is a prefix of `FC$SUBQ10`, and a
     // forward walk would rewrite the second one's head
     for (i, sub) in subs.iter().enumerate().rev() {
+        if let Some(sc) = scope {
+            match corr_scan(sub, sc, db, db_opt) {
+                Some(scan) if scan.refs.is_empty() => {}
+                _ => return None, // correlated (or unscannable): never a constant
+            }
+        }
         let rows = eval_subquery(sub, db, db_opt, None, None, false)?;
         let lit = if rows.values.len() > 1 {
             raise.get_or_insert(EvalErr::SingletonSelect);
@@ -64096,7 +66552,7 @@ fn render_toks(toks: &[Tok]) -> Option<String> {
 #[allow(clippy::too_many_arguments)]
 fn plan_correlated_select(
     proj_marked: &str,
-    correlated: &[(usize, String)],
+    correlated: &[(usize, String, Expr, Descriptor)],
     table_s: &str,
     where_s: Option<&str>,
     order_s: Option<&str>,
@@ -64131,7 +66587,7 @@ fn plan_correlated_select(
         qual: match from.alias {
             None if table_s.contains('.')
                 || where_s.is_some_and(|w| w.contains('.'))
-                || correlated.iter().any(|(_, sub)| sub.contains('.')) =>
+                || correlated.iter().any(|(_, sub, _, _)| sub.contains('.')) =>
             {
                 relation_schema(db, table).map(|s| (s, table))
             }
@@ -64147,24 +66603,28 @@ fn plan_correlated_select(
         (String, String),
         (Option<String>, Option<String>),
     )> = Vec::new();
-    for (marker, sub) in correlated {
-        let Some((lookup, result_desc)) =
-            build_correlated_lookup(sub, db, &columns, &bind, &descs)
-        else {
-            if trace {
-                eprintln!("[srv] plan: correlated subquery {:?} not answerable", sub);
-            }
-            return Some(Plan::Refused);
-        };
+    for (marker, sub, lookup, result_desc) in correlated {
+        // a projected OUTER column names ITS table (probed: `(SELECT
+        // TY.S FROM TY2 y ...)` is table TY, not the inner FROM)
+        let outer_col = split_query(sub).is_some_and(|(p, ..)| {
+            let (body, _) = split_alias(p.trim());
+            body.trim().split_once('.').is_some_and(|(q, c)| {
+                q.trim().trim_matches('"').eq_ignore_ascii_case(bind.key) && ident_ok(c.trim())
+            })
+        });
         lookups.push((
             *marker,
-            lookup,
-            result_desc,
+            lookup.clone(),
+            result_desc.clone(),
             subquery_item_name(sub)
                 .unwrap_or_else(|| ("CONSTANT".to_string(), "CONSTANT".to_string())),
             // probed: a correlated sub delegates its relation exactly
             // as the constant fold does (inner D from U answers U)
-            subquery_source(sub),
+            if outer_col {
+                (Some(table.to_string()), from.alias.map(str::to_string))
+            } else {
+                subquery_source(sub)
+            },
         ));
     }
 
@@ -64290,7 +66750,7 @@ fn plan_correlated_select(
     let index = opt_sql
         .as_deref()
         .and_then(|s| choose_index(db, rel, table, &descs, &filter, s, &order_by));
-    if trace {
+    if trace && !corr_probing() {
         match &index {
             Some(p) => eprintln!("[srv] index scan: rel={} {}", rel, p.describe()),
             None => eprintln!("[srv] natural scan: rel={}", rel),
@@ -64393,6 +66853,8 @@ fn build_correlated_lookup(
     outer_cols: &[RelationColumn],
     outer_bind: &ColBinding<'_>,
     outer_descs: &[Descriptor],
+    // a REBUILD for a later epoch ([LazyLookup]): no access-path trace
+    quiet: bool,
 ) -> Option<(Expr, Descriptor)> {
     // the lookup table below is built from the inner table's ROWS
     // ([PLAN_READ_ROWS])
@@ -64436,9 +66898,13 @@ fn build_correlated_lookup(
     // The residual WHERE names the INNER table, often by its alias
     // (`AND E.SALARY > 150`). The correlation split needed those
     // qualifiers to tell the two sides apart; now that it is done they
-    // only get in the resolver's way, so they come off.
+    // only get in the resolver's way, so they come off. AN ALIAS IS
+    // EXCLUSIVE: after `FROM T x` the base name T qualifies an OUTER
+    // reference (`x.ID < T.ID` is the ranking idiom), and stripping it
+    // as an inner name turned that into `ID < ID` - a silent NULL for
+    // every row (measured, qa/serve-real-corrsub.sh)
     let inner_names: Vec<&str> = match from.alias {
-        Some(a) => vec![table, a],
+        Some(a) => vec![a],
         None => vec![table],
     };
     let strip_inner = |t: &str| -> String {
@@ -64471,6 +66937,17 @@ fn build_correlated_lookup(
     if np != 0 {
         return None; // a `?` inside a correlated subquery
     }
+    // THE INVARIANT PASS DECIDES FIRST ([Predicate::bind]): a residual
+    // conjunct with no column reference is evaluated once whatever the
+    // scan finds, so a fold over an EMPTY inner table must not answer
+    // where the engine raises (`EXISTS (SELECT 1 FROM T0 WHERE 1/0 >
+    // 0)` over empty T0 is 22012, review-caught: the walk below found
+    // no row and folded to FALSE). A raise declines the fold; the
+    // per-row reading that follows raises it.
+    let filter = match filter {
+        Some(p) => Some(p.bind(&[]).ok()?),
+        None => None,
+    };
 
     // The access path for the ONE inner scan, keyed off the RESIDUAL
     // WHERE only. The fold below gathers EVERY correlation key - the
@@ -64495,7 +66972,7 @@ fn build_correlated_lookup(
     };
     let index =
         opt_sql.and_then(|s| choose_index(db, rel, table, &descs, &filter, &s, &[]));
-    if trace_on() {
+    if trace_on() && !quiet {
         match &index {
             Some(p) => eprintln!("[srv] subq index: rel={} {}", rel, p.describe()),
             None => eprintln!("[srv] subq natural: rel={}", rel),
@@ -64528,7 +67005,7 @@ fn build_correlated_lookup(
         if matches!(k, Value::Null) {
             return;
         }
-        match buckets.iter_mut().find(|(bk, _)| *bk == k) {
+        match buckets.iter_mut().find(|(bk, _)| lookup_key_eq(bk, &k)) {
             Some((_, rows)) => rows.push(vals.to_vec()),
             None => buckets.push((k, vec![vals.to_vec()])),
         }
@@ -64629,6 +67106,20 @@ fn build_correlated_lookup(
     };
     let _ = ty;
     let (rty, rscale) = expr_type_of_desc(&result_desc)?;
+    let bytes = exact_dtype_bytes(result_desc.dtype).unwrap_or(8);
+    let lazy = (!quiet).then(|| {
+        std::sync::Arc::new(LazyLookup {
+            sub: sub.to_string(),
+            outer_cols: outer_cols.to_vec(),
+            key: outer_bind.key.to_string(),
+            qual: outer_bind.qual.as_ref().map(|(sc, t)| (sc.clone(), t.to_string())),
+            outer_descs: outer_descs.to_vec(),
+            state: std::sync::Mutex::new((
+                EXEC_EPOCH.with(|c| c.get()),
+                std::sync::Arc::new(pairs.clone()),
+            )),
+        })
+    });
     Some((
         Expr::Lookup {
             key: Box::new(Expr::Col(key_fid)),
@@ -64636,9 +67127,69 @@ fn build_correlated_lookup(
             absent,
             ty: rty,
             scale: rscale,
+            bytes,
+            lazy,
         },
         result_desc,
     ))
+}
+
+/// Are two correlation keys EQUAL the way the predicate `inner.c =
+/// outer.c` compares them? A text key compares trailing-space
+/// insensitive ([value_cmp]): VARCHAR 'ab' against 'ab ' and a CHAR
+/// against a VARCHAR are equal on the engine, and bucketing them
+/// byte-exact answered 0 / NULL for a row the engine joins
+/// (review-caught). Every other shape keeps its exact equality.
+fn lookup_key_eq(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Text(x), Value::Text(y)) => x.trim_end_matches(' ') == y.trim_end_matches(' '),
+        _ => a == b,
+    }
+}
+
+/// What rebuilds an [Expr::Lookup]'s table for the execution that reads
+/// it. The table is scanned at PREPARE, and a CACHED plan re-executed
+/// after an INSERT / DELETE in the same transaction - or after another
+/// connection's COMMIT - answered the prepare-time table (review-caught,
+/// pre-existing). Each execution epoch ([EXEC_EPOCH]) rebuilds it once
+/// from the database in scope, the same pattern as [CorrCache].
+struct LazyLookup {
+    sub: String,
+    outer_cols: Vec<RelationColumn>,
+    key: String,
+    qual: Option<(String, String)>,
+    outer_descs: Vec<Descriptor>,
+    /// (epoch, the table valid for it)
+    state: std::sync::Mutex<(u64, std::sync::Arc<Vec<(Value, Value)>>)>,
+}
+
+impl LazyLookup {
+    /// The table for this epoch: the one built, or a fresh scan when the
+    /// epoch moved on. None when no database is in scope (the caller
+    /// then reads the prepare-time table) ; an error when the rebuild
+    /// fails.
+    fn current(&self) -> Result<Option<std::sync::Arc<Vec<(Value, Value)>>>, EvalErr> {
+        let epoch = EXEC_EPOCH.with(|c| c.get());
+        let mut st = self.state.lock().map_err(|_| EvalErr::Unsupported)?;
+        if st.0 == epoch {
+            return Ok(Some(st.1.clone()));
+        }
+        let Some(ptr) = SUBQ_DB.with(|c| c.get()) else { return Ok(None) };
+        // SAFETY: as in [corr_rows] - armed by a [SubqDbGuard] the
+        // executor holds for the whole evaluation
+        let db_opt: &Option<Database> = unsafe { &*ptr };
+        let Some(db) = db_opt.as_ref() else { return Ok(None) };
+        let bind = ColBinding {
+            key: &self.key,
+            qual: self.qual.as_ref().map(|(sc, t)| (sc.clone(), t.as_str())),
+        };
+        let (e, _) = build_correlated_lookup(&self.sub, db, &self.outer_cols, &bind, &self.outer_descs, true)
+            .ok_or(EvalErr::Unsupported)?;
+        let Expr::Lookup { pairs, .. } = e else { return Err(EvalErr::Unsupported) };
+        let rc = std::sync::Arc::new(pairs);
+        *st = (epoch, rc.clone());
+        Ok(Some(rc))
+    }
 }
 
 /// The (type, scale) an announced descriptor carries, for typing a
@@ -64711,8 +67262,10 @@ fn strip_inner_all(text: &str, names: &[&str]) -> String {
 /// same column in two tables, so stripping the qualifier and asking
 /// which table has "ID" finds BOTH and calls it ambiguous - which is how
 /// a correlated EXISTS over tables sharing a column name came to refuse.
-/// An UNQUALIFIED name present in both tables stays ambiguous, and more
-/// than one correlation pair refuses rather than picking one.
+/// An UNQUALIFIED name the inner table has is the INNER table's
+/// (innermost-first, measured), whatever the outer has; more than one
+/// correlation pair refuses rather than picking one (the per-row path
+/// takes it).
 ///
 /// `outer_bind` is the OUTER query's [ColBinding], and it is what makes
 /// an alias exclusive INSIDE the subquery too: after `FROM T AS Q` the
@@ -64720,46 +67273,6 @@ fn strip_inner_all(text: &str, names: &[&str]) -> String {
 /// `EXISTS (SELECT 1 FROM U WHERE U.C = T.C)` is a -206 and not a
 /// correlation. Without it this pass read every unrecognised qualifier
 /// as "the outer one" and ANSWERED where the engine raises.
-/// Does this subquery's WHERE name the OUTER scope?
-///
-/// A correlated subquery whose correlation this server can express is
-/// answered as a semi-join; one it cannot must REFUSE. The path that
-/// mattered is the fallback: when the correlated reading declines, the
-/// caller used to re-evaluate the subquery as UNCORRELATED and push a
-/// single verdict for every row - which is a silent wrong answer to
-/// everyday SQL. `SELECT id FROM t WHERE NOT EXISTS (SELECT 1 FROM t x
-/// WHERE x.id > t.id)` answered EVERY row instead of the last one, and
-/// `(SELECT COUNT(*) FROM t x WHERE x.id < t.id)` answered 0 for every
-/// row, because the correlation is an INEQUALITY and only equality pairs
-/// are recognised as one.
-///
-/// The test is scope, not shape: a qualifier that the OUTER binding
-/// answers to and that does NOT name the inner FROM item is an outer
-/// reference, whatever operator it appears under. An ALIAS REPLACES THE
-/// TABLE NAME, so `FROM t x` makes the inner relation answer to `x`
-/// alone and a `t.` qualifier there belongs to the outer query.
-fn subquery_names_outer(sql: &str, outer_bind: &ColBinding<'_>) -> bool {
-    let Some((_, table_s, where_s, _, _, _)) = split_query(sql) else {
-        return false;
-    };
-    let Some(w) = where_s else { return false };
-    let Some((from, _)) = parse_from(table_s) else { return false };
-    let inner: Vec<String> = match from.alias {
-        Some(a) => vec![a.to_string()],
-        None => vec![from.table.to_string()],
-    };
-    let Some(toks) = tokenize(w) else { return false };
-    toks.iter().any(|t| match t {
-        Tok::Ident(n) => match n.rsplitn(2, '.').nth(1) {
-            Some(q) => {
-                !inner.iter().any(|i| i.eq_ignore_ascii_case(q)) && outer_bind.answers_to(q)
-            }
-            None => false,
-        },
-        _ => false,
-    })
-}
-
 fn split_correlation(
     toks: &[Tok],
     table: &str,
@@ -64830,14 +67343,21 @@ fn split_correlation(
             let b_in = in_tbl(b)
                 || (qual_of(b).is_none()
                     && columns.iter().any(|c| c.name.eq_ignore_ascii_case(&bn)));
-            let a_out =
-                !in_tbl(a) && outer_cols.iter().any(|c| c.name.eq_ignore_ascii_case(&an));
-            let b_out =
-                !in_tbl(b) && outer_cols.iter().any(|c| c.name.eq_ignore_ascii_case(&bn));
-            // exactly the original rule: one side resolves in the INNER
-            // table and not the outer, and the other side is then the
-            // outer reference
-            let pair = match (a_in && !a_out, b_in && !b_out) {
+            // INNERMOST-FIRST: a bare name the inner relation has is the
+            // inner relation's, whatever the outer has (measured: `EXISTS
+            // (SELECT 1 FROM D WHERE D.ID = ID)` binds ID to D and is true
+            // for every outer row - it is NOT a correlation). Only a bare
+            // name the inner lacks reaches the outer scope.
+            let a_out = !a_in
+                && !in_tbl(a)
+                && outer_cols.iter().any(|c| c.name.eq_ignore_ascii_case(&an));
+            let b_out = !b_in
+                && !in_tbl(b)
+                && outer_cols.iter().any(|c| c.name.eq_ignore_ascii_case(&bn));
+            // one side resolves in the INNER table, and the other side is
+            // then an OUTER reference (a bare name only when the inner
+            // lacks it)
+            let pair = match (a_in && b_out, b_in && a_out) {
                 (true, false) => Some((an.clone(), bn.clone())),
                 (false, true) => Some((bn.clone(), an.clone())),
                 _ => None,
@@ -64995,8 +67515,10 @@ fn eval_subquery_corr_planned(
         split_correlation(&toks, table, alias, &columns, outer_cols, outer_bind)?;
     // the inner name/alias qualifiers come off the residual, as they do
     // in the relation path - the split needed them, the resolver does not
+    // (an alias is exclusive: the base name then belongs to an outer
+    // scope and stays)
     let inner_names: Vec<&str> = match alias {
-        Some(a) => vec![table, a],
+        Some(a) => vec![a],
         None => vec![table],
     };
     let residual = residual.map(|toks| {
@@ -65027,7 +67549,9 @@ fn eval_subquery_corr_planned(
                 return None;
             }
             let mut sink: Vec<Option<Descriptor>> = Vec::new();
-            Some(resolve_predicate(raw, &columns, &descs, &mut sink)?)
+            // the invariant pass first - a raise declines the fold (the
+            // Lookup fold's law; same review)
+            Some(resolve_predicate(raw, &columns, &descs, &mut sink)?.bind(&[]).ok()?)
         }
     };
     let rows = branch_rows_res(&inner_plan, db, &[]).ok()?;
@@ -65153,9 +67677,12 @@ fn eval_subquery_rel(
     // split above NEEDED those qualifiers to tell the two sides apart;
     // now that it is done they only get in the resolver's way, so they
     // come off. (An inner alias made every such subquery refuse, which
-    // is how most people write one.)
+    // is how most people write one.) AN ALIAS IS EXCLUSIVE: with `FROM T
+    // x` the base name T is an OUTER scope's, so it is NOT stripped -
+    // stripping it read `x.ID < T.ID` as `ID < ID` and folded a self-
+    // correlation to NULL for every row (measured)
     let inner_names: Vec<&str> = match from.alias {
-        Some(a) => vec![table, a],
+        Some(a) => vec![a],
         None => vec![table],
     };
     // The 3-PART spelling of the inner table, legal only while the FROM
@@ -65235,7 +67762,9 @@ fn eval_subquery_rel(
                 return None;
             }
             let mut sink: Vec<Option<Descriptor>> = Vec::new();
-            Some(resolve_predicate(raw, &columns, &descs, &mut sink)?)
+            // the invariant pass first - a raise declines the fold (the
+            // Lookup fold's law; same review)
+            Some(resolve_predicate(raw, &columns, &descs, &mut sink)?.bind(&[]).ok()?)
         }
     };
 
@@ -65379,6 +67908,15 @@ fn eval_subquery_rel(
             values.push(v.get(fid).cloned().unwrap_or(Value::Null));
         }
     });
+    // a row the filter cannot judge (a divide by zero, a literal that
+    // does not convert) is the engine's error at execute: this reading
+    // declines rather than answer the rows before it, and the per-row
+    // path raises it - the existence-only walk above already did
+    // (review-caught: `IN (SELECT TID FROM E WHERE E.V / 0 > 1)` and the
+    // semi-join over the same WHERE answered no rows)
+    if ferr {
+        return None;
+    }
     Some(SubqRows { values, any, outer: corr_outer })
 }
 
@@ -65442,6 +67980,9 @@ fn resolve_subqueries(
     db_opt: &Option<Database>,
     outer_cols: &[RelationColumn],
     outer_bind: &ColBinding<'_>,
+    // the outer row's descriptors, by field id: what a per-row subquery
+    // substitutes an outer reference's value as ([Expr::CorrSub])
+    outer_descs: &[Descriptor],
     // Whether a semi-join HERE is one the engine would HASH. It is, in
     // an ordinary statement - but NOT inside a VIEW BODY, where
     // `SET PLANONLY ON` shows two plain plans and no hash, so the
@@ -65449,6 +67990,23 @@ fn resolve_subqueries(
     // refused a view the engine answers.
     keys: bool,
 ) -> Option<Vec<Tok>> {
+    // THE ENCLOSING SCOPE, for the scanner that decides whether a
+    // subquery names the outer row at all ([corr_scan]): the outer
+    // relation under its binding key, its columns and their descriptors
+    let scope = CorrScope::single(
+        outer_bind.key,
+        outer_bind.qual.as_ref().map(|(s, _)| s.as_str()),
+        outer_bind.qual.as_ref().map(|(_, t)| *t),
+        outer_cols,
+        outer_descs,
+    );
+    // a per-row subquery's three-valued verdict, compared as a BOOLEAN so
+    // an enclosing NOT still reads it three-valued
+    let push_corr_bool = |out: &mut Vec<Tok>, id: usize| {
+        out.push(Tok::FnExpr(RawExpr::Subq(id)));
+        out.push(Tok::Cmp(Cmp::Eq));
+        out.push(Tok::FnExpr(RawExpr::Bool(true)));
+    };
     // a set of values becomes the body of an IN list; `key` marks the
     // text ones as HASH KEYS (see [conjunctive_position])
     let list_tokens = |vals: &[Value], key: bool| -> Option<Vec<Tok>> {
@@ -65500,8 +68058,35 @@ fn resolve_subqueries(
                 if negated {
                     out.pop();
                 }
-                // try the correlated (semi-join) reading first
-                match eval_subquery(sql, db, db_opt, Some(outer_cols), Some(outer_bind), true) {
+                // does it name the outer row at all? ([corr_scan] - the
+                // scope test that decides fold vs per-row)
+                let scan = corr_scan(sql, &scope, db, db_opt);
+                if scan.is_none() && corr_hard_refused() {
+                    return None; // the engine's -104: never folded
+                }
+                let correlated = scan.as_ref().is_some_and(|s| !s.refs.is_empty());
+                // a HEAD-LIMITED inner and a LONE AGGREGATE are answered
+                // per row - neither reading below honours the limit, and
+                // the aggregate's one row is the result of a run
+                // ([corr_exists_per_row])
+                let per_row = corr_exists_per_row(sql, scan.is_some());
+                // AN INNER THAT DOES NOT PLAN IS NEVER FOLDED: neither
+                // reading below may answer a constant or a membership
+                // list over it ([corr_inner_plans]; the per-row route
+                // plans it at registration)
+                if let Some(sc) = scan.as_ref().filter(|_| !per_row) {
+                    if !corr_inner_plans(sc, db_opt) {
+                        return None;
+                    }
+                }
+                // try the correlated (semi-join) reading first: an EQUALITY
+                // correlation folds to a membership test
+                let semi = if !per_row && (correlated || scan.is_none()) {
+                    eval_subquery(sql, db, db_opt, Some(outer_cols), Some(outer_bind), true)
+                } else {
+                    None
+                };
+                match semi {
                     Some(rows) => {
                         // the outer column the correlation named: recover
                         // it from the inner WHERE the same way
@@ -65563,17 +68148,26 @@ fn resolve_subqueries(
                     None => {
                         // ...but only if it really is uncorrelated. A
                         // subquery that names the outer scope through a
-                        // correlation this server cannot express must
-                        // REFUSE: evaluating it as uncorrelated pushes ONE
-                        // verdict for every row, which turned the
+                        // correlation the semi-join cannot express is
+                        // evaluated PER ROW ([Expr::CorrSub]) - never as
+                        // one verdict for every row, which turned the
                         // anti-join idiom into "every row" and the
-                        // running-count idiom into zero
-                        // ([subquery_names_outer]).
-                        if subquery_names_outer(sql, outer_bind) {
-                            return None;
+                        // running-count idiom into zero (measured).
+                        let folded = if !correlated && !per_row {
+                            eval_subquery(sql, db, db_opt, None, Some(outer_bind), true)
+                        } else {
+                            None
+                        };
+                        match folded {
+                            Some(rows) => out.push(Tok::Const(rows.any != negated)),
+                            None => {
+                                let scan = scan?; // unscannable: refuse
+                                let id = corr_register(
+                                    sql, scan, CorrKindRaw::Exists { negated }, &scope, db_opt,
+                                )?;
+                                push_corr_bool(&mut out, id);
+                            }
                         }
-                        let rows = eval_subquery(sql, db, db_opt, None, Some(outer_bind), true)?;
-                        out.push(Tok::Const(rows.any != negated));
                     }
                 }
                 i += 2;
@@ -65609,11 +68203,8 @@ fn resolve_subqueries(
                 let Some(Tok::Subq(n)) = toks.get(i + 2).cloned() else {
                     return None;
                 };
-                // the LHS is already in `out`; only a single column
-                // reference is taken, as the IN path does
-                let Some(Tok::Ident(lhs)) = out.last().cloned() else {
-                    return None;
-                };
+                // the LHS is already in `out`
+                let lhs_tok = out.last().cloned()?;
                 // A NOT can govern from further away than the previous
                 // token - `NOT (V = ANY (…))` puts a paren in between -
                 // and UNKNOWN only differs from FALSE under one. So the
@@ -65622,7 +68213,36 @@ fn resolve_subqueries(
                 // enclosing NOT, an enclosing OR) counts as governed.
                 let plain = conjunctive_position(toks, i);
                 let negated = matches!(out.get(out.len().wrapping_sub(2)), Some(Tok::Not));
-                let rows = eval_subquery(subs.get(n)?, db, db_opt, None, Some(outer_bind), false)?;
+                let sql = subs.get(n)?;
+                let scan = corr_scan(sql, &scope, db, db_opt);
+                if scan.is_none() && corr_hard_refused() {
+                    return None; // the engine's -104: never folded
+                }
+                let correlated = scan.as_ref().is_some_and(|s| !s.refs.is_empty());
+                // an UNCORRELATED set over a plain column folds as below;
+                // anything else - a correlated set, an expression side, a
+                // set the fold declines - is compared PER ROW
+                let folded = match (&lhs_tok, correlated) {
+                    (Tok::Ident(_), false) => {
+                        eval_subquery(sql, db, db_opt, None, Some(outer_bind), false)
+                    }
+                    _ => None,
+                };
+                let Some(rows) = folded else {
+                    let scan = scan?;
+                    let lhs = tok_lhs_raw(&lhs_tok)?;
+                    out.pop();
+                    if negated {
+                        out.pop();
+                    }
+                    let id = corr_register(
+                        sql, scan, CorrKindRaw::Quant { lhs, op: *op, all, negated }, &scope, db_opt,
+                    )?;
+                    push_corr_bool(&mut out, id);
+                    i += 3;
+                    continue;
+                };
+                let Tok::Ident(lhs) = lhs_tok else { return None };
                 let has_null = rows.values.iter().any(|v| matches!(v, Value::Null));
                 let vals: Vec<Value> = rows
                     .values
@@ -65682,7 +68302,34 @@ fn resolve_subqueries(
                     i += 1;
                     continue;
                 };
-                let rows = eval_subquery(subs.get(*n)?, db, db_opt, None, Some(outer_bind), false)?;
+                let sql = subs.get(*n)?;
+                let scan = corr_scan(sql, &scope, db, db_opt);
+                if scan.is_none() && corr_hard_refused() {
+                    return None; // the engine's -104: never folded
+                }
+                let correlated = scan.as_ref().is_some_and(|s| !s.refs.is_empty());
+                let folded = if !correlated {
+                    eval_subquery(sql, db, db_opt, None, Some(outer_bind), false)
+                } else {
+                    None
+                };
+                let Some(rows) = folded else {
+                    // a CORRELATED set (or one the fold declines) is a
+                    // membership test PER ROW: the LHS and its NOT come
+                    // off and the three-valued verdict stands in
+                    let scan = scan?;
+                    let negated = matches!(out.last(), Some(Tok::Not));
+                    if negated {
+                        out.pop();
+                    }
+                    let lhs = tok_lhs_raw(&out.pop()?)?;
+                    let id = corr_register(
+                        sql, scan, CorrKindRaw::In { lhs, negated }, &scope, db_opt,
+                    )?;
+                    push_corr_bool(&mut out, id);
+                    i += 2;
+                    continue;
+                };
                 if rows.values.is_empty() {
                     // `x IN (nothing)` is FALSE, `x NOT IN (nothing)`
                     // TRUE - and the column reference must go too
@@ -65715,12 +68362,29 @@ fn resolve_subqueries(
                     i += 1;
                     continue;
                 };
-                let rows = eval_subquery(subs.get(*n)?, db, db_opt, None, Some(outer_bind), false)?;
-                // more than one row is a runtime error in the engine;
-                // refuse rather than pick one
-                if rows.values.len() != 1 {
-                    return None;
+                let sql = subs.get(*n)?;
+                let scan = corr_scan(sql, &scope, db, db_opt);
+                if scan.is_none() && corr_hard_refused() {
+                    return None; // the engine's -104: never folded
                 }
+                let correlated = scan.as_ref().is_some_and(|s| !s.refs.is_empty());
+                let folded = if !correlated {
+                    eval_subquery(sql, db, db_opt, None, Some(outer_bind), false)
+                } else {
+                    None
+                };
+                // ONE row folds to its literal. A CORRELATED scalar - or
+                // one that answers no row / more than one - is evaluated
+                // per row instead: no row is NULL there, and more than
+                // one is the engine's 21000 when that row is reached
+                let Some(rows) = folded.filter(|r| r.values.len() == 1) else {
+                    let scan = scan?;
+                    let id = corr_register(sql, scan, CorrKindRaw::Scalar, &scope, db_opt)?;
+                    out.push(Tok::Cmp(*op));
+                    out.push(Tok::FnExpr(RawExpr::Subq(id)));
+                    i += 2;
+                    continue;
+                };
                 out.push(Tok::Cmp(*op));
                 // a SCALAR subquery is a singleton stream, never a hash
                 // key: `A = (SELECT T FROM J2)` answers where the same
@@ -65728,8 +68392,15 @@ fn resolve_subqueries(
                 out.push(value_to_tok(&rows.values[0], false)?);
                 i += 2;
             }
-            // a subquery anywhere else (bare, or as an LHS) is unsupported
-            Tok::Subq(_) => return None,
+            // a subquery anywhere else (bare, or as an LHS) is a scalar
+            // evaluated per row
+            Tok::Subq(n) => {
+                let sql = subs.get(*n)?;
+                let scan = corr_scan(sql, &scope, db, db_opt)?;
+                let id = corr_register(sql, scan, CorrKindRaw::Scalar, &scope, db_opt)?;
+                out.push(Tok::FnExpr(RawExpr::Subq(id)));
+                i += 1;
+            }
             other => {
                 out.push(other.clone());
                 i += 1;
@@ -65737,6 +68408,21 @@ fn resolve_subqueries(
         }
     }
     Some(out)
+}
+
+/// A comparison's left operand token as the expression it is - what a
+/// per-row `IN` / quantified subquery compares against.
+fn tok_lhs_raw(t: &Tok) -> Option<RawExpr> {
+    Some(match t {
+        Tok::Ident(c) => RawExpr::Col(c.clone()),
+        Tok::Int(n) => RawExpr::Int(*n),
+        Tok::Int128(n) => RawExpr::Int128(*n),
+        Tok::Dec(r, sc) => RawExpr::Dec(*r, *sc),
+        Tok::Str(v) | Tok::StrKey(v) => RawExpr::Str(v.clone()),
+        Tok::Null => RawExpr::Null,
+        Tok::FnExpr(e) => e.clone(),
+        _ => return None,
+    })
 }
 
 /// The OUTER column an inner query's correlation leaf names - the key a
@@ -66969,6 +69655,13 @@ fn default_expr_name(raw: &RawExpr) -> String {
         // member name even for a packaged call `PK.DBL(x)` (probed: the
         // engine names the column DBL, not PK.DBL)
         RawExpr::UserFn(n, _) => return n.rsplit('.').next().unwrap_or(n).to_string(),
+        // a subquery delegates its naming to its inner item (probed:
+        // `(SELECT MAX(X) FROM T)` is field MAX)
+        RawExpr::Subq(id) => {
+            return corr_template(*id)
+                .map(|t| t.desc.fname.clone().unwrap_or(t.desc.name))
+                .unwrap_or_else(|| "CONSTANT".to_string())
+        }
         RawExpr::CurrentDate => "CURRENT_DATE",
         RawExpr::LocalTime => "LOCALTIME",
         RawExpr::LocalTimestamp => "LOCALTIMESTAMP",
@@ -67693,7 +70386,7 @@ fn tokenize(s: &str) -> Option<Vec<Tok>> {
                     continue;
                 }
                 if sysfn_named(&upper).is_some()
-                    || matches!(upper.as_str(), "CAST" | "COALESCE" | "NULLIF" | "IIF")
+                    || matches!(upper.as_str(), "CAST" | "COALESCE" | "NULLIF" | "IIF" | "FC$CORR")
                 {
                     let mut j = i;
                     while j < b.len() && b[j].is_ascii_whitespace() {
@@ -68574,8 +71267,15 @@ fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
     // FL OR UNKNOWN` keeps the TRUE ones (probed) - spelled `NULL = TRUE`
     // so it evaluates to UNKNOWN with no new machinery (cmp_sides passes
     // a NULL side untyped; the BARE marker would refuse it).
+    // ... and so is a CAST to BOOLEAN (`WHERE CAST(S AS BOOLEAN)`,
+    // probed: the engine tests it as the boolean it is), the type gate
+    // again deciding
     if !negated
-        && matches!(lhs, RawLhs::Col(_) | RawLhs::Expr(RawExpr::Bool(_) | RawExpr::Null))
+        && matches!(
+            lhs,
+            RawLhs::Col(_)
+                | RawLhs::Expr(RawExpr::Bool(_) | RawExpr::Null | RawExpr::Cast(_, CastTarget::Bool))
+        )
         && matches!(t.get(*pos), None | Some(Tok::And | Tok::Or | Tok::RParen))
     {
         if matches!(lhs, RawLhs::Expr(RawExpr::Null)) {
@@ -71142,9 +73842,12 @@ fn merge_subst(
     src_cols: &[String],
     row: &[Value],
     tgt_alias: &str,
+    // the target TABLE, which the per-row statement names unaliased
+    target: &str,
     args: &[WireParam],
 ) -> Result<String, String> {
     let b = text.as_bytes();
+    let masked = mask_literals(&text.to_ascii_uppercase());
     let mut out = String::with_capacity(text.len());
     let mut i = 0usize;
     let ident_char = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$';
@@ -71214,6 +73917,23 @@ fn merge_subst(
                     }
                 }
                 let col = text[cstart..j].trim_matches('"').to_ascii_uppercase();
+                // INNERMOST-FIRST: inside a `(SELECT` span whose own FROM
+                // binds this qualifier - `FROM D` unaliased, or anything
+                // aliased AS D - `D.<col>` is that FROM item's row, never
+                // the MERGE source or target. Substituting the source row
+                // there turned `(SELECT NM FROM D WHERE D.ID = T.ID)` into
+                // `WHERE 1 = T.ID` - a 21000 where the engine writes the
+                // matching name, and `D.ID = T.ID + 1` into a silent NULL
+                // (review-caught). The text is copied verbatim; the
+                // per-row statement binds it itself.
+                if (first == src_alias || first == tgt_alias)
+                    && inside_select_span(&masked, start)
+                    && subquery_from_binds(&masked, start, &first)
+                {
+                    out.push_str(&text[start..j]);
+                    i = j;
+                    continue;
+                }
                 if first == src_alias {
                     let idx = src_cols
                         .iter()
@@ -71226,6 +73946,25 @@ fn merge_subst(
                     continue;
                 }
                 if first == tgt_alias {
+                    // INSIDE A SUBQUERY the target row keeps a qualifier
+                    // - the table's own name, which is how the per-row
+                    // UPDATE binds it. Stripped to a bare name it was
+                    // bound innermost-first to the subquery's OWN FROM:
+                    // `SET S = (SELECT NM FROM D d2 WHERE d2.ID = T.ID
+                    // AND d2.ID = 1)` wrote 'one' into EVERY row
+                    // (review-caught). An aliased target beside a
+                    // subquery whose FROM names the table unaliased has
+                    // no spelling that reaches the outer row: refused.
+                    if inside_select_span(&masked, start) {
+                        if tgt_alias != target && subquery_from_names_unaliased(&masked, start, target) {
+                            return Err(
+                                "a MERGE subquery names the target table unaliased beside a reference to the target row"
+                                    .into(),
+                            );
+                        }
+                        out.push_str(target);
+                        out.push('.');
+                    }
                     out.push_str(&text[cstart..j]);
                     i = j;
                     continue;
@@ -71297,7 +74036,7 @@ fn merge_exec(
     let mut pairs: Vec<(String, Vec<(u64, Vec<u8>, u8)>)> = Vec::new();
     let mut touched: std::collections::HashSet<u64> = std::collections::HashSet::new();
     for row in &rows {
-        let sub = |t: &str| merge_subst(t, src_alias, &src_cols, row, tgt_alias, args);
+        let sub = |t: &str| merge_subst(t, src_alias, &src_cols, row, tgt_alias, target, args);
         let on_s = sub(on)?;
         let probe = format!("DELETE FROM {} WHERE {}", target, on_s);
         let (dplan, _) = plan_delete(&probe, database)
@@ -71391,7 +74130,7 @@ fn merge_exec(
     let null_row: Vec<Value> = vec![Value::Null; src_cols.len()];
     for identity in &orphans {
         let step = (|| -> Result<(), ExecErr> {
-            let sub = |t: &str| merge_subst(t, src_alias, &src_cols, &null_row, tgt_alias, args);
+            let sub = |t: &str| merge_subst(t, src_alias, &src_cols, &null_row, tgt_alias, target, args);
             for (cond, action) in by_source {
                 let mut where_ = identity.clone();
                 if let Some(c) = cond {
@@ -71429,7 +74168,7 @@ fn merge_exec(
     }
     for (row, (on_s, targets)) in rows.iter().zip(pairs) {
         let step = (|| -> Result<(), ExecErr> {
-            let sub = |t: &str| merge_subst(t, src_alias, &src_cols, row, tgt_alias, args);
+            let sub = |t: &str| merge_subst(t, src_alias, &src_cols, row, tgt_alias, target, args);
             if targets.is_empty() {
                 for (cond, cols, vals) in not_matched {
                     // INSERT ... SELECT <values> FROM RDB$DATABASE [WHERE <cond>]:
@@ -73776,7 +76515,7 @@ fn materialise_user_fn_rows(
     }
     let base: Vec<Vec<Value>> = {
         let db = database.as_ref().ok_or(EvalErr::Unsupported)?;
-        let filter = bind_filter(filter, args).map_err(|_| EvalErr::Unsupported)?;
+        let filter = bind_filter_eval(filter, args)?;
         let src = RowSource::scan_filter_sort(*rel, formats.clone(), filter, order_by.clone(), index.clone());
         src.rows(db)?
     };
@@ -76503,6 +79242,8 @@ fn expr_no_raise(e: &Expr, descs: &[Descriptor]) -> bool {
         Expr::BlobText(..) => false,
         // the fold already happened at prepare; a lookup only compares
         Expr::Lookup { key, .. } => expr_no_raise(key, descs),
+        // a per-row subquery can raise (21000, or whatever its rows raise)
+        Expr::CorrSub { .. } => false,
         Expr::Col(_)
         | Expr::GenVal(_)
         | Expr::Int(_)
@@ -77148,6 +79889,20 @@ fn resolve_having(
                 terms.push(Term::Const(b));
                 continue;
             }
+            // an aggregate compared against an EXPRESSION side - a per-row
+            // subquery over the group key, `HAVING COUNT(*) > (SELECT
+            // COUNT(*) FROM D WHERE D.ID = E.TID)` - takes the expression
+            // path below, as `SUM(N) * 2 > 10` does
+            let rt_expr;
+            let rt = if let (RawLhs::Agg(f, t), RawKind::CmpExpr(..)) = (&rt.lhs, &rt.kind) {
+                rt_expr = RawTerm {
+                    lhs: RawLhs::Expr(RawExpr::Agg(*f, Box::new(t.clone()))),
+                    kind: rt.kind.clone(),
+                };
+                rt_expr
+            } else {
+                rt
+            };
             // an EXPRESSION OVER AGGREGATES as the tested side - `HAVING
             // SUM(N) * 2 > 10`, `HAVING STDDEV_POP(N) * 2 > 3` (both
             // engine-served, measured): each aggregate folds into an
@@ -78288,6 +81043,15 @@ fn after_auth(
         if std::env::var("FC_SRV_TRACE").is_ok() { eprintln!("[srv] op-loop got op = {}", op); }
         // the image this op's expressions read blobs from (see BLOB_CTX)
         BLOB_CTX.with(|c| *c.borrow_mut() = database.as_ref().map(|d| (d.bytes(), d.page_size)));
+        // the database a per-row subquery in this op's expressions runs
+        // against, and a fresh memo epoch for it (see [SUBQ_DB]) - except
+        // for a FETCH, which continues a cursor and writes nothing: its
+        // batches keep the execution's memo and lookup tables, so a
+        // 700-row cursor rebuilds neither at the 500-row boundary
+        if op != OP_FETCH && op != OP_FETCH_SCROLL {
+            bump_exec_epoch();
+        }
+        let _subq_db = SubqDbGuard::arm(&database);
         // the PREVIOUS op's computed blobs (a LIST result) become
         // resolvable temp blobs before anything this op does can ask for
         // them, and the mint re-arms for this op (see BLOB_MINT)
@@ -79332,6 +82096,20 @@ fn after_auth(
                         let cols = cols.clone();
                         let fields = fields.clone();
                         let new_cols = new_cols.clone();
+                        // a RETURNING item that runs a subquery reads the
+                        // image the statement STARTED from (the engine's
+                        // reading, probed for UPDATE, DELETE and INSERT):
+                        // it is kept here and armed around the projection
+                        // below, which then happens at execute rather
+                        // than at fetch ([SUBQ_IMAGE])
+                        let has_corr = cols.iter().any(|c| c.expr.as_ref().is_some_and(expr_has_corr));
+                        let pre_img = if has_corr { database.as_ref().map(|d| d.bytes()) } else { None };
+                        // ...and such a statement is ALL OR NOTHING with
+                        // its RETURNING: a subquery item that raises (a
+                        // 21000) undoes the write (probed: `SET A = 999
+                        // ... RETURNING (SELECT NM FROM D)` leaves A at
+                        // 10 and counts 0 rows)
+                        let mark = has_corr.then(|| undo_window_push(&mut database, WindowKind::Nested));
                         // RETURNING waits and re-reads too - the write
                         // inside it is the same write
                         match with_conflict_wait(&mut database, |db| {
@@ -79404,13 +82182,19 @@ fn after_auth(
                                 // so the columns are re-indexed
                                 // POSITIONALLY like every other
                                 // materialised plan.
-                                let (cols, rows) = if new_cols.is_empty()
-                                    || !affected.deleted.iter().any(|d| *d)
-                                {
+                                let eager = has_corr
+                                    || (!new_cols.is_empty() && affected.deleted.iter().any(|d| *d));
+                                let (cols, rows) = if !eager {
                                     (cols, rows)
                                 } else {
                                     let del = &affected.deleted;
-                                    let projected: Result<Vec<Vec<Value>>, EvalErr> = rows
+                                    // the image guard lives for the
+                                    // projection ALONE: a write after it
+                                    // (the undo below) must take the
+                                    // published image, not the stand-in
+                                    let projected: Result<Vec<Vec<Value>>, EvalErr> = {
+                                    let _pre = pre_img.as_ref().map(|i| SubqImageGuard::arm(i.clone()));
+                                    rows
                                         .iter()
                                         .enumerate()
                                         .map(|(i, r)| {
@@ -79427,7 +82211,8 @@ fn after_auth(
                                                 })
                                                 .collect()
                                         })
-                                        .collect();
+                                        .collect()
+                                    };
                                     match projected {
                                         Ok(p) => {
                                             let pc = cols
@@ -79441,13 +82226,38 @@ fn after_auth(
                                                 .collect();
                                             (pc, p)
                                         }
+                                        // a subquery item's raise (a 21000)
+                                        // is the statement's, here and now
+                                        // - deferred to the fetch it would
+                                        // be re-evaluated over the wrong
+                                        // image
+                                        // ...and the write goes with it, the
+                                        // counts read 0, and the vector
+                                        // arrives at the FETCH (isql prints
+                                        // the vector, then `Records
+                                        // affected: 0` - probed)
+                                        Err(e) if has_corr => {
+                                            if let Some(m) = mark {
+                                                undo_window(&mut database, m);
+                                            }
+                                            last_dml = (0, 0, 0);
+                                            plan = std::rc::Rc::new(Plan::RefusedEval(e));
+                                            respond(&mut s, &mut enc, resp_tx)?;
+                                            continue;
+                                        }
                                         Err(_) => (cols, rows),
                                     }
                                 };
+                                if let Some(m) = mark {
+                                    undo_window_unwind(&mut database, m, false);
+                                }
                                 plan = std::rc::Rc::new(Plan::Rows { cols, rows });
                                 respond(&mut s, &mut enc, resp_tx)?;
                             }
                             Err(e) => {
+                                if let Some(m) = mark {
+                                    undo_window(&mut database, m);
+                                }
                                 last_dml = (0, 0, 0);
                                 match e {
                                     ExecErr::Eval(ev) => {
@@ -79482,7 +82292,13 @@ fn after_auth(
                             respond(&mut s, &mut enc, resp_tx)?;
                         }
                         Err(e) => {
-                            last_dml = (0, 0, 0);
+                            // an eval-shaped raise reports the rows the
+                            // statement touched before it ([DML_PROGRESS])
+                            last_dml = match (&e, &*plan) {
+                                (ExecErr::Eval(_), Plan::Update { .. }) => (0, dml_progress(), 0),
+                                (ExecErr::Eval(_), Plan::Delete { .. }) => (0, 0, dml_progress()),
+                                _ => (0, 0, 0),
+                            };
                             if std::env::var("FC_SRV_TRACE").is_ok() {
                                 eprintln!("[srv] dml failed: {}", e);
                             }
@@ -82212,6 +85028,12 @@ fn after_auth(
                     }
                     let ctx = SessionCtx { user, attach_id };
                     let mut affected = Affected::default();
+                    // the pre-statement image for a subquery item, as in
+                    // the op_execute arm ([SUBQ_IMAGE])
+                    let has_corr = rcols.iter().any(|c| c.expr.as_ref().is_some_and(expr_has_corr));
+                    let pre_img = if has_corr { database.as_ref().map(|d| d.bytes()) } else { None };
+                    // all or nothing with its RETURNING, as the cursor arm
+                    let mark = has_corr.then(|| undo_window_push(&mut database, WindowKind::Nested));
                     match timed("execute(returning)", || {
                         with_conflict_wait(&mut database, |db| {
                             execute_dml_collecting(&inner, db, &exec2_args, &ctx, Some(&mut affected))
@@ -82234,15 +85056,28 @@ fn after_auth(
                                 .images
                                 .first()
                                 .map(|img| decode_record(img, &affected.descs));
-                            let projected: Result<Vec<Value>, EvalErr> = match &record {
-                                None => Ok(Vec::new()),
-                                Some(r) => rcols.iter().map(|c| c.value_of(r)).collect(),
+                            let projected: Result<Vec<Value>, EvalErr> = {
+                                let _pre = pre_img.as_ref().map(|i| SubqImageGuard::arm(i.clone()));
+                                match &record {
+                                    None => Ok(Vec::new()),
+                                    Some(r) => rcols.iter().map(|c| c.value_of(r)).collect(),
+                                }
                             };
                             match projected {
                                 Err(e) => {
+                                    // the write goes with the raise
+                                    // (probed: an INSERT ... RETURNING
+                                    // whose subquery raises stores no row)
+                                    if let Some(m) = mark {
+                                        undo_window(&mut database, m);
+                                    }
+                                    last_dml = (0, 0, 0);
                                     respond_eval_error(&mut s, &mut enc, &e)?;
                                 }
                                 Ok(mut values) => {
+                                    if let Some(m) = mark {
+                                        undo_window_unwind(&mut database, m, false);
+                                    }
                                     // the client-declared output capacity,
                                     // enforced on the singleton exactly as
                                     // a fetched row is - the raise moves
@@ -82316,6 +85151,9 @@ fn after_auth(
                             }
                         }
                         Err(e) => {
+                            if let Some(m) = mark {
+                                undo_window(&mut database, m);
+                            }
                             last_dml = (0, 0, 0);
                             if std::env::var("FC_SRV_TRACE").is_ok() {
                                 eprintln!("[srv] op_execute2 returning failed: {:?}", e);
@@ -84431,6 +87269,8 @@ mod tests {
             absent: Value::Int(0),
             ty: ExprType::Int,
             scale: 0,
+            bytes: 8,
+            lazy: None,
         };
         let max = Expr::Lookup {
             key: Box::new(Expr::Col(0)),
@@ -84438,6 +87278,8 @@ mod tests {
             absent: Value::Null,
             ty: ExprType::Int,
             scale: 0,
+            bytes: 8,
+            lazy: None,
         };
         assert_eq!(count.eval(&[Value::Int(1)]).unwrap(), Value::Int(2));
         assert_eq!(max.eval(&[Value::Int(1)]).unwrap(), Value::Int(200));
@@ -94030,5 +96872,644 @@ mod tests {
                 .unwrap(),
             "(SELECT MAX(x.VAL) FROM VR x WHERE x.K < T.ID)"
         );
+    }
+
+    // ----- correlated subqueries: the scope scanner, the literal
+    // substitution, the DML alias rewrite -----------------------------------
+
+    fn corr_look<'a>(tables: &'a [(&'a str, &'a [&'a str])]) -> impl Fn(&TableRef<'_>) -> Option<ScopeRel> + 'a {
+        move |tr| {
+            let (_, cols) = tables.iter().find(|(n, _)| n.eq_ignore_ascii_case(tr.table))?;
+            Some(ScopeRel {
+                key: tr.alias.unwrap_or(tr.table).to_string(),
+                relation: Some(tr.table.to_ascii_uppercase()),
+                schema: None,
+                cols: cols.iter().map(|c| (c.to_string(), Some(int_desc()))).collect(),
+                qual_only: false,
+            })
+        }
+    }
+    fn int_desc() -> Descriptor {
+        Descriptor { dtype: dtype::LONG, scale: 0, length: 4, sub_type: 0, flags: 0, offset: 0 }
+    }
+    fn corr_outer(key: &str, cols: &[&str]) -> CorrScope {
+        CorrScope {
+            rels: vec![ScopeRel {
+                key: key.to_string(),
+                relation: Some(key.to_string()),
+                schema: None,
+                cols: cols.iter().map(|c| (c.to_string(), Some(int_desc()))).collect(),
+                qual_only: false,
+            }],
+        }
+    }
+    const CORR_TABLES: &[(&str, &[&str])] = &[
+        ("T", &["ID", "A", "S"]),
+        ("D", &["ID", "NM", "A"]),
+        ("E", &["ID", "TID", "V"]),
+        ("F", &["TID", "V"]),
+    ];
+
+    #[test]
+    fn corr_scan_binds_innermost_first_and_alias_exclusively() {
+        let look = corr_look(CORR_TABLES);
+        let t = corr_outer("T", &["ID", "A", "S"]);
+        // a bare name the inner relation has is the inner relation's
+        let sc = corr_scan_with("SELECT 1 FROM D WHERE D.ID = ID", &t, &look).unwrap();
+        assert!(sc.refs.is_empty());
+        assert_eq!(sc.text, "SELECT 1 FROM D WHERE D.ID = ID");
+        // ...even when the outer has it too (E has an ID of its own)
+        let sc = corr_scan_with("SELECT SUM(V) FROM E WHERE E.TID = ID", &t, &look).unwrap();
+        assert!(sc.refs.is_empty());
+        // a bare name the inner lacks reaches the outer scope
+        let sc = corr_scan_with("SELECT SUM(V) FROM F WHERE F.TID = ID", &t, &look).unwrap();
+        assert_eq!(sc.refs.len(), 1);
+        assert_eq!(sc.refs[0].col, "ID");
+        assert_eq!(sc.text, "SELECT SUM(V) FROM F WHERE F.TID = FC$OUT0");
+        // AN ALIAS IS EXCLUSIVE: after `FROM T x` the base name is the outer's
+        let sc = corr_scan_with("SELECT MAX(x.A) FROM T x WHERE x.ID < T.ID", &t, &look).unwrap();
+        assert_eq!(sc.text, "SELECT MAX(x.A) FROM T x WHERE x.ID < FC$OUT0");
+        // the same reference twice is ONE marker; two columns are two
+        let sc = corr_scan_with(
+            "SELECT 1 FROM D WHERE D.ID = T.ID AND D.A > T.A OR D.ID = T.ID",
+            &t,
+            &look,
+        )
+        .unwrap();
+        assert_eq!(sc.refs.len(), 2);
+        assert_eq!(sc.text, "SELECT 1 FROM D WHERE D.ID = FC$OUT0 AND D.A > FC$OUT1 OR D.ID = FC$OUT0");
+        // a qualifier no scope binds is left alone (after `FROM T AS Q`
+        // the name T is nobody's; the inner planner then refuses it)
+        let q = corr_outer("Q", &["C"]);
+        let sc = corr_scan_with("SELECT 1 FROM D WHERE D.ID = T.ID", &q, &look).unwrap();
+        assert!(sc.refs.is_empty());
+        assert_eq!(sc.text, "SELECT 1 FROM D WHERE D.ID = T.ID");
+        // a column the outer relation lacks is the engine's -206: None
+        assert!(corr_scan_with("SELECT 1 FROM D WHERE D.ID = T.NOPE", &t, &look).is_none());
+        // a relation the catalog lacks cannot be scanned
+        assert!(corr_scan_with("SELECT 1 FROM NOPE WHERE NOPE.ID = T.ID", &t, &look).is_none());
+    }
+
+    #[test]
+    fn corr_scan_nested_spans_shadow_by_level() {
+        let look = corr_look(CORR_TABLES);
+        let t = corr_outer("T", &["ID", "A", "S"]);
+        // two levels: the middle scope's reference is the middle scope's
+        // business; only the outermost scope's reference becomes a marker
+        let sc = corr_scan_with(
+            "SELECT (SELECT MAX(V) FROM E WHERE E.TID = D.ID) FROM D WHERE D.ID = T.ID",
+            &t,
+            &look,
+        )
+        .unwrap();
+        assert_eq!(sc.refs.len(), 1);
+        assert_eq!(sc.text, "SELECT (SELECT MAX(V) FROM E WHERE E.TID = D.ID) FROM D WHERE D.ID = FC$OUT0");
+        // a bare name the middle level has stays there (A is D's); one
+        // only the outer has reaches it from two levels down (S is T's)
+        let sc = corr_scan_with(
+            "SELECT 1 FROM D WHERE EXISTS (SELECT 1 FROM E WHERE E.V = A AND E.TID = S)",
+            &t,
+            &look,
+        )
+        .unwrap();
+        assert_eq!(sc.refs.len(), 1);
+        assert_eq!(sc.refs[0].col, "S");
+        assert_eq!(sc.text, "SELECT 1 FROM D WHERE EXISTS (SELECT 1 FROM E WHERE E.V = A AND E.TID = FC$OUT0)");
+        // a span's own select-list alias is its own name, never a reference
+        let sc = corr_scan_with("SELECT E.V S FROM E WHERE E.TID = T.ID", &t, &look).unwrap();
+        assert_eq!(sc.refs.len(), 1);
+        assert_eq!(sc.refs[0].col, "ID");
+        assert_eq!(sc.text, "SELECT E.V S FROM E WHERE E.TID = FC$OUT0");
+        // a derived table in a nested FROM is a closed scope: copied whole
+        let look2 = corr_look(CORR_TABLES);
+        let sc = corr_scan_with(
+            "SELECT 1 FROM (SELECT ID FROM D WHERE D.A > 1) q WHERE q.ID = T.ID",
+            &t,
+            &|tr| {
+                if tr.table.starts_with('(') {
+                    Some(ScopeRel {
+                        key: "q".into(),
+                        relation: None,
+                        schema: None,
+                        cols: vec![("ID".into(), None)],
+                        qual_only: false,
+                    })
+                } else {
+                    look2(tr)
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(sc.text, "SELECT 1 FROM (SELECT ID FROM D WHERE D.A > 1) q WHERE q.ID = FC$OUT0");
+    }
+
+    #[test]
+    fn corr_scan_skips_literals_functions_and_matches_quoted_names_exactly() {
+        let look = corr_look(CORR_TABLES);
+        let t = corr_outer("T", &["ID", "A", "S"]);
+        // a string literal is text, whatever it spells
+        let sc = corr_scan_with(
+            "SELECT 1 FROM D WHERE D.NM = 'T.ID x'' S' AND \"D\".NM = T.S",
+            &t,
+            &look,
+        )
+        .unwrap();
+        assert_eq!(sc.refs.len(), 1);
+        assert_eq!(sc.refs[0].col, "S");
+        assert_eq!(sc.text, "SELECT 1 FROM D WHERE D.NM = 'T.ID x'' S' AND \"D\".NM = FC$OUT0");
+        // a quoted lower-case name does not match an upper-case catalog name
+        assert!(corr_scan_with("SELECT 1 FROM D WHERE D.ID = T.\"id\"", &t, &look).is_none());
+        let sc = corr_scan_with("SELECT 1 FROM D WHERE D.ID = \"T\".\"ID\"", &t, &look).unwrap();
+        assert_eq!(sc.text, "SELECT 1 FROM D WHERE D.ID = FC$OUT0");
+        // a function name is never a column; its arguments are scanned
+        let sc = corr_scan_with(
+            "SELECT COUNT(*) FROM D WHERE UPPER(D.NM) = UPPER(T.S) AND D.A > T.A - 50",
+            &t,
+            &look,
+        )
+        .unwrap();
+        assert_eq!(sc.refs.len(), 2);
+        assert_eq!(sc.text, "SELECT COUNT(*) FROM D WHERE UPPER(D.NM) = UPPER(FC$OUT0) AND D.A > FC$OUT1 - 50");
+        // a CAST's type name and a keyword are not columns
+        let sc = corr_scan_with(
+            "SELECT 1 FROM D WHERE CAST(D.A AS INTEGER) BETWEEN T.A AND 5 AND D.NM IS NOT NULL",
+            &t,
+            &look,
+        )
+        .unwrap();
+        assert_eq!(sc.text, "SELECT 1 FROM D WHERE CAST(D.A AS INTEGER) BETWEEN FC$OUT0 AND 5 AND D.NM IS NOT NULL");
+    }
+
+    #[test]
+    fn corr_markers_substitute_and_literals_type_a_null() {
+        let out = subst_out_markers("a FC$OUT0 b FC$OUT10 c FC$OUT1", &|i| Some(format!("<{}>", i))).unwrap();
+        assert_eq!(out, "a <0> b <10> c <1>");
+        assert!(subst_out_markers("a FC$OUTx", &|_| Some(String::new())).is_none());
+        let d = int_desc();
+        assert_eq!(corr_literal(&Value::Null, &d).unwrap(), "CAST(NULL AS INTEGER)");
+        assert_eq!(corr_literal(&Value::Int(-7), &d).unwrap(), "-7");
+        // a UTF8 VARCHAR(10) stores 42 bytes: the stand-in is typed in characters
+        let td = Descriptor { dtype: dtype::VARYING, scale: 0, length: 42, sub_type: 4, flags: 0, offset: 0 };
+        // a TEXT value travels as its column's BYTES in its column's SET
+        // and width - never as a bare literal of the attachment's set
+        assert_eq!(
+            corr_literal(&Value::Text("it's".into()), &td).unwrap(),
+            "CAST(x'69742773' AS VARCHAR(10) CHARACTER SET UTF8)"
+        );
+        assert_eq!(corr_literal(&Value::Text(String::new()), &td).unwrap(), "CAST('' AS VARCHAR(10) CHARACTER SET UTF8)");
+        // a WIN1252 column's 'é' is ITS one byte, and a CHAR keeps CHAR
+        let wd = Descriptor { dtype: dtype::TEXT, scale: 0, length: 5, sub_type: 53, flags: 0, offset: 0 };
+        assert_eq!(
+            corr_literal(&Value::Text("caf\u{e9} ".into()), &wd).unwrap(),
+            "CAST(x'636166E920' AS CHAR(5) CHARACTER SET WIN1252)"
+        );
+        // CHARACTER SET NONE is spelled, and a NONE value keeps its byte
+        let nd = Descriptor { dtype: dtype::TEXT, scale: 0, length: 5, sub_type: 0, flags: 0, offset: 0 };
+        assert_eq!(corr_literal(&Value::Null, &nd).unwrap(), "CAST(NULL AS CHAR(5) CHARACTER SET NONE)");
+        assert_eq!(corr_literal(&Value::Text("\u{e9}".into()), &nd).unwrap(), "CAST(x'E9' AS CHAR(5) CHARACTER SET NONE)");
+        assert_eq!(corr_literal(&Value::Null, &td).unwrap(), "CAST(NULL AS VARCHAR(10) CHARACTER SET UTF8)");
+        assert_eq!(corr_literal(&Value::Scaled(1250, -2), &d).unwrap(), "12.50");
+        assert_eq!(corr_literal(&Value::Bool(true), &d).unwrap(), "TRUE");
+        // a scaled INT128 has no bare spelling: a typed CAST, decided at
+        // registration so it never fails mid-fetch
+        let nd38 = Descriptor { dtype: dtype::INT128, scale: -4, length: 16, sub_type: 1, flags: 0, offset: 0 };
+        assert_eq!(corr_literal(&Value::Int128(-1, -4), &nd38).unwrap(), "CAST('-0.0001' AS NUMERIC(38,4))");
+        assert!(corr_literal_form_ok(&nd38));
+        let dfd = Descriptor { dtype: dtype::DEC128, scale: 0, length: 16, sub_type: 0, flags: 0, offset: 0 };
+        assert!(corr_literal_form_ok(&dfd));
+        assert_eq!(
+            corr_literal(&Value::DecFloat34(0), &dfd).unwrap(),
+            format!("CAST('{}' AS DECFLOAT(34))", Value::DecFloat34(0).render())
+        );
+        let tzd = Descriptor { dtype: dtype::SQL_TIME_TZ, scale: 0, length: 8, sub_type: 0, flags: 0, offset: 0 };
+        assert_eq!(corr_literal(&Value::Null, &tzd).unwrap(), "NULL");
+    }
+
+    #[test]
+    fn cast_to_boolean_reads_the_words_and_raises_on_the_rest() {
+        // probed: `' true '` and a tab-led `true` are TRUE, `'FaLsE'`
+        // FALSE; `'yes'`, `' yes '`, `''`, `1`, `1.5`, a DATE are the
+        // 22018 whose argument is the source's own (untrimmed) text
+        let columns = vec![
+            RelationColumn { name: "ID".into(), field_id: 0, position: 0 },
+            RelationColumn { name: "S".into(), field_id: 1, position: 1 },
+            RelationColumn { name: "B".into(), field_id: 2, position: 2 },
+        ];
+        let descs = vec![
+            Descriptor { dtype: dtype::LONG, scale: 0, length: 4, sub_type: 0, flags: 0, offset: 4 },
+            Descriptor { dtype: dtype::VARYING, scale: 0, length: 22, sub_type: 4, flags: 0, offset: 8 },
+            Descriptor { dtype: dtype::BOOLEAN, scale: 0, length: 1, sub_type: 0, flags: 0, offset: 30 },
+        ];
+        let row = vec![Value::Int(1), Value::Text("\ttrue ".into()), Value::Bool(false)];
+        let ev = |s: &str| -> Result<Value, EvalErr> {
+            let raw = parse_raw_expr(s).unwrap();
+            resolve_expr(&raw, &columns, &descs).unwrap().eval(&row)
+        };
+        assert!(matches!(ev("CAST('true' AS BOOLEAN)"), Ok(Value::Bool(true))));
+        assert!(matches!(ev("CAST(' FaLsE ' AS BOOLEAN)"), Ok(Value::Bool(false))));
+        assert!(matches!(ev("CAST(S AS BOOLEAN)"), Ok(Value::Bool(true))));
+        assert!(matches!(ev("CAST(B AS BOOLEAN)"), Ok(Value::Bool(false))));
+        assert!(matches!(ev("CAST(TRUE AS BOOLEAN)"), Ok(Value::Bool(true))));
+        assert!(matches!(ev("CAST(NULL AS BOOLEAN)"), Ok(Value::Null)));
+        let conv = |r: Result<Value, EvalErr>, want: &str| {
+            matches!(r, Err(EvalErr::ConversionError(Some(ref s))) if s == want)
+        };
+        assert!(conv(ev("CAST('yes' AS BOOLEAN)"), "yes"));
+        assert!(conv(ev("CAST(' yes ' AS BOOLEAN)"), " yes "));
+        assert!(conv(ev("CAST('' AS BOOLEAN)"), ""));
+        assert!(conv(ev("CAST(1 AS BOOLEAN)"), "1"));
+        assert!(conv(ev("CAST(ID AS BOOLEAN)"), "1"));
+        // the target parses, describes as the one-byte boolean slot and
+        // types as a boolean - which is what lets it stand in for a
+        // BOOLEAN outer column and be a bare WHERE condition
+        let b: Vec<char> = "BOOLEAN".chars().collect();
+        assert_eq!(parse_cast_target(&b, &mut 0), Some(CastTarget::Bool));
+        let d = cast_target_descriptor(&CastTarget::Bool).unwrap();
+        assert_eq!((d.dtype, d.length), (dtype::BOOLEAN, 1));
+        let raw = parse_raw_expr("CAST(S AS BOOLEAN)").unwrap();
+        let e = resolve_expr(&raw, &columns, &descs).unwrap();
+        assert!(matches!(e.type_of(&descs), Some(ExprType::Bool)));
+        let c = build_expr_col(&raw, "X", &columns, &descs).unwrap();
+        assert_eq!((c.sql_type & !1, c.length), (32764, 1));
+        // a bare CAST to BOOLEAN is a condition, and it raises per row
+        let cond = |s: &str| -> Predicate {
+            let toks = tokenize(s).unwrap();
+            let raw = parse_predicate(&toks, &mut 0).unwrap();
+            resolve_predicate(raw, &columns, &descs, &mut Vec::new()).unwrap()
+        };
+        assert!(cond("CAST(S AS BOOLEAN)").matches(&row).unwrap());
+        assert!(!cond("CAST(S AS BOOLEAN) AND ID = 2").matches(&row).unwrap());
+        assert!(matches!(
+            cond("CAST(S AS BOOLEAN)").matches(&[Value::Int(1), Value::Text("x".into()), Value::Null]),
+            Err(EvalErr::ConversionError(Some(ref s))) if s == "x"
+        ));
+    }
+
+    #[test]
+    fn corr_stand_in_probe_skips_a_type_the_cast_grammar_cannot_read() {
+        // the plan probe stands an outer column in for by `CAST(NULL AS
+        // <type>)`; a type this server's CAST cannot read back must skip
+        // the probe (the reading before the probe), never refuse
+        let d = |dt: u8, len: u16, scale: i8, st: i16| Descriptor { dtype: dt, scale, length: len, sub_type: st, flags: 0, offset: 0 };
+        for ok in [
+            d(dtype::BOOLEAN, 1, 0, 0),
+            d(dtype::LONG, 4, 0, 0),
+            d(dtype::INT128, 16, -4, 1),
+            d(dtype::DEC64, 8, 0, 0),
+            d(dtype::TEXT, 5, 0, 0),
+            d(dtype::VARYING, 22, 0, 4),
+            d(dtype::REAL, 4, 0, 0),
+            d(dtype::SQL_DATE, 4, 0, 0),
+            d(dtype::VARYING, 7, 0, 1),
+        ] {
+            assert!(corr_standin_spellable(&ok), "{}", desc_type_sql_cs(&ok));
+        }
+        for bad in [d(dtype::SQL_TIME_TZ, 8, 0, 0), d(dtype::TIMESTAMP_TZ, 12, 0, 0)] {
+            assert!(!corr_standin_spellable(&bad), "{}", desc_type_sql_cs(&bad));
+        }
+        let look = corr_look(CORR_TABLES);
+        let t = corr_outer("T", &["ID", "A", "S"]);
+        let mut sc = corr_scan_with("SELECT 1 FROM F WHERE F.TID = T.ID", &t, &look).unwrap();
+        assert_eq!(sc.refs.len(), 1);
+        // an INTEGER stand-in is probed - and with no database in hand
+        // the probe cannot plan, so it answers false ...
+        sc.refs[0].desc = Some(d(dtype::LONG, 4, 0, 0));
+        assert_eq!(corr_standin_text(&sc).unwrap(), "SELECT 1 FROM F WHERE F.TID = CAST(NULL AS INTEGER)");
+        assert!(!corr_inner_plans(&sc, &None));
+        // ... where an unspellable one is not probed at all
+        sc.refs[0].desc = Some(d(dtype::SQL_TIME_TZ, 8, 0, 0));
+        assert!(corr_inner_plans(&sc, &None));
+        // a BOOLEAN stand-in now spells and is probed like any other
+        sc.refs[0].desc = Some(d(dtype::BOOLEAN, 1, 0, 0));
+        assert_eq!(corr_standin_text(&sc).unwrap(), "SELECT 1 FROM F WHERE F.TID = CAST(NULL AS BOOLEAN)");
+        assert!(!corr_inner_plans(&sc, &None));
+    }
+
+    #[test]
+    fn an_invariant_raise_is_the_cursor_s_and_a_row_source_keeps_its_vector() {
+        // the engine raises an invariant conjunct's error from the
+        // cursor (first fetch), never from op_execute; a row-source path
+        // (a per-row inner, a derived table) keeps the vector where the
+        // generic refusal would have lost the 22012
+        let columns = vec![RelationColumn { name: "ID".into(), field_id: 0, position: 0 }];
+        let descs = vec![Descriptor { dtype: dtype::LONG, scale: 0, length: 4, sub_type: 0, flags: 0, offset: 4 }];
+        let resolve = |s: &str| -> Option<Predicate> {
+            let toks = tokenize(s)?;
+            let raw = parse_predicate(&toks, &mut 0)?;
+            resolve_predicate(raw, &columns, &descs, &mut Vec::new())
+        };
+        let raising = Some(resolve("ID = 99 AND 1 / 0 = 1").unwrap());
+        assert!(matches!(bind_filter(&raising, &[]), Err(ExecErr::Eval(EvalErr::DivideByZero))));
+        assert!(matches!(bind_filter_eval(&raising, &[]), Err(EvalErr::DivideByZero)));
+        // a bind failure that is a REFUSAL stays one on the row-source path
+        let mut np: Vec<Option<Descriptor>> = Vec::new();
+        let toks = tokenize("ID = ?").unwrap();
+        let raw = parse_predicate(&toks, &mut 0).unwrap();
+        let param = Some(resolve_predicate(raw, &columns, &descs, &mut np).unwrap());
+        assert!(matches!(bind_filter(&param, &[WireParam::Bool(true)]), Err(ExecErr::Text(_))));
+        assert!(matches!(bind_filter_eval(&param, &[WireParam::Bool(true)]), Err(EvalErr::Unsupported)));
+        // op_execute's validation lets the eval-shaped raise through to
+        // the fetch and still reports the refusal
+        let project = |filter: Option<Predicate>| Plan::Project {
+            rel: 0,
+            formats: Vec::new(),
+            cols: Vec::new(),
+            filter,
+            order_by: Vec::new(),
+            gen_cols: Vec::new(),
+            index: None,
+            defer: None,
+            windows: Vec::new(),
+            win_base: 0,
+        };
+        assert!(validate_select_bind(&project(raising.clone()), &[]).is_ok());
+        assert!(matches!(
+            validate_select_bind(&project(param.clone()), &[WireParam::Bool(true)]),
+            Err(ExecErr::Text(_))
+        ));
+        // the count a raising DML reports: the rows it got through
+        dml_progress_set(0);
+        dml_progress_set(2);
+        assert_eq!(dml_progress(), 2);
+        dml_progress_set(0);
+        assert_eq!(dml_progress(), 0);
+    }
+
+    #[test]
+    fn corr_stand_ins_spell_every_column_type_exactly() {
+        let d = |dt: u8, len: u16, scale: i8, st: i16| Descriptor { dtype: dt, scale, length: len, sub_type: st, flags: 0, offset: 0 };
+        assert_eq!(desc_type_sql_cs(&d(dtype::REAL, 4, 0, 0)), "FLOAT");
+        assert_eq!(desc_type_sql_cs(&d(dtype::DEC64, 8, 0, 0)), "DECFLOAT(16)");
+        assert_eq!(desc_type_sql_cs(&d(dtype::DEC128, 16, 0, 0)), "DECFLOAT(34)");
+        assert_eq!(desc_type_sql_cs(&d(dtype::SQL_TIME_TZ, 8, 0, 0)), "TIME WITH TIME ZONE");
+        assert_eq!(desc_type_sql_cs(&d(dtype::TIMESTAMP_TZ, 12, 0, 0)), "TIMESTAMP WITH TIME ZONE");
+        assert_eq!(desc_type_sql_cs(&d(dtype::INT128, 16, 0, 0)), "NUMERIC(38)");
+        assert_eq!(desc_type_sql_cs(&d(dtype::INT128, 16, -4, 1)), "NUMERIC(38,4)");
+        assert_eq!(desc_type_sql_cs(&d(dtype::TEXT, 5, 0, 0)), "CHAR(5) CHARACTER SET NONE");
+        assert_eq!(desc_type_sql_cs(&d(dtype::VARYING, 22, 0, 4)), "VARCHAR(5) CHARACTER SET UTF8");
+    }
+
+    #[test]
+    fn merge_subst_leaves_a_qualifier_the_subquery_s_own_from_binds() {
+        let src = ["ID".to_string(), "NM".to_string()];
+        let row = [Value::Int(1), Value::Text("one".into())];
+        let sub = |t: &str| merge_subst(t, "D", &src, &row, "T", "T", &[]).unwrap();
+        // the source row, outside any subquery (where the target's own
+        // reference is the per-row statement's bare column)
+        assert_eq!(sub("D.ID = T.ID"), "1 = ID");
+        // inside a span whose FROM names D unaliased, `D.` is THAT D
+        // (innermost-first) - the source row must not be written there
+        assert_eq!(sub("S = (SELECT NM FROM D WHERE D.ID = T.ID)"), "S = (SELECT NM FROM D WHERE D.ID = T.ID)");
+        assert_eq!(sub("S = (SELECT NM FROM D WHERE D.ID = T.ID + 1)"), "S = (SELECT NM FROM D WHERE D.ID = T.ID + 1)");
+        assert_eq!(sub("S = (SELECT NM FROM D WHERE D.ID = 2)"), "S = (SELECT NM FROM D WHERE D.ID = 2)");
+        // ...or one that aliases another relation AS D
+        assert_eq!(sub("A = (SELECT COUNT(*) FROM E D WHERE D.TID = 1)"), "A = (SELECT COUNT(*) FROM E D WHERE D.TID = 1)");
+        // a span that binds D under ANOTHER alias leaves `D.` to the source
+        assert_eq!(sub("S = (SELECT NM FROM D x WHERE x.ID = D.ID)"), "S = (SELECT NM FROM D x WHERE x.ID = 1)");
+        // an aliased target: `TG.ID` inside a span becomes the table's own
+        // qualifier - unless the span binds TG itself
+        let subt = |t: &str| merge_subst(t, "D", &src, &row, "TG", "T", &[]).unwrap();
+        assert_eq!(subt("S = (SELECT NM FROM D x WHERE x.ID = TG.ID)"), "S = (SELECT NM FROM D x WHERE x.ID = T.ID)");
+        assert_eq!(subt("A = (SELECT COUNT(*) FROM E TG WHERE TG.TID = D.ID)"), "A = (SELECT COUNT(*) FROM E TG WHERE TG.TID = 1)");
+        // the target named unaliased beside an aliased target reference
+        // still refuses (no spelling reaches the outer row)
+        assert!(merge_subst("S = (SELECT S FROM T WHERE T.ID = TG.ID)", "D", &src, &row, "TG", "T", &[]).is_err());
+    }
+
+    #[test]
+    fn corr_exists_laws_for_a_limited_head_and_a_lone_aggregate() {
+        assert!(corr_head_limited("SELECT FIRST 0 1 FROM E WHERE E.TID = T.ID"));
+        assert!(corr_head_limited("  select skip 1 1 FROM E"));
+        assert!(corr_head_limited("SELECT 1 FROM E ROWS 2 TO 3"));
+        assert!(corr_head_limited("SELECT 1 FROM E ORDER BY V OFFSET 1 ROW FETCH FIRST 1 ROW ONLY"));
+        assert!(!corr_head_limited("SELECT 1 FROM E WHERE E.TID = T.ID"));
+        assert!(!corr_head_limited("SELECT 1 FROM E WHERE E.NM = 'ROWS'"));
+        assert!(!corr_head_limited("SELECT 1 FROM E WHERE E.V IN (SELECT FIRST 1 V FROM E)"));
+        assert!(corr_lone_aggregate("SELECT MAX(V) FROM E WHERE E.TID = T.ID"));
+        assert!(corr_lone_aggregate("SELECT COUNT(*) FROM E WHERE E.TID = 99"));
+        assert!(corr_lone_aggregate("SELECT CAST(MAX(V) AS INTEGER) FROM E"));
+        assert!(corr_lone_aggregate("select sum(v) + 1 from E"));
+        assert!(!corr_lone_aggregate("SELECT V FROM E GROUP BY V"));
+        assert!(!corr_lone_aggregate("SELECT 1 FROM E WHERE E.TID = T.ID HAVING COUNT(*) > 1"));
+        assert!(!corr_lone_aggregate("SELECT (SELECT MAX(V) FROM E) FROM E WHERE E.TID = T.ID"));
+        assert!(!corr_lone_aggregate("SELECT COUNT(*) OVER () FROM E"));
+        assert!(!corr_lone_aggregate("SELECT 1 FROM E WHERE E.TID = T.ID"));
+        assert!(!corr_lone_aggregate("SELECT MAX(V) FROM E UNION ALL SELECT 1 FROM E WHERE 1 = 0"));
+    }
+
+    #[test]
+    fn corr_exists_over_a_lone_aggregate_runs_per_row_over_a_planned_inner() {
+        // the law: a limited head and a scanned lone aggregate run per
+        // row; an aggregate the scanner could not read is left to the
+        // readings that follow, and a plain inner folds
+        assert!(corr_exists_per_row("SELECT FIRST 0 1 FROM E WHERE E.TID = T.ID", true));
+        assert!(corr_exists_per_row("SELECT SKIP 1 1 FROM E", false));
+        assert!(corr_exists_per_row("SELECT MAX(V) FROM E WHERE E.TID = T.ID", true));
+        assert!(corr_exists_per_row("SELECT COUNT(*) FROM E WHERE E.TID = 99", true));
+        assert!(!corr_exists_per_row("SELECT MAX(V) FROM E WHERE E.TID = T.ID", false));
+        assert!(!corr_exists_per_row("SELECT 1 FROM E WHERE E.TID = T.ID", true));
+        assert!(!corr_exists_per_row("SELECT V FROM E WHERE E.TID = T.ID GROUP BY V", true));
+        // what the per-row path plans at prepare: the outer reference
+        // stood in for by a typed NULL, so an unknown inner column or an
+        // unbound qualifier is the planner's refusal, never a fold
+        let look = corr_look(CORR_TABLES);
+        let t = corr_outer("T", &["ID", "A", "S"]);
+        let sc = corr_scan_with("SELECT MAX(V) FROM F WHERE F.TID = T.ID", &t, &look).unwrap();
+        assert_eq!(sc.text, "SELECT MAX(V) FROM F WHERE F.TID = FC$OUT0");
+        assert_eq!(
+            corr_standin_text(&sc).unwrap(),
+            "SELECT MAX(V) FROM F WHERE F.TID = CAST(NULL AS INTEGER)"
+        );
+        // no outer reference: the text itself is what plans
+        let sc = corr_scan_with("SELECT COUNT(*) FROM E WHERE E.TID = 99", &t, &look).unwrap();
+        assert!(sc.refs.is_empty());
+        assert_eq!(corr_standin_text(&sc).unwrap(), "SELECT COUNT(*) FROM E WHERE E.TID = 99");
+    }
+
+    #[test]
+    fn lookup_keys_compare_text_as_the_predicate_does() {
+        assert!(lookup_key_eq(&Value::Text("ab".into()), &Value::Text("ab ".into())));
+        assert!(lookup_key_eq(&Value::Text("x  ".into()), &Value::Text("x".into())));
+        assert!(!lookup_key_eq(&Value::Text("ab".into()), &Value::Text(" ab".into())));
+        assert!(!lookup_key_eq(&Value::Text("ab".into()), &Value::Text("abc".into())));
+        assert!(lookup_key_eq(&Value::Int(7), &Value::Int(7)));
+        assert!(!lookup_key_eq(&Value::Int(7), &Value::Int(8)));
+    }
+
+    #[test]
+    fn text_number_reads_the_int128_minimum() {
+        let min = "-170141183460469231731687303715884105728";
+        assert!(matches!(text_number(min), Some(TextNum::Dec { mantissa: i128::MIN, exp: 0 })));
+        assert_eq!(text_to_exact(text_number(min).unwrap(), dtype::INT128, 0), Some(i128::MIN));
+        assert!(text_number("-170141183460469231731687303715884105729").is_none());
+        assert!(text_number("170141183460469231731687303715884105728").is_none());
+        assert!(matches!(text_number("170141183460469231731687303715884105727"), Some(TextNum::Dec { mantissa: i128::MAX, exp: 0 })));
+        assert_eq!(decimal_parts(min), Some((i128::MIN, 0)));
+        assert_eq!(decimal_parts("-170141183460469231731687303715884105729"), None);
+        // the literal a correlated INT128 outer value travels as reads back
+        let d = Descriptor { dtype: dtype::INT128, scale: 0, length: 16, sub_type: 0, flags: 0, offset: 0 };
+        assert_eq!(corr_literal(&Value::Int128(i128::MIN, 0), &d).unwrap(), format!("CAST('{}' AS NUMERIC(38))", min));
+    }
+
+    #[test]
+    fn corr_exists_stops_at_the_first_row_and_the_memo_is_bounded() {
+        assert_eq!(corr_inject_first("SELECT 1 FROM E WHERE E.TID = FC$OUT0", 1), "SELECT FIRST 1 1 FROM E WHERE E.TID = FC$OUT0");
+        assert_eq!(corr_inject_first("  select DISTINCT V FROM E", 2), "  SELECT FIRST 2 DISTINCT V FROM E");
+        // a FIRST of its own is kept; anything but a SELECT head is left alone
+        assert_eq!(corr_inject_first("SELECT FIRST 5 V FROM E", 1), "SELECT FIRST 5 V FROM E");
+        // an aggregate answers one row anyway (and plans without a FIRST here)
+        assert_eq!(corr_inject_first("SELECT MAX(V) FROM E WHERE E.TID = FC$OUT0", 2), "SELECT MAX(V) FROM E WHERE E.TID = FC$OUT0");
+        assert_eq!(corr_inject_first("SELECT COUNT(*) FROM E", 1), "SELECT COUNT(*) FROM E");
+        assert_eq!(corr_inject_first("SELECT V FROM E GROUP BY V", 2), "SELECT V FROM E GROUP BY V");
+        assert_eq!(corr_inject_first("SELECT V FROM E UNION SELECT V FROM F", 1), "SELECT V FROM E UNION SELECT V FROM F");
+        assert_eq!(corr_inject_first("WITH q AS (SELECT 1 FROM E) SELECT 1 FROM q", 1), "WITH q AS (SELECT 1 FROM E) SELECT 1 FROM q");
+        // the memo clears itself on overflow rather than growing
+        let mut c = CorrCache::default();
+        for i in 0..(CORR_MEMO_MAX_ENTRIES + 5) {
+            c.insert(vec![i.to_string()], std::sync::Arc::new(vec![Value::Int(i as i64)]));
+        }
+        assert!(c.rows.len() <= CORR_MEMO_MAX_ENTRIES);
+        assert!(c.rows.len() >= 5);
+        let mut c = CorrCache::default();
+        let big: Vec<Value> = (0..100_000).map(Value::Int).collect();
+        c.insert(vec!["a".into()], std::sync::Arc::new(big.clone()));
+        c.insert(vec!["b".into()], std::sync::Arc::new(big.clone()));
+        // 3.2 MB each: the second insert cleared the first
+        assert_eq!(c.rows.len(), 1);
+        assert!(c.bytes <= CORR_MEMO_MAX_BYTES);
+        // the op-end sweep empties every live memo
+        let shared = corr_cache_new();
+        shared.lock().unwrap().insert(vec!["k".into()], std::sync::Arc::new(vec![Value::Int(1)]));
+        clear_corr_caches();
+        assert!(shared.lock().unwrap().rows.is_empty());
+    }
+
+    #[test]
+    fn corr_returning_scope_binds_new_and_old_inside_a_lifted_span() {
+        let look = corr_look(CORR_TABLES);
+        // the RETURNING row: the target's columns and the before-image's
+        // synthetic OLD$ ones, with `NEW` a qualified-only second name
+        let mut t = corr_outer("T", &["ID", "A", "S", "OLD$ID", "OLD$A", "OLD$S"]);
+        let mut new_rel = t.rels[0].clone();
+        new_rel.key = "NEW".to_string();
+        new_rel.qual_only = true;
+        t.rels.push(new_rel);
+        // `NEW.ID` is the outer row (measured: E.TID = NEW.ID counts 2,
+        // exactly as T.ID does), never the inner E's ID
+        let sc = corr_scan_with("SELECT COUNT(*) FROM E WHERE E.TID = NEW.ID", &t, &look).unwrap();
+        assert_eq!(sc.refs.len(), 1);
+        assert_eq!(sc.refs[0].col, "ID");
+        assert_eq!(sc.text, "SELECT COUNT(*) FROM E WHERE E.TID = FC$OUT0");
+        // the rewritten OLD reference is the before-image's own column
+        let sc = corr_scan_with(&rewrite_old_refs("SELECT COUNT(*) FROM E WHERE E.V < OLD.A"), &t, &look).unwrap();
+        assert_eq!(sc.refs[0].col, "OLD$A");
+        // a bare name only the outer has is NOT ambiguous through the
+        // qualified-only NEW relation (F has no S)
+        let sc = corr_scan_with("SELECT COUNT(*) FROM F WHERE F.V = S", &t, &look).unwrap();
+        assert_eq!(sc.refs[0].col, "S");
+        assert_eq!(sc.refs[0].rel, 0);
+    }
+
+    #[test]
+    fn corr_scan_refuses_what_the_engine_rejects_with_104() {
+        let look = corr_look(CORR_TABLES);
+        let t = corr_outer("T", &["ID", "A", "S"]);
+        // an outer reference as an aggregate's WHOLE argument
+        assert!(corr_scan_with("SELECT SUM(T.A) FROM D", &t, &look).is_none());
+        assert!(corr_scan_with("SELECT COUNT(DISTINCT T.A) FROM D", &t, &look).is_none());
+        assert!(corr_scan_with("SELECT MAX(T.A) FROM D WHERE D.ID > 0", &t, &look).is_none());
+        // ...but an expression around it, or one beside the aggregate, answers
+        let sc = corr_scan_with("SELECT SUM(D.A + T.A) FROM D", &t, &look).unwrap();
+        assert_eq!(sc.text, "SELECT SUM(D.A + FC$OUT0) FROM D");
+        let sc = corr_scan_with("SELECT SUM(D.A) + T.A FROM D", &t, &look).unwrap();
+        assert_eq!(sc.text, "SELECT SUM(D.A) + FC$OUT0 FROM D");
+        let sc = corr_scan_with("SELECT COUNT(*) FROM D WHERE D.A > T.A", &t, &look).unwrap();
+        assert_eq!(sc.text, "SELECT COUNT(*) FROM D WHERE D.A > FC$OUT0");
+        // an outer reference as an inner GROUP BY key
+        assert!(corr_scan_with("SELECT COUNT(*) FROM D GROUP BY T.ID", &t, &look).is_none());
+        let sc = corr_scan_with("SELECT COUNT(*) FROM D GROUP BY D.NM HAVING D.NM > T.S", &t, &look).unwrap();
+        assert_eq!(sc.text, "SELECT COUNT(*) FROM D GROUP BY D.NM HAVING D.NM > FC$OUT0");
+    }
+
+    #[test]
+    fn a_subquery_value_keeps_its_column_width_through_a_conditional() {
+        // COALESCE((SELECT MAX(V) ...), 0) over an INTEGER is LONG len 4
+        // on the engine: the subquery's describe carries the width
+        let pc = ProjCol {
+            name: "MAX".into(),
+            fname: None,
+            relation: None,
+            rel_alias: None,
+            field_id: 0,
+            wire: Wire::Int32,
+            sql_type: nullable(496),
+            length: 4,
+            oct_length: 4,
+            scale: 0,
+            sub_type: 0,
+            expr: None,
+        };
+        let sub = Expr::CorrSub {
+            text: "SELECT MAX(V) FROM E WHERE E.TID = FC$OUT0".into(),
+            outer: vec![(0, Expr::Col(0), int_desc())],
+            kind: Box::new(CorrKind::Scalar),
+            ty: ExprType::Int,
+            scale: 0,
+            rank: Some(NumRank::Long),
+            desc: Some(Box::new(pc)),
+            cache: corr_cache_new(),
+        };
+        let descs = vec![int_desc()];
+        assert_eq!(result_width_bytes(&sub, &descs), 4);
+        assert_eq!(result_width_bytes(&Expr::Coalesce(vec![sub.clone(), Expr::Int(0)]), &descs), 4);
+        assert_eq!(result_width_bytes(&Expr::NullIf(Box::new(sub.clone()), Box::new(Expr::Int(0))), &descs), 4);
+        assert_eq!(result_width_bytes(&Expr::Neg(Box::new(sub)), &descs), 4);
+        let lk = Expr::Lookup {
+            key: Box::new(Expr::Col(0)),
+            pairs: vec![],
+            absent: Value::Null,
+            ty: ExprType::Int,
+            scale: 0,
+            bytes: 4,
+            lazy: None,
+        };
+        assert_eq!(result_width_bytes(&Expr::Coalesce(vec![lk, Expr::Int(-1)]), &descs), 4);
+    }
+
+    #[test]
+    fn dml_alias_strip_keeps_the_outer_reference_inside_a_subquery() {
+        let squash = |s: Option<String>| s.map(|t| t.split_whitespace().collect::<Vec<_>>().join(" "));
+        // inside a subquery the alias becomes the TARGET's name (the
+        // outer row); outside it comes off
+        assert_eq!(
+            squash(strip_dml_alias(
+                "UPDATE T t SET S = (SELECT NM FROM D WHERE D.ID = t.ID) WHERE t.ID = 1 RETURNING t.ID, t.S",
+                false
+            )),
+            Some("UPDATE T SET S = (SELECT NM FROM D WHERE D.ID = T.ID) WHERE ID = 1 RETURNING ID, S".to_string())
+        );
+        // a bare alias word in a RELATION position is a nested FROM's
+        // relation, not the alias
+        assert_eq!(
+            squash(strip_dml_alias(
+                "DELETE FROM T t WHERE t.A < (SELECT MAX(x.A) FROM T x WHERE x.ID <> t.ID) RETURNING t.ID",
+                false
+            )),
+            Some("DELETE FROM T WHERE A < (SELECT MAX(x.A) FROM T x WHERE x.ID <> T.ID) RETURNING ID".to_string())
+        );
+        // a subquery whose own FROM names the target UNALIASED cannot
+        // tell the rewritten qualifier from its own: refuse
+        assert!(strip_dml_alias("DELETE FROM T t WHERE EXISTS (SELECT 1 FROM T WHERE T.ID = t.ID)", false).is_none());
+        // the base name after AS Q is no binding (the engine's -206):
+        // the statement keeps its alias and refuses
+        assert!(strip_dml_alias("DELETE FROM T AS Q WHERE C IN (SELECT C FROM U WHERE U.C = T.C)", false).is_none());
+        // ...unless the subquery's own FROM names T (then T.C is the inner's)
+        assert_eq!(
+            squash(strip_dml_alias("DELETE FROM T AS Q WHERE C IN (SELECT C FROM T WHERE T.C = 1)", false)),
+            Some("DELETE FROM T WHERE C IN (SELECT C FROM T WHERE T.C = 1)".to_string())
+        );
+        // a bare alias anywhere else still refuses (a nested `FROM O t`
+        // declares the same alias for another table)
+        assert!(strip_dml_alias("UPDATE T t SET A = 1 WHERE EXISTS (SELECT 1 FROM O t WHERE t.X = 1)", false).is_none());
     }
 }
