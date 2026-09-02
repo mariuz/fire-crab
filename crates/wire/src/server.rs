@@ -1755,11 +1755,18 @@ fn ddl_relation_target(plan: &Plan) -> Option<&str> {
 }
 
 fn ddl_dup_codes(plan: &Plan) -> Option<(i32, i32, String)> {
+    // RELATIONS carry a CANONICAL name by now ([canon_ident] at the
+    // planner): print it as stored, or `CREATE TABLE "tq"` beside TQ
+    // reported `"PUBLIC"."TQ" already exists` where the engine reports
+    // `"PUBLIC"."tq"`. The other kinds here are OUT of this slice
+    // (their planners keep the raw spelling and their ods writers fold
+    // it), so their vector still folds - and matches what was stored.
+    let qc = |n: &str| format!("\"PUBLIC\".\"{}\"", n.trim_end());
     let q = |n: &str| format!("\"PUBLIC\".\"{}\"", n.trim().trim_matches('"').to_ascii_uppercase());
     match plan {
-        Plan::CreateTable { name, .. } => Some((336397286, 336068740, q(name))),
+        Plan::CreateTable { name, .. } => Some((336397286, 336068740, qc(name))),
         Plan::CreateException { name, .. } => Some((336397280, 336068861, q(name))),
-        Plan::CreateView { name, .. } => Some((336397298, 336068740, q(name))), // CREATE VIEW @1 failed / Table @1 already exists
+        Plan::CreateView { name, .. } => Some((336397298, 336068740, qc(name))), // CREATE VIEW @1 failed / Table @1 already exists
         Plan::CreateFunction { name, .. } => Some((336397260, 336068876, q(name))), // CREATE FUNCTION @1 failed / Function @1 already exists
         Plan::CreateSequence { name, .. } => Some((336397285, 336068862, q(name))),
         Plan::CreateProcedure { name, .. } => Some((336397265, 336068743, q(name))),
@@ -2036,7 +2043,11 @@ fn respond_ddl_meta(
             // ALTER VIEW of a missing name: "unsuccessful metadata update /
             // ALTER VIEW @1 failed / view @1 not found" (probed - no nested
             // -607, three items).
-            let qn = format!("\"PUBLIC\".\"{}\"", name.trim().trim_matches('"').to_ascii_uppercase());
+            // the CANONICAL name, printed as stored: `ALTER VIEW "nope"`
+            // is `"PUBLIC"."nope"` on the engine, not `"PUBLIC"."NOPE"`
+            // (a bare `Nope` folded to NOPE back at the parse boundary,
+            // which is where the engine folds it too)
+            let qn = format!("\"PUBLIC\".\"{}\"", name.trim_end());
             let mut w = W::default();
             w.int(OP_RESPONSE).int(0).int(0).int(0).int(0);
             w.int(1).int(GDS_NO_META_UPDATE)
@@ -2051,7 +2062,7 @@ fn respond_ddl_meta(
         if let Plan::DropView { name } = plan {
             // DROP VIEW of a missing name (or of a TABLE - probed): the
             // same nested -607 as DROP TABLE, with the view verbs
-            let qn = format!("\"PUBLIC\".\"{}\"", name.trim().trim_matches('"').to_ascii_uppercase());
+            let qn = format!("\"PUBLIC\".\"{}\"", name.trim_end()); // canonical, as stored
             let mut w = W::default();
             w.int(OP_RESPONSE).int(0).int(0).int(0).int(0);
             w.int(1).int(GDS_NO_META_UPDATE)
@@ -2066,10 +2077,7 @@ fn respond_ddl_meta(
             return Ok(true);
         }
         if let Plan::DropTable { name } = plan {
-            let qn = format!(
-                "\"PUBLIC\".\"{}\"",
-                name.trim().trim_matches('"').to_ascii_uppercase()
-            );
+            let qn = format!("\"PUBLIC\".\"{}\"", name.trim_end()); // canonical, as stored
             let mut w = W::default();
             w.int(OP_RESPONSE).int(0).int(0).int(0).int(0);
             w.int(1)
@@ -12269,6 +12277,7 @@ fn not_null_fids(db: &Database, table: &str) -> Vec<usize> {
 }
 
 fn not_null_fids_uncached(db: &Database, table: &str) -> Vec<usize> {
+    let want_rel = rel_row_name(db, table);
     use fire_crab_ods::format::Value;
     let Some(formats) =
         fire_crab_ods::sysfmt::system_relation_formats(&db.bytes(), db.page_size, "RDB$RELATION_FIELDS")
@@ -12300,7 +12309,7 @@ fn not_null_fids_uncached(db: &Database, table: &str) -> Vec<usize> {
     let mut by_source: Vec<(usize, String)> = Vec::new();
     let fmts = vec![(0u8, descs.clone())];
     for_each_record(db, 5, &fmts, usize::MAX, |values| {
-        let is_rel = matches!(values.get(rel_fid), Some(Value::Text(t)) if t.trim_end().eq_ignore_ascii_case(table));
+        let is_rel = matches!(values.get(rel_fid), Some(Value::Text(t)) if t.trim_end() == want_rel);
         if !is_rel {
             return;
         }
@@ -12362,6 +12371,7 @@ fn identity_columns(db: &Database, table: &str) -> Vec<(usize, String, i64)> {
 }
 
 fn identity_columns_uncached(db: &Database, table: &str) -> Vec<(usize, String, i64)> {
+    let want_rel = rel_row_name(db, table);
     use fire_crab_ods::format::Value;
     let Some(formats) =
         fire_crab_ods::sysfmt::system_relation_formats(&db.bytes(), db.page_size, "RDB$RELATION_FIELDS")
@@ -12388,7 +12398,7 @@ fn identity_columns_uncached(db: &Database, table: &str) -> Vec<(usize, String, 
     let mut out = Vec::new();
     let fmts = vec![(0u8, descs.clone())];
     for_each_record(db, 5, &fmts, usize::MAX, |values| {
-        let is_rel = matches!(values.get(rel_fid), Some(Value::Text(t)) if t.trim_end().eq_ignore_ascii_case(table));
+        let is_rel = matches!(values.get(rel_fid), Some(Value::Text(t)) if t.trim_end() == want_rel);
         if !is_rel {
             return;
         }
@@ -12426,6 +12436,7 @@ fn computed_sources_uncached(
     db: &Database,
     table: &str,
 ) -> std::collections::HashMap<usize, String> {
+    let want_rel = rel_row_name(db, table);
     use fire_crab_ods::format::Value;
     let mut out = std::collections::HashMap::new();
     let Some(rf_formats) = fire_crab_ods::sysfmt::system_relation_formats(
@@ -12451,7 +12462,7 @@ fn computed_sources_uncached(
     let mut members: Vec<(usize, String)> = Vec::new();
     let fmts = vec![(0u8, rf_descs.clone())];
     for_each_record(db, 5, &fmts, usize::MAX, |values| {
-        let is_rel = matches!(values.get(rel_f), Some(Value::Text(t)) if t.trim_end().eq_ignore_ascii_case(table));
+        let is_rel = matches!(values.get(rel_f), Some(Value::Text(t)) if t.trim_end() == want_rel);
         if !is_rel {
             return;
         }
@@ -12549,7 +12560,7 @@ fn fk_trigger_parent_cols(db: &Database, table: &str, trigs: &[String]) -> Optio
             return;
         }
         let Some(Value::Text(on)) = values.get(on_f) else { return };
-        if !on.trim_end().eq_ignore_ascii_case(table) {
+        if on.trim_end() != table {
             return;
         }
         if let Some(Value::Text(f)) = values.get(fld_f) {
@@ -12736,6 +12747,7 @@ fn table_defaults(
     columns: &[RelationColumn],
     descs: &[Descriptor],
 ) -> Option<Vec<(usize, Option<DefaultVal>)>> {
+    let want_rel = rel_row_name(db, table);
     let rf_formats = fire_crab_ods::sysfmt::system_relation_formats(
         &db.bytes(),
         db.page_size,
@@ -12754,14 +12766,14 @@ fn table_defaults(
     // (fid, column default blob, domain source name)
     let mut omitted: Vec<(usize, Option<(u16, u64)>, String)> = Vec::new();
     for_each_record(db, 5, &rf_fmts, usize::MAX, |values| {
-        let is_rel = matches!(values.get(rel_f), Some(Value::Text(t)) if t.trim_end().eq_ignore_ascii_case(table));
+        let is_rel = matches!(values.get(rel_f), Some(Value::Text(t)) if t.trim_end() == want_rel);
         if !is_rel {
             return;
         }
         let Some(Value::Text(cname)) = values.get(name_f) else { return };
         let Some(rc) = columns
             .iter()
-            .find(|c| c.name.eq_ignore_ascii_case(cname.trim_end()))
+            .find(|c| c.name == cname.trim_end())
         else {
             return;
         };
@@ -12939,7 +12951,7 @@ fn fk_partners_uncached(
     let segs_of = |name: &str| -> Vec<String> {
         let mut s: Vec<(i64, String)> = segrows
             .iter()
-            .filter(|(ix, _, _)| ix.eq_ignore_ascii_case(name))
+            .filter(|(ix, _, _)| ix == name)
             .map(|(_, p, c)| (*p, c.clone()))
             .collect();
         s.sort_by_key(|(p, _)| *p);
@@ -12948,7 +12960,7 @@ fn fk_partners_uncached(
     let my_fid = |n: &String| {
         columns
             .iter()
-            .find(|c| c.name.eq_ignore_ascii_case(n))
+            .find(|c| c.name == *n)
             .map(|c| c.field_id as usize)
     };
     let other_side = |name: &str, key_cols: &[String]| -> Option<FkPartner> {
@@ -12959,7 +12971,7 @@ fn fk_partners_uncached(
             .map(|c| {
                 ocols
                     .iter()
-                    .find(|rc| rc.name.eq_ignore_ascii_case(c))
+                    .find(|rc| rc.name == *c)
                     .map(|rc| rc.field_id as usize)
             })
             .collect::<Option<_>>()?;
@@ -12978,12 +12990,12 @@ fn fk_partners_uncached(
     for (ix, rn, fkp) in &rows {
         let Some(pname) = fkp else { continue };
         // the partner (unique, parent-side) index row must resolve
-        let (p_ix, p_rn, _) = rows.iter().find(|(n, _, _)| n.eq_ignore_ascii_case(pname))?;
+        let (p_ix, p_rn, _) = rows.iter().find(|(n, _, _)| n == pname)?;
         // the CHILD's constraint name (RDB$RELATION_CONSTRAINTS by the
         // FK index) - the engine names it in both refusal directions;
         // the index's own name stands in if no constraint row exists
         let cname = constraint_for_index(db, ix).unwrap_or_else(|| ix.clone());
-        if rn.eq_ignore_ascii_case(table) {
+        if rn == table {
             // `table` is the child: its FK columns reference p_rn
             let my_cols = segs_of(ix);
             let my_fids: Vec<usize> = my_cols.iter().map(my_fid).collect::<Option<_>>()?;
@@ -12997,7 +13009,7 @@ fn fk_partners_uncached(
             p.child_table = rn.clone();
             as_child.push(p);
         }
-        if p_rn.eq_ignore_ascii_case(table) {
+        if p_rn == table {
             // `table` is the parent: rows of rn reference its key. The
             // key text prints the PARENT's own columns, but constraint
             // and table stay the CHILD's (probed - P11b).
@@ -14219,6 +14231,7 @@ const DB_TRIG_TX_COMMIT: i64 = 8195;
 const DB_TRIG_TX_ROLLBACK: i64 = 8196;
 
 fn user_triggers(db: &Database, table: &str, dml: &DmlGuard) -> Option<Vec<TrigDef>> {
+    let want_rel = rel_row_name(db, table);
     use fire_crab_ods::format::Value;
     // 1 INSERT, 2 UPDATE, 3 DELETE - the action slots' own numbering
     let want_action: u8 = match dml {
@@ -14249,7 +14262,7 @@ fn user_triggers(db: &Database, table: &str, dml: &DmlGuard) -> Option<Vec<TrigD
         if refuse {
             return;
         }
-        let is_rel = matches!(values.get(rel_f), Some(Value::Text(t)) if t.trim_end().eq_ignore_ascii_case(table));
+        let is_rel = matches!(values.get(rel_f), Some(Value::Text(t)) if t.trim_end() == want_rel);
         if !is_rel || !matches!(values.get(sys_f), Some(Value::Int(0))) {
             return; // another relation's, or not a USER trigger
         }
@@ -14454,7 +14467,7 @@ fn trig_body_inlineable(s: &TrigStmt, table: &str) -> bool {
         | TrigStmt::CallProc { .. } => true,
         TrigStmt::Store { table: t, .. }
         | TrigStmt::Update { table: t, .. }
-        | TrigStmt::Delete { table: t, .. } => !t.eq_ignore_ascii_case(table),
+        | TrigStmt::Delete { table: t, .. } => t != table,
         TrigStmt::ForSelect { body, .. } => trig_body_inlineable(body, table),
         TrigStmt::If { then, otherwise, .. } => {
             trig_body_inlineable(then, table)
@@ -14561,6 +14574,7 @@ fn check_predicates_uncached(
     descs: &[Descriptor],
     dml: DmlGuard,
 ) -> Option<Vec<TableCheck>> {
+    let want_rel = rel_row_name(db, table);
     use fire_crab_ods::format::Value;
     let t_formats =
         fire_crab_ods::sysfmt::system_relation_formats(&db.bytes(), db.page_size, "RDB$TRIGGERS")?;
@@ -14585,7 +14599,7 @@ fn check_predicates_uncached(
     let mut fk_update_trigs: Vec<String> = Vec::new();
     let fmts = vec![(0u8, t_descs.clone())];
     for_each_record(db, trel, &fmts, usize::MAX, |values| {
-        let is_rel = matches!(values.get(rel_f), Some(Value::Text(t)) if t.trim_end().eq_ignore_ascii_case(table));
+        let is_rel = matches!(values.get(rel_f), Some(Value::Text(t)) if t.trim_end() == want_rel);
         if !is_rel {
             return;
         }
@@ -14657,7 +14671,7 @@ fn check_predicates_uncached(
                 }
                 if set_cols
                     .iter()
-                    .any(|s| guarded.iter().any(|g| g.eq_ignore_ascii_case(s)))
+                    .any(|s| guarded.iter().any(|g| g == s))
                 {
                     return None; // would change a referenced key; the engine would cascade
                 }
@@ -14713,7 +14727,7 @@ fn check_predicates_uncached(
         }
         let constraint = cnames
             .iter()
-            .find(|(tn, _)| tn.eq_ignore_ascii_case(&trig))
+            .find(|(tn, _)| *tn == trig)
             .map(|(_, cn)| cn.clone())
             .unwrap_or_else(|| trig.clone());
         let trigger = if trig.is_empty() { None } else { Some(trig) };
@@ -14797,6 +14811,7 @@ fn domain_check_predicates_uncached(
     columns: &[RelationColumn],
     descs: &[Descriptor],
 ) -> Option<Vec<DomainCheck>> {
+    let want_rel = rel_row_name(db, table);
     use fire_crab_ods::format::Value;
     // leg 1: this table's columns -> their field sources
     let rf_formats = fire_crab_ods::sysfmt::system_relation_formats(
@@ -14815,7 +14830,7 @@ fn domain_check_predicates_uncached(
     let mut by_source: Vec<(usize, String)> = Vec::new(); // (fid, field source)
     let fmts = vec![(0u8, rf_descs.clone())];
     for_each_record(db, 5, &fmts, usize::MAX, |values| {
-        let is_rel = matches!(values.get(rel_f), Some(Value::Text(t)) if t.trim_end().eq_ignore_ascii_case(table));
+        let is_rel = matches!(values.get(rel_f), Some(Value::Text(t)) if t.trim_end() == want_rel);
         if !is_rel {
             return;
         }
@@ -15069,7 +15084,7 @@ fn constraint_for_index(db: &Database, index_name: &str) -> Option<String> {
         if found.is_some() {
             return;
         }
-        let hit = matches!(values.get(ix_f), Some(Value::Text(t)) if t.trim_end().eq_ignore_ascii_case(index_name));
+        let hit = matches!(values.get(ix_f), Some(Value::Text(t)) if t.trim_end() == index_name);
         if hit {
             if let Some(Value::Text(n)) = values.get(cn_f) {
                 found = Some(n.trim_end().to_string());
@@ -15085,7 +15100,7 @@ fn constraint_for_index(db: &Database, index_name: &str) -> Option<String> {
 /// Unquoted identifiers are stored uppercase, so the parsed name is
 /// uppercased here.
 fn quoted_bare(name: &str) -> String {
-    format!("\"{}\"", name.trim_matches('"').trim_end().to_ascii_uppercase())
+    format!("\"{}\"", engine_spelling(name))
 }
 fn quoted_qualified(name: &str) -> String {
     // A plain object/relation/routine name is ONE identifier under the
@@ -15093,7 +15108,24 @@ fn quoted_qualified(name: &str) -> String {
     // (a quoted `"A.B"`) still renders as one part '"PUBLIC"."A.B"', the
     // way the engine does. Packaged ROUTINE names, which arrive as a
     // dotted `PKG.MEMBER` spelling, use quoted_qualified_pkg instead.
-    format!("\"PUBLIC\".\"{}\"", name.trim_matches('"').trim_end().to_ascii_uppercase())
+    format!("\"PUBLIC\".\"{}\"", engine_spelling(name))
+}
+/// The catalog spelling of a name for an error vector: a CANONICAL or
+/// catalog name (the callers' usual argument) passes through EXACTLY -
+/// a lower-case `a` is the column `a`, never `A` - while a spelling
+/// that still carries its quotes is unquoted, and one that is a bare
+/// word folds, by [canon_ident]'s rule.
+fn engine_spelling(name: &str) -> String {
+    let t = name.trim_end();
+    if t.starts_with('"') {
+        return canon_ident(t).unwrap_or_else(|| t.trim_matches('"').to_string());
+    }
+    if t.bytes().any(|c| c.is_ascii_lowercase()) || !ident_ok(t) {
+        // exact: a canonical name is already the catalog's
+        t.to_string()
+    } else {
+        t.to_ascii_uppercase()
+    }
 }
 
 /// A packaged routine name rendered the engine's way, part by part:
@@ -15287,6 +15319,14 @@ fn text_line_col(hay: &str, part: &str) -> Option<(i64, i64)> {
 /// the whole text capped at 250 chars. None when a value cannot render
 /// as a literal - the engine omits the key item when print_key throws,
 /// and inventing a rendering would diverge from it.
+///
+/// The name is the CATALOG's own spelling, printed as stored between a
+/// pair of quotes and NOTHING else: `("Mixed Col" = 'm1')`, `("Key" =
+/// 1)`, `("u" = 7)` (all measured against the engine over the same
+/// fixture). It used to be upper-cased, which spelled a quoted column
+/// `("MIXED COL" = 'm1')` - a name the catalog does not hold. An inner
+/// `"` is NOT doubled: the engine prints `("a"b" = 111)` for a column
+/// named `a"b` (measured), so the byte-for-byte copy is right.
 fn constraint_key_text(parts: &[(String, &Value)]) -> Option<String> {
     let mut segs = Vec::with_capacity(parts.len());
     for (name, v) in parts {
@@ -15296,11 +15336,7 @@ fn constraint_key_text(parts: &[(String, &Value)]) -> Option<String> {
         // rule [psql_literal] already encodes (text single-quoted,
         // scaled with its decimals, booleans by keyword)
         let rendered = psql_literal(v)?;
-        segs.push(format!(
-            "\"{}\" = {}",
-            name.trim_matches('"').trim_end().to_ascii_uppercase(),
-            rendered
-        ));
+        segs.push(format!("\"{}\" = {}", name.trim_end(), rendered));
     }
     let mut s = format!("({})", segs.join(", "));
     if s.len() > 250 {
@@ -16441,7 +16477,7 @@ fn build_projcols(
     } else {
         let mut v = Vec::new();
         for name in collist {
-            v.push(columns.iter().find(|c| c.name.eq_ignore_ascii_case(name))?);
+            v.push(find_col(columns, name)?);
         }
         v
     };
@@ -16596,9 +16632,9 @@ fn strip_kw<'a>(s: &'a str, kw: &str) -> Option<&'a str> {
 /// `GENERATED ALWAYS AS IDENTITY` falls through to the identity path).
 fn parse_computed_item(item: &str) -> Option<(String, String)> {
     let item = item.trim();
-    let (name, rest) = item.split_once(char::is_whitespace)?;
-    let name = name.trim_matches('"');
-    if !ident_ok(name) {
+    let (name, name_end) = scan_canon_ref(item, 0, 1, false)?;
+    let rest = item[name_end..].trim_start();
+    if rest.is_empty() {
         return None;
     }
     let tail = if let Some(t) = strip_kw(rest, "COMPUTED") {
@@ -16623,7 +16659,7 @@ fn parse_computed_item(item: &str) -> Option<(String, String)> {
                     if i + 1 != tail.len() {
                         return None;
                     }
-                    return Some((name.to_ascii_uppercase(), tail.to_string()));
+                    return Some((name, tail.to_string()));
                 }
             }
             _ => {}
@@ -16917,9 +16953,12 @@ fn collation_name_id(charset: u8, name: &str) -> Option<u8> {
 fn parse_column_def(item: &str) -> Option<(fire_crab_ods::ddl::ColumnDef, Option<(String, bool)>)> {
     use fire_crab_ods::format::dtype;
     let item = item.trim();
-    let (name, ty_orig) = item.split_once(char::is_whitespace)?;
-    let name = name.trim_matches('"');
-    if !ident_ok(name) {
+    // the column name CANONICAL ([canon_ident]): `"Mixed Col"` is one
+    // name, blank and all, and `"a"` is stored as `a` beside A
+    let (name_c, name_end) = scan_canon_ref(item, 0, 1, false)?;
+    let name: &str = name_c.as_str();
+    let ty_orig = item[name_end..].trim_start();
+    if ty_orig.is_empty() {
         return None;
     }
     // extract a GENERATED ... AS IDENTITY clause first - its "BY DEFAULT"
@@ -16966,15 +17005,15 @@ fn parse_column_def(item: &str) -> Option<(fire_crab_ods::ddl::ColumnDef, Option
     // as before, with the DEFAULT clause removed.
     let mut default_parsed: Option<fire_crab_ods::ddl::ColumnDefault> = None;
     let up_ty = ty_orig.to_ascii_uppercase();
+    // folded OUTSIDE quotes: a `CONSTRAINT "pk_x"` name at the tail
+    // keeps its spelling
     let mut ty = if let Some(dp) = find_word(&up_ty, "DEFAULT", 0) {
         let after = ty_orig[dp + "DEFAULT".len()..].trim_start();
         let (def, rest) = parse_default_clause(after)?;
         default_parsed = Some(def);
-        format!("{} {}", ty_orig[..dp].trim_end(), rest)
-            .trim()
-            .to_ascii_uppercase()
+        fold_bare(format!("{} {}", ty_orig[..dp].trim_end(), rest).trim())
     } else {
-        ty_orig.trim().to_ascii_uppercase()
+        fold_bare(ty_orig.trim())
     };
     // trailing column constraints, stripped off the end in any order
     let mut key: Option<(String, bool)> = None;
@@ -16999,14 +17038,11 @@ fn parse_column_def(item: &str) -> Option<(fire_crab_ods::ddl::ColumnDef, Option
         let mut head = rest.trim_end().to_string();
         let mut cname = String::new();
         if let Some(sp) = head.rfind(char::is_whitespace) {
-            let cand = head[sp + 1..].trim().trim_matches('"').to_string();
+            let cand = head[sp + 1..].trim().to_string();
             let before = head[..sp].trim_end().to_string();
             if let Some(pre) = before.strip_suffix("CONSTRAINT") {
                 if pre.is_empty() || pre.ends_with(char::is_whitespace) {
-                    if !ident_ok(&cand) {
-                        return None;
-                    }
-                    cname = cand;
+                    cname = canon_ident(&cand)?;
                     head = pre.trim_end().to_string();
                 }
             }
@@ -17054,7 +17090,7 @@ fn parse_column_def(item: &str) -> Option<(fire_crab_ods::ddl::ColumnDef, Option
     }
     let col = |field_type: i16, dt: u8, length: u16, scale: i8, sub_type: i16, char_len: Option<u16>| {
         Some(fire_crab_ods::ddl::ColumnDef {
-            name: name.to_ascii_uppercase(),
+            name: name.to_string(),
             field_type,
             dtype: dt,
             length,
@@ -17087,7 +17123,7 @@ fn parse_column_def(item: &str) -> Option<(fire_crab_ods::ddl::ColumnDef, Option
     // DECFLOAT carries a precision (16 or 34) the integer `col` does not.
     let decfloat = |field_type: i16, dt: u8, length: u16, precision: i16| {
         Some(fire_crab_ods::ddl::ColumnDef {
-            name: name.to_ascii_uppercase(),
+            name: name.to_string(),
             field_type,
             dtype: dt,
             length,
@@ -17163,7 +17199,7 @@ fn parse_column_def(item: &str) -> Option<(fire_crab_ods::ddl::ColumnDef, Option
         let bytes = char_len.saturating_mul(bpc);
         let length = if dt == dtype::VARYING { bytes + 2 } else { bytes };
         Some(fire_crab_ods::ddl::ColumnDef {
-            name: name.to_ascii_uppercase(),
+            name: name.to_string(),
             field_type,
             dtype: dt,
             length,
@@ -17217,7 +17253,7 @@ fn parse_column_def(item: &str) -> Option<(fire_crab_ods::ddl::ColumnDef, Option
             // `BLOB SUB_TYPE 0 CHARACTER SET UTF8` to subtype 1, charset 4)
             let sub_type = if cs.is_some() { 1 } else { sub_type };
             Some(fire_crab_ods::ddl::ColumnDef {
-                name: name.to_ascii_uppercase(),
+                name: name.to_string(),
                 field_type: 261,
                 dtype: dtype::BLOB,
                 length: 8,
@@ -17271,7 +17307,7 @@ fn parse_column_def(item: &str) -> Option<(fire_crab_ods::ddl::ColumnDef, Option
         // variable): both refuse rather than make a scalar column
         (_, _) if !dims.is_empty() && !matches!(base.as_str(), "SMALLINT" | "INTEGER" | "INT" | "BIGINT" | "FLOAT" | "DOUBLE PRECISION" | "DATE" | "TIME" | "TIMESTAMP" | "CHAR" | "CHARACTER" | "NUMERIC" | "DECIMAL") => None,
         (dom, []) if ident_ok(dom) => Some(fire_crab_ods::ddl::ColumnDef {
-            name: name.to_ascii_uppercase(),
+            name: name.to_string(),
             field_type: 0,
             dtype: 0,
             length: 0,
@@ -17429,7 +17465,11 @@ fn numeric_col(
         _ => return None,
     };
     Some(fire_crab_ods::ddl::ColumnDef {
-        name: name.to_ascii_uppercase(),
+        // the name arrives CANONICAL from [parse_column_def]
+        // ([scan_canon_ref]) and every other arm keeps it as it is;
+        // this one folded, so `CREATE TABLE T ("n" NUMERIC(5,2))`
+        // stored the column as N where a BIGINT twin stored `n`
+        name: name.to_string(),
         field_type,
         dtype: dt,
         length,
@@ -18679,24 +18719,18 @@ fn parse_dyn_text(t: &str, vars: &[String]) -> Option<Vec<DynPart>> {
             .or_else(|| p.strip_prefix("new."))
             .or_else(|| p.strip_prefix("New."))
         {
-            let col = col.trim().trim_matches('"').to_ascii_uppercase();
-            if !ident_ok(&col) {
-                return None;
-            }
+            let col = canon_ident(col)?;
             out.push(DynPart::Row(1, col));
         } else if let Some(col) = p
             .strip_prefix("OLD.")
             .or_else(|| p.strip_prefix("old.")
             .or_else(|| p.strip_prefix("Old.")))
         {
-            let col = col.trim().trim_matches('"').to_ascii_uppercase();
-            if !ident_ok(&col) {
-                return None;
-            }
+            let col = canon_ident(col)?;
             out.push(DynPart::Row(0, col));
         } else {
-            let name = p.trim_start_matches(':').trim().trim_matches('"');
-            let slot = vars.iter().position(|v| v.eq_ignore_ascii_case(name))?;
+            let name = canon_ident(p.trim_start_matches(':'))?;
+            let slot = vars.iter().position(|v| *v == name)?;
             out.push(DynPart::Var(slot as u16));
         }
     }
@@ -18912,8 +18946,8 @@ fn parse_trig_stmt(
             let text = parse_dyn_text(&s[after..into_kw], vars)?;
             let mut into = Vec::new();
             for part in s[into_kw + "INTO".len()..do_kw].split(',') {
-                let name = part.trim().trim_start_matches(':').trim().trim_matches('"');
-                into.push(vars.iter().position(|v| v.eq_ignore_ascii_case(name))? as u16);
+                let name = canon_ident(part.trim().trim_start_matches(':'))?;
+                into.push(vars.iter().position(|v| *v == name)? as u16);
             }
             if into.is_empty() {
                 return None;
@@ -18952,8 +18986,8 @@ fn parse_trig_stmt(
                 while j < qb.len() && (qb[j].is_alphanumeric() || qb[j] == '_' || qb[j] == '$') {
                     j += 1;
                 }
-                let nm: String = qb[qi + 1..j].iter().collect();
-                let slot = vars.iter().position(|v| v.eq_ignore_ascii_case(&nm))?;
+                let nm: String = qb[qi + 1..j].iter().collect::<String>().to_ascii_uppercase();
+                let slot = vars.iter().position(|v| *v == nm)?;
                 query.push_str(&format!("{}{}", PSQL_VAR_MARK, slot));
                 qi = j;
                 continue;
@@ -18964,8 +18998,8 @@ fn parse_trig_stmt(
         let into_text = s[into_kw + "INTO".len()..do_kw].trim();
         let mut into = Vec::new();
         for part in into_text.split(',') {
-            let name = part.trim().trim_start_matches(':').trim().trim_matches('"');
-            let slot = vars.iter().position(|v| v.eq_ignore_ascii_case(name))?;
+            let name = canon_ident(part.trim().trim_start_matches(':'))?;
+            let slot = vars.iter().position(|v| *v == name)?;
             into.push(slot as u16);
         }
         if into.is_empty() {
@@ -19012,8 +19046,8 @@ fn parse_trig_stmt(
             None => {
                 let mut binds: Vec<(String, u16)> = Vec::new();
                 for name in named_refs(&cond_text) {
-                    let slot = vars.iter().position(|v| v.eq_ignore_ascii_case(&name))? as u16;
-                    if !binds.iter().any(|(n, _)| n.eq_ignore_ascii_case(&name)) {
+                    let slot = vars.iter().position(|v| *v == name)? as u16;
+                    if !binds.iter().any(|(n, _)| *n == name) {
                         binds.push((name, slot));
                     }
                 }
@@ -19163,8 +19197,8 @@ fn parse_trig_stmt(
         let sql = text[..into_kw].trim().to_string();
         let mut into = Vec::new();
         for part in text[into_kw + "INTO".len()..].split(',') {
-            let name = part.trim().trim_start_matches(':').trim().trim_matches('"');
-            into.push(vars.iter().position(|v| v.eq_ignore_ascii_case(name))? as u16);
+            let name = canon_ident(part.trim().trim_start_matches(':'))?;
+            into.push(vars.iter().position(|v| *v == name)? as u16);
         }
         if into.is_empty() {
             return None;
@@ -19177,8 +19211,8 @@ fn parse_trig_stmt(
         // a column ([subst_body_query]).
         let mut binds: Vec<(String, u16)> = Vec::new();
         for name in named_refs(&sql) {
-            let slot = vars.iter().position(|v| v.eq_ignore_ascii_case(&name))? as u16;
-            if !binds.iter().any(|(n, _)| n.eq_ignore_ascii_case(&name)) {
+            let slot = vars.iter().position(|v| *v == name)? as u16;
+            if !binds.iter().any(|(n, _)| *n == name) {
                 binds.push((name, slot));
             }
         }
@@ -19220,8 +19254,8 @@ fn parse_trig_stmt(
         let mut into = Vec::new();
         if let Some(k) = into_kw {
             for part in text[k + "INTO".len()..].split(',') {
-                let name = part.trim().trim_start_matches(':').trim().trim_matches('"');
-                into.push(vars.iter().position(|v| v.eq_ignore_ascii_case(name))? as u16);
+                let name = canon_ident(part.trim().trim_start_matches(':'))?;
+                into.push(vars.iter().position(|v| *v == name)? as u16);
             }
             if into.is_empty() {
                 return None;
@@ -19266,8 +19300,8 @@ fn parse_trig_stmt(
         let mut into = Vec::new();
         if let Some(rv) = rv {
             for part in text[rv + "RETURNING_VALUES".len()..].split(',') {
-                let v = part.trim().trim_start_matches(':').trim().trim_matches('"');
-                let slot = vars.iter().position(|n| n.eq_ignore_ascii_case(v))?;
+                let v = canon_ident(part.trim().trim_start_matches(':'))?;
+                let slot = vars.iter().position(|n| *n == v)?;
                 into.push(slot as u16);
             }
             if into.is_empty() {
@@ -19320,8 +19354,8 @@ fn parse_trig_stmt(
         }
         let mut slots = Vec::new();
         for part in text[into + "INTO".len()..].split(',') {
-            let v = part.trim().trim_start_matches(':').trim().trim_matches('"');
-            let slot = vars.iter().position(|n| n.eq_ignore_ascii_case(v))?;
+            let v = canon_ident(part.trim().trim_start_matches(':'))?;
+            let slot = vars.iter().position(|n| *n == v)?;
             slots.push(slot as u16);
         }
         if slots.is_empty() {
@@ -19348,10 +19382,7 @@ fn parse_trig_stmt(
     if find_word(&up, "UPDATE", 0) == Some(0) {
         // UPDATE <t> SET <col> = <expr>[, ...] [WHERE <cond>]
         let set_kw = find_word(&up, "SET", "UPDATE".len())?;
-        let table = text["UPDATE".len()..set_kw].trim().trim_matches('"').to_ascii_uppercase();
-        if !ident_ok(&table) {
-            return None;
-        }
+        let table = canon_ident(&text["UPDATE".len()..set_kw])?;
         let where_kw = find_word(&up, "WHERE", set_kw + "SET".len());
         let set_end = where_kw.unwrap_or(text.len());
         let mut sets: Vec<(String, fire_crab_ods::expr::Expr)> = Vec::new();
@@ -19373,8 +19404,8 @@ fn parse_trig_stmt(
         parts.push(&body[seg..]);
         for part in parts {
             let eq = part.find('=')?;
-            let col = part[..eq].trim().trim_matches('"').to_ascii_uppercase();
-            if !ident_ok(&col) || sets.iter().any(|(c, _)| *c == col) {
+            let col = canon_ident(&part[..eq])?;
+            if sets.iter().any(|(c, _)| *c == col) {
                 return None;
             }
             sets.push((col, parse_store_expr(part[eq + 1..].trim(), vars)?));
@@ -19396,10 +19427,7 @@ fn parse_trig_stmt(
         }
         let where_kw = find_word(&up, "WHERE", from_kw + "FROM".len());
         let t_end = where_kw.unwrap_or(text.len());
-        let table = text[from_kw + "FROM".len()..t_end].trim().trim_matches('"').to_ascii_uppercase();
-        if !ident_ok(&table) {
-            return None;
-        }
+        let table = canon_ident(&text[from_kw + "FROM".len()..t_end])?;
         let wher = match where_kw {
             None => None,
             Some(w) => Some(parse_dml_cond(&text[w + "WHERE".len()..], vars)?),
@@ -19434,13 +19462,7 @@ fn parse_trig_stmt(
             if close > values_kw {
                 return None; // an unclosed list, or a paren from elsewhere
             }
-            let cols: Vec<String> = text[open + 1..close]
-                .split(',')
-                .map(|c| c.trim().trim_matches('"').to_ascii_uppercase())
-                .collect();
-            if cols.is_empty() || cols.iter().any(|c| !ident_ok(c)) {
-                return None;
-            }
+            let cols: Vec<String> = split_ident_list(&text[open + 1..close])?;
             (open, close + 1, cols)
         } else {
             // no list: the name runs to VALUES, and an EMPTY `cols`
@@ -19452,11 +19474,7 @@ fn parse_trig_stmt(
             // the catalog.
             (values_kw, values_kw, Vec::new())
         };
-        let table =
-            text[into_kw + "INTO".len()..head_end].trim().trim_matches('"').to_ascii_uppercase();
-        if !ident_ok(&table) {
-            return None;
-        }
+        let table = canon_ident(&text[into_kw + "INTO".len()..head_end])?;
         if !up[tail_start..values_kw].trim().is_empty() {
             return None;
         }
@@ -19509,8 +19527,8 @@ fn parse_trig_stmt(
         }
         let mut binds: Vec<(String, u16)> = Vec::new();
         for name in named_refs(body) {
-            let slot = vars.iter().position(|v| v.eq_ignore_ascii_case(&name))? as u16;
-            if !binds.iter().any(|(n, _)| n.eq_ignore_ascii_case(&name)) {
+            let slot = vars.iter().position(|v| *v == name)? as u16;
+            if !binds.iter().any(|(n, _)| *n == name) {
                 binds.push((name, slot));
             }
         }
@@ -19534,17 +19552,14 @@ fn parse_trig_stmt(
         };
     }
     let eq = text.find('=')?;
-    let lhs = text[..eq].trim().to_ascii_uppercase();
-    let target = if let Some(col) = lhs.strip_prefix("NEW.") {
-        let col = col.trim().trim_matches('"').to_string();
-        if !ident_ok(&col) {
-            return None;
-        }
-        TrigTarget::Field(col)
+    let lhs = text[..eq].trim();
+    // the target CANONICAL: `NEW."a"` is column "a", `NEW.a` is A
+    let target = if lhs.len() > 4 && lhs[..4].eq_ignore_ascii_case("NEW.") {
+        TrigTarget::Field(canon_ident(&lhs[4..])?)
     } else {
         // a bare target must name a DECLAREd variable
-        let name = lhs.trim().trim_matches('"').to_string();
-        let slot = vars.iter().position(|v| v == &name)?;
+        let name = canon_ident(lhs)?;
+        let slot = vars.iter().position(|v| *v == name)?;
         TrigTarget::Var(slot as u16)
     };
     let rhs = text[eq + 1..].trim();
@@ -20250,10 +20265,8 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
             .filter_map(|k| find_word(&masked[..as_kw], k, trig_kw + "TRIGGER".len()))
             .min()?,
     };
-    let name = s[trig_kw + "TRIGGER".len()..head_kw].trim().trim_matches('"');
-    if !ident_ok(name) {
-        return None;
-    }
+    let name = canon_ident(&s[trig_kw + "TRIGGER".len()..head_kw])?;
+    let name: &str = name.as_str();
     let head_at = match for_kw {
         Some(k) => k + "FOR".len(),
         None => head_kw,
@@ -20267,14 +20280,13 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
     // identifier can be - see [db_triggers] for the firing side
     let (table, mut w) = match for_kw {
         Some(_) => {
-            let t = s[head_at..as_kw].trim_start().split_whitespace().next()?.trim_matches('"');
-            if !ident_ok(t) {
-                return None;
-            }
+            // the relation CANONICAL: `FOR "tq"` is the quoted twin
+            let (t, _) = scan_canon_ref(s[head_at..as_kw].trim_start(), 0, 1, false)?;
             (t, 1usize)
         }
-        None => ("", 0usize),
+        None => (String::new(), 0usize),
     };
+    let table: &str = table.as_str();
     let mut inactive = false;
     match words.get(w) {
         Some(&"ACTIVE") => w += 1,
@@ -20498,7 +20510,7 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
         .map(|(_, d)| d.as_slice())
         .unwrap_or(&[]);
     let col_ok = |n: &str| -> Option<()> {
-        let rc = columns.iter().find(|c| c.name.eq_ignore_ascii_case(n))?;
+        let rc = columns.iter().find(|c| c.name == n)?;
         let d = descs.get(rc.field_id as usize)?;
         body_col_class(d)
     };
@@ -20729,7 +20741,7 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
         let sformats = relation_formats(&db.bytes(), db.page_size, srel);
         let (_, sdescs) = sformats.iter().max_by_key(|(n, _)| *n)?;
         for c in cols {
-            let rc = scols.iter().find(|rc| rc.name.eq_ignore_ascii_case(c))?;
+            let rc = scols.iter().find(|rc| rc.name == *c)?;
             let d = sdescs.get(rc.field_id as usize)?;
             body_col_class(d)?;
         }
@@ -20763,7 +20775,7 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
         let dformats = relation_formats(&db.bytes(), db.page_size, drel);
         let (_, ddescs) = dformats.iter().max_by_key(|(n, _)| *n)?;
         let target_col_ok = |n: &str| -> Option<()> {
-            let rc = dcols.iter().find(|rc| rc.name.eq_ignore_ascii_case(n))?;
+            let rc = dcols.iter().find(|rc| rc.name == n)?;
             let d = ddescs.get(rc.field_id as usize)?;
             body_col_class(d)?;
             Some(())
@@ -20850,7 +20862,7 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
     let debug = trigger_debug_blob(s, &declares, &dbg_entries);
     Some((
         Plan::CreateTrigger {
-            table: table.to_ascii_uppercase(),
+            table: table.to_string(),
             def: fire_crab_ods::ddl::UserTriggerDef {
                 name: name.to_ascii_uppercase(),
                 inactive: false,
@@ -21036,10 +21048,8 @@ fn plan_create_table(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
         }
         0
     };
-    let name = s[table_kw + "TABLE".len()..open].trim().trim_matches('"');
-    if !ident_ok(name) {
-        return None;
-    }
+    // CANONICAL: `"tq"` beside TQ is its own table
+    let name = canon_ident(&s[table_kw + "TABLE".len()..open])?;
     let body = &s[open + 1..close];
     // split on top-level commas (type args carry their own parens; an ARRAY
     // column's `[l:u, l:u]` bounds carry their own brackets)
@@ -21072,10 +21082,11 @@ fn plan_create_table(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
     // compiled below, once every column's type is known
     let mut check_items: Vec<(usize, String)> = Vec::new();
     for item in items {
-        let up_item = item.trim().to_ascii_uppercase();
+        // folded OUTSIDE quotes: the keywords read upper case, a quoted
+        // name keeps its spelling for [canon_ident] downstream
+        let up_item = fold_bare(item.trim());
         // a [CONSTRAINT <name>] FOREIGN KEY (cols) REFERENCES t [(refcols)]
-        // table-level constraint (names uppercased like the engine does
-        // for unquoted identifiers)
+        // table-level constraint (a bare name folds, a quoted one is exact)
         if let Some(fk) = parse_fk_clause(&up_item) {
             fks.push(fk);
             continue;
@@ -21124,7 +21135,7 @@ fn plan_create_table(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
                 _ => item,
             }
         };
-        let up_item = item.trim().to_ascii_uppercase();
+        let up_item = fold_bare(item.trim());
         // a [CONSTRAINT <name>] CHECK (<condition>), compiled after the
         // column loop (it may reference columns declared after it)
         if let Some((cname, source)) = parse_check_clause(item) {
@@ -21192,7 +21203,7 @@ fn plan_create_table(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
         // domain (unresolved here), no other computed column, no NUMERIC
         // scale/sub_type
         let field_rank = |name: &str| {
-            let c = cols.iter().find(|c| c.name.eq_ignore_ascii_case(name))?;
+            let c = cols.iter().find(|c| c.name == name)?;
             if c.domain.is_some() || c.computed.is_some() || c.scale != 0 || c.sub_type != 0 {
                 return None;
             }
@@ -21224,7 +21235,7 @@ fn plan_create_table(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
     for (idx, source) in &check_items {
         let cond = parse_cond(&source["CHECK".len()..])?;
         let field_rank = |name: &str| {
-            let c = cols.iter().find(|c| c.name.eq_ignore_ascii_case(name))?;
+            let c = cols.iter().find(|c| c.name == name)?;
             if c.domain.is_some() || c.computed.is_some() || c.scale != 0 || c.sub_type != 0 {
                 return None;
             }
@@ -21235,7 +21246,7 @@ fn plan_create_table(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
         // outside the int surface still refuses
         let field_is_text = |name: &str| {
             cols.iter().any(|c| {
-                c.name.eq_ignore_ascii_case(name)
+                c.name == name
                     && c.domain.is_none()
                     && c.computed.is_none()
                     && c.sub_type == 0
@@ -21283,7 +21294,7 @@ fn plan_create_table(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
             has_pk = true;
         }
         for n in &k.columns {
-            let i = cols.iter().position(|c| c.name.eq_ignore_ascii_case(n))?;
+            let i = cols.iter().position(|c| c.name == *n)?;
             // a computed column has no stored bytes to key on
             if cols[i].computed.is_some() {
                 return None;
@@ -21296,7 +21307,7 @@ fn plan_create_table(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
         };
         if k.primary {
             for n in &k.columns {
-                let i = cols.iter().position(|c| c.name.eq_ignore_ascii_case(n))?;
+                let i = cols.iter().position(|c| c.name == *n)?;
                 cols[i].not_null = true;
             }
         }
@@ -21306,14 +21317,14 @@ fn plan_create_table(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
         for n in &fk.columns {
             if cols
                 .iter()
-                .any(|c| c.name.eq_ignore_ascii_case(n) && c.computed.is_some())
+                .any(|c| c.name == *n && c.computed.is_some())
             {
                 return None;
             }
         }
     }
     Some((
-        Plan::CreateTable { name: name.to_ascii_uppercase(), cols, constraints, fks, relation_type },
+        Plan::CreateTable { name, cols, constraints, fks, relation_type },
         Vec::new(),
     ))
 }
@@ -21329,10 +21340,7 @@ fn parse_key_clause(up_item: &str) -> Option<fire_crab_ods::ddl::KeyDef> {
     if let Some(rest) = t.strip_prefix("CONSTRAINT ") {
         let rest = rest.trim_start();
         let end = rest.find(char::is_whitespace)?;
-        name = rest[..end].trim_matches('"').to_string();
-        if !ident_ok(&name) {
-            return None;
-        }
+        name = canon_ident(&rest[..end])?;
         t = rest[end..].trim_start();
     }
     let (rest, primary) = if let Some(rest) = t.strip_prefix("PRIMARY KEY") {
@@ -21361,10 +21369,7 @@ fn parse_fk_clause(up_item: &str) -> Option<fire_crab_ods::ddl::ForeignKeyDef> {
     if let Some(rest) = t.strip_prefix("CONSTRAINT ") {
         let rest = rest.trim_start();
         let end = rest.find(char::is_whitespace)?;
-        name = rest[..end].trim_matches('"').to_string();
-        if !ident_ok(&name) {
-            return None;
-        }
+        name = canon_ident(&rest[..end])?;
         t = rest[end..].trim_start();
     }
     let rest = t.strip_prefix("FOREIGN KEY")?.trim_start();
@@ -21388,12 +21393,12 @@ fn parse_fk_clause(up_item: &str) -> Option<fire_crab_ods::ddl::ForeignKeyDef> {
             if rc_close <= p {
                 return None;
             }
-            let rt = ref_part[..p].trim().trim_matches('"').to_string();
+            let rt = canon_ident(&ref_part[..p])?;
             (rt, split_ident_list(&ref_part[p + 1..rc_close])?)
         }
-        None => (ref_part.trim().trim_matches('"').to_string(), Vec::new()),
+        None => (canon_ident(ref_part)?, Vec::new()),
     };
-    if !ident_ok(&ref_table) || columns.is_empty() {
+    if columns.is_empty() {
         return None;
     }
     let (on_update, on_delete) = parse_ref_actions(actions_str)?;
@@ -21457,12 +21462,10 @@ fn parse_ref_actions(s: &str) -> Option<(fire_crab_ods::ddl::RefAction, fire_cra
 /// unquoted; None if any element is not a bare identifier.
 fn split_ident_list(s: &str) -> Option<Vec<String>> {
     let mut out = Vec::new();
+    // each name CANONICAL ([canon_ident]): a quoted one exact, spaces
+    // and all (`INSERT INTO T (ID, "Mixed Col")`), a bare one folded
     for part in s.split(',') {
-        let n = part.trim().trim_matches('"');
-        if !ident_ok(n) {
-            return None;
-        }
-        out.push(n.to_string());
+        out.push(canon_ident(part)?);
     }
     if out.is_empty() {
         None
@@ -21493,33 +21496,19 @@ fn plan_create_index(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
         }
     }
     let on_kw = find_word(&masked, "ON", index_kw + "INDEX".len())?;
-    let name = s[index_kw + "INDEX".len()..on_kw].trim().trim_matches('"');
-    if !ident_ok(name) {
-        return None;
-    }
-    let open = s[on_kw..].find('(')? + on_kw;
+    // every name CANONICAL ([canon_ident]): a bare `dept` is DEPT, a
+    // quoted `"a"` is a - and the ods matcher compares exactly
+    let name = canon_ident(&s[index_kw + "INDEX".len()..on_kw])?;
+    let open = masked[on_kw..].find('(')? + on_kw;
     if !s.ends_with(')') {
         return None;
     }
-    let table = s[on_kw + "ON".len()..open].trim().trim_matches('"');
-    if !ident_ok(table) {
-        return None;
-    }
-    let mut cols = Vec::new();
-    for n in s[open + 1..s.len() - 1].split(',') {
-        let n = n.trim().trim_matches('"');
-        if !ident_ok(n) {
-            return None;
-        }
-        cols.push(n.to_string());
-    }
-    if cols.is_empty() {
-        return None;
-    }
+    let table = canon_ident(&s[on_kw + "ON".len()..open])?;
+    let cols = split_ident_list(&s[open + 1..s.len() - 1])?;
     Some((
         Plan::CreateIndex {
-            table: table.to_ascii_uppercase(),
-            name: name.to_ascii_uppercase(),
+            table,
+            name,
             cols,
             unique,
             descending,
@@ -21540,11 +21529,8 @@ fn plan_drop_table(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
     if masked[..table_kw].trim() != "DROP" {
         return None;
     }
-    let name = s[table_kw + "TABLE".len()..].trim().trim_matches('"');
-    if !ident_ok(name) {
-        return None;
-    }
-    Some((Plan::DropTable { name: name.to_ascii_uppercase() }, Vec::new()))
+    let name = canon_ident(&s[table_kw + "TABLE".len()..])?;
+    Some((Plan::DropTable { name }, Vec::new()))
 }
 
 /// Parse `DROP INDEX <name>`.
@@ -21559,11 +21545,8 @@ fn plan_drop_index(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
     if masked[..index_kw].trim() != "DROP" {
         return None;
     }
-    let name = s[index_kw + "INDEX".len()..].trim().trim_matches('"');
-    if !ident_ok(name) {
-        return None;
-    }
-    Some((Plan::DropIndex { name: name.to_ascii_uppercase() }, Vec::new()))
+    let name = canon_ident(&s[index_kw + "INDEX".len()..])?;
+    Some((Plan::DropIndex { name }, Vec::new()))
 }
 
 /// Parse `CREATE SEQUENCE|GENERATOR <name> [START WITH <n>]
@@ -22370,15 +22353,13 @@ fn plan_create_view(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descr
     let (name_raw, cols): (&str, Option<Vec<String>>) = match head.find('(') {
         Some(p) => {
             let close = head.rfind(')')?;
-            let list = head[p + 1..close]
-                .split(',')
-                .map(|c| unquote_ident(c.trim()))
-                .collect::<Option<Vec<_>>>()?;
+            // CANONICAL: `(eid, ename)` stores EID, ENAME; `("a")` stores a
+            let list = split_ident_list(&head[p + 1..close])?;
             (head[..p].trim(), Some(list))
         }
         None => (head, None),
     };
-    let name = unquote_ident(name_raw)?;
+    let name = canon_ident(name_raw)?;
     let select = s[as_at + "AS".len()..].trim();
     let sel_up = mask_literals(&select.to_ascii_uppercase());
     if find_word(&sel_up, "WITH", 0).is_some() && sel_up.contains("CHECK OPTION") {
@@ -22419,13 +22400,14 @@ fn plan_create_view(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descr
         if tr.schema.is_some_and(|(sc, _)| !sc.eq_ignore_ascii_case("PUBLIC")) {
             return None;
         }
-        let table = tr.table.trim_matches('"').to_ascii_uppercase();
+        // canonical spellings throughout ([TableRef])
+        let table = tr.table.clone();
         if dbr.columns(&table).is_empty() {
             return None; // a derived table / CTE / unknown item: not this slice
         }
-        let key = tr.alias.unwrap_or(tr.table).trim_matches('"').to_ascii_uppercase();
-        let context_name = match tr.alias {
-            Some(a) => format!("\"{}\"", a.trim_matches('"').to_ascii_uppercase()),
+        let key = tr.key().to_string();
+        let context_name = match &tr.alias {
+            Some(a) => format!("\"{}\"", a),
             None => format!("\"PUBLIC\".\"{}\"", table),
         };
         contexts.push(fire_crab_ods::ddl::RestoredViewContext { relation: table.clone(), context: (i + 1) as i64, context_name });
@@ -22445,16 +22427,17 @@ fn plan_create_view(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descr
     for (i, c) in out_cols.iter().enumerate() {
         let name = match &cols {
             Some(list) => list[i].clone(),
-            None => c.name.trim().to_ascii_uppercase(),
+            // the item's own name is the catalog spelling already
+            None => c.name.trim().to_string(),
         };
         if name.is_empty() {
             return None; // an unaliased expression needs a column list (the engine refuses too)
         }
         let plain = c.expr.is_none() && c.relation.is_some() && c.fname.is_some();
         if plain {
-            let base_table = c.relation.clone().unwrap_or_default().to_ascii_uppercase();
-            let base_field = c.fname.clone().unwrap_or_default().to_ascii_uppercase();
-            let key = c.rel_alias.clone().unwrap_or_else(|| base_table.clone()).to_ascii_uppercase();
+            let base_table = c.relation.clone().unwrap_or_default();
+            let base_field = c.fname.clone().unwrap_or_default();
+            let key = c.rel_alias.clone().unwrap_or_else(|| base_table.clone());
             let Some(ctx) = keys
                 .iter()
                 .position(|(k, t)| *k == key || (*t == base_table && keys.iter().filter(|(_, tt)| *tt == base_table).count() == 1))
@@ -22608,7 +22591,7 @@ fn plan_drop_view(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
     if toks.len() != 3 || !toks[0].eq_ignore_ascii_case("DROP") || !toks[1].eq_ignore_ascii_case("VIEW") {
         return None;
     }
-    Some((Plan::DropView { name: unquote_ident(toks[2])? }, Vec::new()))
+    Some((Plan::DropView { name: canon_ident(toks[2])? }, Vec::new()))
 }
 
 /// `ALTER VIEW <name> AS <select>` reuses the CREATE VIEW planner (same
@@ -23106,10 +23089,7 @@ fn parse_check_clause(item: &str) -> Option<(String, String)> {
         let name_start = "CONSTRAINT".len() + (rest.len() - rest.trim_start().len());
         let rest = &item[name_start..];
         let end = rest.find(char::is_whitespace)?;
-        let name = rest[..end].trim_matches('"').to_ascii_uppercase();
-        if !ident_ok(&name) {
-            return None;
-        }
+        let name = canon_ident(&rest[..end])?;
         (name, name_start + end)
     } else {
         (String::new(), 0)
@@ -23679,11 +23659,11 @@ fn plan_comment(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
 
     let target = match kind {
         "TABLE" => {
-            let name = unquote_ident(target_str)?;
+            let name = canon_ident(target_str)?;
             fire_crab_ods::ddl::CommentTarget::Table(name)
         }
         "INDEX" => {
-            let name = unquote_ident(target_str)?;
+            let name = canon_ident(target_str)?;
             fire_crab_ods::ddl::CommentTarget::Index(name)
         }
         "SEQUENCE" | "GENERATOR" => {
@@ -23720,7 +23700,7 @@ fn plan_comment(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
         _ => {
             // <table>.<column> - split on the first dot outside quotes
             let (t, c) = split_qualified(target_str)?;
-            fire_crab_ods::ddl::CommentTarget::Column(unquote_ident(&t)?, unquote_ident(&c)?)
+            fire_crab_ods::ddl::CommentTarget::Column(canon_ident(&t)?, canon_ident(&c)?)
         }
     };
     Some((Plan::Comment { target, text }, Vec::new()))
@@ -23770,7 +23750,7 @@ fn parse_priv_and_fields(s: &str) -> Option<(Vec<char>, Vec<String>)> {
         };
         let mut fields = Vec::new();
         for c in t[open + 1..t.len() - 1].split(',') {
-            fields.push(unquote_ident(c.trim())?);
+            fields.push(canon_ident(c)?);
         }
         return (!fields.is_empty()).then_some((vec![letter], fields));
     }
@@ -23863,7 +23843,7 @@ fn plan_grant(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
 
     Some((
         Plan::Grant {
-            table: unquote_ident(table)?,
+            table: canon_ident(table)?,
             grantees,
             privileges,
             fields,
@@ -24144,22 +24124,20 @@ fn plan_alter_table_add(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<D
         return None;
     }
     let add_kw = find_word(&masked, "ADD", table_kw + "TABLE".len())?;
-    let table = s[table_kw + "TABLE".len()..add_kw].trim().trim_matches('"');
-    if !ident_ok(table) {
-        return None;
-    }
+    let table_c = canon_ident(&s[table_kw + "TABLE".len()..add_kw])?;
+    let table: &str = table_c.as_str();
     let tail = s[add_kw + "ADD".len()..].trim();
     // ADD [CONSTRAINT <name>] FOREIGN KEY (...) REFERENCES ...
-    if let Some(fk) = parse_fk_clause(&tail.to_ascii_uppercase()) {
+    if let Some(fk) = parse_fk_clause(&fold_bare(tail)) {
         return Some((
-            Plan::AlterTableAddFk { table: table.to_ascii_uppercase(), fk },
+            Plan::AlterTableAddFk { table: table.to_string(), fk },
             Vec::new(),
         ));
     }
     // ADD [CONSTRAINT <name>] PRIMARY KEY|UNIQUE (...)
-    if let Some(key) = parse_key_clause(&tail.to_ascii_uppercase()) {
+    if let Some(key) = parse_key_clause(&fold_bare(tail)) {
         return Some((
-            Plan::AlterTableAddKey { table: table.to_ascii_uppercase(), key },
+            Plan::AlterTableAddKey { table: table.to_string(), key },
             Vec::new(),
         ));
     }
@@ -24174,7 +24152,7 @@ fn plan_alter_table_add(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<D
         let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
         let cond = parse_cond(&source["CHECK".len()..])?;
         let field_rank = |name: &str| {
-            let rc = columns.iter().find(|c| c.name.eq_ignore_ascii_case(name))?;
+            let rc = columns.iter().find(|c| c.name == name)?;
             let d = descs.get(rc.field_id as usize)?;
             if (d.offset == 0 && d.length != 0) || d.scale != 0 || d.sub_type != 0 {
                 return None;
@@ -24184,7 +24162,7 @@ fn plan_alter_table_add(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<D
         let field_is_text = |name: &str| {
             columns
                 .iter()
-                .find(|c| c.name.eq_ignore_ascii_case(name))
+                .find(|c| c.name == name)
                 .and_then(|rc| descs.get(rc.field_id as usize))
                 .is_some_and(|d| {
                     !(d.offset == 0 && d.length != 0)
@@ -24213,7 +24191,7 @@ fn plan_alter_table_add(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<D
         let blr = fire_crab_ods::expr::check_trigger_blr(&cond_with_context(&cond, 1));
         return Some((
             Plan::AlterTableAddCheck {
-                table: table.to_ascii_uppercase(),
+                table: table.to_string(),
                 check: fire_crab_ods::ddl::CheckDef {
                     name: cname,
                     source,
@@ -24241,7 +24219,7 @@ fn plan_alter_table_add(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<D
         // carries it since inc 121); the CHECK paths keep the narrower
         // dtype_rank and still refuse INT128 references.
         let field_rank = |name: &str| {
-            let rc = columns.iter().find(|c| c.name.eq_ignore_ascii_case(name))?;
+            let rc = columns.iter().find(|c| c.name == name)?;
             let d = descs.get(rc.field_id as usize)?;
             if (d.offset == 0 && d.length != 0) || d.scale != 0 || d.sub_type != 0 {
                 return None;
@@ -24279,7 +24257,7 @@ fn plan_alter_table_add(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<D
             }),
         };
         return Some((
-            Plan::AlterTableAdd { table: table.to_ascii_uppercase(), col },
+            Plan::AlterTableAdd { table: table.to_string(), col },
             Vec::new(),
         ));
     }
@@ -24288,7 +24266,7 @@ fn plan_alter_table_add(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<D
         return None;
     }
     Some((
-        Plan::AlterTableAdd { table: table.to_ascii_uppercase(), col },
+        Plan::AlterTableAdd { table: table.to_string(), col },
         Vec::new(),
     ))
 }
@@ -24309,36 +24287,22 @@ fn plan_alter_table_drop(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
         return None;
     }
     let drop_kw = find_word(&masked, "DROP", table_kw + "TABLE".len())?;
-    let table = s[table_kw + "TABLE".len()..drop_kw].trim().trim_matches('"');
-    if !ident_ok(table) {
-        return None;
-    }
+    let table = canon_ident(&s[table_kw + "TABLE".len()..drop_kw])?;
     let tail = s[drop_kw + "DROP".len()..].trim();
     // DROP CONSTRAINT <name>
-    if let Some(rest) = tail.to_ascii_uppercase().strip_prefix("CONSTRAINT ") {
-        let cname = rest.trim().trim_matches('"');
-        if !ident_ok(cname) {
-            return None;
-        }
+    if tail.len() > "CONSTRAINT ".len() && tail[.."CONSTRAINT ".len()].eq_ignore_ascii_case("CONSTRAINT ") {
+        let constraint = canon_ident(&tail["CONSTRAINT ".len()..])?;
         return Some((
-            Plan::AlterTableDropConstraint {
-                table: table.to_ascii_uppercase(),
-                constraint: cname.to_ascii_uppercase(),
-            },
+            Plan::AlterTableDropConstraint { table, constraint },
             Vec::new(),
         ));
     }
-    let col = tail.trim_matches('"');
-    if !ident_ok(col) {
-        return None; // DROP PRIMARY KEY / ... not a column drop
+    // a bare keyword (DROP PRIMARY KEY / ...) is no column name
+    if tail.contains(char::is_whitespace) && !tail.starts_with('"') {
+        return None;
     }
-    Some((
-        Plan::AlterTableDrop {
-            table: table.to_ascii_uppercase(),
-            column: col.to_ascii_uppercase(),
-        },
-        Vec::new(),
-    ))
+    let column = canon_ident(tail)?;
+    Some((Plan::AlterTableDrop { table, column }, Vec::new()))
 }
 
 /// Parse `ALTER TABLE <table> ALTER [COLUMN] <col> TYPE <datatype>` -
@@ -24358,31 +24322,19 @@ fn plan_alter_table_alter_type(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
     // the second ALTER (the column clause), then TYPE
     let alter2 = find_word(&masked, "ALTER", table_kw + "TABLE".len())?;
     let type_kw = find_word(&masked, "TYPE", alter2 + "ALTER".len())?;
-    let table = s[table_kw + "TABLE".len()..alter2].trim().trim_matches('"');
-    if !ident_ok(table) {
-        return None;
-    }
+    let table = canon_ident(&s[table_kw + "TABLE".len()..alter2])?;
     // between the second ALTER and TYPE: an optional COLUMN keyword then
     // the column name
     let mid = s[alter2 + "ALTER".len()..type_kw].trim();
-    let toks: Vec<&str> = mid.split_whitespace().collect();
-    let col = match toks.as_slice() {
-        [c] => *c,
-        [kw, c] if kw.eq_ignore_ascii_case("COLUMN") => *c,
-        _ => return None,
+    let mid = match mid.split_once(char::is_whitespace) {
+        Some((kw, c)) if kw.eq_ignore_ascii_case("COLUMN") => c.trim(),
+        _ => mid,
     };
-    let col = col.trim_matches('"');
-    if !ident_ok(col) {
-        return None;
-    }
+    let column = canon_ident(mid)?;
     let datatype = s[type_kw + "TYPE".len()..].trim();
     let (new_col, _col_key) = parse_column_def(&format!("C {}", datatype))?;
     Some((
-        Plan::AlterColumnType {
-            table: table.to_ascii_uppercase(),
-            column: col.to_ascii_uppercase(),
-            col: new_col,
-        },
+        Plan::AlterColumnType { table, column, col: new_col },
         Vec::new(),
     ))
 }
@@ -24401,10 +24353,8 @@ fn plan_alter_column_null(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
         return None;
     }
     let alter2 = find_word(&masked, "ALTER", table_kw + "TABLE".len())?;
-    let table = s[table_kw + "TABLE".len()..alter2].trim().trim_matches('"');
-    if !ident_ok(table) {
-        return None;
-    }
+    let table = canon_ident(&s[table_kw + "TABLE".len()..alter2])?;
+    let table: &str = table.as_str();
     // the tail after the second ALTER: "[COLUMN] <col> (SET|DROP) NOT NULL"
     let tail = s[alter2 + "ALTER".len()..].trim();
     let tail_up = tail.to_ascii_uppercase();
@@ -24425,14 +24375,12 @@ fn plan_alter_column_null(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
         [w, c] if w.eq_ignore_ascii_case("COLUMN") => *c,
         _ => return None,
     };
-    let col = col.trim_matches('"');
-    if !ident_ok(col) {
-        return None;
-    }
+    let col = canon_ident(col)?;
+    let col: &str = col.as_str();
     Some((
         Plan::AlterColumnNull {
-            table: table.to_ascii_uppercase(),
-            column: col.to_ascii_uppercase(),
+            table: table.to_string(),
+            column: col.to_string(),
             not_null,
         },
         Vec::new(),
@@ -24455,10 +24403,8 @@ fn plan_alter_column_default(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
         return None;
     }
     let alter2 = find_word(&masked, "ALTER", table_kw + "TABLE".len())?;
-    let table = s[table_kw + "TABLE".len()..alter2].trim().trim_matches('"');
-    if !ident_ok(table) {
-        return None;
-    }
+    let table = canon_ident(&s[table_kw + "TABLE".len()..alter2])?;
+    let table: &str = table.as_str();
     // the tail after the second ALTER: "[COLUMN] <col> (SET DEFAULT <lit>|DROP DEFAULT)"
     let tail = s[alter2 + "ALTER".len()..].trim();
     let tail_masked = mask_literals(&tail.to_ascii_uppercase());
@@ -24490,14 +24436,12 @@ fn plan_alter_column_default(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
         [w, c] if w.eq_ignore_ascii_case("COLUMN") => *c,
         _ => return None,
     };
-    let col = col.trim_matches('"');
-    if !ident_ok(col) {
-        return None;
-    }
+    let col = canon_ident(col)?;
+    let col: &str = col.as_str();
     Some((
         Plan::AlterColumnDefault {
-            table: table.to_ascii_uppercase(),
-            column: col.to_ascii_uppercase(),
+            table: table.to_string(),
+            column: col.to_string(),
             default,
         },
         Vec::new(),
@@ -24518,10 +24462,8 @@ fn plan_alter_column_restart(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
         return None;
     }
     let alter2 = find_word(&masked, "ALTER", table_kw + "TABLE".len())?;
-    let table = s[table_kw + "TABLE".len()..alter2].trim().trim_matches('"');
-    if !ident_ok(table) {
-        return None;
-    }
+    let table = canon_ident(&s[table_kw + "TABLE".len()..alter2])?;
+    let table: &str = table.as_str();
     let tail = s[alter2 + "ALTER".len()..].trim();
     let tail_up = tail.to_ascii_uppercase();
     let rp = find_word(&tail_up, "RESTART", 0)?;
@@ -24533,10 +24475,8 @@ fn plan_alter_column_restart(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
         [w, c] if w.eq_ignore_ascii_case("COLUMN") => *c,
         _ => return None,
     };
-    let col = col.trim_matches('"');
-    if !ident_ok(col) {
-        return None;
-    }
+    let col = canon_ident(col)?;
+    let col: &str = col.as_str();
     // RESTART, optionally WITH <n>
     let after = tail_up[rp + "RESTART".len()..].trim();
     let with_value = if after.is_empty() {
@@ -24552,8 +24492,8 @@ fn plan_alter_column_restart(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
     };
     Some((
         Plan::AlterColumnRestart {
-            table: table.to_ascii_uppercase(),
-            column: col.to_ascii_uppercase(),
+            table: table.to_string(),
+            column: col.to_string(),
             with_value,
         },
         Vec::new(),
@@ -24574,10 +24514,8 @@ fn plan_alter_column_generated(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
         return None;
     }
     let alter2 = find_word(&masked, "ALTER", table_kw + "TABLE".len())?;
-    let table = s[table_kw + "TABLE".len()..alter2].trim().trim_matches('"');
-    if !ident_ok(table) {
-        return None;
-    }
+    let table = canon_ident(&s[table_kw + "TABLE".len()..alter2])?;
+    let table: &str = table.as_str();
     let tail = s[alter2 + "ALTER".len()..].trim();
     let norm = tail
         .to_ascii_uppercase()
@@ -24605,14 +24543,12 @@ fn plan_alter_column_generated(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
         [w, c] if w.eq_ignore_ascii_case("COLUMN") => *c,
         _ => return None,
     };
-    let col = col.trim_matches('"');
-    if !ident_ok(col) {
-        return None;
-    }
+    let col = canon_ident(col)?;
+    let col: &str = col.as_str();
     Some((
         Plan::AlterColumnGenerated {
-            table: table.to_ascii_uppercase(),
-            column: col.to_ascii_uppercase(),
+            table: table.to_string(),
+            column: col.to_string(),
             identity_type,
         },
         Vec::new(),
@@ -24633,10 +24569,8 @@ fn plan_alter_column_drop_identity(sql: &str) -> Option<(Plan, Vec<Descriptor>)>
         return None;
     }
     let alter2 = find_word(&masked, "ALTER", table_kw + "TABLE".len())?;
-    let table = s[table_kw + "TABLE".len()..alter2].trim().trim_matches('"');
-    if !ident_ok(table) {
-        return None;
-    }
+    let table = canon_ident(&s[table_kw + "TABLE".len()..alter2])?;
+    let table: &str = table.as_str();
     let tail = s[alter2 + "ALTER".len()..].trim();
     let norm = tail
         .to_ascii_uppercase()
@@ -24657,14 +24591,12 @@ fn plan_alter_column_drop_identity(sql: &str) -> Option<(Plan, Vec<Descriptor>)>
         [w, c] if w.eq_ignore_ascii_case("COLUMN") => *c,
         _ => return None,
     };
-    let col = col.trim_matches('"');
-    if !ident_ok(col) {
-        return None;
-    }
+    let col = canon_ident(col)?;
+    let col: &str = col.as_str();
     Some((
         Plan::AlterColumnDropIdentity {
-            table: table.to_ascii_uppercase(),
-            column: col.to_ascii_uppercase(),
+            table: table.to_string(),
+            column: col.to_string(),
         },
         Vec::new(),
     ))
@@ -24684,10 +24616,8 @@ fn plan_alter_column_position(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
         return None;
     }
     let alter2 = find_word(&masked, "ALTER", table_kw + "TABLE".len())?;
-    let table = s[table_kw + "TABLE".len()..alter2].trim().trim_matches('"');
-    if !ident_ok(table) {
-        return None;
-    }
+    let table = canon_ident(&s[table_kw + "TABLE".len()..alter2])?;
+    let table: &str = table.as_str();
     let tail = s[alter2 + "ALTER".len()..].trim();
     let tail_up = tail.to_ascii_uppercase();
     let pp = find_word(&tail_up, "POSITION", 0)?;
@@ -24699,14 +24629,12 @@ fn plan_alter_column_position(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
         [w, c] if w.eq_ignore_ascii_case("COLUMN") => *c,
         _ => return None,
     };
-    let col = col.trim_matches('"');
-    if !ident_ok(col) {
-        return None;
-    }
+    let col = canon_ident(col)?;
+    let col: &str = col.as_str();
     Some((
         Plan::AlterColumnPosition {
-            table: table.to_ascii_uppercase(),
-            column: col.to_ascii_uppercase(),
+            table: table.to_string(),
+            column: col.to_string(),
             position,
         },
         Vec::new(),
@@ -24918,6 +24846,12 @@ fn wrap_returning(
     // the target's own ALIAS, when the statement gave it one - a legal
     // RETURNING qualifier (`UPDATE T t ... RETURNING t.N`, probed)
     alias: Option<&str>,
+    // ...and whether the statement BOUND one at all. An alias REPLACES
+    // the relation name, so `UPDATE TQ t ... RETURNING TQ.ID` is the
+    // engine's -206 while the same clause without the alias answers
+    // ([dml_binds_alias]). `alias` cannot say so on its own: the alias
+    // has usually already come off the text by the time this runs.
+    aliased: bool,
     db: &Option<Database>,
 ) -> Option<(Plan, Vec<Descriptor>)> {
     let dbr = db.as_ref()?;
@@ -24943,7 +24877,7 @@ fn wrap_returning(
                 if matches!(&plan, Plan::Merge { .. }) {
                     return None;
                 }
-                return wrap_returning_view(plan, params, list, &vt, db);
+                return wrap_returning_view(plan, params, list, &vt, aliased, db);
             }
         }
         if is_view(dbr, table) {
@@ -24986,7 +24920,7 @@ fn wrap_returning(
             let (sp, _) = plan_query(source_sql, db);
             let scols: Vec<ProjCol> = output_cols_of(&sp);
             let src: Vec<String> =
-                scols.iter().map(|c| c.name.to_ascii_uppercase()).collect();
+                scols.iter().map(|c| c.name.clone()).collect(); // canonical: exact
             Some((tgt_alias.clone(), src, src_alias.clone(), scols))
         }
         _ => None,
@@ -25062,7 +24996,8 @@ fn wrap_returning(
         // in DECLARATION order (probed: `RETURNING *` over T(ID, N, S)
         // answers ID, N, S). A star is not a name, so it is taken before
         // the spelled/expression split below.
-        if let Some(star_ctx) = returning_star(item, table, &canon, alias, two_rows, &merge) {
+        if let Some(star_ctx) = returning_star(item, table, &canon, alias, aliased, two_rows, &merge)
+        {
             if star_ctx == StarCtx::Source {
                 let (_, _, _, scols) = merge.as_ref()?;
                 for (pos, sc) in scols.iter().enumerate() {
@@ -25240,22 +25175,23 @@ fn wrap_returning(
                 let mut names = Vec::new();
                 raw_expr_col_names(&raw, &mut names);
                 for n in &names {
-                    match n.split_once('.') {
+                    // the names are CANONICAL ([RawExpr::Col]); so are
+                    // the aliases and the source's columns - exact
+                    match n.rsplit_once('.') {
                         Some((q, _)) => {
-                            let q = q.trim().trim_matches('"');
-                            if !(q.eq_ignore_ascii_case(alias_t) || q.eq_ignore_ascii_case("NEW")) {
+                            if !(q == alias_t || q == "NEW") {
                                 return None;
                             }
                         }
                         None => {
-                            let bare = n.trim().trim_matches('"');
+                            let bare = n.as_str();
                             // a name the writer QUALIFIED with the
                             // target is unambiguous; only a truly bare
                             // one meets the 42702 rule
-                            if qualified.iter().any(|q| q.eq_ignore_ascii_case(bare)) {
+                            if qualified.iter().any(|q| q == bare) {
                                 continue;
                             }
-                            if src.iter().any(|s| s.eq_ignore_ascii_case(bare)) {
+                            if src.iter().any(|s| s == bare) {
                                 return None;
                             }
                         }
@@ -25324,14 +25260,14 @@ fn wrap_returning(
         // and describes as the SOURCE's own column (the engine names its
         // table SRC, not the target - probed).
         if let (Some((_, _, src_alias, scols)), Some((q, quoted))) = (&merge, &qual) {
-            let names_src = if *quoted {
-                *q == *src_alias
-            } else {
-                q.eq_ignore_ascii_case(src_alias)
-            };
+            // a bare qualifier FOLDS, a quoted one is exact - and the
+            // alias it is compared with is canonical
+            let names_src = if *quoted { *q == *src_alias } else { q.to_ascii_uppercase() == *src_alias };
             if names_src {
+                // a bare name FOLDS to its catalog spelling; first-match
+                // case-blind would read a quoted lower twin (`a` beside A)
                 let pos = scols.iter().position(|c| {
-                    if bare_q { c.name == bare } else { c.name.eq_ignore_ascii_case(&bare) }
+                    if bare_q { c.name == bare } else { c.name == bare.to_ascii_uppercase() }
                 })?;
                 let mut pc = scols[pos].clone();
                 pc.field_id = 0;
@@ -25393,19 +25329,25 @@ fn wrap_returning(
             let ok = old_ctx
                 || match &merge {
                     Some((alias_t, _, _, _)) => {
-                        (if *quoted { *q == *alias_t } else { q.eq_ignore_ascii_case(alias_t) })
+                        (if *quoted { *q == *alias_t } else { q.to_ascii_uppercase() == *alias_t })
                             || (!*quoted && q.eq_ignore_ascii_case("NEW"))
                     }
                     None => {
+                        // AN ALIAS REPLACES THE RELATION NAME: with one
+                        // bound, `RETURNING TQ.ID` is -206 on the
+                        // engine and only the alias (or the after-image
+                        // context) names the row
+                        let names_rel = |n: &str| !aliased && n == canon;
                         if *quoted {
-                            *q == canon
+                            names_rel(q) || alias.is_some_and(|a| *q == a)
                         } else {
-                            q.eq_ignore_ascii_case(table)
+                            let qu = q.to_ascii_uppercase();
+                            names_rel(&qu)
                                 // the statement's own alias, and the
                                 // after-image context - both name the
                                 // row this route already reads
-                                || alias.is_some_and(|a| q.eq_ignore_ascii_case(a))
-                                || (two_rows && q.eq_ignore_ascii_case("NEW"))
+                                || alias.is_some_and(|a| qu == a)
+                                || (two_rows && qu == "NEW")
                         }
                     }
                 };
@@ -25415,7 +25357,7 @@ fn wrap_returning(
                 return None;
             }
         } else if let Some((_, src, _, _)) = &merge {
-            if src.iter().any(|n| if bare_q { *n == bare } else { n.eq_ignore_ascii_case(&bare) }) {
+            if src.iter().any(|n| if bare_q { *n == bare } else { *n == bare.to_ascii_uppercase() }) {
                 return None; // ambiguous between the source and the target
             }
         }
@@ -25423,7 +25365,7 @@ fn wrap_returning(
             return None;
         }
         let c = columns.iter().find(|c| {
-            if bare_q { c.name == bare } else { c.name.eq_ignore_ascii_case(&bare) }
+            if bare_q { c.name == bare } else { c.name == bare.to_ascii_uppercase() }
         })?;
         let fid = c.field_id as usize;
         // A COMPUTED column has no stored bytes: its descriptor sits at
@@ -25506,6 +25448,9 @@ fn returning_star(
     table: &str,
     canon: &str,
     alias: Option<&str>,
+    // the statement bound an ALIAS, so the relation name no longer
+    // names the row - `RETURNING TQ.*` under `UPDATE TQ t` is -206
+    aliased: bool,
     two_rows: bool,
     merge: &Option<(String, Vec<String>, String, Vec<ProjCol>)>,
 ) -> Option<StarCtx> {
@@ -25537,18 +25482,17 @@ fn returning_star(
     // a MERGE's SOURCE, starred: its own columns, not the target's
     if let Some((_, _, src_alias, _)) = merge {
         let names_src =
-            if quoted { name == *src_alias } else { name.eq_ignore_ascii_case(src_alias) };
+            if quoted { name == *src_alias } else { name.to_ascii_uppercase() == *src_alias };
         if names_src {
             return Some(StarCtx::Source);
         }
     }
-    let names_target = if quoted {
-        name == *canon || merge.as_ref().is_some_and(|(a, ..)| name == *a)
-    } else {
-        name.eq_ignore_ascii_case(table)
-            || alias.is_some_and(|a| name.eq_ignore_ascii_case(a))
-            || merge.as_ref().is_some_and(|(a, ..)| name.eq_ignore_ascii_case(a))
-    };
+    // the canonical spelling of the qualifier against canonical names
+    let cname = if quoted { name.clone() } else { name.to_ascii_uppercase() };
+    let _ = table;
+    let names_target = (!aliased && cname == *canon)
+        || alias.is_some_and(|a| cname == a)
+        || merge.as_ref().is_some_and(|(a, ..)| cname == *a);
     names_target.then_some(StarCtx::New)
 }
 
@@ -25628,7 +25572,7 @@ fn rewrite_old_refs(text: &str) -> String {
 /// PUBLIC.T`, `UPDATE OR INSERT INTO PUBLIC.T ... RETURNING`), and each
 /// keeps its unqualified wire statement type (2/3/4/8) - that comes free
 /// here, since the type is derived from the verb and not from the name.
-fn dml_target_name(head: &str) -> Option<(Option<NamePart<'_>>, &str)> {
+fn dml_target_name(head: &str) -> Option<(Option<NamePart<'_>>, String)> {
     let t = head.trim();
     let (parts, len) = split_name_parts(t, 2)?;
     if len != t.len() {
@@ -25640,19 +25584,30 @@ fn dml_target_name(head: &str) -> Option<(Option<NamePart<'_>>, &str)> {
         _ => return None,
     };
     // a BARE name keeps the ident_ok gate every one of these scanners
-    // has always had; a QUOTED one is taken verbatim
+    // has always had, and FOLDS; a QUOTED one is taken verbatim - the
+    // relation is CANONICAL from here on (`"Order"` is `Order`, `tq` is
+    // TQ), which is what the catalog holds
     if !name.1 && !ident_ok(name.0) {
         return None;
     }
-    Some((schema, name.0))
+    Some((schema, if name.1 { name.0.to_string() } else { name.0.to_ascii_uppercase() }))
 }
 
 /// The (schema, bare name) a DML statement writes to - the head walk
 /// [dml_table_name] and [unqualify_dml] share, so the RETURNING resolver
 /// and the qualifier strip cannot disagree about which relation is the
 /// target.
-fn dml_target(sql: &str) -> Option<(Option<NamePart<'_>>, &str)> {
+fn dml_target(sql: &str) -> Option<(Option<NamePart<'_>>, String)> {
+    dml_target_span(sql).map(|(q, n, _)| (q, n))
+}
+
+/// [dml_target] plus the byte offset (into `sql`) just past the target's
+/// name span - where an alias would start. The span is measured, not
+/// searched for, so a QUOTED target (`UPDATE "Order" o`) is found as
+/// surely as a bare one.
+fn dml_target_span(sql: &str) -> Option<(Option<NamePart<'_>>, String, usize)> {
     let s = sql.trim();
+    let lead = sql.len() - sql.trim_start().len();
     let up = s.to_ascii_uppercase();
     let masked = mask_literals(&up);
     let (kw, after) = if find_word(&masked, "INSERT", 0) == Some(0) {
@@ -25690,7 +25645,9 @@ fn dml_target(sql: &str) -> Option<(Option<NamePart<'_>>, &str)> {
     // the NAME SPAN, not "up to the first blank": the dot is its own
     // token, so `INSERT INTO PUBLIC . T` names PUBLIC.T (probed)
     let end = qualified_name_span(rest)?;
-    dml_target_name(&rest[..end])
+    let (schema, name) = dml_target_name(&rest[..end])?;
+    let span_end = lead + (s.len() - rest.len()) + end;
+    Some((schema, name, span_end))
 }
 
 /// The table a DML plan writes to, for resolving a RETURNING list -
@@ -25698,7 +25655,7 @@ fn dml_target(sql: &str) -> Option<(Option<NamePart<'_>>, &str)> {
 /// planners have already checked the schema by the time this runs
 /// (a refused plan never reaches `wrap_returning`).
 fn dml_table_name(sql: &str) -> Option<String> {
-    dml_target(sql).map(|(_, n)| n.to_string())
+    dml_target(sql).map(|(_, n)| n)
 }
 
 /// Take a DML target's ALIAS off the statement, rewriting every
@@ -25792,10 +25749,13 @@ fn strip_dml_alias(sql: &str, _view_target: bool) -> Option<String> {
     }
     out.push_str(&sql[cut..]);
     // AN ALIAS REPLACES THE TABLE NAME: after `DELETE FROM T AS Q` a
-    // `T.C` inside a subquery is the engine's -206 unless that subquery's
-    // own FROM names T. Rewritten to the bare alias-less statement it
-    // would have READ as the outer row, so the statement keeps its alias
-    // (and refuses) instead
+    // `T.C` is the engine's -206 ANYWHERE the statement's own scope
+    // reaches - `DELETE FROM VCASE v WHERE VCASE."a" = 1` included -
+    // and only a SUBQUERY whose own FROM names T unaliased makes it
+    // that subquery's row instead. Rewritten to the bare alias-less
+    // statement it would have READ as the outer row (or, at depth 0,
+    // as the target's own row: a DELETE of the wrong record,
+    // review-caught), so the statement keeps its alias and refuses.
     let utarget = target.to_ascii_uppercase();
     let mut at = def_at + alias.len();
     // ...unless the alias IS the base name (`UPDATE T t`): then every
@@ -25806,7 +25766,6 @@ fn strip_dml_alias(sql: &str, _view_target: bool) -> Option<String> {
     while let Some(p) = find_word(&masked, &utarget, at) {
         at = p + utarget.len();
         if b.get(at).copied() == Some(b'.')
-            && inside_select_span(&masked, p)
             && !subquery_from_names_unaliased(&masked, p, &target)
         {
             return None;
@@ -25873,7 +25832,7 @@ fn subquery_from_names_unaliased(masked: &str, at: usize, target: &str) -> bool 
         let Some((left, joins)) = parse_from(table_s) else { return false };
         std::iter::once(&left)
             .chain(joins.iter().map(|(_, r, _, _)| r))
-            .any(|tr| tr.alias.is_none() && tr.table.eq_ignore_ascii_case(target))
+            .any(|tr| tr.alias.is_none() && tr.table == target)
     })
 }
 
@@ -25898,10 +25857,7 @@ fn subquery_from_binds(masked: &str, at: usize, key: &str) -> bool {
         let inner = &masked[o + 1..close];
         let Some((_, table_s, ..)) = split_query(inner) else { return false };
         let Some((left, joins)) = parse_from(table_s) else { return false };
-        std::iter::once(&left).chain(joins.iter().map(|(_, r, _, _)| r)).any(|tr| match tr.alias {
-            Some(a) => a.eq_ignore_ascii_case(key),
-            None => tr.table.eq_ignore_ascii_case(key),
-        })
+        std::iter::once(&left).chain(joins.iter().map(|(_, r, _, _)| r)).any(|tr| tr.key() == key)
     })
 }
 
@@ -25923,7 +25879,7 @@ fn dml_alias_subquery_names(masked: &str, at: usize, target: &str) -> bool {
         let word = masked[o + 1..].trim_start();
         word.starts_with("SELECT")
             && !word[6..].starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_' || c == '$')
-            && view_group_from_names(masked, o).iter().any(|n| n.eq_ignore_ascii_case(target))
+            && view_group_from_names(masked, o).iter().any(|n| n == target)
     })
 }
 
@@ -25949,9 +25905,7 @@ fn dml_target_alias(sql: &str) -> Option<(String, usize)> {
     if !update && find_word(&masked, "DELETE", 0) != Some(0) {
         return None;
     }
-    let (_, name) = dml_target(sql)?;
-    let at = find_word(&masked, &name.to_ascii_uppercase(), 0)?;
-    let after_name = at + name.len();
+    let (_, _, after_name) = dml_target_span(sql)?;
     let rest = sql[after_name..].trim_start();
     let mut word_at = after_name + (sql[after_name..].len() - rest.len());
     // `AS` is optional sugar before the alias
@@ -25977,7 +25931,48 @@ fn dml_target_alias(sql: &str) -> Option<(String, usize)> {
     ) {
         return None;
     }
-    Some((word.to_string(), word_at))
+    // CANONICAL: a bare alias is a name and folds (`UPDATE T t` binds T);
+    // a quoted alias never reaches here (the scan above stops at the
+    // quote) - recorded boundary
+    Some((word.to_ascii_uppercase(), word_at))
+}
+
+/// Does this DML statement BIND AN ALIAS to its target?
+///
+/// AN ALIAS REPLACES THE RELATION NAME. Firebird's rule (measured, and
+/// the whole point of this helper): after `DELETE FROM TQ t` the only
+/// legal qualifier for a column of TQ is `t`, and `TQ."a"`,
+/// `PUBLIC.TQ."a"` and `TQ.*` are all `-206 Column unknown` - even
+/// though the same references are perfectly legal on the SAME
+/// statement written without an alias.
+///
+/// [dml_target_alias] cannot spell a QUOTED alias (its scan stops at
+/// the quote - a recorded boundary), but such a statement has bound an
+/// alias all the same and the relation name is gone from scope just as
+/// surely, so the quoted shape is answered here too.
+fn dml_binds_alias(sql: &str) -> bool {
+    if dml_target_alias(sql).is_some() {
+        return true;
+    }
+    let up = sql.to_ascii_uppercase();
+    let masked = mask_literals(&up);
+    // only UPDATE and DELETE take one ([dml_target_alias]'s own rule)
+    let update = find_word(&masked, "UPDATE", 0) == Some(0)
+        && find_word(&masked, "OR", "UPDATE".len())
+            .filter(|&or| masked["UPDATE".len()..or].trim().is_empty())
+            .is_none();
+    if !update && find_word(&masked, "DELETE", 0) != Some(0) {
+        return false;
+    }
+    let Some((_, _, after_name)) = dml_target_span(sql) else {
+        return false;
+    };
+    let rest = sql[after_name..].trim_start();
+    let rest = match rest.split_once(char::is_whitespace) {
+        Some((w, tail)) if w.eq_ignore_ascii_case("AS") => tail.trim_start(),
+        _ => rest,
+    };
+    rest.starts_with('"')
 }
 
 /// Strip a DML statement's 3-part column references before its planner
@@ -25990,8 +25985,21 @@ fn dml_target_alias(sql: &str) -> Option<(String, usize)> {
 /// The TARGET's own `SCHEMA.` prefix survives untouched: it is not
 /// followed by a further dot, so neither of [unqualify_single]'s rules
 /// matches it, and the planner still gets the qualifier to check.
-fn unqualify_dml(sql: &str, db: &Option<Database>) -> Option<String> {
+///
+/// `aliased` says the statement BOUND AN ALIAS to its target
+/// ([dml_binds_alias], asked of the statement AS WRITTEN - the alias
+/// itself has already come off by the time this runs). An alias
+/// REPLACES the relation name, so there is then NO relation-name
+/// binding to strip: `DELETE FROM TQ t WHERE TQ."a" = 1` is the
+/// engine's -206, and stripping the qualifier here turned it into a
+/// DELETE of the wrong row (review-caught). The reference is left
+/// whole and fails to resolve, which is this server's honest answer -
+/// it has no -206 vector to spell (recorded).
+fn unqualify_dml(sql: &str, db: &Option<Database>, aliased: bool) -> Option<String> {
     if !sql.contains('.') {
+        return None;
+    }
+    if aliased {
         return None;
     }
     let dbr = db.as_ref()?;
@@ -26002,9 +26010,10 @@ fn unqualify_dml(sql: &str, db: &Option<Database>) -> Option<String> {
     if find_word(&mask_literals(&sql.trim().to_ascii_uppercase()), "MERGE", 0) == Some(0) {
         return None;
     }
-    let (_, table) = dml_target(sql)?;
-    // a DML target takes no alias in this server's grammar, so the
-    // relation name is the key and the 3-part form is always available
+    let (_, table_c) = dml_target(sql)?;
+    let table: &str = table_c.as_str();
+    // NO ALIAS was bound (checked above), so the relation name is the
+    // key and the 3-part form is available too
     let bind = ColBinding { key: table, qual: relation_schema(dbr, table).map(|s| (s, table)) };
     unqualify_single(sql, &bind)
 }
@@ -26082,7 +26091,7 @@ fn qualified_relation_name_uncached(db: &Database, rel: u16) -> Option<String> {
 /// detail is not reproduced.
 fn split_insert_head(
     head: &str,
-) -> Option<(Option<NamePart<'_>>, &str, Option<Vec<String>>, Overriding)> {
+) -> Option<(Option<NamePart<'_>>, String, Option<Vec<String>>, Overriding)> {
     let up = head.to_ascii_uppercase();
     let masked = mask_literals(&up);
     let (name_end, collist, after) = match masked.find('(') {
@@ -26216,7 +26225,8 @@ fn plan_insert_select(
     sel: usize,
     db: &Option<Database>,
 ) -> Option<(Plan, Vec<Descriptor>)> {
-    let (schema, table, collist, ov) = split_insert_head(s[into + "INTO".len()..sel].trim())?;
+    let (schema, table_c, collist, ov) = split_insert_head(s[into + "INTO".len()..sel].trim())?;
+    let table: &str = table_c.as_str();
     let dbr = db.as_ref()?;
     // THE SCHEMA HALF: `INSERT INTO PUBLIC.T ... SELECT` answers on the
     // engine, `INSERT INTO SYSTEM.T` is its -204. Checked before the
@@ -26253,7 +26263,7 @@ fn plan_insert_select(
     match &collist {
         Some(names) => {
             for n in names {
-                let rc = columns.iter().find(|c| c.name.eq_ignore_ascii_case(n))?;
+                let rc = find_col(&columns, n)?;
                 // a computed column is read-only ("attempted update of
                 // read-only column") - refuse
                 if is_computed_fid(descs, rc.field_id as usize) {
@@ -26373,7 +26383,7 @@ fn plan_insert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
     // between INTO and VALUES (or DEFAULT): the table name + optional
     // (column list) + optional OVERRIDING clause
     let head = s[into + "INTO".len()..default_values.unwrap_or(vals_kw)].trim();
-    let (schema, table, collist, ov) = match default_values {
+    let (schema, table_c, collist, ov) = match default_values {
         // DEFAULT VALUES: the head must be a BARE table name. A '('
         // (`INSERT INTO D_DEF () DEFAULT VALUES`) or an OVERRIDING word
         // (`INSERT INTO TA OVERRIDING SYSTEM VALUE DEFAULT VALUES`)
@@ -26387,6 +26397,7 @@ fn plan_insert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
         }
         None => split_insert_head(head)?,
     };
+    let table: &str = table_c.as_str();
     let mut vals: Vec<InsVal> = Vec::new();
     let mut nparams = 0usize;
     if default_values.is_none() {
@@ -26463,13 +26474,22 @@ fn plan_insert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
                         && b.eq_ignore_ascii_case("VALUE")
                         && c.eq_ignore_ascii_case("FOR") =>
                 {
-                    InsVal::GenId(seq.trim_matches('"').to_string(), None)
+                    // a generator name keeps FOLDING (out of this slice); a
+                    // quoted lower-case one refuses rather than resolving
+                    // to its folded twin
+                    if seq.bytes().any(|c| c.is_ascii_lowercase()) {
+                        return None;
+                    }
+                    InsVal::GenId(seq.clone(), None)
                 }
                 // GEN_ID(<name>, <step>) - advance by an explicit step
                 [Tok::Ident(g), Tok::LParen, Tok::Ident(name), Tok::Comma, Tok::Int(n), Tok::RParen]
                     if g.eq_ignore_ascii_case("GEN_ID") =>
                 {
-                    InsVal::GenId(name.trim_matches('"').to_string(), Some(*n))
+                    if name.bytes().any(|c| c.is_ascii_lowercase()) {
+                        return None;
+                    }
+                    InsVal::GenId(name.clone(), Some(*n))
                 }
                 // ANY OTHER run: a CONSTANT EXPRESSION, as the engine
                 // accepts any value expression here - `1+2`, `'A'||'B'`,
@@ -26554,7 +26574,7 @@ fn plan_insert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
         Some(names) => {
             let mut v = Vec::new();
             for n in names {
-                let rc = columns.iter().find(|c| c.name.eq_ignore_ascii_case(n))?;
+                let rc = find_col(&columns, n)?;
                 // a computed column is read-only (the engine errors:
                 // "attempted update of read-only column") - refuse
                 if is_computed_fid(descs, rc.field_id as usize) {
@@ -28549,11 +28569,13 @@ fn plan_upsert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
     // probed: `UPDATE OR INSERT INTO TA (ID,B) OVERRIDING SYSTEM VALUE
     // VALUES (4242,'uoi') MATCHING (ID)` succeeds where the same
     // statement without the clause answers 335545137
-    let (schema, tbl, collist, ov) = split_insert_head(head)?;
+    let (schema, tbl_c, collist, ov) = split_insert_head(head)?;
+    let tbl: &str = tbl_c.as_str();
     if !db.as_ref().is_some_and(|dbr| relation_qualifier_ok(dbr, schema, tbl)) {
         return None;
     }
-    let table = tbl.to_ascii_uppercase();
+    // the target is CANONICAL already (`"Order"` is Order, `t` is T)
+    let table = tbl.to_string();
     let cols = collist?;
     // the (value list) - paren depth on the MASKED text, so parens
     // and commas inside string literals do not count
@@ -28663,28 +28685,31 @@ fn plan_upsert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
     let mut wheres: Vec<String> = Vec::new();
     let mut upd_args: Vec<usize> = val_slots.concat();
     for m in &mcols {
-        let pos = cols.iter().position(|c| c.eq_ignore_ascii_case(m))?;
+        let pos = cols.iter().position(|c| c == m)?;
         if vals[pos].trim().eq_ignore_ascii_case("NULL") {
             return None;
         }
-        wheres.push(format!("{} = {}", cols[pos], vals[pos]));
+        // RE-RENDERED through [render_canon_ref]: the names are canonical
+        // and the two halves are PARSED AGAIN - a bare `a` there is A
+        // (review-caught: `MATCHING ("a")` wrote column A)
+        wheres.push(format!("{} = {}", render_canon_ref(&cols[pos]), vals[pos]));
         upd_args.extend_from_slice(&val_slots[pos]);
     }
     let sets: Vec<String> = cols
         .iter()
         .zip(vals.iter())
-        .map(|(c, v)| format!("{} = {}", c, v))
+        .map(|(c, v)| format!("{} = {}", render_canon_ref(c), v))
         .collect();
     let upd_sql = format!(
         "UPDATE {} SET {} WHERE {}",
-        table,
+        render_canon_ref(&table),
         sets.join(", "),
         wheres.join(" AND ")
     );
     let ins_sql = format!(
         "INSERT INTO {} ({}){} VALUES ({})",
-        table,
-        cols.join(", "),
+        render_canon_ref(&table),
+        cols.iter().map(|c| render_canon_ref(c)).collect::<Vec<_>>().join(", "),
         ov.sql(),
         vals.join(", ")
     );
@@ -28721,7 +28746,8 @@ fn plan_update(sql: &str, db_outer: &Option<Database>) -> Option<(Plan, Vec<Desc
         return None;
     }
     let set_kw = find_word(&masked, "SET", "UPDATE".len())?;
-    let (schema, table) = dml_target_name(&s["UPDATE".len()..set_kw])?;
+    let (schema, table_c) = dml_target_name(&s["UPDATE".len()..set_kw])?;
+    let table: &str = table_c.as_str();
     // THE STATEMENT'S OWN `WHERE`, at paren depth zero. A SET value may
     // be a SUBQUERY with a WHERE of its own (`SET N = (SELECT V FROM P
     // WHERE P.ID = D.ID)`), and taking the first WHERE cut the SET list
@@ -28812,11 +28838,11 @@ fn plan_update(sql: &str, db_outer: &Option<Database>) -> Option<(Plan, Vec<Desc
             Some(x) => x,
             // `<col> = <expression>`
             None => {
-                let eq = part_text.find('=')?;
-                let col = part_text[..eq].trim().trim_matches('"').to_string();
-                if !ident_ok(&col) {
-                    return None;
-                }
+                // the `=` OUTSIDE any quoted name (`SET "a=b" = 1`)
+                let eq = mask_literals(&part_text).find('=')?;
+                // the column CANONICAL ([canon_ident]): `SET "a" = 5`
+                // writes `a`, never its folded twin A
+                let col = canon_ident(part_text[..eq].trim())?;
                 let rhs = part_text[eq + 1..].trim();
                 // A SUBQUERY AS THE ASSIGNED VALUE. One that names no
                 // outer column is a CONSTANT for the whole statement -
@@ -28840,7 +28866,7 @@ fn plan_update(sql: &str, db_outer: &Option<Database>) -> Option<(Plan, Vec<Desc
                 } else {
                     rhs
                 };
-                let rc0 = columns.iter().find(|c| c.name.eq_ignore_ascii_case(&col))?;
+                let rc0 = find_col(&columns, &col)?;
                 let fid0 = rc0.field_id as usize;
                 // `SET <col> = GEN_ID(g,n)` / `= NEXT VALUE FOR g`: a
                 // GENERATOR DRAW, made once per UPDATED row. It is its
@@ -28981,7 +29007,7 @@ fn plan_update(sql: &str, db_outer: &Option<Database>) -> Option<(Plan, Vec<Desc
             }
         };
         let name = &name;
-        let rc = columns.iter().find(|c| c.name.eq_ignore_ascii_case(name))?;
+        let rc = find_col(&columns, name)?;
         let fid = rc.field_id as usize;
         if sets.iter().any(|(f, _)| *f == fid) {
             return None; // the same column set twice is invalid SQL
@@ -29170,7 +29196,7 @@ fn plan_update(sql: &str, db_outer: &Option<Database>) -> Option<(Plan, Vec<Desc
     // serve-real-index's FC_NO_INDEX twin asserts ZERO "index scan:"
     // lines over a log full of plain DML, and a distinct string keeps
     // that claim and this one independently greppable.
-    let opt_sql = folded_where.as_ref().map(|w| format!("SELECT 1 FROM {} WHERE {}", table, w));
+    let opt_sql = folded_where.as_ref().map(|w| format!("SELECT 1 FROM {} WHERE {}", render_canon_ref(table), w));
     let index = opt_sql
         .as_deref()
         .and_then(|s| choose_index(db, rel, table, descs, &filter, s, &[]));
@@ -29223,7 +29249,8 @@ fn plan_delete(sql: &str, db_outer: &Option<Database>) -> Option<(Plan, Vec<Desc
     }
     let from_kw = find_word(&masked, "FROM", "DELETE".len())?;
     let where_kw = find_word(&masked, "WHERE", from_kw + "FROM".len());
-    let (schema, table) = dml_target_name(&s[from_kw + "FROM".len()..where_kw.unwrap_or(s.len())])?;
+    let (schema, table_c) = dml_target_name(&s[from_kw + "FROM".len()..where_kw.unwrap_or(s.len())])?;
+    let table: &str = table_c.as_str();
     let db = db.as_ref()?;
     if !relation_qualifier_ok(db, schema, table) {
         return None;
@@ -29304,7 +29331,7 @@ fn plan_delete(sql: &str, db_outer: &Option<Database>) -> Option<(Plan, Vec<Desc
     let (_, fk_children) = fk_partners(db, table, &columns)?;
     // the same reconstruction and the same DISTINCT trace pair as
     // plan_update - see the law stated there
-    let opt_sql = folded_where.as_ref().map(|w| format!("SELECT 1 FROM {} WHERE {}", table, w));
+    let opt_sql = folded_where.as_ref().map(|w| format!("SELECT 1 FROM {} WHERE {}", render_canon_ref(table), w));
     let index = opt_sql
         .as_deref()
         .and_then(|s| choose_index(db, rel, table, descs, &filter, s, &[]));
@@ -29583,7 +29610,7 @@ fn parse_gen_where(
     }
     let fid = columns
         .iter()
-        .find(|c| c.name.eq_ignore_ascii_case(col))
+        .find(|c| c.name == col)
         .map(|c| c.field_id as usize)?;
     if is_computed_fid(descs, fid) {
         return None;
@@ -33581,7 +33608,7 @@ fn validate_row_fields(
                     return Err(ExecErr::Eval(EvalErr::NotValid {
                         column: format!(
                             "\"PUBLIC\".\"{}\".\"{}\"",
-                            table.trim_matches('"').to_ascii_uppercase(),
+                            table,
                             c.column.trim_end()
                         ),
                         value: validation_value_text(vals.get(c.fid).unwrap_or(&Value::Null)),
@@ -33656,7 +33683,7 @@ fn not_valid_err(db: &Database, table: &str, fid: usize) -> ExecErr {
         Some(n) => ExecErr::Eval(EvalErr::NotValid {
             column: format!(
                 "\"PUBLIC\".\"{}\".\"{}\"",
-                table.trim_matches('"').to_ascii_uppercase(),
+                table,
                 n.trim_end()
             ),
             value: "*** null ***".into(),
@@ -33719,6 +33746,7 @@ fn unique_violation_err(
 /// `RDB$INDEX_ID` stores the slot + 1, both here and in the engine -
 /// then on to the owning constraint, when one exists.
 fn index_error_names(db: &Database, table: &str, index_id: u8) -> Option<(String, Option<String>)> {
+    let want_rel = rel_row_name(db, table);
     let formats =
         fire_crab_ods::sysfmt::system_relation_formats(&db.bytes(), db.page_size, "RDB$INDICES")?;
     let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
@@ -33736,7 +33764,7 @@ fn index_error_names(db: &Database, table: &str, index_id: u8) -> Option<(String
         if found.is_some() {
             return;
         }
-        let on_rel = matches!(values.get(rn_f), Some(Value::Text(t)) if t.trim_end().eq_ignore_ascii_case(table));
+        let on_rel = matches!(values.get(rn_f), Some(Value::Text(t)) if t.trim_end() == want_rel);
         let on_id = matches!(values.get(id_f), Some(Value::Int(i)) if *i == index_id as i64 + 1);
         if on_rel && on_id {
             if let Some(Value::Text(n)) = values.get(nm_f) {
@@ -33908,15 +33936,16 @@ fn select_formats(db: &Database, table: &str, rel: u16) -> Vec<(u8, Vec<Descript
 /// `PUBLIC.T` into a `ProjCol.relation` is a silent describe corruption
 /// no row-comparison gate would catch.
 struct TableRef<'a> {
-    /// the BARE relation name - a subslice of the SQL with its quotes
-    /// stripped. `splice_ctes` turns this back into a byte offset by
-    /// pointer arithmetic, so it must never become owned.
-    table: &'a str,
+    /// the relation name, CANONICAL ([canon_ident]'s rule: a quoted
+    /// name exact, a bare one folded to upper case) - the catalog
+    /// spelling, which every lookup downstream compares EXACTLY. A
+    /// derived table carries its whole `(SELECT ...)` text here.
+    table: String,
+    /// the relation name AS WRITTEN with its quotes stripped - a
+    /// subslice of the SQL, which the -204 rendering spells from
+    raw: &'a str,
     /// was the relation half written QUOTED? Only the -204 rendering
-    /// needs it. The LOOKUP stays case-insensitive: `resolve_relation`
-    /// compares with `eq_ignore_ascii_case`, so `FROM "t"` answers here
-    /// where the engine raises. Pre-existing asymmetry, NOT widened by
-    /// this slice - the schema half below does honour case.
+    /// needs it: the lookup is exact on `table` either way.
     quoted: bool,
     /// the SCHEMA half AS WRITTEN (quotes stripped, the quoted flag
     /// kept - the engine matches a quoted schema case-sensitively).
@@ -33931,10 +33960,25 @@ struct TableRef<'a> {
     /// `SELECT COUNT(*) FROM PUBLIC.RDB$RELATIONS` reports column 22,
     /// the `P` of PUBLIC)
     span: &'a str,
-    alias: Option<&'a str>,
+    /// the WHOLE reference as written, alias included - a subslice, so
+    /// [splice_ctes] can replace it by pointer arithmetic
+    whole: &'a str,
+    /// the alias, CANONICAL: `FROM TQ "t"` binds `t` and `FROM TQ t`
+    /// binds `T` - an alias is a name like any other
+    alias: Option<String>,
 }
 
 impl<'a> TableRef<'a> {
+    /// The binding key of this FROM item: its alias, else its relation
+    /// name (canonical either way). An alias is EXCLUSIVE - once given,
+    /// the relation name is no key at all.
+    fn key(&self) -> &str {
+        self.alias.as_deref().unwrap_or(&self.table)
+    }
+    /// The alias as an owned option - for the `rel_alias` describe slots.
+    fn alias_owned(&self) -> Option<String> {
+        self.alias.clone()
+    }
     /// The reference as the engine's -204 argument spells it: one part
     /// when the user wrote one, two when the user wrote two. Probed: the
     /// arity of the name in the message mirrors the arity WRITTEN.
@@ -33943,13 +33987,20 @@ impl<'a> TableRef<'a> {
         if let Some(q) = self.schema {
             parts.push(q);
         }
-        parts.push((self.table, self.quoted));
+        parts.push((self.raw, self.quoted));
         quoted_name_parts(&parts)
     }
 }
 
 /// Parse a table reference: `[SCHEMA.]NAME`, optionally followed by
 /// `[AS] ALIAS`.
+/// The relation a FROM item names - `TableRef.table` is canonical
+/// already (a quoted name exact, a bare one folded), so this is the
+/// identity; kept for the callers that want an owned copy.
+fn canon_table_text(tr: &TableRef<'_>) -> String {
+    tr.table.clone()
+}
+
 fn parse_table_ref(s: &str) -> Option<TableRef<'_>> {
     // A DERIVED TABLE is a table reference whose "name" is a whole
     // query. Splitting on whitespace would tear it apart, so the paren
@@ -33977,15 +34028,15 @@ fn parse_table_ref(s: &str) -> Option<TableRef<'_>> {
             }
             None => close + 1,
         };
-        let alias = rest.trim_matches('"');
-        if !ident_ok(alias) {
-            return None;
-        }
+        // the alias is a NAME: `"x y"` binds exactly, `x` binds X
+        let alias = canon_ident(rest)?;
         return Some(TableRef {
-            table: &t[..span_end],
+            table: t[..span_end].to_string(),
+            raw: &t[..span_end],
             quoted: false,
             schema: None,
             span: &t[..span_end],
+            whole: t,
             alias: Some(alias),
         });
     }
@@ -34022,17 +34073,19 @@ fn parse_table_ref(s: &str) -> Option<TableRef<'_>> {
         // all. In particular `FROM PUBLIC.PW6(5)` must still be None so
         // `split_proc_call` stays the only handler for a procedure call
         // in the FROM - fire-crab must not assume a dotted FROM item is
-        // a table.
-        if a.split_whitespace().count() != 1 {
+        // a table. A QUOTED alias is one token whatever it holds
+        // (`"a b"`), and is taken whole.
+        let quoted_alias = a.starts_with('"') && a.ends_with('"') && a.len() >= 2 && !a[1..a.len() - 1].contains('"');
+        if !quoted_alias && a.split_whitespace().count() != 1 {
             return None;
         }
-        let a = a.trim_matches('"');
-        if !ident_ok(a) {
-            return None;
-        }
-        Some(a)
+        // CANONICAL, like the relation: `FROM TQ "t"` binds `t` (and
+        // not T), `FROM TQ t` binds T - probed, the engine's -206 for
+        // `T."a"` after `FROM TQ "t"` says the two are different names
+        Some(canon_ident(a)?)
     };
-    Some(TableRef { table: name.0, quoted: name.1, schema, span: &t[..span_len], alias })
+    let table = if name.1 { name.0.to_string() } else { name.0.to_ascii_uppercase() };
+    Some(TableRef { table, raw: name.0, quoted: name.1, schema, span: &t[..span_len], whole: t, alias })
 }
 
 /// Parse a FROM clause into its left table and - if there is one - the
@@ -34230,16 +34283,17 @@ fn parse_from(
 /// literal) comes back as a bare column, which is the fall-through the
 /// callers have always had.
 fn split_col_ref(name: &str) -> (Option<NamePart<'_>>, Option<NamePart<'_>>, &str) {
+    // the reference is CANONICAL already ([scan_canon_ref]: parts
+    // joined by `.`, no quotes, each part the catalog spelling), so the
+    // split is on the dots alone and every part compares EXACTLY - the
+    // `true` flag says so to [part_is]
     let t = name.trim();
-    let whole = match split_name_parts(t, 3) {
-        Some((parts, len)) if len == t.len() => parts,
-        _ => return (None, None, t.trim_matches('"')),
-    };
-    match whole.as_slice() {
-        [c] => (None, None, c.0),
-        [q, c] => (None, Some(*q), c.0),
-        [s, q, c] => (Some(*s), Some(*q), c.0),
-        _ => (None, None, t.trim_matches('"')),
+    let parts: Vec<&str> = t.split('.').collect();
+    match parts.as_slice() {
+        [c] => (None, None, *c),
+        [q, c] => (None, Some((*q, true)), *c),
+        [s, q, c] => (Some((*s, true)), Some((*q, true)), *c),
+        _ => (None, None, t),
     }
 }
 
@@ -34329,7 +34383,7 @@ fn resolve_join_col<'a>(
     let (schema, qual, col) = split_col_ref(name);
     let hit = |side: &'a JoinSide| -> Option<(usize, &'a Descriptor, &'a str)> {
         let rc = side.columns.iter().find(|c| {
-            c.name.eq_ignore_ascii_case(col)
+            c.name == col
                 // a merged-away column answers only to its qualifier
                 && (qual.is_some() || !side.merged_away.contains(&c.field_id))
         })?;
@@ -34350,12 +34404,12 @@ fn resolve_join_col<'a>(
         // UNREACHABLE - recorded, not implemented.
         (Some(s), Some(q)) => hit(sides.iter().find(|side| {
             side.schema.as_deref().is_some_and(|sc| part_is(s, sc))
-                && side.key.eq_ignore_ascii_case(q.0)
+                && side.key == q.0
         })?),
         // `side.key` is already alias-or-relation, so ALIAS EXCLUSIVITY
         // is right here without a change: once a side is aliased its
         // relation name is not a key at all
-        (None, Some(q)) => hit(sides.iter().find(|s| s.key.eq_ignore_ascii_case(q.0))?),
+        (None, Some(q)) => hit(sides.iter().find(|s| s.key == q.0)?),
         (Some(_), None) => None,
         // a bare name must hit EXACTLY ONE side - with three tables in
         // the FROM there are three chances to be ambiguous, not one
@@ -34489,7 +34543,7 @@ fn combined_view(sides: &[JoinSide]) -> (Vec<RelationColumn>, Vec<Descriptor>) {
             }
             if let Some(prev) = comb_cols
                 .iter()
-                .position(|c| c.name.eq_ignore_ascii_case(&rc.name))
+                .position(|c| c.name == rc.name)
             {
                 comb_cols.remove(prev); // ambiguous: drop both
             } else {
@@ -34540,10 +34594,10 @@ fn resolve_join_predicate(
                     // is the fallback for a view built without it
                     RawLhs::Col(c)
                         if c.contains('.')
-                            && !comb_cols.iter().any(|k| k.name.eq_ignore_ascii_case(c)) =>
+                            && !comb_cols.iter().any(|k| col_name_is(&k.name, c)) =>
                     {
                         let bare = c.rsplit('.').next().unwrap_or(c);
-                        if !comb_cols.iter().any(|k| k.name.eq_ignore_ascii_case(bare)) {
+                        if !comb_cols.iter().any(|k| col_name_is(&k.name, bare)) {
                             return None; // ambiguous, or not in the view
                         }
                         RawTerm { lhs: RawLhs::Col(bare.to_string()), kind: rt.kind }
@@ -34576,9 +34630,9 @@ fn resolve_join_predicate(
                     // bare form is the fallback, same order as the
                     // expression branch above
                     let bare = col.rsplit('.').next().unwrap_or(col);
-                    let name = if comb_cols.iter().any(|c| c.name.eq_ignore_ascii_case(col)) {
+                    let name = if comb_cols.iter().any(|c| col_name_is(&c.name, col)) {
                         col.as_str()
-                    } else if comb_cols.iter().any(|c| c.name.eq_ignore_ascii_case(bare)) {
+                    } else if comb_cols.iter().any(|c| col_name_is(&c.name, bare)) {
                         bare
                     } else {
                         return None; // ambiguous, or not in the view
@@ -34694,32 +34748,33 @@ fn subst_lateral(
             }
             continue;
         }
-        // `<alias>.<col>` at a word boundary, col a real base column
+        // `<alias>.<col>` at a word boundary, col a real base column -
+        // both halves read CANONICALLY ([scan_canon_ref]: `"x"."a"` and
+        // X.A are each spelled the way the catalog does) and compared
+        // exactly against the alias and the base columns
         let boundary = i == 0 || !is_ident_byte(b[i - 1]);
-        if boundary
-            && sub.len() - i >= alias.len()
-            && sub[i..i + alias.len()].eq_ignore_ascii_case(alias)
-            && b.get(i + alias.len()) == Some(&b'.')
-        {
-            let dot = i + alias.len();
-            let mut k = dot + 1;
-            while k < sub.len() && is_ident_byte(b[k]) {
-                k += 1;
-            }
-            if k > dot + 1 {
-                let colname = &sub[dot + 1..k];
-                if let Some(rc) = cols.iter().find(|c| c.name.eq_ignore_ascii_case(colname)) {
-                    let lit = match row {
-                        None => format!(
-                            "CAST(NULL AS {})",
-                            desc_type_sql(descs.get(rc.field_id as usize)?)
-                        ),
-                        Some(vals) => value_to_sql(vals.get(rc.field_id as usize)?)?,
-                    };
-                    out.push_str(&lit);
-                    i = k;
-                    continue;
+        if boundary && (b[i] == b'"' || is_ident_byte(b[i])) {
+            if let Some((r, end)) = scan_canon_ref(sub, i, 2, false) {
+                if let Some((q, colname)) = r.split_once('.') {
+                    if q == alias {
+                        if let Some(rc) = cols.iter().find(|c| c.name == colname) {
+                            let lit = match row {
+                                None => format!(
+                                    "CAST(NULL AS {})",
+                                    desc_type_sql(descs.get(rc.field_id as usize)?)
+                                ),
+                                Some(vals) => value_to_sql(vals.get(rc.field_id as usize)?)?,
+                            };
+                            out.push_str(&lit);
+                            i = end;
+                            continue;
+                        }
+                    }
                 }
+                // not a substitution: copy the reference as written
+                out.push_str(&sub[i..end]);
+                i = end;
+                continue;
             }
         }
         out.push(b[i] as char);
@@ -34732,7 +34787,7 @@ fn subst_lateral(
 /// subquery text, the lateral alias, is-LEFT). First slice: a single base
 /// table (aliased), then either `, LATERAL (<sub>) <x>` (comma / INNER) or
 /// `LEFT [OUTER] JOIN LATERAL (<sub>) <x> ON TRUE`.
-fn parse_lateral_from(table_s: &str) -> Option<(&str, &str, String, String, bool)> {
+fn parse_lateral_from(table_s: &str) -> Option<(&str, String, String, String, bool)> {
     let t = table_s.trim();
     let up = mask_literals(&t.to_ascii_uppercase());
     let lat = find_word_depth0(&up, "LATERAL", 0)?;
@@ -34780,7 +34835,7 @@ fn parse_lateral_from(table_s: &str) -> Option<(&str, &str, String, String, bool
     if bref.schema.is_some() || bref.table.starts_with('(') {
         return None;
     }
-    let outer_alias = bref.alias.unwrap_or(bref.table);
+    let outer_alias = bref.key().to_string();
     Some((base_s, outer_alias, sub, lat_alias, left))
 }
 
@@ -34806,11 +34861,11 @@ fn plan_lateral(
         return None;
     }
     let bref = parse_table_ref(base_s)?;
-    let columns = db.columns(bref.table);
+    let columns = db.columns(&bref.table);
     if columns.is_empty() {
         return None;
     }
-    let rel = resolve_relation(&db.bytes(), db.page_size, bref.table)?;
+    let rel = resolve_relation(&db.bytes(), db.page_size, &bref.table)?;
     let outer_descs: Vec<Descriptor> = relation_formats(&db.bytes(), db.page_size, rel)
         .into_iter()
         .max_by_key(|(n, _)| *n)
@@ -34823,7 +34878,7 @@ fn plan_lateral(
     // pads the row, which is an EXECUTION concern carried by `left`. (fc's
     // join planner does not accept a derived side under LEFT JOIN ON TRUE,
     // so the comma form is also the one that plans.)
-    let null_sub = subst_lateral(&sub, outer_alias, &columns, &outer_descs, None)?;
+    let null_sub = subst_lateral(&sub, &outer_alias, &columns, &outer_descs, None)?;
     let describe_from = format!("{} , ({}) {}", base_s, null_sub, lat_alias);
     let (from, join) = parse_from(&describe_from)?;
     let planned = plan_join(
@@ -34847,7 +34902,7 @@ fn plan_lateral(
         return None;
     }
     let mut cols = cols;
-    mark_not_null_lateral(&mut cols, db, bref.table, base_width, &inner_cols, left);
+    mark_not_null_lateral(&mut cols, db, &bref.table, base_width, &inner_cols, left);
     Some(Plan::Lateral {
         base: base.clone(),
         base_width,
@@ -35081,7 +35136,7 @@ fn build_flatten(db: &Database, inner: &Plan) -> Option<FlatSrc> {
     if cols.iter().any(|c| {
         c.relation
             .as_deref()
-            .is_some_and(|r| !r.eq_ignore_ascii_case(&table))
+            .is_some_and(|r| *r != table)
     }) {
         return None;
     }
@@ -35244,7 +35299,7 @@ fn build_join_probe(
     // sound because fcopt's answer for the equality shape is
     // VALUE-INDEPENDENT (probed: `K = 0` and `K = 12345678` plan alike).
     let bless = |inner_fid: usize, col: &str| -> Option<u8> {
-        let opt_sql = format!("SELECT 1 FROM {} WHERE {} = 0", src.table, col);
+        let opt_sql = format!("SELECT 1 FROM {} WHERE {} = 0", render_canon_ref(&src.table), render_canon_ref(&col));
         let filter = Predicate::dnf(vec![vec![Term::Cmp(inner_fid, Cmp::Eq, Rhs::Int(0))]]);
         let index =
             choose_index(db, src.rel, &src.table, &base_descs, &Some(filter), &opt_sql, &[])?;
@@ -35477,7 +35532,7 @@ fn plan_join_bound(
             let up = mask_literals(&inner.to_ascii_uppercase());
             (find_word(&up, "SELECT", 0) == Some(0)).then(|| inner.to_string())
         });
-        let declared: Vec<String> = parse_derived_table(tr.table)
+        let declared: Vec<String> = parse_derived_table(&tr.table)
             .map(|(_, _, c)| c)
             .unwrap_or_default();
         if let Some(inner_sql) = derived_inner {
@@ -35502,7 +35557,7 @@ fn plan_join_bound(
             let offset: usize = sides.iter().map(|s: &JoinSide| s.descs.len()).sum();
             let flatten = build_flatten(db, &inner);
             sides.push(JoinSide {
-                key: tr.alias?.to_string(),
+                key: tr.alias.clone()?,
                 // a DERIVED side has no relation and so no schema: its
                 // mandatory alias is the only way to name it
                 schema: None,
@@ -35517,7 +35572,7 @@ fn plan_join_bound(
                     .iter()
                     .map(|c| Some(c.fname.clone().unwrap_or_else(|| c.name.clone())))
                     .collect(),
-                rel_alias: tr.alias.map(str::to_string),
+                rel_alias: tr.alias.clone(),
                 merged_away: Vec::new(),
                 probe_src: None,
                 flatten,
@@ -35530,22 +35585,22 @@ fn plan_join_bound(
         // storage. `plan_query_inner`'s gate has already spoken for an
         // ordinary statement; this covers the paths that reach a join
         // through rewritten text (a bound CTE, a view row source).
-        if !relation_qualifier_ok(db, tr.schema, tr.table) {
+        if !relation_qualifier_ok(db, tr.schema, &tr.table) {
             return None;
         }
         // A VIEW is a side whose rows come from a PLAN. It has to be
         // tried BEFORE `resolve_relation`, because a view IS a relation
         // with an id - and one with no records of its own, so scanning
         // it answers zero rows rather than failing.
-        if let Some((inner, view_cols)) = plan_view(db_opt, db, tr.table) {
+        if let Some((inner, view_cols)) = plan_view(db_opt, db, &tr.table) {
             let (columns, descs) = derived_view(&view_cols);
             let offset: usize = sides.iter().map(|s: &JoinSide| s.descs.len()).sum();
             let flatten = build_flatten(db, &inner);
             sides.push(JoinSide {
-                key: tr.alias.unwrap_or(tr.table).to_string(),
+                key: tr.key().to_string(),
                 // a view is a relation like any other, and an ALIAS
                 // kills the 3-part binding as it kills the bare one
-                schema: tr.alias.is_none().then(|| relation_schema(db, tr.table)).flatten(),
+                schema: tr.alias.is_none().then(|| relation_schema(db, &tr.table)).flatten(),
                 src: RowSource::PlanRows(std::rc::Rc::new(inner)),
                 columns,
                 descs,
@@ -35557,7 +35612,7 @@ fn plan_join_bound(
                     .iter()
                     .map(|c| Some(c.fname.clone().unwrap_or_else(|| c.name.clone())))
                     .collect(),
-                rel_alias: tr.alias.map(str::to_string),
+                rel_alias: tr.alias.clone(),
                 merged_away: Vec::new(),
                 probe_src: None,
                 flatten,
@@ -35568,11 +35623,11 @@ fn plan_join_bound(
         // only ever under its BARE name: a CTE cannot be referenced
         // qualified, so `PUBLIC.C1` names no CTE (see splice_ctes)
         if let Some((bname, bcols, bsrc)) = bound {
-            if tr.schema.is_none() && tr.table.eq_ignore_ascii_case(bname) {
+            if tr.schema.is_none() && tr.table == bname {
                 let (columns, descs) = derived_view(bcols);
                 let offset: usize = sides.iter().map(|s: &JoinSide| s.descs.len()).sum();
                 sides.push(JoinSide {
-                    key: tr.alias.unwrap_or(tr.table).to_string(),
+                    key: tr.key().to_string(),
                     // a CTE lives in the statement, not in a schema
                     schema: None,
                     src: bsrc.clone(),
@@ -35586,7 +35641,7 @@ fn plan_join_bound(
                         .iter()
                         .map(|c| Some(c.fname.clone().unwrap_or_else(|| c.name.clone())))
                         .collect(),
-                    rel_alias: Some(tr.alias.unwrap_or(tr.table).to_string()),
+                    rel_alias: Some(tr.key().to_string()),
                     merged_away: Vec::new(),
                     probe_src: None,
                     flatten: None,
@@ -35594,9 +35649,9 @@ fn plan_join_bound(
                 continue;
             }
         }
-        let rel = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, tr.table)?;
-        let columns = db.columns(tr.table);
-        let formats = select_formats(db, tr.table, rel);
+        let rel = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, &tr.table)?;
+        let columns = db.columns(&tr.table);
+        let formats = select_formats(db, &tr.table, rel);
         // joining needs decodable records
         if formats.is_empty() {
             return None;
@@ -35621,8 +35676,8 @@ fn plan_join_bound(
             formats: formats.clone(),
         });
         sides.push(JoinSide {
-            key: tr.alias.unwrap_or(tr.table).to_string(),
-            schema: tr.alias.is_none().then(|| relation_schema(db, tr.table)).flatten(),
+            key: tr.key().to_string(),
+            schema: tr.alias.is_none().then(|| relation_schema(db, &tr.table)).flatten(),
             src: RowSource::TableScan {
                 rel,
                 formats,
@@ -35635,7 +35690,7 @@ fn plan_join_bound(
             offset,
             fnames,
             rels,
-            rel_alias: tr.alias.map(str::to_string),
+            rel_alias: tr.alias.clone(),
             merged_away: Vec::new(),
             probe_src,
             flatten: None,
@@ -35644,7 +35699,7 @@ fn plan_join_bound(
     // every side must be distinguishable by qualifier
     for i in 0..sides.len() {
         for j in i + 1..sides.len() {
-            if sides[i].key.eq_ignore_ascii_case(&sides[j].key) {
+            if sides[i].key == sides[j].key {
                 return None;
             }
         }
@@ -35735,7 +35790,7 @@ fn plan_join_bound(
                 if let Some(rc) = sides[k + 1]
                     .columns
                     .iter()
-                    .find(|c| c.name.eq_ignore_ascii_case(n))
+                    .find(|c| c.name == *n)
                 {
                     let fid = rc.field_id;
                     let idx = sides[k + 1].offset + fid as usize;
@@ -35855,7 +35910,7 @@ fn plan_join_bound(
         })
         .flatten();
         if let (Some(col), true) = (key_col, bare(&src.table)) {
-            let opt_sql = format!("SELECT 1 FROM {} WHERE {} = 0", src.table, col);
+            let opt_sql = format!("SELECT 1 FROM {} WHERE {} = 0", render_canon_ref(&src.table), render_canon_ref(&col));
             match choose_index(db, src.rel, &src.table, &driver_descs, &filter, &opt_sql, &[]) {
                 Some(access) => {
                     if trace_on() {
@@ -35914,6 +35969,17 @@ fn plan_join_bound(
     if grouped {
         let items = items?;
         let (comb_cols, comb_descs) = combined_view(&sides);
+        // the prefixes a qualified entry of the view may carry
+        let side_keys: Vec<String> = sides
+            .iter()
+            .flat_map(|sd| {
+                let mut v = vec![sd.key.clone()];
+                if let Some(sc) = &sd.schema {
+                    v.push(format!("{}.{}", sc, sd.key));
+                }
+                v
+            })
+            .collect();
         // The view carries BOTH spellings of every column - bare (unless
         // ambiguous) and qualified - so items keep the names they were
         // written with. The one rewrite still needed is for an
@@ -35935,7 +36001,7 @@ fn plan_join_bound(
             Some(g) => parse_group_by(g, &items, &comb_cols, &comb_descs, synth_base)?,
         };
         let (mut cols, mut gitems, slot_descs) =
-            build_group_items(&items, &comb_cols, &comb_descs, &key_fids, &key_exprs, synth_base, params)?;
+            build_group_items(&items, &comb_cols, &comb_descs, &side_keys, &key_fids, &key_exprs, synth_base, params)?;
         // a PLAIN group key reads from the side it came from (probed:
         // `GROUP BY T.B` keys answer relation T, and the side's alias);
         // an expression key (a synthetic slot) reads from none
@@ -35992,7 +36058,7 @@ fn plan_join_bound(
             Some(os) => parse_order_by(os, &cols, &[], |n| {
                 let bare = n.rsplit('.').next().unwrap_or(n);
                 cols.iter()
-                    .position(|c| c.name.eq_ignore_ascii_case(bare))
+                    .position(|c| c.name == bare)
                     .filter(|&p| matches!(gitems.get(p), Some(GItem::Key(_))))
             })?,
         };
@@ -36260,7 +36326,7 @@ fn plan_join_bound(
                     .map(|c| c.name.clone())
                     .filter(|c| bare(c));
                 if let (Some(col), true) = (col, bare(&src.table)) {
-                    let opt_sql = format!("SELECT 1 FROM {} ORDER BY {}", src.table, col);
+                    let opt_sql = format!("SELECT 1 FROM {} ORDER BY {}", render_canon_ref(&src.table), render_canon_ref(&col));
                     let nav = [OrderKey {
                         field: key.field,
                         expr: None,
@@ -36480,12 +36546,15 @@ fn first_unknown_relation(sql: &str, db: &Database) -> Option<(usize, usize, boo
             if b[i] == b'(' {
                 continue;
             }
-            let quoted = b[i] == b'"';
+            // the quotes are read off the ORIGINAL bytes: the masked copy
+            // hides a quoted span whole ([mask_literals])
+            let sb = sql.as_bytes();
+            let quoted = sb[i] == b'"';
             let (nstart, nend);
             if quoted {
                 nstart = i + 1;
                 let mut j = nstart;
-                while j < b.len() && b[j] != b'"' {
+                while j < sb.len() && sb[j] != b'"' {
                     j += 1;
                 }
                 nend = j;
@@ -36511,7 +36580,9 @@ fn first_unknown_relation(sql: &str, db: &Database) -> Option<(usize, usize, boo
             if matches!(b.get(aft), Some(&b'.') | Some(&b'(')) {
                 continue;
             }
-            let name = &up[nstart..nend];
+            // CANONICAL: a quoted name is looked up EXACTLY as written
+            // (`"Order"` exists; `"ORDER"` does not), a bare one folded
+            let name: &str = if quoted { &sql[nstart..nend] } else { &up[nstart..nend] };
             // a keyword that can follow FROM but is not a relation
             if !quoted && name == "LATERAL" {
                 continue;
@@ -36622,7 +36693,7 @@ fn with_lock_target_ok(sql: &str, db: &Option<Database>) -> bool {
     if !join.is_empty() {
         return false;
     }
-    let name = from.table;
+    let name = from.table.as_str();
     match db.as_ref() {
         Some(dbr) => relation_schema(dbr, name).is_some() && view_of(dbr, name).is_none(),
         None => false,
@@ -37011,7 +37082,7 @@ fn splice_ctes(sql: &str, ctes: &[(String, ViewDef)]) -> Option<String> {
         if tr.schema.is_some() {
             continue;
         }
-        let Some((_, def)) = ctes.iter().find(|(n, _)| n.eq_ignore_ascii_case(tr.table)) else {
+        let Some((_, def)) = ctes.iter().find(|(n, _)| n.eq_ignore_ascii_case(&tr.table)) else {
             continue;
         };
         // An EXPLICIT column list RENAMES the body's columns, and a
@@ -37053,18 +37124,17 @@ fn splice_ctes(sql: &str, ctes: &[(String, ViewDef)]) -> Option<String> {
         } else {
             String::new()
         };
-        let alias = tr.alias.unwrap_or(tr.table).to_string();
+        let alias = tr.key().to_string();
         // THE OFFSET COMES FROM THE SLICE, NOT FROM A TEXT SEARCH.
         // `sql.find(name)` looks for the CTE's name and finds the `C`
         // inside `SELECT`, splicing the body into the middle of the
         // keyword. `tr.table` is a subslice of `sql`, so its position is
         // arithmetic rather than a guess.
-        let head = tr.table.as_ptr() as usize - sql.as_ptr() as usize;
-        let end = match tr.alias {
-            Some(a) => a.as_ptr() as usize - sql.as_ptr() as usize + a.len(),
-            None => head + tr.table.len(),
-        };
-        splices.push((head, end - head, format!("({}) {}{}", def.source, alias, rename)));
+        // (`tr.whole` is the reference AS WRITTEN, alias and all - the
+        // canonical `tr.table` is an owned spelling with no position)
+        let head = tr.whole.as_ptr() as usize - sql.as_ptr() as usize;
+        let end = head + tr.whole.len();
+        splices.push((head, end - head, format!("({}) {}{}", def.source, render_canon_ref(&alias), rename)));
     }
     let mut out = sql.to_string();
     splices.sort_by(|a, b| b.0.cmp(&a.0));
@@ -37212,17 +37282,17 @@ fn plan_over_source(
     // the bound name must BE the FROM - and BARE: a bound name is a CTE,
     // a derived table or a view standing in for itself, none of which a
     // schema qualifier can reach (see splice_ctes)
-    if from.schema.is_some() || !from.table.eq_ignore_ascii_case(name) {
+    if from.schema.is_some() || from.table != name {
         return None;
     }
-    let alias = from.alias.unwrap_or(from.table);
+    let alias = from.key();
     // the OUTERMOST binding wins (probed: `((...) D1) D2` answers D2,
     // and a use-site alias over a recursive CTE beats the CTE's name):
     // a FROM-item alias here, else what the caller binds this source
     // under - a derived table's alias, a CTE's name, or nothing for a
     // bare view
     let bind_alias: Option<String> =
-        from.alias.or(rel_alias).map(str::to_string);
+        from.alias.clone().or_else(|| rel_alias.map(str::to_string));
     let (columns, descs) = derived_view(cols);
     // SUBQUERIES over a bound source (a derived table, a view standing in
     // for itself): each is lifted into a per-row marker resolved against
@@ -37285,10 +37355,15 @@ fn plan_over_source(
         let synth_base = descs.len();
         let (key_fids, key_exprs) = match group_s {
             None => (Vec::new(), Vec::new()),
-            Some(g) => parse_group_by(g, &items, &columns, &descs, synth_base)?,
+            // ...with the SOURCE's own qualifier off first, exactly as
+            // the projection and the WHERE have it off: `GROUP BY X.A`
+            // over `FROM (SELECT A FROM T) X` is ordinary SQL, and
+            // parse_group_by now REFUSES a qualifier that survived the
+            // strip (it is the engine's -206 over a real relation)
+            Some(g) => parse_group_by(&unq(g), &items, &columns, &descs, synth_base)?,
         };
         let (mut gcols, mut gitems, slot_descs) =
-            build_group_items(&items, &columns, &descs, &key_fids, &key_exprs, synth_base, params)?;
+            build_group_items(&items, &columns, &descs, &[], &key_fids, &key_exprs, synth_base, params)?;
         // a grouped KEY over the derived rows keeps the INNER column's
         // field name, exactly as the ungrouped read does (probed:
         // GROUP BY C over `X AS C` is field X, alias C)
@@ -37322,7 +37397,7 @@ fn plan_over_source(
         let having = match having_s {
             None => None,
             Some(hs) => Some(
-                tokenize(hs)
+                tokenize(&unq(hs))
                     .and_then(|t| parse_predicate(&t, &mut np))
                     .and_then(|raw| {
                         let gl = gitems.len();
@@ -37348,7 +37423,7 @@ fn plan_over_source(
                 let bare = n.rsplit('.').next().unwrap_or(n);
                 gcols
                     .iter()
-                    .position(|c| c.name.eq_ignore_ascii_case(bare))
+                    .position(|c| c.name == bare)
                     .filter(|&p| matches!(gitems.get(p), Some(GItem::Key(_))))
             })?,
         };
@@ -37488,7 +37563,7 @@ fn plan_over_source(
             |n| {
                 columns
                     .iter()
-                    .find(|c| c.name.eq_ignore_ascii_case(n))
+                    .find(|c| col_name_is(&c.name, n))
                     .map(|c| c.field_id as usize)
             },
             |text| parse_raw_expr(text).and_then(|r| resolve_expr(&r, &columns, &descs)),
@@ -37518,7 +37593,7 @@ fn bound_refs(sql: &str, name: &str) -> usize {
     // -204), so it is not a self-reference either
     std::iter::once(&from)
         .chain(joins.iter().map(|(_, r, _, _)| r))
-        .filter(|tr| tr.schema.is_none() && tr.table.eq_ignore_ascii_case(name))
+        .filter(|tr| tr.schema.is_none() && tr.table == name)
         .count()
 }
 
@@ -37673,6 +37748,7 @@ fn parse_with(sql: &str) -> Option<(Vec<(String, ViewDef)>, String, bool)> {
 /// Read `<name>` as a view. None when it is an ordinary table (no
 /// RDB$VIEW_SOURCE) or the blob cannot be read.
 fn view_of(db: &Database, name: &str) -> Option<ViewDef> {
+    let want_rel = rel_row_name(db, name);
     let (rcols, rdescs) = sys_rel(db, "RDB$RELATIONS")?;
     let fid = |n: &str| rcols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
     let (name_f, src_f) = (fid("RDB$RELATION_NAME")?, fid("RDB$VIEW_SOURCE")?);
@@ -37680,7 +37756,7 @@ fn view_of(db: &Database, name: &str) -> Option<ViewDef> {
     let mut source: Option<String> = None;
     for_each_record(db, 6, &fmts, usize::MAX, |v| {
         let hit = matches!(v.get(name_f),
-            Some(Value::Text(t)) if t.trim_end().eq_ignore_ascii_case(name));
+            Some(Value::Text(t)) if t.trim_end() == want_rel);
         if !hit || source.is_some() {
             return;
         }
@@ -37815,7 +37891,8 @@ enum ViewDml {
 /// EVENT (1 INSERT, 2 UPDATE, 3 DELETE) is part of the key: the chain
 /// stops at a view whose USER trigger takes that event.
 fn view_dml_target(db: &Database, name: &str, event: u8) -> ViewDml {
-    let key = format!("{}#{}", name.trim_matches('"').trim_end().to_ascii_uppercase(), event);
+    // the key is the CANONICAL name itself: `"v"` beside V memoise apart
+    let key = format!("{}#{}", name.trim_end(), event);
     db.meta_memo("view-dml", &key, || view_dml_target_at(db, name, event, 0))
         .as_ref()
         .clone()
@@ -37825,7 +37902,7 @@ fn view_dml_target(db: &Database, name: &str, event: u8) -> ViewDml {
 /// DML planner applies after its view hook: a view must never be
 /// planned as a table.
 fn is_view(db: &Database, name: &str) -> bool {
-    let key = name.trim_matches('"').trim_end().to_ascii_uppercase();
+    let key = name.trim_end().to_string();
     *db.meta_memo("is-view", &key, || view_of(db, name).is_some())
 }
 
@@ -37849,6 +37926,15 @@ fn view_event_guard(event: u8) -> DmlGuard<'static> {
     }
 }
 
+/// The catalog spelling the relation `name` denotes, for an EXACT row
+/// match over RDB$RELATION_FIELDS / RDB$TRIGGERS / RDB$RELATIONS: `"tq"`
+/// beside TQ picks one relation's rows, never both. Resolution is
+/// [fire_crab_ods::resolve_relation]'s (exact first, folded fallback);
+/// an unknown relation keeps the spelling, matching nothing.
+fn rel_row_name(db: &Database, name: &str) -> String {
+    canon_relation_name(db, name).unwrap_or_else(|| name.trim().to_string())
+}
+
 /// The catalog's spelling of a relation named in a statement.
 fn canon_relation_name(db: &Database, name: &str) -> Option<String> {
     let rel = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, name)?;
@@ -37862,15 +37948,7 @@ fn canon_relation_name(db: &Database, name: &str) -> Option<String> {
 /// identifier that is not a reserved word, delimited otherwise
 /// (review-caught: a base column named SELECT / COUNT rendered bare).
 fn view_ident_text(name: &str) -> String {
-    let plain = name.starts_with(|c: char| c.is_ascii_uppercase())
-        && name
-            .chars()
-            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_' || c == '$');
-    if plain && !view_is_keyword(name) {
-        name.to_string()
-    } else {
-        format!("\"{}\"", name.replace('"', "\"\""))
-    }
+    render_canon_ref(name)
 }
 
 /// Take a trailing `WITH CHECK OPTION` off a view body. Returns the
@@ -38015,6 +38093,7 @@ fn view_item_is_aggregate(text: &str) -> bool {
 /// The view's columns in RDB$FIELD_ID order, each with its
 /// RDB$BASE_FIELD (None = an expression column, RDB$UPDATE_FLAG 0).
 fn view_field_bases(db: &Database, view: &str) -> Option<Vec<(String, Option<String>)>> {
+    let want_rel = rel_row_name(db, view);
     use fire_crab_ods::format::Value;
     let (cols, descs) = sys_rel(db, "RDB$RELATION_FIELDS")?;
     let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
@@ -38028,7 +38107,7 @@ fn view_field_bases(db: &Database, view: &str) -> Option<Vec<(String, Option<Str
     let mut out: Vec<(i64, String, Option<String>)> = Vec::new();
     for_each_record(db, 5, &fmts, usize::MAX, |v| {
         let is_rel = matches!(v.get(rel_f),
-            Some(Value::Text(t)) if t.trim_end().eq_ignore_ascii_case(view));
+            Some(Value::Text(t)) if t.trim_end() == want_rel);
         if !is_rel {
             return;
         }
@@ -38050,6 +38129,7 @@ fn view_field_bases(db: &Database, view: &str) -> Option<Vec<(String, Option<Str
 /// The CHECK OPTION system triggers of a view: (BEFORE UPDATE name,
 /// BEFORE INSERT name) - RDB$SYSTEM_FLAG 5, types 3 and 1.
 fn view_check_triggers(db: &Database, view: &str) -> Option<(Option<String>, Option<String>)> {
+    let want_rel = rel_row_name(db, view);
     use fire_crab_ods::format::Value;
     let (cols, descs) = sys_rel(db, "RDB$TRIGGERS")?;
     let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
@@ -38065,7 +38145,7 @@ fn view_check_triggers(db: &Database, view: &str) -> Option<(Option<String>, Opt
     let mut ins: Option<String> = None;
     for_each_record(db, trel, &fmts, usize::MAX, |v| {
         let is_rel = matches!(v.get(rel_f),
-            Some(Value::Text(t)) if t.trim_end().eq_ignore_ascii_case(view));
+            Some(Value::Text(t)) if t.trim_end() == want_rel);
         if !is_rel || !matches!(v.get(sys_f), Some(Value::Int(5))) {
             return;
         }
@@ -38091,7 +38171,11 @@ fn requalify_view_body(text: &str, quals: &[&str], rel: &str) -> String {
     let mut stack: Vec<bool> = Vec::new();
     let mut subq = 0usize;
     let mut i = 0usize;
-    let is_qual = |n: &str| quals.iter().any(|q| q.eq_ignore_ascii_case(n));
+    // canonical compare: a quoted qualifier exact, a bare one folded
+    let is_qual = |n: &str, quoted: bool| {
+        let c = if quoted { n.to_string() } else { n.to_ascii_uppercase() };
+        quals.iter().any(|q| *q == c)
+    };
     while i < b.len() {
         let c = b[i];
         if c == '\'' {
@@ -38143,8 +38227,8 @@ fn requalify_view_body(text: &str, quals: &[&str], rel: &str) -> String {
             // `alias.col` or `schema.rel.col`: the head that names the
             // FROM item comes off (or turns into the relation)
             let strip_to = match parts.as_slice() {
-                [(q, _, _, _), _] if is_qual(q) => Some(parts[1].2),
-                [_, (r, _, _, _), _] if is_qual(r) => Some(parts[2].2),
+                [(q, qq, _, _), _] if is_qual(q, *qq) => Some(parts[1].2),
+                [_, (r, rq, _, _), _] if is_qual(r, *rq) => Some(parts[2].2),
                 _ => None,
             };
             match strip_to {
@@ -38447,20 +38531,22 @@ fn rename_view_idents(
     // NEXT VALUE FOR sequence slots
     let mut recent: Vec<String> = Vec::new();
     let mut i = 0usize;
+    // every compare CANONICAL: a quoted name exact, a bare one folded
+    // to upper case first - `C` beside `"c"` are two view columns
     let lookup = |name: &str, quoted: bool| -> Option<&ViewColSrc> {
-        map.iter()
-            .find(|(n, _)| if quoted { n == name } else { n.eq_ignore_ascii_case(name) })
-            .map(|(_, s)| s)
+        let c = if quoted { name.to_string() } else { name.to_ascii_uppercase() };
+        map.iter().find(|(n, _)| *n == c).map(|(_, s)| s)
     };
     let names_view = |q: &str, quoted: bool| {
         if quoted {
             q == view
         } else {
-            q.eq_ignore_ascii_case(view)
+            q.to_ascii_uppercase() == view
         }
     };
     let is_base_col = |n: &str, quoted: bool| {
-        base_cols.iter().any(|c| if quoted { c == n } else { c.eq_ignore_ascii_case(n) })
+        let c = if quoted { n.to_string() } else { n.to_ascii_uppercase() };
+        base_cols.iter().any(|b| *b == c)
     };
     let scope_names = |stack: &Vec<Option<Vec<String>>>, n: &str| {
         stack.iter().flatten().any(|l| l.iter().any(|x| x.eq_ignore_ascii_case(n)))
@@ -38573,7 +38659,9 @@ fn rename_view_idents(
                             out.push_str(&raw);
                         } else {
                             match src {
-                                ViewColSrc::Base(bn) if bn.eq_ignore_ascii_case(n) => {
+                                ViewColSrc::Base(bn)
+                                    if (if *q { bn == n } else { *bn == n.to_ascii_uppercase() }) =>
+                                {
                                     out.push_str(&raw)
                                 }
                                 // a renamed (or expression) view column
@@ -38650,7 +38738,7 @@ fn rename_view_idents(
                 // it is that subquery's own scope.
                 [(qual, qq), _] | [_, (qual, qq), _]
                     if subq == 0
-                        && (if *qq { qual == base } else { qual.eq_ignore_ascii_case(base) }) =>
+                        && (if *qq { qual == base } else { qual.to_ascii_uppercase() == base }) =>
                 {
                     return None
                 }
@@ -38726,16 +38814,15 @@ fn view_dml_target_at(db: &Database, name: &str, event: u8, depth: usize) -> Vie
     if !steps.is_empty() {
         return read_only_target(view);
     }
-    let mut quals: Vec<&str> = vec![tr.table];
-    if let Some(a) = tr.alias {
+    let mut quals: Vec<&str> = vec![tr.table.as_str()];
+    if let Some(a) = tr.alias.as_deref() {
         quals.push(a);
     }
     // `*` and `<from item>.*` alike: every base column, in order
     let proj_t = proj_s.trim();
     let star = proj_t == "*"
         || proj_t.strip_suffix(".*").is_some_and(|q| {
-            let q = q.trim().trim_matches('"');
-            quals.iter().any(|x| x.eq_ignore_ascii_case(q))
+            canon_ident(q).is_some_and(|c| quals.iter().any(|x| *x == c))
         });
     let raw_items: Vec<String> = if star {
         Vec::new()
@@ -38759,10 +38846,10 @@ fn view_dml_target_at(db: &Database, name: &str, event: u8, depth: usize) -> Vie
     // view carries a USER trigger for the event: the trigger replaces
     // every write below it, so the chain stops there (PART 2 plans the
     // trigger; the rewritten statement refuses generically until then)
-    let inner_is_view = view_of(db, tr.table).is_some();
-    let stop_here = inner_is_view && view_has_user_trigger(db, tr.table, &view_event_guard(event));
+    let inner_is_view = view_of(db, &tr.table).is_some();
+    let stop_here = inner_is_view && view_has_user_trigger(db, &tr.table, &view_event_guard(event));
     let inner = if inner_is_view && !stop_here {
-        match view_dml_target_at(db, tr.table, event, depth + 1) {
+        match view_dml_target_at(db, &tr.table, event, depth + 1) {
             ViewDml::Target(it) => {
                 if it.read_only {
                     return read_only_target(view);
@@ -38774,7 +38861,7 @@ fn view_dml_target_at(db: &Database, name: &str, event: u8, depth: usize) -> Vie
     } else {
         None
     };
-    let Some(rel_name) = canon_relation_name(db, tr.table) else { return ViewDml::Unplannable };
+    let Some(rel_name) = canon_relation_name(db, &tr.table) else { return ViewDml::Unplannable };
     let (base, base_is_view) = match &inner {
         Some(it) => (it.base.clone(), it.base_is_view),
         None => (rel_name.clone(), stop_here),
@@ -38805,7 +38892,7 @@ fn view_dml_target_at(db: &Database, name: &str, event: u8, depth: usize) -> Vie
             Some(bf) => match &inner {
                 None => ViewColSrc::Base(bf.clone()),
                 Some(it) => {
-                    match it.cols.iter().find(|(n, _)| n.eq_ignore_ascii_case(bf)) {
+                    match it.cols.iter().find(|(n, _)| n == bf) {
                         Some((_, s)) => s.clone(),
                         None => return ViewDml::Unplannable,
                     }
@@ -38988,22 +39075,17 @@ fn view_trig_rows_sql(
         // `v.A` / `V.A`: the statement's alias or the view's own name
         // qualifying a SET column (both legal on the engine)
         if let Some(dot) = s.rfind('.') {
-            let q = s[..dot].trim().trim_matches('"');
-            let ok = alias.is_some_and(|a| a.eq_ignore_ascii_case(q)) || view.eq_ignore_ascii_case(q);
+            // canonical: the alias and the view name are, and so is
+            // the qualifier once spelled by [canon_ident]
+            let q = canon_ident(&s[..dot])?;
+            let ok = alias.is_some_and(|a| a == q) || view == q;
             if !ok {
                 return None;
             }
             s = s[dot + 1..].trim();
         }
-        if let Some(q) = s.strip_prefix('"') {
-            let name = q.strip_suffix('"')?.replace("\"\"", "\"");
-            cols.iter().position(|(n, _)| *n == name)
-        } else {
-            if !bare_ident_ok(s) {
-                return None;
-            }
-            cols.iter().position(|(n, _)| n.eq_ignore_ascii_case(s))
-        }
+        let name = canon_ident(s)?;
+        cols.iter().position(|(n, _)| *n == name)
     };
     let value_text = |v: &str, ix: usize| -> Option<String> {
         let v = v.trim();
@@ -39020,7 +39102,7 @@ fn view_trig_rows_sql(
         _ => String::new(),
     };
     let from_sql = || match alias {
-        Some(a) => format!("{} {}", view_ident_text(view), a),
+        Some(a) => format!("{} {}", view_ident_text(view), render_canon_ref(a)),
         None => view_ident_text(view),
     };
     match shape {
@@ -39060,7 +39142,7 @@ fn view_trig_rows_sql(
                 Some(list) => {
                     let mut out = Vec::new();
                     for n in list {
-                        let ix = lookup(n).or_else(|| cols.iter().position(|(c, _)| c.eq_ignore_ascii_case(n)))?;
+                        let ix = lookup(n).or_else(|| cols.iter().position(|(c, _)| c == n))?;
                         if out.contains(&ix) {
                             return None;
                         }
@@ -39224,10 +39306,13 @@ fn word_is_at(up: &str, at: usize, word: &str) -> bool {
 fn view_trig_correlated(text: &str, view: &str, alias: Option<&str>) -> bool {
     let masked = mask_literals(&text.to_ascii_uppercase());
     let m = masked.as_bytes();
+    // the masked copy hides a quoted span whole ([mask_literals]), so a
+    // quoted identifier is read off the TEXT at the same offsets
+    let tb = text.as_bytes();
     let mut stack: Vec<bool> = Vec::new();
     let mut i = 0usize;
     while i < m.len() {
-        match m[i] {
+        match if tb[i] == b'"' { b'"' } else { m[i] } {
             b'(' => {
                 let mut j = i + 1;
                 while j < m.len() && m[j].is_ascii_whitespace() {
@@ -39244,7 +39329,7 @@ fn view_trig_correlated(text: &str, view: &str, alias: Option<&str>) -> bool {
                 // a quoted identifier: exact compare
                 let start = i + 1;
                 let mut j = start;
-                while j < m.len() && m[j] != b'"' {
+                while j < tb.len() && tb[j] != b'"' {
                     j += 1;
                 }
                 let name = &text[start..j.min(text.len())];
@@ -39276,9 +39361,7 @@ fn view_trig_correlated(text: &str, view: &str, alias: Option<&str>) -> bool {
                 // `.Y` half, nor a schema-qualified `PUBLIC.V` FROM item
                 // (which is followed by no dot)
                 if !prev_dot && k < m.len() && m[k] == b'.' && stack.iter().any(|s| *s) {
-                    if name.eq_ignore_ascii_case(view)
-                        || alias.is_some_and(|a| a.trim_matches('"').eq_ignore_ascii_case(name))
-                    {
+                    if name == view || alias.is_some_and(|a| a == name) {
                         return true;
                     }
                 }
@@ -39523,16 +39606,10 @@ fn view_trig_insert_body(tail: &str) -> Option<ViewTrigBody<'_>> {
 /// A view column named in a SET list / column list: the map entry it
 /// resolves to. `"quoted"` compares exactly, bare folds.
 fn view_col_lookup<'a>(vt: &'a ViewDmlTarget, spelled: &str) -> Option<&'a (String, ViewColSrc)> {
-    let s = spelled.trim();
-    if let Some(q) = s.strip_prefix('"') {
-        let name = q.strip_suffix('"')?.replace("\"\"", "\"");
-        vt.cols.iter().find(|(n, _)| *n == name)
-    } else {
-        if !bare_ident_ok(s) {
-            return None;
-        }
-        vt.cols.iter().find(|(n, _)| n.eq_ignore_ascii_case(s))
-    }
+    // CANONICAL, then exact: `SET C = 7` lands in view column C and
+    // never in its quoted twin "c" (review-caught)
+    let name = canon_ident(spelled)?;
+    vt.cols.iter().find(|(n, _)| *n == name)
 }
 
 /// `UPDATE <view> SET ... [WHERE ...]` rewritten onto the base table
@@ -39589,7 +39666,7 @@ fn plan_update_view(
         let rhs = rename_view_idents(rhs, &vt.cols, &vt.view, &vt.base, &vt.base_cols)?;
         // two view columns over ONE base column: the LAST assignment
         // wins (measured: `UPDATE VDUP SET X=1, Y=2` stores A=2)
-        sets.retain(|(c, _)| !c.eq_ignore_ascii_case(&base_col));
+        sets.retain(|(c, _)| *c != base_col);
         sets.push((base_col, rhs));
     }
     if sets.is_empty() {
@@ -39704,13 +39781,14 @@ fn plan_insert_view(
             && s[kw_end + "VALUES".len()..].trim().is_empty()
     });
     let head = s[after..default_values.unwrap_or(kw_end)].trim();
-    let (schema, table, collist, ov) = match default_values {
+    let (schema, table_c, collist, ov) = match default_values {
         Some(_) => {
             let (q, t) = dml_target_name(head)?;
             (q, t, None, Overriding::None)
         }
         None => split_insert_head(head)?,
     };
+    let table: &str = table_c.as_str();
     if !relation_qualifier_ok(db, schema, table) {
         return None;
     }
@@ -39771,7 +39849,7 @@ fn plan_insert_view_inner(
     let mut base_cols: Vec<String> = Vec::new();
     let mut base_raw: Vec<String> = Vec::new();
     for n in &view_names {
-        match vt.cols.iter().find(|(c, _)| c.eq_ignore_ascii_case(n)) {
+        match vt.cols.iter().find(|(c, _)| c == n) {
             Some((_, ViewColSrc::Base(b))) => {
                 base_cols.push(view_ident_text(b));
                 base_raw.push(b.clone());
@@ -39833,11 +39911,11 @@ fn plan_insert_view_inner(
                     for (fid, gen, _) in identity_columns(db, &vt.base) {
                         let listed = bm.columns.iter().any(|c| {
                             c.field_id as usize == fid
-                                && base_raw.iter().any(|b| b.eq_ignore_ascii_case(&c.name))
+                                && base_raw.iter().any(|b| *b == c.name)
                         });
                         let listed_default = bm.columns.iter().any(|c| {
                             c.field_id as usize == fid
-                                && defaulted.iter().any(|b| b.eq_ignore_ascii_case(&c.name))
+                                && defaulted.iter().any(|b| *b == c.name)
                         });
                         if (listed && !gen_fields.iter().any(|(f, _, _)| *f == fid)) || listed_default {
                             wasted_gens.push(gen.clone());
@@ -39886,9 +39964,16 @@ fn wrap_returning_view(
     params: Vec<Descriptor>,
     list: &str,
     vt: &ViewDmlTarget,
+    // the statement bound an ALIAS to the view, which REPLACES the
+    // view's name: `DELETE FROM VCASE v ... RETURNING VCASE."a"` is
+    // -206 on the engine, exactly as over a table
+    aliased: bool,
     db: &Option<Database>,
 ) -> Option<(Plan, Vec<Descriptor>)> {
     if vt.read_only {
+        return None;
+    }
+    if aliased && mentions_qualifier(list, &vt.view) {
         return None;
     }
     let mut items: Vec<String> = Vec::new();
@@ -39905,7 +39990,7 @@ fn wrap_returning_view(
         };
         if let Some(q) = star {
             let ctx = q.eq_ignore_ascii_case("OLD") || q.eq_ignore_ascii_case("NEW");
-            if !(ctx || q.is_empty() || q.trim_matches('"').eq_ignore_ascii_case(&vt.view)) {
+            if !(ctx || q.is_empty() || canon_ident(q).as_deref() == Some(vt.view.as_str())) {
                 return None;
             }
             for (i, (_, src)) in vt.cols.iter().enumerate() {
@@ -39942,9 +40027,8 @@ fn wrap_returning_view(
                 let qual_ok = if first_q {
                     first == vt.view
                 } else {
-                    first.eq_ignore_ascii_case(&vt.view)
-                        || first.eq_ignore_ascii_case("OLD")
-                        || first.eq_ignore_ascii_case("NEW")
+                    let fu = first.to_ascii_uppercase();
+                    fu == vt.view || fu == "OLD" || fu == "NEW"
                 };
                 if !qual_ok {
                     return None;
@@ -39956,14 +40040,16 @@ fn wrap_returning_view(
                 (second, second_q)
             };
             vt.cols.iter().position(|(n, _)| {
-                if quoted { *n == name } else { n.eq_ignore_ascii_case(&name) }
+                if quoted { *n == name } else { *n == name.to_ascii_uppercase() }
             })
         })();
         items.push(view_returning_item(item, vt)?);
         origin.push(bare);
     }
     let rewritten = items.join(", ");
-    let (plan, params) = wrap_returning(plan, params, &rewritten, &vt.base, None, db)?;
+    // the rewritten list names BASE columns, unqualified: no alias of
+    // the statement's survives into it
+    let (plan, params) = wrap_returning(plan, params, &rewritten, &vt.base, None, false, db)?;
     let Plan::Returning { inner, mut cols, fields, new_cols } = plan else {
         return None;
     };
@@ -40001,6 +40087,7 @@ fn wrap_returning_view(
 /// qualifier or by a 3-part column reference; an unqualified query never
 /// reaches here. Accepted cost.
 fn relation_schema(db: &Database, name: &str) -> Option<String> {
+    let want_rel = rel_row_name(db, name);
     let (rcols, rdescs) = sys_rel(db, "RDB$RELATIONS")?;
     let fid = |n: &str| rcols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
     let name_f = fid("RDB$RELATION_NAME")?;
@@ -40010,7 +40097,7 @@ fn relation_schema(db: &Database, name: &str) -> Option<String> {
     let mut found: Option<String> = None;
     for_each_record(db, 6, &fmts, usize::MAX, |v| {
         let hit = matches!(v.get(name_f),
-            Some(Value::Text(t)) if t.trim_end().eq_ignore_ascii_case(name));
+            Some(Value::Text(t)) if t.trim_end() == want_rel);
         if !hit || found.is_some() {
             return;
         }
@@ -40074,26 +40161,14 @@ impl ColBinding<'_> {
     /// reference inside a subquery must spell the outer relation the way
     /// the outer FROM bound it, and nothing else resolves.
     fn answers_to(&self, qual: &str) -> bool {
-        let mut it = qual.rsplitn(2, '.');
-        let last = it.next().unwrap_or(qual);
-        match it.next() {
+        // `qual` is CANONICAL (every part the catalog's own spelling -
+        // [scan_canon_ref]), and so are the key and the resolved
+        // (schema, relation) pair: the compare is exact, part for part
+        match qual.rsplit_once('.') {
             // SCHEMA.RELATION - available only when the FROM item is
             // unaliased, since an alias is exclusive
-            Some(sch) => self.qual.as_ref().is_some_and(|(s, r)| {
-                part_is((sch.trim_matches('"'), sch.starts_with('"')), s)
-                    && last.trim_matches('"').eq_ignore_ascii_case(r)
-            }),
-            // the 2-part form, with the quoting rule `wrap_returning`
-            // spells out: a quoted qualifier compares exactly, against
-            // the key as written and against its folded form
-            None => {
-                let bare = last.trim_matches('"');
-                if last.starts_with('"') {
-                    bare == self.key || bare == self.key.to_ascii_uppercase()
-                } else {
-                    self.key.eq_ignore_ascii_case(bare)
-                }
-            }
+            Some((sch, last)) => self.qual.as_ref().is_some_and(|(s, r)| sch == s && last == *r),
+            None => qual == self.key,
         }
     }
 }
@@ -40218,6 +40293,9 @@ fn unqualify_single(text: &str, bind: &ColBinding<'_>) -> Option<String> {
             let word: String = b[start..i].iter().collect();
             let quoted = word.starts_with('"');
             let bare = word.trim_matches('"');
+            // the word's CANONICAL spelling: quoted exact, bare folded -
+            // what the binding's key and (schema, relation) are spelled in
+            let canon = canon_ident(&word);
             // a qualifier is an identifier immediately followed by a dot
             // and another identifier (or a star)
             let follows = |at: usize| {
@@ -40249,7 +40327,7 @@ fn unqualify_single(text: &str, bind: &ColBinding<'_>) -> Option<String> {
                             // the relation half stays case-insensitive,
                             // as `resolve_relation` is; only the SCHEMA
                             // half honours quoting (see TableRef.quoted)
-                            if seg.trim_matches('"').eq_ignore_ascii_case(rel) && follows(after) {
+                            if canon_ident(&seg).as_deref() == Some(rel) && follows(after) {
                                 i = after + 1; // both segments, both dots
                                 hit = true;
                                 continue;
@@ -40265,11 +40343,10 @@ fn unqualify_single(text: &str, bind: &ColBinding<'_>) -> Option<String> {
                 // form, because a bare FROM item does not preserve the
                 // catalog's case - `FROM t` binds the relation T, and
                 // `"T".C` over it is the engine's own spelling.
-                let key_hit = if quoted {
-                    bare == bind.key || bare == bind.key.to_ascii_uppercase()
-                } else {
-                    bind.key.eq_ignore_ascii_case(bare)
-                };
+                // ...and the KEY is canonical too now: `FROM TQ "t"`
+                // binds `t`, which `"t".C` names and `T.C` does not
+                let _ = (quoted, bare);
+                let key_hit = canon.as_deref() == Some(bind.key);
                 if key_hit {
                     i += 1; // the dot goes with the qualifier
                     hit = true;
@@ -42399,7 +42476,7 @@ fn plan_query_inner_ctx(
                         .chain(join.iter().map(|(_, r, _, _)| r))
                         .any(|tr| {
                             tr.schema.is_none()
-                                && ctes.iter().any(|(n, _)| n.eq_ignore_ascii_case(tr.table))
+                                && ctes.iter().any(|(n, _)| n.eq_ignore_ascii_case(&tr.table))
                         })
                 })
                 .unwrap_or(false)
@@ -42639,7 +42716,9 @@ fn plan_query_inner_ctx(
             // bound CTE uses, against a synthetic view built from the
             // inner plan's DESCRIBE. A derived table has no catalog entry
             // to read a format from, and neither has a CTE's rows.
-            let bound = sql_over_from(sql, &alias);
+            // the binding key is canonical; the rebuilt FROM must re-parse
+            // to it (`"vq"` stays delimited)
+            let bound = sql_over_from(sql, &render_canon_ref(&alias));
             return match plan_over_source(
                 &bound,
                 &alias,
@@ -42810,12 +42889,12 @@ fn plan_query_inner_ctx(
                             if !joins.is_empty() {
                                 return None;
                             }
-                            let key = from.alias.unwrap_or(from.table);
+                            let key = from.key();
                             let (p, ..) = split_query(sub)?;
                             let (body, _) = split_alias(p.trim());
                             let (q, c) = body.trim().split_once('.')?;
-                            (q.trim().trim_matches('"').eq_ignore_ascii_case(key) && ident_ok(c.trim()))
-                                .then(|| (Some(from.table.to_string()), from.alias.map(str::to_string)))
+                            (canon_ident(q).as_deref() == Some(key) && ident_ok(c.trim_matches('"').trim()))
+                                .then(|| (Some(from.table.to_string()), from.alias.clone()))
                         });
                         let (rel, ralias) = outer_col_rel.unwrap_or_else(|| subquery_source(sub));
                         // a WHOLE-ITEM subquery also lends the outer
@@ -42885,12 +42964,12 @@ fn plan_query_inner_ctx(
                 // equality correlation on a single table still folds to
                 let scope = CorrScope::of_from(table_s, dbr, db);
                 let single = parse_from(table_s).and_then(|(from, join)| {
-                    if !join.is_empty() || from.table.starts_with('(') || view_of(dbr, from.table).is_some() {
+                    if !join.is_empty() || from.table.starts_with('(') || view_of(dbr, &from.table).is_some() {
                         return None;
                     }
-                    let rel = fire_crab_ods::resolve_relation(&dbr.bytes(), dbr.page_size, from.table)?;
-                    let columns = dbr.columns(from.table);
-                    let descs: Vec<Descriptor> = select_formats(dbr, from.table, rel)
+                    let rel = fire_crab_ods::resolve_relation(&dbr.bytes(), dbr.page_size, &from.table)?;
+                    let columns = dbr.columns(&from.table);
+                    let descs: Vec<Descriptor> = select_formats(dbr, &from.table, rel)
                         .iter()
                         .max_by_key(|(n, _)| *n)
                         .map(|(_, d)| d.clone())
@@ -43020,10 +43099,10 @@ fn plan_query_inner_ctx(
                         if whole && is_corr && group_s.is_none() && having_s.is_none() && !where_has_sub {
                             if let Some((from, columns, descs)) = single.as_ref() {
                                 let bind = ColBinding {
-                                    key: from.alias.unwrap_or(from.table),
+                                    key: from.key(),
                                     qual: match from.alias {
                                         None if sub.contains('.') => {
-                                            relation_schema(dbr, from.table).map(|s| (s, from.table))
+                                            relation_schema(dbr, &from.table).map(|s| (s, from.table.as_str()))
                                         }
                                         _ => None,
                                     },
@@ -43090,7 +43169,7 @@ fn plan_query_inner_ctx(
                                 let (body, alias) = split_alias(it);
                                 is_corr(body)
                                     && alias.is_some_and(|a| {
-                                        a.trim().trim_matches('"').eq_ignore_ascii_case(k.trim_matches('"'))
+                                        canon_ident(a).is_some() && canon_ident(a) == canon_ident(k)
                                     })
                             })
                         };
@@ -43245,7 +43324,7 @@ fn plan_query_inner_ctx(
                         .is_some_and(|(n, _)| load_procedure(dbr, &n).is_some());
                 if !is_proc {
                     for tr in &refs {
-                        if relation_qualifier_ok(dbr, tr.schema, tr.table) {
+                        if relation_qualifier_ok(dbr, tr.schema, &tr.table) {
                             continue;
                         }
                         if trace {
@@ -43283,13 +43362,13 @@ fn plan_query_inner_ctx(
             // the ALIAS, when there is one, is the ONLY key - and it
             // kills the 3-part form with it (see [ColBinding])
             let bind = ColBinding {
-                key: from1.alias.unwrap_or(from1.table),
+                key: from1.key(),
                 // `relation_schema` is a full RDB$RELATIONS scan, so it
                 // is asked only when the text could carry a dotted name
                 // at all - a query without one pays nothing
-                qual: match (from1.alias, db.as_ref()) {
+                qual: match (&from1.alias, db.as_ref()) {
                     (None, Some(dbr)) if sql.contains('.') => {
-                        relation_schema(dbr, from1.table).map(|s| (s, from1.table))
+                        relation_schema(dbr, &from1.table).map(|s| (s, from1.table.as_str()))
                     }
                     _ => None,
                 },
@@ -43454,7 +43533,7 @@ fn plan_query_inner_ctx(
                                     match it {
                                         SelItem::Col(c, alias) => match out_names
                                             .iter()
-                                            .position(|n| n.eq_ignore_ascii_case(c))
+                                            .position(|n| col_name_is(n, c))
                                         {
                                             Some(i) => v.push((i, alias.clone())),
                                             None => return Some(Plan::Refused),
@@ -43536,12 +43615,12 @@ fn plan_query_inner_ctx(
     if let Some(dbr) = db.as_ref() {
         if let Some((from, join)) = parse_from(table_s) {
             if join.is_empty() {
-                if let Some((inner, view_cols)) = plan_view(db, dbr, from.table) {
-                    let alias = from.alias.unwrap_or(from.table);
+                if let Some((inner, view_cols)) = plan_view(db, dbr, &from.table) {
+                    let alias = from.key();
                     if trace {
                         eprintln!("[srv] plan: view {} as a row source", from.table);
                     }
-                    let bound = sql_over_from(sql, alias);
+                    let bound = sql_over_from(sql, &render_canon_ref(alias));
                     return match plan_over_source(
                         &bound,
                         alias,
@@ -43551,7 +43630,7 @@ fn plan_query_inner_ctx(
                         params,
                         // the USER's alias only - a bare view's own
                         // name is not a binding (probed: bare V1 -> "")
-                        from.alias,
+                        from.alias.as_deref(),
                     ) {
                         Some(p) => Some(p),
                         None => Some(Plan::Refused),
@@ -43567,7 +43646,7 @@ fn plan_query_inner_ctx(
             // its turn first, and `from_names_view` carries the same
             // guarantee down to the join planner's return.
             if join.is_empty() {
-                if view_of(dbr, from.table).is_some() {
+                if view_of(dbr, &from.table).is_some() {
                     if trace {
                         eprintln!("[srv] plan: view {} is not planned", from.table);
                     }
@@ -43576,7 +43655,7 @@ fn plan_query_inner_ctx(
             } else {
                 from_names_view = std::iter::once(&from)
                     .chain(join.iter().map(|(_, r, _, _)| r))
-                    .any(|tr| view_of(dbr, tr.table).is_some());
+                    .any(|tr| view_of(dbr, &tr.table).is_some());
             }
         }
     }
@@ -43701,7 +43780,10 @@ fn plan_query_inner_ctx(
             }
         };
     }
-    let table = left.table;
+    // the relation CANONICAL: a quoted `"tq"` exact, a bare `tq` folded
+    // to TQ - the catalog spelling every lookup below compares exactly
+    let table_c = canon_table_text(&left);
+    let table: &str = table_c.as_str();
     // through the metadata cache, like the DML planners - see [crate::mdc]
     let meta = match db.relation_meta(table) {
         Some(m) => m,
@@ -43787,8 +43869,8 @@ fn plan_query_inner_ctx(
                     // those subqueries must spell (an alias is exclusive
                     // there too - see [ColBinding::answers_to])
                     let bind = ColBinding {
-                        key: left.alias.unwrap_or(table),
-                        qual: match (left.alias, ws.contains('.')) {
+                        key: left.alias.as_deref().unwrap_or(table),
+                        qual: match (&left.alias, ws.contains('.')) {
                             (None, true) => relation_schema(db, table).map(|s| (s, table)),
                             _ => None,
                         },
@@ -43821,7 +43903,7 @@ fn plan_query_inner_ctx(
     let opt_sql: String = with_first_rows(match &folded_where {
         Some(w) => format!(
             "SELECT 1 FROM {} WHERE {}{}",
-            table,
+            render_canon_ref(table),
             w,
             order_s.map(|o| format!(" ORDER BY {}", o)).unwrap_or_default()
         ),
@@ -43842,7 +43924,7 @@ fn plan_query_inner_ctx(
             // COMPUTED BY column still answers relation T)
             for c in cols.iter_mut() {
                 c.relation = Some(table.to_string());
-                c.rel_alias = left.alias.map(str::to_string);
+                c.rel_alias = left.alias.clone();
             }
             let cols = cols;
             let order_by = match order_s {
@@ -43854,7 +43936,7 @@ fn plan_query_inner_ctx(
                     |n| {
                         columns
                             .iter()
-                            .find(|c| c.name.eq_ignore_ascii_case(n))
+                            .find(|c| col_name_is(&c.name, n))
                             .map(|c| c.field_id as usize)
                             .filter(|fid| !is_computed_fid(&descs, *fid))
                     },
@@ -43987,7 +44069,7 @@ fn plan_query_inner_ctx(
                         AggFn::Min | AggFn::Max => match target {
                             AggTarget::Col(cn) => columns
                                 .iter()
-                                .find(|c| c.name.eq_ignore_ascii_case(cn))
+                                .find(|c| col_name_is(&c.name, cn))
                                 .and_then(|c| descs.get(c.field_id as usize))
                                 .map(ScalarTy::of_desc)
                                 .unwrap_or_else(ScalarTy::int64),
@@ -44018,7 +44100,7 @@ fn plan_query_inner_ctx(
                         AggFn::PercentileDisc => match target {
                             AggTarget::Percentile { order: RawExpr::Col(cn), .. } => columns
                                 .iter()
-                                .find(|c| c.name.eq_ignore_ascii_case(cn))
+                                .find(|c| col_name_is(&c.name, cn))
                                 .and_then(|c| descs.get(c.field_id as usize))
                                 .map(ScalarTy::of_desc)
                                 .unwrap_or_else(ScalarTy::int64),
@@ -44117,7 +44199,7 @@ fn plan_query_inner_ctx(
                         // a bare column reads from this relation; the
                         // expression and generator items around it do not
                         one.relation = Some(table.to_string());
-                        one.rel_alias = left.alias.map(str::to_string);
+                        one.rel_alias = left.alias.clone();
                         out.push(one);
                     }
                     SelItem::Expr(e, alias, fname) => {
@@ -44224,7 +44306,7 @@ fn plan_query_inner_ctx(
             let mut cols = build_projcols(&collist, &columns, &descs, &computed)?;
             for c in cols.iter_mut() {
                 c.relation = Some(table.to_string());
-                c.rel_alias = left.alias.map(str::to_string);
+                c.rel_alias = left.alias.clone();
             }
             cols
         };
@@ -44254,7 +44336,7 @@ fn plan_query_inner_ctx(
                     |n| {
                         columns
                             .iter()
-                            .find(|c| c.name.eq_ignore_ascii_case(n))
+                            .find(|c| col_name_is(&c.name, n))
                             .map(|c| c.field_id as usize)
                             .filter(|fid| !is_computed_fid(&descs, *fid))
                     },
@@ -44312,7 +44394,7 @@ fn plan_query_inner_ctx(
     // (including a lone parameterised aggregate, deferred to fetch)
     match plan_group(
         &items, group_s, having_s, order_s, rel, formats, &columns, &descs, filter, table,
-        left.alias, params,
+        left.alias.as_deref(), params,
     ) {
         Some(Plan::Group {
             rel,
@@ -44500,7 +44582,7 @@ fn mark_not_null_cols(cols: &mut [ProjCol], db: &Database, table: &str) {
     let is_nn = |fid: usize| nn.contains(&fid);
     for c in cols.iter_mut() {
         let nullable = match &c.expr {
-            None => !(c.relation.as_deref().is_some_and(|r| r.eq_ignore_ascii_case(table.trim_matches('"'))) && is_nn(c.field_id)),
+            None => !(c.relation.as_deref().is_some_and(|r| r == table) && is_nn(c.field_id)),
             Some(e) => expr_nullable(e, &is_nn),
         };
         if !nullable {
@@ -44751,13 +44833,13 @@ fn parse_derived_table(from_s: &str) -> Option<(String, String, Vec<String>)> {
         }
         rest = rest[..open].trim();
     }
-    let alias = rest.trim_matches('"');
     // the engine REQUIRES a name for a derived table; without one there
-    // is nothing to qualify its columns with
-    if !ident_ok(alias) {
-        return None;
-    }
-    Some((inner, alias.to_ascii_uppercase(), cols))
+    // is nothing to qualify its columns with - and the name is a NAME
+    // ([canon_ident]): `(SELECT ...) "x"` binds `x`, which `"x".A`
+    // reaches and `X.A` does not. It used to fold whatever the quotes
+    // held, so `GROUP BY "x"."a"` read the folded twin A.
+    let alias = canon_ident(rest)?;
+    Some((inner, alias, cols))
 }
 
 /// Resolve an aggregate's TARGET into the fold source the group
@@ -44775,7 +44857,7 @@ fn resolve_agg_src(
     let out = match target {
         AggTarget::Star => (AggSrc::Star, false), // COUNT(*) - parse guarantees Count
         AggTarget::Col(name) | AggTarget::Distinct(name) => {
-            let rc = columns.iter().find(|c| c.name.eq_ignore_ascii_case(name))?;
+            let rc = find_col(columns, name)?;
             let fid = rc.field_id as usize;
             // no record bytes to aggregate over
             if is_computed_fid(descs, fid) {
@@ -44814,7 +44896,7 @@ fn resolve_agg_src(
                 RawExpr::Col(n) => {
                     let rc = columns
                         .iter()
-                        .find(|c| c.name.eq_ignore_ascii_case(n.trim_matches('"')))?;
+                        .find(|c| col_name_is(&c.name, n))?;
                     let fid = rc.field_id as usize;
                     let d = descs.get(fid)?;
                     if d.dtype == dtype::BLOB {
@@ -44867,7 +44949,7 @@ fn resolve_agg_src(
             let pad = match arg {
                 RawExpr::Col(n) => columns
                     .iter()
-                    .find(|c| c.name.eq_ignore_ascii_case(n.trim_matches('"')))
+                    .find(|c| col_name_is(&c.name, n))
                     .and_then(|c| descs.get(c.field_id as usize))
                     .filter(|d| d.dtype == dtype::TEXT)
                     .map(|d| {
@@ -44962,7 +45044,7 @@ fn agg_result_desc(
     // expression's typing route ([resolve_agg_src]'s own split); the
     // numeric-ish gate matches the bare select-item arm's
     let col_desc = |n: &str| -> Option<Descriptor> {
-        let rc = columns.iter().find(|c| c.name.eq_ignore_ascii_case(n))?;
+        let rc = find_col(columns, n)?;
         if is_computed_fid(descs, rc.field_id as usize) {
             return None;
         }
@@ -45395,6 +45477,12 @@ fn build_group_items(
     items: &[SelItem],
     columns: &[RelationColumn],
     descs: &[Descriptor],
+    // the join SIDE KEYS when `columns` is a join's COMBINED view
+    // ([combined_view]), whose entries are spelled `key.COL` (and
+    // `schema.key.COL`): a grouped key's describe name is what follows
+    // such a prefix. Empty for a relation's own columns - a column named
+    // "x.y" is announced whole, never split (review-caught)
+    side_keys: &[String],
     key_fids: &[usize],
     key_exprs: &[(RawExpr, Expr)],
     synth_base: usize,
@@ -45542,7 +45630,7 @@ fn build_group_items(
             // folded group row - it belongs to the Project path, not here
             SelItem::Win(..) => return None,
             SelItem::Col(name, alias) => {
-                let rc = columns.iter().find(|c| c.name.eq_ignore_ascii_case(name))?;
+                let rc = find_col(columns, name)?;
                 let fid = rc.field_id as usize;
                 // a computed column has no record bytes to group over
                 if is_computed_fid(descs, fid) {
@@ -45552,11 +45640,17 @@ fn build_group_items(
                     return None; // a selected column that is not grouped
                 }
                 let (wire, sql_type, length, scale, sub_type) = wire_for(descs.get(fid)?);
-                let bare = rc.name.rsplit('.').next().unwrap_or(&rc.name).to_string();
+                // the engine describes a grouped key by its COLUMN name,
+                // qualifier dropped (probed: `GROUP BY D.ID` answers a
+                // column titled ID). Only a REFERENCE the parser made is
+                // split on its dot - a catalog name is never split: a
+                // column called "x.y" (review-caught) is announced whole
+                let bare = side_keys
+                    .iter()
+                    .find_map(|k| rc.name.strip_prefix(k.as_str()).and_then(|r| r.strip_prefix('.')))
+                    .map(str::to_string)
+                    .unwrap_or_else(|| rc.name.clone());
                 cols.push(ProjCol {
-                    // the engine describes a grouped key by its COLUMN
-                    // name, qualifier dropped (probed: `GROUP BY D.ID`
-                    // answers a column titled ID)
                     name: alias.clone().unwrap_or_else(|| bare.clone()),
                     fname: Some(bare),
                     // the CALLER stamps a key's relation - it knows
@@ -45998,7 +46092,7 @@ fn plan_group(
         Some(g) => parse_group_by(g, items, columns, descs, synth_base)?,
     };
     let (mut cols, mut gitems, mut slot_descs) =
-        build_group_items(items, columns, descs, &key_fids, &key_exprs, synth_base, params)?;
+        build_group_items(items, columns, descs, &[], &key_fids, &key_exprs, synth_base, params)?;
     // a PLAIN group key reads from the grouped relation (probed:
     // `SELECT B, COUNT(*) ... GROUP BY B` answers relation T on the
     // key, "" on the fold); an expression key - a synthetic slot at or
@@ -46062,7 +46156,7 @@ fn plan_group(
             &cols,
             &[],
             |n| {
-                if let Some(c) = cols.iter().find(|c| c.name.eq_ignore_ascii_case(n)) {
+                if let Some(c) = cols.iter().find(|c| col_name_is(&c.name, n)) {
                     // an EXPRESSION output (an aggregate expression's
                     // item) has no field of its own - its field_id is
                     // the FIRST aggregate's slot, and sorting by that
@@ -46085,7 +46179,7 @@ fn plan_group(
                 gitems_cell.borrow().iter().enumerate().find_map(|(slot, g)| match g {
                     GItem::Key(fid) => columns
                         .iter()
-                        .find(|rc| rc.field_id as usize == *fid && rc.name.eq_ignore_ascii_case(n))
+                        .find(|rc| rc.field_id as usize == *fid && col_name_is(&rc.name, n))
                         .map(|_| slot),
                     _ => None,
                 })
@@ -46160,14 +46254,21 @@ fn plan_group(
 /// Parse a GROUP BY list into record field ids. Items are column names or
 /// 1-based select-list ordinals (which must name a bare column - grouping
 /// by an aggregate is invalid).
-/// Uppercase every COLUMN NAME in a raw expression - and nothing else
-/// (string literals keep their case) - so two spellings of the same
-/// tree compare equal: `GROUP BY upper( s )` matches `SELECT UPPER(S)`.
+/// Normalise a raw expression so two SPELLINGS of the same tree compare
+/// equal: `GROUP BY upper( s )` matches `SELECT UPPER(S)`. Blanks and
+/// the case of a FUNCTION word are already gone by the time a tree is
+/// built, and a COLUMN NAME arrives CANONICAL from the parse boundary
+/// ([canon_ident] / [scan_canon_ref]: a quoted part exact, a bare one
+/// folded) - so nothing here may touch it. This used to upper-case
+/// `RawExpr::Col`, which turned the column `"a"` into its folded twin
+/// A: the expression key was then RESOLVED and EVALUATED over A, and
+/// `SELECT "a" + 0, COUNT(*) ... GROUP BY "a" + 0` answered A's values
+/// (review-caught, and a refusal where no twin existed).
+/// String literals keep their case, as they always did.
 fn normalize_raw(e: &RawExpr) -> RawExpr {
     let nb = |b: &RawExpr| Box::new(normalize_raw(b));
     let nv = |v: &[RawExpr]| v.iter().map(normalize_raw).collect();
     match e {
-        RawExpr::Col(c) => RawExpr::Col(c.to_ascii_uppercase()),
         RawExpr::Neg(a) => RawExpr::Neg(nb(a)),
         RawExpr::Bin(a, op, b) => RawExpr::Bin(nb(a), *op, nb(b)),
         RawExpr::Concat(a, b) => RawExpr::Concat(nb(a), nb(b)),
@@ -46238,8 +46339,20 @@ fn parse_group_by(
     // top-level commas only: an expression key's own argument commas
     // (GROUP BY MOD(A, 2)) stay inside their parens
     for part in split_top_level_commas(group) {
-        let name = part.trim().trim_matches('"');
-        let col_name = if let Ok(ord) = name.parse::<usize>() {
+        // the key is CANONICAL ([canon_ident]): a quoted one exact, a
+        // bare one folded - `GROUP BY "a"` groups by `a`, not by A. An
+        // ordinal is only ever bare.
+        let raw_key = part.trim();
+        let quoted_key = raw_key.starts_with('"');
+        let canon = canon_ident(raw_key);
+        let qual = if canon.is_none() && is_qualified_col(raw_key) {
+            canon_ref(raw_key, 3)
+        } else {
+            None
+        };
+        let name_owned = canon.clone().or_else(|| qual.clone()).unwrap_or_else(|| raw_key.to_string());
+        let name = name_owned.as_str();
+        let col_name = if let Some(ord) = (!quoted_key).then(|| name.parse::<usize>().ok()).flatten() {
             if ord == 0 || ord > items.len() {
                 return None;
             }
@@ -46253,29 +46366,31 @@ fn parse_group_by(
                 }
                 _ => return None,
             }
-        } else if name.matches('.').count() == 1
-            && name.split('.').all(|p| ident_ok(p.trim_matches('"')))
-        {
+        } else if qual.is_some() {
             // A QUALIFIED key - `GROUP BY D.ID`. A join's combined view
             // carries the qualified spelling, so it is tried first; a
             // single relation has no qualifiers, so the part after the
             // dot is what names its column.
-            if columns.iter().any(|c| c.name.eq_ignore_ascii_case(name)) {
+            // A qualifier that resolved has ALREADY been stripped by the
+            // caller ([unqualify_single]); one still here names a binding
+            // the FROM did not make (`"t".ID` after `FROM TQ t`) - the
+            // engine's -206, never the bare column (review-caught)
+            if find_col(columns, name).is_some() {
                 name
             } else {
-                name.split('.').nth(1)?.trim_matches('"')
+                return None;
             }
-        } else if ident_ok(name) {
+        } else if canon.is_some() {
             // a bare name is a COLUMN, or one of the select list's
             // ALIASES: `SELECT G AS X ... GROUP BY X` groups by G (the
             // engine resolves the alias). A real column of that name
             // wins, which is what makes an alias that shadows one
             // harmless.
-            match columns.iter().find(|c| c.name.eq_ignore_ascii_case(name)) {
+            match find_col(columns, name) {
                 Some(_) => name,
                 None => {
                     let aliased = items.iter().find_map(|it| match it {
-                        SelItem::Col(c, Some(a)) if a.eq_ignore_ascii_case(name) => {
+                        SelItem::Col(c, Some(a)) if a == name => {
                             Some(c.as_str())
                         }
                         _ => None,
@@ -46286,7 +46401,7 @@ fn parse_group_by(
                             // an alias over an EXPRESSION item groups by
                             // that expression
                             let raw = items.iter().find_map(|it| match it {
-                                SelItem::Expr(raw, n, _) if n.eq_ignore_ascii_case(name) => {
+                                SelItem::Expr(raw, n, _) if n == name => {
                                     Some(raw.clone())
                                 }
                                 _ => None,
@@ -46308,7 +46423,7 @@ fn parse_group_by(
         };
         let rc = columns
             .iter()
-            .find(|c| c.name.eq_ignore_ascii_case(col_name))?;
+            .find(|c| col_name_is(&c.name, col_name))?;
         // a computed column has no record bytes to bucket rows by
         if is_computed_fid(descs, rc.field_id as usize) {
             return None;
@@ -46473,7 +46588,7 @@ fn aggregate(
     let AggTarget::Col(name) = target else {
         return None;
     };
-    let rc = columns.iter().find(|c| c.name.eq_ignore_ascii_case(name))?;
+    let rc = find_col(columns, name)?;
     let fid = rc.field_id as usize;
     // a computed column has no record bytes to aggregate over
     if is_computed_fid(descs, fid) {
@@ -48803,7 +48918,7 @@ fn plan_win_item(
             |n| {
                 columns
                     .iter()
-                    .find(|c| c.name.eq_ignore_ascii_case(n))
+                    .find(|c| col_name_is(&c.name, n))
                     .map(|c| c.field_id as usize)
                     .filter(|fid| !is_computed_fid(&descs, *fid))
             },
@@ -48855,6 +48970,7 @@ fn plan_win_item(
                 )),
                 &columns,
                 &descs,
+                &[],
                 &[],
                 &[],
                 win_base,
@@ -54091,7 +54207,7 @@ fn session_zone_id() -> u16 {
 fn blob_col_cast(inner: &RawExpr, t: &CastTarget, columns: &[RelationColumn], descs: &[Descriptor]) -> Option<usize> {
     let RawExpr::Col(name) = inner else { return None };
     let _ = t; // every target: text directly, a number through the text's conversion
-    let rc = columns.iter().find(|c| c.name.eq_ignore_ascii_case(name))?;
+    let rc = find_col(columns, name)?;
     let fid = rc.field_id as usize;
     (descs.get(fid)?.dtype == dtype::BLOB).then_some(fid)
 }
@@ -54385,8 +54501,195 @@ fn bare_ident_ok(s: &str) -> bool {
     ident_ok(s) && s.starts_with(|c: char| c.is_ascii_alphabetic())
 }
 
+/// A DDL item upper-cased OUTSIDE its quotes: the keywords fold (so
+/// `primary key` reads as PRIMARY KEY) while a `"quoted"` name and a
+/// `'string'` keep every byte - the folded copy then still spells the
+/// names the way [canon_ident] reads them. Same length as the input,
+/// so offsets found on the copy index the original.
+fn fold_bare(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut quote: Option<char> = None;
+    for c in s.chars() {
+        match quote {
+            Some(q) => {
+                if c == q {
+                    quote = None;
+                }
+                out.push(c);
+            }
+            None => {
+                if c == '"' || c == '\'' {
+                    quote = Some(c);
+                    out.push(c);
+                } else {
+                    out.push(c.to_ascii_uppercase());
+                }
+            }
+        }
+    }
+    out
+}
+
 fn is_ident_byte(c: u8) -> bool {
     c.is_ascii_alphanumeric() || c == b'_' || c == b'$'
+}
+
+/// THE ONE RULE for an identifier at the parse boundary (measured, see
+/// qa/serve-real-quotedname.sh): a `"quoted"` name is a NAME taken
+/// EXACTLY - case, spaces, keywords - with `""` unescaped to one `"`;
+/// a bare word must be an identifier and FOLDS to upper case, the way
+/// the engine folds an unquoted identifier before lookup. What comes
+/// out IS the catalog spelling (`RDB$FIELD_NAME` holds the exact
+/// text), and every lookup past this point compares with `==`: `"a"`
+/// and `A` are two columns of one table, `"A"` is `A`.
+///
+/// None for an empty quoted name, a lone inner `"`, an unterminated
+/// quote, or a bare word that is no identifier. A bare KEYWORD is the
+/// caller's business - the rule here only spells.
+fn canon_ident(raw: &str) -> Option<String> {
+    let t = raw.trim();
+    if t.len() >= 2 && t.starts_with('"') && t.ends_with('"') {
+        let inner = &t[1..t.len() - 1];
+        let mut out = String::with_capacity(inner.len());
+        let mut chars = inner.chars();
+        while let Some(c) = chars.next() {
+            if c == '"' && chars.next() != Some('"') {
+                return None; // a lone inner quote: not one name
+            }
+            out.push(c);
+        }
+        if out.is_empty() {
+            return None;
+        }
+        Some(out)
+    } else if ident_ok(t) && !t.starts_with(|c: char| c.is_ascii_digit()) {
+        Some(t.to_ascii_uppercase())
+    } else {
+        None
+    }
+}
+
+/// Scan a possibly DOTTED reference (`T.C`, `"t"."a"`, `PUBLIC.T.C`)
+/// starting at byte `from` of `s`, canonicalising every part by
+/// [canon_ident]'s rule, and answer (the parts joined by `.`, the byte
+/// just past the reference). At most `max` parts; `ws` allows blanks
+/// around the dots (`PUBLIC . T`, which the engine takes - the dot is
+/// its own token there). A quoted part that itself CONTAINS a dot
+/// refuses: the joined spelling could not be split back.
+///
+/// The joined text is the ONE representation a reference has past the
+/// parse boundary ([Tok::Ident], [SelItem::Col], [RawExpr::Col]):
+/// canonical parts, `.`-separated, no quotes - so `t."a"` and `T.a`
+/// are the same string, and [split_col_ref] splits on the dots alone.
+fn scan_canon_ref(s: &str, from: usize, max: usize, ws: bool) -> Option<(String, usize)> {
+    let b = s.as_bytes();
+    let mut i = from;
+    let mut out = String::new();
+    let mut n = 0usize;
+    loop {
+        if b.get(i) == Some(&b'"') {
+            let mut j = i + 1;
+            let mut part = String::new();
+            loop {
+                match b.get(j) {
+                    None => return None, // unterminated
+                    Some(b'"') if b.get(j + 1) == Some(&b'"') => {
+                        part.push('"');
+                        j += 2;
+                    }
+                    Some(b'"') => {
+                        j += 1;
+                        break;
+                    }
+                    Some(_) => {
+                        // one whole character, whatever its width
+                        let ch = s[j..].chars().next()?;
+                        part.push(ch);
+                        j += ch.len_utf8();
+                    }
+                }
+            }
+            if part.is_empty() || part.contains('.') {
+                return None;
+            }
+            out.push_str(&part);
+            i = j;
+        } else {
+            let st = i;
+            while b.get(i).is_some_and(|c| is_ident_byte(*c)) {
+                i += 1;
+            }
+            if i == st || b[st].is_ascii_digit() {
+                return None;
+            }
+            out.push_str(&s[st..i].to_ascii_uppercase());
+        }
+        n += 1;
+        let mut k = i;
+        if ws {
+            while b.get(k).is_some_and(|c| c.is_ascii_whitespace()) {
+                k += 1;
+            }
+        }
+        if n < max && b.get(k) == Some(&b'.') {
+            k += 1;
+            if ws {
+                while b.get(k).is_some_and(|c| c.is_ascii_whitespace()) {
+                    k += 1;
+                }
+            }
+            if b.get(k).is_some_and(|c| *c == b'"' || is_ident_byte(*c)) {
+                out.push('.');
+                i = k;
+                continue;
+            }
+        }
+        return Some((out, i));
+    }
+}
+
+/// [scan_canon_ref] over a WHOLE text: the text must be exactly one
+/// reference of at most `max` parts, blanks around the dots allowed.
+fn canon_ref(raw: &str, max: usize) -> Option<String> {
+    let t = raw.trim();
+    let (out, end) = scan_canon_ref(t, 0, max, true)?;
+    (end == t.len()).then_some(out)
+}
+
+/// Does a catalog column name answer to a canonical reference? EXACT:
+/// both sides are canonical spellings - a join's combined view
+/// ([combined_view]) spells its qualified entries `key.COL` with the
+/// side key canonical too (`FROM TQ "t"` binds `t`, `FROM TQ t` binds
+/// T), so a dotted pair compares part for part with no folding.
+fn col_name_is(catalog: &str, want: &str) -> bool {
+    catalog == want
+}
+
+/// The column of `columns` a canonical reference names ([col_name_is]).
+fn find_col<'a>(columns: &'a [RelationColumn], want: &str) -> Option<&'a RelationColumn> {
+    columns.iter().find(|c| col_name_is(&c.name, want))
+}
+
+/// A canonical reference spelled back as SQL text that a SECOND PARSE
+/// reads as the same name: a part that a bare word would fold to stays
+/// bare, any other - lower case, a blank, a keyword (`"select"`,
+/// `"AND"`), a quote (`""`) - is delimited. THE ONE helper every
+/// internal re-render goes through (an UPDATE OR INSERT's halves, an
+/// INSERT ... SELECT's per-row statement, a MERGE's per-row DML, a
+/// view's base-table rewrite, a PSQL body's nested DML, the optimizer
+/// gatekeeper's probe): a canonical name written bare re-parses as its
+/// folded twin (`a` -> A), which is a WRONG WRITE, not a refusal.
+fn render_canon_ref(s: &str) -> String {
+    s.split('.')
+        .map(|p| {
+            if bare_ident_ok(p) && !p.bytes().any(|c| c.is_ascii_lowercase()) && !view_is_keyword(p) {
+                p.to_string()
+            } else {
+                format!("\"{}\"", p.replace('"', "\"\""))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(".")
 }
 
 /// Does the statement carry a SPACE-LIKE CHARACTER THE ENGINE'S LEXER
@@ -56523,24 +56826,63 @@ fn expr_atom_bare(b: &[char], pos: &mut usize) -> Option<RawExpr> {
         }
         c if c.is_alphabetic() || *c == '_' || *c == '$' || *c == '"' => {
             let quoted = *c == '"';
-            if quoted {
-                *pos += 1;
-            }
-            let start = *pos;
-            while *pos < b.len()
-                && (b[*pos].is_alphanumeric()
-                    || b[*pos] == '_'
-                    || b[*pos] == '$'
-                    || b[*pos] == '.')
-            {
-                *pos += 1;
-            }
-            let word: String = b[start..*pos].iter().collect();
-            if quoted {
-                if b.get(*pos) != Some(&'"') {
-                    return None;
+            // The reference, part by part, each CANONICAL by
+            // [canon_ident]'s rule: a quoted part exact (`""` unescaped,
+            // any character inside - `"Mixed Col"` is one name), a bare
+            // part folded. Dotted parts join with `.` - the one
+            // representation a reference has past the parse boundary -
+            // capped at the engine's three.
+            let mut word = String::new();
+            let mut parts = 0usize;
+            loop {
+                if b.get(*pos) == Some(&'"') {
+                    *pos += 1;
+                    let mut part = String::new();
+                    loop {
+                        match b.get(*pos) {
+                            None => return None,
+                            Some('"') if b.get(*pos + 1) == Some(&'"') => {
+                                part.push('"');
+                                *pos += 2;
+                            }
+                            Some('"') => {
+                                *pos += 1;
+                                break;
+                            }
+                            Some(ch) => {
+                                part.push(*ch);
+                                *pos += 1;
+                            }
+                        }
+                    }
+                    if part.is_empty() || part.contains('.') {
+                        return None;
+                    }
+                    word.push_str(&part);
+                } else {
+                    let start = *pos;
+                    while *pos < b.len()
+                        && (b[*pos].is_alphanumeric() || b[*pos] == '_' || b[*pos] == '$')
+                    {
+                        *pos += 1;
+                    }
+                    if *pos == start {
+                        return None;
+                    }
+                    word.extend(b[start..*pos].iter().map(|c| c.to_ascii_uppercase()));
                 }
-                *pos += 1;
+                parts += 1;
+                if parts < 3
+                    && b.get(*pos) == Some(&'.')
+                    && b.get(*pos + 1).is_some_and(|n| {
+                        n.is_alphabetic() || *n == '_' || *n == '$' || *n == '"'
+                    })
+                {
+                    word.push('.');
+                    *pos += 1;
+                    continue;
+                }
+                break;
             }
             // the correlated-subquery marker a clause was lifted into
             if !quoted && word.eq_ignore_ascii_case("FC$CORR") {
@@ -56560,7 +56902,7 @@ fn expr_atom_bare(b: &[char], pos: &mut usize) -> Option<RawExpr> {
                 *pos += 1;
                 return Some(RawExpr::Subq(id));
             }
-            if word.eq_ignore_ascii_case("NULL") {
+            if !quoted && word.eq_ignore_ascii_case("NULL") {
                 Some(RawExpr::Null)
             } else if !quoted && word.eq_ignore_ascii_case("CURRENT_DATE") {
                 Some(RawExpr::CurrentDate)
@@ -58167,7 +58509,8 @@ fn strip_qual_prefix(text: &str, alias: &str, taken: &mut Vec<String>) -> String
                 }
             }
             let word = text[start..i].trim_matches('"');
-            if i < b.len() && b[i] == b'.' && word.eq_ignore_ascii_case(alias) {
+            if i < b.len() && b[i] == b'.' && canon_ident(&text[start..i]).as_deref() == Some(alias) {
+                let _ = word;
                 i += 1; // the qualifier and its dot both go
                 // the name it qualified is UNAMBIGUOUS by construction -
                 // the caller must not judge it against the source
@@ -58593,7 +58936,7 @@ fn resolve_expr_inner(
         // enclosing row's columns ([resolve_corr_sub])
         RawExpr::Subq(id) => resolve_corr_sub(*id, columns, descs)?,
         RawExpr::Col(name) => {
-            let rc = columns.iter().find(|c| c.name.eq_ignore_ascii_case(name))?;
+            let rc = find_col(columns, name)?;
             let fid = rc.field_id as usize;
             // a computed column has no record bytes to evaluate from
             if is_computed_fid(descs, fid) {
@@ -58679,7 +59022,7 @@ fn resolve_expr_inner(
             // length is recognised on the RAW shape and reads the
             // stored blob at eval ([SysFn::BlobOctetLength])
             if let (SysFn::OctetLength, [RawExpr::Col(name)]) = (f, args.as_slice()) {
-                let rc = columns.iter().find(|c| c.name.eq_ignore_ascii_case(name));
+                let rc = find_col(columns, name);
                 if let Some(d) = rc.and_then(|rc| descs.get(rc.field_id as usize)) {
                     if d.dtype == dtype::BLOB && !is_computed_fid(descs, rc.unwrap().field_id as usize) {
                         return Some(Expr::Func(
@@ -64293,12 +64636,25 @@ fn mask_literals(up: &str) -> String {
     let mut b = up.as_bytes().to_vec();
     let mut i = 0;
     let mut in_str = false;
+    // a `"quoted"` identifier is masked like a string: a column named
+    // `"from"` or `"Order"` is a NAME, and a keyword search must never
+    // split the statement inside it (`""` is an escaped quote, so the
+    // toggle just runs twice)
+    let mut in_ident = false;
     while i < b.len() {
-        if b[i] == b'\'' {
+        if in_ident {
+            if b[i] == b'"' {
+                in_ident = false;
+            }
+            b[i] = b'X';
+        } else if b[i] == b'\'' {
             b[i] = b'X';
             in_str = !in_str;
         } else if in_str {
             b[i] = b'X';
+        } else if b[i] == b'"' {
+            b[i] = b'X';
+            in_ident = true;
         }
         i += 1;
     }
@@ -64940,13 +65296,14 @@ impl CorrScope {
     }
 }
 
-/// A catalog spelling against a name as written: quoted compares exactly,
-/// bare compares case-insensitively.
+/// A catalog spelling against a name as written: quoted compares
+/// exactly, bare FOLDS to upper case first and then compares exactly -
+/// a bare `t` is T, which a quoted binding `"t"` never answers to.
 fn name_matches(catalog: &str, written: &str, quoted: bool) -> bool {
     if quoted {
         catalog == written
     } else {
-        catalog.eq_ignore_ascii_case(written)
+        catalog == written.to_ascii_uppercase()
     }
 }
 
@@ -64957,8 +65314,8 @@ fn scope_rel_of(tr: &TableRef<'_>, db: &Database, db_opt: &Option<Database>) -> 
         // declared list; nothing outside it is visible inside it
         // the span holds `(SELECT ...) X (A, B)` whole when a column list
         // was written, and just the query when not
-        let alias = tr.alias?;
-        let (inner_sql, dalias, declared) = parse_derived_table(tr.table)
+        let alias = tr.alias.as_deref()?;
+        let (inner_sql, dalias, declared) = parse_derived_table(&tr.table)
             .or_else(|| parse_derived_table(&format!("{} {}", tr.table, alias)))?;
         let mut ip: Vec<Option<Descriptor>> = Vec::new();
         let plan = plan_query_inner(&inner_sql, db_opt, &mut ip)?;
@@ -64986,15 +65343,15 @@ fn scope_rel_of(tr: &TableRef<'_>, db: &Database, db_opt: &Option<Database>) -> 
             qual_only: false,
         });
     }
-    let key = tr.alias.unwrap_or(tr.table).trim_matches('"').to_string();
-    let relation = canon_relation_name(db, tr.table);
+    let key = tr.key().trim_matches('"').to_string();
+    let relation = canon_relation_name(db, &tr.table);
     let schema = match tr.alias {
-        None => relation_schema(db, tr.table),
+        None => relation_schema(db, &tr.table),
         Some(_) => None,
     };
     // a VIEW's columns are what its body announces, typed by it
-    if view_of(db, tr.table).is_some() {
-        let (_, vcols) = plan_view(db_opt, db, tr.table)?;
+    if view_of(db, &tr.table).is_some() {
+        let (_, vcols) = plan_view(db_opt, db, &tr.table)?;
         let (columns, descs) = derived_view(&vcols);
         return Some(ScopeRel {
             key,
@@ -65007,13 +65364,13 @@ fn scope_rel_of(tr: &TableRef<'_>, db: &Database, db_opt: &Option<Database>) -> 
             qual_only: false,
         });
     }
-    let columns = db.columns(tr.table);
+    let columns = db.columns(&tr.table);
     if columns.is_empty() {
         return None;
     }
     // a table's columns carry their stored descriptors, by field id
-    let rel = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, tr.table)?;
-    let descs: Vec<Descriptor> = select_formats(db, tr.table, rel)
+    let rel = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, &tr.table)?;
+    let descs: Vec<Descriptor> = select_formats(db, &tr.table, rel)
         .iter()
         .max_by_key(|(n, _)| *n)
         .map(|(_, d)| d.clone())
@@ -66221,9 +66578,9 @@ fn resolve_corr_sub(id: usize, columns: &[RelationColumn], descs: &[Descriptor])
         let rc = columns
             .iter()
             .find(|c| c.name == *qualified)
-            .or_else(|| columns.iter().find(|c| c.name.eq_ignore_ascii_case(qualified)))
+            .or_else(|| columns.iter().find(|c| col_name_is(&c.name, qualified)))
             .or_else(|| columns.iter().find(|c| c.name == *bare))
-            .or_else(|| columns.iter().find(|c| c.name.eq_ignore_ascii_case(bare)))?;
+            .or_else(|| columns.iter().find(|c| col_name_is(&c.name, bare)))?;
         let fid = rc.field_id as usize;
         if is_computed_fid(descs, fid) {
             return None;
@@ -66481,7 +66838,9 @@ fn render_toks(toks: &[Tok]) -> Option<String> {
     let mut parts: Vec<String> = Vec::with_capacity(toks.len());
     for t in toks {
         parts.push(match t {
-            Tok::Ident(s) => s.clone(),
+            // a canonical name spelled back: bare where a bare word
+            // folds to it, quoted otherwise ([render_canon_ref])
+            Tok::Ident(s) => render_canon_ref(s),
             Tok::Int(i) => i.to_string(),
             Tok::Int128(i) => i.to_string(),
             // a DECFLOAT literal never keys an index - decline, so the
@@ -66564,7 +66923,8 @@ fn plan_correlated_select(
     if !join.is_empty() {
         return Some(Plan::Refused); // a correlated subquery over a join
     }
-    let table = from.table;
+    let table_c = canon_table_text(&from);
+    let table: &str = table_c.as_str();
     let rel = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, table)?;
     let columns = db.columns(table);
     let formats = select_formats(db, table, rel);
@@ -66583,7 +66943,7 @@ fn plan_correlated_select(
     // against it: the outer relation is in scope inside the subquery
     // only under the name the outer FROM bound it to.
     let bind = ColBinding {
-        key: from.alias.unwrap_or(table),
+        key: from.alias.as_deref().unwrap_or(table),
         qual: match from.alias {
             None if table_s.contains('.')
                 || where_s.is_some_and(|w| w.contains('.'))
@@ -66609,7 +66969,7 @@ fn plan_correlated_select(
         let outer_col = split_query(sub).is_some_and(|(p, ..)| {
             let (body, _) = split_alias(p.trim());
             body.trim().split_once('.').is_some_and(|(q, c)| {
-                q.trim().trim_matches('"').eq_ignore_ascii_case(bind.key) && ident_ok(c.trim())
+                canon_ident(q).as_deref() == Some(bind.key) && ident_ok(c.trim_matches('"').trim())
             })
         });
         lookups.push((
@@ -66621,7 +66981,7 @@ fn plan_correlated_select(
             // probed: a correlated sub delegates its relation exactly
             // as the constant fold does (inner D from U answers U)
             if outer_col {
-                (Some(table.to_string()), from.alias.map(str::to_string))
+                (Some(table.to_string()), from.alias.clone())
             } else {
                 subquery_source(sub)
             },
@@ -66672,7 +67032,8 @@ fn plan_correlated_select(
                 // through untouched (probed: (SELECT MAX(X) AS M ...)
                 // is field MAX, alias M; ... AS SUB is MAX/SUB)
                 name: alias
-                    .map(|a| a.trim_matches('"').to_ascii_uppercase())
+                    // a quoted alias keeps its case, a bare one folds
+                    .and_then(canon_ident)
                     .unwrap_or_else(|| iname.clone()),
                 fname: Some(ifname.clone()),
                 relation: irel.clone(),
@@ -66699,7 +67060,7 @@ fn plan_correlated_select(
                     }
                     // an outer plain column reads from the outer table
                     pc.relation = Some(table.to_string());
-                    pc.rel_alias = from.alias.map(str::to_string);
+                    pc.rel_alias = from.alias.clone();
                     cols.push(pc);
                 }
                 SelItem::Expr(raw, name, fname) => {
@@ -66724,7 +67085,7 @@ fn plan_correlated_select(
             |n| {
                 columns
                     .iter()
-                    .find(|c| c.name.eq_ignore_ascii_case(n))
+                    .find(|c| col_name_is(&c.name, n))
                     .map(|c| c.field_id as usize)
             },
             |text| parse_raw_expr(text).and_then(|r| resolve_expr(&r, &columns, &descs)),
@@ -66742,7 +67103,7 @@ fn plan_correlated_select(
     let opt_sql = ws_unq.as_ref().map(|w| {
         format!(
             "SELECT 1 FROM {} WHERE {}{}",
-            table,
+            render_canon_ref(table),
             w,
             order_s.map(|o| format!(" ORDER BY {}", unq(o))).unwrap_or_default()
         )
@@ -66826,7 +67187,7 @@ fn subquery_source(sub: &str) -> (Option<String>, Option<String>) {
     }
     (
         Some(from.table.to_string()),
-        from.alias.map(str::to_string),
+        from.alias.clone(),
     )
 }
 
@@ -66867,7 +67228,8 @@ fn build_correlated_lookup(
     if !join.is_empty() {
         return None;
     }
-    let table = from.table;
+    let table_c = canon_table_text(&from);
+    let table: &str = table_c.as_str();
     // the same two-way catalog check [eval_subquery] makes: a
     // correlated subquery's FROM is a nested FROM like any other
     if !relation_qualifier_ok(db, from.schema, table) {
@@ -66893,7 +67255,7 @@ fn build_correlated_lookup(
     }
     let toks = tokenize(ws)?;
     let (corr_fid, outer_name, residual) =
-        split_correlation(&toks, table, from.alias, &columns, outer_cols, Some(outer_bind))?;
+        split_correlation(&toks, table, from.alias.as_deref(), &columns, outer_cols, Some(outer_bind))?;
 
     // The residual WHERE names the INNER table, often by its alias
     // (`AND E.SALARY > 150`). The correlation split needed those
@@ -66903,7 +67265,7 @@ fn build_correlated_lookup(
     // reference (`x.ID < T.ID` is the ranking idiom), and stripping it
     // as an inner name turned that into `ID < ID` - a silent NULL for
     // every row (measured, qa/serve-real-corrsub.sh)
-    let inner_names: Vec<&str> = match from.alias {
+    let inner_names: Vec<&str> = match from.alias.as_deref() {
         Some(a) => vec![a],
         None => vec![table],
     };
@@ -66913,7 +67275,7 @@ fn build_correlated_lookup(
             .filter(|_| {
                 t.rsplitn(2, '.')
                     .nth(1)
-                    .map_or(true, |q| inner_names.iter().any(|n| n.eq_ignore_ascii_case(q)))
+                    .map_or(true, |q| inner_names.iter().any(|n| *n == q))
             })
             .unwrap_or(t)
             .to_string()
@@ -66959,13 +67321,13 @@ fn build_correlated_lookup(
         None => Some(format!(
             "SELECT {} FROM {}",
             strip_inner_all(proj_s, &inner_names),
-            table
+            render_canon_ref(table)
         )),
         Some(toks) => render_toks(toks).map(|w| {
             format!(
                 "SELECT {} FROM {} WHERE {}",
                 strip_inner_all(proj_s, &inner_names),
-                table,
+                render_canon_ref(table),
                 w
             )
         }),
@@ -67035,7 +67397,7 @@ fn build_correlated_lookup(
                 AggTarget::Col(n) => agg_field_src(
                     columns
                         .iter()
-                        .find(|c| c.name.eq_ignore_ascii_case(n))?
+                        .find(|c| col_name_is(&c.name, n))?
                         .field_id as usize,
                     &descs,
                 ),
@@ -67066,7 +67428,7 @@ fn build_correlated_lookup(
         }
         SelItem::Col(name, _) => {
             let name = strip_inner(name);
-            let rc = columns.iter().find(|c| c.name.eq_ignore_ascii_case(&name))?;
+            let rc = find_col(&columns, &name)?;
             let fid = rc.field_id as usize;
             if is_computed_fid(&descs, fid) {
                 return None;
@@ -67093,7 +67455,7 @@ fn build_correlated_lookup(
     // the outer key: the column named on the other side of the equality
     let key_rc = outer_cols
         .iter()
-        .find(|c| c.name.eq_ignore_ascii_case(&outer_name))?;
+        .find(|c| col_name_is(&c.name, &outer_name))?;
     let key_fid = key_rc.field_id as usize;
     if is_computed_fid(outer_descs, key_fid) {
         return None;
@@ -67237,7 +67599,7 @@ fn strip_inner_all(text: &str, names: &[&str]) -> String {
                 i += 1;
             }
             let word: String = b[start..i].iter().collect();
-            if i < b.len() && b[i] == '.' && names.iter().any(|n| n.eq_ignore_ascii_case(&word))
+            if i < b.len() && b[i] == '.' && canon_ident(&word).is_some_and(|w| names.iter().any(|n| *n == w))
             {
                 i += 1; // the qualifier and its dot go
                 continue;
@@ -67313,9 +67675,11 @@ fn split_correlation(
             // answered 0 for every row. Both are silent wrong answers to
             // everyday SQL.
             let in_tbl = |q: &str| -> bool {
+                // exact: the qualifier is canonical, and so are the
+                // alias and the table (`TQ` never names an inner `"tq"`)
                 match (qual_of(q), alias) {
-                    (Some(t), Some(a)) => t.eq_ignore_ascii_case(a),
-                    (Some(t), None) => t.eq_ignore_ascii_case(table),
+                    (Some(t), Some(a)) => t == a,
+                    (Some(t), None) => t == table,
                     (None, _) => false,
                 }
             };
@@ -67339,10 +67703,10 @@ fn split_correlation(
             }
             let a_in = in_tbl(a)
                 || (qual_of(a).is_none()
-                    && columns.iter().any(|c| c.name.eq_ignore_ascii_case(&an)));
+                    && find_col(columns, &an).is_some());
             let b_in = in_tbl(b)
                 || (qual_of(b).is_none()
-                    && columns.iter().any(|c| c.name.eq_ignore_ascii_case(&bn)));
+                    && find_col(columns, &bn).is_some());
             // INNERMOST-FIRST: a bare name the inner relation has is the
             // inner relation's, whatever the outer has (measured: `EXISTS
             // (SELECT 1 FROM D WHERE D.ID = ID)` binds ID to D and is true
@@ -67350,10 +67714,10 @@ fn split_correlation(
             // name the inner lacks reaches the outer scope.
             let a_out = !a_in
                 && !in_tbl(a)
-                && outer_cols.iter().any(|c| c.name.eq_ignore_ascii_case(&an));
+                && find_col(outer_cols, &an).is_some();
             let b_out = !b_in
                 && !in_tbl(b)
-                && outer_cols.iter().any(|c| c.name.eq_ignore_ascii_case(&bn));
+                && find_col(outer_cols, &bn).is_some();
             // one side resolves in the INNER table, and the other side is
             // then an OUTER reference (a bare name only when the inner
             // lacks it)
@@ -67369,7 +67733,7 @@ fn split_correlation(
                 found = Some((
                     columns
                         .iter()
-                        .find(|c| c.name.eq_ignore_ascii_case(&inner))?
+                        .find(|c| col_name_is(&c.name, &inner))?
                         .field_id as usize,
                     outer,
                 ));
@@ -67467,7 +67831,7 @@ fn eval_subquery_corr_planned(
     // and is planned as one; a VIEW is planned by name. Both end as an
     // inner plan plus its DESCRIBE, which is all the correlation split
     // below needs - it never asked for a rel id, only for columns.
-    let (inner_plan, inner_cols, table, alias): (Plan, Vec<ProjCol>, String, Option<&str>) =
+    let (inner_plan, inner_cols, table, alias): (Plan, Vec<ProjCol>, String, Option<String>) =
         if let Some((inner_sql, dalias, declared)) = parse_derived_table(table_s) {
             let mut ip: Vec<Option<Descriptor>> = Vec::new();
             let plan = plan_query_inner(&inner_sql, db_opt, &mut ip)?;
@@ -67491,20 +67855,21 @@ fn eval_subquery_corr_planned(
             // a derived table's ALIAS is its only name, and SQL requires
             // one - so it is both the "table" the correlation splits on
             // and the qualifier the residual carries
-            (plan, cols, dalias, None)
+            (plan, cols, dalias, None::<String>)
         } else {
             let (from, join) = parse_from(table_s)?;
             if !join.is_empty() {
                 return None;
             }
             // the same two-way catalog check every nested FROM gets
-            if !relation_qualifier_ok(db, from.schema, from.table) {
+            if !relation_qualifier_ok(db, from.schema, &from.table) {
                 return None;
             }
-            let (plan, cols) = plan_view(db_opt, db, from.table)?;
-            (plan, cols, from.table.to_string(), from.alias)
+            let (plan, cols) = plan_view(db_opt, db, &from.table)?;
+            (plan, cols, from.table.to_string(), from.alias.clone())
         };
     let table = table.as_str();
+    let alias = alias.as_deref();
     let (columns, descs) = derived_view(&inner_cols);
     let ws = where_s?; // a correlated subquery needs a WHERE to correlate
     if !extract_subqueries(ws)?.1.is_empty() {
@@ -67527,7 +67892,7 @@ fn eval_subquery_corr_planned(
                 Tok::Ident(n) => {
                     let bare = n.rsplit('.').next().unwrap_or(&n).to_string();
                     match n.rsplitn(2, '.').nth(1) {
-                        Some(q) if inner_names.iter().any(|m| m.eq_ignore_ascii_case(q)) => {
+                        Some(q) if inner_names.iter().any(|m| *m == q) => {
                             Tok::Ident(bare)
                         }
                         _ => Tok::Ident(n),
@@ -67618,7 +67983,8 @@ fn eval_subquery_rel(
     if !join.is_empty() {
         return None; // a subquery over a join
     }
-    let table = from.table;
+    let table_c = canon_table_text(&from);
+    let table: &str = table_c.as_str();
     // THE SCHEMA HALF, HERE TOO. A nested query expression is its own
     // FROM and gets the same two-way catalog check the top-level one
     // gets: `IN (SELECT C FROM SYSTEM.U)` is a -204 even though U
@@ -67666,7 +68032,7 @@ fn eval_subquery_rel(
     if let Some(outer_cols) = corr {
         let toks = where_toks.take()?; // correlated EXISTS needs a WHERE
         let (fid, outer_name, residual) =
-            split_correlation(&toks, table, from.alias, &columns, outer_cols, outer_bind)?;
+            split_correlation(&toks, table, from.alias.as_deref(), &columns, outer_cols, outer_bind)?;
         corr_inner_fid = Some(fid);
         corr_outer = Some(outer_name);
         where_toks = residual;
@@ -67681,7 +68047,7 @@ fn eval_subquery_rel(
     // x` the base name T is an OUTER scope's, so it is NOT stripped -
     // stripping it read `x.ID < T.ID` as `ID < ID` and folded a self-
     // correlation to NULL for every row (measured)
-    let inner_names: Vec<&str> = match from.alias {
+    let inner_names: Vec<&str> = match from.alias.as_deref() {
         Some(a) => vec![a],
         None => vec![table],
     };
@@ -67690,7 +68056,7 @@ fn eval_subquery_rel(
     // `EXISTS (SELECT 1 FROM PUBLIC.U WHERE PUBLIC.U.C = 1)`. Built from
     // the RESOLVED schema, as [ColBinding.qual] is, and asked for only
     // when the text could carry a dotted name at all.
-    let inner_qual: Option<String> = match (from.alias, sql.contains('.')) {
+    let inner_qual: Option<String> = match (&from.alias, sql.contains('.')) {
         (None, true) => relation_schema(db, table).map(|s| format!("{}.{}", s, table)),
         _ => None,
     };
@@ -67698,8 +68064,8 @@ fn eval_subquery_rel(
         let bare = t.rsplit('.').next().unwrap_or(t);
         match t.rsplitn(2, '.').nth(1) {
             Some(q)
-                if inner_names.iter().any(|n| n.eq_ignore_ascii_case(q))
-                    || inner_qual.as_deref().is_some_and(|i| i.eq_ignore_ascii_case(q)) =>
+                if inner_names.iter().any(|n| *n == q)
+                    || inner_qual.as_deref().is_some_and(|i| i == q) =>
             {
                 bare.to_string()
             }
@@ -67730,7 +68096,7 @@ fn eval_subquery_rel(
                 SelItem::Col(name, _) => Some(
                     columns
                         .iter()
-                        .find(|c| c.name.eq_ignore_ascii_case(name))?
+                        .find(|c| col_name_is(&c.name, name))?
                         .field_id as usize,
                 ),
                 SelItem::Agg(f, t, _) => {
@@ -67777,9 +68143,9 @@ fn eval_subquery_rel(
     // choice; the bands come from the resolved filter, so a rendering
     // infidelity costs an index, not a row.
     let opt_sql = match &where_toks {
-        None => Some(format!("SELECT {} FROM {}", proj_s, table)),
+        None => Some(format!("SELECT {} FROM {}", proj_s, render_canon_ref(table))),
         Some(toks) => render_toks(toks)
-            .map(|w| format!("SELECT {} FROM {} WHERE {}", proj_s, table, w)),
+            .map(|w| format!("SELECT {} FROM {} WHERE {}", proj_s, render_canon_ref(table), w)),
     };
     let index =
         opt_sql.and_then(|s| choose_index(db, rel, table, &descs, &filter, &s, &[]));
@@ -67812,7 +68178,7 @@ fn eval_subquery_rel(
             }
             AggTarget::Star => (AggSrc::Star, false),
             AggTarget::Col(name) | AggTarget::Distinct(name) => {
-                let c = columns.iter().find(|c| c.name.eq_ignore_ascii_case(name))?;
+                let c = columns.iter().find(|c| col_name_is(&c.name, name))?;
                 let fid = c.field_id as usize;
                 if is_computed_fid(&descs, fid) {
                     return None;
@@ -68442,10 +68808,10 @@ fn correlated_outer_col(
     // three times drifts twice.
     let (_, table_s, where_s, _, _, _) = split_query(sql)?;
     let (from, _) = parse_from(table_s)?;
-    let columns = db.columns(from.table);
+    let columns = db.columns(&from.table);
     let toks = tokenize(where_s?)?;
     let (_, outer, _) =
-        split_correlation(&toks, from.table, from.alias, &columns, outer_cols, Some(outer_bind))?;
+        split_correlation(&toks, &from.table, from.alias.as_deref(), &columns, outer_cols, Some(outer_bind))?;
     Some(outer)
 }
 
@@ -69318,12 +69684,12 @@ fn parse_agg_item(item: &str) -> Option<(AggFn, AggTarget)> {
             return None; // SUM/AVG/MIN/MAX DISTINCT: not answered
         }
         let inner = rest.trim();
-        let name = inner.trim_matches('"');
         // a bare column keeps the field-sourced fold; anything else - a
         // CASE (from a filtered distinct) or `COUNT(DISTINCT UPPER(S))` -
-        // becomes an expression the fold evaluates per row before dedup
-        if ident_ok(name) {
-            return Some((func, AggTarget::Distinct(name.to_string())));
+        // becomes an expression the fold evaluates per row before dedup.
+        // The column is CANONICAL ([canon_ident]): `"a"` is `a`.
+        if let Some(name) = canon_ident(inner) {
+            return Some((func, AggTarget::Distinct(name)));
         }
         return Some((func, AggTarget::DistinctExpr(parse_raw_expr_any(inner)?)));
     }
@@ -69333,8 +69699,8 @@ fn parse_agg_item(item: &str) -> Option<(AggFn, AggTarget)> {
             return None;
         }
         AggTarget::Star
-    } else if ident_ok(arg.trim_matches('"')) {
-        AggTarget::Col(arg.trim_matches('"').to_string())
+    } else if let Some(name) = canon_ident(arg) {
+        AggTarget::Col(name)
     } else {
         // not a bare column: an expression argument - SUM(A + B),
         // MIN(UPPER(S)), COUNT(NULLIF(G, 1))
@@ -69366,7 +69732,7 @@ fn parse_projection(proj: &str) -> Option<Proj> {
         let alias_name = |a: &str| {
             let t = a.trim();
             if t.starts_with('"') && t.ends_with('"') && t.len() >= 2 {
-                t[1..t.len() - 1].to_string()
+                t[1..t.len() - 1].replace("\"\"", "\"")
             } else {
                 t.to_ascii_uppercase()
             }
@@ -69438,25 +69804,29 @@ fn parse_projection(proj: &str) -> Option<Proj> {
         }
         // TRUE/FALSE/UNKNOWN/NULL LOOK like identifiers and are
         // literals - they must not take the column path, aliased or not
-        let literal_kw = matches!(
-            body.trim_matches('"').to_ascii_uppercase().as_str(),
-            "TRUE" | "FALSE" | "UNKNOWN" | "NULL"
-        );
-        // An UNQUOTED identifier cannot start with a digit, so `3` is a
-        // LITERAL and not a column named "3" - which is how it was read,
-        // making `SELECT 3 FROM T` refuse while `SELECT NULL` and
-        // `SELECT 'x'` worked. A QUOTED "3" is still a column name.
+        // ... and only when BARE: a quoted `"null"` is a column name
         let quoted_ident = body.starts_with('"') && body.ends_with('"') && body.len() >= 2;
-        let bare_ident = body.trim_matches('"');
-        let ident_like = ident_ok(bare_ident)
-            && (quoted_ident || !bare_ident.starts_with(|c: char| c.is_ascii_digit()));
+        let literal_kw = !quoted_ident
+            && matches!(
+                body.to_ascii_uppercase().as_str(),
+                "TRUE" | "FALSE" | "UNKNOWN" | "NULL"
+            );
+        // A column item is its CANONICAL name ([canon_ident]): a quoted
+        // one exact - `"a"`, `"Mixed Col"`, `"select"`, `"3"` are all
+        // names - a bare one folded. An UNQUOTED word starting with a
+        // digit is a LITERAL, not a column named 3 (canon_ident refuses
+        // it, so `SELECT 3 FROM T` takes the expression path).
+        let canon_col = if quoted_ident {
+            canon_ident(body)
+        } else if ident_ok(body) {
+            canon_ident(body)
+        } else {
+            None
+        };
         if !literal_kw && is_qualified_col(body) {
-            items.push(SelItem::Col(body.to_string(), alias_owned));
-        } else if !literal_kw && ident_like {
-            items.push(SelItem::Col(
-                body.trim_matches('"').to_string(),
-                alias_owned,
-            ));
+            items.push(SelItem::Col(canon_ref(body, 3)?, alias_owned));
+        } else if let (false, Some(name)) = (literal_kw, canon_col) {
+            items.push(SelItem::Col(name, alias_owned));
         } else if let Some(raw) = parse_raw_expr(body).or_else(|| {
             literal_kw.then(|| parse_raw_expr_any(body)).flatten()
         }) {
@@ -69552,7 +69922,31 @@ fn split_alias(item: &str) -> (&str, Option<&str>) {
     // is not an alias but a shape this parser does not know, and must
     // keep refusing rather than silently dropping a token.
     let trimmed = item.trim_end();
-    let Some(cut) = trimmed.rfind(|c: char| c.is_whitespace()) else {
+    // a QUOTED trailing alias may hold blanks (`"a" "a b"`): the split
+    // is at the blank BEFORE its opening quote, not at the last blank
+    let cut = if trimmed.ends_with('"') && trimmed.len() >= 2 {
+        let b = trimmed.as_bytes();
+        let mut j = trimmed.len() - 1;
+        let mut open = None;
+        while j > 0 {
+            j -= 1;
+            if b[j] == b'"' {
+                if j > 0 && b[j - 1] == b'"' {
+                    j -= 1; // an escaped `""`
+                    continue;
+                }
+                open = Some(j);
+                break;
+            }
+        }
+        match open {
+            Some(o) if o > 0 && b[o - 1].is_ascii_whitespace() => Some(o - 1),
+            _ => None,
+        }
+    } else {
+        trimmed.rfind(|c: char| c.is_whitespace())
+    };
+    let Some(cut) = cut else {
         return (item, None);
     };
     let tail = trimmed[cut + 1..].trim();
@@ -69825,24 +70219,26 @@ fn parse_order_by_expr(
             None => None,
         };
         explicits.push(explicit);
-        let name = head.trim_matches('"');
         // a bare identifier or an ordinal is a FIELD key - and so is a
         // QUALIFIED one, `ORDER BY E.ID`, which a join's resolver reads
-        // whole and a single table's reads after the dot
-        let ident_char = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '$';
-        let plain_ident = !name.is_empty() && name.chars().all(ident_char);
-        let qualified = !plain_ident
-            && name.matches('.').count() == 1
-            && name.split('.').all(|p| {
-                let p = p.trim_matches('"');
-                !p.is_empty() && p.chars().all(ident_char)
-            });
+        // whole and a single table's reads after the dot. The name is
+        // CANONICAL ([canon_ident]): a quoted key exact, a bare one
+        // folded - `ORDER BY "a"` sorts by `a`, not by A. An ORDINAL is
+        // only ever bare (a quoted "1" would be a column named 1).
+        let quoted_head = head.starts_with('"');
+        let canon = canon_ident(head);
+        let ordinal = !quoted_head && head.parse::<usize>().is_ok();
+        let plain_ident = canon.is_some() || ordinal;
+        let qualified = !plain_ident && is_qualified_col(head);
         if qualified {
-            let fid = resolve_name(name)
-                .or_else(|| resolve_name(name.split('.').nth(1)?.trim_matches('"')))?;
+            let name = canon_ref(head, 3)?;
+            let fid = resolve_name(&name)
+                .or_else(|| resolve_name(name.rsplit('.').next()?))?;
             keys.push(stamp(OrderKey::field(fid, desc, nulls)));
             continue;
         }
+        let name_owned = canon.unwrap_or_else(|| head.to_string());
+        let name = name_owned.as_str();
         if !plain_ident {
             // anything else - an operator, a call, a CASE - is an
             // EXPRESSION key, computed per row
@@ -69854,7 +70250,7 @@ fn parse_order_by_expr(
                 None => return None,
             }
         }
-        let fid = if let Ok(ord) = name.parse::<usize>() {
+        let fid = if let Some(ord) = (!quoted_head).then(|| name.parse::<usize>().ok()).flatten() {
             // 1-based ordinal into the projection
             if ord == 0 || ord > cols.len() {
                 return None;
@@ -69887,7 +70283,7 @@ fn parse_order_by_expr(
             // refusal: the rows come back in a different order with
             // nothing to say so. It was found by a differential probe,
             // not by a gate.
-            match cols.iter().find(|c| c.name.eq_ignore_ascii_case(name)) {
+            match cols.iter().find(|c| col_name_is(&c.name, name)) {
                 Some(c) => {
                     // an aliased EXPRESSION sorts by the expression it
                     // names, as the ordinal form above does
@@ -70252,6 +70648,15 @@ fn tokenize(s: &str) -> Option<Vec<Tok>> {
                     i += 1;
                 }
             }
+            // a QUOTED identifier is a NAME, never a keyword: the
+            // reference (with any dotted parts, quoted or bare) becomes
+            // one canonical token ([scan_canon_ref] - `"a"` is `a`,
+            // `"A"` is `A`, `t."a"` is `T.a`)
+            b'"' => {
+                let (name, end) = scan_canon_ref(s, i, 3, false)?;
+                i = end;
+                out.push(Tok::Ident(name));
+            }
             _ if is_ident_byte(c) => {
                 let start = i;
                 while i < b.len() && is_ident_byte(b[i]) {
@@ -70262,21 +70667,16 @@ fn tokenize(s: &str) -> Option<Vec<Tok>> {
                 // wherever the 2-part form is (probed: an ON, a WHERE,
                 // a GROUP BY all take it). The resolver splits it from
                 // the RIGHT ([split_col_ref]); TWO dots is the cap the
-                // engine's grammar has (a fourth part is -104).
-                let mut dots = 0;
-                while dots < 2
-                    && i < b.len()
+                // engine's grammar has (a fourth part is -104). Every
+                // part is canonical - a bare one folded, a quoted one
+                // exact - so the token IS the catalog spelling.
+                if i < b.len()
                     && b[i] == b'.'
-                    && b.get(i + 1).is_some_and(|n| is_ident_byte(*n))
+                    && b.get(i + 1).is_some_and(|n| is_ident_byte(*n) || *n == b'"')
                 {
-                    i += 1;
-                    while i < b.len() && is_ident_byte(b[i]) {
-                        i += 1;
-                    }
-                    dots += 1;
-                }
-                if dots > 0 {
-                    out.push(Tok::Ident(s[start..i].to_string()));
+                    let (name, end) = scan_canon_ref(s, start, 3, false)?;
+                    i = end;
+                    out.push(Tok::Ident(name));
                     continue;
                 }
                 let word = &s[start..i];
@@ -70430,7 +70830,8 @@ fn tokenize(s: &str) -> Option<Vec<Tok>> {
                         let n = word[SUBQ_MARK.len()..].parse::<usize>().ok()?;
                         out.push(Tok::Subq(n));
                     }
-                    _ => out.push(Tok::Ident(word.to_string())),
+                    // a bare name FOLDS: the token is the catalog spelling
+                    _ => out.push(Tok::Ident(upper)),
                 }
             }
             _ => return None, // unsupported character
@@ -72464,10 +72865,9 @@ struct TrigCtx {
 
 impl TrigCtx {
     fn fid(&self, name: &str) -> Option<usize> {
-        self.cols
-            .iter()
-            .find(|c| c.name.eq_ignore_ascii_case(name))
-            .map(|c| c.field_id as usize)
+        // EXACT: the body's names are canonical ([parse_trig_stmt]),
+        // and `NEW."a"` beside NEW.A are two columns
+        self.cols.iter().find(|c| c.name == name).map(|c| c.field_id as usize)
     }
     /// ONLY CONTEXT 0 AND 1 ARE THIS EVENT'S ROWS - `OLD.` and `NEW.`.
     /// Everything else, and CTX_PLAIN in particular, is an UNQUALIFIED
@@ -73306,10 +73706,12 @@ fn insert_select(
             // GEN_ID 6 -> 6); OUV discards every source value and
             // advances the generator ONCE PER ROW (ids 7,8,9, GEN_ID
             // 6 -> 9).
+            // the names are canonical and the statement is PARSED AGAIN:
+            // spelled through [render_canon_ref] so `a` stays "a"
             let sql = format!(
                 "INSERT INTO {} ({}){} VALUES ({})",
-                table,
-                cols.join(", "),
+                render_canon_ref(table),
+                cols.iter().map(|c| render_canon_ref(c)).collect::<Vec<_>>().join(", "),
                 ov.sql(),
                 vals.join(", ")
             );
@@ -73366,7 +73768,13 @@ fn plan_merge(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor>
     // texts and is bound at execute ([MERGE_PARAM_MARK])
     let (marked, nparams) = mark_merge_params(text);
     let text = marked.as_str();
-    let up = text.to_ascii_uppercase();
+    // A KEYWORD SEARCH NEVER LOOKS INSIDE A QUOTED NAME. `mask_literals`
+    // blanks `'...'` and `"..."` alike, byte for byte, so offsets found
+    // on it index `text` - and a column named `"ORDER"` stops looking
+    // like the ORDER BY this planner refuses (review-caught: every
+    // MERGE branch naming `t."ORDER"` refused, target and source alike,
+    // while the direct UPDATE over the same column worked).
+    let up = mask_literals(&text.to_ascii_uppercase());
     if find_word(&up, "MERGE", 0) != Some(0) {
         return None;
     }
@@ -73389,9 +73797,11 @@ fn plan_merge(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor>
         if parts.len() == 3 && parts[1].eq_ignore_ascii_case("AS") {
             parts.remove(1);
         }
+        // CANONICAL names: `"Order"` is Order, `t` is T; the alias is a
+        // name too (`MERGE INTO TQ "t"` binds `t`)
         match parts.as_slice() {
-            [t] => (t.trim_matches('"').to_ascii_uppercase(), t.trim_matches('"').to_ascii_uppercase()),
-            [t, a] => (t.trim_matches('"').to_ascii_uppercase(), a.trim_matches('"').to_ascii_uppercase()),
+            [t] => (canon_ident(t)?, canon_ident(t)?),
+            [t, a] => (canon_ident(t)?, canon_ident(a)?),
             _ => return None,
         }
     };
@@ -73420,7 +73830,7 @@ fn plan_merge(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor>
             tail.remove(0);
         }
         let alias = match tail.as_slice() {
-            [a] => a.trim_matches('"').to_ascii_uppercase(),
+            [a] => canon_ident(a)?,
             _ => return None, // a derived source needs its alias
         };
         (format!("({})", body), alias)
@@ -73430,8 +73840,8 @@ fn plan_merge(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor>
             parts.remove(1);
         }
         match parts.as_slice() {
-            [t] => (t.to_string(), t.trim_matches('"').to_ascii_uppercase()),
-            [t, a] => (t.to_string(), a.trim_matches('"').to_ascii_uppercase()),
+            [t] => (t.to_string(), canon_ident(t)?),
+            [t, a] => (t.to_string(), canon_ident(a)?),
             _ => return None,
         }
     };
@@ -73452,7 +73862,9 @@ fn plan_merge(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor>
     for (i, &st) in starts.iter().enumerate() {
         let end = starts.get(i + 1).copied().unwrap_or(text.len());
         let clause = text[st + "WHEN".len()..end].trim();
-        let cup = clause.to_ascii_uppercase();
+        // masked here too: `WHEN MATCHED AND t."THEN" = 1` must not
+        // split at the column
+        let cup = mask_literals(&clause.to_ascii_uppercase());
         let then = find_word(&cup, "THEN", 0)?;
         let head = cup[..then].trim();
         let action = clause[then + "THEN".len()..].trim();
@@ -73513,7 +73925,8 @@ fn plan_merge(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor>
         } else {
             aup.strip_prefix("INSERT")?;
             let ins_txt = action["INSERT".len()..].trim();
-            let values_at = find_word(&ins_txt.to_ascii_uppercase(), "VALUES", 0)?;
+            // ...and the column list may hold a `"VALUES"` of its own
+            let values_at = find_word(&mask_literals(&ins_txt.to_ascii_uppercase()), "VALUES", 0)?;
             let cols_txt = ins_txt[..values_at].trim();
             let cols = if cols_txt.is_empty() {
                 None
@@ -73658,16 +74071,19 @@ fn merge_target_col<'a>(
     columns: &'a [RelationColumn],
     tgt_alias: &str,
 ) -> Option<&'a RelationColumn> {
-    let (qual, bare) = match name.split_once('.') {
-        Some((q, c)) => (Some(q.trim().trim_matches('"')), c.trim().trim_matches('"')),
-        None => (None, name.trim().trim_matches('"')),
+    // CANONICAL, then exact: `t."a"` names "a" and never A
+    // (review-caught: the fold wrote u.A into "a")
+    let r = canon_ref(name, 2)?;
+    let (qual, bare) = match r.rsplit_once('.') {
+        Some((q, c)) => (Some(q), c),
+        None => (None, r.as_str()),
     };
     if let Some(q) = qual {
-        if !q.eq_ignore_ascii_case(tgt_alias) {
+        if q != tgt_alias {
             return None;
         }
     }
-    columns.iter().find(|c| c.name.eq_ignore_ascii_case(bare))
+    columns.iter().find(|c| c.name == bare)
 }
 
 /// Type every marker in a `SET` list: each takes its DESTINATION
@@ -73714,8 +74130,8 @@ fn type_markers_in_values(
         Some(c) => split_set_list(c)
             .iter()
             .map(|n| {
-                let n = n.trim().trim_matches('"');
-                columns.iter().find(|c| c.name.eq_ignore_ascii_case(n))
+                let n = canon_ident(n)?;
+                columns.iter().find(|c| c.name == n)
             })
             .collect::<Option<Vec<_>>>()?,
         None => columns
@@ -73791,7 +74207,6 @@ fn type_markers_in_cond(
 fn mentions_qualifier(text: &str, alias: &str) -> bool {
     let b = text.as_bytes();
     let mut i = 0usize;
-    let ident_char = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$';
     while i < b.len() {
         let c = b[i];
         if c == b'\'' {
@@ -73810,20 +74225,15 @@ fn mentions_qualifier(text: &str, alias: &str) -> bool {
             continue;
         }
         if c.is_ascii_alphabetic() || c == b'_' || c == b'"' {
-            let start = i;
-            if c == b'"' {
-                i += 1;
-                while i < b.len() && b[i] != b'"' {
-                    i += 1;
+            // one identifier by the ONE rule, `""` undoubled inside it
+            match scan_canon_ref(text, i, 1, false) {
+                Some((name, end)) => {
+                    if b.get(end) == Some(&b'.') && name == alias {
+                        return true;
+                    }
+                    i = end;
                 }
-                i = (i + 1).min(b.len());
-            } else {
-                while i < b.len() && ident_char(b[i]) {
-                    i += 1;
-                }
-            }
-            if i < b.len() && b[i] == b'.' && text[start..i].trim_matches('"').eq_ignore_ascii_case(alias) {
-                return true;
+                None => i += 1,
             }
             continue;
         }
@@ -73850,7 +74260,6 @@ fn merge_subst(
     let masked = mask_literals(&text.to_ascii_uppercase());
     let mut out = String::with_capacity(text.len());
     let mut i = 0usize;
-    let ident_char = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$';
     while i < b.len() {
         let c = b[i];
         if c == b'\'' {
@@ -73872,20 +74281,19 @@ fn merge_subst(
             continue;
         }
         if c.is_ascii_alphabetic() || c == b'_' || c == b'"' {
-            // an identifier, possibly qualified
+            // an identifier, possibly qualified - scanned by the ONE
+            // rule ([scan_canon_ref]), so `""` is one quote inside the
+            // name and a SOURCE column named `a"b` is read whole (the
+            // hand-rolled loop here stopped at the first `"` and cut
+            // `u."a""b"` into `u."a"` plus a stray `b"`, which refused
+            // the MERGE - review-caught)
             let start = i;
-            if c == b'"' {
+            let Some((first, after_first)) = scan_canon_ref(text, start, 1, false) else {
+                out.push(c as char);
                 i += 1;
-                while i < b.len() && b[i] != b'"' {
-                    i += 1;
-                }
-                i = (i + 1).min(b.len());
-            } else {
-                while i < b.len() && ident_char(b[i]) {
-                    i += 1;
-                }
-            }
-            let first = text[start..i].trim_matches('"').to_ascii_uppercase();
+                continue;
+            };
+            i = after_first;
             // A BOUND PARAMETER, as its literal: the marker plan_merge
             // left in place of a `?` ([MERGE_PARAM_MARK]). It is written
             // here, beside the source row's own values, because the
@@ -73903,20 +74311,11 @@ fn merge_subst(
                 continue;
             }
             if i < b.len() && b[i] == b'.' {
-                let mut j = i + 1;
-                let cstart = j;
-                if j < b.len() && b[j] == b'"' {
-                    j += 1;
-                    while j < b.len() && b[j] != b'"' {
-                        j += 1;
-                    }
-                    j = (j + 1).min(b.len());
-                } else {
-                    while j < b.len() && ident_char(b[j]) {
-                        j += 1;
-                    }
-                }
-                let col = text[cstart..j].trim_matches('"').to_ascii_uppercase();
+                let cstart = i + 1;
+                let Some((col, j)) = scan_canon_ref(text, cstart, 1, false) else {
+                    out.push_str(&text[start..i]);
+                    continue;
+                };
                 // INNERMOST-FIRST: inside a `(SELECT` span whose own FROM
                 // binds this qualifier - `FROM D` unaliased, or anything
                 // aliased AS D - `D.<col>` is that FROM item's row, never
@@ -73937,7 +74336,7 @@ fn merge_subst(
                 if first == src_alias {
                     let idx = src_cols
                         .iter()
-                        .position(|n| n.eq_ignore_ascii_case(&col))
+                        .position(|n| *n == col)
                         .ok_or_else(|| format!("no column {} in the MERGE source", col))?;
                     let lit = psql_literal(&row[idx])
                         .ok_or_else(|| format!("a source value of {} cannot be written as a literal", col))?;
@@ -73962,7 +74361,7 @@ fn merge_subst(
                                     .into(),
                             );
                         }
-                        out.push_str(target);
+                        out.push_str(&render_canon_ref(target));
                         out.push('.');
                     }
                     out.push_str(&text[cstart..j]);
@@ -74015,7 +74414,7 @@ fn merge_exec(
         let db = database.as_ref().ok_or("no database attached")?;
         let rows = branch_rows(&splan, db, args)
             .ok_or("the MERGE source is not one this server can run")?;
-        let cols: Vec<String> = output_cols_of(&splan).iter().map(|c| c.name.to_ascii_uppercase()).collect();
+        let cols: Vec<String> = output_cols_of(&splan).iter().map(|c| c.name.clone()).collect();
         (rows, cols)
     };
     // the target's primary key, for a per-row identity predicate
@@ -74038,7 +74437,7 @@ fn merge_exec(
     for row in &rows {
         let sub = |t: &str| merge_subst(t, src_alias, &src_cols, row, tgt_alias, target, args);
         let on_s = sub(on)?;
-        let probe = format!("DELETE FROM {} WHERE {}", target, on_s);
+        let probe = format!("DELETE FROM {} WHERE {}", render_canon_ref(target), on_s);
         let (dplan, _) = plan_delete(&probe, database)
             .ok_or_else(|| format!("the MERGE ON clause is outside this server's surface: {}", probe))?;
         let targets = match &dplan {
@@ -74074,7 +74473,7 @@ fn merge_exec(
     // one statement moves them together)
     let mut orphans: Vec<String> = Vec::new();
     if !by_source.is_empty() {
-        let probe = format!("DELETE FROM {}", target);
+        let probe = format!("DELETE FROM {}", render_canon_ref(target));
         let (dplan, _) = plan_delete(&probe, database)
             .ok_or_else(|| format!("the MERGE target is outside this server's surface: {}", probe))?;
         let Plan::Delete { rel: drel, formats, filter, .. } = &dplan else {
@@ -74105,14 +74504,14 @@ fn merge_exec(
             for name in key_cols {
                 let col = rel_cols
                     .iter()
-                    .find(|c| c.name.eq_ignore_ascii_case(name))
+                    .find(|c| c.name == name)
                     .ok_or("MERGE target key column unknown")?;
                 let v = values.get(col.field_id as usize).cloned().unwrap_or(Value::Null);
                 match v {
-                    Value::Null => parts.push(format!("{} IS NULL", name)),
+                    Value::Null => parts.push(format!("{} IS NULL", render_canon_ref(name))),
                     v => {
                         let lit = psql_literal(&v).ok_or("a key value cannot be written as a literal")?;
-                        parts.push(format!("{} = {}", name, lit));
+                        parts.push(format!("{} = {}", render_canon_ref(name), lit));
                     }
                 }
             }
@@ -74137,8 +74536,8 @@ fn merge_exec(
                     where_ = format!("({}) AND ({})", where_, sub(c)?);
                 }
                 let (sql, kind) = match action {
-                    MergeAction::Update(sets) => (format!("UPDATE {} SET {} WHERE {}", target, sub(sets)?, where_), 1),
-                    MergeAction::Delete => (format!("DELETE FROM {} WHERE {}", target, where_), 2),
+                    MergeAction::Update(sets) => (format!("UPDATE {} SET {} WHERE {}", render_canon_ref(target), sub(sets)?, where_), 1),
+                    MergeAction::Delete => (format!("DELETE FROM {} WHERE {}", render_canon_ref(target), where_), 2),
                 };
                 let (aplan, _) = if kind == 1 {
                     plan_update(&sql, database)
@@ -74181,8 +74580,8 @@ fn merge_exec(
                         None => String::new(),
                     };
                     let sql = match cols {
-                        Some(c) => format!("INSERT INTO {} ({}) SELECT {} FROM RDB$DATABASE{}", target, c, sub(vals)?, where_),
-                        None => format!("INSERT INTO {} SELECT {} FROM RDB$DATABASE{}", target, sub(vals)?, where_),
+                        Some(c) => format!("INSERT INTO {} ({}) SELECT {} FROM RDB$DATABASE{}", render_canon_ref(target), c, sub(vals)?, where_),
+                        None => format!("INSERT INTO {} SELECT {} FROM RDB$DATABASE{}", render_canon_ref(target), sub(vals)?, where_),
                     };
                     let (iplan, _) = plan_insert(&sql, database)
                         .ok_or_else(|| format!("the MERGE INSERT branch is outside this server's surface: {}", sql))?;
@@ -74217,11 +74616,11 @@ fn merge_exec(
                     for pk in &pk_cols {
                         let col = rel_cols
                             .iter()
-                            .find(|c| c.name.eq_ignore_ascii_case(pk))
+                            .find(|c| c.name == *pk)
                             .ok_or("MERGE target key column unknown")?;
                         let v = values.get(col.field_id as usize).cloned().unwrap_or(Value::Null);
                         let lit = psql_literal(&v).ok_or("a key value cannot be written as a literal")?;
-                        parts.push(format!("{} = {}", pk, lit));
+                        parts.push(format!("{} = {}", render_canon_ref(pk), lit));
                     }
                     parts.join(" AND ")
                 };
@@ -74232,9 +74631,9 @@ fn merge_exec(
                     }
                     let (sql, kind) = match action {
                         MergeAction::Update(sets) => {
-                            (format!("UPDATE {} SET {} WHERE {}", target, sub(sets)?, where_), 1)
+                            (format!("UPDATE {} SET {} WHERE {}", render_canon_ref(target), sub(sets)?, where_), 1)
                         }
-                        MergeAction::Delete => (format!("DELETE FROM {} WHERE {}", target, where_), 2),
+                        MergeAction::Delete => (format!("DELETE FROM {} WHERE {}", render_canon_ref(target), where_), 2),
                     };
                     let (aplan, _) = if kind == 1 {
                         plan_update(&sql, database)
@@ -74320,7 +74719,8 @@ fn named_refs(sql: &str) -> Vec<String> {
             while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
                 j += 1;
             }
-            out.push(sql[start..j].to_string());
+            // a bare reference FOLDS to the declared (canonical) name
+            out.push(sql[start..j].to_ascii_uppercase());
             i = j;
         } else {
             i += 1;
@@ -74362,8 +74762,8 @@ fn subst_body_query(sql: &str, binds: &[(String, u16)], f: &PsqlFrame) -> Option
             while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
                 j += 1;
             }
-            let name = &sql[start..j];
-            match binds.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)) {
+            let name = sql[start..j].to_ascii_uppercase();
+            match binds.iter().find(|(n, _)| *n == name) {
                 Some((_, slot)) => {
                     out.push_str(&subst_literal(
                         f.vars.get(*slot as usize).unwrap_or(&Value::Null),
@@ -74405,16 +74805,10 @@ fn subst_body_query(sql: &str, binds: &[(String, u16)], f: &PsqlFrame) -> Option
                 i += 1;
                 continue;
             };
+            // the column CANONICAL: `NEW."a"` is "a", `NEW.a` is A
             let start = i + 4;
-            let mut j = start;
-            while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_' || b[j] == b'$') {
-                j += 1;
-            }
-            if j == start {
-                return None;
-            }
-            let name = &sql[start..j];
-            let v = f.trig.as_ref().and_then(|t| t.read(ctx, name))?;
+            let (name, j) = scan_canon_ref(sql, start, 1, false)?;
+            let v = f.trig.as_ref().and_then(|t| t.read(ctx, &name))?;
             out.push_str(&subst_literal(&v)?);
             i = j;
             continue;
@@ -74541,7 +74935,7 @@ fn render_psql_expr(e: &fire_crab_ods::expr::Expr, f: &PsqlFrame) -> Option<Stri
         // rendering it as itself is the whole point: `UPDATE LG SET V =
         // V + 1` has to reach LG's planner with `V` still in it, so the
         // per-row arithmetic happens per LG row.
-        E::Field { context, name } if *context == CTX_PLAIN => name.clone(),
+        E::Field { context, name } if *context == CTX_PLAIN => render_canon_ref(name),
         // ...but an `OLD.`/`NEW.` reference that reached this arm is one
         // the fold above could NOT spell as a literal - [psql_literal]
         // has no form for a DOUBLE, a FLOAT, an INT128, a DECFLOAT or a
@@ -75162,20 +75556,27 @@ fn exec_psql_stmt_inner(
             // no column list means the statement had none - the values
             // go in the relation's own order, and re-adding a list here
             // would mean inventing one
+            // the names are canonical and the text is PARSED AGAIN:
+            // spelled through [render_canon_ref]
             let sql = if cols.is_empty() {
-                format!("INSERT INTO {} VALUES ({})", table, values)
+                format!("INSERT INTO {} VALUES ({})", render_canon_ref(table), values)
             } else {
-                format!("INSERT INTO {} ({}) VALUES ({})", table, cols.join(", "), values)
+                format!(
+                    "INSERT INTO {} ({}) VALUES ({})",
+                    render_canon_ref(table),
+                    cols.iter().map(|c| render_canon_ref(c)).collect::<Vec<_>>().join(", "),
+                    values
+                )
             };
             run_body_dml(&sql, db, ctx, DmlKind::Insert).map(|n| set_row_count(f, n))
         }
         TrigStmt::Update { table, sets, wher, .. } => {
             let assigns = sets
                 .iter()
-                .map(|(c, e)| render_psql_expr(e, f).map(|v| format!("{} = {}", c, v)))
+                .map(|(c, e)| render_psql_expr(e, f).map(|v| format!("{} = {}", render_canon_ref(c), v)))
                 .collect::<Option<Vec<_>>>()
                 .ok_or(PsqlStop::Unsupported)?;
-            let mut sql = format!("UPDATE {} SET {}", table, assigns.join(", "));
+            let mut sql = format!("UPDATE {} SET {}", render_canon_ref(table), assigns.join(", "));
             if let Some(c) = wher {
                 sql.push_str(" WHERE ");
                 sql.push_str(&render_psql_cond(c, f).ok_or(PsqlStop::Unsupported)?);
@@ -75183,7 +75584,7 @@ fn exec_psql_stmt_inner(
             run_body_dml(&sql, db, ctx, DmlKind::Update).map(|n| set_row_count(f, n))
         }
         TrigStmt::Delete { table, wher, .. } => {
-            let mut sql = format!("DELETE FROM {}", table);
+            let mut sql = format!("DELETE FROM {}", render_canon_ref(table));
             if let Some(c) = wher {
                 sql.push_str(" WHERE ");
                 sql.push_str(&render_psql_cond(c, f).ok_or(PsqlStop::Unsupported)?);
@@ -78265,7 +78666,7 @@ fn resolve_predicate(
             let RawLhs::Col(col) = &rt.lhs else {
                 return None; // an aggregate in WHERE is invalid SQL
             };
-            let rc = columns.iter().find(|c| c.name.eq_ignore_ascii_case(col))?;
+            let rc = find_col(columns, col)?;
             let fid = rc.field_id as usize;
             // a computed column has no record bytes for the filter to read
             if is_computed_fid(descs, fid) {
@@ -79942,7 +80343,7 @@ fn resolve_having(
                 // a `?` as the tested side of a HAVING: unprobed - refuse
                 RawLhs::Param(_) => return None,
                 RawLhs::Col(col) => {
-                    let rc = columns.iter().find(|c| c.name.eq_ignore_ascii_case(col))?;
+                    let rc = find_col(columns, col)?;
                     let fid = rc.field_id as usize;
                     if !key_fids.contains(&fid) {
                         return None; // HAVING on a non-grouped column
@@ -80038,7 +80439,7 @@ fn resolve_having(
                         AggTarget::Star => (None, None, None, HKind::Int, false),
                         AggTarget::Col(name) | AggTarget::Distinct(name) => {
                             let rc =
-                                columns.iter().find(|c| c.name.eq_ignore_ascii_case(name))?;
+                                find_col(columns, name)?;
                             let fid = rc.field_id as usize;
                             // no record bytes to aggregate over
                             if is_computed_fid(descs, fid) {
@@ -81639,12 +82040,18 @@ fn after_auth(
                     // always seen ([strip_dml_alias])
                     let alias_view = database
                         .as_ref()
-                        .and_then(|d| dml_target(&stmt_sql).map(|(_, n)| is_view(d, n)))
+                        .and_then(|d| dml_target(&stmt_sql).map(|(_, n)| is_view(d, &n)))
                         .unwrap_or(false);
+                    // ...asked of the statement AS WRITTEN, before the
+                    // alias comes off: AN ALIAS REPLACES THE RELATION
+                    // NAME, so neither the qualifier strip below nor
+                    // the RETURNING resolver may bind that name
+                    // ([dml_binds_alias])
+                    let dml_aliased = dml_binds_alias(&stmt_sql);
                     let stmt_sql = strip_dml_alias(&stmt_sql, alias_view)
                         .unwrap_or_else(|| stmt_sql.clone());
-                    let stmt_sql =
-                        unqualify_dml(&stmt_sql, &database).unwrap_or_else(|| stmt_sql.clone());
+                    let stmt_sql = unqualify_dml(&stmt_sql, &database, dml_aliased)
+                        .unwrap_or_else(|| stmt_sql.clone());
                     let (dml_sql, returning) = split_returning(&stmt_sql);
                     // through the statement cache, like the SELECT
                     // branch above - see [crate::stmc]
@@ -81709,6 +82116,7 @@ fn after_auth(
                                     list,
                                     &t,
                                     dml_target_alias(&dml_sql).map(|(a, _)| a).as_deref(),
+                                    dml_aliased,
                                     &database,
                                 )
                             })
@@ -86063,7 +86471,7 @@ fn eval_blr_val(v: &BVal, ctxs: &[Ctx], input: &[Value], db: &Database) -> Value
             .and_then(|c| {
                 c.columns
                     .iter()
-                    .find(|rc| rc.name.eq_ignore_ascii_case(name))
+                    .find(|rc| rc.name == *name)
                     .and_then(|rc| c.row.get(rc.field_id as usize))
             })
             .cloned()
@@ -87499,12 +87907,14 @@ mod tests {
             "UPDATE T SET D = 1"
         );
         assert_eq!(unqualify_single("UPDATE T SET t.D = 1", &b).unwrap(), "UPDATE T SET D = 1");
-        // a FROM item written bare does not preserve the catalog's
-        // case, so the quoted CATALOG spelling still reaches it
+        // a QUOTED lower-case key (`FROM T "t"`) is its own name: only
+        // the quoted spelling reaches it, never the folded one
         let l = ColBinding { key: "t", qual: None };
+        assert!(unqualify_single("SELECT \"T\".C FROM T \"t\"", &l).is_none());
+        assert!(unqualify_single("SELECT T.C FROM T \"t\"", &l).is_none());
         assert_eq!(
-            unqualify_single("SELECT \"T\".C FROM t", &l).unwrap(),
-            "SELECT C FROM t"
+            unqualify_single("SELECT \"t\".C FROM T \"t\"", &l).unwrap(),
+            "SELECT C FROM T \"t\""
         );
     }
 
@@ -89112,7 +89522,9 @@ mod tests {
     #[test]
     fn parses_aggregates_and_ordinals() {
         assert!(matches!(parse_agg_item("MIN(SALARY)"), Some((AggFn::Min, AggTarget::Col(c))) if c == "SALARY"));
-        assert!(matches!(parse_agg_item("sum( id )"), Some((AggFn::Sum, AggTarget::Col(c))) if c == "id"));
+        // a bare argument FOLDS (the target is the catalog spelling)
+        assert!(matches!(parse_agg_item("sum( id )"), Some((AggFn::Sum, AggTarget::Col(c))) if c == "ID"));
+        assert!(matches!(parse_agg_item("sum( \"id\" )"), Some((AggFn::Sum, AggTarget::Col(c))) if c == "id"));
         assert!(matches!(parse_agg_item("COUNT(*)"), Some((AggFn::Count, AggTarget::Star))));
         assert!(parse_agg_item("MIN(*)").is_none()); // MIN(*) invalid
         assert!(parse_projection("MIN(*)").is_none()); // ...and not an identifier either
@@ -89525,23 +89937,23 @@ mod tests {
         assert_eq!(l.table, "EMP");
         assert!(l.alias.is_none() && j.is_empty());
         let (l, _) = parse_from("EMP E").unwrap();
-        assert_eq!((l.table, l.alias), ("EMP", Some("E")));
+        assert_eq!((l.table.as_str(), l.alias.as_deref()), ("EMP", Some("E")));
         // JOIN with aliases and the optional INNER keyword
         let (l, j) = parse_from("EMP E JOIN DEPT D ON E.DEPT_ID = D.ID").unwrap();
         let [(k, r, on, _)] = j.as_slice() else { panic!("one join") };
         let (k, r, on) = (*k, r, *on);
         assert!(k == JoinKind::Inner);
-        assert_eq!((l.table, l.alias), ("EMP", Some("E")));
-        assert_eq!((r.table, r.alias), ("DEPT", Some("D")));
+        assert_eq!((l.table.as_str(), l.alias.as_deref()), ("EMP", Some("E")));
+        assert_eq!((r.table.as_str(), r.alias.as_deref()), ("DEPT", Some("D")));
         assert_eq!(on, "E.DEPT_ID = D.ID");
         let (_, j) = parse_from("EMP inner join DEPT on EMP.DEPT_ID = DEPT.ID").unwrap();
         assert!(matches!(j.as_slice(), [(JoinKind::Inner, ..)]));
         // the outer kinds, with and without the OUTER keyword, any case
         let (l, j) = parse_from("EMP E LEFT JOIN DEPT D ON E.DEPT_ID = D.ID").unwrap();
-        assert_eq!((l.table, l.alias), ("EMP", Some("E")));
+        assert_eq!((l.table.as_str(), l.alias.as_deref()), ("EMP", Some("E")));
         assert!(matches!(j.as_slice(), [(JoinKind::Left, ..)]));
         let (l, j) = parse_from("EMP left outer join DEPT on EMP.DEPT_ID = DEPT.ID").unwrap();
-        assert_eq!((l.table, l.alias), ("EMP", None));
+        assert_eq!((l.table.as_str(), l.alias.as_deref()), ("EMP", None));
         assert!(matches!(j.as_slice(), [(JoinKind::Left, ..)]));
         let (_, j) = parse_from("EMP RIGHT JOIN DEPT ON EMP.DEPT_ID = DEPT.ID").unwrap();
         assert!(matches!(j.as_slice(), [(JoinKind::Right, ..)]));
@@ -89551,8 +89963,8 @@ mod tests {
         let (l, j) = parse_from("A JOIN B ON A.X = B.X JOIN C ON B.Y = C.Y").unwrap();
         assert_eq!(l.table, "A");
         assert_eq!(j.len(), 2);
-        assert_eq!((j[0].1.table, j[0].2), ("B", "A.X = B.X"));
-        assert_eq!((j[1].1.table, j[1].2), ("C", "B.Y = C.Y"));
+        assert_eq!((j[0].1.table.as_str(), j[0].2), ("B", "A.X = B.X"));
+        assert_eq!((j[1].1.table.as_str(), j[1].2), ("C", "B.Y = C.Y"));
         let (_, j) = parse_from(
             "A JOIN B ON A.X = B.X LEFT JOIN C ON B.Y = C.Y JOIN D ON C.Z = D.Z",
         )
@@ -89565,10 +89977,10 @@ mod tests {
         // a COMMA LIST and a CROSS JOIN are steps with no condition
         let (b, j) = parse_from("EMP, DEPT").unwrap();
         assert_eq!(b.table, "EMP");
-        assert_eq!((j.len(), j[0].1.table, j[0].2), (1, "DEPT", CROSS_ON));
+        assert_eq!((j.len(), j[0].1.table.as_str(), j[0].2), (1, "DEPT", CROSS_ON));
         let (b, j) = parse_from("EMP E CROSS JOIN DEPT D").unwrap();
-        assert_eq!((b.table, b.alias), ("EMP", Some("E")));
-        assert_eq!((j.len(), j[0].1.table, j[0].2), (1, "DEPT", CROSS_ON));
+        assert_eq!((b.table.as_str(), b.alias.as_deref()), ("EMP", Some("E")));
+        assert_eq!((j.len(), j[0].1.table.as_str(), j[0].2), (1, "DEPT", CROSS_ON));
         // a three-item list, and a list whose item is itself a chain
         let (_, j) = parse_from("A, B, C").unwrap();
         assert_eq!(j.len(), 2);
@@ -89590,7 +90002,7 @@ mod tests {
         // names, and the marker says so
         let (b, j) = parse_from("EMP NATURAL JOIN DEPT").unwrap();
         assert_eq!(b.table, "EMP");
-        assert_eq!((j.len(), j[0].1.table, j[0].2), (1, "DEPT", NATURAL_ON));
+        assert_eq!((j.len(), j[0].1.table.as_str(), j[0].2), (1, "DEPT", NATURAL_ON));
         let (_, j) = parse_from("EMP NATURAL LEFT JOIN DEPT").unwrap();
         assert!(matches!(j.as_slice(), [(JoinKind::Left, _, NATURAL_ON, _)]));
         let (_, j) = parse_from("EMP NATURAL full outer join DEPT").unwrap();
@@ -89649,7 +90061,10 @@ mod tests {
         // qualified: side by alias, index offset by side
         assert_eq!(resolve_join_col(&sides, "E.ID").map(|(i, _, _)| i), Some(0));
         assert_eq!(resolve_join_col(&sides, "D.ID").map(|(i, _, _)| i), Some(3));
-        assert_eq!(resolve_join_col(&sides, "d.name").map(|(i, _, _)| i), Some(4));
+        // the reference arrives CANONICAL (the parser folded `d.name`)
+        assert_eq!(resolve_join_col(&sides, "D.NAME").map(|(i, _, _)| i), Some(4));
+        // ... and a quoted lower-case column stays exact: no such column
+        assert!(resolve_join_col(&sides, "D.name").is_none());
         // bare: unique -> resolved, ambiguous (ID, NAME on both) -> None
         assert_eq!(resolve_join_col(&sides, "DEPT_ID").map(|(i, _, _)| i), Some(1));
         assert!(resolve_join_col(&sides, "ID").is_none());
@@ -89672,13 +90087,10 @@ mod tests {
         sides[1].key = "DEPT".into();
         sides[1].schema = Some("PUBLIC".into());
         assert_eq!(resolve_join_col(&sides, "PUBLIC.EMP.ID").map(|(i, _, _)| i), Some(0));
-        assert_eq!(resolve_join_col(&sides, "public.dept.id").map(|(i, _, _)| i), Some(3));
+        assert_eq!(resolve_join_col(&sides, "PUBLIC.DEPT.ID").map(|(i, _, _)| i), Some(3));
         // a QUOTED schema half matches exactly (probed: "public" is -204)
-        assert_eq!(
-            resolve_join_col(&sides, "\"PUBLIC\".EMP.ID").map(|(i, _, _)| i),
-            Some(0)
-        );
-        assert!(resolve_join_col(&sides, "\"public\".EMP.ID").is_none());
+        // (the canonical form of `"public".EMP.ID` is `public.EMP.ID`)
+        assert!(resolve_join_col(&sides, "public.EMP.ID").is_none());
         // the wrong schema reaches nothing
         assert!(resolve_join_col(&sides, "SYSTEM.EMP.ID").is_none());
         // the 2-part form still works alongside it
@@ -89701,8 +90113,8 @@ mod tests {
         assert_eq!(steps[2].2, "C.Z = D.Z");
         // aliases survive the split, and so does the base's
         let (base, steps) = parse_from("EMP E JOIN DEPT D ON E.DEPT_ID = D.ID JOIN REGION R ON D.REGION_ID = R.ID").unwrap();
-        assert_eq!((base.table, base.alias), ("EMP", Some("E")));
-        assert_eq!((steps[1].1.table, steps[1].1.alias), ("REGION", Some("R")));
+        assert_eq!((base.table.as_str(), base.alias.as_deref()), ("EMP", Some("E")));
+        assert_eq!((steps[1].1.table.as_str(), steps[1].1.alias.as_deref()), ("REGION", Some("R")));
 
         // the FOLD itself: one step of it, with the padding rule. The
         // accumulated side is two columns wide, the new side one.
@@ -91577,7 +91989,7 @@ mod tests {
         ));
         assert!(matches!(
             parse_agg_item("count( distinct  g )"),
-            Some((AggFn::Count, AggTarget::Distinct(c))) if c == "g"
+            Some((AggFn::Count, AggTarget::Distinct(c))) if c == "G"
         ));
         assert!(parse_agg_item("SUM(DISTINCT A)").is_none());
         assert!(parse_agg_item("COUNT(DISTINCTG)").is_none() ||
@@ -93567,19 +93979,23 @@ mod tests {
     #[test]
     fn parse_table_ref_takes_qualified_names() {
         let tr = |s| parse_table_ref(s).map(|t| (t.schema.map(|q| q.0), t.table, t.alias));
+        let tr = |s| tr(s).map(|(q, t, a)| (q, t.to_string(), a));
+        fn some<'a>(q: Option<&'a str>, t: &str, a: Option<&str>) -> Option<(Option<&'a str>, String, Option<String>)> {
+            Some((q, t.to_string(), a.map(str::to_string)))
+        }
         // every spelling the engine answers, and the dot's whitespace
         // is its own token there
-        assert_eq!(tr("T"), Some((None, "T", None)));
-        assert_eq!(tr("PUBLIC.T"), Some((Some("PUBLIC"), "T", None)));
-        assert_eq!(tr("public.t"), Some((Some("public"), "t", None)));
-        assert_eq!(tr("PUBLIC . T"), Some((Some("PUBLIC"), "T", None)));
-        assert_eq!(tr("PUBLIC\n.T"), Some((Some("PUBLIC"), "T", None)));
-        assert_eq!(tr("\"PUBLIC\".T"), Some((Some("PUBLIC"), "T", None)));
-        assert_eq!(tr("\"PUBLIC\".\"T\""), Some((Some("PUBLIC"), "T", None)));
+        assert_eq!(tr("T"), some(None, "T", None));
+        assert_eq!(tr("PUBLIC.T"), some(Some("PUBLIC"), "T", None));
+        assert_eq!(tr("public.t"), some(Some("public"), "T", None));
+        assert_eq!(tr("PUBLIC . T"), some(Some("PUBLIC"), "T", None));
+        assert_eq!(tr("PUBLIC\n.T"), some(Some("PUBLIC"), "T", None));
+        assert_eq!(tr("\"PUBLIC\".T"), some(Some("PUBLIC"), "T", None));
+        assert_eq!(tr("\"PUBLIC\".\"T\""), some(Some("PUBLIC"), "T", None));
         // aliased, with and without AS
-        assert_eq!(tr("PUBLIC.T X"), Some((Some("PUBLIC"), "T", Some("X"))));
-        assert_eq!(tr("PUBLIC.T AS X"), Some((Some("PUBLIC"), "T", Some("X"))));
-        assert_eq!(tr("\"PUBLIC\".\"T\" as \"X\""), Some((Some("PUBLIC"), "T", Some("X"))));
+        assert_eq!(tr("PUBLIC.T X"), some(Some("PUBLIC"), "T", Some("X")));
+        assert_eq!(tr("PUBLIC.T AS X"), some(Some("PUBLIC"), "T", Some("X")));
+        assert_eq!(tr("\"PUBLIC\".\"T\" as \"X\""), some(Some("PUBLIC"), "T", Some("X")));
         // a PROCEDURE CALL is not a table reference - split_proc_call
         // owns it, qualified or not
         assert!(tr("PUBLIC.PW6(5)").is_none());
@@ -93587,7 +94003,7 @@ mod tests {
         // three parts is a packaged routine, out of slice
         assert!(tr("A.B.C").is_none());
         // and the derived-table branch is untouched
-        assert_eq!(tr("(SELECT 1 FROM T) D").map(|(q, _, a)| (q, a)), Some((None, Some("D"))));
+        assert_eq!(tr("(SELECT 1 FROM T) D").map(|(q, _, a)| (q, a)), Some((None, Some("D".to_string()))));
     }
 
     #[test]
@@ -93597,13 +94013,222 @@ mod tests {
         let sql = String::from("  \"PUBLIC\" . \"EMP\"  E  ");
         let tr = parse_table_ref(&sql).unwrap();
         let (lo, hi) = (sql.as_ptr() as usize, sql.as_ptr() as usize + sql.len());
-        for part in [tr.table, tr.alias.unwrap(), tr.span] {
+        for part in [tr.raw, tr.whole, tr.span] {
             let at = part.as_ptr() as usize;
             assert!(at >= lo && at + part.len() <= hi, "{:?} is not a subslice", part);
         }
         assert_eq!(tr.table, "EMP");
         assert_eq!(tr.span, "\"PUBLIC\" . \"EMP\"");
         assert_eq!(tr.quoted_name(), "\"PUBLIC\".\"EMP\"");
+    }
+
+    #[test]
+    fn canon_ident_is_the_one_rule() {
+        // a bare word FOLDS; a quoted name is EXACT, `""` unescaped
+        assert_eq!(canon_ident("a").as_deref(), Some("A"));
+        assert_eq!(canon_ident(" Ab_1$ ").as_deref(), Some("AB_1$"));
+        assert_eq!(canon_ident("\"a\"").as_deref(), Some("a"));
+        assert_eq!(canon_ident("\"A\"").as_deref(), Some("A"));
+        assert_eq!(canon_ident("\"Mixed Col\"").as_deref(), Some("Mixed Col"));
+        assert_eq!(canon_ident("\"select\"").as_deref(), Some("select"));
+        assert_eq!(canon_ident("\"a\"\"b\"").as_deref(), Some("a\"b"));
+        assert_eq!(canon_ident("\"3\"").as_deref(), Some("3"));
+        // refusals: empty, a literal, a blank, a lone inner quote
+        assert!(canon_ident("\"\"").is_none());
+        assert!(canon_ident("3").is_none());
+        assert!(canon_ident("a b").is_none());
+        assert!(canon_ident("\"a\"b\"").is_none());
+        assert!(canon_ident("").is_none());
+        // a dotted reference, part by part
+        assert_eq!(canon_ref("t.\"a\"", 3).as_deref(), Some("T.a"));
+        assert_eq!(canon_ref("\"Order\" . \"Key\"", 3).as_deref(), Some("Order.Key"));
+        assert_eq!(canon_ref("public.t.c", 3).as_deref(), Some("PUBLIC.T.C"));
+        assert!(canon_ref("a.b.c.d", 3).is_none());
+        assert!(canon_ref("\"a.b\"", 3).is_none());
+        // EXACT, qualifier and column alike: the side key is canonical
+        // too (`FROM TQ "t"` binds `t`, `FROM TQ t` binds T)
+        assert!(col_name_is("T.a", "T.a"));
+        assert!(!col_name_is("t.a", "T.a"));
+        assert!(!col_name_is("t.a", "T.A"));
+        assert!(!col_name_is("a", "A"));
+        assert!(col_name_is("Mixed Col", "Mixed Col"));
+    }
+
+    #[test]
+    fn a_from_item_binds_its_canonical_names() {
+        // A1/A2: the relation and the alias are NAMES - a quoted one
+        // exact, a bare one folded - and the key is the alias when given
+        let t = parse_table_ref("tq t").unwrap();
+        assert_eq!((t.table.as_str(), t.alias.as_deref(), t.key()), ("TQ", Some("T"), "T"));
+        let t = parse_table_ref("\"tq\" \"t\"").unwrap();
+        assert_eq!((t.table.as_str(), t.alias.as_deref(), t.key()), ("tq", Some("t"), "t"));
+        assert!(t.quoted && t.raw == "tq");
+        let t = parse_table_ref("\"Order\" AS \"a b\"").unwrap();
+        assert_eq!((t.table.as_str(), t.key()), ("Order", "a b"));
+        let t = parse_table_ref("\"Order\"").unwrap();
+        assert_eq!((t.key(), t.quoted_name().as_str()), ("Order", "\"Order\""));
+        // the -204 spelling folds a bare name, keeps a quoted one
+        assert_eq!(parse_table_ref("nope").unwrap().quoted_name(), "\"NOPE\"");
+        assert_eq!(parse_table_ref("\"Tq\"").unwrap().quoted_name(), "\"Tq\"");
+        // the binding answers to its canonical key ONLY: after `FROM TQ
+        // "t"` the qualifier `T` (bare t) is the engine's -206
+        let bind = ColBinding { key: "t", qual: None };
+        assert!(bind.answers_to("t"));
+        assert!(!bind.answers_to("T"));
+        let bind = ColBinding { key: "T", qual: Some(("PUBLIC".to_string(), "TQ")) };
+        assert!(bind.answers_to("T") && bind.answers_to("PUBLIC.TQ"));
+        assert!(!bind.answers_to("t") && !bind.answers_to("PUBLIC.tq"));
+        // and the qualifier strip follows the same rule
+        assert_eq!(unqualify_single("\"t\".ID = 1", &ColBinding { key: "t", qual: None }).as_deref(), Some("ID = 1"));
+        assert!(unqualify_single("T.ID = 1", &ColBinding { key: "t", qual: None }).is_none());
+        assert_eq!(unqualify_single("t.ID = 1", &ColBinding { key: "T", qual: None }).as_deref(), Some("ID = 1"));
+        // a join side keyed by a quoted alias
+        let mut sides = join_sides();
+        sides[0].key = "e".into();
+        assert_eq!(resolve_join_col(&sides, "e.ID").map(|(i, _, _)| i), Some(0));
+        assert!(resolve_join_col(&sides, "E.ID").is_none());
+        // the DML alias is canonical too (bare folds)
+        assert_eq!(dml_target_alias("UPDATE TQ t SET A = 1").map(|(a, _)| a).as_deref(), Some("T"));
+        assert_eq!(dml_target_alias("DELETE FROM \"Order\" o WHERE 1 = 1").map(|(a, _)| a).as_deref(), Some("O"));
+        assert!(dml_target_alias("UPDATE TQ SET A = 1").is_none());
+    }
+
+    #[test]
+    fn render_canon_ref_round_trips_every_shape() {
+        // B: a canonical name spelled back re-parses to ITSELF
+        for (canon, text) in [
+            ("A", "A"),
+            ("MIXED_COL$1", "MIXED_COL$1"),
+            ("a", "\"a\""),
+            ("Mixed Col", "\"Mixed Col\""),
+            ("select", "\"select\""),
+            ("AND", "\"AND\""),
+            ("a\"b", "\"a\"\"b\""),
+            ("T.a", "T.\"a\""),
+            ("Order.Key", "\"Order\".\"Key\""),
+        ] {
+            assert_eq!(render_canon_ref(canon), text, "{}", canon);
+            assert_eq!(canon_ref(&render_canon_ref(canon), 2).as_deref(), Some(canon), "{}", canon);
+        }
+        assert_eq!(view_ident_text("a"), "\"a\"");
+        assert_eq!(view_ident_text("SELECT"), "\"SELECT\"");
+        // the MERGE column resolver reads canonically, exactly
+        let cols = vec![
+            RelationColumn { name: "A".into(), field_id: 0, position: 0 },
+            RelationColumn { name: "a".into(), field_id: 1, position: 1 },
+        ];
+        assert_eq!(merge_target_col("t.\"a\"", &cols, "T").map(|c| c.field_id), Some(1));
+        assert_eq!(merge_target_col("t.a", &cols, "T").map(|c| c.field_id), Some(0));
+        assert_eq!(merge_target_col("\"a\"", &cols, "T").map(|c| c.field_id), Some(1));
+        assert!(merge_target_col("\"t\".a", &cols, "T").is_none());
+        assert!(mentions_qualifier("\"u\".X = 1", "u"));
+        assert!(!mentions_qualifier("U.X = 1", "u"));
+    }
+
+    #[test]
+    fn ddl_names_fold_unquoted_and_keep_quoted() {
+        // C1: every DDL parser canonicalises its names
+        let Some((Plan::CreateIndex { table, name, cols, .. }, _)) =
+            plan_create_index("create index ix_low on lowtab (dept, \"a\", \"Mixed Col\")")
+        else {
+            panic!("index refused");
+        };
+        assert_eq!((table.as_str(), name.as_str()), ("LOWTAB", "IX_LOW"));
+        assert_eq!(cols, vec!["DEPT", "a", "Mixed Col"]);
+        let Some((Plan::CreateTable { name, cols, constraints, fks, .. }, _)) = plan_create_table(
+            "create table \"tq\" (id integer not null, \"a\" integer, \"Mixed Col\" varchar(5), \
+             \"select\" integer constraint \"pk_s\" primary key, constraint uq_x unique (\"a\"), \
+             constraint fk_x foreign key (\"a\") references \"Order\" (\"Key\"))",
+        ) else {
+            panic!("table refused");
+        };
+        assert_eq!(name, "tq");
+        let names: Vec<&str> = cols.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["ID", "a", "Mixed Col", "select"]);
+        let keys: Vec<(String, Vec<String>, bool)> = constraints
+            .iter()
+            .filter_map(|c| match c {
+                fire_crab_ods::ddl::TableConstraint::Key(k) => Some((k.name.clone(), k.columns.clone(), k.primary)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(keys, vec![("pk_s".to_string(), vec!["select".to_string()], true), ("UQ_X".to_string(), vec!["a".to_string()], false)]);
+        assert_eq!((fks[0].name.as_str(), fks[0].ref_table.as_str()), ("FK_X", "Order"));
+        assert_eq!((fks[0].columns.clone(), fks[0].ref_columns.clone()), (vec!["a".to_string()], vec!["Key".to_string()]));
+        // the column definition alone
+        let (c, key) = parse_column_def("\"Mixed Col\" varchar(10) constraint \"c_x\" unique").unwrap();
+        assert_eq!((c.name.as_str(), key), ("Mixed Col", Some(("c_x".to_string(), false))));
+        assert_eq!(parse_column_def("eid integer").unwrap().0.name, "EID");
+        // ...and EVERY type arm keeps it: the NUMERIC/DECIMAL arm went
+        // through its own builder, which folded, so `"n" NUMERIC(5,2)`
+        // was stored as N beside a `"b" BIGINT` stored as b
+        assert_eq!(parse_column_def("\"n\" numeric(5,2)").unwrap().0.name, "n");
+        assert_eq!(parse_column_def("\"d\" decimal(12,3)").unwrap().0.name, "d");
+        assert_eq!(parse_column_def("\"b\" bigint").unwrap().0.name, "b");
+        assert_eq!(parse_column_def("n numeric(5,2)").unwrap().0.name, "N");
+        // a DERIVED TABLE's name is a name too
+        assert_eq!(parse_derived_table("(SELECT A FROM T) \"x\"").unwrap().1, "x");
+        assert_eq!(parse_derived_table("(SELECT A FROM T) x").unwrap().1, "X");
+        assert_eq!(parse_derived_table("(SELECT A FROM T) AS \"Mixed X\"").unwrap().1, "Mixed X");
+        // ALTER TABLE, DROP
+        assert!(matches!(plan_alter_table_drop("alter table \"tq\" drop \"a\""), Some((Plan::AlterTableDrop { table, column }, _)) if table == "tq" && column == "a"));
+        assert!(matches!(plan_alter_table_drop("alter table tq drop constraint \"pk_s\""), Some((Plan::AlterTableDropConstraint { table, constraint }, _)) if table == "TQ" && constraint == "pk_s"));
+        assert!(matches!(plan_drop_table("drop table \"tq\""), Some((Plan::DropTable { name }, _)) if name == "tq"));
+        assert!(matches!(plan_drop_table("drop table tq"), Some((Plan::DropTable { name }, _)) if name == "TQ"));
+        assert!(matches!(plan_drop_index("drop index \"ix\""), Some((Plan::DropIndex { name }, _)) if name == "ix"));
+        assert!(matches!(plan_alter_table_alter_type("alter table tq alter column \"a\" type bigint"), Some((Plan::AlterColumnType { table, column, .. }, _)) if table == "TQ" && column == "a"));
+        // the folded copy keeps quoted spans
+        assert_eq!(fold_bare("constraint \"pk x\" primary key (\"a\", b) default 'lit'"), "CONSTRAINT \"pk x\" PRIMARY KEY (\"a\", B) DEFAULT 'lit'");
+    }
+
+    #[test]
+    fn where_tokenizer_takes_a_quoted_name_exactly() {
+        let toks = tokenize("\"a\" = 2 AND t.\"Mixed Col\" > 'x' AND b = 1").unwrap();
+        let names: Vec<&str> = toks
+            .iter()
+            .filter_map(|t| match t {
+                Tok::Ident(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names, vec!["a", "T.Mixed Col", "B"]);
+        // a quoted keyword is a NAME; the bare one is the keyword
+        let toks = tokenize("\"AND\" = 1").unwrap();
+        assert!(matches!(&toks[0], Tok::Ident(s) if s == "AND"));
+        assert!(matches!(&toks[1], Tok::Cmp(Cmp::Eq)));
+        assert!(tokenize("\"a = 1").is_none());
+        assert!(tokenize("\"\" = 1").is_none());
+        // the gatekeeper spelling re-quotes what a bare word would fold away
+        let rt = |s: &str| render_toks(&tokenize(s).unwrap()).unwrap();
+        assert_eq!(rt("\"a\" = 1 AND \"Mixed Col\" = 2 AND b = 3"), "\"a\" = 1 AND \"Mixed Col\" = 2 AND B = 3");
+        assert_eq!(rt("t.\"a\" = \"T\".A"), "T.\"a\" = T.A");
+    }
+
+    #[test]
+    fn mask_literals_hides_quoted_identifiers() {
+        let s = "SELECT \"from\", 'where' FROM T WHERE \"a\"\"b\" = 1";
+        let m = mask_literals(s);
+        assert_eq!(m.len(), s.len());
+        assert!(!m.contains('"') && !m.contains('\''));
+        assert_eq!(find_word(&m, "FROM", 0), Some("SELECT \"from\", 'where' ".len()));
+        assert_eq!(find_word(&m, "WHERE", 0), Some("SELECT \"from\", 'where' FROM T ".len()));
+    }
+
+    #[test]
+    fn projection_items_are_canonical() {
+        let Some(Proj::Items(items)) =
+            parse_projection("ID, \"a\", \"Mixed Col\" \"a b\", t.\"x\" AS q, \"null\"")
+        else {
+            panic!("no items");
+        };
+        assert!(matches!(&items[0], SelItem::Col(c, None) if c == "ID"));
+        assert!(matches!(&items[1], SelItem::Col(c, None) if c == "a"));
+        assert!(matches!(&items[2], SelItem::Col(c, Some(a)) if c == "Mixed Col" && a == "a b"));
+        assert!(matches!(&items[3], SelItem::Col(c, Some(a)) if c == "T.x" && a == "Q"));
+        assert!(matches!(&items[4], SelItem::Col(c, None) if c == "null"));
+        // a bare NULL stays the literal
+        let Some(Proj::Items(items)) = parse_projection("NULL") else { panic!() };
+        assert!(!matches!(&items[0], SelItem::Col(..)));
     }
 
     #[test]
@@ -93618,7 +94243,10 @@ mod tests {
         // (probed: `SELECT PUBLIC.C FROM PUBLIC.T` is -206 "PUBLIC"."C")
         assert_eq!(f("PUBLIC.C"), (None, Some("PUBLIC"), "C"));
         assert_eq!(f("C"), (None, None, "C"));
-        assert_eq!(f("\"T\".\"C\""), (None, Some("T"), "C"));
+        // the input is CANONICAL (the tokenizer unquoted it): a quoted
+        // lower-case part arrives exact
+        assert_eq!(f("T.a"), (None, Some("T"), "a"));
+        assert_eq!(f("Mixed Col"), (None, None, "Mixed Col"));
         // four parts is not a name at all - it falls through bare and
         // then resolves to nothing
         assert_eq!(f("A.B.C.D"), (None, None, "A.B.C.D"));
@@ -93637,12 +94265,17 @@ mod tests {
 
     #[test]
     fn dml_target_name_takes_qualified_names() {
-        let f = |s| dml_target_name(s).map(|(q, n)| (q.map(|p| p.0), n));
-        assert_eq!(f("T"), Some((None, "T")));
-        assert_eq!(f(" PUBLIC.T "), Some((Some("PUBLIC"), "T")));
-        assert_eq!(f("PUBLIC . T"), Some((Some("PUBLIC"), "T")));
-        assert_eq!(f("\"PUBLIC\".\"T\""), Some((Some("PUBLIC"), "T")));
-        assert_eq!(f("public.t"), Some((Some("public"), "t")));
+        let f = |s| dml_target_name(s).map(|(q, n)| (q.map(|p| p.0.to_string()), n));
+        let some = |q: Option<&str>, n: &str| Some((q.map(str::to_string), n.to_string()));
+        assert_eq!(f("T"), some(None, "T"));
+        assert_eq!(f(" PUBLIC.T "), some(Some("PUBLIC"), "T"));
+        assert_eq!(f("PUBLIC . T"), some(Some("PUBLIC"), "T"));
+        assert_eq!(f("\"PUBLIC\".\"T\""), some(Some("PUBLIC"), "T"));
+        // the relation half is CANONICAL: a bare one folds, a quoted one
+        // is exact (the schema half keeps its spelling for part_is)
+        assert_eq!(f("public.t"), some(Some("public"), "T"));
+        assert_eq!(f("\"tq\""), some(None, "tq"));
+        assert_eq!(f("\"Order\""), some(None, "Order"));
         // a trailing anything is not a DML target in this grammar
         assert!(f("PUBLIC.T X").is_none());
         assert!(f("A.B.C").is_none());
@@ -94079,7 +94712,7 @@ mod tests {
         // the keywords fold, and the list order is preserved verbatim
         assert_eq!(
             owned("ta (B,ID) overriding system value"),
-            Some(("ta".into(), Some(vec!["B".into(), "ID".into()]), Overriding::System))
+            Some(("TA".into(), Some(vec!["B".into(), "ID".into()]), Overriding::System))
         );
         // anything else after OVERRIDING, or after the list, refuses
         assert_eq!(owned("TA (ID) OVERRIDING WHATEVER VALUE"), None);
@@ -95261,7 +95894,8 @@ mod tests {
         // a list of privileges, the optional TABLE keyword, WITH GRANT OPTION
         match plan_grant("grant insert, update on table t to user alice with grant option") {
             Some((Plan::Grant { table, grantees, privileges, grant_option, revoke, .. }, _)) => {
-                assert_eq!(table, "t");
+                // the table is a NAME: bare `t` is T
+                assert_eq!(table, "T");
                 assert_eq!(grantees, vec!["alice".to_string()]);
                 assert_eq!(privileges, vec!['I', 'U']);
                 assert!(grant_option);
@@ -96537,8 +97171,9 @@ mod tests {
         assert_eq!(rename_view_idents("\"k\" = 1", &map, "V", "T", &t_cols()).unwrap(), "ID = 1");
         // a quoted spelling of another case is NOT that column
         assert_eq!(rename_view_idents("\"K\" = 1", &map, "V", "T", &t_cols()).unwrap(), "\"K\" = 1");
-        // ...while a bare one folds
-        assert_eq!(rename_view_idents("K = 1", &map, "V", "T", &t_cols()).unwrap(), "ID = 1");
+        // ...and a bare one FOLDS to K, which is not the view's "k"
+        // either (the engine's -206): left as written, never renamed
+        assert_eq!(rename_view_idents("K = 1", &map, "V", "T", &t_cols()).unwrap(), "K = 1");
     }
 
     #[test]
@@ -96700,10 +97335,10 @@ mod tests {
         let (sql, _) = view_trig_rows_sql(
             "VX",
             &cols,
-            &ViewTrigShape::Update { set_text: "v.A = 7", where_text: Some("v.ID = 3"), alias: Some("v") },
+            &ViewTrigShape::Update { set_text: "v.A = 7", where_text: Some("v.ID = 3"), alias: Some("V") },
         )
         .unwrap();
-        assert_eq!(sql, "SELECT ID, A, A2, 7 FROM VX v WHERE v.ID = 3");
+        assert_eq!(sql, "SELECT ID, A, A2, 7 FROM VX V WHERE v.ID = 3");
         assert!(view_trig_rows_sql(
             "VX",
             &cols,
@@ -96802,7 +97437,9 @@ mod tests {
     fn view_trig_correlated_finds_the_view_qualifying_a_column_in_a_subquery() {
         assert!(view_trig_correlated("(SELECT A FROM D WHERE D.ID = VSQ.ID)", "VSQ", None));
         assert!(view_trig_correlated("(SELECT A FROM D WHERE D.ID = vsq.ID)", "VSQ", None));
-        assert!(view_trig_correlated("EXISTS (SELECT 1 FROM D WHERE D.ID = v.ID)", "VSQ", Some("v")));
+        // the statement's alias arrives CANONICAL (`v` is V)
+        assert!(view_trig_correlated("EXISTS (SELECT 1 FROM D WHERE D.ID = v.ID)", "VSQ", Some("V")));
+        assert!(!view_trig_correlated("EXISTS (SELECT 1 FROM D WHERE D.ID = v.ID)", "VSQ", Some("v")));
         assert!(view_trig_correlated("(SELECT A FROM D WHERE D.ID = \"VSQ\".ID)", "VSQ", None));
         assert!(view_trig_correlated("1 + (SELECT MAX(A) FROM D WHERE (D.ID < VSQ . ID))", "VSQ", None));
         // reading FROM the view, or correlating to another table, is not this
@@ -96879,9 +97516,9 @@ mod tests {
 
     fn corr_look<'a>(tables: &'a [(&'a str, &'a [&'a str])]) -> impl Fn(&TableRef<'_>) -> Option<ScopeRel> + 'a {
         move |tr| {
-            let (_, cols) = tables.iter().find(|(n, _)| n.eq_ignore_ascii_case(tr.table))?;
+            let (_, cols) = tables.iter().find(|(n, _)| *n == tr.table)?;
             Some(ScopeRel {
-                key: tr.alias.unwrap_or(tr.table).to_string(),
+                key: tr.key().to_string(),
                 relation: Some(tr.table.to_ascii_uppercase()),
                 schema: None,
                 cols: cols.iter().map(|c| (c.to_string(), Some(int_desc()))).collect(),
@@ -97247,6 +97884,141 @@ mod tests {
         assert_eq!(desc_type_sql_cs(&d(dtype::INT128, 16, -4, 1)), "NUMERIC(38,4)");
         assert_eq!(desc_type_sql_cs(&d(dtype::TEXT, 5, 0, 0)), "CHAR(5) CHARACTER SET NONE");
         assert_eq!(desc_type_sql_cs(&d(dtype::VARYING, 22, 0, 4)), "VARCHAR(5) CHARACTER SET UTF8");
+    }
+
+    #[test]
+    fn a_canonical_name_never_folds_again_after_the_parse_boundary() {
+        // A. `normalize_raw` used to upper-case `RawExpr::Col`, and the
+        // GROUP-BY expression key it built then read the FOLDED twin:
+        // `SELECT "a" + 0, COUNT(*) FROM TQ GROUP BY "a" + 0` answered
+        // A's values. A parsed name is ALREADY canonical - a quoted
+        // part exact, a bare one folded - so nothing here may touch it.
+        let norm = |s: &str| normalize_raw(&parse_raw_expr_any(s).unwrap());
+        let names = |e: &RawExpr| {
+            let mut v = Vec::new();
+            raw_expr_col_names(e, &mut v);
+            v
+        };
+        assert_eq!(names(&norm("\"a\" + 0")), vec!["a".to_string()]);
+        assert_eq!(names(&norm("COALESCE(\"a\", 0)")), vec!["a".to_string()]);
+        assert_eq!(names(&norm("CAST(\"Mixed Col\" AS VARCHAR(5))")), vec!["Mixed Col".to_string()]);
+        assert_eq!(names(&norm("CASE WHEN \"a\" > 2 THEN 1 ELSE 0 END")), vec!["a".to_string()]);
+        // ...and only the BARE half of a dotted reference folds
+        assert_eq!(names(&norm("o.\"value\" || 'x'")), vec!["O.value".to_string()]);
+        // ...and the twin still is not it
+        assert!(norm("\"a\" + 0") != norm("A + 0"));
+        // a BARE spelling still folds at the boundary, so the two
+        // spellings of ONE name keep matching (the key's whole job)
+        assert!(norm("UPPER(S)") == norm("upper( s )"));
+        assert!(norm("\"A\" + 0") == norm("a + 0"));
+    }
+
+    #[test]
+    fn an_aliased_dml_target_does_not_bind_its_relation_name() {
+        // B. AN ALIAS REPLACES THE RELATION NAME (measured: every one
+        // of these is -206 on the engine). Stripping `TQ.` as the
+        // target's own qualifier turned them into WRITES.
+        assert!(dml_binds_alias("DELETE FROM TQ t WHERE TQ.\"a\" = 1"));
+        assert!(dml_binds_alias("UPDATE TQ AS t SET A = 1"));
+        assert!(dml_binds_alias("UPDATE \"Order\" o SET \"value\" = 'q'"));
+        // a QUOTED alias is an alias too, though dml_target_alias
+        // cannot spell one
+        assert!(dml_binds_alias("UPDATE TQ \"t\" SET A = 1"));
+        assert!(dml_binds_alias("DELETE FROM TQ AS \"t\" WHERE ID = 1"));
+        // ...and these bind none
+        assert!(!dml_binds_alias("UPDATE TQ SET A = 1 WHERE TQ.ID = 1"));
+        assert!(!dml_binds_alias("DELETE FROM \"Order\" WHERE \"Key\" = 1"));
+        assert!(!dml_binds_alias("UPDATE TQ SET A = 1 WHERE ID = 1"));
+        assert!(!dml_binds_alias("INSERT INTO TQ (ID) VALUES (1)"));
+        // with an alias bound, nothing is stripped - the reference is
+        // left whole and fails to resolve (this server has no -206)
+        assert!(unqualify_dml("DELETE FROM TQ t WHERE TQ.\"a\" = 1", &None, true).is_none());
+        assert!(unqualify_dml("DELETE FROM TQ t WHERE PUBLIC.TQ.\"a\" = 1", &None, true).is_none());
+        // ...and the alias-less statement still strips, as it always did
+        let squash = |o: Option<String>| o.map(|s| s.split_whitespace().collect::<Vec<_>>().join(" "));
+        assert_eq!(
+            squash(strip_dml_alias("DELETE FROM T t WHERE t.C = 1", false)),
+            Some("DELETE FROM T WHERE C = 1".to_string())
+        );
+        // the relation name qualifying a column AT DEPTH 0 of an
+        // aliased statement refuses right here
+        assert!(strip_dml_alias("DELETE FROM T q WHERE T.C = 1", false).is_none());
+        assert!(strip_dml_alias("UPDATE T q SET A = 1 WHERE T.C = 1", false).is_none());
+        // ...unless the alias IS the relation name, when every such
+        // reference was the alias all along (`DELETE FROM T t`)
+        assert_eq!(
+            squash(strip_dml_alias("DELETE FROM T t WHERE T.C = 1", false)),
+            Some("DELETE FROM T WHERE C = 1".to_string())
+        );
+        // ...but a subquery whose own FROM names T unaliased still binds it
+        assert_eq!(
+            squash(strip_dml_alias("DELETE FROM T AS Q WHERE C IN (SELECT C FROM T WHERE T.C = 1)", false)),
+            Some("DELETE FROM T WHERE C IN (SELECT C FROM T WHERE T.C = 1)".to_string())
+        );
+        // RETURNING: the alias names the row, the relation name does not
+        let star = |item: &str, aliased: bool| {
+            returning_star(item, "TQ", "TQ", Some("T"), aliased, true, &None).is_some()
+        };
+        assert!(star("TQ.*", false));
+        assert!(!star("TQ.*", true));
+        assert!(star("t.*", true));
+        assert!(star("NEW.*", true));
+    }
+
+    #[test]
+    fn error_vectors_spell_a_name_the_way_the_catalog_holds_it() {
+        // C1: `print_key` prints the CATALOG's spelling, not a folded
+        // copy (measured: the engine says `("Mixed Col" = 'm1')`,
+        // `("Key" = 1)`, `("u" = 7)` over the same fixture)
+        let one = Value::Int(1);
+        let txt = Value::Text("m1".into());
+        let parts = vec![("Mixed Col".to_string(), &txt)];
+        assert_eq!(
+            constraint_key_text(&parts).as_deref(),
+            Some("(\"Mixed Col\" = 'm1')")
+        );
+        let parts = vec![("Key".to_string(), &one)];
+        assert_eq!(constraint_key_text(&parts).as_deref(), Some("(\"Key\" = 1)"));
+        // an inner quote is NOT doubled - the engine prints `("a"b" = 1)`
+        let parts = vec![("a\"b".to_string(), &one)];
+        assert_eq!(constraint_key_text(&parts).as_deref(), Some("(\"a\"b\" = 1)"));
+        // C2: the DDL duplicate vector names the relation as stored
+        // (`CREATE TABLE "tq"` beside TQ is `"PUBLIC"."tq"`), while a
+        // bare `Nope` folded back at the parse boundary
+        let dup = |p: Plan| ddl_dup_codes(&p).unwrap().2;
+        assert_eq!(
+            dup(Plan::CreateTable {
+                name: "tq".into(),
+                cols: Vec::new(),
+                constraints: Vec::new(),
+                fks: Vec::new(),
+                relation_type: 0,
+            }),
+            "\"PUBLIC\".\"tq\""
+        );
+        // and the planner is what folds an unquoted one
+        let dropped = |s: &str| match plan_drop_table(s) {
+            Some((Plan::DropTable { name }, _)) => name,
+            _ => String::new(),
+        };
+        assert_eq!(dropped("DROP TABLE Nope"), "NOPE");
+        assert_eq!(dropped("DROP TABLE \"nope\""), "nope");
+    }
+
+    #[test]
+    fn merge_subst_reads_a_doubled_quote_as_one_name() {
+        // D1: both scan loops stopped at the FIRST `"`, so `u."a""b"`
+        // was cut into `u."a"` plus a stray `b"` and the MERGE refused
+        let src = ["ID".to_string(), "a\"b".to_string()];
+        let row = [Value::Int(1), Value::Int(111)];
+        let sub = |t: &str| merge_subst(t, "D", &src, &row, "T", "T", &[]).unwrap();
+        assert_eq!(sub("V = D.\"a\"\"b\""), "V = 111");
+        assert_eq!(sub("T.\"a\"\"b\" = D.\"a\"\"b\""), "\"a\"\"b\" = 111");
+        assert_eq!(sub("D.\"a\"\"b\" > 900"), "111 > 900");
+        // the qualifier question is asked with the same scan
+        assert!(mentions_qualifier("V = D.\"a\"\"b\"", "D"));
+        assert!(!mentions_qualifier("V = T.\"a\"\"b\"", "D"));
+        assert!(mentions_qualifier("\"a\"\"b\".C = 1", "a\"b"));
     }
 
     #[test]

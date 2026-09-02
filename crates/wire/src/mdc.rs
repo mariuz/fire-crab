@@ -106,7 +106,8 @@ impl DbMetadata {
         if !enabled() {
             return read().map(Arc::new);
         }
-        let key = (self.generation(), name.to_ascii_uppercase());
+        // the name is the catalog spelling - `"tq"` and TQ are two entries
+        let key = (self.generation(), name.to_string());
         if let Some(hit) = lock(&self.cache).relations.get(&key) {
             stats().hits.fetch_add(1, Ordering::Relaxed);
             return Some(Arc::clone(hit));
@@ -136,7 +137,7 @@ impl DbMetadata {
         if !enabled() {
             return Arc::new(read());
         }
-        let key = (self.generation(), kind, about.to_ascii_uppercase());
+        let key = (self.generation(), kind, about.to_string());
         if let Some(hit) = lock(&self.cache).memos.get(&key) {
             if let Ok(v) = Arc::clone(hit).downcast::<T>() {
                 stats().hits.fetch_add(1, Ordering::Relaxed);
@@ -231,13 +232,16 @@ mod tests {
         };
         assert_eq!(md.relation("T", &mut count).unwrap().id, 7);
         assert_eq!(md.relation("T", &mut count).unwrap().id, 7);
-        assert_eq!(md.relation("t", &mut count).unwrap().id, 7, "names fold case");
-        assert_eq!(reads.load(Ordering::Relaxed), 1, "read once, answered thrice");
+        assert_eq!(reads.load(Ordering::Relaxed), 1, "read once, answered twice");
+        // a name is the CATALOG spelling: `t` (a quoted lower-case
+        // relation beside T) is another entry, not T's
+        assert_eq!(md.relation("t", &mut count).unwrap().id, 7, "names are exact");
+        assert_eq!(reads.load(Ordering::Relaxed), 2, "read once per spelling");
 
         // ...until the schema changes
         md.invalidate();
         assert_eq!(md.relation("T", &mut count).unwrap().id, 7);
-        assert_eq!(reads.load(Ordering::Relaxed), 2);
+        assert_eq!(reads.load(Ordering::Relaxed), 3);
     }
 
     #[test]

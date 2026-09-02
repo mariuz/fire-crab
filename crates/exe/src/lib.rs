@@ -3246,9 +3246,12 @@ impl<'a> Exec<'a> {
                     .ok_or("bare field over an aggregate frame")?;
                 let cols =
                     relation_columns(self.file, self.page_size, &rel_name);
+                // EXACT: a BLR field name is the catalog's own spelling
+                // (`"a"` beside A are two fields - a case-blind first
+                // match read A for "a", review-caught)
                 let col = cols
                     .iter()
-                    .find(|c| c.name.eq_ignore_ascii_case(name))
+                    .find(|c| c.name == *name)
                     .ok_or_else(|| format!("field {} unknown", name))?;
                 frame
                     .row

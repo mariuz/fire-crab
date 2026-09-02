@@ -92,17 +92,16 @@ pub fn list_relations(file: &crate::Image, page_size: usize) -> Vec<(u16, String
     out
 }
 
-/// Resolve a table name to its relation id (case-insensitive, matching
-/// the engine's unquoted-identifier folding). Returns None if no relation
-/// of that name exists.
+/// Resolve a CANONICAL table name to its relation id. The name IS the
+/// catalog spelling - a quoted identifier exact, a bare one already
+/// folded to upper case by the parser - and the match is EXACT: `"tq"`
+/// beside TQ is its own relation, and `"Tq"` is no relation at all
+/// (the engine's -204). There is no case-insensitive fallback; a
+/// caller holding a raw spelling must canonicalise before asking.
+/// Returns None if no relation of that name exists.
 pub fn resolve_relation(file: &crate::Image, page_size: usize, name: &str) -> Option<u16> {
     let want = name.trim();
-    for (id, rel_name) in list_relations(file, page_size) {
-        if rel_name.eq_ignore_ascii_case(want) {
-            return Some(id);
-        }
-    }
-    None
+    list_relations(file, page_size).into_iter().find(|(_, n)| n == want).map(|(id, _)| id)
 }
 
 /// One column of a relation: its name, the field id that indexes the
@@ -186,6 +185,9 @@ fn relation_columns_uncached(
     page_size: usize,
     relation_name: &str,
 ) -> Vec<RelationColumn> {
+    // the relation name is CANONICAL (the catalog spelling), so the
+    // rows compare EXACTLY: `"tq"` beside TQ has its own columns, not
+    // both tables' - see [resolve_relation]
     let want = relation_name.trim();
     let mut out = Vec::new();
     let tips = crate::tra::TipChain::read(file, page_size);
@@ -198,7 +200,7 @@ fn relation_columns_uncached(
             let Some(rname) = cstr(&image, RF_RELATION_NAME_OFFSET) else {
                 continue;
             };
-            if !rname.eq_ignore_ascii_case(want) {
+            if rname != want {
                 continue;
             }
             let Some(name) = cstr(&image, RF_FIELD_NAME_OFFSET) else {

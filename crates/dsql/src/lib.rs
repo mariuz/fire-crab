@@ -931,6 +931,35 @@ fn lex(sql: &str) -> Option<Vec<Tok>> {
                 }
                 out.push(Tok::Str(v));
             }
+            '"' => {
+                // a DELIMITED identifier: the name EXACTLY as written
+                // (case, blanks, keywords), `""` one quote - the engine's
+                // rule, and the spelling the compiled BLR names the
+                // field by. An empty name is no name.
+                i += 1;
+                let mut v = String::new();
+                loop {
+                    match b.get(i) {
+                        None => return None,
+                        Some('"') if b.get(i + 1) == Some(&'"') => {
+                            v.push('"');
+                            i += 2;
+                        }
+                        Some('"') => {
+                            i += 1;
+                            break;
+                        }
+                        Some(ch) => {
+                            v.push(*ch);
+                            i += 1;
+                        }
+                    }
+                }
+                if v.is_empty() {
+                    return None;
+                }
+                out.push(Tok::Ident(v));
+            }
             d if d.is_ascii_digit() => {
                 let start = i;
                 while i < b.len() && b[i].is_ascii_digit() {

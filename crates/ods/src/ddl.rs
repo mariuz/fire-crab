@@ -594,7 +594,7 @@ pub fn array_shape(file: &crate::Image, page_size: usize, relation: &str, field:
         let (Some(r), Some(f), Some(src)) = (text(vals.get(rel_f)), text(vals.get(fld_f)), text(vals.get(src_f))) else {
             return;
         };
-        if r.eq_ignore_ascii_case(relation) && f.eq_ignore_ascii_case(field) {
+        if r == relation && f == field {
             source = Some(src);
         }
     });
@@ -795,7 +795,7 @@ fn find_relations_row(
             let Some(image) = crate::data::catalog_image(file, page_size, &r, tips.as_ref()) else { continue };
             let vals = decode_record(&image, descs);
             if let Some(Value::Text(t)) = vals.get(name_fid) {
-                if t.trim_end().eq_ignore_ascii_case(table) {
+                if t.trim_end() == table {
                     return Some((dp_no, r.slot, image, r.format));
                 }
             }
@@ -1041,7 +1041,7 @@ fn relation_trigger_names(file: &crate::Image, page_size: usize, table: &str) ->
     };
     let mut trigs: Vec<(i64, i64, String)> = Vec::new();
     walk_rows(file, page_size, rel, descs, |v| {
-        if text_eq(v.get(rn_f), table) {
+        if text_is(v.get(rn_f), table) {
             if let Some(Value::Text(t)) = v.get(name_f) {
                 let ttype = match v.get(type_f) {
                     Some(Value::Int(n)) => *n,
@@ -1071,7 +1071,7 @@ pub fn alter_table_add_column(
     table: &str,
     col: &ColumnDef,
 ) -> Result<(), String> {
-    let table = table.trim().to_ascii_uppercase();
+    let table = table.trim().to_string();
     let rel = crate::resolve_relation(file, page_size, &table)
         .ok_or_else(|| format!("table {} not found", table))?;
 
@@ -1079,7 +1079,7 @@ pub fn alter_table_add_column(
     let existing = relation_columns(file, page_size, &table);
     if existing
         .iter()
-        .any(|c| c.name.eq_ignore_ascii_case(&col.name))
+        .any(|c| c.name == col.name)
     {
         return Err(format!("column {} already exists", col.name));
     }
@@ -2463,15 +2463,15 @@ pub fn alter_table_drop_column(
     table: &str,
     col_name: &str,
 ) -> Result<(), String> {
-    let table = table.trim().to_ascii_uppercase();
-    let col_up = col_name.trim().trim_matches('"').to_ascii_uppercase();
+    let table = table.trim().to_string();
+    let col_up = col_name.trim().to_string();
     let rel = crate::resolve_relation(file, page_size, &table)
         .ok_or_else(|| format!("table {} not found", table))?;
 
     let cols = relation_columns(file, page_size, &table);
     let target = cols
         .iter()
-        .find(|c| c.name.eq_ignore_ascii_case(&col_up))
+        .find(|c| c.name == col_up)
         .ok_or_else(|| format!("column {} not found", col_name))?;
     let drop_fid = target.field_id as usize;
     let cur_formats = crate::relation_formats(file, page_size, rel);
@@ -2498,7 +2498,7 @@ pub fn alter_table_drop_column(
         for (cname, deps) in computed_dependencies(file, page_size, &table) {
             let depends = match deps {
                 None => true,
-                Some(names) => names.iter().any(|n| n.eq_ignore_ascii_case(&col_up)),
+                Some(names) => names.iter().any(|n| *n == col_up),
             };
             if depends {
                 return Err(format!(
@@ -2698,7 +2698,7 @@ fn indices_containing(
     let fk_f = sys_fid(file, page_size, "RDB$INDICES", "RDB$FOREIGN_KEY")?;
     let mut names: Vec<(String, bool)> = Vec::new();
     walk_rows(file, page_size, irel, descs, |values| {
-        if text_eq(values.get(rn_f), table) {
+        if text_is(values.get(rn_f), table) {
             if let Some(Value::Text(t)) = values.get(ix_f) {
                 let fk = matches!(values.get(fk_f),
                     Some(Value::Text(p)) if !p.trim_end().is_empty());
@@ -2710,7 +2710,7 @@ fn indices_containing(
     for (n, fk) in names {
         if index_segment_columns(file, page_size, &n)?
             .iter()
-            .any(|c| c.eq_ignore_ascii_case(col))
+            .any(|c| c == col)
         {
             out.push((n, fk));
         }
@@ -2749,7 +2749,7 @@ fn column_in_constraint_index(
     walk_rows(file, page_size, crel, cdescs, |values| {
         if let Some(Value::Text(t)) = values.get(cix_f) {
             let t = t.trim_end();
-            if mine.iter().any(|m| m.eq_ignore_ascii_case(t)) {
+            if mine.iter().any(|m| m == t) {
                 hit = true;
             }
         }
@@ -2792,15 +2792,15 @@ pub fn alter_table_alter_column_type(
     if !new_col.dims.is_empty() {
         return Err("an ARRAY column can only be declared at CREATE TABLE".into());
     }
-    let table = table.trim().to_ascii_uppercase();
-    let col_up = col_name.trim().trim_matches('"').to_ascii_uppercase();
+    let table = table.trim().to_string();
+    let col_up = col_name.trim().to_string();
     let rel = crate::resolve_relation(file, page_size, &table)
         .ok_or_else(|| format!("table {} not found", table))?;
 
     let cols = relation_columns(file, page_size, &table);
     let target = cols
         .iter()
-        .find(|c| c.name.eq_ignore_ascii_case(&col_up))
+        .find(|c| c.name == col_up)
         .ok_or_else(|| format!("column {} not found", col_name))?;
     let fid = target.field_id as usize;
 
@@ -2999,8 +2999,8 @@ pub fn alter_column_default(
     column: &str,
     default: Option<&ColumnDefault>,
 ) -> Result<(), String> {
-    let table = table.trim().to_ascii_uppercase();
-    let column = column.trim().trim_matches('"').to_ascii_uppercase();
+    let table = table.trim().to_string();
+    let column = column.trim().to_string();
     let rel = crate::resolve_relation(file, page_size, &table)
         .ok_or_else(|| format!("table {} not found", table))?;
     if rel < 128 {
@@ -3008,7 +3008,7 @@ pub fn alter_column_default(
     }
     let col_fid = relation_columns(file, page_size, &table)
         .iter()
-        .find(|c| c.name.eq_ignore_ascii_case(&column))
+        .find(|c| c.name == column)
         .map(|c| c.field_id)
         .ok_or_else(|| format!("column {} not found in table {}", column, table))?;
     // the engine refuses a default change on a column inside a FOREIGN
@@ -3051,7 +3051,7 @@ pub fn alter_column_default(
         page_size,
         "RDB$RELATION_FIELDS",
         5,
-        move |v| text_eq(v.get(rel_fid), &t) && text_eq(v.get(name_fid), &c),
+        move |v| text_is(v.get(rel_fid), &t) && text_is(v.get(name_fid), &c),
         &[
             ("RDB$DEFAULT_SOURCE", src_val),
             ("RDB$DEFAULT_VALUE", val_val),
@@ -3083,7 +3083,7 @@ fn column_identity_generator(
     );
     let mut out = None;
     walk_rows(file, page_size, rel, descs, |v| {
-        if out.is_none() && text_eq(v.get(rel_f), table) && text_eq(v.get(name_f), column) {
+        if out.is_none() && text_is(v.get(rel_f), table) && text_is(v.get(name_f), column) {
             if matches!(v.get(idt_f), Some(Value::Int(_))) {
                 if let Some(Value::Text(g)) = v.get(gen_f) {
                     out = Some(g.trim_end().to_string());
@@ -3133,8 +3133,8 @@ pub fn alter_column_restart(
     column: &str,
     with_value: Option<i64>,
 ) -> Result<(), String> {
-    let table = table.trim().to_ascii_uppercase();
-    let column = column.trim().trim_matches('"').to_ascii_uppercase();
+    let table = table.trim().to_string();
+    let column = column.trim().to_string();
     let gen = column_identity_generator(file, page_size, &table, &column)
         .ok_or_else(|| format!("column {} is not an identity column", column))?;
     let (id, increment, initial) = generator_incr_init(file, page_size, &gen)
@@ -3157,8 +3157,8 @@ pub fn column_restart_posting(
     column: &str,
     with_value: Option<i64>,
 ) -> Result<(String, i64), String> {
-    let table = table.trim().to_ascii_uppercase();
-    let column = column.trim().trim_matches('"').to_ascii_uppercase();
+    let table = table.trim().to_string();
+    let column = column.trim().to_string();
     let gen = column_identity_generator(file, page_size, &table, &column)
         .ok_or_else(|| format!("column {} is not an identity column", column))?;
     let (_id, increment, initial) = generator_incr_init(file, page_size, &gen)
@@ -3179,8 +3179,8 @@ pub fn alter_column_set_generated(
     column: &str,
     identity_type: i16,
 ) -> Result<(), String> {
-    let table = table.trim().to_ascii_uppercase();
-    let column = column.trim().trim_matches('"').to_ascii_uppercase();
+    let table = table.trim().to_string();
+    let column = column.trim().to_string();
     if column_identity_generator(file, page_size, &table, &column).is_none() {
         return Err(format!("column {} is not an identity column", column));
     }
@@ -3192,7 +3192,7 @@ pub fn alter_column_set_generated(
         page_size,
         "RDB$RELATION_FIELDS",
         5,
-        move |v| text_eq(v.get(rel_fid), &t) && text_eq(v.get(name_fid), &c),
+        move |v| text_is(v.get(rel_fid), &t) && text_is(v.get(name_fid), &c),
         &[("RDB$IDENTITY_TYPE", SysVal::I(identity_type as i64))],
     )?;
     update_relation_runtime(file, page_size, &table)?;
@@ -3212,8 +3212,8 @@ pub fn alter_column_drop_identity(
     table: &str,
     column: &str,
 ) -> Result<(), String> {
-    let table = table.trim().to_ascii_uppercase();
-    let column = column.trim().trim_matches('"').to_ascii_uppercase();
+    let table = table.trim().to_string();
+    let column = column.trim().to_string();
     let gen = column_identity_generator(file, page_size, &table, &column)
         .ok_or_else(|| format!("column {} is not an identity column", column))?;
     let class = find_generator(file, page_size, &gen).and_then(|(_, _, c)| c);
@@ -3226,7 +3226,7 @@ pub fn alter_column_drop_identity(
         page_size,
         "RDB$RELATION_FIELDS",
         5,
-        move |v| text_eq(v.get(rel_fid), &t) && text_eq(v.get(name_fid), &c),
+        move |v| text_is(v.get(rel_fid), &t) && text_is(v.get(name_fid), &c),
         &[
             ("RDB$IDENTITY_TYPE", SysVal::Null),
             ("RDB$GENERATOR_NAME", SysVal::Null),
@@ -3266,8 +3266,8 @@ pub fn alter_column_position(
     column: &str,
     new_pos: i64,
 ) -> Result<(), String> {
-    let table = table.trim().to_ascii_uppercase();
-    let column = column.trim().trim_matches('"').to_ascii_uppercase();
+    let table = table.trim().to_string();
+    let column = column.trim().to_string();
     let rel = crate::resolve_relation(file, page_size, &table)
         .ok_or_else(|| format!("table {} not found", table))?;
     if rel < 128 {
@@ -3287,7 +3287,7 @@ pub fn alter_column_position(
     order.sort_by_key(|(_, p)| *p);
     let from = order
         .iter()
-        .position(|(n, _)| n.eq_ignore_ascii_case(&column))
+        .position(|(n, _)| *n == column)
         .ok_or_else(|| format!("column {} not found in table {}", column, table))?;
     if from == to {
         return advance_oldest_transactions(file, page_size);
@@ -3307,7 +3307,7 @@ pub fn alter_column_position(
             page_size,
             "RDB$RELATION_FIELDS",
             5,
-            move |v| text_eq(v.get(rel_fid), &t) && text_eq(v.get(name_fid), &c),
+            move |v| text_is(v.get(rel_fid), &t) && text_is(v.get(name_fid), &c),
             &[("RDB$FIELD_POSITION", SysVal::I(new_p as i64))],
         )?;
     }
@@ -3451,13 +3451,13 @@ pub fn alter_table_set_not_null(
     table: &str,
     col_name: &str,
 ) -> Result<(), String> {
-    let table = table.trim().to_ascii_uppercase();
-    let col_up = col_name.trim().trim_matches('"').to_ascii_uppercase();
+    let table = table.trim().to_string();
+    let col_up = col_name.trim().to_string();
     let rel = crate::resolve_relation(file, page_size, &table)
         .ok_or_else(|| format!("table {} not found", table))?;
     let target = relation_columns(file, page_size, &table)
         .into_iter()
-        .find(|c| c.name.eq_ignore_ascii_case(&col_up))
+        .find(|c| c.name == col_up)
         .ok_or_else(|| format!("column {} not found", col_name))?;
     if column_has_nulls(file, page_size, rel, target.field_id as usize) {
         return Err(format!(
@@ -3497,13 +3497,13 @@ pub fn alter_table_drop_not_null(
     table: &str,
     col_name: &str,
 ) -> Result<(), String> {
-    let table = table.trim().to_ascii_uppercase();
-    let col_up = col_name.trim().trim_matches('"').to_ascii_uppercase();
+    let table = table.trim().to_string();
+    let col_up = col_name.trim().to_string();
     crate::resolve_relation(file, page_size, &table)
         .ok_or_else(|| format!("table {} not found", table))?;
     if !relation_columns(file, page_size, &table)
         .iter()
-        .any(|c| c.name.eq_ignore_ascii_case(&col_up))
+        .any(|c| c.name == col_up)
     {
         return Err(format!("column {} not found", col_name));
     }
@@ -3626,14 +3626,14 @@ pub fn create_table(
             return Err(format!("computed column {} cannot carry constraints", c.name));
         }
     }
-    let name = name.trim().to_ascii_uppercase();
+    let name = name.trim().to_string();
 
     // relation id: one past the highest in RDB$RELATIONS (user ids
     // start at 128; every real database's system rels reach far below)
     let rels = list_relations(file, page_size);
     if rels
         .iter()
-        .any(|(_, n)| n.trim_end().eq_ignore_ascii_case(&name))
+        .any(|(_, n)| n.trim_end() == name)
     {
         return Err(format!("table {} already exists", name));
     }
@@ -4279,7 +4279,7 @@ pub fn create_view(
     fields: &[ViewFieldSpec],
     contexts: &[RestoredViewContext],
 ) -> Result<(), String> {
-    let want = name.trim().trim_matches('"').to_ascii_uppercase();
+    let want = name.trim().to_string();
     if crate::resolve_relation(file, page_size, &want).is_some() {
         return Err(format!("relation {} already exists", want));
     }
@@ -4298,7 +4298,7 @@ pub fn alter_view(
     fields: &[ViewFieldSpec],
     contexts: &[RestoredViewContext],
 ) -> Result<(), String> {
-    let want = name.trim().trim_matches('"').to_ascii_uppercase();
+    let want = name.trim().to_string();
     let rel = crate::resolve_relation(file, page_size, &want)
         .ok_or_else(|| format!("View {} not found", want))?;
     if rel < 128 || !is_view(file, page_size, &want) {
@@ -4319,7 +4319,7 @@ fn create_view_impl(
     contexts: &[RestoredViewContext],
     forced_id: Option<i64>,
 ) -> Result<(), String> {
-    let want = name.trim().trim_matches('"').to_ascii_uppercase();
+    let want = name.trim().to_string();
     let domain_base = next_domain_number(file, page_size)?;
     let mut auto_idx = 0u64;
     let mut restored: Vec<RestoredViewField> = Vec::with_capacity(fields.len());
@@ -4409,7 +4409,7 @@ fn insert_auto_field_row(file: &mut crate::Image, page_size: usize, source: &str
 /// view relations, formats, security class and privileges go; a TABLE is
 /// not a view (the engine's "does not exist" for DROP VIEW, probed).
 pub fn drop_view(file: &mut crate::Image, page_size: usize, name: &str) -> Result<(), String> {
-    let name = name.trim().trim_matches('"').to_ascii_uppercase();
+    let name = name.trim().to_string();
     let rel = crate::resolve_relation(file, page_size, &name)
         .ok_or_else(|| format!("View {} not found", name))?;
     if rel < 128 || !is_view(file, page_size, &name) {
@@ -4424,7 +4424,7 @@ pub fn drop_view(file: &mut crate::Image, page_size: usize, name: &str) -> Resul
         let rel_fid = sys_fid(file, page_size, "RDB$RELATION_FIELDS", "RDB$RELATION_NAME")?;
         let base_fid = sys_fid(file, page_size, "RDB$RELATION_FIELDS", "RDB$BASE_FIELD")?;
         walk_rows(file, page_size, 5, descs, |values| {
-            if text_eq(values.get(rel_fid), &name) && !matches!(values.get(base_fid), Some(Value::Text(_))) {
+            if text_is(values.get(rel_fid), &name) && !matches!(values.get(base_fid), Some(Value::Text(_))) {
                 if let Some(Value::Text(t)) = values.get(src_fid) {
                     let t = t.trim_end();
                     if t.strip_prefix("RDB$").is_some_and(|x| x.parse::<u64>().is_ok()) {
@@ -4442,7 +4442,7 @@ pub fn drop_view(file: &mut crate::Image, page_size: usize, name: &str) -> Resul
         let rel_fid = sys_fid(file, page_size, "RDB$RELATIONS", "RDB$RELATION_NAME")?;
         let mut class = None;
         walk_rows(file, page_size, 6, descs, |values| {
-            if text_eq(values.get(rel_fid), &name) {
+            if text_is(values.get(rel_fid), &name) {
                 if let Some(Value::Text(t)) = values.get(cls_fid) {
                     class = Some(t.trim_end().to_string());
                 }
@@ -4453,17 +4453,17 @@ pub fn drop_view(file: &mut crate::Image, page_size: usize, name: &str) -> Resul
     {
         let fid = sys_fid(file, page_size, "RDB$RELATION_FIELDS", "RDB$RELATION_NAME")?;
         let n = name.clone();
-        delete_catalog_rows(file, page_size, "RDB$RELATION_FIELDS", move |v| text_eq(v.get(fid), &n))?;
+        delete_catalog_rows(file, page_size, "RDB$RELATION_FIELDS", move |v| text_is(v.get(fid), &n))?;
     }
     {
         let fid = sys_fid(file, page_size, "RDB$FIELDS", "RDB$FIELD_NAME")?;
         let names = domain_names.clone();
-        delete_catalog_rows(file, page_size, "RDB$FIELDS", move |v| names.iter().any(|d| text_eq(v.get(fid), d)))?;
+        delete_catalog_rows(file, page_size, "RDB$FIELDS", move |v| names.iter().any(|d| text_is(v.get(fid), d)))?;
     }
     {
         let fid = sys_fid(file, page_size, "RDB$VIEW_RELATIONS", "RDB$VIEW_NAME")?;
         let n = name.clone();
-        delete_catalog_rows(file, page_size, "RDB$VIEW_RELATIONS", move |v| text_eq(v.get(fid), &n))?;
+        delete_catalog_rows(file, page_size, "RDB$VIEW_RELATIONS", move |v| text_is(v.get(fid), &n))?;
     }
     {
         let fid = sys_fid(file, page_size, "RDB$FORMATS", "RDB$RELATION_ID")?;
@@ -4472,7 +4472,7 @@ pub fn drop_view(file: &mut crate::Image, page_size: usize, name: &str) -> Resul
     {
         let fid = sys_fid(file, page_size, "RDB$RELATIONS", "RDB$RELATION_NAME")?;
         let n = name.clone();
-        delete_catalog_rows(file, page_size, "RDB$RELATIONS", move |v| text_eq(v.get(fid), &n))?;
+        delete_catalog_rows(file, page_size, "RDB$RELATIONS", move |v| text_is(v.get(fid), &n))?;
     }
     if let Some(class) = security_class {
         let fid = sys_fid(file, page_size, "RDB$SECURITY_CLASSES", "RDB$SECURITY_CLASS")?;
@@ -4482,7 +4482,7 @@ pub fn drop_view(file: &mut crate::Image, page_size: usize, name: &str) -> Resul
         let rel_f = sys_fid(file, page_size, "RDB$USER_PRIVILEGES", "RDB$RELATION_NAME")?;
         let obj_f = sys_fid(file, page_size, "RDB$USER_PRIVILEGES", "RDB$OBJECT_TYPE")?;
         let n = name.clone();
-        delete_catalog_rows(file, page_size, "RDB$USER_PRIVILEGES", move |v| text_eq(v.get(rel_f), &n) && int_eq(v.get(obj_f), 0))?;
+        delete_catalog_rows(file, page_size, "RDB$USER_PRIVILEGES", move |v| text_is(v.get(rel_f), &n) && int_eq(v.get(obj_f), 0))?;
     }
     advance_oldest_transactions(file, page_size)
 }
@@ -4496,7 +4496,7 @@ pub fn is_view(file: &crate::Image, page_size: usize, name: &str) -> bool {
     let (Some(name_f), Some(blr_f)) = (fid("RDB$RELATION_NAME"), fid("RDB$VIEW_BLR")) else { return false };
     let mut view = false;
     walk_rows(file, page_size, 6, descs, |v| {
-        if text_eq(v.get(name_f), name) && matches!(v.get(blr_f), Some(Value::Blob(..))) {
+        if text_is(v.get(name_f), name) && matches!(v.get(blr_f), Some(Value::Blob(..))) {
             view = true;
         }
     });
@@ -4513,7 +4513,7 @@ pub fn relation_field_source(file: &crate::Image, page_size: usize, relation: &s
     let (rel_f, fld_f, src_f) = (fid("RDB$RELATION_NAME")?, fid("RDB$FIELD_NAME")?, fid("RDB$FIELD_SOURCE")?);
     let mut out = None;
     walk_rows(file, page_size, 5, descs, |v| {
-        if out.is_none() && text_eq(v.get(rel_f), relation) && text_eq(v.get(fld_f), field) {
+        if out.is_none() && text_is(v.get(rel_f), relation) && text_is(v.get(fld_f), field) {
             if let Some(Value::Text(t)) = v.get(src_f) {
                 out = Some(t.trim_end().to_string());
             }
@@ -4550,9 +4550,9 @@ fn restore_view_with(
     created: Option<(i64, &str, &str)>,
     forced_id: Option<i64>,
 ) -> Result<(), String> {
-    let name = name.trim().to_ascii_uppercase();
+    let name = name.trim().to_string();
     let rels = list_relations(file, page_size);
-    if rels.iter().any(|(_, n)| n.trim_end().eq_ignore_ascii_case(&name)) {
+    if rels.iter().any(|(_, n)| n.trim_end() == name) {
         return Err(format!("relation {} already exists", name));
     }
     // ALTER VIEW keeps the relation's id across the drop-and-repopulate;
@@ -4759,7 +4759,7 @@ pub fn refresh_relation_runtime(
     page_size: usize,
     table: &str,
 ) -> Result<(), String> {
-    update_relation_runtime(file, page_size, &table.trim().to_ascii_uppercase())
+    update_relation_runtime(file, page_size, table.trim())
 }
 
 /// A user `CREATE TRIGGER`, compiled: the catalog values plus the three
@@ -4816,7 +4816,7 @@ pub fn create_user_trigger(
     table: Option<&str>,
     def: &UserTriggerDef,
 ) -> Result<(), String> {
-    let table = table.map(|t| t.trim().to_ascii_uppercase());
+    let table = table.map(|t| t.trim().to_string());
     match table.as_deref() {
         Some(t) => {
             let rel = crate::resolve_relation(file, page_size, t)
@@ -5030,7 +5030,7 @@ pub fn alter_table_add_check(
     table: &str,
     check: &CheckDef,
 ) -> Result<(), String> {
-    let table = table.trim().to_ascii_uppercase();
+    let table = table.trim().to_string();
     let rel = crate::resolve_relation(file, page_size, &table)
         .ok_or_else(|| format!("table {} not found", table))?;
     if rel < 128 {
@@ -5065,7 +5065,7 @@ pub fn alter_table_add_key(
     table: &str,
     key: &KeyDef,
 ) -> Result<(), String> {
-    let name = table.trim().to_ascii_uppercase();
+    let name = table.trim().to_string();
     let rel = crate::resolve_relation(file, page_size, &name)
         .ok_or_else(|| format!("table {} not found", table))?;
     if rel < 128 {
@@ -5073,7 +5073,7 @@ pub fn alter_table_add_key(
     }
     let columns = relation_columns(file, page_size, &name);
     for c in &key.columns {
-        if !columns.iter().any(|rc| rc.name.eq_ignore_ascii_case(c)) {
+        if !columns.iter().any(|rc| rc.name == *c) {
             return Err(format!("unknown column {}", c));
         }
     }
@@ -5082,7 +5082,7 @@ pub fn alter_table_add_key(
             return Err(format!("table {} already has a primary key", name));
         }
         for c in &key.columns {
-            if !column_is_not_null(file, page_size, &name, &c.to_ascii_uppercase()) {
+            if !column_is_not_null(file, page_size, &name, c) {
                 return Err(format!(
                     "Column: {} not defined as NOT NULL - cannot be used in PRIMARY KEY constraint definition",
                     c
@@ -5118,8 +5118,8 @@ pub fn alter_table_drop_constraint(
     table: &str,
     constraint: &str,
 ) -> Result<(), String> {
-    let name = table.trim().to_ascii_uppercase();
-    let cname = constraint.trim().trim_matches('"').to_ascii_uppercase();
+    let name = table.trim().to_string();
+    let cname = constraint.trim().to_string();
     let rel = crate::resolve_relation(file, page_size, &name)
         .ok_or_else(|| format!("table {} not found", table))?;
     if rel < 128 {
@@ -5138,7 +5138,7 @@ pub fn alter_table_drop_constraint(
             patch_rf_null_flag(file, page_size, &name, &column, None)?;
             let cn_fid = sys_fid(file, page_size, "RDB$CHECK_CONSTRAINTS", "RDB$CONSTRAINT_NAME")?;
             delete_catalog_rows(file, page_size, "RDB$CHECK_CONSTRAINTS", |v| {
-                text_eq(v.get(cn_fid), &cname)
+                text_is(v.get(cn_fid), &cname)
             })?;
             refresh_runtime(file, page_size, &name)?;
         }
@@ -5155,7 +5155,7 @@ pub fn alter_table_drop_constraint(
         "FOREIGN KEY" => {
             let cn_fid = sys_fid(file, page_size, "RDB$REF_CONSTRAINTS", "RDB$CONSTRAINT_NAME")?;
             delete_catalog_rows(file, page_size, "RDB$REF_CONSTRAINTS", |v| {
-                text_eq(v.get(cn_fid), &cname)
+                text_is(v.get(cn_fid), &cname)
             })?;
             let index_name = index_name.ok_or("foreign key without an index")?;
             deferred_drop_index(file, page_size, rel, &index_name)?;
@@ -5168,7 +5168,7 @@ pub fn alter_table_drop_constraint(
             let tnames = check_constraint_trigger_names(file, page_size, &cname);
             let cn_fid = sys_fid(file, page_size, "RDB$CHECK_CONSTRAINTS", "RDB$CONSTRAINT_NAME")?;
             delete_catalog_rows(file, page_size, "RDB$CHECK_CONSTRAINTS", |v| {
-                text_eq(v.get(cn_fid), &cname)
+                text_is(v.get(cn_fid), &cname)
             })?;
             let tn_fid = sys_fid(file, page_size, "RDB$TRIGGERS", "RDB$TRIGGER_NAME")?;
             let dn_fid = sys_fid(file, page_size, "RDB$DEPENDENCIES", "RDB$DEPENDENT_NAME")?;
@@ -5176,10 +5176,10 @@ pub fn alter_table_drop_constraint(
                 let t = t.clone();
                 delete_catalog_rows(file, page_size, "RDB$TRIGGERS", {
                     let t = t.clone();
-                    move |v| text_eq(v.get(tn_fid), &t)
+                    move |v| text_is(v.get(tn_fid), &t)
                 })?;
                 delete_catalog_rows(file, page_size, "RDB$DEPENDENCIES", move |v| {
-                    text_eq(v.get(dn_fid), &t)
+                    text_is(v.get(dn_fid), &t)
                 })?;
             }
             refresh_runtime(file, page_size, &name)?;
@@ -5188,7 +5188,7 @@ pub fn alter_table_drop_constraint(
     }
     let rc_name = sys_fid(file, page_size, "RDB$RELATION_CONSTRAINTS", "RDB$CONSTRAINT_NAME")?;
     delete_catalog_rows(file, page_size, "RDB$RELATION_CONSTRAINTS", |v| {
-        text_eq(v.get(rc_name), &cname)
+        text_is(v.get(rc_name), &cname)
     })?;
     advance_oldest_transactions(file, page_size)?;
     Ok(())
@@ -5201,7 +5201,7 @@ pub fn alter_table_drop_constraint(
 /// user to ALTER TABLE DROP CONSTRAINT. The removal itself is the
 /// engine's deferred one - see [deferred_drop_index].
 pub fn drop_index(file: &mut crate::Image, page_size: usize, index_name: &str) -> Result<(), String> {
-    let want = index_name.trim().trim_matches('"').to_ascii_uppercase();
+    let want = index_name.trim().to_string();
     let (table, system) = find_index_relation(file, page_size, &want)
         .ok_or_else(|| format!("index {} not found", want))?;
     if system != 0 {
@@ -5292,7 +5292,7 @@ pub fn comment_on(
     let text = text.filter(|t| !t.is_empty());
     match target {
         CommentTarget::Table(name) => {
-            let name = name.trim().trim_matches('"').to_ascii_uppercase();
+            let name = name.trim().to_string();
             let rel = crate::resolve_relation(file, page_size, &name)
                 .ok_or_else(|| format!("Table \"{}\" not found", name))?;
             if rel < 128 {
@@ -5302,12 +5302,12 @@ pub fn comment_on(
             let name_fid = sys_fid(file, page_size, "RDB$RELATIONS", "RDB$RELATION_NAME")?;
             let nm = name.clone();
             patch_sys_row(file, page_size, "RDB$RELATIONS", 6,
-                move |v| text_eq(v.get(name_fid), &nm),
+                move |v| text_is(v.get(name_fid), &nm),
                 &[("RDB$DESCRIPTION", value)])?;
         }
         CommentTarget::Column(table, column) => {
-            let table = table.trim().trim_matches('"').to_ascii_uppercase();
-            let column = column.trim().trim_matches('"').to_ascii_uppercase();
+            let table = table.trim().to_string();
+            let column = column.trim().to_string();
             let rel = crate::resolve_relation(file, page_size, &table)
                 .ok_or_else(|| format!("Table \"{}\" not found", table))?;
             if rel < 128 {
@@ -5315,7 +5315,7 @@ pub fn comment_on(
             }
             if !relation_columns(file, page_size, &table)
                 .iter()
-                .any(|c| c.name.eq_ignore_ascii_case(&column))
+                .any(|c| c.name == column)
             {
                 return Err(format!(
                     "column {} does not exist in table/view \"{}\"",
@@ -5327,11 +5327,11 @@ pub fn comment_on(
             let name_fid = sys_fid(file, page_size, "RDB$RELATION_FIELDS", "RDB$FIELD_NAME")?;
             let (t, c) = (table.clone(), column.clone());
             patch_sys_row(file, page_size, "RDB$RELATION_FIELDS", 5,
-                move |v| text_eq(v.get(rel_fid), &t) && text_eq(v.get(name_fid), &c),
+                move |v| text_is(v.get(rel_fid), &t) && text_is(v.get(name_fid), &c),
                 &[("RDB$DESCRIPTION", value)])?;
         }
         CommentTarget::Index(name) => {
-            let name = name.trim().trim_matches('"').to_ascii_uppercase();
+            let name = name.trim().to_string();
             let (_table, system) = find_index_relation(file, page_size, &name)
                 .ok_or_else(|| format!("index {} not found", name))?;
             if system != 0 {
@@ -5343,7 +5343,7 @@ pub fn comment_on(
             let name_fid = sys_fid(file, page_size, "RDB$INDICES", "RDB$INDEX_NAME")?;
             let nm = name.clone();
             patch_sys_row(file, page_size, "RDB$INDICES", irel,
-                move |v| text_eq(v.get(name_fid), &nm),
+                move |v| text_is(v.get(name_fid), &nm),
                 &[("RDB$DESCRIPTION", value)])?;
         }
         CommentTarget::Sequence(name) => {
@@ -5478,7 +5478,7 @@ pub fn set_index_statistics(
     page_size: usize,
     index_name: &str,
 ) -> Result<(), String> {
-    let want = index_name.trim().trim_matches('"').to_ascii_uppercase();
+    let want = index_name.trim().to_string();
     let (table, system) = find_index_relation(file, page_size, &want)
         .ok_or_else(|| format!("Index not found: {}", want))?;
     if system != 0 {
@@ -5502,7 +5502,7 @@ pub fn set_index_statistics(
     for n in index_segment_columns(file, page_size, &want)? {
         let rc = columns
             .iter()
-            .find(|c| c.name.eq_ignore_ascii_case(&n))
+            .find(|c| c.name == n)
             .ok_or_else(|| format!("unknown column {}", n))?;
         let d = descs.get(rc.field_id as usize).ok_or("field beyond format")?;
         let itype = index_itype(d).ok_or("column type cannot be indexed by this writer")?;
@@ -5546,7 +5546,7 @@ pub fn alter_index_active(
     index_name: &str,
     active: bool,
 ) -> Result<(), String> {
-    let want = index_name.trim().trim_matches('"').to_ascii_uppercase();
+    let want = index_name.trim().to_string();
     let (table, system) = find_index_relation(file, page_size, &want)
         .ok_or_else(|| format!("Index not found: {}", want))?;
     if system != 0 {
@@ -5576,7 +5576,7 @@ pub fn alter_index_active(
             page_size,
             "RDB$INDICES",
             4,
-            |v| text_eq(v.get(ix_name), &want),
+            |v| text_is(v.get(ix_name), &want),
             &[("RDB$INDEX_INACTIVE", SysVal::I(1))], // MET_index_inactive
         )?;
         advance_oldest_transactions(file, page_size)?;
@@ -5595,7 +5595,7 @@ pub fn alter_index_active(
     for n in index_segment_columns(file, page_size, &want)? {
         let rc = columns
             .iter()
-            .find(|c| c.name.eq_ignore_ascii_case(&n))
+            .find(|c| c.name == n)
             .ok_or_else(|| format!("unknown column {}", n))?;
         let d = descs
             .get(rc.field_id as usize)
@@ -5628,7 +5628,7 @@ pub fn alter_index_active(
         page_size,
         "RDB$INDICES",
         4,
-        |v| text_eq(v.get(ix_name), &want),
+        |v| text_is(v.get(ix_name), &want),
         &[
             ("RDB$INDEX_INACTIVE", SysVal::I(0)), // MET_index_active
             ("RDB$INDEX_ID", SysVal::I(slot as i64 + 1)),
@@ -5652,7 +5652,7 @@ fn index_row_state(file: &crate::Image, page_size: usize, name: &str) -> Result<
     let type_f = sys_fid(file, page_size, "RDB$INDICES", "RDB$INDEX_TYPE")?;
     let mut found = None;
     walk_rows(file, page_size, 4, descs, |values| {
-        if text_eq(values.get(name_f), name) {
+        if text_is(values.get(name_f), name) {
             let int = |v: Option<&Value>| match v {
                 Some(Value::Int(i)) => *i,
                 _ => 0,
@@ -5676,7 +5676,7 @@ fn index_id_of(file: &crate::Image, page_size: usize, name: &str) -> Result<usiz
     let id_f = sys_fid(file, page_size, "RDB$INDICES", "RDB$INDEX_ID")?;
     let mut found = None;
     walk_rows(file, page_size, 4, descs, |values| {
-        if text_eq(values.get(name_f), name) {
+        if text_is(values.get(name_f), name) {
             if let Some(Value::Int(i)) = values.get(id_f) {
                 found = Some(*i as usize);
             }
@@ -5701,7 +5701,7 @@ fn index_segment_columns(
     let pos_f = sys_fid(file, page_size, "RDB$INDEX_SEGMENTS", "RDB$FIELD_POSITION")?;
     let mut segs: Vec<(i64, String)> = Vec::new();
     walk_rows(file, page_size, rel, descs, |values| {
-        if text_eq(values.get(name_f), name) {
+        if text_is(values.get(name_f), name) {
             if let Some(Value::Text(t)) = values.get(field_f) {
                 let pos = match values.get(pos_f) {
                     Some(Value::Int(i)) => *i,
@@ -5753,7 +5753,7 @@ fn find_index_relation(file: &crate::Image, page_size: usize, index_name: &str) 
     );
     let mut found = None;
     walk_rows(file, page_size, rel, descs, |values| {
-        if text_eq(values.get(ix_f), index_name) {
+        if text_is(values.get(ix_f), index_name) {
             if let Some(Value::Text(t)) = values.get(rn_f) {
                 let system = match values.get(sf_f) {
                     Some(Value::Int(i)) => *i,
@@ -5777,7 +5777,7 @@ fn constraint_using_index(file: &crate::Image, page_size: usize, index_name: &st
     let (cn_f, ix_f) = (fid("RDB$CONSTRAINT_NAME")?, fid("RDB$INDEX_NAME")?);
     let mut found = None;
     walk_rows(file, page_size, rel, descs, |values| {
-        if text_eq(values.get(ix_f), index_name) {
+        if text_is(values.get(ix_f), index_name) {
             if let Some(Value::Text(t)) = values.get(cn_f) {
                 found = Some(t.trim_end().to_string());
             }
@@ -5806,7 +5806,7 @@ fn find_constraint(
     );
     let mut found = None;
     walk_rows(file, page_size, rel, descs, |values| {
-        if text_eq(values.get(cn_f), cname) && text_eq(values.get(rn_f), table) {
+        if text_is(values.get(cn_f), cname) && text_is(values.get(rn_f), table) {
             let ctype = match values.get(ct_f) {
                 Some(Value::Text(t)) => t.trim_end().to_string(),
                 _ => return,
@@ -5832,7 +5832,7 @@ fn check_constraint_column(file: &crate::Image, page_size: usize, cname: &str) -
     let (cn_f, tr_f) = (fid("RDB$CONSTRAINT_NAME")?, fid("RDB$TRIGGER_NAME")?);
     let mut found = None;
     walk_rows(file, page_size, rel, descs, |values| {
-        if text_eq(values.get(cn_f), cname) {
+        if text_is(values.get(cn_f), cname) {
             if let Some(Value::Text(t)) = values.get(tr_f) {
                 found = Some(t.trim_end().to_string());
             }
@@ -5861,7 +5861,7 @@ fn check_constraint_trigger_names(file: &crate::Image, page_size: usize, cname: 
         return names;
     };
     walk_rows(file, page_size, rel, descs, |values| {
-        if text_eq(values.get(cn_f), cname) {
+        if text_is(values.get(cn_f), cname) {
             if let Some(Value::Text(t)) = values.get(tr_f) {
                 let t = t.trim_end().to_string();
                 if !names.contains(&t) {
@@ -5886,7 +5886,7 @@ fn table_pk_referenced_by_fk(file: &crate::Image, page_size: usize, table: &str)
     // this table's PRIMARY KEY / UNIQUE constraint names
     let mut uniques: Vec<String> = Vec::new();
     walk_rows(file, page_size, crel, cdescs, |v| {
-        if text_eq(v.get(rn_f), table) {
+        if text_is(v.get(rn_f), table) {
             let ct = match v.get(ct_f) { Some(Value::Text(t)) => t.trim_end().to_string(), _ => String::new() };
             if ct == "PRIMARY KEY" || ct == "UNIQUE" {
                 if let Some(Value::Text(cn)) = v.get(cn_f) {
@@ -5901,7 +5901,7 @@ fn table_pk_referenced_by_fk(file: &crate::Image, page_size: usize, table: &str)
         if let Some(fk) = foreign_key_referencing(file, page_size, uq) {
             let mut on_other = false;
             walk_rows(file, page_size, crel, cdescs, |v| {
-                if text_eq(v.get(cn_f), &fk) && !text_eq(v.get(rn_f), table) {
+                if text_is(v.get(cn_f), &fk) && !text_is(v.get(rn_f), table) {
                     on_other = true;
                 }
             });
@@ -5923,7 +5923,7 @@ fn procedure_dependents(file: &crate::Image, page_size: usize, table: &str) -> V
     let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
     let (Some(dn_f), Some(dt_f), Some(don_f)) = (fid("RDB$DEPENDENT_NAME"), fid("RDB$DEPENDENT_TYPE"), fid("RDB$DEPENDED_ON_NAME")) else { return procs };
     walk_rows(file, page_size, drel, ddescs, |v| {
-        if text_eq(v.get(don_f), table) && matches!(v.get(dt_f), Some(Value::Int(5))) {
+        if text_is(v.get(don_f), table) && matches!(v.get(dt_f), Some(Value::Int(5))) {
             if let Some(Value::Text(t)) = v.get(dn_f) {
                 let n = t.trim_end().to_string();
                 if !procs.iter().any(|x| x.eq_ignore_ascii_case(&n)) {
@@ -5946,7 +5946,7 @@ fn foreign_key_referencing(file: &crate::Image, page_size: usize, cname: &str) -
     let (cn_f, uq_f) = (fid("RDB$CONSTRAINT_NAME")?, fid("RDB$CONST_NAME_UQ")?);
     let mut found = None;
     walk_rows(file, page_size, rel, descs, |values| {
-        if text_eq(values.get(uq_f), cname) {
+        if text_is(values.get(uq_f), cname) {
             if let Some(Value::Text(t)) = values.get(cn_f) {
                 found = Some(t.trim_end().to_string());
             }
@@ -5975,9 +5975,9 @@ fn deferred_drop_index(
     let name_fid = sys_fid(file, page_size, "RDB$INDICES", "RDB$INDEX_NAME")?;
     let id_fid = sys_fid(file, page_size, "RDB$INDICES", "RDB$INDEX_ID")?;
     let inactive_fid = sys_fid(file, page_size, "RDB$INDICES", "RDB$INDEX_INACTIVE")?;
-    let want = index_name.trim().to_ascii_uppercase();
+    let want = index_name.trim().to_string();
     let (page, slot) = find_sys_row_slot(file, page_size, "RDB$INDICES", 4, |vals| {
-        text_eq(vals.get(name_fid), &want)
+        text_is(vals.get(name_fid), &want)
     })
     .ok_or_else(|| format!("index {} not found", index_name))?;
     let mut image = {
@@ -6021,7 +6021,7 @@ fn deferred_drop_index(
     maintain_indexes(file, page_size, 4, recno, &values, &ix_descs)?;
     let seg_fid = sys_fid(file, page_size, "RDB$INDEX_SEGMENTS", "RDB$INDEX_NAME")?;
     delete_catalog_rows(file, page_size, "RDB$INDEX_SEGMENTS", |v| {
-        text_eq(v.get(seg_fid), &want)
+        text_is(v.get(seg_fid), &want)
     })?;
     // the index-root slot: irt_drop, flags cleared, root page kept
     let irt_page = file
@@ -6075,7 +6075,7 @@ fn column_is_not_null(file: &crate::Image, page_size: usize, table: &str, col_up
     };
     let mut not_null = false;
     walk_rows(file, page_size, rel, descs, |values| {
-        if text_eq(values.get(rn_f), table) && text_eq(values.get(fn_f), col_up) {
+        if text_is(values.get(rn_f), table) && text_is(values.get(fn_f), col_up) {
             not_null = int_eq(values.get(nf_f), 1);
         }
     });
@@ -6324,7 +6324,7 @@ fn update_relation_runtime(file: &mut crate::Image, page_size: usize, table: &st
         page_size,
         "RDB$RELATIONS",
         6,
-        move |v| text_eq(v.get(name_fid), &nm),
+        move |v| text_is(v.get(name_fid), &nm),
         &[("RDB$RUNTIME", SysVal::B(blob_id_bytes(6, runtime)))],
     )
 }
@@ -6387,7 +6387,7 @@ fn write_foreign_key_full(
     if synth_triggers
         && (fk.on_update != RefAction::Restrict || fk.on_delete != RefAction::Restrict)
     {
-        let parent = fk.ref_table.trim().to_ascii_uppercase();
+        let parent = fk.ref_table.trim().to_string();
         let pk_cols = if fk.ref_columns.is_empty() {
             index_segment_columns(file, page_size, &partner_index)?
         } else {
@@ -6426,7 +6426,7 @@ pub fn alter_table_add_foreign_key(
     if rel < 128 {
         return Err("system relations are read-only".into());
     }
-    let name = table.trim().to_ascii_uppercase();
+    let name = table.trim().to_string();
     let fk_name = if fk.name.is_empty() {
         let integ = next_numeric_suffix(
             file, page_size, "RDB$RELATION_CONSTRAINTS", "RDB$CONSTRAINT_NAME", "INTEG_",
@@ -6456,7 +6456,7 @@ pub fn alter_table_add_foreign_key_carried(
     if rel < 128 {
         return Err("system relations are read-only".into());
     }
-    let name = table.trim().to_ascii_uppercase();
+    let name = table.trim().to_string();
     let fk_name = if fk.name.is_empty() {
         let integ = next_numeric_suffix(
             file, page_size, "RDB$RELATION_CONSTRAINTS", "RDB$CONSTRAINT_NAME", "INTEG_",
@@ -6511,7 +6511,7 @@ fn find_partner_key(
         fid("RDB$RELATION_NAME")?,
         fid("RDB$INDEX_NAME")?,
     );
-    let want = ref_table.trim().to_ascii_uppercase();
+    let want = ref_table.trim().to_string();
     // every PRIMARY KEY / UNIQUE constraint of the referenced table,
     // primaries first (they win when both would fit)
     let mut candidates: Vec<(bool, String, String)> = Vec::new();
@@ -6520,7 +6520,7 @@ fn find_partner_key(
             Some(Value::Text(t)) => Some(t.trim_end().to_string()),
             _ => None,
         };
-        if txt(rn_f).as_deref().map(|s| s.eq_ignore_ascii_case(&want)) != Some(true) {
+        if txt(rn_f).as_deref() != Some(want.as_str()) {
             return;
         }
         let primary = match txt(ct_f).as_deref() {
@@ -6545,7 +6545,7 @@ fn find_partner_key(
                 && segs
                     .iter()
                     .zip(ref_columns)
-                    .all(|(a, b)| a.eq_ignore_ascii_case(b))
+                    .all(|(a, b)| a == b)
         })
         .map(|(_, cn, ix)| (cn, ix))
 }
@@ -6572,7 +6572,7 @@ fn index_segment_names(file: &crate::Image, page_size: usize, index_name: &str) 
     };
     let mut segs: Vec<(i64, String)> = Vec::new();
     walk_rows(file, page_size, rel, descs, |values| {
-        if !text_eq(values.get(ix_f), index_name) {
+        if !text_is(values.get(ix_f), index_name) {
             return;
         }
         let pos = match values.get(pos_f) {
@@ -6677,7 +6677,7 @@ fn index_name_taken(file: &crate::Image, page_size: usize, index_name: &str) -> 
     let mut taken = false;
     walk_rows(file, page_size, irel, descs, |values| {
         if let Some(Value::Text(t)) = values.get(name_fid) {
-            if t.trim_end().eq_ignore_ascii_case(index_name) {
+            if t.trim_end() == index_name {
                 taken = true;
             }
         }
@@ -6728,10 +6728,12 @@ pub fn create_index(
 
     // segments: (field id, itype, scale) in key order
     let mut segs: Vec<(u16, u16, i8)> = Vec::new();
+    // a column name arrives CANONICAL (a quoted one exact, a bare one
+    // folded), so the match is exact - `"a"` beside `A` keys `a`
     for n in col_names {
         let rc = columns
             .iter()
-            .find(|c| c.name.eq_ignore_ascii_case(n))
+            .find(|c| c.name == *n)
             .ok_or_else(|| format!("unknown column {}", n))?;
         let d = descs
             .get(rc.field_id as usize)
@@ -6768,7 +6770,7 @@ pub fn create_index(
     // rows are legal there (DPM_scan_pages CORRUPTs on anything else,
     // engine-error 257 caught live); B-tree pages are reachable only
     // through the relation's index root slots
-    let table_upper = table.to_ascii_uppercase();
+    let table_upper = table.to_string();
     let mut ivals: Vec<(&str, SysVal<'_>)> = vec![
         ("RDB$INDEX_NAME", SysVal::S(index_name)),
         ("RDB$RELATION_NAME", SysVal::S(&table_upper)),
@@ -6796,10 +6798,10 @@ pub fn create_index(
     }
     sys_row_by_name(file, page_size, "RDB$INDICES", &ivals)?;
     for (pos, n) in col_names.iter().enumerate() {
-        let upper = n.to_ascii_uppercase();
+        // the segment names the column's EXACT catalog spelling
         sys_row_by_name(file, page_size, "RDB$INDEX_SEGMENTS", &[
             ("RDB$INDEX_NAME", SysVal::S(index_name)),
-            ("RDB$FIELD_NAME", SysVal::S(&upper)),
+            ("RDB$FIELD_NAME", SysVal::S(n)),
             ("RDB$FIELD_POSITION", SysVal::I(pos as i64)),
             ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
         ])?;
@@ -6862,7 +6864,7 @@ pub fn create_expression_index(
     let blr_blob = dml::insert_blob(file, page_size, irel, &[expr_blr.to_vec()], 2)?;
     let src_blob =
         dml::insert_blob_cs(file, page_size, irel, &[expr_source.as_bytes().to_vec()], 1, 4)?;
-    let table_upper = table.to_ascii_uppercase();
+    let table_upper = table.to_string();
     sys_row_by_name(file, page_size, "RDB$INDICES", &[
         ("RDB$INDEX_NAME", SysVal::S(index_name)),
         ("RDB$RELATION_NAME", SysVal::S(&table_upper)),
@@ -7145,6 +7147,12 @@ fn sys_fid(file: &crate::Image, page_size: usize, rel_name: &str, col: &str) -> 
 fn text_eq(v: Option<&Value>, want: &str) -> bool {
     matches!(v, Some(Value::Text(t)) if t.trim_end().eq_ignore_ascii_case(want))
 }
+
+/// [text_eq] EXACT - for a relation, column or index name, which arrives
+/// canonical (the catalog's own spelling: `"tq"` beside TQ are two rows)
+fn text_is(v: Option<&Value>, want: &str) -> bool {
+    matches!(v, Some(Value::Text(t)) if t.trim_end() == want)
+}
 fn int_eq(v: Option<&Value>, want: i64) -> bool {
     matches!(v, Some(Value::Int(i)) if *i == want)
 }
@@ -7159,7 +7167,7 @@ fn int_eq(v: Option<&Value>, want: i64) -> bool {
 /// index root, every B-tree bucket, level-1 blob pages) is released
 /// back to the PIP.
 pub fn drop_table(file: &mut crate::Image, page_size: usize, name: &str) -> Result<(), String> {
-    let name = name.trim().to_ascii_uppercase();
+    let name = name.trim().to_string();
     let rel = crate::resolve_relation(file, page_size, &name)
         .ok_or_else(|| format!("table {} not found", name))?;
     if rel < 128 {
@@ -7190,10 +7198,10 @@ pub fn drop_table(file: &mut crate::Image, page_size: usize, name: &str) -> Resu
         let vname_f = sys_fid(file, page_size, "RDB$VIEW_RELATIONS", "RDB$VIEW_NAME")?;
         let vreln_f = sys_fid(file, page_size, "RDB$VIEW_RELATIONS", "RDB$RELATION_NAME")?;
         walk_rows(file, page_size, vrel, vdescs, |v| {
-            if text_eq(v.get(vreln_f), &name) {
+            if text_is(v.get(vreln_f), &name) {
                 if let Some(Value::Text(t)) = v.get(vname_f) {
                     let vn = t.trim_end().to_string();
-                    if !views.iter().any(|x| x.eq_ignore_ascii_case(&vn)) {
+                    if !views.iter().any(|x| *x == vn) {
                         views.push(vn);
                     }
                 }
@@ -7221,7 +7229,7 @@ pub fn drop_table(file: &mut crate::Image, page_size: usize, name: &str) -> Resu
         let name_fid = sys_fid(file, page_size, "RDB$INDICES", "RDB$INDEX_NAME")?;
         let rel_fid = sys_fid(file, page_size, "RDB$INDICES", "RDB$RELATION_NAME")?;
         walk_rows(file, page_size, irel, descs, |values| {
-            if text_eq(values.get(rel_fid), &name) {
+            if text_is(values.get(rel_fid), &name) {
                 if let Some(Value::Text(t)) = values.get(name_fid) {
                     index_names.push(t.trim_end().to_string());
                 }
@@ -7238,7 +7246,7 @@ pub fn drop_table(file: &mut crate::Image, page_size: usize, name: &str) -> Resu
         let name_fid = sys_fid(file, page_size, "RDB$RELATION_CONSTRAINTS", "RDB$CONSTRAINT_NAME")?;
         let rel_fid = sys_fid(file, page_size, "RDB$RELATION_CONSTRAINTS", "RDB$RELATION_NAME")?;
         walk_rows(file, page_size, crel, descs, |values| {
-            if text_eq(values.get(rel_fid), &name) {
+            if text_is(values.get(rel_fid), &name) {
                 if let Some(Value::Text(t)) = values.get(name_fid) {
                     constraint_names.push(t.trim_end().to_string());
                 }
@@ -7253,7 +7261,7 @@ pub fn drop_table(file: &mut crate::Image, page_size: usize, name: &str) -> Resu
         let src_fid = sys_fid(file, page_size, "RDB$RELATION_FIELDS", "RDB$FIELD_SOURCE")?;
         let rel_fid = sys_fid(file, page_size, "RDB$RELATION_FIELDS", "RDB$RELATION_NAME")?;
         walk_rows(file, page_size, 5, descs, |values| {
-            if text_eq(values.get(rel_fid), &name) {
+            if text_is(values.get(rel_fid), &name) {
                 if let Some(Value::Text(t)) = values.get(src_fid) {
                     let t = t.trim_end();
                     // only auto-domains die with the table
@@ -7277,7 +7285,7 @@ pub fn drop_table(file: &mut crate::Image, page_size: usize, name: &str) -> Resu
         let rel_fid = sys_fid(file, page_size, "RDB$RELATIONS", "RDB$RELATION_NAME")?;
         let mut class = None;
         walk_rows(file, page_size, 6, descs, |values| {
-            if text_eq(values.get(rel_fid), &name) {
+            if text_is(values.get(rel_fid), &name) {
                 if let Some(Value::Text(t)) = values.get(cls_fid) {
                     class = Some(t.trim_end().to_string());
                 }
@@ -7289,7 +7297,7 @@ pub fn drop_table(file: &mut crate::Image, page_size: usize, name: &str) -> Resu
     // catalog rows -> deleted stubs (version chains the engine sweeps)
     let idx_pred = |names: Vec<String>, fid: usize| {
         move |values: &[Value]| {
-            names.iter().any(|n| text_eq(values.get(fid), n))
+            names.iter().any(|n| text_is(values.get(fid), n))
         }
     };
     {
@@ -7302,7 +7310,7 @@ pub fn drop_table(file: &mut crate::Image, page_size: usize, name: &str) -> Resu
         let fid = sys_fid(file, page_size, "RDB$INDICES", "RDB$RELATION_NAME")?;
         let n = name2.clone();
         delete_catalog_rows(file, page_size, "RDB$INDICES",
-            move |values| text_eq(values.get(fid), &n))?;
+            move |values| text_is(values.get(fid), &n))?;
     }
     {
         let fid = sys_fid(file, page_size, "RDB$CHECK_CONSTRAINTS", "RDB$CONSTRAINT_NAME")?;
@@ -7313,13 +7321,13 @@ pub fn drop_table(file: &mut crate::Image, page_size: usize, name: &str) -> Resu
         let fid = sys_fid(file, page_size, "RDB$RELATION_CONSTRAINTS", "RDB$RELATION_NAME")?;
         let n = name2.clone();
         delete_catalog_rows(file, page_size, "RDB$RELATION_CONSTRAINTS",
-            move |values| text_eq(values.get(fid), &n))?;
+            move |values| text_is(values.get(fid), &n))?;
     }
     {
         let fid = sys_fid(file, page_size, "RDB$RELATION_FIELDS", "RDB$RELATION_NAME")?;
         let n = name2.clone();
         delete_catalog_rows(file, page_size, "RDB$RELATION_FIELDS",
-            move |values| text_eq(values.get(fid), &n))?;
+            move |values| text_is(values.get(fid), &n))?;
     }
     {
         let fid = sys_fid(file, page_size, "RDB$FIELDS", "RDB$FIELD_NAME")?;
@@ -7335,7 +7343,7 @@ pub fn drop_table(file: &mut crate::Image, page_size: usize, name: &str) -> Resu
         let fid = sys_fid(file, page_size, "RDB$RELATIONS", "RDB$RELATION_NAME")?;
         let n = name2.clone();
         delete_catalog_rows(file, page_size, "RDB$RELATIONS",
-            move |values| text_eq(values.get(fid), &n))?;
+            move |values| text_is(values.get(fid), &n))?;
     }
     // the security catalog: the relation's class row and every privilege
     // granted ON the relation (object type 0 - a sequence of the same
@@ -7350,7 +7358,7 @@ pub fn drop_table(file: &mut crate::Image, page_size: usize, name: &str) -> Resu
         let obj_f = sys_fid(file, page_size, "RDB$USER_PRIVILEGES", "RDB$OBJECT_TYPE")?;
         let n = name2.clone();
         delete_catalog_rows(file, page_size, "RDB$USER_PRIVILEGES",
-            move |values| text_eq(values.get(rel_f), &n) && int_eq(values.get(obj_f), 0))?;
+            move |values| text_is(values.get(rel_f), &n) && int_eq(values.get(obj_f), 0))?;
     }
 
     // the storage: released NOW for a settled drop, at COMMIT under a
@@ -7451,7 +7459,7 @@ pub(crate) fn release_relation_storage(file: &mut crate::Image, page_size: usize
 /// DROP fails at once, no wait, even under WAIT. Read WIDE: every
 /// active transaction's version is exactly what is looked for.
 pub fn relation_head_owner(file: &crate::Image, page_size: usize, name: &str) -> Option<(u64, u16)> {
-    let want = name.trim().trim_matches('"').to_ascii_uppercase();
+    let want = name.trim().to_string();
     let formats = system_relation_formats(file, page_size, "RDB$RELATIONS")?;
     let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
     let cols = relation_columns(file, page_size, "RDB$RELATIONS");
@@ -7481,7 +7489,7 @@ pub fn relation_head_owner(file: &crate::Image, page_size: usize, name: &str) ->
             };
             let Some(image) = image else { continue };
             let values = decode_record(&image, descs);
-            if text_eq(values.get(name_fid), &want) {
+            if text_is(values.get(name_fid), &want) {
                 let rel = match values.get(id_fid) {
                     Some(Value::Int(i)) => *i as u16,
                     _ => 0,
@@ -7801,7 +7809,7 @@ fn write_index_statistics(
                 page_size,
                 "RDB$INDEX_SEGMENTS",
                 seg_rel,
-                |v| text_eq(v.get(seg_name), index_name) && int_eq(v.get(seg_pos), i as i64),
+                |v| text_is(v.get(seg_name), index_name) && int_eq(v.get(seg_pos), i as i64),
                 &[("RDB$STATISTICS", SysVal::F(*sel as f64))],
             )?;
         }
@@ -7813,7 +7821,7 @@ fn write_index_statistics(
         page_size,
         "RDB$INDICES",
         4,
-        |v| text_eq(v.get(ix_name), index_name),
+        |v| text_is(v.get(ix_name), index_name),
         &[("RDB$STATISTICS", SysVal::F(whole as f64))],
     )
 }
@@ -8152,7 +8160,7 @@ fn relation_security(
     );
     let mut found = None;
     walk_rows(file, page_size, rel, descs, |v| {
-        if found.is_none() && text_eq(v.get(name_f), table) {
+        if found.is_none() && text_is(v.get(name_f), table) {
             let sc = match v.get(sc_f) {
                 Some(Value::Text(t)) => t.trim_end().to_string(),
                 _ => return,
@@ -8324,7 +8332,7 @@ fn recompute_acls(file: &crate::Image, page_size: usize, table: &str, owner: &st
                 fid("RDB$OBJECT_TYPE"),
             ) {
                 walk_rows(file, page_size, rel, descs, |v| {
-                    if !text_eq(v.get(rn_f), table) || !int_eq(v.get(ot_f), 0) {
+                    if !text_is(v.get(rn_f), table) || !int_eq(v.get(ot_f), 0) {
                         return;
                     }
                     let user = match v.get(u_f) {
@@ -8465,7 +8473,7 @@ fn field_security_class(
     );
     let mut out = None;
     walk_rows(file, page_size, rel, descs, |v| {
-        if out.is_none() && text_eq(v.get(rn_f), table) && text_eq(v.get(fn_f), field) {
+        if out.is_none() && text_is(v.get(rn_f), table) && text_is(v.get(fn_f), field) {
             if let Some(Value::Text(t)) = v.get(sc_f) {
                 let t = t.trim_end();
                 if !t.is_empty() {
@@ -8502,7 +8510,7 @@ fn granted_field_classes(
         return out;
     };
     walk_rows(file, page_size, rel, descs, |v| {
-        if !text_eq(v.get(rn_f), table) {
+        if !text_is(v.get(rn_f), table) {
             return;
         }
         if let (Some(Value::Text(fname)), Some(Value::Text(cls))) = (v.get(fn_f), v.get(sc_f)) {
@@ -8537,7 +8545,7 @@ fn set_field_security_class(
         page_size,
         "RDB$RELATION_FIELDS",
         rel,
-        move |v| text_eq(v.get(rn_f), &t) && text_eq(v.get(fn_f), &f),
+        move |v| text_is(v.get(rn_f), &t) && text_is(v.get(fn_f), &f),
         &[("RDB$SECURITY_CLASS", value)],
     )
 }
@@ -8641,11 +8649,11 @@ fn priv_row_present(
     let letter = letter.to_string();
     let mut present = false;
     walk_rows(file, page_size, rel, descs, |v| {
-        if text_eq(v.get(rn_f), table)
+        if text_is(v.get(rn_f), table)
             && text_eq(v.get(u_f), grantee)
             && text_eq(v.get(p_f), &letter)
             && match field {
-                Some(f) => text_eq(v.get(fn_f), f),
+                Some(f) => text_is(v.get(fn_f), f),
                 None => matches!(v.get(fn_f), None | Some(Value::Null)),
             }
         {
@@ -8685,7 +8693,7 @@ pub fn grant_table(
     revoke: bool,
     option_only: bool,
 ) -> Result<(), String> {
-    let table = table.trim().trim_matches('"').to_ascii_uppercase();
+    let table = table.trim().to_string();
     let rel = crate::resolve_relation(file, page_size, &table)
         .ok_or_else(|| format!("Table \"{}\" not found", table))?;
     if rel < 128 {
@@ -8696,12 +8704,12 @@ pub fn grant_table(
     // a column grant validates its fields exist
     let field_list: Vec<String> = fields
         .iter()
-        .map(|f| f.trim().trim_matches('"').to_ascii_uppercase())
+        .map(|f| f.trim().to_string())
         .collect();
     if !field_list.is_empty() {
         let have = relation_columns(file, page_size, &table);
         for f in &field_list {
-            if !have.iter().any(|c| c.name.eq_ignore_ascii_case(f)) {
+            if !have.iter().any(|c| c.name == *f) {
                 return Err(format!("column {} does not exist in table/view \"{}\"", f, table));
             }
         }
@@ -8725,11 +8733,11 @@ pub fn grant_table(
                     let p_f = sys_fid(file, page_size, "RDB$USER_PRIVILEGES", "RDB$PRIVILEGE")?;
                     let fn_f = sys_fid(file, page_size, "RDB$USER_PRIVILEGES", "RDB$FIELD_NAME")?;
                     let matches_row = move |v: &[Value]| {
-                        text_eq(v.get(rn_f), &t)
+                        text_is(v.get(rn_f), &t)
                             && text_eq(v.get(u_f), &g)
                             && text_eq(v.get(p_f), &l)
                             && match &want_field {
-                                Some(f) => text_eq(v.get(fn_f), f),
+                                Some(f) => text_is(v.get(fn_f), f),
                                 None => matches!(v.get(fn_f), None | Some(Value::Null)),
                             }
                     };
@@ -8838,7 +8846,7 @@ fn build_object_acl(
                 fid("RDB$OBJECT_TYPE"),
             ) {
                 walk_rows(file, page_size, rel, descs, |v| {
-                    if text_eq(v.get(rn_f), name)
+                    if text_is(v.get(rn_f), name)
                         && text_eq(v.get(p_f), priv_letter)
                         && matches!(v.get(ot_f), Some(Value::Int(t)) if *t == object_type)
                     {
@@ -10496,7 +10504,7 @@ pub fn relation_external_file(
     page_size: usize,
     name: &str,
 ) -> Option<String> {
-    let want = name.trim().to_ascii_uppercase();
+    let want = name.trim().to_string();
     let rel = crate::resolve_relation(file, page_size, "RDB$RELATIONS")?;
     let formats = system_relation_formats(file, page_size, "RDB$RELATIONS")?;
     let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
@@ -10504,7 +10512,7 @@ pub fn relation_external_file(
     let ext_f = sys_fid(file, page_size, "RDB$RELATIONS", "RDB$EXTERNAL_FILE").ok()?;
     let mut found: Option<String> = None;
     walk_rows(file, page_size, rel, descs, |v| {
-        if found.is_none() && text_eq(v.get(name_f), &want) {
+        if found.is_none() && text_is(v.get(name_f), &want) {
             if let Some(Value::Text(t)) = v.get(ext_f) {
                 let t = t.trim_end();
                 if !t.is_empty() {
@@ -10524,7 +10532,7 @@ pub fn patch_relation_external_file(
     name: &str,
     path: &str,
 ) -> Result<(), String> {
-    let want = name.trim().trim_matches('"').to_ascii_uppercase();
+    let want = name.trim().to_string();
     let rel = crate::resolve_relation(file, page_size, "RDB$RELATIONS")
         .ok_or("no RDB$RELATIONS relation")?;
     let name_f = sys_fid(file, page_size, "RDB$RELATIONS", "RDB$RELATION_NAME")?;
@@ -10533,7 +10541,7 @@ pub fn patch_relation_external_file(
         page_size,
         "RDB$RELATIONS",
         rel,
-        move |v| text_eq(v.get(name_f), &want),
+        move |v| text_is(v.get(name_f), &want),
         &[("RDB$EXTERNAL_FILE", SysVal::S(path))],
     )
 }
@@ -10547,7 +10555,7 @@ pub fn patch_relation_dbkey_length(
     name: &str,
     value: i64,
 ) -> Result<(), String> {
-    let want = name.trim().trim_matches('"').to_ascii_uppercase();
+    let want = name.trim().to_string();
     let rel = crate::resolve_relation(file, page_size, "RDB$RELATIONS")
         .ok_or("no RDB$RELATIONS relation")?;
     let name_f = sys_fid(file, page_size, "RDB$RELATIONS", "RDB$RELATION_NAME")?;
@@ -10556,7 +10564,7 @@ pub fn patch_relation_dbkey_length(
         page_size,
         "RDB$RELATIONS",
         rel,
-        move |v| text_eq(v.get(name_f), &want),
+        move |v| text_is(v.get(name_f), &want),
         &[("RDB$DBKEY_LENGTH", SysVal::I(value))],
     )
 }
