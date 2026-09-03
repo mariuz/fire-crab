@@ -1,27 +1,34 @@
 #!/bin/bash
-# The fc-side DML GUARD for FK-parent action triggers (system_flag 4).
+# The fc-side DML path for FK-parent action triggers (system_flag 4),
+# ON A DATABASE THE ENGINE CREATED.
 #
 # An FK referential action (CASCADE / SET NULL / SET DEFAULT) stores an
 # AFTER UPDATE (type 4) / AFTER DELETE (type 6) system trigger on the
-# REFERENCED (parent) table. The engine fires it; this server cannot
-# execute trigger BLR - so its own DML path must refuse exactly the
-# statements that would fire one, and allow the rest:
+# REFERENCED (parent) table. This gate once asserted the STOPGAP: fire-crab
+# could not execute trigger BLR, so it REFUSED every parent statement that
+# would fire one - which made a parent row undeletable even when nothing
+# referenced it. It now PERFORMS the action instead, from the rules
+# RDB$REF_CONSTRAINTS carries (qa/serve-real-fkaction.sh measures the
+# seven action cases against the engine), so the matrix here is what the
+# engine ANSWERS, statement for statement:
 #   - INSERT into the parent never fires an action trigger - allowed;
 #   - UPDATE of a NON-key parent column never acts (the trigger's OLD<>NEW
-#     key guard is false) - allowed, and must match the engine's result;
-#   - UPDATE touching a referenced KEY column would cascade - refused;
-#   - DELETE of a parent row would cascade/SET NULL - refused;
-#   - DML on a USER-trigger table (system_flag 0) is ALLOWED now: this
+#     key guard is false) - allowed;
+#   - UPDATE touching a referenced KEY column CASCADES to the children;
+#   - DELETE of a parent row CASCADES / SETs NULL;
+#   - DML on a USER-trigger table (system_flag 0) is allowed: this
 #     server fires the triggers it can run (serve-real-trigfire.sh), and
 #     refuses only a body outside that surface.
-# The guard reads the CATALOG (trigger rows + their RDB$DEPENDENCIES key
-# columns), so it must hold on a database the ENGINE created.
+# The path reads the CATALOG (the FK partner indexes, their constraint
+# rows and their referential rules), so it must hold on a database the
+# ENGINE created - which is the whole point of this gate.
 #
 # The differential is the engine, four ways:
 #   1. the engine creates the same schema + rows on two copies; fire-crab
-#      runs the DML matrix above against one, the engine mirrors only the
-#      ALLOWED statements on the other; the tables match afterwards;
-#   2. the refused statements changed nothing (same comparison);
+#      runs the DML matrix above against one, the engine runs THE SAME
+#      statements in THE SAME ORDER on the other; the tables match
+#      afterwards - so fire-crab's cascade wrote what the engine's did;
+#   2. the children really moved (a vacuous match would pass otherwise);
 #   3. after fire-crab's writes the engine still CASCADES on that file
 #      (parent key update + delete through isql, contents match the ref);
 #   4. gbak round trip and gfix -v -full on the file fire-crab wrote.
@@ -117,28 +124,27 @@ check() { # <label> <got> <want>
     if [ "$2" = "$3" ]; then echo "OK   $1"; else
         echo "DIFF $1"; echo "     want: $3"; echo "     got:  $2"; fail=1; fi
 }
-refuse() { # <label> <got>
-    case "$2" in
-        ERR*) echo "OK   $1" ;;
-        *) echo "DIFF $1 (want refusal, got: $2)"; fail=1 ;;
-    esac
-}
-
 # --- 1. the DML matrix through fire-crab -------------------------------
 check  "parent INSERT is allowed (no action trigger fires on INSERT)" \
        "$(node_run 'INSERT INTO MASTER (ID, VAL) VALUES (4, 40)')" "OK"
 check  "parent UPDATE of a NON-key column is allowed" \
        "$(node_run 'UPDATE MASTER SET VAL = 7 WHERE ID = 2')" "OK"
-refuse "parent UPDATE touching the referenced KEY column refuses" \
-       "$(node_run 'UPDATE MASTER SET ID = 99 WHERE ID = 1')"
-refuse "parent DELETE refuses (AFTER DELETE cascade trigger)" \
-       "$(node_run 'DELETE FROM MASTER WHERE ID = 3')"
+check  "parent UPDATE touching the referenced KEY column CASCADES" \
+       "$(node_run 'UPDATE MASTER SET ID = 99 WHERE ID = 1')" "OK"
+check  "parent DELETE of a row with NO children is allowed" \
+       "$(node_run 'DELETE FROM MASTER WHERE ID = 3')" "OK"
 check  "child DELETE is allowed (no trigger on the child)" \
        "$(node_run 'DELETE FROM DETAIL WHERE CID = 20')" "OK"
-refuse "SET NULL parent key UPDATE refuses (guard is action-agnostic)" \
-       "$(node_run 'UPDATE P2 SET A = 5 WHERE A = 1')"
-refuse "SET NULL parent DELETE refuses" \
-       "$(node_run 'DELETE FROM P2 WHERE A = 1')"
+check  "SET NULL parent key UPDATE nulls the child" \
+       "$(node_run 'UPDATE P2 SET A = 5 WHERE A = 1')" "OK"
+# ...and a CHILD row put back on the moved key, so the DELETE below
+# really has an ON DELETE SET NULL to perform. Before this it read
+# `WHERE A = 1` - the key the UPDATE above had just moved to 5 - so it
+# matched NO ROW and the path it names was never run.
+check  "a child row is put back on the moved key" \
+       "$(node_run 'INSERT INTO C2 (X) VALUES (5)')" "OK"
+check  "SET NULL parent DELETE nulls that child" \
+       "$(node_run 'DELETE FROM P2 WHERE A = 5')" "OK"
 # a USER trigger no longer refuses the statement: this server FIRES the
 # ones it can run (serve-real-trigfire.sh), and TD's AFTER DELETE body -
 # a variable assignment over OLD - is one of them
@@ -149,10 +155,17 @@ check  "UPDATE on a user-trigger table is allowed (no UPDATE trigger there)" \
 kill $srv 2>/dev/null; wait $srv 2>/dev/null
 
 # --- 2. the engine mirrors the ALLOWED statements on the ref -----------
+# ...IN THE SAME ORDER fire-crab ran them: a cascade writes rows, and a
+# statement that follows one reads what it wrote
 "$ISQL" -q -b -user "$U" -pas "$P" "$REF" >/dev/null 2>&1 <<'SQL'
 INSERT INTO MASTER (ID, VAL) VALUES (4, 40);
 UPDATE MASTER SET VAL = 7 WHERE ID = 2;
+UPDATE MASTER SET ID = 99 WHERE ID = 1;
+DELETE FROM MASTER WHERE ID = 3;
 DELETE FROM DETAIL WHERE CID = 20;
+UPDATE P2 SET A = 5 WHERE A = 1;
+INSERT INTO C2 (X) VALUES (5);
+DELETE FROM P2 WHERE A = 5;
 DELETE FROM TD WHERE ID = 1;
 UPDATE TD SET B = 9 WHERE ID = 2;
 COMMIT;
@@ -167,13 +180,22 @@ SELECT 'C|'||COALESCE(X,-1) FROM C2 ORDER BY 1;
 SELECT 'T|'||ID||'|'||B FROM TD ORDER BY ID;
 SQL
 }
-check "allowed writes match the engine; refused ones changed nothing" \
+check "fire-crab's writes - the cascades among them - match the engine's" \
       "$(dump "$WORK")" "$(dump "$REF")"
+# ...and NOT vacuously: the ON UPDATE CASCADE really moved both children
+# to the new key, and the ON UPDATE SET NULL really nulled its child
+case "$(dump "$WORK")" in
+    *"D|10|99"*"D|11|99"*"C|-1"*)
+        echo "OK   fc's own cascade ran (children at 99, the SET NULL child null)" ;;
+    *) echo "DIFF fc's own cascade did not run"; echo "     $(dump "$WORK")"; fail=1 ;;
+esac
 
 # --- 3. the engine still CASCADES on the file fire-crab wrote ----------
+# the rows fire-crab left: MASTER 2, 4, 99 with DETAIL 10 and 11 at 99.
+# Moving 99 again is what the ENGINE must cascade, out of fire-crab's file.
 for f in "$WORK" "$REF"; do
     "$ISQL" -q -b -user "$U" -pas "$P" "$f" >/dev/null 2>&1 <<'SQL'
-UPDATE MASTER SET ID = 99 WHERE ID = 1;
+UPDATE MASTER SET ID = 77 WHERE ID = 99;
 DELETE FROM MASTER WHERE ID = 2;
 COMMIT;
 SQL
@@ -181,8 +203,8 @@ done
 check "engine cascade on fc's file: key update moved children, delete removed one" \
       "$(dump "$WORK")" "$(dump "$REF")"
 case "$(dump "$WORK")" in
-    *"D|10|99"*"D|11|99"*)
-        echo "OK   the cascade really ran (children follow the new key 99)" ;;
+    *"D|10|77"*"D|11|77"*)
+        echo "OK   the cascade really ran (children follow the new key 77)" ;;
     *) echo "DIFF the cascade comparison was vacuous"; echo "     $(dump "$WORK")"; fail=1 ;;
 esac
 

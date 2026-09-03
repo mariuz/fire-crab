@@ -587,6 +587,26 @@ pub fn write_backup_verbose(
             // binary one's say 9=0, and the scale is meaningless for a
             // quad. att 12 is the segment length (the engine snapshots
             // its default 80).
+            //
+            // RECORDED, NOT FIXED (2026-09-03): att 9 is in fact
+            // RDB$FIELD_SUB_TYPE for EVERY type and att 11 is
+            // RDB$FIELD_SCALE - the blob half of the reading above is
+            // right for the wrong reason. Parsed out of the ENGINE's own
+            // .fbk for a nine-column table: `DECIMAL(9,3)` writes
+            // `(9,2) (11,-3) (44,9)`, `NUMERIC(4,1)` writes
+            // `(9,1) (11,-1) (44,4)`, `BLOB SUB_TYPE 1` writes
+            // `(9,1) (11,0)`, and INTEGER/CHAR/VARCHAR all write
+            // `(9,0) (11,0)`. So every scaled column this writer emits
+            // restores with the scale LOST: measured, a `NUMERIC(9,2)`
+            // holding `700.00` comes back out of a REAL `gbak -c` as an
+            // INTEGER holding `70000`. Writing 9/11/44 correctly needs
+            // the NUMERIC-vs-DECIMAL marker and the declared PRECISION,
+            // and the ODS descriptor carries neither - it is a catalog
+            // read this writer does not do, plus the matching change in
+            // [read_backup] and in the restore's column builder. It is
+            // recorded in docs/roadmap.md with this measurement, and it
+            // is INDEPENDENT of the record format: it is wrong on a
+            // database that was never ALTERed at all.
             let att9 = if c.desc.dtype == dtype::BLOB {
                 c.desc.sub_type as i32
             } else {
@@ -744,6 +764,8 @@ pub fn write_backup_verbose(
         }
         r.end();
         for c in cols.iter() {
+            // att 9 / att 11 - see the global-field record above, and
+            // the recorded defect there
             let att9 = if c.desc.dtype == dtype::BLOB {
                 c.desc.sub_type as i32
             } else {
@@ -1233,6 +1255,11 @@ pub fn write_backup_verbose(
             r.end();
         }
         let descs: Vec<Descriptor> = cols.iter().map(|c| c.desc.clone()).collect();
+        // every format the relation has ever had, and which of them is
+        // the newest - a record written under an older one is re-laid
+        // into `descs` before its bytes are read ([relay_image])
+        let old_formats = fire_crab_ods::relation_formats(image, page_size, *id);
+        let newest_format_no = old_formats.iter().map(|(n, _)| *n).max().unwrap_or(0);
         let rows = match tips.as_ref() {
             // THE LIMBO LAW RIDES THE BACKUP TOO: the engine's gbak
             // dies on "record from transaction N is stuck in limbo"
@@ -1250,8 +1277,46 @@ pub fn write_backup_verbose(
         // the null bitmap sits at the front of the record image
         let nulls_at = 0usize;
         let _ = flag_bytes(cols.len());
-        for row in &rows {
-            let xdr = xdr_row(&row.image, cols, nulls_at)
+        // A RECORD OLDER THAN ITS RELATION IS RE-LAID FIRST. `cols`
+        // describes the NEWEST format; a record written before an
+        // `ALTER ... TYPE` carries its own offsets, widths and SCALE, so
+        // reading its bytes at these offsets writes a wrong value into
+        // the file the client will restore from. Measured 2026-09-03:
+        // an `INTEGER` -> `BIGINT` ALTER made the two pre-ALTER rows
+        // restore as `0`, and an `INTEGER` -> `NUMERIC(9,2)` one made
+        // them restore as their raw mantissas. [relay_image] converts
+        // them, and answers `None` for a shape it cannot carry - which
+        // REFUSES the backup, the same fail-closed law the rest of this
+        // surface follows, rather than writing the wrong number.
+        let relaid: Vec<Vec<u8>> = rows
+            .iter()
+            .map(|row| {
+                if row.format == newest_format_no {
+                    return Ok(row.image.clone());
+                }
+                let old = old_formats
+                    .iter()
+                    .find(|(n, _)| *n == row.format)
+                    .map(|(_, d)| d.as_slice())
+                    .ok_or_else(|| {
+                        Refused(format!(
+                            "relation {}: a record in format {}, which the file does not describe",
+                            name, row.format
+                        ))
+                    })?;
+                fire_crab_ods::format::relay_image(&row.image, old, &descs).ok_or_else(|| {
+                    Refused(format!(
+                        "relation {}: a record in the older format {} carries a field \
+                         this backup cannot re-lay into the current one - a column ADDED \
+                         after it was written (whose value lives in the format's DEFAULT \
+                         section), or a type change outside the exact-numeric family",
+                        name, row.format
+                    ))
+                })
+            })
+            .collect::<Result<_, Refused>>()?;
+        for img in relaid.iter() {
+            let xdr = xdr_row(img, cols, nulls_at)
                 .ok_or_else(|| Refused(format!("relation {}: a row failed to encode", name)))?;
             Rec::new(&mut out, rec::DATA)
                 .int(1, xdr.len() as i32) // att_data_length
@@ -1268,17 +1333,16 @@ pub fn write_backup_verbose(
                 if c.desc.dtype != dtype::BLOB {
                     continue;
                 }
-                let is_null = row
-                    .image
+                let is_null = img
                     .get(nulls_at + c.bitmap_bit / 8)
                     .is_some_and(|b| b & (1 << (c.bitmap_bit % 8)) != 0);
                 let off = c.desc.offset as usize;
-                if is_null || row.image.len() < off + 8 {
+                if is_null || img.len() < off + 8 {
                     continue;
                 }
-                let rel_word = u16::from_le_bytes([row.image[off], row.image[off + 1]]);
-                let recno = ((row.image[off + 3] as u64) << 32)
-                    | u32::from_le_bytes(row.image[off + 4..off + 8].try_into().unwrap()) as u64;
+                let rel_word = u16::from_le_bytes([img[off], img[off + 1]]);
+                let recno = ((img[off + 3] as u64) << 32)
+                    | u32::from_le_bytes(img[off + 4..off + 8].try_into().unwrap()) as u64;
                 let blob = fire_crab_blb::read_blob(image, page_size, rel_word, recno)
                     .map_err(|e| {
                         Refused(format!("relation {}: blob {}:{} unreadable: {}", name, rel_word, recno, e))
@@ -4679,6 +4743,12 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                         .ok_or_else(|| Refused("a field with no name".into()))?,
                     field_type: ftype,
                     length: att(&atts, 10).map(|a| a.int() as u16).unwrap_or(0),
+                    // RECORDED, NOT FIXED: this reads the scale out of
+                    // att 9, which on an ENGINE-written file is
+                    // RDB$FIELD_SUB_TYPE - a `NUMERIC(9,2)` column reads
+                    // back as scale 1. The writer above has the mirror of
+                    // the same confusion, and the two are consistent with
+                    // each other; see that comment for the measurement.
                     scale: if ftype == 261 {
                         0
                     } else {

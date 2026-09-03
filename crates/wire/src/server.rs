@@ -18,6 +18,7 @@
 use crate::crypto::Rc4;
 use crate::srp::SrpVerifier;
 use fire_crab_ods::data::DataPage;
+use fire_crab_ods::ddl::RefAction;
 use fire_crab_ods::format::{decode_record, dtype, Descriptor, Value};
 use fire_crab_ods::{
     relation_columns, relation_data_pages, relation_formats, resolve_relation, RelationColumn,
@@ -1431,6 +1432,11 @@ fn respond_kicked(s: &mut TcpStream, enc: &mut Option<Rc4>) -> std::io::Result<(
 /// isc_dsql_error - the generic "Dynamic SQL Error" the server answers
 /// for statements it cannot honour rather than answering them wrong.
 const GDS_DSQL_ERROR: i32 = 335544569;
+
+/// `isc_req_max_clones_exceeded` - "Too many concurrent executions of
+/// the same request", SQLSTATE 54001. The engine's own refusal when a
+/// referential action recurses past [MAX_FK_ACTION_DEPTH] levels.
+const GDS_REQ_MAX_CLONES: i32 = 335544663;
 
 /// isc_deadlock - what the engine posts when two transactions wait on
 /// each other and its scan denies one of them (iberror: 335544336, the
@@ -11656,9 +11662,15 @@ fn side_filter(filter: &Option<Predicate>, win: std::ops::Range<usize>) -> Optio
 
 /// Compare two exact-numeric values: decompose via [numeric_parts] and
 /// align the scales in i128, saturating on the (astronomically
-/// unlikely) overflow - the same alignment [value_cmp] applies within
-/// one shape, here across Int/Scaled/Int128. None when either side is
-/// not exact-numeric (the comparison is then UNKNOWN).
+/// unlikely) overflow. `None` when either side is not exact-numeric
+/// (the comparison is then UNKNOWN).
+///
+/// THIS IS THE ONE EXACT-NUMERIC ALIGNMENT IN THE SERVER. [value_cmp]
+/// calls it for every pair it cannot answer with an equal-scale fast
+/// path - the cross-format and the MIXED-kind pairs alike - so a
+/// consumer that reaches the comparison through either function gets
+/// the same answer. It used to be two implementations, and [value_cmp]
+/// had no mixed-kind arm at all.
 fn num_cmp(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
     let (ra, sa) = numeric_parts(a)?;
     let (rb, sb) = numeric_parts(b)?;
@@ -12734,7 +12746,10 @@ fn computed_sources_uncached(
 /// An FK referential-action trigger (system_flag 4) lives on the PARENT
 /// table and fires on UPDATE (trigger_type 4) or DELETE (type 6) of the
 /// parent row - the guard must refuse exactly the statements that would
-/// fire a trigger this server cannot execute.
+/// fire a trigger whose EFFECT this server cannot reproduce. For a
+/// flag-4 trigger that is no longer "any of them": the referential
+/// action is performed from the rule words ([fk_actions_runnable]
+/// decides), and only a rule this server cannot perform still refuses.
 enum DmlGuard<'a> {
     Insert,
     /// UPDATE, with the SET-target column names: an AFTER UPDATE action
@@ -13079,6 +13094,23 @@ struct FkPartner {
     /// the column NAMES behind `my_fids` - this table's side of the
     /// partnership, which is what the refusal's key text prints
     my_cols: Vec<String>,
+    /// the column NAMES behind `other_fids` - the PARTNER's side, in
+    /// key order. On a parent-side partnership those are the CHILD's
+    /// foreign-key columns, which is what a referential ACTION writes
+    /// ([fk_action_stmts]); empty when the catalog no longer records
+    /// them (an [FkPartner::opaque] leftover), and then no action can
+    /// be performed from it.
+    other_cols: Vec<String>,
+    /// `RDB$REF_CONSTRAINTS`' rules for this foreign key, read back
+    /// with [RefAction::from_rule]: what the PARENT's statement must DO
+    /// to the referencing child rows. `Restrict`/`NoAction` do nothing
+    /// and leave the ordinary refusal standing; the other three are
+    /// performed ([fk_action_stmts]). A rule this server cannot read is
+    /// `Restrict` here, and the trigger COUNT check in
+    /// [check_predicates_uncached] refuses the statement rather than
+    /// let a missed action look like a restriction.
+    on_update: RefAction,
+    on_delete: RefAction,
     /// A partnership whose CHILD-SIDE KEY COLUMNS THE CATALOG NO LONGER
     /// RECORDS: an `ALTER TABLE ... DROP CONSTRAINT <fk>` leaves the
     /// child's index row behind as `RDB$TEMP_DEPEND_<rel>_<n>`, still
@@ -13117,6 +13149,22 @@ struct FkPartner {
     /// ([fk_partner_could_carry]), which over-refuses rather than miss
     /// a reference.
     opaque: bool,
+    /// THE PARENT-SIDE (referenced) INDEX this partnership hangs off -
+    /// `RDB$INDICES.RDB$FOREIGN_KEY` as this row names it.
+    ///
+    /// It is the unit the ENGINE's master-side check works in: one
+    /// dependent foreign key per referenced index, the first row of
+    /// `RDB$INDICES` in physical record order. THIS SERVER DOES NOT
+    /// SELECT ON IT - it checks every partnership, the deliberate
+    /// divergence recorded on [fk_check_parent_row] - so the field is
+    /// carried for ONE reason: reading a partnership list beside the
+    /// engine's catalog, which is what the divergence is measured
+    /// against. NOTHING reads it in the server (hence the
+    /// `#[allow(dead_code)]`) - the refusal builds its own text from
+    /// the partnership's constraint and table, not from this - and it
+    /// must never decide whether a foreign key is enforced.
+    #[allow(dead_code)]
+    parent_index: String,
 }
 
 /// The FOREIGN KEY partnerships `table` participates in, as
@@ -13140,6 +13188,58 @@ fn fk_partners(
     })
     .as_ref()
     .clone()
+}
+
+/// Every foreign key's REFERENTIAL RULES, by constraint name:
+/// `RDB$REF_CONSTRAINTS`' `RDB$UPDATE_RULE` and `RDB$DELETE_RULE` read
+/// back through [RefAction::from_rule].
+///
+/// This is the whole of what a referential ACTION is made of. The
+/// engine carries the action in a system trigger it synthesises on the
+/// PARENT, and this server writes that trigger byte for byte
+/// (qa/serve-real-fkcascade.sh) - but it does not INTERPRET it, and it
+/// does not need to: the trigger is a rendering of these two words plus
+/// the key's own column lists, all of which are already on file. Read
+/// the rule, act on the rule.
+///
+/// A row whose rule is a word this server does not know is left OUT,
+/// which reads downstream as `Restrict` - and the trigger-count check
+/// in [check_predicates_uncached] then refuses the parent's DML rather
+/// than let a missed action pass for a restriction.
+fn ref_constraint_rules(db: &Database) -> Vec<(String, RefAction, RefAction)> {
+    let Some(formats) = fire_crab_ods::sysfmt::system_relation_formats(
+        &db.bytes(),
+        db.page_size,
+        "RDB$REF_CONSTRAINTS",
+    ) else {
+        return Vec::new();
+    };
+    let Some((_, descs)) = formats.iter().max_by_key(|(n, _)| *n) else {
+        return Vec::new();
+    };
+    let cols = relation_columns(&db.bytes(), db.page_size, "RDB$REF_CONSTRAINTS");
+    let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (Some(cn_f), Some(up_f), Some(del_f), Some(rel)) = (
+        fid("RDB$CONSTRAINT_NAME"),
+        fid("RDB$UPDATE_RULE"),
+        fid("RDB$DELETE_RULE"),
+        fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, "RDB$REF_CONSTRAINTS"),
+    ) else {
+        return Vec::new();
+    };
+    let fmts = vec![(0u8, descs.clone())];
+    let mut out: Vec<(String, RefAction, RefAction)> = Vec::new();
+    for_each_record(db, rel, &fmts, usize::MAX, |values| {
+        let Some(Value::Text(cn)) = values.get(cn_f) else { return };
+        let rule = |f: usize| match values.get(f) {
+            Some(Value::Text(t)) => RefAction::from_rule(t),
+            _ => None,
+        };
+        if let (Some(u), Some(d)) = (rule(up_f), rule(del_f)) {
+            out.push((cn.trim_end().to_string(), u, d));
+        }
+    });
+    out
 }
 
 fn fk_partners_uncached(
@@ -13181,6 +13281,15 @@ fn fk_partners_uncached(
     if !rows.iter().any(|(_, _, fk, _)| fk.is_some()) {
         return Some((Vec::new(), Vec::new())); // no FK anywhere - skip the segment walk
     }
+    // ...and what each of them tells the PARENT's DML to DO
+    let rules = ref_constraint_rules(db);
+    let rules_of = |cname: &str| -> (RefAction, RefAction) {
+        rules
+            .iter()
+            .find(|(n, _, _)| n == cname)
+            .map(|(_, u, d)| (*u, *d))
+            .unwrap_or((RefAction::Restrict, RefAction::Restrict))
+    };
     // every segment row: (index name, position, column name)
     let s_formats = fire_crab_ods::sysfmt::system_relation_formats(
         &db.bytes(),
@@ -13242,7 +13351,11 @@ fn fk_partners_uncached(
             constraint: String::new(),
             child_table: String::new(),
             my_cols: Vec::new(),
+            other_cols: key_cols.to_vec(),
+            on_update: RefAction::Restrict,
+            on_delete: RefAction::Restrict,
             opaque: false,
+            parent_index: String::new(), // the caller names its own side
         })
     };
     let mut as_child = Vec::new();
@@ -13283,8 +13396,12 @@ fn fk_partners_uncached(
                 }
                 p.my_fids = my_fids;
                 p.my_cols = my_cols;
+                let (u, d) = rules_of(&cname);
+                p.on_update = u;
+                p.on_delete = d;
                 p.constraint = cname.clone();
                 p.child_table = rn.clone();
+                p.parent_index = p_ix.clone();
                 as_child.push(p);
             }
         }
@@ -13341,6 +13458,7 @@ fn fk_partners_uncached(
                         .unwrap_or_default();
                     c.my_fids = my_fids;
                     c.my_cols = my_cols;
+                    c.parent_index = p_ix.clone();
                     as_parent.push(c);
                     break 'parent;
                 }
@@ -13349,8 +13467,12 @@ fn fk_partners_uncached(
                 }
                 c.my_fids = my_fids;
                 c.my_cols = my_cols;
+                let (u, d) = rules_of(&cname);
+                c.on_update = u;
+                c.on_delete = d;
                 c.constraint = cname;
                 c.child_table = rn.clone();
+                c.parent_index = p_ix.clone();
                 as_parent.push(c);
             }
         }
@@ -13396,28 +13518,42 @@ fn index_root_key_fids(db: &Database, rel: u16, slot: u8) -> Option<Vec<usize>> 
 
 /// Does this row carry `key` IN THESE COLUMNS? The exact question every
 /// foreign-key check asks - `fids` are the partnership's other-side
-/// field ids, in key order, and a NULL component references nothing
-/// (MATCH SIMPLE, as the engine's idx.epp has it). Equality is
-/// [value_cmp], the pad-insensitive comparison the engine's own index
-/// keys use.
+/// field ids, in key order. Equality is [value_cmp], the pad-insensitive
+/// comparison the engine's own index keys use.
+///
+/// `null_matches` is which SIDE is asking, and the engine answers the
+/// two differently (measured 2026-09-03, multi-column nullable key):
+///
+/// * CHILD side, storing a row: MATCH SIMPLE - a NULL component
+///   references nothing, so a NULL never matches (`false`).
+/// * MASTER side, deleting or re-keying a parent row: the engine probes
+///   the child's INDEX with the parent's key, and a NULL is a storable
+///   index key. Parent `(NULL, 20)` with a child `(NULL, 20)` IS
+///   referenced and the DELETE is refused; parent `(10, NULL)` with a
+///   child `(NULL, NULL)` is NOT (`true`).
 ///
 /// Named because it is the whole difference between the exact test and
 /// [row_could_carry_key]: a child table's `STATUS` or `QTY` column may
 /// hold the parent key's value all day, and only the key column decides.
-fn row_carries_key_at(values: &[Value], fids: &[usize], key: &[&Value]) -> bool {
+fn row_carries_key_at(values: &[Value], fids: &[usize], key: &[&Value], null_matches: bool) -> bool {
     fids.len() == key.len()
         && fids.iter().zip(key).all(|(f, k)| {
             let v = values.get(*f).unwrap_or(&Value::Null);
-            !matches!(v, Value::Null) && value_cmp(v, k) == std::cmp::Ordering::Equal
+            match (matches!(v, Value::Null), matches!(k, Value::Null)) {
+                (true, true) => null_matches,
+                (false, false) => value_cmp(v, k) == std::cmp::Ordering::Equal,
+                _ => false,
+            }
         })
 }
 
 /// TRUE when the partner relation holds a row matching `key` on the
-/// partnership's other-side columns - all non-NULL and equal under
-/// [value_cmp], the pad-insensitive equality the join machinery uses
-/// (the engine compares partner INDEX keys, equally pad-insensitive).
-fn fk_partner_has(db: &Database, fk: &FkPartner, key: &[&Value]) -> bool {
-    let matches_key = |v: &[Value]| row_carries_key_at(v, &fk.other_fids, key);
+/// partnership's other-side columns, equal under [value_cmp], the
+/// pad-insensitive equality the join machinery uses (the engine compares
+/// partner INDEX keys, equally pad-insensitive). `null_matches` is the
+/// side asking - see [row_carries_key_at].
+fn fk_partner_has(db: &Database, fk: &FkPartner, key: &[&Value], null_matches: bool) -> bool {
+    let matches_key = |v: &[Value]| row_carries_key_at(v, &fk.other_fids, key, null_matches);
     // THE PARTNER'S OWN INDEX ANSWERS THIS. A referenced key always
     // carries a UNIQUE index - SQL requires one - and the question here
     // is an EXISTENCE test, so the index names the candidates and the
@@ -13497,7 +13633,17 @@ fn fk_partner_lookup(db: &Database, fk: &FkPartner, key: &[&Value]) -> Option<Ve
 /// whose key is fully non-NULL must reference an existing parent row
 /// (MATCH SIMPLE - a NULL component passes the check, as the engine's
 /// idx.epp does).
-fn fk_check_child_row(db: &Database, fks: &[FkPartner], row: &[Value]) -> Result<(), EvalErr> {
+///
+/// `old_row` is the row as it stood on an UPDATE and `None` on an
+/// INSERT: a partnership whose key did not MOVE is not checked at all,
+/// because the engine checks in the index maintenance and an unchanged
+/// key never touches the index. See the comment on that test.
+fn fk_check_child_row(
+    db: &Database,
+    fks: &[FkPartner],
+    row: &[Value],
+    old_row: Option<&[Value]>,
+) -> Result<(), EvalErr> {
     for fk in fks {
         let key: Vec<&Value> = fk
             .my_fids
@@ -13507,7 +13653,37 @@ fn fk_check_child_row(db: &Database, fks: &[FkPartner], row: &[Value]) -> Result
         if key.iter().any(|v| matches!(v, Value::Null)) {
             continue;
         }
-        if !fk_partner_has(db, fk, &key) {
+        // AN UPDATE THAT LEAVES THE KEY ALONE IS NOT CHECKED. The
+        // engine's child-side check lives in the INDEX maintenance
+        // (`IDX_modify`), and an UPDATE whose key compares equal never
+        // touches the index - so a row already holding a key with no
+        // parent may be rewritten with that same key and the engine
+        // says nothing. Measured 2026-09-03, and it is reachable:
+        // `B INTEGER DEFAULT 7 REFERENCES PZ ON DELETE SET DEFAULT`
+        // with a child row `B = 7`, behind a different, EMPTY
+        // partnership on the same parent index. `DELETE FROM PZ WHERE
+        // ID = 7` fires the action, which writes 7 over 7 - unchanged,
+        // unchecked - and the engine deletes the parent, leaving the
+        // child dangling at 7. The CONTRAST that pins it: the same
+        // shape with `DEFAULT 77` really moves the key and IS refused,
+        // `-Foreign key reference target does not exist ... ("B" = 77)
+        // -At trigger "PUBLIC"."CHECK_2"`.
+        //
+        // This law is the CHILD side and it stands on its own; the
+        // whole-shape answer is now a MASTER-side refusal, because this
+        // server asks the `DEFAULT 7` partnership too (the decision on
+        // [fk_check_parent_row]). It still has to be right here: the
+        // action's own write must not be refused child-side for a key
+        // that did not move, or a cascade the engine performs would
+        // fail from the inside.
+        if let Some(o) = old_row {
+            let was: Vec<&Value> =
+                fk.my_fids.iter().map(|f| o.get(*f).unwrap_or(&Value::Null)).collect();
+            if !fk_key_moved(&was, &key) {
+                continue;
+            }
+        }
+        if !fk_partner_has(db, fk, &key, false) {
             // the child-side refusal: the written row's OWN key columns
             return Err(fk_violation_err(fk, &key, true));
         }
@@ -13577,31 +13753,300 @@ fn row_could_carry_key(values: &[Value], key: &[&Value]) -> bool {
     })
 }
 
+/// THE PARTNERSHIPS THE MASTER-SIDE CHECK ASKS: **ALL OF THEM**.
+///
+/// The engine asks ONE per referenced index - the first `RDB$INDICES`
+/// row naming it, in physical record order - and this server
+/// deliberately does not reproduce that; the reason and the exact
+/// consequence are the decision written out on [fk_check_parent_row].
+///
+/// This function is one line and it earns it: it is where THIS
+/// decision lives, it is greppable, and it is unit-assertable, so the
+/// WALK cannot be narrowed again by accident. The walks it replaces
+/// each ENDED somewhere - at the first partnership whose rule acts, at
+/// the first row per referenced index - and each one shipped a parent
+/// row deleted that the engine keeps, with an orphan behind it and
+/// `gfix -v -full` calling the file clean.
+///
+/// It is NOT the only place that decides which partnerships are asked,
+/// and calling it that would hide the one that matters: [plan_update]
+/// narrows `fk_refs` and `fk_children` by the statement's SET LIST
+/// before this walk is reached (its `touched` filter), and that
+/// narrowing is what the disclosed `BEFORE UPDATE` trigger wrong write
+/// escapes through. This function decides the walk; that filter
+/// decides the list the walk is given.
+fn fk_asked_partnerships(fks: &[FkPartner]) -> std::ops::Range<usize> {
+    0..fks.len()
+}
+
+/// DID THE KEY MOVE? `IS DISTINCT FROM`, column by column: two NULLs
+/// are the SAME key, not two different ones.
+///
+/// Both sides ask it, and for the same reason - the engine checks a
+/// foreign key while maintaining an INDEX, and an UPDATE whose key
+/// compares equal never touches the index. On the MASTER side, testing
+/// a NULL component as "changed" refused every SET list that so much
+/// as NAMED a column of a partly-NULL key and took the row's other
+/// columns down with it (an ORM's whole-row
+/// `SET U1 = 10, U2 = NULL, X = 1` lost the `X = 1`). On the CHILD
+/// side it refused a parent DELETE the engine performs.
+///
+/// It is NOT [fk_action_fires]. That one is the engine's trigger guard
+/// `OLD.k <> NEW.k`, three-valued, and it asks whether the ACTION
+/// runs. The two agree on an unchanged key and part company on
+/// `(10, 20) -> (10, NULL)`: the key MOVED (the second column is
+/// distinct, so the index entry moves and this check runs) while
+/// NOTHING fires (no comparison is TRUE) - which is exactly the shape
+/// the engine refuses.
+fn fk_key_moved(old: &[&Value], new: &[&Value]) -> bool {
+    !old.iter().zip(new).all(|(o, n)| match (o, n) {
+        (Value::Null, Value::Null) => true,
+        (Value::Null, _) | (_, Value::Null) => false,
+        _ => value_cmp(o, n) == std::cmp::Ordering::Equal,
+    })
+}
+
 /// Parent-side (NO ACTION/RESTRICT) partner check: the key of a row
 /// being deleted (`new_row` None) or updated must not be referenced by
-/// any child row. An UPDATE that leaves the key equal never fires the
-/// check; a NULL key component cannot be referenced at all.
+/// any child row. An UPDATE that leaves the key alone never fires the
+/// check.
+///
+/// # DECISION: THIS SERVER CHECKS **EVERY** PARTNERSHIP. THE ENGINE CHECKS ONE PER REFERENCED INDEX.
+///
+/// This is a deliberate, measured DIVERGENCE from the engine, taken
+/// after three rounds of trying to reproduce the engine's selector.
+/// It is recorded here and in `docs/roadmap.md`, with its reason and
+/// its exact consequence.
+///
+/// ## What the engine does
+///
+/// For each REFERENCED (parent) index the engine performs its
+/// master-side check on exactly ONE dependent foreign key - the FIRST
+/// row of `RDB$INDICES`, in PHYSICAL RECORD ORDER, whose
+/// `RDB$FOREIGN_KEY` names that index. Every partnership behind it on
+/// the same index goes unchecked, and the parent row is then deleted
+/// with those children still pointing at it. Measured 2026-09-03
+/// against Firebird 6 at `127.0.0.1/3050`:
+///
+/// ```text
+/// CREATE TABLE QP (ID INTEGER NOT NULL PRIMARY KEY);
+/// CREATE TABLE Q1 (X INTEGER, B INTEGER REFERENCES QP);  -- EMPTY, physically first
+/// CREATE TABLE Q2 (X INTEGER, B INTEGER REFERENCES QP);  -- holds the key
+/// INSERT INTO QP VALUES (1);  INSERT INTO Q2 VALUES (200, 1);
+/// DELETE FROM QP WHERE ID = 1;
+///   engine:  parent rows = 0   Q2 rows = 1   Q2.B = 1    <- A DANGLING REFERENCE
+/// ```
+///
+/// `gfix -v -full` calls that file clean. Every other candidate was
+/// ruled out by its own shape: not "the first partnership whose rule
+/// ACTS" (the `Q1`/`Q2`/`Q3` shape above, with a cascading `Q3`), not
+/// by constraint or index NAME (`FZ` declared first and empty, `FA`
+/// holding), not by child RELATION ID (`R1` lowest and holding, `KR2`
+/// added first), not by child INDEX ID, and not per parent TABLE
+/// (`MP (ID PK, U UNIQUE)`: a clean partnership on the PK says nothing
+/// about the UNIQUE, and the engine refuses there).
+///
+/// ## The shape that proves the selector - and the one that does NOT
+///
+/// The shape that DECIDES between physical `RDB$INDICES` order and
+/// CREATION order is a freed catalog slot, not a `gbak` round trip:
+///
+/// ```text
+/// CREATE TABLE RP (ID INTEGER NOT NULL PRIMARY KEY);
+/// CREATE TABLE JUNK (A INTEGER);  CREATE INDEX J1 ON JUNK (A);  COMMIT;
+/// CREATE TABLE RB (X INTEGER, B INTEGER, CONSTRAINT FB FOREIGN KEY (B) REFERENCES RP);
+/// COMMIT;  DROP TABLE JUNK;  COMMIT;          -- frees an earlier RDB$INDICES slot
+/// CREATE TABLE RA (X INTEGER, B INTEGER, CONSTRAINT FA FOREIGN KEY (B) REFERENCES RP);
+/// ```
+///
+/// `FB` is created BEFORE `FA`, and the engine puts `FA`'s row into
+/// `JUNK`'s freed slot, physically FIRST. Creation order says ask
+/// `FB`; physical order says ask `FA`. Both directions measured on the
+/// engine's own file: with `RA` holding the key it REFUSES naming
+/// `FA`, and with `RB` holding the key it PERFORMS the delete and
+/// leaves `RB` dangling. Physical order, both times.
+///
+/// A PREVIOUS ROUND CLAIMED THE `gbak` FLIP WAS "the shape that
+/// decides it, and the only one that can". IT IS NOT, AND THAT CLAIM
+/// IS WITHDRAWN. A reviewer ran `gbak -c -v`, whose own log prints the
+/// order in which the restore creates the indexes - `FC, FB, FA`,
+/// IDENTICAL to the restored file's physical order. The flip separates
+/// physical order from `RDB$RELATION_CONSTRAINTS` and
+/// `RDB$REF_CONSTRAINTS` (which do not move) and from nothing else; it
+/// cannot tell physical order from creation order. The measurement is
+/// real, the conclusion drawn from it was not supported by it.
+///
+/// ## What this server does instead, and WHY
+///
+/// It checks EVERY partnership, on every referenced index, and refuses
+/// if ANY of them still holds the key. Three reasons, in order of
+/// weight:
+///
+/// 1. Reproducing the selector makes foreign-key ENFORCEMENT depend on
+///    the engine's physical catalog record PLACEMENT. The engine reuses
+///    a freed `RDB$INDICES` slot and this server appends, so whether a
+///    foreign key is enforced at all would turn on the schema's
+///    deletion history - an ordinary `DROP TABLE` of an UNRELATED
+///    table, or a `DROP CONSTRAINT` and re-`ADD`, is enough to move the
+///    answer.
+/// 2. Three rounds have chased that selector and each shipped a NEW
+///    silent wrong write - a parent row deleted that the engine keeps,
+///    an orphan behind it, and `gfix -v -full` clean.
+/// 3. What is being reproduced is referential corruption: the engine's
+///    answer in the `QP`/`Q1`/`Q2` shape above LEAVES A DANGLING CHILD
+///    ROW. A conversion that cannot express a case declines it rather
+///    than approximating it, and a refusal is enormously better than a
+///    silent wrong write.
+///
+/// ## THE EXACT CONSEQUENCE
+///
+/// This server REFUSES some parent `DELETE`s and `UPDATE`s that the
+/// engine PERFORMS - `23000`, naming the first partnership in
+/// `RDB$INDICES` row order that still holds the key. What the engine
+/// left behind is NOT one thing, and the two cases have to be kept
+/// apart, because only the first is this decision's own consequence:
+///
+/// 1. WHERE THE ENGINE'S SELECTOR IS WHAT DIFFERS - a partnership
+///    BEHIND the physically first one on the same index still holds
+///    the key - the engine performs the statement and ITS OWN FILE is
+///    left holding a dangling child row. Measured on every such shape
+///    in `qa/serve-real-fkaction.sh` sections 13 and 14, with the
+///    ENGINE reading both files back and counting the orphans in each.
+/// 2. WHERE ANOTHER PARTNERSHIP'S ACTION HAS ALREADY CLEARED THE VERY
+///    ROWS this one probes, the engine's file is CLEAN and this server
+///    refuses a statement whose engine result was correct. Measured
+///    2026-09-03: one child column carrying two foreign keys to one
+///    parent index, `W1` with no rule and `W2` `ON DELETE SET NULL`,
+///    has the engine null the column and delete the parent with
+///    `ORPH 0` in its file, while this server refuses naming `W1`; the
+///    spelling with an `ON DELETE CASCADE` sibling is the same. That
+///    is an OVER-REFUSAL, not a divergence in this decision's favour -
+///    it is [fk_action_leaves_old_key] being asked only about the
+///    CHECKED partnership's own action, it is present on `79c4720`,
+///    and `docs/roadmap.md` records it with the fix that closes it.
+///
+/// THE OTHER DIRECTION - accepting a parent `DELETE` or `UPDATE` the
+/// engine REFUSES - IS NOT RULED OUT, and the superset argument a
+/// previous round gave for ruling it out does not hold. What is true,
+/// and is all the walk itself buys, is narrower: ASKING EVERY
+/// PARTNERSHIP RATHER THAN ONE CANNOT INTRODUCE AN ACCEPTANCE, because
+/// the walk refuses whenever any partnership answers. The check is not
+/// only a set of partnerships, though, and two paths do accept where
+/// the engine refuses:
+///
+/// - A `BEFORE UPDATE` TRIGGER THAT WRITES `NEW.<key>` moves the
+///   referenced key without the statement's SET list naming it, and
+///   the parent-side partnership list is narrowed BY that SET list
+///   before this check ever runs (the `touched` filter in
+///   [plan_update], which narrows `fk_refs` and `fk_children` alike).
+///   Neither the check nor the action sees the move. Measured
+///   2026-09-03 on a no-rule partnership, `UPDATE TP SET Z = 9 WHERE
+///   ID = 1` under a trigger writing `NEW.ID = 55`:
+///   this server performs it and the ENGINE reads `ORPH 1` back out of
+///   this server's file, where the engine refuses with `ORPH 0` in its
+///   own. Byte-identical on `79c4720`, so PRE-EXISTING, and recorded
+///   in `docs/roadmap.md`.
+/// - A PARTLY-NULL KEY ON AN OPAQUE PARTNERSHIP is accepted on the
+///   last-resort path, deliberately: the wide question that path asks
+///   ("does some row hold every one of these values in ANY column?")
+///   cannot be asked about a NULL. Behaviour-identical to `79c4720`;
+///   reasoned, not run.
+///
+/// A THIRD was closed on 2026-09-03 and is why this paragraph was
+/// rewritten: [value_cmp] had no arm for two exact numerics of
+/// DIFFERENT kinds, so a child column at scale 0 against a parent key
+/// at scale 2 never matched, and the parent deleted out from under a
+/// live child. A superset of partnerships each asked a too-narrow
+/// question is not a superset of refusals - which is exactly why the
+/// argument was the wrong shape of argument, and not merely mistaken
+/// in its scope.
+///
+/// `qa/serve-real-fkaction.sh` sections 13 and 14 assert BOTH halves
+/// of every diverging shape explicitly: this server's refusal, the
+/// engine's own answer recorded beside it, and the ENGINE reading THIS
+/// server's file back to confirm no orphan.
+///
+/// # AND THE CHECK SEES WHAT THE ACTION LEAVES BEHIND
+///
+/// A partnership is not SKIPPED when it carries an action. The
+/// engine's action is an AFTER trigger on the parent, and the
+/// master-side check reads the child AFTER it has run - so a CASCADE
+/// or a SET NULL passes because there is nothing left to find, not
+/// because the check was waived. The shape that proves the difference,
+/// measured: `SC.B INTEGER DEFAULT 7 REFERENCES SP ON DELETE SET
+/// DEFAULT`, child row `B = 7`, `DELETE FROM SP WHERE ID = 7`. The
+/// action fires and writes `B = 7` - the very key being deleted - and
+/// the engine then REFUSES, `-Problematic key value is ("ID" = 7)`.
+/// "Skip an acting partner" would have deleted the parent and left the
+/// child pointing at nothing. Same on the UPDATE side
+/// (`ON UPDATE SET DEFAULT`, default `7`, `SET ID = 8 WHERE ID = 7`),
+/// and the same for a default that is NOT a literal:
+/// `B VARCHAR(31) DEFAULT CURRENT_USER` with a child row `'SYSDBA'`
+/// refuses `DELETE FROM SPU WHERE ID = 'SYSDBA'`, and
+/// `B DATE DEFAULT CURRENT_DATE` refuses the `CURRENT_DATE` row.
+/// [fk_action_leaves_old_key] is that reading; every other rule clears
+/// the key and the check then passes.
+///
+/// A partnership whose action does NOT fire ([fk_action_fires]) is
+/// checked exactly as a no-rule partnership is - `W1`: an
+/// `ON UPDATE CASCADE` child WITH rows refuses `UPDATE P SET U = NULL`
+/// naming its own constraint.
+///
+/// # A KEY IS UNREFERENCEABLE ONLY WHEN EVERY COLUMN OF IT IS NULL
+///
+/// Not "when any is": the master side probes the child's INDEX, where a
+/// NULL is a storable key, and the engine refuses accordingly -
+/// measured 2026-09-03 on `UNIQUE (U1, U2)`:
+///
+/// ```text
+/// parent (10, NULL)   child (10, NULL)     -> DELETE REFUSED
+/// parent (NULL, 20)   child (NULL, 20)     -> DELETE REFUSED
+/// parent (10, NULL)   child (NULL, NULL)   -> DELETE succeeds
+/// parent (NULL, NULL) child (NULL, NULL)   -> DELETE succeeds
+/// ```
+///
+/// The CHILD side is the other law and stays MATCH SIMPLE
+/// ([fk_check_child_row]) - which is what lets such a child row exist
+/// in the first place.
+///
+/// # AND "DID THE KEY CHANGE" IS `IS DISTINCT FROM`
+///
+/// Two NULLs are the SAME key, not two different ones. The engine
+/// touches the index only when the key really moved, so
+/// `UPDATE PE1 SET U1 = 10, U2 = NULL` on a parent already holding
+/// `(10, NULL)` performs the statement - measured, under no rule and
+/// under `ON UPDATE CASCADE` alike. Testing `n` for non-NULL here made
+/// every SET list that merely NAMES a column of a partly-NULL key
+/// refuse, and took the row's other columns down with it (an
+/// ORM's whole-row `SET U1 = 10, U2 = NULL, X = 1` lost the `X = 1`).
 fn fk_check_parent_row(
     db: &Database,
+    ctx: &SessionCtx,
     fks: &[FkPartner],
     old_row: &[Value],
     new_row: Option<&[Value]>,
 ) -> Result<(), EvalErr> {
-    for fk in fks {
+    // EVERY partnership, not one per referenced index - the decision
+    // above. A partnership behind another on the same index is asked
+    // here and shadowed on the engine.
+    for i in fk_asked_partnerships(fks) {
+        let fk = &fks[i];
         let key: Vec<&Value> = fk
             .my_fids
             .iter()
             .map(|f| old_row.get(*f).unwrap_or(&Value::Null))
             .collect();
-        if key.iter().any(|v| matches!(v, Value::Null)) {
+        if key.iter().all(|v| matches!(v, Value::Null)) {
             continue;
         }
-        if let Some(new) = new_row {
-            let unchanged = fk.my_fids.iter().zip(&key).all(|(f, k)| {
-                let n = new.get(*f).unwrap_or(&Value::Null);
-                !matches!(n, Value::Null) && value_cmp(n, k) == std::cmp::Ordering::Equal
-            });
-            if unchanged {
+        let new_key: Option<Vec<&Value>> = new_row.map(|n| {
+            fk.my_fids
+                .iter()
+                .map(|f| n.get(*f).unwrap_or(&Value::Null))
+                .collect()
+        });
+        if let Some(nk) = &new_key {
+            if !fk_key_moved(&key, nk) {
                 continue;
             }
         }
@@ -13613,18 +14058,723 @@ fn fk_check_parent_row(
         // compare, and then the widest SOUND question stands in
         // ([fk_partner_could_carry]) rather than a silent bypass.
         if fk.opaque && fk.other_fids.is_empty() {
-            if fk_partner_could_carry(db, fk, &key) {
+            // ...and the wide question cannot be asked about a NULL: no
+            // column "holds" it. A partly-NULL key keeps the older,
+            // wider acceptance here rather than a guess in either
+            // direction.
+            if key.iter().all(|v| !matches!(v, Value::Null))
+                && fk_partner_could_carry(db, fk, &key)
+            {
                 return Err(fk_violation_err(fk, &key, false));
             }
             continue;
         }
-        if fk_partner_has(db, fk, &key) {
+        if fk_partner_has(db, fk, &key, true) {
+            // Rows reference this key. The ACTION, if it fires, is the
+            // engine's AFTER trigger and has ALREADY run when the check
+            // reads the child - so what matters is whether it leaves
+            // the old key standing (only `SET DEFAULT` can).
+            if fk_rule_for(fk, new_row.is_some()).synthesises_trigger()
+                && fk_action_fires(&key, new_key.as_deref())
+                && !fk_action_leaves_old_key(db, ctx, fk, &key, new_key.as_deref())
+            {
+                continue;
+            }
             // the parent-side refusal: still the CHILD's constraint and
             // table, but the PARENT row's key columns (probed)
             return Err(fk_violation_err(fk, &key, false));
         }
     }
     Ok(())
+}
+
+/// DOES THE ACTION LEAVE ITS CHILD ROWS STILL HOLDING THE OLD KEY?
+///
+/// The engine's referential action runs BEFORE its master-side check
+/// reads the child ([fk_check_parent_row]), so an action that fires is
+/// not a waiver: it is a WRITE, and the check judges what it wrote.
+/// Four of the five rules clear the key - a DELETE CASCADE takes the
+/// row, SET NULL writes NULL, an UPDATE CASCADE writes the parent's new
+/// (different, by [fk_action_fires]) value - and the check then finds
+/// nothing. `SET DEFAULT` is the one that can write the key straight
+/// back: measured on the engine 2026-09-03,
+/// `B INTEGER DEFAULT 7 REFERENCES SP ON DELETE SET DEFAULT` with a
+/// child row `B = 7` refuses `DELETE FROM SP WHERE ID = 7` with
+/// `-Problematic key value is ("ID" = 7)`, the action having written 7
+/// over 7. The same with `ON UPDATE SET DEFAULT` and `SET ID = 8`.
+///
+/// The rows the action rewrites are EXACTLY the rows the check probes
+/// whenever the action fires: [fk_action_fires] has already ruled out a
+/// NULL component in the old key, and `child.k = <non-NULL>` and the
+/// index probe then agree on which rows those are.
+///
+/// THE DEFAULT IS EVALUATED, NOT JUST READ. [default_as_value] answers
+/// every form [default_wire_param] answers - which is exactly the set
+/// the action will actually WRITE a moment later - and the two are
+/// tied together by a test so they cannot drift. Answering `None` for
+/// everything but a literal was a SILENT WRONG WRITE, found by a
+/// reviewer: `B VARCHAR(31) DEFAULT CURRENT_USER` on a child row
+/// `'SYSDBA'` had `DELETE FROM SPU WHERE ID = 'SYSDBA'` accepted here
+/// and then written straight back by the action, leaving the child
+/// dangling where the engine refuses. `DATE DEFAULT CURRENT_DATE` and
+/// the `ON UPDATE SET DEFAULT` spelling were the same defect.
+///
+/// `CURRENT_TRANSACTION` is the ONE form still answered `None`, and
+/// there the wider acceptance is SAFE but the old justification for it
+/// was not accurate. What is true, measured 2026-09-03: its value is
+/// the id the row's own insert allocates, [default_wire_param] answers
+/// `None` for it too, and [fk_action_stmts] therefore REFUSES the
+/// whole statement a moment later rather than this comparison guessing
+/// a key - so no wrong write can come of it, and the ROWS agree with
+/// the engine's.
+///
+/// What is NOT true, and was written here as "verified": that it
+/// refuses "with the engine's own reason". It does not. Measured on
+/// `SCT.B BIGINT DEFAULT CURRENT_TRANSACTION REFERENCES SPT ON DELETE
+/// SET DEFAULT`, `DELETE FROM SPT WHERE ID = 99999`:
+///
+/// ```text
+/// this server: SQLSTATE = 42000 | Dynamic SQL Error
+/// the engine:  SQLSTATE = 23000 | violation of FOREIGN KEY constraint
+///              "INTEG_3" on table "PUBLIC"."SCT"
+///              -Foreign key reference target does not exist
+///              -Problematic key value is ("B" = 15)
+///              -At trigger "PUBLIC"."CHECK_1"
+/// ```
+///
+/// Both refuse and both files hold `NP 1 | CB 99999` afterwards.
+/// Byte-identical on `79c4720`, so the message gap is PRE-EXISTING; it
+/// is recorded in `docs/roadmap.md` as a refusal-text defect.
+fn fk_action_leaves_old_key(
+    db: &Database,
+    ctx: &SessionCtx,
+    fk: &FkPartner,
+    old_key: &[&Value],
+    new_key: Option<&[&Value]>,
+) -> bool {
+    match fk_rule_for(fk, new_key.is_some()) {
+        RefAction::SetDefault => (0..old_key.len()).all(|k| {
+            match fk_child_default(db, fk, k) {
+                Some(Some(d)) => default_as_value(&d, ctx)
+                    .map(|v| value_cmp(&v, old_key[k]) == std::cmp::Ordering::Equal)
+                    .unwrap_or(false),
+                // no default at all writes NULL, which references
+                // nothing; an unevaluatable one refuses in
+                // [fk_action_stmts]
+                _ => false,
+            }
+        }),
+        RefAction::Cascade => match new_key {
+            // ON DELETE CASCADE: the rows go
+            None => false,
+            // ON UPDATE CASCADE: the child gets the parent's new key,
+            // and [fk_action_fires] has already established that some
+            // column of it really differs
+            Some(nk) => nk.iter().zip(old_key).all(|(n, k)| {
+                !matches!(n, Value::Null) && value_cmp(n, k) == std::cmp::Ordering::Equal
+            }),
+        },
+        // a NULL references nothing
+        RefAction::SetNull => false,
+        // not an action at all - the caller does not ask
+        _ => true,
+    }
+}
+
+/// A stored DEFAULT as a plain [Value], for the one question
+/// [fk_action_leaves_old_key] asks of it: is what `SET DEFAULT` writes
+/// the same key that is going away?
+///
+/// EVERY ARM HERE MIRRORS [default_wire_param], value for value,
+/// because that function is what the action actually BINDS - the same
+/// `session_now()` for the date and time forms (not `now_date_time()`,
+/// which [eval_ctx_default] uses for procedure arguments and which is
+/// not time-zone adjusted), the same upper-cased login, the same
+/// `'NONE'` role, the same attachment id. A test asserts the pair
+/// answer `Some`/`None` on the same variants so they cannot drift.
+/// `CURRENT_TRANSACTION` is the one `None`: its value is the id the
+/// row's own insert allocates, and [default_wire_param] refuses it
+/// too, so the statement refuses rather than this comparison guessing.
+/// It refuses with a bare `42000 Dynamic SQL Error`, NOT with the
+/// engine's `23000` - see [fk_action_leaves_old_key] for the measured
+/// pair.
+fn default_as_value(d: &DefaultVal, ctx: &SessionCtx) -> Option<Value> {
+    Some(match d {
+        DefaultVal::Int(v, 0) => Value::Int(*v),
+        DefaultVal::Int(v, s) => Value::Scaled(*v, *s),
+        DefaultVal::Text(t) => Value::Text(t.clone()),
+        DefaultVal::Null => Value::Null,
+        DefaultVal::CurrentDate => Value::Date(session_now().0),
+        DefaultVal::CurrentTime => Value::Time(session_now().1),
+        DefaultVal::CurrentTimestamp => {
+            let (d, t) = session_now();
+            Value::Timestamp(d, t)
+        }
+        DefaultVal::User => Value::Text(ctx.user.to_ascii_uppercase()),
+        DefaultVal::Role => Value::Text("NONE".into()),
+        DefaultVal::Connection => Value::Int(ctx.attach_id as i64),
+        DefaultVal::Transaction => return None,
+    })
+}
+
+/// WHEN A REFERENTIAL ACTION FIRES AT ALL, which is not the same
+/// question as whether the key CHANGED.
+///
+/// The engine carries an `ON UPDATE` action in a trigger whose body is
+/// guarded `IF (OLD.k1 <> NEW.k1 [OR OLD.k2 <> NEW.k2 ...])`
+/// (qa/serve-real-fkcascade.sh compares that BLR byte for byte), and
+/// `<>` against a NULL is UNKNOWN, not TRUE. So the action fires
+/// exactly when SOME key column's NEW value is non-NULL and differs
+/// from the OLD one - and when it does not fire, the parent statement
+/// falls to the engine's ordinary master-side check, which refuses if
+/// any child still references the old key. An `ON DELETE` body carries
+/// no such `<>` guard (`FOR (child WHERE child.fk = OLD.pk) ERASE`), so
+/// nothing about the NEW key can stop a DELETE from firing.
+///
+/// THAT IS NOT "A DELETE ALWAYS FIRES", which is what this sentence
+/// said until 2026-09-03, when a reviewer falsified it against the
+/// function's own first branch three paragraphs below: the OLD key
+/// decides first, and an OLD key with a NULL component fires nothing.
+/// Measured 2026-09-03, a compound `UNIQUE (U1, U2)` parent holding
+/// `(10, NULL)`, a child holding `(10, NULL)` under
+/// `ON DELETE CASCADE`, both servers on byte-identical files:
+///
+/// ```text
+/// DELETE FROM NP WHERE U1 = 10
+///   both: Statement failed, SQLSTATE = 23000
+///         violation of FOREIGN KEY constraint "NCF" on table "PUBLIC"."NC"
+///         -Foreign key references are present for the record
+///         -Problematic key value is ("U1" = 10, "U2" = NULL)
+///         NPARENT 1 | NCHILD 1
+/// ```
+///
+/// The cascade did not fire on either side and the master-side check
+/// refused instead. The BEHAVIOUR was right all along; the sentence was
+/// the law a future reader would have lifted.
+///
+/// Measured on the engine 2026-09-03, one child row present, and every
+/// line of it reproduced through both servers:
+///
+/// ```text
+/// UPDATE P SET U = NULL          CASCADE / SET NULL / SET DEFAULT / none
+///                                -> REFUSED, all four, 23000
+/// UPDATE P SET U1 = 11, U2 = NULL   (was 10, 20)   -> FIRES, child (11, NULL)
+/// UPDATE P SET U1 = NULL, U2 = 21   (was 10, 20)   -> FIRES, child (NULL, 21)
+/// UPDATE P SET U1 = 10, U2 = NULL   (was 10, 20)   -> REFUSED
+/// UPDATE P SET U1 = NULL, U2 = NULL (was 10, 20)   -> REFUSED
+/// ```
+///
+/// So a blanket "any NULL in the new key refuses" would be its own
+/// regression: the engine performs the middle two.
+///
+/// THE OLD KEY DECIDES FIRST. Every action's WHERE is
+/// `child.k = OLD.k`, and SQL equality never matches a NULL, so an OLD
+/// key with a NULL component finds no child row to act on whatever the
+/// rule says - and the parent statement then meets the master-side
+/// check, which DOES match a NULL ([fk_check_parent_row]). Measured:
+/// `DELETE` of a parent `(10, NULL)` whose child holds `(10, NULL)` is
+/// refused by the engine under `ON DELETE CASCADE` and `SET NULL`
+/// alike, with the child left exactly as it was.
+fn fk_action_fires(old_key: &[&Value], new_key: Option<&[&Value]>) -> bool {
+    if old_key.iter().any(|v| matches!(v, Value::Null)) {
+        return false;
+    }
+    let Some(nk) = new_key else {
+        // a DELETE: the synthesised body has no guard
+        return true;
+    };
+    nk.iter()
+        .zip(old_key)
+        .any(|(n, k)| !matches!(n, Value::Null) && value_cmp(n, k) != std::cmp::Ordering::Equal)
+}
+
+/// Which of a partnership's two rules THIS statement obeys - the
+/// UPDATE rule for a parent UPDATE, the DELETE rule for a parent
+/// DELETE. Measured (`PF`/`PG` in [fk_check_parent_row]'s law): a
+/// child that declares only `ON UPDATE CASCADE` keeps the DEFAULT
+/// delete rule, and a parent DELETE obeys that one.
+fn fk_rule_for(fk: &FkPartner, is_update: bool) -> RefAction {
+    if is_update {
+        fk.on_update
+    } else {
+        fk.on_delete
+    }
+}
+
+/// The child column DEFAULT a `SET DEFAULT` writes into key segment
+/// `k`: `Some(None)` when the column has NO default (the action then
+/// writes NULL - measured: `CND.B` with no default reads back
+/// `<null>` after its parent went), `Some(Some(d))` for the default the
+/// catalog carries, and `None` when there IS one and this server cannot
+/// evaluate it - which refuses the parent's DML rather than write the
+/// wrong value.
+///
+/// It is the COLUMN's default, never the parent's value and never zero
+/// (measured: `B INTEGER DEFAULT 7` becomes 7).
+fn fk_child_default(db: &Database, fk: &FkPartner, k: usize) -> Option<Option<DefaultVal>> {
+    let fid = *fk.other_fids.get(k)?;
+    let cols = relation_columns(&db.bytes(), db.page_size, &fk.child_table);
+    let descs = fk.other_formats.iter().max_by_key(|(n, _)| *n).map(|(_, d)| d.clone())?;
+    let all = db.meta_memo("defaults", &fk.child_table, || {
+        table_defaults(db, &fk.child_table, &cols, &descs)
+    });
+    let all = all.as_ref().as_ref()?;
+    match all.iter().find(|(f, _)| *f == fid) {
+        None => Some(None),                     // no default: NULL
+        Some((_, Some(d))) => Some(Some(d.clone())),
+        Some((_, None)) => None,                // exists, unevaluatable
+    }
+}
+
+/// A stored DEFAULT as the value a referential `SET DEFAULT` binds -
+/// the same evaluation an INSERT makes for an omitted column.
+/// `CURRENT_TRANSACTION` is the one shape refused: its value is the id
+/// the row's own insert allocates, which a cascade has no reach to.
+fn default_wire_param(d: &DefaultVal, ctx: &SessionCtx) -> Option<WireParam> {
+    Some(match d {
+        DefaultVal::Int(v, s) => WireParam::Int(*v, *s),
+        DefaultVal::Text(t) => WireParam::Text(t.clone()),
+        DefaultVal::Null => WireParam::Null,
+        DefaultVal::CurrentDate => WireParam::Date(session_now().0),
+        DefaultVal::CurrentTime => WireParam::Time(session_now().1),
+        DefaultVal::CurrentTimestamp => {
+            let (d, t) = session_now();
+            WireParam::Timestamp(d, t)
+        }
+        DefaultVal::User => WireParam::Text(ctx.user.to_ascii_uppercase()),
+        DefaultVal::Role => WireParam::Text("NONE".into()),
+        DefaultVal::Connection => WireParam::Int(ctx.attach_id as i64, 0),
+        DefaultVal::Transaction => return None,
+    })
+}
+
+/// Can this server perform EVERY referential action the engine's own
+/// synthesised triggers would perform on this parent's DML?
+///
+/// `trigs` is how many flag-4 action triggers of this statement's kind
+/// stand on the table, and the count must MATCH the number of
+/// partnerships whose rule acts. That equality is the whole guard: an
+/// action trigger this server could not pair with a readable rule -
+/// a rule word it does not know, a partner index row it could not
+/// resolve, a catalog it could not read at all - would otherwise look
+/// like a restriction and silently refuse a DELETE the engine cascades,
+/// or, worse, pass one it should have acted on. One action, one
+/// trigger; anything else refuses the statement at prepare.
+fn fk_actions_runnable(
+    db: &Database,
+    table: &str,
+    columns: &[RelationColumn],
+    is_update: bool,
+    trigs: usize,
+) -> bool {
+    let Some((_, parents)) = fk_partners(db, table, columns) else {
+        return false;
+    };
+    let acting: Vec<&FkPartner> = parents
+        .iter()
+        .filter(|f| fk_rule_for(f, is_update).synthesises_trigger())
+        .collect();
+    acting.len() == trigs && acting.iter().all(|f| fk_action_runnable(db, f, is_update))
+}
+
+/// CAN this server perform the partnership's action for this statement
+/// kind? Asked at PLAN time, so that a shape it cannot act on refuses
+/// the parent's DML at prepare - the way the blanket refusal did -
+/// instead of writing half a cascade at execute.
+///
+/// The three grounds for refusing: an [FkPartner::opaque] leftover
+/// whose child columns the catalog no longer names, a segment count
+/// that does not line up, and a `SET DEFAULT` whose column default this
+/// server cannot evaluate (`NEXT VALUE FOR`, an expression).
+fn fk_action_runnable(db: &Database, fk: &FkPartner, is_update: bool) -> bool {
+    let rule = fk_rule_for(fk, is_update);
+    if !rule.synthesises_trigger() {
+        return true;
+    }
+    if fk.other_cols.is_empty()
+        || fk.other_cols.len() != fk.my_fids.len()
+        || fk.other_fids.len() != fk.other_cols.len()
+        || fk.child_table.is_empty()
+    {
+        return false;
+    }
+    if rule != RefAction::SetDefault {
+        return true;
+    }
+    (0..fk.other_cols.len()).all(|k| match fk_child_default(db, fk, k) {
+        None => false,
+        Some(None) => true,
+        Some(Some(d)) => !matches!(d, DefaultVal::Transaction),
+    })
+}
+
+/// The name of the system trigger the ENGINE synthesises for this
+/// partnership's action - `CHECK_<n>` on the PARENT, tied to the FK's
+/// constraint by an `RDB$CHECK_CONSTRAINTS` row and told apart from its
+/// twin by `RDB$TRIGGER_TYPE` (4 = AFTER UPDATE, 6 = AFTER DELETE).
+///
+/// This server does not RUN that trigger - it performs the action from
+/// the rule directly - but the engine's failure vector names it, and a
+/// cascade that fails against the child's own NOT NULL or CHECK must
+/// say which trigger the statement was inside. Measured: the engine
+/// answers the child's violation, then `At trigger "PUBLIC"."CHECK_17"`.
+fn fk_action_trigger_name(db: &Database, constraint: &str, is_update: bool) -> Option<String> {
+    let about = format!("{}/{}", constraint, if is_update { "U" } else { "D" });
+    db.meta_memo("fk-action-trigger", &about, || {
+        let cnames = check_constraint_names(db)?;
+        let want: Vec<&str> = cnames
+            .iter()
+            .filter(|(_, c)| c == constraint)
+            .map(|(t, _)| t.as_str())
+            .collect();
+        if want.is_empty() {
+            return None;
+        }
+        let want_type: i64 = if is_update { 4 } else { 6 };
+        let formats = fire_crab_ods::sysfmt::system_relation_formats(
+            &db.bytes(),
+            db.page_size,
+            "RDB$TRIGGERS",
+        )?;
+        let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
+        let cols = relation_columns(&db.bytes(), db.page_size, "RDB$TRIGGERS");
+        let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+        let (name_f, typ_f) = (fid("RDB$TRIGGER_NAME")?, fid("RDB$TRIGGER_TYPE")?);
+        let trel = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, "RDB$TRIGGERS")?;
+        let fmts = vec![(0u8, descs.clone())];
+        let mut found: Option<String> = None;
+        for_each_record(db, trel, &fmts, usize::MAX, |values| {
+            if found.is_some() {
+                return;
+            }
+            // a constraint name is unique in the database, so the two
+            // candidates are this key's own pair and the TYPE tells the
+            // update trigger from the delete one
+            if !matches!(values.get(typ_f), Some(Value::Int(t)) if *t == want_type) {
+                return;
+            }
+            if let Some(Value::Text(n)) = values.get(name_f) {
+                if want.iter().any(|w| *w == n.trim_end()) {
+                    found = Some(n.trim_end().to_string());
+                }
+            }
+        });
+        found
+    })
+    .as_ref()
+    .clone()
+}
+
+/// ONE referential action, as the child statement that performs it -
+/// and the name of the trigger the ENGINE would have been inside while
+/// it ran, which its failure vector names ([EvalErr::InTrigger]).
+struct FkActionStmt {
+    kind: DmlKind,
+    sql: String,
+    args: Vec<WireParam>,
+    /// None only when the catalog does not name the action trigger; the
+    /// action still runs, and its failure simply carries no frame.
+    trigger: Option<String>,
+}
+
+/// THE ACTION, as the statements that perform it: what one parent row's
+/// DELETE (`new_row` None) or UPDATE does to the child rows referencing
+/// the key it is removing or changing.
+///
+/// The engine carries this in a system trigger on the parent, fired
+/// AFTER the row is written; this server reads the same two words out
+/// of `RDB$REF_CONSTRAINTS` ([ref_constraint_rules]) and runs the
+/// child's DML the ordinary way, so the cascade maintains the child's
+/// indexes, fires its own triggers, evaluates its CHECKs and its NOT
+/// NULLs, and cascades ONWARD through the child's own foreign keys -
+/// all of it exactly as a client's statement would, with no second
+/// write path to keep in step. Measured, all of it: a three-level chain
+/// goes all the way down, a self-referencing key walks its generations,
+/// a cascade that would leave a NOT NULL column null fails the whole
+/// statement and leaves nothing behind.
+///
+/// The values travel as PARAMETERS, never as rendered literals: the key
+/// may be text in a character set this server would have to re-spell,
+/// and a re-spelled key is a wrong row.
+///
+/// An UPDATE whose key does not change touches no child - the engine's
+/// synthesised body is `IF (OLD.<pk> <> NEW.<pk>)`, and that guard is
+/// [fk_action_fires] here. It is the SAME guard that stops an action
+/// whose new key is NULL: `<>` against NULL is UNKNOWN, not TRUE, so
+/// the trigger does not fire and the parent statement takes the
+/// master-side refusal instead.
+fn fk_action_stmts(
+    db: &Database,
+    ctx: &SessionCtx,
+    fks: &[FkPartner],
+    old_row: &[Value],
+    new_row: Option<&[Value]>,
+) -> Result<Vec<FkActionStmt>, ExecErr> {
+    let mut out: Vec<FkActionStmt> = Vec::new();
+    for fk in fks {
+        let rule = fk_rule_for(fk, new_row.is_some());
+        if !rule.synthesises_trigger() {
+            continue;
+        }
+        let key: Vec<&Value> = fk
+            .my_fids
+            .iter()
+            .map(|f| old_row.get(*f).unwrap_or(&Value::Null))
+            .collect();
+        // a NULL key component references nothing (MATCH SIMPLE), so
+        // there is no child to act on
+        if key.iter().any(|v| matches!(v, Value::Null)) {
+            continue;
+        }
+        let new_key: Option<Vec<&Value>> = new_row.map(|n| {
+            fk.my_fids
+                .iter()
+                .map(|f| n.get(*f).unwrap_or(&Value::Null))
+                .collect()
+        });
+        // the engine's `IF (OLD.k <> NEW.k ...)` guard: unchanged does
+        // not fire, and neither does a NEW value of NULL
+        if !fk_action_fires(&key, new_key.as_deref()) {
+            continue;
+        }
+        if fk.other_cols.len() != key.len() || fk.child_table.is_empty() {
+            return Err(ExecErr::Text(
+                "this foreign key's referential action names no child columns".into(),
+            ));
+        }
+        let cannot = || {
+            ExecErr::Text("a foreign key's referential action cannot be performed here".into())
+        };
+        // the WHERE is the same in all four: the child rows whose key
+        // columns hold the parent key that is going away
+        let where_sql = fk
+            .other_cols
+            .iter()
+            .map(|c| format!("{} = ?", render_canon_ref(c)))
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        let where_args: Vec<WireParam> = key
+            .iter()
+            .map(|v| value_to_wireparam(v).ok_or_else(cannot))
+            .collect::<Result<_, _>>()?;
+        let child = render_canon_ref(&fk.child_table);
+        // the trigger the ENGINE would have been inside, for the
+        // failure vector ([fk_action_trigger_name])
+        let trigger = fk_action_trigger_name(db, &fk.constraint, new_row.is_some());
+        match rule {
+            RefAction::Cascade if new_key.is_none() => {
+                out.push(FkActionStmt {
+                    kind: DmlKind::Delete,
+                    sql: format!("DELETE FROM {} WHERE {}", child, where_sql),
+                    args: where_args,
+                    trigger,
+                });
+            }
+            _ => {
+                // the three that KEEP the child row and write its key
+                let mut set_args: Vec<WireParam> = Vec::new();
+                let mut sets: Vec<String> = Vec::new();
+                for (k, col) in fk.other_cols.iter().enumerate() {
+                    let v = match rule {
+                        // ON UPDATE CASCADE: the parent's NEW value
+                        RefAction::Cascade => {
+                            let nv = new_key.as_ref().and_then(|n| n.get(k).copied());
+                            Some(value_to_wireparam(nv.ok_or_else(cannot)?).ok_or_else(cannot)?)
+                        }
+                        RefAction::SetNull => None,
+                        RefAction::SetDefault => match fk_child_default(db, fk, k) {
+                            None => return Err(cannot()),
+                            Some(None) => None, // no default: NULL
+                            Some(Some(d)) => Some(default_wire_param(&d, ctx).ok_or_else(cannot)?),
+                        },
+                        _ => return Err(cannot()),
+                    };
+                    match v {
+                        // a literal NULL, not a parameter: an untyped
+                        // `?` has no descriptor to bind against
+                        None => sets.push(format!("{} = NULL", render_canon_ref(col))),
+                        Some(p) => {
+                            sets.push(format!("{} = ?", render_canon_ref(col)));
+                            set_args.push(p);
+                        }
+                    }
+                }
+                // the SET list's parameters are numbered before the
+                // WHERE's, as the text reads
+                set_args.extend(where_args);
+                out.push(FkActionStmt {
+                    kind: DmlKind::Update,
+                    sql: format!("UPDATE {} SET {} WHERE {}", child, sets.join(", "), where_sql),
+                    args: set_args,
+                    trigger,
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// HOW DEEP A CASCADE MAY GO, AND IT IS REACHED BY ROW DATA, NOT BY
+/// SCHEMA. Cycles terminate on their own - each level deletes or
+/// renames rows the next level no longer finds, which is why the engine
+/// takes a self-referencing key, a row that references ITSELF and a
+/// two-table cycle without complaint (all three measured) - but "on
+/// their own" is not a guarantee, and each level here is a whole
+/// executor frame over a published copy of the file.
+///
+/// ONE table with ONE self-referencing `ON DELETE CASCADE` reaches this
+/// on the (N+1)th GENERATION OF ROWS: an org chart, a folder tree, a
+/// bill of materials. No amount of schema review warns anyone, so the
+/// number has to be the engine's, not a guess.
+///
+/// THE ENGINE'S OWN BOUND, bisected 2026-09-03 one generation at a time
+/// on `SR (ID PK, P REFERENCES SR ON DELETE CASCADE)`, deleting the
+/// head of a chain of N rows:
+///
+/// ```text
+/// N = 1000, 1001   -> the whole chain goes, N 0
+/// N = 1002 .. 1100 -> Statement failed, SQLSTATE = 54001
+///                     Too many concurrent executions of the same request
+///                     -At trigger "PUBLIC"."CHECK_1"  (x1000)
+///                     ...and NOTHING is written: all N rows survive
+/// ```
+///
+/// So the engine stops too - at `isc_req_max_clones_exceeded`, cleanly,
+/// with a diagnosis. The bound here is the SAME BOUNDARY expressed in
+/// this counter, which reaches N for a chain of N (the last generation
+/// enters with nothing left to do): 1001 accepts exactly the chains the
+/// engine accepts and refuses exactly the ones it refuses, verified at
+/// 1000/1001/1002 through both servers. The refusal answers the
+/// engine's own status code ([GDS_REQ_MAX_CLONES]) rather than a bare
+/// `Dynamic SQL Error`.
+///
+/// It is also measured to be SAFE here, not merely legal: a 1001-deep
+/// self-referencing cascade completes in under a second on a connection
+/// thread's 16 MiB stack ([handle]'s `stack_size`), and depth does not
+/// accumulate per ROW - 1000 parent rows cascading one level each is
+/// depth 1.
+const MAX_FK_ACTION_DEPTH: u32 = 1001;
+
+thread_local! {
+    static FK_ACTION_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Perform one parent row's referential actions, where the engine
+/// performs them: AFTER the parent row itself is written.
+///
+/// The statement is holding its working copy, and each child statement
+/// takes one of its own - so the copy is PUBLISHED first and taken
+/// again after, exactly as [fire_triggers_published] does around a
+/// trigger body, and for the same reason: two writers cloning one base
+/// both install a whole image and the second drops the first's rows.
+/// Publishing is also what makes the cascade VISIBLE to the rest of the
+/// statement, which is the engine's own order (measured: `DELETE FROM
+/// SV WHERE ID IN (1,2,3)` over a self-referencing chain reports
+/// ROW_COUNT 1 - rows 2 and 3 were gone by cascade before the walk
+/// reached them).
+///
+/// The statement's undo window covers all of it: [execute_dml_collecting]
+/// opens a [WindowKind::Nested] window for a plan that acts
+/// ([plan_publishing_triggers]), so a cascade that fails part-way -
+/// against the child's own NOT NULL, its CHECK, or its own foreign key
+/// - leaves nothing behind.
+fn run_fk_actions_published(
+    database: &mut Option<Database>,
+    work: fire_crab_ods::Image,
+    stmt_tx: Option<u32>,
+    ctx: &SessionCtx,
+    stmts: &[FkActionStmt],
+) -> Result<fire_crab_ods::Image, ExecErr> {
+    if let Some(d) = database.as_mut() {
+        d.install_dirty(work);
+        // ...and the transaction owns its id from here - see
+        // [fire_triggers_published], whose law this follows exactly
+        if let Some(tx) = stmt_tx {
+            d.adopt_tx(tx);
+        }
+        d.refresh_reader_view();
+    }
+    let depth = FK_ACTION_DEPTH.with(|d| {
+        let n = d.get() + 1;
+        d.set(n);
+        n
+    });
+    let r = (|| -> Result<(), ExecErr> {
+        if depth > MAX_FK_ACTION_DEPTH {
+            // THE ENGINE'S OWN VECTOR, so an operator can tell this
+            // refusal from every other one: `ExecErr::Text` reaches the
+            // client as a bare `Dynamic SQL Error` and the sentence the
+            // server wrote is discarded on the way out.
+            return Err(ExecErr::Gds(
+                GDS_REQ_MAX_CLONES,
+                "Too many concurrent executions of the same request".into(),
+            ));
+        }
+        for st in stmts {
+            if trace_on() {
+                eprintln!("[srv] fk action: {}", st.sql);
+            }
+            let planned = match st.kind {
+                DmlKind::Insert => None,
+                DmlKind::Update => plan_update(&st.sql, database),
+                DmlKind::Delete => plan_delete(&st.sql, database),
+            };
+            let (plan, _params) = planned.ok_or_else(|| {
+                ExecErr::Text(format!(
+                    "this server cannot perform the referential action: {}",
+                    st.sql
+                ))
+            })?;
+            // WHAT FAILED, AND WHAT IT WAS INSIDE. The child's own
+            // violation is the error - its constraint, its table, its
+            // key - and the engine appends one `At trigger` item naming
+            // the action trigger that ran it. Measured: a cascade that
+            // would leave the child's NOT NULL column null answers
+            // `validation error for column "PUBLIC"."CNN"."B" ... -At
+            // trigger "PUBLIC"."CHECK_17"`.
+            execute_dml(&plan, database, &st.args, ctx).map_err(|e| match (e, &st.trigger) {
+                (ExecErr::Eval(inner), Some(t)) => ExecErr::Eval(EvalErr::InTrigger {
+                    trigger: quoted_qualified(t),
+                    inner: Box::new(inner),
+                    outer: Vec::new(),
+                }),
+                (e, _) => e,
+            })?;
+        }
+        Ok(())
+    })();
+    FK_ACTION_DEPTH.with(|d| d.set(d.get() - 1));
+    r?;
+    let d = database.as_mut().ok_or("no database attached")?;
+    d.work_copy().map_err(ExecErr::Text)
+}
+
+/// A DML target's row AS IT STANDS NOW - `(format, image)`, or `None`
+/// when there is no row here any more.
+///
+/// Asked of a target the statement collected BEFORE a cascade ran,
+/// because a cascade reaches the very rows the outer statement is still
+/// going to write. Both halves were measured on the engine over a
+/// self-referencing key:
+///
+/// * GONE. `DELETE FROM SV WHERE ID IN (1, 2, 3)` down an
+///   `ON DELETE CASCADE` chain answers ROW_COUNT **1** - row 1 went,
+///   its cascade took 2 and 3, and the walk found nothing left at
+///   either. Without this the walk would write a delete stub over a
+///   delete stub and count three.
+/// * CHANGED. An `ON UPDATE CASCADE` self-reference renames a row the
+///   outer UPDATE has not reached yet; patching the image collected
+///   before the cascade would write the cascade's change straight back
+///   out.
+///
+/// Only a statement that ACTS re-reads: with no cascade in it nothing
+/// can have moved under the walk, and the collected image stands.
+fn dml_target_current(db: &Database, page: u32, slot: u16) -> Option<(u8, Vec<u8>)> {
+    let image = db.bytes();
+    let view = ReadView::of(db, &image);
+    let dp = fire_crab_ods::page_at(&image, db.page_size, page).and_then(DataPage::decode)?;
+    let r = dp.record(slot)?;
+    view.version(&image, db.page_size, &r).map(|(img, f)| (f, img))
 }
 
 /// The CHECK constraints of a table as NEGATED, parameter-free
@@ -15025,16 +16175,26 @@ fn trig_body_of(t: &TrigDef) -> Option<(TrigStmt, Vec<String>)> {
     Some((body, names))
 }
 
+/// The memoised form of [check_predicates_uncached], held in the
+/// metadata cache.
+///
 /// The same walk is the TRIGGER GUARD: a trigger this server cannot
 /// execute but the engine would fire on `dml` also returns None. That
-/// is every user trigger (system_flag 0, any statement kind - the
-/// established coarse rule), and an FK referential-action trigger
-/// (system_flag 4) when the statement would fire it: AFTER DELETE
-/// (type 6) on any DELETE, AFTER UPDATE (type 4) on an UPDATE whose SET
-/// list touches a guarded parent-key column (from the trigger's own
-/// RDB$DEPENDENCIES rows). A DELETE evaluates no checks - the guard is
-/// the only thing [plan_delete] needs from here.
-/// [check_predicates_uncached], held in the metadata cache.
+/// is a USER trigger (system_flag 0) whose body is outside the PSQL
+/// surface this server interprets ([user_triggers]), and a flag-4
+/// referential-action trigger this server cannot PAIR WITH A RULE it
+/// can perform ([fk_actions_runnable]).
+///
+/// It is NO LONGER a blanket refusal of every statement that would fire
+/// an FK action trigger. That was the stopgap, and it made every parent
+/// row of an acting foreign key undeletable; the actions are now
+/// PERFORMED ([fk_action_stmts], [run_fk_actions_published]), so the
+/// guard refuses only the ones that are still out of reach - an
+/// unreadable rule word, a partnership whose child columns the catalog
+/// no longer names, a `SET DEFAULT` whose default this server cannot
+/// evaluate, or a trigger count that does not match the rule count. A
+/// DELETE evaluates no checks - the guard is the only thing
+/// [plan_delete] needs from here.
 ///
 /// The key carries the GUARD as well as the table, because an UPDATE's
 /// answer depends on which columns it sets - an action trigger only
@@ -15086,7 +16246,7 @@ fn check_predicates_uncached(
     // RDB$CHECK_CONSTRAINTS constraint-name lookup
     let mut blobs: Vec<(String, i64, u16, u64)> = Vec::new();
     let mut user_trigger = false;
-    let mut fk_on_delete = false;
+    let mut fk_delete_trigs = 0usize;
     let mut fk_unknown = false;
     let mut fk_update_trigs: Vec<String> = Vec::new();
     let fmts = vec![(0u8, t_descs.clone())];
@@ -15105,7 +16265,7 @@ fn check_predicates_uncached(
         // on this (parent) table - note which statement kind fires it
         if matches!(values.get(sys_f), Some(Value::Int(4))) {
             match values.get(typ_f) {
-                Some(Value::Int(6)) => fk_on_delete = true,
+                Some(Value::Int(6)) => fk_delete_trigs += 1,
                 Some(Value::Int(4)) => {
                     if let Some(Value::Text(n)) = values.get(name_f) {
                         fk_update_trigs.push(n.trim_end().to_string());
@@ -15147,8 +16307,18 @@ fn check_predicates_uncached(
     match dml {
         DmlGuard::Insert => {} // no FK action trigger fires on parent INSERT
         DmlGuard::Delete => {
-            if fk_on_delete {
-                return None; // the engine would cascade; we cannot
+            // AN FK ACTION TRIGGER ON THIS PARENT. This was a blanket
+            // refusal - "the engine would cascade; we cannot" - and it
+            // made every parent row undeletable, including a row with
+            // no children at all. The actions are now PERFORMED
+            // ([fk_action_stmts]) from the rules the catalog carries,
+            // and only a shape this server cannot perform still
+            // refuses, the way the user-trigger arm above refuses only
+            // a body outside its surface.
+            if fk_delete_trigs > 0
+                && !fk_actions_runnable(db, table, columns, false, fk_delete_trigs)
+            {
+                return None;
             }
             // a DELETE evaluates no CHECK constraints
             return Some(Vec::new());
@@ -15161,11 +16331,14 @@ fn check_predicates_uncached(
                 if guarded.is_empty() {
                     return None;
                 }
-                if set_cols
-                    .iter()
-                    .any(|s| guarded.iter().any(|g| g == s))
+                // an UPDATE that names none of the guarded key columns
+                // fires nothing (the engine's body is `IF OLD.pk <>
+                // NEW.pk`); one that names them performs the actions,
+                // and refuses only what it cannot perform
+                if set_cols.iter().any(|s| guarded.iter().any(|g| g == s))
+                    && !fk_actions_runnable(db, table, columns, true, fk_update_trigs.len())
                 {
-                    return None; // would change a referenced key; the engine would cascade
+                    return None;
                 }
             }
         }
@@ -22635,6 +23808,42 @@ fn plain_function_arities(db: &Option<Database>) -> Vec<(String, usize, usize)> 
     }
 }
 
+/// A NUMERIC LITERAL default's BLR - `DEFAULT 7`, `DEFAULT -3`, and the
+/// DECIMAL spellings `DEFAULT 7.0` / `DEFAULT 7.00` / `DEFAULT -7.25`,
+/// which the engine stores as the same `blr_literal blr_long` with the
+/// literal's own scale in the scale byte ([num_default_blr] carries the
+/// measured bytes).
+///
+/// Until 2026-09-03 only the integer spelling parsed, so
+/// `NUMERIC(9,2) DEFAULT 7.00` - which the engine accepts - failed the
+/// whole `CREATE TABLE` with a bare `Dynamic SQL Error`, and `DEFAULT 7`
+/// was the only decimal default this server could create.
+///
+/// What is still DECLINED, and each is the refusal this function already
+/// gave: an exponent (`1e3`), a hex literal, a mantissa too wide for
+/// `blr_long` (`DEFAULT 12345678901.2345`, which the engine writes as
+/// `blr_int64`), and more than 127 fraction digits.
+fn num_literal_default_blr(lit: &str) -> Option<Vec<u8>> {
+    let (neg, digits) = match lit.strip_prefix('-') {
+        Some(d) => (true, d),
+        None => (false, lit.strip_prefix('+').unwrap_or(lit)),
+    };
+    let (int_part, frac) = match digits.split_once('.') {
+        Some((i, f)) => (i, f),
+        None => (digits, ""),
+    };
+    if int_part.is_empty() && frac.is_empty() {
+        return None;
+    }
+    if !int_part.bytes().chain(frac.bytes()).all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let scale = i8::try_from(frac.len()).ok()?.checked_neg()?;
+    let mantissa: i64 = format!("{}{}", int_part, frac).parse().ok()?;
+    let mantissa = i32::try_from(if neg { -mantissa } else { mantissa }).ok()?;
+    Some(fire_crab_ods::ddl::num_default_blr(mantissa, scale))
+}
+
 /// The engine's keyword BLR for a session/clock CONTEXT default, but ONLY
 /// the forms `eval_ctx_default` can resolve at a call - the login, role,
 /// connection id and the clock. CURRENT_TRANSACTION (whose id this fill
@@ -22670,7 +23879,7 @@ fn proc_default_of(src: &str) -> Option<(Vec<u8>, String)> {
         // stored as the engine's own keyword BLR, resolved per call
         kw
     } else {
-        fire_crab_ods::ddl::int_default_blr(lit.parse::<i32>().ok()?)
+        num_literal_default_blr(lit)?
     };
     Some((value_blr, src.to_string()))
 }
@@ -23617,7 +24826,7 @@ fn parse_default_clause(
     } else if lit.eq_ignore_ascii_case("NULL") {
         fire_crab_ods::ddl::null_default_blr()
     } else {
-        fire_crab_ods::ddl::int_default_blr(lit.parse::<i32>().ok()?)
+        num_literal_default_blr(lit)?
     };
     Some((
         fire_crab_ods::ddl::ColumnDefault {
@@ -30225,12 +31434,16 @@ fn plan_delete(sql: &str, db_outer: &Option<Database>) -> Option<(Plan, Vec<Desc
         }
     };
     let params: Vec<Descriptor> = params.into_iter().collect::<Option<_>>()?;
-    // the trigger guard: an FK AFTER DELETE action trigger (the engine
-    // would cascade to the children) or a user trigger would fire on
-    // this DELETE - this server cannot execute trigger BLR, refuse
+    // the trigger guard: a user trigger whose body is outside this
+    // server's PSQL surface, or an FK AFTER DELETE action trigger whose
+    // rule it cannot perform, would fire on this DELETE - refuse. An
+    // action it CAN perform no longer refuses: it is executed at
+    // [run_fk_actions_published].
     check_predicates(db, table, &columns, descs, DmlGuard::Delete)?;
-    // NO ACTION FKs referencing this table: each deleted row's key must
-    // be checked for child references at execute
+    // FKs referencing this table: each deleted row's key is either
+    // CHECKED for child references at execute ([fk_check_parent_row])
+    // or is the ACTION to perform ([fk_action_stmts]) - the same list
+    // is both, and the rule on the partner decides which
     let (_, fk_children) = fk_partners(db, table, &columns)?;
     // the same reconstruction and the same DISTINCT trace pair as
     // plan_update - see the law stated there
@@ -31064,12 +32277,29 @@ where
 /// contexts read - see [TrigDef::deferred].
 /// Does this plan fire a trigger whose body needs the database - one
 /// that will PUBLISH the statement's working copy mid-way?
+///
+/// A REFERENTIAL ACTION publishes for the same reason and must be
+/// counted the same way: the child's DELETE or UPDATE is a statement of
+/// its own over the installed image ([run_fk_actions_published]), so
+/// dropping this statement's working copy would no longer take the
+/// cascade back. The window has to be the nested, id-killing one, or a
+/// cascade that fails against the child's NOT NULL leaves the rows it
+/// already wrote behind.
 fn plan_publishing_triggers(plan: &Plan) -> bool {
     let t = match plan {
-        Plan::Insert { triggers, .. }
-        | Plan::Update { triggers, .. }
-        | Plan::Delete { triggers, .. }
-        | Plan::ViewTrig { triggers, .. } => triggers,
+        Plan::Update { triggers, fk_children, .. } => {
+            if fk_children.iter().any(|f| f.on_update.synthesises_trigger()) {
+                return true;
+            }
+            triggers
+        }
+        Plan::Delete { triggers, fk_children, .. } => {
+            if fk_children.iter().any(|f| f.on_delete.synthesises_trigger()) {
+                return true;
+            }
+            triggers
+        }
+        Plan::Insert { triggers, .. } | Plan::ViewTrig { triggers, .. } => triggers,
         Plan::Returning { inner, .. } => return plan_publishing_triggers(inner),
         _ => return false,
     };
@@ -32195,7 +33425,7 @@ fn execute_dml_collecting_inner(
             // existing parent row (a NULL component passes)
             if !fk_refs.is_empty() {
                 let values = decode_record(&image, descs);
-                fk_check_child_row(db, fk_refs, &values).map_err(ExecErr::Eval)?;
+                fk_check_child_row(db, fk_refs, &values, None).map_err(ExecErr::Eval)?;
             }
             let image = &image;
             if let Some(a) = affected.as_deref_mut() {
@@ -32274,7 +33504,12 @@ fn execute_dml_collecting_inner(
             // with this statement's working copy PUBLISHED, and the
             // rows are then written one at a time as they are read -
             // see [write_updated_row]
-            let publishing = triggers.iter().any(|t| t.needs_db);
+            // A REFERENTIAL ACTION PUBLISHES, like a body that reads
+            // the database: the parent row must carry its NEW key
+            // before the cascade writes the children, which is where
+            // the engine fires its AFTER UPDATE trigger
+            let fk_acts = fk_children.iter().any(|f| f.on_update.synthesises_trigger());
+            let publishing = triggers.iter().any(|t| t.needs_db) || fk_acts;
             let descs = formats
                 .iter()
                 .find(|(n, _)| n == format_no)
@@ -32438,10 +33673,21 @@ fn execute_dml_collecting_inner(
             // itself).
             let mut first_perm: Vec<Option<[u8; 8]>> = vec![None; blob_sets.len()];
             let sets = &bound_sets;
-            for (done, (page, slot, fmt, image)) in found.into_iter().enumerate() {
+            for (done, (page, slot, mut fmt, mut image)) in found.into_iter().enumerate() {
                 // the rows WRITTEN before a raise in this loop
                 // ([DML_PROGRESS])
                 dml_progress_set(done);
+                // A CASCADE MAY HAVE REACHED THIS ROW ALREADY - see
+                // [dml_target_current]
+                if fk_acts {
+                    match dml_target_current(db, page, slot) {
+                        Some((f, img)) => {
+                            fmt = f;
+                            image = img;
+                        }
+                        None => continue,
+                    }
+                }
                 // the SET offsets were resolved in the NEWEST format; a
                 // record still stored in an older one would patch wrong
                 // bytes - refuse the whole statement instead
@@ -32748,8 +33994,9 @@ fn execute_dml_collecting_inner(
                 if !fk_refs.is_empty() || !fk_children.is_empty() {
                     let old_values = decode_record(&upgraded, descs);
                     let new_values = decode_record(&img, descs);
-                    fk_check_child_row(db, fk_refs, &new_values).map_err(ExecErr::Eval)?;
-                    fk_check_parent_row(db, fk_children, &old_values, Some(&new_values))
+                    fk_check_child_row(db, fk_refs, &new_values, Some(&old_values))
+                        .map_err(ExecErr::Eval)?;
+                    fk_check_parent_row(db, ctx, fk_children, &old_values, Some(&new_values))
                         .map_err(ExecErr::Eval)?;
                 }
                 // the RHDF fill trim - see fmt_len above
@@ -32790,6 +34037,21 @@ fn execute_dml_collecting_inner(
                             Some(&mut new_row), Some(&old_row),
                         )?;
                         db = database.as_mut().ok_or("no database attached")?;
+                    }
+                    // THE REFERENTIAL ACTIONS this row's new key sets
+                    // off, where the engine's AFTER UPDATE trigger fires
+                    // them: the row is written, so the children the
+                    // cascade re-points have a parent to point at
+                    if fk_acts {
+                        let old_row = decode_record(old_img, descs);
+                        let new_row = decode_record(new_img, descs);
+                        let stmts =
+                            fk_action_stmts(db, ctx, fk_children, &old_row, Some(&new_row))?;
+                        if !stmts.is_empty() {
+                            work =
+                                run_fk_actions_published(database, work, stmt_tx, ctx, &stmts)?;
+                            db = database.as_mut().ok_or("no database attached")?;
+                        }
                     }
                 }
             }
@@ -32842,8 +34104,11 @@ fn execute_dml_collecting_inner(
         }
         Plan::Delete { rel, triggers, trig_cols, formats, filter, fk_children, index, defer, gen_filter } => {
             // as in the UPDATE arm: a body that reads the database sees
-            // each row go before the next one's trigger fires
-            let publishing = triggers.iter().any(|t| t.needs_db);
+            // each row go before the next one's trigger fires - and so
+            // does a REFERENTIAL ACTION, which the engine fires from an
+            // AFTER DELETE trigger, once the parent row is gone
+            let fk_acts = fk_children.iter().any(|f| f.on_delete.synthesises_trigger());
+            let publishing = triggers.iter().any(|t| t.needs_db) || fk_acts;
             let filter = &bind_filter(filter, args)?;
             // a parameterised WHERE keys at EXECUTE, as in the UPDATE arm
             let descs_now: Vec<Descriptor> = formats
@@ -32888,8 +34153,19 @@ fn execute_dml_collecting_inner(
                 return Err(ExecErr::Conflict(other));
             }
             let fc_defaults = newest_format_defaults(db, *rel);
-            for (done, (page, slot, fmt, image)) in found.into_iter().enumerate() {
+            for (done, (page, slot, mut fmt, mut image)) in found.into_iter().enumerate() {
                 dml_progress_set(done); // see the UPDATE loop
+                // A CASCADE MAY HAVE TAKEN THIS ROW ALREADY - see
+                // [dml_target_current]
+                if fk_acts {
+                    match dml_target_current(db, page, slot) {
+                        Some((f, img)) => {
+                            fmt = f;
+                            image = img;
+                        }
+                        None => continue,
+                    }
+                }
                 // BEFORE DELETE TRIGGERS, where the engine fires them:
                 // over the row as it stands (OLD), before it goes. A
                 // body that raises stops the statement whole - nothing
@@ -32942,7 +34218,7 @@ fn execute_dml_collecting_inner(
                         .map(|(_, d)| d)
                         .ok_or("no format for a matching record")?;
                     let values = decode_stored(&image, descs, formats, &fc_defaults);
-                    fk_check_parent_row(db, fk_children, &values, None)
+                    fk_check_parent_row(db, ctx, fk_children, &values, None)
                         .map_err(ExecErr::Eval)?;
                 }
                 // a DELETE returns the row AS IT WAS
@@ -33004,6 +34280,26 @@ fn execute_dml_collecting_inner(
                             Some(&row),
                         )?;
                         db = database.as_mut().ok_or("no database attached")?;
+                    }
+                    // THE REFERENTIAL ACTIONS this row sets off, where
+                    // the engine's AFTER DELETE trigger fires them: the
+                    // parent row is gone, so a child the cascade keeps
+                    // (SET NULL / SET DEFAULT) is validated against a
+                    // table that no longer holds the key
+                    if fk_acts {
+                        let descs = formats
+                            .iter()
+                            .find(|(n, _)| *n == fmt)
+                            .or_else(|| formats.iter().max_by_key(|(n, _)| *n))
+                            .map(|(_, d)| d)
+                            .ok_or("no format for a matching record")?;
+                        let row = decode_stored(&image, descs, formats, &fc_defaults);
+                        let stmts = fk_action_stmts(db, ctx, fk_children, &row, None)?;
+                        if !stmts.is_empty() {
+                            work =
+                                run_fk_actions_published(database, work, stmt_tx, ctx, &stmts)?;
+                            db = database.as_mut().ok_or("no database attached")?;
+                        }
                     }
                 }
             }
@@ -34755,15 +36051,136 @@ fn recno_of(work: &fire_crab_ods::Image, page_size: usize, page_no: u32, slot: u
 /// writes no entry into the section) answers NULL on the same rows.
 /// Decode a STORED record and materialise the defaults for the fields
 /// its own format never had - the read-side half of
-/// [fill_format_defaults], for the DML walks.
+/// [fill_format_defaults], for the DML walks. [present_through] first,
+/// so a field whose SCALE the newest format changed carries the number
+/// and not the old mantissa.
 fn decode_stored(
     image: &[u8],
     descs: &[Descriptor],
     formats: &[(u8, Vec<Descriptor>)],
     defaults: &[(usize, Value)],
 ) -> Vec<Value> {
-    let newest = formats.iter().max_by_key(|(n, _)| *n).map(|(_, d)| d.len()).unwrap_or(0);
-    fill_format_defaults(decode_record(image, descs), newest, defaults)
+    let newest: &[Descriptor] =
+        formats.iter().max_by_key(|(n, _)| *n).map(|(_, d)| d.as_slice()).unwrap_or(&[]);
+    fill_format_defaults(
+        present_through(decode_record(image, descs), descs, newest),
+        newest.len(),
+        defaults,
+    )
+}
+
+/// Is this a dtype whose value is a SCALED INTEGER - the family whose
+/// stored bytes are a mantissa and whose descriptor carries the scale?
+fn is_exact_dtype(t: u8) -> bool {
+    matches!(t, dtype::SHORT | dtype::LONG | dtype::INT64 | dtype::INT128)
+}
+
+/// THE VALUE A STORED FIELD SHOWS WHEN IT IS PRESENTED THROUGH ANOTHER
+/// FORMAT'S DESCRIPTOR - `None` to leave it exactly as decoded.
+///
+/// An exact numeric is stored as a MANTISSA, and its DESCRIPTOR carries
+/// the scale: `700` under `INTEGER` and `70000` under `NUMERIC(9,2)`
+/// are the same number, `700.00`. Every reader downstream of a decode
+/// was told the column's CURRENT descriptor - the describe the client
+/// prepared against, the wire row body (which ships the raw mantissa
+/// and lets the client divide by `10^|scale|`), the sort and group
+/// keys, the index key builder, the BLR request message. So a mantissa
+/// decoded under an OLDER format has to be CONVERTED into the newest
+/// format's scale before any of them sees it, exactly as the engine's
+/// `MOV_move`/`CVT` converts each field out of the record's own format
+/// on the way past (jrd/vio.cpp).
+///
+/// MEASURED, 2026-09-03, `ALTER TABLE ... ALTER N TYPE NUMERIC(9,2)` over
+/// an `INTEGER` column with rows on both sides of the ALTER: the engine
+/// reads the pre-ALTER `700` back as `700.00`, and this server read it
+/// as `7.00` - the mantissa projected under the new scale rather than
+/// converted into it.
+///
+/// THE NARROWING DIRECTION IS REACHABLE, and it rounds. The engine
+/// accepts an ALTER that keeps the integral digits and drops decimals
+/// (measured: `NUMERIC(9,2)` -> `NUMERIC(18,1)`, `-> INTEGER` and
+/// `-> BIGINT` are all accepted; `NUMERIC(9,2)` -> `NUMERIC(9,4)` is
+/// refused, "New scale specified for column N must be at most 2").
+/// Reading those rows back, the engine ROUNDS HALF AWAY FROM ZERO -
+/// measured over `NUMERIC(9,2)` -> `INTEGER`: `7.55`->`8`, `7.45`->`7`,
+/// `7.50`->`8`, `8.50`->`9` (so not banker's rounding), `-7.50`->`-8`,
+/// `-0.51`->`-1`; and over `NUMERIC(9,2)` -> `NUMERIC(18,1)`:
+/// `7.05`->`7.1`, `-7.45`->`-7.5`. That is [rescale]'s rule, which is
+/// why this calls it rather than choosing one.
+///
+/// WHAT IT DOES NOT TOUCH: a field whose scale did not change (the
+/// common case, and the fast path); anything outside the scaled-integer
+/// family, because the engine refuses those ALTERs anyway (measured:
+/// `NUMERIC(18,2)` -> `DOUBLE PRECISION` is "Conversion from base type
+/// BIGINT to DOUBLE PRECISION is not supported"); and a value whose
+/// converted form does NOT fit the target's backing width. That last is
+/// `None` - the value is left as decoded rather than saturated, zeroed
+/// or panicked on, the same choice [union_scale_value] makes.
+///
+/// THAT LAST CASE IS REACHABLE, and this comment said the opposite
+/// until 2026-09-03 ("not reachable through an engine-accepted ALTER as
+/// far as could be measured"). A reviewer broke it and it is re-measured
+/// here: the engine will not let the DECLARED INTEGRAL DIGITS grow, but
+/// it will let the PRECISION grow, and it is the precision that decides
+/// whether the rescaled mantissa still fits.
+///
+/// ```text
+/// N BIGINT holding 900000000000000000, then ALTER N TYPE NUMERIC(18,4)
+///                                            (the engine ACCEPTS it)
+///   engine:    SQLSTATE 22003, arithmetic exception, numeric overflow,
+///              or string truncation / -numeric value is out of range
+///   this file: N 90000000000000.0000, and the same number folded into
+///              SUM(N) and matched by WHERE N > 0
+/// ```
+///
+/// So there are three answers, not two: convert, decline, or RAISE -
+/// and the engine takes the third where this returns `None`. Declining
+/// ships the raw mantissa under the new scale, silently off by a power
+/// of ten. NOT FIXED this round; recorded in `docs/roadmap.md` under
+/// "RECORDED, NOT REPAIRED", with the unit test that pins the floor
+/// noted there as asserting the current behaviour rather than the
+/// engine's.
+fn present_field(v: &Value, stored: &Descriptor, newest: &Descriptor) -> Option<Value> {
+    if stored.scale == newest.scale
+        || !is_exact_dtype(stored.dtype)
+        || !is_exact_dtype(newest.dtype)
+    {
+        return None;
+    }
+    let (raw, from) = match v {
+        Value::Int(n) => (*n as i128, 0i8),
+        Value::Scaled(r, s) => (*r as i128, *s),
+        Value::Int128(r, s) => (*r, *s),
+        _ => return None,
+    };
+    let to = newest.scale;
+    let n = rescale(raw, from, to).ok()?;
+    Some(if newest.dtype == dtype::INT128 {
+        Value::Int128(n, to)
+    } else if to == 0 {
+        Value::Int(i64::try_from(n).ok()?)
+    } else {
+        Value::Scaled(i64::try_from(n).ok()?, to)
+    })
+}
+
+/// A whole decoded record, presented through `newest` - [present_field]
+/// per field. The two descriptor lists are indexed by FIELD ID, and a
+/// record's own format is a PREFIX of the newest one (a dropped id is
+/// never reused, which is the law [fill_format_defaults] rests on), so
+/// a field the newest format does not describe is left alone.
+fn present_through(
+    mut values: Vec<Value>,
+    stored: &[Descriptor],
+    newest: &[Descriptor],
+) -> Vec<Value> {
+    for (fid, v) in values.iter_mut().enumerate() {
+        let (Some(s), Some(n)) = (stored.get(fid), newest.get(fid)) else { continue };
+        if let Some(nv) = present_field(v, s, n) {
+            *v = nv;
+        }
+    }
+    values
 }
 
 fn select_format_defaults(db: &Database, rel: u16) -> Vec<(u8, Vec<(usize, Value)>)> {
@@ -48275,14 +49692,22 @@ impl<'a> ReadView<'a> {
             .find(|(n, _)| *n == format)
             .or_else(|| formats.iter().max_by_key(|(n, _)| *n))?;
         let values = decode_record(&image, &descs.1);
+        // ...and then CONVERTED into the newest format's scale, because
+        // every reader downstream was described in that one and a
+        // scaled numeric travels as a raw mantissa ([present_through]).
+        // This is the one place every read walk passes through - the
+        // materialising scan, the streaming cursor, the index-driven
+        // retrieval and the by-recno fetch all call it.
+        let newest: &[Descriptor] =
+            formats.iter().max_by_key(|(n, _)| *n).map(|(_, d)| d.as_slice()).unwrap_or(&[]);
+        let values = present_through(values, &descs.1, newest);
         // ...and a field the record's format did not have yet reads the
         // NEWEST format's stored DEFAULT, which is where `ALTER TABLE
         // ... ADD <col> DEFAULT <x> NOT NULL` put it instead of
         // rewriting every row ([fill_format_defaults]). `defaults` is
         // the newest format's section; an empty one leaves the short
         // vector exactly as it was.
-        let newest = formats.iter().max_by_key(|(n, _)| *n).map(|(_, d)| d.len()).unwrap_or(0);
-        Some(fill_format_defaults(values, newest, defaults))
+        Some(fill_format_defaults(values, newest.len(), defaults))
     }
 }
 
@@ -49634,6 +51059,116 @@ fn coll_is_octets(coll: u16) -> bool {
         && fire_crab_ods::intl::charset_id(coll as i16) == fire_crab_ods::intl::CS_OCTETS
 }
 
+/// Order two [Value]s: the comparison every consumer that has no more
+/// specific rule falls back on - ORDER BY and window ORDER BY
+/// ([order_cmp]), GROUP BY and DISTINCT keys, `MIN`/`MAX` and the
+/// `DISTINCT` fold of `LIST`, UNION's set equality, the percentile
+/// sort, the BLR sort ([cmp_value_keys]), and the foreign-key key
+/// comparisons ([row_carries_key_at], [fk_partner_has], [fk_key_moved],
+/// [fk_action_leaves_old_key], [fk_action_fires]).
+///
+/// # AN EXACT NUMERIC COMPARES AS A NUMBER WHATEVER SHAPE IT ARRIVES IN
+///
+/// `Int` (scale 0), `Scaled` (an i64 mantissa and a scale) and
+/// `Int128` are three storage shapes of ONE domain, and a pair drawn
+/// from two of them - `Int(7)` against `Scaled(700, -2)` - is the same
+/// number. They meet whenever the two sides come from different
+/// FORMATS of one column (`ALTER TABLE ... ALTER c TYPE`), from the
+/// two legs of a `UNION`, from a column against a literal or a
+/// procedure/trigger local, or from a child column against a parent
+/// key declared at another scale (Firebird accepts a foreign key whose
+/// segments differ in SCALE).
+///
+/// Before 2026-09-03 there was NO mixed arm: only the three same-kind
+/// pairs were written, and a mixed pair fell to the rendered-text tail
+/// at the bottom of this function, where `"7"` and `"7.00"` are
+/// different strings. That cost a whole foreign key - a parent row
+/// deleted with a live child behind it, and the mirror refusal on the
+/// child side (`docs/roadmap.md`, "A MIXED EXACT-NUMERIC PAIR").
+///
+/// [num_cmp] is that alignment and is what the arm below uses, so the
+/// two places a mixed exact pair can be compared in this server give
+/// one answer by construction.
+///
+/// WHAT WAS MEASURED, against Firebird 6 at `127.0.0.1/3050`,
+/// 2026-09-03, over a column the ENGINE altered from `INTEGER` to
+/// `NUMERIC(9,2)` so that old rows carry scale 0 and new rows scale 2
+/// (the `M6` and `MX` fixtures of `qa/serve-real-scalefmt.sh`):
+///
+/// THE COMPARISON THEY PERFORM is the engine's. `ORDER BY` (both
+/// directions), `GROUP BY`, `SELECT DISTINCT`, `COUNT(DISTINCT)`,
+/// `LIST`, `MIN`/`MAX`, `UNION`, `EXISTS`, `IN`, `NOT IN`,
+/// `= ANY`/`= ALL`, `NULLIF`, `PERCENTILE_DISC`, the window
+/// `PARTITION BY` and `ORDER BY` (`RANK`, `DENSE_RANK`, `LAG`,
+/// `COUNT OVER`) and an unindexed equijoin group, order and match the
+/// rows the engine groups, orders and matches. WHICH of them the arm
+/// moved is a reviewer's measurement, not one re-taken here: running a
+/// 24-query probe against both binaries, six answered something else
+/// before the arm existed and nothing moved the other way (11 SAME /
+/// 13 DIFF on `79c4720`, 17 SAME / 7 DIFF with the arm). `docs/roadmap.md`
+/// records a DIFFERENT pair for the same shape of probe - 12/12 -> 19/5,
+/// taken against a binary built from THIS tree with only the arm
+/// reverted. Two baselines, two measurements; neither was re-taken on
+/// 2026-09-03 and neither supersedes the other.
+///
+/// WHAT THEY RENDERED WAS A SEPARATE DEFECT, and this comment claimed
+/// otherwise until 2026-09-03 - it said all of them "now answer what
+/// the engine answers", and two of them did not. `GROUP BY` and
+/// `SELECT DISTINCT` with the grouped column IN THE SELECT LIST, which
+/// is the ordinary way both are written, answered `0.07; 7.00` where
+/// the engine answers `7.00; 700.00` - and `700.00` was MISSING from
+/// the answer altogether. The mechanism was this arm being RIGHT while
+/// the read path was wrong: the arm correctly collapses an old-format
+/// row with a new-format one, the group's representative is the FIRST
+/// row seen (the old-format one), and that one was projected as its
+/// raw mantissa under the new format's scale. That is
+/// [present_field]'s defect, not this function's; it is fixed there,
+/// and with both in place every shape listed above answers what the
+/// engine answers on those fixtures (`qa/serve-real-scalefmt.sh`
+/// sections A, B, D and E; the whole gate is 57 OK / 0 DIFF here and
+/// 25 OK / 32 DIFF on a binary with the projection fix reverted - both
+/// taken while the gate carried 57 checks, before section H gained its
+/// range probe on 2026-09-03 and the gate became 59).
+///
+/// AND THE TWO FIXES ARE INDEPENDENT, which is worth saying because it
+/// changes what that gate is evidence OF. With the projection fixed, a
+/// stale row presents at the SAME KIND and scale as a fresh one, so no
+/// mixed pair reaches this function through that path at all: reverting
+/// THIS arm on top of the projection fix leaves
+/// `qa/serve-real-scalefmt.sh` at 57 OK / 0 DIFF (measured 2026-09-03,
+/// on the 57-check version of that gate).
+/// The arm's own evidence is elsewhere - the foreign-key path, where a
+/// child column and a parent key are declared at different scales and
+/// nothing converts them: `qa/serve-real-fkaction.sh` on that same
+/// arm-reverted binary is rc=1, 189 OK / 20 DIFF.
+///
+/// WHAT IS STILL WRONG THERE, and is NOT this function's to fix: an
+/// INDEX OLDER THAN THE FORMAT A ROW WAS WRITTEN UNDER does not name
+/// that row. Each entry is keyed at the scale the row carried when the
+/// entry was made, and a probe builds ONE key, so an index misses every
+/// row written under a format MINTED AFTER IT. Measured 2026-09-03,
+/// three fixtures, `INTEGER` -> `NUMERIC(9,2)` [-> `NUMERIC(18,4)`]:
+///
+/// ```text
+/// index made BEFORE the only ALTER
+///   WHERE N = 7    2           engine 2, 3
+///   WHERE N = 700  1           engine 1, 4
+///   WHERE N > 0    1, 2        engine 1, 2, 3, 4     (a RANGE probe too)
+/// index made AFTER a first ALTER and BEFORE a second
+///   WHERE N = 7    2, 3        engine 2, 3, 5
+///   WHERE N > 0    1, 2, 3, 4  engine 1, 2, 3, 4, 5
+/// index made after BOTH ALTERs: every probe is the engine's answer
+/// ```
+///
+/// Identical on a binary with the projection fix reverted, so it is the
+/// index KEY ENCODING and neither this arm's nor [present_field]'s; the
+/// first block is pinned in section H of that gate and all three are
+/// recorded in `docs/roadmap.md`. Two earlier characterisations of this
+/// were too narrow and are retired: the flat "with an INDEX on that
+/// column a probe loses the old-format rows", and then "it is the
+/// index's AGE relative to the ALTER that decides" - which holds only
+/// when there is exactly ONE ALTER. The middle fixture's index is
+/// YOUNGER than the ALTER and still loses rows.
 fn value_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
     use std::cmp::Ordering::*;
     match (a, b) {
@@ -49644,24 +51179,17 @@ fn value_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
         (Value::Text(x), Value::Text(y)) => x.trim_end_matches(' ').cmp(y.trim_end_matches(' ')),
         // same column, same declared scale - the raw values compare
         (Value::Scaled(x, sx), Value::Scaled(y, sy)) if sx == sy => x.cmp(y),
-        (Value::Scaled(x, sx), Value::Scaled(y, sy)) => {
-            // differing scales (cross-format): align exactly in i128
-            let ax = *x as i128 * 10i128.pow(sx.saturating_sub(*sy).max(0) as u32);
-            let ay = *y as i128 * 10i128.pow(sy.saturating_sub(*sx).max(0) as u32);
-            ax.cmp(&ay)
-        }
         (Value::Int128(x, sx), Value::Int128(y, sy)) if sx == sy => x.cmp(y),
-        (Value::Int128(x, sx), Value::Int128(y, sy)) => {
-            // differing scales (cross-format): align, saturating on the
-            // (astronomically unlikely) overflow
-            let up = |v: i128, by: i8| {
-                10i128
-                    .checked_pow(by.max(0) as u32)
-                    .and_then(|p| v.checked_mul(p))
-                    .unwrap_or(if v < 0 { i128::MIN } else { i128::MAX })
-            };
-            up(*x, sx.saturating_sub(*sy)).cmp(&up(*y, sy.saturating_sub(*sx)))
-        }
+        // EVERY OTHER PAIR OF EXACT NUMERICS: the same kind at two
+        // scales (cross-format), and - the arm that was missing - the
+        // kinds MIXED, `Int` against `Scaled`, `Int` against `Int128`,
+        // `Scaled` against `Int128`. [num_cmp] aligns both sides in
+        // i128 and cannot return `None` here, because [numeric_parts]
+        // answers `Some` for exactly these three variants.
+        (
+            Value::Int(_) | Value::Scaled(..) | Value::Int128(..),
+            Value::Int(_) | Value::Scaled(..) | Value::Int128(..),
+        ) => num_cmp(a, b).unwrap_or(Equal),
         (Value::DecFloat16(x), Value::DecFloat16(y)) => fire_crab_ods::decfloat::cmp(
             &fire_crab_ods::decfloat::decode_dec64(*x),
             &fire_crab_ods::decfloat::decode_dec64(*y),
@@ -53230,6 +54758,60 @@ fn eval_status_items(w: &mut W, e: &EvalErr) {
                 .int(2) // isc_arg_string - the object, quoted and qualified
                 .bytes(object.as_bytes());
             eval_status_items(w, inner);
+        }
+        EvalErr::InTrigger { .. } => {
+            // THE WHOLE TRACE IS ONE ITEM. The engine accumulates its
+            // stack into a single `isc_stack_trace` string with the
+            // frames on their own lines, which is why isql prints a
+            // dash before the FIRST frame and none before the rest -
+            // measured against the engine on a cascade that fails the
+            // child's CHECK:
+            //
+            //     Operation violates CHECK constraint "INTEG_46" ...
+            //     -At trigger "PUBLIC"."CHECK_19"
+            //     At trigger "PUBLIC"."CHECK_20"
+            //
+            // Shipping two items instead printed a dash on both.
+            // one level = the action trigger's own frame, then any
+            // frames of the PSQL body it ran inside
+            let mut levels: Vec<(String, Vec<String>)> = Vec::new(); // outermost first
+            let mut cur = e;
+            while let EvalErr::InTrigger { trigger, inner, outer } = cur {
+                levels.push((trigger.clone(), outer.clone()));
+                cur = inner;
+            }
+            levels.reverse(); // the engine names the innermost frame first
+            // ...and the innermost frame of all is the one the failing
+            // error names ITSELF, which must join the same string rather
+            // than stand as an item of its own. Two shapes do that: a
+            // CHECK violation naming its check trigger, and a USER
+            // TRIGGER that raised inside the cascade - its
+            // [EvalErr::AtProcedure] frames are already stack items, and
+            // leaving them separate printed a dash on the FK frame too
+            // (measured: the engine answers `-At trigger "..."."RSBD"
+            // line: 1, col: 73` then a BARE `At trigger "..."."CHECK_4"`).
+            let base_owned;
+            let (base, own): (&EvalErr, Vec<String>) = match cur {
+                EvalErr::CheckViolation { constraint, table, trigger: Some(t) } => {
+                    base_owned = EvalErr::CheckViolation {
+                        constraint: constraint.clone(),
+                        table: table.clone(),
+                        trigger: None,
+                    };
+                    (&base_owned, vec![format!("At trigger {}", t)])
+                }
+                EvalErr::AtProcedure { inner, at } => (inner.as_ref(), at.clone()),
+                other => (other, Vec::new()),
+            };
+            eval_status_items(w, base);
+            let text = own
+                .into_iter()
+                .chain(levels.into_iter().flat_map(|(t, outer)| {
+                    std::iter::once(format!("At trigger {}", t)).chain(outer)
+                }))
+                .collect::<Vec<_>>()
+                .join("\n");
+            w.int(1).int(GDS_STACK_TRACE).int(2).bytes(text.as_bytes());
         }
         EvalErr::CheckViolation { constraint, table, trigger } => {
             w.int(1) // isc_arg_gds
@@ -61240,6 +62822,28 @@ enum EvalErr {
     /// `isc_stack_trace` "At trigger ..." item naming the check trigger
     /// that fired (omitted when the trigger name is unknown)
     CheckViolation { constraint: String, table: String, trigger: Option<String> },
+    /// WHAT WENT WRONG INSIDE A TRIGGER, wrapped as the engine wraps
+    /// it: the failure's own vector first, then one `isc_stack_trace`
+    /// item naming the trigger the statement was inside. The engine
+    /// nests them - a cascade that fails a child's CHECK answers the
+    /// check violation, then `At trigger` for the CHECK trigger, then
+    /// `At trigger` for the referential-action trigger - so this wraps
+    /// and can wrap itself.
+    ///
+    /// This server's referential actions ([fk_action_stmts]) are not
+    /// trigger BODIES, but the engine performs them from a trigger it
+    /// synthesises on the parent, and its name is on file: a failing
+    /// cascade must say so, or the client is told a child's own
+    /// statement failed with no sign of what ran it.
+    ///
+    /// `outer` carries the frames of the PSQL body the whole thing was
+    /// INSIDE - the `At procedure "PUBLIC"."PDEL" line: 1, col: 32` a
+    /// stored procedure adds when a cascade fired from its body fails.
+    /// They belong to the SAME `isc_stack_trace` string as the trigger
+    /// frames ([wrap_at_procedure] puts them here rather than wrapping
+    /// this in an [EvalErr::AtProcedure]), because the engine ships one
+    /// item and isql prints its dash on the first line only.
+    InTrigger { trigger: String, inner: Box<EvalErr>, outer: Vec<String> },
     /// DML against a view that is not naturally updatable and has no
     /// trigger for the event: `isc_read_only_view` (335544362, SQLCODE
     /// -150, SQLSTATE 42000) with the pre-quoted `"SCHEMA"."VIEW"`, no
@@ -75895,7 +77499,12 @@ fn merge_exec(
                 .find(|(n, _)| *n == fmt)
                 .map(|(_, d)| d.clone())
                 .ok_or("MERGE target format unknown")?;
-            let values = decode_record(&img, &descs);
+            // the row's own format decodes it; the newest one PRESENTS
+            // it, so a key column whose scale changed writes the number
+            // as a literal and not the old mantissa ([present_through])
+            let newest: &[Descriptor] =
+                formats.iter().max_by_key(|(n, _)| *n).map(|(_, d)| d.as_slice()).unwrap_or(&[]);
+            let values = present_through(decode_record(&img, &descs), &descs, newest);
             let key_cols: Vec<&str> = if pk_cols.is_empty() {
                 rel_cols.iter().map(|c| c.name.as_str()).collect()
             } else {
@@ -76012,7 +77621,12 @@ fn merge_exec(
                         .find(|(n, _)| *n == fmt)
                         .map(|(_, d)| d.clone())
                         .ok_or("MERGE target format unknown")?;
-                    let values = decode_record(&img, &descs);
+                    let newest: &[Descriptor] = formats
+                        .iter()
+                        .max_by_key(|(n, _)| *n)
+                        .map(|(_, d)| d.as_slice())
+                        .unwrap_or(&[]);
+                    let values = present_through(decode_record(&img, &descs), &descs, newest);
                     let mut parts = Vec::new();
                     for pk in &pk_cols {
                         let col = rel_cols
@@ -76487,6 +78101,36 @@ fn wrap_at_procedure(inner: EvalErr, at: Vec<String>) -> EvalErr {
                 t.push_str(&line);
             }
             EvalErr::CheckViolation { constraint, table, trigger: Some(t) }
+        }
+        // AN FK-ACTION FRAME WOULD BE ONE ITEM TOO. [EvalErr::InTrigger]
+        // folds its whole chain into a single `isc_stack_trace` string,
+        // so an enclosing body's frame belongs INSIDE that string rather
+        // than as a second item - wrapping it in an
+        // [EvalErr::AtProcedure] printed a dash on both lines, where the
+        // engine prints one only on the first.
+        //
+        // THIS ARM IS NOT REACHED TODAY, and the sentence that used to
+        // stand here claimed a measurement of this server that is not
+        // what this server does. What was measured, 2026-09-03, on a
+        // cascade failing inside `PDEL`:
+        //
+        //   this server: ... -Problematic key value is ("ID" = 10)
+        //                    -At trigger "PUBLIC"."CHECK_1"
+        //   the engine:  ... -Problematic key value is ("ID" = 10)
+        //                    -At trigger "PUBLIC"."CHECK_1"
+        //                    At procedure "PUBLIC"."PDEL" line: 1, col: 32
+        //
+        // The bare `At procedure` line is the ENGINE's; this server
+        // emits NO enclosing frame at all, because `at` reaches here
+        // empty and [wrap_at_procedure] returns at its first line. The
+        // missing frame is GENERAL (a plain CHECK, a NOT NULL and a
+        // child-side FK failure inside a procedure lose it too) and is
+        // recorded in `docs/roadmap.md`. The arm stays because it is
+        // the right shape for the day the frame arrives; it is not
+        // evidence that it does.
+        EvalErr::InTrigger { trigger, inner, mut outer } => {
+            outer.extend(at);
+            EvalErr::InTrigger { trigger, inner, outer }
         }
         inner => EvalErr::AtProcedure { inner: Box::new(inner), at },
     }
@@ -88428,6 +90072,536 @@ pub fn serve(addr: &str, user: &str, password: &str) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
+    /// One parent-side FOREIGN KEY partnership, hand-built: parent key
+    /// column 0, child `C(B)` at field 1.
+    fn act_partner(on_update: RefAction, on_delete: RefAction) -> FkPartner {
+        FkPartner {
+            other_rel: 130,
+            other_formats: vec![(0u8, Vec::new())],
+            other_fids: vec![1],
+            my_fids: vec![0],
+            constraint: "INTEG_9".into(),
+            child_table: "C".into(),
+            my_cols: vec!["ID".into()],
+            other_cols: vec!["B".into()],
+            on_update,
+            on_delete,
+            opaque: false,
+            parent_index: "RDB$PRIMARY1".into(),
+        }
+    }
+
+    /// THE RULE IS THE ACTION. Each stored referential rule turns into
+    /// exactly the child statement the engine's synthesised trigger
+    /// performs - measured against the engine 2026-09-03, one parent
+    /// and one child per action.
+    #[test]
+    fn each_referential_rule_becomes_the_statement_the_engine_performs() {
+        let db = detached_db("fkaction-map");
+        let ctx = SessionCtx { user: "SYSDBA", attach_id: 1 };
+        let old = vec![Value::Int(1)];
+        let new = vec![Value::Int(99)];
+        let one = |fks: &[FkPartner], upd: bool| {
+            let n: Option<&[Value]> = upd.then_some(new.as_slice());
+            fk_action_stmts(&db, &ctx, fks, &old, n).unwrap()
+        };
+        // ON DELETE CASCADE: the child row is DELETED
+        let s = one(&[act_partner(RefAction::Restrict, RefAction::Cascade)], false);
+        assert_eq!(s.len(), 1);
+        assert!(matches!(s[0].kind, DmlKind::Delete));
+        assert_eq!(s[0].sql, "DELETE FROM C WHERE B = ?");
+        assert_eq!(s[0].args, vec![WireParam::Int(1, 0)]);
+        // ON DELETE SET NULL: the child is KEPT, its key nulled
+        let s = one(&[act_partner(RefAction::Restrict, RefAction::SetNull)], false);
+        assert!(matches!(s[0].kind, DmlKind::Update));
+        assert_eq!(s[0].sql, "UPDATE C SET B = NULL WHERE B = ?");
+        assert_eq!(s[0].args, vec![WireParam::Int(1, 0)]);
+        // ON UPDATE CASCADE: the child's key becomes the parent's NEW
+        // value - and the SET's parameter is numbered before the
+        // WHERE's, as the text reads
+        let s = one(&[act_partner(RefAction::Cascade, RefAction::Restrict)], true);
+        assert!(matches!(s[0].kind, DmlKind::Update));
+        assert_eq!(s[0].sql, "UPDATE C SET B = ? WHERE B = ?");
+        assert_eq!(s[0].args, vec![WireParam::Int(99, 0), WireParam::Int(1, 0)]);
+        // ON UPDATE SET NULL
+        let s = one(&[act_partner(RefAction::SetNull, RefAction::Restrict)], true);
+        assert_eq!(s[0].sql, "UPDATE C SET B = NULL WHERE B = ?");
+        // RESTRICT and NO ACTION do NOTHING - the ordinary refusal
+        // stands in their place ([fk_check_parent_row])
+        for a in [RefAction::Restrict, RefAction::NoAction] {
+            assert!(one(&[act_partner(a, a)], false).is_empty(), "{:?}", a);
+            assert!(one(&[act_partner(a, a)], true).is_empty(), "{:?}", a);
+        }
+        // THE RULE THAT ACTS IS THIS STATEMENT'S. A child declaring
+        // only ON UPDATE CASCADE keeps the default delete rule, and a
+        // parent DELETE performs nothing for it (measured: PF - it is
+        // REFUSED as a restrict child instead)
+        assert!(one(&[act_partner(RefAction::Cascade, RefAction::Restrict)], false).is_empty());
+        // AN UPDATE THAT LEAVES THE KEY ALONE touches no child - the
+        // engine's body is `IF (OLD.pk <> NEW.pk)`
+        let same = vec![Value::Int(1)];
+        assert!(fk_action_stmts(
+            &db,
+            &ctx,
+            &[act_partner(RefAction::Cascade, RefAction::Restrict)],
+            &old,
+            Some(&same),
+        )
+        .unwrap()
+        .is_empty());
+        // A NULL KEY references nothing, so nothing references it
+        assert!(fk_action_stmts(
+            &db,
+            &ctx,
+            &[act_partner(RefAction::Restrict, RefAction::Cascade)],
+            &[Value::Null],
+            None,
+        )
+        .unwrap()
+        .is_empty());
+        // EVERY partnership acts, not only the first: a parent with
+        // three acting children performs three statements
+        let s = one(
+            &[
+                act_partner(RefAction::Restrict, RefAction::Cascade),
+                act_partner(RefAction::Restrict, RefAction::SetNull),
+                act_partner(RefAction::Restrict, RefAction::Restrict),
+            ],
+            false,
+        );
+        assert_eq!(s.len(), 2);
+    }
+
+    /// Two-column parent key at fields 0 and 1, child `C(B1, B2)` at
+    /// fields 1 and 2 - for the shapes where only PART of a key is NULL.
+    fn act_partner2(on_update: RefAction, on_delete: RefAction) -> FkPartner {
+        FkPartner {
+            other_rel: 131,
+            other_formats: vec![(0u8, Vec::new())],
+            other_fids: vec![1, 2],
+            my_fids: vec![0, 1],
+            constraint: "INTEG_11".into(),
+            child_table: "C".into(),
+            my_cols: vec!["U1".into(), "U2".into()],
+            other_cols: vec!["B1".into(), "B2".into()],
+            on_update,
+            on_delete,
+            opaque: false,
+            parent_index: "RDB$PRIMARY1".into(),
+        }
+    }
+
+    /// AN `ON UPDATE` ACTION FIRES ONLY WHEN THE COMPARISON IS TRUE.
+    ///
+    /// The engine's synthesised body is `IF (OLD.k1 <> NEW.k1 [OR ...])`
+    /// and `<>` against NULL is UNKNOWN, not TRUE - so a new key of NULL
+    /// performs NOTHING and the parent statement meets the ordinary
+    /// master-side refusal instead. Measured against the engine
+    /// 2026-09-03 with one child row present: `UPDATE P SET U = NULL` is
+    /// refused under CASCADE, SET NULL, SET DEFAULT and no rule alike.
+    /// Treating it as an action wrote a child row the engine never
+    /// wrote, and `gfix` called the file clean.
+    ///
+    /// It is NOT "any NULL in the new key refuses": with a two-column
+    /// key the engine PERFORMS `SET U1 = 11, U2 = NULL` (one comparison
+    /// is TRUE) and refuses `SET U1 = 10, U2 = NULL` (none is).
+    #[test]
+    fn an_on_update_action_fires_only_when_a_key_column_really_changed() {
+        let db = detached_db("fkaction-null");
+        let ctx = SessionCtx { user: "SYSDBA", attach_id: 1 };
+        let stmts = |fk: FkPartner, old: &[Value], new: Option<&[Value]>| {
+            fk_action_stmts(&db, &ctx, &[fk], old, new).unwrap()
+        };
+        let old1 = [Value::Int(10)];
+        // every acting UPDATE rule performs NOTHING when the new key is
+        // NULL - the restrict path is what answers
+        for r in [RefAction::Cascade, RefAction::SetNull, RefAction::SetDefault] {
+            assert!(
+                stmts(act_partner(r, RefAction::Restrict), &old1, Some(&[Value::Null])).is_empty(),
+                "{:?} acted on a NULL new key",
+                r
+            );
+        }
+        // ...and it is not a blanket refusal of the rule: a real new
+        // value still acts. (`SET DEFAULT` needs the CHILD COLUMN's
+        // default out of the catalog, which a detached image has none
+        // of - qa/serve-real-fkaction.sh measures that rule against the
+        // engine on a real file.)
+        for r in [RefAction::Cascade, RefAction::SetNull] {
+            assert_eq!(
+                stmts(act_partner(r, RefAction::Restrict), &old1, Some(&[Value::Int(99)])).len(),
+                1,
+                "{:?} stopped acting altogether",
+                r
+            );
+        }
+        // TWO COLUMNS, and the engine's OR is what decides
+        let old2 = [Value::Int(10), Value::Int(20)];
+        let two = |new: [Value; 2]| {
+            stmts(act_partner2(RefAction::Cascade, RefAction::Restrict), &old2, Some(&new))
+        };
+        // one comparison TRUE: it fires, and the NULL is carried into
+        // the child as the parent's new value
+        let s = two([Value::Int(11), Value::Null]);
+        assert_eq!(s.len(), 1);
+        // the parent's NEW values travel as parameters, the NULL one
+        // included (`ON UPDATE SET NULL` is the rule that writes a
+        // literal NULL; a CASCADE carries whatever the parent now holds)
+        assert_eq!(s[0].sql, "UPDATE C SET B1 = ?, B2 = ? WHERE B1 = ? AND B2 = ?");
+        assert_eq!(two([Value::Null, Value::Int(21)]).len(), 1);
+        // no comparison TRUE - one column unchanged, the other NULL,
+        // and both NULL: nothing fires
+        assert!(two([Value::Int(10), Value::Null]).is_empty());
+        assert!(two([Value::Null, Value::Null]).is_empty());
+        // A DELETE has no such guard at all ...
+        assert_eq!(stmts(act_partner(RefAction::Restrict, RefAction::Cascade), &old1, None).len(), 1);
+        // ... but an OLD key with a NULL component matches no child
+        // row through `=`, so it performs nothing either way
+        assert!(stmts(
+            act_partner2(RefAction::Cascade, RefAction::Cascade),
+            &[Value::Int(10), Value::Null],
+            None
+        )
+        .is_empty());
+        assert!(stmts(
+            act_partner2(RefAction::Cascade, RefAction::Cascade),
+            &[Value::Int(10), Value::Null],
+            Some(&[Value::Int(11), Value::Null])
+        )
+        .is_empty());
+    }
+
+    /// THE SAME LAW ON THE CHECKING SIDE: a partnership whose action
+    /// does not fire is CHECKED exactly as a no-rule partnership is -
+    /// its children refuse the statement, which is what the engine
+    /// answers. (It does not "end a walk": this server asks EVERY
+    /// partnership, see the decision on [fk_check_parent_row].)
+    ///
+    /// The partner relation is empty here (no file behind
+    /// [detached_db]), which is the NO-CHILDREN case: it must keep
+    /// SUCCEEDING under every rule, or the fix would be a blanket
+    /// refusal - its own regression.
+    #[test]
+    fn a_non_firing_action_takes_the_restrict_path_and_no_children_still_succeeds() {
+        let db = detached_db("fkaction-walk");
+        let ctx = SessionCtx { user: "SYSDBA", attach_id: 1 };
+        let old = [Value::Int(10)];
+        let ok = |r: RefAction, new: Option<&[Value]>| {
+            fk_check_parent_row(&db, &ctx, &[act_partner(r, r)], &old, new).is_ok()
+        };
+        // no children: a key set to NULL succeeds under every rule -
+        // measured on the engine, all four
+        for r in [
+            RefAction::Cascade,
+            RefAction::SetNull,
+            RefAction::SetDefault,
+            RefAction::Restrict,
+            RefAction::NoAction,
+        ] {
+            assert!(ok(r, Some(&[Value::Null])), "{:?} refused with no children", r);
+            assert!(ok(r, Some(&[Value::Int(99)])), "{:?} refused a real change", r);
+            assert!(ok(r, None), "{:?} refused a DELETE", r);
+        }
+        // an all-NULL key is unreferenceable and never even asks
+        assert!(fk_check_parent_row(
+            &db,
+            &ctx,
+            &[act_partner(RefAction::Restrict, RefAction::Restrict)],
+            &[Value::Null],
+            None
+        )
+        .is_ok());
+    }
+
+    /// One parent-side partnership on a NAMED referenced index -
+    /// everything else as [act_partner] builds it.
+    fn idx_partner(parent_index: &str, on_update: RefAction, on_delete: RefAction) -> FkPartner {
+        let mut p = act_partner(on_update, on_delete);
+        p.parent_index = parent_index.into();
+        p.constraint = format!("K_{}", parent_index);
+        p
+    }
+
+    /// THE DIVERGENCE, ASSERTED AS A DECISION: this server asks EVERY
+    /// partnership, where the engine asks one per referenced index (the
+    /// first `RDB$INDICES` row naming it, in physical record order).
+    /// The reason and the exact consequence are on
+    /// [fk_check_parent_row].
+    ///
+    /// What is pinned here is that the walk cannot be ENDED. Its three
+    /// predecessors each ended it somewhere - at the first partnership
+    /// whose rule ACTS, at the first row per referenced index - and
+    /// each one shipped a parent row deleted that the engine keeps,
+    /// with an orphan behind it and `gfix -v -full` clean. So a
+    /// partnership placed BEHIND an acting one, or behind an empty one,
+    /// or behind one on the same referenced index, is still asked.
+    ///
+    /// The ROW-level half - that a partnership reached this way
+    /// actually refuses, and that the engine reading this server's file
+    /// then finds no orphan - cannot be built here: [detached_db] has
+    /// no file behind it, so no partnership can hold a key. That half
+    /// is `qa/serve-real-fkaction.sh` section 13, against the engine,
+    /// on real files. What IS asserted here is the selection and the
+    /// no-children direction, which is the one a blanket refusal would
+    /// break.
+    #[test]
+    fn every_partnership_is_asked_and_the_walk_cannot_be_ended() {
+        let r = RefAction::Restrict;
+        let c = RefAction::Cascade;
+        let all = |fks: &[FkPartner]| fk_asked_partnerships(fks).collect::<Vec<_>>();
+        // three partnerships on ONE referenced index: the engine asks
+        // the first and shadows the other two
+        let one_index = [
+            idx_partner("RDB$PRIMARY1", r, r),
+            idx_partner("RDB$PRIMARY1", r, r),
+            idx_partner("RDB$PRIMARY1", r, c),
+        ];
+        assert_eq!(all(&one_index), vec![0, 1, 2]);
+        // an ACTING partnership in front does not end it either - the
+        // `Q1`(cascading)/`Q2`(holding) shape, whose engine answer is a
+        // dangling `Q2` row
+        let acting_first = [idx_partner("RDB$PRIMARY1", r, c), idx_partner("RDB$PRIMARY1", r, r)];
+        assert_eq!(all(&acting_first), vec![0, 1]);
+        // two indexes, and every partnership on both
+        let two_indexes = [
+            idx_partner("RDB$PRIMARY1", r, c),
+            idx_partner("RDB$2", r, r),
+            idx_partner("RDB$2", r, r),
+        ];
+        assert_eq!(all(&two_indexes), vec![0, 1, 2]);
+        // NOTHING IS SELECTED ON `parent_index` ANY MORE: three
+        // partnerships all naming one index and three naming three are
+        // the same three questions
+        let all_same = [
+            idx_partner("RDB$PRIMARY1", r, r),
+            idx_partner("RDB$PRIMARY1", r, r),
+            idx_partner("RDB$PRIMARY1", r, r),
+        ];
+        let all_distinct = [
+            idx_partner("RDB$PRIMARY1", r, r),
+            idx_partner("RDB$2", r, r),
+            idx_partner("RDB$3", r, r),
+        ];
+        assert_eq!(all(&all_same), all(&all_distinct));
+        assert!(all(&[]).is_empty());
+        // ...and the walk itself still SUCCEEDS on every one of those
+        // arrangements when no child holds the key: asking more
+        // partnerships must not become a blanket refusal, which would
+        // be this round's own regression
+        let db = detached_db("fkaction-every");
+        let ctx = SessionCtx { user: "SYSDBA", attach_id: 1 };
+        for fks in [
+            one_index.as_slice(),
+            acting_first.as_slice(),
+            two_indexes.as_slice(),
+            all_same.as_slice(),
+            all_distinct.as_slice(),
+        ] {
+            assert!(fk_check_parent_row(&db, &ctx, fks, &[Value::Int(10)], None).is_ok());
+            assert!(fk_check_parent_row(
+                &db,
+                &ctx,
+                fks,
+                &[Value::Int(10)],
+                Some(&[Value::Int(99)])
+            )
+            .is_ok());
+        }
+    }
+
+    /// AN ACTION IS A WRITE, NOT A WAIVER: the engine's action is an
+    /// AFTER trigger on the parent and the master-side check reads the
+    /// child once it has run, so what matters is whether the action
+    /// leaves the OLD key standing. Measured 2026-09-03:
+    /// `B INTEGER DEFAULT 7 REFERENCES SP ON DELETE SET DEFAULT` with a
+    /// child row `B = 7` has `DELETE FROM SP WHERE ID = 7` REFUSED,
+    /// `-Problematic key value is ("ID" = 7)` - the action wrote 7 over
+    /// 7. Skipping an acting partnership deleted that parent row.
+    #[test]
+    fn an_action_that_writes_the_key_straight_back_still_refuses() {
+        let db = detached_db("fkaction-leaves");
+        let ctx = SessionCtx { user: "SYSDBA", attach_id: 1 };
+        let ten = Value::Int(10);
+        let old: Vec<&Value> = vec![&ten];
+        let leaves = |r: RefAction, new: Option<&[&Value]>| {
+            fk_action_leaves_old_key(&db, &ctx, &act_partner(r, r), &old, new)
+        };
+        // the three that CLEAR the key: nothing is left to find
+        assert!(!leaves(RefAction::Cascade, None)); // ON DELETE CASCADE
+        assert!(!leaves(RefAction::SetNull, None));
+        assert!(!leaves(RefAction::SetNull, Some(&[&Value::Int(99)])));
+        // ON UPDATE CASCADE writes the parent's NEW key, and
+        // [fk_action_fires] has already established it differs
+        assert!(!leaves(RefAction::Cascade, Some(&[&Value::Int(99)])));
+        // ...and the degenerate case is stated exactly rather than
+        // assumed away: a NEW key equal to the OLD one would leave it
+        assert!(leaves(RefAction::Cascade, Some(&[&ten])));
+        // a rule that is not an action at all never reaches here, and
+        // answers "the rows stand"
+        assert!(leaves(RefAction::Restrict, None));
+        assert!(leaves(RefAction::NoAction, None));
+        // `SET DEFAULT` is decided by the CHILD COLUMN's default, which
+        // a detached image does not carry - the catalog read answers
+        // None and the wider acceptance stands (qa/serve-real-fkaction.sh
+        // measures both spellings against the engine on a real file)
+        assert!(!leaves(RefAction::SetDefault, None));
+        // the comparison the real path makes, on the values themselves
+        let dv = |d: &DefaultVal| default_as_value(d, &ctx);
+        assert_eq!(dv(&DefaultVal::Int(7, 0)), Some(Value::Int(7)));
+        assert_eq!(dv(&DefaultVal::Int(15, -1)), Some(Value::Scaled(15, -1)));
+        assert_eq!(dv(&DefaultVal::Null), Some(Value::Null));
+        assert_eq!(dv(&DefaultVal::Text("x".into())), Some(Value::Text("x".into())));
+        // A NON-LITERAL DEFAULT IS EVALUATED, NOT WAIVED. Answering
+        // None here and calling that "the wider acceptance" was a
+        // silent wrong write: `DEFAULT CURRENT_USER` on a child row
+        // 'SYSDBA' let `DELETE FROM SPU WHERE ID = 'SYSDBA'` through,
+        // and the action then wrote 'SYSDBA' straight back.
+        assert_eq!(dv(&DefaultVal::User), Some(Value::Text("SYSDBA".into())));
+        assert_eq!(
+            dv(&DefaultVal::User),
+            default_as_value(&DefaultVal::User, &SessionCtx { user: "sysdba", attach_id: 9 })
+        );
+        assert_eq!(dv(&DefaultVal::Role), Some(Value::Text("NONE".into())));
+        assert_eq!(dv(&DefaultVal::Connection), Some(Value::Int(1)));
+        assert_eq!(dv(&DefaultVal::CurrentDate), Some(Value::Date(session_now().0)));
+        // ...and the whole point of evaluating it: a CURRENT_USER
+        // default IS the key going away, so the action leaves it and
+        // the statement must refuse
+        let u = Value::Text("SYSDBA".into());
+        assert_eq!(
+            dv(&DefaultVal::User).map(|v| value_cmp(&v, &u) == std::cmp::Ordering::Equal),
+            Some(true)
+        );
+        // CURRENT_TRANSACTION is the ONE form still unevaluatable, and
+        // there the wider acceptance is sound because
+        // [default_wire_param] refuses it too, so [fk_action_stmts]
+        // refuses the whole statement a moment later - with a bare
+        // `42000 Dynamic SQL Error` where the engine answers `23000`
+        // (measured; the message gap is pre-existing and recorded)
+        assert_eq!(dv(&DefaultVal::Transaction), None);
+        assert!(default_wire_param(&DefaultVal::Transaction, &ctx).is_none());
+        // THE PAIR MUST NOT DRIFT: what this compares and what the
+        // action BINDS answer Some/None on exactly the same forms
+        for d in [
+            DefaultVal::Int(7, 0),
+            DefaultVal::Int(15, -1),
+            DefaultVal::Text("x".into()),
+            DefaultVal::Null,
+            DefaultVal::CurrentDate,
+            DefaultVal::CurrentTime,
+            DefaultVal::CurrentTimestamp,
+            DefaultVal::User,
+            DefaultVal::Role,
+            DefaultVal::Connection,
+            DefaultVal::Transaction,
+        ] {
+            assert_eq!(
+                default_as_value(&d, &ctx).is_some(),
+                default_wire_param(&d, &ctx).is_some(),
+                "{:?} is evaluated on one side and not the other",
+                d
+            );
+        }
+    }
+
+    /// A KEY THAT DID NOT MOVE IS NOT CHECKED, ON EITHER SIDE - and
+    /// "did not move" is `IS DISTINCT FROM`, so two NULLs are ONE key.
+    ///
+    /// The engine checks a foreign key while maintaining the INDEX, and
+    /// an UPDATE whose key compares equal never touches it. Testing a
+    /// NULL component as "changed" was a new over-refusal on the master
+    /// side (`UPDATE PE1 SET U1 = 10, U2 = NULL` on a parent already
+    /// holding `(10, NULL)`, which the engine performs) and on the
+    /// child side refused a parent DELETE the engine performs (an
+    /// `ON DELETE SET DEFAULT` writing 7 over 7 while the parent 7 goes
+    /// away, behind a different, empty partnership on the same index -
+    /// the engine says nothing; with `DEFAULT 77` the key really moves
+    /// and the engine DOES refuse). The child side has to stay right
+    /// whatever the master side decides: an action's own write must not
+    /// be refused from the inside for a key that did not move.
+    #[test]
+    fn a_key_that_did_not_move_is_not_checked_on_either_side() {
+        let n = Value::Null;
+        let ten = Value::Int(10);
+        let eleven = Value::Int(11);
+        let twenty = Value::Int(20);
+        // NULL against NULL is the SAME key
+        assert!(!fk_key_moved(&[&n], &[&n]));
+        assert!(!fk_key_moved(&[&ten, &n], &[&ten, &n]));
+        assert!(!fk_key_moved(&[&ten, &twenty], &[&ten, &twenty]));
+        // ...and a NULL against a value, either way round, is a move
+        assert!(fk_key_moved(&[&ten], &[&n]));
+        assert!(fk_key_moved(&[&n], &[&ten]));
+        assert!(fk_key_moved(&[&ten, &twenty], &[&ten, &n]));
+        assert!(fk_key_moved(&[&ten, &n], &[&ten, &twenty]));
+        assert!(fk_key_moved(&[&ten], &[&eleven]));
+        // THE PAIR THAT SEPARATES THIS FROM [fk_action_fires]:
+        // (10, 20) -> (10, NULL) MOVES the key and fires NOTHING, which
+        // is why the statement meets the check and is refused
+        assert!(fk_key_moved(&[&ten, &twenty], &[&ten, &n]));
+        assert!(!fk_action_fires(&[&ten, &twenty], Some(&[&ten, &n])));
+        // ...while (10, 20) -> (11, NULL) both moves AND fires
+        assert!(fk_key_moved(&[&ten, &twenty], &[&eleven, &n]));
+        assert!(fk_action_fires(&[&ten, &twenty], Some(&[&eleven, &n])));
+        // an unchanged key fires nothing and is not checked either
+        assert!(!fk_action_fires(&[&ten, &n], Some(&[&ten, &n])));
+        // and the master-side check agrees on the whole shape: a
+        // no-op rewrite of a partly-NULL key is accepted
+        let db = detached_db("fkkey-moved");
+        let ctx = SessionCtx { user: "SYSDBA", attach_id: 1 };
+        assert!(fk_check_parent_row(
+            &db,
+            &ctx,
+            &[act_partner2(RefAction::Cascade, RefAction::Cascade)],
+            &[Value::Int(10), Value::Null],
+            Some(&[Value::Int(10), Value::Null]),
+        )
+        .is_ok());
+    }
+
+    /// A CASCADE THAT WILL NOT TERMINATE IS REFUSED, not run for ever.
+    /// Cycles terminate on their own - each level takes rows the next
+    /// no longer finds, which is why the engine accepts a
+    /// self-referencing key, a row referencing ITSELF and a two-table
+    /// cycle (all three measured) - but each level here is a whole
+    /// executor frame over a published copy of the file, so the depth
+    /// is bounded rather than trusted.
+    ///
+    /// THE BOUND IS THE ENGINE'S, AND SO IS THE VECTOR. The engine
+    /// takes a self-referencing `ON DELETE CASCADE` chain of 1001 rows
+    /// and refuses 1002 with `isc_req_max_clones_exceeded` (SQLSTATE
+    /// 54001), writing nothing; so does this. A refusal that reached
+    /// the client as a bare `Dynamic SQL Error` told an operator
+    /// nothing - the ceiling is reached by ROW DATA, on a schema of one
+    /// table, so it has to be nameable.
+    #[test]
+    fn a_cascade_is_bounded_in_depth() {
+        let ctx = SessionCtx { user: "SYSDBA", attach_id: 1 };
+        let img = || fire_crab_ods::Image::from_bytes(&[], 4096);
+        let mut none: Option<Database> = None;
+        // under the ceiling the depth is not what stops it
+        let code = |r: Result<fire_crab_ods::Image, ExecErr>| match r {
+            Ok(_) => 0,
+            Err(ExecErr::Gds(c, _)) => c,
+            Err(_) => -1,
+        };
+        let under = code(run_fk_actions_published(&mut none, img(), None, &ctx, &[]));
+        assert_ne!(under, GDS_REQ_MAX_CLONES);
+        FK_ACTION_DEPTH.with(|d| d.set(MAX_FK_ACTION_DEPTH));
+        let over = code(run_fk_actions_published(&mut none, img(), None, &ctx, &[]));
+        // the ENGINE'S code, not a bare text that becomes `Dynamic SQL
+        // Error` on the way to the client
+        assert_eq!(over, GDS_REQ_MAX_CLONES);
+        // ...and the counter is put back, so the next statement of the
+        // same connection starts at the top again
+        assert_eq!(FK_ACTION_DEPTH.with(|d| d.get()), MAX_FK_ACTION_DEPTH);
+        FK_ACTION_DEPTH.with(|d| d.set(0));
+        // the bound is the engine's measured boundary, not a round
+        // number: a chain of 1001 rows reaches depth 1001 here and the
+        // engine performs it; 1002 refuses on both
+        assert_eq!(MAX_FK_ACTION_DEPTH, 1001);
+    }
+
     /// A Database with no file behind it - the empty detached image the
     /// row-source tests use, which is all a write that must FAIL needs.
     fn detached_db(path: &str) -> Database {
@@ -92719,6 +94893,271 @@ mod tests {
         assert_eq!(value_cmp(&Value::Null, &Value::Date(0)), Less); // NULLs still lowest
     }
 
+    /// A RECORD IS PRESENTED THROUGH THE FORMAT THAT DESCRIBES IT NOW.
+    ///
+    /// Decoding under the format a record was WRITTEN under is only half
+    /// the law: the value then has to be CONVERTED into the format it is
+    /// presented through, because an exact numeric travels as a raw
+    /// mantissa and every reader downstream divides by the CURRENT
+    /// descriptor's `10^|scale|`. Measured against Firebird 6 at
+    /// `127.0.0.1/3050` on 2026-09-03: rows 700 and 7 stored under
+    /// `INTEGER`, then `ALTER TABLE M6 ALTER N TYPE NUMERIC(9,2)`, and
+    /// the engine reads them back as `700.00` and `7.00` where this
+    /// server read `7.00` and `0.07`.
+    ///
+    /// The NARROWING direction is reachable and it ROUNDS HALF AWAY FROM
+    /// ZERO - measured, not chosen: the engine accepts `NUMERIC(9,2)` ->
+    /// `INTEGER`, `-> BIGINT` and `-> NUMERIC(18,1)` (it refuses
+    /// `-> NUMERIC(9,4)`, "New scale specified for column N must be at
+    /// most 2"), and reading the old rows back it answers `7.55` -> `8`,
+    /// `7.45` -> `7`, `7.50` -> `8`, `8.50` -> `9` (so NOT banker's),
+    /// `-7.55` -> `-8`, `-7.50` -> `-8`, `-0.51` -> `-1`, and at one
+    /// decimal `7.05` -> `7.1`, `-7.45` -> `-7.5`.
+    #[test]
+    fn a_stored_value_is_rescaled_into_the_format_it_is_presented_through() {
+        let d = |dtype: u8, scale: i8, length: u16| Descriptor {
+            dtype,
+            scale,
+            length,
+            sub_type: 0,
+            flags: 0,
+            offset: 8,
+        };
+        let long0 = d(dtype::LONG, 0, 4);
+        let long2 = d(dtype::LONG, -2, 4);
+        let long1 = d(dtype::LONG, -1, 4);
+        let short0 = d(dtype::SHORT, 0, 2);
+        let i64_2 = d(dtype::INT64, -2, 8);
+        let i64_4 = d(dtype::INT64, -4, 8);
+        let w128_2 = d(dtype::INT128, -2, 16);
+        let w128_4 = d(dtype::INT128, -4, 16);
+        let f = |v: Value, a: &Descriptor, b: &Descriptor| present_field(&v, a, b);
+
+        // Int -> scaled: the M6 reproducer itself, both rows
+        assert_eq!(f(Value::Int(700), &long0, &long2), Some(Value::Scaled(70000, -2)));
+        assert_eq!(f(Value::Int(7), &long0, &long2), Some(Value::Scaled(700, -2)));
+        // ...and negatives, and a SMALLINT source (a different width)
+        assert_eq!(f(Value::Int(-7), &short0, &long2), Some(Value::Scaled(-700, -2)));
+        // Scaled -> a DIFFERENT scale, both directions
+        assert_eq!(f(Value::Scaled(700, -2), &i64_2, &i64_4), Some(Value::Scaled(70000, -4)));
+        assert_eq!(f(Value::Scaled(-250, -2), &i64_2, &i64_4), Some(Value::Scaled(-25000, -4)));
+        // Int128, and the kinds crossing: an i64-backed source presented
+        // through an INT128 column becomes Int128, and the reverse
+        assert_eq!(f(Value::Int(7), &long0, &w128_2), Some(Value::Int128(700, -2)));
+        assert_eq!(
+            f(Value::Scaled(700, -2), &i64_2, &w128_4),
+            Some(Value::Int128(70000, -4))
+        );
+        assert_eq!(
+            f(Value::Int128(70000, -4), &w128_4, &w128_2),
+            Some(Value::Int128(700, -2))
+        );
+        // THE NARROWING DIRECTION, at the measured rule: half away from
+        // zero, and the ties go AWAY from zero rather than to even
+        for (raw, want) in [
+            (755i64, 8i64),
+            (745, 7),
+            (750, 8),
+            (850, 9), // banker's would answer 8
+            (-755, -8),
+            (-745, -7),
+            (-750, -8),
+            (49, 0),
+            (51, 1),
+            (-51, -1),
+            (799, 8),
+            (-1, 0),
+        ] {
+            assert_eq!(
+                f(Value::Scaled(raw, -2), &long2, &long0),
+                Some(Value::Int(want)),
+                "{raw} at scale -2 into an integer"
+            );
+        }
+        // ...and losing ONE decimal rather than two
+        for (raw, want) in [(755i64, 76i64), (745, 75), (705, 71), (-755, -76), (-705, -71)] {
+            assert_eq!(
+                f(Value::Scaled(raw, -2), &long2, &long1),
+                Some(Value::Scaled(want, -1)),
+                "{raw} at scale -2 into scale -1"
+            );
+        }
+        // A SCALE THAT DID NOT CHANGE IS NOT TOUCHED - the fast path, and
+        // the overwhelming majority of every read
+        assert_eq!(f(Value::Int(7), &long0, &long0), None);
+        assert_eq!(f(Value::Scaled(700, -2), &long2, &long2), None);
+        // NULL and the non-numeric families are left exactly as decoded:
+        // the engine refuses those ALTERs anyway (measured:
+        // `NUMERIC(18,2)` -> `DOUBLE PRECISION` is "Conversion from base
+        // type BIGINT to DOUBLE PRECISION is not supported")
+        assert_eq!(f(Value::Null, &long0, &long2), None);
+        assert_eq!(
+            f(Value::Text("7".into()), &d(dtype::TEXT, 0, 4), &long2),
+            None
+        );
+        assert_eq!(f(Value::Double(7.0), &d(dtype::DOUBLE, 0, 8), &long2), None);
+        // AT THE EXTREMES IT DECLINES rather than saturating, zeroing or
+        // panicking: a conversion whose result does not fit the target's
+        // backing width answers None, and the value is left as decoded.
+        // No engine-accepted ALTER can reach this (the engine will not
+        // let the integral part grow), so it is a floor, not a path.
+        assert_eq!(f(Value::Int(i64::MAX), &d(dtype::INT64, 0, 8), &i64_2), None);
+        assert_eq!(
+            f(Value::Int128(i128::MAX, 0), &d(dtype::INT128, 0, 16), &w128_4),
+            None
+        );
+        // ...and a whole record: field 0 untouched, field 1 converted
+        let stored = vec![long0, long0];
+        let newest = vec![long0, long2];
+        assert_eq!(
+            present_through(vec![Value::Int(1), Value::Int(700)], &stored, &newest),
+            vec![Value::Int(1), Value::Scaled(70000, -2)]
+        );
+        // a field the newest format does not describe is left alone
+        assert_eq!(
+            present_through(vec![Value::Int(1), Value::Int(700)], &stored, &newest[..1]),
+            vec![Value::Int(1), Value::Int(700)]
+        );
+    }
+
+    /// EVERY MIXED EXACT-NUMERIC PAIR, in both directions. `Int` is scale
+    /// 0, `Scaled` an i64 mantissa at a scale, `Int128` the wide one; the
+    /// three are storage shapes of ONE domain and a pair drawn from two
+    /// of them compares as a NUMBER. Before 2026-09-03 no such arm
+    /// existed and the pair fell to the rendered-text tail, where `"7"`
+    /// and `"7.00"` are different strings.
+    #[test]
+    fn value_cmp_aligns_every_mixed_exact_numeric_pair() {
+        use std::cmp::Ordering::*;
+        let i = Value::Int;
+        let sc = |r: i64, s: i8| Value::Scaled(r, s);
+        let w = |r: i128, s: i8| Value::Int128(r, s);
+        // EQUAL values written at different scales, all nine kind pairs
+        for (a, b) in [
+            (i(7), sc(700, -2)),
+            (i(7), w(700, -2)),
+            (i(7), w(7, 0)),
+            (sc(700, -2), w(70, -1)),
+            (sc(700, -2), w(7, 0)),
+            (sc(70, -1), sc(700, -2)),
+            (w(70, -1), w(700, -2)),
+            (i(0), sc(0, -5)),
+            (i(0), w(0, -5)),
+            (sc(0, -2), w(0, -9)),
+            (i(-7), sc(-700, -2)),
+            (i(-7), w(-700, -2)),
+        ] {
+            assert_eq!(value_cmp(&a, &b), Equal, "{:?} vs {:?}", a, b);
+            assert_eq!(value_cmp(&b, &a), Equal, "{:?} vs {:?}", b, a);
+        }
+        // STRICT ordering across the kinds, both directions
+        for (lo, hi) in [
+            (i(7), sc(701, -2)),
+            (sc(699, -2), i(7)),
+            (i(7), w(70001, -4)),
+            (w(69999, -4), i(7)),
+            (sc(-1, -2), i(0)),
+            (i(0), sc(1, -2)),
+            (sc(70, -1), w(701, -2)),
+            (w(-8, 0), sc(-750, -2)),
+            (i(i64::MIN), sc(i64::MIN, -1)),
+            (sc(i64::MAX, -1), i(i64::MAX)),
+        ] {
+            assert_eq!(value_cmp(&lo, &hi), Less, "{:?} < {:?}", lo, hi);
+            assert_eq!(value_cmp(&hi, &lo), Greater, "{:?} > {:?}", hi, lo);
+        }
+        // the mixed arm and [num_cmp] are ONE alignment, not two: every
+        // exact pair must answer the same through either door, or a
+        // consumer's answer would depend on which function it reached
+        let all = [i(7), i(0), i(-3), sc(700, -2), sc(-1, -3), sc(0, -2), w(700, -2), w(7, 0), w(-3, 0)];
+        for a in &all {
+            for b in &all {
+                assert_eq!(Some(value_cmp(a, b)), num_cmp(a, b), "{:?} vs {:?}", a, b);
+            }
+        }
+        // and NOTHING ELSE moved: text still trims blanks, an approximate
+        // side still promotes to f64, a DECFLOAT still compares as
+        // decimal128, and a text/number pair still falls to the tail
+        assert_eq!(value_cmp(&Value::Text("a ".into()), &Value::Text("a".into())), Equal);
+        assert_eq!(value_cmp(&Value::Double(7.0), &sc(700, -2)), Equal);
+        assert_eq!(value_cmp(&Value::Double(6.9), &i(7)), Less);
+        // a TEXT side against a number is still the rendered-text tail:
+        // "10" sorts BELOW "9" there, where a numeric compare would not
+        assert_eq!(value_cmp(&Value::Text("10".into()), &i(9)), Less);
+    }
+
+    /// THE TWO REPRODUCERS THE MISSING ARM COST, at the functions that
+    /// asked the question. Both are one schema: a `NUMERIC(9,2)` parent
+    /// key and a child that meets it at scale 0.
+    #[test]
+    fn a_cross_scale_key_is_the_same_key_on_both_sides_of_a_foreign_key() {
+        use std::cmp::Ordering::Equal;
+        let key_at_scale_2 = Value::Scaled(700, -2);
+        // CHILD SIDE - `INSERT INTO AC VALUES (1, 7)` against a parent
+        // row holding 7.00. [row_carries_key_at] is what asks whether the
+        // parent index holds the child's key; answering "no" refused an
+        // INSERT the engine accepts.
+        let parent_row = [Value::Int(1), key_at_scale_2.clone()];
+        let child_key = [&Value::Int(7)];
+        assert!(row_carries_key_at(&parent_row, &[1], &child_key, false));
+        // ...and a value that is NOT the key still misses
+        assert!(!row_carries_key_at(&parent_row, &[1], &[&Value::Int(8)], false));
+        // PARENT SIDE - `ON DELETE SET DEFAULT` with `DEFAULT 7` against
+        // the key 7.00 going away. [fk_action_leaves_old_key] compares
+        // exactly these two values; "not equal" read as "the action
+        // cleared the key", waived the refusal, and the action then wrote
+        // the deleted key back.
+        let ctx = SessionCtx { user: "sysdba", attach_id: 1 };
+        let written = default_as_value(&DefaultVal::Int(7, 0), &ctx).unwrap();
+        assert_eq!(value_cmp(&written, &key_at_scale_2), Equal);
+        // the CONTRAST that must keep working: a default that is a
+        // DIFFERENT key does not hold the row, and the delete proceeds
+        let other = default_as_value(&DefaultVal::Int(8, 0), &ctx).unwrap();
+        assert_ne!(value_cmp(&other, &key_at_scale_2), Equal);
+    }
+
+    /// A DECIMAL LITERAL DEFAULT is the engine's scaled `blr_long`. The
+    /// bytes are the ones read back out of the engine's own catalog
+    /// (`HEX_ENCODE(RDB$DEFAULT_VALUE)`, 2026-09-03) - see
+    /// [fire_crab_ods::ddl::num_default_blr].
+    #[test]
+    fn a_decimal_literal_default_is_a_scaled_blr_long() {
+        let hex = |h: &str| -> Vec<u8> {
+            (0..h.len() / 2).map(|i| u8::from_str_radix(&h[i * 2..i * 2 + 2], 16).unwrap()).collect()
+        };
+        assert_eq!(num_literal_default_blr("7"), Some(hex("05150800070000004C")));
+        assert_eq!(num_literal_default_blr("7.0"), Some(hex("051508FF460000004C")));
+        assert_eq!(num_literal_default_blr("7.00"), Some(hex("051508FEBC0200004C")));
+        assert_eq!(num_literal_default_blr("-7.25"), Some(hex("051508FE2BFDFFFF4C")));
+        assert_eq!(num_literal_default_blr("7.5"), Some(hex("051508FF4B0000004C")));
+        assert_eq!(num_literal_default_blr("1.5"), Some(hex("051508FF0F0000004C")));
+        assert_eq!(num_literal_default_blr("123456.7890"), Some(hex("051508FCD20296494C")));
+        assert_eq!(num_literal_default_blr("-3"), Some(hex("05150800FDFFFFFF4C")));
+        // and it round-trips through the reader, at the scale it was written
+        assert_eq!(
+            decode_default_blr(&num_literal_default_blr("7.00").unwrap()),
+            Some(DefaultVal::Int(700, -2))
+        );
+        assert_eq!(
+            default_as_value(&decode_default_blr(&num_literal_default_blr("7.00").unwrap()).unwrap(),
+                             &SessionCtx { user: "sysdba", attach_id: 1 }),
+            Some(Value::Scaled(700, -2))
+        );
+        // DECLINED, each the refusal this function already gave: an
+        // exponent, a hex literal, a mantissa wider than `blr_long`
+        // (the engine writes `blr_int64` there and this server does
+        // not), and a lone sign or dot
+        assert_eq!(num_literal_default_blr("1e3"), None);
+        assert_eq!(num_literal_default_blr("0x10"), None);
+        assert_eq!(num_literal_default_blr("12345678901.2345"), None);
+        assert_eq!(num_literal_default_blr("2147483648"), None); // i32::MAX + 1
+        assert_eq!(num_literal_default_blr("-2147483648"), Some(hex("05150800000000804C")));
+        assert_eq!(num_literal_default_blr("-"), None);
+        assert_eq!(num_literal_default_blr("."), None);
+        assert_eq!(num_literal_default_blr("7.a"), None);
+        assert_eq!(num_literal_default_blr(""), None);
+    }
+
     #[test]
     fn encodes_row_bitmap_and_values() {
         // two INT64 cols, second null: 4-byte bitmap (bit 1 set) + one 8-byte value
@@ -96133,22 +98572,32 @@ mod tests {
         let pid = [3usize];
         let k = |n: i64| Value::Int(n);
         // the REFERENCED key is still refused
-        assert!(row_carries_key_at(&row, &pid, &[&k(1)]));
+        assert!(row_carries_key_at(&row, &pid, &[&k(1)], true));
         // STATUS = 2 and QTY = 3 are NOT references - the whole defect
-        assert!(!row_carries_key_at(&row, &pid, &[&k(2)]));
-        assert!(!row_carries_key_at(&row, &pid, &[&k(3)]));
+        assert!(!row_carries_key_at(&row, &pid, &[&k(2)], true));
+        assert!(!row_carries_key_at(&row, &pid, &[&k(3)], true));
         // ... and neither is OID = 100
-        assert!(!row_carries_key_at(&row, &pid, &[&k(100)]));
+        assert!(!row_carries_key_at(&row, &pid, &[&k(100)], true));
         // a NULL key column references nothing
         let nullrow = [Value::Int(100), Value::Int(2), Value::Int(3), Value::Null];
-        assert!(!row_carries_key_at(&nullrow, &pid, &[&k(1)]));
+        assert!(!row_carries_key_at(&nullrow, &pid, &[&k(1)], true));
         // a COMPOUND dropped key: both columns, in key order
         let crow = [Value::Int(9), Value::Int(1), Value::Int(2)];
-        assert!(row_carries_key_at(&crow, &[1, 2], &[&k(1), &k(2)]));
-        assert!(!row_carries_key_at(&crow, &[1, 2], &[&k(2), &k(1)]));
+        assert!(row_carries_key_at(&crow, &[1, 2], &[&k(1), &k(2)], true));
+        assert!(!row_carries_key_at(&crow, &[1, 2], &[&k(2), &k(1)], true));
         // a field id past the row's end answers "no reference", never a
         // panic
-        assert!(!row_carries_key_at(&row, &[99], &[&k(1)]));
+        assert!(!row_carries_key_at(&row, &[99], &[&k(1)], true));
+        // NULL AGAINST NULL IS THE TWO SIDES' DIFFERENCE. The MASTER
+        // side probes the child's index and a NULL is a storable key
+        // there, so parent (NULL, 20) IS referenced by child (NULL, 20);
+        // the CHILD side is MATCH SIMPLE and never matches a NULL.
+        let nrow = [Value::Int(9), Value::Null, Value::Int(20)];
+        assert!(row_carries_key_at(&nrow, &[1, 2], &[&Value::Null, &k(20)], true));
+        assert!(!row_carries_key_at(&nrow, &[1, 2], &[&Value::Null, &k(20)], false));
+        // ...and a NULL never stands in for a value on either side
+        assert!(!row_carries_key_at(&nrow, &[1, 2], &[&k(10), &k(20)], true));
+        assert!(!row_carries_key_at(&crow, &[1, 2], &[&Value::Null, &k(2)], true));
         // the wide test - the last resort, kept for a descriptor this
         // server cannot read - would have refused all three
         assert!(row_could_carry_key(&row, &[&k(2)]));

@@ -188,6 +188,13 @@ impl From<Option<u64>> for OwnTx {
 pub struct VisibleRow {
     pub recno: u64,
     pub values: Vec<Value>,
+    /// THE FORMAT THE VISIBLE VERSION WAS WRITTEN UNDER, which need not
+    /// be the relation's newest: `ALTER TABLE ... ALTER c TYPE` mints a
+    /// format and rewrites no row. A caller that goes back to `image`
+    /// must lay its fields at THIS format's offsets, and convert them
+    /// before presenting them through any other one - see
+    /// [crate::format::relay_image].
+    pub format: u8,
     /// the record image the values were decoded from - kept so a caller
     /// that needs BYTES (an OCTETS column, a format-level check) can go
     /// back to the ground truth instead of a lossy string
@@ -595,6 +602,7 @@ pub fn visible_rows_2pc(
             out.push(VisibleRow {
                 recno,
                 values: decode_record(&v.image, descs),
+                format: v.format,
                 image: v.image,
                 versions_walked: v.walked,
                 deltas_applied: v.deltas,

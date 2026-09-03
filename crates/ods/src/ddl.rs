@@ -172,7 +172,35 @@ pub struct ColumnDefault {
 /// literal as `blr_long` regardless of the column width (probe: a SMALLINT
 /// and a BIGINT default both carry a 4-byte `blr_long` value).
 pub fn int_default_blr(value: i32) -> Vec<u8> {
-    let mut b = vec![5u8, 21, 8, 0]; // version5, blr_literal, blr_long, scale
+    num_default_blr(value, 0)
+}
+
+/// The BLR of a NUMERIC-literal default at a SCALE - the same
+/// `blr_literal blr_long` shape, with the literal's own scale in the
+/// scale byte (which is SIGNED: a fraction is negative). A decimal
+/// default is a scaled integer to the engine, not a separate kind.
+/// Measured on Firebird 6 at `127.0.0.1/3050`, 2026-09-03, by reading
+/// `RDB$DEFAULT_VALUE` back as hex:
+///
+/// ```text
+/// NUMERIC(9,2)     DEFAULT 7.00          05 15 08 FE BC020000 4C   (700, -2)
+/// NUMERIC(9,2)     DEFAULT 7.0           05 15 08 FF 46000000 4C   (70,  -1)
+/// NUMERIC(9,2)     DEFAULT 7             05 15 08 00 07000000 4C   (7,    0)
+/// NUMERIC(9,2)     DEFAULT -7.25         05 15 08 FE 2BFDFFFF 4C   (-725,-2)
+/// NUMERIC(18,2)    DEFAULT 1.5           05 15 08 FF 0F000000 4C   (15,  -1)
+/// INTEGER          DEFAULT 7.0           05 15 08 FF 46000000 4C   (70,  -1)
+/// DOUBLE PRECISION DEFAULT 7.5           05 15 08 FF 4B000000 4C   (75,  -1)
+/// NUMERIC(9,4)     DEFAULT 123456.7890   05 15 08 FC D2029649 4C   (1234567890, -4)
+/// ```
+///
+/// The scale is the LITERAL's, not the column's - `DEFAULT 7.0` on a
+/// `NUMERIC(9,2)` column stores `(70, -1)`, and the column's own scale
+/// is applied when the default is bound. A mantissa that does not fit
+/// `blr_long` is a WIDER literal the engine writes as `blr_int64`
+/// instead; this emitter does not write that form and its callers
+/// decline such a literal, which is the refusal they already gave.
+pub fn num_default_blr(value: i32, scale: i8) -> Vec<u8> {
+    let mut b = vec![5u8, 21, 8, scale as u8]; // version5, blr_literal, blr_long, scale
     b.extend_from_slice(&value.to_le_bytes());
     b.push(76); // blr_eoc
     b
@@ -3690,7 +3718,7 @@ const NONNULL_BLR: [u8; 8] = [5, 59, 61, 24, 0, 0, 0, 76];
 /// once stated the collapse as a law; it was wrong, and collapsing them
 /// was a SILENT WRONG WRITE that survived gbak - the only catalog
 /// divergence among the eighty FK shapes both servers fully accept.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RefAction {
     Restrict,
     /// `ON UPDATE|DELETE NO ACTION` as WRITTEN: the same behaviour as
@@ -3716,8 +3744,25 @@ impl RefAction {
     /// Whether this action synthesises a system trigger on the
     /// referenced table. `RESTRICT` and `NO ACTION` do not - the key is
     /// simply enforced - and every other action does.
-    fn synthesises_trigger(self) -> bool {
+    pub fn synthesises_trigger(self) -> bool {
         !matches!(self, RefAction::Restrict | RefAction::NoAction)
+    }
+
+    /// The action READ BACK from a stored `RDB$UPDATE_RULE` /
+    /// `RDB$DELETE_RULE` - the inverse of [RefAction::rule], and the
+    /// only place a server learns what a foreign key already on file
+    /// tells it to DO. Trailing catalog padding is trimmed; an
+    /// unrecognised rule is `None` and its caller must refuse rather
+    /// than guess a behaviour for it.
+    pub fn from_rule(s: &str) -> Option<RefAction> {
+        Some(match s.trim_end() {
+            "RESTRICT" => RefAction::Restrict,
+            "NO ACTION" => RefAction::NoAction,
+            "CASCADE" => RefAction::Cascade,
+            "SET NULL" => RefAction::SetNull,
+            "SET DEFAULT" => RefAction::SetDefault,
+            _ => return None,
+        })
     }
 }
 
@@ -12654,6 +12699,23 @@ mod tests {
     fn no_action_is_stored_as_no_action_and_still_makes_no_trigger() {
         assert_eq!(RefAction::NoAction.rule(), "NO ACTION");
         assert_eq!(RefAction::Restrict.rule(), "RESTRICT");
+        // EVERY stored rule reads back as the action that wrote it -
+        // the catalog is where a server learns what to DO, so the round
+        // trip is the law and an unknown rule is refused, not guessed
+        for a in [
+            RefAction::Restrict,
+            RefAction::NoAction,
+            RefAction::Cascade,
+            RefAction::SetNull,
+            RefAction::SetDefault,
+        ] {
+            assert_eq!(RefAction::from_rule(a.rule()), Some(a), "{:?}", a);
+            // as the catalog hands it over: CHAR-padded
+            assert_eq!(RefAction::from_rule(&format!("{}    ", a.rule())), Some(a));
+        }
+        assert_eq!(RefAction::from_rule(""), None);
+        assert_eq!(RefAction::from_rule("SET  NULL"), None);
+        assert_eq!(RefAction::from_rule("cascade"), None);
         assert!(!RefAction::NoAction.synthesises_trigger());
         assert!(!RefAction::Restrict.synthesises_trigger());
         for a in [RefAction::Cascade, RefAction::SetNull, RefAction::SetDefault] {

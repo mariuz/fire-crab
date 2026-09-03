@@ -71,6 +71,18 @@ One line each; the gate is the proof.
 
 - "`hdr_next_transaction` is stored one display slot apart (fc: last assigned, engine: next to assign)" — FALSE, read off tra.cpp `bump_transaction_id` on 2026-08-20: both store the highest id assigned. The one-slot difference was fc's OIT sitting AT the first interesting id where the engine's `--oldest` puts it one below — and that was a LIVE bug: the engine's sweep over an fc-written file resurrected 200 rolled-back rows (`serve-real-undo`). Fixed in `update_oldest`; `serve-real-oldesttx` asserts the same triple on both sides now.
 
+- "Every check below was a DIFF before that arm existed" (`qa/serve-real-fkaction.sh` section 16) — FALSE, measured 2026-09-03 on a binary with only `value_cmp`'s mixed arm reverted: 20 of section 16's 37 checks were a DIFF, 17 were not, and four of those seventeen are 16f's CONTRASTS, which exist to stay put. The header now carries the per-subsection split.
+- "`ORDER BY`, `GROUP BY`, `SELECT DISTINCT` … now answer what the engine answers" (`value_cmp`'s doc block) — FALSE for `GROUP BY` and `SELECT DISTINCT` with the grouped column in the select list, which is the ordinary way both are written: they answered `0.07; 7.00` where the engine answers `7.00; 700.00`. The COMPARISON was the engine's; the RENDERING was a separate defect, now fixed ("A RECORD IS PRESENTED THROUGH THE FORMAT THAT DESCRIBES IT NOW").
+- "`MIN`/`MAX`, `PERCENTILE_DISC` … already agreed with the engine on this fixture and still do" (roadmap) — true only of a fixture where nothing PROJECTS the altered column, and the paragraph dropped that qualifier. On one that does, `MIN` answered `-0.02` for the engine's `-2.00` and `SUM` `19.09` for `27.01`.
+- "`CURRENT_TRANSACTION` … where the old justification does hold and was verified" (roadmap) — half of that justification is false and the word "verified" was attached to the false half. It refuses, but NOT "with the engine's own reason".
+- "a count of `RDB$INDEX_INACTIVE` in a restored copy reads 0 even on a restore that FAILED" (roadmap) — does not reproduce: a reviewer re-running the same shape read 3. The conclusion (the count is not a signal) stands; the stated measurement did not.
+- "with an INDEX on that column, a probe loses the old-format rows" (`value_cmp`'s doc block, roadmap) — too broad: measured 2026-09-03, it depends on the index's age relative to the FORMATS the table has minted, not on the column.
+- "it is the index's AGE relative to the `ALTER` that decides" (`value_cmp`'s doc block, roadmap, the correction offered for the line above) — ALSO too narrow, and retired the same day it was written: it holds only for a table with exactly one `ALTER`. Measured 2026-09-03 on a table with two, an index minted BETWEEN them - younger than the first ALTER - loses the rows written under the format the second one minted (`WHERE N = 7` answers `2, 3` for the engine's `2, 3, 5`). The law is per FORMAT: an index does not name a row written under a format minted after the index.
+- "a conversion that does not fit the target's backing width … is a floor, not a path" / "not reachable through an engine-accepted ALTER" (`present_field`'s doc block, roadmap "At the extremes") — FALSE, measured 2026-09-03: `BIGINT` holding `9e17`, `ALTER … TYPE NUMERIC(18,4)` is accepted by the engine, and the engine then answers `22003 numeric value is out of range` where fire-crab answers a number off by `10^4` and folds it into `SUM` and `WHERE`. The engine's third answer - RAISE - is the one the code does not implement.
+- "A foreign key on a DIFFERENT index of the same parent … is always enforced" (`qa/serve-real-fkaction.sh` section 13) — FALSE, measured on the engine 2026-09-03: with two foreign keys on the same UNIQUE index, the SECOND one is not enforced and the engine deletes the parent, leaving an orphan. The law is one check per referenced index, so an FK on another index is enforced only if it is that index's first.
+- "An `ON DELETE` body carries no such guard … so a DELETE always fires" (`fk_action_fires`'s doc block) — FALSE, and refuted by the function's own first branch: an OLD key with a NULL component finds no child row and fires nothing. Measured 2026-09-03, parent `(10, NULL)`, child `(10, NULL)`, `ON DELETE CASCADE`: both servers refuse with `23000` and the child is untouched.
+- "**Every consumer** of `value_cmp` … no consumer moved away from the engine" (roadmap heading and closing line) — an absolute over a set this page says is not reachable here: `cmp_value_keys` cannot be measured on this box, because `gbak -b` through this server refuses any engine-created database. Scope corrected to the consumers a client can reach.
+
 An audit of the history file (2026-08-20) found fifteen places where a
 paragraph says "still to do" and a later paragraph, higher up, closed
 it. Recorded here once so nobody re-opens them:
@@ -4203,6 +4215,1656 @@ pointer-page and TIP page numbers is the next step when it dominates.
 - **G, the external sort** — every sort and hash build is bounded by
   RAM today; after the growth walls this is the next scalability
   ceiling a real database reaches.
+
+## A RECORD IS PRESENTED THROUGH THE FORMAT THAT DESCRIBES IT NOW (2026-09-03) - decoding under the right format and rendering under the wrong scale is half a law
+
+**`ALTER TABLE T ALTER c TYPE <scaled>` mints a format and rewrites NOT
+ONE ROW, so every row written before it read back off by the scale
+factor.** The stored data was right; the wire projection was not.
+
+```sql
+CREATE TABLE M6 (ID INTEGER, N INTEGER);
+INSERT INTO M6 VALUES (1,700);  INSERT INTO M6 VALUES (2,7);   COMMIT;
+ALTER TABLE M6 ALTER N TYPE NUMERIC(9,2);                      COMMIT;
+INSERT INTO M6 VALUES (3,7.00); INSERT INTO M6 VALUES (4,700.00);
+```
+
+| `SELECT ID, N FROM M6 ORDER BY ID` | engine | before | after |
+|---|---|---|---|
+| 1 (written BEFORE the ALTER) | `700.00` | `7.00` | **`700.00`** |
+| 2 (written BEFORE the ALTER) | `7.00` | `0.07` | **`7.00`** |
+| 3 (written after) | `7.00` | `7.00` | `7.00` |
+| 4 (written after) | `700.00` | `700.00` | `700.00` |
+
+An exact numeric is stored as a MANTISSA and its DESCRIPTOR carries the
+scale, so `700` under `INTEGER` and `70000` under `NUMERIC(9,2)` are the
+same number. The wire ships the raw mantissa and the client divides by
+`10^|scale|` from the describe, so handing a reader the old mantissa
+under the new descriptor divides by 100 instead of converting.
+
+**The engine does both halves.** It reads each field through the
+record's OWN format and `MOV_move`s it into the format the request was
+compiled against (jrd/vio.cpp). This server did the first half already -
+that is the `qa/serve-real-stalefmt.sh` law - and not the second.
+
+### What it cost beyond the digits: ROWS
+
+With the mixed-numeric comparison arm in place (the entry below),
+`GROUP BY` and `SELECT DISTINCT` correctly collapse an old-format row
+with a new-format one, and then project the group's representative,
+which is the FIRST row seen - the old-format one. So the engine's row
+left the answer entirely:
+
+```
+SELECT DISTINCT N FROM M6 ORDER BY 1
+  engine:  7.00; 700.00
+  before:  0.07; 7.00        <- 700.00 is GONE
+  after:   7.00; 700.00
+
+SELECT N, COUNT(*) FROM M6 GROUP BY N ORDER BY 1
+  engine:  7.00|2; 700.00|2
+  before:  0.07|2; 7.00|2    <- both keys wrong, the 700.00 group gone
+  after:   7.00|2; 700.00|2
+```
+
+### The fix, and where it sits
+
+`present_field` / `present_through` (`crates/wire/src/server.rs`)
+convert a decoded value into the descriptor the relation carries NOW,
+and they are called from the TWO places every read walk passes through:
+`ReadView::values` (the materialising scan, the streaming cursor, the
+index-driven retrieval and the by-recno fetch all call it) and
+`decode_stored` (the DML walks). The MERGE identity builder, which
+decodes a target row under its own format to write key literals, calls
+it too.
+
+`relay_image` (`crates/ods/src/format.rs`) is the same law for the
+LOGICAL BACKUP, which reads BYTES rather than values: it re-lays a
+record stored under an older format into the newest one before the XDR
+encoder reads it, and answers `None` - refusing the backup - for a shape
+it cannot carry rather than writing a wrong number.
+
+### The rounding rule, measured rather than chosen
+
+The narrowing direction is reachable. The engine accepts an ALTER that
+keeps the integral digits and DROPS decimals - `NUMERIC(9,2)` ->
+`NUMERIC(18,1)`, `-> INTEGER` and `-> BIGINT` are all accepted; it
+refuses `NUMERIC(9,2)` -> `NUMERIC(9,4)` with *"New scale specified for
+column N must be at most 2"*, and `NUMERIC(18,2)` -> `DOUBLE PRECISION`
+with *"Conversion from base type BIGINT to DOUBLE PRECISION is not
+supported"*. Reading the old rows back through the narrower column, the
+engine ROUNDS HALF AWAY FROM ZERO:
+
+| stored | `-> INTEGER` | | stored | `-> NUMERIC(18,1)` |
+|---|---|---|---|---|
+| `7.55` | `8` | | `7.55` | `7.6` |
+| `7.45` | `7` | | `7.45` | `7.5` |
+| `7.50` | `8` | | `7.05` | `7.1` |
+| `8.50` | `9` (banker's would say 8) | | `-7.55` | `-7.6` |
+| `-7.55` | `-8` | | `-7.45` | `-7.5` |
+| `-7.50` | `-8` | | `-7.05` | `-7.1` |
+| `-0.51` | `-1` | | | |
+| `0.49` | `0` | | | |
+
+fire-crab now answers every one of those.
+
+### At the extremes - and the claim here that was FALSE
+
+A conversion whose result does not fit the target's backing width is
+DECLINED: `present_field` answers `None` and the value is left exactly
+as decoded - not saturated, not zeroed, and no panic. `relay_image` does
+the same and refuses the backup rather than writing the number. It is
+asserted directly in the unit tests (`i64::MAX` at scale 0 into scale
+-2, `i128::MAX` into scale -4).
+
+**This paragraph used to end "It is a floor, not a path" - no
+engine-accepted ALTER was found that reaches it. That is FALSE**, broken
+by a reviewer and re-measured here on 2026-09-03. The engine will not
+let the declared INTEGRAL DIGITS grow, but it will let the PRECISION
+grow, and the precision is what decides whether the rescaled mantissa
+still fits:
+
+```
+CREATE TABLE OV (ID INTEGER, N BIGINT);
+INSERT INTO OV VALUES (1, 900000000000000000);  INSERT INTO OV VALUES (2, 7);
+ALTER TABLE OV ALTER N TYPE NUMERIC(18,4);   -- the engine ACCEPTS this
+INSERT INTO OV VALUES (3, 1.5);
+
+SELECT ID, N FROM OV ORDER BY ID
+  fire-crab: ID 1|N 90000000000000.0000  ID 2|N 7.0000  ID 3|N 1.5000
+  engine   : SQLSTATE = 22003, arithmetic exception, numeric overflow,
+             or string truncation / -numeric value is out of range
+SELECT SUM(N) FROM OV        fire-crab: 90000000000008.5000   engine: 22003
+SELECT ID FROM OV WHERE N>0  fire-crab: 1, 2, 3               engine: 22003
+```
+
+`9e17 x 10^4` does not fit `i64`, `present_field` answers `None`, and
+the raw mantissa ships under the new scale - silently off by `10^4`, and
+folded into `SUM` and `WHERE`. There are THREE answers here, not two -
+convert, decline, or RAISE - and the engine takes the third. NOT FIXED
+this round: it is entry F2 of "RECORDED, NOT REPAIRED" below, and the
+unit test that pins the floor asserts the current behaviour, not the
+engine's.
+
+### Every path that renders a decoded value against a column descriptor
+
+Measured on `qa/serve-real-scalefmt.sh`'s fixtures against a binary with
+only this fix reverted (**rc=1, 25 OK / 32 DIFF** there; **rc=0, 57 OK /
+0 DIFF** here). Both counts were taken while the gate carried 57 checks;
+section H gained a range probe later on 2026-09-03 and the gate is 59
+now, so the two comparisons are 57-check numbers and are not re-taken.
+
+| path | verdict |
+|---|---|
+| SELECT projection (materialising scan, streaming cursor) | WAS WRONG, fixed |
+| `GROUP BY`, `SELECT DISTINCT` (missing rows) | WAS WRONG, fixed |
+| aggregates - `SUM`, `MIN`, `MAX`, `AVG`, `PERCENTILE_DISC` | WAS WRONG, fixed |
+| windows - `RANK`, `DENSE_RANK`, `LAG`, `COUNT OVER`, `SUM OVER` | WAS WRONG, fixed |
+| materialised sort keys (`ORDER BY`, both directions) | WAS WRONG, fixed |
+| index-driven reads (the retrieval's fetch) | WAS WRONG, fixed |
+| `CAST` of the column to text | WAS WRONG, fixed |
+| the DML walk's own row (`UPDATE`/`DELETE` `WHERE`, `SET`) | WAS WRONG, fixed |
+| a MERGE target's key literals | WAS WRONG, fixed |
+| the LOGICAL BACKUP's bytes | WAS WRONG, fixed (see below) |
+| `LIST` per group | content was already the engine's; blob id renders differently (pre-existing, pinned) |
+| `RETURNING OLD` / `NEW` | already right - `upgrade_image` re-lays the row first |
+| an AFTER DELETE trigger's `OLD` | already right, measured |
+| arithmetic over the column (`N + 1`, `N * 2`) | already right - the expression path aligns operands by the DESCRIPTOR's scale, which is exactly the conversion the projection was missing |
+| `INSERT ... SELECT` into a scaled target | already right - the store coerces |
+| `WHERE` against a literal (`N = 7`, `N = 700.00`) | already right - `num_cmp` aligned |
+| an INDEX that PREDATES the ALTER | STILL WRONG - the key encoding, not the projection; see the bullet above |
+| the `.fbk`'s COLUMN DEFINITION | STILL WRONG - see below |
+
+### The logical backup: what was fixed, and what was found and NOT fixed
+
+**Fixed.** The backup read every record's bytes at the CURRENT format's
+offsets. Measured 2026-09-03 - `INTEGER` rows `700` and `7`, then
+`ALTER ... TYPE BIGINT`, then two more rows; fire-crab's own backup
+restored by the REAL `gbak -c` and read back BY THE ENGINE:
+
+```
+before:  ID 1|N 0   ID 2|N 0   ID 3|N 7   ID 4|N 700
+after:   ID 1|N 700 ID 2|N 7   ID 3|N 7   ID 4|N 700   <- the engine's own answer
+```
+
+**A NEW REFUSAL, deliberately.** `relay_image` answers `None` - which
+refuses the WHOLE backup, the same fail-closed law the rest of this
+surface follows - for a field the old format never had (its value lives
+in the newest format's stored DEFAULT section, which it does not read)
+and for a type change outside the exact-numeric family. What that
+replaces is worse than a refusal. Measured 2026-09-03, `ALTER TABLE AC
+ADD DFT INTEGER DEFAULT 99 NOT NULL` over a populated table:
+
+```
+before:  the backup SUCCEEDS, and the real `gbak -c` then answers, per
+         pre-ALTER row,
+           gbak: ERROR:validation error for column "PUBLIC"."AC"."DFT",
+                 value "*** null ***"
+           gbak: ERROR:warning -- record could not be restored
+         The restored database is SHORT TWO ROWS and nothing says so.
+after:   the backup REFUSES ("feature is not supported", the wish-list
+         answer every unsupported shape on this surface gives).
+the engine's own backup of the same file:  all three rows, with the
+         format's stored `99` in the added column.
+```
+
+Carrying that case rather than refusing it means reading the format's
+DEFAULT section and encoding those values at the new descriptors - a
+feature, not a fix, and not attempted here. No gate in `qa/` backs up a
+table with an added column either.
+
+**Found here, NOT fixed, HIGH, PRE-EXISTING and independent of any
+ALTER: fire-crab's logical backup loses a scaled column's SCALE.** In a
+burp field record, **att 9 is `RDB$FIELD_SUB_TYPE` and att 11 is
+`RDB$FIELD_SCALE`**; this writer has them swapped, and `read_backup` has
+the mirror of the same confusion. Parsed out of the ENGINE's own `.fbk`
+for a nine-column table, 2026-09-03:
+
+```
+DECIMAL(9,3)        (9,2) (11,-3) (44,9)
+NUMERIC(4,1)        (9,1) (11,-1) (44,4)
+BLOB SUB_TYPE 1     (9,1) (11,0)
+INTEGER/CHAR/VARCHAR(9,0) (11,0) (44,0)
+```
+
+The consequence, measured on a table that was **never ALTERed**: a
+`NUMERIC(9,2)` holding `700.00` comes back out of a real `gbak -c` as an
+INTEGER holding `70000`, and a `DECIMAL(9,3)` holding `4.567` as `4567`.
+Not fixed here: writing 9/11/44 correctly needs the NUMERIC-vs-DECIMAL
+marker and the declared PRECISION, and the ODS descriptor carries
+neither - it is a catalog read this writer does not do, plus the
+matching change in `read_backup` and in the restore's column builder. A
+half fix (writer only) was built and measured and made the file
+disagree with this server's own reader, so it was reverted. **No gate
+in `qa/` backs up a scaled column** (`grep -c NUMERIC` over the four
+gbak gates: 0, 0, 0, 0), which is why it survived. `qa/serve-real-scalefmt.sh`
+section F now pins it, on an ALTERed table AND on one that never was.
+
+### Two boundaries re-confirmed here, recorded and not fixed
+
+- **`gbak -b` through this server refuses any ENGINE-created database**
+  with `gbak: ERROR:Dynamic SQL Error`, on a plain single-table file with
+  no ALTER and nothing exotic. Re-measured 2026-09-03 on three such
+  files; the `.fbk` is never written. It is the CLIENT-side `gbak -b`
+  path (the one that compiles BLR requests), not the SERVICE backup that
+  the four gbak gates and section F above drive - those work. A reviewer
+  recorded it in the previous round as the reason `cmp_value_keys` (the
+  raw-BLR request sort) could not be measured directly, and that stands:
+  it still cannot be, here.
+- **A negative `INT128` rendered by node-firebird is a CLIENT artifact,
+  not this server's answer.** It prints `2^128 - |v|`; `isql` reads the
+  same value correctly off this server. Recorded so the next reviewer
+  does not chase it.
+
+### Why no gate saw any of this
+
+`qa/serve-real-stalefmt.sh` is precisely the gate for old-format rows,
+and every `ALTER` in its fixture PRESERVES the scale (`INTEGER` ->
+`BIGINT`, `NUMERIC(9,2)` -> `NUMERIC(18,2)`), so the one thing that can
+go wrong here cannot happen there. Of the gates that contain an
+`ALTER ... TYPE`, none contained a `GROUP BY` or a `DISTINCT`, and none
+compared a PROJECTED value of the altered column. `qa/serve-real-scalefmt.sh`
+is the gate for that, and its header says so.
+
+### The gate
+
+`qa/serve-real-scalefmt.sh`, 59 checks, rc 0 (57 when the reverted-binary
+comparisons below were taken; section H's range probe is the difference).
+Sections A (the
+projection), B (`DISTINCT`, `GROUP BY`, the aggregates, the windows, the
+sort keys, `UNION`, `PERCENTILE_DISC`, `LIST`), C (an index created
+AFTER the ALTER), D (the narrowing direction and its rounding), E (the
+INT128 backings, `RETURNING`, the SET expression, an AFTER DELETE
+trigger's `OLD`, a MERGE key, a self join), F (the logical backup
+round trip through the real `gbak -c`, the recorded scale loss, the
+ADDED-column refusal, each with the ENGINE's own backup of the same
+file beside it), H (an index older than the format the row was written
+under - two equality probes and a range probe, both answers pinned) and
+G (`LIST`'s blob id, both answers pinned).
+
+**Non-vacuity, measured:** on a binary built from this tree with only
+`present_field` and `relay_image` reverted, the gate is **rc=1, 25 OK /
+32 DIFF**.
+
+**And the two 2026-09-03 fixes are independent, which changes what each
+gate is evidence of.** On a binary that keeps this fix and reverts only
+`value_cmp`'s mixed arm, `qa/serve-real-scalefmt.sh` is **57 OK / 0
+DIFF** (the 57-check version) - with the projection fixed a stale row
+presents at the same
+KIND and scale as a fresh one, so no mixed pair reaches `value_cmp`
+through the format path at all. The arm's own evidence is the
+foreign-key path, where a child column and a parent key are DECLARED at
+different scales and nothing converts them: the same arm-reverted binary
+runs `qa/serve-real-fkaction.sh` at **rc=1, 189 OK / 20 DIFF**.
+
+## RECORDED, NOT REPAIRED: THE NEXT CHUNK (2026-09-03)
+
+**The projection law - a record is presented through the format that
+describes it now - is CONVERTED for the wire read paths and for the
+logical backup, and is NOT yet converted for the PSQL execution path,
+for the restore reader, or for any type change that is not a change of
+scale.** That sentence is the whole of what a future reader needs from
+this section: everything below is either that same law on a path the
+fix above did not reach, or a neighbouring format defect found on the
+way to it, and together they are one coherent next chunk.
+
+**Nothing below is fixed.** Every entry was measured on 2026-09-03
+against Firebird 6 at `127.0.0.1/3050`, on a fixture built BY THE ENGINE
+and copied byte-identically to both servers, unless the entry says
+otherwise. F1 through F7 were found by a reviewer; each was re-run here
+before being written down, and where it was not, the entry says so.
+
+### F1 - HIGH, WRONG ANSWER, PRE-EXISTING. A selectable PSQL procedure or function reads every record at the NEWEST format's descriptors
+
+`crates/exe/src/lib.rs:2691` (`scan_relation`, the newest-format pick at
+`:2697`) and its index-driven twin `:2557` (`scan_relation_bitmap`,
+picks at `:2577`, `:2598`, `:2648`). Entered from
+`crates/wire/src/server.rs:79272` (`try_procedure_blr`) and `:79404`
+(`try_function_blr`), which run a compiled body through
+`fire_crab_exe::bind_and_execute` FIRST and fall back to the source
+interpreter only for a body exe cannot carry.
+
+`crates/exe` is a live WIRE path. The report that landed the round above
+listed it among "diagnostics and the standalone BLR runner" and said it
+was not in the wire path; that was wrong about this crate, and the two
+entry points named above are where a client reaches it. It takes one
+descriptor list - the newest format's - for records
+of every format, and `VisibleRow::format` (the field this chunk ADDED,
+whose doc comment says a caller that goes back to `image` must lay its
+fields at THAT format's offsets) is never consulted there.
+
+It loses THREE things, and all three were re-measured here. Client and
+procedure over the same file, in the same second:
+
+```
+JX: (1,700),(2,7) as INTEGER, ALTER N TYPE NUMERIC(9,2), then (3,7.00)
+  SELECT N FROM JX ORDER BY ID        crab 700.00, 7.00, 7.00   = engine
+  SELECT O FROM PJX  (the procedure)  crab   7.00, 0.07, 7.00
+                                      engine 700.00, 7.00, 7.00   <- SCALE
+
+OFS: (11,22) as two INTEGERs, ALTER A TYPE BIGINT, then (33,44)
+  SELECT A, B FROM OFS                crab 11|22, 33|44         = engine
+  SELECT X, Y FROM POF (the procedure) crab  0|0,  33|44
+                                      engine 11|22, 33|44        <- OFFSETS:
+    the pre-ALTER image is shorter than the new format's extent and BOTH
+    its fields come back 0 - a row silently zeroed, not mis-scaled
+
+ADF: (1,7), ALTER TABLE ADF ADD DFT INTEGER DEFAULT 99 NOT NULL, then (2,8,5)
+  SELECT ID, DFT FROM ADF             crab 1|99, 2|5            = engine
+  SELECT I, DD FROM PADF (procedure)  crab 1|<null>, 2|5
+                                      engine 1|99, 2|5      <- the format's
+    DEFAULT SECTION: a NULL in a NOT NULL column
+
+A PSQL FUNCTION is the same path, and it reaches an ordinary select list:
+  SELECT FN2(1) A, FN2(2) B FROM RDB$DATABASE
+                                      crab A 7.00 | B 0.07
+                                      engine A 700.00 | B 7.00
+```
+
+**What is NEW is the split, not the defect**: before this chunk the
+client SELECT and the procedure were consistently wrong; now the same
+query answers `700.00` through a client and `7.00` through a procedure
+over the same file. The reviewer measured every row above byte-identical
+on a `523b0da` binary.
+
+**Why no gate and no reviewer saw it: the divergence is body-shape
+dependent.** A body exe declines falls back to the source interpreter,
+which goes through `ReadView::values` -> `present_through` and is right.
+The reviewer's boundary table, on one table, one value and one output
+type so that only the body text varies (their measurement, not re-taken
+here): `FOR SELECT N ... INTO :O`, `FOR SELECT N+0 ...`, a two-column
+`FOR SELECT`, a singleton `SELECT ... INTO`, `O = (SELECT ...)` and
+`EXECUTE PROCEDURE` of any of them are all WRONG; a body with a text
+`CAST`, a `CAST` back to the same numeric, a declared CURSOR with
+`OPEN`/`FETCH`, or any body that also writes (exe declines) is RIGHT. So
+"I tested a procedure" is not evidence either way.
+
+**No wrong write follows from it**, measured by the reviewer:
+`INSERT INTO t SELECT ... FROM <proc>`, `INSERT ... (SELECT FN1() ...)`
+and `UPDATE t SET c = FN2(1)` all refuse with `42000 Dynamic SQL Error`
+(separate pre-existing gaps), and a selectable procedure that writes
+falls to the source interpreter and writes the right value.
+
+### F2 - MEDIUM-HIGH, WRONG ANSWER (silent), PRE-EXISTING. The rescale overflow is reachable, and the engine RAISES where fire-crab answers a number
+
+`crates/wire/src/server.rs:36143` (`present_field`; the declining
+`i64::try_from(n).ok()?` at the end of it). The full reproducer and the
+measured answers are in "At the extremes - and the claim here that was
+FALSE" above; in one line: `BIGINT` holding `9e17`,
+`ALTER ... TYPE NUMERIC(18,4)` which the engine ACCEPTS, and the engine
+then answers `22003 numeric value is out of range` where fire-crab
+answers `90000000000000.0000` and folds it into `SUM` and `WHERE`. The
+`INT128` floor is reachable through the same door
+(`NUMERIC(34,0)` -> `NUMERIC(38,10)`, the reviewer's fixture).
+
+Pre-existing: the declining fallback and the pre-fix behaviour coincide,
+so a `523b0da` binary answers the same (the reviewer measured it). What
+this chunk introduced is the CLAIM that it is unreachable, and that
+claim is retired above. **The unit test that pins the floor asserts the
+current behaviour, not the engine's** - whoever converts this should
+expect to change that test rather than keep it.
+
+### F3 - MEDIUM, WRONG ANSWER, PRE-EXISTING. `DATE` -> `TIMESTAMP` is an engine-accepted ALTER the fix's guard excludes, and the old row projects as the epoch
+
+`is_exact_dtype` (`crates/wire/src/server.rs:36074`) makes `present_field`
+answer `None` the moment either side is not
+`SHORT | LONG | INT64 | INT128`, so a `DATE` value is handed to a
+`TIMESTAMP` wire slot and `encode_row_body`'s `Wire::Timestamp` arm
+reads `(0, 0)` for it. Measured here:
+
+```
+DT: (1, DATE'2020-03-04'), ALTER H TYPE TIMESTAMP, then (2, TIMESTAMP'2021-05-06 01:02:03')
+  SELECT ID, H FROM DT     crab   1|1858-11-17 00:00:00.0000  2|2021-05-06 01:02:03.0000
+                           engine 1|2020-03-04 00:00:00.0000  2|2021-05-06 01:02:03.0000
+  EXTRACT(HOUR FROM H) WHERE ID=1     crab <null>   engine 0
+  EXTRACT(YEAR FROM H) WHERE ID=1     crab 2020     engine 2020   <- the STORED
+                                                       value is intact
+```
+
+Purely the projection through the new descriptor - the class this chunk
+closed, in a type direction it did not cover. The engine's ALTER matrix
+is wider than the round above recorded: `CHAR(4)`->`CHAR(10)`,
+`VARCHAR(4)`->`VARCHAR(10)`, `VARCHAR(4)`->`CHAR(20)`,
+`INTEGER`->`VARCHAR(20)`, `DATE`->`TIMESTAMP` and `BIGINT`->`NUMERIC(20,4)`
+are all ACCEPTED (a character column will not go back to a numeric one).
+The reviewer measured that it is SELF-HEALING - an `UPDATE` that touches
+the row re-lays it through `upgrade_image` and both servers then read
+`2020-03-04` - so there is no wrong write, and no `SELECT`-only reader
+is ever told.
+
+### F4 - MEDIUM, WRONG ANSWER, PRE-EXISTING. `CHAR(n)` -> `CHAR(m)`: an old-format row presents at the OLD width
+
+Same guard, same class; the text arm of `decode_field`
+(`crates/ods/src/format.rs:464`) fits the value to the STORED
+descriptor's char length and nothing re-pads it to the newest. Measured
+here on `CW`: `(1,'ab')` under `CHAR(4)`, `ALTER B TYPE CHAR(10)`, then
+`(2,'wxyz')`:
+
+```
+SELECT ID, CHAR_LENGTH(B) L, OCTET_LENGTH(B) O    crab   1|4|4    2|10|10
+                                                  engine 1|10|10  2|10|10
+SELECT ID, CHAR_LENGTH(B || 'X') L                crab   1|5      2|11
+                                                  engine 1|11     2|11
+```
+
+A bare `SELECT B` AGREES, because the wire pads the fixed slot to the
+width the describe announced - which is exactly why a row-comparison
+gate cannot see this and why the shapes above are the ones to pin when
+it is converted. `VARCHAR(4)` -> `VARCHAR(10)` is fine: the varying
+length travels with the value.
+
+### F6 - HIGH, WRONG WRITE (silent), PRE-EXISTING. fire-crab's `action_restore` of the ENGINE's own valid `.fbk` writes a nonsense POSITIVE `RDB$FIELD_SCALE` and values off by a power of ten
+
+`crates/burp/src/lib.rs:4752` (`read_backup`, which reads the scale out
+of att 9 - `RDB$FIELD_SUB_TYPE` on an engine-written file) and
+`restore_column_def` (`crates/wire/src/server.rs:6384`). This is the
+MIRROR of the att-9 / att-11 swap recorded on the WRITER side above, and
+it is worse than a mirror: the writer's swap loses a scale in a file
+fire-crab produced, while this corrupts a file the ENGINE produced.
+Measured here, `B3 NUMERIC(18,4)` on a table that was never ALTERed,
+backed up by the REAL `gbak -b`:
+
+```
+the ENGINE restoring that .fbk (gbak -c):
+  ID 1|N 700.0000   ID 2|N 7.0000   ID 4|N -2.5000   ID 5|N 3.1416
+fire-crab restoring the SAME .fbk (fbsvcmgr action_restore):
+  ID 1|N 70000000   ID 2|N 700000   ID 4|N -250000   ID 5|N 314160
+
+the restored column's catalog, read by the ENGINE out of each file:
+  engine's restore     RDB$FIELD_TYPE 16  SCALE -4  SUB_TYPE 1  PRECISION 18
+  fire-crab's restore  RDB$FIELD_TYPE 16  SCALE  1  SUB_TYPE 0  PRECISION  0
+```
+
+A POSITIVE scale is not a shape the engine ever writes. **Pre-existence:
+the reader's code is byte-identical at `523b0da`** - this chunk's diff
+adds only a comment in that hunk - but the restore was NOT re-run on a
+baseline binary, here or by the reviewer, so pre-existence is code-read
+rather than binary-confirmed.
+
+**The BACKUP direction is right** and was confirmed across three formats
+including a narrowing that rounds; only the declared scale is lost there
+(the writer's half, recorded above). Whoever converts this must change
+BOTH halves in one step - the writer, the reader, and
+`restore_column_def`'s `precision: Some(0)` - because a writer-only fix
+ships a file this server's own reader disagrees with, which is why the
+half fix built above was reverted.
+
+### F7 - MEDIUM, WRONG ANSWER, PRE-EXISTING. A `COMPUTED BY` column re-derives its type instead of keeping the declared one
+
+Not about old formats at all - the POST-ALTER row diverges too, which is
+why it is here rather than in the list above. Measured:
+
+```
+CP (A INTEGER, B INTEGER, S COMPUTED BY (A+B)); (100,200); ALTER A TYPE NUMERIC(9,2); (3.5,4)
+  SELECT A, B, S FROM CP ORDER BY B
+    crab   3.50|4|S 7.50     100.00|200|S 300.00
+    engine 3.50|4|S 8        100.00|200|S 300
+```
+
+The engine keeps `S`'s declared `INTEGER` from `CREATE` time and rounds
+`7.5` to `8`; fire-crab re-derives `NUMERIC(9,2)` from the operands.
+
+### And one neighbouring WRONG WRITE, found on the way: fire-crab's logical backup silently drops a column-level `DEFAULT`
+
+**HIGH, WRONG WRITE (silent), PRE-EXISTING, no gate covers it.** The
+relation-field writer in `crates/burp/src/lib.rs` (the `rec::FIELD`
+record at `:774`) emits atts 1, 48, 2, 13, 8, 10, 9, 11, 22, 24, 34, 38,
+35 and 42/43 - and **no att 15 / att 39**, which are
+`RDB$DEFAULT_VALUE` / `RDB$DEFAULT_SOURCE`. The GLOBAL-field (domain),
+argument and procedure-parameter writers all do emit them (`:555`,
+`:557`). Byte-identical at `523b0da`: pre-existing, and this chunk's only
+touches near it are comments. Measured here, fire-crab's own
+`action_backup` -> the REAL `gbak -c` -> read by the ENGINE:
+
+```
+CREATE DOMAIN DOM_I AS INTEGER DEFAULT 7;
+CREATE TABLE T (A INTEGER, B INTEGER DEFAULT 42, C VARCHAR(8) DEFAULT 'hi', E DOM_I);
+INSERT INTO T (A) VALUES (1);
+
+RDB$RELATION_FIELDS.RDB$DEFAULT_SOURCE, T.A/B/C/E
+  original       <NO DEFAULT> | DEFAULT 42 | DEFAULT 'hi' | <NO DEFAULT>
+  restored copy  <NO DEFAULT> | <NO DEFAULT> | <NO DEFAULT> | <NO DEFAULT>
+INSERT INTO T (A) VALUES (2)  - the row that follows
+  original       A 2 | B 42     | C hi     | E 7
+  restored copy  A 2 | B <null> | C <null> | E 7   <- the DOMAIN default
+                                                      survives, the column
+                                                      ones are gone
+```
+
+**Why no gate saw it:** `qa/serve-real-gbak.sh` has two default checks
+and they cover a DOMAIN default (`CREATE DOMAIN D_POS AS INTEGER DEFAULT
+7`, `:661`) and PSQL argument/parameter defaults (`:384`). No gate
+declares a column-level `DEFAULT` in a `CREATE TABLE` and backs it up.
+
+**Why it is this chunk's business, measured here:** the chunk that makes
+`ON DELETE SET DEFAULT` run is the chunk that makes this matter. On a
+copy restored from fire-crab's own backup, the action writes NULL where
+the original writes the declared default:
+
+```
+GP (ID PK), GD (X, B INTEGER DEFAULT 10, FK B -> GP(ID) ON DELETE SET DEFAULT)
+rows GP(1), GP(10), GD(100, 1);  then DELETE FROM GP WHERE ID = 1
+  original file  NP 1 | X 100 | B 10       <- the declared default
+  restored copy  NP 1 | X 100 | B <null>   <- SET DEFAULT wrote NULL
+```
+
+The `SET DEFAULT` rule itself survives the round trip
+(`RDB$REF_CONSTRAINTS` reads `SET DEFAULT` in the restored copy); it is
+only the default that is gone. Same category as the two entries above -
+newly VISIBLE, not newly wrong.
+
+### Operational notes for whoever picks this up
+
+- **A gate that hardcodes its fixture names cannot be run concurrently
+  with itself.** `qa/serve-real-scalefmt.sh` builds
+  `/tmp/fbhandson/fc-scalefmt-*.fdb` and deletes them on EXIT, so two
+  runs on DIFFERENT ports destroy each other: a reviewer's first run
+  produced twenty-odd bogus DIFFs of the form `08001 ... No such file or
+  directory` purely because another session was running the same gate.
+  The port argument does not isolate the fixtures, and most gates in
+  `qa/` have the same shape.
+- **That gate renders an engine-side connection failure as a content
+  DIFF.** The same reviewer saw nine DIFFs carrying
+  `SQLSTATE 08001 ... Permission denied` verbatim in the `want:` column.
+  It fails loudly rather than silently, so it is not dangerous, but it
+  costs a re-run to tell a fault from a result - the same class as the
+  `gbakverbose` re-chunking caveat recorded elsewhere.
+- **`qa/serve-real-fkaction.sh` leaked its server on every run until
+  2026-09-03**, when a `for srv in ...` loop that shadowed the pid
+  variable was renamed and the trap made a `cleanup` function on
+  `EXIT INT TERM HUP`. That leak is the mechanism behind two incidents in
+  one session, including a cleanup filter that tested the wrong field and
+  killed a server belonging to somebody else. Kill by PID from
+  `ps -eo pid,args`, and check the field you are matching on; never
+  `pkill` on a port - it matches your own shell.
+- **This chunk touches NINE paths, not the six an earlier report
+  listed:** `crates/burp/src/lib.rs`, `crates/ods/src/ddl.rs`,
+  `crates/ods/src/format.rs`, `crates/ods/src/tra.rs`,
+  `crates/wire/src/server.rs`, `docs/roadmap.md`,
+  `qa/serve-real-fkguard.sh` (modified), plus the untracked
+  `qa/serve-real-fkaction.sh` and `qa/serve-real-scalefmt.sh`. Staging by
+  name from the six-path list drops `crates/ods/src/ddl.rs`, which holds
+  `num_default_blr` and `RefAction::from_rule` that the rest of the chunk
+  calls, and the tree would not build.
+- A stray gitignored `$A` (an FDB from 11 Aug) sits in the repo root,
+  untouched and not part of this work.
+
+## A MIXED EXACT-NUMERIC PAIR IS ONE KEY (2026-09-03) - one missing comparison arm cost a whole foreign key
+
+**HIGH, SILENT WRONG WRITE, closed.** `value_cmp` - the comparison every
+consumer without a more specific rule falls back on - had arms for
+`(Int, Int)`, for `(Scaled, Scaled)` at any two scales and for
+`(Int128, Int128)`, and **none for the kinds MIXED**. `Int` is scale 0,
+`Scaled` is an i64 mantissa at a scale, `Int128` is the wide one; they
+are three storage shapes of ONE domain, and a pair drawn from two of
+them fell past every arm to the tail `a.render().cmp(&b.render())`,
+where `"7"` and `"7.00"` are different strings.
+
+Firebird accepts a foreign key whose child column differs from the
+parent key in SCALE, and a `SET DEFAULT` literal is stored at the
+LITERAL's own scale. Both put such a pair in front of the comparison,
+so one missing arm produced **an orphan on the parent side and a
+refusal on the child side of one schema**:
+
+```sql
+-- PARENT SIDE, measured 2026-09-03, before the fix
+CREATE TABLE NP (ID NUMERIC(9,2) NOT NULL PRIMARY KEY);
+CREATE TABLE NC (X INTEGER, B NUMERIC(9,2) DEFAULT 7 REFERENCES NP ON DELETE SET DEFAULT);
+INSERT INTO NP VALUES (7.00);  INSERT INTO NC VALUES (100, 7.00);
+DELETE FROM NP WHERE ID = 7.00;
+  fire-crab: performs it.  The ENGINE then reads NPAR 0 | ORPH 1 out of fire-crab's file
+  the engine: SQLSTATE 23000, refuses.  Its own file: NPAR 1 | ORPH 0
+```
+
+`fk_action_leaves_old_key` read "not equal" as *the action cleared the
+key*, waived the refusal, and the action then bound `7`, which stores
+as `7.00` - the key just deleted.
+
+```sql
+-- CHILD SIDE, the same missing arm, no referential action anywhere
+CREATE TABLE AP (ID INTEGER NOT NULL PRIMARY KEY);
+CREATE TABLE AC (X INTEGER, B NUMERIC(9,2), CONSTRAINT AK FOREIGN KEY (B) REFERENCES AP);
+INSERT INTO AP VALUES (7);  INSERT INTO AC VALUES (1, 7);
+  fire-crab: 23000 ... -Foreign key reference target does not exist ("B" = 7.00)
+  the engine: accepted
+```
+
+### The fix
+
+`value_cmp` keeps its equal-scale fast paths and sends **every other
+exact-numeric pair** - cross-format and cross-KIND alike - to `num_cmp`,
+which was already the server's i128 alignment and was already what the
+majority of consumers called FIRST. So the two places a mixed exact
+pair can be compared now give one answer by construction; it used to be
+two implementations, one of which had no mixed case at all. Unit tests
+pin every mixed pair in both directions, the equal-values-at-different-
+scales case, and the identity `value_cmp == num_cmp` over all nine
+kind pairs.
+
+### Before and after, measured
+
+| | before | after |
+|---|---|---|
+| the two symptoms above, `NUMERIC(9,2)` / `(18,2)` / `(20,2)` / `ON UPDATE` | 6 SAME, 15 DIFF | **18 SAME, 3 DIFF** |
+| the FK key-move probes plus a compound key crossing scales | 7 SAME, 3 DIFF | **10 SAME, 0 DIFF** |
+| `qa/serve-real-fkaction.sh` (209 checks) | rc=1, 186 OK / 23 DIFF | **rc=0, 209 OK** |
+
+The three DIFFs that remain in the first row are refusal TEXT with the
+rows identical, and all three are pre-existing and recorded below.
+
+### The consumers of `value_cmp`, and what the fix did to the ones that could be measured
+
+This heading read "Every consumer of `value_cmp`" until 2026-09-03, and
+the paragraph that closes the section read "no consumer of `value_cmp`
+moved away from the engine". Both were an absolute over a set this page
+itself says is not fully reachable here: `cmp_value_keys` is named three
+paragraphs below as the one consumer NOT measured directly, and it
+CANNOT be measured on this box, because `gbak -b` through this server
+refuses any engine-created database (recorded above). The corrected
+scope is the one that was actually measured, and it is stated per
+consumer below.
+
+`value_cmp` is shared, so each consumer was ENUMERATED, and every one
+that could be reached from a client was then MEASURED - a fixture built
+BY THE ENGINE where one column holds both shapes (`ALTER TABLE MX ALTER
+N TYPE NUMERIC(9,2)` after two rows were inserted as `INTEGER`), read by
+both servers, with nothing projecting that column so that a separate
+rendering defect could not confound the comparison.
+
+**Unchanged, because they call `num_cmp` FIRST and it already aligned:**
+`Term::NumCmp` (WHERE against a numeric literal), `fold_cmp`
+(`MIN`/`MAX` and the aggregate folds), `Cond2::Cmp` (PSQL conditions),
+`Expr::NullIf`, `corr_quantified` (`= ANY` / `= ALL`). Measured SAME
+before and after, and SAME as the engine both times.
+
+**Unchanged, because the pair is routed away before this comparison:**
+the hash JOIN and the index-probe hash - `join_key` buckets by a key
+FAMILY and `desc_family` hashes only when both sides share one, so a
+cross-scale join is not hashed at all: it falls to the full scan and
+the ON decides (which goes through `num_cmp`). The index BAND takes
+only scale-0 values and scans otherwise. `octets_value_cmp`'s fallback
+belongs to a text column's ttype. All three measured identical before
+and after, on the same fixture.
+
+**Changed, and every changed answer became the ENGINE's:**
+
+| consumer | before | after | the engine |
+|---|---|---|---|
+| `ORDER BY` DESC (`order_cmp`) | ids 3,1,4,5,2 | **1,3,4,2,5** | 1,3,4,2,5 |
+| `GROUP BY` (group counts) | 1,1,1,1,1 | **1,2,2** | 1,2,2 |
+| `SELECT DISTINCT` (group count) | 5 | **3** | 3 |
+| `LIST` per group | 1 / 2 / 3 / 4 / 5 | **1,3 / 2,5 / 4** | 1,3 / 2,5 / 4 |
+| `COUNT(*) OVER (PARTITION BY N)` | all 1 | **2,2,2,1,2** | 2,2,2,1,2 |
+| `DENSE_RANK() OVER (ORDER BY N)` | 4,1,5,3,2 | **3,1,3,2,1** | 3,1,3,2,1 |
+| `RANK() OVER (ORDER BY N)` | 4,1,5,3,2 | **4,1,4,3,1** | 4,1,4,3,1 |
+| `LAG() OVER (PARTITION BY N ...)` | all NULL | **null,null,1,null,2** | same |
+| the five FK comparisons | the two symptoms above | parity | - |
+
+Ascending `ORDER BY`, `MIN`/`MAX`, `UNION`'s set equality, `EXISTS`,
+`IN`, `NOT IN`, `PERCENTILE_DISC` and `COUNT(DISTINCT)` answered the
+same before and after the arm - **and on THIS fixture, which is one
+where nothing PROJECTS the altered column, they also answered what the
+engine answers. That qualifier was load-bearing and this paragraph used
+to drop it.** On a fixture that does project it - eleven rows, a
+negative one, and a median landing on an old-format row - three of them
+did not:
+
+| | fire-crab, before this round's fix | the engine |
+|---|---|---|
+| `SELECT MIN(N), MAX(N) FROM MX` | `-0.02 \| 7.01` | `-2.00 \| 7.01` |
+| `SELECT SUM(N) FROM MX` | `19.09` | `27.01` |
+| `PERCENTILE_DISC(0.5) ... ORDER BY N` | `0.03` | `3.00` |
+
+Found by a reviewer, who measured it identical on a binary with only
+the arm reverted; re-measured here on 2026-09-03 against a binary with
+only the PROJECTION fix reverted, which answers those same three wrong
+values while the current binary answers the engine's - so it was the
+projection all along and not this arm. `SUM` is the useful one, because
+it shows the defect was not
+"just rendering" - the sum of the raw mantissas
+(`7+3+700+400+300+701+0-2+0-200 = 1909`) printed at scale -2. It was
+the PROJECTION defect recorded below, and **that is fixed as of
+2026-09-03**: all three now answer the engine's values
+(`qa/serve-real-scalefmt.sh` B4, B11, and the same three queries
+measured directly, `after: -2.00 | 7.01`, `27.01`, `3.00`).
+
+Across the whole probe: **12 SAME / 12 DIFF before, 19 SAME / 5 DIFF
+after**, and no consumer measured here moved away from the engine. That
+is the whole of what is claimed: it is a statement about the consumers
+listed above, all of which a client can reach, and NOT about
+`cmp_value_keys`, which no measurement on this box reaches at all.
+
+**Two probe numbers appear in this repository and they are not the same
+measurement.** This paragraph's **12 SAME / 12 DIFF -> 19 SAME / 5
+DIFF** was taken against a binary built from THIS tree with only
+`value_cmp`'s mixed arm reverted. `value_cmp`'s own doc block records
+**11 SAME / 13 DIFF -> 17 SAME / 7 DIFF on `79c4720`**, which is a
+reviewer's measurement against the PREVIOUS COMMIT's binary - a
+different baseline, carrying whatever else that commit lacked. Neither
+was re-taken on 2026-09-03; both are labelled where they stand, and a
+reader who finds both is looking at two questions, not two answers to
+one.
+
+`cmp_value_keys` (the raw-BLR request
+sort, which `gbak` and the API clients drive) is the one consumer NOT
+measured directly: it sorts whatever a compiled BLR request names, and
+the requests this server actually serves sort system-table columns,
+which have one format each. It is the same `value_cmp`, so a mixed
+pair there would move the same way as everywhere above; the `gbak`
+gates (58 + 39 + 14 + 12 checks, rc 0) exercise the path.
+
+### And a decimal literal DEFAULT can now be created at all
+
+`NUMERIC(9,2) DEFAULT 7.00` and `DEFAULT 7.0` - which the engine
+accepts - failed the whole `CREATE TABLE` with a bare
+`Dynamic SQL Error`, on every column type, because the default parser
+only took an integer literal. So `DEFAULT 7`, the scale-0 spelling that
+was the corrupting one, was **the only decimal default fire-crab could
+write**. The engine stores a decimal default as the same
+`blr_literal blr_long` with the LITERAL's scale in the (signed) scale
+byte, read back out of its catalog as hex:
+
+```
+NUMERIC(9,2) DEFAULT 7.00        05 15 08 FE BC020000 4C     (700,  -2)
+NUMERIC(9,2) DEFAULT 7.0         05 15 08 FF 46000000 4C     (70,   -1)
+NUMERIC(9,2) DEFAULT -7.25       05 15 08 FE 2BFDFFFF 4C     (-725, -2)
+NUMERIC(9,4) DEFAULT 123456.7890 05 15 08 FC D2029649 4C     (1234567890, -4)
+```
+
+`num_default_blr` writes exactly that and `int_default_blr` is now the
+scale-0 call of it, so nothing an integer default writes moved. The
+ENGINE reads the same `RDB$DEFAULT_SOURCE` and the same
+`RDB$DEFAULT_VALUE` bytes out of fire-crab's file as out of its own
+(gate 16g). **Still refused, and each is the refusal it already gave:**
+an exponent literal (`DEFAULT 1.5e2`), and a mantissa too wide for
+`blr_long` (`DEFAULT 12345678901.2345`, which the engine writes as
+`blr_int64`).
+
+### The gate
+
+`qa/serve-real-fkaction.sh` grows from 172 checks to **209**, rc 0.
+Section 16 is new (37 checks): the parent-side `SET DEFAULT` shape and
+the child-side cross-scale shape on `NUMERIC(9,2)`, `NUMERIC(18,2)` and
+`NUMERIC(20,2)` (each paired with its own scale-0 type - `INTEGER`,
+`BIGINT`, `INT128` - because the engine refuses a partner index segment
+of a different WIDTH); the `ON UPDATE SET DEFAULT` spelling; the
+orders/lines shape with no referential action anywhere; a compound key
+crossing scales on one segment; the contrasts that must NOT move (two
+SCALED sides, a `DOUBLE PRECISION` key, and a default that is a
+DIFFERENT live key); and the decimal-default DDL with its catalog bytes
+pinned in both files. Every shape has the ENGINE read both files back
+and COUNT the dangling children. Non-vacuity: **186 OK / 23 DIFF on the
+previous round's binary, 102 OK / 107 DIFF on `79c4720`.**
+
+Section 14e's `efiles` was also repaired: it printed `COALESCE('set',
+'-')` over a row set already filtered to `RDB$FOREIGN_KEY IS NOT NULL`
+- a constant dressed as a measurement, which hid the very difference
+the check exists for. It now READS the column, over an unfiltered row
+set, and shows it: the ENGINE clears the deferred-drop leftover's
+`RDB$FOREIGN_KEY` (`fk=null`) where fire-crab leaves it `fk=set`.
+
+### Recorded here, still open
+
+- **~~MEDIUM, WRONG ANSWER~~ - CLOSED 2026-09-03 by the round below.**
+  An old-format row of a column whose SCALE was altered was returned
+  through the NEW format's scale: the engine reads `7.00` for both rows
+  of an `INTEGER` -> `NUMERIC(9,2)` fixture and fire-crab read `0.07`
+  for the old one. The stored VALUE was always right - `WHERE N = 7`
+  picked that row in both servers - so it was the projection. See "A
+  RECORD IS PRESENTED THROUGH THE FORMAT THAT DESCRIBES IT NOW".
+- **MEDIUM, MISSING ROWS, PRE-EXISTING, STILL OPEN - an INDEX OLDER
+  THAN THE FORMAT A ROW WAS WRITTEN UNDER does not name that row.**
+  This entry has now been narrowed twice, and the second narrowing was
+  itself too narrow. It first said an index over a scale-altered column
+  loses the old-format rows, flatly; then that "it is the index's AGE
+  relative to the ALTER that decides", which holds only when the table
+  has had exactly ONE `ALTER`. The law is per FORMAT: an index entry is
+  keyed at the scale its row carried when the entry was MADE, and a
+  probe builds ONE key, so an index misses every row written under a
+  format MINTED AFTER IT. Measured 2026-09-03, three fixtures,
+  `INTEGER` -> `NUMERIC(9,2)` [-> `NUMERIC(18,4)`], rows written on both
+  sides of every ALTER:
+  - index created BEFORE the only ALTER (`IW`): `WHERE N = 7` answers
+    `2` where the engine answers `2, 3`; `WHERE N = 700` answers `1` for
+    the engine's `1, 4`; and a RANGE probe loses the same rows -
+    `WHERE N > 0` answers `1, 2` for the engine's `1, 2, 3, 4`, as does
+    `BETWEEN 1 AND 1000`.
+  - index created AFTER a first ALTER and BEFORE a second (`IX3`):
+    `WHERE N = 7` answers `2, 3` where the engine answers `2, 3, 5`, and
+    `WHERE N > 0` answers `1, 2, 3, 4` for the engine's `1, 2, 3, 4, 5`.
+    **This is the shape that corrects the wording**: the index is
+    YOUNGER than the ALTER and still loses the rows written under the
+    format minted after it. The projection and `ORDER BY N` over the
+    same table are the engine's answers.
+  - index created after BOTH ALTERs (`IX4`): `= 7`, `> 0`, the
+    projection and an `ORDER BY` are all the engine's answers. (On the
+    single-ALTER fixture, an index created after the ALTER - before or
+    after the later inserts - is likewise the engine's answer on `= 7`,
+    `= 700`, `> 0`, an `ORDER BY` and an indexed self-join.)
+
+  Identical on a binary with the projection fix reverted, so it is the
+  index KEY ENCODING and not the projection. The `IW` shapes, the two
+  equality probes and now the range probe, are pinned with both answers
+  in `qa/serve-real-scalefmt.sh` section H; that fixture has one ALTER,
+  so `IX3`/`IX4` live here rather than in the gate.
+- **MEDIUM, REFUSAL TEXT, PRE-EXISTING - an INT128-backed key loses the
+  `-Problematic key value` line.** `NUMERIC(20,2)`, `NUMERIC(19,2)` and
+  a plain `INT128` primary key all refuse with the constraint and table
+  named and that line ABSENT, where the engine prints it;
+  `NUMERIC(18,2)` (i64-backed) prints it. Byte-identical on the
+  previous round's binary for an ordinary no-rule child with no actions
+  anywhere, so it is not this chunk's. Gate 16a/16b pin BOTH answers.
+- **MEDIUM, REFUSAL TEXT, PRE-EXISTING - a `DOUBLE PRECISION` key
+  renders as `("ID" = 7e0)` where the engine writes
+  `("ID" = 7.000000000000000)`, and a `CHAR(5)` key renders PADDED,
+  `("ID" = 'AB ')` against the engine's `("ID" = 'AB')`.** Same family
+  as the `DATE`/`TIMESTAMP` rendering below; rows identical in every
+  case. Gate 16f pins both answers for the `DOUBLE` one.
+- **MEDIUM, REFUSAL TEXT, PRE-EXISTING - a `SET DEFAULT` whose default
+  is `CURRENT_TRANSACTION` refuses with `42000 Dynamic SQL Error` where
+  the engine answers `23000 ... -Foreign key reference target does not
+  exist ... -At trigger`.** Both refuse and both files hold the same
+  rows, so the wider acceptance in `fk_action_leaves_old_key` is safe -
+  but the comment there claimed, as "verified", that it refuses "with
+  the engine's own reason", and it does not. Byte-identical on
+  `79c4720`; the comment is corrected.
+
+## A DECISION, NOT A CHASE: FIRE-CRAB CHECKS EVERY FOREIGN-KEY PARTNERSHIP (2026-09-03)
+
+**DECISION. On a parent `DELETE` or `UPDATE`, fire-crab checks EVERY
+dependent foreign key on every referenced index, and refuses if ANY of
+them still holds the key. The engine checks exactly ONE per referenced
+index. This is a deliberate, documented divergence, and it is not a
+defect to be closed in a later round.**
+
+The round below spent itself proving the engine's selector. It is now
+genuinely proven, and the proof is the reason to stop reproducing it.
+
+### What the engine does, measured
+
+For each REFERENCED (parent) index the engine performs its master-side
+check on the FIRST row of `RDB$INDICES`, in PHYSICAL RECORD ORDER, whose
+`RDB$FOREIGN_KEY` names that index. Every partnership behind it on that
+index goes unchecked, and the parent row is deleted with those children
+still pointing at it. Measured directly against Firebird 6 at
+`127.0.0.1/3050`, 2026-09-03:
+
+```sql
+CREATE TABLE QP (ID INTEGER NOT NULL PRIMARY KEY);
+CREATE TABLE Q1 (X INTEGER, B INTEGER REFERENCES QP);   -- EMPTY, physically first
+CREATE TABLE Q2 (X INTEGER, B INTEGER REFERENCES QP);   -- holds the key
+INSERT INTO QP VALUES (1);  INSERT INTO Q2 VALUES (200, 1);
+DELETE FROM QP WHERE ID = 1;
+  engine:  parent rows = 0   Q2 rows = 1   Q2.B = 1      <- A DANGLING REFERENCE
+```
+
+`gfix -v -full` calls that file clean. Every other candidate was ruled
+out by its own shape: not "the first partnership whose rule ACTS" (the
+shape above with a cascading `Q3` behind), not by constraint or index
+NAME (`FZ` declared first and empty, `FA` holding), not by child
+RELATION ID (`R1` lowest and holding, `KR2` added first), not by child
+INDEX ID, and not per parent TABLE (`MP (ID PK, U UNIQUE)`: a clean
+partnership on the PK says nothing about the UNIQUE, and the engine
+refuses there - that one is a real defect and it stays closed).
+
+### The shape that proves the selector - and the one that does not
+
+**What decides between PHYSICAL `RDB$INDICES` order and CREATION order
+is a freed catalog slot, not a `gbak` round trip:**
+
+```sql
+CREATE TABLE RP (ID INTEGER NOT NULL PRIMARY KEY);
+CREATE TABLE JUNK (A INTEGER);  CREATE INDEX J1 ON JUNK (A);  COMMIT;
+CREATE TABLE RB (X INTEGER, B INTEGER, CONSTRAINT FB FOREIGN KEY (B) REFERENCES RP);
+COMMIT;  DROP TABLE JUNK;  COMMIT;      -- frees an earlier RDB$INDICES slot
+CREATE TABLE RA (X INTEGER, B INTEGER, CONSTRAINT FA FOREIGN KEY (B) REFERENCES RP);
+```
+
+`FB` is created BEFORE `FA`, the engine puts `FA`'s row into `JUNK`'s
+freed slot, and in the engine's own file the physical order is
+`RDB$PRIMARY1, FA, FB`. Creation order says ask `FB`; physical order
+says ask `FA`. Both directions measured on the engine's file: with `RA`
+holding the key it REFUSES naming `FA`; with `RB` holding the key it
+PERFORMS the delete and leaves `RB` dangling. Physical order, both
+times.
+
+**THE CLAIM THAT THE `gbak` FLIP IS "the shape that decides it, and the
+only one that can" IS FALSE AND IS WITHDRAWN** - from the entry below,
+from `fk_check_parent_row`'s doc block and from
+`qa/serve-real-fkaction.sh`. A reviewer ran `gbak -c -v`, whose own log
+prints the order the restore CREATES the indexes in:
+
+```
+gbak:    activating and creating deferred index "PUBLIC"."FC"
+gbak:    activating and creating deferred index "PUBLIC"."FB"
+gbak:    activating and creating deferred index "PUBLIC"."FA"
+```
+
+`FC, FB, FA` - identical to the restored file's physical order. The flip
+separates physical order from `RDB$RELATION_CONSTRAINTS` and
+`RDB$REF_CONSTRAINTS`, which do not move, and from nothing else. It
+cannot tell physical order from creation order, which is the very class
+of error the round below was pilloried for. The measurement is real; the
+conclusion drawn from it was not supported by it.
+
+### Why fire-crab diverges instead of reproducing it
+
+1. **Reproducing it would make foreign-key ENFORCEMENT depend on the
+   engine's physical catalog record PLACEMENT.** The engine reuses a
+   freed `RDB$INDICES` slot; fire-crab appends. So whether a foreign key
+   is enforced at all would turn on the schema's DELETION HISTORY - an
+   ordinary `DROP TABLE` of an unrelated table is enough, and so is a
+   `DROP CONSTRAINT` followed by a re-`ADD`. That is not a law about
+   foreign keys; it is a law about where a catalog row happened to land.
+2. **Three rounds have chased that selector and each shipped a NEW
+   silent wrong write** - three for three. A parent row deleted that the
+   engine keeps, an orphan behind it, and `gfix -v -full` clean each
+   time.
+3. **What is being reproduced is referential corruption.** The engine's
+   answer in the `QP`/`Q1`/`Q2` shape LEAVES A DANGLING CHILD ROW. This
+   project's standing rule applies: a conversion that cannot express a
+   case declines it rather than approximating it, and a refusal is
+   enormously better than a silent wrong write.
+
+### THE EXACT CONSEQUENCE
+
+**fire-crab REFUSES some parent `DELETE`s and `UPDATE`s that the engine
+PERFORMS** - `SQLSTATE 23000`, naming the first partnership in
+`RDB$INDICES` row order that still holds the key. What the engine left
+behind is **not one thing**, and only the first of these two is this
+decision's own consequence:
+
+- **Where the ENGINE'S SELECTOR is what differs** - a partnership
+  BEHIND the physically first one on the same index still holds the key
+  - the engine performs the statement and **its own file is left
+  holding a dangling child row**. Measured on every such shape, with
+  the ENGINE reading both files back and counting the orphans in each
+  (`qa/serve-real-fkaction.sh` sections 13 and 14).
+- **Where ANOTHER PARTNERSHIP'S ACTION has already cleared the very
+  rows** this one probes, **the engine's file is CLEAN** and fire-crab
+  refuses a statement whose engine result was correct. Measured
+  2026-09-03: one child column carrying two foreign keys to one parent
+  index, `W1` with no rule and `W2` `ON DELETE SET NULL`, has the
+  engine null the column and delete the parent with `ORPH 0` in its
+  file, while fire-crab refuses naming `W1`; with an `ON DELETE
+  CASCADE` sibling instead, the engine deletes both rows, again
+  `ORPH 0`. That is an **over-refusal**, not a divergence in this
+  decision's favour - it is the "the check does not see what ANOTHER
+  partnership's action left behind" bullet under "Recorded, still
+  open", it is present on `79c4720`, and the fix that closes it is
+  named there.
+
+**The other direction is NOT ruled out, and the superset argument this
+entry used to give for ruling it out does not hold.** What is true, and
+is all the walk itself buys, is narrower: **asking every partnership
+rather than one cannot introduce an acceptance**, because the walk
+refuses whenever any partnership answers. But the check is not only a
+set of partnerships, and two paths do accept where the engine refuses:
+
+1. **A `BEFORE UPDATE` trigger that writes `NEW.<key>`.** It moves the
+   referenced key without the statement's SET list naming it, and the
+   parent-side partnership list is narrowed BY that SET list before the
+   check runs (`plan_update`'s `touched` filter, `server.rs`, which
+   narrows `fk_refs` and `fk_children` alike). Measured 2026-09-03 on a
+   no-rule partnership: `UPDATE TP SET Z = 9 WHERE ID = 1` under a
+   trigger writing `NEW.ID = 55` is performed by fire-crab, and the
+   ENGINE reads `ORPH 1` back out of fire-crab's file where it reads
+   `ORPH 0` out of its own. Byte-identical on `79c4720`; it has its own
+   bullet under "Recorded, still open".
+2. **A partly-NULL key on an OPAQUE partnership**, accepted on the
+   last-resort path deliberately - the wide question that path asks
+   cannot be asked about a NULL. Behaviour-identical to `79c4720`;
+   reasoned, not run.
+
+A **third was closed on 2026-09-03**, and it is why this section was
+rewritten: `value_cmp` had no arm for two exact numerics of DIFFERENT
+kinds, so a child column at scale 0 against a parent key at scale 2
+never matched and the parent deleted out from under a live child (see
+"A MIXED EXACT-NUMERIC PAIR" above). A superset of partnerships each
+asked a too-narrow question is not a superset of refusals - which is
+why the superset argument was the wrong SHAPE of argument, not merely
+too broadly scoped.
+
+The divergence itself is invisible on a schema where each parent index
+has one dependent foreign key, which is the ordinary case; it appears
+only where a parent index carries SEVERAL, and only when a partnership
+other than the physically first one holds the key.
+
+### What was kept from the rounds that chased the selector
+
+Two things, both correct and both engine-faithful, and neither is about
+the selector:
+
+- **The check reads the child AFTER the action has run.** An acting
+  partnership is not waived; it is judged on what its action WROTE. Only
+  `SET DEFAULT` can write the old key straight back, and there the
+  engine refuses: `SC.B INTEGER DEFAULT 7 REFERENCES SP ON DELETE SET
+  DEFAULT` with a child row `B = 7` answers `-Problematic key value is
+  ("ID" = 7)` on `DELETE FROM SP WHERE ID = 7`.
+- **The NULL laws on both sides.** A key is unreferenceable only when
+  EVERY column of it is NULL (the master side probes the child's index,
+  where a NULL is a storable key); an action fires only when some
+  comparison is TRUE; and "did the key change" is `IS DISTINCT FROM`, so
+  two NULLs are ONE key.
+
+### The two silent wrong writes this round closed
+
+Both were shipped by the round below and both were found by a reviewer.
+
+- **HIGH, SILENT WRONG WRITE, NEW in the round below - `SET DEFAULT`
+  whose default is NOT a literal waived the check.** `default_as_value`
+  answered `None` for everything but a literal, `fk_action_leaves_old_key`
+  read that as "the action cleared the key", and the refusal was skipped
+  - while `default_wire_param`, which the action actually binds, happily
+  evaluates `CURRENT_USER`, `CURRENT_DATE`, `CURRENT_TIME`,
+  `CURRENT_TIMESTAMP`, `CURRENT_ROLE` and `CURRENT_CONNECTION`. So the
+  action wrote the key straight back and nothing refused. Measured:
+  `B VARCHAR(31) DEFAULT CURRENT_USER` with a child row `'SYSDBA'` had
+  `DELETE FROM SPU WHERE ID = 'SYSDBA'` performed by fire-crab and
+  refused by the engine; `DATE DEFAULT CURRENT_DATE` and the
+  `ON UPDATE SET DEFAULT` spelling were the same. The doc comment that
+  justified the gap - "[fk_action_stmts] refuses the whole statement on
+  the same default a moment later" - was false for every form the server
+  CAN evaluate. `default_as_value` now evaluates every form
+  `default_wire_param` does, a test ties the two together so they cannot
+  drift, and `CURRENT_TRANSACTION` is the one remaining `None`. **Half of
+  the old justification holds there and half does not, and the word
+  "verified" used to be attached to the half that does not.** What is
+  true and was measured: `fk_action_stmts` refuses the whole statement a
+  moment later, so no wrong write comes of it and the rows agree with the
+  engine's. What is NOT true: that it refuses "with the engine's own
+  reason". It refuses `42000 Dynamic SQL Error` where the engine answers
+  `23000 ... -At trigger`; both files hold `NP 1 | CB 99999` afterwards.
+  Byte-identical on `79c4720`, so the message gap is pre-existing, and it
+  is recorded as a refusal-text defect below.
+- **HIGH, SILENT WRONG WRITE, NEW in the round below - `DROP CONSTRAINT`
+  and re-`ADD` put a different row first, and only the first row was
+  asked.** fire-crab places the re-added index row before the live one
+  and leaves the deferred-drop leftover's `RDB$FOREIGN_KEY` set; the
+  engine appends and clears it. Either half alone flips which row is
+  "first", so an empty child became the enforcement and the parent
+  DELETE went through with the real child left dangling. This is
+  subsumed rather than patched: with every partnership asked, the layout
+  decides nothing. **The layout difference itself is real and stays
+  open** - `qa/serve-real-fkaction.sh` 14e pins both files' layouts so it
+  cannot drift unnoticed.
+
+### The safe direction, hunted - and WHAT THE HUNT ACTUALLY COVERED
+
+The claim "fire-crab can only ever refuse more, never less" is a claim
+about a direction, so it was attacked rather than asserted. Every
+several-children shape that could be built was run through both servers
+on their own files and then read back BY THE ENGINE from both:
+`Q1`/`Q2`/`Q3`; two children over two referenced indexes and the
+`ORD`/`LINES`/`PAYMENTS` business schema; the freed-slot shape in both
+directions; the eight-child one-rule-each matrix; the `gbak`-restored
+file whose physical order is reversed; `DROP CONSTRAINT` + re-`ADD`; a
+deferred-drop leftover shadowing a live partner; the non-firing-action
+partner in front, empty and holding; and `SET DEFAULT` writing the key
+back on both the DELETE and the UPDATE side. **Within that space no
+counter-example was found**: in every shape where the two servers
+differ there, fire-crab refuses and the ENGINE's file is the one
+holding the dangling row.
+
+**That space is SEVERAL CHILDREN OF ONE PARENT INDEX, and it is not the
+whole question.** Every shape above varies WHICH PARTNERSHIPS ARE
+ASKED. None of them varies what "holds the key" MEANS, or whether the
+partnership list reaches the check at all - and both of those produced
+counter-examples once a reviewer looked there:
+
+- **the key comparison itself.** `value_cmp` had no arm for two exact
+  numerics of different KINDS, so an `INTEGER` child column against a
+  `NUMERIC(9,2)` parent key was never matched at all. FOUND by a
+  reviewer, FIXED 2026-09-03 ("A MIXED EXACT-NUMERIC PAIR" above). No
+  several-children shape could have found it: it needs two TYPES.
+- **the partnership list.** A `BEFORE UPDATE` trigger moving the key
+  escapes the SET-list narrowing before the walk begins. Found by a
+  reviewer; pre-existing, still open.
+
+**The three whole-file detectors this round leaned on could not have
+found either**, and that is worth writing down next to the hunt:
+`gfix -v -full` calls a file with a dangling child row CLEAN (it
+validates page structure, not referential agreement); a count of
+`RDB$INDEX_INACTIVE` in a restored copy is not evidence either way -
+it read **0** on the failed restore measured here and a reviewer
+re-running the same shape read **3** on theirs, so the count depends on
+how far the restore got and says nothing on its own; and a per-shape
+orphan query only sees the shapes it was written for. The one detector
+that did fire is **`gbak`'s own restore, by what it PRINTS**: a restore
+rebuilds and ACTIVATES every foreign-key index through the engine, and
+on a violated one it did not bring the index online - it emitted
+
+```
+gbak:cannot commit index "PUBLIC"."INTEG_3"
+gbak: ERROR:violation of FOREIGN KEY constraint "INTEG_3" on table "PUBLIC"."TC"
+gbak: ERROR:    Problematic key value is ("B" = 1)
+gbak: ERROR:Database is not online due to failure to activate one or more indices.
+```
+
+Measured 2026-09-03 on a file fire-crab had just corrupted through the
+BEFORE-trigger path: `gfix -v -full` rc=0 and silent, the restored
+copy `INACTIVE 0` and `ORPH 1`, the restore itself rc=2 with the five
+`gbak: ERROR` lines above. **Assert the printed error, not the exit
+code alone** - a reviewer recorded one restore that printed
+`Problematic key value is ("ORDID" = 1.00)` and still exited 0, so the
+code is not by itself the signal, and an inactive-index count is not a
+signal at all.
+
+### The gate
+
+`qa/serve-real-fkaction.sh` grows from 118 checks to **172**, rc 0.
+(The round ABOVE takes it to **209** and repairs 14e's `efiles`, which
+printed a constant where it claimed to read `RDB$FOREIGN_KEY`.)
+Fourteen checks stopped being parity comparisons, and every one of them
+became a LOUDER assertion rather than a quieter one - a gate that
+quietly stops comparing is worse than one that fails. Each diverging
+shape now asserts THREE things where it asserted one: fire-crab's own
+answer against a recorded expectation, the ENGINE's own answer against
+its own, and the DIRECTION (`crab-refuses|engine-performs`) computed
+from the two answers, so neither server can change its mind unnoticed.
+Where rows are at stake a fourth and fifth follow, with the ENGINE
+reading both files: fire-crab's with no dangling child in it, the
+engine's with the one it left. Section 14 adds the `QP`/`Q1`/`Q2`
+measurement, the freed-slot shape in both directions with both files'
+physical `RDB$INDICES` order pinned, and both of the reviewers'
+reproducers. Non-vacuity: **133 OK / 39 DIFF on the previous round's
+binary, 86 OK / 86 DIFF on `79c4720`.**
+
+### Recorded, still open
+
+- **MEDIUM, REFUSAL TEXT, PRE-EXISTING - the refusal names the wrong
+  constraint and the wrong key when a parent has SEVERAL referenced
+  indexes.** The engine's outer loop is over the PARENT's indexes and
+  fire-crab's is over child index rows, so with `OP (ID PK, U UNIQUE)`
+  where the UNIQUE takes index slot 1, both servers refuse and both
+  leave the same rows, but the engine names `KOB`/`("U" = 10)` and
+  fire-crab names `KOA`/`("ID" = 1)`. The `UPDATE` spelling and the
+  mirror shape diverge identically. Byte-identical on `79c4720`. Rows
+  are the same in every case: a message defect, not a write defect.
+- **MEDIUM, REFUSAL TEXT, PRE-EXISTING - a DATE, TIME or TIMESTAMP key
+  is rendered with its type word in the refusal.** `-Problematic key
+  value is ("ID" = DATE '2020-01-02')` where the engine writes
+  `("ID" = '2020-01-02')`, and `TIMESTAMP '...'` likewise. Byte-identical
+  on the previous round's binary for a plain no-rule child, so it is not
+  this chunk's; it became easy to see here because the `SET DEFAULT`
+  fix made a DATE-keyed refusal reachable.
+- **MEDIUM, WRONG WRITE (silent), PRE-EXISTING - a `BEFORE` TRIGGER THAT
+  MOVES THE REFERENCED KEY BYPASSES BOTH THE CHECK AND THE ACTION.**
+  `fk_children` is narrowed to partnerships whose key columns the
+  statement's SET LIST names, and a `BEFORE UPDATE` trigger writing
+  `NEW.<key>` is invisible to that filter. Byte-identical on `79c4720`;
+  the narrowing is only sound if taken AFTER the BEFORE triggers have
+  patched the row. Nothing in any gate holds it.
+- **MEDIUM, OVER-REFUSAL, PRE-EXISTING (narrowed, not closed) - the
+  check does not see what ANOTHER partnership's action left behind.**
+  `fk_action_leaves_old_key` is asked about the checked partnership's own
+  action only, so when a different partnership's action clears the very
+  rows this one probes, fire-crab still refuses: one child column
+  carrying two FKs to one parent index, `W1` (no rule) and `W2`
+  (`ON DELETE SET NULL`), has the engine perform the DELETE with the
+  child nulled and fire-crab refuse. `79c4720` refuses too. **This round
+  makes it WIDER, measured, not guessed:** the same shape with the
+  `SET NULL` constraint declared FIRST used to agree (the clearing
+  partnership was the one asked, so nothing behind it was), and now
+  refuses as well; so does the spelling where a second child's
+  `ON DELETE CASCADE` deletes the very rows the first partnership
+  probes. Direction unchanged - a refusal, never an orphan, and
+  `gfix -v -full` clean on fire-crab's file in all three. The fix is to
+  ask [fk_action_leaves_old_key] of every partnership that rewrites the
+  same child rows rather than only of the one being checked, and it is
+  the natural next piece of work here.
+- **LOW, REFUSAL, PRE-EXISTING - `ORDER BY RDB$DB_KEY` is a
+  `Dynamic SQL Error`.** It costs nothing but the ability to read a
+  relation in physical record order through fire-crab itself, which is
+  why every placement measurement in the round above is taken by the
+  ENGINE reading fire-crab's file. Byte-identical on `79c4720`.
+- **LOW, REFUSAL WITH AN INCOMPLETE VECTOR, PRE-EXISTING - a master-side
+  FK refusal raised inside a PSQL body carries no `-At procedure`
+  frame.** Byte-identical on the baseline, and it is GENERAL, not
+  specific to the guard path: a plain CHECK, a NOT NULL and a child-side
+  FK failure inside a procedure all lose the frame too, and so does a
+  cascade failing inside one. The `InTrigger` arm of `wrap_at_procedure`
+  added by the round below, and its comment claiming the frame is
+  emitted, are therefore unreachable in practice - the comment is
+  wrong and the roadmap bullet below that scopes this to "the path where
+  the refusal comes from the GUARD" is too narrow.
+- **A PARTLY-NULL KEY ON AN OPAQUE PARTNERSHIP IS ACCEPTED, and that is
+  a decision.** Unchanged by this round: the wide question ("does some
+  row hold every one of these values in ANY column?") cannot be asked
+  about a NULL, so a partly-NULL key keeps the older, wider ACCEPTANCE
+  on the last-resort path rather than a guess in either direction.
+  Behaviour-identical to `79c4720`. Reasoned, not run.
+- **`fk_actions_runnable` does not catch an unresolvable index row on a
+  RESTRICT-only parent.** The comment on the old selector claimed such a
+  shape "refuses at prepare instead"; `fk_actions_runnable` is only
+  consulted when a flag-4 action trigger of the statement's kind exists,
+  and a parent whose partnerships are all `RESTRICT`/`NO ACTION` has
+  none. Under the decision above this no longer changes WHICH
+  partnership is asked - all of them are - so what remains is that an
+  index row this server cannot resolve into a partnership at all is
+  simply not asked. Reasoned, not run: a reviewer could not construct an
+  index row that names a parent index and still fails to resolve.
+- **NO SCHEMA SUPPORT, so `parent_index` and the parent-row lookup
+  keying on the BARE index name is a LATENT hazard.** Index names are
+  per-schema in FB6 and the engine will happily create two `IXP` indexes
+  in different schemas; fire-crab rejects `CREATE SCHEMA` outright, so
+  the shape is unreachable through its own DDL today.
+- **A FUSED DOC COMMENT AT `user_triggers` / `db_triggers`,
+  PRE-EXISTING** - the two doc blocks run together with the function
+  between them missing. Identical at `79c4720`.
+
+---
+
+## ONE DEPENDENT FOREIGN KEY PER REFERENCED INDEX (2026-09-03) - the round that corrected a law written on evidence that could not support it
+
+**SUPERSEDED IN PART BY THE ROUND ABOVE.** The law recorded here is the
+ENGINE's and it is correct. What is withdrawn is (a) that the `gbak`
+flip decides it - it cannot separate physical order from creation order
+- and (b) that fire-crab reproduces it. fire-crab now checks EVERY
+partnership, by decision; the entry above says why and what it costs.
+
+A METHODOLOGY FAILURE FIRST, A CODING ONE SECOND. The round below
+replaced a recorded observation ("the engine acts on only the FIRST
+foreign key on a parent-row DELETE") with a sharper-sounding law ("the
+RESTRICT walk stops at the first partner whose rule for THIS statement
+kind acts") and presented seven measured shapes, `PA`-`PH`, as proof.
+All seven measurements are real and all seven still hold. **Not one of
+them could distinguish the two laws**: in every one the deciding partner
+is `partner[0]`, or `partner[1]` behind an empty `partner[0]`, so both
+candidates answer them identically. A probe set that every candidate
+passes has measured nothing, and the law went into a doc comment, into
+this file, and into the code as "measured", "not an accident of this
+server's loop", "recorded as a decision".
+
+Both reviewers found the same shape independently, and it is a SILENT
+WRONG WRITE: a parent row deleted that the engine keeps, an orphan left
+behind, `gfix -v -full` clean, and a file that will not restore with its
+indexes active.
+
+**THE RULE FOR THIS PROJECT, stated so the next round cannot repeat it:
+before encoding a law, write down the candidate laws and construct the
+shape whose ANSWER DIFFERS between them. Probes are designed to
+DISTINGUISH, not to confirm.**
+
+### The law, and the shapes that decide it
+
+**For each REFERENCED (parent) index the engine performs its master-side
+check on exactly ONE dependent foreign key - the FIRST row of
+`RDB$INDICES`, in PHYSICAL RECORD ORDER, whose `RDB$FOREIGN_KEY` names
+that index. Every partnership behind it on the same index goes
+unchecked. Every acting partnership on EVERY index still fires its
+action, and the check reads the child AFTER the action has run.**
+
+Measured 2026-09-03 against Firebird 6 at `127.0.0.1/3050`. Each shape
+below rules out one candidate; the candidates were: "the first partner
+whose rule acts", "the first by constraint/index NAME", "the first by
+child RELATION ID", "the first CREATED", "the first in
+`RDB$RELATION_CONSTRAINTS`", "one per parent TABLE", and the one that
+survived.
+
+- **Not "the first that acts".** `QP (ID PK)` with three no-rule
+  children declared `Q1` (EMPTY), `Q2` (holds key 1), `Q3`
+  (`ON DELETE CASCADE`, holds a row). "First that acts" checks `Q1`,
+  then `Q2`, and REFUSES. The engine DELETES - `NP 0`, `Q3` cascaded
+  away, `Q2` left dangling. Only `Q1` was ever asked.
+- **Not by NAME.** The same three named `FZ` (declared first, EMPTY),
+  `FA` (holds the key), `FM` (cascade). `FA` sorts first; the engine
+  DELETES, so it asked `FZ`.
+- **Not by RELATION ID.** Tables `R1`, `R2`, `R3` created in that order
+  (ids 129, 130, 131), constraints then added `KR2`, `KR1`, `KR3`. `R1`
+  has the lowest id and holds the key, `R2` is empty; the engine
+  DELETES, so it asked `KR2`.
+- ~~**PHYSICAL `RDB$INDICES` ORDER, not creation order and not the
+  constraint catalogs - the shape that DECIDES it, and the only one
+  that can.**~~ **THE MEASUREMENT STANDS; "THE SHAPE THAT DECIDES IT,
+  AND THE ONLY ONE THAT CAN" IS FALSE AND IS WITHDRAWN** - see the
+  round above, which disproved it with `gbak -c -v` and replaced it
+  with a shape that does decide. `FA` (declared first, HOLDS the key),
+  `FB`, `FC` (both empty), all no-rule. As created, `RDB$INDICES` is
+  physically `FA, FB, FC` and `DELETE FROM QP WHERE ID = 1` is REFUSED
+  naming `FA`. A `gbak` backup and restore of that same database
+  REVERSES `RDB$INDICES` to `FC, FB, FA` while
+  `RDB$RELATION_CONSTRAINTS` and `RDB$REF_CONSTRAINTS` keep their
+  original order (`RDB$DB_KEY` read out of both files, unchanged). Same
+  schema, same rows, same statement - and the restored file DELETES the
+  parent, leaving `FA`'s child dangling. What that separates is the
+  physical order of `RDB$INDICES` from the two CONSTRAINT CATALOGS, and
+  nothing else: `gbak -c -v`'s own log prints the order the restore
+  CREATES the indexes in - `FC`, `FB`, `FA` - which is the restored
+  file's physical order, so creation order moved with it and the flip
+  cannot tell the two apart.
+- **PER INDEX, not per parent TABLE.** `MP (ID PK, U UNIQUE)`, `MA`
+  referencing `MP(ID)` (physically first, EMPTY), `MB` referencing
+  `MP(U)` (holds the key). The engine REFUSES, naming `MB` on
+  `("U" = 10)`. This is the wrong write: ending a walk at `MA` deleted
+  the parent row and orphaned `MB`'s.
+- **An index ROW, not a constraint.** `DC1`'s constraint dropped while
+  its row still references the parent leaves `RDB$TEMP_DEPEND_129_0` in
+  `RDB$INDICES`, physically ahead of the live `DK2`. The engine picks
+  the leftover: `violation of FOREIGN KEY constraint "***unknown***"`.
+
+### An action is a WRITE, not a waiver
+
+The selected partnership is not skipped when it carries an action. The
+engine's action is an AFTER trigger on the parent and the master-side
+check reads the child once it has run, so a `CASCADE` or a `SET NULL`
+passes because nothing is left to find. `SET DEFAULT` is the one rule
+that can write the key straight back, and there the engine REFUSES:
+`SC.B INTEGER DEFAULT 7 REFERENCES SP ON DELETE SET DEFAULT`, child row
+`B = 7`, `DELETE FROM SP WHERE ID = 7` answers
+`23000 / -Foreign key references are present for the record /
+-Problematic key value is ("ID" = 7)`, the action having written 7 over
+7. The `ON UPDATE SET DEFAULT` spelling behaves identically, and a
+default that is a DIFFERENT key clears it and the DELETE goes through.
+`fk_action_leaves_old_key` is that reading. **CLASSIFICATION: WRONG
+WRITE (silent), NEW - the previous round's `if acts && fires { return
+Ok(()) }` deleted that parent row.**
+
+### The defects closed
+
+- **A. HIGH, SILENT WRONG WRITE, NEW - an action on one key skipped the
+  check on another.** `fk_check_parent_row`'s two `return Ok(())` ended
+  the walk over ALL partnerships, including partnerships on a DIFFERENT
+  referenced index. A parent with a PRIMARY KEY and a UNIQUE, an
+  `ON DELETE CASCADE` child on the first and a plain child on the
+  second: fire-crab deleted the parent, cascaded the first child away
+  and orphaned the second; the engine refuses. Reproduced on an ordinary
+  business schema (`ORD(ONUM UNIQUE, INVNO UNIQUE)`, `LINES` cascading,
+  `PAYMENTS` restricting), on the UPDATE spelling, and with no NULL
+  anywhere. `gfix -v -full` rc=0 on the file; `gbak` refuses to bring
+  the restored copy online. On `79c4720` the same statements are refused
+  and the two files AGREE, so this was NEW.
+- **B. HIGH - the recorded law was false and asserted as measured.**
+  Corrected in three places at once, because on this project the
+  comments carry the law: `fk_check_parent_row`'s doc block, the
+  withdrawn bullet in the round below, and the code. The doc block now
+  carries the candidate laws, the shape that separates each of them, and
+  a note of which shapes CANNOT decide it. The walk is gone:
+  `fk_checked_partnerships` names the partnerships the check asks, one
+  per `FkPartner::parent_index`, in list order - and
+  `fk_partners_uncached` builds that list by walking `RDB$INDICES` in
+  physical record order, which is the engine's own selector.
+  **SUPERSEDED by the round above: `fk_checked_partnerships` is gone
+  and fire-crab now asks EVERY partnership, deliberately. The law
+  recorded here is still the ENGINE's, and it was proved by a shape
+  this round did not have.**
+  **CLASSIFICATION of the behaviour B caused on its own: OVER-REFUSAL,
+  PRE-EXISTING (`79c4720` refuses the same shapes, differing only in the
+  message). What blocked was the false law.**
+- **C. MEDIUM, OVER-REFUSAL, NEW - a partly-NULL key rewritten with its
+  own values.** The "did the key change" test required
+  `!matches!(n, Value::Null)`, so a NULL component equal on both sides
+  made the key look CHANGED; reachable only because the round below
+  widened the OLD-key guard from `any(NULL)` to `all(NULL)`. Every SET
+  list that so much as NAMED a column of a partly-NULL key refused, and
+  took the row's other columns down with it - an ORM's whole-row
+  `SET U1 = 10, U2 = NULL, X = 1` lost the `X = 1`. The test is now
+  `IS DISTINCT FROM` (`fk_key_moved`): two NULLs are ONE key. It is not
+  the same question as `fk_action_fires`, and the pair that separates
+  them is `(10, 20) -> (10, NULL)`, which MOVES the key (so the check
+  runs) and fires NOTHING (so the statement is refused).
+- **AND THE SAME LAW ON THE CHILD SIDE - an UPDATE that leaves the key
+  equal is not checked at all.** The engine checks a foreign key while
+  maintaining the INDEX, and an unchanged key never touches the index,
+  so a row already holding a key with no parent may be rewritten with
+  that same key and the engine says nothing. Reachable, and it cost a
+  parent DELETE: `B INTEGER DEFAULT 7 REFERENCES PZ ON DELETE SET
+  DEFAULT` with a child row `B = 7`, on an index whose CHECKED
+  partnership is a different, empty one. The action writes 7 over 7 -
+  unchanged, unchecked - and the engine deletes the parent, leaving the
+  child dangling. The contrast that pins it: the same shape with
+  `DEFAULT 77` really moves the key and IS refused,
+  `-Foreign key reference target does not exist ... ("B" = 77) -At
+  trigger "PUBLIC"."CHECK_2"`. `fk_check_child_row` now takes the OLD
+  row on an UPDATE and skips a partnership whose key did not move.
+  **CLASSIFICATION: OVER-REFUSAL, introduced by the actions chunk** (on
+  `79c4720` the whole parent DELETE was refused, so the two files
+  agreed). It is what the eight-child matrix on a `gbak`-restored file
+  was still diverging on after A and B were closed.
+
+Gate: `qa/serve-real-fkaction.sh` grows from 78 checks to **118**, all
+of section 13. Every shape above is in it, each annotated with the
+candidate it rules out - the two-key wrong write and its UPDATE and
+business-schema spellings, the `Q1`/`Q2`/`Q3` shape, the name and
+relation-id and deferred-drop discriminators, the `gbak` physical-order
+flip that decides it (built, refused, backed up, restored, and then
+PERFORMED, with the two catalogs' orders printed on either side), the
+eight-child one-rule-each matrix, both `SET DEFAULT`-writes-the-key-back
+spellings with their clearing contrast, the child-side unchanged-key
+pair, and C's four shapes. It is 118 OK / rc=0 on this tree, **95 OK /
+23 DIFF on the previous round's binary** - every DIFF in section 13 -
+and 43 OK / 75 DIFF on the `79c4720` binary.
+`qa/serve-real-fkguard.sh`'s "SET NULL parent
+DELETE" check ran a DELETE that matched no row (the preceding statement
+had moved the key), so the path it named was never exercised; it now
+puts a child row back on the moved key and deletes that, and the check
+says so.
+
+### Recorded, still open
+
+- **MEDIUM, WRONG WRITE (silent), PRE-EXISTING - A `BEFORE` TRIGGER THAT
+  MOVES THE REFERENCED KEY BYPASSES BOTH THE CHECK AND THE ACTION.**
+  `crates/wire/src/server.rs` narrows `fk_children` to partnerships
+  whose key columns the statement's SET LIST names, and a
+  `BEFORE UPDATE` trigger writing `NEW.<key>` is invisible to that
+  filter, so the partnership is dropped before either the check or the
+  action can see it. With
+  `CREATE TRIGGER T1 FOR P1 BEFORE UPDATE AS BEGIN NEW.U = NEW.U + 1000;
+  END`, `UPDATE P1 SET X = 999` moves `U` from 10 to 1010: under no rule
+  the engine REFUSES (a child holds 10) and fire-crab performs it; under
+  `ON UPDATE CASCADE` the engine moves the child to 1010 and fire-crab
+  leaves it DANGLING at 10. **Byte-identical on the `79c4720` binary**,
+  and the narrowing predates the actions chunk unchanged. The narrowing
+  is only sound if it is taken AFTER the BEFORE triggers have patched
+  the row. Nothing in any gate holds it.
+- **LOW, REFUSAL WITH AN INCOMPLETE VECTOR, PRE-EXISTING - a master-side
+  FK refusal raised inside a PSQL body carries no `-At procedure`
+  frame.** `EXECUTE PROCEDURE PR3(11)` where the body's UPDATE meets a
+  no-rule master-side refusal answers the right `23000` and the right
+  key, but the engine adds `-At procedure "PUBLIC"."PR3" line: 1,
+  col: 43` and this server adds nothing; the DELETE spelling is the
+  same. Byte-identical on the baseline. It is the path where the refusal
+  comes from the GUARD rather than from a nested statement - the round
+  below fixed the duplicated dash on frames that were present, not a
+  frame that is never emitted.
+- **A PARTLY-NULL KEY ON AN OPAQUE PARTNERSHIP IS ACCEPTED, and that is
+  a decision.** `fk_check_parent_row`'s opaque branch asks
+  `fk_partner_could_carry` only when every key column is non-NULL: the
+  wide question ("does some row hold every one of these values in ANY
+  column?") cannot be asked about a NULL, because no column "holds" one.
+  A partly-NULL key therefore keeps the older, wider ACCEPTANCE there
+  rather than a guess in either direction. This is behaviour-identical
+  to `79c4720` for that shape (the old `any(NULL)` guard skipped it
+  too), it reaches only a descriptor this server could not read at all,
+  and it is stated here because the round below's `row_carries_key_at`
+  bullet says the master side matches NULLs - which is true of the exact
+  path and not of this last-resort one. Reasoned, not run: an opaque
+  partnership with a partly-NULL multi-column key was not constructed.
+- **A FUSED DOC COMMENT AT `user_triggers` / `db_triggers`,
+  PRE-EXISTING** - the two doc blocks run together with the function
+  between them missing. Identical at `79c4720`; the same family as the
+  dangling half-sentence the round below restored, and left alone here
+  so that this round's diff stays on its own subject.
+
+## A REFERENTIAL ACTION FIRES ONLY WHEN ITS COMPARISON IS TRUE (2026-09-03) - the referential-actions fix round
+
+The round that closed the one class this project will not ship. The
+chunk that made fire-crab PERFORM referential actions (`ON DELETE` /
+`ON UPDATE` CASCADE, SET NULL, SET DEFAULT) instead of refusing the
+parent's DML is right in every shape three reviewers measured but one,
+and that one turned a REFUSAL into a SILENT WRONG WRITE: before it, the
+two servers' files AGREED on the shape and only the message differed;
+after it they held different data and `gfix -v -full` called the file
+clean.
+
+- **A NEW KEY OF NULL PERFORMED THE ACTION INSTEAD OF REFUSING.**
+  `crates/wire/src/server.rs` `fk_check_parent_row` and
+  `fk_action_stmts` both guarded the OLD key against NULL (correct,
+  MATCH SIMPLE) and neither guarded the NEW one, so
+  `UPDATE P SET U = NULL` on a nullable referenced UNIQUE column with a
+  child present CASCADED - the child key became NULL, or the column's
+  DEFAULT under `SET DEFAULT`, which is the worst of the three because
+  the row then holds a plausible, non-null, referentially valid value
+  the engine never wrote. **CLASSIFICATION: WRONG WRITE (silent),
+  introduced by the actions chunk.** The engine, measured 2026-09-03 on
+  all four update rules with one child row present, REFUSES every one of
+  them: `23000 / violation of FOREIGN KEY constraint ... / -Foreign key
+  references are present for the record / -Problematic key value is
+  ("U" = 10)`.
+- **THE LAW IS NOT "a NULL new key refuses" - it is the engine's own
+  trigger guard.** The synthesised `ON UPDATE` body is
+  `IF (OLD.k1 <> NEW.k1 [OR OLD.k2 <> NEW.k2 ...])` (which
+  `qa/serve-real-fkcascade.sh` already compares byte for byte), and `<>`
+  against a NULL is UNKNOWN, not TRUE. So **an action fires exactly when
+  SOME key column's NEW value is non-NULL and DIFFERS from its OLD one**;
+  otherwise the statement falls to the master-side check, which refuses
+  if any child still references the old key. On a two-column key the
+  difference is decidable and was measured: the engine PERFORMS
+  `SET U1 = 11, U2 = NULL` and `SET U1 = NULL, U2 = 21` (one comparison
+  is TRUE, and the cascade carries the NULL into the child) and REFUSES
+  `SET U1 = 10, U2 = NULL` and `SET U1 = NULL, U2 = NULL` (none is). A
+  blanket "any NULL in the new key refuses" would have been its own
+  regression on the first two. `fk_action_fires` is that one predicate,
+  used by the check and by the statement builder so they cannot drift.
+- ~~**A NON-FIRING ACTION PARTNER IS A RESTRICT PARTNER - and still ends
+  the several-children walk.**~~ **THIS BULLET WAS FALSE AND IS
+  WITHDRAWN.** Half of it stands: a partnership whose action does not
+  fire IS checked exactly as a no-rule partnership is (`W1`, and the
+  observation still holds). The other half - "an acting partner ends the
+  walk" - was never measured. Every shape offered for it (`PA`-`PH`,
+  `W2`, `W4`) has the deciding partner at `partner[0]`, or at
+  `partner[1]` behind an empty `partner[0]`, so not one of them can tell
+  that law from the engine's. The engine's law is per REFERENCED INDEX
+  and is written out in the round below, together with the shapes that
+  DECIDE it and the ones that cannot. The difference is a silent wrong
+  write, and it was found by two reviewers, not by this bullet.
+- **A PARTLY-NULL PARENT KEY IS STILL REFERENCEABLE** - the same
+  asymmetry on the `ON DELETE` side, found by looking for it.
+  `fk_check_parent_row` skipped a partnership when ANY key column was
+  NULL; the engine skips only when EVERY one is. The two sides are not
+  the same law: the CHILD side is MATCH SIMPLE (a NULL component
+  references nothing, which is how such a child row gets in), while the
+  MASTER side probes the child's INDEX, where a NULL is a storable key.
+  Measured on `UNIQUE (U1, U2)`: parent `(10, NULL)` with child
+  `(10, NULL)` REFUSES a DELETE, under no rule and under
+  `ON DELETE CASCADE` / `SET NULL` alike (the action's `WHERE child.k =
+  OLD.k` matches nothing, so the child survives and the check refuses);
+  parent `(NULL, 20)` with child `(NULL, 20)` REFUSES; parent
+  `(10, NULL)` with child `(NULL, NULL)`, and an all-NULL parent key,
+  SUCCEED. **CLASSIFICATION: WRONG WRITE (silent), PRE-EXISTING - the
+  no-rule spelling diverges identically on `79c4720` - but the actions
+  chunk made it reachable through two more spellings, where it was a
+  refusal before.** `row_carries_key_at` now takes which SIDE is asking;
+  the child side is byte-for-byte what it was.
+- **THE DEPTH CEILING IS REACHED BY ROW DATA, NOT BY SCHEMA, AND IT IS
+  NOW THE ENGINE'S.** `MAX_FK_ACTION_DEPTH` was 16 with a doc comment
+  justifying it as a stack guard, which reads as a property of the
+  schema. It is not: ONE table with ONE self-referencing
+  `ON DELETE CASCADE` - an org chart, a folder tree, a bill of materials
+  - hit it on the seventeenth GENERATION OF ROWS, and the refusal
+  reached the client as a bare `Dynamic SQL Error` because
+  `ExecErr::Text` has no vector. The engine's own bound was bisected one
+  generation at a time: a chain of **1001** rows cascades away whole,
+  **1002** refuses with `SQLSTATE 54001 / Too many concurrent executions
+  of the same request` (`isc_req_max_clones_exceeded`) and writes
+  NOTHING. The limit is now 1001 - the same boundary expressed in this
+  counter, which reaches N for a chain of N - and the refusal answers
+  the engine's own status code. Verified at 1000/1001/1002 through both
+  servers; a 1001-deep cascade completes in under a second on a
+  connection thread's 16 MiB stack, and depth does not accumulate per
+  ROW (1000 parents cascading one level each is depth 1). What still
+  differs at 1002 is only the tail: the engine appends its 1000
+  `At trigger` frames and this server appends none.
+- **ONE EXTRA `-` ON THE ENCLOSING FRAME IS GONE.** A cascade that fails
+  inside a PSQL body shipped the enclosing `At procedure` / `At trigger`
+  frame as its OWN `isc_stack_trace` item, and isql prints a dash before
+  each item; the engine ships the whole trace as ONE item with the
+  frames on separate lines. `wrap_at_procedure` now continues the
+  `EvalErr::InTrigger` string (`outer`) instead of wrapping it, and the
+  emitter folds an inner `AtProcedure`'s own frames into the same
+  string - which is the other half of the same defect, seen when a
+  child's USER trigger raises inside the cascade. Four shapes now
+  byte-identical, three controls with no FK anywhere unchanged.
+- **THREE COMMENTS STATED THE REMOVED REFUSAL AS CURRENT LAW.**
+  `check_predicates`' own doc comment (which also had a dangling
+  half-sentence, pre-existing), `DmlGuard`'s doc, and the two comments
+  above `plan_delete`'s `check_predicates` call. On this project the
+  comments carry the law, and a reader auditing severity from them got
+  the opposite of what the function does.
+
+Gate: `qa/serve-real-fkaction.sh` grows from 27 checks to **78** - the
+four update rules against a NULL new key (answer AND the engine reading
+both files), the same four with NO children, which must keep succeeding,
+a child whose own key is NULL, eight multi-column shapes that pin the
+`OR` guard, the three several-children walk shapes, seven partly-NULL
+parent-key shapes across `ON DELETE`, and the depth boundary at 1001 and
+1002 with a non-leak check behind it. It is 78 OK / rc=0 on this tree
+and 29 OK / 49 DIFF on the `79c4720` binary. (The round below takes it
+to 118 and adds the section that decides the several-children law.)
+
+### Recorded, still open
+
+- **A NON-ASCII COLUMN `DEFAULT` IS DOUBLE-ENCODED, and it is the
+  ceiling on `SET DEFAULT`'s correctness.** `CREATE TABLE PLAIN (A
+  INTEGER, D VARCHAR(20) DEFAULT 'déf-ß')` then `INSERT INTO PLAIN (A)
+  VALUES (1)` stores `dÃ©f-Ã` - 11 octets where the engine writes 7 -
+  with NO error: the stored default's UTF-8 bytes are decoded as Latin-1
+  and re-encoded. **CLASSIFICATION: WRONG WRITE (silent), PRE-EXISTING -
+  byte-identical on `79c4720`, on a plain table with no foreign key
+  anywhere.** It matters here because `fk_child_default` reads the same
+  defaults, so `SET DEFAULT` is correct exactly as far as the shared
+  default reader is; through the FK path the corruption is CAUGHT
+  (the mojibake value has no parent row) and surfaces as a spurious
+  refusal rather than a silent write, which is the only reason the
+  action measurements did not see it - every one of them used an ASCII
+  default. The KEY path is genuinely right: a non-ASCII text key moved
+  by `ON UPDATE CASCADE` is byte-for-byte the engine's, which is what
+  the parameter design bought.
+- **THE `CHECK_<n>` COUNTER RUNS IN THE OPPOSITE ORDER when one `CREATE
+  TABLE` carries both a referential action and a CHECK.** For
+  `CREATE TABLE CU (A INTEGER, B INTEGER DEFAULT 9 REFERENCES PU ON
+  DELETE SET DEFAULT, CONSTRAINT CK_U CHECK (B < 5))` the engine draws
+  the FK ACTION trigger on the PARENT first (`CHECK_1 PU type 6 sysflag
+  4`, then the child's two CHECK triggers); fire-crab draws the child's
+  CHECK triggers first and the action trigger last. **CLASSIFICATION:
+  WRONG WRITE (catalog, silent), PRE-EXISTING - identical on
+  `79c4720`.** Newly VISIBLE, not newly wrong: before the actions chunk
+  the parent's DML was refused outright, so the names never reached a
+  user; now they appear in every failure vector as `-At trigger
+  "PUBLIC"."CHECK_<n>"`. It is the same family as `79c4720` itself ("A
+  generated name comes from a COUNTER, drawn in the order the engine
+  walks the statement") and is a residual gap in exactly that law.
+  `qa/serve-real-fkcascade.sh`'s tables carry no CHECK constraint, so no
+  gate holds it.
+- **A MULTIBYTE LITERAL IN A `WHERE` SILENTLY MATCHES NOTHING.**
+  `UPDATE T2 SET V = 5 WHERE K = 'sör'` on `K VARCHAR(10) NOT NULL
+  PRIMARY KEY` holding `'sör'` is a silent no-op with no diagnostic; the
+  engine performs it. **PRE-EXISTING** (identical on `79c4720`, on a
+  plain table with no foreign key), and the worst class. Unrelated to
+  the actions chunk but nothing holds it.
+- **A DUPLICATE UNDER A `COLLATE UNICODE_CI` PRIMARY KEY IS ACCEPTED.**
+  fire-crab writes `'ABC'` next to `'abc'`; the engine refuses with
+  `violation of PRIMARY or UNIQUE KEY constraint`. The same blindness
+  refuses a VALID FK insert (`'ABC'` referencing a parent `'abc'`) with
+  `Foreign key reference target does not exist`. **WRONG WRITE (silent),
+  PRE-EXISTING** - reproduced with no foreign key present at all and
+  identically on `79c4720`. It silently writes a duplicate into a unique
+  index and deserves its own chunk.
+- **`ON UPDATE`/`ON DELETE RESTRICT`, `UPDATE ... ORDER BY` / `... ROWS`,
+  `CREATE TRIGGER` with a bodyless-column-list `INSERT` or the `ACTIVE`
+  keyword, `NUMERIC(9,2) DEFAULT 3.25`, `DEFAULT (3+4)`, and DDL parse
+  rejections generally answer a bare `Dynamic SQL Error` where the
+  engine gives `-SQL error code = -104 / -Token unknown - ...`.**
+  All PRE-EXISTING and confirmed against `79c4720`; each is why an
+  adversarial probe of the action machinery cannot be written entirely
+  in fire-crab's own DDL.
+- **BLOB-ID NUMBERING within a page differs from the engine's** (`80:2`
+  vs `80:1`), reproducible with two plain INSERTs into a table with no
+  FK - PRE-EXISTING, cosmetic.
+- **The FK INDEX of an unnamed inline `REFERENCES` is named after the
+  constraint (`INTEG_<n>`) instead of `RDB$FOREIGN<n>`** - already
+  recorded under the metadata-name-counter round, independently
+  reproduced twice more this round.
 
 ## The metadata name counters (2026-09-02) - the fix round
 

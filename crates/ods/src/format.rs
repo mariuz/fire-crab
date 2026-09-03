@@ -563,6 +563,130 @@ fn scaled_or_int(raw: i64, scale: i8) -> Value {
     }
 }
 
+/// Is this a dtype whose stored bytes are a MANTISSA and whose
+/// descriptor carries the scale?
+fn exact_int(t: u8) -> bool {
+    matches!(t, dtype::SHORT | dtype::LONG | dtype::INT64 | dtype::INT128)
+}
+
+/// Move a mantissa between decimal scales, rounding HALF AWAY FROM ZERO
+/// where digits are lost - the engine's `CVT` rule. Measured against
+/// Firebird 6, 2026-09-03, by ALTERing a populated `NUMERIC(9,2)` column
+/// to `INTEGER` and reading the old rows back: `7.55` -> `8`,
+/// `7.45` -> `7`, `7.50` -> `8`, `8.50` -> `9` (so not banker's),
+/// `-7.50` -> `-8`, `-0.51` -> `-1`. `None` on an i128 overflow, which
+/// the caller must not turn into a wrong number.
+fn rescale_mantissa(raw: i128, from: i8, to: i8) -> Option<i128> {
+    if from == to {
+        return Some(raw);
+    }
+    let shift = from as i32 - to as i32;
+    if shift > 0 {
+        raw.checked_mul(10i128.checked_pow(shift as u32)?)
+    } else {
+        let pow = 10i128.checked_pow((-shift) as u32)?;
+        let q = raw / pow;
+        let r = raw % pow;
+        Some(if 2 * r.unsigned_abs() >= pow as u128 { q + raw.signum() } else { q })
+    }
+}
+
+/// RE-LAY A RECORD IMAGE stored under `old` into `new`'s layout -
+/// `None` when some field cannot be carried, so a caller that must not
+/// write a wrong value can refuse instead.
+///
+/// `ALTER TABLE T ALTER c TYPE ...` mints a format and rewrites NOT ONE
+/// ROW, so a relation holds records of several shapes at once and the
+/// bytes of an old one sit at that format's offsets, with that format's
+/// width and that format's SCALE. A reader that lays them at the newest
+/// format's offsets reads neighbouring bytes; one that keeps the offset
+/// but takes the new scale reads the right mantissa as the wrong number.
+/// The engine does neither: it reads each field through the record's own
+/// format and `MOV_move`s it into the one it is presenting through
+/// (jrd/vio.cpp).
+///
+/// MEASURED, 2026-09-03, on this server's own logical backup of an
+/// engine-built file - `INTEGER` rows 700 and 7, `ALTER ... TYPE
+/// BIGINT`, then two more rows - restored by the REAL `gbak -c` and read
+/// by the ENGINE: the two pre-ALTER rows came back `0` and `0`, where
+/// the engine's backup of the same file restores them as `700` and `7`.
+/// The backup is what survives, so it is the worst place for this.
+///
+/// WHAT IT CARRIES: a field whose descriptor did not change (the bytes,
+/// verbatim, which is what every same-format field is), and an exact
+/// numeric whose width or SCALE changed (converted, [rescale_mantissa]).
+/// WHAT IT REFUSES: a field the old format did not have at all (its
+/// value lives in the newest format's stored DEFAULT section, which this
+/// does not read), and any other descriptor change. `None`, never a
+/// guess.
+pub fn relay_image(image: &[u8], old: &[Descriptor], new: &[Descriptor]) -> Option<Vec<u8>> {
+    let mut len = flag_bytes(new.len());
+    for d in new.iter() {
+        if d.offset != 0 {
+            len = len.max(d.offset as usize + d.length as usize);
+        }
+    }
+    let mut out = vec![0u8; len];
+    for i in 0..new.len() {
+        out[i / 8] |= 1 << (i % 8); // every field NULL until it is laid
+    }
+    for (fid, n) in new.iter().enumerate() {
+        if n.offset == 0 {
+            continue; // a computed field has no stored bytes
+        }
+        // A FIELD THE OLD FORMAT NEVER HAD: its value lives in the
+        // NEWEST format's stored DEFAULT section, which this does not
+        // read, so it refuses rather than laying a zero. Before that,
+        // the caller wrote the bytes at this offset out of an image
+        // that ends before it - measured 2026-09-03, `ALTER TABLE AC
+        // ADD DFT INTEGER DEFAULT 99 NOT NULL` over a populated table:
+        // the backup SUCCEEDED and the real `gbak -c` then refused each
+        // pre-ALTER row with `validation error for column
+        // "PUBLIC"."AC"."DFT", value "*** null ***"` / `warning --
+        // record could not be restored`, so the restored database was
+        // SHORT TWO ROWS and nothing said so. The engine's own backup
+        // of the same file restores all three, with the format's `99`.
+        let o = old.get(fid)?;
+        if o.offset == 0 {
+            continue;
+        }
+        if image.len() <= fid / 8 || image[fid / 8] & (1 << (fid % 8)) != 0 {
+            continue; // NULL stays NULL
+        }
+        let (from, to, w) = (o.offset as usize, n.offset as usize, n.length as usize);
+        if o.dtype == n.dtype && o.length == n.length && o.scale == n.scale {
+            if image.len() < from + w {
+                return None;
+            }
+            out[to..to + w].copy_from_slice(&image[from..from + w]);
+            out[fid / 8] &= !(1 << (fid % 8));
+            continue;
+        }
+        if !exact_int(o.dtype) || !exact_int(n.dtype) {
+            return None;
+        }
+        let v = match decode_field(image, o, fid) {
+            Value::Int(x) => (x as i128, 0i8),
+            Value::Scaled(x, sc) => (x as i128, sc),
+            Value::Int128(x, sc) => (x, sc),
+            _ => return None,
+        };
+        let m = rescale_mantissa(v.0, v.1, n.scale)?;
+        let bytes = match n.dtype {
+            dtype::SHORT => i16::try_from(m).ok()?.to_le_bytes().to_vec(),
+            dtype::LONG => i32::try_from(m).ok()?.to_le_bytes().to_vec(),
+            dtype::INT64 => i64::try_from(m).ok()?.to_le_bytes().to_vec(),
+            _ => m.to_le_bytes().to_vec(),
+        };
+        if bytes.len() != w || out.len() < to + w {
+            return None;
+        }
+        out[to..to + w].copy_from_slice(&bytes);
+        out[fid / 8] &= !(1 << (fid % 8));
+    }
+    Some(out)
+}
+
 /// Decode a whole record image against a format.
 pub fn decode_record(image: &[u8], descs: &[Descriptor]) -> Vec<Value> {
     descs
@@ -918,6 +1042,85 @@ mod tests {
             render_time(36_000_000 + 600_000 + 10_000 + 42),
             "01:01:01.0042"
         );
+    }
+
+    /// A RECORD OLDER THAN ITS RELATION, RE-LAID FOR THE BACKUP.
+    ///
+    /// [relay_image] is what stands between a stale-format row and the
+    /// `.fbk` a client restores from. Measured 2026-09-03 on this
+    /// server's own logical backup: before it existed, `INTEGER` rows 700
+    /// and 7 followed by `ALTER ... TYPE BIGINT` restored as `0` and `0`
+    /// (the bytes read at the WIDER field's offset), and the same rows
+    /// under `ALTER ... TYPE NUMERIC(9,2)` restored as their raw
+    /// mantissas beside converted ones.
+    #[test]
+    fn an_older_format_is_relaid_for_the_backup() {
+        let d = |dtype: u8, scale: i8, length: u16, offset: u32| Descriptor {
+            dtype,
+            scale,
+            length,
+            sub_type: 0,
+            flags: 0,
+            offset,
+        };
+        // two fields, one null byte: ID LONG @4, N LONG @8
+        let old = vec![d(dtype::LONG, 0, 4, 4), d(dtype::LONG, 0, 4, 8)];
+        let mut img = vec![0u8; 12];
+        img[4..8].copy_from_slice(&1i32.to_le_bytes());
+        img[8..12].copy_from_slice(&700i32.to_le_bytes());
+
+        // (a) THE WIDENING that the old code read at the wrong offset:
+        // N becomes BIGINT, which moves to an 8-aligned offset
+        let wide = vec![d(dtype::LONG, 0, 4, 4), d(dtype::INT64, 0, 8, 8)];
+        let out = relay_image(&img, &old, &wide).expect("a widening re-lays");
+        assert_eq!(decode_record(&out, &wide), vec![Value::Int(1), Value::Int(700)]);
+
+        // (b) THE SCALE CHANGE: the mantissa is CONVERTED, not reused
+        let scaled = vec![d(dtype::LONG, 0, 4, 4), d(dtype::LONG, -2, 4, 8)];
+        let out = relay_image(&img, &old, &scaled).expect("a scale change re-lays");
+        assert_eq!(
+            decode_record(&out, &scaled),
+            vec![Value::Int(1), Value::Scaled(70000, -2)]
+        );
+
+        // (c) THE NARROWING, at the engine's measured rule (half away
+        // from zero): 7.55 stored at scale -2 presented at scale 0 is 8
+        let from2 = vec![d(dtype::LONG, 0, 4, 4), d(dtype::LONG, -2, 4, 8)];
+        let mut i2 = vec![0u8; 12];
+        i2[4..8].copy_from_slice(&1i32.to_le_bytes());
+        i2[8..12].copy_from_slice(&755i32.to_le_bytes());
+        let out = relay_image(&i2, &from2, &old).expect("a narrowing re-lays");
+        assert_eq!(decode_record(&out, &old), vec![Value::Int(1), Value::Int(8)]);
+        i2[8..12].copy_from_slice(&(-750i32).to_le_bytes());
+        let out = relay_image(&i2, &from2, &old).unwrap();
+        assert_eq!(decode_record(&out, &old), vec![Value::Int(1), Value::Int(-8)]);
+
+        // (d) A NULL STAYS NULL, and does not take a converted value
+        let mut nul = img.clone();
+        nul[0] |= 0b10; // field 1 null
+        let out = relay_image(&nul, &old, &scaled).unwrap();
+        assert_eq!(decode_record(&out, &scaled), vec![Value::Int(1), Value::Null]);
+
+        // (e) IT REFUSES rather than guessing: a field the old format
+        // never had (its value lives in the newest format's DEFAULT
+        // section, which this does not read) and a cross-family change
+        let added = vec![
+            d(dtype::LONG, 0, 4, 4),
+            d(dtype::LONG, 0, 4, 8),
+            d(dtype::LONG, 0, 4, 12),
+        ];
+        assert!(relay_image(&img, &old, &added).is_none());
+        let to_text = vec![d(dtype::LONG, 0, 4, 4), d(dtype::TEXT, 0, 4, 8)];
+        assert!(relay_image(&img, &old, &to_text).is_none());
+        // ...and a converted value too wide for the target's bytes
+        let mut big = vec![0u8; 12];
+        big[4..8].copy_from_slice(&1i32.to_le_bytes());
+        big[8..12].copy_from_slice(&2000000000i32.to_le_bytes());
+        let narrow = vec![d(dtype::LONG, 0, 4, 4), d(dtype::SHORT, 0, 2, 8)];
+        assert!(relay_image(&big, &old, &narrow).is_none());
+
+        // (f) AN UNCHANGED FORMAT is a byte-for-byte identity
+        assert_eq!(relay_image(&img, &old, &old).unwrap(), img);
     }
 
     #[test]
