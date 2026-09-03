@@ -407,6 +407,14 @@ fn run() -> Result<(), String> {
             check(&args[2], &args[3].to_ascii_uppercase(), &args[4], algo_at(5)?)?
         }
         "vectors" => vectors(algo_at(2)?),
+        "bench" if args.len() == 3 => {
+            let n: usize = args[2].parse().map_err(|_| "bad iteration count")?;
+            bench(n);
+        }
+        "bench-timing" if args.len() == 3 => {
+            let n: usize = args[2].parse().map_err(|_| "bad iteration count")?;
+            bench_timing(n);
+        }
         "login" if args.len() >= 7 => {
             let port: u16 = args[3].parse().map_err(|_| "bad port")?;
             login(
@@ -423,7 +431,8 @@ fn run() -> Result<(), String> {
                 "usage: fcauth verifier <user> <pass> <salt-hex> | verifier-padded <user> <pass> <salt-hex>\n\
                  \x20      | stored <security-db-file> <user>\n\
                  \x20      | check <security-db-file> <user> <pass> [Srp|Srp256]\n\
-                 \x20      | vectors [Srp|Srp256] | login <host> <port> <db> <user> <pass> [Srp|Srp256]"
+                 \x20      | vectors [Srp|Srp256] | login <host> <port> <db> <user> <pass> [Srp|Srp256]\n\
+                 \x20      | bench <iterations> | bench-timing <iterations>"
             );
             std::process::exit(2);
         }
@@ -436,4 +445,158 @@ fn main() {
         eprintln!("REFUSED: {}", e);
         std::process::exit(1);
     }
+}
+
+// ------------------------------------------------------------- bench ------
+// What the handshake costs, measured the way the roadmap entry asks for
+// it: the PROCESS's own CPU out of /proc/self/stat (utime + stime, in
+// clock ticks), not wall clock. This box has two cores and usually
+// something else running on them, so wall clock here measures the
+// neighbours.
+//
+//   fcauth bench <iterations>
+//
+// Prints microseconds of CPU per iteration for:
+//   SERVER  what an ATTACH costs the server half - SrpVerifier::new
+//           (v = g^x mod N), server_public (B = k*v + g^b) and verify
+//           (K = (A*v^u)^b, then the proof hash): four modpows, two with
+//           a 160-bit exponent and two with a 1024-bit one;
+//   CLIENT  the client half - client_start (A = g^a) and proof_with
+//           (g^x, S = (B - k*g^x)^(a + u*x)) plus the proof's
+//           n1 = H(N)^H(g);
+//   TOTAL   both halves: one full handshake with fire-crab at both ends.
+
+/// utime + stime of this process, in clock ticks (100 Hz here)
+fn cpu_ticks() -> u64 {
+    let s = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
+    // field 2 is comm, parenthesised and free to contain spaces, so the
+    // fields are counted from the LAST ')'
+    let after = match s.rfind(')') {
+        Some(i) => s[i + 1..].to_string(),
+        None => return 0,
+    };
+    let f: Vec<&str> = after.split_whitespace().collect();
+    // after ')' the first field is state; utime is then index 11, stime 12
+    let ut: u64 = f.get(11).and_then(|v| v.parse().ok()).unwrap_or(0);
+    let st: u64 = f.get(12).and_then(|v| v.parse().ok()).unwrap_or(0);
+    ut + st
+}
+
+fn bench(iters: usize) {
+    let hz = 100u64; // sysconf(_SC_CLK_TCK) on this platform
+    let us = |ticks: u64, n: usize| (ticks as f64) * 1_000_000.0 / (hz as f64) / (n as f64);
+    let salt = salt_text(&[0x5Au8; 32]);
+    let user = "SYSDBA";
+    let pass = "masterkey";
+
+    // one warm-up handshake, so nothing below pays for first-touch pages
+    {
+        let v = fire_crab_auth::SrpVerifier::new(user, pass, salt.as_bytes());
+        let (bp, bh) = v.server_public(&[9u8; 128]);
+        let c = client_start(&[7u8; 128]);
+        let p = c.proof_with(Algo::Srp256, user, pass, salt.as_bytes(), &bh);
+        assert!(v.verify(&c.a_hex, &bp, &bh, &p.m_hex).is_some());
+    }
+
+    // --- the server half, exactly as fcwire serve runs it -------------
+    // A and M come from a client, so they are prepared OUTSIDE the
+    // measured region; the salt and the private b vary per iteration so
+    // nothing can be hoisted out of the loop.
+    let mut prepared = Vec::with_capacity(iters);
+    for i in 0..iters {
+        let mut b_bytes = [9u8; 128];
+        b_bytes[0] = (i & 0xff) as u8;
+        b_bytes[1] = ((i >> 8) & 0xff) as u8;
+        let v = fire_crab_auth::SrpVerifier::new(user, pass, salt.as_bytes());
+        let (_bp, bh) = v.server_public(&b_bytes);
+        let mut a_bytes = [7u8; 128];
+        a_bytes[0] = (i & 0xff) as u8;
+        let c = client_start(&a_bytes);
+        let p = c.proof_with(Algo::Srp256, user, pass, salt.as_bytes(), &bh);
+        prepared.push((b_bytes, c.a_hex.clone(), p.m_hex.clone()));
+    }
+
+    let t0 = cpu_ticks();
+    let mut acc = 0usize;
+    for (b_bytes, a_hex, m_hex) in &prepared {
+        let v = fire_crab_auth::SrpVerifier::new(user, pass, salt.as_bytes());
+        let (b_priv, b_hex) = v.server_public(b_bytes);
+        match v.verify(a_hex, &b_priv, &b_hex, m_hex) {
+            Some(k) => acc += k[0] as usize,
+            None => acc += 1000,
+        }
+    }
+    let t1 = cpu_ticks();
+
+    // --- the client half ----------------------------------------------
+    let b_hexes: Vec<String> = prepared
+        .iter()
+        .map(|(b_bytes, _, _)| {
+            fire_crab_auth::SrpVerifier::new(user, pass, salt.as_bytes())
+                .server_public(b_bytes)
+                .1
+        })
+        .collect();
+    let t2 = cpu_ticks();
+    for (i, b_hex) in b_hexes.iter().enumerate() {
+        let mut a_bytes = [7u8; 128];
+        a_bytes[0] = (i & 0xff) as u8;
+        let c = client_start(&a_bytes);
+        let p = c.proof_with(Algo::Srp256, user, pass, salt.as_bytes(), b_hex);
+        acc += p.m_hex.len();
+    }
+    let t3 = cpu_ticks();
+
+    println!("ITERS {}", iters);
+    println!("SERVER_US {:.0}", us(t1 - t0, iters));
+    println!("CLIENT_US {:.0}", us(t3 - t2, iters));
+    println!("TOTAL_US {:.0}", us((t1 - t0) + (t3 - t2), iters));
+    println!("CHECKSUM {}", acc);
+}
+
+/// How much the exponentiation's cost depends on the EXPONENT'S BITS.
+/// Both the old implementation and this one square once per exponent bit
+/// and multiply only where a bit is SET, so the cost is a function of the
+/// exponent's Hamming weight: this measures that function at its two
+/// extremes, a 1024-bit exponent of all ones against one with a single
+/// bit set. It is not a claim about constant time; it is the measurement
+/// that shows neither version has it.
+///
+///   fcauth bench-timing <iterations>
+fn bench_timing(iters: usize) {
+    use fire_crab_auth::crypto::BigUint;
+    let hz = 100u64;
+    let us = |ticks: u64, n: usize| (ticks as f64) * 1_000_000.0 / (hz as f64) / (n as f64);
+    let n_hex = concat!(
+        "E67D2E994B2F900C3F41F08F5BB2627ED0D49EE1FE767A52EFCD565CD6E76881",
+        "2C3E1E9CE8F0A8BEA6CB13CD29DDEBF7A96D4A93B55D488DF099A15C89DCB064",
+        "0738EB2CBDD9A8F7BAB561AB1B0DC1C6CDABF303264A08D1BCA932D1F1EE428B",
+        "619D970F342ABA9A65793B8B2F041AE5364350C16F735F56ECBCA87BD57B29E7"
+    );
+    let m = BigUint::from_bytes_be(&hex_to_bytes(n_hex));
+    let g = BigUint::from_bytes_be(&[2]);
+    let dense = BigUint::from_bytes_be(&[0xffu8; 128]); // 1024 bits, all set
+    let mut sparse_bytes = [0u8; 128];
+    sparse_bytes[0] = 0x80; // 2^1023: one bit set
+    let sparse = BigUint::from_bytes_be(&sparse_bytes);
+
+    let _ = BigUint::modpow(&g, &dense, &m); // warm
+    let t0 = cpu_ticks();
+    let mut acc = 0usize;
+    for _ in 0..iters {
+        acc += BigUint::modpow(&g, &dense, &m).to_bytes_be().len();
+    }
+    let t1 = cpu_ticks();
+    for _ in 0..iters {
+        acc += BigUint::modpow(&g, &sparse, &m).to_bytes_be().len();
+    }
+    let t2 = cpu_ticks();
+    println!("ITERS {}", iters);
+    println!("EXP_1024_ONES_US {:.0}", us(t1 - t0, iters));
+    println!("EXP_ONE_BIT_US {:.0}", us(t2 - t1, iters));
+    println!(
+        "RATIO {:.2}",
+        (t1 - t0) as f64 / ((t2 - t1).max(1)) as f64
+    );
+    println!("CHECKSUM {}", acc);
 }
