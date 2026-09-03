@@ -4204,11 +4204,574 @@ pointer-page and TIP page numbers is the next step when it dominates.
   RAM today; after the growth walls this is the next scalability
   ceiling a real database reaches.
 
+## The metadata name counters (2026-09-02) - the fix round
+
+Every name the engine invents - a new relation's id, an auto-domain
+`RDB$<n>`, `RDB$PRIMARY<n>` / `RDB$<n>` for an unnamed index, `INTEG_<n>`
+for an unnamed constraint, an identity column's implicit generator -
+comes from a system GENERATOR (`RDB$RELATIONS`, `RDB$INDEX_NAME`,
+`RDB$CONSTRAINT_NAME`, `RDB$FIELD_NAME`, `RDB$GENERATOR_NAME`), and a
+generator only ever moves forward. fire-crab derived the same names by
+scanning the catalog for the highest one in use and adding one, so after
+the first DROP the two servers named every later object differently -
+and on a file both write, fire-crab handed out the very number the
+engine's counter was about to issue. The counters are now the source
+(`crates/ods/src/ddl.rs` `draw_from_counter`). What the review round
+closed on top of that:
+
+- **A COMMIT WHOSE DISK WRITE FAILS NOW REPORTS AN ERROR.** `crates/wire/src/server.rs` `end_transaction` traced the commit's own `Err` under `FC_SRV_TRACE` and returned `()`, so the wire answered a clean `op_response`: a transaction whose flush failed was reported COMMITTED and everything it did was lost with nothing on disk - measured on a file whose write permission was removed AFTER the attachment opened (`INSERT` + `COMMIT` and `CREATE TABLE` + `COMMIT`, both silent, both absent when the ENGINE read the file). It now returns `Result` and both wire callers answer `isc_io_error("write", <file>)` + the reason as `isc_random` (`respond_write_failed`). This is the invariant the whole chunk is about: a statement either does what it says and reports success, or reports an error.
+- **`INTEG_<n>` NAMES ARE DRAWN IN TWO PASSES** (superseding this chunk's own first answer, which was "one strict declaration order", which in turn superseded "every NOT NULL first, then every key"). The law, measured on the engine 2026-09-03: **every COLUMN-LEVEL (inline) constraint first - the columns in declaration order and, within one column, its clauses in written order - then every TABLE-LEVEL clause, in declaration order.** `(A INTEGER, UNIQUE (A), B INTEGER UNIQUE)` is the decisive shape: `B`'s inline UNIQUE is written LAST and numbered FIRST, which no single-pass text order can produce. `(A INTEGER CHECK (A > 0), B INTEGER NOT NULL, CHECK (B < 100), C INTEGER UNIQUE)` shows it again with CHECKs, and `(A INTEGER UNIQUE NOT NULL, ...)` vs `(A INTEGER NOT NULL UNIQUE, ...)` shows that WITHIN one column it is plain text order. A column-level PRIMARY KEY implies its NOT NULL and the implied row is numbered just BEFORE the key, wherever the explicit `NOT NULL` is written (`A INTEGER PRIMARY KEY NOT NULL` is NOT NULL then PRIMARY KEY). Under either superseded rule `INTEG_4` named a different constraint on the two servers' copies of one file. `TableConstraint::cols_before` - one number that conflated "which pass" with "which column" and carried no within-column position at all - is replaced by `ConstraintPlace::{Inline { col, at }, Table { decl }}` beside `ColumnDef::not_null_at`, and `constraint_steps` sorts pass 1 by `(col, at)` and pass 2 by `decl` (eight shapes plus eight edge shapes measured against the engine through 127.0.0.1/3050, both files read back BY the engine, byte-identical).
+- **THE LAW COVERS FOREIGN KEYS TOO - a FK is numbered WHERE IT IS WRITTEN, not last** (measured 2026-09-03, same method). A FOREIGN KEY is the fourth KIND of constraint, not a fourth thing that comes after everything else: `(A INTEGER, B INTEGER, FOREIGN KEY (A) REFERENCES P, UNIQUE (B))` is FOREIGN KEY then UNIQUE and the same pair swapped in the text is swapped in the answer, `(..., FOREIGN KEY (A) REFERENCES P, CHECK (B > 0))` is FOREIGN KEY then CHECK, and an INLINE `REFERENCES` is a PASS-1 clause - `(A INTEGER, UNIQUE (A), B INTEGER REFERENCES P)` numbers the FK FIRST though it is written LAST, the same inversion as `(A INTEGER, UNIQUE (A), B INTEGER UNIQUE)`. The foreign keys travel in their OWN vector, so vector order alone cannot say which of two table-level clauses of DIFFERENT kinds came first; `ConstraintPlace::Table` therefore carries an explicit `decl` rank (the item's index in the column list) that both vectors are merged on. `ForeignKeyDef` carries a `place` like `TableConstraint` does, `ConstraintStep::Fk(i)` puts the FK in the walk, and `create_table` writes the FK row FROM that walk instead of from a trailing loop. The engine writes an FK's backing INDEX in the same place (`(..., FOREIGN KEY (A) REFERENCES P, UNIQUE (B))` gives the FK index id 1 and the UNIQUE index id 2), and it applies the partner lookup in that order too - a self-referencing `(A INTEGER NOT NULL, B INTEGER, FOREIGN KEY (B) REFERENCES SELF (A), PRIMARY KEY (A))` is REFUSED by the engine and accepted when the PRIMARY KEY is written first, which fire-crab now reproduces.
+- **A COLUMN-LEVEL `REFERENCES` now parses** (`B INTEGER REFERENCES P`, `A INTEGER REFERENCES P`, `B INTEGER REFERENCES P (ID)`, with `CONSTRAINT <name>`, with `ON DELETE`/`ON UPDATE` actions, and with a NOT NULL / key / CHECK clause written after it). It was refused outright with a bare `Dynamic SQL Error` - `parse_fk_clause` demanded a literal `FOREIGN KEY` prefix, so the fourth kind of column-level constraint had no parse path at all. It desugars the way an inline CHECK does: `inline_references_span` finds the clause in the masked item text and it is cut in the SAME rewrite as the inline CHECKs (offsets on the ORIGINAL item text, so a column carrying both, in either order, keeps both), then `parse_inline_references` builds a `ForeignKeyDef` on the column being declared, sharing `parse_references_tail` with the table-level clause so the "no column list means the parent's PRIMARY KEY" rule is not restated.
+- **AN INLINE `CHECK` NO LONGER SWALLOWS THE REST OF ITS COLUMN, AND IS FOUND ON ANY COLUMN.** The inline-CHECK split took `item[at..]` as the whole check clause, so `A INTEGER CHECK (A > 0) NOT NULL` and `... NOT NULL UNIQUE` - which the engine accepts - were refused whole with a bare `Dynamic SQL Error`; and it measured `at` in the item's TRIMMED text while slicing the UNTRIMMED one, so an inline CHECK was only ever recognised on the FIRST column of the list (`(A INTEGER, B INTEGER CHECK (B > 0))` was refused; a NAMED inline CHECK and a second CHECK on one column likewise). The split now runs on the trimmed item, ends each clause at its own closing parenthesis, takes every clause rather than the first, and keeps a `CONSTRAINT <name>` prefix with the clause it belongs to. All six spellings measured identical to the engine.
+- **A DROPPED FK CONSTRAINT NO LONGER MAKES THE PARENT UN-WRITABLE.** `ALTER TABLE ... DROP CONSTRAINT <fk>` leaves a segment-less `RDB$TEMP_DEPEND_<rel>_<n>` index on BOTH servers; `fk_partners_uncached` returned `None` for the WHOLE table on it, so every `INSERT` into the parent refused at prepare, for ever. One unusable index row is now skipped instead.
+- **`DROP INDEX X` THEN `CREATE INDEX X` WORKS.** The reported cause (a back version seen by `index_name_taken`) is NOT the mechanism: the trace says `duplicate key in unique index`. `DROP INDEX` renames the `RDB$INDICES` row, an index entry outlives the version that wrote it, and the unique check asked only whether the record the conflicting entry names is still LIVE - which it is, under its new name. `btw::insert_index_entry_checked` now takes the caller's test of whether that record STILL BUILDS the key (the engine's own duplicate scan, idx.cpp), and `maintain_indexes` rebuilds it with the code that built the key being inserted; a caller that cannot rebuild one answers "still keyed", so a genuine duplicate still refuses.
+
+Gate: `qa/serve-real-ddlsequence.sh` (25 checks) now compares relation
+IDS, every `RDB$RELATION_CONSTRAINTS` row and the column each NOT NULL
+names, the auto-domain `RDB$FIELD_SOURCE` of every user column, the user
+generators, and THE FIVE COUNTERS through `GEN_ID` - and makes a
+commit's write fail on purpose. It failed 1 of 13 checks on the
+pre-change binary before, and fails 8 of 25 now.
+
+### Recorded, still open
+
+- **A FAILED DDL STATEMENT REWINDS THE COUNTERS; THE ENGINE KEEPS THE NUMBERS IT CONSUMED.** `draw_from_counter`'s `gen::write` lands in the statement's work image, which a failed statement discards. Measured: two domains, two all-domain tables, then a `CREATE TABLE PC (ID INTEGER, N NOSUCHDOMAIN)` that fails on every server - the engine's failed statement consumes one relation id and one auto-domain name (the next table is id 131 with `RDB$2`, counters ending 137/32), fire-crab consumes none (id 130, `RDB$1`, 136/31). Not a collision risk (a drawn run steps over anything already in the catalog) but a systematic divergence in exactly the quantity this chunk makes authoritative, so "a fire-crab-built database is name-identical to the engine's" holds only for statements that all succeed.
+- **`ALTER TABLE ... ADD <col> INTEGER NOT NULL` is refused on an EMPTY table the engine accepts** (pre-existing, twinned).
+- **`CREATE INDEX` on a column added by `ALTER TABLE ... ADD` is refused when the table HOLDS ROWS** (pre-existing, identical at HEAD; re-measured 2026-09-03). This was previously recorded as a cascade of the entry above, which it is not - it needs neither `NOT NULL` nor an integer type, only rows: `CREATE TABLE QN (ID INTEGER)` + one row, `ALTER TABLE QN ADD S VARCHAR(5)` (accepted), then `CREATE INDEX QNIX ON QN (S)` -> `42000 Dynamic SQL Error`, where the same three statements on an EMPTY table are all accepted and the engine accepts every one of them either way.
+- **`RDB$TEMP_DEPEND_<rel>_<id>` rows accumulate** where the engine eventually removes them (reusing the dropped index's name removes the engine's at once). After one DROP INDEX the two files agree exactly; over a script with several, fire-crab keeps every stub. `qa/serve-real-ddlsequence.sh` excludes them from its index comparison for this reason.
+- **A VARCHAR projected through a fire-crab-created VIEW DESCRIBES too wide** (pre-existing, twinned on the pre-change binary; values identical). `CREATE VIEW V3 AS SELECT ID, A + 1 AS AP1, B FROM T1` over `B VARCHAR(20)` in a UTF8 database: `RDB$FIELDS` agrees exactly (length 80, character length 20, charset 4) but the ENGINE reading fire-crab's file renders the column 80 characters wide against 20 on its own, so the stored view FORMAT descriptor is missing the bytes-per-character factor. `CHAR_LENGTH` and `OCTET_LENGTH` of the same values are 1 on both files - the data is right and only the description is wide.
+- **The unnamed FOREIGN KEY index is named after its constraint instead of `RDB$FOREIGN<n>`**, so fire-crab draws NO index number for it and the shared `RDB$INDEX_NAME` counter is left one behind the engine's for every generated index name afterwards (a DIFFERENT counter from the `INTEG_<n>` one, which now matches on every measured shape; `qa/serve-real-key.sh`'s FK-shape check therefore compares the constraint names and leaves the index names out); `DROP TABLE` leaks an identity column's implicit generator; an identity PRIMARY KEY gets an extra NOT NULL constraint row the engine does not write.
+
+## AN EXACT KEY, AND A NAME THAT ENDS IN A BLANK (2026-09-03) - the sixth fix round
+
+The round that makes round five's two new checks precise. Both of them
+worked; both also refused things the engine takes, and one of those was
+severe in ordinary schemas. Nothing else was started.
+
+### A. HIGH, over-refusal - the parent-side check after a dropped constraint is now EXACT
+
+`crates/wire/src/server.rs` `fk_partners_uncached` (the parent arm),
+`index_root_key_fids`, `row_carries_key_at`, `fk_check_parent_row`.
+
+Round five stopped fire-crab DELETING a parent row the engine keeps
+after `ALTER TABLE <child> DROP CONSTRAINT <fk>`. Because the drop takes
+the `RDB$INDEX_SEGMENTS` rows with it, that fix could not say WHICH
+child columns had keyed on the parent and asked the widest sound
+question instead - "does some child row hold this key's values in ANY
+column". Sound, and far too wide to ship. The most ordinary child table
+anyone writes lost two of three parent rows, measured on both servers,
+one row in the child:
+
+```
+CREATE TABLE P (ID INTEGER NOT NULL PRIMARY KEY, T VARCHAR(10))
+CREATE TABLE ORD (OID INTEGER, STATUS INTEGER, QTY INTEGER, PID INTEGER,
+                  CONSTRAINT FKO FOREIGN KEY (PID) REFERENCES P)
+INSERT P (1,'a'),(2,'b'),(3,'c');  INSERT ORD (100, 2, 3, 1);  ALTER TABLE ORD DROP CONSTRAINT FKO
+
+                             BEFORE fc                       AFTER fc   engine
+DELETE FROM P WHERE ID = 2   ERR ***unknown*** (STATUS = 2)   OK         OK
+DELETE FROM P WHERE ID = 3   ERR ***unknown*** (QTY = 3)      OK         OK
+DELETE FROM P WHERE ID = 1   ERR ***unknown***                ERR        ERR
+SELECT COUNT(*) AS NP FROM P 3                                1          1
+```
+
+**Where the key columns actually are.** `deferred_drop_index`
+(`crates/ods/src/ddl.rs`) - and the engine's own deferred drop - deletes
+the segment ROWS and moves the index-root slot to `irt_drop` **keeping
+its root page and its per-segment descriptors**. Those descriptors are
+what the surviving B-tree is keyed on, which is exactly why the ENGINE
+goes on refusing a genuinely referenced key from a constraint whose
+catalog rows are gone: it enforces from that tree. So the parent arm now
+reads the child's key field ids straight off the descriptor -
+`RDB$INDICES.RDB$INDEX_ID - 1` is the slot, `btw::index_segments` reads
+it - and the parent-side test is the ordinary exact one,
+`row_carries_key_at` on THOSE columns, resolved through the same
+`fk_partner_lookup` B-tree probe every other partnership uses. A slot is
+never re-used while its root page stands (`allocate_index_slot` takes
+the first slot with NO root page, a deferred drop keeps its own), and an
+id two rows of one relation claim is not trusted.
+
+`row_could_carry_key`, the wide test, survives as the LAST RESORT only -
+reached when the descriptor cannot be read at all, where the choice is
+between it and no check. It was not reached on any measured shape.
+
+Both halves that were already right are kept, and asserted: the CHILD
+arm still skips the segment-less row, so an orphan `INSERT` into the
+dropped-constraint child is still accepted (the engine accepts it too),
+and a genuinely referenced parent key is still refused with the engine's
+own `Violation of FOREIGN KEY constraint "***unknown***"`.
+
+**23 FK cases / 212 statements, each on its own pair of databases, fire-
+crab and the engine statement for statement** (the round-5 reviewer's
+corpus, reconstructed and re-run): **2 DIFFs, both the recorded
+FIRST-FK-WINS engine quirk** (`F9_two_fks_one_dropped`: with one FK
+dropped and one live, fire-crab refuses on the live FK where the engine
+accepts and orphans the child - fire-crab is STRICTER and correct, and
+must not be "fixed"). Every over-refusal the reviewer measured is gone:
+the `STATUS`/`QTY` shape, a `VARCHAR` holding the key's digits, a
+`DOUBLE` holding the same magnitude, a pad-different `CHAR`, an unrelated
+`INTEGER` column holding the key. Every refusal that was right is kept:
+the referenced key after the drop, the key UPDATE, the compound-key
+shape, drop-then-re-add, `ON DELETE CASCADE` then dropped.
+
+### B. MEDIUM, over-refusal - a delimited name's TRAILING BLANKS are not part of it
+
+`crates/wire/src/server.rs`, the `"` arm of `stmt_name_too_long`.
+
+The engine strips trailing blanks BEFORE applying the 63-character
+limit, so a 64-character delimited name whose last character is a blank
+is a legal 63-character name there - and both servers already store such
+a name trimmed (`CREATE TABLE "AB  "` is reachable afterwards as `AB` on
+either), so the check was refusing a name its own writer would have
+written correctly. It never reached the gbak restore path (a backup
+carries the already-trimmed 63), which is why every gate stayed green.
+
+The scan now counts up to the LAST NON-BLANK character. 18 shapes, each
+on a fresh pair of databases, after:
+
+```
+"<63> "                      fc OK   eng OK      "<64> "                    fc ERR  eng ERR
+"<63><37 blanks>"            fc OK   eng OK      "<31> <32>" (internal)     fc ERR  eng ERR
+column "<63> "               fc OK   eng OK      column "<64> "             fc ERR  eng ERR
+"<60>  <1>" (blank run, 63)  fc OK   eng OK      "<61>  <1>" (64)           fc ERR  eng ERR
+"<62>""<blank>" (dq, 63)     fc OK   eng OK      "<63>""<blank>" (dq, 64)   fc ERR  eng ERR
+"<62><TAB>" (63)             fc OK   eng OK      "<63><TAB>" (64)           fc ERR  eng ERR
+```
+
+A trailing TAB is NOT stripped by either server - measured, not assumed.
+
+**And a name of nothing but blanks is not a name.** Trimming the
+trailing blanks cannot be allowed to trim the whole identifier away:
+before this, `CREATE TABLE "<80 blanks>" (A INTEGER)` was written, the
+engine read the relation back as `[               ]` and `gfix -v -full`
+then reported 2 database page warnings on the file. Both servers now
+refuse every blank-only delimited name at every length; only the message
+text differs, and that is recorded below.
+
+### Recorded, still open - what this chunk did NOT start
+
+Everything the round-5 list carries is still open and still true, with
+one entry replaced (the opaque residual). New:
+
+- **LOW (residual of THIS round's own fix A, disclosed) - the last-resort
+  wide scan.** `crates/wire/src/server.rs` `fk_partner_could_carry`. When
+  a deferred-drop index's index-root descriptor cannot be read - no root
+  page, a zero key count, an unreadable page - the parent-side check
+  falls back to "does some child row hold this key in ANY column", which
+  can refuse a parent DELETE the engine takes. It was not reached on any
+  measured shape (23 FK cases / 212 statements, the `dropconstraint`,
+  `fk*` and `key` gates), and it is preferred to the alternative, which
+  is no check and a deleted row. Closing it means deciding what a
+  descriptor this server cannot read should mean, which is a question
+  about `btw`, not about DML.
+
+- **ENGINE OBSERVATION, corrected and sharpened - what actually ENDS the
+  engine's enforcement of a dropped constraint is the next WRITE TO THE
+  CHILD.** Round 5 recorded that the engine "eventually" clears
+  `RDB$FOREIGN_KEY` on the deferred-drop row and stops enforcing, while
+  fire-crab never clears it, so fire-crab's window is permanent. The
+  trigger is now measured exactly - it is not time, and it is not a
+  sweep:
+
+  ```
+  ... DROP CONSTRAINT FKX, then on the ENGINE:
+  RDB$TEMP_DEPEND_129_0 | CX | fk=RDB$PRIMARY1 | ina=4     <- still enforcing
+  INSERT INTO CX VALUES (8, 2)                             <- ONE write to the child
+  RDB$TEMP_DEPEND_129_0 | CX | fk=NULL         | ina=4     <- cleared
+  DELETE FROM P WHERE ID = 1    OK on the engine, and CX still holds B = 1
+  ```
+
+  So after any write to the dropped-constraint child, the engine deletes
+  a referenced parent row and LEAVES THE CHILD ORPHANED, while fire-crab
+  goes on refusing. Measured as 5 statement divergences over 8 further FK
+  cases (`Z3_row_inserted_AFTER_the_drop_still_references`,
+  `Z5_child_key_UPDATED_after_the_drop`); fire-crab is the STRICTER side
+  in every one, exactly as with the first-FK-wins quirk, and this is NOT
+  a divergence to "fix". It is also unchanged by round 6's fix: the exact
+  test is a strict subset of the wide one it replaces, so no shape that
+  round 5 accepted can be newly refused.
+
+- **LOW (message, PRE-EXISTING, unchanged this round) - the engine's
+  `Name longer than database column size` is not reproduced on the fourth
+  call site.** `crates/wire/src/server.rs` `run_dyn_statement` returns
+  `PsqlStop::Unsupported`. Both servers REFUSE, so no wrong write; only
+  the diagnostic is lost:
+
+  ```
+  EXECUTE BLOCK AS BEGIN EXECUTE STATEMENT 'CREATE TABLE <63 x G> (A INTEGER)'; END
+      fc OK    eng OK
+  EXECUTE BLOCK AS BEGIN EXECUTE STATEMENT 'CREATE TABLE <64 x K> (A INTEGER)'; END
+      fc ERR "Dynamic SQL Error"
+      eng ERR "... -104, Name longer than database column size, At line 1, column 14,
+               At block line: 1, col: 24"
+  ```
+
+- **LOW (over-acceptance, PRE-EXISTING) - a bare CR ends a `--` comment
+  on the engine, not in the scanner.** `crates/wire/src/server.rs`, the
+  `--` arm of `stmt_name_too_long` scans `while b[i] != '\n'`, while the
+  same function's own `step!` macro treats a lone `\r` as a line break -
+  which is how it gets the engine's `(line, column)` right. So the two
+  halves disagree about what CR means:
+
+  ```
+  SELECT 1 AS N FROM RDB$DATABASE WHERE 1 = 1 -- c\rAND <64 x K> = 1
+      fc  ROWS [{"N":1}]   (the whole tail eaten as comment)
+      eng ERR -104 Name longer than database column size, At line 2, column 5
+  ```
+
+  No wrong WRITE is reachable through it: `entry_strip_comments` has the
+  same blind spot and turns the DDL shapes into refusals instead
+  (`CREATE TABLE CRT (A INTEGER, -- c\rB INTEGER)` - fc ERR, eng OK, a
+  pre-existing over-refusal). Both halves are rooted in the comment
+  stripper, not in the length check.
+
+- **LOW (message, NEW in round 5) - an exotic divergence at 64
+  supplementary-plane characters.** Same accept/refuse split, same code
+  and column, different text:
+
+  ```
+  CREATE TABLE "<63 x U+1F600>" (A INTEGER)   fc OK   eng OK
+  CREATE TABLE "<64 x U+1F600>" (A INTEGER)   fc ERR "-104 Name longer than database column size,
+                                                      At line 1, column 14"
+                                              eng ERR "-104 Token size exceeds limit,
+                                                      At line 1, column 14"
+  ```
+
+- **LOW (message, NEW in round 6) - a blank-only delimited name is
+  refused with the wrong text.** fire-crab answers `-104 Name longer than
+  database column size`; the engine answers `-104 Zero length identifiers
+  not permitted`. Same code, same accept/refuse split on every shape
+  measured (`"   "`, `"  "` as a column name, 80 blanks); only the text
+  differs. An EMPTY delimited run (`""`) is left to the generic
+  `Dynamic SQL Error` it already had - the engine refuses that one too.
+
+- **LOW (over-refusal, PRE-EXISTING, length-independent) - a delimited
+  CONSTRAINT, INDEX or DOMAIN name containing a blank is refused
+  outright.** Nothing to do with the limit - measured at THREE characters,
+  each on its own pair of databases:
+
+  ```
+  CREATE TABLE "AB  " (A INTEGER)                                fc OK   eng OK
+  INSERT INTO AB VALUES (1)                                      fc OK   eng OK
+  CREATE TABLE SPC3 ("CD " INTEGER)                              fc OK   eng OK
+  CREATE INDEX "IX1 " ON SPC3 (CD)                               fc ERR  eng OK
+  CREATE DOMAIN "DM1 " AS INTEGER                                fc ERR  eng OK
+  CREATE TABLE SPC4 (A INTEGER, CONSTRAINT "CN1 " CHECK (A > 0)) fc ERR  eng OK
+  ```
+
+  Table and column names take a blank on both servers; those three paths
+  do not. It is the quoted-name parser on those paths, not
+  `stmt_name_too_long`, and it is the one DIFF left in the 18-shape
+  trailing-blank sweep.
+
+## A NAME MUST FIT, AND A DROPPED CONSTRAINT HAS TWO SIDES (2026-09-03) - the fifth fix round
+
+The round that closes what the fourth one broke. Two regressions this
+chunk itself caused, two neighbours small enough to fix beside them, and
+everything else recorded rather than started. Every finding below was
+reproduced first, on the unmodified tree, and re-measured after.
+
+- **AN IDENTIFIER MAY BE 63 CHARACTERS AND NO MORE - on every naming path, counted in CHARACTERS.** `crates/wire/src/server.rs:55888` `stmt_name_too_long` (the refusal's vector at `:13992` `respond_name_too_long`, `GDS_DYN_NAME_LONGER` = DYN 159 = 336068767), called beside `has_unknown_space` at the three places a statement's text arrives (`op_prepare` and both `op_exec_immediate` sites) and in `run_dyn_statement` for a PSQL `EXECUTE STATEMENT`. `grep -n "Name longer than\|MAX_IDENT\|> 63"` over `server.rs` and `ddl.rs` used to find **no length check anywhere**: fire-crab wrote the object with its name silently CUT to 63.
+
+  **CLASSIFICATION: WRONG WRITE (silent), HIGH.** Mostly PRE-EXISTING - table names, column names and table-level constraint names all wrote truncated at HEAD `b80c5e6` - but **two spellings were NEW in round 4**, `A INTEGER CONSTRAINT <64+> CHECK (A > 0)` and `A INTEGER CONSTRAINT <64+> REFERENCES P`, which HEAD refused outright and round 4 taught `constraint_prefix_start` to parse without a length check.
+
+  **THE BOUNDARY, MEASURED (2026-09-03, engine at `127.0.0.1/3050`, 30 naming paths x two lengths).** At 63 both servers accept, at 64 the engine answers `-104` / `Name longer than database column size`, on: table, column, domain, index, generator, sequence, view, exception, trigger, procedure, table-level `PRIMARY KEY` / `UNIQUE` / `FOREIGN KEY` / `CHECK` constraint names, the INLINE `CONSTRAINT <n> CHECK` / `REFERENCES` / `UNIQUE` ones, `ALTER TABLE ADD CONSTRAINT`, `ALTER TABLE ADD <column>`, and the QUOTED spelling of each. It is not a DDL rule but a LEXICAL one - `SELECT <64> FROM T`, `SELECT A AS <64> FROM T`, `FROM <64>`, `FROM T "<64>"` and `INSERT INTO T (<64>)` take the same refusal - which is why ONE check at the text boundary closes all thirty paths at once rather than 118 `canon_ident` call sites. **The limit counts CHARACTERS, not bytes**: a quoted name of 63 `Ä` is 126 bytes and accepted by both, 64 of them refused by both, so a byte test would have refused names the engine takes.
+
+  **WHAT IT COST.** Two names differing only past character 63 became ONE catalog row, and the database could not be restored:
+
+  ```
+  CREATE TABLE CT (A INTEGER CONSTRAINT <62K>A1 CHECK (A > 0),
+                   B INTEGER CONSTRAINT <62K>A2 CHECK (B > 0))
+  fire-crab: OK        gfix -v -full: rc=0        gbak backup: rc=0
+  gbak restore: rc=1
+    gbak: ERROR:violation of PRIMARY or UNIQUE KEY constraint "RDB$INDEX_69"
+          on table "SYSTEM"."RDB$RELATION_CONSTRAINTS"
+  ```
+
+  Five tables declared with distinct 64-character names became one row in `RDB$RELATIONS` (`TOTAL 5 / DISTINCT_NAMES 1`), with `gfix -v -full` rc=0 on every one of them.
+
+  **The message is the engine's, byte for byte**, including the position - the same isql output from both servers on five shapes, one of them spanning three lines:
+
+  ```
+  Statement failed, SQLSTATE = 42000
+  Dynamic SQL Error
+  -SQL error code = -104
+  -Name longer than database column size
+  -At line 1, column 14
+  ```
+
+- **A SEGMENT-LESS DEFERRED-DROP INDEX ROW IS NOT THE SAME ANSWER ON THE TWO SIDES.** `crates/wire/src/server.rs:13128` `fk_partners_uncached`, the parent arm; `FkPartner::opaque`; `:13459` `fk_partner_could_carry` / `:13476` `row_could_carry_key`; `:13488` `fk_check_parent_row`.
+
+  **CLASSIFICATION: a REFUSAL that round 4 turned into a WRONG WRITE, HIGH. NEW in this chunk** - and it went in undisclosed, in a hunk (`server.rs:13225`, "ONE UNUSABLE INDEX ROW IS SKIPPED, NOT FATAL TO THE TABLE") that appears in none of round 4's per-defect sections, none of its "files changed" list and nowhere in this file. That is how it survived a whole review round; it is written down now.
+
+  `ALTER TABLE <child> DROP CONSTRAINT <fk>` leaves the child's index row behind as `RDB$TEMP_DEPEND_<rel>_<n>`, `RDB$INDEX_INACTIVE = 4`, `RDB$SEGMENT_COUNT` intact, its `RDB$INDEX_SEGMENTS` rows deleted, and `RDB$FOREIGN_KEY` **still naming the parent's unique index**. Both servers write exactly that row - the two catalogs are identical after the drop - and **the engine goes on enforcing from it**. Round 4 made the row skippable so the CHILD's own DML would stop refusing (right, and measured); the same skip on the PARENT side deleted a row the engine keeps:
+
+  ```
+  CREATE TABLE P (ID INTEGER NOT NULL PRIMARY KEY)
+  CREATE TABLE CX (A INTEGER, B INTEGER, CONSTRAINT FKX FOREIGN KEY (B) REFERENCES P)
+  INSERT P(1),(2),(3); INSERT CX(40,1); DELETE FROM P WHERE ID=2
+  ALTER TABLE CX DROP CONSTRAINT FKX
+  DELETE FROM P WHERE ID = 1
+
+  HEAD b80c5e6  ERR Dynamic SQL Error                   -> parent row survives (wrong reason)
+  round 4       OK                                      -> PARENT ROW DELETED
+  engine        ERR Violation of FOREIGN KEY constraint "***unknown***" on table "PUBLIC"."CX"
+                                                        -> parent row survives
+  ```
+
+  The two directions now have their own answers, which one flag could not carry. The child arm still skips the row (an orphan `INSERT INTO CX` is accepted by both servers). The parent arm keeps it as an **opaque** partnership: it refuses, with the engine's own vector and its own name for a constraint whose row is gone. Since the catalog no longer records WHICH of the child's columns keyed on the parent, the parent-side test widens from "does a child row hold this key in THESE columns" to "does some child row hold every one of the key's values in ANY of its columns" - **sound** (the real key columns are among "any", so a genuine reference is never missed) and, on the whole reproducer, statement-for-statement identical to the engine:
+
+  ```
+                            fire-crab   engine
+  DELETE FROM P WHERE ID=3    OK          OK       <- no child carries 3
+  DELETE FROM P WHERE ID=1    ERR ***unknown***    <- CX(40,1) carries 1
+  UPDATE P SET ID=9 WHERE ID=1 ERR ***unknown***
+  INSERT INTO CX VALUES (41,999) OK        OK      <- the child is free of it
+  INSERT P(7); DELETE FROM P WHERE ID=7  OK  OK
+  SELECT COUNT(*) FROM P       1           1
+  SELECT COUNT(*) FROM CX      2           2
+  ```
+
+  Its residual is recorded below rather than claimed away.
+
+- **`ON UPDATE`/`ON DELETE RESTRICT` IS REFUSED.** `crates/wire/src/server.rs:22207` `parse_ref_actions`. **CLASSIFICATION: OVER-ACCEPTANCE, HIGH.** Pre-existing on the table-level form, newly reachable inline (HEAD refused every inline referential action). `RESTRICT` is the value Firebird **stores** in `RDB$REF_CONSTRAINTS` for an omitted clause; it is not a word its parser accepts - `ON DELETE RESTRICT` is `-104 Token unknown - RESTRICT` on the engine, in all five spellings measured (inline, table-level, named, both events, `ALTER TABLE ADD CONSTRAINT`). Because fire-crab accepted it, every later `INTEG_<n>` on that database shifted by one against the engine's, so it was a NAMING divergence as well as a syntax one - the subject of this whole chunk. After the fix the five `RESTRICT` statements refuse on both servers and `RDB$REF_CONSTRAINTS` reads IDENTICAL on the two files, `INTEG_3`/`INTEG_4`/`INTEG_5` alike. The catalog direction is untouched: `restore_ref_action` still maps a stored `RESTRICT` back to `RefAction::Restrict`.
+
+- **`DROP TABLE` TAKES ITS CONSTRAINTS' TRIGGERS AND PARTNER ROWS WITH IT.** `crates/ods/src/ddl.rs:7919`, inside `drop_table` (`:7832`). **CLASSIFICATION: WRONG WRITE (silent), HIGH. PRE-EXISTING, byte-identical at HEAD.** `drop_table` deleted ten catalog tables' rows and never touched `RDB$REF_CONSTRAINTS`, `RDB$TRIGGERS` or `RDB$DEPENDENCIES`, so dropping a child left the FK's referential row, the action triggers (which sit on the PARENT, not on the table being dropped), the CHECK constraint's own trigger pair, and every one of their dependency rows:
+
+  ```
+  CREATE TABLE PP (ID INTEGER NOT NULL PRIMARY KEY);
+  CREATE TABLE CH4 (X INTEGER, CONSTRAINT FK4 FOREIGN KEY (X) REFERENCES PP ON DELETE CASCADE);
+  CREATE TABLE CH5 (X INTEGER, CONSTRAINT FK5 FOREIGN KEY (X) REFERENCES PP);
+  CREATE TABLE CH6 (X INTEGER NOT NULL, Y INTEGER, CONSTRAINT CKC CHECK (Y > 0),
+                    CONSTRAINT FK6 FOREIGN KEY (X) REFERENCES PP ON UPDATE CASCADE ON DELETE SET NULL);
+  DROP TABLE CH4; DROP TABLE CH5; DROP TABLE CH6;
+
+  engine leaves: nothing
+  fire-crab left: 3 RDB$REF_CONSTRAINTS rows (FK4/FK5/FK6), 5 triggers
+                  (CHECK_1/4/5 on PP, CHECK_2/3 on the dropped CH6), 11 dependency rows
+  gfix -v -full  rc=0        gbak -b  rc=0
+  gbak -c        gbak: ERROR:Name of Referential Constraint not defined in constraints table.
+                 rc=1
+  ```
+
+  Worse than an unrestorable backup: the orphan action trigger RE-ATTACHES BY NAME to a table of the same name created afterwards, and breaks `DELETE` on it. `ALTER TABLE ... DROP CONSTRAINT` learned all of this in round 4; the same walk is now in `DROP TABLE`, with one difference the NOT NULL rows force - a NOT NULL constraint's `RDB$CHECK_CONSTRAINTS` row holds its COLUMN name where a CHECK or FK row holds a TRIGGER name, so only names that really are triggers are followed (otherwise a column called `ID` would take every dependency row of that name with it). After the fix the catalog the engine reads from fire-crab's file is IDENTICAL to the engine's own, `gbak -b` rc=0, `gbak -c` **rc=0**, `gfix -v -full` rc=0.
+
+Gate: `qa/serve-real-key.sh` grows from **79 checks to 163**, all green.
+Added: the 63/64 boundary on 26 naming paths plus the quoted and the
+non-ASCII spellings of each, every 64-character one asserted to carry
+the engine's own `-104 Name longer than database column size` and not
+merely to fail; three COLLISION shapes (constraint, column and table
+names differing only past character 63); a pair of 63-character names
+differing in their LAST character, asserted to be TWO relations in the
+catalog the engine reads back, so the check cannot round down; and a
+`gbak` backup AND **RESTORE** of the long-name database - the restore is
+the assertion, because the collided file backed up rc=0 and only died on
+the way back in. Plus the deferred-drop sequence in its own database:
+the child's orphan INSERT accepted after the drop, an unreferenced
+parent row deleted, a referenced one refused with `***unknown***`, the
+parent key UPDATE refused, a non-key UPDATE still accepted, the
+surviving row COUNTED by the engine on fire-crab's own file, and the
+engine reproducing both answers on that file.
+
+### Recorded, still open - what this chunk did NOT start
+
+- **HIGH (refusal, PRE-EXISTING, identical at HEAD, THIS IS THE NEXT CHUNK) - a referential ACTION makes the parent's matching DML impossible.** `crates/wire/src/server.rs:30131` (`check_predicates(db, table, &columns, descs, DmlGuard::Delete)?` in the DELETE planner) and `:29977` (the UPDATE one). fire-crab WRITES the flag-4 action trigger correctly and cannot PLAN around it, so the statement is refused at PREPARE with a bare `Dynamic SQL Error`. The affected set is completely regular and wider than the round-4 entry said: **every action that synthesises a trigger poisons its own event, for every row.** Measured 2026-09-03, one child table per run, both servers on their own file, `CH (X INTEGER, Y INTEGER REFERENCES PP <action>)` with `PP` holding ID 1 (referenced) and 2 (NOT referenced):
+
+  ```
+  action                  statement                          fire-crab              engine
+  ON DELETE CASCADE       DELETE FROM PP WHERE ID = 2        ERR Dynamic SQL Error  OK
+  ON DELETE SET NULL      DELETE FROM PP WHERE ID = 2        ERR Dynamic SQL Error  OK
+  ON DELETE SET DEFAULT   DELETE FROM PP WHERE ID = 2        ERR Dynamic SQL Error  OK
+  ON UPDATE CASCADE       UPDATE PP SET ID = 5 WHERE ID = 1  ERR Dynamic SQL Error  OK
+  ON UPDATE SET NULL      UPDATE PP SET ID = 5 WHERE ID = 1  ERR Dynamic SQL Error  OK
+  ON UPDATE SET DEFAULT   UPDATE PP SET ID = 5 WHERE ID = 1  ERR Dynamic SQL Error  OK
+  every action            UPDATE PP SET T = 'zzz' WHERE ID=1 OK                     OK
+  ```
+
+  ID=2 has NO children, and its DELETE is refused anyway - the guard is on the trigger's existence, not on the rows. Two things the previous wording got wrong and this one fixes: `ON DELETE SET DEFAULT`, `ON UPDATE SET NULL` and `ON UPDATE SET DEFAULT` were not named, and "entirely UNDELETABLE" overstates it in one direction (a NON-key UPDATE on the parent still works under an `ON DELETE` action) and understates it in another (an `ON UPDATE` action poisons the key UPDATE, not the DELETE). DML on the CHILD is untouched throughout, and no row is ever written wrong: this is a refusal, not a wrong write. Reproducer, cold: create the two tables above, insert the two parent rows and one child row, run the statement in the table's own column. Closing it means fire-crab RUNNING a referential-action trigger - the DML planner admitting the flag-4 triggers it currently refuses to plan around, and a gate that asserts the ACTION and not only the catalog. `qa/serve-real-fkcascade.sh` misses it today because it only checks that fire-crab WRITES the triggers and that the ENGINE runs them, never that fire-crab does.
+
+- **HIGH (refusal, PRE-EXISTING, identical at HEAD) - fire-crab's `gbak` restore fails on an ORDINARY ENGINE BACKUP when a table with a PRIMARY KEY was created after an FK child, and blames an I/O error.** `crates/wire/src/server.rs:6299` (`std::fs::remove_file(&db)` - no half-restored databases, so the target is deleted too). Reproducer, cold - three statements, an engine backup, a restore through fire-crab's service manager:
+
+  ```
+  CREATE DATABASE '<src>' ...;
+  CREATE TABLE PI (ID INTEGER NOT NULL PRIMARY KEY);  COMMIT;
+  CREATE TABLE C1 (X INTEGER REFERENCES PI);          COMMIT;
+  CREATE TABLE PZ (ID INTEGER NOT NULL PRIMARY KEY);  -- a KEYED table AFTER the FK child
+  gbak -b -user SYSDBA -pas masterkey 127.0.0.1/3050:<src> <fbk>        rc=0
+  fbsvcmgr 127.0.0.1/<fc port>:service_mgr ... action_restore bkp_file <fbk> dbname <tgt>
+    I/O error during "<Missing arg #1 - possibly status vector overflow>" operation
+    for file "<Missing arg #2 - possibly status vector overflow>"
+    (and <tgt> does not exist afterwards)
+  gbak -c of the SAME fbk through the ENGINE                            rc=0, 2564096 bytes
+  ```
+
+  Bisected by the reviewer: it needs a keyed table created AFTER at least one FK child (the same statement with `CREATE TABLE PZ (ID INTEGER)` restores fine); any number of FK children with no later keyed table restores fine at n = 8, 12, 14, 16, 20, and 12 PK-only tables restore fine - it is the INTERLEAVING, not a count. The real reason is `duplicate key in unique index`, readable only with `FC_SRV_TRACE=1`; the operator is told about an I/O error on an unnamed file.
+
+- **MEDIUM (over-acceptance, PRE-EXISTING, identical at HEAD) - the duplicate-key-set law is `CREATE TABLE` only.** `crates/ods/src/ddl.rs:3788` - the `SAME_KEY_COLUMNS_MSG` check sits inside `create_table`'s constraints loop and `alter_table_add_*` never sees it. Reproducer, cold:
+
+  ```
+  CREATE TABLE PM (A INTEGER NOT NULL, B INTEGER NOT NULL, CONSTRAINT U1 UNIQUE (A, B))  fc OK  eng OK
+  ALTER TABLE PM ADD CONSTRAINT U2 UNIQUE (A, B)   fc OK  eng ERR ALTER TABLE "PUBLIC"."PM" failed
+  ALTER TABLE PM ADD CONSTRAINT U3 UNIQUE (B, A)   fc OK  eng ERR   (the SET, not the order)
+  CREATE TABLE PZ (A INTEGER NOT NULL PRIMARY KEY) fc OK  eng OK
+  ALTER TABLE PZ ADD CONSTRAINT UZ UNIQUE (A)      fc OK  eng ERR
+  ```
+
+  The consequence is benign for now - the extra `RC|`/`IDX|` rows back up and restore rc=0/rc=0 with `gfix` clean - so it is an incomplete fix rather than a live hazard.
+
+- **MEDIUM (over-refusal HAZARD, design, NEW in round 4, no misfire measured) - the gbak-restore FK path inherits `check_partner_compatible`.** `crates/wire/src/server.rs:5775` -> `crates/ods/src/ddl.rs:6849` `alter_table_add_foreign_key_carried` -> `write_foreign_key_full` -> `:7011` `check_partner_compatible`. There is no restore-specific bypass: the restore runs the check written for `CREATE TABLE`, and `column_key_class` answers `None` (a refusal) for ANY reason a column cannot be resolved - a missing relation, a missing name, a missing format, a `descs.get(fid)` out of range - not only for an incompatible type. A false refusal there lands in the failure mode above: the whole restore aborts, the target is deleted, and the operator is shown the mangled I/O error. 28 legitimate FK varieties in six groups were measured restoring rc=0, so nothing misfires today; the safety margin is accidental, `crates/burp/src/lib.rs:4642` admitting only field types `7|8|16|14|37|261`, so six of `key_class`'s ten non-text classes cannot reach the check from a restore at all. Cheapest containment: a `validate: false` on the carried path (the FK was already accepted by the engine that wrote the backup), or at minimum one restore-side gate case.
+
+- **CLOSED IN ROUND 6 (was: MEDIUM, residual of THIS round's own fix B) - an opaque partnership can over-refuse a parent DELETE.** `crates/wire/src/server.rs` `row_could_carry_key`. As written this round, the parent-side check after a `DROP CONSTRAINT` asked whether ANY column of any child row held the key's values, because the catalog no longer said which columns had keyed on the parent. It never missed a real reference, and it refused far more than the entry admitted: measured by the round-5 reviewer, the ordinary `ORD (OID, STATUS, QTY, PID)` shape with ONE child row made two of three parent rows undeletable (`STATUS = 2` protected `ID = 2`, `QTY = 3` protected `ID = 3`), and the match crossed type boundaries - a `VARCHAR` holding `'2'` and a `DOUBLE` holding `2.0` both counted as references to `ID = 2`. Two corrections to what this entry originally said: the operator's escape was **not** permanence - `gfix -sweep` does not clear the state (`RDB$FOREIGN_KEY` still names the parent's index afterwards) but a full backup/restore cycle does, and the `RDB$TEMP_DEPEND` row is gone from the restored file - though THROUGH FIRE-CRAB that escape does not exist, because its own backup is fail-closed on exactly this state (`crates/burp/src/lib.rs:1735`, `index <name> is inactive - a state this backup cannot say`, reaching the client as `feature is not supported`), so only the real engine can perform it; and "an unrelated child column happens to hold the same value" reads as a corner case when small-integer status and quantity columns make it the norm. **Round 6 closed it** by reading the dropped index's key columns off the index-root SEGMENT DESCRIPTORS, which the deferred drop keeps along with the tree the engine itself enforces from, so the parent-side test is the ordinary exact one again. What is left is the LOW residual recorded in the round-6 section: the wide scan survives only for a descriptor this server cannot read at all.
+
+- **LOW (refusal/naming, PRE-EXISTING, identical at HEAD) - the two-pass constraint-naming law is not applied on the gbak-restore path.** `crates/wire/src/server.rs:5775` calls `create_table(&cols, &[], &[])` and lets it draw fresh `INTEG_<n>` numbers for the columns' NOT NULL rows, then restores the carried keys afterwards, so a restored database's constraint names are neither the source's nor the engine's restore's. One engine-made `.fbk` restored three ways:
+
+  ```
+  ENGINE's own restore        working tree / HEAD
+  RC|PP|INTEG_1|NOT NULL      RC|PP|INTEG_1|NOT NULL
+  RC|PP|INTEG_2|PRIMARY KEY   RC|PP|INTEG_2|NOT NULL
+  RC|PP|INTEG_3|NOT NULL      RC|PP|INTEG_3|PRIMARY KEY
+  CC|INTEG_3|UX               CC|INTEG_2|UX
+  ```
+
+  Since the point of rounds 3, 4 and 5 is that these names must match the engine's, the restore path is the one place the law is still not enforced.
+
+- **LOW (over-acceptance, PRE-EXISTING) - a reserved word is still accepted as a constraint NAME in one spelling.** `crates/wire/src/server.rs:55638` `canon_ident` asks only whether a bare word spells an identifier. Re-measured 2026-09-03 and NARROWER than round 4 recorded: `CREATE TABLE RW1 (A INTEGER, CONSTRAINT CHECK (A > 0))` is now refused by BOTH servers, while `CREATE TABLE RW2 (A INTEGER, CONSTRAINT CONSTRAINT CHECK (A > 0))` is still `fc OK` against the engine's `-104 Token unknown - line 1, column 41, CONSTRAINT`. 3 of 10,668 fuzzed statements in round 4. Closing it wants a reserved-word list the parser does not have.
+
+- **LOW (over-acceptance, PRE-EXISTING, identical at HEAD) - a non-numeric string DEFAULT on a numeric column is accepted when NOT NULL or PRIMARY KEY is present.** Measured 2026-09-03:
+
+  ```
+  CREATE TABLE M6 (A INTEGER DEFAULT 'abc' NOT NULL)     fc OK   eng ERR Conversion error from string "abc"
+  INSERT INTO M6 (A) VALUES (1)                          fc OK   (M6 does not exist on the engine)
+  CREATE TABLE M7 (A INTEGER DEFAULT 'abc' PRIMARY KEY)  fc OK   eng ERR ... Conversion error from string "abc"
+  CREATE TABLE M8 (A INTEGER DEFAULT 'abc')              fc OK   eng OK
+  ```
+
+  The engine only EVALUATES the default when NOT NULL or a key forces it, so the divergence is exactly that combination; with no key clause both accept. Not a charset artifact (pure-ASCII `'abc'` and `'7'` behave the same) and the file itself restores cleanly - an over-acceptance, not a corruption.
+
+- **LOW (over-refusal, PRE-EXISTING, identical at HEAD, WIDER than round 4 recorded) - an inline `CHECK` comparing a NUMERIC column to ANY string literal is refused.** Round 4 recorded this as being about DOMAIN-typed or `CHARACTER SET` columns; the surface is a plain `INTEGER` column against any string literal, `'7'` included. Measured 2026-09-03:
+
+  ```
+  CREATE TABLE I01 (A INTEGER CHECK (A <> 'CONSTRAINT'))  fc ERR Dynamic SQL Error   eng OK
+  CREATE TABLE I02 (A INTEGER CHECK (A <> 'xyz'))         fc ERR                     eng OK
+  CREATE TABLE I03 (A INTEGER CHECK (A <> '7'))           fc ERR                     eng OK
+  CREATE TABLE I04 (A INTEGER CHECK (A <> 7))             fc OK                      eng OK
+  ```
+
+  `mask_literals` is doing its job - on a `VARCHAR` column all 15 keyword-bearing literals agree, `'CONSTRAINT'`, `'CHECK'`, `'REFERENCES'`, `'NOT NULL'` and `'PRIMARY KEY'` among them - so this is the CHECK type-checker alone.
+
+- **ENGINE OBSERVATION, environment hazard, NOT re-verified here on purpose - deeply nested parentheses KILL the Firebird server process.** `CREATE TABLE T (A INTEGER CHECK ((((...20000 deep...A>0...))))` takes the shared engine down outright; the client sees `Connection to Firebird server was lost` and then `Connection is closed`, and every other run on the box loses its engine until someone restarts the service. Reported by a round-4 reviewer, who took `127.0.0.1:3050` down doing it and restarted it (`sudo systemctl restart firebird.service`). fire-crab refuses the same input cleanly and stays up. Deliberately NOT re-run to confirm, because confirming it means taking the shared engine down again; it is recorded so that the next person to fuzz nesting depth against the engine knows what they are looking at and does not read it as a fire-crab defect.
+- **ENGINE OBSERVATION, no fire-crab involvement - Firebird 6 checks only the FIRST foreign key on a parent-row DELETE.** A pure-engine reproducer:
+
+  ```sql
+  CREATE TABLE PP (ID INTEGER NOT NULL PRIMARY KEY);
+  CREATE TABLE K1 (X INTEGER, CONSTRAINT F1 FOREIGN KEY (X) REFERENCES PP);
+  CREATE TABLE K2 (X INTEGER, CONSTRAINT F2 FOREIGN KEY (X) REFERENCES PP);
+  INSERT INTO PP VALUES (1),(2);  INSERT INTO K1 VALUES (1);  INSERT INTO K2 VALUES (2);
+  DELETE FROM PP WHERE ID = 1 -> violation of FOREIGN KEY constraint "F1" on table "PUBLIC"."K1"
+  DELETE FROM PP WHERE ID = 2 -> ACCEPTED, leaving K2 holding an orphan
+  ```
+
+  With only `K2` present the engine refuses correctly, so it is the first-FK-wins shape and not a missing check. fire-crab is STRICTER here. The consequence for this project: any "engine on fire-crab's file" differential of a parent DELETE with more than one child FK compares against an engine that is under-enforcing, and reads as a fire-crab over-refusal. **Do not "fix" fire-crab to match it.**
+
+- **QA hygiene, structural - `qa/serve-real-key.sh` uses fixed, non-port-scoped scratch paths** (`$D/fc-key-work.fdb`, `$D/fc-key-ref.fdb`, and now `$D/fc-key-name.fdb` and `$D/fc-key-defer.fdb`), so a leftover `fcwire` holding the same path can silently rewrite a concurrent run's file. A reviewer saw exactly that signature once - `rc=1 OK=67`, failures degenerating into `Table unknown` for tables the same run had just created - with a stray server from a previous session alive, and could not reproduce it in three later runs. Not a defect; it is why "kill only your own fcwire, by pid" is a standing rule for this repo.
+
+## A foreign key must FIT before it is written (2026-09-03) - the fourth fix round
+
+The round that made an inline `REFERENCES` parse routed it into an FK
+writer that had never checked whether the key it was writing could
+exist, so on those shapes **a refusal became a wrong write** - the one
+direction a conversion must never move. This round closes that, and the
+panic the multi-span clause rewrite shipped with. Every finding below
+was reproduced first, on the unmodified tree, and re-measured after.
+
+- **NO INPUT PANICS THE CONNECTION THREAD ANY MORE.** `crates/wire/src/server.rs`, the merged clause rewrite in the CREATE TABLE item loop. `constraint_prefix_start` walks BACKWARDS from a clause keyword for a `CONSTRAINT <name>` prefix with no regard for a span already claimed, so it could answer a start lying INSIDE an earlier span; the rewrite then sliced `item[prev..start]` with `prev > start` and panicked (`byte range starts at 36 but ends at 23`). The client saw a DROPPED TCP CONNECTION rather than an SQL error and lost its transaction. Four shapes, all NEW relative to HEAD, which refused all four cleanly: `(A INTEGER CHECK (A > 0 CONSTRAINT C) CHECK (A < 9))`, `(A INTEGER CONSTRAINT C1 CHECK (A > 0 CONSTRAINT C2) CHECK (A < 9))`, `(A INTEGER CHECK (A > 0 CONSTRAINT C) REFERENCES P)`, `(A INTEGER REFERENCES CONSTRAINT N CHECK (A > 0))` - and the first two carry no `REFERENCES` at all, so the hazard came in with the multi-span inline-CHECK rewrite and the REFERENCES span doubled it. Two guards, both needed: a prefix that reaches BEHIND the previous clause's end is a `CONSTRAINT` keyword standing inside that clause (which the engine answers `-104 Token unknown - CONSTRAINT`) and REFUSES the statement, and the rewrite loop itself refuses rather than slices whenever a span still starts before the previous one ended. `constraint_prefix_start` also checks its slice is on a character boundary. A `debug_assert` would not have done: the release binary is what serves. Fuzzed afterwards with 10,668 malformed column items (CONSTRAINT prefixes, nested parens, overlapping CHECK/REFERENCES clauses, unbalanced parens, reserved words as names, two and three clauses per column): 0 panics, 0 lost connections, every statement answered.
+- **A FOREIGN KEY WHOSE COLUMN COUNT DOES NOT FIT IS REFUSED, BEFORE ANYTHING IS WRITTEN.** `crates/ods/src/ddl.rs` `check_partner_compatible`, called from `write_foreign_key_full` ahead of `create_index`. `find_partner_key` took the parent's PRIMARY KEY without comparing segment counts, on the empty-list and the explicit-list path alike, so `PC (X INTEGER NOT NULL, Y INTEGER NOT NULL, PRIMARY KEY (X, Y))` accepted `CREATE TABLE T2 (A INTEGER, B INTEGER REFERENCES PC)`: a ONE-segment FK index bound to a TWO-column key, which fire-crab did not enforce, which the ENGINE reading the same file DID enforce (so the two servers disagreed about the file's rows), and whose `gbak -c` failed with `cannot commit index ... Database is not online due to failure to activate one or more indices`. The reverse arity was worse - rc=2 with no rows at all. Table-level pre-existing, inline newly reachable. The refusal now carries the engine's own vector: `unsuccessful metadata update / <VERB> @1 failed / SQL error code = -607 / Invalid command / FOREIGN KEY column count does not match PRIMARY KEY`.
+- **A TYPE-INCOMPATIBLE FOREIGN KEY IS REFUSED.** Same site. The partner was matched by name and column list and never by type, so `CREATE TABLE CH (A BIGINT REFERENCES P)` over an INTEGER key was written, `INSERT INTO CH VALUES (1)` was accepted for a value that IS in P, the ENGINE reading fire-crab's own file called that row an orphan, `gfix -v -full` returned rc=0 so nothing warned anyone, and `gbak -c` refused the restore. The refusal now carries `isc_partner_idx_incompat_type` with the 1-based number of the first segment that does not fit, as the engine does (`Partner index segment no 1 has incompatible data type`).
+
+  **THE COMPATIBILITY RULE, MEASURED (2026-09-03, engine at 127.0.0.1/3050, 24 x 24 type pairs plus precision, charset, collation and domain probes).** Two columns may be the two ends of one foreign key exactly when they fall in the same INDEX-KEY CLASS - which is the same partition the key ENCODING draws, and the reason it is a partition at all: two columns can share one index only if their keys are built the same way. The classes:
+
+  | class | types |
+  |---|---|
+  | small exact / float | SMALLINT, INTEGER, FLOAT, DOUBLE PRECISION, NUMERIC/DECIMAL of precision <= 9 (any scale) |
+  | int64 | BIGINT, NUMERIC/DECIMAL of precision 10..18 |
+  | int128 | INT128, NUMERIC/DECIMAL of precision 19..38 |
+  | DATE / TIME / TIMESTAMP | three separate classes |
+  | TIME WITH TIME ZONE / TIMESTAMP WITH TIME ZONE | two more, each apart from its unzoned twin |
+  | BOOLEAN | its own |
+  | DECFLOAT | DECFLOAT(16) and DECFLOAT(34) TOGETHER - the one pair of different dtypes that share a class |
+  | text | CHAR and VARCHAR alike, keyed on the TTYPE (character set AND collation) |
+  | none | BLOB, ARRAY - no key at all, refused by both servers |
+
+  What follows from it, each measured rather than reasoned: `SMALLINT REFERENCES <INTEGER key>` is accepted by BOTH servers, `INTEGER` onto `BIGINT` is refused, and so is `NUMERIC(9,0)` onto `NUMERIC(10,0)` - the boundary is the PRECISION, because the precision picks the storage type, while the SCALE never matters. A string's declared LENGTH never matters (`VARCHAR(80)` keys against `CHAR(5)`) and neither does CHAR vs VARCHAR, but the CHARACTER SET does (NONE, OCTETS and WIN1252 are three classes) and so does the COLLATION (`UTF8` and `UTF8 COLLATE UNICODE` are two). A DOMAIN behaves exactly as its base type, on either side. On a compound key the message names the FIRST segment that does not fit (`no 2` for a second-column mismatch).
+- **`NO ACTION` IS STORED AS `NO ACTION`.** `RefAction::NoAction` is now its own variant with its own `rule()`; `RefAction::synthesises_trigger()` replaces the `!= Restrict` tests, so it still generates no trigger. A comment in `crates/ods/src/ddl.rs` stated the collapse to `RESTRICT` as a LAW; the engine contradicts it (`INTEG_6 -> INTEG_2 U=NO ACTION D=NO ACTION` on the engine's file against `U=RESTRICT D=RESTRICT` on fire-crab's) and the comment is deleted. A wrong law written down is worse than none. This was a silent wrong write that survived gbak, and the ONLY divergence among the eighty FK shapes both servers fully accept. `restore_ref_action` maps the rule back to itself so a backup taken from a NO ACTION key restores to one.
+- **AN FK ACTION TRIGGER IS LINKED TO ITS CONSTRAINT, AND A DROP TAKES IT WITH IT.** `store_fk_trigger` wrote the `CHECK_<n>` row into `RDB$TRIGGERS` and stopped; the engine also writes the `RDB$CHECK_CONSTRAINTS` row tying that trigger to the FK's constraint name (one row per trigger, both carrying the FK's name). Without it, `ALTER TABLE CH DROP CONSTRAINT INTEG_3` removed the constraint from both catalogs and left the unreferenced `AFTER DELETE` trigger alive and still cascading, so `DELETE FROM P` silently deleted a child row the engine's own database keeps (`CHILD_ROWS_LEFT 0` against `1`, `ORPHAN_TRG CHECK_1`, `gfix -v -full` rc=0). The link row is written now, and `alter_table_drop_constraint`'s FOREIGN KEY arm follows it: the triggers, their dependency rows and the link rows go, and the PARENT's `RDB$RUNTIME` is rebuilt (the trigger sits on the parent, not on the table the ALTER names).
+- **TWO KEYS OVER ONE SET OF COLUMNS ARE REFUSED** - DYN 126, `Same set of columns cannot be used in more than one PRIMARY KEY and/or UNIQUE constraint definition`. It is the SET and not the order (`UNIQUE (A,B)` beside `UNIQUE (B,A)` is refused; `UNIQUE (A)` beside `UNIQUE (A,B)` is fine), and a column-level key counts. fire-crab wrote both constraints and both indexes.
+- **A `DEFAULT` MUST PRECEDE EVERY CONSTRAINT CLAUSE ON ITS COLUMN.** The engine's grammar is `<name> <type> [DEFAULT <v>] [<constraint> ...]`, and `A INTEGER UNIQUE DEFAULT 7` is a `-104 Token unknown - DEFAULT` for NOT NULL, UNIQUE, PRIMARY KEY, CHECK and REFERENCES alike. The clause splits cut the constraints OUT of the item, so by the time the column parser runs the order is gone - it is checked while both are still in one string, and a `SET DEFAULT` referential action or a DEFAULT inside a CHECK condition (both inside a claimed span) is not mistaken for one. The laxity was pre-existing on `UNIQUE`/`NOT NULL`; the CHECK and REFERENCES spellings were newly reachable.
+- **AN EVENT MAY BE NAMED ONCE.** `parse_ref_actions` looped and let the LAST clause win, so `REFERENCES P ON DELETE CASCADE ON DELETE SET NULL` recorded `D=SET NULL` for a table the engine refuses with `-104 Token unknown - DELETE`.
+- **A COLUMN MAY CARRY TWO INLINE `REFERENCES`.** `A INTEGER REFERENCES P REFERENCES Q` is accepted by the engine and writes two foreign keys. The CHECK split always collected a Vec; the REFERENCES one returned a single Option and left the second clause in the residual, where the column parser choked.
+- **AN INLINE `CHECK` SEES ONLY THE COLUMNS DECLARED SO FAR.** `(A INTEGER CHECK (B > 0), B INTEGER)` is `-206 Column unknown "B"` on the engine, while the same condition written as a TABLE-level CHECK is accepted - it is resolved once the whole column list is read. fire-crab accepted both.
+
+Gate: `qa/serve-real-key.sh` grows from 45 checks to **79**, all green. Added:
+the four panic shapes, each asserted to return a clean SQL error AND to
+leave the connection alive (a second statement on the SAME connection
+must still answer - a gate that looked only at the first answer would
+have called the panic a refusal and passed); six arity/type refusals,
+each with the ENGINE's own refusal for the same statement beside it;
+`NO ACTION` and both-action round trips through `RDB$REF_CONSTRAINTS`;
+two inline `REFERENCES` on one column; a SMALLINT child onto an INTEGER
+key (the pair BOTH servers accept); an unfiltered `CCALL|` /`SYSTRG|`
+comparison of every `RDB$CHECK_CONSTRAINTS` row and every system trigger
+(the old `CC|` check filtered `WHERE R.RDB$RELATION_NAME IN ($TBLS)`, and
+an FK's action trigger sits on the PARENT relation, so it was filtered
+out - which is why nothing caught the missing link row); and a
+drop-then-cascade behaviour check that asserts the child row the engine
+keeps is still there and no unreferenced system trigger survived.
+
+### Recorded, still open - the FOREIGN KEY neighbourhood
+
+- **HIGH (refusal, PRE-EXISTING, identical at HEAD, its own chunk) - `ON DELETE CASCADE` / `SET NULL` / `ON UPDATE CASCADE` declared in `CREATE TABLE` make the parent table entirely UNDELETABLE.** The action trigger fire-crab writes is refused at PREPARE (`crates/wire/src/server.rs` `check_predicates(..., DmlGuard::Delete)` in the DELETE planner, and the UPDATE one beside it), so EVERY `DELETE` on the parent fails with a bare `Dynamic SQL Error` - including deleting a row with no children at all. Both spellings, inline and table-level. Measured, one child table per run, both servers on their own file:
+
+  ```
+  ### CHILD: CREATE TABLE CH (A INTEGER, B INTEGER REFERENCES PP ON DELETE CASCADE)
+  --- fire-crab ---
+  INSERT INTO PP VALUES (1, 'one')              -> OK
+  INSERT INTO PP VALUES (2, 'two')              -> OK
+  INSERT INTO CH VALUES (10, 1)                 -> OK
+  DELETE FROM PP WHERE ID = 2                   -> ERR [335544569] Dynamic SQL Error   <-- ID=2 has NO children
+  DELETE FROM PP WHERE ID = 1                   -> ERR [335544569] Dynamic SQL Error
+  SELECT A, B FROM CH                           -> ROWS [{"A":10,"B":1}]
+  --- engine ---
+  DELETE FROM PP WHERE ID = 2                   -> OK
+  DELETE FROM PP WHERE ID = 1                   -> OK          (child row cascaded away)
+
+  ### inline ON DELETE SET NULL
+  fc : DELETE FROM PP WHERE ID = 1  -> ERR [335544569] Dynamic SQL Error   / CH still {"A":10,"B":1}
+  eng: DELETE FROM PP WHERE ID = 1  -> OK                                  / CH now  10 | <null>
+  ### inline ON UPDATE CASCADE
+  fc : UPDATE PP SET ID = 5 WHERE ID = 1 -> ERR [335544569] Dynamic SQL Error / CH still B=1, PP still ID=1
+  eng: UPDATE PP SET ID = 5 WHERE ID = 1 -> OK                               / CH now B=5, PP now ID=5
+  ```
+
+  A HEAD build answers byte-identically on the table-level spelling, so it is not a regression - but it is reachable through one MORE syntax now, and it is a refusal, not a wrong write. `qa/serve-real-fkcascade.sh` misses it because it only checks that fire-crab WRITES the triggers and that the ENGINE runs them, never that fire-crab does. Fixing it means fire-crab RUNNING a referential-action trigger, which is a chunk of its own: the DML planner has to admit the flag-4 triggers it currently refuses to plan around, and the gate has to assert the ACTION and not only the catalog.
+- **MEDIUM (refusal, pre-existing) - an inline `REFERENCES` still does not parse in `ALTER TABLE ... ADD <column>`**, nor do an inline `UNIQUE`, `NOT NULL` or `CHECK` there; the engine accepts all four. A gap in the new feature's reach, not a regression - and `ALTER TABLE ADD` does NOT panic on the overlapping-span shapes, so that hazard was confined to `CREATE TABLE`.
+- **MEDIUM (refusal, pre-existing) - `CONSTRAINT <name> NOT NULL` written inline is refused** (`CREATE TABLE T (A INTEGER CONSTRAINT NN1 NOT NULL, B INTEGER)`); no `REFERENCES` involved. `parse_column_def` has no arm for a named NOT NULL, and the whole statement refuses.
+- **MEDIUM (refusal, pre-existing) - an inline `CHECK` is refused on a DOMAIN-typed or `CHARACTER SET` column** (`(A DOM1 CHECK (A > 0))`, `(A VARCHAR(10) CHARACTER SET UTF8 CHECK (A <> 'z'))`). `check_cond_typechecks`' field-rank closure answers `None` for any column with a domain, and its text path wants the plain NONE-charset shape. The COLLATE placement is not the cause - the same column without a CHECK is fine on both servers.
+- **MEDIUM (refusal, pre-existing, NOT constraint-related) - the CREATE TABLE body splitter is blind to literals and quoted identifiers.** The column-list `close` scan and the top-level-comma item split both walk the RAW statement counting `(`/`)`/`[`/`]`/`,` with no `mask_literals`, though the inner split code that consumes their output is meticulous about masking. `(A VARCHAR(20) CHECK (A <> 'x)y'))`, `(A VARCHAR(20) DEFAULT 'x,y', B INTEGER)`, `("A,B" INTEGER, C INTEGER)` all refuse where the engine accepts. A comma or paren INSIDE a clause's parens is safe (depth >= 1); it is depth-0 literals and quoted names that tear.
+- **LOW (refusal, pre-existing) - `CHECK (A IN (1, 2))` is refused** in both the inline and the table-level form; the CHECK condition surface has no `IN`. Nothing to do with the splitter - the comma sits at depth 1 and the item survives intact.
+- **LOW (over-acceptance, pre-existing) - a reserved word is accepted as a constraint NAME.** `CONSTRAINT CHECK (A > 0)`, `CONSTRAINT REFERENCES P` and `REFERENCES P CONSTRAINT CONSTRAINT CHECK (A > 0)` are written where the engine answers `-104 Token unknown`. `canon_ident` asks only whether a bare word spells an identifier; closing it wants a reserved-word list the parser does not have.
+- **LOW (error text, pre-existing) - a duplicate CONSTRAINT/INDEX name inside `CREATE TABLE` is reported as a duplicate TABLE.** `CREATE TABLE D2 (A INTEGER, CONSTRAINT K UNIQUE (A))` beside an existing `K` answers `CREATE TABLE "PUBLIC"."D2" failed / Table "PUBLIC"."D2" already exists` where the engine says `Index "PUBLIC"."K" already exists` (SQLSTATE 42S11). `respond_ddl_meta` keys on the words "already exists" in the writer's message and renders the plan's own object name. Both refuse; only the reason is wrong.
+- **RECORDED, unchanged - the `INTEG_<n>` counter drift after a FAILED statement now has a wider trigger set.** The engine keeps the numbers a failed DDL statement consumed and fire-crab rewinds them (already recorded above), and every refusal this round ADDS is another statement on which the two counters part company. It is not a collision risk, and a gbak round trip heals the pure counter cases, but "a fire-crab-built database is name-identical to the engine's" continues to hold only for statements that all succeed.
+
 ## Found while converting quoted identifiers (2026-09-02) - still open
 
+- **HIGH (data destruction, pre-existing, no gate)** - `gbak -r -rep` restoring THROUGH fire-crab's wire protocol destroys the target database and SIGSEGVs the gbak client. Trace: op_attach ok, `op_drop_database ... removed`, op_create_database, `shutdown mode 0 -> 2`, op_attach ok, then `op = 40` (OP_INFO_DATABASE, `crates/wire/src/server.rs:~85364`) and the exchange ends. gbak dies with `Segmentation fault (core dumped)`, rc=139, its verbose output stopping at `backup version is 12`. The pre-existing target - 2564096 bytes with its table - is left at 2408448 bytes and the ENGINE then answers `-204 Table unknown` for it: the old database is gone and the new one was never written.
+- **MEDIUM (attach lies, pre-existing)** - `op_attach` to a NON-EXISTENT database file answers SUCCESS (`crates/wire/src/server.rs:~81463`, a `None` from `load_database` falls through to the fixed-answer path); the first statement then fails with `HY000 invalid transaction handle`, and no file is created. The engine answers at attach time with `08001 / I/O error during "open" operation / No such file or directory`. Consequence: `gbak -c` and `gbak -r` into a FRESH path through fire-crab are impossible - gbak probes for existence with an attach, fire-crab's attach succeeds, and gbak reports `database ... already exists. To replace it, use the -REP switch` for a file that is not there. This and the item above are one chunk.
+- **MEDIUM (refusal, pre-existing)** - `CREATE INDEX` is refused on a table whose rows were written BEFORE an `ALTER TABLE ... ALTER COLUMN ... TYPE`.
+- **LOW (pre-existing)** - the service-manager backup's I/O error is sent without its two string arguments, so the client prints `I/O error during "<Missing arg #1 ...>" operation for file "<Missing arg #2 ...>"` where the engine names the operation and the path (the failure IS reported and no partial file is left). `COALESCE` over a system CHAR metadata column refuses with `22000 Malformed string`. A VARCHAR through a fire-crab-created VIEW describes 80 characters wide where the engine says 20 (values identical).
 - **LOW (pre-existing, verified identical on HEAD)** - fire-crab resolves a relation NAME POSITIONALLY: the first `RDB$RELATIONS` row carrying that name decides, for `resolve_relation`, `relation_schema` and now `view_of` alike. The engine resolves an unqualified name through the schema search path and a qualified one in the schema written. On a database where `CREATE VIEW S2.T` runs BEFORE `CREATE TABLE T`, both `SELECT ... FROM T` and `SELECT ... FROM PUBLIC.T` refuse on fire-crab (measured 4-way: engine answers, HEAD and the current tree both refuse identically). Making the three resolvers agree with each other was this chunk's fix; making them agree with the ENGINE needs a schema search path and is its own chunk.
 - ~~**HIGH (silent wrong answers AND wrong writes, pre-existing)**~~ **FIXED 2026-09-02** (`qa/serve-real-joinderived.sh`, 25 checks; see "Found while converting a joined derived table" below) - a DERIVED TABLE or VIEW on the right of a JOIN reads the base relation's fields by OUTPUT POSITION instead of by the derived column's own field: `SELECT t.ID, d.S FROM TQ t JOIN (SELECT ID, G AS S FROM J1) d ON d.ID = t.ID` answers J1.A (base field 1) where the engine answers J1.G, `COUNT(*)` with `d.S = 'g1'` answers 0 for the engine's 2, and `INSERT INTO TQ (ID, A) SELECT t.ID+10, d.S FROM ... JOIN (SELECT ID, ID AS S FROM J1) d ...` PERSISTS the wrong column's values. Same through a view (`CREATE VIEW VS (ID, S) AS SELECT ID, G FROM J1`). `crates/wire/src/server.rs` build_flatten (~35107), set on a derived side by plan_join_bound (~35558) and consumed at ~35195 and frozen_probe_rows (~47869). Reproduced on the pre-change binary.
-- **MEDIUM (silent metadata loss, pre-existing)** - after a `CREATE INDEX` through fire-crab, every later `CREATE TABLE` / `CREATE VIEW` on that database reports SUCCESS and writes nothing: `CREATE TABLE ZT2 ...` returns rc=0 with no error and `SELECT COUNT(*) FROM ZT2` is then -204. The state is on disk, not in one server's memory (a second fcwire process on the same file behaves the same, while the ENGINE creates tables on it normally and gfix validates it). `crates/ods/src/ddl.rs` create_index (~6698) / create_table (~3607) / create_view (~4273). Reproduced on the pre-change binary.
+- **RETRACTED (2026-09-02) - the reported "silent metadata loss" does NOT reproduce.** The claim was that after a `CREATE INDEX` through fire-crab every later `CREATE TABLE` / `CREATE VIEW` reported success and wrote nothing. Re-run on the same binary, by hand and through `qa/serve-real-ddlsequence.sh`: the relation is written and the ENGINE reads it. The likely cause of the report is an environment artefact - the STICKY BIT on `/tmp/fbhandson` (`chmod 1777`) blocks fire-crab's rename-over of an engine-owned scratch file (`ending the transaction: Permission denied`) and produces a pile of DIFFs indistinguishable from a silent-write defect; `chmod 0777` makes them vanish on the same binary. The gate written for the phantom found a real defect instead (the generated-name counters), which is now fixed.
 - **LOW** - `ALTER TABLE ... DROP <column>` leaves ORPHAN CHECK constraints pointing at the dropped column (the engine drops the dependents); and the quoted form of that DROP now SUCCEEDS where the engine raises, so a refusal became a divergent metadata write. `DROP TABLE <view>` succeeds where the engine refuses. System metadata columns describe as UNICODE_FSS where the engine says UTF8. `qa/serve-real-gbakverbose.sh` is non-deterministic: about one run in three the ENGINE's own verbose stream tears a line (`gbak:g privile table ...`), and the gate truncates its diff to 400 characters so the cause is invisible in the log.
 - **LOW (refusals, quoted names)** - a quoted spelling of an UNQUOTED alias (`UPDATE TQ t SET "T"."a" = 5`) refuses where the engine accepts (the SELECT path handles it); a column name containing a doubled quote refuses in a JOIN's select list only; a quoted all-caps-keyword column refuses in a PSQL body's nested UPDATE/DELETE at CREATE time (the MERGE half is fixed); an engine-created procedure whose body assigns to a quoted keyword-named column refuses at EXECUTE.
 Part 2 (relations, aliases, DDL storage, internal re-renders) closed the wrong writes the reviews found: `resolve_relation` is exact (`"Tq"` is -204), a FROM alias is a name (`FROM TQ "t"` binds `t`), every internal re-render goes through `render_canon_ref` (UPDATE OR INSERT, INSERT ... SELECT, MERGE, view DML, PSQL bodies, the optimizer probes), DDL stores canonical names (`CREATE TABLE "tq"` beside TQ, `CREATE VIEW vemp (eid, ename)` stores EID/ENAME, `CREATE INDEX ix ON t (dept)` folds again), the ods writers compare exactly (fc's gbak RESTORE keeps `"Order"` and TQ beside `"tq"`), the BLR executor and TrigCtx resolve fields exactly (an engine-created trigger naming `NEW."a"`, a procedure `RETURNS ("a" INTEGER, A INTEGER)`), and a grouped join key's describe name is split only on a side key ("x.y" is announced whole). Still open after Part 2:

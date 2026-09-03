@@ -1380,6 +1380,35 @@ fn respond_error(s: &mut TcpStream, enc: &mut Option<Rc4>, gds: i32) -> std::io:
     w.send(s, enc)
 }
 
+/// The vector a COMMIT (or a ROLLBACK) whose disk write FAILED answers:
+/// `isc_io_error("write", <file>)` with the underlying reason as
+/// `isc_random` text, the engine's own shape for a file operation that
+/// did not happen. fire-crab has no more specific vector for "the
+/// image could not be put on the disk", and a generic error is the
+/// whole difference between a client that knows its transaction was
+/// lost and one that believes it committed ([end_transaction]).
+fn respond_write_failed(
+    s: &mut TcpStream,
+    enc: &mut Option<Rc4>,
+    path: &str,
+    msg: &str,
+) -> std::io::Result<()> {
+    let mut w = W::default();
+    w.int(OP_RESPONSE).int(0).int(0).int(0).int(0);
+    w.int(1) // isc_arg_gds
+        .int(GDS_IO_ERROR)
+        .int(2) // isc_arg_string - the operation
+        .bytes(b"write")
+        .int(2) // isc_arg_string - the file
+        .bytes(path.as_bytes())
+        .int(1) // isc_arg_gds - isc_random, prints its string arg
+        .int(GDS_RANDOM)
+        .int(2)
+        .bytes(msg.as_bytes())
+        .int(0); // isc_arg_end
+    w.send(s, enc)
+}
+
 /// The vector a KICKED attachment's next statement answers - measured on
 /// a held isql whose next SELECT after a `gfix -shut -force 0` printed
 /// `SQLSTATE = 08003 / connection shutdown / -Database is shutdown.`:
@@ -2099,6 +2128,94 @@ fn respond_ddl_meta(
                 .int(0);
             w.send(s, enc)?;
             return Ok(true);
+        }
+    }
+    // TWO KEYS OVER ONE SET OF COLUMNS - DYN 126, refused by the writer
+    // before anything was written. The engine's vector is the wrapper,
+    // the verb, and the DYN message with no argument.
+    if lc.contains("same set of columns cannot be used") {
+        let named = match plan {
+            Plan::CreateTable { name, .. } => {
+                Some((336397286, format!("\"PUBLIC\".\"{}\"", name.trim_end())))
+            }
+            _ => ddl_relation_target(plan).map(|t| (ALTER_TABLE_FAILED, q(t))),
+        };
+        if let Some((failed, qn)) = named {
+            let mut w = W::default();
+            w.int(OP_RESPONSE).int(0).int(0).int(0).int(0);
+            w.int(1)
+                .int(GDS_NO_META_UPDATE)
+                .int(1)
+                .int(failed)
+                .int(2)
+                .bytes(qn.as_bytes())
+                .int(1)
+                .int(336068734) // DYN 126
+                .int(0);
+            w.send(s, enc)?;
+            return Ok(true);
+        }
+    }
+    // A FOREIGN KEY THE ENGINE WOULD REFUSE, refused by the writer
+    // before anything was written ([check_partner_compatible]). Two
+    // distinct refusals, and a client must be able to tell them apart -
+    // the engine gives them different vectors, so this does too:
+    //
+    //   arity  unsuccessful metadata update / <VERB> @1 failed /
+    //          SQL error code = -607 / Invalid command /
+    //          FOREIGN KEY column count does not match PRIMARY KEY
+    //   type   unsuccessful metadata update / <VERB> @1 failed /
+    //          Partner index segment no @1 has incompatible data type
+    //
+    // both measured over the wire against 127.0.0.1/3050, for CREATE
+    // TABLE and for ALTER TABLE ADD alike.
+    {
+        let arity = lc.contains("foreign key column count does not match");
+        let seg = lc
+            .split("partner index segment no ")
+            .nth(1)
+            .filter(|_| lc.contains("has incompatible data type"))
+            .and_then(|t| {
+                t.split_whitespace().next().and_then(|n| n.parse::<i32>().ok())
+            });
+        if arity || seg.is_some() {
+            let named = match plan {
+                // a relation name is CANONICAL by now - printed as stored
+                Plan::CreateTable { name, .. } => {
+                    Some((336397286, format!("\"PUBLIC\".\"{}\"", name.trim_end())))
+                }
+                _ => ddl_relation_target(plan).map(|t| (ALTER_TABLE_FAILED, q(t))),
+            };
+            if let Some((failed, qn)) = named {
+                let mut w = W::default();
+                w.int(OP_RESPONSE).int(0).int(0).int(0).int(0);
+                w.int(1)
+                    .int(GDS_NO_META_UPDATE)
+                    .int(1)
+                    .int(failed)
+                    .int(2)
+                    .bytes(qn.as_bytes());
+                match seg {
+                    // isc_partner_idx_incompat_type, its one argument the
+                    // 1-based number of the first segment that does not fit
+                    Some(n) => {
+                        w.int(1).int(335544852).int(4).int(n);
+                    }
+                    None => {
+                        w.int(1)
+                            .int(335544436) // isc_sqlerr - "SQL error code = @1"
+                            .int(4)
+                            .int(-607)
+                            .int(1)
+                            .int(335544570) // isc_dsql_command_err - "Invalid command"
+                            .int(1)
+                            .int(335544604); // FOREIGN KEY column count does not match PRIMARY KEY
+                    }
+                }
+                w.int(0);
+                w.send(s, enc)?;
+                return Ok(true);
+            }
         }
     }
     // FIRST-UPDATER-WINS on a relation: the wrapper, the verb, and the
@@ -5962,6 +6079,8 @@ fn run_gbak_restore_core(
                     ref_columns: ref_cols,
                     on_update: restore_ref_action(&fk.update_rule)?,
                     on_delete: restore_ref_action(&fk.delete_rule)?,
+                    // one FK added per call: nothing to order against
+                    place: fire_crab_ods::ddl::ConstraintPlace::Table { decl: 0 },
                 },
             )?;
         }
@@ -6283,6 +6402,7 @@ fn restore_column_def(
         charset_id: None,
         not_null: c.not_null,
         not_null_constraint: c.not_null,
+        not_null_at: 0,
         default: None,
         // a named-domain column binds by NAME - create_table resolves
         // the type off the domain's own RDB$FIELDS row
@@ -12959,6 +13079,44 @@ struct FkPartner {
     /// the column NAMES behind `my_fids` - this table's side of the
     /// partnership, which is what the refusal's key text prints
     my_cols: Vec<String>,
+    /// A partnership whose CHILD-SIDE KEY COLUMNS THE CATALOG NO LONGER
+    /// RECORDS: an `ALTER TABLE ... DROP CONSTRAINT <fk>` leaves the
+    /// child's index row behind as `RDB$TEMP_DEPEND_<rel>_<n>`, still
+    /// naming the parent's unique index in `RDB$FOREIGN_KEY`, with its
+    /// `RDB$INDEX_SEGMENTS` rows deleted (both servers write exactly
+    /// this - the two files are identical after the drop, and the
+    /// ENGINE GOES ON ENFORCING FROM IT: measured, `DELETE` of a
+    /// referenced parent row is refused `Violation of FOREIGN KEY
+    /// constraint "***unknown***"` for as long as the row stands, on
+    /// fire-crab's file as on its own).
+    ///
+    /// Only the PARENT side carries one. On the CHILD side the same row
+    /// describes no enforceable key at all and is skipped, which is
+    /// what lets an orphan `INSERT` into the dropped-constraint child
+    /// through - the engine accepts that too.
+    ///
+    /// THE KEY COLUMNS ARE STILL KNOWN, from the one place the drop
+    /// does not touch: the index-root descriptor. `deferred_drop_index`
+    /// (and the engine's own deferred drop) deletes the
+    /// `RDB$INDEX_SEGMENTS` rows and moves the index-root slot to
+    /// `irt_drop` WITH ITS ROOT PAGE AND SEGMENT DESCRIPTORS INTACT -
+    /// the B-tree the engine goes on enforcing from. So `other_fids` is
+    /// filled from that descriptor ([index_root_key_fids]) and the
+    /// parent-side test is the ordinary, EXACT one: does a child row
+    /// hold this key IN THOSE COLUMNS.
+    ///
+    /// The flag itself now says only "the constraint row is gone, so
+    /// the refusal is named `***unknown***`, as the engine names it".
+    /// `other_fids` is empty only when the descriptor cannot be TRUSTED,
+    /// which is three cases and not one: the slot has no root page or a
+    /// zero key count, the recovered segment count does not equal the
+    /// parent key's arity, or two `RDB$INDICES` rows of that relation
+    /// claim the same slot. Each is a guard against reading a key that
+    /// may not be the dropped one; in all three - and only in those -
+    /// the widest sound question stands in
+    /// ([fk_partner_could_carry]), which over-refuses rather than miss
+    /// a reference.
+    opaque: bool,
 }
 
 /// The FOREIGN KEY partnerships `table` participates in, as
@@ -12995,14 +13153,18 @@ fn fk_partners_uncached(
     let (_, i_descs) = i_formats.iter().max_by_key(|(n, _)| *n)?;
     let icols = relation_columns(&db.bytes(), db.page_size, "RDB$INDICES");
     let ifid = |n: &str| icols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
-    let (ix_f, rn_f, fk_f) = (
+    let (ix_f, rn_f, fk_f, id_f) = (
         ifid("RDB$INDEX_NAME")?,
         ifid("RDB$RELATION_NAME")?,
         ifid("RDB$FOREIGN_KEY")?,
+        ifid("RDB$INDEX_ID")?,
     );
     let irel = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, "RDB$INDICES")?;
     let ifmts = vec![(0u8, i_descs.clone())];
-    let mut rows: Vec<(String, String, Option<String>)> = Vec::new();
+    // (index name, relation name, partner index name, index-root SLOT -
+    // `RDB$INDEX_ID - 1`, the address of the tree and of the segment
+    // descriptors that outlive a deferred drop)
+    let mut rows: Vec<(String, String, Option<String>, Option<u8>)> = Vec::new();
     for_each_record(db, irel, &ifmts, usize::MAX, |values| {
         let Some(Value::Text(ix)) = values.get(ix_f) else { return };
         let Some(Value::Text(rn)) = values.get(rn_f) else { return };
@@ -13010,9 +13172,13 @@ fn fk_partners_uncached(
             Some(Value::Text(t)) if !t.trim_end().is_empty() => Some(t.trim_end().to_string()),
             _ => None,
         };
-        rows.push((ix.trim_end().to_string(), rn.trim_end().to_string(), fk));
+        let slot = match values.get(id_f) {
+            Some(Value::Int(i)) if *i >= 1 && *i <= 256 => Some((*i - 1) as u8),
+            _ => None,
+        };
+        rows.push((ix.trim_end().to_string(), rn.trim_end().to_string(), fk, slot));
     });
-    if !rows.iter().any(|(_, _, fk)| fk.is_some()) {
+    if !rows.iter().any(|(_, _, fk, _)| fk.is_some()) {
         return Some((Vec::new(), Vec::new())); // no FK anywhere - skip the segment walk
     }
     // every segment row: (index name, position, column name)
@@ -13076,50 +13242,174 @@ fn fk_partners_uncached(
             constraint: String::new(),
             child_table: String::new(),
             my_cols: Vec::new(),
+            opaque: false,
         })
     };
     let mut as_child = Vec::new();
     let mut as_parent = Vec::new();
-    for (ix, rn, fkp) in &rows {
+    // ONE UNUSABLE INDEX ROW IS SKIPPED, NOT FATAL TO THE TABLE. Every
+    // step below used to `?` out of the whole function, so a single row
+    // it could not read left the table with NO partner list at all -
+    // and a table whose FK partners cannot be computed refuses every
+    // INSERT at prepare, for ever. `ALTER TABLE ... DROP CONSTRAINT
+    // <fk>` leaves exactly such a row on BOTH servers (the engine's
+    // deferred-drop `RDB$TEMP_DEPEND_<rel>_<n>`: still naming the
+    // parent's PK in RDB$FOREIGN_KEY, but with no RDB$INDEX_SEGMENTS
+    // rows left), so one dropped constraint made the PARENT table
+    // permanently un-writable through fire-crab. A row that names no
+    // usable partnership describes no enforcement either: skipping it
+    // loses nothing to check.
+    for (ix, rn, fkp, slot) in &rows {
         let Some(pname) = fkp else { continue };
         // the partner (unique, parent-side) index row must resolve
-        let (p_ix, p_rn, _) = rows.iter().find(|(n, _, _)| n == pname)?;
+        let Some((p_ix, p_rn, _, _)) = rows.iter().find(|(n, _, _, _)| n == pname) else {
+            continue;
+        };
         // the CHILD's constraint name (RDB$RELATION_CONSTRAINTS by the
         // FK index) - the engine names it in both refusal directions;
         // the index's own name stands in if no constraint row exists
         let cname = constraint_for_index(db, ix).unwrap_or_else(|| ix.clone());
         if rn == table {
             // `table` is the child: its FK columns reference p_rn
-            let my_cols = segs_of(ix);
-            let my_fids: Vec<usize> = my_cols.iter().map(my_fid).collect::<Option<_>>()?;
-            let mut p = other_side(p_rn, &segs_of(p_ix))?;
-            if my_fids.is_empty() || my_fids.len() != p.other_fids.len() {
-                return None;
+            'child: {
+                let my_cols = segs_of(ix);
+                let Some(my_fids) = my_cols.iter().map(my_fid).collect::<Option<Vec<usize>>>()
+                else {
+                    break 'child;
+                };
+                let Some(mut p) = other_side(p_rn, &segs_of(p_ix)) else { break 'child };
+                if my_fids.is_empty() || my_fids.len() != p.other_fids.len() {
+                    break 'child;
+                }
+                p.my_fids = my_fids;
+                p.my_cols = my_cols;
+                p.constraint = cname.clone();
+                p.child_table = rn.clone();
+                as_child.push(p);
             }
-            p.my_fids = my_fids;
-            p.my_cols = my_cols;
-            p.constraint = cname.clone();
-            p.child_table = rn.clone();
-            as_child.push(p);
         }
         if p_rn == table {
             // `table` is the parent: rows of rn reference its key. The
             // key text prints the PARENT's own columns, but constraint
             // and table stay the CHILD's (probed - P11b).
-            let my_cols = segs_of(p_ix);
-            let my_fids: Vec<usize> = my_cols.iter().map(my_fid).collect::<Option<_>>()?;
-            let mut c = other_side(rn, &segs_of(ix))?;
-            if my_fids.is_empty() || my_fids.len() != c.other_fids.len() {
-                return None;
+            'parent: {
+                let my_cols = segs_of(p_ix);
+                let Some(my_fids) = my_cols.iter().map(my_fid).collect::<Option<Vec<usize>>>()
+                else {
+                    break 'parent;
+                };
+                let child_cols = segs_of(ix);
+                let Some(mut c) = other_side(rn, &child_cols) else { break 'parent };
+                if my_fids.is_empty() {
+                    break 'parent;
+                }
+                // THE TWO DIRECTIONS ARE NOT ONE FLAG. A segment-less
+                // index row that STILL NAMES this table's key in
+                // RDB$FOREIGN_KEY is the deferred-drop leftover
+                // described on [FkPartner::opaque]: the child's own DML
+                // must not refuse on it (the arm above skips it), and
+                // the parent's referenced-by check must still SEE it -
+                // the engine enforces from that row, so skipping it
+                // here DELETED A PARENT ROW THE ENGINE KEEPS. The
+                // constraint row is gone with the segments, and the
+                // engine prints the missing name as `***unknown***`
+                // (captured raw off its own wire).
+                if child_cols.is_empty() {
+                    c.opaque = true;
+                    c.constraint = constraint_for_index(db, ix)
+                        .unwrap_or_else(|| "***unknown***".to_string());
+                    c.child_table = rn.clone();
+                    // ... AND THE CHILD'S KEY COLUMNS ARE STILL ON FILE.
+                    // The segment ROWS are gone; the index-root SEGMENT
+                    // DESCRIPTORS are not, and they are what the tree is
+                    // keyed on - which is why the engine can go on
+                    // enforcing exactly the right column. Read them back
+                    // and the parent-side test stays the ordinary exact
+                    // one. `RDB$INDEX_ID` is the slot + 1, and a slot is
+                    // never re-used while its root page stands
+                    // (`allocate_index_slot` takes the first slot with
+                    // NO root page, and a deferred drop keeps its own),
+                    // so the row and the descriptor cannot drift apart -
+                    // and the count check below refuses to trust an id
+                    // two rows of one relation claim.
+                    let exact = slot.filter(|_| {
+                        rows.iter().filter(|(_, r, _, s)| r == rn && s == slot).count() == 1
+                    });
+                    c.other_fids = exact
+                        .and_then(|s| index_root_key_fids(db, c.other_rel, s))
+                        .filter(|f| f.len() == my_fids.len())
+                        .unwrap_or_default();
+                    c.my_fids = my_fids;
+                    c.my_cols = my_cols;
+                    as_parent.push(c);
+                    break 'parent;
+                }
+                if my_fids.len() != c.other_fids.len() {
+                    break 'parent;
+                }
+                c.my_fids = my_fids;
+                c.my_cols = my_cols;
+                c.constraint = cname;
+                c.child_table = rn.clone();
+                as_parent.push(c);
             }
-            c.my_fids = my_fids;
-            c.my_cols = my_cols;
-            c.constraint = cname;
-            c.child_table = rn.clone();
-            as_parent.push(c);
         }
     }
     Some((as_child, as_parent))
+}
+
+/// The key columns of one index, read from the INDEX-ROOT DESCRIPTOR
+/// rather than from `RDB$INDEX_SEGMENTS` - the only reading that
+/// survives a deferred drop.
+///
+/// `ALTER TABLE <child> DROP CONSTRAINT <fk>` deletes the index's
+/// segment ROWS and moves its index-root slot to `irt_drop`, KEEPING
+/// the root page and the per-segment descriptors (`irt_desc`) the tree
+/// is built on - both servers write exactly that, and it is why the
+/// ENGINE goes on refusing a genuinely referenced parent key from a
+/// constraint whose catalog rows are gone: it enforces from the
+/// surviving B-tree, which is keyed on precisely the child columns that
+/// keyed on the parent. Reading those field ids back is what keeps the
+/// parent-side test EXACT instead of column-blind.
+///
+/// `slot` is `RDB$INDICES.RDB$INDEX_ID - 1`. None when the slot holds
+/// no tree or the descriptor cannot be read - never a guess.
+fn index_root_key_fids(db: &Database, rel: u16, slot: u8) -> Option<Vec<usize>> {
+    let image = db.bytes();
+    let irt = fire_crab_ods::btr::find_index_root(&image, db.page_size, rel)?;
+    let e = irt.entry(slot)?;
+    if e.root_page == 0 || e.key_count == 0 {
+        return None;
+    }
+    let (segs, _flags) = fire_crab_ods::btw::index_segments(
+        &image,
+        db.page_size,
+        rel,
+        slot,
+        e.key_count as usize,
+    )?;
+    if segs.is_empty() {
+        return None;
+    }
+    Some(segs.iter().map(|(field, _)| *field as usize).collect())
+}
+
+/// Does this row carry `key` IN THESE COLUMNS? The exact question every
+/// foreign-key check asks - `fids` are the partnership's other-side
+/// field ids, in key order, and a NULL component references nothing
+/// (MATCH SIMPLE, as the engine's idx.epp has it). Equality is
+/// [value_cmp], the pad-insensitive comparison the engine's own index
+/// keys use.
+///
+/// Named because it is the whole difference between the exact test and
+/// [row_could_carry_key]: a child table's `STATUS` or `QTY` column may
+/// hold the parent key's value all day, and only the key column decides.
+fn row_carries_key_at(values: &[Value], fids: &[usize], key: &[&Value]) -> bool {
+    fids.len() == key.len()
+        && fids.iter().zip(key).all(|(f, k)| {
+            let v = values.get(*f).unwrap_or(&Value::Null);
+            !matches!(v, Value::Null) && value_cmp(v, k) == std::cmp::Ordering::Equal
+        })
 }
 
 /// TRUE when the partner relation holds a row matching `key` on the
@@ -13127,12 +13417,7 @@ fn fk_partners_uncached(
 /// [value_cmp], the pad-insensitive equality the join machinery uses
 /// (the engine compares partner INDEX keys, equally pad-insensitive).
 fn fk_partner_has(db: &Database, fk: &FkPartner, key: &[&Value]) -> bool {
-    let matches_key = |v: &[Value]| {
-        fk.other_fids.iter().zip(key).all(|(of, k)| {
-            let o = v.get(*of).unwrap_or(&Value::Null);
-            !matches!(o, Value::Null) && value_cmp(o, k) == std::cmp::Ordering::Equal
-        })
-    };
+    let matches_key = |v: &[Value]| row_carries_key_at(v, &fk.other_fids, key);
     // THE PARTNER'S OWN INDEX ANSWERS THIS. A referenced key always
     // carries a UNIQUE index - SQL requires one - and the question here
     // is an EXISTENCE test, so the index names the candidates and the
@@ -13248,6 +13533,50 @@ fn fk_violation_err(fk: &FkPartner, key: &[&Value], missing_target: bool) -> Eva
     }
 }
 
+/// COULD any row of the partner (child) relation carry `key`, when not
+/// even the surviving index-root descriptor says WHICH of its columns
+/// the key was on?
+///
+/// THE LAST RESORT, NOT THE ORDINARY PATH. An [FkPartner::opaque]
+/// partnership recovers its real key columns from the dropped index's
+/// own segment descriptors ([index_root_key_fids]) and takes the exact
+/// `fk_partner_has` test; this stands in only when that descriptor is
+/// unreadable, where the choice is between the widest SOUND question
+/// and no check at all.
+///
+/// The question: does some child row hold every one of the key's
+/// values, in ANY of its columns? The real key columns are among
+/// "any", so a row that references the key always answers TRUE - the
+/// check can never MISS a reference and let a referenced parent row be
+/// deleted, which is the direction that costs data. It CAN over-answer,
+/// which is exactly why it is no longer reached from an ordinary
+/// dropped constraint: an unrelated `STATUS` or `QTY` column holding
+/// the same small integer refused a parent DELETE the engine takes.
+fn fk_partner_could_carry(db: &Database, fk: &FkPartner, key: &[&Value]) -> bool {
+    let mut any = false;
+    for_each_record_while(db, fk.other_rel, &fk.other_formats, usize::MAX, |values| {
+        if row_could_carry_key(values, key) {
+            any = true;
+            Flow::Stop
+        } else {
+            Flow::Continue
+        }
+    });
+    any
+}
+
+/// One row of [fk_partner_could_carry]'s question: does this row hold
+/// every value of `key`, in ANY of its columns? A NULL never matches -
+/// a NULL child column references nothing, exactly as in
+/// [fk_partner_has].
+fn row_could_carry_key(values: &[Value], key: &[&Value]) -> bool {
+    key.iter().all(|k| {
+        values
+            .iter()
+            .any(|v| !matches!(v, Value::Null) && value_cmp(v, k) == std::cmp::Ordering::Equal)
+    })
+}
+
 /// Parent-side (NO ACTION/RESTRICT) partner check: the key of a row
 /// being deleted (`new_row` None) or updated must not be referenced by
 /// any child row. An UPDATE that leaves the key equal never fires the
@@ -13275,6 +13604,19 @@ fn fk_check_parent_row(
             if unchanged {
                 continue;
             }
+        }
+        // An OPAQUE partnership ([FkPartner::opaque]) normally carries
+        // its key columns anyway, recovered from the index-root
+        // descriptor of the tree the engine still enforces from, and
+        // takes the exact test below like any other. Only a descriptor
+        // this server could not read at all leaves NO columns to
+        // compare, and then the widest SOUND question stands in
+        // ([fk_partner_could_carry]) rather than a silent bypass.
+        if fk.opaque && fk.other_fids.is_empty() {
+            if fk_partner_could_carry(db, fk, &key) {
+                return Err(fk_violation_err(fk, &key, false));
+            }
+            continue;
         }
         if fk_partner_has(db, fk, &key) {
             // the parent-side refusal: still the CHILD's constraint and
@@ -13729,6 +14071,54 @@ fn respond_malformed_statement(
     w.send(s, enc)
 }
 
+/// isc_dyn_name_longer - DYN 159 (`336068608 + 159`), "Name longer than
+/// database column size", SQLSTATE 42000. The engine's LEXER raises it
+/// for any identifier over [MAX_IDENT_CHARS] characters, wrapped the
+/// way every other -104 is: `isc_dsql_error` / `isc_sqlerr`(-104) /
+/// this / `isc_dsql_line_col_error`. Captured off the live engine
+/// through isql, which renders the four items as
+///
+/// ```text
+/// Statement failed, SQLSTATE = 42000
+/// Dynamic SQL Error
+/// -SQL error code = -104
+/// -Name longer than database column size
+/// -At line 1, column 14
+/// ```
+const GDS_DYN_NAME_LONGER: i32 = 336068767;
+
+/// The refusal [stmt_name_too_long] found: an identifier longer than the
+/// catalog's name column, at the (line, column) the engine reports.
+fn respond_name_too_long(
+    s: &mut TcpStream,
+    enc: &mut Option<Rc4>,
+    line: i64,
+    col: i64,
+) -> std::io::Result<()> {
+    let mut w = W::default();
+    w.int(OP_RESPONSE)
+        .int(0)
+        .int(0)
+        .int(0) // blob id
+        .int(0) // response data length
+        .int(1) // isc_arg_gds
+        .int(GDS_DSQL_ERROR)
+        .int(1) // isc_arg_gds
+        .int(GDS_SQLERR)
+        .int(ISC_ARG_NUMBER)
+        .int(-104)
+        .int(1) // isc_arg_gds
+        .int(GDS_DYN_NAME_LONGER)
+        .int(1) // isc_arg_gds
+        .int(GDS_DSQL_LINE_COL_ERROR)
+        .int(ISC_ARG_NUMBER)
+        .int(line as i32)
+        .int(ISC_ARG_NUMBER)
+        .int(col as i32)
+        .int(0); // isc_arg_end
+    w.send(s, enc)
+}
+
 /// Is this statement text deep enough to threaten the planner's
 /// recursion?
 ///
@@ -13965,11 +14355,20 @@ fn fire_db_triggers(
                 let r = exec_psql_stmt(&body, &mut frame, &mut steps, database, ctx);
                 undo_window_unwind(database, mark, r.is_err());
                 if r.is_ok() {
-                    end_transaction(database, TxEnd::Commit);
+                    // the body's OWN transaction: a commit that cannot
+                    // write is the body failing, not a silent loss
+                    match end_transaction(database, TxEnd::Commit) {
+                        Ok(()) => r,
+                        Err(e) => Err(PsqlStop::Failed(e)),
+                    }
                 } else {
-                    end_transaction(database, TxEnd::RollbackNoImage);
+                    // the body already failed and ITS error is what the
+                    // caller is owed; the rollback's own write failing
+                    // cannot make that worse (nothing of the body's is
+                    // meant to survive either way)
+                    let _ = end_transaction(database, TxEnd::RollbackNoImage);
+                    r
                 }
-                r
             } else {
                 exec_psql_stmt(&body, &mut frame, &mut steps, database, ctx)
             };
@@ -17206,6 +17605,7 @@ fn parse_column_def(item: &str) -> Option<(fire_crab_ods::ddl::ColumnDef, Option
             // PRIMARY KEY) is the case the engine records as a
             // constraint row
             not_null_constraint: not_null,
+            not_null_at: 0,
             default: None,
             domain: None,
             identity: None,
@@ -17229,6 +17629,7 @@ fn parse_column_def(item: &str) -> Option<(fire_crab_ods::ddl::ColumnDef, Option
             precision: Some(precision),
             not_null,
             not_null_constraint: not_null,
+            not_null_at: 0,
             default: None,
             domain: None,
             identity: None,
@@ -17309,6 +17710,7 @@ fn parse_column_def(item: &str) -> Option<(fire_crab_ods::ddl::ColumnDef, Option
             precision: None,
             not_null,
             not_null_constraint: not_null,
+            not_null_at: 0,
             default: None,
             domain: None,
             identity: None,
@@ -17359,6 +17761,7 @@ fn parse_column_def(item: &str) -> Option<(fire_crab_ods::ddl::ColumnDef, Option
                 precision: None,
                 not_null,
                 not_null_constraint: not_null,
+                not_null_at: 0,
                 default: None,
                 domain: None,
                 identity: None,
@@ -17413,6 +17816,7 @@ fn parse_column_def(item: &str) -> Option<(fire_crab_ods::ddl::ColumnDef, Option
             precision: None, // the domain's own row carries it
             not_null,
             not_null_constraint: not_null,
+            not_null_at: 0,
             default: None,
             domain: Some(dom.to_string()),
             identity: None,
@@ -17576,6 +17980,7 @@ fn numeric_col(
         precision: Some(p as i16),
         not_null,
         not_null_constraint: not_null,
+        not_null_at: 0,
         default: None,
         domain: None,
         identity: None,
@@ -21174,81 +21579,236 @@ fn plan_create_table(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
     // CHECK constraints: (index into constraints, verbatim source) -
     // compiled below, once every column's type is known
     let mut check_items: Vec<(usize, String)> = Vec::new();
-    for item in items {
+    // WHERE a table-level clause stands in the column list. The
+    // keys/CHECKs and the FOREIGN KEYs travel in two separate vectors,
+    // so neither vector's own order can say which of the two was
+    // written first - this shared rank, the item's index, is what
+    // [ConstraintPlace::Table] carries so the writer can put them back
+    // into one declaration order.
+    for (decl, item) in items.into_iter().enumerate() {
+        let table_place = fire_crab_ods::ddl::ConstraintPlace::Table { decl };
+        // ONE string, ONE set of offsets: every clause position below is
+        // a byte offset into THIS item's own trimmed text, so a NOT
+        // NULL, an inline key, an inline CHECK and an inline REFERENCES
+        // are all comparable - which is what [ConstraintPlace::Inline]
+        // needs. The inline splits rewrite the item, so they are taken
+        // BEFORE them.
+        let item = item.trim();
         // folded OUTSIDE quotes: the keywords read upper case, a quoted
         // name keeps its spelling for [canon_ident] downstream
-        let up_item = fold_bare(item.trim());
+        let up_item = fold_bare(item);
         // a [CONSTRAINT <name>] FOREIGN KEY (cols) REFERENCES t [(refcols)]
         // table-level constraint (a bare name folds, a quoted one is exact)
-        if let Some(fk) = parse_fk_clause(&up_item) {
+        if let Some(fk) = parse_fk_clause(&up_item, table_place) {
             fks.push(fk);
             continue;
         }
         // a [CONSTRAINT <name>] PRIMARY KEY|UNIQUE (cols) table-level one
         if let Some(key) = parse_key_clause(&up_item) {
-            constraints.push(fire_crab_ods::ddl::TableConstraint::Key(key));
+            constraints.push(fire_crab_ods::ddl::TableConstraint {
+                kind: fire_crab_ods::ddl::ConstraintKind::Key(key),
+                place: table_place,
+            });
             continue;
         }
-        // an INLINE column-level CHECK - `V VARCHAR(5) CHECK (V = 'x')` -
-        // is the table-level constraint wearing column syntax: split it
-        // off (top-level, outside literals) and let the column part
-        // parse alone. The engine's own desugaring, and the reason the
-        // first text-CHECK probes looked like a type refusal when they
-        // were a parse gap.
-        let item_owned;
-        let item = {
-            let masked = mask_literals(&up_item);
-            match masked.find(" CHECK") {
-                Some(at)
-                    if !up_item.trim_start().starts_with("CHECK")
-                        // at TOP LEVEL: the parens before it (a type's
-                        // VARCHAR(5), a DEFAULT's) are balanced
-                        && masked[..at].matches('(').count()
-                            == masked[..at].matches(')').count()
-                        // a keyed/fk clause never carries CHECK
-                        && parse_fk_clause(&up_item).is_none()
-                        && parse_key_clause(&up_item).is_none() =>
-                {
-                    if let Some((cname, source)) = parse_check_clause(item[at..].trim()) {
-                        check_items.push((constraints.len(), source.clone()));
-                        constraints.push(fire_crab_ods::ddl::TableConstraint::Check(
-                            fire_crab_ods::ddl::CheckDef {
-                                name: cname,
-                                source,
-                                trigger_blr: Vec::new(),
-                                fields: Vec::new(),
-                            },
-                        ));
-                        item_owned = item[..at].to_string();
-                        item_owned.as_str()
-                    } else {
-                        item
-                    }
-                }
-                _ => item,
-            }
-        };
-        let up_item = fold_bare(item.trim());
-        // a [CONSTRAINT <name>] CHECK (<condition>), compiled after the
-        // column loop (it may reference columns declared after it)
+        // a [CONSTRAINT <name>] CHECK (<condition>) STANDING ON ITS OWN,
+        // recognised here - before the inline-CHECK split, which cannot
+        // tell the two apart from the CHECK keyword alone. Compiled
+        // after the column loop (it may reference columns declared
+        // after it).
         if let Some((cname, source)) = parse_check_clause(item) {
             check_items.push((constraints.len(), source.clone()));
-            constraints.push(fire_crab_ods::ddl::TableConstraint::Check(
-                fire_crab_ods::ddl::CheckDef {
-                    name: cname,
-                    source,
-                    trigger_blr: Vec::new(),
-                    fields: Vec::new(),
-                },
-            ));
+            constraints.push(fire_crab_ods::ddl::TableConstraint {
+                kind: fire_crab_ods::ddl::ConstraintKind::Check(
+                    fire_crab_ods::ddl::CheckDef {
+                        name: cname,
+                        source,
+                        trigger_blr: Vec::new(),
+                        fields: Vec::new(),
+                    },
+                ),
+                place: table_place,
+            });
             continue;
         }
+        // ---- past here the item is a COLUMN definition ----
+        let masked = mask_literals(&up_item);
+        // the column this item declares, whichever branch pushes it
+        let col_i = cols.len();
+        // an INLINE column-level CHECK - `V VARCHAR(5) CHECK (V = 'x')` -
+        // is the table-level constraint wearing column syntax: split
+        // EVERY one off (top level, outside literals) and let what
+        // remains parse as a plain column. The engine's own desugaring,
+        // and the reason the first text-CHECK probes looked like a type
+        // refusal when they were a parse gap.
+        //
+        // A clause ends at its own CLOSING PAREN, not at the end of the
+        // item. Taking the rest of the item swallowed anything written
+        // AFTER the check on the same column, and `A INTEGER CHECK
+        // (A > 0) NOT NULL` - which the engine accepts - was then
+        // refused whole.
+        let mut check_spans: Vec<(usize, usize)> = Vec::new();
+        let mut from = 0usize;
+        while let Some(kw) = find_word_depth0(&masked, "CHECK", from) {
+            let open = match masked[kw..].find('(') {
+                Some(o) => kw + o,
+                None => break,
+            };
+            // a bare CHECK word with no condition after it is not a
+            // CHECK clause
+            if !masked[kw + "CHECK".len()..open].trim().is_empty() {
+                from = kw + "CHECK".len();
+                continue;
+            }
+            // masked hides every literal, so plain paren counting is
+            // exact here
+            let end = match matching_paren(masked.as_bytes(), open) {
+                Some(e) => e + 1, // just PAST the `)`
+                None => break,
+            };
+            // a `CONSTRAINT <name>` prefix belongs to this clause
+            let start = constraint_prefix_start(&masked, kw).unwrap_or(kw);
+            if start == 0 {
+                // the item IS a check clause, and parse_check_clause
+                // refused it above - there is no column here
+                return None;
+            }
+            // A PREFIX MAY NOT REACH BEHIND THE CLAUSE BEFORE IT.
+            // `constraint_prefix_start` walks BACKWARDS from the keyword
+            // and knows nothing of the spans already claimed, so on
+            // `A INTEGER CHECK (A > 0 CONSTRAINT C) CHECK (A < 9)` it
+            // answers the CONSTRAINT written INSIDE the first check's
+            // condition - a start behind that check's end, which the
+            // merged rewrite below would then slice backwards.
+            //
+            // Such a CONSTRAINT is not this clause's prefix at all; it
+            // is a reserved word standing inside another clause, which
+            // the engine answers `-104 Token unknown - CONSTRAINT`
+            // (measured on all four shapes). So the statement REFUSES
+            // here rather than being sliced or silently re-cut.
+            if start < from {
+                return None;
+            }
+            check_spans.push((start, end));
+            from = end;
+        }
+        // an INLINE column-level `REFERENCES <table> [(cols)] [ON ...]`
+        // - `B INTEGER REFERENCES P` - is a FOREIGN KEY wearing column
+        // syntax, the FOURTH kind of column-level constraint, and it is
+        // split off exactly as an inline CHECK is. Its referencing
+        // column is the column being declared, and an absent (cols)
+        // list means the parent's PRIMARY KEY - the writer's own rule,
+        // reused rather than restated here.
+        let ref_spans = inline_references_spans(&masked);
+        // ONE rewrite for BOTH kinds of split: a column may carry an
+        // inline CHECK and an inline REFERENCES in either order, and two
+        // separate rewrites would each measure their offsets against a
+        // string the other had already changed - so the spans are merged
+        // and cut in one pass, all of them in the ORIGINAL item's
+        // coordinates.
+        let mut spans: Vec<(usize, usize, bool)> =
+            check_spans.iter().map(|(a, b)| (*a, *b, true)).collect();
+        spans.extend(ref_spans.iter().map(|(a, b)| (*a, *b, false)));
+        spans.sort_unstable();
+        // A `DEFAULT` MUST PRECEDE EVERY CONSTRAINT CLAUSE. The engine's
+        // column grammar is `<name> <type> [DEFAULT <v>] [<constraint>
+        // ...] [COLLATE ...]`, and `A INTEGER UNIQUE DEFAULT 7` is a
+        // `-104 Token unknown ... DEFAULT` (measured, for NOT NULL,
+        // UNIQUE, PRIMARY KEY, CHECK and REFERENCES alike). The clause
+        // splits above cut the constraints OUT of the item, so the
+        // column parser downstream can no longer see where the DEFAULT
+        // stood - the order is checked HERE, while both are still in one
+        // string. A `SET DEFAULT` referential action and a DEFAULT
+        // inside a CHECK condition live INSIDE a span and are not this.
+        {
+            let first_constraint = [
+                spans.first().map(|(a, _, _)| *a),
+                find_word_depth0(&masked, "NOT NULL", 0),
+                find_word_depth0(&masked, "UNIQUE", 0),
+                find_word_depth0(&masked, "PRIMARY KEY", 0),
+                find_word_depth0(&masked, "CONSTRAINT", 0),
+            ]
+            .into_iter()
+            .flatten()
+            .min();
+            if let Some(first) = first_constraint {
+                let mut from = 0usize;
+                while let Some(at) = find_word_depth0(&masked, "DEFAULT", from) {
+                    let inside = spans.iter().any(|(a, b, _)| at >= *a && at < *b);
+                    if !inside && at > first {
+                        return None;
+                    }
+                    from = at + "DEFAULT".len();
+                }
+            }
+        }
+        // the inline FKs, kept until the column is parsed (it is the
+        // referencing column, and its name is not known before that)
+        let mut inline_fks: Vec<(usize, String)> = Vec::new();
+        let stripped;
+        let item = if spans.is_empty() {
+            item
+        } else {
+            let mut t = String::with_capacity(item.len());
+            let mut prev = 0usize;
+            for (start, end, is_check) in &spans {
+                // NO SLICE IN THIS LOOP MAY RUN BACKWARDS. Two spans
+                // can still overlap after every prefix is clamped - the
+                // CHECK scan and the REFERENCES scan find their
+                // keywords independently, and `A INTEGER REFERENCES
+                // CONSTRAINT N CHECK (A > 0)` gives a REFERENCES span
+                // that ends INSIDE the CHECK span's `CONSTRAINT` prefix.
+                // `item[prev..start]` with `prev > start` PANICS, and a
+                // panic on the connection thread drops the client's TCP
+                // connection and its transaction: the one answer no
+                // input may provoke. The engine answers all such shapes
+                // `-104 Token unknown`, so an overlap REFUSES the
+                // statement (a clean SQL error) rather than being cut.
+                // A `debug_assert` would not do: the release binary is
+                // what serves.
+                if *start < prev || *end < *start || *end > item.len() {
+                    return None;
+                }
+                t.push_str(&item[prev..*start]);
+                t.push(' ');
+                prev = *end;
+                if !*is_check {
+                    inline_fks.push((*start, up_item[*start..*end].trim().to_string()));
+                    continue;
+                }
+                let (cname, source) = parse_check_clause(item[*start..*end].trim())?;
+                check_items.push((constraints.len(), source.clone()));
+                constraints.push(fire_crab_ods::ddl::TableConstraint {
+                    kind: fire_crab_ods::ddl::ConstraintKind::Check(
+                        fire_crab_ods::ddl::CheckDef {
+                            name: cname,
+                            source,
+                            trigger_blr: Vec::new(),
+                            fields: Vec::new(),
+                        },
+                    ),
+                    // an INLINE CHECK belongs to the column this item
+                    // declares, at the offset it is written at
+                    place: fire_crab_ods::ddl::ConstraintPlace::Inline {
+                        col: col_i,
+                        at: *start,
+                    },
+                });
+            }
+            t.push_str(&item[prev..]);
+            stripped = t;
+            stripped.trim()
+        };
         // a COMPUTED BY column: pushed as a placeholder now (so it keeps
         // its declaration-order field id/position); its result type is
         // inferred below, once every stored column's type is known -
         // the expression may reference columns declared after it
         if let Some((cname, src)) = parse_computed_item(item) {
-            computed_items.push((cols.len(), src.clone()));
+            // a COMPUTED BY column has no storage to reference from
+            if !inline_fks.is_empty() {
+                return None;
+            }
+            computed_items.push((col_i, src.clone()));
             cols.push(fire_crab_ods::ddl::ColumnDef {
                 name: cname,
                 field_type: 0,
@@ -21263,6 +21823,7 @@ fn plan_create_table(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
                 charset_id: None,
                 not_null: false,
                 not_null_constraint: false,
+                not_null_at: 0,
                 default: None,
                 domain: None,
                 identity: None,
@@ -21274,15 +21835,59 @@ fn plan_create_table(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
             });
             continue;
         }
-        let (col, col_key) = parse_column_def(item)?;
+        let (mut col, col_key) = parse_column_def(item)?;
+        // WHERE this column's own inline key clause stands, in the
+        // ORIGINAL item's coordinates (a `CONSTRAINT <name>` prefix
+        // ahead of it does not move the ordering)
+        let key_at = [
+            find_word_depth0(&masked, "PRIMARY KEY", 0),
+            find_word_depth0(&masked, "UNIQUE", 0),
+        ]
+        .into_iter()
+        .flatten()
+        .min();
+        if col.not_null_constraint {
+            // a column-level PRIMARY KEY IMPLIES the NOT NULL, and the
+            // implied row stands at the KEY's place - so where both are
+            // written the row takes the EARLIER of the two (probed:
+            // `A INTEGER PRIMARY KEY NOT NULL` numbers NOT NULL first,
+            // though the text reads the other way round). Unfindable
+            // (an odd spelling) means nothing else on the column is
+            // inline anyway, so 0 orders nothing wrongly.
+            let implied = match col_key {
+                Some((_, true)) => key_at,
+                _ => None,
+            };
+            col.not_null_at = [find_word_depth0(&masked, "NOT NULL", 0), implied]
+                .into_iter()
+                .flatten()
+                .min()
+                .unwrap_or(0);
+        }
         if let Some((kname, primary)) = col_key {
-            constraints.push(fire_crab_ods::ddl::TableConstraint::Key(
-                fire_crab_ods::ddl::KeyDef {
-                    name: kname,
-                    columns: vec![col.name.clone()],
-                    primary,
+            constraints.push(fire_crab_ods::ddl::TableConstraint {
+                kind: fire_crab_ods::ddl::ConstraintKind::Key(
+                    fire_crab_ods::ddl::KeyDef {
+                        name: kname,
+                        columns: vec![col.name.clone()],
+                        primary,
+                    },
+                ),
+                place: fire_crab_ods::ddl::ConstraintPlace::Inline {
+                    col: col_i,
+                    at: key_at.unwrap_or(0),
                 },
-            ));
+            });
+        }
+        // the inline REFERENCES, now that the column it references FROM
+        // is named: a plain FOREIGN KEY on this one column, seated in
+        // pass 1 at the offset it was written at. `F1 (A INTEGER,
+        // UNIQUE (A), B INTEGER REFERENCES P)` is numbered FOREIGN KEY
+        // then UNIQUE by the engine - the inline clause written LAST
+        // taking the LOWER number, the M2 inversion on a fourth
+        // constraint kind.
+        for (at, clause) in &inline_fks {
+            fks.push(parse_inline_references(clause, &col.name, col_i, *at)?);
         }
         cols.push(col);
     }
@@ -21327,8 +21932,18 @@ fn plan_create_table(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
     // build the if-failed-raise trigger BLR
     for (idx, source) in &check_items {
         let cond = parse_cond(&source["CHECK".len()..])?;
+        // AN INLINE CHECK SEES ONLY THE COLUMNS DECLARED SO FAR. The
+        // engine answers `-206 Column unknown "B"` to `(A INTEGER CHECK
+        // (B > 0), B INTEGER)` while accepting the same condition
+        // written as a TABLE-level CHECK, which is resolved once the
+        // whole column list is read (both measured). So a column-level
+        // check's name resolution stops at its own column.
+        let visible = match constraints[*idx].place {
+            fire_crab_ods::ddl::ConstraintPlace::Inline { col, .. } => col + 1,
+            fire_crab_ods::ddl::ConstraintPlace::Table { .. } => cols.len(),
+        };
         let field_rank = |name: &str| {
-            let c = cols.iter().find(|c| c.name == name)?;
+            let c = cols.iter().take(visible).find(|c| c.name == name)?;
             if c.domain.is_some() || c.computed.is_some() || c.scale != 0 || c.sub_type != 0 {
                 return None;
             }
@@ -21338,7 +21953,7 @@ fn plan_create_table(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
         // (the stored literal shape is gold-pinned); anything else
         // outside the int surface still refuses
         let field_is_text = |name: &str| {
-            cols.iter().any(|c| {
+            cols.iter().take(visible).any(|c| {
                 c.name == name
                     && c.domain.is_none()
                     && c.computed.is_none()
@@ -21365,7 +21980,7 @@ fn plan_create_table(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
         }
         let blr =
             fire_crab_ods::expr::check_trigger_blr(&cond_with_context(&cond, 1));
-        let fire_crab_ods::ddl::TableConstraint::Check(ck) = &mut constraints[*idx] else {
+        let fire_crab_ods::ddl::ConstraintKind::Check(ck) = &mut constraints[*idx].kind else {
             return None;
         };
         ck.trigger_blr = blr;
@@ -21377,7 +21992,7 @@ fn plan_create_table(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
     // not_null_constraint stays as the column declared it.
     let mut has_pk = false;
     for tc in &constraints {
-        let fire_crab_ods::ddl::TableConstraint::Key(k) = tc else {
+        let fire_crab_ods::ddl::ConstraintKind::Key(k) = &tc.kind else {
             continue;
         };
         if k.primary {
@@ -21395,7 +22010,7 @@ fn plan_create_table(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
         }
     }
     for tc in &constraints {
-        let fire_crab_ods::ddl::TableConstraint::Key(k) = tc else {
+        let fire_crab_ods::ddl::ConstraintKind::Key(k) = &tc.kind else {
             continue;
         };
         if k.primary {
@@ -21456,7 +22071,10 @@ fn parse_key_clause(up_item: &str) -> Option<fire_crab_ods::ddl::KeyDef> {
 /// CREATE TABLE item. None if the item is not a foreign-key clause (a
 /// column definition or another constraint), so the caller keeps parsing.
 /// An unnamed FK carries an empty name - create_table generates one.
-fn parse_fk_clause(up_item: &str) -> Option<fire_crab_ods::ddl::ForeignKeyDef> {
+fn parse_fk_clause(
+    up_item: &str,
+    place: fire_crab_ods::ddl::ConstraintPlace,
+) -> Option<fire_crab_ods::ddl::ForeignKeyDef> {
     let mut t = up_item.trim();
     let mut name = String::new();
     if let Some(rest) = t.strip_prefix("CONSTRAINT ") {
@@ -21472,14 +22090,188 @@ fn parse_fk_clause(up_item: &str) -> Option<fire_crab_ods::ddl::ForeignKeyDef> {
     }
     let close = rest.find(')')?;
     let columns = split_ident_list(&rest[1..close])?;
-    let after = rest[close + 1..].trim_start().strip_prefix("REFERENCES")?.trim_start();
+    if columns.is_empty() {
+        return None;
+    }
+    let after = rest[close + 1..].trim_start().strip_prefix("REFERENCES")?;
+    let (ref_table, ref_columns, on_update, on_delete) = parse_references_tail(after)?;
+    Some(fire_crab_ods::ddl::ForeignKeyDef {
+        name,
+        columns,
+        ref_table,
+        ref_columns,
+        on_update,
+        on_delete,
+        place,
+    })
+}
+
+/// The spans of the COLUMN-level `[CONSTRAINT <name>] REFERENCES <table>
+/// [(<cols>)] [ON UPDATE <action>] [ON DELETE <action>]` clauses inside
+/// one CREATE TABLE item's masked, uppercased text: (start, just past
+/// the end) each. Empty when the item carries no top-level REFERENCES.
+///
+/// A column may carry MORE THAN ONE - `A INTEGER REFERENCES P
+/// REFERENCES Q` declares two foreign keys on it, which the engine
+/// accepts - so this collects them the way the inline-CHECK scan
+/// collects its own. Returning a single clause left the second one in
+/// the residual, where the column parser choked on it.
+///
+/// The clause ends where ITS OWN grammar ends - after the table name,
+/// its optional column list and its referential actions - NOT at the
+/// end of the item, because a column may carry more after it
+/// (`B INTEGER REFERENCES P NOT NULL`, `B INTEGER REFERENCES P
+/// CHECK (B > 0)`). Taking the rest of the item is the mistake the
+/// inline-CHECK split had to be cured of.
+///
+/// Literals and quoted identifiers are already masked by the caller, so
+/// a `REFERENCES` inside a string, a quoted name or a CHECK's condition
+/// (which sits at paren depth > 0) is never mistaken for a clause.
+fn inline_references_spans(masked: &str) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut from = 0usize;
+    while let Some(span) = inline_references_span_from(masked, from) {
+        from = span.1;
+        out.push(span);
+    }
+    out
+}
+
+/// One clause, starting the search at `from`. Split out so the scan can
+/// step past the clause it just took.
+fn inline_references_span_from(masked: &str, from: usize) -> Option<(usize, usize)> {
+    let kw = find_word_depth0(masked, "REFERENCES", from)?;
+    // a `CONSTRAINT <name>` prefix belongs to this clause
+    let start = constraint_prefix_start(masked, kw).unwrap_or(kw);
+    if start == 0 {
+        return None; // no column here - the item IS the clause
+    }
+    let b = masked.as_bytes();
+    let skip_ws = |mut i: usize| {
+        while i < b.len() && b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        i
+    };
+    // the referenced table name (a quoted one reads as masked `X`s,
+    // which are ordinary identifier bytes - the span is what matters
+    // here, the caller re-slices the ORIGINAL text)
+    let mut p = skip_ws(kw + "REFERENCES".len());
+    let name_start = p;
+    while p < b.len() && is_ident_byte(b[p]) {
+        p += 1;
+    }
+    if p == name_start {
+        return None; // `REFERENCES` with nothing after it
+    }
+    // the optional referenced-column list
+    let q = skip_ws(p);
+    if q < b.len() && b[q] == b'(' {
+        p = matching_paren(b, q)? + 1;
+    }
+    // the optional trailing ON UPDATE / ON DELETE actions, each one
+    // `ON <event> <action>` with a two-word action for SET NULL,
+    // SET DEFAULT and NO ACTION
+    loop {
+        let on = skip_ws(p);
+        if !starts_with_word(&masked[on..], "ON") {
+            break;
+        }
+        let ev = skip_ws(on + "ON".len());
+        if !starts_with_word(&masked[ev..], "UPDATE") && !starts_with_word(&masked[ev..], "DELETE") {
+            break;
+        }
+        // UPDATE and DELETE are the same length, so one step past
+        // the event word serves for both
+        let act = skip_ws(ev + "UPDATE".len());
+        let end = if starts_with_word(&masked[act..], "CASCADE") {
+            act + "CASCADE".len()
+        } else if starts_with_word(&masked[act..], "RESTRICT") {
+            act + "RESTRICT".len()
+        } else if starts_with_word(&masked[act..], "NO") {
+            let w = skip_ws(act + "NO".len());
+            if !starts_with_word(&masked[w..], "ACTION") {
+                break;
+            }
+            w + "ACTION".len()
+        } else if starts_with_word(&masked[act..], "SET") {
+            let w = skip_ws(act + "SET".len());
+            if starts_with_word(&masked[w..], "NULL") {
+                w + "NULL".len()
+            } else if starts_with_word(&masked[w..], "DEFAULT") {
+                w + "DEFAULT".len()
+            } else {
+                break;
+            }
+        } else {
+            break;
+        };
+        p = end;
+    }
+    Some((start, p))
+}
+
+/// Whether `s` begins with the whole word `w` (already uppercase): the
+/// letters, and then something that is not an identifier byte.
+fn starts_with_word(s: &str, w: &str) -> bool {
+    s.len() >= w.len()
+        && s.as_bytes()[..w.len()] == *w.as_bytes()
+        && (s.len() == w.len() || !is_ident_byte(s.as_bytes()[w.len()]))
+}
+
+/// Build the [ForeignKeyDef] of a COLUMN-level `REFERENCES` clause -
+/// `clause` being the clause text alone (uppercased, `CONSTRAINT <name>`
+/// prefix and all), `col_name` the CANONICAL name of the column it is
+/// written on, and `col`/`at` its seat in pass 1 of the numbering law.
+/// The referencing column is the column being declared; everything after
+/// the REFERENCES keyword is the same grammar the table-level clause
+/// uses, so it goes through [parse_references_tail].
+fn parse_inline_references(
+    clause: &str,
+    col_name: &str,
+    col: usize,
+    at: usize,
+) -> Option<fire_crab_ods::ddl::ForeignKeyDef> {
+    let mut t = clause.trim();
+    let mut name = String::new();
+    if let Some(rest) = t.strip_prefix("CONSTRAINT ") {
+        let rest = rest.trim_start();
+        let end = rest.find(char::is_whitespace)?;
+        name = canon_ident(&rest[..end])?;
+        t = rest[end..].trim_start();
+    }
+    let after = t.strip_prefix("REFERENCES")?;
+    let (ref_table, ref_columns, on_update, on_delete) = parse_references_tail(after)?;
+    Some(fire_crab_ods::ddl::ForeignKeyDef {
+        name,
+        columns: vec![col_name.to_string()],
+        ref_table,
+        ref_columns,
+        on_update,
+        on_delete,
+        place: fire_crab_ods::ddl::ConstraintPlace::Inline { col, at },
+    })
+}
+
+/// Everything a foreign key says AFTER its `REFERENCES` keyword:
+/// `<table> [(<columns>)] [ON UPDATE <action>] [ON DELETE <action>]`,
+/// already uppercased. Shared by the table-level `FOREIGN KEY (...)`
+/// clause and the COLUMN-level `REFERENCES` one, which differ only in
+/// how the REFERENCING columns are named - the tail is the same
+/// grammar, so it is parsed in one place and not twice.
+fn parse_references_tail(
+    after: &str,
+) -> Option<(String, Vec<String>, fire_crab_ods::ddl::RefAction, fire_crab_ods::ddl::RefAction)> {
+    let after = after.trim_start();
     // split the referenced table[(cols)] from any trailing ON UPDATE /
     // ON DELETE referential-action clauses
     let (ref_part, actions_str) = match find_word(after, "ON", 0) {
         Some(p) => (after[..p].trim(), &after[p..]),
-        None => (after, ""),
+        None => (after.trim(), ""),
     };
-    // referenced table, optionally with an explicit (columns) list
+    // referenced table, optionally with an explicit (columns) list. An
+    // EMPTY list means the parent's PRIMARY KEY, resolved by the writer
+    // (find_partner_key) - the same rule for both forms, not restated.
     let (ref_table, ref_columns) = match ref_part.find('(') {
         Some(p) => {
             let rc_close = ref_part.rfind(')')?;
@@ -21491,26 +22283,35 @@ fn parse_fk_clause(up_item: &str) -> Option<fire_crab_ods::ddl::ForeignKeyDef> {
         }
         None => (canon_ident(ref_part)?, Vec::new()),
     };
-    if columns.is_empty() {
-        return None;
-    }
     let (on_update, on_delete) = parse_ref_actions(actions_str)?;
-    Some(fire_crab_ods::ddl::ForeignKeyDef {
-        name,
-        columns,
-        ref_table,
-        ref_columns,
-        on_update,
-        on_delete,
-    })
+    Some((ref_table, ref_columns, on_update, on_delete))
 }
 
 /// Parse the trailing `[ON UPDATE <action>] [ON DELETE <action>]` of a
-/// foreign key (already uppercased). `CASCADE`, `SET NULL`, `SET DEFAULT`,
-/// `RESTRICT` and `NO ACTION` are modelled (the last two as RESTRICT).
+/// foreign key (already uppercased). The grammar's four actions are
+/// `CASCADE`, `SET NULL`, `SET DEFAULT` and `NO ACTION`. `NO ACTION` is
+/// its OWN action: it behaves exactly as the stored `RESTRICT` (neither
+/// synthesises a trigger) but the engine STORES the rule it was written
+/// with, and folding the two together wrote `RESTRICT` into a file
+/// where the engine writes `NO ACTION` - a silent wrong write that
+/// survived gbak.
+///
+/// `RESTRICT` IS NOT ONE OF THEM. It is the value Firebird STORES in
+/// `RDB$REF_CONSTRAINTS` for an omitted clause, not a word its parser
+/// accepts: `ON DELETE RESTRICT` is a `-104 Token unknown - RESTRICT`
+/// on the engine, inline and table-level alike (measured). Accepting it
+/// wrote a key the engine would never have built AND shifted every
+/// later `INTEG_<n>` on that database by one against the engine's, so
+/// it was a naming divergence as well as a syntax one. The catalog
+/// direction still reads `RESTRICT` - see [restore_ref_action].
 fn parse_ref_actions(s: &str) -> Option<(fire_crab_ods::ddl::RefAction, fire_crab_ods::ddl::RefAction)> {
     use fire_crab_ods::ddl::RefAction;
     let (mut on_update, mut on_delete) = (RefAction::Restrict, RefAction::Restrict);
+    // each event may be spoken for ONCE. `REFERENCES P ON DELETE CASCADE
+    // ON DELETE SET NULL` is a `-104 Token unknown ... DELETE` on the
+    // engine; this loop used to let the LAST clause win and record a
+    // rule for a table the engine would never have built.
+    let (mut seen_update, mut seen_delete) = (false, false);
     let toks: Vec<&str> = s.split_whitespace().collect();
     let mut i = 0;
     while i < toks.len() {
@@ -21524,13 +22325,9 @@ fn parse_ref_actions(s: &str) -> Option<(fire_crab_ods::ddl::RefAction, fire_cra
                 i += 1;
                 RefAction::Cascade
             }
-            "RESTRICT" => {
-                i += 1;
-                RefAction::Restrict
-            }
             "NO" if toks.get(i + 1) == Some(&"ACTION") => {
                 i += 2;
-                RefAction::Restrict
+                RefAction::NoAction
             }
             "SET" if toks.get(i + 1) == Some(&"NULL") => {
                 i += 2;
@@ -21543,8 +22340,14 @@ fn parse_ref_actions(s: &str) -> Option<(fire_crab_ods::ddl::RefAction, fire_cra
             _ => return None,
         };
         match which {
-            "UPDATE" => on_update = action,
-            "DELETE" => on_delete = action,
+            "UPDATE" if !seen_update => {
+                on_update = action;
+                seen_update = true;
+            }
+            "DELETE" if !seen_delete => {
+                on_delete = action;
+                seen_delete = true;
+            }
             _ => return None,
         }
     }
@@ -22602,6 +23405,7 @@ fn projcol_to_coldef(c: &ProjCol, name: &str) -> Option<fire_crab_ods::ddl::Colu
         precision,
         not_null: false,
         not_null_constraint: false,
+        not_null_at: 0,
         default: None,
         domain: None,
         identity: None,
@@ -24221,7 +25025,12 @@ fn plan_alter_table_add(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<D
     let table: &str = table_c.as_str();
     let tail = s[add_kw + "ADD".len()..].trim();
     // ADD [CONSTRAINT <name>] FOREIGN KEY (...) REFERENCES ...
-    if let Some(fk) = parse_fk_clause(&fold_bare(tail)) {
+    // ALTER TABLE ... ADD draws ONE number per statement, so the place
+    // orders nothing here (measured: `ADD UNIQUE` then `ADD CHECK` take
+    // consecutive numbers in statement order, whatever the table holds)
+    if let Some(fk) =
+        parse_fk_clause(&fold_bare(tail), fire_crab_ods::ddl::ConstraintPlace::Table { decl: 0 })
+    {
         return Some((
             Plan::AlterTableAddFk { table: table.to_string(), fk },
             Vec::new(),
@@ -24340,6 +25149,7 @@ fn plan_alter_table_add(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<D
             charset_id: None,
             not_null: false,
             not_null_constraint: false,
+            not_null_at: 0,
             default: None,
             domain: None,
             identity: None,
@@ -55132,6 +55942,172 @@ fn has_unknown_space(sql: &str) -> bool {
     false
 }
 
+/// THE ENGINE'S IDENTIFIER LENGTH: 63 CHARACTERS, NOT BYTES.
+///
+/// `RDB$RELATIONS.RDB$RELATION_NAME` and every other catalog name
+/// column is `CHAR(63) CHARACTER SET UTF8`, and the engine's LEXER
+/// refuses a longer one before anything is planned: `-104` /
+/// `dyn_name_longer` "Name longer than database column size" (DYN 159),
+/// at the (line, column) of the token's FIRST CHARACTER.
+///
+/// MEASURED on Firebird 6 over this project's own transport, 30 naming
+/// paths x two lengths ([the round-5 report]): at 63 both servers
+/// accept, at 64 the engine refuses - table, column, domain, index,
+/// generator, sequence, view, exception, trigger, procedure, the
+/// table-level PRIMARY KEY / UNIQUE / FOREIGN KEY / CHECK constraint
+/// names, the INLINE `CONSTRAINT <n> CHECK` / `REFERENCES` / `UNIQUE`
+/// ones, `ALTER TABLE ADD CONSTRAINT`, `ALTER TABLE ADD <column>`, and
+/// the QUOTED spelling of each. The limit counts CHARACTERS: a quoted
+/// name of 63 `A`-umlauts is 126 bytes and ACCEPTED, 64 of them is
+/// refused - so a byte-length test would refuse names the engine takes.
+const MAX_IDENT_CHARS: usize = 63;
+
+/// It is not a DDL rule but a LEXICAL one - `SELECT <64 chars> FROM T`,
+/// `SELECT A AS <64> FROM T`, `FROM <64>`, `FROM T "<64>"` and
+/// `INSERT INTO T (<64>)` all take the same refusal (measured) - so
+/// this is checked ONCE where the statement text arrives, beside
+/// [has_unknown_space], rather than at each of the ~118 name-producing
+/// call sites. WITHOUT IT fire-crab wrote the object with the name
+/// silently CUT to 63: two names differing only past character 63
+/// collided in the catalog, `gfix -v -full` still returned 0, and
+/// `gbak` restore failed with a duplicate key on
+/// `RDB$RELATION_CONSTRAINTS` - a database that looks healthy and
+/// cannot be restored.
+///
+/// Only what the LEXER sees counts, exactly as in [has_unknown_space]:
+/// a string literal, either comment form, and a run that starts with a
+/// DIGIT (a numeric literal, however long) are all skipped. A bare word
+/// is an ASCII letter or `_` followed by identifier bytes; a delimited
+/// one is the text between quotes, `""` counting as the one character
+/// it stands for.
+///
+/// Answers the 1-based (line, column) of the offending token, counted
+/// the way [text_line_col] counts - the position the engine's
+/// `isc_dsql_line_col_error` reports.
+fn stmt_name_too_long(sql: &str) -> Option<(i64, i64)> {
+    let b: Vec<char> = sql.chars().collect();
+    let (mut line, mut col) = (1i64, 1i64);
+    let mut i = 0usize;
+    // advance one character, keeping the engine's line/column count
+    // (CR, LF and CRLF each end ONE line - see [text_line_col])
+    macro_rules! step {
+        () => {{
+            match b[i] {
+                '\r' => (line, col) = (line + 1, 1),
+                '\n' if i > 0 && b[i - 1] == '\r' => {}
+                '\n' => (line, col) = (line + 1, 1),
+                _ => col += 1,
+            }
+            i += 1;
+        }};
+    }
+    while i < b.len() {
+        match b[i] {
+            '\'' => {
+                step!();
+                while i < b.len() {
+                    if b[i] == '\'' {
+                        if b.get(i + 1) == Some(&'\'') {
+                            step!();
+                            step!();
+                            continue;
+                        }
+                        break;
+                    }
+                    step!();
+                }
+                if i < b.len() {
+                    step!();
+                }
+            }
+            '"' => {
+                let (at_line, at_col) = (line, col);
+                step!();
+                let mut n = 0usize;
+                // TRAILING BLANKS DO NOT COUNT. The engine strips them
+                // BEFORE applying the limit, so `"<63 chars> "` - 64
+                // characters between the quotes - is a legal 63-character
+                // name there, and both servers already store it trimmed
+                // (`CREATE TABLE "AB  "` is reachable afterwards as `AB`
+                // on either). Counting them refused a name this server's
+                // own writer would have written correctly. `sig` is the
+                // length up to the LAST NON-BLANK character; an INTERNAL
+                // blank still counts, and 64 of them with one letter last
+                // is still too long - both measured against the engine.
+                let mut sig = 0usize;
+                while i < b.len() {
+                    if b[i] == '"' {
+                        if b.get(i + 1) == Some(&'"') {
+                            step!();
+                            step!();
+                            n += 1;
+                            sig = n;
+                            continue;
+                        }
+                        break;
+                    }
+                    let blank = b[i] == ' ';
+                    step!();
+                    n += 1;
+                    if !blank {
+                        sig = n;
+                    }
+                }
+                if i < b.len() {
+                    step!();
+                }
+                // A NAME OF NOTHING BUT BLANKS IS NOT A NAME. Trimming
+                // the trailing ones cannot be allowed to trim the whole
+                // identifier away: fire-crab WROTE a relation whose
+                // RDB$RELATION_NAME was all blanks (the engine reads it
+                // back as `[               ]` and `gfix -v -full` then
+                // reports database page warnings), where the engine
+                // refuses with its own `-104 Zero length identifiers
+                // not permitted`. Same accept/refuse split, different
+                // message text - recorded in `docs/roadmap.md`.
+                if sig > MAX_IDENT_CHARS || (n > 0 && sig == 0) {
+                    return Some((at_line, at_col));
+                }
+            }
+            '-' if b.get(i + 1) == Some(&'-') => {
+                while i < b.len() && b[i] != '\n' {
+                    step!();
+                }
+            }
+            '/' if b.get(i + 1) == Some(&'*') => {
+                step!();
+                step!();
+                while i < b.len() && !(b[i] == '*' && b.get(i + 1) == Some(&'/')) {
+                    step!();
+                }
+                if i < b.len() {
+                    step!();
+                    step!();
+                }
+            }
+            c if c.is_ascii_alphabetic() || c == '_' => {
+                let (at_line, at_col) = (line, col);
+                let mut n = 0usize;
+                while i < b.len() && (b[i].is_ascii_alphanumeric() || matches!(b[i], '_' | '$')) {
+                    step!();
+                    n += 1;
+                }
+                if n > MAX_IDENT_CHARS {
+                    return Some((at_line, at_col));
+                }
+            }
+            c if c.is_ascii_digit() => {
+                // a NUMERIC literal, however long, is not a name
+                while i < b.len() && (b[i].is_ascii_alphanumeric() || matches!(b[i], '_' | '$')) {
+                    step!();
+                }
+            }
+            _ => step!(),
+        }
+    }
+    None
+}
+
 /// Find `word` (already uppercase) occurring as a whole word (identifier
 /// boundaries on both sides) in `up`, at or after byte `from`.
 fn find_word(up: &str, word: &str, from: usize) -> Option<usize> {
@@ -65074,6 +66050,30 @@ fn find_word_depth0(masked_up: &str, word: &str, from: usize) -> Option<usize> {
     }
 }
 
+/// Where a `CONSTRAINT <name>` prefix immediately ahead of the keyword
+/// at `kw` begins, in masked, uppercased SQL - the start of the WHOLE
+/// clause, name and all. None when the keyword carries no such prefix.
+fn constraint_prefix_start(masked_up: &str, kw: usize) -> Option<usize> {
+    let head = masked_up[..kw].trim_end();
+    let sp = head.rfind(char::is_whitespace)?; // the name
+    let before = head[..sp].trim_end();
+    let start = before.len().checked_sub("CONSTRAINT".len())?;
+    // the last ten BYTES may end inside a multi-byte character (a
+    // non-ASCII word before the keyword), and slicing off a boundary
+    // panics - which on this thread costs the client its connection
+    if !before.is_char_boundary(start) {
+        return None;
+    }
+    if &before[start..] != "CONSTRAINT" {
+        return None;
+    }
+    // a whole word: `XCONSTRAINT` is not one
+    if start > 0 && is_ident_byte(before.as_bytes()[start - 1]) {
+        return None;
+    }
+    Some(start)
+}
+
 fn find_kw_by(up: &str, kw: &str) -> Option<(usize, usize)> {
     let mut result = None;
     let mut from = 0;
@@ -73902,8 +74902,22 @@ fn retain_end(database: &mut Option<Database>, kept: Retained, committed: bool) 
     }
 }
 
-fn end_transaction(database: &mut Option<Database>, outcome: TxEnd) {
-    let Some(db) = database.as_mut() else { return };
+/// End the transaction the way `outcome` says, and ANSWER WHETHER THE
+/// WRITE THAT ENDS IT SUCCEEDED.
+///
+/// A commit is a disk write like any other and it can fail - a file
+/// whose permissions changed under an open attachment, a full disk, a
+/// filesystem gone read-only. This used to trace the error under
+/// `FC_SRV_TRACE` and return nothing, so the wire answered the client a
+/// clean `op_response`: the whole transaction - every INSERT, every
+/// CREATE TABLE - was lost with SUCCESS reported, and the client could
+/// not tell. That is the one shape of failure nothing downstream can
+/// detect, and it is the invariant this file's DDL work is about: a
+/// statement either does what it says and reports success, or reports
+/// an error. Every caller must now answer the client the error this
+/// returns (see [respond_write_failed]).
+fn end_transaction(database: &mut Option<Database>, outcome: TxEnd) -> Result<(), String> {
+    let Some(db) = database.as_mut() else { return Ok(()) };
     // AN EVENT IS COUNTED AT COMMIT, and swallowed by a rollback. The
     // transaction's posts have been sitting in the event table since the
     // statements that made them; this is where they become counter moves
@@ -73960,12 +74974,18 @@ fn end_transaction(database: &mut Option<Database>, outcome: TxEnd) {
         // else will write
         TxEnd::RollbackNoImage => db.kill_tx(),
     };
-    if let Err(e) = r {
+    if let Err(e) = &r {
         if std::env::var("FC_SRV_TRACE").is_ok() {
             eprintln!("[srv] ending the transaction: {}", e);
         }
     }
+    // THE WRITE SIDE GOES BACK EITHER WAY. A commit whose flush failed
+    // has not written, but it is over: holding the side would leave the
+    // file locked against every other attachment for the life of this
+    // one. What the failure must NOT do is disappear - see the doc
+    // comment above.
     db.end_write();
+    r
 }
 
 /// How a transaction ended, which decides what its TIP entry becomes.
@@ -74129,7 +75149,9 @@ fn insert_select(
 }
 
 /// A backup's RDB$UPDATE_RULE / RDB$DELETE_RULE spelling as the
-/// RefAction it names. "NO ACTION" is the catalog's RESTRICT.
+/// RefAction it names. "NO ACTION" is its OWN rule, not RESTRICT - the
+/// engine stores what was written, so a backup taken from a NO ACTION
+/// key restores to a NO ACTION key.
 /// `MERGE INTO <t> [[AS] a] USING <s | (subselect)> [[AS] b] ON <cond>
 /// {WHEN MATCHED [AND c] THEN UPDATE SET ... | DELETE | WHEN NOT MATCHED
 /// [BY TARGET] [AND c] THEN INSERT [(cols)] VALUES (...)}+` (parse.y:7579).
@@ -75057,7 +76079,11 @@ fn merge_exec(
 
 fn restore_ref_action(rule: &str) -> Result<fire_crab_ods::ddl::RefAction, String> {
     Ok(match rule.trim() {
-        "" | "RESTRICT" | "NO ACTION" => fire_crab_ods::ddl::RefAction::Restrict,
+        // an ABSENT rule and an explicit RESTRICT both read RESTRICT;
+        // NO ACTION is its own stored rule and comes back as itself, so
+        // a backup taken from a NO ACTION key restores to one
+        "" | "RESTRICT" => fire_crab_ods::ddl::RefAction::Restrict,
+        "NO ACTION" => fire_crab_ods::ddl::RefAction::NoAction,
         "CASCADE" => fire_crab_ods::ddl::RefAction::Cascade,
         "SET NULL" => fire_crab_ods::ddl::RefAction::SetNull,
         "SET DEFAULT" => fire_crab_ods::ddl::RefAction::SetDefault,
@@ -76402,6 +77428,11 @@ fn run_dyn_statement(
         return Err(psql_raise(EvalErr::EmptyStatementText));
     }
     if has_unknown_space(sql) {
+        return Err(PsqlStop::Unsupported);
+    }
+    // a name past the catalog's name column refuses here too - a body
+    // that builds one must not write it truncated ([stmt_name_too_long])
+    if stmt_name_too_long(sql).is_some() {
         return Err(PsqlStop::Unsupported);
     }
     let up = sql.trim_start().to_ascii_uppercase();
@@ -82057,6 +83088,14 @@ fn after_auth(
                     respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
                     continue;
                 }
+                // ...and so does a name longer than the catalog's name
+                // column, with the engine's own -104 (see
+                // [stmt_name_too_long]): WRITING it truncated to 63
+                // collides two objects into one catalog row
+                if let Some((l, c)) = stmt_name_too_long(&text) {
+                    respond_name_too_long(&mut s, &mut enc, l, c)?;
+                    continue;
+                }
                 // WHAT THE ANSWER'S OBJECT FIELD CARRIES: the handle
                 // the transaction has after this statement - the new one
                 // when the statement started it, otherwise the one the
@@ -82182,6 +83221,14 @@ fn after_auth(
                     respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
                     continue;
                 }
+                // ...and so does a name longer than the catalog's name
+                // column, with the engine's own -104 (see
+                // [stmt_name_too_long]): WRITING it truncated to 63
+                // collides two objects into one catalog row
+                if let Some((l, c)) = stmt_name_too_long(&text) {
+                    respond_name_too_long(&mut s, &mut enc, l, c)?;
+                    continue;
+                }
                 let (p, _ps) = plan_query(&text, &database);
                 // op_sql_response carries the single output message (a
                 // scalar row: 4-byte null bitmap then the BIGINT), then a
@@ -82302,6 +83349,14 @@ fn after_auth(
                     plan = std::rc::Rc::new(Plan::Refused);
                     stmt_params = std::rc::Rc::new(Vec::new());
                     respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
+                    continue;
+                }
+                // ...and so does a name longer than the catalog's name
+                // column (see [stmt_name_too_long])
+                if let Some((l, c)) = stmt_name_too_long(&stmt_sql) {
+                    plan = std::rc::Rc::new(Plan::Refused);
+                    stmt_params = std::rc::Rc::new(Vec::new());
+                    respond_name_too_long(&mut s, &mut enc, l, c)?;
                     continue;
                 }
                 let up = stmt_sql.trim_start().to_ascii_uppercase();
@@ -82867,12 +83922,25 @@ fn after_auth(
                         // the write side goes back AFTER the generators
                         // have been written forward over the restored
                         // image - that write needs it too
-                        end_transaction(&mut database, outcome);
+                        // A COMMIT THAT COULD NOT WRITE IS AN ERROR, not
+                        // a quiet loss of everything the transaction did
+                        let ended = end_transaction(&mut database, outcome);
                         if let Some(kept) = kept {
-                            retain_end(&mut database, kept, matches!(outcome, TxEnd::Commit));
+                            retain_end(
+                                &mut database,
+                                kept,
+                                matches!(outcome, TxEnd::Commit) && ended.is_ok(),
+                            );
                         }
                         last_dml = (0, 0, 0);
-                        respond(&mut s, &mut enc, resp_tx)?;
+                        match ended {
+                            Ok(()) => respond(&mut s, &mut enc, resp_tx)?,
+                            Err(e) => {
+                                let path =
+                                    database.as_ref().map(|d| d.path.clone()).unwrap_or_default();
+                                respond_write_failed(&mut s, &mut enc, &path, &e)?;
+                            }
+                        }
                     } else if let Plan::Returning { inner, cols, fields, new_cols } = &*plan {
                         // the DML runs HERE, like every other write, and
                         // the rows it touched become the cursor the client
@@ -84739,9 +85807,15 @@ fn after_auth(
                     reset_gen_windows(&mut database);
                     TxEnd::Commit
                 };
-                end_transaction(&mut database, outcome);
+                // A COMMIT THAT COULD NOT WRITE IS AN ERROR (the op_commit
+                // half of the same rule the COMMIT statement follows)
+                let ended = end_transaction(&mut database, outcome);
                 if let Some(kept) = kept {
-                    retain_end(&mut database, kept, matches!(outcome, TxEnd::Commit));
+                    retain_end(
+                        &mut database,
+                        kept,
+                        matches!(outcome, TxEnd::Commit) && ended.is_ok(),
+                    );
                 }
                 // A RETAINING form keeps its handle - the transaction
                 // goes on with the same one (server.cpp:3466 releases
@@ -84756,7 +85830,13 @@ fn after_auth(
                 // the set changed: one fewer, or the same one retained
                 // under a new id
                 publish_txs(&database, attach_id);
-                respond(&mut s, &mut enc, 0)?;
+                match ended {
+                    Ok(()) => respond(&mut s, &mut enc, 0)?,
+                    Err(e) => {
+                        let path = database.as_ref().map(|d| d.path.clone()).unwrap_or_default();
+                        respond_write_failed(&mut s, &mut enc, &path, &e)?;
+                    }
+                }
             }
             x if x == OP_CANCEL => {
                 // The C++ fbclient configures async cancellation right after
@@ -87348,6 +88428,93 @@ pub fn serve(addr: &str, user: &str, password: &str) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
+    /// A Database with no file behind it - the empty detached image the
+    /// row-source tests use, which is all a write that must FAIL needs.
+    fn detached_db(path: &str) -> Database {
+        Database {
+            shared: fire_crab_cch::pool::detached(Vec::new()),
+            write: None,
+            tx: None,
+            gen_cache: std::collections::HashMap::new(),
+            temp_blobs: std::collections::HashMap::new(),
+            next_temp_blob: 0,
+            touched: false,
+            posted: std::cell::RefCell::new(Vec::new()),
+            events: events_for(path),
+            meta: crate::mdc::for_path(path),
+            stmts: Default::default(),
+            locks: crate::dblocks::for_path(path),
+            lock_owner: 0,
+            did_ddl: false,
+            has_db_triggers: false,
+            has_ddl_triggers: false,
+            ddl_deferred: Vec::new(),
+            attachments: {
+                let g = std::sync::Arc::new(DbGate::default());
+                g.attaches.store(1, std::sync::atomic::Ordering::SeqCst);
+                g
+            },
+            my_kick_gen: 0,
+            counted_tx: false,
+            val_counts: None,
+            nested_tx: Vec::new(),
+            page_size: 4096,
+            path: path.to_string(),
+            ods_major: 14,
+            ods_minor: 0,
+            windows: Vec::new(),
+            txns: std::collections::HashMap::new(),
+            cur_handle: 0,
+            savepoints: Vec::new(),
+            prepared: false,
+            next_tx_handle: FIRST_TX_HANDLE,
+            snapshot: None,
+            autonomous_ids: Vec::new(),
+            wait: true,
+            lock_timeout: None,
+            consistency: false,
+            read_only: false,
+            attach_name: String::new(),
+        }
+    }
+
+    /// A COMMIT WHOSE WRITE FAILS IS AN ERROR THE CALLER GETS BACK.
+    /// [end_transaction] used to return `()`: it traced the commit's
+    /// own `Err` under FC_SRV_TRACE and the wire then answered a clean
+    /// op_response, so a transaction that could not be written was
+    /// reported COMMITTED and everything it did was lost silently.
+    #[test]
+    fn a_commit_that_cannot_be_written_reports_the_error() {
+        // a transaction with something to lose, over an image no write
+        // can land on
+        let mut db = detached_db("/nonexistent/fc-endtx-test");
+        db.touched = true;
+        let mut database = Some(db);
+        let e = end_transaction(&mut database, TxEnd::Commit)
+            .expect_err("a commit that cannot write must not answer success");
+        assert!(!e.is_empty(), "the failure reached the caller with no reason");
+        // ...and the write side went back all the same: a failed commit
+        // must not leave the file held
+        assert!(database.as_ref().unwrap().write.is_none());
+        // a transaction that wrote NOTHING still ends cleanly - there is
+        // nothing to put on the disk and nothing to lose
+        let mut idle = Some(detached_db("/nonexistent/fc-endtx-test"));
+        assert!(end_transaction(&mut idle, TxEnd::Commit).is_ok());
+        // and no database at all is not a failure either
+        assert!(end_transaction(&mut None, TxEnd::Commit).is_ok());
+    }
+
+    /// The vector such a failure answers is an ERROR the client raises
+    /// on, never a success: `isc_io_error` decides the SQLSTATE and the
+    /// `isc_random` text carries the reason.
+    #[test]
+    fn the_failed_write_vector_is_an_error_state() {
+        let state = crate::gdscodes::sqlstate_of(&[GDS_IO_ERROR, GDS_RANDOM]);
+        assert_ne!(state, "00000", "a failed commit must not read as success");
+        assert_eq!(GDS_IO_ERROR, 335544344); // isc_io_error
+        assert_eq!(GDS_RANDOM, 335544382); // isc_random - "@1"
+    }
+
     /// The DPB items gfix's switches turn into, read out of a dpb.
     ///
     /// The MULTI-ITEM case is here rather than in a gate because no
@@ -88534,6 +89701,7 @@ mod tests {
             precision: None,
             not_null: false,
             not_null_constraint: false,
+            not_null_at: 0,
             default: None,
             domain: None,
             identity: None,
@@ -94722,6 +95890,326 @@ mod tests {
         assert_eq!(tr.quoted_name(), "\"PUBLIC\".\"EMP\"");
     }
 
+    /// A: THE NAME LENGTH IS 63 CHARACTERS, ON EVERY NAMING PATH.
+    ///
+    /// Measured against Firebird 6 over this project's own transport:
+    /// 30 naming paths x two lengths, 63 accepted by both servers and
+    /// 64 refused by the engine with `-104` / "Name longer than
+    /// database column size" at the token's own (line, column).
+    #[test]
+    fn a_name_may_be_sixty_three_characters_and_no_more() {
+        let n = |c: char, k: usize| c.to_string().repeat(k);
+        let k63 = n('K', 63);
+        let k64 = n('K', 64);
+        // EVERY naming path, at the limit: nothing refuses
+        for ok in [
+            format!("CREATE TABLE {} (A INTEGER)", k63),
+            format!("CREATE TABLE T ({} INTEGER)", k63),
+            format!("CREATE DOMAIN {} AS INTEGER", k63),
+            format!("CREATE INDEX {} ON T (A)", k63),
+            format!("CREATE TABLE T (A INTEGER NOT NULL, CONSTRAINT {} PRIMARY KEY (A))", k63),
+            format!("CREATE TABLE T (A INTEGER NOT NULL, CONSTRAINT {} UNIQUE (A))", k63),
+            format!("CREATE TABLE T (A INTEGER, CONSTRAINT {} FOREIGN KEY (A) REFERENCES P)", k63),
+            format!("CREATE TABLE T (A INTEGER, CONSTRAINT {} CHECK (A > 0))", k63),
+            format!("CREATE TABLE T (A INTEGER CONSTRAINT {} CHECK (A > 0))", k63),
+            format!("CREATE TABLE T (A INTEGER CONSTRAINT {} REFERENCES P)", k63),
+            format!("CREATE TABLE T (A INTEGER NOT NULL CONSTRAINT {} UNIQUE)", k63),
+            format!("ALTER TABLE T ADD CONSTRAINT {} FOREIGN KEY (A) REFERENCES P", k63),
+            format!("ALTER TABLE T ADD {} INTEGER", k63),
+            format!("CREATE TRIGGER {} FOR T BEFORE INSERT AS BEGIN EXIT; END", k63),
+            format!("CREATE GENERATOR {}", k63),
+            format!("CREATE SEQUENCE {}", k63),
+            format!("CREATE PROCEDURE {} AS BEGIN EXIT; END", k63),
+            format!("CREATE VIEW {} AS SELECT A FROM T", k63),
+            format!("CREATE EXCEPTION {} 'x'", k63),
+            format!("CREATE TABLE \"{}\" (A INTEGER)", k63),
+            format!("CREATE TABLE T (\"{}\" INTEGER)", k63),
+            format!("CREATE INDEX \"{}\" ON T (A)", k63),
+            format!("CREATE DOMAIN \"{}\" AS INTEGER", k63),
+            format!("SELECT {} FROM T", k63),
+            format!("SELECT A AS {} FROM T", k63),
+        ] {
+            assert_eq!(stmt_name_too_long(&ok), None, "{}", ok);
+        }
+        // and one character past it, every one refuses
+        for bad in [
+            format!("CREATE TABLE {} (A INTEGER)", k64),
+            format!("CREATE TABLE T ({} INTEGER)", k64),
+            format!("CREATE DOMAIN {} AS INTEGER", k64),
+            format!("CREATE INDEX {} ON T (A)", k64),
+            format!("CREATE TABLE T (A INTEGER NOT NULL, CONSTRAINT {} PRIMARY KEY (A))", k64),
+            format!("CREATE TABLE T (A INTEGER, CONSTRAINT {} FOREIGN KEY (A) REFERENCES P)", k64),
+            format!("CREATE TABLE T (A INTEGER CONSTRAINT {} CHECK (A > 0))", k64),
+            format!("CREATE TABLE T (A INTEGER CONSTRAINT {} REFERENCES P)", k64),
+            format!("ALTER TABLE T ADD CONSTRAINT {} FOREIGN KEY (A) REFERENCES P", k64),
+            format!("ALTER TABLE T ADD {} INTEGER", k64),
+            format!("CREATE GENERATOR {}", k64),
+            format!("CREATE VIEW {} AS SELECT A FROM T", k64),
+            format!("CREATE EXCEPTION {} 'x'", k64),
+            format!("CREATE TABLE \"{}\" (A INTEGER)", k64),
+            format!("CREATE TABLE T (\"{}\" INTEGER)", k64),
+            format!("SELECT {} FROM T", k64),
+            format!("SELECT A AS {} FROM T", k64),
+            format!("SELECT A FROM T \"{}\"", k64),
+        ] {
+            assert!(stmt_name_too_long(&bad).is_some(), "{}", bad);
+        }
+        // CHARACTERS, NOT BYTES: 63 A-umlauts is 126 bytes and legal,
+        // 64 of them is not (the engine refuses on the character count)
+        assert_eq!(
+            stmt_name_too_long(&format!("CREATE TABLE \"{}\" (A INTEGER)", n('\u{c4}', 63))),
+            None
+        );
+        assert!(stmt_name_too_long(&format!(
+            "CREATE TABLE \"{}\" (A INTEGER)",
+            n('\u{c4}', 64)
+        ))
+        .is_some());
+        // a doubled inner quote is ONE character
+        assert_eq!(
+            stmt_name_too_long(&format!("CREATE TABLE \"{}\"\"\" (A INTEGER)", n('K', 62))),
+            None
+        );
+        assert!(stmt_name_too_long(&format!(
+            "CREATE TABLE \"{}\"\"\" (A INTEGER)",
+            n('K', 63)
+        ))
+        .is_some());
+        // ONLY WHAT THE LEXER SEES: a literal, either comment form and a
+        // numeric literal are all exempt, however long
+        assert_eq!(stmt_name_too_long(&format!("SELECT '{}' FROM T", n('x', 200))), None);
+        assert_eq!(stmt_name_too_long(&format!("SELECT 1 FROM T -- {}", n('x', 200))), None);
+        assert_eq!(stmt_name_too_long(&format!("SELECT 1 /* {} */ FROM T", n('x', 200))), None);
+        assert_eq!(stmt_name_too_long(&format!("SELECT {} FROM T", n('9', 200))), None);
+        assert_eq!(
+            stmt_name_too_long(&format!(
+                "CREATE TABLE T (A VARCHAR(300) DEFAULT '{}')",
+                n('x', 200)
+            )),
+            None
+        );
+        // and a doubled quote inside a literal does not end it
+        assert_eq!(stmt_name_too_long(&format!("SELECT 'it''s {}' FROM T", n('x', 200))), None);
+        // THE POSITION IS THE TOKEN'S OWN, counted the way the engine's
+        // isc_dsql_line_col_error counts (measured through isql against
+        // both servers: identical text, identical numbers)
+        assert_eq!(
+            stmt_name_too_long(&format!("CREATE TABLE T{} (A INTEGER)", k64)),
+            Some((1, 14))
+        );
+        assert_eq!(
+            stmt_name_too_long(&format!("CREATE TABLE TCB ({} INTEGER)", k64)),
+            Some((1, 19))
+        );
+        assert_eq!(stmt_name_too_long(&format!("SELECT {} FROM T", k64)), Some((1, 8)));
+        assert_eq!(stmt_name_too_long(&format!("SELECT A FROM T \"{}\"", k64)), Some((1, 17)));
+        // a CR, an LF and a CRLF each end ONE line
+        assert_eq!(
+            stmt_name_too_long(&format!("SELECT 1 AS X\n   FROM T\n  WHERE {} = 1", k64)),
+            Some((3, 9))
+        );
+        assert_eq!(
+            stmt_name_too_long(&format!("SELECT 1 AS X\r\n   FROM T\r\n  WHERE {} = 1", k64)),
+            Some((3, 9))
+        );
+    }
+
+    /// A DELIMITED NAME'S TRAILING BLANKS ARE NOT PART OF IT. The engine
+    /// strips them BEFORE applying the 63-character limit, so a 64-
+    /// character delimited name ending in a blank is a legal 63-character
+    /// name there - and both servers already store it trimmed, so
+    /// counting the blank refused a name this server's own writer would
+    /// have written correctly. An INTERNAL blank still counts.
+    #[test]
+    fn a_delimited_names_trailing_blanks_do_not_count() {
+        let n = |c: char, k: usize| c.to_string().repeat(k);
+        // 63 significant characters plus a trailing blank: ACCEPTED
+        assert_eq!(
+            stmt_name_too_long(&format!("CREATE TABLE \"{} \" (A INTEGER)", n('B', 63))),
+            None
+        );
+        // 63 plus THIRTY-SEVEN trailing blanks - 100 characters between
+        // the quotes - is still that same 63-character name
+        assert_eq!(
+            stmt_name_too_long(&format!(
+                "CREATE TABLE \"{}{}\" (A INTEGER)",
+                n('B', 63),
+                n(' ', 37)
+            )),
+            None
+        );
+        // every other naming path the blank reaches
+        assert_eq!(
+            stmt_name_too_long(&format!("CREATE TABLE T (\"{} \" INTEGER)", n('Y', 63))),
+            None
+        );
+        assert_eq!(
+            stmt_name_too_long(&format!(
+                "CREATE TABLE T (A INTEGER, CONSTRAINT \"{} \" CHECK (A > 0))",
+                n('Z', 63)
+            )),
+            None
+        );
+        // 64 SIGNIFICANT characters with a trailing blank is still long
+        assert_eq!(
+            stmt_name_too_long(&format!("CREATE TABLE \"{} \" (A INTEGER)", n('B', 64))),
+            Some((1, 14))
+        );
+        // an INTERNAL blank counts: 31 + blank + 32 = 64
+        assert_eq!(
+            stmt_name_too_long(&format!(
+                "CREATE TABLE \"{} {}\" (A INTEGER)",
+                n('D', 31),
+                n('D', 32)
+            )),
+            Some((1, 14))
+        );
+        // ... and a blank RUN inside the name counts too: 60 + 2 + 1 = 63
+        assert_eq!(
+            stmt_name_too_long(&format!(
+                "CREATE TABLE \"{}  {}\" (A INTEGER)",
+                n('E', 60),
+                n('E', 1)
+            )),
+            None
+        );
+        // 61 + 2 + 1 = 64
+        assert_eq!(
+            stmt_name_too_long(&format!(
+                "CREATE TABLE \"{}  {}\" (A INTEGER)",
+                n('E', 61),
+                n('E', 1)
+            )),
+            Some((1, 14))
+        );
+        // a doubled inner quote is one character, and it is not blank
+        assert_eq!(
+            stmt_name_too_long(&format!("CREATE TABLE \"{}\"\" \" (A INTEGER)", n('F', 62))),
+            None
+        );
+        assert_eq!(
+            stmt_name_too_long(&format!("CREATE TABLE \"{}\"\" \" (A INTEGER)", n('F', 63))),
+            Some((1, 14))
+        );
+        // a name of NOTHING BUT BLANKS is refused at every length: the
+        // engine refuses it too (`-104 Zero length identifiers not
+        // permitted`), and trimming it away had fire-crab writing a
+        // relation with a blank name
+        assert_eq!(
+            stmt_name_too_long(&format!("CREATE TABLE \"{}\" (A INTEGER)", n(' ', 80))),
+            Some((1, 14))
+        );
+        assert_eq!(
+            stmt_name_too_long("CREATE TABLE \"   \" (A INTEGER)"),
+            Some((1, 14))
+        );
+        assert_eq!(stmt_name_too_long("CREATE TABLE T (\"  \" INTEGER)"), Some((1, 17)));
+        // an EMPTY delimited run is left to the refusal it already has
+        assert_eq!(stmt_name_too_long("CREATE TABLE \"\" (A INTEGER)"), None);
+        // an UNTERMINATED quoted run with trailing blanks: no panic
+        assert_eq!(stmt_name_too_long(&format!("CREATE TABLE \"{}  ", n('G', 63))), None);
+        assert_eq!(
+            stmt_name_too_long(&format!("CREATE TABLE \"{}  ", n('G', 64))),
+            Some((1, 14))
+        );
+    }
+
+    /// A SEGMENT-LESS DEFERRED-DROP PARTNERSHIP STILL ASKS THE EXACT
+    /// QUESTION. The child's key columns come back from the surviving
+    /// index-root descriptor ([index_root_key_fids]), so the parent-side
+    /// check is [row_carries_key_at] on THOSE columns - not "does any
+    /// column of any child row hold this value".
+    ///
+    /// The shape is the one that made the wide test unshippable: an
+    /// order table whose `STATUS` and `QTY` columns hold small integers
+    /// that collide with the parent's keys, and whose FK column is the
+    /// last one. Deleting `ID = 2` or `ID = 3` must be ACCEPTED (the
+    /// engine accepts both); deleting `ID = 1` must be REFUSED.
+    #[test]
+    fn a_dropped_key_is_still_tested_on_its_own_columns() {
+        // ORD (OID, STATUS, QTY, PID) holding (100, 2, 3, 1); the
+        // dropped FK keyed on PID, field 3
+        let row = [Value::Int(100), Value::Int(2), Value::Int(3), Value::Int(1)];
+        let pid = [3usize];
+        let k = |n: i64| Value::Int(n);
+        // the REFERENCED key is still refused
+        assert!(row_carries_key_at(&row, &pid, &[&k(1)]));
+        // STATUS = 2 and QTY = 3 are NOT references - the whole defect
+        assert!(!row_carries_key_at(&row, &pid, &[&k(2)]));
+        assert!(!row_carries_key_at(&row, &pid, &[&k(3)]));
+        // ... and neither is OID = 100
+        assert!(!row_carries_key_at(&row, &pid, &[&k(100)]));
+        // a NULL key column references nothing
+        let nullrow = [Value::Int(100), Value::Int(2), Value::Int(3), Value::Null];
+        assert!(!row_carries_key_at(&nullrow, &pid, &[&k(1)]));
+        // a COMPOUND dropped key: both columns, in key order
+        let crow = [Value::Int(9), Value::Int(1), Value::Int(2)];
+        assert!(row_carries_key_at(&crow, &[1, 2], &[&k(1), &k(2)]));
+        assert!(!row_carries_key_at(&crow, &[1, 2], &[&k(2), &k(1)]));
+        // a field id past the row's end answers "no reference", never a
+        // panic
+        assert!(!row_carries_key_at(&row, &[99], &[&k(1)]));
+        // the wide test - the last resort, kept for a descriptor this
+        // server cannot read - would have refused all three
+        assert!(row_could_carry_key(&row, &[&k(2)]));
+        assert!(row_could_carry_key(&row, &[&k(3)]));
+    }
+
+    /// B: A SEGMENT-LESS DEFERRED-DROP INDEX ROW IS NOT THE SAME ANSWER
+    /// ON THE TWO SIDES. The child's own DML must not refuse on it (the
+    /// round before proved that), and the parent's referenced-by check
+    /// must still see it - the engine goes on enforcing from that row,
+    /// so skipping it on the parent side DELETED A ROW THE ENGINE KEEPS.
+    ///
+    /// [row_could_carry_key] is now the LAST RESORT only (a descriptor
+    /// this server cannot read); it is still what it was, and still
+    /// sound in the direction that costs data.
+    #[test]
+    fn an_opaque_partnership_answers_the_widest_sound_question() {
+        let one = Value::Int(1);
+        let nine = Value::Int(9);
+        let forty = Value::Int(40);
+        // the child row (40, 1) carries the parent key 1 - in its
+        // SECOND column, which is the one the dropped constraint keyed
+        assert!(row_could_carry_key(&[forty.clone(), one.clone()], &[&one]));
+        // ...and does not carry 9 or 3
+        assert!(!row_could_carry_key(&[forty.clone(), one.clone()], &[&nine]));
+        assert!(!row_could_carry_key(&[forty.clone(), one.clone()], &[&Value::Int(3)]));
+        // a NULL column references nothing
+        assert!(!row_could_carry_key(&[Value::Null, Value::Null], &[&one]));
+        assert!(!row_could_carry_key(&[], &[&one]));
+        // a COMPOUND key needs every one of its values present
+        assert!(row_could_carry_key(&[one.clone(), forty.clone()], &[&one, &forty]));
+        assert!(!row_could_carry_key(&[one.clone(), nine.clone()], &[&one, &forty]));
+    }
+
+    /// C: `RESTRICT` IS NOT A WORD THE GRAMMAR HAS. It is the value
+    /// Firebird STORES for an omitted clause; `ON DELETE RESTRICT` is a
+    /// `-104 Token unknown - RESTRICT` on the engine (measured, inline
+    /// and table-level alike). The four real actions still parse.
+    #[test]
+    fn restrict_is_stored_but_never_written() {
+        use fire_crab_ods::ddl::RefAction;
+        assert!(parse_ref_actions("") == Some((RefAction::Restrict, RefAction::Restrict)));
+        assert!(
+            parse_ref_actions("ON DELETE CASCADE")
+                == Some((RefAction::Restrict, RefAction::Cascade))
+        );
+        assert!(
+            parse_ref_actions("ON UPDATE NO ACTION ON DELETE NO ACTION")
+                == Some((RefAction::NoAction, RefAction::NoAction))
+        );
+        assert!(
+            parse_ref_actions("ON UPDATE SET NULL ON DELETE SET DEFAULT")
+                == Some((RefAction::SetNull, RefAction::SetDefault))
+        );
+        assert!(parse_ref_actions("ON DELETE RESTRICT").is_none());
+        assert!(parse_ref_actions("ON UPDATE RESTRICT").is_none());
+        assert!(parse_ref_actions("ON UPDATE RESTRICT ON DELETE RESTRICT").is_none());
+        assert!(parse_ref_actions("ON UPDATE CASCADE ON DELETE RESTRICT").is_none());
+    }
+
+
     #[test]
     fn canon_ident_is_the_one_rule() {
         // a bare word FOLDS; a quoted name is EXACT, `""` unescaped
@@ -94848,7 +96336,9 @@ mod tests {
         let keys: Vec<(String, Vec<String>, bool)> = constraints
             .iter()
             .filter_map(|c| match c {
-                fire_crab_ods::ddl::TableConstraint::Key(k) => Some((k.name.clone(), k.columns.clone(), k.primary)),
+                fire_crab_ods::ddl::TableConstraint {
+                    kind: fire_crab_ods::ddl::ConstraintKind::Key(k), ..
+                } => Some((k.name.clone(), k.columns.clone(), k.primary)),
                 _ => None,
             })
             .collect();
@@ -95863,40 +97353,43 @@ mod tests {
     #[test]
     fn parses_foreign_key_clauses() {
         // named FK with an explicit referenced-column list
-        let fk = parse_fk_clause("CONSTRAINT FK_C_P FOREIGN KEY (PID) REFERENCES P (PID)").unwrap();
+        let fk = parse_fk_clause("CONSTRAINT FK_C_P FOREIGN KEY (PID) REFERENCES P (PID)", fire_crab_ods::ddl::ConstraintPlace::Table { decl: 0 }).unwrap();
         assert_eq!(fk.name, "FK_C_P");
         assert_eq!(fk.columns, vec!["PID".to_string()]);
         assert_eq!(fk.ref_table, "P");
         assert_eq!(fk.ref_columns, vec!["PID".to_string()]);
         // unnamed FK, referenced columns omitted (default to the PK)
-        let fk = parse_fk_clause("FOREIGN KEY (A, B) REFERENCES OTHER").unwrap();
+        let fk = parse_fk_clause("FOREIGN KEY (A, B) REFERENCES OTHER", fire_crab_ods::ddl::ConstraintPlace::Table { decl: 0 }).unwrap();
         assert_eq!(fk.name, "");
         assert_eq!(fk.columns, vec!["A".to_string(), "B".to_string()]);
         assert_eq!(fk.ref_table, "OTHER");
         assert!(fk.ref_columns.is_empty());
         // a plain column definition and a PRIMARY KEY clause are not FKs
-        assert!(parse_fk_clause("PID INTEGER").is_none());
-        assert!(parse_fk_clause("PRIMARY KEY (ID)").is_none());
+        assert!(parse_fk_clause("PID INTEGER", fire_crab_ods::ddl::ConstraintPlace::Table { decl: 0 }).is_none());
+        assert!(parse_fk_clause("PRIMARY KEY (ID)", fire_crab_ods::ddl::ConstraintPlace::Table { decl: 0 }).is_none());
         // referential actions
         use fire_crab_ods::ddl::RefAction;
         let fk = parse_fk_clause(
             "FOREIGN KEY (MID) REFERENCES MASTER (ID) ON DELETE CASCADE ON UPDATE CASCADE",
+            fire_crab_ods::ddl::ConstraintPlace::Table { decl: 0 },
         )
         .unwrap();
         assert!(fk.on_delete == RefAction::Cascade && fk.on_update == RefAction::Cascade);
         // single action; the unspecified one defaults to RESTRICT; no
         // explicit ref columns before the ON clause
-        let fk = parse_fk_clause("FOREIGN KEY (MID) REFERENCES MASTER ON DELETE CASCADE").unwrap();
+        let fk = parse_fk_clause("FOREIGN KEY (MID) REFERENCES MASTER ON DELETE CASCADE", fire_crab_ods::ddl::ConstraintPlace::Table { decl: 0 }).unwrap();
         assert_eq!(fk.ref_table, "MASTER");
         assert!(fk.on_delete == RefAction::Cascade && fk.on_update == RefAction::Restrict);
-        // NO ACTION collapses to RESTRICT; SET NULL is modelled; SET
-        // DEFAULT is not (falls back)
-        let fk = parse_fk_clause("FOREIGN KEY (MID) REFERENCES M ON DELETE NO ACTION").unwrap();
-        assert!(fk.on_delete == RefAction::Restrict);
-        let fk = parse_fk_clause("FOREIGN KEY (MID) REFERENCES M ON DELETE SET NULL").unwrap();
+        // NO ACTION is its OWN action - it behaves as RESTRICT but the
+        // engine STORES the rule that was written, and folding the two
+        // together wrote RESTRICT into a file where the engine writes
+        // NO ACTION (measured). SET NULL and SET DEFAULT are modelled.
+        let fk = parse_fk_clause("FOREIGN KEY (MID) REFERENCES M ON DELETE NO ACTION", fire_crab_ods::ddl::ConstraintPlace::Table { decl: 0 }).unwrap();
+        assert!(fk.on_delete == RefAction::NoAction && fk.on_update == RefAction::Restrict);
+        let fk = parse_fk_clause("FOREIGN KEY (MID) REFERENCES M ON DELETE SET NULL", fire_crab_ods::ddl::ConstraintPlace::Table { decl: 0 }).unwrap();
         assert!(fk.on_delete == RefAction::SetNull && fk.on_update == RefAction::Restrict);
         // SET DEFAULT is modelled since inc 112
-        match parse_fk_clause("FOREIGN KEY (MID) REFERENCES M ON DELETE SET DEFAULT") {
+        match parse_fk_clause("FOREIGN KEY (MID) REFERENCES M ON DELETE SET DEFAULT", fire_crab_ods::ddl::ConstraintPlace::Table { decl: 0 }) {
             Some(fk) => {
                 assert!(fk.on_delete == fire_crab_ods::ddl::RefAction::SetDefault);
                 assert!(fk.on_update == fire_crab_ods::ddl::RefAction::Restrict);
@@ -96010,8 +97503,8 @@ mod tests {
             Plan::CreateTable { cols, constraints, .. } => {
                 let keys: Vec<_> = constraints
                     .iter()
-                    .filter_map(|tc| match tc {
-                        fire_crab_ods::ddl::TableConstraint::Key(k) => Some(k),
+                    .filter_map(|tc| match &tc.kind {
+                        fire_crab_ods::ddl::ConstraintKind::Key(k) => Some(k),
                         _ => None,
                     })
                     .collect();
@@ -96270,19 +97763,243 @@ mod tests {
         assert_eq!(substitute_value_word("XVALUE + VALUES", "V"), "XVALUE + VALUES");
     }
 
+    /// A COLUMN-level `REFERENCES` is a FOREIGN KEY wearing column
+    /// syntax - the fourth kind of column-level constraint, and the one
+    /// fire-crab had NO parse path for at all: `B INTEGER REFERENCES P`
+    /// was refused with a bare `Dynamic SQL Error`. It desugars the way
+    /// an inline CHECK does, and it is seated in PASS 1 of the numbering
+    /// law, so `F1 (A INTEGER, UNIQUE (A), B INTEGER REFERENCES P)` is
+    /// numbered FOREIGN KEY first (engine-measured).
+    #[test]
+    fn an_inline_references_is_a_column_level_foreign_key() {
+        use fire_crab_ods::ddl::{ConstraintPlace, RefAction};
+        let plan = |sql: &str| match plan_create_table(sql) {
+            Some((Plan::CreateTable { cols, constraints, fks, .. }, _)) => (cols, constraints, fks),
+            _ => panic!("expected CreateTable for {}", sql),
+        };
+        // R1: the plainest form. The referencing column is the column
+        // being declared; an EMPTY ref_columns means the parent's
+        // PRIMARY KEY, which the writer resolves.
+        let (cols, cs, fks) = plan("CREATE TABLE R1 (A INTEGER, B INTEGER REFERENCES P)");
+        assert_eq!(cols.len(), 2);
+        assert!(cs.is_empty());
+        assert_eq!(fks.len(), 1);
+        assert_eq!(fks[0].columns, vec!["B".to_string()]);
+        assert_eq!(fks[0].ref_table, "P");
+        assert!(fks[0].ref_columns.is_empty());
+        assert!(matches!(fks[0].place, ConstraintPlace::Inline { col: 1, .. }));
+        // R2: on the FIRST column, and R3 with an explicit column list
+        let (_, _, fks) = plan("CREATE TABLE R2 (A INTEGER REFERENCES P)");
+        assert!(matches!(fks[0].place, ConstraintPlace::Inline { col: 0, .. }));
+        let (_, _, fks) = plan("CREATE TABLE R3 (A INTEGER, B INTEGER REFERENCES P (ID))");
+        assert_eq!(fks[0].ref_columns, vec!["ID".to_string()]);
+        // the clause ENDS AT ITS OWN GRAMMAR, so what is written after it
+        // on the same column still reaches the column parser
+        let (cols, cs, fks) =
+            plan("CREATE TABLE R4 (A INTEGER, B INTEGER REFERENCES P NOT NULL UNIQUE)");
+        assert!(cols[1].not_null_constraint);
+        assert_eq!(cs.len(), 1); // the inline UNIQUE
+        assert_eq!(fks.len(), 1);
+        // ... including its referential actions, and a name
+        let (_, _, fks) = plan(
+            "CREATE TABLE R5 (A INTEGER, B INTEGER CONSTRAINT FK_B REFERENCES P (ID) \
+             ON DELETE CASCADE ON UPDATE SET NULL NOT NULL)",
+        );
+        assert_eq!(fks[0].name, "FK_B");
+        assert!(fks[0].on_delete == RefAction::Cascade && fks[0].on_update == RefAction::SetNull);
+        // an inline CHECK and an inline REFERENCES on ONE column, in
+        // EITHER order: neither split swallows the other
+        for sql in [
+            "CREATE TABLE R6 (A INTEGER, B INTEGER CHECK (B > 0) REFERENCES P)",
+            "CREATE TABLE R6 (A INTEGER, B INTEGER REFERENCES P CHECK (B > 0))",
+        ] {
+            let (cols, cs, fks) = plan(sql);
+            assert_eq!(cols.len(), 2, "{}", sql);
+            assert_eq!(cs.len(), 1, "{}", sql);
+            assert_eq!(fks.len(), 1, "{}", sql);
+            assert_eq!(fks[0].columns, vec!["B".to_string()], "{}", sql);
+        }
+        // a REFERENCES inside a CHECK's condition, a string literal or a
+        // quoted identifier is NOT a clause
+        let (cols, cs, fks) =
+            plan("CREATE TABLE R7 (A VARCHAR(20) CHECK (A <> \'REFERENCES P\'), \"REFERENCES\" INTEGER)");
+        assert_eq!(cols.len(), 2);
+        assert_eq!(cs.len(), 1);
+        assert!(fks.is_empty());
+        // F1's SEATS: the inline FK on column 1, the table-level UNIQUE
+        // with a LOWER declaration rank - and the law puts the FK first
+        let (_, cs, fks) = plan("CREATE TABLE F1 (A INTEGER, UNIQUE (A), B INTEGER REFERENCES P)");
+        assert!(matches!(cs[0].place, ConstraintPlace::Table { decl: 1 }));
+        assert!(matches!(fks[0].place, ConstraintPlace::Inline { col: 1, .. }));
+        // G1/G2: two TABLE-level clauses of different kinds carry the
+        // SHARED declaration rank that puts them back in one order
+        let (_, cs, fks) =
+            plan("CREATE TABLE G1 (A INTEGER, B INTEGER, FOREIGN KEY (A) REFERENCES P, UNIQUE (B))");
+        assert!(matches!(fks[0].place, ConstraintPlace::Table { decl: 2 }));
+        assert!(matches!(cs[0].place, ConstraintPlace::Table { decl: 3 }));
+        let (_, cs, fks) =
+            plan("CREATE TABLE G2 (A INTEGER, B INTEGER, UNIQUE (B), FOREIGN KEY (A) REFERENCES P)");
+        assert!(matches!(cs[0].place, ConstraintPlace::Table { decl: 2 }));
+        assert!(matches!(fks[0].place, ConstraintPlace::Table { decl: 3 }));
+    }
+
+    /// NO INPUT MAY PANIC THE CONNECTION THREAD.
+    ///
+    /// `constraint_prefix_start` walks BACKWARDS from a clause keyword
+    /// looking for a `CONSTRAINT <name>` prefix, and it knows nothing of
+    /// the spans already claimed - so on these four shapes it answered a
+    /// start lying INSIDE an earlier clause, and the merged rewrite then
+    /// sliced `item[prev..start]` with `prev > start`:
+    ///
+    /// ```text
+    /// thread '<unnamed>' panicked at crates/wire/src/server.rs:21373:33:
+    /// byte range starts at 36 but ends at 23
+    /// ```
+    ///
+    /// The client saw a DROPPED TCP CONNECTION, not an SQL error, and
+    /// lost its transaction. Two of the four carry no `REFERENCES` at
+    /// all - the hazard came in with the multi-span inline-CHECK
+    /// rewrite. The engine answers all four `-104 Token unknown -
+    /// CONSTRAINT`, so the planner REFUSES them: a `CONSTRAINT` that
+    /// reaches behind the previous clause is a reserved word standing
+    /// inside that clause, and any overlap that survives is refused
+    /// rather than sliced.
+    #[test]
+    fn overlapping_clause_spans_refuse_and_never_slice_backwards() {
+        for sql in [
+            "CREATE TABLE ZC1 (A INTEGER CHECK (A > 0 CONSTRAINT C) CHECK (A < 9))",
+            "CREATE TABLE ZC2 (A INTEGER CONSTRAINT C1 CHECK (A > 0 CONSTRAINT C2) CHECK (A < 9))",
+            "CREATE TABLE ZC5 (A INTEGER CHECK (A > 0 CONSTRAINT C) REFERENCES P)",
+            "CREATE TABLE ZC3 (A INTEGER REFERENCES CONSTRAINT N CHECK (A > 0))",
+        ] {
+            assert!(plan_create_table(sql).is_none(), "must refuse, not panic: {}", sql);
+        }
+        // and the well-formed neighbours still parse: a CONSTRAINT
+        // prefix on each of two clauses, in either order
+        for sql in [
+            "CREATE TABLE ZO1 (A INTEGER CONSTRAINT CK1 CHECK (A > 0) CONSTRAINT FK1 REFERENCES P)",
+            "CREATE TABLE ZO2 (A INTEGER CONSTRAINT FK1 REFERENCES P CONSTRAINT CK1 CHECK (A > 0))",
+            "CREATE TABLE ZO3 (A INTEGER CONSTRAINT CK1 CHECK (A > 0) CONSTRAINT CK2 CHECK (A < 9))",
+        ] {
+            assert!(plan_create_table(sql).is_some(), "must parse: {}", sql);
+        }
+    }
+
+    /// A column may carry MORE THAN ONE inline `REFERENCES` - the engine
+    /// accepts `A INTEGER REFERENCES P REFERENCES Q` and writes two
+    /// foreign keys on it. The CHECK split has always collected a Vec;
+    /// the REFERENCES one returned a single Option and left the second
+    /// clause in the residual, where the column parser choked.
+    #[test]
+    fn a_column_may_carry_two_inline_references() {
+        use fire_crab_ods::ddl::ConstraintPlace;
+        let plan = |sql: &str| match plan_create_table(sql) {
+            Some((Plan::CreateTable { cols, constraints, fks, .. }, _)) => (cols, constraints, fks),
+            _ => panic!("expected CreateTable for {}", sql),
+        };
+        let (cols, _, fks) = plan("CREATE TABLE X3 (A INTEGER REFERENCES P REFERENCES Q)");
+        assert_eq!(cols.len(), 1);
+        assert_eq!(fks.len(), 2);
+        assert_eq!(fks[0].ref_table, "P");
+        assert_eq!(fks[1].ref_table, "Q");
+        for f in &fks {
+            assert_eq!(f.columns, vec!["A".to_string()]);
+            assert!(matches!(f.place, ConstraintPlace::Inline { col: 0, .. }));
+        }
+        // an inline CHECK between them keeps every one of the three
+        let (_, cs, fks) =
+            plan("CREATE TABLE X4 (A INTEGER REFERENCES P CHECK (A > 0) REFERENCES Q)");
+        assert_eq!(cs.len(), 1);
+        assert_eq!(fks.len(), 2);
+    }
+
+    /// `NO ACTION` parses to its OWN action, not to `RESTRICT` - the
+    /// engine stores the rule that was written. And each event may be
+    /// spoken for ONCE: `ON DELETE CASCADE ON DELETE SET NULL` is a
+    /// `-104 Token unknown - DELETE` on the engine, where this parser
+    /// used to let the last clause win and record a rule for a table the
+    /// engine would never have built.
+    #[test]
+    fn no_action_parses_as_itself_and_an_event_is_named_once() {
+        use fire_crab_ods::ddl::RefAction;
+        let fks = |sql: &str| match plan_create_table(sql) {
+            Some((Plan::CreateTable { fks, .. }, _)) => fks,
+            _ => panic!("expected CreateTable for {}", sql),
+        };
+        let f = fks("CREATE TABLE NA1 (A INTEGER REFERENCES P ON DELETE NO ACTION ON UPDATE NO ACTION)");
+        assert!(f[0].on_delete == RefAction::NoAction && f[0].on_update == RefAction::NoAction);
+        let f = fks("CREATE TABLE NA2 (A INTEGER, FOREIGN KEY (A) REFERENCES P ON DELETE NO ACTION)");
+        assert!(f[0].on_delete == RefAction::NoAction && f[0].on_update == RefAction::Restrict);
+        // an omitted rule, and an explicit RESTRICT, are still RESTRICT
+        let f = fks("CREATE TABLE NA3 (A INTEGER REFERENCES P)");
+        assert!(f[0].on_delete == RefAction::Restrict && f[0].on_update == RefAction::Restrict);
+        for sql in [
+            "CREATE TABLE NA4 (A INTEGER REFERENCES P ON DELETE CASCADE ON DELETE SET NULL)",
+            "CREATE TABLE NA5 (A INTEGER REFERENCES P ON UPDATE CASCADE ON UPDATE SET NULL)",
+            "CREATE TABLE NA6 (A INTEGER, FOREIGN KEY (A) REFERENCES P ON DELETE CASCADE ON DELETE SET NULL)",
+        ] {
+            assert!(plan_create_table(sql).is_none(), "must refuse: {}", sql);
+        }
+    }
+
+    /// A `DEFAULT` must PRECEDE every constraint clause on its column -
+    /// the engine's grammar is `<name> <type> [DEFAULT <v>]
+    /// [<constraint> ...]`, and `A INTEGER UNIQUE DEFAULT 7` is a `-104
+    /// Token unknown - DEFAULT` (measured for NOT NULL, UNIQUE, PRIMARY
+    /// KEY, CHECK and REFERENCES alike). The clause splits cut the
+    /// constraints out of the item, so by the time the column parser
+    /// runs the order is gone - it is checked while both are still in
+    /// one string.
+    #[test]
+    fn a_default_written_after_a_constraint_refuses() {
+        for sql in [
+            "CREATE TABLE VD1 (A INTEGER UNIQUE DEFAULT 7, B INTEGER)",
+            "CREATE TABLE VD2 (A INTEGER CHECK (A > 0) DEFAULT 7, B INTEGER)",
+            "CREATE TABLE VD3 (A INTEGER NOT NULL DEFAULT 7, B INTEGER)",
+            "CREATE TABLE VD4 (A INTEGER REFERENCES P DEFAULT 7, B INTEGER)",
+            "CREATE TABLE VD5 (A INTEGER PRIMARY KEY DEFAULT 7, B INTEGER)",
+        ] {
+            assert!(plan_create_table(sql).is_none(), "must refuse: {}", sql);
+        }
+        // written FIRST it is fine, and a `SET DEFAULT` referential
+        // action is not a column DEFAULT at all
+        for sql in [
+            "CREATE TABLE VD6 (A INTEGER DEFAULT 7 NOT NULL, B INTEGER)",
+            "CREATE TABLE VD7 (A INTEGER DEFAULT 7 REFERENCES P, B INTEGER)",
+            "CREATE TABLE VD8 (A INTEGER DEFAULT 7 CHECK (A > 0), B INTEGER)",
+            "CREATE TABLE VD9 (A INTEGER REFERENCES P ON DELETE SET DEFAULT, B INTEGER)",
+            "CREATE TABLE VDA (A INTEGER DEFAULT 7 REFERENCES P ON DELETE SET DEFAULT, B INTEGER)",
+        ] {
+            assert!(plan_create_table(sql).is_some(), "must parse: {}", sql);
+        }
+    }
+
+    /// An INLINE `CHECK` sees only the columns declared SO FAR: the
+    /// engine answers `-206 Column unknown "B"` to `(A INTEGER CHECK
+    /// (B > 0), B INTEGER)` while accepting the same condition written
+    /// as a TABLE-level CHECK, which is resolved once the whole column
+    /// list has been read (both measured).
+    #[test]
+    fn an_inline_check_may_not_name_a_later_column() {
+        assert!(plan_create_table("CREATE TABLE Y9 (A INTEGER CHECK (B > 0), B INTEGER)").is_none());
+        assert!(plan_create_table("CREATE TABLE Y9B (A INTEGER, B INTEGER CHECK (A > 0))").is_some());
+        assert!(plan_create_table("CREATE TABLE Y9C (A INTEGER, CHECK (B > 0), B INTEGER)").is_some());
+        assert!(plan_create_table("CREATE TABLE Y9D (A INTEGER CHECK (A > 0), B INTEGER)").is_some());
+    }
+
     /// Engine-probed golden facts (inc 111): a CHECK constraint compiles
     /// to the if-failed-raise trigger BLR with the NEGATED condition
     /// (fields in context 1), keeps its verbatim source, and slots into
     /// the declaration-ordered constraint list.
     #[test]
     fn check_constraints_compile_to_engine_trigger_blr() {
-        use fire_crab_ods::ddl::TableConstraint;
+        use fire_crab_ods::ddl::ConstraintKind;
         let plan = |sql: &str| match plan_create_table(sql) {
             Some((Plan::CreateTable { constraints, .. }, _)) => constraints,
             _ => panic!("expected CreateTable for {}", sql),
         };
         let cs = plan("CREATE TABLE CK1 (A INTEGER, B INTEGER, CHECK (A > 0))");
-        let TableConstraint::Check(ck) = &cs[0] else { panic!("expected Check") };
+        let ConstraintKind::Check(ck) = &cs[0].kind else { panic!("expected Check") };
         assert_eq!(ck.source, "CHECK (A > 0)");
         assert_eq!(ck.fields, vec!["A".to_string()]);
         let mut want = vec![5u8, 2, 8, 52, 23, 1, 1, 65, 21, 8, 0, 0, 0, 0, 0, 2, 128, 0, 16];
@@ -96296,13 +98013,39 @@ mod tests {
             "CREATE TABLE CK5 (A INTEGER NOT NULL, B INTEGER, CHECK (B > 0), \
              PRIMARY KEY (A), CONSTRAINT CHK_HI CHECK (B < 100))",
         );
-        assert!(matches!(&cs[0], TableConstraint::Check(c) if c.name.is_empty()));
-        assert!(matches!(&cs[1], TableConstraint::Key(k) if k.primary));
-        assert!(matches!(&cs[2], TableConstraint::Check(c) if c.name == "CHK_HI"));
+        assert!(matches!(&cs[0].kind, ConstraintKind::Check(c) if c.name.is_empty()));
+        assert!(matches!(&cs[1].kind, ConstraintKind::Key(k) if k.primary));
+        assert!(matches!(&cs[2].kind, ConstraintKind::Check(c) if c.name == "CHK_HI"));
+        // ...and each carries WHERE it is written: all three stand on
+        // their own in the column list, so all three are TABLE-level -
+        // the pass the engine numbers LAST
+        use fire_crab_ods::ddl::ConstraintPlace;
+        assert_eq!(
+            cs.iter().map(|c| c.place).collect::<Vec<_>>(),
+            // CK5's three clauses are items 2, 3 and 4 of its column list
+            vec![
+                ConstraintPlace::Table { decl: 2 },
+                ConstraintPlace::Table { decl: 3 },
+                ConstraintPlace::Table { decl: 4 },
+            ]
+        );
+        // an INLINE clause carries its column and its offset inside that
+        // column's own text instead, and those are what order pass 1:
+        // `B INTEGER CHECK (B > 0) UNIQUE` writes the CHECK before the
+        // UNIQUE because it is written first
+        let cs = plan("CREATE TABLE CK6 (A INTEGER, B INTEGER CHECK (B > 0) UNIQUE)");
+        let places: Vec<ConstraintPlace> = cs.iter().map(|c| c.place).collect();
+        let ConstraintPlace::Inline { col: 1, at: check_at } = places[0] else {
+            panic!("the inline CHECK is not inline: {:?}", places)
+        };
+        let ConstraintPlace::Inline { col: 1, at: key_at } = places[1] else {
+            panic!("the inline UNIQUE is not inline: {:?}", places)
+        };
+        assert!(check_at < key_at, "{} {}", check_at, key_at);
         // engine-probed: CHECK (A = 1 OR NOT (A >= 10)) stores
         // blr_and(blr_neq, blr_geq) - no blr_not survives
         let cs = plan("CREATE TABLE CK4 (A INTEGER, CHECK (A = 1 OR NOT (A >= 10)))");
-        let TableConstraint::Check(ck) = &cs[0] else { panic!("expected Check") };
+        let ConstraintKind::Check(ck) = &cs[0].kind else { panic!("expected Check") };
         assert_eq!(
             &ck.trigger_blr[3..8],
             &[58, 48, 23, 1, 1] // blr_and, blr_neq, blr_field ctx 1 ...
@@ -96320,7 +98063,7 @@ mod tests {
             Some((Plan::CreateTable { constraints, .. }, _)) => constraints,
             _ => panic!("expected CreateTable"),
         };
-        let fire_crab_ods::ddl::TableConstraint::Check(c) = &cols[0] else {
+        let fire_crab_ods::ddl::ConstraintKind::Check(c) = &cols[0].kind else {
             panic!("expected a CHECK");
         };
         assert_eq!(

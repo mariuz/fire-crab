@@ -104,6 +104,23 @@ pub struct ColumnDef {
     /// a TABLE-level `PRIMARY KEY (a, b)` sets its columns' NULL_FLAG
     /// but writes no constraint row (probed: table P vs table Q).
     pub not_null_constraint: bool,
+    /// WHERE this column's NOT NULL clause is written INSIDE the
+    /// column's own declaration text - the byte offset of the clause in
+    /// that item. It is what orders the row against the column's other
+    /// inline constraints, which are numbered in plain text order
+    /// (probed: `A INTEGER UNIQUE NOT NULL` numbers UNIQUE first,
+    /// `A INTEGER NOT NULL UNIQUE` numbers NOT NULL first).
+    ///
+    /// A column-level `PRIMARY KEY` IMPLIES a NOT NULL, and the implied
+    /// row stands at the PRIMARY KEY's own place - so when both are
+    /// written the offset is the EARLIER of the two (probed: `A INTEGER
+    /// PRIMARY KEY NOT NULL` is NOT NULL then PRIMARY KEY, though the
+    /// text reads the other way round).
+    ///
+    /// Meaningless when [ColumnDef::not_null_constraint] is false, and 0
+    /// when the caller does not know (nothing else on the column is
+    /// inline, so nothing can be ordered against it).
+    pub not_null_at: usize,
     /// a column `DEFAULT <literal>`, if any: the source text
     /// (`DEFAULT 0`) and its value BLR
     pub default: Option<ColumnDefault>,
@@ -231,12 +248,54 @@ pub struct CheckDef {
     pub fields: Vec<String>,
 }
 
-/// A table-level constraint of a CREATE TABLE, in DECLARATION order -
-/// the order the engine's generated INTEG_<n> names follow (probed: a
-/// CHECK declared between a NOT NULL column and the PRIMARY KEY numbers
-/// between them).
+/// A constraint of a CREATE TABLE other than a column's NOT NULL: a
+/// PRIMARY KEY / UNIQUE key or a CHECK, written either INLINE on a
+/// column or as a clause standing on its own in the column list.
+/// [TableConstraint::place] says which, and that is what orders the
+/// generated `INTEG_<n>` names.
 #[derive(Clone)]
-pub enum TableConstraint {
+pub struct TableConstraint {
+    pub kind: ConstraintKind,
+    /// WHERE the statement writes this constraint - the whole input to
+    /// the two-pass numbering law in [constraint_steps].
+    pub place: ConstraintPlace,
+}
+
+/// WHERE a constraint stands in a CREATE TABLE's column list. The
+/// engine draws the generated `INTEG_<n>` names in TWO PASSES: every
+/// COLUMN-LEVEL (inline) constraint first, and only then every
+/// TABLE-LEVEL clause - so this is not one linear position but a pass
+/// plus a position inside it.
+///
+/// Measured on the engine: `(A INTEGER, UNIQUE (A), B INTEGER UNIQUE)`
+/// numbers `B`'s inline UNIQUE BEFORE the table-level `UNIQUE (A)`
+/// written ahead of it in the text. No single-pass text order can
+/// produce that, and a single `cols_before` count - which is what this
+/// used to be - could express neither the pass nor the position of one
+/// clause INSIDE a column's own text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConstraintPlace {
+    /// Written INLINE as part of column `col`'s definition, at byte
+    /// offset `at` within that column's own declaration text (the same
+    /// scale as [ColumnDef::not_null_at], so the two compare).
+    Inline { col: usize, at: usize },
+    /// A clause standing on its own in the column list, `decl` being
+    /// its position in that list. Ordered among themselves by `decl`,
+    /// and ALL of them after every Inline one.
+    ///
+    /// The rank is carried EXPLICITLY rather than left to the vector's
+    /// own order because a CREATE TABLE's constraints travel in TWO
+    /// vectors - the keys/CHECKs and the foreign keys - and vector
+    /// order can only say where a clause stands among its OWN kind.
+    /// `G1 (A INTEGER, B INTEGER, FOREIGN KEY (A) REFERENCES P,
+    /// UNIQUE (B))` is numbered FOREIGN KEY then UNIQUE by the engine,
+    /// and nothing but a shared rank puts them back in that order.
+    Table { decl: usize },
+}
+
+/// What a [TableConstraint] is: a key (PRIMARY KEY / UNIQUE) or a CHECK.
+#[derive(Clone)]
+pub enum ConstraintKind {
     Key(KeyDef),
     Check(CheckDef),
 }
@@ -416,6 +475,38 @@ pub(crate) fn sys_insert(
     maintain_indexes(file, page_size, rel, recno, &key_values, descs)
 }
 
+/// The values of ONE record of a relation by record number, as the
+/// catalog walk sees it: the visible version, decoded at `descs`.
+/// `None` when that slot holds no live row (a deleted stub, a back
+/// version, a page that is not there) - which is how a caller tells "I
+/// could not read it" from "it is not a row".
+fn row_values_at(
+    file: &crate::Image,
+    page_size: usize,
+    rel: u16,
+    recno: u64,
+    descs: &[Descriptor],
+) -> Option<Vec<Value>> {
+    let recs = max_recs_per_dp(page_size);
+    if recs == 0 {
+        return None;
+    }
+    let (seq, slot) = ((recno / recs) as u32, (recno % recs) as u16);
+    let tips = crate::tra::TipChain::read(file, page_size);
+    for dp_no in relation_data_pages(file, page_size, rel) {
+        let Some(dp) = crate::page_at(file, page_size, dp_no).and_then(DataPage::decode) else {
+            continue;
+        };
+        if dp.sequence != seq {
+            continue;
+        }
+        let r = dp.record(slot)?;
+        let image = crate::data::catalog_image(file, page_size, &r, tips.as_ref())?;
+        return Some(decode_record(&image, descs));
+    }
+    None
+}
+
 /// Key one record into every index of its relation - what the engine
 /// does on any write that changes an INDEXED value. Insertion is the
 /// obvious caller; the other is an in-place row rewrite that changes a
@@ -451,7 +542,35 @@ fn maintain_indexes(
             .collect();
         let (key, all_null) = btw::build_index_key(&key_segs, iflags & btw::IRT_DESCENDING != 0)
             .ok_or("unsupported system index key")?;
-        btw::insert_index_entry(
+        // A CONFLICTING ENTRY COUNTS ONLY IF ITS RECORD STILL BUILDS
+        // THAT KEY. Entries outlive the versions that wrote them, so a
+        // renamed catalog row (`DROP INDEX X` renames its RDB$INDICES
+        // row to RDB$TEMP_DEPEND_<rel>_<n>) leaves an entry under the
+        // OLD name pointing at a row that is still live under the new
+        // one - and `CREATE INDEX X` after it collided with that ghost
+        // for ever. The key is rebuilt HERE, by the code that builds
+        // the one being inserted, so a genuine duplicate still refuses;
+        // a record this cannot read answers "still keyed", the
+        // conservative half.
+        let still_keys = |img: &crate::Image, other: u64| -> bool {
+            let Some(vals) = row_values_at(img, page_size, rel, other, descs) else {
+                return true;
+            };
+            let other_segs: Vec<btw::KeySeg<'_>> = segs
+                .iter()
+                .map(|(field, itype)| btw::KeySeg {
+                    itype: *itype,
+                    value: vals.get(*field as usize).unwrap_or(&null),
+                    scale: descs.get(*field as usize).map_or(0, |d| d.scale),
+                    charset: 0,
+                })
+                .collect();
+            match btw::build_index_key(&other_segs, iflags & btw::IRT_DESCENDING != 0) {
+                Some((other_key, _)) => other_key == key,
+                None => true,
+            }
+        };
+        btw::insert_index_entry_checked(
             file,
             page_size,
             rel,
@@ -460,33 +579,30 @@ fn maintain_indexes(
             recno,
             iflags & btw::IRT_UNIQUE != 0 && !all_null,
             iflags & btw::IRT_DESCENDING != 0,
+            &still_keys,
         )?;
     }
     Ok(())
 }
 
-/// The next free `RDB$<n>` auto-domain number: one past the highest in
-/// RDB$FIELDS. The engine's own generator skips used names, so this
-/// cannot break later engine-side DDL.
-fn next_domain_number(file: &crate::Image, page_size: usize) -> Result<u64, String> {
-    let formats = system_relation_formats(file, page_size, "RDB$FIELDS")
-        .ok_or("no computed RDB$FIELDS format")?;
-    let (_, descs) = formats.iter().max_by_key(|(n, _)| *n).ok_or("empty format")?;
-    let name_fid = relation_columns(file, page_size, "RDB$FIELDS")
-        .iter()
-        .find(|c| c.name == "RDB$FIELD_NAME")
-        .map(|c| c.field_id as usize)
-        .ok_or("no RDB$FIELD_NAME column")?;
-    let mut max = 0u64;
-    walk_rows(file, page_size, 2, descs, |values| {
-        if let Some(Value::Text(t)) = values.get(name_fid) {
-            let t = t.trim_end();
-            if let Some(num) = t.strip_prefix("RDB$").and_then(|s| s.parse::<u64>().ok()) {
-                max = max.max(num);
-            }
-        }
-    });
-    Ok(max + 1)
+/// The first of `count` consecutive `RDB$<n>` auto-domain numbers, from
+/// the engine's own counter for them - the system generator
+/// `RDB$FIELD_NAME` (`DYN_UTIL_generate_field_name`). See
+/// [draw_from_counter] for why the highest name in use is the wrong
+/// answer.
+fn next_domain_numbers(
+    file: &mut crate::Image,
+    page_size: usize,
+    count: u64,
+) -> Result<u64, String> {
+    let used = used_numeric_suffixes(file, page_size, "RDB$FIELDS", "RDB$FIELD_NAME", &["RDB$"])?;
+    let fallback = used.iter().copied().max().unwrap_or(0) + 1;
+    draw_from_counter(file, page_size, "RDB$FIELD_NAME", false, 1, count, &used, fallback)
+}
+
+/// One auto-domain number - [next_domain_numbers] for a single column.
+fn next_domain_number(file: &mut crate::Image, page_size: usize) -> Result<u64, String> {
+    next_domain_numbers(file, page_size, 1)
 }
 
 /// Write a format descriptor blob (makeFormat): one segment of
@@ -3466,10 +3582,7 @@ pub fn alter_table_set_not_null(
         ));
     }
     patch_rf_null_flag(file, page_size, &table, &col_up, Some(1))?;
-    let integ = next_numeric_suffix(
-        file, page_size, "RDB$RELATION_CONSTRAINTS", "RDB$CONSTRAINT_NAME", "INTEG_",
-    )?;
-    let cname = format!("INTEG_{}", integ);
+    let cname = next_integ_name(file, page_size)?;
     sys_row_by_name(file, page_size, "RDB$RELATION_CONSTRAINTS", &[
         ("RDB$CONSTRAINT_NAME", SysVal::S(&cname)),
         ("RDB$CONSTRAINT_TYPE", SysVal::S("NOT NULL")),
@@ -3567,12 +3680,22 @@ pub fn alter_table_drop_not_null(
 const NONNULL_BLR: [u8; 8] = [5, 59, 61, 24, 0, 0, 0, 76];
 
 /// A foreign key's referential action for `ON UPDATE` / `ON DELETE`.
-/// `NO ACTION` and `RESTRICT` both store `RESTRICT` and generate no
-/// trigger, so they collapse to [RefAction::Restrict]. `CASCADE` and
-/// `SET NULL` each synthesise a trigger.
+///
+/// `NO ACTION` and `RESTRICT` behave the same - neither synthesises a
+/// trigger - but they are NOT the same stored rule. The engine writes
+/// back exactly what was written: `ON DELETE NO ACTION` stores
+/// `RDB$DELETE_RULE = 'NO ACTION'`, an omitted clause and an explicit
+/// `RESTRICT` store `'RESTRICT'` (measured 2026-09-03 on
+/// 127.0.0.1/3050, both files read back by the engine). A comment here
+/// once stated the collapse as a law; it was wrong, and collapsing them
+/// was a SILENT WRONG WRITE that survived gbak - the only catalog
+/// divergence among the eighty FK shapes both servers fully accept.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum RefAction {
     Restrict,
+    /// `ON UPDATE|DELETE NO ACTION` as WRITTEN: the same behaviour as
+    /// [RefAction::Restrict] and its own stored rule string
+    NoAction,
     Cascade,
     SetNull,
     SetDefault,
@@ -3583,17 +3706,37 @@ impl RefAction {
     fn rule(self) -> &'static str {
         match self {
             RefAction::Restrict => "RESTRICT",
+            RefAction::NoAction => "NO ACTION",
             RefAction::Cascade => "CASCADE",
             RefAction::SetNull => "SET NULL",
             RefAction::SetDefault => "SET DEFAULT",
         }
     }
+
+    /// Whether this action synthesises a system trigger on the
+    /// referenced table. `RESTRICT` and `NO ACTION` do not - the key is
+    /// simply enforced - and every other action does.
+    fn synthesises_trigger(self) -> bool {
+        !matches!(self, RefAction::Restrict | RefAction::NoAction)
+    }
 }
 
 /// One `FOREIGN KEY (<columns>) REFERENCES <ref_table> [(<ref_columns>)]
-/// [ON UPDATE <action>] [ON DELETE <action>]` clause of a CREATE TABLE.
+/// [ON UPDATE <action>] [ON DELETE <action>]` clause of a CREATE TABLE -
+/// or the same thing wearing COLUMN syntax, `B INTEGER REFERENCES P`.
 /// `name` is the constraint name (also the FK index name, as the engine
 /// names them the same).
+///
+/// [ForeignKeyDef::place] is the FK's seat in the two-pass numbering law
+/// ([constraint_steps]), exactly as [TableConstraint::place] is for a key
+/// or a CHECK: a foreign key is not a fourth thing that always comes
+/// last, it is the FOURTH KIND OF CONSTRAINT and takes its number where
+/// it is written. An inline `REFERENCES` is `Inline { col, at }` and goes
+/// in pass 1; a `FOREIGN KEY (...)` clause standing on its own is
+/// `Table` and takes its declaration place among the other table-level
+/// clauses. Callers that add an FK to an EXISTING table
+/// ([alter_table_add_foreign_key], gbak restore) draw one number per
+/// statement and leave this at `Table`, which orders nothing there.
 #[derive(Clone)]
 pub struct ForeignKeyDef {
     pub name: String,
@@ -3602,6 +3745,7 @@ pub struct ForeignKeyDef {
     pub ref_columns: Vec<String>,
     pub on_update: RefAction,
     pub on_delete: RefAction,
+    pub place: ConstraintPlace,
 }
 
 pub fn create_table(
@@ -3626,10 +3770,32 @@ pub fn create_table(
             return Err(format!("computed column {} cannot carry constraints", c.name));
         }
     }
+    // ONE SET OF COLUMNS, ONE KEY. `(A INTEGER NOT NULL, UNIQUE (A),
+    // PRIMARY KEY (A))` is refused by the engine with DYN 126, "Same set
+    // of columns cannot be used in more than one PRIMARY KEY and/or
+    // UNIQUE constraint definition" - and it is the SET, not the order:
+    // `UNIQUE (A,B)` beside `UNIQUE (B,A)` is refused too, while
+    // `UNIQUE (A)` beside `UNIQUE (A,B)` is fine. A column-level key
+    // counts (measured on `A INTEGER NOT NULL UNIQUE, UNIQUE (A)`).
+    // fire-crab used to write both constraints and both indexes.
+    {
+        let mut seen: Vec<Vec<String>> = Vec::new();
+        for c in constraints {
+            let ConstraintKind::Key(k) = &c.kind else { continue };
+            let mut set = k.columns.clone();
+            set.sort();
+            if seen.contains(&set) {
+                return Err(SAME_KEY_COLUMNS_MSG.to_string());
+            }
+            seen.push(set);
+        }
+    }
     let name = name.trim().to_string();
 
-    // relation id: one past the highest in RDB$RELATIONS (user ids
-    // start at 128; every real database's system rels reach far below)
+    // the name has to be free (the catalog as it stands is the judge of
+    // that), and the id comes from the engine's own counter for it -
+    // NOT from the same list, which would re-issue the id of a dropped
+    // relation the moment the two answers were allowed to disagree
     let rels = list_relations(file, page_size);
     if rels
         .iter()
@@ -3637,7 +3803,7 @@ pub fn create_table(
     {
         return Err(format!("table {} already exists", name));
     }
-    let rel_id_u16 = rels.iter().map(|(id, _)| *id).max().unwrap_or(127).max(127) + 1;
+    let rel_id_u16 = next_relation_id(file, page_size, &rels)?;
     let rel_id = rel_id_u16 as i64;
 
     // resolve each column's source (its RDB$FIELD_SOURCE): a per-table
@@ -3647,12 +3813,15 @@ pub fn create_table(
     // runtime, not the column's own catalog row). The auto-domain counter
     // advances only for built-in columns, so with no domain columns the
     // source names are byte-identical to before.
-    let domain_base = next_domain_number(file, page_size)?;
+    let auto_domains = cols.iter().filter(|c| c.domain.is_none()).count() as u64;
+    let domain_base = next_domain_numbers(file, page_size, auto_domains)?;
     // identity columns get an implicit RDB$<n> generator, named from a
-    // separate counter (over RDB$GENERATORS); the generator itself is written
-    // after the table's security classes, but its name is needed on the field
-    // row now
-    let gen_base = next_generator_number(file, page_size);
+    // separate counter; the generator itself is written after the
+    // table's security classes, but its name is needed on the field row
+    // now, so the run of names is drawn here
+    let identity_gens =
+        cols.iter().filter(|c| c.domain.is_none() && c.identity.is_some()).count() as u64;
+    let gen_base = next_generator_number(file, page_size, identity_gens)?;
     let mut resolved: Vec<ColumnDef> = Vec::with_capacity(cols.len());
     // per column: (source name, is_domain, inherited default BLR, inherited not_null)
     #[allow(clippy::type_complexity)]
@@ -3762,7 +3931,7 @@ pub fn create_table(
     {
         let n_checks = constraints
             .iter()
-            .filter(|c| matches!(c, TableConstraint::Check(_)))
+            .filter(|c| matches!(c.kind, ConstraintKind::Check(_)))
             .count();
         if n_checks > 0 {
             let slot = generator_id_by_name(file, page_size, "RDB$TRIGGER_NAME")
@@ -4040,57 +4209,187 @@ pub fn create_table(
             ],
         )?;
     }
-    // --- constraints: NOT NULL rows first (in column order), then the
-    // key constraints in DECLARATION order - the order the engine's own
-    // INTEG_<n> and index-name sequences follow (probe: a table whose
-    // UNIQUE precedes its PRIMARY KEY numbers them in that order) ---------
-    let mut integ = next_numeric_suffix(file, page_size, "RDB$RELATION_CONSTRAINTS",
-        "RDB$CONSTRAINT_NAME", "INTEG_")?;
-    for c in cols.iter().filter(|c| c.not_null_constraint) {
-        let cname = format!("INTEG_{}", integ);
-        integ += 1;
-        sys_row_by_name(file, page_size, "RDB$RELATION_CONSTRAINTS", &[
-            ("RDB$CONSTRAINT_NAME", SysVal::S(&cname)),
-            ("RDB$CONSTRAINT_TYPE", SysVal::S("NOT NULL")),
-            ("RDB$RELATION_NAME", SysVal::S(&name)),
-            ("RDB$DEFERRABLE", SysVal::S("NO")),
-            ("RDB$INITIALLY_DEFERRED", SysVal::S("NO")),
-            ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
-        ])?;
-        sys_row_by_name(file, page_size, "RDB$CHECK_CONSTRAINTS", &[
-            ("RDB$CONSTRAINT_NAME", SysVal::S(&cname)),
-            ("RDB$TRIGGER_NAME", SysVal::S(&c.name)),
-            ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
-        ])?;
-    }
+    // --- constraints, IN THE ENGINE'S TWO-PASS ORDER: every
+    // COLUMN-LEVEL (inline) constraint first - the columns in
+    // declaration order and, within one column, its clauses in written
+    // order - and only THEN every TABLE-LEVEL clause, in declaration
+    // order. That order is the one the engine's INTEG_<n> and
+    // index-name sequences follow. See [constraint_steps]; the place
+    // travels in [TableConstraint::place] and [ColumnDef::not_null_at].
     let mut check_i = 0usize;
-    for tc in constraints {
-        match tc {
-            TableConstraint::Key(key) => write_key(file, page_size, &name, key)?,
-            TableConstraint::Check(ck) => {
-                write_check(file, page_size, &name, ck, &check_names[check_i])?;
-                check_i += 1;
+    for step in constraint_steps(cols, constraints, fks) {
+        match step {
+            ConstraintStep::NotNull(i) => {
+                let c = &cols[i];
+                let cname = next_integ_name(file, page_size)?;
+                sys_row_by_name(file, page_size, "RDB$RELATION_CONSTRAINTS", &[
+                    ("RDB$CONSTRAINT_NAME", SysVal::S(&cname)),
+                    ("RDB$CONSTRAINT_TYPE", SysVal::S("NOT NULL")),
+                    ("RDB$RELATION_NAME", SysVal::S(&name)),
+                    ("RDB$DEFERRABLE", SysVal::S("NO")),
+                    ("RDB$INITIALLY_DEFERRED", SysVal::S("NO")),
+                    ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
+                ])?;
+                sys_row_by_name(file, page_size, "RDB$CHECK_CONSTRAINTS", &[
+                    ("RDB$CONSTRAINT_NAME", SysVal::S(&cname)),
+                    ("RDB$TRIGGER_NAME", SysVal::S(&c.name)),
+                    ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
+                ])?;
+            }
+            ConstraintStep::Table(i) => match &constraints[i].kind {
+                ConstraintKind::Key(key) => write_key(file, page_size, &name, key)?,
+                ConstraintKind::Check(ck) => {
+                    write_check(file, page_size, &name, ck, &check_names[check_i])?;
+                    check_i += 1;
+                }
+            },
+            // --- a FOREIGN KEY: a non-unique index on the referencing
+            // columns (irt_foreign, naming the partner key's index), an
+            // RDB$RELATION_CONSTRAINTS 'FOREIGN KEY' row, and an
+            // RDB$REF_CONSTRAINTS row linking to the referenced table's
+            // PK/UNIQUE constraint (MATCH FULL). Written HERE, in the
+            // law's place, not from a trailing loop: the engine numbers
+            // an FK where it is written, and it writes the FK's INDEX
+            // there too - probed, `G1 (A INTEGER, B INTEGER, FOREIGN KEY
+            // (A) REFERENCES P, UNIQUE (B))` gives the FK index id 1 and
+            // the UNIQUE index id 2.
+            //
+            // Nothing downstream wants FKs last. The partner lookup
+            // (find_partner_key) reads the catalog as it stands, and a
+            // SELF-referencing FK therefore needs its own table's key
+            // already written - but the ENGINE has exactly the same
+            // rule: `(A INTEGER NOT NULL, B INTEGER, FOREIGN KEY (B)
+            // REFERENCES S1 (A), PRIMARY KEY (A))` is refused by the
+            // engine with "could not find UNIQUE or PRIMARY KEY
+            // constraint", and accepted when the PRIMARY KEY is written
+            // first. Writing in the law's order reproduces that.
+            ConstraintStep::Fk(i) => {
+                let fk = &fks[i];
+                // an unnamed FK is named INTEG_<n> - the same generated
+                // name for both the constraint and its index, as the
+                // engine does
+                let fk_name = if fk.name.is_empty() {
+                    next_integ_name(file, page_size)?
+                } else {
+                    fk.name.clone()
+                };
+                write_foreign_key_full(file, page_size, &name, &fk_name, fk, true)?;
             }
         }
     }
-    // --- FOREIGN KEY constraints: a non-unique index on the referencing
-    // columns (irt_foreign, naming the partner PK index), an RDB$RELATION_
-    // CONSTRAINTS 'FOREIGN KEY' row, and an RDB$REF_CONSTRAINTS row linking
-    // to the referenced table's PK constraint (MATCH FULL, RESTRICT rules)
-    for fk in fks {
-        // an unnamed FK is named INTEG_<n> - the same generated name for
-        // both the constraint and its index, as the engine does. The
-        // number comes from the catalog as it now stands (the key
-        // constraints just written have already taken theirs)
-        let fk_name = if fk.name.is_empty() {
-            next_integ_name(file, page_size)?
-        } else {
-            fk.name.clone()
-        };
-        write_foreign_key_full(file, page_size, &name, &fk_name, fk, true)?;
-    }
     advance_oldest_transactions(file, page_size)?;
     Ok(())
+}
+
+/// One constraint row a CREATE TABLE writes, in the order it writes
+/// them: a column's NOT NULL (by column index) or a table constraint
+/// (by index into the statement's constraint list).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConstraintStep {
+    NotNull(usize),
+    Table(usize),
+    /// a FOREIGN KEY, by index into the statement's `fks` list - inline
+    /// (`B INTEGER REFERENCES P`) or a table-level clause, and ordered
+    /// by its [ForeignKeyDef::place] like every other constraint
+    Fk(usize),
+}
+
+/// THE ORDER A CREATE TABLE WRITES ITS CONSTRAINTS, which is the order
+/// their generated `INTEG_<n>` names - and the backing indexes' names -
+/// are drawn in.
+///
+/// **The law, measured on the engine: the names are drawn in TWO
+/// PASSES. Every COLUMN-LEVEL (inline) constraint first, walking the
+/// columns in declaration order and, within one column, taking its
+/// clauses in the order they are written; then every TABLE-LEVEL
+/// clause, in declaration order.**
+///
+/// Column-level means written as part of a column's definition - its
+/// NOT NULL, an inline `PRIMARY KEY`/`UNIQUE`, an inline `CHECK`.
+/// Table-level means a clause standing on its own in the column list.
+///
+/// The shapes that establish it (all measured through 127.0.0.1/3050,
+/// both servers' files read back BY THE ENGINE):
+///
+/// - `(ID INTEGER NOT NULL PRIMARY KEY, C INTEGER UNIQUE, D VARCHAR(10)
+///   NOT NULL)` -> NOT NULL, PRIMARY KEY, UNIQUE, NOT NULL. One pass is
+///   enough here, which is why the superseded single-pass rule fitted.
+/// - `(A INTEGER, UNIQUE (A), B INTEGER UNIQUE)` -> UNIQUE on B, then
+///   UNIQUE on A. THE DECISIVE ONE: `B`'s inline UNIQUE is written LAST
+///   and numbered FIRST, because it is column-level and the `UNIQUE (A)`
+///   ahead of it is table-level. No single-pass text order can do that.
+/// - `(A INTEGER NOT NULL, B INTEGER, UNIQUE (B), C INTEGER NOT NULL,
+///   PRIMARY KEY (A))` -> NOT NULL, NOT NULL, UNIQUE, PRIMARY KEY: both
+///   NOT NULLs (pass 1) before both table-level keys (pass 2).
+/// - `(A INTEGER CHECK (A > 0), B INTEGER NOT NULL, CHECK (B < 100),
+///   C INTEGER UNIQUE)` -> CHECK on A, NOT NULL on B, UNIQUE on C, then
+///   the table-level CHECK. The same law with CHECKs, independently.
+/// - `(A INTEGER UNIQUE NOT NULL, B INTEGER)` -> UNIQUE, NOT NULL, and
+///   `(A INTEGER NOT NULL UNIQUE, B INTEGER)` -> NOT NULL, UNIQUE:
+///   within ONE column it is plain text order, so the two clauses swap
+///   numbers when the text swaps them.
+///
+/// Two rules this replaced, each right on some shapes and wrong on
+/// others: "every NOT NULL first, then every key" (wrong on the first
+/// shape) and "one strict declaration order" (wrong on the second,
+/// third, fourth and fifth). Under either, `INTEG_4` named a different
+/// constraint on the two servers' copies of one file.
+fn constraint_steps(
+    cols: &[ColumnDef],
+    constraints: &[TableConstraint],
+    fks: &[ForeignKeyDef],
+) -> Vec<ConstraintStep> {
+    // The FOREIGN KEYs travel in their OWN list (they carry a partner
+    // table and referential actions no other constraint has), but they
+    // are numbered in the SAME two passes as everything else - so their
+    // places are merged in here, not appended after. `decl` restores the
+    // one declaration order the two lists were split out of: a
+    // table-level clause's rank is its position in its own list, and
+    // interleaving the two by that rank is what `G1 (..., FOREIGN KEY
+    // (A) REFERENCES P, UNIQUE (B))` needs - measured on the engine as
+    // FOREIGN KEY then UNIQUE, which an FK-last writer cannot produce.
+    //
+    // pass 1: the COLUMN-LEVEL constraints, ordered by (column, offset
+    // inside that column's own text). A stable sort settles a tie the
+    // way the engine does: a column-level PRIMARY KEY's IMPLIED NOT NULL
+    // carries the key's own offset and is numbered just before it.
+    let mut inline: Vec<(usize, usize, ConstraintStep)> =
+        Vec::with_capacity(cols.len() + constraints.len() + fks.len());
+    for (i, c) in cols.iter().enumerate() {
+        if c.not_null_constraint {
+            inline.push((i, c.not_null_at, ConstraintStep::NotNull(i)));
+        }
+    }
+    for (i, k) in constraints.iter().enumerate() {
+        if let ConstraintPlace::Inline { col, at } = k.place {
+            inline.push((col, at, ConstraintStep::Table(i)));
+        }
+    }
+    for (i, f) in fks.iter().enumerate() {
+        if let ConstraintPlace::Inline { col, at } = f.place {
+            inline.push((col, at, ConstraintStep::Fk(i)));
+        }
+    }
+    inline.sort_by_key(|(col, at, _)| (*col, *at));
+    let mut steps: Vec<ConstraintStep> = inline.into_iter().map(|(_, _, s)| s).collect();
+    // pass 2: the TABLE-LEVEL clauses, in declaration order, all of them
+    // after every column-level one. The keys/CHECKs and the FKs are two
+    // lists of one order, so they merge on `decl` - the position the
+    // parser stamped from the SHARED clause counter.
+    let mut table: Vec<(usize, ConstraintStep)> = Vec::new();
+    for (i, k) in constraints.iter().enumerate() {
+        if let ConstraintPlace::Table { decl } = k.place {
+            table.push((decl, ConstraintStep::Table(i)));
+        }
+    }
+    for (i, f) in fks.iter().enumerate() {
+        if let ConstraintPlace::Table { decl } = f.place {
+            table.push((decl, ConstraintStep::Fk(i)));
+        }
+    }
+    table.sort_by_key(|(decl, _)| *decl);
+    steps.extend(table.into_iter().map(|(_, s)| s));
+    steps
 }
 
 /// Write one PRIMARY KEY or UNIQUE constraint onto a table: the unique
@@ -4320,7 +4619,9 @@ fn create_view_impl(
     forced_id: Option<i64>,
 ) -> Result<(), String> {
     let want = name.trim().to_string();
-    let domain_base = next_domain_number(file, page_size)?;
+    let auto_domains =
+        fields.iter().filter(|f| f.base.is_none() && f.expr.is_some()).count() as u64;
+    let domain_base = next_domain_numbers(file, page_size, auto_domains)?;
     let mut auto_idx = 0u64;
     let mut restored: Vec<RestoredViewField> = Vec::with_capacity(fields.len());
     for (i, f) in fields.iter().enumerate() {
@@ -4556,8 +4857,12 @@ fn restore_view_with(
         return Err(format!("relation {} already exists", name));
     }
     // ALTER VIEW keeps the relation's id across the drop-and-repopulate;
-    // a fresh CREATE takes the next free id (max + 1).
-    let rel_id = forced_id.unwrap_or_else(|| (rels.iter().map(|(id, _)| *id).max().unwrap_or(127).max(127) + 1) as i64);
+    // a fresh CREATE draws one from the engine's RDB$RELATIONS counter,
+    // the same as a table.
+    let rel_id = match forced_id {
+        Some(id) => id,
+        None => next_relation_id(file, page_size, &rels)? as i64,
+    };
     // the format: each field's descriptor from its (already restored)
     // domain, offsets laid out the way the row would be
     let mut descs: Vec<Descriptor> = Vec::new();
@@ -5157,6 +5462,42 @@ pub fn alter_table_drop_constraint(
             delete_catalog_rows(file, page_size, "RDB$REF_CONSTRAINTS", |v| {
                 text_is(v.get(cn_fid), &cname)
             })?;
+            // A REFERENTIAL-ACTION TRIGGER GOES WITH ITS CONSTRAINT.
+            // An `ON DELETE CASCADE` key owns an AFTER DELETE trigger on
+            // the PARENT table, linked to this constraint name through
+            // RDB$CHECK_CONSTRAINTS. Left behind it keeps cascading with
+            // no constraint to justify it, and a child row the engine's
+            // own database keeps is silently deleted (measured on the
+            // engine driving both files: CHILD_ROWS_LEFT 1 against 0).
+            // The parent's RDB$RUNTIME is rebuilt so the trigger stops
+            // being loaded - the trigger sits on the PARENT, not on the
+            // table this ALTER names.
+            let tnames = check_constraint_trigger_names(file, page_size, &cname);
+            let parents: Vec<String> = tnames
+                .iter()
+                .filter_map(|t| trigger_relation_name(file, page_size, t))
+                .collect();
+            let cc_fid = sys_fid(file, page_size, "RDB$CHECK_CONSTRAINTS", "RDB$CONSTRAINT_NAME")?;
+            delete_catalog_rows(file, page_size, "RDB$CHECK_CONSTRAINTS", |v| {
+                text_is(v.get(cc_fid), &cname)
+            })?;
+            let tn_fid = sys_fid(file, page_size, "RDB$TRIGGERS", "RDB$TRIGGER_NAME")?;
+            let dn_fid = sys_fid(file, page_size, "RDB$DEPENDENCIES", "RDB$DEPENDENT_NAME")?;
+            for t in &tnames {
+                let t = t.clone();
+                delete_catalog_rows(file, page_size, "RDB$TRIGGERS", {
+                    let t = t.clone();
+                    move |v| text_is(v.get(tn_fid), &t)
+                })?;
+                delete_catalog_rows(file, page_size, "RDB$DEPENDENCIES", move |v| {
+                    text_is(v.get(dn_fid), &t)
+                })?;
+            }
+            for parent in &parents {
+                if crate::resolve_relation(file, page_size, parent).is_some() {
+                    refresh_runtime(file, page_size, parent)?;
+                }
+            }
             let index_name = index_name.ok_or("foreign key without an index")?;
             deferred_drop_index(file, page_size, rel, &index_name)?;
         }
@@ -5841,6 +6182,28 @@ fn check_constraint_column(file: &crate::Image, page_size: usize, cname: &str) -
     found
 }
 
+/// The relation one trigger sits on, from `RDB$TRIGGERS`. A foreign
+/// key's referential-action trigger sits on the REFERENCED (parent)
+/// table, not on the table whose constraint it belongs to, so a drop
+/// has to refresh that table's runtime and not the child's.
+fn trigger_relation_name(file: &crate::Image, page_size: usize, trigger: &str) -> Option<String> {
+    let rel = crate::resolve_relation(file, page_size, "RDB$TRIGGERS")?;
+    let formats = system_relation_formats(file, page_size, "RDB$TRIGGERS")?;
+    let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
+    let cols = relation_columns(file, page_size, "RDB$TRIGGERS");
+    let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (tn_f, rn_f) = (fid("RDB$TRIGGER_NAME")?, fid("RDB$RELATION_NAME")?);
+    let mut found = None;
+    walk_rows(file, page_size, rel, descs, |values| {
+        if text_is(values.get(tn_f), trigger) {
+            if let Some(Value::Text(t)) = values.get(rn_f) {
+                found = Some(t.trim_end().to_string());
+            }
+        }
+    });
+    found
+}
+
 /// EVERY trigger name a check constraint's RDB$CHECK_CONSTRAINTS rows
 /// link to - a CHECK has a pair, where a NOT NULL has its single column
 /// name in the same place ([check_constraint_column]).
@@ -6086,9 +6449,18 @@ fn column_is_not_null(file: &crate::Image, page_size: usize, table: &str, col_up
 /// as it now stands (every writer takes its number this way, so the
 /// sequence advances across mixed constraint kinds the way the engine's
 /// does).
-fn next_integ_name(file: &crate::Image, page_size: usize) -> Result<String, String> {
-    let n = next_numeric_suffix(
-        file, page_size, "RDB$RELATION_CONSTRAINTS", "RDB$CONSTRAINT_NAME", "INTEG_",
+/// The next generated `INTEG_<n>` constraint name, from the engine's own
+/// counter for it - the system generator `RDB$CONSTRAINT_NAME`. Every
+/// unnamed constraint of a statement draws in the order the engine
+/// writes them (NOT NULL rows in column order, then the key constraints
+/// in declaration order, then the foreign keys).
+fn next_integ_name(file: &mut crate::Image, page_size: usize) -> Result<String, String> {
+    let used = used_numeric_suffixes(
+        file, page_size, "RDB$RELATION_CONSTRAINTS", "RDB$CONSTRAINT_NAME", &["INTEG_"],
+    )?;
+    let fallback = used.iter().copied().max().unwrap_or(0) + 1;
+    let n = draw_from_counter(
+        file, page_size, "RDB$CONSTRAINT_NAME", false, 1, 1, &used, fallback,
     )?;
     Ok(format!("INTEG_{}", n))
 }
@@ -6234,17 +6606,31 @@ fn fk_trigger_blr(
 
 /// Store one FK-cascade system trigger on the referenced (parent) table -
 /// a `RDB$TRIGGERS` row named `CHECK_<n>` (number from the
-/// `RDB$TRIGGER_NAME` generator) plus the three `RDB$DEPENDENCIES` rows the
-/// engine records (on the child relation, the child FK column and the
-/// parent key column). `trigger_type` is 4 for AFTER UPDATE, 6 for AFTER
-/// DELETE. The caller must also refresh the parent's `RDB$RUNTIME` so the
-/// trigger is loaded ([update_relation_runtime]).
+/// `RDB$TRIGGER_NAME` generator), the `RDB$CHECK_CONSTRAINTS` row that
+/// TIES that trigger to the foreign key's constraint name, plus the
+/// three `RDB$DEPENDENCIES` rows the engine records (on the child
+/// relation, the child FK column and the parent key column).
+/// `trigger_type` is 4 for AFTER UPDATE, 6 for AFTER DELETE. The caller
+/// must also refresh the parent's `RDB$RUNTIME` so the trigger is loaded
+/// ([update_relation_runtime]).
+///
+/// THE LINK ROW IS NOT DECORATION. It is what makes the trigger part of
+/// the constraint: `ALTER TABLE <child> DROP CONSTRAINT <fk>` follows
+/// `RDB$CHECK_CONSTRAINTS` to find the triggers to delete. Without it
+/// the constraint disappears from both catalogs and the unreferenced
+/// `AFTER DELETE` trigger SURVIVES the drop and keeps cascading, so a
+/// child row the engine's own database keeps is silently deleted on
+/// fire-crab's file (measured; `gfix -v -full` reports rc=0 on it). The
+/// engine writes one row per trigger, both carrying the FK's own
+/// constraint name (measured: `INTEG_3 -> CHECK_1` and
+/// `INTEG_3 -> CHECK_2` for an `ON UPDATE CASCADE ON DELETE SET NULL`).
 #[allow(clippy::too_many_arguments)]
 fn store_fk_trigger(
     file: &mut crate::Image,
     page_size: usize,
     parent: &str,
     child_rel: &str,
+    fk_name: &str,
     fk_cols: &[String],
     pk_cols: &[String],
     trigger_type: i64,
@@ -6277,6 +6663,13 @@ fn store_fk_trigger(
             ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
         ],
     )?;
+    // the link that makes this trigger part of the constraint - what a
+    // later DROP CONSTRAINT follows to take the trigger with it
+    sys_row_by_name(file, page_size, "RDB$CHECK_CONSTRAINTS", &[
+        ("RDB$CONSTRAINT_NAME", SysVal::S(fk_name)),
+        ("RDB$TRIGGER_NAME", SysVal::S(&tname)),
+        ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
+    ])?;
     let dep = |file: &mut crate::Image, on: &str, field: Option<&str>| -> Result<(), String> {
         let mut row = vec![
             ("RDB$DEPENDENT_NAME", SysVal::S(&tname)),
@@ -6357,6 +6750,15 @@ fn write_foreign_key_full(
                 )
             }
         })?;
+    // THE PARTNER KEY MUST ACTUALLY FIT - checked HERE, before one byte
+    // of the index or the catalog rows is written. A foreign key the
+    // engine refuses is not a harmless divergence: fire-crab does NOT
+    // enforce the key it wrote, the ENGINE reading the same file DOES,
+    // so the two servers disagree about the file's rows - and `gbak -c`
+    // of the result fails outright (`cannot commit index ... Database is
+    // not online due to failure to activate one or more indices`), which
+    // makes the database unrestorable. Refusing is the only answer.
+    check_partner_compatible(file, page_size, table, fk, &partner_index)?;
     create_index(
         file, page_size, table, fk_name, &fk.columns, false, false, false,
         Some(&partner_index),
@@ -6385,7 +6787,7 @@ fn write_foreign_key_full(
     // numbers it CHECK_<lower>), then delete - and the parent's RDB$RUNTIME
     // is refreshed so the engine loads them
     if synth_triggers
-        && (fk.on_update != RefAction::Restrict || fk.on_delete != RefAction::Restrict)
+        && (fk.on_update.synthesises_trigger() || fk.on_delete.synthesises_trigger())
     {
         let parent = fk.ref_table.trim().to_string();
         let pk_cols = if fk.ref_columns.is_empty() {
@@ -6397,11 +6799,13 @@ fn write_foreign_key_full(
             return Err("foreign key column count does not match the referenced key".into());
         }
         let mut make = |is_update: bool, action: RefAction, ttype: i64| -> Result<(), String> {
-            if action == RefAction::Restrict {
+            if !action.synthesises_trigger() {
                 return Ok(());
             }
             let blr = fk_trigger_blr(is_update, action, table, &fk.columns, &pk_cols);
-            store_fk_trigger(file, page_size, &parent, table, &fk.columns, &pk_cols, ttype, &blr)
+            store_fk_trigger(
+                file, page_size, &parent, table, fk_name, &fk.columns, &pk_cols, ttype, &blr,
+            )
         };
         make(true, fk.on_update, 4)?;
         make(false, fk.on_delete, 6)?;
@@ -6428,10 +6832,7 @@ pub fn alter_table_add_foreign_key(
     }
     let name = table.trim().to_string();
     let fk_name = if fk.name.is_empty() {
-        let integ = next_numeric_suffix(
-            file, page_size, "RDB$RELATION_CONSTRAINTS", "RDB$CONSTRAINT_NAME", "INTEG_",
-        )?;
-        format!("INTEG_{}", integ)
+        next_integ_name(file, page_size)?
     } else {
         fk.name.clone()
     };
@@ -6458,10 +6859,7 @@ pub fn alter_table_add_foreign_key_carried(
     }
     let name = table.trim().to_string();
     let fk_name = if fk.name.is_empty() {
-        let integ = next_numeric_suffix(
-            file, page_size, "RDB$RELATION_CONSTRAINTS", "RDB$CONSTRAINT_NAME", "INTEG_",
-        )?;
-        format!("INTEG_{}", integ)
+        next_integ_name(file, page_size)?
     } else {
         fk.name.clone()
     };
@@ -6494,6 +6892,146 @@ pub fn primary_key_columns(
     if cols.is_empty() { None } else { Some(cols) }
 }
 
+/// The engine's message for a foreign key whose column count does not
+/// match the key it references (`isc_foreign_key_notfound`'s sibling,
+/// 335544604, under a -607 "Invalid command"). Spelled here EXACTLY as
+/// the engine spells it: the wire server recognises it by text and
+/// rebuilds the engine's own error vector from it, so a client can tell
+/// this refusal from the type one.
+/// DYN 126 (336068734), the engine's refusal when two PRIMARY KEY /
+/// UNIQUE constraints of one table name the same SET of columns.
+/// Spelled here exactly as the engine spells it - the wire server
+/// recognises it by text and rebuilds the engine's vector from it.
+pub(crate) const SAME_KEY_COLUMNS_MSG: &str =
+    "Same set of columns cannot be used in more than one PRIMARY KEY and/or UNIQUE constraint definition";
+
+pub(crate) const FK_ARITY_MSG: &str = "FOREIGN KEY column count does not match PRIMARY KEY";
+
+/// `isc_partner_idx_incompat_type` (335544852), whose one argument is
+/// the 1-BASED number of the FIRST segment that does not fit (measured:
+/// a two-column FK whose second column is wrong says `no 2`).
+pub(crate) fn fk_incompat_msg(segment: usize) -> String {
+    format!("partner index segment no {} has incompatible data type", segment)
+}
+
+/// THE INDEX-KEY CLASS of a stored column: two columns may be the two
+/// ends of one foreign key exactly when they share it.
+///
+/// **Measured on the engine, 2026-09-03**, by building a parent table
+/// per type and a child column per type against it (24 x 24 pairs plus
+/// precision, charset, collation and domain probes) and reading which
+/// `CREATE TABLE ... REFERENCES` it accepted. What it refuses it
+/// refuses with `partner index segment no 1 has incompatible data
+/// type`; the classes measured are:
+///
+/// | class | types |
+/// |---|---|
+/// | 0 | SMALLINT, INTEGER, FLOAT, DOUBLE PRECISION, NUMERIC/DECIMAL of precision <= 9 (any scale) |
+/// | 1 | BIGINT, NUMERIC/DECIMAL of precision 10..18 |
+/// | 2 | INT128, NUMERIC/DECIMAL of precision 19..38 |
+/// | 3 | DATE | 4 | TIME | 5 | TIMESTAMP |
+/// | 6 | BOOLEAN | 7 | DECFLOAT(16) *and* DECFLOAT(34) together |
+/// | 8/9 | TIME WITH TIME ZONE / TIMESTAMP WITH TIME ZONE, each its own |
+/// | text | CHAR and VARCHAR alike, keyed on the TTYPE - character set AND collation |
+///
+/// The consequences worth stating, all measured: the declared LENGTH of
+/// a string never matters (`VARCHAR(80)` keys against `CHAR(5)`), and
+/// CHAR vs VARCHAR never matters, but the CHARACTER SET does (NONE,
+/// OCTETS and WIN1252 are three classes) and so does the COLLATION
+/// (`UTF8` and `UTF8 COLLATE UNICODE` are two). Scale never matters
+/// inside a numeric class, but PRECISION picks the class, because it
+/// picks the storage type. A DOMAIN behaves exactly as its base type on
+/// either side.
+///
+/// This is the same partition [index_itype] draws for the key ENCODING -
+/// which is why it is a partition at all: two columns can share one
+/// index only if their keys are built the same way. It is stated
+/// separately because a class here need not be an itype this crate can
+/// key (DECFLOAT), and because the text case must carry the whole ttype
+/// where an itype folds the untabled ones together.
+///
+/// `None` for a type that cannot be an index key at all (BLOB, ARRAY) -
+/// the engine refuses those too.
+fn key_class(d: &Descriptor) -> Option<u32> {
+    use crate::format::dtype;
+    Some(match d.dtype {
+        dtype::SHORT | dtype::LONG | dtype::REAL | dtype::DOUBLE => 0,
+        dtype::INT64 => 1,
+        dtype::INT128 => 2,
+        dtype::SQL_DATE => 3,
+        dtype::SQL_TIME => 4,
+        dtype::TIMESTAMP => 5,
+        dtype::BOOLEAN => 6,
+        // DECFLOAT(16) and DECFLOAT(34) key together - measured, they
+        // are the one pair of DIFFERENT dtypes that share a class
+        dtype::DEC64 | dtype::DEC128 => 7,
+        dtype::SQL_TIME_TZ => 8,
+        dtype::TIMESTAMP_TZ => 9,
+        dtype::EX_TIME_TZ => 10,
+        dtype::EX_TIMESTAMP_TZ => 11,
+        // the descriptor's sub_type IS the ttype for text: character set
+        // in the low byte, collation in the high one. Both discriminate
+        // (measured), and the length does not - so the whole ttype rides
+        // into the class and nothing else about the column does.
+        dtype::TEXT | dtype::VARYING => 0x1_0000 | (d.sub_type as u16 as u32),
+        _ => return None,
+    })
+}
+
+/// The [key_class] of one named column of one named relation, read from
+/// the relation's newest stored format - so a DOMAIN-typed column
+/// answers its RESOLVED type, exactly as the engine's own comparison
+/// does. `None` when the column, the relation or its format is not
+/// there, or when the type cannot be an index key.
+fn column_key_class(
+    file: &crate::Image,
+    page_size: usize,
+    table: &str,
+    column: &str,
+) -> Option<u32> {
+    let rel = crate::resolve_relation(file, page_size, table)?;
+    let fid = relation_columns(file, page_size, table)
+        .into_iter()
+        .find(|c| c.name == column)?
+        .field_id as usize;
+    let formats = crate::relation_formats(file, page_size, rel);
+    let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
+    key_class(descs.get(fid)?)
+}
+
+/// Refuse a foreign key the engine would refuse, BEFORE anything is
+/// written: the referencing columns must be as MANY as the partner
+/// index's segments, and each must be of a type that keys the same way
+/// as the segment it is paired with ([key_class]).
+///
+/// Both were missing, and both produced a database the engine's own
+/// `gbak -c` could not restore - the arity one additionally producing a
+/// key fire-crab did not enforce and the engine did, so the two servers
+/// read different data out of one file.
+fn check_partner_compatible(
+    file: &crate::Image,
+    page_size: usize,
+    table: &str,
+    fk: &ForeignKeyDef,
+    partner_index: &str,
+) -> Result<(), String> {
+    let partner_cols = index_segment_names(file, page_size, partner_index);
+    if partner_cols.is_empty() {
+        return Err(format!("partner index {} has no segments", partner_index));
+    }
+    if partner_cols.len() != fk.columns.len() {
+        return Err(FK_ARITY_MSG.to_string());
+    }
+    let parent = fk.ref_table.trim();
+    for (i, (child, key)) in fk.columns.iter().zip(partner_cols.iter()).enumerate() {
+        let a = column_key_class(file, page_size, table, child);
+        let b = column_key_class(file, page_size, parent, key);
+        if a.is_none() || a != b {
+            return Err(fk_incompat_msg(i + 1));
+        }
+    }
+    Ok(())
+}
 fn find_partner_key(
     file: &crate::Image,
     page_size: usize,
@@ -6587,28 +7125,35 @@ fn index_segment_names(file: &crate::Image, page_size: usize, index_name: &str) 
     segs.into_iter().map(|(_, n)| n).collect()
 }
 
-/// One past the highest numeric suffix of `<prefix><n>` names in a
-/// catalog column - the INTEG_/RDB$PRIMARY sequences (the engine's own
-/// name generators skip used names, so max+1 cannot collide later).
 /// The next generated index number. The engine draws the `RDB$<n>` name
-/// of an unnamed UNIQUE index and the `RDB$PRIMARY<n>` name of an
-/// unnamed PRIMARY KEY index from ONE sequence (probed: a table
-/// declaring UNIQUE then PRIMARY KEY got RDB$7 and RDB$PRIMARY8), so
-/// both spellings are scanned and the higher successor wins.
-fn next_index_number(file: &crate::Image, page_size: usize) -> Result<u64, String> {
-    let plain = next_numeric_suffix(file, page_size, "RDB$INDICES", "RDB$INDEX_NAME", "RDB$")?;
-    let primary =
-        next_numeric_suffix(file, page_size, "RDB$INDICES", "RDB$INDEX_NAME", "RDB$PRIMARY")?;
-    Ok(plain.max(primary))
+/// of an unnamed UNIQUE index, the `RDB$PRIMARY<n>` name of an unnamed
+/// PRIMARY KEY index and the `RDB$FOREIGN<n>` name of an unnamed
+/// FOREIGN KEY index from ONE counter, the system generator
+/// `RDB$INDEX_NAME` (probed: a table declaring UNIQUE then PRIMARY KEY
+/// got RDB$7 and RDB$PRIMARY8; a fresh database reaches GEN_ID 6 after
+/// five generated index names). All three spellings are therefore
+/// already-used numbers for [draw_from_counter] to step over.
+fn next_index_number(file: &mut crate::Image, page_size: usize) -> Result<u64, String> {
+    let used = used_numeric_suffixes(file, page_size, "RDB$INDICES", "RDB$INDEX_NAME", &[
+        "RDB$PRIMARY",
+        "RDB$FOREIGN",
+        "RDB$",
+    ])?;
+    let fallback = used.iter().copied().max().unwrap_or(0) + 1;
+    draw_from_counter(file, page_size, "RDB$INDEX_NAME", false, 1, 1, &used, fallback)
 }
 
-fn next_numeric_suffix(
+/// Every `<prefix><n>` number already spelled in a catalog column. The
+/// prefixes are tried in order and the first that leaves a number wins,
+/// so a longer spelling (`RDB$PRIMARY`) must precede the shorter one it
+/// starts with (`RDB$`).
+fn used_numeric_suffixes(
     file: &crate::Image,
     page_size: usize,
     rel_name: &str,
     col: &str,
-    prefix: &str,
-) -> Result<u64, String> {
+    prefixes: &[&str],
+) -> Result<std::collections::HashSet<u64>, String> {
     let rel = crate::resolve_relation(file, page_size, rel_name)
         .ok_or_else(|| format!("no {} relation", rel_name))?;
     let formats = system_relation_formats(file, page_size, rel_name)
@@ -6619,17 +7164,135 @@ fn next_numeric_suffix(
         .find(|c| c.name == col)
         .map(|c| c.field_id as usize)
         .ok_or_else(|| format!("no {} column", col))?;
-    let mut max = 0u64;
+    let mut used = std::collections::HashSet::new();
     walk_rows(file, page_size, rel, descs, |values| {
         if let Some(Value::Text(t)) = values.get(fid) {
-            if let Some(num) = t.trim_end().strip_prefix(prefix)
-                .and_then(|x| x.parse::<u64>().ok())
-            {
-                max = max.max(num);
+            let t = t.trim_end();
+            for prefix in prefixes {
+                if let Some(num) =
+                    t.strip_prefix(prefix).and_then(|x| x.parse::<u64>().ok())
+                {
+                    used.insert(num);
+                    break;
+                }
             }
         }
     });
-    Ok(max + 1)
+    Ok(used)
+}
+
+/// Draw `count` consecutive numbers from one of the engine's own
+/// metadata counters - the system generators the DDL names its objects
+/// from.
+///
+/// This is the whole of the divergence this module used to carry.
+/// Firebird never asks the catalog what number is free: `DYN_UTIL_*`
+/// draws from a system generator (`RDB$RELATIONS` for a new relation's
+/// id, `RDB$INDEX_NAME`, `RDB$CONSTRAINT_NAME`, `RDB$FIELD_NAME`,
+/// `RDB$GENERATOR_NAME` for the generated names), and a generator only
+/// ever moves forward - `DROP` gives nothing back. Choosing "one past
+/// the highest in use" instead hands back a number the engine has
+/// retired, so after the first DROP the two servers name every later
+/// object differently, and on a file both servers write, fire-crab
+/// picks the very number the engine's counter is about to issue: two
+/// objects, one name. Reading the counter is also cheaper than the
+/// walk, and, being the engine's own state, it stays right when the
+/// engine writes the next object itself.
+///
+/// `holds_next` distinguishes the two spellings the engine uses:
+/// `RDB$RELATIONS` stores the id to use NEXT (a fresh database reads
+/// 128 and its first table IS 128), while every name counter stores the
+/// number last issued (a fresh database reads 0 and the first name is
+/// 1).
+///
+/// A number already spelled in the catalog is stepped over rather than
+/// re-used - a database whose counter lags behind its own objects (one
+/// restored from a backup, or written by an older fire-crab) then heals
+/// instead of colliding. Each attempt writes a strictly larger value,
+/// so this ends; it cannot return a number in use, and a draw of one or
+/// more numbers always leaves the counter moved past them. A draw of
+/// NONE (a table all of whose columns name a user domain) leaves the
+/// counter alone - it is the engine's, and a statement that mints no
+/// name must not move it.
+fn draw_from_counter(
+    file: &mut crate::Image,
+    page_size: usize,
+    counter: &str,
+    holds_next: bool,
+    floor: u64,
+    count: u64,
+    used: &std::collections::HashSet<u64>,
+    fallback: u64,
+) -> Result<u64, String> {
+    // nothing to name: the counter is the engine's, and a statement that
+    // mints no name must not move it
+    if count == 0 {
+        return Ok(fallback);
+    }
+    let Some(slot) = generator_id_by_name(file, page_size, counter) else {
+        return Ok(fallback);
+    };
+    // a database whose generator vector never grew to hold this slot
+    // keeps the old walk rather than failing the statement
+    if gen::slot_offset(file, page_size, slot).is_none() {
+        return Ok(fallback);
+    }
+    let cur = gen::read(file, page_size, slot).max(0) as u64;
+    let (first, store) = pick_run(cur, holds_next, floor, count, used)
+        .ok_or_else(|| format!("{}: no free number for {} name(s)", counter, count))?;
+    gen::write(file, page_size, slot, store as i64)?;
+    Ok(first)
+}
+
+/// One attempt at a run of `count` numbers from a counter reading `cur`:
+/// the first number of the run, and the value to leave in the counter.
+/// `holds_next` counters (RDB$RELATIONS) store the number to issue NEXT,
+/// the name counters the number last issued.
+fn counter_run(cur: u64, holds_next: bool, floor: u64, count: u64) -> (u64, u64) {
+    let first = if holds_next { cur.max(floor) } else { cur.saturating_add(1).max(floor) };
+    let last = first.saturating_add(count.saturating_sub(1));
+    (first, if holds_next { last.saturating_add(1) } else { last })
+}
+
+/// The run [draw_from_counter] settles on: the first free run of `count`
+/// consecutive numbers at or after what the counter reads, and the value
+/// to leave behind. `None` only if `used` is so dense that stepping over
+/// every number in it still found nothing - impossible for a finite set,
+/// since each attempt starts past the last, so it is the loop's bound
+/// rather than a reachable answer.
+fn pick_run(
+    cur: u64,
+    holds_next: bool,
+    floor: u64,
+    count: u64,
+    used: &std::collections::HashSet<u64>,
+) -> Option<(u64, u64)> {
+    let mut cur = cur;
+    for _ in 0..=used.len() {
+        let (first, store) = counter_run(cur, holds_next, floor, count);
+        if !(first..first + count).any(|n| used.contains(&n)) {
+            return Some((first, store));
+        }
+        cur = store;
+    }
+    None
+}
+
+/// The id a new relation takes. `RDB$RELATIONS` is the engine's counter
+/// for it and holds the id to use next; `rels` is the catalog as it
+/// stands, both to floor the counter and to step over an id a lagging
+/// counter would otherwise hand out twice. A relation id is a `u16` on
+/// every page header that names it, so exhausting the range is an
+/// error, never a wrap.
+fn next_relation_id(
+    file: &mut crate::Image,
+    page_size: usize,
+    rels: &[(u16, String)],
+) -> Result<u16, String> {
+    let used: std::collections::HashSet<u64> = rels.iter().map(|(id, _)| *id as u64).collect();
+    let fallback = rels.iter().map(|(id, _)| *id).max().unwrap_or(127).max(127) as u64 + 1;
+    let id = draw_from_counter(file, page_size, "RDB$RELATIONS", true, 128, 1, &used, fallback)?;
+    u16::try_from(id).map_err(|_| "no relation id left".to_string())
 }
 
 /// [sys_insert] with the relation id resolved by name - for catalog
@@ -7253,6 +7916,64 @@ pub fn drop_table(file: &mut crate::Image, page_size: usize, name: &str) -> Resu
             }
         });
     }
+    // A DROPPED TABLE TAKES ITS CONSTRAINTS' TRIGGERS AND PARTNER ROWS
+    // WITH IT. `ALTER TABLE ... DROP CONSTRAINT` learned this in the
+    // round before; DROP TABLE did not, and left behind the FK's
+    // `RDB$REF_CONSTRAINTS` row, the referential-action triggers (which
+    // sit on the PARENT, not on the table being dropped), the CHECK
+    // constraint's own trigger pair, and every one of their
+    // `RDB$DEPENDENCIES` rows. `gfix -v -full` still returned 0 and
+    // `gbak -b` still returned 0 - the RESTORE is where it died, with
+    // "Name of Referential Constraint not defined in constraints
+    // table". Worse, the orphan action trigger RE-ATTACHED BY NAME to a
+    // table of the same name created afterwards. Measured: the engine
+    // leaves NOTHING of any of it.
+    //
+    // A NOT NULL constraint's `RDB$CHECK_CONSTRAINTS` row holds its
+    // COLUMN name where a CHECK or FK row holds a TRIGGER name (see
+    // [check_constraint_column]), so only names that really are
+    // triggers are followed - otherwise a column called `ID` would take
+    // every `RDB$DEPENDENCIES` row of that name with it.
+    {
+        let mut trigger_names: Vec<String> = Vec::new();
+        let mut trigger_relations: Vec<String> = Vec::new();
+        for c in &constraint_names {
+            for t in check_constraint_trigger_names(file, page_size, c) {
+                let Some(on) = trigger_relation_name(file, page_size, &t) else { continue };
+                if !trigger_names.iter().any(|x| *x == t) {
+                    trigger_names.push(t);
+                }
+                if on != name && !trigger_relations.iter().any(|x| *x == on) {
+                    trigger_relations.push(on);
+                }
+            }
+        }
+        let rc_fid = sys_fid(file, page_size, "RDB$REF_CONSTRAINTS", "RDB$CONSTRAINT_NAME")?;
+        let cs = constraint_names.clone();
+        delete_catalog_rows(file, page_size, "RDB$REF_CONSTRAINTS", move |v| {
+            cs.iter().any(|c| text_is(v.get(rc_fid), c))
+        })?;
+        let tn_fid = sys_fid(file, page_size, "RDB$TRIGGERS", "RDB$TRIGGER_NAME")?;
+        let dn_fid = sys_fid(file, page_size, "RDB$DEPENDENCIES", "RDB$DEPENDENT_NAME")?;
+        for t in &trigger_names {
+            let t = t.clone();
+            delete_catalog_rows(file, page_size, "RDB$TRIGGERS", {
+                let t = t.clone();
+                move |v| text_is(v.get(tn_fid), &t)
+            })?;
+            delete_catalog_rows(file, page_size, "RDB$DEPENDENCIES", move |v| {
+                text_is(v.get(dn_fid), &t)
+            })?;
+        }
+        // the PARENT's runtime, so its action triggers stop loading -
+        // the dropped table's own runtime dies with it
+        for parent in &trigger_relations {
+            if crate::resolve_relation(file, page_size, parent).is_some() {
+                refresh_runtime(file, page_size, parent)?;
+            }
+        }
+    }
+
     let mut domain_names: Vec<String> = Vec::new();
     {
         let formats = system_relation_formats(file, page_size, "RDB$RELATION_FIELDS")
@@ -8063,36 +8784,21 @@ fn write_generator(
     Ok(())
 }
 
-/// The next free system-generated `RDB$<n>` generator name (identity
-/// generators): one past the highest numeric `RDB$<n>` in `RDB$GENERATORS`.
-fn next_generator_number(file: &crate::Image, page_size: usize) -> u64 {
-    let (Some(rel), Some(formats)) = (
-        crate::resolve_relation(file, page_size, "RDB$GENERATORS"),
-        system_relation_formats(file, page_size, "RDB$GENERATORS"),
-    ) else {
-        return 1;
-    };
-    let Some((_, descs)) = formats.iter().max_by_key(|(n, _)| *n) else {
-        return 1;
-    };
-    let name_f = match relation_columns(file, page_size, "RDB$GENERATORS")
-        .iter()
-        .find(|c| c.name == "RDB$GENERATOR_NAME")
-    {
-        Some(c) => c.field_id as usize,
-        None => return 1,
-    };
-    let mut max = 0u64;
-    walk_rows(file, page_size, rel, descs, |v| {
-        if let Some(Value::Text(t)) = v.get(name_f) {
-            if let Some(num) = t.trim_end().strip_prefix("RDB$") {
-                if let Ok(n) = num.parse::<u64>() {
-                    max = max.max(n);
-                }
-            }
-        }
-    });
-    max + 1
+/// The first of `count` consecutive system-generated `RDB$<n>` generator
+/// names (the implicit generator behind an identity column), from the
+/// engine's own counter for them - the system generator
+/// `RDB$GENERATOR_NAME` (probed: a table with an identity column
+/// created, dropped, then created again leaves GEN_ID 3 and names the
+/// third generator RDB$3, never re-using the dropped RDB$2).
+fn next_generator_number(
+    file: &mut crate::Image,
+    page_size: usize,
+    count: u64,
+) -> Result<u64, String> {
+    let used =
+        used_numeric_suffixes(file, page_size, "RDB$GENERATORS", "RDB$GENERATOR_NAME", &["RDB$"])?;
+    let fallback = used.iter().copied().max().unwrap_or(0) + 1;
+    draw_from_counter(file, page_size, "RDB$GENERATOR_NAME", false, 1, count, &used, fallback)
 }
 
 /// The owner every fire-crab-written catalog object belongs to. The
@@ -11564,6 +12270,541 @@ fn advance_oldest_transactions(file: &mut crate::Image, page_size: usize) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn used(ns: &[u64]) -> std::collections::HashSet<u64> {
+        ns.iter().copied().collect()
+    }
+
+    /// A column carrying nothing but its NOT NULL flag, for the
+    /// constraint-order tests. `at` is where the NOT NULL clause is
+    /// written inside the column's own text.
+    fn col_nn(name: &str, at: Option<usize>) -> ColumnDef {
+        ColumnDef {
+            name: name.to_string(),
+            field_type: 8,
+            dtype: 8,
+            length: 4,
+            scale: 0,
+            sub_type: 0,
+            char_len: None,
+            precision: None,
+            dims: Vec::new(),
+            segment_length: None,
+            charset_id: None,
+            not_null: at.is_some(),
+            not_null_constraint: at.is_some(),
+            not_null_at: at.unwrap_or(0),
+            default: None,
+            domain: None,
+            identity: None,
+            computed: None,
+        }
+    }
+
+    /// A plain nullable column.
+    fn col(name: &str) -> ColumnDef {
+        col_nn(name, None)
+    }
+
+    fn key_at(place: ConstraintPlace, primary: bool) -> TableConstraint {
+        TableConstraint {
+            kind: ConstraintKind::Key(KeyDef {
+                name: String::new(),
+                columns: Vec::new(),
+                primary,
+            }),
+            place,
+        }
+    }
+
+    /// A FOREIGN KEY at `place` - only its seat matters to
+    /// [constraint_steps], the partner and the actions never do.
+    fn fk_at(place: ConstraintPlace) -> ForeignKeyDef {
+        ForeignKeyDef {
+            name: String::new(),
+            columns: Vec::new(),
+            ref_table: "P".into(),
+            ref_columns: Vec::new(),
+            on_update: RefAction::Restrict,
+            on_delete: RefAction::Restrict,
+            place,
+        }
+    }
+
+    fn check_at(place: ConstraintPlace) -> TableConstraint {
+        TableConstraint {
+            kind: ConstraintKind::Check(CheckDef {
+                name: String::new(),
+                source: String::new(),
+                trigger_blr: Vec::new(),
+                fields: Vec::new(),
+            }),
+            place,
+        }
+    }
+
+    /// `M1 (ID INTEGER NOT NULL PRIMARY KEY, C INTEGER UNIQUE,
+    ///      D VARCHAR(10) NOT NULL)`
+    /// -> INTEG_1 NOT NULL (ID), INTEG_2 PRIMARY KEY, INTEG_3 UNIQUE,
+    ///    INTEG_4 NOT NULL (D)  [measured on the engine].
+    ///
+    /// Every constraint here is COLUMN-LEVEL, so pass 1 alone orders
+    /// them and the answer reads like plain declaration order - which is
+    /// exactly why the superseded single-pass rule fitted this shape and
+    /// nothing else.
+    #[test]
+    fn every_constraint_inline_reads_as_declaration_order() {
+        //         ID INTEGER NOT NULL PRIMARY KEY
+        //         0          11       20
+        let cols = [col_nn("ID", Some(11)), col("C"), col_nn("D", Some(14))];
+        let cs = [
+            key_at(ConstraintPlace::Inline { col: 0, at: 20 }, true),
+            key_at(ConstraintPlace::Inline { col: 1, at: 10 }, false),
+        ];
+        assert_eq!(
+            constraint_steps(&cols, &cs, &[]),
+            vec![
+                ConstraintStep::NotNull(0), // INTEG_1
+                ConstraintStep::Table(0),   // INTEG_2 - the PRIMARY KEY
+                ConstraintStep::Table(1),   // INTEG_3 - the UNIQUE
+                ConstraintStep::NotNull(2), // INTEG_4
+            ]
+        );
+    }
+
+    /// THE DECISIVE SHAPE. `M2 (A INTEGER, UNIQUE (A), B INTEGER
+    /// UNIQUE)` -> INTEG_5 UNIQUE on B, INTEG_6 UNIQUE on A (measured):
+    /// the inline UNIQUE written LAST is numbered FIRST, because it is
+    /// column-level and the `UNIQUE (A)` ahead of it is table-level. No
+    /// single-pass text order can produce this, which is what forced the
+    /// pass discriminator into [ConstraintPlace].
+    #[test]
+    fn an_inline_constraint_outranks_an_earlier_table_level_one() {
+        let cols = [col("A"), col("B")];
+        let cs = [
+            key_at(ConstraintPlace::Table { decl: 1 }, false),         // UNIQUE (A)
+            key_at(ConstraintPlace::Inline { col: 1, at: 10 }, false), // B ... UNIQUE
+        ];
+        assert_eq!(
+            constraint_steps(&cols, &cs, &[]),
+            vec![
+                ConstraintStep::Table(1), // INTEG_5 - B's inline UNIQUE
+                ConstraintStep::Table(0), // INTEG_6 - the table-level UNIQUE (A)
+            ]
+        );
+    }
+
+    /// `M4 (A INTEGER NOT NULL, B INTEGER, UNIQUE (B), C INTEGER NOT
+    /// NULL, PRIMARY KEY (A))` -> NOT NULL, NOT NULL, UNIQUE, PRIMARY
+    /// KEY (measured): BOTH NOT NULLs (pass 1) before BOTH table-level
+    /// keys (pass 2), even though `UNIQUE (B)` is written between them.
+    /// This is the shape the strict-declaration-order rule broke.
+    #[test]
+    fn both_passes_run_to_completion_in_turn() {
+        let cols = [col_nn("A", Some(10)), col("B"), col_nn("C", Some(10))];
+        let cs = [
+            key_at(ConstraintPlace::Table { decl: 2 }, false), // UNIQUE (B)
+            key_at(ConstraintPlace::Table { decl: 4 }, true),  // PRIMARY KEY (A)
+        ];
+        assert_eq!(
+            constraint_steps(&cols, &cs, &[]),
+            vec![
+                ConstraintStep::NotNull(0), // INTEG_11
+                ConstraintStep::NotNull(2), // INTEG_12
+                ConstraintStep::Table(0),   // INTEG_13 - UNIQUE (B)
+                ConstraintStep::Table(1),   // INTEG_14 - PRIMARY KEY (A)
+            ]
+        );
+    }
+
+    /// `M5 (A INTEGER CHECK (A > 0), B INTEGER NOT NULL, CHECK (B <
+    /// 100), C INTEGER UNIQUE)` -> CHECK on A, NOT NULL on B, UNIQUE on
+    /// C, the table-level CHECK (measured): the same two passes shown
+    /// independently with CHECKs, the table-level one written between
+    /// `B` and `C` landing after `C`'s inline UNIQUE.
+    #[test]
+    fn a_table_level_check_follows_every_inline_constraint() {
+        let cols = [col("A"), col_nn("B", Some(10)), col("C")];
+        let cs = [
+            check_at(ConstraintPlace::Inline { col: 0, at: 10 }), // A ... CHECK (A > 0)
+            check_at(ConstraintPlace::Table { decl: 2 }),         // CHECK (B < 100)
+            key_at(ConstraintPlace::Inline { col: 2, at: 10 }, false), // C ... UNIQUE
+        ];
+        assert_eq!(
+            constraint_steps(&cols, &cs, &[]),
+            vec![
+                ConstraintStep::Table(0),   // INTEG_15 - A's inline CHECK
+                ConstraintStep::NotNull(1), // INTEG_16 - B's NOT NULL
+                ConstraintStep::Table(2),   // INTEG_17 - C's inline UNIQUE
+                ConstraintStep::Table(1),   // INTEG_18 - the table-level CHECK
+            ]
+        );
+    }
+
+    /// WITHIN ONE COLUMN it is plain text order: `N1 (A INTEGER UNIQUE
+    /// NOT NULL, B INTEGER)` -> UNIQUE then NOT NULL, and `N2 (A INTEGER
+    /// NOT NULL UNIQUE, B INTEGER)` -> NOT NULL then UNIQUE (both
+    /// measured). The same two clauses swap numbers when the text swaps
+    /// them - which a per-column count could not express at all.
+    #[test]
+    fn within_one_column_the_clauses_follow_the_text() {
+        // A INTEGER UNIQUE NOT NULL
+        // 0         10     17
+        let n1_cols = [col_nn("A", Some(17)), col("B")];
+        let n1 = [key_at(ConstraintPlace::Inline { col: 0, at: 10 }, false)];
+        assert_eq!(
+            constraint_steps(&n1_cols, &n1, &[]),
+            vec![ConstraintStep::Table(0), ConstraintStep::NotNull(0)]
+        );
+        // A INTEGER NOT NULL UNIQUE
+        // 0         10       19
+        let n2_cols = [col_nn("A", Some(10)), col("B")];
+        let n2 = [key_at(ConstraintPlace::Inline { col: 0, at: 19 }, false)];
+        assert_eq!(
+            constraint_steps(&n2_cols, &n2, &[]),
+            vec![ConstraintStep::NotNull(0), ConstraintStep::Table(0)]
+        );
+    }
+
+    /// A column-level PRIMARY KEY IMPLIES the NOT NULL, and the implied
+    /// row is numbered just BEFORE the key: `(A INTEGER PRIMARY KEY, B
+    /// INTEGER)` -> INTEG_1 NOT NULL, INTEG_2 PRIMARY KEY, and even
+    /// `(A INTEGER PRIMARY KEY NOT NULL, B INTEGER)` -> NOT NULL then
+    /// PRIMARY KEY though the text reads the other way (both measured).
+    /// The caller stamps the EARLIER of the two offsets on the column,
+    /// and the stable sort keeps the NOT NULL ahead of the key on a tie.
+    #[test]
+    fn an_implied_not_null_is_numbered_just_before_its_key() {
+        // A INTEGER PRIMARY KEY  - nothing else written, so both at 10
+        let cols = [col_nn("A", Some(10)), col("B")];
+        let cs = [key_at(ConstraintPlace::Inline { col: 0, at: 10 }, true)];
+        assert_eq!(
+            constraint_steps(&cols, &cs, &[]),
+            vec![ConstraintStep::NotNull(0), ConstraintStep::Table(0)]
+        );
+    }
+
+    /// A FOREIGN KEY is the FOURTH KIND OF CONSTRAINT, not a fourth
+    /// thing that always comes last: it takes its number where it is
+    /// written, in the same two passes as a key, a CHECK or a NOT NULL.
+    /// All four shapes measured on the engine through 127.0.0.1/3050,
+    /// both servers' files read back BY THE ENGINE:
+    ///
+    /// - `F1 (A INTEGER, UNIQUE (A), B INTEGER REFERENCES P)` ->
+    ///   FOREIGN KEY on B, then UNIQUE on A. The M2 inversion on a
+    ///   fourth constraint kind: the INLINE clause written LAST takes
+    ///   the LOWER number, because it is column-level.
+    /// - `G1 (A INTEGER, B INTEGER, FOREIGN KEY (A) REFERENCES P,
+    ///   UNIQUE (B))` -> FOREIGN KEY, then UNIQUE. Two TABLE-level
+    ///   clauses of different kinds, ordered by declaration.
+    /// - `G2 (..., UNIQUE (B), FOREIGN KEY (A) REFERENCES P)` ->
+    ///   UNIQUE, then FOREIGN KEY - the same two clauses, swapped in
+    ///   the text, swapped in the answer. G1 and G2 together are what
+    ///   an FK-last writer cannot do: it is right on G2 by luck and
+    ///   wrong on G1.
+    /// - `G3 (..., FOREIGN KEY (A) REFERENCES P, CHECK (B > 0))` ->
+    ///   FOREIGN KEY, then CHECK. The same, against a CHECK.
+    #[test]
+    fn a_foreign_key_is_numbered_where_it_is_written() {
+        // F1: the inline REFERENCES on B outranks the table-level
+        // UNIQUE (A) written ahead of it
+        let cols = [col("A"), col("B")];
+        assert_eq!(
+            constraint_steps(
+                &cols,
+                &[key_at(ConstraintPlace::Table { decl: 1 }, false)],
+                &[fk_at(ConstraintPlace::Inline { col: 1, at: 10 })],
+            ),
+            vec![ConstraintStep::Fk(0), ConstraintStep::Table(0)]
+        );
+        // G1: FOREIGN KEY written first, numbered first
+        assert_eq!(
+            constraint_steps(
+                &cols,
+                &[key_at(ConstraintPlace::Table { decl: 3 }, false)],
+                &[fk_at(ConstraintPlace::Table { decl: 2 })],
+            ),
+            vec![ConstraintStep::Fk(0), ConstraintStep::Table(0)]
+        );
+        // G2: the same two, swapped in the text
+        assert_eq!(
+            constraint_steps(
+                &cols,
+                &[key_at(ConstraintPlace::Table { decl: 2 }, false)],
+                &[fk_at(ConstraintPlace::Table { decl: 3 })],
+            ),
+            vec![ConstraintStep::Table(0), ConstraintStep::Fk(0)]
+        );
+        // G3: against a table-level CHECK
+        assert_eq!(
+            constraint_steps(
+                &cols,
+                &[check_at(ConstraintPlace::Table { decl: 3 })],
+                &[fk_at(ConstraintPlace::Table { decl: 2 })],
+            ),
+            vec![ConstraintStep::Fk(0), ConstraintStep::Table(0)]
+        );
+    }
+
+    /// `F2 (A INTEGER, FOREIGN KEY (A) REFERENCES P, B INTEGER NOT
+    /// NULL)` -> NOT NULL on B, then FOREIGN KEY on A (measured): the
+    /// TABLE-level foreign key written BEFORE column B still lands
+    /// after B's column-level NOT NULL, because the passes are about
+    /// WHERE A CLAUSE IS ATTACHED and not about what kind it is.
+    #[test]
+    fn a_table_level_fk_still_follows_every_inline_constraint() {
+        let cols = [col("A"), col_nn("B", Some(10))];
+        assert_eq!(
+            constraint_steps(&cols, &[], &[fk_at(ConstraintPlace::Table { decl: 1 })]),
+            vec![ConstraintStep::NotNull(1), ConstraintStep::Fk(0)]
+        );
+    }
+
+    /// THE TYPE-COMPATIBILITY RULE FOR A FOREIGN KEY, measured on the
+    /// engine at 127.0.0.1/3050 on 2026-09-03 by building a parent table
+    /// per type and a child column per type against it and reading back
+    /// which `CREATE TABLE ... REFERENCES` it accepted (24 x 24 pairs,
+    /// plus precision, charset, collation and domain probes). What it
+    /// refuses it refuses with `partner index segment no 1 has
+    /// incompatible data type`, and a database carrying such a key
+    /// cannot be restored by `gbak -c`.
+    ///
+    /// The rows this pins, each measured:
+    ///
+    /// - SMALLINT, INTEGER, FLOAT, DOUBLE and NUMERIC(p <= 9) key
+    ///   together; SMALLINT onto INTEGER is accepted by BOTH servers.
+    /// - BIGINT keys with NUMERIC(10..18) and with nothing narrower:
+    ///   INTEGER onto BIGINT is refused, and so is NUMERIC(9,0) onto
+    ///   NUMERIC(10,0) - the boundary is the PRECISION, because the
+    ///   precision picks the storage type.
+    /// - INT128 keys with NUMERIC(19..38) and not with BIGINT.
+    /// - DATE, TIME and TIMESTAMP are three classes, and each TIME ZONE
+    ///   type is its own (TIMESTAMP onto TIMESTAMP WITH TIME ZONE is
+    ///   refused).
+    /// - DECFLOAT(16) and DECFLOAT(34) key TOGETHER - the one pair of
+    ///   different dtypes that share a class.
+    /// - a string's LENGTH and CHAR-vs-VARCHAR never matter
+    ///   (VARCHAR(80) keys against CHAR(5)), but its CHARACTER SET and
+    ///   its COLLATION both do (NONE, OCTETS and WIN1252 are three
+    ///   classes; UTF8 and UTF8 COLLATE UNICODE are two).
+    /// - BLOB cannot be a key at all, on either side.
+    #[test]
+    fn a_foreign_key_partner_must_key_the_same_way() {
+        use crate::format::dtype;
+        let d = |dtype: u8, length: u16, scale: i8, sub_type: i16| Descriptor {
+            dtype,
+            scale,
+            length,
+            sub_type,
+            flags: 0,
+            offset: 0,
+        };
+        let same = |a: &Descriptor, b: &Descriptor| key_class(a) == key_class(b);
+        let short = d(dtype::SHORT, 2, 0, 0);
+        let long = d(dtype::LONG, 4, 0, 0);
+        let num92 = d(dtype::LONG, 4, -2, 1); // NUMERIC(9,2)
+        let dbl = d(dtype::DOUBLE, 8, 0, 0);
+        let flt = d(dtype::REAL, 4, 0, 0);
+        let i64_ = d(dtype::INT64, 8, 0, 0);
+        let num182 = d(dtype::INT64, 8, -2, 1); // NUMERIC(18,2)
+        let i128_ = d(dtype::INT128, 16, 0, 0);
+        // one class: the small exact ints, the floats, and NUMERIC(p<=9)
+        for x in [&short, &num92, &dbl, &flt] {
+            assert!(same(&long, x));
+        }
+        // and NOT with the int64 class, nor int64 with int128
+        assert!(!same(&long, &i64_));
+        assert!(same(&i64_, &num182));
+        assert!(!same(&i64_, &i128_));
+        // the date/time family: three classes, and the zoned ones apart
+        let date = d(dtype::SQL_DATE, 4, 0, 0);
+        let time = d(dtype::SQL_TIME, 4, 0, 0);
+        let ts = d(dtype::TIMESTAMP, 8, 0, 0);
+        let tstz = d(dtype::TIMESTAMP_TZ, 12, 0, 0);
+        assert!(!same(&date, &time) && !same(&time, &ts) && !same(&date, &ts));
+        assert!(!same(&ts, &tstz));
+        // DECFLOAT(16) and DECFLOAT(34) key together
+        assert!(same(&d(dtype::DEC64, 8, 0, 0), &d(dtype::DEC128, 16, 0, 0)));
+        assert!(!same(&d(dtype::DEC64, 8, 0, 0), &dbl));
+        // text: length and CHAR-vs-VARCHAR are nothing, ttype is all
+        let char_none_5 = d(dtype::TEXT, 5, 0, 0);
+        let varchar_none_80 = d(dtype::VARYING, 82, 0, 0);
+        let varchar_utf8 = d(dtype::VARYING, 42, 0, 4);
+        let varchar_utf8_unicode = d(dtype::VARYING, 42, 0, (2 << 8) | 4);
+        let char_octets = d(dtype::TEXT, 5, 0, 1);
+        assert!(same(&char_none_5, &varchar_none_80));
+        assert!(!same(&char_none_5, &varchar_utf8));
+        assert!(!same(&char_none_5, &char_octets));
+        assert!(!same(&varchar_utf8, &varchar_utf8_unicode));
+        assert!(same(&varchar_utf8, &d(dtype::TEXT, 40, 0, 4)));
+        // a text column never keys with a number
+        assert!(!same(&char_none_5, &long));
+        // and a BLOB is no key at all
+        assert!(key_class(&d(dtype::BLOB, 8, 0, 1)).is_none());
+    }
+
+    /// `NO ACTION` is its OWN stored rule. It behaves exactly as
+    /// `RESTRICT` - neither synthesises a trigger - but the engine
+    /// writes back what was written: `ON DELETE NO ACTION` stores
+    /// `RDB$DELETE_RULE = 'NO ACTION'` where an omitted clause and an
+    /// explicit `RESTRICT` store `'RESTRICT'` (measured, both files read
+    /// back by the engine). Collapsing the two was a silent wrong write
+    /// that survived gbak.
+    #[test]
+    fn no_action_is_stored_as_no_action_and_still_makes_no_trigger() {
+        assert_eq!(RefAction::NoAction.rule(), "NO ACTION");
+        assert_eq!(RefAction::Restrict.rule(), "RESTRICT");
+        assert!(!RefAction::NoAction.synthesises_trigger());
+        assert!(!RefAction::Restrict.synthesises_trigger());
+        for a in [RefAction::Cascade, RefAction::SetNull, RefAction::SetDefault] {
+            assert!(a.synthesises_trigger());
+        }
+    }
+
+    /// Nothing is dropped and nothing is written twice, whatever the
+    /// places are: every column with a NOT NULL and every constraint
+    /// appears exactly once, the table-level ones keeping declaration
+    /// order among themselves.
+    #[test]
+    fn every_constraint_is_written_exactly_once() {
+        let cols = [col_nn("A", Some(3)), col_nn("B", Some(9)), col("C")];
+        for cs in [
+            vec![],
+            vec![key_at(ConstraintPlace::Table { decl: 0 }, true)],
+            vec![
+                key_at(ConstraintPlace::Table { decl: 0 }, true),
+                check_at(ConstraintPlace::Table { decl: 1 }),
+            ],
+            vec![
+                check_at(ConstraintPlace::Inline { col: 0, at: 20 }),
+                key_at(ConstraintPlace::Inline { col: 0, at: 1 }, false),
+                check_at(ConstraintPlace::Table { decl: 2 }),
+            ],
+            vec![
+                check_at(ConstraintPlace::Table { decl: 0 }),
+                key_at(ConstraintPlace::Inline { col: 2, at: 5 }, false),
+                check_at(ConstraintPlace::Table { decl: 2 }),
+            ],
+        ] {
+            let steps = constraint_steps(&cols, &cs, &[]);
+            let mut tables: Vec<usize> = steps
+                .iter()
+                .filter_map(|s| match s {
+                    ConstraintStep::Table(i) => Some(*i),
+                    _ => None,
+                })
+                .collect();
+            let nn: Vec<usize> = steps
+                .iter()
+                .filter_map(|s| match s {
+                    ConstraintStep::NotNull(i) => Some(*i),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(nn, vec![0, 1], "the NOT NULL rows, in column order");
+            // the TABLE-level ones keep declaration order among themselves
+            let table_only: Vec<usize> = tables
+                .iter()
+                .copied()
+                .filter(|i| matches!(cs[*i].place, ConstraintPlace::Table { .. }))
+                .collect();
+            let mut sorted_table_only = table_only.clone();
+            sorted_table_only.sort_unstable();
+            assert_eq!(
+                table_only, sorted_table_only,
+                "the table-level clauses left declaration order"
+            );
+            tables.sort_unstable();
+            tables.dedup();
+            assert_eq!(tables.len(), cs.len(), "a constraint was dropped or doubled");
+        }
+    }
+
+    /// A fresh database's name counters read 0 and their first name is
+    /// 1 (probed: RDB$INDEX_NAME is 0 in a just-created database and 1
+    /// after the first generated index name); the counter keeps the
+    /// number last issued.
+    #[test]
+    fn a_name_counter_issues_one_first_and_keeps_the_last_issued() {
+        assert_eq!(counter_run(0, false, 1, 1), (1, 1));
+        assert_eq!(counter_run(1, false, 1, 1), (2, 2));
+        assert_eq!(counter_run(7, false, 1, 1), (8, 8));
+    }
+
+    /// RDB$RELATIONS spells it the other way: it holds the id to use
+    /// NEXT. A fresh database reads 128 and its first table IS 128
+    /// (probed), leaving 129 behind.
+    #[test]
+    fn the_relation_counter_issues_what_it_holds() {
+        assert_eq!(counter_run(128, true, 128, 1), (128, 129));
+        assert_eq!(counter_run(131, true, 128, 1), (131, 132));
+    }
+
+    /// A statement that mints several names at once takes them
+    /// consecutively and leaves the counter past the whole run.
+    #[test]
+    fn a_run_of_names_is_consecutive() {
+        assert_eq!(counter_run(5, false, 1, 3), (6, 8));
+        assert_eq!(counter_run(128, true, 128, 2), (128, 130));
+    }
+
+    /// A counter below its floor is lifted to it: a relation id is never
+    /// below 128 whatever the counter says.
+    #[test]
+    fn the_floor_wins_over_a_lagging_counter() {
+        assert_eq!(counter_run(0, true, 128, 1), (128, 129));
+        assert_eq!(counter_run(0, false, 1, 1), (1, 1));
+    }
+
+    /// The whole point of the counter: a number a DROP gave back is NOT
+    /// re-issued. The catalog no longer holds RDB$PRIMARY2, and the
+    /// counter still hands out 3.
+    #[test]
+    fn a_dropped_number_is_not_re_issued() {
+        assert_eq!(pick_run(2, false, 1, 1, &used(&[1])), Some((3, 3)));
+    }
+
+    /// A counter that lags behind the objects already written (a
+    /// database restored from a backup, or one an older fire-crab wrote
+    /// by scanning) steps over every number in use instead of naming a
+    /// second object what the first is called.
+    #[test]
+    fn a_lagging_counter_steps_over_what_is_in_use() {
+        assert_eq!(pick_run(0, false, 1, 1, &used(&[1, 2, 3])), Some((4, 4)));
+        assert_eq!(pick_run(0, true, 128, 1, &used(&[128, 129])), Some((130, 131)));
+        // and it heals: the counter is left past the collision, so the
+        // next draw is one step, not another walk
+        let (_, store) = pick_run(0, false, 1, 1, &used(&[1, 2, 3])).unwrap();
+        assert_eq!(pick_run(store, false, 1, 1, &used(&[1, 2, 3])), Some((5, 5)));
+    }
+
+    /// A run is placed whole: a free number inside an otherwise taken
+    /// run does not make the run free.
+    #[test]
+    fn a_run_needs_every_number_of_it_free() {
+        assert_eq!(pick_run(0, false, 1, 3, &used(&[2])), Some((4, 6)));
+        assert_eq!(pick_run(0, false, 1, 2, &used(&[2])), Some((3, 4)));
+        // a run clear of everything in use is taken where it lies
+        assert_eq!(pick_run(0, false, 1, 2, &used(&[3])), Some((1, 2)));
+    }
+
+    /// Whatever it returns is free, and it always moves the counter past
+    /// what it returned - the invariant that stops two objects sharing a
+    /// name.
+    #[test]
+    fn a_drawn_run_is_free_and_the_counter_moves_past_it() {
+        let taken = used(&[1, 2, 4, 5, 7]);
+        for count in 1..4u64 {
+            for cur in 0..10u64 {
+                let (first, store) = pick_run(cur, false, 1, count, &taken).unwrap();
+                assert!(first > cur, "cur {} gave {}", cur, first);
+                for n in first..first + count {
+                    assert!(!taken.contains(&n), "drew a used number {}", n);
+                }
+                assert_eq!(store, first + count - 1);
+            }
+        }
+    }
 
     #[test]
     fn blob_id_bytes_round_trip() {

@@ -861,6 +861,44 @@ pub fn insert_index_entry(
     unique: bool,
     descending: bool,
 ) -> Result<(), String> {
+    // no caller-supplied test: a live record's entry is taken at its
+    // word, which is what this always did
+    insert_index_entry_checked(
+        file, page_size, rel, index_id, key, recno, unique, descending, &|_, _| true,
+    )
+}
+
+/// [insert_index_entry] with the caller's own test of whether a
+/// CONFLICTING entry is still real.
+///
+/// An index entry OUTLIVES the record version that wrote it: a row
+/// whose key column is rewritten keeps its old entry until garbage
+/// collection, and this file's unique check only asked whether the
+/// record it names is still LIVE - which it is, under its new key. So
+/// `DROP INDEX X` (a rename of the RDB$INDICES row to
+/// `RDB$TEMP_DEPEND_<rel>_<n>`, the engine's own deferred drop)
+/// left a "X" entry pointing at a live row that no longer spells X, and
+/// `CREATE INDEX X` after it collided with that ghost FOR EVER - the
+/// engine accepts it, and one engine attachment (whose GC clears the
+/// entry) made fire-crab accept it too.
+///
+/// `still_keys(file, recno)` answers whether the record that entry
+/// names STILL BUILDS THIS KEY - the engine's own duplicate scan, which
+/// fetches the conflicting record and compares (idx.cpp). A caller that
+/// cannot rebuild a key answers `true`, which is the conservative half:
+/// a refusal, never a duplicate let through.
+#[allow(clippy::too_many_arguments)]
+pub fn insert_index_entry_checked(
+    file: &mut crate::Image,
+    page_size: usize,
+    rel: u16,
+    index_id: u8,
+    key: &[u8],
+    recno: u64,
+    unique: bool,
+    descending: bool,
+    still_keys: &dyn Fn(&crate::Image, u64) -> bool,
+) -> Result<(), String> {
     // a DESCENDING index orders its (complemented) keys by a different
     // rule where one is a prefix of another - see `node_cmp_desc`
     let cmp = |k: &[u8], r: u64, n: &BtNode| {
@@ -936,10 +974,12 @@ pub fn insert_index_entry(
     // again under the same name.
     if unique
         && !key.is_empty()
-        && content
-            .nodes
-            .iter()
-            .any(|n| n.key == key && n.recno != recno && recno_is_live(file, page_size, rel, n.recno))
+        && content.nodes.iter().any(|n| {
+            n.key == key
+                && n.recno != recno
+                && recno_is_live(file, page_size, rel, n.recno)
+                && still_keys(file, n.recno)
+        })
     {
         // the EXACT string is load-bearing: the server matches on it to
         // build the typed 23000 vector (gdscode 335544665 with the

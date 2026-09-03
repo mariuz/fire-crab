@@ -94,7 +94,11 @@ if [ -f "$KNOWN" ] && [ ${#gates[@]} -gt 1 ]; then
 fi
 
 : > "$LOG"
-mkdir -p /tmp/fbhandson && chmod 1777 /tmp/fbhandson 2>/dev/null
+# 0777 and NOT 1777: the sticky bit stops this server renaming its own
+# work file over a scratch database the ENGINE created (they run as
+# different users), so the commit fails "Permission denied" and the
+# gate reads as a silent-write defect in whatever is under test.
+mkdir -p /tmp/fbhandson && chmod 0777 /tmp/fbhandson 2>/dev/null
 TMP=$(mktemp -d /tmp/fc-sweep-XXXXXX)
 trap 'rm -rf "$TMP"' EXIT
 TIMES="$TMP/times"
