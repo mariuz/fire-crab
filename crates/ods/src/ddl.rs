@@ -8327,6 +8327,57 @@ fn dispose_row_purge(file: &mut crate::Image, page_size: usize, rel: u16, page: 
     }
 }
 
+/// PATCH ONE ROW OF A SYSTEM RELATION, from outside this crate.
+///
+/// The legacy BLR write API (`blr_modify` over a system relation, which
+/// is how gbak's client-driven restore re-points `RDB$DATABASE`) needs
+/// exactly what [patch_sys_row] does and nothing more: find the row,
+/// decode it AT ITS OWN FORMAT, and write the named columns back.
+///
+/// It is deliberately a thin wrapper rather than a new writer. Every
+/// property that took a defect to learn - the row's own format rather
+/// than the newest, the fragmented-row read-whole-patch-head path, the
+/// back version and the deferred blob disposal under a DDL transaction -
+/// belongs to that function, and a second implementation would have to
+/// re-learn all of them.
+///
+/// `values` names columns by their catalog name; a text column takes
+/// [SysValue::Text], which SPACE-pads to the column width the way the
+/// engine's own `PAD()` does (ini.epp:785).
+pub fn patch_system_row(
+    file: &mut crate::Image,
+    page_size: usize,
+    rel_name: &str,
+    rel: u16,
+    pred: impl Fn(&[Value]) -> bool,
+    values: &[(&str, SysValue<'_>)],
+) -> Result<(), String> {
+    let vals: Vec<(&str, SysVal<'_>)> = values
+        .iter()
+        .map(|(c, v)| {
+            (
+                *c,
+                match v {
+                    SysValue::Text(t) => SysVal::S(t),
+                    SysValue::Int(n) => SysVal::I(*n),
+                    SysValue::Null => SysVal::Null,
+                },
+            )
+        })
+        .collect();
+    patch_sys_row(file, page_size, rel_name, rel, pred, &vals)
+}
+
+/// The value shapes [patch_system_row] takes. A narrow public face over
+/// the crate-private `SysVal`: the BLR write path assigns text, integers
+/// and NULL, and has no business naming a raw blob id or an octet
+/// column, whose padding rules differ.
+pub enum SysValue<'a> {
+    Text(&'a str),
+    Int(i64),
+    Null,
+}
+
 fn patch_sys_row(
     file: &mut crate::Image,
     page_size: usize,

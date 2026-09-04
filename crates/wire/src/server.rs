@@ -88331,7 +88331,7 @@ fn after_auth(
                         // `request synchronization error` to a request
                         // that was never waiting.
                         m.input = input;
-                        if let Some(e) = m.pump(db, usize::MAX) {
+                        if let Some(e) = m.pump(&mut database, usize::MAX) {
                             if trace_on() {
                                 eprintln!("[srv] op_transact refused: {e}");
                             }
@@ -88428,13 +88428,13 @@ fn after_auth(
                     .and_then(|slot| slot.req.msgs.get(msgno.max(0) as usize).cloned())
                     .unwrap_or_default();
                 let input = read_request_message(&mut s, &mut dec, &fields)?;
-                match (blr_slots.get_mut(&handle), &database) {
-                    (Some(slot), Some(db)) => {
+                match blr_slots.get_mut(&handle) {
+                    Some(slot) if database.is_some() => {
                         // EXE_start then EXE_send: the request runs to its
                         // first stall, and the message is delivered into
                         // it there (exe.cpp:1185-1190, 896-967).
                         slot.m = BlrMachine::start(slot.req.clone());
-                        slot.m.run(db);
+                        slot.m.run(&mut database);
                         if slot.m.deliver(msgno.max(0) as u8, input).is_err() {
                             respond_error(&mut s, &mut enc, GDS_REQ_SYNC)?;
                             continue;
@@ -88456,10 +88456,10 @@ fn after_auth(
                 if !switch_named_tx(&mut database, op_tr, &mut s, &mut enc)? {
                     continue;
                 }
-                match (blr_slots.get_mut(&handle), &database) {
-                    (Some(slot), Some(db)) => {
+                match blr_slots.get_mut(&handle) {
+                    Some(slot) if database.is_some() => {
                         slot.m = BlrMachine::start(slot.req.clone());
-                        slot.m.run(db);
+                        slot.m.run(&mut database);
                         respond(&mut s, &mut enc, handle)?;
                     }
                     _ => respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?,
@@ -88474,12 +88474,12 @@ fn after_auth(
                 // the frame echoes the transaction the client named, so
                 // the answer belongs to the request it asked about
                 let tx = if op_tr != 0 { op_tr } else { database.as_ref().map_or(0, |d| d.cur_handle) };
-                match (blr_slots.get_mut(&handle), &database) {
-                    (Some(slot), Some(db)) => {
+                match blr_slots.get_mut(&handle) {
+                    Some(slot) if database.is_some() => {
                         // run the request forward until it has what the
                         // client asked for, or parks, or ends
                         let want = batch.max(1) as usize;
-                        if let Some(e) = slot.m.pump(db, want) {
+                        if let Some(e) = slot.m.pump(&mut database, want) {
                             if trace_on() {
                                 eprintln!("[srv] blr request refused: {e}");
                             }
@@ -88495,6 +88495,50 @@ fn after_auth(
                         let mut c = 0;
                         send_request_batch(&mut s, &mut enc, handle, &[], &mut c, msgno, batch, tx)?;
                     }
+                }
+            }
+            // `op_send` INBOUND - the packet that un-parks a request.
+            // Opcode 25 travels in BOTH directions: the server tags a
+            // delivered message with it, and the client uses it to push
+            // one INTO a stalled request. Until the executor could
+            // suspend there was nothing to push into, so this arm did
+            // not exist and the catch-all broke the connection.
+            x if x == OP_SEND => {
+                let handle = read_int(&mut s, &mut dec)?; // request handle
+                read_int(&mut s, &mut dec)?; // incarnation
+                // p_data_transaction IS STALE GARBAGE HERE. The client
+                // never sets it for op_send (client/interface.cpp) and
+                // the engine never reads it - a request runs under the
+                // transaction pinned at its START (TRA_attach_request),
+                // not one named per packet. Switching to it would
+                // silently retarget the write.
+                read_int(&mut s, &mut dec)?;
+                let msgno = read_int(&mut s, &mut dec)?;
+                read_int(&mut s, &mut dec)?; // message count
+                // the body is laid out per THAT message's descriptors
+                let fields = blr_slots
+                    .get(&handle)
+                    .and_then(|slot| slot.req.msgs.get(msgno.max(0) as usize).cloned())
+                    .unwrap_or_default();
+                let vals = read_request_message(&mut s, &mut dec, &fields)?;
+                match blr_slots.get_mut(&handle) {
+                    Some(slot) if database.is_some() => {
+                        if slot.m.deliver(msgno.max(0) as u8, vals).is_err() {
+                            respond_error(&mut s, &mut enc, GDS_REQ_SYNC)?;
+                            continue;
+                        }
+                        // ...and run on, so the work this message asked
+                        // for happens before the client is answered
+                        if let Some(e) = slot.m.pump(&mut database, 1) {
+                            if trace_on() {
+                                eprintln!("[srv] blr request refused: {e}");
+                            }
+                            respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
+                            continue;
+                        }
+                        respond(&mut s, &mut enc, handle)?;
+                    }
+                    _ => respond_error(&mut s, &mut enc, GDS_REQ_SYNC)?,
                 }
             }
             x if x == OP_RELEASE => {
@@ -89300,15 +89344,17 @@ fn blr_stmt_runnable(stmt: &BStmt) -> bool {
         BStmt::Begin(v) => v.iter().all(|s| blr_stmt_runnable(s)),
         BStmt::Receive(_, b) | BStmt::Handler(b) => blr_stmt_runnable(b),
         BStmt::For(_, b) => blr_stmt_runnable(b),
-        // not run: see the doc comment
-        BStmt::Label(..)
-        | BStmt::Loop(_)
-        | BStmt::Leave(_)
-        | BStmt::Select(_)
-        | BStmt::Modify(..)
-        | BStmt::Erase(_)
-        | BStmt::Store(..)
-        | BStmt::Assign(..) => false,
+        // the co-routine: the machine parks at a select and the client's
+        // op_send picks the branch
+        BStmt::Label(_, b) | BStmt::Loop(b) => blr_stmt_runnable(b),
+        BStmt::Leave(_) => true,
+        BStmt::Select(branches) => branches.iter().all(|(_, b)| blr_stmt_runnable(b)),
+        // a modify runs over a SYSTEM relation only; the body is
+        // assignments into its new context
+        BStmt::Modify(_, _, b) => blr_stmt_runnable(b),
+        BStmt::Assign(..) => true,
+        // still not run: see the doc comment
+        BStmt::Erase(_) | BStmt::Store(..) => false,
     }
 }
 
@@ -89898,6 +89944,112 @@ struct Ctx<'a> {
 // for an op_receive, or the request is parked waiting for an op_send.
 // ===================================================================
 
+/// WRITE BACK a `blr_modify`'s row.
+///
+/// The row is found by matching the OLD values the cursor was sitting
+/// on, and only the columns the body actually CHANGED are written -
+/// which is what makes this a modify rather than a whole-row rewrite,
+/// and what keeps a column the body never mentioned at whatever the
+/// row already held.
+///
+/// SYSTEM RELATIONS ONLY, and that is a refusal rather than an
+/// oversight. A system relation is what gbak's restore modifies, it
+/// carries no user triggers and no indexes to maintain, and its rows go
+/// through [fire_crab_ods::ddl::patch_system_row] - the same writer
+/// every catalog patch in this server already uses, with the row's own
+/// format, the back version and the deferred blob disposal that took
+/// defects to learn. A USER relation would need the enforcement the
+/// ordinary DML planner carries (constraints, triggers, indexes,
+/// referential actions), and reaching it through this path would bypass
+/// all of it silently. It refuses instead.
+///
+/// THE ROW IS IDENTIFIED BY ITS OWN VALUES, which is exact only while
+/// the match is unique. A BLR cursor names "the record I am on" and
+/// fire-crab's for-loop carries values, not an address
+/// ([OwnedCtx] has no page or slot), so a relation where the old tuple
+/// matches twice is refused rather than guessed at. `RDB$DATABASE`,
+/// the one this chunk exists for, holds exactly one row.
+fn write_modified_row(
+    database: &mut Option<Database>,
+    relation: &str,
+    columns: &[RelationColumn],
+    old_row: &[Value],
+    new_row: &[Value],
+) -> Result<(), String> {
+    let changed: Vec<usize> = columns
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| old_row.get(*i) != new_row.get(*i))
+        .map(|(i, _)| i)
+        .collect();
+    if changed.is_empty() {
+        return Ok(());
+    }
+    let db = database.as_mut().ok_or("no database attached")?;
+    let rel = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, relation)
+        .ok_or_else(|| format!("unknown relation {relation}"))?;
+    if fire_crab_ods::system_relation_formats(&db.bytes(), db.page_size, relation).is_none() {
+        return Err(format!(
+            "this server can only execute a BLR modify over a system relation, not {relation}"
+        ));
+    }
+    // the old tuple must name exactly one row, or "the record the cursor
+    // is on" is not a question these values can answer
+    let want: Vec<Value> = old_row.to_vec();
+    let mut matches = 0usize;
+    {
+        let formats = select_formats(db, relation, rel);
+        for_each_record(db, rel, &formats, usize::MAX, |values| {
+            if values == want.as_slice() {
+                matches += 1;
+            }
+        });
+    }
+    if matches != 1 {
+        return Err(format!(
+            "a BLR modify over {relation} matched {matches} rows where it must match exactly one"
+        ));
+    }
+    let vals: Vec<(String, Value)> = changed
+        .iter()
+        .map(|&i| (columns[i].name.clone(), new_row.get(i).cloned().unwrap_or(Value::Null)))
+        .collect();
+    let (mut work, tx) = db.work_copy_with_tx()?;
+    // the catalog row belongs to THIS statement's transaction, exactly
+    // as a DDL statement's rows do - that is what makes it undoable by
+    // state and invisible to everyone else until commit
+    work.ddl_tx = Some(u64::from(tx));
+    let pred_want = want.clone();
+    let named: Vec<(&str, fire_crab_ods::ddl::SysValue<'_>)> = vals
+        .iter()
+        .map(|(n, v)| {
+            let sv = match v {
+                Value::Null => fire_crab_ods::ddl::SysValue::Null,
+                Value::Int(n) => fire_crab_ods::ddl::SysValue::Int(*n),
+                other => fire_crab_ods::ddl::SysValue::Text(match other {
+                    Value::Text(t) => t.as_str(),
+                    _ => "",
+                }),
+            };
+            (n.as_str(), sv)
+        })
+        .collect();
+    let r = fire_crab_ods::ddl::patch_system_row(
+        &mut work,
+        db.page_size,
+        relation,
+        rel,
+        move |v| v == pred_want.as_slice(),
+        &named,
+    );
+    work.ddl_tx = None;
+    r?;
+    db.install_dirty(work);
+    db.adopt_tx(tx);
+    db.refresh_reader_view();
+    Ok(())
+}
+
 /// A context open in a running request: the stream a `blr_field`
 /// carrying this context number resolves against, and the row it is on.
 ///
@@ -89931,6 +90083,12 @@ enum BFrame {
     Loop { node: Rc<BStmt> },
     /// `blr_label n`: where a `blr_leave n` unwinds to
     Label { id: u8, ctx_depth: usize },
+    /// inside a `blr_modify`: the NEW context is a copy of the OLD one
+    /// that the body assigns over, and popping this frame is what
+    /// WRITES it back. The engine does the same in two phases - the copy
+    /// at `req_evaluate` (`VIO_copy_record`, StmtNodes.cpp:8903), the
+    /// store at `req_return`.
+    Modify { relation: String, old_row: Vec<Value>, new_ctx: u8, ctx_depth: usize },
 }
 
 /// What one run of the trampoline stopped for - the engine's three
@@ -90015,7 +90173,7 @@ impl BlrMachine {
     }
 
     /// Run until the program ends, produces a message, or parks.
-    fn run(&mut self, db: &Database) -> BlrStep {
+    fn run(&mut self, database: &mut Option<Database>) -> BlrStep {
         loop {
             if self.done {
                 return BlrStep::Done;
@@ -90043,6 +90201,27 @@ impl BlrMachine {
                         }
                     }
                     Some(BFrame::Label { .. }) => {}
+                    Some(BFrame::Modify { relation, old_row, new_ctx, ctx_depth }) => {
+                        // THE BODY HAS RUN; the NEW context now holds
+                        // what the row should become. The engine stores
+                        // here too - the copy happens at req_evaluate,
+                        // the VIO_modify at req_return
+                        // (StmtNodes.cpp:8757-8816).
+                        let new_row = self
+                            .ctxs
+                            .iter()
+                            .find(|c| c.ctx == new_ctx)
+                            .map(|c| (c.columns.clone(), c.row.clone()));
+                        self.ctxs.truncate(ctx_depth);
+                        let Some((columns, new_row)) = new_row else {
+                            return BlrStep::Refused("the modify's new context is gone".into());
+                        };
+                        if let Err(e) =
+                            write_modified_row(database, &relation, &columns, &old_row, &new_row)
+                        {
+                            return BlrStep::Refused(e);
+                        }
+                    }
                     Some(BFrame::For { node, rows, i, ctx_depth }) => {
                         self.ctxs.truncate(ctx_depth);
                         if i < rows.len() {
@@ -90107,6 +90286,9 @@ impl BlrMachine {
                     return BlrStep::Await(self.awaiting.clone());
                 }
                 BStmt::For(rse, _) => {
+                    let Some(db) = database.as_ref() else {
+                        return BlrStep::Refused("no database attached".into());
+                    };
                     match self.open_for(rse, db) {
                         Ok(rows) => {
                             self.stack.push(BFrame::For {
@@ -90120,6 +90302,9 @@ impl BlrMachine {
                     }
                 }
                 BStmt::Send(msg, assigns) => {
+                    let Some(db) = database.as_ref() else {
+                        return BlrStep::Refused("no database attached".into());
+                    };
                     let fields = self.req.msgs.get(*msg as usize).cloned().unwrap_or_default();
                     let mut vals: Vec<Value> = vec![Value::Null; fields.len()];
                     {
@@ -90145,9 +90330,57 @@ impl BlrMachine {
                 // ever being compiled, so this is unreachable rather
                 // than silent - but it is spelled out so that wiring the
                 // write path in is a change HERE and nowhere else.
-                BStmt::Modify(..) | BStmt::Store(..) | BStmt::Erase(_) | BStmt::Assign(..) => {
+                BStmt::Modify(old_ctx, new_ctx, body) => {
+                    // THE OLD RECORD IS COPIED INTO THE NEW CONTEXT
+                    // BEFORE THE ASSIGNMENTS RUN (`VIO_copy_record`,
+                    // StmtNodes.cpp:8903). That is what makes a modify
+                    // that assigns one column keep the other twenty.
+                    let Some(src) = self.ctxs.iter().find(|c| c.ctx == *old_ctx).cloned() else {
+                        return BlrStep::Refused(format!("context {old_ctx} is not open"));
+                    };
+                    self.stack.push(BFrame::Modify {
+                        relation: src.relation.clone(),
+                        old_row: src.row.clone(),
+                        new_ctx: *new_ctx,
+                        ctx_depth: self.ctxs.len(),
+                    });
+                    self.ctxs.push(OwnedCtx { ctx: *new_ctx, ..src });
+                    self.next = Some(body.clone());
+                }
+                BStmt::Assign(from, to) => {
+                    let v = {
+                        let Some(db) = database.as_ref() else {
+                            return BlrStep::Refused("no database attached".into());
+                        };
+                        let view = self.view();
+                        eval_blr_val(from, &view, &self.input, db)
+                    };
+                    match to {
+                        // into a context FIELD: the write a store or
+                        // modify body is made of
+                        BTarget::Field(ctx, name) => {
+                            let Some(c) = self.ctxs.iter_mut().find(|c| c.ctx == *ctx) else {
+                                return BlrStep::Refused(format!("context {ctx} is not open"));
+                            };
+                            let Some(i) = c.columns.iter().position(|rc| rc.name == *name) else {
+                                return BlrStep::Refused(format!("no column {name}"));
+                            };
+                            if let Some(slot) = c.row.get_mut(i) {
+                                *slot = v;
+                            }
+                        }
+                        // into an output parameter: only reachable from a
+                        // send body, which handles its own assignments
+                        BTarget::Param(..) => {
+                            return BlrStep::Refused(
+                                "an assignment to a message parameter outside a send".into(),
+                            );
+                        }
+                    }
+                }
+                BStmt::Store(..) | BStmt::Erase(_) => {
                     return BlrStep::Refused(
-                        "this server cannot execute a BLR write verb yet".into(),
+                        "this server cannot execute blr_store or blr_erase yet".into(),
                     );
                 }
             }
@@ -90157,9 +90390,9 @@ impl BlrMachine {
     /// Run until at least `want` messages are queued for the client, or
     /// the request parks or ends. This is `EXE_receive`'s drive-forward
     /// loop (exe.cpp:733-748): run until there is something to send.
-    fn pump(&mut self, db: &Database, want: usize) -> Option<String> {
+    fn pump(&mut self, database: &mut Option<Database>, want: usize) -> Option<String> {
         while self.out.len().saturating_sub(self.cursor) < want {
-            match self.run(db) {
+            match self.run(database) {
                 BlrStep::Sent => continue,
                 BlrStep::Done | BlrStep::Await(_) => break,
                 BlrStep::Refused(e) => return Some(e),
@@ -104390,12 +104623,18 @@ mod tests {
             BStmt::Assign(BVal::Param(1, 0), BTarget::Field(1, f)) if f == "RDB$CHARACTER_SET_SCHEMA_NAME"
         ));
 
-        // ...AND IT IS STILL REFUSED, because parsing is not running.
-        // This executor cannot suspend at the select, so op_compile
-        // answers the same error it answered before the grammar grew -
-        // never success over a request it would silently no-op.
-        assert!(!blr_stmt_runnable(&req.stmt));
-        assert!(parse_blr_request(&GBAK_MODIFY_REQUEST).is_none());
+        // ...AND IT NOW COMPILES. The machine suspends at the select
+        // and writes at the modify, so the runnability gate lets this
+        // program through - which it did not while parsing ran ahead of
+        // execution. The gate still holds the line for the verbs that
+        // are genuinely not implemented.
+        assert!(blr_stmt_runnable(&req.stmt));
+        assert!(parse_blr_request(&GBAK_MODIFY_REQUEST).is_some());
+        // blr_store and blr_erase are still refused, and a program is
+        // refused for carrying one ANYWHERE inside it
+        let store = BStmt::Store("T".into(), 0, Rc::new(BStmt::Nop));
+        assert!(!blr_stmt_runnable(&store));
+        assert!(!blr_stmt_runnable(&BStmt::Loop(Rc::new(store))));
     }
 
     /// THE CO-ROUTINE'S ONE DECISION: which branch of a `blr_select`
