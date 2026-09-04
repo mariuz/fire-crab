@@ -1517,6 +1517,22 @@ const GDS_WISH_LIST: i32 = 335544378;
 /// the database it was given (the real server answers exactly this for a
 /// file its own user cannot read).
 const GDS_IO_ERROR: i32 = 335544344;
+/// `isc_io_open_err` - the second cluster of an `isc_io_error` whose
+/// failing syscall was `open`: "Error while trying to open file".
+const GDS_IO_OPEN_ERR: i32 = 335544734;
+/// `isc_io_read_err` - the same for a failing `read`: "Error while
+/// trying to read from file". A DIRECTORY opens and then fails to
+/// read, which is why the engine names `read` for one.
+const GDS_IO_READ_ERR: i32 = 335544736;
+/// `isc_bad_db_format` - "file @1 is not a valid database". A file that
+/// opens and reads but carries no header the engine recognises.
+const GDS_BAD_DB_FORMAT: i32 = 335544323;
+/// `isc_arg_interpreted` - a status-vector argument that is already
+/// TEXT, not a code to look up. The engine puts the OS's own `strerror`
+/// there as the third line of an I/O failure ("No such file or
+/// directory"), and the wire carries it as a string like isc_arg_string.
+const ISC_ARG_INTERPRETED: i32 = 5;
+
 /// "invalid database handle (no active connection)"
 const GDS_BAD_DB_HANDLE: i32 = 335544324;
 /// "transaction is not in limbo" - reconnecting an id that is not one
@@ -4848,9 +4864,14 @@ fn reset_gen_windows(database: &mut Option<Database>) {
 }
 
 /// Open the file the client named in op_attach, if it exists and looks
-/// like a database (a decodable header page). Returns None otherwise -
-/// the server then answers the fixed constant, so a client attaching to
-/// a bare name with no file behind it still completes the pipeline.
+/// like a database (a decodable header page). Returns None otherwise.
+///
+/// A None used to fall through to the fixed-answer path, so an attach
+/// naming a file that is not there was answered SUCCESS; op_attach now
+/// REFUSES on a None, with the vector [classify_attach_failure] picks.
+/// The three probing callers in [create_database_file] are asking a
+/// question ("is this already a database?", "did the create work?"),
+/// not attaching, and each of them fails closed on its own None.
 fn load_database(path: &str) -> Option<Database> {
     let p = path.trim();
     if p.is_empty() {
@@ -4920,6 +4941,96 @@ fn load_database(path: &str) -> Option<Database> {
         attach_name: String::new(),
         consistency: false,
     })
+}
+
+/// WHY an `op_attach` cannot open the file the client named. The engine
+/// has THREE distinct answers here, measured against 127.0.0.1/3050 on
+/// 2026-09-03 and re-measured 2026-09-04 with the raw status vector:
+///
+/// | target | vector |
+/// |---|---|
+/// | missing path, or missing directory | `isc_io_error` / "open" / `<path>` / `isc_io_open_err` / `"No such file or directory"` |
+/// | a file with no read permission | the same, with `"Permission denied"` |
+/// | a directory | `isc_io_error` / "read" / `<path>` / `isc_io_read_err` / `"Is a directory"` |
+/// | a file that is not a database | `isc_bad_db_format` / `<path>` |
+///
+/// which is not four rules but two: WHICH SYSCALL FAILED. A directory
+/// `open`s fine on Linux and fails at the first `read` with `EISDIR`,
+/// so [classify_attach_failure] simply performs the open and the read
+/// and reports whichever one broke, with the OS's own message. A file
+/// that survives both, and still has no header [load_database] can
+/// decode, is the not-a-database case.
+enum AttachRefusal {
+    /// `isc_io_error`: the failing syscall's name, the second gds code
+    /// for it, and the OS's `strerror` text as `isc_arg_interpreted`.
+    Io { syscall: &'static str, gds: i32, os_text: String },
+    /// `isc_bad_db_format`: it opened and it read, but it is not a
+    /// database.
+    NotADatabase,
+}
+
+impl AttachRefusal {
+    /// The status vector's items, in the engine's own argument order.
+    /// `path` is the FILE, which is what the engine names even when the
+    /// client attached to an alias.
+    fn write_items(&self, w: &mut W, path: &str) {
+        match self {
+            AttachRefusal::Io { syscall, gds, os_text } => {
+                w.int(1) // isc_arg_gds
+                    .int(GDS_IO_ERROR)
+                    .int(2) // isc_arg_string - the operation
+                    .bytes(syscall.as_bytes())
+                    .int(2) // isc_arg_string - the file
+                    .bytes(path.as_bytes())
+                    .int(1) // isc_arg_gds - which syscall it was
+                    .int(*gds)
+                    .int(ISC_ARG_INTERPRETED)
+                    .bytes(os_text.as_bytes());
+            }
+            AttachRefusal::NotADatabase => {
+                w.int(1) // isc_arg_gds
+                    .int(GDS_BAD_DB_FORMAT)
+                    .int(2) // isc_arg_string - the file
+                    .bytes(path.as_bytes());
+            }
+        }
+    }
+}
+
+/// The OS's own message for an `io::Error`, without Rust's ` (os error
+/// N)` tail - which is what `strerror` returns and what the engine
+/// ships as its third line.
+fn os_error_text(e: &std::io::Error) -> String {
+    let s = e.to_string();
+    match s.find(" (os error ") {
+        Some(i) => s[..i].to_string(),
+        None => s,
+    }
+}
+
+/// Reproduce the engine's classification by DOING what it does: open
+/// the file, then read from it. See [AttachRefusal].
+fn classify_attach_failure(path: &str) -> AttachRefusal {
+    let p = path.trim();
+    match std::fs::File::open(p) {
+        Err(e) => AttachRefusal::Io {
+            syscall: "open",
+            gds: GDS_IO_OPEN_ERR,
+            os_text: os_error_text(&e),
+        },
+        Ok(mut f) => {
+            use std::io::Read;
+            let mut buf = [0u8; 1024];
+            match f.read(&mut buf) {
+                Err(e) => AttachRefusal::Io {
+                    syscall: "read",
+                    gds: GDS_IO_READ_ERR,
+                    os_text: os_error_text(&e),
+                },
+                Ok(_) => AttachRefusal::NotADatabase,
+            }
+        }
+    }
 }
 
 /// Materialise an empty real database at `path` (op_create). fire-crab
@@ -84040,6 +84151,46 @@ fn after_auth(
     if let Some(d) = database.as_mut() {
         d.attach_name = attach_name.clone();
     }
+    // AN ATTACH THAT CANNOT OPEN THE DATABASE SAYS SO, HERE, AT ATTACH
+    // TIME. `load_database` returning None used to fall through to the
+    // fixed-answer path below, so op_attach answered SUCCESS for a file
+    // that is not there and the client only found out at its first
+    // statement - and was then told the wrong thing (`HY000 invalid
+    // transaction handle`) about the wrong subject. It is not merely a
+    // message: gbak PROBES FOR A TARGET BY ATTACHING TO IT, so an
+    // attach that always succeeds told gbak every path was occupied and
+    // made `gbak -c` / `gbak -r` into a FRESH path impossible.
+    //
+    // THE DISTINCTION FROM op_create IS ORDER, NOT AN EXEMPTION, and it
+    // is the whole reason this is not simply "refuse a path with no
+    // file": op_create LEGITIMATELY names a path that does not exist
+    // yet. It has already run `create_database_file` ABOVE, which
+    // materialises the file - and answers its own error and returns
+    // when it cannot - so by the time control reaches here an op_create
+    // has its database. A None here is therefore a genuine failure for
+    // EITHER op, and lying about it would be no better for create than
+    // for attach.
+    if database.is_none() {
+        let why = classify_attach_failure(&db_path);
+        if std::env::var("FC_SRV_TRACE").is_ok() {
+            eprintln!(
+                "[srv] {} refused: '{}' {}",
+                if attach_op == OP_CREATE { "op_create" } else { "op_attach" },
+                db_path,
+                match &why {
+                    AttachRefusal::Io { syscall, os_text, .. } =>
+                        format!("{} failed: {}", syscall, os_text),
+                    AttachRefusal::NotADatabase => "is not a valid database".to_string(),
+                }
+            );
+        }
+        let mut w = W::default();
+        w.int(OP_RESPONSE).int(0).int(0).int(0).int(0);
+        why.write_items(&mut w, &db_path);
+        w.int(0); // isc_arg_end
+        w.send(&mut s, &mut enc)?;
+        return Ok(());
+    }
     // A SHUT-DOWN DATABASE REFUSES THE ATTACH ITSELF, before any of the
     // DPB's work - and the order of the two exemptions was MEASURED, not
     // assumed: an attach carrying `-shut`/`-online` gets past the FULL
@@ -87984,8 +88135,17 @@ fn after_auth(
                         .unwrap_or(0),
                     val_counts: database.as_ref().and_then(|d| d.val_counts),
                     read_only: database.as_ref().is_some_and(|d| d.is_read_only()),
+                    att_charset: att_cs.id,
                 };
                 let info = build_db_info(&items, &ctx);
+                if std::env::var("FC_SRV_TRACE").is_ok() {
+                    eprintln!(
+                        "[srv] op_info_database items={:?} -> {} bytes {:?}",
+                        items,
+                        info.len(),
+                        info
+                    );
+                }
                 let mut w = W::default();
                 w.int(OP_RESPONSE).int(0).int(0).int(0).bytes(&info).int(0);
                 w.send(&mut s, &mut enc)?;
@@ -88889,6 +89049,9 @@ struct BRse {
     /// blr_project: the DISTINCT value expressions - rows are unique on
     /// their evaluated tuple (empty = no DISTINCT)
     project: Vec<BVal>,
+    /// blr_first: at most this many rows, evaluated once before the
+    /// walk (None = no limit)
+    first: Option<BVal>,
 }
 
 /// A BLR statement.
@@ -88966,6 +89129,11 @@ const BLR_RSE: u8 = 67;
 /// blr_project (69): the DISTINCT clause of an rse - the result is unique
 /// on the listed value expressions. SHOW PROCEDURES uses it to fold a
 /// table dependency's field-level and table-level rows into one entry.
+/// blr_first (68): the rse's row LIMIT, a value expression. gbak's
+/// restore asks `RDB$RELATIONS ... FIRST 1` to test whether a relation
+/// already exists; without this the whole request refused to parse and
+/// the restore died with `Dynamic SQL Error`.
+const BLR_FIRST: u8 = 68;
 const BLR_PROJECT: u8 = 69;
 const BLR_SORT: u8 = 70;
 const BLR_BOOLEAN: u8 = 71;
@@ -89145,8 +89313,13 @@ fn parse_blr_rse(c: &mut BlrCur) -> Option<BRse> {
     let mut boolean = None;
     let mut sort = Vec::new();
     let mut project = Vec::new();
+    let mut first = None;
     loop {
         match c.peek()? {
+            BLR_FIRST => {
+                c.u8();
+                first = Some(parse_blr_val(c)?);
+            }
             BLR_BOOLEAN => {
                 c.u8();
                 boolean = Some(parse_blr_bool(c)?);
@@ -89183,7 +89356,7 @@ fn parse_blr_rse(c: &mut BlrCur) -> Option<BRse> {
             _ => return None,
         }
     }
-    Some(BRse { streams, boolean, sort, project })
+    Some(BRse { streams, boolean, sort, project, first })
 }
 
 fn parse_blr_bool(c: &mut BlrCur) -> Option<BBool> {
@@ -89519,6 +89692,16 @@ fn exec_blr_stmt(
                         .collect();
                     seen.insert(key)
                 });
+            }
+            // blr_first: the row cap, applied LAST - after the
+            // boolean, the sort and the DISTINCT, which is the order
+            // the engine's rse applies them in
+            if let Some(f) = rse.first.as_ref() {
+                let n = match eval_blr_val(f, ctxs, input, db) {
+                    Value::Int(n) => n.max(0) as usize,
+                    other => other.render().parse::<usize>().unwrap_or(0),
+                };
+                matched.truncate(n);
             }
             for combo in matched {
                 let all = build(&combo);
@@ -89947,6 +90130,9 @@ fn build_db_info(items: &[u8], ctx: &DbInfoCtx) -> Vec<u8> {
             // isc_info_db_read_only: the header's own flag, now that
             // `gfix -mode read_only` can set it
             63 => put_int(&mut out, 63, i32::from(ctx.read_only)),
+            // frb_info_att_charset: the ATTACHMENT's charset, not the
+            // database's default - a 4-byte int, 0 for NONE (probed)
+            101 => put_int(&mut out, 101, ctx.att_charset as i32),
             // fb_info_replica_mode (inf_pub.h:174): isql reads it with
             // getBigInt and prints NONE / READ_ONLY / READ_WRITE; the
             // value is the header's own replica byte, so a replica file
@@ -89983,13 +90169,70 @@ fn build_db_info(items: &[u8], ctx: &DbInfoCtx) -> Vec<u8> {
                 out.extend_from_slice(&(data.len() as u16).to_le_bytes());
                 out.extend_from_slice(&data);
             }
+            11 => {
+                // isc_info_implementation, and 114 below - THE ITEMS
+                // WHOSE SILENCE SIGSEGV'd gbak. `isc_version()`
+                // (why.cpp) asks for 103, 11 and 114 together, walks
+                // the reply, and then does `count = *implementations++`
+                // on a pointer it only ever sets from item 11 or 114.
+                // Answer neither and that pointer is still NULL: the
+                // client dereferences it and dies. A server may fail a
+                // request; it may not hand its client a reply the
+                // client cannot parse.
+                //
+                // Shape measured off 127.0.0.1/3050: a COUNT byte then
+                // that many (implementation_nr, class) pairs. The
+                // engine answers three - access method, remote server,
+                // remote interface - matching its three version strings
+                // in item 103; fire-crab answers ONE banner there, so
+                // it answers one pair here, class 1 (access method).
+                out.push(11);
+                out.extend_from_slice(&3u16.to_le_bytes());
+                out.extend_from_slice(&[1, IMPL_NUMBER, 1]);
+            }
+            114 => {
+                // fb_info_implementation: a COUNT byte then that many
+                // six-byte entries (cpu, os, cc, reserved, class, 0) -
+                // the engine's own first entry on this box is
+                // `15 1 1 0 1 0`, and fire-crab runs on the same
+                // hardware and OS, so it reports the same triple.
+                out.push(114);
+                out.extend_from_slice(&7u16.to_le_bytes());
+                out.extend_from_slice(&[1, IMPL_CPU, IMPL_OS, IMPL_CC, 0, 1, 0]);
+            }
             1 => break, // isc_info_end already in the request
-            _ => {}     // unknown item: skip
+            other => {
+                // AN ITEM fire-crab DOES NOT SERVE SAYS SO, in the
+                // protocol's own terms. Skipping it silently is what
+                // made the gbak crash above possible and would make the
+                // next one possible too: the client sees a reply with a
+                // hole in it and has no way to tell that from an answer.
+                // The engine's own answer for an item it does not know
+                // (probed with item 200): isc_info_error, a 5-byte
+                // value of the item code followed by isc_infunk.
+                out.push(3); // isc_info_error
+                out.extend_from_slice(&5u16.to_le_bytes());
+                out.push(other);
+                out.extend_from_slice(&INFO_UNKNOWN_ITEM.to_le_bytes());
+            }
         }
     }
     out.push(1); // isc_info_end
     out
 }
+
+/// `isc_info_db_impl_linux_amd64` - the implementation number the engine
+/// reports for itself on this box (probed: `11 7 0 3 84 1 84 4 84 3`).
+const IMPL_NUMBER: u8 = 84;
+/// The three bytes `fb_info_implementation` leads each entry with -
+/// cpu, os, compiler - as the engine reports them here (`15 1 1 0 ...`).
+const IMPL_CPU: u8 = 15;
+const IMPL_OS: u8 = 1;
+const IMPL_CC: u8 = 1;
+/// `isc_infunk` - "information type inappropriate for object specified",
+/// what the engine puts in an `isc_info_error` cluster for an item it
+/// does not know.
+const INFO_UNKNOWN_ITEM: u32 = 335544341;
 
 /// Context for `build_db_info`: what the per-attachment info items need.
 struct DbInfoCtx {
@@ -90011,6 +90254,12 @@ struct DbInfoCtx {
     /// `hdr_read_only` off the header - `isc_info_db_read_only` (63)
     /// answered 0 unconditionally until the mode existed
     read_only: bool,
+    /// `frb_info_att_charset` (101): THIS attachment's character set id,
+    /// the dpb's `isc_dpb_lc_ctype` - what isql reads right after the
+    /// dialect. Answering it with an isc_info_error made isql abandon
+    /// the whole reply and fall back to "Pre IB V6 server ... dialect
+    /// is reset to 1".
+    att_charset: u8,
 }
 
 /// Run the fire-crab wire server on `addr` (e.g. "127.0.0.1:3051"),
@@ -95309,6 +95558,7 @@ mod tests {
             ods_minor: 0,
             page_size: 8192,
             replica_mode: 0,
+            att_charset: 0,
         }
     }
 
@@ -95360,9 +95610,16 @@ mod tests {
     }
 
     #[test]
-    fn db_info_skips_unknown_items() {
-        // an unrecognised item (200) contributes nothing but the trailer.
-        assert_eq!(build_db_info(&[200], &dbctx()), vec![1]);
+    fn db_info_names_the_item_it_cannot_serve() {
+        // IT USED TO CONTRIBUTE NOTHING BUT THE TRAILER, and silence is
+        // what a client cannot tell from an answer - the hole in an
+        // isc_version() reply is what SIGSEGV'd gbak. The engine's own
+        // answer for an item it does not know (probed with item 200):
+        // isc_info_error, a 5-byte value of the item then isc_infunk.
+        let mut want = vec![3u8, 5, 0, 200];
+        want.extend_from_slice(&INFO_UNKNOWN_ITEM.to_le_bytes());
+        want.push(1); // isc_info_end
+        assert_eq!(build_db_info(&[200], &dbctx()), want);
     }
 
     #[test]
@@ -103175,5 +103432,242 @@ mod tests {
         // a bare alias anywhere else still refuses (a nested `FROM O t`
         // declares the same alias for another table)
         assert!(strip_dml_alias("UPDATE T t SET A = 1 WHERE EXISTS (SELECT 1 FROM O t WHERE t.X = 1)", false).is_none());
+    }
+
+    /// THE THREE WAYS AN ATTACH CANNOT OPEN A DATABASE, and the fourth
+    /// that is really the first: a missing DIRECTORY. Measured against
+    /// 127.0.0.1/3050 on 2026-09-04 with the raw status vector - see
+    /// [AttachRefusal].
+    #[test]
+    fn attach_failure_is_classified_the_way_the_engine_classifies_it() {
+        let dir = std::env::temp_dir().join(format!("fc-attcls-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 1. a path that does not exist -> the OPEN failed
+        let missing = dir.join("nosuch.fdb");
+        match classify_attach_failure(missing.to_str().unwrap()) {
+            AttachRefusal::Io { syscall, gds, os_text } => {
+                assert_eq!(syscall, "open");
+                assert_eq!(gds, GDS_IO_OPEN_ERR);
+                assert_eq!(os_text, "No such file or directory");
+            }
+            _ => panic!("a missing path is an open failure"),
+        }
+        // ...and a path whose DIRECTORY does not exist is the same one
+        let no_dir = dir.join("nodir").join("x.fdb");
+        assert!(matches!(
+            classify_attach_failure(no_dir.to_str().unwrap()),
+            AttachRefusal::Io { syscall: "open", .. }
+        ));
+
+        // 2. a file that opens and reads but is not a database
+        let notadb = dir.join("notadb.fdb");
+        std::fs::write(&notadb, b"not a database at all\n").unwrap();
+        assert!(matches!(
+            classify_attach_failure(notadb.to_str().unwrap()),
+            AttachRefusal::NotADatabase
+        ));
+        // an EMPTY file reads (zero bytes) and is not a database either
+        let empty = dir.join("empty.fdb");
+        std::fs::write(&empty, b"").unwrap();
+        assert!(matches!(
+            classify_attach_failure(empty.to_str().unwrap()),
+            AttachRefusal::NotADatabase
+        ));
+
+        // 3. a DIRECTORY: it opens on Linux and fails at the first read
+        match classify_attach_failure(dir.to_str().unwrap()) {
+            AttachRefusal::Io { syscall, gds, os_text } => {
+                assert_eq!(syscall, "read");
+                assert_eq!(gds, GDS_IO_READ_ERR);
+                assert_eq!(os_text, "Is a directory");
+            }
+            _ => panic!("a directory is a read failure"),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The status vector each refusal writes, argument for argument, in
+    /// the engine's own order - compared as the BYTES that go on the
+    /// wire, since that is what the client parses.
+    #[test]
+    fn attach_refusal_writes_the_engines_argument_structure() {
+        // the wire's own encoding: a 4-byte big-endian int, and a
+        // string as its length then its bytes padded to four
+        fn i(v: i32) -> Vec<u8> {
+            v.to_be_bytes().to_vec()
+        }
+        fn t(b: &str) -> Vec<u8> {
+            let mut out = i(b.len() as i32);
+            out.extend_from_slice(b.as_bytes());
+            out.extend(std::iter::repeat(0).take((4 - b.len() % 4) % 4));
+            out
+        }
+        let mut w = W::default();
+        AttachRefusal::Io {
+            syscall: "open",
+            gds: GDS_IO_OPEN_ERR,
+            os_text: "No such file or directory".to_string(),
+        }
+        .write_items(&mut w, "/tmp/nosuch.fdb");
+        w.int(0);
+        let mut want = Vec::new();
+        want.extend(i(1)); // isc_arg_gds
+        want.extend(i(GDS_IO_ERROR));
+        want.extend(i(2)); // isc_arg_string - the failing operation
+        want.extend(t("open"));
+        want.extend(i(2)); // isc_arg_string - the file
+        want.extend(t("/tmp/nosuch.fdb"));
+        want.extend(i(1)); // isc_arg_gds - which syscall
+        want.extend(i(GDS_IO_OPEN_ERR));
+        want.extend(i(ISC_ARG_INTERPRETED)); // the OS's own message
+        want.extend(t("No such file or directory"));
+        want.extend(i(0)); // isc_arg_end
+        assert_eq!(w.buf, want);
+
+        let mut w = W::default();
+        AttachRefusal::NotADatabase.write_items(&mut w, "/tmp/notadb.fdb");
+        w.int(0);
+        let mut want = Vec::new();
+        want.extend(i(1));
+        want.extend(i(GDS_BAD_DB_FORMAT));
+        want.extend(i(2));
+        want.extend(t("/tmp/notadb.fdb"));
+        want.extend(i(0));
+        assert_eq!(w.buf, want);
+    }
+
+    /// CREATE IS TOLD FROM ATTACH BY ORDER, not by an exemption:
+    /// op_create runs `create_database_file` FIRST, so the path it
+    /// legitimately named-before-it-existed is a real database by the
+    /// time the refusal above is reached. This is the same path an
+    /// op_attach would have refused a moment earlier.
+    #[test]
+    fn op_create_names_a_path_an_op_attach_would_refuse() {
+        if std::process::Command::new(
+            std::env::var("FC_ISQL").unwrap_or_else(|_| "isql".to_string()),
+        )
+        .arg("-z")
+        .output()
+        .is_err()
+        {
+            return; // no isql on PATH: op_create has no engine to borrow
+        }
+        let dir = std::env::temp_dir().join(format!("fc-attcreate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o777);
+        let _ = std::fs::set_permissions(&dir, perms);
+        let path = dir.join("brandnew.fdb");
+        let p = path.to_str().unwrap();
+
+        // BEFORE: an op_attach here refuses, and names the open failure
+        assert!(load_database(p).is_none());
+        assert!(matches!(
+            classify_attach_failure(p),
+            AttachRefusal::Io { syscall: "open", .. }
+        ));
+        assert!(!path.exists(), "a refused attach creates no file");
+
+        // op_create materialises it, and then the SAME path loads
+        if create_database_file(p).is_ok() {
+            assert!(path.exists(), "op_create leaves the file it named");
+            assert!(
+                load_database(p).is_some(),
+                "and the attachment loop that follows has a real database"
+            );
+        }
+        fire_crab_cch::pool::forget(p);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The two info items whose SILENCE killed gbak, and the shape of
+    /// the answer for an item this server does not serve.
+    #[test]
+    fn db_info_never_answers_an_item_with_silence() {
+        let ctx = DbInfoCtx {
+            db_path: "/tmp/x.fdb".to_string(),
+            attach_id: 1,
+            limbo: Vec::new(),
+            ods_major: 14,
+            ods_minor: 0,
+            page_size: 8192,
+            replica_mode: 0,
+            val_counts: None,
+            read_only: false,
+            att_charset: 0,
+        };
+        // isc_version()'s own request: 103, 11, 114. The client walks
+        // the reply and dereferences the pointer it sets from 11 or
+        // 114 - answer neither and it dereferences NULL.
+        let out = build_db_info(&[103, 11, 114, 1], &ctx);
+        // walk the reply the way the client walks it - item, 2-byte
+        // length, value - rather than searching for a byte, since the
+        // version banner's own text contains both codes
+        let mut clusters: Vec<(u8, Vec<u8>)> = Vec::new();
+        let mut at = 0usize;
+        while at < out.len() && out[at] != 1 {
+            let code = out[at];
+            let len = u16::from_le_bytes([out[at + 1], out[at + 2]]) as usize;
+            clusters.push((code, out[at + 3..at + 3 + len].to_vec()));
+            at += 3 + len;
+        }
+        assert_eq!(out[at], 1, "the reply ends with isc_info_end");
+        let codes: Vec<u8> = clusters.iter().map(|(c, _)| *c).collect();
+        assert_eq!(codes, vec![103, 11, 114], "in request order, none missing");
+        assert_eq!(clusters[1].1, vec![1, IMPL_NUMBER, 1]);
+        assert_eq!(clusters[2].1, vec![1, IMPL_CPU, IMPL_OS, IMPL_CC, 0, 1, 0]);
+
+        // an item this server does not serve says so - isc_info_error
+        // with the item and isc_infunk, exactly as the engine answers
+        // an item it does not know (probed with item 200)
+        let out = build_db_info(&[200, 1], &ctx);
+        let mut want = vec![3u8, 5, 0, 200];
+        want.extend_from_slice(&INFO_UNKNOWN_ITEM.to_le_bytes());
+        want.push(1);
+        assert_eq!(out, want);
+    }
+
+    /// blr_first: the row cap gbak's restore puts on its "does this
+    /// relation exist" probe. Without it the whole request refused to
+    /// parse, and the restore died with `Dynamic SQL Error`.
+    #[test]
+    fn blr_first_parses_and_caps_the_rse() {
+        // blr_version4 blr_begin blr_message 0 (1 cstring)
+        //   blr_for [rse: 1 stream RDB$RELATIONS ctx 0, blr_first 1, end]
+        //     blr_send 0 { blr_assignment blr_field 0 "RDB$RELATION_NAME"
+        //                  -> blr_parameter 0 0 }
+        //   blr_end
+        let mut blr: Vec<u8> = vec![4, 2];
+        blr.extend_from_slice(&[4, 0, 1, 0, 40, 253, 0]); // message 0: cstring(253)
+        blr.push(7); // blr_for
+        blr.extend_from_slice(&[67, 1, 74, 13]); // rse, 1 stream, blr_relation len 13
+        blr.extend_from_slice(b"RDB$RELATIONS");
+        blr.push(0); // context 0
+        blr.extend_from_slice(&[68, 21, 8, 0, 1, 0, 0, 0]); // blr_first literal long 1
+        blr.push(255); // end of rse
+        blr.extend_from_slice(&[14, 0, 1, 23, 0, 17]); // send msg 0, assignment, field ctx 0
+        blr.extend_from_slice(b"RDB$RELATION_NAME");
+        blr.extend_from_slice(&[25, 0, 0, 0]); // -> parameter msg 0 index 0
+        blr.push(255); // blr_end
+        let req = parse_blr_request(&blr).expect("blr_first must parse");
+        match &req.stmt {
+            BStmt::For(rse, _) => {
+                assert!(rse.first.is_some(), "the rse carries its FIRST");
+                assert!(matches!(rse.first, Some(BVal::LitLong(1))));
+            }
+            _ => panic!("expected a blr_for"),
+        }
+        // and the same request WITHOUT blr_first still parses, with none
+        let mut plain: Vec<u8> = blr.clone();
+        let at = plain.windows(8).position(|w| w == [68, 21, 8, 0, 1, 0, 0, 0]).unwrap();
+        plain.drain(at..at + 8);
+        match &parse_blr_request(&plain).expect("still parses").stmt {
+            BStmt::For(rse, _) => assert!(rse.first.is_none()),
+            _ => panic!("expected a blr_for"),
+        }
     }
 }
