@@ -25,6 +25,7 @@ use fire_crab_ods::{
 };
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::rc::Rc;
 
 use crate::{
     OP_ATTACH, OP_COMMIT, OP_CONNECT, OP_CONT_AUTH, OP_CREATE, OP_CRYPT, OP_DETACH,
@@ -88136,6 +88137,10 @@ fn after_auth(
                     val_counts: database.as_ref().and_then(|d| d.val_counts),
                     read_only: database.as_ref().is_some_and(|d| d.is_read_only()),
                     att_charset: att_cs.id,
+                    protocol: best,
+                    crypted: enc.is_some(),
+                    compressed: ZIN.with(|z| z.borrow().is_some()),
+                    host: local_host(),
                 };
                 let info = build_db_info(&items, &ctx);
                 if std::env::var("FC_SRV_TRACE").is_ok() {
@@ -89056,21 +89061,62 @@ struct BRse {
 
 /// A BLR statement.
 enum BStmt {
-    Begin(Vec<BStmt>),
-    Receive(Box<BStmt>),
-    For(BRse, Box<BStmt>),
+    Begin(Vec<Rc<BStmt>>),
+    /// `blr_receive <msg> <statement>`: the message number is what a
+    /// blr_select dispatches on, so it has to be kept.
+    Receive(u8, Rc<BStmt>),
+    For(BRse, Rc<BStmt>),
     /// send message `msg`, assigning each source value to its parameter.
     /// A target is (message, value-index, optional null-indicator index) -
     /// blr_parameter2 carries a separate short that the send sets to -1
     /// when the source is NULL, 0 otherwise.
     Send(u8, Vec<(BVal, (u8, u16, Option<u16>))>),
+    /// `blr_label <n> <statement>` - names the statement a blr_leave can
+    /// jump out of. Labels are numbered per request, not per loop.
+    Label(u8, Rc<BStmt>),
+    /// `blr_loop <statement>` - repeat until something leaves it
+    Loop(Rc<BStmt>),
+    /// `blr_leave <n>` - unwind out of the statement labelled n
+    Leave(u8),
+    /// `blr_select <receive>... blr_end` - PARK until the client sends a
+    /// message, then run the branch whose blr_receive names that message
+    /// number. This is the verb that makes a request a CO-ROUTINE: every
+    /// branch is a `blr_receive`, and which one runs is decided by the
+    /// client, not by the request.
+    Select(Vec<(u8, Rc<BStmt>)>),
+    /// `blr_handler <statement>` - the wrapper GPRE puts around the body
+    /// of a receive. It carries no behaviour of its own here.
+    Handler(Rc<BStmt>),
+    /// `blr_modify <old ctx> <new ctx> <statement>` - the record of the
+    /// OLD context is copied into the NEW one, the statement assigns over
+    /// it, and the result replaces the old record.
+    Modify(u8, u8, Rc<BStmt>),
+    /// `blr_erase <ctx>` - delete the current record of that context
+    Erase(u8),
+    /// `blr_store <relation> <statement>` - a NEW record of the relation,
+    /// built by the statement's assignments into the context the relation
+    /// carries, then stored.
+    Store(String, u8, Rc<BStmt>),
+    /// `blr_assignment <from> <to>` as a STATEMENT (inside a modify or
+    /// store body). It used to parse to `Nop`, which was harmless only
+    /// because nothing this executor ran could write.
+    Assign(BVal, BTarget),
     Nop,
+}
+
+/// Where a statement-level assignment puts its value.
+#[derive(Clone)]
+enum BTarget {
+    /// a field of a context - the modify/store target
+    Field(u8, String),
+    /// an output message parameter, with an optional null indicator
+    Param(u8, u16, Option<u16>),
 }
 
 /// A compiled BLR request: the message layouts and the program.
 struct BlrReq {
     msgs: Vec<Vec<BField>>,
-    stmt: BStmt,
+    stmt: Rc<BStmt>,
 }
 
 /// A cursor over BLR bytes.
@@ -89125,6 +89171,19 @@ const BLR_OR: u8 = 57;
 const BLR_AND: u8 = 58;
 const BLR_NOT: u8 = 59;
 const BLR_MISSING: u8 = 61;
+/// The statement verbs of the legacy WRITE api and the co-routine that
+/// drives it (blr.h:114-126). GPRE compiles `FOR ... MODIFY ... END` and
+/// `STORE ... END_STORE` into these, and gbak's restore is written in
+/// them: it writes the system catalog row by row through blr_store and
+/// re-points RDB$DATABASE through blr_modify.
+const BLR_ERASE: u8 = 5;
+const BLR_LOOP: u8 = 9;
+const BLR_MODIFY: u8 = 10;
+const BLR_HANDLER: u8 = 11;
+const BLR_SELECT: u8 = 13;
+const BLR_STORE: u8 = 15;
+const BLR_LABEL: u8 = 17;
+const BLR_LEAVE: u8 = 18;
 const BLR_RSE: u8 = 67;
 /// blr_project (69): the DISTINCT clause of an rse - the result is unique
 /// on the listed value expressions. SHOW PROCEDURES uses it to fold a
@@ -89143,6 +89202,39 @@ const BLR_GEN_ID: u8 = 101;
 const BLR_VALUE_IF: u8 = 105;
 const BLR_MATCHING2: u8 = 106;
 const BLR_END: u8 = 255;
+
+/// WHETHER [exec_blr_request] CAN ACTUALLY RUN THIS PROGRAM.
+///
+/// The grammar below parses the whole legacy statement set, including
+/// the WRITE verbs (blr_store / blr_modify / blr_erase) and the
+/// co-routine that drives them (blr_label / blr_loop / blr_select /
+/// blr_leave). The EXECUTOR covers only the read-only subset: it
+/// materialises every output message up front, against a database it
+/// holds immutably, so it can neither suspend at a blr_select nor write.
+///
+/// Parsing further than the executor runs is deliberate - it is what
+/// lets a request be decoded and reported - but it must never be
+/// mistaken for support. A program this returns false for is refused at
+/// op_compile, exactly as before the grammar grew; the alternative is a
+/// request that compiles, runs, writes nothing and answers success,
+/// which is the one failure a client cannot tell from an answer.
+fn blr_stmt_runnable(stmt: &BStmt) -> bool {
+    match stmt {
+        BStmt::Nop | BStmt::Send(..) => true,
+        BStmt::Begin(v) => v.iter().all(|s| blr_stmt_runnable(s)),
+        BStmt::Receive(_, b) | BStmt::Handler(b) => blr_stmt_runnable(b),
+        BStmt::For(_, b) => blr_stmt_runnable(b),
+        // not run: see the doc comment
+        BStmt::Label(..)
+        | BStmt::Loop(_)
+        | BStmt::Leave(_)
+        | BStmt::Select(_)
+        | BStmt::Modify(..)
+        | BStmt::Erase(_)
+        | BStmt::Store(..)
+        | BStmt::Assign(..) => false,
+    }
+}
 
 /// Parse a compiled BLR request. None on any shape this executor does
 /// not cover (the caller then answers an SQL error).
@@ -89170,7 +89262,8 @@ fn parse_blr_request(blr: &[u8]) -> Option<BlrReq> {
                 }
                 msgs[mno] = fields;
             }
-            BLR_RECEIVE | BLR_FOR | BLR_BEGIN | BLR_SEND | BLR_ASSIGNMENT => {
+            BLR_RECEIVE | BLR_FOR | BLR_BEGIN | BLR_SEND | BLR_ASSIGNMENT | BLR_LABEL
+            | BLR_LOOP | BLR_SELECT | BLR_STORE | BLR_MODIFY | BLR_ERASE | BLR_HANDLER => {
                 stmt = parse_blr_stmt(&mut c)?;
                 break;
             }
@@ -89181,7 +89274,10 @@ fn parse_blr_request(blr: &[u8]) -> Option<BlrReq> {
             _ => return None,
         }
     }
-    Some(BlrReq { msgs, stmt })
+    if !blr_stmt_runnable(&stmt) {
+        return None;
+    }
+    Some(BlrReq { msgs, stmt: Rc::new(stmt) })
 }
 
 fn parse_blr_field(c: &mut BlrCur) -> Option<BField> {
@@ -89228,30 +89324,84 @@ fn parse_blr_stmt(c: &mut BlrCur) -> Option<BStmt> {
         BLR_BEGIN => {
             let mut v = Vec::new();
             while c.peek()? != BLR_END {
-                v.push(parse_blr_stmt(c)?);
+                v.push(Rc::new(parse_blr_stmt(c)?));
             }
             c.u8(); // end
             BStmt::Begin(v)
         }
         BLR_RECEIVE => {
-            c.u8()?; // msgno
-            BStmt::Receive(Box::new(parse_blr_stmt(c)?))
+            let msg = c.u8()?;
+            BStmt::Receive(msg, Rc::new(parse_blr_stmt(c)?))
+        }
+        BLR_LABEL => {
+            let id = c.u8()?;
+            BStmt::Label(id, Rc::new(parse_blr_stmt(c)?))
+        }
+        BLR_LOOP => BStmt::Loop(Rc::new(parse_blr_stmt(c)?)),
+        BLR_LEAVE => BStmt::Leave(c.u8()?),
+        BLR_HANDLER => BStmt::Handler(Rc::new(parse_blr_stmt(c)?)),
+        BLR_SELECT => {
+            // a list of blr_receive branches, closed by blr_end. Every
+            // branch MUST be a receive - that is what makes the message
+            // number the client sends select one.
+            let mut branches = Vec::new();
+            while c.peek()? != BLR_END {
+                if c.u8()? != BLR_RECEIVE {
+                    return None;
+                }
+                let msg = c.u8()?;
+                branches.push((msg, Rc::new(parse_blr_stmt(c)?)));
+            }
+            c.u8(); // end
+            BStmt::Select(branches)
+        }
+        BLR_MODIFY => {
+            let old_ctx = c.u8()?;
+            let new_ctx = c.u8()?;
+            BStmt::Modify(old_ctx, new_ctx, Rc::new(parse_blr_stmt(c)?))
+        }
+        BLR_ERASE => BStmt::Erase(c.u8()?),
+        BLR_STORE => {
+            if c.u8()? != BLR_RELATION {
+                return None;
+            }
+            let relation = c.name()?;
+            let ctx = c.u8()?;
+            BStmt::Store(relation, ctx, Rc::new(parse_blr_stmt(c)?))
+        }
+        BLR_ASSIGNMENT => {
+            let from = parse_blr_val(c)?;
+            // THE TARGET DECIDES WHAT THIS IS. Into a message parameter it
+            // is an output assignment; into a context FIELD it is a write,
+            // which is the whole point of a store or modify body.
+            let to = match c.u8()? {
+                BLR_PARAMETER => {
+                    let m = c.u8()?;
+                    BTarget::Param(m, c.u16()?, None)
+                }
+                BLR_PARAMETER2 => {
+                    let m = c.u8()?;
+                    let idx = c.u16()?;
+                    BTarget::Param(m, idx, Some(c.u16()?))
+                }
+                BLR_FIELD => {
+                    let ctx = c.u8()?;
+                    BTarget::Field(ctx, c.name()?)
+                }
+                _ => return None,
+            };
+            BStmt::Assign(from, to)
         }
         BLR_FOR => {
             let rse = parse_blr_rse(c)?;
             let body = parse_blr_stmt(c)?;
-            BStmt::For(rse, Box::new(body))
+            BStmt::For(rse, Rc::new(body))
         }
         BLR_SEND => {
             let msg = c.u8()?;
             // the body is a blr_begin of blr_assignment (value -> param)
             let assigns = parse_blr_assignments(c)?;
             BStmt::Send(msg, assigns)
-        }
-        BLR_ASSIGNMENT => {
-            let _ = parse_blr_val(c)?;
-            let _ = parse_blr_val(c)?;
-            BStmt::Nop
         }
         _ => return None,
     })
@@ -89611,7 +89761,23 @@ fn exec_blr_stmt(
                 exec_blr_stmt(st, req, input, ctxs, db, out);
             }
         }
-        BStmt::Receive(body) => exec_blr_stmt(body, req, input, ctxs, db, out),
+        BStmt::Receive(_, body) => exec_blr_stmt(body, req, input, ctxs, db, out),
+        BStmt::Handler(body) => exec_blr_stmt(body, req, input, ctxs, db, out),
+        // THE WRITE AND CO-ROUTINE VERBS ARE PARSED BUT NOT RUN HERE.
+        // This executor materialises every output message up front from
+        // an IMMUTABLE database - it cannot suspend, and it cannot write.
+        // Reaching one of these would be a silent no-op, so a request
+        // carrying one never gets this far: [blr_stmt_runnable] refuses
+        // it at op_compile, which is what the engine's parser does with
+        // a verb it has no node for.
+        BStmt::Label(..)
+        | BStmt::Loop(_)
+        | BStmt::Leave(_)
+        | BStmt::Select(_)
+        | BStmt::Modify(..)
+        | BStmt::Erase(_)
+        | BStmt::Store(..)
+        | BStmt::Assign(..) => {}
         BStmt::For(rse, body) => {
             // resolve every stream of the rse (SHOW INDICES joins two)
             let mut streams: Vec<StreamData> = Vec::new();
@@ -90161,13 +90327,37 @@ fn build_db_info(items: &[u8], ctx: &DbInfoCtx) -> Vec<u8> {
                 out.extend_from_slice(&[1, 6]);
             }
             103 => {
-                // isc_info_firebird_version: count byte + [len][string]*
-                let banner: &[u8] = b"LI-V6.0.0 fire-crab";
-                let mut data = vec![1u8, banner.len() as u8];
-                data.extend_from_slice(banner);
+                // isc_info_firebird_version: count byte + [len][string]*,
+                // ONE PER MERGE LEVEL. A Firebird server does not answer
+                // this alone - the engine core answers one string (the
+                // "access method"), the REMOTE SERVER merges its own on
+                // top (MERGE_database_info, remote/server.cpp:4700 with
+                // class_ = 4), and the client's remote interface merges a
+                // THIRD (client/interface.cpp:2109, class_ = 3). Answering
+                // only the core's string is what made gbak read this
+                // connection as EMBEDDED: gbak takes the negotiated
+                // protocol out of the version TEXT, scanning for ")/P"
+                // (restore.epp:857) - no marker, no protocol, and
+                // `gbl_network_protocol` stays 0, which sends the whole
+                // data restore down the legacy BLR path instead of the
+                // batch API (restore.epp:14071).
+                let mut data = vec![2u8];
+                for banner in [ctx.core_version(), ctx.remote_version()] {
+                    data.push(banner.len() as u8);
+                    data.extend_from_slice(banner.as_bytes());
+                }
                 out.push(103);
                 out.extend_from_slice(&(data.len() as u16).to_le_bytes());
                 out.extend_from_slice(&data);
+            }
+            137 => {
+                // fb_info_protocol_version (inf_pub.h:158): the version
+                // the connection NEGOTIATED, as a 2-byte word. The engine
+                // answers it from the remote layer, and only when the
+                // client asked (server.cpp:4702).
+                out.push(137);
+                out.extend_from_slice(&2u16.to_le_bytes());
+                out.extend_from_slice(&(ctx.protocol as u16).to_le_bytes());
             }
             11 => {
                 // isc_info_implementation, and 114 below - THE ITEMS
@@ -90181,14 +90371,18 @@ fn build_db_info(items: &[u8], ctx: &DbInfoCtx) -> Vec<u8> {
                 // client cannot parse.
                 //
                 // Shape measured off 127.0.0.1/3050: a COUNT byte then
-                // that many (implementation_nr, class) pairs. The
-                // engine answers three - access method, remote server,
-                // remote interface - matching its three version strings
-                // in item 103; fire-crab answers ONE banner there, so
-                // it answers one pair here, class 1 (access method).
+                // that many (implementation_nr, class) pairs. The probe
+                // `11 7 0 3 84 1 84 4 84 3` was read at the CLIENT, so it
+                // carries THREE - and the third is the client's own merge
+                // (class 3, remote interface). A SERVER answers the two
+                // below, and the count must match item 103's string count
+                // exactly: isc_version takes MIN(*versions,
+                // *implementations) (utl.cpp:506) and reads that many of
+                // BOTH, so an under-counted pair list silently truncates
+                // the version banner the client prints.
                 out.push(11);
-                out.extend_from_slice(&3u16.to_le_bytes());
-                out.extend_from_slice(&[1, IMPL_NUMBER, 1]);
+                out.extend_from_slice(&5u16.to_le_bytes());
+                out.extend_from_slice(&[2, IMPL_NUMBER, CLASS_ACCESS_METHOD, IMPL_NUMBER, CLASS_REMOTE_SERVER]);
             }
             114 => {
                 // fb_info_implementation: a COUNT byte then that many
@@ -90197,8 +90391,14 @@ fn build_db_info(items: &[u8], ctx: &DbInfoCtx) -> Vec<u8> {
                 // `15 1 1 0 1 0`, and fire-crab runs on the same
                 // hardware and OS, so it reports the same triple.
                 out.push(114);
-                out.extend_from_slice(&7u16.to_le_bytes());
-                out.extend_from_slice(&[1, IMPL_CPU, IMPL_OS, IMPL_CC, 0, 1, 0]);
+                // ...one six-byte entry per merge level, and the LAST
+                // byte is the level the entry belongs to (merge.cpp's
+                // `mergeLevel`, read off item 11's count BEFORE the
+                // merge): the core is level 0, the remote server level 1.
+                out.extend_from_slice(&13u16.to_le_bytes());
+                out.extend_from_slice(&[2]);
+                out.extend_from_slice(&[IMPL_CPU, IMPL_OS, IMPL_CC, 0, CLASS_ACCESS_METHOD, 0]);
+                out.extend_from_slice(&[IMPL_CPU, IMPL_OS, IMPL_CC, 0, CLASS_REMOTE_SERVER, 1]);
             }
             1 => break, // isc_info_end already in the request
             other => {
@@ -90224,6 +90424,12 @@ fn build_db_info(items: &[u8], ctx: &DbInfoCtx) -> Vec<u8> {
 /// `isc_info_db_impl_linux_amd64` - the implementation number the engine
 /// reports for itself on this box (probed: `11 7 0 3 84 1 84 4 84 3`).
 const IMPL_NUMBER: u8 = 84;
+/// The implementation CLASSES of `impl_class[]` (utl.cpp:140) this
+/// server speaks for: the engine core it converts, and the remote server
+/// it is. The remaining class a client sees, 3 ("remote interface"), is
+/// merged in by the client's own remote provider, not by any server.
+const CLASS_ACCESS_METHOD: u8 = 1;
+const CLASS_REMOTE_SERVER: u8 = 4;
 /// The three bytes `fb_info_implementation` leads each entry with -
 /// cpu, os, compiler - as the engine reports them here (`15 1 1 0 ...`).
 const IMPL_CPU: u8 = 15;
@@ -90260,6 +90466,52 @@ struct DbInfoCtx {
     /// the whole reply and fall back to "Pre IB V6 server ... dialect
     /// is reset to 1".
     att_charset: u8,
+    /// the protocol version this connection NEGOTIATED (op_connect's
+    /// best common offer) - what `fb_info_protocol_version` answers and
+    /// what the remote-server version string carries as `/P<n>`
+    protocol: i32,
+    /// wire crypt is running on this connection (the `C` of `/P20:C`)
+    crypted: bool,
+    /// wire compression is running on this connection (the `Z`)
+    compressed: bool,
+    /// this host's name, as the engine's `port_version` carries it
+    host: String,
+}
+
+impl DbInfoCtx {
+    /// The engine CORE's version string - what a converted `jrd` answers
+    /// on its own, with no remote layer in front of it.
+    fn core_version(&self) -> String {
+        FC_VERSION.to_string()
+    }
+
+    /// The REMOTE SERVER's version string, built the way `rem_port` builds
+    /// it: the base version, then the port's own `tcp (<host>)/P<n>`
+    /// (inet.cpp:836), then `:` and `C`/`Z` for crypt and compression
+    /// (remote.cpp:1515 `versionInfo`).
+    fn remote_version(&self) -> String {
+        let mut v = format!("{}/tcp ({})/P{}", FC_VERSION, self.host, self.protocol);
+        if self.crypted || self.compressed {
+            v.push(':');
+        }
+        if self.crypted {
+            v.push('C');
+        }
+        if self.compressed {
+            v.push('Z');
+        }
+        v
+    }
+}
+
+/// fire-crab's version banner, the base both merge levels are built on.
+const FC_VERSION: &str = "LI-V6.0.0 fire-crab";
+
+/// This host's name, as `ISC_get_host` reports it to the engine.
+fn local_host() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .map(|h| h.trim().to_string())
+        .unwrap_or_else(|_| "localhost".to_string())
 }
 
 /// Run the fire-crab wire server on `addr` (e.g. "127.0.0.1:3051"),
@@ -95559,6 +95811,10 @@ mod tests {
             page_size: 8192,
             replica_mode: 0,
             att_charset: 0,
+            protocol: 20,
+            crypted: false,
+            compressed: false,
+            host: "testhost".into(),
         }
     }
 
@@ -98114,8 +98370,8 @@ mod tests {
         fn find_for(s: &BStmt) -> Option<&BRse> {
             match s {
                 BStmt::For(rse, _) => Some(rse),
-                BStmt::Begin(v) => v.iter().find_map(find_for),
-                BStmt::Receive(b) => find_for(b),
+                BStmt::Begin(v) => v.iter().find_map(|s| find_for(s)),
+                BStmt::Receive(_, b) => find_for(b),
                 _ => None,
             }
         }
@@ -103599,6 +103855,10 @@ mod tests {
             val_counts: None,
             read_only: false,
             att_charset: 0,
+            protocol: 20,
+            crypted: false,
+            compressed: false,
+            host: "testhost".into(),
         };
         // isc_version()'s own request: 103, 11, 114. The client walks
         // the reply and dereferences the pointer it sets from 11 or
@@ -103618,8 +103878,39 @@ mod tests {
         assert_eq!(out[at], 1, "the reply ends with isc_info_end");
         let codes: Vec<u8> = clusters.iter().map(|(c, _)| *c).collect();
         assert_eq!(codes, vec![103, 11, 114], "in request order, none missing");
-        assert_eq!(clusters[1].1, vec![1, IMPL_NUMBER, 1]);
-        assert_eq!(clusters[2].1, vec![1, IMPL_CPU, IMPL_OS, IMPL_CC, 0, 1, 0]);
+        // TWO MERGE LEVELS, and the counts must agree. A server answers
+        // the engine core's entry (class 1) and its own remote-server
+        // entry (class 4); the client's remote interface merges the
+        // third. isc_version reads MIN(*versions, *implementations)
+        // (utl.cpp:506) of BOTH lists, so a mismatch silently truncates
+        // the banner rather than failing.
+        assert_eq!(
+            clusters[1].1,
+            vec![2, IMPL_NUMBER, CLASS_ACCESS_METHOD, IMPL_NUMBER, CLASS_REMOTE_SERVER]
+        );
+        assert_eq!(
+            clusters[2].1,
+            vec![
+                2,
+                IMPL_CPU, IMPL_OS, IMPL_CC, 0, CLASS_ACCESS_METHOD, 0,
+                IMPL_CPU, IMPL_OS, IMPL_CC, 0, CLASS_REMOTE_SERVER, 1,
+            ]
+        );
+        assert_eq!(clusters[0].1[0], clusters[1].1[0], "one version string per pair");
+
+        // THE PROTOCOL MARKER gbak READS. It does not ask the server for
+        // the protocol - it scans the version TEXT for ")/P" and takes
+        // the number after it (restore.epp:857). Without the marker the
+        // connection reads as EMBEDDED and the whole data restore takes
+        // the legacy BLR path instead of the batch API.
+        let versions = &clusters[0].1;
+        let n0 = versions[1] as usize;
+        let remote = String::from_utf8_lossy(&versions[2 + n0 + 1..]).into_owned();
+        assert!(remote.contains(")/P20"), "the remote-server entry carries the protocol: {remote}");
+
+        // fb_info_protocol_version answers the same number as a word
+        let pv = build_db_info(&[137, 1], &ctx);
+        assert_eq!(pv, vec![137, 2, 0, 20, 0, 1]);
 
         // an item this server does not serve says so - isc_info_error
         // with the item and isc_infunk, exactly as the engine answers
@@ -103654,7 +103945,7 @@ mod tests {
         blr.extend_from_slice(&[25, 0, 0, 0]); // -> parameter msg 0 index 0
         blr.push(255); // blr_end
         let req = parse_blr_request(&blr).expect("blr_first must parse");
-        match &req.stmt {
+        match &*req.stmt {
             BStmt::For(rse, _) => {
                 assert!(rse.first.is_some(), "the rse carries its FIRST");
                 assert!(matches!(rse.first, Some(BVal::LitLong(1))));
@@ -103665,7 +103956,7 @@ mod tests {
         let mut plain: Vec<u8> = blr.clone();
         let at = plain.windows(8).position(|w| w == [68, 21, 8, 0, 1, 0, 0, 0]).unwrap();
         plain.drain(at..at + 8);
-        match &parse_blr_request(&plain).expect("still parses").stmt {
+        match &*parse_blr_request(&plain).expect("still parses").stmt {
             BStmt::For(rse, _) => assert!(rse.first.is_none()),
             _ => panic!("expected a blr_for"),
         }
