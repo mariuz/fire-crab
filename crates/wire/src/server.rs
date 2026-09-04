@@ -89976,11 +89976,14 @@ fn write_modified_row(
     old_row: &[Value],
     new_row: &[Value],
 ) -> Result<(), String> {
-    let changed: Vec<usize> = columns
+    // by FIELD ID, the way the row is indexed - see the note on
+    // [BTarget::Field] assignment
+    let changed: Vec<&RelationColumn> = columns
         .iter()
-        .enumerate()
-        .filter(|(i, _)| old_row.get(*i) != new_row.get(*i))
-        .map(|(i, _)| i)
+        .filter(|rc| {
+            let i = rc.field_id as usize;
+            old_row.get(i) != new_row.get(i)
+        })
         .collect();
     if changed.is_empty() {
         return Ok(());
@@ -90012,7 +90015,12 @@ fn write_modified_row(
     }
     let vals: Vec<(String, Value)> = changed
         .iter()
-        .map(|&i| (columns[i].name.clone(), new_row.get(i).cloned().unwrap_or(Value::Null)))
+        .map(|rc| {
+            (
+                rc.name.clone(),
+                new_row.get(rc.field_id as usize).cloned().unwrap_or(Value::Null),
+            )
+        })
         .collect();
     let (mut work, tx) = db.work_copy_with_tx()?;
     // the catalog row belongs to THIS statement's transaction, exactly
@@ -90362,12 +90370,26 @@ impl BlrMachine {
                             let Some(c) = self.ctxs.iter_mut().find(|c| c.ctx == *ctx) else {
                                 return BlrStep::Refused(format!("context {ctx} is not open"));
                             };
-                            let Some(i) = c.columns.iter().position(|rc| rc.name == *name) else {
+                            // BY FIELD ID, NOT BY POSITION IN THE COLUMN
+                            // LIST. A row is indexed by the field id the
+                            // format assigns, which is what the READ side
+                            // resolves a `blr_field` through
+                            // ([eval_blr_val]); the two coincide only
+                            // while the catalog happens to list columns
+                            // in field-id order, and a write that assumed
+                            // it would land in the wrong column silently.
+                            let Some(fid) = c
+                                .columns
+                                .iter()
+                                .find(|rc| rc.name == *name)
+                                .map(|rc| rc.field_id as usize)
+                            else {
                                 return BlrStep::Refused(format!("no column {name}"));
                             };
-                            if let Some(slot) = c.row.get_mut(i) {
-                                *slot = v;
+                            if fid >= c.row.len() {
+                                c.row.resize(fid + 1, Value::Null);
                             }
+                            c.row[fid] = v;
                         }
                         // into an output parameter: only reachable from a
                         // send body, which handles its own assignments
@@ -104635,6 +104657,66 @@ mod tests {
         let store = BStmt::Store("T".into(), 0, Rc::new(BStmt::Nop));
         assert!(!blr_stmt_runnable(&store));
         assert!(!blr_stmt_runnable(&BStmt::Loop(Rc::new(store))));
+    }
+
+    /// GPRE's OTHER SHAPE, and the one the restore's whole metadata
+    /// stream is made of: `STORE X IN <system relation>`. Captured off
+    /// the wire on 2026-09-04, from the request that stops the restore
+    /// once the two RDB$DATABASE modifies pass.
+    ///
+    /// It is the co-routine's opposite. No `blr_for`, no `blr_send`, no
+    /// `blr_select` - one `blr_receive` and one `blr_store`, driven with
+    /// one `op_start_send_and_receive` per row, because the engine kills
+    /// the previous incarnation at every start. The message carries the
+    /// row: a blob id, eight shorts (GPRE's `blr_parameter2` null flags
+    /// travel as fields of their own), and five metadata names.
+    #[test]
+    fn parses_the_gbak_restore_store_request() {
+        const GBAK_STORE_REQUEST: [u8; 283] = [
+        4, 2, 4, 0, 15, 0, 9, 0, 7, 0, 7, 0, 7, 0, 7, 0,
+        7, 0, 7, 0, 7, 0, 7, 0, 40, 253, 0, 40, 253, 0, 40, 253,
+        0, 23, 40, 253, 0, 40, 253, 0, 12, 0, 15, 74, 11, 82, 68, 66,
+        36, 83, 67, 72, 69, 77, 65, 83, 0, 2, 1, 25, 0, 1, 0, 23,
+        0, 15, 82, 68, 66, 36, 83, 89, 83, 84, 69, 77, 95, 70, 76, 65,
+        71, 1, 41, 0, 0, 0, 2, 0, 23, 0, 15, 82, 68, 66, 36, 68,
+        69, 83, 67, 82, 73, 80, 84, 73, 79, 78, 1, 41, 0, 14, 0, 3,
+        0, 23, 0, 14, 82, 68, 66, 36, 79, 87, 78, 69, 82, 95, 78, 65,
+        77, 69, 1, 41, 0, 13, 0, 4, 0, 23, 0, 18, 82, 68, 66, 36,
+        83, 69, 67, 85, 82, 73, 84, 89, 95, 67, 76, 65, 83, 83, 1, 41,
+        0, 12, 0, 5, 0, 23, 0, 16, 82, 68, 66, 36, 83, 81, 76, 95,
+        83, 69, 67, 85, 82, 73, 84, 89, 1, 41, 0, 11, 0, 6, 0, 23,
+        0, 22, 82, 68, 66, 36, 67, 72, 65, 82, 65, 67, 84, 69, 82, 95,
+        83, 69, 84, 95, 78, 65, 77, 69, 1, 41, 0, 10, 0, 7, 0, 23,
+        0, 29, 82, 68, 66, 36, 67, 72, 65, 82, 65, 67, 84, 69, 82, 95,
+        83, 69, 84, 95, 83, 67, 72, 69, 77, 65, 95, 78, 65, 77, 69, 1,
+        41, 0, 9, 0, 8, 0, 23, 0, 15, 82, 68, 66, 36, 83, 67, 72,
+        69, 77, 65, 95, 78, 65, 77, 69, 255, 255, 76,
+        ];
+        let req = parse_blr_program(&GBAK_STORE_REQUEST).expect("the grammar covers it");
+        assert_eq!(req.msgs.len(), 1);
+        assert_eq!(req.msgs[0].len(), 15, "fifteen descriptors");
+        assert!(matches!(req.msgs[0][0], BField::Quad), "a blob id leads");
+
+        // the whole program is ONE receive around ONE store
+        let BStmt::Receive(0, body) = &*req.stmt else { panic!("blr_receive 0 at the top") };
+        let BStmt::Store(rel, ctx, sbody) = &**body else { panic!("blr_store") };
+        assert_eq!(rel, "RDB$SCHEMAS");
+        assert_eq!(*ctx, 0, "the context is the relation reference's trailing byte");
+        let BStmt::Begin(assigns) = &**sbody else { panic!("a begin of assignments") };
+        assert!(!assigns.is_empty());
+        assert!(
+            assigns.iter().all(|a| matches!(
+                &**a,
+                BStmt::Assign(BVal::Param(0, _), BTarget::Field(0, _))
+            )),
+            "every one is a message parameter into a field of the new record"
+        );
+
+        // ...and it is REFUSED, because blr_store does not execute yet.
+        // The gate is what keeps a request that would write nothing from
+        // being answered as success.
+        assert!(!blr_stmt_runnable(&req.stmt));
+        assert!(parse_blr_request(&GBAK_STORE_REQUEST).is_none());
     }
 
     /// THE CO-ROUTINE'S ONE DECISION: which branch of a `blr_select`
