@@ -89177,6 +89177,17 @@ const BLR_MISSING: u8 = 61;
 /// them: it writes the system catalog row by row through blr_store and
 /// re-points RDB$DATABASE through blr_modify.
 const BLR_ERASE: u8 = 5;
+/// `blr_marks` (217) - a flag word the engine hangs on the statement it
+/// precedes (`PAR_marks`, par.cpp:735): the verb, then a LENGTH byte
+/// that must be 1, 2 or 4, then that many bytes little-endian. gbak's
+/// data-restore store request carries `blr_marks 1 0x10`
+/// (MARK_BULK_INSERT, restore.epp:14520), so a parser that does not skip
+/// it cannot read the request that restores the rows.
+const BLR_MARKS: u8 = 217;
+/// `blr_stall` (155) - "fake server stall", accepted before a blr_for's
+/// rse (StmtNodes.cpp:6080). Nothing this server is asked to run emits
+/// one; it is named so the skip below is not mistaken for the rse.
+const BLR_STALL: u8 = 155;
 const BLR_LOOP: u8 = 9;
 const BLR_MODIFY: u8 = 10;
 const BLR_HANDLER: u8 = 11;
@@ -89236,9 +89247,20 @@ fn blr_stmt_runnable(stmt: &BStmt) -> bool {
     }
 }
 
-/// Parse a compiled BLR request. None on any shape this executor does
-/// not cover (the caller then answers an SQL error).
+/// Parse a compiled BLR request, and refuse one this executor cannot
+/// RUN. None on either, and the caller then answers an SQL error.
 fn parse_blr_request(blr: &[u8]) -> Option<BlrReq> {
+    let req = parse_blr_program(blr)?;
+    if !blr_stmt_runnable(&req.stmt) {
+        return None;
+    }
+    Some(req)
+}
+
+/// The GRAMMAR alone: what the bytes say, whether or not this server can
+/// execute it. Kept separate so a request can be decoded and asserted
+/// on without being claimed as supported.
+fn parse_blr_program(blr: &[u8]) -> Option<BlrReq> {
     // the first byte is the blr_version (4 or 5); the request body then
     // opens with blr_begin
     let mut c = BlrCur { b: blr, i: 1 };
@@ -89273,9 +89295,6 @@ fn parse_blr_request(blr: &[u8]) -> Option<BlrReq> {
             }
             _ => return None,
         }
-    }
-    if !blr_stmt_runnable(&stmt) {
-        return None;
     }
     Some(BlrReq { msgs, stmt: Rc::new(stmt) })
 }
@@ -89319,6 +89338,33 @@ fn parse_blr_field(c: &mut BlrCur) -> Option<BField> {
     })
 }
 
+/// Skip an optional `blr_marks` where the engine's parser peeks for one.
+/// The value itself is not kept: every mark defined today is an
+/// optimisation hint (bulk insert), and acting on one this server does
+/// not understand would be a guess.
+fn skip_blr_marks(c: &mut BlrCur) -> Option<()> {
+    if c.peek()? != BLR_MARKS {
+        return Some(());
+    }
+    c.u8();
+    match c.u8()? {
+        1 => {
+            c.u8()?;
+        }
+        2 => {
+            c.u16()?;
+        }
+        4 => {
+            c.u16()?;
+            c.u16()?;
+        }
+        // the engine raises a syntax error on any other length, so a
+        // request carrying one is not a request it would have run
+        _ => return None,
+    }
+    Some(())
+}
+
 fn parse_blr_stmt(c: &mut BlrCur) -> Option<BStmt> {
     Some(match c.u8()? {
         BLR_BEGIN => {
@@ -89358,10 +89404,18 @@ fn parse_blr_stmt(c: &mut BlrCur) -> Option<BStmt> {
         BLR_MODIFY => {
             let old_ctx = c.u8()?;
             let new_ctx = c.u8()?;
+            skip_blr_marks(c)?;
             BStmt::Modify(old_ctx, new_ctx, Rc::new(parse_blr_stmt(c)?))
         }
-        BLR_ERASE => BStmt::Erase(c.u8()?),
+        BLR_ERASE => {
+            // a LEAF: the context byte, an optional mark, and no body -
+            // only blr_erase2 (173) carries a RETURNING statement
+            let ctx = c.u8()?;
+            skip_blr_marks(c)?;
+            BStmt::Erase(ctx)
+        }
         BLR_STORE => {
+            skip_blr_marks(c)?;
             if c.u8()? != BLR_RELATION {
                 return None;
             }
@@ -89393,6 +89447,10 @@ fn parse_blr_stmt(c: &mut BlrCur) -> Option<BStmt> {
             BStmt::Assign(from, to)
         }
         BLR_FOR => {
+            skip_blr_marks(c)?;
+            if c.peek()? == BLR_STALL {
+                return None; // a stall is a statement this server does not run
+            }
             let rse = parse_blr_rse(c)?;
             let body = parse_blr_stmt(c)?;
             BStmt::For(rse, Rc::new(body))
@@ -103920,6 +103978,76 @@ mod tests {
         want.extend_from_slice(&INFO_UNKNOWN_ITEM.to_le_bytes());
         want.push(1);
         assert_eq!(out, want);
+    }
+
+    /// THE REQUEST THAT STOPS A CLIENT-DRIVEN RESTORE, captured off the
+    /// wire on 2026-09-04 with FC_SRV_TRACE while `gbak -c` ran against
+    /// this server. GPRE compiled it from restore.epp's
+    /// `FOR (RDB$DATABASE) ... MODIFY ... END_MODIFY`, and it is the
+    /// shape every GPRE update loop has: a for-loop that SENDS the row
+    /// out, then parks in a `label / loop / select` waiting for the
+    /// client to send back either "modify with this value" or "I am
+    /// done", and a final send after the loop carrying the EOF flag.
+    ///
+    /// The bytes are the pin. They fix the grammar - two context bytes
+    /// on the blr_modify, a message number on every blr_receive, a
+    /// blr_select whose branches are all receives - and they fix the
+    /// SHAPE: the trailing blr_send is a SIBLING of the blr_for, not the
+    /// last statement of its body (gpre/cmp.cpp:989-999).
+    #[test]
+    fn parses_the_gbak_restore_modify_request() {
+        const GBAK_MODIFY_REQUEST: [u8; 170] = [
+            4, 2, 4, 2, 1, 0, 7, 0, 4, 1, 1, 0, 40, 253, 0, 4,
+            0, 2, 0, 7, 0, 40, 253, 0, 2, 7, 67, 1, 74, 12, 82, 68,
+            66, 36, 68, 65, 84, 65, 66, 65, 83, 69, 0, 255, 2, 14, 0, 2,
+            1, 21, 8, 0, 1, 0, 0, 0, 25, 0, 0, 0, 1, 23, 0, 29,
+            82, 68, 66, 36, 67, 72, 65, 82, 65, 67, 84, 69, 82, 95, 83, 69,
+            84, 95, 83, 67, 72, 69, 77, 65, 95, 78, 65, 77, 69, 25, 0, 1,
+            0, 255, 17, 0, 9, 13, 12, 2, 18, 0, 12, 1, 11, 10, 0, 1,
+            2, 1, 25, 1, 0, 0, 23, 1, 29, 82, 68, 66, 36, 67, 72, 65,
+            82, 65, 67, 84, 69, 82, 95, 83, 69, 84, 95, 83, 67, 72, 69, 77,
+            65, 95, 78, 65, 77, 69, 255, 255, 255, 14, 0, 1, 21, 8, 0, 0,
+            0, 0, 0, 25, 0, 0, 0, 255, 255, 76,
+        ];
+        let req = parse_blr_program(&GBAK_MODIFY_REQUEST).expect("the grammar covers it");
+        // message 0 carries the flag and the name the loop sends OUT;
+        // message 1 the name the client sends BACK; message 2 the "done"
+        assert_eq!(req.msgs.len(), 3);
+        assert!(matches!(req.msgs[2].as_slice(), [BField::Short]));
+        assert!(matches!(req.msgs[1].as_slice(), [BField::Cstring(253)]));
+        assert!(matches!(req.msgs[0].as_slice(), [BField::Short, BField::Cstring(253)]));
+
+        let BStmt::Begin(top) = &*req.stmt else { panic!("a begin at the top") };
+        assert_eq!(top.len(), 2, "the for, and the EOF send BESIDE it");
+        assert!(matches!(&*top[1], BStmt::Send(0, _)), "the EOF send is the for's SIBLING");
+
+        let BStmt::For(rse, body) = &*top[0] else { panic!("a for") };
+        assert_eq!(rse.streams, vec![(0u8, "RDB$DATABASE".to_string())]);
+        let BStmt::Begin(fb) = &**body else { panic!("the for body is a begin") };
+        assert!(matches!(&*fb[0], BStmt::Send(0, _)));
+        let BStmt::Label(0, lbody) = &*fb[1] else { panic!("blr_label 0") };
+        let BStmt::Loop(lb) = &**lbody else { panic!("blr_loop") };
+        let BStmt::Select(branches) = &**lb else { panic!("blr_select") };
+        assert_eq!(branches.len(), 2);
+        // the QUIT branch: message 2 leaves the labelled statement
+        assert_eq!(branches[0].0, 2);
+        assert!(matches!(&*branches[0].1, BStmt::Leave(0)));
+        // the WORK branch: message 1 modifies context 0 into context 1
+        assert_eq!(branches[1].0, 1);
+        let BStmt::Handler(h) = &*branches[1].1 else { panic!("blr_handler") };
+        let BStmt::Modify(0, 1, mbody) = &**h else { panic!("blr_modify 0 -> 1") };
+        let BStmt::Begin(ms) = &**mbody else { panic!("a begin of assignments") };
+        assert!(matches!(
+            &*ms[0],
+            BStmt::Assign(BVal::Param(1, 0), BTarget::Field(1, f)) if f == "RDB$CHARACTER_SET_SCHEMA_NAME"
+        ));
+
+        // ...AND IT IS STILL REFUSED, because parsing is not running.
+        // This executor cannot suspend at the select, so op_compile
+        // answers the same error it answered before the grammar grew -
+        // never success over a request it would silently no-op.
+        assert!(!blr_stmt_runnable(&req.stmt));
+        assert!(parse_blr_request(&GBAK_MODIFY_REQUEST).is_none());
     }
 
     /// blr_first: the row cap gbak's restore puts on its "does this
