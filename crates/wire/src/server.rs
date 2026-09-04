@@ -88374,7 +88374,7 @@ fn after_auth(
                 let handle = read_int(&mut s, &mut dec)?; // request handle
                 read_int(&mut s, &mut dec)?; // incarnation
                 let op_tr = read_int(&mut s, &mut dec)?;
-                read_int(&mut s, &mut dec)?; // message number
+                let msgno = read_int(&mut s, &mut dec)?; // message number
                 read_int(&mut s, &mut dec)?; // message count
                 // this op acts on the transaction it NAMES: its temp
                 // blobs, its own info, its request - none of which
@@ -88382,9 +88382,21 @@ fn after_auth(
                 if !switch_named_tx(&mut database, op_tr, &mut s, &mut enc)? {
                     continue;
                 }
+                // THE MESSAGE NUMBER CHOOSES THE FORMAT, and it used to
+                // be read and thrown away: the body was always decoded
+                // as message 0. Every request this server has run so far
+                // sends message 0, so it never showed - but the bytes
+                // that follow are laid out per THAT message's
+                // descriptors, and the shapes differ in LENGTH. A
+                // request whose messages are `cstring(253)` and `short`
+                // decodes 4 bytes where the client sent 4+n+pad, or the
+                // reverse, and what is left in the buffer is the next
+                // op's header. Not a wrong answer - a desynchronised
+                // connection, which is the failure that takes the client
+                // down with it.
                 let fields = blr_slots
                     .get(&handle)
-                    .and_then(|slot| slot.req.msgs.first().cloned())
+                    .and_then(|slot| slot.req.msgs.get(msgno.max(0) as usize).cloned())
                     .unwrap_or_default();
                 let input = read_request_message(&mut s, &mut dec, &fields)?;
                 match (blr_slots.get_mut(&handle), &database) {
@@ -89213,6 +89225,10 @@ const BLR_GEN_ID: u8 = 101;
 const BLR_VALUE_IF: u8 = 105;
 const BLR_MATCHING2: u8 = 106;
 const BLR_END: u8 = 255;
+/// `blr_eoc` (76) - end of command. `PAR_blr` reads exactly one node and
+/// then requires this byte, so it is what says the parse consumed the
+/// whole program rather than stopping early in the middle of one.
+const BLR_EOC: u8 = 76;
 
 /// WHETHER [exec_blr_request] CAN ACTUALLY RUN THIS PROGRAM.
 ///
@@ -89261,14 +89277,21 @@ fn parse_blr_request(blr: &[u8]) -> Option<BlrReq> {
 /// execute it. Kept separate so a request can be decoded and asserted
 /// on without being claimed as supported.
 fn parse_blr_program(blr: &[u8]) -> Option<BlrReq> {
-    // the first byte is the blr_version (4 or 5); the request body then
-    // opens with blr_begin
-    let mut c = BlrCur { b: blr, i: 1 };
+    // `blr_version4` (4) or `blr_version5` (5) and NOTHING else - the
+    // engine answers isc_wroblrver2 for any other first byte
+    // (par.cpp:645-673). Accepting whatever arrives and reading on from
+    // offset 1 meant a buffer that is not BLR at all could still parse.
+    let mut c = BlrCur { b: blr, i: 0 };
+    if !matches!(c.u8()?, 4 | 5) {
+        return None;
+    }
+    // the request body then opens with blr_begin
     if c.u8()? != BLR_BEGIN {
         return None;
     }
     let mut msgs: Vec<Vec<BField>> = Vec::new();
     let mut stmt = BStmt::Nop;
+    let mut closed = false;
     loop {
         match c.peek()? {
             BLR_MESSAGE => {
@@ -89291,10 +89314,23 @@ fn parse_blr_program(blr: &[u8]) -> Option<BlrReq> {
             }
             BLR_END => {
                 c.u8();
+                closed = true;
                 break;
             }
             _ => return None,
         }
+    }
+    // close the outer blr_begin the program opened with, unless the loop
+    // above already consumed its blr_end (a program of messages alone)
+    if !closed && c.u8()? != BLR_END {
+        return None;
+    }
+    // ...and the whole thing ends. `PAR_blr` reads ONE node and then
+    // insists on blr_eoc (par.cpp:214-217, `end_of_command`); a program
+    // with trailing bytes is a program this parser mis-read, and
+    // accepting it silently is how a mis-read becomes a wrong answer.
+    if c.peek() != Some(BLR_EOC) {
+        return None;
     }
     Some(BlrReq { msgs, stmt: Rc::new(stmt) })
 }
@@ -104071,7 +104107,8 @@ mod tests {
         blr.extend_from_slice(&[14, 0, 1, 23, 0, 17]); // send msg 0, assignment, field ctx 0
         blr.extend_from_slice(b"RDB$RELATION_NAME");
         blr.extend_from_slice(&[25, 0, 0, 0]); // -> parameter msg 0 index 0
-        blr.push(255); // blr_end
+        blr.push(255); // blr_end, closing the outer blr_begin
+        blr.push(76); // blr_eoc - PAR_blr requires it (par.cpp:214-217)
         let req = parse_blr_request(&blr).expect("blr_first must parse");
         match &*req.stmt {
             BStmt::For(rse, _) => {
