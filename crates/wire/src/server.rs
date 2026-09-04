@@ -88439,6 +88439,22 @@ fn after_auth(
                             respond_error(&mut s, &mut enc, GDS_REQ_SYNC)?;
                             continue;
                         }
+                        // ...AND RUN ON. `EXE_send` ends by resuming the
+                        // request (`execute_looper(req_next,
+                        // req_proceed)`, exe.cpp:967), and for a program
+                        // whose whole body is a store there is nothing
+                        // else that ever would: it has no `blr_send`, so
+                        // no op_receive follows to pump it. Delivering
+                        // the message and answering success without
+                        // running it told gbak that every catalog row it
+                        // sent had been written when none had.
+                        if let BlrStep::Refused(e) = slot.m.run(&mut database) {
+                            if trace_on() {
+                                eprintln!("[srv] blr request refused: {e}");
+                            }
+                            respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
+                            continue;
+                        }
                         respond(&mut s, &mut enc, handle)?;
                     }
                     _ => respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?,
@@ -89315,6 +89331,9 @@ const BLR_BOOLEAN: u8 = 71;
 const BLR_ASCENDING: u8 = 72;
 const BLR_RELATION: u8 = 74;
 const BLR_GEN_ID: u8 = 101;
+/// `blr_gen_id3` (231) - a generator named with its SCHEMA, and an
+/// explicit-step FLAG rather than an always-present step operand.
+const BLR_GEN_ID3: u8 = 231;
 const BLR_VALUE_IF: u8 = 105;
 const BLR_MATCHING2: u8 = 106;
 const BLR_END: u8 = 255;
@@ -89353,8 +89372,12 @@ fn blr_stmt_runnable(stmt: &BStmt) -> bool {
         // assignments into its new context
         BStmt::Modify(_, _, b) => blr_stmt_runnable(b),
         BStmt::Assign(..) => true,
+        // a store runs into a SYSTEM relation whose row is the whole
+        // object; [write_stored_row] holds that line at execution, where
+        // the relation name is known
+        BStmt::Store(_, _, b) => blr_stmt_runnable(b),
         // still not run: see the doc comment
-        BStmt::Erase(_) | BStmt::Store(..) => false,
+        BStmt::Erase(_) => false,
     }
 }
 
@@ -89834,6 +89857,18 @@ fn parse_blr_val(c: &mut BlrCur) -> Option<BVal> {
             let step = parse_blr_val(c)?;
             BVal::GenId(name, Box::new(step))
         }
+        BLR_GEN_ID3 => {
+            // `blr_gen_id3 <schema> <name> <flag> [step]` - the schema
+            // qualifier FB6 added, and a flag byte that says whether an
+            // explicit step follows at all (ExprNodes.cpp:7148-7163). A
+            // zero flag means "use the sequence's own increment", which
+            // is `NEXT VALUE FOR`; gbak's `fix_security_class_name`
+            // sends flag 1 with a literal step of 1.
+            let _schema = c.name()?;
+            let name = c.name()?;
+            let step = if c.u8()? != 0 { parse_blr_val(c)? } else { BVal::LitLong(1) };
+            BVal::GenId(name, Box::new(step))
+        }
         op @ (34..=37) => {
             // blr_add/subtract/multiply/divide
             let l = parse_blr_val(c)?;
@@ -89852,6 +89887,18 @@ fn parse_blr_val(c: &mut BlrCur) -> Option<BVal> {
             7 => {
                 c.u8()?; // scale
                 let v = c.u8()? as i64 | (c.u8()? as i64) << 8;
+                BVal::LitLong(v)
+            }
+            16 => {
+                // blr_int64: a scale byte then EIGHT little-endian bytes.
+                // A generator step arrives this way (gbak draws with an
+                // explicit step of 1), so a parser that stops at
+                // blr_long cannot read the request that draws one.
+                c.u8()?; // scale
+                let mut v: i64 = 0;
+                for i in 0..8 {
+                    v |= (c.u8()? as i64) << (8 * i);
+                }
                 BVal::LitLong(v)
             }
             14 => {
@@ -89881,9 +89928,18 @@ fn read_request_message(
         match f {
             BField::Short | BField::Long => vals.push(Value::Int(read_int(s, dec)? as i64)),
             BField::Quad => {
-                read_int(s, dec)?;
-                read_int(s, dec)?; // an 8-byte blob id: two longs
-                vals.push(Value::Null);
+                // AN 8-BYTE BLOB ID, and it must not flatten to NULL.
+                // A store has to be able to tell "this column is null"
+                // from "the client sent a blob this server cannot carry"
+                // - the second one dropped silently is a row that looks
+                // written and has lost a column.
+                let a = read_int(s, dec)? as u32;
+                let b = read_int(s, dec)? as u32;
+                vals.push(if a == 0 && b == 0 {
+                    Value::Null
+                } else {
+                    Value::Blob((a & 0xffff) as u16, u64::from(b))
+                });
             }
             BField::Bool => {
                 read_int(s, dec)?; // one byte padded to four
@@ -89943,6 +89999,126 @@ struct Ctx<'a> {
 // the engine's three outcomes: the program ended, a message is ready
 // for an op_receive, or the request is parked waiting for an op_send.
 // ===================================================================
+
+/// Does this value expression contain a generator draw anywhere inside
+/// it? Used to REFUSE the shapes where drawing and reading would differ
+/// rather than answer one when the client asked for the other.
+fn val_has_gen_id(v: &BVal) -> bool {
+    match v {
+        BVal::GenId(..) => true,
+        BVal::ValueIf(_, a, b) | BVal::Arith(_, a, b) => val_has_gen_id(a) || val_has_gen_id(b),
+        _ => false,
+    }
+}
+
+/// Draw the next value of a generator - a PAGE WRITE, staged like every
+/// other write and never holding the write side across a packet.
+fn draw_generator(
+    database: &mut Option<Database>,
+    name: &str,
+    step: i64,
+) -> Result<i64, String> {
+    let db = database.as_mut().ok_or("no database attached")?;
+    let id = generator_id(db, name).ok_or_else(|| format!("unknown generator {name}"))?;
+    let (mut work, tx) = db.work_copy_with_tx()?;
+    let v = gen_bump_through_cache(db, &mut work, name, id, step)?;
+    db.install_dirty(work);
+    db.adopt_tx(tx);
+    db.refresh_reader_view();
+    Ok(v)
+}
+
+/// INSERT a `blr_store`'s new record.
+///
+/// SYSTEM RELATIONS ONLY, for the same reason [write_modified_row]
+/// refuses a user one: this writes through
+/// [fire_crab_ods::ddl::insert_system_row], which keys the record into
+/// the relation's indexes and does nothing else. A user relation needs
+/// the constraints, triggers, defaults and referential actions the
+/// ordinary DML planner carries, and reaching it here would skip all of
+/// them without saying so.
+///
+/// IT ALSO DOES NOT DO THE ENGINE'S DEFERRED WORK. A row in
+/// `RDB$RELATIONS` is a catalog entry, not a usable relation - the
+/// pointer page, the format blob and the `RDB$PAGES` rows come from
+/// `DFW_post_work` at commit. So the relations this accepts are the
+/// ones where a row IS the whole object, and every other one refuses
+/// rather than leaving a half-built object behind.
+fn write_stored_row(
+    database: &mut Option<Database>,
+    relation: &str,
+    columns: &[RelationColumn],
+    row: &[Value],
+) -> Result<(), String> {
+    let db = database.as_mut().ok_or("no database attached")?;
+    let rel = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, relation)
+        .ok_or_else(|| format!("unknown relation {relation}"))?;
+    if fire_crab_ods::system_relation_formats(&db.bytes(), db.page_size, relation).is_none() {
+        return Err(format!(
+            "this server can only execute a BLR store into a system relation, not {relation}"
+        ));
+    }
+    if !STORABLE_SYSTEM_RELATIONS.contains(&relation) {
+        return Err(format!(
+            "a BLR store into {relation} needs the deferred work a row alone does not do"
+        ));
+    }
+    let mut vals: Vec<(String, Value)> = Vec::new();
+    for rc in columns {
+        let v = row.get(rc.field_id as usize).cloned().unwrap_or(Value::Null);
+        match v {
+            Value::Null => {}
+            // A BLOB ARRIVES AS AN ID, NOT AS ITS CONTENT. The client
+            // writes the segments separately (op_create_blob2 /
+            // op_put_segment) and then names the id here; carrying that
+            // through is its own slice, and storing the row without it
+            // would lose a column while reporting success.
+            Value::Blob(..) => {
+                return Err(format!(
+                    "a BLR store cannot carry the blob column {} yet",
+                    rc.name
+                ))
+            }
+            v => vals.push((rc.name.clone(), v)),
+        }
+    }
+    let named: Vec<(&str, fire_crab_ods::ddl::SysValue<'_>)> = vals
+        .iter()
+        .map(|(n, v)| {
+            let sv = match v {
+                Value::Int(i) => fire_crab_ods::ddl::SysValue::Int(*i),
+                Value::Bool(b) => fire_crab_ods::ddl::SysValue::Int(i64::from(*b)),
+                Value::Text(t) => fire_crab_ods::ddl::SysValue::Text(t.as_str()),
+                _ => fire_crab_ods::ddl::SysValue::Null,
+            };
+            (n.as_str(), sv)
+        })
+        .collect();
+    if trace_on() {
+        eprintln!("[srv] blr_store into {relation}: {vals:?}");
+    }
+    let (mut work, tx) = db.work_copy_with_tx()?;
+    work.ddl_tx = Some(u64::from(tx));
+    let r =
+        fire_crab_ods::ddl::insert_system_row(&mut work, db.page_size, relation, rel, &named);
+    work.ddl_tx = None;
+    r?;
+    db.install_dirty(work);
+    db.adopt_tx(tx);
+    db.refresh_reader_view();
+    Ok(())
+}
+
+/// The system relations a `blr_store` may write, and it is a SHORT list
+/// on purpose. A relation belongs here only when its row is the whole
+/// object - nothing else in the file has to change for the object to
+/// exist and be usable. `RDB$SCHEMAS` qualifies: a schema is a name and
+/// an owner, with no pages, no format and no dependent structure.
+///
+/// `RDB$RELATIONS` and `RDB$FIELDS` do NOT, and adding them without the
+/// deferred work would produce a database whose catalog describes tables
+/// the file cannot hold.
+const STORABLE_SYSTEM_RELATIONS: &[&str] = &["RDB$SCHEMAS"];
 
 /// WRITE BACK a `blr_modify`'s row.
 ///
@@ -90091,6 +90267,18 @@ enum BFrame {
     Loop { node: Rc<BStmt> },
     /// `blr_label n`: where a `blr_leave n` unwinds to
     Label { id: u8, ctx_depth: usize },
+    /// `blr_handler`: an ERROR BOUNDARY, not a wrapper. The engine's
+    /// HandlerNode swallows ANY unwind carrying label 0 - the error
+    /// unwind included - and turns it back into ordinary return
+    /// (StmtNodes.cpp:6793-6810). That is not decoration: GPRE emits it
+    /// only where the source wrote `ON_ERROR`, and gbak's restore leans
+    /// on it. Its `STORE X IN RDB$SCHEMAS` is EXPECTED to fail on a
+    /// database that already has the schema, and the handler is what
+    /// lets the restore carry on past it.
+    Handler { ctx_depth: usize },
+    /// inside a `blr_store`: the NEW record being built. Popping this
+    /// frame is what INSERTS it, the way popping a Modify frame writes.
+    Store { relation: String, ctx: u8, ctx_depth: usize },
     /// inside a `blr_modify`: the NEW context is a copy of the OLD one
     /// that the body assigns over, and popping this frame is what
     /// WRITES it back. The engine does the same in two phases - the copy
@@ -90160,6 +90348,28 @@ impl BlrMachine {
             .collect()
     }
 
+    /// SOMETHING WENT WRONG. If a `blr_handler` is open, the error is
+    /// swallowed and execution resumes after it - the engine's
+    /// `req_unwind` with label 0 being caught by a HandlerNode. If none
+    /// is open, the request is dead and the caller answers an error.
+    ///
+    /// Returning `None` means "handled, keep running", which is what
+    /// lets a failing store inside `ON_ERROR` not kill the restore.
+    fn fail(&mut self, e: String) -> Option<BlrStep> {
+        while let Some(f) = self.stack.pop() {
+            if let BFrame::Handler { ctx_depth } = f {
+                self.ctxs.truncate(ctx_depth);
+                self.next = None;
+                if trace_on() {
+                    eprintln!("[srv] blr handler swallowed: {e}");
+                }
+                return None;
+            }
+        }
+        self.done = true;
+        Some(BlrStep::Refused(e))
+    }
+
     /// Unwind to the frame labelled `id`, dropping the contexts every
     /// frame in between opened. `blr_leave` targets a LABEL, and the
     /// label may be anywhere up the stack - in gbak's request it
@@ -90208,7 +90418,23 @@ impl BlrMachine {
                             self.stack.push(BFrame::Loop { node: node.clone() });
                         }
                     }
-                    Some(BFrame::Label { .. }) => {}
+                    Some(BFrame::Label { .. }) | Some(BFrame::Handler { .. }) => {}
+                    Some(BFrame::Store { relation, ctx, ctx_depth }) => {
+                        let built = self
+                            .ctxs
+                            .iter()
+                            .find(|c| c.ctx == ctx)
+                            .map(|c| (c.columns.clone(), c.row.clone()));
+                        self.ctxs.truncate(ctx_depth);
+                        let Some((columns, row)) = built else {
+                            return BlrStep::Refused("the store's context is gone".into());
+                        };
+                        if let Err(e) = write_stored_row(database, &relation, &columns, &row) {
+                            if let Some(step) = self.fail(e) {
+                                return step;
+                            }
+                        }
+                    }
                     Some(BFrame::Modify { relation, old_row, new_ctx, ctx_depth }) => {
                         // THE BODY HAS RUN; the NEW context now holds
                         // what the row should become. The engine stores
@@ -90227,7 +90453,9 @@ impl BlrMachine {
                         if let Err(e) =
                             write_modified_row(database, &relation, &columns, &old_row, &new_row)
                         {
-                            return BlrStep::Refused(e);
+                            if let Some(step) = self.fail(e) {
+                                return step;
+                            }
                         }
                     }
                     Some(BFrame::For { node, rows, i, ctx_depth }) => {
@@ -90258,7 +90486,10 @@ impl BlrMachine {
                         self.stack.push(BFrame::Seq { node: node.clone(), i: 1 });
                     }
                 }
-                BStmt::Handler(b) => self.next = Some(b.clone()),
+                BStmt::Handler(b) => {
+                    self.stack.push(BFrame::Handler { ctx_depth: self.ctxs.len() });
+                    self.next = Some(b.clone());
+                }
                 BStmt::Label(id, body) => {
                     self.stack.push(BFrame::Label { id: *id, ctx_depth: self.ctxs.len() });
                     self.next = Some(body.clone());
@@ -90310,15 +90541,66 @@ impl BlrMachine {
                     }
                 }
                 BStmt::Send(msg, assigns) => {
+                    let fields = self.req.msgs.get(*msg as usize).cloned().unwrap_or_default();
+                    let mut vals: Vec<Value> = vec![Value::Null; fields.len()];
+                    // A GENERATOR IN A SEND IS A DRAW, NOT A READ, and
+                    // it is a page write, so it cannot happen inside
+                    // [eval_blr_val] - which every read path shares and
+                    // which holds the database immutably. gbak asks for
+                    // one (`fix_security_class_name` takes the next
+                    // RDB$SECURITY_CLASS to build a name nothing else
+                    // holds), so the draws are done HERE, before the
+                    // evaluation, and their values substituted in.
+                    let mut drawn: Vec<(usize, Value)> = Vec::new();
+                    for (i, (from, _)) in assigns.iter().enumerate() {
+                        match from {
+                            BVal::GenId(name, step) => {
+                                let step = match &**step {
+                                    BVal::LitLong(n) => *n,
+                                    _ => {
+                                        if let Some(st) = self
+                                            .fail("a generator step this server cannot fold".into())
+                                        {
+                                            return st;
+                                        }
+                                        continue;
+                                    }
+                                };
+                                match draw_generator(database, name, step) {
+                                    Ok(v) => drawn.push((i, Value::Int(v))),
+                                    Err(e) => {
+                                        if let Some(st) = self.fail(e) {
+                                            return st;
+                                        }
+                                        continue;
+                                    }
+                                }
+                            }
+                            // A GENERATOR NESTED INSIDE AN EXPRESSION
+                            // would be READ rather than drawn by the
+                            // evaluator, which is a different answer -
+                            // so it refuses instead of quietly differing.
+                            other if val_has_gen_id(other) => {
+                                if let Some(st) = self.fail(
+                                    "a generator inside an expression is not drawn here".into(),
+                                ) {
+                                    return st;
+                                }
+                                continue;
+                            }
+                            _ => {}
+                        }
+                    }
                     let Some(db) = database.as_ref() else {
                         return BlrStep::Refused("no database attached".into());
                     };
-                    let fields = self.req.msgs.get(*msg as usize).cloned().unwrap_or_default();
-                    let mut vals: Vec<Value> = vec![Value::Null; fields.len()];
                     {
                         let view = self.view();
-                        for (from, (_m, idx, nidx)) in assigns {
-                            let v = eval_blr_val(from, &view, &self.input, db);
+                        for (i, (from, (_m, idx, nidx))) in assigns.iter().enumerate() {
+                            let v = match drawn.iter().find(|(j, _)| *j == i) {
+                                Some((_, v)) => v.clone(),
+                                None => eval_blr_val(from, &view, &self.input, db),
+                            };
                             if let Some(ni) = nidx {
                                 if let Some(slot) = vals.get_mut(*ni as usize) {
                                     *slot =
@@ -90400,10 +90682,36 @@ impl BlrMachine {
                         }
                     }
                 }
-                BStmt::Store(..) | BStmt::Erase(_) => {
-                    return BlrStep::Refused(
-                        "this server cannot execute blr_store or blr_erase yet".into(),
-                    );
+                BStmt::Store(relation, ctx, body) => {
+                    let Some(db) = database.as_ref() else {
+                        return BlrStep::Refused("no database attached".into());
+                    };
+                    if fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, relation)
+                        .is_none()
+                    {
+                        return BlrStep::Refused(format!("unknown relation {relation}"));
+                    }
+                    // A NEW RECORD STARTS ALL-NULL and the body's
+                    // assignments fill it, which is what makes a store
+                    // that names six columns leave the rest null rather
+                    // than zero.
+                    let columns = db.columns(relation);
+                    let width = columns.iter().map(|c| c.field_id as usize + 1).max().unwrap_or(0);
+                    self.stack.push(BFrame::Store {
+                        relation: relation.clone(),
+                        ctx: *ctx,
+                        ctx_depth: self.ctxs.len(),
+                    });
+                    self.ctxs.push(OwnedCtx {
+                        ctx: *ctx,
+                        relation: relation.clone(),
+                        columns,
+                        row: vec![Value::Null; width],
+                    });
+                    self.next = Some(body.clone());
+                }
+                BStmt::Erase(_) => {
+                    return BlrStep::Refused("this server cannot execute blr_erase yet".into());
                 }
             }
         }
@@ -104652,11 +104960,35 @@ mod tests {
         // are genuinely not implemented.
         assert!(blr_stmt_runnable(&req.stmt));
         assert!(parse_blr_request(&GBAK_MODIFY_REQUEST).is_some());
-        // blr_store and blr_erase are still refused, and a program is
-        // refused for carrying one ANYWHERE inside it
-        let store = BStmt::Store("T".into(), 0, Rc::new(BStmt::Nop));
-        assert!(!blr_stmt_runnable(&store));
-        assert!(!blr_stmt_runnable(&BStmt::Loop(Rc::new(store))));
+        // blr_erase is still refused, and a program is refused for
+        // carrying it ANYWHERE inside it
+        assert!(!blr_stmt_runnable(&BStmt::Erase(0)));
+        assert!(!blr_stmt_runnable(&BStmt::Loop(Rc::new(BStmt::Erase(0)))));
+        // a store compiles by SHAPE - which relations it may write is a
+        // question only the executor can answer, since the name is a
+        // string in the program rather than a property of the verb
+        assert!(blr_stmt_runnable(&BStmt::Store("T".into(), 0, Rc::new(BStmt::Nop))));
+    }
+
+    /// `blr_gen_id3` (231): a generator named with its SCHEMA, and an
+    /// explicit-step FLAG rather than an always-present step operand
+    /// (ExprNodes.cpp:7148-7163). gbak's `fix_security_class_name` draws
+    /// the next `SYSTEM.RDB$SECURITY_CLASS` to build a name nothing else
+    /// holds; captured off the wire, 58 bytes.
+    #[test]
+    fn parses_blr_gen_id3() {
+        const REQ: [u8; 58] = [
+            5, 2, 4, 0, 1, 0, 16, 0, 14, 0, 2, 1, 231, 6, 83, 89, 83, 84, 69, 77, 18, 82, 68,
+            66, 36, 83, 69, 67, 85, 82, 73, 84, 89, 95, 67, 76, 65, 83, 83, 1, 21, 16, 0, 1, 0,
+            0, 0, 0, 0, 0, 0, 25, 0, 0, 0, 255, 255, 76,
+        ];
+        let req = parse_blr_program(&REQ).expect("the grammar covers blr_gen_id3");
+        let BStmt::Send(0, assigns) = &*req.stmt else { panic!("blr_send 0") };
+        assert_eq!(assigns.len(), 1);
+        let (BVal::GenId(name, step), _) = &assigns[0] else { panic!("a generator draw") };
+        assert_eq!(name, "RDB$SECURITY_CLASS", "the NAME, not the schema");
+        assert!(matches!(**step, BVal::LitLong(1)), "an explicit step of 1");
+        assert!(blr_stmt_runnable(&req.stmt));
     }
 
     /// GPRE's OTHER SHAPE, and the one the restore's whole metadata
@@ -104712,11 +105044,12 @@ mod tests {
             "every one is a message parameter into a field of the new record"
         );
 
-        // ...and it is REFUSED, because blr_store does not execute yet.
-        // The gate is what keeps a request that would write nothing from
-        // being answered as success.
-        assert!(!blr_stmt_runnable(&req.stmt));
-        assert!(parse_blr_request(&GBAK_STORE_REQUEST).is_none());
+        // ...and it COMPILES now. Which relations a store may actually
+        // write is decided at execution, where the name is known -
+        // [STORABLE_SYSTEM_RELATIONS] - not here, where refusing by
+        // shape would refuse RDB$SCHEMAS too.
+        assert!(blr_stmt_runnable(&req.stmt));
+        assert!(parse_blr_request(&GBAK_STORE_REQUEST).is_some());
     }
 
     /// THE CO-ROUTINE'S ONE DECISION: which branch of a `blr_select`

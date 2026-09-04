@@ -8327,6 +8327,44 @@ fn dispose_row_purge(file: &mut crate::Image, page_size: usize, rel: u16, page: 
     }
 }
 
+/// STORE ONE NEW ROW INTO A SYSTEM RELATION, from outside this crate.
+///
+/// The other half of what the legacy BLR write API needs: gbak's
+/// client-driven restore writes the whole metadata catalog this way,
+/// one `STORE X IN RDB$<something>` request per row. Like
+/// [patch_system_row] this is a thin face on the writer the DDL
+/// planners already use ([sys_insert]) rather than a second one - it
+/// starts every field NULL, sets the named ones, and keys the record
+/// into every index the relation carries.
+///
+/// It does NOT do the engine's deferred work. Storing a row into
+/// `RDB$RELATIONS` makes a catalog entry, not a usable relation - the
+/// pointer page, the format blob and the `RDB$PAGES` rows come from
+/// `DFW_post_work`, and a caller that needs them must post the
+/// equivalent itself.
+pub fn insert_system_row(
+    file: &mut crate::Image,
+    page_size: usize,
+    rel_name: &str,
+    rel: u16,
+    values: &[(&str, SysValue<'_>)],
+) -> Result<(), String> {
+    let vals: Vec<(&str, SysVal<'_>)> = values
+        .iter()
+        .map(|(c, v)| {
+            (
+                *c,
+                match v {
+                    SysValue::Text(t) => SysVal::S(t),
+                    SysValue::Int(n) => SysVal::I(*n),
+                    SysValue::Null => SysVal::Null,
+                },
+            )
+        })
+        .collect();
+    sys_insert(file, page_size, rel_name, rel, &vals)
+}
+
 /// PATCH ONE ROW OF A SYSTEM RELATION, from outside this crate.
 ///
 /// The legacy BLR write API (`blr_modify` over a system relation, which
