@@ -1433,6 +1433,11 @@ fn respond_kicked(s: &mut TcpStream, enc: &mut Option<Rc4>) -> std::io::Result<(
 /// isc_dsql_error - the generic "Dynamic SQL Error" the server answers
 /// for statements it cannot honour rather than answering them wrong.
 const GDS_DSQL_ERROR: i32 = 335544569;
+/// `isc_req_sync` - "request synchronization error". What the engine
+/// answers when a client sends into a request that is not waiting for a
+/// message, or names a message number the parked `blr_select` does not
+/// offer (exe.cpp:929, 955-957).
+const GDS_REQ_SYNC: i32 = 335544364;
 
 /// `isc_req_max_clones_exceeded` - "Too many concurrent executions of
 /// the same request", SQLSTATE 54001. The engine's own refusal when a
@@ -84591,9 +84596,8 @@ fn after_auth(
     // its own handle; the request, its output queue and read cursor live
     // under that handle until op_release.
     struct BlrSlot {
-        req: BlrReq,
-        queue: Vec<(i32, Vec<u8>)>,
-        cursor: usize,
+        req: Rc<BlrReq>,
+        m: BlrMachine,
     }
     let mut blr_slots: std::collections::HashMap<i32, BlrSlot> = std::collections::HashMap::new();
 
@@ -88311,7 +88315,30 @@ fn after_auth(
                 }
                 match (req, database.as_ref()) {
                     (Some(req), Some(db)) => {
-                        let out = exec_blr_request(&req, &input, db);
+                        // ONE EXECUTOR. `isc_transact_request` runs the
+                        // same programs op_compile does and must run
+                        // them the same way, so it drives the same
+                        // machine - start, deliver the input message the
+                        // packet carried, then run to the end.
+                        let mut m = BlrMachine::start(Rc::new(req));
+                        // THE INPUT IS A PARAMETER SOURCE HERE, NOT A
+                        // DELIVERED MESSAGE. `isc_transact_request`
+                        // fills the message in BEFORE the start, which
+                        // is why its BLR carries no `blr_receive` - one
+                        // would stall the request, and there is no
+                        // second packet to un-stall it. Running it
+                        // through `deliver` (the EXE_send path) answered
+                        // `request synchronization error` to a request
+                        // that was never waiting.
+                        m.input = input;
+                        if let Some(e) = m.pump(db, usize::MAX) {
+                            if trace_on() {
+                                eprintln!("[srv] op_transact refused: {e}");
+                            }
+                            respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
+                            continue;
+                        }
+                        let out = m.out;
                         let mut w = W::default();
                         match out.iter().find(|(m, _)| *m == 1) {
                             Some((_, msg)) => {
@@ -88354,7 +88381,9 @@ fn after_auth(
                                 break next_stmt_handle;
                             }
                         };
-                        blr_slots.insert(handle, BlrSlot { req, queue: Vec::new(), cursor: 0 });
+                        let req = Rc::new(req);
+                        blr_slots
+                            .insert(handle, BlrSlot { req: req.clone(), m: BlrMachine::start(req) });
                         respond(&mut s, &mut enc, handle)?;
                     }
                     None => {
@@ -88401,8 +88430,15 @@ fn after_auth(
                 let input = read_request_message(&mut s, &mut dec, &fields)?;
                 match (blr_slots.get_mut(&handle), &database) {
                     (Some(slot), Some(db)) => {
-                        slot.queue = exec_blr_request(&slot.req, &input, db);
-                        slot.cursor = 0;
+                        // EXE_start then EXE_send: the request runs to its
+                        // first stall, and the message is delivered into
+                        // it there (exe.cpp:1185-1190, 896-967).
+                        slot.m = BlrMachine::start(slot.req.clone());
+                        slot.m.run(db);
+                        if slot.m.deliver(msgno.max(0) as u8, input).is_err() {
+                            respond_error(&mut s, &mut enc, GDS_REQ_SYNC)?;
+                            continue;
+                        }
                         respond(&mut s, &mut enc, handle)?;
                     }
                     _ => respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?,
@@ -88422,8 +88458,8 @@ fn after_auth(
                 }
                 match (blr_slots.get_mut(&handle), &database) {
                     (Some(slot), Some(db)) => {
-                        slot.queue = exec_blr_request(&slot.req, &[], db);
-                        slot.cursor = 0;
+                        slot.m = BlrMachine::start(slot.req.clone());
+                        slot.m.run(db);
                         respond(&mut s, &mut enc, handle)?;
                     }
                     _ => respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?,
@@ -88438,11 +88474,24 @@ fn after_auth(
                 // the frame echoes the transaction the client named, so
                 // the answer belongs to the request it asked about
                 let tx = if op_tr != 0 { op_tr } else { database.as_ref().map_or(0, |d| d.cur_handle) };
-                match blr_slots.get_mut(&handle) {
-                    Some(slot) => send_request_batch(
-                        &mut s, &mut enc, handle, &slot.queue, &mut slot.cursor, msgno, batch, tx,
-                    )?,
-                    None => {
+                match (blr_slots.get_mut(&handle), &database) {
+                    (Some(slot), Some(db)) => {
+                        // run the request forward until it has what the
+                        // client asked for, or parks, or ends
+                        let want = batch.max(1) as usize;
+                        if let Some(e) = slot.m.pump(db, want) {
+                            if trace_on() {
+                                eprintln!("[srv] blr request refused: {e}");
+                            }
+                            respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
+                            continue;
+                        }
+                        let (queue, cursor) = (&slot.m.out, &mut slot.m.cursor);
+                        send_request_batch(
+                            &mut s, &mut enc, handle, queue, cursor, msgno, batch, tx,
+                        )?;
+                    }
+                    _ => {
                         let mut c = 0;
                         send_request_batch(&mut s, &mut enc, handle, &[], &mut c, msgno, batch, tx)?;
                     }
@@ -89230,7 +89279,7 @@ const BLR_END: u8 = 255;
 /// whole program rather than stopping early in the middle of one.
 const BLR_EOC: u8 = 76;
 
-/// WHETHER [exec_blr_request] CAN ACTUALLY RUN THIS PROGRAM.
+/// WHETHER [BlrMachine] CAN ACTUALLY RUN THIS PROGRAM.
 ///
 /// The grammar below parses the whole legacy statement set, including
 /// the WRITE verbs (blr_store / blr_modify / blr_erase) and the
@@ -89824,169 +89873,431 @@ struct Ctx<'a> {
     row: &'a [Value],
 }
 
-/// Execute a compiled BLR request, returning the queue of xdr-encoded
-/// output messages (each drained by one op_receive). `input` are the
-/// values from the op_start_and_send message (the request's parameters).
-fn exec_blr_request(req: &BlrReq, input: &[Value], db: &Database) -> Vec<(i32, Vec<u8>)> {
-    let mut out = Vec::new();
-    exec_blr_stmt(&req.stmt, req, input, &[], db, &mut out);
-    out
-}
+// ===================================================================
+// A REQUEST IS A CO-ROUTINE, NOT A FUNCTION.
+//
+// [exec_blr_request] above runs a program to completion and hands back
+// every message it produced. That is enough for a SHOW, whose whole
+// program is "walk this relation and send each row", and it is not a
+// request at all in the engine's terms - it is the special case where
+// the co-routine never yields.
+//
+// GPRE compiles `FOR ... MODIFY ... END_MODIFY` into a program that
+// SENDS a row out, then PARKS inside a `blr_label / blr_loop /
+// blr_select` until the client sends back either "modify, with this
+// value" or "I am done". Between those two packets the request is
+// suspended with an open cursor, and the engine holds NO stack across
+// the gap: `EXE_looper` is a trampoline over
+// `(req_operation, req_next, req_message, req_flags, req_label)`
+// (exe.cpp:1746-1786), each node returning the next one to run.
+//
+// So the conversion is an EXPLICIT FRAME STACK, not a recursive
+// interpreter. [BlrMachine] is that stack; [BlrMachine::run] is the
+// trampoline; [BlrStep] is what the loop exits with, which is exactly
+// the engine's three outcomes: the program ended, a message is ready
+// for an op_receive, or the request is parked waiting for an op_send.
+// ===================================================================
 
-/// A resolved stream: its context number, columns and the rows read.
-struct StreamData {
+/// A context open in a running request: the stream a `blr_field`
+/// carrying this context number resolves against, and the row it is on.
+///
+/// The read-only executor gets away with [Ctx], which BORROWS its
+/// columns and row out of a `match`-arm local. A suspended request has
+/// no such local - its contexts have to outlive the packet that opened
+/// them - so the machine's contexts are OWNED, and [Ctx] is rebuilt
+/// from them for the duration of one evaluation.
+#[derive(Clone)]
+struct OwnedCtx {
     ctx: u8,
-    columns: Vec<RelationColumn>,
-    rows: Vec<Vec<Value>>,
+    /// the relation this context is a cursor over - a `blr_modify`
+    /// needs it to know what it is writing
+    relation: String,
+    columns: std::sync::Arc<Vec<RelationColumn>>,
+    row: Vec<Value>,
 }
 
-fn exec_blr_stmt(
-    stmt: &BStmt,
-    req: &BlrReq,
-    input: &[Value],
-    ctxs: &[Ctx],
-    db: &Database,
-    out: &mut Vec<(i32, Vec<u8>)>,
-) {
-    match stmt {
-        BStmt::Nop => {}
-        BStmt::Begin(v) => {
-            for st in v {
-                exec_blr_stmt(st, req, input, ctxs, db, out);
+/// One entry of a running request's control stack. Every frame that can
+/// open a context records the context DEPTH at which it was pushed, so
+/// unwinding past it drops exactly the contexts it opened.
+enum BFrame {
+    /// running the statements of a `blr_begin`, `i` next
+    Seq { node: Rc<BStmt>, i: usize },
+    /// an OPEN CURSOR. `rows` is the for-loop's matched rows, already
+    /// resolved; `i` is the next one to visit. The engine keeps a live
+    /// cursor here and fire-crab keeps a snapshot - a divergence that is
+    /// invisible for a one-row relation and is recorded in the roadmap.
+    For { node: Rc<BStmt>, rows: Vec<Vec<OwnedCtx>>, i: usize, ctx_depth: usize },
+    /// `blr_loop`: when its body falls off the end, run it again
+    Loop { node: Rc<BStmt> },
+    /// `blr_label n`: where a `blr_leave n` unwinds to
+    Label { id: u8, ctx_depth: usize },
+}
+
+/// What one run of the trampoline stopped for - the engine's three
+/// outcomes, and an error.
+#[derive(Debug, PartialEq)]
+enum BlrStep {
+    /// the program ran off the end
+    Done,
+    /// a message is queued for the client's op_receive (the engine's
+    /// `req_send` stall)
+    Sent,
+    /// parked at a `blr_select` or a bare `blr_receive`: the client must
+    /// op_send one of these message numbers next (`req_receive`)
+    Await(Vec<u8>),
+    /// the program asked for something this server does not do. The
+    /// request is dead; the caller answers an error.
+    Refused(String),
+}
+
+/// A running request: everything that must survive between wire packets.
+struct BlrMachine {
+    req: Rc<BlrReq>,
+    stack: Vec<BFrame>,
+    /// the statement to ENTER next, when there is one. `None` means
+    /// "advance the innermost frame instead".
+    next: Option<Rc<BStmt>>,
+    ctxs: Vec<OwnedCtx>,
+    /// messages produced but not yet drained by an op_receive
+    out: Vec<(i32, Vec<u8>)>,
+    cursor: usize,
+    /// the message the client last sent, by parameter index
+    input: Vec<Value>,
+    /// message numbers this request is parked on, empty when running
+    awaiting: Vec<u8>,
+    done: bool,
+}
+
+impl BlrMachine {
+    fn start(req: Rc<BlrReq>) -> Self {
+        let next = Some(req.stmt.clone());
+        BlrMachine {
+            req,
+            stack: Vec::new(),
+            next,
+            ctxs: Vec::new(),
+            out: Vec::new(),
+            cursor: 0,
+            input: Vec::new(),
+            awaiting: Vec::new(),
+            done: false,
+        }
+    }
+
+    /// Borrowed contexts for one evaluation. The evaluators take
+    /// `&[Ctx]` and are shared with the read-only executor; rebuilding
+    /// the slice per evaluation is what keeps them untouched.
+    fn view(&self) -> Vec<Ctx<'_>> {
+        self.ctxs
+            .iter()
+            .map(|c| Ctx { ctx: c.ctx, columns: &c.columns, row: &c.row })
+            .collect()
+    }
+
+    /// Unwind to the frame labelled `id`, dropping the contexts every
+    /// frame in between opened. `blr_leave` targets a LABEL, and the
+    /// label may be anywhere up the stack - in gbak's request it
+    /// encloses only the loop, so leaving it falls out of the loop and
+    /// back into the for-BODY, which then advances the cursor
+    /// (StmtNodes.cpp:6337-6350). It does NOT leave the for.
+    fn leave(&mut self, id: u8) -> Option<()> {
+        while let Some(f) = self.stack.pop() {
+            if let BFrame::Label { id: lid, ctx_depth } = f {
+                if lid == id {
+                    self.ctxs.truncate(ctx_depth);
+                    return Some(());
+                }
             }
         }
-        BStmt::Receive(_, body) => exec_blr_stmt(body, req, input, ctxs, db, out),
-        BStmt::Handler(body) => exec_blr_stmt(body, req, input, ctxs, db, out),
-        // THE WRITE AND CO-ROUTINE VERBS ARE PARSED BUT NOT RUN HERE.
-        // This executor materialises every output message up front from
-        // an IMMUTABLE database - it cannot suspend, and it cannot write.
-        // Reaching one of these would be a silent no-op, so a request
-        // carrying one never gets this far: [blr_stmt_runnable] refuses
-        // it at op_compile, which is what the engine's parser does with
-        // a verb it has no node for.
-        BStmt::Label(..)
-        | BStmt::Loop(_)
-        | BStmt::Leave(_)
-        | BStmt::Select(_)
-        | BStmt::Modify(..)
-        | BStmt::Erase(_)
-        | BStmt::Store(..)
-        | BStmt::Assign(..) => {}
-        BStmt::For(rse, body) => {
-            // resolve every stream of the rse (SHOW INDICES joins two)
-            let mut streams: Vec<StreamData> = Vec::new();
-            for (ctx, relname) in &rse.streams {
-                let Some(rel) =
-                    fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, relname)
-                else {
-                    return;
-                };
-                let columns = db.columns(relname);
-                let formats = select_formats(db, relname, rel);
-                if formats.is_empty() {
-                    return;
-                }
-                let mut rows: Vec<Vec<Value>> = Vec::new();
-                for_each_record(db, rel, &formats, usize::MAX, |values| rows.push(values.to_vec()));
-                streams.push(StreamData { ctx: *ctx, columns: columns.as_ref().clone(), rows });
+        // a leave naming a label that is not open: the engine unwinds
+        // the whole request rather than looping forever
+        None
+    }
+
+    /// Run until the program ends, produces a message, or parks.
+    fn run(&mut self, db: &Database) -> BlrStep {
+        loop {
+            if self.done {
+                return BlrStep::Done;
             }
-            // nested-loop join: every combination of one row per stream,
-            // kept when the rse boolean holds over the enclosing contexts
-            // plus this combination
-            let mut combos: Vec<Vec<usize>> = vec![Vec::new()];
-            for s in &streams {
-                let mut next = Vec::with_capacity(combos.len() * s.rows.len());
-                for combo in &combos {
-                    for ri in 0..s.rows.len() {
-                        let mut c = combo.clone();
-                        c.push(ri);
-                        next.push(c);
+            // enter a statement, or advance the innermost frame
+            let Some(node) = self.next.take() else {
+                match self.stack.pop() {
+                    None => {
+                        self.done = true;
+                        return BlrStep::Done;
+                    }
+                    Some(BFrame::Seq { node, i }) => {
+                        if let BStmt::Begin(v) = &*node {
+                            if i < v.len() {
+                                self.next = Some(v[i].clone());
+                                self.stack.push(BFrame::Seq { node: node.clone(), i: i + 1 });
+                            }
+                        }
+                    }
+                    Some(BFrame::Loop { node }) => {
+                        // a loop only ends by being LEFT
+                        if let BStmt::Loop(body) = &*node {
+                            self.next = Some(body.clone());
+                            self.stack.push(BFrame::Loop { node: node.clone() });
+                        }
+                    }
+                    Some(BFrame::Label { .. }) => {}
+                    Some(BFrame::For { node, rows, i, ctx_depth }) => {
+                        self.ctxs.truncate(ctx_depth);
+                        if i < rows.len() {
+                            for c in &rows[i] {
+                                self.ctxs.push(c.clone());
+                            }
+                            if let BStmt::For(_, body) = &*node {
+                                self.next = Some(body.clone());
+                            }
+                            self.stack.push(BFrame::For {
+                                node: node.clone(),
+                                rows,
+                                i: i + 1,
+                                ctx_depth,
+                            });
+                        }
                     }
                 }
-                combos = next;
-            }
-            let build = |combo: &[usize]| -> Vec<Ctx> {
-                let mut all: Vec<Ctx> = ctxs.to_vec();
-                for (s, &ri) in streams.iter().zip(combo) {
-                    all.push(Ctx { ctx: s.ctx, columns: &s.columns, row: &s.rows[ri] });
-                }
-                all
+                continue;
             };
-            let mut matched: Vec<Vec<usize>> = combos
-                .into_iter()
-                .filter(|combo| {
-                    let all = build(combo);
-                    rse.boolean
-                        .as_ref()
-                        .map_or(true, |b| eval_blr_bool(b, &all, input, db))
+            match &*node {
+                BStmt::Nop => {}
+                BStmt::Begin(v) => {
+                    if !v.is_empty() {
+                        self.next = Some(v[0].clone());
+                        self.stack.push(BFrame::Seq { node: node.clone(), i: 1 });
+                    }
+                }
+                BStmt::Handler(b) => self.next = Some(b.clone()),
+                BStmt::Label(id, body) => {
+                    self.stack.push(BFrame::Label { id: *id, ctx_depth: self.ctxs.len() });
+                    self.next = Some(body.clone());
+                }
+                BStmt::Loop(body) => {
+                    self.stack.push(BFrame::Loop { node: node.clone() });
+                    self.next = Some(body.clone());
+                }
+                BStmt::Leave(id) => {
+                    if self.leave(*id).is_none() {
+                        self.done = true;
+                        return BlrStep::Done;
+                    }
+                }
+                BStmt::Receive(msg, body) => {
+                    // A BARE RECEIVE PARKS TOO. op_start_and_send then
+                    // delivers the message, which is why the read-only
+                    // executor could treat it as transparent: its
+                    // requests are all `receive 0 { ... }` and the start
+                    // packet carries message 0.
+                    self.awaiting = vec![*msg];
+                    self.next = Some(body.clone());
+                    return BlrStep::Await(self.awaiting.clone());
+                }
+                BStmt::Select(branches) => {
+                    // THE CLIENT CHOOSES THE BRANCH. The engine parks
+                    // here with `req_message` pointing at the select and
+                    // resolves it in EXE_send by scanning the branches
+                    // for the message number the client sent
+                    // (exe.cpp:936-947).
+                    self.awaiting = branches.iter().map(|(m, _)| *m).collect();
+                    self.next = Some(node.clone());
+                    return BlrStep::Await(self.awaiting.clone());
+                }
+                BStmt::For(rse, _) => {
+                    match self.open_for(rse, db) {
+                        Ok(rows) => {
+                            self.stack.push(BFrame::For {
+                                node: node.clone(),
+                                rows,
+                                i: 0,
+                                ctx_depth: self.ctxs.len(),
+                            });
+                        }
+                        Err(e) => return BlrStep::Refused(e),
+                    }
+                }
+                BStmt::Send(msg, assigns) => {
+                    let fields = self.req.msgs.get(*msg as usize).cloned().unwrap_or_default();
+                    let mut vals: Vec<Value> = vec![Value::Null; fields.len()];
+                    {
+                        let view = self.view();
+                        for (from, (_m, idx, nidx)) in assigns {
+                            let v = eval_blr_val(from, &view, &self.input, db);
+                            if let Some(ni) = nidx {
+                                if let Some(slot) = vals.get_mut(*ni as usize) {
+                                    *slot =
+                                        Value::Int(if matches!(v, Value::Null) { -1 } else { 0 });
+                                }
+                            }
+                            if let Some(slot) = vals.get_mut(*idx as usize) {
+                                *slot = v;
+                            }
+                        }
+                    }
+                    self.out.push((*msg as i32, encode_request_message(&fields, &vals)));
+                    return BlrStep::Sent;
+                }
+                // THE WRITE VERBS ARE NOT RUN YET. They parse, and
+                // `blr_stmt_runnable` keeps a program carrying one from
+                // ever being compiled, so this is unreachable rather
+                // than silent - but it is spelled out so that wiring the
+                // write path in is a change HERE and nowhere else.
+                BStmt::Modify(..) | BStmt::Store(..) | BStmt::Erase(_) | BStmt::Assign(..) => {
+                    return BlrStep::Refused(
+                        "this server cannot execute a BLR write verb yet".into(),
+                    );
+                }
+            }
+        }
+    }
+
+    /// Run until at least `want` messages are queued for the client, or
+    /// the request parks or ends. This is `EXE_receive`'s drive-forward
+    /// loop (exe.cpp:733-748): run until there is something to send.
+    fn pump(&mut self, db: &Database, want: usize) -> Option<String> {
+        while self.out.len().saturating_sub(self.cursor) < want {
+            match self.run(db) {
+                BlrStep::Sent => continue,
+                BlrStep::Done | BlrStep::Await(_) => break,
+                BlrStep::Refused(e) => return Some(e),
+            }
+        }
+        None
+    }
+
+    /// Deliver the client's message into a parked request, choosing the
+    /// `blr_select` branch it names. `Err` is the engine's `isc_req_sync`
+    /// - either the request was not waiting, or it was waiting for a
+    /// message this one is not (exe.cpp:931-957).
+    fn deliver(&mut self, msg: u8, vals: Vec<Value>) -> Result<(), ()> {
+        if !self.awaiting.contains(&msg) {
+            return Err(());
+        }
+        self.input = vals;
+        // A SELECT IS RESOLVED HERE, NOT WHERE IT PARKED. The engine
+        // leaves `req_message` pointing at the select and scans its
+        // branches for the number the client sent, setting `req_next` to
+        // that branch (exe.cpp:936-947).
+        if let Some(node) = self.next.clone() {
+            if let BStmt::Select(branches) = &*node {
+                let (_, body) = branches.iter().find(|(m, _)| *m == msg).ok_or(())?;
+                self.next = Some(body.clone());
+            }
+        }
+        self.awaiting.clear();
+        Ok(())
+    }
+
+    /// Resolve a `blr_for`'s rse into the rows its body will visit, in
+    /// the engine's order: the boolean filters, the sort orders, the
+    /// project (DISTINCT) keeps the first of each tuple, and `blr_first`
+    /// caps LAST.
+    fn open_for(&self, rse: &BRse, db: &Database) -> Result<Vec<Vec<OwnedCtx>>, String> {
+        let mut streams: Vec<(u8, String, std::sync::Arc<Vec<RelationColumn>>, Vec<Vec<Value>>)> =
+            Vec::new();
+        for (ctx, relname) in &rse.streams {
+            let rel = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, relname)
+                .ok_or_else(|| format!("unknown relation {relname}"))?;
+            let columns = db.columns(relname);
+            let formats = select_formats(db, relname, rel);
+            if formats.is_empty() {
+                return Err(format!("no format for {relname}"));
+            }
+            let mut rows: Vec<Vec<Value>> = Vec::new();
+            for_each_record(db, rel, &formats, usize::MAX, |values| rows.push(values.to_vec()));
+            streams.push((*ctx, relname.clone(), columns, rows));
+        }
+        // every combination of one row per stream
+        let mut combos: Vec<Vec<usize>> = vec![Vec::new()];
+        for (_, _, _, rows) in &streams {
+            let mut next = Vec::with_capacity(combos.len() * rows.len());
+            for combo in &combos {
+                for ri in 0..rows.len() {
+                    let mut c = combo.clone();
+                    c.push(ri);
+                    next.push(c);
+                }
+            }
+            combos = next;
+        }
+        let build = |combo: &[usize]| -> Vec<OwnedCtx> {
+            streams
+                .iter()
+                .zip(combo)
+                .map(|((ctx, relation, columns, rows), &ri)| OwnedCtx {
+                    ctx: *ctx,
+                    relation: relation.clone(),
+                    columns: columns.clone(),
+                    row: rows[ri].clone(),
                 })
-                .collect();
-            // sort by the named keys, resolving each against its context
-            if !rse.sort.is_empty() {
-                let descs: Vec<bool> = rse.sort.iter().map(|(_, _, d)| *d).collect();
-                let key_of = |combo: &[usize]| -> Vec<Value> {
-                    let all = build(combo);
-                    rse.sort
+                .collect()
+        };
+        // the enclosing contexts stay visible to the boolean and the
+        // keys - a for-loop nested inside another one filters on both.
+        // Written as a function rather than a closure because the two
+        // borrows have DIFFERENT lifetimes (the outer contexts live in
+        // `self`, the inner ones in a local) and must unify to the
+        // shorter one; `Ctx` is covariant, so they do.
+        fn with_outer<'a>(outer: &[Ctx<'a>], o: &'a [OwnedCtx]) -> Vec<Ctx<'a>> {
+            let mut v = outer.to_vec();
+            v.extend(o.iter().map(|c| Ctx { ctx: c.ctx, columns: &c.columns, row: &c.row }));
+            v
+        }
+        let outer = self.view();
+        let mut matched: Vec<Vec<OwnedCtx>> = combos
+            .into_iter()
+            .map(|c| build(&c))
+            .filter(|o| {
+                rse.boolean
+                    .as_ref()
+                    .map_or(true, |b| eval_blr_bool(b, &with_outer(&outer, o), &self.input, db))
+            })
+            .collect();
+        if !rse.sort.is_empty() {
+            let descs: Vec<bool> = rse.sort.iter().map(|(_, _, d)| *d).collect();
+            let mut keyed: Vec<(Vec<Value>, Vec<OwnedCtx>)> = matched
+                .into_iter()
+                .map(|o| {
+                    let key = rse
+                        .sort
                         .iter()
                         .map(|(ctx, name, _)| {
-                            eval_blr_val(&BVal::Field(*ctx, name.clone()), &all, input, db)
+                            eval_blr_val(
+                                &BVal::Field(*ctx, name.clone()),
+                                &with_outer(&outer, &o),
+                                &self.input,
+                                db,
+                            )
                         })
-                        .collect()
-                };
-                let mut keyed: Vec<(Vec<Value>, Vec<usize>)> =
-                    matched.into_iter().map(|c| (key_of(&c), c)).collect();
-                keyed.sort_by(|(ka, _), (kb, _)| cmp_value_keys(ka, kb, &descs));
-                matched = keyed.into_iter().map(|(_, c)| c).collect();
-            }
-            // DISTINCT (blr_project): keep the first combo of each distinct
-            // tuple of projected values - already sorted, so first == the
-            // engine's chosen representative
-            if !rse.project.is_empty() {
-                let mut seen = std::collections::HashSet::new();
-                matched.retain(|combo| {
-                    let all = build(combo);
-                    let key: Vec<String> = rse
-                        .project
-                        .iter()
-                        .map(|v| eval_blr_val(v, &all, input, db).render())
                         .collect();
-                    seen.insert(key)
-                });
-            }
-            // blr_first: the row cap, applied LAST - after the
-            // boolean, the sort and the DISTINCT, which is the order
-            // the engine's rse applies them in
-            if let Some(f) = rse.first.as_ref() {
-                let n = match eval_blr_val(f, ctxs, input, db) {
-                    Value::Int(n) => n.max(0) as usize,
-                    other => other.render().parse::<usize>().unwrap_or(0),
-                };
-                matched.truncate(n);
-            }
-            for combo in matched {
-                let all = build(&combo);
-                exec_blr_stmt(body, req, input, &all, db, out);
-            }
+                    (key, o)
+                })
+                .collect();
+            keyed.sort_by(|(ka, _), (kb, _)| cmp_value_keys(ka, kb, &descs));
+            matched = keyed.into_iter().map(|(_, o)| o).collect();
         }
-        BStmt::Send(msg, assigns) => {
-            let fields = req.msgs.get(*msg as usize).cloned().unwrap_or_default();
-            // gather assigned values by their parameter index
-            let mut vals: Vec<Value> = vec![Value::Null; fields.len()];
-            for (from, (_m, idx, nidx)) in assigns {
-                let v = eval_blr_val(from, ctxs, input, db);
-                // a blr_parameter2 carries a separate short null indicator:
-                // -1 when the value is NULL, 0 otherwise
-                if let Some(ni) = nidx {
-                    if let Some(slot) = vals.get_mut(*ni as usize) {
-                        *slot = Value::Int(if matches!(v, Value::Null) { -1 } else { 0 });
-                    }
-                }
-                if let Some(slot) = vals.get_mut(*idx as usize) {
-                    *slot = v;
-                }
-            }
-            out.push((*msg as i32, encode_request_message(&fields, &vals)));
+        if !rse.project.is_empty() {
+            let mut seen = std::collections::HashSet::new();
+            matched.retain(|o| {
+                let key: Vec<String> = rse
+                    .project
+                    .iter()
+                    .map(|v| eval_blr_val(v, &with_outer(&outer, o), &self.input, db).render())
+                    .collect();
+                seen.insert(key)
+            });
         }
+        if let Some(f) = rse.first.as_ref() {
+            let n = match eval_blr_val(f, &outer, &self.input, db) {
+                Value::Int(n) => n.max(0) as usize,
+                other => other.render().parse::<usize>().unwrap_or(0),
+            };
+            matched.truncate(n);
+        }
+        Ok(matched)
     }
 }
 
@@ -104016,6 +104327,20 @@ mod tests {
         assert_eq!(out, want);
     }
 
+    const GBAK_MODIFY_REQUEST: [u8; 170] = [
+        4, 2, 4, 2, 1, 0, 7, 0, 4, 1, 1, 0, 40, 253, 0, 4,
+        0, 2, 0, 7, 0, 40, 253, 0, 2, 7, 67, 1, 74, 12, 82, 68,
+        66, 36, 68, 65, 84, 65, 66, 65, 83, 69, 0, 255, 2, 14, 0, 2,
+        1, 21, 8, 0, 1, 0, 0, 0, 25, 0, 0, 0, 1, 23, 0, 29,
+        82, 68, 66, 36, 67, 72, 65, 82, 65, 67, 84, 69, 82, 95, 83, 69,
+        84, 95, 83, 67, 72, 69, 77, 65, 95, 78, 65, 77, 69, 25, 0, 1,
+        0, 255, 17, 0, 9, 13, 12, 2, 18, 0, 12, 1, 11, 10, 0, 1,
+        2, 1, 25, 1, 0, 0, 23, 1, 29, 82, 68, 66, 36, 67, 72, 65,
+        82, 65, 67, 84, 69, 82, 95, 83, 69, 84, 95, 83, 67, 72, 69, 77,
+        65, 95, 78, 65, 77, 69, 255, 255, 255, 14, 0, 1, 21, 8, 0, 0,
+        0, 0, 0, 25, 0, 0, 0, 255, 255, 76,
+    ];
+
     /// THE REQUEST THAT STOPS A CLIENT-DRIVEN RESTORE, captured off the
     /// wire on 2026-09-04 with FC_SRV_TRACE while `gbak -c` ran against
     /// this server. GPRE compiled it from restore.epp's
@@ -104032,19 +104357,6 @@ mod tests {
     /// last statement of its body (gpre/cmp.cpp:989-999).
     #[test]
     fn parses_the_gbak_restore_modify_request() {
-        const GBAK_MODIFY_REQUEST: [u8; 170] = [
-            4, 2, 4, 2, 1, 0, 7, 0, 4, 1, 1, 0, 40, 253, 0, 4,
-            0, 2, 0, 7, 0, 40, 253, 0, 2, 7, 67, 1, 74, 12, 82, 68,
-            66, 36, 68, 65, 84, 65, 66, 65, 83, 69, 0, 255, 2, 14, 0, 2,
-            1, 21, 8, 0, 1, 0, 0, 0, 25, 0, 0, 0, 1, 23, 0, 29,
-            82, 68, 66, 36, 67, 72, 65, 82, 65, 67, 84, 69, 82, 95, 83, 69,
-            84, 95, 83, 67, 72, 69, 77, 65, 95, 78, 65, 77, 69, 25, 0, 1,
-            0, 255, 17, 0, 9, 13, 12, 2, 18, 0, 12, 1, 11, 10, 0, 1,
-            2, 1, 25, 1, 0, 0, 23, 1, 29, 82, 68, 66, 36, 67, 72, 65,
-            82, 65, 67, 84, 69, 82, 95, 83, 69, 84, 95, 83, 67, 72, 69, 77,
-            65, 95, 78, 65, 77, 69, 255, 255, 255, 14, 0, 1, 21, 8, 0, 0,
-            0, 0, 0, 25, 0, 0, 0, 255, 255, 76,
-        ];
         let req = parse_blr_program(&GBAK_MODIFY_REQUEST).expect("the grammar covers it");
         // message 0 carries the flag and the name the loop sends OUT;
         // message 1 the name the client sends BACK; message 2 the "done"
@@ -104084,6 +104396,62 @@ mod tests {
         // never success over a request it would silently no-op.
         assert!(!blr_stmt_runnable(&req.stmt));
         assert!(parse_blr_request(&GBAK_MODIFY_REQUEST).is_none());
+    }
+
+    /// THE CO-ROUTINE'S ONE DECISION: which branch of a `blr_select`
+    /// runs is chosen by the CLIENT, in the packet that un-parks the
+    /// request - not by the request, and not where it parked.
+    ///
+    /// The engine leaves `req_message` pointing at the select and
+    /// resolves it inside `EXE_send`, scanning the branches for the
+    /// message number the client sent and setting `req_next` to that
+    /// branch (exe.cpp:936-947). A number no branch offers falls through
+    /// to a BARE `isc_req_sync` (exe.cpp:955-957) - not a message, not a
+    /// length complaint, just "you and I disagree about what happens
+    /// next". Driven here over the real captured gbak request.
+    #[test]
+    fn a_select_dispatches_on_the_message_the_client_sends() {
+        let req = Rc::new(parse_blr_program(&GBAK_MODIFY_REQUEST).expect("parses"));
+        // reach into the program for the select the for-body parks on
+        let BStmt::Begin(top) = &*req.stmt else { panic!() };
+        let BStmt::For(_, body) = &*top[0] else { panic!() };
+        let BStmt::Begin(fb) = &**body else { panic!() };
+        let BStmt::Label(_, lbody) = &*fb[1] else { panic!() };
+        let BStmt::Loop(select) = &**lbody else { panic!() };
+
+        let park = |m: &mut BlrMachine| {
+            m.next = Some(select.clone());
+            m.awaiting = match &**select {
+                BStmt::Select(b) => b.iter().map(|(n, _)| *n).collect(),
+                _ => panic!("a select"),
+            };
+        };
+
+        // message 1 selects the MODIFY branch...
+        let mut m = BlrMachine::start(req.clone());
+        park(&mut m);
+        assert_eq!(m.awaiting, vec![2, 1]);
+        m.deliver(1, vec![Value::Text("PUBLIC".into())]).expect("branch 1 exists");
+        assert!(matches!(m.next.as_deref(), Some(BStmt::Handler(_))), "the modify branch");
+        assert!(m.awaiting.is_empty(), "no longer parked");
+        assert_eq!(m.input, vec![Value::Text("PUBLIC".into())]);
+
+        // ...message 2 the QUIT branch, from the same parked state
+        let mut m = BlrMachine::start(req.clone());
+        park(&mut m);
+        m.deliver(2, vec![Value::Int(0)]).expect("branch 2 exists");
+        assert!(matches!(m.next.as_deref(), Some(BStmt::Leave(0))), "the quit branch");
+
+        // ...and a number no branch offers is refused, which is the
+        // engine's bare isc_req_sync
+        let mut m = BlrMachine::start(req.clone());
+        park(&mut m);
+        assert!(m.deliver(0, Vec::new()).is_err(), "message 0 is not on offer");
+
+        // sending into a request that is NOT parked is the same refusal
+        let mut m = BlrMachine::start(req);
+        assert!(m.awaiting.is_empty());
+        assert!(m.deliver(1, Vec::new()).is_err(), "not waiting for anything");
     }
 
     /// blr_first: the row cap gbak's restore puts on its "does this
