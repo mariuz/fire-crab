@@ -8327,6 +8327,251 @@ fn dispose_row_purge(file: &mut crate::Image, page_size: usize, rel: u16, page: 
     }
 }
 
+/// THE CONVERSION OF `dfw_create_relation`: give a relation that exists
+/// only as a CATALOG ROW the storage that makes it a table.
+///
+/// A client storing straight into `RDB$RELATIONS` - which is what gbak's
+/// restore does - writes a row and nothing else. The engine posts
+/// deferred work for it and runs that work AT COMMIT, and the timing is
+/// not incidental: the relation's column rows arrive AFTER its own, so
+/// the format cannot be computed when the row is stored. Only at commit
+/// is the catalog complete enough to describe the table it names.
+///
+/// So this reads the catalog as it then stands and produces exactly what
+/// [create_table] produces in one go for a parsed `CREATE TABLE`: a
+/// pointer page and an index root page with their headers, the format
+/// descriptor blob and its `RDB$FORMATS` row, and the two `RDB$PAGES`
+/// rows that say where the storage is.
+///
+/// Idempotent: a relation that already has an index root has already
+/// been through here (or was made by [create_table]), and is left alone.
+pub fn create_relation_storage(
+    file: &mut crate::Image,
+    page_size: usize,
+    name: &str,
+) -> Result<(), String> {
+    // READ THE CATALOG WIDE. This runs at commit but BEFORE the TIP
+    // flip - the engine's own ordering (tra.cpp:488 `DFW_perform_work`
+    // ahead of the flip at 547) - so the rows this work exists to read
+    // are still uncommitted. A visibility-filtered walk cannot see the
+    // relation it is about to give storage to, nor its columns, and the
+    // task would build a table out of nothing.
+    let _wide = crate::tra::ReaderViewGuard::wide();
+    // THE ID IS NOT IN THE ROW THE CLIENT STORED. gbak leaves
+    // `RDB$RELATION_ID` and `RDB$FORMAT` NULL and the ENGINE assigns
+    // both - which is the other half of why this cannot happen at store
+    // time, and why the work is named rather than numbered.
+    let rels = crate::catalog::list_relations(file, page_size);
+    // A NULL id READS AS ZERO. `relation_row` takes the id from a fixed
+    // offset without consulting the null bitmap, so the row this work
+    // exists to finish - whose id has not been assigned yet - comes back
+    // as relation 0. Relation 0 is RDB$PAGES, which HAS an index root,
+    // so treating that as "already has storage" made this task a no-op
+    // every single time, silently: the catalog rows landed, the storage
+    // never did, and the engine reading the file said the table was
+    // unknown. No user relation is 0.
+    let existing = rels.iter().find(|(id, n)| n == name && *id != 0).map(|(id, _)| *id);
+    let rel = match existing {
+        Some(id) => id,
+        None => {
+            let id = next_relation_id(file, page_size, &rels)?;
+            let want = name.to_string();
+            let name_fid = sys_fid(file, page_size, "RDB$RELATIONS", "RDB$RELATION_NAME")?;
+            patch_sys_row(
+                file,
+                page_size,
+                "RDB$RELATIONS",
+                6,
+                move |v| {
+                    matches!(v.get(name_fid), Some(Value::Text(t)) if t.trim_end() == want)
+                },
+                &[("RDB$RELATION_ID", SysVal::I(id as i64))],
+            )?;
+            id
+        }
+    };
+    if crate::btr::find_index_root(file, page_size, rel).is_some() {
+        return Ok(());
+    }
+    let fields = catalog_field_list(file, page_size, name)?;
+    if fields.is_empty() {
+        return Err(format!("relation {name} has no columns to lay out"));
+    }
+    let descs = compute_format_mixed(&fields);
+
+    // --- pages, exactly as DPM_create_relation lays them out ---------
+    let pointer_page = dml::allocate_page(file, page_size)?;
+    let root_page = dml::allocate_page(file, page_size)?;
+    {
+        let page = crate::page_mut(file, page_size, pointer_page).ok_or("pointer page range")?;
+        page.fill(0);
+        page[0] = 4; // pag_pointer
+        page[1] = 1; // pag_flags = ppg_eof
+        dml::put_u32(page, 12, pointer_page);
+        dml::put_u16(page, 26, rel);
+    }
+    {
+        let page = crate::page_mut(file, page_size, root_page).ok_or("root page range")?;
+        page.fill(0);
+        page[0] = 6; // pag_root
+        dml::put_u32(page, 12, root_page);
+        dml::put_u16(page, 16, rel);
+        dml::put_u16(page, 18, 0); // irt_count
+    }
+
+    // --- the format, and the row that names it -----------------------
+    let fmt_blob = write_format_blob(file, page_size, &descs)?;
+    sys_insert(
+        file,
+        page_size,
+        "RDB$FORMATS",
+        8,
+        &[
+            ("RDB$RELATION_ID", SysVal::I(rel as i64)),
+            // FORMAT 1, not 0 - what [create_table] writes for a new
+            // table and what the engine's own restore leaves behind
+            ("RDB$FORMAT", SysVal::I(1)),
+            ("RDB$DESCRIPTOR", SysVal::B(blob_id_bytes(8, fmt_blob))),
+        ],
+    )?;
+    for (page, ptype) in [(pointer_page, 4i64), (root_page, 6i64)] {
+        sys_insert(
+            file,
+            page_size,
+            "RDB$PAGES",
+            0,
+            &[
+                ("RDB$RELATION_ID", SysVal::I(rel as i64)),
+                ("RDB$PAGE_NUMBER", SysVal::I(page as i64)),
+                ("RDB$PAGE_SEQUENCE", SysVal::I(0)),
+                ("RDB$PAGE_TYPE", SysVal::I(ptype)),
+            ],
+        )?;
+    }
+    // THE RUNTIME SUMMARY. Without it the engine's metadata scan has no
+    // description of the relation to cache, and a table whose catalog
+    // rows are all present is still answered `-204 Table unknown` -
+    // which is exactly what it answered until this was written.
+    let runtime = rebuild_runtime_blob(file, page_size, name, &descs)?;
+
+    // ...and the relation names the format it now has, and how many
+    // fields it turned out to have. The client leaves these for the
+    // server, the way it leaves the id.
+    let want = name.to_string();
+    let name_fid = sys_fid(file, page_size, "RDB$RELATIONS", "RDB$RELATION_NAME")?;
+    patch_sys_row(
+        file,
+        page_size,
+        "RDB$RELATIONS",
+        6,
+        move |v| matches!(v.get(name_fid), Some(Value::Text(t)) if t.trim_end() == want),
+        &[
+            ("RDB$FORMAT", SysVal::I(1)),
+            ("RDB$FIELD_ID", SysVal::I(descs.len() as i64)),
+            ("RDB$DBKEY_LENGTH", SysVal::I(8)),
+            ("RDB$RUNTIME", SysVal::B(blob_id_bytes(6, runtime))),
+        ],
+    )?;
+    Ok(())
+}
+
+/// A relation's columns AS THE CATALOG HOLDS THEM, in field-id order and
+/// in the shape [compute_format_mixed] takes.
+///
+/// [create_table] builds this from a parsed `CREATE TABLE`; a relation
+/// that arrived as catalog rows has no such parse to read, so the same
+/// facts are joined back out of `RDB$RELATION_FIELDS` and the
+/// `RDB$FIELDS` rows its `RDB$FIELD_SOURCE` names.
+fn catalog_field_list(
+    file: &crate::Image,
+    page_size: usize,
+    table: &str,
+) -> Result<Vec<(u8, u16, i8, i16, bool)>, String> {
+    let text = |v: Option<&Value>| match v {
+        Some(Value::Text(t)) => Some(t.trim_end().to_string()),
+        _ => None,
+    };
+    let rf_formats = system_relation_formats(file, page_size, "RDB$RELATION_FIELDS")
+        .ok_or("no RDB$RELATION_FIELDS format")?;
+    let (_, rf_descs) = rf_formats.iter().max_by_key(|(n, _)| *n).ok_or("empty rf format")?;
+    let rf_cols = relation_columns(file, page_size, "RDB$RELATION_FIELDS");
+    let rf_fid = |n: &str| rf_cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (Some(rf_rel), Some(rf_src), Some(rf_id)) =
+        (rf_fid("RDB$RELATION_NAME"), rf_fid("RDB$FIELD_SOURCE"), rf_fid("RDB$FIELD_ID"))
+    else {
+        return Err("RDB$RELATION_FIELDS is missing a column this needs".into());
+    };
+    let mut members: Vec<(usize, String)> = Vec::new();
+    walk_rows(file, page_size, 5, rf_descs, |vals| {
+        if text(vals.get(rf_rel)).as_deref() != Some(table) {
+            return;
+        }
+        let (Some(Value::Int(id)), Some(src)) = (vals.get(rf_id), text(vals.get(rf_src))) else {
+            return;
+        };
+        members.push((*id as usize, src));
+    });
+    if members.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let f_formats =
+        system_relation_formats(file, page_size, "RDB$FIELDS").ok_or("no RDB$FIELDS format")?;
+    let (_, f_descs) = f_formats.iter().max_by_key(|(n, _)| *n).ok_or("empty fields format")?;
+    let fcols = relation_columns(file, page_size, "RDB$FIELDS");
+    let ffid = |n: &str| fcols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (Some(fn_f), Some(ft_f), Some(fl_f)) =
+        (ffid("RDB$FIELD_NAME"), ffid("RDB$FIELD_TYPE"), ffid("RDB$FIELD_LENGTH"))
+    else {
+        return Err("RDB$FIELDS is missing a column this needs".into());
+    };
+    let fs_f = ffid("RDB$FIELD_SCALE");
+    let fsub_f = ffid("RDB$FIELD_SUB_TYPE");
+    let fcomp_f = ffid("RDB$COMPUTED_BLR");
+    let mut sources: Vec<(String, (u8, u16, i8, i16, bool))> = Vec::new();
+    walk_rows(file, page_size, 2, f_descs, |vals| {
+        let Some(fname) = text(vals.get(fn_f)) else { return };
+        if !members.iter().any(|(_, s)| *s == fname) {
+            return;
+        }
+        let int_at = |i: Option<usize>| -> i64 {
+            match i.and_then(|i| vals.get(i)) {
+                Some(Value::Int(n)) => *n,
+                _ => 0,
+            }
+        };
+        let dt = match vals.get(ft_f) {
+            Some(Value::Int(n)) => *n as u8,
+            _ => return,
+        };
+        let len = match vals.get(fl_f) {
+            Some(Value::Int(n)) => *n as u16,
+            _ => return,
+        };
+        let computed =
+            matches!(fcomp_f.and_then(|i| vals.get(i)), Some(Value::Blob(..)));
+        sources.push((
+            fname,
+            (dt, len, int_at(fs_f) as i8, int_at(fsub_f) as i16, computed),
+        ));
+    });
+
+    let width = members.iter().map(|(id, _)| id + 1).max().unwrap_or(0);
+    // a gap in the field ids keeps its slot, the way [laid_out_descs]
+    // does: the walk is by OFFSET, so a missing descriptor would shift
+    // every column after it
+    let mut out = vec![(crate::format::dtype::SHORT, 2u16, 0i8, 0i16, false); width];
+    for (id, src) in &members {
+        let f = sources
+            .iter()
+            .find(|(n, _)| n == src)
+            .map(|(_, f)| *f)
+            .ok_or_else(|| format!("no RDB$FIELDS row for {src}"))?;
+        out[*id] = f;
+    }
+    Ok(out)
+}
+
 /// DELETE ONE ROW OF A SYSTEM RELATION, from outside this crate.
 ///
 /// `Ok(false)` when no row matched, which is not an error: the caller

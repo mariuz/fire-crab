@@ -4185,7 +4185,12 @@ impl Database {
                     )
                 });
             }
-            fire_crab_ods::dml::apply_ddl_deferred(&mut work, self.page_size, &deferred)?;
+            if let Err(e) = fire_crab_ods::dml::apply_ddl_deferred(&mut work, self.page_size, &deferred) {
+                if trace_on() {
+                    eprintln!("[srv] commit: deferred work failed: {e}");
+                }
+                return Err(e);
+            }
             self.invalidate_meta();
         }
         // A TRANSACTION ID IS NOT WHAT MAKES A COMMIT. One that only did
@@ -90195,6 +90200,17 @@ fn write_stored_row(
             v => vals.push((rc.name.clone(), v)),
         }
     }
+    // THE OWNER IS THE SERVER'S TO FILL IN, not the client's. The engine
+    // calls `set_owner_name` on the record inside VIO_store for every
+    // relation that has such a column (vio.cpp's rel_relations arm and
+    // its neighbours), so a stored row that leaves it NULL comes back
+    // owned by nobody - and the metadata that describes the object is
+    // incomplete in a way its own catalog row does not show.
+    if columns.iter().any(|c| c.name == "RDB$OWNER_NAME")
+        && !vals.iter().any(|(n, _)| n == "RDB$OWNER_NAME")
+    {
+        vals.push(("RDB$OWNER_NAME".to_string(), Value::Text("SYSDBA".into())));
+    }
     let named: Vec<(&str, fire_crab_ods::ddl::SysValue<'_>)> = vals
         .iter()
         .map(|(n, v)| {
@@ -90214,9 +90230,51 @@ fn write_stored_row(
     work.ddl_tx = Some(u64::from(tx));
     let r =
         fire_crab_ods::ddl::insert_system_row(&mut work, db.page_size, relation, rel, &named);
+    // ...and if that row NAMES a relation, the relation's storage is
+    // owed at commit. The id comes from the row itself: gbak carries the
+    // original one out of the backup rather than letting the server
+    // assign a new one.
+    // ...and if that row NAMES a relation, the relation's storage is
+    // owed at commit. By NAME: the client leaves `RDB$RELATION_ID` and
+    // `RDB$FORMAT` NULL for the server to assign, so at store time the
+    // relation has no number to be known by.
+    if r.is_ok() && RELATION_STORAGE_TRIGGERS.contains(&relation) {
+        if let Some(Value::Text(new_name)) = vals
+            .iter()
+            .find(|(n, _)| n == "RDB$RELATION_NAME")
+            .map(|(_, v)| v.clone())
+        {
+            work.ddl_deferred.push(fire_crab_ods::DdlDeferred::CreateRelationStorage {
+                name: new_name.trim_end().to_string(),
+            });
+        }
+    }
     work.ddl_tx = None;
     r?;
+    // THE PUBLISHED IMAGE CARRIES NEITHER OF THESE. A work copy clones
+    // the Image whole, so anything left on `work` is dropped at
+    // `install_dirty`; the deferred list has to be moved onto the
+    // attachment (or the open undo window) to survive to the commit that
+    // runs it. Leaving it behind is silent: the catalog rows land, the
+    // storage never does, and the engine reading the file afterwards
+    // says the table is unknown.
+    let residue = std::mem::take(&mut work.ddl_residue);
+    let deferred = std::mem::take(&mut work.ddl_deferred);
     db.install_dirty(work);
+    match db.windows.last_mut() {
+        Some(w) => {
+            w.residue.extend(residue);
+            w.deferred.extend(deferred);
+        }
+        None => {
+            // no undo window open: the attachment holds it to its commit.
+            // The residue is a window's own concern (it is what an undo
+            // has to clean up), so with no window there is nothing to
+            // carry it and nothing that would use it.
+            let _ = residue;
+            db.ddl_deferred.extend(deferred);
+        }
+    }
     db.adopt_tx(tx);
     db.refresh_reader_view();
     Ok(())
@@ -90236,12 +90294,27 @@ fn write_stored_row(
 /// is one this server already has everywhere rather than one this path
 /// introduces.
 ///
-/// `RDB$RELATIONS` does NOT qualify, and that is the line. Its store
-/// posts `dfw_create_relation`, and a row without it is a catalog entry
-/// for a table the file cannot hold - no pointer page, no format blob,
-/// no `RDB$PAGES` rows. Adding it here without that work would produce a
-/// database that looks restored and is not.
+/// `RDB$RELATIONS` IS NOT HERE, AND THE MACHINERY FOR IT IS WRITTEN.
+/// [fire_crab_ods::ddl::create_relation_storage] builds a relation's
+/// storage at commit, out of the catalog as it then stands - assigning
+/// the id and format the client leaves NULL, laying out the format from
+/// the column rows that arrived after the relation's own, allocating the
+/// pointer and index-root pages, and writing the `RDB$PAGES`,
+/// `RDB$FORMATS` and `RDB$RUNTIME` that name them. Driven through gbak
+/// it produces a catalog row-for-row identical to the engine's own
+/// restore of the same backup, `RDB$DBKEY_LENGTH` and the runtime
+/// blob's content excepted.
+///
+/// And the engine still answers `-204 Table unknown` for the result. So
+/// the relation is NOT usable, whatever its catalog looks like, and
+/// until that is understood a store into `RDB$RELATIONS` must keep
+/// refusing - a restore that leaves a table the engine cannot read is
+/// the "looks restored and is not" outcome this list exists to prevent.
 const STORABLE_SYSTEM_RELATIONS: &[&str] = &["RDB$SCHEMAS", "RDB$FIELDS"];
+
+/// Storing into one of these leaves a relation that is only half made
+/// until the transaction commits - see [STORABLE_SYSTEM_RELATIONS].
+const RELATION_STORAGE_TRIGGERS: &[&str] = &["RDB$RELATIONS"];
 
 /// WRITE BACK a `blr_modify`'s row.
 ///

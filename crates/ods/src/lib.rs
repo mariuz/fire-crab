@@ -156,6 +156,16 @@ pub enum DdlDeferred {
     /// (vio.cpp:6977) removes chain and blob references together; so
     /// does this, at the same no-other-actives moment the frees run
     PurgeRowChain { rel: u16, page: u32, slot: u16 },
+    /// GIVE A RELATION ITS STORAGE - the conversion of the engine's
+    /// `dfw_create_relation`. A client that stores straight into
+    /// `RDB$RELATIONS` writes a row and nothing else, and its COLUMN
+    /// rows arrive after, so the format cannot be laid out at store
+    /// time. Only at commit does the catalog describe the table it
+    /// names. See [crate::ddl::create_relation_storage].
+    /// Named rather than numbered because the id is not known yet: a
+    /// client storing into `RDB$RELATIONS` leaves `RDB$RELATION_ID`
+    /// NULL for the engine to assign, exactly as it leaves `RDB$FORMAT`.
+    CreateRelationStorage { name: String },
 }
 
 impl Image {

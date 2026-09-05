@@ -1030,9 +1030,12 @@ pub fn apply_ddl_deferred(
     deferred: &[crate::DdlDeferred],
 ) -> Result<(), String> {
     for d in deferred {
-        match *d {
+        match d.clone() {
             crate::DdlDeferred::DropRelation { rel } => {
                 crate::ddl::release_relation_storage(file, page_size, rel)?;
+            }
+            crate::DdlDeferred::CreateRelationStorage { name } => {
+                crate::ddl::create_relation_storage(file, page_size, &name)?;
             }
             crate::DdlDeferred::DropIndexSlot { irt_page, slot } => {
                 let page = crate::page_mut(file, page_size, irt_page).ok_or("irt page out of range")?;
