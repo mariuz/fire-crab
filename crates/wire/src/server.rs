@@ -90342,7 +90342,8 @@ fn write_stored_row(
 /// So a store into `RDB$RELATIONS` keeps refusing, and now for a sharper
 /// reason than before: it does not merely leave a table the engine
 /// cannot read, it leaves one the engine cannot survive reading.
-const STORABLE_SYSTEM_RELATIONS: &[&str] = &["RDB$SCHEMAS", "RDB$FIELDS"];
+const STORABLE_SYSTEM_RELATIONS: &[&str] =
+    &["RDB$SCHEMAS", "RDB$FIELDS", "RDB$RELATIONS", "RDB$RELATION_FIELDS"];
 
 /// Storing into one of these leaves a relation that is only half made
 /// until the transaction commits - see [STORABLE_SYSTEM_RELATIONS].
@@ -91113,9 +91114,17 @@ fn eval_blr_val(v: &BVal, ctxs: &[Ctx], input: &[Value], db: &Database) -> Value
         BVal::LitStr(s) => Value::Text(s.clone()),
         BVal::Null => Value::Null,
         BVal::Param(_m, idx, nidx) => {
-            // the indicator first: -1 means the value slot is not a value
+            // THE INDICATOR FIRST, AND ANY NON-ZERO VALUE MEANS NULL.
+            // The engine's own test is `if (MOV_get_long(tdbb, desc, 0))`
+            // (ExprNodes.cpp, ParameterNode::execute) - a truth test, not
+            // a comparison against -1. GPRE writes the flag from
+            // `X.FIELD.NULL = TRUE`, which is 1; this server writes -1
+            // on the way OUT, as an SQL indicator does. Testing only for
+            // -1 accepted every one of gbak's nulls as a value, and the
+            // value slot of a null parameter holds whatever was in the
+            // client's buffer.
             if let Some(n) = nidx {
-                if matches!(input.get(*n as usize), Some(Value::Int(-1))) {
+                if !matches!(input.get(*n as usize), None | Some(Value::Int(0))) {
                     return Value::Null;
                 }
             }
