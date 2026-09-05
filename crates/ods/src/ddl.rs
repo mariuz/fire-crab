@@ -8559,8 +8559,20 @@ fn catalog_field_list(
                 _ => 0,
             }
         };
+        // `RDB$FIELD_TYPE` IS THE BLR CODE, NOT THE dsc DTYPE. They are
+        // different numbering schemes that overlap: blr 8 is a LONG and
+        // dsc 8 is a SHORT, blr 37 is a VARYING and dsc 37 is nothing at
+        // all. Passing the catalog's value straight into
+        // [compute_format_mixed] laid the record out as SHORT + garbage,
+        // and - because the VARYING arm never fired - without the two
+        // bytes a varying's length prefix needs. The engine READ that
+        // table (the catalog columns all agree) and could not WRITE to
+        // it: `internal error` on any insert.
         let dt = match vals.get(ft_f) {
-            Some(Value::Int(n)) => *n as u8,
+            Some(Value::Int(n)) => match field_type_to_dtype(*n as i16) {
+                Some(d) => d,
+                None => return,
+            },
             _ => return,
         };
         let len = match vals.get(fl_f) {

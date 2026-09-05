@@ -90363,14 +90363,10 @@ fn write_stored_row(
 /// restore of the same backup, `RDB$DBKEY_LENGTH` and the runtime
 /// blob's content excepted.
 ///
-/// KNOWN GAP, and it is the next thing to close: the table these produce
-/// is READ-ONLY to the engine. `SHOW TABLE` and `SELECT` answer, `gfix
-/// -v -full` is clean and every catalog column matches a table
-/// fire-crab creates itself - but an INSERT from the engine fails with
-/// `internal error`. Measured with the index slice DISABLED as well, so
-/// it belongs to the relation, not to the index. Reading was tested and
-/// writing was not, which is why it was not caught when the relation
-/// slice landed.
+/// The table these produce is READ AND WRITTEN by the engine: it inserts,
+/// commits, reads back by key, and the restored PRIMARY KEY refuses a
+/// duplicate with the engine's own vector naming the index. `gfix -v
+/// -full` is clean.
 const STORABLE_SYSTEM_RELATIONS: &[&str] = &[
     "RDB$SCHEMAS",
     "RDB$FIELDS",
