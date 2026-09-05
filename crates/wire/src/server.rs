@@ -30302,7 +30302,18 @@ struct CreateDpb {
     /// PUBLIC schema, I am about to store it myself". The engine skips
     /// it at `ini.epp:819`, and skips the DDL grants and security
     /// classes scoped to it at `ini.epp:577`.
+    ///
+    /// ONLY MEANINGFUL ALONGSIDE `isc_dpb_gbak_attach`. The engine acts
+    /// on it exclusively inside `if (options.dpb_gbak_attach)`
+    /// (jrd.cpp:2977-2982), and that flag is set only by tag 59 carrying
+    /// a NON-EMPTY string (jrd.cpp:7224-7229). So 107 on its own does
+    /// nothing in real Firebird, and a server that acted on it alone
+    /// would let any client ask for a database missing its PUBLIC
+    /// schema.
     restore_has_schema: bool,
+    /// `isc_dpb_gbak_attach` (59) with a non-empty value - the client
+    /// says it is gbak
+    gbak_attach: bool,
 }
 
 fn parse_create_dpb(dpb: &[u8]) -> CreateDpb {
@@ -30323,11 +30334,15 @@ fn parse_create_dpb(dpb: &[u8]) -> CreateDpb {
         }
         match tag {
             4 => want.page_size = Some(v as u32),
+            59 => want.gbak_attach = len > 0,
             107 => want.restore_has_schema = true,
             _ => {}
         }
         i = end;
     }
+    // the engine reads 107 only through the gbak gate, so this server
+    // does too
+    want.restore_has_schema &= want.gbak_attach;
     want
 }
 
@@ -105076,6 +105091,35 @@ mod tests {
         // question only the executor can answer, since the name is a
         // string in the program rather than a property of the verb
         assert!(blr_stmt_runnable(&BStmt::Store("T".into(), 0, Rc::new(BStmt::Nop))));
+    }
+
+    /// `isc_dpb_gbak_restore_has_schema` (107) IS GATED BY
+    /// `isc_dpb_gbak_attach` (59), and the gate is not a formality: the
+    /// flag makes a freshly created database come back WITHOUT its
+    /// PUBLIC schema. The engine reads 107 only inside
+    /// `if (options.dpb_gbak_attach)` (jrd.cpp:2977-2982), and that is
+    /// set only by tag 59 carrying a NON-EMPTY string (jrd.cpp:7224).
+    #[test]
+    fn restore_has_schema_needs_the_gbak_tag() {
+        // dpb version 1, then [tag][len][value]*
+        let with_both: &[u8] = &[1, 59, 3, b'F', b'B', b'6', 107, 0, 4, 2, 0, 32];
+        let d = parse_create_dpb(with_both);
+        assert!(d.restore_has_schema, "gbak asking for it gets it");
+        assert_eq!(d.page_size, Some(8192), "and the page size is read beside it");
+
+        // 107 alone does nothing in the engine, so it does nothing here
+        let alone: &[u8] = &[1, 107, 0];
+        assert!(!parse_create_dpb(alone).restore_has_schema);
+
+        // ...nor does an EMPTY tag 59, which is what makes
+        // `dpb_gbak_attach` false rather than true
+        let empty_gbak: &[u8] = &[1, 59, 0, 107, 0];
+        assert!(!parse_create_dpb(empty_gbak).restore_has_schema);
+
+        // and a database created with no DPB at all keeps its defaults
+        let none = parse_create_dpb(&[1]);
+        assert!(!none.restore_has_schema);
+        assert_eq!(none.page_size, None);
     }
 
     /// `blr_gen_id3` (231): a generator named with its SCHEMA, and an
