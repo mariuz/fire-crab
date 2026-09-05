@@ -166,6 +166,12 @@ pub enum DdlDeferred {
     /// client storing into `RDB$RELATIONS` leaves `RDB$RELATION_ID`
     /// NULL for the engine to assign, exactly as it leaves `RDB$FORMAT`.
     CreateRelationStorage { name: String },
+    /// BUILD AN INDEX that arrived as catalog rows - the sibling of
+    /// [DdlDeferred::CreateRelationStorage], deferred for the same
+    /// reason: the index's SEGMENT rows arrive after its own, and the
+    /// b-tree cannot be built until they have.
+    /// See [crate::ddl::create_index_storage].
+    CreateIndexStorage { name: String },
 }
 
 impl Image {

@@ -90285,6 +90285,17 @@ fn write_stored_row(
     // owed at commit. By NAME: the client leaves `RDB$RELATION_ID` and
     // `RDB$FORMAT` NULL for the server to assign, so at store time the
     // relation has no number to be known by.
+    if r.is_ok() && INDEX_STORAGE_TRIGGERS.contains(&relation) {
+        if let Some(Value::Text(idx)) = vals
+            .iter()
+            .find(|(n, _)| n == "RDB$INDEX_NAME")
+            .map(|(_, v)| v.clone())
+        {
+            work.ddl_deferred.push(fire_crab_ods::DdlDeferred::CreateIndexStorage {
+                name: idx.trim_end().to_string(),
+            });
+        }
+    }
     if r.is_ok() && RELATION_STORAGE_TRIGGERS.contains(&relation) {
         if let Some(Value::Text(new_name)) = vals
             .iter()
@@ -90352,23 +90363,32 @@ fn write_stored_row(
 /// restore of the same backup, `RDB$DBKEY_LENGTH` and the runtime
 /// blob's content excepted.
 ///
-/// The relation is FOUND now - stamping its id before the row is written
-/// fixed the lookup - and what it runs into next is worse than -204: the
-/// engine CRASHES reading the metadata. `RDB$BASE_FIELD` holds binary
-/// garbage, `RDB$QUERY_NAME` a run of spaces, `RDB$EDIT_STRING` two
-/// stray characters. [read_request_message] is MISALIGNED over a message
-/// this wide, so values land in the wrong slots, and the catalog it
-/// writes is malformed in ways a column-by-column read does not show.
-///
-/// So a store into `RDB$RELATIONS` keeps refusing, and now for a sharper
-/// reason than before: it does not merely leave a table the engine
-/// cannot read, it leaves one the engine cannot survive reading.
-const STORABLE_SYSTEM_RELATIONS: &[&str] =
-    &["RDB$SCHEMAS", "RDB$FIELDS", "RDB$RELATIONS", "RDB$RELATION_FIELDS"];
+/// KNOWN GAP, and it is the next thing to close: the table these produce
+/// is READ-ONLY to the engine. `SHOW TABLE` and `SELECT` answer, `gfix
+/// -v -full` is clean and every catalog column matches a table
+/// fire-crab creates itself - but an INSERT from the engine fails with
+/// `internal error`. Measured with the index slice DISABLED as well, so
+/// it belongs to the relation, not to the index. Reading was tested and
+/// writing was not, which is why it was not caught when the relation
+/// slice landed.
+const STORABLE_SYSTEM_RELATIONS: &[&str] = &[
+    "RDB$SCHEMAS",
+    "RDB$FIELDS",
+    "RDB$RELATIONS",
+    "RDB$RELATION_FIELDS",
+    "RDB$INDICES",
+    "RDB$INDEX_SEGMENTS",
+    "RDB$RELATION_CONSTRAINTS",
+];
 
 /// Storing into one of these leaves a relation that is only half made
 /// until the transaction commits - see [STORABLE_SYSTEM_RELATIONS].
 const RELATION_STORAGE_TRIGGERS: &[&str] = &["RDB$RELATIONS"];
+
+/// ...and storing into one of these leaves an INDEX half made. Its
+/// segment rows arrive after its own, so the b-tree is built at commit
+/// out of the catalog, the way a relation's storage is.
+const INDEX_STORAGE_TRIGGERS: &[&str] = &["RDB$INDICES"];
 
 /// WRITE BACK a `blr_modify`'s row.
 ///

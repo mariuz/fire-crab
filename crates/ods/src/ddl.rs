@@ -8591,6 +8591,183 @@ fn catalog_field_list(
     Ok(out)
 }
 
+/// BUILD AN INDEX THAT ARRIVED AS CATALOG ROWS.
+///
+/// The sibling of [create_relation_storage], and the same shape: a
+/// client storing straight into `RDB$INDICES` writes a row, its SEGMENT
+/// rows arrive after it, and the b-tree cannot be built until they have.
+/// So the work is deferred to commit and reads the catalog as it then
+/// stands.
+///
+/// It does what [create_index]'s structural half does - allocate the
+/// index-root slot, stamp the `RDB$INDEX_ID` that names it, key every
+/// existing row into the tree, and write the selectivity - but takes its
+/// segments and its flags from the catalog instead of from a parsed
+/// `CREATE INDEX`.
+///
+/// Idempotent: an index whose `RDB$INDEX_ID` is already set has been
+/// through here (or was made by [create_index]).
+pub fn create_index_storage(
+    file: &mut crate::Image,
+    page_size: usize,
+    index_name: &str,
+) -> Result<(), String> {
+    // the catalog is read WIDE: this runs at commit but before the TIP
+    // flip, so the rows it exists to read are still uncommitted
+    let _wide = crate::tra::ReaderViewGuard::wide();
+
+    let text = |v: Option<&Value>| match v {
+        Some(Value::Text(t)) => Some(t.trim_end().to_string()),
+        _ => None,
+    };
+    let int = |v: Option<&Value>| match v {
+        Some(Value::Int(n)) => Some(*n),
+        _ => None,
+    };
+
+    // --- the index's own row ------------------------------------------
+    let i_formats =
+        system_relation_formats(file, page_size, "RDB$INDICES").ok_or("no RDB$INDICES format")?;
+    let (_, i_descs) = i_formats.iter().max_by_key(|(n, _)| *n).ok_or("empty format")?;
+    let icols = relation_columns(file, page_size, "RDB$INDICES");
+    let ifid = |n: &str| icols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (Some(i_name), Some(i_rel)) = (ifid("RDB$INDEX_NAME"), ifid("RDB$RELATION_NAME")) else {
+        return Err("RDB$INDICES is missing a column this needs".into());
+    };
+    let (i_id, i_uniq, i_type) =
+        (ifid("RDB$INDEX_ID"), ifid("RDB$UNIQUE_FLAG"), ifid("RDB$INDEX_TYPE"));
+    // BY NAME, NEVER BY A GUESSED ID. This module deliberately does not
+    // hardcode the ids of the catalog relations outside the handful it
+    // owns - `sys_row_by_name` exists for exactly that - and a walk over
+    // the wrong relation finds nothing and reports the row missing.
+    let i_rel_id = crate::resolve_relation(file, page_size, "RDB$INDICES")
+        .ok_or("no RDB$INDICES relation")?;
+    let mut found: Option<(String, bool, bool, bool)> = None;
+    walk_rows(file, page_size, i_rel_id, i_descs, |vals| {
+        if text(vals.get(i_name)).as_deref() != Some(index_name) {
+            return;
+        }
+        let already = i_id.and_then(|f| int(vals.get(f))).is_some();
+        found = Some((
+            text(vals.get(i_rel)).unwrap_or_default(),
+            i_uniq.and_then(|f| int(vals.get(f))).unwrap_or(0) != 0,
+            i_type.and_then(|f| int(vals.get(f))).unwrap_or(0) != 0,
+            already,
+        ));
+    });
+    let Some((table, unique, descending, already)) = found else {
+        return Err(format!("no RDB$INDICES row for {index_name}"));
+    };
+    if already {
+        return Ok(());
+    }
+    let rel = crate::resolve_relation(file, page_size, &table)
+        .ok_or_else(|| format!("index {index_name} names unknown relation {table}"))?;
+
+    // --- its segments, in key order -----------------------------------
+    let s_formats = system_relation_formats(file, page_size, "RDB$INDEX_SEGMENTS")
+        .ok_or("no RDB$INDEX_SEGMENTS format")?;
+    let (_, s_descs) = s_formats.iter().max_by_key(|(n, _)| *n).ok_or("empty format")?;
+    let scols = relation_columns(file, page_size, "RDB$INDEX_SEGMENTS");
+    let sfid = |n: &str| scols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (Some(s_idx), Some(s_fld), Some(s_pos)) =
+        (sfid("RDB$INDEX_NAME"), sfid("RDB$FIELD_NAME"), sfid("RDB$FIELD_POSITION"))
+    else {
+        return Err("RDB$INDEX_SEGMENTS is missing a column this needs".into());
+    };
+    let s_rel_id = crate::resolve_relation(file, page_size, "RDB$INDEX_SEGMENTS")
+        .ok_or("no RDB$INDEX_SEGMENTS relation")?;
+    let mut members: Vec<(i64, String)> = Vec::new();
+    walk_rows(file, page_size, s_rel_id, s_descs, |vals| {
+        if text(vals.get(s_idx)).as_deref() != Some(index_name) {
+            return;
+        }
+        if let Some(f) = text(vals.get(s_fld)) {
+            members.push((int(vals.get(s_pos)).unwrap_or(0), f));
+        }
+    });
+    if members.is_empty() {
+        return Err(format!("index {index_name} has no segments"));
+    }
+    members.sort_by_key(|(p, _)| *p);
+
+    // --- is it a PRIMARY KEY? the index row does not say; the
+    //     constraint row does, and this runs late enough to see it -----
+    let primary = constraint_kind_of(file, page_size, index_name)
+        .map(|k| k == "PRIMARY KEY")
+        .unwrap_or(false);
+
+    // --- the same segment resolution [create_index] does ---------------
+    let columns = relation_columns(file, page_size, &table);
+    let formats = crate::relation_formats(file, page_size, rel);
+    let (_, descs) = formats.iter().max_by_key(|(n, _)| *n).ok_or("relation has no format")?;
+    let mut segs: Vec<(u16, u16, i8)> = Vec::new();
+    for (_, n) in &members {
+        let rc = columns
+            .iter()
+            .find(|c| c.name == *n)
+            .ok_or_else(|| format!("index {index_name} names unknown column {n}"))?;
+        let d = descs.get(rc.field_id as usize).ok_or("field beyond format")?;
+        let itype = index_itype(d).ok_or("column type cannot be indexed by this writer")?;
+        segs.push((rc.field_id, itype, d.scale));
+    }
+
+    let mut iflags = 0u16;
+    if unique {
+        iflags |= btw::IRT_UNIQUE;
+    }
+    if descending {
+        iflags |= btw::IRT_DESCENDING;
+    }
+    if primary {
+        iflags |= btw::IRT_PRIMARY;
+    }
+    let slot = allocate_index_slot(file, page_size, rel, &segs, iflags)?;
+
+    // the id NAMES the slot, and it is patched rather than inserted
+    // because the row is already there - which is safe here and is not
+    // for a relation id: RDB$INDEX_ID is not a key of any system index
+    // (idx.h has RDB$INDICES keyed by name and by relation, not by id).
+    let want = index_name.to_string();
+    let name_fid = sys_fid(file, page_size, "RDB$INDICES", "RDB$INDEX_NAME")?;
+    patch_sys_row(
+        file,
+        page_size,
+        "RDB$INDICES",
+        i_rel_id,
+        move |v| matches!(v.get(name_fid), Some(Value::Text(t)) if t.trim_end() == want),
+        &[("RDB$INDEX_ID", SysVal::I(slot as i64 + 1))],
+    )?;
+
+    backfill_index(file, page_size, rel, slot, &segs, descs, unique, descending, primary)?;
+    let sel = index_selectivity(file, page_size, rel, &segs, descending)?;
+    write_index_statistics(file, page_size, rel, slot, index_name, &sel, true)
+}
+
+/// The constraint TYPE that names this index, if one does. A primary key
+/// is not visible on the `RDB$INDICES` row at all - the engine records it
+/// only in `RDB$RELATION_CONSTRAINTS` - so an index built without asking
+/// would lose its `irt_primary` flag.
+fn constraint_kind_of(file: &crate::Image, page_size: usize, index_name: &str) -> Option<String> {
+    let formats = system_relation_formats(file, page_size, "RDB$RELATION_CONSTRAINTS")?;
+    let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
+    let cols = relation_columns(file, page_size, "RDB$RELATION_CONSTRAINTS");
+    let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (idx_f, typ_f) = (fid("RDB$INDEX_NAME")?, fid("RDB$CONSTRAINT_TYPE")?);
+    let c_rel_id = crate::resolve_relation(file, page_size, "RDB$RELATION_CONSTRAINTS")?;
+    let mut out = None;
+    walk_rows(file, page_size, c_rel_id, descs, |vals| {
+        let names_it = matches!(vals.get(idx_f), Some(Value::Text(t)) if t.trim_end() == index_name);
+        if !names_it {
+            return;
+        }
+        if let Some(Value::Text(t)) = vals.get(typ_f) {
+            out = Some(t.trim_end().to_string());
+        }
+    });
+    out
+}
+
 /// DELETE ONE ROW OF A SYSTEM RELATION, from outside this crate.
 ///
 /// `Ok(false)` when no row matched, which is not an error: the caller
