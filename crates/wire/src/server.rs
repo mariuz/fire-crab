@@ -90075,15 +90075,36 @@ fn read_request_message(
                 read_int(s, dec)?; // 8 bytes
                 vals.push(Value::Null);
             }
-            BField::Cstring(_) | BField::Text(_) | BField::Varying(_) => {
-                // a text input parameter (the object name a SHOW filters
-                // on): length then that many bytes padded to four. The
-                // text value must survive - the segment/field sub-queries
-                // compare it against a catalog column.
+            BField::Cstring(_) | BField::Varying(_) => {
+                // A COUNTED field: a 4-byte count then that many bytes,
+                // padded to four (`xdr_datum`'s dtype_cstring and
+                // dtype_varying arms, xdr.cpp:186-217). The text value
+                // must survive - the segment/field sub-queries compare it
+                // against a catalog column.
                 let n = read_int(s, dec)?.max(0) as usize;
                 let bytes = read_n(s, dec, n.div_ceil(4) * 4)?;
                 let text: String = bytes[..n].iter().map(|&b| b as char).collect();
                 vals.push(Value::Text(text));
+            }
+            BField::Text(len) => {
+                // A FIXED-WIDTH field, and NOT a counted one: `blr_text`
+                // shares `xdr_datum`'s dtype_text arm, which is a bare
+                // `xdr_opaque(p, dsc_length)` - the descriptor's own
+                // length, padded to four, with NO count in front
+                // (xdr.cpp:178-181). This used to read a count off the
+                // first four bytes of the TEXT, and then that many bytes
+                // of whatever followed: one `blr_text` field in an input
+                // message and the rest of it was rubble.
+                //
+                // Nothing this server has been asked to run sends one -
+                // gbak's restore messages are cstring throughout - so it
+                // was never seen. The ENCODER has always had it right
+                // ([encode_request_message]), which is the asymmetry that
+                // named it.
+                let n = *len as usize;
+                let bytes = read_n(s, dec, n.div_ceil(4) * 4)?;
+                let text: String = bytes[..n].iter().map(|&b| b as char).collect();
+                vals.push(Value::Text(text.trim_end().to_string()));
             }
         }
     }
@@ -105242,6 +105263,84 @@ mod tests {
         let none = parse_create_dpb(&[1]);
         assert!(!none.restore_has_schema);
         assert_eq!(none.page_size, None);
+    }
+
+    /// THE DECODER AND THE ENCODER MUST AGREE ON EVERY FIELD'S WIDTH,
+    /// and for `blr_text` they did not.
+    ///
+    /// `xdr_datum` gives dtype_text a bare `xdr_opaque(p, dsc_length)` -
+    /// the descriptor's own length, padded to four, with NO count in
+    /// front (xdr.cpp:178-181) - while dtype_cstring and dtype_varying
+    /// are counted (xdr.cpp:186-217). fire-crab's encoder had that
+    /// right and its decoder read a count for all three, so one
+    /// `blr_text` in an input message turned the rest of it to rubble.
+    ///
+    /// No request this server runs sends one, which is exactly why the
+    /// check is worth having: what the wire never exercises, a test has
+    /// to. `encode_request_message` is the reference - every SHOW gate
+    /// runs through it - so this asserts the two are inverses.
+    #[test]
+    fn the_message_decoder_inverts_the_encoder() {
+        // one field of each shape, with a value that would misread if the
+        // width were wrong
+        let fields = vec![
+            BField::Short,
+            BField::Text(6),
+            BField::Cstring(253),
+            BField::Long,
+            BField::Varying(20),
+            BField::Bool,
+            BField::Int64,
+        ];
+        let vals = vec![
+            Value::Int(7),
+            Value::Text("ABCDEF".into()),
+            Value::Text("PUBLIC".into()),
+            Value::Int(-3),
+            Value::Text("hello".into()),
+            Value::Bool(true),
+            Value::Int(1),
+        ];
+        let wire = encode_request_message(&fields, &vals);
+
+        // walk it the way `read_request_message` does, without a socket
+        let mut at = 0usize;
+        let mut int_at = |at: &mut usize| {
+            let v = i32::from_be_bytes([wire[*at], wire[*at + 1], wire[*at + 2], wire[*at + 3]]);
+            *at += 4;
+            v
+        };
+        assert_eq!(int_at(&mut at), 7, "short: four bytes big-endian");
+
+        // TEXT: fixed width, padded to four, NO count
+        let n = 6usize;
+        let text: String = wire[at..at + n].iter().map(|&b| b as char).collect();
+        at += n.div_ceil(4) * 4;
+        assert_eq!(text, "ABCDEF");
+
+        // CSTRING: a count, then that many bytes padded to four
+        let n = int_at(&mut at) as usize;
+        assert_eq!(n, 6, "the count is the string's length, not the column's");
+        let cstr: String = wire[at..at + n].iter().map(|&b| b as char).collect();
+        at += n.div_ceil(4) * 4;
+        assert_eq!(cstr, "PUBLIC");
+
+        assert_eq!(int_at(&mut at), -3, "long");
+
+        let n = int_at(&mut at) as usize;
+        let vary: String = wire[at..at + n].iter().map(|&b| b as char).collect();
+        at += n.div_ceil(4) * 4;
+        assert_eq!(vary, "hello", "varying is counted too");
+
+        assert_eq!(wire[at], 1, "boolean: ONE data byte...");
+        at += 4; // ...padded to four
+        assert_eq!(
+            i64::from_be_bytes(wire[at..at + 8].try_into().unwrap()),
+            1,
+            "int64 is eight bytes big-endian"
+        );
+        at += 8;
+        assert_eq!(at, wire.len(), "and the walk consumes the message exactly");
     }
 
     /// `blr_gen_id3` (231): a generator named with its SCHEMA, and an
