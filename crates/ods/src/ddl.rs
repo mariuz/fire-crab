@@ -8855,6 +8855,7 @@ pub fn insert_system_row(
                 match v {
                     SysValue::Text(t) => SysVal::S(t),
                     SysValue::Int(n) => SysVal::I(*n),
+                    SysValue::Double(d) => SysVal::F(*d),
                     SysValue::Null => SysVal::Null,
                 },
             )
@@ -8896,6 +8897,7 @@ pub fn patch_system_row(
                 match v {
                     SysValue::Text(t) => SysVal::S(t),
                     SysValue::Int(n) => SysVal::I(*n),
+                    SysValue::Double(d) => SysVal::F(*d),
                     SysValue::Null => SysVal::Null,
                 },
             )
@@ -8911,6 +8913,8 @@ pub fn patch_system_row(
 pub enum SysValue<'a> {
     Text(&'a str),
     Int(i64),
+    /// a DOUBLE PRECISION catalog column - an index's selectivity
+    Double(f64),
     Null,
 }
 

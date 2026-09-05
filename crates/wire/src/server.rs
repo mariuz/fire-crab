@@ -1179,6 +1179,10 @@ fn bpb_segmented(bpb: &[u8]) -> bool {
 /// integers). Read as a byte-length buffer, every knob came out off and
 /// libfbclient, expecting the counts it had asked for, crashed on a
 /// count-less completion state.
+/// `DsqlBatch::HARD_BUFFER_LIMIT` (DsqlBatch.h:57): the most a batch may
+/// buffer, and what a client asking for zero is given.
+const BATCH_HARD_BUFFER_LIMIT: u32 = 256 * 1024 * 1024;
+
 fn batch_pb_flags(pb: &[u8]) -> (bool, bool, usize, u32) {
     let (mut multierror, mut counts, mut detailed, mut buffer) = (false, false, 64usize, 16u32 << 20);
     let mut at = 1usize; // the version tag
@@ -1194,7 +1198,24 @@ fn batch_pb_flags(pb: &[u8]) -> (bool, bool, usize, u32) {
         match tag {
             1 => multierror = v != 0,          // TAG_MULTIERROR
             2 => counts = v != 0,              // TAG_RECORD_COUNTS
-            3 => buffer = v as u32,            // TAG_BUFFER_BYTES_SIZE
+            // TAG_BUFFER_BYTES_SIZE - and ZERO MEANS THE HARD LIMIT, not
+            // zero. The engine clamps a request above HARD_BUFFER_LIMIT
+            // down to it and lifts a request OF ZERO up to it
+            // (DsqlBatch.cpp:114-118). gbak sends exactly zero - "as much
+            // as you have" - and this server used to store it literally,
+            // then answer INF_BUFFER_BYTES_SIZE = 0 to the client's
+            // setServerInfo, whose own guard (`blobAlign && serverSize &&
+            // blobHeadSize`, client/interface.cpp:3195) refuses a zero
+            // with isc_batch_align: "Unexpected info buffer structure
+            // querying for server batch parameters". The value is only
+            // ever advertised back, never allocated, so the limit costs
+            // nothing to honour.
+            3 => {
+                buffer = match v as u32 {
+                    0 => BATCH_HARD_BUFFER_LIMIT,
+                    n => n.min(BATCH_HARD_BUFFER_LIMIT),
+                }
+            }
             5 => detailed = (v as usize).min(256), // TAG_DETAILED_ERRORS
             _ => {}
         }
@@ -27000,6 +27021,22 @@ fn plan_set_time_zone(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
     Some((Plan::SetTimeZone { zone: Some(zone) }, Vec::new()))
 }
 
+/// A generator's name as `SET GENERATOR` / `ALTER SEQUENCE` spell it -
+/// optionally SCHEMA-QUALIFIED. gbak writes `SET GENERATOR
+/// SYSTEM.RDB$INDEX_NAME TO n` (the system counters live in SYSTEM, a
+/// user's in PUBLIC), and `unquote_ident` handed the dotted spelling on
+/// whole, so the lookup went looking for a generator literally named
+/// `SYSTEM.RDB$INDEX_NAME`. This server keeps one generator namespace,
+/// so the two schemas it knows are accepted and dropped; any other is
+/// refused rather than guessed at.
+fn generator_ident(tok: &str) -> Option<String> {
+    match split_qualified_name(tok)? {
+        (None, name) => Some(name),
+        (Some(sch), name) if sch == "SYSTEM" || sch == "PUBLIC" => Some(name),
+        _ => None,
+    }
+}
+
 fn plan_set_generator(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
     let s = sql.trim().trim_end_matches(';');
     let toks: Vec<&str> = s.split_whitespace().collect();
@@ -27010,7 +27047,7 @@ fn plan_set_generator(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
     {
         return None;
     }
-    let name = unquote_ident(toks[2])?;
+    let name = generator_ident(toks[2])?;
     let value: i64 = toks[4].parse().ok()?;
     Some((
         Plan::SetGenerator {
@@ -27036,7 +27073,7 @@ fn plan_alter_sequence(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
     {
         return None;
     }
-    let name = unquote_ident(toks[2])?;
+    let name = generator_ident(toks[2])?;
     let value: i64 = toks[5].parse().ok()?;
     Some((
         Plan::SetGenerator {
@@ -43225,11 +43262,33 @@ fn strip_modifiers(sql: &str) -> Option<(String, bool, usize, Option<usize>, boo
     let num_after = |from: usize| -> Option<(usize, usize)> {
         let rest = up[from..].trim_start();
         let lead = up.len() - rest.len();
-        let d: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        // `FIRST (1)` IS THE SAME STATEMENT AS `FIRST 1`. The grammar
+        // takes a value expression here, and a parenthesised integer
+        // literal is the spelling gbak's restore uses in the nine blocks
+        // that realign the system name counters (`SELECT FIRST(1) ...
+        // ORDER BY 1 DESC INTO :maxInTable`). Read as a bare word, the
+        // `(` made FIRST look like a FUNCTION CALL and the whole
+        // projection failed to parse - which surfaced downstream as
+        // -313 "count of column list and variable list do not match",
+        // three refusals away from its cause. A `?` or a non-literal
+        // expression inside the parentheses still refuses.
+        let (inner, wrap) = match rest.strip_prefix('(') {
+            Some(r) => (r.trim_start(), true),
+            None => (rest, false),
+        };
+        let d: String = inner.chars().take_while(|c| c.is_ascii_digit()).collect();
         if d.is_empty() {
-            return None; // FIRST ? / FIRST (expr) are not this slice
+            return None;
         }
-        Some((d.parse().ok()?, lead + d.len()))
+        let mut consumed = (rest.len() - inner.len()) + d.len();
+        if wrap {
+            let after = inner[d.len()..].trim_start();
+            if !after.starts_with(')') {
+                return None;
+            }
+            consumed += (inner[d.len()..].len() - after.len()) + 1;
+        }
+        Some((d.parse().ok()?, lead + consumed))
     };
     let (mut w, mut lead) = word_at(at);
     if w == "FIRST" {
@@ -78433,7 +78492,34 @@ fn exec_psql_stmt_inner(
     }
     match s {
         TrigStmt::Assign { target, expr, .. } => {
-            let v = eval_psql_expr(expr, f)?;
+            // `x = gen_id(G, 0)` IS A READ, NOT A DRAW. A body that draws
+            // refuses in a procedure or block ([GenMode::Refuse]) because
+            // no caller can own the page write; a step of zero writes no
+            // page, and the engine answers the generator's current value.
+            // gbak's counter-realigning blocks do exactly this
+            // (`currentGen = gen_id(RDB$INDEX_NAME, 0)`). Resolved here
+            // rather than in [PsqlFrame::gen_draw] because the frame
+            // carries no database and this arm does. Only the exact
+            // shape is taken - a zero-step read as the whole right-hand
+            // side; a draw, or a read folded into a larger expression,
+            // keeps the refusal it always had.
+            let v = match expr {
+                fire_crab_ods::expr::Expr::GenId { name, step }
+                    if matches!(
+                        **step,
+                        fire_crab_ods::expr::Expr::IntLiteral(0)
+                            | fire_crab_ods::expr::Expr::Int64Literal(0)
+                    ) && matches!(f.gen.borrow().mode, GenMode::Refuse) =>
+                {
+                    let dbr = db.as_ref().ok_or(PsqlStop::Unsupported)?;
+                    Value::Int(
+                        gen_cached(dbr, name)
+                            .or_else(|| read_generator_value(dbr, name))
+                            .ok_or(PsqlStop::Unsupported)?,
+                    )
+                }
+                _ => eval_psql_expr(expr, f)?,
+            };
             match target {
                 TrigTarget::Var(n) => {
                     let n = *n as usize;
@@ -79342,7 +79428,18 @@ fn run_dyn_statement(
         };
     }
     let (ddl_kw, dml_kw) = immediate_verb(sql);
-    if ddl_kw || dml_kw {
+    // A SET STATEMENT IS IMMEDIATE TOO. `immediate_verb` deliberately
+    // leaves SET out of both families ("a statement in neither is a SET
+    // or a query"), and this path then treated it as a QUERY and refused
+    // it - so `EXECUTE STATEMENT 'SET GENERATOR ...'` from a body could
+    // never reach the chain that plans it, even though that chain begins
+    // with `plan_set_generator`. The engine routes a body's EXECUTE
+    // STATEMENT through `isc_dsql_execute_immediate`, and SET GENERATOR
+    // is one of its statement types (`isc_info_sql_stmt_set_generator`,
+    // 13). gbak's restore realigns nine system name counters this way,
+    // and every one of them was refused here.
+    let set_kw = find_word(&sql.to_ascii_uppercase(), "SET", 0) == Some(0);
+    if ddl_kw || dml_kw || set_kw {
         let (plan, params) = plan_immediate(sql, &*db).ok_or(PsqlStop::Unsupported)?;
         if !params.is_empty() {
             return Err(PsqlStop::Unsupported); // a `?` this surface cannot bind
@@ -81110,13 +81207,33 @@ fn declared_var_names(header: &str) -> Vec<String> {
         let end = rest
             .find(|c: char| c.is_whitespace() || c == ';' || c == ',')
             .unwrap_or(rest.len());
-        let name = rest[..end].trim().trim_matches('"');
+        let name = canonical_var_name(rest[..end].trim());
         if !name.is_empty() {
-            out.push(name.to_string());
+            out.push(name);
         }
         at = d + "DECLARE".len();
     }
     out
+}
+
+/// A declared variable's name AS THE BODY WILL LOOK IT UP. A bare SQL
+/// identifier is case-insensitive and folds to upper case; a quoted one
+/// is exact. The body parser already folds every bare identifier it
+/// meets, so a declaration that kept `maxInTable` as written declared a
+/// slot no statement could ever name - `maxInTable = 1` looked for
+/// MAXINTABLE, found nothing, and the whole body was refused as
+/// "outside this server's PSQL surface". Every lower- or mixed-case
+/// declaration hit it; the trigger and procedure gates never did, because
+/// their fixtures declare in upper case. gbak's restore declares
+/// `maxInTable` and `currentGen` in the nine blocks that realign the
+/// system name counters, which is how it surfaced.
+fn canonical_var_name(raw: &str) -> String {
+    let raw = raw.trim();
+    if raw.len() >= 2 && raw.starts_with('"') && raw.ends_with('"') {
+        raw[1..raw.len() - 1].to_string()
+    } else {
+        raw.to_ascii_uppercase()
+    }
 }
 
 /// The INITIALISERS a header declares - `DECLARE [VARIABLE] <name>
@@ -81170,7 +81287,7 @@ fn declared_var_inits(header: &str, names: &[String]) -> Result<Vec<TrigStmt>, S
             .find(|c: char| c.is_whitespace() || c == ',')
             .map(|i| name_at + i)
             .unwrap_or(decl.len());
-        let name = decl[name_at..name_end].trim_matches('"').to_string();
+        let name = canonical_var_name(&decl[name_at..name_end]);
         if name.is_empty() {
             continue;
         }
@@ -89225,6 +89342,11 @@ enum BField {
     Bool,
     /// blr_int64: an 8-byte big-endian value (xdr_hyper)
     Int64,
+    /// blr_double: eight bytes, high word first, each word big-endian -
+    /// a plain big-endian IEEE 754 double on the wire (xdr_double with
+    /// FB_LONG_DOUBLE_FIRST = 1 on a little-endian host, xdr.cpp:338,
+    /// common.h:753-762). An index's selectivity travels this way.
+    Double,
     Cstring(u16),
     Text(u16),
     Varying(u16),
@@ -89597,6 +89719,12 @@ fn parse_blr_field(c: &mut BlrCur) -> Option<BField> {
             c.u8()?; // scale
             BField::Int64
         }
+        // blr_double: NO scale byte - unlike the exact-numeric codes
+        // (short/long/quad/int64), a floating descriptor is the code
+        // alone (parser.cpp:285-289: dtype and length set, nothing read).
+        // Consuming a scale here ate the next descriptor's code, and a
+        // three-field message read as two.
+        27 => BField::Double,
         14 => BField::Text(c.u16()?),
         37 => BField::Varying(c.u16()?),
         40 => BField::Cstring(c.u16()?),
@@ -90075,6 +90203,11 @@ fn read_request_message(
                 read_int(s, dec)?; // 8 bytes
                 vals.push(Value::Null);
             }
+            BField::Double => {
+                let hi = read_int(s, dec)? as u32;
+                let lo = read_int(s, dec)? as u32;
+                vals.push(Value::Double(f64::from_bits(((hi as u64) << 32) | lo as u64)));
+            }
             BField::Cstring(_) | BField::Varying(_) => {
                 // A COUNTED field: a 4-byte count then that many bytes,
                 // padded to four (`xdr_datum`'s dtype_cstring and
@@ -90246,6 +90379,7 @@ fn write_stored_row(
                 Value::Int(i) => fire_crab_ods::ddl::SysValue::Int(*i),
                 Value::Bool(b) => fire_crab_ods::ddl::SysValue::Int(i64::from(*b)),
                 Value::Text(t) => fire_crab_ods::ddl::SysValue::Text(t.as_str()),
+                Value::Double(d) => fire_crab_ods::ddl::SysValue::Double(*d),
                 _ => fire_crab_ods::ddl::SysValue::Null,
             };
             (n.as_str(), sv)
@@ -90375,6 +90509,15 @@ const STORABLE_SYSTEM_RELATIONS: &[&str] = &[
     "RDB$INDICES",
     "RDB$INDEX_SEGMENTS",
     "RDB$RELATION_CONSTRAINTS",
+    // a privilege, a security class and a check-constraint row ARE their
+    // rows. (vio.cpp:696-708 is worth citing for a different reason: it
+    // is the list of system relations a GBAK attachment is PERMITTED to
+    // write - `check_gbak_cheating_insupd`'s exemption, "protection
+    // against gbak impersonators" at :659 - and every relation on this
+    // allow-list is on that one.)
+    "RDB$USER_PRIVILEGES",
+    "RDB$SECURITY_CLASSES",
+    "RDB$CHECK_CONSTRAINTS",
 ];
 
 /// Storing into one of these leaves a relation that is only half made
@@ -90476,6 +90619,7 @@ fn write_modified_row(
             let sv = match v {
                 Value::Null => fire_crab_ods::ddl::SysValue::Null,
                 Value::Int(n) => fire_crab_ods::ddl::SysValue::Int(*n),
+                Value::Double(d) => fire_crab_ods::ddl::SysValue::Double(*d),
                 other => fire_crab_ods::ddl::SysValue::Text(match other {
                     Value::Text(t) => t.as_str(),
                     _ => "",
@@ -91458,6 +91602,14 @@ fn encode_request_message(fields: &[BField], vals: &[Value]) -> Vec<u8> {
                     _ => 0,
                 };
                 m.extend_from_slice(&n.to_be_bytes());
+            }
+            BField::Double => {
+                let d = match v {
+                    Value::Double(d) => d,
+                    Value::Int(n) => n as f64,
+                    _ => 0.0,
+                };
+                m.extend_from_slice(&d.to_bits().to_be_bytes());
             }
             BField::Cstring(_) => {
                 let text = match &v {
@@ -103162,10 +103314,13 @@ mod tests {
             }
             other => panic!("expected SetGenerator, got {:?}", other.is_some()),
         }
-        // negative value, trailing semicolon, lowercase keywords
+        // negative value, trailing semicolon, lowercase keywords - and a
+        // BARE name folds to upper, as the engine's own identifier rule
+        // has it (the lookup was always case-insensitive; this makes the
+        // planned name the canonical one an error vector would echo)
         match plan_set_generator("set generator gen_c to -9;") {
             Some((Plan::SetGenerator { name, mode, .. }, _)) => {
-                assert_eq!(name, "gen_c");
+                assert_eq!(name, "GEN_C");
                 assert!(matches!(mode, GenWrite::Absolute(-9)));
             }
             _ => panic!("expected SetGenerator"),
@@ -105281,6 +105436,73 @@ mod tests {
         assert_eq!(none.page_size, None);
     }
 
+    /// gbak's batch parameter block, byte for byte as captured off the
+    /// wire: multierror on, blob policy 1, detailed errors 1000, and a
+    /// BUFFER SIZE OF ZERO. Zero is not a size, it is "the hard limit"
+    /// (DsqlBatch.cpp:117-118) - and answering it back as zero is what
+    /// made libfbclient refuse the batch and gbak fall back to the
+    /// legacy store path.
+    #[test]
+    fn a_zero_batch_buffer_means_the_hard_limit() {
+        let pb: &[u8] = &[
+            1, 1, 4, 0, 0, 0, 1, 0, 0, 0, 4, 4, 0, 0, 0, 1, 0, 0, 0, 5, 4, 0, 0, 0, 232, 3, 0, 0,
+            3, 4, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        let (multierror, counts, detailed, buffer) = batch_pb_flags(pb);
+        assert!(multierror);
+        assert!(!counts);
+        assert_eq!(detailed, 256, "1000 asked, clamped to the limit");
+        assert_eq!(buffer, BATCH_HARD_BUFFER_LIMIT, "zero is the hard limit, not zero");
+        // an explicit size above the limit is clamped down to it too
+        let big: &[u8] = &[1, 3, 4, 0, 0, 0, 0, 0, 0, 64];
+        assert_eq!(batch_pb_flags(big).3, BATCH_HARD_BUFFER_LIMIT);
+        // and an ordinary size is kept
+        let small: &[u8] = &[1, 3, 4, 0, 0, 0, 0, 0, 16, 0];
+        assert_eq!(batch_pb_flags(small).3, 1 << 20);
+    }
+
+    /// A declared name is what the BODY will look up: bare folds to
+    /// upper, quoted stays exact. gbak's restore declares `maxInTable`
+    /// and `currentGen`; kept as written they named slots no statement
+    /// could reach and every one of its nine counter-realigning blocks
+    /// was refused.
+    #[test]
+    fn declared_names_fold_the_way_the_body_looks_them_up() {
+        let hdr = r#"DECLARE VARIABLE maxInTable INT; DECLARE VARIABLE "lo" INT; DECLARE V INTEGER; BEGIN"#;
+        assert_eq!(declared_var_names(hdr), vec!["MAXINTABLE", "lo", "V"]);
+        assert_eq!(canonical_var_name("currentGen"), "CURRENTGEN");
+        assert_eq!(canonical_var_name("\"Mixed Case\""), "Mixed Case");
+    }
+
+    /// `FIRST (1)` is `FIRST 1`: the grammar takes a value here and the
+    /// parenthesised literal is how gbak spells it. Read as a bare word
+    /// it looked like a function call.
+    #[test]
+    fn first_and_skip_take_a_parenthesised_literal() {
+        let (_, _, skip, take, _) = strip_modifiers("SELECT FIRST(1) X FROM T ORDER BY 1 DESC").unwrap();
+        assert_eq!((skip, take), (0, Some(1)));
+        let (_, _, skip, take, _) = strip_modifiers("SELECT FIRST ( 3 ) SKIP (2) X FROM T").unwrap();
+        assert_eq!((skip, take), (2, Some(3)));
+        let (_, _, skip, take, _) = strip_modifiers("SELECT FIRST 2 X FROM T").unwrap();
+        assert_eq!((skip, take), (0, Some(2)));
+        // an expression or a parameter inside the parentheses is still
+        // not this slice
+        assert!(strip_modifiers("SELECT FIRST (?) X FROM T").is_none());
+        assert!(strip_modifiers("SELECT FIRST (1+1) X FROM T").is_none());
+    }
+
+    /// A generator may be named with its schema; the two this server
+    /// knows are accepted and dropped, anything else refuses.
+    #[test]
+    fn generator_names_may_carry_a_known_schema() {
+        assert_eq!(generator_ident("RDB$INDEX_NAME").as_deref(), Some("RDB$INDEX_NAME"));
+        assert_eq!(generator_ident("SYSTEM.RDB$INDEX_NAME").as_deref(), Some("RDB$INDEX_NAME"));
+        assert_eq!(generator_ident("PUBLIC.UG").as_deref(), Some("UG"));
+        assert_eq!(generator_ident("\"lo\"").as_deref(), Some("lo"));
+        assert!(generator_ident("OTHER.UG").is_none());
+        assert!(plan_set_generator("SET GENERATOR SYSTEM.RDB$INDEX_NAME TO 7").is_some());
+    }
+
     /// THE DECODER AND THE ENCODER MUST AGREE ON EVERY FIELD'S WIDTH,
     /// and for `blr_text` they did not.
     ///
@@ -105307,6 +105529,7 @@ mod tests {
             BField::Varying(20),
             BField::Bool,
             BField::Int64,
+            BField::Double,
         ];
         let vals = vec![
             Value::Int(7),
@@ -105316,6 +105539,7 @@ mod tests {
             Value::Text("hello".into()),
             Value::Bool(true),
             Value::Int(1),
+            Value::Double(0.5),
         ];
         let wire = encode_request_message(&fields, &vals);
 
@@ -105355,6 +105579,10 @@ mod tests {
             1,
             "int64 is eight bytes big-endian"
         );
+        at += 8;
+        // double: a plain big-endian IEEE 754 value - 0.5 is 0x3FE0_0000_0000_0000
+        assert_eq!(&wire[at..at + 8], &0.5f64.to_bits().to_be_bytes());
+        assert_eq!(wire[at], 0x3F, "high word first");
         at += 8;
         assert_eq!(at, wire.len(), "and the walk consumes the message exactly");
     }
