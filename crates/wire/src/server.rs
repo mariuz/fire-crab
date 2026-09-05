@@ -90235,6 +90235,25 @@ fn write_stored_row(
     }
     let (mut work, tx) = db.work_copy_with_tx()?;
     work.ddl_tx = Some(u64::from(tx));
+    // THE ID GOES IN BEFORE THE ROW DOES. `insert_system_row` keys the
+    // record into every index as it writes it; patching the id in
+    // afterwards does NOT re-key, so the row would keep the RDB$INDEX_1
+    // entry built when its id was null - and the engine, which finds a
+    // relation by NAME and then re-finds it BY ID through that index,
+    // would miss and answer `-204 Table unknown` about a catalog that
+    // reads correctly in every column. The engine assigns it in a
+    // BEFORE-insert trigger for the same reason.
+    let assigned_id = if RELATION_STORAGE_TRIGGERS.contains(&relation)
+        && !named.iter().any(|(n, _)| *n == "RDB$RELATION_ID")
+    {
+        Some(fire_crab_ods::ddl::next_free_relation_id(&mut work, db.page_size)?)
+    } else {
+        None
+    };
+    let mut named = named;
+    if let Some(id) = assigned_id {
+        named.push(("RDB$RELATION_ID", fire_crab_ods::ddl::SysValue::Int(i64::from(id))));
+    }
     let r =
         fire_crab_ods::ddl::insert_system_row(&mut work, db.page_size, relation, rel, &named);
     // ...and if that row NAMES a relation, the relation's storage is
@@ -90312,19 +90331,17 @@ fn write_stored_row(
 /// restore of the same backup, `RDB$DBKEY_LENGTH` and the runtime
 /// blob's content excepted.
 ///
-/// And the engine still answers `-204 Table unknown` for the result -
-/// because the ROW IS WRONG in a way the catalog diff that pronounced it
-/// identical could not show. `RDB$EXTERNAL_FILE` comes out as an EMPTY
-/// STRING where it should be NULL, and a relation whose external file is
-/// not null is an EXTERNAL TABLE, which is why a perfectly ordinary
-/// query cannot find it. Beside it `RDB$BASE_FIELD` holds binary
-/// garbage, `RDB$QUERY_NAME` a run of spaces and `RDB$EDIT_STRING` two
-/// stray characters: [read_request_message] is MISALIGNED over a message
-/// this wide, so values land in the wrong slots.
+/// The relation is FOUND now - stamping its id before the row is written
+/// fixed the lookup - and what it runs into next is worse than -204: the
+/// engine CRASHES reading the metadata. `RDB$BASE_FIELD` holds binary
+/// garbage, `RDB$QUERY_NAME` a run of spaces, `RDB$EDIT_STRING` two
+/// stray characters. [read_request_message] is MISALIGNED over a message
+/// this wide, so values land in the wrong slots, and the catalog it
+/// writes is malformed in ways a column-by-column read does not show.
 ///
-/// Until that decoder is right, a store into `RDB$RELATIONS` must keep
-/// refusing - a restore that leaves a table the engine cannot read is
-/// the "looks restored and is not" outcome this list exists to prevent.
+/// So a store into `RDB$RELATIONS` keeps refusing, and now for a sharper
+/// reason than before: it does not merely leave a table the engine
+/// cannot read, it leaves one the engine cannot survive reading.
 const STORABLE_SYSTEM_RELATIONS: &[&str] = &["RDB$SCHEMAS", "RDB$FIELDS"];
 
 /// Storing into one of these leaves a relation that is only half made

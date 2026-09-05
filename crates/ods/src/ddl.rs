@@ -7329,6 +7329,25 @@ fn pick_run(
 /// counter would otherwise hand out twice. A relation id is a `u16` on
 /// every page header that names it, so exhausting the range is an
 /// error, never a wrap.
+/// The next free relation id, for a caller that must stamp it into a row
+/// BEFORE the row is written.
+///
+/// It has to be before. `sys_insert` keys the record into every index of
+/// its relation as it writes it, and `patch_sys_row` does NOT - so a row
+/// stored with a NULL id and patched afterwards keeps the `RDB$INDEX_1`
+/// key it was given when the id was null. The engine finds a relation by
+/// NAME and then re-finds it BY ID through that index (`jrd_rel::scan`,
+/// `WITH REL.RDB$RELATION_ID EQ getId()`), so the second probe misses
+/// and the table is answered `-204 Table unknown` - with a catalog that
+/// reads correctly in every column. The engine avoids the whole problem
+/// by assigning the id in a BEFORE-insert trigger
+/// (`SystemTriggers::beforeInsertRelation`, which asserts the client did
+/// not supply one).
+pub fn next_free_relation_id(file: &mut crate::Image, page_size: usize) -> Result<u16, String> {
+    let rels = crate::catalog::list_relations(file, page_size);
+    next_relation_id(file, page_size, &rels)
+}
+
 fn next_relation_id(
     file: &mut crate::Image,
     page_size: usize,
