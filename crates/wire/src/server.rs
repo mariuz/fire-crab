@@ -89237,7 +89237,14 @@ enum BVal {
     /// a field reference: (context number, field name). The context
     /// selects which stream of a joined for-loop the field comes from.
     Field(u8, String),
-    Param(u8, u16),
+    /// a message parameter: (message, value index, null-indicator index).
+    /// THE INDICATOR IS NOT OPTIONAL DECORATION - it is what says the
+    /// value IS NULL. `blr_parameter2` carries a second short that the
+    /// client sets to -1 for a null, and the value slot then holds
+    /// whatever was in the buffer: an empty string for text, zero for a
+    /// number. Reading the slot and ignoring the indicator turns every
+    /// NULL a client sends into one of those.
+    Param(u8, u16, Option<u16>),
     LitLong(i64),
     LitStr(String),
     /// blr_null (45)
@@ -89955,13 +89962,13 @@ fn parse_blr_val(c: &mut BlrCur) -> Option<BVal> {
         BLR_PARAMETER => {
             let m = c.u8()?;
             let idx = c.u16()?;
-            BVal::Param(m, idx)
+            BVal::Param(m, idx, None)
         }
         BLR_PARAMETER2 => {
             let m = c.u8()?;
             let idx = c.u16()?;
-            c.u16()?; // null-indicator index (unused when read as a source)
-            BVal::Param(m, idx)
+            let nidx = c.u16()?;
+            BVal::Param(m, idx, Some(nidx))
         }
         BLR_NULL => BVal::Null,
         BLR_VALUE_IF => {
@@ -90305,9 +90312,17 @@ fn write_stored_row(
 /// restore of the same backup, `RDB$DBKEY_LENGTH` and the runtime
 /// blob's content excepted.
 ///
-/// And the engine still answers `-204 Table unknown` for the result. So
-/// the relation is NOT usable, whatever its catalog looks like, and
-/// until that is understood a store into `RDB$RELATIONS` must keep
+/// And the engine still answers `-204 Table unknown` for the result -
+/// because the ROW IS WRONG in a way the catalog diff that pronounced it
+/// identical could not show. `RDB$EXTERNAL_FILE` comes out as an EMPTY
+/// STRING where it should be NULL, and a relation whose external file is
+/// not null is an EXTERNAL TABLE, which is why a perfectly ordinary
+/// query cannot find it. Beside it `RDB$BASE_FIELD` holds binary
+/// garbage, `RDB$QUERY_NAME` a run of spaces and `RDB$EDIT_STRING` two
+/// stray characters: [read_request_message] is MISALIGNED over a message
+/// this wide, so values land in the wrong slots.
+///
+/// Until that decoder is right, a store into `RDB$RELATIONS` must keep
 /// refusing - a restore that leaves a table the engine cannot read is
 /// the "looks restored and is not" outcome this list exists to prevent.
 const STORABLE_SYSTEM_RELATIONS: &[&str] = &["RDB$SCHEMAS", "RDB$FIELDS"];
@@ -91080,7 +91095,15 @@ fn eval_blr_val(v: &BVal, ctxs: &[Ctx], input: &[Value], db: &Database) -> Value
         BVal::LitLong(n) => Value::Int(*n),
         BVal::LitStr(s) => Value::Text(s.clone()),
         BVal::Null => Value::Null,
-        BVal::Param(_m, idx) => input.get(*idx as usize).cloned().unwrap_or(Value::Null),
+        BVal::Param(_m, idx, nidx) => {
+            // the indicator first: -1 means the value slot is not a value
+            if let Some(n) = nidx {
+                if matches!(input.get(*n as usize), Some(Value::Int(-1))) {
+                    return Value::Null;
+                }
+            }
+            input.get(*idx as usize).cloned().unwrap_or(Value::Null)
+        }
         BVal::Field(ctx, name) => ctxs
             .iter()
             .find(|c| c.ctx == *ctx)
@@ -105146,7 +105169,7 @@ mod tests {
         let BStmt::Begin(ms) = &**mbody else { panic!("a begin of assignments") };
         assert!(matches!(
             &*ms[0],
-            BStmt::Assign(BVal::Param(1, 0), BTarget::Field(1, f)) if f == "RDB$CHARACTER_SET_SCHEMA_NAME"
+            BStmt::Assign(BVal::Param(1, 0, _), BTarget::Field(1, f)) if f == "RDB$CHARACTER_SET_SCHEMA_NAME"
         ));
 
         // ...AND IT NOW COMPILES. The machine suspends at the select
@@ -105264,7 +105287,7 @@ mod tests {
         assert!(
             assigns.iter().all(|a| matches!(
                 &**a,
-                BStmt::Assign(BVal::Param(0, _), BTarget::Field(0, _))
+                BStmt::Assign(BVal::Param(0, _, _), BTarget::Field(0, _))
             )),
             "every one is a message parameter into a field of the new record"
         );
