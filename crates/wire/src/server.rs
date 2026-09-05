@@ -90213,10 +90213,20 @@ fn write_stored_row(
 /// exist and be usable. `RDB$SCHEMAS` qualifies: a schema is a name and
 /// an owner, with no pages, no format and no dependent structure.
 ///
-/// `RDB$RELATIONS` and `RDB$FIELDS` do NOT, and adding them without the
-/// deferred work would produce a database whose catalog describes tables
-/// the file cannot hold.
-const STORABLE_SYSTEM_RELATIONS: &[&str] = &["RDB$SCHEMAS"];
+/// `RDB$FIELDS` qualifies too - a DOMAIN is its row. The engine posts
+/// `dfw_create_field` for one, but that task only registers
+/// DEPENDENCIES: it reads the domain's validation BLR and records what
+/// it refers to (dfw.epp:3090), writing no page and creating no object.
+/// fire-crab does not populate `RDB$DEPENDENCIES` anywhere, so the gap
+/// is one this server already has everywhere rather than one this path
+/// introduces.
+///
+/// `RDB$RELATIONS` does NOT qualify, and that is the line. Its store
+/// posts `dfw_create_relation`, and a row without it is a catalog entry
+/// for a table the file cannot hold - no pointer page, no format blob,
+/// no `RDB$PAGES` rows. Adding it here without that work would produce a
+/// database that looks restored and is not.
+const STORABLE_SYSTEM_RELATIONS: &[&str] = &["RDB$SCHEMAS", "RDB$FIELDS"];
 
 /// WRITE BACK a `blr_modify`'s row.
 ///
