@@ -5046,7 +5046,7 @@ fn classify_attach_failure(path: &str) -> AttachRefusal {
 /// as every gate builds its scratch db. The binary is taken from
 /// $FC_ISQL, else `isql` on PATH. The client's own DDL/DML then runs
 /// through fire-crab against the file.
-fn create_database_file(path: &str) -> Result<(), String> {
+fn create_database_file(path: &str, want: CreateDpb) -> Result<(), String> {
     let p = path.trim();
     if p.is_empty() {
         return Err("empty database path".into());
@@ -5060,11 +5060,16 @@ fn create_database_file(path: &str) -> Result<(), String> {
     let isql = std::env::var("FC_ISQL").unwrap_or_else(|_| "isql".to_string());
     let user = std::env::var("FC_CREATE_USER").unwrap_or_else(|_| "SYSDBA".to_string());
     let pass = std::env::var("FC_CREATE_PASSWORD").unwrap_or_else(|_| "masterkey".to_string());
+    // THE PAGE SIZE THE CLIENT ASKED FOR. gbak carries the backup's own
+    // page size (or its -p switch) in the create DPB, and a restore that
+    // silently lands on 8192 is not the database that was backed up.
+    let page_size = want.page_size.unwrap_or(8192);
     let sql = format!(
-        "CREATE DATABASE '{}' USER '{}' PASSWORD '{}' PAGE_SIZE 8192;\n",
+        "CREATE DATABASE '{}' USER '{}' PASSWORD '{}' PAGE_SIZE {};\n",
         p.replace('\'', "''"),
         user,
-        pass
+        pass,
+        page_size
     );
     let out = std::process::Command::new(&isql)
         .args(["-q", "-o", "/dev/null"])
@@ -5086,6 +5091,52 @@ fn create_database_file(path: &str) -> Result<(), String> {
     }
     if load_database(p).is_none() {
         return Err("created file is not a decodable database".into());
+    }
+    // ...AND THE SCHEMA THE CLIENT SAID IT WOULD BRING ITS OWN OF.
+    //
+    // `isc_dpb_gbak_restore_has_schema` means "do not create the PUBLIC
+    // schema" - gbak sends it because its backup contains a `rec_schema`
+    // for PUBLIC and the restore is about to STORE it (restore.epp:1030,
+    // ini.epp:819). This server does not create the file, the engine
+    // does, so the row cannot be skipped at creation; it is removed
+    // afterwards, which leaves the same database.
+    //
+    // Without this the restore's very first store is refused by
+    // RDB$SCHEMAS' own unique index and the whole thing stops there.
+    if want.restore_has_schema {
+        remove_public_schema(p)?;
+    }
+    Ok(())
+}
+
+/// Drop the PUBLIC schema row a fresh database is created with, for a
+/// client that said it will store its own. The index entry stays behind
+/// as it does everywhere else here - a conflicting entry counts only
+/// while its record still builds that key - so the name can be stored
+/// again immediately.
+fn remove_public_schema(path: &str) -> Result<(), String> {
+    let mut db = load_database(path).ok_or("created file is not a decodable database")?;
+    let rel = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, "RDB$SCHEMAS")
+        .ok_or("no RDB$SCHEMAS in the created database")?;
+    let columns = db.columns("RDB$SCHEMAS");
+    let name_fid = columns
+        .iter()
+        .find(|c| c.name == "RDB$SCHEMA_NAME")
+        .map(|c| c.field_id as usize)
+        .ok_or("RDB$SCHEMAS has no RDB$SCHEMA_NAME")?;
+    let mut work = db.work_copy()?;
+    let removed = fire_crab_ods::ddl::delete_system_row(
+        &mut work,
+        db.page_size,
+        "RDB$SCHEMAS",
+        rel,
+        move |v| {
+            matches!(v.get(name_fid), Some(Value::Text(t)) if t.trim_end() == "PUBLIC")
+        },
+    )?;
+    if removed {
+        db.install_dirty(work);
+        db.flush_dirty()?;
     }
     Ok(())
 }
@@ -5762,7 +5813,9 @@ fn run_gbak_restore_core(
         let _ = std::fs::remove_file(&db);
         fire_crab_cch::pool::forget(&db);
     }
-    create_database_file(&db).map_err(|e| {
+    // the SERVICE restore makes its own shell: no client DPB reaches
+    // here, so the defaults stand
+    create_database_file(&db, CreateDpb::default()).map_err(|e| {
         if std::env::var("FC_SRV_TRACE").is_ok() {
             eprintln!("[srv] gbak restore cannot create {}: {}", db, e);
         }
@@ -30233,6 +30286,51 @@ impl ShutDpb {
 
 /// Read the shutdown items out of a DPB, in the same walk shape as
 /// [parse_dpb_header].
+/// WHAT THE CLIENT ASKED FOR AT CREATE, which this server used to
+/// ignore completely.
+///
+/// `create_database_file` does not synthesise a database - it has the
+/// engine make one - so the DPB was dropped on the floor and every
+/// target came out the same: 8192-byte pages, and a full standard
+/// catalog including the PUBLIC schema. Both of those are wrong for a
+/// restore.
+#[derive(Default, Clone, Copy)]
+struct CreateDpb {
+    /// `isc_dpb_page_size` (4)
+    page_size: Option<u32>,
+    /// `isc_dpb_gbak_restore_has_schema` (107) - "do not create the
+    /// PUBLIC schema, I am about to store it myself". The engine skips
+    /// it at `ini.epp:819`, and skips the DDL grants and security
+    /// classes scoped to it at `ini.epp:577`.
+    restore_has_schema: bool,
+}
+
+fn parse_create_dpb(dpb: &[u8]) -> CreateDpb {
+    let mut want = CreateDpb::default();
+    if dpb.first() != Some(&1) {
+        return want;
+    }
+    let mut i = 1;
+    while i + 1 < dpb.len() {
+        let (tag, len) = (dpb[i], dpb[i + 1] as usize);
+        let end = i + 2 + len;
+        if end > dpb.len() {
+            break;
+        }
+        let mut v: u64 = 0;
+        for (k, b) in dpb[i + 2..end].iter().enumerate() {
+            v |= (*b as u64) << (8 * k);
+        }
+        match tag {
+            4 => want.page_size = Some(v as u32),
+            107 => want.restore_has_schema = true,
+            _ => {}
+        }
+        i = end;
+    }
+    want
+}
+
 fn parse_dpb_shut(dpb: &[u8]) -> ShutDpb {
     let mut want = ShutDpb::default();
     if dpb.first() != Some(&1) {
@@ -84141,7 +84239,7 @@ fn after_auth(
         None => attach_name.clone(),
     };
     if attach_op == OP_CREATE {
-        if let Err(e) = create_database_file(&db_path) {
+        if let Err(e) = create_database_file(&db_path, parse_create_dpb(&dpb)) {
             if std::env::var("FC_SRV_TRACE").is_ok() {
                 eprintln!("[srv] create_database failed: {}", e);
             }
@@ -104797,7 +104895,7 @@ mod tests {
         assert!(!path.exists(), "a refused attach creates no file");
 
         // op_create materialises it, and then the SAME path loads
-        if create_database_file(p).is_ok() {
+        if create_database_file(p, CreateDpb::default()).is_ok() {
             assert!(path.exists(), "op_create leaves the file it named");
             assert!(
                 load_database(p).is_some(),

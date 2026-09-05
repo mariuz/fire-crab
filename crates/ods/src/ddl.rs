@@ -8327,6 +8327,30 @@ fn dispose_row_purge(file: &mut crate::Image, page_size: usize, rel: u16, page: 
     }
 }
 
+/// DELETE ONE ROW OF A SYSTEM RELATION, from outside this crate.
+///
+/// `Ok(false)` when no row matched, which is not an error: the caller
+/// asking for a row that is already absent has got what it wanted.
+///
+/// The index entry is deliberately left behind, as it is everywhere
+/// else here - an entry outlives the version that wrote it, and the
+/// uniqueness check counts a conflicting entry only when its record
+/// still builds that key ([maintain_indexes]). So the name can be
+/// stored again straight away.
+pub fn delete_system_row(
+    file: &mut crate::Image,
+    page_size: usize,
+    rel_name: &str,
+    rel: u16,
+    pred: impl Fn(&[Value]) -> bool,
+) -> Result<bool, String> {
+    let Some((page, slot)) = find_sys_row_slot(file, page_size, rel_name, rel, pred) else {
+        return Ok(false);
+    };
+    dml::delete_records(file, page_size, rel, &[(page, slot)])?;
+    Ok(true)
+}
+
 /// STORE ONE NEW ROW INTO A SYSTEM RELATION, from outside this crate.
 ///
 /// The other half of what the legacy BLR write API needs: gbak's
