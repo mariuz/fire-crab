@@ -8736,7 +8736,28 @@ pub fn create_index_storage(
         "RDB$INDICES",
         i_rel_id,
         move |v| matches!(v.get(name_fid), Some(Value::Text(t)) if t.trim_end() == want),
-        &[("RDB$INDEX_ID", SysVal::I(slot as i64 + 1))],
+        &[
+            ("RDB$INDEX_ID", SysVal::I(slot as i64 + 1)),
+            // ...AND THE DEFERRAL IS DISCHARGED. gbak stores EVERY index
+            // with `RDB$INDEX_INACTIVE = 3` - `DEFERRED_ACTIVE`
+            // (restore.epp:97, and the coercion at :6843 that turns an
+            // active index into a deferred one) - and the ENGINE builds
+            // it much later, when the restore's tail modifies that 3
+            // back to 0 after the data is loaded
+            // (`SystemTriggers::afterUpdateIndex`). Storing the row posts
+            // the engine no work at all: `indexDfw` returns without
+            // posting when RDB$INDEX_ID is null (vio.cpp).
+            //
+            // fire-crab builds HERE instead, at the store's commit, and
+            // that is a recorded divergence rather than an oversight:
+            // its DML keys every written row into whatever indexes the
+            // relation's root already carries ([resolve_index_ops]), so
+            // an index built empty before the load ends up with the same
+            // entries the engine's end-of-restore build would have made.
+            // What must not be left behind is the FLAG - a 3 says "not
+            // built yet" about an index that is.
+            ("RDB$INDEX_INACTIVE", SysVal::I(0)),
+        ],
     )?;
 
     backfill_index(file, page_size, rel, slot, &segs, descs, unique, descending, primary)?;
