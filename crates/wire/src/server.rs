@@ -90697,6 +90697,29 @@ fn write_stored_row(
             work.ddl_deferred.push(fire_crab_ods::DdlDeferred::GrantPrivileges { name: obj, object_type: ot });
         }
     }
+    // A PROCEDURE, A TRIGGER OR A VIEW OWES ITS DEPENDENCY ROWS at commit,
+    // derived from the BLR the row carries - dfw create_procedure /
+    // get_trigger_dependencies / the view's RDB$VIEW_BLR scan compile it
+    // with csb_get_dependencies. gbak backs none of these rows up. A
+    // packaged procedure is left alone (its dependencies are the
+    // package's).
+    if r.is_ok() {
+        let text_of = |col: &str| {
+            vals.iter().find(|(n, _)| n == col).and_then(|(_, v)| match v {
+                Value::Text(t) => Some(t.trim_end().to_string()),
+                _ => None,
+            })
+        };
+        let dep = match relation {
+            "RDB$PROCEDURES" if text_of("RDB$PACKAGE_NAME").is_none() => text_of("RDB$PROCEDURE_NAME").map(|n| (5, n)),
+            "RDB$TRIGGERS" => text_of("RDB$TRIGGER_NAME").map(|n| (2, n)),
+            "RDB$RELATIONS" if blobs.iter().any(|(c, ..)| c == "RDB$VIEW_BLR") => text_of("RDB$RELATION_NAME").map(|n| (1, n)),
+            _ => None,
+        };
+        if let Some((kind, name)) = dep {
+            work.ddl_deferred.push(fire_crab_ods::DdlDeferred::StoreDependencies { kind, name });
+        }
+    }
     // A PRIVILEGE ROW POSTS ITS OBJECT'S ACL RECOMPILE (vio.cpp rel_priv ->
     // dfw_grant, by the row's RDB$RELATION_NAME and RDB$OBJECT_TYPE). The
     // DDL-object grants (types 22 and up) and the schema's are left to the

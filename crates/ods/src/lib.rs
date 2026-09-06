@@ -193,6 +193,12 @@ pub enum DdlDeferred {
     /// never carried); a relation without a default class gets one.
     /// Applied once per (name, type) however many rows posted it.
     GrantPrivileges { name: String, object_type: i64 },
+    /// a procedure (5), trigger (2) or view (1) row landed: its
+    /// RDB$DEPENDENCIES rows are derived at commit from the BLR the row
+    /// carries - the engine compiles it with `csb_get_dependencies`
+    /// (dfw create_procedure / get_trigger_dependencies / the view's
+    /// RDB$VIEW_BLR in MET_scan_relation) and stores what it met
+    StoreDependencies { kind: i64, name: String },
 }
 
 impl Image {

@@ -10467,6 +10467,311 @@ pub fn grant_privileges_deferred(
     }
 }
 
+/// One column of a system relation's row for `name`, as text.
+fn sys_text_of(file: &crate::Image, page_size: usize, rel_name: &str, key_col: &str, key: &str, col: &str) -> Option<String> {
+    let rel = crate::resolve_relation(file, page_size, rel_name)?;
+    let formats = system_relation_formats(file, page_size, rel_name)?;
+    let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
+    let cols = relation_columns(file, page_size, rel_name);
+    let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (k_f, c_f) = (fid(key_col)?, fid(col)?);
+    let mut out = None;
+    walk_rows(file, page_size, rel, descs, |v| {
+        if out.is_none() && text_eq(v.get(k_f), key) {
+            if let Some(Value::Text(t)) = v.get(c_f) {
+                out = Some(t.trim_end().to_string());
+            }
+        }
+    });
+    out
+}
+
+/// A blob column of a system relation's row for `name`: its bytes.
+fn sys_blob_of(file: &crate::Image, page_size: usize, rel_name: &str, key_col: &str, key: &str, col: &str) -> Option<Vec<u8>> {
+    let rel = crate::resolve_relation(file, page_size, rel_name)?;
+    let formats = system_relation_formats(file, page_size, rel_name)?;
+    let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
+    let cols = relation_columns(file, page_size, rel_name);
+    let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (k_f, c_f) = (fid(key_col)?, fid(col)?);
+    let mut id = None;
+    walk_rows(file, page_size, rel, descs, |v| {
+        if id.is_none() && text_eq(v.get(k_f), key) {
+            if let Some(Value::Blob(r, n)) = v.get(c_f) {
+                id = Some((*r, *n));
+            }
+        }
+    });
+    let (r, n) = id?;
+    crate::format::read_blob_content(file, page_size, r, n)
+}
+
+/// What a BLR context is bound to while resolving dependencies.
+#[derive(Clone, Debug)]
+enum CtxBind {
+    Relation(String),
+    Procedure(String),
+}
+
+/// `MET_get_dependencies` for a row a client stored: the object's BLR is
+/// walked ([crate::blr::decode]) and every reference the engine's parse
+/// would record (`PAR_dependency`, `csb->addDependency`) becomes an
+/// RDB$DEPENDENCIES row - `kind` is RDB$DEPENDENT_TYPE: 5 a procedure
+/// (RDB$PROCEDURE_BLR), 2 a trigger (RDB$TRIGGER_BLR, with contexts 0 and
+/// 1 bound to its relation, the way `PAR_blr` binds them - which is why
+/// a trigger's own columns give field rows and no relation row), 1 a
+/// view (RDB$VIEW_BLR, plus the base fields its columns name, as
+/// `PAR_make_field` records them from RSR_base_field). Reads WIDE.
+///
+/// Rows: a stream opened on a relation is a NULL-field row (type 0, or 1
+/// when the relation is a view); a field of a bound relation a field row;
+/// a procedure called or opened a type-5 row (named arguments as field
+/// rows); a generator drawn a type-14 row unless it is a system one
+/// (`MET_store_dependency` drops those); an exception raised or handled a
+/// type-7 row; a user function type 15; a domain named in a descriptor
+/// type 9; an explicit collation type 17. Deduplicated on (name, type,
+/// field) as the engine's store lookups do, and inserted in the REVERSE
+/// of encounter order - `MET_store_dependencies` pops its array. The
+/// object's existing rows of this type go first (`MET_delete_dependencies`).
+pub fn store_dependencies_deferred(file: &mut crate::Image, page_size: usize, kind: i64, name: &str) -> Result<(), String> {
+    let _wide = crate::tra::ReaderViewGuard::wide();
+    let (blr, own_relation): (Vec<u8>, Option<String>) = match kind {
+        5 => (
+            match sys_blob_of(file, page_size, "RDB$PROCEDURES", "RDB$PROCEDURE_NAME", name, "RDB$PROCEDURE_BLR") {
+                Some(b) => b,
+                None => return Ok(()), // no body: nothing depends on anything
+            },
+            None,
+        ),
+        2 => (
+            match sys_blob_of(file, page_size, "RDB$TRIGGERS", "RDB$TRIGGER_NAME", name, "RDB$TRIGGER_BLR") {
+                Some(b) => b,
+                None => return Ok(()),
+            },
+            sys_text_of(file, page_size, "RDB$TRIGGERS", "RDB$TRIGGER_NAME", name, "RDB$RELATION_NAME"),
+        ),
+        1 => (
+            match sys_blob_of(file, page_size, "RDB$RELATIONS", "RDB$RELATION_NAME", name, "RDB$VIEW_BLR") {
+                Some(b) => b,
+                None => return Ok(()),
+            },
+            None,
+        ),
+        _ => return Ok(()),
+    };
+    let decoded = crate::blr::decode(&blr).map_err(|e| format!("dependencies of {name}: {e}"))?;
+
+    let mut ctx: std::collections::HashMap<u8, CtxBind> = std::collections::HashMap::new();
+    if let Some(rel) = &own_relation {
+        ctx.insert(0, CtxBind::Relation(rel.clone()));
+        ctx.insert(1, CtxBind::Relation(rel.clone()));
+    }
+    // (depended-on name, its type, field) in encounter order
+    let mut deps: Vec<(String, i64, Option<String>)> = Vec::new();
+    let rels = crate::catalog::list_relations(file, page_size);
+    let rel_type = |file: &crate::Image, r: &str| -> i64 { if is_view(file, page_size, r) { 1 } else { 0 } };
+    for ev in &decoded.deps {
+        match ev {
+            crate::blr::DepEvent::RelCtx { ctx: c, name: r } => {
+                ctx.insert(*c, CtxBind::Relation(r.clone()));
+                deps.push((r.clone(), rel_type(file, r), None));
+            }
+            crate::blr::DepEvent::RelId { ctx: c, id } => {
+                if let Some((_, r)) = rels.iter().find(|(i, _)| *i == *id) {
+                    let r = r.trim_end().to_string();
+                    ctx.insert(*c, CtxBind::Relation(r.clone()));
+                    deps.push((r.clone(), rel_type(file, &r), None));
+                }
+            }
+            crate::blr::DepEvent::ProcCtx { ctx: c, name: p } => {
+                ctx.insert(*c, CtxBind::Procedure(p.clone()));
+                deps.push((p.clone(), 5, None));
+            }
+            crate::blr::DepEvent::Field { ctx: c, name: f } => match ctx.get(c) {
+                Some(CtxBind::Relation(r)) => deps.push((r.clone(), rel_type(file, r), Some(f.clone()))),
+                Some(CtxBind::Procedure(p)) => deps.push((p.clone(), 5, Some(f.clone()))),
+                None => {}
+            },
+            crate::blr::DepEvent::Fid { ctx: c, id } => match ctx.get(c) {
+                Some(CtxBind::Relation(r)) => {
+                    if let Some(col) = relation_columns(file, page_size, r).iter().find(|col| col.field_id == *id) {
+                        deps.push((r.clone(), rel_type(file, r), Some(col.name.clone())));
+                    }
+                }
+                Some(CtxBind::Procedure(p)) => {
+                    if let Some(param) = procedure_param_name(file, page_size, p, 1, *id as i64) {
+                        deps.push((p.clone(), 5, Some(param)));
+                    }
+                }
+                None => {}
+            },
+            crate::blr::DepEvent::ExecProc { name: p } => deps.push((p.clone(), 5, None)),
+            crate::blr::DepEvent::ProcArg { proc, arg } => deps.push((proc.clone(), 5, Some(arg.clone()))),
+            crate::blr::DepEvent::GenId { name: g } => {
+                // a system generator is dropped (MET_store_dependency: sysGen)
+                if let Some((_, sys, _)) = find_generator(file, page_size, g) {
+                    if sys == 0 {
+                        deps.push((g.clone(), 14, None));
+                    }
+                }
+            }
+            crate::blr::DepEvent::Exception { name: e } => deps.push((e.clone(), 7, None)),
+            crate::blr::DepEvent::Function { name: f } => deps.push((f.clone(), 15, None)),
+            crate::blr::DepEvent::Domain { name: d } => deps.push((d.clone(), 9, None)),
+            crate::blr::DepEvent::RelField { relation: r, field: f } => {
+                deps.push((r.clone(), rel_type(file, r), Some(f.clone())));
+            }
+            crate::blr::DepEvent::Collation { ttype } => {
+                if let Some(coll) = collation_name(file, page_size, *ttype) {
+                    deps.push((coll, 17, None));
+                }
+            }
+        }
+    }
+    // a view's columns: the base field each names, on the relation of its
+    // context (RSR_base_field -> PAR_make_field -> PAR_dependency)
+    if kind == 1 {
+        let vrel_of_ctx: Vec<(i64, String)> = view_context_relations(file, page_size, name);
+        for (vctx, base) in view_base_fields(file, page_size, name) {
+            if let Some((_, r)) = vrel_of_ctx.iter().find(|(c, _)| *c == vctx) {
+                deps.push((r.clone(), rel_type(file, r), Some(base)));
+            }
+        }
+    }
+    // dedupe on (name, type, field), keeping the FIRST encounter - then
+    // the engine's pop order
+    let mut seen: Vec<(String, i64, Option<String>)> = Vec::new();
+    for d in deps {
+        if !seen.contains(&d) {
+            seen.push(d);
+        }
+    }
+    seen.reverse();
+
+    // MET_delete_dependencies for (name, kind)
+    if crate::resolve_relation(file, page_size, "RDB$DEPENDENCIES").is_some() {
+        let dn_f = sys_fid(file, page_size, "RDB$DEPENDENCIES", "RDB$DEPENDENT_NAME")?;
+        let dt_f = sys_fid(file, page_size, "RDB$DEPENDENCIES", "RDB$DEPENDENT_TYPE")?;
+        let want = name.to_string();
+        delete_catalog_rows(file, page_size, "RDB$DEPENDENCIES", move |v| text_eq(v.get(dn_f), &want) && int_eq(v.get(dt_f), kind))?;
+    }
+    let drel = crate::resolve_relation(file, page_size, "RDB$DEPENDENCIES").ok_or("no RDB$DEPENDENCIES relation")?;
+    for (on, otype, field) in &seen {
+        // the depended-on object's schema: a relation's own (a system
+        // relation lives in SYSTEM), PUBLIC for everything else here
+        let on_schema = if *otype == 0 || *otype == 1 {
+            sys_text_of(file, page_size, "RDB$RELATIONS", "RDB$RELATION_NAME", on, "RDB$SCHEMA_NAME").unwrap_or_else(|| "PUBLIC".into())
+        } else {
+            "PUBLIC".to_string()
+        };
+        let mut row: Vec<(&str, SysVal<'_>)> = vec![
+            ("RDB$DEPENDENT_NAME", SysVal::S(name)),
+            ("RDB$DEPENDED_ON_NAME", SysVal::S(on)),
+            ("RDB$DEPENDENT_TYPE", SysVal::I(kind)),
+            ("RDB$DEPENDED_ON_TYPE", SysVal::I(*otype)),
+            ("RDB$DEPENDENT_SCHEMA_NAME", SysVal::S("PUBLIC")),
+            ("RDB$DEPENDED_ON_SCHEMA_NAME", SysVal::S(&on_schema)),
+        ];
+        if let Some(f) = field {
+            row.push(("RDB$FIELD_NAME", SysVal::S(f)));
+        }
+        sys_insert(file, page_size, "RDB$DEPENDENCIES", drel, &row)?;
+    }
+    Ok(())
+}
+
+/// A procedure's parameter name by (RDB$PARAMETER_TYPE, RDB$PARAMETER_NUMBER).
+fn procedure_param_name(file: &crate::Image, page_size: usize, proc: &str, ptype: i64, number: i64) -> Option<String> {
+    let rel = crate::resolve_relation(file, page_size, "RDB$PROCEDURE_PARAMETERS")?;
+    let formats = system_relation_formats(file, page_size, "RDB$PROCEDURE_PARAMETERS")?;
+    let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
+    let cols = relation_columns(file, page_size, "RDB$PROCEDURE_PARAMETERS");
+    let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (p_f, n_f, t_f, num_f) = (fid("RDB$PROCEDURE_NAME")?, fid("RDB$PARAMETER_NAME")?, fid("RDB$PARAMETER_TYPE")?, fid("RDB$PARAMETER_NUMBER")?);
+    let mut out = None;
+    walk_rows(file, page_size, rel, descs, |v| {
+        if out.is_none() && text_eq(v.get(p_f), proc) && int_eq(v.get(t_f), ptype) && int_eq(v.get(num_f), number) {
+            if let Some(Value::Text(t)) = v.get(n_f) {
+                out = Some(t.trim_end().to_string());
+            }
+        }
+    });
+    out
+}
+
+/// A collation's name from a text type (charset id | collation id << 8).
+fn collation_name(file: &crate::Image, page_size: usize, ttype: u16) -> Option<String> {
+    let (cs, coll) = ((ttype & 0xff) as i64, (ttype >> 8) as i64);
+    let rel = crate::resolve_relation(file, page_size, "RDB$COLLATIONS")?;
+    let formats = system_relation_formats(file, page_size, "RDB$COLLATIONS")?;
+    let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
+    let cols = relation_columns(file, page_size, "RDB$COLLATIONS");
+    let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (n_f, cs_f, id_f) = (fid("RDB$COLLATION_NAME")?, fid("RDB$CHARACTER_SET_ID")?, fid("RDB$COLLATION_ID")?);
+    let mut out = None;
+    walk_rows(file, page_size, rel, descs, |v| {
+        if out.is_none() && int_eq(v.get(cs_f), cs) && int_eq(v.get(id_f), coll) {
+            if let Some(Value::Text(t)) = v.get(n_f) {
+                out = Some(t.trim_end().to_string());
+            }
+        }
+    });
+    out
+}
+
+/// A view's (context, base relation) pairs from RDB$VIEW_RELATIONS.
+fn view_context_relations(file: &crate::Image, page_size: usize, view: &str) -> Vec<(i64, String)> {
+    let mut out = Vec::new();
+    let (Some(rel), Some(formats)) = (
+        crate::resolve_relation(file, page_size, "RDB$VIEW_RELATIONS"),
+        system_relation_formats(file, page_size, "RDB$VIEW_RELATIONS"),
+    ) else {
+        return out;
+    };
+    let Some((_, descs)) = formats.iter().max_by_key(|(n, _)| *n) else { return out };
+    let cols = relation_columns(file, page_size, "RDB$VIEW_RELATIONS");
+    let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (Some(v_f), Some(r_f), Some(c_f)) = (fid("RDB$VIEW_NAME"), fid("RDB$RELATION_NAME"), fid("RDB$VIEW_CONTEXT")) else {
+        return out;
+    };
+    walk_rows(file, page_size, rel, descs, |v| {
+        if text_eq(v.get(v_f), view) {
+            if let (Some(Value::Text(r)), Some(Value::Int(c))) = (v.get(r_f), v.get(c_f)) {
+                out.push((*c, r.trim_end().to_string()));
+            }
+        }
+    });
+    out
+}
+
+/// A view's (context, base field) pairs from its RDB$RELATION_FIELDS rows.
+fn view_base_fields(file: &crate::Image, page_size: usize, view: &str) -> Vec<(i64, String)> {
+    let mut out = Vec::new();
+    let (Some(rel), Some(formats)) = (
+        crate::resolve_relation(file, page_size, "RDB$RELATION_FIELDS"),
+        system_relation_formats(file, page_size, "RDB$RELATION_FIELDS"),
+    ) else {
+        return out;
+    };
+    let Some((_, descs)) = formats.iter().max_by_key(|(n, _)| *n) else { return out };
+    let cols = relation_columns(file, page_size, "RDB$RELATION_FIELDS");
+    let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (Some(r_f), Some(b_f), Some(c_f)) = (fid("RDB$RELATION_NAME"), fid("RDB$BASE_FIELD"), fid("RDB$VIEW_CONTEXT")) else {
+        return out;
+    };
+    walk_rows(file, page_size, rel, descs, |v| {
+        if text_eq(v.get(r_f), view) {
+            if let (Some(Value::Text(b)), Some(Value::Int(c))) = (v.get(b_f), v.get(c_f)) {
+                let b = b.trim_end();
+                if !b.is_empty() {
+                    out.push((*c, b.to_string()));
+                }
+            }
+        }
+    });
+    out
+}
+
 /// Whether a matching `RDB$USER_PRIVILEGES` row already exists - by
 /// grantee, letter and field (`None` = the relation-level, NULL-field
 /// row) - so a re-`GRANT` does not duplicate it.

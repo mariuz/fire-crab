@@ -1057,6 +1057,9 @@ pub fn apply_ddl_deferred(
             crate::DdlDeferred::FieldChanged { name } => {
                 crate::ddl::field_changed(file, page_size, &name)?;
             }
+            crate::DdlDeferred::StoreDependencies { kind, name } => {
+                crate::ddl::store_dependencies_deferred(file, page_size, kind, &name)?;
+            }
             crate::DdlDeferred::DropIndexSlot { irt_page, slot } => {
                 let page = crate::page_mut(file, page_size, irt_page).ok_or("irt page out of range")?;
                 let at = 24 + slot * 24;
