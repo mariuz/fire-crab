@@ -172,6 +172,19 @@ pub enum DdlDeferred {
     /// b-tree cannot be built until they have.
     /// See [crate::ddl::create_index_storage].
     CreateIndexStorage { name: String },
+    /// rebuild a relation's RDB$RUNTIME summary at commit - posted when a
+    /// row that the summary carries lands after the relation's own
+    /// storage did (a trigger stored later: the engine loads a table's
+    /// triggers from the summary's RSR_trigger_name entries, so a summary
+    /// without them is a table whose triggers never fire)
+    RefreshRuntime { name: String },
+    /// a domain's row was MODIFIED after tables were built on it (gbak
+    /// stores RDB$COMPUTED_BLR / RDB$VALIDATION_BLR only once every
+    /// relation exists - restore.epp `update_global_field`): every table
+    /// using the domain re-derives its format from the catalog, taking a
+    /// new version when the layout changed (a column that became
+    /// COMPUTED), and its summary
+    FieldChanged { name: String },
 }
 
 impl Image {

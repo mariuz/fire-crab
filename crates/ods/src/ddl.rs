@@ -716,6 +716,49 @@ pub struct ArrayShape {
     pub dims: Vec<(i32, i32)>,
 }
 
+/// An `Ods::InternalArrayDesc` (ods.h:1044, 16 + 24 per dimension) for a
+/// shape - what the engine stores ahead of an array's elements and
+/// carries in the runtime summary. The last dimension varies fastest
+/// (stride 1).
+pub fn array_desc_bytes(sh: &ArrayShape) -> Vec<u8> {
+    // `sh.length` is already the slot ([array_shape] adds the length
+    // word for a VARYING) - adding it again here made 19-byte elements
+    // the engine read as blanks (measured: 40 + 95 against its 40 + 85)
+    let elem_len: u16 = sh.length;
+    let mut dims: Vec<(u32, i32, i32)> = sh.dims.iter().map(|&(lo, hi)| (0u32, lo, hi)).collect();
+    let mut count: u32 = 1;
+    for d in dims.iter_mut().rev() {
+        d.0 = count;
+        count *= (d.2 - d.1 + 1).max(0) as u32;
+    }
+    let header_len = 16 + 24 * dims.len().max(1);
+    let mut h = Vec::with_capacity(header_len);
+    h.push(1); // iad_version
+    h.push(dims.len() as u8); // iad_dimensions
+    h.extend_from_slice(&1u16.to_le_bytes()); // iad_struct_count
+    h.extend_from_slice(&elem_len.to_le_bytes()); // iad_element_length
+    h.extend_from_slice(&(header_len as u16).to_le_bytes()); // iad_length
+    h.extend_from_slice(&count.to_le_bytes()); // iad_count
+    h.extend_from_slice(&(count * u32::from(elem_len)).to_le_bytes()); // iad_total_length
+    for (i, (stride, lo, hi)) in dims.iter().enumerate() {
+        if i == 0 {
+            // iad_desc: the element descriptor, in the first repeat only
+            h.push(sh.dtype);
+            h.push(sh.scale as u8);
+            h.extend_from_slice(&elem_len.to_le_bytes());
+            h.extend_from_slice(&sh.sub_type.to_le_bytes());
+            h.extend_from_slice(&0u16.to_le_bytes()); // dsc_flags
+            h.extend_from_slice(&0u32.to_le_bytes()); // dsc_address
+        } else {
+            h.extend_from_slice(&[0u8; 12]);
+        }
+        h.extend_from_slice(&stride.to_le_bytes()); // iad_length: the stride
+        h.extend_from_slice(&lo.to_le_bytes());
+        h.extend_from_slice(&hi.to_le_bytes());
+    }
+    h
+}
+
 /// The shape of `relation`.`field`, or None when it is not an array
 /// column (or unknown)
 pub fn array_shape(file: &crate::Image, page_size: usize, relation: &str, field: &str) -> Option<ArrayShape> {
@@ -1076,6 +1119,15 @@ fn rebuild_runtime_blob(
         }
     }
 
+    if std::env::var_os("FC_DDL_TRACE").is_some() {
+        eprintln!(
+            "[ddl] runtime {table}: fields {:?} computed {} defaults {} validations {}",
+            fields.iter().map(|f| f.2.clone()).collect::<Vec<_>>(),
+            computed_blobs.len(),
+            domain_defaults.len(),
+            domain_validations.len()
+        );
+    }
     let seg = |tag: u8, data: &[u8]| {
         let mut s = Vec::with_capacity(1 + data.len());
         s.push(tag);
@@ -1096,6 +1148,16 @@ fn rebuild_runtime_blob(
         }
         let qsrc = format!("\"PUBLIC\".\"{}\"", src);
         runtime.push(seg(25, qsrc.as_bytes())); // RSR_field_source
+        // an ARRAY column: RSR_dimensions (10) - the count, a u16 the
+        // engine reads from the segment's first two bytes (met.epp:3518,
+        // `n`) - then RSR_array_desc (11), the Ods::InternalArrayDesc it
+        // memcpy's over the ArrayField it just made. Without these the
+        // engine's DSQL answers "scalar operator used on field ... which
+        // is not an array" for a column whose catalog says it is one.
+        if let Some(shape) = array_shape(file, page_size, table, name) {
+            runtime.push(seg(10, &(shape.dims.len() as u16).to_le_bytes()));
+            runtime.push(seg(11, &array_desc_bytes(&shape)));
+        }
         let char_len = match d.dtype {
             dtype::VARYING => Some(d.length.saturating_sub(2)),
             dtype::TEXT => Some(d.length),
@@ -1158,11 +1220,19 @@ fn rebuild_runtime_blob(
 }
 
 /// The names of a relation's triggers in the order the engine lists
-/// them in the relation's `RDB$RUNTIME` summary: by (RDB$TRIGGER_
-/// SEQUENCE, then name LEXICALLY) - probed three ways: user triggers at
-/// positions 0/1/5 list in position order regardless of name or event;
-/// same-position triggers list lexically (CHECK_10 before CHECK_7); the
-/// event type does not participate.
+/// them in the relation's `RDB$RUNTIME` summary - which is the order it
+/// FIRES same-position triggers in. Two passes, as `RelationNode`'s
+/// summary writer makes them (DdlNodes.epp:9190-9250): first the USER
+/// triggers that are not a constraint's (system flag 0, not named by an
+/// RDB$CHECK_CONSTRAINTS row of a CHECK or FOREIGN KEY constraint),
+/// then the CONSTRAINT triggers (system flag 3..5, or a user-flag trigger
+/// a CHECK / FOREIGN KEY constraint names), each pass `SORTED BY
+/// RDB$TRIGGER_SEQUENCE`, inactive triggers skipped. Within a position
+/// the pass lists lexically (probed: CHECK_10 before CHECK_7). The
+/// split is not cosmetic: on the employee sample a BEFORE INSERT
+/// `SET_EMP_NO` at position 0 must run before `CHECK_3` at position 0,
+/// or a row that fails its check never draws the generator the engine
+/// draws for it.
 fn relation_trigger_names(file: &crate::Image, page_size: usize, table: &str) -> Vec<String> {
     let (Some(rel), Some(formats)) = (
         crate::resolve_relation(file, page_size, "RDB$TRIGGERS"),
@@ -1175,32 +1245,94 @@ fn relation_trigger_names(file: &crate::Image, page_size: usize, table: &str) ->
     };
     let cols = relation_columns(file, page_size, "RDB$TRIGGERS");
     let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
-    let (Some(name_f), Some(rn_f), Some(type_f), Some(seq_f)) = (
-        fid("RDB$TRIGGER_NAME"),
-        fid("RDB$RELATION_NAME"),
-        fid("RDB$TRIGGER_TYPE"),
-        fid("RDB$TRIGGER_SEQUENCE"),
-    ) else {
+    let (Some(name_f), Some(rn_f), Some(seq_f)) =
+        (fid("RDB$TRIGGER_NAME"), fid("RDB$RELATION_NAME"), fid("RDB$TRIGGER_SEQUENCE"))
+    else {
         return Vec::new();
     };
-    let mut trigs: Vec<(i64, i64, String)> = Vec::new();
-    walk_rows(file, page_size, rel, descs, |v| {
-        if text_is(v.get(rn_f), table) {
-            if let Some(Value::Text(t)) = v.get(name_f) {
-                let ttype = match v.get(type_f) {
-                    Some(Value::Int(n)) => *n,
-                    _ => 0,
-                };
-                let seq = match v.get(seq_f) {
-                    Some(Value::Int(n)) => *n,
-                    _ => 0,
-                };
-                trigs.push((ttype, seq, t.trim_end().to_string()));
+    let sys_f = fid("RDB$SYSTEM_FLAG");
+    let inactive_f = fid("RDB$TRIGGER_INACTIVE");
+    let int = |v: Option<&Value>| match v {
+        Some(Value::Int(n)) => *n,
+        _ => 0,
+    };
+    // the triggers a CHECK / FOREIGN KEY constraint of this table names
+    let constraint_triggers: std::collections::HashSet<String> = {
+        let mut names: Vec<String> = Vec::new();
+        if let (Some(rc_rel), Some(rc_formats)) = (
+            crate::resolve_relation(file, page_size, "RDB$RELATION_CONSTRAINTS"),
+            system_relation_formats(file, page_size, "RDB$RELATION_CONSTRAINTS"),
+        ) {
+            if let Some((_, rc_descs)) = rc_formats.iter().max_by_key(|(n, _)| *n) {
+                let rc_cols = relation_columns(file, page_size, "RDB$RELATION_CONSTRAINTS");
+                let rf = |n: &str| rc_cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+                if let (Some(cn_f), Some(ct_f), Some(crn_f)) =
+                    (rf("RDB$CONSTRAINT_NAME"), rf("RDB$CONSTRAINT_TYPE"), rf("RDB$RELATION_NAME"))
+                {
+                    walk_rows(file, page_size, rc_rel, rc_descs, |v| {
+                        if !text_is(v.get(crn_f), table) {
+                            return;
+                        }
+                        let kind = match v.get(ct_f) {
+                            Some(Value::Text(t)) => t.trim_end().to_string(),
+                            _ => return,
+                        };
+                        if kind != "CHECK" && kind != "FOREIGN KEY" {
+                            return;
+                        }
+                        if let Some(Value::Text(t)) = v.get(cn_f) {
+                            names.push(t.trim_end().to_string());
+                        }
+                    });
+                }
             }
         }
+        let mut out = std::collections::HashSet::new();
+        if !names.is_empty() {
+            if let (Some(cc_rel), Some(cc_formats)) = (
+                crate::resolve_relation(file, page_size, "RDB$CHECK_CONSTRAINTS"),
+                system_relation_formats(file, page_size, "RDB$CHECK_CONSTRAINTS"),
+            ) {
+                if let Some((_, cc_descs)) = cc_formats.iter().max_by_key(|(n, _)| *n) {
+                    let cc_cols = relation_columns(file, page_size, "RDB$CHECK_CONSTRAINTS");
+                    let cf = |n: &str| cc_cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+                    if let (Some(ccn_f), Some(ctn_f)) = (cf("RDB$CONSTRAINT_NAME"), cf("RDB$TRIGGER_NAME")) {
+                        walk_rows(file, page_size, cc_rel, cc_descs, |v| {
+                            let (Some(Value::Text(c)), Some(Value::Text(t))) = (v.get(ccn_f), v.get(ctn_f)) else {
+                                return;
+                            };
+                            if names.iter().any(|n| n == c.trim_end()) {
+                                out.insert(t.trim_end().to_string());
+                            }
+                        });
+                    }
+                }
+            }
+        }
+        out
+    };
+    let mut user: Vec<(i64, String)> = Vec::new();
+    let mut constraint: Vec<(i64, String)> = Vec::new();
+    walk_rows(file, page_size, rel, descs, |v| {
+        if !text_is(v.get(rn_f), table) {
+            return;
+        }
+        let Some(Value::Text(t)) = v.get(name_f) else { return };
+        if inactive_f.map(|f| int(v.get(f))) == Some(1) {
+            return;
+        }
+        let name = t.trim_end().to_string();
+        let seq = int(v.get(seq_f));
+        let sys = sys_f.map(|f| int(v.get(f))).unwrap_or(0);
+        if (3..=5).contains(&sys) || constraint_triggers.contains(&name) {
+            constraint.push((seq, name));
+        } else if sys == 0 {
+            user.push((seq, name));
+        }
     });
-    trigs.sort_by(|(_, s1, n1), (_, s2, n2)| s1.cmp(s2).then_with(|| n1.cmp(n2)));
-    trigs.into_iter().map(|(_, _, n)| n).collect()
+    user.sort();
+    constraint.sort();
+    user.into_iter().chain(constraint).map(|(_, n)| n).collect()
 }
 
 /// `ALTER TABLE <table> ADD <column>`: append one column to an existing
@@ -2240,6 +2372,10 @@ pub fn field_type_to_dtype(ft: i16) -> Option<u8> {
         23 => dtype::BOOLEAN,
         14 => dtype::TEXT,
         37 => dtype::VARYING,
+        // blr_blob is 261 in the catalog (blr_blob = 261, blr.h), the
+        // 8-byte id in the record; blr_quad the same width
+        261 => dtype::BLOB,
+        9 => dtype::QUAD,
         _ => return None,
     })
 }
@@ -3578,6 +3714,110 @@ fn refresh_runtime(file: &mut crate::Image, page_size: usize, table: &str) -> Re
     if let Some((orel, onum)) = old_rt {
         dispose_superseded_blob(file, page_size, orel, onum);
         dispose_row_purge(file, page_size, 6, page, slot);
+    }
+    Ok(())
+}
+
+/// The commit-time half of a trigger (or anything else the summary
+/// carries) that landed after its relation was built: the summary is
+/// rebuilt from the catalog as it now stands. Reads WIDE, as every
+/// deferred task does - the rows it exists to pick up are this
+/// transaction's own. A relation with no storage yet (its own task is
+/// later in the same list, or it is a view without a format) is left to
+/// that task.
+pub fn refresh_runtime_deferred(file: &mut crate::Image, page_size: usize, table: &str) -> Result<(), String> {
+    let _wide = crate::tra::ReaderViewGuard::wide();
+    let Some(rel) = crate::resolve_relation(file, page_size, table) else {
+        return Ok(()); // a database trigger, or a relation this server does not know
+    };
+    if crate::relation_formats(file, page_size, rel).is_empty() {
+        return Ok(());
+    }
+    refresh_runtime(file, page_size, table)
+}
+
+/// A domain's row changed under the tables built on it: each dependent
+/// table re-derives its layout from the catalog. A layout that differs
+/// from the current format - a column whose RDB$COMPUTED_BLR arrived
+/// late and now has no storage - is a NEW FORMAT VERSION (the engine's
+/// dfw modify_field -> make_version: the employee sample's three tables
+/// with computed columns end their restore at RDB$FORMAT 2 for exactly
+/// this reason); existing records keep their format and read back
+/// through it. An unchanged layout only refreshes the summary, which
+/// now carries the validation / computed BLR.
+pub fn field_changed(file: &mut crate::Image, page_size: usize, field: &str) -> Result<(), String> {
+    let _wide = crate::tra::ReaderViewGuard::wide();
+    let mut tables: Vec<String> = domain_dependents(file, page_size, field)?
+        .into_iter()
+        .map(|(t, _)| t)
+        .collect();
+    tables.sort();
+    tables.dedup();
+    for table in tables {
+        let Some(rel) = crate::resolve_relation(file, page_size, &table) else { continue };
+        let cur_formats = crate::relation_formats(file, page_size, rel);
+        let Some((cur_no, cur_descs)) = cur_formats.iter().max_by_key(|(n, _)| *n) else {
+            continue; // not built yet: its own storage task reads the catalog as it stands
+        };
+        if is_view(file, page_size, &table) {
+            refresh_runtime(file, page_size, &table)?;
+            continue;
+        }
+        let fields = catalog_field_list(file, page_size, &table)?;
+        if fields.is_empty() {
+            continue;
+        }
+        let new_descs = compute_format_mixed(&fields);
+        let same = new_descs.len() == cur_descs.len()
+            && new_descs.iter().zip(cur_descs.iter()).all(|(a, b)| {
+                a.dtype == b.dtype && a.length == b.length && a.scale == b.scale && a.sub_type == b.sub_type && a.offset == b.offset
+            });
+        if same {
+            refresh_runtime(file, page_size, &table)?;
+            continue;
+        }
+        let new_format_no = *cur_no as i64 + 1;
+        let fmt_blob = write_format_blob(file, page_size, &new_descs)?;
+        sys_insert(
+            file,
+            page_size,
+            "RDB$FORMATS",
+            8,
+            &[
+                ("RDB$RELATION_ID", SysVal::I(rel as i64)),
+                ("RDB$FORMAT", SysVal::I(new_format_no)),
+                ("RDB$DESCRIPTOR", SysVal::B(blob_id_bytes(8, fmt_blob))),
+            ],
+        )?;
+        let runtime = rebuild_runtime_blob(file, page_size, &table, &new_descs)?;
+        let (rel_page, rel_slot, mut rel_image, rec_format) =
+            find_relations_row(file, page_size, &table).ok_or("RDB$RELATIONS row not found")?;
+        let sys_formats = system_relation_formats(file, page_size, "RDB$RELATIONS")
+            .ok_or("no RDB$RELATIONS format")?;
+        let (_, rel_descs) = sys_formats.iter().max_by_key(|(n, _)| *n).ok_or("empty format")?;
+        let rel_cols = relation_columns(file, page_size, "RDB$RELATIONS");
+        let rel_field =
+            |name: &str| rel_cols.iter().find(|c| c.name == name).map(|c| c.field_id as usize);
+        let old_rt = rel_field("RDB$RUNTIME").and_then(|f| old_blob_at(&rel_image, rel_descs, f));
+        for (name, v) in [
+            ("RDB$FORMAT", SysVal::I(new_format_no)),
+            ("RDB$RUNTIME", SysVal::B(blob_id_bytes(6, runtime))),
+        ] {
+            let fid = rel_field(name).ok_or_else(|| format!("no {} column", name))?;
+            let d = rel_descs.get(fid).ok_or("field beyond format")?;
+            let bytes = encode_sys_value(d, &v)?;
+            let at = d.offset as usize;
+            rel_image
+                .get_mut(at..at + bytes.len())
+                .ok_or("image shorter than format")?
+                .copy_from_slice(&bytes);
+            rel_image[fid / 8] &= !(1 << (fid % 8));
+        }
+        dml::update_records(file, page_size, 6, &[(rel_page, rel_slot, rel_image)], rec_format)?;
+        if let Some((orel, onum)) = old_rt {
+            dispose_superseded_blob(file, page_size, orel, onum);
+            dispose_row_purge(file, page_size, 6, rel_page, rel_slot);
+        }
     }
     Ok(())
 }
@@ -8412,6 +8652,15 @@ pub fn create_relation_storage(
     if crate::btr::find_index_root(file, page_size, rel).is_some() {
         return Ok(());
     }
+    // A VIEW GETS A FORMAT AND NOTHING TO STORE IT IN. The engine's own
+    // restore leaves a view with one RDB$FORMATS row and no RDB$PAGES
+    // (measured on the employee sample's PHONE_LIST: fmts 1, pgs 0), and
+    // a DBKEY_LENGTH of 8 per context - what [restore_view_with] writes
+    // for fire-crab's own CREATE VIEW. Laying a view out as a table gave
+    // it a pointer page and a root page it would never use.
+    if is_view(file, page_size, name) {
+        return create_view_storage(file, page_size, name, rel);
+    }
     let fields = catalog_field_list(file, page_size, name)?;
     if fields.is_empty() {
         return Err(format!("relation {name} has no columns to lay out"));
@@ -8487,8 +8736,81 @@ pub fn create_relation_storage(
         &[
             ("RDB$FORMAT", SysVal::I(1)),
             ("RDB$FIELD_ID", SysVal::I(descs.len() as i64)),
-            ("RDB$DBKEY_LENGTH", SysVal::I(8)),
+            // gbak never sends RDB$DBKEY_LENGTH for a table and the
+            // engine's restored row reads 0 (measured on every employee
+            // table; met.epp:3243 reads 0 as 8). DDL's 8 is
+            // CreateRelationNode's, not dfw_create_relation's.
+            ("RDB$DBKEY_LENGTH", SysVal::I(0)),
             ("RDB$RUNTIME", SysVal::B(blob_id_bytes(6, runtime))),
+        ],
+    )?;
+    Ok(())
+}
+
+/// The commit-time half of a VIEW that arrived as catalog rows: its
+/// format (each column's descriptor from the domain its
+/// `RDB$FIELD_SOURCE` names, laid out the way [restore_view_with] does),
+/// `RDB$FORMAT` = 1, the field count, and a dbkey length of 8 per
+/// `RDB$VIEW_RELATIONS` context - the rows gbak stores right after the
+/// view's columns and before it commits. Idempotent through
+/// `RDB$FORMAT`: a view that already names its format has been here.
+fn create_view_storage(
+    file: &mut crate::Image,
+    page_size: usize,
+    name: &str,
+    rel: u16,
+) -> Result<(), String> {
+    let has_format = relation_columns(file, page_size, "RDB$RELATIONS")
+        .iter()
+        .find(|c| c.name == "RDB$FORMAT")
+        .map(|c| c.field_id as usize)
+        .and_then(|fid| {
+            let formats = system_relation_formats(file, page_size, "RDB$RELATIONS")?;
+            let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
+            let name_fid = sys_fid(file, page_size, "RDB$RELATIONS", "RDB$RELATION_NAME").ok()?;
+            let mut found = None;
+            walk_rows(file, page_size, 6, descs, |vals| {
+                if matches!(vals.get(name_fid), Some(Value::Text(t)) if t.trim_end() == name) {
+                    found = Some(matches!(vals.get(fid), Some(Value::Int(_))));
+                }
+            });
+            found
+        })
+        .unwrap_or(false);
+    if has_format {
+        return Ok(());
+    }
+    let fields = catalog_field_list(file, page_size, name)?;
+    if fields.is_empty() {
+        return Err(format!("view {name} has no columns to describe"));
+    }
+    let descs = compute_format_mixed(&fields);
+    let fmt_blob = write_format_blob(file, page_size, &descs)?;
+    sys_insert(
+        file,
+        page_size,
+        "RDB$FORMATS",
+        8,
+        &[
+            ("RDB$RELATION_ID", SysVal::I(rel as i64)),
+            ("RDB$FORMAT", SysVal::I(1)),
+            ("RDB$DESCRIPTOR", SysVal::B(blob_id_bytes(8, fmt_blob))),
+        ],
+    )?;
+    // RDB$DBKEY_LENGTH is the client's (gbak's "adjusting views dbkey
+    // length" pass MODIFIES it itself; the engine's restore ends with
+    // 0 on the employee view - measured)
+    let want = name.to_string();
+    let name_fid = sys_fid(file, page_size, "RDB$RELATIONS", "RDB$RELATION_NAME")?;
+    patch_sys_row(
+        file,
+        page_size,
+        "RDB$RELATIONS",
+        6,
+        move |v| matches!(v.get(name_fid), Some(Value::Text(t)) if t.trim_end() == want),
+        &[
+            ("RDB$FORMAT", SysVal::I(1)),
+            ("RDB$FIELD_ID", SysVal::I(descs.len() as i64)),
         ],
     )?;
     Ok(())
@@ -8533,6 +8855,9 @@ fn catalog_field_list(
     if members.is_empty() {
         return Ok(Vec::new());
     }
+    if std::env::var_os("FC_DDL_TRACE").is_some() {
+        eprintln!("[ddl] catalog_field_list {table}: members {members:?}");
+    }
 
     let f_formats =
         system_relation_formats(file, page_size, "RDB$FIELDS").ok_or("no RDB$FIELDS format")?;
@@ -8547,6 +8872,8 @@ fn catalog_field_list(
     let fs_f = ffid("RDB$FIELD_SCALE");
     let fsub_f = ffid("RDB$FIELD_SUB_TYPE");
     let fcomp_f = ffid("RDB$COMPUTED_BLR");
+    let fdims_f = ffid("RDB$DIMENSIONS");
+    let fcs_f = ffid("RDB$CHARACTER_SET_ID");
     let mut sources: Vec<(String, (u8, u16, i8, i16, bool))> = Vec::new();
     walk_rows(file, page_size, 2, f_descs, |vals| {
         let Some(fname) = text(vals.get(fn_f)) else { return };
@@ -8581,10 +8908,21 @@ fn catalog_field_list(
         };
         let computed =
             matches!(fcomp_f.and_then(|i| vals.get(i)), Some(Value::Blob(..)));
-        sources.push((
-            fname,
-            (dt, len, int_at(fs_f) as i8, int_at(fsub_f) as i16, computed),
-        ));
+        // the same tuple [col_field_of] builds for a parsed column: an
+        // ARRAY (RDB$DIMENSIONS > 0) is stored as its 8-byte array id
+        // whatever its element type; a BLOB is its 8-byte id, sub_type
+        // carried and the CHARACTER SET where a scale would be. Both
+        // used to fall out of the `field_type_to_dtype` match and be
+        // reported as a missing RDB$FIELDS row - JOB's RDB$3 in the
+        // employee sample.
+        let tuple = if int_at(fdims_f) > 0 {
+            (crate::format::dtype::ARRAY, 8, 0, 0, false)
+        } else if dt == crate::format::dtype::BLOB {
+            (dt, 8, int_at(fcs_f) as i8, int_at(fsub_f) as i16, computed)
+        } else {
+            (dt, len, int_at(fs_f) as i8, int_at(fsub_f) as i16, computed)
+        };
+        sources.push((fname, tuple));
     });
 
     let width = members.iter().map(|(id, _)| id + 1).max().unwrap_or(0);
@@ -8856,6 +9194,7 @@ pub fn insert_system_row(
                     SysValue::Text(t) => SysVal::S(t),
                     SysValue::Int(n) => SysVal::I(*n),
                     SysValue::Double(d) => SysVal::F(*d),
+                    SysValue::Blob(b) => SysVal::B(*b),
                     SysValue::Null => SysVal::Null,
                 },
             )
@@ -8898,6 +9237,7 @@ pub fn patch_system_row(
                     SysValue::Text(t) => SysVal::S(t),
                     SysValue::Int(n) => SysVal::I(*n),
                     SysValue::Double(d) => SysVal::F(*d),
+                    SysValue::Blob(b) => SysVal::B(*b),
                     SysValue::Null => SysVal::Null,
                 },
             )
@@ -8915,6 +9255,9 @@ pub enum SysValue<'a> {
     Int(i64),
     /// a DOUBLE PRECISION catalog column - an index's selectivity
     Double(f64),
+    /// a blob column: the 8 on-disk bid bytes of a blob ALREADY
+    /// materialised in the target relation
+    Blob([u8; 8]),
     Null,
 }
 
@@ -9374,6 +9717,33 @@ pub fn set_sequence_value(
     gen::write(file, page_size, id, value)
 }
 
+/// The next number a SYSTEM GENERATOR hands out for a metadata object -
+/// `RDB$EXCEPTIONS` for an exception's number, `RDB$PROCEDURES` for a
+/// procedure's id, `RDB$FUNCTIONS` for a function's (vio.cpp
+/// `set_metadata_id` -> `DYN_UTIL_gen_unique_id`, when the stored row
+/// left the column NULL, as gbak's does). The engine's SSHORT cast is
+/// kept: the ids are shorts.
+pub fn next_metadata_id(file: &mut crate::Image, page_size: usize, generator: &str) -> Result<i64, String> {
+    let slot = generator_id_by_name(file, page_size, generator)
+        .ok_or_else(|| format!("no {generator} generator"))?;
+    Ok(gen::bump(file, page_size, slot, 1)? as i16 as i64)
+}
+
+/// The next generator id, the engine's way: drawn from the MASTER
+/// generator modulo `MAX_SSHORT + 1`, zero skipped, retried while it
+/// names a live generator (`set_metadata_id` in vio.cpp, which a
+/// gbak-stored `RDB$GENERATORS` row with a NULL id goes through at store
+/// time; `DYN_UTIL_gen_unique_id` for DDL).
+pub fn next_generator_id(file: &mut crate::Image, page_size: usize) -> Result<i64, String> {
+    for _ in 0..=u16::MAX {
+        let next = gen::bump(file, page_size, gen::MASTER, 1)? % (i16::MAX as i64 + 1);
+        if next != 0 && !generator_id_taken(file, page_size, next) {
+            return Ok(next);
+        }
+    }
+    Err("no free generator id".into())
+}
+
 fn write_generator(
     file: &mut crate::Image,
     page_size: usize,
@@ -9384,17 +9754,7 @@ fn write_generator(
 ) -> Result<(), String> {
     let rel = crate::resolve_relation(file, page_size, "RDB$GENERATORS")
         .ok_or("no RDB$GENERATORS relation")?;
-    let mut id = 0;
-    for _ in 0..=u16::MAX {
-        let next = gen::bump(file, page_size, gen::MASTER, 1)? % (i16::MAX as i64 + 1);
-        if next != 0 && !generator_id_taken(file, page_size, next) {
-            id = next;
-            break;
-        }
-    }
-    if id == 0 {
-        return Err("no free generator id".into());
-    }
+    let id = next_generator_id(file, page_size)?;
     let class = next_security_class(file, page_size, ACL_SEQUENCE_OWNER)?;
     sys_insert(
         file,

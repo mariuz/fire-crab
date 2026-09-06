@@ -338,6 +338,8 @@ impl ArrayDesc {
             d.0 = count;
             count *= (d.2 - d.1 + 1).max(0) as u32;
         }
+        // `sh.length` is the element's SLOT - a VARYING's `vary`, length
+        // word included ([fire_crab_ods::ddl::array_shape])
         ArrayDesc { dtype: sh.dtype, scale: sh.scale, elem_len: sh.length, sub_type: sh.sub_type, dims }
     }
     fn count(&self) -> u32 {
@@ -488,6 +490,19 @@ fn parse_sdl(b: &[u8]) -> Option<Sdl> {
                     // the stream whole (isc_invalid_sdl), where a guess would
                     // desync it
                     14 | 40 => (dtype::TEXT, 0),
+                    // blr_text2: a charset word, then the length word
+                    15 => (dtype::TEXT, 0),
+                    // blr_varying (37) / blr_varying2 (38): SDL_info types
+                    // the element dtype_cstring with dsc_length =
+                    // sizeof(USHORT) + the declared length (sdl.cpp:825-834,
+                    // 940-946), so its wire form is xdr_datum's cstring
+                    // case - a 4-byte length, the bytes, padded to 4 - and
+                    // its memory slot is length + 2: the `vary` the stored
+                    // array element is. gbak's restore of a VARCHAR array
+                    // column sends exactly this (restore.epp: blr_varying2 +
+                    // charset + length; the slice sized `fld_length +
+                    // sizeof(USHORT)` per element)
+                    37 | 38 => (dtype::VARYING, 0),
                     _ => return None,
                 };
                 out.dtype = dt;
@@ -497,9 +512,15 @@ fn parse_sdl(b: &[u8]) -> Option<Sdl> {
                         out.scale = *b.get(i)? as i8;
                         i += 1;
                     }
-                    14 | 40 => {
+                    14 | 40 | 15 | 37 | 38 => {
+                        if matches!(blr, 15 | 38) {
+                            i += 2; // the charset word
+                        }
                         out.elem_len = u16::from_le_bytes([*b.get(i)?, *b.get(i + 1)?]);
                         i += 2;
+                        if dt == dtype::VARYING {
+                            out.elem_len += 2;
+                        }
                     }
                     _ => {}
                 }
@@ -613,6 +634,15 @@ fn xdr_element(w: &mut Vec<u8>, dtype: u8, bytes: &[u8]) {
             w.extend_from_slice(&u32::from_le_bytes(bytes[0..4].try_into().unwrap()).to_be_bytes());
             w.extend_from_slice(&u32::from_le_bytes(bytes[4..8].try_into().unwrap()).to_be_bytes());
         }
+        // a `vary` slot: its length as a 4-byte xdr short, then the bytes
+        // padded to 4 (xdr_datum, the element typed cstring by SDL_info)
+        dtype::VARYING if bytes.len() >= 2 => {
+            let n = (u16::from_le_bytes([bytes[0], bytes[1]]) as usize).min(bytes.len() - 2);
+            w.extend_from_slice(&(n as u32).to_be_bytes());
+            w.extend_from_slice(&bytes[2..2 + n]);
+            let pad = (4 - n % 4) % 4;
+            w.extend(std::iter::repeat(0u8).take(pad));
+        }
         _ => {
             w.extend_from_slice(bytes);
             let pad = (4 - bytes.len() % 4) % 4;
@@ -716,6 +746,19 @@ fn unxdr_element(b: &[u8], at: &mut usize, dtype: u8, elem_len: usize) -> Option
         dtype::TIMESTAMP => {
             let mut v = u32::from_be_bytes(take(at, 4)?.try_into().unwrap()).to_le_bytes().to_vec();
             v.extend_from_slice(&u32::from_be_bytes(take(at, 4)?.try_into().unwrap()).to_le_bytes());
+            v
+        }
+        // the wire's length-prefixed bytes into a `vary` slot of elem_len:
+        // u16 length, the bytes (cut to the slot), zero-filled
+        dtype::VARYING if elem_len >= 2 => {
+            let n = u32::from_be_bytes(take(at, 4)?.try_into().unwrap()) as usize;
+            let body = take(at, n)?.to_vec();
+            take(at, (4 - n % 4) % 4)?;
+            let keep = n.min(elem_len - 2);
+            let mut v = Vec::with_capacity(elem_len);
+            v.extend_from_slice(&(keep as u16).to_le_bytes());
+            v.extend_from_slice(&body[..keep]);
+            v.resize(elem_len, 0);
             v
         }
         _ => {
@@ -5131,6 +5174,56 @@ fn create_database_file(path: &str, want: CreateDpb) -> Result<(), String> {
     // RDB$SCHEMAS' own unique index and the whole thing stops there.
     if want.restore_has_schema {
         remove_public_schema(p)?;
+        remove_public_schema_grants(p)?;
+    }
+    Ok(())
+}
+
+/// ...and the grants that came with it. A database the ENGINE creates for
+/// a gbak attachment carrying `isc_dpb_gbak_restore_has_schema` skips the
+/// PUBLIC schema's own USAGE grants and the DDL-object grants scoped to
+/// PUBLIC (ini.epp:577-583, 819: `!isGbak() ||
+/// !ATT_gbak_restore_has_schema`) - the backup brings them. The file
+/// here was created without that flag, so those rows are removed
+/// afterwards; left in place, the restore stored the backup's copies
+/// beside them and every one was doubled (measured: 6 rows per DDL
+/// object type against the engine's 3, and `GRANT USAGE ON SCHEMA
+/// PUBLIC TO PUBLIC` twice).
+fn remove_public_schema_grants(path: &str) -> Result<(), String> {
+    let mut db = load_database(path).ok_or("created file is not a decodable database")?;
+    let rel = fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, "RDB$USER_PRIVILEGES")
+        .ok_or("no RDB$USER_PRIVILEGES in the created database")?;
+    let columns = db.columns("RDB$USER_PRIVILEGES");
+    let fid = |n: &str| columns.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (Some(type_f), Some(name_f), Some(schema_f)) =
+        (fid("RDB$OBJECT_TYPE"), fid("RDB$RELATION_NAME"), fid("RDB$RELATION_SCHEMA_NAME"))
+    else {
+        return Ok(()); // a pre-schema ODS has none of this
+    };
+    let mut work = db.work_copy()?;
+    let mut removed_any = false;
+    loop {
+        let removed = fire_crab_ods::ddl::delete_system_row(&mut work, db.page_size, "RDB$USER_PRIVILEGES", rel, |v| {
+            let ty = match v.get(type_f) {
+                Some(Value::Int(n)) => *n,
+                _ => return false,
+            };
+            let text = |i: usize| match v.get(i) {
+                Some(Value::Text(t)) => Some(t.trim_end()),
+                _ => None,
+            };
+            // obj_schema = 38: the PUBLIC schema's own grants; a DDL
+            // object type (22 and up) scoped to the PUBLIC schema
+            (ty == 38 && text(name_f) == Some("PUBLIC")) || (ty >= 22 && text(schema_f) == Some("PUBLIC"))
+        })?;
+        if !removed {
+            break;
+        }
+        removed_any = true;
+    }
+    if removed_any {
+        db.install_dirty(work);
+        db.flush_dirty()?;
     }
     Ok(())
 }
@@ -29556,8 +29649,16 @@ enum WireParam {
 /// out in the XDR message.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum PSlot {
-    /// blr_quad - a blob id, 8 bytes
+    /// blr_quad - 8 bytes: an ARRAY's id (gbak's batch declares an array
+    /// column SQL_QUAD, restore.epp `prepareBatch`), or a blob id from a
+    /// client that types its blob parameters that way (node's
+    /// SQLParamQuad)
     Quad,
+    /// blr_blob2 - a BLOB parameter as libfbclient describes SQL_BLOB
+    /// (utils.cpp `fb_utils::sqlTypeToBlr`): the same 8-byte id, but the
+    /// one kind a BATCH translates through its blob map
+    /// (DsqlBatch::m_blobMeta lists SQL_BLOB parameters only)
+    Blob,
     /// blr_text: `len` bytes, padded to 4 (no length prefix)
     Text(usize),
     /// blr_varying: 4-byte BE length + bytes + padding
@@ -29648,7 +29749,7 @@ fn parse_param_blr(b: &[u8]) -> Option<Vec<PSlot>> {
                 // SQLParamQuad sends blr_quad); the value is the same
                 // 8-byte id
                 i += 4;
-                PSlot::Quad
+                PSlot::Blob
             }
             _ => return None, // int128, decfloat, tz: not bindable
         };
@@ -29749,7 +29850,7 @@ fn read_param_message(
                 let raw = read_n(s, dec, 4)?;
                 WireParam::Bool(raw[0] != 0)
             }
-            PSlot::Quad => {
+            PSlot::Quad | PSlot::Blob => {
                 let raw = quad_wire(&read_n(s, dec, 8)?).to_vec();
                 WireParam::BlobId(raw.try_into().unwrap())
             }
@@ -57432,7 +57533,7 @@ fn store_blob_param(
     let (mut src_rel, mut num) = decode_blob_id(b);
     if src_rel == 0 {
         if num == 0 {
-            let charset = if sub_type == 1 { d.scale as u8 } else { 0 };
+            let charset = if sub_type == 1 { d.scale as u8 } else { CS_BINARY };
             let recno = fire_crab_blb::create_blob(work, db.page_size, rel, &[], sub_type, charset)?;
             return Ok(encode_blob_id(rel, recno));
         }
@@ -57450,8 +57551,10 @@ fn store_blob_param(
     // the copy is stamped with the TARGET column's sub_type and charset
     // (blb.cpp:1262 `blob->blb_sub_type = to_desc->getBlobSubType()`),
     // not the source's: a binary blob copied into a text column reads
-    // back as text
-    let charset = if sub_type == 1 { d.scale as u8 } else { 0 };
+    // back as text. A non-text blob's charset is CS_BINARY, not NONE
+    // (`dsc::getCharSet`, dsc.h:260-269, via blb.cpp:1258
+    // `blob->blb_charset = to_desc->getCharSet()`)
+    let charset = if sub_type == 1 { d.scale as u8 } else { CS_BINARY };
     let recno = if src.header.is_stream() {
         fire_crab_blb::create_stream_blob_counted(
             work,
@@ -57472,6 +57575,9 @@ fn store_blob_param(
     }
     Ok(encode_blob_id(rel, recno))
 }
+
+/// `CS_BINARY` (intl.h:97): the charset of every blob that is not text.
+const CS_BINARY: u8 = 1;
 
 fn materialise_temp_blob(
     db: &mut Database,
@@ -86744,6 +86850,7 @@ fn after_auth(
                 // whole execute with isc_batch_blob_id before any message
                 // runs
                 let mut map = std::mem::take(&mut b.blob_map);
+                let slots = b.slots.clone();
                 b.bs = BatchStreamState::default(); // DsqlBatch::cancel: the stream is spent
                 if !map.is_empty() && std::env::var("FC_SRV_TRACE").is_ok() {
                     eprintln!("[srv] batch blobs: stmt {} {} ids", h, map.len());
@@ -86761,7 +86868,18 @@ fn after_auth(
                     // messages before it are stored and STAY, the rest
                     // never run (probed: two messages naming one id, the
                     // first row is in the table after the error)
-                    for a in args.iter_mut() {
+                    // ONLY A BLOB PARAMETER GOES THROUGH THE MAP. The
+                    // engine builds m_blobMeta from the SQL_BLOB parameters
+                    // of the message; an ARRAY parameter is SQL_QUAD, and
+                    // its id - the temp array `op_put_slice` just made -
+                    // passes to the request untouched. gbak's restore of
+                    // a table with an array column is exactly that: the
+                    // slices written, the ids named in the rows, no
+                    // registration (restore.epp `prepareBatch`).
+                    for (a, slot) in args.iter_mut().zip(slots.iter()) {
+                        if !matches!(slot, PSlot::Blob) {
+                            continue;
+                        }
                         if let WireParam::BlobId(id) = a {
                             if *id == [0u8; 8] {
                                 continue;
@@ -88137,7 +88255,21 @@ fn after_auth(
                     // data_len is the slice's byte length in MEMORY form; the
                     // wire carries `count` elements in xdr form
                     let count = if sdl.elem_len > 0 { data_len / sdl.elem_len as usize } else { 0 };
-                    read_n(&mut s, &mut dec, count * wire_elem(sdl.dtype, sdl.elem_len as usize))?
+                    if sdl.dtype == fire_crab_ods::format::dtype::VARYING {
+                        // per element: a 4-byte length, then that many
+                        // bytes padded to 4 - variable, so read one at a
+                        // time (xdr_datum dtype_cstring)
+                        let mut raw = Vec::new();
+                        for _ in 0..count {
+                            let l = read_n(&mut s, &mut dec, 4)?;
+                            let n = u32::from_be_bytes(l[0..4].try_into().unwrap()) as usize;
+                            raw.extend_from_slice(&l);
+                            raw.extend_from_slice(&read_n(&mut s, &mut dec, n.div_ceil(4) * 4)?);
+                        }
+                        raw
+                    } else {
+                        read_n(&mut s, &mut dec, count * wire_elem(sdl.dtype, sdl.elem_len as usize))?
+                    }
                 } else {
                     Vec::new()
                 };
@@ -89479,11 +89611,15 @@ enum BTarget {
     Field(u8, String),
     /// an output message parameter, with an optional null indicator
     Param(u8, u16, Option<u16>),
+    /// a declared request variable ([BLR_DCL_VARIABLE])
+    Var(u16),
 }
 
-/// A compiled BLR request: the message layouts and the program.
+/// A compiled BLR request: the message layouts, the declared variables
+/// and the program.
 struct BlrReq {
     msgs: Vec<Vec<BField>>,
+    vars: Vec<BField>,
     stmt: Rc<BStmt>,
 }
 
@@ -89558,6 +89694,15 @@ const BLR_MARKS: u8 = 217;
 const BLR_STALL: u8 = 155;
 const BLR_LOOP: u8 = 9;
 const BLR_MODIFY: u8 = 10;
+/// `blr_dcl_variable` (3): a request-local variable, declared in the
+/// program header like a message - `<var u16> <field type>`. gbak's
+/// generator-value setter (restore.epp `store_blr_gen_id`) declares one
+/// INT64 and assigns `gen_id3(<schema>, <name>, 1, <literal value>)`
+/// into it: the DRAW is the point, the variable is where the answer
+/// goes to be ignored.
+const BLR_DCL_VARIABLE: u8 = 3;
+/// `blr_variable` (26): `<var u16>` - the variable as a value or target.
+const BLR_VARIABLE: u8 = 26;
 const BLR_HANDLER: u8 = 11;
 const BLR_SELECT: u8 = 13;
 const BLR_STORE: u8 = 15;
@@ -89655,10 +89800,20 @@ fn parse_blr_program(blr: &[u8]) -> Option<BlrReq> {
         return None;
     }
     let mut msgs: Vec<Vec<BField>> = Vec::new();
+    let mut vars: Vec<BField> = Vec::new();
     let mut stmt = BStmt::Nop;
     let mut closed = false;
     loop {
         match c.peek()? {
+            BLR_DCL_VARIABLE => {
+                c.u8();
+                let vno = c.u16()? as usize;
+                let f = parse_blr_field(&mut c)?;
+                if vars.len() <= vno {
+                    vars.resize(vno + 1, BField::Long);
+                }
+                vars[vno] = f;
+            }
             BLR_MESSAGE => {
                 c.u8();
                 let mno = c.u8()? as usize;
@@ -89697,7 +89852,7 @@ fn parse_blr_program(blr: &[u8]) -> Option<BlrReq> {
     if c.peek() != Some(BLR_EOC) {
         return None;
     }
-    Some(BlrReq { msgs, stmt: Rc::new(stmt) })
+    Some(BlrReq { msgs, vars, stmt: Rc::new(stmt) })
 }
 
 fn parse_blr_field(c: &mut BlrCur) -> Option<BField> {
@@ -89849,6 +90004,7 @@ fn parse_blr_stmt(c: &mut BlrCur) -> Option<BStmt> {
                     let ctx = c.u8()?;
                     BTarget::Field(ctx, c.name()?)
                 }
+                BLR_VARIABLE => BTarget::Var(c.u16()?),
                 _ => return None,
             };
             BStmt::Assign(from, to)
@@ -90181,27 +90337,32 @@ fn read_request_message(
         match f {
             BField::Short | BField::Long => vals.push(Value::Int(read_int(s, dec)? as i64)),
             BField::Quad => {
-                // AN 8-BYTE BLOB ID, and it must not flatten to NULL.
-                // A store has to be able to tell "this column is null"
-                // from "the client sent a blob this server cannot carry"
-                // - the second one dropped silently is a row that looks
-                // written and has lost a column.
-                let a = read_int(s, dec)? as u32;
-                let b = read_int(s, dec)? as u32;
-                vals.push(if a == 0 && b == 0 {
-                    Value::Null
-                } else {
-                    Value::Blob((a & 0xffff) as u16, u64::from(b))
-                });
+                // AN 8-BYTE BLOB ID, decoded EXACTLY as a DSQL blob
+                // parameter is: the two big-endian wire longs byte-swapped
+                // by [quad_wire] into the on-disk bid layout, then read by
+                // [decode_blob_id]. A TEMPORARY blob - one the client just
+                // wrote with op_create_blob2 / op_put_segment - has
+                // relation 0 and its temp key as the number, which is the
+                // key [Database::temp_blobs] is indexed by; the store
+                // materialises it from there. An all-zero id is NULL.
+                let raw = quad_wire(&read_n(s, dec, 8)?);
+                let (rel, num) = decode_blob_id(&raw);
+                vals.push(if rel == 0 && num == 0 { Value::Null } else { Value::Blob(rel, num) });
             }
             BField::Bool => {
                 read_int(s, dec)?; // one byte padded to four
                 vals.push(Value::Null);
             }
             BField::Int64 => {
-                read_int(s, dec)?;
-                read_int(s, dec)?; // 8 bytes
-                vals.push(Value::Null);
+                // an xdr_hyper: two big-endian longs, high first. This
+                // used to push NULL - and every BIGINT catalog column a
+                // restore stores went missing with it: a trigger's
+                // RDB$TRIGGER_TYPE (the engine then showed `ACTIVE AFTER`
+                // with no event and isql -x lost every CHECK constraint),
+                // a generator's RDB$INITIAL_VALUE.
+                let hi = read_int(s, dec)? as u32;
+                let lo = read_int(s, dec)? as u32;
+                vals.push(Value::Int((((hi as u64) << 32) | lo as u64) as i64));
             }
             BField::Double => {
                 let hi = read_int(s, dec)? as u32;
@@ -90343,21 +90504,18 @@ fn write_stored_row(
         ));
     }
     let mut vals: Vec<(String, Value)> = Vec::new();
+    // A BLOB ARRIVES AS AN ID, NOT AS ITS CONTENT. The client wrote the
+    // segments first (op_create_blob2 / op_put_segment / op_close_blob)
+    // and names the TEMPORARY id here; it is materialised into THIS
+    // relation below, once the work copy exists, and the permanent id
+    // goes into the row - exactly what the ordinary INSERT does with a
+    // blob parameter ([store_blob_param]).
+    let mut blobs: Vec<(String, u16, u16, u64)> = Vec::new();
     for rc in columns {
         let v = row.get(rc.field_id as usize).cloned().unwrap_or(Value::Null);
         match v {
             Value::Null => {}
-            // A BLOB ARRIVES AS AN ID, NOT AS ITS CONTENT. The client
-            // writes the segments separately (op_create_blob2 /
-            // op_put_segment) and then names the id here; carrying that
-            // through is its own slice, and storing the row without it
-            // would lose a column while reporting success.
-            Value::Blob(..) => {
-                return Err(format!(
-                    "a BLR store cannot carry the blob column {} yet",
-                    rc.name
-                ))
-            }
+            Value::Blob(r, n) => blobs.push((rc.name.clone(), rc.field_id, r, n)),
             v => vals.push((rc.name.clone(), v)),
         }
     }
@@ -90390,6 +90548,19 @@ fn write_stored_row(
     }
     let (mut work, tx) = db.work_copy_with_tx()?;
     work.ddl_tx = Some(u64::from(tx));
+    // the blobs, into this relation's pages, before the row that names
+    // them; the destination column's descriptor decides sub_type/charset
+    let mut blob_vals: Vec<(String, [u8; 8])> = Vec::new();
+    if !blobs.is_empty() {
+        let formats = fire_crab_ods::system_relation_formats(&work, db.page_size, relation)
+            .ok_or("no computed system format")?;
+        let (_, descs) = formats.iter().max_by_key(|(n, _)| *n).ok_or("empty system format")?;
+        for (name, fid, r, n) in &blobs {
+            let d = descs.get(*fid as usize).ok_or("blob field beyond format")?;
+            let perm = store_blob_param(db, &mut work, rel, d, &encode_blob_id(*r, *n))?;
+            blob_vals.push((name.clone(), perm));
+        }
+    }
     // THE ID GOES IN BEFORE THE ROW DOES. `insert_system_row` keys the
     // record into every index as it writes it; patching the id in
     // afterwards does NOT re-key, so the row would keep the RDB$INDEX_1
@@ -90405,16 +90576,55 @@ fn write_stored_row(
     } else {
         None
     };
+    // A GENERATOR'S ID IS THE SERVER'S TOO, and it is settled AT STORE
+    // TIME, not at commit: vio.cpp:4652 `set_metadata_id(..., f_gen_id,
+    // drq_g_nxt_gen_id, MASTER_GENERATOR)` draws it from the master
+    // generator when the client left it NULL (gbak does -
+    // restore.epp `store_blr_gen_id` sets every other column), then
+    // `dfw_set_generator` zeroes the slot at commit. The VALUE comes
+    // later, by the client's own `SET GENERATOR`.
+    let assigned_gen_id = if relation == "RDB$GENERATORS"
+        && !named.iter().any(|(n, _)| *n == "RDB$GENERATOR_ID")
+    {
+        Some(fire_crab_ods::ddl::next_generator_id(&mut work, db.page_size)?)
+    } else {
+        None
+    };
+    // AN EXCEPTION'S NUMBER, A PROCEDURE'S OR A FUNCTION'S ID come the
+    // same way, at store time, from the system generator that numbers
+    // that kind of object (vio.cpp `set_metadata_id(..., "RDB$EXCEPTIONS")`
+    // / `"RDB$PROCEDURES"` / `"RDB$FUNCTIONS"`) - when the client left
+    // the column NULL; a client that sent one keeps it.
+    let assigned_meta_id = match METADATA_IDS.iter().find(|(r, _, _)| *r == relation) {
+        Some((_, col, generator)) if !named.iter().any(|(n, _)| n == col) => Some((
+            *col,
+            fire_crab_ods::ddl::next_metadata_id(&mut work, db.page_size, generator)?,
+        )),
+        _ => None,
+    };
     let mut named = named;
     if let Some(id) = assigned_id {
         named.push(("RDB$RELATION_ID", fire_crab_ods::ddl::SysValue::Int(i64::from(id))));
     }
+    if let Some((col, id)) = assigned_meta_id {
+        named.push((col, fire_crab_ods::ddl::SysValue::Int(id)));
+    }
+    if let Some(id) = assigned_gen_id {
+        named.push(("RDB$GENERATOR_ID", fire_crab_ods::ddl::SysValue::Int(id)));
+    }
+    for (name, perm) in &blob_vals {
+        named.push((name.as_str(), fire_crab_ods::ddl::SysValue::Blob(*perm)));
+    }
     let r =
         fire_crab_ods::ddl::insert_system_row(&mut work, db.page_size, relation, rel, &named);
-    // ...and if that row NAMES a relation, the relation's storage is
-    // owed at commit. The id comes from the row itself: gbak carries the
-    // original one out of the backup rather than letting the server
-    // assign a new one.
+    // the slot the new id names starts at zero (DPM_gen_id(id, true, 0)
+    // from set_generator's phase 3 - a slot a dropped generator left
+    // behind would otherwise read its stale value)
+    if r.is_ok() {
+        if let Some(id) = assigned_gen_id {
+            fire_crab_ods::gen::write(&mut work, db.page_size, id, 0)?;
+        }
+    }
     // ...and if that row NAMES a relation, the relation's storage is
     // owed at commit. By NAME: the client leaves `RDB$RELATION_ID` and
     // `RDB$FORMAT` NULL for the server to assign, so at store time the
@@ -90439,6 +90649,18 @@ fn write_stored_row(
             work.ddl_deferred.push(fire_crab_ods::DdlDeferred::CreateRelationStorage {
                 name: new_name.trim_end().to_string(),
             });
+        }
+    }
+    // A TRIGGER IS PART OF ITS TABLE'S SUMMARY. The engine loads a
+    // relation's triggers from RDB$RUNTIME's RSR_trigger_name entries
+    // (met.epp:3510), and gbak stores triggers AFTER the table - and its
+    // data - so the summary built at the table's own commit does not
+    // name them; the engine then fires nothing on that table. The
+    // summary is rebuilt at this commit (`RelationPermanent::newVersion`
+    // from vio.cpp:4772 is the engine's version of the same).
+    if r.is_ok() && relation == "RDB$TRIGGERS" {
+        if let Some(Value::Text(t)) = vals.iter().find(|(n, _)| n == "RDB$RELATION_NAME").map(|(_, v)| v.clone()) {
+            work.ddl_deferred.push(fire_crab_ods::DdlDeferred::RefreshRuntime { name: t.trim_end().to_string() });
         }
     }
     work.ddl_tx = None;
@@ -90501,6 +90723,15 @@ fn write_stored_row(
 /// commits, reads back by key, and the restored PRIMARY KEY refuses a
 /// duplicate with the engine's own vector naming the index. `gfix -v
 /// -full` is clean.
+/// (system relation, its id column, the system generator that numbers
+/// it) - the objects whose id the ENGINE assigns at store time
+/// (vio.cpp `set_metadata_id`) when the stored row leaves it NULL.
+const METADATA_IDS: &[(&str, &str, &str)] = &[
+    ("RDB$EXCEPTIONS", "RDB$EXCEPTION_NUMBER", "RDB$EXCEPTIONS"),
+    ("RDB$PROCEDURES", "RDB$PROCEDURE_ID", "RDB$PROCEDURES"),
+    ("RDB$FUNCTIONS", "RDB$FUNCTION_ID", "RDB$FUNCTIONS"),
+];
+
 const STORABLE_SYSTEM_RELATIONS: &[&str] = &[
     "RDB$SCHEMAS",
     "RDB$FIELDS",
@@ -90509,6 +90740,37 @@ const STORABLE_SYSTEM_RELATIONS: &[&str] = &[
     "RDB$INDICES",
     "RDB$INDEX_SEGMENTS",
     "RDB$RELATION_CONSTRAINTS",
+    // an array column's bounds are rows on the field's name and nothing
+    // else: the field itself (RDB$FIELDS.RDB$DIMENSIONS) is what makes the
+    // column an array, and the format computation reads the bounds when
+    // it describes the element ([fire_crab_ods::ddl] `array_desc_of`)
+    "RDB$FIELD_DIMENSIONS",
+    // a view's contexts are rows; the view's own deferred work (its
+    // format and dbkey length) is posted by its RDB$RELATIONS row and
+    // counts these at commit
+    "RDB$VIEW_RELATIONS",
+    // a generator's row is settled at store time: its id is drawn there
+    // ([write_stored_row]) and its slot zeroed
+    "RDB$GENERATORS",
+    // an exception is its row once its number is drawn ([METADATA_IDS])
+    "RDB$EXCEPTIONS",
+    // A PROCEDURE, A FUNCTION AND A TRIGGER ARE THEIR SOURCE HERE. The
+    // engine's deferred work on these rows compiles the BLR blob and
+    // records dependencies; this server runs a procedure by re-parsing
+    // RDB$PROCEDURE_SOURCE ([load_procedure]) and a trigger by
+    // RDB$TRIGGER_SOURCE ([fire_triggers]), and gbak stores both. The id
+    // is drawn at store time ([METADATA_IDS]); parameters, arguments and
+    // messages are rows.
+    "RDB$PROCEDURES",
+    "RDB$PROCEDURE_PARAMETERS",
+    "RDB$FUNCTIONS",
+    "RDB$FUNCTION_ARGUMENTS",
+    "RDB$TRIGGERS",
+    "RDB$TRIGGER_MESSAGES",
+    // a foreign key's row; the index it rides on is built by
+    // [CreateIndexStorage] when its RDB$INDICES row arrives
+    "RDB$REF_CONSTRAINTS",
+    "RDB$DEPENDENCIES",
     // a privilege, a security class and a check-constraint row ARE their
     // rows. (vio.cpp:696-708 is worth citing for a different reason: it
     // is the list of system relations a GBAK attachment is PERMITTED to
@@ -90608,6 +90870,21 @@ fn write_modified_row(
         })
         .collect();
     let (mut work, tx) = db.work_copy_with_tx()?;
+    // a modify that assigns a BLOB names a temp id the same way a store
+    // does; materialise it into this relation first
+    let mut blob_vals: Vec<(String, [u8; 8])> = Vec::new();
+    if vals.iter().any(|(_, v)| matches!(v, Value::Blob(..))) {
+        let formats = fire_crab_ods::system_relation_formats(&work, db.page_size, relation)
+            .ok_or("no computed system format")?;
+        let (_, descs) = formats.iter().max_by_key(|(n, _)| *n).ok_or("empty system format")?;
+        for rc in &changed {
+            if let Some(Value::Blob(r, n)) = new_row.get(rc.field_id as usize) {
+                let d = descs.get(rc.field_id as usize).ok_or("blob field beyond format")?;
+                let perm = store_blob_param(db, &mut work, rel, d, &encode_blob_id(*r, *n))?;
+                blob_vals.push((rc.name.clone(), perm));
+            }
+        }
+    }
     // the catalog row belongs to THIS statement's transaction, exactly
     // as a DDL statement's rows do - that is what makes it undoable by
     // state and invisible to everyone else until commit
@@ -90615,6 +90892,7 @@ fn write_modified_row(
     let pred_want = want.clone();
     let named: Vec<(&str, fire_crab_ods::ddl::SysValue<'_>)> = vals
         .iter()
+        .filter(|(_, v)| !matches!(v, Value::Blob(..)))
         .map(|(n, v)| {
             let sv = match v {
                 Value::Null => fire_crab_ods::ddl::SysValue::Null,
@@ -90627,6 +90905,7 @@ fn write_modified_row(
             };
             (n.as_str(), sv)
         })
+        .chain(blob_vals.iter().map(|(n, b)| (n.as_str(), fire_crab_ods::ddl::SysValue::Blob(*b))))
         .collect();
     let r = fire_crab_ods::ddl::patch_system_row(
         &mut work,
@@ -90638,7 +90917,35 @@ fn write_modified_row(
     );
     work.ddl_tx = None;
     r?;
+    // A DOMAIN MODIFIED UNDER ITS TABLES. gbak stores a domain's
+    // RDB$COMPUTED_BLR / RDB$VALIDATION_BLR only after every relation
+    // exists (restore.epp `update_global_field`: the BLR names tables),
+    // by a MODIFY of the RDB$FIELDS row - and by then the tables using
+    // it have their format and summary built without them. The engine's
+    // dfw modify_field re-versions each dependent table; the deferred
+    // task does the same at this commit.
+    if relation == "RDB$FIELDS" {
+        if let Some(Value::Text(f)) = columns
+            .iter()
+            .find(|rc| rc.name == "RDB$FIELD_NAME")
+            .and_then(|rc| new_row.get(rc.field_id as usize))
+        {
+            work.ddl_deferred.push(fire_crab_ods::DdlDeferred::FieldChanged { name: f.trim_end().to_string() });
+        }
+    }
+    let residue = std::mem::take(&mut work.ddl_residue);
+    let deferred = std::mem::take(&mut work.ddl_deferred);
     db.install_dirty(work);
+    match db.windows.last_mut() {
+        Some(w) => {
+            w.residue.extend(residue);
+            w.deferred.extend(deferred);
+        }
+        None => {
+            let _ = residue;
+            db.ddl_deferred.extend(deferred);
+        }
+    }
     db.adopt_tx(tx);
     db.refresh_reader_view();
     Ok(())
@@ -90729,12 +91036,15 @@ struct BlrMachine {
     input: Vec<Value>,
     /// message numbers this request is parked on, empty when running
     awaiting: Vec<u8>,
+    /// the declared variables' current values, by number
+    vars: Vec<Value>,
     done: bool,
 }
 
 impl BlrMachine {
     fn start(req: Rc<BlrReq>) -> Self {
         let next = Some(req.stmt.clone());
+        let vars = vec![Value::Null; req.vars.len()];
         BlrMachine {
             req,
             stack: Vec::new(),
@@ -90744,6 +91054,7 @@ impl BlrMachine {
             cursor: 0,
             input: Vec::new(),
             awaiting: Vec::new(),
+            vars,
             done: false,
         }
     }
@@ -91048,14 +91359,39 @@ impl BlrMachine {
                     self.next = Some(body.clone());
                 }
                 BStmt::Assign(from, to) => {
-                    let v = {
-                        let Some(db) = database.as_ref() else {
-                            return BlrStep::Refused("no database attached".into());
-                        };
-                        let view = self.view();
-                        eval_blr_val(from, &view, &self.input, db)
+                    let v = match from {
+                        // A GENERATOR AS THE SOURCE IS DRAWN, NOT READ -
+                        // the same line the send body holds. gbak sets a
+                        // restored generator's value exactly this way:
+                        // `<var> = gen_id3(<gen>, <backup value>)` over
+                        // the zeroed slot the store left.
+                        BVal::GenId(name, step) => {
+                            let BVal::LitLong(step) = &**step else {
+                                return BlrStep::Refused(
+                                    "a generator step this server cannot fold".into(),
+                                );
+                            };
+                            match draw_generator(database, name, *step) {
+                                Ok(v) => Value::Int(v),
+                                Err(e) => return BlrStep::Refused(e),
+                            }
+                        }
+                        _ => {
+                            let Some(db) = database.as_ref() else {
+                                return BlrStep::Refused("no database attached".into());
+                            };
+                            let view = self.view();
+                            eval_blr_val(from, &view, &self.input, db)
+                        }
                     };
                     match to {
+                        BTarget::Var(n) => {
+                            let n = *n as usize;
+                            if n >= self.vars.len() {
+                                return BlrStep::Refused(format!("variable {n} is not declared"));
+                            }
+                            self.vars[n] = v;
+                        }
                         // into a context FIELD: the write a store or
                         // modify body is made of
                         BTarget::Field(ctx, name) => {
@@ -94445,10 +94781,12 @@ mod tests {
         assert_eq!(parse_param_blr(&blr4), Some(vec![PSlot::Varying]));
         // blr_quad (a blob id, node's SQLParamQuad) binds as 8 raw bytes
         assert_eq!(parse_param_blr(&[5u8, 2, 4, 0, 2, 0, 9, 0, 7, 0, 255, 76]), Some(vec![PSlot::Quad]));
-        // blr_blob2 (libfbclient's SQL_BLOB): sub_type and charset words
+        // blr_blob2 (libfbclient's SQL_BLOB): sub_type and charset words -
+        // its own slot kind, the one a batch translates through its blob
+        // map (an array's blr_quad is not)
         assert_eq!(
             parse_param_blr(&[5u8, 2, 4, 0, 4, 0, 17, 0, 0, 0, 0, 7, 0, 17, 1, 0, 4, 0, 7, 0, 255, 76]),
-            Some(vec![PSlot::Quad, PSlot::Quad])
+            Some(vec![PSlot::Blob, PSlot::Blob])
         );
         // an undecodable dtype (blr_int128 = 26) still refuses the whole BLR
         assert!(parse_param_blr(&[5u8, 2, 4, 0, 2, 0, 26, 0, 7, 0, 255, 76]).is_none());
@@ -105503,6 +105841,27 @@ mod tests {
         assert!(plan_set_generator("SET GENERATOR SYSTEM.RDB$INDEX_NAME TO 7").is_some());
     }
 
+    /// A blob id in a legacy message decodes the way a DSQL blob
+    /// parameter does - through `quad_wire` then `decode_blob_id` - so a
+    /// TEMPORARY id (relation 0, the temp key as its number) comes back
+    /// as the key the temp-blob table is indexed by. The old arm read the
+    /// two longs as host integers and kept the low 16 bits of the first
+    /// as the relation: right for zero, wrong for everything else.
+    #[test]
+    fn a_message_blob_id_decodes_like_a_dsql_one() {
+        // what the server hands out for temp blob 7: encode, then put on
+        // the wire as xdr_quad (each half big-endian) - which is what
+        // quad_wire undoes
+        let id = encode_blob_id(0, 7);
+        let wire = quad_wire(&id); // quad_wire is its own inverse (a swap)
+        let back = quad_wire(&wire);
+        assert_eq!(back, id);
+        assert_eq!(decode_blob_id(&back), (0, 7));
+        // a permanent one keeps its relation and its high number byte
+        let id = encode_blob_id(128, (3u64 << 32) | 99);
+        assert_eq!(decode_blob_id(&quad_wire(&quad_wire(&id))), (128, (3u64 << 32) | 99));
+    }
+
     /// THE DECODER AND THE ENCODER MUST AGREE ON EVERY FIELD'S WIDTH,
     /// and for `blr_text` they did not.
     ///
@@ -105585,6 +105944,58 @@ mod tests {
         assert_eq!(wire[at], 0x3F, "high word first");
         at += 8;
         assert_eq!(at, wire.len(), "and the walk consumes the message exactly");
+    }
+
+    /// gbak's generator-value setter: one declared INT64 variable, and an
+    /// assignment of `gen_id3(PUBLIC.EMP_NO_GEN, flag 1, literal 145)`
+    /// into it (restore.epp `store_blr_gen_id`, bytes as sent restoring
+    /// the employee sample). It parsed as nothing at all before the
+    /// header knew `blr_dcl_variable` and a target could be a variable.
+    #[test]
+    fn a_declared_variable_takes_a_generator_draw() {
+        let blr: [u8; 46] = [
+            5, 2, 3, 0, 0, 16, 0, 2, 1, 231, 6, 80, 85, 66, 76, 73, 67, 10, 69, 77, 80, 95, 78,
+            79, 95, 71, 69, 78, 1, 21, 16, 0, 145, 0, 0, 0, 0, 0, 0, 0, 26, 0, 0, 255, 255, 76,
+        ];
+        let req = parse_blr_request(&blr).expect("parses");
+        assert_eq!(req.vars.len(), 1);
+        assert!(matches!(req.vars[0], BField::Int64));
+        let BStmt::Begin(body) = &*req.stmt else { panic!("a begin") };
+        assert_eq!(body.len(), 1);
+        let BStmt::Assign(BVal::GenId(name, step), BTarget::Var(0)) = &*body[0] else {
+            panic!("a draw into variable 0")
+        };
+        assert_eq!(name, "EMP_NO_GEN");
+        assert!(matches!(**step, BVal::LitLong(145)));
+    }
+
+    /// gbak's SDL for a VARCHAR(15)[1:5] array column (JOB.LANGUAGE_REQ in
+    /// the employee sample, bytes as sent): blr_varying2 with a charset
+    /// word and a length word, schema / relation / field, one do2 loop,
+    /// one scalar variable. The element is a 17-byte `vary` slot.
+    #[test]
+    fn a_varying_array_sdl_parses_to_a_vary_slot() {
+        let sdl: [u8; 55] = [
+            1, 6, 1, 38, 0, 0, 15, 0, 37, 6, 80, 85, 66, 76, 73, 67, 2, 3, 74, 79, 66, 4, 12, 76, 65,
+            78, 71, 85, 65, 71, 69, 95, 82, 69, 81, 34, 0, 11, 1, 0, 0, 0, 11, 5, 0, 0, 0, 36, 1, 8,
+            0, 1, 7, 0, 255,
+        ];
+        let s = parse_sdl(&sdl).expect("parses");
+        assert_eq!(s.dtype, fire_crab_ods::format::dtype::VARYING);
+        assert_eq!(s.elem_len, 17);
+        assert_eq!((s.relation.as_str(), s.field.as_str()), ("JOB", "LANGUAGE_REQ"));
+        assert_eq!(s.loops, vec![(0u8, 1i64, 5i64)]);
+        assert_eq!(sdl_subscripts(&s).len(), 5);
+        // the wire form of one element round-trips through the vary slot
+        let mut w = Vec::new();
+        xdr_element(&mut w, s.dtype, &[7, 0, b'E', b'n', b'g', b'l', b'i', b's', b'h', 0, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(&w[..4], &[0, 0, 0, 7]);
+        assert_eq!(w.len(), 4 + 8);
+        let mut at = 0;
+        let back = unxdr_element(&w, &mut at, s.dtype, 17).unwrap();
+        assert_eq!(&back[..9], &[7, 0, b'E', b'n', b'g', b'l', b'i', b's', b'h']);
+        assert_eq!(back.len(), 17);
+        assert_eq!(at, w.len());
     }
 
     /// `blr_gen_id3` (231): a generator named with its SCHEMA, and an
