@@ -10318,6 +10318,155 @@ fn recompute_relation_acl(
 }
 
 
+/// Write a security class's ACL, creating the `RDB$SECURITY_CLASSES` row
+/// when the class is only a NAME so far - which is every class a gbak
+/// restore's object rows name: the backup carries the names, the engine
+/// recompiles the rows from the restored privileges (`dfw_grant`).
+fn upsert_class_acl(file: &mut crate::Image, page_size: usize, class: &str, acl: &[u8]) -> Result<(), String> {
+    let screl = crate::resolve_relation(file, page_size, "RDB$SECURITY_CLASSES")
+        .ok_or("no RDB$SECURITY_CLASSES relation")?;
+    let name_fid = sys_fid(file, page_size, "RDB$SECURITY_CLASSES", "RDB$SECURITY_CLASS")?;
+    let cl = class.to_string();
+    let exists = find_sys_row_slot(file, page_size, "RDB$SECURITY_CLASSES", screl, move |v| text_eq(v.get(name_fid), &cl)).is_some();
+    if exists {
+        return write_class_acl(file, page_size, class, acl);
+    }
+    let blob = dml::insert_blob(file, page_size, screl, &[acl.to_vec()], 3)?;
+    sys_insert(
+        file,
+        page_size,
+        "RDB$SECURITY_CLASSES",
+        screl,
+        &[
+            ("RDB$SECURITY_CLASS", SysVal::S(class)),
+            ("RDB$ACL", SysVal::B(blob_id_bytes(screl, blob))),
+        ],
+    )
+}
+
+/// An object's `(RDB$OWNER_NAME, RDB$SECURITY_CLASS)` off the system
+/// relation that holds it, by its name column - the exception, domain,
+/// character-set and collation shape of [procedure_owner_class].
+fn object_owner_class(
+    file: &crate::Image,
+    page_size: usize,
+    rel_name: &str,
+    name_col: &str,
+    name: &str,
+) -> Option<(String, String)> {
+    let rel = crate::resolve_relation(file, page_size, rel_name)?;
+    let formats = system_relation_formats(file, page_size, rel_name)?;
+    let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
+    let cols = relation_columns(file, page_size, rel_name);
+    let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let (name_f, own_f, sc_f) = (fid(name_col)?, fid("RDB$OWNER_NAME")?, fid("RDB$SECURITY_CLASS")?);
+    let mut out = None;
+    walk_rows(file, page_size, rel, descs, |v| {
+        if out.is_none() && text_eq(v.get(name_f), name) {
+            let own = match v.get(own_f) {
+                Some(Value::Text(t)) => t.trim_end().to_string(),
+                _ => OWNER.to_string(),
+            };
+            let sc = match v.get(sc_f) {
+                Some(Value::Text(t)) => t.trim_end().to_string(),
+                _ => return,
+            };
+            if !sc.is_empty() {
+                out = Some((own, sc));
+            }
+        }
+    });
+    out
+}
+
+/// `dfw_grant` for one object, at commit: `GRANT_privileges` (grant.epp:89)
+/// recompiled from the `RDB$USER_PRIVILEGES` rows now present, keyed by
+/// the object type the privilege row carried (obj.h). Reads WIDE - the
+/// rows are this transaction's. The object's class row is created when it
+/// is missing, and a relation without an `RDB$DEFAULT_CLASS` is given one
+/// (`SQL$DEFAULT<n>`, the relation's own ACL until field grants restrict
+/// it - the engine's restore of the employee sample leaves the two
+/// byte-identical, measured). A type this server does not compile a class
+/// for - the DDL-object grants, the schema - is left as it is. THE
+/// CONSEQUENCE OF NOT DOING THIS IS NOT A COSMETIC ONE: the engine treats
+/// a class with no row as UNCHECKED, so a restore that stored the rows
+/// alone answered a non-SYSDBA user `gen_id(EMP_NO_GEN, 0)` where the
+/// engine's own restore refuses `no permission for USAGE access`.
+pub fn grant_privileges_deferred(
+    file: &mut crate::Image,
+    page_size: usize,
+    name: &str,
+    object_type: i64,
+) -> Result<(), String> {
+    let _wide = crate::tra::ReaderViewGuard::wide();
+    let usage = |file: &mut crate::Image, rel_name: &str, name_col: &str, letter: &str| -> Result<(), String> {
+        let Some((owner, class)) = object_owner_class(file, page_size, rel_name, name_col, name) else {
+            return Ok(());
+        };
+        let acl = build_object_acl(file, page_size, name, object_type, letter, &owner, OWNER_USAGE_PRIVS, SCL_USAGE);
+        upsert_class_acl(file, page_size, &class, &acl)
+    };
+    match object_type {
+        // obj_relation / obj_view
+        0 | 1 => {
+            let Some((class, owner, default_class)) = relation_security(file, page_size, name) else {
+                return Ok(());
+            };
+            if class.is_empty() {
+                return Ok(());
+            }
+            let acls = recompute_acls(file, page_size, name, &owner);
+            upsert_class_acl(file, page_size, &class, &acls.relation)?;
+            let default_acl = acls.default.clone().unwrap_or_else(|| acls.relation.clone());
+            if default_class.is_empty() {
+                let id = generator_id_by_name(file, page_size, "SQL$DEFAULT").ok_or("no SQL$DEFAULT generator")?;
+                let c = format!("SQL$DEFAULT{}", gen::bump(file, page_size, id, 1)?);
+                upsert_class_acl(file, page_size, &c, &default_acl)?;
+                let rrel = crate::resolve_relation(file, page_size, "RDB$RELATIONS").ok_or("no RDB$RELATIONS")?;
+                let name_fid = sys_fid(file, page_size, "RDB$RELATIONS", "RDB$RELATION_NAME")?;
+                let want = name.to_string();
+                patch_sys_row(
+                    file,
+                    page_size,
+                    "RDB$RELATIONS",
+                    rrel,
+                    move |v| text_is(v.get(name_fid), &want),
+                    &[("RDB$DEFAULT_CLASS", SysVal::S(&c))],
+                )?;
+            } else {
+                upsert_class_acl(file, page_size, &default_class, &default_acl)?;
+            }
+            // the granted fields' own classes, and the default class again
+            // when field grants restricted it
+            recompute_relation_acl(file, page_size, name)
+        }
+        // obj_procedure
+        5 => {
+            let Some((owner, class)) = procedure_owner_class(file, page_size, name) else { return Ok(()) };
+            let acl = build_object_acl(file, page_size, name, 5, "X", &owner, OWNER_PROCEDURE_PRIVS, SCL_EXECUTE);
+            upsert_class_acl(file, page_size, &class, &acl)
+        }
+        // obj_udf
+        15 => {
+            let Some((owner, class)) = function_owner_class(file, page_size, name) else { return Ok(()) };
+            let acl = build_object_acl(file, page_size, name, 15, "X", &owner, OWNER_PROCEDURE_PRIVS, SCL_EXECUTE);
+            upsert_class_acl(file, page_size, &class, &acl)
+        }
+        // obj_generator
+        14 => {
+            let Some((owner, class)) = generator_owner_class(file, page_size, name) else { return Ok(()) };
+            let acl = build_object_acl(file, page_size, name, 14, "G", &owner, OWNER_USAGE_PRIVS, SCL_USAGE);
+            upsert_class_acl(file, page_size, &class, &acl)
+        }
+        // obj_exception / obj_field / obj_charset / obj_collation
+        7 => usage(file, "RDB$EXCEPTIONS", "RDB$EXCEPTION_NAME", "G"),
+        9 => usage(file, "RDB$FIELDS", "RDB$FIELD_NAME", "G"),
+        11 => usage(file, "RDB$CHARACTER_SETS", "RDB$CHARACTER_SET_NAME", "G"),
+        17 => usage(file, "RDB$COLLATIONS", "RDB$COLLATION_NAME", "G"),
+        _ => Ok(()),
+    }
+}
+
 /// Whether a matching `RDB$USER_PRIVILEGES` row already exists - by
 /// grantee, letter and field (`None` = the relation-level, NULL-field
 /// row) - so a re-`GRANT` does not duplicate it.

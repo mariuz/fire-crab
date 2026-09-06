@@ -90530,6 +90530,31 @@ fn write_stored_row(
     {
         vals.push(("RDB$OWNER_NAME".to_string(), Value::Text("SYSDBA".into())));
     }
+    // ...AND SO IS A PRIVILEGE'S GRANTOR (`beforeInsertUserPrivilege`,
+    // SystemTriggers.epp:1221-1231: an empty grantor becomes the current
+    // user). gbak's `fix_missing_privileges` stores its rows with the
+    // grantor NULL and the engine's restore shows SYSDBA in every one.
+    if relation == "RDB$USER_PRIVILEGES" && !vals.iter().any(|(n, _)| n == "RDB$GRANTOR") {
+        vals.push(("RDB$GRANTOR".to_string(), Value::Text("SYSDBA".into())));
+    }
+    // AN OBJECT STORED WITHOUT A SECURITY CLASS IS GIVEN ONE, and its
+    // ACL is owed at commit: `set_security_class` (vio.cpp:7264-7345,
+    // called from every object arm of VIO_store) draws `SQL$<n>` from the
+    // RDB$SECURITY_CLASS generator when the column is NULL and, having
+    // done so, posts dfw_grant for the object. gbak's backup carries a
+    // class name for a named domain and NONE for a system-named one
+    // (`RDB$1` ...), which is where the engine's restore gets the 71
+    // domain classes a row-only restore never had.
+    let mut generated_class: Option<(String, i64)> = None;
+    if let Some((_, name_col, object_type)) = SECURED_OBJECT_ROWS.iter().find(|(r, _, _)| *r == relation) {
+        if columns.iter().any(|c| c.name == "RDB$SECURITY_CLASS")
+            && !vals.iter().any(|(n, _)| n == "RDB$SECURITY_CLASS")
+        {
+            if let Some(Value::Text(obj)) = vals.iter().find(|(n, _)| n == *name_col).map(|(_, v)| v) {
+                generated_class = Some((obj.trim_end().to_string(), *object_type));
+            }
+        }
+    }
     let named: Vec<(&str, fire_crab_ods::ddl::SysValue<'_>)> = vals
         .iter()
         .map(|(n, v)| {
@@ -90606,6 +90631,15 @@ fn write_stored_row(
     if let Some(id) = assigned_id {
         named.push(("RDB$RELATION_ID", fire_crab_ods::ddl::SysValue::Int(i64::from(id))));
     }
+    let drawn_class: Option<String> = if generated_class.is_some() {
+        let n = fire_crab_ods::gen::bump(&mut work, db.page_size, fire_crab_ods::gen::SECURITY_CLASS, 1)?;
+        Some(format!("SQL${n}"))
+    } else {
+        None
+    };
+    if let Some(c) = &drawn_class {
+        named.push(("RDB$SECURITY_CLASS", fire_crab_ods::ddl::SysValue::Text(c.as_str())));
+    }
     if let Some((col, id)) = assigned_meta_id {
         named.push((col, fire_crab_ods::ddl::SysValue::Int(id)));
     }
@@ -90658,6 +90692,34 @@ fn write_stored_row(
     // name them; the engine then fires nothing on that table. The
     // summary is rebuilt at this commit (`RelationPermanent::newVersion`
     // from vio.cpp:4772 is the engine's version of the same).
+    if r.is_ok() {
+        if let Some((obj, ot)) = generated_class {
+            work.ddl_deferred.push(fire_crab_ods::DdlDeferred::GrantPrivileges { name: obj, object_type: ot });
+        }
+    }
+    // A PRIVILEGE ROW POSTS ITS OBJECT'S ACL RECOMPILE (vio.cpp rel_priv ->
+    // dfw_grant, by the row's RDB$RELATION_NAME and RDB$OBJECT_TYPE). The
+    // DDL-object grants (types 22 and up) and the schema's are left to the
+    // classes the created database already carries.
+    if r.is_ok() && relation == "RDB$USER_PRIVILEGES" {
+        let name = vals.iter().find(|(n, _)| n == "RDB$RELATION_NAME").and_then(|(_, v)| match v {
+            Value::Text(t) => Some(t.trim_end().to_string()),
+            _ => None,
+        });
+        let ot = vals
+            .iter()
+            .find(|(n, _)| n == "RDB$OBJECT_TYPE")
+            .and_then(|(_, v)| match v {
+                Value::Int(n) => Some(*n),
+                _ => None,
+            })
+            .unwrap_or(0);
+        if let Some(name) = name {
+            if ot < 22 {
+                work.ddl_deferred.push(fire_crab_ods::DdlDeferred::GrantPrivileges { name, object_type: ot });
+            }
+        }
+    }
     if r.is_ok() && relation == "RDB$TRIGGERS" {
         if let Some(Value::Text(t)) = vals.iter().find(|(n, _)| n == "RDB$RELATION_NAME").map(|(_, v)| v.clone()) {
             work.ddl_deferred.push(fire_crab_ods::DdlDeferred::RefreshRuntime { name: t.trim_end().to_string() });
@@ -90730,6 +90792,20 @@ const METADATA_IDS: &[(&str, &str, &str)] = &[
     ("RDB$EXCEPTIONS", "RDB$EXCEPTION_NUMBER", "RDB$EXCEPTIONS"),
     ("RDB$PROCEDURES", "RDB$PROCEDURE_ID", "RDB$PROCEDURES"),
     ("RDB$FUNCTIONS", "RDB$FUNCTION_ID", "RDB$FUNCTIONS"),
+];
+
+/// The object rows VIO_store gives a security class to when the client
+/// left it NULL (`set_security_class`), with the object's name column and
+/// the obj.h type `dfw_grant` is posted with.
+const SECURED_OBJECT_ROWS: &[(&str, &str, i64)] = &[
+    ("RDB$RELATIONS", "RDB$RELATION_NAME", 0),
+    ("RDB$PROCEDURES", "RDB$PROCEDURE_NAME", 5),
+    ("RDB$EXCEPTIONS", "RDB$EXCEPTION_NAME", 7),
+    ("RDB$FIELDS", "RDB$FIELD_NAME", 9),
+    ("RDB$CHARACTER_SETS", "RDB$CHARACTER_SET_NAME", 11),
+    ("RDB$GENERATORS", "RDB$GENERATOR_NAME", 14),
+    ("RDB$FUNCTIONS", "RDB$FUNCTION_NAME", 15),
+    ("RDB$COLLATIONS", "RDB$COLLATION_NAME", 17),
 ];
 
 const STORABLE_SYSTEM_RELATIONS: &[&str] = &[

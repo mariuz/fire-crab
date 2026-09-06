@@ -1029,8 +1029,19 @@ pub fn apply_ddl_deferred(
     page_size: usize,
     deferred: &[crate::DdlDeferred],
 ) -> Result<(), String> {
+    // a grant recompute is idempotent and a restore posts one per
+    // privilege row - 1536 on the employee sample - so each (object, type)
+    // runs once
+    let mut granted: Vec<(String, i64)> = Vec::new();
     for d in deferred {
         match d.clone() {
+            crate::DdlDeferred::GrantPrivileges { name, object_type } => {
+                if granted.iter().any(|(n, t)| *n == name && *t == object_type) {
+                    continue;
+                }
+                granted.push((name.clone(), object_type));
+                crate::ddl::grant_privileges_deferred(file, page_size, &name, object_type)?;
+            }
             crate::DdlDeferred::DropRelation { rel } => {
                 crate::ddl::release_relation_storage(file, page_size, rel)?;
             }

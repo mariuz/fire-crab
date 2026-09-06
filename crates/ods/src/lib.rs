@@ -185,6 +185,14 @@ pub enum DdlDeferred {
     /// new version when the layout changed (a column that became
     /// COMPUTED), and its summary
     FieldChanged { name: String },
+    /// an RDB$USER_PRIVILEGES row landed for (object, type): the object's
+    /// security class ACL is (re)compiled from the privileges at commit -
+    /// vio.cpp `rel_priv` -> `dfw_grant` -> `GRANT_privileges`. A class
+    /// the object names but whose row does not exist yet is CREATED (a
+    /// gbak restore stores the object rows naming classes the backup
+    /// never carried); a relation without a default class gets one.
+    /// Applied once per (name, type) however many rows posted it.
+    GrantPrivileges { name: String, object_type: i64 },
 }
 
 impl Image {
