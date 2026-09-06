@@ -85,6 +85,8 @@ const F_LENGTH: usize = 8;
 const F_SCALE: usize = 9;
 const F_TYPE: usize = 10;
 const F_SUB_TYPE: usize = 11;
+const F_COLLATION_ID: usize = 25;
+const F_CHARACTER_SET_ID: usize = 26;
 
 /// `RDB$RELATION_FIELDS` (relation 5), relations.h:115-141 at ODS 14.
 const RFR_DEF: &[Def] = &[
@@ -377,7 +379,20 @@ fn system_relation_formats_uncached(
                 continue;
             };
             let scale = as_int(&values[F_SCALE]).unwrap_or(0) as i8;
-            let sub_type = as_int(&values[F_SUB_TYPE]).unwrap_or(0) as i16;
+            // A TEXT descriptor's sub_type is its TTYPE - character set
+            // in the low byte, collation in the high one - which the
+            // catalog keeps in RDB$CHARACTER_SET_ID / RDB$COLLATION_ID.
+            // RDB$FIELD_SUB_TYPE on a CHAR domain is the text SUBTYPE
+            // (3 = metadata), and carrying it as the ttype described every
+            // catalog column as UNICODE_FSS where the engine says UTF8 -
+            // isql then divided 252 bytes by 3 and printed 84-wide names.
+            let sub_type = if matches!(dt, dtype::TEXT | dtype::VARYING) {
+                let cs = as_int(&values[F_CHARACTER_SET_ID]).unwrap_or(0) as i16;
+                let coll = as_int(&values[F_COLLATION_ID]).unwrap_or(0) as i16;
+                cs | (coll << 8)
+            } else {
+                as_int(&values[F_SUB_TYPE]).unwrap_or(0) as i16
+            };
             // dsc_length is final here; compute_format must not add the
             // VARYING count word again, so pass it as a raw length
             let raw = if dt == dtype::VARYING { dsc_length - 2 } else { dsc_length };

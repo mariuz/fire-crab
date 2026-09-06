@@ -16491,6 +16491,7 @@ fn trig_body_of(t: &TrigDef) -> Option<(TrigStmt, Vec<String>)> {
 /// shape, same answer; a different SET list is a different key.
 fn check_predicates(
     db: &Database,
+    db_opt: &Option<Database>,
     table: &str,
     columns: &[RelationColumn],
     descs: &[Descriptor],
@@ -16502,7 +16503,7 @@ fn check_predicates(
         DmlGuard::Update(cols) => format!("{}/U:{}", table, cols.join(",")),
     };
     db.meta_memo("checks", &about, || {
-        check_predicates_uncached(db, table, columns, descs, dml)
+        check_predicates_uncached(db, db_opt, table, columns, descs, dml)
     })
     .as_ref()
     .clone()
@@ -16510,6 +16511,7 @@ fn check_predicates(
 
 fn check_predicates_uncached(
     db: &Database,
+    db_opt: &Option<Database>,
     table: &str,
     columns: &[RelationColumn],
     descs: &[Descriptor],
@@ -16668,7 +16670,28 @@ fn check_predicates_uncached(
             return None; // a check trigger whose source is not CHECK (...)
         }
         let negated = format!("NOT {}", &t[5..]);
-        let toks = tokenize(&negated)?;
+        // A CHECK MAY HOLD A SUBSELECT - `salary >= (SELECT min_salary
+        // FROM job WHERE ...)`, `NOT (... AND EXISTS (SELECT ...))` on
+        // the employee sample - and the WHERE tokenizer reads one only
+        // once it has been LIFTED into a placeholder: the same lifting a
+        // DML WHERE gets ([extract_subqueries] / [resolve_subqueries]),
+        // bound to this table as the outer row. Without it every INSERT
+        // or UPDATE on EMPLOYEE and SALES was refused at prepare with a
+        // bare Dynamic SQL Error and no trace.
+        let (rewritten, subs) = extract_subqueries(&negated)?;
+        let toks = tokenize(&rewritten)?;
+        let toks = if subs.is_empty() {
+            toks
+        } else {
+            let bind = ColBinding {
+                key: table,
+                qual: negated
+                    .contains('.')
+                    .then(|| relation_schema(db, table).map(|s| (s, table)))
+                    .flatten(),
+            };
+            resolve_subqueries(&toks, &subs, db, db_opt, columns, &bind, descs, true)?
+        };
         let mut np = 0usize;
         let raw = parse_predicate(&toks, &mut np)?;
         if np != 0 {
@@ -18173,6 +18196,47 @@ fn build_expr_col(
 /// through [resolve_proj_expr] (collecting the `?` slots) and hand the
 /// result here without a second resolution.
 fn build_expr_col_from(e: Expr, name: &str, descs: &[Descriptor]) -> Option<ProjCol> {
+    // USER / CURRENT_USER / CURRENT_ROLE: VARCHAR(63) CHARACTER SET UTF8
+    // (252 bytes), named USER / ROLE, no relation (SQLDA measured)
+    if matches!(e, Expr::CtxUser | Expr::CtxRole) {
+        let d = Descriptor { dtype: dtype::VARYING, scale: 0, length: 254, sub_type: 4, flags: 0, offset: 0 };
+        let (wire, sql_type, length, scale, sub_type) = wire_for(&d);
+        let fname = if matches!(e, Expr::CtxUser) { "USER" } else { "ROLE" };
+        return Some(ProjCol {
+            name: name.to_string(),
+            fname: Some(fname.to_string()),
+            relation: None,
+            rel_alias: None,
+            field_id: 0,
+            wire,
+            sql_type: nullable(sql_type),
+            length,
+            oct_length: length,
+            scale,
+            sub_type,
+            expr: Some(e),
+        });
+    }
+    // an ARRAY element describes as the element's own type, under the
+    // column's name, from the column's relation
+    if let Expr::ArrayElem { elem, .. } = &e {
+        let (wire, sql_type, length, scale, sub_type) = wire_for(elem);
+        let relation = ARRAY_TABLE.with(|t| t.borrow().clone());
+        return Some(ProjCol {
+            name: name.to_string(),
+            fname: Some(name.to_string()),
+            relation,
+            rel_alias: None,
+            field_id: 0,
+            wire,
+            sql_type: nullable(sql_type),
+            length,
+            oct_length: length,
+            scale,
+            sub_type,
+            expr: Some(e),
+        });
+    }
     // A BARE NULL LITERAL DESCRIBES AS CHAR(1) CHARACTER SET NONE
     // (probed: `SELECT NULL`, `SELECT NULL AS X` and `... RETURNING
     // NULL` all announce sqltype 452, len 1, charset 0 - this server
@@ -22451,6 +22515,7 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
     // the event decides which contexts exist - an INSERT trigger has no
     // OLD row, a DELETE trigger no NEW, and only a BEFORE INSERT/UPDATE
     // may ASSIGN to NEW (the engine's rules)
+    let db_outer = db;
     let db = db.as_ref()?;
     // A DATABASE TRIGGER HAS NO RELATION to check names against - no
     // row fired it - so the column checks below have nothing to find
@@ -26544,7 +26609,8 @@ fn plan_alter_table_add(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<D
     // ADD [CONSTRAINT <name>] CHECK (<condition>) - compiled against the
     // CATALOG's columns (needs the attached database)
     if let Some((cname, source)) = parse_check_clause(tail) {
-        let db = db.as_ref()?;
+        let db_outer = db;
+    let db = db.as_ref()?;
         let columns = db.columns(table);
         let meta = db.relation_meta(table)?; // see [crate::mdc]
         let rel = meta.id;
@@ -26606,7 +26672,8 @@ fn plan_alter_table_add(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<D
     // the result type is inferred from the CATALOG's existing columns
     // (needs the attached database - the statement's text has no types)
     if let Some((cname, src)) = parse_computed_item(tail) {
-        let db = db.as_ref()?;
+        let db_outer = db;
+    let db = db.as_ref()?;
         let columns = db.columns(table);
         let meta = db.relation_meta(table)?; // see [crate::mdc]
         let rel = meta.id;
@@ -28966,6 +29033,7 @@ fn plan_insert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
         }
     }
 
+    let db_outer = db;
     let db = db.as_ref()?;
     // THE SCHEMA HALF, before the relation is resolved (see
     // [relation_qualifier_ok]): `INSERT INTO SYSTEM.T` is a -204 on the
@@ -29212,7 +29280,7 @@ fn plan_insert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
     // the table's CHECK constraints; a check this server cannot
     // evaluate refuses the whole statement - never bypass
     let checks = timed("plan:checks", || {
-        check_predicates(db, table, &columns, descs, DmlGuard::Insert)
+        check_predicates(db, db_outer, table, &columns, descs, DmlGuard::Insert)
     });
     let checks = checks?;
     // the columns' DOMAIN CHECKs; an unevaluatable one refuses the
@@ -31240,6 +31308,7 @@ fn plan_update(sql: &str, db_outer: &Option<Database>) -> Option<(Plan, Vec<Desc
     // statement refused
     let where_kw = find_word_depth0(&masked, "WHERE", set_kw + "SET".len());
 
+    let db_outer = db;
     let db = db.as_ref()?;
     if !relation_qualifier_ok(db, schema, table) {
         return None;
@@ -31656,7 +31725,7 @@ fn plan_update(sql: &str, db_outer: &Option<Database>) -> Option<(Plan, Vec<Desc
                 .map(|c| c.name.clone())
         })
         .collect();
-    let checks = check_predicates(db, table, &columns, descs, DmlGuard::Update(&set_names))?;
+    let checks = check_predicates(db, db_outer, table, &columns, descs, DmlGuard::Update(&set_names))?;
     // DOMAIN CHECKs: the engine validates EVERY validated column of the
     // patched row, not just the SET list's (measured), so the list does
     // not narrow by assignment
@@ -31736,6 +31805,7 @@ fn plan_delete(sql: &str, db_outer: &Option<Database>) -> Option<(Plan, Vec<Desc
     let where_kw = find_word(&masked, "WHERE", from_kw + "FROM".len());
     let (schema, table_c) = dml_target_name(&s[from_kw + "FROM".len()..where_kw.unwrap_or(s.len())])?;
     let table: &str = table_c.as_str();
+    let db_outer = db;
     let db = db.as_ref()?;
     if !relation_qualifier_ok(db, schema, table) {
         return None;
@@ -31812,7 +31882,7 @@ fn plan_delete(sql: &str, db_outer: &Option<Database>) -> Option<(Plan, Vec<Desc
     // rule it cannot perform, would fire on this DELETE - refuse. An
     // action it CAN perform no longer refuses: it is executed at
     // [run_fk_actions_published].
-    check_predicates(db, table, &columns, descs, DmlGuard::Delete)?;
+    check_predicates(db, db_outer, table, &columns, descs, DmlGuard::Delete)?;
     // FKs referencing this table: each deleted row's key is either
     // CHECKED for child references at execute ([fk_check_parent_row])
     // or is the ACTION to perform ([fk_action_stmts]) - the same list
@@ -39584,6 +39654,15 @@ thread_local! {
     static PLAN_IMAGE: std::cell::RefCell<
         Option<(std::sync::Arc<fire_crab_ods::Image>, usize)>,
     > = const { std::cell::RefCell::new(None) };
+    /// The ONE table a plain single-table query is being planned over,
+    /// for the resolver of an ARRAY element (`COL[i]`), which needs the
+    /// column's domain shape and is handed only the column list. Set at
+    /// the single-table site, cleared elsewhere: an array element in a
+    /// join or a derived table refuses rather than guessing its table.
+    static ARRAY_TABLE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+    /// The attachment's user name, for `USER` / `CURRENT_USER` in a
+    /// statement - recorded at prepare with the statement text
+    static CURRENT_USER_NAME: std::cell::RefCell<String> = std::cell::RefCell::new(String::from("SYSDBA"));
 }
 
 fn plan_query(sql: &str, db: &Option<Database>) -> (Plan, Vec<Descriptor>) {
@@ -39591,6 +39670,7 @@ fn plan_query(sql: &str, db: &Option<Database>) -> (Plan, Vec<Descriptor>) {
     PLAN_IMAGE.with(|c| {
         *c.borrow_mut() = db.as_ref().map(|d| (d.bytes(), d.page_size));
     });
+    ARRAY_TABLE.with(|t| *t.borrow_mut() = None);
     FN_CALLS.with(|l| l.borrow_mut().clear());
     clear_corr_registry();
     PREPARE_REFUSAL.with(|r| *r.borrow_mut() = None);
@@ -44708,8 +44788,21 @@ fn plan_union(
         if !sink.is_empty() {
             return None;
         }
-        if !matches!(plan, Plan::Project { .. }) {
-            return None; // aggregate/group/join branch
+        // every branch shape [branch_rows_res] materialises - a plain
+        // scan, an aggregate or GROUP BY (`SELECT 'T' K, COUNT(*) FROM T
+        // UNION ALL ...` is how a catalog is counted table by table), a
+        // join, a derived table, a modifier
+        if !matches!(
+            plan,
+            Plan::Project { .. }
+                | Plan::Group { .. }
+                | Plan::Join { .. }
+                | Plan::JoinGroup { .. }
+                | Plan::Derived { .. }
+                | Plan::Modified { .. }
+                | Plan::Scalar(..)
+        ) {
+            return None;
         }
         branches.push(plan);
     }
@@ -44724,56 +44817,35 @@ fn plan_union(
             return None;
         }
     }
-    // the output columns read the already-projected row positionally.
-    // The union FIELD name is EMPTY only when some branch's item is an
-    // EXPRESSION; when every branch reads a plain column, the FIRST
-    // branch's column name stays (probed: X UNION ALL X+1 is field "",
-    // X UNION ALL Y is field X, X+1 UNION ALL X is "" - an adversarial
-    // pass refuted the first version of this rule, which blanked every
-    // union column from the one shape the gate had probed). A plain
-    // column's ProjCol carries expr: None; anything computed does not.
-    let all_plain: Vec<bool> = (0..first_cols.len())
-        .map(|i| {
-            branches.iter().all(|b| {
-                output_cols_of(b).get(i).is_some_and(|c| c.expr.is_none())
-            })
-        })
-        .collect();
+    // the output columns read the already-projected row positionally;
+    // their NAMES are settled after the types are reconciled below,
+    // because the engine's naming turns on whether the first branch
+    // kept its own shape - see [union_naming]
     let cols: Vec<ProjCol> = first_cols
         .iter()
         .enumerate()
         .map(|(i, c)| {
-            // ... and the ALIAS goes the same way when the FIRST
-            // branch's item is an UNALIASED expression (probed:
-            // `X+1 UNION ALL X` describes ""/"" where `X UNION ALL
-            // X+1` keeps alias X and `X+1 AS U1 ...` keeps U1).
-            // "Unaliased" is approximated as name == symbolic name -
-            // an explicit `AS ADD` on an ADD would blank wrongly, a
-            // corner the engine distinguishes by par_alias presence
-            // that the branch plan no longer carries.
-            let unaliased_expr =
-                c.expr.is_some() && c.fname.as_deref() == Some(c.name.as_str());
+            // TEXT UNIFIES TO THE WIDEST BRANCH (DataTypeUtil::makeFromList:
+            // the longest literal decides, VARYING if any branch is):
+            // 'EMPLOYEE_PROJECT' beside 'JOB' is a 16-wide column
+            let is_text = |sc: &ProjCol| matches!(sc.sql_type & !1, 448 | 452);
+            let text_len = branches.iter().filter_map(|b| output_cols_of(b).get(i).filter(|bc| is_text(bc)).map(|bc| (bc.length, bc.oct_length))).fold(None, |acc: Option<(i32, i32)>, (l, o)| Some(match acc { Some((al, ao)) => (al.max(l), ao.max(o)), None => (l, o) }));
+            let any_varying = branches.iter().any(|b| output_cols_of(b).get(i).is_some_and(|bc| bc.sql_type & !1 == 448));
             ProjCol {
                 field_id: i,
                 expr: None,
-                name: if unaliased_expr { String::new() } else { c.name.clone() },
-                fname: if all_plain[i] {
-                    Some(c.fname.clone().unwrap_or_else(|| c.name.clone()))
-                } else {
-                    Some(String::new())
-                },
-                // the SAME predicate carries the relation and its
-                // binding alias (probed: an all-plain union answers the
-                // FIRST branch's table AND its alias; any expression
-                // branch blanks all four relation-derived items)
-                relation: if all_plain[i] { c.relation.clone() } else { None },
-                rel_alias: if all_plain[i] { c.rel_alias.clone() } else { None },
+                name: c.name.clone(),
+                length: match text_len { Some((l, _)) if is_text(c) => l, _ => c.length },
+                oct_length: match text_len { Some((_, o)) if is_text(c) => o, _ => c.oct_length },
                 // nullable when ANY branch's column is (probed: a NOT NULL
                 // column unioned with a nullable one describes nullable)
-                sql_type: if branches.iter().any(|b| output_cols_of(b).get(i).is_some_and(|bc| bc.sql_type & 1 == 1)) {
-                    c.sql_type | 1
-                } else {
-                    c.sql_type
+                sql_type: {
+                    let base = if is_text(c) && any_varying { 448 } else { c.sql_type & !1 };
+                    if branches.iter().any(|b| output_cols_of(b).get(i).is_some_and(|bc| bc.sql_type & 1 == 1)) {
+                        base | 1
+                    } else {
+                        base
+                    }
                 },
                 ..c.clone()
             }
@@ -44800,9 +44872,19 @@ fn plan_union(
         // Every branch's (type, scale, sub_type) at this position.
         let mut shapes = Vec::with_capacity(branches.len());
         let mut widths = Vec::with_capacity(branches.len());
+        let mut first_typed: Option<ProjCol> = None;
         for b in &branches {
             match output_cols_of(b).get(i) {
+                // A BARE NULL BRANCH HAS NO SAY IN THE TYPE: the engine's
+                // DataTypeUtil::makeFromList skips a null descriptor, so
+                // `X UNION ALL NULL` describes as X / X / T (measured) and
+                // `NULL UNION ALL X` as X's type. It only makes the
+                // column nullable, which the map above already did.
+                Some(bc) if matches!(bc.expr, Some(Expr::Null)) => {}
                 Some(bc) => {
+                    if first_typed.is_none() {
+                        first_typed = Some(bc.clone());
+                    }
                     shapes.push((bc.sql_type & !1, bc.scale, bc.sub_type));
                     widths.push((bc.length, bc.oct_length));
                 }
@@ -44813,6 +44895,21 @@ fn plan_union(
         }
         // identical in every branch: there is nothing to reconcile, and
         // this is the path every non-numeric union takes
+        if shapes.is_empty() {
+            continue; // every branch is NULL: the first one's own shape stands
+        }
+        if matches!(first_cols[i].expr, Some(Expr::Null)) {
+            // the first branch is the NULL: the first TYPED branch
+            // seeds the shape the loop below reconciles the rest against
+            if let Some(t) = &first_typed {
+                c.sql_type = (t.sql_type & !1) | 1;
+                c.wire = t.wire.clone();
+                c.length = t.length;
+                c.oct_length = t.oct_length;
+                c.scale = t.scale;
+                c.sub_type = t.sub_type;
+            }
+        }
         let same_shape = shapes.iter().all(|s| *s == (c.sql_type & !1, c.scale, c.sub_type));
         let same_width = widths.iter().all(|w| *w == (c.length, c.oct_length));
         if same_shape && same_width {
@@ -44941,6 +45038,54 @@ fn plan_union(
             // widest is the SMALLEST number
             c.scale = shapes.iter().map(|(_, sc, _)| *sc).min().unwrap_or(c.scale);
             c.sub_type = shapes.iter().map(|(_, _, st)| *st).max().unwrap_or(c.sub_type);
+        }
+    }
+    // [union_naming] THE FIRST BRANCH NAMES THE COLUMN, BUT ONLY AS FAR
+    // AS IT KEPT ITS OWN SHAPE. The engine (PASS1_union) maps each union
+    // column onto the first branch's item when the reconciled descriptor
+    // is equivalent to that item's own (dtype, length, scale, sub_type -
+    // nullability aside), and onto a CAST of it otherwise. The map names
+    // the column by the item's KIND (DsqlMapNode::setParameterName): a
+    // plain field keeps field, alias, relation and its binding alias; an
+    // AS keeps only the alias; a literal is CONSTANT and an aggregate its
+    // own name, both ways; any other expression is nameless. Under the
+    // cast only a field's or an alias's name survives, as the alias, and
+    // the field is empty. Measured on the engine, 29 shapes:
+    //   X | X          X / X / T         X | X+1        "" / X
+    //   X+1 | X        "" / ""           X+1 AS Z | X+1 "" / Z
+    //   X | B(igint)   "" / X            B | X          B / B / T
+    //   1 | X          CONSTANT/CONSTANT 'a' | 'bb'     "" / ""
+    //   'a' AS L | 'bb' "" / L           COUNT(*) | B   COUNT / COUNT
+    //   S(varchar) | C(char) S / S / T   C | S          "" / C
+    //   UPPER(S) | S   "" / ""           X | NULL       X / X / T
+    for (i, c) in cols.iter_mut().enumerate() {
+        let f = &first_cols[i];
+        let equiv = (c.sql_type & !1, c.length, c.scale, c.sub_type)
+            == (f.sql_type & !1, f.length, f.scale, f.sub_type);
+        let symbolic = f.fname.clone().unwrap_or_default();
+        let kind_named = symbolic == "CONSTANT"
+            || matches!(symbolic.as_str(), "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "LIST");
+        // a grouped plan hands its aggregate out as a relation-less
+        // column that reads a slot, expr None like a field: its
+        // symbolic name tells it apart (measured: `COUNT(*) AS K UNION
+        // ALL B` is "" / K, an aliased expression, not a field)
+        let plain = f.expr.is_none() && !(f.relation.is_none() && kind_named);
+        // an unaliased expression carries its symbolic name in BOTH
+        // slots ([default_expr_name]); an AS overwrote only the alias
+        let unaliased = plain || symbolic == f.name;
+        let (fname, name, keep_rel) = match (equiv, plain, unaliased) {
+            (true, true, _) => (symbolic.is_empty().then(|| f.name.clone()).unwrap_or(symbolic), f.name.clone(), true),
+            (true, false, true) if kind_named => (symbolic.clone(), symbolic.clone(), false),
+            (true, false, true) => (String::new(), String::new(), false),
+            (true, false, false) => (String::new(), f.name.clone(), false),
+            (false, true, _) | (false, false, false) => (String::new(), f.name.clone(), false),
+            (false, false, true) => (String::new(), String::new(), false),
+        };
+        c.fname = Some(fname);
+        c.name = name;
+        if !keep_rel {
+            c.relation = None;
+            c.rel_alias = None;
         }
     }
     Some(Plan::Union { cols, branches, distinct: !all, order_by: order_ordinal })
@@ -45520,7 +45665,8 @@ fn plan_query_inner_ctx(
     // EXECUTE PROCEDURE is not a SELECT, but isql prepares and FETCHES
     // it like one, so it resolves to a plan here (see PSQL EXECUTION).
     if let Some((parts, pargs)) = parse_execute_procedure(sql) {
-        let db = db.as_ref()?;
+        let db_outer = db;
+    let db = db.as_ref()?;
         // a `?` argument would have to arrive with op_execute; this
         // slice takes literals only
         let args: Vec<Value> = pargs.into_iter().collect::<Option<Vec<_>>>()?;
@@ -45577,6 +45723,14 @@ fn plan_query_inner_ctx(
     // catalog entry to read a format from. Everything above it - the
     // projection, the WHERE, the ORDER BY - is resolved exactly as it
     // would be over a real relation, against that synthetic view.
+    // the ONE table a plain query reads, for the array-element resolver
+    // ([ARRAY_TABLE]) - set before anything resolves a projection
+    ARRAY_TABLE.with(|t| {
+        *t.borrow_mut() = match parse_from(table_s) {
+            Some((from, joins)) if joins.is_empty() => Some(from.table.clone()),
+            _ => None,
+        }
+    });
     if let Some(_dbr) = db.as_ref() {
         if let Some((inner_sql, alias, declared)) = parse_derived_table(table_s) {
             let mut inner_params: Vec<Option<Descriptor>> = Vec::new();
@@ -45859,6 +46013,7 @@ fn plan_query_inner_ctx(
                     }
                     let rel = fire_crab_ods::resolve_relation(&dbr.bytes(), dbr.page_size, &from.table)?;
                     let columns = dbr.columns(&from.table);
+                    ARRAY_TABLE.with(|t| *t.borrow_mut() = Some(from.table.clone()));
                     let descs: Vec<Descriptor> = select_formats(dbr, &from.table, rel)
                         .iter()
                         .max_by_key(|(n, _)| *n)
@@ -46596,6 +46751,7 @@ fn plan_query_inner_ctx(
     // the Option is kept alongside the narrowed reference: a DERIVED
     // side plans its own inner query, and that planner takes the Option
     let db_all = db;
+    let db_outer = db;
     let db = db.as_ref()?;
     // a LATERAL derived table in the FROM is a correlated join the ordinary
     // parser cannot represent - route it to its own planner, which reuses
@@ -55045,6 +55201,17 @@ fn eval_status_items(w: &mut W, e: &EvalErr) {
             w.int(1) // isc_arg_gds
                 .int(GDS_ESCAPE_INVALID);
         }
+        EvalErr::ArrayOutOfBounds { n, lo, hi } => {
+            w.int(1).int(335545028); // isc_ss_out_of_bounds
+            w.int(ISC_ARG_NUMBER).int(*n as i32);
+            w.int(ISC_ARG_NUMBER).int(*lo as i32);
+            w.int(ISC_ARG_NUMBER).int(*hi as i32);
+        }
+        EvalErr::ArrayDimension { expected, got } => {
+            w.int(1).int(335544458); // isc_invalid_dimension
+            w.int(ISC_ARG_NUMBER).int(*expected as i32);
+            w.int(ISC_ARG_NUMBER).int(*got as i32);
+        }
         // the 23000 family: every arg string below is ALREADY QUOTED by
         // the error's builder, exactly as captured from the engine's
         // wire; the key item is appended only when the key rendered
@@ -57416,6 +57583,47 @@ fn blob_charset(descs: &[Descriptor], fid: usize) -> u8 {
     descs.get(fid).map_or(0, |d| d.scale as u8)
 }
 
+/// Element `idx` of the stored array `rel:num`, as a [Value] of the
+/// element's type - `blb::scalar` (blb.cpp): the array blob is read
+/// whole, its InternalArrayDesc header gives the element width and the
+/// bounds, the subscripts locate the element (a subscript outside the
+/// declared bounds is the engine's isc_out_of_bounds), and the element's
+/// bytes decode by the column's element descriptor. Beyond the data
+/// actually written the engine answers the zero element, which is what
+/// a slot of zero bytes decodes to.
+fn array_element_of(rel: u16, num: u64, idx: &[i32], elem: &Descriptor) -> Result<Value, EvalErr> {
+    let ctx = BLOB_CTX.with(|c| c.borrow().clone());
+    let Some((image, page_size)) = ctx else {
+        return Err(EvalErr::Unsupported);
+    };
+    let b = fire_crab_blb::read_blob(&image, page_size, rel, num).map_err(|_| EvalErr::Unsupported)?;
+    let content = b.content();
+    let Some((desc, data)) = ArrayDesc::decode(&content) else {
+        return Err(EvalErr::Unsupported);
+    };
+    if idx.len() != desc.dims.len() {
+        return Err(EvalErr::ArrayDimension { expected: desc.dims.len() as i64, got: idx.len() as i64 });
+    }
+    for (&n, &(_, lo, hi)) in idx.iter().zip(&desc.dims) {
+        if n < lo || n > hi {
+            return Err(EvalErr::ArrayOutOfBounds { n: n as i64, lo: lo as i64, hi: hi as i64 });
+        }
+    }
+    let Some(off) = desc.subscript(idx) else {
+        return Err(EvalErr::Unsupported);
+    };
+    let elen = desc.elem_len as usize;
+    let mut slot = vec![0u8; elen];
+    if let Some(bytes) = data.get(off * elen..(off + 1) * elen) {
+        slot.copy_from_slice(bytes);
+    }
+    // decode as a one-field record: a clear null bit, then the slot
+    let mut rec = vec![0u8];
+    rec.extend_from_slice(&slot);
+    let d = Descriptor { offset: 1, length: elen as u16, ..elem.clone() };
+    Ok(fire_crab_ods::format::decode_field(&rec, &d, 0))
+}
+
 fn blob_text_of(rel: u16, num: u64, cs: u8) -> Result<String, EvalErr> {
     // A COMPUTED BLOB IS READABLE BY THE STATEMENT THAT MADE IT. One
     // carries relation 0 and lives in the mint context until the op
@@ -58753,6 +58961,12 @@ enum WinKind {
 /// is known).
 #[derive(Clone, PartialEq)]
 enum RawExpr {
+    /// `<column>[<sub>, ...]` - one element of an ARRAY column
+    Subscript(String, Vec<RawExpr>),
+    /// `USER` / `CURRENT_USER`: the attachment's user name
+    CtxUser,
+    /// `CURRENT_ROLE`: the attachment's role (NONE when none)
+    CtxRole,
     /// `<value> COLLATE <name>` - an EXPLICIT collation on an
     /// operand, the tightest-binding postfix SQL has. It changes no
     /// VALUE (a projected `S COLLATE X` answers S), only what a
@@ -60640,6 +60854,36 @@ fn expr_atom_bare(b: &[char], pos: &mut usize) -> Option<RawExpr> {
                         });
                     }
                 }
+                // the user-context keywords are values, not columns
+                // (parse.y: USER and CURRENT_USER are the same node,
+                // CURRENT_ROLE its sibling) - unquoted only
+                if !quoted {
+                    match word.to_ascii_uppercase().as_str() {
+                        "USER" | "CURRENT_USER" => return Some(RawExpr::CtxUser),
+                        "CURRENT_ROLE" => return Some(RawExpr::CtxRole),
+                        _ => {}
+                    }
+                }
+                // `NAME[i, j]`: an element of an ARRAY column (parse.y
+                // array_element_ref) - the subscripts are value
+                // expressions, one per dimension
+                let mut p2 = *pos;
+                skip_ws(b, &mut p2);
+                if b.get(p2) == Some(&'[') {
+                    p2 += 1;
+                    let mut subs = Vec::new();
+                    loop {
+                        subs.push(expr_add(b, &mut p2)?);
+                        skip_ws(b, &mut p2);
+                        match b.get(p2) {
+                            Some(',') => p2 += 1,
+                            Some(']') => break,
+                            _ => return None,
+                        }
+                    }
+                    *pos = p2 + 1;
+                    return Some(RawExpr::Subscript(word, subs));
+                }
                 Some(RawExpr::Col(word))
             }
         }
@@ -60664,6 +60908,8 @@ fn raw_bad_substring_len(e: &RawExpr) -> Option<i64> {
     let walk_all = |args: &[RawExpr]| args.iter().find_map(raw_bad_substring_len);
     match e {
         RawExpr::Param(_) | RawExpr::Subq(_) => None,
+        RawExpr::Subscript(_, subs) => walk_all(subs),
+        RawExpr::CtxUser | RawExpr::CtxRole => None,
         // the wrapper decides nothing about literals; walk through it
         RawExpr::Collate(inner, _) => raw_bad_substring_len(inner),
         RawExpr::UserFn(_, args) => walk_all(args),
@@ -61477,6 +61723,23 @@ fn cast_charset_id(name: &str) -> Option<u8> {
 /// Resolve a raw expression's column names to field ids against the
 /// relation, producing a typed [Expr]. None on an unknown column or an
 /// unsupported column type (the caller then falls back).
+/// The operand of `IS [NOT] NULL`: a bare BLOB or ARRAY column resolves
+/// to its stored id ([Expr::Col]) whatever its sub_type, since the test
+/// never opens it; anything else resolves as a value.
+fn resolve_null_test_operand(a: &RawExpr, columns: &[RelationColumn], descs: &[Descriptor]) -> Option<Expr> {
+    if let RawExpr::Col(name) = a {
+        if let Some(rc) = find_col(columns, name) {
+            let fid = rc.field_id as usize;
+            if let Some(d) = descs.get(fid) {
+                if matches!(d.dtype, dtype::BLOB | dtype::ARRAY) && !is_computed_fid(descs, fid) {
+                    return Some(Expr::Col(fid));
+                }
+            }
+        }
+    }
+    resolve_expr(a, columns, descs)
+}
+
 fn resolve_raw_cond(
     c: &RawCond,
     columns: &[RelationColumn],
@@ -61547,8 +61810,12 @@ fn resolve_raw_cond(
             }
             Cond2::Similar(Box::new(e), sim_compile(pat, *esc)?, *negated)
         }
-        RawCond::IsNull(a) => Cond2::IsNull(Box::new(resolve_expr(a, columns, descs)?)),
-        RawCond::IsNotNull(a) => Cond2::IsNotNull(Box::new(resolve_expr(a, columns, descs)?)),
+        // A NULL TEST READS NO CONTENT: a BLOB column of ANY sub_type (a
+        // BLR blob has no text filter and refuses everywhere else) and an
+        // ARRAY column test their stored id - `RDB$DEFAULT_VALUE IS NULL`
+        // is how the catalog is asked whether a domain has a default
+        RawCond::IsNull(a) => Cond2::IsNull(Box::new(resolve_null_test_operand(a, columns, descs)?)),
+        RawCond::IsNotNull(a) => Cond2::IsNotNull(Box::new(resolve_null_test_operand(a, columns, descs)?)),
         // the NULL test with the engine's BOOLEAN-ONLY operand rule:
         // `ID IS UNKNOWN` refuses at prepare (as the engine does) where
         // `ID IS NULL` answers - the gate lives here because only
@@ -62272,6 +62539,38 @@ fn resolve_expr_inner(
         // a correlated subquery: its outer references bind HERE, in the
         // enclosing row's columns ([resolve_corr_sub])
         RawExpr::Subq(id) => resolve_corr_sub(*id, columns, descs)?,
+        RawExpr::Subscript(name, subs) => {
+            let rc = find_col(columns, name)?;
+            let fid = rc.field_id as usize;
+            let d = descs.get(fid)?;
+            let table = ARRAY_TABLE.with(|t| t.borrow().clone());
+            if d.dtype != dtype::ARRAY {
+                return None; // the engine: "scalar operator used on field which is not an array"
+            }
+            // the element's shape from the catalog (RDB$FIELDS +
+            // RDB$FIELD_DIMENSIONS of the column's domain), for the
+            // describe; reachable only while a single table is being
+            // planned ([ARRAY_TABLE])
+            let table = table?;
+            let (image, ps) = PLAN_IMAGE.with(|c| c.borrow().clone())?;
+            let shape = fire_crab_ods::ddl::array_shape(&image, ps, &table, &rc.name)?;
+            if subs.len() != shape.dims.len() {
+                return None;
+            }
+            let elem = Descriptor {
+                dtype: shape.dtype,
+                scale: shape.scale,
+                length: shape.length,
+                sub_type: shape.sub_type,
+                flags: 0,
+                offset: 0,
+            };
+            let mut rs = Vec::with_capacity(subs.len());
+            for sx in subs {
+                rs.push(resolve_expr(sx, columns, descs)?);
+            }
+            Expr::ArrayElem { fid, subs: rs, elem }
+        }
         RawExpr::Col(name) => {
             let rc = find_col(columns, name)?;
             let fid = rc.field_id as usize;
@@ -62309,6 +62608,8 @@ fn resolve_expr_inner(
         RawExpr::Dec(raw, scale) => Expr::Dec(*raw, *scale),
         RawExpr::Double(d) => Expr::Double(*d),
         RawExpr::Bool(b) => Expr::Bool(*b),
+        RawExpr::CtxUser => Expr::CtxUser,
+        RawExpr::CtxRole => Expr::CtxRole,
         // the bare-column-as-condition marker resolves ONLY at the two
         // sites that check the tested side is BOOLEAN; anywhere else it
         // refuses (the engine's prepare-time "invalid usage of boolean
@@ -62572,6 +62873,16 @@ fn resolve_expr_inner(
 /// operand propagates (SQL three-valued arithmetic).
 #[derive(Clone)]
 enum Expr {
+    /// `USER` / `CURRENT_USER` - the attachment's user name, VARCHAR(63)
+    /// UTF8 named USER (SQLDA measured)
+    CtxUser,
+    /// `CURRENT_ROLE` - VARCHAR(63) UTF8 named ROLE, NONE when no role
+    CtxRole,
+    /// one element of the ARRAY column `fid`: the subscripts, and the
+    /// element's descriptor (from the catalog at prepare, for describe);
+    /// the value is read at row time out of the array blob's own
+    /// header and data (its InternalArrayDesc names the layout)
+    ArrayElem { fid: usize, subs: Vec<Expr>, elem: Descriptor },
     /// a BLOB column read as TEXT - the operand form of a blob: what
     /// `CAST(<blob> AS VARCHAR)` reads, and what every text predicate
     /// and length function over a blob column reads. The bytes are
@@ -63169,6 +63480,13 @@ enum EvalErr {
     /// (SQLSTATE 22025, jrd/evl_string.h:349). Raised at first real
     /// evaluation, value-gated (see [invalid_escape])
     InvalidEscape,
+    /// an array subscript outside the declared bounds: isc_ss_out_of_bounds
+    /// (-406, "Subscript @1 out of bounds [@2, @3]")
+    ArrayOutOfBounds { n: i64, lo: i64, hi: i64 },
+    /// a subscript count that is not the array's dimension count:
+    /// isc_invalid_dimension (-171, "column not array or invalid
+    /// dimensions (expected @1, encountered @2)")
+    ArrayDimension { expected: i64, got: i64 },
     /// a duplicate key in a CONSTRAINT-backed unique index (PK or
     /// UNIQUE constraint): `isc_unique_key_violation` (SQLSTATE 23000)
     /// + the key item when the key renders. Every string is stored
@@ -65594,6 +65912,8 @@ impl Expr {
                 _ => None,
             },
             Expr::BlobText(..) => Some(ExprType::Text),
+            Expr::ArrayElem { elem, .. } => expr_type_of_desc(elem).map(|(t, _)| t),
+            Expr::CtxUser | Expr::CtxRole => Some(ExprType::Text),
             // a BINARY literal is TEXT, at charset OCTETS
             Expr::Hex(_) => Some(ExprType::Text),
             // a `?` is untyped on its own - it is always wrapped by the
@@ -66168,6 +66488,15 @@ impl Expr {
     fn rank_of(&self, descs: &[Descriptor]) -> Option<NumRank> {
         match self {
             Expr::BlobOf(..) => None,
+            Expr::CtxUser | Expr::CtxRole => None,
+            // an array element ranks by the element's stored dtype, as
+            // a column does by its own
+            Expr::ArrayElem { elem, .. } => match elem.dtype {
+                dtype::SHORT | dtype::LONG => Some(NumRank::Long),
+                dtype::INT64 => Some(NumRank::I64),
+                dtype::INT128 => Some(NumRank::I128),
+                _ => None,
+            },
             Expr::BlobText(..)
             | Expr::Hex(_)
             | Expr::TimeTzLit(..)
@@ -66476,6 +66805,8 @@ impl Expr {
             }
             Expr::Double(d) => Value::Double(*d),
             Expr::Bool(b) => Value::Bool(*b),
+            Expr::CtxUser => Value::Text(CURRENT_USER_NAME.with(|u| u.borrow().clone())),
+            Expr::CtxRole => Value::Text("NONE".into()),
             // three-valued: UNKNOWN is the SQL NULL of the boolean type
             Expr::Cond(c) => match c.eval(values)? {
                 Some(b) => Value::Bool(b),
@@ -66558,6 +66889,20 @@ impl Expr {
             },
             Expr::BlobText(fid, cs) => match values.get(*fid) {
                 Some(Value::Blob(rel, num)) => Value::Text(blob_text_of(*rel, *num, *cs)?),
+                _ => Value::Null,
+            },
+            Expr::ArrayElem { fid, subs, elem } => match values.get(*fid) {
+                Some(Value::Blob(rel, num)) => {
+                    let mut idx: Vec<i32> = Vec::with_capacity(subs.len());
+                    for sx in subs {
+                        match sx.eval(values)? {
+                            Value::Int(n) => idx.push(n as i32),
+                            Value::Null => return Ok(Value::Null),
+                            _ => return Err(EvalErr::Unsupported),
+                        }
+                    }
+                    array_element_of(*rel, *num, &idx, elem)?
+                }
                 _ => Value::Null,
             },
             Expr::GenVal(i) => values.get(*i).cloned().unwrap_or(Value::Null),
@@ -73175,7 +73520,7 @@ fn parse_projection(proj: &str) -> Option<Proj> {
         // the bare clock keywords LOOK like column names but are
         // expressions - route them to the expression parser before the
         // ident path reads them as a (nonexistent) column
-        let clock_kw = ["CURRENT_DATE", "CURRENT_TIME", "CURRENT_TIMESTAMP", "LOCALTIME", "LOCALTIMESTAMP"]
+        let clock_kw = ["CURRENT_DATE", "CURRENT_TIME", "CURRENT_TIMESTAMP", "LOCALTIME", "LOCALTIMESTAMP", "CURRENT_USER", "USER", "CURRENT_ROLE"]
             .iter()
             .any(|k| body.trim().eq_ignore_ascii_case(k));
         if clock_kw {
@@ -73359,7 +73704,14 @@ fn split_alias(item: &str) -> (&str, Option<&str>) {
     // is lifted: a trailing `NULL`/`UNKNOWN` (`S IS NULL X`) keeps refusing,
     // because a projected boolean is a shape this evaluator does not yet
     // answer correctly - a refusal beats a wrong answer.
-    let head_keyword = |w: &str| keyword(w) && !w.eq_ignore_ascii_case("END");
+    // NULL / UNKNOWN at the end of the head are the same: `S IS NULL X`
+    // ends its predicate, and a projected boolean has been an answered
+    // shape since [parse_raw_expr_any] took conditions as values - the
+    // refusal this once kept outlived its reason (found on the employee
+    // sample's catalog probes: `RDB$DEFAULT_VALUE IS NULL DV`)
+    let head_keyword = |w: &str| {
+        keyword(w) && !matches!(w.to_ascii_uppercase().as_str(), "END" | "NULL" | "UNKNOWN")
+    };
     let last_word = head.rsplit(|c: char| c.is_whitespace()).next().unwrap_or("");
     // ... and a head that is EXACTLY `NULL` is the LITERAL, not the tail
     // of an `IS NULL`, so the token after it is an ordinary alias.
@@ -73403,6 +73755,10 @@ fn split_alias(item: &str) -> (&str, Option<&str>) {
 fn default_expr_name(raw: &RawExpr) -> String {
     match raw {
         RawExpr::Param(_) => "",
+        // an array element is titled by its column (measured: LANGUAGE_REQ)
+        RawExpr::Subscript(n, _) => return n.to_ascii_uppercase(),
+        RawExpr::CtxUser => "USER",
+        RawExpr::CtxRole => "ROLE",
         // `S COLLATE X` describes as CAST, name and alias both -
         // the engine builds a CastNode for it (measured)
         RawExpr::Collate(..) => "CAST",
@@ -76443,7 +76799,7 @@ fn eval_psql_expr(e: &fire_crab_ods::expr::Expr, f: &PsqlFrame) -> Result<Value,
     // overflow` (SQLSTATE 22003, "Integer overflow. The result of an
     // integer operation caused the most significant bit of the result to
     // carry") and a body can catch it.
-    let bin = |a: &E, b: &E, op: fn(i64, i64) -> Option<i64>| -> Result<Value, PsqlStop> {
+    let bin = |a: &E, b: &E, op: fn(i64, i64) -> Option<i64>, kind: char| -> Result<Value, PsqlStop> {
         match (eval_psql_expr(a, f)?, eval_psql_expr(b, f)?) {
             (Value::Int(x), Value::Int(y)) => match op(x, y) {
                 Some(v) => Ok(Value::Int(v)),
@@ -76453,7 +76809,10 @@ fn eval_psql_expr(e: &fire_crab_ods::expr::Expr, f: &PsqlFrame) -> Result<Value,
                 })),
             },
             (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
-            _ => Err(PsqlStop::Unsupported),
+            // a SCALED operand: exact arithmetic at the engine's result
+            // scale (DSC_add_result / DSC_multiply_result: the wider
+            // scale for + and -, the summed scale for *)
+            (x, y) => psql_scaled_arith(kind, &x, &y),
         }
     };
     match e {
@@ -76509,9 +76868,9 @@ fn eval_psql_expr(e: &fire_crab_ods::expr::Expr, f: &PsqlFrame) -> Result<Value,
                 }
             }
         },
-        E::Add(a, b) => bin(a, b, |x, y| x.checked_add(y)),
-        E::Subtract(a, b) => bin(a, b, |x, y| x.checked_sub(y)),
-        E::Multiply(a, b) => bin(a, b, |x, y| x.checked_mul(y)),
+        E::Add(a, b) => bin(a, b, |x, y| x.checked_add(y), '+'),
+        E::Subtract(a, b) => bin(a, b, |x, y| x.checked_sub(y), '-'),
+        E::Multiply(a, b) => bin(a, b, |x, y| x.checked_mul(y), '*'),
         // division by zero is an error in SQL, not a NULL
         E::Divide(a, b) => match (eval_psql_expr(a, f)?, eval_psql_expr(b, f)?) {
             // it was an error already - but a REFUSAL, which no handler
@@ -76524,9 +76883,89 @@ fn eval_psql_expr(e: &fire_crab_ods::expr::Expr, f: &PsqlFrame) -> Result<Value,
             })),
             (Value::Int(x), Value::Int(y)) => Ok(Value::Int(x / y)),
             (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
-            _ => Err(PsqlStop::Unsupported),
+            (x, y) => psql_scaled_arith('/', &x, &y),
         },
     }
+}
+
+/// A PSQL comparison of two numeric values of any exact or approximate
+/// kind: exact against exact by scaled integer ([num_cmp]), anything
+/// against a DOUBLE as doubles.
+fn psql_num_cmp(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
+    if let Some(o) = num_cmp(a, b) {
+        return Some(o);
+    }
+    let as_f64 = |v: &Value| -> Option<f64> {
+        match v {
+            Value::Double(d) => Some(*d),
+            _ => {
+                let (r, sc) = numeric_parts(v)?;
+                Some(r as f64 / 10f64.powi(sc as i32))
+            }
+        }
+    };
+    as_f64(a)?.partial_cmp(&as_f64(b)?)
+}
+
+/// `+ - * /` over two numeric PSQL values when at least one is not a
+/// plain integer: exact operands compute as scaled integers with the
+/// engine's dialect-3 result scales - `+`/`-` at the wider scale, `*` at
+/// the summed scale, `/` at the summed scale with the dividend scaled
+/// up by the divisor's scale twice (measured: `(1000.00) * 100 /
+/// 105900.00` = 0.9442, the employee sample's PERCENT_CHANGE); a double
+/// operand makes the whole thing double.
+fn psql_scaled_arith(kind: char, a: &Value, b: &Value) -> Result<Value, PsqlStop> {
+    let overflow = || PsqlStop::Raise(Thrown::Runtime { err: EvalErr::IntegerOverflow, trace: Vec::new() });
+    let div0 = || PsqlStop::Raise(Thrown::Runtime { err: EvalErr::DivideByZero, trace: Vec::new() });
+    if matches!(a, Value::Double(_)) || matches!(b, Value::Double(_)) {
+        let f = |v: &Value| -> Option<f64> {
+            match v {
+                Value::Double(d) => Some(*d),
+                _ => numeric_parts(v).map(|(r, sc)| r as f64 / 10f64.powi(sc as i32)),
+            }
+        };
+        let (x, y) = (f(a).ok_or(PsqlStop::Unsupported)?, f(b).ok_or(PsqlStop::Unsupported)?);
+        return Ok(Value::Double(match kind {
+            '+' => x + y,
+            '-' => x - y,
+            '*' => x * y,
+            '/' => {
+                if y == 0.0 {
+                    return Err(div0());
+                }
+                x / y
+            }
+            _ => return Err(PsqlStop::Unsupported),
+        }));
+    }
+    let (ra, sa) = numeric_parts(a).ok_or(PsqlStop::Unsupported)?;
+    let (rb, sb) = numeric_parts(b).ok_or(PsqlStop::Unsupported)?;
+    // Firebird scales are NEGATIVE powers of ten: scale -2 means /100
+    let pow = |k: i32| -> Option<i128> { 10i128.checked_pow(k as u32) };
+    let (raw, scale) = match kind {
+        '+' | '-' => {
+            let sc = sa.min(sb);
+            let x = ra.checked_mul(pow((sa - sc) as i32).ok_or_else(overflow)?).ok_or_else(overflow)?;
+            let y = rb.checked_mul(pow((sb - sc) as i32).ok_or_else(overflow)?).ok_or_else(overflow)?;
+            let r = if kind == '+' { x.checked_add(y) } else { x.checked_sub(y) }.ok_or_else(overflow)?;
+            (r, sc)
+        }
+        '*' => (ra.checked_mul(rb).ok_or_else(overflow)?, sa.checked_add(sb).ok_or_else(overflow)?),
+        '/' => {
+            if rb == 0 {
+                return Err(div0());
+            }
+            // result scale sa + sb; R = A * 10^(2*|sb|) / B (truncating)
+            let up = pow((-2 * sb as i32).max(0)).ok_or_else(overflow)?;
+            let r = ra.checked_mul(up).ok_or_else(overflow)? / rb;
+            (r, sa.checked_add(sb).ok_or_else(overflow)?)
+        }
+        _ => return Err(PsqlStop::Unsupported),
+    };
+    if i64::try_from(raw).is_err() {
+        return Err(overflow());
+    }
+    Ok(scaled_value(raw, scale))
 }
 
 /// Evaluate a PSQL condition - three-valued, None being UNKNOWN, which
@@ -76552,6 +76991,28 @@ fn eval_psql_cond(
         },
         C::Cmp(op, l, r) => {
             let (a, b) = (eval_psql_expr(l, f)?, eval_psql_expr(r, f)?);
+            // EVERY NUMERIC PAIR compares by value - a scaled NUMERIC
+            // against another, or against an integer or a double
+            // (`IF (old.salary <> new.salary)` on the employee sample's
+            // SAVE_SALARY_CHANGE, two NUMERIC(10,2) values, refused as
+            // "PSQL this server does not interpret" before this)
+            if !matches!(a, Value::Null | Value::Int(_) | Value::Text(_)) || !matches!(b, Value::Null | Value::Int(_) | Value::Text(_)) {
+                if matches!(a, Value::Null) || matches!(b, Value::Null) {
+                    return Ok(None);
+                }
+                let Some(ord) = psql_num_cmp(&a, &b) else {
+                    return Err(PsqlStop::Unsupported);
+                };
+                use std::cmp::Ordering::*;
+                return Ok(Some(match op {
+                    CmpOp::Eql => ord == Equal,
+                    CmpOp::Neq => ord != Equal,
+                    CmpOp::Lss => ord == Less,
+                    CmpOp::Leq => ord != Greater,
+                    CmpOp::Gtr => ord == Greater,
+                    CmpOp::Geq => ord != Less,
+                }));
+            }
             match (a, b) {
                 (Value::Null, _) | (_, Value::Null) => None,
                 (Value::Int(x), Value::Int(y)) => Some(match op {
@@ -78354,6 +78815,18 @@ fn render_psql_expr(e: &fire_crab_ods::expr::Expr, f: &PsqlFrame) -> Option<Stri
         // rendering it as itself is the whole point: `UPDATE LG SET V =
         // V + 1` has to reach LG's planner with `V` still in it, so the
         // per-row arithmetic happens per LG row.
+        // A bare `USER` / `CURRENT_USER` / `CURRENT_ROLE` in a body is the
+        // context keyword, not a column: the body parser reads it as a
+        // plain field (it has no keyword atom), and rendering it as the
+        // quoted identifier `"USER"` would send the planner looking for
+        // a column of that name. The keyword text goes through instead,
+        // so the rendered statement evaluates it the way a typed one does.
+        E::Field { context, name }
+            if *context == CTX_PLAIN
+                && matches!(name.as_str(), "USER" | "CURRENT_USER" | "CURRENT_ROLE") =>
+        {
+            name.clone()
+        }
         E::Field { context, name } if *context == CTX_PLAIN => render_canon_ref(name),
         // ...but an `OLD.`/`NEW.` reference that reached this arm is one
         // the fold above could NOT spell as a literal - [psql_literal]
@@ -83146,6 +83619,9 @@ fn expr_no_raise(e: &Expr, descs: &[Descriptor]) -> bool {
         // minting a blob reads its operand's blob and can raise (a user
         // sub_type has no filter to text)
         Expr::BlobOf(..) => false,
+        // an array element read can raise (a subscript out of bounds)
+        Expr::ArrayElem { .. } => false,
+        Expr::CtxUser | Expr::CtxRole => true,
         // a literal never raises
         Expr::Hex(_) => true,
         // a parameter's value is substituted before eval; the CAST above
@@ -85149,6 +85625,7 @@ fn after_auth(
                     read_int(&mut s, &mut dec)?; // p_sqlst_flags
                 }
                 CURRENT_ATT_CS.with(|c| c.set(att_cs.id));
+                CURRENT_USER_NAME.with(|u| *u.borrow_mut() = user.to_string());
                 CURRENT_SQL.with(|c| *c.borrow_mut() = stmt_text_decode(&sql, att_cs.id));
                 let text = entry_strip_comments(&stmt_text_decode(&sql, att_cs.id));
                 // THE SAME TWO GUARDS THE PREPARE PATH APPLIES. These
@@ -85456,6 +85933,7 @@ fn after_auth(
                 CURRENT_ATT_CS.with(|c| c.set(att_cs.id));
                 stmt_sql = entry_strip_comments(&stmt_text_decode(&sql, att_cs.id));
                 // ...and the text a DDL trigger reads as SQL_TEXT
+                CURRENT_USER_NAME.with(|u| *u.borrow_mut() = user.to_string());
                 CURRENT_SQL.with(|c| *c.borrow_mut() = stmt_text_decode(&sql, att_cs.id));
                 if std::env::var("FC_SRV_TRACE").is_ok() {
                     eprintln!("[srv] prepare sql = {:?}", stmt_sql);

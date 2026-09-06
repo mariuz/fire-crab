@@ -148,13 +148,14 @@ case "$out" in
     *) echo "DIFF mismatched branch widths answered [$out]"; fail=1 ;;
 esac
 
-# 4. an aggregate branch is outside this slice - it must fail, not answer
-out=$(printf 'SELECT COUNT(*) FROM A UNION ALL SELECT ID FROM B;\n' |
+# 4. an aggregate branch answers under the AGGREGATE's description
+# (the engine: COUNT(*) is INT64 and wider than ID, so the union column
+# describes as COUNT and the first row is A's count, then B's ids)
+out=$(printf 'SELECT COUNT(*) FROM A UNION ALL SELECT ID FROM B ORDER BY 1;\n' |
       "$ISQL" -q -b -user "$U" -pas "$P" "127.0.0.1/$PORT:$DB" 2>&1 | tr -s ' \n' ' ')
 case "$out" in
-    *"Statement failed"*|*error*|*ERROR*)
-        echo "OK   teeth: an aggregate branch is refused" ;;
-    *) echo "DIFF an aggregate branch answered [$out]"; fail=1 ;;
+    *"COUNT"*1*2*4*5*) echo "OK   teeth: an aggregate branch answers as COUNT ($out)" ;;
+    *) echo "DIFF an aggregate branch answered [$out], want COUNT then 1 2 4 5"; fail=1 ;;
 esac
 
 exit $fail

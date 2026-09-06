@@ -8874,6 +8874,7 @@ fn catalog_field_list(
     let fcomp_f = ffid("RDB$COMPUTED_BLR");
     let fdims_f = ffid("RDB$DIMENSIONS");
     let fcs_f = ffid("RDB$CHARACTER_SET_ID");
+    let fcoll_f = ffid("RDB$COLLATION_ID");
     let mut sources: Vec<(String, (u8, u16, i8, i16, bool))> = Vec::new();
     walk_rows(file, page_size, 2, f_descs, |vals| {
         let Some(fname) = text(vals.get(fn_f)) else { return };
@@ -8919,6 +8920,11 @@ fn catalog_field_list(
             (crate::format::dtype::ARRAY, 8, 0, 0, false)
         } else if dt == crate::format::dtype::BLOB {
             (dt, 8, int_at(fcs_f) as i8, int_at(fsub_f) as i16, computed)
+        } else if matches!(dt, crate::format::dtype::TEXT | crate::format::dtype::VARYING) {
+            // a text column's sub_type is its ttype (charset | collation
+            // << 8), never RDB$FIELD_SUB_TYPE - see [crate::sysfmt]
+            let tt = (int_at(fcs_f) as i16) | ((int_at(fcoll_f) as i16) << 8);
+            (dt, len, int_at(fs_f) as i8, tt, computed)
         } else {
             (dt, len, int_at(fs_f) as i8, int_at(fsub_f) as i16, computed)
         };
