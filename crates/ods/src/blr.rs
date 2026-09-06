@@ -493,6 +493,10 @@ impl<'a> Reader<'a> {
     }
 }
 
+/// The literal width of a descriptor whose data is a word-length numeric
+/// string rather than a fixed number of bytes.
+const LEN_PREFIXED: usize = usize::MAX;
+
 /// A counted name: one length byte, then the bytes.
 fn read_name(r: &mut Reader) -> Option<String> {
     let n = r.byte()? as usize;
@@ -562,14 +566,18 @@ fn consume_dtype(r: &mut Reader, out: &mut BlrDecode) -> Option<(usize, &'static
             r.byte()?;
             8
         } // blr_int64  (+scale)
-        26 => {
-            r.byte()?;
-            16
-        } // blr_int128 (+scale)
         9 => 8,                       // blr_quad
         10 => 4,                      // blr_float
-        11 => 8,                      // blr_d_float
-        27 => 8,                      // blr_double
+        // A DOUBLE / DEC128 / INT128 LITERAL IS NUMERIC TEXT: a word
+        // length then the digits (LiteralNode::parse, ExprNodes.cpp:7729-
+        // 7768, "the value is passed as if it were a text string") - not
+        // the binary width the descriptor names. The width is decided
+        // when the literal's data is read ([LEN_PREFIXED]).
+        11 | 27 | 25 => LEN_PREFIXED, // blr_d_float / blr_double / blr_dec128
+        26 => {
+            r.byte()?; // scale
+            LEN_PREFIXED
+        } // blr_int128
         12 => 4,                      // blr_sql_date
         13 => 4,                      // blr_sql_time
         28 => 6,                      // blr_sql_time_tz
@@ -577,7 +585,6 @@ fn consume_dtype(r: &mut Reader, out: &mut BlrDecode) -> Option<(usize, &'static
         29 => 10,                     // blr_timestamp_tz
         23 => 1,                      // blr_bool
         24 => 8,                      // blr_dec64
-        25 => 16,                     // blr_dec128
         14 => r.word()? as usize,     // blr_text   (+len)
         37 => r.word()? as usize + 2, // blr_varying (+len, +2)
         40 => r.word()? as usize,     // blr_cstring (+len)
@@ -654,11 +661,20 @@ pub fn decode(blr: &[u8]) -> Result<BlrDecode, BlrError> {
         ..Default::default()
     };
     out.lines.push(format!("blr_version{}", version));
-    // blr_flags (234): a header byte FB6 may put right after the version
-    // (blr_flags_search_system_schema), before the program
+    // blr_flags (234): a header FB6 may put right after the version -
+    // a list of `tag, word length, bytes` ending in blr_end
+    // (BlrReader::parseHeader, BlrReader.h:131-172; tag 1 =
+    // blr_flags_search_system_schema)
     if r.b.get(r.pos) == Some(&234) {
         r.byte();
-        r.byte().ok_or(BlrError::Truncated { offset: r.pos })?;
+        loop {
+            let tag = r.byte().ok_or(BlrError::Truncated { offset: r.pos })?;
+            if tag == 255 {
+                break;
+            }
+            let len = r.word().ok_or(BlrError::Truncated { offset: r.pos })? as usize;
+            r.take(len).ok_or(BlrError::Truncated { offset: r.pos })?;
+        }
     }
 
     walk_verb(&mut r, &mut out, 1)?;
@@ -816,6 +832,9 @@ fn walk_verb(r: &mut Reader, out: &mut BlrDecode, level: usize) -> Result<(), Bl
                     .push(format!("{}{}", "   ".repeat(level + 1), dname));
             }
             Op::Literal => {
+                if n == LEN_PREFIXED {
+                    n = r.word().ok_or_else(|| trunc(r))? as usize;
+                }
                 let data = r.take(n).ok_or_else(|| trunc(r))?;
                 if verb != 21 {
                     // every literal but blr_literal's data is a NAME
@@ -1258,6 +1277,40 @@ mod tests {
         // full clean consume to blr_eoc
         assert!(d.lines.iter().any(|l| l.contains("blr_concatenate")));
         assert_eq!(d.lines.last().unwrap(), "blr_eoc");
+    }
+
+    /// FB6 may follow the version with a blr_flags header: tag, word
+    /// length, bytes, ..., blr_end (BlrReader::parseHeader). Skipped
+    /// whole; the program after it decodes as before.
+    #[test]
+    fn skips_a_flags_header() {
+        let d = decode(&[5, 234, 1, 0, 0, 255, 45, 76]).unwrap();
+        assert!(d.lines.iter().any(|l| l.contains("blr_null")));
+        assert_eq!(d.lines.last().unwrap(), "blr_eoc");
+    }
+
+    /// A blr_double literal is numeric TEXT with a word length
+    /// (LiteralNode::parse): `1.5` travels as 3 characters, not 8 bytes.
+    #[test]
+    fn a_double_literal_is_a_counted_numeric_string() {
+        let d = decode(&[5, 21, 27, 3, 0, b'1', b'.', b'5', 76]).unwrap();
+        assert_eq!(d.lines.last().unwrap(), "blr_eoc");
+        let d = decode(&[5, 21, 26, 0, 2, 0, b'4', b'2', 76]).unwrap();
+        assert_eq!(d.lines.last().unwrap(), "blr_eoc");
+    }
+
+    /// gbak's generator-value program records the generator it draws; a
+    /// blr_abort records the exception it raises.
+    #[test]
+    fn records_a_generator_draw_and_an_exception() {
+        let blr: [u8; 46] = [
+            5, 2, 3, 0, 0, 16, 0, 2, 1, 231, 6, 80, 85, 66, 76, 73, 67, 10, 69, 77, 80, 95, 78,
+            79, 95, 71, 69, 78, 1, 21, 16, 0, 145, 0, 0, 0, 0, 0, 0, 0, 26, 0, 0, 255, 255, 76,
+        ];
+        let d = decode(&blr).unwrap();
+        assert_eq!(d.deps, vec![DepEvent::GenId { name: "EMP_NO_GEN".into() }]);
+        let d = decode(&[5, 128, 2, 3, b'E', b'X', b'C', 76]).unwrap();
+        assert_eq!(d.deps, vec![DepEvent::Exception { name: "EXC".into() }]);
     }
 
     #[test]
