@@ -1450,6 +1450,18 @@ thread_local! {
     static FN_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
+/// A value expression stored on its own - `RDB$COMPUTED_BLR`: the
+/// version byte, one expression, blr_eoc. A verb outside this
+/// executor's surface is an Err, which the caller turns into "outside"
+/// so the source interpreter runs the body instead.
+pub fn parse_value_blr(blr_bytes: &[u8]) -> Result<Expr, String> {
+    let mut p = P { b: blr_bytes, i: 0, uses_generators: false };
+    if p.u8()? != blr::VERSION5 {
+        return Err("computed blr is not blr_version5 - unconverted".into());
+    }
+    p.expr()
+}
+
 pub fn parse(blr_bytes: &[u8]) -> Result<Request, String> {
     let mut p = P { b: blr_bytes, i: 0, uses_generators: false };
     if p.u8()? != blr::VERSION5 {
@@ -1570,6 +1582,12 @@ struct Exec<'a> {
     /// set by blr_continue_loop to the target label; unwinds to that loop,
     /// which clears it and starts the next iteration
     continuing: Option<u8>,
+    /// (relation, field) -> the parsed RDB$COMPUTED_BLR of a COMPUTED BY
+    /// column, None for a stored column; Err when the stored expression
+    /// is outside this executor's surface
+    computed: std::collections::HashMap<(String, String), Option<Result<std::rc::Rc<Expr>, String>>>,
+    /// EXECUTE PROCEDURE mode: the first blr_stall ends the request
+    halt_at_stall: bool,
 }
 
 /// The looper (`EXE_looper`): execute the statement tree synchronously,
@@ -1619,6 +1637,27 @@ pub fn bind_and_execute(
     request: &Request,
     args: &[Value],
 ) -> Result<Vec<(u8, Vec<Value>)>, String> {
+    bind_and_execute_mode(file, page_size, request, args, false)
+}
+
+/// The label a halt unwinds to: one no blr_label carries, so the
+/// unwinding runs to the top of the request the way a RETURN does.
+const HALT_LABEL: u8 = u8::MAX;
+
+/// [bind_and_execute] with the EXECUTE PROCEDURE semantics available:
+/// with `halt_at_stall` the request stops at its first blr_stall - the
+/// engine's `EXECUTE PROCEDURE` sends the inputs, receives ONE output
+/// message and unwinds the request, so a body's statements after its
+/// first SUSPEND never run (probed: an UPDATE after the first SUSPEND
+/// is visible after `SELECT * FROM p` and NOT after `EXECUTE PROCEDURE
+/// p`, on the engine).
+pub fn bind_and_execute_mode(
+    file: &fire_crab_ods::Image,
+    page_size: usize,
+    request: &Request,
+    args: &[Value],
+    halt_at_stall: bool,
+) -> Result<Vec<(u8, Vec<Value>)>, String> {
     let mut max_msg = 0u8;
     for (n, _) in &request.messages {
         max_msg = max_msg.max(*n);
@@ -1660,6 +1699,8 @@ pub fn bind_and_execute(
         sends: Vec::new(),
         leaving: None,
         continuing: None,
+        computed: std::collections::HashMap::new(),
+        halt_at_stall,
     };
     ex.stmt(&request.body)?;
     Ok(ex.sends)
@@ -1685,7 +1726,16 @@ impl<'a> Exec<'a> {
                 }
             }
             Stmt::Leave(n) => self.leaving = Some(*n),
-            Stmt::Stall => {}
+            // a SUSPEND is a send followed by a stall; under EXECUTE
+            // PROCEDURE the stall is where the engine unwinds the
+            // request. The procedure PROLOGUE stalls too, before the
+            // body, waiting for the first receive - only a stall after
+            // an output send is a SUSPEND's.
+            Stmt::Stall => {
+                if self.halt_at_stall && !self.sends.is_empty() {
+                    self.leaving = Some(HALT_LABEL);
+                }
+            }
             Stmt::Send(msg, filler) => {
                 self.stmt(filler)?;
                 let buf = self
@@ -2746,8 +2796,12 @@ impl<'a> Exec<'a> {
         }
         enum Fold {
             Count(i64),
-            Sum(Option<i64>),
-            Avg(Option<(i64, i64)>),
+            // exact folds carry (raw, scale) at the SOURCE's scale, so a
+            // SUM over DECIMAL(12,2) stays a scale-2 number (probed on
+            // the employee sample: SUB_TOT_BUDGET's SUM(budget) is
+            // 2350000.00, and a fold that only took integers gave NULL)
+            Sum(Option<(i128, i8)>),
+            Avg(Option<(i128, i8, i64)>),
             Min(Option<Value>),
             Max(Option<Value>),
             Pass(Value),
@@ -2805,14 +2859,16 @@ impl<'a> Exec<'a> {
                         }
                     }
                     (Fold::Sum(acc), _, Some(v)) => {
-                        if let Some(n) = int_of(&v) {
-                            *acc = Some(acc.unwrap_or(0) + n);
+                        if let Some((raw, sc)) = num_parts(&v) {
+                            let (a, s) = acc.unwrap_or((0, sc));
+                            *acc = Some(exe_numeric_bin(a, s, blr::ADD, raw, sc)?);
                         }
                     }
                     (Fold::Avg(acc), _, Some(v)) => {
-                        if let Some(n) = int_of(&v) {
-                            let (s, c) = acc.unwrap_or((0, 0));
-                            *acc = Some((s + n, c + 1));
+                        if let Some((raw, sc)) = num_parts(&v) {
+                            let (a, s, c) = acc.unwrap_or((0, sc, 0));
+                            let (r, s2) = exe_numeric_bin(a, s, blr::ADD, raw, sc)?;
+                            *acc = Some((r, s2, c + 1));
                         }
                     }
                     (Fold::Min(acc), _, Some(v)) => {
@@ -2870,10 +2926,13 @@ impl<'a> Exec<'a> {
             for (slot, fold) in g.slots {
                 row[slot as usize] = match fold {
                     Fold::Count(n) => Value::Int(n),
-                    Fold::Sum(v) => v.map(Value::Int).unwrap_or(Value::Null),
-                    // integer average truncates toward zero, like the
-                    // engine's integer division
-                    Fold::Avg(v) => v.map(|(s, c)| Value::Int(s / c)).unwrap_or(Value::Null),
+                    Fold::Sum(v) => v.map(|(r, s)| mk_num(r, s)).unwrap_or(Value::Null),
+                    // the average is taken AT THE SOURCE'S SCALE by an
+                    // integer division truncating toward zero, like the
+                    // engine's (probed: AVG of 1.01, 1.02, 1.02 is 1.01,
+                    // of their negatives -1.01; AVG(budget) under head
+                    // department 000 is 1166666.66)
+                    Fold::Avg(v) => v.map(|(r, s, c)| mk_num(r / c as i128, s)).unwrap_or(Value::Null),
                     Fold::Min(v) | Fold::Max(v) => v.unwrap_or(Value::Null),
                     Fold::Pass(v) => v,
                 };
@@ -3232,18 +3291,21 @@ impl<'a> Exec<'a> {
                 frame.row.get(*slot as usize).cloned().unwrap_or(Value::Null)
             }
             Expr::Field(ctx, name) => {
-                let frame = self
-                    .frames
-                    .iter()
-                    .rev()
-                    .find(|f| f.context == *ctx)
-                    .ok_or_else(|| format!("context {} not bound", ctx))?;
-                // resolve the NAME through the catalog to the field id
-                // - decoded rows index by field id
-                let rel_name = frame
-                    .relation
-                    .clone()
-                    .ok_or("bare field over an aggregate frame")?;
+                let (rel_name, row) = {
+                    let frame = self
+                        .frames
+                        .iter()
+                        .rev()
+                        .find(|f| f.context == *ctx)
+                        .ok_or_else(|| format!("context {} not bound", ctx))?;
+                    // resolve the NAME through the catalog to the field id
+                    // - decoded rows index by field id
+                    let rel_name = frame
+                        .relation
+                        .clone()
+                        .ok_or("bare field over an aggregate frame")?;
+                    (rel_name, frame.row.clone())
+                };
                 let cols =
                     relation_columns(self.file, self.page_size, &rel_name);
                 // EXACT: a BLR field name is the catalog's own spelling
@@ -3253,11 +3315,34 @@ impl<'a> Exec<'a> {
                     .iter()
                     .find(|c| c.name == *name)
                     .ok_or_else(|| format!("field {} unknown", name))?;
-                frame
-                    .row
-                    .get(col.field_id as usize)
-                    .cloned()
-                    .unwrap_or(Value::Null)
+                let fid = col.field_id as usize;
+                // A COMPUTED BY column has NO record bytes: its stored
+                // expression is evaluated over THIS row, with context 0
+                // bound to the relation - the engine's own numbering in
+                // RDB$COMPUTED_BLR (probed on the employee sample:
+                // EMPLOYEE.FULL_NAME is `last_name || ', ' || first_name`
+                // as `blr_field 0`, and a slot read answered NULL for
+                // every manager in ORG_CHART)
+                let key = (rel_name.clone(), name.clone());
+                let stored = match self.computed.get(&key) {
+                    Some(c) => c.clone(),
+                    None => {
+                        let c = computed_field_blr(self.file, self.page_size, &rel_name, name)
+                            .map(|b| parse_value_blr(&b).map(std::rc::Rc::new));
+                        self.computed.insert(key, c.clone());
+                        c
+                    }
+                };
+                match stored {
+                    None => row.get(fid).cloned().unwrap_or(Value::Null),
+                    Some(Err(e)) => return Err(format!("computed field {}: {}", name, e)),
+                    Some(Ok(expr)) => {
+                        self.frames.push(StreamFrame { context: 0, relation: Some(rel_name), row });
+                        let v = self.eval(&expr);
+                        self.frames.pop();
+                        v?
+                    }
+                }
             }
         })
     }
@@ -3556,6 +3641,76 @@ fn null_aware_cmp(a: &Value, b: &Value, desc: bool) -> std::cmp::Ordering {
         o.reverse()
     } else {
         o
+    }
+}
+
+/// One column of the first committed primary row of a system relation
+/// whose `keys` columns all equal the given (blank-trimmed) texts.
+fn catalog_lookup(
+    file: &fire_crab_ods::Image,
+    page_size: usize,
+    relation: &str,
+    keys: &[(&str, &str)],
+    want: &str,
+) -> Option<Value> {
+    let rel = resolve_relation(file, page_size, relation)?;
+    let formats = system_relation_formats(file, page_size, relation)?;
+    let (_, descs) = formats.iter().max_by_key(|(n, _)| *n)?;
+    let cols = relation_columns(file, page_size, relation);
+    let fid = |n: &str| cols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+    let key_f: Vec<(usize, &str)> =
+        keys.iter().map(|(c, v)| fid(c).map(|f| (f, *v))).collect::<Option<_>>()?;
+    let want_f = fid(want)?;
+    for dp_no in relation_data_pages(file, page_size, rel) {
+        let Some(dp) = fire_crab_ods::page_at(file, page_size, dp_no).and_then(DataPage::decode)
+        else {
+            continue;
+        };
+        for r in dp.records() {
+            if !r.is_primary_record() {
+                continue;
+            }
+            let Some(image) = fire_crab_ods::data::assembled_image(file, page_size, &r) else { continue };
+            let values = decode_record(&image, descs);
+            let hit = key_f.iter().all(|(f, v)| {
+                matches!(values.get(*f), Some(Value::Text(t)) if t.trim_end() == *v)
+            });
+            if hit {
+                return values.get(want_f).cloned();
+            }
+        }
+    }
+    None
+}
+
+/// The stored `RDB$COMPUTED_BLR` of a COMPUTED BY column: the column's
+/// RDB$RELATION_FIELDS row names its RDB$FIELD_SOURCE domain, whose
+/// RDB$FIELDS row holds the expression. None for a stored column.
+pub fn computed_field_blr(
+    file: &fire_crab_ods::Image,
+    page_size: usize,
+    relation: &str,
+    field: &str,
+) -> Option<Vec<u8>> {
+    let source = match catalog_lookup(
+        file,
+        page_size,
+        "RDB$RELATION_FIELDS",
+        &[("RDB$RELATION_NAME", relation), ("RDB$FIELD_NAME", field)],
+        "RDB$FIELD_SOURCE",
+    )? {
+        Value::Text(t) => t.trim_end().to_string(),
+        _ => return None,
+    };
+    match catalog_lookup(
+        file,
+        page_size,
+        "RDB$FIELDS",
+        &[("RDB$FIELD_NAME", &source)],
+        "RDB$COMPUTED_BLR",
+    )? {
+        Value::Blob(brel, brec) => read_blob_content(file, page_size, brel, brec),
+        _ => None,
     }
 }
 

@@ -15665,6 +15665,7 @@ fn fire_ddl_triggers(
                 ExecErr::Text(format!("trigger {} is outside this server's PSQL surface", d.name))
             })?;
             let mut frame = PsqlFrame {
+ stop_at_suspend: false,
                 vars: vec![Value::Null; names.len()],
                 out_at: names.len(),
                 out_len: 0,
@@ -15764,6 +15765,7 @@ fn fire_db_triggers(
         let (body, names) = trig_body_of(d)
             .ok_or_else(|| ExecErr::Text(format!("trigger {} is outside this server's PSQL surface", d.name)))?;
         let mut frame = PsqlFrame {
+ stop_at_suspend: false,
             vars: vec![Value::Null; names.len()],
             out_at: names.len(),
             out_len: 0,
@@ -21306,7 +21308,17 @@ fn parse_trig_stmt(
                 let close = call.rfind(')')?;
                 (&call[..o], Some(call[o + 1..close].trim()))
             }
-            None => (call, None),
+            // the PAREN-LESS form `EXECUTE PROCEDURE p :a, :b` the
+            // employee sample's DEPT_BUDGET is written in: the name is
+            // the first token and everything after it is the argument
+            // list (the engine's grammar takes both spellings)
+            None => {
+                let t = call.trim();
+                match t.find(|c: char| c.is_whitespace()) {
+                    Some(sp) => (&t[..sp], Some(t[sp..].trim())),
+                    None => (t, None),
+                }
+            }
         };
         let name = name_part.trim().trim_matches('"').to_ascii_uppercase();
         if !ident_ok(&name) {
@@ -76528,6 +76540,8 @@ struct PsqlFrame {
     /// the rows SUSPEND has emitted so far - a selectable procedure's
     /// result set, in the order the body produced them
     suspended: Vec<Vec<Value>>,
+    /// EXECUTE PROCEDURE semantics: the first SUSPEND ends the body
+    stop_at_suspend: bool,
     /// WHAT THE ENCLOSING HANDLER CAUGHT, while its body runs - what a
     /// bare `EXCEPTION;` re-raises. Handlers nest, so this is saved and
     /// restored around each one rather than simply set.
@@ -79232,7 +79246,7 @@ fn exec_psql_stmt_inner(
         // values assigned into the INTO variables. Planning it the normal
         // way means a loop sees everything a client SELECT does - views,
         // subqueries, expressions - for free.
-        TrigStmt::ForSelect { query, into, body, label, .. } => {
+        TrigStmt::ForSelect { query, into, body, label, src_off, .. } => {
             // put each variable's current value into the query text
             let mut q = query.clone();
             for (i, v) in f.vars.iter().enumerate().rev() {
@@ -79252,8 +79266,7 @@ fn exec_psql_stmt_inner(
                 if !sink.is_empty() {
                     return Err(PsqlStop::Unsupported); // a `?` in a loop query
                 }
-                let dbr = db.as_ref().ok_or(PsqlStop::Unsupported)?;
-                branch_rows(&plan, dbr, &[]).ok_or(PsqlStop::Unsupported)?
+                psql_plan_rows(&plan, db, ctx, *src_off)?
             };
             for row in rows {
                 if row.len() != into.len() {
@@ -79287,6 +79300,9 @@ fn exec_psql_stmt_inner(
                 .map(|i| f.vars.get(f.out_at + i).cloned().unwrap_or(Value::Null))
                 .collect();
             f.suspended.push(row);
+            if f.stop_at_suspend {
+                return Err(PsqlStop::Exit); // EXECUTE PROCEDURE: one row, then unwind
+            }
             Ok(())
         }
         // OPEN: plan the cursor's query with the ORDINARY planner and
@@ -79382,7 +79398,7 @@ fn exec_psql_stmt_inner(
                 .iter()
                 .map(|e| eval_psql_expr(e, f))
                 .collect::<Result<Vec<_>, _>>()?;
-            let out = psql_depth_guard(|| run_procedure(db, name, &vals, ctx))?;
+            let out = psql_depth_guard(|| run_procedure(db, name, &vals, ctx, true))?;
             match out {
                 Ok((values, _rows)) => {
                     for (slot, v) in into.iter().zip(values.into_iter()) {
@@ -79626,7 +79642,7 @@ fn exec_psql_stmt_inner(
         // it, and the arity is judged against the PLAN's projection
         // (so an empty result still refuses a mismatched list, the
         // -313 the engine raises at prepare).
-        TrigStmt::SelectInto { sql, into, binds, .. } => {
+        TrigStmt::SelectInto { sql, into, binds, src_off, .. } => {
             let sql = subst_body_query(sql, binds, f).ok_or(PsqlStop::Unsupported)?;
             let mut sink: Vec<Option<Descriptor>> = Vec::new();
             let plan =
@@ -79637,10 +79653,7 @@ fn exec_psql_stmt_inner(
             if output_cols_of(&plan).len() != into.len() {
                 return Err(psql_raise(EvalErr::DsqlCountMismatch));
             }
-            let rows = {
-                let dbr = db.as_ref().ok_or(PsqlStop::Unsupported)?;
-                branch_rows(&plan, dbr, &[]).ok_or(PsqlStop::Unsupported)?
-            };
+            let rows = psql_plan_rows(&plan, db, ctx, *src_off)?;
             if rows.len() > 1 {
                 // taking the first row would be a wrong answer
                 return Err(psql_raise(EvalErr::SingletonSelect));
@@ -79855,6 +79868,43 @@ fn run_autonomous(
 
 /// A runtime error raised from a statement, with the position left for
 /// [exec_psql_stmt] to stamp.
+/// The rows of a body query's plan. A SELECTABLE PROCEDURE source
+/// (`FOR SELECT ... FROM show_langs(:code, :grade, :country)`, the
+/// employee sample's ALL_LANGS) runs the callee the way the client
+/// path does: the compiled BLR first, the source interpreter otherwise,
+/// projected by `picks`; every other shape is [branch_rows].
+fn psql_plan_rows(
+    plan: &Plan,
+    db: &mut Option<Database>,
+    ctx: &SessionCtx,
+    src_off: usize,
+) -> Result<Vec<Vec<Value>>, PsqlStop> {
+    if let Plan::ProcSelect { name, args, picks, .. } = plan {
+        let project = |sus: Vec<Vec<Value>>| -> Vec<Vec<Value>> {
+            sus.iter()
+                .map(|r| picks.iter().map(|p| r.get(*p).cloned().unwrap_or(Value::Null)).collect())
+                .collect()
+        };
+        match try_procedure_blr(&*db, name, args, false) {
+            BlrProcOutcome::Rows(sus, _) => return Ok(project(sus)),
+            BlrProcOutcome::Runtime(e) => {
+                let err = runtime_with_position(db, name, args, ctx, e, false);
+                return Err(PsqlStop::Raise(Thrown::Runtime { err, trace: vec![src_off] }));
+            }
+            BlrProcOutcome::Outside => {}
+        }
+        return match psql_depth_guard(|| run_procedure(db, name, args, ctx, false))? {
+            Ok((_, sus)) => Ok(project(sus)),
+            Err(ProcErr { status: Some(err), .. }) => {
+                Err(PsqlStop::Raise(Thrown::Runtime { err, trace: vec![src_off] }))
+            }
+            Err(_) => Err(PsqlStop::Unsupported),
+        };
+    }
+    let dbr = db.as_ref().ok_or(PsqlStop::Unsupported)?;
+    branch_rows(plan, dbr, &[]).ok_or(PsqlStop::Unsupported)
+}
+
 fn psql_raise(err: EvalErr) -> PsqlStop {
     PsqlStop::Raise(Thrown::Runtime { err, trace: Vec::new() })
 }
@@ -79997,7 +80047,7 @@ fn run_dyn_statement(
         // a `?` argument has nothing to bind to from inside a body
         let args: Vec<Value> =
             args.into_iter().collect::<Option<Vec<_>>>().ok_or(PsqlStop::Unsupported)?;
-        let out = psql_depth_guard(|| run_procedure(db, &name, &args, ctx))?;
+        let out = psql_depth_guard(|| run_procedure(db, &name, &args, ctx, true))?;
         return match out {
             Ok((values, _rows)) => Ok(Some(vec![values])),
             Err(ProcErr { status: Some(err), .. }) => {
@@ -80106,8 +80156,9 @@ fn runtime_with_position(
     args: &[Value],
     ctx: &SessionCtx,
     e: EvalErr,
+    first_only: bool,
 ) -> EvalErr {
-    match run_procedure(database, name, args, ctx) {
+    match run_procedure(database, name, args, ctx, first_only) {
         Err(ProcErr { status: Some(EvalErr::AtProcedure { inner, at }), .. }) if *inner == e => {
             EvalErr::AtProcedure { inner, at }
         }
@@ -80184,6 +80235,7 @@ fn try_procedure_blr(
     database: &Option<Database>,
     name: &str,
     args: &[Value],
+    first_only: bool,
 ) -> BlrProcOutcome {
     let Some(db) = database.as_ref() else {
         return BlrProcOutcome::Outside;
@@ -80226,7 +80278,7 @@ fn try_procedure_blr(
         return BlrProcOutcome::Outside;
     }
     let sends =
-        match fire_crab_exe::bind_and_execute(&db.bytes(), db.page_size, &req, args) {
+        match fire_crab_exe::bind_and_execute_mode(&db.bytes(), db.page_size, &req, args, first_only) {
             Ok(s) => s,
             Err(e) => {
                 // the runtime classes surface with the engine's own
@@ -81084,7 +81136,7 @@ fn run_function(
     let db = database.as_ref().ok_or("no database attached")?;
     let meta = load_function(db, name)
         .ok_or_else(|| format!("function {} is not one this server can run", name))?;
-    let (outs, _) = run_body_source(database, name, &meta, args, ctx)?;
+    let (outs, _) = run_body_source(database, name, &meta, args, ctx, false)?;
     let v = outs.into_iter().next().unwrap_or(Value::Null);
     // COERCE the result to the declared RETURN scale. The source
     // interpreter's RETURN stores the value uncoerced, so a scale-0 value
@@ -81351,6 +81403,7 @@ fn fire_triggers(
             ExecErr::Text(format!("trigger {} is outside this server's PSQL surface", d.name))
         })?;
         let mut frame = PsqlFrame {
+ stop_at_suspend: false,
             vars: vec![Value::Null; names.len()],
             out_at: names.len(),
             out_len: 0,
@@ -81383,6 +81436,7 @@ fn fire_triggers(
                 )));
             };
             let mut scout = PsqlFrame {
+ stop_at_suspend: false,
                 vars: vec![Value::Null; names.len()],
                 out_at: names.len(),
                 out_len: 0,
@@ -81452,16 +81506,23 @@ fn fire_triggers(
     Ok(())
 }
 
+/// `first_only` is the EXECUTE PROCEDURE semantics: the body stops at
+/// its first SUSPEND, the way the engine unwinds a request after the
+/// one output message the call receives (probed: an UPDATE written
+/// after the first SUSPEND happens under `SELECT * FROM p` and NOT
+/// under `EXECUTE PROCEDURE p`); a SELECT over the procedure runs it
+/// to the end.
 fn run_procedure(
     database: &mut Option<Database>,
     name: &str,
     args: &[Value],
     ctx: &SessionCtx,
+    first_only: bool,
 ) -> Result<(Vec<Value>, Vec<Vec<Value>>), ProcErr> {
     let db = database.as_ref().ok_or("no database attached")?;
     let meta = load_procedure(db, name)
         .ok_or_else(|| format!("procedure {} is not one this server can run", name))?;
-    run_body_source(database, name, &meta, args, ctx)
+    run_body_source(database, name, &meta, args, ctx, first_only)
 }
 
 /// `EXECUTE BLOCK AS ... BEGIN ... END` - a procedure with no name and
@@ -81486,7 +81547,7 @@ fn run_execute_block(
         body_at: Some(body_at),
         prc_type: None,
     };
-    run_body_source(database, ANONYMOUS_BLOCK, &meta, &[], ctx).map(|_| ())
+    run_body_source(database, ANONYMOUS_BLOCK, &meta, &[], ctx, false).map(|_| ())
 }
 
 /// The name [run_body_source] runs an anonymous block under. The engine
@@ -81503,6 +81564,7 @@ fn run_body_source(
     meta: &ProcMeta,
     args: &[Value],
     ctx: &SessionCtx,
+    first_only: bool,
 ) -> Result<(Vec<Value>, Vec<Vec<Value>>), ProcErr> {
     // omitted trailing arguments take their parameters' DEFAULTs
     let args = with_proc_defaults(meta, args, Some(ctx));
@@ -81564,6 +81626,7 @@ fn run_body_source(
     };
 
     let mut frame = PsqlFrame {
+ stop_at_suspend: false,
         vars: Vec::new(),
         out_at: meta.ins.len(),
         out_len: meta.outs.len(),
@@ -81592,6 +81655,7 @@ fn run_body_source(
     // carry, since they were installed statement by statement.
     let mark = undo_window_push(database, WindowKind::Nested);
     let mut steps = 0u32;
+    frame.stop_at_suspend = first_only;
     let outcome = exec_psql_stmt(&body, &mut frame, &mut steps, database, ctx);
     if outcome.is_err() {
         undo_window(database, mark);
@@ -86821,7 +86885,7 @@ fn after_auth(
                         _ => unreachable!(),
                     };
                     let ctx = SessionCtx { user, attach_id };
-                    match run_procedure(&mut database, &pname, &pargs, &ctx) {
+                    match run_procedure(&mut database, &pname, &pargs, &ctx, false) {
                         Ok((_, suspended)) => {
                             let rows: Vec<Vec<Value>> = suspended
                                 .iter()
@@ -86880,7 +86944,7 @@ fn after_auth(
                         body_at: Some(body_at),
                         prc_type: None,
                     };
-                    match run_body_source(&mut database, ANONYMOUS_BLOCK, &meta, &[], &ctx) {
+                    match run_body_source(&mut database, ANONYMOUS_BLOCK, &meta, &[], &ctx, false) {
                         Ok((_, suspended)) => {
                             plan = std::rc::Rc::new(Plan::ProcRows { cols: bcols, rows: suspended });
                             respond(&mut s, &mut enc, resp_tx)?;
@@ -86908,7 +86972,7 @@ fn after_auth(
                     // in fire-crab-exe's surface, the source
                     // interpreter otherwise - and a RUNTIME error
                     // from the executed body is a real SQL error
-                    match try_procedure_blr(&database, &pname, &pargs) {
+                    match try_procedure_blr(&database, &pname, &pargs, false) {
                         BlrProcOutcome::Rows(suspended, _finals) => {
                             let rows: Vec<Vec<Value>> = suspended
                                 .iter()
@@ -86930,7 +86994,7 @@ fn after_auth(
                             // runs a selectable body lazily, so its
                             // error follows the header
                             let e = runtime_with_position(
-                                &mut database, &pname, &pargs, &ctx, e,
+                                &mut database, &pname, &pargs, &ctx, e, false,
                             );
                             plan = std::rc::Rc::new(Plan::RefusedEval(e));
                             respond(&mut s, &mut enc, resp_tx)?;
@@ -86938,7 +87002,7 @@ fn after_auth(
                         }
                         BlrProcOutcome::Outside => {}
                     }
-                    match run_procedure(&mut database, &pname, &pargs, &ctx) {
+                    match run_procedure(&mut database, &pname, &pargs, &ctx, false) {
                         Ok((_, suspended)) => {
                             // project each suspended row down to the
                             // columns the select list asked for
@@ -87011,7 +87075,7 @@ fn after_auth(
                     // suspended row of a selectable body (the engine
                     // runs to the first SUSPEND), or the final
                     // output state of a non-suspending one
-                    match try_procedure_blr(&database, &pname, &pargs) {
+                    match try_procedure_blr(&database, &pname, &pargs, true) {
                         BlrProcOutcome::Rows(rows, finals) => {
                             let values =
                                 rows.into_iter().next().unwrap_or(finals);
@@ -87021,14 +87085,14 @@ fn after_auth(
                         }
                         BlrProcOutcome::Runtime(e) => {
                             let e = runtime_with_position(
-                                &mut database, &pname, &pargs, &ctx, e,
+                                &mut database, &pname, &pargs, &ctx, e, true,
                             );
                             respond_eval_error(&mut s, &mut enc, &e)?;
                             continue;
                         }
                         BlrProcOutcome::Outside => {}
                     }
-                    match run_procedure(&mut database, &pname, &pargs, &ctx) {
+                    match run_procedure(&mut database, &pname, &pargs, &ctx, true) {
                         Ok((values, _rows)) => {
                             plan = std::rc::Rc::new(Plan::ProcCall { cols: pcols, values });
                             respond(&mut s, &mut enc, resp_tx)?;
@@ -89531,7 +89595,7 @@ fn after_auth(
                     let ctx = SessionCtx { user, attach_id };
                     // BLR-FIRST here too - op_execute2 is the path
                     // the OO clients drive EXECUTE PROCEDURE through
-                    match try_procedure_blr(&database, &pname, &pargs) {
+                    match try_procedure_blr(&database, &pname, &pargs, true) {
                         BlrProcOutcome::Rows(rows, finals) => {
                             let mut values =
                                 rows.into_iter().next().unwrap_or(finals);
@@ -89578,14 +89642,14 @@ fn after_auth(
                         }
                         BlrProcOutcome::Runtime(e) => {
                             let e = runtime_with_position(
-                                &mut database, &pname, &pargs, &ctx, e,
+                                &mut database, &pname, &pargs, &ctx, e, true,
                             );
                             respond_eval_error(&mut s, &mut enc, &e)?;
                             continue;
                         }
                         BlrProcOutcome::Outside => {}
                     }
-                    match run_procedure(&mut database, &pname, &pargs, &ctx) {
+                    match run_procedure(&mut database, &pname, &pargs, &ctx, true) {
                         Ok((mut values, _rows)) => {
                             if std::env::var("FC_SRV_TRACE").is_ok() {
                                 eprintln!("[srv] op_execute2 {} -> {:?}", pname, values);
@@ -100886,6 +100950,7 @@ mod tests {
         let one = |t: &str| parse_dyn_text(t, &vars);
         let render = |parts: &[DynPart], k: Value, s: Value| {
             let f = PsqlFrame {
+ stop_at_suspend: false,
                 vars: vec![k, s],
                 out_at: 0,
                 out_len: 0,
