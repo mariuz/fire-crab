@@ -2638,9 +2638,8 @@ impl<'a> Exec<'a> {
             .filter(|vr| bitmap.contains(&vr.recno))
             .map(|vr| {
                 fire_crab_ods::format::present_record(&vr.image, vr.format, &formats, &newest_defaults)
-                    .map_err(|_| "numeric value is out of range".to_string())
             })
-            .collect::<Result<Vec<_>, _>>()?)
+            .collect())
     }
 
     /// RDB$INDICES: the named index's 0-based slot in the relation's
@@ -2771,9 +2770,8 @@ impl<'a> Exec<'a> {
             .into_iter()
             .map(|vr| {
                 fire_crab_ods::format::present_record(&vr.image, vr.format, &formats, &newest_defaults)
-                    .map_err(|_| "numeric value is out of range".to_string())
             })
-            .collect::<Result<Vec<_>, _>>()?)
+            .collect())
     }
 
     /// The newest RDB$FORMATS default section of a relation - the values

@@ -8196,7 +8196,7 @@ impl RowSource {
                 let mut err: Option<EvalErr> = None;
                 // the checked walk raises 22003 on an out-of-range old
                 // row (F2) instead of feeding the sink the raw mantissa
-                let limbo = for_each_record_while_checked(db, *rel, formats, *decode_len, |values| {
+                let limbo = for_each_record_while(db, *rel, formats, *decode_len, |values| {
                     let mut row = values.to_vec();
                     if let Some(w) = width {
                         row.resize(*w, Value::Null);
@@ -8211,7 +8211,7 @@ impl RowSource {
                             Flow::Stop
                         }
                     }
-                })?;
+                });
                 if limbo != 0 && err.is_none() {
                     err = Some(EvalErr::RecInLimbo(limbo));
                 }
@@ -8919,6 +8919,17 @@ impl ProjCol {
             }
             None => {
                 let v = values.get(self.field_id).cloned().unwrap_or(Value::Null);
+                // the out-of-range poison ([Value::OutOfRange]): an old
+                // row an ALTER TYPE pushed past the new format's range is
+                // being PRESENTED (as an output column, or a sort / group
+                // / distinct key). This is the projection every read path
+                // passes through and it runs BEFORE any wire byte, so the
+                // 22003 lands cleanly at a row boundary - the engine's own
+                // lazy raise, only for a row that survives to presentation
+                // (F2).
+                if matches!(v, Value::OutOfRange) {
+                    return Err(EvalErr::NumericOutOfRange);
+                }
                 // a stored tz value whose UTC instant left the valid
                 // calendar (the wall clock was in range at store, both
                 // servers accept it) raises the engine's 22008 at READ
@@ -12342,6 +12353,24 @@ impl Term {
     /// PROPAGATES - the engine raises WHERE A / 0 = 1 mid-statement,
     /// and so do we.
     fn matches(&self, values: &[Value]) -> Result<Option<bool>, EvalErr> {
+        // a term that PRESENTS a column's value (a comparison, a LIKE, a
+        // STARTING) over an out-of-range old row raises 22003, as the
+        // engine does when a filter references the altered column
+        // (F2) - IS [NOT] NULL only reads the null flag and does not.
+        let value_fid = match self {
+            Term::Cmp(fid, ..)
+            | Term::NumCmp(fid, ..)
+            | Term::TextNumCmp(fid, ..)
+            | Term::CmpConvErr(fid, ..)
+            | Term::Like(fid, ..)
+            | Term::Starting(fid, ..) => Some(*fid),
+            _ => None,
+        };
+        if let Some(fid) = value_fid {
+            if matches!(values.get(fid), Some(Value::OutOfRange)) {
+                return Err(EvalErr::NumericOutOfRange);
+            }
+        }
         Ok(match self {
             // out-of-range / missing column reads as NULL
             Term::IsNull(fid) => {
@@ -37390,7 +37419,7 @@ fn present_field(v: &Value, stored: &Descriptor, newest: &Descriptor) -> Option<
     // through its Option, so it is left UNCHANGED here as it always was
     // (F2 on the client read path, recorded not repaired); the
     // procedure/function path raises it.
-    fire_crab_ods::format::present_field(v, stored, newest).ok().flatten()
+    fire_crab_ods::format::present_field(v, stored, newest)
 }
 
 /// A whole decoded record, presented through `newest` - [present_field]
@@ -50533,6 +50562,13 @@ fn aggregate(
     if matches!(func, AggFn::Count) {
         let mut n = 0i64;
         let hit = for_each_candidate(db, rel, formats, index, usize::MAX, |v| {
+            // an out-of-range old row presents its value even to COUNT(col)
+            // (the engine raises 22003); bail to the general aggregate,
+            // which raises through src_value, by tripping the error flag
+            if matches!(v.get(fid), Some(Value::OutOfRange)) {
+                ferr.set(true);
+                return;
+            }
             if matches(v) && matches!(v.get(fid), Some(x) if !matches!(x, Value::Null)) {
                 n += 1;
             }
@@ -51047,45 +51083,6 @@ impl<'a> ReadView<'a> {
         Some(fill_format_defaults(values, newest.len(), defaults))
     }
 
-    /// [values], but an exact-numeric field whose presented scale
-    /// OVERFLOWS the newest format's range raises `22003` instead of
-    /// leaving the raw mantissa (which the wire would render divided by
-    /// the wrong power of ten). The engine raises at the streamed read;
-    /// `Ok(None)` is still "not visible". Only the streaming full-scan
-    /// cursor uses this - the one path a plain client SELECT of an
-    /// out-of-range old row takes (F2). The index-driven, join-build,
-    /// uniqueness and system-scan walks keep [values]'s leave-unchanged
-    /// behaviour (each would need the raise threaded through a `bool`- or
-    /// count-returning walk; recorded, an even narrower remainder).
-    fn values_checked(
-        &self,
-        bytes: &fire_crab_ods::Image,
-        page_size: usize,
-        formats: &[(u8, Vec<Descriptor>)],
-        defaults: &[(usize, Value)],
-        r: &fire_crab_ods::RecordHeader,
-    ) -> Result<Option<Vec<Value>>, EvalErr> {
-        let Some((image, format)) = self.version(bytes, page_size, r) else {
-            return Ok(None);
-        };
-        let descs = match formats
-            .iter()
-            .find(|(n, _)| *n == format)
-            .or_else(|| formats.iter().max_by_key(|(n, _)| *n))
-        {
-            Some(d) => d,
-            None => return Ok(None),
-        };
-        let newest: &[Descriptor] =
-            formats.iter().max_by_key(|(n, _)| *n).map(|(_, d)| d.as_slice()).unwrap_or(&[]);
-        let values = fire_crab_ods::format::present_through(
-            decode_record(&image, &descs.1),
-            &descs.1,
-            newest,
-        )
-        .map_err(|_| EvalErr::NumericOutOfRange)?;
-        Ok(Some(fill_format_defaults(values, newest.len(), defaults)))
-    }
 }
 
 /// A resumable cursor over a plain full scan: it produces up to `want`
@@ -51212,7 +51209,7 @@ impl StreamCursor {
             while self.si < recs.len() {
                 let r = &recs[self.si];
                 self.si += 1;
-                let Some(values) = view.values_checked(&self.image, db.page_size, &self.formats, &self.defaults, r)? else {
+                let Some(values) = view.values(&self.image, db.page_size, &self.formats, &self.defaults, r) else {
                     if view.limbo.get() != 0 {
                         let e = EvalErr::RecInLimbo(view.limbo.get());
                         if out.is_empty() {
@@ -52173,44 +52170,6 @@ fn for_each_record_while<F: FnMut(&[Value]) -> Flow>(
     0
 }
 
-/// [for_each_record_while], but a record whose presented value OVERFLOWS
-/// the newest format's range raises `22003` (via [ReadView::values_checked])
-/// instead of feeding the sink a wrong number - the streamed read the
-/// engine raises on. Only the materialising/aggregating scan
-/// ([RowSource::for_each]) uses it; the FK-partner probe keeps the
-/// leave-unchanged [for_each_record_while] (its answer is a bool, not a
-/// row a client renders). Returns the limbo transaction (0 = none).
-fn for_each_record_while_checked<F: FnMut(&[Value]) -> Flow>(
-    db: &Database,
-    rel: u16,
-    formats: &[(u8, Vec<Descriptor>)],
-    decode_len: usize,
-    mut f: F,
-) -> Result<u64, EvalErr> {
-    let db_image = db.bytes();
-    let defaults = newest_format_defaults(db, rel);
-    let mut view = ReadView::of(db, &db_image);
-    view.decode_len = decode_len;
-    for dp_no in relation_data_pages(&db_image, db.page_size, rel) {
-        let Some(dp) = fire_crab_ods::page_at(&db_image, db.page_size, dp_no)
-            .and_then(DataPage::decode)
-        else {
-            continue;
-        };
-        for r in dp.records() {
-            let Some(values) = view.values_checked(&db_image, db.page_size, formats, &defaults, &r)? else {
-                if view.limbo.get() != 0 {
-                    return Ok(view.limbo.get());
-                }
-                continue;
-            };
-            if matches!(f(&values), Flow::Stop) {
-                return Ok(0);
-            }
-        }
-    }
-    Ok(0)
-}
 
 /// Rows of `rel` this attachment counts - the decode-free walk behind
 /// `SELECT COUNT(*)` with no filter. See [ReadView] for whose rows they
@@ -54241,7 +54200,16 @@ fn compute_group(rows: &[Vec<Value>], gitems: &[GItem]) -> Result<Vec<Value>, Ev
         Ok(match src {
             AggSrc::Star => Value::Int(1),
             AggSrc::Field(fid) | AggSrc::CollField(fid, _) => {
-                r.get(*fid).cloned().unwrap_or(Value::Null)
+                // the out-of-range poison: an aggregate that READS an old
+                // row an ALTER TYPE pushed out of range presents it, and
+                // the engine raises 22003 - SUM(N)/MIN(N)/AVG(N) over the
+                // overflow row raises, it does not fold it as 0 or skip it
+                // (F2). COUNT(N) counts it as non-null after the raise
+                // check, matching the engine (it also presents N).
+                match r.get(*fid) {
+                    Some(Value::OutOfRange) => return Err(EvalErr::NumericOutOfRange),
+                    v => v.cloned().unwrap_or(Value::Null),
+                }
             }
             AggSrc::Expr(e) => e.eval(r)?,
             // a paired source folds through its own arm, never here
@@ -67733,7 +67701,14 @@ impl Expr {
                     None => Value::Null,
                 }
             }
-            Expr::Col(fid) => values.get(*fid).cloned().unwrap_or(Value::Null),
+            Expr::Col(fid) => match values.get(*fid) {
+                // the out-of-range poison: an expression that READS an
+                // old row an ALTER TYPE pushed out of range presents it,
+                // and the engine raises 22003 (F2) - `N + 1` over the
+                // overflow row raises, it does not answer NULL
+                Some(Value::OutOfRange) => return Err(EvalErr::NumericOutOfRange),
+                v => v.cloned().unwrap_or(Value::Null),
+            },
             Expr::BlobOf(inner, cs) => match inner.eval(values)? {
                 Value::Null => Value::Null,
                 // already a blob (a bare column reached through a
@@ -98776,15 +98751,16 @@ mod tests {
             None
         );
         assert_eq!(f(Value::Double(7.0), &d(dtype::DOUBLE, 0, 8), &long2), None);
-        // AT THE EXTREMES IT DECLINES rather than saturating, zeroing or
+        // AT THE EXTREMES IT POISONS rather than saturating, zeroing or
         // panicking: a conversion whose result does not fit the target's
-        // backing width answers None, and the value is left as decoded.
-        // No engine-accepted ALTER can reach this (the engine will not
-        // let the integral part grow), so it is a floor, not a path.
-        assert_eq!(f(Value::Int(i64::MAX), &d(dtype::INT64, 0, 8), &i64_2), None);
+        // backing width answers Value::OutOfRange, the poison that raises
+        // 22003 wherever it is consumed (output, filter, aggregate) and
+        // never earlier. An engine-accepted ALTER DOES reach this - a
+        // BIGINT 9e17 altered to NUMERIC(18,4) is exactly it (F2).
+        assert_eq!(f(Value::Int(i64::MAX), &d(dtype::INT64, 0, 8), &i64_2), Some(Value::OutOfRange));
         assert_eq!(
             f(Value::Int128(i128::MAX, 0), &d(dtype::INT128, 0, 16), &w128_4),
-            None
+            Some(Value::OutOfRange)
         );
         // ...and a whole record: field 0 untouched, field 1 converted
         let stored = vec![long0, long0];

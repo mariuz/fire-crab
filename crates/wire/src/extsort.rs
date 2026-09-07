@@ -138,6 +138,9 @@ pub fn encode_row(row: &[Value], out: &mut Vec<u8>) {
                 put_u32(out, why.len() as u32);
                 out.extend_from_slice(why.as_bytes());
             }
+            // the out-of-range poison round-trips through a spilled run;
+            // it raises only when consumed (compared, output), not here
+            Value::OutOfRange => out.push(17),
         }
     }
 }
@@ -209,6 +212,7 @@ pub fn decode_row(b: &[u8]) -> io::Result<Vec<Value>> {
                 let why: &'static str = Box::leak(String::from_utf8_lossy(c.take(len)?).into_owned().into_boxed_str());
                 Value::Unsupported(why)
             }
+            17 => Value::OutOfRange,
             t => return Err(io::Error::new(io::ErrorKind::InvalidData, format!("run value tag {}", t))),
         });
     }

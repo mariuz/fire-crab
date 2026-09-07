@@ -263,6 +263,14 @@ pub enum Value {
     TimestampTz(i32, u32, u16),
     /// present but not yet decodable (time-zone types)
     Unsupported(&'static str),
+    /// a POISON: an exact-numeric value that, presented through a newer
+    /// format's scale, overflows the target. It flows through unread
+    /// slots (a row a filter excludes never touches it) and RAISES
+    /// `22003` only where it is CONSUMED - output, a comparison, an
+    /// aggregate, a sort key - which is exactly where the engine raises
+    /// (lazily, at presentation of a surviving row), never eagerly at
+    /// decode. See [present_field].
+    OutOfRange,
 }
 
 impl Value {
@@ -285,6 +293,7 @@ impl Value {
             Value::TimeTz(t, zone) => render_time_tz(*t, *zone),
             Value::TimestampTz(d, t, zone) => render_timestamp_tz(*d, *t, *zone),
             Value::Unsupported(t) => format!("<{}>", t),
+            Value::OutOfRange => "<out-of-range>".into(),
         }
     }
 }
@@ -1145,21 +1154,11 @@ pub fn is_exact_dtype(t: u8) -> bool {
     matches!(t, dtype::SHORT | dtype::LONG | dtype::INT64 | dtype::INT128)
 }
 
-/// A record shown through a format's descriptor could not be presented:
-/// an exact-numeric rescale overflowed the target's range, which the
-/// engine raises as `22003 numeric value is out of range` rather than
-/// answering a wrong number.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PresentErr {
-    OutOfRange,
-}
-
 /// Move an exact integer from scale `from` to scale `to`. Scaling UP
 /// multiplies (an overflow of the 128-bit accumulator is None - out of
 /// range for any target); scaling DOWN drops decimals, ROUNDING half
 /// AWAY FROM ZERO (the engine's rule, measured: 8.55 -> 8.6, 8.50 -> 9,
-/// -7.55 -> -7.6), never truncating - so an old row read through a
-/// narrower scale rounds as the engine would.
+/// -7.55 -> -7.6), never truncating.
 fn rescale_present(raw: i128, from: i8, to: i8) -> Option<i128> {
     let e = from as i32 - to as i32;
     if e >= 0 {
@@ -1178,64 +1177,60 @@ fn rescale_present(raw: i128, from: i8, to: i8) -> Option<i128> {
 ///
 /// * an exact-numeric column whose SCALE changed is re-expressed at the
 ///   new scale (the raw mantissa travels); a value that no longer fits
-///   the target is `Err(OutOfRange)` - the engine's 22003, not a wrong
-///   number (F2).
+///   the target becomes [Value::OutOfRange], a POISON that raises 22003
+///   only where it is consumed - the engine raises lazily, at the
+///   presentation of a surviving row, so an eager `Err` here would
+///   over-raise on a row a filter excludes (F2).
 /// * a `DATE` presented through a `TIMESTAMP` keeps its day and takes
 ///   midnight (F3) - without this the old row read the epoch.
-/// * a `CHAR` presented through a WIDER `CHAR` re-pads to the new width,
-///   so `CHAR_LENGTH`/`OCTET_LENGTH` and concatenation see the declared
-///   width and not the stored one (F4).
+/// * a `CHAR` presented through a WIDER `CHAR` re-pads to the new width
+///   (F4), so `CHAR_LENGTH`/`OCTET_LENGTH` and concatenation see it.
 ///
 /// Everything else - a non-exact numeric with an unchanged type, a type
-/// change with no presentation rule - is `Ok(None)`, left as the record
-/// carries it.
-pub fn present_field(v: &Value, stored: &Descriptor, newest: &Descriptor) -> Result<Option<Value>, PresentErr> {
-    // F3: DATE -> TIMESTAMP (the engine accepts the widening; the day is
-    // intact, the time is midnight)
+/// change with no rule - is `None`, left as the record carries it.
+pub fn present_field(v: &Value, stored: &Descriptor, newest: &Descriptor) -> Option<Value> {
     if stored.dtype == dtype::SQL_DATE && newest.dtype == dtype::TIMESTAMP {
-        if let Value::Date(d) = v {
-            return Ok(Some(Value::Timestamp(*d, 0)));
-        }
-        return Ok(None);
+        return match v {
+            Value::Date(d) => Some(Value::Timestamp(*d, 0)),
+            _ => None,
+        };
     }
-    // F4: CHAR -> a wider CHAR (re-pad to the new declared width)
     if stored.dtype == dtype::TEXT && newest.dtype == dtype::TEXT {
         let sw = crate::intl::char_length(stored.dtype, stored.length, stored.sub_type);
         let nw = crate::intl::char_length(newest.dtype, newest.length, newest.sub_type);
         if nw != sw {
             if let Value::Text(t) = v {
-                return Ok(Some(Value::Text(crate::intl::fit_char(t, nw))));
+                return Some(Value::Text(crate::intl::fit_char(t, nw)));
             }
         }
-        return Ok(None);
+        return None;
     }
     if stored.scale == newest.scale
         || !is_exact_dtype(stored.dtype)
         || !is_exact_dtype(newest.dtype)
     {
-        return Ok(None);
+        return None;
     }
     let (raw, from) = match v {
         Value::Int(n) => (*n as i128, 0i8),
         Value::Scaled(r, s) => (*r as i128, *s),
         Value::Int128(r, s) => (*r, *s),
-        _ => return Ok(None),
+        _ => return None,
     };
     let to = newest.scale;
-    // an i128 multiply that overflows is out of range for any target
-    let n = rescale_present(raw, from, to).ok_or(PresentErr::OutOfRange)?;
+    let Some(n) = rescale_present(raw, from, to) else {
+        return Some(Value::OutOfRange);
+    };
     if newest.dtype == dtype::INT128 {
-        // an INT128-backed column holds up to 38 decimal digits
         if n.checked_abs().map_or(true, |a| a >= 10i128.pow(38)) {
-            return Err(PresentErr::OutOfRange);
+            return Some(Value::OutOfRange);
         }
-        Ok(Some(Value::Int128(n, to)))
+        Some(Value::Int128(n, to))
     } else {
-        // a SHORT/LONG/INT64-backed column: a value past i64 is out of
-        // range (the engine raises where the old code answered the
-        // unscaled mantissa, silently)
-        let m = i64::try_from(n).map_err(|_| PresentErr::OutOfRange)?;
-        Ok(Some(if to == 0 { Value::Int(m) } else { Value::Scaled(m, to) }))
+        match i64::try_from(n) {
+            Ok(m) => Some(if to == 0 { Value::Int(m) } else { Value::Scaled(m, to) }),
+            Err(_) => Some(Value::OutOfRange),
+        }
     }
 }
 
@@ -1243,15 +1238,16 @@ pub fn present_field(v: &Value, stored: &Descriptor, newest: &Descriptor) -> Res
 /// per field. The two descriptor lists are indexed by FIELD ID, and a
 /// record's own format is a PREFIX of the newest one (a dropped id is
 /// never reused), so a field the newest format does not describe is left
-/// alone. An overflow on any field is `Err(OutOfRange)` (F2).
-pub fn present_through(mut values: Vec<Value>, stored: &[Descriptor], newest: &[Descriptor]) -> Result<Vec<Value>, PresentErr> {
+/// alone. An overflow becomes [Value::OutOfRange] in its slot (F2), not
+/// an error: the raise waits until the value is consumed.
+pub fn present_through(mut values: Vec<Value>, stored: &[Descriptor], newest: &[Descriptor]) -> Vec<Value> {
     for (fid, v) in values.iter_mut().enumerate() {
         let (Some(s), Some(n)) = (stored.get(fid), newest.get(fid)) else { continue };
-        if let Some(nv) = present_field(v, s, n)? {
+        if let Some(nv) = present_field(v, s, n) {
             *v = nv;
         }
     }
-    Ok(values)
+    values
 }
 
 /// Extend a record STORED under a shorter format up to `newest_len`
@@ -1278,15 +1274,14 @@ pub fn fill_format_defaults(mut values: Vec<Value>, newest_len: usize, defaults:
 /// is `format`, through the relation's NEWEST format: decode under the
 /// record's own descriptors, present the changed columns (scale, DATE ->
 /// TIMESTAMP, CHAR width), then fill the newest format's defaults for
-/// fields added after this record was written. `formats` is every
-/// (number, descriptors) the relation has; `newest_defaults` the newest
-/// format's default section. `Err(OutOfRange)` where a rescale overflows.
+/// fields added after this record was written. An overflow rides as
+/// [Value::OutOfRange] in its slot; the consumer raises.
 pub fn present_record(
     image: &[u8],
     format: u8,
     formats: &[(u8, Vec<Descriptor>)],
     newest_defaults: &[(usize, Value)],
-) -> Result<Vec<Value>, PresentErr> {
+) -> Vec<Value> {
     let newest: &[Descriptor] = formats
         .iter()
         .max_by_key(|(n, _)| *n)
@@ -1297,6 +1292,6 @@ pub fn present_record(
         .find(|(n, _)| *n == format)
         .map(|(_, d)| d.as_slice())
         .unwrap_or(newest);
-    let values = present_through(decode_record(image, stored), stored, newest)?;
-    Ok(fill_format_defaults(values, newest.len(), newest_defaults))
+    let values = present_through(decode_record(image, stored), stored, newest);
+    fill_format_defaults(values, newest.len(), newest_defaults)
 }
