@@ -254,6 +254,89 @@ pub fn null_default_blr() -> Vec<u8> {
 /// a `UNIQUE`, named or not. Both are backed by a unique index; the
 /// engine names that index after the constraint when the constraint is
 /// named, and generates `RDB$PRIMARY<n>` / `RDB$<n>` when it is not.
+/// Names a RESTORE hands the DDL writers so the catalog reads as the
+/// file's did: the engine's gbak stores constraint rows verbatim, where
+/// this server's create_table draws fresh `INTEG_<n>` / `RDB$PRIMARY<n>`
+/// names - and a file's CHECK named INTEG_11 then collided with a drawn
+/// INTEG_11 (measured on the employee backup). Set for the span of one
+/// table's DDL, cleared after; absent, every writer draws as before.
+#[derive(Default, Clone)]
+pub struct RestoreNames {
+    /// (column, NOT NULL constraint name)
+    pub not_null: Vec<(String, String)>,
+    /// (key constraint name, its index name)
+    pub key_index: Vec<(String, String)>,
+    /// (column, RDB$FIELDS row it binds to) - the row ALREADY EXISTS
+    /// (the restore made every global field first, in stream order, as
+    /// the engine's does), so create_table neither invents a name nor
+    /// writes the row
+    pub column_source: Vec<(String, String)>,
+    /// (procedure parameter, its existing RDB$FIELDS row) - likewise
+    pub param_source: Vec<(String, String)>,
+    /// (column, RDB$FIELD_POSITION) - a restore lays columns out in
+    /// POSITION order (the format's descriptor order, what SELECT *
+    /// follows), so the position equals the creation rank; kept for the
+    /// odd column whose position the caller wants explicit
+    pub field_position: Vec<(String, i64)>,
+    /// (column, RDB$FIELD_ID) - the engine's restore numbers ids by the
+    /// field records' ARRIVAL order, independent of position; create_table
+    /// otherwise ties the id to the creation (position) rank
+    pub field_id: Vec<(String, i64)>,
+    /// leave RDB$DEFAULT_CLASS unset: the engine's restore numbers a
+    /// table WITHOUT a data block (and every view) after the tables with
+    /// one, so the restore draws those in a later pass
+    pub defer_default_class: bool,
+}
+
+thread_local! {
+    static RESTORE_NAMES: std::cell::RefCell<Option<RestoreNames>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Install (or clear) the restore's name book for the calling thread.
+pub fn set_restore_names(names: Option<RestoreNames>) {
+    RESTORE_NAMES.with(|r| *r.borrow_mut() = names);
+}
+
+fn restore_not_null_name(column: &str) -> Option<String> {
+    RESTORE_NAMES.with(|r| {
+        r.borrow().as_ref().and_then(|n| n.not_null.iter().find(|(c, _)| c == column).map(|(_, k)| k.clone()))
+    })
+}
+
+fn restore_column_source(column: &str) -> Option<String> {
+    RESTORE_NAMES.with(|r| {
+        r.borrow().as_ref().and_then(|n| n.column_source.iter().find(|(c, _)| c == column).map(|(_, s)| s.clone()))
+    })
+}
+
+fn restore_param_source(param: &str) -> Option<String> {
+    RESTORE_NAMES.with(|r| {
+        r.borrow().as_ref().and_then(|n| n.param_source.iter().find(|(c, _)| c == param).map(|(_, s)| s.clone()))
+    })
+}
+
+fn restore_field_position(column: &str) -> Option<i64> {
+    RESTORE_NAMES.with(|r| {
+        r.borrow().as_ref().and_then(|n| n.field_position.iter().find(|(c, _)| c == column).map(|(_, p)| *p))
+    })
+}
+
+fn restore_field_id(column: &str) -> Option<i64> {
+    RESTORE_NAMES.with(|r| {
+        r.borrow().as_ref().and_then(|n| n.field_id.iter().find(|(c, _)| c == column).map(|(_, p)| *p))
+    })
+}
+
+fn restore_defers_default_class() -> bool {
+    RESTORE_NAMES.with(|r| r.borrow().as_ref().map_or(false, |n| n.defer_default_class))
+}
+
+fn restore_key_index_name(constraint: &str) -> Option<String> {
+    RESTORE_NAMES.with(|r| {
+        r.borrow().as_ref().and_then(|n| n.key_index.iter().find(|(c, _)| c == constraint).map(|(_, i)| i.clone()))
+    })
+}
+
 #[derive(Clone)]
 pub struct KeyDef {
     /// constraint name, empty when the statement did not name it
@@ -4103,7 +4186,8 @@ pub fn create_table(
     // runtime, not the column's own catalog row). The auto-domain counter
     // advances only for built-in columns, so with no domain columns the
     // source names are byte-identical to before.
-    let auto_domains = cols.iter().filter(|c| c.domain.is_none()).count() as u64;
+    let auto_domains =
+        cols.iter().filter(|c| c.domain.is_none() && restore_column_source(&c.name).is_none()).count() as u64;
     let domain_base = next_domain_numbers(file, page_size, auto_domains)?;
     // identity columns get an implicit RDB$<n> generator, named from a
     // separate counter; the generator itself is written after the
@@ -4113,6 +4197,8 @@ pub fn create_table(
         cols.iter().filter(|c| c.domain.is_none() && c.identity.is_some()).count() as u64;
     let gen_base = next_generator_number(file, page_size, identity_gens)?;
     let mut resolved: Vec<ColumnDef> = Vec::with_capacity(cols.len());
+    // per column: its RDB$FIELDS row already exists (a restore's book)
+    let mut pre_existing: Vec<bool> = Vec::with_capacity(cols.len());
     // per column: (source name, is_domain, inherited default BLR, inherited not_null)
     #[allow(clippy::type_complexity)]
     let mut src_meta: Vec<(String, bool, Option<Vec<u8>>, bool, Option<Vec<u8>>)> =
@@ -4140,10 +4226,20 @@ pub fn create_table(
             resolved.push(rc);
             src_meta.push((dname, true, dt.default_blr, dt.not_null, dt.validation_blr));
             identity_meta.push(None);
+            pre_existing.push(false);
         } else {
             resolved.push(c.clone());
-            src_meta.push((format!("RDB${}", domain_base + auto_idx), false, None, false, None));
-            auto_idx += 1;
+            match restore_column_source(&c.name) {
+                Some(src) => {
+                    src_meta.push((src, false, None, false, None));
+                    pre_existing.push(true);
+                }
+                None => {
+                    src_meta.push((format!("RDB${}", domain_base + auto_idx), false, None, false, None));
+                    auto_idx += 1;
+                    pre_existing.push(false);
+                }
+            }
             match &c.identity {
                 Some(id) => {
                     identity_meta.push(Some((format!("RDB${}", gen_base + gen_idx), id.clone())));
@@ -4314,7 +4410,7 @@ pub fn create_table(
     // domain column's RDB$FIELDS row already exists (the domain itself)
     for (i, c) in cols.iter().enumerate() {
         let (source, is_domain, ..) = &src_meta[i];
-        if *is_domain {
+        if *is_domain || pre_existing[i] {
             continue;
         }
         let mut vals: Vec<(&str, SysVal<'_>)> = vec![
@@ -4398,10 +4494,14 @@ pub fn create_table(
             ("RDB$FIELD_NAME", SysVal::S(&c.name)),
             ("RDB$RELATION_NAME", SysVal::S(&name)),
             ("RDB$FIELD_SOURCE", SysVal::S(source)),
-            ("RDB$FIELD_POSITION", SysVal::I(i as i64)),
+            // the display position: the file's when a restore says so,
+            // else the creation order (which is field-id order too)
+            ("RDB$FIELD_POSITION", SysVal::I(restore_field_position(&c.name).unwrap_or(i as i64))),
             // a computed column is read-only: RDB$UPDATE_FLAG 0 (probed)
             ("RDB$UPDATE_FLAG", SysVal::I(if c.computed.is_some() { 0 } else { 1 })),
-            ("RDB$FIELD_ID", SysVal::I(i as i64)),
+            // the file's own id when a restore says so (the engine numbers
+            // ids by field-record arrival, not by position)
+            ("RDB$FIELD_ID", SysVal::I(restore_field_id(&c.name).unwrap_or(i as i64))),
             ("RDB$SYSTEM_FLAG", SysVal::I(0)),
             ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
             ("RDB$FIELD_SOURCE_SCHEMA_NAME", SysVal::S("PUBLIC")),
@@ -4442,7 +4542,8 @@ pub fn create_table(
     // five privileges. Both class NAMES come from counters the engine
     // does not re-check, so they are taken by advancing them.
     let class = next_security_class(file, page_size, ACL_TABLE_OWNER)?;
-    let default_class = next_default_class(file, page_size)?;
+    let default_class =
+        if restore_defers_default_class() { None } else { Some(next_default_class(file, page_size)?) };
     // A COLUMN-LEVEL PRIMARY KEY or UNIQUE leaves the table at FORMAT 2
     // with two identical RDB$FORMATS rows (measured on the employee
     // sample: COUNTRY, DEPARTMENT and PROJECT are 2, every other table
@@ -4456,12 +4557,7 @@ pub fn create_table(
     } else {
         1
     };
-    sys_insert(
-        file,
-        page_size,
-        "RDB$RELATIONS",
-        6,
-        &[
+    let mut rvals: Vec<(&str, SysVal<'_>)> = vec![
             ("RDB$RELATION_ID", SysVal::I(rel_id)),
             ("RDB$RELATION_NAME", SysVal::S(&name)),
             ("RDB$RUNTIME", SysVal::B(blob_id_bytes(6, runtime_blob))),
@@ -4474,10 +4570,12 @@ pub fn create_table(
             ("RDB$RELATION_TYPE", SysVal::I(relation_type)),
             ("RDB$OWNER_NAME", SysVal::S("SYSDBA")),
             ("RDB$SECURITY_CLASS", SysVal::S(&class)),
-            ("RDB$DEFAULT_CLASS", SysVal::S(&default_class)),
             ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
-        ],
-    )?;
+    ];
+    if let Some(dc) = &default_class {
+        rvals.push(("RDB$DEFAULT_CLASS", SysVal::S(dc)));
+    }
+    sys_insert(file, page_size, "RDB$RELATIONS", 6, &rvals)?;
     store_privileges(file, page_size, &name, 0, TABLE_OWNER_PRIVILEGES)?;
     // the implicit identity generators (system_flag 6), created after the
     // table's own security class so their SQL$<n> classes follow it, in
@@ -4498,7 +4596,9 @@ pub fn create_table(
     )?;
     // a computed column's dependency rows, from its stored expression
     for (i, c) in cols.iter().enumerate() {
-        if c.computed.is_some() {
+        // (a restore's pre-made computed field records none - the
+        // engine's restore stores the expression and walks nothing)
+        if c.computed.is_some() && !pre_existing[i] {
             if let Some((dname, ..)) = src_meta.get(i) {
                 store_dependencies_deferred(file, page_size, 3, dname)?;
             }
@@ -4549,7 +4649,10 @@ pub fn create_table(
         match step {
             ConstraintStep::NotNull(i) => {
                 let c = &cols[i];
-                let cname = next_integ_name(file, page_size)?;
+                let cname = match restore_not_null_name(&c.name) {
+                    Some(n) => n,
+                    None => next_integ_name(file, page_size)?,
+                };
                 sys_row_by_name(file, page_size, "RDB$RELATION_CONSTRAINTS", &[
                     ("RDB$CONSTRAINT_NAME", SysVal::S(&cname)),
                     ("RDB$CONSTRAINT_TYPE", SysVal::S("NOT NULL")),
@@ -4741,7 +4844,10 @@ fn write_key(
         };
         (next_integ_name(file, page_size)?, iname)
     } else {
-        (key.name.clone(), key.name.clone())
+        // a named constraint's index takes the constraint's name - unless
+        // a restore says what the file called it (INTEG_5 / RDB$PRIMARY2)
+        let iname = restore_key_index_name(&key.name).unwrap_or_else(|| key.name.clone());
+        (key.name.clone(), iname)
     };
     create_index(
         file, page_size, table, &iname, &key.columns, true, false, key.primary, None,
@@ -5145,7 +5251,156 @@ pub fn restore_view(
     fields: &[RestoredViewField],
     contexts: &[RestoredViewContext],
 ) -> Result<(), String> {
-    restore_view_with(file, page_size, name, view_blr, view_source, fields, contexts, None, None)
+    // the view's security class, drawn as CREATE VIEW draws it - the
+    // engine's restore classes every relation in stream order, views
+    // among the tables; its DEFAULT class it numbers after every
+    // table's, which the privilege pass does (grant_privileges_deferred
+    // gives a relation without one the next SQL$DEFAULT<n>)
+    let class = next_security_class(file, page_size, ACL_TABLE_OWNER)?;
+    // 8 bytes of dbkey per context (probed: a two-table view is 16)
+    let dbkey = 8 * contexts.len().max(1) as i64;
+    restore_view_with(file, page_size, name, view_blr, view_source, fields, contexts, Some((dbkey, &class, "")), None)
+}
+
+/// RDB$RELATION_FIELDS.RDB$FIELD_POSITION of one column set verbatim (a
+/// restore lays the columns out in the file's FIELD-ID order, which is
+/// the format's descriptor order, and then puts each back at the
+/// position the file had for it - the engine's own DDL numbers ids and
+/// positions independently).
+pub fn set_field_position(
+    file: &mut crate::Image,
+    page_size: usize,
+    table: &str,
+    column: &str,
+    position: i64,
+) -> Result<(), String> {
+    let rfrel = crate::resolve_relation(file, page_size, "RDB$RELATION_FIELDS").ok_or("no RDB$RELATION_FIELDS")?;
+    let rel_fid = sys_fid(file, page_size, "RDB$RELATION_FIELDS", "RDB$RELATION_NAME")?;
+    let fld_fid = sys_fid(file, page_size, "RDB$RELATION_FIELDS", "RDB$FIELD_NAME")?;
+    let (want_t, want_c) = (table.to_string(), column.to_string());
+    patch_sys_row(
+        file,
+        page_size,
+        "RDB$RELATION_FIELDS",
+        rfrel,
+        move |v| text_is(v.get(rel_fid), &want_t) && text_is(v.get(fld_fid), &want_c),
+        &[("RDB$FIELD_POSITION", SysVal::I(position))],
+    )
+}
+
+/// RDB$FIELDS.RDB$FIELD_SUB_TYPE set to the value a backup carried: the
+/// engine's restore stores att 9 verbatim on every global field, so a
+/// DOUBLE or TIMESTAMP domain reads 0 after a restore where CREATE
+/// leaves NULL.
+pub fn set_field_sub_type(file: &mut crate::Image, page_size: usize, field: &str, sub_type: i64) -> Result<(), String> {
+    let frel = crate::resolve_relation(file, page_size, "RDB$FIELDS").ok_or("no RDB$FIELDS")?;
+    let name_fid = sys_fid(file, page_size, "RDB$FIELDS", "RDB$FIELD_NAME")?;
+    let want = field.to_string();
+    patch_sys_row(
+        file,
+        page_size,
+        "RDB$FIELDS",
+        frel,
+        move |v| text_is(v.get(name_fid), &want),
+        &[("RDB$FIELD_SUB_TYPE", SysVal::I(sub_type))],
+    )
+}
+
+/// RDB$INDICES.RDB$INDEX_TYPE set to the value a backup carried (the
+/// engine's restore stores the record's att 7 verbatim, so a constraint
+/// index that CREATE leaves NULL reads 0 after a restore).
+pub fn set_index_type(file: &mut crate::Image, page_size: usize, index: &str, index_type: i64) -> Result<(), String> {
+    let irel = crate::resolve_relation(file, page_size, "RDB$INDICES").ok_or("no RDB$INDICES")?;
+    let name_fid = sys_fid(file, page_size, "RDB$INDICES", "RDB$INDEX_NAME")?;
+    let want = index.to_string();
+    patch_sys_row(
+        file,
+        page_size,
+        "RDB$INDICES",
+        irel,
+        move |v| text_is(v.get(name_fid), &want),
+        &[("RDB$INDEX_TYPE", SysVal::I(index_type))],
+    )
+}
+
+/// A table's format bumped by one with an IDENTICAL descriptor: what the
+/// engine's restore leaves on a table with a COMPUTED BY column (gbak
+/// stores the expression onto the field row after the relation exists,
+/// and the deferred work re-formats the relation - EMPLOYEE,
+/// SALARY_HISTORY and SALES read RDB$FORMAT 2 with two equal rows).
+pub fn append_identical_format(file: &mut crate::Image, page_size: usize, table: &str) -> Result<(), String> {
+    let rel = crate::resolve_relation(file, page_size, table).ok_or_else(|| format!("table {} not found", table))?;
+    let formats = crate::relation_formats(file, page_size, rel);
+    let (cur, descs) = formats.iter().max_by_key(|(n, _)| *n).ok_or("relation has no format")?;
+    let next = *cur as i64 + 1;
+    let fmt_blob = write_format_blob(file, page_size, descs)?;
+    sys_insert(
+        file,
+        page_size,
+        "RDB$FORMATS",
+        8,
+        &[
+            ("RDB$RELATION_ID", SysVal::I(rel as i64)),
+            ("RDB$FORMAT", SysVal::I(next)),
+            ("RDB$DESCRIPTOR", SysVal::B(blob_id_bytes(8, fmt_blob))),
+        ],
+    )?;
+    let rrel = crate::resolve_relation(file, page_size, "RDB$RELATIONS").ok_or("no RDB$RELATIONS")?;
+    let name_fid = sys_fid(file, page_size, "RDB$RELATIONS", "RDB$RELATION_NAME")?;
+    let want = table.to_string();
+    patch_sys_row(
+        file,
+        page_size,
+        "RDB$RELATIONS",
+        rrel,
+        move |v| text_is(v.get(name_fid), &want),
+        &[("RDB$FORMAT", SysVal::I(next))],
+    )
+}
+
+/// A restore's COMPUTED BY global field: the RDB$FIELDS row of an
+/// auto-domain carrying the expression's BLR and source verbatim, with
+/// its security class - what the engine's restore stores for RDB$n of
+/// a computed column, before any table exists.
+pub fn restore_computed_domain(
+    file: &mut crate::Image,
+    page_size: usize,
+    source: &str,
+    c: &ColumnDef,
+    blr: &[u8],
+    src_text: &[u8],
+) -> Result<(), String> {
+    let mut src_text = src_text.to_vec();
+    if src_text.last() == Some(&0) {
+        src_text.pop();
+    }
+    let class = next_security_class(file, page_size, ACL_SEQUENCE_OWNER)?;
+    let blr_id = blob_id_bytes(2, dml::insert_blob(file, page_size, 2, &[blr.to_vec()], 2)?);
+    let src_id = blob_id_bytes(2, dml::insert_blob_cs(file, page_size, 2, &[src_text], 1, 4)?);
+    let mut vals: Vec<(&str, SysVal<'_>)> = vec![
+        ("RDB$FIELD_NAME", SysVal::S(source)),
+        ("RDB$FIELD_TYPE", SysVal::I(c.field_type as i64)),
+        ("RDB$FIELD_LENGTH", SysVal::I(catalog_field_length(c))),
+        ("RDB$FIELD_SCALE", SysVal::I(c.scale as i64)),
+        ("RDB$SYSTEM_FLAG", SysVal::I(0)),
+        ("RDB$OWNER_NAME", SysVal::S(OWNER)),
+        ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
+        ("RDB$SECURITY_CLASS", SysVal::S(&class)),
+        ("RDB$COMPUTED_BLR", SysVal::B(blr_id)),
+        ("RDB$COMPUTED_SOURCE", SysVal::B(src_id)),
+    ];
+    if subtype_carried(c.field_type) {
+        vals.push(("RDB$FIELD_SUB_TYPE", SysVal::I(c.sub_type as i64)));
+    }
+    if let Some(cl) = c.char_len {
+        vals.push(("RDB$CHARACTER_SET_ID", SysVal::I(c.charset_id.unwrap_or(0) as i64)));
+        vals.push(("RDB$CHARACTER_LENGTH", SysVal::I(cl as i64)));
+        vals.push(("RDB$COLLATION_ID", SysVal::I(0)));
+    }
+    if let Some(p) = c.precision {
+        vals.push(("RDB$FIELD_PRECISION", SysVal::I(p as i64)));
+    }
+    sys_insert(file, page_size, "RDB$FIELDS", 2, &vals)
 }
 
 /// [restore_view] with what a CREATE writes beyond a restore - the dbkey
@@ -5228,7 +5483,11 @@ fn restore_view_with(
     ]
     .into_iter()
     .chain(created.iter().flat_map(|(_, cls, dcls)| {
-        [("RDB$SECURITY_CLASS", SysVal::S(*cls)), ("RDB$DEFAULT_CLASS", SysVal::S(*dcls))]
+        let mut v = vec![("RDB$SECURITY_CLASS", SysVal::S(*cls))];
+        if !dcls.is_empty() {
+            v.push(("RDB$DEFAULT_CLASS", SysVal::S(*dcls)));
+        }
+        v
     }))
     .collect::<Vec<_>>())?;
     for (i, f) in fields.iter().enumerate() {
@@ -5247,6 +5506,15 @@ fn restore_view_with(
             ("RDB$FIELD_SOURCE_SCHEMA_NAME", SysVal::S("PUBLIC")),
             ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
         ];
+        // a TEXT view field carries RDB$COLLATION_ID 0 on its relation-
+        // field row (the engine's restore of PHONE_LIST: 0 on every text
+        // column, NULL on the integer EMP_NO) - the same text-or-not rule
+        // a base table's columns follow
+        let is_text = resolve_domain_type(file, page_size, &f.source)
+            .map_or(false, |d| matches!(d.field_type, 14 | 37));
+        if is_text {
+            fvals.push(("RDB$COLLATION_ID", SysVal::I(0)));
+        }
         if !expr {
             // an expression column has no context and no base field (probed: both NULL)
             fvals.push(("RDB$VIEW_CONTEXT", SysVal::I(f.view_context)));
@@ -7010,7 +7278,10 @@ fn fk_names(file: &mut crate::Image, page_size: usize, fk: &ForeignKeyDef) -> Re
         let iname = format!("RDB$FOREIGN{}", next_index_number(file, page_size)?);
         Ok((cname, iname))
     } else {
-        Ok((fk.name.clone(), fk.name.clone()))
+        // a named FK's index takes the constraint's name - unless a
+        // restore says what the file called it (INTEG_11 / RDB$FOREIGN3)
+        let iname = restore_key_index_name(&fk.name).unwrap_or_else(|| fk.name.clone());
+        Ok((fk.name.clone(), iname))
     }
 }
 
@@ -7145,7 +7416,10 @@ pub fn alter_table_add_foreign_key_carried(
     } else {
         fk.name.clone()
     };
-    write_foreign_key_full(file, page_size, &name, &fk_name, &fk_name, fk, false)?;
+    // the index under the file's name when a restore says so
+    // (RDB$FOREIGN<n>), else the constraint's, as CREATE names it
+    let index_name = restore_key_index_name(&fk_name).unwrap_or_else(|| fk_name.clone());
+    write_foreign_key_full(file, page_size, &name, &fk_name, &index_name, fk, false)?;
     advance_oldest_transactions(file, page_size)?;
     Ok(())
 }
@@ -11947,8 +12221,12 @@ pub fn create_procedure_with_id(
         .ok_or("no RDB$PROCEDURE_PARAMETERS relation")?;
     for (ptype, list) in [(0i64, ins), (1i64, outs)] {
         for (num, p) in list.iter().enumerate() {
-            let domain_num = next_domain_number(file, page_size)?;
-            let dom = format!("RDB${}", domain_num);
+            // a restore binds the parameter to the file's own RDB$n row,
+            // made with every other global field before the procedure
+            let (dom, pre_existing) = match restore_param_source(&p.name) {
+                Some(s) => (s, true),
+                None => (format!("RDB${}", next_domain_number(file, page_size)?), false),
+            };
             let mut field_vals: Vec<(&str, SysVal<'_>)> = vec![
                 ("RDB$FIELD_NAME", SysVal::S(&dom)),
                 ("RDB$FIELD_TYPE", SysVal::I(p.field_type as i64)),
@@ -11972,9 +12250,11 @@ pub fn create_procedure_with_id(
                 field_vals.push(("RDB$CHARACTER_SET_ID", SysVal::I(0)));
                 field_vals.push(("RDB$CHARACTER_LENGTH", SysVal::I(p.length as i64)));
             }
-            let frel = crate::resolve_relation(file, page_size, "RDB$FIELDS")
-                .ok_or("no RDB$FIELDS relation")?;
-            sys_insert(file, page_size, "RDB$FIELDS", frel, &field_vals)?;
+            if !pre_existing {
+                let frel = crate::resolve_relation(file, page_size, "RDB$FIELDS")
+                    .ok_or("no RDB$FIELDS relation")?;
+                sys_insert(file, page_size, "RDB$FIELDS", frel, &field_vals)?;
+            }
             // RDB$FIELD_SOURCE_SCHEMA_NAME is LOAD-BEARING: the
             // engine's procedure loader resolves the param's domain
             // through it and SEGFAULTS on NULL (the FK-blocker lesson

@@ -5951,12 +5951,44 @@ fn run_gbak_restore_core(
         let mut file = fire_crab_ods::Image::from_bytes(&raw, page_size);
         // the user-NAMED domains first - table columns bind to them
         // by name, so the RDB$FIELDS rows must exist before the tables
-        for nd in &restored.named_domains {
-            let (_, ft, len, sc, st) = restored
-                .domain_types
-                .iter()
-                .find(|(n, ..)| n == &nd.name)
-                .ok_or_else(|| format!("named domain {}: no type facts in the file", nd.name))?;
+        // EVERY GLOBAL FIELD FIRST, IN STREAM ORDER - named domains and
+        // the RDB$n the tables, views and procedures bind to - each with
+        // its security class, as the engine's restore stores them (79
+        // classed fields before the first relation on the employee
+        // backup); the tables then bind their columns to the rows by name
+        for (gname, ft, len, sc, st) in &restored.domain_types {
+            let Some(nd) = restored.named_domains.iter().find(|d| &d.name == gname) else {
+                let facts = restored.domain_facts.iter().find(|f| &f.name == gname);
+                let dims = restore_dims_of(&restored, gname);
+                let col = restore_column_def(
+                    &fire_crab_burp::RCol {
+                        name: gname.clone(),
+                        field_type: *ft as i32,
+                        length: *len as u16,
+                        scale: *sc as i8,
+                        sub_type: *st as i16,
+                        position: 0,
+                        field_id: 0,
+                        not_null: false,
+                        domain: None,
+                        source: gname.clone(),
+                        dims: dims.len() as i32,
+                        computed: facts.map_or(false, |f| f.computed.is_some()),
+                        default: None,
+                    },
+                    facts,
+                    &dims,
+                )?;
+                match facts.and_then(|f| f.computed.as_ref()) {
+                    Some((blr, src)) => {
+                        fire_crab_ods::ddl::restore_computed_domain(&mut file, page_size, gname, &col, blr, src)?
+                    }
+                    None => fire_crab_ods::ddl::create_domain(&mut file, page_size, &col)?,
+                }
+                // att 9 verbatim (a DOUBLE's 0 where CREATE leaves NULL)
+                fire_crab_ods::ddl::set_field_sub_type(&mut file, page_size, gname, *st)?;
+                continue;
+            };
             let mut col = restore_column_def(&fire_crab_burp::RCol {
                 name: nd.name.clone(),
                 field_type: *ft as i32,
@@ -5967,7 +5999,11 @@ fn run_gbak_restore_core(
                 field_id: 0,
                 not_null: nd.not_null,
                 domain: None,
-            })?;
+                source: nd.name.clone(),
+                dims: 0,
+                computed: false,
+                default: None,
+            }, restored.domain_facts.iter().find(|f| f.name == nd.name), &[])?;
             if let Some(cl) = nd.char_len {
                 col.char_len = Some(cl as u16);
             }
@@ -5981,6 +6017,7 @@ fn run_gbak_restore_core(
             if let Some((blr, src)) = &nd.check {
                 fire_crab_ods::ddl::set_domain_validation(&mut file, page_size, &nd.name, blr, src)?;
             }
+            fire_crab_ods::ddl::set_field_sub_type(&mut file, page_size, &nd.name, *st)?;
         }
         // the SHADOWS: refuse whole BEFORE building when a shadow file
         // already exists - the engine's own restore errors there
@@ -6039,38 +6076,147 @@ fn run_gbak_restore_core(
         // EXCEPTIONS first - nothing references them at restore time,
         // and create_exception's own counter numbers them in file
         // order, which is the catalog order the backup walked
-        for (name, msg) in &restored.exceptions {
-            fire_crab_ods::ddl::create_exception(&mut file, page_size, name, msg)?;
-        }
         // SEQUENCES first - they are independent of the tables, and the
         // backed-up CURRENT value is written into the generator vector
         // after the catalog row exists (the value is not a catalog
         // column; gbak carries it separately and so does this restore)
-        for g in &restored.generators {
-            fire_crab_ods::ddl::create_sequence(
-                &mut file,
-                page_size,
-                &g.name,
-                g.init,
-                Some(g.increment),
-            )?;
-            fire_crab_ods::ddl::set_sequence_value(&mut file, page_size, &g.name, g.value)?;
-        }
-        for t in &restored.tables {
-            if t.view_blr.is_some() {
-                continue; // views restore after their base tables
+        for (ti, t) in restored.tables.iter().enumerate() {
+            if let (Some(blr), Some(srcb)) = (&t.view_blr, &t.view_source) {
+                // a VIEW at its stream position (its base tables precede
+                // it in the file, as they did in the source database), so
+                // relation ids and classes fall as the engine's restore
+                // numbers them - the two blobs verbatim, fields sharing
+                // the base columns' domains
+                let mut fields: Vec<fire_crab_ods::ddl::RestoredViewField> = Vec::new();
+                for (name, source, base, ctx, pos, computed) in &t.view_fields {
+                    // an EXPRESSION column's carried domain is re-minted
+                    // with the type facts off the file's global-field
+                    // record - nobody else creates its RDB$FIELDS row
+                    let source = if *computed || base.is_empty() {
+                        let (_, ft, len, sc, st) = restored
+                            .domain_types
+                            .iter()
+                            .find(|(n, ..)| n == source)
+                            .ok_or_else(|| {
+                                format!(
+                                    "view {}: expression column {}: its domain {} is not in the file",
+                                    t.name, name, source
+                                )
+                            })?;
+                        fire_crab_ods::ddl::mint_carrier_domain(
+                            &mut file,
+                            page_size,
+                            *ft as i16,
+                            *len as u16,
+                            *sc as i16,
+                            *st as i16,
+                            restored
+                                .domain_computed
+                                .iter()
+                                .find(|(n, _)| n == source)
+                                .map(|(_, b)| b.as_slice()),
+                        )?
+                    } else {
+                        source.clone()
+                    };
+                    fields.push(fire_crab_ods::ddl::RestoredViewField {
+                        name: name.clone(),
+                        source,
+                        base_field: base.clone(),
+                        view_context: *ctx,
+                        position: *pos,
+                    });
+                }
+                let contexts: Vec<fire_crab_ods::ddl::RestoredViewContext> = t
+                    .view_contexts
+                    .iter()
+                    .map(|(rel, ctx, cname)| fire_crab_ods::ddl::RestoredViewContext {
+                        relation: rel.clone(),
+                        context: *ctx,
+                        context_name: cname.clone(),
+                    })
+                    .collect();
+                fire_crab_ods::ddl::restore_view(
+                    &mut file,
+                    page_size,
+                    &t.name,
+                    blr,
+                    srcb,
+                    &fields,
+                    &contexts,
+                )?;
+                continue;
             }
             // FIELD RECORDS ARRIVE BLOBS-FIRST (the engine's own file
             // order), and att 13 carries the true position - so the
             // table is created in POSITION order and each row's values
             // are mapped from file order to position order.
+            // the columns in the file's FIELD-ID order (the record's
+            // descriptor layout the XDR is packed in - decoding and the
+            // record image agree only in this order); each column's
+            // display POSITION and the constraint names come from the
+            // book, so the catalog reads as the file did. (One gap: the
+            // record FORMAT is in field-id order, and the engine's
+            // SELECT * follows the format, so on a table whose position
+            // order differs from its field-id order - employee JOB and
+            // COUNTRY - a bare SELECT * lists the columns field-id-first;
+            // every explicit-column read and the whole catalog match. The
+            // engine's own restore lays the format out in arrival order;
+            // matching that means rebuilding the index-segment and
+            // field-id bindings around it, recorded not done.)
             let mut order: Vec<usize> = (0..t.cols.len()).collect();
-            order.sort_by_key(|i| t.cols[*i].position);
+            order.sort_by_key(|i| t.cols[*i].field_id);
             let cols: Vec<fire_crab_ods::ddl::ColumnDef> = order
                 .iter()
-                .map(|i| restore_column_def(&t.cols[*i]))
+                .map(|i| {
+                    let c = &t.cols[*i];
+                    restore_column_def(
+                        c,
+                        restored.domain_facts.iter().find(|f| f.name == c.source),
+                        &restore_dims_of(&restored, &c.source),
+                    )
+                })
                 .collect::<Result<_, _>>()?;
-            fire_crab_ods::ddl::create_table(
+            // the file's constraint names, for this table's DDL: NOT NULL
+            // rows by column, key constraints with their index names
+            fire_crab_ods::ddl::set_restore_names(Some(fire_crab_ods::ddl::RestoreNames {
+                not_null: restored
+                    .not_null_names
+                    .iter()
+                    .filter(|(_, tb, _)| tb == &t.name)
+                    .map(|(cn, _, col)| (col.clone(), cn.clone()))
+                    .collect(),
+                key_index: restored
+                    .uq_map
+                    .iter()
+                    .filter(|(_, tb, _)| tb == &t.name)
+                    .map(|(cn, _, ix)| (cn.clone(), ix.clone()))
+                    .collect(),
+                // the built-in columns bind to the RDB$n rows made above
+                column_source: t
+                    .cols
+                    .iter()
+                    .filter(|c| c.domain.is_none())
+                    .map(|c| (c.name.clone(), c.source.clone()))
+                    .collect(),
+                param_source: Vec::new(),
+                // each column keeps the file's display position and its
+                // field-record arrival id (all columns, named-domain ones
+                // included - every column has an RDB$RELATION_FIELDS row)
+                field_position: t
+                    .cols
+                    .iter()
+                    .map(|c| (c.name.clone(), c.position as i64))
+                    .collect(),
+                field_id: Vec::new(),
+                // no default class yet: the engine's restore draws them
+                // in the REVERSE of the data-block order (the deferred
+                // work the stored records post runs LIFO at the data
+                // phase's commit), then an empty table's, then a view's -
+                // the pass below numbers them so
+                defer_default_class: true,
+            }));
+            let created = fire_crab_ods::ddl::create_table(
                 &mut file,
                 page_size,
                 &t.name,
@@ -6078,7 +6224,14 @@ fn run_gbak_restore_core(
                 &[],
                 &[],
                 t.rtype,
-            )?;
+            );
+            fire_crab_ods::ddl::set_restore_names(None);
+            created?;
+            if t.cols.iter().any(|c| c.computed) {
+                // gbak stores a computed field's expression after the
+                // relation exists; the engine re-formats: RDB$FORMAT 2
+                fire_crab_ods::ddl::append_identical_format(&mut file, page_size, &t.name)?;
+            }
             // a GTT's restored row carries DBKEY_LENGTH 0 - the
             // ENGINE'S OWN RESTORE writes 0 where live DDL writes 8
             // (measured on a round trip), and this restore mirrors
@@ -6104,6 +6257,11 @@ fn run_gbak_restore_core(
                 .iter()
                 .max_by_key(|(n, _)| *n)
                 .ok_or("the created table has no format")?;
+            // EVERY BLOB AND ARRAY OF THE TABLE FIRST, then the rows: the
+            // engine's restore numbers them so (JOB's blobs are 81:0,
+            // 81:1, 81:2 ... in row order, the rows come after), and a
+            // client reading `select *` sees those ids
+            let mut all_vals: Vec<Vec<RestoreVal>> = Vec::with_capacity(t.rows.len());
             for row in &t.rows {
                 if row.len() != t.cols.len() {
                     return Err("a row with the wrong column count".to_string());
@@ -6149,8 +6307,33 @@ fn run_gbak_restore_core(
                         fire_crab_burp::RVal::Null => RestoreVal::Null,
                         fire_crab_burp::RVal::Int(n) => RestoreVal::Int(*n),
                         fire_crab_burp::RVal::Bytes(b) => RestoreVal::Bytes(b.clone()),
+                        fire_crab_burp::RVal::Raw(b) => RestoreVal::Raw(b.clone()),
+                        fire_crab_burp::RVal::Array { raw, .. } => {
+                            // an array is a stream blob whose content is
+                            // the InternalArrayDesc then the elements -
+                            // the layout op_put_slice materialises
+                            // (header put, then 32K chunks)
+                            let shape = fire_crab_ods::ddl::array_shape(&file, page_size, &t.name, &c.name)
+                                .ok_or_else(|| format!("array column {}.{} has no shape", t.name, c.name))?;
+                            let header = fire_crab_ods::ddl::array_desc_bytes(&shape);
+                            let mut content = header.clone();
+                            content.extend_from_slice(raw);
+                            let puts = 1 + raw.chunks(32768).count() as u32;
+                            let max_put = header.len().max(raw.len().min(32768));
+                            let recno = fire_crab_blb::create_stream_blob_counted(
+                                &mut file, page_size, rel, &content, 0, 0, puts, max_put,
+                            )?;
+                            let mut id = [0u8; 8];
+                            id[0..2].copy_from_slice(&rel.to_le_bytes());
+                            id[3] = (recno >> 32) as u8;
+                            id[4..8].copy_from_slice(&(recno as u32).to_le_bytes());
+                            RestoreVal::BlobId(id)
+                        }
                     });
                 }
+                all_vals.push(vals);
+            }
+            for vals in &all_vals {
                 // ...then reordered to position order, which is what the
                 // created table's descriptors follow
                 let by_position: Vec<&RestoreVal> = order.iter().map(|i| &vals[*i]).collect();
@@ -6221,23 +6404,33 @@ fn run_gbak_restore_core(
                     continue;
                 }
                 if t.pk_index.as_deref() == Some(ix.name.as_str()) {
-                    // the PK's INTEG_<n> name is REGENERATED, not the
-                    // file's: fc's create_table already burned INTEG
-                    // numbers for the NOT NULLs in ITS order, so the
-                    // file's name can collide (measured: passing it
-                    // failed the whole restore). The enforcement is
-                    // identical; the name drift is the recorded
-                    // fidelity note.
-                    fire_crab_ods::ddl::alter_table_add_key(
+                    // the PK under the FILE's constraint and index names
+                    // (the name book routes the index name through
+                    // write_key); the NOT NULLs took theirs at
+                    // create_table, so nothing collides
+                    let pk_name = restored
+                        .uq_map
+                        .iter()
+                        .find(|(_, tb, idx)| tb == &t.name && idx == &ix.name)
+                        .map(|(cn, ..)| cn.clone())
+                        .unwrap_or_default();
+                    fire_crab_ods::ddl::set_restore_names(Some(fire_crab_ods::ddl::RestoreNames {
+                        not_null: Vec::new(),
+                        key_index: vec![(pk_name.clone(), ix.name.clone())],
+                        ..Default::default()
+                    }));
+                    let added = fire_crab_ods::ddl::alter_table_add_key(
                         &mut file,
                         page_size,
                         &t.name,
                         &fire_crab_ods::ddl::KeyDef {
-                            name: String::new(),
+                            name: pk_name,
                             columns: ix.segments.clone(),
                             primary: true,
                         },
-                    )?;
+                    );
+                    fire_crab_ods::ddl::set_restore_names(None);
+                    added?;
                 } else if let Some((cname, ..)) = restored
                     .uniques
                     .iter()
@@ -6246,8 +6439,13 @@ fn run_gbak_restore_core(
                     // a UNIQUE CONSTRAINT's index arrives through the
                     // constraint, which backfills and enforces as the
                     // PK's does - a create_index beside it would build
-                    // the same index twice
-                    fire_crab_ods::ddl::alter_table_add_key(
+                    // the same index twice; the index keeps the file's name
+                    fire_crab_ods::ddl::set_restore_names(Some(fire_crab_ods::ddl::RestoreNames {
+                        not_null: Vec::new(),
+                        key_index: vec![(cname.clone(), ix.name.clone())],
+                        ..Default::default()
+                    }));
+                    let added = fire_crab_ods::ddl::alter_table_add_key(
                         &mut file,
                         page_size,
                         &t.name,
@@ -6256,7 +6454,9 @@ fn run_gbak_restore_core(
                             columns: ix.segments.clone(),
                             primary: false,
                         },
-                    )?;
+                    );
+                    fire_crab_ods::ddl::set_restore_names(None);
+                    added?;
                 } else {
                     fire_crab_ods::ddl::create_index(
                         &mut file,
@@ -6272,70 +6472,48 @@ fn run_gbak_restore_core(
                 }
             }
         }
-        // the VIEWS, in file order - each after its base tables, the
-        // two blobs verbatim, fields sharing the base columns' domains
-        for t in &restored.tables {
-            let (Some(blr), Some(srcb)) = (&t.view_blr, &t.view_source) else {
+        // THE DEFAULT CLASSES, numbered as the engine's restore numbers
+        // them: the deferred grant work runs per relation in the order
+        // the relations first appear among the PRIVILEGE records - the
+        // source's RDB$USER_PRIVILEGES row order, i.e. the order the
+        // tables were CREATED (owner rows are stored at CREATE) - tables
+        // first; the views take theirs in the privilege pass, after
+        // these. Measured on three files: a script-built one (creation
+        // order != id order != data order), the shipped sample, fc's own.
+        let mut classed: Vec<&str> = Vec::new();
+        for p in &restored.privileges {
+            if p.object_type != 0 || classed.contains(&p.object.as_str()) {
                 continue;
-            };
-            let mut fields: Vec<fire_crab_ods::ddl::RestoredViewField> = Vec::new();
-            for (name, source, base, ctx, pos, computed) in &t.view_fields {
-                // an EXPRESSION column's carried domain is re-minted
-                // with the type facts off the file's global-field
-                // record - nobody else creates its RDB$FIELDS row
-                let source = if *computed || base.is_empty() {
-                    let (_, ft, len, sc, st) = restored
-                        .domain_types
-                        .iter()
-                        .find(|(n, ..)| n == source)
-                        .ok_or_else(|| {
-                            format!(
-                                "view {}: expression column {}: its domain {} is not in the file",
-                                t.name, name, source
-                            )
-                        })?;
-                    fire_crab_ods::ddl::mint_carrier_domain(
-                        &mut file,
-                        page_size,
-                        *ft as i16,
-                        *len as u16,
-                        *sc as i16,
-                        *st as i16,
-                        restored
-                            .domain_computed
-                            .iter()
-                            .find(|(n, _)| n == source)
-                            .map(|(_, b)| b.as_slice()),
-                    )?
-                } else {
-                    source.clone()
-                };
-                fields.push(fire_crab_ods::ddl::RestoredViewField {
-                    name: name.clone(),
-                    source,
-                    base_field: base.clone(),
-                    view_context: *ctx,
-                    position: *pos,
-                });
             }
-            let contexts: Vec<fire_crab_ods::ddl::RestoredViewContext> = t
-                .view_contexts
-                .iter()
-                .map(|(rel, ctx, cname)| fire_crab_ods::ddl::RestoredViewContext {
-                    relation: rel.clone(),
-                    context: *ctx,
-                    context_name: cname.clone(),
-                })
-                .collect();
-            fire_crab_ods::ddl::restore_view(
+            let Some(t) = restored.tables.iter().find(|t| t.name == p.object) else { continue };
+            if t.view_blr.is_some() {
+                continue;
+            }
+            classed.push(&p.object);
+            fire_crab_ods::ddl::grant_privileges_deferred(&mut file, page_size, &t.name, 0)?;
+        }
+        for t in restored.tables.iter() {
+            if t.view_blr.is_none() && !classed.contains(&t.name.as_str()) {
+                fire_crab_ods::ddl::grant_privileges_deferred(&mut file, page_size, &t.name, 0)?;
+            }
+        }
+        // the GENERATORS after the relations - the engine's restore
+        // classes them there (SQL$560/561 after SALES's 559), then the
+        // exceptions, then the procedures
+        for g in &restored.generators {
+            fire_crab_ods::ddl::create_sequence(
                 &mut file,
                 page_size,
-                &t.name,
-                blr,
-                srcb,
-                &fields,
-                &contexts,
+                &g.name,
+                g.init,
+                Some(g.increment),
             )?;
+            fire_crab_ods::ddl::set_sequence_value(&mut file, page_size, &g.name, g.value)?;
+        }
+        // the EXCEPTIONS after the generators (the engine's restore
+        // classes them there: SQL$562-566 after the generators' 560/561)
+        for (name, msg) in &restored.exceptions {
+            fire_crab_ods::ddl::create_exception(&mut file, page_size, name, msg)?;
         }
         // FOREIGN KEYS LAST, once every table and key exists: the
         // file names the REFERENCED CONSTRAINT; its table and columns
@@ -6345,6 +6523,11 @@ fn run_gbak_restore_core(
             if std::env::var("FC_SRV_TRACE").is_ok() {
                 eprintln!("[srv] restore fk {}", fk.name);
             }
+            // the FK's index under the file's name (RDB$FOREIGN<n>)
+            fire_crab_ods::ddl::set_restore_names(Some(fire_crab_ods::ddl::RestoreNames {
+                key_index: vec![(fk.name.clone(), fk.index.clone())],
+                ..Default::default()
+            }));
             let (_, ref_table, ref_index) = restored
                 .uq_map
                 .iter()
@@ -6410,6 +6593,7 @@ fn run_gbak_restore_core(
                 },
             )?;
         }
+        fire_crab_ods::ddl::set_restore_names(None);
         for (cname, table) in &restored.checks {
             if std::env::var("FC_SRV_TRACE").is_ok() {
                 eprintln!("[srv] restore check row {} on {}", cname, table);
@@ -6439,6 +6623,11 @@ fn run_gbak_restore_core(
         // own RDB$n domains for them - the numbering matches on a
         // fresh shell and drift is a name, not a type
         for pr in &restored.procedures {
+            // the parameters bind to the file's RDB$n rows, made above
+            fire_crab_ods::ddl::set_restore_names(Some(fire_crab_ods::ddl::RestoreNames {
+                param_source: pr.params.iter().map(|pp| (pp.name.clone(), pp.source.clone())).collect(),
+                ..Default::default()
+            }));
             let param = |pp: &fire_crab_burp::RProcParam| -> Result<fire_crab_ods::ddl::ProcParamDef, String> {
                 let (_, ft, len, sc, st) = restored
                     .domain_types
@@ -6480,6 +6669,7 @@ fn run_gbak_restore_core(
                 pr.package.as_ref().map(|(n, v)| (n.as_str(), *v)),
             )?;
         }
+        fire_crab_ods::ddl::set_restore_names(None);
         // the FUNCTIONS, blobs verbatim: the args re-type through the
         // carried domain records, position 0 the RETURN argument
         for fu in &restored.functions {
@@ -6570,6 +6760,83 @@ fn run_gbak_restore_core(
                 other => return Err(format!("a COMMENT on a {} is outside this restore's surface", other)),
             };
             fire_crab_ods::ddl::set_catalog_description(&mut file, page_size, rel, &keys, text)?;
+        }
+        // every index's RDB$INDEX_TYPE as the file carried it (the
+        // engine's restore stores att 7 verbatim; CREATE leaves a
+        // constraint index's NULL)
+        for t in &restored.tables {
+            for ix in &t.indexes {
+                if let Some(ty) = ix.index_type {
+                    fire_crab_ods::ddl::set_index_type(&mut file, page_size, &ix.name, ty)?;
+                }
+            }
+        }
+        // THE DEPENDENCIES the engine's restore derives when it stores
+        // each body: views (1), triggers (2), procedures (5) - walked off
+        // the carried BLR now that every object they name exists
+        for t in &restored.tables {
+            if t.view_blr.is_some() {
+                fire_crab_ods::ddl::store_dependencies_deferred(&mut file, page_size, 1, &t.name)?;
+            }
+        }
+        for tr in &restored.triggers {
+            fire_crab_ods::ddl::store_dependencies_deferred(&mut file, page_size, 2, &tr.name)?;
+        }
+        for pr in &restored.procedures {
+            fire_crab_ods::ddl::store_dependencies_deferred(&mut file, page_size, 5, &pr.name)?;
+        }
+        // THE PRIVILEGES, VERBATIM. The DDL path above wrote each object's
+        // owner rows as CREATE would; the engine's restore instead stores
+        // the file's RDB$USER_PRIVILEGES rows as they are and recomputes
+        // the classes. So: every row with a grantor (gbak's own criterion,
+        // `WITH RDB$GRANTOR NOT MISSING`) goes, the file's rows come back
+        // in stream order, and each granted object's ACL is rebuilt from
+        // them - a class with no row is UNCHECKED to the engine.
+        if !restored.privileges.is_empty() {
+            let rel = fire_crab_ods::resolve_relation(&file, page_size, "RDB$USER_PRIVILEGES")
+                .ok_or("no RDB$USER_PRIVILEGES")?;
+            let columns = relation_columns(&file, page_size, "RDB$USER_PRIVILEGES");
+            let grantor_f = columns
+                .iter()
+                .find(|c| c.name == "RDB$GRANTOR")
+                .map(|c| c.field_id as usize)
+                .ok_or("RDB$USER_PRIVILEGES has no RDB$GRANTOR")?;
+            loop {
+                let removed = fire_crab_ods::ddl::delete_system_row(&mut file, page_size, "RDB$USER_PRIVILEGES", rel, |v| {
+                    matches!(v.get(grantor_f), Some(fire_crab_ods::format::Value::Text(_)))
+                })?;
+                if !removed {
+                    break;
+                }
+            }
+            for p in &restored.privileges {
+                use fire_crab_ods::ddl::SysValue as V;
+                let mut vals: Vec<(&str, V)> = vec![
+                    ("RDB$USER", V::Text(&p.user)),
+                    ("RDB$GRANTOR", V::Text(&p.grantor)),
+                    ("RDB$PRIVILEGE", V::Text(&p.privilege)),
+                    ("RDB$GRANT_OPTION", p.grant_option.map(V::Int).unwrap_or(V::Null)),
+                    ("RDB$RELATION_NAME", V::Text(&p.object)),
+                    ("RDB$USER_TYPE", V::Int(p.user_type)),
+                    ("RDB$OBJECT_TYPE", V::Int(p.object_type)),
+                ];
+                if let Some(sch) = &p.schema {
+                    vals.push(("RDB$RELATION_SCHEMA_NAME", V::Text(sch)));
+                }
+                if let Some(f) = &p.field {
+                    vals.push(("RDB$FIELD_NAME", V::Text(f)));
+                }
+                fire_crab_ods::ddl::insert_system_row(&mut file, page_size, "RDB$USER_PRIVILEGES", rel, &vals)?;
+            }
+            let mut done: Vec<(&str, i64)> = Vec::new();
+            for p in &restored.privileges {
+                let key = (p.object.as_str(), p.object_type);
+                if done.contains(&key) {
+                    continue;
+                }
+                done.push(key);
+                fire_crab_ods::ddl::grant_privileges_deferred(&mut file, page_size, &p.object, p.object_type)?;
+            }
         }
         let mut refreshed: Vec<&str> = Vec::new();
         for tr in &restored.triggers {
@@ -6680,18 +6947,63 @@ fn run_gbak_restore_core(
 /// A restored column as `ddl::create_table` wants it. VARCHAR's stored
 /// length includes the count word; the fbk's att 10 carries the
 /// CHARACTER length (charset NONE: == bytes).
+/// An ARRAY column's declared bounds, from the rec_field_dimensions rows
+/// of its global field, in dimension order.
+fn restore_dims_of(restored: &fire_crab_burp::Restored, source: &str) -> Vec<(i32, i32)> {
+    let mut rows: Vec<&(String, i64, i64, i64)> =
+        restored.dimensions.iter().filter(|d| d.0 == source).collect();
+    rows.sort_by_key(|d| d.1);
+    rows.iter().map(|d| (d.2 as i32, d.3 as i32)).collect()
+}
+
+/// A restored column's declaration: the type off its field record, the
+/// facts that complete it (precision, character length, charset, segment
+/// length, COMPUTED BY expression) off its global field, and its array
+/// bounds off the dimension rows.
 fn restore_column_def(
     c: &fire_crab_burp::RCol,
+    facts: Option<&fire_crab_burp::RDomainFacts>,
+    dims: &[(i32, i32)],
 ) -> Result<fire_crab_ods::ddl::ColumnDef, String> {
     use fire_crab_ods::format::dtype;
+    let prec = facts.and_then(|f| f.precision).map(|p| p as i16);
     let (dt, length, char_len, precision) = match c.field_type {
-        7 => (dtype::SHORT, 2u16, None, Some(0)),
-        8 => (dtype::LONG, 4, None, Some(0)),
-        16 => (dtype::INT64, 8, None, Some(0)),
-        14 => (dtype::TEXT, c.length, Some(c.length), None),
-        37 => (dtype::VARYING, c.length + 2, Some(c.length), None),
+        7 => (dtype::SHORT, 2u16, None, prec.or(Some(0))),
+        8 => (dtype::LONG, 4, None, prec.or(Some(0))),
+        16 => (dtype::INT64, 8, None, prec.or(Some(0))),
+        26 => (dtype::INT128, 16, None, prec.or(Some(0))),
+        9 => (dtype::QUAD, 8, None, prec),
+        10 => (dtype::REAL, 4, None, prec),
+        27 => (dtype::DOUBLE, 8, None, prec),
+        12 => (dtype::SQL_DATE, 4, None, prec),
+        13 => (dtype::SQL_TIME, 4, None, prec),
+        35 => (dtype::TIMESTAMP, 8, None, prec),
+        23 => (dtype::BOOLEAN, 1, None, prec),
+        14 => (dtype::TEXT, c.length, Some(facts.and_then(|f| f.char_len).map(|n| n as u16).unwrap_or(c.length)), prec),
+        37 => (dtype::VARYING, c.length + 2, Some(facts.and_then(|f| f.char_len).map(|n| n as u16).unwrap_or(c.length)), prec),
         261 => (dtype::BLOB, 8, None, None),
         t => return Err(format!("field type {} in restore", t)),
+    };
+    if c.dims > 0 && dims.len() != c.dims as usize {
+        return Err(format!(
+            "array column {}: {} dimensions declared, {} bound rows in the file",
+            c.name, c.dims, dims.len()
+        ));
+    }
+    let computed = match (c.computed, facts.and_then(|f| f.computed.as_ref())) {
+        (true, Some((blr, src))) => {
+            let mut src = src.clone();
+            if src.last() == Some(&0) {
+                src.pop();
+            }
+            Some(fire_crab_ods::ddl::ComputedCol {
+                source: String::from_utf8_lossy(&src).into_owned(),
+                blr: blr.clone(),
+                precision: prec,
+            })
+        }
+        (true, None) => return Err(format!("computed column {} without its expression", c.name)),
+        _ => None,
     };
     Ok(fire_crab_ods::ddl::ColumnDef {
         name: c.name.clone(),
@@ -6702,18 +7014,27 @@ fn restore_column_def(
         sub_type: c.sub_type,
         precision,
         char_len,
-        dims: Vec::new(),
-        segment_length: None,
-        charset_id: None,
+        dims: dims.to_vec(),
+        segment_length: if c.field_type == 261 { facts.and_then(|f| f.segment_length).map(|n| n as u16) } else { None },
+        charset_id: facts.and_then(|f| f.charset).map(|n| n as u8),
         not_null: c.not_null,
         not_null_constraint: c.not_null,
         not_null_at: 0,
-        default: None,
+        default: c.default.as_ref().map(|(blr, src)| {
+            let mut src = src.clone();
+            if src.last() == Some(&0) {
+                src.pop();
+            }
+            fire_crab_ods::ddl::ColumnDefault {
+                source: String::from_utf8_lossy(&src).into_owned(),
+                value_blr: blr.clone(),
+            }
+        }),
         // a named-domain column binds by NAME - create_table resolves
         // the type off the domain's own RDB$FIELDS row
         domain: c.domain.clone(),
         identity: None,
-        computed: None,
+        computed,
     })
 }
 
@@ -6723,6 +7044,8 @@ enum RestoreVal {
     Null,
     Int(i64),
     Bytes(Vec<u8>),
+    /// native-layout bytes copied verbatim into the slot
+    Raw(Vec<u8>),
     BlobId([u8; 8]),
 }
 
@@ -6793,8 +7116,14 @@ fn restore_row_image(
                 }
                 _ => return Err("text into a non-text column".into()),
             },
+            RVal::Raw(b) => {
+                if b.len() > d.length as usize {
+                    return Err("a value wider than its slot".into());
+                }
+                img[off..off + b.len()].copy_from_slice(b);
+            }
             RVal::BlobId(id) => {
-                if d.dtype != fire_crab_ods::format::dtype::BLOB {
+                if !matches!(d.dtype, fire_crab_ods::format::dtype::BLOB | fire_crab_ods::format::dtype::ARRAY) {
                     return Err("a blob into a non-blob column".into());
                 }
                 img[off..off + 8].copy_from_slice(id);

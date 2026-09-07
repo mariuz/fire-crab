@@ -3966,6 +3966,14 @@ pub enum RVal {
     /// what a non-null EMPTY blob legitimately stays). `stream` is the
     /// rec_blob's att 4 - the restored blob keeps its kind.
     Blob { stream: bool, segments: Vec<Vec<u8>> },
+    /// a value copied into its slot VERBATIM in the engine's native
+    /// (little-endian) layout: DATE, TIME, TIMESTAMP, FLOAT, DOUBLE,
+    /// BOOLEAN, INT128 - decoded off the XDR by type
+    Raw(Vec<u8>),
+    /// an ARRAY column's value: the elements in native layout (the
+    /// rec_array that follows the row fills them; a non-null array
+    /// starts empty), with the slice's per-dimension bounds
+    Array { raw: Vec<u8>, dims: Vec<(i32, i32)> },
 }
 
 /// One restored column.
@@ -3986,6 +3994,53 @@ pub struct RCol {
     pub not_null: bool,
     /// att 2 when it names a user domain - the column binds by name
     pub domain: Option<String>,
+    /// att 2 as stored - the global field (named or RDB$n) whose facts
+    /// (precision, character length, charset, dimensions, COMPUTED BY)
+    /// complete this column's type
+    pub source: String,
+    /// att 29 - an ARRAY column's dimension count (0 for a scalar)
+    pub dims: i32,
+    /// att 23 - a COMPUTED BY column (its expression rides on the source
+    /// global field)
+    pub computed: bool,
+    /// a column-level DEFAULT: att 15 (value BLR) and att 39 (the
+    /// NUL-terminated `DEFAULT ...` source), int32-framed blobs
+    pub default: Option<(Vec<u8>, Vec<u8>)>,
+}
+
+/// What a global-field record says beyond its type/length/scale/sub_type:
+/// the facts a column completes its declaration from.
+#[derive(Default, Clone)]
+pub struct RDomainFacts {
+    pub name: String,
+    /// att 44
+    pub precision: Option<i64>,
+    /// att 41
+    pub char_len: Option<i64>,
+    /// att 42 / 43
+    pub charset: Option<i64>,
+    pub collation: Option<i64>,
+    /// att 12 - a blob's segment length
+    pub segment_length: Option<i64>,
+    /// att 29
+    pub dims: i64,
+    /// att 18 (BLR) + att 37 (NUL-terminated source) of a COMPUTED BY
+    pub computed: Option<(Vec<u8>, Vec<u8>)>,
+}
+
+/// One RDB$USER_PRIVILEGES row the backup carries (rec_user_privilege),
+/// exactly as stored - the restore writes it back verbatim.
+#[derive(Clone)]
+pub struct RPrivilege {
+    pub user: String,
+    pub grantor: String,
+    pub privilege: String,
+    pub grant_option: Option<i64>,
+    pub schema: Option<String>,
+    pub object: String,
+    pub field: Option<String>,
+    pub user_type: i64,
+    pub object_type: i64,
 }
 
 /// One restored index.
@@ -3993,6 +4048,10 @@ pub struct RIndex {
     pub name: String,
     pub unique: bool,
     pub descending: bool,
+    /// att 7 as stored (RDB$INDEX_TYPE: 0 ascending, 1 descending) -
+    /// the engine's restore writes it back even where CREATE would
+    /// leave NULL (every constraint index reads 0 after a restore)
+    pub index_type: Option<i64>,
     pub segments: Vec<String>,
     /// a FOREIGN KEY index's PARTNER index name (att 8) - such an
     /// index is built by the FK application, not the index backfill
@@ -4093,6 +4152,16 @@ pub struct Restored {
     /// the grantee of each privilege record, in stream order - the
     /// restore narrates one "restoring privilege for user" line per record
     pub privilege_users: Vec<String>,
+    /// the privilege records themselves, stream order
+    pub privileges: Vec<RPrivilege>,
+    /// per global field, its completing facts
+    pub domain_facts: Vec<RDomainFacts>,
+    /// rec_field_dimensions rows: (global field, dimension 0-based,
+    /// lower bound, upper bound), stream order
+    pub dimensions: Vec<(String, i64, i64, i64)>,
+    /// the NOT NULL constraints by name: (constraint, table, column) -
+    /// the restore writes the file's INTEG_<n> names, not fresh ones
+    pub not_null_names: Vec<(String, String, String)>,
 }
 
 /// One restored FOREIGN KEY.
@@ -4334,6 +4403,9 @@ fn att<'a>(atts: &'a [Att], tag: u8) -> Option<&'a Att> {
 /// Decode one XDR row (the transportable encoding, big-endian, null
 /// indicators trailing - the exact mirror of [xdr_row]).
 fn xdr_decode(xdr: &[u8], cols: &[RCol]) -> Result<Vec<RVal>, Refused> {
+    // the stream is in the field records' ARRIVAL order (the columns as
+    // held), the record's own descriptor layout - read sequentially, one
+    // value then, after all values, one null indicator per stored field
     let mut vals = Vec::with_capacity(cols.len());
     let mut at = 0usize;
     let take = |at: &mut usize, n: usize| -> Result<Vec<u8>, Refused> {
@@ -4345,14 +4417,51 @@ fn xdr_decode(xdr: &[u8], cols: &[RCol]) -> Result<Vec<RVal>, Refused> {
         Ok(d)
     };
     for c in cols {
-        match c.field_type {
+        if c.computed {
+            vals.push(RVal::Null);
+            continue;
+        }
+        if c.dims > 0 {
+            let _ = take(&mut at, 8)?;
+            vals.push(RVal::Array { raw: Vec::new(), dims: Vec::new() });
+            continue;
+        }
+        let v = match c.field_type {
             7 | 8 => {
                 let b = take(&mut at, 4)?;
-                vals.push(RVal::Int(i32::from_be_bytes(b.try_into().unwrap()) as i64));
+                RVal::Int(i32::from_be_bytes(b.try_into().unwrap()) as i64)
             }
             16 => {
                 let b = take(&mut at, 8)?;
-                vals.push(RVal::Int(i64::from_be_bytes(b.try_into().unwrap())));
+                RVal::Int(i64::from_be_bytes(b.try_into().unwrap()))
+            }
+            10 | 12 | 13 => {
+                let b = take(&mut at, 4)?;
+                RVal::Raw(u32::from_be_bytes(b.try_into().unwrap()).to_le_bytes().to_vec())
+            }
+            27 => {
+                let b = take(&mut at, 8)?;
+                RVal::Raw(u64::from_be_bytes(b.try_into().unwrap()).to_le_bytes().to_vec())
+            }
+            9 | 35 => {
+                let b = take(&mut at, 8)?;
+                let d = u32::from_be_bytes(b[..4].try_into().unwrap());
+                let t = u32::from_be_bytes(b[4..].try_into().unwrap());
+                let mut v = d.to_le_bytes().to_vec();
+                v.extend_from_slice(&t.to_le_bytes());
+                RVal::Raw(v)
+            }
+            23 => {
+                let b = take(&mut at, 4)?;
+                RVal::Raw(vec![b[0]])
+            }
+            26 => {
+                let b = take(&mut at, 16)?;
+                let mut v = Vec::with_capacity(16);
+                for w in b.chunks(4).rev() {
+                    v.extend_from_slice(&u32::from_be_bytes(w.try_into().unwrap()).to_le_bytes());
+                }
+                RVal::Raw(v)
             }
             37 => {
                 let b = take(&mut at, 4)?;
@@ -4361,34 +4470,93 @@ fn xdr_decode(xdr: &[u8], cols: &[RCol]) -> Result<Vec<RVal>, Refused> {
                     return Err(Refused("a varchar longer than its column".into()));
                 }
                 let d = take(&mut at, n)?;
-                at += (4 - n % 4) % 4; // the pad
-                vals.push(RVal::Bytes(d));
+                at += (4 - n % 4) % 4;
+                RVal::Bytes(d)
             }
             14 => {
                 let n = c.length as usize;
                 let d = take(&mut at, n)?;
                 at += (4 - n % 4) % 4;
-                vals.push(RVal::Bytes(d));
+                RVal::Bytes(d)
             }
             261 => {
-                // the quad rides as two BE longs; its VALUE is the
-                // source database's blob id, replaced wholesale on
-                // restore - the rec_blob records that follow the row
-                // carry the content
                 let _ = take(&mut at, 8)?;
-                vals.push(RVal::Blob { stream: false, segments: Vec::new() });
+                RVal::Blob { stream: false, segments: Vec::new() }
             }
             _ => return Err(Refused("a field type outside this restore's surface".into())),
-        }
+        };
+        vals.push(v);
     }
-    // the trailing null indicators, one per field
-    for v in vals.iter_mut() {
+    for (v, c) in vals.iter_mut().zip(cols.iter()) {
+        if c.computed {
+            continue;
+        }
         let b = take(&mut at, 4)?;
         if u32::from_be_bytes(b.try_into().unwrap()) != 0 {
             *v = RVal::Null;
         }
     }
     Ok(vals)
+}
+
+/// The canonical XDR slice back into native element bytes for a column
+/// of `count` elements: the inverse of [xdr_slice]. The slice opens with
+/// its raw length (a BE long, skipped); then per element by the column's
+/// type - text opaque padded to 4, varying a BE count + bytes padded (the
+/// native element is a LE u16 count + bytes in a slot of length+2),
+/// short/long/date/time/float one BE long, int64/double one BE hyper,
+/// timestamp two BE longs, boolean one byte padded.
+fn unxdr_slice(xdr: &[u8], c: &RCol, count: usize) -> Result<Vec<u8>, Refused> {
+    let mut at = 4usize.min(xdr.len());
+    let take = |at: &mut usize, n: usize| -> Result<Vec<u8>, Refused> {
+        let d = xdr.get(*at..*at + n).ok_or_else(|| Refused("an array slice ended mid-element".into()))?.to_vec();
+        *at += n;
+        Ok(d)
+    };
+    let mut out = Vec::new();
+    for _ in 0..count {
+        match c.field_type {
+            14 => {
+                let n = c.length as usize;
+                out.extend_from_slice(&take(&mut at, n)?);
+                at += (4 - n % 4) % 4;
+            }
+            37 => {
+                let n = u32::from_be_bytes(take(&mut at, 4)?.try_into().unwrap()) as usize;
+                if n > c.length as usize {
+                    return Err(Refused("an array element longer than its column".into()));
+                }
+                let d = take(&mut at, n)?;
+                at += (4 - n % 4) % 4;
+                out.extend_from_slice(&(n as u16).to_le_bytes());
+                out.extend_from_slice(&d);
+                out.extend(std::iter::repeat(0u8).take(c.length as usize - n));
+            }
+            7 => {
+                let v = i32::from_be_bytes(take(&mut at, 4)?.try_into().unwrap());
+                out.extend_from_slice(&(v as i16).to_le_bytes());
+            }
+            8 | 10 | 12 | 13 => {
+                let v = u32::from_be_bytes(take(&mut at, 4)?.try_into().unwrap());
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            16 | 27 => {
+                let v = u64::from_be_bytes(take(&mut at, 8)?.try_into().unwrap());
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            9 | 35 => {
+                let b = take(&mut at, 8)?;
+                out.extend_from_slice(&u32::from_be_bytes(b[..4].try_into().unwrap()).to_le_bytes());
+                out.extend_from_slice(&u32::from_be_bytes(b[4..].try_into().unwrap()).to_le_bytes());
+            }
+            23 => {
+                let b = take(&mut at, 4)?;
+                out.push(b[0]);
+            }
+            t => return Err(Refused(format!("array element type {} is outside this restore's surface", t))),
+        }
+    }
+    Ok(out)
 }
 
 /// Read a whole .fbk.
@@ -4424,6 +4592,10 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
         shadows: Vec::new(),
         privileges_skipped: 0,
         privilege_users: Vec::new(),
+        privileges: Vec::new(),
+        domain_facts: Vec::new(),
+        dimensions: Vec::new(),
+        not_null_names: Vec::new(),
     };
     // (schema, source name) -> not-null flag learned from constraints
     let mut current_rel: Option<usize> = None; // index into out.tables (metadata phase)
@@ -4531,6 +4703,7 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                 // walker desynced on the first one (measured)
                 let mut atts: Vec<Att> = Vec::new();
                 let mut computed: Option<Vec<u8>> = None;
+                let mut computed_src: Option<Vec<u8>> = None;
                 let mut dom_desc: Option<Vec<u8>> = None;
                 let mut dom_default_blr: Option<Vec<u8>> = None;
                 let mut dom_default_src: Option<Vec<u8>> = None;
@@ -4554,7 +4727,7 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                         .ok_or_else(|| Refused("truncated domain attribute".into()))?
                         .to_vec();
                     at += len;
-                    if matches!(tag, 15..=21 | 35 | 36 | 39) {
+                    if matches!(tag, 15..=21 | 35 | 36 | 37 | 39) {
                         let mut n: i64 = 0;
                         for (k, b) in data.iter().enumerate().take(8) {
                             n |= (*b as i64) << (8 * k);
@@ -4567,6 +4740,7 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                         at += n;
                         match tag {
                             18 => computed = Some(raw),
+                            37 => computed_src = Some(raw),
                             35 => dom_desc = Some(raw),
                             15 => dom_default_blr = Some(raw),
                             39 => dom_default_src = Some(raw),
@@ -4617,12 +4791,24 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                             ));
                         }
                     }
+                    out.domain_facts.push(RDomainFacts {
+                        name: name.clone(),
+                        precision: att(&atts, 44).map(|a| a.int()),
+                        char_len: att(&atts, 41).map(|a| a.int()),
+                        charset: att(&atts, 42).map(|a| a.int()),
+                        collation: att(&atts, 43).map(|a| a.int()),
+                        segment_length: att(&atts, 12).map(|a| a.int()),
+                        dims: att(&atts, 29).map(|a| a.int()).unwrap_or(0),
+                        computed: computed.clone().map(|b| (b, computed_src.clone().unwrap_or_default())),
+                    });
                     out.domain_types.push((
                         name.clone(),
                         att(&atts, 8).map(|a| a.int()).unwrap_or(0),
                         att(&atts, 10).map(|a| a.int()).unwrap_or(0),
-                        att(&atts, 9).map(|a| a.int()).unwrap_or(0),
+                        // scale is att 11, sub_type att 9 (burp.h) - the
+                        // tuple's consumers read (.., scale, sub_type)
                         att(&atts, 11).map(|a| a.int()).unwrap_or(0),
+                        att(&atts, 9).map(|a| a.int()).unwrap_or(0),
                     ));
                     if let Some(cb) = computed {
                         out.domain_computed.push((name.clone(), cb));
@@ -5387,12 +5573,16 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
             }
             rec::FIELD => {
                 const DESC_TAG: u8 = 35;
-                let (atts, blobs) = read_atts_blob(f, &mut at, &[DESC_TAG])?;
+                // blobs on a local field: the description (35) and a
+                // column-level DEFAULT's BLR (15) + source (39) - the
+                // latter two unframed once desynced the whole stream at
+                // SALES.ORDER_STATUS `DEFAULT 'new'`
+                let (atts, blobs) = read_atts_blob(f, &mut at, &[DESC_TAG, 15, 39])?;
                 let t = current_rel.ok_or_else(|| Refused("a field outside a relation".into()))?;
                 let ftype = att(&atts, 8)
                     .map(|a| a.int() as i32)
                     .ok_or_else(|| Refused("a field with no type".into()))?;
-                if !matches!(ftype, 7 | 8 | 16 | 14 | 37 | 261) {
+                if !matches!(ftype, 7 | 8 | 9 | 10 | 12 | 13 | 14 | 16 | 23 | 26 | 27 | 35 | 37 | 261) {
                     return Err(Refused(format!(
                         "field type {} is outside this restore's surface",
                         ftype
@@ -5432,29 +5622,120 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                         .ok_or_else(|| Refused("a field with no name".into()))?,
                     field_type: ftype,
                     length: att(&atts, 10).map(|a| a.int() as u16).unwrap_or(0),
-                    // RECORDED, NOT FIXED: this reads the scale out of
-                    // att 9, which on an ENGINE-written file is
-                    // RDB$FIELD_SUB_TYPE - a `NUMERIC(9,2)` column reads
-                    // back as scale 1. The writer above has the mirror of
-                    // the same confusion, and the two are consistent with
-                    // each other; see that comment for the measurement.
+                    // burp.h: att 9 is RDB$FIELD_SUB_TYPE, att 11
+                    // RDB$FIELD_SCALE - the two rode swapped here (and in
+                    // the writer) for a long time; a NUMERIC(9,2) read
+                    // back as scale 1
                     scale: if ftype == 261 {
                         0
                     } else {
-                        att(&atts, 9).map(|a| a.int() as i8).unwrap_or(0)
+                        att(&atts, 11).map(|a| a.int() as i8).unwrap_or(0)
                     },
-                    sub_type: if ftype == 261 {
-                        att(&atts, 9).map(|a| a.int() as i16).unwrap_or(0)
-                    } else {
-                        0
-                    },
+                    sub_type: att(&atts, 9).map(|a| a.int() as i16).unwrap_or(0),
                     position: att(&atts, 13).map(|a| a.int() as i32).unwrap_or(n as i32),
                     field_id: att(&atts, 22).map(|a| a.int() as i32).unwrap_or((n + 1) as i32),
                     not_null: att(&atts, 38).map(|a| a.int() == 1).unwrap_or(false),
                     domain: att(&atts, 2)
                         .map(|a| a.text())
                         .filter(|d| !d.starts_with("RDB$")),
+                    source: att(&atts, 2).map(|a| a.text()).unwrap_or_default(),
+                    dims: att(&atts, 29).map(|a| a.int() as i32).unwrap_or(0),
+                    computed: att(&atts, 23).map(|a| a.int() != 0).unwrap_or(false),
+                    default: blobs.iter().find(|(tg, _)| *tg == 15).map(|(_, blr)| {
+                        (
+                            blr.clone(),
+                            blobs.iter().find(|(tg, _)| *tg == 39).map(|(_, d)| d.clone()).unwrap_or_default(),
+                        )
+                    }),
                 });
+            }
+            rec::FIELD_DIMENSIONS => {
+                // `48 PUBLIC, 1 name, 29 dim (0-based), 32 low, 33 high`
+                let atts = read_atts(f, &mut at)?;
+                out.dimensions.push((
+                    att(&atts, 1).map(|a| a.text()).unwrap_or_default(),
+                    att(&atts, 29).map(|a| a.int()).unwrap_or(0),
+                    att(&atts, 32).map(|a| a.int()).unwrap_or(1),
+                    att(&atts, 33).map(|a| a.int()).unwrap_or(1),
+                ));
+            }
+            rec::ARRAY => {
+                // `3 field number, 14 dims, (15 low, 16 high) per dim,
+                // then BARE 7 + u32 LE raw length + raw slice, BARE 18 +
+                // u32 LE XDR length + the canonical slice` - no att_end.
+                // The XDR slice is what is decoded (the raw one is the
+                // writing machine's byte order); it opens with its raw
+                // length as a big-endian long.
+                let t = data_rel.ok_or_else(|| Refused("an array outside relation data".into()))?;
+                let mut field_no: i64 = 0;
+                let mut dims: Vec<(i32, i32)> = Vec::new();
+                let mut lo: Option<i32> = None;
+                let mut raw_len: Option<usize> = None;
+                let mut xdr: Option<Vec<u8>> = None;
+                loop {
+                    let tag = *f.get(at).ok_or_else(|| Refused("truncated array record".into()))?;
+                    at += 1;
+                    if tag == 7 || tag == 18 {
+                        // 7 is the raw slice's LENGTH alone (a bare u32, no
+                        // bytes follow it); 18 is the XDR slice's length
+                        // and then the slice itself
+                        let lb = f.get(at..at + 4).ok_or_else(|| Refused("truncated array slice".into()))?;
+                        let n = u32::from_le_bytes([lb[0], lb[1], lb[2], lb[3]]) as usize;
+                        at += 4;
+                        if tag == 7 {
+                            raw_len = Some(n);
+                            continue;
+                        }
+                        let d = f.get(at..at + n).ok_or_else(|| Refused("an array slice past the end".into()))?.to_vec();
+                        at += n;
+                        xdr = Some(d);
+                        break;
+                    }
+                    let len = *f.get(at).ok_or_else(|| Refused("truncated array record".into()))? as usize;
+                    at += 1;
+                    let a = Att {
+                        tag,
+                        data: f.get(at..at + len).ok_or_else(|| Refused("truncated array record".into()))?.to_vec(),
+                    };
+                    at += len;
+                    match a.tag {
+                        3 => field_no = a.int(),
+                        15 => lo = Some(a.int() as i32),
+                        16 => dims.push((lo.take().unwrap_or(1), a.int() as i32)),
+                        _ => {}
+                    }
+                }
+                let table = &mut out.tables[t];
+                let col = table
+                    .cols
+                    .iter()
+                    .position(|c| c.field_id as i64 == field_no)
+                    .ok_or_else(|| Refused("an array for an unknown field".into()))?;
+                let count: usize = dims.iter().map(|(l, h)| (*h - *l + 1).max(0) as usize).product();
+                let native = match &xdr {
+                    Some(x) => unxdr_slice(x, &table.cols[col], count)?,
+                    None => return Err(Refused("an array record without its XDR slice".into())),
+                };
+                if let Some(n) = raw_len {
+                    if n != native.len() {
+                        return Err(Refused(format!(
+                            "an array slice of {} bytes where the record says {}",
+                            native.len(),
+                            n
+                        )));
+                    }
+                }
+                let row = table
+                    .rows
+                    .last_mut()
+                    .ok_or_else(|| Refused("an array before any row".into()))?;
+                match row.get_mut(col) {
+                    Some(RVal::Array { raw: r, dims: d }) => {
+                        *r = native;
+                        *d = dims;
+                    }
+                    _ => return Err(Refused("an array for a non-array value".into())),
+                }
             }
             rec::RELATION_END => {
                 current_rel = None;
@@ -5529,6 +5810,7 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                         .ok_or_else(|| Refused("an index with no name".into()))?,
                     unique: att(&atts, 4).map(|a| a.int() == 1).unwrap_or(false),
                     descending: itype == 1,
+                    index_type: att(&atts, 7).map(|a| a.int()),
                     segments,
                     foreign: att(&atts, 8).map(|a| a.text()),
                     expression,
@@ -5722,6 +6004,17 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                 out.privileges_skipped += 1;
                 out.privilege_users
                     .push(att(&atts, 1).map(|a| a.text()).unwrap_or_default());
+                out.privileges.push(RPrivilege {
+                    user: att(&atts, 1).map(|a| a.text()).unwrap_or_default(),
+                    grantor: att(&atts, 2).map(|a| a.text()).unwrap_or_default(),
+                    privilege: att(&atts, 3).map(|a| a.text()).unwrap_or_default(),
+                    grant_option: att(&atts, 4).map(|a| a.int()),
+                    schema: att(&atts, 10).map(|a| a.text()),
+                    object: att(&atts, 5).map(|a| a.text()).unwrap_or_default(),
+                    field: att(&atts, 6).map(|a| a.text()),
+                    user_type: att(&atts, 7).map(|a| a.int()).unwrap_or(8),
+                    object_type: att(&atts, 8).map(|a| a.int()).unwrap_or(0),
+                });
             }
             rec::END => break,
             other => {
@@ -5742,6 +6035,7 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                 c.not_null = true;
             }
         }
+        out.not_null_names.push((cname.clone(), table.clone(), col.clone()));
     }
     Ok(out)
 }
