@@ -4589,7 +4589,11 @@ and `UPDATE t SET c = FN2(1)` all refuse with `42000 Dynamic SQL Error`
 (separate pre-existing gaps), and a selectable procedure that writes
 falls to the source interpreter and writes the right value.
 
-### F2 - MEDIUM-HIGH, WRONG ANSWER (silent), PRE-EXISTING. The rescale overflow is reachable, and the engine RAISES where fire-crab answers a number
+### F2 - DONE for the PSQL path (2026-09-07, `serve-real-altfmt`). The rescale overflow raises where the engine raises
+
+**FIXED on the procedure/function path.** `fire_crab_ods::format::present_field` now returns `Err(PresentErr::OutOfRange)` when an exact rescale overflows (the 128-bit accumulator, or the target's i64/38-digit backing), and `present_record`/`present_through` propagate it; the executor turns it into `numeric value is out of range`, so a selectable procedure over a `BIGINT` holding 9e17 after `ALTER ... TYPE NUMERIC(18,4)` raises `22003` as the engine does instead of answering `90000000000000.0000`. RECORDED, still open: the CLIENT read walk (`decode_stored` and its seven callers) returns `Option` and cannot carry a raise, so a bare client `SELECT` of the same overflow still leaves the value unconverted; raising it needs an error channel through that walk. The floor unit test now asserts the engine's behaviour (an overflow declines to `None` on the client path via `present_field(...).ok().flatten()`, and the wire narrowing/rounding cases are unchanged).
+
+### F2 (original) - MEDIUM-HIGH, WRONG ANSWER (silent), PRE-EXISTING. The rescale overflow is reachable, and the engine RAISES where fire-crab answers a number
 
 `crates/wire/src/server.rs:36143` (`present_field`; the declining
 `i64::try_from(n).ok()?` at the end of it). The full reproducer and the
@@ -4608,7 +4612,11 @@ claim is retired above. **The unit test that pins the floor asserts the
 current behaviour, not the engine's** - whoever converts this should
 expect to change that test rather than keep it.
 
-### F3 - MEDIUM, WRONG ANSWER, PRE-EXISTING. `DATE` -> `TIMESTAMP` is an engine-accepted ALTER the fix's guard excludes, and the old row projects as the epoch
+### F3 - DONE (2026-09-07, `serve-real-altfmt`). `DATE` -> `TIMESTAMP` presents the stored day at midnight
+
+**FIXED.** `present_field` converts a `DATE` shown through a `TIMESTAMP` slot to that day at midnight instead of letting the wire read the epoch; measured against the engine, the old row reads `2020-03-04 00:00:00` and `EXTRACT(HOUR)` is 0. On both the client read and the procedure path (shared `ods` helper).
+
+### F3 (original) - MEDIUM, WRONG ANSWER, PRE-EXISTING. `DATE` -> `TIMESTAMP` is an engine-accepted ALTER the fix's guard excludes, and the old row projects as the epoch
 
 `is_exact_dtype` (`crates/wire/src/server.rs:36074`) makes `present_field`
 answer `None` the moment either side is not
@@ -4636,7 +4644,11 @@ the row re-lays it through `upgrade_image` and both servers then read
 `2020-03-04` - so there is no wrong write, and no `SELECT`-only reader
 is ever told.
 
-### F4 - MEDIUM, WRONG ANSWER, PRE-EXISTING. `CHAR(n)` -> `CHAR(m)`: an old-format row presents at the OLD width
+### F4 - DONE (2026-09-07, `serve-real-altfmt`). `CHAR(n)` -> `CHAR(m)` presents at the new width
+
+**FIXED.** `present_field` re-pads a `CHAR` shown through a wider `CHAR` to the new declared width, so `CHAR_LENGTH`, `OCTET_LENGTH` and concatenation see 10 and 11 rather than 4 and 5. `VARCHAR` needed nothing (its length travels with the value).
+
+### F4 (original) - MEDIUM, WRONG ANSWER, PRE-EXISTING. `CHAR(n)` -> `CHAR(m)`: an old-format row presents at the OLD width
 
 Same guard, same class; the text arm of `decode_field`
 (`crates/ods/src/format.rs:464`) fits the value to the STORED

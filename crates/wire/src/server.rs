@@ -37381,27 +37381,14 @@ fn is_exact_dtype(t: u8) -> bool {
 /// noted there as asserting the current behaviour rather than the
 /// engine's.
 fn present_field(v: &Value, stored: &Descriptor, newest: &Descriptor) -> Option<Value> {
-    if stored.scale == newest.scale
-        || !is_exact_dtype(stored.dtype)
-        || !is_exact_dtype(newest.dtype)
-    {
-        return None;
-    }
-    let (raw, from) = match v {
-        Value::Int(n) => (*n as i128, 0i8),
-        Value::Scaled(r, s) => (*r as i128, *s),
-        Value::Int128(r, s) => (*r, *s),
-        _ => return None,
-    };
-    let to = newest.scale;
-    let n = rescale(raw, from, to).ok()?;
-    Some(if newest.dtype == dtype::INT128 {
-        Value::Int128(n, to)
-    } else if to == 0 {
-        Value::Int(i64::try_from(n).ok()?)
-    } else {
-        Value::Scaled(i64::try_from(n).ok()?, to)
-    })
+    // the shared presentation ([fire_crab_ods::format::present_field]) -
+    // scale change, DATE -> TIMESTAMP (F3), CHAR -> wider CHAR (F4). An
+    // exact rescale that OVERFLOWS is Err(OutOfRange): the engine raises
+    // 22003 there, and the wire read walk below cannot carry a raise
+    // through its Option, so it is left UNCHANGED here as it always was
+    // (F2 on the client read path, recorded not repaired); the
+    // procedure/function path raises it.
+    fire_crab_ods::format::present_field(v, stored, newest).ok().flatten()
 }
 
 /// A whole decoded record, presented through `newest` - [present_field]

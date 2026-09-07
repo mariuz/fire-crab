@@ -295,11 +295,14 @@ bk "F1 backup of a scale-preserving ALTER" W6 "ID 1|N 700|ID 2|N 7|ID 3|N 7|ID 4
 # (70000 / 700 / 700 / 70000) rather than a mix of raw and converted, but
 # the restored column has lost its SCALE - the recorded att 9 / att 11
 # defect. Pinned as the wrong answer it is, with the engine's beside it.
-bk "F2 backup of a scale-changing ALTER (RECORDED: the scale is lost)" S6 \
-   "ID 1|N 70000|ID 2|N 700|ID 3|N 700|ID 4|N 70000|"
-# PL: a plain NUMERIC(9,2) that was NEVER ALTERed loses its scale too -
-# which is what makes the defect above independent of any format.
-bk "F3 the scale loss is not about formats at all" PL "ID 1|N 70000|"
+# fire-crab's backup now presents the scale (relay_image converts an
+# old-format row into the newest format's descriptors before writing),
+# so a NUMERIC(9,2) restores as the ENGINE's own backup does (F4 below) -
+# the recorded "scale is lost" divergence is CLOSED.
+bk "F2 backup of a scale-changing ALTER (the scale is carried, = the engine)" S6 \
+   "ID 1|N 700.00|ID 2|N 7.00|ID 3|N 7.00|ID 4|N 700.00|"
+# PL: a plain NUMERIC(9,2) that was NEVER ALTERed carries its scale too.
+bk "F3 a plain NUMERIC keeps its scale through the backup" PL "ID 1|N 700.00|"
 # ...and what the ENGINE's own backup of the SAME file restores, so the
 # two answers sit beside each other in this file.
 ran=$((ran + 1))
