@@ -68416,8 +68416,42 @@ impl Expr {
                     // (probed: 12.55 to scale 1 is 12.6, -12.55 is -12.6)
                     CastTarget::Numeric { scale, bytes, .. } => {
                         let (raw, from) = match &v {
-                            Value::Text(t) => decimal_parts(t)
-                                .ok_or_else(|| conv_err(*cs, t.clone()))?,
+                            Value::Text(t) => {
+                                let (mut raw, mut from) = decimal_parts(t)
+                                    .ok_or_else(|| conv_err(*cs, t.clone()))?;
+                                // a PLAIN decimal's trailing FRACTION zeros
+                                // are not significant digits and the engine
+                                // drops them before the coefficient gate:
+                                // '0.9999000' has coefficient 9999, not
+                                // 9999000, so it fits NUMERIC(4,4)
+                                while from < 0 && raw % 10 == 0 {
+                                    raw /= 10;
+                                    from += 1;
+                                }
+                                // GATE 1 (the engine's, measured): the
+                                // pre-round COEFFICIENT of the string - its
+                                // significant digits, plain-decimal trailing
+                                // fraction zeros already dropped by
+                                // decimal_parts - must fit the target's
+                                // BACKING integer width BEFORE any rounding
+                                // to scale. `CAST('0.99995' AS NUMERIC(4,4))`
+                                // raises 22003 even though it rounds to
+                                // 1.0000 which fits, because 99995 overflows
+                                // the int16 backing; widen to NUMERIC(9,4)
+                                // (int32) and the same string succeeds. The
+                                // rescaled STORED value is gated separately
+                                // below.
+                                let (lo, hi) = match *bytes {
+                                    2 => (i16::MIN as i128, i16::MAX as i128),
+                                    4 => (i32::MIN as i128, i32::MAX as i128),
+                                    8 => (i64::MIN as i128, i64::MAX as i128),
+                                    _ => (i128::MIN, i128::MAX),
+                                };
+                                if raw < lo || raw > hi {
+                                    return Err(EvalErr::NumericOutOfRange);
+                                }
+                                (raw, from)
+                            }
                             // an approximate source rounds at the target
                             // scale directly - it has no exact form to
                             // rescale from
@@ -68482,9 +68516,23 @@ impl Expr {
                         v if approx_of(v).is_some() => {
                             Value::Double(approx_of(v).unwrap_or(0.0))
                         }
-                        Value::Text(t) => match t.trim_matches(' ').parse::<f64>() {
-                            Ok(d) => Value::Double(d),
-                            Err(_) => return Err(conv_err(*cs, t.clone())),
+                        // the engine NEVER produces Infinity or NaN from a
+                        // string cast (measured): 'inf'/'nan'/'infinity' and
+                        // any non-numeric text are 22018 conversion errors,
+                        // and a well-formed value that OVERFLOWS binary64
+                        // ('1e400', '1e309') is 22003 out of range - not a
+                        // silent Infinity, which Rust's own f64 parse gives.
+                        // text_number is the strict CVT grammar (rejects the
+                        // special words and hex); text_to_approx rejects the
+                        // non-finite result.
+                        Value::Text(t) => match text_number(t) {
+                            None | Some(TextNum::Hex { .. }) => {
+                                return Err(conv_err(*cs, t.clone()))
+                            }
+                            Some(tn) => match text_to_approx(tn, t) {
+                                Some(d) => Value::Double(d),
+                                None => return Err(EvalErr::NumericOutOfRange),
+                            },
                         },
                         other => match numeric_parts(other) {
                             Some((raw, sc)) => {
