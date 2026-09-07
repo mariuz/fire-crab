@@ -146,7 +146,10 @@ pub struct ColumnDef {
 pub struct ComputedCol {
     pub source: String,
     pub blr: Vec<u8>,
-    pub precision: i16,
+    /// RDB$FIELD_PRECISION of the result: the exact-numeric family
+    /// carries one (4/9/18/38, or 18 for a timestamp difference); a
+    /// DOUBLE or text result stores NULL (probed on the employee sample)
+    pub precision: Option<i16>,
 }
 
 /// A column's `GENERATED {ALWAYS | BY DEFAULT} AS IDENTITY
@@ -1512,7 +1515,9 @@ pub fn alter_table_add_column(
     if let Some((src, blr, precision)) = computed_blobs {
         field_vals.push(("RDB$COMPUTED_SOURCE", SysVal::B(blob_id_bytes(2, src))));
         field_vals.push(("RDB$COMPUTED_BLR", SysVal::B(blob_id_bytes(2, blr))));
-        field_vals.push(("RDB$FIELD_PRECISION", SysVal::I(precision as i64)));
+        if let Some(precision) = precision {
+            field_vals.push(("RDB$FIELD_PRECISION", SysVal::I(precision as i64)));
+        }
     } else if let Some(p) = col.precision {
         // a plain added column's precision, same rule as create_table
         field_vals.push(("RDB$FIELD_PRECISION", SysVal::I(p as i64)));
@@ -4361,7 +4366,9 @@ pub fn create_table(
         if let Some((src, blr, precision)) = computed_blobs {
             vals.push(("RDB$COMPUTED_SOURCE", SysVal::B(blob_id_bytes(2, src))));
             vals.push(("RDB$COMPUTED_BLR", SysVal::B(blob_id_bytes(2, blr))));
-            vals.push(("RDB$FIELD_PRECISION", SysVal::I(precision as i64)));
+            if let Some(precision) = precision {
+                vals.push(("RDB$FIELD_PRECISION", SysVal::I(precision as i64)));
+            }
         } else if let Some(p) = c.precision {
             // a plain declared column's precision: 0 for the exact-int
             // family, the declared p for NUMERIC/DECIMAL (probed)
@@ -4436,6 +4443,19 @@ pub fn create_table(
     // does not re-check, so they are taken by advancing them.
     let class = next_security_class(file, page_size, ACL_TABLE_OWNER)?;
     let default_class = next_default_class(file, page_size)?;
+    // A COLUMN-LEVEL PRIMARY KEY or UNIQUE leaves the table at FORMAT 2
+    // with two identical RDB$FORMATS rows (measured on the employee
+    // sample: COUNTRY, DEPARTMENT and PROJECT are 2, every other table
+    // 1) - the engine's inline key constraint re-formats the relation
+    // it has just created
+    let table_format_no: i64 = if constraints.iter().any(|c| {
+        matches!(c.place, ConstraintPlace::Inline { .. })
+            && matches!(c.kind, ConstraintKind::Key(_))
+    }) {
+        2
+    } else {
+        1
+    };
     sys_insert(
         file,
         page_size,
@@ -4446,7 +4466,7 @@ pub fn create_table(
             ("RDB$RELATION_NAME", SysVal::S(&name)),
             ("RDB$RUNTIME", SysVal::B(blob_id_bytes(6, runtime_blob))),
             ("RDB$DBKEY_LENGTH", SysVal::I(8)),
-            ("RDB$FORMAT", SysVal::I(1)),
+            ("RDB$FORMAT", SysVal::I(table_format_no)),
             ("RDB$FIELD_ID", SysVal::I(cols.len() as i64)),
             ("RDB$SYSTEM_FLAG", SysVal::I(0)),
             ("RDB$FLAGS", SysVal::I(1)), // REL_sql
@@ -4476,6 +4496,29 @@ pub fn create_table(
             ("RDB$DESCRIPTOR", SysVal::B(blob_id_bytes(8, fmt_blob))),
         ],
     )?;
+    // a computed column's dependency rows, from its stored expression
+    for (i, c) in cols.iter().enumerate() {
+        if c.computed.is_some() {
+            if let Some((dname, ..)) = src_meta.get(i) {
+                store_dependencies_deferred(file, page_size, 3, dname)?;
+            }
+        }
+    }
+    if table_format_no == 2 {
+        // the inline key's re-format: a second, identical descriptor
+        let fmt_blob2 = write_format_blob(file, page_size, &descs)?;
+        sys_insert(
+            file,
+            page_size,
+            "RDB$FORMATS",
+            8,
+            &[
+                ("RDB$RELATION_ID", SysVal::I(rel_id)),
+                ("RDB$FORMAT", SysVal::I(2)),
+                ("RDB$DESCRIPTOR", SysVal::B(blob_id_bytes(8, fmt_blob2))),
+            ],
+        )?;
+    }
     for (page, ptype) in if external {
         vec![]
     } else {
@@ -4550,15 +4593,12 @@ pub fn create_table(
             // first. Writing in the law's order reproduces that.
             ConstraintStep::Fk(i) => {
                 let fk = &fks[i];
-                // an unnamed FK is named INTEG_<n> - the same generated
-                // name for both the constraint and its index, as the
-                // engine does
-                let fk_name = if fk.name.is_empty() {
-                    next_integ_name(file, page_size)?
-                } else {
-                    fk.name.clone()
-                };
-                write_foreign_key_full(file, page_size, &name, &fk_name, fk, true)?;
+                // an unnamed FK is named INTEG_<n>, and its index draws
+                // the shared index counter as RDB$FOREIGN<n> (measured:
+                // INTEG_11 -> RDB$FOREIGN3, the same counter RDB$PRIMARYn
+                // and RDB$n draw from); a NAMED constraint names its index
+                let (fk_name, index_name) = fk_names(file, page_size, fk)?;
+                write_foreign_key_full(file, page_size, &name, &fk_name, &index_name, fk, true)?;
             }
         }
     }
@@ -4766,26 +4806,10 @@ fn write_check(
                 ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
             ],
         )?;
-        // one dependency row per referenced field, first-seen order
-        for f in &check.fields {
-            let drel = crate::resolve_relation(file, page_size, "RDB$DEPENDENCIES")
-                .ok_or("no RDB$DEPENDENCIES relation")?;
-            sys_insert(
-                file,
-                page_size,
-                "RDB$DEPENDENCIES",
-                drel,
-                &[
-                    ("RDB$DEPENDENT_NAME", SysVal::S(tname)),
-                    ("RDB$DEPENDED_ON_NAME", SysVal::S(table)),
-                    ("RDB$FIELD_NAME", SysVal::S(f)),
-                    ("RDB$DEPENDENT_TYPE", SysVal::I(2)),   // obj_trigger
-                    ("RDB$DEPENDED_ON_TYPE", SysVal::I(0)), // obj_relation
-                    ("RDB$DEPENDENT_SCHEMA_NAME", SysVal::S("PUBLIC")),
-                    ("RDB$DEPENDED_ON_SCHEMA_NAME", SysVal::S("PUBLIC")),
-                ],
-            )?;
-        }
+        // the dependency rows come from walking the stored BLR, the way
+        // the engine's MET_get_dependencies does (a subselect's table and
+        // fields included: EMPLOYEE's salary CHECK depends on JOB)
+        store_dependencies_deferred(file, page_size, 2, tname)?;
     }
     sys_row_by_name(file, page_size, "RDB$RELATION_CONSTRAINTS", &[
         ("RDB$CONSTRAINT_NAME", SysVal::S(&cname)),
@@ -4947,7 +4971,11 @@ fn create_view_impl(
         contexts,
         Some((dbkey, &class, &default_class)),
         forced_id,
-    )
+    )?;
+    // a view's owner holds the same five privileges a table's does
+    // (measured: PHONE_LIST has SYSDBA D/I/R/S/U rows like the tables)
+    store_privileges(file, page_size, &want, 0, TABLE_OWNER_PRIVILEGES)?;
+    Ok(())
 }
 
 /// The RDB$FIELDS row of an auto-domain (`RDB$<n>`) - the type of an
@@ -5150,23 +5178,19 @@ fn restore_view_with(
     };
     // the format: each field's descriptor from its (already restored)
     // domain, offsets laid out the way the row would be
-    let mut descs: Vec<Descriptor> = Vec::new();
-    let mut off = 4u16; // the null bitmap slot, as create_table lays out
+    // the view's format is laid out like a table's: the ini.epp walk
+    // (a VARCHAR carries its 2-byte count, fields align) - measured on
+    // the employee sample's PHONE_LIST, where a raw-length layout made
+    // the engine refuse the view with a string truncation
+    let mut fields_ty: Vec<(u8, u16, i8, i16)> = Vec::new();
     for f in fields {
         let (ft, len, sc, st) = domain_type_info(file, page_size, &f.source)
             .ok_or_else(|| format!("view {}: domain {} not found", name, f.source))?;
         let dt = field_type_to_dtype(ft)
             .ok_or_else(|| format!("view {}: field type {} unsupported", name, ft))?;
-        descs.push(Descriptor {
-            dtype: dt,
-            scale: sc,
-            length: len,
-            sub_type: st,
-            flags: 0,
-            offset: off as u32,
-        });
-        off += len;
+        fields_ty.push((dt, len, sc, st));
     }
+    let descs: Vec<Descriptor> = compute_format(&fields_ty);
     let fmt_blob = write_format_blob(file, page_size, &descs)?;
     let formats_rel = crate::resolve_relation(file, page_size, "RDB$FORMATS")
         .ok_or("no RDB$FORMATS relation")?;
@@ -5459,48 +5483,10 @@ pub fn create_user_trigger(
             row
         },
     )?;
-    let dep = |file: &mut crate::Image, on: &str, field: Option<&str>, otype: i64| -> Result<(), String> {
-        let drel = crate::resolve_relation(file, page_size, "RDB$DEPENDENCIES")
-            .ok_or("no RDB$DEPENDENCIES relation")?;
-        let mut row = vec![
-            ("RDB$DEPENDENT_NAME", SysVal::S(&def.name)),
-            ("RDB$DEPENDED_ON_NAME", SysVal::S(on)),
-            ("RDB$DEPENDENT_TYPE", SysVal::I(2)), // obj_trigger
-            ("RDB$DEPENDED_ON_TYPE", SysVal::I(otype)),
-            ("RDB$DEPENDENT_SCHEMA_NAME", SysVal::S("PUBLIC")),
-            ("RDB$DEPENDED_ON_SCHEMA_NAME", SysVal::S("PUBLIC")),
-        ];
-        if let Some(f) = field {
-            row.push(("RDB$FIELD_NAME", SysVal::S(f)));
-        }
-        sys_insert(file, page_size, "RDB$DEPENDENCIES", drel, &row)
-    };
-    // a database trigger has no row, so it names no column of its own
-    if let Some(t) = table.as_deref() {
-        for f in &def.fields {
-            dep(file, t, Some(f), 0)?;
-        }
-    }
-    // a blr_store's target: the relation itself plus each stored column
-    for (srel_name, scols) in &def.store_deps {
-        dep(file, srel_name, None, 0)?;
-        for c in scols {
-            dep(file, srel_name, Some(c), 0)?;
-        }
-    }
-    // a raised exception: object type 7 (probed)
-    for e in &def.exceptions {
-        dep(file, e, None, 7)?;
-    }
-    // a generator the body draws: object type 14 (measured)
-    for g in &def.generators {
-        dep(file, g, None, 14)?;
-    }
-    // the character set of a declared TEXT variable: object type 17,
-    // one row whatever the count (measured)
-    if let Some(cs) = &def.charset {
-        dep(file, cs, None, 17)?;
-    }
+    // the dependency rows come from walking the stored BLR - the engine's
+    // own collection (MET_get_dependencies), proven row for row on the
+    // employee sample's restore
+    store_dependencies_deferred(file, page_size, 2, &def.name)?;
     // a database trigger belongs to no relation, so no relation's
     // runtime summary changes with it
     if let Some(t) = table.as_deref() {
@@ -7015,11 +7001,25 @@ fn update_relation_runtime(file: &mut crate::Image, page_size: usize, table: &st
 /// action - the system trigger(s) the engine synthesises on the referenced
 /// table (single column), refreshing that table's RDB$RUNTIME so they load.
 /// Shared by create_table and ALTER TABLE ADD CONSTRAINT.
+/// The constraint name and the index name of a FOREIGN KEY: a generated
+/// constraint is INTEG_<n> with its index RDB$FOREIGN<m> from the shared
+/// index counter; a named one names its index after itself.
+fn fk_names(file: &mut crate::Image, page_size: usize, fk: &ForeignKeyDef) -> Result<(String, String), String> {
+    if fk.name.is_empty() {
+        let cname = next_integ_name(file, page_size)?;
+        let iname = format!("RDB$FOREIGN{}", next_index_number(file, page_size)?);
+        Ok((cname, iname))
+    } else {
+        Ok((fk.name.clone(), fk.name.clone()))
+    }
+}
+
 fn write_foreign_key_full(
     file: &mut crate::Image,
     page_size: usize,
     table: &str,
     fk_name: &str,
+    index_name: &str,
     fk: &ForeignKeyDef,
     synth_triggers: bool,
 ) -> Result<(), String> {
@@ -7045,14 +7045,14 @@ fn write_foreign_key_full(
     // makes the database unrestorable. Refusing is the only answer.
     check_partner_compatible(file, page_size, table, fk, &partner_index)?;
     create_index(
-        file, page_size, table, fk_name, &fk.columns, false, false, false,
+        file, page_size, table, index_name, &fk.columns, false, false, false,
         Some(&partner_index),
     )?;
     sys_row_by_name(file, page_size, "RDB$RELATION_CONSTRAINTS", &[
         ("RDB$CONSTRAINT_NAME", SysVal::S(fk_name)),
         ("RDB$CONSTRAINT_TYPE", SysVal::S("FOREIGN KEY")),
         ("RDB$RELATION_NAME", SysVal::S(table)),
-        ("RDB$INDEX_NAME", SysVal::S(fk_name)),
+        ("RDB$INDEX_NAME", SysVal::S(index_name)),
         ("RDB$DEFERRABLE", SysVal::S("NO")),
         ("RDB$INITIALLY_DEFERRED", SysVal::S("NO")),
         ("RDB$SCHEMA_NAME", SysVal::S("PUBLIC")),
@@ -7116,12 +7116,8 @@ pub fn alter_table_add_foreign_key(
         return Err("system relations are read-only".into());
     }
     let name = table.trim().to_string();
-    let fk_name = if fk.name.is_empty() {
-        next_integ_name(file, page_size)?
-    } else {
-        fk.name.clone()
-    };
-    write_foreign_key_full(file, page_size, &name, &fk_name, fk, true)?;
+    let (fk_name, index_name) = fk_names(file, page_size, fk)?;
+    write_foreign_key_full(file, page_size, &name, &fk_name, &index_name, fk, true)?;
     advance_oldest_transactions(file, page_size)?;
     Ok(())
 }
@@ -7143,12 +7139,13 @@ pub fn alter_table_add_foreign_key_carried(
         return Err("system relations are read-only".into());
     }
     let name = table.trim().to_string();
+    // gbak carries the constraint's own name; its index rides under it
     let fk_name = if fk.name.is_empty() {
         next_integ_name(file, page_size)?
     } else {
         fk.name.clone()
     };
-    write_foreign_key_full(file, page_size, &name, &fk_name, fk, false)?;
+    write_foreign_key_full(file, page_size, &name, &fk_name, &fk_name, fk, false)?;
     advance_oldest_transactions(file, page_size)?;
     Ok(())
 }
@@ -10563,6 +10560,17 @@ pub fn store_dependencies_deferred(file: &mut crate::Image, page_size: usize, ki
             },
             None,
         ),
+        // a COMPUTED BY column's RDB$FIELDS row (dependent type 3): its
+        // expression, context 0 = the owning relation (measured: the
+        // employee sample's three computed columns record two field
+        // rows each)
+        3 => (
+            match sys_blob_of(file, page_size, "RDB$FIELDS", "RDB$FIELD_NAME", name, "RDB$COMPUTED_BLR") {
+                Some(b) => b,
+                None => return Ok(()),
+            },
+            sys_text_of(file, page_size, "RDB$RELATION_FIELDS", "RDB$FIELD_SOURCE", name, "RDB$RELATION_NAME"),
+        ),
         _ => return Ok(()),
     };
     let decoded = crate::blr::decode(&blr).map_err(|e| format!("dependencies of {name}: {e}"))?;
@@ -10581,6 +10589,11 @@ pub fn store_dependencies_deferred(file: &mut crate::Image, page_size: usize, ki
             crate::blr::DepEvent::RelCtx { ctx: c, name: r } => {
                 ctx.insert(*c, CtxBind::Relation(r.clone()));
                 deps.push((r.clone(), rel_type(file, r), None));
+            }
+            crate::blr::DepEvent::ModifyCtx { org, new } => {
+                if let Some(b) = ctx.get(org).cloned() {
+                    ctx.insert(*new, b);
+                }
             }
             crate::blr::DepEvent::RelId { ctx: c, id } => {
                 if let Some((_, r)) = rels.iter().find(|(i, _)| *i == *id) {
@@ -11785,6 +11798,9 @@ pub struct ProcParamDef {
     pub length: u16,
     pub scale: i16,
     pub sub_type: i16,
+    /// RDB$FIELD_PRECISION: the declared p of a NUMERIC/DECIMAL parameter,
+    /// 0 for the plain exact-integer family (probed)
+    pub precision: Option<i16>,
     /// a parameter DEFAULT: (value BLR verbatim, `= 7` source text)
     pub default: Option<(Vec<u8>, String)>,
 }
@@ -11944,7 +11960,7 @@ pub fn create_procedure_with_id(
             // computed column gets) - a NULL here is what crashed the
             // engine's executor reading an fc-authored procedure
             if matches!(p.field_type, 7 | 8 | 16 | 26) {
-                field_vals.push(("RDB$FIELD_PRECISION", SysVal::I(0)));
+                field_vals.push(("RDB$FIELD_PRECISION", SysVal::I(p.precision.unwrap_or(0) as i64)));
             }
             if matches!(p.field_type, 14 | 37) {
                 field_vals.push(("RDB$CHARACTER_SET_ID", SysVal::I(0)));

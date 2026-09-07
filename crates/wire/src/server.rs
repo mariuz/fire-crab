@@ -1434,6 +1434,9 @@ fn send_request_batch(
 /// server refuses a statement (isc_arg_gds + code + isc_arg_end); the
 /// client raises it as an SQL error instead of silently proceeding.
 fn respond_error(s: &mut TcpStream, enc: &mut Option<Rc4>, gds: i32) -> std::io::Result<()> {
+    if std::env::var("FC_SRV_TRACE").is_ok() {
+        eprintln!("[srv] respond_error gds={}", gds);
+    }
     let mut w = W::default();
     w.int(OP_RESPONSE)
         .int(0)
@@ -6450,6 +6453,7 @@ fn run_gbak_restore_core(
                     length: *len as u16,
                     scale: *sc as i16,
                     sub_type: *st as i16,
+                    precision: None,
                     default: pp.default.clone(),
                 })
             };
@@ -18723,6 +18727,7 @@ fn infer_int_rank(
         // the firing action is a plain number (1/2/3), the rank an
         // integer literal has - which is what lets `INSERTING` compare
         Expr::TriggerAction => Some(IntRank::Long),
+        Expr::UserName | Expr::CurrentRole => None, // text, outside the int surface
         // a generator is a BIGINT on the engine, whatever the column
         // it lands in
         Expr::GenId { .. } | Expr::GenId2 { .. } => Some(IntRank::Int64),
@@ -18760,12 +18765,19 @@ fn infer_int_rank(
 /// against the engine's.
 fn body_col_class(d: &Descriptor) -> Option<()> {
     use fire_crab_ods::format::dtype;
-    if (d.offset == 0 && d.length != 0) || d.scale != 0 {
-        return None;
+    if d.offset == 0 && d.length != 0 {
+        return None; // a computed column: no stored bytes to name
     }
+    // the BLR a body compiles to names a column by `blr_field` whatever
+    // its type, and the arithmetic verbs are type-free; a scaled NUMERIC,
+    // a DOUBLE and a TIMESTAMP (the employee sample's SAVE_SALARY_CHANGE
+    // writes OLD_SALARY, PERCENT_CHANGE and CHANGE_DATE) are stored the
+    // same way (probed against the engine's trigger BLR)
     match d.dtype {
-        dtype::SHORT | dtype::LONG | dtype::INT64 if d.sub_type == 0 => Some(()),
+        dtype::SHORT | dtype::LONG | dtype::INT64 | dtype::INT128 => Some(()),
         dtype::TEXT | dtype::VARYING => Some(()),
+        dtype::DOUBLE | dtype::REAL => Some(()),
+        dtype::TIMESTAMP | dtype::SQL_DATE | dtype::SQL_TIME | dtype::BOOLEAN => Some(()),
         _ => None,
     }
 }
@@ -18810,6 +18822,50 @@ fn check_operand_class(
 /// Both operands of every comparison in `cond` typecheck: Int with
 /// Int, Text with Text, Null with anything. IS [NOT] NULL takes any
 /// single classifiable operand.
+/// The table's own columns a CHECK source names, first-seen order - the
+/// dependency rows a check trigger records (identifiers outside literals,
+/// case-blind, qualified or not).
+fn check_source_fields<'a>(source: &str, cols: impl Iterator<Item = &'a str>) -> Vec<String> {
+    let cols: Vec<&str> = cols.collect();
+    let masked = mask_literals(&source.to_ascii_uppercase());
+    let mut out: Vec<String> = Vec::new();
+    for word in masked.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$')) {
+        if word.is_empty() {
+            continue;
+        }
+        if let Some(c) = cols.iter().find(|c| c.eq_ignore_ascii_case(word)) {
+            if !out.iter().any(|o| o == c) {
+                out.push(c.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// A comparison between a plain exact-integer column and a text literal
+/// that is not a number: the engine refuses it when the CHECK compiles.
+fn cond_int_vs_text(cond: &fire_crab_ods::expr::Cond, cols: &[fire_crab_ods::ddl::ColumnDef]) -> bool {
+    use fire_crab_ods::expr::{Cond, Expr};
+    use fire_crab_ods::format::dtype;
+    let int_col = |e: &Expr| match e {
+        Expr::Field { name, .. } => cols.iter().any(|c| {
+            c.name == *name
+                && c.domain.is_none()
+                && c.computed.is_none()
+                && c.scale == 0
+                && matches!(c.dtype, dtype::SHORT | dtype::LONG | dtype::INT64 | dtype::INT128)
+        }),
+        _ => false,
+    };
+    let bad_text = |e: &Expr| matches!(e, Expr::TextLiteral(t) if t.trim().parse::<f64>().is_err());
+    match cond {
+        Cond::Cmp(_, l, r) => (int_col(l) && bad_text(r)) || (int_col(r) && bad_text(l)),
+        Cond::And(a, b) | Cond::Or(a, b) => cond_int_vs_text(a, cols) || cond_int_vs_text(b, cols),
+        Cond::Not(a) => cond_int_vs_text(a, cols),
+        Cond::Missing(_) | Cond::NotMissing(_) => false,
+    }
+}
+
 fn check_cond_typechecks(
     cond: &fire_crab_ods::expr::Cond,
     field_rank: &dyn Fn(&str) -> Option<IntRank>,
@@ -18843,6 +18899,187 @@ fn check_cond_typechecks(
 /// INT128 38 - field type 26, 16 bytes).
 /// `field_rank` types the expression's field references - from the
 /// statement's own columns (CREATE TABLE) or the catalog (ALTER ADD).
+/// What a computed expression's operand IS, as far as its result type
+/// goes - the stored column's declared class.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ComputedKind {
+    /// a plain exact integer column
+    Exact,
+    Double,
+    /// a CHAR/VARCHAR column or literal: characters, bytes, charset
+    Text(u16, u16, u8),
+    Timestamp,
+    Date,
+    Time,
+    /// a domain-typed or computed column, whose type this planner does
+    /// not resolve here
+    Unknown,
+}
+
+fn computed_kind_of(c: &fire_crab_ods::ddl::ColumnDef, db: Option<&Database>) -> ComputedKind {
+    use fire_crab_ods::format::dtype;
+    if c.computed.is_some() {
+        return ComputedKind::Unknown;
+    }
+    // a DOMAIN-typed column (the sample's LASTNAME, FIRSTNAME, SALARY)
+    // takes its class from the domain's RDB$FIELDS row
+    if let Some(dom) = &c.domain {
+        let Some(db) = db else { return ComputedKind::Unknown };
+        let Some((ft, len, _scale, _sub)) =
+            fire_crab_ods::ddl::domain_type_info(&db.bytes(), db.page_size, dom)
+        else {
+            return ComputedKind::Unknown;
+        };
+        return match ft {
+            14 | 37 => {
+                // RDB$FIELD_LENGTH is the byte length without a VARCHAR's
+                // count prefix
+                let cs = fire_crab_ods::ddl::domain_charset_id(&db.bytes(), db.page_size, dom)
+                    .unwrap_or(0) as u8;
+                let bpc = fire_crab_ods::intl::bytes_per_char(cs).max(1) as u16;
+                ComputedKind::Text(len / bpc, len, cs)
+            }
+            27 | 10 => ComputedKind::Double,
+            35 => ComputedKind::Timestamp,
+            12 => ComputedKind::Date,
+            13 => ComputedKind::Time,
+            7 | 8 | 16 | 26 => ComputedKind::Exact,
+            _ => ComputedKind::Unknown,
+        };
+    }
+    match c.dtype {
+        dtype::TEXT | dtype::VARYING => {
+            // a column definition's `length` carries a VARCHAR's 2-byte
+            // count prefix; the result is sized in characters and the
+            // engine's byte length has no prefix (RDB$9 is 37 for
+            // VARCHAR(20) || ', ' || VARCHAR(15))
+            let cs = c.charset_id.unwrap_or(0);
+            let bpc = fire_crab_ods::intl::bytes_per_char(cs).max(1) as u16;
+            let bytes = if c.dtype == dtype::VARYING { c.length.saturating_sub(2) } else { c.length };
+            let chars = c.char_len.unwrap_or(bytes / bpc);
+            ComputedKind::Text(chars, chars * bpc, cs)
+        }
+        dtype::DOUBLE | dtype::REAL => ComputedKind::Double,
+        dtype::TIMESTAMP => ComputedKind::Timestamp,
+        dtype::SQL_DATE => ComputedKind::Date,
+        dtype::SQL_TIME => ComputedKind::Time,
+        dtype::SHORT | dtype::LONG | dtype::INT64 | dtype::INT128 => ComputedKind::Exact,
+        _ => ComputedKind::Unknown,
+    }
+}
+
+/// A computed column's result type in RDB$FIELDS terms.
+struct WideTy {
+    field_type: i16,
+    dtype: u8,
+    length: u16,
+    scale: i8,
+    sub_type: i16,
+    precision: Option<i16>,
+    char_len: Option<u16>,
+    charset_id: Option<u8>,
+}
+
+/// The kind of a computed expression's VALUE, walking the operands.
+fn computed_kind(
+    e: &fire_crab_ods::expr::Expr,
+    kind_of: &dyn Fn(&str) -> Option<ComputedKind>,
+) -> Option<ComputedKind> {
+    use fire_crab_ods::expr::Expr;
+    Some(match e {
+        Expr::Field { name, .. } => kind_of(name)?,
+        Expr::TextLiteral(t) => ComputedKind::Text(t.chars().count() as u16, t.len() as u16, 0),
+        Expr::IntLiteral(_) | Expr::Int64Literal(_) => ComputedKind::Exact,
+        Expr::Concat(l, r) => match (computed_kind(l, kind_of)?, computed_kind(r, kind_of)?) {
+            (ComputedKind::Text(lc, lb, lcs), ComputedKind::Text(rc, rb, rcs)) => {
+                // a literal is charset NONE and defers to a column's
+                let cs = if lcs != 0 { lcs } else { rcs };
+                ComputedKind::Text(lc.checked_add(rc)?, lb.checked_add(rb)?, cs)
+            }
+            _ => return None,
+        },
+        Expr::Add(l, r) | Expr::Subtract(l, r) | Expr::Multiply(l, r) | Expr::Divide(l, r) => {
+            let (lk, rk) = (computed_kind(l, kind_of)?, computed_kind(r, kind_of)?);
+            if matches!(lk, ComputedKind::Text(..)) || matches!(rk, ComputedKind::Text(..)) {
+                return None;
+            }
+            // a DOUBLE operand makes the whole result DOUBLE, whatever
+            // the other operand is (a domain-typed NUMERIC included)
+            if lk == ComputedKind::Double || rk == ComputedKind::Double {
+                ComputedKind::Double
+            } else if matches!(e, Expr::Subtract(..))
+                && lk == ComputedKind::Timestamp
+                && rk == ComputedKind::Timestamp
+            {
+                // the difference of two timestamps - typed by the caller
+                ComputedKind::Unknown
+            } else {
+                return None; // exact arithmetic is the int path's
+            }
+        }
+        _ => return None,
+    })
+}
+
+/// The result type of a computed expression OUTSIDE the exact-integer
+/// surface, by the engine's rules as measured on the employee sample:
+///   `last_name || ', ' || first_name` (VARCHAR(20), VARCHAR(15)) is
+///   VARCHAR(37) in the operands' charset (RDB$9: type 37, length 37,
+///   character_length 37, charset 0, no precision);
+///   `old_salary + old_salary * percent_change / 100` with a DOUBLE
+///   operand is DOUBLE PRECISION (RDB$17: type 27, length 8, no
+///   precision) whatever the other operands are;
+///   `ship_date - order_date` on TIMESTAMPs is NUMERIC(18, 9) (RDB$31:
+///   type 16, length 8, scale -9, sub_type 1, precision 18).
+fn infer_computed_wide(
+    e: &fire_crab_ods::expr::Expr,
+    kind_of: &dyn Fn(&str) -> Option<ComputedKind>,
+) -> Option<WideTy> {
+    use fire_crab_ods::expr::Expr;
+    use fire_crab_ods::format::dtype;
+    if let Expr::Subtract(l, r) = e {
+        if computed_kind(l, kind_of) == Some(ComputedKind::Timestamp)
+            && computed_kind(r, kind_of) == Some(ComputedKind::Timestamp)
+        {
+            return Some(WideTy {
+                field_type: 16,
+                dtype: dtype::INT64,
+                length: 8,
+                scale: -9,
+                sub_type: 1,
+                precision: Some(18),
+                char_len: None,
+                charset_id: None,
+            });
+        }
+    }
+    Some(match computed_kind(e, kind_of)? {
+        ComputedKind::Text(chars, bytes, cs) => WideTy {
+            field_type: 37,
+            dtype: dtype::VARYING,
+            // a column definition's VARYING length carries the 2-byte
+            // count prefix; the catalog writer takes it back off
+            length: bytes + 2,
+            scale: 0,
+            sub_type: 0,
+            precision: None,
+            char_len: Some(chars),
+            charset_id: Some(cs),
+        },
+        ComputedKind::Double => WideTy {
+            field_type: 27,
+            dtype: dtype::DOUBLE,
+            length: 8,
+            scale: 0,
+            sub_type: 0,
+            precision: None,
+            char_len: None,
+            charset_id: None,
+        },
+        _ => return None,
+    })
+}
+
 fn infer_computed_type(
     e: &fire_crab_ods::expr::Expr,
     field_rank: &dyn Fn(&str) -> Option<IntRank>,
@@ -19245,6 +19482,22 @@ fn parse_column_def(item: &str) -> Option<(fire_crab_ods::ddl::ColumnDef, Option
             computed: None,
         })
     };
+    // the LEGACY `BLOB(seg[, sub])` spelling the employee sample's build
+    // script uses (`BLOB(400,1)`, `BLOB(800,1)`) is the modern
+    // `BLOB SUB_TYPE sub SEGMENT SIZE seg` (probed: RDB$FIELDS sub_type
+    // 1, segment 400; isql -x writes the modern form back)
+    let ty = if let Some(rest) = ty.strip_prefix("BLOB(") {
+        let inner = rest.strip_suffix(')')?;
+        let mut nums = inner.split(',').map(|n| n.trim().parse::<u16>().ok());
+        let seg = nums.next().flatten()?;
+        let sub = nums.next().unwrap_or(Some(0))?;
+        if nums.next().is_some() || sub > 1 {
+            return None;
+        }
+        format!("BLOB SUB_TYPE {} SEGMENT SIZE {}", sub, seg)
+    } else {
+        ty
+    };
     let (base, args) = match ty.find('(') {
         Some(p) => {
             if !ty.ends_with(')') {
@@ -19312,6 +19565,10 @@ fn parse_column_def(item: &str) -> Option<(fire_crab_ods::ddl::ColumnDef, Option
         ("DECFLOAT", [p]) if *p == 34 => decfloat(25, dtype::DEC128, 16, 34),
         ("BOOLEAN", []) => col(23, dtype::BOOLEAN, 1, 0, 0, None),
         ("CHAR" | "CHARACTER", [n]) if *n >= 1 => text_col(14, dtype::TEXT, *n),
+        // a bare `CHAR` is CHAR(1) (probed: the sample's `on_hold CHAR`
+        // and `paid CHAR` are RDB$FIELDS length 1) - it must sit before
+        // the domain arm, which would otherwise take CHAR for a domain
+        ("CHAR" | "CHARACTER", []) => text_col(14, dtype::TEXT, 1),
         ("VARCHAR" | "CHARACTER VARYING" | "CHAR VARYING", [n]) if *n >= 1 => text_col(37, dtype::VARYING, *n),
         // NUMERIC/DECIMAL: storage by precision (dialect-3 rule);
         // sub_type 1 = NUMERIC, 2 = DECIMAL
@@ -19798,6 +20055,7 @@ fn expr_resolve_vars(
         | Expr::NullLiteral
         | Expr::DomainValue => e.clone(),
         | Expr::TriggerAction => e.clone(),
+        | Expr::UserName | Expr::CurrentRole => e.clone(),
         Expr::Concat(l, r) => Expr::Concat(
             Box::new(expr_resolve_vars(l, vars)),
             Box::new(expr_resolve_vars(r, vars)),
@@ -19971,6 +20229,7 @@ fn expr_plain_ctx(e: &fire_crab_ods::expr::Expr, ctx: u8) -> fire_crab_ods::expr
         | Expr::NullLiteral
         | Expr::DomainValue => e.clone(),
         | Expr::TriggerAction => e.clone(),
+        | Expr::UserName | Expr::CurrentRole => e.clone(),
         Expr::Concat(l, r) => Expr::Concat(
             Box::new(expr_plain_ctx(l, ctx)),
             Box::new(expr_plain_ctx(r, ctx)),
@@ -20046,6 +20305,7 @@ fn expr_resolve_marked(
         | Expr::NullLiteral
         | Expr::DomainValue => e.clone(),
         | Expr::TriggerAction => e.clone(),
+        | Expr::UserName | Expr::CurrentRole => e.clone(),
         Expr::Concat(l, r) => Expr::Concat(
             Box::new(expr_resolve_marked(l, vars, marked)),
             Box::new(expr_resolve_marked(r, vars, marked)),
@@ -20341,6 +20601,7 @@ fn expr_has_text(e: &fire_crab_ods::expr::Expr) -> bool {
         | Expr::NullLiteral
         | Expr::DomainValue => false,
         | Expr::TriggerAction => false,
+        | Expr::UserName | Expr::CurrentRole => false,
         // a CONCATENATION is text whatever its operands are
         Expr::Concat(..) => true,
         Expr::Add(l, r) | Expr::Subtract(l, r) | Expr::Multiply(l, r) | Expr::Divide(l, r) => {
@@ -20890,6 +21151,33 @@ fn sql_comment_unterminated(text: &str) -> bool {
 /// The entry transform: comments blanked - unless one is UNTERMINATED,
 /// in which case the original text passes through and the parsers
 /// refuse it, as the engine's -104 does.
+thread_local! {
+    /// The statement text AS THE CLIENT SENT IT, beside the comment-
+    /// blanked copy the planners read: a stored body keeps its comments
+    /// (the engine writes RDB$PROCEDURE_SOURCE / RDB$TRIGGER_SOURCE from
+    /// the raw text; measured on the employee sample's DELETE_EMPLOYEE)
+    static RAW_STMT: std::cell::RefCell<String> = std::cell::RefCell::new(String::new());
+}
+
+/// The raw spelling of `blanked_src`, a slice of the blanked statement
+/// `blanked_stmt` the planner holds: comment blanking keeps lengths, so
+/// the same offsets into the raw text are the source with its comments.
+/// Falls back to the blanked slice when the raw text is not this
+/// statement (a rewritten RECREATE, a synthesized body).
+fn raw_source(blanked_stmt: &str, blanked_src: &str) -> String {
+    RAW_STMT.with(|r| {
+        let raw = r.borrow();
+        if raw.len() == blanked_stmt.len() && entry_strip_comments(&raw) == blanked_stmt {
+            if let Some(off) = blanked_stmt.find(blanked_src) {
+                if let Some(slice) = raw.get(off..off + blanked_src.len()) {
+                    return slice.to_string();
+                }
+            }
+        }
+        blanked_src.to_string()
+    })
+}
+
 fn entry_strip_comments(text: &str) -> String {
     if sql_comment_unterminated(text) {
         return text.to_string();
@@ -22455,7 +22743,7 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
         return None;
     }
     // the verbatim source, from AS on - what the engine stores
-    let source = s[as_kw..].to_string();
+    let source = raw_source(s, &s[as_kw..]);
     let begin_kw = find_word(&masked, "BEGIN", as_kw + "AS".len())?;
     // between AS and BEGIN: `DECLARE VARIABLE <name> <int type>;`*
     // (name, blr dtype, DECLARE keyword offset) in slot order
@@ -22715,6 +23003,7 @@ fn plan_create_trigger(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<De
             | Expr::NullLiteral
             | Expr::DomainValue => {}
             | Expr::TriggerAction => {}
+            | Expr::UserName | Expr::CurrentRole => {}
             Expr::Concat(l, r)
             | Expr::Add(l, r)
             | Expr::Subtract(l, r)
@@ -23011,7 +23300,7 @@ fn exception_exists(db: &Database, name: &str) -> bool {
 /// constraints, options and every other CREATE verb refuse (the caller
 /// answers a real SQL error, never the fallback: a client must never
 /// think its DDL succeeded).
-fn plan_create_table(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
+fn plan_create_table(sql: &str, db: Option<&Database>) -> Option<(Plan, Vec<Descriptor>)> {
     let s = sql.trim().trim_end_matches(';').trim();
     let up = s.to_ascii_uppercase();
     let masked = mask_literals(&up);
@@ -23031,8 +23320,17 @@ fn plan_create_table(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
     // parens for type args); a trailing ON COMMIT clause follows it for a GTT
     let mut depth = 0i32;
     let mut close = None;
+    let mut quote: Option<char> = None;
     for (i, ch) in s[open..].char_indices() {
+        // a paren inside a literal or a quoted identifier is text
+        if let Some(q) = quote {
+            if ch == q {
+                quote = None;
+            }
+            continue;
+        }
         match ch {
+            '\'' | '"' => quote = Some(ch),
             '(' => depth += 1,
             ')' => {
                 depth -= 1;
@@ -23093,8 +23391,19 @@ fn plan_create_table(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
     let mut items: Vec<&str> = Vec::new();
     let mut depth = 0usize;
     let mut start = 0usize;
+    // a comma or a paren inside a LITERAL or a quoted identifier is text,
+    // not structure (the employee sample's `COMPUTED BY (last_name || ', '
+    // || first_name)` split at the literal's comma and refused the table)
+    let mut quote: Option<char> = None;
     for (i, ch) in body.char_indices() {
+        if let Some(q) = quote {
+            if ch == q {
+                quote = None;
+            }
+            continue;
+        }
         match ch {
+            '\'' | '"' => quote = Some(ch),
             '(' | '[' => depth += 1,
             ')' | ']' => depth = depth.checked_sub(1)?,
             ',' if depth == 0 => {
@@ -23369,7 +23678,7 @@ fn plan_create_table(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
                 computed: Some(fire_crab_ods::ddl::ComputedCol {
                     source: src,
                     blr: Vec::new(),
-                    precision: 0,
+                    precision: None,
                 }),
             });
             continue;
@@ -23454,15 +23763,35 @@ fn plan_create_table(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
         if !expr_all_plain(&expr) {
             return None; // NEW./OLD. do not exist in a computed column
         }
-        let (field_type, dt, length, precision) = infer_computed_type(&expr, &field_rank)?;
+        // the exact-integer inference first; beyond it, the wider rules
+        // the employee sample needs ([infer_computed_wide]: text
+        // concatenation, DOUBLE arithmetic, a timestamp difference)
+        let kind_of = |name: &str| cols.iter().find(|c| c.name == name).map(|c| computed_kind_of(c, db));
+        let wide = match infer_computed_type(&expr, &field_rank) {
+            Some((field_type, dt, length, precision)) => WideTy {
+                field_type,
+                dtype: dt,
+                length,
+                scale: 0,
+                sub_type: 0,
+                precision: Some(precision),
+                char_len: None,
+                charset_id: None,
+            },
+            None => infer_computed_wide(&expr, &kind_of)?,
+        };
         let c = &mut cols[*idx];
-        c.field_type = field_type;
-        c.dtype = dt;
-        c.length = length;
+        c.field_type = wide.field_type;
+        c.dtype = wide.dtype;
+        c.length = wide.length;
+        c.scale = wide.scale;
+        c.sub_type = wide.sub_type;
+        c.char_len = wide.char_len;
+        c.charset_id = wide.charset_id;
         c.computed = Some(fire_crab_ods::ddl::ComputedCol {
             source: src.clone(),
             blr: expr_with_context(&expr, 0).to_blr(),
-            precision,
+            precision: wide.precision,
         });
     }
     // compile each CHECK's search condition, every column now typed:
@@ -23470,55 +23799,102 @@ fn plan_create_table(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
     // rewrite field references to context 1 (NEW - the trigger's), and
     // build the if-failed-raise trigger BLR
     for (idx, source) in &check_items {
-        let cond = parse_cond(&source["CHECK".len()..])?;
-        // AN INLINE CHECK SEES ONLY THE COLUMNS DECLARED SO FAR. The
-        // engine answers `-206 Column unknown "B"` to `(A INTEGER CHECK
-        // (B > 0), B INTEGER)` while accepting the same condition
-        // written as a TABLE-level CHECK, which is resolved once the
-        // whole column list is read (both measured). So a column-level
-        // check's name resolution stops at its own column.
+        // AN INLINE CHECK SEES ONLY THE COLUMNS DECLARED SO FAR (the
+        // engine's -206 on a later column, measured) - the visible
+        // prefix bounds both compilers below
         let visible = match constraints[*idx].place {
             fire_crab_ods::ddl::ConstraintPlace::Inline { col, .. } => col + 1,
             fire_crab_ods::ddl::ConstraintPlace::Table { .. } => cols.len(),
         };
-        let field_rank = |name: &str| {
-            let c = cols.iter().take(visible).find(|c| c.name == name)?;
-            if c.domain.is_some() || c.computed.is_some() || c.scale != 0 || c.sub_type != 0 {
+        // the pinned int/NONE-text compiler first ...
+        let pinned = || -> Option<(Vec<u8>, Vec<String>)> {
+            let cond = parse_cond(&source["CHECK".len()..])?;
+            // AN INLINE CHECK SEES ONLY THE COLUMNS DECLARED SO FAR. The
+            // engine answers `-206 Column unknown "B"` to `(A INTEGER CHECK
+            // (B > 0), B INTEGER)` while accepting the same condition
+            // written as a TABLE-level CHECK, which is resolved once the
+            // whole column list is read (both measured). So a column-level
+            // check's name resolution stops at its own column.
+            let field_rank = |name: &str| {
+                let c = cols.iter().take(visible).find(|c| c.name == name)?;
+                if c.domain.is_some() || c.computed.is_some() || c.scale != 0 || c.sub_type != 0 {
+                    return None;
+                }
+                dtype_rank(c.dtype)
+            };
+            // a plain NONE-charset text column may meet a text literal now
+            // (the stored literal shape is gold-pinned); anything else
+            // outside the int surface still refuses
+            let field_is_text = |name: &str| {
+                cols.iter().take(visible).any(|c| {
+                    c.name == name
+                        && c.domain.is_none()
+                        && c.computed.is_none()
+                        && c.sub_type == 0
+                        && matches!(
+                            c.dtype,
+                            fire_crab_ods::format::dtype::TEXT | fire_crab_ods::format::dtype::VARYING
+                        )
+                })
+            };
+            if !check_cond_typechecks(&cond, &field_rank, &field_is_text) {
                 return None;
             }
-            dtype_rank(c.dtype)
-        };
-        // a plain NONE-charset text column may meet a text literal now
-        // (the stored literal shape is gold-pinned); anything else
-        // outside the int surface still refuses
-        let field_is_text = |name: &str| {
-            cols.iter().take(visible).any(|c| {
-                c.name == name
-                    && c.domain.is_none()
-                    && c.computed.is_none()
-                    && c.sub_type == 0
-                    && matches!(
-                        c.dtype,
-                        fire_crab_ods::format::dtype::TEXT | fire_crab_ods::format::dtype::VARYING
-                    )
-            })
-        };
-        if !check_cond_typechecks(&cond, &field_rank, &field_is_text) {
-            return None;
-        }
-        let mut fields: Vec<String> = Vec::new();
-        for e in cond.operands() {
-            if !expr_all_plain(e) {
-                return None; // NEW./OLD. do not exist in a CHECK
-            }
-            for f in e.field_refs() {
-                if !fields.iter().any(|n| n == &f) {
-                    fields.push(f);
+            let mut fields: Vec<String> = Vec::new();
+            for e in cond.operands() {
+                if !expr_all_plain(e) {
+                    return None; // NEW./OLD. do not exist in a CHECK
+                }
+                for f in e.field_refs() {
+                    if !fields.iter().any(|n| n == &f) {
+                        fields.push(f);
+                    }
                 }
             }
-        }
-        let blr =
-            fire_crab_ods::expr::check_trigger_blr(&cond_with_context(&cond, 1));
+            let blr =
+                fire_crab_ods::expr::check_trigger_blr(&cond_with_context(&cond, 1));
+            Some((blr, fields))
+        };
+        // ... and what it does not cover (scaled or domain-typed
+        // operands, BETWEEN, IN, IS NULL chains, dates, subselects - the
+        // employee sample's JOB, EMPLOYEE, SALARY_HISTORY, CUSTOMER and
+        // SALES checks) compiles through the DSQL check compiler with the
+        // table's name and column types, whose BLR is the engine's
+        let (blr, fields) = match pinned() {
+            Some(x) => x,
+            None => {
+                // two refusals the pinned path made stay: an INLINE check
+                // naming a LATER column (the engine's -206), and a plain
+                // integer column compared with a non-numeric text literal
+                // (the engine's conversion error at CREATE)
+                if !check_source_fields(source, cols.iter().skip(visible).map(|c| c.name.as_str())).is_empty() {
+                    return None;
+                }
+                if let Some(cond) = parse_cond(&source["CHECK".len()..]) {
+                    if cond_int_vs_text(&cond, &cols[..visible]) {
+                        return None;
+                    }
+                }
+                let specs: Vec<(String, fire_crab_dsql::TypeSpec)> = cols
+                    .iter()
+                    .take(visible)
+                    .filter(|c| c.domain.is_none() && c.computed.is_none())
+                    .map(|c| {
+                        (
+                            c.name.clone(),
+                            fire_crab_dsql::TypeSpec {
+                                blr_type: c.field_type as u8,
+                                length: c.length,
+                                scale: c.scale,
+                            },
+                        )
+                    })
+                    .collect();
+                let blr = fire_crab_dsql::compile_check_for(source, &name, &specs)?;
+                let fields = check_source_fields(source, cols.iter().take(visible).map(|c| c.name.as_str()));
+                (blr, fields)
+            }
+        };
         let fire_crab_ods::ddl::ConstraintKind::Check(ck) = &mut constraints[*idx].kind else {
             return None;
         };
@@ -24250,6 +24626,30 @@ fn proc_default_of(src: &str) -> Option<(Vec<u8>, String)> {
     Some((value_blr, src.to_string()))
 }
 
+/// The (table or procedure, its columns or outputs) pairs a body may
+/// name: every identifier of the statement that resolves as a user
+/// relation or a procedure in the catalog.
+fn dsql_catalog_for(db: &Option<Database>, sql: &str) -> Vec<(String, Vec<String>)> {
+    let Some(db) = db.as_ref() else { return Vec::new() };
+    let masked = mask_literals(&sql.to_ascii_uppercase());
+    let mut out: Vec<(String, Vec<String>)> = Vec::new();
+    for word in masked.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$')) {
+        if word.is_empty() || out.iter().any(|(n, _)| n == word) {
+            continue;
+        }
+        if fire_crab_ods::resolve_relation(&db.bytes(), db.page_size, word).is_some() {
+            let cols: Vec<String> = relation_columns(&db.bytes(), db.page_size, word)
+                .into_iter()
+                .map(|c| c.name)
+                .collect();
+            out.push((word.to_string(), cols));
+        } else if let Some(meta) = load_procedure(db, word) {
+            out.push((word.to_string(), meta.outs.iter().map(|p| p.name.clone()).collect()));
+        }
+    }
+    out
+}
+
 fn plan_create_procedure(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor>)> {
     let up = sql.trim_start().to_ascii_uppercase();
     if find_word(&up, "CREATE", 0) != Some(0)
@@ -24258,7 +24658,14 @@ fn plan_create_procedure(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<
         return None;
     }
     let plain_funcs = plain_function_arities(db);
-    let c = fire_crab_dsql::compile_procedure_full_with_funcs(sql, &plain_funcs)?;
+    // the compiler resolves a bare column across streams through the
+    // catalog of the tables and procedures the body names
+    fire_crab_dsql::set_catalog(dsql_catalog_for(db, sql));
+    let c = fire_crab_dsql::compile_procedure_full_with_funcs(sql, &plain_funcs);
+    fire_crab_dsql::set_catalog(Vec::new());
+    let mut c = c?;
+    // the stored source is the client's text, comments included
+    c.source = raw_source(sql, &c.source);
     if c.calls_user_fn && !exe_can_run(&c.blob) {
         return None; // stores BLR fc could not itself run - refuse instead
     }
@@ -24277,6 +24684,7 @@ fn plan_create_procedure(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<
         length: m.length,
         scale: m.scale,
         sub_type: m.sub_type,
+        precision: m.precision,
     };
     Some((
         Plan::CreateProcedure {
@@ -24476,11 +24884,16 @@ fn plan_create_package_body(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
     for seg in &segs {
         let su = seg.to_ascii_uppercase();
         if find_word(&su, "PROCEDURE", 0) == Some(0) {
+            // the compiler resolves a bare column across streams through the
+            // catalog of the tables and procedures the body names
+            fire_crab_dsql::set_catalog(Vec::new()); // a synthesized header names no table
             let c = fire_crab_dsql::compile_procedure_full_in_package(
                 &format!("CREATE {}", seg),
                 &name,
                 &member_names,
-            )?;
+            );
+            fire_crab_dsql::set_catalog(Vec::new());
+            let c = c?;
             members.push(fire_crab_ods::ddl::PackageBodyMember::Procedure {
                 name: c.name,
                 ins: c.ins.iter().map(proc_param_of).collect(),
@@ -24530,6 +24943,7 @@ fn proc_param_of(m: &fire_crab_dsql::ProcParamMeta) -> fire_crab_ods::ddl::ProcP
         default: param_default_marker(m.default.as_deref()),
         name: m.name.clone(), field_type: m.field_type,
         length: m.length, scale: m.scale, sub_type: m.sub_type,
+        precision: m.precision,
     }
 }
 fn fn_arg_of(m: &fire_crab_dsql::ProcParamMeta, position: i64, named: bool) -> fire_crab_ods::ddl::FnArgDef {
@@ -24601,6 +25015,7 @@ fn plan_create_package(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
         default: m.default.as_deref().and_then(proc_default_of),
         name: m.name.clone(), field_type: m.field_type,
         length: m.length, scale: m.scale, sub_type: m.sub_type,
+        precision: m.precision,
     };
     let fnarg = |m: &fire_crab_dsql::ProcParamMeta, position: i64, named: bool| fire_crab_ods::ddl::FnArgDef {
         name: if named { Some(m.name.to_ascii_uppercase()) } else { None },
@@ -25476,6 +25891,8 @@ fn expr_with_context(e: &fire_crab_ods::expr::Expr, context: u8) -> fire_crab_od
         Expr::NullLiteral => Expr::NullLiteral,
         Expr::DomainValue => Expr::DomainValue,
         Expr::TriggerAction => Expr::TriggerAction,
+        Expr::UserName => Expr::UserName,
+        Expr::CurrentRole => Expr::CurrentRole,
         Expr::Concat(l, r) => Expr::Concat(
             Box::new(expr_with_context(l, context)),
             Box::new(expr_with_context(r, context)),
@@ -25534,6 +25951,7 @@ fn expr_all_plain(e: &fire_crab_ods::expr::Expr) -> bool {
         Expr::Variable(_) => false, // only a trigger body has variables
         Expr::DomainValue => false, // checked before the VALUE rewrite - never here
         Expr::TriggerAction => false, // checked before the VALUE rewrite - never here
+        Expr::UserName | Expr::CurrentRole => false,
         Expr::IntLiteral(_) => true,
         Expr::Int64Literal(_) => true,
         Expr::TextLiteral(_) => true,
@@ -25735,11 +26153,19 @@ fn blr_expr_factor(t: &[ETok], p: &mut usize) -> Option<fire_crab_ods::expr::Exp
                 };
                 return Some(Expr::Field { context, name: col });
             }
+            // the context variables are leaves, not columns
+            match name.as_str() {
+                "USER" | "CURRENT_USER" => return Some(Expr::UserName),
+                "CURRENT_ROLE" => return Some(Expr::CurrentRole),
+                _ => {}
+            }
             Some(Expr::Field { context: CTX_PLAIN, name })
         }
         ETok::LParen => {
             *p += 1;
-            let e = blr_expr_add(t, p)?;
+            // the full expression grammar re-enters here, concatenation
+            // included: a COMPUTED BY source arrives as `(a || b)`
+            let e = blr_expr_concat(t, p)?;
             if !matches!(t.get(*p)?, ETok::RParen) {
                 return None;
             }
@@ -25957,7 +26383,9 @@ fn expr_value_to_fid(e: &fire_crab_ods::expr::Expr) -> Option<fire_crab_ods::exp
         Expr::Field { .. }
         | Expr::Variable(_)
         | Expr::DomainValue
-        | Expr::TriggerAction => return None,
+        | Expr::TriggerAction
+        | Expr::UserName
+        | Expr::CurrentRole => return None,
         Expr::IntLiteral(_) | Expr::Int64Literal(_) | Expr::TextLiteral(_) | Expr::NullLiteral => {
             e.clone()
         }
@@ -26073,7 +26501,22 @@ fn plan_create_domain(sql: &str) -> Option<(Plan, Vec<Descriptor>)> {
             if !col.dims.is_empty() {
                 return None; // an ARRAY domain's check is outside this surface
             }
-            let blr = compile_domain_check(&src["CHECK".len()..], col.dtype, col.scale, col.sub_type)?;
+            // the pinned int/NONE-text compiler first; what it does not
+            // cover (BETWEEN, IN, STARTING WITH, UPPER, a scaled VALUE,
+            // OR-chains - the employee sample's six domains) compiles
+            // through the DSQL validation compiler, whose BLR is the
+            // engine's byte for byte ([compile_validation])
+            let blr = match compile_domain_check(&src["CHECK".len()..], col.dtype, col.scale, col.sub_type) {
+                Some(b) => b,
+                None => fire_crab_dsql::compile_validation_typed(
+                    src,
+                    fire_crab_dsql::TypeSpec {
+                        blr_type: col.field_type as u8,
+                        length: col.length,
+                        scale: col.scale,
+                    },
+                )?,
+            };
             Some((blr, src.clone()))
         }
     };
@@ -26733,7 +27176,7 @@ fn plan_alter_table_add(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<D
             computed: Some(fire_crab_ods::ddl::ComputedCol {
                 source: src,
                 blr: expr_with_context(&expr, 0).to_blr(),
-                precision,
+                precision: Some(precision),
             }),
         };
         return Some((
@@ -33160,6 +33603,9 @@ fn execute_dml_collecting_inner(
         }
         Plan::CreateView { name, blr, source, fields, contexts } => {
             fire_crab_ods::ddl::create_view(&mut work, db.page_size, name, blr, source, fields, contexts)?;
+            // the dependency rows the engine's MET_get_dependencies records
+            // for a view, from the stored BLR (measured: PHONE_LIST has 10)
+            fire_crab_ods::ddl::store_dependencies_deferred(&mut work, db.page_size, 1, name)?;
             (0, 0, 0)
         }
         Plan::CreateMapping(m) | Plan::AlterMapping(m) => {
@@ -33223,6 +33669,9 @@ fn execute_dml_collecting_inner(
                 &mut work, db.page_size, name, ins, outs, *selectable, source, blr,
                 None,
             )?;
+            // the dependency rows from the stored BLR: tables and their
+            // fields, called procedures (5), raised exceptions (7)
+            fire_crab_ods::ddl::store_dependencies_deferred(&mut work, db.page_size, 5, name)?;
             (0, 0, 0)
         }
         Plan::AlterException { name, message } => {
@@ -33339,6 +33788,7 @@ fn execute_dml_collecting_inner(
                         sub
                     };
                     let blr = compile_domain_check(&src["CHECK".len()..], dt, scale, eff_sub)
+                        .or_else(|| fire_crab_dsql::compile_validation(src))
                         .ok_or("this ALTER DOMAIN check is outside this server's surface")?;
                     Some((blr, src.clone()))
                 }
@@ -55602,6 +56052,9 @@ fn eval_identity(e: &EvalErr) -> (Vec<i32>, Option<i32>, &'static str) {
 /// prepare refuses with the engine's SPECIFIC error rather than the
 /// generic Dynamic SQL Error.
 fn respond_eval_error(s: &mut TcpStream, enc: &mut Option<Rc4>, e: &EvalErr) -> std::io::Result<()> {
+    if std::env::var("FC_SRV_TRACE").is_ok() {
+        eprintln!("[srv] respond_eval_error {:?}", e);
+    }
     let mut w = W::default();
     w.int(OP_RESPONSE)
         .int(0)
@@ -76860,6 +77313,10 @@ fn eval_psql_expr(e: &fire_crab_ods::expr::Expr, f: &PsqlFrame) -> Result<Value,
         // INSERTING / UPDATING / DELETING: the ACTION firing this
         // trigger, as the number the comparison beside it expects.
         // Outside a trigger there is none, and the reference refuses
+        // the context variables: the attachment's user, and its role
+        // (this server attaches every session under NONE)
+        E::UserName => Ok(Value::Text(CURRENT_USER_NAME.with(|u| u.borrow().clone()))),
+        E::CurrentRole => Ok(Value::Text("NONE".to_string())),
         E::TriggerAction => match f.trig.as_ref() {
             Some(t) => Ok(Value::Int(t.action as i64)),
             None => Err(PsqlStop::Unsupported),
@@ -77104,7 +77561,7 @@ fn plan_recreate(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descript
         return None;
     }
     let create_sql = format!("CREATE {}", s["RECREATE".len()..].trim_start());
-    let (create, descs) = plan_create_table(&create_sql)
+    let (create, descs) = plan_create_table(&create_sql, db.as_ref())
         .or_else(|| plan_create_view(&create_sql, db))
         .or_else(|| plan_create_procedure(&create_sql, db))
         .or_else(|| plan_create_exception(&create_sql))
@@ -77144,7 +77601,7 @@ fn plan_immediate(text: &str, database: &Option<Database>) -> Option<(Plan, Vec<
                     .or_else(|| plan_grant(text))
                     .or_else(|| plan_grant_role(text))
                     .or_else(|| plan_recreate(text, database))
-                    .or_else(|| plan_create_table(text))
+                    .or_else(|| plan_create_table(text, database.as_ref()))
                     .or_else(|| plan_create_trigger(text, database))
                     .or_else(|| plan_alter_trigger(text, database))
                     .or_else(|| plan_drop_trigger(text))
@@ -78853,6 +79310,8 @@ fn render_psql_expr(e: &fire_crab_ods::expr::Expr, f: &PsqlFrame) -> Option<Stri
         E::Field { .. } => return None,
         E::DomainValue => return None, // never appears in a PSQL body
         E::TriggerAction => return None, // never appears in a PSQL body
+        E::UserName => "USER".to_string(),
+        E::CurrentRole => "CURRENT_ROLE".to_string(),
         E::Concat(a, b) => {
             format!("({} || {})", render_psql_expr(a, f)?, render_psql_expr(b, f)?)
         }
@@ -82026,7 +82485,12 @@ fn parse_execute_block_select(sql: &str) -> Option<Plan> {
     // recover the output metadata (and validate the body) through the
     // procedure compiler, then interpret the body as a nameless block
     let synth = format!("CREATE PROCEDURE FC$BLOCK {} AS {}", returns_text, body);
-    let c = fire_crab_dsql::compile_procedure_full(&synth)?;
+    // the compiler resolves a bare column across streams through the
+    // catalog of the tables and procedures the body names
+    fire_crab_dsql::set_catalog(Vec::new()); // an anonymous block: no database in scope here
+    let c = fire_crab_dsql::compile_procedure_full(&synth);
+    fire_crab_dsql::set_catalog(Vec::new());
+    let c = c?;
     if !c.ins.is_empty() || c.outs.is_empty() {
         return None; // no input params here; a RETURNS with columns
     }
@@ -85691,7 +86155,9 @@ fn after_auth(
                 CURRENT_ATT_CS.with(|c| c.set(att_cs.id));
                 CURRENT_USER_NAME.with(|u| *u.borrow_mut() = user.to_string());
                 CURRENT_SQL.with(|c| *c.borrow_mut() = stmt_text_decode(&sql, att_cs.id));
-                let text = entry_strip_comments(&stmt_text_decode(&sql, att_cs.id));
+                let raw_text = stmt_text_decode(&sql, att_cs.id);
+                RAW_STMT.with(|r| *r.borrow_mut() = raw_text.clone());
+                let text = entry_strip_comments(&raw_text);
                 // THE SAME TWO GUARDS THE PREPARE PATH APPLIES. These
                 // are properties of the STATEMENT TEXT, so every entry
                 // point that accepts text owes them: a deep expression
@@ -85803,6 +86269,9 @@ fn after_auth(
                                 respond_error(&mut s, &mut enc, code)?
                             }
                             Err(ExecErr::Text(t)) => {
+                                if std::env::var("FC_SRV_TRACE").is_ok() {
+                                    eprintln!("[srv] ddl failed: {}", t);
+                                }
                                 if !respond_ddl_meta(&mut s, &mut enc, &p, &t)? {
                                     respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?
                                 }
@@ -85814,6 +86283,12 @@ fn after_auth(
                     }
                     Some(_) => respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?,
                     None if ddl_kw || dml_kw => {
+                        // isql runs DDL through execute-immediate: a
+                        // refusal here is what a script's failed
+                        // statement looks like - say which
+                        if std::env::var("FC_SRV_TRACE").is_ok() {
+                            eprintln!("[srv] immediate refused: {:?}", text);
+                        }
                         respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?
                     }
                     None => {
@@ -85861,7 +86336,9 @@ fn after_auth(
                     read_int(&mut s, &mut dec)?; // p_sqlst_flags
                 }
                 CURRENT_ATT_CS.with(|c| c.set(att_cs.id));
-                let text = entry_strip_comments(&stmt_text_decode(&sql, att_cs.id));
+                let raw_text = stmt_text_decode(&sql, att_cs.id);
+                RAW_STMT.with(|r| *r.borrow_mut() = raw_text.clone());
+                let text = entry_strip_comments(&raw_text);
                 // THE SAME TWO GUARDS THE PREPARE PATH APPLIES. These
                 // are properties of the STATEMENT TEXT, so every entry
                 // point that accepts text owes them: a deep expression
@@ -85995,7 +86472,14 @@ fn after_auth(
                     read_int(&mut s, &mut dec)?; // p_sqlst_flags (FB6/proto 20+)
                 }
                 CURRENT_ATT_CS.with(|c| c.set(att_cs.id));
-                stmt_sql = entry_strip_comments(&stmt_text_decode(&sql, att_cs.id));
+                {
+                        let raw_sql = stmt_text_decode(&sql, att_cs.id);
+                        if std::env::var("FC_SRV_TRACE").is_ok() && raw_sql.contains("/*") {
+                            eprintln!("[srv] prepare raw = {:?}", raw_sql);
+                        }
+                        RAW_STMT.with(|r| *r.borrow_mut() = raw_sql.clone());
+                        stmt_sql = entry_strip_comments(&raw_sql);
+                    }
                 // ...and the text a DDL trigger reads as SQL_TEXT
                 CURRENT_USER_NAME.with(|u| *u.borrow_mut() = user.to_string());
                 CURRENT_SQL.with(|c| *c.borrow_mut() = stmt_text_decode(&sql, att_cs.id));
@@ -86070,7 +86554,7 @@ fn after_auth(
                         .or_else(|| plan_grant(&stmt_sql))
                         .or_else(|| plan_grant_role(&stmt_sql))
                         .or_else(|| plan_recreate(&stmt_sql, &database))
-                        .or_else(|| plan_create_table(&stmt_sql))
+                        .or_else(|| plan_create_table(&stmt_sql, database.as_ref()))
                         .or_else(|| plan_create_trigger(&stmt_sql, &database))
                         .or_else(|| plan_alter_trigger(&stmt_sql, &database))
                         .or_else(|| plan_drop_trigger(&stmt_sql))
@@ -86134,6 +86618,9 @@ fn after_auth(
                         None => {
                             plan = std::rc::Rc::new(Plan::Scalar(ScalarVal::Fixed(Some(FIXED_ANSWER)), "CONSTANT".to_string(), None, ScalarTy::int64()));
                             stmt_params = std::rc::Rc::new(Vec::new());
+                            if std::env::var("FC_SRV_TRACE").is_ok() {
+                                eprintln!("[srv] ddl prepare refused: {:?}", stmt_sql);
+                            }
                             respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
                         }
                     }
@@ -86271,7 +86758,15 @@ fn after_auth(
                             stmt_params = std::rc::Rc::new(Vec::new());
                             match PREPARE_REFUSAL.with(|r| r.borrow_mut().take()) {
                                 Some(e) => respond_eval_error(&mut s, &mut enc, &e)?,
-                                None => respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?,
+                                None => {
+                                    // a DDL statement this server cannot
+                                    // plan: say which, so a script's
+                                    // refusals can be read off the log
+                                    if std::env::var("FC_SRV_TRACE").is_ok() {
+                                        eprintln!("[srv] prepare refused: {:?}", stmt_sql);
+                                    }
+                                    respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?
+                                }
                             }
                         }
                     }
@@ -101670,7 +102165,7 @@ mod tests {
         let Some((Plan::CreateTable { name, cols, constraints, fks, .. }, _)) = plan_create_table(
             "create table \"tq\" (id integer not null, \"a\" integer, \"Mixed Col\" varchar(5), \
              \"select\" integer constraint \"pk_s\" primary key, constraint uq_x unique (\"a\"), \
-             constraint fk_x foreign key (\"a\") references \"Order\" (\"Key\"))",
+             constraint fk_x foreign key (\"a\") references \"Order\" (\"Key\"))", None,
         ) else {
             panic!("table refused");
         };
@@ -102839,7 +103334,7 @@ mod tests {
         // declaration order, so the plan must preserve it
         let plan = plan_create_table(
             "CREATE TABLE M (A INTEGER NOT NULL, B INTEGER, UNIQUE(B), \
-             C INTEGER NOT NULL, PRIMARY KEY(A))",
+             C INTEGER NOT NULL, PRIMARY KEY(A))", None,
         )
         .unwrap()
         .0;
@@ -102866,19 +103361,19 @@ mod tests {
         // a table-level PRIMARY KEY alone sets NULL_FLAG without a
         // NOT NULL constraint row
         // GLOBAL TEMPORARY TABLE carries a relation type (5 delete, 4 preserve)
-        match plan_create_table("CREATE GLOBAL TEMPORARY TABLE G (A INTEGER) ON COMMIT PRESERVE ROWS").unwrap().0 {
+        match plan_create_table("CREATE GLOBAL TEMPORARY TABLE G (A INTEGER) ON COMMIT PRESERVE ROWS", None).unwrap().0 {
             Plan::CreateTable { relation_type, .. } => assert_eq!(relation_type, 4),
             _ => panic!("expected CreateTable"),
         }
-        match plan_create_table("CREATE GLOBAL TEMPORARY TABLE G (A INTEGER)").unwrap().0 {
+        match plan_create_table("CREATE GLOBAL TEMPORARY TABLE G (A INTEGER)", None).unwrap().0 {
             Plan::CreateTable { relation_type, .. } => assert_eq!(relation_type, 5),
             _ => panic!("expected CreateTable"),
         }
-        match plan_create_table("CREATE TABLE R (A INTEGER)").unwrap().0 {
+        match plan_create_table("CREATE TABLE R (A INTEGER)", None).unwrap().0 {
             Plan::CreateTable { relation_type, .. } => assert_eq!(relation_type, 0),
             _ => panic!("expected CreateTable"),
         }
-        let plan = plan_create_table("CREATE TABLE P (A INTEGER, B INTEGER, PRIMARY KEY (A, B))")
+        let plan = plan_create_table("CREATE TABLE P (A INTEGER, B INTEGER, PRIMARY KEY (A, B))", None)
             .unwrap()
             .0;
         match &plan {
@@ -102889,9 +103384,7 @@ mod tests {
             _ => panic!("not a CREATE TABLE plan"),
         }
         // two PRIMARY KEYs are refused
-        assert!(plan_create_table(
-            "CREATE TABLE T (A INTEGER PRIMARY KEY, B INTEGER, PRIMARY KEY (B))"
-        )
+        assert!(plan_create_table("CREATE TABLE T (A INTEGER PRIMARY KEY, B INTEGER, PRIMARY KEY (B))", None)
         .is_none());
     }
 
@@ -103079,9 +103572,9 @@ mod tests {
             }
             other => panic!("expected CreateDomain, got {:?}", other.is_some()),
         }
-        // an unsupported check refuses the WHOLE statement - never a
-        // domain silently created without its rule
-        assert!(plan_create_domain("CREATE DOMAIN DP AS NUMERIC(9,2) CHECK (VALUE > 0)").is_none());
+        // a scaled VALUE compiles through the DSQL validation compiler
+        // (the employee sample's SALARY and BUDGET domains)
+        assert!(plan_create_domain("CREATE DOMAIN DP AS NUMERIC(9,2) CHECK (VALUE > 0)").is_some());
         // ALTER DOMAIN: both constraint forms parse; the check text
         // rides to execute verbatim
         match plan_alter_domain("ALTER DOMAIN D ADD CONSTRAINT CHECK (VALUE > 3)") {
@@ -103117,7 +103610,7 @@ mod tests {
     #[test]
     fn an_inline_references_is_a_column_level_foreign_key() {
         use fire_crab_ods::ddl::{ConstraintPlace, RefAction};
-        let plan = |sql: &str| match plan_create_table(sql) {
+        let plan = |sql: &str| match plan_create_table(sql, None) {
             Some((Plan::CreateTable { cols, constraints, fks, .. }, _)) => (cols, constraints, fks),
             _ => panic!("expected CreateTable for {}", sql),
         };
@@ -103216,7 +103709,7 @@ mod tests {
             "CREATE TABLE ZC5 (A INTEGER CHECK (A > 0 CONSTRAINT C) REFERENCES P)",
             "CREATE TABLE ZC3 (A INTEGER REFERENCES CONSTRAINT N CHECK (A > 0))",
         ] {
-            assert!(plan_create_table(sql).is_none(), "must refuse, not panic: {}", sql);
+            assert!(plan_create_table(sql, None).is_none(), "must refuse, not panic: {}", sql);
         }
         // and the well-formed neighbours still parse: a CONSTRAINT
         // prefix on each of two clauses, in either order
@@ -103225,7 +103718,7 @@ mod tests {
             "CREATE TABLE ZO2 (A INTEGER CONSTRAINT FK1 REFERENCES P CONSTRAINT CK1 CHECK (A > 0))",
             "CREATE TABLE ZO3 (A INTEGER CONSTRAINT CK1 CHECK (A > 0) CONSTRAINT CK2 CHECK (A < 9))",
         ] {
-            assert!(plan_create_table(sql).is_some(), "must parse: {}", sql);
+            assert!(plan_create_table(sql, None).is_some(), "must parse: {}", sql);
         }
     }
 
@@ -103237,7 +103730,7 @@ mod tests {
     #[test]
     fn a_column_may_carry_two_inline_references() {
         use fire_crab_ods::ddl::ConstraintPlace;
-        let plan = |sql: &str| match plan_create_table(sql) {
+        let plan = |sql: &str| match plan_create_table(sql, None) {
             Some((Plan::CreateTable { cols, constraints, fks, .. }, _)) => (cols, constraints, fks),
             _ => panic!("expected CreateTable for {}", sql),
         };
@@ -103266,7 +103759,7 @@ mod tests {
     #[test]
     fn no_action_parses_as_itself_and_an_event_is_named_once() {
         use fire_crab_ods::ddl::RefAction;
-        let fks = |sql: &str| match plan_create_table(sql) {
+        let fks = |sql: &str| match plan_create_table(sql, None) {
             Some((Plan::CreateTable { fks, .. }, _)) => fks,
             _ => panic!("expected CreateTable for {}", sql),
         };
@@ -103282,7 +103775,7 @@ mod tests {
             "CREATE TABLE NA5 (A INTEGER REFERENCES P ON UPDATE CASCADE ON UPDATE SET NULL)",
             "CREATE TABLE NA6 (A INTEGER, FOREIGN KEY (A) REFERENCES P ON DELETE CASCADE ON DELETE SET NULL)",
         ] {
-            assert!(plan_create_table(sql).is_none(), "must refuse: {}", sql);
+            assert!(plan_create_table(sql, None).is_none(), "must refuse: {}", sql);
         }
     }
 
@@ -103303,7 +103796,7 @@ mod tests {
             "CREATE TABLE VD4 (A INTEGER REFERENCES P DEFAULT 7, B INTEGER)",
             "CREATE TABLE VD5 (A INTEGER PRIMARY KEY DEFAULT 7, B INTEGER)",
         ] {
-            assert!(plan_create_table(sql).is_none(), "must refuse: {}", sql);
+            assert!(plan_create_table(sql, None).is_none(), "must refuse: {}", sql);
         }
         // written FIRST it is fine, and a `SET DEFAULT` referential
         // action is not a column DEFAULT at all
@@ -103314,7 +103807,7 @@ mod tests {
             "CREATE TABLE VD9 (A INTEGER REFERENCES P ON DELETE SET DEFAULT, B INTEGER)",
             "CREATE TABLE VDA (A INTEGER DEFAULT 7 REFERENCES P ON DELETE SET DEFAULT, B INTEGER)",
         ] {
-            assert!(plan_create_table(sql).is_some(), "must parse: {}", sql);
+            assert!(plan_create_table(sql, None).is_some(), "must parse: {}", sql);
         }
     }
 
@@ -103325,10 +103818,10 @@ mod tests {
     /// list has been read (both measured).
     #[test]
     fn an_inline_check_may_not_name_a_later_column() {
-        assert!(plan_create_table("CREATE TABLE Y9 (A INTEGER CHECK (B > 0), B INTEGER)").is_none());
-        assert!(plan_create_table("CREATE TABLE Y9B (A INTEGER, B INTEGER CHECK (A > 0))").is_some());
-        assert!(plan_create_table("CREATE TABLE Y9C (A INTEGER, CHECK (B > 0), B INTEGER)").is_some());
-        assert!(plan_create_table("CREATE TABLE Y9D (A INTEGER CHECK (A > 0), B INTEGER)").is_some());
+        assert!(plan_create_table("CREATE TABLE Y9 (A INTEGER CHECK (B > 0), B INTEGER)", None).is_none());
+        assert!(plan_create_table("CREATE TABLE Y9B (A INTEGER, B INTEGER CHECK (A > 0))", None).is_some());
+        assert!(plan_create_table("CREATE TABLE Y9C (A INTEGER, CHECK (B > 0), B INTEGER)", None).is_some());
+        assert!(plan_create_table("CREATE TABLE Y9D (A INTEGER CHECK (A > 0), B INTEGER)", None).is_some());
     }
 
     /// Engine-probed golden facts (inc 111): a CHECK constraint compiles
@@ -103338,7 +103831,7 @@ mod tests {
     #[test]
     fn check_constraints_compile_to_engine_trigger_blr() {
         use fire_crab_ods::ddl::ConstraintKind;
-        let plan = |sql: &str| match plan_create_table(sql) {
+        let plan = |sql: &str| match plan_create_table(sql, None) {
             Some((Plan::CreateTable { constraints, .. }, _)) => constraints,
             _ => panic!("expected CreateTable for {}", sql),
         };
@@ -103398,12 +103891,12 @@ mod tests {
         // text/NULL/bigint - the stored literal gold-pinned as
         // blr_text2); still out of surface: a comparison across
         // incompatible classes, refused whole
-        assert!(plan_create_table("CREATE TABLE T (A VARCHAR(5), CHECK (A > 'x'))").is_some());
-        assert!(plan_create_table("CREATE TABLE T (A INTEGER, CHECK (A > 'x'))").is_none());
+        assert!(plan_create_table("CREATE TABLE T (A VARCHAR(5), CHECK (A > 'x'))", None).is_some());
+        assert!(plan_create_table("CREATE TABLE T (A INTEGER, CHECK (A > 'x'))", None).is_none());
         // CHECK (A IS NOT NULL) stores its negation as blr_missing -
         // engine bytes probed; the IS NULL surface arrived with the
         // trigger-surface slice
-        let cols = match plan_create_table("CREATE TABLE T (A INTEGER, CHECK (A IS NOT NULL))") {
+        let cols = match plan_create_table("CREATE TABLE T (A INTEGER, CHECK (A IS NOT NULL))", None) {
             Some((Plan::CreateTable { constraints, .. }, _)) => constraints,
             _ => panic!("expected CreateTable"),
         };
@@ -103421,7 +103914,7 @@ mod tests {
                 .unwrap())
                 .collect::<Vec<u8>>()
         );
-        assert!(plan_create_table("CREATE TABLE T (A INTEGER, CHECK (A > 0) NOT NULL)").is_none());
+        assert!(plan_create_table("CREATE TABLE T (A INTEGER, CHECK (A > 0) NOT NULL)", None).is_none());
     }
 
     /// Engine-probed golden facts (inc 108): COMPUTED BY columns' result
@@ -103429,7 +103922,7 @@ mod tests {
     /// RDB$FIELDS/RDB$COMPUTED_BLR.
     #[test]
     fn computed_columns_infer_engine_types_and_compile_blr() {
-        let cols_of = |sql: &str| match plan_create_table(sql) {
+        let cols_of = |sql: &str| match plan_create_table(sql, None) {
             Some((Plan::CreateTable { cols, .. }, _)) => cols,
             _ => panic!("expected CreateTable for {}", sql),
         };
@@ -103438,7 +103931,7 @@ mod tests {
         let c = &cols[2];
         assert_eq!((c.field_type, c.dtype, c.length), (16, dtype::INT64, 8));
         let cp = c.computed.as_ref().unwrap();
-        assert_eq!(cp.precision, 18);
+        assert_eq!(cp.precision, Some(18));
         assert_eq!(cp.source, "(A+B)"); // verbatim, parens kept
         assert_eq!(cp.blr, vec![5, 34, 23, 0, 1, 65, 23, 0, 1, 66, 76]);
         // a bare field reference keeps its column's type, with the real
@@ -103447,13 +103940,13 @@ mod tests {
         let d = &cols[1];
         assert_eq!((d.field_type, d.dtype, d.length), (7, dtype::SHORT, 2));
         let dp = d.computed.as_ref().unwrap();
-        assert_eq!(dp.precision, 4);
+        assert_eq!(dp.precision, Some(4));
         assert_eq!(dp.blr, vec![5, 23, 0, 1, 83, 76]);
         // a bare literal is INTEGER (precision 9); * of LONGs is INT64
         let cols = cols_of("CREATE TABLE TG (A INTEGER, W COMPUTED BY (5), E COMPUTED BY (A*2))");
-        assert_eq!(cols[1].computed.as_ref().unwrap().precision, 9);
+        assert_eq!(cols[1].computed.as_ref().unwrap().precision, Some(9));
         assert_eq!((cols[1].field_type, cols[1].length), (8, 4));
-        assert_eq!(cols[2].computed.as_ref().unwrap().precision, 18);
+        assert_eq!(cols[2].computed.as_ref().unwrap().precision, Some(18));
         // GENERATED ALWAYS AS is the same catalog (probed); COMPUTED
         // may also skip BY. A computed column may reference a column
         // declared AFTER it (two-phase inference)
@@ -103472,15 +103965,17 @@ mod tests {
             let cols = cols_of(sql);
             let x = cols.last().unwrap();
             assert_eq!((x.field_type, x.dtype, x.length), (26, dtype::INT128, 16), "{}", sql);
-            assert_eq!(x.computed.as_ref().unwrap().precision, 38, "{}", sql);
+            assert_eq!(x.computed.as_ref().unwrap().precision, Some(38), "{}", sql);
         }
         let cols = cols_of("CREATE TABLE TH (B BIGINT, X COMPUTED BY (B-1))");
-        assert_eq!(cols[1].computed.as_ref().unwrap().precision, 18);
-        // non-integer operands, keys on computed columns, and trailing
-        // constraints all refuse
-        assert!(plan_create_table("CREATE TABLE TT (T VARCHAR(5), X COMPUTED BY (T))").is_none());
-        assert!(plan_create_table("CREATE TABLE TT (A INTEGER, X COMPUTED BY (A), PRIMARY KEY (X))").is_none());
-        assert!(plan_create_table("CREATE TABLE TT (A INTEGER, X COMPUTED BY (A) NOT NULL)").is_none());
+        assert_eq!(cols[1].computed.as_ref().unwrap().precision, Some(18));
+        // a text computed column types as the operand (VARCHAR(5) with
+        // its count prefix in the definition's length); keys on computed
+        // columns and trailing constraints refuse
+        let tt = cols_of("CREATE TABLE TT (T VARCHAR(5), X COMPUTED BY (T))");
+        assert_eq!((tt[1].field_type, tt[1].length, tt[1].char_len), (37, 7, Some(5)));
+        assert!(plan_create_table("CREATE TABLE TT (A INTEGER, X COMPUTED BY (A), PRIMARY KEY (X))", None).is_none());
+        assert!(plan_create_table("CREATE TABLE TT (A INTEGER, X COMPUTED BY (A) NOT NULL)", None).is_none());
         // GENERATED ALWAYS AS IDENTITY still parses as an identity column
         let cols = cols_of("CREATE TABLE TI (A INTEGER GENERATED ALWAYS AS IDENTITY)");
         assert!(cols[0].identity.is_some() && cols[0].computed.is_none());
@@ -106817,5 +107312,32 @@ mod tests {
             BStmt::For(rse, _) => assert!(rse.first.is_none()),
             _ => panic!("expected a blr_for"),
         }
+    }
+}
+
+#[cfg(test)]
+mod computed_wide_types {
+    use super::*;
+    /// The employee sample's three computed columns type as the engine's
+    /// RDB$FIELDS rows say (measured): a concatenation of VARCHAR(20),
+    /// ', ' and VARCHAR(15) is VARCHAR(37) without a precision; DOUBLE
+    /// arithmetic is DOUBLE; a timestamp difference is NUMERIC(18, 9).
+    #[test]
+    fn computed_columns_type_like_the_engine() {
+        let (plan, _) = plan_create_table(
+            "CREATE TABLE c (ln VARCHAR(20), fn VARCHAR(15), pc DOUBLE PRECISION, os INTEGER, sd TIMESTAMP, od TIMESTAMP, \
+             full_name COMPUTED BY (ln || ', ' || fn), ns COMPUTED BY (os + os * pc / 100), aged COMPUTED BY (sd - od))",
+            None,
+        )
+        .expect("plans");
+        let Plan::CreateTable { cols, .. } = plan else { panic!("not a table") };
+        let fname = &cols[6];
+        assert_eq!((fname.field_type, fname.length, fname.char_len, fname.charset_id), (37, 39, Some(37), Some(0)));
+        assert_eq!(fname.computed.as_ref().unwrap().precision, None);
+        let ns = &cols[7];
+        assert_eq!((ns.field_type, ns.length, ns.computed.as_ref().unwrap().precision), (27, 8, None));
+        let aged = &cols[8];
+        assert_eq!((aged.field_type, aged.length, aged.scale, aged.sub_type), (16, 8, -9, 1));
+        assert_eq!(aged.computed.as_ref().unwrap().precision, Some(18));
     }
 }

@@ -125,6 +125,11 @@ mod blr {
     /// a relation WITH AN ALIAS: counted name, counted alias (the
     /// alias travels UPPERCASED IN DOUBLE QUOTES - probed), context
     pub const RELATION2: u8 = 0x92;
+    /// an ARRAY element: blr_index <array value> <u8 count> <subscripts>
+    pub const INDEX: u8 = 0x6B;
+    /// a SELECTABLE PROCEDURE as a stream: blr_procedure <counted name>
+    /// <ctx> <u16 input count> <inputs>
+    pub const PROCEDURE: u8 = 0x7C;
     /// join-type sub-clause inside blr_join: absent for INNER,
     /// 1=LEFT, 2=RIGHT, 3=FULL (probed)
     pub const JOIN_TYPE: u8 = 0x50;
@@ -444,6 +449,8 @@ enum Val {
     Decode(Box<Val>, Vec<Val>, Vec<Val>),
     /// a scalar subselect: blr_via(blr_singular(rse), value, null)
     ScalarSub(Box<SubQ>),
+    /// `col[i, j]` - an array element of a field (blr_index)
+    ArrayElem(Box<Val>, Vec<Val>),
     /// blr_fid - a stream's own column by number; how HAVING, ORDER
     /// BY and the DO body address an aggregate's output
     Fid(u8, u16),
@@ -655,6 +662,9 @@ impl CmpOp {
     }
 }
 
+/// The join "type" of a comma-listed stream: no ON, one flat rse.
+const JOIN_COMMA: u8 = 0xFE;
+
 #[derive(Clone, Debug, PartialEq)]
 enum Bool {
     And(Box<Bool>, Box<Bool>),
@@ -827,6 +837,9 @@ enum Tok {
     Dot,
     Colon,
     Semi,
+    /// `[` / `]` - an ARRAY element's subscript list
+    LBracket,
+    RBracket,
 }
 
 fn lex(sql: &str) -> Option<Vec<Tok>> {
@@ -992,6 +1005,14 @@ fn lex(sql: &str) -> Option<Vec<Tok>> {
                     b[start..i].iter().collect::<String>().to_ascii_uppercase(),
                 ));
             }
+            '[' => {
+                out.push(Tok::LBracket);
+                i += 1;
+            }
+            ']' => {
+                out.push(Tok::RBracket);
+                i += 1;
+            }
             _ => return None, // outside this slice's lexicon
         }
     }
@@ -1005,6 +1026,10 @@ fn lex(sql: &str) -> Option<Vec<Tok>> {
 struct Stream {
     name: String,
     alias: Option<String>,
+    /// a SELECTABLE PROCEDURE called with arguments as the source
+    /// (`FROM show_langs(:code, :grade, :country)`): emitted as
+    /// blr_procedure with the inputs, no relation
+    proc_args: Option<Vec<Val>>,
     /// a derived table `(SELECT cols FROM name [WHERE ...]) alias`:
     /// emitted as an rse-within-a-stream-slot whose relation2 alias
     /// text is `"ALIAS" "PUBLIC"."NAME"` - the schema-qualified
@@ -1206,7 +1231,20 @@ impl<'a> P<'a> {
         // streams are visible, and bare names refuse (catalog-free -
         // the engine resolves them through column lists)
         if let Some((start, end)) = self.merge_scope {
-            let q = qualifier?;
+            let Some(q) = qualifier else {
+                // a BARE name over several streams: the catalog says which
+                // one owns the column - exactly one (the employee sample's
+                // SHIP_ORDER reads `po_number` across `sales s, customer c`)
+                let hits: Vec<usize> = (start..end)
+                    .filter(|&i| {
+                        self.streams[i].derived.is_none() && catalog_has(&self.streams[i].name, name)
+                    })
+                    .collect();
+                if hits.len() != 1 {
+                    return None;
+                }
+                return Some(Val::Field(hits[0] as u8 + self.base, name.to_string()));
+            };
             let hit = |st: &Stream| {
                 st.alias.as_deref().map_or(st.name == q, |a| a == q)
             };
@@ -1237,7 +1275,19 @@ impl<'a> P<'a> {
                 Some(si) => si as u8 + self.base,
                 None => {
                     if n_outer != 1 {
-                        return None;
+                        // several streams: the catalog says which one
+                        // owns the column - exactly one, or the name
+                        // is ambiguous / unknown and refuses
+                        let hits: Vec<usize> = (0..n_outer)
+                            .filter(|&i| {
+                                self.streams[i].derived.is_none()
+                                    && catalog_has(&self.streams[i].name, name)
+                            })
+                            .collect();
+                        if hits.len() != 1 {
+                            return None;
+                        }
+                        return Some(Val::Field(hits[0] as u8 + self.base, name.to_string()));
                     }
                     self.base
                 }
@@ -1293,6 +1343,25 @@ impl<'a> P<'a> {
         }
         let name = name.clone();
         self.i += 1;
+        // `name(args)`: a selectable procedure as the source
+        let proc_args = if matches!(self.t.get(self.i), Some(Tok::LParen)) {
+            self.i += 1;
+            let mut args = Vec::new();
+            if !matches!(self.t.get(self.i), Some(Tok::RParen)) {
+                loop {
+                    args.push(self.val()?);
+                    match self.t.get(self.i)? {
+                        Tok::Comma => self.i += 1,
+                        Tok::RParen => break,
+                        _ => return None,
+                    }
+                }
+            }
+            self.i += 1; // )
+            Some(args)
+        } else {
+            None
+        };
         let alias = match self.t.get(self.i) {
             Some(Tok::Ident(a)) if !is_keyword(a) => {
                 let a = a.clone();
@@ -1301,7 +1370,7 @@ impl<'a> P<'a> {
             }
             _ => None,
         };
-        Some(Stream { name, alias, derived: None, sub: self.in_sub, cur: None })
+        Some(Stream { name, alias, derived: None, sub: self.in_sub, cur: None, proc_args })
     }
 
     /// A derived table: pass-through column list, ONE underlying
@@ -1391,6 +1460,7 @@ impl<'a> P<'a> {
             derived: None,
             sub: self.in_sub,
             cur: None,
+            proc_args: None,
         });
         let si = self.streams.len() - 1;
         let saved = self.sub.replace(si);
@@ -1407,6 +1477,7 @@ impl<'a> P<'a> {
             derived: Some(Box::new(Derived { wher, cols })),
             sub: self.in_sub,
             cur: None,
+            proc_args: None,
         })
     }
 
@@ -1735,6 +1806,7 @@ impl<'a> P<'a> {
                 derived: None,
                 sub: self.in_sub,
                 cur: None,
+                proc_args: None,
             });
             (self.streams.len() - 1) as u8 + self.base
         } else {
@@ -1806,6 +1878,7 @@ impl<'a> P<'a> {
             derived: None,
             sub: self.in_sub,
             cur: None,
+            proc_args: None,
         });
         let ctx = (self.streams.len() - 1) as u8 + self.base;
         let mut branches: Vec<(Stream, u8, Option<Box<Bool>>, Val)> = Vec::new();
@@ -1924,6 +1997,7 @@ impl<'a> P<'a> {
                 derived: None,
                 sub: self.in_sub,
                 cur: None,
+                proc_args: None,
             },
             ctx,
             wher: None,
@@ -1936,6 +2010,26 @@ impl<'a> P<'a> {
 
     /// expression grammar mirroring the engine's precedence:
     /// `+`/`-` over `*`/`/` over unary `-` over `||` over atoms
+    /// `field[i, j]`: an ARRAY element of the field just parsed, when a
+    /// subscript list follows (the employee sample's SHOW_LANGS reads
+    /// `language_req[:i]`); the field itself otherwise.
+    fn array_suffix(&mut self, base: Val) -> Option<Val> {
+        if !matches!(self.t.get(self.i), Some(Tok::LBracket)) {
+            return Some(base);
+        }
+        self.i += 1;
+        let mut subs = vec![self.val()?];
+        while matches!(self.t.get(self.i), Some(Tok::Comma)) {
+            self.i += 1;
+            subs.push(self.val()?);
+        }
+        if !matches!(self.t.get(self.i), Some(Tok::RBracket)) {
+            return None;
+        }
+        self.i += 1;
+        Some(Val::ArrayElem(Box::new(base), subs))
+    }
+
     fn val(&mut self) -> Option<Val> {
         let mut left = self.val_mul()?;
         loop {
@@ -2102,9 +2196,11 @@ impl<'a> P<'a> {
                         }
                         return Some(Val::PkgFn(first, f, args));
                     }
-                    return self.field(Some(&first), &f);
+                    let v = self.field(Some(&first), &f)?;
+                    return self.array_suffix(v);
                 }
-                return self.field(None, &first);
+                let v = self.field(None, &first)?;
+                return self.array_suffix(v);
             }
             Tok::Int(n) => match i32::try_from(*n) {
                 Ok(v) => Val::Int(v),
@@ -2697,8 +2793,22 @@ impl<'a> P<'a> {
             // declared type, in views and CHECKs alike). Integer
             // literals and input parameters are the probed UNCAST
             // cases; anything else needs the catalog and refuses.
+            // a TEXT member is stored cast to the tested operand's
+            // declared type (measured on the engine's RDB$VALIDATION_BLR
+            // and CHECK trigger BLR); without that type the shape is
+            // unknown and refuses
+            let items: Vec<Val> = match typing_of(&left) {
+                Some(d @ (Dsc::Text(_) | Dsc::Varying(_))) => items
+                    .into_iter()
+                    .map(|it| match it {
+                        Val::Str(_) => Val::Cast(d, Box::new(it)),
+                        other => other,
+                    })
+                    .collect(),
+                _ => items,
+            };
             if items.iter().any(|it| {
-                !matches!(it, Val::Int(_) | Val::Int64(_) | Val::InParam(_))
+                !matches!(it, Val::Int(_) | Val::Int64(_) | Val::InParam(_) | Val::Cast(..))
             }) {
                 return None;
             }
@@ -2839,6 +2949,16 @@ fn emit_val(out: &mut Vec<u8>, v: &Val) {
             out.push(*ctx);
             out.push(name.len() as u8);
             out.extend_from_slice(name.as_bytes());
+        }
+        // measured (SHOW_LANGS): blr_index, the field, a one-byte count,
+        // then the subscripts
+        Val::ArrayElem(field, subs) => {
+            out.push(blr::INDEX);
+            emit_val(out, field);
+            out.push(subs.len() as u8);
+            for sv in subs {
+                emit_val(out, sv);
+            }
         }
         Val::Add(a, b) => {
             out.push(blr::ADD);
@@ -3224,7 +3344,58 @@ fn emit_bool(out: &mut Vec<u8>, b: &Bool) {
 
 /// One relation stream: plain (blr_relation) or aliased
 /// (blr_relation2, the alias UPPERCASED IN DOUBLE QUOTES - probed).
+/// How many streams the rse header counts: a comma list is flat (all of
+/// its streams), a JOIN chain is one nested stream.
+fn rse_stream_count(joins: &[(u8, Stream, u8, Bool)]) -> u8 {
+    if !joins.is_empty() && joins.iter().all(|j| j.0 == JOIN_COMMA) {
+        1 + joins.len() as u8
+    } else {
+        1
+    }
+}
+
+/// The FROM streams: a flat comma list, or the left-nested JOIN chain
+/// (n join heads, the first stream, then per join its stream, the type
+/// (absent for INNER) and the ON).
+fn emit_join_chain(out: &mut Vec<u8>, first: &Stream, ctx: u8, joins: &[(u8, Stream, u8, Bool)]) {
+    if !joins.is_empty() && joins.iter().all(|j| j.0 == JOIN_COMMA) {
+        emit_stream(out, first, ctx);
+        for (_, st, jctx, _) in joins {
+            emit_stream(out, st, *jctx);
+        }
+        return;
+    }
+    for _ in joins {
+        out.push(blr::JOIN);
+        out.push(2);
+    }
+    emit_stream(out, first, ctx);
+    for (jt, st, jctx, on) in joins {
+        emit_stream(out, st, *jctx);
+        if *jt != 0 {
+            out.push(blr::JOIN_TYPE);
+            out.push(*jt);
+        }
+        out.push(blr::BOOLEAN);
+        emit_bool(out, on);
+        out.push(blr::END);
+    }
+}
+
 fn emit_stream(out: &mut Vec<u8>, st: &Stream, ctx: u8) {
+    // a selectable procedure source (measured, ALL_LANGS): blr_procedure,
+    // the counted name, the context, a u16 input count, the inputs
+    if let Some(args) = &st.proc_args {
+        out.push(blr::PROCEDURE);
+        out.push(st.name.len() as u8);
+        out.extend_from_slice(st.name.as_bytes());
+        out.push(ctx);
+        out.extend_from_slice(&(args.len() as u16).to_le_bytes());
+        for a in args {
+            emit_val(out, a);
+        }
+        return;
+    }
     if let Some(d) = &st.derived {
         // a derived table is an rse in the stream slot; its relation2
         // alias text carries the alias AND the schema-qualified
@@ -3688,6 +3859,7 @@ fn compile_union(p: &mut P) -> Option<Vec<u8>> {
         derived: None,
         sub: p.in_sub,
         cur: None,
+        proc_args: None,
     });
     // no outer scope: qualified names resolve only through the
     // current branch's stream, bare names bind to it
@@ -4111,6 +4283,12 @@ pub fn compile_procedure(sql: &str) -> Option<Vec<u8>> {
 struct BodyOut {
     blob: Vec<u8>,
     ins: Vec<(String, Dsc)>,
+    /// parallel to `ins` / `outs`: a NUMERIC(p, s) / DECIMAL(p, s)
+    /// declaration's (sub_type 1|2, precision p) - the catalog keeps
+    /// the declared spelling (measured: SUB_TOT_BUDGET's outputs are
+    /// sub_type 2, precision 12), which the descriptor alone loses
+    in_decls: Vec<Option<(i16, i16)>>,
+    out_decls: Vec<Option<(i16, i16)>>,
     /// parallel to `ins`: an input parameter's DEFAULT value SOURCE
     /// (`5`, `'x'`, `NULL`), or None. Procedures only, literals only -
     /// the wire turns the source into RDB$DEFAULT_SOURCE / VALUE.
@@ -4129,11 +4307,32 @@ struct BodyOut {
 /// skip the end-of-input check, may end with a spare `;`, and emit
 /// blr_stall only when they HAVE outputs - a void sub-procedure
 /// goes without where a top-level one keeps it (probed).
+/// The NUMERIC(p, s) / DECIMAL(p, s) spelling at the parser's position,
+/// as (RDB$FIELD_SUB_TYPE 1|2, RDB$FIELD_PRECISION p); None for any
+/// other type.
+fn numeric_decl(p: &P) -> Option<(i16, i16)> {
+    let Some(Tok::Ident(w)) = p.t.get(p.i) else { return None };
+    let sub = match w.as_str() {
+        "NUMERIC" => 1,
+        "DECIMAL" => 2,
+        _ => return None,
+    };
+    if !matches!(p.t.get(p.i + 1), Some(Tok::LParen)) {
+        return None;
+    }
+    match p.t.get(p.i + 2) {
+        Some(Tok::Int(prec)) => Some((sub, *prec as i16)),
+        _ => None,
+    }
+}
+
 fn body_compile(p: &mut P, func: bool, sub: bool) -> Option<BodyOut> {
     // optional INPUT parameters: message 0, one dsc + null-flag short
     // per parameter, NO EOF slot
     let mut inputs: Vec<(String, Dsc)> = Vec::new();
     let mut in_defaults: Vec<Option<String>> = Vec::new();
+    let mut in_decls: Vec<Option<(i16, i16)>> = Vec::new();
+    let mut out_decls: Vec<Option<(i16, i16)>> = Vec::new();
     if matches!(p.t.get(p.i), Some(Tok::LParen)) {
         p.i += 1;
         // `()` - an EMPTY list, the same as none (a function may say it)
@@ -4149,6 +4348,7 @@ fn body_compile(p: &mut P, func: bool, sub: bool) -> Option<BodyOut> {
             }
             let name = name.clone();
             p.i += 1;
+            in_decls.push(numeric_decl(p));
             let dsc = p.cast_target()?;
             // optional DEFAULT / = <literal>. Procedures only (a function
             // parameter default is refused for now); a literal only
@@ -4216,6 +4416,7 @@ fn body_compile(p: &mut P, func: bool, sub: bool) -> Option<BodyOut> {
             }
             let name = name.clone();
             p.i += 1;
+            out_decls.push(numeric_decl(p));
             let dsc = p.cast_target()?;
             params.push((name, dsc));
             match p.t.get(p.i)? {
@@ -4433,6 +4634,8 @@ fn body_compile(p: &mut P, func: bool, sub: bool) -> Option<BodyOut> {
         blob: out,
         ins: inputs,
         in_defaults,
+        in_decls,
+        out_decls,
         outs: params,
         selectable: p.saw_suspend,
         deterministic,
@@ -5545,7 +5748,8 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
                 }
             }
             out.push(blr::RSE);
-            out.push(1);
+            // a flat comma list counts every stream; a JOIN chain is one
+            out.push(if f.aggregate { 1 } else { rse_stream_count(&f.joins) });
             if let Some(rc) = &f.recurse {
                 // the recursion tower: a wrapper rse whose stream is
                 // blr_recurse - context, the SECONDARY recursive
@@ -5609,24 +5813,10 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
                 out.push(blr::AGGREGATE);
                 out.push(f.ctx + 1 + f.joins.len() as u8);
                 out.push(blr::RSE);
-                out.push(1);
+                out.push(rse_stream_count(&f.joins));
                 // the inner rse holds the JOIN chain when one exists,
                 // its WHERE inside either way (probed)
-                for _ in &f.joins {
-                    out.push(blr::JOIN);
-                    out.push(2);
-                }
-                emit_stream(out, &f.stream, f.ctx);
-                for (jt, st, jctx, on) in &f.joins {
-                    emit_stream(out, st, *jctx);
-                    if *jt != 0 {
-                        out.push(blr::JOIN_TYPE);
-                        out.push(*jt);
-                    }
-                    out.push(blr::BOOLEAN);
-                    emit_bool(out, on);
-                    out.push(blr::END);
-                }
+                emit_join_chain(out, &f.stream, f.ctx, &f.joins);
                 if let Some(b) = &f.boolean {
                     out.push(blr::BOOLEAN);
                     emit_bool(out, b);
@@ -5810,22 +6000,9 @@ fn emit_trig_stmt(out: &mut Vec<u8>, st: &TrigStmt) {
             } else if !f.joins.is_empty() {
                 // the view's left-nested chain at body numbering:
                 // n join heads, the first stream, then per join its
-                // stream, the type (absent for INNER), the ON
-                for _ in &f.joins {
-                    out.push(blr::JOIN);
-                    out.push(2);
-                }
-                emit_stream(out, &f.stream, f.ctx);
-                for (jt, st, jctx, on) in &f.joins {
-                    emit_stream(out, st, *jctx);
-                    if *jt != 0 {
-                        out.push(blr::JOIN_TYPE);
-                        out.push(*jt);
-                    }
-                    out.push(blr::BOOLEAN);
-                    emit_bool(out, on);
-                    out.push(blr::END);
-                }
+                // stream, the type (absent for INNER), the ON - or the
+                // flat comma list
+                emit_join_chain(out, &f.stream, f.ctx, &f.joins);
                 if let Some(b) = &f.boolean {
                     out.push(blr::BOOLEAN);
                     emit_bool(out, b);
@@ -6036,6 +6213,7 @@ impl<'a> P<'a> {
                 derived: None,
                 sub: self.in_sub,
                 cur: None,
+                proc_args: None,
             });
             Some((self.streams.len() - 1) as u8 + self.base)
         } else {
@@ -6091,6 +6269,24 @@ impl<'a> P<'a> {
             let on = self.bool_or()?;
             self.merge_scope = saved_scope;
             joins.push((jt, st2, ctx2, on));
+        }
+        // a COMMA-SEPARATED stream list (`FROM sales s, customer c`, the
+        // employee sample's SHIP_ORDER): the engine compiles it to ONE
+        // flat rse with all the streams and the WHERE as its boolean
+        // (measured), which [JOIN_COMMA] marks for the emitter; mixing it
+        // with an explicit JOIN chain is unprobed and refuses
+        while matches!(self.t.get(self.i), Some(Tok::Comma)) {
+            if joins.iter().any(|j| j.0 != JOIN_COMMA) {
+                return None;
+            }
+            self.i += 1;
+            let st2 = self.stream_item()?;
+            if st2.derived.is_some() {
+                return None;
+            }
+            self.streams.push(st2.clone());
+            let ctx2 = (self.streams.len() - 1) as u8 + self.base;
+            joins.push((JOIN_COMMA, st2, ctx2, Bool::Missing(Val::Null)));
         }
         let after_from = self.i;
         self.i = list_start;
@@ -6478,6 +6674,7 @@ impl<'a> P<'a> {
                 derived: None,
                 sub: self.in_sub,
                 cur: None,
+                proc_args: None,
             });
             // the map takes each select item's contribution in
             // SELECT-LIST order: a column or expression contributes
@@ -6656,6 +6853,7 @@ impl<'a> P<'a> {
                     derived: None,
                     sub: self.in_sub,
                     cur: None,
+                    proc_args: None,
                 });
             }
             for w in &mut windows {
@@ -7220,6 +7418,8 @@ impl<'a> P<'a> {
         // MIN/MAX([qual.]col), each with an optional traceless
         // AS alias
         enum RawItem {
+    /// `col[subs]` - an array element of a column
+    ColIdx(Option<String>, String, Vec<Val>),
             Col(Option<String>, String),
             Agg(u8, Option<(Option<String>, String)>),
         }
@@ -7286,7 +7486,22 @@ impl<'a> P<'a> {
                 items.push(RawItem::Agg(verb, arg));
             } else {
                 let (q, n) = qual_name(self)?;
-                items.push(RawItem::Col(q, n));
+                if matches!(self.t.get(self.i), Some(Tok::LBracket)) {
+                    // an ARRAY element item: `language_req[:i]`
+                    self.i += 1;
+                    let mut subs = vec![self.val()?];
+                    while matches!(self.t.get(self.i), Some(Tok::Comma)) {
+                        self.i += 1;
+                        subs.push(self.val()?);
+                    }
+                    if !matches!(self.t.get(self.i), Some(Tok::RBracket)) {
+                        return None;
+                    }
+                    self.i += 1;
+                    items.push(RawItem::ColIdx(q, n, subs));
+                } else {
+                    items.push(RawItem::Col(q, n));
+                }
             }
             // an AS alias names the derived column - traceless,
             // but REQUIRED on an aggregate (the engine demands a
@@ -7332,6 +7547,7 @@ impl<'a> P<'a> {
             derived: None,
             sub: self.in_sub,
             cur: None,
+            proc_args: None,
         });
         let sidx = self.streams.len() - 1;
         let ctx = sidx as u8 + self.base;
@@ -7389,6 +7605,7 @@ impl<'a> P<'a> {
                 derived: None,
                 sub: self.in_sub,
                 cur: Some(name.clone()),
+                proc_args: None,
             };
             self.streams.push(st2.clone());
             let ctx2 = (self.streams.len() - 1) as u8 + self.base;
@@ -7400,6 +7617,26 @@ impl<'a> P<'a> {
             let on = self.bool_or()?;
             self.merge_scope = saved_scope;
             joins.push((jt, st2, ctx2, on));
+        }
+        // a COMMA-SEPARATED stream list (`FROM sales s, customer c`, the
+        // employee sample's SHIP_ORDER): the engine compiles it to ONE
+        // flat rse with all the streams and the WHERE as its boolean
+        // (measured), which [JOIN_COMMA] marks for the emitter; mixing it
+        // with an explicit JOIN chain is unprobed and refuses
+        while matches!(self.t.get(self.i), Some(Tok::Comma)) {
+            if joins.iter().any(|j| j.0 != JOIN_COMMA) {
+                return None;
+            }
+            self.i += 1;
+            let st2 = self.stream_item()?;
+            if st2.derived.is_some() {
+                return None;
+            }
+            let mut st2 = st2;
+            st2.cur = Some(name.clone());
+            self.streams.push(st2.clone());
+            let ctx2 = (self.streams.len() - 1) as u8 + self.base;
+            joins.push((JOIN_COMMA, st2, ctx2, Bool::Missing(Val::Null)));
         }
         let aggregate = items
             .iter()
@@ -7418,6 +7655,7 @@ impl<'a> P<'a> {
                 derived: None,
                 sub: self.in_sub,
                 cur: None,
+                proc_args: None,
             });
             Some((self.streams.len() - 1) as u8 + self.base)
         } else {
@@ -7440,9 +7678,22 @@ impl<'a> P<'a> {
                     None
                 }
                 None => {
-                    // bare names need the catalog across a join
+                    // bare names across a join: the catalog says which
+                    // stream owns the column (exactly one)
                     if !joins.is_empty() {
-                        return None;
+                        let mut hits: Vec<u8> = Vec::new();
+                        if catalog_has(&tbl, n) {
+                            hits.push(ctx);
+                        }
+                        for (_, st, jctx, _) in &joins {
+                            if catalog_has(&st.name, n) {
+                                hits.push(*jctx);
+                            }
+                        }
+                        if hits.len() != 1 {
+                            return None;
+                        }
+                        return Some(Val::Field(hits[0], n.to_string()));
                     }
                     Some(Val::Field(ctx, n.to_string()))
                 }
@@ -7467,15 +7718,19 @@ impl<'a> P<'a> {
                             None => None,
                         },
                     )),
+                    RawItem::ColIdx(..) => return None, // an array element as a group key: unprobed
                 }
                 outs.push(Val::Fid(agg_ctx, (outs.len()) as u16));
             }
         } else {
             for it in &items {
-                let RawItem::Col(q, n) = it else {
-                    return None;
-                };
-                outs.push(resolve(q, n)?);
+                match it {
+                    RawItem::Col(q, n) => outs.push(resolve(q, n)?),
+                    RawItem::ColIdx(q, n, subs) => {
+                        outs.push(Val::ArrayElem(Box::new(resolve(q, n)?), subs.clone()))
+                    }
+                    RawItem::Agg(..) => return None,
+                }
             }
         }
         let saved = self.sub.replace(sidx);
@@ -7613,6 +7868,7 @@ impl<'a> P<'a> {
             derived: None,
             sub: self.in_sub,
             cur: None,
+            proc_args: None,
         });
         let new_ctx = (self.streams.len() - 1) as u8 + self.base;
         if !self.kw("SET") {
@@ -7832,6 +8088,7 @@ impl<'a> P<'a> {
                 derived: None,
                 sub: self.in_sub,
                 cur: None,
+                proc_args: None,
             });
         }
         let secondary = (self.streams.len() - 3) as u8 + self.base;
@@ -7983,6 +8240,7 @@ impl<'a> P<'a> {
                 derived: None,
                 sub: self.in_sub,
                 cur: None,
+                proc_args: None,
             },
             ctx,
             cursor: None,
@@ -8521,6 +8779,20 @@ impl<'a> P<'a> {
                         _ => return None,
                     }
                 }
+            } else if !matches!(self.t.get(self.i), Some(Tok::Semi) | None)
+                && !matches!(self.t.get(self.i), Some(Tok::Ident(w)) if w == "RETURNING_VALUES")
+            {
+                // the PAREN-LESS argument list `EXECUTE PROCEDURE p :a, :b`
+                // (the employee sample's DEPT_BUDGET): the same BLR as
+                // the parenthesised spelling
+                loop {
+                    ins.push(self.val()?);
+                    if matches!(self.t.get(self.i), Some(Tok::Comma)) {
+                        self.i += 1;
+                    } else {
+                        break;
+                    }
+                }
             }
             let mut outs = Vec::new();
             if matches!(self.t.get(self.i), Some(Tok::Ident(w)) if w == "RETURNING_VALUES")
@@ -8901,6 +9173,7 @@ impl<'a> P<'a> {
                     derived: None,
                     sub: self.in_sub,
                     cur: None,
+                    proc_args: None,
                 };
                 self.streams.push(tgt.clone());
                 let tgt_ctx = (self.streams.len() - 1) as u8 + self.base;
@@ -8944,6 +9217,7 @@ impl<'a> P<'a> {
                 derived: None,
                 sub: self.in_sub,
                 cur: None,
+                proc_args: None,
             };
             self.streams.push(st.clone());
             let ctx = (self.streams.len() - 1) as u8 + self.base;
@@ -9039,6 +9313,7 @@ impl<'a> P<'a> {
                     derived: None,
                     sub: p.in_sub,
                     cur: None,
+                    proc_args: None,
                 })
             };
             let tgt = named(self)?;
@@ -9206,6 +9481,7 @@ impl<'a> P<'a> {
                                     derived: None,
                                     sub: self.in_sub,
                                     cur: None,
+                                    proc_args: None,
                                 });
                                 MergeAct::Upd(
                                     (self.streams.len() - 1) as u8
@@ -9228,6 +9504,7 @@ impl<'a> P<'a> {
                             derived: None,
                             sub: self.in_sub,
                             cur: None,
+                            proc_args: None,
                         });
                         (
                             c,
@@ -9341,6 +9618,7 @@ impl<'a> P<'a> {
                     derived: None,
                     sub: self.in_sub,
                     cur: None,
+                    proc_args: None,
                 };
                 // contexts: store, modify-new, rse-org - in order
                 let base = self.base;
@@ -9352,6 +9630,7 @@ impl<'a> P<'a> {
                     derived: None,
                     sub: self.in_sub,
                     cur: None,
+                    proc_args: None,
                 });
                 let new_ctx = (self.streams.len() - 1) as u8 + base;
                 self.streams.push(Stream {
@@ -9360,6 +9639,7 @@ impl<'a> P<'a> {
                     derived: None,
                     sub: self.in_sub,
                     cur: None,
+                    proc_args: None,
                 });
                 let org_ctx = (self.streams.len() - 1) as u8 + base;
                 return Some(TrigStmt::UpdateOrInsert {
@@ -9427,6 +9707,7 @@ impl<'a> P<'a> {
                 derived: None,
                 sub: self.in_sub,
                 cur: None,
+                proc_args: None,
             });
             let new_ctx = (self.streams.len() - 1) as u8 + self.base;
             let st = Stream {
@@ -9435,6 +9716,7 @@ impl<'a> P<'a> {
                 derived: None,
                 sub: self.in_sub,
                 cur: None,
+                proc_args: None,
             };
             self.streams.push(st.clone());
             let org_idx = self.streams.len() - 1;
@@ -9603,6 +9885,7 @@ pub fn compile_computed(sql: &str) -> Option<Vec<u8>> {
             derived: None,
             sub: false,
             cur: None,
+            proc_args: None,
         }],
         base: 0,
         outer: Some(1),
@@ -9663,6 +9946,25 @@ pub fn compile_computed(sql: &str) -> Option<Vec<u8>> {
 /// record). The negation reuses the same fold as NOT (probed:
 /// CHECK (A < B) stores blr_geq).
 pub fn compile_check(sql: &str) -> Option<Vec<u8>> {
+    compile_check_for(sql, "", &[])
+}
+
+/// [compile_check] for a table whose NAME and COLUMN TYPES are known:
+/// `TABLE.COL` resolves to the NEW context (the engine's check trigger
+/// reads context 1), and a text `IN` list casts to the column's type.
+pub fn compile_check_for(sql: &str, table: &str, cols: &[(String, TypeSpec)]) -> Option<Vec<u8>> {
+    TYPING.with(|t| {
+        *t.borrow_mut() = Typing {
+            value: None,
+            cols: cols.iter().map(|(n, ts)| (n.clone(), ts.dsc())).collect(),
+        }
+    });
+    let r = compile_check_inner(sql, table);
+    TYPING.with(|t| *t.borrow_mut() = Typing::default());
+    r
+}
+
+fn compile_check_inner(sql: &str, table: &str) -> Option<Vec<u8>> {
     let toks = lex(sql.trim().trim_end_matches(';'))?;
     let mut p = P {
         t: &toks,
@@ -9675,13 +9977,15 @@ pub fn compile_check(sql: &str) -> Option<Vec<u8>> {
                 derived: None,
                 sub: false,
                 cur: None,
+                proc_args: None,
             },
             Stream {
-                name: String::new(),
+                name: table.to_ascii_uppercase(),
                 alias: None,
                 derived: None,
                 sub: false,
                 cur: None,
+                proc_args: None,
             },
         ],
         base: 0,
@@ -9759,6 +10063,84 @@ pub fn compile_check_hex(sql: &str) -> Option<String> {
 /// shape differs from a table CHECK's system trigger: the RAW boolean
 /// (NOT negated, no abort wrapper) between blr_version5 and blr_eoc,
 /// with VALUE compiling to blr_fid(0, 0) (probed).
+/// A column's or a domain VALUE's declared type, as the caller knows it
+/// from RDB$FIELDS terms: the BLR type code (blr_text 14, blr_varying
+/// 37, blr_short 7, blr_long 8, blr_int64 16, blr_double 27, the
+/// date/time codes), the byte length and the scale.
+#[derive(Clone, Copy, Debug)]
+pub struct TypeSpec {
+    pub blr_type: u8,
+    pub length: u16,
+    pub scale: i8,
+}
+
+impl TypeSpec {
+    fn dsc(&self) -> Dsc {
+        match self.blr_type {
+            14 => Dsc::Text(self.length),
+            37 => Dsc::Varying(self.length),
+            12 => Dsc::Date,
+            13 => Dsc::Time,
+            35 => Dsc::Timestamp,
+            t => Dsc::Num(t, self.scale),
+        }
+    }
+}
+
+/// What the compiler knows about the types around it while compiling a
+/// CHECK: the domain VALUE's type, and the checked table's columns. The
+/// engine casts the members of a text `IN (...)` list to the tested
+/// operand's type (measured: `VALUE IN ('software', ...)` on a
+/// VARCHAR(12) domain stores each literal under `blr_cast blr_varying2
+/// 0,0 12,0`), so the list needs the operand's declared type.
+#[derive(Default, Clone)]
+struct Typing {
+    value: Option<Dsc>,
+    cols: Vec<(String, Dsc)>,
+}
+
+thread_local! {
+    static TYPING: std::cell::RefCell<Typing> = std::cell::RefCell::new(Typing::default());
+    /// (relation or procedure name, its column or output names): what a
+    /// bare column name across several streams resolves through
+    static CATALOG: std::cell::RefCell<Vec<(String, Vec<String>)>> = std::cell::RefCell::new(Vec::new());
+}
+
+/// Hand the compiler the columns of the tables (and the outputs of the
+/// procedures) a body may read, so a bare name across two streams binds
+/// the way the engine's resolves it. Cleared with an empty list.
+pub fn set_catalog(entries: Vec<(String, Vec<String>)>) {
+    CATALOG.with(|c| *c.borrow_mut() = entries);
+}
+
+fn catalog_has(rel: &str, col: &str) -> bool {
+    CATALOG.with(|c| {
+        c.borrow()
+            .iter()
+            .any(|(r, cols)| r == rel && cols.iter().any(|x| x == col))
+    })
+}
+
+fn typing_of(v: &Val) -> Option<Dsc> {
+    TYPING.with(|t| {
+        let t = t.borrow();
+        match v {
+            Val::Fid(0, 0) => t.value,
+            Val::Field(_, name) => t.cols.iter().find(|(n, _)| n == name).map(|(_, d)| *d),
+            _ => None,
+        }
+    })
+}
+
+/// [compile_validation] with the domain VALUE's declared type known, so
+/// a text `IN` list compiles the way the engine stores it.
+pub fn compile_validation_typed(sql: &str, value: TypeSpec) -> Option<Vec<u8>> {
+    TYPING.with(|t| *t.borrow_mut() = Typing { value: Some(value.dsc()), cols: Vec::new() });
+    let r = compile_validation(sql);
+    TYPING.with(|t| *t.borrow_mut() = Typing::default());
+    r
+}
+
 pub fn compile_validation(sql: &str) -> Option<Vec<u8>> {
     let toks = lex(sql.trim().trim_end_matches(';'))?;
     let mut p = P {
@@ -9861,6 +10243,7 @@ pub fn compile_trigger(sql: &str) -> Option<Vec<u8>> {
                 derived: None,
                 sub: false,
                 cur: None,
+                proc_args: None,
             },
             Stream {
                 name: "NEW".to_string(),
@@ -9868,6 +10251,7 @@ pub fn compile_trigger(sql: &str) -> Option<Vec<u8>> {
                 derived: None,
                 sub: false,
                 cur: None,
+                proc_args: None,
             },
         ],
         base: 0,
@@ -10064,10 +10448,21 @@ pub struct ProcParamMeta {
     pub length: u16,
     pub scale: i16,
     pub sub_type: i16,
+    /// RDB$FIELD_PRECISION: the declared p of a NUMERIC/DECIMAL parameter
+    pub precision: Option<i16>,
     /// an input parameter DEFAULT value SOURCE (`5`, `'x'`, `NULL`); None
     /// for outputs and undefaulted inputs. The wire turns it into the
     /// stored RDB$DEFAULT_SOURCE / VALUE.
     pub default: Option<String>,
+}
+
+/// A declared NUMERIC/DECIMAL spelling overrides the descriptor's guess
+/// at sub_type and supplies the precision.
+fn apply_decl(m: &mut ProcParamMeta, decl: &Option<(i16, i16)>) {
+    if let Some((sub, prec)) = decl {
+        m.sub_type = *sub;
+        m.precision = Some(*prec);
+    }
 }
 
 fn dsc_to_meta(name: &str, d: &Dsc) -> ProcParamMeta {
@@ -10090,6 +10485,7 @@ fn dsc_to_meta(name: &str, d: &Dsc) -> ProcParamMeta {
         // 1); a plain integer or a non-numeric type is 0. DECIMAL (2) is
         // not distinguished from NUMERIC by the Dsc here - a boundary.
         sub_type: if scale != 0 { 1 } else { 0 },
+        precision: None,
         default: None,
     }
 }
@@ -10171,13 +10567,24 @@ fn compile_routine_full(
             .ins
             .iter()
             .zip(bo.in_defaults.iter())
-            .map(|((n, d), def)| {
+            .zip(bo.in_decls.iter().chain(std::iter::repeat(&None)))
+            .map(|(((n, d), def), decl)| {
                 let mut m = dsc_to_meta(n, d);
                 m.default = def.clone();
+                apply_decl(&mut m, decl);
                 m
             })
             .collect(),
-        outs: bo.outs.iter().map(|(n, d)| dsc_to_meta(n, d)).collect(),
+        outs: bo
+            .outs
+            .iter()
+            .zip(bo.out_decls.iter().chain(std::iter::repeat(&None)))
+            .map(|((n, d), decl)| {
+                let mut m = dsc_to_meta(n, d);
+                apply_decl(&mut m, decl);
+                m
+            })
+            .collect(),
         selectable: bo.selectable,
         source,
         calls_user_fn: p.saw_user_fn,
@@ -12796,5 +13203,50 @@ mod tests {
             compile_view_select("SELECT ID FROM T WHERE NOT (NOT (A > 5))"),
             compile_view_select("SELECT ID FROM T WHERE A > 5"),
         );
+    }
+}
+
+#[cfg(test)]
+mod employee_sample_bodies {
+    use super::*;
+    /// The procedure shapes the employee sample's build script uses, each
+    /// once refused here: a bare column across a comma-joined FROM (through
+    /// the catalog), an array element with a parameter subscript, a
+    /// selectable procedure with arguments as a FOR SELECT source, and the
+    /// paren-less EXECUTE PROCEDURE argument list.
+    #[test]
+    fn compile_the_sample_shapes() {
+        set_catalog(vec![
+            ("SALES".into(), vec!["PO_NUMBER".into(), "CUST_NO".into(), "ORDER_STATUS".into()]),
+            ("CUSTOMER".into(), vec!["CUST_NO".into(), "ON_HOLD".into()]),
+            ("JOB".into(), vec!["JOB_CODE".into(), "LANGUAGE_REQ".into()]),
+            ("SHOW_LANGS".into(), vec!["LANGUAGES".into()]),
+        ]);
+        let comma = compile_procedure_full(
+            "CREATE PROCEDURE p (po CHAR(8)) AS DECLARE VARIABLE a CHAR(7); DECLARE VARIABLE h CHAR(1); BEGIN \
+             SELECT s.order_status, c.on_hold FROM sales s, customer c WHERE po_number = :po AND s.cust_no = c.cust_no INTO :a, :h; END",
+        );
+        let elem = compile_procedure_full(
+            "CREATE PROCEDURE q (i INTEGER) RETURNS (l VARCHAR(15)) AS BEGIN SELECT language_req[:i] FROM job WHERE job_code = 'x' INTO :l; END",
+        );
+        let source = compile_procedure_full(
+            "CREATE PROCEDURE r (code VARCHAR(5)) RETURNS (lang VARCHAR(15)) AS BEGIN FOR SELECT languages FROM show_langs(:code, 1, 'USA') INTO :lang DO SUSPEND; END",
+        );
+        let parenless = compile_procedure_full(
+            "CREATE PROCEDURE d (dno CHAR(3)) RETURNS (t INTEGER) AS DECLARE VARIABLE s INTEGER; BEGIN EXECUTE PROCEDURE d :dno RETURNING_VALUES :s; t = s; END",
+        );
+        let paren = compile_procedure_full(
+            "CREATE PROCEDURE d (dno CHAR(3)) RETURNS (t INTEGER) AS DECLARE VARIABLE s INTEGER; BEGIN EXECUTE PROCEDURE d(:dno) RETURNING_VALUES :s; t = s; END",
+        );
+        set_catalog(Vec::new());
+        let comma = comma.expect("comma join compiles");
+        // measured: a flat rse of TWO streams, no join heads
+        assert!(comma.blob.windows(2).any(|w| w == [blr::RSE, 2]));
+        assert!(!comma.blob.contains(&blr::JOIN));
+        let elem = elem.expect("array element compiles");
+        assert!(elem.blob.contains(&blr::INDEX));
+        let source = source.expect("procedure source compiles");
+        assert!(source.blob.contains(&blr::PROCEDURE));
+        assert_eq!(parenless.expect("paren-less").blob, paren.expect("paren").blob);
     }
 }

@@ -99,6 +99,11 @@ pub enum Expr {
     /// INTERNAL INFO half of that comparison and the literal beside it
     /// says which action the body asked about.
     TriggerAction,
+    /// `USER` / `CURRENT_USER` - blr_user_name (44), a body leaf the
+    /// employee sample's SAVE_SALARY_CHANGE writes into UPDATER_ID
+    UserName,
+    /// `CURRENT_ROLE` - blr_current_role (174)
+    CurrentRole,
     /// `GEN_ID(<name>, <step>)` - `blr_gen_id`, a COUNTED name, then
     /// the step as an ordinary expression. The engine's own dump of
     /// `NEW.ID = GEN_ID(G, 1)`:
@@ -164,6 +169,8 @@ impl Expr {
             // blr_internal_info, then its operand: the info TYPE as an
             // ordinary long literal (parse.y builds it with
             // MAKE_const_slong(INFO_TYPE_TRIGGER_ACTION))
+            Expr::UserName => out.push(44),
+            Expr::CurrentRole => out.push(174),
             Expr::TriggerAction => {
                 out.push(BLR_INTERNAL_INFO);
                 Expr::IntLiteral(INFO_TYPE_TRIGGER_ACTION).emit(out);
@@ -221,6 +228,8 @@ impl Expr {
             // it names no column - it asks the runtime which action
             // is firing
             | Expr::TriggerAction
+            | Expr::UserName
+            | Expr::CurrentRole
             // a draw names a GENERATOR, not a column
             | Expr::GenId2 { .. } => {}
             Expr::GenId { step, .. } => step.collect_refs(refs),

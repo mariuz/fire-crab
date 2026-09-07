@@ -442,6 +442,11 @@ pub enum DepEvent {
     /// a relation opened as a stream (`blr_relation*`): the context it
     /// is bound to, and its name - the relation-level (NULL field) row
     RelCtx { ctx: u8, name: String },
+    /// blr_modify / blr_modify2: the NEW record's context is the same
+    /// relation as the stream it modifies (an assignment target under
+    /// it is a field dependency: the engine records LOG.Y for
+    /// `UPDATE LOG SET Y = :v`)
+    ModifyCtx { org: u8, new: u8 },
     /// `blr_rid*`: the same, by relation id
     RelId { ctx: u8, id: u16 },
     /// a procedure opened as a stream (`blr_procedure*`, `blr_select_procedure`)
@@ -1218,6 +1223,13 @@ fn stream_event(verb: u8, strings: &[String], bytes: &[u8], words: &[u16]) -> Op
                 return None;
             }
             Some(DepEvent::RelId { ctx: *bytes.last()?, id: *words.first()? })
+        }
+        // blr_modify (10) / blr_modify2 (172): org ctx, new ctx
+        10 | 172 => {
+            if bytes.len() < 2 {
+                return None;
+            }
+            Some(DepEvent::ModifyCtx { org: bytes[0], new: bytes[1] })
         }
         // blr_field (23): ctx, name
         23 => Some(DepEvent::Field { ctx: *bytes.first()?, name: strings.first()?.clone() }),
