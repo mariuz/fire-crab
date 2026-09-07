@@ -4724,7 +4724,11 @@ CP (A INTEGER, B INTEGER, S COMPUTED BY (A+B)); (100,200); ALTER A TYPE NUMERIC(
 The engine keeps `S`'s declared `INTEGER` from `CREATE` time and rounds
 `7.5` to `8`; fire-crab re-derives `NUMERIC(9,2)` from the operands.
 
-### And one neighbouring WRONG WRITE, found on the way: fire-crab's logical backup silently drops a column-level `DEFAULT`
+### And one neighbouring WRONG WRITE - DONE (2026-09-08, `serve-real-coldefault`): fire-crab's logical backup silently drops a column-level `DEFAULT`
+
+**FIXED (the write landed with the gbak backup chunk; now GATED).** The relation-field record now emits att 15 (`RDB$DEFAULT_VALUE`) and att 39 (`RDB$DEFAULT_SOURCE`) from the column's `RDB$RELATION_FIELDS` row (`Col::col_default`), so a `CREATE TABLE ... B INTEGER DEFAULT 42` round-trips: its default source survives fire-crab's backup + the engine's restore, an INSERT that omits the column stores the default, and an `ON DELETE SET DEFAULT` foreign key writes the declared default rather than NULL. Held against the engine's own backup of the same file (both restores agree). The original description follows.
+
+### (original) And one neighbouring WRONG WRITE, found on the way: fire-crab's logical backup silently drops a column-level `DEFAULT`
 
 **HIGH, WRONG WRITE (silent), PRE-EXISTING, no gate covers it.** The
 relation-field writer in `crates/burp/src/lib.rs` (the `rec::FIELD`
