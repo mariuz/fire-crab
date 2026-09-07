@@ -8892,6 +8892,19 @@ impl ProjCol {
                         other => other,
                     });
                 }
+                // a TEXT-announced conditional whose surviving branch is a
+                // NUMERIC one RENDERS the number to its digits (the
+                // engine's makeFromList: character wins over the numeric
+                // families, COALESCE(<numeric>, <text>) is VARYING). Do it
+                // BEFORE the exact-scale contract below, which would try to
+                // rescale a Scaled value to the text column's scale 0 and
+                // 22003 on the negative exponent (review-caught:
+                // COALESCE(<numeric(9,2)>, <varchar>) errored mid-fetch).
+                if matches!(self.wire, Wire::Text | Wire::Varying)
+                    && matches!(v, Value::Int(_) | Value::Scaled(..) | Value::Int128(..))
+                {
+                    return Ok(Value::Text(v.render()));
+                }
                 if let Some((raw, vs)) = numeric_parts(&v) {
                     let announced = self.scale as i8;
                     if vs != announced && !matches!(v, Value::Null) {
@@ -18203,6 +18216,24 @@ fn text_form_m(
             },
             TfCs::Ttype(0),
         ));
+    }
+    // AN EXACT-NUMERIC OPERAND CONVERTED TO TEXT has a natural render
+    // width too (DataTypeUtil::makeConcatenate / the CVT string length):
+    // by storage dtype, plus one for the decimal point of a scaled type,
+    // and NO charset (it announces NONE; the text operand decides the
+    // result's). Measured: SMALLINT 6, INTEGER 11, BIGINT 20, INT128 47;
+    // NUMERIC(9,2) 12, NUMERIC(18,4) 21, NUMERIC(4,2) 7, NUMERIC(38,10)
+    // 48. Without this a `<integer> || 'x'` and a mixed COALESCE fell to
+    // the 32765 catch-all (measured, mid-fix).
+    if matches!(e.type_of(descs), Some(ExprType::Numeric | ExprType::Int)) {
+        let base = match result_width_bytes(e, descs) {
+            0..=2 => 6,
+            3..=4 => 11,
+            5..=8 => 20,
+            _ => 47,
+        };
+        let scaled = e.result_scale(descs).map_or(false, |sc| sc != 0);
+        return Some((true, base + i32::from(scaled), TfCs::Ttype(0)));
     }
     match e {
         Expr::Str(s) => Some((false, lit_w(s), TfCs::Att)),
@@ -64614,7 +64645,16 @@ fn conditional_type<'a>(
         // COALESCE(VAR_SAMP(N), 0) is 480) - but never with text
         return if any_text { None } else { Some(ExprType::Approx) };
     }
-    if any_numeric && !any_text {
+    // TEXT WINS over the exact-numeric families: a mix of CHAR/VARCHAR
+    // with INTEGER or NUMERIC unifies to a character type, and each
+    // numeric branch RENDERS to its digits (DataTypeUtil::makeFromList -
+    // measured: COALESCE(<integer>, 'x') is VARYING, a non-null integer
+    // comes back as text). fire-crab used to keep the numeric type and
+    // silently coerce the string branch to 0 (COALESCE(a, 'xnone') -> 0).
+    if any_text {
+        return Some(ExprType::Text);
+    }
+    if any_numeric {
         return Some(ExprType::Numeric);
     }
     if first.is_none() && all_null {

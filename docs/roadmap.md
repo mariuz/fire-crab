@@ -3072,6 +3072,9 @@ pointer-page and TIP page numbers is the next step when it dominates.
 
 ## Next, in order
 
+- **A CONDITIONAL THAT MIXES NUMERIC AND TEXT UNIFIES TO TEXT DONE (2026-09-08, `serve-real-condtext`):** `COALESCE`, `CASE`, `DECODE`, `IIF` with a numeric branch and a text branch answered a NUMBER and silently coerced the string branch to 0 - `COALESCE(<integer>, 'xnone')` returned `0`, not `'xnone'`. The engine's `DataTypeUtil::makeFromList` gives CHARACTER precedence over the exact-numeric families: the result is VARCHAR and each numeric branch RENDERS to its digits. Fixed in `conditional_type` (a `Text` branch now wins over `Numeric`/`Int`, after the temporal/bool/approx guards that still refuse those mixes). The result WIDTH was also wrong - a numeric operand had no text-render width in `text_form_m`, so a mixed conditional AND `<numeric> || <text>` concatenation announced the VARCHAR maximum (32765); added the engine's render widths (SMALLINT 6, INTEGER 11, BIGINT 20, INT128 47, +1 for a scaled type). And `ProjCol::value_of` now renders a numeric value to text when the column's wire form is character, before the exact-scale contract that used to 22003 on a `NUMERIC(9,2)` branch. Found by an eight-surface differential hunt; the same fix closed the hunt's separate `'x' || 5` width divergence. Left for a later chunk (also from the hunt): the COALESCE type is unrelated to CAST-string-to-NUMERIC(p,s) overflow (murky engine rule), OVERLAY / ASCII_CHAR / BIT_LENGTH / trailing-UNION-DISTINCT / RETURNING-of-computed / DECFLOAT-and-INT128 cast refusals, and a bare untyped `NULL` in concat still announcing VARCHAR(32767).
+
+
 - **RE-EXECUTING A PREPARED STATEMENT DONE (2026-08-30,
   `serve-real-reexec` NEW, 15):** a second execute of a prepared handle
   answered **ZERO ROWS**, silently. A FETCH MUTATES THE LIVE PLAN - it
