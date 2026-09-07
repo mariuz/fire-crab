@@ -14,8 +14,9 @@
 #       the describe width - so the length functions are what pin it).
 #   OV  ALTER N TYPE NUMERIC(18,4) after a BIGINT row holding 9e17 (F2):
 #       the rescale overflows, and both raise 22003 numeric value is out
-#       of range through a selectable procedure rather than answering a
-#       wrong number.
+#       of range - through a selectable procedure AND a plain client
+#       SELECT, a WHERE and a SUM (the streaming/aggregating scan) -
+#       rather than answering a wrong number.
 #
 # Usage: qa/serve-real-altfmt.sh [port]   (default 4134)
 set -u
@@ -81,6 +82,9 @@ select id, extract(hour from h) hh, extract(year from h) yy from dt where id = 1
 select id, char_length(b) l, octet_length(b) o from cw order by id;
 select id, char_length(b || 'X') l from cw order by id;
 select o from pov;
+select n from ov order by id;
+select n from ov where n > 0;
+select sum(n) from ov;
 SQL
 # the engine tags the 22003 with the procedure's line/col; strip that so
 # the SQLSTATE and message are what is compared, not the source position

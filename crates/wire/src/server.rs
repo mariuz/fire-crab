@@ -8194,7 +8194,9 @@ impl RowSource {
                 // rest of the relation and discarding it
                 let mut flow = Flow::Continue;
                 let mut err: Option<EvalErr> = None;
-                let limbo = for_each_record_while(db, *rel, formats, *decode_len, |values| {
+                // the checked walk raises 22003 on an out-of-range old
+                // row (F2) instead of feeding the sink the raw mantissa
+                let limbo = for_each_record_while_checked(db, *rel, formats, *decode_len, |values| {
                     let mut row = values.to_vec();
                     if let Some(w) = width {
                         row.resize(*w, Value::Null);
@@ -8209,7 +8211,7 @@ impl RowSource {
                             Flow::Stop
                         }
                     }
-                });
+                })?;
                 if limbo != 0 && err.is_none() {
                     err = Some(EvalErr::RecInLimbo(limbo));
                 }
@@ -51044,6 +51046,46 @@ impl<'a> ReadView<'a> {
         // vector exactly as it was.
         Some(fill_format_defaults(values, newest.len(), defaults))
     }
+
+    /// [values], but an exact-numeric field whose presented scale
+    /// OVERFLOWS the newest format's range raises `22003` instead of
+    /// leaving the raw mantissa (which the wire would render divided by
+    /// the wrong power of ten). The engine raises at the streamed read;
+    /// `Ok(None)` is still "not visible". Only the streaming full-scan
+    /// cursor uses this - the one path a plain client SELECT of an
+    /// out-of-range old row takes (F2). The index-driven, join-build,
+    /// uniqueness and system-scan walks keep [values]'s leave-unchanged
+    /// behaviour (each would need the raise threaded through a `bool`- or
+    /// count-returning walk; recorded, an even narrower remainder).
+    fn values_checked(
+        &self,
+        bytes: &fire_crab_ods::Image,
+        page_size: usize,
+        formats: &[(u8, Vec<Descriptor>)],
+        defaults: &[(usize, Value)],
+        r: &fire_crab_ods::RecordHeader,
+    ) -> Result<Option<Vec<Value>>, EvalErr> {
+        let Some((image, format)) = self.version(bytes, page_size, r) else {
+            return Ok(None);
+        };
+        let descs = match formats
+            .iter()
+            .find(|(n, _)| *n == format)
+            .or_else(|| formats.iter().max_by_key(|(n, _)| *n))
+        {
+            Some(d) => d,
+            None => return Ok(None),
+        };
+        let newest: &[Descriptor] =
+            formats.iter().max_by_key(|(n, _)| *n).map(|(_, d)| d.as_slice()).unwrap_or(&[]);
+        let values = fire_crab_ods::format::present_through(
+            decode_record(&image, &descs.1),
+            &descs.1,
+            newest,
+        )
+        .map_err(|_| EvalErr::NumericOutOfRange)?;
+        Ok(Some(fill_format_defaults(values, newest.len(), defaults)))
+    }
 }
 
 /// A resumable cursor over a plain full scan: it produces up to `want`
@@ -51170,7 +51212,7 @@ impl StreamCursor {
             while self.si < recs.len() {
                 let r = &recs[self.si];
                 self.si += 1;
-                let Some(values) = view.values(&self.image, db.page_size, &self.formats, &self.defaults, r) else {
+                let Some(values) = view.values_checked(&self.image, db.page_size, &self.formats, &self.defaults, r)? else {
                     if view.limbo.get() != 0 {
                         let e = EvalErr::RecInLimbo(view.limbo.get());
                         if out.is_empty() {
@@ -52129,6 +52171,45 @@ fn for_each_record_while<F: FnMut(&[Value]) -> Flow>(
         }
     }
     0
+}
+
+/// [for_each_record_while], but a record whose presented value OVERFLOWS
+/// the newest format's range raises `22003` (via [ReadView::values_checked])
+/// instead of feeding the sink a wrong number - the streamed read the
+/// engine raises on. Only the materialising/aggregating scan
+/// ([RowSource::for_each]) uses it; the FK-partner probe keeps the
+/// leave-unchanged [for_each_record_while] (its answer is a bool, not a
+/// row a client renders). Returns the limbo transaction (0 = none).
+fn for_each_record_while_checked<F: FnMut(&[Value]) -> Flow>(
+    db: &Database,
+    rel: u16,
+    formats: &[(u8, Vec<Descriptor>)],
+    decode_len: usize,
+    mut f: F,
+) -> Result<u64, EvalErr> {
+    let db_image = db.bytes();
+    let defaults = newest_format_defaults(db, rel);
+    let mut view = ReadView::of(db, &db_image);
+    view.decode_len = decode_len;
+    for dp_no in relation_data_pages(&db_image, db.page_size, rel) {
+        let Some(dp) = fire_crab_ods::page_at(&db_image, db.page_size, dp_no)
+            .and_then(DataPage::decode)
+        else {
+            continue;
+        };
+        for r in dp.records() {
+            let Some(values) = view.values_checked(&db_image, db.page_size, formats, &defaults, &r)? else {
+                if view.limbo.get() != 0 {
+                    return Ok(view.limbo.get());
+                }
+                continue;
+            };
+            if matches!(f(&values), Flow::Stop) {
+                return Ok(0);
+            }
+        }
+    }
+    Ok(0)
 }
 
 /// Rows of `rel` this attachment counts - the decode-free walk behind
