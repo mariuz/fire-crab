@@ -1137,3 +1137,116 @@ mod tests {
         assert_eq!(max_recs_per_dp(8192), 480);
     }
 }
+
+/// The exact-numeric dtypes: a change of `RDB$FIELD_SCALE` between two
+/// formats moves the stored mantissa, and only these carry one.
+pub fn is_exact_dtype(t: u8) -> bool {
+    matches!(t, dtype::SHORT | dtype::LONG | dtype::INT64 | dtype::INT128)
+}
+
+/// Move an exact integer from scale `from` to scale `to`. Scaling down
+/// (fewer decimals) requires exact divisibility; a value that would lose
+/// a digit returns None, which a caller presents as the unchanged value
+/// rather than a wrong one.
+fn rescale_exact(raw: i128, from: i8, to: i8) -> Option<i128> {
+    let e = from as i32 - to as i32;
+    if e >= 0 {
+        raw.checked_mul(10i128.checked_pow(e as u32)?)
+    } else {
+        let p = 10i128.checked_pow((-e) as u32)?;
+        (raw % p == 0).then_some(raw / p)
+    }
+}
+
+/// One field of a record STORED under `stored`, shown as the `newest`
+/// format describes it: an exact-numeric column whose scale changed is
+/// re-expressed at the new scale (the raw mantissa travels, so a reader
+/// described in the newest format renders it right). Everything else -
+/// a type change that is not a scale change, a non-exact column - is
+/// left as the record carries it (None). Mirrors the wire read path.
+pub fn present_field(v: &Value, stored: &Descriptor, newest: &Descriptor) -> Option<Value> {
+    if stored.scale == newest.scale
+        || !is_exact_dtype(stored.dtype)
+        || !is_exact_dtype(newest.dtype)
+    {
+        return None;
+    }
+    let (raw, from) = match v {
+        Value::Int(n) => (*n as i128, 0i8),
+        Value::Scaled(r, s) => (*r as i128, *s),
+        Value::Int128(r, s) => (*r, *s),
+        _ => return None,
+    };
+    let to = newest.scale;
+    let n = rescale_exact(raw, from, to)?;
+    Some(if newest.dtype == dtype::INT128 {
+        Value::Int128(n, to)
+    } else if to == 0 {
+        Value::Int(i64::try_from(n).ok()?)
+    } else {
+        Value::Scaled(i64::try_from(n).ok()?, to)
+    })
+}
+
+/// A whole decoded record, presented through `newest` - [present_field]
+/// per field. The two descriptor lists are indexed by FIELD ID, and a
+/// record's own format is a PREFIX of the newest one (a dropped id is
+/// never reused), so a field the newest format does not describe is left
+/// alone.
+pub fn present_through(mut values: Vec<Value>, stored: &[Descriptor], newest: &[Descriptor]) -> Vec<Value> {
+    for (fid, v) in values.iter_mut().enumerate() {
+        let (Some(s), Some(n)) = (stored.get(fid), newest.get(fid)) else { continue };
+        if let Some(nv) = present_field(v, s, n) {
+            *v = nv;
+        }
+    }
+    values
+}
+
+/// Extend a record STORED under a shorter format up to `newest_len`
+/// fields: each field the newest format has and the record's own did not
+/// takes the newest format's stored DEFAULT (where `ALTER TABLE ... ADD
+/// <col> DEFAULT <x> NOT NULL` put it instead of rewriting every row),
+/// or NULL where the format lists none. A field id is never reused once
+/// dropped, so a field the old format lacks is always one past its end.
+pub fn fill_format_defaults(mut values: Vec<Value>, newest_len: usize, defaults: &[(usize, Value)]) -> Vec<Value> {
+    while values.len() < newest_len {
+        let fid = values.len();
+        values.push(
+            defaults
+                .iter()
+                .find(|(i, _)| *i == fid)
+                .map(|(_, v)| v.clone())
+                .unwrap_or(Value::Null),
+        );
+    }
+    values
+}
+
+/// Present a record whose bytes are `image` and whose own format number
+/// is `format`, through the relation's NEWEST format: decode under the
+/// record's own descriptors, re-scale changed exact columns, then fill
+/// the newest format's defaults for fields added after this record was
+/// written. `formats` is every (number, descriptors) the relation has;
+/// `newest_defaults` the newest format's default section. This is the
+/// one presentation a selectable-procedure or function read needs and
+/// the newest-descriptors-only decode got wrong for an older row.
+pub fn present_record(
+    image: &[u8],
+    format: u8,
+    formats: &[(u8, Vec<Descriptor>)],
+    newest_defaults: &[(usize, Value)],
+) -> Vec<Value> {
+    let newest: &[Descriptor] = formats
+        .iter()
+        .max_by_key(|(n, _)| *n)
+        .map(|(_, d)| d.as_slice())
+        .unwrap_or(&[]);
+    let stored: &[Descriptor] = formats
+        .iter()
+        .find(|(n, _)| *n == format)
+        .map(|(_, d)| d.as_slice())
+        .unwrap_or(newest);
+    let values = present_through(decode_record(image, stored), stored, newest);
+    fill_format_defaults(values, newest.len(), newest_defaults)
+}

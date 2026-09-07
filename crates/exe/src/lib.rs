@@ -2626,12 +2626,19 @@ impl<'a> Exec<'a> {
             .iter()
             .max_by_key(|(n, _)| *n)
             .ok_or("relation has no format")?;
+        let descs = descs.clone();
         let tips = TipChain::read(self.file, self.page_size)
             .ok_or("cannot read transaction inventory")?;
-        Ok(visible_rows(self.file, self.page_size, rel, descs, &tips)
+        // the same per-format presentation as scan_relation (F1) - an
+        // index-driven read of an old row must re-scale and default-fill
+        // it too
+        let newest_defaults = self.newest_defaults(rel);
+        Ok(visible_rows(self.file, self.page_size, rel, &descs, &tips)
             .into_iter()
             .filter(|vr| bitmap.contains(&vr.recno))
-            .map(|vr| vr.values)
+            .map(|vr| {
+                fire_crab_ods::format::present_record(&vr.image, vr.format, &formats, &newest_defaults)
+            })
             .collect())
     }
 
@@ -2746,12 +2753,36 @@ impl<'a> Exec<'a> {
             .iter()
             .max_by_key(|(n, _)| *n)
             .ok_or("relation has no format")?;
+        let descs = descs.clone();
         let tips = TipChain::read(self.file, self.page_size)
             .ok_or("cannot read transaction inventory")?;
-        Ok(visible_rows(self.file, self.page_size, rel, descs, &tips)
+        // present EACH record through the format that describes IT, not
+        // through the newest one alone: an older row's exact-numeric
+        // columns re-scale, its short image extends with the newest
+        // format's defaults, and its fields sit at their own offsets.
+        // visible_rows decoded every row at `descs` (the newest) and so
+        // lost scale, offsets and the default section for an old row -
+        // the F1 defect, a selectable procedure or function reading
+        // wrong numbers where a client SELECT over the same file read
+        // right ones.
+        let newest_defaults = self.newest_defaults(rel);
+        Ok(visible_rows(self.file, self.page_size, rel, &descs, &tips)
             .into_iter()
-            .map(|vr| vr.values)
+            .map(|vr| {
+                fire_crab_ods::format::present_record(&vr.image, vr.format, &formats, &newest_defaults)
+            })
             .collect())
+    }
+
+    /// The newest RDB$FORMATS default section of a relation - the values
+    /// a record shorter than the newest format shows for the fields it
+    /// does not carry (an `ALTER TABLE ... ADD ... DEFAULT` after rows).
+    fn newest_defaults(&self, rel: u16) -> Vec<(usize, Value)> {
+        fire_crab_ods::relation_format_defaults(self.file, self.page_size, rel)
+            .into_iter()
+            .max_by_key(|(n, _)| *n)
+            .map(|(_, d)| d)
+            .unwrap_or_default()
     }
 
     /// Run an evaluation with a binding's frames pushed.

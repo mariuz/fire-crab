@@ -4514,7 +4514,11 @@ and copied byte-identically to both servers, unless the entry says
 otherwise. F1 through F7 were found by a reviewer; each was re-run here
 before being written down, and where it was not, the entry says so.
 
-### F1 - HIGH, WRONG ANSWER, PRE-EXISTING. A selectable PSQL procedure or function reads every record at the NEWEST format's descriptors
+### F1 - DONE (2026-09-07, `serve-real-procfmt`). A selectable PSQL procedure or function reads every record at the NEWEST format's descriptors
+
+**FIXED.** `crates/exe`'s `scan_relation` and `scan_relation_bitmap` now present each visible row through the format that describes IT, not the newest one alone: `fire_crab_ods::format::present_record` decodes the record under its own format's descriptors, re-scales the exact-numeric columns whose scale changed (`present_through`), and extends a short image with the newest format's stored defaults (`fill_format_defaults`) - the same three steps the wire read path took, now shared from `ods` rather than duplicated. Measured against the engine over a byte-identical file: PJX 700.00/7.00/7.00 (scale), POF 11|22 then 33|44 (offsets, not 0|0), PADF 99 in the NOT NULL default column, FN2(1)/FN2(2) 700.00/7.00. The presentation helpers moved into `fire_crab_ods::format` (`present_field`, `present_through`, `fill_format_defaults`, `is_exact_dtype`, `present_record`). The original description follows.
+
+### F1 (original) - HIGH, WRONG ANSWER, PRE-EXISTING. A selectable PSQL procedure or function reads every record at the NEWEST format's descriptors
 
 `crates/exe/src/lib.rs:2691` (`scan_relation`, the newest-format pick at
 `:2697`) and its index-driven twin `:2557` (`scan_relation_bitmap`,
