@@ -8849,6 +8849,12 @@ fn catalog_field_list(
         };
         members.push((*id as usize, src));
     });
+    // FIELD-ID ORDER, whatever order the catalog rows sit in: a format's
+    // descriptors are indexed by field id, and a gbak-restored table
+    // stores its RDB$RELATION_FIELDS rows in restore order (found: the
+    // sample's SALES re-format laid its fields out in row order, a
+    // format no record used but every reader would have misread)
+    members.sort_by_key(|m| m.0);
     if members.is_empty() {
         return Ok(Vec::new());
     }

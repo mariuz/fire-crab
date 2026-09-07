@@ -656,6 +656,9 @@ pub fn relay_image(image: &[u8], old: &[Descriptor], new: &[Descriptor]) -> Opti
         let (from, to, w) = (o.offset as usize, n.offset as usize, n.length as usize);
         if o.dtype == n.dtype && o.length == n.length && o.scale == n.scale {
             if image.len() < from + w {
+                if std::env::var("FC_SRV_TRACE").is_ok() {
+                    eprintln!("[relay] field {} short: image {} bytes, needs {}..{}", fid, image.len(), from, from + w);
+                }
                 return None;
             }
             out[to..to + w].copy_from_slice(&image[from..from + w]);
@@ -663,6 +666,10 @@ pub fn relay_image(image: &[u8], old: &[Descriptor], new: &[Descriptor]) -> Opti
             continue;
         }
         if !exact_int(o.dtype) || !exact_int(n.dtype) {
+            if std::env::var("FC_SRV_TRACE").is_ok() {
+                let shape = |d: &[Descriptor]| d.iter().map(|x| (x.dtype, x.length, x.offset)).collect::<Vec<_>>();
+                eprintln!("[relay] field {} changes shape: {:?} -> {:?}; old {:?} new {:?}", fid, (o.dtype, o.length, o.scale), (n.dtype, n.length, n.scale), shape(old), shape(new));
+            }
             return None;
         }
         let v = match decode_field(image, o, fid) {

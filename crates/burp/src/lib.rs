@@ -38,6 +38,12 @@ mod rec {
     pub const BLOB: u8 = 7;
     pub const RELATION_DATA: u8 = 8;
     pub const RELATION_END: u8 = 9;
+    /// an ARRAY's slice, after its row's rec_data (23)
+    pub const ARRAY: u8 = 23;
+    /// one RDB$FIELD_DIMENSIONS row (24)
+    pub const FIELD_DIMENSIONS: u8 = 24;
+    /// one RDB$USER_PRIVILEGES row (22)
+    pub const USER_PRIVILEGE: u8 = 22;
     pub const END: u8 = 10;
     pub const PHYSICAL_DB: u8 = 14;
     pub const VIEW: u8 = 11;
@@ -125,6 +131,20 @@ impl<'a> Rec<'a> {
 /// A column the writer carries: everything both the metadata records
 /// and the row encoder need.
 struct Col {
+    /// an ARRAY column's element type and bounds (RDB$FIELDS +
+    /// RDB$FIELD_DIMENSIONS); None for a scalar
+    array: Option<fire_crab_ods::ddl::ArrayShape>,
+    /// the column's RDB$FIELDS row - what the field records say beyond
+    /// the descriptor (sub_type, precision, character length, charset,
+    /// collation, a computed expression)
+    cat: Option<FieldCat>,
+    /// a COLUMN-level DEFAULT (RDB$RELATION_FIELDS): the BLR and the
+    /// NUL-terminated source
+    col_default: Option<(Vec<u8>, Vec<u8>)>,
+    /// COMPUTED BY: metadata only - no bytes in the data records
+    computed: bool,
+    /// RDB$RELATION_FIELDS.RDB$UPDATE_FLAG (0 for a computed column)
+    update_flag: i32,
     name: String,
     /// att 22 - the field id rec_blob's field number points at
     field_id: i32,
@@ -149,16 +169,352 @@ struct Col {
 
 /// RDB$FIELDS.RDB$FIELD_TYPE for a descriptor's dtype - the values the
 /// catalog stores and the burp records carry.
+/// A column's catalog spelling for the field records: (RDB$FIELD_TYPE,
+/// RDB$FIELD_LENGTH, the att 9 value - a blob's sub_type, else the
+/// scale -, RDB$FIELD_SUB_TYPE, whether it is text). An ARRAY column
+/// speaks for its ELEMENT: gbak writes fld_type / fld_length of the
+/// element and the dimensions apart (measured: JOB.LANGUAGE_REQ is
+/// type 37, length 15, one dimension).
+fn col_catalog_type(c: &Col) -> (i32, i32, i32, i32, bool) {
+    // (RDB$FIELD_TYPE, RDB$FIELD_LENGTH, RDB$FIELD_SUB_TYPE, RDB$FIELD_SCALE, text?)
+    if let Some(sh) = &c.array {
+        let (t, len, text_like) = match sh.dtype {
+            dtype::TEXT => (14, sh.length as i32, true),
+            dtype::VARYING => (37, sh.length as i32 - 2, true),
+            dtype::SHORT => (7, 2, false),
+            dtype::LONG => (8, 4, false),
+            dtype::INT64 => (16, 8, false),
+            dtype::REAL => (10, 4, false),
+            dtype::DOUBLE => (27, 8, false),
+            dtype::SQL_DATE => (12, 4, false),
+            dtype::SQL_TIME => (13, 4, false),
+            dtype::TIMESTAMP => (35, 8, false),
+            _ => (0, sh.length as i32, false),
+        };
+        return (t, len, sh.sub_type as i32, sh.scale as i32, text_like);
+    }
+    let sub = if c.desc.dtype == dtype::BLOB { c.desc.sub_type as i32 } else { 0 };
+    let scale = if c.desc.dtype == dtype::BLOB { 0 } else { c.desc.scale as i32 };
+    // RDB$FIELD_LENGTH from the catalog row when it is at hand; the
+    // descriptor's VARYING length carries the 2-byte count the catalog's
+    // does not (measured: VARCHAR(10) is RDB$FIELD_LENGTH 10, restored
+    // as VARCHAR(12) when the descriptor's 12 rode in att 10)
+    let len = match c.cat.as_ref().and_then(|k| k.length) {
+        Some(l) => l as i32,
+        None if c.desc.dtype == dtype::VARYING => c.desc.length as i32 - 2,
+        None => c.desc.length as i32,
+    };
+    (
+        rdb_field_type(&c.desc).unwrap_or(0),
+        len,
+        sub,
+        scale,
+        matches!(c.desc.dtype, dtype::TEXT | dtype::VARYING),
+    )
+}
+
+/// The canonical (XDR) form of an array slice, element by element, the
+/// way gbak's transportable backup writes it (common/xdr.cpp xdr_datum):
+/// text is opaque padded to 4; varying is its count as a 4-byte short
+/// then the bytes padded to 4; short/long/date/time are 4-byte
+/// big-endian; int64, double and timestamp 8 bytes big-endian.
+fn xdr_slice(sh: &fire_crab_ods::ddl::ArrayShape, data: &[u8]) -> Option<Vec<u8>> {
+    let elen = sh.length as usize;
+    if elen == 0 || data.len() % elen != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(data.len() + data.len() / 2 + 4);
+    // the canonical slice opens with its RAW length as a big-endian long
+    // (measured: `12 40 00 00 00 | 00 00 00 55 | ...` for 5 x VARCHAR(15),
+    // raw 85 bytes) - without it the restore reads the first element's
+    // count from the wrong word ("expected length 15, actual 16")
+    out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    let pad4 = |out: &mut Vec<u8>| {
+        while out.len() % 4 != 0 {
+            out.push(0);
+        }
+    };
+    for e in data.chunks(elen) {
+        match sh.dtype {
+            dtype::TEXT => {
+                out.extend_from_slice(e);
+                pad4(&mut out);
+            }
+            dtype::VARYING => {
+                let n = u16::from_le_bytes([e[0], e[1]]) as usize;
+                let n = n.min(elen - 2);
+                out.extend_from_slice(&(n as i16 as i32).to_be_bytes());
+                out.extend_from_slice(&e[2..2 + n]);
+                pad4(&mut out);
+            }
+            dtype::SHORT => {
+                let v = i16::from_le_bytes([e[0], e[1]]) as i32;
+                out.extend_from_slice(&v.to_be_bytes());
+            }
+            dtype::LONG | dtype::SQL_DATE | dtype::SQL_TIME | dtype::REAL => {
+                let v = u32::from_le_bytes(e[..4].try_into().ok()?);
+                out.extend_from_slice(&v.to_be_bytes());
+            }
+            dtype::INT64 | dtype::DOUBLE => {
+                let v = u64::from_le_bytes(e[..8].try_into().ok()?);
+                out.extend_from_slice(&v.to_be_bytes());
+            }
+            dtype::TIMESTAMP => {
+                let d = u32::from_le_bytes(e[..4].try_into().ok()?);
+                let t = u32::from_le_bytes(e[4..8].try_into().ok()?);
+                out.extend_from_slice(&d.to_be_bytes());
+                out.extend_from_slice(&t.to_be_bytes());
+            }
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+/// An array blob's content: the slice header (iad) and the element
+/// bytes after it - dimensions as (lower, upper), the element length,
+/// and the data.
+fn array_blob_parts(content: &[u8]) -> Option<(Vec<(i32, i32)>, usize, &[u8])> {
+    if content.len() < 40 || content[0] != 1 {
+        return None;
+    }
+    let ndims = content[1] as usize;
+    let elem_len = u16::from_le_bytes([content[4], content[5]]) as usize;
+    let hlen = u16::from_le_bytes([content[6], content[7]]) as usize;
+    let count = u32::from_le_bytes(content[8..12].try_into().ok()?) as usize;
+    if hlen < 16 + 24 * ndims.max(1) || content.len() < hlen {
+        return None;
+    }
+    let mut dims = Vec::with_capacity(ndims);
+    for i in 0..ndims {
+        let at = 16 + 24 * i;
+        let lo = i32::from_le_bytes(content[at + 16..at + 20].try_into().ok()?);
+        let hi = i32::from_le_bytes(content[at + 20..at + 24].try_into().ok()?);
+        dims.push((lo, hi));
+    }
+    let end = (hlen + count * elem_len).min(content.len());
+    Some((dims, elem_len, &content[hlen..end]))
+}
+
 fn rdb_field_type(d: &Descriptor) -> Option<i32> {
     Some(match d.dtype {
         dtype::SHORT => 7,
         dtype::LONG => 8,
         dtype::INT64 => 16,
+        dtype::INT128 => 26,
+        dtype::REAL => 10,
+        dtype::DOUBLE => 27,
+        dtype::SQL_DATE => 12,
+        dtype::SQL_TIME => 13,
+        dtype::TIMESTAMP => 35,
+        dtype::BOOLEAN => 23,
         dtype::TEXT => 14,
         dtype::VARYING => 37,
         dtype::BLOB => 261,
         _ => return None,
     })
+}
+
+/// A column's RDB$FIELDS row, the way gbak's field records spell it.
+#[derive(Clone, Debug, Default)]
+struct FieldCat {
+    /// RDB$FIELD_LENGTH as stored: a VARCHAR's byte length WITHOUT its
+    /// 2-byte count (the descriptor's length carries it)
+    length: Option<i64>,
+    sub_type: Option<i64>,
+    precision: Option<i64>,
+    char_len: Option<i64>,
+    charset: Option<i64>,
+    collation: Option<i64>,
+    segment_length: Option<i64>,
+    /// COMPUTED BY: the BLR and the NUL-terminated source
+    computed: Option<(Vec<u8>, Vec<u8>)>,
+}
+
+/// Every RDB$FIELDS row by name.
+fn read_field_cats(image: &fire_crab_ods::Image, page_size: usize) -> std::collections::HashMap<String, FieldCat> {
+    let mut out = std::collections::HashMap::new();
+    let Some((cols, rows)) = sys_rows(image, page_size, "RDB$FIELDS") else { return out };
+    let Some(frel) = fire_crab_ods::resolve_relation(image, page_size, "RDB$FIELDS") else { return out };
+    let at = |n: &str| cols.iter().find(|(c, _)| c.eq_ignore_ascii_case(n)).map(|(_, i)| *i);
+    for r in &rows {
+        let int = |n: &str| match at(n).and_then(|i| r.values.get(i)) {
+            Some(fire_crab_ods::format::Value::Int(v)) => Some(*v),
+            _ => None,
+        };
+        let blob = |n: &str, nul: bool| -> Option<Vec<u8>> {
+            match at(n).and_then(|i| r.values.get(i)) {
+                Some(fire_crab_ods::format::Value::Blob(_, num)) => {
+                    fire_crab_blb::read_blob_content(image, page_size, frel, *num).map(|mut d| {
+                        if nul {
+                            d.push(0);
+                        }
+                        d
+                    })
+                }
+                _ => None,
+            }
+        };
+        let Some(fire_crab_ods::format::Value::Text(name)) = at("RDB$FIELD_NAME").and_then(|i| r.values.get(i)) else { continue };
+        let computed = blob("RDB$COMPUTED_BLR", false).map(|b| (b, blob("RDB$COMPUTED_SOURCE", true).unwrap_or_default()));
+        out.insert(
+            name.trim_end().to_string(),
+            FieldCat {
+                length: int("RDB$FIELD_LENGTH"),
+                sub_type: int("RDB$FIELD_SUB_TYPE"),
+                precision: int("RDB$FIELD_PRECISION"),
+                char_len: int("RDB$CHARACTER_LENGTH"),
+                charset: int("RDB$CHARACTER_SET_ID"),
+                collation: int("RDB$COLLATION_ID"),
+                segment_length: int("RDB$SEGMENT_LENGTH"),
+                computed,
+            },
+        );
+    }
+    out
+}
+
+/// The owner every global field record names (att_field_owner_name 45,
+/// measured on the engine's stream: `2d 06 SYSDBA` closes each domain).
+const OWNER_NAME: &str = "SYSDBA";
+
+/// One RDB$USER_PRIVILEGES row the backup carries.
+struct UPrivilege {
+    user: String,
+    grantor: String,
+    privilege: String,
+    grant_option: Option<i64>,
+    /// RDB$RELATION_SCHEMA_NAME as stored - absent for a privilege on a
+    /// schema itself (object type 38), and the engine writes no att 10
+    /// then; stamping one made the restore look for a schema-qualified
+    /// object it could not find, and both USAGE ON SCHEMA grants vanished
+    schema: Option<String>,
+    object: String,
+    field: Option<String>,
+    user_type: i64,
+    object_type: i64,
+}
+
+/// Every RDB$USER_PRIVILEGES row that has a grantor, in catalog order
+/// (gbak: `WITH X.RDB$GRANTOR NOT MISSING`).
+fn read_user_privileges(image: &fire_crab_ods::Image, page_size: usize) -> Vec<UPrivilege> {
+    let mut out = Vec::new();
+    let Some((cols, rows)) = sys_rows(image, page_size, "RDB$USER_PRIVILEGES") else { return out };
+    let at = |n: &str| cols.iter().find(|(c, _)| c.eq_ignore_ascii_case(n)).map(|(_, i)| *i);
+    for r in &rows {
+        let text = |n: &str| match at(n).and_then(|i| r.values.get(i)) {
+            Some(fire_crab_ods::format::Value::Text(t)) => Some(t.trim_end().to_string()),
+            _ => None,
+        };
+        let int = |n: &str| match at(n).and_then(|i| r.values.get(i)) {
+            Some(fire_crab_ods::format::Value::Int(v)) => Some(*v),
+            _ => None,
+        };
+        let Some(grantor) = text("RDB$GRANTOR") else { continue };
+        let (Some(user), Some(privilege), Some(object)) = (text("RDB$USER"), text("RDB$PRIVILEGE"), text("RDB$RELATION_NAME")) else { continue };
+        out.push(UPrivilege {
+            user,
+            grantor,
+            privilege,
+            grant_option: int("RDB$GRANT_OPTION"),
+            schema: text("RDB$RELATION_SCHEMA_NAME"),
+            object,
+            field: text("RDB$FIELD_NAME"),
+            user_type: int("RDB$USER_TYPE").unwrap_or(8),
+            object_type: int("RDB$OBJECT_TYPE").unwrap_or(0),
+        });
+    }
+    out
+}
+
+/// RDB$SCHEMAS: a schema's security class and owner.
+fn schema_class_owner(image: &fire_crab_ods::Image, page_size: usize, schema: &str) -> (Option<String>, Option<String>) {
+    let Some((cols, rows)) = sys_rows(image, page_size, "RDB$SCHEMAS") else { return (None, None) };
+    let at = |n: &str| cols.iter().find(|(c, _)| c.eq_ignore_ascii_case(n)).map(|(_, i)| *i);
+    for r in &rows {
+        let text = |n: &str| match at(n).and_then(|i| r.values.get(i)) {
+            Some(fire_crab_ods::format::Value::Text(t)) => Some(t.trim_end().to_string()),
+            _ => None,
+        };
+        if text("RDB$SCHEMA_NAME").as_deref() == Some(schema) {
+            return (text("RDB$SECURITY_CLASS"), text("RDB$OWNER_NAME"));
+        }
+    }
+    (None, None)
+}
+
+/// RDB$SECURITY_CLASS and RDB$OWNER_NAME of one row of a system table,
+/// found by its name column.
+fn table_class_owner(
+    image: &fire_crab_ods::Image,
+    page_size: usize,
+    table: &str,
+    name_col: &str,
+    name: &str,
+) -> (Option<String>, Option<String>) {
+    let Some((cols, rows)) = sys_rows(image, page_size, table) else { return (None, None) };
+    let at = |n: &str| cols.iter().find(|(c, _)| c.eq_ignore_ascii_case(n)).map(|(_, i)| *i);
+    for r in &rows {
+        let text = |n: &str| match at(n).and_then(|i| r.values.get(i)) {
+            Some(fire_crab_ods::format::Value::Text(t)) => Some(t.trim_end().to_string()),
+            _ => None,
+        };
+        if text(name_col).as_deref() == Some(name) {
+            return (text("RDB$SECURITY_CLASS"), text("RDB$OWNER_NAME"));
+        }
+    }
+    (None, None)
+}
+
+/// The RDB$FIELD_SOURCE a column points at, as stored (a named domain or
+/// the engine's RDB$n).
+fn orig_source_name(image: &fire_crab_ods::Image, page_size: usize, rel: &str, col: &str) -> String {
+    column_source_of(image, page_size, rel, col).unwrap_or_default()
+}
+
+/// Per column of a relation: the column-level DEFAULT (BLR, NUL-terminated
+/// source) and the update flag, from RDB$RELATION_FIELDS.
+struct ColMeta {
+    name: String,
+    default: Option<(Vec<u8>, Vec<u8>)>,
+    update_flag: i32,
+}
+
+fn relation_field_meta(image: &fire_crab_ods::Image, page_size: usize, rel: &str) -> Vec<ColMeta> {
+    let mut out = Vec::new();
+    let Some((cols, rows)) = sys_rows(image, page_size, "RDB$RELATION_FIELDS") else { return out };
+    let Some(rfrel) = fire_crab_ods::resolve_relation(image, page_size, "RDB$RELATION_FIELDS") else { return out };
+    let at = |n: &str| cols.iter().find(|(c, _)| c.eq_ignore_ascii_case(n)).map(|(_, i)| *i);
+    for r in &rows {
+        let text = |n: &str| match at(n).and_then(|i| r.values.get(i)) {
+            Some(fire_crab_ods::format::Value::Text(t)) => Some(t.trim_end().to_string()),
+            _ => None,
+        };
+        if text("RDB$RELATION_NAME").as_deref() != Some(rel) {
+            continue;
+        }
+        let Some(name) = text("RDB$FIELD_NAME") else { continue };
+        let blob = |n: &str, nul: bool| -> Option<Vec<u8>> {
+            match at(n).and_then(|i| r.values.get(i)) {
+                Some(fire_crab_ods::format::Value::Blob(_, num)) => {
+                    fire_crab_blb::read_blob_content(image, page_size, rfrel, *num).map(|mut d| {
+                        if nul {
+                            d.push(0);
+                        }
+                        d
+                    })
+                }
+                _ => None,
+            }
+        };
+        let default = blob("RDB$DEFAULT_VALUE", false).map(|b| (b, blob("RDB$DEFAULT_SOURCE", true).unwrap_or_default()));
+        let update_flag = match at("RDB$UPDATE_FLAG").and_then(|i| r.values.get(i)) {
+            Some(fire_crab_ods::format::Value::Int(v)) => *v as i32,
+            _ => 1,
+        };
+        out.push(ColMeta { name, default, update_flag });
+    }
+    out
 }
 
 /// XDR-encode one row (canonical.cpp seen from its output): values in
@@ -172,6 +528,9 @@ fn xdr_row(image: &[u8], cols: &[Col], nulls_at: usize) -> Option<Vec<u8>> {
         image.get(nulls_at + bit / 8).is_some_and(|b| b & (1 << (bit % 8)) != 0)
     };
     for c in cols.iter() {
+        if c.computed {
+            continue; // no bytes: gbak's message leaves a computed field out
+        }
         let off = c.desc.offset as usize;
         let is_null = null(c.bitmap_bit);
         match c.desc.dtype {
@@ -223,7 +582,43 @@ fn xdr_row(image: &[u8], cols: &[Col], nulls_at: usize) -> Option<Vec<u8>> {
                 }
                 out.extend(std::iter::repeat(0u8).take((4 - n % 4) % 4));
             }
-            dtype::BLOB => {
+            // the wider scalar types, canonical XDR (common/xdr.cpp
+            // xdr_datum): 4-byte and 8-byte quantities big-endian, a
+            // timestamp as its two longs, a boolean as one opaque byte
+            // padded to four
+            dtype::REAL | dtype::SQL_DATE | dtype::SQL_TIME => {
+                let v = if is_null || image.len() < off + 4 {
+                    0
+                } else {
+                    u32::from_le_bytes(image[off..off + 4].try_into().ok()?)
+                };
+                out.extend_from_slice(&v.to_be_bytes());
+            }
+            dtype::DOUBLE => {
+                let v = if is_null || image.len() < off + 8 {
+                    0
+                } else {
+                    u64::from_le_bytes(image[off..off + 8].try_into().ok()?)
+                };
+                out.extend_from_slice(&v.to_be_bytes());
+            }
+            dtype::TIMESTAMP => {
+                let (d, t) = if is_null || image.len() < off + 8 {
+                    (0u32, 0u32)
+                } else {
+                    (
+                        u32::from_le_bytes(image[off..off + 4].try_into().ok()?),
+                        u32::from_le_bytes(image[off + 4..off + 8].try_into().ok()?),
+                    )
+                };
+                out.extend_from_slice(&d.to_be_bytes());
+                out.extend_from_slice(&t.to_be_bytes());
+            }
+            dtype::BOOLEAN => {
+                let v = if is_null || image.len() < off + 1 { 0 } else { image[off] };
+                out.extend_from_slice(&[v, 0, 0, 0]);
+            }
+            dtype::BLOB | dtype::ARRAY => {
                 // the QUAD, canonicalized as two big-endian longs of its
                 // two stored little-endian words - measured: the first
                 // blob of relation 128 rides as 00000080 00000000
@@ -242,6 +637,9 @@ fn xdr_row(image: &[u8], cols: &[Col], nulls_at: usize) -> Option<Vec<u8>> {
         }
     }
     for c in cols.iter() {
+        if c.computed {
+            continue;
+        }
         let flag: u32 = if null(c.bitmap_bit) { 0xffff_ffff } else { 0 };
         out.extend_from_slice(&flag.to_be_bytes());
     }
@@ -436,9 +834,22 @@ pub fn write_backup_verbose(
     // --- rec_schema: PUBLIC ----------------------------------------------
     log.push("gbak:writing schemas".into());
     log.push("gbak:writing schema \"PUBLIC\"".into());
-    Rec::new(&mut out, rec::SCHEMA).text(1, "PUBLIC").end();
+    {
+        // att 5 the schema's security class, att 6 its owner (measured on
+        // the engine's stream: `PUBLIC SQL$249 SYSDBA`)
+        let (sclass, sowner) = schema_class_owner(image, page_size, "PUBLIC");
+        let mut sr = Rec::new(&mut out, rec::SCHEMA).text(1, "PUBLIC");
+        if let Some(c) = &sclass {
+            sr = sr.text(5, c);
+        }
+        if let Some(o) = &sowner {
+            sr = sr.text(6, o);
+        }
+        sr.end();
+    }
 
     // --- the relations' columns, and their invented domains --------------
+    let field_cats = read_field_cats(image, page_size);
     let mut rel_cols: Vec<(u16, String, Vec<Col>)> = Vec::new();
     let mut next_source = 1usize;
     for (id, name) in &user_rels {
@@ -458,9 +869,28 @@ pub fn write_backup_verbose(
             )));
         }
         let not_nulls = not_null_columns(image, page_size, name);
+        let col_meta = relation_field_meta(image, page_size, name);
         let mut cols = Vec::new();
-        for (i, d) in descs.iter().enumerate() {
-            if rdb_field_type(d).is_none() {
+        // THE DESCRIPTOR IS THE COLUMN'S FIELD ID, NOT ITS POSITION: a
+        // gbak-restored table numbers its fields in restore order
+        // (PROJ_DEPT_BUDGET: FISCAL_YEAR is position 0, field id 1;
+        // PROJECTED_BUDGET position 4, field id 0), so a walk that paired
+        // the i-th name with the i-th descriptor read the wrong type
+        for (i, nm) in names.iter().enumerate() {
+            let fid = nm.field_id as usize;
+            let d = descs.get(fid).ok_or_else(|| {
+                Refused(format!("relation {}: column {} has field id {} beyond its format", name, nm.name, fid))
+            })?;
+            // an ARRAY column rides as its element type plus dimensions
+            // (gbak's fld_type / fld_dimensions / fld_ranges)
+            let array = if d.dtype == dtype::ARRAY {
+                Some(fire_crab_ods::ddl::array_shape(image, page_size, name, &names[i].name).ok_or_else(|| {
+                    Refused(format!("relation {}: array column {} has no shape in the catalog", name, names[i].name))
+                })?)
+            } else {
+                None
+            };
+            if rdb_field_type(d).is_none() && array.is_none() {
                 return Err(Refused(format!(
                     "relation {}: column {} has a type outside this backup's surface",
                     name, names[i].name
@@ -477,13 +907,20 @@ pub fn write_backup_verbose(
                     (s, false)
                 }
             };
+            let computed = d.offset == 0 && d.length != 0;
+            let meta = col_meta.iter().find(|m| m.name == names[i].name);
             cols.push(Col {
+                array,
+                cat: field_cats.get(&orig_source_name(image, page_size, name, &names[i].name)).cloned(),
+                col_default: meta.and_then(|m| m.default.clone()),
+                computed,
+                update_flag: meta.map(|m| m.update_flag).unwrap_or(1),
                 name: names[i].name.clone(),
                 // the field id follows CREATION order - the reference
                 // file's ID column keeps id 1 though its record comes
                 // after the blobs'
-                field_id: (i + 1) as i32,
-                bitmap_bit: i,
+                field_id: (fid + 1) as i32,
+                bitmap_bit: fid,
                 source,
                 named_domain,
                 position: names[i].position,
@@ -546,8 +983,12 @@ pub fn write_backup_verbose(
             .text(1, &nd.name)
             .int(8, nd.field_type as i32)
             .int(10, nd.length as i32)
-            .int(9, nd.scale as i32)
-            .int(11, nd.sub_type as i32);
+            // att 9 is RDB$FIELD_SUB_TYPE and att 11 RDB$FIELD_SCALE (burp.h:
+            // type 8, sub_type 9, length 10, scale 11) - the two rode
+            // swapped for a long time, which is how every NUMERIC restored
+            // as a plain BIGINT
+            .int(9, nd.sub_type as i32)
+            .int(11, nd.scale as i32);
         if nd.not_null {
             r = r.int(38, 1);
         }
@@ -566,75 +1007,111 @@ pub fn write_backup_verbose(
         if let Some(d) = &nd.desc {
             r = r.blob(35, d);
         }
-        if matches!(nd.field_type, 14 | 37) {
+        let r = if matches!(nd.field_type, 14 | 37) {
             r.int(41, nd.char_len.unwrap_or(nd.length) as i32)
                 .int(42, 0)
                 .int(43, 0)
-                .end();
         } else {
-            r.int(44, nd.precision.unwrap_or(0) as i32).end();
-        }
+            r.int(44, nd.precision.unwrap_or(0) as i32)
+        };
+        // att_field_security_class 25 (`19 07 SQL$470`) then the owner:
+        // a named domain without its class is one the engine's restore
+        // grants USAGE on to PUBLIC in "adding missing privileges"
+        let r = match table_class_owner(image, page_size, "RDB$FIELDS", "RDB$FIELD_NAME", &nd.name).0 {
+            Some(c) => r.text(25, &c),
+            None => r,
+        };
+        r.text(45, OWNER_NAME).end();
     }
-    for (_, _, cols) in &rel_cols {
-        for c in cols {
-            if c.named_domain {
-                continue; // its domain rode above, once, by name
-            }
+    // the engine walks RDB$FIELDS in physical row order (`FOR X IN
+    // RDB$FIELDS WITH X.RDB$SYSTEM_FLAG NE 1`), and the restore hands each
+    // record without a class a fresh SQL$n in arrival order - so the
+    // invented domains ride in catalog row order, not table-then-column
+    // order (RDB$2/RDB$3 and RDB$10/RDB$11 swapped classes under the latter)
+    let field_row_order: std::collections::HashMap<String, usize> = sys_rows(image, page_size, "RDB$FIELDS")
+        .map(|(cols, rows)| {
+            let at = cols.iter().find(|(c, _)| c.eq_ignore_ascii_case("RDB$FIELD_NAME")).map(|(_, i)| *i);
+            rows.iter()
+                .enumerate()
+                .filter_map(|(i, r)| text_opt(r, at).map(|n| (n, i)))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut invented: Vec<&Col> = rel_cols
+        .iter()
+        .flat_map(|(_, _, cols)| cols.iter())
+        .filter(|c| !c.named_domain)
+        .collect();
+    invented.sort_by_key(|c| field_row_order.get(&c.source).copied().unwrap_or(usize::MAX));
+    {
+        for c in invented {
             log.push(format!("gbak:    writing domain \"PUBLIC\".\"{}\"", c.source));
-            let t = rdb_field_type(&c.desc).unwrap();
-            // FOR A BLOB THE SCALE SLOT (att 9) CARRIES THE SUB_TYPE -
-            // measured: the TEXT blob's records say 9=1 where the
-            // binary one's say 9=0, and the scale is meaningless for a
-            // quad. att 12 is the segment length (the engine snapshots
-            // its default 80).
-            //
-            // RECORDED, NOT FIXED (2026-09-03): att 9 is in fact
-            // RDB$FIELD_SUB_TYPE for EVERY type and att 11 is
-            // RDB$FIELD_SCALE - the blob half of the reading above is
-            // right for the wrong reason. Parsed out of the ENGINE's own
-            // .fbk for a nine-column table: `DECIMAL(9,3)` writes
-            // `(9,2) (11,-3) (44,9)`, `NUMERIC(4,1)` writes
-            // `(9,1) (11,-1) (44,4)`, `BLOB SUB_TYPE 1` writes
-            // `(9,1) (11,0)`, and INTEGER/CHAR/VARCHAR all write
-            // `(9,0) (11,0)`. So every scaled column this writer emits
-            // restores with the scale LOST: measured, a `NUMERIC(9,2)`
-            // holding `700.00` comes back out of a REAL `gbak -c` as an
-            // INTEGER holding `70000`. Writing 9/11/44 correctly needs
-            // the NUMERIC-vs-DECIMAL marker and the declared PRECISION,
-            // and the ODS descriptor carries neither - it is a catalog
-            // read this writer does not do, plus the matching change in
-            // [read_backup] and in the restore's column builder. It is
-            // recorded in docs/roadmap.md with this measurement, and it
-            // is INDEPENDENT of the record format: it is wrong on a
-            // database that was never ALTERed at all.
-            let att9 = if c.desc.dtype == dtype::BLOB {
-                c.desc.sub_type as i32
-            } else {
-                c.desc.scale as i32
-            };
-            let r = Rec::new(&mut out, rec::GLOBAL_FIELD)
+            let (t, dlen, dsub, dscale, text_like) = col_catalog_type(c);
+            let cat = c.cat.as_ref();
+            let is_blob = c.desc.dtype == dtype::BLOB;
+            // att 9 RDB$FIELD_SUB_TYPE as the catalog stores it (NUMERIC 1 /
+            // DECIMAL 2 on an exact numeric, a blob's 0/1, else 0), att 11
+            // RDB$FIELD_SCALE
+            let sub9 = if is_blob { dsub } else { cat.and_then(|k| k.sub_type).map(|v| v as i32).unwrap_or(dsub) };
+            let mut r = Rec::new(&mut out, rec::GLOBAL_FIELD)
                 .text(48, "PUBLIC")
                 .text(1, &c.source)
                 .int(8, t)
-                .int(10, c.desc.length as i32)
-                .int(9, att9)
-                .int(11, 0);
-            match c.desc.dtype {
-                dtype::VARYING | dtype::TEXT => r
-                    .int(41, c.desc.length as i32) // character length (NONE: 1 byte/char)
-                    .int(42, 0) // character set NONE
-                    .int(43, 0) // collation
-                    .end(),
-                dtype::BLOB if c.desc.sub_type == 1 => {
-                    r.int(12, 80).int(42, 0).int(43, 0).end()
+                .int(10, dlen)
+                .int(9, sub9)
+                .int(11, dscale);
+            // a COMPUTED BY column: its expression (att_field_computed_blr 18,
+            // att_field_computed_source2 37) rides on the domain
+            if let Some((blr, src)) = cat.and_then(|k| k.computed.as_ref()) {
+                r = r.blob(18, blr);
+                if !src.is_empty() {
+                    r = r.blob(37, src);
                 }
-                dtype::BLOB => r.int(12, 80).end(),
-                _ => r.int(44, 0).end(),
             }
+            if is_blob {
+                r = r.int(12, cat.and_then(|k| k.segment_length).map(|v| v as i32).unwrap_or(80));
+            }
+            // an array domain carries its dimension count (att_field_dimensions
+            // 29) - gbak's write_global_fields order (RDB$DIMENSIONS before
+            // NULL_FLAG / CHARACTER_LENGTH)
+            if let Some(sh) = &c.array {
+                r = r.int(29, sh.dims.len() as i32);
+            }
+            // then, each only when the catalog has it (gbak: `if
+            // (!X.<col>.NULL)`): character length, charset, collation,
+            // precision
+            let text_kind = matches!(c.desc.dtype, dtype::VARYING | dtype::TEXT) || (c.desc.dtype == dtype::ARRAY && text_like);
+            if text_kind {
+                r = r.int(41, cat.and_then(|k| k.char_len).map(|v| v as i32).unwrap_or(dlen));
+            }
+            if let Some(cs) = cat.and_then(|k| k.charset) {
+                r = r.int(42, cs as i32);
+            } else if text_kind || (is_blob && c.desc.sub_type == 1) {
+                r = r.int(42, 0);
+            }
+            if let Some(co) = cat.and_then(|k| k.collation) {
+                r = r.int(43, co as i32);
+            } else if text_kind || (is_blob && c.desc.sub_type == 1) {
+                r = r.int(43, 0);
+            }
+            match cat {
+                Some(k) => {
+                    if let Some(pr) = k.precision {
+                        r = r.int(44, pr as i32);
+                    }
+                }
+                None => {
+                    if !text_kind && !is_blob {
+                        r = r.int(44, 0);
+                    }
+                }
+            }
+            r.text(45, OWNER_NAME).end();
         }
     }
 
     // ... and one per procedure parameter, the same record family
+    let param_cats = read_field_cats(image, page_size);
     for pr in &procedures {
         for pp in &pr.params {
             let dom = param_domains
@@ -643,14 +1120,41 @@ pub fn write_backup_verbose(
                 .map(|(_, _, d)| d.clone())
                 .unwrap_or_default();
             log.push(format!("gbak:    writing domain \"PUBLIC\".\"{}\"", dom));
-            Rec::new(&mut out, rec::GLOBAL_FIELD)
+            let mut r = Rec::new(&mut out, rec::GLOBAL_FIELD)
                 .text(48, "PUBLIC")
                 .text(1, &dom)
                 .int(8, pp.field_type as i32)
                 .int(10, pp.length as i32)
-                .int(9, pp.scale as i32)
-                .int(44, 0)
-                .end();
+                .int(9, pp.sub_type as i32)
+                .int(11, pp.scale as i32);
+            // 41 character length, 42 charset, 43 collation, 44 precision -
+            // each only where RDB$FIELDS has it (a CHAR(5) parameter's
+            // record reads `41 5, 42 0, 45 SYSDBA`: no collation, no
+            // precision; a NUMERIC's reads `44 12`)
+            match param_cats.get(&pp.source) {
+                Some(k) => {
+                    if let Some(v) = k.char_len {
+                        r = r.int(41, v as i32);
+                    }
+                    if let Some(v) = k.charset {
+                        r = r.int(42, v as i32);
+                    }
+                    if let Some(v) = k.collation {
+                        r = r.int(43, v as i32);
+                    }
+                    if let Some(v) = k.precision {
+                        r = r.int(44, v as i32);
+                    }
+                }
+                None => {
+                    if matches!(pp.field_type, 14 | 37) {
+                        r = r.int(41, pp.length as i32).int(42, 0);
+                    } else {
+                        r = r.int(44, pp.precision.unwrap_or(0) as i32);
+                    }
+                }
+            }
+            r.text(45, OWNER_NAME).end();
         }
     }
 
@@ -673,12 +1177,12 @@ pub fn write_backup_verbose(
                 .text(1, &dom)
                 .int(8, a.field_type as i32)
                 .int(10, a.length as i32)
-                .int(9, a.scale as i32)
-                .int(11, 0);
+                .int(9, 0)
+                .int(11, a.scale as i32);
             if a.field_type == 37 || a.field_type == 14 {
-                r.int(41, a.length as i32).int(42, 0).int(43, 0).end()
+                r.int(41, a.length as i32).int(42, 0).int(43, 0).text(45, OWNER_NAME).end()
             } else {
-                r.int(44, 0).end()
+                r.int(44, 0).text(45, OWNER_NAME).end()
             }
         }
     }
@@ -696,20 +1200,43 @@ pub fn write_backup_verbose(
                 .text(1, &f.source)
                 .int(8, f.ftype)
                 .int(10, f.length)
-                .int(9, f.scale)
-                .int(11, f.sub_type);
+                .int(9, f.sub_type)
+                .int(11, f.scale);
             if let Some(cb) = &f.computed_blr {
                 r = r.blob(18, cb);
             }
             if f.ftype == 37 || f.ftype == 14 {
-                r.int(41, f.length).int(42, 0).int(43, 0).end()
+                r.int(41, f.length).int(42, 0).int(43, 0).text(45, OWNER_NAME).end()
             } else {
-                r.int(44, f.precision.unwrap_or(0) as i32).end()
+                r.int(44, f.precision.unwrap_or(0) as i32).text(45, OWNER_NAME).end()
             }
         }
     }
 
     // --- per relation: rec_relation + fields + end -----------------------
+    // RDB$FIELD_DIMENSIONS, one record per dimension of each array domain,
+    // right after the global fields (gbak's write_field_dimensions; no
+    // verbose line of its own)
+    for (_, _, cols) in &rel_cols {
+        let mut by_pos: Vec<&Col> = cols.iter().filter(|c| c.array.is_some()).collect();
+        by_pos.sort_by_key(|c| c.position);
+        for c in by_pos {
+            if let Some(sh) = &c.array {
+                for (i, (lo, hi)) in sh.dims.iter().enumerate() {
+                    // the schema attribute leads (measured: `18 30 06 PUBLIC 01 05
+                    // RDB$4 1d.. 20.. 21..`) - without it the restored row has
+                    // no RDB$SCHEMA_NAME and the extractor prints `[]`
+                    Rec::new(&mut out, rec::FIELD_DIMENSIONS)
+                        .text(48, "PUBLIC")
+                        .text(1, &c.source)
+                        .int(29, i as i32) // RDB$DIMENSION counts from 0
+                        .int(32, *lo) // att_field_range_low
+                        .int(33, *hi) // att_field_range_high
+                        .end();
+                }
+            }
+        }
+    }
     log.push("gbak:writing shadow files".into());
     for (path, shadow, flags) in read_shadow_files(image, page_size)? {
         log.push(format!("gbak:    writing shadow file \"{}\"", path));
@@ -725,7 +1252,90 @@ pub fn write_backup_verbose(
     log.push("gbak:writing character sets".into());
     log.push("gbak:writing collations".into());
     log.push("gbak:writing tables".into());
-    for (_, name, cols) in &rel_cols {
+    // ONE PASS IN CATALOG ORDER, views in place: gbak's write_relations
+    // walks RDB$RELATIONS and writes a view where it finds it, so a
+    // view created between two tables restores between them (measured:
+    // PHONE_LIST is relation 132 in the engine's restore of this
+    // database, PROJECT 133 - the previous tables-then-views order
+    // shifted every id after it)
+    for (rid, rname, is_view, _) in &all_rels {
+        if *is_view {
+            let Some(v) = views.iter().find(|v| &v.name == rname) else { continue };
+            log.push(format!("gbak:    writing view \"PUBLIC\".\"{}\"", v.name));
+            // measured order on the engine's view record: 21 1 2 16 8 14 12 18
+            // - the security class rides after the flags, the owner after
+            // the source
+            let (vclass, vowner) = table_class_owner(image, page_size, "RDB$RELATIONS", "RDB$RELATION_NAME", &v.name);
+            let mut vr = Rec::new(&mut out, rec::RELATION)
+                .text(21, "PUBLIC")
+                .text(1, &v.name)
+                .blob(2, &v.blr)
+                .int(16, 1);
+            if let Some(c) = &vclass {
+                vr = vr.text(8, c);
+            }
+            vr = vr.blob(14, &v.source);
+            if let Some(o) = &vowner {
+                vr = vr.text(12, o);
+            }
+            vr = vr.int(18, 1); // relation type: view
+            if let Some(d) = catalog_description(
+                image,
+                page_size,
+                "RDB$RELATIONS",
+                &[("RDB$RELATION_NAME", &v.name)],
+            ) {
+                vr = vr.blob(13, &d);
+            }
+            vr.end();
+            for (i, f) in v.fields.iter().enumerate() {
+                log.push(format!("gbak:         writing column \"{}\"", f.name));
+                let r = Rec::new(&mut out, rec::FIELD)
+                    .text(1, &f.name)
+                    .text(48, "PUBLIC")
+                    .text(2, &f.source)
+                    .int(13, f.position as i32)
+                    .int(8, f.ftype)
+                    .int(10, f.length)
+                    .int(9, 0)
+                    .int(11, f.scale)
+                    // att_field_number - what the restore derives the
+                    // relation's RDB$FIELD_ID from; without it the field
+                    // vector sizes to ZERO and every column vanishes
+                    .int(22, (i + 1) as i32);
+                let r = match catalog_description(
+                    image,
+                    page_size,
+                    "RDB$RELATION_FIELDS",
+                    &[("RDB$RELATION_NAME", &v.name), ("RDB$FIELD_NAME", &f.name)],
+                ) {
+                    Some(d) => r.blob(35, &d),
+                    None => r,
+                };
+                if f.base_field.is_empty() {
+                    // an EXPRESSION column, the measured shape: read-only,
+                    // context 0, computed_flag 1, and NO base-field att
+                    r.int(34, 0).int(4, 0).int(23, 1).end();
+                } else {
+                    r.int(34, 1) // att_field_update_flag
+                        .int(4, f.view_context as i32) // att_view_context
+                        .text(3, &f.base_field)
+                        .end();
+                }
+            }
+            for (rel, ctx, cname) in &v.contexts {
+                Rec::new(&mut out, rec::VIEW)
+                    .text(20, "PUBLIC")
+                    .text(8, rel)
+                    .int(9, *ctx as i32)
+                    .text(10, cname)
+                    .int(11, 0)
+                    .end();
+            }
+            out.push(rec::RELATION_END);
+            continue;
+        }
+        let Some((_, name, cols)) = rel_cols.iter().find(|(id, ..)| id == rid) else { continue };
         log.push(format!("gbak:    writing table \"PUBLIC\".\"{}\"", name));
         for c in cols.iter() {
             log.push(format!("gbak:         writing column \"{}\"", c.name));
@@ -739,6 +1349,17 @@ pub fn write_backup_verbose(
             .text(21, "PUBLIC")
             .text(1, name)
             .int(16, 1); // att_relation_flags (pinned from the reference file)
+        // att_relation_security_class 8 and att_relation_owner_name 12
+        // (`08 07 SQL$565 0c 06 SYSDBA` on the engine's record) - without
+        // them the restore hands the table a fresh SQL$DEFAULTn class, and
+        // two tables' default classes swapped on the restored sample
+        let (rclass, rowner) = table_class_owner(image, page_size, "RDB$RELATIONS", "RDB$RELATION_NAME", name);
+        if let Some(c) = &rclass {
+            r = r.text(8, c);
+        }
+        if let Some(o) = &rowner {
+            r = r.text(12, o);
+        }
         if rtype == 2 {
             // the EXTERNAL FILE path verbatim (att 17, measured
             // between owner and type on a real record)
@@ -771,18 +1392,22 @@ pub fn write_backup_verbose(
             } else {
                 c.desc.scale as i32
             };
+            let (lt, llen, lsub, lscale, ltext) = col_catalog_type(c);
+            let _ = att9;
+            let is_blob = c.desc.dtype == dtype::BLOB;
+            let lsub = if is_blob { lsub } else { c.cat.as_ref().and_then(|k| k.sub_type).map(|v| v as i32).unwrap_or(lsub) };
             let mut r = Rec::new(&mut out, rec::FIELD)
                 .text(1, &c.name)
                 .text(48, "PUBLIC")
                 .text(2, &c.source)
                 .int(13, c.position as i32)
-                .int(8, rdb_field_type(&c.desc).unwrap())
-                .int(10, c.desc.length as i32)
-                .int(9, att9)
-                .int(11, 0)
+                .int(8, lt)
+                .int(10, llen)
+                .int(9, lsub)
+                .int(11, lscale)
                 .int(22, c.field_id)
                 .int(24, 0)
-                .int(34, 1);
+                .int(34, c.update_flag);
             if c.not_null {
                 // att 38 - the field-level NULL_FLAG the reference file
                 // carries on its NOT NULL column
@@ -796,11 +1421,33 @@ pub fn write_backup_verbose(
             ) {
                 r = r.blob(35, &d); // att_field_description2
             }
-            match c.desc.dtype {
-                dtype::VARYING | dtype::TEXT => r.int(42, 0).int(43, 0).end(),
-                dtype::BLOB if c.desc.sub_type == 1 => r.int(42, 0).int(43, 0).end(),
-                _ => r.int(43, 0).end(),
+            let mut r = match c.desc.dtype {
+                dtype::VARYING | dtype::TEXT => r.int(42, 0).int(43, 0),
+                dtype::ARRAY if ltext => r.int(42, 0).int(43, 0),
+                dtype::BLOB if c.desc.sub_type == 1 => r.int(42, 0).int(43, 0),
+                _ => r.int(43, 0),
+            };
+            // a COLUMN-level DEFAULT: its BLR (att_field_default_value 15)
+            // and source (att_field_default_source 39)
+            if let Some((blr, src)) = &c.col_default {
+                r = r.blob(15, blr);
+                if !src.is_empty() {
+                    r = r.blob(39, src);
+                }
             }
+            // a computed column is flagged (att_field_computed_flag 23)
+            if c.computed {
+                r = r.int(23, 1);
+            }
+            // an array field: its dimension count and per-dimension bounds
+            // (gbak's FLD_array block, after the character set)
+            if let Some(sh) = &c.array {
+                r = r.int(29, sh.dims.len() as i32);
+                for (lo, hi) in &sh.dims {
+                    r = r.int(32, *lo).int(33, *hi); // att_field_range_low / _high
+                }
+            }
+            r.end();
         }
         out.push(rec::RELATION_END);
     }
@@ -808,69 +1455,6 @@ pub fn write_backup_verbose(
     // --- the VIEWS: relation records with the two blobs, their fields
     // referencing the BASE columns' domains (or the expression
     // domains minted above), and the context records
-    for v in &views {
-        log.push(format!("gbak:    writing view \"PUBLIC\".\"{}\"", v.name));
-        let mut vr = Rec::new(&mut out, rec::RELATION)
-            .text(21, "PUBLIC")
-            .text(1, &v.name)
-            .blob(2, &v.blr)
-            .int(16, 1)
-            .blob(14, &v.source)
-            .int(18, 1); // relation type: view
-        if let Some(d) = catalog_description(
-            image,
-            page_size,
-            "RDB$RELATIONS",
-            &[("RDB$RELATION_NAME", &v.name)],
-        ) {
-            vr = vr.blob(13, &d);
-        }
-        vr.end();
-        for (i, f) in v.fields.iter().enumerate() {
-            log.push(format!("gbak:         writing column \"{}\"", f.name));
-            let r = Rec::new(&mut out, rec::FIELD)
-                .text(1, &f.name)
-                .text(48, "PUBLIC")
-                .text(2, &f.source)
-                .int(13, f.position as i32)
-                .int(8, f.ftype)
-                .int(10, f.length)
-                .int(9, f.scale)
-                // att_field_number - what the restore derives the
-                // relation's RDB$FIELD_ID from; without it the field
-                // vector sizes to ZERO and every column vanishes
-                .int(22, (i + 1) as i32);
-            let r = match catalog_description(
-                image,
-                page_size,
-                "RDB$RELATION_FIELDS",
-                &[("RDB$RELATION_NAME", &v.name), ("RDB$FIELD_NAME", &f.name)],
-            ) {
-                Some(d) => r.blob(35, &d),
-                None => r,
-            };
-            if f.base_field.is_empty() {
-                // an EXPRESSION column, the measured shape: read-only,
-                // context 0, computed_flag 1, and NO base-field att
-                r.int(34, 0).int(4, 0).int(23, 1).end();
-            } else {
-                r.int(34, 1) // att_field_update_flag
-                    .int(4, f.view_context as i32) // att_view_context
-                    .text(3, &f.base_field)
-                    .end();
-            }
-        }
-        for (rel, ctx, cname) in &v.contexts {
-            Rec::new(&mut out, rec::VIEW)
-                .text(20, "PUBLIC")
-                .text(8, rel)
-                .int(9, *ctx as i32)
-                .text(10, cname)
-                .int(11, 0)
-                .end();
-        }
-        out.push(rec::RELATION_END);
-    }
 
     // --- per relation: the data ------------------------------------------
     log.push("gbak:writing types".into());
@@ -934,6 +1518,17 @@ pub fn write_backup_verbose(
             .text(8, "PUBLIC")
             .text(1, &name)
             .text(2, &msg);
+        // att_exception_security_class 6 / att_exception_owner_name 7 -
+        // without an owner the engine's restore treats the exception as
+        // ownerless and grants USAGE to PUBLIC in its "adding missing
+        // privileges" phase, a grant the original file never had
+        let (xclass, xowner) = table_class_owner(image, page_size, "RDB$EXCEPTIONS", "RDB$EXCEPTION_NAME", &name);
+        if let Some(c) = xclass {
+            r = r.text(6, &c);
+        }
+        if let Some(o) = xowner {
+            r = r.text(7, &o);
+        }
         if let Some(d) = catalog_description(
             image,
             page_size,
@@ -1254,12 +1849,19 @@ pub fn write_backup_verbose(
             }
             r.end();
         }
-        let descs: Vec<Descriptor> = cols.iter().map(|c| c.desc.clone()).collect();
         // every format the relation has ever had, and which of them is
         // the newest - a record written under an older one is re-laid
-        // into `descs` before its bytes are read ([relay_image])
+        // into the CURRENT format in FIELD-ID order before its bytes are
+        // read ([relay_image]). The emitted column order (blobs first,
+        // then position) is not that order: relaying against it permuted
+        // SALES on the restored sample and refused rows that were fine
         let old_formats = fire_crab_ods::relation_formats(image, page_size, *id);
         let newest_format_no = old_formats.iter().map(|(n, _)| *n).max().unwrap_or(0);
+        let descs: Vec<Descriptor> = old_formats
+            .iter()
+            .find(|(n, _)| *n == newest_format_no)
+            .map(|(_, d)| d.clone())
+            .unwrap_or_else(|| cols.iter().map(|c| c.desc.clone()).collect());
         let rows = match tips.as_ref() {
             // THE LIMBO LAW RIDES THE BACKUP TOO: the engine's gbak
             // dies on "record from transaction N is stuck in limbo"
@@ -1378,6 +1980,48 @@ pub fn write_backup_verbose(
                     out.extend_from_slice(seg);
                 }
             }
+            // ARRAYS: a rec_array per non-null array (gbak's put_array):
+            // the field number, the dimension count, per dimension its
+            // bounds, then att_blob_data with the raw slice length and -
+            // the transportable form gbak writes by default - att_xdr_array
+            // with the canonical slice
+            for c in cols.iter() {
+                let Some(sh) = &c.array else { continue };
+                let is_null = img
+                    .get(nulls_at + c.bitmap_bit / 8)
+                    .is_some_and(|b| b & (1 << (c.bitmap_bit % 8)) != 0);
+                let off = c.desc.offset as usize;
+                if is_null || img.len() < off + 8 {
+                    continue;
+                }
+                let rel_word = u16::from_le_bytes([img[off], img[off + 1]]);
+                let recno = ((img[off + 3] as u64) << 32)
+                    | u32::from_le_bytes(img[off + 4..off + 8].try_into().unwrap()) as u64;
+                if rel_word == 0 && recno == 0 {
+                    continue;
+                }
+                let blob = fire_crab_blb::read_blob(image, page_size, rel_word, recno)
+                    .map_err(|e| Refused(format!("relation {}: array {}:{} unreadable: {}", name, rel_word, recno, e)))?;
+                let content = blob.content();
+                let (dims, _elen, data) = array_blob_parts(&content)
+                    .ok_or_else(|| Refused(format!("relation {}: array {} has no slice header", name, c.name)))?;
+                let xdr = xdr_slice(sh, data)
+                    .ok_or_else(|| Refused(format!("relation {}: array {} element type outside the XDR surface", name, c.name)))?;
+                let mut r = Rec::new(&mut out, rec::ARRAY)
+                    .int(3, c.field_id) // att_blob_field_number
+                    .int(14, dims.len() as i32); // att_array_dimensions
+                for (lo, hi) in &dims {
+                    r = r.int(15, *lo).int(16, *hi);
+                }
+                drop(r);
+                out.push(7); // att_blob_data
+                out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+                if !data.is_empty() {
+                    out.push(18); // att_xdr_array
+                    out.extend_from_slice(&(xdr.len() as u32).to_le_bytes());
+                    out.extend_from_slice(&xdr);
+                }
+            }
         }
         log.push(format!("gbak:{} records written", rows.len()));
         out.push(rec::RELATION_END);
@@ -1419,6 +2063,30 @@ pub fn write_backup_verbose(
         r.end();
     }
     log.push("gbak:writing trigger messages".into());
+    // --- rec_user_privilege: every RDB$USER_PRIVILEGES row with a grantor,
+    // in catalog order (gbak's write_user_privileges, between the trigger
+    // messages and the security classes). Measured record: user (1),
+    // grantor (2), privilege (3), grant option (4) when not null, the
+    // object's schema (10), the object (5), the field (6) when not null,
+    // user type (7), object type (8).
+    for pr in read_user_privileges(image, page_size) {
+        log.push(format!("gbak:    writing privilege for user \"{}\"", pr.user));
+        let mut r = Rec::new(&mut out, rec::USER_PRIVILEGE)
+            .text(1, &pr.user)
+            .text(2, &pr.grantor)
+            .text(3, &pr.privilege);
+        if let Some(g) = pr.grant_option {
+            r = r.int(4, g as i32);
+        }
+        if let Some(sch) = &pr.schema {
+            r = r.text(10, sch);
+        }
+        r = r.text(5, &pr.object);
+        if let Some(f) = &pr.field {
+            r = r.text(6, f);
+        }
+        r.int(7, pr.user_type as i32).int(8, pr.object_type as i32).end();
+    }
     log.push("gbak:writing security classes".into());
     log.push("gbak:writing table constraints".into());
     // --- the table constraints, in CATALOG ROW ORDER (the engine's own
@@ -2212,6 +2880,11 @@ struct UProcParam {
     length: i64,
     scale: i64,
     sub_type: i64,
+    /// RDB$FIELD_PRECISION of the parameter's domain (None where NULL)
+    precision: Option<i64>,
+    /// RDB$FIELD_SOURCE as stored - the catalog row the parameter's
+    /// attributes come from (the WRITTEN domain name is renumbered)
+    source: String,
     /// DEFAULT: (value BLR, NUL-terminated `= 7` source) - dropping it
     /// silently would change every argument-less call after a restore
     default: Option<(Vec<u8>, Vec<u8>)>,
@@ -2511,6 +3184,8 @@ fn read_procedures(
                 length: f.1,
                 scale: f.2,
                 sub_type: f.3,
+                precision: read_field_cats(image, page_size).get(&src).and_then(|k| k.precision),
+                source: src.clone(),
                 default,
             });
         }
@@ -3210,6 +3885,11 @@ mod tests {
         img.extend_from_slice(b"one");
         let cols = vec![
             Col {
+                array: None,
+                cat: None,
+                col_default: None,
+                computed: false,
+                update_flag: 1,
                 name: "ID".into(),
                 field_id: 1,
                 bitmap_bit: 0,
@@ -3220,6 +3900,11 @@ mod tests {
                 not_null: false,
             },
             Col {
+                array: None,
+                cat: None,
+                col_default: None,
+                computed: false,
+                update_flag: 1,
                 name: "V".into(),
                 field_id: 2,
                 bitmap_bit: 1,
@@ -3405,6 +4090,9 @@ pub struct Restored {
     /// privilege records seen and set aside - the count keeps the
     /// omission visible in the trace instead of silent
     pub privileges_skipped: u64,
+    /// the grantee of each privilege record, in stream order - the
+    /// restore narrates one "restoring privilege for user" line per record
+    pub privilege_users: Vec<String>,
 }
 
 /// One restored FOREIGN KEY.
@@ -3735,6 +4423,7 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
         filters: Vec::new(),
         shadows: Vec::new(),
         privileges_skipped: 0,
+        privilege_users: Vec::new(),
     };
     // (schema, source name) -> not-null flag learned from constraints
     let mut current_rel: Option<usize> = None; // index into out.tables (metadata phase)
@@ -5029,8 +5718,10 @@ pub fn read_backup(f: &[u8]) -> Result<Restored, Refused> {
                 // rec_user_privilege: parsed and set aside. GRANTs are
                 // access metadata, not data; the count keeps the
                 // omission visible.
-                let _ = read_atts(f, &mut at)?;
+                let atts = read_atts(f, &mut at)?;
                 out.privileges_skipped += 1;
+                out.privilege_users
+                    .push(att(&atts, 1).map(|a| a.text()).unwrap_or_default());
             }
             rec::END => break,
             other => {

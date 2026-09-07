@@ -6605,8 +6605,8 @@ fn run_gbak_restore_core(
         // fixed phase markers print unconditionally, exactly as the
         // engine prints them over an fbk with nothing in the phase; the
         // per-record lines print per record). One recorded difference:
-        // privileges are SET ASIDE here, so no "restoring privilege"
-        // lines - the gate filters the engine's.
+        // privileges are SET ASIDE here, but each record is still
+        // narrated ("restoring privilege for user"), as the engine does.
         let shell_ps = std::fs::read(&db)
             .ok()
             .and_then(|f| fire_crab_ods::header::HeaderPage::decode(&f).map(|h| h.page_size))
@@ -6646,6 +6646,12 @@ fn run_gbak_restore_core(
             }
             log.push(format!("gbak:restoring data for table \"PUBLIC\".\"{}\"", t.name));
             log.push(format!("gbak:   {} records restored", t.rows.len()));
+        }
+        // the privilege records, one line each in stream order - the
+        // engine narrates them after the last table's data and before
+        // "creating indexes" (the grants themselves are still set aside)
+        for u in &restored.privilege_users {
+            log.push(format!("gbak:    restoring privilege for user \"{}\"", u));
         }
         log.push("gbak:creating indexes".into());
         log.push("gbak:committing metadata".into());
