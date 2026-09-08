@@ -68688,7 +68688,37 @@ impl Expr {
                                 if !scaled.is_finite() {
                                     return Err(EvalErr::ConversionError(None));
                                 }
-                                (scaled.round() as i128, *scale)
+                                // an INT128-backed target: a double past
+                                // the backing range is 22003 (not a
+                                // SATURATED value), and an in-range one
+                                // stores its DECIMAL SIGNIFICANCE - the
+                                // double's shortest round-trip decimal -
+                                // not the exact binary expansion.
+                                // `CAST(1.5e38 AS NUMERIC(38,0))` is
+                                // 1.5x10^38 where `d*10^-scale as i128`
+                                // carried the 1500...006067... low-bit
+                                // noise, and `CAST(1e39 ...)` saturated to
+                                // 2^127-1. The narrower backings (2/4/8)
+                                // overflow at i64 or below, so their
+                                // double source cannot reach a noisy
+                                // in-range value and keeps the direct form.
+                                if *bytes == 16 {
+                                    if scaled.round().abs()
+                                        >= 1.701_411_834_604_692_3e38
+                                    {
+                                        return Err(EvalErr::NumericOutOfRange);
+                                    }
+                                    match text_number(&format!("{:e}", d)) {
+                                        Some(TextNum::Dec { mantissa, exp })
+                                            if i8::try_from(exp).is_ok() =>
+                                        {
+                                            (mantissa, exp as i8)
+                                        }
+                                        _ => (scaled.round() as i128, *scale),
+                                    }
+                                } else {
+                                    (scaled.round() as i128, *scale)
+                                }
                             }
                             other => numeric_parts(other)
                                 .ok_or(EvalErr::ConversionError(None))?,
