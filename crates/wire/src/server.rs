@@ -17907,11 +17907,16 @@ fn temporal_diff_shape(e: &Expr, descs: &[Descriptor]) -> Option<(u8, i16)> {
         return None;
     };
     let timey = |k| matches!(k, TKind::Time | TKind::TimeTz);
-    Some(match (x, y) {
-        (TKind::Date, TKind::Date) => (4, 0),
-        (p, q) if timey(p) && timey(q) => (4, 1),
-        _ => (8, 1),
-    })
+    let tsy = |k| matches!(k, TKind::Timestamp | TKind::TimestampTz);
+    match (x, y) {
+        (TKind::Date, TKind::Date) => Some((4, 0)),
+        (p, q) if timey(p) && timey(q) => Some((4, 1)),
+        (p, q) if tsy(p) && tsy(q) => Some((8, 1)),
+        // a mixed-family difference is refused ([Expr::type_of]); it has
+        // no shape, and this must agree with the type so the rank/width
+        // cascade cannot contradict the seed
+        _ => None,
+    }
 }
 
 fn exact_width_form(bytes: u8) -> (Wire, i32, i32) {
@@ -67008,9 +67013,23 @@ impl Expr {
                             TKind::Time | TKind::TimeTz,
                             TKind::Time | TKind::TimeTz,
                         ) => Some(ExprType::Numeric),
-                        (TKind::Time | TKind::TimeTz, _)
-                        | (_, TKind::Time | TKind::TimeTz) => None,
-                        _ => Some(ExprType::Numeric),
+                        (
+                            TKind::Timestamp | TKind::TimestampTz,
+                            TKind::Timestamp | TKind::TimestampTz,
+                        ) => Some(ExprType::Numeric),
+                        // every OTHER temporal pair is a MIXED family -
+                        // a DATE differenced against a TIMESTAMP (either
+                        // order, zoned or not), or a TIME against
+                        // anything but a TIME. The engine REFUSES it
+                        // ("expression evaluation not supported /
+                        // -Invalid data type in DATE/TIME/TIMESTAMP
+                        // addition or subtraction in add_datettime()")
+                        // where this server used to INVENT a fractional-
+                        // day number (measured: DATE - TIMESTAMP,
+                        // TIMESTAMP - DATE and DATE - TIMESTAMP WITH TIME
+                        // ZONE are all 42000). Untypeable here is refused
+                        // at prepare, never a wrong value.
+                        _ => None,
                     }
                 }
                 _ => None, // a text operand is not arithmetic
@@ -68148,22 +68167,41 @@ impl Expr {
                     match (dt(&va), dt(&vb), *op) {
                         // temporal - temporal
                         (Some((d1, u1, k1)), Some((d2, u2, k2)), ArithOp::Sub) => {
+                            // `dt` collapses a zoned value onto its
+                            // plain kind, so k1/k2 are only Date/Time/
+                            // Timestamp here
                             match (k1, k2) {
                                 (TKind::Date, TKind::Date) => Value::Int(d1 - d2),
                                 (TKind::Time, TKind::Time) => {
                                     Value::Scaled(u1 - u2, -4)
                                 }
-                                (TKind::Time, _) | (_, TKind::Time) => Value::Null,
-                                _ => {
+                                (TKind::Timestamp, TKind::Timestamp) => {
                                     let total = |d: i64, u: i64| {
                                         d as i128 * UNITS_PER_DAY + u as i128
                                     };
                                     let diff = total(d1, u1) - total(d2, u2);
-                                    // nanodays, truncating exactly as the
-                                    // engine renders (probed to 9 digits)
-                                    let raw = diff * 1_000_000_000 / UNITS_PER_DAY;
+                                    // nanodays at scale 9, ROUNDED HALF
+                                    // AWAY FROM ZERO - the engine's rule
+                                    // (measured: a 10-hour TIMESTAMP
+                                    // difference is 0.416666667, not the
+                                    // ...666 a truncating divide gives;
+                                    // an earlier note here called it
+                                    // truncation, from a case where the
+                                    // two happen to coincide)
+                                    let num = diff * 1_000_000_000;
+                                    let q = num / UNITS_PER_DAY;
+                                    let rem = num % UNITS_PER_DAY;
+                                    let raw = if 2 * rem.abs() >= UNITS_PER_DAY {
+                                        q + num.signum()
+                                    } else {
+                                        q
+                                    };
                                     Value::Scaled(raw as i64, -9)
                                 }
+                                // a MIXED-family difference is refused at
+                                // prepare ([Expr::type_of]); this is a
+                                // fail-closed guard, never a value
+                                _ => return Err(EvalErr::Unsupported),
                             }
                         }
                         // temporal ± number / number + temporal. A DATE
