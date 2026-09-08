@@ -12094,6 +12094,7 @@ fn expr_reads(e: &Expr, f: &dyn Fn(usize) -> bool) -> bool {
         | Expr::CollKey(a, _)
         | Expr::Collate(a, _)
         | Expr::CollCanon(a, _, _)
+        | Expr::CarrierEnc(a, _)
         | Expr::OctKey(a, _) => expr_reads(a, f),
         Expr::Neg(a) | Expr::Cast(a, _, _) => expr_reads(a, f),
         Expr::Bin(a, _, b) | Expr::Concat(a, b) | Expr::NullIf(a, b) => {
@@ -48569,6 +48570,7 @@ fn expr_nullable(e: &Expr, is_nn: &dyn Fn(usize) -> bool) -> bool {
         | Expr::TextNum(a, _)
         | Expr::TextNumKey(a, _)
         | Expr::OctKey(a, _)
+        | Expr::CarrierEnc(a, _)
         | Expr::TextBool(a, _) => expr_nullable(a, is_nn),
         Expr::Bin(a, _, b) | Expr::Concat(a, b) => expr_nullable(a, is_nn) || expr_nullable(b, is_nn),
         // AtNode::make (ExprNodes.cpp:3328): nullable iff the datetime
@@ -64056,6 +64058,17 @@ enum Expr {
     /// operand, where the padded bytes ARE part of the value
     /// (`x'6162'` does not match a `CHAR(4)` holding `61620000`).
     OctKey(Box<Expr>, bool),
+    /// A CROSS-CHARSET COMPARISON KEY: the inner text value re-spelled
+    /// as the CARRIER (one char per octet) of its OWN character set's
+    /// bytes (`u8` = that charset). It exists only to reconcile a
+    /// byte-carrier operand meeting a real-charset one in BYTE SPACE -
+    /// a real `'café'` becomes its five UTF-8 octets so it byte-matches
+    /// a NONE/OCTETS/hex operand carrying the same octets. A byte
+    /// carrier already IS such a string and is never wrapped. Lives only
+    /// in comparison / key positions, never projected, so it needs no
+    /// describe width; it passes type, nullability, rank and reads
+    /// through to the inner like [Expr::OctKey].
+    CarrierEnc(Box<Expr>, u8),
 }
 
 /// A resolved [RawCond].
@@ -66936,6 +66949,7 @@ impl Expr {
             Expr::TextBool(e, _) => e.type_of(descs).map(|_| ExprType::Bool),
             Expr::CollKey(e, _)
             | Expr::OctKey(e, _)
+            | Expr::CarrierEnc(e, _)
             | Expr::Collate(e, _)
             | Expr::CollCanon(e, _, _) => e.type_of(descs),
             Expr::Null => Some(ExprType::Int),
@@ -67470,6 +67484,7 @@ impl Expr {
             | Expr::CollKey(_, _)
             | Expr::Collate(_, _)
             | Expr::CollCanon(_, _, _)
+            | Expr::CarrierEnc(_, _)
             | Expr::OctKey(_, _) => None,
             Expr::Coalesce(args) => args.iter().filter_map(|a| a.rank_of(descs)).max(),
             Expr::Case(branches, else_) => branches
@@ -67921,6 +67936,29 @@ impl Expr {
                         // from the column; keep the raw text (defensive)
                         _ => Value::Text(s),
                     }
+                }
+                v => v,
+            },
+            // the cross-charset comparison key (see the variant):
+            // re-spell a REAL text value as the carrier of its OWN
+            // charset bytes, so a byte-space compare against a
+            // byte-carrier operand runs over the same octets. A byte
+            // carrier is already such a string and reaches here only
+            // when a real charset was (defensively) named - the
+            // carrier_encode branch is then the identity.
+            Expr::CarrierEnc(e, cs) => match e.eval(values)? {
+                Value::Null => Value::Null,
+                Value::Text(s) => {
+                    let bytes = if fire_crab_ods::intl::byte_carrier(*cs) {
+                        fire_crab_ods::intl::carrier_encode(&s)
+                            .unwrap_or_else(|| s.as_bytes().to_vec())
+                    } else {
+                        fire_crab_ods::intl::encode_text(*cs, &s)
+                            .ok()
+                            .flatten()
+                            .unwrap_or_else(|| s.as_bytes().to_vec())
+                    };
+                    Value::Text(fire_crab_ods::intl::carrier_decode(&bytes))
                 }
                 v => v,
             },
@@ -84406,6 +84444,19 @@ fn resolve_expr_term(
 /// rule). TIME against DATE or TIMESTAMP is REFUSED: the engine promotes
 /// a TIME using the CURRENT DATE, which this server does not do, and a
 /// render-compare of the two would answer confidently and wrongly.
+/// The character set a text comparison operand contributes: a column,
+/// blob or CAST its own set (via [text_form]'s ttype); a bare literal or
+/// any attachment-typed expression the ATTACHMENT set (a hex literal is
+/// OCTETS). None when no text form is known, and the caller then leaves
+/// the pair on its existing path.
+fn cmp_text_charset(e: &Expr, descs: &[Descriptor]) -> Option<u8> {
+    match text_form(e, descs) {
+        Some((_, _, TfCs::Ttype(t))) => Some(fire_crab_ods::intl::charset_id(t as i16)),
+        Some((_, _, TfCs::Att)) => Some(CURRENT_ATT_CS.with(|c| c.get())),
+        None => None,
+    }
+}
+
 fn cmp_sides(lhs: Expr, rhs: Expr, descs: &[Descriptor]) -> Option<(Expr, Expr)> {
     // a NULL literal has no type to check against - the comparison is
     // UNKNOWN whatever the other side is. (It types as Int, so without
@@ -84595,6 +84646,44 @@ fn cmp_sides(lhs: Expr, rhs: Expr, descs: &[Descriptor]) -> Option<(Expr, Expr)>
             }
         }
         (ExprType::Text, ExprType::Text) => {
+            // BYTE-SPACE reconciliation: when EXACTLY ONE operand is a
+            // byte carrier (NONE/OCTETS/hex, or a literal under a
+            // byte-carrier attachment) and the other a real charset, the
+            // engine compares OCTETS - the real side re-spelled as the
+            // carrier of its OWN bytes ([Expr::CarrierEnc]), the carrier
+            // side verbatim, no transliteration and no raise. This is the
+            // expression-path twin of the literal fast path
+            // ([adopt_carrier_literal]) and runs BEFORE the octets and
+            // collation branches (a byte-carrier side bypasses collation
+            // in the engine too). Two real charsets, or two byte
+            // carriers, fall through to the existing paths unchanged.
+            if let (Some(ca), Some(cb)) =
+                (cmp_text_charset(&lhs, descs), cmp_text_charset(&rhs, descs))
+            {
+                use fire_crab_ods::intl::{byte_carrier, CS_OCTETS};
+                if byte_carrier(ca) != byte_carrier(cb) {
+                    let wrap = |e: Expr, cs: u8| {
+                        if byte_carrier(cs) {
+                            e
+                        } else {
+                            Expr::CarrierEnc(Box::new(e), cs)
+                        }
+                    };
+                    let (l, r) = (wrap(lhs, ca), wrap(rhs, cb));
+                    return if ca == CS_OCTETS || cb == CS_OCTETS {
+                        // OCTETS pads the shorter side with 0x00 and is
+                        // byte-exact - the OctKey key
+                        Some((
+                            Expr::OctKey(Box::new(l), false),
+                            Expr::OctKey(Box::new(r), false),
+                        ))
+                    } else {
+                        // NONE/ASCII pad with the blank, which is exactly
+                        // value_cmp's trailing-0x20 strip over the carrier
+                        Some((l, r))
+                    };
+                }
+            }
             // an OCTETS side on EITHER hand takes the whole comparison
             // binary: 0x00 pads the shorter value and neither side is
             // transliterated (CVT2_compare, cvt2.cpp:422-439). Both
@@ -84823,6 +84912,7 @@ fn expr_no_raise(e: &Expr, descs: &[Descriptor]) -> bool {
         Expr::TextNum(_, _) | Expr::TextNumKey(_, _) | Expr::TextBool(_, _) => false,
         Expr::CollKey(a, _)
         | Expr::OctKey(a, _)
+        | Expr::CarrierEnc(a, _)
         | Expr::Collate(a, _)
         | Expr::CollCanon(a, _, _) => expr_no_raise(a, descs),
         Expr::Neg(x) => expr_no_raise(x, descs),
@@ -85199,15 +85289,23 @@ fn adopt_carrier_literal(raw: RawKind, d: &Descriptor) -> RawKind {
             Err(_) => v,
         }
     };
-    // ONLY equality/ordering (=, <>, <, >, <=, >=, and the BETWEEN/IN
-    // desugars) is a clean byte-space compare. LIKE / STARTING / SIMILAR
-    // / CONTAINING carry a per-operator pattern semantics the engine does
-    // NOT resolve the same way (measured: `<utf8> LIKE '<accented>%'`
-    // under a NONE attachment RAISES 22000 *Malformed string*, it does
-    // not answer) - left on the current path and recorded for their own
-    // measured chunk rather than answered wrongly here.
+    // Equality/ordering (=, <>, <, >, <=, >=, and the BETWEEN/IN
+    // desugars) and the byte-space PREFIX/SUBSTRING/REGEX operators
+    // STARTING WITH, CONTAINING and SIMILAR TO all reinterpret the
+    // carrier pattern into the column's charset and then answer exactly
+    // as the engine does (measured: `<utf8> STARTING WITH '<accented>'`,
+    // `CONTAINING '<accented>'` and `SIMILAR TO '<accented>%'` all match
+    // the accented row). LIKE is the ONE exception left on the current
+    // path: the engine SPLITS it - `<utf8> LIKE '<accented>%'` RAISES
+    // 22000 *Malformed string* while `LIKE '%<accented>%'` and an exact
+    // `LIKE '<accented>'` ANSWER - a raise/answer predicate that also
+    // turns on the column's byte width, not cheaply reproduced; recorded
+    // for its own measured chunk rather than answered wrongly here.
     match raw {
         RawKind::Cmp(op, Rhs::Str(v)) => RawKind::Cmp(op, Rhs::Str(redo(v))),
+        RawKind::Starting(Rhs::Str(v), n) => RawKind::Starting(Rhs::Str(redo(v)), n),
+        RawKind::Containing(Rhs::Str(v), n) => RawKind::Containing(Rhs::Str(redo(v)), n),
+        RawKind::Similar(Rhs::Str(v), e, n) => RawKind::Similar(Rhs::Str(redo(v)), e, n),
         other => other,
     }
 }
@@ -85351,6 +85449,12 @@ fn param_or_typed_term(
     // why every existing gate is untouched.
     let raw = if matches!(kind, ColKind::Text)
         && fire_crab_ods::intl::byte_carrier(fire_crab_ods::intl::charset_id(d.sub_type))
+        // ...but ONLY a REAL literal needs lifting. Under a byte-carrier
+        // attachment the literal ALREADY arrived as the carrier of its
+        // own octets (`stmt_text_decode`), so lifting again double-encoded
+        // it (C3 -> C3 83…) and `n = 'café'` over a NONE column answered
+        // 0. The lift is for a real-attachment literal only.
+        && !fire_crab_ods::intl::byte_carrier(CURRENT_ATT_CS.with(|c| c.get()))
     {
         let lift = |r: Rhs| match r {
             Rhs::Str(v) => Rhs::Str(fire_crab_ods::intl::to_carrier(&v)),
