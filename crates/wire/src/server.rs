@@ -68403,7 +68403,7 @@ impl Expr {
                     }
                     // to a text width: render the value, refuse if it does
                     // not fit (the engine's convert error), pad for CHAR
-                    CastTarget::Text { len, pad, cs: target_cs, .. } => {
+                    CastTarget::Text { len, pad, cs: target_cs, synthetic } => {
                         // A BOOLEAN casts to the WORD IN CAPITALS -
                         // `CAST(B AS VARCHAR(6))` is 'TRUE', while isql
                         // DISPLAYS the same column as `<true>`. Two
@@ -68457,6 +68457,45 @@ impl Expr {
                                     (err, _) => err,
                                 }
                             })?,
+                            // AN UNQUALIFIED CAST TO A STRING TAKES THE
+                            // ATTACHMENT CHARSET (measured: under a UTF8
+                            // attachment `CAST(<utf8> AS VARCHAR)`
+                            // describes charset 4; under NONE it is
+                            // charset 0 and carries the source's RAW
+                            // BYTES - `CAST(<utf8 'café'> AS VARCHAR(20))`
+                            // is 5 octets, not 4). When the attachment is
+                            // a BYTE CARRIER the value must move into it
+                            // (real -> carrier is a raw byte copy through
+                            // [transcode_text], so 'café' becomes its five
+                            // carrier octets and the row encoder ships all
+                            // five); fire-crab used to keep the decoded
+                            // string and the carrier encoder then dropped
+                            // é to one byte. A real attachment is left
+                            // exactly as before - the row encoder already
+                            // transliterates the decoded string into it,
+                            // so touching it here would only risk moving a
+                            // transliteration error. The source charset is
+                            // the blob's own where the source is a text
+                            // blob, else the charset the cast recorded.
+                            // the SYNTHETIC pad wrap [pad_conditional]
+                            // adds around a CHAR-formed conditional is not
+                            // a user cast: its charset is the branches'
+                            // own and the row encoder handles it, so it
+                            // must NOT be moved into the attachment here -
+                            // doing so inflated a carrier result past its
+                            // char `len` and raised a spurious 22001.
+                            None if !*synthetic => {
+                                let att = CURRENT_ATT_CS.with(|c| c.get());
+                                if fire_crab_ods::intl::byte_carrier(att) {
+                                    let src = match &**e {
+                                        Expr::BlobText(_, bcs) => *bcs,
+                                        _ => *cs,
+                                    };
+                                    transcode_text(src, att, s)?
+                                } else {
+                                    s
+                                }
+                            }
                             None => s,
                         };
                         // and the PAD is the target character set's
@@ -85115,6 +85154,64 @@ fn decfloat_term(
 /// The parameter-aware wrapper around [typed_term]: a `?` right-hand
 /// side fills its parse-time slot with the column's descriptor;
 /// anything else resolves as before.
+/// Reinterpret a BYTE-CARRIER text literal against a REAL-charset column.
+///
+/// Under a byte-carrier attachment (NONE - isql's default) a text literal
+/// arrives as one char per octet (`stmt_text_decode` -> [carrier_decode]),
+/// so `'café'` is the five-char carrier `caf\u{c3}\u{a9}`, not the four
+/// real chars. The engine compares a byte carrier against a real charset
+/// in BYTE SPACE: the carrier's octets are read AS the column's charset
+/// (measured: `WHERE u = 'café'` MATCHES a UTF8 column, and `WHERE u =
+/// _NONE x'FF'` is 0 rows with NO error - the comparison never validates
+/// or raises, unlike a CAST). fire-crab used to compare the carrier chars
+/// against the column's real chars and silently DROP the matching row.
+///
+/// Reinterpreting the literal ONCE here - `decode_text(col_cs,
+/// carrier_encode(lit))` - turns the term into an ordinary real-vs-real
+/// comparison the existing machinery runs correctly for every operator
+/// (=, <>, <, >, BETWEEN and IN desugar to these, LIKE, STARTING,
+/// SIMILAR, CONTAINING). Bytes that do NOT spell the column's charset
+/// leave the literal untouched: a carrier string can never equal a real
+/// value, which is exactly the engine's "no match, no raise" for that
+/// case. Only fires when the column is a real charset AND the attachment
+/// is a byte carrier; a NONE/OCTETS column, or a real attachment, keeps
+/// the current path verbatim.
+fn adopt_carrier_literal(raw: RawKind, d: &Descriptor) -> RawKind {
+    use fire_crab_ods::intl;
+    if d.sub_type < 0 {
+        return raw;
+    }
+    let col_cs = intl::charset_id(d.sub_type as i16);
+    let att = CURRENT_ATT_CS.with(|c| c.get());
+    if intl::byte_carrier(col_cs) || !intl::byte_carrier(att) {
+        return raw;
+    }
+    // read the carrier's octets AS the column's charset - the engine's
+    // byte-space comparison. [transcode_text] from the byte-carrier
+    // attachment to the real column set is exactly that: UTF8 validates
+    // the bytes (from_utf8), a tabled set maps every octet. Bytes that do
+    // not spell the set are an Err - leave the literal a carrier string,
+    // which then equals no real value (the engine's "no match, no
+    // raise"); the comparison, unlike a CAST, must never surface a raise.
+    let redo = |v: String| -> String {
+        match transcode_text(att, col_cs, v.clone()) {
+            Ok(t) => t,
+            Err(_) => v,
+        }
+    };
+    // ONLY equality/ordering (=, <>, <, >, <=, >=, and the BETWEEN/IN
+    // desugars) is a clean byte-space compare. LIKE / STARTING / SIMILAR
+    // / CONTAINING carry a per-operator pattern semantics the engine does
+    // NOT resolve the same way (measured: `<utf8> LIKE '<accented>%'`
+    // under a NONE attachment RAISES 22000 *Malformed string*, it does
+    // not answer) - left on the current path and recorded for their own
+    // measured chunk rather than answered wrongly here.
+    match raw {
+        RawKind::Cmp(op, Rhs::Str(v)) => RawKind::Cmp(op, Rhs::Str(redo(v))),
+        other => other,
+    }
+}
+
 fn param_or_typed_term(
     idx: usize,
     kind: ColKind,
@@ -85122,6 +85219,7 @@ fn param_or_typed_term(
     d: &Descriptor,
     params: &mut Vec<Option<Descriptor>>,
 ) -> Option<Term> {
+    let raw = adopt_carrier_literal(raw, d);
     // `<col> CONTAINING <p>` - the upper-cased substring test, and the
     // one predicate that folds case on EVERY character set. It comes
     // FIRST because it is answerable under a collation this server
