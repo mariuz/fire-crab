@@ -15654,7 +15654,15 @@ fn db_triggers(db: &Database, event: i64) -> Option<Vec<TrigDef>> {
     if refuse {
         return None;
     }
-    out.sort_by(|a, b| a.seq.cmp(&b.seq).then_with(|| a.name.cmp(&b.name)));
+    // POSITION (RDB$TRIGGER_SEQUENCE) is the only order the engine
+    // guarantees; among triggers that SHARE a position it fires in
+    // catalog/creation order, NOT by name (measured: three BEFORE INSERT
+    // at position 0 created za/mb/ac fire ZMA - creation order - where a
+    // name sort gives AMZ). `out` is collected in storage (creation)
+    // order and sort_by is STABLE, so sorting on the sequence alone keeps
+    // that order for equal positions; the old `.then_with(name)` forced a
+    // wrong alphabetical tiebreak that changed the final NEW/row value.
+    out.sort_by(|a, b| a.seq.cmp(&b.seq));
     // every body must be one this server can RUN, and the exceptions it
     // names resolved while the catalog is in reach - the same two things
     // [user_triggers] settles for a relation's
@@ -15796,7 +15804,15 @@ fn ddl_triggers(db: &Database, event: u32, before: bool) -> Option<Vec<TrigDef>>
     if refuse {
         return None;
     }
-    out.sort_by(|a, b| a.seq.cmp(&b.seq).then_with(|| a.name.cmp(&b.name)));
+    // POSITION (RDB$TRIGGER_SEQUENCE) is the only order the engine
+    // guarantees; among triggers that SHARE a position it fires in
+    // catalog/creation order, NOT by name (measured: three BEFORE INSERT
+    // at position 0 created za/mb/ac fire ZMA - creation order - where a
+    // name sort gives AMZ). `out` is collected in storage (creation)
+    // order and sort_by is STABLE, so sorting on the sequence alone keeps
+    // that order for equal positions; the old `.then_with(name)` forced a
+    // wrong alphabetical tiebreak that changed the final NEW/row value.
+    out.sort_by(|a, b| a.seq.cmp(&b.seq));
     for t in out.iter_mut() {
         let (body, _) = trig_body_of(t)?;
         if !trig_body_inlineable(&body, "") {
@@ -16643,8 +16659,15 @@ fn user_triggers(db: &Database, table: &str, dml: &DmlGuard) -> Option<Vec<TrigD
     if refuse {
         return None;
     }
-    // the engine fires by SEQUENCE, then by name
-    out.sort_by(|a, b| a.seq.cmp(&b.seq).then_with(|| a.name.cmp(&b.name)));
+    // POSITION (RDB$TRIGGER_SEQUENCE) is the only order the engine
+    // guarantees; among triggers that SHARE a position it fires in
+    // catalog/creation order, NOT by name (measured: three BEFORE INSERT
+    // at position 0 created za/mb/ac fire ZMA - creation order - where a
+    // name sort gives AMZ). `out` is collected in storage (creation)
+    // order and sort_by is STABLE, so sorting on the sequence alone keeps
+    // that order for equal positions; the old `.then_with(name)` forced a
+    // wrong alphabetical tiebreak that changed the final NEW/row value.
+    out.sort_by(|a, b| a.seq.cmp(&b.seq));
     // EVERY body must be interpretable HERE, at prepare: a trigger this
     // server cannot run must refuse the statement, not fail half way
     // through a write
