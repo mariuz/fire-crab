@@ -18921,6 +18921,33 @@ fn build_expr_col_from(e: Expr, name: &str, descs: &[Descriptor]) -> Option<Proj
     })
 }
 
+/// The CAST target a COMPUTED column's expression is coerced into: its
+/// DECLARED field format. The engine wraps a computed expression in a
+/// `blr_cast` to the RDB$RELATION_FIELDS descriptor, so the value rounds
+/// to the column's scale, range-checks against its width, and describes
+/// by its own wire type. None for the declared types this server does
+/// not yet cast a computed column into (text, temporal, blob, DECFLOAT,
+/// FLOAT), which keep the expression's own form.
+fn computed_cast_target(d: &Descriptor) -> Option<CastTarget> {
+    let bytes: u8 = match d.dtype {
+        dtype::SHORT => 2,
+        dtype::LONG => 4,
+        dtype::INT64 => 8,
+        dtype::INT128 => 16,
+        dtype::DOUBLE => return Some(CastTarget::Approx),
+        _ => return None,
+    };
+    // a scaled or NUMERIC/DECIMAL-tagged exact column is the numeric
+    // target (it rounds to scale); a plain integer is the integer
+    // target - except INT128, which has no integer cast rung and rides
+    // the numeric one at scale 0
+    if d.scale != 0 || matches!(d.sub_type, 1 | 2) || d.dtype == dtype::INT128 {
+        Some(CastTarget::Numeric { scale: d.scale, bytes, sub_type: d.sub_type })
+    } else {
+        Some(CastTarget::Int { bytes })
+    }
+}
+
 fn build_projcols(
     collist: &[String],
     columns: &[RelationColumn],
@@ -18943,6 +18970,38 @@ fn build_projcols(
         // named after itself; one whose expression is not in the map
         // (unparsable source) refuses rather than reading garbage
         if let Some(raw) = computed.get(&(rc.field_id as usize)) {
+            // THE ENGINE CASTS A COMPUTED EXPRESSION TO THE COLUMN'S
+            // DECLARED FIELD FORMAT - a `blr_cast` to the
+            // RDB$RELATION_FIELDS descriptor - so the value is rounded to
+            // the column's scale, range-checked against its width, and
+            // described by ITS wire type, not the expression's natural
+            // one (probed: `INTEGER COMPUTED BY (ID/3.0)` is 7 and
+            // describes LONG, not 6.6 / INT64; a `SMALLINT` one whose
+            // expression overflows raises 22003). Wrap the resolved
+            // expression in that cast and describe by the declared
+            // descriptor. Declared types this server does not yet cast a
+            // computed column into (text, temporal, blob, DECFLOAT) keep
+            // the expression's own form ([computed_cast_target] is None).
+            if let Some(target) = computed_cast_target(d) {
+                let e = resolve_expr(raw, columns, descs)?;
+                let cs = err_spell_charset(&e, descs);
+                let (wire, sql_type, length, scale, sub_type) = wire_for(d);
+                out.push(ProjCol {
+                    name: rc.name.clone(),
+                    fname: Some(rc.name.clone()),
+                    relation: None,
+                    rel_alias: None,
+                    field_id: rc.field_id as usize,
+                    wire,
+                    sql_type: nullable(sql_type),
+                    length,
+                    oct_length: length,
+                    scale,
+                    sub_type,
+                    expr: Some(Expr::Cast(Box::new(e), target, cs)),
+                });
+                continue;
+            }
             let mut pc = build_expr_col(raw, &rc.name, columns, descs)?;
             // a computed column describes as its OWN name, not the
             // expression's (probed: CC COMPUTED BY (X+1) is CC/CC)
@@ -46054,8 +46113,8 @@ fn union_coerce_value(v: Value, sql_type: i32, scale: i32) -> Value {
         // value it does not know writes 0.0
         return match v {
             Value::Int(n) => Value::Double(n as f64),
-            Value::Scaled(raw, sc) => Value::Double(raw as f64 * 10f64.powi(sc as i32)),
-            Value::Int128(raw, sc) => Value::Double(raw as f64 * 10f64.powi(sc as i32)),
+            Value::Scaled(raw, sc) => Value::Double(exact_to_f64(raw as i128, sc as i32)),
+            Value::Int128(raw, sc) => Value::Double(exact_to_f64(raw as i128, sc as i32)),
             Value::Float(f) => Value::Double(f as f64),
             other => other,
         };
@@ -68106,7 +68165,7 @@ impl Expr {
                     let f = |v: &Value| {
                         approx_of(v).or_else(|| {
                             numeric_parts(v)
-                                .map(|(raw, sc)| raw as f64 * 10f64.powi(sc as i32))
+                                .map(|(raw, sc)| exact_to_f64(raw as i128, sc as i32))
                         })
                     };
                     let (x, y) = match (f(&va), f(&vb)) {
@@ -68704,7 +68763,7 @@ impl Expr {
                         },
                         other => match numeric_parts(other) {
                             Some((raw, sc)) => {
-                                Value::Double(raw as f64 * 10f64.powi(sc as i32))
+                                Value::Double(exact_to_f64(raw as i128, sc as i32))
                             }
                             None => return Err(EvalErr::ConversionError(None)),
                         },
