@@ -16746,6 +16746,11 @@ fn user_triggers(db: &Database, table: &str, dml: &DmlGuard) -> Option<Vec<TrigD
 /// autonomous block - keeps the statement's old refusal.
 fn trig_body_pure(s: &TrigStmt) -> bool {
     match s {
+        // a RAW assignment answers its RHS through the planner
+        // ([eval_raw_scalar]), which needs the database in reach - so it
+        // is NOT pure and takes the inline (needs_db) path, where a
+        // COALESCE/CASE over the row (or a subquery) can be evaluated
+        TrigStmt::Assign { raw: Some(_), .. } => false,
         TrigStmt::Assign { .. }
         | TrigStmt::AssignText { .. }
         | TrigStmt::Raise { .. }
@@ -20245,7 +20250,19 @@ enum DynPart {
 
 enum TrigStmt {
     /// `NEW.<col> = <expr>;` or `<var> = <expr>;`
-    Assign { target: TrigTarget, expr: fire_crab_ods::expr::Expr, src_off: usize },
+    Assign {
+        target: TrigTarget,
+        expr: fire_crab_ods::expr::Expr,
+        /// the RHS KEPT AS WRITTEN, for a value the arithmetic body
+        /// grammar has no node for - COALESCE/CASE/IIF/NULLIF/CAST or a
+        /// scalar subquery. Evaluated at run time through the planner
+        /// ([eval_raw_scalar]), exactly as an IF/WHILE condition's `raw`
+        /// is ([eval_raw_cond]). `Some` makes the body uninterpretable as
+        /// BLR, so a trigger CREATEd this way is refused (no faithful BLR
+        /// to store) while an engine-created one fires through the source.
+        raw: Option<(String, Vec<(String, u16)>)>,
+        src_off: usize,
+    },
     /// `IF (<cond>) THEN <stmt> [ELSE <stmt>]` - the ELSE arrives as the
     /// NEXT semicolon segment and is attached by the caller
     If {
@@ -20937,9 +20954,9 @@ fn parse_trig_block(
         }
         stmts.push(parse_trig_stmt(s, pos, limit, vars)?);
     }
-    if stmts.is_empty() {
-        return None;
-    }
+    // an EMPTY body (BEGIN END) is a valid no-op - the engine runs the
+    // DML unchanged; it must NOT refuse (it did, blocking every INSERT on
+    // a table with an empty trigger)
     Some(TrigStmt::Block { stmts, handlers, src_off: begin_off })
 }
 
@@ -20984,7 +21001,7 @@ fn body_has_uninterpretable_blr(st: &TrigStmt) -> bool {
         // `blr_concatenate` (39) in prefix form - and the gate holds
         // both byte for byte. What still cannot be stored is a value
         // KEPT AS WRITTEN (`raw`), which has no `Expr` to emit at all.
-        TrigStmt::Assign { .. } => false,
+        TrigStmt::Assign { raw, .. } => raw.is_some(),
         // ...and a store whose VALUES were kept as text: there is no
         // `Expr` to emit, and storing the trigger with the statement
         // silently missing would be a trigger that does not do what its
@@ -22308,7 +22325,7 @@ fn parse_trig_stmt(
     };
     let rhs = text[eq + 1..].trim();
     match parse_body_expr(rhs, vars) {
-        Some(e) => Some(TrigStmt::Assign { target, expr: e, src_off: start }),
+        Some(e) => Some(TrigStmt::Assign { target, expr: e, raw: None, src_off: start }),
         // A TEXT ASSIGNMENT. `Expr` is arithmetic - it has no string
         // literal - so `S = 'SELECT ...'` used to refuse the whole body,
         // and with it the CANONICAL EXECUTE STATEMENT: build the
@@ -22317,14 +22334,27 @@ fn parse_trig_stmt(
         // operand is ([DynPart]), assigned to a variable, and nothing
         // wider - a text expression this server cannot read still
         // refuses, as it did before.
-        None => match target {
-            TrigTarget::Var(slot) => Some(TrigStmt::AssignText {
-                slot,
-                text: parse_dyn_text(rhs, vars)?,
-                src_off: start,
-            }),
-            TrigTarget::Field(_) => None,
-        },
+        None => {
+            // a var text-statement assignment (the EXECUTE STATEMENT
+            // builder: S = 'SELECT ...' | S || ...), kept as before
+            if let TrigTarget::Var(slot) = target {
+                if let Some(text) = parse_dyn_text(rhs, vars) {
+                    return Some(TrigStmt::AssignText { slot, text, src_off: start });
+                }
+            }
+            // RAW: a value the arithmetic grammar cannot hold - COALESCE,
+            // CASE, IIF, NULLIF, CAST, or a scalar subquery (incl. one
+            // over a system table or after a DML). Keep the text and its
+            // :variable binds and let the planner answer it at run time.
+            let mut binds: Vec<(String, u16)> = Vec::new();
+            for name in named_refs(rhs) {
+                let slot = vars.iter().position(|v| *v == name)? as u16;
+                if !binds.iter().any(|(n, _)| *n == name) {
+                    binds.push((name, slot));
+                }
+            }
+            Some(TrigStmt::Assign { target, expr: fire_crab_ods::expr::Expr::NullLiteral, raw: Some((rhs.to_string(), binds)), src_off: start })
+        }
     }
 }
 
@@ -22399,7 +22429,7 @@ fn emit_trigger_stmt(
         | TrigStmt::SelectInto { .. }
         | TrigStmt::ForExecStmt { .. }
         | TrigStmt::CallProc { .. } => {}
-        TrigStmt::Assign { target, expr, src_off } => {
+        TrigStmt::Assign { target, expr, src_off, .. } => {
             dbg.push((*src_off, b.len()));
             b.push(1); // blr_assignment
             expr.emit(b);
@@ -80039,7 +80069,7 @@ fn exec_psql_stmt_inner(
         return Err(PsqlStop::Unsupported); // runaway body
     }
     match s {
-        TrigStmt::Assign { target, expr, .. } => {
+        TrigStmt::Assign { target, expr, raw, .. } => {
             // `x = gen_id(G, 0)` IS A READ, NOT A DRAW. A body that draws
             // refuses in a procedure or block ([GenMode::Refuse]) because
             // no caller can own the page write; a step of zero writes no
@@ -80051,7 +80081,13 @@ fn exec_psql_stmt_inner(
             // shape is taken - a zero-step read as the whole right-hand
             // side; a draw, or a read folded into a larger expression,
             // keeps the refusal it always had.
-            let v = match expr {
+            let v = match raw {
+                // a value the arithmetic grammar could not hold - answered
+                // by the planner (COALESCE/CASE/NULLIF/CAST/scalar
+                // subquery, incl. over a system table or after a DML) -
+                // then assigned to the target exactly like the parsed form
+                Some((text, binds)) => eval_raw_scalar(text, binds, f, db)?,
+                None => match expr {
                 fire_crab_ods::expr::Expr::GenId { name, step }
                     if matches!(
                         **step,
@@ -80067,6 +80103,7 @@ fn exec_psql_stmt_inner(
                     )
                 }
                 _ => eval_psql_expr(expr, f)?,
+                },
             };
             match target {
                 TrigTarget::Var(n) => {
@@ -80912,6 +80949,34 @@ fn eval_raw_cond(
         Some(Value::Int(n)) => Ok(*n != 0),
         _ => Err(PsqlStop::Unsupported),
     }
+}
+
+/// [eval_raw_cond] for a SCALAR value: the RHS of an assignment or RETURN
+/// the arithmetic body grammar could not hold - COALESCE/CASE/IIF/NULLIF/
+/// CAST or a scalar subquery. Its `:variable` binds and NEW./OLD. row
+/// references are substituted, then it is answered as the one value of
+/// `SELECT <expr> FROM RDB$DATABASE` through the planner's rich evaluator,
+/// which reads any prior DML in the body (the reader view is refreshed by
+/// run_body_dml) and resolves a system-table subquery.
+fn eval_raw_scalar(
+    text: &str,
+    binds: &[(String, u16)],
+    f: &PsqlFrame,
+    db: &mut Option<Database>,
+) -> Result<Value, PsqlStop> {
+    let expr = subst_body_query(text, binds, f).ok_or(PsqlStop::Unsupported)?;
+    let sql = format!("SELECT {} FROM RDB$DATABASE", expr);
+    let mut sink: Vec<Option<Descriptor>> = Vec::new();
+    let plan = plan_query_inner(&sql, &*db, &mut sink).ok_or(PsqlStop::Unsupported)?;
+    if !sink.is_empty() {
+        return Err(PsqlStop::Unsupported); // a `?` parameter - not from a body
+    }
+    let dbr = db.as_ref().ok_or(PsqlStop::Unsupported)?;
+    let rows = branch_rows(&plan, dbr, &[]).ok_or(PsqlStop::Unsupported)?;
+    rows.into_iter()
+        .next()
+        .and_then(|mut r| (!r.is_empty()).then(|| r.swap_remove(0)))
+        .ok_or(PsqlStop::Unsupported)
 }
 
 fn render_dyn_text(parts: &[DynPart], f: &PsqlFrame) -> Result<Option<String>, PsqlStop> {

@@ -9,9 +9,10 @@ fire-crab, 2026-08-20: a Rust conversion of the Firebird 6 engine —
 `exe`, `opt`, `lck`, `svc`, `auth`, `cch`, `pio`, `blb`, `evt`,
 `fcstat`, and the `wire` server at 67k). The server answers real SQL
 over the real wire protocol, and every answer is held DIFFERENTIALLY
-against the live FB6 engine: 289 gates under `qa/`, of which the 264
-`serve-real-*` sweeps are green (8,627 checks at the last full sweep
-before the growth chunk; +32 with it).
+against the live FB6 engine: 416 gates under `qa/`, of which the 383
+`serve-real-*` sweeps are green (each a multi-check differential run;
+the last full-suite sweep counted 8,627 checks before the growth
+chunks, which have since added many more).
 The rule that produced all of it still holds: *what does the engine do
 here?* — measured, then converted, then gated in both directions
 (the engine reads what fire-crab writes, fire-crab reads what the
@@ -3074,13 +3075,15 @@ pointer-page and TIP page numbers is the next step when it dominates.
 
 - **SAME-POSITION TRIGGERS FIRE IN CREATION ORDER, NOT BY NAME DONE (2026-09-08, `serve-real-trigorder`):** fire-crab collected a table's triggers in creation (storage) order then re-sorted them by `(position, NAME)`, forcing an alphabetical tiebreak the engine does not use. A BEFORE trigger runs per row, so the order sets the final NEW value: three `BEFORE INSERT` at position 0 created `za_t`/`mb_t`/`ac_t` (appending Z/M/A) stored `ZMA` on the engine (creation order) and `AMZ` under the name sort - a silent wrong value. Dropped the `.then_with(name)` tiebreak at all three trigger-enumeration sites (`db_triggers` 15657, `ddl_triggers` 15799, `user_triggers` 16647); the collection is already creation-ordered and `sort_by` is stable, so equal positions keep creation order. Distinct positions were and remain correct (position dominates). The engine's same-position order is formally unspecified (an unstable sort over equal `RDB$TRIGGER_SEQUENCE`), but for triggers created in sequence it is creation order, which this matches; the fix is to STOP imposing a wrong deterministic order, not to reproduce the engine's instability.
 
+- **A TRIGGER OR PROCEDURE BODY RUNS A CONSTRUCT THE ARITHMETIC BODY-GRAMMAR CANNOT HOLD DONE (2026-09-08, `serve-real-psqlbody`):** three gaps that made a runnable body refuse or mis-answer, all closed on the FIRE (interpret) path, which is the path a restore and `empbuild` use. (1) An EMPTY body (`begin end`) parsed to zero statements and `parse_trig_block` rejected the whole block, so ANY DML on a table carrying an empty trigger failed; an empty body is now a valid no-op, as the engine treats it. (2) An assignment whose right side is a CONDITIONAL (`COALESCE`/`CASE`) - which the arithmetic `fire_crab_ods::expr::Expr` grammar cannot represent - made the body refuse; the `TrigStmt::Assign` now carries an optional `raw: (text, binds)` kept as written, evaluated at fire time through the query planner (new `eval_raw_scalar`, mirroring `eval_raw_cond`: substitute `:var` and `NEW./OLD.` refs, `SELECT <expr> FROM RDB$DATABASE`, pull one row). Because a raw assignment needs the db, `trig_body_pure` now reports it non-pure so it takes the inline-with-db path. (3) A procedure statement reading a SCALAR SUBQUERY after its own INSERT (a running `SUM`) or over a system table (`COUNT` of `RDB$RELATIONS`) is evaluated the same way. A conditional body created THROUGH fire-crab is STILL refused at CREATE (`body_has_uninterpretable_blr` is true when `raw` is set - fire-crab will not emit BLR it cannot round-trip); the gate builds such triggers on the engine, the restore path. Found while gating trigorder.
+
 - **NOT DONE, BY DESIGN - collation-aware DISTINCT / GROUP BY / UNION over a case/accent-insensitive collation:** the engine answers these; fire-crab refuses (`coll_groupable_ttype`, server.rs:45469, deliberately rejects ICU Secondary/Primary). Researched and left as-is: the comparison side already works (ORDER BY and `=` under a CI collation are correct), but a collapsed CI group has NO specified survivor spelling - the engine returns different members for `DISTINCT` vs `GROUP BY` vs `GROUP BY ... MIN(x)` over the same rows (measured). Producing a survivor would be a guess at an unspecified value, which the refuse-rather-than-guess law forbids; the refusal is correct. (`COUNT`/cardinality would be right, but the projected key spelling would be a coin toss.)
 
 ### Second-hunt backlog (remaining)
 
-- Trigger BODY gaps: a conditional-value expression (COALESCE/CASE/IIF/NULLIF) in a trigger body is refused; an empty trigger body is refused; an AFTER trigger that UPDATEs its own table is refused (found while gating trigorder).
+- Trigger BODY gaps: DONE for a conditional-value `COALESCE`/`CASE` assignment and for an empty body (`serve-real-psqlbody`); STILL refused - `IIF`/`NULLIF` assignment (untested), and an AFTER trigger that UPDATEs its own table (found while gating trigorder).
 - DECFLOAT(16) arithmetic/division computes at 34 digits and types DECFLOAT(34); `SUM`/`AVG` over DECFLOAT refused.
-- Refusals of common constructs: scalar subquery in a PSQL assignment after a DML or over a system table; `WHERE CURRENT OF`; UNION with a multi-key `ORDER BY`; GROUP BY / window + `FIRST`/`SKIP`/`ROWS`; `ALTER COLUMN TYPE` to a scaled numeric; `CREATE OR ALTER VIEW`; `ALTER COLUMN ... TO <newname>`; multi-clause `ALTER TABLE`; a computed column declared with an explicit datatype; `UPDATE`/`DELETE` with `ORDER BY`/`ROWS`; `MERGE`/`UPDATE OR INSERT` `RETURNING OLD./NEW.`.
+- Refusals of common constructs: `WHERE CURRENT OF`; UNION with a multi-key `ORDER BY`; GROUP BY / window + `FIRST`/`SKIP`/`ROWS`; `ALTER COLUMN TYPE` to a scaled numeric; `CREATE OR ALTER VIEW`; `ALTER COLUMN ... TO <newname>`; multi-clause `ALTER TABLE`; a computed column declared with an explicit datatype; `UPDATE`/`DELETE` with `ORDER BY`/`ROWS`; `MERGE`/`UPDATE OR INSERT` `RETURNING OLD./NEW.`.
 - Low: `MOD` result descriptor type (LONG vs INT64; NUMERIC-operand subtype bit).
 
 
