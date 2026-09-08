@@ -74603,7 +74603,14 @@ fn split_alias(item: &str) -> (&str, Option<&str>) {
             _ => None,
         }
     } else {
-        trimmed.rfind(|c: char| c.is_whitespace())
+        // ASCII whitespace ONLY: SQL separates an `expr alias` on real
+        // whitespace, and the `cut + 1` below advances past a ONE-byte
+        // separator. A Unicode whitespace char (a NBSP - which a
+        // misdecoded high byte of a NONE multibyte literal like 'aa'
+        // decodes to, or a literal one) is multibyte, so matching it
+        // here sliced `cut + 1` INSIDE the char and panicked, dropping
+        // the connection on `SELECT '<non-ascii>' FROM ...` with no alias.
+        trimmed.rfind(|c: char| c.is_ascii_whitespace())
     };
     let Some(cut) = cut else {
         return (item, None);
