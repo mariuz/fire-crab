@@ -809,6 +809,21 @@ fn case_table(charset: u8) -> Option<&'static [(char, char); 128]> {
 pub fn simple_case(t: &str, upper: bool) -> String {
     let mut out = String::with_capacity(t.len());
     for c in t.chars() {
+        // The engine cases per character by the SIMPLE (single-char)
+        // Unicode mapping, where Rust's to_lowercase/to_uppercase yield
+        // the FULL (sometimes multi-char) mapping. The rule below keeps a
+        // char whose full mapping is multi-char UNCHANGED (right for
+        // 'ß' UPPER -> 'ß', a ligature -> itself), but that is WRONG for
+        // the few whose SIMPLE mapping is a single DIFFERENT char.
+        // U+0130 (LATIN CAPITAL LETTER I WITH DOT ABOVE) is the one that
+        // matters: its simple lowercase is 'i' (U+0069) though its full
+        // lowercase is 'i' + COMBINING DOT ABOVE - measured, the engine's
+        // LOWER('İ') is 'i' (one octet) and `WHERE LOWER(nm)='istanbul'`
+        // matches an 'İSTANBUL' row.
+        if !upper && c == '\u{0130}' {
+            out.push('\u{0069}');
+            continue;
+        }
         // a character with no ONE-character mapping keeps itself
         if upper {
             let mut it = c.to_uppercase();
