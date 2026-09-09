@@ -79700,6 +79700,11 @@ fn merge_exec(
     }
     // PHASE 2 - THE ACTIONS, all or nothing
     let mark = undo_window_push(database, WindowKind::Nested);
+    // the image the MERGE STARTED FROM - every SET / `AND` / VALUES
+    // subquery that reads the target must fold against THIS, not a state
+    // rows processed earlier in the same MERGE have mutated (statement
+    // stability; see [merge_stmt_image] use below)
+    let start_image = database.as_ref().map(|d| d.bytes());
     let (mut ins, mut upd, mut del) = (0i32, 0i32, 0i32);
     // the BY SOURCE branches name the target alone; the source's
     // columns are all NULL there (RETURNING S.X answers NULL, probed)
@@ -79716,12 +79721,20 @@ fn merge_exec(
                     MergeAction::Update(sets) => (format!("UPDATE {} SET {} WHERE {}", render_canon_ref(target), sub(sets)?, where_), 1),
                     MergeAction::Delete => (format!("DELETE FROM {} WHERE {}", render_canon_ref(target), where_), 2),
                 };
-                let (aplan, _) = if kind == 1 {
-                    plan_update(&sql, database)
-                        .ok_or_else(|| format!("the MERGE UPDATE branch is outside this server's surface: {}", sql))?
-                } else {
-                    plan_delete(&sql, database)
-                        .ok_or_else(|| format!("the MERGE DELETE branch is outside this server's surface: {}", sql))?
+                // FOLD the branch's SET / condition subqueries against
+                // the MERGE's start image (statement stability), then
+                // EXECUTE the write on the LIVE image so earlier rows'
+                // writes accumulate - the guard is dropped before the
+                // write.
+                let (aplan, _) = {
+                    let _g = start_image.clone().map(SubqImageGuard::arm);
+                    if kind == 1 {
+                        plan_update(&sql, database)
+                            .ok_or_else(|| format!("the MERGE UPDATE branch is outside this server's surface: {}", sql))?
+                    } else {
+                        plan_delete(&sql, database)
+                            .ok_or_else(|| format!("the MERGE DELETE branch is outside this server's surface: {}", sql))?
+                    }
                 };
                 if let Plan::RefusedEval(e) = &aplan {
                     return Err(ExecErr::Eval(e.clone()));
@@ -79760,8 +79773,11 @@ fn merge_exec(
                         Some(c) => format!("INSERT INTO {} ({}) SELECT {} FROM RDB$DATABASE{}", render_canon_ref(target), c, sub(vals)?, where_),
                         None => format!("INSERT INTO {} SELECT {} FROM RDB$DATABASE{}", render_canon_ref(target), sub(vals)?, where_),
                     };
-                    let (iplan, _) = plan_insert(&sql, database)
-                        .ok_or_else(|| format!("the MERGE INSERT branch is outside this server's surface: {}", sql))?;
+                    let (iplan, _) = {
+                        let _g = start_image.clone().map(SubqImageGuard::arm);
+                        plan_insert(&sql, database)
+                            .ok_or_else(|| format!("the MERGE INSERT branch is outside this server's surface: {}", sql))?
+                    };
                     if let Plan::RefusedEval(e) = &iplan {
                         return Err(ExecErr::Eval(e.clone()));
                     }
@@ -79817,12 +79833,17 @@ fn merge_exec(
                         }
                         MergeAction::Delete => (format!("DELETE FROM {} WHERE {}", render_canon_ref(target), where_), 2),
                     };
-                    let (aplan, _) = if kind == 1 {
-                        plan_update(&sql, database)
-                            .ok_or_else(|| format!("the MERGE UPDATE branch is outside this server's surface: {}", sql))?
-                    } else {
-                        plan_delete(&sql, database)
-                            .ok_or_else(|| format!("the MERGE DELETE branch is outside this server's surface: {}", sql))?
+                    // fold against the start image, execute on the live
+                    // one (see the by-source branch above)
+                    let (aplan, _) = {
+                        let _g = start_image.clone().map(SubqImageGuard::arm);
+                        if kind == 1 {
+                            plan_update(&sql, database)
+                                .ok_or_else(|| format!("the MERGE UPDATE branch is outside this server's surface: {}", sql))?
+                        } else {
+                            plan_delete(&sql, database)
+                                .ok_or_else(|| format!("the MERGE DELETE branch is outside this server's surface: {}", sql))?
+                        }
                     };
                     if let Plan::RefusedEval(e) = &aplan {
                         return Err(ExecErr::Eval(e.clone()));
