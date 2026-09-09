@@ -64713,6 +64713,22 @@ fn conditional_type<'a>(
     branches: impl Iterator<Item = &'a Expr>,
     descs: &[Descriptor],
 ) -> Option<ExprType> {
+    let branches: Vec<&Expr> = branches.collect();
+    // A DECFLOAT branch has no shared describe this server can announce
+    // yet - DECFLOAT is not an ExprType, so the fold below DROPS it (its
+    // type_of is None) and the conditional would take the SIBLING's type,
+    // rendering the decfloat value WRONG (COALESCE(<decfloat>, <int>)
+    // came back 0, and COALESCE(<int>, <decfloat>) would truncate the
+    // decfloat when the int is NULL). The engine types the mix DECFLOAT
+    // and coerces the other branch into it - a full DECFLOAT result type
+    // is a later chunk. Until then REFUSE the whole conditional rather
+    // than answer a confident wrong value; a pure-decfloat conditional
+    // already refuses (every branch's type_of is None). NULLIF does not
+    // reach here (its own first-operand rule).
+    if branches.iter().any(|e| is_decfloat_arith(e, descs)) {
+        return None;
+    }
+    let branches = branches.into_iter();
     let mut first = None;
     let mut any_numeric = false;
     let mut any_text = false;
@@ -67033,6 +67049,11 @@ impl Expr {
             // Reading it through `Expr::Null`'s Int made `NULLIF(NULL, 1)`
             // announce INT64 len 8 where the engine says TEXT len 1.
             Expr::NullIf(a, _) if matches!(**a, Expr::Null) => Some(ExprType::Text),
+            // NULLIF answers its FIRST operand's type. A DECFLOAT first
+            // operand types the result DECFLOAT (a type this server has
+            // no ExprType for yet), so it must REFUSE - never borrow the
+            // second operand's type below and render the decfloat 0.
+            Expr::NullIf(a, _) if is_decfloat_arith(a, descs) => None,
             Expr::NullIf(a, b) => a.type_of(descs).or_else(|| b.type_of(descs)),
             Expr::Iif(_, a, b) => {
                 conditional_type([&**a, &**b].into_iter(), descs)
