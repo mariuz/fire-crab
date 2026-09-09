@@ -61317,10 +61317,10 @@ fn expr_atom_bare(b: &[char], pos: &mut usize) -> Option<RawExpr> {
                 }
                 scale = -((*pos - frac_start) as i8);
             }
-            // an EXPONENT makes the literal APPROXIMATE, whatever it
-            // looks like otherwise: `1e3` is a DOUBLE 1000, not the
-            // integer (the engine types it that way, probed - its
-            // describe is a DOUBLE and it prints at 16 digits)
+            // an EXPONENT makes the literal a SIGNIFICAND-typed number,
+            // not automatically a DOUBLE ([classify_exp_literal]): a
+            // significand within i64 is DOUBLE (`1e3`, `1e40`), exactly
+            // 2^63 is the INT128 quirk, and a larger one is DECFLOAT(34).
             if b.get(*pos).is_some_and(|c| *c == 'e' || *c == 'E') {
                 let after = *pos + 1;
                 let digits_at = if b.get(after).is_some_and(|c| *c == '+' || *c == '-') {
@@ -61336,7 +61336,11 @@ fn expr_atom_bare(b: &[char], pos: &mut usize) -> Option<RawExpr> {
                         *pos += 1;
                     }
                     let text: String = b[start..*pos].iter().collect();
-                    return text.parse::<f64>().ok().map(RawExpr::Double);
+                    return classify_exp_literal(&text).map(|e| match e {
+                        ExpLit::Double(d) => RawExpr::Double(d),
+                        ExpLit::Int128(n) => RawExpr::Int128(n),
+                        ExpLit::DecFloat34(x) => RawExpr::DecFloat34(x),
+                    });
                 }
             }
             if scale != 0 {
@@ -64929,6 +64933,82 @@ fn value_as_dec(v: &Value) -> Option<fire_crab_ods::decfloat::Dec> {
 /// literals and would need the infinity/NaN encodings and the NaN trap,
 /// so this returns `None` and the compare raises 22018 instead of the
 /// engine's convert/trap. A recorded boundary.
+/// The outcome of typing an EXPONENT-form numeric literal.
+enum ExpLit {
+    Double(f64),
+    Int128(i128),
+    DecFloat34(u128),
+}
+
+/// Type an EXPONENT-form numeric literal the way Firebird 6 does. The
+/// SIGNIFICAND alone decides - the mantissa digits with the `.` removed
+/// and leading zeros dropped, parsed as an unsigned magnitude M - NOT
+/// the net value or the exponent's magnitude (all measured on FB6):
+///
+///   M <= 2^63-1   -> DOUBLE          (`1e5`, `1.5e38`, even `1e40`;
+///                                     the significand is just `1`)
+///   M == 2^63     -> INT128          (a lone quirk: EXACTLY
+///                                     9223372036854775808, and only a
+///                                     whole scale-0 value - `...808e0`,
+///                                     `...808e5`)
+///   M >= 2^63+1   -> DECFLOAT(34)    (`9999999999999999999e0`,
+///                                     `12345678901234567890e0`,
+///                                     `1.2345678901234567890e5`)
+///
+/// The DOUBLE branch parses the ORIGINAL text, byte-identical to before.
+/// `None` REFUSES a 2^63 significand that would need a SCALED or ROUNDED
+/// INT128 (a fractional mantissa or a negative exponent) - no literal
+/// form carries an Int128 scale, and the engine types these INT128, so a
+/// DOUBLE would be a confident WRONG TYPE; refusing is law-safe.
+fn classify_exp_literal(text: &str) -> Option<ExpLit> {
+    let (sig, exp) = text.split_once(['e', 'E'])?;
+    let exp: i32 = exp.parse().ok()?;
+    let neg = sig.starts_with('-');
+    let body = sig.strip_prefix(['+', '-']).unwrap_or(sig);
+    let (mut digits, mut frac, mut seen_dot) = (String::new(), 0i32, false);
+    for c in body.chars() {
+        match c {
+            '0'..='9' => {
+                digits.push(c);
+                if seen_dot {
+                    frac += 1;
+                }
+            }
+            '.' => {
+                if seen_dot {
+                    return None;
+                }
+                seen_dot = true;
+            }
+            _ => return None,
+        }
+    }
+    let d = digits.trim_start_matches('0');
+    const I64MAX: u128 = 9_223_372_036_854_775_807;
+    const TWO63: u128 = 9_223_372_036_854_775_808;
+    let m = match d.parse::<u128>() {
+        Ok(m) => m,
+        // past 39 digits it cannot fit u128 and is certainly > 2^63
+        Err(_) => return text_to_dec128(text).map(ExpLit::DecFloat34),
+    };
+    if m <= I64MAX {
+        text.parse::<f64>().ok().map(ExpLit::Double)
+    } else if m == TWO63 {
+        // the 2^63 INT128 quirk: representable only as a scale-0 i128
+        if frac == 0 && exp >= 0 {
+            let mut v: i128 = TWO63 as i128;
+            for _ in 0..exp {
+                v = v.checked_mul(10)?; // refuse on i128 overflow, never wrap
+            }
+            Some(ExpLit::Int128(if neg { -v } else { v }))
+        } else {
+            None
+        }
+    } else {
+        text_to_dec128(text).map(ExpLit::DecFloat34)
+    }
+}
+
 fn text_to_dec128(s: &str) -> Option<u128> {
     let b = s.as_bytes();
     let mut i = 0;
@@ -73699,6 +73779,7 @@ fn tok_lhs_raw(t: &Tok) -> Option<RawExpr> {
         Tok::Ident(c) => RawExpr::Col(c.clone()),
         Tok::Int(n) => RawExpr::Int(*n),
         Tok::Int128(n) => RawExpr::Int128(*n),
+        Tok::DecFloat34(b) => RawExpr::DecFloat34(*b),
         Tok::Dec(r, sc) => RawExpr::Dec(*r, *sc),
         Tok::Str(v) | Tok::StrKey(v) => RawExpr::Str(v.clone()),
         Tok::Null => RawExpr::Null,
@@ -75350,10 +75431,11 @@ fn numeric_tok(s: &str, b: &[u8], start: usize, i: &mut usize) -> Option<Tok> {
         }
         scale = -((*i - fs) as i8);
     }
-    // an EXPONENT makes the literal APPROXIMATE, exactly as it does in
-    // the select list's parser: `1e3` is a DOUBLE 1000, not an integer.
-    // An `e` with no digits after it is not an exponent - it begins the
-    // next token, so `i` stays put.
+    // an EXPONENT is typed by its SIGNIFICAND, exactly as in the select
+    // list's parser ([classify_exp_literal]): within i64 -> DOUBLE, the
+    // 2^63 quirk -> INT128, larger -> DECFLOAT(34). An `e` with no digits
+    // after it is not an exponent - it begins the next token, so `i`
+    // stays put.
     if b.get(*i).is_some_and(|c| *c == b'e' || *c == b'E') {
         let after = *i + 1;
         let digits_at = if b.get(after).is_some_and(|c| *c == b'+' || *c == b'-') {
@@ -75366,10 +75448,11 @@ fn numeric_tok(s: &str, b: &[u8], start: usize, i: &mut usize) -> Option<Tok> {
             while *i < b.len() && b[*i].is_ascii_digit() {
                 *i += 1;
             }
-            return s[start..*i]
-                .parse::<f64>()
-                .ok()
-                .map(|d| Tok::FnExpr(RawExpr::Double(d)));
+            return classify_exp_literal(&s[start..*i]).map(|e| match e {
+                ExpLit::Double(d) => Tok::FnExpr(RawExpr::Double(d)),
+                ExpLit::Int128(n) => Tok::Int128(n),
+                ExpLit::DecFloat34(x) => Tok::DecFloat34(x),
+            });
         }
     }
     if scale != 0 {
@@ -76206,6 +76289,7 @@ fn texpr_atom_bare(t: &[Tok], pos: &mut usize) -> Option<RawExpr> {
     let e = match t.get(*pos)? {
         Tok::Int(n) => RawExpr::Int(*n),
         Tok::Int128(n) => RawExpr::Int128(*n),
+        Tok::DecFloat34(b) => RawExpr::DecFloat34(*b),
         Tok::Dec(r, sc) => RawExpr::Dec(*r, *sc),
         Tok::Str(v) => RawExpr::Str(v.clone()),
         Tok::Null => RawExpr::Null,
