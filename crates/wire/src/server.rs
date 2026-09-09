@@ -63673,6 +63673,31 @@ fn resolve_expr_inner(
             // which charset that is: the blank everywhere, a single
             // 0x00 for OCTETS (intl_builtin.cpp:1516 sets the binary
             // charset's space character to a NUL)
+            // FIREBIRD'S IMPLEMENTATION LIMIT: an LPAD/RPAD result is a
+            // VARCHAR whose declared byte width is the pad length N times
+            // the SOURCE charset's bytes-per-character; when that exceeds
+            // 65535 the engine raises 54000 "Implementation limit
+            // exceeded" AT PREPARE - even wrapped in CHAR_LENGTH, which
+            // otherwise consumes the string. fire-crab built the
+            // over-long string and answered a confident wrong value (and
+            // a wrong cardinality where the engine errors). Refuse the
+            // whole statement here so the raise propagates through any
+            // enclosing expression (measured: `LPAD('Hi',16384,'*')`
+            // under UTF8 is 16384x4 = 65536 -> refuse; 16383 is fine; a
+            // NONE/single-byte source caps at 65535 chars). A non-literal
+            // length keeps the current fallback width (the rare dynamic
+            // case).
+            if matches!(f, SysFn::Lpad | SysFn::Rpad) {
+                if let (Some(src), Some(Expr::Int(len))) = (resolved.first(), resolved.get(1)) {
+                    if *len >= 0 {
+                        let bpc = cmp_text_charset(src, descs)
+                            .map_or(1i64, |cs| fire_crab_ods::intl::bytes_per_char(cs) as i64);
+                        if *len * bpc > 65535 {
+                            return None;
+                        }
+                    }
+                }
+            }
             // LPAD/RPAD's default fill is the same charset space
             // (SysFunction.cpp): 0x00 pads a byte string, so
             // `LPAD(x'41', 3)` is `000041` and not `202041`
