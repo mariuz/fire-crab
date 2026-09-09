@@ -46388,6 +46388,32 @@ fn plan_query_inner_ctx(
                     }
                     None => (main.clone(), false, 0, None),
                 };
+                // FIRST/SKIP/ROWS SLICES A SET whose row order the engine
+                // takes from RECORD-NUMBER (storage) order - a depth-first
+                // walk - and this server takes from level order (a
+                // breadth-first queue). The two pick DIFFERENT ROWS at the
+                // boundary (measured: FIRST 3 of a tree walk is the engine's
+                // {1, 1/2, 1/2/4} against this server's {1, 1/2, 1/3}).
+                // fire-crab has no record-number model, so it cannot
+                // reproduce the engine's sibling order - a stack instead of
+                // a queue would only trade one wrong order for another. A
+                // top-level ORDER BY over a key makes the two agree
+                // (measured, byte-identical); without one, a FIRST/SKIP
+                // recursive result is a confident WRONG ROWSET, so REFUSE.
+                // (A DISTINCT alone is order-independent - it changes which
+                // duplicates survive, never which rows - and stays allowed;
+                // the pure-order, no-limit walk is a known order-only gap,
+                // not a wrong set, and is left answering.)
+                if (skip > 0 || take.is_some())
+                    && split_query(&final_sql).and_then(|q| q.5).is_none()
+                {
+                    return Some({
+                        if trace {
+                            eprintln!("[srv] recursive CTE refused: FIRST/SKIP/ROWS without a top-level ORDER BY (BFS picks different rows than the engine's DFS)");
+                        }
+                        Plan::Refused
+                    });
+                }
                 // the CTE's name IS the binding alias (probed: a bare
                 // recursive CTE R answers relation_alias R)
                 let plan = plan_over_source(
@@ -71026,7 +71052,7 @@ fn corr_template(id: usize) -> Option<CorrTemplate> {
 
 /// Plan the inner text with typed NULL stand-ins to learn what it
 /// announces. None when it does not plan - the statement then refuses.
-fn corr_describe(scan: &CorrScan, scope: &CorrScope, db_opt: &Option<Database>) -> Option<ProjCol> {
+fn corr_describe(scan: &CorrScan, scope: &CorrScope, db_opt: &Option<Database>, scalar_arity: bool) -> Option<ProjCol> {
     // A PROJECTED OUTER COLUMN describes as that column itself - its own
     // type and width (an INT128 / DECFLOAT / TIME ZONE column exactly,
     // where a CAST(NULL) stand-in planned by this server described
@@ -71068,7 +71094,20 @@ fn corr_describe(scan: &CorrScan, scope: &CorrScope, db_opt: &Option<Database>) 
     if !ip.is_empty() || matches!(plan, Plan::Refused | Plan::RefusedEval(_)) {
         return None;
     }
-    let mut col = output_cols_of(&plan).into_iter().next()?;
+    let outs = output_cols_of(&plan);
+    // ENGINE ARITY CONTRACT (07002 / -104 "count of column list and
+    // variable list do not match"): a subquery used as a SCALAR operand,
+    // an IN / NOT IN right side, or a quantified (ANY/ALL/SOME) operand
+    // must project EXACTLY ONE column - the engine raises otherwise, at
+    // prepare and independent of cardinality. fire-crab folded the
+    // multi-column inner to None upstream and then fell into this
+    // describe, which took column 1 and answered a WRONG ROWSET. Refuse
+    // the mismatch instead. EXISTS is exempt (it ignores its projection)
+    // and is registered with scalar_arity = false.
+    if scalar_arity && outs.len() != 1 {
+        return None;
+    }
+    let mut col = outs.into_iter().next()?;
     // THE ANNOUNCED WIDTH MUST BE THE TYPE'S: an INT128 described at 64
     // bytes while its value is encoded at 16 was a malformed wire row
     // (isql "message length error", review-caught) - refuse instead
@@ -71196,7 +71235,13 @@ fn corr_register(
     if scan.refs.iter().any(|r| r.desc.as_ref().is_none_or(|d| !corr_literal_form_ok(d))) {
         return None; // an outer column with no literal form: refused at prepare
     }
-    let desc = corr_describe(&scan, scope, db_opt)?;
+    // a scalar / IN / quantified operand takes exactly one column (the
+    // engine's 07002); EXISTS ignores arity
+    let scalar_arity = matches!(
+        kind,
+        CorrKindRaw::Scalar | CorrKindRaw::In { .. } | CorrKindRaw::Quant { .. }
+    );
+    let desc = corr_describe(&scan, scope, db_opt, scalar_arity)?;
     if matches!(kind, CorrKindRaw::Scalar) && desc.sql_type & !1 == 520 {
         return None; // a blob-valued scalar: recorded refusal
     }
