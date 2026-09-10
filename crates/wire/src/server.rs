@@ -18897,8 +18897,17 @@ fn build_expr_col_from(e: Expr, name: &str, descs: &[Descriptor]) -> Option<Proj
             (w, nullable(t), l, e.result_scale(descs)? as i32)
         }
         // an approximate result is a DOUBLE on the wire whatever its
-        // source width - the engine widens FLOAT the same way
-        ExprType::Approx => (Wire::Double, nullable(480), 8, 0),
+        // source width - the engine widens FLOAT arithmetic the same
+        // way - EXCEPT a bare CAST(.. AS FLOAT/REAL), which announces
+        // the 4-byte single-precision slot (the value is Value::Float,
+        // rendered at 8 significant digits)
+        ExprType::Approx => {
+            if matches!(e, Expr::Cast(_, CastTarget::Float, _)) {
+                (Wire::Float, nullable(482), 4, 0)
+            } else {
+                (Wire::Double, nullable(480), 8, 0)
+            }
+        }
         ExprType::Bool => (Wire::Bool, nullable(32764), 1, 0),
         // a temporal result travels exactly like a stored temporal
         // column (the same wire forms wire_for announces)
@@ -50046,7 +50055,14 @@ fn build_group_items(
                                 Some(d) => wire_for(d),
                                 None => (Wire::Varying, 448, 32765, 0, 0),
                             },
-                            ExprType::Approx => (Wire::Double, 480, 8, 0, 0),
+                            // MIN/MAX keep the SOURCE column's own
+                            // describe (a FLOAT column stays 482/len4;
+                            // the fold keeps the winning Value verbatim,
+                            // so a Value::Float survives)
+                            ExprType::Approx => match field_desc {
+                                Some(d) => wire_for(d),
+                                None => (Wire::Double, 480, 8, 0, 0),
+                            },
                             ExprType::Bool => (Wire::Bool, 32764, 1, 0, 0),
                             ExprType::Temporal(TKind::Date) => (Wire::Date, 570, 4, 0, 0),
                             ExprType::Temporal(TKind::Time) => (Wire::Time, 560, 4, 0, 0),
@@ -55049,7 +55065,8 @@ fn cast_target_of_col(pc: &ProjCol) -> Option<CastTarget> {
                 })
             }
         }
-        480 | 482 => Some(CastTarget::Approx),
+        480 => Some(CastTarget::Approx),
+        482 => Some(CastTarget::Float),
         452 | 448 => Some(CastTarget::Text {
             len: usize::try_from(pc.length).ok()?,
             pad: pc.sql_type & !1 == 452,
@@ -60552,8 +60569,15 @@ enum CastTarget {
     /// (probed: CAST(1 AS NUMERIC(9,2)) describes subtype 1, DECIMAL
     /// subtype 2).
     Numeric { scale: i8, bytes: u8, sub_type: i16 },
-    /// `FLOAT` / `DOUBLE PRECISION` - both announce DOUBLE
+    /// `DOUBLE PRECISION` - announces DOUBLE (sqltype 480, len 8)
     Approx,
+    /// `FLOAT` / `REAL` - single precision (sqltype 482, len 4). Typed
+    /// as `ExprType::Approx` like DOUBLE, so arithmetic AROUND it still
+    /// widens to DOUBLE (the engine's rule: FLOAT + FLOAT is DOUBLE);
+    /// the cast itself narrows the value to f32 (`Value::Float`) and
+    /// announces the 4-byte FLOAT slot, which renders at 8 significant
+    /// digits.
+    Float,
     /// `DATE` / `TIME` / `TIMESTAMP`
     Temporal(TKind),
     /// `CAST(<v> AS BLOB [SUB_TYPE <n>|TEXT|BINARY] [CHARACTER SET <cs>]
@@ -60626,7 +60650,7 @@ impl CastTarget {
                 16 => None,
                 _ => Some(52),
             },
-            CastTarget::Approx | CastTarget::Temporal(_) => Some(130),
+            CastTarget::Approx | CastTarget::Float | CastTarget::Temporal(_) => Some(130),
             // a DECFLOAT text conversion is capped by decNumber's own
             // grammar (text_to_dec128), not a fixed buffer here
             CastTarget::Text { .. }
@@ -62542,8 +62566,9 @@ fn parse_cast_target(b: &[char], pos: &mut usize) -> Option<CastTarget> {
             _ => TKind::Timestamp,
         }));
     }
-    if ku == "FLOAT" {
-        return Some(CastTarget::Approx);
+    if ku == "FLOAT" || ku == "REAL" {
+        // REAL is the SQL synonym for single-precision FLOAT
+        return Some(CastTarget::Float);
     }
     if ku == "BOOLEAN" {
         return Some(CastTarget::Bool);
@@ -63388,6 +63413,7 @@ fn cast_target_descriptor(t: &CastTarget) -> Option<Descriptor> {
         CastTarget::Numeric { scale, bytes, sub_type } => {
             d(int_dtype(*bytes)?, *scale, *bytes as u16, *sub_type)
         }
+        CastTarget::Float => d(dtype::REAL, 0, 4, 0),
         CastTarget::Approx => d(dtype::DOUBLE, 0, 8, 0),
         // the temporal targets travel in their native slots (probed: the
         // `?` of CAST(? AS DATE) describes 570 SQL_TYPE_DATE len 4, TIME
@@ -67392,7 +67418,7 @@ impl Expr {
                     // DML value stores its text
                     CastTarget::Blob { .. } => ExprType::Text,
                     CastTarget::Numeric { .. } => ExprType::Numeric,
-                    CastTarget::Approx => ExprType::Approx,
+                    CastTarget::Approx | CastTarget::Float => ExprType::Approx,
                     CastTarget::Temporal(k) => ExprType::Temporal(*k),
                     // a DECFLOAT cast has no ExprType of its own; the
                     // describe short-circuits it, so declining here
@@ -67908,6 +67934,7 @@ impl Expr {
                 }),
                 CastTarget::Text { .. }
                 | CastTarget::Approx
+                | CastTarget::Float
                 | CastTarget::Temporal(_)
                 | CastTarget::DecFloat { .. }
                 | CastTarget::Bool => None,
@@ -69042,6 +69069,37 @@ impl Expr {
                     // the engine's 22018). SPACE-trimmed, like the exact
                     // targets: cvt.cpp's double grammar skips 0x20 and
                     // no other blank
+                    // FLOAT / REAL: compute the f64 exactly as the
+                    // DOUBLE cast does, then NARROW to f32 (Value::Float,
+                    // 8-significant-digit render). A well-formed value
+                    // past f32 range narrows to a non-finite - the
+                    // engine's 22003 there too (a FLOAT column cannot
+                    // hold it), never a silent Infinity.
+                    CastTarget::Float => {
+                        let narrow = |d: f64| -> Result<Value, EvalErr> {
+                            let f = d as f32;
+                            if !f.is_finite() {
+                                return Err(EvalErr::NumericOutOfRange);
+                            }
+                            Ok(Value::Float(f))
+                        };
+                        match &v {
+                            v if approx_of(v).is_some() => narrow(approx_of(v).unwrap_or(0.0))?,
+                            Value::Text(t) => match text_number(t) {
+                                None | Some(TextNum::Hex { .. }) => {
+                                    return Err(conv_err(*cs, t.clone()))
+                                }
+                                Some(tn) => match text_to_approx(tn, t) {
+                                    Some(d) => narrow(d)?,
+                                    None => return Err(EvalErr::NumericOutOfRange),
+                                },
+                            },
+                            other => match numeric_parts(other) {
+                                Some((raw, sc)) => narrow(exact_to_f64(raw as i128, sc as i32))?,
+                                None => return Err(EvalErr::ConversionError(None)),
+                            },
+                        }
+                    }
                     CastTarget::Approx => match &v {
                         v if approx_of(v).is_some() => {
                             Value::Double(approx_of(v).unwrap_or(0.0))
@@ -101962,7 +102020,8 @@ mod tests {
         assert_eq!(tc(CS_OCTETS, CS_WIN1252, "\u{81}\u{82}").map(|s| s.chars().count()), Ok(2));
         assert!(matches!(target("CHAR(5)"), Some(CastTarget::Text { len: 5, pad: true, .. })));
         assert!(matches!(target("DOUBLE PRECISION"), Some(CastTarget::Approx)));
-        assert!(matches!(target("FLOAT"), Some(CastTarget::Approx)));
+        assert!(matches!(target("FLOAT"), Some(CastTarget::Float)));
+        assert!(matches!(target("REAL"), Some(CastTarget::Float)));
         assert!(matches!(target("DATE"), Some(CastTarget::Temporal(TKind::Date))));
         assert!(matches!(target("TIMESTAMP"), Some(CastTarget::Temporal(TKind::Timestamp))));
         // NUMERIC's scale is what the value is rounded TO; a precision
