@@ -45093,7 +45093,8 @@ fn branch_rows_res(
             rows.append(&mut got);
         }
         if *distinct {
-            distinct_rows(&mut rows, order_by.is_some(), &coll_cols(&output_cols_of(plan)));
+            let oc = output_cols_of(plan);
+            distinct_rows(&mut rows, order_by.is_some(), &coll_cols(&oc), &varying_cols(&oc))?;
         }
         if let Some(key) = order_by {
             let keys = [key.clone()];
@@ -45154,7 +45155,8 @@ fn branch_rows_res(
         }
         let mut rows = branch_rows_res(inner, db, args)?;
         if *distinct {
-            distinct_rows(&mut rows, plan_is_ordered(inner), &coll_cols(&output_cols_of(inner)));
+            let oc = output_cols_of(inner);
+            distinct_rows(&mut rows, plan_is_ordered(inner), &coll_cols(&oc), &varying_cols(&oc))?;
         }
         return Ok(rows.into_iter().skip(*skip).take(take.unwrap_or(usize::MAX)).collect());
     }
@@ -45676,7 +45678,12 @@ fn coll_cols(cols: &[ProjCol]) -> Vec<u16> {
 /// answers descending, so `ordered` says whether something else has
 /// already decided the row order; only when nothing has does the set's
 /// own ascending order show through.
-fn distinct_rows(rows: &mut Vec<Vec<Value>>, ordered: bool, coll: &[u16]) {
+fn distinct_rows(
+    rows: &mut Vec<Vec<Value>>,
+    ordered: bool,
+    coll: &[u16],
+    varying: &[bool],
+) -> Result<(), EvalErr> {
     // SORT, THEN DROP ADJACENT EQUALS (the engine's SORT_unique over a
     // projection) - in place of the quadratic seen-list this was. Each
     // row carries its input position as a trailing key, so the stable
@@ -45702,12 +45709,36 @@ fn distinct_rows(rows: &mut Vec<Vec<Value>>, ordered: bool, coll: &[u16]) {
         .collect();
     let sorted = match sort_rows_spilling(decorated, &keys) {
         Ok(s) => s,
-        Err(_) => return,
+        Err(_) => return Ok(()),
     };
     let mut kept: Vec<Vec<Value>> = Vec::new();
     for r in sorted {
         if let Some(last) = kept.last() {
             if rows_equal(&last[..width], &r[..width], coll) {
+                // A dedup collision whose survivors differ in TRAILING
+                // BLANKS on a VARYING column has no representative this
+                // server can reproduce: the engine returns whichever
+                // spelling the LAST row fed to its unique-sort carried -
+                // a storage/leg-order artifact (measured: the survivor
+                // flips with union leg order AND with a table's insert
+                // order). Refuse rather than answer a confident wrong
+                // spelling. A CHAR survivor is re-padded to its declared
+                // width by the encoder, so its representative is
+                // invariant and never refused (checked only for
+                // Wire::Varying); a byte-EQUAL collapse (two 'ab's) is
+                // unambiguous and kept. This is the same call
+                // [coll_groupable_ttype] already makes for a CI/AI
+                // collation, here for the default PAD SPACE one and only
+                // when the colliding rows actually differ.
+                for i in 0..width {
+                    if varying.get(i).copied().unwrap_or(false) {
+                        if let (Value::Text(a), Value::Text(b)) = (&last[i], &r[i]) {
+                            if a != b {
+                                return Err(EvalErr::Unsupported);
+                            }
+                        }
+                    }
+                }
                 continue;
             }
         }
@@ -45717,13 +45748,22 @@ fn distinct_rows(rows: &mut Vec<Vec<Value>>, ordered: bool, coll: &[u16]) {
         keys = vec![OrderKey::field(width, false, NullsAt::Default)];
         kept = match sort_rows_spilling(kept, &keys) {
             Ok(s) => s,
-            Err(_) => return,
+            Err(_) => return Ok(()),
         };
     }
     for mut r in kept {
         r.truncate(width);
         rows.push(r);
     }
+    Ok(())
+}
+
+/// Which output columns travel as `Wire::Varying` (VARCHAR) - the ones
+/// whose deduped-survivor spelling is not re-padded by the encoder, so a
+/// blank-differing collision on one has no reproducible representative
+/// (see [distinct_rows]).
+fn varying_cols(cols: &[ProjCol]) -> Vec<bool> {
+    cols.iter().map(|c| matches!(c.wire, Wire::Varying)).collect()
 }
 
 /// Does this plan decide its own row order? A `DISTINCT` above one that
@@ -57178,7 +57218,7 @@ fn emit_rows_inner(
                             }
                             rows_v.push(row);
                         }
-                        distinct_rows(&mut rows_v, !order_by.is_empty(), &coll_cols(icols));
+                        distinct_rows(&mut rows_v, !order_by.is_empty(), &coll_cols(icols), &varying_cols(icols)).map_err(EmitErr::Eval)?;
                         for r in rows_v.iter().skip(*skip).take(take.unwrap_or(usize::MAX)) {
                             encode_row(w, cols, r, out)?;
                         }
@@ -57268,7 +57308,8 @@ fn emit_rows_inner(
                 // DISTINCT compares whole projected rows with NULL equal
                 // to NULL - the same set semantics UNION uses
                 if *distinct {
-                    distinct_rows(&mut rows, plan_is_ordered(inner), &coll_cols(&output_cols_of(inner)));
+                    let oc = output_cols_of(inner);
+                    distinct_rows(&mut rows, plan_is_ordered(inner), &coll_cols(&oc), &varying_cols(&oc)).map_err(EmitErr::Eval)?;
                 }
                 for r in rows.iter().skip(*skip).take(take.unwrap_or(usize::MAX)) {
                     encode_row(w, cols, r, out)?;
@@ -57316,7 +57357,7 @@ fn emit_rows_inner(
                 // duplicates of each other here (SQL's set semantics),
                 // unlike `= NULL` in a predicate.
                 if *distinct {
-                    distinct_rows(&mut rows, order_by.is_some(), &coll_cols(cols));
+                    distinct_rows(&mut rows, order_by.is_some(), &coll_cols(cols), &varying_cols(cols)).map_err(EmitErr::Eval)?;
                 }
                 if let Some(key) = order_by {
                     let keys = [key.clone()];
@@ -98055,7 +98096,7 @@ mod tests {
             vec![Value::Int(20)],
             vec![Value::Null],
         ];
-        distinct_rows(&mut rows, false, &[]);
+        distinct_rows(&mut rows, false, &[], &[]).unwrap();
         assert_eq!(
             rows,
             vec![
@@ -98072,7 +98113,7 @@ mod tests {
             vec![Value::Int(2), Value::Int(1)],
             vec![Value::Int(1), Value::Int(5)],
         ];
-        distinct_rows(&mut two, false, &[]);
+        distinct_rows(&mut two, false, &[], &[]).unwrap();
         assert_eq!(
             two,
             vec![
@@ -98095,7 +98136,7 @@ mod tests {
             vec![Value::Int(20)],
             vec![Value::Int(10)],
         ];
-        distinct_rows(&mut rows, true, &[]);
+        distinct_rows(&mut rows, true, &[], &[]).unwrap();
         assert_eq!(
             rows,
             vec![vec![Value::Int(30)], vec![Value::Int(20)], vec![Value::Int(10)]]
