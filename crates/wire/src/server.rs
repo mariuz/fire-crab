@@ -2728,12 +2728,21 @@ fn build_describe(cols: &[ProjCol], params: &[Descriptor], att: AttCs) -> Vec<u8
         // an attachment-charset or real-charset-expression text column
         // resolves to its announced charset, width in its bytes - same
         // law as [answer_prepare] (see [resolve_text_cs])
-        // a BLOB's sub_type is its own (a negative one is a user
-        // sub_type, not the text-charset sentinel) and its length is 8
-        let (sub_type, length) = if matches!(c.wire, Wire::Blob) {
-            (c.sub_type, c.length)
-        } else {
+        // ONLY a text wire's sub_type is a charset ttype to resolve to
+        // the attachment charset. Everything else - a numeric (its
+        // sub_type is the NUMERIC/DECIMAL discriminator, 1 or 2), a
+        // temporal, a bool, a DECFLOAT, a BLOB (whose length is 8 and
+        // whose charset rides `scale` via [blob_out_charset]) - carries
+        // its own sub_type and length untouched. Running the text
+        // resolver over a DECIMAL (sub_type 2) mis-read that 2 as a
+        // charset id and, under a real-charset attachment, rewrote the
+        // slot to (att.id, len x bytes-per-char): the row then failed to
+        // fetch (a message-length error) where the value bytes were the
+        // native width all along.
+        let (sub_type, length) = if matches!(c.wire, Wire::Text | Wire::Varying) {
             resolve_text_cs(c.sub_type, c.length, c.oct_length, &att)
+        } else {
+            (c.sub_type, c.length)
         };
         // A TEXT BLOB IS ANNOUNCED IN THE ATTACHMENT'S CHARSET, like
         // every other text value: the engine transliterates its content
@@ -55232,10 +55241,16 @@ fn answer_prepare(items: &[u8], plan: &Plan, params: &[Descriptor], att: AttCs) 
             // 'ab' under a UTF8 attachment is length 8 CHARSET UTF8,
             // under NONE it is length 2 CHARSET NONE; a real-charset
             // EXPRESSION resolves the same way (see [resolve_text_cs])
-            let (sub_type, length) = if matches!(c.wire, Wire::Blob) {
-                (c.sub_type, c.length)
-            } else {
+            // text wires only: their sub_type is a charset ttype (and
+            // the negative sentinels ATT_SUBTYPE / sub<=-2 ride text
+            // too). A numeric/temporal/bool/DECFLOAT/BLOB keeps its own
+            // sub_type and length - the same guard [build_describe]
+            // uses, so a DECIMAL (sub_type 2) is no longer misread as a
+            // charset under a real-charset attachment.
+            let (sub_type, length) = if matches!(c.wire, Wire::Text | Wire::Varying) {
                 resolve_text_cs(c.sub_type, c.length, c.oct_length, &att)
+            } else {
+                (c.sub_type, c.length)
             };
             // a TEXT blob is announced in the ATTACHMENT's charset
             // ([blob_out_charset]) - the content is transliterated on
