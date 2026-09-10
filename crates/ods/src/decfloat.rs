@@ -330,7 +330,20 @@ pub fn encode_dec128(neg: bool, coeff: u128, exp: i32) -> u128 {
 /// [-398, 369]. The exponent's top two bits are always < 0b11 for a valid
 /// decimal64 (biased qe <= 767 < 3*256), the same combination-field
 /// guarantee decimal128 has.
-pub fn encode_dec64(neg: bool, coeff: u64, exp: i32) -> u64 {
+pub fn encode_dec64(neg: bool, mut coeff: u64, mut exp: i32) -> u64 {
+    // BRING THE VALUE INTO CANONICAL RANGE: the stored exponent qe must
+    // be <= 369, or `biased` overflows its two combination-field bits and
+    // garbles the whole word. A value handed in with a higher exponent
+    // and a short coefficient - a cast of `1E+384` arrives as coeff 1,
+    // exp 384 - is padded with trailing zeros: qe drops toward 369 while
+    // the coefficient stays within 16 digits (each x10 keeps it <= 10^16
+    // - 1). A value whose exponent still exceeds 369 after padding is a
+    // decimal64 overflow the caller must reject up front ([fit_dec64]);
+    // reaching here with one only keeps the encoding well-formed.
+    while exp > 369 && coeff <= 999_999_999_999_999 {
+        coeff *= 10;
+        exp -= 1;
+    }
     let biased = (exp + 398) as u32;
     // 16 digits, MSD first; the MSD rides the combination field, the
     // remaining 15 ride 5 declets of 3 digits each
@@ -695,12 +708,32 @@ pub fn dec_to_dec64_bits(d: &Dec) -> u64 {
 /// declines the shapes an INSERT of a plain literal cannot reach.
 pub fn round_to_dec16_of(bits128: u128) -> Option<u64> {
     match decode_dec128(bits128) {
-        Dec::Finite { neg, coeff, exp } => match round_to_dec16(neg, coeff, exp) {
-            Dec::Finite { neg, coeff, exp } => Some(encode_dec64(neg, coeff as u64, exp)),
-            _ => None,
-        },
+        Dec::Finite { neg, coeff, exp } => fit_dec64(neg, coeff, exp),
         _ => None,
     }
+}
+
+/// Fit a decimal value into decimal64: round to 16 significant digits,
+/// normalise the exponent into the storable range, and REFUSE (None) a
+/// magnitude the format cannot hold - the engine's 22003 "Decimal float
+/// overflow". `coeff`/`exp` are the unrounded value; the returned bits
+/// are canonical. Padding brings the stored exponent down to 369 while
+/// the coefficient stays within 16 digits; when even a 16-digit
+/// coefficient leaves the exponent above 369 (adjusted exponent past
+/// emax 384, e.g. `1E+385`), the value overflows and this returns None.
+pub fn fit_dec64(neg: bool, coeff: u128, exp: i32) -> Option<u64> {
+    let (mut c, mut e) = match round_to_dec16(neg, coeff, exp) {
+        Dec::Finite { coeff, exp, .. } => (coeff, exp),
+        _ => return None,
+    };
+    while e > 369 && c <= 999_999_999_999_999 {
+        c *= 10;
+        e -= 1;
+    }
+    if e > 369 {
+        return None; // overflows decimal64 (adjusted exponent > emax 384)
+    }
+    Some(encode_dec64(neg, c as u64, e))
 }
 
 /// Encode a base-10 INTEGER literal (a string of ASCII digits, no sign,

@@ -31694,15 +31694,13 @@ fn encode_wire_value(d: &Descriptor, wp: &WireParam) -> Option<Option<Vec<u8>>> 
                     .to_le_bytes()
                     .to_vec()
             }
-            dtype::DEC64 => match fire_crab_ods::decfloat::round_to_dec16(
+            dtype::DEC64 => match fire_crab_ods::decfloat::fit_dec64(
                 *v < 0,
                 (*v as i128).unsigned_abs(),
                 *ws as i32,
             ) {
-                fire_crab_ods::decfloat::Dec::Finite { neg, coeff, exp } => {
-                    fire_crab_ods::decfloat::encode_dec64(neg, coeff as u64, exp).to_le_bytes().to_vec()
-                }
-                _ => return None,
+                Some(bits) => bits.to_le_bytes().to_vec(),
+                None => return None,
             },
             // a scaled decimal literal (2.5 arrives as Int(25, ws=-1)) into
             // an approximate column: convert the whole magnitude to f64 the
@@ -68580,7 +68578,18 @@ impl Expr {
                         if *wide {
                             Value::DecFloat34(fire_crab_ods::decfloat::dec_to_bits(&dec))
                         } else {
-                            Value::DecFloat16(fire_crab_ods::decfloat::dec_to_dec64_bits(&dec))
+                            // a finite value must FIT decimal64: over the
+                            // format's magnitude the engine raises 22003
+                            // (`CAST('1E+385' AS DECFLOAT(16))`), where a
+                            // raw encode garbled the exponent field
+                            let bits = match &dec {
+                                fire_crab_ods::decfloat::Dec::Finite { neg, coeff, exp } => {
+                                    fire_crab_ods::decfloat::fit_dec64(*neg, *coeff, *exp)
+                                        .ok_or(EvalErr::NumericOutOfRange)?
+                                }
+                                _ => fire_crab_ods::decfloat::dec_to_dec64_bits(&dec),
+                            };
+                            Value::DecFloat16(bits)
                         }
                     }
                     // to the integer family: an integer is kept, a scaled
