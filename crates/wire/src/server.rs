@@ -8928,6 +8928,34 @@ impl ProjCol {
                 if !matches!(self.wire, Wire::Int128) && matches!(v, Value::Int128(..)) {
                     return Err(EvalErr::IntegerOverflow);
                 }
+                // ...and part three, the narrow backings: an exact result
+                // past its announced SMALLINT / INTEGER range raises rather
+                // than encode a WRAPPED value. `-CAST(-32768 AS SMALLINT)`
+                // is +32768, one past the SMALLINT maximum, so the engine
+                // (and now this server) raise 22003 where the 2-byte wire
+                // slot would otherwise truncate it back to -32768. The i64
+                // and i128 negations carry their own checks; only the
+                // i16/i32 backing lacked one. The test is on the BACKING
+                // integer, so a scaled NUMERIC(p,s) over the same width is
+                // covered too; a stored column value always fits and does
+                // not reach this COMPUTED-column arm.
+                if matches!(self.wire, Wire::Int32) {
+                    let raw = match v {
+                        Value::Int(n) => Some(n as i128),
+                        Value::Scaled(r, _) => Some(r as i128),
+                        _ => None,
+                    };
+                    if let Some(r) = raw {
+                        let (lo, hi) = if self.length <= 2 {
+                            (i16::MIN as i128, i16::MAX as i128)
+                        } else {
+                            (i32::MIN as i128, i32::MAX as i128)
+                        };
+                        if r < lo || r > hi {
+                            return Err(EvalErr::IntegerOverflow);
+                        }
+                    }
+                }
                 Ok(v)
             }
             None => {
