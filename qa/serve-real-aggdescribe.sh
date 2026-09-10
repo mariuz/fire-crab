@@ -5,7 +5,9 @@
 #   * MIN and MAX carry the SOURCE column's own type: over an INTEGER
 #     they describe 496 LONG, over a SMALLINT 500 SHORT, over a BIGINT
 #     580 INT64 - lone, and as a scalar subquery in a projection;
-#   * SUM and AVG widen to INT64 (580) regardless of source;
+#   * SUM over SMALLINT/INTEGER and AVG widen to INT64 (580) - SUM
+#     over BIGINT/INT128 widens one bucket further, to INT128, which
+#     serve-real-sumbig covers;
 #   * COUNT(*) and COUNT(col) are INT64 and the ONE aggregate the
 #     engine announces NOT NULLABLE (580 even, no Nullable flag);
 #   * an aggregate inside arithmetic (MAX(I) + 1) widens to INT64.
@@ -73,7 +75,7 @@ both() { check "$1" "$(sq "$F" "$2")" "$(sq "$E" "$2")"; }
 both "MAX over INTEGER describes LONG"        "SELECT MAX(I) FROM T;"
 both "MAX over SMALLINT describes SHORT"      "SELECT MAX(S) FROM T;"
 both "MIN over BIGINT stays INT64"            "SELECT MIN(B) FROM T;"
-both "SUM widens to INT64 whatever the source" "SELECT SUM(S) FROM T;"
+both "SUM over SMALLINT widens to INT64"      "SELECT SUM(S) FROM T;"
 both "COUNT(*) is INT64 and NOT nullable"     "SELECT COUNT(*) FROM T;"
 both "COUNT(col) the same"                    "SELECT COUNT(I) FROM T;"
 both "an aliased MIN keeps the type and the alias" "SELECT MIN(S) AS LO FROM T;"

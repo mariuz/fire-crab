@@ -50813,6 +50813,19 @@ fn aggregate(
     if matches!(func, AggFn::Avg | AggFn::List) || func.is_statistical() {
         return None;
     }
+    // SUM over a BIGINT (INT64) column widens to INT128: the engine
+    // promotes SUM(BIGINT) -> INT128, and even a non-overflowing total
+    // is announced INT128 (len 16). This i64 fold and the lone-aggregate
+    // fast path's hardcoded ScalarTy::int64 describe can carry neither -
+    // the fold `a + *i` wraps silently past 2^63 and the truncated value
+    // serializes into an 8-byte slot (measured: SUM over 9e18 + 9e18
+    // answered -446744073709551616, no error). Decline so the group
+    // machinery handles it: it accumulates in i128 (exe mk_num) and
+    // describes INT128, exactly as it already does for a scaled-numeric
+    // SUM. MIN/MAX over the same column do not widen and stay here.
+    if matches!(func, AggFn::Sum) && descs.get(fid)?.dtype == dtype::INT64 {
+        return None;
+    }
     let mut acc: Option<i64> = None;
     let hit = for_each_candidate(db, rel, formats, index, usize::MAX, |v| {
         if !matches(v) {
