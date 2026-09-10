@@ -12111,6 +12111,21 @@ fn expr_reads(e: &Expr, f: &dyn Fn(usize) -> bool) -> bool {
     match e {
         Expr::Col(fid) => f(*fid),
         Expr::BlobText(fid, _) => f(*fid),
+        // an ARRAY element reads the array column's blob id (the `fid`
+        // slot in the record) AND every subscript expression. Without
+        // the fid marked, [project_read_len] under-estimates the
+        // partial-decompression length, the scan stops BEFORE the array
+        // column (it is the last field of JOB), and the element reads
+        // NULL for every row - a confident wrong rowset in the WHERE
+        // filter and an all-NULL value in the projection. `|=`, not a
+        // short-circuit, so the mark closure visits the subscripts too.
+        Expr::ArrayElem { fid, subs, .. } => {
+            let mut hit = f(*fid);
+            for s in subs {
+                hit |= expr_reads(s, f);
+            }
+            hit
+        }
         Expr::BlobOf(a, _) => expr_reads(a, f),
         Expr::GenVal(_) => true,
         // the per-row coercion wrappers read whatever they wrap - a
@@ -75826,6 +75841,30 @@ fn tokenize(s: &str) -> Option<Vec<Tok>> {
                 }
                 let word = &s[start..i];
                 let upper = word.to_ascii_uppercase();
+                // `COL[i, ...]`: an ARRAY-element reference. A bare
+                // subscript in a search condition (WHERE/HAVING/ON) used
+                // to die here - `[` is not a byte this tokenizer knew, so
+                // the whole predicate refused at prepare. Lex the whole
+                // `COL[...]` as ONE expression token, exactly as a call
+                // or a CASE is lexed: the char-based expression parser
+                // ([expr_primary]) already reads a subscript into
+                // RawExpr::Subscript, which resolves and evaluates on the
+                // predicate path identically to the projection. Only a
+                // BARE name takes this - a function's `(` and a keyword
+                // never precede `[`.
+                {
+                    let mut j = i;
+                    while j < b.len() && b[j].is_ascii_whitespace() {
+                        j += 1;
+                    }
+                    if j < b.len() && b[j] == b'[' {
+                        let close = matching_bracket(b, j)?;
+                        let raw = parse_raw_expr_any(&s[start..=close])?;
+                        out.push(Tok::FnExpr(raw));
+                        i = close + 1;
+                        continue;
+                    }
+                }
                 // an aggregate name followed by `(...)` lexes as one
                 // aggregate-call token (spacing-tolerant, no nesting) -
                 // the WHOLE family ([agg_named]), so a HAVING over
@@ -76032,6 +76071,46 @@ fn matching_case_end(b: &[u8], case_at: usize) -> Option<usize> {
                     return Some(i + 3);
                 }
                 i += 2;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The index of the `]` matching the `[` at `open`, skipping
+/// single-quoted string literals and nested brackets (an array of
+/// arrays subscripts an element). None when they never balance. Used
+/// to lex a `COL[...]` array-element reference whole out of a WHERE /
+/// HAVING / JOIN-ON clause, the way [matching_paren] lexes a call.
+fn matching_bracket(b: &[u8], open: usize) -> Option<usize> {
+    let mut depth = 0i32;
+    let mut i = open;
+    while i < b.len() {
+        match b[i] {
+            b'\'' => {
+                i += 1;
+                loop {
+                    if i >= b.len() {
+                        return None; // unterminated literal
+                    }
+                    if b[i] == b'\'' {
+                        if b.get(i + 1) == Some(&b'\'') {
+                            i += 2;
+                            continue;
+                        }
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'[' => depth += 1,
+            b']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
             }
             _ => {}
         }
