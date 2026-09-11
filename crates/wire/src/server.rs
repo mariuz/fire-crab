@@ -13118,9 +13118,15 @@ fn blob_out_charset(c: &ProjCol, att: &AttCs) -> i32 {
     if !matches!(c.wire, Wire::Blob) || c.sub_type != 1 {
         return c.scale;
     }
-    // a byte-carrier attachment converts nothing, so the stored set
-    // stands - the same rule the text paths follow
-    if fire_crab_ods::intl::byte_carrier(att.id) {
+    // a byte carrier on EITHER side converts nothing, so the stored set
+    // stands - the same assignment-matrix rule the write path follows. A
+    // NONE-stored text blob (c.scale a carrier) keeps charset 0 under any
+    // attachment (measured: it never echoes a real attachment's id); a
+    // real-charset blob is announced in a real attachment's charset and
+    // keeps its own under a NONE attachment.
+    if fire_crab_ods::intl::byte_carrier(att.id)
+        || fire_crab_ods::intl::byte_carrier(c.scale as u8)
+    {
         return c.scale;
     }
     att.id as i32
@@ -30163,39 +30169,16 @@ fn plan_insert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
             if !matches!(descs.get(fid).map(|d| d.dtype), Some(dtype::BLOB)) {
                 return None;
             }
-            // THE BYTES A LITERAL TAKES IN THE COLUMN'S CHARACTER SET,
-            // starting from the charset the literal IS - the attachment's
-            // ([stmt_text_decode]), not UTF-8. Under a byte carrier its
-            // chars ARE its bytes, and a move into a real set is a BYTE
-            // COPY, so the conversion runs through [transcode_text] first
-            // and only then encodes. This comment used to say a carrier
-            // stores "the UTF-8 the SQL text arrived as", which was true
-            // only while the SQL text was decoded as UTF-8 whatever the
-            // client asked for: `INSERT INTO T VALUES ('caf<C3 A9>')`
-            // into a UTF8 text blob stored SEVEN bytes where the engine
-            // stores five.
+            // THE OCTETS A LITERAL TAKES IN THE BLOB COLUMN, by the
+            // charset assignment matrix ([blob_literal_bytes]): a byte
+            // copy when the column (or the attachment) is a byte carrier,
+            // a real transcode when both are real charsets. Encoding in
+            // the column charset directly double-encoded a NONE column
+            // (`INSERT INTO T VALUES ('caf<C3 A9>')` stored 7 octets
+            // where the engine stores 5).
             let cs = descs.get(fid).map_or(0, |d| d.scale as u8);
             let att = CURRENT_ATT_CS.with(|c| c.get());
-            let lit = |t: &str| -> Vec<u8> {
-                let owned;
-                let t = if att != cs && !t.is_ascii() {
-                    match transcode_text(att, cs, t.to_string()) {
-                        Ok(x) => {
-                            owned = x;
-                            owned.as_str()
-                        }
-                        // an unconvertible value keeps the old path and
-                        // fails where it always did
-                        Err(_) => t,
-                    }
-                } else {
-                    t
-                };
-                fire_crab_ods::intl::encode_text(cs, t)
-                    .ok()
-                    .flatten()
-                    .unwrap_or_else(|| t.as_bytes().to_vec())
-            };
+            let lit = |t: &str| -> Vec<u8> { blob_literal_bytes(t, att, cs) };
             match v {
                 InsVal::Str(t) => Some((fid, lit(t), 1)),
                 InsVal::Octets(b) => Some((fid, b.clone(), 0)),
@@ -32616,28 +32599,18 @@ fn plan_update(sql: &str, db_outer: &Option<Database>) -> Option<(Plan, Vec<Desc
                 params.push(Some(d.clone()));
                 SetVal::Param(params.len() - 1)
             }
-            // A TEXT BLOB LITERAL CARRIES THE ATTACHMENT'S BYTES, like
-            // every other literal ([wire_text_param]'s law). `into_bytes`
-            // is the UTF-8 spelling, so under a byte-carrier attachment a
-            // literal's chars - which ARE its bytes - were written twice
-            // as wide: `INSERT INTO T VALUES ('caf<C3 A9>')` into a UTF8
-            // text blob stored 7 bytes where the engine stores 5, and the
-            // damage was invisible until something READ the blob back.
+            // A TEXT BLOB LITERAL moves into the column by the charset
+            // assignment matrix ([blob_literal_bytes]): a byte copy when
+            // the column (or attachment) is a byte carrier, a real
+            // transcode when both are real. Encoding in the attachment
+            // charset alone double-encoded a NONE column (`UPDATE ... SET
+            // b = 'caf<C3 A9>'` stored 7 octets where the engine stores
+            // 5), and the damage was invisible until something READ the
+            // blob back.
             InsVal::Str(t) if d.dtype == dtype::BLOB => {
                 let att = CURRENT_ATT_CS.with(|c| c.get());
-                let bytes = if t.is_ascii() {
-                    t.as_bytes().to_vec()
-                } else if fire_crab_ods::intl::byte_carrier(att) {
-                    fire_crab_ods::intl::carrier_encode(&t).unwrap_or_else(|| t.as_bytes().to_vec())
-                } else if fire_crab_ods::intl::tabled(att) {
-                    fire_crab_ods::intl::encode_text(att, &t)
-                        .ok()
-                        .flatten()
-                        .unwrap_or_else(|| t.as_bytes().to_vec())
-                } else {
-                    t.as_bytes().to_vec()
-                };
-                SetVal::BlobLit(bytes, 1)
+                let col_cs = if d.sub_type == 1 { d.scale as u8 } else { 0 };
+                SetVal::BlobLit(blob_literal_bytes(&t, att, col_cs), 1)
             }
             InsVal::Octets(b) if d.dtype == dtype::BLOB => SetVal::BlobLit(b, 0),
             lit => SetVal::Lit(encode_set_value(d, &lit)?),
@@ -58811,6 +58784,49 @@ fn blob_text_of(rel: u16, num: u64, cs: u8) -> Result<String, EvalErr> {
     } else {
         String::from_utf8_lossy(&bytes).into_owned()
     })
+}
+
+/// The octets a text/number LITERAL occupies in a blob column, given the
+/// ATTACHMENT charset it arrived in (`att`, the charset the SQL text was
+/// decoded with) and the column's declared charset (`col_cs`). The
+/// engine moves a literal into a blob by the charset ASSIGNMENT MATRIX:
+/// a BYTE COPY whenever EITHER side is a byte carrier (NONE/OCTETS) - the
+/// literal's own octets land verbatim - and a real transcode only when
+/// BOTH are real charsets. Measured against the live engine: 'café'
+/// (5 octets on the wire) into a NONE text blob stays 5 octets under a
+/// NONE, UTF8 or WIN1252 attachment; UTF8 -> WIN1252 is 4, WIN1252 ->
+/// UTF8 is 7. Encoding the literal in the COLUMN charset instead (the
+/// old path) double-encoded a NONE column - it stored 7 octets where
+/// the engine stores 5, corrupting durable state.
+fn blob_literal_bytes(t: &str, att: u8, col_cs: u8) -> Vec<u8> {
+    use fire_crab_ods::intl;
+    // a byte carrier on either side is a byte copy: recover the
+    // literal's raw octets by encoding in the charset it arrived in (the
+    // attachment's). Both real -> transcode attachment to column.
+    let enc_cs = if intl::byte_carrier(att) || intl::byte_carrier(col_cs) {
+        att
+    } else {
+        col_cs
+    };
+    let owned;
+    let s = if enc_cs != att && !t.is_ascii() {
+        match transcode_text(att, enc_cs, t.to_string()) {
+            Ok(x) => {
+                owned = x;
+                owned.as_str()
+            }
+            // an unconvertible value keeps the old path and fails where
+            // it always did
+            Err(_) => t,
+        }
+    } else {
+        t
+    };
+    if intl::byte_carrier(enc_cs) {
+        intl::carrier_encode(s).unwrap_or_else(|| s.as_bytes().to_vec())
+    } else {
+        intl::encode_text(enc_cs, s).ok().flatten().unwrap_or_else(|| s.as_bytes().to_vec())
+    }
 }
 
 /// The BYTES a text value occupies in a blob column's character set -
