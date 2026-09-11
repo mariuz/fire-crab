@@ -56240,6 +56240,14 @@ fn eval_status_items(w: &mut W, e: &EvalErr) {
                 .int(2)
                 .bytes(func.as_bytes());
         }
+        EvalErr::CtxVarNotFound(var, ns) => {
+            w.int(1) // isc_arg_gds - isc_ctx_var_not_found, SQLSTATE HY000
+                .int(335544843)
+                .int(2)
+                .bytes(var.as_bytes())
+                .int(2)
+                .bytes(ns.as_bytes());
+        }
         EvalErr::NoFilter(from, to) => {
             w.int(1) // isc_arg_gds - filter not found to convert type @1 to type @2
                 .int(GDS_NO_FILTER)
@@ -64557,6 +64565,10 @@ enum EvalErr {
     InvalidLength(i64),
     /// isc_ctx_namespace_invalid: "Invalid namespace name '@1' passed to @2"
     CtxNamespace(String, &'static str),
+    /// isc_ctx_var_not_found: "Context variable '@1' is not found in
+    /// namespace '@2'" - an unknown key in a KNOWN namespace (SYSTEM),
+    /// where USER_SESSION/USER_TRANSACTION answer NULL instead
+    CtxVarNotFound(String, String),
     /// `NAME(...)` names no function: -804 "Function unknown" (probed)
     FunctionUnknown(String),
     /// a user-function call with the wrong argument count: the first
@@ -69397,14 +69409,81 @@ impl Expr {
                                     _ => Value::Null,
                                 }
                             }),
+                            // The SYSTEM namespace answers a FIXED set of
+                            // keys; an unknown one RAISES (the engine's
+                            // isc_ctx_var_not_found), where USER_SESSION/
+                            // USER_TRANSACTION return NULL for a missing
+                            // var. Keys whose value is unconditionally
+                            // fire-crab's own truth (a single SYSDBA
+                            // login, no role, no idle/statement timeout,
+                            // no wire compression, the DECFLOAT and
+                            // ext-conn-pool defaults, a read/write
+                            // default transaction) match the engine
+                            // exactly. Keys whose value is bound to THIS
+                            // connection/transaction/database (the db
+                            // path, the session and transaction ids, the
+                            // peer address, the wire-crypt state) or that
+                            // fire-crab has no faithful source for (the
+                            // client host/pid/process, the db file id and
+                            // GUID, the commit numbers) answer NULL - the
+                            // key is VALID so it must not raise, and an
+                            // honest NULL beats a fabricated value. These
+                            // are recorded for the day a session/tx
+                            // thread-local carries the datum to `eval`.
                             "SYSTEM" => match name.to_ascii_uppercase().as_str() {
                                 "SEARCH_PATH" => Value::Text("\"PUBLIC\", \"SYSTEM\"".into()),
-                                "CURRENT_USER" => Value::Text("SYSDBA".into()),
                                 "CURRENT_SCHEMA" => Value::Text("PUBLIC".into()),
                                 "ENGINE_VERSION" => Value::Text("6.0.0".into()),
                                 "NETWORK_PROTOCOL" => Value::Text("TCPv4".into()),
+                                "CURRENT_USER" | "EFFECTIVE_USER" => {
+                                    Value::Text("SYSDBA".into())
+                                }
+                                "CURRENT_ROLE" => Value::Text("NONE".into()),
+                                // the DEFAULT transaction's shape (fire-crab
+                                // announces one isolation level; a non-default
+                                // tx would need the tx state threaded to eval -
+                                // recorded)
                                 "ISOLATION_LEVEL" => Value::Text("SNAPSHOT".into()),
-                                _ => Value::Null,
+                                "LOCK_TIMEOUT" => Value::Text("-1".into()),
+                                "READ_ONLY" => Value::Text("FALSE".into()),
+                                "SESSION_IDLE_TIMEOUT" | "STATEMENT_TIMEOUT" => {
+                                    Value::Text("0".into())
+                                }
+                                "WIRE_COMPRESSED" => Value::Text("FALSE".into()),
+                                "DECFLOAT_ROUND" => Value::Text("HALF_UP".into()),
+                                "DECFLOAT_TRAPS" => {
+                                    Value::Text("Division_by_zero,Invalid_operation,Overflow".into())
+                                }
+                                "EXT_CONN_POOL_SIZE"
+                                | "EXT_CONN_POOL_IDLE_COUNT"
+                                | "EXT_CONN_POOL_ACTIVE_COUNT" => Value::Text("0".into()),
+                                "EXT_CONN_POOL_LIFETIME" => Value::Text("7200".into()),
+                                // VALID keys fire-crab cannot yet answer
+                                // truthfully: a NULL (not a raise, not a
+                                // fabricated value). Recorded for the
+                                // session/tx thread-local follow-up.
+                                "REPLICA_MODE"
+                                | "DB_NAME"
+                                | "SESSION_ID"
+                                | "TRANSACTION_ID"
+                                | "CLIENT_ADDRESS"
+                                | "CLIENT_HOST"
+                                | "CLIENT_PID"
+                                | "CLIENT_PROCESS"
+                                | "WIRE_ENCRYPTED"
+                                | "WIRE_CRYPT_PLUGIN"
+                                | "DB_FILE_ID"
+                                | "DB_GUID"
+                                | "SNAPSHOT_NUMBER"
+                                | "GLOBAL_CN" => Value::Null,
+                                // an unknown SYSTEM key raises, as the
+                                // engine does (DATABASE_NAME is NOT a key)
+                                _ => {
+                                    return Err(EvalErr::CtxVarNotFound(
+                                        name.clone(),
+                                        "SYSTEM".into(),
+                                    ))
+                                }
                             },
                             _ => return Err(EvalErr::CtxNamespace(ns, "RDB$GET_CONTEXT")),
                         }
