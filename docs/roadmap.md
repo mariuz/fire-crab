@@ -9,7 +9,7 @@ fire-crab, 2026-08-20: a Rust conversion of the Firebird 6 engine —
 `exe`, `opt`, `lck`, `svc`, `auth`, `cch`, `pio`, `blb`, `evt`,
 `fcstat`, and the `wire` server at 67k). The server answers real SQL
 over the real wire protocol, and every answer is held DIFFERENTIALLY
-against the live FB6 engine: 443 gates under `qa/`, of which the 410
+against the live FB6 engine: 444 gates under `qa/`, of which the 411
 `serve-real-*` sweeps are green (each a multi-check differential run;
 the last full-suite sweep counted 8,627 checks before the growth
 chunks, which have since added many more).

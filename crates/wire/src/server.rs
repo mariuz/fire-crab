@@ -18521,7 +18521,13 @@ fn text_form_m(
                 // binary operand makes the whole result binary
                 SysFn::Replace => match (arg(0), arg(1), arg(2)) {
                     (Some((_, ws, cs)), Some((_, wf, _)), Some((_, wr, _))) => {
-                        let grow = (wr - wf).max(0) * (ws / wf.max(1));
+                        // an EMPTY search string matches nothing: the
+                        // engine returns the source unchanged, so the
+                        // result cannot grow (probed: REPLACE(V, '', 'X')
+                        // is the source width, not doubled). Only a
+                        // non-empty search can expand, once per its
+                        // occurrences (ws / wf).
+                        let grow = if wf <= 0 { 0 } else { (wr - wf).max(0) * (ws / wf) };
                         Some((
                             true,
                             ws.saturating_add(grow),
