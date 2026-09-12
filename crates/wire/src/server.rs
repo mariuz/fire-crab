@@ -40181,7 +40181,7 @@ fn plan_join_bound(
             &cols,
             &ord_descs,
             |n| resolve_join_col(&sides, n).map(|(idx, _, _)| idx),
-            |text| parse_raw_expr(text).and_then(|r| resolve_expr(&r, &ord_cols, &ord_descs)),
+            |text| parse_raw_expr_any(text).and_then(|r| resolve_expr(&r, &ord_cols, &ord_descs)),
         )?,
     };
 
@@ -41472,7 +41472,7 @@ fn plan_over_source(
                     .find(|c| col_name_is(&c.name, n))
                     .map(|c| c.field_id as usize)
             },
-            |text| parse_raw_expr(text).and_then(|r| resolve_expr(&r, &columns, &descs)),
+            |text| parse_raw_expr_any(text).and_then(|r| resolve_expr(&r, &columns, &descs)),
         )?,
     };
     Some(Plan::Derived {
@@ -48057,7 +48057,7 @@ fn plan_query_inner_ctx(
                     // ORDER BY <expression>: the same parser and resolver
                     // the select list uses, so an expression that can be
                     // projected can also be sorted by
-                    |text| parse_raw_expr(text).and_then(|r| resolve_expr(&r, &columns, &descs)),
+                    |text| parse_raw_expr_any(text).and_then(|r| resolve_expr(&r, &columns, &descs)),
                 )?,
             };
             let index = choose_index(db, rel, table, &descs, &filter, &opt_sql, &order_by);
@@ -48454,7 +48454,7 @@ fn plan_query_inner_ctx(
                             .map(|c| c.field_id as usize)
                             .filter(|fid| !is_computed_fid(&descs, *fid))
                     },
-                    |text| parse_raw_expr(text).and_then(|r| resolve_expr(&r, &columns, &descs)),
+                    |text| parse_raw_expr_any(text).and_then(|r| resolve_expr(&r, &columns, &descs)),
                 ) {
                     Some(keys) => keys,
                     None => {
@@ -49076,11 +49076,19 @@ fn resolve_agg_src(
         AggTarget::Col(name) | AggTarget::Distinct(name) => {
             let rc = find_col(columns, name)?;
             let fid = rc.field_id as usize;
-            // no record bytes to aggregate over
+            let distinct = matches!(target, AggTarget::Distinct(_));
+            // a COMPUTED BY column has no stored bytes: it aggregates
+            // over its defining EXPRESSION (resolve_expr expands the
+            // computed fid from COMPUTED_EXPR and casts to the declared
+            // type), the same source an explicit SUM(a+b) folds. An
+            // unarmed context or unparsable source still refuses inside
+            // resolve_expr.
             if is_computed_fid(descs, fid) {
-                return None;
+                let e = resolve_expr(&RawExpr::Col(name.clone()), columns, descs)?;
+                (agg_expr_src(e)?, distinct)
+            } else {
+                (agg_field_src(fid, descs), distinct)
             }
-            (agg_field_src(fid, descs), matches!(target, AggTarget::Distinct(_)))
         }
         AggTarget::DistinctExpr(raw) => {
             (agg_expr_src(resolve_expr(raw, columns, descs)?)?, true)
@@ -49221,7 +49229,23 @@ fn agg_result_desc(
     descs: &[Descriptor],
 ) -> Option<Descriptor> {
     let stripped = strip_collate_target(target);
-    let target = &stripped;
+    // a COMPUTED BY column is typed by its defining EXPRESSION - demote
+    // the target to its Expr form so the expression-source describe arms
+    // handle it (resolve_expr expands the computed fid and casts to the
+    // declared type); distinct-ness does not change the result TYPE, so
+    // both Col and Distinct demote to Expr here. Matches the fold source
+    // [resolve_agg_src] builds for the same computed target.
+    let demoted;
+    let target: &AggTarget = match &stripped {
+        AggTarget::Col(n) | AggTarget::Distinct(n)
+            if find_col(columns, n)
+                .is_some_and(|rc| is_computed_fid(descs, rc.field_id as usize)) =>
+        {
+            demoted = AggTarget::Expr(RawExpr::Col(n.clone()));
+            &demoted
+        }
+        _ => &stripped,
+    };
     // A SYNTHETIC descriptor may not carry offset 0: `is_computed_fid`
     // reads `offset == 0 && length != 0` as "this is a COMPUTED column",
     // so a freshly built descriptor is indistinguishable from one - and
@@ -49849,9 +49873,39 @@ fn build_group_items(
             SelItem::Col(name, alias) => {
                 let rc = find_col(columns, name)?;
                 let fid = rc.field_id as usize;
-                // a computed column has no record bytes to group over
+                // a COMPUTED BY grouped key is an EXPRESSION key (parse_group_by
+                // pushed RawExpr::Col(this column) as the key): match it by the
+                // same normalized reference, describe by the expression's own
+                // declared-type typing, and read the value from the group's
+                // computed key slot (expr: None). Selected-but-not-grouped
+                // refuses, as for a stored column.
                 if is_computed_fid(descs, fid) {
-                    return None;
+                    let raw = RawExpr::Col(rc.name.clone());
+                    let n = normalize_raw(&raw);
+                    let pos = key_exprs.iter().position(|(r, _)| *r == n)?;
+                    let bare = side_keys
+                        .iter()
+                        .find_map(|k| rc.name.strip_prefix(k.as_str()).and_then(|r| r.strip_prefix('.')))
+                        .map(str::to_string)
+                        .unwrap_or_else(|| rc.name.clone());
+                    let pc = build_expr_col(&raw, &bare, columns, descs)?;
+                    cols.push(ProjCol {
+                        name: alias.clone().unwrap_or_else(|| bare.clone()),
+                        fname: Some(bare),
+                        relation: None,
+                        rel_alias: None,
+                        field_id: out_idx,
+                        wire: pc.wire,
+                        sql_type: pc.sql_type,
+                        length: pc.length,
+                        oct_length: pc.oct_length,
+                        scale: pc.scale,
+                        sub_type: pc.sub_type,
+                        expr: None,
+                    });
+                    gitems.push(GItem::Key(synth_base + pos));
+                    slot_descs.push(None);
+                    continue;
                 }
                 if !key_fids.contains(&fid) {
                     return None; // a selected column that is not grouped
@@ -50648,9 +50702,14 @@ fn parse_group_by(
         let rc = columns
             .iter()
             .find(|c| col_name_is(&c.name, col_name))?;
-        // a computed column has no record bytes to bucket rows by
+        // a COMPUTED BY column has no record bytes to bucket rows by: it
+        // groups by its defining EXPRESSION, an expression key keyed by
+        // the (canonical) column reference so build_group_items matches
+        // the same normalized RawExpr::Col. resolve_expr (inside
+        // push_expr) expands the computed column via COMPUTED_EXPR.
         if is_computed_fid(descs, rc.field_id as usize) {
-            return None;
+            push_expr(RawExpr::Col(rc.name.clone()), &mut key_exprs, &mut fids)?;
+            continue;
         }
         fids.push(rc.field_id as usize);
     }
@@ -72527,7 +72586,7 @@ fn plan_correlated_select(
                     .find(|c| col_name_is(&c.name, n))
                     .map(|c| c.field_id as usize)
             },
-            |text| parse_raw_expr(text).and_then(|r| resolve_expr(&r, &columns, &descs)),
+            |text| parse_raw_expr_any(text).and_then(|r| resolve_expr(&r, &columns, &descs)),
         )?,
     };
     // The OUTER retrieval's access path, chosen the way every other
@@ -75751,7 +75810,19 @@ fn parse_order_by_expr(
                     }
                     c.field_id
                 }
-                None => resolve_name(name)?,
+                None => match resolve_name(name) {
+                    Some(f) => f,
+                    // not a stored column resolve_name will return: a
+                    // COMPUTED BY column (filtered out of resolve_name,
+                    // it has no field to sort on) becomes its defining
+                    // EXPRESSION key; a truly unknown name expands to
+                    // None here too and refuses
+                    None => {
+                        let e = resolve_expression(name)?;
+                        keys.push(stamp(OrderKey { field: 0, expr: Some(e), desc, nulls, coll: 0, coll_explicit: false }));
+                        continue;
+                    }
+                },
             }
         };
         keys.push(stamp(OrderKey::field(fid, desc, nulls)));
