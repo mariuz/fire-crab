@@ -47946,6 +47946,12 @@ fn plan_query_inner_ctx(
         } else {
             Default::default()
         };
+    // Arm the computed-column expander for every resolve_expr in THIS
+    // single-table plan (the WHERE, the aggregate sources, the ORDER BY
+    // / GROUP BY keys): a COMPUTED BY reference outside the bare select
+    // list now expands to its stored expression instead of refusing.
+    // The guard restores the previous map when this plan returns.
+    let _computed_guard = ComputedExprGuard::arm(computed.clone());
 
     // parse + resolve the optional WHERE clause - its `?`s number AFTER
     // the projection's (proj_params leading slots)
@@ -58461,6 +58467,51 @@ thread_local! {
     )> = std::cell::RefCell::new((std::collections::HashMap::new(), std::collections::HashMap::new()));
 }
 
+thread_local! {
+    /// The single-table SELECT planner arms this with the relation's
+    /// COMPUTED BY expressions (field id -> parsed source) so
+    /// [resolve_expr]'s Col arm can EXPAND a computed reference in place
+    /// - in a WHERE, an aggregate source, an ORDER BY / GROUP BY key,
+    /// wherever a column resolves - as the engine substitutes the
+    /// expression. Only that path arms it; a join / derived-table /
+    /// subquery resolve sees an empty map and keeps refusing a computed
+    /// reference (those are separate choke points). The HashSet is the
+    /// recursion guard for a computed-over-computed chain or a cycle.
+    static COMPUTED_EXPR: std::cell::RefCell<(
+        std::collections::HashMap<usize, RawExpr>,
+        std::collections::HashSet<usize>,
+    )> = std::cell::RefCell::new((
+        std::collections::HashMap::new(),
+        std::collections::HashSet::new(),
+    ));
+}
+
+/// Arms [COMPUTED_EXPR] for the lifetime of the guard and restores the
+/// previous map on drop (so a nested single-table plan - a derived table
+/// planned recursively - cannot leak its map to the outer one).
+struct ComputedExprGuard(Option<std::collections::HashMap<usize, RawExpr>>);
+impl ComputedExprGuard {
+    fn arm(map: std::collections::HashMap<usize, RawExpr>) -> Self {
+        let prev = COMPUTED_EXPR.with(|c| {
+            let mut c = c.borrow_mut();
+            c.1.clear();
+            Some(std::mem::replace(&mut c.0, map))
+        });
+        ComputedExprGuard(prev)
+    }
+}
+impl Drop for ComputedExprGuard {
+    fn drop(&mut self) {
+        if let Some(prev) = self.0.take() {
+            COMPUTED_EXPR.with(|c| {
+                let mut c = c.borrow_mut();
+                c.0 = prev;
+                c.1.clear();
+            });
+        }
+    }
+}
+
 /// Whether an expression calls RDB$SET_CONTEXT anywhere - a side effect
 /// the engine evaluates select-list items RIGHT-TO-LEFT around (probed:
 /// `SET_CONTEXT(K, v), GET_CONTEXT(K)` reads the OLD value), so a row
@@ -63750,9 +63801,36 @@ fn resolve_expr_inner(
         RawExpr::Col(name) => {
             let rc = find_col(columns, name)?;
             let fid = rc.field_id as usize;
-            // a computed column has no record bytes to evaluate from
+            // A COMPUTED BY column has no record bytes: it IS its stored
+            // expression, which the engine substitutes wherever the
+            // column is named. Expand it in place from the map the
+            // single-table planner armed ([COMPUTED_EXPR]); an unarmed
+            // context (join, derived table, subquery) or an unparsable
+            // source keeps the refusal, and a recursion/cycle is guarded.
+            // The expanded value describes as the DECLARED column type -
+            // the engine's blr_cast to the field format - so it is
+            // wrapped in [computed_cast_target] exactly as build_projcols
+            // does for the bare projection.
             if is_computed_fid(descs, fid) {
-                return None;
+                let raw = COMPUTED_EXPR.with(|c| c.borrow().0.get(&fid).cloned())?;
+                // guard the recursion BEFORE recursing (no COMPUTED_EXPR
+                // borrow may be held across resolve_expr, which re-enters
+                // it); a fid already expanding is a cycle -> refuse
+                if !COMPUTED_EXPR.with(|c| c.borrow_mut().1.insert(fid)) {
+                    return None;
+                }
+                let inner = resolve_expr(&raw, columns, descs);
+                COMPUTED_EXPR.with(|c| {
+                    c.borrow_mut().1.remove(&fid);
+                });
+                let e = inner?;
+                return Some(match computed_cast_target(descs.get(fid)?) {
+                    Some(target) => {
+                        let cs = err_spell_charset(&e, descs);
+                        Expr::Cast(Box::new(e), target, cs)
+                    }
+                    None => e,
+                });
             }
             let d = descs.get(fid)?;
             // a BLOB column is a TEXT OPERAND: every predicate and text
@@ -84480,9 +84558,15 @@ fn resolve_predicate(
             };
             let rc = find_col(columns, col)?;
             let fid = rc.field_id as usize;
-            // a computed column has no record bytes for the filter to read
+            // a COMPUTED BY column has no stored bytes for the keyed
+            // filter to read, but it IS its defining expression: take the
+            // per-row EXPRESSION-predicate path, where resolve_expr
+            // expands it (the same route a BLOB or an expression LHS
+            // takes). The single-table planner has armed COMPUTED_EXPR;
+            // an unparsable source still refuses inside resolve_expr.
             if is_computed_fid(descs, fid) {
-                return None;
+                terms.push(resolve_expr_term(&rt, columns, descs, params)?);
+                continue;
             }
             let d = descs.get(fid)?;
             // IS [NOT] NULL reads only the null flag, so a column of ANY
