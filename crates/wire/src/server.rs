@@ -18034,6 +18034,12 @@ fn numeric_subtype(e: &Expr, descs: &[Descriptor]) -> i16 {
         // (makeRound / makeTrunc `*result = *value`); CEIL / FLOOR drop it
         // to 0 (makeLong / makeInt64), which is the default below.
         Expr::Func(SysFn::Round | SysFn::Trunc, args) => numeric_subtype(&args[0], descs),
+        // MOD keeps the dividend's family code (makeMod copies the first
+        // operand's descriptor): MOD over a NUMERIC/DECIMAL stays
+        // subtype 1/2 (probed: MOD(N92,3) is LONG subtype 1, MOD(N41,2)
+        // SHORT subtype 1). ABS, by contrast, DROPS it (makeAbs remakes a
+        // plain integer) - so ABS stays on the default 0 below.
+        Expr::Func(SysFn::Mod, args) => numeric_subtype(&args[0], descs),
         _ => 0,
     }
 }
