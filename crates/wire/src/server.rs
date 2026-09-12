@@ -68029,11 +68029,19 @@ impl Expr {
             Expr::Int128(_) => Some(NumRank::I128),
             // DECFLOAT is not an exact-numeric rank (it is not i128-backed)
             Expr::DecFloat34(_) => None,
-            Expr::Dec(raw, _) => Some(if i32::try_from(*raw).is_ok() {
-                NumRank::Long
-            } else {
-                NumRank::I64
-            }),
+            // A dialect-3 numeric LITERAL carries arithmetic PRECISION 18
+            // (the engine's fixed-point rule: any literal with a decimal
+            // point or exponent is precision 18, not its digit count) =
+            // the INT64 storage bucket. So `literal * / any operand`
+            // exceeds precision 18 and promotes the exact-numeric result
+            // to INT128, exactly as the engine does (n41*1.5 is 4+18=22 ->
+            // INT128; 1.5*1.5 is 36 -> INT128) - where ranking by the
+            // significand's digit count wrongly kept a small literal at
+            // INT64. The significand always fits i64 here (a wider one
+            // parses as Expr::Int128 / Expr::DecFloat34, which rank
+            // themselves), and Add/Sub is unaffected: its rank test is
+            // I128-only, so two INT64 literals still add at INT64.
+            Expr::Dec(..) => Some(NumRank::I64),
             Expr::Null => None, // takes the sibling's rank in Bin below
             Expr::Neg(e) => e.rank_of(descs),
             // A TEMPORAL DIFFERENCE HAS ITS OWN RANK, and getting it
