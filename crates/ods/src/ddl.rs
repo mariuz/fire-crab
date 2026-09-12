@@ -1495,6 +1495,26 @@ pub fn alter_table_add_column(
     {
         return Err(format!("computed column {} cannot carry constraints", col.name));
     }
+    // an IDENTITY column must be an exact-numeric type with zero scale -
+    // the engine rejects ALTER TABLE ADD of a NUMERIC(p,s>0) / text /
+    // temporal / DOUBLE identity, exactly as it rejects it at CREATE (see
+    // create_table). `col` is the domain-resolved definition here, so its
+    // dtype/scale are final.
+    if col.identity.is_some()
+        && !(matches!(
+            col.dtype,
+            crate::format::dtype::SHORT
+                | crate::format::dtype::LONG
+                | crate::format::dtype::INT64
+                | crate::format::dtype::INT128
+        ) && col.scale == 0
+            && col.dims.is_empty())
+    {
+        return Err(format!(
+            "Identity column {} of table {} must be of exact number type with zero scale",
+            col.name, table
+        ));
+    }
     // existing COMPUTED fields (descriptor at offset 0) keep their
     // offset-0 descriptors through the recompute; the stored-offset walk
     // skips them, so existing stored fields keep their offsets and a new
@@ -4250,6 +4270,32 @@ pub fn create_table(
         }
     }
     let cols: &[ColumnDef] = &resolved;
+
+    // an IDENTITY column must be an exact-numeric type with zero scale
+    // (SMALLINT / INTEGER / BIGINT / INT128 / NUMERIC|DECIMAL(p,0)) - the
+    // engine rejects CREATE TABLE otherwise (probed: NUMERIC(12,3),
+    // VARCHAR, DATE and DOUBLE identities all raise "must be of exact
+    // number type with zero scale", and no table is created). Checked
+    // here, after domain resolution, where each column's dtype/scale is
+    // final; an array of an exact-numeric element is not a scalar
+    // identity either.
+    for c in cols {
+        if c.identity.is_some()
+            && !(matches!(
+                c.dtype,
+                crate::format::dtype::SHORT
+                    | crate::format::dtype::LONG
+                    | crate::format::dtype::INT64
+                    | crate::format::dtype::INT128
+            ) && c.scale == 0
+                && c.dims.is_empty())
+        {
+            return Err(format!(
+                "Identity column {} of table {} must be of exact number type with zero scale",
+                c.name, name
+            ));
+        }
+    }
 
     // the physical format: field ids in declaration order (probe-pinned),
     // offsets by the ini.epp walk sysfmt already implements. A computed
