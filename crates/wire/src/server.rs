@@ -50086,7 +50086,26 @@ fn build_group_items(
                             ExprType::Text => match field_desc {
                                 // a text COLUMN keeps its own describe
                                 Some(d) => wire_for(d),
-                                None => (Wire::Varying, 448, 32765, 0, 0),
+                                // a text EXPRESSION describes EXACTLY as it
+                                // would PROJECT - MIN/MAX keep the source's
+                                // shape, so the arg's projection descriptor IS
+                                // the aggregate's. Reuse build_expr_col_from
+                                // for the real width and charset (concat
+                                // 10+1, UPPER same, SUBSTRING the FOR length,
+                                // the operand/attachment charset) instead of
+                                // the VARCHAR(32765)/NONE catch-all that
+                                // announced a huge width and the wrong
+                                // charset. sql_type is masked to its base
+                                // (the tuple is re-nullabled below, as
+                                // wire_for's raw form is); an unparseable
+                                // expression refuses via `?`, never 32765.
+                                None => match &src {
+                                    AggSrc::Expr(e) => {
+                                        let pc = build_expr_col_from(e.clone(), "", descs)?;
+                                        (pc.wire, pc.sql_type & !1, pc.length, pc.scale, pc.sub_type)
+                                    }
+                                    _ => return None,
+                                },
                             },
                             // MIN/MAX keep the SOURCE column's own
                             // describe (a FLOAT column stays 482/len4;
