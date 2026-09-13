@@ -65351,6 +65351,55 @@ fn approx_of(v: &Value) -> Option<f64> {
     }
 }
 
+/// A RUNTIME approximate value converts to DECFLOAT by rendering the f64
+/// to a FIXED significant-digit count and parsing that decimal - the
+/// engine's `Decimal128/64::set(double)` = sprintf then decXxxFromString.
+/// `sig` is the TARGET's OWN significant count (17 for DECFLOAT(34), 16
+/// for DECFLOAT(16)); formatting to the target width directly avoids a
+/// double-rounding through 17 sig. A 16/17-digit coefficient is well
+/// under text_to_dec128's 34-sig fold, so no extra rounding happens
+/// there. Signed zero (`-0E-16`) and inf/NaN carry through the string.
+fn f64_to_dec(x: f64, sig: usize) -> Option<fire_crab_ods::decfloat::Dec> {
+    // a zero converts to 0E-16 (signed) in BOTH widths - the engine's
+    // decimal128 zero exponent, kept when narrowing to decimal64. The
+    // "{:.15e}" form for DECFLOAT(16) would otherwise give 0E-15.
+    if x == 0.0 {
+        return Some(fire_crab_ods::decfloat::Dec::Finite {
+            neg: x.is_sign_negative(),
+            coeff: 0,
+            exp: -16,
+        });
+    }
+    text_to_dec128(&format!("{:.*e}", sig - 1, x))
+        .map(fire_crab_ods::decfloat::decode_dec128)
+}
+
+/// True when a CAST-to-DECFLOAT operand is a COMPILE-TIME-CONSTANT
+/// expression carrying an APPROXIMATE (Double) literal and NOT forced
+/// through a cast/column/param. The engine folds such a constant in the
+/// DECIMAL domain from the literal's own text (`CAST(0.1e0 AS DECFLOAT)`
+/// -> 0.1, `0.100e0` -> 0.100, `1e0/3e0` -> 34 threes), which is NOT the
+/// runtime 17-sig binary expansion and is not derivable from the f64
+/// (the literal text is not carried past parse). fire-crab keeps this
+/// shape REFUSING rather than shipping the wrong 17-sig value - a
+/// separate follow-on. An intervening CAST(.. AS DOUBLE) defeats the fold
+/// (the engine then expands at runtime), so a Cast operand returns false.
+fn approx_const_fold(e: &Expr) -> bool {
+    // Some(has_approx_literal) for a pure constant built from numeric
+    // literals + Neg/Bin; None as soon as a column/param/cast/anything
+    // else appears (=> a runtime value, the 17-sig rule applies).
+    fn go(e: &Expr) -> Option<bool> {
+        match e {
+            Expr::Double(_) => Some(true),
+            Expr::Int(_) | Expr::Int128(_) | Expr::Dec(..) | Expr::DecFloat34(_) => Some(false),
+            Expr::Neg(x) => go(x),
+            Expr::Bin(a, _, b) => Some(go(a)? || go(b)?),
+            _ => None,
+        }
+    }
+    go(e) == Some(true)
+}
+
 /// A FLOAT / DOUBLE PRECISION column - the APPROXIMATE numerics, which
 /// decode to `Value::Float`/`Value::Double` and compare as f64 rather
 /// than through the exact i128 alignment.
@@ -69055,6 +69104,30 @@ impl Expr {
                                 Some(bits) => fire_crab_ods::decfloat::decode_dec128(bits),
                                 None => return Err(conv_err(*cs, s.clone())),
                             }
+                        } else if approx_of(&v).is_some() && approx_const_fold(e) {
+                            // a pure-constant approximate literal cast to
+                            // DECFLOAT is a PREPARE-TIME decimal fold on the
+                            // literal text (0.1e0 -> 0.1), NOT the runtime
+                            // 17-sig expansion. fire-crab cannot yet
+                            // reproduce the fold, so REFUSE rather than ship
+                            // the wrong value (deferred follow-on) - the same
+                            // refusal a Double source earned before.
+                            return Err(EvalErr::ConversionError(None));
+                        } else if let Some(x) = approx_of(&v) {
+                            // a RUNTIME approximate value (FLOAT/DOUBLE
+                            // column, CAST(.. AS DOUBLE) result, param): the
+                            // engine's 17-sig (DECFLOAT(34)) / 16-sig
+                            // (DECFLOAT(16)) render. FLOAT is already f64
+                            // here (approx_of widens f as f64), so it takes
+                            // the f64 digits, not an f32 shortest form. A
+                            // finite double NEVER overflows at RUNTIME (a
+                            // DBL_MAX column casts to a value at both widths -
+                            // measured; the 22003 the engine raises for
+                            // CAST(<top-double literal> AS DECFLOAT(16)) is a
+                            // PREPARE-TIME constant-fold trap, not a runtime
+                            // one, so it belongs with the deferred fold).
+                            let sig = if *wide { 17 } else { 16 };
+                            f64_to_dec(x, sig).ok_or(EvalErr::ConversionError(None))?
                         } else {
                             value_as_dec(&v).ok_or(EvalErr::ConversionError(None))?
                         };
