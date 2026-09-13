@@ -18011,6 +18011,20 @@ fn numeric_subtype(e: &Expr, descs: &[Descriptor]) -> i16 {
         _ if temporal_diff_shape(e, descs).is_some() => {
             temporal_diff_shape(e, descs).map_or(0, |(_, st)| st)
         }
+        // DIVIDE at the INT64 (BIGINT) width RESETS the family code to 0
+        // - makeDivide's 8-byte path drops the operands' NUMERIC/DECIMAL
+        // sub_type - while at INT128 it keeps the MAX of the operands'
+        // codes, exactly as +/-/* do at every width (probed: n92/n41 is
+        // INT64 subtype 0, n38/n41 INT128 subtype 1, n92*n41/2 INT128
+        // subtype 1, but n92/n41/2 INT128 subtype 0 because its inner
+        // divide already reset). rank_of gives the divide's own width.
+        Expr::Bin(a, ArithOp::Div, b) => {
+            if matches!(e.rank_of(descs), Some(NumRank::I128)) {
+                numeric_subtype(a, descs).max(numeric_subtype(b, descs))
+            } else {
+                0
+            }
+        }
         Expr::Bin(a, _, b) => numeric_subtype(a, descs).max(numeric_subtype(b, descs)),
         Expr::Coalesce(v) => v.iter().map(|x| numeric_subtype(x, descs)).max().unwrap_or(0),
         // NULLIF's value IS its first operand - the second one only
