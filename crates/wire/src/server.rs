@@ -49324,6 +49324,42 @@ fn agg_result_desc(
             _ => return None,
         })
     };
+    // A DECFLOAT column source has no ExprType, so neither the
+    // expression route (resolve_expr / type_of) nor the SUM/AVG
+    // int-widen route below can type it - they refuse. Intercept a
+    // decfloat COLUMN (reached as a bare Col or through an identity
+    // Expr(Col) wrapper, distinct or not) and describe from the source
+    // descriptor: SUM -> DECFLOAT(34), AVG/MIN/MAX keep the source width
+    // (measured). COUNT is INT64; every other fold over a decfloat
+    // source stays refused.
+    let df_col_wide = |t: &AggTarget| -> Option<bool> {
+        let n = match t {
+            AggTarget::Col(n) | AggTarget::Distinct(n) => n,
+            AggTarget::Expr(RawExpr::Col(n)) | AggTarget::DistinctExpr(RawExpr::Col(n)) => n,
+            _ => return None,
+        };
+        match col_desc(n)?.dtype {
+            dtype::DEC64 => Some(false),
+            dtype::DEC128 => Some(true),
+            _ => None,
+        }
+    };
+    if let Some(wide) = df_col_wide(target) {
+        let dec = |wide: bool| Descriptor {
+            dtype: if wide { dtype::DEC128 } else { dtype::DEC64 },
+            scale: 0,
+            length: if wide { 16 } else { 8 },
+            sub_type: 0,
+            flags: 0,
+            offset: 1,
+        };
+        return match func {
+            AggFn::Count => Some(int64(0)),
+            AggFn::Sum => Some(dec(true)),
+            AggFn::Avg | AggFn::Min | AggFn::Max => Some(dec(wide)),
+            _ => None,
+        };
+    }
     Some(match func {
         // a LIST result is a computed BLOB: no scalar slot descriptor -
         // LIST inside an expression stays refused (recorded boundary)
@@ -49974,8 +50010,25 @@ fn build_group_items(
                     AggSrc::Percentile { order: Expr::Col(f), .. } => descs.get(*f),
                     _ => None,
                 };
-                // (type, scale, rank) of the aggregate's input
-                let src_shape: Option<(ExprType, i8, NumRank)> = match (&src, field_desc) {
+                // a DECFLOAT column source has no ExprType, so src_shape
+                // below would hard-refuse it (its else `return None`).
+                // Detect it FIRST: SUM always widens to DECFLOAT(34); AVG
+                // and MIN/MAX keep the source width (measured). Computed
+                // here so src_shape can be skipped for a decfloat source.
+                let df_wide = match (&src, field_desc) {
+                    (AggSrc::Field(_) | AggSrc::CollField(..), Some(d)) => match d.dtype {
+                        dtype::DEC64 => Some(false),
+                        dtype::DEC128 => Some(true),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                // (type, scale, rank) of the aggregate's input - not needed
+                // for a decfloat source (the df path types it), and its
+                // else-arm `return None` must not fire for one
+                let src_shape: Option<(ExprType, i8, NumRank)> = if df_wide.is_some() {
+                    None
+                } else { match (&src, field_desc) {
                     (AggSrc::Field(_) | AggSrc::CollField(..), Some(d))
                     | (AggSrc::Percentile { .. }, Some(d)) => {
                         let t = if matches!(col_kind(d), Some(ColKind::Int)) {
@@ -50010,7 +50063,7 @@ fn build_group_items(
                         Some((t, sc, e.rank_of(descs).unwrap_or(NumRank::Long)))
                     }
                     _ => None, // COUNT(*)
-                };
+                } };
                 // THE SOURCE'S NUMERIC SUB_TYPE, which every fold that
                 // keeps a value carries through: SUM/AVG/MIN/MAX over a
                 // NUMERIC answer sub_type 1 and over a DECIMAL 2
@@ -50033,7 +50086,22 @@ fn build_group_items(
                     (AggSrc::Expr(e), _) => numeric_subtype(e, descs) as i32,
                     _ => 0,
                 };
-                let (wire, sql_type, length, scale, sub_type) = match func {
+                // SUM always widens to DECFLOAT(34); AVG and MIN/MAX keep
+                // the source width (DECFLOAT(16) -> 16, DECFLOAT(34) -> 34).
+                // COUNT stays INT64 (its own arm); any other fold over a
+                // decfloat source stays refused. (df_wide computed above.)
+                let df_tuple = df_wide.and_then(|wide| match func {
+                    AggFn::Sum => Some((Wire::Dec34, 32762, 16, 0, 0)),
+                    AggFn::Avg | AggFn::Min | AggFn::Max => Some(if wide {
+                        (Wire::Dec34, 32762, 16, 0, 0)
+                    } else {
+                        (Wire::Dec16, 32760, 8, 0, 0)
+                    }),
+                    _ => None,
+                });
+                let (wire, sql_type, length, scale, sub_type) = match df_tuple {
+                    Some(t) => t,
+                    None => match func {
                     // COUNT is INT64 and the ONE aggregate the engine
                     // announces NOT NULLABLE - the even 580 survives
                     // below because nullable() skips it
@@ -50230,6 +50298,7 @@ fn build_group_items(
                         };
                         (Wire::Blob, 520, 8, cs, 1)
                     }
+                    },
                 };
                 // the engine titles aggregate output columns by function
                 // unless the item carries an alias - and the FUNCTION
@@ -54677,8 +54746,29 @@ fn compute_group(rows: &[Vec<Value>], gitems: &[GItem]) -> Result<Vec<Value>, Ev
                 GItem::Agg(func @ (AggFn::Sum | AggFn::Avg), src, _) => {
                     let (mut sum, mut scale, mut n) = (0i128, None::<i8>, 0i64);
                     let (mut fsum, mut approx) = (0f64, false);
+                    // a DECFLOAT fold accumulates in decimal (the engine's
+                    // DecimalContext, HALF-UP to 34 significant digits);
+                    // the source width decides the AVG result type - SUM is
+                    // always DECFLOAT(34), AVG keeps the source width. A
+                    // decfloat source never mixes with exact/approx in one
+                    // aggregate, so `dsum` being set means the decfloat path.
+                    let mut dsum: Option<fire_crab_ods::decfloat::Dec> = None;
+                    let mut dwide = false;
                     for r in rows {
                         let v = src_value(src, r)?;
+                        if matches!(v, Value::DecFloat16(_) | Value::DecFloat34(_)) {
+                            if matches!(v, Value::DecFloat34(_)) {
+                                dwide = true;
+                            }
+                            if let Some(d) = value_as_dec(&v) {
+                                dsum = Some(match dsum {
+                                    None => d,
+                                    Some(acc) => fire_crab_ods::decfloat::add(&acc, &d),
+                                });
+                                n += 1;
+                            }
+                            continue;
+                        }
                         match (&v, numeric_parts(&v)) {
                             (_, Some((raw, sc))) => {
                                 // one source, one scale - the first pins it
@@ -54698,7 +54788,41 @@ fn compute_group(rows: &[Vec<Value>], gitems: &[GItem]) -> Result<Vec<Value>, Ev
                             _ => continue,
                         }
                     }
-                    if n == 0 {
+                    if let Some(acc) = dsum {
+                        use fire_crab_ods::decfloat::{self as dfl, Dec};
+                        if matches!(func, AggFn::Sum) {
+                            // SUM -> DECFLOAT(34)
+                            Value::DecFloat34(dfl::dec_to_bits(&acc))
+                        } else {
+                            // AVG -> divide by the non-NULL count, present
+                            // at the source width
+                            let q = dfl::div(
+                                &acc,
+                                &Dec::Finite { neg: false, coeff: n as u128, exp: 0 },
+                            );
+                            if dwide {
+                                Value::DecFloat34(dfl::dec_to_bits(&q))
+                            } else {
+                                // DECFLOAT(16): fit the quotient to 16 sig
+                                let bits = match &q {
+                                    Dec::Finite { neg, coeff, exp } => {
+                                        dfl::fit_dec64(*neg, *coeff, *exp)
+                                    }
+                                    Dec::Infinity { neg } => {
+                                        Some(dfl::encode_dec64_special(*neg, false))
+                                    }
+                                    Dec::Nan => Some(dfl::encode_dec64_special(false, true)),
+                                };
+                                match bits {
+                                    Some(b) => Value::DecFloat16(b),
+                                    // an average of DECFLOAT(16) values is
+                                    // always within decimal64's range, so
+                                    // this is unreachable in practice
+                                    None => return Err(EvalErr::NumericOutOfRange),
+                                }
+                            }
+                        }
+                    } else if n == 0 {
                         Value::Null
                     } else if approx {
                         Value::Double(if matches!(func, AggFn::Sum) {
