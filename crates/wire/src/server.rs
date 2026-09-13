@@ -8965,10 +8965,23 @@ impl ProjCol {
                         }
                     }
                 }
+                // a DECFLOAT(16)-announced value carried as a 34-sig
+                // decimal128 intermediate (df16 arithmetic / -df16, the
+                // engine's decQuad model) is NARROWED to decimal64 HERE, at
+                // materialization: 16 sig HALF-UP, raising the engine's
+                // 22003 on a decimal64 magnitude overflow. A consumer that
+                // keeps the value wider (CAST(.. AS VARCHAR), further
+                // arithmetic) never reaches this - its column is not Dec16.
+                if let (Wire::Dec16, Value::DecFloat34(bits)) = (self.wire, &v) {
+                    v = match fire_crab_ods::decfloat::round_to_dec16_of(*bits) {
+                        Some(d64) => Value::DecFloat16(d64),
+                        None => return Err(EvalErr::NumericOutOfRange),
+                    };
+                }
                 Ok(v)
             }
             None => {
-                let v = values.get(self.field_id).cloned().unwrap_or(Value::Null);
+                let mut v = values.get(self.field_id).cloned().unwrap_or(Value::Null);
                 // the out-of-range poison ([Value::OutOfRange]): an old
                 // row an ALTER TYPE pushed past the new format's range is
                 // being PRESENTED (as an output column, or a sort / group
@@ -8993,6 +9006,16 @@ impl ProjCol {
                 // announced wire form raises, never encodes wrong
                 if !matches!(self.wire, Wire::Int128) && matches!(v, Value::Int128(..)) {
                     return Err(EvalErr::IntegerOverflow);
+                }
+                // an aggregate slot (SUM/AVG/MIN/MAX over df16 arithmetic)
+                // announced DECFLOAT(16) holds the 34-sig fold result -
+                // narrow to decimal64 at materialization, as the expr arm
+                // above does (22003 on decimal64 overflow)
+                if let (Wire::Dec16, Value::DecFloat34(bits)) = (self.wire, &v) {
+                    v = match fire_crab_ods::decfloat::round_to_dec16_of(*bits) {
+                        Some(d64) => Value::DecFloat16(d64),
+                        None => return Err(EvalErr::NumericOutOfRange),
+                    };
                 }
                 Ok(v)
             }
@@ -18859,16 +18882,28 @@ fn build_expr_col_from(e: Expr, name: &str, descs: &[Descriptor]) -> Option<Proj
     // operand (`df + 1`, `df * 2`, `df1 - df2`, `-df`) - both ride the
     // DECFLOAT(34) wire form and short-circuit the exact-numeric describe
     if matches!(e, Expr::DecFloat34(_)) || is_decfloat_arith(&e, descs) {
+        // a decfloat ARITHMETIC tree keeps DECFLOAT(16) when both operands
+        // reduce to df16 (d16+d16, -d16, nested), and widens to DECFLOAT(34)
+        // for any df34 or promoted-non-decfloat operand - the recursive
+        // engine rule. The capture GATE stays is_decfloat_arith (identical
+        // to today's captured set); only the width chosen within it moves
+        // off the old always-34. A bare DecFloat34 literal is df34.
+        let wide = df_agg_engine_width(&e, descs).unwrap_or(true);
+        let (wire, sql_type, length) = if wide {
+            (Wire::Dec34, 32762, 16i32)
+        } else {
+            (Wire::Dec16, 32760, 8i32)
+        };
         return Some(ProjCol {
             name: name.to_string(),
-            oct_length: 16,
+            oct_length: length,
             fname: None,
             relation: None,
             rel_alias: None,
             field_id: 0,
-            wire: Wire::Dec34,
-            sql_type: nullable(32762),
-            length: 16,
+            wire,
+            sql_type: nullable(sql_type),
+            length,
             scale: 0,
             sub_type: 0,
             expr: Some(e),
@@ -65668,21 +65703,11 @@ fn is_decfloat_arith(e: &Expr, descs: &[Descriptor]) -> bool {
 /// fire-crab's shipped arith-always-34 rule (the df16+df16-arith->df16
 /// engine case is a separately-tracked latent divergence).
 fn decfloat_width(e: &Expr, descs: &[Descriptor]) -> Option<bool> {
-    match e {
-        Expr::DecFloat34(_) => Some(true),
-        Expr::Cast(_, CastTarget::DecFloat { wide }, _) => Some(*wide),
-        Expr::Col(fid) => match descs.get(*fid)?.dtype {
-            dtype::DEC128 => Some(true),
-            dtype::DEC64 => Some(false),
-            _ => None,
-        },
-        Expr::Neg(x) => decfloat_width(x, descs),
-        Expr::Bin(a, _, b) => match (decfloat_width(a, descs), decfloat_width(b, descs)) {
-            (None, None) => None,
-            _ => Some(true),
-        },
-        _ => None,
-    }
+    // the recursive engine rule: a Bin of two df16 operands is df16, only
+    // a df34 (or a promoted non-decfloat) operand widens to df34. Shared
+    // with [df_agg_engine_width] so a conditional branch over df16
+    // arithmetic (COALESCE(d16+d16, ..)) announces df16 consistently.
+    df_agg_engine_width(e, descs)
 }
 
 /// The DECFLOAT width the ENGINE describes for `SELECT <e>` over a
@@ -65717,17 +65742,11 @@ fn df_agg_engine_width(e: &Expr, descs: &[Descriptor]) -> Option<bool> {
 /// rule), so those always emit df34; a Cast / column / literal leaf emits
 /// its own width.
 fn df_agg_fold_width(e: &Expr, descs: &[Descriptor]) -> Option<bool> {
-    match e {
-        Expr::DecFloat34(_) => Some(true),
-        Expr::Cast(_, CastTarget::DecFloat { wide }, _) => Some(*wide),
-        Expr::Col(fid) => match descs.get(*fid)?.dtype {
-            dtype::DEC128 => Some(true),
-            dtype::DEC64 => Some(false),
-            _ => None,
-        },
-        Expr::Neg(_) | Expr::Bin(..) => Some(true),
-        _ => None,
-    }
+    // Now that the Neg/Bin EVAL produces a Value::DecFloat16 whenever both
+    // operands are df16 (the df16-arithmetic chunk), the fold emits EXACTLY
+    // the engine width - so fold width == engine width, and df_expr_agg_wide
+    // now passes AVG/MIN/MAX over a both-df16 Bin or -df16 (was refused).
+    df_agg_engine_width(e, descs)
 }
 
 /// The DECFLOAT result width of an aggregate over a decfloat EXPRESSION,
@@ -69086,6 +69105,10 @@ impl Expr {
                 Value::DecFloat34(bits) => Value::DecFloat34(fire_crab_ods::decfloat::dec_to_bits(
                     &fire_crab_ods::decfloat::negate(&fire_crab_ods::decfloat::decode_dec128(bits)),
                 )),
+                // negating a DECFLOAT(16) keeps the 34-sig intermediate
+                // model: the value carries as DecFloat34 (exact sign flip)
+                // and value_of narrows it back to df16 at materialization,
+                // matching the DECFLOAT(16) the describe announces for -d16
                 Value::DecFloat16(bits) => Value::DecFloat34(fire_crab_ods::decfloat::dec_to_bits(
                     &fire_crab_ods::decfloat::negate(&fire_crab_ods::decfloat::decode_dec64(bits)),
                 )),
@@ -69183,6 +69206,15 @@ impl Expr {
                     if matches!(r, df::Dec::Nan) {
                         return Err(EvalErr::DecfloatInvalidOperation);
                     }
+                    // decfloat arithmetic computes in a 34-sig decimal128
+                    // intermediate (the engine's decQuad model), whatever
+                    // the operand widths - even d16-op-d16. The result is
+                    // DESCRIBED DECFLOAT(16) when both operands reduce to
+                    // df16 (df_agg_engine_width), and NARROWED to decimal64
+                    // only at MATERIALIZATION (ProjCol::value_of / an
+                    // INSERT into a df16 column); a consumer that keeps it
+                    // wide (CAST(.. AS VARCHAR), further arithmetic) sees
+                    // the 34-sig value, as the engine does.
                     Value::DecFloat34(df::dec_to_bits(&r))
                 } else if let (Some((r1, s1)), Some((r2, s2))) =
                     (numeric_parts(&va), numeric_parts(&vb))
