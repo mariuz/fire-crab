@@ -63385,7 +63385,12 @@ fn resolve_expr(
     // appears: inside a concatenation, a comparison, an aggregate's
     // source or the select list
     let e = align_conditional(resolve_expr_inner(raw, columns, descs)?, descs);
-    Some(pad_conditional(recode_conditional(recode_concat(e, descs), descs), descs))
+    let e = pad_conditional(recode_conditional(recode_concat(e, descs), descs), descs);
+    // a DECFLOAT conditional (COALESCE/CASE/IIF/NULLIF with a decfloat
+    // branch) is typed by an OUTERMOST CAST to DECFLOAT - the passes above
+    // all no-op on it (its type_of is None, not Numeric/Text), so this runs
+    // last and they never see through the wrap
+    Some(decfloat_conditional(e, descs))
 }
 
 /// EACH CONCATENATION OPERAND IS CONVERTED TO THE RESULT'S CHARACTER
@@ -63593,6 +63598,66 @@ fn align_conditional(e: Expr, descs: &[Descriptor]) -> Expr {
         CastTarget::Numeric { scale, bytes, sub_type },
         fire_crab_ods::intl::CS_UTF8,
     )
+}
+
+/// Wrap a DECFLOAT conditional (COALESCE/CASE/IIF/DECODE/NULLIF with a
+/// decfloat branch) in a CAST to DECFLOAT, so the existing decfloat-cast
+/// describe (its own width) and eval (Value->decimal at the result width)
+/// carry the result. A DECFLOAT branch DOMINATES exact numerics and
+/// DOUBLE/FLOAT (measured, order-independent), and the width is 34 iff any
+/// decfloat branch is df34, else 16 - non-decfloat siblings convert INTO
+/// that width and never bump 16->34. A TEXT/temporal/bool sibling is not
+/// coercible here, so the node is left UNWRAPPED and the conditional_type
+/// guard keeps refusing it (TEXT-dominant folding is a separate slice).
+/// NULLIF takes its FIRST operand's width alone. The align_conditional
+/// numeric CAST above never fired for these (type_of is None for a
+/// decfloat branch), so this is the vehicle that types them.
+fn decfloat_conditional(e: Expr, descs: &[Descriptor]) -> Expr {
+    // decide in a borrowing scope (Some(wide) = wrap at that width, None =
+    // leave unchanged), then move `e`
+    let decide = |e: &Expr| -> Option<bool> {
+        let branches: Vec<&Expr> = match e {
+            Expr::Coalesce(v) => v.iter().collect(),
+            Expr::Case(arms, els) => {
+                arms.iter().map(|(_, t)| t).chain(els.iter().map(|b| &**b)).collect()
+            }
+            Expr::Iif(_, a, b) => vec![&**a, &**b],
+            // NULLIF's type is its FIRST operand alone
+            Expr::NullIf(a, _) => return decfloat_width(a, descs),
+            _ => return None,
+        };
+        let (mut seen, mut wide) = (false, false);
+        for b in branches {
+            // a bare NULL branch is transparent (contributes no type)
+            if matches!(b, Expr::Null) {
+                continue;
+            }
+            match decfloat_width(b, descs) {
+                Some(w) => {
+                    seen = true;
+                    wide |= w;
+                }
+                // an exact-numeric or approximate sibling coerces INTO the
+                // decfloat result; anything else (text/temporal/bool) is
+                // left for the refusing guard
+                None => match b.type_of(descs) {
+                    Some(ExprType::Int | ExprType::Numeric | ExprType::Approx) => {}
+                    _ => return None,
+                },
+            }
+        }
+        if seen {
+            Some(wide)
+        } else {
+            None
+        }
+    };
+    match decide(&e) {
+        Some(wide) => {
+            Expr::Cast(Box::new(e), CastTarget::DecFloat { wide }, fire_crab_ods::intl::CS_UTF8)
+        }
+        None => e,
+    }
 }
 
 /// Does this expression carry a `?` parameter anywhere?
@@ -65550,6 +65615,31 @@ fn is_decfloat_arith(e: &Expr, descs: &[Descriptor]) -> bool {
         })
     }
     walk(e, descs) == Some(true)
+}
+
+/// The DECFLOAT width of a decfloat leaf: `Some(true)` for DECFLOAT(34),
+/// `Some(false)` for DECFLOAT(16), `None` if `e` is not a decfloat leaf.
+/// Mirrors [is_decfloat_arith]'s structure but carries the width, so a
+/// conditional can pick its result width (34 iff ANY branch is a df34
+/// leaf). An arithmetic tree with a decfloat operand counts as 34 -
+/// fire-crab's shipped arith-always-34 rule (the df16+df16-arith->df16
+/// engine case is a separately-tracked latent divergence).
+fn decfloat_width(e: &Expr, descs: &[Descriptor]) -> Option<bool> {
+    match e {
+        Expr::DecFloat34(_) => Some(true),
+        Expr::Cast(_, CastTarget::DecFloat { wide }, _) => Some(*wide),
+        Expr::Col(fid) => match descs.get(*fid)?.dtype {
+            dtype::DEC128 => Some(true),
+            dtype::DEC64 => Some(false),
+            _ => None,
+        },
+        Expr::Neg(x) => decfloat_width(x, descs),
+        Expr::Bin(a, _, b) => match (decfloat_width(a, descs), decfloat_width(b, descs)) {
+            (None, None) => None,
+            _ => Some(true),
+        },
+        _ => None,
+    }
 }
 
 /// Decompose a numeric value into (raw integer, scale) for arithmetic:
