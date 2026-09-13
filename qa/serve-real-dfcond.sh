@@ -86,10 +86,12 @@ agree "CASE int"                "select case when id=1 then 7 else 9 end v from 
 agree "COALESCE(null-num,dbl)"  "select coalesce(cast(null as numeric(9,2)),cast(2.5 as double precision)) v from rdb\$database;"
 agree "NULLIF(i,d34)->int"      "select nullif(i,d34) v from t where id=1;"
 agree "NULLIF(i,5)"             "select nullif(i,5) v from t where id=1;"
-echo "-- deferred (still refuse): TEXT-mixed, and aggregate over a decfloat conditional --"
+echo "-- an aggregate over a decfloat conditional now answers (agg-over-decfloat-expression) --"
+agree "SUM(COALESCE(d16,0))"        "select sum(coalesce(d16, cast(0 as decfloat(16)))) v from t;"
+agree "AVG(COALESCE(d16,0))"        "select avg(coalesce(d16, cast(0 as decfloat(16)))) v from t;"
+echo "-- deferred (still refuse): TEXT-mixed decfloat conditional --"
 fc_refuses "COALESCE(d16,varchar)"  "select coalesce(d16, cast(1 as varchar(10))) v from t where id=1;"
 fc_refuses "COALESCE(d16,'5')"      "select coalesce(d16, '5') v from t where id=1;"
-fc_refuses "SUM(COALESCE(d16,0))"   "select sum(coalesce(d16, cast(0 as decfloat(16)))) v from t;"
 
 kill $srv 2>/dev/null; wait $srv 2>/dev/null; trap - EXIT
 [ $fail = 0 ] && echo "PASS dfcond" || echo "FAIL dfcond"

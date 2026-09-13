@@ -49391,6 +49391,35 @@ fn agg_result_desc(
             _ => None,
         };
     }
+    // a decfloat EXPRESSION source (df+1, df*2, a CAST-to-DECFLOAT, or a
+    // COALESCE/CASE/IIF/NULLIF the resolver already lowered to one): SUM
+    // -> DECFLOAT(34), AVG/MIN/MAX preserve the expression's own width.
+    // df_expr_agg_wide refuses the shapes where the shipped arith fold
+    // would over-widen a df16 result (d16-d16, -d16). The Col case rode
+    // df_col_wide above; a real expression falls here.
+    let df_expr_wide = |t: &AggTarget| -> Option<bool> {
+        let raw = match t {
+            AggTarget::Expr(r) | AggTarget::DistinctExpr(r) => r,
+            _ => return None,
+        };
+        let e = resolve_expr(raw, columns, descs)?;
+        df_expr_agg_wide(&func, &e, descs)
+    };
+    if let Some(wide) = df_expr_wide(target) {
+        let dec = |wide: bool| Descriptor {
+            dtype: if wide { dtype::DEC128 } else { dtype::DEC64 },
+            scale: 0,
+            length: if wide { 16 } else { 8 },
+            sub_type: 0,
+            flags: 0,
+            offset: 1,
+        };
+        return match func {
+            AggFn::Sum => Some(dec(true)),
+            AggFn::Avg | AggFn::Min | AggFn::Max => Some(dec(wide)),
+            _ => None,
+        };
+    }
     Some(match func {
         // a LIST result is a computed BLOB: no scalar slot descriptor -
         // LIST inside an expression stays refused (recorded boundary)
@@ -50054,10 +50083,24 @@ fn build_group_items(
                     },
                     _ => None,
                 };
+                // a decfloat EXPRESSION source (df+1, a CAST-to-DECFLOAT, a
+                // lowered COALESCE/CASE/IIF/NULLIF): SUM -> DECFLOAT(34),
+                // AVG/MIN/MAX preserve the expression's width; the shapes
+                // the shipped arith fold would over-widen (d16-d16, -d16)
+                // refuse via df_expr_agg_wide returning None.
+                let df_expr = match &src {
+                    AggSrc::Expr(e) => df_expr_agg_wide(func, e, descs),
+                    _ => None,
+                };
                 // (type, scale, rank) of the aggregate's input - not needed
                 // for a decfloat source (the df path types it), and its
-                // else-arm `return None` must not fire for one
-                let src_shape: Option<(ExprType, i8, NumRank)> = if df_wide.is_some() {
+                // else-arm `return None` must not fire for one. A decfloat
+                // EXPRESSION source is skipped on is_decfloat_arith (NOT
+                // df_expr), so a REFUSED shape (AVG(d16-d16)) still skips
+                // src_shape's `type_of()?` and falls to a clean None.
+                let src_shape: Option<(ExprType, i8, NumRank)> = if df_wide.is_some()
+                    || matches!(&src, AggSrc::Expr(e) if is_decfloat_arith(e, descs))
+                {
                     None
                 } else { match (&src, field_desc) {
                     (AggSrc::Field(_) | AggSrc::CollField(..), Some(d))
@@ -50121,7 +50164,7 @@ fn build_group_items(
                 // the source width (DECFLOAT(16) -> 16, DECFLOAT(34) -> 34).
                 // COUNT stays INT64 (its own arm); any other fold over a
                 // decfloat source stays refused. (df_wide computed above.)
-                let df_tuple = df_wide.and_then(|wide| match func {
+                let df_tuple = df_wide.or(df_expr).and_then(|wide| match func {
                     AggFn::Sum => Some((Wire::Dec34, 32762, 16, 0, 0)),
                     AggFn::Avg | AggFn::Min | AggFn::Max => Some(if wide {
                         (Wire::Dec34, 32762, 16, 0, 0)
@@ -65638,6 +65681,73 @@ fn decfloat_width(e: &Expr, descs: &[Descriptor]) -> Option<bool> {
             (None, None) => None,
             _ => Some(true),
         },
+        _ => None,
+    }
+}
+
+/// The DECFLOAT width the ENGINE describes for `SELECT <e>` over a
+/// decfloat-typed expression: a decfloat leaf keeps its declared width,
+/// Neg preserves it, and a Bin is the WIDER of two decfloat operands but
+/// DECFLOAT(34) when exactly one operand is decfloat (the other promotes
+/// to df34 first). `None` if not a decfloat leaf/tree.
+fn df_agg_engine_width(e: &Expr, descs: &[Descriptor]) -> Option<bool> {
+    match e {
+        Expr::DecFloat34(_) => Some(true),
+        Expr::Cast(_, CastTarget::DecFloat { wide }, _) => Some(*wide),
+        Expr::Col(fid) => match descs.get(*fid)?.dtype {
+            dtype::DEC128 => Some(true),
+            dtype::DEC64 => Some(false),
+            _ => None,
+        },
+        Expr::Neg(x) => df_agg_engine_width(x, descs),
+        Expr::Bin(a, _, b) => {
+            match (df_agg_engine_width(a, descs), df_agg_engine_width(b, descs)) {
+                (Some(x), Some(y)) => Some(x || y), // both decfloat -> the wider
+                (Some(_), None) | (None, Some(_)) => Some(true), // one -> df34
+                (None, None) => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// The DECFLOAT width the FOLD actually EMITS for a decfloat expression.
+/// It differs from [df_agg_engine_width] only in that Neg and every Bin
+/// widen a df16 operand to df34 at eval (the shipped arith-always-34
+/// rule), so those always emit df34; a Cast / column / literal leaf emits
+/// its own width.
+fn df_agg_fold_width(e: &Expr, descs: &[Descriptor]) -> Option<bool> {
+    match e {
+        Expr::DecFloat34(_) => Some(true),
+        Expr::Cast(_, CastTarget::DecFloat { wide }, _) => Some(*wide),
+        Expr::Col(fid) => match descs.get(*fid)?.dtype {
+            dtype::DEC128 => Some(true),
+            dtype::DEC64 => Some(false),
+            _ => None,
+        },
+        Expr::Neg(_) | Expr::Bin(..) => Some(true),
+        _ => None,
+    }
+}
+
+/// The DECFLOAT result width of an aggregate over a decfloat EXPRESSION,
+/// or `None` to refuse. SUM is always DECFLOAT(34) (width-immune, and the
+/// engine agrees). AVG/MIN/MAX PRESERVE the expression's width, but only
+/// where the width the engine describes equals the width the fold emits -
+/// so a Bin whose both operands are DECFLOAT(16) (`d16 - d16`, engine
+/// df16) and a Neg of a df16 cohort (`-d16`, engine df16) are REFUSED,
+/// because the shipped arith-always-34 fold would present them at df34
+/// (the tracked latent divergence). Requires a decfloat numeric tree.
+fn df_expr_agg_wide(func: &AggFn, e: &Expr, descs: &[Descriptor]) -> Option<bool> {
+    if !is_decfloat_arith(e, descs) {
+        return None;
+    }
+    match func {
+        AggFn::Sum => Some(true),
+        AggFn::Avg | AggFn::Min | AggFn::Max => {
+            let eng = df_agg_engine_width(e, descs)?;
+            (eng == df_agg_fold_width(e, descs)?).then_some(eng)
+        }
         _ => None,
     }
 }
