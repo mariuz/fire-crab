@@ -17925,6 +17925,16 @@ fn result_width_bytes(e: &Expr, descs: &[Descriptor]) -> u8 {
             }
         }
         Expr::Func(SysFn::Round | SysFn::Trunc, args) => result_width_bytes(&args[0], descs),
+        // an integer-valued builtin's width is what int_func_form
+        // announces (CHAR_LENGTH/POSITION -> LONG len 4, SIGN -> SHORT,
+        // HASH -> BIGINT, MOD -> its operand's) - the SAME width the
+        // projection describes, so a wrapping MIN/MAX or arithmetic keeps
+        // it instead of falling to the 8-byte default (probed:
+        // MAX(CHAR_LENGTH(s)) is LONG len 4, not INT64). Only when
+        // int_func_form declines does the default below stand.
+        Expr::Func(..) if int_func_form(e, descs).is_some() => {
+            int_func_form(e, descs).map_or(8, |(_, _, len)| len as u8)
+        }
         // a temporal difference's own width - see [temporal_diff_shape]
         _ if temporal_diff_shape(e, descs).is_some() => {
             temporal_diff_shape(e, descs).map_or(8, |(w, _)| w)
@@ -18065,9 +18075,16 @@ fn int_func_form(e: &Expr, descs: &[Descriptor]) -> Option<(Wire, i32, i32)> {
     let long = (Wire::Int32, 496, 4);
     let int64 = (Wire::Int64, 580, 8);
     let Expr::Func(f, args) = e else { return None };
-    // the operand's own stored width, when it has one
+    // the operand's own stored width, when it has one - a column's
+    // dtype, or an integer LITERAL's natural width (INTEGER when it fits
+    // 32 bits, else BIGINT; an INT128 literal stays INT128), so
+    // `MOD(10, 3)` types LONG like the engine and not the 8-byte default
     let src_dtype = |i: usize| match args.get(i) {
         Some(Expr::Col(fid)) => descs.get(*fid).map(|d| d.dtype),
+        Some(Expr::Int(n)) => {
+            Some(if i32::try_from(*n).is_ok() { dtype::LONG } else { dtype::INT64 })
+        }
+        Some(Expr::Int128(_)) => Some(dtype::INT128),
         _ => None,
     };
     match f {
