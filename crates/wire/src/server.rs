@@ -53014,6 +53014,55 @@ fn value_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
         {
             fire_crab_ods::decfloat::cmp(&value_as_dec(a).unwrap(), &value_as_dec(b).unwrap())
         }
+        // a DECFLOAT against an APPROXIMATE value (DOUBLE, or FLOAT
+        // widened to f64): the engine converts the approximate operand to
+        // a decimal at the DECFLOAT operand's OWN width - 16 significant
+        // digits for DECFLOAT(16), 17 for DECFLOAT(34) - then compares in
+        // the decimal domain (measured: a runtime double 0.1 is EQ to
+        // DECFLOAT(16) 0.1 but NE to DECFLOAT(34) 0.1 - the width flips
+        // it). NOT an f64 compare and NOT the lexical render the
+        // approximate arm below would otherwise fall to. The width comes
+        // from the Value variant alone, so this is operand-order
+        // symmetric - the reversed arms SWAP decfloat::cmp's arguments
+        // (it is a total order), they never negate. f64_to_dec is the
+        // same conversion the runtime CAST-to-DECFLOAT path uses; a
+        // non-finite f64 (unreachable via SQL) keeps the render fallback.
+        (Value::DecFloat16(x), _) if approx_of(b).is_some() => {
+            match f64_to_dec(approx_of(b).unwrap(), 16) {
+                Some(db) => fire_crab_ods::decfloat::cmp(
+                    &fire_crab_ods::decfloat::decode_dec64(*x),
+                    &db,
+                ),
+                None => a.render().cmp(&b.render()),
+            }
+        }
+        (Value::DecFloat34(x), _) if approx_of(b).is_some() => {
+            match f64_to_dec(approx_of(b).unwrap(), 17) {
+                Some(db) => fire_crab_ods::decfloat::cmp(
+                    &fire_crab_ods::decfloat::decode_dec128(*x),
+                    &db,
+                ),
+                None => a.render().cmp(&b.render()),
+            }
+        }
+        (_, Value::DecFloat16(y)) if approx_of(a).is_some() => {
+            match f64_to_dec(approx_of(a).unwrap(), 16) {
+                Some(da) => fire_crab_ods::decfloat::cmp(
+                    &da,
+                    &fire_crab_ods::decfloat::decode_dec64(*y),
+                ),
+                None => a.render().cmp(&b.render()),
+            }
+        }
+        (_, Value::DecFloat34(y)) if approx_of(a).is_some() => {
+            match f64_to_dec(approx_of(a).unwrap(), 17) {
+                Some(da) => fire_crab_ods::decfloat::cmp(
+                    &da,
+                    &fire_crab_ods::decfloat::decode_dec128(*y),
+                ),
+                None => a.render().cmp(&b.render()),
+            }
+        }
         // APPROXIMATE values compare as f64 whatever their widths, and
         // against an exact value the exact side converts - the engine's
         // promotion. Without these arms the pair fell to the
@@ -85595,13 +85644,20 @@ fn cmp_sides(lhs: Expr, rhs: Expr, descs: &[Descriptor]) -> Option<(Expr, Expr)>
     if matches!(lhs, Expr::Null) || matches!(rhs, Expr::Null) {
         return Some((lhs, rhs));
     }
-    // a DECFLOAT arithmetic side (`df + 1 > 5`) has no ExprType of its own -
-    // it compares in decimal128. The other side must be exact-numeric (an
-    // int/NUMERIC/DECFLOAT expression); value_cmp does the decimal compare.
+    // a DECFLOAT side (a column, an arithmetic tree `df + 1 > 5`, or a
+    // CAST) has no ExprType of its own - it compares in decimal. The other
+    // side may be exact-numeric OR APPROXIMATE: value_cmp converts an
+    // approximate operand to a decimal at the DECFLOAT operand's own width
+    // (measured: df16 0.1 = 0.1e0 EQ, df34 0.1 = 0.1e0 NE) and compares
+    // there. Without Approx here a DECFLOAT-vs-DOUBLE comparison refused at
+    // prepare and never reached value_cmp.
     if is_decfloat_arith(&lhs, descs) || is_decfloat_arith(&rhs, descs) {
         let numeric = |e: &Expr| {
             is_decfloat_arith(e, descs)
-                || matches!(e.type_of(descs), Some(ExprType::Int | ExprType::Numeric))
+                || matches!(
+                    e.type_of(descs),
+                    Some(ExprType::Int | ExprType::Numeric | ExprType::Approx)
+                )
         };
         return if numeric(&lhs) && numeric(&rhs) { Some((lhs, rhs)) } else { None };
     }
