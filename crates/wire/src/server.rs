@@ -67602,8 +67602,12 @@ impl Expr {
                 // the operand must be typeable; the result type is the
                 // cast target. A `?` parameter is the exception - it has
                 // no type of its own and is typed BY this cast, which is
-                // exactly why a projection `?` must wear one.
-                if !matches!(**e, Expr::Param(_)) {
+                // exactly why a projection `?` must wear one. A DECFLOAT
+                // operand is the other exception: it has no ExprType of
+                // its own (type_of returns None for it), but a CAST OUT
+                // of DECFLOAT is valid - the target arm below types the
+                // result and the eval reads the operand as a Dec.
+                if !matches!(**e, Expr::Param(_)) && !is_decfloat_arith(e, descs) {
                     e.type_of(descs)?;
                 }
                 Some(match t {
@@ -68999,6 +69003,31 @@ impl Expr {
                                 }
                                 fit(r as i128)?
                             }
+                            // a DECFLOAT source rounds half AWAY FROM ZERO
+                            // to an integer (2.5 -> 3). The engine converts
+                            // it to the i32 intermediate (SMALLINT/INTEGER)
+                            // or the i64 one (BIGINT) FIRST: overflowing
+                            // THAT is "decimal float invalid operation"
+                            // (SQLSTATE 22000), where a SMALLINT then
+                            // narrows i32 -> i16 with the ordinary 22003
+                            // range check (probed: 3e9 -> INTEGER is 22000,
+                            // 40000 -> SMALLINT is 22003, 1e19 -> BIGINT is
+                            // 22000). A non-finite value is 22000 too.
+                            v @ (Value::DecFloat16(_) | Value::DecFloat34(_)) => {
+                                let dec =
+                                    value_as_dec(&v).ok_or(EvalErr::DecfloatInvalidOperation)?;
+                                let x = fire_crab_ods::decfloat::round_to_exp(&dec, 0)
+                                    .ok_or(EvalErr::DecfloatInvalidOperation)?;
+                                let (clo, chi) = if *bytes >= 8 {
+                                    (i64::MIN as i128, i64::MAX as i128)
+                                } else {
+                                    (i32::MIN as i128, i32::MAX as i128)
+                                };
+                                if x < clo || x > chi {
+                                    return Err(EvalErr::DecfloatInvalidOperation);
+                                }
+                                fit(x)?
+                            }
                             _ => return Err(EvalErr::ConversionError(None)),
                         }
                     }
@@ -69224,6 +69253,33 @@ impl Expr {
                                     (scaled.round() as i128, *scale)
                                 }
                             }
+                            // a DECFLOAT source rounds HALF AWAY FROM ZERO
+                            // straight to the target scale (round_to_exp
+                            // to the declared exponent), so it arrives
+                            // pre-scaled; the shared width gate below
+                            // still applies. A non-finite value has no
+                            // fixed-point form (22000).
+                            v @ (Value::DecFloat16(_) | Value::DecFloat34(_)) => {
+                                let dec =
+                                    value_as_dec(v).ok_or(EvalErr::DecfloatInvalidOperation)?;
+                                let raw = fire_crab_ods::decfloat::round_to_exp(&dec, *scale as i32)
+                                    .ok_or(EvalErr::DecfloatInvalidOperation)?;
+                                // a DECFLOAT source overflows the NUMERIC
+                                // BACKING as 22000 (probed: 1e18 ->
+                                // NUMERIC(9,0) i32, 1e30 -> NUMERIC(18,0)
+                                // i64), not the 22003 the shared gate below
+                                // raises for an exact/approx source
+                                let (lo, hi) = match *bytes {
+                                    2 => (i16::MIN as i128, i16::MAX as i128),
+                                    4 => (i32::MIN as i128, i32::MAX as i128),
+                                    8 => (i64::MIN as i128, i64::MAX as i128),
+                                    _ => (i128::MIN, i128::MAX),
+                                };
+                                if raw < lo || raw > hi {
+                                    return Err(EvalErr::DecfloatInvalidOperation);
+                                }
+                                (raw, *scale)
+                            }
                             other => numeric_parts(other)
                                 .ok_or(EvalErr::ConversionError(None))?,
                         };
@@ -69298,6 +69354,16 @@ impl Expr {
                                     None => return Err(EvalErr::NumericOutOfRange),
                                 },
                             },
+                            // a DECFLOAT source: decimal -> binary via the
+                            // canonical string, then narrowed to f32
+                            dfv @ (Value::DecFloat16(_) | Value::DecFloat34(_)) => {
+                                let dec =
+                                    value_as_dec(dfv).ok_or(EvalErr::ConversionError(None))?;
+                                let d: f64 = fire_crab_ods::decfloat::to_string(&dec)
+                                    .parse()
+                                    .map_err(|_| EvalErr::ConversionError(None))?;
+                                narrow(d)?
+                            }
                             other => match numeric_parts(other) {
                                 Some((raw, sc)) => narrow(exact_to_f64(raw as i128, sc as i32))?,
                                 None => return Err(EvalErr::ConversionError(None)),
@@ -69307,6 +69373,18 @@ impl Expr {
                     CastTarget::Approx => match &v {
                         v if approx_of(v).is_some() => {
                             Value::Double(approx_of(v).unwrap_or(0.0))
+                        }
+                        // a DECFLOAT source converts decimal -> binary
+                        // through its canonical decimal string, which the
+                        // f64 parser rounds correctly (probed: 0.1 -> the
+                        // nearest double, 1/3 likewise); Infinity/NaN carry
+                        // through as the f64 non-finite
+                        dfv @ (Value::DecFloat16(_) | Value::DecFloat34(_)) => {
+                            let dec = value_as_dec(dfv).ok_or(EvalErr::ConversionError(None))?;
+                            let f: f64 = fire_crab_ods::decfloat::to_string(&dec)
+                                .parse()
+                                .map_err(|_| EvalErr::ConversionError(None))?;
+                            Value::Double(f)
                         }
                         // the engine NEVER produces Infinity or NaN from a
                         // string cast (measured): 'inf'/'nan'/'infinity' and

@@ -771,6 +771,39 @@ pub fn dec128_from_int_digits(neg: bool, digits: &[u8]) -> u128 {
 /// digits is exact; a wider one (an INT128 up to 39 digits) drops its low
 /// places into the exponent, carrying to 10^33 when an all-nines run
 /// rounds up.
+/// Round a decoded DECFLOAT to the fixed-point value `raw * 10^target_exp`
+/// and return the signed `raw` - the engine's CAST-out-of-DECFLOAT
+/// rounding, HALF-UP (half AWAY FROM ZERO: 2.5 -> 3, -2.5 -> -3). Used by
+/// CAST(<decfloat> AS INTEGER) (target_exp 0) and AS NUMERIC(p,s)
+/// (target_exp = the declared scale). `None` for a non-finite value
+/// (Infinity/NaN) or one that overflows i128 - the caller raises the
+/// engine's "decimal float invalid operation" (SQLSTATE 22000).
+pub fn round_to_exp(d: &Dec, target_exp: i32) -> Option<i128> {
+    let (neg, coeff, exp) = match d {
+        Dec::Finite { neg, coeff, exp } => (*neg, *coeff, *exp),
+        _ => return None, // Infinity / NaN: no fixed-point value
+    };
+    let mag: u128 = if exp >= target_exp {
+        // scale UP: coeff * 10^(exp - target_exp), exact
+        coeff.checked_mul(10u128.checked_pow((exp - target_exp) as u32)?)?
+    } else {
+        // scale DOWN by (target_exp - exp) digits, rounding half away
+        // from zero on the dropped part
+        let pow = 10u128.checked_pow((target_exp - exp) as u32)?;
+        let q = coeff / pow;
+        let r = coeff % pow;
+        // round up when the dropped remainder is >= half; `r*2 >= pow`
+        // catches the exact-half up-round without a fractional half
+        if r.checked_mul(2).is_none_or(|d2| d2 >= pow) {
+            q.checked_add(1)?
+        } else {
+            q
+        }
+    };
+    let signed = i128::try_from(mag).ok()?;
+    Some(if neg { -signed } else { signed })
+}
+
 pub fn round_to_dec34(neg: bool, coeff: u128, exp: i32) -> Dec {
     let digits = coeff.to_string();
     if digits.len() <= 34 {
