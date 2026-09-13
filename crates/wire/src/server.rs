@@ -56122,6 +56122,12 @@ fn eval_status_items(w: &mut W, e: &EvalErr) {
                 .int(1) // isc_arg_gds
                 .int(GDS_FLOAT_OVERFLOW);
         }
+        EvalErr::FloatOverflowBare => {
+            // emitted ALONE - a non-finite DECFLOAT cast to DOUBLE/FLOAT
+            // shows only "Floating-point overflow. ..." (probed)
+            w.int(1) // isc_arg_gds
+                .int(GDS_FLOAT_OVERFLOW);
+        }
         EvalErr::SingletonSelect => {
             w.int(1) // isc_arg_gds
                 .int(GDS_SING_SELECT);
@@ -64834,6 +64840,12 @@ enum EvalErr {
     /// a floating-point result past the double's range:
     /// `isc_exception_float_overflow` (SQLSTATE 22003)
     FloatOverflow,
+    /// the same float overflow, but emitted ALONE without the
+    /// `arith_except` wrapper - the shape the engine's CVT routine
+    /// raises when a non-finite DECFLOAT is cast to DOUBLE/FLOAT
+    /// (measured: only "Floating-point overflow. ..." prints, where a
+    /// genuine arithmetic overflow keeps the arith_except prefix)
+    FloatOverflowBare,
     /// UPDATE OR INSERT without MATCHING on a table that has no
     /// primary key: `isc_dsql_error` + `isc_primary_key_required`
     /// (SQLSTATE 22000), the schema-qualified table name as the
@@ -69355,10 +69367,24 @@ impl Expr {
                                 },
                             },
                             // a DECFLOAT source: decimal -> binary via the
-                            // canonical string, then narrowed to f32
+                            // canonical string, then narrowed to f32. A
+                            // non-finite decfloat traps exactly as the engine
+                            // does (measured): Infinity (either sign) is a
+                            // 22003 float overflow - NOT the numeric-out-of-
+                            // range that narrow() would post - and NaN/sNaN
+                            // is a 22000 decimal-float invalid operation.
                             dfv @ (Value::DecFloat16(_) | Value::DecFloat34(_)) => {
                                 let dec =
                                     value_as_dec(dfv).ok_or(EvalErr::ConversionError(None))?;
+                                match dec {
+                                    fire_crab_ods::decfloat::Dec::Infinity { .. } => {
+                                        return Err(EvalErr::FloatOverflowBare)
+                                    }
+                                    fire_crab_ods::decfloat::Dec::Nan => {
+                                        return Err(EvalErr::DecfloatInvalidOperation)
+                                    }
+                                    fire_crab_ods::decfloat::Dec::Finite { .. } => {}
+                                }
                                 let d: f64 = fire_crab_ods::decfloat::to_string(&dec)
                                     .parse()
                                     .map_err(|_| EvalErr::ConversionError(None))?;
@@ -69377,10 +69403,22 @@ impl Expr {
                         // a DECFLOAT source converts decimal -> binary
                         // through its canonical decimal string, which the
                         // f64 parser rounds correctly (probed: 0.1 -> the
-                        // nearest double, 1/3 likewise); Infinity/NaN carry
-                        // through as the f64 non-finite
+                        // nearest double, 1/3 likewise). A non-finite source
+                        // TRAPS as the engine does (measured), rather than
+                        // shipping a silent f64 Infinity/NaN: Infinity (either
+                        // sign) is a 22003 float overflow, NaN/sNaN a 22000
+                        // decimal-float invalid operation.
                         dfv @ (Value::DecFloat16(_) | Value::DecFloat34(_)) => {
                             let dec = value_as_dec(dfv).ok_or(EvalErr::ConversionError(None))?;
+                            match dec {
+                                fire_crab_ods::decfloat::Dec::Infinity { .. } => {
+                                    return Err(EvalErr::FloatOverflowBare)
+                                }
+                                fire_crab_ods::decfloat::Dec::Nan => {
+                                    return Err(EvalErr::DecfloatInvalidOperation)
+                                }
+                                fire_crab_ods::decfloat::Dec::Finite { .. } => {}
+                            }
                             let f: f64 = fire_crab_ods::decfloat::to_string(&dec)
                                 .parse()
                                 .map_err(|_| EvalErr::ConversionError(None))?;
