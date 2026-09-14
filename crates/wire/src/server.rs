@@ -8910,8 +8910,17 @@ impl ProjCol {
                 // 22003 on the negative exponent (review-caught:
                 // COALESCE(<numeric(9,2)>, <varchar>) errored mid-fetch).
                 if matches!(self.wire, Wire::Text | Wire::Varying)
-                    && matches!(v, Value::Int(_) | Value::Scaled(..) | Value::Int128(..))
+                    && matches!(
+                        v,
+                        Value::Int(_)
+                            | Value::Scaled(..)
+                            | Value::Int128(..)
+                            | Value::DecFloat16(_)
+                            | Value::DecFloat34(_)
+                    )
                 {
+                    // a DECFLOAT branch surviving a TEXT-typed conditional
+                    // renders to its canonical string (Value::render)
                     return Ok(Value::Text(v.render()));
                 }
                 if let Some((raw, vs)) = numeric_parts(&v) {
@@ -18386,6 +18395,16 @@ fn text_form_m(
         };
         let scaled = e.result_scale(descs).map_or(false, |sc| sc != 0);
         return Some((true, base + i32::from(scaled), TfCs::Ttype(0)));
+    }
+    // A DECFLOAT OPERAND CONVERTED TO TEXT has a fixed render width - the
+    // widest canonical form: DECFLOAT(16) -> 23 ("-9.999999999999999E+384"),
+    // DECFLOAT(34) -> 42 ("-9.99..(33 nines)..E+6144"), value-independent
+    // (measured). Like a numeric operand it announces VARYING and NO
+    // charset (NONE; the text operand decides the result's). This carries
+    // a decfloat branch through the number-beside-text conditional and a
+    // `<decfloat> || <text>` concatenation.
+    if let Some(wide) = decfloat_width(e, descs) {
+        return Some((true, if wide { 42 } else { 23 }, TfCs::Ttype(0)));
     }
     match e {
         Expr::Str(s) => Some((false, lit_w(s), TfCs::Att)),
@@ -65543,7 +65562,16 @@ fn conditional_type<'a>(
     // than answer a confident wrong value; a pure-decfloat conditional
     // already refuses (every branch's type_of is None). NULLIF does not
     // reach here (its own first-operand rule).
-    if branches.iter().any(|e| is_decfloat_arith(e, descs)) {
+    // ...unless a TEXT branch is present: TEXT wins over DECFLOAT (measured),
+    // so the conditional types VARYING and the decfloat renders to text -
+    // exactly the numeric-beside-text path below. Only a decfloat mix with
+    // NO text branch (decfloat+int/numeric/approx/temporal/bool) still
+    // refuses here.
+    if branches.iter().any(|e| is_decfloat_arith(e, descs))
+        && !branches
+            .iter()
+            .any(|e| e.type_of(descs) == Some(ExprType::Text))
+    {
         return None;
     }
     let branches = branches.into_iter();

@@ -89,9 +89,9 @@ agree "NULLIF(i,5)"             "select nullif(i,5) v from t where id=1;"
 echo "-- an aggregate over a decfloat conditional now answers (agg-over-decfloat-expression) --"
 agree "SUM(COALESCE(d16,0))"        "select sum(coalesce(d16, cast(0 as decfloat(16)))) v from t;"
 agree "AVG(COALESCE(d16,0))"        "select avg(coalesce(d16, cast(0 as decfloat(16)))) v from t;"
-echo "-- deferred (still refuse): TEXT-mixed decfloat conditional --"
-fc_refuses "COALESCE(d16,varchar)"  "select coalesce(d16, cast(1 as varchar(10))) v from t where id=1;"
-fc_refuses "COALESCE(d16,'5')"      "select coalesce(d16, '5') v from t where id=1;"
+echo "-- a TEXT-mixed decfloat conditional now folds to VARYING (decfloat rendered) --"
+agree "COALESCE(d16,varchar)" "select coalesce(d16, cast(1 as varchar(10))) v from t where id=1;"
+agree "COALESCE(d16,'5')"     "select coalesce(d16, '5') v from t where id=1;"
 
 kill $srv 2>/dev/null; wait $srv 2>/dev/null; trap - EXIT
 [ $fail = 0 ] && echo "PASS dfcond" || echo "FAIL dfcond"
