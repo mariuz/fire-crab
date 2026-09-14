@@ -68224,10 +68224,20 @@ impl Expr {
                 _ => None, // a text operand is not arithmetic
             },
             Expr::Concat(a, b) => {
-                // both operands must be typeable (int or text); the
-                // engine coerces each to text, and the result is text
-                a.type_of(descs)?;
-                b.type_of(descs)?;
+                // both operands must be typeable; the engine coerces each
+                // to text and the result is VARYING. A DECFLOAT operand has
+                // no ExprType of its own but IS renderable to text (like a
+                // CAST-to-DECFLOAT operand of an outer cast) - skip its
+                // type_of the same way the Cast arm does, so `<decfloat> ||
+                // <text>` types Text instead of refusing. A genuinely
+                // untypeable operand (text/temporal mix, bare double
+                // literal) is not is_decfloat_arith and still refuses.
+                if !is_decfloat_arith(a, descs) {
+                    a.type_of(descs)?;
+                }
+                if !is_decfloat_arith(b, descs) {
+                    b.type_of(descs)?;
+                }
                 Some(ExprType::Text)
             }
             Expr::Cast(e, t, _) => {
