@@ -65754,17 +65754,38 @@ fn is_decfloat_arith(e: &Expr, descs: &[Descriptor]) -> bool {
                 } else if matches!(d.dtype, dtype::SHORT | dtype::LONG | dtype::INT64 | dtype::INT128)
                 {
                     false
+                } else if is_approx_col(d) {
+                    // a RUNTIME DOUBLE/FLOAT operand PROMOTES into a decfloat
+                    // arithmetic tree (df + <double col> is DECFLOAT(34), the
+                    // double converted to a decimal in the eval) - like an
+                    // exact-numeric leaf, it is not a decfloat leaf but does
+                    // not refuse
+                    false
                 } else {
                     return None;
                 }
             }
             Expr::Neg(x) => walk(x, descs)?,
-            Expr::Bin(a, _, b) => walk(a, descs)? || walk(b, descs)?,
+            // STRICT: evaluate BOTH sides so a refusing operand (a text /
+            // temporal / bare-double-LITERAL leaf) refuses the whole tree in
+            // EITHER order - the `||` short-circuit used to capture such a
+            // tree when the DECFLOAT was on the LEFT and then error at eval
+            Expr::Bin(a, _, b) => {
+                let (wa, wb) = (walk(a, descs)?, walk(b, descs)?);
+                wa || wb
+            }
             // a CAST to DECFLOAT is a decimal leaf (so `CAST(x AS DECFLOAT)
             // + 1` promotes); a CAST to an exact-numeric type is an ordinary
-            // numeric leaf whatever it wraps (the result is that type)
+            // numeric leaf whatever it wraps (the result is that type); a
+            // CAST to DOUBLE/FLOAT is a runtime approx operand that promotes
             Expr::Cast(_, CastTarget::DecFloat { .. }, _) => true,
             Expr::Cast(_, CastTarget::Int { .. } | CastTarget::Numeric { .. }, _) => false,
+            Expr::Cast(_, CastTarget::Approx | CastTarget::Float, _) => false,
+            // a bare DOUBLE/FLOAT LITERAL beside a decfloat is a prepare-time
+            // constant fold whose cohort the engine measures inconsistently
+            // (1+0.1e0 is 17-sig but 2*2.5e0 is a text fold) - not derivable
+            // from the f64, so it REFUSES rather than risk a wrong value
+            Expr::Double(_) => return None,
             _ => return None,
         })
     }
@@ -65835,6 +65856,23 @@ fn df_agg_fold_width(e: &Expr, descs: &[Descriptor]) -> Option<bool> {
 /// (the tracked latent divergence). Requires a decfloat numeric tree.
 fn df_expr_agg_wide(func: &AggFn, e: &Expr, descs: &[Descriptor]) -> Option<bool> {
     if !is_decfloat_arith(e, descs) {
+        return None;
+    }
+    // is_decfloat_arith now also captures a df-op-approx tree (df + <double
+    // col>). SUM/AVG/MIN/MAX over such a tree is an UNMEASURED aggregate
+    // path, so refuse it (the projection-level df-op-approx arithmetic is
+    // the measured, in-scope surface) rather than answer an unverified fold.
+    fn has_approx_leaf(e: &Expr, descs: &[Descriptor]) -> bool {
+        match e {
+            Expr::Double(_) => true,
+            Expr::Col(fid) => descs.get(*fid).is_some_and(is_approx_col),
+            Expr::Cast(_, CastTarget::Approx | CastTarget::Float, _) => true,
+            Expr::Neg(x) => has_approx_leaf(x, descs),
+            Expr::Bin(a, _, b) => has_approx_leaf(a, descs) || has_approx_leaf(b, descs),
+            _ => false,
+        }
+    }
+    if has_approx_leaf(e, descs) {
         return None;
     }
     match func {
@@ -65947,6 +65985,12 @@ fn classify_exp_literal(text: &str) -> Option<ExpLit> {
     const TWO63: u128 = 9_223_372_036_854_775_808;
     let m = match d.parse::<u128>() {
         Ok(m) => m,
+        // an ALL-ZERO significand (`0.0e0`, `0e5`) trims to an empty string:
+        // it is the approximate ZERO, a DOUBLE like any small literal - NOT
+        // a DECFLOAT (the empty-string parse error used to fall to the
+        // decfloat path, so `0.1e0 + 0.0e0` became a double+decfloat mix
+        // where the engine sees double+double -> DOUBLE)
+        Err(_) if d.is_empty() => 0,
         // past 39 digits it cannot fit u128 and is certainly > 2^63
         Err(_) => return text_to_dec128(text).map(ExpLit::DecFloat34),
     };
@@ -69220,9 +69264,15 @@ impl Expr {
                             scaled_value((*x as i128) / (*y as i128), 0)
                         }
                     }
-                } else if approx_of(&va).is_some() || approx_of(&vb).is_some() {
+                } else if (approx_of(&va).is_some() || approx_of(&vb).is_some())
+                    && !matches!(va, Value::DecFloat34(_) | Value::DecFloat16(_))
+                    && !matches!(vb, Value::DecFloat34(_) | Value::DecFloat16(_))
+                {
                     // one approximate operand makes the arithmetic
-                    // approximate; the exact side converts to f64 first
+                    // approximate - UNLESS the other is a DECFLOAT, which
+                    // DOMINATES (the pair falls through to the decfloat
+                    // branch below and the approx side promotes to a Dec);
+                    // the exact side converts to f64 first
                     let f = |v: &Value| {
                         approx_of(v).or_else(|| {
                             numeric_parts(v)
@@ -69255,14 +69305,21 @@ impl Expr {
                     || matches!(vb, Value::DecFloat34(_) | Value::DecFloat16(_))
                 {
                     // any DECFLOAT operand makes the arithmetic decimal128:
-                    // both sides promote to a Dec (an exact numeric exactly,
-                    // a stored DECFLOAT decoded), the op computes to 34
-                    // significant digits HALF-UP, and a NaN result traps
-                    // (SQLSTATE 22000). Division is a later slice; the
-                    // describe refuses it, so it never reaches here.
+                    // both sides promote to a Dec - an exact numeric
+                    // exactly, a stored DECFLOAT decoded, and a runtime
+                    // DOUBLE/FLOAT rendered to 17 significant digits (the
+                    // df34 result width, f64_to_dec - the same conversion
+                    // CAST(double AS decfloat) uses) - then the op computes
+                    // to 34 significant digits HALF-UP, and a NaN result
+                    // traps (SQLSTATE 22000). A df-op-approx result is
+                    // ALWAYS DECFLOAT(34) (df_agg_engine_width), so no df16
+                    // narrow applies.
                     use fire_crab_ods::decfloat as df;
-                    let da = value_as_dec(&va).ok_or(EvalErr::ConversionError(None))?;
-                    let db = value_as_dec(&vb).ok_or(EvalErr::ConversionError(None))?;
+                    let promote = |v: &Value| {
+                        value_as_dec(v).or_else(|| approx_of(v).and_then(|f| f64_to_dec(f, 17)))
+                    };
+                    let da = promote(&va).ok_or(EvalErr::ConversionError(None))?;
+                    let db = promote(&vb).ok_or(EvalErr::ConversionError(None))?;
                     let r = match op {
                         ArithOp::Add => df::add(&da, &db),
                         ArithOp::Sub => df::sub(&da, &db),
@@ -69492,7 +69549,7 @@ impl Expr {
                                 Some(bits) => fire_crab_ods::decfloat::decode_dec128(bits),
                                 None => return Err(conv_err(*cs, s.clone())),
                             }
-                        } else if approx_of(&v).is_some() && approx_const_fold(e) {
+                        } else if approx_const_fold(e) {
                             // a pure-constant approximate literal cast to
                             // DECFLOAT is a PREPARE-TIME decimal fold on the
                             // literal text (0.1e0 -> 0.1), NOT the runtime
