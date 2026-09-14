@@ -44724,15 +44724,27 @@ fn split_union(sql: &str) -> Option<(Vec<String>, bool)> {
             let after = i + "UNION".len();
             let after_ok = after >= b.len() || !(b[after].1.is_alphanumeric() || b[after].1 == '_');
             if before_ok && after_ok {
-                // an optional ALL follows
+                // an optional ALL follows - or DISTINCT, which the engine
+                // takes as a synonym of the bare UNION (measured: `UNION
+                // DISTINCT` describes and answers exactly as `UNION`)
                 let mut j = after;
                 while j < b.len() && b[j].1.is_whitespace() {
                     j += 1;
                 }
-                let is_all = up[byte_at(j)..].starts_with("ALL")
-                    && (j + 3 >= b.len()
-                        || !(b[j + 3].1.is_alphanumeric() || b[j + 3].1 == '_'));
-                let end = if is_all { j + 3 } else { after };
+                let word_at = |k: usize, w: &str| {
+                    up[byte_at(k)..].starts_with(w)
+                        && (k + w.len() >= b.len()
+                            || !(b[k + w.len()].1.is_alphanumeric() || b[k + w.len()].1 == '_'))
+                };
+                let is_all = word_at(j, "ALL");
+                let is_distinct = !is_all && word_at(j, "DISTINCT");
+                let end = if is_all {
+                    j + 3
+                } else if is_distinct {
+                    j + "DISTINCT".len()
+                } else {
+                    after
+                };
                 cuts.push((b[i].0, byte_at(end), is_all));
                 i = end;
                 continue;
@@ -49154,6 +49166,13 @@ fn desc_of_projcol(c: &ProjCol) -> Descriptor {
         // whole and was right, which is what hid it)
         32756 => (dtype::SQL_TIME_TZ, 8),
         32754 => (dtype::TIMESTAMP_TZ, 12),
+        // DECFLOAT, the same bug class: without these arms a NAMED
+        // decfloat column out of a derived table, a CTE or a VIEW fell to
+        // the INT64 default, so `WHERE a > 2` found no row, SUM(a) was an
+        // INT128 0 and ORDER BY a sorted zeros (measured against the
+        // engine, which keeps DECFLOAT(16)/(34) through all three)
+        32760 => (dtype::DEC64, 8),
+        32762 => (dtype::DEC128, 16),
         32764 => (dtype::BOOLEAN, 1),
         520 => (dtype::BLOB, 8),
         _ => (dtype::INT64, 8),
@@ -55014,8 +55033,27 @@ fn compute_group(rows: &[Vec<Value>], gitems: &[GItem]) -> Result<Vec<Value>, Ev
                                 dwide = true;
                             }
                             if let Some(d) = value_as_dec(&v) {
+                                // THE ACCUMULATOR STARTS FROM A ZERO OF
+                                // EXPONENT 0, as the engine's does: the
+                                // first addend is ADDED to it, not adopted,
+                                // so a positive-exponent input comes out at
+                                // exponent 0 (3 x 1E+3 sums to 3000, not
+                                // 3E+3; 9.99E+15 alone sums to
+                                // 9990000000000000) and a huge one pads to
+                                // 34 digits (1E+400 ->
+                                // 1.000000000000000000000000000000000E+400).
+                                // The value is the same either way; the
+                                // decimal128 BYTES and the rendered text
+                                // are not. MIN/MAX keep the input cohort.
                                 dsum = Some(match dsum {
-                                    None => d,
+                                    None => fire_crab_ods::decfloat::add(
+                                        &fire_crab_ods::decfloat::Dec::Finite {
+                                            neg: false,
+                                            coeff: 0,
+                                            exp: 0,
+                                        },
+                                        &d,
+                                    ),
                                     Some(acc) => fire_crab_ods::decfloat::add(&acc, &d),
                                 });
                                 n += 1;
@@ -55522,6 +55560,8 @@ fn cast_target_of_col(pc: &ProjCol) -> Option<CastTarget> {
         570 => Some(CastTarget::Temporal(TKind::Date)),
         560 => Some(CastTarget::Temporal(TKind::Time)),
         510 => Some(CastTarget::Temporal(TKind::Timestamp)),
+        32760 => Some(CastTarget::DecFloat { wide: false }),
+        32762 => Some(CastTarget::DecFloat { wide: true }),
         _ => None,
     }
 }
