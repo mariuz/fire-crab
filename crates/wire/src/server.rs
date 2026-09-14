@@ -46098,6 +46098,43 @@ fn plan_union(
             c.oct_length = widths.iter().map(|(_, o)| *o).max().unwrap_or(c.oct_length);
             continue;
         }
+        // a DECFLOAT branch DOMINATES exact numerics and DOUBLE/FLOAT
+        // (measured, order-independent) - the same precedence the DECFLOAT
+        // conditionals use, and the OPPOSITE of the approx-wins arm below.
+        // df34 wins iff ANY branch is df34, else df16; a non-decfloat
+        // sibling converts INTO that width (union_coerce_value) and the
+        // sibling scale is dropped (scale 0). A const approx literal branch
+        // is a RUNTIME 17-sig conversion here (measured: `SELECT 0.1e0`
+        // beside a df34 is 0.10000000000000001, NOT the CAST fold), so no
+        // const-fold refusal is needed - the coercion handles it.
+        let is_decfloat = |t: i32| matches!(t, 32760 | 32762);
+        if shapes.iter().any(|(t, ..)| is_decfloat(*t)) {
+            // TEXT beside a decfloat resolves to VARCHAR by rendering the
+            // decfloat - deferred (needs the value-side render), the same
+            // boundary the number-beside-text refuse below draws.
+            if shapes.iter().any(|(t, ..)| is_text(*t)) {
+                return Some(Plan::Refused);
+            }
+            // only exact / approx / decfloat siblings reconcile into a
+            // decfloat; a temporal/blob sibling is not a guess we make.
+            if !shapes.iter().all(|(t, ..)| {
+                is_decfloat(*t) || exact_numeric_rank(*t).is_some() || is_approx_sqltype(*t)
+            }) {
+                return Some(Plan::Refused);
+            }
+            let wide = shapes.iter().any(|(t, ..)| *t == 32762);
+            let (w, t, l) = if wide {
+                (Wire::Dec34, 32762, 16)
+            } else {
+                (Wire::Dec16, 32760, 8)
+            };
+            c.wire = w;
+            c.sql_type = t | (c.sql_type & 1);
+            c.length = l;
+            c.scale = 0;
+            c.sub_type = 0;
+            continue;
+        }
         if same_shape {
             // a non-text column whose branches differ only in announced
             // width: nothing here knows how to reconcile that
@@ -46256,6 +46293,45 @@ fn is_exact_numeric_sqltype(t: i32) -> bool {
 /// scaled one; a value at a NARROWER scale is widened. Nothing else is
 /// converted - the planner refuses those before a row is read.
 fn union_coerce_value(v: Value, sql_type: i32, scale: i32) -> Value {
+    // a DECFLOAT union column: every branch converts to the result width -
+    // the same vehicle CAST(.. AS DECFLOAT) uses. Exact numerics promote
+    // via value_as_dec (round to 34 sig); DOUBLE/FLOAT via f64_to_dec at
+    // the result width (17 sig for df34, 16 for df16 - FLOAT already f64
+    // via approx_of); a narrower decfloat widens by decode+reencode. The
+    // Dec16/Dec34 encoders write 0 for a non-DecFloat value, so this MUST
+    // emit the exact-width variant.
+    if sql_type == 32760 || sql_type == 32762 {
+        if matches!(v, Value::Null) {
+            return Value::Null;
+        }
+        let wide = sql_type == 32762;
+        let dec = if let Some(x) = approx_of(&v) {
+            match f64_to_dec(x, if wide { 17 } else { 16 }) {
+                Some(d) => d,
+                None => return v,
+            }
+        } else {
+            match value_as_dec(&v) {
+                Some(d) => d,
+                None => return v,
+            }
+        };
+        return if wide {
+            Value::DecFloat34(fire_crab_ods::decfloat::dec_to_bits(&dec))
+        } else {
+            match &dec {
+                fire_crab_ods::decfloat::Dec::Finite { neg, coeff, exp } => {
+                    match fire_crab_ods::decfloat::fit_dec64(*neg, *coeff, *exp) {
+                        Some(bits) => Value::DecFloat16(bits),
+                        // unreachable for a permitted df16 sibling; a poison
+                        // raises at consumption rather than encoding 0
+                        None => Value::OutOfRange,
+                    }
+                }
+                _ => Value::DecFloat16(fire_crab_ods::decfloat::dec_to_dec64_bits(&dec)),
+            }
+        };
+    }
     if is_approx_sqltype(sql_type) {
         // an approximate union answers every branch as a DOUBLE, so an
         // exact branch's scaled integer has to BECOME one here - the
