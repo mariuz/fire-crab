@@ -9,7 +9,7 @@ fire-crab, 2026-08-20: a Rust conversion of the Firebird 6 engine —
 `exe`, `opt`, `lck`, `svc`, `auth`, `cch`, `pio`, `blb`, `evt`,
 `fcstat`, and the `wire` server at 67k). The server answers real SQL
 over the real wire protocol, and every answer is held DIFFERENTIALLY
-against the live FB6 engine: 461 gates under `qa/`, of which the 428
+against the live FB6 engine: 462 gates under `qa/`, of which the 429
 `serve-real-*` sweeps are green (each a multi-check differential run;
 the last full-suite sweep counted 8,627 checks before the growth
 chunks, which have since added many more).
@@ -3120,6 +3120,7 @@ pointer-page and TIP page numbers is the next step when it dominates.
   - THE DECFLOAT TYPE SYSTEM, answered instead of refused: CAST out of DECFLOAT (`castfromdecfloat`, `castdfnonfinite`), CAST into DECFLOAT from a runtime double at 17/16 digits (`castintodecfloat`), SUM/AVG/MIN/MAX over columns and expressions (`decfloatagg`, `decfloataggexpr`), DECFLOAT-vs-DOUBLE comparison at the operand width (`decfloatdoublecmp`), conditionals typed DECFLOAT and TEXT-mixed ones VARYING (`dfcond`, `decfloattextcond`), DECFLOAT(16) arithmetic narrowed at materialization (`df16arith`), UNION with a DECFLOAT branch (`uniondecfloat`), arithmetic with a runtime DOUBLE (`decfloatdoublearith`), `||` over a decfloat (`decfloatconcat`), a DECFLOAT column through a derived table / CTE / view (`derivedecfloat`, 2026-09-14).
   - A driver-bound DOUBLE against a DECFLOAT slot converts at 17/16 digits; FLOAT width through conditionals; the CVT rounding epsilon; CAST(<approx> AS VARCHAR(n)) fits by the engine's shrinking precision; provenance gates at every DECFLOAT store (`serve-real-dfparambind`, 2026-09-15).
   - A DECFLOAT(16) slot narrows a text / int64 bind to 16 digits with per-row raises for specials; and a bind error under a derived table, a CTE or DISTINCT / FIRST / ROWS raises instead of answering an EMPTY result, for every column type (`serve-real-dfparam16`, 2026-09-15).
+  - A FLOAT compares in SINGLE precision beside a FLOAT, an exact number or a plain decimal text (both sides cast to FLOAT); a DOUBLE beside it compares in double, an exponent or INT128-overflowing text is a double; a FLOAT UNION exact branches is FLOAT 482 with every branch in single (`serve-real-floatcmp`, 2026-09-15). `WHERE FL = 2.675` answered no row.
 
 - **NOT DONE, BY DESIGN - collation-aware DISTINCT / GROUP BY / UNION over a case/accent-insensitive collation:** the engine answers these; fire-crab refuses (`coll_groupable_ttype`, server.rs:45469, deliberately rejects ICU Secondary/Primary). Researched and left as-is: the comparison side already works (ORDER BY and `=` under a CI collation are correct), but a collapsed CI group has NO specified survivor spelling - the engine returns different members for `DISTINCT` vs `GROUP BY` vs `GROUP BY ... MIN(x)` over the same rows (measured). Producing a survivor would be a guess at an unspecified value, which the refuse-rather-than-guess law forbids; the refusal is correct. (`COUNT`/cardinality would be right, but the projected key spelling would be a coin toss.)
 
@@ -3128,7 +3129,7 @@ pointer-page and TIP page numbers is the next step when it dominates.
 Wrong answers first; a refusal is law-safe and ranks below any wrong answer.
 
 - **Parameter slot typing inside an expression (all destination types).** The engine types a `?` from the expression around it and converts the bound value THERE: `N = ? * 2` [1.1] stores 2 (the slot is INTEGER), `COALESCE(?, 0)` is a LONG slot that raises on 2^40, `? / 3` into a DECFLOAT is decimal arithmetic. fire-crab splices the raw value - wrong for INTEGER / NUMERIC destinations today; refused for a DECFLOAT destination.
-- **Single-precision FLOAT comparison.** `FL = 2.675` is TRUE in the engine (both sides cast to FLOAT); fire-crab compares in double. Also NULLIF / CASE-WHEN / IN over a FLOAT column, and GROUP BY / MIN / MAX over a FLOAT-typed conditional's exact branch.
+- **FLOAT leftovers** (the single-precision compare itself is DONE, `serve-real-floatcmp`): `GROUP BY FL HAVING FL = <x>` refuses (the HAVING resolver declines a FLOAT group key); GROUP BY / MIN / MAX over a FLOAT-typed conditional's exact branch answers the branch's own value.
 - **ROUND / TRUNC over an approximate value is an EXACT scaled value** in the engine (`ROUND(dp, 2)` of 2.675 is 2.68 exactly): CAST(ROUND(dp,n) AS NUMERIC(p,s<n)) re-scales half-away, the VARCHAR render is '2.68'. Into a DECFLOAT column it is refused until then.
 - **An exponent literal stored into a DECFLOAT column keeps its TEXT** (1E+200 stays 1E+200, 1.5E-398 stores 2E-398); refused today - needs the literal spelling carried to the store encoder.
 - **DECFLOAT(34) exponent overflow / underflow in arithmetic** wraps to garbage (d34+d34 near max, d34*float) where the engine raises *Decimal float overflow*; SUM over +Inf and -Inf answers NaN where the engine raises.

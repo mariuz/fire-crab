@@ -11579,20 +11579,37 @@ impl Predicate {
                 // an exact value for an approximate slot converts, the
                 // way an exact literal in the SQL text would
                 // (exact_to_f64: divide-not-multiply, the CVT step)
-                (ColKind::Approx, WireParam::Int(v, sc)) => {
-                    Some(Expr::Double(exact_to_f64(*v as i128, *sc as i32)))
-                }
+                // ... but it stays EXACT here: beside a FLOAT column the
+                // comparison is single precision (an exact value casts to
+                // FLOAT - `FL = ?` [16777217] matches the stored 16777216),
+                // beside a DOUBLE one [value_cmp] converts it by the same
+                // exact_to_f64 step. A pre-converted double would have
+                // forced the double compare on a FLOAT column.
+                (ColKind::Approx, WireParam::Int(v, 0)) => Some(Expr::Int(*v)),
+                (ColKind::Approx, WireParam::Int(v, sc)) => Some(Expr::Dec(*v, *sc)),
                 // the same two text conversions the store path learned,
                 // reaching the filter side: a text value into an
                 // approximate column, and the engine's NAME match for a
                 // text value against a BOOLEAN one (probed on this side
                 // too: `'true'`, `'FALSE'` and `' True '` all answer
                 // rows, `'t'` is a conversion error)
-                (ColKind::Approx, WireParam::Text(s) | WireParam::TextCs(s, _)) => Some(Expr::Double(
-                    text_number(s)
-                        .and_then(|n| text_to_approx(n, s))
-                        .ok_or_else(|| format!("conversion error from string \"{}\"", s))?,
-                )),
+                // a numeric TEXT keeps its exact decimal when it has one, for
+                // the same reason (`FL = ?` ['0.1'] is the single compare);
+                // one past i64 / a scale past i8 converts as before
+                (ColKind::Approx, WireParam::Text(s) | WireParam::TextCs(s, _)) => {
+                    let n = text_number(s)
+                        .filter(|n| text_to_approx(*n, s).is_some())
+                        .ok_or_else(|| format!("conversion error from string \"{}\"", s))?;
+                    match n {
+                        TextNum::Dec { mantissa, exp }
+                            if exp <= 0 && exp >= -18 && i64::try_from(mantissa).is_ok() =>
+                        {
+                            let raw = mantissa as i64;
+                            Some(if exp == 0 { Expr::Int(raw) } else { Expr::Dec(raw, exp as i8) })
+                        }
+                        _ => Some(Expr::Double(text_to_approx(n, s).unwrap_or(0.0))),
+                    }
+                }
                 (ColKind::Bool, WireParam::Text(s) | WireParam::TextCs(s, _)) => Some(Expr::Bool(match s.trim() {
                     t if t.eq_ignore_ascii_case("true") => true,
                     t if t.eq_ignore_ascii_case("false") => false,
@@ -12428,6 +12445,40 @@ fn side_filter(filter: &Option<Predicate>, win: std::ops::Range<usize>) -> Optio
 /// consumer that reaches the comparison through either function gets
 /// the same answer. It used to be two implementations, and [value_cmp]
 /// had no mixed-kind arm at all.
+/// May this value sit in a SINGLE-precision comparison beside a FLOAT
+/// ([value_cmp])? A FLOAT, an exact numeric, or a text the numeric grammar
+/// reads - never a DOUBLE, which makes the comparison double.
+fn single_cmp_operand(v: &Value) -> bool {
+    match v {
+        // a TEXT read by [Expr::TextNum] folds trailing zeros into a
+        // POSITIVE scale ('340000000000000000000000000000000000000' is
+        // 34 x 10^37); the engine counts such a text exact only while its
+        // VALUE fits INT128, and beyond that it is a DOUBLE and compares in
+        // double (measured: that 39-digit 3.4e38 does NOT match a FLOAT
+        // 3.4e38, while '10000000000000000000' matches a FLOAT 1e19)
+        Value::Int128(m, sc) if *sc > 0 => {
+            10i128.checked_pow(*sc as u32).and_then(|p| m.checked_mul(p)).is_some()
+        }
+        Value::Float(_) | Value::Int(_) | Value::Scaled(..) | Value::Int128(..) => true,
+        Value::Text(t) => text_number(t).is_some_and(|n| text_to_approx(n, t).is_some()),
+        _ => false,
+    }
+}
+
+/// The value cast to FLOAT the engine's way: an exact value through its
+/// correctly rounded double ([exact_to_f64]) and then to single, a text
+/// through its numeric grammar.
+fn single_cmp_f32(v: &Value) -> Option<f32> {
+    Some(match v {
+        Value::Float(f) => *f,
+        Value::Text(t) => text_to_approx(text_number(t)?, t)? as f32,
+        _ => {
+            let (raw, sc) = numeric_parts(v)?;
+            exact_to_f64(raw, sc as i32) as f32
+        }
+    })
+}
+
 fn num_cmp(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
     let (ra, sa) = numeric_parts(a)?;
     let (rb, sb) = numeric_parts(b)?;
@@ -46389,14 +46440,26 @@ fn plan_union(
         if !shapes.iter().all(|(t, ..)| exact_numeric_rank(*t).is_some() || is_approx_sqltype(*t)) {
             return Some(Plan::Refused);
         }
-        if shapes.iter().any(|(t, ..)| is_approx_sqltype(*t)) {
-            // one approximate branch makes the whole column a DOUBLE,
+        if shapes.iter().any(|(t, ..)| *t == 480) {
+            // one DOUBLE branch makes the whole column a DOUBLE,
             // scale 0 sub_type 0, whatever the exact branches carried
             // (probed: NUMERIC(9,2) beside a DOUBLE, and INTEGER beside
             // one, both answer 480 len 8 scale 0)
             c.wire = Wire::Double;
             c.sql_type = 480 | (c.sql_type & 1);
             c.length = 8;
+            c.scale = 0;
+            c.sub_type = 0;
+        } else if shapes.iter().any(|(t, ..)| *t == 482) {
+            // a FLOAT branch beside EXACT ones (and no DOUBLE) keeps the
+            // column FLOAT - 482 len 4 - and every branch converts to
+            // single (measured: FL UNION ALL an INTEGER 16777217 answers
+            // 16777216, a BIGINT 123456789012 answers 1.2345679e+11, and
+            // UNION DISTINCT dedups a NUMERIC 2.675 against the FLOAT
+            // 2.675). It announced DOUBLE with the full-width values.
+            c.wire = Wire::Float;
+            c.sql_type = 482 | (c.sql_type & 1);
+            c.length = 4;
             c.scale = 0;
             c.sub_type = 0;
         } else {
@@ -46571,6 +46634,17 @@ fn union_coerce_value(v: Value, sql_type: i32, scale: i32) -> Value {
                 }
                 _ => Value::DecFloat16(fire_crab_ods::decfloat::dec_to_dec64_bits(&dec)),
             }
+        };
+    }
+    if sql_type == 482 {
+        // a FLOAT union answers every branch as a SINGLE (the typing arm
+        // announces 482 only when no branch is DOUBLE)
+        return match v {
+            Value::Int(n) => Value::Float(n as f64 as f32),
+            Value::Scaled(raw, sc) => Value::Float(exact_to_f64(raw as i128, sc as i32) as f32),
+            Value::Int128(raw, sc) => Value::Float(exact_to_f64(raw, sc as i32) as f32),
+            Value::Double(x) => Value::Float(x as f32),
+            other => other,
         };
     }
     if is_approx_sqltype(sql_type) {
@@ -53501,6 +53575,22 @@ fn value_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
         // promotion. Without these arms the pair fell to the
         // rendered-text fallback below and `DP > 1` compared "1.5"
         // against "1" as strings.
+        // A FLOAT (single precision) against a FLOAT, an EXACT numeric or a
+        // numeric TEXT compares in SINGLE precision: the engine's
+        // comparison takes the higher of the two operand types, and FLOAT
+        // outranks every exact type, so both sides cast to FLOAT (measured:
+        // a FLOAT storing 2.675 is EQUAL to the literal 2.675, to '2.675'
+        // and to 2.67500001; 16777217 equals the stored 16777216). Only a
+        // DOUBLE beside it (or a DECFLOAT, whose arms precede this one)
+        // takes the wider compare below.
+        _ if single_cmp_operand(a) && single_cmp_operand(b)
+            && (matches!(a, Value::Float(_)) || matches!(b, Value::Float(_))) =>
+        {
+            match (single_cmp_f32(a), single_cmp_f32(b)) {
+                (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(Equal),
+                _ => a.render().cmp(&b.render()),
+            }
+        }
         _ if approx_of(a).is_some() || approx_of(b).is_some() => {
             // exact_to_f64 DIVIDES for a scaled value - the engine's
             // CVT_get_double, one correctly-rounded step. The multiply
@@ -87171,23 +87261,36 @@ fn cmp_sides(lhs: Expr, rhs: Expr, descs: &[Descriptor]) -> Option<(Expr, Expr)>
         // [Expr::TextNum] wrap; its Double result meets the approx
         // side through value_cmp's promotion (probed: `S = D` matched
         // '2.50' against the stored 2.5 - the double domain).
+        // Beside a SINGLE-precision side (a FLOAT column, CAST(.. AS FLOAT),
+        // -FL, a conditional that stays FLOAT - [approx_expr_single]) a
+        // string LITERAL is still validated here but compares through the
+        // per-value [Expr::TextNum] split instead of a pre-parsed double:
+        // a PLAIN decimal text is EXACT and meets the FLOAT in single
+        // precision (`FL = '2.675'`, `FL = '0.1000000000000000000001'`,
+        // `FL = '10000000000000000000'` against a stored 1e19 all match),
+        // while an EXPONENT text or one too wide to be exact is a DOUBLE and
+        // meets it in double (`FL = '1e-1'`, `'1.5e-7'`, `'3.4e20'` and the
+        // 39-digit 3.4e38 do NOT match) - all measured, and exactly what
+        // [value_cmp] does with the two shapes TextNum produces.
         (ExprType::Approx, ExprType::Text) => {
             if matches!(rhs, Expr::Str(_)) {
                 let r = approx_literal(&rhs)?;
-                Some((lhs, r))
-            } else {
-                let cs = err_spell_charset(&rhs, descs);
-                Some((lhs, Expr::TextNum(Box::new(rhs), cs)))
+                if !approx_expr_single(&lhs, descs) {
+                    return Some((lhs, r));
+                }
             }
+            let cs = err_spell_charset(&rhs, descs);
+            Some((lhs, Expr::TextNum(Box::new(rhs), cs)))
         }
         (ExprType::Text, ExprType::Approx) => {
             if matches!(lhs, Expr::Str(_)) {
                 let l = approx_literal(&lhs)?;
-                Some((l, rhs))
-            } else {
-                let cs = err_spell_charset(&lhs, descs);
-                Some((Expr::TextNum(Box::new(lhs), cs), rhs))
+                if !approx_expr_single(&rhs, descs) {
+                    return Some((l, rhs));
+                }
             }
+            let cs = err_spell_charset(&lhs, descs);
+            Some((Expr::TextNum(Box::new(lhs), cs), rhs))
         }
         (ExprType::Approx, _) | (_, ExprType::Approx) => None,
         // BOOLEAN meets BOOLEAN, or a string the engine converts
