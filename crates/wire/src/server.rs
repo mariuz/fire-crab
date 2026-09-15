@@ -11142,6 +11142,11 @@ enum Term {
     /// strict grammar. One literal, two conversions, the index deciding
     /// which one the statement sees - all four cases probed.
     CmpConvErr(usize, Cmp, String, Option<Rhs>),
+    /// [Term::CmpConvErr]'s DECFLOAT(34) twin: a bound text decNumber
+    /// cannot read, against a DECFLOAT(34) column. The same value gate
+    /// (NULL is UNKNOWN, an empty table or a dead conjunct never raises -
+    /// probed), a different vector ([EvalErr::DecfloatConvError]).
+    DfConvErr(usize, Cmp, String),
     /// A SEMI-JOIN's hash key that the STRICT grammar refuses - what a
     /// [Tok::StrKey] against a numeric column becomes.
     ///
@@ -11656,8 +11661,24 @@ impl Predicate {
             let (WireParam::Text(s) | WireParam::TextCs(s, _)) = args.get(*idx)? else {
                 return None;
             };
-            if text_number(s).is_some() {
-                return None;
+            match text_number(s) {
+                // a lowercase hex spelling the store grammar takes is still
+                // a per-row raise here (probed: `I = ?` ['0x5']); capital
+                // '0X..' is the engine's uninitialized-memory read and keeps
+                // its refusal
+                Some(TextNum::Hex { .. }) if text_col_num(s) == ColNum::Raise => {
+                    return Some(Term::CmpConvErr(fid, op, s.clone(), None));
+                }
+                Some(_) => return None,
+                None => {}
+            }
+            // a text NEITHER grammar reads ('abc', '5x', '', '0x10') is
+            // the same per-row raise with no fallback compare (probed for
+            // INTEGER, BIGINT and NUMERIC: an empty table, a NULL column
+            // and a dead `ID = 99 AND` group answer with no raise). It
+            // refused at execute with a generic *Dynamic SQL Error*.
+            if text_col_num(s) == ColNum::Raise {
+                return Some(Term::CmpConvErr(fid, op, s.clone(), None));
             }
             Some(Term::CmpConvErr(fid, op, s.clone(), Some(lenient_num_rhs(s)?)))
         };
@@ -11927,23 +11948,49 @@ impl Predicate {
                                 Box::new(lit),
                             )))
                         } else {
-                            match bind_literal(idx, kind)? {
-                                None => Term::Unknown, // compared with NULL: UNKNOWN
-                                Some(lit) => {
-                                    // a text value against a COLLATED
-                                    // side adopts the collation, like a
-                                    // literal in the statement text
-                                    let lit = match lhs.as_ref() {
-                                        Expr::CollKey(_, tt) => {
-                                            Expr::CollKey(Box::new(lit), *tt)
-                                        }
-                                        _ => lit,
-                                    };
-                                    Term::ExprCond(Box::new(Cond2::Cmp(
-                                        lhs.clone(),
-                                        *op,
-                                        Box::new(lit),
-                                    )))
+                            // a non-number text against a plain DOUBLE /
+                            // FLOAT column, or a non-name text against a
+                            // BOOLEAN one: the engine's per-row, value-gated
+                            // *Conversion error from string* (probed: an
+                            // empty table, a NULL column and a dead
+                            // conjunct in front answer with no raise), not
+                            // an execute-time refusal
+                            let conv = match (lhs.as_ref(), kind, args.get(*idx)) {
+                                (
+                                    Expr::Col(fid),
+                                    ColKind::Approx | ColKind::Bool,
+                                    Some(WireParam::Text(s) | WireParam::TextCs(s, _)),
+                                ) => match bind_literal(idx, kind) {
+                                    Err(e) if e.starts_with("conversion error from string")
+                                        && (matches!(kind, ColKind::Bool) || text_number(s).is_none()) =>
+                                    {
+                                        Some(Term::CmpConvErr(*fid, *op, s.clone(), None))
+                                    }
+                                    _ => None,
+                                },
+                                _ => None,
+                            };
+                            if let Some(t) = conv {
+                                t
+                            } else {
+                                match bind_literal(idx, kind)? {
+                                    None => Term::Unknown, // compared with NULL: UNKNOWN
+                                    Some(lit) => {
+                                        // a text value against a COLLATED
+                                        // side adopts the collation, like a
+                                        // literal in the statement text
+                                        let lit = match lhs.as_ref() {
+                                            Expr::CollKey(_, tt) => {
+                                                Expr::CollKey(Box::new(lit), *tt)
+                                            }
+                                            _ => lit,
+                                        };
+                                        Term::ExprCond(Box::new(Cond2::Cmp(
+                                            lhs.clone(),
+                                            *op,
+                                            Box::new(lit),
+                                        )))
+                                    }
                                 }
                             }
                         }
@@ -12279,6 +12326,7 @@ fn term_side_only(t: &Term, win: &std::ops::Range<usize>) -> bool {
         Term::Cmp(fid, ..)
         | Term::NumCmp(fid, ..)
         | Term::CmpConvErr(fid, ..)
+        | Term::DfConvErr(fid, ..)
         | Term::TextNumCmp(fid, ..)
         | Term::IsNull(fid)
         | Term::IsNotNull(fid)
@@ -12306,6 +12354,7 @@ fn collect_term_fids(t: &Term, mark: &dyn Fn(usize) -> bool) -> bool {
         Term::Cmp(fid, ..)
         | Term::NumCmp(fid, ..)
         | Term::CmpConvErr(fid, ..)
+        | Term::DfConvErr(fid, ..)
         | Term::TextNumCmp(fid, ..)
         | Term::IsNull(fid)
         | Term::IsNotNull(fid)
@@ -12533,6 +12582,7 @@ impl Term {
             | Term::NumCmp(fid, ..)
             | Term::TextNumCmp(fid, ..)
             | Term::CmpConvErr(fid, ..)
+            | Term::DfConvErr(fid, ..)
             | Term::Like(fid, ..)
             | Term::Starting(fid, ..) => Some(*fid),
             _ => None,
@@ -12595,6 +12645,10 @@ impl Term {
                     Some(rhs) => Term::NumCmp(*fid, *op, rhs.clone()).matches(values)?,
                     None => return Err(EvalErr::ConversionError(Some(s.clone()))),
                 },
+            },
+            Term::DfConvErr(fid, _, s) => match values.get(*fid) {
+                None | Some(Value::Null) => None,
+                Some(_) => return Err(EvalErr::DecfloatConvError(s.clone())),
             },
             // no value gate at all - see the variant
             Term::KeyConvErr(s) => return Err(EvalErr::ConversionError(Some(s.clone()))),
@@ -39153,6 +39207,7 @@ fn null_rejecting(t: &Term, win: &std::ops::Range<usize>) -> bool {
         | Term::NumCmp(fid, ..)
         | Term::TextNumCmp(fid, ..)
         | Term::CmpConvErr(fid, ..)
+        | Term::DfConvErr(fid, ..)
         | Term::Like(fid, ..)
         | Term::Starting(fid, ..)
         | Term::IsNotNull(fid) => win.contains(fid),
@@ -56952,6 +57007,14 @@ fn eval_status_items(w: &mut W, e: &EvalErr) {
                 .int(2)
                 .bytes(conversion_error_arg(text).as_bytes());
         }
+        EvalErr::DecfloatConvError(text) => {
+            w.int(1) // isc_arg_gds
+                .int(GDS_DECFLOAT_INVALID_OPERATION)
+                .int(1) // isc_arg_gds
+                .int(GDS_CONVERT_ERROR)
+                .int(2)
+                .bytes(conversion_error_arg(text).as_bytes());
+        }
         EvalErr::ConversionErrorBytes(raw) => {
             w.int(1) // isc_arg_gds
                 .int(GDS_CONVERT_ERROR)
@@ -65597,6 +65660,11 @@ enum EvalErr {
     /// rows before it, then raises (probed) - so it is an eval error, not
     /// an UNKNOWN.
     DecfloatInvalidOperation,
+    /// a TEXT bound against a DECFLOAT(34) slot that decNumber cannot
+    /// read: the engine raises *Decimal float invalid operation* FOLLOWED
+    /// by *Conversion error from string "<text>"* (both, in that order,
+    /// probed), per row and value-gated like [EvalErr::ConversionError]
+    DecfloatConvError(String),
     /// a DECFLOAT `x / 0` (x != 0): `isc_decfloat_divide_by_zero` (SQLSTATE
     /// 22012). `0 / 0` is the invalid-operation trap above (22000, probed).
     DecfloatDivideByZero,
@@ -66355,9 +66423,13 @@ fn decfloat_param_term(arg: Option<&WireParam>, fid: usize, op: Cmp, kind: &ColK
                 if text_to_dec128(s).is_some() {
                     return None;
                 }
-                return text_to_dec128_clamped(s)
-                    .ok()
-                    .map(|bits| Term::NumCmp(fid, op, Rhs::DecFloat34(bits)));
+                return match text_to_dec128_clamped(s) {
+                    Ok(bits) => Some(Term::NumCmp(fid, op, Rhs::DecFloat34(bits))),
+                    // not a number at all: the per-row two-part raise
+                    Err(false) => Some(Term::DfConvErr(fid, op, s.clone())),
+                    // an exponent overflow keeps its refusal
+                    Err(true) => None,
+                };
             }
             match text_to_dec128_clamped(s.trim_matches(' ')) {
                 Ok(bits) => match fire_crab_ods::decfloat::decode_dec128(bits) {
@@ -99789,13 +99861,36 @@ mod tests {
         ]).unwrap());
         // A TEXT value against an INTEGER column now converts, the way
         // the engine does (`WHERE N_INT = ?` with '5' answers rows); the
-        // mismatch that stays an error is a string that is not a number.
+        // A string that is not a number binds too, into the engine's
+        // PER-ROW conversion error: a non-NULL column value raises, a
+        // NULL one is UNKNOWN with no raise (serve-real-bindconv).
         assert!(p
             .bind(&[WireParam::Text("42".into()), WireParam::Text("x".into())])
             .is_ok());
-        assert!(p
+        let b = p
             .bind(&[WireParam::Text("forty-two".into()), WireParam::Text("x".into())])
-            .is_err());
+            .unwrap();
+        assert!(matches!(
+            b.matches(&[
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Int(42),
+                Value::Null,
+                Value::Text("x".into()),
+            ]),
+            Err(EvalErr::ConversionError(Some(ref s))) if s == "forty-two"
+        ));
+        assert!(!b
+            .matches(&[
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Text("x".into()),
+            ])
+            .unwrap());
         // scaled wire integers do not bind into scale-0 comparisons
         assert!(p
             .bind(&[WireParam::Int(42, -2), WireParam::Text("x".into())])
