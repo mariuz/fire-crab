@@ -512,12 +512,55 @@ fn parts(d: &Dec) -> (bool, Vec<u8>, i64) {
         unreachable!("parts on a non-finite Dec")
     }
 }
+/// The result of a decimal128 operation, brought into the format's range
+/// the way decNumber's context does it (measured against the engine):
+///
+/// * an adjusted exponent past emax 6144 is an OVERFLOW - returned as
+///   `Infinity` of the result's sign, which a FINITE operation cannot
+///   otherwise produce, so the caller traps it as the engine's *Decimal
+///   float overflow* (22003). It used to be encoded with the out-of-range
+///   exponent, and `9.99..E+6144 + 9.99..E+6144` answered 8.0E-2047;
+/// * a stored exponent above 6111 pads the coefficient (`1E+6144` is
+///   `1000..0E+6111`, 34 digits), a zero clamping to `0E+6111`;
+/// * a stored exponent below -6176 is SUBNORMAL: the digits the format
+///   cannot carry round away HALF-UP and the exponent clamps to -6176
+///   (`1E-6000 / 1E+200` is `0E-6176`, `5E-6176 * 0.1` is `1E-6176`), where
+///   the out-of-range exponent answered garbage (`8.0E-2071`).
 fn finite(neg: bool, digits: Vec<u8>, exp: i64) -> Dec {
-    let d = strip0(digits);
-    let coeff = digits_u128(&d);
+    let mut d = strip0(digits);
+    let mut exp = exp;
+    if d != b"0" && exp < -6176 {
+        let drop = (-6176 - exp) as usize;
+        exp = -6176;
+        if drop > d.len() {
+            d = vec![b'0'];
+        } else {
+            let keep = d.len() - drop;
+            let up = d[keep] >= b'5';
+            d.truncate(keep);
+            if d.is_empty() {
+                d.push(b'0');
+            }
+            if up {
+                d = uadd(&d, b"1");
+            }
+            d = strip0(d);
+        }
+    }
+    let coeff0 = d == b"0";
     // a zero result normalises to +0 at the working exponent
-    let neg = if coeff == 0 { false } else { neg };
-    Dec::Finite { neg, coeff, exp: exp.clamp(i32::MIN as i64, i32::MAX as i64) as i32 }
+    let neg = if coeff0 { false } else { neg };
+    if coeff0 {
+        return Dec::Finite { neg, coeff: 0, exp: exp.clamp(-6176, 6111) as i32 };
+    }
+    if exp + d.len() as i64 - 1 > 6144 {
+        return Dec::Infinity { neg };
+    }
+    if exp > 6111 {
+        d.extend(std::iter::repeat(b'0').take((exp - 6111) as usize));
+        exp = 6111;
+    }
+    Dec::Finite { neg, coeff: digits_u128(&d), exp: exp as i32 }
 }
 
 fn sig_len(d: &[u8]) -> usize {

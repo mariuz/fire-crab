@@ -9,7 +9,7 @@ fire-crab, 2026-08-20: a Rust conversion of the Firebird 6 engine —
 `exe`, `opt`, `lck`, `svc`, `auth`, `cch`, `pio`, `blb`, `evt`,
 `fcstat`, and the `wire` server at 67k). The server answers real SQL
 over the real wire protocol, and every answer is held DIFFERENTIALLY
-against the live FB6 engine: 462 gates under `qa/`, of which the 429
+against the live FB6 engine: 463 gates under `qa/`, of which the 430
 `serve-real-*` sweeps are green (each a multi-check differential run;
 the last full-suite sweep counted 8,627 checks before the growth
 chunks, which have since added many more).
@@ -3121,6 +3121,7 @@ pointer-page and TIP page numbers is the next step when it dominates.
   - A driver-bound DOUBLE against a DECFLOAT slot converts at 17/16 digits; FLOAT width through conditionals; the CVT rounding epsilon; CAST(<approx> AS VARCHAR(n)) fits by the engine's shrinking precision; provenance gates at every DECFLOAT store (`serve-real-dfparambind`, 2026-09-15).
   - A DECFLOAT(16) slot narrows a text / int64 bind to 16 digits with per-row raises for specials; and a bind error under a derived table, a CTE or DISTINCT / FIRST / ROWS raises instead of answering an EMPTY result, for every column type (`serve-real-dfparam16`, 2026-09-15).
   - A FLOAT compares in SINGLE precision beside a FLOAT, an exact number or a plain decimal text (both sides cast to FLOAT); a DOUBLE beside it compares in double, an exponent or INT128-overflowing text is a double; a FLOAT UNION exact branches is FLOAT 482 with every branch in single (`serve-real-floatcmp`, 2026-09-15). `WHERE FL = 2.675` answered no row.
+  - DECFLOAT arithmetic at decimal128's exponent limits: an OVERFLOW (adjusted exponent past 6144) raises *Decimal float overflow* per row through +, -, *, /, SUM, AVG, a WHERE and a CAST; an UNDERFLOW rounds HALF-UP to exponent -6176; an exponent above 6111 pads the coefficient; a DECFLOAT(16) overflow at materialization or CAST raises the same vector (`serve-real-dfoverflow`, 2026-09-15). fire-crab encoded the out-of-range exponent and answered garbage (`max + max` was 8.0E-2047, `WHERE A * 10 > 0` returned every row).
 
 - **NOT DONE, BY DESIGN - collation-aware DISTINCT / GROUP BY / UNION over a case/accent-insensitive collation:** the engine answers these; fire-crab refuses (`coll_groupable_ttype`, server.rs:45469, deliberately rejects ICU Secondary/Primary). Researched and left as-is: the comparison side already works (ORDER BY and `=` under a CI collation are correct), but a collapsed CI group has NO specified survivor spelling - the engine returns different members for `DISTINCT` vs `GROUP BY` vs `GROUP BY ... MIN(x)` over the same rows (measured). Producing a survivor would be a guess at an unspecified value, which the refuse-rather-than-guess law forbids; the refusal is correct. (`COUNT`/cardinality would be right, but the projected key spelling would be a coin toss.)
 
@@ -3132,7 +3133,7 @@ Wrong answers first; a refusal is law-safe and ranks below any wrong answer.
 - **FLOAT leftovers** (the single-precision compare itself is DONE, `serve-real-floatcmp`): `GROUP BY FL HAVING FL = <x>` refuses (the HAVING resolver declines a FLOAT group key); GROUP BY / MIN / MAX over a FLOAT-typed conditional's exact branch answers the branch's own value.
 - **ROUND / TRUNC over an approximate value is an EXACT scaled value** in the engine (`ROUND(dp, 2)` of 2.675 is 2.68 exactly): CAST(ROUND(dp,n) AS NUMERIC(p,s<n)) re-scales half-away, the VARCHAR render is '2.68'. Into a DECFLOAT column it is refused until then.
 - **An exponent literal stored into a DECFLOAT column keeps its TEXT** (1E+200 stays 1E+200, 1.5E-398 stores 2E-398); refused today - needs the literal spelling carried to the store encoder.
-- **DECFLOAT(34) exponent overflow / underflow in arithmetic** wraps to garbage (d34+d34 near max, d34*float) where the engine raises *Decimal float overflow*; SUM over +Inf and -Inf answers NaN where the engine raises.
+- **DECFLOAT leftovers** (the exponent overflow / underflow in arithmetic is DONE, `serve-real-dfoverflow`): SUM over a +Infinity and a -Infinity row answers NaN where the engine raises; a TEXT past decimal128's exponent range in a CAST / store (`1E-6177`, `1E+6112`) refuses where the engine clamps.
 - **The 1e400 literal types DOUBLE Infinity** (engine: DECFLOAT(34) 1E+400).
 - **NULLIF(<decfloat>, <text>)** answers where the engine raises 22018; `D16 = 'inf'` literal likewise.
 - **ABS over a scaled INT64 / INT128 numeric** describes sub_type 0 (engine 1/2); `ABS(i64::MIN)` in a WHERE delivers the row.

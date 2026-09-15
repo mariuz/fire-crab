@@ -9000,7 +9000,9 @@ impl ProjCol {
                 if let (Wire::Dec16, Value::DecFloat34(bits)) = (self.wire, &v) {
                     v = match fire_crab_ods::decfloat::round_to_dec16_of(*bits) {
                         Some(d64) => Value::DecFloat16(d64),
-                        None => return Err(EvalErr::NumericOutOfRange),
+                        // the engine's vector here is *Decimal float
+                        // overflow*, not the numeric out-of-range one
+                        None => return Err(EvalErr::DecfloatOverflow),
                     };
                 }
                 Ok(v)
@@ -9039,7 +9041,9 @@ impl ProjCol {
                 if let (Wire::Dec16, Value::DecFloat34(bits)) = (self.wire, &v) {
                     v = match fire_crab_ods::decfloat::round_to_dec16_of(*bits) {
                         Some(d64) => Value::DecFloat16(d64),
-                        None => return Err(EvalErr::NumericOutOfRange),
+                        // the engine's vector here is *Decimal float
+                        // overflow*, not the numeric out-of-range one
+                        None => return Err(EvalErr::DecfloatOverflow),
                     };
                 }
                 Ok(v)
@@ -55345,7 +55349,8 @@ fn compute_group(rows: &[Vec<Value>], gitems: &[GItem]) -> Result<Vec<Value>, Ev
                                 // The value is the same either way; the
                                 // decimal128 BYTES and the rendered text
                                 // are not. MIN/MAX keep the input cohort.
-                                dsum = Some(match dsum {
+                                let acc0 = dsum.clone();
+                                let next = match dsum {
                                     None => fire_crab_ods::decfloat::add(
                                         &fire_crab_ods::decfloat::Dec::Finite {
                                             neg: false,
@@ -55355,7 +55360,19 @@ fn compute_group(rows: &[Vec<Value>], gitems: &[GItem]) -> Result<Vec<Value>, Ev
                                         &d,
                                     ),
                                     Some(acc) => fire_crab_ods::decfloat::add(&acc, &d),
-                                });
+                                };
+                                // a finite running sum plus a finite value can
+                                // only reach Infinity by OVERFLOW: the engine
+                                // raises it (SUM and AVG alike, measured)
+                                if matches!(next, fire_crab_ods::decfloat::Dec::Infinity { .. })
+                                    && matches!(d, fire_crab_ods::decfloat::Dec::Finite { .. })
+                                    && acc0.as_ref().map_or(true, |a| {
+                                        matches!(a, fire_crab_ods::decfloat::Dec::Finite { .. })
+                                    })
+                                {
+                                    return Err(EvalErr::DecfloatOverflow);
+                                }
+                                dsum = Some(next);
                                 n += 1;
                             }
                             continue;
@@ -56361,6 +56378,9 @@ const GDS_DECFLOAT_INVALID_OPERATION: i32 = 335545141;
 /// `isc_decfloat_divide_by_zero` - SQLSTATE 22012, emitted ALONE: a
 /// DECFLOAT `x / 0` ("Decimal float divide by zero. ...", probed)
 const GDS_DECFLOAT_DIVIDE_BY_ZERO: i32 = 335545139;
+/// isc_decfloat_overflow - "Decimal float overflow.  The exponent of a
+/// result is greater than the magnitude allowed." (SQLSTATE 22003)
+const GDS_DECFLOAT_OVERFLOW: i32 = 335545142;
 /// `isc_exception_float_divide_by_zero` - SQLSTATE 22012
 const GDS_FLOAT_DIVIDE: i32 = 335544772;
 /// `isc_exception_float_overflow` - SQLSTATE 22003
@@ -56835,6 +56855,11 @@ fn eval_status_items(w: &mut W, e: &EvalErr) {
             // emitted ALONE ("Decimal float divide by zero. ...", probed)
             w.int(1) // isc_arg_gds
                 .int(GDS_DECFLOAT_DIVIDE_BY_ZERO);
+        }
+        EvalErr::DecfloatOverflow => {
+            // emitted ALONE ("Decimal float overflow. ...", measured)
+            w.int(1) // isc_arg_gds
+                .int(GDS_DECFLOAT_OVERFLOW);
         }
         EvalErr::FloatOverflow => {
             w.int(1) // isc_arg_gds
@@ -65539,6 +65564,14 @@ enum EvalErr {
     /// a DECFLOAT `x / 0` (x != 0): `isc_decfloat_divide_by_zero` (SQLSTATE
     /// 22012). `0 / 0` is the invalid-operation trap above (22000, probed).
     DecfloatDivideByZero,
+    /// a DECFLOAT result whose adjusted exponent passes the format's emax
+    /// (6144 for decimal128, 384 for decimal64 at materialization):
+    /// `isc_decfloat_overflow` (SQLSTATE 22003), emitted alone - the
+    /// engine's isql shows only *Decimal float overflow. The exponent of a
+    /// result is greater than the magnitude allowed.* (measured for +, -, *,
+    /// /, SUM, AVG, a DECFLOAT(16) arithmetic result and a CAST to
+    /// DECFLOAT(16) past its range).
+    DecfloatOverflow,
     /// a CAST whose value does not fit the integer target's width -
     /// `isc_numeric_out_of_range` under `isc_arith_except` (SQLSTATE
     /// 22003), a DIFFERENT vector from IntegerOverflow's single code
@@ -70211,6 +70244,15 @@ impl Expr {
                     if matches!(r, df::Dec::Nan) {
                         return Err(EvalErr::DecfloatInvalidOperation);
                     }
+                    // a FINITE pair can only reach Infinity by OVERFLOW - the
+                    // decimal module signals the adjusted exponent passing
+                    // 6144 that way ([decfloat::finite]); the engine raises
+                    if matches!(r, df::Dec::Infinity { .. })
+                        && matches!(da, df::Dec::Finite { .. })
+                        && matches!(db, df::Dec::Finite { .. })
+                    {
+                        return Err(EvalErr::DecfloatOverflow);
+                    }
                     // decfloat arithmetic computes in a 34-sig decimal128
                     // intermediate (the engine's decQuad model), whatever
                     // the operand widths - even d16-op-d16. The result is
@@ -70453,12 +70495,13 @@ impl Expr {
                         } else {
                             // a finite value must FIT decimal64: over the
                             // format's magnitude the engine raises 22003
-                            // (`CAST('1E+385' AS DECFLOAT(16))`), where a
-                            // raw encode garbled the exponent field
+                            // *Decimal float overflow* (`CAST('1E+385' AS
+                            // DECFLOAT(16))`, measured), where a raw encode
+                            // garbled the exponent field
                             let bits = match &dec {
                                 fire_crab_ods::decfloat::Dec::Finite { neg, coeff, exp } => {
                                     fire_crab_ods::decfloat::fit_dec64(*neg, *coeff, *exp)
-                                        .ok_or(EvalErr::NumericOutOfRange)?
+                                        .ok_or(EvalErr::DecfloatOverflow)?
                                 }
                                 _ => fire_crab_ods::decfloat::dec_to_dec64_bits(&dec),
                             };
