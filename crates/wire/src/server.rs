@@ -11694,7 +11694,9 @@ impl Predicate {
                         }
                     }
                     Term::NumCmp(fid, op, Rhs::Param(idx, kind)) => {
-                        match lenient_param(idx, *fid, *op, kind) {
+                        match decfloat_param_term(args.get(*idx), *fid, *op, kind)
+                            .or_else(|| lenient_param(idx, *fid, *op, kind))
+                        {
                             Some(t) => t,
                             None => match bind_rhs(idx, kind)? {
                                 None => Term::Unknown,
@@ -37361,6 +37363,21 @@ fn validate_select_bind(plan: &Plan, args: &[WireParam]) -> Result<(), ExecErr> 
         Plan::Project { filter, .. } | Plan::Join { filter, .. } => {
             bind_filter(filter, args).map(|_| ())
         }
+        // THE WRAPPERS AND THE DERIVED SOURCES TOO. Without these a bad
+        // bind under DISTINCT / FIRST / ROWS, a derived table, a CTE or a
+        // windowed derived projection skipped the check, reached the
+        // fetch as a bind failure, and shipped an EMPTY result - `SELECT
+        // ID FROM (SELECT ID, I FROM P) T WHERE I = ?` ['abc'] answered no
+        // rows where the engine raises *Conversion error from string*
+        // (measured for INTEGER, NUMERIC, DOUBLE, BOOLEAN and both
+        // DECFLOAT widths). Each nested plan is checked the same way.
+        Plan::Modified { inner, .. } => return validate_select_bind(inner, args),
+        Plan::Derived { inner, filter, .. } => {
+            bind_filter(filter, args).map(|_| ()).and_then(|_| validate_select_bind(inner, args))
+        }
+        Plan::Union { branches, .. } => {
+            branches.iter().try_for_each(|b| validate_select_bind(b, args))
+        }
         _ => Ok(()),
     };
     match r {
@@ -56184,6 +56201,9 @@ fn answer_info_sql(items: &[u8], plan: &Plan, last_dml: (i32, i32, i32)) -> Vec<
 /// (server.cpp:4302, `send_response(... status ...)`).
 enum EmitErr {
     Bind,
+    /// a folded scalar whose source went away ([ScalarErr::Gone]) - the
+    /// cursor ends with no row, as it always has
+    Gone,
     Eval(EvalErr),
 }
 
@@ -57708,16 +57728,20 @@ fn emit_rows_uncounted(
     gen_writes: &mut Vec<(String, i64)>,
     out: Option<&OutFmt>,
 ) {
-    // a filter bind failure emits no rows, only the terminator -
-    // op_execute already validated the bind and reported any error, so
-    // reaching fetch with a bad bind means the client ignored it; an
-    // arithmetic exception mid-cursor is reported like the engine, with
-    // an error op_response in place of the terminator
+    // A FILTER BIND FAILURE AT FETCH IS AN ERROR, NEVER AN EMPTY RESULT.
+    // op_execute validates the bind ([validate_select_bind]) and reports
+    // the failure there; a plan shape that check does not reach used to
+    // land here and ship the bare terminator - a silent empty answer for
+    // a statement the engine refuses. It now answers the same generic
+    // SQL error op_execute would have. An arithmetic exception
+    // mid-cursor is reported like the engine, with an error op_response
+    // in place of the terminator.
     match emit_rows_inner(w, plan, db, args, gen_writes, out) {
-        Ok(()) | Err(EmitErr::Bind) => {
+        Ok(()) | Err(EmitErr::Gone) => {
             // end-of-cursor terminator
             w.int(OP_FETCH_RESPONSE).int(100).int(0);
         }
+        Err(EmitErr::Bind) => write_eval_error(w, &EvalErr::Unsupported),
         Err(EmitErr::Eval(e)) => write_eval_error(w, &e),
     }
 }
@@ -57773,7 +57797,7 @@ fn emit_rows_inner(
             // WORKED OUT HERE, not at prepare - see [ScalarVal]
             let n = scalar_value(v, db.as_ref()).map_err(|e| match e {
                 ScalarErr::Limbo(id) => EmitErr::Eval(EvalErr::RecInLimbo(id)),
-                ScalarErr::Gone => EmitErr::Bind,
+                ScalarErr::Gone => EmitErr::Gone,
             })?;
             w.int(OP_FETCH_RESPONSE).int(0).int(1);
             match n {
@@ -66120,6 +66144,210 @@ fn float_conditional(e: Expr, descs: &[Descriptor]) -> Expr {
         ),
         other => other,
     }
+}
+
+/// A bound TEXT or INTEGER value against a DECFLOAT parameter slot, the
+/// engine's way (measured against the live engine, node-firebird text
+/// binds and a native SQL_INT64 binder):
+///
+/// * DECFLOAT(16): the value is parsed to decimal128 (a text rounds to
+///   34 digits first, HALF-UP) and then NARROWED to 16 significant
+///   digits, HALF-UP - `D16 = ?` ['12345678901234565'] matches the row
+///   storing 1234567890123457E+1, and the int64 12345678901234565 the
+///   same row; '1.00000000000000049999999999999999999' matches
+///   1.000000000000001 (the 34-digit rounding makes the 5). The narrowed
+///   value is used only when decimal64 holds it EXACTLY; a value whose
+///   16-digit form overflows (9.9999999999999995E+384, 1E+385) or would
+///   go subnormal (1.5E-398, 1e-400, 1.2345678901234565E-390) keeps its
+///   WIDE value in the comparison - it sorts between the neighbours, never
+///   collapsing to Infinity or zero. Leading and trailing BLANKS are
+///   trimmed (tabs, CR/LF and NBSP are not). Every special - inf,
+///   infinity, nan, snan, any sign - and every non-number is a
+///   *Conversion error from string* raised PER ROW: an empty table, a NULL
+///   column and a dead `ID = 3 AND` group all answer with no raise.
+/// * DECFLOAT(34): a text whose exponent leaves decimal128's range clamps
+///   as decNumber does (1e-6177 underflows to 0; 1E+6112 pads to
+///   10E+6111); everything else keeps the ordinary bind.
+///
+/// None = not this case (a double, a NULL, a DECFLOAT(34) text in range,
+/// an exponent OVERFLOW - the engine's per-row *Decimal float overflow*,
+/// which stays a refusal here); the ordinary bind decides.
+fn decfloat_param_term(arg: Option<&WireParam>, fid: usize, op: Cmp, kind: &ColKind) -> Option<Term> {
+    let ColKind::DecFloat { wide } = kind else {
+        return None;
+    };
+    match arg? {
+        WireParam::Text(s) | WireParam::TextCs(s, _) => {
+            if *wide {
+                if text_to_dec128(s).is_some() {
+                    return None;
+                }
+                return text_to_dec128_clamped(s)
+                    .ok()
+                    .map(|bits| Term::NumCmp(fid, op, Rhs::DecFloat34(bits)));
+            }
+            match text_to_dec128_clamped(s.trim_matches(' ')) {
+                Ok(bits) => match fire_crab_ods::decfloat::decode_dec128(bits) {
+                    fire_crab_ods::decfloat::Dec::Finite { .. } => {
+                        Some(Term::NumCmp(fid, op, Rhs::DecFloat34(narrow_dec16_bind(bits))))
+                    }
+                    _ => Some(Term::CmpConvErr(fid, op, s.clone(), None)),
+                },
+                Err(true) => None,
+                Err(false) => Some(Term::CmpConvErr(fid, op, s.clone(), None)),
+            }
+        }
+        WireParam::Int(v, ws) if !*wide => {
+            let bits = fire_crab_ods::decfloat::encode_dec128(*v < 0, (*v as i128).unsigned_abs(), *ws as i32);
+            Some(Term::NumCmp(fid, op, Rhs::DecFloat34(narrow_dec16_bind(bits))))
+        }
+        _ => None,
+    }
+}
+
+/// A decimal128 value narrowed to DECFLOAT(16)'s 16 significant digits
+/// (HALF-UP) when decimal64 holds the narrowed value exactly; otherwise
+/// the wide value unchanged ([decfloat_param_term]).
+fn narrow_dec16_bind(bits: u128) -> u128 {
+    use fire_crab_ods::decfloat::{self as df, Dec};
+    if let Dec::Finite { neg, coeff, exp } = df::decode_dec128(bits) {
+        if let Dec::Finite { neg: n, coeff: c, exp: e } = df::round_to_dec16(neg, coeff, exp) {
+            if let Some(b64) = df::fit_dec64(n, c, e) {
+                let narrowed = Dec::Finite { neg: n, coeff: c, exp: e };
+                if df::cmp(&df::decode_dec64(b64), &narrowed) == std::cmp::Ordering::Equal {
+                    return df::encode_dec128(n, c, e);
+                }
+            }
+        }
+    }
+    bits
+}
+
+/// [text_to_dec128] with decNumber's exponent CLAMPING: a coefficient
+/// rounded to 34 digits (HALF-UP) whose exponent falls below decimal128's
+/// minimum -6176 rounds away the digits it cannot carry (1e-6177 is 0,
+/// 6e-6177 is 1E-6176), and one above 6111 pads the coefficient while the
+/// adjusted exponent stays within 6144 (1E+6112 is 10E+6111). Err(true):
+/// the adjusted exponent passes 6144 - the engine's *Decimal float
+/// overflow*. Err(false): not a number by the grammar.
+fn text_to_dec128_clamped(s: &str) -> Result<u128, bool> {
+    if let Some(bits) = text_to_dec128(s) {
+        return Ok(bits);
+    }
+    let b = s.as_bytes();
+    let mut i = 0;
+    let neg = match b.first() {
+        Some(b'+') => {
+            i = 1;
+            false
+        }
+        Some(b'-') => {
+            i = 1;
+            true
+        }
+        _ => false,
+    };
+    let mut digits: Vec<u8> = Vec::new();
+    let (mut seen_dot, mut frac) = (false, 0i128);
+    while i < b.len() {
+        match b[i] {
+            c @ b'0'..=b'9' => {
+                digits.push(c);
+                if seen_dot {
+                    frac += 1;
+                }
+            }
+            b'.' if !seen_dot => seen_dot = true,
+            b'e' | b'E' => break,
+            _ => return Err(false),
+        }
+        i += 1;
+    }
+    if digits.is_empty() {
+        return Err(false);
+    }
+    let mut exp: i128 = -frac;
+    if i < b.len() {
+        i += 1;
+        let esign: i128 = match b.get(i) {
+            Some(b'+') => {
+                i += 1;
+                1
+            }
+            Some(b'-') => {
+                i += 1;
+                -1
+            }
+            _ => 1,
+        };
+        let start = i;
+        let mut ev: i128 = 0;
+        while i < b.len() && b[i].is_ascii_digit() {
+            ev = (ev * 10 + (b[i] - b'0') as i128).min(1_000_000_000_000);
+            i += 1;
+        }
+        if i == start {
+            return Err(false);
+        }
+        exp += esign * ev;
+    }
+    if i != b.len() {
+        return Err(false);
+    }
+    // add one to an ASCII digit string, growing it on a full carry
+    fn bump(d: &mut Vec<u8>) {
+        for k in (0..d.len()).rev() {
+            if d[k] == b'9' {
+                d[k] = b'0';
+            } else {
+                d[k] += 1;
+                return;
+            }
+        }
+        d.insert(0, b'1');
+    }
+    let Some(first) = digits.iter().position(|&d| d != b'0') else {
+        return Ok(fire_crab_ods::decfloat::encode_dec128(neg, 0, exp.clamp(-6176, 6111) as i32));
+    };
+    let mut sig: Vec<u8> = digits[first..].to_vec();
+    if sig.len() > 34 {
+        let up = sig[34] >= b'5';
+        exp += (sig.len() - 34) as i128;
+        sig.truncate(34);
+        if up {
+            bump(&mut sig);
+            if sig.len() > 34 {
+                sig.truncate(34);
+                exp += 1;
+            }
+        }
+    }
+    if exp + sig.len() as i128 - 1 > 6144 {
+        return Err(true);
+    }
+    if exp > 6111 {
+        sig.extend(std::iter::repeat(b'0').take((exp - 6111) as usize));
+        exp = 6111;
+    }
+    if exp < -6176 {
+        let drop = (-6176 - exp) as usize;
+        exp = -6176;
+        if drop > sig.len() {
+            sig = vec![b'0'];
+        } else {
+            let keep = sig.len() - drop;
+            let up = sig[keep] >= b'5';
+            sig.truncate(keep);
+            if sig.is_empty() {
+                sig.push(b'0');
+            }
+            if up {
+                bump(&mut sig);
+            }
+        }
+    }
+    let coeff = sig.iter().fold(0u128, |m, &d| m * 10 + (d - b'0') as u128);
+    Ok(fire_crab_ods::decfloat::encode_dec128(neg, coeff, exp as i32))
 }
 
 fn f64_to_dec(x: f64, sig: usize) -> Option<fire_crab_ods::decfloat::Dec> {

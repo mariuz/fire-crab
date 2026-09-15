@@ -9,7 +9,7 @@ fire-crab, 2026-08-20: a Rust conversion of the Firebird 6 engine —
 `exe`, `opt`, `lck`, `svc`, `auth`, `cch`, `pio`, `blb`, `evt`,
 `fcstat`, and the `wire` server at 67k). The server answers real SQL
 over the real wire protocol, and every answer is held DIFFERENTIALLY
-against the live FB6 engine: 460 gates under `qa/`, of which the 427
+against the live FB6 engine: 461 gates under `qa/`, of which the 428
 `serve-real-*` sweeps are green (each a multi-check differential run;
 the last full-suite sweep counted 8,627 checks before the growth
 chunks, which have since added many more).
@@ -3105,14 +3105,46 @@ pointer-page and TIP page numbers is the next step when it dominates.
 
 - **AN ARRAY-ELEMENT SUBSCRIPT IN A WHERE FILTER READS THE REAL ELEMENT DONE (2026-09-10, `serve-real-wherearr`):** the sixth hunt's highest-blast-radius silent wrong - a wrong RESULT SET on any query filtering by an array element. Settled by a research workflow (contract slices + eval map) and verified directly. **Root cause (not the tokenizer, not an unarmed blob context):** `expr_reads` had no `Expr::ArrayElem` arm, so `project_read_len` under-estimated the natural-scan partial-decompression length and stopped BEFORE the array column (`JOB.LANGUAGE_REQ` is JOB's last field) - the slot stayed undecoded and every array-element read collapsed to NULL, in the WHERE filter (wrong COUNT: `WHERE coalesce(language_req[1],'x')='x'` was 31, engine 21) AND in the projection under a scan filter. It was access-path-dependent: a leading-equality predicate chose an index (whole record decoded -> correct) and a no-WHERE query decoded everything (`project_read_len` returns MAX), so only the natural-scan-with-filter path truncated. Fixed by adding the `ArrayElem` arm to `expr_reads` (mark the array `fid` and walk the subscripts); over-estimating the read length is always safe. **Second, independent fix:** a BARE `COL[i]` subscript in WHERE/HAVING/ON refused at prepare because the predicate tokenizer had no arm for `[` (only function-wrapped forms slipped through, which is how the NULL-read surfaced); a new `matching_bracket` + a tokenizer arm now lexes `COL[...]` whole through the char-expression parser, so a bare subscript reads the real element and matches the engine. **Recorded, still REFUSED (a separate slice, law-safe):** a subscript in HAVING over the grouped element and in a JOIN ON. No regressions: the wire 345 unit tests and the arrays / wherefn / wherexpr / numericwhere / textnumwhere / where / having / join / groupby gates stay green.
 
+- **DONE SINCE 2026-09-10, one line each (the commit message carries the measured contract; the gate is the proof):**
+  - SUM over a BIGINT widens to INT128, no silent 64-bit wrap (`serve-real-sumbig`, `aggdescribe`).
+  - A DECIMAL result describes as DECIMAL, not text under a real-charset attachment (`serve-real-decdesc`).
+  - A VARCHAR dedup survivor differing only in trailing blanks is refused, not guessed (`serve-real-unionrep`).
+  - CAST AS FLOAT/REAL is single precision; MIN/MAX of a FLOAT column stays FLOAT (`serve-real-castfloat`).
+  - A text-blob literal moves by the charset assignment matrix (`serve-real-noneblob`).
+  - RDB$GET_CONTEXT('SYSTEM', ...): the deterministic keys answer, an unknown key raises (`serve-real-getcontext`).
+  - A COMPUTED BY column in a WHERE, as an aggregate source, ORDER BY and GROUP BY key (`serve-real-computedwhere`, `computedagg`).
+  - An IDENTITY column must be exact-numeric scale 0 (`serve-real-identityvalid`).
+  - A numeric literal has arithmetic precision 18, so literal arithmetic promotes to INT128 (`serve-real-litprec18`).
+  - MIN/MAX over a text expression describes at its real width and charset; REPLACE with an empty search keeps its width (`serve-real-minmaxtext`, `replempty`).
+  - Divide result sub_type; integer builtins keep LONG width (`serve-real-divsubtype`, `intfuncwidth`).
+  - THE DECFLOAT TYPE SYSTEM, answered instead of refused: CAST out of DECFLOAT (`castfromdecfloat`, `castdfnonfinite`), CAST into DECFLOAT from a runtime double at 17/16 digits (`castintodecfloat`), SUM/AVG/MIN/MAX over columns and expressions (`decfloatagg`, `decfloataggexpr`), DECFLOAT-vs-DOUBLE comparison at the operand width (`decfloatdoublecmp`), conditionals typed DECFLOAT and TEXT-mixed ones VARYING (`dfcond`, `decfloattextcond`), DECFLOAT(16) arithmetic narrowed at materialization (`df16arith`), UNION with a DECFLOAT branch (`uniondecfloat`), arithmetic with a runtime DOUBLE (`decfloatdoublearith`), `||` over a decfloat (`decfloatconcat`), a DECFLOAT column through a derived table / CTE / view (`derivedecfloat`, 2026-09-14).
+  - A driver-bound DOUBLE against a DECFLOAT slot converts at 17/16 digits; FLOAT width through conditionals; the CVT rounding epsilon; CAST(<approx> AS VARCHAR(n)) fits by the engine's shrinking precision; provenance gates at every DECFLOAT store (`serve-real-dfparambind`, 2026-09-15).
+  - A DECFLOAT(16) slot narrows a text / int64 bind to 16 digits with per-row raises for specials; and a bind error under a derived table, a CTE or DISTINCT / FIRST / ROWS raises instead of answering an EMPTY result, for every column type (`serve-real-dfparam16`, 2026-09-15).
+
 - **NOT DONE, BY DESIGN - collation-aware DISTINCT / GROUP BY / UNION over a case/accent-insensitive collation:** the engine answers these; fire-crab refuses (`coll_groupable_ttype`, server.rs:45469, deliberately rejects ICU Secondary/Primary). Researched and left as-is: the comparison side already works (ORDER BY and `=` under a CI collation are correct), but a collapsed CI group has NO specified survivor spelling - the engine returns different members for `DISTINCT` vs `GROUP BY` vs `GROUP BY ... MIN(x)` over the same rows (measured). Producing a survivor would be a guess at an unspecified value, which the refuse-rather-than-guess law forbids; the refusal is correct. (`COUNT`/cardinality would be right, but the projected key spelling would be a coin toss.)
+
+### What is left to do (consolidated 2026-09-15, each item MEASURED against the engine and not yet fixed)
+
+Wrong answers first; a refusal is law-safe and ranks below any wrong answer.
+
+- **Parameter slot typing inside an expression (all destination types).** The engine types a `?` from the expression around it and converts the bound value THERE: `N = ? * 2` [1.1] stores 2 (the slot is INTEGER), `COALESCE(?, 0)` is a LONG slot that raises on 2^40, `? / 3` into a DECFLOAT is decimal arithmetic. fire-crab splices the raw value - wrong for INTEGER / NUMERIC destinations today; refused for a DECFLOAT destination.
+- **Single-precision FLOAT comparison.** `FL = 2.675` is TRUE in the engine (both sides cast to FLOAT); fire-crab compares in double. Also NULLIF / CASE-WHEN / IN over a FLOAT column, and GROUP BY / MIN / MAX over a FLOAT-typed conditional's exact branch.
+- **ROUND / TRUNC over an approximate value is an EXACT scaled value** in the engine (`ROUND(dp, 2)` of 2.675 is 2.68 exactly): CAST(ROUND(dp,n) AS NUMERIC(p,s<n)) re-scales half-away, the VARCHAR render is '2.68'. Into a DECFLOAT column it is refused until then.
+- **An exponent literal stored into a DECFLOAT column keeps its TEXT** (1E+200 stays 1E+200, 1.5E-398 stores 2E-398); refused today - needs the literal spelling carried to the store encoder.
+- **DECFLOAT(34) exponent overflow / underflow in arithmetic** wraps to garbage (d34+d34 near max, d34*float) where the engine raises *Decimal float overflow*; SUM over +Inf and -Inf answers NaN where the engine raises.
+- **The 1e400 literal types DOUBLE Infinity** (engine: DECFLOAT(34) 1E+400).
+- **NULLIF(<decfloat>, <text>)** answers where the engine raises 22018; `D16 = 'inf'` literal likewise.
+- **ABS over a scaled INT64 / INT128 numeric** describes sub_type 0 (engine 1/2); `ABS(i64::MIN)` in a WHERE delivers the row.
+- **The CVT rounding association**: the engine adds (0.5 + eps) as one constant, so an even integer-valued double in [2^52, 2^53) casts one higher than the exact answer fire-crab gives.
+- **Base-table bind errors** refuse with the generic *Dynamic SQL Error* at op_execute where the engine raises the per-row conversion error at fetch (every type; law-safe, vector and timing differ).
+- **Refusals of common constructs** (law-safe): number-beside-text UNION (VARYING typing), a DECFLOAT literal in `=`/IN outside the param path, DECFLOAT builtins (COMPARE_DECFLOAT, NORMALIZE_DECFLOAT, QUANTIZE, TOTALORDER), SET DECFLOAT ROUND / TRAPS, a conforming driver binding blr_dec64 / blr_dec128 raw, multi-column UNION, HAVING over a decfloat aggregate, a decfloat IN-subquery, `WHERE CURRENT OF`, GROUP BY / window + FIRST/SKIP/ROWS, collation-aware DISTINCT (by design, below).
 
 ### Second-hunt backlog (remaining)
 
 - Trigger BODY gaps: DONE for a conditional-value `COALESCE`/`CASE` assignment and for an empty body (`serve-real-psqlbody`); STILL refused - `IIF`/`NULLIF` assignment (untested), and an AFTER trigger that UPDATEs its own table (found while gating trigorder).
-- DECFLOAT(16) arithmetic/division computes at 34 digits and types DECFLOAT(34); `SUM`/`AVG` over DECFLOAT refused.
+- DONE: DECFLOAT(16) arithmetic stays DECFLOAT(16) (`serve-real-df16arith`, 2026-09-13); SUM/AVG/MIN/MAX over DECFLOAT columns and expressions answer (`serve-real-decfloatagg`, `serve-real-decfloataggexpr`).
 - Refusals of common constructs: `WHERE CURRENT OF`; UNION with a multi-key `ORDER BY`; GROUP BY / window + `FIRST`/`SKIP`/`ROWS`; `ALTER COLUMN TYPE` to a scaled numeric; `CREATE OR ALTER VIEW`; `ALTER COLUMN ... TO <newname>`; multi-clause `ALTER TABLE`; a computed column declared with an explicit datatype; `UPDATE`/`DELETE` with `ORDER BY`/`ROWS`; `MERGE`/`UPDATE OR INSERT` `RETURNING OLD./NEW.`.
-- Low: `MOD` result descriptor type (LONG vs INT64; NUMERIC-operand subtype bit).
+- DONE: `MOD` result descriptor type and the NUMERIC-operand subtype bit (`serve-real-modsubtype`, `serve-real-intfuncwidth`, 2026-09-12/13).
 
 ### Third-hunt top find - DONE for CAST + equality/ordering (see the DONE entry above); the pattern/blob/none-column/col-vs-col tails remain
 
@@ -3123,10 +3155,10 @@ pointer-page and TIP page numbers is the next step when it dominates.
 
 ### Second-hunt backlog (2026-09-08, all confirmed vs the engine, not yet done)
 
-- **Trigger firing order at the same POSITION** is definition order in the engine, alphabetical-by-name in fire-crab (a wrong final value; medium).
-- **DECFLOAT(16)** arithmetic/division computes at 34 significant digits and types the result DECFLOAT(34) (should stay 16); `SUM`/`AVG` over DECFLOAT are refused (medium).
+- DONE: trigger firing order at the same POSITION is creation order (`serve-real-trigorder`, 2026-09-08).
+- DONE: DECFLOAT(16) arithmetic stays DECFLOAT(16); SUM/AVG over DECFLOAT answer (see the entry in the first backlog list).
 - Refusals of common constructs (medium): a scalar subquery in a PSQL assignment AFTER a DML, or one whose FROM is a system table; `WHERE CURRENT OF` a PSQL cursor; UNION/UNION ALL with a multi-key `ORDER BY`; GROUP BY / window + `FIRST`/`SKIP`/`ROWS`; a conditional-value expression (COALESCE/CASE/IIF/NULLIF) in a TRIGGER body; an empty-bodied trigger; `SELECT DISTINCT` / `GROUP BY` / `UNION` over a case-insensitive collation; `ALTER COLUMN TYPE` to a scaled numeric; `CREATE OR ALTER VIEW`; `ALTER COLUMN ... TO <newname>`; multi-clause `ALTER TABLE`; a computed column declared with an explicit datatype; `UPDATE`/`DELETE` with `ORDER BY`/`ROWS`; `MERGE`/`UPDATE OR INSERT` `RETURNING OLD./NEW.`.
-- Low: `MOD` result descriptor type (LONG vs INT64, and the NUMERIC-operand subtype bit).
+- DONE: `MOD` result descriptor type (see the entry in the first backlog list).
 
 
 - **A CAST FROM A STRING TO A NUMERIC OR FLOATING TYPE VALIDATES ITS RESULT DONE (2026-09-08, `serve-real-castrange`):** two silent wrong answers, both from an eight-surface hunt and then pinned by a four-agent contract-research pass. (1) `CAST(<string> AS NUMERIC(p,s))` rounded to scale BEFORE checking the range, so `CAST('0.99995' AS NUMERIC(4,4))` answered `1.0000` where the engine raises `22003` - the engine gates on the BACKING integer width TWICE: the string's pre-round COEFFICIENT must fit (a plain decimal's trailing fraction zeros dropped first, so `'0.9999000'` is coefficient 9999) AND the rounded stored value must fit. Added the coefficient gate in the CAST-Numeric text branch (the stored-value gate was already there); widening the target (`NUMERIC(9,4)`) admits the same string, exactly as the engine. (2) `CAST(<string> AS DOUBLE PRECISION)` used Rust's `f64` parse and answered `Infinity` for `'1e400'` and `NaN` for `'nan'`; the engine never makes an infinity or a NaN from a string - `'inf'`/`'nan'`/`'infinity'` are `22018` and an overflow of binary64 is `22003`. Routed the text branch through the strict CVT grammar (`text_number`) and the finiteness check (`text_to_approx`). Recorded, not done (a separate feature, not a silent wrong answer): fire-crab still refuses an EXPONENT-form string to NUMERIC (`'0.99990e0'`) with 22018 where the engine parses it and raises 22003; and the DOUBLE underflow-exponent guard (`'1e-309'` -> 22003 on the engine) is unhandled. The murky `NUMERIC(4,4)` puzzle (`1.5` accepted, `0.99995` rejected) is the two-gate rule above.
