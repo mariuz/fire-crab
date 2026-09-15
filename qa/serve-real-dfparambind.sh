@@ -407,7 +407,10 @@ agree "ins-sel DP 3.4e38, 1e-30, 1e30 -> DOUBLE/FLOAT" "DELETE FROM DX; INSERT I
 agree "VALUES((SELECT FL)) 3.4e38"           "DELETE FROM DX; INSERT INTO DX (ID, F, DP) VALUES (7, (SELECT FL FROM TX WHERE ID = 7), (SELECT FL FROM TX WHERE ID = 7)); SELECT ID, F, DP FROM DX;"
 agree "UPDATE .. = (SELECT FL) 3.4e38"       "DELETE FROM DX; INSERT INTO DX (ID) VALUES (1); UPDATE DX SET F = (SELECT FL FROM TX WHERE ID = 7) WHERE ID = 1; SELECT ID, F FROM DX;"
 echo "-- verify-found: an EXPONENT LITERAL into a DECFLOAT column refuses (the engine stores the literal's TEXT: 1E+200, 2E-398, 0.1) --"
-refuses "insert 1.5E-398 into D16"  "INSERT INTO DX (ID, D16) VALUES (501, 1.5E-398);"
+# 1.5E-398 is past DOUBLE's range, so it is a DECFLOAT(34) literal (the
+# dfliteral chunk) and stores its exact decimal - the engine's 2E-398 in a
+# DECFLOAT(16) - no longer the refused DOUBLE underflow
+agree "insert 1.5E-398 into D16 stores 2E-398" "INSERT INTO DX (ID, D16) VALUES (501, 1.5E-398); SELECT ID, D16 FROM DX WHERE ID = 501;"
 refuses "insert 1E+200 into D34"    "INSERT INTO DX (ID, D34) VALUES (502, 1E+200);"
 refuses "insert 0.1E0 into D34"     "INSERT INTO DX (ID, D34) VALUES (503, 0.1E0);"
 refuses "insert -1.5E-300 into D34" "INSERT INTO DX (ID, D34) VALUES (504, -1.5E-300);"

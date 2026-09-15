@@ -32064,9 +32064,9 @@ fn encode_wire_value(d: &Descriptor, wp: &WireParam) -> Option<Option<Vec<u8>>> 
                     // store a plain NaN - refuse rather than lose it
                     return None;
                 }
-                dtype::DEC128 => Some(text_to_dec128(text)?.to_le_bytes().to_vec()),
+                dtype::DEC128 => Some(text_to_dec128_clamped(text).ok()?.to_le_bytes().to_vec()),
                 dtype::DEC64 => {
-                    let bits = text_to_dec128(text)?;
+                    let bits = text_to_dec128_clamped(text).ok()?;
                     match fire_crab_ods::decfloat::decode_dec128(bits) {
                         fire_crab_ods::decfloat::Dec::Finite { neg, coeff, exp } => {
                             Some(fire_crab_ods::decfloat::fit_dec64(neg, coeff, exp)?.to_le_bytes().to_vec())
@@ -55372,6 +55372,16 @@ fn compute_group(rows: &[Vec<Value>], gitems: &[GItem]) -> Result<Vec<Value>, Ev
                                 {
                                     return Err(EvalErr::DecfloatOverflow);
                                 }
+                                // +Infinity and -Infinity meeting in the sum
+                                // is the invalid operation the engine traps
+                                // (SUM / AVG, grouped and windowed, measured);
+                                // a NaN INPUT still propagates as NaN
+                                if matches!(next, fire_crab_ods::decfloat::Dec::Nan)
+                                    && !matches!(d, fire_crab_ods::decfloat::Dec::Nan)
+                                    && !matches!(acc0, Some(fire_crab_ods::decfloat::Dec::Nan))
+                                {
+                                    return Err(EvalErr::DecfloatInvalidOperation);
+                                }
                                 dsum = Some(next);
                                 n += 1;
                             }
@@ -62262,7 +62272,13 @@ fn expr_unary(b: &[char], pos: &mut usize) -> Option<RawExpr> {
             return Some(e);
         }
         *pos = after_minus;
-        return Some(RawExpr::Neg(Box::new(expr_unary(b, pos)?)));
+        // a minus before a DECFLOAT literal folds INTO the literal (sign
+        // bit flipped), as the engine's parser folds a negative literal: it
+        // describes CONSTANT and `-0e400` keeps its sign (-0E+400)
+        return Some(match expr_unary(b, pos)? {
+            RawExpr::DecFloat34(bits) => RawExpr::DecFloat34(bits ^ (1u128 << 127)),
+            other => RawExpr::Neg(Box::new(other)),
+        });
     }
     if b.get(*pos) == Some(&'+') {
         *pos += 1;
@@ -66882,9 +66898,37 @@ fn classify_exp_literal(text: &str) -> Option<ExpLit> {
         // where the engine sees double+double -> DOUBLE)
         Err(_) if d.is_empty() => 0,
         // past 39 digits it cannot fit u128 and is certainly > 2^63
-        Err(_) => return text_to_dec128(text).map(ExpLit::DecFloat34),
+        Err(_) => return text_to_dec128_clamped(text).ok().map(ExpLit::DecFloat34),
     };
     if m <= I64MAX {
+        // ... and within DOUBLE'S RANGE AS WRITTEN (measured): the leading
+        // digit's decimal exponent at least -308 (`1.5e-308`, `0.01e-306`
+        // DOUBLE; `9.99e-309`, `12.5e-310` DECFLOAT), and the value at most
+        // 1.7976931348623157e308 (`17976931348623157e292` DOUBLE,
+        // `1.7976931348623158e308` and `1.7976931348623157081e308`
+        // DECFLOAT - the text, not its rounded double, decides). A ZERO
+        // goes by its written exponent (`0e308` / `0e-308` DOUBLE, `0e309`
+        // / `0e-309` DECFLOAT). Outside, the literal is DECFLOAT(34): `1e400`
+        // was a DOUBLE Infinity and `1e-330` a DOUBLE zero.
+        let qexp = exp as i64 - frac as i64;
+        let in_range = if m == 0 {
+            (-308..=308).contains(&qexp)
+        } else {
+            let adjusted = qexp + d.len() as i64 - 1;
+            if adjusted < -308 || adjusted > 308 {
+                false
+            } else if adjusted == 308 {
+                let sig = d.trim_end_matches('0');
+                const DMAX: &str = "17976931348623157";
+                let w = sig.len().max(DMAX.len());
+                format!("{:0<w$}", sig, w = w) <= format!("{:0<w$}", DMAX, w = w)
+            } else {
+                true
+            }
+        };
+        if !in_range {
+            return text_to_dec128_clamped(text).ok().map(ExpLit::DecFloat34);
+        }
         text.parse::<f64>().ok().map(ExpLit::Double)
     } else if m == TWO63 {
         // the 2^63 INT128 quirk: representable only as a scale-0 i128
@@ -66898,7 +66942,7 @@ fn classify_exp_literal(text: &str) -> Option<ExpLit> {
             None
         }
     } else {
-        text_to_dec128(text).map(ExpLit::DecFloat34)
+        text_to_dec128_clamped(text).ok().map(ExpLit::DecFloat34)
     }
 }
 
@@ -70459,9 +70503,14 @@ impl Expr {
                     // CAST re-represents, it does not trap).
                     CastTarget::DecFloat { wide } => {
                         let dec = if let Value::Text(s) = &v {
-                            match text_to_dec128(s) {
-                                Some(bits) => fire_crab_ods::decfloat::decode_dec128(bits),
-                                None => return Err(conv_err(*cs, s.clone())),
+                            // an exponent past decimal128's range CLAMPS
+                            // ('1E-6177' is 0E-6176, '1E+6112' 1.0E+6112) and
+                            // past emax raises *Decimal float overflow*, as
+                            // decNumber does (measured)
+                            match text_to_dec128_clamped(s) {
+                                Ok(bits) => fire_crab_ods::decfloat::decode_dec128(bits),
+                                Err(true) => return Err(EvalErr::DecfloatOverflow),
+                                Err(false) => return Err(conv_err(*cs, s.clone())),
                             }
                         } else if approx_const_fold(e) {
                             // a pure-constant approximate literal cast to
@@ -78646,7 +78695,11 @@ fn texpr_mul(t: &[Tok], pos: &mut usize) -> Option<RawExpr> {
 fn texpr_unary(t: &[Tok], pos: &mut usize) -> Option<RawExpr> {
     if matches!(t.get(*pos), Some(Tok::Minus)) {
         *pos += 1;
-        return Some(RawExpr::Neg(Box::new(texpr_unary(t, pos)?)));
+        // the DECFLOAT literal fold [expr_unary] makes
+        return Some(match texpr_unary(t, pos)? {
+            RawExpr::DecFloat34(bits) => RawExpr::DecFloat34(bits ^ (1u128 << 127)),
+            other => RawExpr::Neg(Box::new(other)),
+        });
     }
     if matches!(t.get(*pos), Some(Tok::Plus)) {
         *pos += 1;
@@ -86847,7 +86900,11 @@ fn resolve_expr_term(
             // StrKey refuses rather than drop its grammar marker; a DECFLOAT
             // literal against an EXPRESSION side refuses (its own slice, as
             // the INT128 expression-compare was after its column compare)
-            Rhs::Dbl(_) | Rhs::Param(..) | Rhs::StrKey(_) | Rhs::DecFloat34(_) => return None,
+            // a DECFLOAT literal becomes its expression literal: [cmp_sides]
+            // takes it beside an exact or approximate side and compares in
+            // decimal (`DP < 1e309`, measured), and refuses anything else
+            Rhs::DecFloat34(b) => Expr::DecFloat34(*b),
+            Rhs::Dbl(_) | Rhs::Param(..) | Rhs::StrKey(_) => return None,
             // a BINARY literal reaches a comparison as an EXPRESSION
             // (Tok::FnExpr), never as an Rhs - only the pattern
             // positions build one, and they resolve it themselves
@@ -87963,9 +88020,9 @@ fn decfloat_term(
         // grammar; a non-convertible one raises 22018 PER ROW (UNKNOWN over
         // NULL, no raise on an empty table), which is exactly what
         // [Term::CmpConvErr] with no lenient fallback does
-        RawKind::Cmp(op, Rhs::Str(v)) => match text_to_dec128(&v) {
-            Some(bits) => Term::NumCmp(idx, op, Rhs::DecFloat34(bits)),
-            None => Term::CmpConvErr(idx, op, v, None),
+        RawKind::Cmp(op, Rhs::Str(v)) => match text_to_dec128_clamped(&v) {
+            Ok(bits) => Term::NumCmp(idx, op, Rhs::DecFloat34(bits)),
+            Err(_) => Term::CmpConvErr(idx, op, v, None),
         },
         RawKind::Cmp(op, rhs) => Term::NumCmp(idx, op, Rhs::DecFloat34(rhs_to_dec128(&rhs)?)),
         RawKind::IsNull => Term::IsNull(idx),

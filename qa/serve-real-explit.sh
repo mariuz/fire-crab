@@ -69,11 +69,11 @@ echo "== INT128 quirk: type + value + WHERE (all faithful) =="
 for c in "9223372036854775808e0" "9223372036854775808e1" "9223372036854775808e5"; do
   type_agree "$c"; val_agree "$c"; where_agree "$c"; done
 
-echo "== DECFLOAT(34) side: type + value (SELECT); WHERE is a known-refuse =="
+echo "== DECFLOAT(34) side: type + value (SELECT) + WHERE (a DECFLOAT literal compares in decimal since the dfliteral chunk, 2026-09-15) =="
 for c in "9223372036854775809e0" "9999999999999999999e0" "12345678901234567890e0" \
          "1.2345678901234567890e5" "1.2345678901234567890e30" \
          "1234567890123456789012345678901234567890e0"; do
-  type_agree "$c"; val_agree "$c"; fc_refuses "$c"; done
+  type_agree "$c"; val_agree "$c"; where_agree "$c"; done
 
 echo "== known-refuse: a 2^63 significand needing a SCALED/ROUNDED INT128 =="
 fc_refuses_sel "9223372036854775808e-1"
