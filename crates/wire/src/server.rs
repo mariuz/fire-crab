@@ -8891,7 +8891,23 @@ impl ProjCol {
                         return Err(EvalErr::DatetimeRange);
                     }
                 }
-                if matches!(self.wire, Wire::Double) {
+                if matches!(self.wire, Wire::Double | Wire::Float) {
+                    // ... and a FLOAT-announced one converts it the same
+                    // way (COALESCE(fl, 12345678901) travels as the f32
+                    // 1.2345679e+10 - the Wire::Float encoder narrows at
+                    // send time; it reads approx_of, which is None for an
+                    // exact value and wrote 0.0, and the exact-scale
+                    // contract below raised 22003 on a Scaled branch).
+                    // The VALUE kept here stays the exact double, not an
+                    // f32: a consumer above a CTE / derived table compares
+                    // it against exact operands, and the engine compares a
+                    // FLOAT-typed value in SINGLE precision (both sides
+                    // cast to float, so `x = 2.68` is TRUE) - a widened f32
+                    // (2.6800000667) against the exact 2.68 answered FALSE.
+                    // fire-crab's comparison does not model the single-
+                    // precision compare yet (a plain `fl = 2.675` has the
+                    // same gap - backlog); the exact value keeps every
+                    // comparison the old build got right.
                     return Ok(match v {
                         Value::Int(n) => Value::Double(n as f64),
                         Value::Scaled(raw, sc) => {
@@ -11441,39 +11457,39 @@ impl Predicate {
                 // integer/decimal value `v * 10^ws` encodes exactly (the
                 // scale is the exponent), a text value converts by the
                 // decNumber grammar and raises 22018 when it cannot.
-                (ColKind::DecFloat, WireParam::Int(v, ws)) => Some(Rhs::DecFloat34(
+                (ColKind::DecFloat { .. }, WireParam::Int(v, ws)) => Some(Rhs::DecFloat34(
                     fire_crab_ods::decfloat::encode_dec128(
                         *v < 0,
                         (*v as i128).unsigned_abs(),
                         *ws as i32,
                     ),
                 )),
-                (ColKind::DecFloat, WireParam::Text(s) | WireParam::TextCs(s, _)) => Some(Rhs::DecFloat34(
+                (ColKind::DecFloat { .. }, WireParam::Text(s) | WireParam::TextCs(s, _)) => Some(Rhs::DecFloat34(
                     text_to_dec128(s).ok_or_else(|| format!("conversion error from string \"{}\"", s))?,
                 )),
                 // a DOUBLE value (a driver sends a non-integer JS number as
-                // blr_double) promotes by its EXACT binary value, rounded to
-                // 34 significant - probed: `DF = ?` bound the f64 1.1 finds
-                // NO 1.1 row, because the double is 1.1000...0888, not the
-                // decimal 1.1. Formatting past 34 significant digits then
-                // re-parsing reproduces that exact expansion.
-                (ColKind::DecFloat, WireParam::Double(x)) => {
+                // blr_double) converts at the SLOT's OWN significant-digit
+                // count, exactly as the engine's Decimal128/64::set(double)
+                // does (sprintf "%.16e" / "%.15e", then decNumberFromString):
+                // 17 digits for a DECFLOAT(34) slot, 16 for a DECFLOAT(16)
+                // one - NOT the full binary expansion. Measured: `D34 = ?`
+                // bound the f64 1.1 finds the row storing 1.1000000000000001
+                // and NOT the one storing 1.100000000000000088817841970012523
+                // (which the former expansion matched), and `D16 = ?` bound
+                // 1.1 finds every row of the 1.1 cohort (16 digits of 1.1
+                // are 1.100000000000000). f64_to_dec is the CAST chunks'
+                // already-gated implementation of that rule.
+                (ColKind::DecFloat { wide }, WireParam::Double(x)) => {
                     if !x.is_finite() {
                         return Err("cannot convert a non-finite value to DECFLOAT".into());
                     }
-                    if *x == 0.0 {
-                        Some(Rhs::DecFloat34(fire_crab_ods::decfloat::encode_dec128(
-                            x.is_sign_negative(),
-                            0,
-                            0,
-                        )))
-                    } else {
-                        let e10 = x.abs().log10().floor() as i32;
-                        let prec = (40 - e10).clamp(0, 700) as usize;
-                        let s = format!("{:.*}", prec, x);
-                        Some(Rhs::DecFloat34(
-                            text_to_dec128(&s).ok_or("could not convert the double value")?,
-                        ))
+                    match f64_to_dec(*x, if *wide { 17 } else { 16 }) {
+                        Some(fire_crab_ods::decfloat::Dec::Finite { neg, coeff, exp }) => {
+                            Some(Rhs::DecFloat34(fire_crab_ods::decfloat::encode_dec128(
+                                neg, coeff, exp,
+                            )))
+                        }
+                        _ => return Err("could not convert the double value".into()),
                     }
                 }
                 // A TEXT parameter against a NUMERIC column. The engine
@@ -19005,7 +19021,9 @@ fn build_expr_col_from(e: Expr, name: &str, descs: &[Descriptor]) -> Option<Proj
         // the 4-byte single-precision slot (the value is Value::Float,
         // rendered at 8 significant digits)
         ExprType::Approx => {
-            if matches!(e, Expr::Cast(_, CastTarget::Float, _)) {
+            // ... and a FLOAT column kept single through unary minus / ABS /
+            // a conditional with no DOUBLE branch ([approx_expr_single])
+            if approx_expr_single(&e, descs) {
                 (Wire::Float, nullable(482), 4, 0)
             } else {
                 (Wire::Double, nullable(480), 8, 0)
@@ -19236,6 +19254,20 @@ enum InsVal {
     /// the value list is parsed; the slots are already numbered, in
     /// source order.
     ParamExpr(RawExpr),
+    /// A constant APPROXIMATE value that is NOT a runtime double to the
+    /// engine ([approx_runtime_expr]): a bare exponent literal
+    /// (`1.5E-398`, `1E+200`, `0.1E0`), arithmetic over such literals, a
+    /// function or conditional over one (ROUND(2.675E0, 2),
+    /// COALESCE(1E+200, 0)) - folded to its double. Into any column but a
+    /// DECFLOAT one it stores as that fold; into a DECFLOAT column it
+    /// REFUSES: the engine stores a literal from its TEXT (1E+200 stays
+    /// 1E+200, 1.5E-398 stores 2E-398, 0.1E0 stores 0.1, the cohort kept)
+    /// and a ROUND as its exact scaled value (2.68), where the runtime
+    /// path would write the 17/16-digit expansion (9.9999999999999997E+199,
+    /// 2.6800000000000002) or, past the double's range, a plain zero. The
+    /// text-exact store needs the literal's spelling carried to the
+    /// encoder - a later slice.
+    ApproxConst(WireParam),
     /// `GenId(name, step)`: `None` step = `NEXT VALUE FOR` (use the
     /// sequence's own increment), `Some(n)` = `GEN_ID(name, n)`.
     GenId(String, Option<i64>),
@@ -29944,6 +29976,13 @@ fn plan_insert_select(
     // `496 LONG`, then `448 VARYING len 10`).
     let mut sink: Vec<Option<Descriptor>> = Vec::new();
     let src = plan_query_inner(s[sel..].trim(), db, &mut sink)?;
+    // an approximate source that is not a RUNTIME double - a literal,
+    // ROUND / TRUNC, a conditional - into a DECFLOAT column refuses: the
+    // engine stores the literal's text / evlRound's exact 2.68, where this
+    // server's double would store the 17-digit expansion (recorded)
+    if approx_source_into_decfloat(&src, &listed, descs) {
+        return None;
+    }
     // an untypeable `?` (a param-to-param compare, a UNION leg, a CTE,
     // an IN-subquery, ORDER BY ?) refuses. The engine refuses those too,
     // at prepare, with `-804 / HY004 Data type unknown`; fire-crab's
@@ -30155,7 +30194,14 @@ fn plan_insert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
                     if std::env::var("FC_SRV_TRACE").is_ok() {
                         eprintln!("[srv] insert const-expr {:?} -> {}", part_text, v.render());
                     }
-                    InsVal::Wire(expr_value_to_wireparam(&e, &v, &[])?)
+                    let wp = expr_value_to_wireparam(&e, &v, &[])?;
+                    if matches!(wp, WireParam::Double(_) | WireParam::Single(_))
+                        && !approx_runtime_expr(&e)
+                    {
+                        InsVal::ApproxConst(wp)
+                    } else {
+                        InsVal::Wire(wp)
+                    }
                 }
             });
         }
@@ -30282,7 +30328,9 @@ fn plan_insert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
                 // a CONSTANT EXPRESSION folded to text, and a plain
                 // number: the engine stores the RENDERING (probed:
                 // `VALUES (42)` into a blob column reads back '42')
-                InsVal::Wire(wp) => wireparam_text(wp).map(|t| (fid, lit(&t), 1)),
+                InsVal::Wire(wp) | InsVal::ApproxConst(wp) => {
+                    wireparam_text(wp).map(|t| (fid, lit(&t), 1))
+                }
                 InsVal::Int(n) => Some((fid, lit(&n.to_string()), 1)),
                 InsVal::Bool(b) => {
                     Some((fid, lit(if *b { "TRUE" } else { "FALSE" }), 1))
@@ -30326,6 +30374,20 @@ fn plan_insert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
             InsVal::ParamExpr(raw) => {
                 let d = descs.get(fid)?.clone();
                 if !param_target_ok(&d) {
+                    return None;
+                }
+                // a `?` INSIDE an expression aimed at a DECFLOAT column
+                // REFUSES: the engine types the slot from the EXPRESSION'S
+                // context and converts the driver's value THERE, before the
+                // decimal arithmetic - `COALESCE(?, 0)` [1.1] stores 1 (a
+                // LONG slot; 2^40 overflows it), `? * 3` [0.1] stores
+                // 0.30000000000000003, `? / 3` [2] is the decimal
+                // 0.6666666666666666666666666666666667, `? * 1E+3` [2] is
+                // 2E+3 (the literal read as decfloat text). A raw splice of
+                // the bound value gets only the simplest shapes right;
+                // typing the slot the engine's way is a general slice
+                // (INTEGER / NUMERIC destinations carry the same gap).
+                if d.dtype == dtype::DEC64 || d.dtype == dtype::DEC128 {
                     return None;
                 }
                 // a BLOB destination takes its value through the
@@ -30641,7 +30703,7 @@ fn build_insert_image(
                     | InsVal::Dec(..)
                     | InsVal::Bool(_)
             ) || (d.dtype == dtype::BLOB
-                && matches!(v, InsVal::Wire(wp) if wireparam_text(wp).is_some()))
+                && matches!(v, InsVal::Wire(wp) | InsVal::ApproxConst(wp) if wireparam_text(wp).is_some()))
         {
             continue;
         }
@@ -30754,6 +30816,15 @@ fn encode_set_value(d: &Descriptor, v: &InsVal) -> Option<Option<Vec<u8>>> {
         // midnight of a TIMESTAMP one, a TIME lands dated today, a
         // temporal renders into a TEXT column - the encode arms' rules)
         InsVal::Wire(wp) => wp.clone(),
+        // a constant approximate fold stores as the double it folded to -
+        // except into a DECFLOAT column, where the engine keeps the
+        // LITERAL'S TEXT and this fold has lost it ([InsVal::ApproxConst])
+        InsVal::ApproxConst(wp) => {
+            if matches!(d.dtype, dtype::DEC64 | dtype::DEC128) {
+                return None;
+            }
+            wp.clone()
+        }
         // parameters bind, generators advance, at execute - not here.
         // DEFAULT never reaches an encoder at all: plan_insert drops a
         // DEFAULT-valued column out of the image targets so the column
@@ -30812,6 +30883,15 @@ enum WireParam {
     /// lands verbatim in a WIN1252 one, and into UTF8 refuses).
     TextCs(String, u8),
     Double(f64),
+    /// A SINGLE-precision value - an INTERNAL shape, never decoded off
+    /// the wire (a driver sends a non-integer number as blr_double).
+    /// `insert_select` and the row-conversion paths bind a FLOAT source
+    /// value with its width KEPT, so the store follows the engine's FLOAT
+    /// rules: eps_float 1e-5 into an exact column (a FLOAT 2.675 into
+    /// NUMERIC(9,2) stores 2.68 where the widened DOUBLE
+    /// 2.674999952316284 would store 2.67) and the FLOAT's own
+    /// 8-significant-digit text into a CHAR/VARCHAR.
+    Single(f32),
     Timestamp(i32, u32),
     Date(i32),
     Time(u32),
@@ -31736,6 +31816,12 @@ fn param_target_ok(d: &Descriptor) -> bool {
             | dtype::BOOLEAN
             | dtype::BLOB // a blr_quad: a temp blob id materialised at the store
             | dtype::ARRAY // a temp array (op_put_slice) materialised the same way
+            // a DECFLOAT target: the slot describes as the column (32760 /
+            // 32762) and the value converts at the store - an integer or
+            // decimal exactly, a DOUBLE at 17/16 significant digits, a text
+            // by the decNumber grammar ([encode_wire_value])
+            | dtype::DEC64
+            | dtype::DEC128
     )
 }
 
@@ -31902,6 +31988,37 @@ fn encode_wire_value(d: &Descriptor, wp: &WireParam) -> Option<Option<Vec<u8>>> 
                         .to_le_bytes()
                         .to_vec(),
                 ),
+                // a TEXT parameter into a DECFLOAT column converts by the
+                // decNumber grammar, cohort kept ('1E+3' stores 1E+3, '1.00'
+                // stores 1.00, 'Infinity' stores Infinity); DECFLOAT(16)
+                // rounds an over-long coefficient to 16 significant
+                // ('9.99999999999999999' stores 10.00000000000000). A
+                // non-convertible text or a decimal64 overflow is a
+                // refusal here (the engine raises its decfloat
+                // invalid-operation / overflow vector - message shape
+                // recorded, not matched).
+                dtype::DEC128 | dtype::DEC64
+                    if text.to_ascii_lowercase().contains("nan")
+                        && !text.eq_ignore_ascii_case("nan") =>
+                {
+                    // a SIGNED / signalling / payload-carrying NaN ('-nan',
+                    // 'sNaN', 'nan123') is stored by the engine as written;
+                    // our Dec::Nan carries none of that and would quietly
+                    // store a plain NaN - refuse rather than lose it
+                    return None;
+                }
+                dtype::DEC128 => Some(text_to_dec128(text)?.to_le_bytes().to_vec()),
+                dtype::DEC64 => {
+                    let bits = text_to_dec128(text)?;
+                    match fire_crab_ods::decfloat::decode_dec128(bits) {
+                        fire_crab_ods::decfloat::Dec::Finite { neg, coeff, exp } => {
+                            Some(fire_crab_ods::decfloat::fit_dec64(neg, coeff, exp)?.to_le_bytes().to_vec())
+                        }
+                        special => Some(
+                            fire_crab_ods::decfloat::dec_to_dec64_bits(&special).to_le_bytes().to_vec(),
+                        ),
+                    }
+                }
                 // a TEXT value into a temporal column: the engine's string
                 // coercion - the full CVT grammar, specials included
                 // (probed: '15-JAN-2020', '5.6.2020', 'TODAY', 'now' all
@@ -31950,9 +32067,35 @@ fn encode_wire_value(d: &Descriptor, wp: &WireParam) -> Option<Option<Vec<u8>>> 
                 _ => return None,
             }
         }
+        // a SINGLE-precision source value: the engine's FLOAT rules -
+        // eps_float 1e-5 into an exact column, the FLOAT's own text into a
+        // text column; every other destination takes the widened double
+        WireParam::Single(f) => Some(match d.dtype {
+            dtype::REAL => f.to_le_bytes().to_vec(),
+            dtype::SHORT | dtype::LONG | dtype::INT64 => {
+                let scaled = (*f as f64) * 10f64.powi(-(d.scale as i32));
+                if !scaled.is_finite() || scaled.abs() >= i64::MAX as f64 {
+                    return None;
+                }
+                let adjusted =
+                    if scaled > 0.0 { scaled + 0.5 + 1e-5 } else { scaled - 0.5 - 1e-5 };
+                int_bytes(adjusted.trunc() as i128)?
+            }
+            dtype::TEXT | dtype::VARYING => {
+                text_bytes_for(&approx_store_text(*f as f64, true, d)?, fire_crab_ods::intl::CS_UTF8, d, flen)?
+            }
+            _ => return encode_wire_value(d, &WireParam::Double(*f as f64)),
+        }),
         WireParam::Double(x) => Some(match d.dtype {
             dtype::DOUBLE => x.to_le_bytes().to_vec(),
-            dtype::REAL => (*x as f32).to_le_bytes().to_vec(),
+            // past the single's range the engine raises 22003 (a stored
+            // Infinity poisoned every later arithmetic over the column)
+            dtype::REAL => {
+                if x.is_finite() && x.abs() > f32::MAX as f64 {
+                    return None;
+                }
+                (*x as f32).to_le_bytes().to_vec()
+            }
             dtype::SHORT | dtype::LONG | dtype::INT64 => {
                 // engine rounding: scale to the target, then half away
                 // WITH the CVT epsilon (cvt.cpp: d += 0.5 + 1e-14, then
@@ -31971,14 +32114,37 @@ fn encode_wire_value(d: &Descriptor, wp: &WireParam) -> Option<Option<Vec<u8>>> 
             }
             // an approximate value into a TEXT column renders the
             // engine's 16-significant-digit form (probed: SQRT(2) into a
-            // VARCHAR is '1.414213562373095')
+            // VARCHAR is '1.414213562373095'), FITTED to the column as
+            // the CVT does ([approx_store_text])
             dtype::TEXT | dtype::VARYING => {
-                text_bytes_for(
-                    &Value::Double(*x).render(),
-                    fire_crab_ods::intl::CS_UTF8,
-                    d,
-                    flen,
-                )?
+                text_bytes_for(&approx_store_text(*x, false, d)?, fire_crab_ods::intl::CS_UTF8, d, flen)?
+            }
+            // a DOUBLE value into a DECFLOAT column stores the engine's
+            // Decimal128/64::set(double) conversion - 17 significant digits
+            // for DECFLOAT(34), 16 for DECFLOAT(16), trailing-zero cohort
+            // KEPT (measured: a bound 1.5 stores 1.5000000000000000 /
+            // 1.500000000000000, a bound 1e-7 stores 9.9999999999999995E-8 /
+            // 1.000000000000000E-7). Non-finite stays a refuse.
+            dtype::DEC128 | dtype::DEC64 => {
+                if !x.is_finite() {
+                    return None;
+                }
+                let wide = d.dtype == dtype::DEC128;
+                match f64_to_dec(*x, if wide { 17 } else { 16 }) {
+                    Some(fire_crab_ods::decfloat::Dec::Finite { neg, coeff, exp }) => {
+                        if wide {
+                            fire_crab_ods::decfloat::encode_dec128(neg, coeff, exp)
+                                .to_le_bytes()
+                                .to_vec()
+                        } else {
+                            match fire_crab_ods::decfloat::fit_dec64(neg, coeff, exp) {
+                                Some(bits) => bits.to_le_bytes().to_vec(),
+                                None => return None,
+                            }
+                        }
+                    }
+                    _ => return None,
+                }
             }
             _ => return None,
         }),
@@ -32580,6 +32746,14 @@ fn plan_update(sql: &str, db_outer: &Option<Database>) -> Option<(Plan, Vec<Desc
                         if e.type_of(descs).is_none() {
                             return None;
                         }
+                        // an approximate lookup into a DECFLOAT column: the
+                        // subquery's own expression is out of sight here -
+                        // refuse (the runtime-provenance rule below)
+                        if matches!(descs.get(fid0).map(|d| d.dtype), Some(dtype::DEC64 | dtype::DEC128))
+                            && e.type_of(descs) == Some(ExprType::Approx)
+                        {
+                            return None;
+                        }
                         if sets.iter().any(|(f, _)| *f == fid0) {
                             return None;
                         }
@@ -32622,6 +32796,12 @@ fn plan_update(sql: &str, db_outer: &Option<Database>) -> Option<(Plan, Vec<Desc
                     let mut next = params.len();
                     renumber_raw_params(&mut raw, &mut next);
                     let dest = descs.get(fid0)?.clone();
+                    // a `?` inside an expression aimed at a DECFLOAT column
+                    // refuses (the INSERT arm's twin: the slot's type is the
+                    // expression's, not the column's - recorded)
+                    if dest.dtype == dtype::DEC64 || dest.dtype == dtype::DEC128 {
+                        return None;
+                    }
                     let e = resolve_dest_param_expr(&raw, &dest, &columns, descs, &mut params)?;
                     // NO type gate here: a `?` has no type until it is
                     // bound (`? * 2` types None at prepare), and the
@@ -32644,6 +32824,19 @@ fn plan_update(sql: &str, db_outer: &Option<Database>) -> Option<(Plan, Vec<Desc
                 }
                 let raw = raw;
                 let e = resolve_expr(&raw, &columns, descs)?;
+                // an APPROXIMATE value that is not a runtime double into a
+                // DECFLOAT column refuses ([approx_runtime_expr]): the
+                // engine stores an exponent literal from its TEXT (`SET D =
+                // 1E+200` keeps 1E+200), ROUND(dp, 2) as the exact 2.68,
+                // COALESCE(dp, 0)'s NULL arm as 0E-16 - the fold here has
+                // lost every one of those ([InsVal::ApproxConst], the
+                // INSERT twin)
+                if matches!(descs.get(fid0).map(|d| d.dtype), Some(dtype::DEC64 | dtype::DEC128))
+                    && e.type_of(descs) == Some(ExprType::Approx)
+                    && !approx_runtime_expr(&e)
+                {
+                    return None;
+                }
                 // the TYPE GATE, as the projection's own rule: an
                 // expression the type system refuses (`'5' + 1` - the
                 // engine's "Strings cannot be added") must not reach the
@@ -57374,7 +57567,22 @@ fn param_to_expr(p: &WireParam) -> Option<Expr> {
         WireParam::Int(v, 0) => Expr::Int(*v),
         WireParam::Int(v, s) => Expr::Dec(*v, *s),
         WireParam::Text(s) | WireParam::TextCs(s, _) => Expr::Str(s.clone()),
-        WireParam::Double(x) => Expr::Double(*x),
+        // a bound DOUBLE is a RUNTIME value, not a compile-time literal:
+        // wrapped in an explicit CAST-to-DOUBLE so `CAST(? AS DECFLOAT)`
+        // takes the runtime 17/16-significant-digit path (engine: a bound
+        // 1.1 is 1.1000000000000001) instead of the literal const-fold
+        // boundary [approx_const_fold], which refuses a bare Expr::Double
+        WireParam::Double(x) => Expr::Cast(
+            Box::new(Expr::Double(*x)),
+            CastTarget::Approx,
+            fire_crab_ods::intl::CS_UTF8,
+        ),
+        // a single-precision value keeps its width as CAST(.. AS FLOAT)
+        WireParam::Single(f) => Expr::Cast(
+            Box::new(Expr::Double(*f as f64)),
+            CastTarget::Float,
+            fire_crab_ods::intl::CS_UTF8,
+        ),
         WireParam::Bool(b) => Expr::Bool(*b),
         // a bound temporal value binds to its literal, so CAST(? AS DATE)
         // over a sent DATE collapses to the date itself
@@ -59427,6 +59635,7 @@ fn wireparam_text(wp: &WireParam) -> Option<String> {
         WireParam::Int(n, 0) => n.to_string(),
         WireParam::Int(r, sc) => render_exact(*r as i128, *sc),
         WireParam::Double(d) => Value::Double(*d).render(),
+        WireParam::Single(f) => Value::Float(*f).render(),
         WireParam::Date(d) => Value::Date(*d).render(),
         WireParam::Time(t) => Value::Time(*t).render(),
         WireParam::Timestamp(d, t) => Value::Timestamp(*d, *t).render(),
@@ -63599,6 +63808,8 @@ fn resolve_expr(
     // source or the select list
     let e = align_conditional(resolve_expr_inner(raw, columns, descs)?, descs);
     let e = pad_conditional(recode_conditional(recode_concat(e, descs), descs), descs);
+    // a FLOAT branch beside a DOUBLE one widens to the common DOUBLE
+    let e = float_conditional(e, descs);
     // a DECFLOAT conditional (COALESCE/CASE/IIF/NULLIF with a decfloat
     // branch) is typed by an OUTERMOST CAST to DECFLOAT - the passes above
     // all no-op on it (its type_of is None, not Numeric/Text), so this runs
@@ -64285,10 +64496,16 @@ fn resolve_proj_expr(
             Box::new(resolve_proj_expr(a, columns, descs, sink)?),
             Box::new(resolve_proj_expr(b, columns, descs, sink)?),
         ),
-        RawExpr::Coalesce(v) => Expr::Coalesce(
-            v.iter()
-                .map(|a| resolve_proj_expr(a, columns, descs, sink))
-                .collect::<Option<Vec<_>>>()?,
+        // a FLOAT branch (CAST(? AS FLOAT)) beside a DOUBLE one widens to
+        // the common DOUBLE here too - resolve_expr's chain never sees a
+        // param-bearing conditional
+        RawExpr::Coalesce(v) => float_conditional(
+            Expr::Coalesce(
+                v.iter()
+                    .map(|a| resolve_proj_expr(a, columns, descs, sink))
+                    .collect::<Option<Vec<_>>>()?,
+            ),
+            descs,
         ),
         RawExpr::NullIf(a, b) => Expr::NullIf(
             Box::new(resolve_proj_expr(a, columns, descs, sink)?),
@@ -65710,6 +65927,73 @@ fn conditional_type<'a>(
 /// FLOAT and a DOUBLE differ in how they PRINT, never in how they
 /// compare or fold - so every arithmetic path asks this, and only
 /// `render` cares which it was.
+/// C's `%#.<p>g` of a non-negative finite double: `p` significant
+/// digits, trailing zeros KEPT and the point always written (`12.`),
+/// the exponent form when the decimal exponent is below -4 or at least
+/// `p` (`1.00e+30`, sign and two digits minimum).
+fn fmt_g_alt(x: f64, p: usize) -> String {
+    let p = p.max(1);
+    if x == 0.0 {
+        return if p > 1 { format!("0.{}", "0".repeat(p - 1)) } else { "0.".to_string() };
+    }
+    let sci = format!("{:.*e}", p - 1, x);
+    let (mant, exp) = sci.split_once('e').unwrap_or((sci.as_str(), "0"));
+    let exp: i32 = exp.parse().unwrap_or(0);
+    if exp < -4 || exp >= p as i32 {
+        let mant = if p == 1 { format!("{}.", mant) } else { mant.to_string() };
+        format!("{}e{}{:02}", mant, if exp < 0 { '-' } else { '+' }, exp.abs())
+    } else {
+        let decimals = (p as i32 - 1 - exp).max(0) as usize;
+        let s = format!("{:.*}", decimals, x);
+        if decimals == 0 { format!("{}.", s) } else { s }
+    }
+}
+
+/// An approximate value rendered into a text of `len` characters the way
+/// the engine's CVT_move does (cvt.cpp, double -> string): `%- #.*g` at
+/// 16 significant digits (8 for a FLOAT) with ONE column reserved for
+/// the sign; while the text does not fit, the precision loses the
+/// overflow and the render is retried; below two digits it is the
+/// 22003 *numeric value is out of range* (None). Measured: 1.1 into
+/// VARCHAR(5) '1.10', VARCHAR(9) '1.100000', VARCHAR(17)
+/// '1.10000000000000', VARCHAR(3) 22003; -1.5 into VARCHAR(9)
+/// '-1.500000'; 1e30 into VARCHAR(9) '1.00e+30', VARCHAR(7) 22003;
+/// 123456789.1234568 into VARCHAR(9) '1.23e+08', VARCHAR(11)
+/// '123456789.'; 12 into VARCHAR(4) '12.'; a FLOAT 1.1 into VARCHAR(4)
+/// '1.1', VARCHAR(3) 22003.
+fn approx_fit_text(x: f64, single: bool, len: usize) -> Option<String> {
+    let mut p: i64 = if single { 8 } else { 16 };
+    loop {
+        let body = fmt_g_alt(x.abs(), p as usize);
+        let width = body.len() + 1;
+        if width <= len {
+            // a NEGATIVE ZERO prints unsigned (measured: CAST(-DP ..) of a
+            // zero column is '0.000000000000000', never '-0.0..')
+            return Some(if x < 0.0 { format!("-{}", body) } else { body });
+        }
+        p -= (width - len) as i64;
+        if p < 2 {
+            return None;
+        }
+    }
+}
+
+/// An approximate value rendered for a STORE into the text column `d`:
+/// [approx_fit_text] into the column's byte length, then the character
+/// length checked (None = the engine's 22001, refused here). A FLOAT
+/// 0.499995 into a NONE VARCHAR(10) is '0.4999950' - 8 digits plus the
+/// sign column would be 11 (measured).
+fn approx_store_text(x: f64, single: bool, d: &Descriptor) -> Option<String> {
+    if !x.is_finite() {
+        return None;
+    }
+    let chars = fire_crab_ods::intl::char_length(d.dtype, d.length, d.sub_type as i16);
+    let bpc = fire_crab_ods::intl::bytes_per_char(fire_crab_ods::intl::charset_id(d.sub_type as i16)).max(1)
+        as usize;
+    let s = approx_fit_text(x, single, chars * bpc)?;
+    (s.chars().count() <= chars).then_some(s)
+}
+
 fn approx_of(v: &Value) -> Option<f64> {
     match v {
         Value::Double(d) => Some(*d),
@@ -65726,6 +66010,118 @@ fn approx_of(v: &Value) -> Option<f64> {
 /// double-rounding through 17 sig. A 16/17-digit coefficient is well
 /// under text_to_dec128's 34-sig fold, so no extra rounding happens
 /// there. Signed zero (`-0E-16`) and inf/NaN carry through the string.
+/// Is a CAST operand's approximate value SINGLE precision by the engine's
+/// runtime descriptor? The CVT epsilon follows that descriptor (eps_float
+/// 1e-5, else 1e-14), and DSQL casts a CASE / COALESCE / IIF over a FLOAT
+/// and a DOUBLE to the common DOUBLE before the CAST sees it - so a
+/// Value::Float leaking through such a node must NOT take the float
+/// epsilon (`CAST(COALESCE(fl, dp) AS INTEGER)` of 0.499995 is 0, as the
+/// engine answers, not 1). Only the shapes that KEEP the single width
+/// count: a column (a Value::Float comes from a REAL column alone), a bare
+/// CAST(.. AS FLOAT), and unary minus / ABS over one of those.
+fn approx_source_is_single(e: &Expr) -> bool {
+    match e {
+        Expr::Col(_) => true,
+        Expr::Cast(_, CastTarget::Float, _) => true,
+        Expr::Neg(x) => approx_source_is_single(x),
+        Expr::Func(SysFn::Abs, v) if v.len() == 1 => approx_source_is_single(&v[0]),
+        Expr::Func(SysFn::Round, v) if !v.is_empty() => approx_source_is_single(&v[0]),
+        // a conditional's FLOAT branches were widened at resolve when the
+        // engine's common type is DOUBLE ([float_conditional]), so a
+        // Value::Float reaching here from one is genuinely single
+        Expr::Coalesce(_) | Expr::Iif(..) | Expr::Case(..) | Expr::NullIf(..) => true,
+        _ => false,
+    }
+}
+
+/// Is an approximate expression SINGLE precision (SQL_FLOAT 482) by the
+/// engine's descriptor rules, measured: a FLOAT column, CAST(.. AS FLOAT),
+/// unary minus / ABS over one; a COALESCE / CASE / IIF whose every non-NULL
+/// branch is single or EXACT-numeric (a FLOAT beside INTEGER / BIGINT /
+/// NUMERIC(18,4) / INT128 / an exact literal stays FLOAT); NULLIF by its
+/// FIRST operand. Any DOUBLE branch (a DOUBLE column, a `0e0` literal,
+/// arithmetic - FLOAT arithmetic widens) makes the whole thing DOUBLE.
+fn approx_expr_single(e: &Expr, descs: &[Descriptor]) -> bool {
+    let branches_single = |bs: Vec<&Expr>| -> bool {
+        let mut seen = false;
+        for b in bs {
+            if matches!(b, Expr::Null) {
+                continue;
+            }
+            if approx_expr_single(b, descs) {
+                seen = true;
+            } else if !matches!(b.type_of(descs), Some(ExprType::Int | ExprType::Numeric)) {
+                return false;
+            }
+        }
+        seen
+    };
+    match e {
+        Expr::Col(fid) => descs.get(*fid).is_some_and(|d| d.dtype == dtype::REAL),
+        Expr::Cast(_, CastTarget::Float, _) => true,
+        Expr::Neg(x) => approx_expr_single(x, descs),
+        Expr::Func(SysFn::Abs, v) if v.len() == 1 => approx_expr_single(&v[0], descs),
+        // ROUND keeps its operand's width (measured 482 for ROUND(fl, 2));
+        // TRUNC / FLOOR / CEIL widen to DOUBLE
+        Expr::Func(SysFn::Round, v) if !v.is_empty() => approx_expr_single(&v[0], descs),
+        Expr::Coalesce(v) => branches_single(v.iter().collect()),
+        Expr::Iif(_, a, b) => branches_single(vec![&**a, &**b]),
+        Expr::Case(arms, els) => {
+            branches_single(arms.iter().map(|(_, t)| t).chain(els.iter().map(|b| &**b)).collect())
+        }
+        Expr::NullIf(a, _) => approx_expr_single(a, descs),
+        _ => false,
+    }
+}
+
+/// Wrap the SINGLE-precision branches of a conditional whose common type
+/// is DOUBLE in CAST(.. AS DOUBLE PRECISION), so the branch VALUE carries
+/// the width the engine gives it (DSQL casts every branch to the common
+/// type before anything downstream sees it). Without this a Value::Float
+/// leaked through a CTE / view column and `CAST(COALESCE(fl, dp) AS
+/// INTEGER)` of 0.499995 took the FLOAT epsilon (1) where the engine's
+/// DOUBLE descriptor answers 0. An all-FLOAT-or-exact conditional stays
+/// as it is (the engine describes it FLOAT).
+fn float_conditional(e: Expr, descs: &[Descriptor]) -> Expr {
+    // a DOUBLE branch: types Approx and is not single (a DOUBLE column, a
+    // `0e0` literal, CAST(.. AS DOUBLE PRECISION), arithmetic). Decided
+    // per BRANCH rather than from the node's type_of, which is None while
+    // a `?` branch (CAST(? AS FLOAT), bound only at execute) is untyped -
+    // that branch is single and still needs the widening.
+    let has_double = |bs: Vec<&Expr>| {
+        bs.iter().any(|b| {
+            b.type_of(descs) == Some(ExprType::Approx) && !approx_expr_single(b, descs)
+        })
+    };
+    let widen_needed = match &e {
+        Expr::Coalesce(v) => has_double(v.iter().collect()),
+        Expr::Iif(_, a, b) => has_double(vec![&**a, &**b]),
+        Expr::Case(arms, els) => {
+            has_double(arms.iter().map(|(_, t)| t).chain(els.iter().map(|b| &**b)).collect())
+        }
+        _ => false,
+    };
+    if !widen_needed {
+        return e;
+    }
+    let widen = |b: Expr| -> Expr {
+        if approx_expr_single(&b, descs) {
+            Expr::Cast(Box::new(b), CastTarget::Approx, fire_crab_ods::intl::CS_UTF8)
+        } else {
+            b
+        }
+    };
+    match e {
+        Expr::Coalesce(v) => Expr::Coalesce(v.into_iter().map(widen).collect()),
+        Expr::Iif(c, a, b) => Expr::Iif(c, Box::new(widen(*a)), Box::new(widen(*b))),
+        Expr::Case(arms, els) => Expr::Case(
+            arms.into_iter().map(|(c, t)| (c, widen(t))).collect(),
+            els.map(|b| Box::new(widen(*b))),
+        ),
+        other => other,
+    }
+}
+
 fn f64_to_dec(x: f64, sig: usize) -> Option<fire_crab_ods::decfloat::Dec> {
     // a zero converts to 0E-16 (signed) in BOTH widths - the engine's
     // decimal128 zero exponent, kept when narrowing to decimal64. The
@@ -65737,8 +66133,35 @@ fn f64_to_dec(x: f64, sig: usize) -> Option<fire_crab_ods::decfloat::Dec> {
             exp: -16,
         });
     }
-    text_to_dec128(&format!("{:.*e}", sig - 1, x))
-        .map(fire_crab_ods::decfloat::decode_dec128)
+    // The engine's Decimal128::set(double) AND Decimal64::set(double) BOTH
+    // start from the 17-significant-digit rendering (snprintf "%.16e");
+    // the decimal64 one then NARROWS 17 -> 16 in the decNumber context
+    // (HALF-UP, the session default) - a DOUBLE rounding, not a direct
+    // 16-digit format. The two differ whenever the 17-digit rendering ends
+    // in 5 while the exact binary sits below the 16-digit midpoint (about
+    // one double in twenty): 2^-23 = 1.1920928955078125e-7 renders
+    // ...8125E-7 at 17 digits and narrows UP to 1.192092895507813E-7,
+    // where "{:.15e}" (correctly rounded, half-even) gave ...812E-7.
+    // Verified against the engine on 7.2576582964629335, 9.61958083567592,
+    // 4.3392507574808175, 0.37661826488242445, 83.41949964394693.
+    let d17 = text_to_dec128(&format!("{:.16e}", x)).map(fire_crab_ods::decfloat::decode_dec128)?;
+    if sig >= 17 {
+        return Some(d17);
+    }
+    match d17 {
+        fire_crab_ods::decfloat::Dec::Finite { neg, coeff, exp } => {
+            let (mut c, mut e) = (coeff, exp);
+            let mut digits = c.to_string().len();
+            while digits > sig {
+                let (q, r) = (c / 10, c % 10);
+                c = if r >= 5 { q + 1 } else { q };
+                e += 1;
+                digits = c.to_string().len();
+            }
+            Some(fire_crab_ods::decfloat::Dec::Finite { neg, coeff: c, exp: e })
+        }
+        other => Some(other),
+    }
 }
 
 /// True when a CAST-to-DECFLOAT operand is a COMPILE-TIME-CONSTANT
@@ -65751,6 +66174,54 @@ fn f64_to_dec(x: f64, sig: usize) -> Option<fire_crab_ods::decfloat::Dec> {
 /// shape REFUSING rather than shipping the wrong 17-sig value - a
 /// separate follow-on. An intervening CAST(.. AS DOUBLE) defeats the fold
 /// (the engine then expands at runtime), so a Cast operand returns false.
+/// Is an approximate-valued expression a RUNTIME double to the engine -
+/// one whose value reaches a DECFLOAT store through
+/// Decimal128/64::set(double), 17 / 16 digits, which is what this
+/// server's store path does with a double? An approximate COLUMN; a
+/// CAST to DOUBLE PRECISION / FLOAT (evaluated at runtime - a bound
+/// double included, [param_to_expr] wraps it so); unary minus or
+/// arithmetic over one (DOUBLE arithmetic, with a literal beside it or
+/// not). NOT: an exponent literal or arithmetic over literals alone (the
+/// engine stores the literal's TEXT: 1E+200 stays 1E+200, 1.5E-398
+/// stores 2E-398, 0.1E0 stores 0.1); a conditional (COALESCE(dp, 0)
+/// stores the engine's DOUBLE 0E-16 for a NULL row where this value is
+/// the exact 0); ROUND / TRUNC / FLOOR / CEIL and every other function
+/// (evlRound's value is an EXACT int64-scaled number: ROUND(dp, 2)
+/// stores 2.68, not 2.6800000000000002 - and so does -ROUND(dp, 2) or
+/// ROUND(dp, 2) * 1, which is why a function under a minus or an
+/// operator answers false too); a subquery, a lookup. Everything not
+/// listed refuses at the DECFLOAT store, recorded.
+fn approx_runtime_expr(e: &Expr) -> bool {
+    match e {
+        Expr::Col(_) => true,
+        Expr::Cast(_, CastTarget::Approx | CastTarget::Float, _) => true,
+        Expr::Neg(x) => approx_runtime_expr(x),
+        Expr::Bin(a, _, b) => {
+            let (ra, rb) = (approx_runtime_expr(a), approx_runtime_expr(b));
+            let exact_or_runtime = |x: &Expr, r: bool| {
+                r || matches!(x, Expr::Int(_) | Expr::Int128(_) | Expr::Dec(..) | Expr::Double(_))
+            };
+            (ra || rb) && exact_or_runtime(a, ra) && exact_or_runtime(b, rb)
+        }
+        _ => false,
+    }
+}
+
+/// Does an INSERT .. SELECT land an approximate source value that is NOT
+/// a runtime double ([approx_runtime_expr]) in a DECFLOAT column? A
+/// plain source column is runtime; a literal, a function, a conditional
+/// in the select list is not - refused at prepare, recorded.
+fn approx_source_into_decfloat(src: &Plan, listed: &[usize], descs: &[Descriptor]) -> bool {
+    let cols = output_cols_of(src);
+    listed.iter().enumerate().any(|(i, fid)| {
+        descs.get(*fid).is_some_and(|d| matches!(d.dtype, dtype::DEC64 | dtype::DEC128))
+            && cols.get(i).is_some_and(|c| {
+                matches!(c.wire, Wire::Double | Wire::Float)
+                    && !c.expr.as_ref().map_or(true, approx_runtime_expr)
+            })
+    })
+}
+
 fn approx_const_fold(e: &Expr) -> bool {
     // Some(has_approx_literal) for a pure constant built from numeric
     // literals + Neg/Bin; None as soon as a column/param/cast/anything
@@ -67750,7 +68221,8 @@ fn value_to_wireparam(v: &Value) -> Option<WireParam> {
         Value::Int(n) => WireParam::Int(*n, 0),
         Value::Scaled(r, sc) => WireParam::Int(*r, *sc),
         Value::Text(t) => WireParam::Text(t.clone()),
-        Value::Double(_) | Value::Float(_) => WireParam::Double(approx_of(v)?),
+        Value::Double(x) => WireParam::Double(*x),
+        Value::Float(f) => WireParam::Single(*f),
         Value::Bool(b) => WireParam::Bool(*b),
         Value::Date(d) => WireParam::Date(*d),
         Value::Time(t) => WireParam::Time(*t),
@@ -68125,7 +68597,7 @@ impl Expr {
                         ColKind::Numeric
                         | ColKind::Temporal(_)
                         | ColKind::Approx
-                        | ColKind::DecFloat
+                        | ColKind::DecFloat { .. }
                         | ColKind::Bool,
                     ) => None,
                     None if is_numeric_col(d) => Some(ExprType::Numeric),
@@ -69014,6 +69486,10 @@ impl Expr {
                 None => Value::Null,
             },
             // the first operand that is not NULL; NULL when all are
+            // a conditional over a FLOAT and a DOUBLE branch had its FLOAT
+            // branches wrapped in CAST(.. AS DOUBLE PRECISION) at resolve
+            // ([float_conditional]), so the value here already carries the
+            // width the engine's common type gives it
             Expr::Coalesce(args) => {
                 let mut out = Value::Null;
                 for a in args {
@@ -69726,10 +70202,21 @@ impl Expr {
                             // width test, so a double past the target is
                             // out of range too (probed: 1.23e30 is 22003)
                             v if approx_of(&v).is_some() => {
-                                let r = approx_of(&v).unwrap_or(0.0).round();
-                                if !r.is_finite() {
+                                // half away from zero WITH the CVT 1e-14
+                                // epsilon (cvt.cpp), then truncate - so
+                                // 0.49999999999999994 is 1, as the engine
+                                // answers, not 0 (the NUMERIC arm and the
+                                // store path pin the same constant)
+                                let x = approx_of(&v).unwrap_or(0.0);
+                                if !x.is_finite() {
                                     return Err(EvalErr::ConversionError(None));
                                 }
+                                let eps = if matches!(v, Value::Float(_)) && approx_source_is_single(e) {
+                                    1e-5
+                                } else {
+                                    1e-14
+                                };
+                                let r = if x > 0.0 { x + 0.5 + eps } else { x - 0.5 - eps }.trunc();
                                 if r.abs() >= 1.701_411_834_604_692_3e38 {
                                     return Err(EvalErr::NumericOutOfRange);
                                 }
@@ -69782,7 +70269,11 @@ impl Expr {
                         // VARCHAR(5)) is 22001, not 22018)
                         let is_numeric_src = matches!(
                             v,
-                            Value::Int(_) | Value::Scaled(..) | Value::Int128(..) | Value::Double(_)
+                            Value::Int(_)
+                                | Value::Scaled(..)
+                                | Value::Int128(..)
+                                | Value::Double(_)
+                                | Value::Float(_)
                         );
                         let s = match v {
                             Value::Bool(b) => {
@@ -69798,6 +70289,47 @@ impl Expr {
                                 if fire_crab_ods::tz::displacement(z).is_none() =>
                             {
                                 return Err(EvalErr::Unsupported)
+                            }
+                            // an APPROXIMATE source renders the way the
+                            // engine's CVT does into a BOUNDED text:
+                            // `%#.*g` at 16 digits (8 for a FLOAT) with a
+                            // sign column reserved, the precision cut by
+                            // the overflow and retried while it does not
+                            // fit, 22003 below two digits
+                            // ([approx_fit_text]). CAST(1.1e0 AS
+                            // VARCHAR(10)) is '1.1000000', VARCHAR(17) is
+                            // '1.10000000000000' (15 digits: the sign
+                            // column), 1e30 into VARCHAR(9) '1.00e+30';
+                            // the old fixed 16-digit render raised 22018
+                            // for every one of them.
+                            // The fit is into the target's BYTE length -
+                            // `len` characters of the target charset (the
+                            // attachment's for an unqualified cast) - and
+                            // the CHARACTER length is checked after, as
+                            // the engine's CVT does: under UTF8 a
+                            // VARCHAR(9) is 36 bytes, so CAST(FL AS
+                            // VARCHAR(9)) keeps all 8 digits ('1.1000000'),
+                            // and VARCHAR(6) fits the full 16-digit render
+                            // into 24 bytes and then raises 22001 on its
+                            // 17 characters (measured both).
+                            Value::Double(_) | Value::Float(_) if approx_of(&v).is_some_and(f64::is_finite) => {
+                                let x = approx_of(&v).unwrap_or(0.0);
+                                let single = matches!(v, Value::Float(_));
+                                let cs_of_len = match target_cs {
+                                    Some(d) => *d,
+                                    None => CURRENT_ATT_CS.with(|c| c.get()),
+                                };
+                                let bpc = fire_crab_ods::intl::bytes_per_char(cs_of_len).max(1) as usize;
+                                let fitted = approx_fit_text(x, single, *len * bpc)
+                                    .ok_or(EvalErr::NumericOutOfRange)?;
+                                let n = fitted.chars().count();
+                                if n > *len {
+                                    return Err(EvalErr::StringTruncation {
+                                        expected: *len as i64,
+                                        actual: n as i64,
+                                    });
+                                }
+                                fitted
                             }
                             _ => v.render(),
                         };
@@ -69982,7 +70514,30 @@ impl Expr {
                                         _ => (scaled.round() as i128, *scale),
                                     }
                                 } else {
-                                    (scaled.round() as i128, *scale)
+                                    // the engine's CVT rounding (cvt.cpp):
+                                    // scale, add 0.5 plus its 1e-14 epsilon
+                                    // away from zero, truncate - the fudge
+                                    // that lands the .xx5 binary edge the
+                                    // decimal way. `CAST(1.005e0 AS
+                                    // NUMERIC(9,2))` is 1.01 (100.4999.. +
+                                    // 0.5 + 1e-14 truncates to 101), where a
+                                    // bare .round() gave 1.00; the store
+                                    // path and ROUND pin the same constant.
+                                    // eps_float 1e-5 for a FLOAT source,
+                                    // 1e-14 for a DOUBLE (cvt.cpp, as ROUND)
+                                    let eps = if matches!(v, Value::Float(_))
+                                        && approx_source_is_single(e)
+                                    {
+                                        1e-5
+                                    } else {
+                                        1e-14
+                                    };
+                                    let adjusted = if scaled > 0.0 {
+                                        scaled + 0.5 + eps
+                                    } else {
+                                        scaled - 0.5 - eps
+                                    };
+                                    (adjusted.trunc() as i128, *scale)
                                 }
                             }
                             // a DECFLOAT source rounds HALF AWAY FROM ZERO
@@ -70898,6 +71453,14 @@ impl Expr {
                                     } else {
                                         1e-14
                                     };
+                                    // ROUND over a FLOAT DESCRIBES as FLOAT
+                                    // (482, [approx_expr_single]) but its
+                                    // runtime VALUE is the engine's exact
+                                    // int64-scaled result (evlRound ->
+                                    // makeInt64): `round(fl, 2) = 2.68` is
+                                    // TRUE and `round(fl, 2) + 1` is exactly
+                                    // 3.68 - so the value stays the exact
+                                    // double, never narrowed to f32
                                     round_double(x, -places, eps)?
                                 }
                                 RndMode::Trunc => {
@@ -71413,7 +71976,22 @@ fn dml_subq_literal(v: &Value) -> Option<String> {
         if !d.is_finite() {
             return None;
         }
-        return Some(format!("CAST('{}' AS DOUBLE PRECISION)", d));
+        // the EXPONENT spelling: the plain `{}` of 3.4e38 is a 39-digit
+        // integer text and of 1e-30 a 32-decimal one, and the literal
+        // re-parse folded either as an exact numeric and overflowed
+        // INT128 - a FLOAT source of 3.4e38 (or 1e-30) refused the whole
+        // INSERT .. SELECT. `{:e}` is the CVT grammar's own form.
+        return Some(format!("CAST('{:e}' AS DOUBLE PRECISION)", d));
+    }
+    // a FLOAT likewise travels as a typed cast, spelled at its WIDENED
+    // f64 - rendered bare it read back as the scaled numeric 2.675, and a
+    // DOUBLE destination then stored that decimal where the engine
+    // stores the single's binary value 2.674999952316284
+    if let Value::Float(f) = v {
+        if !f.is_finite() {
+            return None;
+        }
+        return Some(format!("CAST('{:e}' AS FLOAT)", *f as f64));
     }
     psql_literal(v).or_else(|| value_literal(v))
 }
@@ -72246,7 +72824,12 @@ fn corr_literal(v: &Value, d: &Descriptor) -> Option<String> {
             if !x.is_finite() {
                 return None;
             }
-            format!("CAST('{:e}' AS FLOAT)", x)
+            // spelled at the WIDENED f64 (2.674999952316284, not the f32's
+            // shortest 2.675): the FLOAT re-parse lands on the same single
+            // either way, but a DOUBLE destination fed through this text
+            // stored the decimal 2.675 where the engine stores the
+            // binary value 2.674999952316284
+            format!("CAST('{:e}' AS FLOAT)", *x as f64)
         }
         // an INT128 magnitude or a scaled one has no literal spelling of
         // its own that every parser reads at its width: it travels as a
@@ -73195,7 +73778,33 @@ fn fold_dml_subqueries(
             "NULL".to_string()
         } else {
             let v = rows.values.first().cloned().unwrap_or(Value::Null);
-            dml_subq_literal(&v)?
+            // an approximate answer that is NOT a runtime double to the
+            // engine - the subquery selects a literal, a ROUND, a
+            // conditional ([approx_runtime_expr]) - is spelled as the
+            // BARE literal it is, so the DML planner sees a constant and
+            // a DECFLOAT column refuses it ([InsVal::ApproxConst]) rather
+            // than store the double's digits; every other destination
+            // reads the same value either way
+            let runtime = match &v {
+                Value::Double(_) | Value::Float(_) => {
+                    let mut sink: Vec<Option<Descriptor>> = Vec::new();
+                    plan_query_inner(sub, db_opt, &mut sink).map_or(true, |sp| {
+                        output_cols_of(&sp)
+                            .first()
+                            .map_or(true, |c| c.expr.as_ref().map_or(true, approx_runtime_expr))
+                    })
+                }
+                _ => true,
+            };
+            if runtime {
+                dml_subq_literal(&v)?
+            } else {
+                match &v {
+                    Value::Double(x) if x.is_finite() => format!("{:e}", x),
+                    Value::Float(f) if f.is_finite() => format!("{:e}", *f as f64),
+                    _ => return None,
+                }
+            }
         };
         out = out.replace(&format!("{}{}", SUBQ_MARK, i), &lit);
     }
@@ -78589,7 +79198,9 @@ enum ColKind {
     /// a DECFLOAT(16/34) parameter target - a binding marker only. The
     /// bound value (an integer, decimal or text the driver sends) promotes
     /// to decimal128 for the comparison, as the engine coerces it.
-    DecFloat,
+    /// `wide` = DECFLOAT(34) (a DECFLOAT(16) target converts a bound
+    /// DOUBLE at 16 significant digits, a DECFLOAT(34) one at 17)
+    DecFloat { wide: bool },
     /// a BOOLEAN parameter target - a binding marker only
     Bool,
 }
@@ -80712,11 +81323,34 @@ fn type_markers_in_sets(
         }
         let col = merge_target_col(part[..eq].trim(), columns, tgt_alias)?;
         let d = descs.get(col.field_id as usize)?.clone();
+        if !merge_decfloat_marker_ok(&d, &part[eq + 1..]) {
+            return None;
+        }
         for slot in slots {
             set_marker_desc(params, slot, d.clone())?;
         }
     }
     Some(())
+}
+
+/// A marker aimed at a DECFLOAT column is written into the per-row
+/// statement as a LITERAL of the bound value; inside an EXPRESSION that
+/// loses the engine's rule (the slot is typed from the expression's own
+/// context and the driver's value converts THERE, before the decimal
+/// arithmetic - `COALESCE(?, 0)` [1.1] stores 1, `? * 3` [0.1] stores
+/// 0.30000000000000003, `? / 3` [2] is the decimal 0.666...7), so only a
+/// BARE marker is admitted for such a column - the same refuse the
+/// INSERT and UPDATE arms make. A bare marker's literal takes the
+/// runtime store path.
+fn merge_decfloat_marker_ok(d: &Descriptor, value: &str) -> bool {
+    if d.dtype != dtype::DEC64 && d.dtype != dtype::DEC128 {
+        return true;
+    }
+    let v = value.trim();
+    match v.strip_prefix(MERGE_PARAM_MARK) {
+        Some(rest) => !rest.is_empty() && rest.bytes().all(|c| c.is_ascii_digit()),
+        None => marker_slots(v).is_empty(),
+    }
 }
 
 /// Type every marker in an `INSERT` branch's value list: by POSITION
@@ -80752,6 +81386,9 @@ fn type_markers_in_values(
             continue;
         }
         let d = descs.get(col.field_id as usize)?.clone();
+        if !merge_decfloat_marker_ok(&d, item) {
+            return None;
+        }
         for slot in slots {
             set_marker_desc(params, slot, d.clone())?;
         }
@@ -80846,6 +81483,21 @@ fn mentions_qualifier(text: &str, alias: &str) -> bool {
     false
 }
 
+/// Is the token at `text[start..end]` the WHOLE value of a SET item or a
+/// VALUES item? The clause texts this sees are a SET list (`D = SRC.F, N
+/// = SRC.N`) and a bare VALUES list (`SRC.ID, SRC.F`), so a whole value
+/// is preceded (blanks aside) by `=`, `,` or the start of the text and
+/// followed by `,` or its end. `SET D = SRC.F` and `SRC.ID, SRC.F` are;
+/// `IIF(SRC.F = 1.1, ..)`, `ROUND(SRC.F, 2)`, `SRC.F + 1`, `SET B = SRC.F
+/// = 2`, `(SRC.F)` are not - a parenthesis on either side is a function
+/// argument or an expression, never a value position here.
+fn bare_value_position(text: &str, start: usize, end: usize) -> bool {
+    let before = text[..start].trim_end();
+    let after = text[end..].trim_start();
+    (before.is_empty() || matches!(before.chars().last(), Some('=' | ',')))
+        && (after.is_empty() || after.starts_with(','))
+}
+
 /// Substitute the SOURCE alias's column references in a MERGE clause
 /// with the current source row's values as literals, and strip the
 /// TARGET alias's qualifier (the per-row statement runs over the target
@@ -80859,6 +81511,29 @@ fn merge_subst(
     // the target TABLE, which the per-row statement names unaliased
     target: &str,
     args: &[WireParam],
+    // per SOURCE column: is its value a RUNTIME approximate to the engine
+    // ([approx_runtime_expr] of the source's select-list expression; a
+    // plain column is)? Only such a value is spelled as its TYPED cast
+    // (below); a literal or a function column stays a bare literal, so
+    // the planner sees the constant it is and a DECFLOAT column refuses
+    // it ([InsVal::ApproxConst]) rather than store the double's digits.
+    src_runtime: &[bool],
+    // WHERE a runtime DOUBLE / FLOAT source value is spelled as its TYPED
+    // cast ([dml_subq_literal]) rather than a bare exponent literal:
+    //   0 - never: a WHEN .. AND condition. A FLOAT compared with a
+    //       decimal literal (SRC.FL = 2.675) is TRUE in the engine's
+    //       SINGLE-precision compare; this server compares in double, and
+    //       the bare shortest text (2.675e0) is what still agrees.
+    //   1 - in a BARE VALUE POSITION only (`SET col = SRC.FL`, a VALUES
+    //       item): the assignment is where the width matters - a FLOAT
+    //       spelled at its shortest text stored 1.1000000000000001 into a
+    //       DECFLOAT where the engine converts the widened single
+    //       (1.1000000238418579) - while inside an expression (IIF(SRC.FL
+    //       = 1.1, ..)) the compare rule above wins.
+    //   2 - always: the ON predicate, where `T.F = SRC.FL` must compare
+    //       the single's own value (bare 1.1e0 matched no non-integer
+    //       FLOAT row).
+    typed_mode: u8,
 ) -> Result<String, String> {
     let b = text.as_bytes();
     let masked = mask_literals(&text.to_ascii_uppercase());
@@ -80942,8 +81617,17 @@ fn merge_subst(
                         .iter()
                         .position(|n| *n == col)
                         .ok_or_else(|| format!("no column {} in the MERGE source", col))?;
-                    let lit = psql_literal(&row[idx])
-                        .ok_or_else(|| format!("a source value of {} cannot be written as a literal", col))?;
+                    let typed = src_runtime.get(idx).copied().unwrap_or(true)
+                        && match typed_mode {
+                            2 => true,
+                            1 => bare_value_position(text, start, j),
+                            _ => false,
+                        };
+                    let lit = match &row[idx] {
+                        Value::Double(_) | Value::Float(_) if typed => dml_subq_literal(&row[idx]),
+                        other => psql_literal(other),
+                    }
+                    .ok_or_else(|| format!("a source value of {} cannot be written as a literal", col))?;
                     out.push_str(&lit);
                     i = j;
                     continue;
@@ -81010,7 +81694,7 @@ fn merge_exec(
         return Err("not a MERGE plan".into());
     };
     // the source rows, and the names their values answer to
-    let (rows, src_cols) = {
+    let (rows, src_cols, src_runtime) = {
         let (splan, _) = plan_query(source_sql, database);
         if let Plan::RefusedEval(e) = &splan {
             return Err(ExecErr::Eval(e.clone()));
@@ -81018,8 +81702,38 @@ fn merge_exec(
         let db = database.as_ref().ok_or("no database attached")?;
         let rows = branch_rows(&splan, db, args)
             .ok_or("the MERGE source is not one this server can run")?;
-        let cols: Vec<String> = output_cols_of(&splan).iter().map(|c| c.name.clone()).collect();
-        (rows, cols)
+        let ocols = output_cols_of(&splan);
+        let cols: Vec<String> = ocols.iter().map(|c| c.name.clone()).collect();
+        // per source column: a RUNTIME approximate ([approx_runtime_expr])?
+        // The source is `SELECT * FROM <item> <alias>`; a DERIVED-TABLE
+        // item hides its select list behind that star (every outer column
+        // is a plain column of the derived relation), so the item's own
+        // SELECT is planned once more to read the expressions. A source
+        // that cannot be seen through answers false: its approximate
+        // values are spelled bare and a DECFLOAT column refuses them.
+        let runtime: Vec<bool> = match source_sql.strip_prefix("SELECT * FROM (") {
+            Some(rest) => {
+                let inner = rest.rfind(')').map(|i| &rest[..i]).unwrap_or("");
+                let mut sink: Vec<Option<Descriptor>> = Vec::new();
+                match plan_query_inner(inner, database, &mut sink) {
+                    Some(ip) => {
+                        let icols = output_cols_of(&ip);
+                        ocols
+                            .iter()
+                            .map(|c| {
+                                icols
+                                    .iter()
+                                    .find(|ic| ic.name == c.name)
+                                    .is_some_and(|ic| ic.expr.as_ref().map_or(true, approx_runtime_expr))
+                            })
+                            .collect()
+                    }
+                    None => vec![false; ocols.len()],
+                }
+            }
+            None => ocols.iter().map(|c| c.expr.as_ref().map_or(true, approx_runtime_expr)).collect(),
+        };
+        (rows, cols, runtime)
     };
     // the target's primary key, for a per-row identity predicate
     let (rel, pk_cols, rel_cols) = {
@@ -81039,8 +81753,10 @@ fn merge_exec(
     let mut pairs: Vec<(String, Vec<(u64, Vec<u8>, u8)>)> = Vec::new();
     let mut touched: std::collections::HashSet<u64> = std::collections::HashSet::new();
     for row in &rows {
-        let sub = |t: &str| merge_subst(t, src_alias, &src_cols, row, tgt_alias, target, args);
-        let on_s = sub(on)?;
+        let sub = |t: &str, mode: u8| {
+            merge_subst(t, src_alias, &src_cols, row, tgt_alias, target, args, &src_runtime, mode)
+        };
+        let on_s = sub(on, 2)?;
         let probe = format!("DELETE FROM {} WHERE {}", render_canon_ref(target), on_s);
         let (dplan, _) = plan_delete(&probe, database)
             .ok_or_else(|| format!("the MERGE ON clause is outside this server's surface: {}", probe))?;
@@ -81143,14 +81859,16 @@ fn merge_exec(
     let null_row: Vec<Value> = vec![Value::Null; src_cols.len()];
     for identity in &orphans {
         let step = (|| -> Result<(), ExecErr> {
-            let sub = |t: &str| merge_subst(t, src_alias, &src_cols, &null_row, tgt_alias, target, args);
+            let sub = |t: &str, mode: u8| {
+                merge_subst(t, src_alias, &src_cols, &null_row, tgt_alias, target, args, &src_runtime, mode)
+            };
             for (cond, action) in by_source {
                 let mut where_ = identity.clone();
                 if let Some(c) = cond {
-                    where_ = format!("({}) AND ({})", where_, sub(c)?);
+                    where_ = format!("({}) AND ({})", where_, sub(c, 0)?);
                 }
                 let (sql, kind) = match action {
-                    MergeAction::Update(sets) => (format!("UPDATE {} SET {} WHERE {}", render_canon_ref(target), sub(sets)?, where_), 1),
+                    MergeAction::Update(sets) => (format!("UPDATE {} SET {} WHERE {}", render_canon_ref(target), sub(sets, 1)?, where_), 1),
                     MergeAction::Delete => (format!("DELETE FROM {} WHERE {}", render_canon_ref(target), where_), 2),
                 };
                 // FOLD the branch's SET / condition subqueries against
@@ -81189,7 +81907,9 @@ fn merge_exec(
     }
     for (row, (on_s, targets)) in rows.iter().zip(pairs) {
         let step = (|| -> Result<(), ExecErr> {
-            let sub = |t: &str| merge_subst(t, src_alias, &src_cols, row, tgt_alias, target, args);
+            let sub = |t: &str, mode: u8| {
+                merge_subst(t, src_alias, &src_cols, row, tgt_alias, target, args, &src_runtime, mode)
+            };
             if targets.is_empty() {
                 for (cond, cols, vals) in not_matched {
                     // INSERT ... SELECT <values> FROM RDB$DATABASE [WHERE <cond>]:
@@ -81198,12 +81918,12 @@ fn merge_exec(
                     // names the source alone here - is its WHERE; no row
                     // selected is "the condition did not hold"
                     let where_ = match cond {
-                        Some(c) => format!(" WHERE {}", sub(c)?),
+                        Some(c) => format!(" WHERE {}", sub(c, 0)?),
                         None => String::new(),
                     };
                     let sql = match cols {
-                        Some(c) => format!("INSERT INTO {} ({}) SELECT {} FROM RDB$DATABASE{}", render_canon_ref(target), c, sub(vals)?, where_),
-                        None => format!("INSERT INTO {} SELECT {} FROM RDB$DATABASE{}", render_canon_ref(target), sub(vals)?, where_),
+                        Some(c) => format!("INSERT INTO {} ({}) SELECT {} FROM RDB$DATABASE{}", render_canon_ref(target), c, sub(vals, 1)?, where_),
+                        None => format!("INSERT INTO {} SELECT {} FROM RDB$DATABASE{}", render_canon_ref(target), sub(vals, 1)?, where_),
                     };
                     let (iplan, _) = {
                         let _g = start_image.clone().map(SubqImageGuard::arm);
@@ -81257,11 +81977,11 @@ fn merge_exec(
                 for (cond, action) in matched {
                     let mut where_ = identity.clone();
                     if let Some(c) = cond {
-                        where_ = format!("({}) AND ({})", where_, sub(c)?);
+                        where_ = format!("({}) AND ({})", where_, sub(c, 0)?);
                     }
                     let (sql, kind) = match action {
                         MergeAction::Update(sets) => {
-                            (format!("UPDATE {} SET {} WHERE {}", render_canon_ref(target), sub(sets)?, where_), 1)
+                            (format!("UPDATE {} SET {} WHERE {}", render_canon_ref(target), sub(sets, 1)?, where_), 1)
                         }
                         MergeAction::Delete => (format!("DELETE FROM {} WHERE {}", render_canon_ref(target), where_), 2),
                     };
@@ -86859,7 +87579,11 @@ fn decfloat_term(
                 params.resize(slot + 1, None);
             }
             params[slot] = Some(d.clone());
-            Term::NumCmp(idx, op, Rhs::Param(slot, ColKind::DecFloat))
+            Term::NumCmp(
+                idx,
+                op,
+                Rhs::Param(slot, ColKind::DecFloat { wide: d.dtype == dtype::DEC128 }),
+            )
         }
         // a TEXT literal converts to decimal128 by the engine's decNumber
         // grammar; a non-convertible one raises 22018 PER ROW (UNKNOWN over
@@ -87560,7 +88284,11 @@ fn resolve_having(
                             // rather than mis-decode.
                             RawKind::Cmp(op, Rhs::Param(slot, _)) => {
                                 let d = ad.clone()?;
-                                if d.dtype == dtype::INT128 || !param_target_ok(&d) {
+                                if d.dtype == dtype::INT128
+                                    || d.dtype == dtype::DEC64
+                                    || d.dtype == dtype::DEC128
+                                    || !param_target_ok(&d)
+                                {
                                     return None;
                                 }
                                 if params.len() <= slot {
@@ -108759,7 +109487,7 @@ mod tests {
         // was cut into `u."a"` plus a stray `b"` and the MERGE refused
         let src = ["ID".to_string(), "a\"b".to_string()];
         let row = [Value::Int(1), Value::Int(111)];
-        let sub = |t: &str| merge_subst(t, "D", &src, &row, "T", "T", &[]).unwrap();
+        let sub = |t: &str| merge_subst(t, "D", &src, &row, "T", "T", &[], &[], 1).unwrap();
         assert_eq!(sub("V = D.\"a\"\"b\""), "V = 111");
         assert_eq!(sub("T.\"a\"\"b\" = D.\"a\"\"b\""), "\"a\"\"b\" = 111");
         assert_eq!(sub("D.\"a\"\"b\" > 900"), "111 > 900");
@@ -108773,7 +109501,7 @@ mod tests {
     fn merge_subst_leaves_a_qualifier_the_subquery_s_own_from_binds() {
         let src = ["ID".to_string(), "NM".to_string()];
         let row = [Value::Int(1), Value::Text("one".into())];
-        let sub = |t: &str| merge_subst(t, "D", &src, &row, "T", "T", &[]).unwrap();
+        let sub = |t: &str| merge_subst(t, "D", &src, &row, "T", "T", &[], &[], 1).unwrap();
         // the source row, outside any subquery (where the target's own
         // reference is the per-row statement's bare column)
         assert_eq!(sub("D.ID = T.ID"), "1 = ID");
@@ -108788,12 +109516,12 @@ mod tests {
         assert_eq!(sub("S = (SELECT NM FROM D x WHERE x.ID = D.ID)"), "S = (SELECT NM FROM D x WHERE x.ID = 1)");
         // an aliased target: `TG.ID` inside a span becomes the table's own
         // qualifier - unless the span binds TG itself
-        let subt = |t: &str| merge_subst(t, "D", &src, &row, "TG", "T", &[]).unwrap();
+        let subt = |t: &str| merge_subst(t, "D", &src, &row, "TG", "T", &[], &[], 1).unwrap();
         assert_eq!(subt("S = (SELECT NM FROM D x WHERE x.ID = TG.ID)"), "S = (SELECT NM FROM D x WHERE x.ID = T.ID)");
         assert_eq!(subt("A = (SELECT COUNT(*) FROM E TG WHERE TG.TID = D.ID)"), "A = (SELECT COUNT(*) FROM E TG WHERE TG.TID = 1)");
         // the target named unaliased beside an aliased target reference
         // still refuses (no spelling reaches the outer row)
-        assert!(merge_subst("S = (SELECT S FROM T WHERE T.ID = TG.ID)", "D", &src, &row, "TG", "T", &[]).is_err());
+        assert!(merge_subst("S = (SELECT S FROM T WHERE T.ID = TG.ID)", "D", &src, &row, "TG", "T", &[], &[], 1).is_err());
     }
 
     #[test]

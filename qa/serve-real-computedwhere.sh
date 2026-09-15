@@ -83,11 +83,14 @@ echo "-- regression: the bare projection and its describe are unchanged --"
 agree "bare c1..c5 describe" "select c1,c2,c3,c4,c5 from t where 1=0;"
 agree "bare c1 rows"        "select c1 from t order by a;"
 agree "bare c3 text rows"   "select c3 from t order by s;"
-echo "-- deferred contexts still REFUSE (law-safe, recorded follow-on) --"
-refuses "SUM(c1) aggregate"  "select sum(c1) s from t;"
-refuses "MAX(c1) aggregate"  "select max(c1) m from t;"
-refuses "ORDER BY c1 (not in list)" "select a from t order by c1;"
-refuses "GROUP BY c1"        "select c1, count(*) n from t group by c1;"
+echo "-- the once-deferred contexts, answered since the computedagg chunk (2026-09-12) --"
+# these four asserted a REFUSE until 2026-09-14; the computedagg chunk made
+# them agree with the engine and this gate was never updated (a sweep that
+# skipped it hid the stale assertion) - now compared as answers
+agree "SUM(c1) aggregate"  "select sum(c1) s from t;"
+agree "MAX(c1) aggregate"  "select max(c1) m from t;"
+agree "ORDER BY c1 (not in list)" "select a from t order by c1;"
+agree "GROUP BY c1"        "select c1, count(*) n from t group by c1;"
 
 kill $srv 2>/dev/null; wait $srv 2>/dev/null; trap - EXIT
 [ $fail = 0 ] && echo "PASS computedwhere" || echo "FAIL computedwhere"

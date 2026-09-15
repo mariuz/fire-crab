@@ -631,6 +631,13 @@ pub fn add(a: &Dec, b: &Dec) -> Dec {
     da.extend(std::iter::repeat(b'0').take((ea - e) as usize));
     let mut db = cb;
     db.extend(std::iter::repeat(b'0').take((eb - e) as usize));
+    // the aligned strings must carry NO leading zeros: a zero operand
+    // padded to "0000" beside "5" compared LONGER, so the length-first
+    // ucmp called it the larger magnitude and the subtraction ran
+    // backwards - `-0.5 + 0` answered 9.5 (and SUM of a lone -0.5, which
+    // starts from a zero accumulator, likewise)
+    let da = strip0(da);
+    let db = strip0(db);
     let (sign, mag) = if na == nb {
         (na, uadd(&da, &db))
     } else {
@@ -722,10 +729,40 @@ pub fn round_to_dec16_of(bits128: u128) -> Option<u64> {
 /// coefficient leaves the exponent above 369 (adjusted exponent past
 /// emax 384, e.g. `1E+385`), the value overflows and this returns None.
 pub fn fit_dec64(neg: bool, coeff: u128, exp: i32) -> Option<u64> {
-    let (mut c, mut e) = match round_to_dec16(neg, coeff, exp) {
-        Dec::Finite { coeff, exp, .. } => (coeff, exp),
-        _ => return None,
-    };
+    // ONE rounding, at the digit position the format can carry: 16
+    // significant digits, OR fewer when the exponent would fall below
+    // decimal64's minimum -398 (emin -383 minus 15) and the value is
+    // SUBNORMAL - the coefficient loses the digits the exponent cannot
+    // carry and the exponent clamps to -398. HALF-UP, from the ORIGINAL
+    // digits: rounding to 16 first and then to the subnormal position
+    // rounded twice ('1.234567894999999999E-390' -> 1.2345678950E-390 ->
+    // 1.23456790E-390 where the engine's single decNumber rounding gives
+    // 1.23456789E-390). The engine does not trap underflow: '1.5E-398'
+    // stores 2E-398, '1e-400' and '0E-500' store 0E-398. Encoding a lower
+    // exponent garbled the combination field (8.000000000000001E-129).
+    let ndigits = coeff.to_string().len() as i32;
+    let e16 = exp + (ndigits - 16).max(0);
+    let target = e16.max(-398);
+    let (mut c, mut e) = (coeff, exp);
+    if target > exp {
+        let drop = (target - exp) as u32;
+        c = match 10u128.checked_pow(drop) {
+            Some(p) => {
+                let (q, r) = (c / p, c % p);
+                if r * 2 >= p { q + 1 } else { q }
+            }
+            None => 0,
+        };
+        e = target;
+        // a carry past 16 digits (9999999999999999|5 -> 10^16) renormalises
+        if c == 10u128.pow(16) {
+            c /= 10;
+            e += 1;
+        }
+    } else if e < -398 {
+        // a zero (or short) coefficient below the floor just clamps
+        e = -398;
+    }
     while e > 369 && c <= 999_999_999_999_999 {
         c *= 10;
         e -= 1;
