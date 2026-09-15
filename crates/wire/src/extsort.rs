@@ -87,6 +87,11 @@ pub fn encode_row(row: &[Value], out: &mut Vec<u8>) {
                 out.push(5);
                 out.extend_from_slice(&f.to_bits().to_le_bytes());
             }
+            Value::Rounded(i, s) => {
+                out.push(18);
+                out.extend_from_slice(&i.to_le_bytes());
+                out.push(*s as u8);
+            }
             Value::Bool(b) => {
                 out.push(6);
                 out.push(*b as u8);
@@ -213,6 +218,7 @@ pub fn decode_row(b: &[u8]) -> io::Result<Vec<Value>> {
                 Value::Unsupported(why)
             }
             17 => Value::OutOfRange,
+            18 => Value::Rounded(c.i64()?, c.u8()? as i8),
             t => return Err(io::Error::new(io::ErrorKind::InvalidData, format!("run value tag {}", t))),
         });
     }

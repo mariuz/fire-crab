@@ -18467,6 +18467,12 @@ fn text_form_m(
     // NUMERIC(9,2) 12, NUMERIC(18,4) 21, NUMERIC(4,2) 7, NUMERIC(38,10)
     // 48. Without this a `<integer> || 'x'` and a mixed COALESCE fell to
     // the 32765 catch-all (measured, mid-fix).
+    // AN APPROXIMATE OPERAND CONVERTED TO TEXT: DOUBLE renders into 24
+    // characters, FLOAT into 15, no charset (measured: `DP || ''` is
+    // VARYING(24), `ROUND(FL, 2) || ''` VARYING(15)); it announced 32765
+    if matches!(e.type_of(descs), Some(ExprType::Approx)) {
+        return Some((true, if approx_expr_single(e, descs) { 15 } else { 24 }, TfCs::Ttype(0)));
+    }
     if matches!(e.type_of(descs), Some(ExprType::Numeric | ExprType::Int)) {
         let base = match result_width_bytes(e, descs) {
             0..=2 => 6,
@@ -46660,6 +46666,7 @@ fn union_coerce_value(v: Value, sql_type: i32, scale: i32) -> Value {
             Value::Scaled(raw, sc) => Value::Float(exact_to_f64(raw as i128, sc as i32) as f32),
             Value::Int128(raw, sc) => Value::Float(exact_to_f64(raw, sc as i32) as f32),
             Value::Double(x) => Value::Float(x as f32),
+            Value::Rounded(raw, sc) => Value::Float(exact_to_f64(raw as i128, sc as i32) as f32),
             other => other,
         };
     }
@@ -46673,6 +46680,7 @@ fn union_coerce_value(v: Value, sql_type: i32, scale: i32) -> Value {
             Value::Scaled(raw, sc) => Value::Double(exact_to_f64(raw as i128, sc as i32)),
             Value::Int128(raw, sc) => Value::Double(exact_to_f64(raw as i128, sc as i32)),
             Value::Float(f) => Value::Double(f as f64),
+            Value::Rounded(raw, sc) => Value::Double(exact_to_f64(raw as i128, sc as i32)),
             other => other,
         };
     }
@@ -66173,7 +66181,21 @@ fn approx_of(v: &Value) -> Option<f64> {
     match v {
         Value::Double(d) => Some(*d),
         Value::Float(f) => Some(*f as f64),
+        // a ROUND over an approximate value reads as the double it
+        // describes as ([Value::Rounded])
+        Value::Rounded(r, s) => Some(exact_to_f64(*r as i128, *s as i32)),
         _ => None,
+    }
+}
+
+/// A [Value::Rounded] seen by a consumer the engine TYPES as DOUBLE - a
+/// COALESCE / IIF / CASE / NULLIF result - converts to that double
+/// (`CAST(COALESCE(ROUND(dp, 2), 0) AS VARCHAR)` is '2.680000000000000',
+/// measured); everything else passes through.
+fn unround(v: Value) -> Value {
+    match v {
+        Value::Rounded(r, s) => Value::Double(exact_to_f64(r as i128, s as i32)),
+        other => other,
     }
 }
 
@@ -66573,6 +66595,10 @@ fn f64_to_dec(x: f64, sig: usize) -> Option<fire_crab_ods::decfloat::Dec> {
 fn approx_runtime_expr(e: &Expr) -> bool {
     match e {
         Expr::Col(_) => true,
+        // a ROUND over an approximate value carries its EXACT result
+        // ([Value::Rounded]) and stores 2.68 into a DECFLOAT as the engine
+        // does - no longer the double's 17 digits
+        Expr::Func(SysFn::Round, v) if !v.is_empty() => true,
         Expr::Cast(_, CastTarget::Approx | CastTarget::Float, _) => true,
         Expr::Neg(x) => approx_runtime_expr(x),
         Expr::Bin(a, _, b) => {
@@ -66828,6 +66854,8 @@ fn value_as_dec(v: &Value) -> Option<fire_crab_ods::decfloat::Dec> {
         Value::Int(n) => round_to_dec34(*n < 0, (*n as i128).unsigned_abs(), 0),
         Value::Scaled(r, s) => round_to_dec34(*r < 0, (*r as i128).unsigned_abs(), *s as i32),
         Value::Int128(r, s) => round_to_dec34(*r < 0, r.unsigned_abs(), *s as i32),
+        // a ROUND result stores EXACTLY into a DECFLOAT (2.68, measured)
+        Value::Rounded(r, s) => round_to_dec34(*r < 0, (*r as i128).unsigned_abs(), *s as i32),
         Value::DecFloat34(b) => decode_dec128(*b),
         Value::DecFloat16(b) => decode_dec64(*b),
         _ => return None,
@@ -67947,7 +67975,7 @@ fn temporal_shift(
             Value::Int(n) => *n as i128 * per,
             Value::Scaled(r, sc) => exact(*r as i128, *sc),
             Value::Int128(r, sc) => exact(*r, *sc),
-            Value::Double(_) | Value::Float(_) => {
+            Value::Double(_) | Value::Float(_) | Value::Rounded(..) => {
                 let f = approx_of(amount).ok_or(EvalErr::Unsupported)?;
                 if !f.is_finite() {
                     return Err(EvalErr::Unsupported);
@@ -68630,6 +68658,9 @@ fn value_to_wireparam(v: &Value) -> Option<WireParam> {
         Value::Text(t) => WireParam::Text(t.clone()),
         Value::Double(x) => WireParam::Double(*x),
         Value::Float(f) => WireParam::Single(*f),
+        // a ROUND result binds as the EXACT value the engine stores: 3 into
+        // an INTEGER, 2.7 into NUMERIC(9,1), '2.68' into a VARCHAR
+        Value::Rounded(r, s) => WireParam::Int(*r, *s),
         Value::Bool(b) => WireParam::Bool(*b),
         Value::Date(d) => WireParam::Date(*d),
         Value::Time(t) => WireParam::Time(*t),
@@ -68756,7 +68787,11 @@ fn round_double(mut d: f64, s: i32, eps: f64) -> Result<Value, EvalErr> {
     if !d.is_finite() || d < i64::MIN as f64 || d >= 9.223372036854776e18 {
         return Err(EvalErr::NumericOutOfRange);
     }
-    Ok(Value::Double(exact_to_f64(d as i64 as i128, s)))
+    // the engine's evlRound result is an EXACT INT64 of scale -places
+    // ([Value::Rounded]) - a negative places count keeps the POSITIVE scale
+    // (ROUND(45.7e0, -2) renders '000', measured)
+    let sc = i8::try_from(s).map_err(|_| EvalErr::NumericOutOfRange)?;
+    Ok(Value::Rounded(d as i64, sc))
 }
 
 /// TRUNC of an APPROXIMATE operand: the engine's evlTrunc stays in the f64
@@ -69902,7 +69937,7 @@ impl Expr {
                 for a in args {
                     let v = a.eval(values)?;
                     if !matches!(v, Value::Null) {
-                        out = v;
+                        out = unround(v);
                         break;
                     }
                 }
@@ -69959,28 +69994,26 @@ impl Expr {
                         Some(o) => o == std::cmp::Ordering::Equal,
                         None => value_cmp(&x, &y) == std::cmp::Ordering::Equal,
                     };
-                if equal { Value::Null } else { x }
+                if equal { Value::Null } else { unround(x) }
             }
             // ONLY a TRUE condition takes the then-branch: false and
             // UNKNOWN both take the else, which is the engine's rule
-            Expr::Iif(c, a, b) => {
-                if c.eval(values)? == Some(true) {
-                    a.eval(values)?
-                } else {
-                    b.eval(values)?
-                }
-            }
+            Expr::Iif(c, a, b) => unround(if c.eval(values)? == Some(true) {
+                a.eval(values)?
+            } else {
+                b.eval(values)?
+            }),
             // the first branch whose condition is TRUE answers; false
             // and UNKNOWN both move on; no branch left -> ELSE, and a
             // missing ELSE is NULL (probed)
             Expr::Case(branches, else_) => {
                 for (c, t) in branches {
                     if c.eval(values)? == Some(true) {
-                        return t.eval(values);
+                        return t.eval(values).map(unround);
                     }
                 }
                 match else_ {
-                    Some(e) => e.eval(values)?,
+                    Some(e) => unround(e.eval(values)?),
                     None => Value::Null,
                 }
             }
@@ -70217,6 +70250,8 @@ impl Expr {
                 }
                 Value::Double(d) => Value::Double(-d),
                 Value::Float(f) => Value::Float(-f),
+                // -ROUND(dp, 2) keeps the exact value ('-2.68', measured)
+                Value::Rounded(r, s) => Value::Rounded(r.checked_neg().ok_or(EvalErr::NumericOutOfRange)?, s),
                 // a DECFLOAT negates in decimal (sign flip, cohort kept)
                 Value::DecFloat34(bits) => Value::DecFloat34(fire_crab_ods::decfloat::dec_to_bits(
                     &fire_crab_ods::decfloat::negate(&fire_crab_ods::decfloat::decode_dec128(bits)),
@@ -70734,6 +70769,7 @@ impl Expr {
                                 | Value::Int128(..)
                                 | Value::Double(_)
                                 | Value::Float(_)
+                                | Value::Rounded(..)
                         );
                         let s = match v {
                             Value::Bool(b) => {
@@ -71676,6 +71712,10 @@ impl Expr {
                         let Value::Double(d) = vs[0] else { unreachable!() };
                         Value::Double(d.abs())
                     }
+                    SysFn::Abs if matches!(vs[0], Value::Rounded(..)) => {
+                        let Value::Rounded(r, sc) = vs[0] else { unreachable!() };
+                        Value::Rounded(r.checked_abs().ok_or(EvalErr::NumericOutOfRange)?, sc)
+                    }
                     SysFn::Abs => {
                         let (raw, scale) =
                             numeric_parts(&vs[0]).ok_or(EvalErr::ConversionError(None))?;
@@ -71909,7 +71949,7 @@ impl Expr {
                             _ => RndMode::Trunc,
                         };
                         let v = &vs[0];
-                        if matches!(v, Value::Double(_) | Value::Float(_) | Value::Text(_)) {
+                        if matches!(v, Value::Double(_) | Value::Float(_) | Value::Rounded(..) | Value::Text(_)) {
                             // an approximate (or text-converted) operand: CEIL
                             // / FLOOR are exact on the double, ROUND / TRUNC
                             // follow the engine's evlRound / evlTrunc
@@ -80741,10 +80781,11 @@ fn psql_num_cmp(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
 fn psql_scaled_arith(kind: char, a: &Value, b: &Value) -> Result<Value, PsqlStop> {
     let overflow = || PsqlStop::Raise(Thrown::Runtime { err: EvalErr::IntegerOverflow, trace: Vec::new() });
     let div0 = || PsqlStop::Raise(Thrown::Runtime { err: EvalErr::DivideByZero, trace: Vec::new() });
-    if matches!(a, Value::Double(_)) || matches!(b, Value::Double(_)) {
+    if matches!(a, Value::Double(_) | Value::Rounded(..)) || matches!(b, Value::Double(_) | Value::Rounded(..)) {
         let f = |v: &Value| -> Option<f64> {
             match v {
                 Value::Double(d) => Some(*d),
+                Value::Rounded(..) => approx_of(v),
                 _ => numeric_parts(v).map(|(r, sc)| r as f64 / 10f64.powi(sc as i32)),
             }
         };
@@ -81377,6 +81418,14 @@ fn insert_select(
                             bound.push(WireParam::TextCs(t.clone(), cs));
                             return Some("?".to_string());
                         }
+                    }
+                    // a ROUND result binds as its EXACT (raw, scale): every
+                    // target converts it the typed way, and a DECFLOAT keeps
+                    // the cohort - ROUND(dp, -2) stores 1E+2, not the 100 a
+                    // flattened literal spelled (measured)
+                    if let Value::Rounded(r, sc) = v {
+                        bound.push(WireParam::Int(*r, *sc));
+                        return Some("?".to_string());
                     }
                     // a DOUBLE has no literal spelling that keeps its
                     // type - it travels as a cast over its shortest
@@ -82657,6 +82706,16 @@ fn subst_body_query(sql: &str, binds: &[(String, u16)], f: &PsqlFrame) -> Option
 }
 
 fn psql_literal(v: &Value) -> Option<String> {
+    // a ROUND result is spelled as the EXACT literal it stores as
+    if let Value::Rounded(r, sc) = v {
+        return psql_literal(&if *sc > 0 {
+            Value::Int(r.checked_mul(10i64.checked_pow(*sc as u32)?)?)
+        } else if *sc == 0 {
+            Value::Int(*r)
+        } else {
+            Value::Scaled(*r, *sc)
+        });
+    }
     Some(match v {
         Value::Null => "NULL".to_string(),
         Value::Int(n) => n.to_string(),

@@ -332,6 +332,7 @@ pub fn index_key(itype: u16, value: &Value, scale: i8, charset: u8) -> Option<Ve
                 // meant every candidate from an index holding one failed
                 // verification - the index returned the EMPTY SET
                 Value::Float(f) => *f as f64,
+                Value::Rounded(raw, s) => *raw as f64 / 10f64.powi(-(*s as i32)),
                 _ => return None,
             };
             Some(double_key(d))

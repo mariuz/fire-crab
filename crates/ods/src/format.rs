@@ -242,6 +242,16 @@ pub enum Value {
     /// digits and a double at 16 - and the stored width is the only
     /// thing that says which (1.5 is exactly representable either way)
     Float(f32),
+    /// the RESULT of ROUND over an approximate value: the engine's evlRound
+    /// builds an EXACT INT64 of scale -n (0 for n <= 0) while the describe
+    /// keeps DOUBLE / FLOAT. It reads as a double wherever a double is
+    /// consumed (arithmetic, comparison, a conditional, a UNION) and as
+    /// the exact (raw, scale) where the runtime value shows through - a
+    /// CAST to text, `||`, a store (`CAST(ROUND(dp, 2) AS VARCHAR)` is
+    /// '2.68', measured). A NEGATIVE places count keeps a POSITIVE scale,
+    /// rendered as the raw digits followed by that many zeros:
+    /// `CAST(ROUND(45.7e0, -2) AS VARCHAR)` is '000', 145.045 gives '100'.
+    Rounded(i64, i8),
     Bool(bool),
     /// SQL_DATE: days since the Modified Julian Day epoch (1858-11-17)
     Date(i32),
@@ -282,6 +292,8 @@ impl Value {
             Value::Scaled(raw, scale) => render_scaled(*raw, *scale),
             Value::Double(d) => render_double(*d),
             Value::Float(f) => render_float(*f),
+            Value::Rounded(raw, scale) if *scale > 0 => format!("{}{}", raw, "0".repeat(*scale as usize)),
+            Value::Rounded(raw, scale) => render_scaled(*raw, *scale),
             Value::Bool(b) => if *b { "true" } else { "false" }.into(),
             Value::Date(d) => render_date(*d),
             Value::Time(t) => render_time(*t),
