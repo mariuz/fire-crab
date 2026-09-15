@@ -9,7 +9,7 @@ fire-crab, 2026-08-20: a Rust conversion of the Firebird 6 engine —
 `exe`, `opt`, `lck`, `svc`, `auth`, `cch`, `pio`, `blb`, `evt`,
 `fcstat`, and the `wire` server at 67k). The server answers real SQL
 over the real wire protocol, and every answer is held DIFFERENTIALLY
-against the live FB6 engine: 464 gates under `qa/`, of which the 431
+against the live FB6 engine: 465 gates under `qa/`, of which the 432
 `serve-real-*` sweeps are green (each a multi-check differential run;
 the last full-suite sweep counted 8,627 checks before the growth
 chunks, which have since added many more).
@@ -3123,6 +3123,7 @@ pointer-page and TIP page numbers is the next step when it dominates.
   - A FLOAT compares in SINGLE precision beside a FLOAT, an exact number or a plain decimal text (both sides cast to FLOAT); a DOUBLE beside it compares in double, an exponent or INT128-overflowing text is a double; a FLOAT UNION exact branches is FLOAT 482 with every branch in single (`serve-real-floatcmp`, 2026-09-15). `WHERE FL = 2.675` answered no row.
   - DECFLOAT arithmetic at decimal128's exponent limits: an OVERFLOW (adjusted exponent past 6144) raises *Decimal float overflow* per row through +, -, *, /, SUM, AVG, a WHERE and a CAST; an UNDERFLOW rounds HALF-UP to exponent -6176; an exponent above 6111 pads the coefficient; a DECFLOAT(16) overflow at materialization or CAST raises the same vector (`serve-real-dfoverflow`, 2026-09-15). fire-crab encoded the out-of-range exponent and answered garbage (`max + max` was 8.0E-2047, `WHERE A * 10 > 0` returned every row).
   - The DECFLOAT leftovers: an exponent literal outside DOUBLE's range (by its written value and leading-digit exponent; a zero by its written exponent) types DECFLOAT(34) - `1e400` was DOUBLE Infinity - and a negative one folds into the literal; a DECFLOAT literal compares in decimal on the WHERE expression path; a text past decimal128's exponent range clamps in CAST, store and literal compare; SUM / AVG over +Infinity and -Infinity trap (`serve-real-dfliteral`, 2026-09-15).
+  - ABS keeps the NUMERIC / DECIMAL family code at an unwidened type and raises *numeric value is out of range* at the BIGINT minimum (a WHERE counted that row); the CVT rounding adds (0.5 + epsilon) as one constant (`CAST(8000000000000000e0 AS BIGINT)` is ...001); NULLIF(<decfloat>, <text>) converts the text and raises on a non-number; a DECFLOAT(16) column reads a text literal by the parameter rule (`serve-real-absround`, 2026-09-15).
 
 - **NOT DONE, BY DESIGN - collation-aware DISTINCT / GROUP BY / UNION over a case/accent-insensitive collation:** the engine answers these; fire-crab refuses (`coll_groupable_ttype`, server.rs:45469, deliberately rejects ICU Secondary/Primary). Researched and left as-is: the comparison side already works (ORDER BY and `=` under a CI collation are correct), but a collapsed CI group has NO specified survivor spelling - the engine returns different members for `DISTINCT` vs `GROUP BY` vs `GROUP BY ... MIN(x)` over the same rows (measured). Producing a survivor would be a guess at an unspecified value, which the refuse-rather-than-guess law forbids; the refusal is correct. (`COUNT`/cardinality would be right, but the projected key spelling would be a coin toss.)
 
@@ -3136,9 +3137,6 @@ Wrong answers first; a refusal is law-safe and ranks below any wrong answer.
 - **An exponent literal stored into a DECFLOAT column keeps its TEXT** (1E+200 stays 1E+200, 1.5E-398 stores 2E-398); refused today - needs the literal spelling carried to the store encoder.
 - **DECFLOAT leftovers** (exponent overflow / underflow, out-of-range literals, text clamping and SUM over opposite infinities are DONE - `serve-real-dfoverflow`, `serve-real-dfliteral`): an out-of-range text stored into a DECFLOAT column refuses where the engine raises the overflow vector; `UPDATE .. SET <decfloat> = <out-of-DOUBLE-range literal>` refuses where the engine stores it.
 - **The engine's decimal-to-DOUBLE literal conversion is imprecise near DOUBLE's lower limit** (`1e-307` renders 1.000000000000000e-307, `1.5e-308` renders 0 while `1e-308` does not); fire-crab's correctly rounded parse differs (DOUBLE on both, render-only, low).
-- **NULLIF(<decfloat>, <text>)** answers where the engine raises 22018; `D16 = 'inf'` literal likewise.
-- **ABS over a scaled INT64 / INT128 numeric** describes sub_type 0 (engine 1/2); `ABS(i64::MIN)` in a WHERE delivers the row.
-- **The CVT rounding association**: the engine adds (0.5 + eps) as one constant, so an even integer-valued double in [2^52, 2^53) casts one higher than the exact answer fire-crab gives.
 - **Base-table bind errors** refuse with the generic *Dynamic SQL Error* at op_execute where the engine raises the per-row conversion error at fetch (every type; law-safe, vector and timing differ).
 - **Refusals of common constructs** (law-safe): number-beside-text UNION (VARYING typing), a DECFLOAT literal in `=`/IN outside the param path, DECFLOAT builtins (COMPARE_DECFLOAT, NORMALIZE_DECFLOAT, QUANTIZE, TOTALORDER), SET DECFLOAT ROUND / TRAPS, a conforming driver binding blr_dec64 / blr_dec128 raw, multi-column UNION, HAVING over a decfloat aggregate, a decfloat IN-subquery, `WHERE CURRENT OF`, GROUP BY / window + FIRST/SKIP/ROWS, collation-aware DISTINCT (by design, below).
 

@@ -18119,6 +18119,14 @@ fn numeric_subtype(e: &Expr, descs: &[Descriptor]) -> i16 {
             .filter(|d| exact_dtype_bytes(d.dtype).is_some())
             .map_or(0, |d| d.sub_type),
         Expr::Neg(a) => numeric_subtype(a, descs),
+        // ABS keeps the operand's family code when its result type is the
+        // operand's own (INT64 -> INT64, INT128 -> INT128): ABS(NUMERIC(18,4))
+        // is sub_type 1, ABS(DECIMAL(38,2)) 2; a WIDENED result (a
+        // NUMERIC(9,2) LONG backing -> INT64) is 0 (all measured)
+        Expr::Func(SysFn::Abs, v) if v.len() == 1 => match v[0].rank_of(descs) {
+            Some(NumRank::I64 | NumRank::I128) => numeric_subtype(&v[0], descs),
+            _ => 0,
+        },
         // a temporal difference carries its own family code, and it is
         // NOT a blanket 1: a DATE pair is 0, and this function is called
         // for Int-typed expressions too - which is exactly the path a
@@ -32135,7 +32143,7 @@ fn encode_wire_value(d: &Descriptor, wp: &WireParam) -> Option<Option<Vec<u8>>> 
                     return None;
                 }
                 let adjusted =
-                    if scaled > 0.0 { scaled + 0.5 + 1e-5 } else { scaled - 0.5 - 1e-5 };
+                    if scaled > 0.0 { scaled + (0.5 + 1e-5) } else { scaled - (0.5 + 1e-5) };
                 int_bytes(adjusted.trunc() as i128)?
             }
             dtype::TEXT | dtype::VARYING => {
@@ -32166,7 +32174,11 @@ fn encode_wire_value(d: &Descriptor, wp: &WireParam) -> Option<Option<Vec<u8>>> 
                     return None;
                 }
                 let adjusted =
-                    if scaled > 0.0 { scaled + 0.5 + 1e-14 } else { scaled - 0.5 - 1e-14 };
+                    // the engine adds (0.5 + epsilon) as ONE constant: an
+                    // integer-valued double in [2^52, 2^53) lands one higher
+                    // (8000000000000000e0 stores 8000000000000001, measured);
+                    // adding 0.5 first rounded the tie to even and lost it
+                    if scaled > 0.0 { scaled + (0.5 + 1e-14) } else { scaled - (0.5 + 1e-14) };
                 int_bytes(adjusted.trunc() as i128)?
             }
             // an approximate value into a TEXT column renders the
@@ -69901,6 +69913,41 @@ impl Expr {
             // so the first operand comes through (and is NULL if it was).
             Expr::NullIf(a, b) => {
                 let (x, y) = (a.eval(values)?, b.eval(values)?);
+                // A DECFLOAT beside a TEXT converts the text to the
+                // DECFLOAT's width (DECFLOAT(16): blanks trimmed, narrowed
+                // to 16 digits, a special refused) and a text that is not a
+                // number raises *conversion error* - NULLIF(<decfloat>,
+                // 'abc') raised in the engine and answered the first
+                // operand here (measured)
+                let dec_text = |dv: &Value, t: &str| -> Result<std::cmp::Ordering, EvalErr> {
+                    use fire_crab_ods::decfloat::{self as df, Dec};
+                    let conv = || EvalErr::ConversionError(Some(t.to_string()));
+                    let d = value_as_dec(dv).ok_or_else(conv)?;
+                    let narrow16 = matches!(dv, Value::DecFloat16(_));
+                    let bits = if narrow16 {
+                        let b = text_to_dec128_clamped(t.trim_matches(' ')).map_err(|_| conv())?;
+                        if !matches!(df::decode_dec128(b), Dec::Finite { .. }) {
+                            return Err(conv());
+                        }
+                        narrow_dec16_bind(b)
+                    } else {
+                        text_to_dec128_clamped(t).map_err(|_| conv())?
+                    };
+                    let lit = df::decode_dec128(bits);
+                    if matches!(d, Dec::Nan) || matches!(lit, Dec::Nan) {
+                        return Err(EvalErr::DecfloatInvalidOperation);
+                    }
+                    Ok(df::cmp(&d, &lit))
+                };
+                match (&x, &y) {
+                    (Value::DecFloat16(_) | Value::DecFloat34(_), Value::Text(t)) => {
+                        return Ok(if dec_text(&x, t)? == std::cmp::Ordering::Equal { Value::Null } else { x });
+                    }
+                    (Value::Text(t), Value::DecFloat16(_) | Value::DecFloat34(_)) => {
+                        return Ok(if dec_text(&y, t)? == std::cmp::Ordering::Equal { Value::Null } else { x });
+                    }
+                    _ => {}
+                }
                 // MIXED NUMERIC SHAPES MUST ALIGN EXACTLY: value_cmp
                 // compares within one shape, so Int(0) against
                 // Scaled(0, -2) is NOT equal to it - num_cmp is the
@@ -70626,7 +70673,10 @@ impl Expr {
                                 } else {
                                     1e-14
                                 };
-                                let r = if x > 0.0 { x + 0.5 + eps } else { x - 0.5 - eps }.trunc();
+                                // (0.5 + eps) is ONE constant, as in cvt.cpp
+                                // (CAST(8000000000000000e0 AS BIGINT) is
+                                // 8000000000000001, measured)
+                                let r = if x > 0.0 { x + (0.5 + eps) } else { x - (0.5 + eps) }.trunc();
                                 if r.abs() >= 1.701_411_834_604_692_3e38 {
                                     return Err(EvalErr::NumericOutOfRange);
                                 }
@@ -70942,10 +70992,14 @@ impl Expr {
                                     } else {
                                         1e-14
                                     };
+                                    // (0.5 + eps) is ONE constant: a DOUBLE
+                                    // 8.99 to NUMERIC(18,15) scales to
+                                    // 8990000000000000, which lands on
+                                    // ...001 (measured)
                                     let adjusted = if scaled > 0.0 {
-                                        scaled + 0.5 + eps
+                                        scaled + (0.5 + eps)
                                     } else {
-                                        scaled - 0.5 - eps
+                                        scaled - (0.5 + eps)
                                     };
                                     (adjusted.trunc() as i128, *scale)
                                 }
@@ -71625,10 +71679,17 @@ impl Expr {
                     SysFn::Abs => {
                         let (raw, scale) =
                             numeric_parts(&vs[0]).ok_or(EvalErr::ConversionError(None))?;
-                        scaled_value(
-                            raw.checked_abs().ok_or(EvalErr::IntegerOverflow)?,
-                            scale,
-                        )
+                        // ABS keeps an INT64 operand at INT64 (only SMALLINT /
+                        // INTEGER widen), so the BIGINT minimum has no
+                        // result: the engine raises *numeric value is out of
+                        // range* - in a projection and, per row, in a WHERE
+                        // (measured; the i128 fold here answered
+                        // 9223372036854775808 and a WHERE counted the row)
+                        let a = raw.checked_abs().ok_or(EvalErr::NumericOutOfRange)?;
+                        if matches!(vs[0], Value::Int(_) | Value::Scaled(..)) && a > i64::MAX as i128 {
+                            return Err(EvalErr::NumericOutOfRange);
+                        }
+                        scaled_value(a, scale)
                     }
                     // round each operand to an integer first (the
                     // engine's rule, probed: MOD(12.50, 5) = 3), then a
@@ -88020,6 +88081,16 @@ fn decfloat_term(
         // grammar; a non-convertible one raises 22018 PER ROW (UNKNOWN over
         // NULL, no raise on an empty table), which is exactly what
         // [Term::CmpConvErr] with no lenient fallback does
+        // a DECFLOAT(16) column reads the literal by the parameter rule
+        // ([decfloat_param_term]): blanks trimmed, narrowed to 16 digits,
+        // every special a per-row conversion error (`D16 = 'inf'` raises,
+        // measured)
+        RawKind::Cmp(op, Rhs::Str(v)) if d.dtype == dtype::DEC64 => {
+            match decfloat_param_term(Some(&WireParam::Text(v.clone())), idx, op, &ColKind::DecFloat { wide: false }) {
+                Some(t) => t,
+                None => Term::CmpConvErr(idx, op, v, None),
+            }
+        }
         RawKind::Cmp(op, Rhs::Str(v)) => match text_to_dec128_clamped(&v) {
             Ok(bits) => Term::NumCmp(idx, op, Rhs::DecFloat34(bits)),
             Err(_) => Term::CmpConvErr(idx, op, v, None),
