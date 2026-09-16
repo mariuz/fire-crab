@@ -405,7 +405,7 @@ store "merge set D34/D16 bare ?"    "MERGE INTO PBW USING (SELECT 2 AS K FROM RD
 store "merge set D16 narrows 17->16" "MERGE INTO PBW USING (SELECT 2 AS K FROM RDB\$DATABASE) SRC ON PBW.ID = SRC.K WHEN MATCHED THEN UPDATE SET D16 = ?" "[7.2576582964629335]"
 store "merge insert bare ? double"  "MERGE INTO PBW USING (SELECT 777 AS K FROM RDB\$DATABASE) SRC ON PBW.ID = SRC.K WHEN NOT MATCHED THEN INSERT (ID, D34, D16) VALUES (SRC.K, ?, ?)" "[0.1,0.1]"
 store "merge insert bare ? text"    "MERGE INTO PBW USING (SELECT 778 AS K FROM RDB\$DATABASE) SRC ON PBW.ID = SRC.K WHEN NOT MATCHED THEN INSERT (ID, D34, D16) VALUES (SRC.K, ?, ?)" '["1E+3","1.00"]'
-refuses_fc "merge insert ? * 3"     "MERGE INTO PBW USING (SELECT 779 AS K FROM RDB\$DATABASE) SRC ON PBW.ID = SRC.K WHEN NOT MATCHED THEN INSERT (ID, D34) VALUES (SRC.K, ? * 3)" "[0.1]"
+both "merge insert ? * 3"     "MERGE INTO PBW USING (SELECT 779 AS K FROM RDB\$DATABASE) SRC ON PBW.ID = SRC.K WHEN NOT MATCHED THEN INSERT (ID, D34) VALUES (SRC.K, ? * 3)" "[0.1]"
 agree "stored table after boundaries" "select id, cast(d34 as varchar(40)) a, cast(d16 as varchar(40)) b from pbw where id in (2, 777, 778, 779) order by id;"
 agree "stored row count/sum"          "select count(*), sum(id) from pbw;"
 
@@ -426,7 +426,14 @@ refuses "insert 1E+200 into D34"    "INSERT INTO DX (ID, D34) VALUES (502, 1E+20
 refuses "insert 0.1E0 into D34"     "INSERT INTO DX (ID, D34) VALUES (503, 0.1E0);"
 refuses "insert -1.5E-300 into D34" "INSERT INTO DX (ID, D34) VALUES (504, -1.5E-300);"
 refuses "insert 1E+3 * 2 into D34"  "INSERT INTO DX (ID, D34) VALUES (505, 1E+3 * 2);"
-refuses "update D16 = 1.5E-398"     "UPDATE PBW SET D16 = 1.5E-398 WHERE ID = 1;"
+# An UPDATE takes it now (serve-real-slottype, 2026-09-16: the UPDATE
+# planner's type gate learned the decfloat question, and this literal
+# underflows to the value BOTH sides store). Measured before converting:
+# engine 2E-398, fire-crab 2E-398 - and `D34 = 1.5E-398` 1.5E-398 on both.
+# It runs on its OWN row of DX, never PBW's: an fc-only refusal turned
+# into a both-sides check makes the ENGINE run a statement it never ran,
+# and a later table-state check then diverges.
+agree "update D16 = 1.5E-398 stores 2E-398" "INSERT INTO DX (ID, D16) VALUES (503, 1); UPDATE DX SET D16 = 1.5E-398 WHERE ID = 503; SELECT ID, D16 FROM DX WHERE ID = 503;"
 refuses "update D34 = 1E+200"       "UPDATE PBW SET D34 = 1E+200 WHERE ID = 1;"
 agree "plain decimal / integer literals still store" "DELETE FROM DX; INSERT INTO DX (ID, D34, D16) VALUES (510, 1.1, 1.1); INSERT INTO DX (ID, D34, D16) VALUES (511, 1000, 1000); SELECT ID, D34, D16 FROM DX ORDER BY ID;"
 agree "1.5E0 into DOUBLE / NUMERIC / FLOAT unchanged" "DELETE FROM DX; INSERT INTO DX (ID, DP, N, F) VALUES (512, 1.5E0, 1.5E0, 1.5E0); SELECT ID, DP, N, F FROM DX;"
@@ -459,7 +466,7 @@ both "update D34 = ? / 3 [2]"          "UPDATE PBW SET D34 = ? / 3 WHERE ID = 2"
 both "update D16 = COALESCE(?, 0) [2^40]" "UPDATE PBW SET D16 = COALESCE(?, 0) WHERE ID = 2" "[1099511627776]"
 refuses_fc "insert D34 ? * 1E+3 [2]"         "INSERT INTO PBW (ID, D34) VALUES (790, ? * 1E+3)" "[2]"
 refuses_fc "merge set COALESCE(?,0) [2]"     "MERGE INTO PBW USING (SELECT 2 AS K FROM RDB\$DATABASE) SRC ON PBW.ID = SRC.K WHEN MATCHED THEN UPDATE SET D34 = COALESCE(?, 0)" "[2]"
-refuses_fc "merge insert ? * 3 [2]"          "MERGE INTO PBW USING (SELECT 791 AS K FROM RDB\$DATABASE) SRC ON PBW.ID = SRC.K WHEN NOT MATCHED THEN INSERT (ID, D34) VALUES (SRC.K, ? * 3)" "[2]"
+both "merge insert ? * 3 [2]"          "MERGE INTO PBW USING (SELECT 791 AS K FROM RDB\$DATABASE) SRC ON PBW.ID = SRC.K WHEN NOT MATCHED THEN INSERT (ID, D34) VALUES (SRC.K, ? * 3)" "[2]"
 echo "-- verify-found (round 2): a NON-RUNTIME approximate value refuses at a DECFLOAT store wherever its provenance was erased; ROUND now stores its EXACT value (the roundexact chunk) and is compared --"
 refuses "ins-sel literal 1E+200 -> D34"      "INSERT INTO DX (ID, D34) SELECT 1, 1E+200 FROM RDB\$DATABASE;"
 refuses "VALUES((SELECT 1E+200)) -> D34"     "INSERT INTO DX (ID, D34) VALUES (1, (SELECT 1E+200 FROM RDB\$DATABASE));"

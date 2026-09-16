@@ -44,6 +44,15 @@ echo "create database '127.0.0.1/3050:$ENG' user '$U' password '$P' page_size 81
 CREATE TABLE T (ID INTEGER, I INTEGER, N NUMERIC(9,2), N4 NUMERIC(9,4), DP DOUBLE PRECISION, DF DECFLOAT(34), D16 DECFLOAT(16), BI BIGINT, SM SMALLINT);
 CREATE TABLE U (ID INTEGER, I INTEGER, N NUMERIC(9,2), DF DECFLOAT(34));
 INSERT INTO U VALUES (1, 2, 1.00, 1);
+CREATE TABLE MG (ID INTEGER, I INTEGER, N NUMERIC(9,2), DF DECFLOAT(34));
+INSERT INTO MG VALUES (1, 10, 10.00, 10);
+INSERT INTO MG VALUES (2, 10, 10.00, 10);
+INSERT INTO MG VALUES (3, 10, 10.00, 10);
+INSERT INTO MG VALUES (4, 10, 10.00, 10);
+INSERT INTO MG VALUES (5, 10, 10.00, 10);
+INSERT INTO MG VALUES (6, 10, 10.00, 10);
+INSERT INTO MG VALUES (7, 10, 10.00, 10);
+INSERT INTO MG VALUES (8, 10, 10.00, 10);
 COMMIT;
 SQL
 if grep -qi error /tmp/slot-build.log; then echo "FAIL building the fixture:"; sed 's/^/     /' /tmp/slot-build.log; exit 1; fi
@@ -127,5 +136,33 @@ both "UPDATE SET N = ? * 2"       "UPDATE U SET N = ? * 2 WHERE ID = 1"       '[
 both "UPDATE SET N = 2 * ?"       "UPDATE U SET N = 2 * ? WHERE ID = 1"       '[1.115]'   N  1 U
 both "UPDATE SET I = ? * 2"       "UPDATE U SET I = ? * 2 WHERE ID = 1"       '[1.6]'     I  1 U
 both "UPDATE SET DF = ? / 3"      "UPDATE U SET DF = ? / 3 WHERE ID = 1"      '[10]'      DF 1 U
+
+echo "-- a MERGE takes the same law, in both branches --"
+# each check matches its OWN seeded row, so one never reads another's write
+mg() { printf 'MERGE INTO MG USING (SELECT %s AS K FROM RDB$DATABASE) S ON MG.ID = S.K WHEN MATCHED THEN UPDATE SET %s' "$1" "$2"; }
+mgi() { printf 'MERGE INTO MG USING (SELECT %s AS K FROM RDB$DATABASE) S ON MG.ID = S.K WHEN NOT MATCHED THEN INSERT (ID, %s) VALUES (S.K, %s)' "$1" "$2" "$3"; }
+both "MERGE UPDATE I = ? * 2"     "$(mg 1 'I = ? * 2')"   '[1.6]'     I  1 MG
+both "MERGE UPDATE N = ? * 2"     "$(mg 2 'N = ? * 2')"   '[1.115]'   N  2 MG
+both "MERGE UPDATE N = 2 * ?"     "$(mg 3 'N = 2 * ?')"   '[1.115]'   N  3 MG
+both "MERGE UPDATE N = ? / 2"     "$(mg 4 'N = ? / 2')"   '[1.115]'   N  4 MG
+both "MERGE UPDATE N = ? + 0"     "$(mg 5 'N = ? + 0')"   '[1.115]'   N  5 MG
+both "MERGE UPDATE DF = ? / 3"    "$(mg 6 'DF = ? / 3')"  '[10]'      DF 6 MG
+both "MERGE UPDATE DF = ? * 3"    "$(mg 7 'DF = ? * 3')"  '[0.1]'     DF 7 MG
+both "MERGE UPDATE N = ? (bare)"  "$(mg 8 'N = ?')"       '[1.115]'   N  8 MG
+both "MERGE INSERT I = ? * 2"     "$(mgi 101 I '? * 2')"  '[1.6]'     I  101 MG
+both "MERGE INSERT N = ? * 2"     "$(mgi 102 N '? * 2')"  '[1.115]'   N  102 MG
+both "MERGE INSERT N = 2 * ?"     "$(mgi 103 N '2 * ?')"  '[1.115]'   N  103 MG
+both "MERGE INSERT DF = ? / 3"    "$(mgi 104 DF '? / 3')" '[10]'      DF 104 MG
+both "MERGE INSERT DF = ? * 3"    "$(mgi 105 DF '? * 3')" '[0.1]'     DF 105 MG
+echo "-- ... and a marker in the ON / WHEN-AND still COMPARES, never converts --"
+both "MERGE ON param + SET param"  "MERGE INTO MG USING (SELECT 1 AS K FROM RDB\$DATABASE) S ON MG.ID = S.K AND MG.I = ? WHEN MATCHED THEN UPDATE SET N = ?" '[10, 5]' N 1 MG
+both "MERGE WHEN-AND param"        "MERGE INTO MG USING (SELECT 2 AS K FROM RDB\$DATABASE) S ON MG.ID = S.K WHEN MATCHED AND MG.I = ? THEN UPDATE SET N = ? * 2" '[10, 1.115]' N 2 MG
+
+echo "-- recorded refusals (fire-crab only) --"
+# COALESCE types its parameter from its OTHER arguments, which MERGE's
+# text-based typing does not reproduce - admitting the shape STORED
+# 1.1000000000000001 where the engine stores 1, so it refuses instead
+refuses "MERGE UPDATE DF = COALESCE(?, 0)" "MERGE INTO MG USING (SELECT 1 AS K FROM RDB\$DATABASE) S ON MG.ID = S.K WHEN MATCHED THEN UPDATE SET DF = COALESCE(?, 0)" '[1.1]'
+refuses "MERGE UPDATE I = COALESCE(?, 0)"  "MERGE INTO MG USING (SELECT 1 AS K FROM RDB\$DATABASE) S ON MG.ID = S.K WHEN MATCHED THEN UPDATE SET I = COALESCE(?, 0)" '[1099511627776]'
 
 [ $fail -eq 0 ] && echo "PASS serve-real-slottype" || { echo "FAIL serve-real-slottype"; exit 1; }

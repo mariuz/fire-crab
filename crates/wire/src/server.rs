@@ -9786,6 +9786,15 @@ AlterDomainRename {
         /// reference in these clauses is "Column unknown" on the engine
         /// (probed: not NULL), so the planner refuses one.
         by_source: Vec<(Option<String>, MergeAction)>,
+        /// Per `?` slot: the DESTINATION descriptor the typing passes
+        /// gave it, and whether its value converts at SCALE 0 (the LEFT
+        /// operand of a multiply over an exact scaled column). A marker
+        /// in a VALUE position is spelled into the per-row statement as
+        /// its value CONVERTED THROUGH THIS - the engine converts the
+        /// driver's value at the slot, before the arithmetic, and the
+        /// per-row text is planned after the substitution, so there is
+        /// nowhere later for the conversion to happen ([merge_subst]).
+        param_slots: Vec<(Descriptor, bool)>,
     },
     /// `DELETE FROM <t> [WHERE ...]`: op_execute rewrites each matching
     /// primary record as a deleted stub over its version chain
@@ -33176,8 +33185,15 @@ fn plan_update(sql: &str, db_outer: &Option<Database>) -> Option<(Plan, Vec<Desc
                 // engine's "Strings cannot be added") must not reach the
                 // per-row eval, whose fallthrough answers NULL - storing
                 // that NULL would be a silently wrong update
-                // (review-caught, the INSERT arm's twin)
-                if e.type_of(descs).is_none() {
+                // (review-caught, the INSERT arm's twin).
+                //
+                // A DECFLOAT-valued expression has no ExprType of its own
+                // (the describe short-circuits it), so that question is
+                // asked separately - without this, a MERGE's desugared
+                // per-row `UPDATE M SET DF = CAST('10' AS DECFLOAT(34)) / 3`
+                // refused at re-plan, though the value had already been
+                // converted at its slot ([merge_subst]).
+                if e.type_of(descs).is_none() && !is_decfloat_arith(&e, descs) {
                     return None;
                 }
                 let fid = fid0;
@@ -72931,6 +72947,18 @@ fn dml_subq_literal(v: &Value) -> Option<String> {
         }
         return Some(format!("CAST('{:e}' AS FLOAT)", *f as f64));
     }
+    // a DECFLOAT has no bare literal spelling that keeps its type - the
+    // digits read back as a scaled numeric - so it travels as a CAST over
+    // its EXACT decimal text, the shape [corr_literal] already uses. NaN
+    // and the infinities have no text the CVT grammar takes.
+    if matches!(v, Value::DecFloat16(_) | Value::DecFloat34(_)) {
+        let t = v.render();
+        if t.contains("NaN") || t.contains("nan") || t.contains("Inf") || t.contains("inf") {
+            return None;
+        }
+        let w = if matches!(v, Value::DecFloat16(_)) { 16 } else { 34 };
+        return Some(format!("CAST('{}' AS DECFLOAT({}))", t, w));
+    }
     psql_literal(v).or_else(|| value_literal(v))
 }
 
@@ -82319,6 +82347,32 @@ fn plan_merge(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor>
         // not reach - has no type here
         slots.into_iter().collect::<Option<_>>()?
     };
+    // WHICH SLOTS CONVERT AT SCALE 0: the LEFT operand of a multiply, in
+    // a VALUE position, over an exact SCALED destination - the asymmetry
+    // [resolve_dest_param_expr] carries, measured inside a MERGE too
+    // (`SET N = ? * 2` bound 1.115 stores 2.00 where `SET N = 2 * ?`
+    // stores 2.24, one statement per fresh row; the INSERT branch the
+    // same).
+    let mut scale0: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    for (_, act) in matched.iter().chain(by_source.iter()) {
+        if let MergeAction::Update(sets) = act {
+            merge_scale0_slots(sets, &mut scale0);
+        }
+    }
+    for (_, _, vals) in &not_matched {
+        merge_scale0_slots(vals, &mut scale0);
+    }
+    let param_slots: Vec<(Descriptor, bool)> = params
+        .iter()
+        .enumerate()
+        .map(|(i, d)| {
+            let exact = matches!(
+                d.dtype,
+                dtype::SHORT | dtype::LONG | dtype::INT64 | dtype::INT128
+            );
+            (d.clone(), scale0.contains(&i) && exact && d.scale != 0)
+        })
+        .collect();
     Some((
         Plan::Merge {
             target,
@@ -82329,9 +82383,55 @@ fn plan_merge(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor>
             matched,
             not_matched,
             by_source,
+            param_slots,
         },
         params,
     ))
+}
+
+/// The marker slots a VALUE position multiplies FROM THE LEFT -
+/// `FC$P0 * 2`, the one position that converts at scale 0. Scanned on
+/// the clause text because the typing passes see it and [merge_subst],
+/// which does the substituting, does not.
+fn merge_scale0_slots(text: &str, out: &mut std::collections::HashSet<usize>) {
+    let b = text.as_bytes();
+    let mut at = 0usize;
+    while let Some(rel) = text[at..].find(MERGE_PARAM_MARK) {
+        let start = at + rel;
+        let tail = &text[start + MERGE_PARAM_MARK.len()..];
+        let dig = tail.find(|c: char| !c.is_ascii_digit()).unwrap_or(tail.len());
+        let end = start + MERGE_PARAM_MARK.len() + dig;
+        if let Ok(n) = tail[..dig].parse::<usize>() {
+            let mut j = end;
+            while j < b.len() && b[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j < b.len() && b[j] == b'*' {
+                out.insert(n);
+            }
+        }
+        at = end.max(start + 1);
+    }
+}
+
+/// The CAST a marker's bound value converts through before it is
+/// spelled: its slot's own type, or the SCALE-0 integer rung for the
+/// left-of-multiply position.
+fn merge_slot_cast(e: Expr, d: &Descriptor, scale0: bool) -> Expr {
+    let cs = fire_crab_ods::intl::CS_UTF8;
+    if scale0 {
+        let bytes = match d.dtype {
+            dtype::SHORT => 2,
+            dtype::LONG => 4,
+            dtype::INT64 => 8,
+            _ => 16,
+        };
+        return Expr::Cast(Box::new(e), CastTarget::Int { bytes }, cs);
+    }
+    match dest_cast_target(d) {
+        Some(t) => Expr::Cast(Box::new(e), t, cs),
+        None => e,
+    }
 }
 
 /// The placeholder a MERGE's `?` becomes at prepare.
@@ -82448,6 +82548,9 @@ fn type_markers_in_sets(
         if !marker_slots(&part[..eq]).is_empty() {
             return None;
         }
+        if !merge_marker_shape_ok(&part[eq + 1..]) {
+            return None;
+        }
         let col = merge_target_col(part[..eq].trim(), columns, tgt_alias)?;
         let d = descs.get(col.field_id as usize)?.clone();
         if !merge_decfloat_marker_ok(&d, &part[eq + 1..]) {
@@ -82469,15 +82572,34 @@ fn type_markers_in_sets(
 /// BARE marker is admitted for such a column - the same refuse the
 /// INSERT and UPDATE arms make. A bare marker's literal takes the
 /// runtime store path.
-fn merge_decfloat_marker_ok(d: &Descriptor, value: &str) -> bool {
-    if d.dtype != dtype::DEC64 && d.dtype != dtype::DEC128 {
-        return true;
-    }
-    let v = value.trim();
-    match v.strip_prefix(MERGE_PARAM_MARK) {
-        Some(rest) => !rest.is_empty() && rest.bytes().all(|c| c.is_ascii_digit()),
-        None => marker_slots(v).is_empty(),
-    }
+/// Is this value expression one whose markers MERGE can type?
+///
+/// MERGE types a marker from its DESTINATION COLUMN, pushed down the
+/// value text. That is the engine's rule for a bare marker and for
+/// arithmetic - but NOT inside a CALL, where the engine's own overrides
+/// take precedence: **COALESCE types its parameter from its OTHER
+/// arguments**, so `SET DF = COALESCE(?, 0)` bound 1.1 is a plain
+/// INTEGER slot and stores 1, where typing from the DECFLOAT column
+/// stores 1.1000000000000001 (measured - this refusal exists because
+/// admitting the shape produced that WRONG STORE, not because the
+/// engine refuses it). A CAST likewise types its own operand.
+///
+/// So a marker inside parentheses keeps the old refusal, and the shapes
+/// this admits are the ones destination-typing gets right. Reproducing
+/// the overrides on the TEXT - as [resolve_dest_param_expr] does on the
+/// tree - is the slice that lifts it.
+fn merge_marker_shape_ok(value: &str) -> bool {
+    marker_slots(value).is_empty() || !value.contains('(')
+}
+
+fn merge_decfloat_marker_ok(_d: &Descriptor, _value: &str) -> bool {
+    // A marker inside an EXPRESSION used to refuse for a DECFLOAT column,
+    // because its value was spelled RAW and the decimal arithmetic then
+    // ran on the wrong thing. [merge_subst] now spells it CONVERTED AT
+    // ITS SLOT, which is where the engine converts it - so `SET DF =
+    // ? / 3` bound 10 is the decimal 3.333333333333333333333333333333333
+    // on both sides, and the refusal has nothing left to protect.
+    true
 }
 
 /// Type every marker in an `INSERT` branch's value list: by POSITION
@@ -82511,6 +82633,9 @@ fn type_markers_in_values(
         let slots = marker_slots(item);
         if slots.is_empty() {
             continue;
+        }
+        if !merge_marker_shape_ok(item) {
+            return None;
         }
         let d = descs.get(col.field_id as usize)?.clone();
         if !merge_decfloat_marker_ok(&d, item) {
@@ -82638,6 +82763,10 @@ fn merge_subst(
     // the target TABLE, which the per-row statement names unaliased
     target: &str,
     args: &[WireParam],
+    // per `?` slot: the destination descriptor and the scale-0 flag
+    // ([Plan::Merge::param_slots]) - a marker in a VALUE POSITION
+    // (`typed_mode` 1) is spelled as its value CONVERTED THROUGH THIS
+    slots: &[(Descriptor, bool)],
     // per SOURCE column: is its value a RUNTIME approximate to the engine
     // ([approx_runtime_expr] of the source's select-list expression; a
     // plain column is)? Only such a value is spelled as its TYPED cast
@@ -82707,8 +82836,21 @@ fn merge_subst(
             if let Some(n) = first.strip_prefix(MERGE_PARAM_MARK).and_then(|d| d.parse::<usize>().ok())
             {
                 let wp = args.get(n).ok_or("missing parameter value")?;
-                let v = param_to_expr(wp)
-                    .and_then(|e| e.eval(&[]).ok())
+                let e = param_to_expr(wp)
+                    .ok_or("a parameter this MERGE cannot write as a literal")?;
+                // IN A VALUE POSITION the value converts AT ITS SLOT
+                // first - the engine reads the driver's value there and
+                // evaluates from it, so `SET I = ? * 2` bound 1.6 is
+                // 2 * 2 = 4. The ON predicate and a WHEN .. AND
+                // condition are COMPARISONS, not assignments, and keep
+                // the value as it arrived.
+                let e = match (typed_mode == 1, slots.get(n)) {
+                    (true, Some((d, s0))) => merge_slot_cast(e, d, *s0),
+                    _ => e,
+                };
+                let v = e
+                    .eval(&[])
+                    .ok()
                     .ok_or("a parameter this MERGE cannot write as a literal")?;
                 out.push_str(
                     &dml_subq_literal(&v)
@@ -82816,7 +82958,17 @@ fn merge_exec(
     ctx: &SessionCtx,
     mut affected: Option<&mut Affected>,
 ) -> Result<(i32, i32, i32), ExecErr> {
-    let Plan::Merge { target, tgt_alias, source_sql, src_alias, on, matched, not_matched, by_source } = plan
+    let Plan::Merge {
+        target,
+        tgt_alias,
+        source_sql,
+        src_alias,
+        on,
+        matched,
+        not_matched,
+        by_source,
+        param_slots,
+    } = plan
     else {
         return Err("not a MERGE plan".into());
     };
@@ -82881,7 +83033,7 @@ fn merge_exec(
     let mut touched: std::collections::HashSet<u64> = std::collections::HashSet::new();
     for row in &rows {
         let sub = |t: &str, mode: u8| {
-            merge_subst(t, src_alias, &src_cols, row, tgt_alias, target, args, &src_runtime, mode)
+            merge_subst(t, src_alias, &src_cols, row, tgt_alias, target, args, param_slots, &src_runtime, mode)
         };
         let on_s = sub(on, 2)?;
         let probe = format!("DELETE FROM {} WHERE {}", render_canon_ref(target), on_s);
@@ -82987,7 +83139,7 @@ fn merge_exec(
     for identity in &orphans {
         let step = (|| -> Result<(), ExecErr> {
             let sub = |t: &str, mode: u8| {
-                merge_subst(t, src_alias, &src_cols, &null_row, tgt_alias, target, args, &src_runtime, mode)
+                merge_subst(t, src_alias, &src_cols, &null_row, tgt_alias, target, args, param_slots, &src_runtime, mode)
             };
             for (cond, action) in by_source {
                 let mut where_ = identity.clone();
@@ -83035,7 +83187,7 @@ fn merge_exec(
     for (row, (on_s, targets)) in rows.iter().zip(pairs) {
         let step = (|| -> Result<(), ExecErr> {
             let sub = |t: &str, mode: u8| {
-                merge_subst(t, src_alias, &src_cols, row, tgt_alias, target, args, &src_runtime, mode)
+                merge_subst(t, src_alias, &src_cols, row, tgt_alias, target, args, param_slots, &src_runtime, mode)
             };
             if targets.is_empty() {
                 for (cond, cols, vals) in not_matched {
@@ -110700,7 +110852,7 @@ mod tests {
         // was cut into `u."a"` plus a stray `b"` and the MERGE refused
         let src = ["ID".to_string(), "a\"b".to_string()];
         let row = [Value::Int(1), Value::Int(111)];
-        let sub = |t: &str| merge_subst(t, "D", &src, &row, "T", "T", &[], &[], 1).unwrap();
+        let sub = |t: &str| merge_subst(t, "D", &src, &row, "T", "T", &[], &[], &[], 1).unwrap();
         assert_eq!(sub("V = D.\"a\"\"b\""), "V = 111");
         assert_eq!(sub("T.\"a\"\"b\" = D.\"a\"\"b\""), "\"a\"\"b\" = 111");
         assert_eq!(sub("D.\"a\"\"b\" > 900"), "111 > 900");
@@ -110714,7 +110866,7 @@ mod tests {
     fn merge_subst_leaves_a_qualifier_the_subquery_s_own_from_binds() {
         let src = ["ID".to_string(), "NM".to_string()];
         let row = [Value::Int(1), Value::Text("one".into())];
-        let sub = |t: &str| merge_subst(t, "D", &src, &row, "T", "T", &[], &[], 1).unwrap();
+        let sub = |t: &str| merge_subst(t, "D", &src, &row, "T", "T", &[], &[], &[], 1).unwrap();
         // the source row, outside any subquery (where the target's own
         // reference is the per-row statement's bare column)
         assert_eq!(sub("D.ID = T.ID"), "1 = ID");
@@ -110729,12 +110881,12 @@ mod tests {
         assert_eq!(sub("S = (SELECT NM FROM D x WHERE x.ID = D.ID)"), "S = (SELECT NM FROM D x WHERE x.ID = 1)");
         // an aliased target: `TG.ID` inside a span becomes the table's own
         // qualifier - unless the span binds TG itself
-        let subt = |t: &str| merge_subst(t, "D", &src, &row, "TG", "T", &[], &[], 1).unwrap();
+        let subt = |t: &str| merge_subst(t, "D", &src, &row, "TG", "T", &[], &[], &[], 1).unwrap();
         assert_eq!(subt("S = (SELECT NM FROM D x WHERE x.ID = TG.ID)"), "S = (SELECT NM FROM D x WHERE x.ID = T.ID)");
         assert_eq!(subt("A = (SELECT COUNT(*) FROM E TG WHERE TG.TID = D.ID)"), "A = (SELECT COUNT(*) FROM E TG WHERE TG.TID = 1)");
         // the target named unaliased beside an aliased target reference
         // still refuses (no spelling reaches the outer row)
-        assert!(merge_subst("S = (SELECT S FROM T WHERE T.ID = TG.ID)", "D", &src, &row, "TG", "T", &[], &[], 1).is_err());
+        assert!(merge_subst("S = (SELECT S FROM T WHERE T.ID = TG.ID)", "D", &src, &row, "TG", "T", &[], &[], &[], 1).is_err());
     }
 
     #[test]
