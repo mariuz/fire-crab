@@ -30709,7 +30709,26 @@ fn plan_insert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
         })
         .map(|(rc, v)| (*rc, v))
         .collect();
-    let image = build_insert_image(&landing, descs, db, rel, *format_no)?;
+    // A LITERAL TOO LONG FOR ITS COLUMN IS THE ENGINE'S 22001, the same
+    // law the UPDATE arm's SET list follows: the image builder answers a
+    // bare None for it, and refusing on that answered a 42000 for
+    // `VALUES ('abcdefg')` where the engine raises "string right
+    // truncation, expected length 5, actual 7". The reason is RE-ASKED
+    // here rather than plumbed out of the builder, so the question is
+    // always put to [set_value_fit_error] itself and no second copy of
+    // the fit rule exists to go stale.
+    let image = match build_insert_image(&landing, descs, db, rel, *format_no) {
+        Some(img) => img,
+        None => {
+            for &(rc, v) in &landing {
+                let d = descs.get(rc.field_id as usize)?;
+                if let Some(err) = set_value_fit_error(d, v) {
+                    return Some((Plan::RefusedEval(err), Vec::new()));
+                }
+            }
+            return None;
+        }
+    };
     // a literal for a BLOB column has no bytes in the image: it becomes a
     // blob of this relation at execute (a string is sub_type 1, `_octets` 0)
     let blob_lits: Vec<(usize, Vec<u8>, i16)> = landing
@@ -31178,7 +31197,16 @@ fn encode_set_value(d: &Descriptor, v: &InsVal) -> Option<Option<Vec<u8>>> {
             _ => return None,
         }));
     }
-    let wp = match v {
+    let wp = set_value_wireparam(d, v)?;
+    return encode_wire_value(d, &wp);
+}
+
+/// The wire value a SQL LITERAL becomes on its way into a column - split
+/// out of [encode_set_value] so the fit probe can ask for the SAME value
+/// rather than rebuild it. A copy here went stale once before, in the
+/// text encoder this feeds ([text_bytes_for]).
+fn set_value_wireparam(d: &Descriptor, v: &InsVal) -> Option<WireParam> {
+    Some(match v {
         InsVal::Null => WireParam::Null,
         InsVal::Int(n) => WireParam::Int(*n, 0),
         InsVal::Int128(_) | InsVal::DecFloat34(_) => unreachable!("handled above"),
@@ -31255,8 +31283,22 @@ fn encode_set_value(d: &Descriptor, v: &InsVal) -> Option<Option<Vec<u8>>> {
         InsVal::Param(_) | InsVal::ParamExpr(_) | InsVal::GenId(..) | InsVal::Default => {
             return None
         }
-    };
-    encode_wire_value(d, &wp)
+    })
+}
+
+/// WHY a literal did not encode: the engine's 22001 when it was merely
+/// TOO LONG for its column, `None` for every other refusal - a type
+/// mismatch, or a character with no image in the destination set, which
+/// is the engine's own 22018 and a different vector. Asks
+/// [wire_value_fit_error] over the same wire value [encode_set_value]
+/// builds, so the two cannot drift apart.
+fn set_value_fit_error(d: &Descriptor, v: &InsVal) -> Option<EvalErr> {
+    // [encode_set_value] answers these before the match below, which
+    // calls them unreachable - and neither is ever a text value
+    if matches!(v, InsVal::Int128(_) | InsVal::DecFloat34(_)) {
+        return None;
+    }
+    wire_value_fit_error(d, &set_value_wireparam(d, v)?)
 }
 
 /// One parameter value as decoded from the op_execute message, in the
@@ -33357,7 +33399,24 @@ fn plan_update(sql: &str, db_outer: &Option<Database>) -> Option<(Plan, Vec<Desc
                 SetVal::BlobLit(blob_literal_bytes(&t, att, col_cs), 1)
             }
             InsVal::Octets(b) if d.dtype == dtype::BLOB => SetVal::BlobLit(b, 0),
-            lit => SetVal::Lit(encode_set_value(d, &lit)?),
+            // A LITERAL TOO LONG FOR ITS COLUMN IS THE ENGINE'S 22001,
+            // not a statement this server cannot plan. Refusing at
+            // prepare answered a bare 42000 for `SET S = 'abcdefg'`
+            // where the engine raises "string right truncation, expected
+            // length 5, actual 7" - and a MERGE inherited it through the
+            // UPDATE its branch desugars to. The plan carries the raise
+            // instead ([Plan::RefusedEval], the shape a subquery's raise
+            // above already uses); every OTHER encode failure keeps the
+            // refusal it had.
+            lit => match encode_set_value(d, &lit) {
+                Some(b) => SetVal::Lit(b),
+                None => {
+                    if let Some(err) = set_value_fit_error(d, &lit) {
+                        return Some((Plan::RefusedEval(err), Vec::new()));
+                    }
+                    return None;
+                }
+            },
         };
         sets.push((fid, sv));
     }
@@ -35428,7 +35487,7 @@ fn execute_dml_collecting_inner(
                 let d = descs.get(*fid).ok_or("field beyond format")?;
                 let arg = args.get(*slot).ok_or("missing parameter value")?;
                 match encode_wire_value(d, arg)
-                    .ok_or("parameter type does not match its column")?
+                    .ok_or_else(|| fit_or(d, arg, "parameter type does not match its column"))?
                 {
                     None => {} // NULL: the flag is already set
                     Some(bytes) => {
@@ -35462,7 +35521,7 @@ fn execute_dml_collecting_inner(
                 let wp = expr_value_to_wireparam(&bound, &v, &[])
                     .ok_or("parameter type does not match its column")?;
                 match encode_wire_value(d, &wp)
-                    .ok_or("parameter type does not match its column")?
+                    .ok_or_else(|| fit_or(d, &wp, "parameter type does not match its column"))?
                 {
                     None => {} // NULL: the flag is already set
                     Some(bytes) => {
@@ -35546,7 +35605,7 @@ fn execute_dml_collecting_inner(
                     ),
                 };
                 match encode_wire_value(d, &wp)
-                    .ok_or("default value does not fit its column")?
+                    .ok_or_else(|| fit_or(d, &wp, "default value does not fit its column"))?
                 {
                     None => {}
                     Some(bytes) => {
@@ -35772,8 +35831,9 @@ fn execute_dml_collecting_inner(
                             blob_sets.push((*fid, *slot));
                             continue;
                         }
-                        encode_wire_value(d, arg)
-                            .ok_or("parameter type does not match its column")?
+                        encode_wire_value(d, arg).ok_or_else(|| {
+                            fit_or(d, arg, "parameter type does not match its column")
+                        })?
                     }
                     SetVal::Expr(e) => {
                         expr_sets.push((
@@ -36131,8 +36191,9 @@ fn execute_dml_collecting_inner(
                                 }
                             },
                         };
-                        match encode_wire_value(d, &wp)
-                            .ok_or("expression result does not fit the column")?
+                        match encode_wire_value(d, &wp).ok_or_else(|| {
+                            fit_or(d, &wp, "expression result does not fit the column")
+                        })?
                         {
                             None => img[fid / 8] |= 1 << (fid % 8),
                             Some(b) => {
@@ -36917,7 +36978,83 @@ fn flush_careful(path: &str, before: &fire_crab_ods::Image, after: &fire_crab_od
 /// The byte bound stays. It is the field's actual capacity, it is what
 /// stops a wide value overrunning the record image, and in every
 /// single-byte character set the two bounds are the same number.
+/// WHY a text value could not be written into its column.
+///
+/// The distinction matters because the two answers are different SQL
+/// errors: a value too long for the declared width is the engine's
+/// 22001 *string right truncation* carrying two counts, while a
+/// character with no image in the destination set, a malformed carrier
+/// value or a type that does not convert are the REFUSALS this server
+/// records (the 22018 / 22000 boundaries), which keep their own text.
+enum TextFit {
+    /// the engine's 22001, with the counts it reports: `expected` is the
+    /// column's declared CHARACTER count and `actual` the value's own,
+    /// measured in the DESTINATION's characters - one byte is one
+    /// character in a byte carrier, which is why five two-byte
+    /// characters into a `VARCHAR(5) CHARACTER SET NONE` report 10 while
+    /// seven of them into a `VARCHAR(5) UTF8` report 7 (measured on
+    /// every write path: UPDATE, INSERT, INSERT .. SELECT, MERGE,
+    /// RETURNING, a bound `?`, and CHAR as well as VARCHAR)
+    TooLong { expected: usize, actual: usize },
+    Other,
+}
+
+/// The 22001 a text value earns when it does not fit its column - the
+/// vector the engine raises on EVERY write path, measured: UPDATE and
+/// INSERT with a literal, a concatenation, INSERT .. SELECT, MERGE,
+/// UPDATE .. RETURNING and a bound `?`, into VARCHAR and CHAR alike
+/// (`expected length 5, actual 7`). `None` when the value failed for
+/// some OTHER reason, where the caller's own refusal text still stands.
+///
+/// fire-crab answered a bare Dynamic SQL Error (42000) for all of them:
+/// [encode_wire_value] returns a plain `None` and every caller mapped it
+/// to a generic message, throwing away the two counts the error carries.
+fn wire_value_fit_error(d: &Descriptor, wp: &WireParam) -> Option<EvalErr> {
+    if !matches!(d.dtype, dtype::TEXT | dtype::VARYING) {
+        return None;
+    }
+    // the same source-charset reading [encode_wire_value]'s text arm
+    // makes, so the counts come from the same encoding it tried
+    let (text, src_cs) = match wp {
+        WireParam::Text(t) => (t, fire_crab_ods::intl::CS_UTF8),
+        WireParam::TextCs(t, cs) => (t, *cs),
+        _ => return None,
+    };
+    match text_bytes_for_r(text, src_cs, d, d.length as usize) {
+        Err(TextFit::TooLong { expected, actual }) => Some(EvalErr::StringTruncation {
+            expected: expected as i64,
+            actual: actual as i64,
+        }),
+        _ => None,
+    }
+}
+
+/// The error a failed [encode_wire_value] earns on a write path: the
+/// ENGINE'S OWN 22001 when the value was simply too long for its column,
+/// else this path's own refusal text. Every DML site asks for it, so
+/// UPDATE, INSERT, INSERT .. SELECT, MERGE, RETURNING and a bound `?`
+/// all answer the same vector - they answered a bare 42000 before.
+fn fit_or(d: &Descriptor, wp: &WireParam, msg: &str) -> ExecErr {
+    match wire_value_fit_error(d, wp) {
+        Some(e) => ExecErr::Eval(e),
+        None => ExecErr::Text(msg.to_string()),
+    }
+}
+
 fn text_bytes_for(text: &str, src_cs: u8, d: &Descriptor, flen: usize) -> Option<Vec<u8>> {
+    text_bytes_for_r(text, src_cs, d, flen).ok()
+}
+
+/// [text_bytes_for] with its reason kept. ONE implementation, not two:
+/// the copy that used to live beside this one went stale the moment the
+/// length check here learned to count characters, so the DML paths that
+/// need the 22001's numbers ask this rather than measuring again.
+fn text_bytes_for_r(
+    text: &str,
+    src_cs: u8,
+    d: &Descriptor,
+    flen: usize,
+) -> Result<Vec<u8>, TextFit> {
     // a TABLED single-byte column (WIN1252, ISO8859_1) stores its
     // codepage's bytes, not UTF-8 - 'é' into a WIN1252 column is the one
     // byte 0xE9, exactly what the engine wrote and reads back. A
@@ -36935,9 +37072,9 @@ fn text_bytes_for(text: &str, src_cs: u8, d: &Descriptor, flen: usize) -> Option
         // validated only against the destination's encoding: the same
         // bytes into UTF8 raise the engine's 22000 malformed-string,
         // which this refusal stands in for (both reject, no row lands)
-        encoded = fire_crab_ods::intl::carrier_encode(text)?;
+        encoded = fire_crab_ods::intl::carrier_encode(text).ok_or(TextFit::Other)?;
         if dest_cs == fire_crab_ods::intl::CS_UTF8 && std::str::from_utf8(&encoded).is_err() {
-            return None;
+            return Err(TextFit::Other);
         }
         &encoded
     } else if fire_crab_ods::intl::tabled(src_cs)
@@ -36946,11 +37083,14 @@ fn text_bytes_for(text: &str, src_cs: u8, d: &Descriptor, flen: usize) -> Option
         // a TABLED source into a byte-carrier destination: the engine
         // copies the SOURCE CODEPAGE's bytes (probed: WIN1252 'é€2'
         // lands E9 80 32 in a NONE column, not the UTF-8 six)
-        encoded = fire_crab_ods::intl::encode_text(src_cs, text).ok().flatten()?;
+        encoded = fire_crab_ods::intl::encode_text(src_cs, text)
+            .ok()
+            .flatten()
+            .ok_or(TextFit::Other)?;
         &encoded
     } else {
         match fire_crab_ods::intl::encode_text(dest_cs, text) {
-            Err(_) => return None,
+            Err(_) => return Err(TextFit::Other),
             Ok(Some(v)) => {
                 encoded = v;
                 &encoded
@@ -36958,29 +37098,36 @@ fn text_bytes_for(text: &str, src_cs: u8, d: &Descriptor, flen: usize) -> Option
             Ok(None) => text.as_bytes(),
         }
     };
-    if text.chars().count() > fire_crab_ods::intl::char_length(d.dtype, flen as u16, d.sub_type) {
-        return None;
+    // TOO LONG IS NOT A REFUSAL, it is the engine's 22001 ([TextFit]).
+    // `expected` is the declared CHARACTER count and `actual` the
+    // value's own: its characters for a real destination charset, and
+    // its BYTES for a byte carrier, where one byte IS one character -
+    // which is why five two-byte characters into a VARCHAR(5) NONE
+    // report 10 and seven of them into a VARCHAR(5) UTF8 report 7.
+    let expected = fire_crab_ods::intl::char_length(d.dtype, flen as u16, d.sub_type);
+    if text.chars().count() > expected {
+        return Err(TextFit::TooLong { expected, actual: text.chars().count() });
     }
     match d.dtype {
         dtype::VARYING => {
             if b.len() + 2 > flen {
-                return None;
+                return Err(TextFit::TooLong { expected, actual: b.len() });
             }
             let mut out = (b.len() as u16).to_le_bytes().to_vec();
             out.extend_from_slice(b);
-            Some(out)
+            Ok(out)
         }
         dtype::TEXT => {
             if b.len() > flen {
-                return None;
+                return Err(TextFit::TooLong { expected, actual: b.len() });
             }
             let mut out = b.to_vec();
             // CHAR pads to its declared length with the CHARSET's own
             // space - 0x00 for OCTETS (cvt.cpp:2069)
             out.resize(flen, fire_crab_ods::intl::pad_byte(dest_cs));
-            Some(out)
+            Ok(out)
         }
-        _ => None,
+        _ => Err(TextFit::Other),
     }
 }
 
