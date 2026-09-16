@@ -89,6 +89,35 @@ both "an UPDATE over a rolled-back DELETE's stub (the engine reads the chain)" \
     "DELETE FROM T WHERE ID = 2; ROLLBACK; UPDATE T SET V = 'again' WHERE ID = 2; COMMIT; SELECT * FROM T ORDER BY ID; UPDATE T SET V = 't2' WHERE ID = 2; COMMIT;"
 both "MATCHED updates, NOT MATCHED inserts" \
     "MERGE INTO T USING S ON T.ID = S.ID WHEN MATCHED THEN UPDATE SET V = S.V WHEN NOT MATCHED THEN INSERT (ID, V) VALUES (S.ID, S.V); SELECT * FROM T ORDER BY ID; ROLLBACK;"
+
+# A NON-ASCII LITERAL ANYWHERE IN A MERGE. [mark_merge_params] renumbers
+# the statement's `?` before it is split, and it walked BYTES - `b[i] as
+# char` made every byte of a multi-byte character its own char, which
+# pushing re-encoded as UTF-8. So every literal in a MERGE was doubled
+# (`SET V = 'éé'` stored 8 octets for the engine's 4), under EVERY
+# attachment charset, while the plain UPDATE twin of the same clause was
+# always right - it never comes through here. The two condition cells
+# matter most: a doubled literal simply stops COMPARING EQUAL, so the
+# row was silently not matched and the branch never fired at all.
+echo "-- a non-ASCII literal in a MERGE (marker renumbering walked bytes) --"
+both "branch literal keeps its octets" \
+    "MERGE INTO T USING S ON T.ID = S.ID WHEN MATCHED THEN UPDATE SET V = 'éé'; SELECT ID, OCTET_LENGTH(V), CHAR_LENGTH(V) FROM T ORDER BY ID; ROLLBACK;"
+both "literal carried by the SOURCE" \
+    "MERGE INTO T USING (SELECT 2 AS ID, 'éé' AS V FROM RDB\$DATABASE) S ON T.ID = S.ID WHEN MATCHED THEN UPDATE SET V = S.V; SELECT ID, OCTET_LENGTH(V) FROM T ORDER BY ID; ROLLBACK;"
+# THE CONDITION CELLS COMPARE AGAINST A STORED COLUMN, written by a
+# plain UPDATE whose path was always correct - not against another
+# literal in the same MERGE. Both literals were doubled together, so
+# they still compared EQUAL to each other and the cell passed on the
+# broken binary: a check that passes on the bug it is meant to catch is
+# not a check.
+both "an ON-clause literal still MATCHES" \
+    "UPDATE T SET V = 'éé' WHERE ID = 2; MERGE INTO T USING (SELECT 2 AS ID FROM RDB\$DATABASE) S ON T.ID = S.ID AND T.V = 'éé' WHEN MATCHED THEN UPDATE SET V = 'hit'; SELECT ID, V FROM T ORDER BY ID; ROLLBACK;"
+both "a WHEN .. AND literal still MATCHES" \
+    "UPDATE T SET V = 'éé' WHERE ID = 2; MERGE INTO T USING (SELECT 2 AS ID FROM RDB\$DATABASE) S ON T.ID = S.ID WHEN MATCHED AND T.V = 'éé' THEN UPDATE SET V = 'hit'; SELECT ID, V FROM T ORDER BY ID; ROLLBACK;"
+both "a NOT MATCHED insert's literal" \
+    "MERGE INTO T USING S ON T.ID = S.ID WHEN NOT MATCHED THEN INSERT (ID, V) VALUES (S.ID, 'éé'); SELECT ID, OCTET_LENGTH(V) FROM T ORDER BY ID; ROLLBACK;"
+both "an ascii literal (control)" \
+    "MERGE INTO T USING S ON T.ID = S.ID WHEN MATCHED THEN UPDATE SET V = 'ee'; SELECT ID, V FROM T ORDER BY ID; ROLLBACK;"
 both "conditional branches, first in order wins; DELETE; an insert condition" \
     "MERGE INTO T USING S ON T.ID = S.ID WHEN MATCHED AND S.V = 'del' THEN DELETE WHEN MATCHED THEN UPDATE SET V = S.V || '!' WHEN NOT MATCHED AND S.ID > 3 THEN INSERT VALUES (S.ID, 'new'); SELECT * FROM T ORDER BY ID; ROLLBACK;"
 both "a condition on the TARGET side" \

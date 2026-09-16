@@ -74,6 +74,37 @@ agree "cast(w) café @WIN1252" "select octet_length(cast(w as varchar(20))) ol, 
 echo "-- CAST validates carrier->real (raises) where comparison does not --"
 agree "cast(o x'..C3A9' AS UTF8) ok" "select char_length(cast(o as varchar(6) character set utf8)) cl from t where id=1;"
 
+echo "-- ...and a LITERAL source, the half of this law that was missing --"
+# [cast_source_charset] consulted [text_form] ONLY when the target NAMED
+# a character set, so a bare `CAST(<literal> AS VARCHAR(n))` fell through
+# to [err_spell_charset] and kept CS_UTF8 - and the evaluator then moved
+# it into a byte-carrier attachment a SECOND time. The literal already
+# holds one char per byte there ([stmt_text_decode]), so under a NONE
+# attachment `CAST('éé' AS VARCHAR(20))` was 8 octets for the engine's 4
+# and read back as the mojibake Ã©Ã©; a 3-byte character went 3 -> 6, and
+# an OCTETS destination shipped C383C2A9C383C2A9 for C3A9C3A9.
+#
+# EVERY CELL ABOVE IS COLUMN-SOURCED, which is why the whole literal
+# family was wrong while this gate passed: a column carries its own
+# charset into err_spell_charset and never took the second encode.
+agree "cast(literal) café bare"     "select octet_length(cast('café' as varchar(20))) ol, char_length(cast('café' as varchar(20))) cl from rdb\$database;"
+agree "cast(literal) 中 (3-byte)"    "select octet_length(cast('中' as varchar(20))) ol, char_length(cast('中' as varchar(20))) cl from rdb\$database;"
+agree "cast(literal || NONE column)"  "select octet_length(cast('é' || n as varchar(20))) ol, char_length(cast('é' || n as varchar(20))) cl from t where id=1;"
+# RECORDED, NOT FIXED - a DIFFERENT bug, in the CONCAT itself and not in
+# the cast: a non-ASCII literal concatenated with a REAL-charset column
+# under a byte-carrier attachment double-encodes the literal, with or
+# without a cast around it. Measured: `select 'é' || u` under a NONE
+# attachment is OL 7 / CL 5 on the engine and OL 9 / CL 6 here, and the
+# cast forms follow (7 -> 9). A NONE column (the cell above) agrees, an
+# ASCII literal agrees, and every shape agrees under a UTF8 attachment.
+# It fails on the previous binary too, so it is not this slice's doing.
+agree "cast(literal) into OCTETS"    "select octet_length(cast('café' as varchar(20) character set octets)) ol, char_length(cast('café' as varchar(20) character set octets)) cl from rdb\$database;"
+agree "cast(literal) named NONE"     "select octet_length(cast('café' as varchar(20) character set none)) ol, char_length(cast('café' as varchar(20) character set none)) cl from rdb\$database;"
+agree "cast(literal) into a CHAR(8)" "select octet_length(cast('café' as char(8))) ol, char_length(cast('café' as char(8))) cl from rdb\$database;"
+agree "cast(literal) @UTF8"          "select octet_length(cast('café' as varchar(20))) ol, char_length(cast('café' as varchar(20))) cl from rdb\$database;" UTF8
+agree "cast(literal) @WIN1252"       "select octet_length(cast('café' as varchar(20))) ol, char_length(cast('café' as varchar(20))) cl from rdb\$database;" WIN1252
+agree "cast(ascii literal) control"  "select octet_length(cast('cafe' as varchar(20))) ol, char_length(cast('cafe' as varchar(20))) cl from rdb\$database;"
+
 kill $srv 2>/dev/null; wait $srv 2>/dev/null; trap - EXIT
 [ $fail = 0 ] && echo "PASS castnone" || echo "FAIL castnone"
 exit $fail

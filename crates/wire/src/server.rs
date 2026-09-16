@@ -57190,7 +57190,26 @@ fn transcode_text(src: u8, dst: u8, s: String) -> Result<String, EvalErr> {
 /// moves.
 fn cast_source_charset(e: &Expr, t: &CastTarget, descs: &[Descriptor]) -> u8 {
     use fire_crab_ods::intl::{byte_carrier, charset_id, tabled, CS_UTF8};
-    if matches!(t, CastTarget::Text { cs: Some(_), .. }) {
+    // ...AND FOR AN UNQUALIFIED TEXT TARGET TOO, which is where this was
+    // missing. The `Att` branch below was written for a cast that NAMES
+    // a character set; a bare `CAST(x AS VARCHAR(n))` never reached it,
+    // so a LITERAL source kept CS_UTF8 from [err_spell_charset] and the
+    // evaluator transcoded it into a byte-carrier attachment a SECOND
+    // time - the literal already holds one char per byte there
+    // ([stmt_text_decode]), the same trap the predicate path records at
+    // its own `to_carrier` lift. Measured under a NONE attachment:
+    // `CAST('éé' AS VARCHAR(20))` was 8 octets for the engine's 4 (and
+    // read back as the mojibake Ã©Ã©), `'€'` 6 for 3, an OCTETS
+    // destination C383C2A9C383C2A9 for the engine's C3A9C3A9, and a
+    // MERGE - whose branch desugars through text - doubled TWICE to 16.
+    // A plain SELECT shows it too, so this was never a store bug.
+    //
+    // Widening the guard moves ONLY the `Att` case: for an unqualified
+    // target the `Ttype` branch returns exactly what err_spell_charset
+    // already returns (a carrier or tabled column its own set, a UTF8
+    // one CS_UTF8), which is why a COLUMN source, a named CHARACTER SET,
+    // an ASCII literal and a real attachment all already agreed.
+    if matches!(t, CastTarget::Text { .. }) {
         match text_form(e, descs) {
             Some((_, _, TfCs::Ttype(tt))) => {
                 let cs = charset_id(tt as i16);
@@ -82670,6 +82689,13 @@ fn plan_merge(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor>
                     return None;
                 }
                 let sets_txt = action["UPDATE".len()..].trim()["SET".len()..].trim().to_string();
+                // WHERE A BRANCH'S TEXT COMES FROM: captured here as a
+                // slice of the statement the planner was handed. Printed
+                // with its BYTE LENGTH beside the desugared statement's
+                // ([merge_exec]), because a text literal encoded once too
+                // often reads identically on a UTF-8 console and differs
+                // only in the count - which is what separates a capture
+                // fault from an assembly one.
                 MergeAction::Update(sets_txt)
             } else {
                 return None;
@@ -82847,13 +82873,29 @@ const MERGE_PARAM_MARK: &str = "FC$P";
 /// Replace every `?` outside a string literal with its numbered marker.
 /// Returns the rewritten text and how many there were.
 fn mark_merge_params(text: &str) -> (String, usize) {
-    let b = text.as_bytes();
+    // BY CHARACTER, NOT BY BYTE. `b[i] as char` made every BYTE of a
+    // multi-byte character its own char, and pushing it re-encoded each
+    // as UTF-8 - the `to_carrier` lift applied to a string that was
+    // already decoded, so a two-character literal came out four.
+    //
+    // This runs on EVERY MERGE before the statement is split, so it
+    // doubled every non-ASCII literal ANYWHERE in one: a SET value
+    // (`SET U20 = 'éé'` stored 8 octets for the engine's 4, as the
+    // mojibake Ã©Ã©), a literal in the SOURCE select, and one in the ON
+    // or WHEN .. AND condition - where the doubled text simply stopped
+    // COMPARING EQUAL, so the row was silently not matched and the
+    // branch never fired. Under every attachment charset, since the lift
+    // is of the decoded string and not of the client's bytes.
+    //
+    // A hex literal and a column value were never affected (ASCII, and
+    // not carried in the text), and the plain UPDATE twin of the same
+    // clause was always right - it never comes through here.
+    //
+    // `'` and `?` are ASCII, so the marker scan itself is unchanged.
     let mut out = String::with_capacity(text.len() + 8);
-    let mut i = 0usize;
     let mut in_str = false;
     let mut n = 0usize;
-    while i < b.len() {
-        let c = b[i] as char;
+    for c in text.chars() {
         if c == '\'' {
             in_str = !in_str;
             out.push(c);
@@ -82863,7 +82905,6 @@ fn mark_merge_params(text: &str) -> (String, usize) {
         } else {
             out.push(c);
         }
-        i += 1;
     }
     (out, n)
 }
@@ -83470,6 +83511,11 @@ fn merge_exec(
     else {
         return Err("not a MERGE plan".into());
     };
+    // THE SWITCH IS READ ONCE, not once per source row: the desugared
+    // statement is traced inside the per-row loops below, and an
+    // `env::var` there would put a lookup on every row of every MERGE -
+    // the cost [timed] records for the same reason.
+    let trace = trace_on();
     // the source rows, and the names their values answer to
     let (rows, src_cols, src_runtime) = {
         let (splan, _) = plan_query(source_sql, database);
@@ -83653,6 +83699,16 @@ fn merge_exec(
                 // EXECUTE the write on the LIVE image so earlier rows'
                 // writes accumulate - the guard is dropped before the
                 // write.
+                // THE DESUGARED PER-ROW STATEMENT, which nothing printed
+                // before: a MERGE is executed by building these as TEXT,
+                // so when a branch answers differently from the plain DML
+                // twin of the same clause, this line is the difference.
+                // The byte length is part of it - a text literal that has
+                // been encoded once too often looks identical on a UTF-8
+                // console and differs only here.
+                if trace {
+                    eprintln!("[srv] merge branch sql = {:?} ({} bytes)", sql, sql.len());
+                }
                 let (aplan, _) = {
                     let _g = start_image.clone().map(SubqImageGuard::arm);
                     if kind == 1 {
@@ -83702,6 +83758,9 @@ fn merge_exec(
                         Some(c) => format!("INSERT INTO {} ({}) SELECT {} FROM RDB$DATABASE{}", render_canon_ref(target), c, sub(vals, 1)?, where_),
                         None => format!("INSERT INTO {} SELECT {} FROM RDB$DATABASE{}", render_canon_ref(target), sub(vals, 1)?, where_),
                     };
+                    if trace {
+                        eprintln!("[srv] merge insert sql = {:?} ({} bytes)", sql, sql.len());
+                    }
                     let (iplan, _) = {
                         let _g = start_image.clone().map(SubqImageGuard::arm);
                         plan_insert(&sql, database)
@@ -83762,6 +83821,16 @@ fn merge_exec(
                         }
                         MergeAction::Delete => (format!("DELETE FROM {} WHERE {}", render_canon_ref(target), where_), 2),
                     };
+                    // the MATCHED branch's desugared statement, printed
+                    // for the same reason as the by-source one above:
+                    // when a branch answers differently from the plain
+                    // DML twin of the same clause, this text and its
+                    // BYTE LENGTH are the difference - a text literal
+                    // encoded once too often reads identically on a
+                    // UTF-8 console and differs only in the count.
+                    if trace {
+                        eprintln!("[srv] merge matched sql = {:?} ({} bytes)", sql, sql.len());
+                    }
                     // fold against the start image, execute on the live
                     // one (see the by-source branch above)
                     let (aplan, _) = {
