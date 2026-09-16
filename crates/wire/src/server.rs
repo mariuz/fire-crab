@@ -34157,6 +34157,14 @@ impl From<String> for ExecErr {
         // probed: `UPDATE B SET SEG = ?` with a committed tx's temp id
         // answers the single status line "invalid BLOB ID"), not the
         // generic dynamic SQL error a bare text would become
+        // an OVERFLOW AT A PARAMETER'S SLOT is the engine's 22003, not a
+        // refusal: a MERGE spelling its bound value through that slot
+        // ([merge_subst]) reports this text, and the generic dynamic SQL
+        // error would lose the vector every other DML path already gives
+        // it (the plain `UPDATE ... SET I = COALESCE(?, 0)` twin)
+        if t == "numeric value is out of range" {
+            return ExecErr::Eval(EvalErr::NumericOutOfRange);
+        }
         if t == "invalid BLOB ID" {
             return ExecErr::Gds(GDS_BAD_BLOB_ID, t);
         }
@@ -65017,6 +65025,40 @@ fn resolve_dest_param_expr(
     if !raw_has_param(raw) {
         return resolve_expr(raw, columns, descs);
     }
+    /// A parameter this position leaves UNTYPED. A CAST types its own
+    /// operand and a nested COALESCE types its arguments from its own
+    /// siblings, so a parameter under either is known by the time the
+    /// arithmetic above it is made; anything else this walk does not
+    /// understand counts as untyped, which refuses.
+    fn untyped_param(e: &RawExpr) -> bool {
+        match e {
+            RawExpr::Param(_) => true,
+            RawExpr::Cast(_, _) | RawExpr::Coalesce(_) => false,
+            RawExpr::Neg(a) => untyped_param(a),
+            RawExpr::Bin(a, _, b) | RawExpr::Concat(a, b) | RawExpr::NullIf(a, b) => {
+                untyped_param(a) || untyped_param(b)
+            }
+            _ => raw_has_param(e),
+        }
+    }
+    /// Does this COALESCE argument MULTIPLY, DIVIDE or NEGATE a
+    /// parameter the node cannot type? The engine raises there rather
+    /// than answering - see the Coalesce arm below for the measurement.
+    fn coalesce_arg_raises(a: &RawExpr) -> bool {
+        match a {
+            RawExpr::Bin(l, op, r) => {
+                (matches!(op, ArithOp::Mul | ArithOp::Div)
+                    && (untyped_param(l) || untyped_param(r)))
+                    || coalesce_arg_raises(l)
+                    || coalesce_arg_raises(r)
+            }
+            RawExpr::Neg(x) => untyped_param(x) || coalesce_arg_raises(x),
+            RawExpr::Concat(l, r) | RawExpr::NullIf(l, r) => {
+                coalesce_arg_raises(l) || coalesce_arg_raises(r)
+            }
+            _ => false,
+        }
+    }
     fn set(sink: &mut Vec<Option<Descriptor>>, i: usize, d: Descriptor) {
         if sink.len() <= i {
             sink.resize(i + 1, None);
@@ -65107,6 +65149,29 @@ fn resolve_dest_param_expr(
             // "Data type unknown", refused here
             let sib = v.iter().find(|a| !raw_has_param(a))?;
             let sd = desc_of_projcol(&build_expr_col(sib, "", columns, descs)?);
+            // COALESCE PUSHES NO TYPE INTO ITS ARGUMENTS, so a parameter
+            // under one is still UNKNOWN when the arithmetic above it is
+            // made - and a MULTIPLY, a DIVIDE or a UNARY MINUS over an
+            // unknown operand is an ERROR, not a value: `COALESCE(? * 2,
+            // 0.5)` is -expression evaluation not supported / "Invalid
+            // data type for multiplication in dialect 3", with `2 * ?`,
+            // `? / 2`, `2 / ?` and `? * 1.0` the same and `-?` carrying
+            // negation's own message. ADDITIVE shapes are fine and take
+            // the SIBLING's descriptor (`? + 0`, `? - 0`, `0 - ?` all
+            // describe INT64 scale -1 beside a 0.5, not the column's own
+            // scale), as do a CAST and a nested COALESCE.
+            //
+            // NULLIF, IIF and CASE are NOT this rule - they push the
+            // destination down and take `? * 2` at its type (LONG scale
+            // -2 into a NUMERIC(9,2)). Measured every cell, both as
+            // plain DML and inside a MERGE.
+            //
+            // Refused rather than answered: the engine produces no value
+            // here, and fire-crab used to invent one (`COALESCE(? * 2,
+            // 0.5)` bound 1.115 stored 2.00).
+            if v.iter().any(coalesce_arg_raises) {
+                return None;
+            }
             Expr::Coalesce(
                 v.iter()
                     .map(|a| resolve_dest_param_expr(a, &sd, columns, descs, sink))
@@ -82734,16 +82799,28 @@ fn type_markers_in_sets(
         if !marker_slots(&part[..eq]).is_empty() {
             return None;
         }
-        if !merge_marker_shape_ok(&part[eq + 1..]) {
-            return None;
-        }
         let col = merge_target_col(part[..eq].trim(), columns, tgt_alias)?;
         let d = descs.get(col.field_id as usize)?.clone();
         if !merge_decfloat_marker_ok(&d, &part[eq + 1..]) {
             return None;
         }
-        for slot in slots {
-            set_marker_desc(params, slot, d.clone())?;
+        // THE TREE FIRST - the engine's overrides live there
+        // ([merge_marker_descs]). Destination-typing is what is left when
+        // the value is not a tree that resolver reads.
+        match merge_marker_descs(&part[eq + 1..], &d, columns, descs) {
+            Some(typed) => {
+                for (slot, sd) in typed {
+                    set_marker_desc(params, slot, sd)?;
+                }
+            }
+            None => {
+                if !merge_marker_shape_ok(&part[eq + 1..]) {
+                    return None;
+                }
+                for slot in slots {
+                    set_marker_desc(params, slot, d.clone())?;
+                }
+            }
         }
     }
     Some(())
@@ -82770,10 +82847,12 @@ fn type_markers_in_sets(
 /// admitting the shape produced that WRONG STORE, not because the
 /// engine refuses it). A CAST likewise types its own operand.
 ///
-/// So a marker inside parentheses keeps the old refusal, and the shapes
-/// this admits are the ones destination-typing gets right. Reproducing
-/// the overrides on the TEXT - as [resolve_dest_param_expr] does on the
-/// tree - is the slice that lifts it.
+/// So this is now the FALLBACK rule only: [merge_marker_descs] reads the
+/// value as a TREE first and gets the overrides from the resolver
+/// itself, and this decides what happens when the text is not a tree
+/// that resolver reads (a SOURCE column reference, typically). There
+/// destination-typing is all there is, so a marker inside parentheses -
+/// where an override could be hiding - keeps the old refusal.
 fn merge_marker_shape_ok(value: &str) -> bool {
     marker_slots(value).is_empty() || !value.contains('(')
 }
@@ -82786,6 +82865,66 @@ fn merge_decfloat_marker_ok(_d: &Descriptor, _value: &str) -> bool {
     // ? / 3` bound 10 is the decimal 3.333333333333333333333333333333333
     // on both sides, and the refusal has nothing left to protect.
     true
+}
+
+/// The descriptors a value expression's markers earn when the text can
+/// be READ AS A TREE: each marker becomes the `?` it was made from,
+/// numbered in text order, and [resolve_dest_param_expr] - the engine's
+/// own law - types it against the destination pushed down that tree.
+///
+/// This is what lifts a marker inside a CALL. Measured on a MERGE, one
+/// statement per fresh row, both branches: `SET DF = COALESCE(?, 0)`
+/// describes a plain INTEGER and stores 1 for a bound 1.1 (where typing
+/// from the DECFLOAT column stored 1.1000000000000001); `SET N =
+/// COALESCE(?, 0.5)` takes the SIBLING's scale (INT64 scale -1, storing
+/// 1.10 for 1.115) and not the column's own scale 2; `SET DF = CAST(?
+/// AS INTEGER)` takes the cast's target and stores 2 for 1.6; `SET I =
+/// COALESCE(?, 0)` bound 2^40 overflows at the INTEGER slot (22003) and
+/// leaves the row alone.
+///
+/// `None` when the text is not a tree this resolver reads - a SOURCE
+/// column reference is the common one, since names resolve against the
+/// TARGET's columns - and the caller falls back to destination-typing
+/// under [merge_marker_shape_ok]. A paren-free value cannot hold a CAST
+/// or a COALESCE, so that fallback types exactly what it typed before.
+fn merge_marker_descs(
+    value: &str,
+    dest: &Descriptor,
+    columns: &[RelationColumn],
+    descs: &[Descriptor],
+) -> Option<Vec<(usize, Descriptor)>> {
+    let slots = marker_slots(value);
+    let mut raw = parse_raw_expr_any(&merge_markers_as_params(value)?)?;
+    let mut next = 0usize;
+    renumber_raw_params(&mut raw, &mut next);
+    // the markers the TEXT carries and the placeholders the TREE holds
+    // must be the same ones, or the zip below would type the wrong slot
+    if next != slots.len() {
+        return None;
+    }
+    let mut sink: Vec<Option<Descriptor>> = Vec::new();
+    resolve_dest_param_expr(&raw, dest, columns, descs, &mut sink)?;
+    if sink.len() != slots.len() {
+        return None;
+    }
+    slots.into_iter().zip(sink).map(|(s, d)| Some((s, d?))).collect()
+}
+
+/// Every `FC$P<n>` marker back to the `?` it was made from, so the raw
+/// parser sees the statement the client sent.
+fn merge_markers_as_params(value: &str) -> Option<String> {
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(at) = rest.find(MERGE_PARAM_MARK) {
+        out.push_str(&rest[..at]);
+        let tail = &rest[at + MERGE_PARAM_MARK.len()..];
+        let end = tail.find(|c: char| !c.is_ascii_digit()).unwrap_or(tail.len());
+        tail[..end].parse::<usize>().ok()?;
+        out.push('?');
+        rest = &tail[end..];
+    }
+    out.push_str(rest);
+    Some(out)
 }
 
 /// Type every marker in an `INSERT` branch's value list: by POSITION
@@ -82820,15 +82959,25 @@ fn type_markers_in_values(
         if slots.is_empty() {
             continue;
         }
-        if !merge_marker_shape_ok(item) {
-            return None;
-        }
         let d = descs.get(col.field_id as usize)?.clone();
         if !merge_decfloat_marker_ok(&d, item) {
             return None;
         }
-        for slot in slots {
-            set_marker_desc(params, slot, d.clone())?;
+        // the SET list's twin, one column at a time
+        match merge_marker_descs(item, &d, columns, descs) {
+            Some(typed) => {
+                for (slot, sd) in typed {
+                    set_marker_desc(params, slot, sd)?;
+                }
+            }
+            None => {
+                if !merge_marker_shape_ok(item) {
+                    return None;
+                }
+                for slot in slots {
+                    set_marker_desc(params, slot, d.clone())?;
+                }
+            }
         }
     }
     Some(())
@@ -83034,10 +83183,26 @@ fn merge_subst(
                     (true, Some((d, s0))) => merge_slot_cast(e, d, *s0),
                     _ => e,
                 };
-                let v = e
-                    .eval(&[])
-                    .ok()
-                    .ok_or("a parameter this MERGE cannot write as a literal")?;
+                let v = match e.eval(&[]) {
+                    // THE SLOT'S OWN OVERFLOW IS A RAISE, NOT A REFUSAL.
+                    // `SET I = COALESCE(?, 0)` bound 2^40 types the slot
+                    // INTEGER ([merge_marker_descs]) and the engine
+                    // answers 22003 "numeric value is out of range",
+                    // leaving the row alone - which the plain UPDATE
+                    // twin already did here. Reported as the engine's
+                    // own text so [ExecErr] carries it to the arithmetic
+                    // exception vector; the generic message below used
+                    // to mask it as a bare Dynamic SQL Error.
+                    Ok(Value::OutOfRange) | Err(EvalErr::NumericOutOfRange) => {
+                        return Err("numeric value is out of range".to_string())
+                    }
+                    Ok(v) => v,
+                    Err(_) => {
+                        return Err(
+                            "a parameter this MERGE cannot write as a literal".to_string()
+                        )
+                    }
+                };
                 out.push_str(
                     &dml_subq_literal(&v)
                         .ok_or("a parameter this MERGE cannot write as a literal")?,

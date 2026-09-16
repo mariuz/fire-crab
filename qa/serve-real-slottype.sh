@@ -13,6 +13,22 @@
 # makes: a CAST types its own operand, and COALESCE types from its other
 # arguments (`COALESCE(?, 0)` is a plain INTEGER - 2^40 overflows it).
 #
+# COALESCE pushes NO type into its arguments, which has a second edge:
+# a parameter under a MULTIPLY, a DIVIDE or a unary MINUS there is still
+# UNKNOWN when that node is made, and the engine RAISES rather than
+# answering - `COALESCE(? * 2, 0.5)` is "-expression evaluation not
+# supported / Invalid data type for multiplication in dialect 3", with
+# `2 * ?`, `? / 2`, `2 / ?`, `? * 1.0` the same and `-?` carrying
+# negation's own message. `? + 0`, `? - 0` and `0 - ?` are fine and take
+# the SIBLING's scale, as do a CAST and a nested COALESCE. NULLIF, IIF
+# and CASE are not this rule: they push the destination down and take
+# `? * 2` at its type.
+#
+# A MERGE takes ALL of it, in both branches: its markers are read back
+# as a tree and typed by the same resolver, so `SET DF = COALESCE(?, 0)`
+# stores the engine's 1 and not the 1.1000000000000001 that typing from
+# the destination column produced.
+#
 # THE MULTIPLY ASYMMETRY, measured cell by cell into NUMERIC(9,2) with
 # 1.115 bound: the LEFT operand of a multiply converts at SCALE 0 while
 # everything else takes the destination's scale -
@@ -53,6 +69,16 @@ INSERT INTO MG VALUES (5, 10, 10.00, 10);
 INSERT INTO MG VALUES (6, 10, 10.00, 10);
 INSERT INTO MG VALUES (7, 10, 10.00, 10);
 INSERT INTO MG VALUES (8, 10, 10.00, 10);
+INSERT INTO MG VALUES (9, 10, 10.00, 10);
+INSERT INTO MG VALUES (10, 10, 10.00, 10);
+INSERT INTO MG VALUES (11, 10, 10.00, 10);
+INSERT INTO MG VALUES (12, 10, 10.00, 10);
+INSERT INTO MG VALUES (13, 10, 10.00, 10);
+INSERT INTO MG VALUES (14, 10, 10.00, 10);
+INSERT INTO MG VALUES (15, 10, 10.00, 10);
+INSERT INTO MG VALUES (16, 10, 10.00, 10);
+INSERT INTO MG VALUES (17, 10, 10.00, 10);
+INSERT INTO MG VALUES (18, 10, 10.00, 10);
 COMMIT;
 SQL
 if grep -qi error /tmp/slot-build.log; then echo "FAIL building the fixture:"; sed 's/^/     /' /tmp/slot-build.log; exit 1; fi
@@ -95,6 +121,20 @@ both() { # <label> <sql> <json> <col> <id> [table, default T]
     if [ "$e" = "$f" ] && [ "$se" = "$sf" ]; then echo "OK   $1 [$3] => $e / $se"
     else echo "DIFF $1 [$3]"; echo "     eng: $e / $se"; echo "     fc:  $f / $sf"; fail=1; fi
 }
+# fire-crab DECLINES a shape the ENGINE also refuses, so there is no
+# value to compare - only that fc does not INVENT one. Defined HERE,
+# beside [both], because a helper defined after its call sites is not a
+# helper at all: this gate carried two `refuses` lines it never defined,
+# and bash reported "refuses: command not found" on stderr while the
+# gate still printed PASS. Both lines asserted nothing for as long as
+# they existed; they are real checks below now.
+refuses_fc() { # <label> <sql> <json>
+    local f; f=$(run "$PORT" "$FC" "$2" "$3")
+    case "$f" in
+        ERR*) echo "OK   $1 (fc refuses)" ;;
+        *) echo "FAIL $1 (fc should refuse)"; echo "     fc: $f"; fail=1 ;;
+    esac
+}
 
 echo "-- the value converts at its slot, BEFORE the arithmetic --"
 both "INTEGER dest, ? * 2"        "INSERT INTO T (ID, I) VALUES (1, ? * 2)"   '[1.6]'     I  1
@@ -131,6 +171,39 @@ both "COALESCE(?, 0) fits"        "INSERT INTO T (ID, I) VALUES (50, COALESCE(?,
 both "COALESCE(?, 0) 2^40"        "INSERT INTO T (ID, I) VALUES (51, COALESCE(?, 0))" '[1099511627776]' I 51
 both "COALESCE(?, 0) NULL"        "INSERT INTO T (ID, I) VALUES (52, COALESCE(?, 0))" '[null]' I 52
 
+echo "-- ... and the SIBLING's own scale wins, not the destination's --"
+# COALESCE builds its own descriptor from the arguments that are not
+# parameters: beside a 0.5 the slot is INT64 scale -1 and 1.115 stores
+# 1.10, where the column's own scale 2 would have kept 1.12 (measured)
+both "COALESCE(?, 0.5) scale -1"  "INSERT INTO T (ID, N) VALUES (60, COALESCE(?, 0.5))" '[1.115]' N 60
+both "COALESCE(? + 0, 0.5)"       "INSERT INTO T (ID, N) VALUES (61, COALESCE(? + 0, 0.5))" '[1.115]' N 61
+both "COALESCE(? - 0, 0.5)"       "INSERT INTO T (ID, N) VALUES (62, COALESCE(? - 0, 0.5))" '[1.115]' N 62
+both "COALESCE(0 - ?, 0.5)"       "INSERT INTO T (ID, N) VALUES (63, COALESCE(0 - ?, 0.5))" '[1.115]' N 63
+both "COALESCE(CAST(? AS INT),.5)" "INSERT INTO T (ID, N) VALUES (64, COALESCE(CAST(? AS INTEGER), 0.5))" '[1.6]' N 64
+both "COALESCE(?, ?, 0.5)"        "INSERT INTO T (ID, N) VALUES (65, COALESCE(?, ?, 0.5))" '[null, 1.115]' N 65
+
+echo "-- a param under * / - INSIDE a COALESCE is the ENGINE'S OWN ERROR --"
+# COALESCE pushes NO type into its arguments, so the parameter is still
+# UNKNOWN when the arithmetic above it is made - and the engine raises
+# "-expression evaluation not supported / Invalid data type for
+# multiplication in dialect 3" (division and negation carry their own
+# message). fire-crab used to answer these: COALESCE(? * 2, 0.5) bound
+# 1.115 STORED 2.00 where the engine stores nothing at all.
+#
+# NULLIF, IIF and CASE are NOT this rule - they push the DESTINATION
+# down and take `? * 2` at its type, which is why they are checked
+# against the engine's value just below rather than refused.
+refuses_fc "COALESCE(? * 2, 0.5)"  "INSERT INTO T (ID, N) VALUES (70, COALESCE(? * 2, 0.5))" '[1.115]'
+refuses_fc "COALESCE(2 * ?, 0.5)"  "INSERT INTO T (ID, N) VALUES (71, COALESCE(2 * ?, 0.5))" '[1.115]'
+refuses_fc "COALESCE(? / 2, 0.5)"  "INSERT INTO T (ID, N) VALUES (72, COALESCE(? / 2, 0.5))" '[1.115]'
+refuses_fc "COALESCE(2 / ?, 0.5)"  "INSERT INTO T (ID, N) VALUES (73, COALESCE(2 / ?, 0.5))" '[1.115]'
+refuses_fc "COALESCE(-?, 0.5)"     "INSERT INTO T (ID, N) VALUES (74, COALESCE(-?, 0.5))"    '[1.115]'
+refuses_fc "COALESCE(? * 1.0, .5)" "INSERT INTO T (ID, N) VALUES (75, COALESCE(? * 1.0, 0.5))" '[1.115]'
+refuses_fc "UPDATE COALESCE(? * 2)" "UPDATE U SET N = COALESCE(? * 2, 0.5) WHERE ID = 1"    '[1.115]'
+both "NULLIF(? * 2, 0) answers"    "INSERT INTO T (ID, N) VALUES (76, NULLIF(? * 2, 0))" '[1.115]' N 76
+both "IIF(.., ? * 2, 0) answers"   "INSERT INTO T (ID, N) VALUES (77, IIF(1 > 0, ? * 2, 0))" '[1.115]' N 77
+both "CASE WHEN .. ? * 2 answers"  "INSERT INTO T (ID, N) VALUES (78, CASE WHEN 1 > 0 THEN ? * 2 ELSE 0 END)" '[1.115]' N 78
+
 echo "-- UPDATE ... SET takes the same law --"
 both "UPDATE SET N = ? * 2"       "UPDATE U SET N = ? * 2 WHERE ID = 1"       '[1.115]'   N  1 U
 both "UPDATE SET N = 2 * ?"       "UPDATE U SET N = 2 * ? WHERE ID = 1"       '[1.115]'   N  1 U
@@ -158,11 +231,32 @@ echo "-- ... and a marker in the ON / WHEN-AND still COMPARES, never converts --
 both "MERGE ON param + SET param"  "MERGE INTO MG USING (SELECT 1 AS K FROM RDB\$DATABASE) S ON MG.ID = S.K AND MG.I = ? WHEN MATCHED THEN UPDATE SET N = ?" '[10, 5]' N 1 MG
 both "MERGE WHEN-AND param"        "MERGE INTO MG USING (SELECT 2 AS K FROM RDB\$DATABASE) S ON MG.ID = S.K WHEN MATCHED AND MG.I = ? THEN UPDATE SET N = ? * 2" '[10, 1.115]' N 2 MG
 
-echo "-- recorded refusals (fire-crab only) --"
-# COALESCE types its parameter from its OTHER arguments, which MERGE's
-# text-based typing does not reproduce - admitting the shape STORED
-# 1.1000000000000001 where the engine stores 1, so it refuses instead
-refuses "MERGE UPDATE DF = COALESCE(?, 0)" "MERGE INTO MG USING (SELECT 1 AS K FROM RDB\$DATABASE) S ON MG.ID = S.K WHEN MATCHED THEN UPDATE SET DF = COALESCE(?, 0)" '[1.1]'
-refuses "MERGE UPDATE I = COALESCE(?, 0)"  "MERGE INTO MG USING (SELECT 1 AS K FROM RDB\$DATABASE) S ON MG.ID = S.K WHEN MATCHED THEN UPDATE SET I = COALESCE(?, 0)" '[1099511627776]'
+echo "-- a MERGE's marker inside a CALL takes the CALL's type, both branches --"
+# WAS A REFUSAL: MERGE types a marker from its DESTINATION COLUMN pushed
+# down the value TEXT, which reproduces the destination rule only -
+# admitting `SET DF = COALESCE(?, 0)` that way STORED 1.1000000000000001
+# where the engine stores 1. The value text is now read back as a TREE
+# (its FC$P markers become `?` again) and typed by the SAME resolver the
+# plain INSERT and UPDATE use, so the engine's own overrides apply.
+# Every cell measured on both sides, one statement per fresh row.
+both "MERGE UPDATE DF = COALESCE(?, 0)"   "$(mg 9 'DF = COALESCE(?, 0)')"   '[1.1]'   DF 9  MG
+both "MERGE UPDATE N = COALESCE(?, 0)"    "$(mg 11 'N = COALESCE(?, 0)')"   '[1.115]' N  11 MG
+both "MERGE UPDATE N = COALESCE(?, 0.5)"  "$(mg 12 'N = COALESCE(?, 0.5)')" '[1.115]' N  12 MG
+both "MERGE UPDATE DF = CAST(? AS INT)"   "$(mg 13 'DF = CAST(? AS INTEGER)')" '[1.6]' DF 13 MG
+both "MERGE UPDATE I = CAST(? AS INT)"    "$(mg 14 'I = CAST(? AS INTEGER)')"  '[1.6]' I  14 MG
+both "MERGE UPDATE N = COALESCE(?+0,0.5)" "$(mg 15 'N = COALESCE(? + 0, 0.5)')" '[1.115]' N 15 MG
+# the slot COALESCE gives is a plain INTEGER, and 2^40 OVERFLOWS IT: the
+# engine answers 22003 and leaves the row alone. fire-crab reported a
+# bare "Dynamic SQL Error" here - the overflow was swallowed by the
+# generic "cannot write as a literal" refusal on the substitution path -
+# while its own plain UPDATE twin already answered 22003
+both "MERGE UPDATE I = COALESCE(?, 0) 2^40" "$(mg 10 'I = COALESCE(?, 0)')" '[1099511627776]' I 10 MG
+both "MERGE INSERT DF = COALESCE(?, 0)"   "$(mgi 106 DF 'COALESCE(?, 0)')"  '[1.1]'   DF 106 MG
+both "MERGE INSERT N = COALESCE(?, 0.5)"  "$(mgi 107 N 'COALESCE(?, 0.5)')" '[1.115]' N  107 MG
+both "MERGE INSERT DF = CAST(? AS INT)"   "$(mgi 108 DF 'CAST(? AS INTEGER)')" '[1.6]' DF 108 MG
+# and the engine's own refusal reaches the MERGE branches too
+refuses_fc "MERGE COALESCE(? * 2, 0.5)"   "$(mg 16 'N = COALESCE(? * 2, 0.5)')" '[1.115]'
+refuses_fc "MERGE COALESCE(-?, 0.5)"      "$(mg 17 'N = COALESCE(-?, 0.5)')"    '[1.115]'
+refuses_fc "MERGE INSERT COALESCE(?*2,0)" "$(mgi 109 N 'COALESCE(? * 2, 0.5)')" '[1.115]'
 
 [ $fail -eq 0 ] && echo "PASS serve-real-slottype" || { echo "FAIL serve-real-slottype"; exit 1; }

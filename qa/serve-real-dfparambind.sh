@@ -399,7 +399,19 @@ both "insert ? + ? into D34"    "INSERT INTO PBW (ID, D34) VALUES (302, ? + ?)" 
 both "insert coalesce(?,0) D16" "INSERT INTO PBW (ID, D16) VALUES (303, COALESCE(?, 0))" "[1.1]"
 both "update ? + 1 D34"         "UPDATE PBW SET D34 = ? + 1 WHERE ID = 1" "[0.7]"
 both "update coalesce(?,0) D34" "UPDATE PBW SET D34 = COALESCE(?, 0) WHERE ID = 1" "[1.1]"
-refuses_fc "merge set coalesce(?,0)"  "MERGE INTO PBW USING (SELECT 2 AS K FROM RDB\$DATABASE) SRC ON PBW.ID = SRC.K WHEN MATCHED THEN UPDATE SET D34 = COALESCE(?, 0)" "[1.1]"
+# WAS `refuses_fc`: a MERGE's marker inside a CALL now takes the CALL's
+# OWN type ([merge_marker_descs]), so COALESCE types this parameter from
+# its OTHER argument - a plain INTEGER slot - and a bound 1.1 stores 1 on
+# both sides, exactly as the plain UPDATE twin two lines above already
+# did. Measured (status AND stored value) before converting.
+#
+# ON ITS OWN ROWS, not the shared ID 2: converting an fc-only refusal
+# makes the ENGINE run the statement for the FIRST time, and ID 2 is read
+# by the `stored PBW` check at the end of this gate - rewriting it there
+# is the fixture collision this gate has already been bitten by once.
+store "seed 601 for the MERGE COALESCE cell"  "INSERT INTO PBW (ID, D34, D16) VALUES (601, 0, 0)" "[]"
+store "seed 602 for the MERGE COALESCE cell"  "INSERT INTO PBW (ID, D34, D16) VALUES (602, 0, 0)" "[]"
+store "merge set coalesce(?,0) [1.1] -> 1"  "MERGE INTO PBW USING (SELECT 601 AS K FROM RDB\$DATABASE) SRC ON PBW.ID = SRC.K WHEN MATCHED THEN UPDATE SET D34 = COALESCE(?, 0)" "[1.1]"
 echo "-- MERGE: a BARE marker into a DECFLOAT column binds (written as the value's literal) --"
 store "merge set D34/D16 bare ?"    "MERGE INTO PBW USING (SELECT 2 AS K FROM RDB\$DATABASE) SRC ON PBW.ID = SRC.K WHEN MATCHED THEN UPDATE SET D34 = ?, D16 = ?" "[1.1,1.1]"
 store "merge set D16 narrows 17->16" "MERGE INTO PBW USING (SELECT 2 AS K FROM RDB\$DATABASE) SRC ON PBW.ID = SRC.K WHEN MATCHED THEN UPDATE SET D16 = ?" "[7.2576582964629335]"
@@ -494,7 +506,9 @@ both "update D34 = ? + 1 [2]"          "UPDATE PBW SET D34 = ? + 1 WHERE ID = 2"
 both "update D34 = ? / 3 [2]"          "UPDATE PBW SET D34 = ? / 3 WHERE ID = 2" "[2]"
 both "update D16 = COALESCE(?, 0) [2^40]" "UPDATE PBW SET D16 = COALESCE(?, 0) WHERE ID = 2" "[1099511627776]"
 refuses_fc "insert D34 ? * 1E+3 [2]"         "INSERT INTO PBW (ID, D34) VALUES (790, ? * 1E+3)" "[2]"
-refuses_fc "merge set COALESCE(?,0) [2]"     "MERGE INTO PBW USING (SELECT 2 AS K FROM RDB\$DATABASE) SRC ON PBW.ID = SRC.K WHEN MATCHED THEN UPDATE SET D34 = COALESCE(?, 0)" "[2]"
+# the same conversion as the [1.1] cell above, on its own row 602: the
+# INTEGER slot COALESCE gives takes a bound 2 unchanged and stores 2
+store "merge set COALESCE(?,0) [2] -> 2"     "MERGE INTO PBW USING (SELECT 602 AS K FROM RDB\$DATABASE) SRC ON PBW.ID = SRC.K WHEN MATCHED THEN UPDATE SET D34 = COALESCE(?, 0)" "[2]"
 both "merge insert ? * 3 [2]"          "MERGE INTO PBW USING (SELECT 791 AS K FROM RDB\$DATABASE) SRC ON PBW.ID = SRC.K WHEN NOT MATCHED THEN INSERT (ID, D34) VALUES (SRC.K, ? * 3)" "[2]"
 echo "-- verify-found (round 2): a NON-RUNTIME approximate value refuses at a DECFLOAT store wherever its provenance was erased; ROUND now stores its EXACT value (the roundexact chunk) and is compared --"
 # An INSERT .. SELECT of a CONSTANT literal source is re-planned with its
@@ -539,7 +553,7 @@ agree "FLOAT column untouched by the refused stores; 3.4e38 itself stores" "INSE
 echo "-- verify-found (round 2): MERGE - a FLOAT source compared in ON matches by its own value; a WHEN condition / SET expression compares the bare literal --"
 agree "MERGE ON T.F = SRC.FL matches every non-integer FLOAT row" "DELETE FROM DX; INSERT INTO DX (ID, F, DP) SELECT ID, FL, FL FROM TX; MERGE INTO DX USING (SELECT ID, FL FROM TX) SRC ON (DX.F = SRC.FL AND DX.ID = SRC.ID) WHEN MATCHED THEN UPDATE SET I = 1; MERGE INTO DX USING (SELECT ID, FL FROM TX) SRC ON (DX.DP = SRC.FL) WHEN MATCHED THEN UPDATE SET N = 1; SELECT ID, I, N FROM DX ORDER BY ID;"
 agree "MERGE WHEN .. AND SRC.FL = 2.675 (single-precision TRUE), SET IIF(SRC.FL = 1.1 ..)" "MERGE INTO DX USING (SELECT ID, FL FROM TX) SRC ON (DX.ID = SRC.ID) WHEN MATCHED AND SRC.FL = 2.675 THEN UPDATE SET V = 'hit'; MERGE INTO DX USING (SELECT ID, FL FROM TX) SRC ON (DX.ID = SRC.ID) WHEN MATCHED THEN UPDATE SET I = IIF(SRC.FL = 1.1, 7, 0); SELECT ID, V, I FROM DX ORDER BY ID;"
-agree "stored PBW after the verify-found sections" "select id, cast(d34 as varchar(40)) a, cast(d16 as varchar(40)) b from pbw where id in (1, 2, 3, 9, 78, 790, 791) order by id;"
+agree "stored PBW after the verify-found sections" "select id, cast(d34 as varchar(40)) a, cast(d16 as varchar(40)) b from pbw where id in (1, 2, 3, 9, 78, 601, 602, 790, 791) order by id;"
 
 kill $srv 2>/dev/null; wait $srv 2>/dev/null; trap - EXIT
 [ $fail = 0 ] && echo "PASS dfparambind" || echo "FAIL dfparambind"
