@@ -12306,6 +12306,34 @@ fn bind_filter(
     }
 }
 
+/// Bind the `?` placeholders in every join step's ON condition.
+///
+/// The ON is evaluated PER COMBINED ROW, at several executors, off the
+/// [JoinPart]s the plan carries - so the substitution happens ONCE here,
+/// where the arguments are in hand, exactly as [bind_filter] does for the
+/// WHERE above the join. Binding before the parts are split or cloned is
+/// what keeps an unbound ON from reaching a mirror side.
+fn bind_parts(parts: &[JoinPart], args: &[WireParam]) -> Result<Vec<JoinPart>, ExecErr> {
+    parts
+        .iter()
+        .map(|p| {
+            let mut p = p.clone();
+            p.on = p.on.bind(args)?;
+            Ok(p)
+        })
+        .collect()
+}
+
+/// [bind_parts] on a ROW-SOURCE path, whose failures are [EvalErr]s -
+/// the [bind_filter_eval] twin, and for the same reason: an ON that
+/// raises per row keeps its status vector.
+fn bind_parts_eval(parts: &[JoinPart], args: &[WireParam]) -> Result<Vec<JoinPart>, EvalErr> {
+    bind_parts(parts, args).map_err(|e| match e {
+        ExecErr::Eval(ev) => ev,
+        _ => EvalErr::Unsupported,
+    })
+}
+
 /// [bind_filter] on a ROW-SOURCE path, whose failures are [EvalErr]s:
 /// an EVAL-shaped bind failure - the invariant pass or the key
 /// conversion raising - KEEPS its status vector, so a per-row inner
@@ -38813,7 +38841,12 @@ const CROSS_ON: &str = "\u{0}cross";
 /// DERIVED from the two sides' shared column names.
 const NATURAL_ON: &str = "\u{0}natural";
 
-fn parse_on(on_s: &str, sides: &[JoinSide]) -> Option<Predicate> {
+fn parse_on(
+    on_s: &str,
+    sides: &[JoinSide],
+    np: &mut usize,
+    params: &mut Vec<Option<Descriptor>>,
+) -> Option<Predicate> {
     // a step with no condition keeps every pair: the fold's `matches`
     // answers true for every combined row
     if on_s == CROSS_ON {
@@ -38829,19 +38862,18 @@ fn parse_on(on_s: &str, sides: &[JoinSide]) -> Option<Predicate> {
     // UNKNOWN, `Predicate::matches` answers false, and an unmatched
     // left row is padded exactly as it was.
     let toks = tokenize(on_s)?;
-    let mut np = 0usize;
-    let raw = parse_predicate(&toks, &mut np)?;
-    if np != 0 {
-        return None; // a `?` in an ON is not a shape this server binds
-    }
-    let mut params: Vec<Option<Descriptor>> = Vec::new();
-    let on = resolve_join_predicate(raw, sides, &mut params)?;
-    // the ON must actually reference BOTH sides - a condition over one
-    // of them is a filter wearing a join's clothes, and answering it
-    // would turn a missing predicate into a silent cross product
-    if !params.is_empty() {
-        return None;
-    }
+    // A `?` IN THE ON. Its slot number continues the statement's count -
+    // the ON sits between the select list and the WHERE in the text, and
+    // that is the order the engine numbers by (probed: `ON P.I = ?
+    // WHERE P.ID = ?` bound [5, 1] answers, [1, 5] does not). The
+    // descriptors land in the caller's sink, so the describe announces
+    // them, and each part's `on` is BOUND at execute ([bind_parts]).
+    let raw = parse_predicate(&toks, np)?;
+    let on = resolve_join_predicate(raw, sides, params)?;
+    // (A slot registered here used to refuse the statement - the guard
+    // read the LOCAL sink this function used to own. With the caller's
+    // sink threaded through it would have refused every statement
+    // carrying any parameter at all, the WHERE's included.)
     Some(on)
 }
 
@@ -40206,6 +40238,10 @@ fn plan_join_bound(
     // per step, the column names a NATURAL join merged - hidden on the
     // new side so `*` emits them once and a bare name is not ambiguous
     let mut natural_shared: Vec<Vec<String>> = Vec::new();
+    // the ON clauses number their `?` placeholders BEFORE the WHERE's
+    // (the text order the engine uses), and each step continues the one
+    // before it, so a two-join chain numbers left to right
+    let mut on_np = params.len().max(proj_params);
     for (k, (kind, _, on_s, vis)) in joins.iter().enumerate() {
         // a step sees the sides from `vis` up to the one it adds - the
         // whole chain for a plain FROM, and only its own comma item for
@@ -40240,7 +40276,7 @@ fn plan_join_bound(
             }
         } else {
             natural_shared.push(Vec::new());
-            parse_on(on_s, visible)?
+            parse_on(on_s, visible, &mut on_np, params)?
         };
         // an INNER or comma join's key is HASHED, so its text side is
         // read strictly - see [mark_hash_keys]
@@ -40306,7 +40342,7 @@ fn plan_join_bound(
     // the select list resolves); the WHERE's own `?` number after them.
     // params is empty on the main join call, so the max keeps the other
     // callers (COUNT(*), the bound recursion) at their old params.len()
-    let mut next_param = params.len().max(proj_params);
+    let mut next_param = on_np.max(params.len()).max(proj_params);
     let filter = match where_s {
         None => None,
         Some(ws) => Some(
@@ -45612,8 +45648,9 @@ fn stream_first_n(
         // past the limit.
         Plan::Join { base, base_width, parts, cols, filter, order_by, defer } => {
             let bound = bind_filter_eval(filter, args)?;
+            let parts = bind_parts_eval(parts, args)?;
             let base = resolve_driver_base(db, base, defer, &bound);
-            let src = join_rowsource(&base, *base_width, parts, &bound);
+            let src = join_rowsource(&base, *base_width, &parts, &bound);
             let mut out: Vec<Vec<Value>> = Vec::new();
             if order_by.is_empty() {
                 src.for_each(db, &mut |combined| {
@@ -45840,9 +45877,10 @@ fn branch_rows_res(
     // same two steps `Plan::Project` takes below.
     if let Plan::Join { base, base_width, parts, cols, filter, order_by, defer } = plan {
         let filter = bind_filter_eval(filter, args)?;
+        let parts = bind_parts_eval(parts, args)?;
         let base = resolve_driver_base(db, base, defer, &filter);
         let mut rows =
-            join_rows(db, &base, *base_width, parts, &filter)?;
+            join_rows(db, &base, *base_width, &parts, &filter)?;
         if !order_by.is_empty() {
             sort_rows(&mut rows, order_by)?;
         }
@@ -45871,8 +45909,9 @@ fn branch_rows_res(
     {
         let filter = bind_filter_eval(filter, args)?;
         let having = bind_filter_eval(having, args)?;
+        let parts = bind_parts_eval(parts, args)?;
         let base = resolve_driver_base(db, base, defer, &filter);
-        let input = join_rows(db, &base, *base_width, parts, &filter)?;
+        let input = join_rows(db, &base, *base_width, &parts, &filter)?;
         // the joined rows are a materialised leaf; the fold and the sort
         // above them are tree nodes (a NestedLoopJoin leaf is R3)
         let rows = RowSource::aggregate_sorted(
@@ -52602,6 +52641,11 @@ impl JoinCursor {
         let Plan::Join { base, base_width, parts, cols, filter, order_by, defer } = plan else {
             return None;
         };
+        // a `?` in an ON is substituted HERE, before the parts are split
+        // or cloned into the cursor's own data - an unbound one reaching
+        // the mirror side would answer with no value at all
+        let bound_parts = bind_parts(parts, args).ok()?;
+        let parts: &[JoinPart] = &bound_parts;
         // FIRST/SKIP already stream via stream_first_n (this is the BARE join)
         if !order_by.is_empty() && !raw {
             return None;
@@ -58371,8 +58415,9 @@ fn emit_rows_inner(
                 {
                     if !*distinct && order_by.is_empty() {
                         let bound = bind_filter(filter, args)?;
+                        let parts = bind_parts(parts, args)?;
                         let base = resolve_driver_base(db, base, defer, &bound);
-                        let src = join_rowsource(&base, *base_width, parts, &bound);
+                        let src = join_rowsource(&base, *base_width, &parts, &bound);
                         let stop_at = take.map(|t| skip.saturating_add(t));
                         let mut accepted = 0usize;
                         let mut enc: Option<EvalErr> = None;
@@ -58416,8 +58461,9 @@ fn emit_rows_inner(
                         // ORDER BY A.K` raised on a later row where the engine
                         // sorts, cuts to two rows, and projects only those.
                         let bound = bind_filter(filter, args)?;
+                        let parts = bind_parts(parts, args)?;
                         let base = resolve_driver_base(db, base, defer, &bound);
-                        let src = join_rowsource(&base, *base_width, parts, &bound);
+                        let src = join_rowsource(&base, *base_width, &parts, &bound);
                         let mut rows = src.rows(db).map_err(EmitErr::Eval)?;
                         sort_rows(&mut rows, order_by).map_err(EmitErr::Eval)?;
                         for values in rows.iter().skip(*skip).take(take.unwrap_or(usize::MAX)) {
@@ -58848,9 +58894,10 @@ fn emit_rows_inner(
         } => {
             if let Some(db) = db {
                 let filter = bind_filter(filter, args)?;
+                let parts = bind_parts(parts, args)?;
                 let base = resolve_driver_base(db, base, defer, &filter);
                 let mut rows =
-                    join_rows(db, &base, *base_width, parts, &filter)
+                    join_rows(db, &base, *base_width, &parts, &filter)
                         .map_err(EmitErr::Eval)?;
                 if !order_by.is_empty() {
                     sort_rows(&mut rows, order_by).map_err(EmitErr::Eval)?;
@@ -58881,9 +58928,10 @@ fn emit_rows_inner(
             if let Some(db) = db {
                 let filter = bind_filter(filter, args)?;
                 let having = bind_filter(having, args)?;
+                let parts = bind_parts(parts, args)?;
                 let base = resolve_driver_base(db, base, defer, &filter);
                 let input =
-                    join_rows(db, &base, *base_width, parts, &filter)
+                    join_rows(db, &base, *base_width, &parts, &filter)
                         .map_err(EmitErr::Eval)?;
                 let rows = RowSource::aggregate_sorted(
                     RowSource::Rows(input),
@@ -101877,7 +101925,10 @@ mod tests {
                 Value::Text(dname.into()),
             ]
         };
-        let on = |s: &str| parse_on(s, &sides);
+        let on = |s: &str| {
+            let (mut np, mut params) = (0usize, Vec::new());
+            parse_on(s, &sides, &mut np, &mut params)
+        };
         let keeps = |s: &str, r: &[Value]| on(s).unwrap().matches(r).unwrap();
         let matched = row(1, 3, "a", 3, "a");
         let other = row(1, 3, "a", 4, "b");
@@ -101902,8 +101953,14 @@ mod tests {
             Value::Text("a".into()),
         ];
         assert!(!keeps("E.DEPT_ID = D.ID", &null_key));
-        // a `?` in an ON is not a shape this server binds
-        assert!(on("E.DEPT_ID = ?").is_none());
+        // a `?` in an ON RESOLVES: it claims a slot in the caller's sink
+        // (numbered between the select list and the WHERE) and the value
+        // is substituted at execute ([bind_parts])
+        let (mut np, mut params) = (0usize, Vec::new());
+        let p = parse_on("E.DEPT_ID = ?", &sides, &mut np, &mut params).unwrap();
+        assert_eq!((np, params.len()), (1, 1));
+        assert!(p.bind(&[WireParam::Int(3, 0)]).unwrap().matches(&matched).unwrap());
+        assert!(!p.bind(&[WireParam::Int(4, 0)]).unwrap().matches(&matched).unwrap());
     }
 
     #[test]
