@@ -17519,7 +17519,7 @@ fn check_predicates_uncached(
                     .then(|| relation_schema(db, table).map(|s| (s, table)))
                     .flatten(),
             };
-            resolve_subqueries(&toks, &subs, db, db_opt, columns, &bind, descs, true)?
+            resolve_subqueries(&toks, &subs, db, db_opt, columns, &bind, descs, true, None)?
         };
         let mut np = 0usize;
         let raw = parse_predicate(&toks, &mut np)?;
@@ -33295,7 +33295,7 @@ fn plan_update(sql: &str, db_outer: &Option<Database>) -> Option<(Plan, Vec<Desc
                                     .then(|| relation_schema(db, table).map(|s| (s, table)))
                                     .flatten(),
                             };
-                            resolve_subqueries(&toks, &subs, db, db_outer, &columns, &bind, descs, true)?
+                            resolve_subqueries(&toks, &subs, db, db_outer, &columns, &bind, descs, true, None)?
                         };
                         folded_where = render_toks(&folded);
                         Some(folded)
@@ -33482,7 +33482,7 @@ fn plan_delete(sql: &str, db_outer: &Option<Database>) -> Option<(Plan, Vec<Desc
                                     .then(|| relation_schema(db, table).map(|s| (s, table)))
                                     .flatten(),
                             };
-                            resolve_subqueries(&toks, &subs, db, db_outer, &columns, &bind, descs, true)?
+                            resolve_subqueries(&toks, &subs, db, db_outer, &columns, &bind, descs, true, None)?
                         };
                         folded_where = render_toks(&folded);
                         Some(folded)
@@ -47923,6 +47923,8 @@ fn plan_query_inner_ctx(
                                 };
                                 let Some(id) = corr_register(
                                     sub, scan, CorrKindRaw::Exists { negated }, scope.as_ref()?, db,
+                                    // this path numbers no statement slot
+                                    None,
                                 ) else {
                                     if trace {
                                         eprintln!("[srv] plan: EXISTS subquery {:?} not answerable", sub);
@@ -47983,7 +47985,7 @@ fn plan_query_inner_ctx(
                             }
                             return Some(Plan::Refused);
                         };
-                        let Some(id) = corr_register(sub, scan, CorrKindRaw::Scalar, scope.as_ref()?, db) else {
+                        let Some(id) = corr_register(sub, scan, CorrKindRaw::Scalar, scope.as_ref()?, db, None) else {
                             if trace {
                                 eprintln!("[srv] plan: select-list subquery {:?} not answerable", sub);
                             }
@@ -48746,7 +48748,19 @@ fn plan_query_inner_ctx(
                             _ => None,
                         },
                     };
-                    let folded = resolve_subqueries(&toks, &subs, db, db_all, &columns, &bind, &descs, !in_view)?;
+                    // the WHERE's own numbering starts at `next_param`
+                    // (the projection's `?`s lead), so an inner `?`
+                    // claims slots from there in text order
+                    let folded = resolve_subqueries(&toks, &subs, db, db_all, &columns, &bind, &descs, !in_view, Some(next_param))?;
+                    // publish the slots those subqueries' own `?`s took,
+                    // so the input describe announces them; the outer
+                    // numbering below skips the same slots
+                    for (slot, d) in corr_claimed_params() {
+                        if params.len() <= slot {
+                            params.resize(slot + 1, None);
+                        }
+                        params[slot] = Some(d);
+                    }
                     folded_where = render_toks(&folded);
                     Some(folded)
                 }
@@ -58041,6 +58055,8 @@ fn param_to_expr(p: &WireParam) -> Option<Expr> {
 fn expr_has_param(e: &Expr) -> bool {
     match e {
         Expr::Param(_) => true,
+        // a `?` inside a per-row subquery's TEXT - marked, not a node
+        Expr::CorrSub { prm, .. } => !prm.is_empty(),
         Expr::Neg(a) | Expr::Cast(a, _, _) => expr_has_param(a),
         Expr::Bin(a, _, b) | Expr::Concat(a, b) | Expr::NullIf(a, b) => {
             expr_has_param(a) || expr_has_param(b)
@@ -58067,6 +58083,30 @@ fn expr_has_param(e: &Expr) -> bool {
 fn subst_params_expr(e: &Expr, args: &[WireParam]) -> Option<Expr> {
     Some(match e {
         Expr::Param(i) => param_to_expr(args.get(*i)?)?,
+        // the subquery's own `?`s: each marker becomes the bound value's
+        // SQL literal, so the text the per-row walk plans has none left.
+        // The bound node takes a FRESH cache - two executions of one
+        // prepared statement bind different values to the same text.
+        Expr::CorrSub { text, outer, prm, kind, ty, scale, rank, desc, .. }
+            if !prm.is_empty() =>
+        {
+            let t = subst_prm_markers(text, &|slot| {
+                let d = prm.iter().find(|(s, _)| *s == slot).map(|(_, d)| d)?;
+                let v = param_to_expr(args.get(slot)?)?.eval(&[]).ok()?;
+                corr_literal(&v, d)
+            })?;
+            Expr::CorrSub {
+                text: t,
+                outer: outer.clone(),
+                prm: Vec::new(),
+                kind: kind.clone(),
+                ty: *ty,
+                scale: *scale,
+                rank: *rank,
+                desc: desc.clone(),
+                cache: corr_cache_new(),
+            }
+        }
         Expr::Neg(a) => Expr::Neg(Box::new(subst_params_expr(a, args)?)),
         Expr::Cast(a, t, cs) => Expr::Cast(Box::new(subst_params_expr(a, args)?), *t, *cs),
         Expr::Bin(a, op, b) => Expr::Bin(
@@ -65552,6 +65592,11 @@ enum Expr {
     CorrSub {
         text: String,
         outer: Vec<(usize, Expr, Descriptor)>,
+        /// the `?` placeholders inside the subquery text - see
+        /// [CorrTemplate::params]. Empty for every subquery without one,
+        /// which is every shape that existed before parameters were
+        /// carried here; [Predicate::bind] spells each value in.
+        prm: Vec<(usize, Descriptor)>,
         kind: Box<CorrKind>,
         ty: ExprType,
         scale: i8,
@@ -72849,6 +72894,14 @@ thread_local! {
     /// top-level plan.
     static CORR_REG: std::cell::RefCell<Vec<CorrTemplate>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// The statement slots the registered subqueries claimed for their
+    /// own `?` placeholders, with the descriptor each one announced -
+    /// what the DESCRIBE must publish, since the outer resolver never
+    /// sees a placeholder that lives inside a subquery's text. Merged
+    /// into the statement's sink right after [resolve_subqueries] and
+    /// cleared with the registry.
+    static CORR_PRM: std::cell::RefCell<Vec<(usize, Descriptor)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
     /// An IMAGE that stands in for the database's published one on this
     /// thread while armed ([SubqImageGuard]): what [Database::bytes]
     /// answers, so a subquery run under it reads THAT state. Armed around
@@ -72940,6 +72993,12 @@ fn bump_exec_epoch() {
 /// Forget every registered template - the start of a top-level plan.
 fn clear_corr_registry() {
     CORR_REG.with(|r| r.borrow_mut().clear());
+    CORR_PRM.with(|r| r.borrow_mut().clear());
+}
+
+/// The slots every subquery registered so far claimed, for the describe.
+fn corr_claimed_params() -> Vec<(usize, Descriptor)> {
+    CORR_PRM.with(|r| r.borrow().clone())
 }
 
 /// One relation a scope makes visible: the key it answers to (its alias,
@@ -73611,6 +73670,51 @@ fn subst_out_markers(text: &str, lit: &dyn Fn(usize) -> Option<String>) -> Optio
     Some(out)
 }
 
+/// Substitute every `FC$PRM<slot>` marker - the [CorrTemplate::params]
+/// twin of [subst_out_markers], and deliberately the same mechanism: a
+/// bound value reaches the inner statement as a SQL LITERAL spelled into
+/// its text, which is how an outer row's value already reaches it.
+fn subst_prm_markers(text: &str, lit: &dyn Fn(usize) -> Option<String>) -> Option<String> {
+    let mut out = String::with_capacity(text.len() + 32);
+    let mut rest = text;
+    while let Some(p) = rest.find("FC$PRM") {
+        out.push_str(&rest[..p]);
+        let after = &rest[p + 6..];
+        let n: usize = after.bytes().take_while(|c| c.is_ascii_digit()).count();
+        if n == 0 {
+            return None;
+        }
+        let idx: usize = after[..n].parse().ok()?;
+        out.push_str(&lit(idx)?);
+        rest = &after[n..];
+    }
+    out.push_str(rest);
+    Some(out)
+}
+
+/// Rewrite each `?` OUTSIDE a string literal into an `FC$PRM<slot>`
+/// marker, numbering from `base` in TEXT order, and answer the markers
+/// made. `None` when the text holds no placeholder at all, so a caller
+/// can keep its existing path unchanged.
+fn mark_text_params(text: &str, base: usize) -> Option<(String, Vec<usize>)> {
+    let masked = mask_literals(text);
+    if !masked.contains('?') {
+        return None;
+    }
+    let mut out = String::with_capacity(text.len() + 16);
+    let mut slots = Vec::new();
+    for (i, c) in text.char_indices() {
+        // the MASK decides: a `?` inside a string literal is data
+        if c == '?' && masked[i..].starts_with('?') {
+            out.push_str(&format!("FC$PRM{}", base + slots.len()));
+            slots.push(base + slots.len());
+        } else {
+            out.push(c);
+        }
+    }
+    Some((out, slots))
+}
+
 /// The SQL literal an outer row's value substitutes as. NULL is typed
 /// (`CAST(NULL AS <type>)`) so the inner comparison keeps its type rather
 /// than folding away; a temporal spells its typed literal; an approximate
@@ -73716,6 +73820,14 @@ struct CorrTemplate {
     text: String,
     /// per marker: (index, `KEY.COL` spelling, bare column name)
     refs: Vec<(usize, String, String)>,
+    /// the `?` placeholders INSIDE this subquery, as `FC$PRM<slot>`
+    /// markers in `text`: the statement-wide slot number each one
+    /// claimed (the engine numbers them in TEXT order, so an inner `?`
+    /// numbers before an outer one written after the subquery) and the
+    /// descriptor the inner plan announced for it. The value is spelled
+    /// into the text as a literal at BIND, exactly as an outer
+    /// reference's value is spelled in per row ([subst_prm_markers]).
+    params: Vec<(usize, Descriptor)>,
     kind: CorrKindRaw,
     /// the inner statement's DESCRIBE over `CAST(NULL AS <type>)`
     /// stand-ins: its one output column, nullable
@@ -73724,6 +73836,23 @@ struct CorrTemplate {
 
 fn corr_template(id: usize) -> Option<CorrTemplate> {
     CORR_REG.with(|r| r.borrow().get(id).cloned())
+}
+
+/// How many statement slots the registered subquery `id` claimed for its
+/// own `?` placeholders - what the OUTER numbering must skip when it
+/// reaches the subquery's token, so a `?` written after it numbers after
+/// the inner ones (the engine's text order, probed).
+fn corr_param_count(id: usize) -> usize {
+    CORR_REG.with(|r| r.borrow().get(id).map_or(0, |t| t.params.len()))
+}
+
+/// The statement slot a subquery's FIRST `?` claims: the clause's own
+/// base, plus every placeholder written BEFORE it in this token stream,
+/// plus the slots earlier subqueries already took. That is the engine's
+/// TEXT order (probed: `WHERE I = ? AND ID IN (SELECT .. WHERE I = ?)`
+/// binds the outer value first, the inner one second).
+fn prm_base(toks: &[Tok], at: usize, base: Option<usize>, used: usize) -> Option<usize> {
+    Some(base? + toks[..at].iter().filter(|t| matches!(t, Tok::Param)).count() + used)
 }
 
 /// Plan the inner text with typed NULL stand-ins to learn what it
@@ -73873,7 +74002,14 @@ fn corr_inner_plans(scan: &CorrScan, db_opt: &Option<Database>) -> bool {
     CORR_PROBE.with(|c| c.set(prev));
     match plan {
         None | Some(Plan::Refused) | Some(Plan::RefusedEval(_)) => false,
-        Some(_) => ip.is_empty(),
+        // the question is whether the inner PLANS, not whether it is
+        // parameter-free: a `?` inside it plans perfectly well and
+        // announces a slot, and the per-row route binds that slot's
+        // value at execute ([corr_register]). Reading a claimed slot as
+        // "did not plan" refused the whole statement before the
+        // registration that handles it (EXISTS was the one arm that
+        // consults this probe).
+        Some(_) => ip.is_empty() || text_has_param(&scan.text),
     }
 }
 
@@ -73900,14 +74036,34 @@ fn text_has_param(text: &str) -> bool {
 /// Register a scanned subquery under a fresh id.
 fn corr_register(
     source: &str,
-    scan: CorrScan,
+    mut scan: CorrScan,
     kind: CorrKindRaw,
     scope: &CorrScope,
     db_opt: &Option<Database>,
+    // the statement-wide slot this subquery's FIRST `?` claims, or None
+    // on a path that cannot number one (it then keeps the old refusal)
+    param_base: Option<usize>,
 ) -> Option<usize> {
-    if text_has_param(&scan.text) {
-        return None; // a `?` inside a correlated subquery: recorded refusal
-    }
+    // A `?` INSIDE THE SUBQUERY. It is marked here and spelled in as a
+    // literal at bind ([subst_prm_markers]) - the same mechanism the
+    // outer references already use, one step earlier in the statement's
+    // life. Its DESCRIPTOR comes from the inner plan: the stand-in text
+    // still carries the placeholder, so planning it announces the slot.
+    let params: Vec<(usize, Descriptor)> = if text_has_param(&scan.text) {
+        let base = param_base?;
+        let (marked, slots) = mark_text_params(&scan.text, base)?;
+        let standin = corr_standin_text(&scan)?;
+        let mut ip: Vec<Option<Descriptor>> = Vec::new();
+        plan_query_inner(&standin, db_opt, &mut ip)?;
+        if ip.len() != slots.len() {
+            return None; // the inner plan numbered them differently
+        }
+        let ds: Vec<Descriptor> = ip.into_iter().collect::<Option<Vec<_>>>()?;
+        scan.text = marked;
+        slots.into_iter().zip(ds).collect()
+    } else {
+        Vec::new()
+    };
     if scan.refs.iter().any(|r| r.desc.as_ref().is_none_or(|d| !corr_literal_form_ok(d))) {
         return None; // an outer column with no literal form: refused at prepare
     }
@@ -73917,7 +74073,21 @@ fn corr_register(
         kind,
         CorrKindRaw::Scalar | CorrKindRaw::In { .. } | CorrKindRaw::Quant { .. }
     );
-    let desc = corr_describe(&scan, scope, db_opt, scalar_arity)?;
+    // the DESCRIBE plans the inner text, so it must see no marker of
+    // either kind: the `?`s stand in as typed NULLs here exactly as the
+    // outer references do inside [corr_standin_text]
+    let describe_scan = if params.is_empty() {
+        None
+    } else {
+        let text = subst_prm_markers(&scan.text, &|slot| {
+            params
+                .iter()
+                .find(|(s, _)| *s == slot)
+                .map(|(_, d)| format!("CAST(NULL AS {})", desc_type_sql_cs(d)))
+        })?;
+        Some(CorrScan { text, refs: scan.refs.clone() })
+    };
+    let desc = corr_describe(describe_scan.as_ref().unwrap_or(&scan), scope, db_opt, scalar_arity)?;
     if matches!(kind, CorrKindRaw::Scalar) && desc.sql_type & !1 == 520 {
         return None; // a blob-valued scalar: recorded refusal
     }
@@ -73938,7 +74108,10 @@ fn corr_register(
             refs.iter().map(|(i, q, _)| format!("{}={}", i, q)).collect::<Vec<_>>().join(", ")
         );
     }
-    let t = CorrTemplate { source: source.to_string(), text: scan.text, refs, kind, desc };
+    // the describe cannot see a `?` that lives inside this text, so the
+    // slots it claimed are published for the statement's sink
+    CORR_PRM.with(|r| r.borrow_mut().extend(params.iter().cloned()));
+    let t = CorrTemplate { source: source.to_string(), text: scan.text, refs, params, kind, desc };
     CORR_REG.with(|r| {
         let mut reg = r.borrow_mut();
         reg.push(t);
@@ -74090,7 +74263,7 @@ fn lift_corr_text(
             }
             _ => (at, CorrKindRaw::Scalar, false),
         };
-        let id = corr_register(sub, scan, kind, scope, db_opt)?;
+        let id = corr_register(sub, scan, kind, scope, db_opt, None)?;
         let repl = if wrap {
             format!("FC$CORR({}) = TRUE", id)
         } else if select_list && alone[i] {
@@ -74384,6 +74557,7 @@ fn resolve_corr_sub(id: usize, columns: &[RelationColumn], descs: &[Descriptor])
     Some(Expr::CorrSub {
         text,
         outer,
+        prm: t.params.clone(),
         kind: Box::new(kind),
         ty,
         scale,
@@ -76144,6 +76318,13 @@ fn resolve_subqueries(
     // lenient grammar decides and a body this server marked as a key
     // refused a view the engine answers.
     keys: bool,
+    // the statement slot the WHERE's own numbering starts at: a `?`
+    // INSIDE one of these subqueries claims slots from here, in text
+    // order, before any placeholder written after it ([corr_register]).
+    // None on a caller that cannot say - the inner `?` then keeps its
+    // refusal rather than take a slot number this cannot prove, which
+    // would bind the wrong value to it
+    param_base: Option<usize>,
 ) -> Option<Vec<Tok>> {
     // THE ENCLOSING SCOPE, for the scanner that decides whether a
     // subquery names the outer row at all ([corr_scan]): the outer
@@ -76200,6 +76381,8 @@ fn resolve_subqueries(
 
     let mut out: Vec<Tok> = Vec::new();
     let mut i = 0usize;
+    // slots the subqueries BEFORE this one claimed for their own `?`
+    let mut prm_used = 0usize;
     while i < toks.len() {
         match &toks[i] {
             // [NOT] EXISTS <subq>
@@ -76308,7 +76491,10 @@ fn resolve_subqueries(
                         // one verdict for every row, which turned the
                         // anti-join idiom into "every row" and the
                         // running-count idiom into zero (measured).
-                        let folded = if !correlated && !per_row {
+                        // a `?` inside it cannot fold at PREPARE - its
+                        // value arrives at execute - so it takes the
+                        // per-row route, where the bind spells it in
+                        let folded = if !correlated && !per_row && !text_has_param(sql) {
                             eval_subquery(sql, db, db_opt, None, Some(outer_bind), true)
                         } else {
                             None
@@ -76319,7 +76505,9 @@ fn resolve_subqueries(
                                 let scan = scan?; // unscannable: refuse
                                 let id = corr_register(
                                     sql, scan, CorrKindRaw::Exists { negated }, &scope, db_opt,
+                                    prm_base(toks, i, param_base, prm_used),
                                 )?;
+                                prm_used += corr_param_count(id);
                                 push_corr_bool(&mut out, id);
                             }
                         }
@@ -76378,7 +76566,8 @@ fn resolve_subqueries(
                 // anything else - a correlated set, an expression side, a
                 // set the fold declines - is compared PER ROW
                 let folded = match (&lhs_tok, correlated) {
-                    (Tok::Ident(_), false) => {
+                    // a `?` inside it defers to the per-row route
+                    (Tok::Ident(_), false) if !text_has_param(sql) => {
                         eval_subquery(sql, db, db_opt, None, Some(outer_bind), false)
                     }
                     _ => None,
@@ -76392,7 +76581,9 @@ fn resolve_subqueries(
                     }
                     let id = corr_register(
                         sql, scan, CorrKindRaw::Quant { lhs, op: *op, all, negated }, &scope, db_opt,
+                        prm_base(toks, i, param_base, prm_used),
                     )?;
+                    prm_used += corr_param_count(id);
                     push_corr_bool(&mut out, id);
                     i += 3;
                     continue;
@@ -76463,7 +76654,7 @@ fn resolve_subqueries(
                     return None; // the engine's -104: never folded
                 }
                 let correlated = scan.as_ref().is_some_and(|s| !s.refs.is_empty());
-                let folded = if !correlated {
+                let folded = if !correlated && !text_has_param(sql) {
                     eval_subquery(sql, db, db_opt, None, Some(outer_bind), false)
                 } else {
                     None
@@ -76480,7 +76671,9 @@ fn resolve_subqueries(
                     let lhs = tok_lhs_raw(&out.pop()?)?;
                     let id = corr_register(
                         sql, scan, CorrKindRaw::In { lhs, negated }, &scope, db_opt,
+                        prm_base(toks, i, param_base, prm_used),
                     )?;
+                    prm_used += corr_param_count(id);
                     push_corr_bool(&mut out, id);
                     i += 2;
                     continue;
@@ -76523,7 +76716,7 @@ fn resolve_subqueries(
                     return None; // the engine's -104: never folded
                 }
                 let correlated = scan.as_ref().is_some_and(|s| !s.refs.is_empty());
-                let folded = if !correlated {
+                let folded = if !correlated && !text_has_param(sql) {
                     eval_subquery(sql, db, db_opt, None, Some(outer_bind), false)
                 } else {
                     None
@@ -76534,7 +76727,11 @@ fn resolve_subqueries(
                 // one is the engine's 21000 when that row is reached
                 let Some(rows) = folded.filter(|r| r.values.len() == 1) else {
                     let scan = scan?;
-                    let id = corr_register(sql, scan, CorrKindRaw::Scalar, &scope, db_opt)?;
+                    let id = corr_register(
+                        sql, scan, CorrKindRaw::Scalar, &scope, db_opt,
+                        prm_base(toks, i, param_base, prm_used),
+                    )?;
+                    prm_used += corr_param_count(id);
                     out.push(Tok::Cmp(*op));
                     out.push(Tok::FnExpr(RawExpr::Subq(id)));
                     i += 2;
@@ -76552,7 +76749,11 @@ fn resolve_subqueries(
             Tok::Subq(n) => {
                 let sql = subs.get(*n)?;
                 let scan = corr_scan(sql, &scope, db, db_opt)?;
-                let id = corr_register(sql, scan, CorrKindRaw::Scalar, &scope, db_opt)?;
+                let id = corr_register(
+                    sql, scan, CorrKindRaw::Scalar, &scope, db_opt,
+                    prm_base(toks, i, param_base, prm_used),
+                )?;
+                prm_used += corr_param_count(id);
                 out.push(Tok::FnExpr(RawExpr::Subq(id)));
                 i += 1;
             }
@@ -79175,6 +79376,14 @@ fn texpr_atom_bare(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<RawExpr
         // text (`WHERE I = ? AND J = CAST(? AS INTEGER)` numbers 0 then 1)
         Tok::FnExpr(e) => {
             let mut e = e.clone();
+            // a per-row SUBQUERY claimed its own `?` slots at
+            // registration, in this position of the text - skip them, so
+            // a placeholder written AFTER the subquery numbers after
+            // them (the engine's text order: `WHERE I = ? AND ID IN
+            // (SELECT .. WHERE I = ?)` binds outer then inner)
+            if let RawExpr::Subq(id) = &e {
+                *np += corr_param_count(*id);
+            }
             if raw_has_param(&e) {
                 renumber_raw_params(&mut e, np);
             }
@@ -110616,6 +110825,7 @@ mod tests {
             expr: None,
         };
         let sub = Expr::CorrSub {
+            prm: Vec::new(),
             text: "SELECT MAX(V) FROM E WHERE E.TID = FC$OUT0".into(),
             outer: vec![(0, Expr::Col(0), int_desc())],
             kind: Box::new(CorrKind::Scalar),
