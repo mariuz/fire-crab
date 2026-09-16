@@ -19433,6 +19433,21 @@ fn build_expr_col_from(e: Expr, name: &str, descs: &[Descriptor]) -> Option<Proj
 /// by its own wire type. None for the declared types this server does
 /// not yet cast a computed column into (text, temporal, blob, DECFLOAT,
 /// FLOAT), which keep the expression's own form.
+/// The cast a `?` bound to this DESTINATION converts through - the
+/// numeric rungs [computed_cast_target] names, plus the two families it
+/// has no computed-column use for: a DECFLOAT destination (where the
+/// arithmetic is decimal - `(DF) VALUES (? / 3)` bound 10 is
+/// 3.333333333333333333333333333333333, measured) and FLOAT.
+fn dest_cast_target(d: &Descriptor) -> Option<CastTarget> {
+    use fire_crab_ods::format::dtype;
+    match d.dtype {
+        dtype::DEC64 => Some(CastTarget::DecFloat { wide: false }),
+        dtype::DEC128 => Some(CastTarget::DecFloat { wide: true }),
+        dtype::REAL => Some(CastTarget::Float),
+        _ => computed_cast_target(d),
+    }
+}
+
 fn computed_cast_target(d: &Descriptor) -> Option<CastTarget> {
     let bytes: u8 = match d.dtype {
         dtype::SHORT => 2,
@@ -30699,20 +30714,14 @@ fn plan_insert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
                 if !param_target_ok(&d) {
                     return None;
                 }
-                // a `?` INSIDE an expression aimed at a DECFLOAT column
-                // REFUSES: the engine types the slot from the EXPRESSION'S
-                // context and converts the driver's value THERE, before the
-                // decimal arithmetic - `COALESCE(?, 0)` [1.1] stores 1 (a
-                // LONG slot; 2^40 overflows it), `? * 3` [0.1] stores
-                // 0.30000000000000003, `? / 3` [2] is the decimal
-                // 0.6666666666666666666666666666666667, `? * 1E+3` [2] is
-                // 2E+3 (the literal read as decfloat text). A raw splice of
-                // the bound value gets only the simplest shapes right;
-                // typing the slot the engine's way is a general slice
-                // (INTEGER / NUMERIC destinations carry the same gap).
-                if d.dtype == dtype::DEC64 || d.dtype == dtype::DEC128 {
-                    return None;
-                }
+                // A DECFLOAT destination converts THROUGH THE SLOT like
+                // every other: [resolve_dest_param_expr] wraps the `?` in
+                // a CAST to the destination's own type, so the decimal
+                // arithmetic runs on the converted value (`? / 3` bound 10
+                // is 3.333333333333333333333333333333333, measured). This
+                // arm used to refuse because the raw bound value was
+                // spliced instead, which got only the simplest shapes
+                // right.
                 // a BLOB destination takes its value through the
                 // blob-store path at execute, which this arm does not
                 // walk - refuse rather than write eight bytes of text
@@ -33123,12 +33132,10 @@ fn plan_update(sql: &str, db_outer: &Option<Database>) -> Option<(Plan, Vec<Desc
                     let mut next = params.len();
                     renumber_raw_params(&mut raw, &mut next);
                     let dest = descs.get(fid0)?.clone();
-                    // a `?` inside an expression aimed at a DECFLOAT column
-                    // refuses (the INSERT arm's twin: the slot's type is the
-                    // expression's, not the column's - recorded)
-                    if dest.dtype == dtype::DEC64 || dest.dtype == dtype::DEC128 {
-                        return None;
-                    }
+                    // a DECFLOAT destination converts through its slot like
+                    // every other (the INSERT arm's twin): the `?` is wrapped
+                    // in a CAST to the destination's type, so the decimal
+                    // arithmetic runs on the converted value
                     let e = resolve_dest_param_expr(&raw, &dest, &columns, descs, &mut params)?;
                     // NO type gate here: a `?` has no type until it is
                     // bound (`? * 2` types None at prepare), and the
@@ -35315,7 +35322,12 @@ fn execute_dml_collecting_inner(
                 // fallthrough would answer NULL and store it silently -
                 // the same gate the constant-expression arm makes at
                 // prepare, made here because the value arrives now
-                if bound.type_of(&[]).is_none() {
+                // a DECFLOAT-valued tree has no ExprType of its own (the
+                // describe short-circuits it), so the gate asks the
+                // decfloat question separately - without this a `?`
+                // aimed at a DECFLOAT column failed here as a type
+                // mismatch after the CAST wrap made it decimal
+                if bound.type_of(&[]).is_none() && !is_decfloat_arith(&bound, &[]) {
                     return Err("parameter type does not match its column".into());
                 }
                 let v = bound.eval(&[]).map_err(ExecErr::Eval)?;
@@ -35647,7 +35659,15 @@ fn execute_dml_collecting_inner(
                                 // row (the prepare-time gate every other
                                 // SET expression passes, made here
                                 // because this value arrives now)
-                                if bound.type_of(descs).is_none() {
+                                // ... and a DECFLOAT-valued tree has no
+                                // ExprType of its own (the describe
+                                // short-circuits it), so that question is
+                                // asked separately - the INSERT arm's
+                                // twin, and what lets `SET <decfloat> =
+                                // ? / 3` reach the decimal arithmetic
+                                if bound.type_of(descs).is_none()
+                                    && !is_decfloat_arith(&bound, descs)
+                                {
                                     return Err(ExecErr::Text(
                                         "parameter type does not match its column".into(),
                                     ));
@@ -64878,7 +64898,22 @@ fn resolve_dest_param_expr(
     Some(match raw {
         RawExpr::Param(i) => {
             set(sink, *i, dest.clone());
-            Expr::Param(*i)
+            // THE VALUE CONVERTS INTO THE SLOT BEFORE THE ARITHMETIC, not
+            // after it. The engine reads the driver's value AT THE SLOT
+            // the describe announced and evaluates from there, so
+            // `(I) VALUES (? * 2)` bound 1.6 is 2 * 2 = 4 - where
+            // splicing the raw double computed 3.2 and stored 3
+            // (measured, silently wrong). A driver that honours the
+            // describe sends the converted value already and the CAST is
+            // a no-op; node-firebird binds value-derived BLR whatever the
+            // slot says, which is exactly the case this fixes.
+            match dest_cast_target(dest) {
+                Some(t) => {
+                    Expr::Cast(Box::new(Expr::Param(*i)), t, fire_crab_ods::intl::CS_UTF8)
+                }
+                // a text / temporal slot has no cast rung here yet
+                None => Expr::Param(*i),
+            }
         }
         RawExpr::Cast(inner, t) => {
             let td = cast_target_descriptor(t)?;
@@ -64889,11 +64924,47 @@ fn resolve_dest_param_expr(
         RawExpr::Neg(a) => {
             Expr::Neg(Box::new(resolve_dest_param_expr(a, dest, columns, descs, sink)?))
         }
-        RawExpr::Bin(a, op, b) => Expr::Bin(
-            Box::new(resolve_dest_param_expr(a, dest, columns, descs, sink)?),
-            *op,
-            Box::new(resolve_dest_param_expr(b, dest, columns, descs, sink)?),
-        ),
+        // A MULTIPLY CONVERTS ITS LEFT OPERAND AT SCALE 0 when the
+        // destination is an exact SCALED type - and only there. Measured
+        // into NUMERIC(9,2) with 1.115: `? * 2` stores 2.00 and `? * 2.0`
+        // 2.00 (the value became 1), while `2 * ?` stores 2.24, `? / 2`
+        // 0.56 and `? + 0` / `? - 0` 1.12 (all the destination's scale);
+        // into NUMERIC(9,4) `? * 2` bound 1.11115 is 2.0000; `? * ?`,
+        // `? * <column>`, `(? * 2) + 0` and `? * 2 * 2` follow the same
+        // LEFT-operand rule, and a DOUBLE destination keeps its double
+        // (`DP = ? * 2` is 2.23). The DESCRIBE still announces the
+        // destination's own scale (SQLDA_DISPLAY: LONG scale -2), so the
+        // slot published and the conversion applied differ here - which
+        // is why this wraps the cast itself instead of passing a
+        // doctored descriptor down.
+        RawExpr::Bin(a, op, b) => {
+            let scale0 = matches!(op, ArithOp::Mul)
+                && dest.scale != 0
+                && matches!(**a, RawExpr::Param(_))
+                && dest_cast_target(dest).is_some_and(|t| matches!(t, CastTarget::Numeric { .. }));
+            let left = match (&**a, scale0) {
+                (RawExpr::Param(i), true) => {
+                    set(sink, *i, dest.clone());
+                    let bytes = match dest.dtype {
+                        dtype::SHORT => 2,
+                        dtype::LONG => 4,
+                        dtype::INT64 => 8,
+                        _ => 16,
+                    };
+                    Expr::Cast(
+                        Box::new(Expr::Param(*i)),
+                        CastTarget::Int { bytes },
+                        fire_crab_ods::intl::CS_UTF8,
+                    )
+                }
+                _ => resolve_dest_param_expr(a, dest, columns, descs, sink)?,
+            };
+            Expr::Bin(
+                Box::new(left),
+                *op,
+                Box::new(resolve_dest_param_expr(b, dest, columns, descs, sink)?),
+            )
+        }
         RawExpr::Concat(a, b) => Expr::Concat(
             Box::new(resolve_dest_param_expr(a, dest, columns, descs, sink)?),
             Box::new(resolve_dest_param_expr(b, dest, columns, descs, sink)?),
@@ -69006,6 +69077,21 @@ fn value_to_wireparam(v: &Value) -> Option<WireParam> {
         Value::TimeTz(utc, zone) => WireParam::TimeTz(*utc, *zone),
         Value::TimestampTz(dd, utc, zone) => WireParam::TimestampTz(*dd, *utc, *zone),
         Value::Int128(r, sc) => WireParam::Int(i64::try_from(*r).ok()?, *sc),
+        // A DECFLOAT VALUE TRAVELS AS ITS EXACT DECIMAL TEXT: [WireParam]
+        // has no decfloat carrier, and the destination's encoder already
+        // reads a text by the decNumber grammar ([encode_wire_value]'s
+        // DEC128 / DEC64 arms). This is what lets a `?` inside an
+        // expression reach a DECFLOAT column - `(DF) VALUES (? / 3)`
+        // bound 10 stores 3.333333333333333333333333333333333, the
+        // decimal division the engine does. A non-finite result has no
+        // decimal text and still refuses.
+        Value::DecFloat16(_) | Value::DecFloat34(_) => {
+            let t = v.render();
+            if t.contains("NaN") || t.contains("nan") || t.contains("Inf") || t.contains("inf") {
+                return None;
+            }
+            WireParam::Text(t)
+        }
         _ => return None,
     })
 }

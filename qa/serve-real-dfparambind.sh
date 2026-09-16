@@ -388,11 +388,17 @@ echo "-- boundary (recorded): a ? INSIDE an expression stored into a DECFLOAT co
 # and stores 1, and raises on 2^40; `? / 3` [2] is the decimal 0.666...7;
 # `? * 1E+3` [2] is 2E+3); a raw splice of the bound value is right only for
 # the simplest integer shapes - refused, every bind type
-refuses_fc "insert ? * 3 into D34"    "INSERT INTO PBW (ID, D34) VALUES (301, ? * 3)" "[0.1]"
-refuses_fc "insert ? + ? into D34"    "INSERT INTO PBW (ID, D34) VALUES (302, ? + ?)" "[0.1,0.2]"
-refuses_fc "insert coalesce(?,0) D16" "INSERT INTO PBW (ID, D16) VALUES (303, COALESCE(?, 0))" "[1.1]"
-refuses_fc "update ? + 1 D34"         "UPDATE PBW SET D34 = ? + 1 WHERE ID = 1" "[0.7]"
-refuses_fc "update coalesce(?,0) D34" "UPDATE PBW SET D34 = COALESCE(?, 0) WHERE ID = 1" "[1.1]"
+# `?`-in-expression into a DECFLOAT column ANSWERS since serve-real-slottype
+# (2026-09-16): the placeholder converts at its own slot, so the decimal
+# arithmetic runs on the converted value. These were fc-only refusals;
+# each was measured against the engine (status AND stored value) before
+# it became an agreement check. `? * 1E+3` and the WHERE-side `D16 = ? + 0`
+# still refuse - different items, still recorded below.
+both "insert ? * 3 into D34"    "INSERT INTO PBW (ID, D34) VALUES (301, ? * 3)" "[0.1]"
+both "insert ? + ? into D34"    "INSERT INTO PBW (ID, D34) VALUES (302, ? + ?)" "[0.1,0.2]"
+both "insert coalesce(?,0) D16" "INSERT INTO PBW (ID, D16) VALUES (303, COALESCE(?, 0))" "[1.1]"
+both "update ? + 1 D34"         "UPDATE PBW SET D34 = ? + 1 WHERE ID = 1" "[0.7]"
+both "update coalesce(?,0) D34" "UPDATE PBW SET D34 = COALESCE(?, 0) WHERE ID = 1" "[1.1]"
 refuses_fc "merge set coalesce(?,0)"  "MERGE INTO PBW USING (SELECT 2 AS K FROM RDB\$DATABASE) SRC ON PBW.ID = SRC.K WHEN MATCHED THEN UPDATE SET D34 = COALESCE(?, 0)" "[1.1]"
 echo "-- MERGE: a BARE marker into a DECFLOAT column binds (written as the value's literal) --"
 store "merge set D34/D16 bare ?"    "MERGE INTO PBW USING (SELECT 2 AS K FROM RDB\$DATABASE) SRC ON PBW.ID = SRC.K WHEN MATCHED THEN UPDATE SET D34 = ?, D16 = ?" "[1.1,1.1]"
@@ -448,9 +454,9 @@ agree "MERGE NOT MATCHED INSERT (SRC.FL, SRC.DP)"         "MERGE INTO PBW USING 
 agree "MERGE ON with a DOUBLE source column"              "MERGE INTO PBW USING (SELECT ID, DP FROM TX WHERE ID = 1) SRC ON (PBW.ID = SRC.ID AND PBW.D16 < SRC.DP + 100) WHEN MATCHED THEN UPDATE SET D34 = 77; SELECT ID, CAST(D34 AS VARCHAR(40)) A FROM PBW WHERE ID = 1;"
 echo "-- verify-found (round 2): a ? INSIDE an expression aimed at a DECFLOAT column refuses for EVERY bind (engine answers noted) --"
 # engine: `? + 1` [2] -> 3, `? / 3` [2] -> 0.6666666666666666666666666666666667, COALESCE(?, 0) [2^40] -> raises (LONG slot), `? * 1E+3` [2] -> 2E+3
-refuses_fc "update D34 = ? + 1 [2]"          "UPDATE PBW SET D34 = ? + 1 WHERE ID = 2" "[2]"
-refuses_fc "update D34 = ? / 3 [2]"          "UPDATE PBW SET D34 = ? / 3 WHERE ID = 2" "[2]"
-refuses_fc "update D16 = COALESCE(?, 0) [2^40]" "UPDATE PBW SET D16 = COALESCE(?, 0) WHERE ID = 2" "[1099511627776]"
+both "update D34 = ? + 1 [2]"          "UPDATE PBW SET D34 = ? + 1 WHERE ID = 2" "[2]"
+both "update D34 = ? / 3 [2]"          "UPDATE PBW SET D34 = ? / 3 WHERE ID = 2" "[2]"
+both "update D16 = COALESCE(?, 0) [2^40]" "UPDATE PBW SET D16 = COALESCE(?, 0) WHERE ID = 2" "[1099511627776]"
 refuses_fc "insert D34 ? * 1E+3 [2]"         "INSERT INTO PBW (ID, D34) VALUES (790, ? * 1E+3)" "[2]"
 refuses_fc "merge set COALESCE(?,0) [2]"     "MERGE INTO PBW USING (SELECT 2 AS K FROM RDB\$DATABASE) SRC ON PBW.ID = SRC.K WHEN MATCHED THEN UPDATE SET D34 = COALESCE(?, 0)" "[2]"
 refuses_fc "merge insert ? * 3 [2]"          "MERGE INTO PBW USING (SELECT 791 AS K FROM RDB\$DATABASE) SRC ON PBW.ID = SRC.K WHEN NOT MATCHED THEN INSERT (ID, D34) VALUES (SRC.K, ? * 3)" "[2]"
