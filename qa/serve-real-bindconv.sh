@@ -53,6 +53,7 @@ INSERT INTO NU VALUES (1, NULL, NULL, NULL, NULL);
 CREATE TABLE E (ID INTEGER, I INTEGER, N NUMERIC(9,2), DP DOUBLE PRECISION, B BOOLEAN, D34 DECFLOAT(34));
 CREATE TABLE J (ID INTEGER, I INTEGER);
 INSERT INTO J VALUES (1, 1);
+CREATE TABLE Z (ID INTEGER, I INTEGER, DP DOUBLE PRECISION);
 COMMIT;
 CREATE INDEX PBI ON P (BI);
 COMMIT;
@@ -181,13 +182,68 @@ both "DELETE FROM P WHERE I = ?" '["abc"]'
 both "DELETE FROM P WHERE D34 = ?" '["abc"]'
 both "SELECT ID, S FROM P ORDER BY ID" '[]'
 
+echo "-- an EXPRESSION left side gates on its OWN value --"
+for e in "DP + 0" "I + 0" "ABS(I)" "I * 2" "DP * 2" "CAST(I AS NUMERIC(9,2))" "COALESCE(I, 0)" "CAST(DP AS FLOAT)"; do
+    both "SELECT ID FROM P WHERE $e = ?" '["abc"]'
+done
+both "SELECT ID FROM NU WHERE DP + 0 = ?" '["abc"]'
+both "SELECT ID FROM NU WHERE I + 0 = ?" '["abc"]'
+both "SELECT ID FROM NU WHERE ABS(I) = ?" '["abc"]'
+both "SELECT ID FROM Z WHERE DP + 0 = ?" '["abc"]'
+both "SELECT ID FROM Z WHERE I + 0 = ?" '["abc"]'
+both "SELECT ID FROM Z WHERE ABS(I) = ?" '["abc"]'
+both "SELECT ID FROM P WHERE ID = 99 AND DP + 0 = ?" '["abc"]'
+both "SELECT ID FROM P WHERE DP + 0 = ? AND ID = 99" '["abc"]'
+both "SELECT ID FROM P WHERE DP + 0 = ? OR ID = 1 ORDER BY ID" '["abc"]'
+both "SELECT ID FROM P WHERE ID = 1 OR DP + 0 = ? ORDER BY ID" '["abc"]'
+both "SELECT ID FROM P WHERE I = ? AND DP + 0 = ?" '["5", "abc"]'
+both "SELECT ID FROM P WHERE DP + 0 = ? AND I = ?" '["abc", "5"]'
+
+echo "-- a magnitude no Rhs::Num holds: exact compares exactly, approximate is +-infinity --"
+for op in "<" ">" "=" "<>"; do
+    both "SELECT ID FROM P WHERE I $op ? ORDER BY ID" '["1e400"]'
+    both "SELECT ID FROM P WHERE I $op ? ORDER BY ID" '["-1e400"]'
+done
+both "SELECT ID FROM P WHERE N < ? ORDER BY ID" '["1e400"]'
+both "SELECT ID FROM P WHERE N > ? ORDER BY ID" '["-1e400"]'
+both "SELECT ID FROM P WHERE BI < ? ORDER BY ID" '["1e400"]'
+both "SELECT ID FROM X WHERE H < ? ORDER BY ID" '["1e400"]'
+both "SELECT ID FROM X WHERE H > ? ORDER BY ID" '["1e400"]'
+both "SELECT ID FROM P WHERE DP = ? ORDER BY ID" '["1e400"]'
+both "SELECT ID FROM P WHERE DP > ? ORDER BY ID" '["-1e400"]'
+both "SELECT ID FROM P WHERE DP < ? ORDER BY ID" '["1e400"]'
+both "SELECT ID FROM P WHERE DP <= ? ORDER BY ID" '["1e400"]'
+both "SELECT ID FROM X WHERE FL = ? ORDER BY ID" '["1e400"]'
+both "SELECT ID FROM X WHERE FL > ? ORDER BY ID" '["-1e400"]'
+both "SELECT ID FROM P WHERE D16 < ? ORDER BY ID" '["1e400"]'
+both "SELECT ID FROM P WHERE D34 < ? ORDER BY ID" '["1e400"]'
+echo "-- the exact spellings: 20 digits, i128's limits, 41 digits --"
+both "SELECT ID FROM P WHERE I < ? ORDER BY ID" '["99999999999999999999"]'
+both "SELECT ID FROM P WHERE I > ? ORDER BY ID" '["99999999999999999999"]'
+both "SELECT ID FROM P WHERE I = ? ORDER BY ID" '["99999999999999999999"]'
+both "SELECT ID FROM P WHERE I < ? ORDER BY ID" '["170141183460469231731687303715884105727"]'
+both "SELECT ID FROM P WHERE I > ? ORDER BY ID" '["-170141183460469231731687303715884105728"]'
+both "SELECT ID FROM P WHERE I < ? ORDER BY ID" '["99999999999999999999999999999999999999999"]'
+both "SELECT ID FROM P WHERE I > ? ORDER BY ID" '["-99999999999999999999999999999999999999999"]'
+both "SELECT ID FROM P WHERE I = ? ORDER BY ID" '["99999999999999999999999999999999999999999"]'
+both "SELECT ID FROM P WHERE I <> ? ORDER BY ID" '["99999999999999999999999999999999999999999"]'
+both "SELECT ID FROM P WHERE N < ? ORDER BY ID" '["99999999999999999999999999999999999999999"]'
+echo "-- the wide bind is still gated and still not a raise --"
+both "SELECT ID FROM NU WHERE I < ? ORDER BY ID" '["1e400"]'
+both "SELECT ID FROM Z WHERE I < ? ORDER BY ID" '["1e400"]'
+both "SELECT ID FROM NU WHERE DP = ?" '["1e400"]'
+both "SELECT ID FROM P WHERE ID = 99 AND I < ? ORDER BY ID" '["1e400"]'
+both "SELECT ID FROM P WHERE I + 0 < ? ORDER BY ID" '["1e400"]'
+both "SELECT ID FROM P WHERE DP + 0 = ? ORDER BY ID" '["1e400"]'
+
 echo "-- recorded refusals (fire-crab only) --"
-refuses "SELECT ID FROM P WHERE DP + 0 = ?" '["abc"]'
-refuses "SELECT ID FROM P WHERE ABS(I) = ?" '["abc"]'
 refuses "SELECT P.ID FROM P JOIN J ON P.ID = J.ID AND P.I = ?" '["abc"]'
+refuses "SELECT P.ID FROM P LEFT JOIN J ON P.ID = J.ID AND P.I = ?" '["abc"]'
 refuses "SELECT ID FROM P WHERE ID IN (SELECT ID FROM E WHERE I = ?)" '["abc"]'
+refuses "SELECT ID FROM P WHERE EXISTS (SELECT 1 FROM E WHERE I = ?)" '["abc"]'
 refuses "SELECT ID FROM P WHERE I = CAST(? AS INTEGER)" '["abc"]'
-refuses "SELECT ID FROM P WHERE DP = ?" '["1e400"]'
+refuses "SELECT ID FROM P WHERE I = CAST(? AS INTEGER)" '["5"]'
+refuses "SELECT ID FROM P WHERE I < ?" '["1e-400"]'
 refuses "SELECT ID FROM P WHERE I = ?" '["0X10"]'
 
 [ $fail -eq 0 ] && echo "PASS serve-real-bindconv" || { echo "FAIL serve-real-bindconv"; exit 1; }

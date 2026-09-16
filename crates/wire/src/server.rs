@@ -11147,6 +11147,13 @@ enum Term {
     /// (NULL is UNKNOWN, an empty table or a dead conjunct never raises -
     /// probed), a different vector ([EvalErr::DecfloatConvError]).
     DfConvErr(usize, Cmp, String),
+    /// [Term::CmpConvErr] for an EXPRESSION left side - `DP + 0 = ?`,
+    /// `ABS(I) = ?`, `I * 2 = ?`, `CAST(I AS NUMERIC(9,2)) = ?` - where
+    /// the bound text will not convert. The gate is the EXPRESSION's own
+    /// value, not a column's (probed: a NULL column answers with no
+    /// raise, an empty table answers, a FALSE conjunct written in front
+    /// silences it, and either side of an OR raises).
+    ExprConvErr(Box<Expr>, String),
     /// A SEMI-JOIN's hash key that the STRICT grammar refuses - what a
     /// [Tok::StrKey] against a numeric column becomes.
     ///
@@ -11606,6 +11613,18 @@ impl Predicate {
                 // the same reason (`FL = ?` ['0.1'] is the single compare);
                 // one past i64 / a scale past i8 converts as before
                 (ColKind::Approx, WireParam::Text(s) | WireParam::TextCs(s, _)) => {
+                    // a magnitude past DOUBLE's range is +-INFINITY here,
+                    // not an error (probed: `DP > ?` ['-1e400'] answers
+                    // every non-NULL row, `DP = ?` ['1e400'] answers none)
+                    if let Some(n @ TextNum::Dec { mantissa, exp }) = text_number(s) {
+                        if exp > 0 && text_to_approx(n, s).is_none() {
+                            return Ok(Some(Expr::Double(if mantissa < 0 {
+                                f64::NEG_INFINITY
+                            } else {
+                                f64::INFINITY
+                            })));
+                        }
+                    }
                     let n = text_number(s)
                         .filter(|n| text_to_approx(*n, s).is_some())
                         .ok_or_else(|| format!("conversion error from string \"{}\"", s))?;
@@ -11624,6 +11643,29 @@ impl Predicate {
                     t if t.eq_ignore_ascii_case("false") => false,
                     _ => return Err(format!("conversion error from string \"{}\"", s)),
                 })),
+                // an exact side against a magnitude no `Rhs::Num` holds -
+                // the expression twin of the wide bind in [lenient_param]
+                // (`I + 0 < ?` ['1e400'] answers every non-NULL row).
+                // Past i128 nothing exact can reach it, so infinity
+                // compares the same way the engine's exact value does.
+                (ColKind::Int | ColKind::Numeric, WireParam::Text(s) | WireParam::TextCs(s, _))
+                    if matches!(text_number(s), Some(TextNum::Dec { mantissa, exp })
+                        if exp >= 0 && (i64::try_from(mantissa).is_err() || i8::try_from(exp).is_err())) =>
+                {
+                    let Some(TextNum::Dec { mantissa, exp }) = text_number(s) else {
+                        unreachable!("the guard just matched this spelling")
+                    };
+                    let folded = if exp > 0 {
+                        10i128.checked_pow(exp as u32).and_then(|p| mantissa.checked_mul(p))
+                    } else {
+                        Some(mantissa)
+                    };
+                    Some(match folded {
+                        Some(v) => Expr::Int128(v),
+                        None if mantissa < 0 => Expr::Double(f64::NEG_INFINITY),
+                        None => Expr::Double(f64::INFINITY),
+                    })
+                }
                 // everything else keeps the classic Rhs typing, then
                 // becomes the matching literal
                 _ => match bind_rhs(idx, kind)? {
@@ -11661,6 +11703,55 @@ impl Predicate {
             let (WireParam::Text(s) | WireParam::TextCs(s, _)) = args.get(*idx)? else {
                 return None;
             };
+            // A magnitude no [Rhs::Num] can hold. The engine compares it
+            // EXACTLY (probed: `I < ?` ['1e400'] and a 41-digit spelling
+            // both answer every non-NULL row, `I = ?` answers none), so
+            // fold the exponent in: what fits i128 travels as
+            // [Rhs::Int128], and what outruns i128 outruns every exact
+            // column too, which decides the comparison by SIGN - still
+            // UNKNOWN over a NULL column, never a raise.
+            // a spelling so long that the STRICT grammar overflows i128
+            // reaches the same decision through the compare grammar,
+            // which rounds to 34 digits and keeps the exponent (a
+            // 41-digit integer outruns INT128's 39 either way)
+            let wide = match text_number(s) {
+                Some(TextNum::Dec { mantissa, exp }) => Some((mantissa, exp)),
+                None => match text_col_num(s) {
+                    ColNum::Exact(m, e) => Some((m, e)),
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some((mantissa, exp)) = wide {
+                if i64::try_from(mantissa).is_err() || i8::try_from(exp).is_err() {
+                    let folded = match exp.cmp(&0) {
+                        std::cmp::Ordering::Greater => 10i128
+                            .checked_pow(exp as u32)
+                            .and_then(|p| mantissa.checked_mul(p)),
+                        std::cmp::Ordering::Equal => Some(mantissa),
+                        std::cmp::Ordering::Less => None,
+                    };
+                    return match folded {
+                        Some(v) => match i64::try_from(v) {
+                            Ok(_) => None, // the ordinary bind holds it
+                            Err(_) => Some(Term::NumCmp(fid, op, Rhs::Int128(v))),
+                        },
+                        // only a POSITIVE exponent past i128 is decided
+                        // here; a tiny `1e-400` keeps its refusal
+                        None if exp > 0 => {
+                            let above = mantissa >= 0;
+                            let hit = match op {
+                                Cmp::Ne => true,
+                                Cmp::Eq => false,
+                                Cmp::Lt | Cmp::Le => above,
+                                Cmp::Gt | Cmp::Ge => !above,
+                            };
+                            Some(if hit { Term::IsNotNull(fid) } else { Term::Const(false) })
+                        }
+                        None => None,
+                    };
+                }
+            }
             match text_number(s) {
                 // a lowercase hex spelling the store grammar takes is still
                 // a per-row raise here (probed: `I = ?` ['0x5']); capital
@@ -11955,16 +12046,31 @@ impl Predicate {
                             // empty table, a NULL column and a dead
                             // conjunct in front answer with no raise), not
                             // an execute-time refusal
-                            let conv = match (lhs.as_ref(), kind, args.get(*idx)) {
+                            // an EXPRESSION left side gates on its OWN
+                            // value ([Term::ExprConvErr]); a bare column
+                            // keeps the column gate [Term::CmpConvErr],
+                            // which the keying and join passes can read
+                            let conv = match (kind, args.get(*idx)) {
                                 (
-                                    Expr::Col(fid),
-                                    ColKind::Approx | ColKind::Bool,
+                                    ColKind::Approx
+                                    | ColKind::Bool
+                                    | ColKind::Int
+                                    | ColKind::Numeric,
                                     Some(WireParam::Text(s) | WireParam::TextCs(s, _)),
                                 ) => match bind_literal(idx, kind) {
                                     Err(e) if e.starts_with("conversion error from string")
-                                        && (matches!(kind, ColKind::Bool) || text_number(s).is_none()) =>
+                                        && (matches!(kind, ColKind::Bool)
+                                            || text_number(s).is_none()) =>
                                     {
-                                        Some(Term::CmpConvErr(*fid, *op, s.clone(), None))
+                                        Some(match lhs.as_ref() {
+                                            Expr::Col(fid) => {
+                                                Term::CmpConvErr(*fid, *op, s.clone(), None)
+                                            }
+                                            other => Term::ExprConvErr(
+                                                Box::new(other.clone()),
+                                                s.clone(),
+                                            ),
+                                        })
                                     }
                                     _ => None,
                                 },
@@ -12216,6 +12322,7 @@ fn term_row_independent(t: &Term) -> bool {
     match t {
         Term::Const(_) | Term::Never => true,
         Term::ExprCond(c) => !cond_has_col(c),
+        Term::ExprConvErr(e, _) => !expr_has_col(e),
         Term::ExprLike(e, ..) | Term::ExprStarting(e, ..) | Term::BadExprLike(e, ..) => {
             !expr_has_col(e)
         }
@@ -12334,6 +12441,7 @@ fn term_side_only(t: &Term, win: &std::ops::Range<usize>) -> bool {
         | Term::BadLike(fid, ..)
         | Term::Starting(fid, ..) => win.contains(fid),
         Term::ExprCond(c) => !cond_reads(c, &outside),
+        Term::ExprConvErr(e, _) => !expr_reads(e, &outside),
         Term::ExprLike(e, ..) | Term::ExprStarting(e, ..) | Term::BadExprLike(e, ..) => {
             !expr_reads(e, &outside)
         }
@@ -12362,6 +12470,10 @@ fn collect_term_fids(t: &Term, mark: &dyn Fn(usize) -> bool) -> bool {
         | Term::BadLike(fid, ..)
         | Term::Starting(fid, ..) => {
             mark(*fid);
+            true
+        }
+        Term::ExprConvErr(e, _) => {
+            expr_reads(e, mark);
             true
         }
         Term::ExprCond(c) => {
@@ -12770,6 +12882,11 @@ impl Term {
             },
             Term::Const(b) => Some(*b),
             Term::Never | Term::Unknown => None,
+            // the value gate is the EXPRESSION's value - see the variant
+            Term::ExprConvErr(e, s) => match e.eval(values)? {
+                Value::Null => None,
+                _ => return Err(EvalErr::ConversionError(Some(s.clone()))),
+            },
             Term::ExprCond(c) => c.eval(values)?,
             Term::ExprLike(e, pattern, escape, negated) => match e.eval(values)? {
                 Value::Null => None,
