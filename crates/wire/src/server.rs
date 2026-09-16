@@ -12101,6 +12101,17 @@ impl Predicate {
                             }
                         }
                     }
+                    // a `?` INSIDE an expression - `I = CAST(? AS
+                    // INTEGER)`. The value becomes a literal under the
+                    // CAST that types it, once, here; the CAST itself
+                    // converts PER ROW, which is where the engine raises
+                    // from (probed: a NULL column still raises, an empty
+                    // table does not, a FALSE conjunct in front silences
+                    // it - exactly what an ordinary ExprCond does).
+                    Term::ExprCond(c) if cond_has_param(c) => Term::ExprCond(Box::new(
+                        subst_params_cond(c, args)
+                            .ok_or("parameter type does not match its column")?,
+                    )),
                     other => other.clone(),
                 });
             }
@@ -12405,6 +12416,48 @@ fn expr_reads(e: &Expr, f: &dyn Fn(usize) -> bool) -> bool {
 
 fn cond_has_col(c: &Cond2) -> bool {
     cond_reads(c, &|_| true)
+}
+
+/// Does this condition carry a `?` placeholder - the shape
+/// [Predicate::bind] must substitute before any row sees it?
+fn cond_has_param(c: &Cond2) -> bool {
+    match c {
+        Cond2::Cmp(a, _, b) => expr_has_param(a) || expr_has_param(b),
+        Cond2::IsNull(a)
+        | Cond2::IsNotNull(a)
+        | Cond2::Like(a, ..)
+        | Cond2::Starting(a, ..)
+        | Cond2::Similar(a, ..) => expr_has_param(a),
+        Cond2::Not(inner) => cond_has_param(inner),
+        Cond2::And(parts) | Cond2::Or(parts) => parts.iter().any(cond_has_param),
+    }
+}
+
+/// Substitute the bound arguments into a condition's `?` placeholders,
+/// the [subst_params_expr] twin for the predicate side. The CAST that
+/// types each one then converts it PER ROW, which is where the engine
+/// raises from (probed: a NULL column still raises, an empty table does
+/// not, and a FALSE conjunct written in front silences it).
+fn subst_params_cond(c: &Cond2, args: &[WireParam]) -> Option<Cond2> {
+    Some(match c {
+        Cond2::Cmp(a, op, b) => Cond2::Cmp(
+            Box::new(subst_params_expr(a, args)?),
+            *op,
+            Box::new(subst_params_expr(b, args)?),
+        ),
+        Cond2::IsNull(a) => Cond2::IsNull(Box::new(subst_params_expr(a, args)?)),
+        Cond2::IsNotNull(a) => Cond2::IsNotNull(Box::new(subst_params_expr(a, args)?)),
+        Cond2::Not(inner) => Cond2::Not(Box::new(subst_params_cond(inner, args)?)),
+        Cond2::And(parts) => Cond2::And(
+            parts.iter().map(|p| subst_params_cond(p, args)).collect::<Option<Vec<_>>>()?,
+        ),
+        Cond2::Or(parts) => Cond2::Or(
+            parts.iter().map(|p| subst_params_cond(p, args)).collect::<Option<Vec<_>>>()?,
+        ),
+        // a pattern side carrying a `?` never resolves (the projection
+        // resolver types no pattern), so these pass through unchanged
+        Cond2::Like(..) | Cond2::Starting(..) | Cond2::Similar(..) => return None,
+    })
 }
 
 fn cond_reads(c: &Cond2, f: &dyn Fn(usize) -> bool) -> bool {
@@ -70781,7 +70834,13 @@ impl Expr {
                             match text_to_dec128_clamped(s) {
                                 Ok(bits) => fire_crab_ods::decfloat::decode_dec128(bits),
                                 Err(true) => return Err(EvalErr::DecfloatOverflow),
-                                Err(false) => return Err(conv_err(*cs, s.clone())),
+                                // decNumber's own refusal: *Decimal float
+                                // invalid operation* AND THEN the conversion
+                                // error, both widths (probed: `D16 = CAST(?
+                                // AS DECFLOAT(16))` and the (34) twin)
+                                Err(false) => {
+                                    return Err(EvalErr::DecfloatConvError(s.clone()))
+                                }
                             }
                         } else if approx_const_fold(e) {
                             // a pure-constant approximate literal cast to
@@ -78943,20 +79002,22 @@ fn parse_value(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Rhs> {
 /// arithmetic operators back into a [RawExpr] - the comparison SIDES of
 /// a predicate (`WHERE A + 1 > B * 2`). Mirrors the char-level parser's
 /// precedence (`+`/`-` over `*`/`/` over unary `-` over atoms); function
-/// calls arrive pre-parsed as [Tok::FnExpr]. Parameters (`?`) are NOT
-/// expression atoms - a bare `?` stays on the classic Rhs path, where
-/// its bind machinery lives.
-fn texpr(t: &[Tok], pos: &mut usize) -> Option<RawExpr> {
-    let mut left = texpr_mul(t, pos)?;
+/// calls arrive pre-parsed as [Tok::FnExpr]. A bare `?` is NOT an
+/// expression atom - it stays on the classic Rhs path, where its bind
+/// machinery lives - but a `?` INSIDE a pre-parsed call (`CAST(? AS
+/// INTEGER)`) is numbered here, at its textual place, because the whole
+/// call lexed as ONE token and [parse_value] never saw its placeholder.
+fn texpr(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<RawExpr> {
+    let mut left = texpr_mul(t, pos, np)?;
     loop {
         match t.get(*pos) {
             Some(Tok::Plus) => {
                 *pos += 1;
-                left = RawExpr::Bin(Box::new(left), ArithOp::Add, Box::new(texpr_mul(t, pos)?));
+                left = RawExpr::Bin(Box::new(left), ArithOp::Add, Box::new(texpr_mul(t, pos, np)?));
             }
             Some(Tok::Minus) => {
                 *pos += 1;
-                left = RawExpr::Bin(Box::new(left), ArithOp::Sub, Box::new(texpr_mul(t, pos)?));
+                left = RawExpr::Bin(Box::new(left), ArithOp::Sub, Box::new(texpr_mul(t, pos, np)?));
             }
             _ => break,
         }
@@ -78964,17 +79025,17 @@ fn texpr(t: &[Tok], pos: &mut usize) -> Option<RawExpr> {
     Some(left)
 }
 
-fn texpr_mul(t: &[Tok], pos: &mut usize) -> Option<RawExpr> {
-    let mut left = texpr_unary(t, pos)?;
+fn texpr_mul(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<RawExpr> {
+    let mut left = texpr_unary(t, pos, np)?;
     loop {
         match t.get(*pos) {
             Some(Tok::Star) => {
                 *pos += 1;
-                left = RawExpr::Bin(Box::new(left), ArithOp::Mul, Box::new(texpr_unary(t, pos)?));
+                left = RawExpr::Bin(Box::new(left), ArithOp::Mul, Box::new(texpr_unary(t, pos, np)?));
             }
             Some(Tok::Slash) => {
                 *pos += 1;
-                left = RawExpr::Bin(Box::new(left), ArithOp::Div, Box::new(texpr_unary(t, pos)?));
+                left = RawExpr::Bin(Box::new(left), ArithOp::Div, Box::new(texpr_unary(t, pos, np)?));
             }
             _ => break,
         }
@@ -78982,38 +79043,38 @@ fn texpr_mul(t: &[Tok], pos: &mut usize) -> Option<RawExpr> {
     Some(left)
 }
 
-fn texpr_unary(t: &[Tok], pos: &mut usize) -> Option<RawExpr> {
+fn texpr_unary(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<RawExpr> {
     if matches!(t.get(*pos), Some(Tok::Minus)) {
         *pos += 1;
         // the DECFLOAT literal fold [expr_unary] makes
-        return Some(match texpr_unary(t, pos)? {
+        return Some(match texpr_unary(t, pos, np)? {
             RawExpr::DecFloat34(bits) => RawExpr::DecFloat34(bits ^ (1u128 << 127)),
             other => RawExpr::Neg(Box::new(other)),
         });
     }
     if matches!(t.get(*pos), Some(Tok::Plus)) {
         *pos += 1;
-        return texpr_unary(t, pos);
+        return texpr_unary(t, pos, np);
     }
-    texpr_concat(t, pos)
+    texpr_concat(t, pos, np)
 }
 
 /// The `||` concatenation level - tighter than unary minus and the
 /// arithmetic operators, left-associative, mirroring the char-level
 /// [expr_concat] the select-list parser uses.
-fn texpr_concat(t: &[Tok], pos: &mut usize) -> Option<RawExpr> {
-    let mut left = texpr_at_tz(t, pos)?;
+fn texpr_concat(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<RawExpr> {
+    let mut left = texpr_at_tz(t, pos, np)?;
     while matches!(t.get(*pos), Some(Tok::Concat)) {
         *pos += 1;
-        left = RawExpr::Concat(Box::new(left), Box::new(texpr_at_tz(t, pos)?));
+        left = RawExpr::Concat(Box::new(left), Box::new(texpr_at_tz(t, pos, np)?));
     }
     Some(left)
 }
 
 /// The token twin of [expr_at_tz]: `AT TIME ZONE` / `AT LOCAL` arrive
 /// as bare identifier tokens here.
-fn texpr_at_tz(t: &[Tok], pos: &mut usize) -> Option<RawExpr> {
-    let mut left = texpr_atom(t, pos)?;
+fn texpr_at_tz(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<RawExpr> {
+    let mut left = texpr_atom(t, pos, np)?;
     loop {
         let word = |i: usize, w: &str| {
             matches!(t.get(i), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case(w))
@@ -79030,7 +79091,7 @@ fn texpr_at_tz(t: &[Tok], pos: &mut usize) -> Option<RawExpr> {
             break;
         }
         *pos += 3;
-        let zone = texpr_atom(t, pos)?;
+        let zone = texpr_atom(t, pos, np)?;
         left = RawExpr::AtTimeZone(Box::new(left), Some(Box::new(zone)));
     }
     Some(left)
@@ -79039,8 +79100,8 @@ fn texpr_at_tz(t: &[Tok], pos: &mut usize) -> Option<RawExpr> {
 /// An atom, plus any `COLLATE <name>` postfixes on it. COLLATE binds
 /// TIGHTER than every operator - `A || B COLLATE X` collates B, not the
 /// concatenation - which is exactly what a postfix on the atom gives.
-fn texpr_atom(t: &[Tok], pos: &mut usize) -> Option<RawExpr> {
-    let mut e = texpr_atom_bare(t, pos)?;
+fn texpr_atom(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<RawExpr> {
+    let mut e = texpr_atom_bare(t, pos, np)?;
     while let (Some(Tok::Ident(kw)), Some(Tok::Ident(name))) = (t.get(*pos), t.get(*pos + 1)) {
         if !kw.eq_ignore_ascii_case("COLLATE") {
             break;
@@ -79051,7 +79112,7 @@ fn texpr_atom(t: &[Tok], pos: &mut usize) -> Option<RawExpr> {
     Some(e)
 }
 
-fn texpr_atom_bare(t: &[Tok], pos: &mut usize) -> Option<RawExpr> {
+fn texpr_atom_bare(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<RawExpr> {
     let e = match t.get(*pos)? {
         Tok::Int(n) => RawExpr::Int(*n),
         Tok::Int128(n) => RawExpr::Int128(*n),
@@ -79060,7 +79121,17 @@ fn texpr_atom_bare(t: &[Tok], pos: &mut usize) -> Option<RawExpr> {
         Tok::Str(v) => RawExpr::Str(v.clone()),
         Tok::Null => RawExpr::Null,
         Tok::Ident(c) => RawExpr::Col(c.clone()),
-        Tok::FnExpr(e) => e.clone(),
+        // the whole call lexed as ONE token, so any `?` inside it still
+        // carries the parser's `usize::MAX` placeholder: number it HERE,
+        // where the token is consumed, and the slot is its place in the
+        // text (`WHERE I = ? AND J = CAST(? AS INTEGER)` numbers 0 then 1)
+        Tok::FnExpr(e) => {
+            let mut e = e.clone();
+            if raw_has_param(&e) {
+                renumber_raw_params(&mut e, np);
+            }
+            e
+        }
         // an aggregate call inside an ARITHMETIC side - `HAVING
         // SUM(N) * 2 > 10`, `HAVING STDDEV_POP(N) * 2 > 3` (both
         // engine-served, measured): the leaf the group planner later
@@ -79069,7 +79140,7 @@ fn texpr_atom_bare(t: &[Tok], pos: &mut usize) -> Option<RawExpr> {
         Tok::Agg(f, target) => RawExpr::Agg(*f, Box::new(target.clone())),
         Tok::LParen => {
             *pos += 1;
-            let inner = texpr(t, pos)?;
+            let inner = texpr(t, pos, np)?;
             if !matches!(t.get(*pos), Some(Tok::RParen)) {
                 return None;
             }
@@ -79123,7 +79194,7 @@ fn parse_side(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Side> {
             }
         }
     }
-    Some(Side::Expr(texpr(t, pos)?))
+    Some(Side::Expr(texpr(t, pos, np)?))
 }
 
 fn side_kind(op: Cmp, side: Side) -> RawKind {
@@ -79162,7 +79233,7 @@ fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
             if let Some(Tok::Cmp(op)) = t.get(p2) {
                 let op = *op;
                 let mut p3 = p2 + 1;
-                if let Some(rhs_expr) = texpr(t, &mut p3) {
+                if let Some(rhs_expr) = texpr(t, &mut p3, &mut np2) {
                     let lhs = match rhs_expr {
                         RawExpr::Col(c) => RawLhs::Col(c),
                         e => RawLhs::Expr(e),
@@ -79406,7 +79477,7 @@ fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
         // anything else parses as an expression side; a side that
         // reduces to a bare column keeps the classic paths (parameters,
         // the exact numeric terms)
-        _ => match texpr(t, pos)? {
+        _ => match texpr(t, pos, np)? {
             RawExpr::Col(c) => RawLhs::Col(c),
             e => RawLhs::Expr(e),
         },
@@ -87164,6 +87235,16 @@ fn resolve_expr_term(
     // the left side as a resolved expression: the call itself, or the
     // plain column a CmpExpr right side compares against
     let lhs = match &rt.lhs {
+        // A SIDE CARRYING A `?` - `CAST(? AS INTEGER) = I`. The
+        // projection resolver types each placeholder from the shape
+        // around it (a CAST target IS the slot the engine describes,
+        // probed: LONG for INTEGER, VARYING(5) for VARCHAR(5), DOUBLE
+        // for DOUBLE PRECISION) and refuses every shape it cannot type,
+        // a bare `?` included - so this admits the typed cast and
+        // nothing else. The value is substituted at bind.
+        RawLhs::Expr(e) if raw_has_param(e) => {
+            resolve_proj_expr(e, columns, descs, params)?
+        }
         RawLhs::Expr(e) => resolve_expr(e, columns, descs)?,
         RawLhs::Col(name) => resolve_expr(&RawExpr::Col(name.clone()), columns, descs)?,
         RawLhs::Agg(..) => return None,
@@ -87277,6 +87358,9 @@ fn resolve_expr_term(
                     return None;
                 }
                 Expr::Bool(true)
+            } else if raw_has_param(e) {
+                // the twin of the lhs arm above: `I = CAST(? AS INTEGER)`
+                resolve_proj_expr(e, columns, descs, params)?
             } else {
                 resolve_expr(e, columns, descs)?
             };
@@ -88341,7 +88425,11 @@ fn decfloat_term(
         }
         RawKind::Cmp(op, Rhs::Str(v)) => match text_to_dec128_clamped(&v) {
             Ok(bits) => Term::NumCmp(idx, op, Rhs::DecFloat34(bits)),
-            Err(_) => Term::CmpConvErr(idx, op, v, None),
+            // the WIDE column's own vector: *Decimal float invalid
+            // operation* and then the conversion error (probed: `D34 =
+            // 'abc'`; a DECFLOAT(16) column raises the conversion error
+            // ALONE, which is the DEC64 arm above)
+            Err(_) => Term::DfConvErr(idx, op, v),
         },
         RawKind::Cmp(op, rhs) => Term::NumCmp(idx, op, Rhs::DecFloat34(rhs_to_dec128(&rhs)?)),
         RawKind::IsNull => Term::IsNull(idx),

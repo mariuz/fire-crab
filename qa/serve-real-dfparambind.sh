@@ -374,7 +374,12 @@ both "cast ? df16 0.37661826488242445" "SELECT CAST(CAST(? AS DECFLOAT(16)) AS V
 both "cast ? df16 3873.2130461097545" "SELECT CAST(CAST(? AS DECFLOAT(16)) AS VARCHAR(60)) B FROM RDB\$DATABASE" "[3873.2130461097545]"
 echo "-- boundary (recorded): an EXPRESSION carrying a ? against a DECFLOAT column still refuses --"
 refuses_fc() { local f; f=$(node_run "$PORT" "$FC" "$2" "$3"); if [ "$f" = "ERR" ]; then echo "OK   $1 (fc refuses, deferred)"; else echo "FAIL $1 (fc should refuse)"; echo "     fc: $f"; fail=1; fi; }
-refuses_fc "D34 = CAST(? AS DOUBLE)"  "SELECT ID FROM PB WHERE D34 = CAST(? AS DOUBLE PRECISION) ORDER BY ID" "[1.1]"
+# was an fc-only refusal until `CAST(? AS <type>)` became a resolvable
+# comparison side (serve-real-bindconv, 2026-09-16): the slot describes as
+# the cast target and the cast converts per row, so this now ANSWERS - and
+# answers what the engine answers, the 17-significant-digit double expansion
+# against the DECFLOAT(34) cohort included
+both "D34 = CAST(? AS DOUBLE)"  "SELECT ID FROM PB WHERE D34 = CAST(? AS DOUBLE PRECISION) ORDER BY ID" "[1.1]"
 refuses_fc "D16 = ? + 0"              "SELECT ID FROM PB WHERE D16 = ? + 0 ORDER BY ID" "[1.1]"
 echo "-- boundary (recorded): a ? INSIDE an expression stored into a DECFLOAT column refuses --"
 # the engine types the slot from the EXPRESSION'S context and converts the
