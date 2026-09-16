@@ -30340,9 +30340,31 @@ fn plan_insert_select(
     // ROUND / TRUNC, a conditional - into a DECFLOAT column refuses: the
     // engine stores the literal's text / evlRound's exact 2.68, where this
     // server's double would store the 17-digit expansion (recorded)
-    if approx_source_into_decfloat(&src, &listed, descs) {
-        return None;
-    }
+    let src = if approx_source_into_decfloat(&src, &listed, descs) {
+        // A CONSTANT LITERAL SOURCE is re-planned with its exponent
+        // literals read as DECIMALS ([decfloat_const_expr]'s parse mode):
+        // the column then TYPES decfloat, this gate stops firing on its
+        // own, and the value reaches the column as the engine's does
+        // (`SELECT 1E+200` stores 1E+200, `SELECT 1E+3 * 2` stores 2E+3;
+        // a MERGE's NOT MATCHED INSERT desugars to this same statement,
+        // so it follows). A ROUND / TRUNC / conditional source has no
+        // spelling to re-read and keeps the refusal.
+        if !decfloat_source_is_const(&src, &listed, descs) {
+            return None;
+        }
+        let mut resink: Vec<Option<Descriptor>> = Vec::new();
+        let prev = DEC_LITS.with(|c| c.replace(true));
+        let replanned = plan_query_inner(s[sel..].trim(), db, &mut resink);
+        DEC_LITS.with(|c| c.set(prev));
+        // the re-plan must describe the SAME parameters, or the two
+        // passes disagree about the statement's input
+        match replanned.filter(|_| resink.len() == sink.len()) {
+            Some(sp) if !approx_source_into_decfloat(&sp, &listed, descs) => sp,
+            _ => return None,
+        }
+    } else {
+        src
+    };
     // an untypeable `?` (a param-to-param compare, a UNION leg, a CTE,
     // an IN-subquery, ORDER BY ?) refuses. The engine refuses those too,
     // at prepare, with `-804 / HY004 Data type unknown`; fire-crab's
@@ -67136,6 +67158,28 @@ fn approx_source_into_decfloat(src: &Plan, listed: &[usize], descs: &[Descriptor
                 matches!(c.wire, Wire::Double | Wire::Float)
                     && !c.expr.as_ref().map_or(true, approx_runtime_expr)
             })
+    })
+}
+
+/// Is EVERY approximate source landing in a DECFLOAT column a pure
+/// CONSTANT fold over literals ([approx_const_fold])?
+///
+/// Such a source is re-plannable with its literals read as DECIMALS, so
+/// the value reaches the column the way the engine's does (`SELECT
+/// 1E+200` stores 1E+200, `SELECT 1E+3 * 2` stores 2E+3). A ROUND, a
+/// TRUNC or a conditional is NOT - it has no literal spelling to re-read
+/// - and keeps [approx_source_into_decfloat]'s refusal.
+fn decfloat_source_is_const(src: &Plan, listed: &[usize], descs: &[Descriptor]) -> bool {
+    let cols = output_cols_of(src);
+    listed.iter().enumerate().all(|(i, fid)| {
+        let offending = descs
+            .get(*fid)
+            .is_some_and(|d| matches!(d.dtype, dtype::DEC64 | dtype::DEC128))
+            && cols.get(i).is_some_and(|c| {
+                matches!(c.wire, Wire::Double | Wire::Float)
+                    && !c.expr.as_ref().map_or(true, approx_runtime_expr)
+            });
+        !offending || cols.get(i).is_some_and(|c| c.expr.as_ref().is_some_and(approx_const_fold))
     })
 }
 
