@@ -19611,10 +19611,18 @@ enum InsVal {
     /// 1E+200, 1.5E-398 stores 2E-398, 0.1E0 stores 0.1, the cohort kept)
     /// and a ROUND as its exact scaled value (2.68), where the runtime
     /// path would write the 17/16-digit expansion (9.9999999999999997E+199,
-    /// 2.6800000000000002) or, past the double's range, a plain zero. The
-    /// text-exact store needs the literal's spelling carried to the
-    /// encoder - a later slice.
-    ApproxConst(WireParam),
+    /// 2.6800000000000002) or, past the double's range, a plain zero.
+    ///
+    /// The second field is the literal's OWN SPELLING, kept when the value
+    /// is a BARE numeric literal (never for arithmetic or a call over
+    /// one). A DECFLOAT destination reads the decimal from that text -
+    /// which is not the text verbatim but the decNumber form of the value
+    /// it denotes, coefficient and exponent as written: measured,
+    /// `1e+200` / `1E200` / `+1E200` all store 1E+200, `1.5E+2` stays
+    /// 1.5E+2, while `1.50E+2` is 150, `0.1E+1` is 1 and `1.0E+0` is 1.0.
+    /// Arithmetic over such a literal keeps the refusal (`1E+200 + 0` is
+    /// the engine's 34-digit decimal sum, a different question).
+    ApproxConst(WireParam, Option<String>),
     /// `GenId(name, step)`: `None` step = `NEXT VALUE FOR` (use the
     /// sequence's own increment), `Some(n)` = `GEN_ID(name, n)`.
     GenId(String, Option<i64>),
@@ -30545,7 +30553,14 @@ fn plan_insert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
                     if matches!(wp, WireParam::Double(_) | WireParam::Single(_))
                         && !approx_runtime_expr(&e)
                     {
-                        InsVal::ApproxConst(wp)
+                        // a BARE literal keeps its spelling for a DECFLOAT
+                        // destination, which reads its decimal from the
+                        // text rather than from the double it folded to
+                        // ([InsVal::ApproxConst]); anything built OVER a
+                        // literal has no single spelling to keep
+                        let text =
+                            bare_double_literal(&e).then(|| part_text.trim().to_string());
+                        InsVal::ApproxConst(wp, text)
                     } else {
                         InsVal::Wire(wp)
                     }
@@ -30675,7 +30690,7 @@ fn plan_insert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
                 // a CONSTANT EXPRESSION folded to text, and a plain
                 // number: the engine stores the RENDERING (probed:
                 // `VALUES (42)` into a blob column reads back '42')
-                InsVal::Wire(wp) | InsVal::ApproxConst(wp) => {
+                InsVal::Wire(wp) | InsVal::ApproxConst(wp, _) => {
                     wireparam_text(wp).map(|t| (fid, lit(&t), 1))
                 }
                 InsVal::Int(n) => Some((fid, lit(&n.to_string()), 1)),
@@ -31044,7 +31059,7 @@ fn build_insert_image(
                     | InsVal::Dec(..)
                     | InsVal::Bool(_)
             ) || (d.dtype == dtype::BLOB
-                && matches!(v, InsVal::Wire(wp) | InsVal::ApproxConst(wp) if wireparam_text(wp).is_some()))
+                && matches!(v, InsVal::Wire(wp) | InsVal::ApproxConst(wp, _) if wireparam_text(wp).is_some()))
         {
             continue;
         }
@@ -31158,13 +31173,20 @@ fn encode_set_value(d: &Descriptor, v: &InsVal) -> Option<Option<Vec<u8>>> {
         // temporal renders into a TEXT column - the encode arms' rules)
         InsVal::Wire(wp) => wp.clone(),
         // a constant approximate fold stores as the double it folded to -
-        // except into a DECFLOAT column, where the engine keeps the
-        // LITERAL'S TEXT and this fold has lost it ([InsVal::ApproxConst])
-        InsVal::ApproxConst(wp) => {
+        // except into a DECFLOAT column, which reads the decimal from the
+        // LITERAL'S OWN SPELLING ([InsVal::ApproxConst]): the text goes to
+        // the encoder, whose DEC128 / DEC64 arms parse it by the decNumber
+        // grammar, so `1E+200` stores 1E+200 where the folded double
+        // stored 9.9999999999999997E+199. A value with no single spelling
+        // (arithmetic, a call) keeps the refusal.
+        InsVal::ApproxConst(wp, text) => {
             if matches!(d.dtype, dtype::DEC64 | dtype::DEC128) {
-                return None;
+                let t = text.as_ref()?;
+                text_to_dec128_clamped(t).ok()?;
+                WireParam::Text(t.clone())
+            } else {
+                wp.clone()
             }
-            wp.clone()
         }
         // parameters bind, generators advance, at execute - not here.
         // DEFAULT never reaches an encoder at all: plan_insert drops a
@@ -33167,6 +33189,25 @@ fn plan_update(sql: &str, db_outer: &Option<Database>) -> Option<(Plan, Vec<Desc
                 }
                 let raw = raw;
                 let e = resolve_expr(&raw, &columns, descs)?;
+                // A BARE NUMERIC LITERAL aimed at a DECFLOAT column is read
+                // as DECIMAL FROM ITS OWN SPELLING, not from the double it
+                // folded to - the INSERT arm's twin ([InsVal::ApproxConst]),
+                // done here as a literal swap because a SET value stays an
+                // expression evaluated per row, with no later place to
+                // spell it. Measured: `SET D = 1E+200` keeps 1E+200 where
+                // the fold stored 9.9999999999999997E+199.
+                let e = if bare_double_literal(&e)
+                    && matches!(
+                        descs.get(fid0).map(|d| d.dtype),
+                        Some(dtype::DEC64 | dtype::DEC128)
+                    ) {
+                    match text_to_dec128_clamped(rhs.trim()) {
+                        Ok(bits) => Expr::DecFloat34(bits),
+                        Err(_) => e,
+                    }
+                } else {
+                    e
+                };
                 // an APPROXIMATE value that is not a runtime double into a
                 // DECFLOAT column refuses ([approx_runtime_expr]): the
                 // engine stores an exponent literal from its TEXT (`SET D =
@@ -67014,6 +67055,22 @@ fn f64_to_dec(x: f64, sig: usize) -> Option<fire_crab_ods::decfloat::Dec> {
 /// ROUND(dp, 2) * 1, which is why a function under a minus or an
 /// operator answers false too); a subquery, a lookup. Everything not
 /// listed refuses at the DECFLOAT store, recorded.
+/// Is this a BARE numeric literal - the one shape whose own SPELLING a
+/// DECFLOAT destination reads its decimal from ([InsVal::ApproxConst])?
+///
+/// A leading minus parses as a NEGATION over the literal, not into it,
+/// and the engine stores the sign all the same (measured: `-2.5E+3`,
+/// `-1E+200`, `-0.1`), so it counts - the captured text carries the sign
+/// and [text_to_dec128_clamped] reads it. Anything built OVER a literal
+/// (`1E+200 + 0`, a call) has no single spelling and keeps the refusal.
+fn bare_double_literal(e: &Expr) -> bool {
+    match e {
+        Expr::Double(_) => true,
+        Expr::Neg(inner) => matches!(**inner, Expr::Double(_)),
+        _ => false,
+    }
+}
+
 fn approx_runtime_expr(e: &Expr) -> bool {
     match e {
         Expr::Col(_) => true,

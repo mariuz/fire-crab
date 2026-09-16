@@ -417,14 +417,20 @@ agree "ins-sel FL 3.4e38, 1e-30 -> FLOAT/DOUBLE/VARCHAR" "INSERT INTO DX (ID, F,
 agree "ins-sel DP 3.4e38, 1e-30, 1e30 -> DOUBLE/FLOAT" "DELETE FROM DX; INSERT INTO DX (ID, DP, F) SELECT ID, DP, DP FROM TX WHERE ID IN (7, 8, 4); SELECT ID, DP, F FROM DX ORDER BY ID;"
 agree "VALUES((SELECT FL)) 3.4e38"           "DELETE FROM DX; INSERT INTO DX (ID, F, DP) VALUES (7, (SELECT FL FROM TX WHERE ID = 7), (SELECT FL FROM TX WHERE ID = 7)); SELECT ID, F, DP FROM DX;"
 agree "UPDATE .. = (SELECT FL) 3.4e38"       "DELETE FROM DX; INSERT INTO DX (ID) VALUES (1); UPDATE DX SET F = (SELECT FL FROM TX WHERE ID = 7) WHERE ID = 1; SELECT ID, F FROM DX;"
-echo "-- verify-found: an EXPONENT LITERAL into a DECFLOAT column refuses (the engine stores the literal's TEXT: 1E+200, 2E-398, 0.1) --"
+echo "-- verify-found: an EXPONENT LITERAL into a DECFLOAT column is read as DECIMAL FROM ITS OWN SPELLING (serve-real-explitstore, 2026-09-16) --"
+# NOT the text verbatim: the decNumber form of the value the literal
+# denotes, coefficient and exponent as written - 1e+200 / 1E200 / +1E200
+# all store 1E+200, 1.5E+2 stays 1.5E+2, while 1.50E+2 is 150, 0.1E+1 is 1
+# and 1.0E+0 is 1.0. Each line below was measured on BOTH sides (status
+# AND stored value) before it became an agreement check; arithmetic over a
+# literal, INSERT..SELECT and a MERGE INSERT literal still refuse.
 # 1.5E-398 is past DOUBLE's range, so it is a DECFLOAT(34) literal (the
 # dfliteral chunk) and stores its exact decimal - the engine's 2E-398 in a
 # DECFLOAT(16) - no longer the refused DOUBLE underflow
 agree "insert 1.5E-398 into D16 stores 2E-398" "INSERT INTO DX (ID, D16) VALUES (501, 1.5E-398); SELECT ID, D16 FROM DX WHERE ID = 501;"
-refuses "insert 1E+200 into D34"    "INSERT INTO DX (ID, D34) VALUES (502, 1E+200);"
-refuses "insert 0.1E0 into D34"     "INSERT INTO DX (ID, D34) VALUES (503, 0.1E0);"
-refuses "insert -1.5E-300 into D34" "INSERT INTO DX (ID, D34) VALUES (504, -1.5E-300);"
+agree "insert 1E+200 into D34"      "INSERT INTO DX (ID, D34) VALUES (502, 1E+200); SELECT ID, CAST(D34 AS VARCHAR(45)) A FROM DX WHERE ID = 502;"
+agree "insert 0.1E0 into D34"       "INSERT INTO DX (ID, D34) VALUES (506, 0.1E0); SELECT ID, CAST(D34 AS VARCHAR(45)) A FROM DX WHERE ID = 506;"
+agree "insert -1.5E-300 into D34"   "INSERT INTO DX (ID, D34) VALUES (504, -1.5E-300); SELECT ID, CAST(D34 AS VARCHAR(45)) A FROM DX WHERE ID = 504;"
 refuses "insert 1E+3 * 2 into D34"  "INSERT INTO DX (ID, D34) VALUES (505, 1E+3 * 2);"
 # An UPDATE takes it now (serve-real-slottype, 2026-09-16: the UPDATE
 # planner's type gate learned the decfloat question, and this literal
@@ -434,7 +440,9 @@ refuses "insert 1E+3 * 2 into D34"  "INSERT INTO DX (ID, D34) VALUES (505, 1E+3 
 # into a both-sides check makes the ENGINE run a statement it never ran,
 # and a later table-state check then diverges.
 agree "update D16 = 1.5E-398 stores 2E-398" "INSERT INTO DX (ID, D16) VALUES (503, 1); UPDATE DX SET D16 = 1.5E-398 WHERE ID = 503; SELECT ID, D16 FROM DX WHERE ID = 503;"
-refuses "update D34 = 1E+200"       "UPDATE PBW SET D34 = 1E+200 WHERE ID = 1;"
+# on its OWN DX row: the ENGINE runs this for the first time now, and a
+# statement that mutates PBW would move ground a later check stands on
+agree "update D34 = 1E+200"         "INSERT INTO DX (ID, D34) VALUES (520, 1); UPDATE DX SET D34 = 1E+200 WHERE ID = 520; SELECT ID, CAST(D34 AS VARCHAR(45)) A FROM DX WHERE ID = 520;"
 agree "plain decimal / integer literals still store" "DELETE FROM DX; INSERT INTO DX (ID, D34, D16) VALUES (510, 1.1, 1.1); INSERT INTO DX (ID, D34, D16) VALUES (511, 1000, 1000); SELECT ID, D34, D16 FROM DX ORDER BY ID;"
 agree "1.5E0 into DOUBLE / NUMERIC / FLOAT unchanged" "DELETE FROM DX; INSERT INTO DX (ID, DP, N, F) VALUES (512, 1.5E0, 1.5E0, 1.5E0); SELECT ID, DP, N, F FROM DX;"
 agree "CAST('1.1' AS DOUBLE PRECISION) takes the runtime path" "DELETE FROM DX; INSERT INTO DX (ID, D34, D16) VALUES (513, CAST('1.1' AS DOUBLE PRECISION), CAST('1.1' AS DOUBLE PRECISION)); SELECT ID, D34, D16 FROM DX;"
@@ -469,9 +477,9 @@ refuses_fc "merge set COALESCE(?,0) [2]"     "MERGE INTO PBW USING (SELECT 2 AS 
 both "merge insert ? * 3 [2]"          "MERGE INTO PBW USING (SELECT 791 AS K FROM RDB\$DATABASE) SRC ON PBW.ID = SRC.K WHEN NOT MATCHED THEN INSERT (ID, D34) VALUES (SRC.K, ? * 3)" "[2]"
 echo "-- verify-found (round 2): a NON-RUNTIME approximate value refuses at a DECFLOAT store wherever its provenance was erased; ROUND now stores its EXACT value (the roundexact chunk) and is compared --"
 refuses "ins-sel literal 1E+200 -> D34"      "INSERT INTO DX (ID, D34) SELECT 1, 1E+200 FROM RDB\$DATABASE;"
-refuses "VALUES((SELECT 1E+200)) -> D34"     "INSERT INTO DX (ID, D34) VALUES (1, (SELECT 1E+200 FROM RDB\$DATABASE));"
-refuses "UPDATE .. = (SELECT 1E+200) D34"    "UPDATE PBW SET D34 = (SELECT 1E+200 FROM RDB\$DATABASE) WHERE ID = 1;"
-refuses "MERGE source literal col -> D34"    "MERGE INTO PBW USING (SELECT 1 AS K, 1E+200 AS X FROM RDB\$DATABASE) SRC ON PBW.ID = SRC.K WHEN MATCHED THEN UPDATE SET D34 = SRC.X;"
+agree "VALUES((SELECT 1E+200)) -> D34"       "INSERT INTO DX (ID, D34) VALUES (521, (SELECT 1E+200 FROM RDB\$DATABASE)); SELECT ID, CAST(D34 AS VARCHAR(45)) A FROM DX WHERE ID = 521;"
+agree "UPDATE .. = (SELECT 1E+200) D34"      "INSERT INTO DX (ID, D34) VALUES (522, 1); UPDATE DX SET D34 = (SELECT 1E+200 FROM RDB\$DATABASE) WHERE ID = 522; SELECT ID, CAST(D34 AS VARCHAR(45)) A FROM DX WHERE ID = 522;"
+agree "MERGE source literal col -> D34"      "MERGE INTO PBW USING (SELECT 1 AS K, 1E+200 AS X FROM RDB\$DATABASE) SRC ON PBW.ID = SRC.K WHEN MATCHED THEN UPDATE SET D34 = SRC.X; SELECT ID, CAST(D34 AS VARCHAR(45)) A FROM PBW WHERE ID = 1;"
 refuses "MERGE insert literal 1E+200 -> D16" "MERGE INTO PBW USING (SELECT 78 AS K FROM RDB\$DATABASE) SRC ON PBW.ID = SRC.K WHEN NOT MATCHED THEN INSERT (ID, D16) VALUES (SRC.K, 1E+200);"
 refuses "COALESCE(1E+200, 0) -> D34"         "INSERT INTO DX (ID, D34) VALUES (1, COALESCE(1E+200, 0));"
 agree "ROUND(2.675E0, 2) const -> D34 stores 2.68" "DELETE FROM DX; INSERT INTO DX (ID, D34) VALUES (1, ROUND(2.675E0, 2)); SELECT ID, D34 FROM DX;"
