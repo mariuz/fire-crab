@@ -431,7 +431,28 @@ agree "insert 1.5E-398 into D16 stores 2E-398" "INSERT INTO DX (ID, D16) VALUES 
 agree "insert 1E+200 into D34"      "INSERT INTO DX (ID, D34) VALUES (502, 1E+200); SELECT ID, CAST(D34 AS VARCHAR(45)) A FROM DX WHERE ID = 502;"
 agree "insert 0.1E0 into D34"       "INSERT INTO DX (ID, D34) VALUES (506, 0.1E0); SELECT ID, CAST(D34 AS VARCHAR(45)) A FROM DX WHERE ID = 506;"
 agree "insert -1.5E-300 into D34"   "INSERT INTO DX (ID, D34) VALUES (504, -1.5E-300); SELECT ID, CAST(D34 AS VARCHAR(45)) A FROM DX WHERE ID = 504;"
-refuses "insert 1E+3 * 2 into D34"  "INSERT INTO DX (ID, D34) VALUES (505, 1E+3 * 2);"
+# ARITHMETIC over literals into a DECFLOAT column is DECIMAL arithmetic on
+# their decimal forms, never through a double (2026-09-16). Measured cell
+# by cell on both sides, status AND stored value, each on its own row.
+agree "insert 1E+3 * 2 into D34"    "INSERT INTO DX (ID, D34) VALUES (530, 1E+3 * 2); SELECT ID, CAST(D34 AS VARCHAR(45)) A FROM DX WHERE ID = 530;"
+agree "insert 1E+200 + 0 into D34"  "INSERT INTO DX (ID, D34) VALUES (531, 1E+200 + 0); SELECT ID, CAST(D34 AS VARCHAR(45)) A FROM DX WHERE ID = 531;"
+agree "insert 0.1E0 * 3 into D34"   "INSERT INTO DX (ID, D34) VALUES (532, 0.1E0 * 3); SELECT ID, CAST(D34 AS VARCHAR(45)) A FROM DX WHERE ID = 532;"
+agree "insert 1.5E+2 + 1 into D34"  "INSERT INTO DX (ID, D34) VALUES (533, 1.5E+2 + 1); SELECT ID, CAST(D34 AS VARCHAR(45)) A FROM DX WHERE ID = 533;"
+agree "insert 1E+3 / 4 into D34"    "INSERT INTO DX (ID, D34) VALUES (534, 1E+3 / 4); SELECT ID, CAST(D34 AS VARCHAR(45)) A FROM DX WHERE ID = 534;"
+agree "insert 1E+3 * 1.5 into D34"  "INSERT INTO DX (ID, D34) VALUES (535, 1E+3 * 1.5); SELECT ID, CAST(D34 AS VARCHAR(45)) A FROM DX WHERE ID = 535;"
+agree "insert -1E+3 * 2 into D34"   "INSERT INTO DX (ID, D34) VALUES (536, -1E+3 * 2); SELECT ID, CAST(D34 AS VARCHAR(45)) A FROM DX WHERE ID = 536;"
+# past DOUBLE's range entirely - the cell that proves no f64 is involved
+agree "insert 1E+200 * 1E+200 -> 1E+400" "INSERT INTO DX (ID, D34) VALUES (537, 1E+200 * 1E+200); SELECT ID, CAST(D34 AS VARCHAR(45)) A FROM DX WHERE ID = 537;"
+agree "insert 1E+3 * 2 + 1 (nested)" "INSERT INTO DX (ID, D34) VALUES (538, 1E+3 * 2 + 1); SELECT ID, CAST(D34 AS VARCHAR(45)) A FROM DX WHERE ID = 538;"
+agree "insert 1E+3 * 2 into D16"    "INSERT INTO DX (ID, D16) VALUES (539, 1E+3 * 2); SELECT ID, CAST(D16 AS VARCHAR(45)) B FROM DX WHERE ID = 539;"
+agree "update D34 = 1E+3 * 2"       "INSERT INTO DX (ID, D34) VALUES (540, 1); UPDATE DX SET D34 = 1E+3 * 2 WHERE ID = 540; SELECT ID, CAST(D34 AS VARCHAR(45)) A FROM DX WHERE ID = 540;"
+agree "update D34 = 0.1E0 * 3"      "INSERT INTO DX (ID, D34) VALUES (541, 1); UPDATE DX SET D34 = 0.1E0 * 3 WHERE ID = 541; SELECT ID, CAST(D34 AS VARCHAR(45)) A FROM DX WHERE ID = 541;"
+# the CONTROLS: an approximate / exact destination keeps double arithmetic
+agree "1E+3 * 2 into DOUBLE / NUMERIC" "INSERT INTO DX (ID, DP, N) VALUES (542, 1E+3 * 2, 1E+3 * 2); SELECT ID, DP, N FROM DX WHERE ID = 542;"
+agree "exact-only trees unchanged"     "INSERT INTO DX (ID, D34) VALUES (543, 2 * 3); INSERT INTO DX (ID, D34) VALUES (544, 0.1 + 0.2); SELECT ID, CAST(D34 AS VARCHAR(45)) A FROM DX WHERE ID IN (543, 544) ORDER BY ID;"
+# RECORDED: a constant past DOUBLE's range into a DOUBLE column refuses on
+# both, but the engine raises 22003 where fire-crab answers 42000
+refuses "1E+200 * 1E+200 into DOUBLE" "INSERT INTO DX (ID, DP) VALUES (545, 1E+200 * 1E+200);"
 # An UPDATE takes it now (serve-real-slottype, 2026-09-16: the UPDATE
 # planner's type gate learned the decfloat question, and this literal
 # underflows to the value BOTH sides store). Measured before converting:

@@ -19622,7 +19622,12 @@ enum InsVal {
     /// 1.5E+2, while `1.50E+2` is 150, `0.1E+1` is 1 and `1.0E+0` is 1.0.
     /// Arithmetic over such a literal keeps the refusal (`1E+200 + 0` is
     /// the engine's 34-digit decimal sum, a different question).
-    ApproxConst(WireParam, Option<String>),
+    /// The first field is None when the DOUBLE fold OVERFLOWED - the
+    /// constant is representable only in decimal (`1E+200 * 1E+200` is
+    /// 1E+400, past DOUBLE's range entirely). Such an item survives to
+    /// the encoder so a DECFLOAT destination can re-read it; every other
+    /// destination refuses it, as the engine's own DOUBLE column does.
+    ApproxConst(Option<WireParam>, Option<String>),
     /// `GenId(name, step)`: `None` step = `NEXT VALUE FOR` (use the
     /// sequence's own increment), `Some(n)` = `GEN_ID(name, n)`.
     GenId(String, Option<i64>),
@@ -30542,7 +30547,21 @@ fn plan_insert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
                     let e = parse_raw_expr_any(part_text.trim())
                         .and_then(|r| resolve_expr(&r, &[], &[]))?;
                     let typed = e.type_of(&[]).is_some();
-                    let v = e.eval(&[]).ok()?;
+                    // A CONSTANT TREE WHOSE DOUBLE FOLD OVERFLOWS is not a
+                    // refusal yet: its value may be perfectly representable
+                    // in DECIMAL (`1E+200 * 1E+200` is 1E+400), and only the
+                    // DESTINATION - not known here - decides. It travels with
+                    // its text and no wire value ([InsVal::ApproxConst]).
+                    // This arm evaluates TO an InsVal, so the overflow case
+                    // is a value here, never an early return.
+                    // (`vals.push(match ..)` consumes this arm's VALUE, so
+                    // the overflow case is an expression here; `return None`
+                    // still means "refuse the statement", as below.)
+                    let folded = e.eval(&[]);
+                    if folded.is_err() && approx_const_fold(&e) {
+                        InsVal::ApproxConst(None, Some(part_text.trim().to_string()))
+                    } else {
+                    let Ok(v) = folded else { return None };
                     if !typed && matches!(v, Value::Null) {
                         return None;
                     }
@@ -30553,16 +30572,20 @@ fn plan_insert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
                     if matches!(wp, WireParam::Double(_) | WireParam::Single(_))
                         && !approx_runtime_expr(&e)
                     {
-                        // a BARE literal keeps its spelling for a DECFLOAT
-                        // destination, which reads its decimal from the
-                        // text rather than from the double it folded to
-                        // ([InsVal::ApproxConst]); anything built OVER a
-                        // literal has no single spelling to keep
+                        // THE ITEM'S TEXT, for a DECFLOAT destination to
+                        // read its decimal from ([InsVal::ApproxConst]):
+                        // a bare literal spells itself, and a CONSTANT
+                        // TREE over literals is re-read as decimal at the
+                        // encoder, where the destination is known
+                        // ([decfloat_const_expr]). The destination is not
+                        // known HERE - a VALUES list is parsed before the
+                        // target list is resolved.
                         let text =
-                            bare_double_literal(&e).then(|| part_text.trim().to_string());
-                        InsVal::ApproxConst(wp, text)
+                            approx_const_fold(&e).then(|| part_text.trim().to_string());
+                        InsVal::ApproxConst(Some(wp), text)
                     } else {
                         InsVal::Wire(wp)
+                    }
                     }
                 }
             });
@@ -30690,8 +30713,10 @@ fn plan_insert(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor
                 // a CONSTANT EXPRESSION folded to text, and a plain
                 // number: the engine stores the RENDERING (probed:
                 // `VALUES (42)` into a blob column reads back '42')
-                InsVal::Wire(wp) | InsVal::ApproxConst(wp, _) => {
-                    wireparam_text(wp).map(|t| (fid, lit(&t), 1))
+                InsVal::Wire(wp) => wireparam_text(wp).map(|t| (fid, lit(&t), 1)),
+                // a decimal-only constant has no wire form to render
+                InsVal::ApproxConst(wp, _) => {
+                    wireparam_text(wp.as_ref()?).map(|t| (fid, lit(&t), 1))
                 }
                 InsVal::Int(n) => Some((fid, lit(&n.to_string()), 1)),
                 InsVal::Bool(b) => {
@@ -31059,7 +31084,7 @@ fn build_insert_image(
                     | InsVal::Dec(..)
                     | InsVal::Bool(_)
             ) || (d.dtype == dtype::BLOB
-                && matches!(v, InsVal::Wire(wp) | InsVal::ApproxConst(wp, _) if wireparam_text(wp).is_some()))
+                && matches!(v, InsVal::Wire(wp) if wireparam_text(wp).is_some()))
         {
             continue;
         }
@@ -31182,10 +31207,22 @@ fn encode_set_value(d: &Descriptor, v: &InsVal) -> Option<Option<Vec<u8>>> {
         InsVal::ApproxConst(wp, text) => {
             if matches!(d.dtype, dtype::DEC64 | dtype::DEC128) {
                 let t = text.as_ref()?;
-                text_to_dec128_clamped(t).ok()?;
-                WireParam::Text(t.clone())
+                match text_to_dec128_clamped(t) {
+                    // a BARE literal is its own decimal
+                    Ok(_) => WireParam::Text(t.clone()),
+                    // ... and a CONSTANT TREE over literals is arithmetic
+                    // done IN DECIMAL on their decimal forms - including
+                    // one whose DOUBLE fold overflowed (1E+400)
+                    Err(_) => {
+                        let v = decfloat_const_expr(t)?.eval(&[]).ok()?;
+                        WireParam::Text(decfloat_value_text(&v)?)
+                    }
+                }
             } else {
-                wp.clone()
+                // no wire value = representable only in decimal, and this
+                // destination is not a DECFLOAT one: refuse, as the
+                // engine's DOUBLE column does for the same constant
+                wp.clone()?
             }
         }
         // parameters bind, generators advance, at execute - not here.
@@ -33196,14 +33233,18 @@ fn plan_update(sql: &str, db_outer: &Option<Database>) -> Option<(Plan, Vec<Desc
                 // expression evaluated per row, with no later place to
                 // spell it. Measured: `SET D = 1E+200` keeps 1E+200 where
                 // the fold stored 9.9999999999999997E+199.
-                let e = if bare_double_literal(&e)
+                let e = if approx_const_fold(&e)
                     && matches!(
                         descs.get(fid0).map(|d| d.dtype),
                         Some(dtype::DEC64 | dtype::DEC128)
                     ) {
                     match text_to_dec128_clamped(rhs.trim()) {
+                        // a bare literal is its own decimal ...
                         Ok(bits) => Expr::DecFloat34(bits),
-                        Err(_) => e,
+                        // ... and a constant TREE is re-read with its
+                        // literals as decimals, so the arithmetic runs in
+                        // decimal ([decfloat_const_expr])
+                        Err(_) => decfloat_const_expr(rhs).unwrap_or(e),
                     }
                 } else {
                     e
@@ -62867,7 +62908,15 @@ fn expr_atom_bare(b: &[char], pos: &mut usize) -> Option<RawExpr> {
                     }
                     let text: String = b[start..*pos].iter().collect();
                     return classify_exp_literal(&text).map(|e| match e {
-                        ExpLit::Double(d) => RawExpr::Double(d),
+                        // ... as a DECIMAL while [decfloat_const_expr] is
+                        // re-reading the expression for a DECFLOAT store
+                        ExpLit::Double(d) => match dec_lits_armed()
+                            .then(|| text_to_dec128_clamped(&text).ok())
+                            .flatten()
+                        {
+                            Some(bits) => RawExpr::DecFloat34(bits),
+                            None => RawExpr::Double(d),
+                        },
                         ExpLit::Int128(n) => RawExpr::Int128(n),
                         ExpLit::DecFloat34(x) => RawExpr::DecFloat34(x),
                     });
@@ -67055,22 +67104,6 @@ fn f64_to_dec(x: f64, sig: usize) -> Option<fire_crab_ods::decfloat::Dec> {
 /// ROUND(dp, 2) * 1, which is why a function under a minus or an
 /// operator answers false too); a subquery, a lookup. Everything not
 /// listed refuses at the DECFLOAT store, recorded.
-/// Is this a BARE numeric literal - the one shape whose own SPELLING a
-/// DECFLOAT destination reads its decimal from ([InsVal::ApproxConst])?
-///
-/// A leading minus parses as a NEGATION over the literal, not into it,
-/// and the engine stores the sign all the same (measured: `-2.5E+3`,
-/// `-1E+200`, `-0.1`), so it counts - the captured text carries the sign
-/// and [text_to_dec128_clamped] reads it. Anything built OVER a literal
-/// (`1E+200 + 0`, a call) has no single spelling and keeps the refusal.
-fn bare_double_literal(e: &Expr) -> bool {
-    match e {
-        Expr::Double(_) => true,
-        Expr::Neg(inner) => matches!(**inner, Expr::Double(_)),
-        _ => false,
-    }
-}
-
 fn approx_runtime_expr(e: &Expr) -> bool {
     match e {
         Expr::Col(_) => true,
@@ -67360,6 +67393,50 @@ enum ExpLit {
     Double(f64),
     Int128(i128),
     DecFloat34(u128),
+}
+
+thread_local! {
+    /// While armed, an EXPONENT literal lexes as a DECIMAL (DECFLOAT(34))
+    /// literal instead of a DOUBLE one - see [decfloat_const_expr].
+    static DEC_LITS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn dec_lits_armed() -> bool {
+    DEC_LITS.with(|c| c.get())
+}
+
+/// Re-read a CONSTANT value expression with its exponent literals as
+/// DECIMALS - what a DECFLOAT destination stores.
+///
+/// The engine does the arithmetic IN DECIMAL on the literals' own
+/// decimal forms, never through a double: `1E+3 * 2` is 2E+3, `1E+3 / 4`
+/// is 2.5E+2, `1E+3 * 1.5` is 1.5E+3, `0.1E0 * 3` is 0.3 (not the
+/// double's 0.30000000000000004), `1E+200 + 0` the 34-digit form, and
+/// `1E+200 * 1E+200` is 1E+400 - past DOUBLE's range entirely, which is
+/// the cell that proves no f64 is involved (all measured).
+///
+/// Re-lexing is what carries each LEAF's spelling: the parsed tree keeps
+/// only an f64 per literal, and the item text spells the whole
+/// expression, not its leaves. Done here rather than by widening
+/// [RawExpr::Double], which derives `PartialEq` and is compared
+/// elsewhere - two literals of equal value and different spelling must
+/// not start comparing unequal for this.
+fn decfloat_const_expr(text: &str) -> Option<Expr> {
+    let prev = DEC_LITS.with(|c| c.replace(true));
+    let raw = parse_raw_expr_any(text.trim());
+    DEC_LITS.with(|c| c.set(prev));
+    resolve_expr(&raw?, &[], &[])
+}
+
+/// The decimal TEXT a folded constant stores as, or None when it is not
+/// a decimal value (or has no literal form - a NaN, an infinity).
+fn decfloat_value_text(v: &Value) -> Option<String> {
+    if !matches!(v, Value::DecFloat16(_) | Value::DecFloat34(_)) {
+        return None;
+    }
+    let t = v.render();
+    (!t.contains("NaN") && !t.contains("nan") && !t.contains("Inf") && !t.contains("inf"))
+        .then_some(t)
 }
 
 /// Type an EXPONENT-form numeric literal the way Firebird 6 does. The
@@ -78625,8 +78702,16 @@ fn numeric_tok(s: &str, b: &[u8], start: usize, i: &mut usize) -> Option<Tok> {
             while *i < b.len() && b[*i].is_ascii_digit() {
                 *i += 1;
             }
-            return classify_exp_literal(&s[start..*i]).map(|e| match e {
-                ExpLit::Double(d) => Tok::FnExpr(RawExpr::Double(d)),
+            let lit_text = &s[start..*i];
+            return classify_exp_literal(lit_text).map(|e| match e {
+                // the [decfloat_const_expr] mode, on the SECOND lexer too
+                ExpLit::Double(d) => match dec_lits_armed()
+                    .then(|| text_to_dec128_clamped(lit_text).ok())
+                    .flatten()
+                {
+                    Some(bits) => Tok::DecFloat34(bits),
+                    None => Tok::FnExpr(RawExpr::Double(d)),
+                },
                 ExpLit::Int128(n) => Tok::Int128(n),
                 ExpLit::DecFloat34(x) => Tok::DecFloat34(x),
             });
