@@ -47565,7 +47565,21 @@ fn branch_rows_each(
     // keeps the fold on ONE implementation instead of growing a second
     // here, and is what stopped a window in a derived table, a CTE level
     // or a union branch from dying at the fetch.
-    if matches!(plan, Plan::Project { windows, .. } if !windows.is_empty()) {
+    // ...and NEITHER CAN A GENERATOR-ADVANCING ONE, for the same reason
+    // and by the same delegation. The arm below destructures `Project`
+    // with `..`, so `gen_cols` went on the floor and every generator
+    // slot read back NULL - rendered 0 under the non-nullable
+    // announcement `NEXT VALUE FOR` carries - while the sequence never
+    // moved. That is the THIRD time this exact `..` has dropped
+    // gen_cols here (see [advance_generators]'s own note about
+    // `branch_rows`), and the guard [branch_rows_res] already carries
+    // is what this was missing: a UNION branch, a FOR SELECT or an
+    // INSERT ... SELECT now refuses instead of answering zero. A
+    // DERIVED TABLE does not arrive here with its generator intact -
+    // [classify_derived_gen] decides that shape and strips the column
+    // first, which is why the unreferenced case still answers.
+    if matches!(plan, Plan::Project { windows, gen_cols, .. } if !windows.is_empty() || !gen_cols.is_empty())
+    {
         for row in branch_rows_res(plan, db, args)? {
             sink(row)?;
         }
@@ -60074,6 +60088,136 @@ fn persist_generators(db: Option<&mut Database>, writes: &[(String, i64)]) {
 /// The engine evaluates NEXT VALUE FOR / GEN_ID mid-fetch, AFTER the
 /// sort, so the caller must sort before calling this: the first row of
 /// the output gets the first value, whatever record it came from.
+/// A DERIVED TABLE (or CTE) WHOSE INNER PROJECT ADVANCES A GENERATOR,
+/// classified by how many times the OUTER query actually DELIVERS that
+/// column - because THE ENGINE DRAWS PER EVALUATED REFERENCE, NOT PER
+/// ROW. Measured over four rows: `SELECT Z.N FROM (...) Z` draws 4,
+/// `SELECT Z.N, Z.N ...` draws 8, three references draw 12, and
+/// `SELECT Z.ID FROM (...) Z` - which never delivers the column - draws
+/// NOTHING. A filter on another column does not re-evaluate; it only
+/// shrinks the delivered set first (keeping 2 of 4 draws 2, keeping
+/// none draws 0). The value follows OUTPUT order: `ORDER BY Z.ID DESC`
+/// answers 4->1, 3->2, 2->3, 1->4, so the advance runs AFTER the sort.
+///
+/// Materialise-then-advance therefore reproduces the engine EXACTLY at
+/// ONE delivered reference and nowhere else - at two it would draw 4
+/// where the engine draws 8. Every other shape REFUSES rather than
+/// answer a different wrong number: this server answered 0 (or NULL, or
+/// an empty set) for all of them, and trading one wrong answer for
+/// another is not a fix.
+enum DerivedGen {
+    /// the inner advances nothing - every existing path is unchanged
+    NoGen,
+    /// it advances, but the outer never delivers the column. The engine
+    /// draws NOTHING there, which is exactly what not advancing
+    /// produces - so this shape was already right, and it is stripped
+    /// deliberately rather than left to a materialisation that happens
+    /// to leave the slot unfilled.
+    Unreferenced,
+    /// exactly one delivered reference, at this position of the inner's
+    /// PROJECTED row (not the record slot - see [advance_generators],
+    /// which fills either coordinate system)
+    Once(usize, String, Option<i64>),
+    /// any shape whose draw count this cannot reproduce
+    Refuse,
+}
+
+fn classify_derived_gen(
+    inner: &Plan,
+    cols: &[ProjCol],
+    filter: &Option<Predicate>,
+    order_by: &[OrderKey],
+) -> DerivedGen {
+    let Plan::Project { cols: icols, gen_cols, .. } = inner else {
+        return DerivedGen::NoGen;
+    };
+    if gen_cols.is_empty() {
+        return DerivedGen::NoGen;
+    }
+    // WHOLE-ITEM generator columns only. `NEXT VALUE FOR G + 100` hides
+    // the slot inside the column's EXPRESSION, where the advance would
+    // have to fill the RECORD slot BEFORE that expression computes;
+    // filling the projected position instead would overwrite the sum
+    // with the raw draw. Refused, not approximated (it answers NULL
+    // today, so the refusal is still the better answer).
+    if icols.iter().any(|c| c.expr.as_ref().is_some_and(expr_contains_genval)) {
+        return DerivedGen::Refuse;
+    }
+    let gen_at: Vec<(usize, &GenCol)> = icols
+        .iter()
+        .enumerate()
+        .filter_map(|(p, c)| {
+            c.expr
+                .is_none()
+                .then(|| gen_cols.iter().find(|g| g.value_index == c.field_id).map(|g| (p, g)))
+                .flatten()
+        })
+        .collect();
+    // two sequences, or a slot this cannot place in the projected row:
+    // the reference count would be a guess
+    if gen_at.len() != gen_cols.len() || gen_at.len() != 1 {
+        return DerivedGen::Refuse;
+    }
+    let (p, g) = gen_at[0];
+    let reads_p = |f: usize| f == p;
+    // A REFERENCE FROM THE ORDER BY OR THE WHERE RE-EVALUATES on the
+    // engine (measured: `WHERE Z.N > 2` draws SIX for four rows), and a
+    // sort key would compare slots the advance has not filled yet -
+    // the same rule [plan_query_inner_at] already applies to a
+    // TOP-LEVEL sort key that reaches a generator.
+    if order_by
+        .iter()
+        .any(|k| k.field == p || k.expr.as_ref().is_some_and(|e| expr_reads(e, &reads_p)))
+    {
+        return DerivedGen::Refuse;
+    }
+    if let Some(pred) = filter {
+        // [collect_term_fids] marks through an `Fn`, so the flag is a
+        // Cell rather than a captured `mut` - the mark closure is meant
+        // to be callable without touching the caller's stack
+        let hit = std::cell::Cell::new(false);
+        let mut complete = true;
+        for grp in &pred.groups {
+            for t in grp {
+                complete &= collect_term_fids(t, &|f| {
+                    if f == p {
+                        hit.set(true);
+                    }
+                    true
+                });
+            }
+        }
+        // `complete == false` is a term whose read set cannot be
+        // proven, which is not a licence to assume it misses the column
+        if hit.get() || !complete {
+            return DerivedGen::Refuse;
+        }
+    }
+    // an outer EXPRESSION over the column can hold SEVERAL references
+    // (`Z.N + Z.N` draws twice) and [expr_reads] answers yes/no rather
+    // than how many, so only PLAIN references are counted
+    if cols.iter().any(|c| c.expr.as_ref().is_some_and(|e| expr_reads(e, &reads_p))) {
+        return DerivedGen::Refuse;
+    }
+    match cols.iter().filter(|c| c.expr.is_none() && c.field_id == p).count() {
+        0 => DerivedGen::Unreferenced,
+        1 => DerivedGen::Once(p, g.name.clone(), g.step),
+        _ => DerivedGen::Refuse,
+    }
+}
+
+/// The same plan with its generator columns removed - for the shape the
+/// outer never delivers, and as the leaf the one-reference path
+/// materialises before it advances (the column comes back NULL there
+/// and the advance fills it at its PROJECTED position).
+fn strip_gen_cols(plan: &Plan) -> Plan {
+    let mut out = plan.clone();
+    if let Plan::Project { gen_cols, .. } = &mut out {
+        gen_cols.clear();
+    }
+    out
+}
+
 fn advance_generators(
     db: &Database,
     slots: &[(usize, String, Option<i64>)],
@@ -60962,6 +61106,61 @@ fn emit_rows_inner(
                 // outer WHERE and ORDER BY are nodes above it - the same
                 // Rows -> Filter -> Sort the grouped join builds
                 let pred = bind_filter(filter, args)?;
+                // A GENERATOR INSIDE THE DERIVED TABLE. The inner
+                // Project carries `gen_cols`, but every route below
+                // materialises WITHOUT the advance, so the synthetic
+                // slot stayed unfilled and read back NULL - answered as
+                // 0 under the non-nullable announcement `NEXT VALUE FOR`
+                // carries (580) and as <null> under GEN_ID's (581).
+                // Which route is legal depends on how many times the
+                // OUTER delivers the column - see [classify_derived_gen].
+                let gen = classify_derived_gen(inner, cols, filter, order_by);
+                if matches!(gen, DerivedGen::Refuse)
+                    || (!windows.is_empty() && !matches!(gen, DerivedGen::NoGen))
+                {
+                    return Err(EmitErr::Eval(EvalErr::Unsupported));
+                }
+                let stripped;
+                let inner: &Plan = match gen {
+                    DerivedGen::NoGen => inner,
+                    // the advance is performed here, or deliberately not
+                    // performed - either way the leaf no longer claims a
+                    // generator column it will not fill
+                    _ => {
+                        stripped = strip_gen_cols(inner);
+                        &stripped
+                    }
+                };
+                if let DerivedGen::Once(pos, name, step) = gen {
+                    // MATERIALISE, FILTER, SORT, *THEN* ADVANCE - the
+                    // engine's own order, measured: `WHERE Z.ID > 2
+                    // ORDER BY Z.ID DESC` over four rows draws TWO and
+                    // answers 4->1, 3->2. The first DELIVERED row takes
+                    // the first value, whatever record it came from,
+                    // which is the same law the top-level fetch follows
+                    // by sorting before it calls [advance_generators].
+                    let rows = branch_rows_res(inner, db, args).map_err(EmitErr::Eval)?;
+                    let filtered =
+                        RowSource::Filter { input: Box::new(RowSource::Rows(rows)), pred }
+                            .rows(db)
+                            .map_err(EmitErr::Eval)?;
+                    let mut rows = RowSource::Sort {
+                        input: Box::new(RowSource::Rows(filtered)),
+                        keys: order_by.clone(),
+                    }
+                    .rows(db)
+                    .map_err(EmitErr::Eval)?;
+                    // the slot here is the column's POSITION in the
+                    // projected row, not the record slot - the same
+                    // function, the other coordinate system
+                    for (k, v) in advance_generators(db, &[(pos, name, step)], &mut rows) {
+                        gen_writes.push((k, v));
+                    }
+                    for values in &rows {
+                        encode_row(w, cols, values, out)?;
+                    }
+                    return Ok(());
+                }
                 if !windows.is_empty() {
                     // a WINDOW folds over every filtered row before any
                     // ships (a partition is not known until its last row
@@ -61012,7 +61211,7 @@ fn emit_rows_inner(
                     // rather than a shortfall - and it falls through.
                     if let Plan::Project {
                         rel, formats, cols: icols, filter: ifilter, index, gen_cols, windows, ..
-                    } = &**inner
+                    } = inner
                     {
                         // a windowed inner cannot re-express its keys over
                         // BASE RECORDS (the window value is not a record

@@ -45,6 +45,12 @@ CREATE SEQUENCE SEQ;
 CREATE SEQUENCE SEQ5 START WITH 100 INCREMENT BY 5;
 CREATE GENERATOR G;
 CREATE SEQUENCE SEQBIG;
+-- SEQD belongs to the DERIVED-TABLE block at the end and to nothing
+-- else, so those cells cannot perturb the sequences above. The cells
+-- that ANSWER advance both sides identically (lockstep); the cells that
+-- RECORD a refusal never call the engine at all, so neither side moves
+-- and the lockstep the stored-value checks rely on is preserved.
+CREATE SEQUENCE SEQD;
 -- BIG exists for ONE check, and it is the check the whole batching
 -- interaction hangs on: 2500 rows is past the ~2300 where a fetch has
 -- to be split into batches, which is what made the cursor MATERIALISE
@@ -243,6 +249,54 @@ a=$(fc_rows "$QB2" | md5sum | cut -d' ' -f1)
 b=$(en_rows "SELECT ((NEXT VALUE FOR SEQBIG) + 0) || '|' || X FROM BIG ORDER BY X" | md5sum | cut -d' ' -f1)
 check "the expression form over 2500 rows" "$a" "$b"
 
+# --- A GENERATOR INSIDE A DERIVED TABLE, A CTE OR A VIEW -------------
+# The advance lived only in the TOP-LEVEL fetch. Every row source below
+# it - a derived table, a CTE level, a view, a union branch - projected
+# the inner columns WITHOUT it, so the synthetic slot stayed unfilled
+# and read back NULL: rendered 0 under the non-nullable announcement
+# `NEXT VALUE FOR` carries (sqltype 580) and <null> under GEN_ID's
+# (581), with the sequence never moving. One cause, two appearances,
+# and the third time this exact `..`-destructure dropped `gen_cols`.
+#
+# THE ENGINE DRAWS PER EVALUATED REFERENCE, NOT PER ROW (measured over
+# four rows): one reference draws 4, two draw 8, three draw 12, and a
+# column the outer never delivers draws NOTHING. A filter on another
+# column does not re-evaluate - it shrinks the delivered set FIRST
+# (keeping 2 of 4 draws 2). The value follows OUTPUT order: the first
+# DELIVERED row takes the first value, whatever record it came from.
+# So the fix materialises, filters, sorts and only THEN advances, and
+# it is exact at ONE delivered reference and nowhere else - everything
+# else refuses below rather than answer a different wrong number.
+check "a generator in a DERIVED TABLE, per delivered row" \
+    "$(fc_rows 'SELECT Z.N FROM (SELECT NEXT VALUE FOR SEQD AS N FROM SRC) Z')" \
+    "$(en_rows 'SELECT Z.N FROM (SELECT NEXT VALUE FOR SEQD AS N FROM SRC) Z')"
+check "...beside another column, in OUTPUT order" \
+    "$(fc_rows 'SELECT Z.N, Z.X FROM (SELECT X, NEXT VALUE FOR SEQD AS N FROM SRC) Z ORDER BY Z.X')" \
+    "$(en_rows "SELECT Z.N || '|' || Z.X FROM (SELECT X, NEXT VALUE FOR SEQD AS N FROM SRC) Z ORDER BY Z.X")"
+# the first DELIVERED row takes the first value: under DESC the HIGHEST
+# X is drawn FIRST, which a sort after the advance could not produce
+check "the value follows the OUTER sort, not the scan" \
+    "$(fc_rows 'SELECT Z.N, Z.X FROM (SELECT X, NEXT VALUE FOR SEQD AS N FROM SRC) Z ORDER BY Z.X DESC')" \
+    "$(en_rows "SELECT Z.N || '|' || Z.X FROM (SELECT X, NEXT VALUE FOR SEQD AS N FROM SRC) Z ORDER BY Z.X DESC")"
+check "an INNER ORDER BY drives the delivery order" \
+    "$(fc_rows 'SELECT Z.N, Z.X FROM (SELECT X, NEXT VALUE FOR SEQD AS N FROM SRC ORDER BY X DESC) Z')" \
+    "$(en_rows "SELECT Z.N || '|' || Z.X FROM (SELECT X, NEXT VALUE FOR SEQD AS N FROM SRC ORDER BY X DESC) Z")"
+check "an outer WHERE shrinks the set BEFORE the draw" \
+    "$(fc_rows 'SELECT Z.N FROM (SELECT X, NEXT VALUE FOR SEQD AS N FROM SRC) Z WHERE Z.X = 10')" \
+    "$(en_rows 'SELECT Z.N FROM (SELECT X, NEXT VALUE FOR SEQD AS N FROM SRC) Z WHERE Z.X = 10')"
+# the column the outer never delivers: the engine draws NOTHING, which
+# is what NOT advancing already produced - so this shape was always
+# right and must STAY right (a blanket guard here would have broken it)
+check "a generator column the outer never selects" \
+    "$(fc_rows 'SELECT Z.X FROM (SELECT X, NEXT VALUE FOR SEQD AS N FROM SRC) Z ORDER BY Z.X')" \
+    "$(en_rows 'SELECT Z.X FROM (SELECT X, NEXT VALUE FOR SEQD AS N FROM SRC) Z ORDER BY Z.X')"
+check "a CTE level is the same shape" \
+    "$(fc_rows 'WITH C AS (SELECT NEXT VALUE FOR SEQD AS N FROM SRC) SELECT N FROM C')" \
+    "$(en_rows 'WITH C AS (SELECT NEXT VALUE FOR SEQD AS N FROM SRC) SELECT N FROM C')"
+check "the GEN_ID spelling through a derived table" \
+    "$(fc_rows 'SELECT Z.N FROM (SELECT GEN_ID(SEQD, 1) AS N FROM SRC) Z')" \
+    "$(en_rows 'SELECT Z.N FROM (SELECT GEN_ID(SEQD, 1) AS N FROM SRC) Z')"
+
 # THE DECLARED COLUMN, which the value comparisons above cannot see -
 # they compare values positionally and a wrong NAME is invisible to them.
 # Probed with SET SQLDA_DISPLAY ON: the two spellings get DIFFERENT
@@ -291,12 +345,40 @@ for st in "SELECT X FROM SRC WHERE NEXT VALUE FOR SEQ > 0" \
     esac
 done
 
+# ...and the SAME law one level down. Materialise-then-advance is exact
+# at ONE delivered reference; each shape here draws a DIFFERENT number
+# on the engine, so answering any of them with one-draw-per-row would
+# trade one wrong answer for another. The engine's count is named
+# beside each. fire-crab only - a refusal advances nothing, so the
+# twins stay in lockstep and the stored-SEQD check below still holds.
+for st in "SELECT Z.N, Z.N FROM (SELECT NEXT VALUE FOR SEQD AS N FROM SRC) Z" \
+          "SELECT Z.N, Z.N, Z.N FROM (SELECT NEXT VALUE FOR SEQD AS N FROM SRC) Z" \
+          "SELECT Z.N FROM (SELECT NEXT VALUE FOR SEQD AS N FROM SRC) Z WHERE Z.N > 1" \
+          "SELECT Z.N FROM (SELECT NEXT VALUE FOR SEQD AS N FROM SRC) Z ORDER BY Z.N" \
+          "SELECT DISTINCT Z.N FROM (SELECT NEXT VALUE FOR SEQD AS N FROM SRC) Z" \
+          "SELECT FIRST 1 Z.N FROM (SELECT X, NEXT VALUE FOR SEQD AS N FROM SRC) Z ORDER BY Z.X" \
+          "SELECT SUM(Z.N) FROM (SELECT NEXT VALUE FOR SEQD AS N FROM SRC) Z" \
+          "SELECT Z.N FROM (SELECT (NEXT VALUE FOR SEQD) + 100 AS N FROM SRC) Z" \
+          "SELECT * FROM (SELECT NEXT VALUE FOR SEQD AS A, NEXT VALUE FOR SEQ5 AS B FROM SRC) Z" \
+          "WITH C AS (SELECT NEXT VALUE FOR SEQD AS N FROM SRC) SELECT N FROM C UNION ALL SELECT N FROM C" \
+          "SELECT Z.N FROM (SELECT * FROM (SELECT NEXT VALUE FOR SEQD AS N FROM SRC) Y) Z" \
+          "SELECT NEXT VALUE FOR SEQD AS N FROM SRC UNION ALL SELECT 99 FROM RDB\$DATABASE" \
+          "SELECT Z.N FROM SRC A JOIN (SELECT X, NEXT VALUE FOR SEQD AS N FROM SRC) Z ON Z.X = A.X"; do
+    r=$(fc_rows "$st")
+    case "$r" in
+        *ERR*) echo "OK   refused (the draw count is not one per delivered row): $st" ;;
+        *) echo "DIFF fire-crab answered a derived generator shape it must refuse: $st -> $r"
+           echo "     re-measure the ENGINE's draw count for it before gating an answer"
+           fail=1 ;;
+    esac
+done
+
 # stored generator values must match the engine's. WORK advanced once per
 # fc query above; REF advanced once per en_rows query in the SAME order
 # (same generators, same steps, same row counts) - so they are in lockstep
 # and no replay is needed (replaying would double-advance REF).
 kill $srv 2>/dev/null; wait $srv 2>/dev/null
-for g in SEQ SEQ5 G SEQBIG; do
+for g in SEQ SEQ5 G SEQBIG SEQD; do
     check "stored $g matches engine" "$(gen_of "$WORK" "$g")" "$(gen_of "$REF" "$g")"
 done
 
