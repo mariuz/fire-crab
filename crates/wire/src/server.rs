@@ -40837,6 +40837,27 @@ fn plan_join_bound(
                     c.name = n.clone();
                 }
             }
+            // ...and the same law on a derived table used as a JOIN SIDE,
+            // which never reaches the plain-FROM check in
+            // [plan_query_inner_at]: measured, `NN A JOIN (SELECT 1+1 FROM
+            // RDB$DATABASE) Z ON 1=1` is the engine's -104 too, naming the
+            // SIDE's alias. This function answers `Option<Plan>` and
+            // `RefusedEval` IS a `Plan`, so the side carries the same
+            // four-line diagnosis the FROM path does rather than dropping
+            // to a bare 42000. Two callers narrow it back to a plain
+            // refusal - [plan_lateral], which destructures for `Plan::Join`
+            // and returns None otherwise, and the lone-`COUNT(*)` fast path
+            // that does the same - both of which REFUSE rather than answer,
+            // so the law holds and the gap is recorded.
+            if let Some(at) = inner_cols.iter().position(|c| {
+                let plain = c.expr.is_none() && c.relation.is_some() && c.fname.is_some();
+                !plain && c.fname.as_deref().unwrap_or(c.name.as_str()) == c.name.as_str()
+            }) {
+                return Some(Plan::RefusedEval(EvalErr::DerivedFieldUnnamed {
+                    pos: at as i32 + 1,
+                    table: tr.alias.clone()?,
+                }));
+            }
             let (columns, descs) = derived_view(&inner_cols);
             let offset: usize = sides.iter().map(|s: &JoinSide| s.descs.len()).sum();
             let flatten = build_flatten(db, &inner);
@@ -49247,6 +49268,17 @@ fn plan_query_inner_at(
             // stopping at the top-level plan's columns, so the inner
             // `Project`'s own columns are substituted before any fetch
             // path evaluates them. This used to refuse here.
+            // AN INNER RAISE IS CARRIED, NOT DOWNGRADED. A refused-eval
+            // plan has no columns, so [output_cols_of]'s catch-all hands
+            // back an empty vector and the guard below used to turn a
+            // precise inner diagnosis into a bare 42000 - which is how a
+            // NESTED derived table lost its message while the flat one
+            // kept it. The engine names the INNERMOST scope (probed:
+            // `(SELECT * FROM (SELECT 1+1 FROM T) Y) Z` says "in derived
+            // table Y"), so the inner error passes through unchanged.
+            if let Plan::RefusedEval(e) = &inner {
+                return Some(Plan::RefusedEval(e.clone()));
+            }
             let mut inner_cols = output_cols_of(&inner);
             if inner_cols.is_empty() {
                 return Some(Plan::Refused);
@@ -49258,6 +49290,52 @@ fn plan_query_inner_at(
                 for (c, n) in inner_cols.iter_mut().zip(declared.iter()) {
                     c.name = n.clone();
                 }
+            }
+            // EVERY COLUMN HERE MUST HAVE A NAME OF ITS OWN, and only
+            // three things give one: a plain field reference, an explicit
+            // `AS`, or the declared column list just applied above. An
+            // unaliased expression has none, and the engine refuses the
+            // whole statement ([GDS_DSQL_DERIVED_FIELD_UNNAMED]) where
+            // this server answered it - measured over fourteen shapes.
+            //
+            // The test reads the DESCRIBE SLOTS rather than the parse
+            // tree: `name` is the ALIAS and an `AS` overwrites only that,
+            // while `fname` keeps the symbolic name. An aliased expression
+            // therefore has `fname != name`, and an unaliased one carries
+            // the SAME kind-name in both. (Those kind-names - ADD, UPPER,
+            // CONSTANT, COUNT, CAST, CASE, BOOL - are the ENGINE'S OWN and
+            // this server matches them on every shape; they are a display
+            // name, not a column name, which is why they cannot stand in
+            // for one.) Running AFTER the declared override is what makes
+            // `(SELECT 1+1 FROM T) Z (E)` legal.
+            //
+            // "A plain field" is [the union arm's test], not `expr.is_some()`:
+            // an AGGREGATE or a UNION inner query plans as `Group`/`Union`
+            // whose columns are SLOT READS carrying no `expr` at all, so
+            // keying on `expr` let `(SELECT COUNT(*) FROM T) Z` through.
+            // `relation` is what actually separates them, and it SURVIVES
+            // every wrapper - probed through a derived table, two nested
+            // ones, a CTE, a view, a view inside a derived, a union and a
+            // rename, all keeping theirs - so a column literally named ADD
+            // or COUNT still answers, while every expression carries none.
+            // A UNION takes its name from the FIRST branch only (measured:
+            // `1+1 AS E UNION ALL 2+2` answers E, `1+1 UNION ALL 2+2 AS E`
+            // refuses), which the existing blank `fname` already encodes.
+            if let Some(at) = inner_cols.iter().position(|c| {
+                let plain = c.expr.is_none() && c.relation.is_some() && c.fname.is_some();
+                !plain && c.fname.as_deref().unwrap_or(c.name.as_str()) == c.name.as_str()
+            }) {
+                if trace {
+                    eprintln!(
+                        "[srv] plan: derived table {:?} column {} has no name",
+                        alias,
+                        at + 1
+                    );
+                }
+                return Some(Plan::RefusedEval(EvalErr::DerivedFieldUnnamed {
+                    pos: at as i32 + 1,
+                    table: alias.clone(),
+                }));
             }
             // Everything above the leaf - the projection, the WHERE, the
             // GROUP BY, the ORDER BY - is resolved by the SAME planner a
@@ -58987,6 +59065,35 @@ const GDS_DSQL_RELATION_ERR: i32 = 335544580;
 /// that resolves to no procedure. Same five-item shape, this code in
 /// place of the relation one, SQLSTATE 42000 instead of 42S02.
 const GDS_DSQL_PROCEDURE_ERR: i32 = 335544581;
+/// `isc_dsql_command_err` - the bare "Invalid command" line the engine
+/// puts under its -104 wrapper before the specific diagnosis. Already
+/// emitted by the DDL paths inline; named here because the derived-table
+/// column check needs the same shape.
+const GDS_DSQL_COMMAND_ERR: i32 = 335544570;
+/// `isc_dsql_derived_field_unnamed` (336397220, sqlcode -104, SQLSTATE
+/// 42000 - see [crate::gdscodes]): "no column name specified for column
+/// number @1 in derived table @2".
+///
+/// EVERY COLUMN OF A DERIVED TABLE MUST HAVE A NAME, and only three
+/// things give one: a plain field reference (it keeps the column's own
+/// name), an explicit `AS`, or the derived table's declared column list
+/// `(...)`. An unaliased EXPRESSION has none and the engine refuses the
+/// whole statement - measured over fourteen shapes: an arithmetic,
+/// literal, function, aggregate, CAST, CASE, concatenation, boolean or
+/// scalar-subquery column, in first, second or third position, inside a
+/// JOIN, a CTE, a UNION and a nested derived table.
+///
+/// @1 is the 1-BASED position of the FIRST offender (two unnamed columns
+/// report 1, not 2) and @2 the derived table's alias AS WRITTEN - `Z`,
+/// `LONGNAME`, a CTE's `C`, and for a nested pair the INNERMOST (`Y`).
+/// The top-level select list is exempt: `SELECT 1+1 FROM T` answers.
+///
+/// The kind-names an expression describes with (`ADD`, `UPPER`,
+/// `CONSTANT`, `COUNT`, `MAX`, `CAST`, `CASE`, `BOOL`) are the ENGINE'S
+/// OWN and this server already matches them on every shape - they are a
+/// display name, not a column name, which is why they cannot stand in
+/// for one here.
+const GDS_DSQL_DERIVED_FIELD_UNNAMED: i32 = 336397220;
 const GDS_RANDOM: i32 = 335544382;
 
 /// isc_string_truncation - "string right truncation" - and
@@ -59573,6 +59680,26 @@ fn eval_status_items(w: &mut W, e: &EvalErr) {
         EvalErr::TooManyClones => {
             w.int(1) // isc_arg_gds
                 .int(GDS_REQ_MAX_CLONES);
+        }
+        // the engine's four lines: "Dynamic SQL Error", "SQL error code =
+        // -104", "Invalid command", then the diagnosis with its two
+        // arguments - the column POSITION as a number and the derived
+        // table's alias as a string (measured, in that order)
+        EvalErr::DerivedFieldUnnamed { pos, table } => {
+            w.int(1) // isc_arg_gds - Dynamic SQL Error
+                .int(GDS_DSQL_ERROR)
+                .int(1) // isc_arg_gds - isc_sqlerr
+                .int(GDS_SQLERR)
+                .int(ISC_ARG_NUMBER)
+                .int(-104)
+                .int(1) // isc_arg_gds - "Invalid command"
+                .int(GDS_DSQL_COMMAND_ERR)
+                .int(1) // isc_arg_gds - the diagnosis
+                .int(GDS_DSQL_DERIVED_FIELD_UNNAMED)
+                .int(ISC_ARG_NUMBER) // @1 - the column's 1-based position
+                .int(*pos)
+                .int(2) // isc_arg_string - @2 - the derived table's alias
+                .bytes(table.as_bytes());
         }
         EvalErr::ReadOnlyView(name) => {
             w.int(1) // isc_arg_gds
@@ -68554,6 +68681,11 @@ enum EvalErr {
     /// status code through `ExecErr::Gds` at its own depth
     /// (`MAX_FK_ACTION_DEPTH`); the limits differ, the diagnosis does not.
     TooManyClones,
+    /// a DERIVED TABLE (or CTE) column with no name of its own:
+    /// [GDS_DSQL_DERIVED_FIELD_UNNAMED] under the -104 wrapper. `pos` is
+    /// the 1-based position of the FIRST such column and `table` the
+    /// derived table's alias as written.
+    DerivedFieldUnnamed { pos: i32, table: String },
 }
 
 /// What an expression's result is typed as - which drives its wire form

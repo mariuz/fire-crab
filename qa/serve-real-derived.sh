@@ -61,7 +61,17 @@ make_db() {
 CREATE DATABASE '$1' USER '$U' PASSWORD '$P' PAGE_SIZE 8192;
 CREATE TABLE EMP (ID INTEGER, DEPT_ID INTEGER, SALARY INTEGER, NAME VARCHAR(6));
 CREATE TABLE DEPT (ID INTEGER, DNAME VARCHAR(6));
+-- columns literally NAMED after the engine's expression kind-names, which
+-- is what keeps the unnamed-column test honest: it must refuse an
+-- expression called ADD and ANSWER a real column called "ADD"
+CREATE TABLE KK ("ADD" INTEGER, "COUNT" INTEGER);
+CREATE SEQUENCE G1;
 COMMIT;
+-- an EXPRESSION view column: it has a name of its own and a relation
+-- behind it, so a derived table over it is legal
+CREATE VIEW VE AS SELECT ID, SALARY + 1 AS S FROM EMP;
+COMMIT;
+INSERT INTO KK VALUES (7, 8);
 INSERT INTO EMP VALUES (1, 1, 100, 'a');
 INSERT INTO EMP VALUES (2, 1, 200, 'b');
 INSERT INTO EMP VALUES (3, 2, 300, 'c');
@@ -193,6 +203,76 @@ refuses() { # <label> <sql>
     esac
 }
 
+# THE WHOLE MESSAGE, NOT ITS FIRST FIFTY CHARACTERS. `query` above keeps
+# `message.split("\n")[0].slice(0,50)`, which for every -104 is the
+# string "Dynamic SQL Error" on BOTH sides - so a cell built on it would
+# score OK whatever column number and whatever derived-table alias the
+# server named, and would only ever catch a contentless refusal. The law
+# below IS the message, so it is compared whole.
+qfull() { # <sql> <port> <db>
+    timeout 25 env FC_Q="$1" FC_PORT="$2" FC_DB="$3" node -e '
+      process.on("uncaughtException", () => { console.log("CONN_ERR"); process.exit(0); });
+      const F=require("node-firebird");
+      F.attach({host:"127.0.0.1",port:+process.env.FC_PORT,database:process.env.FC_DB,
+                user:"SYSDBA",password:"masterkey"},(e,db)=>{
+        if(e){console.log("CONN_ERR");process.exit(0);}
+        db.query(process.env.FC_Q,(e2,r)=>{
+          if(e2){console.log("RAISE "+JSON.stringify((e2.message||"").replace(/\s+/g," ").trim()));
+                 db.detach();process.exit(0);}
+          console.log("ROWS "+JSON.stringify(Array.isArray(r)?r:(r?[r]:[])));
+          db.detach();process.exit(0);});});' 2>/dev/null
+}
+# both sides must raise, and raise THE SAME TEXT - position and alias
+raises() { # <label> <sql>
+    ran=$((ran + 1))
+    a=$(qfull "$2" "$PORT" "$A")
+    b=$(qfull "$2" "$REAL" "$B")
+    case "$a$b" in
+        *CONN_ERR*|"") echo "DIFF $1 [VACUOUS: a side did not answer] fcwire=[$a] engine=[$b]"
+                       fail=1; return ;;
+    esac
+    # if the ENGINE stopped raising, the cell is describing a law that no
+    # longer exists - that is a finding, not a pass
+    case "$b" in
+        RAISE*) ;;
+        *) echo "DIFF $1 [the ENGINE did not raise: $b]"; fail=1; return ;;
+    esac
+    if [ "$a" = "$b" ]; then
+        echo "OK   raises alike: $1 - ${b#RAISE }"
+    else
+        echo "DIFF $1"
+        echo "     fcwire: $a"
+        echo "     engine: $b"
+        fail=1
+    fi
+}
+# A RECORDED NARROWER REFUSAL. Two callers destructure the join plan for
+# `Plan::Join` and drop anything else - [plan_lateral] and the lone
+# COUNT(*) fast path - so the side's diagnosis becomes a bare 42000
+# there. Both still REFUSE, so no wrong answer is served; the cell
+# announces its own retirement the day the full message arrives.
+narrower() { # <label> <sql>
+    ran=$((ran + 1))
+    a=$(qfull "$2" "$PORT" "$A")
+    b=$(qfull "$2" "$REAL" "$B")
+    case "$a$b" in
+        *CONN_ERR*|"") echo "DIFF $1 [VACUOUS: a side did not answer] fcwire=[$a] engine=[$b]"
+                       fail=1; return ;;
+    esac
+    case "$b" in
+        RAISE*) ;;
+        *) echo "DIFF $1 [the ENGINE did not raise: $b]"; fail=1; return ;;
+    esac
+    case "$a" in
+        RAISE*) if [ "$a" = "$b" ]; then
+                    echo "OK   $1 NOW CARRIES the engine's message - retire this record"
+                else
+                    echo "OK   narrower refusal recorded: $1"
+                fi ;;
+        *) echo "DIFF $1 ANSWERED where the engine raises: $a"; fail=1 ;;
+    esac
+}
+
 # --- 0. the control ---------------------------------------------------
 both "the same query without one" "SELECT ID FROM EMP ORDER BY ID"
 
@@ -286,6 +366,95 @@ both "GROUP BY over a join with a derived side" \
 # whose body selected more than one column
 both "a comma join beside a derived table" \
      "SELECT COUNT(*) FROM EMP E, DEPT D WHERE E.DEPT_ID = D.ID"
+
+# --- 5b. EVERY COLUMN MUST HAVE A NAME OF ITS OWN ---------------------
+# A derived table's columns exist only because the inner query ANNOUNCES
+# them, and an announcement is not a name. Three things give a column a
+# name - a plain field reference (it keeps the column's own), an explicit
+# AS, or the derived table's declared column list - and an unaliased
+# EXPRESSION has none of them. The engine refuses the whole statement
+# with -104 / "Invalid command" / "no column name specified for column
+# number @1 in derived table @2"; this server used to ANSWER, inventing a
+# name from the node kind.
+#
+# Those kind-names (ADD, UPPER, CONSTANT, COUNT, CAST, CASE, BOOL) are
+# the ENGINE'S OWN - it announces them too - which is exactly why they
+# cannot stand in for a name, and why the KK fixture has real columns
+# CALLED "ADD" and "COUNT": the test must refuse the expression and
+# answer the column.
+raises "an unnamed arithmetic column"    "SELECT * FROM (SELECT SALARY + 1 FROM EMP) Z"
+raises "an unnamed literal"              "SELECT * FROM (SELECT 7 FROM EMP) Z"
+raises "an unnamed function"             "SELECT * FROM (SELECT UPPER(NAME) FROM EMP) Z"
+raises "an unnamed scalar subquery"      "SELECT * FROM (SELECT (SELECT MAX(ID) FROM EMP) FROM EMP) Z"
+raises "an unnamed CAST"                 "SELECT * FROM (SELECT CAST(ID AS BIGINT) FROM EMP) Z"
+raises "an unnamed CASE"                 "SELECT * FROM (SELECT CASE WHEN ID > 2 THEN 1 ELSE 0 END FROM EMP) Z"
+raises "an unnamed concatenation"        "SELECT * FROM (SELECT NAME || NAME FROM EMP) Z"
+# the POSITION is the offender's, 1-based, and TWO of them report the FIRST
+raises "the offender at position 2"      "SELECT * FROM (SELECT ID, SALARY + 1 FROM EMP) Z"
+raises "the offender at position 3"      "SELECT * FROM (SELECT ID, DEPT_ID, SALARY + 1 FROM EMP) Z"
+raises "two unnamed, the FIRST reported" "SELECT * FROM (SELECT SALARY + 1, ID + 1 FROM EMP) Z"
+# an AGGREGATE or a UNION inner query plans as a fold, not a projection,
+# and its columns are SLOT READS carrying no expression at all - the
+# shapes a test keyed on "is there an expression here" walks straight past
+raises "an unnamed aggregate"            "SELECT * FROM (SELECT COUNT(*) FROM EMP) Z"
+raises "an unnamed SUM"                  "SELECT * FROM (SELECT SUM(SALARY) FROM EMP) Z"
+raises "GROUP BY, the offender at 2"     "SELECT * FROM (SELECT DEPT_ID, COUNT(*) FROM EMP GROUP BY DEPT_ID) Z"
+raises "a UNION of expressions"          "SELECT * FROM (SELECT 1+1 FROM EMP UNION ALL SELECT 2+2 FROM EMP) Z"
+raises "a UNION named in the SECOND only" "SELECT * FROM (SELECT 1+1 FROM EMP UNION ALL SELECT 2+2 AS E FROM EMP) Z"
+# a generator and a context variable carry a kind-name and no relation
+raises "NEXT VALUE FOR, unnamed"         "SELECT * FROM (SELECT NEXT VALUE FOR G1 FROM EMP) Z"
+raises "GEN_ID, unnamed"                 "SELECT * FROM (SELECT GEN_ID(G1, 1) FROM EMP) Z"
+raises "CURRENT_TIMESTAMP, unnamed"      "SELECT * FROM (SELECT CURRENT_TIMESTAMP FROM EMP) Z"
+raises "CURRENT_USER, unnamed"           "SELECT * FROM (SELECT CURRENT_USER FROM EMP) Z"
+# @2 is the scope AS WRITTEN - a CTE's name, a long alias, and for a
+# nested pair the INNERMOST one, which only arrives if the inner raise is
+# CARRIED rather than downgraded on its way out
+raises "a CTE names the CTE"             "WITH C AS (SELECT 1+1 FROM EMP) SELECT * FROM C"
+raises "a longer alias"                  "SELECT * FROM (SELECT 1+1 FROM EMP) LONGNAME"
+raises "NESTED names the INNER scope"    "SELECT * FROM (SELECT * FROM (SELECT 1+1 FROM EMP) Y) Z"
+# ...and the same law on a derived table used as a JOIN SIDE, which never
+# reaches the plain-FROM check at all
+raises "an INNER JOIN side"              "SELECT * FROM EMP A JOIN (SELECT 1+1 FROM EMP) Z ON 1=1"
+raises "a LEFT JOIN side"                "SELECT * FROM EMP A LEFT JOIN (SELECT 1+1 FROM EMP) Z ON 1=1"
+raises "a comma join side"               "SELECT * FROM EMP A, (SELECT 1+1 FROM EMP) Z"
+raises "a side SECOND of three"          "SELECT * FROM EMP A JOIN (SELECT 1+1 FROM EMP) Z ON 1=1 JOIN EMP B ON 1=1"
+raises "COUNT(*) + GROUP BY over a side" "SELECT COUNT(*) FROM EMP A JOIN (SELECT 1+1 FROM EMP) Z ON 1=1 GROUP BY A.ID"
+# the OUTER query naming only the good column does not rescue it: the
+# derived table is refused when it is BUILT, not when it is read
+raises "the outer names the good column" "SELECT Z.ID FROM (SELECT ID, 1+1 FROM EMP) Z"
+
+# RECORDED, both still refusing: two callers destructure for `Plan::Join`
+# and drop the carried diagnosis, so these refuse WITHOUT the message
+narrower "a LATERAL side"                "SELECT * FROM EMP A, LATERAL (SELECT 1+1 FROM EMP) Z"
+narrower "a correlated LATERAL side"     "SELECT * FROM EMP A, LATERAL (SELECT A.ID + 1 FROM RDB\$DATABASE) Z"
+narrower "lone COUNT(*) over a side"     "SELECT COUNT(*) FROM EMP A JOIN (SELECT 1+1 FROM EMP) Z ON 1=1"
+
+# --- 5c. ...and what a NAME actually is, which must keep answering ----
+both "an ALIASED expression"             "SELECT * FROM (SELECT SALARY + 1 AS S FROM EMP) Z ORDER BY 1"
+both "a DECLARED column list"            "SELECT * FROM (SELECT SALARY + 1 FROM EMP) Z (S) ORDER BY 1"
+both "the TOP LEVEL needs no name"       "SELECT 1+1 FROM RDB\$DATABASE"
+both "a plain column, two deep"          "SELECT * FROM (SELECT * FROM (SELECT ID FROM EMP) Y) Z ORDER BY 1"
+both "a UNION of COLUMNS"                "SELECT * FROM (SELECT ID FROM EMP UNION ALL SELECT DEPT_ID FROM EMP) Z ORDER BY 1"
+both "a UNION named in the FIRST branch" "SELECT * FROM (SELECT 1+1 AS E FROM EMP UNION ALL SELECT 2+2 FROM EMP) Z ORDER BY 1"
+both "COUNT(*) AS K"                     "SELECT * FROM (SELECT COUNT(*) AS K FROM EMP) Z"
+both "SUM(SALARY) AS S"                  "SELECT * FROM (SELECT SUM(SALARY) AS S FROM EMP) Z"
+both "a column literally named ADD"      "SELECT * FROM (SELECT \"ADD\" FROM KK) Z"
+both "a column literally named COUNT"    "SELECT * FROM (SELECT \"COUNT\" FROM KK) Z"
+both "an expression VIEW column"         "SELECT * FROM (SELECT S FROM VE) Z ORDER BY 1"
+both "the whole expression view"         "SELECT * FROM (SELECT * FROM VE) Z ORDER BY 1"
+both "DISTINCT over a column"            "SELECT * FROM (SELECT DISTINCT DEPT_ID FROM EMP) Z ORDER BY 1"
+both "FIRST over a column"               "SELECT * FROM (SELECT FIRST 2 ID FROM EMP ORDER BY ID) Z"
+both "a star over a table"               "SELECT * FROM (SELECT * FROM EMP) Z ORDER BY ID"
+both "an ALIASED JOIN side"              "SELECT COUNT(*) FROM EMP A JOIN (SELECT 1+1 AS E FROM EMP) Z ON 1=1"
+both "a DECLARED list on a JOIN side"    "SELECT COUNT(*) FROM EMP A JOIN (SELECT 1+1 FROM EMP) Z (E) ON 1=1"
+both "an aliased LATERAL side"           "SELECT * FROM EMP A, LATERAL (SELECT A.ID + 1 AS E FROM RDB\$DATABASE) Z ORDER BY A.ID"
+# RECORDED, pre-existing and unrelated to naming: an AGGREGATE over a
+# LATERAL refuses here where the engine answers. Measured on BOTH this
+# binary and 7a66881, so this chunk neither caused nor fixed it; the cell
+# is here so it cannot be re-discovered as if it were new, and it turns
+# red the day fire-crab answers it.
+refuses "COUNT(*) over a LATERAL (engine answers)" \
+        "SELECT COUNT(*) FROM EMP A, LATERAL (SELECT A.ID + 1 AS E FROM RDB\$DATABASE) Z"
 
 # --- 6. the refusals, each for a stated reason ------------------------
 # a column the INNER query did not project is not there to name
@@ -591,8 +760,8 @@ rm -f "$A" "$B"
 
 
 
-if [ "$ran" -lt 77 ]; then
-    echo "DIFF only $ran checks ran (expected at least 77) - did one silently skip?"
+if [ "$ran" -lt 175 ]; then
+    echo "DIFF only $ran checks ran (expected at least 175) - did one silently skip?"
     fail=1
 fi
 exit $fail
