@@ -190,6 +190,7 @@ def shape(dbname, sql):
 
 ran = 0
 engine_flags_seen = set()
+engine_types_seen = set()
 def flagcheck(label, sql):
     global fail, ran
     e = shape('engdb', sql); f = shape('fcdb', sql)
@@ -200,6 +201,7 @@ def flagcheck(label, sql):
         fail = 1
         return
     engine_flags_seen.add(e[1])
+    engine_types_seen.add(e[0])
     ran += 1
     if e == f:
         print(f"OK   flags {label} (type={e[0]} flags={e[1]})")
@@ -219,6 +221,38 @@ CELLS = [
     ("cte",                            "WITH C AS (SELECT ID FROM T) SELECT ID FROM C"),
     ("derived table",                  "SELECT ID FROM (SELECT ID FROM T) D"),
     ("union",                          "SELECT ID FROM T UNION ALL SELECT 1 FROM RDB$DATABASE"),
+    # SELECT ... FOR UPDATE is isc_info_sql_stmt_select_for_update (12),
+    # not plain select (1) - measured shape by shape against the engine.
+    # The FLAG word stays 3 throughout, which is why only the pair can
+    # tell these cells apart from the plain-select one above.
+    ("FOR UPDATE is TYPE 12",          "SELECT ID FROM T FOR UPDATE"),
+    ("FOR UPDATE OF <col>",            "SELECT ID FROM T FOR UPDATE OF ID"),
+    ("lower case for update",          "select id from t for update"),
+    ("ORDER BY then FOR UPDATE",       "SELECT ID FROM T ORDER BY ID FOR UPDATE"),
+    ("ROWS then FOR UPDATE",           "SELECT ID FROM T ROWS 2 FOR UPDATE"),
+    ("FOR UPDATE beside WITH LOCK",    "SELECT ID FROM T FOR UPDATE WITH LOCK"),
+    ("star projection + FOR UPDATE",   "SELECT * FROM T FOR UPDATE"),
+    ("aggregate + FOR UPDATE",         "SELECT COUNT(*) FROM T FOR UPDATE"),
+    ("GROUP BY + FOR UPDATE",          "SELECT ID FROM T GROUP BY ID FOR UPDATE"),
+    ("FIRST, no DISTINCT",             "SELECT FIRST 2 ID FROM T FOR UPDATE"),
+    # DISTINCTs that are NOT the statement's own - all still 12
+    ("COUNT(DISTINCT x) + FU",         "SELECT COUNT(DISTINCT ID) FROM T FOR UPDATE"),
+    ("a 'DISTINCT' LITERAL + FU",      "SELECT ID, 'DISTINCT' AS W FROM T FOR UPDATE"),
+    ("IS DISTINCT FROM + FU",          "SELECT ID, SAL IS DISTINCT FROM 1 AS D FROM T FOR UPDATE"),
+    # UNION ALL does not cancel, and neither does a BRANCH's own DISTINCT
+    ("UNION ALL stays 12",             "SELECT ID FROM T UNION ALL SELECT 1 FROM RDB$DATABASE FOR UPDATE"),
+    ("a branch DISTINCT does not cancel", "SELECT DISTINCT ID FROM T UNION ALL SELECT 1 FROM RDB$DATABASE FOR UPDATE"),
+    # a CTE is typed by its MAIN select
+    ("CTE + FOR UPDATE",               "WITH C AS (SELECT ID FROM T) SELECT ID FROM C FOR UPDATE"),
+    ("DISTINCT in the CTE BODY",       "WITH C AS (SELECT DISTINCT ID FROM T) SELECT ID FROM C FOR UPDATE"),
+    # ...and the two cancels, which come back as a plain select (1)
+    ("top-level DISTINCT CANCELS",     "SELECT DISTINCT ID FROM T FOR UPDATE"),
+    ("FIRST + DISTINCT cancels",       "SELECT FIRST 2 DISTINCT ID FROM T FOR UPDATE"),
+    ("SKIP + DISTINCT cancels",        "SELECT SKIP 1 DISTINCT ID FROM T FOR UPDATE"),
+    ("bare UNION CANCELS",             "SELECT ID FROM T UNION SELECT 1 FROM RDB$DATABASE FOR UPDATE"),
+    # (a MIXED UNION ALL / bare UNION chain is a RECORDED divergence -
+    #  fire-crab refuses the statement outright; checked at the end)
+    ("CTE top-level DISTINCT cancels", "WITH C AS (SELECT ID FROM T) SELECT DISTINCT ID FROM C FOR UPDATE"),
     # the RETURNING split: INSERT..RETURNING is a SINGLETON (type 8 -> 2),
     # UPDATE/DELETE..RETURNING are CURSORS (type 1 -> 3)
     ("insert .. returning IS A SINGLETON", "INSERT INTO T (ID) VALUES (?) RETURNING ID"),
@@ -252,6 +286,35 @@ for label, sql in CELLS:
 if ran < len(CELLS):
     print(f"DIFF flags battery ran {ran} of {len(CELLS)} cells")
     fail = 1
+# THE TYPE LAW NEEDS ITS OWN SPAN CHECK. Every cell compares the (type,
+# flags) PAIR, and the flag word is 3 for a plain select and for a FOR
+# UPDATE one alike - so a battery that never saw a 12 would agree with a
+# server that has never heard of FOR UPDATE, exactly the vacuity the
+# flags guard below closes for 0/2/3.
+if "12" not in engine_types_seen:
+    print(f"DIFF type battery is VACUOUS: the engine never answered select_for_update "
+          f"(saw types {sorted(engine_types_seen)}), so the FOR UPDATE law went untested")
+    fail = 1
+else:
+    print(f"OK   type battery spans select_for_update (engine types {sorted(engine_types_seen)})")
+
+# RECORDED, NOT FIXED: a chain that MIXES `UNION ALL` with a bare
+# `UNION` is refused by fire-crab outright - `split_union` answers None
+# for a mixed chain, so the planner never reaches a shape it can plan
+# and the statement cannot be typed at all, while the engine prepares it
+# as a plain select. Measured IDENTICAL on the binary before this slice,
+# so it is not the FOR UPDATE law failing: that law would answer 1 here
+# too, it is simply never asked. Self-expiring - this FAILS if fire-crab
+# starts answering, or if the engine stops typing it 1.
+mixed = ("SELECT ID FROM T UNION ALL SELECT 1 FROM RDB$DATABASE "
+         "UNION SELECT 2 FROM RDB$DATABASE FOR UPDATE")
+me = shape('engdb', mixed); mf = shape('fcdb', mixed)
+if me == ('1', 3) and isinstance(mf, str) and mf.startswith("ERR:"):
+    print("OK   recorded: a MIXED UNION ALL/bare UNION chain - engine types it 1, fc refuses")
+else:
+    print(f"DIFF the mixed-chain divergence MOVED\n     engine: {me}\n     fc:     {mf}")
+    fail = 1
+
 # the law has THREE distinct answers; a battery that saw only one of
 # them would agree with almost any implementation
 if not {0, 2, 3}.issubset(engine_flags_seen):

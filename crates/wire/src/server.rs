@@ -41797,15 +41797,10 @@ fn strip_row_locking(sql: &str, db: &Option<Database>) -> Option<String> {
     let mut had_with_lock = false;
     // FOR UPDATE / OPTIMIZE are lenient (the engine takes them over a
     // view, CTE, join or aggregate too); WITH LOCK is not.
-    let mut from = 0;
-    while let Some(f) = find_word_depth0(&up, "FOR", from) {
-        from = f + "FOR".len();
-        if word_after(from, "UPDATE") {
-            cut = Some(cut.map_or(f, |c| c.min(f)));
-            break;
-        }
+    if let Some(f) = find_depth0_for_update(&up) {
+        cut = Some(cut.map_or(f, |c| c.min(f)));
     }
-    from = 0;
+    let mut from = 0;
     while let Some(w) = find_word_depth0(&up, "WITH", from) {
         from = w + "WITH".len();
         if word_after(from, "LOCK") {
@@ -42001,6 +41996,103 @@ fn with_lock_one_bad(sql: &str, db: &Option<Database>) -> Option<EvalErr> {
         return Some(EvalErr::WithLock { code: GDS_WLOCK_CONFLICT, what: Some("DISTINCT") });
     }
     None
+}
+
+/// The offset of a depth-0 `FOR UPDATE` in already masked, upper-cased
+/// text. ONE reader for both users - [strip_row_locking], which cuts the
+/// clause off, and [stmt_for_update], which types the statement by it -
+/// so the two cannot drift the way the describe emitters once did.
+fn find_depth0_for_update(up: &str) -> Option<usize> {
+    let mut from = 0;
+    while let Some(f) = find_word_depth0(up, "FOR", from) {
+        from = f + "FOR".len();
+        let rest = up[from..].trim_start();
+        if rest.starts_with("UPDATE")
+            && rest["UPDATE".len()..]
+                .chars()
+                .next()
+                .is_none_or(|c| !(c.is_alphanumeric() || c == '_'))
+        {
+            return Some(f);
+        }
+    }
+    None
+}
+
+/// Does this statement announce `isc_info_sql_stmt_select_for_update`
+/// (12) rather than a plain select (1)?
+///
+/// Measured shape by shape against the live engine. A depth-0 `FOR
+/// UPDATE` types the statement 12 - `FOR UPDATE OF <col>`, lower case,
+/// after an `ORDER BY` or a `ROWS`, beside a `WITH LOCK`, and over a
+/// star projection, an aggregate, a GROUP BY, a join, a view, a derived
+/// table or a CTE alike - and unlike `WITH LOCK` it never refuses.
+///
+/// TWO things cancel it back to 1, and only at the TOP LEVEL:
+///
+/// - a `DISTINCT` on the statement's own projection, INCLUDING after
+///   `FIRST`/`SKIP` - which is why [proj_distinct] does the reading and
+///   a leading-word test would not (`SELECT FIRST 2 DISTINCT ... FOR
+///   UPDATE` is 1). `COUNT(DISTINCT x)`, a `'DISTINCT'` literal and
+///   `IS [NOT] DISTINCT FROM` are all still 12.
+/// - a depth-0 BARE `UNION`. `UNION ALL` does NOT cancel (12, and 12 for
+///   three branches), but a chain MIXING the two cancels in EITHER
+///   order. Inside an all-ALL chain a branch's own `DISTINCT` does not
+///   cancel either - measured in the first branch and in the last - so
+///   the projection is not read there at all.
+///
+/// A `WITH` statement is typed by its MAIN select: a plain CTE is 12,
+/// `WITH C AS (...) SELECT DISTINCT ... FOR UPDATE` is 1, and a
+/// `DISTINCT` inside the CTE BODY leaves it at 12.
+fn stmt_for_update(sql: &str) -> bool {
+    let s = sql.trim().trim_end_matches(';').trim();
+    let up = mask_literals(&s.to_ascii_uppercase());
+    if find_depth0_for_update(&up).is_none() {
+        return false;
+    }
+    let mut at = 0usize;
+    let mut chained = false;
+    while let Some(u) = find_word_depth0(&up, "UNION", at) {
+        at = u + "UNION".len();
+        chained = true;
+        let rest = up[at..].trim_start();
+        let all = rest.starts_with("ALL")
+            && rest["ALL".len()..]
+                .chars()
+                .next()
+                .is_none_or(|c| !(c.is_alphanumeric() || c == '_'));
+        if !all {
+            return false;
+        }
+    }
+    if chained {
+        return true;
+    }
+    let main = parse_with(s).map(|(_, m, _)| m);
+    let body = main.as_deref().unwrap_or(s);
+    match split_query(body) {
+        Some((proj, ..)) => !proj_distinct(&mask_literals(&proj.to_ascii_uppercase())),
+        None => true,
+    }
+}
+
+/// The statement type the wire ANNOUNCES: [stmt_type_of] for the plan,
+/// promoted to 12 when the TEXT carries a `FOR UPDATE` that nothing
+/// cancels. The plan cannot answer this on its own - [strip_row_locking]
+/// cuts the clause off before planning, deliberately, because the rows
+/// are the plain query's - so the type is read from the statement text,
+/// which [switch_stmt] keeps PER HANDLE beside the plan.
+///
+/// The FLAG word needs no such promotion: measured, a `FOR UPDATE`
+/// select answers 3 exactly as a plain one does, and [stmt_flags_of]
+/// already counts 12 as a cursor type.
+fn stmt_type_announced(plan: &Plan, for_update: bool) -> i32 {
+    let ty = stmt_type_of(plan);
+    if ty == 1 && for_update {
+        12
+    } else {
+        ty
+    }
 }
 
 /// Does this projection carry the statement's own DISTINCT?
@@ -57948,7 +58040,13 @@ fn count_top_level_cols(proj: &str) -> usize {
 /// every var is answered with the requested items in requested order,
 /// closed by describe_end - the shape node-firebird's tag-driven
 /// parser reads equally happily.
-fn answer_prepare(items: &[u8], plan: &Plan, params: &[Descriptor], att: AttCs) -> Vec<u8> {
+fn answer_prepare(
+    items: &[u8],
+    plan: &Plan,
+    params: &[Descriptor],
+    att: AttCs,
+    for_update: bool,
+) -> Vec<u8> {
     fn int_item(d: &mut Vec<u8>, code: u8, val: i32) {
         d.push(code);
         d.extend_from_slice(&4u16.to_le_bytes());
@@ -58063,7 +58161,7 @@ fn answer_prepare(items: &[u8], plan: &Plan, params: &[Descriptor], att: AttCs) 
     let mut i = 0usize;
     while i < items.len() {
         match items[i] {
-            21 => int_item(&mut d, 21, stmt_type_of(plan)),
+            21 => int_item(&mut d, 21, stmt_type_announced(plan, for_update)),
             27 => int_item(&mut d, 27, stmt_flags_of(plan)), // isc_info_sql_stmt_flags
             22 => str_item(&mut d, 22, ""), // isc_info_sql_get_plan
             6 => int_item(&mut d, 6, out_vars.len() as i32), // num_variables
@@ -58151,7 +58249,12 @@ fn answer_prepare(items: &[u8], plan: &Plan, params: &[Descriptor], att: AttCs) 
 /// Answer an op_info_sql request item-by-item: records(23) with the
 /// per-verb counts, stmt_type(21), stmt_flags(27) - the item the
 /// python driver's Statement.get_flags() lives on - and the plan(22).
-fn answer_info_sql(items: &[u8], plan: &Plan, last_dml: (i32, i32, i32)) -> Vec<u8> {
+fn answer_info_sql(
+    items: &[u8],
+    plan: &Plan,
+    last_dml: (i32, i32, i32),
+    for_update: bool,
+) -> Vec<u8> {
     let mut d = Vec::new();
     for &it in items {
         match it {
@@ -58163,7 +58266,7 @@ fn answer_info_sql(items: &[u8], plan: &Plan, last_dml: (i32, i32, i32)) -> Vec<
             21 => {
                 d.push(21);
                 d.extend_from_slice(&4u16.to_le_bytes());
-                d.extend_from_slice(&stmt_type_of(plan).to_le_bytes());
+                d.extend_from_slice(&stmt_type_announced(plan, for_update).to_le_bytes());
             }
             27 => {
                 d.push(27);
@@ -93682,7 +93785,8 @@ fn after_auth(
                 {
                     // SET GENERATOR / SET STATISTICS - DDL that begins with
                     // SET, so it is not caught by the DDL/DML verb list
-                    let describe = answer_prepare(&prep_items, &p, &ps, att_cs);
+                    let describe =
+                        answer_prepare(&prep_items, &p, &ps, att_cs, stmt_for_update(&stmt_sql));
                     plan = p;
                     stmt_params = ps;
                     respond_prepare(&mut s, &mut enc, &describe)?;
@@ -93752,7 +93856,13 @@ fn after_auth(
                     match planned {
                         Some((p, ps)) => {
                             // DDL is not cached, so this pair is owned
-                            let describe = answer_prepare(&prep_items, &p, &ps, att_cs);
+                            let describe = answer_prepare(
+                                &prep_items,
+                                &p,
+                                &ps,
+                                att_cs,
+                                stmt_for_update(&stmt_sql),
+                            );
                             plan = p;
                             stmt_params = ps;
                             respond_prepare(&mut s, &mut enc, &describe)?;
@@ -93890,7 +94000,13 @@ fn after_auth(
                         }
                         Some((p, ps)) => {
                             // adopted, not copied - both are already Rc
-                            let describe = answer_prepare(&prep_items, &p, &ps, att_cs);
+                            let describe = answer_prepare(
+                                &prep_items,
+                                &p,
+                                &ps,
+                                att_cs,
+                                stmt_for_update(&stmt_sql),
+                            );
                             plan = p;
                             stmt_params = ps;
                             respond_prepare(&mut s, &mut enc, &describe)?;
@@ -93975,7 +94091,13 @@ fn after_auth(
                     } else {
                         plan = p;
                         stmt_params = ps;
-                        let describe = answer_prepare(&prep_items, &*plan, &stmt_params, att_cs);
+                        let describe = answer_prepare(
+                            &prep_items,
+                            &*plan,
+                            &stmt_params,
+                            att_cs,
+                            stmt_for_update(&stmt_sql),
+                        );
                         respond_prepare(&mut s, &mut enc, &describe)?;
                     }
                 }
@@ -94877,7 +94999,9 @@ fn after_auth(
                 if std::env::var("FC_SRV_TRACE").is_ok() {
                     eprintln!("[srv] op_info_sql items: {:?}", items);
                 }
-                let info = answer_info_sql(&items, &*plan, last_dml);
+                // `stmt_sql` is this HANDLE's text - [switch_stmt] restored
+                // it at the use_stmt! above, beside the plan
+                let info = answer_info_sql(&items, &*plan, last_dml, stmt_for_update(&stmt_sql));
                 let mut w = W::default();
                 w.int(OP_RESPONSE).int(0).int(0).int(0).bytes(&info).int(0);
                 w.send(&mut s, &mut enc)?;
@@ -103606,7 +103730,7 @@ mod tests {
             ],
             rows: Vec::new(),
         };
-        let d = answer_prepare(&[4, 9, 17, 18, 25, 33, 8], &plan, &[], AttCs::NONE);
+        let d = answer_prepare(&[4, 9, 17, 18, 25, 33, 8], &plan, &[], AttCs::NONE, false);
         // every answered item is code + u16 length + payload; the
         // section tag (4), each var's describe_end (8) and the final
         // isc_info_end (1) travel bare
@@ -103647,7 +103771,7 @@ mod tests {
         assert_eq!(var(2, 25), "");
         assert_eq!(var(2, 33), ""); // no relation, no schema
         // 34 names no item: the writer omits it rather than answering
-        let d = answer_prepare(&[4, 34, 8], &plan, &[], AttCs::NONE);
+        let d = answer_prepare(&[4, 34, 8], &plan, &[], AttCs::NONE, false);
         assert_eq!(d, vec![4, 8, 8, 8, 1]);
     }
 
@@ -109949,6 +110073,81 @@ mod tests {
     // (the engine returns one row per touched row - two for a MATCHING
     // that updates two rows, three for a three-row source), while the
     // bare forms stay type 2 (insert).
+    #[test]
+    fn for_update_types_the_statement_twelve_unless_cancelled() {
+        // a depth-0 FOR UPDATE types the statement 12, in every spelling
+        // the engine answers 12 for (measured shape by shape)
+        for s in [
+            "SELECT ID FROM T FOR UPDATE",
+            "SELECT ID FROM T FOR UPDATE OF ID",
+            "select id from t for update",
+            "SELECT ID FROM T ORDER BY ID FOR UPDATE",
+            "SELECT ID FROM T ROWS 2 FOR UPDATE",
+            "SELECT ID FROM T FOR UPDATE WITH LOCK",
+            "SELECT * FROM T FOR UPDATE",
+            "SELECT COUNT(*) FROM T FOR UPDATE",
+            "SELECT ID FROM T GROUP BY ID FOR UPDATE",
+            "SELECT FIRST 2 ID FROM T FOR UPDATE",
+            "SELECT SKIP 1 ID FROM T FOR UPDATE",
+            // a DISTINCT that is NOT the statement's own
+            "SELECT COUNT(DISTINCT ID) FROM T FOR UPDATE",
+            "SELECT ID, 'DISTINCT' AS W FROM T FOR UPDATE",
+            "SELECT ID, V IS DISTINCT FROM 1 AS D FROM T FOR UPDATE",
+            "SELECT ID, V IS NOT DISTINCT FROM 1 AS D FROM T FOR UPDATE",
+            // UNION ALL does not cancel, and neither does a BRANCH's DISTINCT
+            "SELECT ID FROM T UNION ALL SELECT ID FROM U FOR UPDATE",
+            "SELECT DISTINCT ID FROM T UNION ALL SELECT ID FROM U FOR UPDATE",
+            "SELECT ID FROM T UNION ALL SELECT DISTINCT ID FROM U FOR UPDATE",
+            // a CTE is typed by its MAIN select; a DISTINCT in the BODY is not one
+            "WITH C AS (SELECT ID FROM T) SELECT ID FROM C FOR UPDATE",
+            "WITH C AS (SELECT DISTINCT ID FROM T) SELECT ID FROM C FOR UPDATE",
+        ] {
+            assert!(stmt_for_update(s), "should be 12: {s}");
+        }
+        // cancelled back to 1 by a TOP-LEVEL DISTINCT - after FIRST/SKIP
+        // too, which a leading-word test would miss - or by a depth-0
+        // BARE UNION, in either chain order
+        for s in [
+            "SELECT DISTINCT ID FROM T FOR UPDATE",
+            "SELECT FIRST 2 DISTINCT ID FROM T FOR UPDATE",
+            "SELECT SKIP 1 DISTINCT ID FROM T FOR UPDATE",
+            "SELECT FIRST 2 SKIP 1 DISTINCT ID FROM T FOR UPDATE",
+            "SELECT ID FROM T UNION SELECT ID FROM U FOR UPDATE",
+            "SELECT ID FROM T UNION ALL SELECT ID FROM U UNION SELECT ID FROM T FOR UPDATE",
+            "SELECT ID FROM T UNION SELECT ID FROM U UNION ALL SELECT ID FROM T FOR UPDATE",
+            "WITH C AS (SELECT ID FROM T) SELECT DISTINCT ID FROM C FOR UPDATE",
+        ] {
+            assert!(!stmt_for_update(s), "should be cancelled to 1: {s}");
+        }
+        // and no FOR UPDATE at all is never 12 - a FOR that is not the
+        // clause's must not trip it either
+        assert!(!stmt_for_update("SELECT ID FROM T"));
+        assert!(!stmt_for_update("SELECT ID FROM T WITH LOCK"));
+        assert!(!stmt_for_update("SELECT ID FROM T WHERE S = 'FOR UPDATE'"));
+        // the promotion applies only to a plan that types 1
+        let sel = Plan::Rows { cols: Vec::new(), rows: Vec::new() };
+        assert_eq!(stmt_type_announced(&sel, false), 1);
+        assert_eq!(stmt_type_announced(&sel, true), 12);
+        // a plan that does NOT type 1 is never promoted, whatever the text says
+        assert_eq!(
+            stmt_type_announced(
+                &Plan::InsertSelect {
+                    table: "DST".into(),
+                    cols: vec!["X".into()],
+                    ov: Overriding::None,
+                    src: Box::new(Plan::Scalar(
+                        ScalarVal::Fixed(Some(1)),
+                        "X".into(),
+                        None,
+                        ScalarTy::int64()
+                    )),
+                },
+                true
+            ),
+            2
+        );
+    }
+
     #[test]
     fn upsert_and_insert_select_returning_announce_cursors() {
         let insert = || {
