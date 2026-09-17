@@ -43271,6 +43271,73 @@ fn plan_over_source(
     })
 }
 
+/// Every UNQUALIFIED relation name a statement names after `FROM` or
+/// `JOIN`, ANYWHERE in it - a subquery, a derived table's body, either
+/// branch of a union, an `IN`/`EXISTS` body. Modelled on
+/// [first_unknown_relation], which walks the same two keywords for the
+/// same reason; this one collects the names instead of checking them
+/// against the catalog.
+///
+/// [bound_refs] cannot serve here: it reads ONE query's top-level FROM
+/// and joins, while the engine's cycle check reaches a self-reference
+/// buried in a subquery, in a derived table and across union branches
+/// (measured - all three raise).
+///
+/// A QUALIFIED reference is skipped, because it bypasses the CTE
+/// namespace entirely (measured: `WITH C1 AS (SELECT ID FROM
+/// PUBLIC.C1)` reads the TABLE and answers on BOTH servers), and so is
+/// a `(`, which opens a derived table rather than a name. Quoted names
+/// are read off the UPPERCASED ORIGINAL, because [mask_literals] hides
+/// a quoted span whole - the same care [first_unknown_relation] takes.
+fn from_names(sql: &str) -> Vec<String> {
+    let up = sql.to_ascii_uppercase();
+    let masked = mask_literals(&up);
+    let b = masked.as_bytes();
+    let sb = up.as_bytes();
+    let is_ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$';
+    let mut out: Vec<String> = Vec::new();
+    for kw in ["FROM", "JOIN"] {
+        let mut at = 0;
+        while let Some(k) = find_word(&masked, kw, at) {
+            at = k + kw.len();
+            let mut i = at;
+            while i < b.len() && b[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            if i >= b.len() || b[i] == b'(' {
+                continue;
+            }
+            let (start, end, after);
+            if sb[i] == b'"' {
+                start = i + 1;
+                let mut j = start;
+                while j < sb.len() && sb[j] != b'"' {
+                    j += 1;
+                }
+                end = j;
+                after = (j + 1).min(sb.len());
+            } else {
+                start = i;
+                let mut j = i;
+                while j < b.len() && is_ident(b[j]) {
+                    j += 1;
+                }
+                end = j;
+                after = j;
+            }
+            if end <= start {
+                continue;
+            }
+            // `PUBLIC.C1` names the TABLE, never the CTE
+            if sb.get(after) == Some(&b'.') {
+                continue;
+            }
+            out.push(up[start..end].to_string());
+        }
+    }
+    out
+}
+
 /// How many times a query's FROM names `name` - the count that decides
 /// whether a recursive branch is legal (exactly one) and whether a
 /// `WITH RECURSIVE` body is recursive at all (more than zero).
@@ -48708,6 +48775,106 @@ fn plan_query_inner_at(
             // `WITH RECURSIVE` is a DECLARATION, not a fact: a body that
             // never names itself is an ordinary CTE and takes the
             // ordinary path, exactly as the engine treats it.
+            // A CTE'S BODY NAMING A CTE OF THE SAME `WITH` BINDS TO THAT
+            // CTE, NOT TO A SAME-NAMED TABLE - and if that closes a
+            // CYCLE the engine refuses the whole statement. This server
+            // resolved such a name to the TABLE wherever one existed and
+            // ANSWERED it (PostgreSQL-style scoping), and gave a
+            // contentless 42000 where no table existed. Measured over
+            // ~35 cells, and the shape is wider than "shadows a table":
+            // the cycle alone is the error, with or without a table of
+            // that name, reachable from the main query or not, and
+            // whether the body is a plain SELECT or a UNION.
+            //
+            // A QUALIFIED self-reference is legal and answers on both
+            // servers ([from_names] skips it), and so is a CTE that
+            // merely SHADOWS a table without naming itself.
+            //
+            // The RECURSIVE spellings have their own two diagnoses, so
+            // they are decided first; what is left is a plain cycle.
+            let cte_names: Vec<String> =
+                ctes.iter().map(|(n, _)| n.to_ascii_uppercase()).collect();
+            let idx_of = |r: &str| cte_names.iter().position(|n| n.eq_ignore_ascii_case(r));
+            // a LEGAL recursive member: `WITH RECURSIVE`, a top-level
+            // UNION, and a first member that does NOT name the CTE -
+            // that one's self-edge is the fixpoint, not a cycle
+            let mut legal_rec = vec![false; ctes.len()];
+            for (i, (name, def)) in ctes.iter().enumerate() {
+                let names_self = from_names(&def.source).iter().any(|r| r.eq_ignore_ascii_case(name));
+                if !names_self {
+                    continue;
+                }
+                match (recursive, split_recursive_body(&def.source)) {
+                    // measured: `WITH RECURSIVE X AS (SELECT .. FROM X)`
+                    // is "Recursive CTE (X) must be an UNION"
+                    (true, None) => {
+                        PREPARE_REFUSAL
+                            .with(|r| *r.borrow_mut() = Some(EvalErr::CteNotAUnion(name.clone())));
+                        return Some(Plan::Refused);
+                    }
+                    (true, Some((seed, _))) => {
+                        if from_names(&seed).iter().any(|r| r.eq_ignore_ascii_case(name)) {
+                            // measured: a union whose FIRST member already
+                            // names the CTE has no anchor to start from
+                            PREPARE_REFUSAL.with(|r| {
+                                *r.borrow_mut() = Some(EvalErr::CteMissNonRecursive(name.clone()))
+                            });
+                            return Some(Plan::Refused);
+                        }
+                        legal_rec[i] = true;
+                    }
+                    // WITHOUT the RECURSIVE keyword a self-reference is a
+                    // plain cycle, union body or not (measured, both
+                    // branch positions)
+                    (false, _) => {}
+                }
+            }
+            let edges: Vec<Vec<usize>> = ctes
+                .iter()
+                .enumerate()
+                .map(|(i, (_, def))| {
+                    if legal_rec[i] {
+                        // its own name is the fixpoint; every OTHER name still counts
+                        from_names(&def.source)
+                            .iter()
+                            .filter(|r| !r.eq_ignore_ascii_case(&ctes[i].0))
+                            .filter_map(|r| idx_of(r))
+                            .collect()
+                    } else {
+                        from_names(&def.source).iter().filter_map(|r| idx_of(r)).collect()
+                    }
+                })
+                .collect();
+            // THE NAME IN THE MESSAGE IS THE CTE THE RESOLUTION ENTERED
+            // THE CYCLE AT. Measured: one three-CTE cycle answers A1, A2
+            // or A3 depending only on which one the MAIN query reads.
+            // When no member is reachable from the main query the engine
+            // names the LAST-DECLARED member (`P,Q` -> Q; `Q,P` -> P),
+            // so the unreachable candidates are tried in reverse.
+            let mut order: Vec<usize> = from_names(&main).iter().filter_map(|r| idx_of(r)).collect();
+            order.extend((0..ctes.len()).rev());
+            let reaches_self = |start: usize| -> bool {
+                let mut seen = vec![false; ctes.len()];
+                let mut stack = edges[start].clone();
+                while let Some(n) = stack.pop() {
+                    if n == start {
+                        return true;
+                    }
+                    if std::mem::replace(&mut seen[n], true) {
+                        continue;
+                    }
+                    stack.extend(edges[n].iter().copied());
+                }
+                false
+            };
+            if let Some(hit) = order.into_iter().find(|i| reaches_self(*i)) {
+                // @1 carries its OWN double quotes - see [GDS_DSQL_CTE_CYCLE]
+                PREPARE_REFUSAL.with(|r| {
+                    *r.borrow_mut() =
+                        Some(EvalErr::CteCycle(format!("\"{}\"", cte_names[hit])))
+                });
+                return Some(Plan::Refused);
+            }
             let self_referencing = ctes.len() == 1
                 && split_recursive_body(&ctes[0].1.source)
                     .is_some_and(|(_, rec)| bound_refs(&rec, &ctes[0].0) > 0);
@@ -59209,6 +59376,33 @@ const GDS_DSQL_COMMAND_ERR: i32 = 335544570;
 /// display name, not a column name, which is why they cannot stand in
 /// for one here.
 const GDS_DSQL_DERIVED_FIELD_UNNAMED: i32 = 336397220;
+/// `isc_dsql_cte_cycle` - "CTE '@1' has cyclic dependencies". A CTE's
+/// body naming a CTE of the same `WITH` - itself, or one that leads
+/// back to it - is a CYCLE, and the engine refuses the whole statement.
+/// **@1 CARRIES ITS OWN DOUBLE QUOTES**: the template is `CTE '@1' has
+/// ...` and the engine prints `CTE '"C1"' has cyclic dependencies`, so
+/// the argument string is `"C1"`, quotes included (read off
+/// `include/firebird/impl/msg/sqlerr.h:177`, not guessed).
+///
+/// The name is the CTE the resolution ENTERED the cycle at - the one
+/// the MAIN query references (measured: the same three-CTE cycle
+/// answers A1, A2 or A3 depending only on which the main query reads).
+/// When no member is reachable from the main query the engine names
+/// the LAST-DECLARED member of the cycle (`P,Q` -> Q; `Q,P` -> P).
+const GDS_DSQL_CTE_CYCLE: i32 = 336397226;
+/// `isc_dsql_cte_not_a_union` - "Recursive CTE (@1) must be an UNION".
+/// `WITH RECURSIVE X AS (<body naming X>)` whose body is NOT a union:
+/// @1 is BARE, the template supplies the parentheses (sqlerr.h:180).
+const GDS_DSQL_CTE_NOT_A_UNION: i32 = 336397229;
+/// `isc_dsql_cte_miss_nonrecursive` - "Non-recursive member is missing
+/// in CTE '@1'". A recursive body that IS a union but whose FIRST
+/// member already names the CTE, so there is no anchor to start from:
+/// @1 bare, the template supplies the quotes (sqlerr.h:184).
+const GDS_DSQL_CTE_MISS_NONRECURSIVE: i32 = 336397233;
+/// `isc_dsql_cte_not_used` (336397237) - "CTE \"@1\" is not used in
+/// query" - is a WARNING, not an error: the engine emits it and then
+/// ANSWERS the rows (measured). Recorded here rather than emitted,
+/// because this server has no warning channel on the prepare path yet.
 const GDS_RANDOM: i32 = 335544382;
 
 /// isc_string_truncation - "string right truncation" - and
@@ -59815,6 +60009,46 @@ fn eval_status_items(w: &mut W, e: &EvalErr) {
                 .int(*pos)
                 .int(2) // isc_arg_string - @2 - the derived table's alias
                 .bytes(table.as_bytes());
+        }
+        // THREE LINES, not four: the engine prints "Dynamic SQL Error",
+        // "SQL error code = -104" and then the diagnosis, with NO
+        // "Invalid command" line between them - unlike the
+        // derived-field vector above (measured on all three).
+        EvalErr::CteCycle(name) => {
+            w.int(1) // isc_arg_gds - Dynamic SQL Error
+                .int(GDS_DSQL_ERROR)
+                .int(1) // isc_arg_gds - isc_sqlerr
+                .int(GDS_SQLERR)
+                .int(ISC_ARG_NUMBER)
+                .int(-104)
+                .int(1) // isc_arg_gds - the diagnosis
+                .int(GDS_DSQL_CTE_CYCLE)
+                .int(2) // isc_arg_string - @1, quotes already applied
+                .bytes(name.as_bytes());
+        }
+        EvalErr::CteNotAUnion(name) => {
+            w.int(1)
+                .int(GDS_DSQL_ERROR)
+                .int(1)
+                .int(GDS_SQLERR)
+                .int(ISC_ARG_NUMBER)
+                .int(-104)
+                .int(1)
+                .int(GDS_DSQL_CTE_NOT_A_UNION)
+                .int(2) // isc_arg_string - @1 BARE: the template parenthesises it
+                .bytes(name.as_bytes());
+        }
+        EvalErr::CteMissNonRecursive(name) => {
+            w.int(1)
+                .int(GDS_DSQL_ERROR)
+                .int(1)
+                .int(GDS_SQLERR)
+                .int(ISC_ARG_NUMBER)
+                .int(-104)
+                .int(1)
+                .int(GDS_DSQL_CTE_MISS_NONRECURSIVE)
+                .int(2) // isc_arg_string - @1 bare: the template quotes it
+                .bytes(name.as_bytes());
         }
         EvalErr::ReadOnlyView(name) => {
             w.int(1) // isc_arg_gds
@@ -68986,6 +69220,19 @@ enum EvalErr {
     /// the 1-based position of the FIRST such column and `table` the
     /// derived table's alias as written.
     DerivedFieldUnnamed { pos: i32, table: String },
+    /// a CTE that names a CTE of the same `WITH` in a way that closes a
+    /// CYCLE - itself directly, or through others. The engine refuses
+    /// the statement ([GDS_DSQL_CTE_CYCLE]); this server resolved the
+    /// name to a same-named TABLE where one existed and ANSWERED, and
+    /// gave a contentless 42000 where one did not. The string is the
+    /// message's `@1` **with its double quotes already applied**.
+    CteCycle(String),
+    /// `WITH RECURSIVE X AS (<body naming X>)` whose body is not a
+    /// union, so there is nothing to recurse from ([GDS_DSQL_CTE_NOT_A_UNION]).
+    CteNotAUnion(String),
+    /// a recursive body that IS a union but whose FIRST member already
+    /// names the CTE - no anchor ([GDS_DSQL_CTE_MISS_NONRECURSIVE]).
+    CteMissNonRecursive(String),
 }
 
 /// What an expression's result is typed as - which drives its wire form

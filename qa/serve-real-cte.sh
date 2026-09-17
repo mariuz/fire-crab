@@ -121,6 +121,54 @@ both() { # <label> <sql>
         fail=1
     fi
 }
+
+# THE WHOLE MESSAGE, NOT ITS FIRST FIFTY CHARACTERS. `query` above keeps
+# `message.split("\n")[0].slice(0,50)`, which for every -104 in this
+# gate is the string "Dynamic SQL Error" ON BOTH SIDES - so a `both`
+# cell over a CTE diagnosis would score OK whichever CTE the engine
+# named, and would pass a contentless 42000 just as happily. The CTE
+# rules below ARE their messages: three different diagnoses, three
+# different spellings of the name (`'"C1"'`, `(C1)`, `'C1'`), and a name
+# that changes with which CTE the query ENTERS the cycle at. So they are
+# compared whole.
+qfull() { # <sql> <port> <db>
+    timeout 25 env FC_Q="$1" FC_PORT="$2" FC_DB="$3" node -e '
+      process.on("uncaughtException", () => { console.log("CONN_ERR"); process.exit(0); });
+      const F=require("node-firebird");
+      F.attach({host:"127.0.0.1",port:+process.env.FC_PORT,database:process.env.FC_DB,
+                user:"SYSDBA",password:"masterkey"},(e,db)=>{
+        if(e){console.log("CONN_ERR");process.exit(0);}
+        db.query(process.env.FC_Q,(e2,r)=>{
+          if(e2){console.log("RAISE "+JSON.stringify((e2.message||"").replace(/\s+/g," ").trim()));
+                 db.detach();process.exit(0);}
+          console.log("ROWS "+JSON.stringify(Array.isArray(r)?r:(r?[r]:[])));
+          db.detach();process.exit(0);});});' 2>/dev/null
+}
+# both sides must raise, and raise THE SAME TEXT - which CTE is named
+# included
+raises() { # <label> <sql>
+    ran=$((ran + 1))
+    a=$(qfull "$2" "$PORT" "$A")
+    b=$(qfull "$2" "$REAL" "$B")
+    case "$a$b" in
+        *CONN_ERR*|"") echo "DIFF $1 [VACUOUS: a side did not answer] fcwire=[$a] engine=[$b]"
+                       fail=1; return ;;
+    esac
+    # if the ENGINE stopped raising, the cell describes a law that no
+    # longer exists - a finding, not a pass
+    case "$b" in
+        RAISE*) ;;
+        *) echo "DIFF $1 [the ENGINE did not raise: $b]"; fail=1; return ;;
+    esac
+    if [ "$a" = "$b" ]; then
+        echo "OK   raises alike: $1 - ${b#RAISE }"
+    else
+        echo "DIFF $1"
+        echo "     fcwire: $a"
+        echo "     engine: $b"
+        fail=1
+    fi
+}
 refuses() { # <label> <sql>
     ran=$((ran + 1))
     r=$(query "$2" "$PORT" "$A")
@@ -249,9 +297,77 @@ both "TWO CTEs joined to each other" \
      "WITH C AS (SELECT DEPT_ID FROM EMP), E AS (SELECT ID FROM DEPT)
       SELECT COUNT(*) FROM C JOIN E ON C.DEPT_ID = E.ID"
 
+# --- A CTE NAME BINDS TO THE CTE, AND A CYCLE IS AN ERROR ------------
+# Inside a `WITH`, an UNQUALIFIED name that matches a CTE of the same
+# WITH binds to THAT CTE - never to a same-named table. If that closes a
+# cycle the engine refuses the whole statement, and this server used to
+# resolve the name to the TABLE and ANSWER (PostgreSQL-style scoping)
+# wherever one existed, or give a contentless 42000 where none did.
+#
+# Compared with `raises`, not `both`: `query` keeps only the first fifty
+# characters of the first line, which is "Dynamic SQL Error" for every
+# one of these, so a `both` cell would pass whichever CTE was named -
+# and these three diagnoses differ precisely in WHICH name they carry.
+raises "a CTE that names itself" \
+       "WITH EMP AS (SELECT ID FROM EMP) SELECT ID FROM EMP"
+raises "...with SELECT *" \
+       "WITH EMP AS (SELECT * FROM EMP) SELECT * FROM EMP"
+raises "a mutual pair" \
+       "WITH C2 AS (SELECT ID FROM C1), C1 AS (SELECT ID FROM C2) SELECT ID FROM C1"
+# the name in the message is the CTE the resolution ENTERED the cycle
+# at - the same three-CTE cycle names a different member depending only
+# on which one the MAIN query reads
+raises "a three-CTE cycle, entered at A1" \
+       "WITH A1 AS (SELECT ID FROM A3), A2 AS (SELECT ID FROM A1), A3 AS (SELECT ID FROM A2) SELECT ID FROM A1"
+raises "...the same cycle, entered at A2" \
+       "WITH A1 AS (SELECT ID FROM A3), A2 AS (SELECT ID FROM A1), A3 AS (SELECT ID FROM A2) SELECT ID FROM A2"
+# a self-reference anywhere in the body counts, not only in its top FROM
+raises "a self-reference inside a SUBQUERY" \
+       "WITH EMP AS (SELECT 1 AS ID FROM DEPT WHERE EXISTS(SELECT 1 FROM EMP)) SELECT ID FROM EMP"
+raises "a self-reference in a JOIN" \
+       "WITH EMP AS (SELECT a.ID FROM EMP a JOIN DEPT b ON b.ID = 1) SELECT ID FROM EMP"
+raises "a self-reference in a nested DERIVED table" \
+       "WITH EMP AS (SELECT ID FROM (SELECT ID FROM EMP) D) SELECT ID FROM EMP"
+# an UNUSED cycle is still an error (the engine warns separately about
+# an unused CTE, but a cyclic one never gets that far), and it names the
+# LAST-DECLARED member when the main query enters no part of it
+raises "a cycle the main query never reaches" \
+       "WITH P AS (SELECT ID FROM Q), Q AS (SELECT ID FROM P), R AS (SELECT 1 AS ID FROM RDB\$DATABASE) SELECT ID FROM R"
+raises "...declared the other way round" \
+       "WITH Q AS (SELECT ID FROM P), P AS (SELECT ID FROM Q) SELECT 1 AS ID FROM RDB\$DATABASE"
+raises "a NON-recursive union that names itself" \
+       "WITH EMP AS (SELECT 1 AS ID FROM DEPT UNION ALL SELECT ID + 1 FROM EMP WHERE ID < 3) SELECT ID FROM EMP"
+raises "the lower-case spelling" \
+       "WITH emp AS (SELECT ID FROM emp) SELECT ID FROM emp"
+# the RECURSIVE spellings carry their OWN two diagnoses
+raises "RECURSIVE with a non-union body" \
+       "WITH RECURSIVE EMP AS (SELECT ID FROM EMP) SELECT ID FROM EMP"
+raises "RECURSIVE whose FIRST member names it" \
+       "WITH RECURSIVE EMP AS (SELECT ID FROM EMP UNION ALL SELECT ID + 1 FROM EMP WHERE ID < 3) SELECT ID FROM EMP"
+raises "RECURSIVE with BOTH branches naming it" \
+       "WITH RECURSIVE EMP AS (SELECT ID FROM EMP WHERE ID > 0 UNION ALL SELECT ID + 1 FROM EMP WHERE ID < 3) SELECT ID FROM EMP"
+
+# --- ...and what is still LEGAL, which a blanket refusal would break --
+both "a CTE that shadows a table without naming itself" \
+     "WITH EMP AS (SELECT 1 AS ID FROM DEPT) SELECT ID FROM EMP"
+both "a shadowing CTE whose body reads ANOTHER table" \
+     "WITH EMP AS (SELECT ID FROM DEPT) SELECT ID FROM EMP ORDER BY ID"
+both "a QUALIFIED self-reference reads the TABLE" \
+     "WITH EMP AS (SELECT ID FROM PUBLIC.EMP) SELECT ID FROM EMP ORDER BY ID"
+both "a forward reference with no cycle" \
+     "WITH C2 AS (SELECT ID FROM EMP), C3 AS (SELECT ID FROM C2) SELECT ID FROM C3 ORDER BY ID"
+both "a proper recursive anchor still walks" \
+     "WITH RECURSIVE R AS (SELECT 1 AS ID FROM RDB\$DATABASE UNION ALL SELECT ID + 1 FROM R WHERE ID < 3) SELECT ID FROM R"
+both "a plain CTE, the control" \
+     "WITH C AS (SELECT ID FROM EMP) SELECT COUNT(*) AS N FROM C"
+
+# the scratch databases come out only AFTER the last cell - a cell
+# placed below this line queries a file that no longer exists and both
+# sides answer CONN_ERR, which compares EQUAL and scores OK
 rm -f "$A" "$B"
-if [ "$ran" -lt 35 ]; then
-    echo "DIFF only $ran checks ran (expected at least 35) - did one silently skip?"
+
+if [ "$ran" -lt 56 ]; then
+    echo "DIFF only $ran checks ran (expected at least 56) - did one silently skip?"
     fail=1
 fi
 exit $fail
