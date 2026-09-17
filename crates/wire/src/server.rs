@@ -45833,6 +45833,141 @@ fn materialise_laterals_src(
     }
 }
 
+/// Does this plan hold a deferred [Plan::ProcSelect] anywhere?
+///
+/// The op_execute arm asks this before cloning: a plan tree is cloned to
+/// be walked, and every ordinary statement would pay for that clone if
+/// the arm's condition were the walk itself.
+fn plan_has_procselect(plan: &Plan) -> bool {
+    match plan {
+        Plan::ProcSelect { .. } => true,
+        Plan::Derived { inner, .. }
+        | Plan::Modified { inner, .. }
+        | Plan::Returning { inner, .. } => plan_has_procselect(inner),
+        Plan::Union { branches, .. } => branches.iter().any(plan_has_procselect),
+        Plan::Join { base, .. } | Plan::JoinGroup { base, .. } | Plan::Lateral { base, .. } => {
+            plan_has_procselect_src(base)
+        }
+        _ => false,
+    }
+}
+
+fn plan_has_procselect_src(src: &RowSource) -> bool {
+    match src {
+        RowSource::PlanRows(p) => plan_has_procselect(p),
+        RowSource::Filter { input, .. } | RowSource::Sort { input, .. } => {
+            plan_has_procselect_src(input)
+        }
+        _ => false,
+    }
+}
+
+/// Replace every deferred [Plan::ProcSelect] in a plan tree with the
+/// rows its body SUSPENDs, IN PLACE, so everything above it - a derived
+/// table's projection and WHERE, a grouped fold, DISTINCT/FIRST/SKIP, a
+/// union branch - then runs on the ordinary machinery.
+///
+/// This is [materialise_laterals]' problem one step further out, and
+/// that function's doc states the constraint they share: the generic
+/// row-source path ([branch_rows_res]) holds only a `&Database`, while
+/// running a procedure body needs `&mut Option<Database>` AND a
+/// [SessionCtx] - the body may WRITE. op_execute is the one place with
+/// both, which is why the substitution happens there and not at fetch,
+/// and why a `ProcSelect` left in the tree raises instead of answering.
+///
+/// IN PLACE, and that is not a style preference: a returning walk would
+/// rebuild [Plan::JoinGroup]'s thirteen fields and [Plan::Join]'s seven
+/// by hand at every level - a great deal of boilerplate whose only
+/// effect could be to mistype one of them.
+///
+/// `Ok(false)` means there was no procedure anywhere and the caller
+/// keeps the plan it had. A body that RAISES becomes [Plan::RefusedEval]
+/// in place: the engine runs a selectable body lazily, so the statement
+/// still prepares and the raise follows at fetch - exactly what the
+/// bare-call arm did before this generalised it.
+fn materialise_procedures(
+    plan: &mut Plan,
+    database: &mut Option<Database>,
+    ctx: &SessionCtx,
+) -> Result<bool, ProcErr> {
+    if let Plan::ProcSelect { name, args, cols, picks } = &*plan {
+        let (name, args, cols, picks) =
+            (name.clone(), args.clone(), cols.clone(), picks.clone());
+        // each suspended row projected down to the columns the call
+        // announced, which is what `picks` is for
+        let project = |suspended: &[Vec<Value>]| -> Vec<Vec<Value>> {
+            suspended
+                .iter()
+                .map(|r| {
+                    picks.iter().map(|p| r.get(*p).cloned().unwrap_or(Value::Null)).collect()
+                })
+                .collect()
+        };
+        // BLR-FIRST, exactly as the bare call has always run it: the
+        // compiled bytes when they parse in fire-crab-exe's surface,
+        // the source interpreter otherwise
+        match try_procedure_blr(database, &name, &args, false) {
+            BlrProcOutcome::Rows(suspended, _finals) => {
+                let rows = project(&suspended);
+                *plan = Plan::ProcRows { cols, rows };
+                return Ok(true);
+            }
+            BlrProcOutcome::Runtime(e) => {
+                let e = runtime_with_position(database, &name, &args, ctx, e, false);
+                *plan = Plan::RefusedEval(e);
+                return Ok(true);
+            }
+            BlrProcOutcome::Outside => {}
+        }
+        let (_, suspended) = run_procedure(database, &name, &args, ctx, false)?;
+        let rows = project(&suspended);
+        *plan = Plan::ProcRows { cols, rows };
+        return Ok(true);
+    }
+    match plan {
+        Plan::Derived { inner, .. }
+        | Plan::Modified { inner, .. }
+        | Plan::Returning { inner, .. } => materialise_procedures(inner, database, ctx),
+        Plan::Union { branches, .. } => {
+            let mut any = false;
+            for b in branches.iter_mut() {
+                any |= materialise_procedures(b, database, ctx)?;
+            }
+            Ok(any)
+        }
+        // a bound source reaches the JOIN and GROUP planners wrapped as
+        // a row source, so a grouped read over a procedure hides one
+        // below the plan tree entirely
+        Plan::Join { base, .. } | Plan::JoinGroup { base, .. } | Plan::Lateral { base, .. } => {
+            materialise_procedures_src(base, database, ctx)
+        }
+        _ => Ok(false),
+    }
+}
+
+/// [materialise_procedures] for a [RowSource] - the same reason
+/// [materialise_laterals_src] exists.
+fn materialise_procedures_src(
+    src: &mut RowSource,
+    database: &mut Option<Database>,
+    ctx: &SessionCtx,
+) -> Result<bool, ProcErr> {
+    match src {
+        RowSource::PlanRows(rc) => {
+            let mut inner = (**rc).clone();
+            if materialise_procedures(&mut inner, database, ctx)? {
+                *rc = std::rc::Rc::new(inner);
+                return Ok(true);
+            }
+            Ok(false)
+        }
+        RowSource::Filter { input, .. } | RowSource::Sort { input, .. } => {
+            materialise_procedures_src(input, database, ctx)
+        }
+        _ => Ok(false),
+    }
+}
+
 fn materialise_laterals(
     plan: &Plan,
     db: &Option<Database>,
@@ -48784,10 +48919,105 @@ fn plan_query_inner_ctx(
                             &pname,
                         ))));
                     }
-                    // no WHERE/GROUP/HAVING/ORDER over the call in this
-                    // slice - refuse rather than answer a wrong row set
-                    if w_s.is_some() || g_s.is_some() || h_s.is_some() || o_s.is_some() {
-                        return Some(Plan::Refused);
+                    // A CLAUSE OVER THE CALL - WHERE, GROUP BY, HAVING
+                    // or ORDER BY - is the ORDINARY OUTER QUERY OVER A
+                    // BOUND ROW SOURCE, which is exactly what a VIEW
+                    // already does two branches below: rewrite the FROM
+                    // item to the bound name and hand the whole
+                    // statement to [plan_over_source], which owns the
+                    // projection, the filter, the grouping, the HAVING
+                    // and the ordering. Nothing here re-implements any
+                    // of them.
+                    //
+                    // MEASURED, and the DESCRIBE is what settles the
+                    // shape: `SELECT K FROM GEN(5) WHERE K > 2` keeps
+                    // relation GEN with an EMPTY binding alias;
+                    // `SELECT G.K FROM GEN(5) G WHERE G.K > 2` keeps
+                    // GEN under alias G; a `COUNT(*)` column carries no
+                    // relation at all; a grouped key keeps GEN. Every
+                    // one of those falls out of the bound-source path
+                    // rather than needing a rule of its own.
+                    //
+                    // THE BINDING KEY is the alias when the call
+                    // carries one, else the procedure's bare name.
+                    // [ColBinding] records that an alias is EXCLUSIVE -
+                    // after `FROM T AS X` the engine answers only
+                    // `X.C` - which is the same rule measured for
+                    // procedures, so `GEN.K FROM GEN(5) G` refuses
+                    // without a line of procedure-specific code.
+                    //
+                    // AN AGGREGATE IN THE PROJECTION IS THE SAME THING
+                    // WITHOUT THE CLAUSE, and copying only half of
+                    // [plan_over_source]'s own rule is what left it out:
+                    // there, `grouped` is "a GROUP BY **or** an
+                    // aggregate item". Keying this on the clauses alone
+                    // sent `SELECT COUNT(*) FROM GEN(5)` down to the
+                    // picker below, which refuses a `SelItem::Agg` -
+                    // measured, the engine answers 5, and the GROUPED
+                    // form was already agreeing because it has a clause.
+                    let proj_agg = matches!(
+                        parse_projection(split_query(sql)?.0),
+                        Some(Proj::Items(v)) if v.iter().any(|i| matches!(i, SelItem::Agg(..)))
+                    );
+                    if w_s.is_some() || g_s.is_some() || h_s.is_some() || o_s.is_some() || proj_agg
+                    {
+                        // NOT SELECTABLE still refuses first, as it does
+                        // for the bare call. The generic refusal, not
+                        // the BLR-offset vector: that offset is measured
+                        // for the bare call's BLR only, and a fabricated
+                        // number is worse than the refusal this shape
+                        // already gave ([downgrade_rewritten]).
+                        if meta.prc_type == Some(2) {
+                            return Some(Plan::Refused);
+                        }
+                        // the bound source announces EVERY output
+                        // column: the outer projection belongs to
+                        // plan_over_source, and it may name an
+                        // aggregate or an expression that this branch's
+                        // own picker (below) would refuse.
+                        let all_cols: Vec<ProjCol> = meta
+                            .outs
+                            .iter()
+                            .enumerate()
+                            .map(|(i, p)| {
+                                proc_out_col(
+                                    p.name.clone(),
+                                    Some(p.name.clone()),
+                                    &pname,
+                                    palias.clone(),
+                                    i,
+                                    &p.desc,
+                                )
+                            })
+                            .collect();
+                        let inner = Plan::ProcSelect {
+                            name: pname.clone(),
+                            args: args.clone(),
+                            cols: all_cols.clone(),
+                            picks: (0..meta.outs.len()).collect(),
+                        };
+                        let key = palias.clone().unwrap_or_else(|| {
+                            pname.rsplit('.').next().unwrap_or(pname.as_str()).to_string()
+                        });
+                        let bound = sql_over_from(sql, &render_canon_ref(&key));
+                        if trace {
+                            eprintln!(
+                                "[srv] plan: procedure {} as a bound row source, key {:?}",
+                                pname, key
+                            );
+                        }
+                        return Some(
+                            plan_over_source(
+                                &bound,
+                                &key,
+                                &all_cols,
+                                BoundSrc::Inner(inner),
+                                db,
+                                params,
+                                palias.as_deref(),
+                            )
+                            .unwrap_or(Plan::Refused),
+                        );
                     }
                     // the projection picks output parameters by name
                     let out_names: Vec<String> =
@@ -92852,64 +93082,26 @@ fn after_auth(
                         },
                     }
                     continue;
-                } else if matches!(&*plan, Plan::ProcSelect { .. }) {
-                    // a selectable procedure: run the body HERE (it may
-                    // write) and keep the rows it SUSPENDed for the fetch
-                    let (pname, pargs, pcols, picks) = match &*plan {
-                        Plan::ProcSelect { name, args, cols, picks } => {
-                            (name.clone(), args.clone(), cols.clone(), picks.clone())
-                        }
-                        _ => unreachable!(),
-                    };
+                } else if plan_has_procselect(&plan) {
+                    // A SELECTABLE PROCEDURE ANYWHERE IN THE PLAN: the
+                    // bare call, and now also a derived table, a grouped
+                    // fold or a join built over one by
+                    // [plan_over_source]. The body is DEFERRED - it has
+                    // to run before there are any rows for the nodes
+                    // above it to filter, sort or fold - and op_execute
+                    // is the only place holding both `&mut database` and
+                    // the session the body may write through.
+                    //
+                    // This replaces the bespoke bare-call arm: the walk
+                    // substitutes every ProcSelect leaf wherever it sits,
+                    // which is the whole difference between "a procedure
+                    // IS the statement" and "a procedure is a leaf the
+                    // ordinary machinery reads".
                     let ctx = SessionCtx { user, attach_id };
-                    // BLR-FIRST: the compiled bytes when they parse
-                    // in fire-crab-exe's surface, the source
-                    // interpreter otherwise - and a RUNTIME error
-                    // from the executed body is a real SQL error
-                    match try_procedure_blr(&database, &pname, &pargs, false) {
-                        BlrProcOutcome::Rows(suspended, _finals) => {
-                            let rows: Vec<Vec<Value>> = suspended
-                                .iter()
-                                .map(|r| {
-                                    picks
-                                        .iter()
-                                        .map(|p| {
-                                            r.get(*p).cloned().unwrap_or(Value::Null)
-                                        })
-                                        .collect()
-                                })
-                                .collect();
-                            plan = std::rc::Rc::new(Plan::ProcRows { cols: pcols, rows });
-                            respond(&mut s, &mut enc, resp_tx)?;
-                            continue;
-                        }
-                        BlrProcOutcome::Runtime(e) => {
-                            // ANNOUNCED, RAISED AT FETCH: the engine
-                            // runs a selectable body lazily, so its
-                            // error follows the header
-                            let e = runtime_with_position(
-                                &mut database, &pname, &pargs, &ctx, e, false,
-                            );
-                            plan = std::rc::Rc::new(Plan::RefusedEval(e));
-                            respond(&mut s, &mut enc, resp_tx)?;
-                            continue;
-                        }
-                        BlrProcOutcome::Outside => {}
-                    }
-                    match run_procedure(&mut database, &pname, &pargs, &ctx, false) {
-                        Ok((_, suspended)) => {
-                            // project each suspended row down to the
-                            // columns the select list asked for
-                            let rows: Vec<Vec<Value>> = suspended
-                                .iter()
-                                .map(|r| {
-                                    picks
-                                        .iter()
-                                        .map(|p| r.get(*p).cloned().unwrap_or(Value::Null))
-                                        .collect()
-                                })
-                                .collect();
-                            plan = std::rc::Rc::new(Plan::ProcRows { cols: pcols, rows });
+                    let mut p = (*plan).clone();
+                    match materialise_procedures(&mut p, &mut database, &ctx) {
+                        Ok(_) => {
+                            plan = std::rc::Rc::new(p);
                             respond(&mut s, &mut enc, resp_tx)?;
                         }
                         Err(e) => {

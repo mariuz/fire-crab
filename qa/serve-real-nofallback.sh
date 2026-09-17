@@ -231,22 +231,47 @@ both_refuse "rollback to a savepoint never set" "ROLLBACK TO NOSUCHPOINT"
 # one-sided check cannot notice.
 answers "SELECT COUNT(*) FROM T UNION ALL SELECT ID FROM U2"
 
-# A REAL GAP, AND STILL TRUE - kept as a refusal, with the engine's own
-# answer recorded so it carries an expiry date. A SELECTABLE PROCEDURE
-# IS NOT A COMPOSABLE ROW SOURCE HERE: fire-crab answers the bare call
-# and a FIRST over it, and raises on everything else the engine answers.
-# Measured on this fixture:
-#     SELECT K FROM GEN(5)                      both [1 2 3 4 5]
-#     SELECT FIRST 2 K FROM GEN(5)              both [1 2]
-#     SELECT K FROM GEN(5) WHERE K > 2          engine [3 4 5],    fc raises
-#     SELECT K FROM GEN(5) ORDER BY K DESC      engine [5 4 3 2 1], fc raises
-#     SELECT COUNT(*) FROM GEN(5)               engine [5],        fc raises
-#     SELECT K, COUNT(*) FROM GEN(5) GROUP BY K engine 5 rows,     fc raises
-#     GEN(3) JOIN T ON T.ID = G.K               engine 3 rows,     fc raises
-#     SELECT K FROM (SELECT K FROM GEN(5)) ...  engine [3 4 5],    fc raises
-# Every one is a law-safe refusal, not a wrong answer - which is why it
-# stays here rather than being converted.
-refuses "SELECT K FROM GEN(5) WHERE K > 2"
+# THAT GAP IS CLOSED, AND THE EXPIRY DATE IS WHY THIS LINE SAYS SO.
+# It was recorded here as a refusal with the engine's own answers beside
+# it - "kept as a refusal ... so it carries an expiry date" - and the
+# next slice made a selectable procedure a BOUND ROW SOURCE, so the
+# ordinary projection, filter, sort and fold now run over it. EVERY
+# SHAPE THAT WAS LISTED HERE AGREES WITH THE ENGINE NOW - EXCEPT THE
+# JOIN, which is recorded again below rather than quietly dropped:
+#
+#     SELECT K FROM GEN(5) WHERE K > 2          both [3 4 5]
+#     SELECT K FROM GEN(5) ORDER BY K DESC      both [5 4 3 2 1]
+#     SELECT COUNT(*) FROM GEN(5)               both [5]
+#     SELECT K, COUNT(*) FROM GEN(5) GROUP BY K both, 5 rows
+#     SELECT K FROM (SELECT K FROM GEN(5)) ...  both [3 4 5]
+#
+# so they are ANSWERS cells now - which also compare the values against
+# the engine, where a `refuses` line only ever asked this server.
+answers "SELECT K FROM GEN(5) WHERE K > 2"
+answers "SELECT K FROM GEN(5) ORDER BY K DESC"
+answers "SELECT COUNT(*) FROM GEN(5)"
+answers "SELECT K, COUNT(*) FROM GEN(5) GROUP BY K"
+answers "SELECT K FROM (SELECT K FROM GEN(5)) DT WHERE K > 2"
+# ...and the unaliased/aliased controls beside them, so a regression in
+# the binding shows up here rather than only in serve-real-describe
+answers "SELECT K FROM GEN(5)"
+answers "SELECT G.K FROM GEN(5) G WHERE G.K > 2"
+
+# STILL A GAP, and it keeps its expiry date: a procedure JOINED to a
+# table. The bound-source route hands a FROM with a join to
+# plan_join_bound, which this slice did not follow through, so all three
+# spellings still refuse where the engine answers. Measured on this
+# fixture, 2026-09-17:
+#
+#     SELECT G.K, T.S FROM GEN(3) G JOIN T ON T.ID = G.K
+#                                      engine [1 x 2 y 3 <null>], fc raises
+#     SELECT T.S, G.K FROM T JOIN GEN(3) G ON T.ID = G.K
+#                                      engine [x 1 y 2 <null> 3],  fc raises
+#     ... the same with a WHERE        engine [2 3],               fc raises
+#
+# A law-safe refusal rather than a wrong answer, which is why it is
+# recorded here instead of being left to a comment nobody re-measures.
+refuses "SELECT G.K, T.S FROM GEN(3) G JOIN T ON T.ID = G.K"
 
 # --- the lexer's whitespace class --------------------------------------
 # THE ENGINE'S LEXER KNOWS FIVE WHITESPACE CHARACTERS - space, TAB, LF,
