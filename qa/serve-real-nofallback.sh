@@ -195,30 +195,58 @@ answers "SELECT ID, W FROM VJ"
 answers "SELECT COUNT(*) FROM VJ"
 
 # --- NOT supported: each must raise ------------------------------------
-# a PSQL body outside the interpreted surface (see UNSUP above: the
-# EXECUTE STATEMENT it used to hold is converted, so the body moved to
-# the ON EXTERNAL DATA SOURCE form rather than the check being dropped)
-refuses "EXECUTE PROCEDURE UNSUP"
-# a procedure that does not exist
-refuses "EXECUTE PROCEDURE NOSUCHPROC"
-# malformed conditional calls
-refuses "SELECT COALESCE(A) FROM T"
-refuses "SELECT NULLIF(A) FROM T"
-refuses "SELECT IIF(A > 1) FROM T"
-# malformed built-in function calls
-refuses "SELECT UPPER() FROM T"
-refuses "SELECT LEFT(S) FROM T"
-# modifier grammar the engine rejects too
-refuses "SELECT DISTINCT FIRST 2 A FROM T"
-refuses "SELECT SKIP 1 FIRST 2 ID FROM T"
-# a union whose branches are different widths
-refuses "SELECT ID FROM T UNION ALL SELECT ID, W FROM U2"
-# an aggregate branch in a union
-refuses "SELECT COUNT(*) FROM T UNION ALL SELECT ID FROM U2"
-# a WHERE over a procedure call
+#
+# THESE WERE ONE-SIDED, AND ONE OF THEM HAD GONE STALE UNNOTICED.
+# `refuses` asks fire-crab alone: it says "this server raises" and never
+# checks that the ENGINE raises too, so a shape fire-crab later learned
+# to answer CORRECTLY reads here as a failure for ever. That is what
+# happened to the aggregate-union line below - it demanded a refusal the
+# engine does not make, and reported a DIFF on every run, on every
+# binary, for as long as it stood.
+#
+# So each case that the engine also rejects now goes through
+# `both_refuse`, which asserts the ENGINE's refusal first and fails the
+# case if the engine accepts it. Measured 2026-09-17, all thirteen of
+# the old `refuses` lines, against the live engine on this fixture:
+# eleven raise on both, one answers on both (converted), one is a real
+# gap (kept, annotated).
+both_refuse "a PSQL body outside the interpreted surface" "EXECUTE PROCEDURE UNSUP"
+both_refuse "a procedure that does not exist" "EXECUTE PROCEDURE NOSUCHPROC"
+both_refuse "COALESCE with one argument" "SELECT COALESCE(A) FROM T"
+both_refuse "NULLIF with one argument" "SELECT NULLIF(A) FROM T"
+both_refuse "IIF with no branches" "SELECT IIF(A > 1) FROM T"
+both_refuse "UPPER with no argument" "SELECT UPPER() FROM T"
+both_refuse "LEFT with one argument" "SELECT LEFT(S) FROM T"
+both_refuse "DISTINCT before FIRST" "SELECT DISTINCT FIRST 2 A FROM T"
+both_refuse "SKIP before FIRST" "SELECT SKIP 1 FIRST 2 ID FROM T"
+both_refuse "union branches of different widths" "SELECT ID FROM T UNION ALL SELECT ID, W FROM U2"
+both_refuse "rollback to a savepoint never set" "ROLLBACK TO NOSUCHPOINT"
+
+# STALE, NOW CONVERTED: an aggregate branch in a union is not an error
+# at all. Measured, engine and fire-crab alike: `SELECT COUNT(*) FROM T
+# UNION ALL SELECT ID FROM U2` answers [3 1] on both, and so do its
+# neighbours (UNION distinct, SUM, a grouped COUNT, a literal branch).
+# This line was written when unions were a fallback hazard; fire-crab
+# learned to answer them and nobody unrecorded the assertion, which a
+# one-sided check cannot notice.
+answers "SELECT COUNT(*) FROM T UNION ALL SELECT ID FROM U2"
+
+# A REAL GAP, AND STILL TRUE - kept as a refusal, with the engine's own
+# answer recorded so it carries an expiry date. A SELECTABLE PROCEDURE
+# IS NOT A COMPOSABLE ROW SOURCE HERE: fire-crab answers the bare call
+# and a FIRST over it, and raises on everything else the engine answers.
+# Measured on this fixture:
+#     SELECT K FROM GEN(5)                      both [1 2 3 4 5]
+#     SELECT FIRST 2 K FROM GEN(5)              both [1 2]
+#     SELECT K FROM GEN(5) WHERE K > 2          engine [3 4 5],    fc raises
+#     SELECT K FROM GEN(5) ORDER BY K DESC      engine [5 4 3 2 1], fc raises
+#     SELECT COUNT(*) FROM GEN(5)               engine [5],        fc raises
+#     SELECT K, COUNT(*) FROM GEN(5) GROUP BY K engine 5 rows,     fc raises
+#     GEN(3) JOIN T ON T.ID = G.K               engine 3 rows,     fc raises
+#     SELECT K FROM (SELECT K FROM GEN(5)) ...  engine [3 4 5],    fc raises
+# Every one is a law-safe refusal, not a wrong answer - which is why it
+# stays here rather than being converted.
 refuses "SELECT K FROM GEN(5) WHERE K > 2"
-# a rollback to a savepoint that was never set
-refuses "ROLLBACK TO NOSUCHPOINT"
 
 # --- the lexer's whitespace class --------------------------------------
 # THE ENGINE'S LEXER KNOWS FIVE WHITESPACE CHARACTERS - space, TAB, LF,
