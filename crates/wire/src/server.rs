@@ -43291,7 +43291,9 @@ fn split_recursive_body(source: &str) -> Option<(String, String)> {
 /// the same rewrite, renamed columns and all.
 ///
 /// `WITH RECURSIVE` is not this: it is a fixpoint rather than a
-/// substitution, and it refuses.
+/// substitution, so it does not expand here - it is evaluated as one by
+/// the recursive arm in [plan_query_inner]. (This said "and it refuses"
+/// long after that arm was written.)
 fn parse_with(sql: &str) -> Option<(Vec<(String, ViewDef)>, String, bool)> {
     let t = sql.trim().trim_end_matches(';').trim();
     let up = mask_literals(&t.to_ascii_uppercase());
@@ -48715,23 +48717,65 @@ fn plan_query_inner_at(
                         c.name = n.clone();
                     }
                 }
-                let Some(mut acc) = branch_rows(&seed_plan, dbr, &[]) else {
+                let Some(seed_rows) = branch_rows(&seed_plan, dbr, &[]) else {
                     return Some({ if trace { eprintln!("[srv] recursive CTE refused: the seed does not materialise"); } Plan::Refused });
                 };
-                // the engine bounds recursion at 1024 levels; the same
-                // bound here turns a non-terminating fixpoint into an
-                // error rather than a hang
-                let mut frontier = acc.clone();
-                for _ in 0..1024 {
-                    if frontier.is_empty() {
-                        break;
-                    }
+                // THE ENGINE WALKS DEPTH-FIRST, PRE-ORDER - and a
+                // level-at-a-time fixpoint cannot produce that order,
+                // whatever it does with the frontier.
+                //
+                // Measured over a two-root tree: the engine emits
+                // 1,2,4,6,3,5,7,9,10,8 (down each branch to the bottom,
+                // then back up) where a breadth-first queue emits
+                // 1,7,2,3,9,8,4,5,10,6. The projected level makes it
+                // plainer still - 0,1,2,3,1,2,0,1,2,1 against
+                // 0,0,1,1,1,1,2,2,2,3. Siblings and roots follow RECORD
+                // (storage) order, not id order: inserting the same tree
+                // in reverse turns the engine's walk into
+                // 7,8,9,10,1,3,5,2,4,6, and an INDEX on the parent column
+                // changes nothing.
+                //
+                // An earlier note here reasoned that "a stack instead of a
+                // queue would only trade one wrong order for another,
+                // since fire-crab has no record-number model". The first
+                // half is wrong and the second is beside the point: each
+                // expansion already SCANS the table, so the rows come back
+                // in storage order by construction - this server's own
+                // level-1 rows were 2,3,9,8, exactly the engine's sibling
+                // order. What was missing was never the sibling order but
+                // the INTERLEAVING, and that is a stack over ROWS, not
+                // over levels.
+                //
+                // So the frontier becomes a STACK and each row is expanded
+                // ALONE: pop a row, emit it (pre-order: the parent
+                // precedes its children), expand that one row, and push
+                // its children in REVERSE so they pop in storage order.
+                //
+                // THE COST IS REAL AND IS THE POINT OF THE TRADE. The
+                // branch is re-planned once per ROW instead of once per
+                // LEVEL, because `plan_over_source` consumes its
+                // `BoundSrc` at three shape-dependent sites and there is
+                // no single node to re-bind. Measured (attach amortised,
+                // repeatable to the millisecond): a ~950-node BUSHY tree
+                // cost 1 ms at ~3 expansions and costs about 140 ms at one
+                // per row, in the same range as the engine's own time for
+                // that shape; a CHAIN is unchanged, since one row per
+                // level was already one expansion per row. A wrong row
+                // order is a wrong answer, which outranks the speed of a
+                // shape this server was only fast at because it was
+                // answering in the wrong order.
+                let mut acc: Vec<Vec<Value>> = Vec::with_capacity(seed_rows.len());
+                let mut stack: Vec<(Vec<Value>, usize)> =
+                    seed_rows.into_iter().rev().map(|r| (r, 1usize)).collect();
+                while let Some((row, depth)) = stack.pop() {
+                    // pre-order: the row is answered BEFORE its subtree
+                    acc.push(row.clone());
                     let mut rec_params: Vec<Option<Descriptor>> = Vec::new();
                     let step = plan_over_source(
                         &rec_sql,
                         name,
                         &cols,
-                        BoundSrc::Rows(frontier),
+                        BoundSrc::Rows(vec![row]),
                         db,
                         &mut rec_params,
                         Some(name),
@@ -48772,11 +48816,28 @@ fn plan_query_inner_at(
                     let Some(next) = branch_rows(&step, dbr, &[]) else {
                         return Some({ if trace { eprintln!("[srv] recursive CTE refused: the recursive branch does not materialise"); } Plan::Refused });
                     };
-                    frontier = next.clone();
-                    acc.extend(next);
-                }
-                if !frontier.is_empty() {
-                    return Some({ if trace { eprintln!("[srv] recursive CTE refused: did not converge in 1024 levels"); } Plan::Refused }); // did not converge
+                    // PAST THE ENGINE'S BOUND IS A RAISE, NOT A REFUSAL.
+                    // Measured: a chain of 1023 and of 1024 answer in full,
+                    // 1025 raises SQLSTATE 54001 *Too many concurrent
+                    // executions of the same request*, and a CYCLE raises
+                    // the same way - the engine does not detect cycles, it
+                    // simply recurses until the bound. This server answered
+                    // a bare 42000 for both. The test is "a node at the
+                    // bound still has children", so the 1024-deep chain
+                    // (whose last node has none) answers and the 1025-deep
+                    // one raises, exactly as the engine splits them.
+                    if !next.is_empty() && depth >= 1024 {
+                        if trace {
+                            eprintln!("[srv] recursive CTE: past 1024 levels - the engine's 54001");
+                        }
+                        return Some(Plan::RefusedEval(EvalErr::TooManyClones));
+                    }
+                    // REVERSED so they pop in storage order: the stack
+                    // hands back the last one pushed, and the engine visits
+                    // siblings in the order the scan delivered them.
+                    for child in next.into_iter().rev() {
+                        stack.push((child, depth + 1));
+                    }
                 }
                 if trace {
                     eprintln!("[srv] plan: recursive CTE {} produced {} rows", name, acc.len());
@@ -48810,16 +48871,13 @@ fn plan_query_inner_at(
                 // duplicates survive, never which rows - and stays allowed;
                 // the pure-order, no-limit walk is a known order-only gap,
                 // not a wrong set, and is left answering.)
-                if (skip > 0 || take.is_some())
-                    && split_query(&final_sql).and_then(|q| q.5).is_none()
-                {
-                    return Some({
-                        if trace {
-                            eprintln!("[srv] recursive CTE refused: FIRST/SKIP/ROWS without a top-level ORDER BY (BFS picks different rows than the engine's DFS)");
-                        }
-                        Plan::Refused
-                    });
-                }
+                // (That refusal is gone: the walk above is now the engine's
+                // own depth-first order, so a FIRST/SKIP/ROWS slice takes
+                // the SAME rows it does. Measured before the change:
+                // `FIRST 4` of a tree walk answered 1,2,4,6 on the engine
+                // and refused here; `SKIP 2` and `ROWS 4` likewise, and so
+                // did a table-less counter CTE, while the same modifiers
+                // over a plain CTE or a derived table always agreed.)
                 // the CTE's name IS the binding alias (probed: a bare
                 // recursive CTE R answers relation_alias R)
                 let plan = plan_over_source(
@@ -59508,6 +59566,14 @@ fn eval_status_items(w: &mut W, e: &EvalErr) {
                     .bytes(kw.as_bytes());
             }
         }
+        // ALONE, with no wrapper: the engine's isql prints one line for
+        // this - "Statement failed, SQLSTATE = 54001 / Too many concurrent
+        // executions of the same request" - where a divide by zero or a
+        // failed transliteration carries `isc_arith_except` in front.
+        EvalErr::TooManyClones => {
+            w.int(1) // isc_arg_gds
+                .int(GDS_REQ_MAX_CLONES);
+        }
         EvalErr::ReadOnlyView(name) => {
             w.int(1) // isc_arg_gds
                 .int(GDS_READ_ONLY_VIEW)
@@ -68475,6 +68541,19 @@ enum EvalErr {
     /// error a body can raise gets them: measured, a division by zero
     /// inside a procedure carries the same item a user exception does.
     AtProcedure { inner: Box<EvalErr>, at: Vec<String> },
+    /// a recursion that went past the engine's depth bound:
+    /// `isc_req_max_clones_exceeded` ([GDS_REQ_MAX_CLONES], SQLSTATE
+    /// 54001, *Too many concurrent executions of the same request*),
+    /// emitted ALONE - the engine's isql prints exactly the one line, with
+    /// no arithmetic-exception wrapper and no argument.
+    ///
+    /// Measured on a recursive CTE over a chain of N: 1023 and 1024 answer
+    /// in full, 1025 raises, and a CYCLE raises the same way once it has
+    /// descended that far (the engine does not detect cycles - it simply
+    /// recurses until the bound). The FK-cascade path reaches the same
+    /// status code through `ExecErr::Gds` at its own depth
+    /// (`MAX_FK_ACTION_DEPTH`); the limits differ, the diagnosis does not.
+    TooManyClones,
 }
 
 /// What an expression's result is typed as - which drives its wire form

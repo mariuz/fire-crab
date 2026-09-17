@@ -60,6 +60,24 @@ make_db() {
 CREATE DATABASE '$1' USER '$U' PASSWORD '$P' PAGE_SIZE 8192;
 CREATE TABLE ORG (ID INTEGER, PARENT INTEGER, NAME VARCHAR(6));
 CREATE TABLE T (ID INTEGER, N INTEGER, V VARCHAR(10));
+-- THE WALK-ORDER TABLES. ORG is left exactly as it was: existing cells
+-- select from it, so an extra row would move their result sets.
+--   TREE  two roots, uneven depth, siblings inserted OUT of id order (9
+--         before 8) and ONE ORPHAN (99 under a parent that does not
+--         exist) which must never appear in a walk;
+--   DIA   a diamond - 4 is reachable under both 2 and 3, so a depth-first
+--         walk emits it TWICE, once per path;
+--   DUP   two identical rows, which UNION ALL keeps;
+--   CYC   a cycle reachable from the root: the engine does not detect it,
+--         it recurses until the depth bound and raises 54001;
+--   CH    a 1025-deep chain. Seeded at the root it is 1025 deep and
+--         raises; seeded at ID=2 it is 1024 and answers; at ID=3, 1023.
+--         One table, all three sides of the bound.
+CREATE TABLE TREE (ID INTEGER, PARENT INTEGER);
+CREATE TABLE DIA  (ID INTEGER, PARENT INTEGER);
+CREATE TABLE DUP  (ID INTEGER, PARENT INTEGER);
+CREATE TABLE CYC  (ID INTEGER, PARENT INTEGER);
+CREATE TABLE CH   (ID INTEGER, PARENT INTEGER);
 COMMIT;
 INSERT INTO ORG VALUES (1, NULL, 'root');
 INSERT INTO ORG VALUES (2, 1, 'a');
@@ -72,6 +90,38 @@ INSERT INTO T VALUES (2, 20, 'b');
 INSERT INTO T VALUES (3, 30, 'c');
 INSERT INTO T VALUES (4, 40, 'd');
 INSERT INTO T VALUES (5, 50, NULL);
+INSERT INTO TREE VALUES (1, NULL);
+INSERT INTO TREE VALUES (2, 1);
+INSERT INTO TREE VALUES (3, 1);
+INSERT INTO TREE VALUES (4, 2);
+INSERT INTO TREE VALUES (5, 3);
+INSERT INTO TREE VALUES (6, 4);
+INSERT INTO TREE VALUES (7, NULL);
+INSERT INTO TREE VALUES (9, 7);
+INSERT INTO TREE VALUES (8, 7);
+INSERT INTO TREE VALUES (10, 9);
+INSERT INTO TREE VALUES (99, 77);
+INSERT INTO DIA VALUES (1, NULL);
+INSERT INTO DIA VALUES (2, 1);
+INSERT INTO DIA VALUES (3, 1);
+INSERT INTO DIA VALUES (4, 2);
+INSERT INTO DIA VALUES (5, 3);
+INSERT INTO DIA VALUES (4, 3);
+INSERT INTO DUP VALUES (1, NULL);
+INSERT INTO DUP VALUES (2, 1);
+INSERT INTO DUP VALUES (2, 1);
+INSERT INTO CYC VALUES (1, NULL);
+INSERT INTO CYC VALUES (2, 1);
+INSERT INTO CYC VALUES (3, 2);
+INSERT INTO CYC VALUES (1, 3);
+COMMIT;
+SET TERM ^ ;
+EXECUTE BLOCK AS DECLARE I INTEGER; BEGIN
+  I = 1;
+  INSERT INTO CH VALUES (1, NULL);
+  WHILE (I < 1025) DO BEGIN INSERT INTO CH VALUES (:I + 1, :I); I = I + 1; END
+END^
+SET TERM ; ^
 COMMIT;
 EOF
     chmod 666 "$1"
@@ -290,6 +340,60 @@ refuses "a LEFT JOIN to the recursive reference" \
         UNION ALL SELECT O.ID, O.PARENT, C.LVL+1 FROM ORG O LEFT JOIN C ON O.PARENT = C.ID)
       SELECT ID, LVL FROM C ORDER BY ID"
 
+# --- THE WALK ORDER: the engine goes DEPTH-FIRST, PRE-ORDER ------------
+# Every cell above pins its order with ORDER BY or walks a CHAIN, where a
+# depth-first and a breadth-first walk are the same sequence - which is why
+# a level-at-a-time fixpoint sat here for so long looking correct. It is
+# not: over a TREE the engine descends each branch to the bottom before
+# taking the next sibling, and a queue answers by level.
+#
+# Measured against the engine, with no ORDER BY anywhere:
+#   ORG        1,2,4,5,3            (a queue gives 1,2,3,4,5)
+#   TREE       1,2,4,6,3,5,7,9,10,8 (a queue gives 1,7,2,3,9,8,4,5,10,6)
+#   the LEVEL  0,1,2,3,1,2,0,1,2,1  (a queue gives 0,0,1,1,1,1,2,2,2,3)
+# Siblings and roots follow RECORD order, not id order - TREE's 9 is
+# inserted before its 8 and comes back first - and the orphan 99 never
+# enters any walk.
+ORGW="WITH RECURSIVE C AS (SELECT ID, PARENT FROM ORG WHERE PARENT IS NULL
+        UNION ALL SELECT O.ID, O.PARENT FROM ORG O JOIN C ON O.PARENT = C.ID)"
+TRW="WITH RECURSIVE C AS (SELECT ID, PARENT, 0 AS LVL FROM TREE WHERE PARENT IS NULL
+        UNION ALL SELECT T2.ID, T2.PARENT, C.LVL+1 FROM TREE T2 JOIN C ON T2.PARENT = C.ID)"
+both "a bare ORG walk is depth-first"        "$ORGW SELECT ID FROM C"
+both "a two-root tree, uneven depth"         "$TRW SELECT ID FROM C"
+both "...and the LEVEL it reports"           "$TRW SELECT LVL FROM C"
+both "one root only"                         "WITH RECURSIVE C AS (SELECT ID, PARENT FROM TREE WHERE ID = 1
+        UNION ALL SELECT T2.ID, T2.PARENT FROM TREE T2 JOIN C ON T2.PARENT = C.ID) SELECT ID FROM C"
+both "the other root, siblings 9 then 8"     "WITH RECURSIVE C AS (SELECT ID, PARENT FROM TREE WHERE ID = 7
+        UNION ALL SELECT T2.ID, T2.PARENT FROM TREE T2 JOIN C ON T2.PARENT = C.ID) SELECT ID FROM C"
+both "a WHERE over the walk keeps the order"  "$TRW SELECT ID FROM C WHERE LVL > 0"
+# a DIAMOND: 4 hangs under both 2 and 3, so it is emitted TWICE - once per
+# path, each at its own place in the walk (the engine does not de-duplicate)
+both "a diamond emits the node once per path" "WITH RECURSIVE C AS (SELECT ID, PARENT FROM DIA WHERE PARENT IS NULL
+        UNION ALL SELECT D.ID, D.PARENT FROM DIA D JOIN C ON D.PARENT = C.ID) SELECT ID FROM C"
+both "duplicate rows are kept, adjacent"      "WITH RECURSIVE C AS (SELECT ID, PARENT FROM DUP WHERE PARENT IS NULL
+        UNION ALL SELECT D.ID, D.PARENT FROM DUP D JOIN C ON D.PARENT = C.ID) SELECT ID FROM C"
+
+# --- FIRST / SKIP / ROWS over a walk, which used to REFUSE --------------
+# A slice of a walk takes the rows the walk's ORDER puts first, so while
+# the order was wrong the slice was a confident WRONG ROWSET and this gate
+# refused it. With the order right the refusal is gone and the rows match:
+# `FIRST 4` is the engine's 1,2,4,6, not a queue's 1,7,2,3.
+both "FIRST 4 of a walk"                      "$TRW SELECT FIRST 4 ID FROM C"
+both "SKIP 2 of a walk"                       "$TRW SELECT SKIP 2 ID FROM C"
+both "ROWS 4 of a walk"                       "$TRW SELECT ID FROM C ROWS 4"
+
+# --- the DEPTH BOUND is a RAISE, not a refusal -------------------------
+# Measured: 1023 and 1024 levels answer in full, 1025 raises SQLSTATE
+# 54001 *Too many concurrent executions of the same request*, and a CYCLE
+# raises the same way - the engine does not detect cycles, it recurses
+# until the bound. This server answered a bare 42000 for both.
+CHW="UNION ALL SELECT H.ID, H.PARENT FROM CH H JOIN C ON H.PARENT = C.ID) SELECT COUNT(*) AS N FROM C"
+both "1023 levels answer"   "WITH RECURSIVE C AS (SELECT ID, PARENT FROM CH WHERE ID = 3 $CHW"
+both "1024 levels answer"   "WITH RECURSIVE C AS (SELECT ID, PARENT FROM CH WHERE ID = 2 $CHW"
+both "1025 levels raise 54001" "WITH RECURSIVE C AS (SELECT ID, PARENT FROM CH WHERE PARENT IS NULL $CHW"
+both "a cycle raises the same 54001" "WITH RECURSIVE C AS (SELECT ID, PARENT FROM CYC WHERE PARENT IS NULL
+        UNION ALL SELECT Y.ID, Y.PARENT FROM CYC Y JOIN C ON Y.PARENT = C.ID) SELECT COUNT(*) AS N FROM C"
+
 # the engine's verdict on each of the above, so this gate cannot drift
 # into asserting a refusal the engine does not share
 engine_errs() { # <label> <sql>
@@ -315,8 +419,8 @@ engine_errs "UNION rather than UNION ALL" \
         UNION SELECT N+1 FROM C WHERE N < 3) SELECT N FROM C"
 
 rm -f "$A" "$B"
-if [ "$ran" -lt 43 ]; then
-    echo "DIFF only $ran checks ran (expected at least 43) - did one silently skip?"
+if [ "$ran" -lt 57 ]; then
+    echo "DIFF only $ran checks ran (expected at least 57) - did one silently skip?"
     fail=1
 fi
 exit $fail
