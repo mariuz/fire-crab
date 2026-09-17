@@ -127,6 +127,63 @@ both() { # <label> <sql>
         fail=1
     fi
 }
+# THE PARAMETERIZED TWINS. `query`/`both` above bind nothing - this
+# gate predated bound parameters in a derived body - so a `?` inside one
+# needs its own helper that ships the argument message.
+queryq() { # <sql> <json args> <port> <db>
+    FC_Q="$1" FC_A="$2" FC_PORT="$3" FC_DB="$4" node -e '
+      process.on("uncaughtException", () => { console.log("CONN_ERR"); process.exit(0); });
+      const F=require("node-firebird");
+      F.attach({host:"127.0.0.1",port:+process.env.FC_PORT,database:process.env.FC_DB,
+                user:"SYSDBA",password:"masterkey"},(e,db)=>{
+        if(e){console.log("CONN_ERR");process.exit(0);}
+        db.query(process.env.FC_Q,JSON.parse(process.env.FC_A),(e2,r)=>{
+          if(e2){console.log("ERR "+(e2.message||"").split("\n")[0].slice(0,50));db.detach();process.exit(0);}
+          console.log(JSON.stringify(Array.isArray(r)?r:(r?[r]:[])));
+          db.detach();process.exit(0);});});' 2>/dev/null
+}
+bothq() { # <label> <sql> <json args>
+    ran=$((ran + 1))
+    a=$(queryq "$2" "$3" "$PORT" "$A")
+    b=$(queryq "$2" "$3" "$REAL" "$B")
+    # A SIDE THAT DID NOT ANSWER IS NOT AGREEMENT. Two CONN_ERRs compare
+    # equal and score OK while measuring nothing - which is exactly what
+    # happened when these cells sat below the blocking sections.
+    if [ "$a" = "CONN_ERR" ] || [ "$b" = "CONN_ERR" ] || [ -z "$a" ] || [ -z "$b" ]; then
+        echo "DIFF $1 $3 [VACUOUS: a side did not answer] fcwire=[$a] engine=[$b]"
+        fail=1
+        return
+    fi
+    if [ "$a" = "$b" ]; then
+        echo "OK   $1 $3: $a"
+    else
+        echo "DIFF $1 $3"
+        echo "     fcwire: $a"
+        echo "     engine: $b"
+        fail=1
+    fi
+}
+# a recorded refusal that carries the ENGINE's answer, so it EXPIRES
+# ITSELF the day fire-crab answers it
+refusesq() { # <label> <sql> <json args>
+    ran=$((ran + 1))
+    a=$(queryq "$2" "$3" "$PORT" "$A")
+    if [ "$a" = "CONN_ERR" ] || [ -z "$a" ]; then
+        echo "DIFF $1 [VACUOUS: fcwire did not answer at all]"
+        fail=1
+        return
+    fi
+    case "$a" in
+        ERR*) echo "OK   refusal kept (engine answers): $1" ;;
+        *) b=$(queryq "$2" "$3" "$REAL" "$B")
+           if [ "$a" = "$b" ]; then
+               echo "OK   $1 now agrees: $a (update the refusal list)"
+           else
+               echo "DIFF $1: fcwire [$a] engine [$b]"; fail=1
+           fi ;;
+    esac
+}
+
 refuses() { # <label> <sql>
     ran=$((ran + 1))
     r=$(query "$2" "$PORT" "$A")
@@ -264,6 +321,66 @@ both "a select-list subquery still splits" \
 both "SUBSTRING's own FROM keyword still splits" \
      "SELECT COUNT(*) FROM EMP WHERE SUBSTRING(NAME FROM 1 FOR 1) = 'a'"
 
+# NOTE: these live ABOVE the blocking sections below. fcwire serves
+# connections SERIALLY, so the cells that deliberately block leave
+# nothing able to attach after them - a cell placed below answered
+# CONN_ERR on BOTH sides and scored a vacuous OK.
+# --- a ? INSIDE the derived body --------------------------------------
+# It used to refuse outright: the inner query was planned into a FRESH
+# sink and any slot it claimed killed the statement ("a `?` inside a
+# derived table"). That took ORDINARY SQL with it - there is no procedure
+# anywhere in `SELECT ID FROM (SELECT ID FROM EMP WHERE ID > ?) X`.
+# The inner now plans into the STATEMENT's sink at its text-position
+# base, so slots number left to right across the nesting.
+#
+# Every predicate is paired with a twin that must answer NOTHING.
+bothq "an inner WHERE ?" "SELECT ID FROM (SELECT ID FROM EMP WHERE ID > ?) X ORDER BY ID" '[3]'
+bothq "...an inner WHERE ? that EXCLUDES" "SELECT ID FROM (SELECT ID FROM EMP WHERE ID > ?) X ORDER BY ID" '[99]'
+bothq "an inner ? and an outer ?" "SELECT ID FROM (SELECT ID FROM EMP WHERE ID > ?) X WHERE ID < ? ORDER BY ID" '[1,4]'
+bothq "...the OUTER half excludes" "SELECT ID FROM (SELECT ID FROM EMP WHERE ID > ?) X WHERE ID < ? ORDER BY ID" '[1,2]'
+bothq "...the INNER half excludes" "SELECT ID FROM (SELECT ID FROM EMP WHERE ID > ?) X WHERE ID < ? ORDER BY ID" '[99,4]'
+bothq "a NESTED derived table's ?" "SELECT ID FROM (SELECT ID FROM (SELECT ID FROM EMP WHERE ID > ?) E) X ORDER BY ID" '[3]'
+bothq "a CTE body's ?" "WITH C AS (SELECT ID FROM EMP WHERE ID > ?) SELECT ID FROM C ORDER BY ID" '[3]'
+bothq "a CTE body's ? and an outer ?" "WITH C AS (SELECT ID FROM EMP WHERE ID > ?) SELECT ID FROM C WHERE ID < ? ORDER BY ID" '[1,4]'
+bothq "an inner ? over a TEXT column" "SELECT NAME FROM (SELECT NAME FROM EMP WHERE NAME > ?) X ORDER BY NAME" '["c"]'
+# ...but NOT with a JOIN or a FOLD above it - both still refuse, and the
+# gate found that: they were written as live cells on the strength of a
+# hand-probe that never covered them. Recorded rather than dropped, so
+# each carries the engine's answer and expires itself.
+refusesq "an inner ? with a JOIN above it" "SELECT X.ID FROM (SELECT ID, DEPT_ID FROM EMP WHERE ID > ?) X JOIN DEPT D ON D.ID = X.DEPT_ID ORDER BY X.ID" '[1]'
+refusesq "an aggregate over an inner ?" "SELECT COUNT(*) AS N FROM (SELECT ID FROM EMP WHERE ID > ?) X" '[3]'
+refusesq "a GROUP BY over an inner ?" "SELECT DEPT_ID, COUNT(*) AS N FROM (SELECT ID, DEPT_ID FROM EMP WHERE ID > ?) X GROUP BY DEPT_ID" '[1]'
+# the LITERAL-argument twins of both shapes answer, which is what says
+# only the BOUND half is missing rather than the shape itself
+both "a JOIN above a LITERAL inner predicate" "SELECT X.ID FROM (SELECT ID, DEPT_ID FROM EMP WHERE ID > 1) X JOIN DEPT D ON D.ID = X.DEPT_ID ORDER BY X.ID"
+both "an aggregate over a LITERAL inner predicate" "SELECT COUNT(*) AS N FROM (SELECT ID FROM EMP WHERE ID > 3) X"
+# the controls: these worked BEFORE, so they say the cells above measure
+# the inner-? path specifically
+bothq "CONTROL an outer ? only" "SELECT ID FROM (SELECT ID FROM EMP) X WHERE ID > ? ORDER BY ID" '[3]'
+both "CONTROL a literal inner predicate" "SELECT ID FROM (SELECT ID FROM EMP WHERE ID > 3) X ORDER BY ID"
+
+# RECORDED, NOT FIXED - each carries the engine's answer and expires
+# itself. Both are law-safe refusals, never wrong answers:
+#   - an OUTER PROJECTION `?` above a derived body that also has one.
+#     The outer projection is textually FIRST, but the inner plans into
+#     the sink before the outer projection is renumbered, so
+#     plan_over_source (which infers its base from `params.len()`)
+#     numbers the projection AFTER the inner's slots. It needs an
+#     EXPLICIT base rather than an inferred one.
+#   - a `?` in the INNER PROJECTION: nothing binds it at execute -
+#     bind_plan_params reaches the top-level plan's columns only.
+#   - a derived SIDE OF A JOIN keeps its own copy of the old guard
+#     (plan_join_bound), whose base needs per-side text offsets - which
+#     is also why a JOIN sits above an inner `?` refuses ("JOIN plan
+#     failed" in the trace).
+#   - an AGGREGATE or GROUP BY above an inner `?` takes the
+#     bound-row-source route, where plan_over_source infers its base from
+#     `params.len()` - the same inferred-base limit as the outer
+#     projection above. One explicit base would retire all three.
+refusesq "an outer projection ? above an inner ?" "SELECT CAST(? AS INTEGER) AS C, ID FROM (SELECT ID FROM EMP WHERE ID > ?) X ORDER BY ID" '[42,3]'
+refusesq "a ? in the INNER projection" "SELECT C FROM (SELECT CAST(? AS INTEGER) AS C FROM EMP) X" '[5]'
+refusesq "a derived SIDE of a join" "SELECT X.ID FROM DEPT D JOIN (SELECT ID, DEPT_ID FROM EMP WHERE ID > ?) X ON D.ID = X.DEPT_ID ORDER BY X.ID" '[1]'
+
 # --- a materialised row source carries its rows' OWN error ------------
 # branch_rows answered an Option, so "this shape is unserved" and "the
 # rows RAISED" came back identically - and every caller that needed an
@@ -388,8 +505,8 @@ rm -f "$A" "$B"
 
 
 
-if [ "$ran" -lt 60 ]; then
-    echo "DIFF only $ran checks ran (expected at least 60) - did one silently skip?"
+if [ "$ran" -lt 77 ]; then
+    echo "DIFF only $ran checks ran (expected at least 77) - did one silently skip?"
     fail=1
 fi
 exit $fail

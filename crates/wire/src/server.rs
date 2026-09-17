@@ -47915,6 +47915,23 @@ fn plan_query_inner_ctx(
     params: &mut Vec<Option<Descriptor>>,
     in_view: bool,
 ) -> Option<Plan> {
+    plan_query_inner_at(sql, db, params, in_view, 0)
+}
+
+/// [plan_query_inner_ctx] over text whose `?` do NOT start at slot zero.
+/// A DERIVED TABLE is planned from inside its enclosing statement, and
+/// slots are numbered by TEXT POSITION across the whole statement - so
+/// everything written before the derived span has already claimed its
+/// slots and the inner query must number after them (measured: `SELECT
+/// CAST(? AS INTEGER) C, ID FROM (SELECT ID FROM T WHERE ID > ?) D` is
+/// two slots, the PROJECTION's first). Zero for a whole statement.
+fn plan_query_inner_at(
+    sql: &str,
+    db: &Option<Database>,
+    params: &mut Vec<Option<Descriptor>>,
+    in_view: bool,
+    base: usize,
+) -> Option<Plan> {
     let trace = std::env::var("FC_SRV_TRACE").is_ok();
     {
         let up = sql.trim().trim_end_matches(';').trim().to_ascii_uppercase();
@@ -48480,15 +48497,33 @@ fn plan_query_inner_ctx(
     });
     if let Some(_dbr) = db.as_ref() {
         if let Some((inner_sql, alias, declared)) = parse_derived_table(table_s) {
-            let mut inner_params: Vec<Option<Descriptor>> = Vec::new();
-            let Some(inner) = plan_query_inner(&inner_sql, db, &mut inner_params) else {
+            // A `?` INSIDE THE DERIVED BODY numbers by TEXT POSITION, so
+            // the inner query plans into THIS statement's sink starting
+            // after everything written before the derived span - which
+            // is the same count [arg_base] takes for a procedure call's
+            // arguments. It used to refuse outright (a fresh sink, then
+            // "a `?` inside a derived table"), which took ordinary SQL
+            // with it: `SELECT ID FROM (SELECT ID FROM T WHERE ID > ?) D`
+            // has no procedure in it at all.
+            let dbase = {
+                let (h, q) = (sql.as_ptr() as usize, table_s.as_ptr() as usize);
+                if q < h || q > h + sql.len() {
+                    return Some(Plan::Refused);
+                }
+                mask_literals(&sql[..q - h]).matches('?').count()
+            };
+            let Some(inner) = plan_query_inner_at(&inner_sql, db, params, false, dbase) else {
                 if trace {
                     eprintln!("[srv] plan: derived table {:?} not planned", inner_sql);
                 }
                 return Some(Plan::Refused);
             };
-            if !inner_params.is_empty() {
-                return Some(Plan::Refused); // a `?` inside a derived table
+            // ...EXCEPT a `?` in the inner PROJECTION, which nothing
+            // binds at execute: [bind_plan_params] reaches the top-level
+            // plan's columns only, so the inner's would evaluate unbound
+            // - a wrong answer where a refusal is honest.
+            if plan_has_proj_param(&inner) {
+                return Some(Plan::Refused);
             }
             let mut inner_cols = output_cols_of(&inner);
             if inner_cols.is_empty() {
@@ -49678,7 +49713,7 @@ fn plan_query_inner_ctx(
     // number the projection's `?` parameters FIRST, so they take the
     // leading input-SQLDA slots and the WHERE clause's own number after
     // them - the engine's textual order
-    let proj_params = renumber_proj_params(&mut proj);
+    let proj_params = renumber_proj_params_from(&mut proj, base);
     // A MALFORMED CONDITIONAL CALL MUST RAISE. When the expression
     // parser declines `COALESCE(A)` - one operand where two are needed -
     // the text falls through to the column resolver, which looks for a
@@ -49855,7 +49890,11 @@ fn plan_query_inner_ctx(
 
     // parse + resolve the optional WHERE clause - its `?`s number AFTER
     // the projection's (proj_params leading slots)
-    let mut next_param = proj_params;
+    // ...and AFTER anything the FROM itself claimed: a derived table
+    // plans into this same sink, so its slots already sit between the
+    // projection's and the WHERE's ([plan_join_bound] floors its own
+    // numbering the same way).
+    let mut next_param = params.len().max(proj_params);
     // When subqueries FOLD, the original text still spells `(SELECT`,
     // which the optimizer gatekeeper refuses - the outer retrieval
     // would always scan (probed: engine T INDEX (RDB$PRIMARY1) where
