@@ -51,11 +51,20 @@ rm -f "$SRC" "$CLEAN" "$WORK"
 "$ISQL" -q -b -user "$U" -pas "$P" <<EOF || { echo "FAIL scratch db creation"; exit 1; }
 CREATE DATABASE '$SRC' USER '$U' PASSWORD '$P' PAGE_SIZE 8192;
 CREATE TABLE T (ID INTEGER, NAME VARCHAR(20), SAL NUMERIC(9,2));
+CREATE SEQUENCE SQQ;
+COMMIT;
+SET TERM ^ ;
+CREATE PROCEDURE PU (A VARCHAR(10), B INTEGER) RETURNS (K INTEGER) AS BEGIN K = B; SUSPEND; END^
+SET TERM ; ^
 COMMIT;
 INSERT INTO T VALUES (1, 'seed', 10.50);
 COMMIT;
 EOF
 cp "$SRC" "$CLEAN"; cp "$CLEAN" "$WORK"
+# the live engine serves $CLEAN over 3050 for the differential
+# flag battery; it runs as its own user, so the copies must be
+# openable by it (the harness law for engine-served fixtures)
+chmod 666 "$SRC" "$CLEAN" "$WORK" 2>/dev/null || true
 
 "$FCWIRE" serve "127.0.0.1:$PORT" "$U" "$P" >/tmp/fc-serve-pydriver.log 2>&1 &
 srv=$!
@@ -75,7 +84,7 @@ kill -0 $srv 2>/dev/null || {
 
 # the whole battery runs inside one python process; it prints one
 # "OK <label>" / "DIFF <label> ..." line per check and a final RC
-FC_DB="$WORK" FC_PORT="$PORT" FC_U="$U" FC_P="$P" "$FCPY" - <<'PYEOF'
+FC_DB="$WORK" FC_REF="$CLEAN" FC_ENGPORT="${FC_ENGPORT:-3050}" FC_PORT="$PORT" FC_U="$U" FC_P="$P" "$FCPY" - <<'PYEOF'
 import os, sys
 from firebird.driver import connect, driver_config
 srv = driver_config.register_server('fc')
@@ -148,6 +157,110 @@ cur2.execute("SELECT ID, SAL FROM T ORDER BY ID")
 check("a fresh connection sees the committed writes", cur2.fetchall(),
       [(1, __import__('decimal').Decimal('99.99'))])
 con2.close()
+
+# ---------------------------------------------------------------
+# THE STATEMENT FLAG WORD (isc_info_sql_stmt_flags, info item 27)
+#
+# This is what the OO API dispatches on to choose openCursor() over the
+# singleton execute(). It is NOT cosmetic: announcing a bare
+# `SELECT ... FROM <selectable procedure>` WITHOUT FLAG_HAS_CURSOR sent
+# this very driver down op_execute2, where the statement died with a
+# Dynamic SQL Error - while isql and node-firebird, which dispatch on
+# the stmt TYPE instead, ran the identical SQL correctly. A whole class
+# of statement was broken for OO clients only.
+#
+# Measured DIFFERENTIALLY against the live engine on the SAME fixture
+# rather than against stored constants: 1 = FLAG_HAS_CURSOR,
+# 2 = FLAG_REPEAT_EXECUTE.
+# ---------------------------------------------------------------
+esrv = driver_config.register_server('eng')
+esrv.host.value = '127.0.0.1'; esrv.port.value = os.environ['FC_ENGPORT']
+esrv.user.value = os.environ['FC_U']; esrv.password.value = os.environ['FC_P']
+edb = driver_config.register_database('engdb')
+edb.server.value = 'eng'; edb.database.value = os.environ['FC_REF']
+
+def shape(dbname, sql):
+    """(stmt_type, flag word) as that server announces them at PREPARE."""
+    try:
+        with connect(dbname, user=os.environ['FC_U'], password=os.environ['FC_P']) as c:
+            st = c.cursor().prepare(sql)
+            return ("%s" % st.type, int(st._istmt.get_flags()))
+    except Exception as e:
+        return "ERR:" + str(e).split("\n")[0][:44]
+
+ran = 0
+engine_flags_seen = set()
+def flagcheck(label, sql):
+    global fail, ran
+    e = shape('engdb', sql); f = shape('fcdb', sql)
+    if isinstance(e, str):
+        # a cell the ENGINE cannot prepare measures nothing - the gate
+        # must not bank an agreement between two refusals
+        print(f"DIFF flags {label} [VACUOUS: the engine refused this shape] {e}")
+        fail = 1
+        return
+    engine_flags_seen.add(e[1])
+    ran += 1
+    if e == f:
+        print(f"OK   flags {label} (type={e[0]} flags={e[1]})")
+    else:
+        print(f"DIFF flags {label}\n     engine: {e}\n     fc:     {f}")
+        fail = 1
+
+CELLS = [
+    # cursor statements - flags 3
+    ("plain select",                   "SELECT ID FROM T WHERE ID = 1"),
+    ("virtual select",                 "SELECT 1 FROM RDB$DATABASE"),
+    ("BARE CALL, literal args",        "SELECT K FROM PU('ab', 9)"),
+    ("BARE CALL, bound args",          "SELECT K FROM PU(?, ?)"),
+    ("aliased bare call",              "SELECT P.K FROM PU('ab', 9) P"),
+    ("modifier over the call",         "SELECT FIRST 1 K FROM PU('ab', 9)"),
+    ("aggregate over the call",        "SELECT MAX(K) FROM PU('ab', 9)"),
+    ("cte",                            "WITH C AS (SELECT ID FROM T) SELECT ID FROM C"),
+    ("derived table",                  "SELECT ID FROM (SELECT ID FROM T) D"),
+    ("union",                          "SELECT ID FROM T UNION ALL SELECT 1 FROM RDB$DATABASE"),
+    # the RETURNING split: INSERT..RETURNING is a SINGLETON (type 8 -> 2),
+    # UPDATE/DELETE..RETURNING are CURSORS (type 1 -> 3)
+    ("insert .. returning IS A SINGLETON", "INSERT INTO T (ID) VALUES (?) RETURNING ID"),
+    ("update .. returning IS A CURSOR",    "UPDATE T SET ID = ? RETURNING ID"),
+    ("delete .. returning IS A CURSOR",    "DELETE FROM T RETURNING ID"),
+    # non-cursor executable statements - flags 2
+    ("insert values",                  "INSERT INTO T (ID) VALUES (?)"),
+    ("insert .. select",               "INSERT INTO T (ID) SELECT ID FROM T"),
+    ("update",                         "UPDATE T SET ID = ?"),
+    ("delete",                         "DELETE FROM T"),
+    ("execute procedure",              "EXECUTE PROCEDURE PU('ab', 9)"),
+    ("exec block that SUSPENDs",       "EXECUTE BLOCK RETURNS (X INTEGER) AS BEGIN X = 1; SUSPEND; END"),
+    ("exec block, void",               "EXECUTE BLOCK AS BEGIN END"),
+    ("commit",                         "COMMIT"),
+    ("rollback",                       "ROLLBACK"),
+    ("savepoint",                      "SAVEPOINT SP1"),
+    ("set generator",                  "SET GENERATOR SQQ TO 5"),
+    # session management reports the DDL TYPE (5) yet is NOT DDL: it
+    # still answers 2. This is why "is DDL" cannot be a type test.
+    ("set time zone (type 5, yet 2)",  "SET TIME ZONE 'UTC'"),
+    # real DDL - a bare 0, neither bit. These already agreed BEFORE the
+    # fix, so they are the battery's positive controls: if the whole
+    # battery started reporting DIFF, these would too.
+    ("real DDL create table",          "CREATE TABLE ZZQ (A INTEGER)"),
+    ("real DDL create index",          "CREATE INDEX IXQ ON T (ID)"),
+    ("real DDL grant",                 "GRANT SELECT ON T TO PUBLIC"),
+]
+for label, sql in CELLS:
+    flagcheck(label, sql)
+
+if ran < len(CELLS):
+    print(f"DIFF flags battery ran {ran} of {len(CELLS)} cells")
+    fail = 1
+# the law has THREE distinct answers; a battery that saw only one of
+# them would agree with almost any implementation
+if not {0, 2, 3}.issubset(engine_flags_seen):
+    print(f"DIFF flags battery is VACUOUS: the engine answered only {sorted(engine_flags_seen)}, "
+          f"so the 0/2/3 distinction went untested")
+    fail = 1
+else:
+    print(f"OK   flags battery spans the law ({ran} cells, engine answered {sorted(engine_flags_seen)})")
+
 sys.exit(fail)
 PYEOF
 py_rc=$?

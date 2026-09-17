@@ -57201,6 +57201,43 @@ fn stmt_type_of(plan: &Plan) -> i32 {
     }
 }
 
+/// The IStatement FLAG WORD - isc_info_sql_stmt_flags, info item 27,
+/// where the python driver's `Statement.get_flags()` reads it and where
+/// the OO API decides between `openCursor()` and the SINGLETON
+/// `execute()`. Getting it wrong is NOT cosmetic: a bare `SELECT ... FROM
+/// <selectable procedure>` announced without FLAG_HAS_CURSOR sent
+/// firebird-driver down op_execute2 and the statement died with a
+/// Dynamic SQL Error, while isql and node-firebird - which dispatch on
+/// the stmt TYPE instead - ran the very same SQL correctly.
+///
+/// MEASURED against FB6 (prepare-only, engine vs fc, 23 shapes):
+///   * FLAG_HAS_CURSOR (1) exactly when the statement is a CURSOR one,
+///     which is stmt_type 1 (select) or 12 (select_for_update). This is
+///     why INSERT .. RETURNING (type 8, a singleton) answers 2 while
+///     UPDATE/DELETE .. RETURNING (type 1, a cursor) answer 3, and why
+///     EXECUTE BLOCK splits the same way on whether it SUSPENDs.
+///   * FLAG_REPEAT_EXECUTE (2) for everything EXCEPT real DDL, which
+///     answers a bare 0 - including commit(10), rollback(11),
+///     savepoint(14) and set generator(13).
+///   * "real DDL" is a PLAN-SHAPE test, not a type test: SET TIME ZONE
+///     reports stmt_type 5 (ddl) like every session-management
+///     statement, yet answers 2, not 0.
+/// Derived from [stmt_type_of] rather than re-listing plan shapes, so
+/// the two emitters cannot drift apart - they did, and the copy in
+/// `answer_info_sql` had gone stale the same way.
+fn stmt_flags_of(plan: &Plan) -> i32 {
+    const FLAG_HAS_CURSOR: i32 = 1;
+    const FLAG_REPEAT_EXECUTE: i32 = 2;
+    let ty = stmt_type_of(plan);
+    // session management reports the DDL type but is not DDL
+    let session_mgmt = matches!(plan, Plan::SetTimeZone { .. } | Plan::SetTimeZoneRefused(_));
+    if ty == 5 && !session_mgmt {
+        return 0;
+    }
+    let cursor = if ty == 1 || ty == 12 { FLAG_HAS_CURSOR } else { 0 };
+    cursor | FLAG_REPEAT_EXECUTE
+}
+
 /// One projected BIGINT column named `Cn` - what a virtual-empty query's
 /// columns describe as.
 /// The announced type of a [Plan::Scalar]'s one column. MEASURED:
@@ -57585,23 +57622,13 @@ fn answer_prepare(items: &[u8], plan: &Plan, params: &[Descriptor], att: AttCs) 
             }
         })
         .collect();
-    let has_cursor = matches!(
-        plan,
-        Plan::Scalar(..)
-            | Plan::GenIdIncrement { .. }
-            | Plan::Project { .. }
-            | Plan::Join { .. }
-            | Plan::JoinGroup { .. }
-            | Plan::Group { .. }
-            | Plan::VirtualEmpty { .. }
-    );
 
     let mut d = Vec::new();
     let mut i = 0usize;
     while i < items.len() {
         match items[i] {
             21 => int_item(&mut d, 21, stmt_type_of(plan)),
-            27 => int_item(&mut d, 27, if has_cursor { 1 } else { 0 }), // FLAG_HAS_CURSOR
+            27 => int_item(&mut d, 27, stmt_flags_of(plan)), // isc_info_sql_stmt_flags
             22 => str_item(&mut d, 22, ""), // isc_info_sql_get_plan
             6 => int_item(&mut d, 6, out_vars.len() as i32), // num_variables
             tag @ (4 | 5) => {
@@ -57690,16 +57717,6 @@ fn answer_prepare(items: &[u8], plan: &Plan, params: &[Descriptor], att: AttCs) 
 /// python driver's Statement.get_flags() lives on - and the plan(22).
 fn answer_info_sql(items: &[u8], plan: &Plan, last_dml: (i32, i32, i32)) -> Vec<u8> {
     let mut d = Vec::new();
-    let has_cursor = matches!(
-        plan,
-        Plan::Scalar(..)
-            | Plan::GenIdIncrement { .. }
-            | Plan::Project { .. }
-            | Plan::Join { .. }
-            | Plan::JoinGroup { .. }
-            | Plan::Group { .. }
-            | Plan::VirtualEmpty { .. }
-    );
     for &it in items {
         match it {
             23 => {
@@ -57715,7 +57732,7 @@ fn answer_info_sql(items: &[u8], plan: &Plan, last_dml: (i32, i32, i32)) -> Vec<
             27 => {
                 d.push(27);
                 d.extend_from_slice(&4u16.to_le_bytes());
-                d.extend_from_slice(&(if has_cursor { 1i32 } else { 0 }).to_le_bytes());
+                d.extend_from_slice(&stmt_flags_of(plan).to_le_bytes());
             }
             22 => {
                 d.push(22);
