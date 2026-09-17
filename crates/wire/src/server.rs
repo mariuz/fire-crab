@@ -11425,6 +11425,15 @@ enum Term {
     /// pattern `'1'`, exact, not a prefix; the slot describes as text);
     /// becomes [Term::ExprLike] at bind.
     ExprLikeParam(Box<Expr>, usize, Option<char>, bool),
+    /// `<text column> [NOT] CONTAINING ?` - the upper-cased substring
+    /// test with the pattern arriving at EXECUTE. The fold is the
+    /// OPERAND's character set (measured: a byte carrier folds ASCII
+    /// only, while UTF8 and WIN1252 fold accents), so the column's
+    /// ttype rides along and [containing_term] builds the real term at
+    /// bind, where the pattern value is finally in hand. A NULL bind is
+    /// UNKNOWN under both polarities and an EMPTY pattern matches every
+    /// non-NULL row - both measured.
+    ExprContainingParam(Box<Expr>, u16, usize, bool),
 }
 
 /// A resolved WHERE predicate in disjunctive normal form (OR of ANDs),
@@ -12107,6 +12116,24 @@ impl Predicate {
                     // `<int/numeric col or expression> LIKE ?`: the
                     // bound pattern becomes the literal and the term
                     // the ordinary per-row render-and-match
+                    Term::ExprContainingParam(e, tt, slot, negated) => {
+                        match args.get(*slot).ok_or("missing parameter value")? {
+                            WireParam::Null => Term::Unknown,
+                            WireParam::Text(t) | WireParam::TextCs(t, _) => {
+                                containing_term((**e).clone(), *tt, t, *negated)
+                            }
+                            // an integer bind renders to its decimal
+                            // text, as it does for LIKE and STARTING
+                            WireParam::Int(v, 0) => {
+                                containing_term((**e).clone(), *tt, &v.to_string(), *negated)
+                            }
+                            _ => {
+                                return Err(
+                                    "parameter type does not match its column".into()
+                                )
+                            }
+                        }
+                    }
                     Term::ExprLikeParam(e, slot, escape, negated) => {
                         match args.get(*slot).ok_or("missing parameter value")? {
                             WireParam::Null => Term::Unknown,
@@ -13119,6 +13146,7 @@ impl Term {
             | Term::ParamStarting(..)
             | Term::ExprStartingParam(..)
             | Term::ParamSimilar(..)
+            | Term::ExprContainingParam(..)
             | Term::ExprLikeParam(..) => None,
         })
     }
@@ -37489,6 +37517,7 @@ fn filter_has_params(filter: &Option<Predicate>) -> bool {
                     | Term::ParamStarting(..)
                     | Term::ExprStartingParam(..)
                     | Term::ParamSimilar(..)
+                    | Term::ExprContainingParam(..)
                     | Term::ExprLikeParam(..)
             )
         })
@@ -90613,8 +90642,13 @@ fn param_or_typed_term(
     if matches!(raw, RawKind::Containing(Rhs::Null, _)) {
         return Some(Term::Never);
     }
-    if matches!(raw, RawKind::Containing(..)) {
-        return None; // a `?` or a binary pattern: not driven here
+    // ...and a BINARY pattern still is not driven here. A `?` pattern
+    // now IS - the arm below claims its slot - so this refusal, which
+    // used to swallow both, must let it through.
+    if matches!(raw, RawKind::Containing(..))
+        && !matches!(raw, RawKind::Containing(Rhs::Param(..), _))
+    {
+        return None;
     }
     // AN ICU COLLATION DECIDES THIS COMPARISON, and this server has no
     // table for it: under `UNICODE_CI`, `= 'APPLE'` matches `'apple'`
@@ -90798,6 +90832,40 @@ fn param_or_typed_term(
                     Box::new(Expr::Col(idx)),
                     slot,
                     escape,
+                    negated,
+                ))
+            }
+            _ => None,
+        },
+        // `<text col> [NOT] CONTAINING ?` - the pattern arrives at
+        // execute. The slot claims the COLUMN's own descriptor (measured:
+        // `U CONTAINING ?` over a `VARCHAR(5) UTF8` announces 20/UTF8
+        // under a NONE or UTF8 attachment and 5/WIN1252 under WIN1252 -
+        // the ordinary attachment law for a column-typed slot), and the
+        // fold is the column's character set, carried on the term.
+        //
+        // The `canonical_known` gate is the LITERAL arm's, verbatim and
+        // for its reason: under a collation whose canonical form this
+        // server does not have, the match would compare upper-cased text
+        // where the engine compares the canonical form.
+        //
+        // An INTEGER column keeps refusing: the engine renders it to
+        // decimal text for LIKE and STARTING, but CONTAINING over one
+        // was never probed, and a rendered fold is not a thing to guess.
+        RawKind::Containing(Rhs::Param(slot, _), negated) => match kind {
+            ColKind::Text => {
+                let tt = if d.sub_type >= 0 { d.sub_type as u16 } else { 0 };
+                let coll = fire_crab_ods::intl::collation_id(d.sub_type);
+                let canonical_known =
+                    coll == 0 || fire_crab_ods::coll::icu_strength_of_ttype(tt).is_some();
+                if !canonical_known {
+                    return None;
+                }
+                claim(slot)?;
+                Some(Term::ExprContainingParam(
+                    Box::new(Expr::Col(idx)),
+                    tt,
+                    slot,
                     negated,
                 ))
             }

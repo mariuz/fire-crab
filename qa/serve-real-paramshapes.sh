@@ -159,6 +159,29 @@ both "? NOT STARTING WITH with NULL" "? NOT STARTING WITH 'a'" '[null]'
 both "? STARTING WITH ?" "? STARTING WITH ?" '["ab","a"]'
 both "? STARTING WITH ?" "? STARTING WITH ?" '["ab","b"]'
 
+# --- 3b. <text col> CONTAINING ? (a BOUND PATTERN) --------------------
+#
+# CONTAINING is the one predicate that folds case on EVERY character
+# set, and until this slice a BOUND pattern refused where the engine
+# answered. The fold is the OPERAND's character set - here NAME, a
+# VARCHAR(10) in a NONE-charset database, so the fold is ASCII - and the
+# pattern is folded at bind, where the value finally exists.
+#
+# NAME holds 'ok', 'open', 'x', NULL, 'aa'.
+both "NAME CONTAINING ? (lower)" "NAME CONTAINING ?" '["o"]'
+both "NAME CONTAINING ? folds case" "NAME CONTAINING ?" '["O"]'
+both "NAME CONTAINING ? mid-string" "NAME CONTAINING ?" '["PE"]'
+both "NAME CONTAINING ? no match" "NAME CONTAINING ?" '["zz"]'
+# an EMPTY pattern matches every non-NULL row, and a NULL bind is
+# UNKNOWN under BOTH polarities - the two boundaries of the shape
+both "NAME CONTAINING '' takes every non-NULL" "NAME CONTAINING ?" '[""]'
+both "NAME CONTAINING ? with a NULL bind" "NAME CONTAINING ?" '[null]'
+both "NAME NOT CONTAINING ?" "NAME NOT CONTAINING ?" '["o"]'
+both "NAME NOT CONTAINING ? with a NULL bind" "NAME NOT CONTAINING ?" '[null]'
+# ...and the pattern has NO WILDCARDS, bound exactly as literal
+both "a bound % is a literal percent" "NAME CONTAINING ?" '["%"]'
+both "a bound _ is a literal underscore" "NAME CONTAINING ?" '["_"]'
+
 # --- 4. ? BETWEEN: a desugar into the mirrored comparisons ------------
 both "? BETWEEN ints" "? BETWEEN 1 AND 3" '[2]'
 both "? BETWEEN ints" "? BETWEEN 1 AND 3" '[5]'
@@ -315,8 +338,17 @@ fi
 # --- 9. refusals kept, engine answers recorded ------------------------
 # each of these the ENGINE answers (see the gate header); fire-crab
 # refuses rather than risk the engine's wilder semantics
+# The last two are THIS SLICE'S SCOPE BOUNDARY, deliberately drawn:
+# `<text col> CONTAINING ?` is answered now, but CONTAINING over an
+# INTEGER column was never probed (LIKE and STARTING render the column
+# to decimal text there; whether CONTAINING folds the rendering is a
+# guess), and a bound TESTED side hits a measured engine anomaly - under
+# a UTF8 attachment `? CONTAINING '<non-ascii>'` is false even SAME-CASE,
+# while every other combination is true. Answering either would risk a
+# wrong answer where a refusal is merely incomplete.
 for pair in "? IN (?, 2)|[1,1]" "? IN (1, 'a')|[\"a\"]" "? BETWEEN 1 AND 'x'|[2]" \
-            "? IS DISTINCT FROM 5|[4]"; do
+            "? IS DISTINCT FROM 5|[4]" "N CONTAINING ?|[\"1\"]" \
+            "? CONTAINING 'o'|[\"ok\"]"; do
     pred="${pair%%|*}"; args="${pair##*|}"
     a=$(query "SELECT ID FROM T WHERE $pred ORDER BY ID" "$args" "$PORT" "$A")
     case "$a" in
