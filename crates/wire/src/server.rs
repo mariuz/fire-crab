@@ -2614,8 +2614,10 @@ fn append_bind_section(d: &mut Vec<u8>, params: &[Descriptor], att: AttCs) {
     for (i, pd) in params.iter().enumerate() {
         let (wire, sql_type, length, scale, sub_type) = wire_for(pd);
         // ...and in the ATTACHMENT's character set, exactly as an output
-        // column is ([bind_text_cs])
+        // column is ([bind_text_cs]) - and a TEXT BLOB slot the same,
+        // through its own field ([bind_blob_cs])
         let (sub_type, length) = bind_text_cs(wire, sub_type, length, &att);
+        let scale = bind_blob_cs(wire, sub_type, scale, &att);
         // NULLABLE unless the planner marked the destination NOT NULL
         let sql_type =
             if pd.flags & PARAM_NOT_NULL != 0 { sql_type } else { nullable(sql_type) };
@@ -13633,10 +13635,37 @@ fn blob_out_charset(c: &ProjCol, att: &AttCs) -> i32 {
     // attachment (measured: it never echoes a real attachment's id); a
     // real-charset blob is announced in a real attachment's charset and
     // keeps its own under a NONE attachment.
-    if fire_crab_ods::intl::byte_carrier(att.id)
-        || fire_crab_ods::intl::byte_carrier(c.scale as u8)
-    {
+    //
+    // **ASCII IS A REAL CHARSET HERE**, and this used to ask
+    // `byte_carrier`, which counts it as one of the carriers: an `ASCII`
+    // text blob was announced charset 2 under a UTF8 attachment where
+    // the engine announces 4, and 53 under WIN1252. Only NONE (0) and
+    // OCTETS (1) keep their set - the same `cs > 1` line [resolve_text_cs]
+    // draws for a text COLUMN, where the ASCII control has always agreed.
+    if fire_crab_ods::intl::byte_carrier(att.id) || (c.scale as u8) <= 1 {
         return c.scale;
+    }
+    att.id as i32
+}
+
+/// [blob_out_charset] for an INPUT slot: the charset a text blob
+/// PARAMETER is announced in, which obeys the same law - measured across
+/// five blob kinds and three attachments, through INSERT and UPDATE
+/// alike. A `BLOB SUB_TYPE TEXT CHARACTER SET UTF8` destination is
+/// announced charset 53 under a WIN1252 attachment and 4 under UTF8; a
+/// WIN1252 one is announced 4 under UTF8; an ASCII one transliterates
+/// too; a NONE blob keeps 0 everywhere; and a BINARY blob (sub_type 0)
+/// has no charset at all.
+///
+/// The blob's charset rides in `scale` ([wire_for] puts it there), which
+/// is why [bind_text_cs] cannot carry this: that one resolves a
+/// `sub_type`, and a blob's sub_type is text-vs-binary.
+fn bind_blob_cs(wire: Wire, sub_type: i32, scale: i32, att: &AttCs) -> i32 {
+    if !matches!(wire, Wire::Blob) || sub_type != 1 {
+        return scale;
+    }
+    if fire_crab_ods::intl::byte_carrier(att.id) || (scale as u8) <= 1 {
+        return scale;
     }
     att.id as i32
 }
@@ -57325,8 +57354,10 @@ fn answer_prepare(items: &[u8], plan: &Plan, params: &[Descriptor], att: AttCs) 
         .map(|pd| {
             let (wire, sql_type, length, scale, sub_type) = wire_for(pd);
             // an input slot travels in the attachment's charset, the
-            // mirror of the out_vars resolution just above
+            // mirror of the out_vars resolution just above - text
+            // through its sub_type, a TEXT BLOB through its scale
             let (sub_type, length) = bind_text_cs(wire, sub_type, length, &att);
+            let scale = bind_blob_cs(wire, sub_type, scale, &att);
             // an input parameter is NULLABLE unless its destination
             // column forbids it ([PARAM_NOT_NULL]) - the same rule
             // [append_bind_section] follows for the other describe shape

@@ -70,7 +70,12 @@ CREATE TABLE T (U VARCHAR(5) CHARACTER SET UTF8,
                 O VARCHAR(5) CHARACTER SET OCTETS,
                 A VARCHAR(5) CHARACTER SET ASCII,
                 C CHAR(5) CHARACTER SET UTF8,
-                I INTEGER, S SMALLINT, B BIGINT, NN INTEGER NOT NULL);
+                I INTEGER, S SMALLINT, B BIGINT, NN INTEGER NOT NULL,
+                BN BLOB SUB_TYPE TEXT,
+                BU BLOB SUB_TYPE TEXT CHARACTER SET UTF8,
+                BW BLOB SUB_TYPE TEXT CHARACTER SET WIN1252,
+                BA BLOB SUB_TYPE TEXT CHARACTER SET ASCII,
+                BB BLOB SUB_TYPE 0);
 COMMIT;
 EOF
     chmod 666 "$1"
@@ -121,6 +126,34 @@ cell() { # <label> <sql> [charsets...]
             echo "     engine: [$e]"
             echo "     fc:     [$f]"
             fail=1
+        fi
+    done
+}
+
+# The same, for the OUTPUT message - a blob's charset is announced on
+# both sides of the wire and the law is one law, so one gate holds it.
+oslots() { # <connstring> <charset> <sql>
+    printf 'SET SQLDA_DISPLAY ON;\nSET PLANONLY ON;\n%s\n' "$3" |
+        timeout 40 "$ISQL" -q -b -ch "$2" -user "$U" -pas "$P" "$1" 2>&1 |
+        awk '/OUTPUT message/{o=1; next} o && /sqltype/{print}' |
+        tr -s ' ' | sed 's/^ //; s/ $//' | paste -sd'|'
+}
+ocell() { # <label> <sql> [charsets...]
+    local lbl="$1" sql="$2"; shift 2
+    local chs="${*:-NONE UTF8 WIN1252}"
+    local ch e f
+    for ch in $chs; do
+        ran=$((ran + 1))
+        e=$(oslots "127.0.0.1/$REAL:$REF" "$ch" "$sql")
+        f=$(oslots "127.0.0.1/$PORT:$WORK" "$ch" "$sql")
+        if [ -z "$e" ] || [ -z "$f" ]; then
+            echo "DIFF [-ch $ch] $lbl described NO output column (engine=[$e] fc=[$f])"
+            fail=1; continue
+        fi
+        if [ "$e" = "$f" ]; then
+            echo "OK   [-ch $ch] $lbl: $e"
+        else
+            echo "DIFF [-ch $ch] $lbl"; echo "     engine: [$e]"; echo "     fc:     [$f]"; fail=1
         fi
     done
 }
@@ -223,6 +256,29 @@ cell "...its STARTING slot"           "SELECT 1 FROM T WHERE I STARTING WITH ?;"
 cell "...and its CONTAINING slot"     "SELECT 1 FROM T WHERE I CONTAINING ?;"
 cell "a BIGINT column's LIKE slot"    "SELECT 1 FROM T WHERE B LIKE ?;"
 
+# A TEXT BLOB OBEYS THE SAME LAW, IN BOTH DIRECTIONS - and its charset
+# rides in a DIFFERENT FIELD (scale, not sub_type), which is why the
+# input side had no rule at all: the text resolver never sees it.
+#
+# ASCII is the cell that matters. It is a REAL charset here - it
+# transliterates - while `intl::byte_carrier` counts it as a carrier,
+# and the OUTPUT helper asked exactly that question and so announced 2
+# where the engine announces 4. The same trap as the text columns'.
+echo "-- a TEXT BLOB parameter takes the attachment's charset too --"
+cell "a NONE blob keeps its own"      "INSERT INTO T (BN) VALUES (?);"
+cell "a UTF8 blob follows"            "INSERT INTO T (BU) VALUES (?);"
+cell "a WIN1252 blob follows"         "INSERT INTO T (BW) VALUES (?);"
+cell "an ASCII blob follows too"      "INSERT INTO T (BA) VALUES (?);"
+cell "a BINARY blob has no charset"   "INSERT INTO T (BB) VALUES (?);"
+cell "...and through UPDATE as well"  "UPDATE T SET BU = ? WHERE I = 1;"
+
+echo "-- ...and the OUTPUT side of the same law --"
+ocell "SELECT a NONE blob"            "SELECT BN FROM T;"
+ocell "SELECT a UTF8 blob"            "SELECT BU FROM T;"
+ocell "SELECT a WIN1252 blob"         "SELECT BW FROM T;"
+ocell "SELECT an ASCII blob"          "SELECT BA FROM T;"
+ocell "SELECT a BINARY blob"          "SELECT BB FROM T;"
+
 # THE SAME TWO RULES IN THE NUMERIC FAMILY, which is where they are
 # easiest to tell apart - and where assuming BETWEEN took the WIDER
 # bound (as IN takes the wider element) would be wrong in BOTH
@@ -282,6 +338,6 @@ cell "a NOT NULL column"             "SELECT 1 FROM T WHERE ? = NN;"
 
 kill $srv 2>/dev/null; wait $srv 2>/dev/null; trap - EXIT
 rm -f "$WORK" "$REF"
-[ "$ran" -ge 147 ] || { echo "FAIL only $ran checks ran (expected >= 147)"; fail=1; }
+[ "$ran" -ge 180 ] || { echo "FAIL only $ran checks ran (expected >= 180)"; fail=1; }
 [ $fail = 0 ] && echo "PASS bindcs ($ran checks)" || echo "FAIL bindcs"
 exit $fail
