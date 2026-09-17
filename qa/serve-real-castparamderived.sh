@@ -116,10 +116,16 @@ both "a NESTED derived body's proj ?" "SELECT V FROM (SELECT C AS V FROM (SELECT
 # says these cells measure the BOUND half
 both "CONTROL a literal inner projection" "SELECT C FROM (SELECT CAST(5 AS INTEGER) AS C FROM T) X" "[]"
 
-# RECORDED, NOT FIXED - carried with the engine's answer so each expires
-# itself. Both have ONE cause: bind_plan_params walks a plan's FIELDS and
-# never a `RowSource::PlanRows`, which is where a FOLD keeps its base and
-# a JOIN keeps a derived side.
+# A FOLD's BASE and a JOIN's DERIVED SIDE keep their rows in a
+# `RowSource::PlanRows`, which is not one of the plan FIELDS
+# bind_plan_params walks - so an inner projection `?` under either of
+# them reached the FETCH unbound (prepare succeeded, op_execute was
+# accepted, `fetch plan = JoinGroup` was the last line). The row-source
+# walk binds that plan's projection before materialising it now.
+#
+# The teeth: a side whose WHERE excludes every row must answer NOTHING,
+# and a fold over an EMPTY inner never evaluates the projection at all -
+# so the pair together tells a bound projection from an unbound one.
 refuses_q() { # <label> <sql> <json args>
     local a b
     a=$(query "$2" "$3" 127.0.0.1 "$PORT" "$A")
@@ -134,8 +140,16 @@ refuses_q() { # <label> <sql> <json args>
            else echo "DIFF $1: fcwire [$a] engine [$b]"; fail=1; fi ;;
     esac
 }
-refuses_q "a FOLD over an inner projection ?" "SELECT SUM(C) AS S FROM (SELECT CAST(? AS INTEGER) AS C FROM T) X" "[10]"
-refuses_q "a JOIN SIDE with an inner projection ?" "SELECT X.C FROM (SELECT CAST(? AS INTEGER) AS C, ID FROM T WHERE ID = 1) X JOIN T D ON D.ID = X.ID" "[5]"
+both "a FOLD over an inner projection ?" "SELECT SUM(C) AS S FROM (SELECT CAST(? AS INTEGER) AS C FROM T) X" "[10]"
+both "...COUNT over one"              "SELECT COUNT(C) AS N FROM (SELECT CAST(? AS INTEGER) AS C FROM T) X" "[10]"
+both "...MAX over one"                "SELECT MAX(C) AS M FROM (SELECT CAST(? AS INTEGER) AS C FROM T) X" "[10]"
+both "...a GROUP BY over one"         "SELECT C, COUNT(*) AS N FROM (SELECT CAST(? AS INTEGER) AS C, ID FROM T) X GROUP BY C" "[10]"
+both "a JOIN SIDE with an inner projection ?" "SELECT X.C FROM (SELECT CAST(? AS INTEGER) AS C, ID FROM T WHERE ID = 1) X JOIN T D ON D.ID = X.ID" "[5]"
+both "...the derived side on the RIGHT" "SELECT X.C FROM T D JOIN (SELECT CAST(? AS INTEGER) AS C, ID FROM T WHERE ID = 1) X ON D.ID = X.ID" "[5]"
+both "...the side under FIRST"        "SELECT FIRST 1 X.C FROM (SELECT CAST(? AS INTEGER) AS C, ID FROM T WHERE ID = 1) X JOIN T D ON D.ID = X.ID" "[5]"
+both "...a fold ABOVE the joined side" "SELECT SUM(X.C) AS S FROM (SELECT CAST(? AS INTEGER) AS C, ID FROM T WHERE ID < 3) X JOIN T D ON D.ID = X.ID" "[5]"
+both "...the side EXCLUDES every row" "SELECT X.C FROM (SELECT CAST(? AS INTEGER) AS C, ID FROM T WHERE ID > ?) X JOIN T D ON D.ID = X.ID" "[5,99]"
+both "CONTROL a fold over a LITERAL inner projection" "SELECT SUM(C) AS S FROM (SELECT CAST(5 AS INTEGER) AS C FROM T) X" "[]"
 
 echo "ran $ran checks"
 exit $fail

@@ -40631,12 +40631,10 @@ fn plan_join_bound(
                 return None;
             }
             let inner = plan_query_inner_at(&inner_sql, db_opt, params, false, sbase)?;
-            // an inner PROJECTION `?` is bound nowhere at execute
-            // ([bind_plan_params] reaches the top-level plan's columns
-            // only), so it keeps refusing rather than reading unbound
-            if plan_has_proj_param(&inner) {
-                return None;
-            }
+            // An inner PROJECTION `?` on a derived SIDE is bound now:
+            // the side's rows are a `RowSource::PlanRows`, and
+            // [materialise_bound_src] binds that plan's projection
+            // before materialising it at the fetch. This used to refuse.
             let mut inner_cols = output_cols_of(&inner);
             if inner_cols.is_empty() {
                 return None;
@@ -46432,15 +46430,34 @@ fn materialise_bound_in(plan: &mut Plan, db: &Database, args: &[WireParam]) -> b
 /// [materialise_procedures_src] does.
 fn materialise_bound_src(src: &mut RowSource, db: &Database, args: &[WireParam]) -> bool {
     match src {
-        RowSource::PlanRows(rc) => match branch_rows_res(rc.as_ref(), db, args) {
-            Ok(rows) => {
-                *src = RowSource::Rows(rows);
-                true
+        RowSource::PlanRows(rc) => {
+            // THE INNER PROJECTION IS BOUND FIRST. [branch_rows_res]
+            // evaluates the plan's own `cols` with `value_of`, and a `?`
+            // in that select list is STILL a Param expression here:
+            // [bind_plan_params] ran over the TOP-LEVEL plan, and a row
+            // source is not one of its fields - which is where a FOLD
+            // keeps its base and a JOIN keeps a derived side. Without
+            // this, `SELECT SUM(C) FROM (SELECT CAST(? AS INTEGER) AS C
+            // ...)` prepared, had its execute ACCEPTED, and died at the
+            // FETCH (`fetch plan = JoinGroup`, no refusal anywhere).
+            //
+            // An unbindable projection leaves the source alone rather
+            // than inventing rows: the ordinary path then reports the
+            // failure, exactly as the Err arm below does.
+            let inner = match bind_plan_params(rc.as_ref(), args) {
+                Some(p) => p,
+                None => (**rc).clone(),
+            };
+            match branch_rows_res(&inner, db, args) {
+                Ok(rows) => {
+                    *src = RowSource::Rows(rows);
+                    true
+                }
+                // the source's own error stands: leaving it unmaterialised
+                // lets the ordinary path report it, rather than inventing one
+                Err(_) => false,
             }
-            // the source's own error stands: leaving it unmaterialised
-            // lets the ordinary path report it, rather than inventing one
-            Err(_) => false,
-        },
+        }
         RowSource::Filter { input, .. } | RowSource::Sort { input, .. } => {
             materialise_bound_src(input, db, args)
         }
