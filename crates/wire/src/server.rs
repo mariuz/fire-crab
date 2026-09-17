@@ -8632,8 +8632,13 @@ impl RowSource {
                 Ok(out)
             }
             RowSource::PlanRows(plan) => {
-                // a derived side refuses `?` at plan time, so there are
-                // no bound arguments to thread through here
+                // NO ARGUMENTS REACH HERE. That used to be safe by
+                // construction - a derived side refused a `?` at plan
+                // time - and stopped being when the derived body learned
+                // to take one. A bound base is materialised BEFORE the
+                // fold runs ([materialise_bound_bases]); anything that
+                // still arrives here with an unbound `?` reports its own
+                // "missing parameter value" rather than answering wrongly.
                 // the row source's OWN error, not an invented one:
                 // [branch_rows_res] tells "unserved" from "raised"
                 branch_rows_res(plan, db, &[])
@@ -46319,6 +46324,64 @@ fn materialise_procedures_src(
             materialise_procedures_src(input, database, ctx, params)
         }
         _ => Ok(false),
+    }
+}
+
+/// Materialise a BOUND DERIVED BASE under a fold.
+///
+/// A fold reads its base row source through `RowSource::rows_materialised`,
+/// which has no arguments to hand it - the one place a `?` inside a
+/// derived body cannot reach. That was true BY CONSTRUCTION while a
+/// derived side refused a `?` at plan time (the comment there said so),
+/// and it stopped being true when the derived body learned to take one:
+/// the fold then bound its OWN filter, having and parts correctly and
+/// died at the FETCH, because [Predicate::bind] against an empty slice
+/// answers "missing parameter value" for every slot.
+///
+/// Only [Plan::JoinGroup] is walked. A fold consumes its whole input
+/// anyway, so materialising its base here costs no laziness - the same
+/// trade the fetch path already makes when it flattens a plan to
+/// `Plan::Rows`. A plain `Plan::Join` and a `Plan::Lateral` are left
+/// alone precisely because they CAN stream under `FIRST n`.
+fn materialise_bound_bases(
+    plan: &Plan,
+    db: &Option<Database>,
+    args: &[WireParam],
+) -> Option<Plan> {
+    if args.is_empty() {
+        return None;
+    }
+    let dbr = db.as_ref()?;
+    let mut p = plan.clone();
+    let changed = match &mut p {
+        Plan::JoinGroup { base, .. } => materialise_bound_src(base, dbr, args),
+        _ => false,
+    };
+    if changed {
+        Some(p)
+    } else {
+        None
+    }
+}
+
+/// [materialise_bound_bases] for a [RowSource] - the wrapping a bound
+/// source picks up (a Filter or a Sort) is walked through, exactly as
+/// [materialise_procedures_src] does.
+fn materialise_bound_src(src: &mut RowSource, db: &Database, args: &[WireParam]) -> bool {
+    match src {
+        RowSource::PlanRows(rc) => match branch_rows_res(rc.as_ref(), db, args) {
+            Ok(rows) => {
+                *src = RowSource::Rows(rows);
+                true
+            }
+            // the source's own error stands: leaving it unmaterialised
+            // lets the ordinary path report it, rather than inventing one
+            Err(_) => false,
+        },
+        RowSource::Filter { input, .. } | RowSource::Sort { input, .. } => {
+            materialise_bound_src(input, db, args)
+        }
+        _ => false,
     }
 }
 
@@ -95350,6 +95413,15 @@ fn after_auth(
                 }
                 if want > 0 && !matches!(&*plan, Plan::Rows { .. }) {
                     if let Some(m) = materialise_laterals(&plan, &database, &bound_args) {
+                        plan = std::rc::Rc::new(m);
+                    }
+                }
+                // ...and a FOLD's bound derived base, for the same
+                // reason one step lower: the fold reads its base without
+                // the arguments, so a `?` inside a derived body reached
+                // the fetch unbound.
+                if want > 0 && !matches!(&*plan, Plan::Rows { .. }) {
+                    if let Some(m) = materialise_bound_bases(&plan, &database, &bound_args) {
                         plan = std::rc::Rc::new(m);
                     }
                 }

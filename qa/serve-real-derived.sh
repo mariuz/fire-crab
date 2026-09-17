@@ -349,13 +349,30 @@ bothq "an inner ? over a TEXT column" "SELECT NAME FROM (SELECT NAME FROM EMP WH
 # exactly what used to happen and what made this refuse.
 bothq "an outer projection ? above an inner ?" "SELECT CAST(? AS INTEGER) AS C, ID FROM (SELECT ID FROM EMP WHERE ID > ?) X ORDER BY ID" '[42,3]'
 bothq "...the inner half EXCLUDES" "SELECT CAST(? AS INTEGER) AS C, ID FROM (SELECT ID FROM EMP WHERE ID > ?) X ORDER BY ID" '[42,99]'
+# A FOLD ABOVE AN INNER `?`. These failed at the FETCH, not at prepare:
+# the fold bound its own filter/having/parts with the arguments and then
+# read its BASE row source without them. The empty-inner twins are the
+# teeth AND the type check - SUM over no rows is NULL where COUNT is 0.
+bothq "COUNT above an inner ?" "SELECT COUNT(*) AS N FROM (SELECT ID FROM EMP WHERE ID > ?) X" '[3]'
+bothq "...COUNT over an EMPTY inner is 0" "SELECT COUNT(*) AS N FROM (SELECT ID FROM EMP WHERE ID > ?) X" '[99]'
+bothq "SUM above an inner ?" "SELECT SUM(ID) AS S FROM (SELECT ID FROM EMP WHERE ID > ?) X" '[3]'
+bothq "...SUM over an EMPTY inner is NULL" "SELECT SUM(ID) AS S FROM (SELECT ID FROM EMP WHERE ID > ?) X" '[99]'
+bothq "MAX above an inner ?" "SELECT MAX(ID) AS M FROM (SELECT ID FROM EMP WHERE ID > ?) X" '[3]'
+bothq "AVG above an inner ?" "SELECT AVG(SALARY) AS A FROM (SELECT SALARY FROM EMP WHERE SALARY > ?) X" '[100]'
+bothq "a GROUP BY above an inner ?" "SELECT DEPT_ID, COUNT(*) AS N FROM (SELECT ID, DEPT_ID FROM EMP WHERE ID > ?) X GROUP BY DEPT_ID ORDER BY DEPT_ID" '[1]'
+bothq "...the GROUP BY over an EMPTY inner" "SELECT DEPT_ID, COUNT(*) AS N FROM (SELECT ID, DEPT_ID FROM EMP WHERE ID > ?) X GROUP BY DEPT_ID ORDER BY DEPT_ID" '[99]'
+bothq "a HAVING above an inner ?" "SELECT DEPT_ID, COUNT(*) AS N FROM (SELECT ID, DEPT_ID FROM EMP WHERE ID > ?) X GROUP BY DEPT_ID HAVING COUNT(*) > ?" '[0,1]'
+bothq "...the HAVING half EXCLUDES" "SELECT DEPT_ID, COUNT(*) AS N FROM (SELECT ID, DEPT_ID FROM EMP WHERE ID > ?) X GROUP BY DEPT_ID HAVING COUNT(*) > ?" '[0,9]'
+bothq "a CTE body's ? under a fold" "WITH C AS (SELECT ID FROM EMP WHERE ID > ?) SELECT COUNT(*) AS N FROM C" '[3]'
+# a grouped JOIN over real tables still streams its own way - the walk
+# materialises a bound DERIVED base only, and this says so
+both "CONTROL a grouped join over tables" "SELECT D.DNAME, COUNT(*) AS N FROM EMP E JOIN DEPT D ON D.ID = E.DEPT_ID GROUP BY D.DNAME ORDER BY D.DNAME"
+bothq "CONTROL FIRST n over a derived ?" "SELECT FIRST 2 ID FROM (SELECT ID FROM EMP WHERE ID > ?) X ORDER BY ID" '[1]'
 # ...but NOT with a JOIN or a FOLD above it - both still refuse, and the
 # gate found that: they were written as live cells on the strength of a
 # hand-probe that never covered them. Recorded rather than dropped, so
 # each carries the engine's answer and expires itself.
 refusesq "an inner ? with a JOIN above it" "SELECT X.ID FROM (SELECT ID, DEPT_ID FROM EMP WHERE ID > ?) X JOIN DEPT D ON D.ID = X.DEPT_ID ORDER BY X.ID" '[1]'
-refusesq "an aggregate over an inner ?" "SELECT COUNT(*) AS N FROM (SELECT ID FROM EMP WHERE ID > ?) X" '[3]'
-refusesq "a GROUP BY over an inner ?" "SELECT DEPT_ID, COUNT(*) AS N FROM (SELECT ID, DEPT_ID FROM EMP WHERE ID > ?) X GROUP BY DEPT_ID" '[1]'
 # the LITERAL-argument twins of both shapes answer, which is what says
 # only the BOUND half is missing rather than the shape itself
 both "a JOIN above a LITERAL inner predicate" "SELECT X.ID FROM (SELECT ID, DEPT_ID FROM EMP WHERE ID > 1) X JOIN DEPT D ON D.ID = X.DEPT_ID ORDER BY X.ID"
@@ -379,14 +396,12 @@ both "CONTROL a literal inner predicate" "SELECT ID FROM (SELECT ID FROM EMP WHE
 #   - a derived SIDE OF A JOIN keeps its own copy of the old guard
 #     (plan_join_bound), whose base needs per-side text offsets - which
 #     is also why a JOIN above an inner `?` refuses ("JOIN plan failed").
-#   - an AGGREGATE or GROUP BY above an inner `?` is a DIFFERENT failure
-#     from the rest, and measuring it corrected an earlier guess: it
-#     PREPARES (type 1, the slots described) and its op_execute is
-#     accepted - it fails at the FETCH, `fetch plan = JoinGroup`. The
-#     fold binds its OWN filter/having/parts with the arguments but reads
-#     its BASE row source without them, so the derived inner's `?` is
-#     still unbound when the fold pulls rows. An explicit base does NOT
-#     retire this one; binding the base row source would.
+#   (an AGGREGATE or GROUP BY above an inner `?` used to be recorded here
+#   too. It was a FETCH-time failure, not a refusal - the fold read its
+#   base row source without the arguments - and materialising a bound
+#   derived base before the fold runs retired it; its cells are live
+#   above. The JOIN above an inner `?` is NOT the same thing: it refuses
+#   at PLAN time, in plan_join_bound's own copy of the old guard.)
 refusesq "a ? in the INNER projection" "SELECT C FROM (SELECT CAST(? AS INTEGER) AS C FROM EMP) X" '[5]'
 refusesq "a derived SIDE of a join" "SELECT X.ID FROM DEPT D JOIN (SELECT ID, DEPT_ID FROM EMP WHERE ID > ?) X ON D.ID = X.DEPT_ID ORDER BY X.ID" '[1]'
 
