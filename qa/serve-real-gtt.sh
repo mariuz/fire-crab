@@ -97,6 +97,104 @@ check "fire-crab: GTT ON COMMIT DELETE ROWS" "$(node_run "$G1")" "OK"
 check "fire-crab: GTT ON COMMIT PRESERVE ROWS" "$(node_run "$G2")" "OK"
 check "fire-crab: GTT with no ON COMMIT clause" "$(node_run "$G3")" "OK"
 check "fire-crab: a plain persistent table still works" "$(node_run "$R")" "OK"
+
+# ------------------------------------------------------------------
+# THE ROWS, not just the catalog.
+#
+# Everything above is DDL - a GTT's catalog row, its format, its type
+# code - and this gate's own header used to say the rows "live in
+# per-connection temporary space at runtime, which is not part of what
+# fire-crab writes". That sentence was the gap: fire-crab DID write
+# them, to the pages, like any other table's, and then never applied
+# the schedule that makes a temporary table temporary. Measured on
+# 2bd44e3, the commit before this one:
+#
+#     ON COMMIT DELETE ROWS, after the commit   fc 2, engine 0
+#     ...after a ROLLBACK                       fc 2, engine 0
+#     a FRESH attachment reading G1 / G2        fc 4 / 2, engine 0 / 0
+#
+# i.e. rows that outlived the transaction that wrote them AND were
+# handed to the next attachment - a silent wrong answer on a shape
+# this server already accepted.
+#
+# Held against the live engine over TCP on BOTH sides: a bare path
+# would attach the embedded engine here and compare two transports at
+# once (the recorded rule).
+chmod 666 "$WORK" "$REF" 2>/dev/null
+cat > "$D/gtt-life-1.sql" <<'SQL'
+SET LIST ON;
+-- G1 IS (A INTEGER, B VARCHAR(5)) - two columns. A one-value INSERT
+-- here failed on BOTH sides, so A/B/D/E all read 0 = 0 and five cells
+-- reported OK while measuring nothing at all. Match the shape.
+INSERT INTO G1 VALUES (1, 'x'); INSERT INTO G1 VALUES (2, 'y');
+SELECT COUNT(*) A_DELETE_ROWS_IN_TX FROM G1;
+COMMIT;
+SELECT COUNT(*) B_DELETE_ROWS_AFTER_COMMIT FROM G1;
+INSERT INTO G2 VALUES (1); INSERT INTO G2 VALUES (2);
+COMMIT;
+SELECT COUNT(*) C_PRESERVE_AFTER_COMMIT FROM G2;
+INSERT INTO G1 VALUES (3, 'z');
+ROLLBACK;
+SELECT COUNT(*) D_DELETE_ROWS_AFTER_ROLLBACK FROM G1;
+SQL
+# a SECOND attachment, after the first one has gone: its rows are not
+# this session's to see, whichever kind of GTT they are in
+cat > "$D/gtt-life-2.sql" <<'SQL'
+SET LIST ON;
+SELECT COUNT(*) E_FRESH_ATTACHMENT_SEES_G1 FROM G1;
+SELECT COUNT(*) F_FRESH_ATTACHMENT_SEES_G2 FROM G2;
+SQL
+life() {
+    "$ISQL" -q -user "$U" -pas "$P" "$1" < "$D/gtt-life-1.sql" 2>&1 | strip | grep -av '^$'
+    "$ISQL" -q -user "$U" -pas "$P" "$1" < "$D/gtt-life-2.sql" 2>&1 | strip | grep -av '^$'
+}
+fc_life=$(life "127.0.0.1/$PORT:$WORK")
+en_life=$(life "127.0.0.1/${FC_REAL_PORT:-3050}:$REF")
+# THE POSITIVE CONTROL, and this block exists because it was missing:
+# every cell below compares fire-crab against the ENGINE, so a probe
+# that wrote nothing makes both sides agree on zero and the whole
+# section passes while measuring nothing. The engine MUST see its own
+# two rows inside the transaction, or these numbers mean nothing.
+en_a=$(printf '%s\n' "$en_life" | grep -a '^A_DELETE_ROWS_IN_TX' | tr -s ' ')
+if [ "$en_a" != "A_DELETE_ROWS_IN_TX 2" ]; then
+    echo "DIFF the row-lifetime probe did not write on the ENGINE side: [$en_a]"
+    echo "     (its INSERTs failed - every cell below would compare 0 with 0)"
+    fail=1
+fi
+# A CELL THAT READS NOTHING IS NOT A CELL: both sides empty would
+# compare equal and report six passes while measuring none.
+if [ -z "$fc_life" ] || [ -z "$en_life" ]; then
+    echo "DIFF the row-lifetime probe read nothing (fc=[$fc_life] engine=[$en_life])"; fail=1
+else
+    for k in A_DELETE_ROWS_IN_TX B_DELETE_ROWS_AFTER_COMMIT C_PRESERVE_AFTER_COMMIT \
+             D_DELETE_ROWS_AFTER_ROLLBACK E_FRESH_ATTACHMENT_SEES_G1 F_FRESH_ATTACHMENT_SEES_G2; do
+        g=$(printf '%s\n' "$fc_life" | grep -a "^$k" | tr -s ' ')
+        w=$(printf '%s\n' "$en_life" | grep -a "^$k" | tr -s ' ')
+        # PER CELL, not once for the block: a key that reads empty on
+        # BOTH sides compares equal and prints OK while measuring
+        # nothing. The block-level guard above cannot see that.
+        if [ -z "$g" ] || [ -z "$w" ]; then
+            echo "DIFF row lifetime: $k read nothing (fc=[$g] engine=[$w])"; fail=1
+        elif [ "$g" = "$w" ]; then
+            # the VALUE is printed on success too, so a run that agrees
+            # for the wrong reason is visible in the log
+            echo "OK   row lifetime: $k [$w]"
+        else
+            echo "DIFF row lifetime: $k"; echo "     fc=[$g] engine=[$w]"; fail=1
+        fi
+    done
+fi
+# RECORDED, NOT FIXED - and NOT this slice's doing. Through ISQL, a
+# `COMMIT RETAIN` over a DELETE ROWS GTT leaves the engine 2 rows and
+# fire-crab 0. The wire contract is not what differs: driven through
+# firebird-driver, every form agrees (explicit commit(retaining=True)
+# 2, a following plain commit 0, a plain commit after an insert 0, the
+# DSQL text `COMMIT RETAIN` 2). What differs is that isql sends fc an
+# EXTRA plain op_commit (op 30) straight after the retaining statement
+# - present in the trace of the previous binary too, byte for byte -
+# and that commit legitimately empties the table. The divergence is in
+# what isql is answered about a DSQL COMMIT RETAIN, which is its own
+# chunk; the purge is only what made it visible.
 kill $srv 2>/dev/null; wait $srv 2>/dev/null
 
 typeq() { "$ISQL" -q -b -user "$U" -pas "$P" "$1" 2>&1 <<'SQL' | strip | grep -v '^$'

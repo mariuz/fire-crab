@@ -82356,6 +82356,155 @@ fn retain_end(database: &mut Option<Database>, kept: Retained, committed: bool) 
     }
 }
 
+/// The GLOBAL TEMPORARY TABLES of this database, as `(relation id,
+/// RDB$RELATION_TYPE)` - 4 for ON COMMIT PRESERVE ROWS, 5 for ON COMMIT
+/// DELETE ROWS.
+///
+/// Held in the metadata cache beside the other answers only DDL can
+/// change, because the COMMIT path asks this EVERY TIME and the answer
+/// for a database with no GTT at all - which is nearly every database -
+/// must cost a hash lookup rather than a walk of `RDB$RELATIONS`.
+/// An attachment with uncommitted DDL of its own reads the catalog
+/// directly, exactly as [Database::relation_meta] does and for the same
+/// reason: the cache is shared, and what this attachment can see is not.
+fn gtt_relations(db: &Database) -> std::sync::Arc<Vec<(u16, i64)>> {
+    let read = || -> Vec<(u16, i64)> {
+        let Some((rcols, rdescs)) = sys_rel(db, "RDB$RELATIONS") else {
+            return Vec::new();
+        };
+        let fid = |n: &str| rcols.iter().find(|c| c.name == n).map(|c| c.field_id as usize);
+        let (Some(id_f), Some(ty_f)) = (fid("RDB$RELATION_ID"), fid("RDB$RELATION_TYPE")) else {
+            return Vec::new(); // a pre-GTT ODS: nothing here is temporary
+        };
+        let fmts = vec![(0u8, rdescs)];
+        let mut out: Vec<(u16, i64)> = Vec::new();
+        for_each_record(db, 6, &fmts, usize::MAX, |v| {
+            let ty = match v.get(ty_f) {
+                Some(Value::Int(t)) => *t,
+                _ => return,
+            };
+            if ty != 4 && ty != 5 {
+                return;
+            }
+            if let Some(Value::Int(id)) = v.get(id_f) {
+                out.push((*id as u16, ty));
+            }
+        });
+        out
+    };
+    if db.did_ddl {
+        return std::sync::Arc::new(read());
+    }
+    db.meta.memo("gtt-rels", "", read)
+}
+
+/// How a GTT purge writes its deletes.
+#[derive(Clone, Copy, PartialEq)]
+enum GttPurge {
+    /// ON the transaction that is ending: the delete stubs carry its id
+    /// and become real when it commits, exactly as a DELETE statement's
+    /// do. The purge is part of the commit, not a write beside it.
+    Riding,
+    /// Under an id of its own that is ALREADY COMMITTED, flushed here.
+    /// The detach purge has no transaction to ride - the attachment's
+    /// was just killed - and nothing after it would ever flush.
+    Standalone,
+}
+
+/// DELETE THE ROWS OF THIS ATTACHMENT'S TEMPORARY TABLES.
+///
+/// A GTT's rows are per-attachment and die on a schedule its type sets:
+/// ON COMMIT DELETE ROWS (type 5) at every non-retaining commit, ON
+/// COMMIT PRESERVE ROWS (type 4) when the attachment goes. Measured
+/// against the engine, one attachment, two rows in each:
+///
+/// ```text
+///   insert; commit           -> DELETE ROWS 0, PRESERVE ROWS 2
+///   insert; rollback         -> 0 (both: the ordinary undo)
+///   insert; commit retain    -> 2 (BOTH KINDS - a retaining commit
+///                                  keeps them, which is why this is
+///                                  called where `retain` is known and
+///                                  not from inside [Database::commit_tx])
+///   a FRESH attachment       -> 0, 0
+/// ```
+///
+/// fire-crab stores those rows on the pages like any other table's, so
+/// this is where the schedule is kept. Storing them somewhere else
+/// instead - a per-connection heap - was the first design and it is the
+/// wrong one: GTT rows honour ROLLBACK and SAVEPOINTS (measured: an
+/// uncommitted insert goes back, `rollback to savepoint` takes 3 rows to
+/// 2), so a heap would have to re-implement the undo windows and MVCC
+/// that the pages already give correctly. What was missing was never the
+/// storage; it was the two moments the rows are supposed to die.
+///
+/// WHOSE ROWS GO. `collect_dml_targets` sees what THIS attachment sees,
+/// so another attachment's UNCOMMITTED rows are invisible here and
+/// cannot be purged by somebody else's commit - the MVCC that already
+/// hides them is what makes the commit purge safe to run unguarded. Its
+/// COMMITTED rows are a different matter, which is why the DETACH purge
+/// runs only when this is the LAST attachment (see its call site): the
+/// engine keeps a second attachment's PRESERVE rows across the first's
+/// detach (measured), and deleting them would be a worse answer than
+/// leaving them.
+fn purge_gtt_rows(db: &mut Database, want: &[i64], mode: GttPurge, why: &str) -> Result<(), String> {
+    if db.is_read_only() {
+        return Ok(());
+    }
+    let rels: Vec<(u16, i64)> = gtt_relations(db)
+        .iter()
+        .copied()
+        .filter(|(_, ty)| want.contains(ty))
+        .collect();
+    if rels.is_empty() {
+        return Ok(()); // the common case, and it costs one cache lookup
+    }
+    let trace = trace_on();
+    for (rel, ty) in rels {
+        let formats = {
+            let image = db.bytes();
+            relation_formats(&image, db.page_size, rel)
+        };
+        if formats.is_empty() {
+            continue;
+        }
+        let targets: Vec<(u32, u16)> = match collect_dml_targets(db, rel, &formats, &None, &None) {
+            Ok(rows) => rows.into_iter().map(|(page, slot, _, _)| (page, slot)).collect(),
+            // a record in limbo stops a DELETE statement, and it stops
+            // this the same way: those rows are not the purge's to judge
+            Err(_) => continue,
+        };
+        if targets.is_empty() {
+            continue;
+        }
+        match mode {
+            GttPurge::Riding => {
+                let (mut work, tx) = db.work_copy_with_tx()?;
+                fire_crab_ods::delete_records_under(&mut work, db.page_size, rel, &targets, tx)?;
+                db.install_dirty(work);
+                // the write landed, so the id it reserved is this
+                // attachment's now - the same pairing every statement makes
+                db.adopt_tx(tx);
+            }
+            GttPurge::Standalone => {
+                let mut work = db.work_copy()?;
+                let tx = fire_crab_ods::dml::begin_committed_tx(&mut work, db.page_size)?;
+                fire_crab_ods::delete_records_under(&mut work, db.page_size, rel, &targets, tx)?;
+                db.flush_and_install(work)?;
+            }
+        }
+        if trace {
+            eprintln!(
+                "[srv] GTT purge ({}): relation {} type {}, {} row(s)",
+                why,
+                rel,
+                ty,
+                targets.len()
+            );
+        }
+    }
+    Ok(())
+}
+
 /// End the transaction the way `outcome` says, and ANSWER WHETHER THE
 /// WRITE THAT ENDS IT SUCCEEDED.
 ///
@@ -92242,6 +92391,19 @@ fn after_auth(
                     } else if let Plan::TxControl { rollback, retain } = &*plan {
                         // ending the transaction discards every mark
                         if let Some(d) = database.as_mut() { d.savepoints.clear(); }
+                        // ON COMMIT DELETE ROWS, on the DSQL `COMMIT`.
+                        // Not on a ROLLBACK (the undo takes the rows
+                        // back by itself) and NOT ON `COMMIT RETAIN`,
+                        // where the engine keeps them - see [purge_gtt_rows].
+                        if !*rollback && !*retain {
+                            if let Some(d) = database.as_mut() {
+                                if let Err(e) = purge_gtt_rows(d, &[5], GttPurge::Riding, "commit") {
+                                    if trace_on() {
+                                        eprintln!("[srv] GTT purge at COMMIT failed: {}", e);
+                                    }
+                                }
+                            }
+                        }
                         let kept = if *retain { Some(retain_begin(&database)) } else { None };
                         let outcome = if *rollback {
                             let (outcome, undone) = rollback_now(&database);
@@ -94146,6 +94308,18 @@ fn after_auth(
                 // generator windows are stacked one per mark, so the two
                 // lists have to end together
                 if let Some(d) = database.as_mut() { d.savepoints.clear(); }
+                // ...and the same purge on the WIRE's commit, which is
+                // the one a driver sends (isql and firebird-driver both
+                // reach a GTT this way, never through the DSQL text)
+                if !rollback && !retain {
+                    if let Some(d) = database.as_mut() {
+                        if let Err(e) = purge_gtt_rows(d, &[5], GttPurge::Riding, "op_commit") {
+                            if trace_on() {
+                                eprintln!("[srv] GTT purge at op_commit failed: {}", e);
+                            }
+                        }
+                    }
+                }
                 let kept = if retain { Some(retain_begin(&database)) } else { None };
                 let outcome = if rollback {
                     let (outcome, undone) = rollback_now(&database);
@@ -95648,6 +95822,30 @@ fn after_auth(
                 }
                 db.end_write();
             }
+        }
+        // A TEMPORARY TABLE'S ROWS DIE WITH THE ATTACHMENT THAT WROTE
+        // THEM - both kinds, since a DELETE ROWS table can still hold
+        // the rows of a transaction that never committed. This is after
+        // the kill loop on purpose: those deletes must NOT ride a
+        // transaction that is about to be marked dead, so they go under
+        // a committed id of their own and are flushed here, the last
+        // thing this connection writes.
+        //
+        // ONLY WHEN THIS IS THE LAST ATTACHMENT. Measured on the engine:
+        // when A detaches, B still sees B's own PRESERVE rows - they are
+        // per-attachment, and fire-crab keeps them in one shared file
+        // where this purge cannot tell whose are whose. With somebody
+        // else still attached it does nothing, leaving the rows to be
+        // collected by the last one out: the old wrong answer (rows that
+        // outstay their attachment) is better than a new one (deleting a
+        // live session's data).
+        if db.attachments.attaches.load(std::sync::atomic::Ordering::SeqCst) == 1 {
+            if let Err(e) = purge_gtt_rows(db, &[4, 5], GttPurge::Standalone, "detach") {
+                if std::env::var("FC_SRV_TRACE").is_ok() {
+                    eprintln!("[srv] GTT purge at detach failed: {}", e);
+                }
+            }
+            db.end_write();
         }
     }
     Ok(())
