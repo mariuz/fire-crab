@@ -182,6 +182,18 @@ both "NAME NOT CONTAINING ? with a NULL bind" "NAME NOT CONTAINING ?" '[null]'
 both "a bound % is a literal percent" "NAME CONTAINING ?" '["%"]'
 both "a bound _ is a literal underscore" "NAME CONTAINING ?" '["_"]'
 
+# ...and over a NUMERIC side, where the column is RENDERED to its
+# decimal text first and the rendering has no case to fold. N holds
+# 1, 2, 3, 10, NULL; N92 holds 0, 0.5, -1.5, 10, NULL.
+both "N CONTAINING ? takes every '1'" "N CONTAINING ?" '["1"]'
+both "N CONTAINING ? takes the '0' of 10" "N CONTAINING ?" '["0"]'
+both "N CONTAINING ? with an INTEGER bind" "N CONTAINING ?" '[1]'
+both "N CONTAINING '' takes every non-NULL" "N CONTAINING ?" '[""]'
+both "N CONTAINING ? with a NULL bind" "N CONTAINING ?" '[null]'
+both "N NOT CONTAINING ?" "N NOT CONTAINING ?" '["1"]'
+both "N92 CONTAINING ? sees the fraction" "N92 CONTAINING ?" '["1.5"]'
+both "N92 CONTAINING ? sees the point" "N92 CONTAINING ?" '["."]'
+
 # --- 4. ? BETWEEN: a desugar into the mirrored comparisons ------------
 both "? BETWEEN ints" "? BETWEEN 1 AND 3" '[2]'
 both "? BETWEEN ints" "? BETWEEN 1 AND 3" '[5]'
@@ -338,17 +350,20 @@ fi
 # --- 9. refusals kept, engine answers recorded ------------------------
 # each of these the ENGINE answers (see the gate header); fire-crab
 # refuses rather than risk the engine's wilder semantics
-# The last two are THIS SLICE'S SCOPE BOUNDARY, deliberately drawn:
-# `<text col> CONTAINING ?` is answered now, but CONTAINING over an
-# INTEGER column was never probed (LIKE and STARTING render the column
-# to decimal text there; whether CONTAINING folds the rendering is a
-# guess), and a bound TESTED side hits a measured engine anomaly - under
-# a UTF8 attachment `? CONTAINING '<non-ascii>'` is false even SAME-CASE,
-# while every other combination is true. Answering either would risk a
-# wrong answer where a refusal is merely incomplete.
+# The last is what remains of THIS FAMILY'S SCOPE BOUNDARY. The
+# numeric-column half that stood here - `N CONTAINING ?` - was measured
+# and implemented the chunk after it was recorded, and THIS LOOP IS WHAT
+# SAID SO: it answers on a fresh binary and printed "now agrees (update
+# the refusal list)". A recorded refusal that carries the engine's own
+# answer expires by itself; one written as a bare comment would have
+# rotted silently.
+#
+# What is left is the bound TESTED side, which hits a measured engine
+# anomaly: under a UTF8 attachment `? CONTAINING '<non-ascii>'` is false
+# even SAME-CASE, while every other combination is true. Answering it
+# would mean saying TRUE where the engine says false.
 for pair in "? IN (?, 2)|[1,1]" "? IN (1, 'a')|[\"a\"]" "? BETWEEN 1 AND 'x'|[2]" \
-            "? IS DISTINCT FROM 5|[4]" "N CONTAINING ?|[\"1\"]" \
-            "? CONTAINING 'o'|[\"ok\"]"; do
+            "? IS DISTINCT FROM 5|[4]" "? CONTAINING 'o'|[\"ok\"]"; do
     pred="${pair%%|*}"; args="${pair##*|}"
     a=$(query "SELECT ID FROM T WHERE $pred ORDER BY ID" "$args" "$PORT" "$A")
     case "$a" in

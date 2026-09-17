@@ -89554,7 +89554,10 @@ fn resolve_expr_term(
                 sub_type: if matches!(lhs.type_of(descs), Some(ExprType::Text)) {
                     text_param_cs(&lhs, descs)
                 } else {
-                    0
+                    // a NUMERIC side's fixed 30 is 30 CHARACTERS in the
+                    // attachment's charset, the same law [num_pat_desc]
+                    // carries - it was flat NONE here too
+                    ATT_SUBTYPE as i16
                 },
                 flags: if expr_has_col(&lhs) { 0 } else { PARAM_NOT_NULL },
                 offset: 4,
@@ -89618,7 +89621,30 @@ fn resolve_expr_term(
             containing_term(value, tt, p, *negated)
         }
         RawKind::Containing(Rhs::Null, _) => Term::Never,
-        RawKind::Containing(..) => return None, // a non-literal pattern
+        // `<numeric side> CONTAINING ?` - the bound-pattern twin of the
+        // literal arm above. The rendered decimal text has no case to
+        // fold, so the ttype is 0, exactly as the literal arm resolves a
+        // non-text side. Measured: `N CONTAINING ?` bound '1' takes
+        // N=1,10,100; '0' takes 10 and 100; an INTEGER bind renders; an
+        // EMPTY pattern takes every non-NULL row; a NULL bind is UNKNOWN
+        // under both polarities; and `N92 CONTAINING ?` bound '1.5'
+        // takes 1.50 and -1.50 while '.' takes every non-NULL.
+        //
+        // A TEXT side is NOT admitted here: a text COLUMN's bound
+        // pattern is [param_or_typed_term]'s (it claims the column's own
+        // descriptor, which is what the engine announces), and a text
+        // EXPRESSION's slot width is unprobed.
+        RawKind::Containing(Rhs::Param(slot, _), negated) => {
+            if !matches!(lhs.type_of(descs)?, ExprType::Int | ExprType::Numeric) {
+                return None;
+            }
+            if params.len() <= *slot {
+                params.resize(*slot + 1, None);
+            }
+            params[*slot] = Some(num_pat_desc());
+            return Some(Term::ExprContainingParam(Box::new(lhs), 0, *slot, *negated));
+        }
+        RawKind::Containing(..) => return None, // a binary pattern
         RawKind::Starting(Rhs::Str(p), negated) => {
             // temporal/approx/bool/numeric rendering under a prefix test
             // is unprobed - refuse those, answer text and integer sides
@@ -90313,14 +90339,39 @@ fn cond_no_raise(c: &Cond2, descs: &[Descriptor]) -> bool {
     }
 }
 
-/// The descriptor length of a LIKE/STARTING pattern `?` slot on ANY
-/// numeric column (NUMERIC/INTEGER/INT128/DECFLOAT): the engine describes
-/// it as a FIXED `VARYING(30)`, not the column's own width the way a TEXT
-/// column's pattern is (probed: N92, I, BIGINT, INT128, DECFLOAT(34) and
-/// (16) all len 30). A VARYING descriptor length carries the 2-byte count,
-/// so 32 announces 30. (A text column's pattern still claims the column's
-/// own descriptor, which is already its width.)
+/// The descriptor length of a LIKE/STARTING/CONTAINING pattern `?` slot
+/// on ANY numeric column (NUMERIC/INTEGER/INT128/DECFLOAT): a fixed
+/// THIRTY CHARACTERS, not the column's own width the way a TEXT
+/// column's pattern is (probed: N92, I, BIGINT, INT128, DECFLOAT(34)
+/// and (16) all 30). A VARYING descriptor length carries the 2-byte
+/// count, so 32 announces 30. (A text column's pattern still claims the
+/// column's own descriptor, which is already its width.)
+///
+/// **THIRTY CHARACTERS, NOT THIRTY BYTES** - and the doc here used to
+/// say "a FIXED VARYING(30)" because the probe behind it ran under ONE
+/// attachment, where the two coincide. Measured across three: the
+/// engine announces 30 bytes CHARACTER SET NONE under a NONE
+/// attachment, **120 bytes UTF8** under UTF8, and 30 WIN1252 under
+/// WIN1252 - the ordinary attachment law, which [num_pat_desc] now
+/// carries through the `ATT_SUBTYPE` sentinel.
 const NUM_LIKE_PATTERN_LEN: u16 = 32;
+
+/// The SYNTHESIZED text slot a numeric side's pattern predicate claims -
+/// [NUM_LIKE_PATTERN_LEN] characters in the ATTACHMENT's charset,
+/// nullable (measured; unlike a tested-side `?` pattern slot, which the
+/// engine marks NOT NULL). Four resolvers built this descriptor inline
+/// and all four were flat `CHARACTER SET NONE`, so every one of them was
+/// wrong under any non-NONE attachment.
+fn num_pat_desc() -> Descriptor {
+    Descriptor {
+        dtype: dtype::VARYING,
+        scale: 0,
+        length: NUM_LIKE_PATTERN_LEN,
+        sub_type: ATT_SUBTYPE as i16,
+        flags: 0,
+        offset: 4,
+    }
+}
 
 /// [typed_term] for a scaled NUMERIC/DECIMAL or INT128 column - the
 /// kinds [col_kind] does not classify. Comparisons take integer and
@@ -90346,20 +90397,23 @@ fn numeric_term(
         if params.len() <= slot {
             params.resize(slot + 1, None);
         }
-        params[slot] = Some(Descriptor {
-            dtype: dtype::VARYING,
-            scale: 0,
-            length: NUM_LIKE_PATTERN_LEN,
-            sub_type: 0,
-            flags: 0,
-            offset: 4,
-        });
+        params[slot] = Some(num_pat_desc());
     };
     Some(match raw {
         RawKind::Const(b) => Term::Const(b),
         RawKind::CmpExpr(..) => return None, // see typed_term
-        // a numeric operand's CONTAINING renders it to decimal text -
-        // the shape [resolve_expr_term] answers, not this one
+        // a numeric operand's CONTAINING renders it to decimal text.
+        // A LITERAL pattern is answered by the resolver that holds the
+        // column's descriptor; a BOUND one is answered HERE, because a
+        // scaled NUMERIC column reaches no other arm - [col_kind] names
+        // no kind for it, so [resolve_predicate] routes it straight to
+        // this resolver. Measured: `N92 CONTAINING ?` bound '1.5' takes
+        // 1.50 and -1.50, and '.' takes every non-NULL row - the
+        // rendering carries its decimal point.
+        RawKind::Containing(Rhs::Param(slot, _), negated) => {
+            claim_text(slot);
+            Term::ExprContainingParam(Box::new(Expr::Col(idx)), 0, slot, negated)
+        }
         RawKind::Containing(..) => return None,
         // a BINARY pattern against a DECFLOAT column: refused, as
         // every other text-shaped pattern is here
@@ -90458,14 +90512,7 @@ fn decfloat_term(
         if params.len() <= slot {
             params.resize(slot + 1, None);
         }
-        params[slot] = Some(Descriptor {
-            dtype: dtype::VARYING,
-            scale: 0,
-            length: NUM_LIKE_PATTERN_LEN,
-            sub_type: 0,
-            flags: 0,
-            offset: 4,
-        });
+        params[slot] = Some(num_pat_desc());
     };
     Some(match raw {
         // CONTAINING over a DECFLOAT column: the rendered text has no
@@ -90820,14 +90867,7 @@ fn param_or_typed_term(
                 if params.len() <= slot {
                     params.resize(slot + 1, None);
                 }
-                params[slot] = Some(Descriptor {
-                    dtype: dtype::VARYING,
-                    scale: 0,
-                    length: NUM_LIKE_PATTERN_LEN,
-                    sub_type: 0,
-                    flags: 0,
-                    offset: 4,
-                });
+                params[slot] = Some(num_pat_desc());
                 Some(Term::ExprLikeParam(
                     Box::new(Expr::Col(idx)),
                     slot,
@@ -90869,6 +90909,26 @@ fn param_or_typed_term(
                     negated,
                 ))
             }
+            // an INTEGER column: the engine RENDERS it to decimal text
+            // and matches the pattern against that, exactly as LIKE and
+            // STARTING do here - so the slot is the SYNTHESIZED 30, not
+            // the column's own descriptor, and the ttype is 0 because a
+            // rendered number has no case to fold. Measured: `N
+            // CONTAINING ?` bound '1' takes N=1,10,100 and '0' takes
+            // 10,100; an INTEGER bind renders; an EMPTY pattern takes
+            // every non-NULL row; a NULL bind is UNKNOWN both ways.
+            ColKind::Int => {
+                if params.len() <= slot {
+                    params.resize(slot + 1, None);
+                }
+                params[slot] = Some(num_pat_desc());
+                Some(Term::ExprContainingParam(
+                    Box::new(Expr::Col(idx)),
+                    0,
+                    slot,
+                    negated,
+                ))
+            }
             _ => None,
         },
         // `<text col> SIMILAR TO ?` - the pattern arrives at execute; the
@@ -90898,14 +90958,7 @@ fn param_or_typed_term(
                 if params.len() <= slot {
                     params.resize(slot + 1, None);
                 }
-                params[slot] = Some(Descriptor {
-                    dtype: dtype::VARYING,
-                    scale: 0,
-                    length: NUM_LIKE_PATTERN_LEN,
-                    sub_type: 0,
-                    flags: 0,
-                    offset: 4,
-                });
+                params[slot] = Some(num_pat_desc());
                 Some(Term::ExprStartingParam(Box::new(Expr::Col(idx)), slot, negated))
             }
             _ => None,

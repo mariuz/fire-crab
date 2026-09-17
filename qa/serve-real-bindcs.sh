@@ -210,6 +210,19 @@ cell "...and so does a bound prefix"  "SELECT 1 FROM RDB\$DATABASE WHERE ? START
 cell "a NULL pattern stays flat"      "SELECT 1 FROM RDB\$DATABASE WHERE ? LIKE NULL;"
 cell "a NULL prefix stays flat"       "SELECT 1 FROM RDB\$DATABASE WHERE ? STARTING WITH NULL;"
 
+# A NUMERIC COLUMN'S PATTERN SLOT IS SYNTHESIZED, AND IT SCALES TOO.
+# `I LIKE ?` over an INTEGER column describes a fixed THIRTY CHARACTERS
+# rather than the column's own width - and those 30 are characters in
+# the ATTACHMENT's charset: 30 bytes NONE, 120 UTF8, 30 WIN1252. Four
+# resolvers built that descriptor inline and every one was flat
+# CHARACTER SET NONE, so this was wrong on every non-NONE attachment -
+# the same defect as the parameter-pattern slots above, found by asking
+# the same question one column type further along.
+cell "an INTEGER column's LIKE slot"  "SELECT 1 FROM T WHERE I LIKE ?;"
+cell "...its STARTING slot"           "SELECT 1 FROM T WHERE I STARTING WITH ?;"
+cell "...and its CONTAINING slot"     "SELECT 1 FROM T WHERE I CONTAINING ?;"
+cell "a BIGINT column's LIKE slot"    "SELECT 1 FROM T WHERE B LIKE ?;"
+
 # THE SAME TWO RULES IN THE NUMERIC FAMILY, which is where they are
 # easiest to tell apart - and where assuming BETWEEN took the WIDER
 # bound (as IN takes the wider element) would be wrong in BOTH
@@ -269,6 +282,6 @@ cell "a NOT NULL column"             "SELECT 1 FROM T WHERE ? = NN;"
 
 kill $srv 2>/dev/null; wait $srv 2>/dev/null; trap - EXIT
 rm -f "$WORK" "$REF"
-[ "$ran" -ge 135 ] || { echo "FAIL only $ran checks ran (expected >= 135)"; fail=1; }
+[ "$ran" -ge 147 ] || { echo "FAIL only $ran checks ran (expected >= 147)"; fail=1; }
 [ $fail = 0 ] && echo "PASS bindcs ($ran checks)" || echo "FAIL bindcs"
 exit $fail
