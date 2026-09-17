@@ -173,6 +173,56 @@ both "a NONE column concatenated with a literal" \
 both "... and with a non-empty one"  \
     "SELECT N || 'x' AS R FROM TX WHERE ID=1"
 
+echo "--- 5. the CONCAT double-encode: VALUE diverges, DESCRIBE agrees ------"
+# Measured 2026-09-17 across NONE / UTF8 / WIN1252 attachments with a
+# NON-ASCII literal (an ASCII one transliterates identically everywhere
+# and cannot show this at all - the first probe of it was vacuous):
+#
+#   -ch NONE     'e-acute' || U   engine CL 3 / OL 4   fc 4 / 6   (fc DOUBLES)
+#                U || 'e-acute'   engine CL 3 / OL 4   fc 4 / 6
+#   -ch WIN1252  'e-acute' || U   engine CL 4 / OL 4   fc 4 / 6   (literal FIRST only)
+#   -ch UTF8     'e-acute' || W   engine CL 3 / OL 4   fc 3 / 3   (fc is SHORT)
+#                'e-acute' || O   engine CL 4 / OL 4   fc 3 / 3
+#
+# THE ANNOUNCED DESCRIPTOR AGREES ON EVERY ONE OF THEM - sqltype, VARYING
+# and charset are identical on both servers under all three attachments,
+# and every column||column pair agrees too. So this is a VALUE defect in
+# how operands are transcoded and joined, NOT the width algebra the
+# withdrawn attempt steered by (that one broke on announced widths, 160
+# vs 64, while values stayed byte-identical).
+#
+# Recorded rather than fixed: three widths meet one join rule here (a
+# literal carries a character count AND an octet count, resolve_text_cs
+# picks between them by the ATTACHMENT), and the divergences pull in
+# OPPOSITE directions. A rule that predicts all eighteen cells has not
+# been found, and the last attempt was withdrawn after three designs each
+# moved the failures between families.
+lenpair() { # <dsn> <expr> <flags>
+    printf 'SET HEADING OFF;\nSELECT CHAR_LENGTH(%s) AS CL, OCTET_LENGTH(%s) AS OL FROM TX WHERE ID=1;\n' "$2" "$2" |
+        timeout 25 "$ISQL" -q -user "$U" -pas "$P" ${3:-} "$1" 2>&1 | tr -s ' \n' ' '
+}
+known_len_diff() { # <label> <expr> [flags]
+    ran=$((ran + 1))
+    e=$(lenpair "$EN" "$2" "${3:-}"); c=$(lenpair "$FC" "$2" "${3:-}")
+    if [ -z "$e" ] || [ -z "$c" ]; then
+        echo "DIFF $1 [VACUOUS: a side did not answer] engine=[$e] fc=[$c]"; fail=1
+    elif [ "$c" != "$e" ]; then
+        echo "OK   still divergent (recorded): $1 engine=[$e] fc=[$c]"
+    else
+        echo "DIFF $1 now AGREES - the double-encode is fixed, update this gate"; fail=1
+    fi
+}
+known_len_diff "literal || UTF8 col, NONE attachment"    "'é' || U" "-ch NONE"
+known_len_diff "UTF8 col || literal, NONE attachment"    "U || 'é'" "-ch NONE"
+known_len_diff "literal || UTF8 col, WIN1252 attachment" "'é' || U" "-ch WIN1252"
+known_len_diff "literal || WIN1252 col, UTF8 attachment" "'é' || W" "-ch UTF8"
+known_len_diff "literal || OCTETS col, UTF8 attachment"  "'é' || O" "-ch UTF8"
+# ...and the cells that must NOT move: every column||column pair agrees
+# today, and the withdrawn attempt is exactly what broke them.
+both "column || column stays right (UTF8||WIN1252)" "SELECT U || W AS R FROM TX WHERE ID=1"
+both "column || column stays right (UTF8||OCTETS)"  "SELECT U || O AS R FROM TX WHERE ID=1"
+both "column || column stays right (WIN1252||NONE)" "SELECT W || N AS R FROM TX WHERE ID=1"
+
 echo "----------------------------------------------------------------------"
 [ "$ran" -ge 42 ] || { echo "FAIL only $ran checks ran"; fail=1; }
 [ $fail -eq 0 ] && echo "PASS $ran checks" || echo "FAIL"
