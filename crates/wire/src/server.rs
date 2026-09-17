@@ -43217,6 +43217,33 @@ fn plan_over_source(
                             build_expr_col(&raw, &n, &columns, &descs)?
                         };
                         pc.fname = Some(fname.clone());
+                        // NOT NULL TRAVELS THROUGH THE SCOPE, and an
+                        // EXPRESSION over a wrapped column has to
+                        // recompute it. The plain-column branch above
+                        // copies the inner bit explicitly, which is why
+                        // `SELECT Z.ID FROM (SELECT ID FROM NN) Z` kept
+                        // it while `SELECT Z.ID + 1 ...` lost it - the
+                        // synthetic view's descriptors carry `flags: 0`
+                        // ([desc_of_projcol]) and [mark_not_null_cols]
+                        // needs a base TABLE, which a derived scope has
+                        // not got, so the closure it would use answers
+                        // "nullable" for every field.
+                        //
+                        // Measured: the engine announces `ID + 1` over a
+                        // derived table, a CTE, a UNION branch and a
+                        // two-deep wrap all NOT NULL, for arithmetic,
+                        // negation, CAST, a function, UPPER, `||` and a
+                        // CASE whose branches are both fixed - while
+                        // the same expression over a NULLABLE column
+                        // stays nullable on both servers, which is why
+                        // this reads the inner column's own bit rather
+                        // than setting the flag.
+                        let is_nn =
+                            |fid: usize| cols.get(fid).is_some_and(|c| c.sql_type & 1 == 0);
+                        let fixed = pc.expr.as_ref().is_some_and(|e| !expr_nullable(e, &is_nn));
+                        if fixed {
+                            pc.sql_type &= !1;
+                        }
                         out_cols.push(pc)
                     }
                     SelItem::Win(func, part_raw, order_raw, frame, alias, fname) => {
@@ -51719,9 +51746,17 @@ fn plan_query_inner_at(
 /// it refuses - a trap this codebase has already paid for once.
 /// A plain base column that is NOT NULL describes in the even, not-nullable
 /// form (probed: `ID INT NOT NULL PRIMARY KEY` is sqltype 496, a nullable
-/// column 497). Only a column read straight from the relation qualifies -
-/// an expression over it, or a column on the outer side of a join, stays
-/// nullable (the engine's rule for those is a later slice).
+/// column 497).
+///
+/// The note that used to stand here - "only a column read straight from
+/// the relation qualifies; an expression over it stays nullable" -
+/// described an older slice and is no longer true of this function: the
+/// `Some(e)` arm below runs [expr_nullable], so `ID + 1` over a NOT NULL
+/// column describes NOT NULL here exactly as the engine does (measured).
+/// A column on the outer side of a join is settled by
+/// [mark_not_null_join], and an expression over a DERIVED or CTE column
+/// by the projection in [plan_over_source], which has no base table to
+/// look up and reads the inner column's own bit instead.
 fn mark_not_null_cols(cols: &mut [ProjCol], db: &Database, table: &str) {
     // an empty set still matters: a literal or CURRENT_TIMESTAMP over a
     // table with no NOT NULL column is not-nullable all the same

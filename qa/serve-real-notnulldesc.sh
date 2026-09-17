@@ -58,6 +58,10 @@ run() { # <conn> <sql>
 }
 while IFS= read -r q; do
     [ -z "$q" ] && continue
+    # a `--` line is documentation, not a statement: sent to isql it
+    # produces no sqltype output on EITHER side, so it would compare
+    # empty to empty, score OK, and count toward the floor
+    case "$q" in --*) continue ;; esac
     e=$(run "127.0.0.1/$REAL:$B" "$q"); c=$(run "127.0.0.1/$PORT:$A" "$q")
     check "$q -> $e" "$c" "$e"
 done <<'SQL'
@@ -88,6 +92,39 @@ SELECT DISTINCT ID, V FROM A;
 SELECT ROW_NUMBER() OVER (), ID FROM A;
 SELECT a.ID FROM A a WHERE EXISTS (SELECT 1 FROM B b WHERE b.AID = a.ID);
 SELECT ID FROM A WHERE ID = ?;
+-- NOT NULL TRAVELS THROUGH A SCOPE, AND AN EXPRESSION OVER A WRAPPED
+-- COLUMN KEEPS IT. A derived table, a CTE and a union all carry the bit
+-- (those already passed above); what lost it was an EXPRESSION in the
+-- OUTER query over such a column - the synthetic view's descriptors
+-- carry no not-null flag and mark_not_null_cols needs a base table a
+-- derived scope has not got, so every field looked nullable. Measured:
+-- the engine announces all of these fixed, for every expression kind.
+SELECT Z.ID + 1 FROM (SELECT ID FROM A) Z;
+SELECT -Z.ID FROM (SELECT ID FROM A) Z;
+SELECT CAST(Z.ID AS BIGINT) FROM (SELECT ID FROM A) Z;
+SELECT ABS(Z.ID) FROM (SELECT ID FROM A) Z;
+SELECT UPPER(Z.S) FROM (SELECT S FROM A) Z;
+SELECT Z.S || 'x' FROM (SELECT S FROM A) Z;
+SELECT CASE WHEN Z.ID > 0 THEN Z.ID ELSE 1 END FROM (SELECT ID FROM A) Z;
+WITH C AS (SELECT ID FROM A) SELECT ID + 1 FROM C;
+SELECT U.ID + 1 FROM (SELECT ID FROM A UNION ALL SELECT ID FROM B) U;
+SELECT Z.ID + 1 FROM (SELECT * FROM (SELECT ID FROM A) Y) Z;
+SELECT Z.G + 1 FROM (SELECT ID AS G FROM A GROUP BY ID) Z;
+-- the controls that keep this honest: the bit must be READ from the
+-- inner column, never set. A nullable source stays nullable, a plain
+-- pass-through was already right, an expression computed INSIDE the
+-- derived table was already right, and a GROUP BY key through a derived
+-- table agrees today (the roadmap listed it as a loser - it is stale).
+SELECT Z.V + 1 FROM (SELECT V FROM A) Z;
+SELECT Z.ID FROM (SELECT ID FROM A) Z;
+SELECT * FROM (SELECT ID + 1 AS E FROM A) Z;
+SELECT * FROM (SELECT ID FROM A GROUP BY ID) Z;
 SQL
 echo "ran $ran checks"
+# a statement that silently stops being read (a heredoc edited wrong, a
+# stray terminator) would leave this gate green over nothing
+if [ "$ran" -lt 42 ]; then
+    echo "DIFF only $ran checks ran (expected at least 42) - did one silently skip?"
+    fail=1
+fi
 exit $fail
