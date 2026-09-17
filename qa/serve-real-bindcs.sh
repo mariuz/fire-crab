@@ -287,21 +287,18 @@ cell "a BIGINT column's LIKE slot"    "SELECT 1 FROM T WHERE B LIKE ?;"
 # argument is a byte carrier and never moves; a declared NOT NULL
 # parameter marks its slot NOT NULL; and a LITERAL argument claims no
 # slot at all.
-echo "-- a procedure call's ARGUMENT slots (EXECUTE PROCEDURE) --"
+echo "-- a procedure call's ARGUMENT slots --"
+cell "a call's arguments in the FROM"  "SELECT K FROM PU(?, ?);"
 cell "...through EXECUTE PROCEDURE"   "EXECUTE PROCEDURE PU(?, ?);"
 cell "a NOT NULL parameter"           "EXECUTE PROCEDURE PN(?, ?);"
 cell "a literal claims no slot"       "EXECUTE PROCEDURE PU('ab', ?);"
-# RECORDED, NOT FIXED - the FROM-clause form (`SELECT K FROM PU(?, ?)`)
-# still refuses. Its describe is measured (the same declared-parameter
-# law as above: 20/UTF8 under NONE and UTF8, 5/WIN1252 under WIN1252,
-# and `... WHERE K = ?` numbers three slots in TEXT ORDER), but the
-# route it takes rebuilds the statement through `sql_over_from`, which
+# RECORDED, NOT FIXED - a CLAUSE over the call (`... WHERE K = ?`) still
+# refuses. Its describe is measured (three slots, in TEXT ORDER), but
+# that shape takes the bound-row-source route, where `sql_over_from`
 # SPLICES THE FROM ITEM OUT - deleting the call's `?` from the text - and
-# the outer re-plan then renumbers from zero and collides with the
-# argument slots. Fixing it needs `plan_over_source` to accept a
-# parameter BASE, which is a slice of its own; an attempt that claimed
-# the slots without it made `SELECT FIRST 1 K FROM PU(?, ?)` ANSWER
-# K = NULL instead of refusing, and was reverted for that reason.
+# the re-plan renumbers from zero, colliding with the argument slots.
+# It needs `plan_over_source` to accept a parameter BASE: its ungrouped
+# branch starts at `proj_params`, not at the statement's own count.
 # ...and the OUTPUT side of the same descriptor. A procedure parameter is
 # rebuilt from RDB$FIELDS, where the charset is in RDB$CHARACTER_SET_ID -
 # a table column's comes from the stored record format, whose sub_type
@@ -391,6 +388,6 @@ cell "a NOT NULL column"             "SELECT 1 FROM T WHERE ? = NN;"
 
 kill $srv 2>/dev/null; wait $srv 2>/dev/null; trap - EXIT
 rm -f "$WORK" "$REF"
-[ "$ran" -ge 204 ] || { echo "FAIL only $ran checks ran (expected >= 204)"; fail=1; }
+[ "$ran" -ge 207 ] || { echo "FAIL only $ran checks ran (expected >= 207)"; fail=1; }
 [ $fail = 0 ] && echo "PASS bindcs ($ran checks)" || echo "FAIL bindcs"
 exit $fail

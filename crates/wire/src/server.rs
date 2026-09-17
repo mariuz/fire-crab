@@ -9302,6 +9302,10 @@ enum Plan {
         cols: Vec<ProjCol>,
         /// which output parameter each projected column reads
         picks: Vec<usize>,
+        /// `(argument position, statement slot)` for each `?` argument -
+        /// the value arrives at op_execute and is written into `args`
+        /// there, as [Plan::ProcInvoke] already does it
+        arg_slots: Vec<(usize, usize)>,
     },
     /// `COMMIT` / `ROLLBACK` arriving as a PREPARED STATEMENT. isql does
     /// not send op_rollback for a typed `ROLLBACK;` - it prepares and
@@ -46115,9 +46119,23 @@ fn materialise_procedures(
     // see [PsqlFrame::stop_after]. `None` runs the body out.
     cap: Option<BodyCap>,
 ) -> Result<bool, ProcErr> {
-    if let Plan::ProcSelect { name, args, cols, picks } = &*plan {
-        let (name, args, cols, picks) =
-            (name.clone(), args.clone(), cols.clone(), picks.clone());
+    if let Plan::ProcSelect { name, args, cols, picks, arg_slots } = &*plan {
+        let (name, mut args, cols, picks, arg_slots) =
+            (name.clone(), args.clone(), cols.clone(), picks.clone(), arg_slots.clone());
+        // THE BOUND VALUES BECOME THE ARGUMENTS HERE - the plan was built
+        // at prepare with a seat per `?`
+        for (pos, slot) in &arg_slots {
+            let Some(v) = params.get(*slot).and_then(wireparam_arg_value) else {
+                return Err(ProcErr {
+                    rows: Vec::new(),
+                    text: format!("procedure {}: unbound argument", name),
+                    status: None,
+                });
+            };
+            if *pos < args.len() {
+                args[*pos] = v;
+            }
+        }
         // A CAP'S PREDICATE SPEAKS THE PROCEDURE'S OWN OUTPUT POSITIONS,
         // which is what a suspended row carries only when `picks` is the
         // identity - the call announced every output, in order. It is for
@@ -46396,6 +46414,10 @@ fn plan_kind(p: &Plan) -> String {
         Plan::JoinGroup { .. } => "JoinGroup".to_string(),
         Plan::Project { .. } => "Project".to_string(),
         Plan::Refused => "Refused".to_string(),
+        Plan::ProcSelect { args, picks, .. } => {
+            format!("ProcSelect[args={},picks={}]", args.len(), picks.len())
+        }
+        Plan::ProcInvoke { args, .. } => format!("ProcInvoke[args={}]", args.len()),
         Plan::ProcRows { rows, then, .. } => format!(
             "ProcRows[{}{}]",
             rows.len(),
@@ -49211,13 +49233,58 @@ fn plan_query_inner_ctx(
                     // the vectors, and `WHERE 1=0` does not suppress
                     // them). A parse failure keeps the generic refusal:
                     // the argument grammar is not this slice.
-                    let args: Vec<Value> = match pargs_text {
+                    let pargs_raw: Vec<Option<Value>> = match &pargs_text {
                         None => Vec::new(),
-                        Some(t) => match parse_proc_args(&t) {
+                        Some(t) => match parse_call_args(t, true) {
                             Some(a) => a,
                             None => return Some(Plan::Refused),
                         },
                     };
+                    let has_ph = pargs_raw.iter().any(|a| a.is_none());
+                    // ROUTE 2 IS NOT DRIVEN YET. A clause over the call
+                    // takes the bound-row-source route, where
+                    // [sql_over_from] SPLICES THE FROM ITEM OUT - the
+                    // call's `?` vanish from the text - and the re-plan
+                    // renumbers from zero, colliding with the argument
+                    // slots. It needs [plan_over_source] to accept a
+                    // parameter base; until then this keeps refusing,
+                    // rather than answering with the wrong values.
+                    if has_ph
+                        && (w_s.is_some() || g_s.is_some() || h_s.is_some() || o_s.is_some())
+                    {
+                        return Some(Plan::Refused);
+                    }
+                    // THE SLOT A CALL'S FIRST `?` CLAIMS is every
+                    // placeholder written BEFORE the FROM item, counted
+                    // quote-aware: slots are numbered by TEXT POSITION
+                    // (measured). `table_s` is a SLICE of `sql`, the same
+                    // containment [text_line_col] relies on.
+                    let arg_base = {
+                        let (h, q) = (sql.as_ptr() as usize, table_s.as_ptr() as usize);
+                        if q < h || q > h + sql.len() {
+                            return Some(Plan::Refused);
+                        }
+                        mask_literals(&sql[..q - h]).matches('?').count()
+                    };
+                    let mut args: Vec<Value> = Vec::with_capacity(pargs_raw.len());
+                    let mut arg_slots: Vec<(usize, usize)> = Vec::new();
+                    for (i, a) in pargs_raw.into_iter().enumerate() {
+                        match a {
+                            Some(v) => args.push(v),
+                            None => {
+                                let Some(param) = meta.ins.get(i) else {
+                                    return Some(Plan::Refused);
+                                };
+                                let slot = arg_base + arg_slots.len();
+                                if params.len() <= slot {
+                                    params.resize(slot + 1, None);
+                                }
+                                params[slot] = Some(param.desc.clone());
+                                arg_slots.push((i, slot));
+                                args.push(Value::Null);
+                            }
+                        }
+                    }
                     // ZERO OUTPUTS FIRST, and it beats the arity check
                     // too. Re-probed on the live engine, against the
                     // slice spec, which had the two the other way round:
@@ -49341,6 +49408,7 @@ fn plan_query_inner_ctx(
                             args: args.clone(),
                             cols: all_cols.clone(),
                             picks: (0..meta.outs.len()).collect(),
+                            arg_slots: Vec::new(),
                         };
                         let key = palias.clone().unwrap_or_else(|| {
                             pname.rsplit('.').next().unwrap_or(pname.as_str()).to_string()
@@ -49447,7 +49515,20 @@ fn plan_query_inner_ctx(
                         })
                         .collect();
                     let picks: Vec<usize> = picked.iter().map(|(p, _)| *p).collect();
-                    params.clear();
+                    // ...but NOT the slots this call's own `?` arguments
+                    // just claimed. Every other `params.clear()` in this
+                    // function precedes `return plan_query_inner(&rewritten,
+                    // ..)` - a RE-PLAN that re-claims every slot from
+                    // scratch - so clearing is right there. THIS one
+                    // returns a plan DIRECTLY, with nothing to refill the
+                    // sink, and it silently discarded every argument slot:
+                    // the statement then described ZERO input parameters
+                    // (which reads exactly like a refusal to a client).
+                    // Harmless until now only because a call's arguments
+                    // were always literals.
+                    if arg_slots.is_empty() {
+                        params.clear();
+                    }
                     // NOT SELECTABLE (RDB$PROCEDURE_TYPE = 2): the
                     // engine refuses at PREPARE, at BLR COMPILE, and
                     // never runs the body - so this sits LAST, after
@@ -49464,7 +49545,7 @@ fn plan_query_inner_ctx(
                             offset: proc_blr_offset(&pname, picks.len(), &args),
                         }));
                     }
-                    return Some(Plan::ProcSelect { name: pname, args, cols, picks });
+                    return Some(Plan::ProcSelect { name: pname, args, cols, picks, arg_slots });
                 } else if pargs_text.is_some() && procedure_defined(dbr, &pname) == false {
                     // `FROM NAME(args)` written as a CALL, but no such
                     // procedure: the engine's -204 "Procedure unknown"
@@ -86335,7 +86416,12 @@ fn psql_plan_rows(
     ctx: &SessionCtx,
     src_off: usize,
 ) -> Result<Vec<Vec<Value>>, PsqlStop> {
-    if let Plan::ProcSelect { name, args, picks, .. } = plan {
+    if let Plan::ProcSelect { name, args, picks, arg_slots, .. } = plan {
+        // a body's own statement carries no `?` to bind: a slot here
+        // would mean running the body with a NULL in its seat
+        if !arg_slots.is_empty() {
+            return Err(PsqlStop::Unsupported);
+        }
         let project = |sus: Vec<Vec<Value>>| -> Vec<Vec<Value>> {
             sus.iter()
                 .map(|r| picks.iter().map(|p| r.get(*p).cloned().unwrap_or(Value::Null)).collect())
@@ -93897,13 +93983,28 @@ fn after_auth(
                     }
                     let (pname, pargs, icols, picks, outer) = match &*plan {
                         Plan::Modified { inner, cols, distinct, skip, take } => match &**inner {
-                            Plan::ProcSelect { name, args, cols: ic, picks } => (
-                                name.clone(),
-                                args.clone(),
-                                ic.clone(),
-                                picks.clone(),
-                                (cols.clone(), *distinct, *skip, *take),
-                            ),
+                            Plan::ProcSelect { name, args, cols: ic, picks, arg_slots } => {
+                                // ...and here too: a modifier over the
+                                // call runs the body on THIS arm, not
+                                // through materialise_procedures
+                                let mut a = args.clone();
+                                for (pos, slot) in arg_slots {
+                                    if let (Some(wp), true) =
+                                        (bound_args.get(*slot), *pos < a.len())
+                                    {
+                                        if let Some(v) = wireparam_arg_value(wp) {
+                                            a[*pos] = v;
+                                        }
+                                    }
+                                }
+                                (
+                                    name.clone(),
+                                    a,
+                                    ic.clone(),
+                                    picks.clone(),
+                                    (cols.clone(), *distinct, *skip, *take),
+                                )
+                            }
                             _ => unreachable!(),
                         },
                         _ => unreachable!(),

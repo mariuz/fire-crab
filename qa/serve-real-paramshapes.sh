@@ -271,11 +271,23 @@ both "a NULL value gates the bad pattern off" "? SIMILAR TO '['" '[null]'
 # wrong describe. Slots are numbered in TEXT ORDER across the whole
 # statement (measured), which is why the call-plus-WHERE shapes are
 # here: they pin the numbering, not just the binding.
-# RECORDED, NOT FIXED - a `?` in a FROM-clause procedure call. The
-# ANSWER contract is measured (the bound value reaches the body in the
-# right slot; `PU(?, ?) WHERE K = ?` numbers three slots in text order),
-# but the route rebuilds the statement without the call's placeholders,
-# so the slots collide. Only EXECUTE PROCEDURE is answered below.
+# A `?` ARGUMENT IN A FROM-CLAUSE CALL. The bound value must reach the
+# BODY, in the right slot: PU returns its SECOND argument and PX the
+# CHAR_LENGTH of its first, so a swapped pair or a dropped slot shows up
+# as a wrong ANSWER rather than only a wrong describe.
+bothq "both arguments bound" "SELECT K FROM PU(?, ?)" '["ab",7]'
+bothq "...and the order matters" "SELECT K FROM PU(?, ?)" '["zz",42]'
+bothq "a literal beside a bound one" "SELECT K FROM PU('ab', ?)" '[7]'
+bothq "the TEXT argument reaches the body" "SELECT K FROM PX(?)" '["abc"]'
+bothq "a NULL argument" "SELECT K FROM PU(?, ?)" '[null,5]'
+# ...and through a MODIFIER, which runs the body on its own arm rather
+# than through materialise_procedures - the seat has to be filled there
+# too, or the body runs with a NULL in it (which it once did).
+bothq "a modifier over the call" "SELECT FIRST 1 K FROM PU(?, ?)" '["ab",7]'
+# RECORDED, NOT FIXED - a CLAUSE over the call still refuses: that route
+# rebuilds the statement without the call's placeholders and renumbers
+# from zero. Measured: `PU(?, ?) WHERE K = ?` is three slots in text
+# order, and a nested call numbers AFTER an outer WHERE's `?`.
 bothq "EXECUTE PROCEDURE binds too" "EXECUTE PROCEDURE PU(?, ?)" '["ab",7]'
 
 # --- 4. ? BETWEEN: a desugar into the mirrored comparisons ------------
