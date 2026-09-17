@@ -112,6 +112,38 @@ both() { # <label> <sql> [charsets...]
     done
 }
 
+# A RECORDED GAP, NOT AN ASSERTION: fire-crab refuses where the engine
+# answers. Two things make this a real cell rather than a tombstone:
+# the ENGINE side must actually answer (a cell where both sides fail
+# measures nothing and is scored DIFF, not OK - the one-sided guard is
+# how a whole probe once scored twenty connection failures as twenty
+# divergences), and the day fire-crab starts answering, the cell goes
+# red and says so, because then it belongs in both() with the engine's
+# own value.
+refuses() { # <label> <sql> [charsets...]
+    local lbl="$1" sql="$2"; shift 2
+    local chs="${*:-NONE UTF8 WIN1252}"
+    printf 'SET HEADING OFF;\n%s;\n' "$sql" > "$Q"
+    for ch in $chs; do
+        ran=$((ran + 1))
+        local e f
+        e=$(run "127.0.0.1/$REAL:$B" "$ch"); f=$(run "127.0.0.1/$PORT:$A" "$ch")
+        case "$e" in
+            ""|*"Statement failed"*|*08004*|*08006*)
+                echo "DIFF [-ch $ch] $lbl: the ENGINE did not answer either - this cell measures nothing"
+                echo "     engine: $(printf '%.100s' "$e")"
+                fail=1
+                continue ;;
+        esac
+        case "$f" in
+            *"Statement failed"*) echo "OK   [-ch $ch] refused (recorded gap): $lbl" ;;
+            *) echo "DIFF [-ch $ch] $lbl now ANSWERS [$(printf '%.60s' "$f")]"
+               echo "     the gap is closed - promote this cell to both() against the engine"
+               fail=1 ;;
+        esac
+    done
+}
+
 # the raw byte vectors (note 3)
 E9=$(printf '\xe9'); NINEF=$(printf '\x9f'); SS=$(printf '\xc3\x9f'); EACC=$(printf '\xc3\xa9')
 
@@ -195,8 +227,70 @@ desc "N || 'x' announces a charset" "SELECT N || 'x' FROM T WHERE ID=1"
 desc "N alone"                      "SELECT N FROM T WHERE ID=1"
 desc "a bare literal"               "SELECT 'abc' FROM RDB\$DATABASE"
 
+# --- 7. THROUGH A DERIVED SCOPE ---------------------------------------
+# The same literal, wrapped in a derived table / CTE / nested scope. The
+# wrapper's synthetic descriptor carries the ATTACHMENT SENTINEL (-1),
+# and reading that as a ttype gave every consumer charset 255: the
+# describe announced 255, and the VALUE fell through to UTF-8 semantics -
+# OCTET_LENGTH counted the literal's UTF-8 spelling (4 for a 2-byte
+# 'é' under NONE, where the engine counts 2) and a concat raised a
+# truncation the engine never raises. Only a NONE attachment shows it;
+# under UTF8/WIN1252 the result is re-typed in the attachment's set, so
+# these cells MUST run under all three (note 1) or the class scores green.
+both "derived literal: octet_length"   "SELECT OCTET_LENGTH(Z.C) FROM (SELECT 'a${EACC}b' AS C FROM RDB\$DATABASE) Z"
+both "derived literal: char_length"    "SELECT CHAR_LENGTH(Z.C) FROM (SELECT 'a${EACC}b' AS C FROM RDB\$DATABASE) Z"
+both "derived literal: concat bytes"   "SELECT CAST(Z.C || 'x' AS VARCHAR(32) CHARACTER SET OCTETS) FROM (SELECT 'a${EACC}b' AS C FROM RDB\$DATABASE) Z"
+both "derived literal: upper bytes"    "SELECT CAST(UPPER(Z.C) AS VARCHAR(32) CHARACTER SET OCTETS) FROM (SELECT 'a${EACC}b' AS C FROM RDB\$DATABASE) Z"
+both "derived literal: substring bytes" "SELECT CAST(SUBSTRING(Z.C FROM 1 FOR 2) AS VARCHAR(32) CHARACTER SET OCTETS) FROM (SELECT 'a${EACC}b' AS C FROM RDB\$DATABASE) Z"
+# A CTE carries the same sentinel and the same law - proved here with an
+# ASCII literal, because a NON-ASCII literal inside a CTE refuses at
+# prepare for an unrelated reason recorded below.
+both "CTE literal: octet_length"       "WITH Q AS (SELECT 'abc' AS C FROM RDB\$DATABASE) SELECT OCTET_LENGTH(Q.C) FROM Q"
+both "CTE literal: concat bytes"       "WITH Q AS (SELECT 'abc' AS C FROM RDB\$DATABASE) SELECT CAST(Q.C || 'x' AS VARCHAR(32) CHARACTER SET OCTETS) FROM Q"
+
+# RECORDED, NOT ASSERTED: a NON-ASCII literal inside a CTE refuses with a
+# contentless 42000 at PREPARE - on this binary and on b1df783 alike, so
+# it is older than the charset fix and not caused by it. It is the
+# LITERAL's bytes and not the CTE that does it: with an ASCII literal
+# every CTE shape above agrees (plain column, ||, OCTET_LENGTH,
+# CHAR_LENGTH, CAST to OCTETS, CAST to VARCHAR, UPPER, qualified and
+# unqualified), and the DERIVED-TABLE twin of this very statement answers
+# correctly. The engine answers 4 and 61C3A96278.
+refuses "CTE + non-ASCII literal: octet_length" "WITH Q AS (SELECT 'a${EACC}b' AS C FROM RDB\$DATABASE) SELECT OCTET_LENGTH(Q.C) FROM Q"
+refuses "CTE + non-ASCII literal: concat bytes" "WITH Q AS (SELECT 'a${EACC}b' AS C FROM RDB\$DATABASE) SELECT CAST(Q.C || 'x' AS VARCHAR(32) CHARACTER SET OCTETS) FROM Q"
+both "nested derived literal"          "SELECT OCTET_LENGTH(Z.C) FROM (SELECT * FROM (SELECT 'a${EACC}b' AS C FROM RDB\$DATABASE) Y) Z"
+
+# The controls that keep section 7 honest - and two cells that are NOT
+# controls however they read. The sentinel must be READ as the
+# attachment's charset, never rewritten: a literal at TOP level was
+# always right (a DIFF there is the RECORDED literal double-encode, not
+# this law), and a REAL-charset column through the same wrapper never
+# carries the sentinel at all. Those three held on BOTH binaries.
+#
+# The two below were first written as "controls" on the strength of the
+# DESCRIBE matrix, where CAST over a wrapped literal announces correctly.
+# They FLIP on b1df783, because measuring bytes with `CAST(... CHARACTER
+# SET OCTETS)` is itself an expression through [text_form]: the
+# announcement was exempt, the VALUE never was. Kept, correctly named.
+both "TOP literal octet_length (control)"    "SELECT OCTET_LENGTH('a${EACC}b') FROM RDB\$DATABASE"
+both "TOP literal concat bytes (control)"    "SELECT CAST('a${EACC}b' || 'x' AS VARCHAR(32) CHARACTER SET OCTETS) FROM RDB\$DATABASE"
+both "derived NONE column concat (control)"  "SELECT CAST(Z.N || 'x' AS VARCHAR(64) CHARACTER SET OCTETS) FROM (SELECT N FROM T WHERE ID=1) Z"
+both "derived UTF8 column concat (control)"  "SELECT CAST(Z.U || 'x' AS VARCHAR(64) CHARACTER SET OCTETS) FROM (SELECT U FROM T WHERE ID=5) Z"
+both "derived ASCII literal (control)"       "SELECT CAST(Z.C || 'x' AS VARCHAR(32) CHARACTER SET OCTETS) FROM (SELECT 'abc' AS C FROM RDB\$DATABASE) Z"
+both "derived literal measured as octets"    "SELECT CAST(Z.C AS VARCHAR(32) CHARACTER SET OCTETS) FROM (SELECT 'a${EACC}b' AS C FROM RDB\$DATABASE) Z"
+both "CAST over a derived literal, as octets" "SELECT CAST(CAST(Z.C AS VARCHAR(8)) AS VARCHAR(32) CHARACTER SET OCTETS) FROM (SELECT 'a${EACC}b' AS C FROM RDB\$DATABASE) Z"
+
+# and the DESCRIBE half of the same law, one statement per connection
+# (note 6). These run under isql's default attachment, which is NONE -
+# the only attachment that shows the leak.
+desc "a literal through a derived table"     "SELECT Z.C || 'x' FROM (SELECT 'abc' AS C FROM RDB\$DATABASE) Z"
+desc "UPPER over a derived literal"          "SELECT UPPER(Z.C) FROM (SELECT 'abc' AS C FROM RDB\$DATABASE) Z"
+desc "SUBSTRING over a derived literal"      "SELECT SUBSTRING(Z.C FROM 1 FOR 2) FROM (SELECT 'abc' AS C FROM RDB\$DATABASE) Z"
+desc "a literal through a CTE"               "WITH Q AS (SELECT 'abc' AS C FROM RDB\$DATABASE) SELECT Q.C || 'x' FROM Q"
+desc "a derived literal, no expression (control)" "SELECT Z.C FROM (SELECT 'abc' AS C FROM RDB\$DATABASE) Z"
+
 echo "----------------------------------------------------------------------"
 echo "ran $ran checks"
-[ "$ran" -ge 60 ] || { echo "FAIL only $ran checks ran"; fail=1; }
+[ "$ran" -ge 134 ] || { echo "FAIL only $ran checks ran"; fail=1; }
 [ $fail -eq 0 ] && echo "PASS $ran checks" || echo "FAIL"
 exit $fail

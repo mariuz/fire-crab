@@ -19232,16 +19232,40 @@ fn text_form_m(
             let bpc = fire_crab_ods::intl::bytes_per_char(
                 fire_crab_ods::intl::charset_id(d.sub_type),
             ) as i32;
+            // A DERIVED SCOPE'S DESCRIPTOR STILL CARRIES THE ATTACHMENT
+            // SENTINEL, AND IT IS NOT A TTYPE. [desc_of_projcol] resolves
+            // the real-charset sentinel ([enc_real_cs]) into a ttype and a
+            // byte length, but passes [ATT_SUBTYPE] through untouched - so
+            // a LITERAL wrapped in a derived table, a CTE or a view
+            // arrives here as sub_type -1. Read as a ttype it becomes
+            // `charset_id(-1)` = 255 in every consumer: [cs_join] masks it
+            // (`t & 0xFF`), [build_expr_col] announces `enc_real_cs(255)`,
+            // and [expr_value_charset] finds 255 neither a byte carrier
+            // nor tabled, falls through to UTF-8 semantics and counts a
+            // NONE literal's UTF-8 SPELLING. Measured under a NONE
+            // attachment: `OCTET_LENGTH(Z.C)` over a wrapped 'a<C3A9>b'
+            // answered 4 where the engine answers 2, and `Z.C || 'x'`
+            // raised `string right truncation, expected 3, actual 5`
+            // where the engine answers the row - a WRONG ANSWER and a
+            // false refusal from one sentinel. Under a UTF8 or WIN1252
+            // attachment the result is re-typed in the attachment's set,
+            // which is why every other attachment agreed and hid it.
+            //
+            // [corr_text_form] guards this for a described column; this
+            // arm is its twin and did not. Only the CHARSET moves:
+            // `bytes_per_char(255)` is already 1 - an id the engine does
+            // not ship counts single-byte - and the sentinel's length is
+            // already a CHARACTER count, so both widths below are the
+            // numbers they always were.
+            let cs = if d.sub_type as i32 == ATT_SUBTYPE {
+                TfCs::Att
+            } else {
+                TfCs::Ttype(d.sub_type as i32)
+            };
             match d.dtype {
-                dtype::TEXT => {
-                    Some((false, d.length as i32 / bpc, TfCs::Ttype(d.sub_type as i32)))
-                }
+                dtype::TEXT => Some((false, d.length as i32 / bpc, cs)),
                 // a VARYING descriptor's length carries its 2-byte count
-                dtype::VARYING => Some((
-                    true,
-                    (d.length as i32 - 2).max(0) / bpc,
-                    TfCs::Ttype(d.sub_type as i32),
-                )),
+                dtype::VARYING => Some((true, (d.length as i32 - 2).max(0) / bpc, cs)),
                 _ => None,
             }
         }
