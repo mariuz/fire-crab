@@ -41781,9 +41781,10 @@ fn first_unknown_relation(sql: &str, db: &Database) -> Option<(usize, usize, boo
 /// - `FOR UPDATE [OF ...]`, `WITH LOCK [SKIP LOCKED]`, `OPTIMIZE FOR ...`
 /// - which this single-snapshot server does not act on but whose rows are
 /// the same as the plain query's. Returns the cleaned text, or None when
-/// there is no such clause. WITH LOCK over an AGGREGATE is left in place
-/// (the engine rejects it with -104; leaving it lets the normal parser
-/// refuse rather than answer a row the engine never returns).
+/// there is no such clause. A WITH LOCK the engine will NOT take is left
+/// in place - leaving it lets the planner refuse rather than answer a row
+/// the engine never returns - and [PREPARE_REFUSAL] carries the engine's
+/// own -104 vector. See [with_lock_verdict] for the rule.
 fn strip_row_locking(sql: &str, db: &Option<Database>) -> Option<String> {
     let s = sql.trim().trim_end_matches(';').trim();
     let up = mask_literals(&s.to_ascii_uppercase());
@@ -41818,27 +41819,163 @@ fn strip_row_locking(sql: &str, db: &Option<Database>) -> Option<String> {
     }
     let cut = cut?;
     let cleaned = s[..cut].trim_end();
-    // WITH LOCK is valid ONLY over a single physical base table with no
-    // aggregate (the engine's -104 otherwise). When it is not, leave the
-    // clause in so the normal parser refuses rather than answer rows the
-    // engine never returns.
-    if had_with_lock && !with_lock_target_ok(cleaned, db) {
-        return None;
+    // WITH LOCK is valid ONLY over a single physical base table - or an
+    // all-ALL chain of them - with no aggregate and no DISTINCT (the
+    // engine's -104 otherwise). When it is not, leave the clause in so
+    // the planner refuses rather than answer rows the engine never
+    // returns, carrying the engine's own vector where there is one.
+    if had_with_lock {
+        match with_lock_verdict(cleaned, db) {
+            WithLockVerdict::Takes => {}
+            WithLockVerdict::Refuses(e) => {
+                PREPARE_REFUSAL.with(|r| *r.borrow_mut() = Some(e));
+                return None;
+            }
+            WithLockVerdict::Unreproducible => return None,
+        }
     }
     Some(cleaned.to_string())
 }
 
-/// Is `sql` a plain single-physical-table select (no aggregate, GROUP BY,
-/// join, view, CTE or derived table) - the only shape the engine accepts
-/// WITH LOCK over?
-fn with_lock_target_ok(sql: &str, db: &Option<Database>) -> bool {
-    let Some((proj, table_s, _w, group, _h, _o)) = split_query(sql) else {
-        return false;
-    };
-    if group.is_some() {
-        return false;
+/// `isc_dsql_wlock_simple` - "WITH LOCK can be used only with a single
+/// physical table": a join, a view, a derived table or a CTE.
+///
+/// The three below are posted as -104 DSQL errors, which isql renders as
+///
+/// ```text
+/// Statement failed, SQLSTATE = 42000
+/// Dynamic SQL Error
+/// -SQL error code = -104
+/// -WITH LOCK cannot be used with DISTINCT
+/// ```
+///
+/// - four lines, with NO trailing line/column item, unlike every other
+/// -104 this server answers (compare [respond_name_too_long]).
+const GDS_WLOCK_SIMPLE: i32 = 336397326;
+/// `isc_dsql_wlock_aggregates` - "WITH LOCK cannot be used with
+/// aggregates": an aggregate call in the projection, or a GROUP BY
+const GDS_WLOCK_AGGREGATES: i32 = 336397328;
+/// `isc_dsql_wlock_conflict` - "WITH LOCK cannot be used with @1", whose
+/// `@1` is the offending keyword: measured as `DISTINCT` and `UNION`
+const GDS_WLOCK_CONFLICT: i32 = 336397329;
+
+/// What the engine does with a `WITH LOCK` over a given target.
+enum WithLockVerdict {
+    /// it locks and answers - the clause strips, and the rows are the
+    /// plain query's
+    Takes,
+    /// it refuses with one of the three -104 messages above
+    Refuses(EvalErr),
+    /// it ANSWERS, but with rows this server cannot reproduce - refuse
+    /// generically rather than answer wrongly or invent a vector
+    Unreproducible,
+}
+
+/// Is `sql` a target the engine will lock, and if not, with which of its
+/// three -104 messages does it say so?
+///
+/// The rule, measured cell by cell off the live engine:
+///
+/// - a single PHYSICAL base table (not a view, join, derived table or
+///   CTE), with no aggregate, no GROUP BY and no DISTINCT
+/// - or a chain of exactly those joined by `UNION ALL` only, which the
+///   engine answers (8 rows over two branches, 13 over three)
+///
+/// When a statement breaks more than one rule the engine reports just
+/// one, and the precedence is UNION > single-physical-table > aggregates
+/// > DISTINCT: measured, `SELECT DISTINCT ... JOIN` and `SELECT COUNT(*)
+/// ... JOIN` both report the table rule, `SELECT DISTINCT COUNT(*)`
+/// reports aggregates, and a bare UNION reports UNION even when one of
+/// its branches is a join. In an all-ALL chain the FIRST bad branch left
+/// to right supplies the message (`COUNT(*) UNION ALL DISTINCT` reports
+/// aggregates, `DISTINCT UNION ALL COUNT(*)` reports DISTINCT).
+fn with_lock_verdict(sql: &str, db: &Option<Database>) -> WithLockVerdict {
+    let up = mask_literals(&sql.trim().to_ascii_uppercase());
+    // A BARE UNION ANYWHERE outranks every other defect - including a
+    // chain that MIXES it with UNION ALL, in either order (measured: both
+    // orders report UNION). `UNION DISTINCT` is the bare UNION's synonym
+    // and lands here too.
+    let mut at = 0usize;
+    let mut chained = false;
+    while let Some(u) = find_word_depth0(&up, "UNION", at) {
+        at = u + "UNION".len();
+        chained = true;
+        let rest = up[at..].trim_start();
+        let all = rest.starts_with("ALL")
+            && rest["ALL".len()..]
+                .chars()
+                .next()
+                .is_none_or(|c| !(c.is_alphanumeric() || c == '_'));
+        if !all {
+            return WithLockVerdict::Refuses(EvalErr::WithLock {
+                code: GDS_WLOCK_CONFLICT,
+                what: Some("UNION"),
+            });
+        }
     }
-    // an aggregate anywhere in the projection
+    if chained {
+        // THE ENGINE ANSWERS ZERO ROWS for an all-ALL chain under a
+        // depth-0 ORDER BY. Measured on two separate databases against
+        // three controls: 8 rows without the ORDER BY, 8 without the
+        // lock, 0 with both - and 0 for DESC and for three branches too,
+        // while the single-table `ORDER BY ... WITH LOCK` answers its 5.
+        // Nothing here reproduces that, and answering the 8 rows would be
+        // a WRONG ANSWER where the engine returns none, so it refuses -
+        // without a vector, because the engine posts none to copy.
+        if find_word_depth0(&up, "ORDER", 0).is_some() {
+            return WithLockVerdict::Unreproducible;
+        }
+        let Some((parts, true)) = split_union(sql) else {
+            return WithLockVerdict::Refuses(EvalErr::WithLock {
+                code: GDS_WLOCK_SIMPLE,
+                what: None,
+            });
+        };
+        for p in &parts {
+            if let Some(e) = with_lock_one_bad(p, db) {
+                return WithLockVerdict::Refuses(e);
+            }
+        }
+        return WithLockVerdict::Takes;
+    }
+    match with_lock_one_bad(sql, db) {
+        Some(e) => WithLockVerdict::Refuses(e),
+        None => WithLockVerdict::Takes,
+    }
+}
+
+/// One branch, or a whole un-chained statement: the engine's defect for
+/// this target, or None when it locks it.
+fn with_lock_one_bad(sql: &str, db: &Option<Database>) -> Option<EvalErr> {
+    let simple = || Some(EvalErr::WithLock { code: GDS_WLOCK_SIMPLE, what: None });
+    let aggregates = || Some(EvalErr::WithLock { code: GDS_WLOCK_AGGREGATES, what: None });
+    // not a plain SELECT at all (a CTE arrives here as its whole `WITH`
+    // text) - the engine calls that the single-physical-table rule
+    let Some((proj, table_s, _w, group, _h, _o)) = split_query(sql) else {
+        return simple();
+    };
+    // THE FROM DECIDES FIRST: a single bare item that is a base relation,
+    // not a view. Measured, `COUNT(*)` and `DISTINCT` over a join both
+    // report THIS rule rather than their own.
+    let Some((from, join)) = parse_from(table_s) else {
+        return simple();
+    };
+    if !join.is_empty() {
+        return simple();
+    }
+    let name = from.table.as_str();
+    let base = match db.as_ref() {
+        Some(dbr) => relation_schema(dbr, name).is_some() && view_of(dbr, name).is_none(),
+        None => false,
+    };
+    if !base {
+        return simple();
+    }
+    if group.is_some() {
+        return aggregates();
+    }
+    // an aggregate anywhere in the projection - `COUNT(DISTINCT x)` is
+    // one of these, and the engine reports aggregates for it, not DISTINCT
     let pu = mask_literals(&proj.to_ascii_uppercase());
     let b = pu.as_bytes();
     let mut i = 0;
@@ -41854,24 +41991,40 @@ fn with_lock_target_ok(sql: &str, db: &Option<Database>) -> bool {
                 j += 1;
             }
             if agg_named(word) && b.get(j) == Some(&b'(') {
-                return false;
+                return aggregates();
             }
         } else {
             i += 1;
         }
     }
-    // a single bare FROM item that is a base relation, not a view
-    let Some((from, join)) = parse_from(table_s) else {
-        return false;
-    };
-    if !join.is_empty() {
-        return false;
+    if proj_distinct(&pu) {
+        return Some(EvalErr::WithLock { code: GDS_WLOCK_CONFLICT, what: Some("DISTINCT") });
     }
-    let name = from.table.as_str();
-    match db.as_ref() {
-        Some(dbr) => relation_schema(dbr, name).is_some() && view_of(dbr, name).is_none(),
-        None => false,
+    None
+}
+
+/// Does this projection carry the statement's own DISTINCT?
+///
+/// NOT a leading-word test: `FIRST` and `SKIP` come before it - measured,
+/// `SELECT FIRST 2 SKIP 1 DISTINCT ID ... WITH LOCK` refuses with the
+/// DISTINCT message while `DISTINCT FIRST` is a syntax error - and
+/// `FIRST (1 + 1)` puts a parenthesis in between. NOT a bare word search
+/// either: `x IS [NOT] DISTINCT FROM y` writes the same keyword at depth
+/// 0 of a select list and ANSWERS (measured, parenthesised or not), so
+/// the preceding word vetoes the match. `COUNT(DISTINCT x)` sits at
+/// depth 1, where the aggregate test has already claimed it.
+///
+/// `pu` is already masked and upper-cased: a `'DISTINCT'` LITERAL answers.
+fn proj_distinct(pu: &str) -> bool {
+    let mut at = 0usize;
+    while let Some(d) = find_word_depth0(pu, "DISTINCT", at) {
+        at = d + "DISTINCT".len();
+        let before = pu[..d].trim_end().rsplit(|c: char| c.is_whitespace()).next().unwrap_or("");
+        if before != "IS" && before != "NOT" {
+            return true;
+        }
     }
+    false
 }
 
 /// Does this plan DEDUPLICATE over a WITH TIME ZONE column - a GROUP BY
@@ -42007,6 +42160,24 @@ fn plan_query(sql: &str, db: &Option<Database>) -> (Plan, Vec<Descriptor>) {
     // SELECT DISTINCT and UNION-dedup over tz columns all refuse.
     if plan_tz_dedup(&outcome.0) {
         return (Plan::Refused, Vec::new());
+    }
+    // A SUB-PLANNER MAY ANSWER `Some(Plan::Refused)` RATHER THAN `None` -
+    // a wrapper (SELECT DISTINCT, a CTE, a UNION branch) that refuses by
+    // returning a generic refusal PLAN instead of failing. That never
+    // reaches the arm above, which is the only place a [PREPARE_REFUSAL]
+    // posted while parsing was consumed, so a statement carrying the
+    // engine's own vector arrived as a bare Dynamic SQL Error whenever a
+    // wrapper sat over it: measured, `SELECT COUNT(*) FROM T WITH LOCK`
+    // answered the engine's -104 while `SELECT DISTINCT COUNT(*) FROM T
+    // WITH LOCK` - the SAME vector, posted by the same line - did not.
+    //
+    // Taken here too, and only over a BARE refusal, so a typed one is
+    // never overridden. The posted vector outranks the -204 guess below,
+    // which is the order the arm above already sets.
+    if let (Plan::Refused, Some(_)) = (&outcome.0, db.as_ref()) {
+        if let Some(e) = PREPARE_REFUSAL.with(|r| r.borrow_mut().take()) {
+            return (Plan::RefusedEval(e), Vec::new());
+        }
     }
     // A GENERIC refusal over a statement that names an UNKNOWN RELATION
     // anywhere (a subquery, a derived table, an IN/EXISTS body) becomes
@@ -59018,6 +59189,23 @@ fn eval_status_items(w: &mut W, e: &EvalErr) {
                 .bytes(table.as_bytes());
         }
         // the two view refusals: one gds code, one string, no wrapper
+        // a WITH LOCK target refusal: the -104 wrapper every DSQL refusal
+        // carries, then the message - and NO line/column item after it
+        // (measured: isql prints exactly four lines)
+        EvalErr::WithLock { code, what } => {
+            w.int(1) // isc_arg_gds - Dynamic SQL Error
+                .int(GDS_DSQL_ERROR)
+                .int(1) // isc_arg_gds - isc_sqlerr
+                .int(GDS_SQLERR)
+                .int(ISC_ARG_NUMBER)
+                .int(-104)
+                .int(1) // isc_arg_gds - the WITH LOCK message
+                .int(*code);
+            if let Some(kw) = what {
+                w.int(2) // isc_arg_string - @1
+                    .bytes(kw.as_bytes());
+            }
+        }
         EvalErr::ReadOnlyView(name) => {
             w.int(1) // isc_arg_gds
                 .int(GDS_READ_ONLY_VIEW)
@@ -67514,6 +67702,11 @@ enum EvalErr {
     /// a domain error posted as a DSQL error (primary "Dynamic SQL Error"),
     /// as PERCENTILE_CONT/DISC's out-of-range fraction is
     DsqlDomain { func: &'static str, code: i32 },
+    /// a `WITH LOCK` over a target the engine will not lock: one of its
+    /// three -104 messages ([GDS_WLOCK_SIMPLE], [GDS_WLOCK_AGGREGATES],
+    /// [GDS_WLOCK_CONFLICT]), the last carrying the offending keyword as
+    /// its `@1`. Posted at PREPARE, through [PREPARE_REFUSAL].
+    WithLock { code: i32, what: Option<&'static str> },
     /// `isc_expression_eval_err` on its own - AtNode::make's refusal for
     /// an `AT TIME ZONE` operand that is not a TIME or a TIMESTAMP
     /// (ExprNodes.cpp:3326), posted at PREPARE
