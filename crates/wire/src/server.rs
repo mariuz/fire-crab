@@ -42410,6 +42410,16 @@ fn plan_over_source(
     rel_alias: Option<&str>,
 ) -> Option<Plan> {
     let (proj_s, table_s, where_s, group_s, having_s, order_s) = split_query(sql)?;
+    // THE SLOTS ALREADY CLAIMED BY THIS SOURCE'S OWN TEXT. A FROM-clause
+    // procedure call binds its `?` arguments into the outer sink and is
+    // then spliced OUT of the statement by [sql_over_from], so the
+    // rebuilt text carries fewer `?` than the sink has slots; numbering
+    // the projection and the WHERE from zero would collide with the
+    // arguments. [plan_join_bound] already floors its own numbering at
+    // `params.len()` for the same reason - this is that rule one level
+    // up. Zero for a CTE, a derived table or a view, which claim nothing
+    // before they are planned, so their numbering is unchanged.
+    let param_base = params.len();
     let (from, join) = parse_from(table_s)?;
     // A JOIN against the bound name is the hierarchy walk - the thing a
     // recursive CTE is usually FOR. It goes to the ordinary join
@@ -42497,7 +42507,7 @@ fn plan_over_source(
     // returned before the shared renumber_proj_params), so a projection
     // param over a grouped derived source takes the leading input slots
     let mut group_proj = parse_projection(&unq(proj_s))?;
-    let dgroup_params = renumber_proj_params(&mut group_proj);
+    let dgroup_params = renumber_proj_params_from(&mut group_proj, param_base);
     let items_for_group = match group_proj {
         Proj::Items(v) => Some(v),
         Proj::Star => None,
@@ -42623,7 +42633,7 @@ fn plan_over_source(
     // `?` numbers after it - the engine's one textual order. A projection
     // with no `?` renumbers to zero and nothing changes (CTE/view unaffected)
     let mut proj_parsed = parse_projection(&unq(proj_s))?;
-    let proj_params = renumber_proj_params(&mut proj_parsed);
+    let proj_params = renumber_proj_params_from(&mut proj_parsed, param_base);
     match proj_parsed {
         Proj::Star => {
             for (i, c) in cols.iter().enumerate() {
@@ -49241,19 +49251,23 @@ fn plan_query_inner_ctx(
                         },
                     };
                     let has_ph = pargs_raw.iter().any(|a| a.is_none());
-                    // ROUTE 2 IS NOT DRIVEN YET. A clause over the call
-                    // takes the bound-row-source route, where
-                    // [sql_over_from] SPLICES THE FROM ITEM OUT - the
-                    // call's `?` vanish from the text - and the re-plan
-                    // renumbers from zero, colliding with the argument
-                    // slots. It needs [plan_over_source] to accept a
-                    // parameter base; until then this keeps refusing,
-                    // rather than answering with the wrong values.
-                    if has_ph
-                        && (w_s.is_some() || g_s.is_some() || h_s.is_some() || o_s.is_some())
-                    {
-                        return Some(Plan::Refused);
-                    }
+                    // ROUTE 2: A CLAUSE OVER A CALL WHOSE ARGUMENTS ARE
+                    // BOUND. [sql_over_from] splices the FROM item out,
+                    // so the call's `?` vanish from the text while their
+                    // slots stay claimed in the sink - which is why this
+                    // refused outright. [plan_over_source] now numbers
+                    // the rebuilt statement from `params.len()`, so the
+                    // WHERE's own `?` lands AFTER the arguments, in the
+                    // engine's textual order, and nothing here needs to
+                    // know about it.
+                    //
+                    // Still refused, and SAFELY: a shape whose numbering
+                    // [plan_over_source] cannot express returns None,
+                    // which the call site turns into Plan::Refused. A
+                    // `HAVING ... > ?` over the grouped form is the one
+                    // that does - and it refuses with LITERAL arguments
+                    // too, so it is a pre-existing gap, not route 2's.
+                    let _ = has_ph;
                     // THE SLOT A CALL'S FIRST `?` CLAIMS is every
                     // placeholder written BEFORE the FROM item, counted
                     // quote-aware: slots are numbered by TEXT POSITION
@@ -63594,7 +63608,17 @@ fn renumber_raw_params(e: &mut RawExpr, next: &mut usize) {
 /// `SELECT CAST(? AS INT) FROM T WHERE X = ?` (probed: the projection
 /// `?` is param 0, the WHERE `?` is param 1).
 fn renumber_proj_params(proj: &mut Proj) -> usize {
-    let mut n = 0usize;
+    renumber_proj_params_from(proj, 0)
+}
+
+/// [renumber_proj_params] over a source whose slots do NOT start at zero.
+/// A FROM-clause PROCEDURE CALL claims its `?` arguments in the outer
+/// sink FIRST, and [sql_over_from] then splices the call out of the text
+/// - so the re-planned statement's own `?` must number from where the
+/// arguments stopped, not from 0. Returns the NEXT absolute slot index,
+/// which is what the WHERE numbers from.
+fn renumber_proj_params_from(proj: &mut Proj, base: usize) -> usize {
+    let mut n = base;
     if let Proj::Items(items) = proj {
         for it in items.iter_mut() {
             if let SelItem::Expr(raw, ..) = it {

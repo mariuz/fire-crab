@@ -298,10 +298,53 @@ bothq "an aggregate over the call" "SELECT MAX(K) FROM PU(?, ?)" '["ab",7]'
 bothq "...a SUM, where the value shows" "SELECT SUM(K) FROM PU(?, ?)" '["ab",42]'
 bothq "...and over the TEXT argument" "SELECT MAX(K) FROM PX(?)" '["abcde"]'
 bothq "COUNT(*) agrees either way (a control)" "SELECT COUNT(*) FROM PU(?, ?)" '["ab",7]'
-# RECORDED, NOT FIXED - a CLAUSE over the call still refuses: that route
-# rebuilds the statement without the call's placeholders and renumbers
-# from zero. Measured: `PU(?, ?) WHERE K = ?` is three slots in text
-# order, and a nested call numbers AFTER an outer WHERE's `?`.
+# ROUTE 2 - A CLAUSE OVER THE CALL. The re-plan rebuilds the statement
+# with the call spliced OUT of the FROM, so the call's `?` vanish from
+# the text while their slots stay claimed: the statement's own `?` must
+# therefore number AFTER the arguments. Measured, and asserted by the
+# slot counts in serve-real-bindcs: `PU(?, ?) WHERE K = ?` is three
+# slots in TEXT order.
+#
+# THE EXCLUDING CELLS ARE THE TEETH. A filter that never ran would
+# answer the row anyway, so every predicate here is paired with one
+# that must answer NOTHING - the same lesson COUNT(*) taught above.
+bothq "a WHERE over the call" "SELECT K FROM PU(?, ?) WHERE K > ?" '["ab",7,0]'
+bothq "...a WHERE that EXCLUDES the row" "SELECT K FROM PU(?, ?) WHERE K > ?" '["ab",7,99]'
+bothq "...an equality that MATCHES" "SELECT K FROM PU(?, ?) WHERE K = ?" '["ab",7,7]'
+bothq "...an equality that MISSES" "SELECT K FROM PU(?, ?) WHERE K = ?" '["ab",7,6]'
+bothq "a WHERE with no ? of its own" "SELECT K FROM PU(?, ?) WHERE K > 0" '["ab",7]'
+bothq "an ORDER BY over the call" "SELECT K FROM PU(?, ?) ORDER BY K" '["ab",7]'
+bothq "a GROUP BY over the call" "SELECT K FROM PU(?, ?) GROUP BY K" '["ab",7]'
+bothq "the TEXT argument under a WHERE ?" "SELECT K FROM PX(?) WHERE K > ?" '["abcde",0]'
+bothq "...the TEXT argument, EXCLUDED" "SELECT K FROM PX(?) WHERE K > ?" '["abcde",99]'
+# LITERAL arguments under a clause worked before route 2 landed - it is
+# the control that says these cells measure the BOUND half specifically
+bothq "LITERAL args + a WHERE ? (a control)" "SELECT K FROM PU('ab', 9) WHERE K > ?" '[0]'
+
+# RECORDED, NOT FIXED - written so each EXPIRES ITSELF: the cell carries
+# the engine's own answer and says so the day fire-crab agrees. A
+# refusal written as a bare comment rots silently instead.
+#   - `HAVING ... > ?` over the grouped form: the grouped branch refuses
+#     a WHERE/HAVING `?` outright. It refuses with LITERAL arguments too,
+#     so it is a PRE-EXISTING gap, not route 2's.
+#   - a derived table or CTE over a call with BOUND arguments: refused by
+#     a different guard entirely - the inner statement carries no clause
+#     at all, so route 2's guard was never what stopped it.
+for pair in "SELECT K, COUNT(*) FROM PU(?, ?) GROUP BY K HAVING COUNT(*) > ?|[\"ab\",7,0]" \
+            "SELECT K FROM (SELECT K FROM PU(?, ?)) D|[\"ab\",7]" \
+            "WITH C AS (SELECT K FROM PU(?, ?)) SELECT K FROM C|[\"ab\",7]"; do
+    q="${pair%%|*}"; args="${pair##*|}"
+    a=$(query "$q" "$args" "$PORT" "$A")
+    case "$a" in
+        ERR*) echo "OK   refusal kept (engine answers): $q" ;;
+        *) b=$(query "$q" "$args" "$REAL" "$B")
+           if [ "$a" = "$b" ]; then
+               echo "OK   $q now agrees: $a (update the refusal list)"
+           else
+               echo "DIFF $q: fcwire [$a] engine [$b]"; fail=1
+           fi ;;
+    esac
+done
 bothq "EXECUTE PROCEDURE binds too" "EXECUTE PROCEDURE PU(?, ?)" '["ab",7]'
 
 # --- 4. ? BETWEEN: a desugar into the mirrored comparisons ------------

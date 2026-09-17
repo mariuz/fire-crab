@@ -292,13 +292,16 @@ cell "a call's arguments in the FROM"  "SELECT K FROM PU(?, ?);"
 cell "...through EXECUTE PROCEDURE"   "EXECUTE PROCEDURE PU(?, ?);"
 cell "a NOT NULL parameter"           "EXECUTE PROCEDURE PN(?, ?);"
 cell "a literal claims no slot"       "EXECUTE PROCEDURE PU('ab', ?);"
-# RECORDED, NOT FIXED - a CLAUSE over the call (`... WHERE K = ?`) still
-# refuses. Its describe is measured (three slots, in TEXT ORDER), but
-# that shape takes the bound-row-source route, where `sql_over_from`
-# SPLICES THE FROM ITEM OUT - deleting the call's `?` from the text - and
-# the re-plan renumbers from zero, colliding with the argument slots.
-# It needs `plan_over_source` to accept a parameter BASE: its ungrouped
-# branch starts at `proj_params`, not at the statement's own count.
+# A CLAUSE OVER THE CALL now describes too, and the slot ORDER is the
+# whole point: the re-plan splices the FROM item OUT, deleting the
+# call's `?` from the text, so the statement's own `?` must number AFTER
+# the arguments rather than from zero. `PU(?, ?) WHERE K = ?` is three
+# slots in TEXT ORDER - the two arguments, then the WHERE's - and each
+# still follows the attachment law like any other slot.
+cell "a WHERE over the call"          "SELECT K FROM PU(?, ?) WHERE K = ?;"
+cell "...a WHERE with no ? of its own" "SELECT K FROM PU(?, ?) WHERE K > 0;"
+cell "...an ORDER BY over the call"   "SELECT K FROM PU(?, ?) ORDER BY K;"
+cell "...a GROUP BY over the call"    "SELECT K FROM PU(?, ?) GROUP BY K;"
 # ...and the OUTPUT side of the same descriptor. A procedure parameter is
 # rebuilt from RDB$FIELDS, where the charset is in RDB$CHARACTER_SET_ID -
 # a table column's comes from the stored record format, whose sub_type
