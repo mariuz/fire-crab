@@ -87542,10 +87542,33 @@ fn run_body_source(
     let mut steps = 0u32;
     frame.stop_at_suspend = first_only;
     let outcome = exec_psql_stmt(&body, &mut frame, &mut steps, database, ctx);
-    if outcome.is_err() {
-        undo_window(database, mark);
-    } else {
+    // AN `EXIT` IS NOT A FAILURE, AND ASKING `is_err()` SAID IT WAS.
+    //
+    // `PsqlStop::Exit` rides the error channel because it STOPS the body
+    // - the match below says so itself, treating `Ok(()) | Err(Exit)`
+    // alike as "what the body left behind IS the answer". This undo
+    // asked only whether the outcome was an `Err`, so Exit counted as
+    // the failure the comment above describes ("a statement that fails
+    // partway") and the window was killed.
+    //
+    // EXECUTE PROCEDURE reaches SUSPEND with `stop_at_suspend` set, and
+    // SUSPEND returns exactly `Err(PsqlStop::Exit)` there - so EVERY
+    // `EXECUTE PROCEDURE` on a body that suspends silently discarded
+    // what the body had written before it. Measured against the engine,
+    // one INSERT before a SUSPEND: the engine keeps the row, this
+    // server kept nothing; the same body under `SELECT` kept it on both
+    // (that path never sets the flag, so SUSPEND answers `Ok`), which is
+    // why the loss hid - and why only a SUSPENDING writer exposes it,
+    // which no gate had.
+    //
+    // A write AFTER the first SUSPEND is a different rule and is left
+    // exactly as it was: the engine drops it under EXECUTE PROCEDURE and
+    // performs it under SELECT (recorded on [run_procedure]), and both
+    // servers already agree.
+    if outcome.is_ok() || matches!(outcome, Err(PsqlStop::Exit)) {
         undo_window_unwind(database, mark, false);
+    } else {
+        undo_window(database, mark);
     }
     match outcome {
         // EXIT ends the body, and what it leaves behind IS the answer -

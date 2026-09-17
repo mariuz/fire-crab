@@ -108,6 +108,11 @@ BEGIN X = :P; END^
 CREATE PROCEDURE PLONGNAMEXYZ RETURNS (X INTEGER, Y INTEGER, Z INTEGER) AS
 BEGIN X = 1; END^
 CREATE PROCEDURE PNOOUT AS BEGIN INSERT INTO T (ID) VALUES (99); END^
+-- A WRITER THAT SUSPENDS. PNOOUT above does not, and that is exactly
+-- why the lost write below went unseen: under EXECUTE PROCEDURE only a
+-- body that reaches a SUSPEND took the path that discarded its work.
+CREATE PROCEDURE PSUSPW RETURNS (X INTEGER) AS
+BEGIN INSERT INTO T (ID) VALUES (77); X = 1; SUSPEND; END^
 CREATE PROCEDURE PEMPTY AS BEGIN END^
 CREATE PROCEDURE PNOUTARG (P INTEGER) AS BEGIN END^
 CREATE PROCEDURE PSEL RETURNS (X INTEGER) AS
@@ -368,6 +373,35 @@ same "E4. the SAME 0-output procedure B1 refused in FROM" "EXECUTE PROCEDURE PNO
 check "E5. EXECUTE PROCEDURE's INSERT landed (engine reads fc's file)" \
       "$(col "$WORK" "SELECT ID FROM T")" "99"
 check "E6. ... and on the ref copy" "$(col "$REF" "SELECT ID FROM T")" "99"
+
+# E8. THE WRITE A SUSPENDING BODY MAKES BEFORE IT SUSPENDS, under
+# EXECUTE PROCEDURE. E5/E6 above check a landed write too, but PNOOUT
+# does NOT suspend - and that is the whole reason this was invisible:
+# `EXECUTE PROCEDURE` sets `stop_at_suspend`, SUSPEND then returns
+# `PsqlStop::Exit`, and the body's undo window asked only `is_err()`, so
+# an EXIT counted as a failure and everything the body had written was
+# killed. Measured against the engine: one INSERT before a SUSPEND, the
+# engine keeps the row and fire-crab kept nothing. The same body under
+# `SELECT` always agreed (that path never sets the flag), which is why
+# no existing cell saw it.
+printf 'EXECUTE PROCEDURE PSUSPW;\nCOMMIT;\n' |
+    "$ISQL" -q -b -user "$U" -pas "$P" "127.0.0.1/$PORT:$WORK" >/dev/null 2>&1
+printf 'EXECUTE PROCEDURE PSUSPW;\nCOMMIT;\n' |
+    "$ISQL" -q -b -user "$U" -pas "$P" "$REF" >/dev/null 2>&1
+e8fc=$(col "$WORK" "SELECT ID FROM T WHERE ID = 77")
+e8en=$(col "$REF" "SELECT ID FROM T WHERE ID = 77")
+ran=$((ran + 1))
+# THE POSITIVE CONTROL FIRST: if the ENGINE did not write either, the
+# two sides agree on nothing at all and the cell would pass while
+# measuring nothing.
+if [ "$e8en" != "77" ]; then
+    echo "DIFF E8. the ENGINE did not write - the probe measures nothing: [$e8en]"; fail=1
+elif [ "$e8fc" = "$e8en" ]; then
+    echo "OK   E8. a write BEFORE the SUSPEND survives EXECUTE PROCEDURE [$e8en]"
+else
+    echo "DIFF E8. EXECUTE PROCEDURE discarded the body's write"
+    echo "     engine: [$e8en]"; echo "     fc:     [$e8fc]"; fail=1
+fi
 # An EMPTY body USED TO BE outside fire-crab's PSQL surface: the
 # engine's EXECUTE PROCEDURE succeeded silently and this server refused,
 # and the cell asserted that difference so that closing it would be
@@ -450,8 +484,8 @@ esac
 ran=$((ran + 1))
 
 # --- the ran counter ---------------------------------------------------
-if [ "$ran" -ne 82 ]; then
-    echo "DIFF $ran checks ran (expected exactly 82) - did one silently skip?"
+if [ "$ran" -ne 83 ]; then
+    echo "DIFF $ran checks ran (expected exactly 83) - did one silently skip?"
     fail=1
 fi
 

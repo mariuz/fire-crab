@@ -338,15 +338,24 @@ same "a no-argument selectable procedure" "SELECT R FROM ONEROW"
 same "EXECUTE PROCEDURE on a selectable one" "EXECUTE PROCEDURE SUSPENDER"
 same "COUNT is not supported over a call, but must agree" "SELECT R FROM ONEROW"
 
-# a WHERE over a procedure call is outside this slice - it must fail
-# rather than silently ignore the filter
-out=$(printf 'SELECT K FROM GEN3(4) WHERE K > 2;\n' |
-      "$ISQL" -q -b -user "$U" -pas "$P" "127.0.0.1/$PORT:$DB" 2>&1 | tr -s ' \n' ' ')
-case "$out" in
-    *"Statement failed"*|*error*|*ERROR*)
-        echo "OK   teeth: a WHERE over a procedure call is refused, not ignored" ;;
-    *) echo "DIFF a WHERE over a procedure call answered [$out]"; fail=1 ;;
-esac
+# A WHERE OVER A PROCEDURE CALL IS ANSWERED NOW, and this cell asserted
+# the opposite. It was written when the call could not be a row source
+# at all: the worry was that fire-crab would silently IGNORE the filter,
+# so the cell demanded a refusal and treated any answer as the failure.
+# The slice that made a selectable procedure a BOUND ROW SOURCE closed
+# that - the filter is honoured by the ordinary machinery - and the cell
+# then reported a DIFF for a server that had got BETTER. Same shape as
+# serve-real-nofallback's aggregate-union line, serve-real-services' MON$
+# row, and this suite's own nosuspend E7.
+#
+# IT IS TWO-SIDED NOW, which is the part that would have caught it going
+# stale: the old form asked fire-crab alone whether it refused, while
+# `same` compares the ROWS against the engine. Measured on this fixture,
+# engine and fire-crab alike: [3 4], [] , [4 3 2], [3 9 4 16].
+same "a WHERE over a procedure call filters" "SELECT K FROM GEN3(4) WHERE K > 2"
+same "...a filter that matches nothing"      "SELECT K FROM GEN3(4) WHERE K > 99"
+same "...with an ORDER BY over it"           "SELECT K FROM GEN3(4) WHERE K > 1 ORDER BY K DESC"
+same "...filtering on a later column"        "SELECT K, SQ FROM GEN3(4) WHERE SQ > 4"
 # and the row count must really follow the argument
 a=$(printf 'SET HEADING OFF;\nSELECT K FROM GEN3(2);\n' |
     "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$DB" 2>&1 | tr -s ' \n' ' ' | wc -w)
