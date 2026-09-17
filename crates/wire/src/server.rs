@@ -45915,13 +45915,32 @@ fn materialise_procedures(
     plan: &mut Plan,
     database: &mut Option<Database>,
     ctx: &SessionCtx,
+    // the STATEMENT's arguments, for binding a cap's predicate - the
+    // consumer's WHERE may carry `?` and cannot judge a row until it does
+    params: &[WireParam],
     // the consumer's row limit, when the walk has PROVEN one applies -
     // see [PsqlFrame::stop_after]. `None` runs the body out.
-    cap: Option<usize>,
+    cap: Option<BodyCap>,
 ) -> Result<bool, ProcErr> {
     if let Plan::ProcSelect { name, args, cols, picks } = &*plan {
         let (name, args, cols, picks) =
             (name.clone(), args.clone(), cols.clone(), picks.clone());
+        // A CAP'S PREDICATE SPEAKS THE PROCEDURE'S OWN OUTPUT POSITIONS,
+        // which is what a suspended row carries only when `picks` is the
+        // identity - the call announced every output, in order. It is for
+        // the row-source route that builds the filter, but a narrowed
+        // `picks` would silently judge the wrong columns, so the cap is
+        // dropped WHOLE there: counting all rows under a survivor limit
+        // would stop the body early, which is a wrong answer, while
+        // running it out is only the cost this chunk saves.
+        let cap = match cap {
+            Some(c)
+                if c.keep.is_some() && !picks.iter().enumerate().all(|(i, p)| i == *p) =>
+            {
+                None
+            }
+            other => other,
+        };
         // each suspended row projected down to the columns the call
         // announced, which is what `picks` is for
         let project = |suspended: &[Vec<Value>]| -> Vec<Vec<Value>> {
@@ -45982,32 +46001,45 @@ fn materialise_procedures(
         // has no bound, so neither has a cap.
         Plan::Modified { inner, distinct, skip, take, .. } => {
             let here = match (*distinct, *take) {
-                (false, Some(t)) => Some(skip.saturating_add(t)),
+                (false, Some(t)) => Some(BodyCap { take: skip.saturating_add(t), keep: None }),
                 _ => None,
             };
-            materialise_procedures(inner, database, ctx, here)
+            materialise_procedures(inner, database, ctx, params, here)
         }
-        // A DERIVED TABLE IS TRANSPARENT ONLY WHEN IT DOES NOTHING. It
-        // passes a cap through when it merely re-projects (measured:
-        // `FIRST 1 FROM (SELECT K FROM PLOG(5)) DT` runs the body ONCE on
-        // the engine), and SWALLOWS it otherwise: a filter makes the
-        // limit count SURVIVING rows, which this cap cannot express
-        // (`FIRST 1 ... WHERE K > 3` is four iterations there, recorded,
-        // not implemented), and a sort or a window is BLOCKING - the
-        // engine runs the whole body under `FIRST 2 ... ORDER BY`, so a
-        // cap would change the answer rather than the cost.
+        // A DERIVED TABLE PASSES A CAP THROUGH, AND ITS WHERE RIDES
+        // ALONG. Bare, it merely re-projects (measured: `FIRST 1 FROM
+        // (SELECT K FROM PLOG(5)) DT` runs the body ONCE on the engine).
+        // With a filter the limit counts SURVIVING rows - `FIRST 1 ...
+        // WHERE K > 3` is FOUR iterations there and `WHERE K > 0` one -
+        // so the predicate travels INTO the cap and the body stops at the
+        // nth row that passes it, rather than the cap being thrown away.
+        //
+        // A SORT OR A WINDOW IS STILL BLOCKING: the engine runs the whole
+        // body under `FIRST 2 ... ORDER BY`, so a cap there would change
+        // the ANSWER rather than the cost. The filter's `?`s are bound
+        // here, where the arguments are; an unbindable one drops the cap
+        // whole rather than counting rows it cannot judge.
         Plan::Derived { inner, filter, order_by, windows, .. } => {
-            let through =
-                if filter.is_none() && order_by.is_empty() && windows.is_empty() { cap } else { None };
-            materialise_procedures(inner, database, ctx, through)
+            let through = match cap {
+                Some(_) if !order_by.is_empty() || !windows.is_empty() => None,
+                Some(c) if filter.is_none() => Some(c),
+                Some(c) => match bind_filter_eval(filter, params) {
+                    Ok(keep) => Some(BodyCap { keep, ..c }),
+                    Err(_) => None,
+                },
+                None => None,
+            };
+            materialise_procedures(inner, database, ctx, params, through)
         }
-        Plan::Returning { inner, .. } => materialise_procedures(inner, database, ctx, None),
+        Plan::Returning { inner, .. } => {
+            materialise_procedures(inner, database, ctx, params, None)
+        }
         Plan::Union { branches, .. } => {
             let mut any = false;
             for b in branches.iter_mut() {
                 // a branch's share of an outer limit is not this branch's
                 // row count, so no cap crosses a union
-                any |= materialise_procedures(b, database, ctx, None)?;
+                any |= materialise_procedures(b, database, ctx, params, None)?;
             }
             Ok(any)
         }
@@ -46019,7 +46051,7 @@ fn materialise_procedures(
         // the CONSUMER wants says nothing about how many the BODY must
         // produce
         Plan::Join { base, .. } | Plan::JoinGroup { base, .. } | Plan::Lateral { base, .. } => {
-            materialise_procedures_src(base, database, ctx)
+            materialise_procedures_src(base, database, ctx, params)
         }
         _ => Ok(false),
     }
@@ -46031,19 +46063,20 @@ fn materialise_procedures_src(
     src: &mut RowSource,
     database: &mut Option<Database>,
     ctx: &SessionCtx,
+    params: &[WireParam],
 ) -> Result<bool, ProcErr> {
     match src {
         RowSource::PlanRows(rc) => {
             let mut inner = (**rc).clone();
             // a row source under a join or a fold: no cap (see above)
-            if materialise_procedures(&mut inner, database, ctx, None)? {
+            if materialise_procedures(&mut inner, database, ctx, params, None)? {
                 *rc = std::rc::Rc::new(inner);
                 return Ok(true);
             }
             Ok(false)
         }
         RowSource::Filter { input, .. } | RowSource::Sort { input, .. } => {
-            materialise_procedures_src(input, database, ctx)
+            materialise_procedures_src(input, database, ctx, params)
         }
         _ => Ok(false),
     }
@@ -81915,6 +81948,24 @@ enum GenMode {
     Replay,
 }
 
+/// WHAT STOPS A SELECTABLE BODY EARLY: how many rows the consumer will
+/// take, and - when the consumer FILTERS - the predicate a row must
+/// satisfy to COUNT toward that number.
+///
+/// The engine pulls until the nth SURVIVING row, which is not the nth
+/// suspended one: measured by side effect, `FIRST 1 ... WHERE K > 3`
+/// runs the body FOUR times and `FIRST 1 ... WHERE K > 0` ONCE. Counting
+/// every suspended row would stop at the first and answer the wrong row.
+#[derive(Clone)]
+struct BodyCap {
+    /// rows still wanted - `skip + take`, counted DOWN as rows qualify
+    take: usize,
+    /// the consumer's WHERE, ALREADY BOUND: only a row that matches
+    /// counts toward `take`. `None` counts every suspended row, which is
+    /// the unfiltered limit and EXECUTE PROCEDURE's own rule.
+    keep: Option<Predicate>,
+}
+
 struct PsqlFrame {
     vars: Vec<Value>,
     /// where the output parameters start in `vars` (inputs come first)
@@ -81936,7 +81987,7 @@ struct PsqlFrame {
     /// BLOCKING consumer - a sort, an aggregate, DISTINCT - runs it out
     /// (`FIRST 2 ... ORDER BY` is five iterations on the engine, so a
     /// cap there would be a wrong answer, not a saving).
-    stop_after: Option<usize>,
+    stop_after: Option<BodyCap>,
     /// WHAT THE ENCLOSING HANDLER CAUGHT, while its body runs - what a
     /// bare `EXCEPTION;` re-raises. Handlers nest, so this is saved and
     /// restored around each one rather than simply set.
@@ -85285,12 +85336,28 @@ fn exec_psql_stmt_inner(
             let row: Vec<Value> = (0..f.out_len)
                 .map(|i| f.vars.get(f.out_at + i).cloned().unwrap_or(Value::Null))
                 .collect();
+            // DOES THE CONSUMER KEEP THIS ROW? Asked BEFORE the push,
+            // while the row is still in hand. A filter error is the
+            // ENGINE'S OWN RAISE and must travel - [Predicate::matches]
+            // says so: swallowing it would silently drop exactly the row
+            // the engine raises on.
+            let counts = match f.stop_after.as_ref().and_then(|c| c.keep.as_ref()) {
+                None => true,
+                Some(pred) => pred.matches(&row).map_err(|err| {
+                    PsqlStop::Raise(Thrown::Runtime { err, trace: Vec::new() })
+                })?,
+            };
             f.suspended.push(row);
             // THE CONSUMER'S LIMIT STOPS THE BODY - what makes a
             // selectable procedure PULLED rather than run-then-sliced.
             // EXECUTE PROCEDURE is this same rule with a limit of one.
-            if f.stop_after.is_some_and(|n| f.suspended.len() >= n) {
-                return Err(PsqlStop::Exit);
+            if let Some(cap) = f.stop_after.as_mut() {
+                if counts {
+                    cap.take = cap.take.saturating_sub(1);
+                    if cap.take == 0 {
+                        return Err(PsqlStop::Exit);
+                    }
+                }
             }
             Ok(())
         }
@@ -87549,7 +87616,13 @@ fn run_procedure(
 ) -> Result<(Vec<Value>, Vec<Vec<Value>>), ProcErr> {
     // EXECUTE PROCEDURE is a row limit of ONE, which is the same rule a
     // `FIRST n` over the call applies with a different number
-    run_procedure_capped(database, name, args, ctx, if first_only { Some(1) } else { None })
+    run_procedure_capped(
+        database,
+        name,
+        args,
+        ctx,
+        first_only.then(|| BodyCap { take: 1, keep: None }),
+    )
 }
 
 /// [run_procedure] with the CONSUMER'S ROW LIMIT, when the caller knows
@@ -87565,7 +87638,7 @@ fn run_procedure_capped(
     name: &str,
     args: &[Value],
     ctx: &SessionCtx,
-    stop_after: Option<usize>,
+    stop_after: Option<BodyCap>,
 ) -> Result<(Vec<Value>, Vec<Vec<Value>>), ProcErr> {
     let db = database.as_ref().ok_or("no database attached")?;
     let meta = load_procedure(db, name)
@@ -87613,7 +87686,7 @@ fn run_body_source(
     args: &[Value],
     ctx: &SessionCtx,
     // the consumer's row limit, when it is known - see [PsqlFrame::stop_after]
-    stop_after: Option<usize>,
+    stop_after: Option<BodyCap>,
 ) -> Result<(Vec<Value>, Vec<Vec<Value>>), ProcErr> {
     // omitted trailing arguments take their parameters' DEFAULTs
     let args = with_proc_defaults(meta, args, Some(ctx));
@@ -93212,7 +93285,9 @@ fn after_auth(
                     // times. A DISTINCT or a bare SKIP has no bound and
                     // takes no cap.
                     let cap = match (outer.1, outer.3) {
-                        (false, Some(t)) => Some(outer.2.saturating_add(t)),
+                        (false, Some(t)) => {
+                            Some(BodyCap { take: outer.2.saturating_add(t), keep: None })
+                        }
                         _ => None,
                     };
                     match run_procedure_capped(&mut database, &pname, &pargs, &ctx, cap) {
@@ -93343,7 +93418,7 @@ fn after_auth(
                     let mut p = (*plan).clone();
                     // the walk starts UNCAPPED and earns a cap on the way
                     // down, at a bounded non-DISTINCT limit
-                    match materialise_procedures(&mut p, &mut database, &ctx, None) {
+                    match materialise_procedures(&mut p, &mut database, &ctx, &bound_args, None) {
                         Ok(subst) => {
                             if std::env::var("FC_SRV_TRACE").is_ok() {
                                 eprintln!(

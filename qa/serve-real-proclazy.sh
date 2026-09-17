@@ -24,10 +24,18 @@
 #   FIRST 2              2     FIRST 99             5   (limit > rows)
 #   FIRST 1 SKIP 1       2     ROWS 2               2
 #   ROWS 2 TO 3          3     SKIP 2               5   (no bound)
-#   derived + FIRST 1    1     WHERE                5   (a filter does
-#   ORDER BY             5      not stop the body)
+#   derived + FIRST 1    1     WHERE                5   (a filter alone
+#   ORDER BY             5      does not stop it)
 #   COUNT(*)             5     DISTINCT             5
 #   FIRST 2 + ORDER BY   5     EXECUTE PROCEDURE    1
+#
+# A LIMIT *WITH* A FILTER COUNTS SURVIVORS, not suspended rows, and that
+# is a third answer rather than either half:
+#
+#   FIRST 1 WHERE K > 3  4     FIRST 1 WHERE K > 0  1
+#   FIRST 2 WHERE K > 2  4     FIRST 3 WHERE K > 1  4
+#   ROWS 2  WHERE K > 2  4     FIRST 1 SKIP 1 K>1   3   (skip+take
+#   FIRST 1 WHERE K > 99 5      (runs out)                survivors)
 #
 # The blocking ones matter as much as the stopping ones: a sort, an
 # aggregate or a DISTINCT consumes the WHOLE body on the engine, so a
@@ -196,17 +204,33 @@ cell "a bare raising body: rows, then the raise" "SELECT K FROM PRAISE"
 cell "a limit PAST the raise still raises"       "SELECT FIRST 3 K FROM PRAISE"
 cell "a WRITING raising body: rows yes, writes no" "SELECT K FROM PRW"
 
-# RECORDED, NOT FIXED - measured here, left as it is:
+# A LIMIT *WITH* A FILTER STOPS AT THE nTH SURVIVOR.
 #
-#   A LIMIT WITH A FILTER counts SURVIVING rows, which the body's cap
-#   cannot express: `SELECT FIRST 1 K FROM PLOG(5) WHERE K > 3` is FOUR
-#   iterations on the engine (it pulls until one row passes the filter)
-#   and five here. The rows are identical; only the side-effect count
-#   differs. Implementing it needs the filter evaluated inside the
-#   body's pull rather than above it.
+# This was recorded here and not fixed for one commit: the cap could say
+# "n rows" but not "n rows THAT PASS", so `FIRST 1 ... WHERE K > 3` ran
+# the body out. The rows were always right - only the side-effect count
+# was wrong, which is exactly what this fixture exists to see.
 #
-# It is recorded the honest way round: NOT as an OK cell, and not hidden
-# either - that number is what a future slice must move.
+# The predicate now rides the cap into the body and the SUSPEND site
+# counts only rows that pass it. The two ends of the range are the
+# interesting cells: a filter nothing passes early runs the body out
+# (the cap is never reached), and one everything passes stops at once -
+# the same statement shape, four iterations apart.
+echo "-- a limit WITH a filter counts SURVIVORS --"
+cell "FIRST 1 pulls until one passes"    "SELECT FIRST 1 K FROM PLOG(5) WHERE K > 3"
+cell "FIRST 1 over a filter nothing bars" "SELECT FIRST 1 K FROM PLOG(5) WHERE K > 0"
+cell "FIRST 2 counts two survivors"      "SELECT FIRST 2 K FROM PLOG(5) WHERE K > 2"
+cell "a limit past the survivors"        "SELECT FIRST 3 K FROM PLOG(5) WHERE K > 1"
+cell "ROWS 2 with a filter"              "SELECT K FROM PLOG(5) WHERE K > 2 ROWS 2"
+cell "FIRST 1 SKIP 1 counts survivors"   "SELECT FIRST 1 SKIP 1 K FROM PLOG(5) WHERE K > 1"
+# ...and the cap must NOT fire when it is never reached, or when the
+# consumer above it is blocking - both would be wrong ANSWERS, not
+# wrong costs
+cell "a filter nothing passes runs out"  "SELECT FIRST 1 K FROM PLOG(5) WHERE K > 99"
+cell "a sort still blocks a filtered limit" \
+     "SELECT FIRST 1 K FROM PLOG(5) WHERE K > 1 ORDER BY K DESC"
+cell "a filtered limit through a derived table" \
+     "SELECT FIRST 1 K FROM (SELECT K FROM PLOG(5) WHERE K > 2) DT"
 
 kill $srv 2>/dev/null; wait $srv 2>/dev/null; trap - EXIT
 rm -f "$WORK" "$REF"
