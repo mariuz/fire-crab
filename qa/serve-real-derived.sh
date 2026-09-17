@@ -409,6 +409,18 @@ bothq "a derived table ABOVE the join" "SELECT Y.ID FROM (SELECT X.ID FROM (SELE
 # the controls: a join of plain tables, and an ON ? with no derived side
 both "CONTROL a join of plain tables" "SELECT E.ID FROM EMP E JOIN DEPT D ON D.ID = E.DEPT_ID ORDER BY E.ID"
 bothq "CONTROL an ON ? with no derived side" "SELECT E.ID FROM EMP E JOIN DEPT D ON D.ID = E.DEPT_ID AND D.ID > ? ORDER BY E.ID" '[0]'
+# --- a MULTI-ON chain that IS numberable -------------------------------
+# The guard used to refuse every chain of more than one join whose ON
+# carried a `?`. Text order is `s0, s1, on0, s2, on1, ...` and this
+# planner numbers sides then ONs, so the two agree whenever the derived
+# side comes BEFORE the ONs - which is every shape here. Each cell has a
+# twin that must answer NOTHING, so a mis-numbered slot cannot hide.
+bothq "a derived side, then two bound ONs" "SELECT A.ID FROM EMP A JOIN (SELECT ID FROM EMP WHERE ID > ?) B ON A.ID = B.ID AND A.ID > ? JOIN DEPT D ON D.ID = A.DEPT_ID AND D.ID > ? ORDER BY A.ID" '[0,0,0]'
+bothq "...the LAST ON excludes" "SELECT A.ID FROM EMP A JOIN (SELECT ID FROM EMP WHERE ID > ?) B ON A.ID = B.ID AND A.ID > ? JOIN DEPT D ON D.ID = A.DEPT_ID AND D.ID > ? ORDER BY A.ID" '[0,0,99]'
+bothq "...the DERIVED SIDE excludes" "SELECT A.ID FROM EMP A JOIN (SELECT ID FROM EMP WHERE ID > ?) B ON A.ID = B.ID AND A.ID > ? JOIN DEPT D ON D.ID = A.DEPT_ID AND D.ID > ? ORDER BY A.ID" '[99,0,0]'
+bothq "a ? in the FIRST ON only" "SELECT A.ID FROM EMP A JOIN (SELECT ID FROM EMP WHERE ID > ?) B ON A.ID = B.ID AND A.ID > ? JOIN DEPT D ON D.ID = A.DEPT_ID ORDER BY A.ID" '[0,0]'
+bothq "a ? in the SECOND ON only" "SELECT A.ID FROM EMP A JOIN (SELECT ID FROM EMP WHERE ID > ?) B ON A.ID = B.ID JOIN DEPT D ON D.ID = A.DEPT_ID AND D.ID > ? ORDER BY A.ID" '[0,0]'
+bothq "TWO derived sides ahead of two ONs" "SELECT A.ID FROM (SELECT ID FROM EMP WHERE ID > ?) A JOIN (SELECT ID FROM EMP WHERE ID < ?) B ON A.ID = B.ID AND A.ID > ? JOIN DEPT D ON D.ID = A.ID AND D.ID > ? ORDER BY A.ID" '[0,9,0,0]'
 # ...but NOT with a JOIN or a FOLD above it - both still refuse, and the
 # gate found that: they were written as live cells on the strength of a
 # hand-probe that never covered them. Recorded rather than dropped, so
@@ -437,10 +449,13 @@ both "CONTROL a literal inner predicate" "SELECT ID FROM (SELECT ID FROM EMP WHE
 #   row-source walk binds that plan's projection before materialising it.
 #   Cells for both are live above, and serve-real-castparamderived owns
 #   the rest.)
-#   - a chain of MORE THAN ONE join whose ON carries a `?`: an ON is then
-#     written BETWEEN two sides, and this planner numbers every side
-#     before any ON, so it would MIS-NUMBER rather than refuse. Refused
-#     deliberately (multi_on_param).
+#   - a derived side written AFTER an ON that carries its own `?`. Slots
+#     number by TEXT POSITION (`s0, s1, on0, s2, on1, ...`) while this
+#     planner numbers every SIDE and then every ON, so those two orders
+#     agree UNLESS a side at index >= 2 claims a slot with an earlier ON
+#     claiming one too - the single arrangement that would SWAP two
+#     slots. Refused deliberately (multi_on_param), now testing exactly
+#     that shape rather than every multi-ON chain alike.
 #   (a `?` in a UNION BRANCH was recorded here too, and is FIXED: it was
 #   never about derived tables - plan_union cleared the parameter sink
 #   after building its branches. serve-real-union owns those cells now.)
@@ -450,7 +465,7 @@ both "CONTROL a literal inner predicate" "SELECT ID FROM (SELECT ID FROM EMP WHE
 #   derived base before the fold runs retired it; its cells are live
 #   above. The JOIN above an inner `?` is NOT the same thing: it refuses
 #   at PLAN time, in plan_join_bound's own copy of the old guard.)
-refusesq "a multi-ON chain with a bound ON" "SELECT A.ID FROM EMP A JOIN (SELECT ID FROM EMP WHERE ID > ?) B ON A.ID = B.ID AND A.ID > ? JOIN DEPT D ON D.ID = A.DEPT_ID AND D.ID > ? ORDER BY A.ID" '[0,0,0]'
+refusesq "a derived side written AFTER an ON-with-?" "SELECT A.ID FROM EMP A JOIN DEPT D ON D.ID = A.DEPT_ID AND D.ID > ? JOIN (SELECT ID FROM EMP WHERE ID > ?) B ON B.ID = A.ID ORDER BY A.ID" '[0,0]'
 
 # --- a materialised row source carries its rows' OWN error ------------
 # branch_rows answered an Option, so "this shape is unserved" and "the

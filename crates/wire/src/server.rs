@@ -40574,13 +40574,37 @@ fn plan_join_bound(
     if joins.is_empty() {
         return None;
     }
-    // Does an ON clause carry a `?` in a chain of more than one step?
-    // Then an ON is written BETWEEN sides, and this planner numbers all
-    // sides before any ON - see the refusal at the derived side below.
-    let multi_on_param = joins.len() > 1
-        && joins.iter().any(|(_, _, on_s, _)| {
-            *on_s != CROSS_ON && *on_s != NATURAL_ON && mask_literals(on_s).contains('?')
-        });
+    // WHICH multi-join shapes this planner cannot number, exactly.
+    //
+    // Slots are numbered by TEXT POSITION: `s0, s1, on0, s2, on1, ...`.
+    // This planner numbers every SIDE first and then every ON, so the
+    // two orders agree unless a side written AFTER an ON claims a slot
+    // while that ON claims one too. Only a DERIVED side can claim one (a
+    // plain relation has no `?`), and the sides after the first ON are
+    // those at index >= 2 - side `i` is introduced by `joins[i - 1]`, so
+    // the ONs written before it are `joins[0 ..= i - 2]`.
+    //
+    // Measured: `A JOIN (d ?) B ON ? JOIN DEPT ON ?` is three slots and
+    // both orders agree (the derived side is s1, before every ON), and
+    // so do the `?`-in-one-ON forms and two derived sides ahead of two
+    // ONs; but `A JOIN DEPT ON ? JOIN (d ?) B ON ...` would SWAP its two
+    // slots, so that one still refuses. The old test - any ON with a `?`
+    // in a chain of more than one step - refused all of them alike.
+    let side_has_param = |tr: &TableRef<'_>| {
+        tr.table.trim().starts_with('(') && mask_literals(&tr.table).contains('?')
+    };
+    let on_has_param = |on_s: &str| {
+        on_s != CROSS_ON && on_s != NATURAL_ON && mask_literals(on_s).contains('?')
+    };
+    let ordered_sides: Vec<&TableRef<'_>> =
+        std::iter::once(left).chain(joins.iter().map(|(_, r, _, _)| r)).collect();
+    let multi_on_param = ordered_sides.iter().enumerate().skip(2).any(|(i, tr)| {
+        side_has_param(tr)
+            && joins
+                .iter()
+                .take(i - 1)
+                .any(|(_, _, on_s, _)| on_has_param(on_s))
+    });
     let mut sides: Vec<JoinSide> = Vec::new();
     let mut refs: Vec<&TableRef<'_>> = vec![left];
     refs.extend(joins.iter().map(|(_, r, _, _)| r));
@@ -40622,11 +40646,11 @@ fn plan_join_bound(
             // It used to plan into a FRESH sink and refuse if the side
             // claimed anything ("a `?` inside a derived side").
             let sbase = params.len().max(proj_params);
-            // ...EXCEPT where an ON carrying its own `?` is written
-            // BETWEEN two sides: this numbers every side before every
-            // ON, so a chain like `a JOIN (d1) ON ? JOIN (d2) ON ?`
-            // would mis-number rather than refuse. Every shape measured
-            // for this slice has its sides before a single ON.
+            // ...EXCEPT this side is written AFTER an ON that claims a
+            // slot of its own, which is the one arrangement whose text
+            // order this planner cannot reproduce - see the test where
+            // `multi_on_param` is computed. Refused rather than
+            // mis-numbered.
             if multi_on_param {
                 return None;
             }
