@@ -49403,12 +49403,29 @@ fn plan_query_inner_ctx(
                                 )
                             })
                             .collect();
+                        // THE SEATS TRAVEL WITH THE INNER PLAN. Leaving
+                        // them empty here described the argument slots
+                        // (they are claimed in the outer `params`) and
+                        // then ran the body with NULL in every seat:
+                        // `SELECT MAX(K) FROM PU(?, ?)` answered NULL
+                        // where the engine answers the bound value, while
+                        // `COUNT(*)` agreed by accident because counting
+                        // a row never reads its arguments.
+                        //
+                        // [materialise_procedures_src] already carries the
+                        // bound values down to this leaf, so the seats are
+                        // filled there. Safe for exactly the shapes that
+                        // reach here: anything with an outer `?` - a
+                        // WHERE, GROUP BY, HAVING or ORDER BY - is refused
+                        // above (the re-plan would renumber from zero),
+                        // and a projection `?` over a call describes
+                        // nothing on BOTH servers.
                         let inner = Plan::ProcSelect {
                             name: pname.clone(),
                             args: args.clone(),
                             cols: all_cols.clone(),
                             picks: (0..meta.outs.len()).collect(),
-                            arg_slots: Vec::new(),
+                            arg_slots: arg_slots.clone(),
                         };
                         let key = palias.clone().unwrap_or_else(|| {
                             pname.rsplit('.').next().unwrap_or(pname.as_str()).to_string()

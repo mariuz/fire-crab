@@ -284,6 +284,20 @@ bothq "a NULL argument" "SELECT K FROM PU(?, ?)" '[null,5]'
 # than through materialise_procedures - the seat has to be filled there
 # too, or the body runs with a NULL in it (which it once did).
 bothq "a modifier over the call" "SELECT FIRST 1 K FROM PU(?, ?)" '["ab",7]'
+# ...and through an AGGREGATE, which takes a THIRD route again - the
+# bound-row-source one, where the call becomes an inner plan under a
+# fold. The seats have to travel WITH that inner plan or the body runs
+# with NULL in each of them.
+#
+# THE CELL THAT WOULD NOT HAVE CAUGHT IT: `COUNT(*)` agrees even when
+# every argument is NULL, because counting a row never reads one. The
+# value-carrying folds below are the ones with teeth - PU returns its
+# SECOND argument and PX the CHAR_LENGTH of its first, so a NULL seat
+# shows up as a NULL answer.
+bothq "an aggregate over the call" "SELECT MAX(K) FROM PU(?, ?)" '["ab",7]'
+bothq "...a SUM, where the value shows" "SELECT SUM(K) FROM PU(?, ?)" '["ab",42]'
+bothq "...and over the TEXT argument" "SELECT MAX(K) FROM PX(?)" '["abcde"]'
+bothq "COUNT(*) agrees either way (a control)" "SELECT COUNT(*) FROM PU(?, ?)" '["ab",7]'
 # RECORDED, NOT FIXED - a CLAUSE over the call still refuses: that route
 # rebuilds the statement without the call's placeholders and renumbers
 # from zero. Measured: `PU(?, ?) WHERE K = ?` is three slots in text
