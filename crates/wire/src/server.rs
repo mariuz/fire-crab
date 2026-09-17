@@ -47192,13 +47192,38 @@ fn branch_rows_res(
     if matches!(plan, Plan::Project { gen_cols, .. } if !gen_cols.is_empty()) {
         return Err(EvalErr::Unsupported);
     }
-    // A WINDOWED PROJECT IS NOT A ROW SOURCE HERE either. This destructures
-    // Project with `..` and knows nothing of `windows`, so the window
-    // columns would come back missing. A window nested in a union branch,
-    // a FOR SELECT, INSERT ... SELECT, a derived table or a CTE level
-    // refuses until that path is converted deliberately (its own slice).
-    if matches!(plan, Plan::Project { windows, .. } if !windows.is_empty()) {
-        return Err(EvalErr::Unsupported);
+    // A WINDOWED PROJECT IS A ROW SOURCE, folded by the SAME implementation
+    // the batch fetch uses ([fold_project_windows]: scan, fold each window
+    // over its partition, and only THEN sort - an order that is
+    // load-bearing). Refusing it here is what made a window inside a
+    // DERIVED TABLE, a CTE level or a union branch die at the FETCH with a
+    // bare `Unsupported` - rendered `42000 / Dynamic SQL Error` - even
+    // though the statement PREPARED and BOTH levels PLANNED: the inner
+    // rows simply had no source. Measured against the engine, which
+    // answers a window in a derived table, one with PARTITION BY, a
+    // ROW_NUMBER, and one on a join's derived side.
+    //
+    // The fold hands back RECORDS, each window's value appended at
+    // `win_base`, so they are projected down through `cols` here exactly
+    // as the Join arm below does: THIS function's contract is to return
+    // PROJECTED rows, and a `Derived`'s own `cols` then index those output
+    // positions (see [side_base_fids]). A Project carrying BOTH a
+    // generator and a window still refuses, at the guard above.
+    if let Plan::Project {
+        rel, formats, cols, filter, order_by, index, defer, windows, win_base, ..
+    } = plan
+    {
+        if !windows.is_empty() {
+            let records = fold_project_windows(
+                *rel, formats, filter, order_by, index, defer, windows, *win_base, db, args,
+            )?;
+            return records
+                .iter()
+                // a column's own evaluation error travels too, as it does
+                // in every other arm here
+                .map(|values| cols.iter().map(|c| c.value_of(values)).collect())
+                .collect();
+        }
     }
     // a UNION is a row source too - and so is a nested one, since this
     // recurses. Everything that materialises rows (INSERT ... SELECT, a
@@ -47506,13 +47531,21 @@ fn branch_rows_each(
         }
         return Ok(());
     }
-    // a WINDOWED Project streams its cols here WITHOUT the fold that fills
-    // them (that lives in emit's Project arm), so its window slots would
-    // read back NULL - the silent-wrong-answer the gen_cols guards also
-    // prevent. Refuse it here too: a window nested in a derived table,
-    // CTE or union branch is its own later slice.
+    // a WINDOWED Project cannot STREAM here: the arm below pushes its cols
+    // WITHOUT the fold that fills them, so every window slot would read
+    // back NULL - the silent wrong answer the gen_cols guard also
+    // prevents. It is a BLOCKING shape on the engine too (a fold must see
+    // the whole partition before any row can be delivered, so there is no
+    // row to push early), which puts it with the other blocking shapes on
+    // the COLLECTING path below - now that that path folds it. Delegating
+    // keeps the fold on ONE implementation instead of growing a second
+    // here, and is what stopped a window in a derived table, a CTE level
+    // or a union branch from dying at the fetch.
     if matches!(plan, Plan::Project { windows, .. } if !windows.is_empty()) {
-        return Err(EvalErr::Unsupported);
+        for row in branch_rows_res(plan, db, args)? {
+            sink(row)?;
+        }
+        return Ok(());
     }
     if let Plan::Project { rel, formats, cols, filter, order_by, index, .. } = plan {
         let filter = bind_filter_eval(filter, args)?;

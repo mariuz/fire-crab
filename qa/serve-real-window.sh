@@ -47,10 +47,20 @@
 # values (peers fall in naturally). A VALUE function takes an explicit
 # `ROWS` frame too. A `RANGE` frame over a numeric/temporal key, a `RANGE`
 # frame on a value function, a `GROUPS` frame, and a frame on a
-# ranking/navigation function are later slices (refused). Still
-# refused, each its own slice: a window over a JOIN or a derived / CTE /
-# union-branch row source, a window mixed with GROUP BY, and a `?` inside
-# a window. Every ROW_NUMBER / LAG / LEAD / NTH / ROWS-frame check uses a
+# ranking/navigation function are later slices (refused).
+#
+# A WINDOW INSIDE A ROW SOURCE IS SERVED: a derived table, a CTE level, a
+# union BRANCH, a VIEW, a scalar or IN subquery, a derived table on a
+# JOIN's side, an INSERT ... SELECT and a FOR SELECT all fold a windowed
+# projection, every one of them measured against the engine. What is still
+# refused is a window whose OWN row source is not a single relation - over
+# a JOIN directly, over a derived table WRAPPING a join, or over the rows
+# of a RECURSIVE CTE - because the fold hangs off `Plan::Project` and
+# `Plan::Join` carries no `windows` at all; and a window mixed with GROUP
+# BY. Those are recorded by `known_diff` below, which FAILS if they ever
+# start agreeing. A `?` inside a window is refused by BOTH servers (the
+# engine with -804), so only the message text differs.
+# Every ROW_NUMBER / LAG / LEAD / NTH / ROWS-frame check uses a
 # TOTAL order - a tie leaves the row sequence unpinned, so only a total
 # order is differentially deterministic.
 #
@@ -88,6 +98,9 @@ INSERT INTO T VALUES (7,NULL,NULL,4,NULL,'gg');
 INSERT INTO T VALUES (8,NULL,3,6,4.00,'hh');
 INSERT INTO T VALUES (9,40,3,9,6.00,'ii');
 COMMIT;
+CREATE TABLE T2 (K INTEGER);
+CREATE VIEW VW AS SELECT ID, ROW_NUMBER() OVER (ORDER BY ID) AS R FROM T;
+COMMIT;
 EOF
     chmod 666 "$1" 2>/dev/null
 }
@@ -119,6 +132,27 @@ both() { # <label> <sql>
     ran=$((ran + 1))
     if [ "$a" = "$b" ]; then echo "OK   $1: $a"
     else echo "DIFF $1"; echo "     fcwire: $a"; echo "     engine: $b"; fail=1; fi
+}
+# A RECORDED DIVERGENCE THAT EXPIRES BY ITSELF. The cell passes only while
+# the two servers still DISAGREE and FAILS the moment they agree, so a
+# later fix cannot leave a stale "known difference" standing in the gate.
+# The engine must actually ANSWER for the record to mean anything: two
+# servers that both fail to connect are the vacuous shape, not a
+# divergence, and a control that agrees by erroring measures nothing.
+known_diff() { # <label> <sql>
+    local a b
+    a=$(query "$2" 127.0.0.1 "$PORT" "$A")
+    b=$(query "$2" 127.0.0.1 "$REAL" "$B")
+    ran=$((ran + 1))
+    if [ "$a" = "$b" ]; then
+        echo "DIFF $1: the recorded divergence is GONE (both answer ${a:0:50}) - promote this cell to both()"
+        fail=1
+    elif [ -z "$b" ] || [ "$b" = "CONN_ERR" ] || [ "$a" = "CONN_ERR" ]; then
+        echo "DIFF $1: VACUOUS - a server never answered (engine=${b:0:30} fcwire=${a:0:30})"
+        fail=1
+    else
+        echo "OK   $1: recorded (engine ${b:0:44} / fcwire ${a:0:32})"
+    fi
 }
 
 both "COUNT(*) OVER ()"        "SELECT ID, COUNT(*) OVER () C FROM T ORDER BY ID"
@@ -325,6 +359,96 @@ both "PERCENT_RANK, no ORDER BY" "SELECT ID, PERCENT_RANK() OVER () R FROM T ORD
 both "CUME_DIST, no ORDER BY"  "SELECT ID, CUME_DIST() OVER () R FROM T ORDER BY ID"
 both "a distribution ranking composed" \
     "SELECT ID, CUME_DIST() OVER (ORDER BY V) * 100 R FROM T ORDER BY ID"
+
+# --- A WINDOW INSIDE A ROW SOURCE ---------------------------------------
+# The window fold existed only for the TOP-LEVEL cursor. `branch_rows_res`
+# - the row-source spine every nested shape draws from (a derived table, a
+# CTE level, a union branch, a view, a subquery, INSERT ... SELECT, a FOR
+# SELECT loop) - REFUSED a windowed `Plan::Project` outright, with a
+# comment naming "a derived table or a CTE level" as a deliberately later
+# slice. `EvalErr::Unsupported` renders as a bare `42000 / Dynamic SQL
+# Error`, and the failure mode was invisible in the usual places: the
+# statement PREPARED, BOTH levels PLANNED (the trace shows the outer
+# projection and the inner `SUM(ID) OVER (ORDER BY DEPT_ID)` one after the
+# other), and the fetch was ENTERED - the inner rows simply had no source.
+# There was no "prepare refused" line to grep for, which is why reading
+# the planner for it three times found nothing.
+#
+# The fix hands those callers the SAME fold the batch fetch uses
+# ([fold_project_windows]: scan, fold each window over its partition, and
+# only THEN sort - the order is load-bearing), so there is still exactly
+# one implementation. The streaming twin (`branch_rows_each`) DELEGATES
+# here rather than growing a second one: a fold must see the whole
+# partition before it can answer any row, so a windowed projection is a
+# blocking shape, which is what the collecting path is for.
+both "control: derived, no window" "SELECT SUM(W) AS N FROM (SELECT V AS W FROM T WHERE ID<=3) Z"
+both "derived, running SUM"        "SELECT W FROM (SELECT SUM(V) OVER (ORDER BY G, ID) AS W FROM T WHERE ID<=3) Z ORDER BY 1"
+both "derived, PARTITION BY"       "SELECT W FROM (SELECT SUM(V) OVER (PARTITION BY G) AS W FROM T) Z ORDER BY 1"
+both "derived, ROW_NUMBER"         "SELECT R FROM (SELECT ROW_NUMBER() OVER (ORDER BY ID) AS R FROM T) Z ORDER BY 1"
+both "derived, LAG"                "SELECT L FROM (SELECT LAG(V) OVER (ORDER BY ID) AS L FROM T) Z ORDER BY 1"
+both "derived, RANK ties"          "SELECT R FROM (SELECT RANK() OVER (ORDER BY V) AS R FROM T) Z ORDER BY 1"
+both "derived, two windows"        "SELECT A, B FROM (SELECT SUM(V) OVER (PARTITION BY G) AS A, COUNT(*) OVER () AS B FROM T) Z ORDER BY A, B"
+both "derived, window + plain col" "SELECT ID, W FROM (SELECT ID, SUM(V) OVER (PARTITION BY G) AS W FROM T) Z ORDER BY ID"
+both "derived, ROWS frame"         "SELECT M FROM (SELECT SUM(V) OVER (ORDER BY V, ID ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS M FROM T) Z ORDER BY 1"
+both "derived + outer WHERE"       "SELECT W FROM (SELECT ID, SUM(V) OVER (PARTITION BY G) AS W FROM T) Z WHERE W>5 ORDER BY 1"
+both "derived + outer ORDER BY"    "SELECT ID, W FROM (SELECT ID, ROW_NUMBER() OVER (ORDER BY V, ID) AS W FROM T) Z ORDER BY W DESC"
+both "derived + outer DISTINCT"    "SELECT DISTINCT W FROM (SELECT SUM(V) OVER (PARTITION BY G) AS W FROM T) Z ORDER BY 1"
+both "derived + outer FIRST 3"     "SELECT FIRST 3 W FROM (SELECT ROW_NUMBER() OVER (ORDER BY ID) AS W FROM T) Z ORDER BY 1"
+both "derived + outer aggregate"   "SELECT SUM(W) AS N FROM (SELECT SUM(V) OVER (PARTITION BY G) AS W FROM T) Z"
+both "derived + outer GROUP BY"    "SELECT W, COUNT(*) C FROM (SELECT SUM(V) OVER (PARTITION BY G) AS W FROM T) Z GROUP BY W ORDER BY W"
+both "derived over derived"        "SELECT W FROM (SELECT W FROM (SELECT ROW_NUMBER() OVER (ORDER BY ID) AS W FROM T) Y) Z ORDER BY 1"
+both "a CTE level"                 "WITH C AS (SELECT ID, ROW_NUMBER() OVER (ORDER BY ID) AS R FROM T) SELECT ID, R FROM C ORDER BY ID"
+both "a CTE joined to itself"      "WITH C AS (SELECT ID, SUM(V) OVER (PARTITION BY G) AS W FROM T) SELECT X.ID, Y.W FROM C X JOIN C Y ON Y.ID=X.ID ORDER BY X.ID"
+both "a union BRANCH"              "SELECT ROW_NUMBER() OVER (ORDER BY ID) R FROM T UNION ALL SELECT 99 FROM RDB\$DATABASE ORDER BY 1"
+both "both union branches"         "SELECT ROW_NUMBER() OVER (ORDER BY ID) R FROM T UNION ALL SELECT COUNT(*) OVER () FROM T ORDER BY 1"
+both "a VIEW carrying a window"    "SELECT R FROM VW ORDER BY 1"
+both "a VIEW, filtered"            "SELECT ID, R FROM VW WHERE R>6 ORDER BY ID"
+both "a scalar subquery"           "SELECT (SELECT MAX(W) FROM (SELECT SUM(V) OVER (PARTITION BY G) AS W FROM T) Z) AS N FROM RDB\$DATABASE"
+both "an IN subquery"              "SELECT ID FROM T WHERE ID IN (SELECT R FROM (SELECT ROW_NUMBER() OVER (ORDER BY ID) AS R FROM T) Z) ORDER BY ID"
+both "an EXISTS subquery"          "SELECT ID FROM T WHERE EXISTS (SELECT 1 FROM (SELECT ROW_NUMBER() OVER (ORDER BY ID) AS R FROM T) Z WHERE Z.R=T.ID) ORDER BY ID"
+both "a JOIN's derived SIDE"       "SELECT A.ID, Z.W FROM T A JOIN (SELECT ID, SUM(V) OVER (PARTITION BY G) AS W FROM T) Z ON Z.ID=A.ID ORDER BY A.ID"
+both "a LEFT JOIN's derived side"  "SELECT A.ID, Z.W FROM T A LEFT JOIN (SELECT ID, SUM(V) OVER (PARTITION BY G) AS W FROM T WHERE ID<5) Z ON Z.ID=A.ID ORDER BY A.ID"
+# the streaming spine (`branch_rows_each`) delegates to the fold above
+both "a FOR SELECT loop"           "EXECUTE BLOCK RETURNS (R INTEGER) AS BEGIN FOR SELECT ROW_NUMBER() OVER (ORDER BY ID) FROM T INTO :R DO SUSPEND; END"
+# A THIRD path, and NOT the row-source spine: a `FOR SELECT` whose source
+# is a derived table CARRYING a window never reaches the spine at all. The
+# PSQL body is split TEXTUALLY first, and the trace says `split_query
+# failed` followed by `prepare refused` - it dies at PREPARE. Three
+# controls separate it from the window work: `FOR SELECT` over a derived
+# table with NO window works (above), `FOR SELECT` with a window DIRECTLY
+# works (above), and a plain `SELECT` of this very derived table works
+# (above) - only the COMBINATION defeats the splitter. Recorded rather
+# than fixed here: it is a parser slice and a refusal, so it ranks below
+# any wrong answer, and folding a parser rewrite into this change would
+# put every measurement above back in question.
+known_diff "FOR SELECT+derived+window (split_query)" "EXECUTE BLOCK RETURNS (R INTEGER) AS BEGIN FOR SELECT W FROM (SELECT SUM(V) OVER (PARTITION BY G) AS W FROM T) Z INTO :R DO SUSPEND; END"
+# INSERT ... SELECT draws from the same spine: the write is compared, and
+# then the TABLE is read back, which is where a refused source shows up as
+# an empty table rather than as an error
+both "INSERT..SELECT a window"     "INSERT INTO T2 SELECT ROW_NUMBER() OVER (ORDER BY ID) FROM T"
+both "T2 after INSERT..SELECT"     "SELECT K FROM T2 ORDER BY 1"
+
+# --- STILL REFUSED: a window whose SOURCE is not one relation -----------
+# The fold hangs off `Plan::Project`, so a window over a JOIN, over a
+# derived table wrapping a join, or over a RECURSIVE CTE's rows has no
+# node to hang from - `Plan::Join` has no `windows` field. The engine
+# answers all four; fire-crab refuses, which is law-safe and ranks below
+# any wrong answer. Recorded here so the day one starts agreeing, the
+# gate says so instead of quietly passing.
+known_diff "window OVER a join"        "SELECT A.ID, SUM(A.V) OVER (PARTITION BY A.G) S FROM T A JOIN T B ON B.ID=A.ID ORDER BY A.ID"
+known_diff "window over a joined derived" "SELECT W FROM (SELECT SUM(A.V) OVER (PARTITION BY A.G) AS W FROM T A JOIN T B ON B.ID=A.ID) Z ORDER BY 1"
+known_diff "window inside a RECURSIVE CTE" "WITH RECURSIVE R AS (SELECT 1 AS L FROM RDB\$DATABASE UNION ALL SELECT L+1 FROM R WHERE L<3) SELECT L FROM (SELECT L, ROW_NUMBER() OVER (ORDER BY L) N FROM R) Z ORDER BY L"
+known_diff "window mixed with GROUP BY"   "SELECT G, SUM(V) S, COUNT(*) OVER () C FROM T GROUP BY G ORDER BY G"
+# both servers REFUSE a `?` in a window - only the message differs (the
+# engine adds "SQL error code = -804"), so this records a message gap and
+# not a capability one
+known_diff "a ? inside a window (msg)"    "SELECT ID, SUM(V+?) OVER () S FROM T ORDER BY ID"
+# and the shapes that worked BEFORE this change, kept as controls so the
+# fix cannot be credited with them: a window OVER a plain CTE, over a
+# derived UNION, and inside a selectable procedure all already agreed
+both "control: window over a CTE"  "WITH C AS (SELECT ID, V FROM T) SELECT ID, SUM(V) OVER () S FROM C ORDER BY ID"
+both "control: window over union"  "SELECT ID, ROW_NUMBER() OVER (ORDER BY ID) R FROM (SELECT ID FROM T UNION ALL SELECT 99 FROM RDB\$DATABASE) Z ORDER BY ID"
+both "control: recursive CTE, outside" "WITH RECURSIVE R AS (SELECT 1 AS L FROM RDB\$DATABASE UNION ALL SELECT L+1 FROM R WHERE L<3) SELECT L, ROW_NUMBER() OVER (ORDER BY L) N FROM R ORDER BY L"
 
 echo "ran $ran checks"
 exit $fail
