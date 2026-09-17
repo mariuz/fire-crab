@@ -343,6 +343,12 @@ bothq "a NESTED derived table's ?" "SELECT ID FROM (SELECT ID FROM (SELECT ID FR
 bothq "a CTE body's ?" "WITH C AS (SELECT ID FROM EMP WHERE ID > ?) SELECT ID FROM C ORDER BY ID" '[3]'
 bothq "a CTE body's ? and an outer ?" "WITH C AS (SELECT ID FROM EMP WHERE ID > ?) SELECT ID FROM C WHERE ID < ? ORDER BY ID" '[1,4]'
 bothq "an inner ? over a TEXT column" "SELECT NAME FROM (SELECT NAME FROM EMP WHERE NAME > ?) X ORDER BY NAME" '["c"]'
+# AN OUTER PROJECTION `?` ABOVE AN INNER ONE - two slots, the
+# PROJECTION's first (measured). These two cells would SWAP if the
+# projection were numbered after the derived body's slots, which is
+# exactly what used to happen and what made this refuse.
+bothq "an outer projection ? above an inner ?" "SELECT CAST(? AS INTEGER) AS C, ID FROM (SELECT ID FROM EMP WHERE ID > ?) X ORDER BY ID" '[42,3]'
+bothq "...the inner half EXCLUDES" "SELECT CAST(? AS INTEGER) AS C, ID FROM (SELECT ID FROM EMP WHERE ID > ?) X ORDER BY ID" '[42,99]'
 # ...but NOT with a JOIN or a FOLD above it - both still refuse, and the
 # gate found that: they were written as live cells on the strength of a
 # hand-probe that never covered them. Recorded rather than dropped, so
@@ -359,25 +365,28 @@ both "an aggregate over a LITERAL inner predicate" "SELECT COUNT(*) AS N FROM (S
 bothq "CONTROL an outer ? only" "SELECT ID FROM (SELECT ID FROM EMP) X WHERE ID > ? ORDER BY ID" '[3]'
 both "CONTROL a literal inner predicate" "SELECT ID FROM (SELECT ID FROM EMP WHERE ID > 3) X ORDER BY ID"
 
+# AN OUTER PROJECTION `?` ABOVE AN INNER ONE now answers, and its two
+# cells are above. The projection is textually FIRST, so it numbers from
+# ZERO and what the FROM claimed is a FLOOR under the WHERE - not a base
+# under the projection, which is what plan_over_source used to infer from
+# `params.len()`.
+#
 # RECORDED, NOT FIXED - each carries the engine's answer and expires
-# itself. Both are law-safe refusals, never wrong answers:
-#   - an OUTER PROJECTION `?` above a derived body that also has one.
-#     The outer projection is textually FIRST, but the inner plans into
-#     the sink before the outer projection is renumbered, so
-#     plan_over_source (which infers its base from `params.len()`)
-#     numbers the projection AFTER the inner's slots. It needs an
-#     EXPLICIT base rather than an inferred one.
-#   - a `?` in the INNER PROJECTION: nothing binds it at execute -
-#     bind_plan_params reaches the top-level plan's columns only.
+# itself. All are law-safe: refusals or fetch-time errors, never wrong
+# answers.
+#   - a `?` in the INNER PROJECTION: nothing binds it - bind_plan_params
+#     reaches the top-level plan's columns only.
 #   - a derived SIDE OF A JOIN keeps its own copy of the old guard
 #     (plan_join_bound), whose base needs per-side text offsets - which
-#     is also why a JOIN sits above an inner `?` refuses ("JOIN plan
-#     failed" in the trace).
-#   - an AGGREGATE or GROUP BY above an inner `?` takes the
-#     bound-row-source route, where plan_over_source infers its base from
-#     `params.len()` - the same inferred-base limit as the outer
-#     projection above. One explicit base would retire all three.
-refusesq "an outer projection ? above an inner ?" "SELECT CAST(? AS INTEGER) AS C, ID FROM (SELECT ID FROM EMP WHERE ID > ?) X ORDER BY ID" '[42,3]'
+#     is also why a JOIN above an inner `?` refuses ("JOIN plan failed").
+#   - an AGGREGATE or GROUP BY above an inner `?` is a DIFFERENT failure
+#     from the rest, and measuring it corrected an earlier guess: it
+#     PREPARES (type 1, the slots described) and its op_execute is
+#     accepted - it fails at the FETCH, `fetch plan = JoinGroup`. The
+#     fold binds its OWN filter/having/parts with the arguments but reads
+#     its BASE row source without them, so the derived inner's `?` is
+#     still unbound when the fold pulls rows. An explicit base does NOT
+#     retire this one; binding the base row source would.
 refusesq "a ? in the INNER projection" "SELECT C FROM (SELECT CAST(? AS INTEGER) AS C FROM EMP) X" '[5]'
 refusesq "a derived SIDE of a join" "SELECT X.ID FROM DEPT D JOIN (SELECT ID, DEPT_ID FROM EMP WHERE ID > ?) X ON D.ID = X.DEPT_ID ORDER BY X.ID" '[1]'
 

@@ -42410,16 +42410,20 @@ fn plan_over_source(
     rel_alias: Option<&str>,
 ) -> Option<Plan> {
     let (proj_s, table_s, where_s, group_s, having_s, order_s) = split_query(sql)?;
-    // THE SLOTS ALREADY CLAIMED BY THIS SOURCE'S OWN TEXT. A FROM-clause
-    // procedure call binds its `?` arguments into the outer sink and is
-    // then spliced OUT of the statement by [sql_over_from], so the
-    // rebuilt text carries fewer `?` than the sink has slots; numbering
-    // the projection and the WHERE from zero would collide with the
-    // arguments. [plan_join_bound] already floors its own numbering at
-    // `params.len()` for the same reason - this is that rule one level
-    // up. Zero for a CTE, a derived table or a view, which claim nothing
-    // before they are planned, so their numbering is unchanged.
-    let param_base = params.len();
+    // THE PROJECTION IS TEXTUALLY FIRST, at every call site this has:
+    // a derived table, a CTE, a view and a FROM-clause procedure call
+    // are all re-planned as a whole statement, and a statement's own
+    // `SELECT` list precedes its FROM. So the projection numbers from
+    // ZERO - and what the FROM already claimed is a FLOOR under the
+    // WHERE, not a base under the projection.
+    //
+    // This started life as `params.len()`, which is right only while the
+    // projection has no `?` of its own: once the FROM had claimed slots
+    // (a procedure call's arguments, or a derived body's own `?`), a
+    // projection `?` was numbered AFTER them and the statement refused.
+    // `SELECT CAST(? AS INTEGER), ID FROM (SELECT ID FROM T WHERE ID >
+    // ?) X` is two slots with the PROJECTION's first (measured).
+    let param_base = 0;
     let (from, join) = parse_from(table_s)?;
     // A JOIN against the bound name is the hierarchy walk - the thing a
     // recursive CTE is usually FOR. It goes to the ordinary join
@@ -42563,7 +42567,9 @@ fn plan_over_source(
         // AND having for Group/JoinGroup, as does the fetch), so what the
         // fence was waiting for was the numbering - which the parameter
         // base now gets right.
-        let mut np = dgroup_params;
+        // ...and the WHERE/HAVING number after BOTH: the projection's
+        // reserved slots and whatever the FROM itself claimed
+        let mut np = dgroup_params.max(params.len());
         let filter = match where_s {
             None => None,
             Some(ws) => Some(resolve_predicate(
@@ -42720,7 +42726,10 @@ fn plan_over_source(
         }
     }
     // the WHERE's `?` number after the projection's reserved slots
-    let mut np = proj_params;
+    // the WHERE's `?` number after the projection's reserved slots AND
+    // after anything the FROM claimed (a procedure call's arguments, a
+    // derived body's own `?`) - one textual order across the statement
+    let mut np = proj_params.max(params.len());
     let filter = match where_s {
         None => None,
         Some(ws) => Some(resolve_predicate(
