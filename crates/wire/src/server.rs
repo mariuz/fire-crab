@@ -13527,6 +13527,11 @@ fn proc_out_col(
     name: String,
     fname: Option<String>,
     pname: &str,
+    // describe item 25: the alias BINDING the procedure into the FROM,
+    // when the call carries one. Measured: the engine answers
+    // `[R, R, PR, P, SYSDBA, PUBLIC]` for `SELECT R FROM PR P` and
+    // leaves it empty for the unaliased call - the table rule exactly.
+    rel_alias: Option<String>,
     i: usize,
     d: &Descriptor,
 ) -> ProjCol {
@@ -13535,7 +13540,7 @@ fn proc_out_col(
         name,
         fname,
         relation: Some(pname.to_string()),
-        rel_alias: None,
+        rel_alias,
         field_id: i,
         wire,
         sql_type: nullable(sql_type),
@@ -41797,18 +41802,47 @@ fn plan_query(sql: &str, db: &Option<Database>) -> (Plan, Vec<Descriptor>) {
 /// the caller then tries the item as a view or table. A qualified name
 /// whose PROCEDURE does not exist also falls through there, exactly as
 /// an unqualified one always has (load_procedure decides).
-fn split_proc_call(table_s: &str) -> Option<(String, Option<String>)> {
+fn split_proc_call(table_s: &str) -> Option<(String, Option<String>, Option<String>)> {
     let t = table_s.trim();
-    let (head, args) = match t.find('(') {
-        None => (t, None),
+    // THE MATCHING CLOSE PAREN, NOT THE LAST CHARACTER. `strip_suffix(')')`
+    // failed the moment an ALIAS followed the call, so `FROM P(5) G` was
+    // not a procedure call here at all: the item fell through to relation
+    // handling, which went looking for a table named `P(5) G` and refused.
+    // Measured against the engine, every aliased spelling answers -
+    // `FROM GEN(5) G`, `FROM GEN(5) AS G`, `FROM ONEROW G` - and the
+    // describe carries the alias as item 25 (`[K, K, PGEN, G, SYSDBA,
+    // PUBLIC]`), exactly as a table's does.
+    let (head, args, tail) = match t.find('(') {
+        None => (t, None, ""),
         Some(at) => {
-            let rest = t[at + 1..].trim();
-            let inner = rest.strip_suffix(')')?;
-            (t[..at].trim(), Some(inner.trim().to_string()))
+            let close = matching_paren(t.as_bytes(), at)?;
+            (t[..at].trim(), Some(t[at + 1..close].trim().to_string()), t[close + 1..].trim())
+        }
+    };
+    // ...and the paren-less spelling carries its alias after the NAME
+    // SPAN, where [proc_call_name] refuses any trailing token at all.
+    // A derived table still answers None: its text starts with `(`, so
+    // the head is empty and proc_call_name refuses it (unit-tested).
+    let (head, tail) = match args {
+        Some(_) => (head, tail),
+        None => {
+            let (_, span) = split_name_parts(head, 3)?;
+            (head[..span].trim(), head[span..].trim())
         }
     };
     let name = proc_call_name(head)?;
-    Some((name, args))
+    let alias = match tail {
+        "" => None,
+        a => {
+            // `AS` is optional here, as it is for a table
+            let a = match a.get(..3) {
+                Some(p) if p.eq_ignore_ascii_case("AS ") => a[3..].trim(),
+                _ => a,
+            };
+            Some(canon_ident(a)?)
+        }
+    };
+    Some((name, args, alias))
 }
 
 /// Resolve a FROM/procedure-call spelling to the name load_procedure
@@ -47892,7 +47926,7 @@ fn plan_query_inner_ctx(
             // probed: EXECUTE PROCEDURE P answers the procedure as
             // the relation of each output parameter, no alias - and
             // each parameter describes its DECLARED type
-            .map(|(i, p)| proc_out_col(p.name.clone(), None, &pname, i, &p.desc))
+            .map(|(i, p)| proc_out_col(p.name.clone(), None, &pname, None, i, &p.desc))
             .collect();
         // the body runs at EXECUTE, not here: it may write
         return Some(Plan::ProcInvoke { name: pname, args, cols });
@@ -48558,7 +48592,7 @@ fn plan_query_inner_ctx(
                 // on it - the same ordering `PUBLIC.PW6(5)` relies on.
                 let is_proc = join.is_empty()
                     && split_proc_call(table_s)
-                        .is_some_and(|(n, _)| load_procedure(dbr, &n).is_some());
+                        .is_some_and(|(n, _, _)| load_procedure(dbr, &n).is_some());
                 if !is_proc {
                     for tr in &refs {
                         if relation_qualifier_ok(dbr, tr.schema, &tr.table) {
@@ -48685,7 +48719,7 @@ fn plan_query_inner_ctx(
     // SUSPENDed. Checked before views, since both look like a table here.
     if let Some(dbr) = db.as_ref() {
         if let Some((_, table_s, w_s, g_s, h_s, o_s)) = split_query(sql) {
-            if let Some((pname, pargs_text)) = split_proc_call(table_s) {
+            if let Some((pname, pargs_text, palias)) = split_proc_call(table_s) {
                 if let Some(meta) = load_procedure(dbr, &pname) {
                     // THE ENGINE'S ORDER IS zero-outputs -> arity ->
                     // (DSQL binding errors) -> not-selectable, so the
@@ -48761,6 +48795,26 @@ fn plan_query_inner_ctx(
                     // each pick keeps its ALIAS: dropping it answered
                     // `R AS RR` under the name R - invisible to isql,
                     // wrong for every client keying rows by alias
+                    // A QUALIFIED COLUMN over the call - `G.K`, or the
+                    // procedure's own name when nothing aliases it.
+                    // Measured against the engine, and it is the
+                    // ORDINARY TABLE RULE: an ALIAS HIDES THE NAME, so
+                    // `SELECT GEN.K FROM GEN(5) G` refuses exactly as
+                    // `SELECT T.ID FROM T TT` does, while the unaliased
+                    // `SELECT GEN.K FROM GEN(5)` answers.
+                    //
+                    // The engine spells a wrong qualifier -206 `Column
+                    // unknown "GEN"."K"`. This server has NO
+                    // column-unknown vector for any relation - measured,
+                    // the aliased-TABLE case answers a generic Dynamic
+                    // SQL Error here too - so the generic refusal is the
+                    // bar, and inventing a -206 for procedures alone
+                    // would be a fabricated vector ([downgrade_rewritten]).
+                    let pbare = pname.rsplit('.').next().unwrap_or(pname.as_str()).to_string();
+                    let qual_ok = |q: NamePart<'_>| match palias.as_deref() {
+                        Some(a) => part_is(q, a),
+                        None => part_is(q, &pbare),
+                    };
                     let picked: Vec<(usize, Option<String>)> =
                         match parse_projection(split_query(sql)?.0)? {
                             Proj::Star => (0..out_names.len()).map(|i| (i, None)).collect(),
@@ -48768,13 +48822,27 @@ fn plan_query_inner_ctx(
                                 let mut v = Vec::new();
                                 for it in &items {
                                     match it {
-                                        SelItem::Col(c, alias) => match out_names
-                                            .iter()
-                                            .position(|n| col_name_is(n, c))
-                                        {
-                                            Some(i) => v.push((i, alias.clone())),
-                                            None => return Some(Plan::Refused),
-                                        },
+                                        SelItem::Col(c, alias) => {
+                                            // the reference is CANONICAL
+                                            // already, so the split is on
+                                            // the dots alone ([split_col_ref])
+                                            let (schema, qual, col) = split_col_ref(c);
+                                            if schema.is_some() {
+                                                return Some(Plan::Refused);
+                                            }
+                                            if let Some(q) = qual {
+                                                if !qual_ok(q) {
+                                                    return Some(Plan::Refused);
+                                                }
+                                            }
+                                            match out_names
+                                                .iter()
+                                                .position(|n| col_name_is(n, col))
+                                            {
+                                                Some(i) => v.push((i, alias.clone())),
+                                                None => return Some(Plan::Refused),
+                                            }
+                                        }
                                         _ => return Some(Plan::Refused),
                                     }
                                 }
@@ -48793,6 +48861,10 @@ fn plan_query_inner_ctx(
                                 // PROCEDURE as the relation, no alias
                                 Some(out_names[*p].clone()),
                                 &pname,
+                                // ...and the BINDING ALIAS when the call
+                                // carries one, which is what the engine
+                                // puts in item 25 (measured)
+                                palias.clone(),
                                 i,
                                 &meta.outs[*p].desc,
                             )
@@ -87624,7 +87696,7 @@ fn parse_execute_block_select(sql: &str) -> Option<Plan> {
     for (i, m) in c.outs.iter().enumerate() {
         let d = desc_from_proc_meta(m)?;
         // the engine describes a block column with an EMPTY table/owner
-        cols.push(proc_out_col(m.name.clone(), Some(m.name.clone()), "", i, &d));
+        cols.push(proc_out_col(m.name.clone(), Some(m.name.clone()), "", None, i, &d));
         out_names.push(m.name.clone());
         out_descs.push(d);
     }
@@ -107802,29 +107874,77 @@ mod tests {
     fn split_proc_call_takes_qualified_names() {
         assert_eq!(
             split_proc_call("PSEL(5)"),
-            Some(("PSEL".to_string(), Some("5".to_string())))
+            Some(("PSEL".to_string(), Some("5".to_string()), None))
         );
         // `SELECT ... FROM PUBLIC.PSEL(5)` - the engine answers rows
         // (probed); the old ident_ok refused the dot
         assert_eq!(
             split_proc_call("PUBLIC.PSEL(5)"),
-            Some(("PSEL".to_string(), Some("5".to_string())))
+            Some(("PSEL".to_string(), Some("5".to_string()), None))
         );
         assert_eq!(
             split_proc_call("\"PUBLIC\".\"PSEL\"(5)"),
-            Some(("PSEL".to_string(), Some("5".to_string())))
+            Some(("PSEL".to_string(), Some("5".to_string()), None))
         );
         assert_eq!(
             split_proc_call("PUBLIC.ONEROW"),
-            Some(("ONEROW".to_string(), None))
+            Some(("ONEROW".to_string(), None, None))
         );
         // a non-PUBLIC two-part qualifier is a PACKAGED spelling now,
         // kept dotted; whether it resolves is load_procedure's call
         assert_eq!(
             split_proc_call("NOSCHEMA.PSEL(5)"),
-            Some(("NOSCHEMA.PSEL".to_string(), Some("5".to_string())))
+            Some(("NOSCHEMA.PSEL".to_string(), Some("5".to_string()), None))
         );
-        // a derived table is not a call
+        // a derived table is not a call - its text starts with `(`, so
+        // the head is empty and proc_call_name refuses it
+        assert_eq!(split_proc_call("(SELECT 1 FROM RDB$DATABASE) X"), None);
+    }
+
+    /// AN ALIAS ON THE CALL, both spellings. The engine answers every
+    /// one of these and fire-crab refused them all: `strip_suffix(')')`
+    /// rejected the parenthesised form the moment an alias followed,
+    /// and proc_call_name rejected the paren-less form's trailing token.
+    #[test]
+    fn split_proc_call_takes_an_alias() {
+        assert_eq!(
+            split_proc_call("PSEL(5) G"),
+            Some(("PSEL".to_string(), Some("5".to_string()), Some("G".to_string())))
+        );
+        assert_eq!(
+            split_proc_call("PSEL(5) AS G"),
+            Some(("PSEL".to_string(), Some("5".to_string()), Some("G".to_string())))
+        );
+        // the paren-less spelling: the alias follows the NAME SPAN
+        assert_eq!(
+            split_proc_call("ONEROW G"),
+            Some(("ONEROW".to_string(), None, Some("G".to_string())))
+        );
+        assert_eq!(
+            split_proc_call("ONEROW AS G"),
+            Some(("ONEROW".to_string(), None, Some("G".to_string())))
+        );
+        // an alias FOLDS unless quoted, like every other identifier
+        assert_eq!(
+            split_proc_call("PSEL(5) g"),
+            Some(("PSEL".to_string(), Some("5".to_string()), Some("G".to_string())))
+        );
+        assert_eq!(
+            split_proc_call("PSEL(5) \"g\""),
+            Some(("PSEL".to_string(), Some("5".to_string()), Some("g".to_string())))
+        );
+        // a qualified call keeps both its name and its alias
+        assert_eq!(
+            split_proc_call("PUBLIC.PSEL(5) G"),
+            Some(("PSEL".to_string(), Some("5".to_string()), Some("G".to_string())))
+        );
+        // an argument list containing a paren still finds the MATCHING
+        // close paren, so the alias after it is still the alias
+        assert_eq!(
+            split_proc_call("PSEL('a(b') G"),
+            Some(("PSEL".to_string(), Some("'a(b'".to_string()), Some("G".to_string())))
+        );
+        // ...and a derived table with an alias is still not a call
         assert_eq!(split_proc_call("(SELECT 1 FROM RDB$DATABASE) X"), None);
     }
 

@@ -60,6 +60,16 @@ CREATE VIEW V2 (E) AS SELECT X + 1 FROM T;
 ALTER TABLE T ADD CC COMPUTED BY (X + 1);
 SET TERM ^ ;
 CREATE PROCEDURE PR RETURNS (R INTEGER) AS BEGIN R = 7; SUSPEND; END^
+-- a procedure WITH AN ARGUMENT, so the parenthesised call spelling
+-- `FROM PGEN(5) G` can be described here too: the two spellings take
+-- different paths through split_proc_call, and only the paren-less one
+-- was ever covered
+CREATE PROCEDURE PGEN (N INTEGER) RETURNS (K INTEGER) AS
+DECLARE VARIABLE I INTEGER;
+BEGIN
+  I = 1;
+  WHILE (I <= N) DO BEGIN K = I; SUSPEND; I = I + 1; END
+END^
 SET TERM ; ^
 COMMIT;
 INSERT INTO T (X, S, D) VALUES (1, 'a', 1.5);
@@ -274,6 +284,39 @@ both "a recursive CTE binds under its name" "WITH RECURSIVE R AS (SELECT X FROM 
 # procedures: the procedure is the relation, no alias
 both "a selectable procedure is the relation" "SELECT R FROM PR"
 both "EXECUTE PROCEDURE carries the procedure" "EXECUTE PROCEDURE PR"
+
+# ...AND AN ALIASED ONE, which nothing here covered - which is why
+# nobody noticed that fire-crab REFUSES a procedure call carrying an
+# alias outright. Measured against the live engine, values first:
+#
+#   SELECT K FROM GEN(5) G      engine [1 2 3 4 5]   fc raises
+#   SELECT G.K FROM GEN(5) G    engine [1 2 3 4 5]   fc raises
+#   SELECT K FROM ONEROW G      engine [42]          fc raises
+#   SELECT K FROM GEN(5)        both  [1 2 3 4 5]    (the unaliased
+#                                                     form has always
+#                                                     agreed)
+#
+# split_proc_call takes the text up to a TRAILING `)` - `strip_suffix`
+# fails the moment an alias follows it - and its paren-less spelling
+# refuses trailing tokens outright, so the whole procedure branch
+# declines and the FROM item falls through to relation handling, which
+# looks for a table literally named `GEN(5) G`.
+#
+# The engine's ALIAS RULE is the ordinary one, measured: an alias HIDES
+# the procedure name, so `SELECT GEN.K FROM GEN(5) G` raises -206
+# Column unknown "GEN"."K" exactly as `SELECT T.ID FROM T TT` does,
+# while `SELECT GEN.K FROM GEN(5)` (unaliased) answers.
+#
+# These cells describe rather than assert a number: item 25 is the
+# binding alias, and what the ENGINE puts there for an aliased
+# procedure is the expectation, verbatim - the one field proc_out_col
+# hardcodes to None today.
+both "an aliased procedure, unqualified column" "SELECT R FROM PR P"
+both "an aliased procedure, qualified column" "SELECT P.R FROM PR P"
+both "an aliased procedure with AS" "SELECT R FROM PR AS P"
+both "a PARENTHESISED call is the relation" "SELECT K FROM PGEN(5)"
+both "...and an aliased parenthesised call" "SELECT K FROM PGEN(5) G"
+both "...qualified through that alias" "SELECT G.K FROM PGEN(5) G"
 
 # unions: the FIRST branch's relation AND alias, under the same
 # all-plain predicate the field name follows

@@ -368,19 +368,30 @@ same "E4. the SAME 0-output procedure B1 refused in FROM" "EXECUTE PROCEDURE PNO
 check "E5. EXECUTE PROCEDURE's INSERT landed (engine reads fc's file)" \
       "$(col "$WORK" "SELECT ID FROM T")" "99"
 check "E6. ... and on the ref copy" "$(col "$REF" "SELECT ID FROM T")" "99"
-# An EMPTY body is outside fire-crab's PSQL surface: the engine's
-# EXECUTE PROCEDURE succeeds silently, fc refuses. PRE-EXISTING and
-# unrelated to selectability (verified against the pre-change binary) -
-# recorded, not hidden, and asserted so that implementing it says so.
+# An EMPTY body USED TO BE outside fire-crab's PSQL surface: the
+# engine's EXECUTE PROCEDURE succeeded silently and this server refused,
+# and the cell asserted that difference so that closing it would be
+# noticed - "recorded, not hidden, and asserted so that implementing it
+# says so".
+#
+# IT SAID SO, AND NOBODY LISTENED. Both servers now answer nothing at
+# all, so the cell has been reporting a DIFF on every run, on every
+# binary, because fire-crab got BETTER - the same stale-assertion shape
+# as the aggregate-union line in serve-real-nofallback and the MON$
+# architecture row in serve-real-services.
+#
+# It is an AGREEMENT cell now, and a strict one: BOTH sides must be
+# silent. Comparing the two strings alone would pass if they ever broke
+# in the same way, which is the vacuity that keeps biting here.
 e7fc=$(printf 'EXECUTE PROCEDURE PEMPTY;\n' |
        "$ISQL" -q -b -user "$U" -pas "$P" "127.0.0.1/$PORT:$WORK" 2>&1 | tr -s ' \n' ' ' | strip)
 e7en=$(printf 'EXECUTE PROCEDURE PEMPTY;\n' |
        "$ISQL" -q -b -user "$U" -pas "$P" "$REF" 2>&1 | tr -s ' \n' ' ' | strip)
 ran=$((ran + 1))
-if [ -z "$e7en" ] && case "$e7fc" in *"Statement failed"*) true ;; *) false ;; esac; then
-    echo "OK   E7. EXECUTE PROCEDURE on BEGIN END: engine silent, fc refuses (boundary)"
+if [ -z "$e7en" ] && [ -z "$e7fc" ]; then
+    echo "OK   E7. EXECUTE PROCEDURE on BEGIN END: both silent"
 else
-    echo "DIFF E7. the empty-body boundary moved"
+    echo "DIFF E7. the empty-body answers differ"
     echo "     engine: [$e7en]"; echo "     fc:     [$e7fc]"; fail=1
 fi
 
