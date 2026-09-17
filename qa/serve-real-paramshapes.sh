@@ -320,18 +320,22 @@ bothq "...the TEXT argument, EXCLUDED" "SELECT K FROM PX(?) WHERE K > ?" '["abcd
 # LITERAL arguments under a clause worked before route 2 landed - it is
 # the control that says these cells measure the BOUND half specifically
 bothq "LITERAL args + a WHERE ? (a control)" "SELECT K FROM PU('ab', 9) WHERE K > ?" '[0]'
+# A HAVING `?` OVER THE GROUPED FORM - recorded here one chunk ago as a
+# refusal, and it EXPIRED ITSELF: the grouped branch of plan_over_source
+# carried a scope fence that outlived what it was waiting for. The same
+# removal answers a grouped derived table, a CTE and a grouped join
+# (serve-real-castparamgroup), so these cells pin the procedure end of it.
+bothq "a HAVING ? over the call" "SELECT K, COUNT(*) FROM PU(?, ?) GROUP BY K HAVING COUNT(*) > ?" '["ab",7,0]'
+bothq "...a HAVING that EXCLUDES the group" "SELECT K, COUNT(*) FROM PU(?, ?) GROUP BY K HAVING COUNT(*) > ?" '["ab",7,9]'
+bothq "...with LITERAL arguments too" "SELECT K, COUNT(*) FROM PU('ab', 9) GROUP BY K HAVING COUNT(*) > ?" '[0]'
 
 # RECORDED, NOT FIXED - written so each EXPIRES ITSELF: the cell carries
 # the engine's own answer and says so the day fire-crab agrees. A
 # refusal written as a bare comment rots silently instead.
-#   - `HAVING ... > ?` over the grouped form: the grouped branch refuses
-#     a WHERE/HAVING `?` outright. It refuses with LITERAL arguments too,
-#     so it is a PRE-EXISTING gap, not route 2's.
 #   - a derived table or CTE over a call with BOUND arguments: refused by
 #     a different guard entirely - the inner statement carries no clause
 #     at all, so route 2's guard was never what stopped it.
-for pair in "SELECT K, COUNT(*) FROM PU(?, ?) GROUP BY K HAVING COUNT(*) > ?|[\"ab\",7,0]" \
-            "SELECT K FROM (SELECT K FROM PU(?, ?)) D|[\"ab\",7]" \
+for pair in "SELECT K FROM (SELECT K FROM PU(?, ?)) D|[\"ab\",7]" \
             "WITH C AS (SELECT K FROM PU(?, ?)) SELECT K FROM C|[\"ab\",7]"; do
     q="${pair%%|*}"; args="${pair##*|}"
     a=$(query "$q" "$args" "$PORT" "$A")

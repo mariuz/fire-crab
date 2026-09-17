@@ -42547,9 +42547,22 @@ fn plan_over_source(
                 }
             }
         }
-        // the projection's `?` took slots 0..dgroup_params; a WHERE or
-        // HAVING `?` over a grouped derived source is still unsupported,
-        // so np must not advance past them
+        // the projection's `?` took slots param_base..dgroup_params, and a
+        // WHERE or HAVING `?` numbers AFTER them - the engine's textual
+        // order (measured: `SELECT CAST(? AS INTEGER), A, COUNT(*) FROM
+        // (...) D GROUP BY A HAVING COUNT(*) > ?` is two slots, the
+        // projection's first).
+        //
+        // This used to refuse instead, by the guard below: the slice that
+        // brought the grouped projection param said so in as many words -
+        // "being still unsupported there, keeps that path's refusal
+        // exact". It was a SCOPE FENCE, not protection. Both resolvers
+        // already take the `?` sink ([resolve_having] describes a HAVING
+        // `?` as the compared value's type) and both predicates are
+        // already bound at execute ([validate_select_bind] binds filter
+        // AND having for Group/JoinGroup, as does the fetch), so what the
+        // fence was waiting for was the numbering - which the parameter
+        // base now gets right.
         let mut np = dgroup_params;
         let filter = match where_s {
             None => None,
@@ -42580,9 +42593,6 @@ fn plan_over_source(
                     })?,
             ),
         };
-        if np != dgroup_params {
-            return None;
-        }
         let mut order_by = match order_s {
             None => Vec::new(),
             Some(os) => parse_order_by(os, &gcols, &[], |n| {

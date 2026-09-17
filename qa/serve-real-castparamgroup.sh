@@ -18,9 +18,16 @@
 #     aggregate, a grouped JOIN and a grouped derived table;
 #   * a projection `?` numbers before the WHERE, one textual order.
 #
-# SCOPE: the group projection param itself. A `?` in a WHERE/HAVING of a
-# grouped query, and an expression over a grouping column (SELECT V*2 ...
-# GROUP BY V), are separate slices.
+# A `?` IN THE WHERE OR HAVING OF A GROUPED BOUND SOURCE is covered here
+# too now. It used to refuse - the grouped branch of plan_over_source
+# carried an explicit scope fence saying so - and the fence outlived what
+# it was waiting for: both resolvers already took the `?` sink and both
+# predicates were already bound at execute, so only the NUMBERING was
+# missing. A derived table, a CTE and a procedure call all reach that one
+# branch, which is why one removed guard answers all three.
+#
+# SCOPE: an expression over a grouping column (SELECT V*2 ... GROUP BY V)
+# is still a separate slice.
 #
 #   qa/serve-real-castparamgroup.sh [port]
 set -u
@@ -84,6 +91,32 @@ both "grouped join, smallint"     "SELECT CAST(? AS SMALLINT) AS C, COUNT(*) AS 
 both "grouped derived table"      "SELECT CAST(? AS INTEGER) AS C, COUNT(*) AS N FROM (SELECT V FROM T) X GROUP BY X.V" "[100]"
 both "group, bigint target"       "SELECT CAST(? AS BIGINT) AS C, COUNT(*) AS N FROM T GROUP BY V" "[9999999999]"
 both "group, width overflow"      "SELECT CAST(? AS SMALLINT) AS C, COUNT(*) AS N FROM T GROUP BY V" "[99999]"
+
+# --- a ? in the WHERE / HAVING of a GROUPED BOUND SOURCE ---------------
+# Every predicate is paired with a twin that must answer NOTHING: a
+# filter that never ran would return the rows anyway, and a HAVING that
+# was dropped would keep every group. T groups as V=10 (two rows) and
+# V=20 (one), so `> 1` keeps exactly one group and `> 9` keeps none.
+both "derived: HAVING ?"          "SELECT V, COUNT(*) AS N FROM (SELECT V FROM T) X GROUP BY V HAVING COUNT(*) > ?" "[1]"
+both "derived: HAVING ? EXCLUDES" "SELECT V, COUNT(*) AS N FROM (SELECT V FROM T) X GROUP BY V HAVING COUNT(*) > ?" "[9]"
+both "derived: WHERE ?"           "SELECT V, COUNT(*) AS N FROM (SELECT V FROM T) X WHERE V > ? GROUP BY V" "[10]"
+both "derived: WHERE ? EXCLUDES"  "SELECT V, COUNT(*) AS N FROM (SELECT V FROM T) X WHERE V > ? GROUP BY V" "[99]"
+both "derived: WHERE ? + HAVING ?" "SELECT V, COUNT(*) AS N FROM (SELECT V FROM T) X WHERE V > ? GROUP BY V HAVING COUNT(*) > ?" "[0,1]"
+both "derived: the HAVING half excludes" "SELECT V, COUNT(*) AS N FROM (SELECT V FROM T) X WHERE V > ? GROUP BY V HAVING COUNT(*) > ?" "[0,9]"
+# the projection `?` still numbers FIRST - one textual order, and these
+# two cells would SWAP if it did not
+both "derived: proj ? then HAVING ?" "SELECT CAST(? AS INTEGER) AS C, V, COUNT(*) AS N FROM (SELECT V FROM T) X GROUP BY V HAVING COUNT(*) > ?" "[42,1]"
+both "derived: proj ? then HAVING ? excl" "SELECT CAST(? AS INTEGER) AS C, V, COUNT(*) AS N FROM (SELECT V FROM T) X GROUP BY V HAVING COUNT(*) > ?" "[42,9]"
+both "cte: HAVING ?"              "WITH C AS (SELECT V FROM T) SELECT V, COUNT(*) AS N FROM C GROUP BY V HAVING COUNT(*) > ?" "[1]"
+both "cte: HAVING ? EXCLUDES"     "WITH C AS (SELECT V FROM T) SELECT V, COUNT(*) AS N FROM C GROUP BY V HAVING COUNT(*) > ?" "[9]"
+both "cte: WHERE ?"               "WITH C AS (SELECT V FROM T) SELECT V, COUNT(*) AS N FROM C WHERE V > ? GROUP BY V" "[10]"
+# the grouped JOIN takes plan_join_bound, a DIFFERENT builder - a control
+# that says which branch the fix actually moved
+both "grouped join: HAVING ?"     "SELECT T.V, COUNT(*) AS N FROM T JOIN U ON T.ID = U.ID GROUP BY T.V HAVING COUNT(*) > ?" "[0]"
+both "grouped join: HAVING ? excl" "SELECT T.V, COUNT(*) AS N FROM T JOIN U ON T.ID = U.ID GROUP BY T.V HAVING COUNT(*) > ?" "[9]"
+# a plain table already worked - the control that says these cells
+# measure the BOUND-SOURCE path specifically
+both "plain table: HAVING ?"      "SELECT V, COUNT(*) AS N FROM T GROUP BY V HAVING COUNT(*) > ?" "[1]"
 
 echo "ran $ran checks"
 exit $fail
