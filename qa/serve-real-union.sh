@@ -49,6 +49,13 @@ INSERT INTO B VALUES (2, 99, 'q');
 INSERT INTO B VALUES (5, NULL, NULL);
 COMMIT;
 EOF
+# THE ENGINE MUST BE ABLE TO OPEN THIS OVER TCP. The isql cells above
+# reach it through a LOCAL path, where the file's owner is enough; the
+# parameterized cells below attach to 127.0.0.1:3050, and the engine runs
+# as its own user - without this every one of them answers CONN_ERR on
+# the engine side (caught by the vacuity guard, which refuses to score
+# two non-answers as agreement).
+chmod 666 "$DB" 2>/dev/null || true
 
 "$FCWIRE" serve "127.0.0.1:$PORT" "$U" "$P" >/tmp/fc-serve-union.log 2>&1 &
 srv=$!
@@ -78,6 +85,69 @@ same() { # <label> <sql>
         echo "DIFF $1"; echo "     engine: [$en]"; echo "     fc:     [$fc]"; fail=1
     fi
 }
+
+# A PARAMETERIZED TWIN. `same` runs isql, which binds nothing, so a `?`
+# in a branch needs a client that ships an argument message. Same
+# differential: one statement, both servers, the row sets must match.
+ran=0
+sameq() { # <label> <sql> <json args>
+    ran=$((ran + 1))
+    local a b
+    a=$(FC_Q="$2" FC_A="$3" FC_PORT="$PORT" FC_DB="$DB" node -e '
+      process.on("uncaughtException", () => { console.log("CONN_ERR"); process.exit(0); });
+      const F=require("node-firebird");
+      F.attach({host:"127.0.0.1",port:+process.env.FC_PORT,database:process.env.FC_DB,
+                user:"SYSDBA",password:"masterkey"},(e,db)=>{
+        if(e){console.log("CONN_ERR");process.exit(0);}
+        db.query(process.env.FC_Q,JSON.parse(process.env.FC_A),(e2,r)=>{
+          if(e2){console.log("ERR "+(e2.message||"").split("\n")[0].slice(0,50));db.detach();process.exit(0);}
+          console.log(JSON.stringify(Array.isArray(r)?r:(r?[r]:[])));
+          db.detach();process.exit(0);});});' 2>/dev/null)
+    b=$(FC_Q="$2" FC_A="$3" FC_PORT=3050 FC_DB="$DB" node -e '
+      process.on("uncaughtException", () => { console.log("CONN_ERR"); process.exit(0); });
+      const F=require("node-firebird");
+      F.attach({host:"127.0.0.1",port:+process.env.FC_PORT,database:process.env.FC_DB,
+                user:"SYSDBA",password:"masterkey"},(e,db)=>{
+        if(e){console.log("CONN_ERR");process.exit(0);}
+        db.query(process.env.FC_Q,JSON.parse(process.env.FC_A),(e2,r)=>{
+          if(e2){console.log("ERR "+(e2.message||"").split("\n")[0].slice(0,50));db.detach();process.exit(0);}
+          console.log(JSON.stringify(Array.isArray(r)?r:(r?[r]:[])));
+          db.detach();process.exit(0);});});' 2>/dev/null)
+    # A SIDE THAT DID NOT ANSWER IS NOT AGREEMENT: two CONN_ERRs compare
+    # equal and would score OK while measuring nothing.
+    if [ "$a" = "CONN_ERR" ] || [ "$b" = "CONN_ERR" ] || [ -z "$a" ] || [ -z "$b" ]; then
+        echo "DIFF $1 $3 [VACUOUS: a side did not answer] fc=[$a] engine=[$b]"; fail=1; return
+    fi
+    if [ "$a" = "$b" ]; then
+        echo "OK   $1 $3: $a"
+    else
+        echo "DIFF $1 $3"; echo "     engine: [$b]"; echo "     fc:     [$a]"; fail=1
+    fi
+}
+
+# --- a ? INSIDE A BRANCH -----------------------------------------------
+# A branch used to be planned into a FRESH sink and refused if it claimed
+# a slot, and then - once that guard went - plan_union still CLEARED the
+# sink after building the branches, so the statement prepared and
+# described ZERO input fields for a union that has one. Slots number by
+# TEXT POSITION, left to right across the branches.
+#
+# Every predicate is paired with a twin that must answer NOTHING from
+# that branch, so a branch whose `?` never bound would fail one of them.
+sameq "a ? in the FIRST branch" "SELECT ID FROM A WHERE ID > ? UNION ALL SELECT ID FROM B ORDER BY 1" '[2]'
+sameq "...the FIRST branch EXCLUDES" "SELECT ID FROM A WHERE ID > ? UNION ALL SELECT ID FROM B ORDER BY 1" '[99]'
+sameq "a ? in the SECOND branch" "SELECT ID FROM A UNION ALL SELECT ID FROM B WHERE ID > ? ORDER BY 1" '[1]'
+sameq "...the SECOND branch EXCLUDES" "SELECT ID FROM A UNION ALL SELECT ID FROM B WHERE ID > ? ORDER BY 1" '[99]'
+sameq "a ? in BOTH branches" "SELECT ID FROM A WHERE ID > ? UNION ALL SELECT ID FROM B WHERE ID < ? ORDER BY 1" '[2,5]'
+sameq "...the second half excludes" "SELECT ID FROM A WHERE ID > ? UNION ALL SELECT ID FROM B WHERE ID < ? ORDER BY 1" '[2,0]'
+sameq "THREE branches, a ? in each" "SELECT ID FROM A WHERE ID > ? UNION ALL SELECT ID FROM B WHERE ID < ? UNION ALL SELECT ID FROM A WHERE ID = ? ORDER BY 1" '[3,2,1]'
+sameq "a distinct UNION with a ? each" "SELECT N FROM A WHERE N > ? UNION SELECT N FROM B WHERE N > ? ORDER BY 1" '[5,5]'
+sameq "a ? with the union's ORDER BY" "SELECT ID FROM A WHERE ID > ? UNION ALL SELECT ID FROM B ORDER BY 1 DESC" '[2]'
+sameq "a DERIVED TABLE in a branch" "SELECT X.ID FROM (SELECT ID FROM A WHERE ID > ?) X UNION ALL SELECT ID FROM B ORDER BY 1" '[2]'
+sameq "a FOLD in a branch" "SELECT COUNT(*) FROM A WHERE ID > ? UNION ALL SELECT ID FROM B ORDER BY 1" '[2]'
+# the control: the same union with no `?` at all worked before and must
+# still, which is what says these cells measure the BOUND half
+same "CONTROL the same union, no ?" "SELECT ID FROM A WHERE ID > 2 UNION ALL SELECT ID FROM B ORDER BY 1"
 
 # --- UNION ALL ---------------------------------------------------------
 same "ALL over two tables"          "SELECT ID FROM A UNION ALL SELECT ID FROM B ORDER BY 1"
@@ -157,5 +227,10 @@ case "$out" in
     *"COUNT"*1*2*4*5*) echo "OK   teeth: an aggregate branch answers as COUNT ($out)" ;;
     *) echo "DIFF an aggregate branch answered [$out], want COUNT then 1 2 4 5"; fail=1 ;;
 esac
+
+if [ "$ran" -lt 11 ]; then
+    echo "DIFF only $ran parameterized checks ran (expected at least 11) - did one silently skip?"
+    fail=1
+fi
 
 exit $fail

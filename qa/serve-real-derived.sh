@@ -364,6 +364,11 @@ bothq "...the GROUP BY over an EMPTY inner" "SELECT DEPT_ID, COUNT(*) AS N FROM 
 bothq "a HAVING above an inner ?" "SELECT DEPT_ID, COUNT(*) AS N FROM (SELECT ID, DEPT_ID FROM EMP WHERE ID > ?) X GROUP BY DEPT_ID HAVING COUNT(*) > ?" '[0,1]'
 bothq "...the HAVING half EXCLUDES" "SELECT DEPT_ID, COUNT(*) AS N FROM (SELECT ID, DEPT_ID FROM EMP WHERE ID > ?) X GROUP BY DEPT_ID HAVING COUNT(*) > ?" '[0,9]'
 bothq "a CTE body's ? under a fold" "WITH C AS (SELECT ID FROM EMP WHERE ID > ?) SELECT COUNT(*) AS N FROM C" '[3]'
+# a UNION branch carrying a `?` - the derived end of it, since a branch
+# may itself be a derived table (serve-real-union owns the rest)
+bothq "a ? in a UNION branch" "SELECT ID FROM EMP WHERE ID > ? UNION ALL SELECT 99 FROM RDB\$DATABASE ORDER BY 1" '[3]'
+bothq "...a derived table inside that branch" "SELECT X.ID FROM (SELECT ID FROM EMP WHERE ID > ?) X UNION ALL SELECT 99 FROM RDB\$DATABASE ORDER BY 1" '[3]'
+bothq "...the branch EXCLUDES everything" "SELECT X.ID FROM (SELECT ID FROM EMP WHERE ID > ?) X UNION ALL SELECT 99 FROM RDB\$DATABASE ORDER BY 1" '[99]'
 # a grouped JOIN over real tables still streams its own way - the walk
 # materialises a bound DERIVED base only, and this says so
 both "CONTROL a grouped join over tables" "SELECT D.DNAME, COUNT(*) AS N FROM EMP E JOIN DEPT D ON D.ID = E.DEPT_ID GROUP BY D.DNAME ORDER BY D.DNAME"
@@ -422,10 +427,9 @@ both "CONTROL a literal inner predicate" "SELECT ID FROM (SELECT ID FROM EMP WHE
 #     written BETWEEN two sides, and this planner numbers every side
 #     before any ON, so it would MIS-NUMBER rather than refuse. Refused
 #     deliberately (multi_on_param).
-#   - a `?` ANYWHERE IN A UNION BRANCH - measured PRE-EXISTING, on this
-#     binary and the one before it, and nothing to do with derived
-#     tables: `SELECT ID FROM EMP WHERE ID > ? UNION ALL SELECT 99 FROM
-#     RDB$DATABASE` refuses while the same union without a `?` answers.
+#   (a `?` in a UNION BRANCH was recorded here too, and is FIXED: it was
+#   never about derived tables - plan_union cleared the parameter sink
+#   after building its branches. serve-real-union owns those cells now.)
 #   (an AGGREGATE or GROUP BY above an inner `?` used to be recorded here
 #   too. It was a FETCH-time failure, not a refusal - the fold read its
 #   base row source without the arguments - and materialising a bound
@@ -434,7 +438,6 @@ both "CONTROL a literal inner predicate" "SELECT ID FROM (SELECT ID FROM EMP WHE
 #   at PLAN time, in plan_join_bound's own copy of the old guard.)
 refusesq "a ? in the INNER projection" "SELECT C FROM (SELECT CAST(? AS INTEGER) AS C FROM EMP) X" '[5]'
 refusesq "a multi-ON chain with a bound ON" "SELECT A.ID FROM EMP A JOIN (SELECT ID FROM EMP WHERE ID > ?) B ON A.ID = B.ID AND A.ID > ? JOIN DEPT D ON D.ID = A.DEPT_ID AND D.ID > ? ORDER BY A.ID" '[0,0,0]'
-refusesq "a ? in a UNION branch (pre-existing)" "SELECT ID FROM EMP WHERE ID > ? UNION ALL SELECT 99 FROM RDB\$DATABASE" '[3]'
 
 # --- a materialised row source carries its rows' OWN error ------------
 # branch_rows answered an Option, so "this shape is unserved" and "the

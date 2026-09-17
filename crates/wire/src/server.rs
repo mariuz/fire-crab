@@ -47503,12 +47503,27 @@ fn plan_union(
 
     let mut branches: Vec<Plan> = Vec::new();
     for p in &parts {
-        // a branch claims no parameter slots in this slice
-        let mut sink: Vec<Option<Descriptor>> = Vec::new();
-        let plan = plan_query_inner(p, db, &mut sink)?;
-        if !sink.is_empty() {
-            return None;
-        }
+        // A `?` IN A BRANCH numbers by TEXT POSITION. `parts` is in
+        // SOURCE ORDER (the last branch's trailing ORDER BY belongs to
+        // the whole union and was lifted off above), so what this branch
+        // must number after is exactly what the branches before it
+        // claimed: the running `params.len()` - the same floor the
+        // derived body, the join side and the WHERE all number from.
+        // Measured: one branch with a `?` is 1 slot, two branches 2,
+        // three branches 3, left to right.
+        //
+        // It used to plan into a FRESH sink and refuse if the branch
+        // claimed anything ("a branch claims no parameter slots in this
+        // slice"), which took ORDINARY SQL with it - there is no derived
+        // table and no procedure in `SELECT ID FROM EMP WHERE ID > ?
+        // UNION ALL SELECT 99 FROM RDB$DATABASE`.
+        //
+        // The execute side needs nothing here: every path that reads a
+        // union already threads the arguments into each branch -
+        // [validate_select_bind], [branch_rows_res], and the fetch arm's
+        // `branch_rows_each` / `branch_rows_res`.
+        let base = params.len();
+        let plan = plan_query_inner_at(p, db, params, false, base)?;
         // every branch shape [branch_rows_res] materialises - a plain
         // scan, an aggregate or GROUP BY (`SELECT 'T' K, COUNT(*) FROM T
         // UNION ALL ...` is how a catalog is counted table by table), a
@@ -47577,7 +47592,20 @@ fn plan_union(
             return None;
         }
     }
-    params.clear();
+    // NO `params.clear()` HERE. It stood here while a branch could not
+    // claim a slot - the guard above refused one that did, so emptying
+    // the sink was housekeeping over something already known to be
+    // empty. Now that a branch numbers its `?` into this sink, clearing
+    // it DESTROYS the claims: the branches planned, the statement
+    // prepared, and the describe announced `INPUT message field count:
+    // 0` for a union that has one - so the client sent a value for a
+    // slot the server had just denied having, and the execute failed.
+    //
+    // The five other `params.clear()` in this file are correct because
+    // each precedes `return plan_query_inner(&rewritten, ..)` - a
+    // RE-PLAN that re-claims every slot. This one cleared and carried on
+    // building. A branch that plans and is then rejected needs no clear
+    // either: the whole union returns None and the statement refuses.
     // a distinct UNION deduplicates by the collation too ([coll_keyable])
     if !all && cols_unkeyable_coll(&cols) {
         return Some(Plan::Refused);
