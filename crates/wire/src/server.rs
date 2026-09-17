@@ -16570,7 +16570,7 @@ fn fire_ddl_triggers(
                 ExecErr::Text(format!("trigger {} is outside this server's PSQL surface", d.name))
             })?;
             let mut frame = PsqlFrame {
- stop_at_suspend: false,
+ stop_after: None,
                 vars: vec![Value::Null; names.len()],
                 out_at: names.len(),
                 out_len: 0,
@@ -16670,7 +16670,7 @@ fn fire_db_triggers(
         let (body, names) = trig_body_of(d)
             .ok_or_else(|| ExecErr::Text(format!("trigger {} is outside this server's PSQL surface", d.name)))?;
         let mut frame = PsqlFrame {
- stop_at_suspend: false,
+ stop_after: None,
             vars: vec![Value::Null; names.len()],
             out_at: names.len(),
             out_len: 0,
@@ -45889,6 +45889,9 @@ fn materialise_procedures(
     plan: &mut Plan,
     database: &mut Option<Database>,
     ctx: &SessionCtx,
+    // the consumer's row limit, when the walk has PROVEN one applies -
+    // see [PsqlFrame::stop_after]. `None` runs the body out.
+    cap: Option<usize>,
 ) -> Result<bool, ProcErr> {
     if let Plan::ProcSelect { name, args, cols, picks } = &*plan {
         let (name, args, cols, picks) =
@@ -45905,39 +45908,77 @@ fn materialise_procedures(
         };
         // BLR-FIRST, exactly as the bare call has always run it: the
         // compiled bytes when they parse in fire-crab-exe's surface,
-        // the source interpreter otherwise
-        match try_procedure_blr(database, &name, &args, false) {
-            BlrProcOutcome::Rows(suspended, _finals) => {
-                let rows = project(&suspended);
-                *plan = Plan::ProcRows { cols, rows };
-                return Ok(true);
+        // the source interpreter otherwise.
+        //
+        // A CAP SKIPS IT. `try_procedure_blr` takes only `first_only` and
+        // [fire_crab_exe::bind_and_execute_mode] only `halt_at_stall`:
+        // neither can express "n rows", so running the BLR path with a
+        // cap set would silently ignore the limit and run the body out -
+        // the very thing being fixed. The interpreter honours it.
+        if cap.is_none() {
+            match try_procedure_blr(database, &name, &args, false) {
+                BlrProcOutcome::Rows(suspended, _finals) => {
+                    let rows = project(&suspended);
+                    *plan = Plan::ProcRows { cols, rows };
+                    return Ok(true);
+                }
+                BlrProcOutcome::Runtime(e) => {
+                    let e = runtime_with_position(database, &name, &args, ctx, e, false);
+                    *plan = Plan::RefusedEval(e);
+                    return Ok(true);
+                }
+                BlrProcOutcome::Outside => {}
             }
-            BlrProcOutcome::Runtime(e) => {
-                let e = runtime_with_position(database, &name, &args, ctx, e, false);
-                *plan = Plan::RefusedEval(e);
-                return Ok(true);
-            }
-            BlrProcOutcome::Outside => {}
         }
-        let (_, suspended) = run_procedure(database, &name, &args, ctx, false)?;
+        let (_, suspended) = run_procedure_capped(database, &name, &args, ctx, cap)?;
         let rows = project(&suspended);
         *plan = Plan::ProcRows { cols, rows };
         return Ok(true);
     }
     match plan {
-        Plan::Derived { inner, .. }
-        | Plan::Modified { inner, .. }
-        | Plan::Returning { inner, .. } => materialise_procedures(inner, database, ctx),
+        // A LIMIT IS WHERE A CAP COMES FROM. `FIRST n` / `ROWS n` is a
+        // bounded, non-DISTINCT take, and the bound the body must reach
+        // is `skip + take` - the same sum [stream_first_n]'s caller
+        // computes for an ordinary row source. A DISTINCT or a bare SKIP
+        // has no bound, so neither has a cap.
+        Plan::Modified { inner, distinct, skip, take, .. } => {
+            let here = match (*distinct, *take) {
+                (false, Some(t)) => Some(skip.saturating_add(t)),
+                _ => None,
+            };
+            materialise_procedures(inner, database, ctx, here)
+        }
+        // A DERIVED TABLE IS TRANSPARENT ONLY WHEN IT DOES NOTHING. It
+        // passes a cap through when it merely re-projects (measured:
+        // `FIRST 1 FROM (SELECT K FROM PLOG(5)) DT` runs the body ONCE on
+        // the engine), and SWALLOWS it otherwise: a filter makes the
+        // limit count SURVIVING rows, which this cap cannot express
+        // (`FIRST 1 ... WHERE K > 3` is four iterations there, recorded,
+        // not implemented), and a sort or a window is BLOCKING - the
+        // engine runs the whole body under `FIRST 2 ... ORDER BY`, so a
+        // cap would change the answer rather than the cost.
+        Plan::Derived { inner, filter, order_by, windows, .. } => {
+            let through =
+                if filter.is_none() && order_by.is_empty() && windows.is_empty() { cap } else { None };
+            materialise_procedures(inner, database, ctx, through)
+        }
+        Plan::Returning { inner, .. } => materialise_procedures(inner, database, ctx, None),
         Plan::Union { branches, .. } => {
             let mut any = false;
             for b in branches.iter_mut() {
-                any |= materialise_procedures(b, database, ctx)?;
+                // a branch's share of an outer limit is not this branch's
+                // row count, so no cap crosses a union
+                any |= materialise_procedures(b, database, ctx, None)?;
             }
             Ok(any)
         }
         // a bound source reaches the JOIN and GROUP planners wrapped as
         // a row source, so a grouped read over a procedure hides one
         // below the plan tree entirely
+        // ...and no cap crosses one: a join multiplies its sides and a
+        // grouped fold consumes the whole of them, so the number of rows
+        // the CONSUMER wants says nothing about how many the BODY must
+        // produce
         Plan::Join { base, .. } | Plan::JoinGroup { base, .. } | Plan::Lateral { base, .. } => {
             materialise_procedures_src(base, database, ctx)
         }
@@ -45955,7 +45996,8 @@ fn materialise_procedures_src(
     match src {
         RowSource::PlanRows(rc) => {
             let mut inner = (**rc).clone();
-            if materialise_procedures(&mut inner, database, ctx)? {
+            // a row source under a join or a fold: no cap (see above)
+            if materialise_procedures(&mut inner, database, ctx, None)? {
                 *rc = std::rc::Rc::new(inner);
                 return Ok(true);
             }
@@ -81812,8 +81854,19 @@ struct PsqlFrame {
     /// the rows SUSPEND has emitted so far - a selectable procedure's
     /// result set, in the order the body produced them
     suspended: Vec<Vec<Value>>,
-    /// EXECUTE PROCEDURE semantics: the first SUSPEND ends the body
-    stop_at_suspend: bool,
+    /// HOW MANY ROWS THE CONSUMER WILL TAKE, when that is known: the
+    /// body stops once SUSPEND has emitted this many. `Some(1)` is
+    /// EXECUTE PROCEDURE's own rule (the first SUSPEND ends the body),
+    /// `None` runs the body out.
+    ///
+    /// The engine PULLS a selectable body, and the count is observable
+    /// through the body's SIDE EFFECTS - measured with a procedure that
+    /// logs one row per iteration: `FIRST 1` runs it once, `FIRST 2`
+    /// twice, `FIRST 1 SKIP 1` twice, `ROWS 2 TO 3` three times, while a
+    /// BLOCKING consumer - a sort, an aggregate, DISTINCT - runs it out
+    /// (`FIRST 2 ... ORDER BY` is five iterations on the engine, so a
+    /// cap there would be a wrong answer, not a saving).
+    stop_after: Option<usize>,
     /// WHAT THE ENCLOSING HANDLER CAUGHT, while its body runs - what a
     /// bare `EXCEPTION;` re-raises. Handlers nest, so this is saved and
     /// restored around each one rather than simply set.
@@ -85157,8 +85210,11 @@ fn exec_psql_stmt_inner(
                 .map(|i| f.vars.get(f.out_at + i).cloned().unwrap_or(Value::Null))
                 .collect();
             f.suspended.push(row);
-            if f.stop_at_suspend {
-                return Err(PsqlStop::Exit); // EXECUTE PROCEDURE: one row, then unwind
+            // THE CONSUMER'S LIMIT STOPS THE BODY - what makes a
+            // selectable procedure PULLED rather than run-then-sliced.
+            // EXECUTE PROCEDURE is this same rule with a limit of one.
+            if f.stop_after.is_some_and(|n| f.suspended.len() >= n) {
+                return Err(PsqlStop::Exit);
             }
             Ok(())
         }
@@ -87021,7 +87077,7 @@ fn run_function(
     let db = database.as_ref().ok_or("no database attached")?;
     let meta = load_function(db, name)
         .ok_or_else(|| format!("function {} is not one this server can run", name))?;
-    let (outs, _) = run_body_source(database, name, &meta, args, ctx, false)?;
+    let (outs, _) = run_body_source(database, name, &meta, args, ctx, None)?;
     let v = outs.into_iter().next().unwrap_or(Value::Null);
     // COERCE the result to the declared RETURN scale. The source
     // interpreter's RETURN stores the value uncoerced, so a scale-0 value
@@ -87288,7 +87344,7 @@ fn fire_triggers(
             ExecErr::Text(format!("trigger {} is outside this server's PSQL surface", d.name))
         })?;
         let mut frame = PsqlFrame {
- stop_at_suspend: false,
+ stop_after: None,
             vars: vec![Value::Null; names.len()],
             out_at: names.len(),
             out_len: 0,
@@ -87321,7 +87377,7 @@ fn fire_triggers(
                 )));
             };
             let mut scout = PsqlFrame {
- stop_at_suspend: false,
+ stop_after: None,
                 vars: vec![Value::Null; names.len()],
                 out_at: names.len(),
                 out_len: 0,
@@ -87404,10 +87460,30 @@ fn run_procedure(
     ctx: &SessionCtx,
     first_only: bool,
 ) -> Result<(Vec<Value>, Vec<Vec<Value>>), ProcErr> {
+    // EXECUTE PROCEDURE is a row limit of ONE, which is the same rule a
+    // `FIRST n` over the call applies with a different number
+    run_procedure_capped(database, name, args, ctx, if first_only { Some(1) } else { None })
+}
+
+/// [run_procedure] with the CONSUMER'S ROW LIMIT, when the caller knows
+/// one: the body stops once it has SUSPENDed that many rows, instead of
+/// running out and being sliced afterwards.
+///
+/// Only a caller that can prove nothing BLOCKING sits between the limit
+/// and the call may pass one - a sort, an aggregate or DISTINCT consumes
+/// the whole body on the engine too, so a cap there would change the
+/// answer rather than the cost.
+fn run_procedure_capped(
+    database: &mut Option<Database>,
+    name: &str,
+    args: &[Value],
+    ctx: &SessionCtx,
+    stop_after: Option<usize>,
+) -> Result<(Vec<Value>, Vec<Vec<Value>>), ProcErr> {
     let db = database.as_ref().ok_or("no database attached")?;
     let meta = load_procedure(db, name)
         .ok_or_else(|| format!("procedure {} is not one this server can run", name))?;
-    run_body_source(database, name, &meta, args, ctx, first_only)
+    run_body_source(database, name, &meta, args, ctx, stop_after)
 }
 
 /// `EXECUTE BLOCK AS ... BEGIN ... END` - a procedure with no name and
@@ -87432,7 +87508,7 @@ fn run_execute_block(
         body_at: Some(body_at),
         prc_type: None,
     };
-    run_body_source(database, ANONYMOUS_BLOCK, &meta, &[], ctx, false).map(|_| ())
+    run_body_source(database, ANONYMOUS_BLOCK, &meta, &[], ctx, None).map(|_| ())
 }
 
 /// The name [run_body_source] runs an anonymous block under. The engine
@@ -87449,7 +87525,8 @@ fn run_body_source(
     meta: &ProcMeta,
     args: &[Value],
     ctx: &SessionCtx,
-    first_only: bool,
+    // the consumer's row limit, when it is known - see [PsqlFrame::stop_after]
+    stop_after: Option<usize>,
 ) -> Result<(Vec<Value>, Vec<Vec<Value>>), ProcErr> {
     // omitted trailing arguments take their parameters' DEFAULTs
     let args = with_proc_defaults(meta, args, Some(ctx));
@@ -87511,7 +87588,7 @@ fn run_body_source(
     };
 
     let mut frame = PsqlFrame {
- stop_at_suspend: false,
+ stop_after: None,
         vars: Vec::new(),
         out_at: meta.ins.len(),
         out_len: meta.outs.len(),
@@ -87540,7 +87617,7 @@ fn run_body_source(
     // carry, since they were installed statement by statement.
     let mark = undo_window_push(database, WindowKind::Nested);
     let mut steps = 0u32;
-    frame.stop_at_suspend = first_only;
+    frame.stop_after = stop_after;
     let outcome = exec_psql_stmt(&body, &mut frame, &mut steps, database, ctx);
     // AN `EXIT` IS NOT A FAILURE, AND ASKING `is_err()` SAID IT WAS.
     //
@@ -93032,7 +93109,19 @@ fn after_auth(
                         _ => unreachable!(),
                     };
                     let ctx = SessionCtx { user, attach_id };
-                    match run_procedure(&mut database, &pname, &pargs, &ctx, false) {
+                    // THE MODIFIER'S OWN LIMIT STOPS THE BODY. `FIRST n`
+                    // and `ROWS n` are a bounded, non-DISTINCT take, so
+                    // the body need only reach `skip + take` rows -
+                    // measured on the engine with a procedure that logs
+                    // one row per iteration: FIRST 1 runs it once, FIRST
+                    // 2 twice, FIRST 1 SKIP 1 twice, ROWS 2 TO 3 three
+                    // times. A DISTINCT or a bare SKIP has no bound and
+                    // takes no cap.
+                    let cap = match (outer.1, outer.3) {
+                        (false, Some(t)) => Some(outer.2.saturating_add(t)),
+                        _ => None,
+                    };
+                    match run_procedure_capped(&mut database, &pname, &pargs, &ctx, cap) {
                         Ok((_, suspended)) => {
                             let rows: Vec<Vec<Value>> = suspended
                                 .iter()
@@ -93091,7 +93180,7 @@ fn after_auth(
                         body_at: Some(body_at),
                         prc_type: None,
                     };
-                    match run_body_source(&mut database, ANONYMOUS_BLOCK, &meta, &[], &ctx, false) {
+                    match run_body_source(&mut database, ANONYMOUS_BLOCK, &meta, &[], &ctx, None) {
                         Ok((_, suspended)) => {
                             plan = std::rc::Rc::new(Plan::ProcRows { cols: bcols, rows: suspended });
                             respond(&mut s, &mut enc, resp_tx)?;
@@ -93122,7 +93211,9 @@ fn after_auth(
                     // ordinary machinery reads".
                     let ctx = SessionCtx { user, attach_id };
                     let mut p = (*plan).clone();
-                    match materialise_procedures(&mut p, &mut database, &ctx) {
+                    // the walk starts UNCAPPED and earns a cap on the way
+                    // down, at a bounded non-DISTINCT limit
+                    match materialise_procedures(&mut p, &mut database, &ctx, None) {
                         Ok(_) => {
                             plan = std::rc::Rc::new(p);
                             respond(&mut s, &mut enc, resp_tx)?;
@@ -107129,7 +107220,7 @@ mod tests {
         let one = |t: &str| parse_dyn_text(t, &vars);
         let render = |parts: &[DynPart], k: Value, s: Value| {
             let f = PsqlFrame {
- stop_at_suspend: false,
+ stop_after: None,
                 vars: vec![k, s],
                 out_at: 0,
                 out_len: 0,
