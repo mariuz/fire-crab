@@ -5666,6 +5666,82 @@ fn run_service_action(spb: &[u8]) -> Result<String, SpecialErr> {
     if action == fire_crab_svc::action::NREST {
         return run_nrest(&b).map_err(SpecialErr::Plain);
     }
+    // `isc_action_svc_properties`: gfix's header switches, asked for
+    // through the SERVICE MANAGER rather than through an attachment's
+    // DPB. The write mode is the one the upstream firebird-qa suite
+    // needs - its `database_fixture` calls `set_async_write()` after
+    // EVERY database it creates, so without this every test that makes a
+    // database fails in setup with "feature is not supported".
+    //
+    // The work is [Database::apply_header_dpb], the same function the
+    // DPB route uses, so both spellings of `gfix -write` write the same
+    // header bit and refuse the same way: `isc_obj_in_use` while another
+    // attachment holds the file, `isc_read_only_database` on a read-only
+    // one. Measured against the engine: `-write async` CLEARS the
+    // header's "force write" attribute and `-write sync` restores it.
+    if action == fire_crab_svc::action::PROPERTIES {
+        let db = b
+            .text(fire_crab_svc::spb::DBNAME)
+            .ok_or(SpecialErr::Plain(GDS_WISH_LIST))?;
+        // THE FLAGS THAT RIDE `isc_spb_options` rather than a tag of
+        // their own. `gfix -nolinger` clears the database's LINGER
+        // setting - the SuperServer cache that outlives the last detach -
+        // and fire-crab keeps no linger state at all, so there is nothing
+        // to clear and the honest answer is the engine's: success, no
+        // output. Measured: on a database whose RDB$LINGER is already
+        // null (every one the suite makes), the engine's own no_linger
+        // succeeds and leaves it null.
+        //
+        // The suite's `Database.drop()` sends this for EVERY test
+        // database, so refusing it failed every test in teardown even
+        // once the write mode worked.
+        if let Some(options) = b.number(fire_crab_svc::spb::OPTIONS) {
+            let options = options as u32;
+            if options & !fire_crab_svc::prp::NOLINGER != 0 {
+                // ACTIVATE (a shadow) and DB_ONLINE (the shutdown
+                // ladder's other half) are real work this server does not
+                // do through the service manager yet - refused, not
+                // silently reported as done
+                if std::env::var("FC_SRV_TRACE").is_ok() {
+                    eprintln!("[srv] properties options {:#x} not converted", options);
+                }
+                return Err(SpecialErr::Plain(GDS_WISH_LIST));
+            }
+            if std::env::var("FC_SRV_TRACE").is_ok() {
+                eprintln!("[srv] properties nolinger on {}: nothing to clear", db);
+            }
+            return Ok(String::new());
+        }
+        let mode = b
+            .first(fire_crab_svc::prp::WRITE_MODE)
+            .and_then(|c| c.data.first().copied())
+            .ok_or(SpecialErr::Plain(GDS_WISH_LIST))?;
+        let force_write = match mode {
+            fire_crab_svc::prp::WM_SYNC => true,
+            fire_crab_svc::prp::WM_ASYNC => false,
+            _ => return Err(SpecialErr::Plain(GDS_WISH_LIST)),
+        };
+        let want = HeaderDpb { force_write: Some(force_write), ..Default::default() };
+        let mut database = load_database(&db).ok_or(SpecialErr::Plain(GDS_IO_ERROR))?;
+        return match database.apply_header_dpb(&want) {
+            Ok(moves) => {
+                if std::env::var("FC_SRV_TRACE").is_ok() {
+                    eprintln!(
+                        "[srv] properties write_mode {} on {}: {}",
+                        if force_write { "sync" } else { "async" },
+                        db,
+                        if moves.is_empty() { "already so".into() } else { moves.join(", ") }
+                    );
+                }
+                // gfix prints nothing on success, and the driver's
+                // `set_write_mode` never polls the output stream
+                Ok(String::new())
+            }
+            Err(HeaderDpbErr::InUse(_)) => Err(SpecialErr::Plain(GDS_OBJ_IN_USE)),
+            Err(HeaderDpbErr::ReadOnly) => Err(SpecialErr::Plain(GDS_READ_ONLY_DATABASE)),
+            Err(_) => Err(SpecialErr::Plain(GDS_WISH_LIST)),
+        };
+    }
     if action != fire_crab_svc::action::DB_STATS {
         if std::env::var("FC_SRV_TRACE").is_ok() {
             eprintln!("[srv] action {} not converted", action);

@@ -267,9 +267,54 @@ pub fn start_clumplet_type(action: u8, tag: u8) -> Option<ClumpletType> {
             nbk::CLEAN_HISTORY => Some(Single),
             _ => None,
         },
+        // `gfix` THROUGH THE SERVICE MANAGER: the database is a counted
+        // string like every other action's, and the write mode is a BARE
+        // BYTE (ClumpletReader.cpp gives the isc_spb_prp_* values
+        // `ByteSpb`). Measured off the wire: the firebird-driver's
+        // `set_write_mode` sends `08 6a 2f 00 <path> 0c 25` - action 8,
+        // tag 106 with a 2-byte length, then tag 12 with the raw 37.
+        action::PROPERTIES => match tag {
+            spb::DBNAME => Some(StringSpb),
+            prp::WRITE_MODE => Some(ByteSpb),
+            // ...and the OPTIONS bitmask, framed as an int like every
+            // other action's (captured: `6c 04 00 00 00` - tag 108 then
+            // four LE bytes - which is what the driver sends for the
+            // properties that are flags rather than values)
+            spb::OPTIONS => Some(IntSpb),
+            _ => None,
+        },
         action::GET_FB_LOG => None,
         _ => None,
     }
+}
+
+/// `isc_spb_prp_*` - the PROPERTIES action's own tags (consts_pub.h:462+),
+/// what `gfix` asks for when it goes through the service manager rather
+/// than through an attachment's DPB.
+///
+/// The write mode is a BARE BYTE after its tag, not a counted string:
+/// the driver's `set_write_mode` sends `[8][106][len u16][path][12][37]`,
+/// and 37/38 are the two values themselves rather than a length.
+pub mod prp {
+    /// `isc_spb_prp_write_mode` - `gfix -write sync|async`
+    pub const WRITE_MODE: u8 = 12;
+    /// `isc_spb_prp_wm_async` - forced writes OFF
+    pub const WM_ASYNC: u8 = 37;
+    /// `isc_spb_prp_wm_sync` - forced writes ON
+    pub const WM_SYNC: u8 = 38;
+
+    /// The flags that ride `isc_spb_options` for this action rather than
+    /// carrying a tag of their own (`isc_spb_prp_*`, consts_pub.h:470+).
+    /// `isc_spb_prp_nolinger` - `gfix -nolinger`, which clears the
+    /// database's LINGER setting. Captured off the wire from the upstream
+    /// firebird-qa suite, whose `Database.drop()` sends it for every test
+    /// database: `... 6c 00 04 00 00` - tag 108 then the four LE bytes of
+    /// 0x400.
+    pub const NOLINGER: u32 = 0x400;
+    /// `isc_spb_prp_activate` - bring a shadow online
+    pub const ACTIVATE: u32 = 0x100;
+    /// `isc_spb_prp_db_online` - the online half of the shutdown ladder
+    pub const DB_ONLINE: u32 = 0x200;
 }
 
 /// `isc_spb_bkp_*` - the gbak actions' own tags (consts_pub.h:425+).
@@ -1230,6 +1275,35 @@ mod tests {
             start_clumplet_type(action::DB_STATS, spb::OPTIONS),
             Some(ClumpletType::IntSpb)
         );
+        // the PROPERTIES action: a counted database name and a BARE-BYTE
+        // write mode. The buffer below is the one firebird-driver's
+        // `set_write_mode` actually sends (captured from the upstream
+        // firebird-qa suite, whose every database fixture calls it).
+        assert_eq!(
+            start_clumplet_type(action::PROPERTIES, spb::DBNAME),
+            Some(ClumpletType::StringSpb)
+        );
+        assert_eq!(
+            start_clumplet_type(action::PROPERTIES, prp::WRITE_MODE),
+            Some(ClumpletType::ByteSpb)
+        );
+        let mut wm = vec![action::PROPERTIES, spb::DBNAME, 3, 0, b'a', b'b', b'c'];
+        wm.extend_from_slice(&[prp::WRITE_MODE, prp::WM_ASYNC]);
+        let b = parse(Grammar::SpbStart, &wm).expect("properties SPB");
+        assert_eq!(b.text(spb::DBNAME).as_deref(), Some("abc"));
+        assert_eq!(b.first(prp::WRITE_MODE).map(|c| c.data[0]), Some(prp::WM_ASYNC));
+        // the TEARDOWN buffer, byte for byte as the suite's `drop()`
+        // sends it: options is an INT, so the four bytes after tag 108
+        // are the value 0x400 and NOT a length plus data (reading them
+        // the other way says "4", which is a different flag entirely)
+        assert_eq!(start_clumplet_type(action::PROPERTIES, spb::OPTIONS), Some(ClumpletType::IntSpb));
+        let mut nl = vec![action::PROPERTIES, spb::DBNAME, 3, 0, b'a', b'b', b'c'];
+        nl.extend_from_slice(&[spb::OPTIONS, 0x00, 0x04, 0x00, 0x00]);
+        let b = parse(Grammar::SpbStart, &nl).expect("nolinger SPB");
+        assert_eq!(b.text(spb::DBNAME).as_deref(), Some("abc"));
+        assert_eq!(b.number(spb::OPTIONS).map(|n| n as u32), Some(prp::NOLINGER));
+        // ...and a tag PROPERTIES has no framing for is still refused
+        assert_eq!(start_clumplet_type(action::PROPERTIES, spb::PASSWORD), None);
         // a tag this action has no framing for is REFUSED, not guessed:
         // guessing a length turns the next tag into data
         assert_eq!(start_clumplet_type(action::DB_STATS, spb::PASSWORD), None);
