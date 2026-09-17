@@ -48752,6 +48752,30 @@ fn plan_query_inner_at(
                         c.name = n.clone();
                     }
                 }
+                // A RECURSIVE CTE IS A UNION, and the engine names its
+                // columns the way it names one: an EXPRESSION anchor
+                // announces a BLANK symbolic name, a plain FIELD anchor
+                // keeps its own. Measured: `SELECT 1 AS L ...` is
+                // `name: <blank> alias: L` on the engine where this
+                // server said CONSTANT (and CONSTANT/CONSTANT for a
+                // two-column anchor), while `SELECT W AS L ...` is `W`
+                // on BOTH. A plain `UNION` already agrees - [plan_union]
+                // runs this exact test one function over - and the
+                // recursive path simply took [output_cols_of]'s columns
+                // untouched, so the rule never reached it. The same
+                // predicate is used here so the two cannot drift apart.
+                for c in cols.iter_mut() {
+                    let symbolic = c.fname.clone().unwrap_or_default();
+                    let kind_named = symbolic == "CONSTANT"
+                        || matches!(
+                            symbolic.as_str(),
+                            "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "LIST"
+                        );
+                    let plain = c.expr.is_none() && !(c.relation.is_none() && kind_named);
+                    if !plain {
+                        c.fname = Some(String::new());
+                    }
+                }
                 let Some(seed_rows) = branch_rows(&seed_plan, dbr, &[]) else {
                     return Some({ if trace { eprintln!("[srv] recursive CTE refused: the seed does not materialise"); } Plan::Refused });
                 };
@@ -49351,6 +49375,52 @@ fn plan_query_inner_at(
                     table: alias.clone(),
                 }));
             }
+            // A SUBQUERY IN THE INNER SELECT LIST BLANKS EVERY
+            // EXPRESSION COLUMN'S SYMBOLIC NAME, one level up. Measured
+            // over ~20 cells: `(SELECT (SELECT MAX(W) FROM NN) AS E,
+            // W+1 AS F FROM NN) Z` announces `name:` BLANK for BOTH
+            // columns on the engine, where this server said MAX and ADD
+            // - and it blanks a neighbour the outer never even selects
+            // (`SELECT Z.F FROM ...` alone is blank too), so it is a
+            // property of the SCOPE, not of the column or of what is
+            // asked for. Plain FIELD columns keep their names through
+            // it (`W` survives beside a blanked subquery column), and
+            // at TOP LEVEL nothing blanks at all: the same select list
+            // unwrapped is MAX / ADD on both servers.
+            //
+            // THE TRIGGER IS THE SELECT LIST, NOT THE QUERY. A subquery
+            // in the inner WHERE, HAVING, an EXISTS or IN there, or a
+            // nested derived table in the inner FROM all KEEP the
+            // kind-name (measured, each one agreeing today) - so the
+            // test reads the PROJECTION text only. Nor is it a
+            // flattening rule, which was the obvious guess and is
+            // refused by measurement: DISTINCT, GROUP BY, an aggregate,
+            // FIRST, SKIP, ORDER BY and a window function are all
+            // flatten blockers and all KEEP the name.
+            //
+            // A non-recursive CTE is spliced in as a derived table
+            // ([splice_ctes]) and re-planned, so it arrives here too -
+            // which is why the CTE cells measure identically.
+            let list_has_subq = split_query(&inner_sql)
+                .and_then(|(p, ..)| extract_subqueries(p))
+                .is_some_and(|(_, subs)| !subs.is_empty());
+            if list_has_subq {
+                for c in inner_cols.iter_mut() {
+                    // the same "is this a real field" test [plan_union]
+                    // and the recursive-CTE anchor use, so the three
+                    // cannot drift apart
+                    let symbolic = c.fname.clone().unwrap_or_default();
+                    let kind_named = symbolic == "CONSTANT"
+                        || matches!(
+                            symbolic.as_str(),
+                            "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "LIST"
+                        );
+                    let plain = c.expr.is_none() && !(c.relation.is_none() && kind_named);
+                    if !plain {
+                        c.fname = Some(String::new());
+                    }
+                }
+            }
             // Everything above the leaf - the projection, the WHERE, the
             // GROUP BY, the ORDER BY - is resolved by the SAME planner a
             // bound CTE uses, against a synthetic view built from the
@@ -49510,12 +49580,43 @@ fn plan_query_inner_at(
                         // AS BOOL`, and the engine names such a column
                         // BOOL - the literal would say CONSTANT
                         // (matched on squashed text: split_alias reads
-                        // the marker as EXISTS's trailing alias)
-                        if let Some(idx) = items.iter().position(|item| {
-                            let squashed: String =
-                                item.split_whitespace().collect::<Vec<_>>().join(" ");
-                            squashed.eq_ignore_ascii_case(&exists_item)
-                        }) {
+                        // the marker as EXISTS's trailing alias).
+                        //
+                        // AN ALIAS OR A LEADING `NOT` DEFEATED THAT
+                        // MATCH, and the column then fell through to
+                        // CONSTANT. Measured: the engine says BOOL for
+                        // `EXISTS(...)`, for `EXISTS(...) AS E`, for a
+                        // bare `EXISTS(...) E` and for `NOT EXISTS(...)`
+                        // alike, in every select-list position - while
+                        // this server announced CONSTANT for the last
+                        // three. `NOT EXISTS` even got the ALIAS right
+                        // (BOOL) with the field still CONSTANT, so the
+                        // two travel by different routes and only this
+                        // one was wrong. The tail is stripped
+                        // explicitly: nothing, `AS <ident>`, or a bare
+                        // `<ident>`; anything else (`EXISTS <m> AND ...`)
+                        // is not a whole item and must not match.
+                        let exists_named = |item: &str| -> bool {
+                            let up: String = item
+                                .split_whitespace()
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                                .to_ascii_uppercase();
+                            let e_up = exists_item.to_ascii_uppercase();
+                            let Some(tail) = up
+                                .strip_prefix(&format!("NOT {}", e_up))
+                                .or_else(|| up.strip_prefix(&e_up))
+                            else {
+                                return false;
+                            };
+                            let t = tail.trim();
+                            if t.is_empty() {
+                                return true;
+                            }
+                            let t = t.strip_prefix("AS ").unwrap_or(t).trim();
+                            !t.is_empty() && !t.contains(' ')
+                        };
+                        if let Some(idx) = items.iter().position(|item| exists_named(item)) {
                             return Some((idx, "BOOL".to_string(), None, None, None));
                         }
                         let idx = items.iter().position(|item| {

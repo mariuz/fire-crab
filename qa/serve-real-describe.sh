@@ -352,6 +352,61 @@ both "DELETE RETURNING carries the table" "DELETE FROM T WHERE X = 0 RETURNING X
 # join (SELECT * FROM T JOIN U - T's computed column refuses), and a
 # view in a union branch.
 
+# --- 10a. THE SYMBOLIC NAME OF A SUBQUERY COLUMN ------------------------
+# Three separate defects, all announcing this server's own NODE KIND
+# where the engine announces a chosen label or nothing.
+#
+# (1) EXISTS is named BOOL. The fold turns `EXISTS <marker>` into a
+# literal, which would describe as CONSTANT, so the planner patches the
+# column back to BOOL - but it matched the item text EXACTLY, so an
+# alias or a leading NOT fell through and announced CONSTANT. The engine
+# says BOOL in every spelling and every position.
+both "EXISTS is BOOL, unaliased"        "SELECT EXISTS(SELECT 1 FROM U) FROM T"
+both "EXISTS is BOOL, AS alias"         "SELECT EXISTS(SELECT 1 FROM U) AS E FROM T"
+both "EXISTS is BOOL, bare alias"       "SELECT EXISTS(SELECT 1 FROM U) E FROM T"
+both "NOT EXISTS is BOOL too"           "SELECT NOT EXISTS(SELECT 1 FROM U) FROM T"
+both "NOT EXISTS, aliased"              "SELECT NOT EXISTS(SELECT 1 FROM U) AS E FROM T"
+both "EXISTS second of two items"       "SELECT X, EXISTS(SELECT 1 FROM U) FROM T"
+both "two EXISTS items"                 "SELECT EXISTS(SELECT 1 FROM U), EXISTS(SELECT 1 FROM U) FROM T"
+# (2) A SUBQUERY IN THE SELECT LIST BLANKS EVERY EXPRESSION COLUMN OF
+# THAT SCOPE, one level up - measured over ~20 cells. It blanks a
+# neighbour the outer never selects, so it is a property of the SCOPE
+# rather than of the column; plain FIELD columns keep their names
+# through it; and at TOP LEVEL nothing blanks at all.
+both "a subquery column blanks through a derived" "SELECT * FROM (SELECT (SELECT MAX(Y) FROM U) AS E FROM T) Z"
+both "...and its neighbours blank with it" "SELECT * FROM (SELECT (SELECT MAX(Y) FROM U) AS E, X+1 AS F FROM T) Z"
+both "...even one the outer never selects" "SELECT Z.F FROM (SELECT (SELECT MAX(Y) FROM U) AS E, X+1 AS F FROM T) Z"
+both "a plain field keeps its name beside it" "SELECT * FROM (SELECT X, (SELECT MAX(Y) FROM U) AS E FROM T) Z"
+both "a subquery INSIDE an expression blanks" "SELECT * FROM (SELECT (SELECT MAX(Y) FROM U) + 0 AS E FROM T) Z"
+both "a subquery inside a CAST blanks"   "SELECT * FROM (SELECT CAST((SELECT MAX(Y) FROM U) AS BIGINT) AS E FROM T) Z"
+both "the same one level deeper"         "SELECT * FROM (SELECT * FROM (SELECT (SELECT MAX(Y) FROM U) AS E FROM T) Y2) Z"
+both "the same through a CTE"            "WITH C AS (SELECT (SELECT MAX(Y) FROM U) AS E, X+1 AS F FROM T) SELECT E, F FROM C"
+both "TOP LEVEL keeps both names"        "SELECT (SELECT MAX(Y) FROM U) AS E, X+1 AS F FROM T"
+# THE TRIGGER IS THE SELECT LIST, NOT THE QUERY, and it is NOT a
+# flattening rule - which was the obvious guess and is refuted by every
+# cell below. These are the regression pins: blanking any of them would
+# trade the wrong answer this removes for a fresh one.
+both "a subquery in the inner WHERE does not" "SELECT * FROM (SELECT X+1 AS F FROM T WHERE X > (SELECT MIN(Y) FROM U)) Z"
+both "EXISTS in the inner WHERE does not" "SELECT * FROM (SELECT X+1 AS F FROM T WHERE EXISTS(SELECT 1 FROM U)) Z"
+both "IN (subquery) in the inner WHERE does not" "SELECT * FROM (SELECT X+1 AS F FROM T WHERE X IN (SELECT Y FROM U)) Z"
+both "a nested derived in the inner FROM does not" "SELECT * FROM (SELECT Y2.F+1 AS F FROM (SELECT X AS F FROM T) Y2) Z"
+both "inner DISTINCT does not"           "SELECT * FROM (SELECT DISTINCT X+1 AS F FROM T) Z"
+both "inner GROUP BY does not"           "SELECT * FROM (SELECT X+1 AS F FROM T GROUP BY X+1) Z"
+both "inner FIRST does not"              "SELECT * FROM (SELECT FIRST 1 X+1 AS F FROM T) Z"
+both "inner ORDER BY does not"           "SELECT * FROM (SELECT X+1 AS F FROM T ORDER BY X) Z"
+both "a window does not"                 "SELECT * FROM (SELECT X+1 AS F, ROW_NUMBER() OVER () AS R FROM T) Z"
+# (3) A RECURSIVE CTE IS A UNION and names its columns like one: an
+# EXPRESSION anchor blanks, a plain FIELD anchor keeps its own. A plain
+# UNION already agreed; the recursive path took the seed's columns
+# untouched, so the rule never reached it.
+both "a recursive CTE blanks its expression anchor" \
+     "WITH RECURSIVE R AS (SELECT 1 AS L FROM RDB\$DATABASE UNION ALL SELECT L+1 FROM R WHERE L<3) SELECT L FROM R"
+both "...both columns of a two-column anchor" \
+     "WITH RECURSIVE R AS (SELECT 1 AS L, 2 AS M FROM RDB\$DATABASE UNION ALL SELECT L+1, M FROM R WHERE L<3) SELECT L, M FROM R"
+both "a COLUMN anchor keeps its name"    "WITH RECURSIVE R AS (SELECT X AS L FROM T UNION ALL SELECT L+1 FROM R WHERE L<30) SELECT L FROM R"
+both "a plain CTE keeps CONSTANT"        "WITH C AS (SELECT 1 AS L FROM RDB\$DATABASE) SELECT L FROM C"
+both "a bare UNION blanks, as before"    "SELECT 1 AS L FROM RDB\$DATABASE UNION ALL SELECT 2 FROM RDB\$DATABASE"
+
 # --- 11. shared refusals ------------------------------------------------
 a=$(describe "SELECT ? FROM T" "$PORT" "$A")
 b=$(describe "SELECT ? FROM T" "$REAL" "$B")
