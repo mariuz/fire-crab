@@ -73,6 +73,14 @@ INSERT INTO T VALUES (3, 3,    'x',    -1.5);
 INSERT INTO T VALUES (4, 10,   NULL,   10);
 INSERT INTO T VALUES (5, NULL, 'aa',   NULL);
 COMMIT;
+SET TERM ^;
+/* a bound value must reach the BODY, in the right slot */
+CREATE PROCEDURE PU (A VARCHAR(5) CHARACTER SET UTF8, B INTEGER)
+    RETURNS (K INTEGER) AS BEGIN K = B; SUSPEND; END^
+CREATE PROCEDURE PX (A VARCHAR(5) CHARACTER SET UTF8)
+    RETURNS (K INTEGER) AS BEGIN K = CHAR_LENGTH(A); SUSPEND; END^
+SET TERM ;^
+COMMIT;
 EOF
     chmod 666 "$1"
 }
@@ -110,6 +118,22 @@ query() { # <sql> <json args> <port> <db>
         esac
     done
     printf 'CONN_ERR'
+}
+
+# the same comparison over a WHOLE statement, for shapes that are not a
+# WHERE clause over T (a procedure call in the FROM, say)
+bothq() { # <label> <full sql> <json args>
+    local a b
+    a=$(query "$2" "$3" "$PORT" "$A")
+    b=$(query "$2" "$3" "$REAL" "$B")
+    if [ "$a" = "$b" ]; then
+        echo "OK   $1 $3: $a"
+    else
+        echo "DIFF $1 $3"
+        echo "     fcwire: $a"
+        echo "     engine: $b"
+        fail=1
+    fi
 }
 
 both() { # <label> <predicate> <json args>
@@ -238,6 +262,21 @@ for pair in "? SIMILAR TO '['|[\"x\"]" \
 done
 both "a FALSE written BEFORE suppresses the raise" "? IS NULL AND ? SIMILAR TO '['" '[5,"x"]'
 both "a NULL value gates the bad pattern off" "? SIMILAR TO '['" '[null]'
+
+# --- 3d. a PROCEDURE CALL'S ARGUMENTS ---------------------------------
+#
+# The bound value must reach the BODY, in the right slot. PU returns its
+# second argument; PX returns the CHAR_LENGTH of its first - so a
+# swapped pair or a dropped slot shows up as a wrong ANSWER, not just a
+# wrong describe. Slots are numbered in TEXT ORDER across the whole
+# statement (measured), which is why the call-plus-WHERE shapes are
+# here: they pin the numbering, not just the binding.
+# RECORDED, NOT FIXED - a `?` in a FROM-clause procedure call. The
+# ANSWER contract is measured (the bound value reaches the body in the
+# right slot; `PU(?, ?) WHERE K = ?` numbers three slots in text order),
+# but the route rebuilds the statement without the call's placeholders,
+# so the slots collide. Only EXECUTE PROCEDURE is answered below.
+bothq "EXECUTE PROCEDURE binds too" "EXECUTE PROCEDURE PU(?, ?)" '["ab",7]'
 
 # --- 4. ? BETWEEN: a desugar into the mirrored comparisons ------------
 both "? BETWEEN ints" "? BETWEEN 1 AND 3" '[2]'

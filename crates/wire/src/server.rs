@@ -9265,6 +9265,11 @@ enum Plan {
         name: String,
         args: Vec<Value>,
         cols: Vec<ProjCol>,
+        /// `(argument position, statement slot)` for each `?` argument.
+        /// The value arrives at op_execute and is written into `args`
+        /// there; empty for an all-literal call, which is every call
+        /// this plan could express before.
+        arg_slots: Vec<(usize, usize)>,
     },
     /// `EXECUTE BLOCK AS ... BEGIN ... END` - a body with no name and no
     /// catalog row. Like [Plan::ProcInvoke] it runs at op_execute
@@ -48333,9 +48338,9 @@ fn plan_query_inner_ctx(
     if let Some((parts, pargs)) = parse_execute_procedure(sql) {
         let db_outer = db;
     let db = db.as_ref()?;
-        // a `?` argument would have to arrive with op_execute; this
-        // slice takes literals only
-        let args: Vec<Value> = pargs.into_iter().collect::<Option<Vec<_>>>()?;
+        // the `?` arguments are resolved once the procedure is KNOWN -
+        // each claims its DECLARED parameter's descriptor
+        let pargs_raw = pargs;
         // NAME RESOLUTION, measured: a bare name and `PUBLIC.name` are
         // the plain procedure; any other two-part `Q.N` tries package
         // Q down the search path (`RDB$PROFILER.FLUSH` answers, and
@@ -48370,8 +48375,42 @@ fn plan_query_inner_ctx(
             // each parameter describes its DECLARED type
             .map(|(i, p)| proc_out_col(p.name.clone(), None, &pname, None, i, &p.desc))
             .collect();
+        // A `?` ARGUMENT CLAIMS THE PARAMETER'S OWN DESCRIPTOR, which is
+        // what the engine announces - measured across three attachments:
+        // a real-charset argument follows the attachment exactly as a
+        // column does (VARCHAR(5) UTF8 is 20/UTF8 under NONE and UTF8,
+        // 5/WIN1252 under WIN1252), a NONE one never moves, and a
+        // declared NOT NULL parameter marks its slot NOT NULL.
+        //
+        // EXECUTE PROCEDURE is a WHOLE STATEMENT, so its arguments are
+        // the only placeholders in it: the first claims slot 0 and the
+        // rest follow in text order, which is the engine's numbering
+        // (measured: slots are numbered by textual position).
+        let mut args: Vec<Value> = Vec::with_capacity(pargs_raw.len());
+        let mut arg_slots: Vec<(usize, usize)> = Vec::new();
+        for (i, a) in pargs_raw.into_iter().enumerate() {
+            match a {
+                Some(v) => args.push(v),
+                None => {
+                    // a placeholder past the declared parameters has no
+                    // descriptor to claim: refuse deterministically
+                    // rather than fall through to another planner branch
+                    let Some(param) = meta.ins.get(i) else {
+                        return Some(Plan::Refused);
+                    };
+                    let slot = arg_slots.len();
+                    if params.len() <= slot {
+                        params.resize(slot + 1, None);
+                    }
+                    params[slot] = Some(param.desc.clone());
+                    arg_slots.push((i, slot));
+                    // the placeholder's seat, overwritten at op_execute
+                    args.push(Value::Null);
+                }
+            }
+        }
         // the body runs at EXECUTE, not here: it may write
-        return Some(Plan::ProcInvoke { name: pname, args, cols });
+        return Some(Plan::ProcInvoke { name: pname, args, cols, arg_slots });
     }
     let Some((proj_s, table_s, where_s, group_s, having_s, order_s)) = split_query(sql) else {
         if trace { eprintln!("[srv] plan: split_query failed for {:?}", sql); }
@@ -61160,6 +61199,27 @@ fn blob_bytes_in(text: &str, cs: u8) -> Result<Vec<u8>, EvalErr> {
 /// its full '…10:20:30.0000', TRUE the word in capitals, 1.5e2
 /// '150.0000000000000'). None for a value that is no scalar - a blob id
 /// is not assigned this way.
+/// The [Value] a bound parameter enters a PROCEDURE ARGUMENT as.
+///
+/// It does NOT coerce: [bind_proc_args] applies the declared
+/// parameter's own CVT rules on top (a text argument into an INTEGER
+/// parameter parses, an integer into a text one renders and pads), and
+/// pre-coercing here would apply them twice. What this decides is
+/// FAITHFULNESS - a scaled integer keeps its scale, a `TextCs` keeps
+/// its text - and that an unrepresentable bind REFUSES rather than
+/// folding to NULL, which would run the body with a silently different
+/// argument.
+fn wireparam_arg_value(wp: &WireParam) -> Option<Value> {
+    Some(match wp {
+        WireParam::Null => Value::Null,
+        WireParam::Int(v, 0) => Value::Int(*v),
+        WireParam::Int(v, sc) => Value::Scaled(*v, *sc),
+        WireParam::Text(t) | WireParam::TextCs(t, _) => Value::Text(t.clone()),
+        WireParam::Double(d) => Value::Double(*d),
+        _ => return None,
+    })
+}
+
 fn wireparam_text(wp: &WireParam) -> Option<String> {
     Some(match wp {
         WireParam::Text(t) | WireParam::TextCs(t, _) => t.clone(),
@@ -81916,9 +81976,15 @@ fn load_procedure(db: &Database, name: &str) -> Option<ProcMeta> {
         cfid("RDB$FIELD_SOURCE")?,
     );
     // (parameter type 0=in/1=out, number, name, field source, defaulted,
-    //  decoded default value)
-    let mut raw: Vec<(i64, i64, String, String, bool, Option<DefaultVal>)> = Vec::new();
+    //  decoded default value, declared NOT NULL)
+    let mut raw: Vec<(i64, i64, String, String, bool, Option<DefaultVal>, bool)> = Vec::new();
     let pname_f = cfid("RDB$PARAMETER_NAME")?;
+    // RDB$NULL_FLAG on the PARAMETER row: the engine announces a
+    // declared-NOT NULL argument's slot as NOT NULL, exactly as it does
+    // a NOT NULL column's (measured: `PN(A VARCHAR(5), B INTEGER NOT
+    // NULL)` describes slot 2 without `Nullable` and slot 1 with it).
+    // Absent on a pre-schema ODS, where every parameter is nullable.
+    let cnull_f = cfid("RDB$NULL_FLAG");
     let cdef_f = cfid("RDB$DEFAULT_SOURCE");
     let cdefval_f = cfid("RDB$DEFAULT_VALUE");
     // the same schema/package filter as the source scan: FB6's packaged
@@ -81949,6 +82015,7 @@ fn load_procedure(db: &Database, name: &str) -> Option<ProcMeta> {
                     .and_then(|b| decode_default_blr(&b)),
                 _ => None,
             };
+            let not_null = matches!(cnull_f.and_then(|i| v.get(i)), Some(Value::Int(1)));
             raw.push((
                 *typ as i64,
                 *num as i64,
@@ -81956,6 +82023,7 @@ fn load_procedure(db: &Database, name: &str) -> Option<ProcMeta> {
                 fs.trim_end().to_string(),
                 defaulted,
                 defval,
+                not_null,
             ));
         }
     });
@@ -81971,19 +82039,43 @@ fn load_procedure(db: &Database, name: &str) -> Option<ProcMeta> {
         // (the describe) subtracts it back - without this a VARCHAR(7)
         // output announced as 5 and isql drew the column a width short
         let length = if dtype == dtype::VARYING { len + 2 } else { len };
+        // A TEXT PARAMETER'S CHARSET IS NOT `RDB$FIELD_SUB_TYPE`. A table
+        // column's descriptor comes from the STORED RECORD FORMAT, whose
+        // sub_type already carries the ttype; a procedure parameter is
+        // rebuilt from RDB$FIELDS, where the charset lives in
+        // RDB$CHARACTER_SET_ID and the sub_type is 0 - so every text
+        // parameter was announced CHARACTER SET NONE, in BOTH directions
+        // (measured: a `VARCHAR(5) CHARACTER SET UTF8` argument and
+        // output both read 20/NONE where the engine says 20/UTF8, and
+        // 5/WIN1252 under a WIN1252 attachment).
+        //
+        // The ttype's high byte is the COLLATION, and it is deliberately
+        // left 0: measured, a `COLLATE UNICODE` parameter stores
+        // COLLID 2 in the catalogue and the engine still announces
+        // `charset: 4` - the describe carries the charset alone.
+        //
+        // Only the text wires: a numeric keeps its NUMERIC/DECIMAL
+        // sub_type, and a text BLOB carries its charset in `scale`
+        // ([wire_for]) - unmeasured for a parameter, so left alone.
+        let sub_type = if matches!(dtype, dtype::TEXT | dtype::VARYING) {
+            fire_crab_ods::ddl::domain_charset_id(&db.bytes(), db.page_size, dom)
+                .map_or(sub, |cs| cs as i16)
+        } else {
+            sub
+        };
         Some(Descriptor {
             dtype,
             scale,
             length,
-            sub_type: sub,
+            sub_type,
             flags: 0,
             offset: 0,
         })
     };
     let mut ins: Vec<ProcParam> = Vec::new();
     let mut outs: Vec<ProcParam> = Vec::new();
-    raw.sort_by_key(|(t, n, _, _, _, _)| (*t, *n));
-    for (typ, _, pnm, fs, defaulted, defval) in raw {
+    raw.sort_by_key(|(t, n, _, _, _, _, _)| (*t, *n));
+    for (typ, _, pnm, fs, defaulted, defval, not_null) in raw {
         // the native no-op body reads NOTHING, so its DEFAULTED inputs
         // are simply omittable - the engine binds their defaults
         // (ATTACHMENT_ID = the current one) and answers NONE [] either
@@ -81994,7 +82086,12 @@ fn load_procedure(db: &Database, name: &str) -> Option<ProcMeta> {
         if native_noop && typ == 0 && defaulted {
             continue;
         }
-        let desc = domain_desc(&fs)?;
+        let mut desc = domain_desc(&fs)?;
+        // the DECLARED nullability rides on the descriptor, where
+        // [append_bind_section] and [answer_prepare] already read it
+        if not_null {
+            desc.flags |= PARAM_NOT_NULL;
+        }
         // INT/TEXT the source path handles directly; NUMERIC (scaled or
         // INT128) the BLR executor computes and describes (proc_out_col ->
         // wire_for), so a procedure of these types is loadable now that it
@@ -87496,7 +87593,31 @@ fn load_function(db: &Database, name: &str) -> Option<ProcMeta> {
         let (ft, len, scale, sub) = fire_crab_ods::ddl::domain_type_info(&db.bytes(), db.page_size, dom)?;
         let dtype = fire_crab_ods::ddl::field_type_to_dtype(ft)?;
         let length = if dtype == dtype::VARYING { len + 2 } else { len };
-        Some(Descriptor { dtype, scale, length, sub_type: sub, flags: 0, offset: 0 })
+        // A TEXT PARAMETER'S CHARSET IS NOT `RDB$FIELD_SUB_TYPE`. A table
+        // column's descriptor comes from the STORED RECORD FORMAT, whose
+        // sub_type already carries the ttype; a procedure parameter is
+        // rebuilt from RDB$FIELDS, where the charset lives in
+        // RDB$CHARACTER_SET_ID and the sub_type is 0 - so every text
+        // parameter was announced CHARACTER SET NONE, in BOTH directions
+        // (measured: a `VARCHAR(5) CHARACTER SET UTF8` argument and
+        // output both read 20/NONE where the engine says 20/UTF8, and
+        // 5/WIN1252 under a WIN1252 attachment).
+        //
+        // The ttype's high byte is the COLLATION, and it is deliberately
+        // left 0: measured, a `COLLATE UNICODE` parameter stores
+        // COLLID 2 in the catalogue and the engine still announces
+        // `charset: 4` - the describe carries the charset alone.
+        //
+        // Only the text wires: a numeric keeps its NUMERIC/DECIMAL
+        // sub_type, and a text BLOB carries its charset in `scale`
+        // ([wire_for]) - unmeasured for a parameter, so left alone.
+        let sub_type = if matches!(dtype, dtype::TEXT | dtype::VARYING) {
+            fire_crab_ods::ddl::domain_charset_id(&db.bytes(), db.page_size, dom)
+                .map_or(sub, |cs| cs as i16)
+        } else {
+            sub
+        };
+        Some(Descriptor { dtype, scale, length, sub_type, flags: 0, offset: 0 })
     };
     let mut ins: Vec<ProcParam> = Vec::new();
     let mut outs: Vec<ProcParam> = Vec::new();
@@ -93988,11 +94109,24 @@ fn after_auth(
                     // EXECUTE PROCEDURE runs HERE, because a body may
                     // WRITE, and becomes the row its output parameters
                     // make for the fetch
-                    let (pname, pargs, pcols) = match &*plan {
-                        Plan::ProcInvoke { name, args, cols } => {
-                            (name.clone(), args.clone(), cols.clone())
+                    let (pname, pargs0, pcols, pslots) = match &*plan {
+                        Plan::ProcInvoke { name, args, cols, arg_slots } => {
+                            (name.clone(), args.clone(), cols.clone(), arg_slots.clone())
                         }
                         _ => unreachable!(),
+                    };
+                    // THE BOUND VALUES BECOME THE ARGUMENTS HERE - the
+                    // only place they exist. The plan was built at
+                    // prepare with a seat per `?`.
+                    let Some(pargs) = (|| {
+                        let mut a = pargs0.clone();
+                        for (pos, slot) in &pslots {
+                            *a.get_mut(*pos)? = wireparam_arg_value(bound_args.get(*slot)?)?;
+                        }
+                        Some(a)
+                    })() else {
+                        respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
+                        continue;
                     };
                     let ctx = SessionCtx { user, attach_id };
                     // BLR-FIRST: EXECUTE PROCEDURE answers the FIRST
@@ -96530,11 +96664,26 @@ fn after_auth(
                 // this rather than opening a cursor). Run the body, send
                 // the outputs as op_sql_response, then the op_response.
                 if matches!(&*plan, Plan::ProcInvoke { .. }) {
-                    let (pname, pargs, pcols) = match &*plan {
-                        Plan::ProcInvoke { name, args, cols } => {
-                            (name.clone(), args.clone(), cols.clone())
+                    let (pname, pargs0, pcols, pslots) = match &*plan {
+                        Plan::ProcInvoke { name, args, cols, arg_slots } => {
+                            (name.clone(), args.clone(), cols.clone(), arg_slots.clone())
                         }
                         _ => unreachable!(),
+                    };
+                    // ...and the bound values become the arguments on
+                    // THIS path too, from op_execute2's own message.
+                    // Substituting on one path only would leave the OO
+                    // clients running the body with a NULL in every `?`
+                    // seat - a wrong answer, not a refusal.
+                    let Some(pargs) = (|| {
+                        let mut a = pargs0.clone();
+                        for (pos, slot) in &pslots {
+                            *a.get_mut(*pos)? = wireparam_arg_value(exec2_args.get(*slot)?)?;
+                        }
+                        Some(a)
+                    })() else {
+                        respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
+                        continue;
                     };
                     let ctx = SessionCtx { user, attach_id };
                     // BLR-FIRST here too - op_execute2 is the path

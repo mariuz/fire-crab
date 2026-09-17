@@ -77,6 +77,24 @@ CREATE TABLE T (U VARCHAR(5) CHARACTER SET UTF8,
                 BA BLOB SUB_TYPE TEXT CHARACTER SET ASCII,
                 BB BLOB SUB_TYPE 0);
 COMMIT;
+SET TERM ^;
+/* a call's ARGUMENT slots describe the PARAMETER's declared type - PU's
+   first is a real charset (it follows the attachment), PN's second is
+   declared NOT NULL */
+CREATE PROCEDURE PU (A VARCHAR(5) CHARACTER SET UTF8, B INTEGER)
+    RETURNS (K INTEGER) AS BEGIN K = B; SUSPEND; END^
+CREATE PROCEDURE PN (A VARCHAR(5), B INTEGER NOT NULL)
+    RETURNS (K INTEGER) AS BEGIN K = B; SUSPEND; END^
+/* a TEXT OUTPUT carries the same law: its charset comes from the
+   parameter domain's CHARACTER SET ID column, not its FIELD SUB TYPE.
+   (Spelled without the RDB-dollar prefixes ON PURPOSE: this heredoc is
+   UNQUOTED and the gate runs under `set -u`, so a literal RDB-dollar
+   name is expanded by the shell and the fixture dies with "unbound
+   variable" - which is exactly how this comment broke the gate once.) */
+CREATE PROCEDURE POUT RETURNS (S VARCHAR(5) CHARACTER SET UTF8, N VARCHAR(5)) AS
+    BEGIN S = 'ab'; N = 'cd'; SUSPEND; END^
+SET TERM ;^
+COMMIT;
 EOF
     chmod 666 "$1"
 }
@@ -262,6 +280,35 @@ cell "...its STARTING slot"           "SELECT 1 FROM T WHERE I STARTING WITH ?;"
 cell "...and its CONTAINING slot"     "SELECT 1 FROM T WHERE I CONTAINING ?;"
 cell "a BIGINT column's LIKE slot"    "SELECT 1 FROM T WHERE B LIKE ?;"
 
+# A PROCEDURE CALL'S ARGUMENT SLOTS take the PARAMETER's own declared
+# descriptor - and a real-charset one follows the attachment exactly as
+# a column does (measured: a `VARCHAR(5) CHARACTER SET UTF8` argument is
+# 20/UTF8 under NONE and UTF8, 5/WIN1252 under WIN1252). A NONE
+# argument is a byte carrier and never moves; a declared NOT NULL
+# parameter marks its slot NOT NULL; and a LITERAL argument claims no
+# slot at all.
+echo "-- a procedure call's ARGUMENT slots (EXECUTE PROCEDURE) --"
+cell "...through EXECUTE PROCEDURE"   "EXECUTE PROCEDURE PU(?, ?);"
+cell "a NOT NULL parameter"           "EXECUTE PROCEDURE PN(?, ?);"
+cell "a literal claims no slot"       "EXECUTE PROCEDURE PU('ab', ?);"
+# RECORDED, NOT FIXED - the FROM-clause form (`SELECT K FROM PU(?, ?)`)
+# still refuses. Its describe is measured (the same declared-parameter
+# law as above: 20/UTF8 under NONE and UTF8, 5/WIN1252 under WIN1252,
+# and `... WHERE K = ?` numbers three slots in TEXT ORDER), but the
+# route it takes rebuilds the statement through `sql_over_from`, which
+# SPLICES THE FROM ITEM OUT - deleting the call's `?` from the text - and
+# the outer re-plan then renumbers from zero and collides with the
+# argument slots. Fixing it needs `plan_over_source` to accept a
+# parameter BASE, which is a slice of its own; an attempt that claimed
+# the slots without it made `SELECT FIRST 1 K FROM PU(?, ?)` ANSWER
+# K = NULL instead of refusing, and was reverted for that reason.
+# ...and the OUTPUT side of the same descriptor. A procedure parameter is
+# rebuilt from RDB$FIELDS, where the charset is in RDB$CHARACTER_SET_ID -
+# a table column's comes from the stored record format, whose sub_type
+# already carries the ttype, which is why columns were always right and
+# these were announced CHARACTER SET NONE in both directions.
+ocell "a procedure's TEXT OUTPUT charset" "SELECT S, N FROM POUT;"
+
 # A TEXT BLOB OBEYS THE SAME LAW, IN BOTH DIRECTIONS - and its charset
 # rides in a DIFFERENT FIELD (scale, not sub_type), which is why the
 # input side had no rule at all: the text resolver never sees it.
@@ -344,6 +391,6 @@ cell "a NOT NULL column"             "SELECT 1 FROM T WHERE ? = NN;"
 
 kill $srv 2>/dev/null; wait $srv 2>/dev/null; trap - EXIT
 rm -f "$WORK" "$REF"
-[ "$ran" -ge 192 ] || { echo "FAIL only $ran checks ran (expected >= 192)"; fail=1; }
+[ "$ran" -ge 204 ] || { echo "FAIL only $ran checks ran (expected >= 204)"; fail=1; }
 [ $fail = 0 ] && echo "PASS bindcs ($ran checks)" || echo "FAIL bindcs"
 exit $fail
