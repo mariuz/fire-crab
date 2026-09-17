@@ -47,6 +47,15 @@ alter table t add b blob sub_type text character set utf8;
 commit;
 update t set b = u;
 commit;
+-- a NONE (byte-carrier) COLUMN, for the MIRROR direction: the carrier is
+-- the COLUMN and the literal is REAL. Added by ALTER rather than widening
+-- the column-less `insert ... values` list above - and it must exist, or
+-- every cell naming it errors on BOTH servers and sig()'s REFUSE would
+-- compare equal to REFUSE and score a vacuous OK.
+alter table t add nn varchar(20) character set none;
+commit;
+update t set nn = u;
+commit;
 SQL
 if grep -qi error /tmp/nonecmp-build.log; then echo "FAIL building the fixture:"; sed 's/^/     /' /tmp/nonecmp-build.log; exit 1; fi
 cp "$ENG" "$FC"; chmod 666 "$FC"
@@ -95,6 +104,23 @@ mal() { local ch=""; [ -n "${3:-}" ] && ch="-ch $3"
     if printf 'set list on;\n%s\n' "$2" \
         | "$ISQL" -q $ch -user "$U" -pas "$P" "$1" 2>&1 | grep -aqi 'malformed string'
     then echo MALFORMED; else echo OTHER; fi; }
+# A RECORDED DIVERGENCE, self-expiring: the two servers must still
+# DISAGREE. It fails if they start AGREEING - which is the signal to
+# promote the cell back to `agree` - and it fails if either side does not
+# answer, so two REFUSEs can never be scored as a difference (sig()
+# collapses every error to that one word).
+differs() { # <label> <sql> [client-charset]
+    local e f
+    e=$(sig "127.0.0.1/3050:$ENG" x "$2" "${3:-}"); f=$(sig "127.0.0.1/$PORT:$FC" x "$2" "${3:-}")
+    if [ "$e" = REFUSE ] || [ "$f" = REFUSE ] || [ -z "$e" ] || [ -z "$f" ]; then
+        echo "FAIL $1 [VACUOUS: a side did not answer] eng=[$e] fc=[$f]"; fail=1
+    elif [ "$e" != "$f" ]; then
+        echo "OK   recorded divergence: $1 eng=[$e] fc=[$f]"
+    else
+        echo "FAIL $1 NOW AGREES [$e] - the mirror is fixed; promote this cell to agree"; fail=1
+    fi
+}
+
 malformed() { # <label> <sql> - BOTH servers must raise 22000 Malformed string
     local e f
     e=$(mal "127.0.0.1/3050:$ENG" "$2"); f=$(mal "127.0.0.1/$PORT:$FC" "$2")
@@ -130,6 +156,25 @@ agree "u||'' LIKE '%é%'"      "select count(*) n from t where u||'' like '%é%'
 agree "UPPER(u) LIKE '%É%'"   "select count(*) n from t where upper(u) like '%É%';"
 malformed "u||'' LIKE 'é%'"   "select count(*) n from t where u||'' like 'é%';"
 agree "CAST(u) LIKE '%é%' ctl" "select count(*) n from t where cast(u as varchar(20)) like '%é%';"
+echo "-- THE MIRROR: the CARRIER is the COLUMN and the literal is REAL --"
+echo "--  (a real attachment; the engine still compares in byte space) --"
+differs "POSITION('é' IN nn) @UTF8"      "select position('é' in nn) n from t where id=1;" UTF8
+differs "POSITION(nn IN 'xcafé') @UTF8"  "select position(nn in 'xcafé') n from t where id=1;" UTF8
+differs "REPLACE(nn,'é','e') @UTF8"      "select octet_length(replace(nn,'é','e')) n from t where id=1;" UTF8
+differs "TRIM(TRAILING 'é' FROM nn)@UTF8" "select octet_length(trim(trailing 'é' from nn)) n from t where id=1;" UTF8
+differs "nn CONTAINING 'é' @UTF8"        "select count(*) n from t where nn containing 'é';" UTF8
+agree "nn LIKE '%é%' @UTF8"            "select count(*) n from t where nn like '%é%';" UTF8
+echo "--  an OCTETS operand is the same carrier case --"
+differs "POSITION('é' IN octets) @UTF8"  "select position('é' in cast(u as varchar(20) character set octets)) n from t where id=1;" UTF8
+differs "octets CONTAINING 'é' @UTF8"    "select count(*) n from t where cast(u as varchar(20) character set octets) containing 'é';" UTF8
+differs "REPLACE(octets,'é','e') @UTF8"  "select octet_length(replace(cast(u as varchar(20) character set octets),'é','e')) n from t where id=1;" UTF8
+differs "POSITION('é' IN padded) @UTF8"  "select position('é' in cast(u as char(8) character set octets)) n from t where id=1;" UTF8
+echo "--  controls: BOTH-carrier and BOTH-real need no reconciliation --"
+agree "POSITION('é' IN nn) @NONE"      "select position('é' in nn) n from t where id=1;"
+agree "nn CONTAINING 'é' @NONE"        "select count(*) n from t where nn containing 'é';"
+agree "POSITION('é' IN u) @UTF8 ctl"   "select position('é' in u) n from t where id=1;" UTF8
+agree "POSITION('f' IN nn) ascii ctl"  "select position('f' in nn) n from t where id=1;" UTF8
+agree "TRIM(TRAILING 'é' FROM padded)" "select octet_length(trim(trailing 'é' from cast(u as char(8) character set octets))) n from t where id=1;" UTF8
 echo "-- a TEXT BLOB is the same law by a DIFFERENT route: col_kind is None --"
 echo "--  for a blob, so the literal fast path never sees it --"
 agree "b CONTAINING 'é'"              "select count(*) n from t where b containing 'é';"
