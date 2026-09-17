@@ -135,5 +135,28 @@ bothp "param ESCAPE"        "S SIMILAR TO ? ESCAPE '#'" '["a#%c"]'
 bothp "param no match"      "S SIMILAR TO ?" '["zzz"]'
 bothp "param + AND"         "ID > 1 AND S SIMILAR TO ?" '["a%c"]'
 
+# A MALFORMED PATTERN RAISES WHEN SOMETHING REACHES IT - it does not
+# refuse the statement. This gate drove only VALID patterns, so the
+# divergence sat here unmeasured: fire-crab refused a bad bound pattern
+# at prepare and reported a generic *Dynamic SQL Error*, where the
+# engine raises its own *Invalid SIMILAR TO pattern* at execute.
+#
+# WHERE it raises depends on what the tested side is, and both halves
+# are measured:
+#   * over a COLUMN the term reads a row, so it raises only when a row
+#     reaches it - EITHER FALSE order answers no rows;
+#   * over a bound VALUE the term is row-independent and joins the
+#     invariant pass, which evaluates in WRITTEN ORDER, so only a FALSE
+#     written BEFORE it suppresses the raise (pinned in paramshapes).
+bothp "a malformed bound pattern raises"  "S SIMILAR TO ?" '["["]'
+bothp "...a FALSE before it: no raise"    "1 = 0 AND S SIMILAR TO ?" '["["]'
+bothp "...a FALSE after it: no raise too" "S SIMILAR TO ? AND 1 = 0" '["["]'
+bothp "...and a NULL bind never raises"   "S SIMILAR TO ?" '[null]'
+both  "a malformed LITERAL pattern raises when a row reaches it" \
+      "1 = 1 AND S SIMILAR TO '['"
+both  "...and answers when no row does"   "1 = 0 AND S SIMILAR TO '['"
+both  "...either order, since the term reads a row" \
+      "S SIMILAR TO '[' AND 1 = 0"
+
 echo "ran $ran checks"
 exit $fail

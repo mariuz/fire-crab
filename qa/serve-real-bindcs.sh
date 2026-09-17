@@ -242,6 +242,12 @@ cell "...and so does a bound prefix"  "SELECT 1 FROM RDB\$DATABASE WHERE ? START
 # binaries - they are here to pin the boundary the fix must not cross.
 cell "a NULL pattern stays flat"      "SELECT 1 FROM RDB\$DATABASE WHERE ? LIKE NULL;"
 cell "a NULL prefix stays flat"       "SELECT 1 FROM RDB\$DATABASE WHERE ? STARTING WITH NULL;"
+# SIMILAR TO completes the tested-side pattern family, and takes the
+# same three slot shapes as LIKE and STARTING WITH
+cell "a SIMILAR pattern scales"       "SELECT 1 FROM RDB\$DATABASE WHERE ? SIMILAR TO 'a%';"
+cell "...at its own width"            "SELECT 1 FROM RDB\$DATABASE WHERE ? SIMILAR TO 'abcd%';"
+cell "a bound SIMILAR pattern"        "SELECT 1 FROM RDB\$DATABASE WHERE ? SIMILAR TO ?;"
+cell "a NULL SIMILAR pattern is flat" "SELECT 1 FROM RDB\$DATABASE WHERE ? SIMILAR TO NULL;"
 
 # A NUMERIC COLUMN'S PATTERN SLOT IS SYNTHESIZED, AND IT SCALES TOO.
 # `I LIKE ?` over an INTEGER column describes a fixed THIRTY CHARACTERS
@@ -338,6 +344,6 @@ cell "a NOT NULL column"             "SELECT 1 FROM T WHERE ? = NN;"
 
 kill $srv 2>/dev/null; wait $srv 2>/dev/null; trap - EXIT
 rm -f "$WORK" "$REF"
-[ "$ran" -ge 180 ] || { echo "FAIL only $ran checks ran (expected >= 180)"; fail=1; }
+[ "$ran" -ge 192 ] || { echo "FAIL only $ran checks ran (expected >= 192)"; fail=1; }
 [ $fail = 0 ] && echo "PASS bindcs ($ran checks)" || echo "FAIL bindcs"
 exit $fail

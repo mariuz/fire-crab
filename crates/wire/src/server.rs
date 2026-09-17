@@ -11353,6 +11353,17 @@ enum Term {
     /// answers [] where 'abc' raises - the latter is row-independent,
     /// so the invariant pass raises it even over an empty table.
     BadExprLike(Box<Expr>, String),
+    /// A SIMILAR TO whose pattern does not compile, deferred to the
+    /// INVARIANT PASS instead of failing the bind.
+    ///
+    /// Returning an `Err` out of [Predicate::bind] was wrong twice
+    /// over: it reached the client as a generic *Dynamic SQL Error*
+    /// rather than the engine's own vector, and it fired OUTSIDE the
+    /// invariant pass, so a FALSE conjunct written before it could not
+    /// suppress it - the engine answers no rows for `1 = 0 AND <col>
+    /// SIMILAR TO '['` and raises for `... AND 1 = 0` (measured, both
+    /// orders). As a TERM it obeys the written order for free.
+    BadSimilar(Box<Expr>),
     /// `<col> [NOT] STARTING [WITH] <prefix>`: per-BYTE prefix on the
     /// STORED value - CHAR padding counts on BOTH sides, no trimming
     /// (probed: CHAR(5) 'ab' matches prefixes 'ab ' and 'ab   ' but not
@@ -11416,6 +11427,20 @@ enum Term {
     /// `? [NOT] STARTING [WITH] <prefix>` - per-byte, no trimming
     /// (probed: a bound ' 1' prefixes nothing that '1' does).
     ParamStarting(usize, Rhs, bool),
+    /// `? [NOT] SIMILAR TO <pattern> [ESCAPE c]` - the bound value
+    /// against a literal or second-parameter regex; becomes Const at
+    /// bind. NULL on either side is UNKNOWN under both polarities.
+    ///
+    /// **An INVALID pattern RAISES whenever the tested value is
+    /// non-NULL** - measured: bare, with a TRUE conjunct before it, with
+    /// a FALSE conjunct AFTER it, and over a zero-row table; only a
+    /// FALSE written BEFORE it suppresses the raise (the written-order
+    /// invariant law), and only a NULL value gates it off. This is NOT
+    /// LIKE's rule: an invalid ESCAPE is gated by the LENIENT PREFIX, so
+    /// `? LIKE 'a!' ESCAPE '!'` bound 'x' ANSWERS where this raises -
+    /// which is why [lenient_like_prefix] and `BadExprLike` have no twin
+    /// here.
+    ParamSimilarLhs(usize, Rhs, Option<char>, bool),
     /// `<integer column> [NOT] STARTING WITH ?` - the column rendered
     /// to its decimal text against the BOUND prefix (probed: '1'
     /// matches N=1 and N=10, '' matches every non-NULL N, a blr_long 1
@@ -11982,11 +12007,10 @@ impl Predicate {
                     Term::ParamSimilar(fid, idx, escape, negated) => {
                         match bind_rhs(idx, &ColKind::Text)? {
                             None => Term::Unknown,
-                            Some(Rhs::Str(p)) => {
-                                let re = sim_compile(&p, *escape)
-                                    .ok_or_else(|| "invalid SIMILAR TO pattern".to_string())?;
-                                Term::Similar(*fid, re, *negated)
-                            }
+                            Some(Rhs::Str(p)) => match sim_compile(&p, *escape) {
+                                Some(re) => Term::Similar(*fid, re, *negated),
+                                None => Term::BadSimilar(Box::new(Expr::Col(*fid))),
+                            },
                             Some(_) => Term::Unknown,
                         }
                     }
@@ -12007,6 +12031,36 @@ impl Predicate {
                             WireParam::Null
                         ) != *negated,
                     ),
+                    Term::ParamSimilarLhs(slot, pattern, escape, negated) => {
+                        let fetch = |s: usize| -> Result<Option<String>, String> {
+                            match args.get(s).ok_or("missing parameter value")? {
+                                WireParam::Null => Ok(None),
+                                WireParam::Text(t) | WireParam::TextCs(t, _) => Ok(Some(t.clone())),
+                                WireParam::Int(v, 0) => Ok(Some(v.to_string())),
+                                _ => Err("parameter type does not match its column"
+                                    .to_string()),
+                            }
+                        };
+                        // a NULL on EITHER side is UNKNOWN both ways, and
+                        // a NULL VALUE gates the pattern check off - the
+                        // invalid pattern below raises only for a real one
+                        let Some(val) = fetch(*slot)? else {
+                            terms.push(Term::Never);
+                            continue;
+                        };
+                        let pat = match pattern {
+                            Rhs::Str(p) => Some(p.clone()),
+                            Rhs::Param(pslot, _) => fetch(*pslot)?,
+                            _ => None,
+                        };
+                        match pat {
+                            None => Term::Never,
+                            Some(p) => match sim_compile(&p, *escape) {
+                                Some(re) => Term::Const(sim_match(&re, &val) != *negated),
+                                None => Term::BadSimilar(Box::new(Expr::Str(val))),
+                            },
+                        }
+                    }
                     Term::ParamLike(slot, pattern, escape, negated) => {
                         // the tested value: text as-is, an integer
                         // rendered to its decimal text (the engine
@@ -12513,6 +12567,17 @@ fn term_row_independent(t: &Term) -> bool {
         Term::ExprLike(e, ..) | Term::ExprStarting(e, ..) | Term::BadExprLike(e, ..) => {
             !expr_has_col(e)
         }
+        // A BAD SIMILAR PATTERN IS INVARIANT WHEN ITS VALUE IS, and that
+        // one line gives both measured behaviours. Over a BOUND tested
+        // value the expression is a literal, so the conjunct joins the
+        // invariant pass and raises in WRITTEN ORDER - only a FALSE
+        // before it suppresses the raise. Over a COLUMN it reads a row,
+        // so it stays in the per-row walk and raises only when a row
+        // reaches it, which is why either FALSE order answers no rows
+        // there. Without this arm the term fell to `_ => false`, the
+        // conjunct was skipped by the pass entirely, and a FALSE written
+        // AFTER the bad pattern silently won.
+        Term::BadSimilar(e) => !expr_has_col(e),
         _ => false,
     }
 }
@@ -13090,6 +13155,12 @@ impl Term {
                 }
                 _ => None,
             },
+            // ...and unlike the bad escape above, NO prefix gate: any
+            // non-NULL value raises
+            Term::BadSimilar(e) => match e.eval(values)? {
+                Value::Null => None,
+                _ => return Err(EvalErr::InvalidSimilar),
+            },
             Term::BadExprLike(e, prefix) => match e.eval(values)? {
                 Value::Null => None,
                 v => {
@@ -13148,6 +13219,7 @@ impl Term {
             | Term::ParamStarting(..)
             | Term::ExprStartingParam(..)
             | Term::ParamSimilar(..)
+            | Term::ParamSimilarLhs(..)
             | Term::ExprContainingParam(..)
             | Term::ExprLikeParam(..) => None,
         })
@@ -37546,6 +37618,7 @@ fn filter_has_params(filter: &Option<Predicate>) -> bool {
                     | Term::ParamStarting(..)
                     | Term::ExprStartingParam(..)
                     | Term::ParamSimilar(..)
+                    | Term::ParamSimilarLhs(..)
                     | Term::ExprContainingParam(..)
                     | Term::ExprLikeParam(..)
             )
@@ -57978,6 +58051,13 @@ const GDS_TRUNC_LIMITS: i32 = 335545033;
 /// impl/msg/jrd.h:383): the pattern compiler's refusal of an escape
 /// character that does not precede `%`, `_` or itself.
 const GDS_ESCAPE_INVALID: i32 = 335544702;
+/// `isc_invalid_similar_pattern` - "Invalid SIMILAR TO pattern"
+/// (SQLSTATE 42000, msg/jrd.h:565, JRD message 564). Derived, not
+/// guessed: every JRD code here is `335544320 + <message number>`,
+/// cross-checked on arith_except (1 -> 335544321), escape_invalid
+/// (382 -> 335544702), string_truncation (594 -> 335544914) and
+/// trunc_limits (713 -> 335545033).
+const GDS_INVALID_SIMILAR: i32 = 335544884;
 
 /// The 23000 constraint-violation family, codes confirmed against
 /// `impl/msg/jrd.h` (code = 335544320 + msg#) and captured raw from
@@ -58415,6 +58495,10 @@ fn eval_status_items(w: &mut W, e: &EvalErr) {
         EvalErr::InvalidEscape => {
             w.int(1) // isc_arg_gds
                 .int(GDS_ESCAPE_INVALID);
+        }
+        EvalErr::InvalidSimilar => {
+            w.int(1) // isc_arg_gds
+                .int(GDS_INVALID_SIMILAR);
         }
         EvalErr::ArrayOutOfBounds { n, lo, hi } => {
             w.int(1).int(335545028); // isc_ss_out_of_bounds
@@ -67173,6 +67257,13 @@ enum EvalErr {
     /// (SQLSTATE 22025, jrd/evl_string.h:349). Raised at first real
     /// evaluation, value-gated (see [invalid_escape])
     InvalidEscape,
+    /// a SIMILAR TO pattern the compiler rejects: `isc_invalid_similar_pattern`,
+    /// "Invalid SIMILAR TO pattern" (SQLSTATE 42000). Raised at first
+    /// real evaluation and VALUE-gated like [InvalidEscape] - but NOT
+    /// prefix-gated: ANY non-NULL value raises, where a bad LIKE escape
+    /// only raises for a value matching the lenient prefix (measured
+    /// both ways).
+    InvalidSimilar,
     /// an array subscript outside the declared bounds: isc_ss_out_of_bounds
     /// (-406, "Subscript @1 out of bounds [@2, @3]")
     ArrayOutOfBounds { n: i64, lo: i64, hi: i64 },
@@ -80801,6 +80892,46 @@ fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
                         kind: RawKind::Starting(prefix, negated),
                     }));
                 }
+                // `? [NOT] SIMILAR TO <pattern> [ESCAPE 'c']` - the last
+                // of the tested-side pattern family, read exactly as the
+                // ordinary parser reads it: `SIMILAR` then `TO` by Ident
+                // text, so a column named SIMILAR still parses
+                // everywhere else. The `NOT` above already knows the
+                // word; without THIS arm the whole shape never became a
+                // param-lhs term at all, and the statement refused - the
+                // resolver's arm and the bind-time term were both
+                // unreachable, which is the trap one layer earlier than
+                // a blanket refusal inside a resolver.
+                Some(Tok::Ident(w)) if w.eq_ignore_ascii_case("SIMILAR") => {
+                    let mut p4 = p3 + 1;
+                    if !matches!(t.get(p4), Some(Tok::Ident(w2)) if w2.eq_ignore_ascii_case("TO")) {
+                        return None; // a bare `SIMILAR` is a column
+                    }
+                    p4 += 1;
+                    let pattern = parse_value(t, &mut p4, &mut np2)?;
+                    if matches!(pattern, Rhs::Int(_) | Rhs::Num(..)) {
+                        return None; // a numeric SIMILAR pattern is not answered
+                    }
+                    let escape = if matches!(t.get(p4), Some(Tok::Escape)) {
+                        p4 += 1;
+                        let Some(Tok::Str(e)) = t.get(p4) else { return None };
+                        let mut chars = e.chars();
+                        let c = chars.next()?;
+                        if chars.next().is_some() {
+                            return None; // ESCAPE must be a single character
+                        }
+                        p4 += 1;
+                        Some(c)
+                    } else {
+                        None
+                    };
+                    *pos = p4;
+                    *np = np2;
+                    return Some(Ast::Leaf(RawTerm {
+                        lhs: RawLhs::Param(slot),
+                        kind: RawKind::Similar(pattern, escape, negated),
+                    }));
+                }
                 // `? [NOT] BETWEEN <lo> AND <hi>` desugars into the
                 // MIRRORED comparison leaves this parser already
                 // answers - `lo <= ?` AND `hi >= ?` - both referencing
@@ -88981,13 +89112,16 @@ fn typed_term(idx: usize, kind: ColKind, raw: RawKind) -> Option<Term> {
             _ => return None,
         },
         RawKind::Similar(pattern, escape, negated) => match (kind, pattern) {
-            // a text column against a LITERAL pattern: compile it once
-            // (a malformed pattern refuses at prepare, where the engine
-            // raises). A parameter pattern or a non-text operand is a
-            // later slice.
+            // a text column against a LITERAL pattern: compile it once.
+            // A MALFORMED one does NOT refuse at prepare - measured, the
+            // engine raises only when a ROW REACHES it (`1 = 1 AND <col>
+            // SIMILAR TO '['` raises, while `1 = 0 AND ...` and `...
+            // AND 1 = 0` both answer no rows), so it becomes the
+            // row-gated [Term::BadSimilar] like a bound one. A parameter
+            // pattern or a non-text operand is a later slice.
             (ColKind::Text, Rhs::Str(p)) => match sim_compile(&p, escape) {
                 Some(re) => Term::Similar(idx, re, negated),
-                None => return None,
+                None => Term::BadSimilar(Box::new(Expr::Col(idx))),
             },
             (_, Rhs::Null) => Term::Unknown,
             _ => return None,
@@ -89240,6 +89374,36 @@ fn resolve_param_lhs(
                     claim(slot, lit_pat_desc(param_pat_chars));
                     claim(*pslot, lit_pat_desc(param_pat_chars));
                     Term::ParamStarting(slot, Rhs::Param(*pslot, ColKind::Text), *negated)
+                }
+                Rhs::Null => {
+                    claim(slot, text_desc_chars(1));
+                    Term::Never
+                }
+                _ => return None,
+            }
+        }
+        // `? [NOT] SIMILAR TO <pattern> [ESCAPE c]` - the same three
+        // branches as STARTING above, and the same slot law: a literal
+        // pattern's CHARACTER count in the attachment's charset and NOT
+        // NULL (measured 2/8/2 and 5/20/5 under NONE/UTF8/WIN1252), a
+        // parameter pattern the fixed 30 on both slots, a NULL pattern
+        // the flat nullable VARYING(1). The regex itself is compiled at
+        // BIND, where an invalid one raises - see [Term::ParamSimilarLhs].
+        RawKind::Similar(pattern, escape, negated) => {
+            match pattern {
+                Rhs::Str(p) => {
+                    claim(slot, lit_pat_desc(p.chars().count()));
+                    Term::ParamSimilarLhs(slot, pattern.clone(), *escape, *negated)
+                }
+                Rhs::Param(pslot, _) => {
+                    claim(slot, lit_pat_desc(param_pat_chars));
+                    claim(*pslot, lit_pat_desc(param_pat_chars));
+                    Term::ParamSimilarLhs(
+                        slot,
+                        Rhs::Param(*pslot, ColKind::Text),
+                        *escape,
+                        *negated,
+                    )
                 }
                 Rhs::Null => {
                     claim(slot, text_desc_chars(1));
@@ -89624,7 +89788,10 @@ fn resolve_expr_term(
             };
             match sim_compile(p, *escape) {
                 Some(re) => Term::ExprSimilar(Box::new(lhs), re, *negated),
-                None => return None,
+                // ...and a malformed one raises WHEN A ROW REACHES IT,
+                // rather than refusing the statement - the expression
+                // twin of the column arm in [typed_term]
+                None => Term::BadSimilar(Box::new(lhs)),
             }
         }
         RawKind::Similar(..) => return None, // NULL or parameter pattern

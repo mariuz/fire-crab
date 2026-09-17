@@ -194,6 +194,51 @@ both "N NOT CONTAINING ?" "N NOT CONTAINING ?" '["1"]'
 both "N92 CONTAINING ? sees the fraction" "N92 CONTAINING ?" '["1.5"]'
 both "N92 CONTAINING ? sees the point" "N92 CONTAINING ?" '["."]'
 
+# --- 3c. ? SIMILAR TO: the tested side of the regex matcher -----------
+#
+# The last of the tested-side pattern family. The slot takes the same
+# shape LIKE and STARTING WITH take; the regex is compiled at BIND.
+both "? SIMILAR TO literal" "? SIMILAR TO 'o%'" '["ok"]'
+both "? SIMILAR TO literal, no match" "? SIMILAR TO 'o%'" '["x"]'
+both "? SIMILAR TO with a NULL bind" "? SIMILAR TO 'o%'" '[null]'
+both "? NOT SIMILAR TO" "? NOT SIMILAR TO 'o%'" '["x"]'
+both "? NOT SIMILAR TO with a NULL bind" "? NOT SIMILAR TO 'o%'" '[null]'
+both "? SIMILAR TO ? (both parameters)" "? SIMILAR TO ?" '["ok","o%"]'
+both "a character class" "? SIMILAR TO '[[:ALPHA:]]+'" '["ok"]'
+both "a character class rejects a digit" "? SIMILAR TO '[[:ALPHA:]]+'" '["o1"]'
+both "? SIMILAR TO with ESCAPE" "? SIMILAR TO 'o!%%' ESCAPE '!'" '["o%mitted"]'
+both "an INTEGER bind renders" "? SIMILAR TO '1%'" '[10]'
+both "an empty pattern matches empty" "? SIMILAR TO ''" '[""]'
+both "? SIMILAR TO NULL is never true" "? SIMILAR TO NULL" '["x"]'
+
+# AN INVALID PATTERN RAISES AT EXECUTE - and NOT the way an invalid LIKE
+# escape does. LIKE's is gated by its LENIENT PREFIX, so `? LIKE 'a!'
+# ESCAPE '!'` bound 'x' ANSWERS; SIMILAR TO's raises for ANY non-NULL
+# value. Only a FALSE written BEFORE it suppresses the raise (the
+# written-order invariant law of 8c), and a FALSE written AFTER does
+# not. All measured against the engine.
+for pair in "? SIMILAR TO '['|[\"x\"]" \
+            "? IS NOT NULL AND ? SIMILAR TO '['|[5,\"x\"]" \
+            "? SIMILAR TO '[' AND ? IS NULL|[\"x\",5]" \
+            "? SIMILAR TO '[' AND 1 = 0|[\"x\"]"; do
+    pred="${pair%%|*}"; args="${pair##*|}"
+    a=$(query "SELECT ID FROM T WHERE $pred ORDER BY ID" "$args" "$PORT" "$A")
+    b=$(query "SELECT ID FROM T WHERE $pred ORDER BY ID" "$args" "$REAL" "$B")
+    # BOTH must raise - and `ERR*:ERR*` alone CANNOT SAY THAT. A
+    # prepare-time REFUSAL is also an ERR, so these four cells passed
+    # while the shape was not implemented at all: every one of them
+    # compared "fire-crab refuses" against "the engine raises" and
+    # called it agreement. The engine's message names the predicate, so
+    # require that of both sides.
+    case "$a:$b" in
+        *SIMILAR*:*SIMILAR*) echo "OK   $pred $args raises on BOTH (invalid SIMILAR pattern)" ;;
+        ERR*:ERR*) echo "DIFF $pred $args: both ERR but not both a SIMILAR raise - fcwire [$a] engine [$b]"; fail=1 ;;
+        *) echo "DIFF $pred $args: fcwire [$a] engine [$b]"; fail=1 ;;
+    esac
+done
+both "a FALSE written BEFORE suppresses the raise" "? IS NULL AND ? SIMILAR TO '['" '[5,"x"]'
+both "a NULL value gates the bad pattern off" "? SIMILAR TO '['" '[null]'
+
 # --- 4. ? BETWEEN: a desugar into the mirrored comparisons ------------
 both "? BETWEEN ints" "? BETWEEN 1 AND 3" '[2]'
 both "? BETWEEN ints" "? BETWEEN 1 AND 3" '[5]'
