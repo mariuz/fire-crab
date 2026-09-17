@@ -11378,6 +11378,19 @@ enum Term {
     /// SIMILAR TO '['` and raises for `... AND 1 = 0` (measured, both
     /// orders). As a TERM it obeys the written order for free.
     BadSimilar(Box<Expr>),
+    /// A positive LIKE whose BYTE-CARRIER pattern, reinterpreted into the
+    /// tested side's real charset, leaves a leading literal segment
+    /// ending in a MULTI-BYTE character: the engine raises 22000
+    /// *Malformed string* ([carrier_like_raises] holds the measured
+    /// predicate). Shaped on [Term::BadSimilar] because the behaviour is
+    /// identical - the raise is VALUE-INDEPENDENT (every non-NULL row
+    /// reaching it raises, whatever it holds), a NULL is UNKNOWN with no
+    /// raise, and it stays a TERM so a FALSE conjunct written before it
+    /// suppresses the raise in written order (measured: `1 = 0 AND <col>
+    /// LIKE 'é%'`, `... AND 1 = 0`, an empty table and an OR-guard all
+    /// answer with no raise). A NEGATED LIKE and a BOUND pattern never
+    /// raise and never land here.
+    MalformedLike(Box<Expr>),
     /// `<col> [NOT] STARTING [WITH] <prefix>`: per-BYTE prefix on the
     /// STORED value - CHAR padding counts on BOTH sides, no trimming
     /// (probed: CHAR(5) 'ab' matches prefixes 'ab ' and 'ab   ' but not
@@ -12592,6 +12605,11 @@ fn term_row_independent(t: &Term) -> bool {
         // conjunct was skipped by the pass entirely, and a FALSE written
         // AFTER the bad pattern silently won.
         Term::BadSimilar(e) => !expr_has_col(e),
+        // and the malformed carrier LIKE, for the same reason: invariant
+        // exactly when its tested value is, so a COLUMN keeps it in the
+        // per-row walk (where `1 = 0 AND ...` and an empty table answer
+        // with no raise, both measured)
+        Term::MalformedLike(e) => !expr_has_col(e),
         _ => false,
     }
 }
@@ -13171,6 +13189,12 @@ impl Term {
             },
             // ...and unlike the bad escape above, NO prefix gate: any
             // non-NULL value raises
+            // the same no-prefix-gate shape as BadSimilar below: any
+            // non-NULL value raises, a NULL is UNKNOWN
+            Term::MalformedLike(e) => match e.eval(values)? {
+                Value::Null => None,
+                _ => return Err(EvalErr::MalformedString),
+            },
             Term::BadSimilar(e) => match e.eval(values)? {
                 Value::Null => None,
                 _ => return Err(EvalErr::InvalidSimilar),
@@ -13257,6 +13281,85 @@ impl Term {
 /// `a%bc`, `'ab%!c'` -> `ab`, `'_b!c'` and `'%a!b'` -> `` (every
 /// non-NULL row reached). The comparison is the same per-byte,
 /// case-sensitive, pad-including starts_with the STARTING term uses.
+/// Does a REINTERPRETED carrier LIKE pattern RAISE instead of matching?
+///
+/// Measured against the live engine: a byte-carrier literal meeting a
+/// REAL-charset operand raises 22000 *Malformed string* exactly when the
+/// pattern's LEADING LITERAL SEGMENT - the run before the first
+/// UNESCAPED wildcard - both EXISTS (a wildcard terminated it) and ENDS
+/// IN A MULTI-BYTE character. Every one of 33 probed cells follows:
+///
+/// - raise: `'é%'`, `'café%'`, `'é_'`, `'é_%'`, `'漢%'`, `'漢字%'`,
+///   `'漢_%'` - the segment ends `é` / `漢`
+/// - answer: `'éx%'`, `'漢字t%'`, `'caf%'`, `'c%é%'` (segment ends
+///   ASCII), `'%é%'`, `'%é'`, `'_é'`, `'%café%'`, `'%%é%'`, `'%é%é%'`
+///   (the wildcard comes FIRST, so the segment is empty), and
+///   `'café'`, `'é'`, `'漢字table'`, `'éclair'` (NO wildcard at all -
+///   the whole pattern converts as one piece and validates)
+///
+/// The no-wildcard case is why this cannot reuse [lenient_like_prefix]
+/// directly: that returns the whole pattern when nothing terminates it,
+/// and `LIKE 'café'` ANSWERS. Column byte width does NOT enter into it
+/// (measured identical over VARCHAR(20)/(5)/(4) and CHAR(5), against
+/// the deferral note's guess), and neither `NOT LIKE` nor a BOUND
+/// pattern ever raises - both measured, and both excluded by the
+/// callers.
+/// The byte-space reinterpretation for an EXPRESSION-side LIKE - the
+/// twin of [adopt_carrier_literal]'s literal path, for tested sides that
+/// carry no column descriptor. Answers the term to use, or `None` to
+/// leave the existing path untouched.
+///
+/// Measured: `V || '' LIKE '%é%'` and `UPPER(V) LIKE '%É%'` both match on
+/// the engine and found NOTHING here, and `V || '' LIKE 'é%'` RAISES - so
+/// the expression path needs both halves exactly as the column path does.
+/// A `CAST(V AS VARCHAR(n))` operand already agreed before this slice
+/// (the cast's own descriptor makes both sides real) and is the control.
+fn carrier_expr_like(
+    lhs: &Expr,
+    descs: &[Descriptor],
+    pattern: &str,
+    escape: Option<char>,
+    negated: bool,
+) -> Option<Term> {
+    use fire_crab_ods::intl;
+    let att = CURRENT_ATT_CS.with(|c| c.get());
+    if !intl::byte_carrier(att) {
+        return None;
+    }
+    let cs = cmp_text_charset(lhs, descs)?;
+    if intl::byte_carrier(cs) {
+        return None;
+    }
+    // the carrier's octets READ AS the operand's charset - the engine's
+    // byte space. Bytes that do not spell it stay a carrier string, which
+    // matches no real value (its "no match, no raise").
+    let p = transcode_text(att, cs, pattern.to_string()).ok()?;
+    if !negated && carrier_like_raises(&p, escape) {
+        return Some(Term::MalformedLike(Box::new(lhs.clone())));
+    }
+    Some(Term::ExprLike(Box::new(lhs.clone()), p, escape, negated))
+}
+
+fn carrier_like_raises(pattern: &str, escape: Option<char>) -> bool {
+    let mut seg = String::new();
+    let mut it = pattern.chars();
+    let mut terminated = false;
+    while let Some(c) = it.next() {
+        if Some(c) == escape {
+            match it.next() {
+                Some(n) => seg.push(n),
+                None => break,
+            }
+        } else if c == '%' || c == '_' {
+            terminated = true;
+            break;
+        } else {
+            seg.push(c);
+        }
+    }
+    terminated && seg.chars().next_back().is_some_and(|c| c.len_utf8() > 1)
+}
+
 fn lenient_like_prefix(pattern: &str, escape: Option<char>) -> String {
     let mut out = String::new();
     let mut it = pattern.chars();
@@ -90554,7 +90657,11 @@ fn resolve_expr_term(
                     *negated,
                 )
             } else {
-                Term::ExprLike(Box::new(lhs), p.clone(), *escape, *negated)
+                // a BYTE-CARRIER pattern against a REAL-charset expression
+                // reinterprets into that charset (and may raise) - the
+                // expression twin of [adopt_carrier_literal]
+                carrier_expr_like(&lhs, descs, p, *escape, *negated)
+                    .unwrap_or_else(|| Term::ExprLike(Box::new(lhs), p.clone(), *escape, *negated))
             }
         }
         // `<expression> LIKE ?` - the evaluated side rendered against
@@ -91701,6 +91808,15 @@ fn adopt_carrier_literal(raw: RawKind, d: &Descriptor) -> RawKind {
         RawKind::Starting(Rhs::Str(v), n) => RawKind::Starting(Rhs::Str(redo(v)), n),
         RawKind::Containing(Rhs::Str(v), n) => RawKind::Containing(Rhs::Str(redo(v)), n),
         RawKind::Similar(Rhs::Str(v), e, n) => RawKind::Similar(Rhs::Str(redo(v)), e, n),
+        // LIKE joins them: the pattern reinterprets exactly as the others
+        // do, and the engine then matches it as real-vs-real (measured:
+        // `<utf8> LIKE '%é%'`, `'%é'` and an exact `'café'` all match the
+        // accented row, where the carrier chars found nothing). The ONE
+        // extra rule is the raise its caller adds - a pattern whose
+        // leading literal segment ends multi-byte is 22000 rather than a
+        // match ([carrier_like_raises]); the reinterpretation itself is
+        // the same single step.
+        RawKind::Like(Rhs::Str(v), e, n) => RawKind::Like(Rhs::Str(redo(v)), e, n),
         other => other,
     }
 }
@@ -91713,6 +91829,25 @@ fn param_or_typed_term(
     params: &mut Vec<Option<Descriptor>>,
 ) -> Option<Term> {
     let raw = adopt_carrier_literal(raw, d);
+    // ...and the ONE extra rule LIKE carries over the other reinterpreted
+    // predicates: a pattern whose leading literal segment ends MULTI-BYTE
+    // is the engine's 22000 rather than a match ([carrier_like_raises]).
+    // Guarded by the same pair [adopt_carrier_literal] reads - a byte
+    // carrier attachment against a REAL column charset - so an ordinary
+    // real-attachment LIKE never raises, and only the POSITIVE form does
+    // (measured: `NOT LIKE` answers where LIKE raises).
+    if let RawKind::Like(Rhs::Str(p), escape, false) = &raw {
+        let att = CURRENT_ATT_CS.with(|c| c.get());
+        if d.sub_type >= 0 {
+            let col_cs = fire_crab_ods::intl::charset_id(d.sub_type as i16);
+            if fire_crab_ods::intl::byte_carrier(att)
+                && !fire_crab_ods::intl::byte_carrier(col_cs)
+                && carrier_like_raises(p, *escape)
+            {
+                return Some(Term::MalformedLike(Box::new(Expr::Col(idx))));
+            }
+        }
+    }
     // `<col> CONTAINING <p>` - the upper-cased substring test, and the
     // one predicate that folds case on EVERY character set. It comes
     // FIRST because it is answerable under a collation this server
@@ -103773,6 +103908,31 @@ mod tests {
         // 34 names no item: the writer omits it rather than answering
         let d = answer_prepare(&[4, 34, 8], &plan, &[], AttCs::NONE, false);
         assert_eq!(d, vec![4, 8, 8, 8, 1]);
+    }
+
+    #[test]
+    fn carrier_like_raise_predicate_matches_every_probed_cell() {
+        // RAISES - the leading literal segment EXISTS (a wildcard ended
+        // it) and ENDS in a multi-byte character. Every one measured
+        // against the live engine, over 2-byte and 3-byte characters and
+        // with the accented char both first and mid-value.
+        for p in ["é%", "café%", "é_", "é_%", "漢%", "漢字%", "漢_%"] {
+            assert!(carrier_like_raises(p, None), "should raise: {p}");
+        }
+        // ANSWERS - the segment ends ASCII, or a wildcard comes FIRST so
+        // the segment is empty, or there is no wildcard at all and the
+        // whole pattern converts as one piece
+        for p in [
+            "éx%", "漢字t%", "caf%", "c%é%", "%é%", "%é", "_é", "%café%", "%%é%", "%é%é%",
+            "café", "é", "漢字table", "éclair", "%", "cafe%",
+        ] {
+            assert!(!carrier_like_raises(p, None), "should answer: {p}");
+        }
+        // the helper's own contract for an ESCAPE: an ESCAPED wildcard is
+        // a literal character and does NOT terminate the segment, so what
+        // decides is the last character before the first REAL wildcard
+        assert!(!carrier_like_raises("é!%x", Some('!')));
+        assert!(carrier_like_raises("!%é%", Some('!')));
     }
 
     #[test]

@@ -80,6 +80,48 @@ agree "w = 'café' (win1252)" "select count(*) n from t where w='café';"
 echo "-- the no-raise inversion: bad bytes are 0 rows, never an error --"
 agree "u = x'636166FF'"     "select count(*) n from t where u=x'636166FF';"
 agree "u = x'FF'"           "select count(*) n from t where u=x'FF';"
+# A RAISE CELL NEEDS THE MESSAGE, NOT JUST "an error": sig() above maps
+# every failure to the single word REFUSE, so two DIFFERENT errors would
+# score as agreement - the same trap as counting `grep -ci error`.
+mal() { local ch=""; [ -n "${3:-}" ] && ch="-ch $3"
+    if printf 'set list on;\n%s\n' "$2" \
+        | "$ISQL" -q $ch -user "$U" -pas "$P" "$1" 2>&1 | grep -aqi 'malformed string'
+    then echo MALFORMED; else echo OTHER; fi; }
+malformed() { # <label> <sql> - BOTH servers must raise 22000 Malformed string
+    local e f
+    e=$(mal "127.0.0.1/3050:$ENG" "$2"); f=$(mal "127.0.0.1/$PORT:$FC" "$2")
+    if [ "$e" = MALFORMED ] && [ "$f" = MALFORMED ]; then
+        echo "OK   $1 [both 22000 Malformed string]"
+    else echo "FAIL $1"; echo "     eng=[$e] fc=[$f]"; fail=1; fi; }
+
+echo "-- LIKE joins the byte-space law: the pattern reinterprets too --"
+agree "u LIKE '%é%'"          "select count(*) n from t where u like '%é%';"
+agree "u LIKE '%é'"           "select count(*) n from t where u like '%é';"
+agree "u LIKE 'café' exact"   "select count(*) n from t where u like 'café';"
+agree "u LIKE '%café%'"       "select count(*) n from t where u like '%café%';"
+agree "u LIKE 'caf%' (ascii)" "select count(*) n from t where u like 'caf%';"
+agree "u LIKE 'c%é%'"         "select count(*) n from t where u like 'c%é%';"
+agree "u LIKE '%ñ%'"          "select count(*) n from t where u like '%ñ%';"
+agree "u LIKE '%ü%'"          "select count(*) n from t where u like '%ü%';"
+agree "u NOT LIKE '%é%'"      "select count(*) n from t where u not like '%é%';"
+agree "u NOT LIKE 'é%'"       "select count(*) n from t where u not like 'é%';"
+agree "w LIKE '%é%' win1252"  "select count(*) n from t where w like '%é%';"
+agree "ids where u LIKE '%é%'" "select id from t where u like '%é%' order by id;"
+echo "-- ...and a leading segment ending MULTI-BYTE is 22000, not a match --"
+malformed "u LIKE 'é%'"       "select count(*) n from t where u like 'é%';"
+malformed "u LIKE 'café%'"    "select count(*) n from t where u like 'café%';"
+malformed "u LIKE 'é_'"       "select count(*) n from t where u like 'é_';"
+malformed "u LIKE 'ñ%'"       "select count(*) n from t where u like 'ñ%';"
+agree "u LIKE 'éx%' ANSWERS"  "select count(*) n from t where u like 'éx%';"
+echo "-- the raise is PER ROW: a FALSE written before it suppresses it --"
+agree "1=0 AND u LIKE 'é%'"   "select count(*) n from t where 1=0 and u like 'é%';"
+agree "u LIKE 'é%' AND 1=0"   "select count(*) n from t where u like 'é%' and 1=0;"
+agree "1=1 OR u LIKE 'é%'"    "select count(*) n from t where 1=1 or u like 'é%';"
+echo "-- the EXPRESSION path takes the same law (no column descriptor) --"
+agree "u||'' LIKE '%é%'"      "select count(*) n from t where u||'' like '%é%';"
+agree "UPPER(u) LIKE '%É%'"   "select count(*) n from t where upper(u) like '%É%';"
+malformed "u||'' LIKE 'é%'"   "select count(*) n from t where u||'' like 'é%';"
+agree "CAST(u) LIKE '%é%' ctl" "select count(*) n from t where cast(u as varchar(20)) like '%é%';"
 echo "-- regression: real attachments must be unchanged --"
 agree "u='café' @UTF8"      "select count(*) n from t where u='café';" UTF8
 agree "u='abc' @UTF8"       "select count(*) n from t where u='abc';" UTF8
