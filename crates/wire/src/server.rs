@@ -9323,6 +9323,13 @@ enum Plan {
     ProcRows {
         cols: Vec<ProjCol>,
         rows: Vec<Vec<Value>>,
+        /// THE RAISE THAT FOLLOWS THEM, when the body suspended these
+        /// rows and then failed. The engine delivers what the body
+        /// produced and raises AFTER it - measured: `SELECT K FROM
+        /// PR_PURE` answers 1 and 2 and then the exception - so the rows
+        /// and the error travel together rather than the error replacing
+        /// them. `None` is an ordinary, complete result.
+        then: Option<EvalErr>,
     },
     /// `<select> UNION [ALL] <select> [...]` - each branch's rows are
     /// collected and concatenated, then de-duplicated unless ALL. The
@@ -42190,7 +42197,7 @@ impl BoundSrc {
     }
     fn into_plan(self, cols: &[ProjCol]) -> Plan {
         match self {
-            BoundSrc::Rows(rows) => Plan::ProcRows { cols: cols.to_vec(), rows },
+            BoundSrc::Rows(rows) => Plan::ProcRows { cols: cols.to_vec(), rows, then: None },
             BoundSrc::Inner(plan) => plan,
         }
     }
@@ -45852,6 +45859,25 @@ fn plan_has_procselect(plan: &Plan) -> bool {
     }
 }
 
+/// Does this plan end in a RAISE the client is owed AFTER its rows?
+///
+/// [Plan::ProcRows] carries one when a selectable body SUSPENDed rows and
+/// then failed. [branch_rows] cannot express that - it answers `Ok(rows)`
+/// or `Err(e)`, never both - so the fetch must not flatten such a plan
+/// into [Plan::Rows]: that delivered the rows and SWALLOWED the raise.
+/// Measured: `SELECT K FROM PR_PURE` answered 1 and 2 with no error,
+/// where the engine answers both rows and then raises. [emit_rows] serves
+/// the shape correctly, so the flattening is simply skipped for it.
+fn plan_has_trailing_raise(p: &Plan) -> bool {
+    match p {
+        Plan::ProcRows { then, .. } => then.is_some(),
+        Plan::Modified { inner, .. }
+        | Plan::Derived { inner, .. }
+        | Plan::Returning { inner, .. } => plan_has_trailing_raise(inner),
+        _ => false,
+    }
+}
+
 fn plan_has_procselect_src(src: &RowSource) -> bool {
     match src {
         RowSource::PlanRows(p) => plan_has_procselect(p),
@@ -45919,7 +45945,7 @@ fn materialise_procedures(
             match try_procedure_blr(database, &name, &args, false) {
                 BlrProcOutcome::Rows(suspended, _finals) => {
                     let rows = project(&suspended);
-                    *plan = Plan::ProcRows { cols, rows };
+                    *plan = Plan::ProcRows { cols, rows, then: None };
                     return Ok(true);
                 }
                 BlrProcOutcome::Runtime(e) => {
@@ -45930,10 +45956,23 @@ fn materialise_procedures(
                 BlrProcOutcome::Outside => {}
             }
         }
-        let (_, suspended) = run_procedure_capped(database, &name, &args, ctx, cap)?;
-        let rows = project(&suspended);
-        *plan = Plan::ProcRows { cols, rows };
-        return Ok(true);
+        return match run_procedure_capped(database, &name, &args, ctx, cap) {
+            Ok((_, suspended)) => {
+                let rows = project(&suspended);
+                *plan = Plan::ProcRows { cols, rows, then: None };
+                Ok(true)
+            }
+            // A BODY THAT RAISED AFTER SUSPENDING ROWS still owes the
+            // client those rows: they become the result, with the raise
+            // carried as the plan's trailing error so the fetch delivers
+            // them and THEN raises - the engine's own order.
+            Err(e) if e.status.is_some() && !e.rows.is_empty() => {
+                let rows = project(&e.rows);
+                *plan = Plan::ProcRows { cols, rows, then: e.status };
+                Ok(true)
+            }
+            Err(e) => Err(e),
+        };
     }
     match plan {
         // A LIMIT IS WHERE A CAP COMES FROM. `FIRST n` / `ROWS n` is a
@@ -46131,6 +46170,11 @@ fn plan_kind(p: &Plan) -> String {
         Plan::JoinGroup { .. } => "JoinGroup".to_string(),
         Plan::Project { .. } => "Project".to_string(),
         Plan::Refused => "Refused".to_string(),
+        Plan::ProcRows { rows, then, .. } => format!(
+            "ProcRows[{}{}]",
+            rows.len(),
+            if then.is_some() { ",raise" } else { "" }
+        ),
         _ => "other".to_string(),
     }
 }
@@ -59261,11 +59305,37 @@ fn emit_rows_inner(
                 for r in rows.iter().skip(*skip).take(take.unwrap_or(usize::MAX)) {
                     encode_row(w, cols, r, out)?;
                 }
+                // A TRAILING RAISE UNDER A MODIFIER STILL RAISES.
+                // [branch_rows_res] answers `Ok(rows)` for a ProcRows and
+                // has nowhere to put the error that follows them, so a
+                // `FIRST 3` over a body that suspends two rows and then
+                // fails would have delivered both rows and NO error -
+                // where the engine delivers both and raises. A limit that
+                // STOPS the body never gets here: it has no trailing
+                // raise, because the body never reached one.
+                if let Plan::ProcRows { then: Some(e), .. } = &**inner {
+                    return Err(EmitErr::Eval(e.clone()));
+                }
             }
         }
-        Plan::ProcRows { cols, rows } => {
+        Plan::ProcRows { cols, rows, then } => {
+            if trace_on() {
+                eprintln!(
+                    "[srv] emit ProcRows: {} row(s), then={}",
+                    rows.len(),
+                    then.is_some()
+                );
+            }
             for r in rows {
                 encode_row(w, cols, r, out)?;
+            }
+            // ...AND THEN THE RAISE. [EmitErr::Eval] is exactly the shape
+            // this wants, and its own doc says so: the good rows already
+            // encoded are followed by the engine's error op_response, in
+            // place of the terminator. Nothing new is needed on the wire -
+            // this is the same path a per-row arithmetic exception takes.
+            if let Some(e) = then {
+                return Err(EmitErr::Eval(e.clone()));
             }
         }
         Plan::Union { cols, branches, distinct, order_by } => {
@@ -82017,17 +82087,23 @@ struct Raised {
 struct ProcErr {
     text: String,
     status: Option<EvalErr>,
+    /// THE ROWS THE BODY ALREADY SUSPENDED before it failed. The engine
+    /// delivers them and raises after - measured: a body that suspends
+    /// two rows and then raises answers both rows followed by the
+    /// exception, where dropping them answered the exception alone.
+    /// Empty for every failure that produced no row.
+    rows: Vec<Vec<Value>>,
 }
 
 impl From<String> for ProcErr {
     fn from(text: String) -> ProcErr {
-        ProcErr { text, status: None }
+        ProcErr { text, status: None, rows: Vec::new() }
     }
 }
 
 impl From<&str> for ProcErr {
     fn from(text: &str) -> ProcErr {
-        ProcErr { text: text.to_string(), status: None }
+        ProcErr { text: text.to_string(), status: None, rows: Vec::new() }
     }
 }
 
@@ -86515,6 +86591,7 @@ fn bind_proc_args(name: &str, meta: &ProcMeta, args: &[Value]) -> Result<Vec<Val
             (Value::Text(t), Some(ColKind::Text)) => {
                 if t.chars().count() > declared_chars {
                     return Err(ProcErr {
+                        rows: Vec::new(),
                         text: format!(
                             "procedure {}: argument longer than parameter {}",
                             name, param.name
@@ -86545,6 +86622,7 @@ fn bind_proc_args(name: &str, meta: &ProcMeta, args: &[Value]) -> Result<Vec<Val
                 Ok(n) => Value::Int(n),
                 Err(_) => {
                     return Err(ProcErr {
+                        rows: Vec::new(),
                         text: format!("procedure {}: cannot convert {:?}", name, t),
                         status: Some(EvalErr::ConversionError(Some(t.clone()))),
                     })
@@ -86558,6 +86636,7 @@ fn bind_proc_args(name: &str, meta: &ProcMeta, args: &[Value]) -> Result<Vec<Val
                 // 22018 "conversion error from string \"123456789012\"")
                 if rendered.chars().count() > declared_chars {
                     return Err(ProcErr {
+                        rows: Vec::new(),
                         text: format!("procedure {}: cannot convert {}", name, rendered),
                         status: Some(EvalErr::ConversionError(Some(rendered))),
                     });
@@ -86592,6 +86671,7 @@ fn bind_proc_args(name: &str, meta: &ProcMeta, args: &[Value]) -> Result<Vec<Val
                         };
                         if !fits {
                             return Err(ProcErr {
+                                rows: Vec::new(),
                                 text: format!(
                                     "procedure {}: {} out of range for {}",
                                     name, raw, param.name
@@ -86603,6 +86683,7 @@ fn bind_proc_args(name: &str, meta: &ProcMeta, args: &[Value]) -> Result<Vec<Val
                     }
                     Err(ev) => {
                         return Err(ProcErr {
+                            rows: Vec::new(),
                             text: format!("procedure {}: conversion", name),
                             status: Some(ev),
                         })
@@ -86622,6 +86703,7 @@ fn bind_proc_args(name: &str, meta: &ProcMeta, args: &[Value]) -> Result<Vec<Val
                 let rendered = render_exact(raw, scale);
                 if rendered.chars().count() > declared_chars {
                     return Err(ProcErr {
+                        rows: Vec::new(),
                         text: format!("procedure {}: cannot convert {}", name, rendered),
                         status: Some(EvalErr::ConversionError(Some(rendered))),
                     });
@@ -86655,6 +86737,7 @@ fn bind_proc_args(name: &str, meta: &ProcMeta, args: &[Value]) -> Result<Vec<Val
                             }
                             None => {
                                 return Err(ProcErr {
+                                    rows: Vec::new(),
                                     text: format!(
                                         "procedure {}: {} out of range for {}",
                                         name, t, param.name
@@ -86666,6 +86749,7 @@ fn bind_proc_args(name: &str, meta: &ProcMeta, args: &[Value]) -> Result<Vec<Val
                     }
                     _ => {
                         return Err(ProcErr {
+                            rows: Vec::new(),
                             text: format!("procedure {}: cannot convert {:?}", name, t),
                             status: Some(EvalErr::ConversionError(Some(t.clone()))),
                         })
@@ -86696,6 +86780,7 @@ fn bind_proc_args(name: &str, meta: &ProcMeta, args: &[Value]) -> Result<Vec<Val
                         };
                         if !fits {
                             return Err(ProcErr {
+                                rows: Vec::new(),
                                 text: format!(
                                     "procedure {}: {} out of range for {}",
                                     name, raw, param.name
@@ -86711,6 +86796,7 @@ fn bind_proc_args(name: &str, meta: &ProcMeta, args: &[Value]) -> Result<Vec<Val
                     }
                     Err(ev) => {
                         return Err(ProcErr {
+                            rows: Vec::new(),
                             text: format!("procedure {}: conversion", name),
                             status: Some(ev),
                         })
@@ -87094,7 +87180,7 @@ fn run_function(
             };
             if let Some((raw, from)) = parts {
                 let r = rescale(raw, from, ret.desc.scale)
-                    .map_err(|e| ProcErr { text: format!("function {}", name), status: Some(e) })?;
+                    .map_err(|e| ProcErr { text: format!("function {}", name), status: Some(e), rows: Vec::new() })?;
                 let fits = match ret.desc.dtype {
                     dtype::SHORT => i16::try_from(r).is_ok(),
                     dtype::LONG => i32::try_from(r).is_ok(),
@@ -87103,6 +87189,7 @@ fn run_function(
                 };
                 if !fits {
                     return Err(ProcErr {
+                        rows: Vec::new(),
                         text: format!("function {}: numeric value is out of range", name),
                         status: Some(EvalErr::NumericOutOfRange),
                     });
@@ -87703,6 +87790,13 @@ fn run_body_source(
                     Thrown::Runtime { err, .. } => format!("{:?}", err),
                 },
                 status: Some(wrap_at_procedure(inner, at)),
+                // WHAT SUSPEND ALREADY EMITTED TRAVELS WITH THE RAISE.
+                // The engine delivers the rows the body produced and
+                // raises after them; dropping them here answered the
+                // exception alone (measured: `SELECT K FROM PR_PURE` is
+                // 1, 2, then the exception there, and the exception by
+                // itself here).
+                rows: std::mem::take(&mut frame.suspended),
             });
         }
         Err(PsqlStop::Failed(e)) => return Err(ProcErr::from(e)),
@@ -93132,9 +93226,45 @@ fn after_auth(
                                         .collect()
                                 })
                                 .collect();
+                            let (mcols, distinct, skip, take) = outer.clone();
+                            plan = std::rc::Rc::new(Plan::Modified {
+                                inner: Box::new(Plan::ProcRows { cols: icols, rows, then: None }),
+                                cols: mcols,
+                                distinct,
+                                skip,
+                                take,
+                            });
+                            respond(&mut s, &mut enc, resp_tx)?;
+                        }
+                        // A BODY THAT RAISED AFTER SUSPENDING ROWS still
+                        // owes the client those rows. `FIRST 3` over a
+                        // body that suspends two and then fails answers
+                        // both rows AND the exception on the engine, so
+                        // the rows become the result and the raise rides
+                        // along as the plan's trailing error - delivered
+                        // after them by the fetch. Answering the error
+                        // here instead threw the rows away.
+                        //
+                        // A limit that STOPPED the body never reaches
+                        // this: it has no raise to carry.
+                        Err(e) if e.status.is_some() && !e.rows.is_empty() => {
+                            let rows: Vec<Vec<Value>> = e
+                                .rows
+                                .iter()
+                                .map(|r| {
+                                    picks
+                                        .iter()
+                                        .map(|p| r.get(*p).cloned().unwrap_or(Value::Null))
+                                        .collect()
+                                })
+                                .collect();
                             let (mcols, distinct, skip, take) = outer;
                             plan = std::rc::Rc::new(Plan::Modified {
-                                inner: Box::new(Plan::ProcRows { cols: icols, rows }),
+                                inner: Box::new(Plan::ProcRows {
+                                    cols: icols,
+                                    rows,
+                                    then: e.status,
+                                }),
                                 cols: mcols,
                                 distinct,
                                 skip,
@@ -93182,7 +93312,7 @@ fn after_auth(
                     };
                     match run_body_source(&mut database, ANONYMOUS_BLOCK, &meta, &[], &ctx, None) {
                         Ok((_, suspended)) => {
-                            plan = std::rc::Rc::new(Plan::ProcRows { cols: bcols, rows: suspended });
+                            plan = std::rc::Rc::new(Plan::ProcRows { cols: bcols, rows: suspended, then: None });
                             respond(&mut s, &mut enc, resp_tx)?;
                         }
                         Err(e) => match e.status {
@@ -93214,7 +93344,14 @@ fn after_auth(
                     // the walk starts UNCAPPED and earns a cap on the way
                     // down, at a bounded non-DISTINCT limit
                     match materialise_procedures(&mut p, &mut database, &ctx, None) {
-                        Ok(_) => {
+                        Ok(subst) => {
+                            if std::env::var("FC_SRV_TRACE").is_ok() {
+                                eprintln!(
+                                    "[srv] materialise_procedures: substituted={} -> {}",
+                                    subst,
+                                    plan_kind(&p)
+                                );
+                            }
                             plan = std::rc::Rc::new(p);
                             respond(&mut s, &mut enc, resp_tx)?;
                         }
@@ -94278,7 +94415,15 @@ fn after_auth(
                         plan = std::rc::Rc::new(m);
                     }
                 }
-                if want > 0 && !matches!(&*plan, Plan::Rows { .. }) && !small_first {
+                if want > 0
+                    && !matches!(&*plan, Plan::Rows { .. })
+                    && !small_first
+                    // A PLAN WHOSE ROWS ARE FOLLOWED BY A RAISE must not
+                    // be flattened here: `branch_rows` answers rows OR an
+                    // error and never both, so the raise was lost and the
+                    // client saw a clean result. `emit_rows` serves it.
+                    && !plan_has_trailing_raise(&plan)
+                {
                     if let Some(db) = database.as_ref() {
                         if let Some(rows) = branch_rows(&*plan, db, &bound_args) {
                             // `branch_rows` hands back rows that are

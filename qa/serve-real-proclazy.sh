@@ -85,6 +85,16 @@ BEGIN
   K = 2; SUSPEND;
   EXCEPTION E_MINE;
 END^
+/* WRITES, suspends, then raises. One cell then pins both halves of the
+   engine's answer at once: the ROWS arrive (they were produced before
+   the failure) and the WRITES do not (the body is undone), because
+   `iters` folds the log count into what it compares. */
+CREATE PROCEDURE PRW RETURNS (K INTEGER) AS
+BEGIN
+  INSERT INTO LOG (N) VALUES (1); K = 1; SUSPEND;
+  INSERT INTO LOG (N) VALUES (2); K = 2; SUSPEND;
+  EXCEPTION E_MINE;
+END^
 SET TERM ;^
 COMMIT;
 EOF
@@ -170,24 +180,33 @@ cell "FIRST 2 stops before the raise"    "SELECT FIRST 2 K FROM PRAISE"
 cell "FIRST 1 stops before the raise"    "SELECT FIRST 1 K FROM PRAISE"
 cell "ROWS 2 stops before the raise"     "SELECT K FROM PRAISE ROWS 2"
 
-# RECORDED, NOT FIXED - both measured here, both left as they are:
+# ...AND WHEN THE RAISE IS REACHED, THE ROWS COME FIRST.
 #
-#  1. A LIMIT WITH A FILTER counts SURVIVING rows, which this cap cannot
-#     express: `SELECT FIRST 1 K FROM PLOG(5) WHERE K > 3` is FOUR
-#     iterations on the engine (it pulls until one row passes the
-#     filter) and five here. The rows are identical; only the side
-#     effect count differs. Implementing it needs the filter evaluated
-#     inside the body's pull rather than above it.
+# The engine delivers what the body already produced and raises AFTER
+# it; fire-crab used to raise with no rows at all. The carrier is a
+# trailing error on the rows themselves, so the fetch writes the rows
+# and then the engine's status vector in the same reply - which is what
+# a per-row arithmetic exception mid-cursor has always done.
 #
-#  2. ROWS BEFORE A RAISE. When the raise IS reached, the engine
-#     delivers the rows it already produced and THEN raises - `SELECT K
-#     FROM PRAISE` is `1 2` followed by the exception, and `FIRST 3` the
-#     same - while fire-crab raises with no rows at all. That needs a
-#     "these rows, then this error" carrier at the fetch, which no plan
-#     shape has yet.
+# The writing body pins the other half in the same cell: its rows arrive
+# and its WRITES DO NOT (the body is undone on a raise, on both servers),
+# because `iters` compares the log count along with the rows.
+echo "-- ...and when the raise IS reached, the rows come first --"
+cell "a bare raising body: rows, then the raise" "SELECT K FROM PRAISE"
+cell "a limit PAST the raise still raises"       "SELECT FIRST 3 K FROM PRAISE"
+cell "a WRITING raising body: rows yes, writes no" "SELECT K FROM PRW"
+
+# RECORDED, NOT FIXED - measured here, left as it is:
 #
-# Both are asserted the honest way round: NOT as OK cells, and not
-# hidden either - the numbers above are what a future slice must move.
+#   A LIMIT WITH A FILTER counts SURVIVING rows, which the body's cap
+#   cannot express: `SELECT FIRST 1 K FROM PLOG(5) WHERE K > 3` is FOUR
+#   iterations on the engine (it pulls until one row passes the filter)
+#   and five here. The rows are identical; only the side-effect count
+#   differs. Implementing it needs the filter evaluated inside the
+#   body's pull rather than above it.
+#
+# It is recorded the honest way round: NOT as an OK cell, and not hidden
+# either - that number is what a future slice must move.
 
 kill $srv 2>/dev/null; wait $srv 2>/dev/null; trap - EXIT
 rm -f "$WORK" "$REF"
