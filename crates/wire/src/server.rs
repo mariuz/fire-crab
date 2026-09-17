@@ -40574,6 +40574,13 @@ fn plan_join_bound(
     if joins.is_empty() {
         return None;
     }
+    // Does an ON clause carry a `?` in a chain of more than one step?
+    // Then an ON is written BETWEEN sides, and this planner numbers all
+    // sides before any ON - see the refusal at the derived side below.
+    let multi_on_param = joins.len() > 1
+        && joins.iter().any(|(_, _, on_s, _)| {
+            *on_s != CROSS_ON && *on_s != NATURAL_ON && mask_literals(on_s).contains('?')
+        });
     let mut sides: Vec<JoinSide> = Vec::new();
     let mut refs: Vec<&TableRef<'_>> = vec![left];
     refs.extend(joins.iter().map(|(_, r, _, _)| r));
@@ -40602,10 +40609,33 @@ fn plan_join_bound(
             .map(|(_, _, c)| c)
             .unwrap_or_default();
         if let Some(inner_sql) = derived_inner {
-            let mut inner_params: Vec<Option<Descriptor>> = Vec::new();
-            let inner = plan_query_inner(&inner_sql, db_opt, &mut inner_params)?;
-            if !inner_params.is_empty() {
-                return None; // a `?` inside a derived side
+            // A `?` INSIDE A DERIVED SIDE numbers by TEXT POSITION - and
+            // the running count is already here. Sides are built in FROM
+            // order and every ON is numbered only after the last of them
+            // (`on_np` floors at `params.len()`), so what this side must
+            // number after is exactly what has been claimed so far. The
+            // same floor the ON and the WHERE use, one level down; no
+            // statement text and no span arithmetic, which also keeps
+            // the CROSS_ON/NATURAL_ON sentinels (`\0cross`, `\0natural`
+            // - not slices of the statement at all) out of it.
+            //
+            // It used to plan into a FRESH sink and refuse if the side
+            // claimed anything ("a `?` inside a derived side").
+            let sbase = params.len().max(proj_params);
+            // ...EXCEPT where an ON carrying its own `?` is written
+            // BETWEEN two sides: this numbers every side before every
+            // ON, so a chain like `a JOIN (d1) ON ? JOIN (d2) ON ?`
+            // would mis-number rather than refuse. Every shape measured
+            // for this slice has its sides before a single ON.
+            if multi_on_param {
+                return None;
+            }
+            let inner = plan_query_inner_at(&inner_sql, db_opt, params, false, sbase)?;
+            // an inner PROJECTION `?` is bound nowhere at execute
+            // ([bind_plan_params] reaches the top-level plan's columns
+            // only), so it keeps refusing rather than reading unbound
+            if plan_has_proj_param(&inner) {
+                return None;
             }
             let mut inner_cols = output_cols_of(&inner);
             if inner_cols.is_empty() {
@@ -46338,11 +46368,21 @@ fn materialise_procedures_src(
 /// died at the FETCH, because [Predicate::bind] against an empty slice
 /// answers "missing parameter value" for every slot.
 ///
-/// Only [Plan::JoinGroup] is walked. A fold consumes its whole input
-/// anyway, so materialising its base here costs no laziness - the same
-/// trade the fetch path already makes when it flattens a plan to
-/// `Plan::Rows`. A plain `Plan::Join` and a `Plan::Lateral` are left
-/// alone precisely because they CAN stream under `FIRST n`.
+/// [Plan::JoinGroup] and [Plan::Join] are walked, base and stepped sides
+/// alike. A fold consumes its whole input anyway; a JOIN materialises a
+/// derived side regardless, because a side that is not a plain relation
+/// is read from its plan and hashed rather than probed per driver row
+/// ([JoinPart::probe] is `None` for one) - so neither loses laziness it
+/// had. `Plan::Lateral` stays out: its base re-runs the subquery per
+/// outer row, which is the one shape where materialising early would
+/// change what runs.
+///
+/// AND THE WRAPPERS ARE WALKED THROUGH. A `FIRST`/`SKIP`/`DISTINCT`
+/// ([Plan::Modified]), a derived table above the join ([Plan::Derived])
+/// or a UNION branch hides it from a top-level match - `SELECT FIRST 2
+/// ... FROM (<derived with a ?>) X JOIN ...` failed for exactly that,
+/// while the same statement without `FIRST` answered. [materialise_laterals]
+/// recurses through the same three, for the same reason.
 fn materialise_bound_bases(
     plan: &Plan,
     db: &Option<Database>,
@@ -46353,14 +46393,37 @@ fn materialise_bound_bases(
     }
     let dbr = db.as_ref()?;
     let mut p = plan.clone();
-    let changed = match &mut p {
-        Plan::JoinGroup { base, .. } => materialise_bound_src(base, dbr, args),
-        _ => false,
-    };
-    if changed {
+    if materialise_bound_in(&mut p, dbr, args) {
         Some(p)
     } else {
         None
+    }
+}
+
+/// [materialise_bound_bases]'s walk, in place.
+fn materialise_bound_in(plan: &mut Plan, db: &Database, args: &[WireParam]) -> bool {
+    match plan {
+        // BOTH the driving side and the stepped ones: a derived side
+        // keeps its rows in its own `JoinPart::src`, and every one of
+        // them reads through the same argument-less choke point.
+        Plan::JoinGroup { base, parts, .. } | Plan::Join { base, parts, .. } => {
+            let mut any = materialise_bound_src(base, db, args);
+            for part in parts.iter_mut() {
+                any |= materialise_bound_src(&mut part.src, db, args);
+            }
+            any
+        }
+        Plan::Modified { inner, .. } | Plan::Derived { inner, .. } => {
+            materialise_bound_in(inner, db, args)
+        }
+        Plan::Union { branches, .. } => {
+            let mut any = false;
+            for b in branches.iter_mut() {
+                any |= materialise_bound_in(b, db, args);
+            }
+            any
+        }
+        _ => false,
     }
 }
 

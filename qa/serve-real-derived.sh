@@ -368,11 +368,36 @@ bothq "a CTE body's ? under a fold" "WITH C AS (SELECT ID FROM EMP WHERE ID > ?)
 # materialises a bound DERIVED base only, and this says so
 both "CONTROL a grouped join over tables" "SELECT D.DNAME, COUNT(*) AS N FROM EMP E JOIN DEPT D ON D.ID = E.DEPT_ID GROUP BY D.DNAME ORDER BY D.DNAME"
 bothq "CONTROL FIRST n over a derived ?" "SELECT FIRST 2 ID FROM (SELECT ID FROM EMP WHERE ID > ?) X ORDER BY ID" '[1]'
+
+# --- a ? inside a derived SIDE OF A JOIN -------------------------------
+# The side used to be planned into a FRESH sink and refused if it claimed
+# anything. Sides are built in FROM order and every ON is numbered after
+# the last of them, so a side numbers from what has been claimed so far -
+# the same floor the ON and the WHERE already use.
+bothq "a derived side on the LEFT" "SELECT X.ID FROM (SELECT ID, DEPT_ID FROM EMP WHERE ID > ?) X JOIN DEPT D ON D.ID = X.DEPT_ID ORDER BY X.ID" '[1]'
+bothq "...the LEFT side EXCLUDES" "SELECT X.ID FROM (SELECT ID, DEPT_ID FROM EMP WHERE ID > ?) X JOIN DEPT D ON D.ID = X.DEPT_ID ORDER BY X.ID" '[99]'
+bothq "a derived side on the RIGHT" "SELECT X.ID FROM DEPT D JOIN (SELECT ID, DEPT_ID FROM EMP WHERE ID > ?) X ON D.ID = X.DEPT_ID ORDER BY X.ID" '[1]'
+bothq "TWO derived sides, one ? each" "SELECT A.ID FROM (SELECT ID FROM EMP WHERE ID > ?) A JOIN (SELECT ID FROM EMP WHERE ID < ?) B ON A.ID = B.ID ORDER BY A.ID" '[1,5]'
+bothq "...the SECOND side EXCLUDES" "SELECT A.ID FROM (SELECT ID FROM EMP WHERE ID > ?) A JOIN (SELECT ID FROM EMP WHERE ID < ?) B ON A.ID = B.ID ORDER BY A.ID" '[1,2]'
+bothq "a side ? then an ON ?" "SELECT X.ID FROM (SELECT ID, DEPT_ID FROM EMP WHERE ID > ?) X JOIN DEPT D ON D.ID = X.DEPT_ID AND D.ID > ? ORDER BY X.ID" '[1,0]'
+bothq "a side ? then an outer WHERE ?" "SELECT X.ID FROM (SELECT ID, DEPT_ID FROM EMP WHERE ID > ?) X JOIN DEPT D ON D.ID = X.DEPT_ID WHERE X.ID < ? ORDER BY X.ID" '[1,4]'
+bothq "a LEFT JOIN whose RIGHT side is derived" "SELECT D.ID, X.ID FROM DEPT D LEFT JOIN (SELECT ID, DEPT_ID FROM EMP WHERE ID > ?) X ON D.ID = X.DEPT_ID ORDER BY D.ID" '[3]'
+bothq "a fold over the whole join" "SELECT COUNT(*) AS N FROM (SELECT ID, DEPT_ID FROM EMP WHERE ID > ?) X JOIN DEPT D ON D.ID = X.DEPT_ID" '[1]'
+# ...and the WRAPPERS, which hid the join from the walk that materialises
+# a bound side: without them `FIRST 2` failed where the same statement
+# without it answered.
+bothq "FIRST n over a join with a bound side" "SELECT FIRST 2 X.ID FROM (SELECT ID, DEPT_ID FROM EMP WHERE ID > ?) X JOIN DEPT D ON D.ID = X.DEPT_ID ORDER BY X.ID" '[0]'
+bothq "...FIRST n where the side EXCLUDES" "SELECT FIRST 2 X.ID FROM (SELECT ID, DEPT_ID FROM EMP WHERE ID > ?) X JOIN DEPT D ON D.ID = X.DEPT_ID ORDER BY X.ID" '[99]'
+bothq "SKIP over a join with a bound side" "SELECT SKIP 1 X.ID FROM (SELECT ID, DEPT_ID FROM EMP WHERE ID > ?) X JOIN DEPT D ON D.ID = X.DEPT_ID ORDER BY X.ID" '[0]'
+bothq "DISTINCT over a join with a bound side" "SELECT DISTINCT X.DEPT_ID FROM (SELECT ID, DEPT_ID FROM EMP WHERE ID > ?) X JOIN DEPT D ON D.ID = X.DEPT_ID ORDER BY X.DEPT_ID" '[0]'
+bothq "a derived table ABOVE the join" "SELECT Y.ID FROM (SELECT X.ID FROM (SELECT ID, DEPT_ID FROM EMP WHERE ID > ?) X JOIN DEPT D ON D.ID = X.DEPT_ID) Y ORDER BY Y.ID" '[1]'
+# the controls: a join of plain tables, and an ON ? with no derived side
+both "CONTROL a join of plain tables" "SELECT E.ID FROM EMP E JOIN DEPT D ON D.ID = E.DEPT_ID ORDER BY E.ID"
+bothq "CONTROL an ON ? with no derived side" "SELECT E.ID FROM EMP E JOIN DEPT D ON D.ID = E.DEPT_ID AND D.ID > ? ORDER BY E.ID" '[0]'
 # ...but NOT with a JOIN or a FOLD above it - both still refuse, and the
 # gate found that: they were written as live cells on the strength of a
 # hand-probe that never covered them. Recorded rather than dropped, so
 # each carries the engine's answer and expires itself.
-refusesq "an inner ? with a JOIN above it" "SELECT X.ID FROM (SELECT ID, DEPT_ID FROM EMP WHERE ID > ?) X JOIN DEPT D ON D.ID = X.DEPT_ID ORDER BY X.ID" '[1]'
 # the LITERAL-argument twins of both shapes answer, which is what says
 # only the BOUND half is missing rather than the shape itself
 both "a JOIN above a LITERAL inner predicate" "SELECT X.ID FROM (SELECT ID, DEPT_ID FROM EMP WHERE ID > 1) X JOIN DEPT D ON D.ID = X.DEPT_ID ORDER BY X.ID"
@@ -393,9 +418,14 @@ both "CONTROL a literal inner predicate" "SELECT ID FROM (SELECT ID FROM EMP WHE
 # answers.
 #   - a `?` in the INNER PROJECTION: nothing binds it - bind_plan_params
 #     reaches the top-level plan's columns only.
-#   - a derived SIDE OF A JOIN keeps its own copy of the old guard
-#     (plan_join_bound), whose base needs per-side text offsets - which
-#     is also why a JOIN above an inner `?` refuses ("JOIN plan failed").
+#   - a chain of MORE THAN ONE join whose ON carries a `?`: an ON is then
+#     written BETWEEN two sides, and this planner numbers every side
+#     before any ON, so it would MIS-NUMBER rather than refuse. Refused
+#     deliberately (multi_on_param).
+#   - a `?` ANYWHERE IN A UNION BRANCH - measured PRE-EXISTING, on this
+#     binary and the one before it, and nothing to do with derived
+#     tables: `SELECT ID FROM EMP WHERE ID > ? UNION ALL SELECT 99 FROM
+#     RDB$DATABASE` refuses while the same union without a `?` answers.
 #   (an AGGREGATE or GROUP BY above an inner `?` used to be recorded here
 #   too. It was a FETCH-time failure, not a refusal - the fold read its
 #   base row source without the arguments - and materialising a bound
@@ -403,7 +433,8 @@ both "CONTROL a literal inner predicate" "SELECT ID FROM (SELECT ID FROM EMP WHE
 #   above. The JOIN above an inner `?` is NOT the same thing: it refuses
 #   at PLAN time, in plan_join_bound's own copy of the old guard.)
 refusesq "a ? in the INNER projection" "SELECT C FROM (SELECT CAST(? AS INTEGER) AS C FROM EMP) X" '[5]'
-refusesq "a derived SIDE of a join" "SELECT X.ID FROM DEPT D JOIN (SELECT ID, DEPT_ID FROM EMP WHERE ID > ?) X ON D.ID = X.DEPT_ID ORDER BY X.ID" '[1]'
+refusesq "a multi-ON chain with a bound ON" "SELECT A.ID FROM EMP A JOIN (SELECT ID FROM EMP WHERE ID > ?) B ON A.ID = B.ID AND A.ID > ? JOIN DEPT D ON D.ID = A.DEPT_ID AND D.ID > ? ORDER BY A.ID" '[0,0,0]'
+refusesq "a ? in a UNION branch (pre-existing)" "SELECT ID FROM EMP WHERE ID > ? UNION ALL SELECT 99 FROM RDB\$DATABASE" '[3]'
 
 # --- a materialised row source carries its rows' OWN error ------------
 # branch_rows answered an Option, so "this shape is unserved" and "the
