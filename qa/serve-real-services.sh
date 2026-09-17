@@ -108,14 +108,44 @@ from firebird.driver import connect
 con_b = connect('newdb', user=os.environ['FC_U'], password=os.environ['FC_P'])
 check("distinct attachment ids across connections", con.info.id != con_b.info.id)
 
-# 4. MON$ virtual tables report as empty - the plugin's architecture
-# probe (an aggregate over MON$ATTACHMENTS) returns one all-NULL row
+# 4. THE firebird-qa PLUGIN'S OWN ARCHITECTURE PROBE, the query it runs
+# at startup to classify a server - COUNT(DISTINCT), MIN over text and
+# MAX(IIF(..)) in one projection over MON$ATTACHMENTS, filtered to the
+# two attachments it owns.
+#
+# THIS LINE USED TO ASSERT `row == (None, None, None)` - a divergence
+# recorded when MON$ answered one all-NULL row for any query. The chunk
+# that sent MON$ down the ordinary planner path fixed it and nobody
+# unrecorded the assertion, so the gate went on demanding the WRONG
+# answer. Measured 2026-09-17, both servers, two driver connections:
+#   engine   (1, 'TCPv4', 0)   attachments 4 and 7, both pid 736
+#   firecrab (1, 'TCPv4', 0)   attachments 1 and 2, both this pid
+# so it is the ENGINE's answer that is asserted now.
+#
+# The ID FILTER is what makes this comparable at all: the engine's own
+# server also holds INTERNAL attachments (measured: ids 5 and 6, same
+# server pid, NULL protocol and address) which no other server has, so
+# an unfiltered `count(*)` or `max(iif(protocol is null,1,0))` over
+# MON$ATTACHMENTS answers 3 and 1 there against 1 and 0 here - a
+# difference in what the two servers ATTACH FOR, not in what they
+# report. Only the owned rows are asserted.
 cur_b = con_b.cursor()
 cur_b.execute("""select count(distinct a.mon$server_pid), min(a.mon$remote_protocol),
     max(iif(a.mon$remote_protocol is null, 1, 0)) from mon$attachments a
     where a.mon$attachment_id in (%d, %d)""" % (con.info.id, con_b.info.id))
 row = cur_b.fetchone()
-check("MON$ architecture query returns one all-NULL row", row == (None, None, None))
+check(f"MON$ architecture probe answers the engine's row {row}", row == (1, 'TCPv4', 0))
+# ...and the rows behind it: two attachments, one per connection, each
+# naming this server's process and the TCP wire it arrived on
+cur_b.execute("""select a.mon$attachment_id, a.mon$server_pid, a.mon$remote_protocol
+    from mon$attachments a where a.mon$attachment_id in (%d, %d)
+    order by a.mon$attachment_id""" % (con.info.id, con_b.info.id))
+atts = cur_b.fetchall()
+check("MON$ATTACHMENTS has one row per live connection", len(atts) == 2)
+check("...each on TCPv4, under one server pid",
+      {r[2] for r in atts} == {'TCPv4'} and len({r[1] for r in atts}) == 1)
+check("...and the ids are the ones the connections report",
+      [r[0] for r in atts] == sorted([con.info.id, con_b.info.id]))
 con_b.close()
 
 # 5. op_drop_database: the SAME operation firebird-qa's per-test
