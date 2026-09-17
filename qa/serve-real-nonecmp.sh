@@ -39,6 +39,14 @@ insert into t values (2,'abc','abc');
 insert into t values (3,'niño','niño');
 insert into t values (4,'Zürich','Zürich');
 commit;
+-- a TEXT BLOB carries its charset in the descriptor's SCALE, and
+-- `col_kind` answers None for a blob - so the literal fast path
+-- (adopt_carrier_literal) never sees one and the blob reaches the
+-- EXPRESSION arm instead. Added here so that route is gated too.
+alter table t add b blob sub_type text character set utf8;
+commit;
+update t set b = u;
+commit;
 SQL
 if grep -qi error /tmp/nonecmp-build.log; then echo "FAIL building the fixture:"; sed 's/^/     /' /tmp/nonecmp-build.log; exit 1; fi
 cp "$ENG" "$FC"; chmod 666 "$FC"
@@ -122,6 +130,31 @@ agree "u||'' LIKE '%é%'"      "select count(*) n from t where u||'' like '%é%'
 agree "UPPER(u) LIKE '%É%'"   "select count(*) n from t where upper(u) like '%É%';"
 malformed "u||'' LIKE 'é%'"   "select count(*) n from t where u||'' like 'é%';"
 agree "CAST(u) LIKE '%é%' ctl" "select count(*) n from t where cast(u as varchar(20)) like '%é%';"
+echo "-- a TEXT BLOB is the same law by a DIFFERENT route: col_kind is None --"
+echo "--  for a blob, so the literal fast path never sees it --"
+agree "b CONTAINING 'é'"              "select count(*) n from t where b containing 'é';"
+agree "b CONTAINING 'ñ'"              "select count(*) n from t where b containing 'ñ';"
+agree "b CONTAINING 'caf' ascii ctl"  "select count(*) n from t where b containing 'caf';"
+agree "POSITION('é' IN b)"            "select position('é' in b) n from t where id=1;"
+agree "b LIKE '%é%'"                  "select count(*) n from t where b like '%é%';"
+agree "OCTET_LENGTH(b) control"       "select octet_length(b) n from t where id=1;"
+agree "b CONTAINING 'é' @UTF8"        "select count(*) n from t where b containing 'é';" UTF8
+echo "-- the STRING FUNCTIONS take the same byte-space law --"
+agree "POSITION('é' IN u)  needle"    "select position('é' in u) n from t where id=1;"
+agree "POSITION('café' IN u) whole"   "select position('café' in u) n from t where id=1;"
+agree "POSITION(u IN 'xcafé') cont'r" "select position(u in 'xcafé') n from t where id=1;"
+agree "POSITION('ñ' IN u)"            "select position('ñ' in u) n from t where id=3;"
+agree "POSITION('f' IN u) ascii ctl"  "select position('f' in u) n from t where id=1;"
+agree "REPLACE(u,'é','e') octets"     "select octet_length(replace(u,'é','e')) n from t where id=1;"
+agree "REPLACE(u,'ñ','n') octets"     "select octet_length(replace(u,'ñ','n')) n from t where id=3;"
+agree "TRIM(TRAILING 'é') octets"     "select octet_length(trim(trailing 'é' from u)) n from t where id=1;"
+agree "TRIM(LEADING 'c') ascii ctl"   "select octet_length(trim(leading 'c' from u)) n from t where id=1;"
+agree "POSITION('é' IN w) win1252"    "select position('é' in w) n from t where id=1;"
+echo "-- ...and both-carrier / real-attachment forms are untouched --"
+agree "POSITION('é' IN u) @UTF8"      "select position('é' in u) n from t where id=1;" UTF8
+agree "REPLACE(u,'é','e') @UTF8"      "select octet_length(replace(u,'é','e')) n from t where id=1;" UTF8
+agree "TRIM(TRAILING 'é') @UTF8"      "select octet_length(trim(trailing 'é' from u)) n from t where id=1;" UTF8
+agree "POSITION('é' IN w) @WIN1252"   "select position('é' in w) n from t where id=1;" WIN1252
 echo "-- regression: real attachments must be unchanged --"
 agree "u='café' @UTF8"      "select count(*) n from t where u='café';" UTF8
 agree "u='abc' @UTF8"       "select count(*) n from t where u='abc';" UTF8

@@ -13304,6 +13304,68 @@ impl Term {
 /// the deferral note's guess), and neither `NOT LIKE` nor a BOUND
 /// pattern ever raises - both measured, and both excluded by the
 /// callers.
+/// Reinterpret the BYTE-CARRIER text LITERAL arguments of a string
+/// function against a REAL-charset sibling argument - the function-call
+/// twin of [adopt_carrier_literal].
+///
+/// Under a byte-carrier attachment a literal arrives one char per octet,
+/// so `POSITION('é' IN <utf8 col>)` compared carrier chars against real
+/// ones and answered 0 where the engine answers 4. The engine works in
+/// BYTE SPACE here exactly as it does for a comparison: the carrier's
+/// octets are read AS the sibling's charset. Measured under the default
+/// NONE attachment against a UTF8 column:
+///
+/// - `POSITION('é' IN V)` is 4, `POSITION('café' IN V)` 1 and
+///   `POSITION(V IN 'xcafé')` 2 - the literal is the NEEDLE in the first
+///   two and the CONTAINER in the third, so ANY argument may be the one
+///   that needs it (`position_impl(sub, s, start)` takes them in that
+///   order, and `REPLACE` is `(s, find, repl)`)
+/// - `OCTET_LENGTH(REPLACE(V,'é','e'))` is 4 and
+///   `OCTET_LENGTH(TRIM(TRAILING 'é' FROM V))` is 3, where fire-crab
+///   returned the string UNCHANGED (5) because the needle never matched
+/// - ASCII arguments are untouched (`POSITION('f' IN V)` 3,
+///   `TRIM(LEADING 'c' FROM V)` 4), and a NONE column on both sides
+///   agrees already - two byte carriers need no reconciliation
+///
+/// Only a LITERAL is rewritten, and only when exactly one real charset
+/// is in play. Where the CARRIER side is a COLUMN (`REPLACE(V, N, 'x')`,
+/// `POSITION(N IN V)`) there is nothing to reinterpret at prepare - the
+/// values must meet in byte space at EVAL, which is a separate measured
+/// slice and is recorded rather than answered here.
+fn carrier_fn_args(resolved: &mut [Expr], descs: &[Descriptor]) {
+    use fire_crab_ods::intl;
+    let att = CURRENT_ATT_CS.with(|c| c.get());
+    if !intl::byte_carrier(att) {
+        return;
+    }
+    // the charset a NON-literal text argument contributes; two different
+    // real sets in one call are left alone rather than guessed between
+    let mut real: Option<u8> = None;
+    for e in resolved.iter() {
+        if matches!(e, Expr::Str(_)) {
+            continue;
+        }
+        if let Some(cs) = cmp_text_charset(e, descs) {
+            if !intl::byte_carrier(cs) {
+                match real {
+                    Some(prev) if prev != cs => return,
+                    _ => real = Some(cs),
+                }
+            }
+        }
+    }
+    let Some(cs) = real else { return };
+    for e in resolved.iter_mut() {
+        if let Expr::Str(s) = e {
+            // bytes that do not spell the set stay a carrier string,
+            // which then matches nothing - the engine's no-match/no-raise
+            if let Ok(t) = transcode_text(att, cs, s.clone()) {
+                *s = t;
+            }
+        }
+    }
+}
+
 /// The byte-space reinterpretation for an EXPRESSION-side LIKE - the
 /// twin of [adopt_carrier_literal]'s literal path, for tested sides that
 /// carry no column descriptor. Answers the term to use, or `None` to
@@ -67265,10 +67327,17 @@ fn resolve_expr_inner(
                     }
                 }
             }
-            let resolved: Vec<Expr> = args
+            let mut resolved: Vec<Expr> = args
                 .iter()
                 .map(|a| resolve_expr(a, columns, descs))
                 .collect::<Option<Vec<_>>>()?;
+            // a BYTE-CARRIER literal argument meeting a REAL-charset one
+            // reads as that charset's OCTETS - the engine's byte space,
+            // the same single step [adopt_carrier_literal] takes for a
+            // comparison. Without it POSITION/REPLACE/TRIM compared
+            // carrier chars against real ones and found nothing.
+            carrier_fn_args(&mut resolved, descs);
+            let resolved = resolved;
             // OCTET_LENGTH over a COLUMN of a tabled single-byte set
             // counts the COLUMN's stored bytes (WIN1252 'café' is 4,
             // probed), not the decoded text's UTF-8 bytes - the charset
@@ -90773,7 +90842,22 @@ fn resolve_expr_term(
                     },
                 ),
             };
-            containing_term(value, tt, p, *negated)
+            // the same byte-space step the comparison and function paths
+            // take: a carrier literal's octets read AS the operand's
+            // charset. This is the arm a BLOB column reaches - `col_kind`
+            // answers None for a blob, so [adopt_carrier_literal] never
+            // sees it, which is why `B CONTAINING 'é'` found nothing
+            // while the VARCHAR form already agreed.
+            let att = CURRENT_ATT_CS.with(|c| c.get());
+            let cs = fire_crab_ods::intl::charset_id(tt as i16);
+            let redone = if fire_crab_ods::intl::byte_carrier(att)
+                && !fire_crab_ods::intl::byte_carrier(cs)
+            {
+                transcode_text(att, cs, p.clone()).unwrap_or_else(|_| p.clone())
+            } else {
+                p.clone()
+            };
+            containing_term(value, tt, &redone, *negated)
         }
         RawKind::Containing(Rhs::Null, _) => Term::Never,
         // `<numeric side> CONTAINING ?` - the bound-pattern twin of the
