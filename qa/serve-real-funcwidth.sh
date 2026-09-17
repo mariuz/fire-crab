@@ -55,12 +55,19 @@ ran=0
 rm -f "$DB"
 "$ISQL" -q -b -user "$U" -pas "$P" <<EOF >/dev/null 2>&1 || { echo "FAIL scratch"; exit 1; }
 CREATE DATABASE '$DB' USER '$U' PASSWORD '$P' PAGE_SIZE 8192;
+-- THE DATABASE HAS NO DEFAULT CHARACTER SET, so V / C / W are all NONE -
+-- byte carriers, one byte per character. That is why the computed-length
+-- pad's wrong width survived this gate for so long: every cell here sized
+-- at one byte per character, where the defect doubled a MULTI-byte one.
+-- U8 and OC give the other half of the law.
 CREATE TABLE T (ID INTEGER, V VARCHAR(6), C CHAR(6), W VARCHAR(10),
-                SM SMALLINT, BG BIGINT);
+                SM SMALLINT, BG BIGINT,
+                U8 VARCHAR(6) CHARACTER SET UTF8,
+                OC VARCHAR(6) CHARACTER SET OCTETS);
 COMMIT;
-INSERT INTO T VALUES (1, 'ab', 'ab', 'abc', 7, 9000000000);
-INSERT INTO T VALUES (2, 'abcdef', 'abcdef', 'abcdefghij', -7, -9000000000);
-INSERT INTO T VALUES (3, NULL, NULL, NULL, NULL, NULL);
+INSERT INTO T VALUES (1, 'ab', 'ab', 'abc', 7, 9000000000, 'ab', _OCTETS x'4142');
+INSERT INTO T VALUES (2, 'abcdef', 'abcdef', 'abcdefghij', -7, -9000000000, 'abcdef', _OCTETS x'414243');
+INSERT INTO T VALUES (3, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
 COMMIT;
 EOF
 chmod 666 "$DB"
@@ -135,6 +142,69 @@ both "SELECT LPAD(V, 9) FROM T ORDER BY ID"
 both "SELECT RPAD(V, 8) FROM T ORDER BY ID"
 both "SELECT LPAD(W, 12) FROM T ORDER BY ID"
 
+# --- 5b. A COMPUTED pad length takes the WIDEST VARCHAR, not twice it --
+# A pad whose length is not a literal cannot be sized statically, so the
+# width falls back to the widest VARCHAR the result's charset admits.
+# fire-crab's ceiling for that fallback was 65533 - the u16 limit less the
+# count word - where a VARCHAR's declared length tops out at 32765 bytes.
+# It announced exactly TWICE the engine's width on every computed pad:
+# 65533 against 32765 where the result resolves to a byte carrier or a
+# single-byte page, and 65532 (16383 x 4) against 32764 (8191 x 4) where
+# it resolves to UTF8. The VALUES always agreed, so only a describe
+# comparison could see it - and section 5 above tests pad lengths that are
+# all LITERALS, which is exactly how it survived here.
+both "SELECT LPAD(V, ID) FROM T ORDER BY ID"
+both "SELECT RPAD(V, ID) FROM T ORDER BY ID"
+both "SELECT LPAD(C, ID) FROM T ORDER BY ID"
+both "SELECT LPAD(W, ID) FROM T ORDER BY ID"
+both "SELECT LPAD(OC, ID) FROM T ORDER BY ID"
+both "SELECT LPAD(U8, ID) FROM T ORDER BY ID"
+both "SELECT RPAD(U8, ID) FROM T ORDER BY ID"
+# the length need not be a bare column: any shape that is not a literal
+# takes the same fallback
+both "SELECT LPAD(U8, ID + 1) FROM T ORDER BY ID"
+both "SELECT LPAD(U8, CAST(ID AS SMALLINT)) FROM T ORDER BY ID"
+both "SELECT LPAD(V, ID, '*') FROM T ORDER BY ID"
+
+# --- 5c. RECORDED: a folded scalar subquery sizes from the DATA --------
+# A non-correlated scalar subquery is evaluated at PREPARE and spliced
+# into the statement text as a literal, so by the time the width is
+# computed it is indistinguishable from one the user wrote - and the pad
+# is sized at that value. The announce therefore depends on the ROWS:
+# measured over a two-row table, `LPAD(<utf8>, (SELECT MAX(ID) ...))`
+# announced len 28 for MAX 7 and len 4 for MIN 1, where the engine keeps
+# it dynamic at 32764. The same statement describes differently against
+# different data, which is the one thing a describe must never do.
+#
+# Left RECORDED rather than fixed: the fold is a TEXT rewrite, so undoing
+# it for this one position needs the argument's place recovered from the
+# pre-fold text, and widening every subquery-bearing item instead would be
+# wrong - a whole-item scalar subquery announces its column's own type and
+# agrees today. This cell passes only while they still differ.
+differs() { # <label> <select body>
+    ran=$((ran + 1))
+    local a b
+    a=$("$ISQL" -q -b -user "$U" -pas "$P" "127.0.0.1/$PORT:$DB" <<EOF 2>&1
+$2;
+EOF
+)
+    b=$("$ISQL" -q -b -user "$U" -pas "$P" "$DB" <<EOF 2>&1
+$2;
+EOF
+)
+    if [ "$a" = "$b" ]; then
+        echo "DIFF $1: the recorded divergence is GONE - promote this cell to both()"
+        fail=1
+    elif [ -z "$b" ]; then
+        echo "DIFF $1: VACUOUS - the engine answered nothing"
+        fail=1
+    else
+        echo "OK   $1: recorded (still differs)"
+    fi
+}
+differs "a folded subquery sizes the pad from the data" \
+    "SELECT LPAD(U8, (SELECT MAX(ID) FROM T)) FROM T ORDER BY ID"
+
 # --- 6. CONCATENATION sums its operands -------------------------------
 both "SELECT C || V FROM T ORDER BY ID"
 both "SELECT V || W FROM T ORDER BY ID"
@@ -187,8 +257,8 @@ both "SELECT ID, ID + 1, CHAR_LENGTH(V) FROM T ORDER BY ID"
 both "SELECT SIGN(ID), UPPER(V), MOD(ID, 3), TRIM(C) FROM T ORDER BY ID"
 
 rm -f "$DB"
-if [ "$ran" -lt 48 ]; then
-    echo "DIFF only $ran checks ran (expected at least 48) - did one silently skip?"
+if [ "$ran" -lt 59 ]; then
+    echo "DIFF only $ran checks ran (expected at least 59) - did one silently skip?"
     fail=1
 fi
 exit $fail
