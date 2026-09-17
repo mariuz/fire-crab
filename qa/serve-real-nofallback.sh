@@ -273,6 +273,34 @@ answers "SELECT G.K FROM GEN(5) G WHERE G.K > 2"
 # recorded here instead of being left to a comment nobody re-measures.
 refuses "SELECT G.K, T.S FROM GEN(3) G JOIN T ON T.ID = G.K"
 
+# ...AND THE SAME ROOT REFUSES A CALL INSIDE A SUBQUERY. All four of
+# these fail in ONE place: `parse_table_ref` deliberately answers None
+# for a procedure call ("split_proc_call owns it, qualified or not",
+# pinned by its own unit tests), so `parse_from` answers None for any
+# FROM holding one - and a join never reaches plan_join_bound while
+# `corr_scan_span`, which does `parse_from(table_s)?` per side, declines
+# every correlated/scalar subquery. Measured on this fixture 2026-09-17:
+#
+#   SELECT 1 FROM RDB$DATABASE WHERE EXISTS (SELECT 1 FROM GEN(3))
+#                                       engine [1],       fc raises
+#   SELECT ID FROM T WHERE ID IN (SELECT K FROM GEN(3))
+#                                       engine [1 2 3],   fc raises
+#   SELECT (SELECT MAX(K) FROM GEN(3)) FROM RDB$DATABASE
+#                                       engine [3],       fc raises
+#
+# WHY THE OBVIOUS FIX IS WRONG, so the next attempt does not spend the
+# time twice: rewriting `FROM GEN(3) G` into the derived table
+# `FROM (SELECT * FROM GEN(3)) G` would make every path work, because a
+# derived side is already supported everywhere - but a derived table
+# MUST bind an alias, and the engine's describe for an UNALIASED call in
+# a join is relation GEN with binding alias "" (measured), where the
+# rewrite would report GEN. That is a silent describe corruption of the
+# kind TableRef's own doc warns about. A procedure side has to be a
+# first-class side (rel_alias None when unaliased), not a derived table.
+refuses "SELECT 1 X FROM RDB\$DATABASE WHERE EXISTS (SELECT 1 FROM GEN(3))"
+refuses "SELECT ID FROM T WHERE ID IN (SELECT K FROM GEN(3))"
+refuses "SELECT (SELECT MAX(K) FROM GEN(3)) M FROM RDB\$DATABASE"
+
 # --- the lexer's whitespace class --------------------------------------
 # THE ENGINE'S LEXER KNOWS FIVE WHITESPACE CHARACTERS - space, TAB, LF,
 # FF (0x0C) and CR - and calls every other character Rust calls
