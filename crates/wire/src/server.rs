@@ -89110,9 +89110,13 @@ fn resolve_param_lhs(
     // either: the slot is typed by a literal, which the engine says so
     // for (no `Nullable` on any of the three).
     //
-    // The PARAMETER-pattern and NULL-pattern cases keep the flat
-    // descriptor above: `? LIKE ?`'s charset and nullability were never
-    // probed, and stamping them would be a guess.
+    // A PARAMETER PATTERN OBEYS THE SAME LAW - measured after this was
+    // first written, and it corrects what stood here: `? LIKE ?` is not
+    // a flat pair of 30s but 30 CHARACTERS in the attachment's charset
+    // (30 bytes NONE, 120 UTF8, 30 WIN1252) and NOT NULL on both slots,
+    // which differed here on EVERY attachment, the byte carrier
+    // included. Only the NULL-pattern case keeps the flat descriptor
+    // above.
     let lit_pat_desc = |chars: usize| Descriptor {
         sub_type: ATT_SUBTYPE as i16,
         flags: PARAM_NOT_NULL,
@@ -89147,8 +89151,8 @@ fn resolve_param_lhs(
                     Term::ParamLike(slot, pattern.clone(), *escape, *negated)
                 }
                 Rhs::Param(pslot, _) => {
-                    claim(slot, text_desc_chars(param_pat_chars));
-                    claim(*pslot, text_desc_chars(param_pat_chars));
+                    claim(slot, lit_pat_desc(param_pat_chars));
+                    claim(*pslot, lit_pat_desc(param_pat_chars));
                     Term::ParamLike(
                         slot,
                         Rhs::Param(*pslot, ColKind::Text),
@@ -89173,8 +89177,8 @@ fn resolve_param_lhs(
                     Term::ParamStarting(slot, prefix.clone(), *negated)
                 }
                 Rhs::Param(pslot, _) => {
-                    claim(slot, text_desc_chars(param_pat_chars));
-                    claim(*pslot, text_desc_chars(param_pat_chars));
+                    claim(slot, lit_pat_desc(param_pat_chars));
+                    claim(*pslot, lit_pat_desc(param_pat_chars));
                     Term::ParamStarting(slot, Rhs::Param(*pslot, ColKind::Text), *negated)
                 }
                 Rhs::Null => {

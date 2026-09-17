@@ -196,6 +196,20 @@ cell "STARTING WITH types from the prefix" "SELECT 1 FROM RDB\$DATABASE WHERE ? 
 cell "IN, the widest of four"         "SELECT 1 FROM RDB\$DATABASE WHERE ? IN ('a','bbbb','cc','d');"
 cell "BETWEEN, equal-width bounds"    "SELECT 1 FROM RDB\$DATABASE WHERE ? BETWEEN 'aa' AND 'bb';"
 
+# A PARAMETER PATTERN SCALES LIKE A LITERAL ONE. Both slots of
+# `? LIKE ?` are the fixed THIRTY CHARACTERS - 30 bytes under NONE, 120
+# under UTF8, 30 under WIN1252 - and NOT NULL. This gate first recorded
+# them as "flat, never probed"; they had been measured under NONE alone,
+# where flat and scaled coincide, and the nullability differed even
+# there. A cell measured under one attachment is not a measurement.
+cell "a parameter PATTERN scales too" "SELECT 1 FROM RDB\$DATABASE WHERE ? LIKE ?;"
+cell "...and so does a bound prefix"  "SELECT 1 FROM RDB\$DATABASE WHERE ? STARTING WITH ?;"
+# ...but a NULL pattern does NOT: it stays a bare VARYING(1) CHARACTER
+# SET NONE, nullable, on every attachment. These two pass on BOTH
+# binaries - they are here to pin the boundary the fix must not cross.
+cell "a NULL pattern stays flat"      "SELECT 1 FROM RDB\$DATABASE WHERE ? LIKE NULL;"
+cell "a NULL prefix stays flat"       "SELECT 1 FROM RDB\$DATABASE WHERE ? STARTING WITH NULL;"
+
 # THE SAME TWO RULES IN THE NUMERIC FAMILY, which is where they are
 # easiest to tell apart - and where assuming BETWEEN took the WIDER
 # bound (as IN takes the wider element) would be wrong in BOTH
@@ -245,12 +259,16 @@ cell "a NOT NULL column"             "SELECT 1 FROM T WHERE ? = NN;"
 #   STARTING WITH` resolve here and CONTAINING has no tested-side arm.
 #   It is left for a slice of its own rather than grown into this one.
 #
-#   `? LIKE ?` (a parameter PATTERN) describes both slots as the fixed
-#   30 on both servers, and its charset and nullability were never
-#   probed - so those two slots keep their flat descriptor deliberately.
+#   (The note that stood here - that `? LIKE ?`'s two slots were flat
+#   on both servers and unprobed - was WRONG, and the cells above
+#   replace it: the engine scales that 30 by the attachment and marks
+#   both slots NOT NULL. It had been measured under a NONE attachment
+#   alone, where the scaling is invisible; the nullability was a
+#   divergence even there. It is corrected rather than deleted because
+#   the mistake is the instructive part.)
 
 kill $srv 2>/dev/null; wait $srv 2>/dev/null; trap - EXIT
 rm -f "$WORK" "$REF"
-[ "$ran" -ge 123 ] || { echo "FAIL only $ran checks ran (expected >= 123)"; fail=1; }
+[ "$ran" -ge 135 ] || { echo "FAIL only $ran checks ran (expected >= 135)"; fail=1; }
 [ $fail = 0 ] && echo "PASS bindcs ($ran checks)" || echo "FAIL bindcs"
 exit $fail
