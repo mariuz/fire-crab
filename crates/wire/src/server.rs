@@ -18895,7 +18895,7 @@ fn int_func_form(e: &Expr, descs: &[Descriptor]) -> Option<(Wire, i32, i32)> {
             _ => short,
         }),
         SysFn::Sign => Some(short),
-        SysFn::AsciiVal => Some(short), // SMALLINT (probed)
+        SysFn::AsciiVal | SysFn::AsciiValCs(_) => Some(short), // SMALLINT (probed)
         SysFn::Hash => Some(int64), // BIGINT (probed)
         // ... but over a BLOB argument both lengths are BIGINT
         // (probed: CHAR_LENGTH(<blob>) describes INT64 where
@@ -19558,6 +19558,7 @@ fn fn_answers_text(f: &SysFn) -> bool {
             | SysFn::Position
             | SysFn::Hash
             | SysFn::AsciiVal
+            | SysFn::AsciiValCs(_)
     )
 }
 
@@ -63624,9 +63625,29 @@ enum SysFn {
     /// BIN_SHR(-8,1) = -4); the engine types the result BIGINT.
     BinShl,
     BinShr,
-    /// ASCII_VAL(s) - the SMALLINT code of the first byte (0 for an
-    /// empty string).
+    /// ASCII_VAL(s) - the SMALLINT code of the first BYTE of the operand's
+    /// STORED representation, 0 for an empty string and NULL for NULL.
+    /// Kept for an operand whose character set is not known at
+    /// resolution; where it is, [SysFn::AsciiValCs] carries it.
     AsciiVal,
+    /// ASCII_VAL over an operand whose CHARACTER SET is known - stamped at
+    /// resolution from [cmp_text_charset], the [SysFn::OctetLengthCs]
+    /// precedent. The set decides all three behaviours, each measured
+    /// against the live engine:
+    ///   - a BYTE CARRIER (NONE / OCTETS / ASCII): the decoded char IS the
+    ///     stored byte, so its code is the answer (a NONE 0xE9 is 233);
+    ///   - a TABLED SINGLE-BYTE page (WIN1252, ISO8859_1, ...): the STORED
+    ///     CODEPAGE BYTE, not the Unicode code point the value decoded to
+    ///     - a WIN1252 0x9F is 159, where reading the decoded `char`
+    ///     answered 376 (U+0178): a wrong value with no raise in sight;
+    ///   - a MULTIBYTE set (UTF8): the engine RAISES SQLSTATE 22018
+    ///     *Cannot transliterate character between character sets* when the
+    ///     FIRST character occupies more than one byte, and answers the
+    ///     plain byte when it does not (`'aé'` is 97, not a raise).
+    /// The raise is PER ROW and lands in DELIVERY order (measured: under
+    /// `ORDER BY` the rows before the offending one are delivered first,
+    /// and a row the WHERE excludes never raises at all).
+    AsciiValCs(u8),
     /// HASH(s) - the engine's default WEAK 64-bit hash of the value's
     /// bytes (an ELF-style rolling hash), a BIGINT.
     Hash,
@@ -63765,7 +63786,7 @@ impl SysFn {
             SysFn::BinNot => "BIN_NOT",
             SysFn::BinShl => "BIN_SHL",
             SysFn::BinShr => "BIN_SHR",
-            SysFn::AsciiVal => "ASCII_VAL",
+            SysFn::AsciiVal | SysFn::AsciiValCs(_) => "ASCII_VAL",
             SysFn::Hash => "HASH",
             SysFn::Sqrt => "SQRT",
             SysFn::Power => "POWER",
@@ -65753,7 +65774,7 @@ fn parse_sysfn_call(up: &str, b: &[char], pos: &mut usize) -> Option<RawExpr> {
         | SysFn::Abs
         | SysFn::Sign => (1, 1),
         SysFn::Left | SysFn::Right | SysFn::Mod | SysFn::BinShl | SysFn::BinShr => (2, 2),
-        SysFn::BinNot | SysFn::AsciiVal | SysFn::Hash | SysFn::Sqrt | SysFn::Ln | SysFn::Log10 | SysFn::Exp
+        SysFn::BinNot | SysFn::AsciiVal | SysFn::AsciiValCs(_) | SysFn::Hash | SysFn::Sqrt | SysFn::Ln | SysFn::Log10 | SysFn::Exp
         | SysFn::Sin | SysFn::Cos | SysFn::Tan | SysFn::Cot | SysFn::Asin | SysFn::Acos | SysFn::Atan
         | SysFn::Sinh | SysFn::Cosh | SysFn::Tanh => (1, 1),
         SysFn::Ceil | SysFn::Ceiling | SysFn::Floor => (1, 1),
@@ -67446,6 +67467,21 @@ fn resolve_expr_inner(
                 // its own set's bytes counts THOSE (a WIN1252 'caf\u{e9}'
                 // is 4 octets, not the 5 its UTF-8 spelling would give;
                 // a cast to NONE counts the octets it converted to)
+                // ASCII_VAL needs the operand's set for a DIFFERENT reason
+                // than OCTET_LENGTH, and needs a DIFFERENT helper:
+                // [expr_value_charset] deliberately answers None for UTF8
+                // (whose values ARE their Rust characters) - which is
+                // exactly the set that must RAISE here, so stamping from it
+                // would have produced a fix that never fires on the case it
+                // was written for. [cmp_text_charset] answers the ttype's
+                // set for a column / blob / CAST and the ATTACHMENT's for a
+                // bare literal, which is why `ASCII_VAL('é')` raises under a
+                // UTF8 attachment and answers 195 under a WIN1252 or NONE
+                // one - both measured.
+                (SysFn::AsciiVal, [a]) => match cmp_text_charset(a, descs) {
+                    Some(cs) => SysFn::AsciiValCs(cs),
+                    None => *f,
+                },
                 (SysFn::OctetLength, [a]) => match expr_value_charset(a, descs) {
                     Some(cs) => SysFn::OctetLengthCs(cs),
                     None => *f,
@@ -71933,8 +71969,15 @@ impl Expr {
                     }
                     // ASCII_VAL(text) -> SMALLINT (an integer); a wrong-typed
                     // operand refuses (an unpinned conversion).
-                    SysFn::AsciiVal => {
-                        if ts[0] == ExprType::Text {
+                    // A BARE `NULL` LITERAL IS A LEGAL OPERAND. It types as
+                    // Int here (see the [Expr::Null] arm), so the text test
+                    // alone refused `ASCII_VAL(NULL)` with a contentless
+                    // 42000 where the engine answers NULL - measured. A NULL
+                    // COLUMN was never affected (it types Text and its value
+                    // short-circuits at eval), nor was `CAST(NULL AS
+                    // VARCHAR(4))`; only the untyped literal reached here.
+                    SysFn::AsciiVal | SysFn::AsciiValCs(_) => {
+                        if ts[0] == ExprType::Text || matches!(args[0], Expr::Null) {
                             Some(ExprType::Int)
                         } else {
                             None
@@ -72358,6 +72401,7 @@ impl Expr {
                 | SysFn::Position
                 | SysFn::Sign
                 | SysFn::AsciiVal
+                | SysFn::AsciiValCs(_)
                 | SysFn::Extract(_) => Some(NumRank::Long),
                 SysFn::BlobOctetLength | SysFn::Hash => Some(NumRank::I64),
                 // the exact-rounding family ranks by its RESULT width (which
@@ -74391,6 +74435,52 @@ impl Expr {
                     SysFn::AsciiVal => {
                         let s = fn_text(&vs[0]);
                         Value::Int(s.chars().next().map_or(0, |c| c as i64))
+                    }
+                    // ...and with the operand's CHARACTER SET known, the
+                    // engine's actual law (see [SysFn::AsciiValCs]): the
+                    // STORED byte, and a raise where a multibyte set's first
+                    // character cannot be one. Reading the decoded `char`
+                    // answered the Unicode code point instead - 376 for a
+                    // WIN1252 0x9F the engine calls 159, and 233 for a UTF8
+                    // 'é' the engine refuses to answer at all.
+                    SysFn::AsciiValCs(cs) => {
+                        use fire_crab_ods::intl;
+                        match &vs[0] {
+                            // a NULL operand answers NULL; the column path
+                            // already short-circuits, this keeps the arm
+                            // correct on its own
+                            Value::Null => Value::Null,
+                            v => {
+                                let s = fn_text(v);
+                                match s.chars().next() {
+                                    None => Value::Int(0),
+                                    Some(c) if intl::byte_carrier(*cs) => Value::Int(c as i64),
+                                    Some(c) if intl::bytes_per_char(*cs) > 1 => {
+                                        if c.len_utf8() > 1 {
+                                            return Err(EvalErr::TransliterationFailed);
+                                        }
+                                        Value::Int(c as i64)
+                                    }
+                                    Some(c) => {
+                                        // a tabled single-byte page: encode
+                                        // the character back into the set it
+                                        // came FROM and read that byte. It
+                                        // cannot fail for a value that came
+                                        // from the set - the same argument
+                                        // [SysFn::OctetLengthCs] makes - so
+                                        // the char code stands in if it
+                                        // somehow does.
+                                        let mut buf = [0u8; 4];
+                                        match intl::encode_text(*cs, c.encode_utf8(&mut buf)) {
+                                            Ok(Some(enc)) if !enc.is_empty() => {
+                                                Value::Int(enc[0] as i64)
+                                            }
+                                            _ => Value::Int(c as i64),
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                     // HASH(s): the engine's WeakHashContext over the string
                     // bytes (Hash.cpp) - a 64-bit ELF-style rolling hash.
@@ -91571,7 +91661,17 @@ fn expr_no_raise(e: &Expr, descs: &[Descriptor]) -> bool {
                 SysFn::Abs => safe_num(&args[0]),
                 // ASCII_VAL never raises; ASCII_CHAR raises 22003 unless its
                 // operand is a literal visibly within 0..255
-                SysFn::AsciiVal | SysFn::Hash => true,
+                // HASH never raises. ASCII_VAL DOES, and the old claim that
+                // it did not let a WHERE term be ADMITTED that then answered
+                // where the engine raised (measured: `WHERE ASCII_VAL(<utf8
+                // col>) > 0` counted 3 rows against the engine's 22018).
+                // Only a MULTIBYTE set can raise - a byte carrier and a
+                // tabled single-byte page always have a byte to answer with
+                // - so a STAMPED operand is judged by its set, while an
+                // unstamped one keeps the old answer rather than newly
+                // refusing statements that work today.
+                SysFn::Hash | SysFn::AsciiVal => true,
+                SysFn::AsciiValCs(cs) => fire_crab_ods::intl::bytes_per_char(*cs) == 1,
                 // PI never raises; the other DOUBLE math functions can leave
                 // their domain (SQRT of a negative, LN of <= 0, ...) - defer
                 // to the per-row eval rather than fold at prepare
