@@ -69,7 +69,8 @@ CREATE TABLE T (U VARCHAR(5) CHARACTER SET UTF8,
                 N VARCHAR(5) CHARACTER SET NONE,
                 O VARCHAR(5) CHARACTER SET OCTETS,
                 A VARCHAR(5) CHARACTER SET ASCII,
-                C CHAR(5) CHARACTER SET UTF8);
+                C CHAR(5) CHARACTER SET UTF8,
+                I INTEGER, S SMALLINT, B BIGINT, NN INTEGER NOT NULL);
 COMMIT;
 EOF
     chmod 666 "$1"
@@ -157,20 +158,99 @@ cell "CAST with no charset named"    "SELECT CAST(? AS VARCHAR(5)) FROM RDB\$DAT
 cell "CAST naming UTF8 explicitly"   "SELECT CAST(? AS VARCHAR(5) CHARACTER SET UTF8) FROM RDB\$DATABASE;"
 cell "CAST AS CHAR, naming none"     "SELECT CAST(? AS CHAR(5)) FROM RDB\$DATABASE;"
 
-# RECORDED, NOT FIXED - measured here and left as it is, the honest way
-# round (not an OK cell, and not hidden either):
+# A `?` TAKES THE OTHER SIDE'S OWN DESCRIPTOR.
 #
-#   A `?` TYPED BY A LITERAL is typed from the LITERAL, not defaulted.
-#   `SELECT 1 FROM RDB$DATABASE WHERE ? = 'x'` describes on the engine as
-#   452 TEXT len 1 (the literal's own character count) in the ATTACHMENT's
-#   charset - len 4 cs 4 under UTF8, len 1 cs 53 under WIN1252 - where
-#   fire-crab announces 448 VARYING len 32763 cs 0 on every attachment.
-#   That is a SLOT TYPING defect, not an attachment one: it diverges under
-#   a NONE attachment too, so it is a root of its own and belongs in its
-#   own slice rather than being smuggled into this one.
+# Recorded here and not fixed for one commit, then measured out in full.
+# A slot compared against an EXPRESSION is announced as that expression:
+# its type, its CHARACTER width in the charset the expression resolves
+# to, and - when the expression reads no column - NOT NULL.
+#
+# The three axes, each its own defect and each measured:
+#
+#   TYPE    `? = 1` is a LONG, not a BIGINT; past INTEGER range it IS a
+#           BIGINT (`? = 5000000000`). A text literal is 452 TEXT; a
+#           computed text expression (`||`, UPPER of a column) is 448.
+#   WIDTH   the literal's own character count, scaled to the announced
+#           charset: `? > 'abc'` is 3 bytes NONE, 12 UTF8, 3 WIN1252.
+#   NULL    a slot typed by an expression that reads NO COLUMN is NOT
+#           NULL (`? = 1 + 1`, `? = UPPER('abc')`); one that reads a
+#           column keeps that column's nullability.
+#
+# The last is the one no row-comparison gate could ever catch, and the
+# one that differs on EVERY attachment including NONE.
+echo "-- a ? takes the other side's TYPE and WIDTH --"
+cell "= a 1-char literal"            "SELECT 1 FROM RDB\$DATABASE WHERE ? = 'x';"
+cell "= a 5-char literal"            "SELECT 1 FROM RDB\$DATABASE WHERE ? = 'abcde';"
+cell "the literal on the LEFT"       "SELECT 1 FROM RDB\$DATABASE WHERE 'x' = ?;"
+cell "a non-equality comparison"     "SELECT 1 FROM RDB\$DATABASE WHERE ? > 'abc';"
+cell "BETWEEN takes the LOW bound"   "SELECT 1 FROM RDB\$DATABASE WHERE ? BETWEEN 'a' AND 'bbb';"
+cell "IN takes the WIDEST element"   "SELECT 1 FROM RDB\$DATABASE WHERE ? IN ('a','bb');"
+# ...and the SAME list REORDERED, which is the cell that has teeth: with
+# the widest element FIRST, a server that simply keeps the last one it
+# saw answers 1 where the engine answers 2. The passing cell above has
+# its widest element last and cannot tell the two apart - it was a
+# passenger until these joined it.
+cell "IN, widest element FIRST"      "SELECT 1 FROM RDB\$DATABASE WHERE ? IN ('bb','a');"
+cell "IN, widest element in the MIDDLE" "SELECT 1 FROM RDB\$DATABASE WHERE ? IN ('a','bbb','cc');"
+cell "STARTING WITH types from the prefix" "SELECT 1 FROM RDB\$DATABASE WHERE ? STARTING WITH 'ab';"
+cell "IN, the widest of four"         "SELECT 1 FROM RDB\$DATABASE WHERE ? IN ('a','bbbb','cc','d');"
+cell "BETWEEN, equal-width bounds"    "SELECT 1 FROM RDB\$DATABASE WHERE ? BETWEEN 'aa' AND 'bb';"
+
+# THE SAME TWO RULES IN THE NUMERIC FAMILY, which is where they are
+# easiest to tell apart - and where assuming BETWEEN took the WIDER
+# bound (as IN takes the wider element) would be wrong in BOTH
+# directions. These run under ONE attachment: an INT64 slot has no
+# charset, so running them under three would triple the cost for no
+# information.
+echo "-- ...and the same two rules over NUMERIC lists --"
+cell "BETWEEN low=NARROW decides"     "SELECT 1 FROM RDB\$DATABASE WHERE ? BETWEEN 1 AND 5000000000;" NONE
+cell "BETWEEN low=WIDE decides"       "SELECT 1 FROM RDB\$DATABASE WHERE ? BETWEEN 5000000000 AND 1;" NONE
+cell "BETWEEN low drops the scale"    "SELECT 1 FROM RDB\$DATABASE WHERE ? BETWEEN 1 AND 2.5;" NONE
+cell "BETWEEN low KEEPS the scale"    "SELECT 1 FROM RDB\$DATABASE WHERE ? BETWEEN 2.5 AND 1;" NONE
+cell "IN, the wide one LAST"          "SELECT 1 FROM RDB\$DATABASE WHERE ? IN (1, 5000000000);" NONE
+cell "IN, the wide one FIRST"         "SELECT 1 FROM RDB\$DATABASE WHERE ? IN (5000000000, 1);" NONE
+cell "IN, both narrow"                "SELECT 1 FROM RDB\$DATABASE WHERE ? IN (1, 2);" NONE
+cell "IN, a scaled item outranks"     "SELECT 1 FROM RDB\$DATABASE WHERE ? IN (1, 2.5);" NONE
+cell "a LIKE pattern is VARYING"     "SELECT 1 FROM RDB\$DATABASE WHERE ? LIKE 'a%';"
+cell "an integer literal is a LONG"  "SELECT 1 FROM RDB\$DATABASE WHERE ? = 1;"
+cell "...and past INTEGER, a BIGINT" "SELECT 1 FROM RDB\$DATABASE WHERE ? = 5000000000;"
+cell "a scaled literal keeps scale"  "SELECT 1 FROM RDB\$DATABASE WHERE ? = 1.5;"
+cell "a DATE literal"                "SELECT 1 FROM RDB\$DATABASE WHERE ? = DATE '2020-01-01';"
+
+echo "-- ...and NOT NULL exactly when the side reads no column --"
+cell "folded literals are NOT NULL"  "SELECT 1 FROM RDB\$DATABASE WHERE ? = 1 + 1;"
+cell "a CAST of a literal, NOT NULL" "SELECT 1 FROM RDB\$DATABASE WHERE ? = CAST('x' AS CHAR(3));"
+cell "a VARCHAR cast is 448"         "SELECT 1 FROM RDB\$DATABASE WHERE ? = CAST('x' AS VARCHAR(3));"
+cell "a function OF a literal"       "SELECT 1 FROM RDB\$DATABASE WHERE ? = UPPER('abc');"
+cell "an expression OVER a column stays nullable" "SELECT 1 FROM T WHERE ? = I + 1;"
+cell "a text expression over a column" "SELECT 1 FROM T WHERE ? = U || 'x';"
+cell "UPPER of a column"             "SELECT 1 FROM T WHERE ? = UPPER(U);"
+
+# THE CONTROLS. A bare column on the other side has taken the column's
+# own descriptor since long before this slice, and must keep doing so -
+# these pass on BOTH binaries, which is what separates a control from a
+# passenger.
+echo "-- controls: a bare COLUMN side, unchanged by this slice --"
+cell "a SMALLINT column"             "SELECT 1 FROM T WHERE ? = S;"
+cell "a BIGINT column"               "SELECT 1 FROM T WHERE ? = B;"
+cell "a nullable INTEGER column"     "SELECT 1 FROM T WHERE ? = I;"
+cell "a NOT NULL column"             "SELECT 1 FROM T WHERE ? = NN;"
+
+# RECORDED, NOT FIXED - measured beside the cells above:
+#
+#   `? CONTAINING 'abc'` describes on the engine as 448 VARYING at the
+#   pattern's character width (3 bytes NONE), NOT NULL - and fire-crab
+#   REFUSES the statement outright, describing nothing at all. That is a
+#   missing predicate shape, not a describe defect: `? LIKE` and `?
+#   STARTING WITH` resolve here and CONTAINING has no tested-side arm.
+#   It is left for a slice of its own rather than grown into this one.
+#
+#   `? LIKE ?` (a parameter PATTERN) describes both slots as the fixed
+#   30 on both servers, and its charset and nullability were never
+#   probed - so those two slots keep their flat descriptor deliberately.
 
 kill $srv 2>/dev/null; wait $srv 2>/dev/null; trap - EXIT
 rm -f "$WORK" "$REF"
-[ "$ran" -ge 34 ] || { echo "FAIL only $ran checks ran (expected >= 34)"; fail=1; }
+[ "$ran" -ge 123 ] || { echo "FAIL only $ran checks ran (expected >= 123)"; fail=1; }
 [ $fail = 0 ] && echo "PASS bindcs ($ran checks)" || echo "FAIL bindcs"
 exit $fail

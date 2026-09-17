@@ -18746,6 +18746,36 @@ fn text_form(e: &Expr, descs: &[Descriptor]) -> Option<(bool, i32, TfCs)> {
     text_form_m(e, descs, |s| s.chars().count() as i32)
 }
 
+/// The CHARACTER SET a `?` slot claims when the OTHER side of its
+/// predicate is a text expression - the sentinel encoding
+/// [build_expr_col_from] uses for a projection column, and for the same
+/// reason: the set is not known until the describe is emitted.
+/// NONE/OCTETS are announced as they stand (one byte per character).
+fn text_param_cs(e: &Expr, descs: &[Descriptor]) -> i16 {
+    match text_form(e, descs) {
+        Some((_, _, TfCs::Ttype(t))) => {
+            let id = fire_crab_ods::intl::charset_id(t as i16);
+            if id <= 1 { t as i16 } else { enc_real_cs(id) as i16 }
+        }
+        Some((_, _, TfCs::Att)) => ATT_SUBTYPE as i16,
+        None => 0,
+    }
+}
+
+/// That expression's FORM and CHARACTER width - `(varying, chars)`.
+///
+/// A literal carries TWO widths (its characters and its source octets)
+/// and a descriptor has ONE length, so the choice [resolve_text_cs]
+/// makes at emission is made here instead: a single-byte attachment
+/// measures a literal in octets. The attachment is known at prepare -
+/// [CURRENT_ATT_CS] is set before planning - which is the whole reason
+/// this can be decided at all.
+fn text_param_width(e: &Expr, descs: &[Descriptor]) -> Option<(bool, i32)> {
+    let att = AttCs::by_id(CURRENT_ATT_CS.with(|c| c.get()));
+    let form = if att.bpc == 1 { text_form_oct(e, descs) } else { text_form(e, descs) };
+    form.map(|(v, w, _)| (v, w))
+}
+
 /// The same widths, with a LITERAL measured the way a SINGLE-BYTE
 /// attachment measures one: every OCTET of the source text is a
 /// character of it.
@@ -80739,8 +80769,21 @@ fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
                             kind: RawKind::Cmp(op, param.clone()),
                         }))
                     };
+                    // THE LOW BOUND TYPES THE SLOT, and it does so
+                    // POSITIONALLY - not by being the wider. Measured:
+                    // `? BETWEEN 1 AND 5000000000` is a LONG (the low
+                    // bound, the NARROWER one) and `? BETWEEN 5000000000
+                    // AND 1` a BIGINT; `BETWEEN 1 AND 2.5` drops the
+                    // scale and `BETWEEN 2.5 AND 1` keeps it; `BETWEEN
+                    // 'a' AND 'bbb'` is one character.
+                    //
+                    // Each leaf claims the one slot as it resolves, so
+                    // the LAST one wins - and the low leaf goes last for
+                    // exactly that reason. An AND of two comparisons is
+                    // order-insensitive, so this changes only which
+                    // descriptor survives.
                     let body =
-                        Ast::And(vec![leaf(&lo, Cmp::Le)?, leaf(&hi, Cmp::Ge)?]);
+                        Ast::And(vec![leaf(&hi, Cmp::Ge)?, leaf(&lo, Cmp::Le)?]);
                     *pos = p4;
                     *np = np2;
                     return Some(if negated { Ast::Not(Box::new(body)) } else { body });
@@ -80772,8 +80815,36 @@ fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
                     if any_str && any_num {
                         return None;
                     }
+                    // THE WIDEST ITEM TYPES THE SLOT, wherever it sits
+                    // in the list - the opposite rule to BETWEEN's, and
+                    // measured across both families: `IN (5000000000, 1)`
+                    // is a BIGINT, `IN (1, 2.5)` a scaled INT64, and
+                    // `IN ('a','bbbb','cc','d')` four characters. Each
+                    // leaf claims the one slot as it resolves, so the
+                    // widest goes LAST; the sort is STABLE, so equal
+                    // widths keep the order they had (and with it
+                    // today's answer for a list of one width).
+                    //
+                    // A NULL item never decides: `? IN (1, NULL)` was
+                    // not probed, so it ranks below every typed item
+                    // rather than being given a rule it was not measured
+                    // to have.
+                    let rank = |r: &Rhs| -> (u8, i64) {
+                        match r {
+                            Rhs::Str(v) => (1, v.chars().count() as i64),
+                            // an integer literal is a LONG while it fits
+                            // 32 bits, a BIGINT past it ([result_width_bytes])
+                            Rhs::Int(n) => (1, if i32::try_from(*n).is_ok() { 4 } else { 8 }),
+                            // a scaled literal is an INT64 and outranks
+                            // an unscaled one of the same magnitude
+                            Rhs::Num(..) => (1, 8),
+                            _ => (0, 0),
+                        }
+                    };
+                    let mut ordered: Vec<&Rhs> = items.iter().collect();
+                    ordered.sort_by_key(|r| rank(r));
                     let mut ors = Vec::new();
-                    for item in &items {
+                    for item in ordered {
                         ors.push(Ast::Leaf(RawTerm {
                             lhs: RawLhs::Expr(raw_of(item)?),
                             kind: RawKind::Cmp(Cmp::Eq, param.clone()),
@@ -89031,6 +89102,22 @@ fn resolve_param_lhs(
         flags: 0,
         offset: 4,
     };
+    // A LITERAL PATTERN'S SLOT IS THE ATTACHMENT'S CHARSET, AND NOT
+    // NULL. The width is the pattern's CHARACTERS, so the sentinel
+    // scales it at emission ([resolve_text_cs]): `? LIKE 'a%'` is
+    // announced 2 bytes NONE, 8 UTF8, 2 WIN1252 - measured, and it was
+    // a flat charset 0 on every attachment before. It cannot be null
+    // either: the slot is typed by a literal, which the engine says so
+    // for (no `Nullable` on any of the three).
+    //
+    // The PARAMETER-pattern and NULL-pattern cases keep the flat
+    // descriptor above: `? LIKE ?`'s charset and nullability were never
+    // probed, and stamping them would be a guess.
+    let lit_pat_desc = |chars: usize| Descriptor {
+        sub_type: ATT_SUBTYPE as i16,
+        flags: PARAM_NOT_NULL,
+        ..text_desc_chars(chars)
+    };
     // the width of a `?` pattern against another `?` (or the tested `?`
     // when the pattern is itself a `?`): 30, matching numeric_term's slot
     let param_pat_chars = (NUM_LIKE_PATTERN_LEN - 2) as usize;
@@ -89056,7 +89143,7 @@ fn resolve_param_lhs(
         RawKind::Like(pattern, escape, negated) => {
             match pattern {
                 Rhs::Str(p) => {
-                    claim(slot, text_desc_chars(p.chars().count()));
+                    claim(slot, lit_pat_desc(p.chars().count()));
                     Term::ParamLike(slot, pattern.clone(), *escape, *negated)
                 }
                 Rhs::Param(pslot, _) => {
@@ -89082,7 +89169,7 @@ fn resolve_param_lhs(
         RawKind::Starting(prefix, negated) => {
             match prefix {
                 Rhs::Str(p) => {
-                    claim(slot, text_desc_chars(p.chars().count()));
+                    claim(slot, lit_pat_desc(p.chars().count()));
                     Term::ParamStarting(slot, prefix.clone(), *negated)
                 }
                 Rhs::Param(pslot, _) => {
@@ -89202,20 +89289,72 @@ fn resolve_expr_term(
         // a `?` against the expression side: synthesize the bind
         // target from the expression's type and defer to bind()
         RawKind::Cmp(op, Rhs::Param(slot, _)) => {
+            // THE SLOT TAKES THE OTHER SIDE'S OWN DESCRIPTOR, which is
+            // what the engine announces - measured slot by slot with
+            // SQLDA_DISPLAY: `? = 1` is a LONG (not this server's
+            // BIGINT), `? = 'abcde'` a TEXT of five CHARACTERS in the
+            // attachment's charset (not a 32765-byte NONE catch-all),
+            // `? = U || 'x'` a VARYING of the JOINED charset.
+            //
+            // ...AND IT IS NOT NULL WHEN THE EXPRESSION READS NO COLUMN.
+            // A slot typed by a literal can never be null, and the
+            // engine says so: `? = 1 + 1`, `? = CAST('x' AS CHAR(3))`
+            // and `? = UPPER('abc')` are all NOT NULL, while `? = I + 1`
+            // and `? = UPPER(U)` stay nullable - the difference is
+            // exactly [expr_has_col].
+            let nn = !expr_has_col(&lhs);
+            let flags = if nn { PARAM_NOT_NULL } else { 0 };
             let d = |dt: u8, len: u16, sc: i8| Descriptor {
                 dtype: dt,
                 scale: sc,
                 length: len,
                 sub_type: 0,
-                flags: 0,
+                flags,
                 offset: 4,
             };
             let (desc, kind) = match lhs.type_of(descs)? {
-                ExprType::Int => (d(dtype::INT64, 8, 0), ColKind::Int),
+                // the expression's own integer width ([result_width_bytes],
+                // whose doc already carries the probe: a literal is LONG
+                // when it fits 32 bits, BIGINT past it, never SMALLINT)
+                ExprType::Int => {
+                    let bytes = result_width_bytes(&lhs, descs);
+                    let dt = match bytes {
+                        2 => dtype::SHORT,
+                        4 => dtype::LONG,
+                        16 => dtype::INT128,
+                        _ => dtype::INT64,
+                    };
+                    (d(dt, bytes as u16, 0), ColKind::Int)
+                }
                 ExprType::Numeric => {
                     (d(dtype::INT64, 8, lhs.result_scale(descs)?), ColKind::Numeric)
                 }
-                ExprType::Text => (d(dtype::VARYING, 32765, 0), ColKind::Text),
+                // a fixed-text side (a literal, CAST AS CHAR, UPPER of
+                // one) is 452 TEXT and a varying one 448, at a CHARACTER
+                // width behind the charset sentinel - the same pair
+                // [build_expr_col_from] announces for a projection
+                ExprType::Text => {
+                    let desc = match text_param_width(&lhs, descs) {
+                        Some((varying, w)) => {
+                            let (dt, len) = if varying {
+                                (dtype::VARYING, (w as u16).saturating_add(2))
+                            } else {
+                                (dtype::TEXT, w as u16)
+                            };
+                            Descriptor {
+                                dtype: dt,
+                                scale: 0,
+                                length: len,
+                                sub_type: text_param_cs(&lhs, descs),
+                                flags,
+                                offset: 4,
+                            }
+                        }
+                        // no statically known width: the old catch-all
+                        None => d(dtype::VARYING, 32765, 0),
+                    };
+                    (desc, ColKind::Text)
+                }
                 // a temporal or approximate side asks the client for
                 // that type: the descriptor IS the contract, so the
                 // driver encodes a DATE where a DATE is announced and
@@ -89362,20 +89501,29 @@ fn resolve_expr_term(
                 // the fixed 30, matching the literal-pattern arm above,
                 // which already accepts a numeric side
                 ExprType::Int | ExprType::Numeric => NUM_LIKE_PATTERN_LEN,
-                ExprType::Text => text_form(&lhs, descs)
-                    .map(|(_, w, _)| (w as u16).saturating_add(2))
+                ExprType::Text => text_param_width(&lhs, descs)
+                    .map(|(_, w)| (w as u16).saturating_add(2))
                     .unwrap_or(32765),
                 _ => return None,
             };
             if params.len() <= *slot {
                 params.resize(*slot + 1, None);
             }
+            // A PATTERN IS ALWAYS VARYING, whatever form the side has -
+            // but its CHARSET is the side's, through the same sentinel
+            // the comparison arm uses (`? LIKE 'a%'` is announced in the
+            // attachment's set, measured). The numeric side's fixed 30
+            // keeps its flat ttype: its charset is not measured here.
             params[*slot] = Some(Descriptor {
                 dtype: dtype::VARYING,
                 scale: 0,
                 length,
-                sub_type: 0,
-                flags: 0,
+                sub_type: if matches!(lhs.type_of(descs), Some(ExprType::Text)) {
+                    text_param_cs(&lhs, descs)
+                } else {
+                    0
+                },
+                flags: if expr_has_col(&lhs) { 0 } else { PARAM_NOT_NULL },
                 offset: 4,
             });
             Term::ExprLikeParam(Box::new(lhs), *slot, *escape, *negated)
@@ -102154,12 +102302,19 @@ mod tests {
         let (d, _) = dnf("? IS NOT NULL");
         assert!(matches!(&d.0[0][0].kind, RawKind::IsNotNull));
         // ? BETWEEN desugars into the mirrored comparisons, BOTH
-        // referencing the ONE slot (lo <= ?, hi >= ?)
+        // referencing the ONE slot (lo <= ?, hi >= ?) - with the HIGH
+        // leaf FIRST, so that the LOW one resolves LAST and is the one
+        // that types the slot. THE ORDER IS LOAD-BEARING: the engine
+        // describes the slot from the low bound POSITIONALLY, not from
+        // the wider one (`? BETWEEN 1 AND 5000000000` is a LONG and
+        // `? BETWEEN 5000000000 AND 1` a BIGINT - measured), and each
+        // leaf claims the slot as it resolves.
         let (d, np) = dnf("? BETWEEN 1 AND 3");
         assert_eq!((np, d.0.len(), d.0[0].len()), (1, 1, 2));
-        assert!(matches!(&d.0[0][0].kind, RawKind::Cmp(Cmp::Le, Rhs::Param(0, _))));
-        assert!(matches!(&d.0[0][1].kind, RawKind::Cmp(Cmp::Ge, Rhs::Param(0, _))));
-        assert!(matches!(&d.0[0][0].lhs, RawLhs::Expr(RawExpr::Int(1))));
+        assert!(matches!(&d.0[0][0].kind, RawKind::Cmp(Cmp::Ge, Rhs::Param(0, _))));
+        assert!(matches!(&d.0[0][1].kind, RawKind::Cmp(Cmp::Le, Rhs::Param(0, _))));
+        assert!(matches!(&d.0[0][0].lhs, RawLhs::Expr(RawExpr::Int(3))));
+        assert!(matches!(&d.0[0][1].lhs, RawLhs::Expr(RawExpr::Int(1))));
         // ? IN is an OR of mirrored equalities over the one slot
         let (d, np) = dnf("? IN (1, 2)");
         assert_eq!((np, d.0.len()), (1, 2));
