@@ -2603,7 +2603,7 @@ impl CryptOffer {
 /// planners overwrite it on the COPY they register.
 const PARAM_NOT_NULL: u16 = 8;
 
-fn append_bind_section(d: &mut Vec<u8>, params: &[Descriptor]) {
+fn append_bind_section(d: &mut Vec<u8>, params: &[Descriptor], att: AttCs) {
     fn int_item(d: &mut Vec<u8>, code: u8, val: i32) {
         d.push(code);
         d.extend_from_slice(&4u16.to_le_bytes());
@@ -2612,7 +2612,10 @@ fn append_bind_section(d: &mut Vec<u8>, params: &[Descriptor]) {
     d.push(5); // isc_info_sql_bind (bare)
     int_item(d, 7, params.len() as i32); // describe_vars
     for (i, pd) in params.iter().enumerate() {
-        let (_, sql_type, length, scale, sub_type) = wire_for(pd);
+        let (wire, sql_type, length, scale, sub_type) = wire_for(pd);
+        // ...and in the ATTACHMENT's character set, exactly as an output
+        // column is ([bind_text_cs])
+        let (sub_type, length) = bind_text_cs(wire, sub_type, length, &att);
         // NULLABLE unless the planner marked the destination NOT NULL
         let sql_type =
             if pd.flags & PARAM_NOT_NULL != 0 { sql_type } else { nullable(sql_type) };
@@ -2630,7 +2633,7 @@ fn append_bind_section(d: &mut Vec<u8>, params: &[Descriptor]) {
 
 /// The describe buffer describing exactly one BIGINT column - the
 /// reciprocal of the client's parse_describe.
-fn describe_one_bigint(params: &[Descriptor]) -> Vec<u8> {
+fn describe_one_bigint(params: &[Descriptor], att: AttCs) -> Vec<u8> {
     let mut d = Vec::new();
     let item = |d: &mut Vec<u8>, code: u8, val: i32| {
         d.push(code);
@@ -2638,7 +2641,7 @@ fn describe_one_bigint(params: &[Descriptor]) -> Vec<u8> {
         d.extend_from_slice(&val.to_le_bytes());
     };
     item(&mut d, 21, 1); // isc_info_sql_stmt_type = select(1)
-    append_bind_section(&mut d, params);
+    append_bind_section(&mut d, params, att);
     d.push(4); // isc_info_sql_select (bare)
     item(&mut d, 7, 1); // describe_vars: 1 column
     item(&mut d, 9, 1); // sqlda_seq = 1
@@ -2654,7 +2657,7 @@ fn describe_one_bigint(params: &[Descriptor]) -> Vec<u8> {
 /// The describe buffer for a DML statement: its statement type
 /// (isc_info_sql_stmt_ insert=2, update=3, delete=4), its parameters,
 /// no output columns - the client executes without fetching.
-fn describe_dml(stmt_type: i32, params: &[Descriptor]) -> Vec<u8> {
+fn describe_dml(stmt_type: i32, params: &[Descriptor], att: AttCs) -> Vec<u8> {
     let mut d = Vec::new();
     let item = |d: &mut Vec<u8>, code: u8, val: i32| {
         d.push(code);
@@ -2662,7 +2665,7 @@ fn describe_dml(stmt_type: i32, params: &[Descriptor]) -> Vec<u8> {
         d.extend_from_slice(&val.to_le_bytes());
     };
     item(&mut d, 21, stmt_type); // isc_info_sql_stmt_type
-    append_bind_section(&mut d, params);
+    append_bind_section(&mut d, params, att);
     d.push(4); // isc_info_sql_select
     item(&mut d, 7, 0); // 0 output columns
     d.push(8); // describe_end
@@ -2721,7 +2724,7 @@ fn build_describe(cols: &[ProjCol], params: &[Descriptor], att: AttCs) -> Vec<u8
         d.extend_from_slice(s.as_bytes());
     }
     int_item(&mut d, 21, 1); // isc_info_sql_stmt_type = select
-    append_bind_section(&mut d, params);
+    append_bind_section(&mut d, params, att);
     d.push(4); // isc_info_sql_select
     int_item(&mut d, 7, cols.len() as i32); // describe_vars: N columns
     for (i, c) in cols.iter().enumerate() {
@@ -8881,6 +8884,30 @@ fn resolve_text_cs(sub: i32, len: i32, oct: i32, att: &AttCs) -> (i32, i32) {
         }
     } else {
         (sub, len)
+    }
+}
+
+/// An INPUT (bind) slot's `(sub_type, length)`, resolved the way the
+/// engine announces it: **a parameter is described in the ATTACHMENT's
+/// character set whenever that is non-NONE**, its CHARACTER count
+/// preserved and its byte length rescaled - measured slot by slot
+/// against the live engine (`SET SQLDA_DISPLAY ON`), which is where
+/// [resolve_text_cs] came from in the first place. A `VARCHAR(5)
+/// WIN1252` destination under a UTF8 attachment is 20 bytes charset 4,
+/// a `VARCHAR(5) UTF8` one under WIN1252 is 5 bytes charset 53, and the
+/// attachment overrides even an EXPLICIT `CAST(? AS VARCHAR(5)
+/// CHARACTER SET UTF8)`. The exceptions are the byte carriers NONE and
+/// OCTETS, never transliterated - while ASCII IS, which is why this
+/// reuses `resolve_text_cs` (whose rule is `col_cs > 1`) rather than
+/// `intl::byte_carrier` (which counts ASCII as a carrier).
+///
+/// Only the text wires: a BLOB carries its charset in `scale` and a
+/// numeric its subtype, the same guard [build_describe] applies.
+fn bind_text_cs(wire: Wire, sub_type: i32, length: i32, att: &AttCs) -> (i32, i32) {
+    if matches!(wire, Wire::Text | Wire::Varying) {
+        resolve_text_cs(sub_type, length, length, att)
+    } else {
+        (sub_type, length)
     }
 }
 
@@ -56711,7 +56738,7 @@ fn describe_for(plan: &Plan, params: &[Descriptor], att: AttCs) -> Vec<u8> {
         Plan::Scalar(_, name, fname, ty) => {
             build_describe(&[scalar_col(name, fname, *ty)], params, att)
         }
-        Plan::GenIdIncrement { .. } => describe_one_bigint(params),
+        Plan::GenIdIncrement { .. } => describe_one_bigint(params, att),
         // the procedure's output parameters, described like a projection
         Plan::ProcCall { cols, .. } | Plan::ProcInvoke { cols, .. } => build_describe(cols, params, att),
         Plan::Union { cols, .. }
@@ -56747,17 +56774,17 @@ fn describe_for(plan: &Plan, params: &[Descriptor], att: AttCs) -> Vec<u8> {
         | Plan::AlterTableAddKey { .. } | Plan::AlterTableAddCheck { .. } | Plan::CreateTrigger { .. } | Plan::AlterTableDropConstraint { .. }
         | Plan::AlterTableDrop { .. }
         | Plan::AlterColumnType { .. } | Plan::AlterColumnNull { .. } | Plan::AlterColumnDefault { .. } | Plan::AlterColumnRestart { .. } | Plan::AlterColumnGenerated { .. } | Plan::AlterColumnDropIdentity { .. } | Plan::AlterColumnPosition { .. } => {
-            describe_dml(5, params) // isc_info_sql_stmt_ddl
+            describe_dml(5, params, att) // isc_info_sql_stmt_ddl
         }
-        Plan::Insert { .. } => describe_dml(2, params), // isc_info_sql_stmt_insert
+        Plan::Insert { .. } => describe_dml(2, params, att), // isc_info_sql_stmt_insert
         // the engine types UPDATE OR INSERT as an INSERT
         // (UpdateOrInsertNode sets TYPE_INSERT)
-        Plan::UpdateOrInsert { .. } => describe_dml(2, params),
+        Plan::UpdateOrInsert { .. } => describe_dml(2, params, att),
         // MergeNode::dsqlPass: TYPE_INSERT without RETURNING (StmtNodes.cpp:7646)
-        Plan::Merge { .. } => describe_dml(2, params),
-        Plan::Update { .. } => describe_dml(3, params), // isc_info_sql_stmt_update
-        Plan::Delete { .. } => describe_dml(4, params), // isc_info_sql_stmt_delete
-        Plan::ViewTrig { action, .. } => describe_dml(view_trig_stmt_type(*action), params),
+        Plan::Merge { .. } => describe_dml(2, params, att),
+        Plan::Update { .. } => describe_dml(3, params, att), // isc_info_sql_stmt_update
+        Plan::Delete { .. } => describe_dml(4, params, att), // isc_info_sql_stmt_delete
+        Plan::ViewTrig { action, .. } => describe_dml(view_trig_stmt_type(*action), params, att),
         Plan::Project { cols, .. } => build_describe(cols, params, att),
         Plan::Join { cols, .. } | Plan::JoinGroup { cols, .. } => build_describe(cols, params, att),
         Plan::Lateral { cols, .. } => build_describe(cols, params, att),
@@ -56765,8 +56792,8 @@ fn describe_for(plan: &Plan, params: &[Descriptor], att: AttCs) -> Vec<u8> {
         Plan::VirtualEmpty { .. } => build_describe(&output_cols_of(plan), params, att),
         Plan::Rows { cols, .. } => build_describe(cols, params, att),
         Plan::Returning { cols, .. } => build_describe(cols, params, att),
-        Plan::SetGenerator { stmt_type, .. } => describe_dml(*stmt_type, params),
-        Plan::InsertSelect { .. } => describe_dml(2, params), // isc_info_sql_stmt_insert
+        Plan::SetGenerator { stmt_type, .. } => describe_dml(*stmt_type, params, att),
+        Plan::InsertSelect { .. } => describe_dml(2, params, att), // isc_info_sql_stmt_insert
         // isc_info_sql_stmt_commit (?) - no columns either way
         // a block projects nothing: no cursor, no columns
         Plan::ExecBlock { .. } => build_describe(&[], params, att),
@@ -57237,7 +57264,10 @@ fn answer_prepare(items: &[u8], plan: &Plan, params: &[Descriptor], att: AttCs) 
     let bind_vars: Vec<Var> = params
         .iter()
         .map(|pd| {
-            let (_, sql_type, length, scale, sub_type) = wire_for(pd);
+            let (wire, sql_type, length, scale, sub_type) = wire_for(pd);
+            // an input slot travels in the attachment's charset, the
+            // mirror of the out_vars resolution just above
+            let (sub_type, length) = bind_text_cs(wire, sub_type, length, &att);
             // an input parameter is NULLABLE unless its destination
             // column forbids it ([PARAM_NOT_NULL]) - the same rule
             // [append_bind_section] follows for the other describe shape
@@ -65658,16 +65688,27 @@ fn cast_target_descriptor(t: &CastTarget) -> Option<Descriptor> {
     })
 }
 
-/// The BYTE width and ttype a text cast target declares: a character
-/// count times the named character set's bytes per character, or the
-/// plain count when the target names none (the attachment resolves it).
+/// The CHARACTER count and sub_type sentinel a text cast target
+/// declares - resolved to a charset and a BYTE width at emission by
+/// [resolve_text_cs], through [bind_text_cs].
+///
+/// It carried the byte width and a flat ttype before, which announced
+/// `CAST(? AS VARCHAR(5))` as CHARACTER SET NONE on every attachment
+/// where the engine announces the ATTACHMENT's set - and a bare 0 is
+/// indistinguishable from a genuine NONE COLUMN, which the engine does
+/// NOT transliterate. The sentinels carry that difference: `ATT_SUBTYPE`
+/// is "whatever the attachment is", `enc_real_cs(c)` is "this set,
+/// unless an attachment overrides it" - which is what the engine does to
+/// an explicit `CAST(? AS VARCHAR(5) CHARACTER SET UTF8)` under a
+/// WIN1252 attachment (measured: 5 bytes, charset 53).
+///
+/// Only the describe reads these: the prepared parameter list reaches
+/// [answer_prepare]/[append_bind_section] and the arity check, and
+/// nothing else - a bound value is fitted from the CAST target itself.
 fn cast_text_bytes(len: usize, cs: Option<u8>) -> (u16, i16) {
     match cs {
-        Some(c) => (
-            (len as u16).saturating_mul(fire_crab_ods::intl::bytes_per_char(c) as u16),
-            c as i16,
-        ),
-        None => (len as u16, 0),
+        Some(c) => (len as u16, enc_real_cs(c) as i16),
+        None => (len as u16, ATT_SUBTYPE as i16),
     }
 }
 
@@ -101002,7 +101043,7 @@ mod tests {
     #[test]
     fn describe_buffer_is_parseable() {
         // the describe the server produces must satisfy the client parser
-        let d = describe_one_bigint(&[]);
+        let d = describe_one_bigint(&[], AttCs::NONE);
         // marker [4,7,4,0] must be present
         assert!(d.windows(4).any(|w| w == [4, 7, 4, 0]));
     }
@@ -102478,7 +102519,7 @@ mod tests {
     fn bind_section_describes_params() {
         let params = vec![desc(dtype::LONG, 4, 0), desc(dtype::VARYING, 22, 0)];
         let mut d = Vec::new();
-        append_bind_section(&mut d, &params);
+        append_bind_section(&mut d, &params, AttCs::NONE);
         // section marker + count 2
         assert_eq!(&d[..7], &[5, 7, 4, 0, 2, 0, 0]);
         // both sqlda_seq items present, each var closed with describe_end
