@@ -98,5 +98,51 @@ if [ -n "$RIG2" ]; then
     else echo "DIFF projection param + WHERE param"; echo "     engine: $e"; echo "     fcrab:  $c"; fail=1; fi
 fi
 
+# --- a projection `?` UNDER A WRAPPER ----------------------------------
+# FIRST / SKIP / DISTINCT and a UNION branch all refused an ordinary
+# projection parameter. A modifier's own columns are POSITIONAL with
+# `expr: None`, so the `?` lives in the plan BELOW it and a top-level
+# test saw nothing - [plan_has_proj_param] and [bind_plan_params] now
+# walk through the wrappers.
+#
+# The C rig above binds ONE scalar; these need a client that ships an
+# argument list, so they run through node - skipped cleanly without it.
+if command -v node >/dev/null 2>&1 && node -e 'require("node-firebird")' >/dev/null 2>&1; then
+    qrun() { # <sql> <json args> <port> <db>
+        FC_Q="$1" FC_A="$2" FC_PORT="$3" FC_DB="$4" node -e '
+          process.on("uncaughtException", () => { console.log("CONN_ERR"); process.exit(0); });
+          const F=require("node-firebird");
+          F.attach({host:"127.0.0.1",port:+process.env.FC_PORT,database:process.env.FC_DB,
+                    user:"SYSDBA",password:"masterkey"},(e,db)=>{
+            if(e){console.log("CONN_ERR");process.exit(0);}
+            db.query(process.env.FC_Q,JSON.parse(process.env.FC_A),(e2,r)=>{
+              if(e2){console.log("ERR "+(e2.message||"").split("\n")[0].slice(0,50));db.detach();process.exit(0);}
+              console.log(JSON.stringify(Array.isArray(r)?r:(r?[r]:[])));
+              db.detach();process.exit(0);});});' 2>/dev/null
+    }
+    bothq() { # <label> <sql> <json args>
+        local a b
+        a=$(qrun "$2" "$3" "$PORT" "$FDB")
+        b=$(qrun "$2" "$3" "$REAL" "$EDB")
+        ran=$((ran + 1))
+        # a side that did not ANSWER is not agreement
+        if [ "$a" = "CONN_ERR" ] || [ "$b" = "CONN_ERR" ] || [ -z "$a" ] || [ -z "$b" ]; then
+            echo "DIFF $1 $3 [VACUOUS: a side did not answer] fc=[$a] engine=[$b]"; fail=1; return
+        fi
+        if [ "$a" = "$b" ]; then echo "OK   $1 $3: $a"
+        else echo "DIFF $1 $3"; echo "     engine: $b"; echo "     fcrab:  $a"; fail=1; fi
+    }
+    bothq "a projection ? under FIRST"    "SELECT FIRST 1 CAST(? AS INTEGER) AS C, X FROM T ORDER BY X" '[5]'
+    bothq "a projection ? under SKIP"     "SELECT SKIP 1 CAST(? AS INTEGER) AS C, X FROM T ORDER BY X" '[5]'
+    bothq "a projection ? under DISTINCT" "SELECT DISTINCT CAST(? AS INTEGER) AS C FROM T" '[5]'
+    bothq "a projection ? in a UNION branch" "SELECT CAST(? AS INTEGER) AS C FROM T WHERE X = 7 UNION ALL SELECT 99 FROM RDB\$DATABASE" '[5]'
+    # the teeth: the WHERE excludes every row, so a projection that was
+    # never bound cannot hide behind a row that happens to exist
+    bothq "...FIRST with a WHERE that EXCLUDES" "SELECT FIRST 1 CAST(? AS INTEGER) AS C, X FROM T WHERE X > ? ORDER BY X" '[5,99]'
+    bothq "...and one that KEEPS a row"         "SELECT FIRST 1 CAST(? AS INTEGER) AS C, X FROM T WHERE X > ? ORDER BY X" '[5,0]'
+    # the control: the same projection ? with no wrapper worked before
+    bothq "CONTROL no wrapper"            "SELECT CAST(? AS INTEGER) AS C, X FROM T ORDER BY X" '[5]'
+fi
+
 echo "ran $ran checks"
 exit $fail

@@ -21,6 +21,13 @@
 #   * SMALLINT/INTEGER/BIGINT targets, ORDER BY, and two projection
 #     params (one nested in arithmetic) all hold.
 #
+# A `?` IN THE INNER SELECT LIST is covered here too now. It used to
+# refuse at plan time: nothing bound it at execute, because
+# bind_plan_params reached the TOP-LEVEL plan's columns only, so the
+# inner Project's own columns would have evaluated unbound - a wrong
+# answer where a refusal was honest. Both it and plan_has_proj_param now
+# walk into a derived body, a modifier and a union branch.
+#
 # SCOPE: the UNGROUPED derived projection. A GROUPED derived projection
 # param needs projected constants in a grouped query first (the group
 # builder refuses any non-key expression) - the same prerequisite the
@@ -92,6 +99,43 @@ both "derived two proj params"      "SELECT CAST(? AS INTEGER) AS C, X.V + CAST(
 both "derived width overflow"       "SELECT CAST(? AS SMALLINT) AS C, X.V FROM (SELECT V FROM T) X" "[99999]"
 # a param-free derived constant still matches (the path is unchanged for it)
 both "derived constant"             "SELECT 7 AS C, X.V FROM (SELECT V FROM T) X" "[]"
+
+# --- a `?` in the INNER select list ------------------------------------
+# Every predicate is paired with a twin that must answer NOTHING, so a
+# projection that was never bound cannot pass by riding an existing row.
+both "an inner projection ?"          "SELECT C FROM (SELECT CAST(? AS INTEGER) AS C FROM T) X" "[5]"
+both "...a different bound value"     "SELECT C FROM (SELECT CAST(? AS INTEGER) AS C FROM T) X" "[7]"
+both "an inner proj ? beside a column" "SELECT C, V FROM (SELECT CAST(? AS INTEGER) AS C, V FROM T WHERE V > ?) X ORDER BY V" "[42,10]"
+both "...the inner WHERE EXCLUDES"    "SELECT C, V FROM (SELECT CAST(? AS INTEGER) AS C, V FROM T WHERE V > ?) X ORDER BY V" "[42,99]"
+# the ORDER: the outer projection's `?` is textually first, so these two
+# values would SWAP if the inner body's slot were numbered before it
+both "an outer proj ? and an inner one" "SELECT CAST(? AS INTEGER) AS O, C FROM (SELECT CAST(? AS INTEGER) AS C FROM T WHERE ID = 1) X" "[7,9]"
+both "a CTE body's projection ?"      "WITH C AS (SELECT CAST(? AS INTEGER) AS V FROM T WHERE ID = 1) SELECT V FROM C" "[5]"
+both "a NESTED derived body's proj ?" "SELECT V FROM (SELECT C AS V FROM (SELECT CAST(? AS INTEGER) AS C FROM T WHERE ID = 1) Y) X" "[5]"
+# the control: a literal inner projection worked before, which is what
+# says these cells measure the BOUND half
+both "CONTROL a literal inner projection" "SELECT C FROM (SELECT CAST(5 AS INTEGER) AS C FROM T) X" "[]"
+
+# RECORDED, NOT FIXED - carried with the engine's answer so each expires
+# itself. Both have ONE cause: bind_plan_params walks a plan's FIELDS and
+# never a `RowSource::PlanRows`, which is where a FOLD keeps its base and
+# a JOIN keeps a derived side.
+refuses_q() { # <label> <sql> <json args>
+    local a b
+    a=$(query "$2" "$3" 127.0.0.1 "$PORT" "$A")
+    ran=$((ran + 1))
+    if [ "$a" = "CONN_ERR" ] || [ -z "$a" ]; then
+        echo "DIFF $1 [VACUOUS: fcwire did not answer at all]"; fail=1; return
+    fi
+    case "$a" in
+        ERR*) echo "OK   refusal kept (engine answers): $1" ;;
+        *) b=$(query "$2" "$3" 127.0.0.1 "$REAL" "$B")
+           if [ "$a" = "$b" ]; then echo "OK   $1 now agrees: $a (update the refusal list)"
+           else echo "DIFF $1: fcwire [$a] engine [$b]"; fail=1; fi ;;
+    esac
+}
+refuses_q "a FOLD over an inner projection ?" "SELECT SUM(C) AS S FROM (SELECT CAST(? AS INTEGER) AS C FROM T) X" "[10]"
+refuses_q "a JOIN SIDE with an inner projection ?" "SELECT X.C FROM (SELECT CAST(? AS INTEGER) AS C, ID FROM T WHERE ID = 1) X JOIN T D ON D.ID = X.ID" "[5]"
 
 echo "ran $ran checks"
 exit $fail

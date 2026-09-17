@@ -369,6 +369,10 @@ bothq "a CTE body's ? under a fold" "WITH C AS (SELECT ID FROM EMP WHERE ID > ?)
 bothq "a ? in a UNION branch" "SELECT ID FROM EMP WHERE ID > ? UNION ALL SELECT 99 FROM RDB\$DATABASE ORDER BY 1" '[3]'
 bothq "...a derived table inside that branch" "SELECT X.ID FROM (SELECT ID FROM EMP WHERE ID > ?) X UNION ALL SELECT 99 FROM RDB\$DATABASE ORDER BY 1" '[3]'
 bothq "...the branch EXCLUDES everything" "SELECT X.ID FROM (SELECT ID FROM EMP WHERE ID > ?) X UNION ALL SELECT 99 FROM RDB\$DATABASE ORDER BY 1" '[99]'
+# a `?` in the INNER SELECT LIST - the derived end of it
+bothq "a ? in the inner projection" "SELECT C FROM (SELECT CAST(? AS INTEGER) AS C FROM EMP WHERE ID = 1) X" '[5]'
+bothq "...beside a real column, inner WHERE ?" "SELECT C, ID FROM (SELECT CAST(? AS INTEGER) AS C, ID FROM EMP WHERE ID > ?) X ORDER BY ID" '[42,3]'
+bothq "...the inner WHERE EXCLUDES" "SELECT C, ID FROM (SELECT CAST(? AS INTEGER) AS C, ID FROM EMP WHERE ID > ?) X ORDER BY ID" '[42,99]'
 # a grouped JOIN over real tables still streams its own way - the walk
 # materialises a bound DERIVED base only, and this says so
 both "CONTROL a grouped join over tables" "SELECT D.DNAME, COUNT(*) AS N FROM EMP E JOIN DEPT D ON D.ID = E.DEPT_ID GROUP BY D.DNAME ORDER BY D.DNAME"
@@ -421,8 +425,13 @@ both "CONTROL a literal inner predicate" "SELECT ID FROM (SELECT ID FROM EMP WHE
 # RECORDED, NOT FIXED - each carries the engine's answer and expires
 # itself. All are law-safe: refusals or fetch-time errors, never wrong
 # answers.
-#   - a `?` in the INNER PROJECTION: nothing binds it - bind_plan_params
-#     reaches the top-level plan's columns only.
+#   - a FOLD over an inner projection `?`, and a JOIN SIDE carrying one:
+#     bind_plan_params walks a plan's FIELDS and never a
+#     `RowSource::PlanRows`, which is where a fold keeps its base and a
+#     join keeps a derived side. (A plain `?` in an inner projection is
+#     FIXED - both it and plan_has_proj_param now walk into a derived
+#     body, a modifier and a union branch; serve-real-castparamderived
+#     owns those cells.)
 #   - a chain of MORE THAN ONE join whose ON carries a `?`: an ON is then
 #     written BETWEEN two sides, and this planner numbers every side
 #     before any ON, so it would MIS-NUMBER rather than refuse. Refused
@@ -436,7 +445,7 @@ both "CONTROL a literal inner predicate" "SELECT ID FROM (SELECT ID FROM EMP WHE
 #   derived base before the fold runs retired it; its cells are live
 #   above. The JOIN above an inner `?` is NOT the same thing: it refuses
 #   at PLAN time, in plan_join_bound's own copy of the old guard.)
-refusesq "a ? in the INNER projection" "SELECT C FROM (SELECT CAST(? AS INTEGER) AS C FROM EMP) X" '[5]'
+refusesq "a FOLD over an inner projection ?" "SELECT SUM(C) AS S FROM (SELECT CAST(? AS INTEGER) AS C FROM EMP) X" '[10]'
 refusesq "a multi-ON chain with a bound ON" "SELECT A.ID FROM EMP A JOIN (SELECT ID FROM EMP WHERE ID > ?) B ON A.ID = B.ID AND A.ID > ? JOIN DEPT D ON D.ID = A.DEPT_ID AND D.ID > ? ORDER BY A.ID" '[0,0,0]'
 
 # --- a materialised row source carries its rows' OWN error ------------

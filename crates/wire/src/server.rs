@@ -48681,13 +48681,11 @@ fn plan_query_inner_at(
                 }
                 return Some(Plan::Refused);
             };
-            // ...EXCEPT a `?` in the inner PROJECTION, which nothing
-            // binds at execute: [bind_plan_params] reaches the top-level
-            // plan's columns only, so the inner's would evaluate unbound
-            // - a wrong answer where a refusal is honest.
-            if plan_has_proj_param(&inner) {
-                return Some(Plan::Refused);
-            }
+            // A `?` IN THE INNER PROJECTION is bound now:
+            // [bind_plan_params] walks into a derived body instead of
+            // stopping at the top-level plan's columns, so the inner
+            // `Project`'s own columns are substituted before any fetch
+            // path evaluates them. This used to refuse here.
             let mut inner_cols = output_cols_of(&inner);
             if inner_cols.is_empty() {
                 return Some(Plan::Refused);
@@ -59544,7 +59542,29 @@ fn subst_params_expr(e: &Expr, args: &[WireParam]) -> Option<Expr> {
 }
 
 /// Does this plan's PROJECTION carry `?` parameters that must be bound?
+///
+/// THE WRAPPERS ARE WALKED THROUGH, and they have to be: a modifier's
+/// own columns are POSITIONAL over the rows the plan below it already
+/// projected (`ProjCol { field_id: i, expr: None, .. }` where
+/// [Plan::Modified] is built), so a `SELECT FIRST 2 CAST(? AS INTEGER)`
+/// keeps its `?` in the INNER `Project`'s columns and a top-level test
+/// sees nothing at all. Same for a UNION branch and a derived body.
+/// Testing only the outermost plan left `FIRST`, `SKIP`, `DISTINCT` and
+/// a union branch refusing an ordinary projection parameter.
 fn plan_has_proj_param(plan: &Plan) -> bool {
+    match plan {
+        Plan::Derived { inner, .. } | Plan::Modified { inner, .. } => {
+            if plan_has_proj_param(inner) {
+                return true;
+            }
+        }
+        Plan::Union { branches, .. } => {
+            if branches.iter().any(plan_has_proj_param) {
+                return true;
+            }
+        }
+        _ => {}
+    }
     let cols = match plan {
         Plan::Project { cols, .. }
         | Plan::Join { cols, .. }
@@ -59561,6 +59581,22 @@ fn plan_has_proj_param(plan: &Plan) -> bool {
 /// before any fetch path evaluates the projection.
 fn bind_plan_params(plan: &Plan, args: &[WireParam]) -> Option<Plan> {
     let mut p = plan.clone();
+    // the wrappers first, for the reason [plan_has_proj_param] spells
+    // out: the `?` lives in the plan BELOW a modifier, a union branch or
+    // a derived body, never in the wrapper's own positional columns.
+    match &mut p {
+        Plan::Derived { inner, .. } | Plan::Modified { inner, .. } => {
+            let bound = bind_plan_params(&**inner, args)?;
+            **inner = bound;
+        }
+        Plan::Union { branches, .. } => {
+            for b in branches.iter_mut() {
+                let bound = bind_plan_params(&*b, args)?;
+                *b = bound;
+            }
+        }
+        _ => {}
+    }
     if let Plan::Project { cols, .. }
     | Plan::Join { cols, .. }
     | Plan::Derived { cols, .. }
