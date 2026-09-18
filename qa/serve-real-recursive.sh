@@ -101,6 +101,30 @@ INSERT INTO TREE VALUES (9, 7);
 INSERT INTO TREE VALUES (8, 7);
 INSERT INTO TREE VALUES (10, 9);
 INSERT INTO TREE VALUES (99, 77);
+-- SOMETHING TO JOIN THE WALK AGAINST. This gate owned TREE but nothing to
+-- join it to, which is why the join-driver divergence survived the
+-- depth-first chunk: a walk on its own can never show WHO DRIVES. JM is
+-- stored OUT of order (50, 10, 20, 40) with DUPLICATE keys (10 and 20 both
+-- name TREE 1) and a row matching NOTHING (30 -> 99), because a 1:1 fixture
+-- hides the pairing and an ascending one hides the order - the two blind
+-- spots that hid this law and the RIGHT-join one before it.
+CREATE TABLE JM (MID INTEGER, ID INTEGER);
+CREATE TABLE JN (NID INTEGER, ID INTEGER);
+-- JK carries a PRIMARY KEY on the join column: the engine drives the CTE
+-- when an index serves that column, and this server already agrees there.
+CREATE TABLE JK (ID INTEGER NOT NULL PRIMARY KEY, KTAG VARCHAR(3));
+COMMIT;
+INSERT INTO JM VALUES (50, 9);
+INSERT INTO JM VALUES (10, 1);
+INSERT INTO JM VALUES (30, 99);
+INSERT INTO JM VALUES (20, 1);
+INSERT INTO JM VALUES (40, 2);
+INSERT INTO JN VALUES (700, 2);
+INSERT INTO JN VALUES (500, 1);
+INSERT INTO JN VALUES (900, 9);
+INSERT INTO JK VALUES (9, 'k9');
+INSERT INTO JK VALUES (1, 'k1');
+INSERT INTO JK VALUES (2, 'k2');
 INSERT INTO DIA VALUES (1, NULL);
 INSERT INTO DIA VALUES (2, 1);
 INSERT INTO DIA VALUES (3, 1);
@@ -179,6 +203,29 @@ both() { # <label> <sql>
         fail=1
     fi
 }
+# A RECORDED DIVERGENCE, self-expiring: the two servers must still DISAGREE.
+# It goes red if they start AGREEING - which is the signal to promote the
+# cell back to `both` - and red if EITHER side fails to answer, so a
+# CONN_ERR or an ERR can never be scored as a difference. That guard is
+# two-sided on purpose: a one-sided one let this server's own refusal count
+# as a divergence while measuring nothing at all.
+differs() { # <label> <sql>
+    ran=$((ran + 1))
+    a=$(query "$2" "$PORT" "$A")
+    b=$(query "$2" "$REAL" "$B")
+    case "$a" in CONN_ERR|ERR*|"") echo "DIFF $1 [VACUOUS: fcwire did not answer: $a]"; fail=1; return ;; esac
+    case "$b" in CONN_ERR|ERR*|"") echo "DIFF $1 [VACUOUS: the engine did not answer: $b]"; fail=1; return ;; esac
+    if [ "$a" = "$b" ]; then
+        echo "DIFF $1 NOW AGREES - the driver order is fixed; promote this cell to both"
+        echo "     both: $a"
+        fail=1
+    else
+        echo "OK   recorded divergence: $1"
+        echo "     fcwire: $a"
+        echo "     engine: $b"
+    fi
+}
+
 refuses() { # <label> <sql>
     ran=$((ran + 1))
     r=$(query "$2" "$PORT" "$A")
@@ -366,6 +413,60 @@ both "one root only"                         "WITH RECURSIVE C AS (SELECT ID, PA
 both "the other root, siblings 9 then 8"     "WITH RECURSIVE C AS (SELECT ID, PARENT FROM TREE WHERE ID = 7
         UNION ALL SELECT T2.ID, T2.PARENT FROM TREE T2 JOIN C ON T2.PARENT = C.ID) SELECT ID FROM C"
 both "a WHERE over the walk keeps the order"  "$TRW SELECT ID FROM C WHERE LVL > 0"
+
+# --- WHO DRIVES when the walk is JOINED to something ---------------------
+# RECORDED, NOT FIXED - and the cells below say which is which.
+#
+# THE LAW, measured: the engine DEMOTES a recursive CTE out of the driving
+# position and drives the other stream, so rows come back grouped by THAT
+# side's rows in ITS storage order. Over JM stored 50,10,30,20,40 the engine
+# answers `50/9 10/1 20/1 40/2`; this server answers the WALK's order. It is
+# NOT order-only - a FIRST/SKIP slice then takes a DIFFERENT SET OF ROWS -
+# and it holds with a table, a derived table and a view opposite the CTE
+# alike, and only when the CTE is written FIRST.
+#
+# THE ENGINE ONLY DOES THAT FOR A PLAIN JOIN. It drives the CTE instead -
+# and this server already agrees - when a conjunct in the WHERE or the ON
+# names one of the two streams, or when an index serves the join column.
+# Those are the `both` cells further down, and they are the reason a blanket
+# "group by the other side" would be a NEW wrong answer rather than a fix.
+#
+# WHY IT IS RECORDED. The ordering cannot live in [join_step], where the
+# RIGHT-join law lives: for an INNER equi-join every one of its call sites
+# passes a ONE-ROW accumulated side (`rows_materialised` takes its whole-acc
+# early return only for non-LEFT/INNER kinds; `JoinCursor::fold` expands one
+# base row at a time), so a sort there reorders within a single row's slice
+# and measures as doing NOTHING - which is exactly what a first attempt did.
+# Ordering it correctly means carrying the other side's row index out to the
+# three concatenation points - the streaming arm, the materialising loop and
+# the cursor - i.e. changing a function called from twelve sites on the
+# hottest path in the server, for a LOW-tier bullet. Not attempted on this
+# evidence; the `differs` cells go red the day someone does it.
+differs "walk JOIN table: who drives"        "$TRW SELECT M.MID FROM C R JOIN JM M ON M.ID = R.ID"
+differs "walk JOIN table: the pairing"       "$TRW SELECT M.MID, R.ID FROM C R JOIN JM M ON M.ID = R.ID"
+differs "FIRST 3 over it (a rowset, not an order)" "$TRW SELECT FIRST 3 M.MID FROM C R JOIN JM M ON M.ID = R.ID"
+differs "SKIP 2 over it"                     "$TRW SELECT SKIP 2 M.MID FROM C R JOIN JM M ON M.ID = R.ID"
+differs "a DERIVED table opposite the walk"  "$TRW SELECT Z.MID FROM C R JOIN (SELECT MID, ID FROM JM) Z ON Z.ID = R.ID"
+differs "a comma join"                       "$TRW SELECT M.MID FROM C R, JM M WHERE M.ID = R.ID"
+differs "a three-way chain"                  "$TRW SELECT M.MID, N.NID FROM C R JOIN JM M ON M.ID = R.ID JOIN JN N ON N.ID = R.ID"
+# ...and the shapes where the engine drives the CTE INSTEAD, which this
+# server already matched and must keep matching. Each is one condition of
+# the guard: a conjunct naming a stream (in the WHERE or in the ON), and an
+# index serving the join column.
+both "WHERE on the table (engine drives CTE)"  "$TRW SELECT M.MID FROM C R JOIN JM M ON M.ID = R.ID WHERE M.MID > 15"
+both "WHERE on the walk (engine drives CTE)"   "$TRW SELECT M.MID FROM C R JOIN JM M ON M.ID = R.ID WHERE R.ID > 0"
+both "an extra ON conjunct"                    "$TRW SELECT M.MID FROM C R JOIN JM M ON M.ID = R.ID AND M.MID > 0"
+both "an INDEXED join column (JK)"             "$TRW SELECT K.KTAG FROM C R JOIN JK K ON K.ID = R.ID"
+# THE CONST TRAP: `WHERE 1=1` names NEITHER stream and does NOT move the
+# engine - it still drives the table - yet term_side_only answers TRUE for a
+# Const term against every window. Without the row-independent exclusion in
+# the guard this cell would silently go back to the walk's order.
+differs "WHERE 1=1 names neither stream"          "$TRW SELECT M.MID FROM C R JOIN JM M ON M.ID = R.ID WHERE 1=1"
+# the table written FIRST already agreed, and the outer-join and ORDER BY
+# forms are decided elsewhere - all three must not move
+both "the table written FIRST"            "$TRW SELECT M.MID FROM JM M JOIN C R ON M.ID = R.ID"
+both "LEFT JOIN from the walk"            "$TRW SELECT R.ID, M.MID FROM C R LEFT JOIN JM M ON M.ID = R.ID"
+both "ORDER BY collapses it"              "$TRW SELECT M.MID FROM C R JOIN JM M ON M.ID = R.ID ORDER BY M.MID"
 # a DIAMOND: 4 hangs under both 2 and 3, so it is emitted TWICE - once per
 # path, each at its own place in the walk (the engine does not de-duplicate)
 both "a diamond emits the node once per path" "WITH RECURSIVE C AS (SELECT ID, PARENT FROM DIA WHERE PARENT IS NULL
@@ -419,8 +520,8 @@ engine_errs "UNION rather than UNION ALL" \
         UNION SELECT N+1 FROM C WHERE N < 3) SELECT N FROM C"
 
 rm -f "$A" "$B"
-if [ "$ran" -lt 57 ]; then
-    echo "DIFF only $ran checks ran (expected at least 57) - did one silently skip?"
+if [ "$ran" -lt 73 ]; then
+    echo "DIFF only $ran checks ran (expected at least 73) - did one silently skip?"
     fail=1
 fi
 exit $fail
