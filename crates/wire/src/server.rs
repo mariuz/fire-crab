@@ -11502,6 +11502,20 @@ enum Term {
     /// to its decimal text: N=1,10 both match prefix '1', probed)
     /// against the prefix, per byte. A NULL result is UNKNOWN.
     ExprStarting(Box<Expr>, String, bool),
+    /// `<expression> [NOT] STARTING [WITH] <expression>` - both sides
+    /// evaluated per row. The `Option<u16>` is the WRITTEN collation's
+    /// ttype when there is one: the literal arm canonicalises the prefix at
+    /// prepare, and with a per-row prefix there is nothing to canonicalise
+    /// until the row arrives, so it happens here instead. `None` is the
+    /// ordinary per-byte prefix test. NULL on either side is UNKNOWN.
+    ExprStartingExpr(Box<Expr>, Box<Expr>, Option<u16>, bool),
+    /// `<expression> [NOT] CONTAINING <expression>` - both sides evaluated
+    /// per row. The `u16` is the operand's ttype, which decides the case
+    /// fold and the canonical form; the left side arrives already wrapped in
+    /// `CollCanon` (prepare-time, pattern-independent), and the PATTERN's
+    /// half of [containing_term] - upper-case, canonicalise, escape the
+    /// wildcards, wrap in `%…%` - is rebuilt per row.
+    ExprContainingExpr(Box<Expr>, Box<Expr>, u16, bool),
     /// an expression side compared against a `?` parameter -
     /// `WHERE UPPER(S) = ?`. The bind target descriptor is SYNTHESIZED
     /// from the expression's type (what the client builds its encoder
@@ -12841,7 +12855,9 @@ fn term_side_only(t: &Term, win: &std::ops::Range<usize>) -> bool {
         // OTHER side belongs to neither alone; answering `true` here would
         // let it gate a partnerless raise or ride a side's retrieval, which
         // is a WRONG ANSWER rather than a refusal.
-        Term::ExprLikeExpr(e, pat, ..) => {
+        Term::ExprLikeExpr(e, pat, ..)
+        | Term::ExprStartingExpr(e, pat, ..)
+        | Term::ExprContainingExpr(e, pat, ..) => {
             !expr_reads(e, &outside) && !expr_reads(pat, &outside)
         }
         Term::ExprLike(e, ..) | Term::ExprStarting(e, ..) | Term::BadExprLike(e, ..) => {
@@ -12884,7 +12900,9 @@ fn collect_term_fids(t: &Term, mark: &dyn Fn(usize) -> bool) -> bool {
         }
         // both expressions, for the reason [term_side_only] states: the
         // pattern reads columns of its own and they must be marked too
-        Term::ExprLikeExpr(e, pat, ..) => {
+        Term::ExprLikeExpr(e, pat, ..)
+        | Term::ExprStartingExpr(e, pat, ..)
+        | Term::ExprContainingExpr(e, pat, ..) => {
             expr_reads(e, mark);
             expr_reads(pat, mark);
             true
@@ -13349,6 +13367,57 @@ impl Term {
                 // a per-byte prefix test
                 v => Some(v.render().starts_with(prefix.as_str()) != *negated),
             },
+            // ...and the same with the PREFIX evaluated per row. The
+            // canonicalisation the literal arm does at prepare happens here,
+            // because there is no prefix text until the row arrives.
+            Term::ExprStartingExpr(e, pre, tt, negated) => {
+                match (e.eval(values)?, pre.eval(values)?) {
+                    (Value::Null, _) | (_, Value::Null) => None,
+                    (v, p) => {
+                        let prefix = match tt
+                            .and_then(fire_crab_ods::coll::icu_strength_of_ttype)
+                        {
+                            Some(st) => fire_crab_ods::coll::icu_canonical(&p.render(), st),
+                            None => p.render(),
+                        };
+                        Some(v.render().starts_with(prefix.as_str()) != *negated)
+                    }
+                }
+            }
+            // CONTAINING with a per-row pattern: the left side already
+            // carries its `CollCanon` wrapper from prepare, and this rebuilds
+            // the PATTERN exactly as [containing_term] does - upper-case in
+            // the operand's charset, canonicalise under the collation's
+            // strength, escape `%`/`_`/the escape itself, wrap in `%…%` -
+            // then runs the same `like_match`. Written as the same sequence
+            // in the same order so the two cannot drift apart silently.
+            Term::ExprContainingExpr(e, pat, tt, negated) => {
+                match (e.eval(values)?, pat.eval(values)?) {
+                    (Value::Null, _) | (_, Value::Null) => None,
+                    (v, p) => {
+                        let cs = fire_crab_ods::intl::charset_id(*tt as i16);
+                        let up = upcase_cs(cs, &p.render());
+                        let canon = match fire_crab_ods::coll::icu_strength_of_ttype(*tt) {
+                            Some(st) => fire_crab_ods::coll::icu_canonical(&up, st),
+                            None => up,
+                        };
+                        let mut escaped = String::with_capacity(canon.len() + 2);
+                        for c in canon.chars() {
+                            if c == CONTAINING_ESCAPE || c == '%' || c == '_' {
+                                escaped.push(CONTAINING_ESCAPE);
+                            }
+                            escaped.push(c);
+                        }
+                        Some(
+                            like_match(
+                                &v.render(),
+                                &format!("%{escaped}%"),
+                                Some(CONTAINING_ESCAPE),
+                            ) != *negated,
+                        )
+                    }
+                }
+            }
             // an unbound parameter never matches (the execute path
             // binds before evaluating; this is the defensive answer)
             Term::ExprParam(..) => None,
@@ -40051,7 +40120,13 @@ fn resolve_join_predicate(
             // PATTERN is one of these too (`<col> LIKE <expr>`): the left
             // side is a plain column, so only naming the kind routes it.
             if matches!(rt.lhs, RawLhs::Expr(_))
-                || matches!(rt.kind, RawKind::CmpExpr(..) | RawKind::LikeExpr(..))
+                || matches!(
+                    rt.kind,
+                    RawKind::CmpExpr(..)
+                        | RawKind::LikeExpr(..)
+                        | RawKind::StartingExpr(..)
+                        | RawKind::ContainingExpr(..)
+                )
             {
                 let rt = match &rt.lhs {
                     // the view carries the QUALIFIED spelling too, and it
@@ -82625,6 +82700,19 @@ enum RawKind {
     /// a canonical form, Collation.cpp:527). The pattern has NO
     /// wildcards.
     Containing(Rhs, bool),
+    /// `[NOT] STARTING [WITH] <expression>` - the prefix computed per row.
+    /// The twin of [RawKind::LikeExpr] for the prefix family, and additive
+    /// for the same reason: `Rhs` feeds index banding and [Predicate::bind],
+    /// neither of which can take a value that varies per row.
+    StartingExpr(RawExpr, bool),
+    /// `<x> CONTAINING <expression>` - the substring computed per row.
+    /// CONTAINING does MORE work at prepare than the other families
+    /// ([containing_term] upper-cases, canonicalises, escapes and wraps the
+    /// pattern in `%…%`), and all of it moves per row here - which is not a
+    /// new idea: `ExprContainingParam` already defers exactly that work to
+    /// BIND for a `?` pattern. The VALUE side keeps its prepare-time
+    /// `CollCanon` wrapper, which does not depend on the pattern.
+    ContainingExpr(RawExpr, bool),
     /// A leaf whose truth is already decided and does not depend on the
     /// row: what a subquery collapses to once it has been evaluated
     /// (`EXISTS` over an uncorrelated inner query, or an `IN` whose
@@ -83708,11 +83796,23 @@ fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
         // CONTAINING - by Ident text, like STARTING below
         Tok::Ident(w) if w.eq_ignore_ascii_case("CONTAINING") => {
             *pos += 1;
-            let pattern = parse_pattern(t, pos, np)?;
-            if matches!(pattern, Rhs::Int(_) | Rhs::Num(..)) {
+            // literal first, expression second - the shape [parse_side] uses
+            // and the one the LIKE arm above takes. BOTH `*pos` and `*np` are
+            // restored before the fallback: rewinding only the position
+            // leaks parameter numbering into the expression parse.
+            let save = (*pos, *np);
+            let literal = parse_pattern(t, pos, np);
+            if literal.is_none() {
+                *pos = save.0;
+                *np = save.1;
+            }
+            if matches!(literal, Some(Rhs::Int(_)) | Some(Rhs::Num(..))) {
                 return None; // a numeric pattern literal: unprobed, as LIKE
             }
-            Some(leaf(RawKind::Containing(pattern, negated)))
+            match literal {
+                Some(pattern) => Some(leaf(RawKind::Containing(pattern, negated))),
+                None => Some(leaf(RawKind::ContainingExpr(texpr(t, pos, np)?, negated))),
+            }
         }
         // STARTING [WITH] - by Ident text, so a column NAMED "STARTING"
         // still parses everywhere else exactly as before
@@ -83721,14 +83821,22 @@ fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
             if matches!(t.get(*pos), Some(Tok::Ident(w2)) if w2.eq_ignore_ascii_case("WITH")) {
                 *pos += 1; // WITH is optional sugar (the PSQL parser agrees)
             }
-            let prefix = parse_pattern(t, pos, np)?;
-            if matches!(prefix, Rhs::Int(_) | Rhs::Num(..)) {
+            let save = (*pos, *np);
+            let prefix = parse_pattern(t, pos, np);
+            if prefix.is_none() {
+                *pos = save.0;
+                *np = save.1;
+            }
+            if matches!(prefix, Some(Rhs::Int(_)) | Some(Rhs::Num(..))) {
                 // a numeric prefix literal is legal (the engine renders
                 // it to text) but unprobed through every scale shape -
                 // refuse, as LIKE does
                 return None;
             }
-            Some(leaf(RawKind::Starting(prefix, negated)))
+            match prefix {
+                Some(prefix) => Some(leaf(RawKind::Starting(prefix, negated))),
+                None => Some(leaf(RawKind::StartingExpr(texpr(t, pos, np)?, negated))),
+            }
         }
         _ => None,
     }
@@ -83836,6 +83944,11 @@ fn negate_term(t: &RawTerm) -> Option<RawTerm> {
         // flipped like LIKE - sound in 3VL (probed: NULL operand rows
         // drop under both polarities)
         RawKind::Starting(p, negated) => RawKind::Starting(p.clone(), !negated),
+        // the same flip for the per-row forms, and the same reason: these
+        // are the sites the compiler forces, and losing a `NOT` here is a
+        // wrong answer rather than a refusal
+        RawKind::StartingExpr(p, negated) => RawKind::StartingExpr(p.clone(), !negated),
+        RawKind::ContainingExpr(p, negated) => RawKind::ContainingExpr(p.clone(), !negated),
         // a decided leaf negates to the opposite decision - no
         // three-valued subtlety, it is TRUE or FALSE, never UNKNOWN
         RawKind::Const(b) => RawKind::Const(!b),
@@ -91384,8 +91497,12 @@ fn typed_term(idx: usize, kind: ColKind, raw: RawKind) -> Option<Term> {
         | RawKind::Cmp(_, Rhs::Oct(_)) | RawKind::Similar(Rhs::Oct(_), ..) => return None,
         // an expression right side is resolve_expr_term's business - a
         // resolver without that path (HAVING, joins) refuses it, and an
-        // expression PATTERN is the same class of thing
-        RawKind::CmpExpr(..) | RawKind::LikeExpr(..) => return None,
+        // expression PATTERN is the same class of thing, for all three
+        // families that now have one
+        RawKind::CmpExpr(..)
+        | RawKind::LikeExpr(..)
+        | RawKind::StartingExpr(..)
+        | RawKind::ContainingExpr(..) => return None,
         RawKind::Cmp(op, Rhs::Int(n)) => match kind {
             ColKind::Int => Term::Cmp(idx, op, Rhs::Int(n)),
             // a numeric literal against a TEXT column coerces the
@@ -91554,7 +91671,13 @@ fn resolve_predicate(
             // how the capability built above sat unreachable, compiling
             // clean and answering nothing.
             if matches!(rt.lhs, RawLhs::Expr(_))
-                || matches!(rt.kind, RawKind::CmpExpr(..) | RawKind::LikeExpr(..))
+                || matches!(
+                    rt.kind,
+                    RawKind::CmpExpr(..)
+                        | RawKind::LikeExpr(..)
+                        | RawKind::StartingExpr(..)
+                        | RawKind::ContainingExpr(..)
+                )
             {
                 terms.push(resolve_expr_term(&rt, columns, descs, params)?);
                 continue;
@@ -92438,6 +92561,84 @@ fn resolve_expr_term(
         }
         RawKind::Starting(Rhs::Null, _) => Term::Never,
         RawKind::Starting(..) => return None, // non-literal prefix
+        // THE PER-ROW PREFIX. Same declines as the LIKE arm: a `?` inside it
+        // is placeholder numbering's problem, and a CARRIER/REAL mix between
+        // the two sides refuses rather than guesses - measured, the engine
+        // RAISES 22000 for `<real> STARTING WITH <carrier>`, and this server
+        // has no STARTING raise mechanism at all ([Term::MalformedLike] is
+        // built only from [carrier_expr_like] and [param_or_typed_term], both
+        // LIKE's). Refusing turns no correct answer wrong; answering by the
+        // literal arm's byte-space rule would, since that rule rewrites a
+        // LITERAL at prepare and there is no literal here.
+        RawKind::StartingExpr(pre, negated) => {
+            if !matches!(lhs.type_of(descs)?, ExprType::Text | ExprType::Int) {
+                return None;
+            }
+            if raw_has_param(pre) {
+                return None;
+            }
+            let pre = resolve_expr(pre, columns, descs)?;
+            if let (Some(a), Some(b)) =
+                (cmp_text_charset(&lhs, descs), cmp_text_charset(&pre, descs))
+            {
+                if fire_crab_ods::intl::byte_carrier(a)
+                    != fire_crab_ods::intl::byte_carrier(b)
+                {
+                    return None;
+                }
+            }
+            match collate_canon_of(&lhs) {
+                // the written collation reads the CANONICAL form of both
+                // sides; the prefix's half of that moves per row
+                Some((inner, tt, _)) => Term::ExprStartingExpr(
+                    Box::new(Expr::CollCanon(Box::new(inner), tt, false)),
+                    Box::new(pre),
+                    Some(tt),
+                    *negated,
+                ),
+                None => Term::ExprStartingExpr(Box::new(lhs), Box::new(pre), None, *negated),
+            }
+        }
+        // THE PER-ROW SUBSTRING. The ttype is taken exactly as the literal
+        // arm takes it - an explicit COLLATE replaces the operand's own - and
+        // the value keeps its prepare-time `CollCanon`; only the pattern's
+        // transformation is deferred. The mix refuses here too, although the
+        // engine ANSWERS `<real> CONTAINING <carrier>` (measured 2, no
+        // raise): this arm's literal twin reaches that answer by transcoding
+        // a LITERAL at prepare, which a per-row pattern cannot do, and three
+        // families with three different carrier rules is precisely where
+        // guessing produced wrong answers in the LIKE slice.
+        RawKind::ContainingExpr(pat, negated) => {
+            if !matches!(lhs.type_of(descs)?, ExprType::Text | ExprType::Int) {
+                return None;
+            }
+            if raw_has_param(pat) {
+                return None;
+            }
+            let (value, tt) = match &lhs {
+                Expr::Collate(inner, tt) => ((**inner).clone(), *tt),
+                other => (
+                    other.clone(),
+                    expr_text_ttype(other, descs).unwrap_or(0),
+                ),
+            };
+            let pat = resolve_expr(pat, columns, descs)?;
+            if let (Some(a), Some(b)) =
+                (cmp_text_charset(&lhs, descs), cmp_text_charset(&pat, descs))
+            {
+                if fire_crab_ods::intl::byte_carrier(a)
+                    != fire_crab_ods::intl::byte_carrier(b)
+                {
+                    return None;
+                }
+            }
+            Term::ExprContainingExpr(
+                Box::new(Expr::CollCanon(Box::new(value), tt, true)),
+                Box::new(pat),
+                tt,
+                *negated,
+            )
+        }
         RawKind::Const(_) => return None, // handled before resolution
     };
     // both sides must TYPE - an untypeable operand never reaches
@@ -92475,7 +92676,9 @@ fn resolve_expr_term(
         // compiler does NOT force a new variant to appear here - it would
         // simply skip the check in silence, which is why it is written in
         // deliberately rather than waited for.
-        Term::ExprLikeExpr(e, pat, ..) => {
+        Term::ExprLikeExpr(e, pat, ..)
+        | Term::ExprStartingExpr(e, pat, ..)
+        | Term::ExprContainingExpr(e, pat, ..) => {
             e.type_of(descs)?;
             pat.type_of(descs)?;
         }
@@ -93189,7 +93392,12 @@ fn numeric_term(
         // ...and an expression PATTERN for the same reason: this resolver
         // holds a numeric column, not the machinery that evaluates a
         // pattern per row
-        RawKind::CmpExpr(..) | RawKind::LikeExpr(..) => return None, // see typed_term
+        // see typed_term: these are routed to resolve_expr_term before the
+        // typed path is reached, so this arm is unreachable-defensive
+        RawKind::CmpExpr(..)
+        | RawKind::LikeExpr(..)
+        | RawKind::StartingExpr(..)
+        | RawKind::ContainingExpr(..) => return None,
         // a numeric operand's CONTAINING renders it to decimal text.
         // A LITERAL pattern is answered by the resolver that holds the
         // column's descriptor; a BOUND one is answered HERE, because a
@@ -93308,7 +93516,9 @@ fn decfloat_term(
         RawKind::Containing(..) => return None,
         // an expression PATTERN over a DECFLOAT column, likewise: the
         // pattern varies per row and this resolver cannot evaluate one
-        RawKind::LikeExpr(..) => return None,
+        RawKind::LikeExpr(..)
+        | RawKind::StartingExpr(..)
+        | RawKind::ContainingExpr(..) => return None,
         RawKind::Const(b) => Term::Const(b),
         RawKind::Cmp(_, Rhs::Null) => Term::Unknown,
         // a `?` against a DECFLOAT column: the input slot describes as the

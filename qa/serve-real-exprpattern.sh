@@ -205,14 +205,20 @@ echo "-- 6. DELIBERATE DECLINES: shapes this slice refuses on purpose --"
 gap "a COLLATE-canonical left side" \
     "select id from t where ci collate unicode_ci like pu order by id;"
 
-echo "-- 7. THE OTHER THREE FAMILIES still refuse - LIKE only, this slice --"
+# PROMOTED, and this is what those cells were for. The LIKE slice recorded
+# these three as gaps so that the day the server answered them they would go
+# RED and ask to be promoted rather than quietly passing. STARTING WITH and
+# CONTAINING now answer (their own gate is serve-real-exprpattern2.sh);
+# SIMILAR TO stays a gap - its pattern is a compiled SimRe, so a per-row
+# pattern means sim_compile per row, a cost to measure before shipping.
+echo "-- 7. the other families: two promoted, SIMILAR still refuses --"
 # COUNTED, not listed: `u starting with pu` legitimately matches NOTHING
 # (pu is a LIKE pattern, and STARTING WITH reads `%` as a literal), and an
 # empty listing is indistinguishable from a refusal in sig() - the first run
 # scored both cells VACUOUS for exactly that reason. `count(*)` makes the
 # engine's answer `N0`: still an answer, and still not a refusal.
-gap "STARTING WITH an expression"     "select count(*) n from t where u starting with pu;"
-gap "CONTAINING an expression"        "select count(*) n from t where u containing pu;"
+agree "STARTING WITH an expression"   "select count(*) n from t where u starting with pu;"
+agree "CONTAINING an expression"      "select count(*) n from t where u containing pu;"
 gap "SIMILAR TO an expression"        "select id from t where u similar to pu order by id;"
 
 kill $srv 2>/dev/null; wait $srv 2>/dev/null; trap - EXIT
