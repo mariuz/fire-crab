@@ -11476,6 +11476,23 @@ enum Term {
     /// result (rendered to text, as the engine coerces) against the
     /// pattern. A NULL result is UNKNOWN.
     ExprLike(Box<Expr>, String, Option<char>, bool),
+    /// `<expression> [NOT] LIKE <expression> [ESCAPE <c>]` - the pattern is
+    /// itself computed per row: a sibling column, `V || '%'`, `TRIM(V)`, a
+    /// `CASE`, a scalar subquery. Both sides are evaluated per row and
+    /// rendered to text, exactly as [Term::ExprLike] renders its left side.
+    ///
+    /// TWO expressions is the whole point, and it is why the fid-attribution
+    /// sites must ask about BOTH ([term_side_only], [collect_term_fids]):
+    /// a term whose left side belongs to one join side but whose PATTERN
+    /// reads the other belongs to neither alone, and saying otherwise
+    /// mis-gates a WHERE push-down or a partnerless raise - a wrong answer,
+    /// not a refusal.
+    ///
+    /// NULL on EITHER side is UNKNOWN, the rule [Term::Like] already applies
+    /// to a NULL value or a NULL/unbound pattern. The escape is validated
+    /// PER ROW, which needs no new rule either: the literal arm above
+    /// already checks it at evaluation time rather than at prepare.
+    ExprLikeExpr(Box<Expr>, Box<Expr>, Option<char>, bool),
     /// `<text expression> [NOT] SIMILAR TO <pattern>` - the evaluated
     /// result rendered to text and matched against the compiled anchored
     /// pattern; a NULL result is UNKNOWN
@@ -12819,6 +12836,14 @@ fn term_side_only(t: &Term, win: &std::ops::Range<usize>) -> bool {
         | Term::Starting(fid, ..) => win.contains(fid),
         Term::ExprCond(c) => !cond_reads(c, &outside),
         Term::ExprConvErr(e, _) => !expr_reads(e, &outside),
+        // BOTH expressions, because an expression PATTERN reads columns too.
+        // A term whose left side is this side's but whose pattern reads the
+        // OTHER side belongs to neither alone; answering `true` here would
+        // let it gate a partnerless raise or ride a side's retrieval, which
+        // is a WRONG ANSWER rather than a refusal.
+        Term::ExprLikeExpr(e, pat, ..) => {
+            !expr_reads(e, &outside) && !expr_reads(pat, &outside)
+        }
         Term::ExprLike(e, ..) | Term::ExprStarting(e, ..) | Term::BadExprLike(e, ..) => {
             !expr_reads(e, &outside)
         }
@@ -12855,6 +12880,13 @@ fn collect_term_fids(t: &Term, mark: &dyn Fn(usize) -> bool) -> bool {
         }
         Term::ExprCond(c) => {
             cond_reads(c, mark);
+            true
+        }
+        // both expressions, for the reason [term_side_only] states: the
+        // pattern reads columns of its own and they must be marked too
+        Term::ExprLikeExpr(e, pat, ..) => {
+            expr_reads(e, mark);
+            expr_reads(pat, mark);
             true
         }
         Term::ExprLike(e, ..) | Term::ExprStarting(e, ..) | Term::BadExprLike(e, ..) => {
@@ -13287,6 +13319,23 @@ impl Term {
                     Some(like_match(&v.render(), pattern, *escape) != *negated)
                 }
             },
+            // ...and the same with the PATTERN evaluated per row too. NULL on
+            // either side is UNKNOWN - the rule the literal arms already
+            // carry for a NULL value or a NULL pattern. The escape check
+            // stays where it is above, per row: that is not a concession to
+            // this variant, it is where the literal form already checks it.
+            Term::ExprLikeExpr(e, pat, escape, negated) => {
+                match (e.eval(values)?, pat.eval(values)?) {
+                    (Value::Null, _) | (_, Value::Null) => None,
+                    (v, p) => {
+                        let pattern = p.render();
+                        if invalid_escape(&pattern, *escape) {
+                            return Err(EvalErr::InvalidEscape);
+                        }
+                        Some(like_match(&v.render(), &pattern, *escape) != *negated)
+                    }
+                }
+            }
             Term::ExprSimilar(e, re, negated) => match e.eval(values)? {
                 Value::Null => None,
                 // rendered to text, then the anchored regex match; the
@@ -39998,8 +40047,12 @@ fn resolve_join_predicate(
             // qualifier stripped first. Without that, `WHERE A.D >
             // DATE'2020-01-01'` refused while the unqualified `D > ...`
             // answered: the literal makes it a CmpExpr, which is caught
-            // here rather than by the column path below.
-            if matches!(rt.lhs, RawLhs::Expr(_)) || matches!(rt.kind, RawKind::CmpExpr(..)) {
+            // here rather than by the column path below. An expression
+            // PATTERN is one of these too (`<col> LIKE <expr>`): the left
+            // side is a plain column, so only naming the kind routes it.
+            if matches!(rt.lhs, RawLhs::Expr(_))
+                || matches!(rt.kind, RawKind::CmpExpr(..) | RawKind::LikeExpr(..))
+            {
                 let rt = match &rt.lhs {
                     // the view carries the QUALIFIED spelling too, and it
                     // is the one that resolves when both sides have a
@@ -82534,6 +82587,29 @@ enum RawKind {
     IsNull,
     IsNotNull,
     Like(Rhs, Option<char>, bool),
+    /// `[NOT] LIKE <expression> [ESCAPE <c>]` - a pattern that is neither a
+    /// literal nor a `?` but a VALUE computed per row: a sibling column,
+    /// `V || '%'`, `TRIM(V)`, a `CASE`, a scalar subquery. The engine
+    /// answers all of them; this server refused them because
+    /// [parse_pattern] admits only literal tokens and `Tok::Param`, so the
+    /// predicate never became a `RawTerm` and the whole statement declined.
+    /// (A `?` pattern already works and is NOT this - measured 7 of 7.)
+    ///
+    /// A SEPARATE VARIANT rather than a wider [Rhs], on purpose: `Rhs` flows
+    /// into index banding, hashing and [Predicate::bind], none of which can
+    /// accept a value that varies per row, and keeping it out means every
+    /// existing arm compiles unchanged. The matches that are EXHAUSTIVE over
+    /// `RawKind` then fail to compile until they handle this, which is the
+    /// point - [negate_term] must flip its `negated`, or `NOT x LIKE V`
+    /// would silently lose its negation.
+    ///
+    /// NO TRANSCODE. A literal pattern is statement text that the attachment
+    /// decodes, which is why [redo] and the tabled-attachment lift rewrite
+    /// one; an expression pattern is a VALUE carrying its own column's
+    /// charset and never passes through that decode. Measured: every
+    /// expression-pattern shape answers identically under NONE, WIN1252 and
+    /// UTF8, where the literal form moves with the attachment.
+    LikeExpr(RawExpr, Option<char>, bool),
     /// `[NOT] SIMILAR TO <pattern> [ESCAPE <c>]` - a SQL:2008 regular
     /// expression (pattern, escape, negated); resolved to a compiled
     /// [SimRe] and matched anchored
@@ -83504,10 +83580,28 @@ fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
         }
         Tok::Like => {
             *pos += 1;
-            let pattern = parse_pattern(t, pos, np)?;
-            if matches!(pattern, Rhs::Int(_)) {
+            // A LITERAL or `?` pattern FIRST, by exactly the call that was
+            // here before: every shape that parsed yesterday takes the same
+            // path and builds the same `RawKind::Like`. [parse_value]
+            // declines WITHOUT consuming, so restoring the cursor and trying
+            // an expression cannot alter an existing parse - the fallback
+            // can only ADD shapes that used to refuse the whole statement.
+            let save = (*pos, *np);
+            let literal = parse_pattern(t, pos, np);
+            if literal.is_none() {
+                *pos = save.0;
+                *np = save.1;
+            }
+            if matches!(literal, Some(Rhs::Int(_))) {
                 return None; // a numeric LIKE pattern is not a shape we answer
             }
+            // ...else an EXPRESSION pattern, evaluated per row. [texpr] stops
+            // at the first token it cannot consume, so the ESCAPE clause
+            // below still parses after it.
+            let expr = match literal {
+                Some(_) => None,
+                None => Some(texpr(t, pos, np)?),
+            };
             let escape = if matches!(t.get(*pos), Some(Tok::Escape)) {
                 *pos += 1;
                 let Some(Tok::Str(e)) = t.get(*pos) else { return None };
@@ -83521,7 +83615,11 @@ fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
             } else {
                 None
             };
-            Some(leaf(RawKind::Like(pattern, escape, negated)))
+            match (literal, expr) {
+                (Some(pattern), _) => Some(leaf(RawKind::Like(pattern, escape, negated))),
+                (None, Some(e)) => Some(leaf(RawKind::LikeExpr(e, escape, negated))),
+                (None, None) => None,
+            }
         }
         Tok::Between => {
             *pos += 1;
@@ -83728,6 +83826,12 @@ fn negate_term(t: &RawTerm) -> Option<RawTerm> {
         RawKind::IsNotNull => RawKind::IsNull,
         RawKind::Containing(p, n) => RawKind::Containing(p.clone(), !n),
         RawKind::Like(p, e, negated) => RawKind::Like(p.clone(), *e, !negated),
+        // the same flip for an EXPRESSION pattern. This is the ONLY site the
+        // compiler forces when the variant is added, and it is the one that
+        // matters: without it `NOT <x> LIKE <expr>` would silently lose its
+        // negation - a wrong answer, not a refusal. An additive variant was
+        // chosen over widening `Rhs` exactly so that this match would break.
+        RawKind::LikeExpr(p, e, negated) => RawKind::LikeExpr(p.clone(), *e, !negated),
         RawKind::Similar(p, e, negated) => RawKind::Similar(p.clone(), *e, !negated),
         // flipped like LIKE - sound in 3VL (probed: NULL operand rows
         // drop under both polarities)
@@ -91279,8 +91383,9 @@ fn typed_term(idx: usize, kind: ColKind, raw: RawKind) -> Option<Term> {
         RawKind::Like(Rhs::Oct(_), ..) | RawKind::Starting(Rhs::Oct(_), _)
         | RawKind::Cmp(_, Rhs::Oct(_)) | RawKind::Similar(Rhs::Oct(_), ..) => return None,
         // an expression right side is resolve_expr_term's business - a
-        // resolver without that path (HAVING, joins) refuses it
-        RawKind::CmpExpr(..) => return None,
+        // resolver without that path (HAVING, joins) refuses it, and an
+        // expression PATTERN is the same class of thing
+        RawKind::CmpExpr(..) | RawKind::LikeExpr(..) => return None,
         RawKind::Cmp(op, Rhs::Int(n)) => match kind {
             ColKind::Int => Term::Cmp(idx, op, Rhs::Int(n)),
             // a numeric literal against a TEXT column coerces the
@@ -91442,8 +91547,15 @@ fn resolve_predicate(
                 continue;
             }
             // an EXPRESSION on either side takes the expression-predicate
-            // path (Cond2 evaluation per row)
-            if matches!(rt.lhs, RawLhs::Expr(_)) || matches!(rt.kind, RawKind::CmpExpr(..)) {
+            // path (Cond2 evaluation per row). The PATTERN is a side too:
+            // `<col> LIKE <expr>` has an ordinary column on the left, so
+            // without naming it here the term falls through to the typed
+            // path below and [typed_term] declines it - which is exactly
+            // how the capability built above sat unreachable, compiling
+            // clean and answering nothing.
+            if matches!(rt.lhs, RawLhs::Expr(_))
+                || matches!(rt.kind, RawKind::CmpExpr(..) | RawKind::LikeExpr(..))
+            {
                 terms.push(resolve_expr_term(&rt, columns, descs, params)?);
                 continue;
             }
@@ -91786,6 +91898,72 @@ fn resolve_expr_term(
         })
     };
     let term = match &rt.kind {
+        // AN EXPRESSION PATTERN, evaluated per row. `<x> LIKE <expr>` -
+        // a sibling column, `V || '%'`, `TRIM(V)`, a `CASE`, a scalar
+        // subquery. The engine answers all of them; this server refused
+        // them because [parse_pattern] admits only literals and `?`, so
+        // the predicate never became a `RawTerm` at all.
+        //
+        // The pattern resolves through [resolve_expr], the same call the
+        // LEFT side above uses - the two sides are the same kind of thing
+        // and there is no second resolver to get wrong.
+        //
+        // NO TRANSCODE, measured: every expression-pattern shape answers
+        // identically under NONE, WIN1252 and UTF8, where the LITERAL form
+        // moves with the attachment. A literal is statement text the
+        // attachment decodes; an expression pattern is a VALUE carrying its
+        // own column's charset, so [carrier_expr_like] is deliberately NOT
+        // applied here.
+        //
+        // TWO DECLINES, both because the literal arm below does something
+        // at PREPARE that a per-row pattern cannot:
+        //  * a `?` INSIDE the pattern - placeholder numbering is its own
+        //    problem, and this path already declines a `?` LEFT side for
+        //    the same reason (see `raw_has_param` above);
+        //  * a COLLATE-canonical left side - the literal arm rewrites the
+        //    PATTERN TEXT with `icu_canonical` at prepare, and there is no
+        //    text to rewrite until the row arrives. Matching in the
+        //    uncanonicalised form would answer differently under a CI
+        //    collation, so it refuses instead.
+        RawKind::LikeExpr(pat, escape, negated) => {
+            if raw_has_param(pat) {
+                return None;
+            }
+            if collate_canon_of(&lhs).is_some() {
+                return None;
+            }
+            let pat = resolve_expr(pat, columns, descs)?;
+            // A CARRIER/REAL MIX BETWEEN THE TWO SIDES REFUSES - it is the
+            // slice [carrier_fn_operands] already defers in its own doc:
+            // "where the CARRIER side is a COLUMN there is nothing to
+            // reinterpret at prepare - the values must meet in byte space
+            // at EVAL". [carrier_expr_like] answers only the ATTACHMENT
+            // carrier; a carrier COLUMN facing a real one is unmeasured here.
+            //
+            // Not a precaution - MEASURED, and this arm without the guard
+            // gave three WRONG ANSWERS: `N LIKE PU` listed the non-ASCII row
+            // the engine MISSES (1,2 against the engine's 2), and `U LIKE PN`
+            // answered rows where the engine RAISES 22000 Malformed string.
+            // The engine gives the three pairings three different answers -
+            // carrier/carrier matches, carrier-value/real-pattern misses
+            // without raising, real-value/carrier-pattern raises - so there
+            // is no single byte-space rule to apply, and refusing is the
+            // only honest answer until that slice is measured on its own.
+            //
+            // The test reads BOTH sides' contributed charsets and compares
+            // only CARRIER-NESS, not identity: two real sets meeting is the
+            // ordinary text law this path already handles.
+            if let (Some(a), Some(b)) =
+                (cmp_text_charset(&lhs, descs), cmp_text_charset(&pat, descs))
+            {
+                if fire_crab_ods::intl::byte_carrier(a)
+                    != fire_crab_ods::intl::byte_carrier(b)
+                {
+                    return None;
+                }
+            }
+            Term::ExprLikeExpr(Box::new(lhs), Box::new(pat), *escape, *negated)
+        }
         // a `?` against the expression side: synthesize the bind
         // target from the expression's type and defer to bind()
         RawKind::Cmp(op, Rhs::Param(slot, _)) => {
@@ -92293,6 +92471,14 @@ fn resolve_expr_term(
     }
     match &term {
         Term::ExprCond(c) => cond_types(c, descs)?,
+        // BOTH sides type-checked. This match ends in `_ => {}`, so the
+        // compiler does NOT force a new variant to appear here - it would
+        // simply skip the check in silence, which is why it is written in
+        // deliberately rather than waited for.
+        Term::ExprLikeExpr(e, pat, ..) => {
+            e.type_of(descs)?;
+            pat.type_of(descs)?;
+        }
         Term::ExprLike(e, ..) | Term::ExprStarting(e, ..) => {
             e.type_of(descs)?;
         }
@@ -93000,7 +93186,10 @@ fn numeric_term(
     };
     Some(match raw {
         RawKind::Const(b) => Term::Const(b),
-        RawKind::CmpExpr(..) => return None, // see typed_term
+        // ...and an expression PATTERN for the same reason: this resolver
+        // holds a numeric column, not the machinery that evaluates a
+        // pattern per row
+        RawKind::CmpExpr(..) | RawKind::LikeExpr(..) => return None, // see typed_term
         // a numeric operand's CONTAINING renders it to decimal text.
         // A LITERAL pattern is answered by the resolver that holds the
         // column's descriptor; a BOUND one is answered HERE, because a
@@ -93117,6 +93306,9 @@ fn decfloat_term(
         // CONTAINING over a DECFLOAT column: the rendered text has no
         // case to fold, but its rendering is unprobed here - refuse
         RawKind::Containing(..) => return None,
+        // an expression PATTERN over a DECFLOAT column, likewise: the
+        // pattern varies per row and this resolver cannot evaluate one
+        RawKind::LikeExpr(..) => return None,
         RawKind::Const(b) => Term::Const(b),
         RawKind::Cmp(_, Rhs::Null) => Term::Unknown,
         // a `?` against a DECFLOAT column: the input slot describes as the
