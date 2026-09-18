@@ -45547,6 +45547,53 @@ fn view_trig_stmt_type(action: u8) -> i32 {
 /// that subquery's own (the query planner types it from what it
 /// compares against); every other `?` takes `ty`. String literals are
 /// left alone.
+/// The SCALE-0 TWIN of an exact scaled type's spelling - the type a
+/// multiply's LEFT parameter operand converts at ([resolve_dest_param_expr]'s
+/// Bin arm: into a NUMERIC(9,2), `? * 2` bound 1.25 stores 2, not 2.50).
+/// [desc_type_sql] spells a scaled exact column as `NUMERIC(<precision>,
+/// <scale>)` and only ever with precision 4, 9, 18 or 38, so the twin is
+/// that precision's own integer keyword. `None` for anything else - a
+/// DOUBLE, a text or temporal type, or an already-integral one - which
+/// leaves the destination's own type in place, as measured.
+fn scale0_twin(ty: &str) -> Option<&'static str> {
+    let t = ty.trim();
+    let rest = t.strip_prefix("NUMERIC(").or_else(|| t.strip_prefix("DECIMAL("))?;
+    let (prec, tail) = rest.split_once(',')?;
+    // a scale of 0 is not written by `desc_type_sql`, but a hand-spelled
+    // `NUMERIC(9,0)` must not be twinned either: it already converts whole
+    if tail.trim_end_matches(')').trim() == "0" {
+        return None;
+    }
+    match prec.trim() {
+        "4" => Some("SMALLINT"),
+        "9" => Some("INTEGER"),
+        "18" => Some("BIGINT"),
+        "38" => Some("NUMERIC(38)"),
+        _ => None,
+    }
+}
+
+/// Is the `?` at `at` the LEFT OPERAND of a multiplication? Whitespace
+/// and the closing parens of groups that hold only the parameter are
+/// skipped - `(?) * 2` is the same shape as `? * 2`, measured. A `?`
+/// followed by anything else (`? + 1`, `? / 2`, `COALESCE(?, 0) * 2`
+/// where the comma comes first) is not.
+fn param_is_mul_left(masked: &str, at: usize) -> bool {
+    let b = masked.as_bytes();
+    let mut j = at + 1;
+    loop {
+        while j < b.len() && b[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if b.get(j) == Some(&b')') {
+            j += 1;
+            continue;
+        }
+        break;
+    }
+    b.get(j) == Some(&b'*')
+}
+
 fn view_trig_type_params(value: &str, ty: &str) -> String {
     let masked = mask_literals(&value.to_ascii_uppercase());
     let m = masked.as_bytes();
@@ -45580,7 +45627,31 @@ fn view_trig_type_params(value: &str, ty: &str) -> String {
                 if in_subquery || cast_operand {
                     out.push('?');
                 } else {
-                    out.push_str(&format!("CAST(? AS {})", ty));
+                    // A MULTIPLY'S LEFT PARAMETER OPERAND CONVERTS AT
+                    // SCALE 0, and this path used to spell the
+                    // destination's own type here for every `?` - so
+                    // `UPDATE <trigger view> SET NM = ? * 2` bound 1.25
+                    // generated `CAST(? AS NUMERIC(9,2)) * 2` and stored
+                    // 2.50 where the engine stores 2. A SILENT WRONG
+                    // WRITE, and this server was answering correctly for
+                    // the statement it had rewritten to rather than the
+                    // one the client sent: the engine gives 2.50 for that
+                    // generated text too (measured both ways).
+                    //
+                    // The table planner has carried this rule since
+                    // `e81c64f`; the trigger path never reached it,
+                    // because it hands the SET clause on as TEXT and
+                    // plans it as an ordinary SELECT. Same rule, second
+                    // router. The twin text was validated against the
+                    // engine before it was written here:
+                    // `CAST(? AS INTEGER) * 2` is 2 and
+                    // `-CAST(? AS INTEGER) * 2` is -2, while
+                    // `2 * CAST(? AS NUMERIC(9,2))` stays 2.5.
+                    let t = match scale0_twin(ty).filter(|_| param_is_mul_left(&masked, i)) {
+                        Some(t) => t,
+                        None => ty,
+                    };
+                    out.push_str(&format!("CAST(? AS {})", t));
                 }
             }
             _ => {
@@ -68653,24 +68724,55 @@ fn resolve_dest_param_expr(
         // is why this wraps the cast itself instead of passing a
         // doctored descriptor down.
         RawExpr::Bin(a, op, b) => {
+            // AND THE RULE SURVIVES A UNARY MINUS. `-? * 2` bound 1.25
+            // into a NUMERIC(9,2) stores -2 on the engine, not -2.50 -
+            // measured, with `-? * 3` (-3), `-? * ?` (-2) and a
+            // DECIMAL(9,3) destination (-2) alongside. This guard used to
+            // match only a BARE Param on the left, so `Neg(Param)` slipped
+            // past and stored -2.50: THE SAME WRONG VALUE THE MULTIPLY
+            // RULE EXISTS TO PREVENT, ONE NODE DEEPER, on a plain table
+            // and in both DML verbs.
+            //
+            // The controls that bound it, each measured: `-(? * 2)` was
+            // already right (the negation sits ABOVE the multiply, so the
+            // left operand IS the bare parameter); `2 * -?` keeps the
+            // destination's scale (-2.5) because the rule is the LEFT
+            // operand's alone; `-? + 1`, `-? / 2` and a bare `-?` keep it
+            // too (not a multiply); and an INTEGER, BIGINT or DOUBLE
+            // destination is untouched (`dest.scale != 0` and the Numeric
+            // target already say so).
+            let left_param = |e: &RawExpr| -> Option<(usize, bool)> {
+                match e {
+                    RawExpr::Param(i) => Some((*i, false)),
+                    RawExpr::Neg(inner) => match &**inner {
+                        RawExpr::Param(i) => Some((*i, true)),
+                        _ => None,
+                    },
+                    _ => None,
+                }
+            };
+            let lp = left_param(a);
             let scale0 = matches!(op, ArithOp::Mul)
                 && dest.scale != 0
-                && matches!(**a, RawExpr::Param(_))
+                && lp.is_some()
                 && dest_cast_target(dest).is_some_and(|t| matches!(t, CastTarget::Numeric { .. }));
-            let left = match (&**a, scale0) {
-                (RawExpr::Param(i), true) => {
-                    set(sink, *i, dest.clone());
+            let left = match (lp, scale0) {
+                (Some((i, negated)), true) => {
+                    set(sink, i, dest.clone());
                     let bytes = match dest.dtype {
                         dtype::SHORT => 2,
                         dtype::LONG => 4,
                         dtype::INT64 => 8,
                         _ => 16,
                     };
-                    Expr::Cast(
-                        Box::new(Expr::Param(*i)),
+                    let cast = Expr::Cast(
+                        Box::new(Expr::Param(i)),
                         CastTarget::Int { bytes },
                         fire_crab_ods::intl::CS_UTF8,
-                    )
+                    );
+                    // the negation goes back ON TOP of the converted
+                    // value: -(CAST(? AS INTEGER)) * 2, which measures -2
+                    if negated { Expr::Neg(Box::new(cast)) } else { cast }
                 }
                 _ => resolve_dest_param_expr(a, dest, columns, descs, sink)?,
             };
@@ -116076,7 +116178,29 @@ mod tests {
     fn view_trig_type_params_types_every_free_placeholder_by_the_destination() {
         assert_eq!(view_trig_type_params("?", "INTEGER"), "CAST(? AS INTEGER)");
         assert_eq!(view_trig_type_params("A + ?", "INTEGER"), "A + CAST(? AS INTEGER)");
-        assert_eq!(view_trig_type_params("? * 2 + ?", "NUMERIC(9,2)"), "CAST(? AS NUMERIC(9,2)) * 2 + CAST(? AS NUMERIC(9,2))");
+        // A MULTIPLY'S LEFT OPERAND TAKES THE SCALE-0 TWIN. This
+        // assertion used to read `CAST(? AS NUMERIC(9,2)) * 2 + ...`,
+        // encoding the defect: bound 1.25 that generated text stores 2.50
+        // where the engine stores 2. The SECOND `?` here is an addend,
+        // not a multiply's left operand, so it keeps the column's type.
+        assert_eq!(view_trig_type_params("? * 2 + ?", "NUMERIC(9,2)"), "CAST(? AS INTEGER) * 2 + CAST(? AS NUMERIC(9,2))");
+        // the negated form, and the paren form, are the same shape
+        assert_eq!(view_trig_type_params("-? * 2", "NUMERIC(9,2)"), "-CAST(? AS INTEGER) * 2");
+        assert_eq!(view_trig_type_params("(?) * 2", "NUMERIC(9,2)"), "(CAST(? AS INTEGER)) * 2");
+        // the RIGHT operand keeps the destination's scale, measured 2.5
+        assert_eq!(view_trig_type_params("2 * ?", "NUMERIC(9,2)"), "2 * CAST(? AS NUMERIC(9,2))");
+        // every other operator keeps it too
+        assert_eq!(view_trig_type_params("? / 2", "NUMERIC(9,2)"), "CAST(? AS NUMERIC(9,2)) / 2");
+        assert_eq!(view_trig_type_params("? + 1", "NUMERIC(9,2)"), "CAST(? AS NUMERIC(9,2)) + 1");
+        // a COMMA before the `*` is not this shape (COALESCE's argument)
+        assert_eq!(view_trig_type_params("COALESCE(?, 0) * 2", "NUMERIC(9,2)"), "COALESCE(CAST(? AS NUMERIC(9,2)), 0) * 2");
+        // the twin follows the destination's WIDTH, and leaves alone what
+        // is not an exact scaled type
+        assert_eq!(view_trig_type_params("? * 2", "NUMERIC(4,2)"), "CAST(? AS SMALLINT) * 2");
+        assert_eq!(view_trig_type_params("? * 2", "NUMERIC(18,4)"), "CAST(? AS BIGINT) * 2");
+        assert_eq!(view_trig_type_params("? * 2", "NUMERIC(38,4)"), "CAST(? AS NUMERIC(38)) * 2");
+        assert_eq!(view_trig_type_params("? * 2", "INTEGER"), "CAST(? AS INTEGER) * 2");
+        assert_eq!(view_trig_type_params("? * 2", "DOUBLE PRECISION"), "CAST(? AS DOUBLE PRECISION) * 2");
         assert_eq!(view_trig_type_params("CAST(? AS BIGINT)", "INTEGER"), "CAST(? AS BIGINT)");
         assert_eq!(view_trig_type_params("cast ( ? as bigint)", "INTEGER"), "cast ( ? as bigint)");
         assert_eq!(view_trig_type_params("XCAST(?)", "INTEGER"), "XCAST(CAST(? AS INTEGER))");
