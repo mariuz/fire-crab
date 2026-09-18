@@ -39631,8 +39631,19 @@ fn parse_table_ref(s: &str) -> Option<TableRef<'_>> {
             }
             None => close + 1,
         };
-        // the alias is a NAME: `"x y"` binds exactly, `x` binds X
-        let alias = canon_ident(rest)?;
+        // the alias is a NAME: `"x y"` binds exactly, `x` binds X - and
+        // it is OPTIONAL, measured: `SELECT ID FROM (SELECT ID FROM T)`
+        // answers on the engine, as does the column-list form with no
+        // name at all (`(SELECT ID FROM T) (A)`), in EVERY row-source
+        // position (alone, either side of a comma join, the right of a
+        // JOIN ... ON, over a UNION, nested). An UNNAMED derived table
+        // is reachable ONLY UNQUALIFIED: `X.ID` and the inner table's
+        // own `T.ID` are both -206, and the engine's -204 renders it
+        // with NO NAME ("between table \"PUBLIC\".\"T\" and derived
+        // table"). The EMPTY name carries all of that: no written
+        // qualifier can equal it, and unlike a synthesised word it
+        // cannot shadow a real table that happens to be called that.
+        let alias = if rest.is_empty() { String::new() } else { canon_ident(rest)? };
         return Some(TableRef {
             table: t[..span_end].to_string(),
             raw: &t[..span_end],
@@ -41327,7 +41338,11 @@ fn plan_join_bound(
             }) {
                 return Some(Plan::RefusedEval(EvalErr::DerivedFieldUnnamed {
                     pos: at as i32 + 1,
-                    table: tr.alias.clone()?,
+                    // an UNNAMED derived table names itself with nothing,
+                    // which is what the engine's own rendering does -
+                    // refusing here instead would turn a legal statement
+                    // into an error for want of a name it never needed
+                    table: tr.alias.clone().unwrap_or_default(),
                 }));
             }
             let (columns, descs) = derived_view(&inner_cols);
@@ -41337,9 +41352,13 @@ fn plan_join_bound(
             // row source: the side's own columns cannot answer it
             let base_fids = side_base_fids(Some(&inner), &inner_cols);
             sides.push(JoinSide {
-                key: tr.alias.clone()?,
-                // a DERIVED side has no relation and so no schema: its
-                // mandatory alias is the only way to name it
+                // an UNNAMED derived side keys on the EMPTY name: a
+                // qualifier is always a written identifier, so nothing
+                // can ever bind to it - which is the engine's rule
+                // (`X.ID` over an unnamed derived table is -206)
+                key: tr.alias.clone().unwrap_or_default(),
+                // a DERIVED side has no relation and so no schema; an
+                // alias, when written, is the only way to name it
                 schema: None,
                 src: RowSource::PlanRows(std::rc::Rc::new(inner)),
                 columns,
@@ -41518,10 +41537,18 @@ fn plan_join_bound(
             flatten: None,
         });
     }
-    // every side must be distinguishable by qualifier
+    // every side must be distinguishable by qualifier - EXCEPT that an
+    // UNNAMED derived side has no qualifier to be distinguished BY. Its
+    // key is the empty name, which no written qualifier can equal, so
+    // two of them are not a collision: the engine answers
+    // `SELECT COUNT(*) FROM (SELECT ID FROM T), (SELECT ID FROM U)`
+    // (measured, 4) and only refuses when a COLUMN is named ambiguously
+    // across them, which is a -204 raised where the column resolves,
+    // not here. Comparing the empty keys made this server refuse the
+    // whole statement.
     for i in 0..sides.len() {
         for j in i + 1..sides.len() {
-            if sides[i].key == sides[j].key {
+            if !sides[i].key.is_empty() && sides[i].key == sides[j].key {
                 return None;
             }
         }
@@ -50094,15 +50121,40 @@ fn plan_query_inner_at(
             // to read a format from, and neither has a CTE's rows.
             // the binding key is canonical; the rebuilt FROM must re-parse
             // to it (`"vq"` stays delimited)
-            let bound = sql_over_from(sql, &render_canon_ref(&alias));
+            //
+            // AN UNNAMED DERIVED TABLE HAS NO NAME TO SPELL. Unlike the
+            // JOIN path - which binds a side and needs no text at all,
+            // and so carries the empty name happily - this path REBUILDS
+            // THE STATEMENT with the name written in place of the derived
+            // span, and `render_canon_ref("")` is `""`, which
+            // [canon_ident] rejects: the rebuilt SQL does not re-parse.
+            // (Traced: the inner plan succeeds, then `plan_over_source`
+            // hands back None.)
+            //
+            // So it binds under a RESERVED name and REFUSES the statement
+            // if the text mentions that name itself. The guard is not
+            // decoration: a user CAN create `RDB$FC_UNNAMED_DERIVED`, and
+            // `SELECT RDB$FC_UNNAMED_DERIVED.ID FROM (SELECT ID FROM T)`
+            // is -206 on the engine - binding under it unguarded would
+            // ANSWER that, a WRONG ANSWER, where refusing is a refusal.
+            // `contains` rather than a word search on purpose: it refuses
+            // MORE, and more is the safe direction here.
+            let (bind, bound) = if alias.is_empty() {
+                if mask_literals(&sql.to_ascii_uppercase()).contains(UNNAMED_DERIVED) {
+                    return Some(Plan::Refused);
+                }
+                (UNNAMED_DERIVED.to_string(), sql_over_from(sql, UNNAMED_DERIVED))
+            } else {
+                (alias.clone(), sql_over_from(sql, &render_canon_ref(&alias)))
+            };
             return match plan_over_source(
                 &bound,
-                &alias,
+                &bind,
                 &inner_cols,
                 BoundSrc::Inner(inner),
                 db,
                 params,
-                Some(&alias),
+                Some(&bind),
             ) {
                 Some(p) => Some(p),
                 None => {
@@ -52598,12 +52650,20 @@ fn parse_derived_table(from_s: &str) -> Option<(String, String, Vec<String>)> {
         }
         rest = rest[..open].trim();
     }
-    // the engine REQUIRES a name for a derived table; without one there
-    // is nothing to qualify its columns with - and the name is a NAME
-    // ([canon_ident]): `(SELECT ...) "x"` binds `x`, which `"x".A`
-    // reaches and `X.A` does not. It used to fold whatever the quotes
-    // held, so `GROUP BY "x"."a"` read the folded twin A.
-    let alias = canon_ident(rest)?;
+    // the name is a NAME ([canon_ident]): `(SELECT ...) "x"` binds `x`,
+    // which `"x".A` reaches and `X.A` does not. It used to fold whatever
+    // the quotes held, so `GROUP BY "x"."a"` read the folded twin A.
+    //
+    // AND IT IS OPTIONAL. This used to say the engine REQUIRES one
+    // "because without it there is nothing to qualify its columns
+    // with" - reasoned, not measured, and wrong on both halves:
+    // `SELECT ID FROM (SELECT ID FROM T)` answers on the engine, and
+    // the columns are reachable precisely because they are NOT
+    // qualified (`X.ID` is -206, and so is the inner table's `T.ID`).
+    // An unnamed derived table gets the EMPTY name, which no written
+    // qualifier can equal - and which the engine's own -204 rendering
+    // uses too ("between derived table  and derived table").
+    let alias = if rest.is_empty() { String::new() } else { canon_ident(rest)? };
     Some((inner, alias, cols))
 }
 
@@ -63886,6 +63946,17 @@ fn find_col<'a>(columns: &'a [RelationColumn], want: &str) -> Option<&'a Relatio
 /// view's base-table rewrite, a PSQL body's nested DML, the optimizer
 /// gatekeeper's probe): a canonical name written bare re-parses as its
 /// folded twin (`a` -> A), which is a WRONG WRITE, not a refusal.
+/// The name an UNNAMED derived table is BOUND under on the path that
+/// rebuilds the statement text ([sql_over_from]). It is never the
+/// derived table's name in any sense the user can reach: the caller
+/// REFUSES the statement outright when the text mentions it, because a
+/// user can occupy this spelling. MEASURED, not assumed - a bare
+/// `CREATE TABLE RDB$FC_UNNAMED_DERIVED (ID INT)` SUCCEEDS on the
+/// engine (the `RDB$` namespace is not protected against it), and the
+/// word is a legal alias and qualifier, while
+/// `SELECT RDB$FC_UNNAMED_DERIVED.ID FROM (SELECT ID FROM T)` is -206.
+const UNNAMED_DERIVED: &str = "RDB$FC_UNNAMED_DERIVED";
+
 fn render_canon_ref(s: &str) -> String {
     s.split('.')
         .map(|p| {
@@ -77195,7 +77266,11 @@ fn scope_rel_of(tr: &TableRef<'_>, db: &Database, db_opt: &Option<Database>) -> 
         // declared list; nothing outside it is visible inside it
         // the span holds `(SELECT ...) X (A, B)` whole when a column list
         // was written, and just the query when not
-        let alias = tr.alias.as_deref()?;
+        // the alias may be absent (an UNNAMED derived table) - this used
+        // to `?` on it and refuse the statement before the parser was
+        // ever consulted, which is why widening the parser alone would
+        // have built clean and changed nothing
+        let alias = tr.alias.as_deref().unwrap_or("");
         let (inner_sql, dalias, declared) = parse_derived_table(&tr.table)
             .or_else(|| parse_derived_table(&format!("{} {}", tr.table, alias)))?;
         let mut ip: Vec<Option<Descriptor>> = Vec::new();
@@ -115237,8 +115312,19 @@ mod tests {
         let (_, _, cols) = parse_derived_table("(SELECT ID FROM T) AS X (K)").unwrap();
         assert_eq!(cols, vec!["K"]);
 
-        // a name is still required, and the list must hold names
-        assert!(parse_derived_table("(SELECT ID FROM T)").is_none());
+        // A NAME IS NOT REQUIRED - this assertion used to read
+        // `.is_none()`, encoding the defect: the engine answers
+        // `SELECT ID FROM (SELECT ID FROM T)`, and the column-list form
+        // with no name too. An unnamed one takes the EMPTY name, which
+        // no written qualifier can equal.
+        let (inner, alias, cols) = parse_derived_table("(SELECT ID FROM T)").unwrap();
+        assert_eq!(inner, "SELECT ID FROM T");
+        assert_eq!(alias, "");
+        assert!(cols.is_empty());
+        let (_, alias, cols) = parse_derived_table("(SELECT ID FROM T) (A)").unwrap();
+        assert_eq!(alias, "");
+        assert_eq!(cols, vec!["A"]);
+        // the list must still hold names
         assert!(parse_derived_table("(SELECT ID FROM T) X ()").is_none());
         assert!(parse_derived_table("(SELECT ID FROM T) X (1)").is_none());
     }

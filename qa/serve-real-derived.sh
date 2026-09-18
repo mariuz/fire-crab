@@ -474,9 +474,21 @@ both "an ungrouped aggregate over a derived table" \
 both "GROUP BY with a HAVING over a derived table" \
      "SELECT X.DEPT_ID, MAX(X.SALARY) AS M FROM (SELECT DEPT_ID, SALARY FROM EMP) X
       GROUP BY X.DEPT_ID HAVING COUNT(*) > 1 ORDER BY X.DEPT_ID"
-# SQL requires a derived table to be named; without one there is nothing
-# to qualify its columns with
-refuses "a derived table with NO alias" "SELECT ID FROM (SELECT ID FROM EMP)"
+# PROMOTED 2026-09-18, and the comment that stood here was WRONG. It read
+# "SQL requires a derived table to be named; without one there is nothing
+# to qualify its columns with" - reasoned, never measured. The engine
+# ANSWERS this, and the columns are reachable precisely BECAUSE they are
+# not qualified (`X.ID` over it is -206, and so is the inner table's own
+# `T.ID`). This cell asserted the defect as a rule for as long as it
+# stood, and it is what went red on the landing that fixed it - which is
+# the cell working, not failing.
+#
+# NOTE WHAT THIS GATE'S OWN HABIT COST: all fourteen of its other derived
+# tables are ALIASED, so this one `refuses` cell was the only place the
+# unnamed shape appeared anywhere in 445 gates - and it recorded the
+# wrong answer. Full coverage in `qa/serve-real-derivnoalias.sh` (31
+# cells, floor 31).
+both "a derived table with NO alias" "SELECT ID FROM (SELECT ID FROM EMP)"
 
 # --- 7. the clause splitter, which this changed for EVERY statement ---
 both "a subquery in the WHERE still splits" \
