@@ -8453,8 +8453,20 @@ impl RowSource {
             // mirror needs it); its probe, when the ON has an equi-key, is
             // the key alone and HASHES that side by row. A (hypothetical)
             // index-probed one falls to the materialising arm.
+            // A RIGHT JOIN NO LONGER STREAMS, AND THAT IS A REAL COST.
+            // The engine drives a RIGHT join from the PRESERVED side, so
+            // its rows must come back in that side's storage order - which
+            // this arm cannot do while walking the accumulated side lazily.
+            // A Right part therefore falls past both streaming arms to the
+            // materialising `other` arm, which calls [join_step] once with
+            // the whole accumulated side (the early return at the top of
+            // `rows_materialised`'s NestedLoopJoin arm), and the ordering
+            // happens there. What is lost is the `FIRST n` early stop for
+            // RIGHT joins alone; FULL keeps it, and so do LEFT and INNER.
+            // Recorded rather than hidden: the alternative was answering
+            // the wrong ROWS, which every slice over a right join did.
             RowSource::NestedLoopJoin { left, left_width, right, part, above }
-                if matches!(part.kind, JoinKind::Right | JoinKind::Full)
+                if matches!(part.kind, JoinKind::Full)
                     && part.probe.as_ref().map_or(true, |p| p.index.is_none()) =>
             {
                 let rrows = right.rows(db)?;
@@ -55218,6 +55230,35 @@ impl JoinCursor {
         if inner_parts.iter().any(|p| !matches!(p.kind, JoinKind::Left | JoinKind::Inner)) {
             return None;
         }
+        // A RIGHT LAST PART CANNOT BE DELIVERED INCREMENTALLY, because the
+        // engine emits a RIGHT join in the PRESERVED side's storage order:
+        // right rows in that order, each followed by its matches in the
+        // accumulated side's order, and an UNMATCHED right row padded IN ITS
+        // STORAGE POSITION (measured - over JR stored 40,10,30,20 the
+        // unmatched 30 lands THIRD, not last). This cursor is the opposite
+        // shape by construction: `driver_output` expands ONE base row at a
+        // time and `mirror_output` emits the unmatched preserved rows only
+        // after the driver phase exhausts, so they can only ever trail. No
+        // amount of buffering inside either phase fixes that - the phase
+        // never sees more than one base row's slice.
+        //
+        // So a bare RIGHT join declines here and the materialising path takes
+        // it, where [join_step] receives the whole accumulated side at once
+        // and orders the result. The cost is the incremental delivery this
+        // cursor exists to provide, for RIGHT joins alone - recorded rather
+        // than hidden, and paid because the alternative was answering the
+        // wrong ROWS: every `FIRST`/`SKIP`/`ROWS` over a right join sliced a
+        // DIFFERENT SET from the engine's, silently and with no error.
+        //
+        // TWO DELIBERATE EXCLUSIONS, both measured: FULL keeps the cursor
+        // (its two-phase result is identical to the engine's on the same
+        // fixtures, and reordering it would trade a correct answer for a
+        // wrong one), and `raw` - the ORDER BY path - keeps it too, because
+        // a sort decides the final order there and the join's emission order
+        // cannot be observed (`RIGHT JOIN ... ORDER BY` already agrees).
+        if !raw && matches!(last.kind, JoinKind::Right) {
+            return None;
+        }
         // a LIVE INDEX PROBE reads its side per accumulated row. The cursor
         // freezes the page image at open (as StreamCursor does), so the probe
         // can repeat that read on every fetch against the SAME pages its
@@ -56099,6 +56140,32 @@ fn join_step(
 ) -> Result<Vec<Vec<Value>>, EvalErr> {
     let mut out = Vec::new();
     let mut right_matched = vec![false; rrows.len()];
+    // WHO DRIVES A RIGHT JOIN. The engine drives it from the PRESERVED
+    // (right) side, mirroring a LEFT join driving from the left - its plan
+    // names that side first (`PLAN JOIN ("B" NATURAL, "A" NATURAL)`) -
+    // while this fold walks the ACCUMULATED side and appends the mirror.
+    // That is not an order nicety: every top-level slice then takes a
+    // DIFFERENT SET OF ROWS. Over `TA(1,2,3,4)` against `TB` stored
+    // `4,2,1,3`, `FIRST 1` is the engine's `[4]` and was this server's
+    // `[1]` - silently, with no error (pre-existing on `bd5e39d`,
+    // `302c4d1` and `1762f79` alike).
+    //
+    // THE MEASURED LAW, over JR stored 40,10,30(unmatched),20 against JL
+    // stored 3,1,4,2: right rows come back in the PRESERVED side's
+    // storage order; within one right row its matches follow the
+    // ACCUMULATED side's order - which this loop ALREADY produces, so
+    // that half is left exactly as it is; and an UNMATCHED right row is
+    // emitted padded IN ITS STORAGE POSITION (30 lands THIRD, not last).
+    // That last fact is what makes "group by the right row's index" a
+    // faithful model rather than a near one, and it was measured before
+    // a line of this was written.
+    //
+    // So the pairing, the ON evaluation and the partnerless raise all
+    // stay where they are and only the EMISSION ORDER changes: each
+    // pushed row carries the right-row index that produced it, and a
+    // RIGHT part stable-sorts on that at the end. `usize::MAX` tags the
+    // padded ACCUMULATED row, which only a LEFT or FULL part ever emits.
+    let mut tags: Vec<usize> = Vec::new();
     // The WHERE above the join runs BEFORE the ON on the stream it
     // names: a top-level conjunct all of whose columns are one side's
     // rides that side's retrieval, so a row it rejects never reaches
@@ -56144,6 +56211,7 @@ fn join_step(
             }
             matched = true;
             right_matched[ri] = true;
+            tags.push(ri);
             out.push(row);
         }
         // A PARTNERLESS outer row still meets the ON: the engine walks
@@ -56171,6 +56239,7 @@ fn join_step(
                 part.on.matches(&row)?;
             }
             if matches!(part.kind, JoinKind::Left | JoinKind::Full) {
+                tags.push(usize::MAX);
                 out.push(row);
             }
         }
@@ -56192,8 +56261,20 @@ fn join_step(
             if open(&rgate, &row)? {
                 part.on.matches(&row)?;
             }
+            tags.push(ri);
             out.push(row);
         }
+    }
+    // ...and the ONE thing this changes: a RIGHT part emits grouped by the
+    // preserved row, in that side's storage order. `sort_by_key` is STABLE,
+    // so each right row's matches keep the accumulated order the loop above
+    // gave them. FULL is deliberately NOT reordered: its two-phase result
+    // is measured identical to the engine's on the same fixtures, and
+    // reordering it would trade a correct answer for a wrong one.
+    if matches!(part.kind, JoinKind::Right) {
+        let mut paired: Vec<(usize, Vec<Value>)> = tags.into_iter().zip(out).collect();
+        paired.sort_by_key(|(ri, _)| *ri);
+        out = paired.into_iter().map(|(_, r)| r).collect();
     }
     Ok(out)
 }

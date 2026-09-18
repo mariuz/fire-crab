@@ -36,6 +36,12 @@ B="$D/fc-jt-engine.fdb"
 command -v node >/dev/null 2>&1 || { echo "SKIP node not found"; exit 0; }
 mkdir -p "$D"
 fail=0
+# THIS GATE HAD NO COUNTER AT ALL until 2026-09-18: a block that silently
+# stopped being read - an edit that drops a line, a helper renamed - would
+# have left it green over fewer cells with no sign at all. Counted in
+# `both` alone, which is where every cell ends up: `where` and `on_cmp`
+# both delegate to it, so one increment counts all three.
+ran=0
 
 make_db() {
     rm -f "$1"
@@ -51,6 +57,22 @@ INSERT INTO A VALUES (3, 2, 5.00,  '2019-03-03', -0.5, NULL);
 INSERT INTO A VALUES (4, 3, NULL,  NULL,          NULL, TRUE);
 INSERT INTO C VALUES (10, 1, 'one', 10.50);
 INSERT INTO C VALUES (20, 2, 'two', 99.00);
+COMMIT;
+-- A PRESERVED SIDE STORED OUT OF ORDER. Every other table here is
+-- inserted ascending, and C holds two rows - so a RIGHT join driven from
+-- either side yields the same first row, and this gate's own
+-- "FIRST 1 over a RIGHT join" cell could not see a driver-order defect
+-- at all. JR is stored 40, 10, 30, 20 with DUPLICATE keys on both sides
+-- and its UNMATCHED row (30, 'z') in the MIDDLE, because the engine
+-- emits an unmatched preserved row IN ITS STORAGE POSITION, not at the
+-- end - which is the fact that decides how a fix may be written.
+CREATE TABLE JL (ID INTEGER, K VARCHAR(2));
+CREATE TABLE JR (ID INTEGER, K VARCHAR(2));
+COMMIT;
+INSERT INTO JL VALUES (3,'b'); INSERT INTO JL VALUES (1,'a');
+INSERT INTO JL VALUES (4,'c'); INSERT INTO JL VALUES (2,'a');
+INSERT INTO JR VALUES (40,'a'); INSERT INTO JR VALUES (10,'b');
+INSERT INTO JR VALUES (30,'z'); INSERT INTO JR VALUES (20,'a');
 COMMIT;
 CREATE TABLE BIG (ID INTEGER);
 -- BIGK carries a PRIMARY KEY, so ORDER BY ID NAVIGATES its index (the
@@ -111,6 +133,7 @@ query() { # <sql> <port> <db>
 }
 
 both() { # <label> <sql>
+    ran=$((ran + 1))
     a=$(query "$2" "$PORT" "$A")
     b=$(query "$2" "$REAL" "$B")
     if [ "$a" = "$b" ]; then
@@ -259,6 +282,51 @@ both "FIRST 1 over a FULL join, raiser past the limit" \
 both "no FIRST: the join raiser runs on both" \
      "SELECT A.ID, 10/(A.ID - 2) AS Q FROM A JOIN C ON A.K = C.K ORDER BY A.ID"
 
+# --- WHO DRIVES A RIGHT JOIN, over a preserved side stored OUT of order --
+# The engine drives a RIGHT join from the PRESERVED (right) side, mirroring
+# a LEFT join driving from the left: its plan names that side first
+# (PLAN JOIN ("B" NATURAL, "A" NATURAL)). Measured law, over JR stored
+# 40,10,30,20 against JL stored 3,1,4,2:
+#   * right rows come back in the PRESERVED side's storage order;
+#   * within one right row, its matches follow the ACCUMULATED side's
+#     storage order - which this server already produces, so that half
+#     needs no change and is pinned below as a cell that must NOT move;
+#   * an UNMATCHED right row is emitted padded IN ITS STORAGE POSITION
+#     (30 lands THIRD, not last), which is what makes "emit grouped by the
+#     right row's index" a faithful model rather than a near one.
+# This is NOT order-only: every top-level slice takes a DIFFERENT SET OF
+# ROWS, silently and with no error, which is why these cells exist at all.
+both "RIGHT: the whole pairing" \
+     "SELECT R.ID AS RID, COALESCE(L.ID,-1) AS LID FROM JL L RIGHT JOIN JR R ON R.K = L.K"
+both "RIGHT: where the unmatched row lands" \
+     "SELECT R.ID AS RID FROM JL L RIGHT JOIN JR R ON R.K = L.K"
+both "RIGHT: FIRST 1 takes the engine's first row" \
+     "SELECT FIRST 1 R.ID AS RID, COALESCE(L.ID,-1) AS LID FROM JL L RIGHT JOIN JR R ON R.K = L.K"
+both "RIGHT: FIRST 3" \
+     "SELECT FIRST 3 R.ID AS RID, COALESCE(L.ID,-1) AS LID FROM JL L RIGHT JOIN JR R ON R.K = L.K"
+both "RIGHT: SKIP 2" \
+     "SELECT SKIP 2 R.ID AS RID FROM JL L RIGHT JOIN JR R ON R.K = L.K"
+both "RIGHT: ROWS 2 TO 3" \
+     "SELECT R.ID AS RID FROM JL L RIGHT JOIN JR R ON R.K = L.K ROWS 2 TO 3"
+both "RIGHT: a WHERE over the preserved side" \
+     "SELECT R.ID AS RID FROM JL L RIGHT JOIN JR R ON R.K = L.K WHERE R.ID > 15"
+both "RIGHT: a derived preserved side" \
+     "SELECT Z.ID AS RID FROM JL L RIGHT JOIN (SELECT ID, K FROM JR) Z ON Z.K = L.K"
+both "RIGHT: a three-way chain" \
+     "SELECT R.ID AS RID FROM JL L JOIN JL L2 ON L2.K = L.K RIGHT JOIN JR R ON R.K = L.K"
+# the cells that must NOT move: one right row's own matches already agree,
+# and LEFT / INNER / FULL / ORDER BY are measured identical on this fixture
+both "RIGHT: one right row's matches (already agrees)" \
+     "SELECT R.ID AS RID, L.ID AS LID FROM JL L RIGHT JOIN JR R ON R.K = L.K WHERE R.ID = 40"
+both "RIGHT with ORDER BY collapses the difference" \
+     "SELECT R.ID AS RID FROM JL L RIGHT JOIN JR R ON R.K = L.K ORDER BY R.ID"
+both "LEFT over the same fixture (must not move)" \
+     "SELECT L.ID AS LID, COALESCE(R.ID,-1) AS RID FROM JL L LEFT JOIN JR R ON R.K = L.K"
+both "INNER over the same fixture (must not move)" \
+     "SELECT L.ID AS LID, R.ID AS RID FROM JL L JOIN JR R ON R.K = L.K"
+both "FULL over the same fixture (must not move)" \
+     "SELECT COALESCE(L.ID,-1) AS LID, COALESCE(R.ID,-1) AS RID FROM JL L FULL JOIN JR R ON R.K = L.K"
+
 # --- a BIG FIRST n (past the wire batch) stream-collects, not the whole --
 # BIG has 300 rows; `10/(ID - 280)` divides by zero at row 280. FIRST 250
 # is past the client's ~200-row fetch, so it used to MATERIALISE the whole
@@ -333,4 +401,11 @@ both "FIRST 3 nav ORDER BY pk DESC, clean values" \
      "SELECT FIRST 3 ID FROM BIGK ORDER BY ID DESC"
 
 rm -f "$A" "$B"
+echo "ran $ran checks"
+# derived from the invocations, not guessed: every top-level `both`, plus
+# every `where` and `on_cmp`, which reach the same helper from inside.
+if [ "$ran" -lt 78 ]; then
+    echo "DIFF only $ran checks ran (expected at least 78) - did a block silently skip?"
+    fail=1
+fi
 exit $fail
