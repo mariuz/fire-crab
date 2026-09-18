@@ -115,6 +115,10 @@ mal() { local ch=""; [ -n "${3:-}" ] && ch="-ch $3"
 # promote the cell back to `agree` - and it fails if either side does not
 # answer, so two REFUSEs can never be scored as a difference (sig()
 # collapses every error to that one word).
+# CURRENTLY UNCALLED - its last two cells (the OCTETS cast under STARTING
+# WITH) were promoted to `agree` when that divergence was fixed. Kept, not
+# deleted: the next recorded divergence wants this idiom, and its vacuity
+# guard is the part that took two attempts to get right.
 differs() { # <label> <sql> [client-charset]
     ran=$((ran + 1))
     local e f
@@ -138,6 +142,9 @@ differs() { # <label> <sql> [client-charset]
 # cell VACUOUS; it needs its own helper. It fails if they CONVERGE (we
 # start raising too - promote it), and it fails if the ENGINE stops
 # raising, which would mean the law itself moved.
+# CURRENTLY UNCALLED - its two cells (the wildcard-free LIKE truncation) were
+# promoted to `both_raise` the night they were recorded, once this server
+# learned to raise it too. Kept for the next engine-only raise.
 eng_raises() { # <label> <sql> [client-charset]
     ran=$((ran + 1))
     local e f
@@ -171,6 +178,30 @@ malformed() { # <label> <sql> - BOTH servers must raise 22000 Malformed string
     if [ "$e" = MALFORMED ] && [ "$f" = MALFORMED ]; then
         echo "OK   $1 [both 22000 Malformed string]"
     else echo "FAIL $1"; echo "     eng=[$e] fc=[$f]"; fail=1; fi; }
+
+# the WHOLE error text on one line - every word and, crucially, both NUMBERS
+errtext() { local ch=""; [ -n "${3:-}" ] && ch="-ch $3"
+    printf 'set heading off;\n%s\n' "$2" \
+        | "$ISQL" -q $ch -user "$U" -pas "$P" "$1" 2>&1 \
+        | tr -d '\r' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -v '^$' | paste -sd'|' -; }
+
+# BOTH servers must raise, AND SAY THE SAME THING. `agree` cannot hold this:
+# sig() collapses every failure to the one word REFUSE, so a cell where we
+# raised 22001 with the WRONG NUMBERS - or a different error entirely - would
+# score a silent OK. That is the trap recorded at the head of `mal` above,
+# and a vector with wrong counts is a wrong answer, not a near miss.
+# Fails three ways: the ENGINE stops raising (the law itself moved), THIS
+# server stops raising (a regression in [like_truncation_raise]), or the two
+# texts differ (same SQLSTATE, different message or counts).
+both_raise() { # <label> <sql> [client-charset]
+    ran=$((ran + 1))
+    local e f
+    e=$(errtext "127.0.0.1/3050:$ENG" "$2" "${3:-}"); f=$(errtext "127.0.0.1/$PORT:$FC" "$2" "${3:-}")
+    case "$e" in *22001*) ;; *) echo "FAIL $1: the ENGINE no longer raises 22001 [$e] - re-measure, the law moved"; fail=1; return;; esac
+    case "$f" in *22001*) ;; *) echo "FAIL $1: THIS server no longer raises [$f] - regression"; fail=1; return;; esac
+    if [ "$e" = "$f" ]; then echo "OK   both raise, same text: $1"
+    else echo "FAIL $1 - both raise but the TEXT differs"; echo "     eng=[$e]"; echo "     fc =[$f]"; fail=1; fi
+}
 
 echo "-- LIKE joins the byte-space law: the pattern reinterprets too --"
 agree "u LIKE '%é%'"          "select count(*) n from t where u like '%é%';"
@@ -328,25 +359,74 @@ agree "none-cast STARTING 'café' @UTF8"   "select count(*) n from t where cast(
 # PREVIOUS slice's column-path lift and never gated - found while
 # measuring this one, and pinned here so it cannot regress unnoticed.
 agree "nn SIMILAR '%café%' @WIN1252"      "select count(*) n from t where nn similar to '%café%';" WIN1252
-# RECORDED, pre-existing, NOT this law: over a REAL (UTF8) column under a
-# TABLED attachment, a wildcard-free `LIKE '<non-ascii>'` makes the ENGINE
-# raise 22001 *string right truncation* while this server answers 0 rows.
-# Measured identical on `9bf97ca`, `34df15d` and this binary, so none of
-# the carrier slices caused it. Its neighbours do NOT raise: `LIKE
-# '%café%'`, `STARTING WITH` and `=` all answer 0 on the engine there, so
-# it is specific to the wildcard-free form. This server has no raise path
-# at all under a real attachment ([carrier_expr_like] and
-# [param_or_typed_term]'s LIKE guard are both gated on a byte-carrier
-# ATTACHMENT), which is why it answers instead.
-# NOTE the deliberate contradiction with the cell far above: `u LIKE
-# 'café'` is an `agree` cell under the DEFAULT (NONE) attachment, where
-# BOTH servers answer 1, and an `eng_raises` cell here under the two
-# TABLED attachments, where the engine raises 22001 and this server
-# answers 0. That is not an inconsistency in the gate - it is the law:
-# the engine's behaviour for one statement genuinely turns on the
-# attachment, which is the whole subject of this section.
-eng_raises "u LIKE 'café' exact @WIN1252"   "select count(*) n from t where u like 'café';" WIN1252
-eng_raises "u LIKE 'café' exact @ISO8859_1" "select count(*) n from t where u like 'café';" ISO8859_1
+echo "-- a WILDCARD-FREE LIKE with a NON-ASCII pattern raises 22001 --"
+# Over a REAL multi-byte column under a TABLED single-byte attachment, the
+# engine raises `22001 string right truncation, expected length 0, actual 1`
+# for a wildcard-free `LIKE '<non-ascii>'`. Recorded here as a gap on
+# 2026-09-18 and IMPLEMENTED the same night ([like_truncation_raise]).
+#
+# The counts are CONSTANT - always 0 and 1 - which is what says the engine is
+# not measuring the data: it is not value-gated at all. It fires on an EMPTY
+# table, on a row whose value is NULL, and behind `1=0 AND`, so it is a
+# statement-level refusal at PREPARE (posted to PREPARE_REFUSAL), not a
+# per-row Term. The column's declared WIDTH does not move it either
+# (VARCHAR(5) and CHAR(8) give the same two numbers as VARCHAR(20)).
+#
+# NOTE the deliberate contradiction with the cell far above: `u LIKE 'café'`
+# is an `agree` cell under the DEFAULT (NONE) attachment, where BOTH servers
+# answer 1, and a `both_raise` cell here under the two TABLED attachments.
+# That is not an inconsistency in the gate - it is the law: the engine's
+# behaviour for ONE statement genuinely turns on the attachment.
+both_raise "u LIKE 'café' exact @WIN1252"   "select count(*) n from t where u like 'café';" WIN1252
+both_raise "u LIKE 'café' exact @ISO8859_1" "select count(*) n from t where u like 'café';" ISO8859_1
+both_raise "u LIKE 'é' one char @WIN1252"   "select count(*) n from t where u like 'é';" WIN1252
+# the EXPRESSION path is a SECOND call site, not the same one: a column
+# reaches [param_or_typed_term] with a Descriptor, an expression reaches
+# [resolve_expr_term] instead. Both had to learn this, and a fix to one
+# leaves the other answering 0.
+both_raise "u||'' LIKE 'café' @WIN1252"     "select count(*) n from t where u||'' like 'café';" WIN1252
+both_raise "upper(u) LIKE 'CAFÉ' @WIN1252"  "select count(*) n from t where upper(u) like 'CAFÉ';" WIN1252
+# not value-gated: a FALSE written first does not suppress it
+both_raise "1=0 AND u LIKE 'café' @WIN1252" "select count(*) n from t where 1=0 and u like 'café';" WIN1252
+#
+# THE BOUNDARIES. One cell per condition in [like_truncation_raise]: delete
+# any single guard from that helper and exactly one of these goes red. They
+# are the point of this block - the raise is NARROW, and a raise that fires
+# one shape too wide is a wrong answer on a statement that used to work.
+agree "u NOT LIKE 'café' @WIN1252"    "select count(*) n from t where u not like 'café';" WIN1252
+agree "u LIKE 'caf!é' ESCAPE @WIN1252" "select count(*) n from t where u like 'caf!é' escape '!';" WIN1252
+agree "u LIKE '%café%' wildcard @WIN1252" "select count(*) n from t where u like '%café%';" WIN1252
+agree "u LIKE 'caf_' underscore @WIN1252" "select count(*) n from t where u like 'caf_';" WIN1252
+agree "u LIKE 'abc' all-ascii @WIN1252" "select count(*) n from t where u like 'abc';" WIN1252
+agree "w LIKE 'café' 1-byte col @WIN1252" "select count(*) n from t where w like 'café';" WIN1252
+agree "nn LIKE 'café' carrier col @WIN1252" "select count(*) n from t where nn like 'café';" WIN1252
+# A BLOB NEVER RAISES, however multi-byte its charset - and this is the
+# cell that caught a REGRESSION. The first version of the raise refused
+# `b LIKE 'café'`, which the engine ANSWERS 0: a wrong answer replacing a
+# right one. Measured after the fact, the engine stays quiet on SIXTEEN
+# blob-typed shapes and raises only for a plain VARCHAR operand, while the
+# broken binary raised on TWELVE of them - so one cell stood for twelve.
+# [blob_result] walks Concat/Iif/Coalesce/Case and every text-answering
+# function, which is why the mixed `u||b` is covered without naming it.
+agree "b LIKE 'café' blob @WIN1252"   "select count(*) n from t where b like 'café';" WIN1252
+agree "upper(b) LIKE 'CAFÉ' @WIN1252" "select count(*) n from t where upper(b) like 'CAFÉ';" WIN1252
+agree "b||'' LIKE 'café' @WIN1252"    "select count(*) n from t where b||'' like 'café';" WIN1252
+agree "u||b LIKE 'café' mixed @WIN1252" "select count(*) n from t where u||b like 'café';" WIN1252
+agree "coalesce(b,'x') LIKE @WIN1252" "select count(*) n from t where coalesce(b,'x') like 'café';" WIN1252
+agree "substring(b) LIKE 'café' @WIN1252" "select count(*) n from t where substring(b from 1 for 4) like 'café';" WIN1252
+# a CAST is NOT a blob_result (its target names the type) and must be
+# unaffected in BOTH directions - measured 0 on both servers either way
+agree "CAST(u AS BLOB) LIKE @WIN1252" "select count(*) n from t where cast(u as blob sub_type text) like 'café';" WIN1252
+agree "CAST(b AS VARCHAR) LIKE @WIN1252" "select count(*) n from t where cast(b as varchar(20)) like 'café';" WIN1252
+agree "u LIKE 'café' @UTF8 (untabled)" "select count(*) n from t where u like 'café';" UTF8
+# the PROJECTION form must keep ANSWERING: it is built by resolve_raw_cond as
+# a Cond2::Like and never reaches the predicate arms that were edited.
+agree "CASE WHEN u LIKE 'café' @WIN1252" "select case when u like 'café' then 1 else 0 end n from t where id=1;" WIN1252
+# and the four quiet neighbours, which must stay quiet
+agree "u STARTING WITH 'café' @WIN1252" "select count(*) n from t where u starting with 'café';" WIN1252
+agree "u = 'café' @WIN1252"           "select count(*) n from t where u='café';" WIN1252
+agree "u CONTAINING 'café' @WIN1252"  "select count(*) n from t where u containing 'café';" WIN1252
+agree "u SIMILAR TO 'café' @WIN1252"  "select count(*) n from t where u similar to 'café';" WIN1252
 
 echo "-- a WRAPPED LITERAL column: RECORDED, pre-existing, NOT this law --"
 echo "--  CONTAINING over a derived/CTE LITERAL column refuses at PLAN --"
@@ -396,8 +476,8 @@ echo "ran $ran checks"
 # derived from the invocations, not guessed: agree + differs + malformed
 # + refuses. A block that stops being read trips this instead of passing
 # quietly over fewer cells.
-if [ "$ran" -lt 113 ]; then
-    echo "FAIL only $ran checks ran (expected at least 113) - did a block silently skip?"
+if [ "$ran" -lt 138 ]; then
+    echo "FAIL only $ran checks ran (expected at least 138) - did a block silently skip?"
     fail=1
 fi
 [ $fail = 0 ] && echo "PASS nonecmp" || echo "FAIL nonecmp"

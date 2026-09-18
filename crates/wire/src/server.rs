@@ -13544,6 +13544,68 @@ fn carrier_like_raises(pattern: &str, escape: Option<char>) -> bool {
     terminated && seg.chars().next_back().is_some_and(|c| c.len_utf8() > 1)
 }
 
+/// The engine's **22001** for a WILDCARD-FREE `LIKE` whose pattern
+/// carries a non-ASCII character, over a MULTI-BYTE column, under a
+/// TABLED single-byte attachment: *string right truncation, expected
+/// length 0, actual 1*.
+///
+/// Every clause here is measured, and several of them refute the obvious
+/// guess:
+///
+///   * the counts are CONSTANT. `'é'`, `'café'`, `'ééééé'` and a
+///     24-character pattern all report `expected 0, actual 1`, and so do
+///     a `VARCHAR(20)`, a `VARCHAR(5)` and a `CHAR(8)` column - so it is
+///     NOT the column's width, despite the message's wording.
+///   * ANY wildcard suppresses it, `_` as well as `%`, in any position
+///     (`'café%'`, `'%café'`, `'café_'`, `'_afé'` all answer 0).
+///   * an ESCAPE suppresses it too (`'caf!é' ESCAPE '!'` answers 0),
+///     which is why this declines whenever one is present: no measured
+///     escape form raises, and asserting an unmeasured rule inside a
+///     RAISE is worse than missing one.
+///   * `NOT LIKE` does not raise - the same positive-only asymmetry
+///     [carrier_like_raises] already records for the 22000.
+///   * the OPERAND must be multi-byte: a WIN1252 column never raises,
+///     even under ISO8859_1, so it is not a mere charset mismatch.
+///   * a TEXT BLOB operand does NOT raise, however multi-byte its
+///     charset: `B LIKE 'café'` answers 0 on the engine under WIN1252
+///     where `U LIKE 'café'` raises. This helper is handed a CHARSET
+///     and a blob's charset looks like any other, so the exclusion sits
+///     at the call site, via [blob_result] - the predicate CONTAINING
+///     already uses. It was found the hard way: the first version of
+///     this guard REFUSED a statement the engine answers, which is a
+///     wrong answer replacing a right one, and it was a gate cell added
+///     on a hunch rather than a probe that caught it.
+///   * the ATTACHMENT must be TABLED. NONE and UTF8 never raise; WIN1252
+///     and ISO8859_1 always do.
+///
+/// And it is NOT value-gated, which is the opposite of the 22000 law:
+/// it fires over an EMPTY table, over a NULL value, and under `1 = 0 AND`
+/// - so it is a statement-level refusal ([PREPARE_REFUSAL]), not a
+/// per-row `Term`. A PROJECTION (`CASE WHEN x LIKE ...`) does NOT raise
+/// at all; that path builds `Cond2::Like` through `resolve_raw_cond` and
+/// never reaches the predicate arms this guard sits in.
+fn like_truncation_raise(
+    pattern: &str,
+    escape: Option<char>,
+    negated: bool,
+    operand_cs: Option<u8>,
+) -> bool {
+    use fire_crab_ods::intl;
+    if negated || escape.is_some() {
+        return false;
+    }
+    if pattern.chars().any(|c| c == '%' || c == '_') {
+        return false;
+    }
+    if !pattern.chars().any(|c| c.len_utf8() > 1) {
+        return false;
+    }
+    if !intl::tabled(CURRENT_ATT_CS.with(|c| c.get())) {
+        return false;
+    }
+    matches!(operand_cs, Some(cs) if !intl::byte_carrier(cs) && intl::bytes_per_char(cs) > 1)
+}
+
 fn lenient_like_prefix(pattern: &str, escape: Option<char>) -> String {
     let mut out = String::new();
     let mut it = pattern.chars();
@@ -91792,6 +91854,27 @@ fn resolve_expr_term(
             );
         }
         RawKind::Like(Rhs::Str(p), escape, negated) => {
+            // THE TABLED-ATTACHMENT 22001 comes first: a wildcard-free
+            // pattern carrying a non-ASCII character, over a MULTI-BYTE
+            // operand, under a TABLED single-byte attachment, is the
+            // engine's *string right truncation* ([like_truncation_raise])
+            // - and it reaches EXPRESSIONS too, measured: `U || '' LIKE
+            // 'café'` and `UPPER(U) LIKE 'CAFÉ'` both raise where this
+            // server answered 0. Not value-gated, so it refuses the
+            // statement rather than becoming a per-row Term.
+            // ...but NOT over a BLOB, which is the one text operand the
+            // engine does not raise for ([blob_result], the same predicate
+            // CONTAINING uses). This guard's absence made `B LIKE 'café'`
+            // REFUSE a statement the engine answers 0 - a wrong answer
+            // where there had been a right one, caught by a gate cell.
+            if blob_result(&lhs, descs).is_none()
+                && like_truncation_raise(p, *escape, *negated, cmp_text_charset(&lhs, descs))
+            {
+                PREPARE_REFUSAL.with(|r| {
+                    *r.borrow_mut() = Some(EvalErr::StringTruncation { expected: 0, actual: 1 })
+                });
+                return None;
+            }
             // LIKE over an OCTETS operand has NO WILDCARDS. The
             // wildcard bytes are `%`/`_` CONVERTED FROM UNICODE into
             // the LEFT side's charset (Collation.cpp:1025 through
@@ -93125,6 +93208,21 @@ fn param_or_typed_term(
                 && carrier_like_raises(p, *escape)
             {
                 return Some(Term::MalformedLike(Box::new(Expr::Col(idx))));
+            }
+            // ...and the MIRROR attachment's own raise, which is a
+            // different vector and a different law: a wildcard-free
+            // pattern with a non-ASCII character over a MULTI-BYTE column
+            // under a TABLED attachment is the engine's 22001
+            // ([like_truncation_raise]). It is NOT value-gated - it fires
+            // over an empty table and under `1 = 0 AND` - so it refuses
+            // the statement rather than becoming a per-row Term, and the
+            // counts are constant (`expected 0, actual 1`), measured
+            // across pattern lengths and column widths alike.
+            if like_truncation_raise(p, *escape, false, Some(col_cs)) {
+                PREPARE_REFUSAL.with(|r| {
+                    *r.borrow_mut() = Some(EvalErr::StringTruncation { expected: 0, actual: 1 })
+                });
+                return None;
             }
         }
     }
