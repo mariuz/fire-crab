@@ -68791,11 +68791,21 @@ fn resolve_dest_param_expr(
             Box::new(resolve_dest_param_expr(b, dest, columns, descs, sink)?),
         ),
         RawExpr::Coalesce(v) => {
-            // the node's OWN descriptor, built from the arguments that
-            // are not parameters - all-parameter is the engine's -804
-            // "Data type unknown", refused here
-            let sib = v.iter().find(|a| !raw_has_param(a))?;
-            let sd = desc_of_projcol(&build_expr_col(sib, "", columns, descs)?);
+            // the node's OWN descriptor, RECONCILED across the arguments
+            // that are not parameters ([coalesce_sibling_desc]) -
+            // all-parameter is the engine's -804 "Data type unknown",
+            // refused there.
+            //
+            // THIS USED TO TAKE THE FIRST NON-PARAMETER SIBLING, and
+            // agreed only when that sibling happened to BE the
+            // reconciled type. Measured on the engine's input SQLDA:
+            // `COALESCE(?, 0, 0.5)` is INT64 scale -1 (stored 1.3, not
+            // 1), `COALESCE(?, 0, D4)` is scale -4, `COALESCE(?, N, BI)`
+            // is INT64 len 8 where the STORED VALUE IS IDENTICAL - a
+            // describe-only divergence no value cell can see - and
+            // `COALESCE(?, 0, F16)` is DECFLOAT(16), where taking the
+            // leading `0` stored 0 against the engine's 1.25.
+            let sd = coalesce_sibling_desc(v, columns, descs)?;
             // COALESCE PUSHES NO TYPE INTO ITS ARGUMENTS, so a parameter
             // under one is still UNKNOWN when the arithmetic above it is
             // made - and a MULTIPLY, a DIVIDE or a UNARY MINUS over an
@@ -68857,6 +68867,98 @@ fn resolve_dest_param_expr(
         // every other shape carrying a `?` keeps its refusal
         _ => return None,
     })
+}
+
+/// The descriptor a COALESCE gives a PARAMETER argument: the RECONCILED
+/// type of its non-parameter arguments. Measured on the engine's own
+/// input SQLDA (`SET SQLDA_DISPLAY ON`), and ORDER-INDEPENDENT - which
+/// is what the "first non-parameter sibling" rule this replaces could
+/// not express. It agreed only when the first sibling happened to BE the
+/// reconciled type, and that coincidence is what hid it.
+///
+///   * a TEXT sibling beside a numeric one wins as VARYING, but its
+///     WIDTH is the text's or the NUMBER'S RENDERED width, whichever is
+///     wider - measured 11 beside an INTEGER, 23 beside a DECFLOAT(16),
+///     24 beside a DOUBLE, 30 beside a VARCHAR(30). Reproducing that
+///     needs the value side to render exactly as the engine does, so
+///     this REFUSES rather than guess - the same boundary the UNION
+///     reconciliation draws, in the same words. It is a refusal
+///     REPLACING A WRONG VALUE (`COALESCE(?, 0, S)` bound 1.25 stored
+///     1 here where the engine stores 1.25).
+///   * else a DECFLOAT sibling DOMINATES - 34 if any sibling is 34,
+///     else 16, scale 0. It beats DOUBLE too (`COALESCE(?, DP, F16)`
+///     describes DECFLOAT(16)). **THIS ARM IS CORRECT AND CURRENTLY
+///     UNREACHABLE IN EFFECT:** the statement still refuses downstream,
+///     because a `CastTarget::DecFloat` cast has no `ExprType`
+///     ([Expr::type_of] declines it deliberately, to fail-close nesting
+///     it "where a type is needed - a conditional branch"), and a
+///     COALESCE branch is exactly that. Measured against the previous
+///     binary WITH A SENTINEL: these shapes refused before this change
+///     too, so they are neither fixed nor broken here. Giving DECFLOAT
+///     an ExprType is its own capability; the arm is written so that
+///     capability needs no second reconciliation rule.
+///   * else an APPROXIMATE sibling wins, DOUBLE over FLOAT.
+///   * else the exact family reconciles THREE FIELDS INDEPENDENTLY:
+///     the WIDEST rank ([exact_numeric_rank]), the MOST NEGATIVE scale,
+///     and the HIGHEST sub_type (0 plain < 1 NUMERIC < 2 DECIMAL).
+///     `COALESCE(?, DE1, NU4)` takes INT64 from the DECIMAL(18,1) and
+///     scale -4 from the NUMERIC(9,4) - TWO DIFFERENT SIBLINGS - and
+///     `COALESCE(?, NU4, DE4)` is subtype 2 whichever comes first.
+///
+/// A NULL literal is NOT a sibling: `COALESCE(?, NULL, 0.5)` describes
+/// the 0.5's INT64 scale -1, and `COALESCE(?, NULL)` is the engine's
+/// -804 "Data type unknown" (this server answered it). `None` refuses,
+/// which is also what a temporal, blob or boolean sibling gets: those
+/// are not a guess this makes.
+fn coalesce_sibling_desc(
+    v: &[RawExpr],
+    columns: &[RelationColumn],
+    descs: &[Descriptor],
+) -> Option<Descriptor> {
+    let sibs: Vec<Descriptor> = v
+        .iter()
+        .filter(|a| !raw_has_param(a) && !matches!(a, RawExpr::Null))
+        .map(|a| build_expr_col(a, "", columns, descs).map(|c| desc_of_projcol(&c)))
+        .collect::<Option<Vec<_>>>()?;
+    let first = sibs.first()?;
+    let flags = first.flags;
+    let is_text = |d: &Descriptor| matches!(d.dtype, dtype::VARYING | dtype::TEXT);
+    let is_decfloat = |d: &Descriptor| matches!(d.dtype, dtype::DEC64 | dtype::DEC128);
+    let is_approx = |d: &Descriptor| matches!(d.dtype, dtype::DOUBLE | dtype::REAL);
+    let mk = |dt: u8, scale: i8, length: u16, sub_type: i16| {
+        Some(Descriptor { dtype: dt, scale, length, sub_type, flags, offset: 0 })
+    };
+    if sibs.iter().any(is_text) {
+        // all-text reconciles to the widest, which needs no rendering;
+        // text BESIDE a number is the boundary described above
+        if !sibs.iter().all(is_text) {
+            return None;
+        }
+        return sibs.iter().max_by_key(|d| d.length).cloned();
+    }
+    if sibs.iter().any(is_decfloat) {
+        let wide = sibs.iter().any(|d| d.dtype == dtype::DEC128);
+        return if wide { mk(dtype::DEC128, 0, 16, 0) } else { mk(dtype::DEC64, 0, 8, 0) };
+    }
+    if sibs.iter().any(is_approx) {
+        let dbl = sibs.iter().any(|d| d.dtype == dtype::DOUBLE);
+        return if dbl { mk(dtype::DOUBLE, 0, 8, 0) } else { mk(dtype::REAL, 0, 4, 0) };
+    }
+    // the exact family: every sibling must be in it, or this is not a
+    // reconciliation we make
+    let mut rank = 0u8;
+    for d in &sibs {
+        rank = rank.max(exact_numeric_rank(wire_for(d).1)?);
+    }
+    let (dt, len) = match rank {
+        0 => (dtype::SHORT, 2u16),
+        1 => (dtype::LONG, 4),
+        2 => (dtype::INT64, 8),
+        _ => (dtype::INT128, 16),
+    };
+    let scale = sibs.iter().map(|d| d.scale).min()?;
+    let sub_type = sibs.iter().map(|d| d.sub_type).max()?;
+    mk(dt, scale, len, sub_type)
 }
 
 fn resolve_proj_expr(
