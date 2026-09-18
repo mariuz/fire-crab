@@ -141,8 +141,10 @@ agree "HAVING u = u || '' (group key vs expression)" \
 # always true while keeping an ARITHMETIC expression on the right.
 agree "HAVING MAX(n) <> MAX(id) - 1" "select count(*) as n from t group by u having max(n) <> max(id) - 1;"
 
-echo "-- 4. out of scope by design --"
-gap "HAVING u SIMILAR TO v (sim_compile per row - own slice)" \
+echo "-- 4. closed by the SIMILAR TO expression-pattern chunk (serve-real-simexpr) --"
+# recorded here as its own slice; that slice landed the same day and
+# this cell was promoted when the fourth-router sweep found it expired
+agree "HAVING u SIMILAR TO v" \
     "select count(*) as n from t group by u, v having u similar to v;"
 
 echo "-- 5. the other worlds must not move (chunks 37, 38, 39) --"

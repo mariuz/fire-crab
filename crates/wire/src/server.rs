@@ -41858,7 +41858,7 @@ fn plan_join_bound(
         let synth_base = comb_descs.len();
         let (key_fids, key_exprs) = match group_s {
             None => (Vec::new(), Vec::new()),
-            Some(g) => parse_group_by(g, &items, &comb_cols, &comb_descs, synth_base)?,
+            Some(g) => parse_group_by(g, &items, &comb_cols, &comb_descs, synth_base, next_param, params)?,
         };
         let (mut cols, mut gitems, slot_descs) =
             build_group_items(&items, &comb_cols, &comb_descs, &side_keys, &key_fids, &key_exprs, synth_base, params)?;
@@ -42138,6 +42138,9 @@ fn plan_join_bound(
     // taken expression sort keys for several increments and this one
     // took names and ordinals only.
     let (ord_cols, ord_descs) = combined_view(&sides);
+    // an ORDER BY expression's `?` numbers last; see the single-table
+    // planner for the RefCell
+    let params_cell = std::cell::RefCell::new(&mut *params);
     let mut order_by = match order_s {
         None => Vec::new(),
         Some(os) => parse_order_by_expr(
@@ -42145,9 +42148,16 @@ fn plan_join_bound(
             &cols,
             &ord_descs,
             |n| resolve_join_col(&sides, n).map(|(idx, _, _)| idx),
-            |text| parse_raw_expr_any(text).and_then(|r| resolve_expr(&r, &ord_cols, &ord_descs)),
+            |text| {
+                let mut r = parse_raw_expr_any(text)?;
+                let mut ps = params_cell.borrow_mut();
+                let mut np = ps.len();
+                renumber_raw_params(&mut r, &mut np);
+                resolve_expr_sink(&r, &ord_cols, &ord_descs, &mut **ps)
+            },
         )?,
     };
+    drop(params_cell);
 
     // NAVIGATE THE DRIVER FOR THE ORDER BY instead of sorting above the join.
     // `... FROM A JOIN B ... ORDER BY A.<pk>` is the engine's `A ORDER
@@ -43529,6 +43539,7 @@ fn plan_over_source(
     if grouped {
         let items = items_for_group?;
         let synth_base = descs.len();
+        let np0 = dgroup_params.max(params.len());
         let (key_fids, key_exprs) = match group_s {
             None => (Vec::new(), Vec::new()),
             // ...with the SOURCE's own qualifier off first, exactly as
@@ -43536,7 +43547,7 @@ fn plan_over_source(
             // over `FROM (SELECT A FROM T) X` is ordinary SQL, and
             // parse_group_by now REFUSES a qualifier that survived the
             // strip (it is the engine's -206 over a real relation)
-            Some(g) => parse_group_by(&unq(g), &items, &columns, &descs, synth_base)?,
+            Some(g) => parse_group_by(&unq(g), &items, &columns, &descs, synth_base, np0, params)?,
         };
         let (mut gcols, mut gitems, slot_descs) =
             build_group_items(&items, &columns, &descs, &[], &key_fids, &key_exprs, synth_base, params)?;
@@ -43575,7 +43586,8 @@ fn plan_over_source(
         // base now gets right.
         // ...and the WHERE/HAVING number after BOTH: the projection's
         // reserved slots and whatever the FROM itself claimed
-        let mut np = dgroup_params.max(params.len());
+        let mut np = np0.max(params.len());
+        let np_before_where = np;
         let filter = match where_s {
             None => None,
             Some(ws) => Some(resolve_predicate(
@@ -43585,6 +43597,13 @@ fn plan_over_source(
                 params,
             )?),
         };
+        // THIS PATH PARSES THE WHERE AFTER THE GROUP BY, so a `?` in both
+        // would number out of the engine's text order (WHERE first) and
+        // each would bind the other's value - a refusal, never a swapped
+        // answer
+        if np > np_before_where && key_exprs.iter().any(|(r, _)| raw_has_param(r)) {
+            return None;
+        }
         let having = match having_s {
             None => None,
             Some(hs) => Some(
@@ -43772,6 +43791,9 @@ fn plan_over_source(
             params,
         )?),
     };
+    // an ORDER BY expression's `?` numbers last; see the single-table
+    // planner for the RefCell
+    let params_cell = std::cell::RefCell::new(&mut *params);
     let order_by = match order_s {
         None => Vec::new(),
         Some(os) => parse_order_by_expr(
@@ -43784,9 +43806,16 @@ fn plan_over_source(
                     .find(|c| col_name_is(&c.name, n))
                     .map(|c| c.field_id as usize)
             },
-            |text| parse_raw_expr_any(text).and_then(|r| resolve_expr(&r, &columns, &descs)),
+            |text| {
+                let mut r = parse_raw_expr_any(text)?;
+                let mut ps = params_cell.borrow_mut();
+                let mut np = ps.len();
+                renumber_raw_params(&mut r, &mut np);
+                resolve_expr_sink(&r, &columns, &descs, &mut **ps)
+            },
         )?,
     };
+    drop(params_cell);
     Some(Plan::Derived {
         inner: Box::new(src.into_plan(cols)),
         cols: out_cols,
@@ -52095,6 +52124,11 @@ fn plan_query_inner_at(
         if cols.is_empty() {
             return None;
         }
+        // an ORDER BY expression may carry a typed or sibling-typed `?`
+        // (`ORDER BY COALESCE(?, ID)`); its slot numbers LAST in the
+        // statement. RefCell because the resolver runs under
+        // parse_order_by_expr's shared borrow of the closure.
+        let params_cell = std::cell::RefCell::new(&mut *params);
         let order_by = match order_s {
             None => Vec::new(),
             Some(os) => {
@@ -52109,7 +52143,13 @@ fn plan_query_inner_at(
                             .map(|c| c.field_id as usize)
                             .filter(|fid| !is_computed_fid(&descs, *fid))
                     },
-                    |text| parse_raw_expr_any(text).and_then(|r| resolve_expr(&r, &columns, &descs)),
+                    |text| {
+                        let mut r = parse_raw_expr_any(text)?;
+                        let mut ps = params_cell.borrow_mut();
+                        let mut np = ps.len();
+                        renumber_raw_params(&mut r, &mut np);
+                        resolve_expr_sink(&r, &columns, &descs, &mut **ps)
+                    },
                 ) {
                     Some(keys) => keys,
                     None => {
@@ -52119,6 +52159,7 @@ fn plan_query_inner_at(
                 }
             }
         };
+        drop(params_cell);
         // ORDER BY aimed at a GENERATOR column must refuse, however it
         // is spelled. The spelled form (`ORDER BY NEXT VALUE FOR S`)
         // refuses at resolution, but an ORDINAL or ALIAS reference
@@ -52163,7 +52204,7 @@ fn plan_query_inner_at(
     // (including a lone parameterised aggregate, deferred to fetch)
     match plan_group(
         &items, group_s, having_s, order_s, rel, formats, &columns, &descs, filter, table,
-        left.alias.as_deref(), params,
+        left.alias.as_deref(), params, next_param,
     ) {
         Some(Plan::Group {
             rel,
@@ -52749,6 +52790,9 @@ fn resolve_agg_src(
     target: &AggTarget,
     columns: &[RelationColumn],
     descs: &[Descriptor],
+    // the statement's `?` sink: a typed or sibling-typed parameter in
+    // the argument registers its slot here ([resolve_expr_sink])
+    sink: &mut Vec<Option<Descriptor>>,
 ) -> Option<(AggSrc, bool)> {
     let out = match target {
         AggTarget::Star => (AggSrc::Star, false), // COUNT(*) - parse guarantees Count
@@ -52770,22 +52814,22 @@ fn resolve_agg_src(
             }
         }
         AggTarget::DistinctExpr(raw) => {
-            (agg_expr_src(resolve_expr(raw, columns, descs)?)?, true)
+            (agg_expr_src(resolve_expr_sink(raw, columns, descs, sink)?)?, true)
         }
         AggTarget::Expr(raw) => {
-            (agg_expr_src(resolve_expr(raw, columns, descs)?)?, false)
+            (agg_expr_src(resolve_expr_sink(raw, columns, descs, sink)?)?, false)
         }
         AggTarget::Pair(y, x) => (
             AggSrc::Pair(
-                resolve_expr(y, columns, descs)?,
-                resolve_expr(x, columns, descs)?,
+                resolve_expr_sink(y, columns, descs, sink)?,
+                resolve_expr_sink(x, columns, descs, sink)?,
             ),
             false,
         ),
         AggTarget::Percentile { frac, order, desc } => (
             AggSrc::Percentile {
-                frac: resolve_expr(frac, columns, descs)?,
-                order: resolve_expr(order, columns, descs)?,
+                frac: resolve_expr_sink(frac, columns, descs, sink)?,
+                order: resolve_expr_sink(order, columns, descs, sink)?,
                 desc: *desc,
             },
             false,
@@ -52823,7 +52867,7 @@ fn resolve_agg_src(
                         resolve_expr(arg, columns, descs)?
                     }
                 }
-                _ => resolve_expr(arg, columns, descs)?,
+                _ => resolve_expr_sink(arg, columns, descs, sink)?,
             };
             // the engine's DISTINCT dedupes by the argument's
             // COLLATION key; fc's value_cmp is binary - a
@@ -52842,7 +52886,7 @@ fn resolve_agg_src(
                 return None;
             }
             let s = match sep {
-                Some(r) => Some(resolve_expr(r, columns, descs)?),
+                Some(r) => Some(resolve_expr_sink(r, columns, descs, sink)?),
                 None => None,
             };
             // a CHAR column's value travels padded to its
@@ -52971,7 +53015,7 @@ fn agg_result_desc(
         descs.get(rc.field_id as usize).cloned()
     };
     let numericish_expr = |raw: &RawExpr| -> Option<bool> {
-        let e = resolve_expr(raw, columns, descs)?;
+        let e = resolve_expr_sink(raw, columns, descs, &mut Vec::new())?;
         Some(matches!(
             e.type_of(descs)?,
             ExprType::Int | ExprType::Numeric | ExprType::Approx
@@ -53038,7 +53082,7 @@ fn agg_result_desc(
             AggTarget::Expr(r) | AggTarget::DistinctExpr(r) => r,
             _ => return None,
         };
-        let e = resolve_expr(raw, columns, descs)?;
+        let e = resolve_expr_sink(raw, columns, descs, &mut Vec::new())?;
         df_expr_agg_wide(&func, &e, descs)
     };
     if let Some(wide) = df_expr_wide(target) {
@@ -53079,7 +53123,7 @@ fn agg_result_desc(
             AggTarget::Col(n) => synth(&col_desc(n)?),
             // an expression source folds at the expression's own shape
             AggTarget::Expr(raw) => {
-                let e = resolve_expr(raw, columns, descs)?;
+                let e = resolve_expr_sink(raw, columns, descs, &mut Vec::new())?;
                 match e.type_of(descs)? {
                     ExprType::Int => int64(0),
                     ExprType::Numeric => {
@@ -53131,7 +53175,7 @@ fn agg_result_desc(
                     }
                 }
                 AggTarget::Expr(raw) => {
-                    let e = resolve_expr(raw, columns, descs)?;
+                    let e = resolve_expr_sink(raw, columns, descs, &mut Vec::new())?;
                     match e.type_of(descs)? {
                         ExprType::Approx => (NumRank::Long, 0, 0, true),
                         ExprType::Int => {
@@ -53530,7 +53574,7 @@ fn build_group_items(
                 let aggs = collect_aggs(raw);
                 let (f, t) = aggs.first()?.clone();
                 let d = agg_result_desc(f, &t, columns, descs)?;
-                let (src, distinct) = resolve_agg_src(&t, columns, descs)?;
+                let (src, distinct) = resolve_agg_src(&t, columns, descs, sink)?;
                 if distinct && !matches!(f, AggFn::Count) {
                     return None; // only COUNT(DISTINCT) is answered
                 }
@@ -53559,8 +53603,11 @@ fn build_group_items(
                 if let Some(pos) = key_exprs.iter().position(|(r, _)| *r == n) {
                     // the describe comes from the expression's own typing;
                     // the VALUE comes from the group's computed key slot,
-                    // so the output column reads plainly (expr: None)
-                    let pc = build_expr_col(raw, name, columns, descs)?;
+                    // so the output column reads plainly (expr: None).
+                    // The key's own `?` (`SELECT COALESCE(?, N), COUNT(*)
+                    // .. GROUP BY 1`) types through the sink-aware router.
+                    let re = resolve_expr_sink(raw, columns, descs, sink)?;
+                    let pc = build_expr_col_from(re, name, descs)?;
                     cols.push(ProjCol {
                         name: pc.name,
                         fname: Some(fname.clone()),
@@ -53714,7 +53761,7 @@ fn build_group_items(
                 slot_descs.push(descs.get(fid).cloned());
             }
             SelItem::Agg(func, target, agg_alias) => {
-                let (src, distinct) = resolve_agg_src(target, columns, descs)?;
+                let (src, distinct) = resolve_agg_src(target, columns, descs, sink)?;
 
                 if distinct && !matches!(func, AggFn::Count) {
                     return None; // only COUNT(DISTINCT) is answered
@@ -54114,7 +54161,7 @@ fn build_group_items(
                     *out_idx
                 } else {
                     let d = agg_result_desc(*f, t, columns, descs)?;
-                    let (src, distinct) = resolve_agg_src(t, columns, descs)?;
+                    let (src, distinct) = resolve_agg_src(t, columns, descs, sink)?;
                     if distinct && !matches!(f, AggFn::Count) {
                         return None;
                     }
@@ -54132,7 +54179,11 @@ fn build_group_items(
                     .find(|(nf, nt, _)| nf == f && nt == t)
                     .map(|(_, _, n)| n.clone())
             })?;
-            let pc = build_expr_col(&subbed, name, &synth_cols, &synth_descs)?;
+            // the expression over the group row may itself carry a `?`
+            // (`SUM(ID) + CAST(? AS INTEGER)`): resolved ONCE through the
+            // sink-aware router and described from that resolution
+            let re = resolve_expr_sink(&subbed, &synth_cols, &synth_descs, sink)?;
+            let pc = build_expr_col_from(re.clone(), name, &synth_descs)?;
             let col = cols.get_mut(*out_idx)?;
             col.name = pc.name;
             col.wire = pc.wire;
@@ -54155,7 +54206,7 @@ fn build_group_items(
             col.scale = pc.scale;
             col.sub_type = pc.sub_type;
             // the VALUE is computed from the group row by this expression
-            col.expr = Some(resolve_expr(&subbed, &synth_cols, &synth_descs)?);
+            col.expr = Some(re);
         }
     }
     Some((cols, gitems, slot_descs))
@@ -54188,6 +54239,9 @@ fn plan_group(
     // select list fills a slot here (the projection is renumbered before
     // the WHERE, which the caller already numbers past it)
     params: &mut Vec<Option<Descriptor>>,
+    // how many `?` the caller numbered (projection + WHERE): the GROUP
+    // BY's first slot ([parse_group_by])
+    first_slot: usize,
 ) -> Option<Plan> {
     // grouping decodes records, which needs the relation's formats: a
     // relation without any (a system relation) cannot be answered here -
@@ -54205,7 +54259,7 @@ fn plan_group(
         .max(descs.len());
     let (key_fids, key_exprs) = match group_s {
         None => (Vec::new(), Vec::new()),
-        Some(g) => parse_group_by(g, items, columns, descs, synth_base)?,
+        Some(g) => parse_group_by(g, items, columns, descs, synth_base, first_slot, params)?,
     };
     let (mut cols, mut gitems, mut slot_descs) =
         build_group_items(items, columns, descs, &[], &key_fids, &key_exprs, synth_base, params)?;
@@ -54265,6 +54319,10 @@ fn plan_group(
     // the resolver closure runs under parse_order_by's shared borrow.
     let gitems_cell = std::cell::RefCell::new(&mut gitems);
     let slot_descs_cell = std::cell::RefCell::new(&mut slot_descs);
+    // the `?` sink too: an aggregate's argument in the ORDER BY may
+    // carry a typed parameter (`ORDER BY SUM(ID * CAST(? AS INTEGER))`),
+    // and its slot numbers LAST - after the HAVING's, resolved above
+    let params_cell = std::cell::RefCell::new(&mut *params);
     let order_by = match order_s {
         None => Vec::new(),
         Some(os) => parse_order_by_expr(
@@ -54339,17 +54397,20 @@ fn plan_group(
                 Some(gitems.len() - 1)
             },
             |text| {
-                let raw = parse_raw_expr_any(text)?;
+                let mut raw = parse_raw_expr_any(text)?;
                 if !raw_has_agg(&raw) {
                     return None; // non-aggregate order expressions keep refusing here
                 }
                 let mut gitems = gitems_cell.borrow_mut();
                 let mut slot_descs = slot_descs_cell.borrow_mut();
+                let mut ps = params_cell.borrow_mut();
+                let mut np = ps.len();
+                renumber_raw_params(&mut raw, &mut np);
                 let aggs = collect_aggs(&raw);
                 let mut names: Vec<(AggFn, AggTarget, String)> = Vec::new();
                 for (f, t) in &aggs {
                     let d = agg_result_desc(*f, t, columns, descs)?;
-                    let (src, distinct) = resolve_agg_src(t, columns, descs)?;
+                    let (src, distinct) = resolve_agg_src(t, columns, descs, &mut **ps)?;
                     if distinct && !matches!(f, AggFn::Count) {
                         return None;
                     }
@@ -54365,12 +54426,13 @@ fn plan_group(
                 })?;
                 let (synth_cols, synth_descs) =
                     synth_group_view(&gitems, &slot_descs, columns, synth_base);
-                resolve_expr(&subbed, &synth_cols, &synth_descs)
+                resolve_expr_sink(&subbed, &synth_cols, &synth_descs, &mut **ps)
             },
         )?,
     };
     drop(gitems_cell);
     drop(slot_descs_cell);
+    drop(params_cell);
     let mut order_by = order_by;
     stamp_group_order_coll(&mut order_by, &slot_descs);
     // AN ICU COLLATION DECIDES WHICH ROWS ARE ONE GROUP - `UNICODE_CI`
@@ -54469,7 +54531,25 @@ fn parse_group_by(
     columns: &[RelationColumn],
     descs: &[Descriptor],
     synth_base: usize,
+    // THE FIRST SLOT THIS CLAUSE MAY NUMBER: how many `?` the caller has
+    // numbered so far (the projection's and the WHERE's). Not the sink's
+    // length - the projection's slots are numbered before the keys parse
+    // but REGISTERED after ([build_group_items] runs on the keys), so the
+    // sink is short by exactly the projection's count here, and numbering
+    // from it gave `SELECT CAST(? AS INTEGER), COUNT(*) FROM T GROUP BY
+    // CAST(? AS INTEGER)` the SAME slot twice: the key then matched the
+    // item structurally, the second slot was never claimed, and the
+    // statement refused
+    first_slot: usize,
+    // the statement's `?` sink: an expression key with a typed or
+    // sibling-typed parameter (`GROUP BY CAST(? AS INTEGER)`, `GROUP BY
+    // COALESCE(?, N)`) registers its slot here; a bare `?` still refuses
+    // (the engine's -804)
+    sink: &mut Vec<Option<Descriptor>>,
 ) -> Option<(Vec<usize>, Vec<(RawExpr, Expr)>)> {
+    // a GROUP BY `?` numbers after the WHERE's and before the HAVING's
+    // (measured: textual order), key after key
+    let mut np = first_slot.max(sink.len());
     let mut fids = Vec::new();
     let mut key_exprs: Vec<(RawExpr, Expr)> = Vec::new();
     // an EXPRESSION key gets a SYNTHETIC value slot past every real
@@ -54477,15 +54557,18 @@ fn parse_group_by(
     // into that slot, and bucketing/output read it like a field
     let mut push_expr = |raw: RawExpr,
                          key_exprs: &mut Vec<(RawExpr, Expr)>,
-                         fids: &mut Vec<usize>|
+                         fids: &mut Vec<usize>,
+                         sink: &mut Vec<Option<Descriptor>>|
      -> Option<()> {
         let raw = normalize_raw(&raw);
-        // the same expression named twice groups once
+        // the same expression named twice groups once (two `?` are two
+        // slots and never the same tree, so they group twice - as the
+        // engine's two input parameters do)
         if let Some(pos) = key_exprs.iter().position(|(r, _)| *r == raw) {
             fids.push(synth_base + pos);
             return Some(());
         }
-        let e = resolve_expr(&raw, columns, descs)?;
+        let e = resolve_expr_sink(&raw, columns, descs, sink)?;
         // bucketing compares evaluated values, so the expression must
         // TYPE; a could-raise shape aborts the fetch like an aggregate
         // argument does (group_output is fallible)
@@ -54519,7 +54602,7 @@ fn parse_group_by(
                 // GROUP BY <ordinal> may name an EXPRESSION select item
                 // (probed: GROUP BY 1 over SELECT UPPER(S), COUNT(*))
                 SelItem::Expr(raw, ..) => {
-                    push_expr(raw.clone(), &mut key_exprs, &mut fids)?;
+                    push_expr(raw.clone(), &mut key_exprs, &mut fids, sink)?;
                     continue;
                 }
                 _ => return None,
@@ -54583,7 +54666,7 @@ fn parse_group_by(
                                 }
                                 _ => None,
                             })?;
-                            push_expr(raw, &mut key_exprs, &mut fids)?;
+                            push_expr(raw, &mut key_exprs, &mut fids, sink)?;
                             continue;
                         }
                     }
@@ -54594,8 +54677,11 @@ fn parse_group_by(
             // GROUP BY EXTRACT(YEAR FROM D). Matched to select items
             // STRUCTURALLY (the parsed trees compare, so spacing and
             // case differences do not matter).
-            let raw = parse_raw_expr_any(part.trim())?;
-            push_expr(raw, &mut key_exprs, &mut fids)?;
+            let mut raw = parse_raw_expr_any(part.trim())?;
+            // the select-list and alias forms above carry slots the
+            // projection numbered already and are not renumbered
+            renumber_raw_params(&mut raw, &mut np);
+            push_expr(raw, &mut key_exprs, &mut fids, sink)?;
             continue;
         };
         let rc = columns
@@ -54607,7 +54693,7 @@ fn parse_group_by(
         // the same normalized RawExpr::Col. resolve_expr (inside
         // push_expr) expands the computed column via COMPUTED_EXPR.
         if is_computed_fid(descs, rc.field_id as usize) {
-            push_expr(RawExpr::Col(rc.name.clone()), &mut key_exprs, &mut fids)?;
+            push_expr(RawExpr::Col(rc.name.clone()), &mut key_exprs, &mut fids, sink)?;
             continue;
         }
         fids.push(rc.field_id as usize);
@@ -61565,15 +61651,70 @@ fn plan_has_proj_param(plan: &Plan) -> bool {
         }
         _ => {}
     }
-    let cols = match plan {
-        Plan::Project { cols, .. }
-        | Plan::Join { cols, .. }
-        | Plan::Derived { cols, .. }
-        | Plan::Group { cols, .. }
-        | Plan::JoinGroup { cols, .. } => cols,
+    // the projection, and since the fourth-router chunk the ORDER BY
+    // keys, the aggregate sources and the group keys as well - every
+    // expression a plan evaluates that a `?` can now be typed into
+    let (cols, order_by) = match plan {
+        Plan::Project { cols, order_by, .. }
+        | Plan::Join { cols, order_by, .. }
+        | Plan::Derived { cols, order_by, .. }
+        | Plan::Group { cols, order_by, .. }
+        | Plan::JoinGroup { cols, order_by, .. } => (cols, order_by),
         _ => return false,
     };
-    cols.iter().any(|c| c.expr.as_ref().is_some_and(expr_has_param))
+    if cols.iter().any(|c| c.expr.as_ref().is_some_and(expr_has_param))
+        || order_by.iter().any(|k| k.expr.as_ref().is_some_and(expr_has_param))
+    {
+        return true;
+    }
+    match plan {
+        Plan::Group { gitems, key_exprs, .. } | Plan::JoinGroup { gitems, key_exprs, .. } => {
+            gitems.iter().any(gitem_has_param) || key_exprs.iter().any(expr_has_param)
+        }
+        _ => false,
+    }
+}
+
+/// Does an aggregate's fold read a `?` - `SUM(CAST(? AS INTEGER))`?
+fn gitem_has_param(g: &GItem) -> bool {
+    matches!(g, GItem::Agg(_, src, _) if aggsrc_has_param(src))
+}
+
+fn aggsrc_has_param(s: &AggSrc) -> bool {
+    match s {
+        AggSrc::Expr(e) => expr_has_param(e),
+        AggSrc::Pair(a, b) => expr_has_param(a) || expr_has_param(b),
+        AggSrc::Percentile { frac, order, .. } => expr_has_param(frac) || expr_has_param(order),
+        AggSrc::List { arg, sep, .. } => {
+            expr_has_param(arg) || sep.as_ref().is_some_and(expr_has_param)
+        }
+        AggSrc::Star | AggSrc::Field(_) | AggSrc::CollField(..) => false,
+    }
+}
+
+/// [subst_params_expr] over an aggregate's source(s).
+fn subst_params_aggsrc(s: &AggSrc, args: &[WireParam]) -> Option<AggSrc> {
+    Some(match s {
+        AggSrc::Expr(e) => AggSrc::Expr(subst_params_expr(e, args)?),
+        AggSrc::Pair(a, b) => {
+            AggSrc::Pair(subst_params_expr(a, args)?, subst_params_expr(b, args)?)
+        }
+        AggSrc::Percentile { frac, order, desc } => AggSrc::Percentile {
+            frac: subst_params_expr(frac, args)?,
+            order: subst_params_expr(order, args)?,
+            desc: *desc,
+        },
+        AggSrc::List { arg, sep, distinct, pad } => AggSrc::List {
+            arg: subst_params_expr(arg, args)?,
+            sep: match sep {
+                Some(x) => Some(subst_params_expr(x, args)?),
+                None => None,
+            },
+            distinct: *distinct,
+            pad: *pad,
+        },
+        other => other.clone(),
+    })
 }
 
 /// A copy of the plan with its projection `?` parameters bound to the
@@ -61597,16 +61738,42 @@ fn bind_plan_params(plan: &Plan, args: &[WireParam]) -> Option<Plan> {
         }
         _ => {}
     }
-    if let Plan::Project { cols, .. }
-    | Plan::Join { cols, .. }
-    | Plan::Derived { cols, .. }
-    | Plan::Group { cols, .. }
-    | Plan::JoinGroup { cols, .. } = &mut p
+    if let Plan::Project { cols, order_by, .. }
+    | Plan::Join { cols, order_by, .. }
+    | Plan::Derived { cols, order_by, .. }
+    | Plan::Group { cols, order_by, .. }
+    | Plan::JoinGroup { cols, order_by, .. } = &mut p
     {
         for c in cols.iter_mut() {
             if c.expr.as_ref().is_some_and(expr_has_param) {
                 let e = c.expr.as_ref()?;
                 c.expr = Some(subst_params_expr(e, args)?);
+            }
+        }
+        // an ORDER BY expression key binds the same way - the sort then
+        // evaluates a param-free key per row
+        for k in order_by.iter_mut() {
+            if k.expr.as_ref().is_some_and(expr_has_param) {
+                let e = k.expr.as_ref()?;
+                k.expr = Some(subst_params_expr(e, args)?);
+            }
+        }
+    }
+    // an aggregate's source and an expression group key evaluate per
+    // input row inside the fold; bound here, once, like the projection
+    if let Plan::Group { gitems, key_exprs, .. } | Plan::JoinGroup { gitems, key_exprs, .. } =
+        &mut p
+    {
+        for g in gitems.iter_mut() {
+            if let GItem::Agg(_, src, _) = g {
+                if aggsrc_has_param(src) {
+                    *src = subst_params_aggsrc(src, args)?;
+                }
+            }
+        }
+        for e in key_exprs.iter_mut() {
+            if expr_has_param(e) {
+                *e = subst_params_expr(e, args)?;
             }
         }
     }
@@ -66011,7 +66178,34 @@ fn renumber_raw_params(e: &mut RawExpr, next: &mut usize) {
             }
         }
         RawExpr::Cond(c) => renumber_cond_params(c, next),
+        // an AGGREGATE's argument numbers in place: `SUM(CAST(? AS
+        // INTEGER))` between its select-list neighbours (measured:
+        // `CAST(? AS SMALLINT), SUM(CAST(? AS INTEGER)), CAST(? AS
+        // BIGINT)` describes SHORT, LONG, INT64 in that order)
+        RawExpr::Agg(_, t) => renumber_agg_target_params(t, next),
         _ => {}
+    }
+}
+
+/// [renumber_raw_params] over an aggregate's argument(s), in source order.
+fn renumber_agg_target_params(t: &mut AggTarget, next: &mut usize) {
+    match t {
+        AggTarget::Expr(e) | AggTarget::DistinctExpr(e) => renumber_raw_params(e, next),
+        AggTarget::Pair(y, x) => {
+            renumber_raw_params(y, next);
+            renumber_raw_params(x, next);
+        }
+        AggTarget::Percentile { frac, order, .. } => {
+            renumber_raw_params(frac, next);
+            renumber_raw_params(order, next);
+        }
+        AggTarget::List { arg, sep, .. } => {
+            renumber_raw_params(arg, next);
+            if let Some(s) = sep {
+                renumber_raw_params(s, next);
+            }
+        }
+        AggTarget::Star | AggTarget::Col(_) | AggTarget::Distinct(_) => {}
     }
 }
 
@@ -66035,8 +66229,12 @@ fn renumber_proj_params_from(proj: &mut Proj, base: usize) -> usize {
     let mut n = base;
     if let Proj::Items(items) = proj {
         for it in items.iter_mut() {
-            if let SelItem::Expr(raw, ..) = it {
-                renumber_raw_params(raw, &mut n);
+            match it {
+                SelItem::Expr(raw, ..) => renumber_raw_params(raw, &mut n),
+                // a bare aggregate item's argument is a select-list
+                // position like any other
+                SelItem::Agg(_, t, _) => renumber_agg_target_params(t, &mut n),
+                _ => {}
             }
         }
     }
@@ -68976,6 +69174,34 @@ fn coalesce_sibling_desc(
     let scale = sibs.iter().map(|d| d.scale).min()?;
     let sub_type = sibs.iter().map(|d| d.sub_type).max()?;
     mk(dt, scale, len, sub_type)
+}
+
+/// [resolve_expr] for a shape that MAY carry a `?`. A shape with one
+/// goes through the projection router, which types the parameter and
+/// registers its slot in `sink`; a shape without goes the ordinary way.
+///
+/// This is what an AGGREGATE ARGUMENT, a GROUP BY KEY, an ORDER BY
+/// EXPRESSION and a HAVING side resolve through. Each of those four
+/// routers called [resolve_expr] directly, which refuses every `?` - so
+/// `SUM(CAST(? AS INTEGER))`, `GROUP BY CAST(? AS INTEGER)`, `ORDER BY
+/// COALESCE(?, ID)` and `HAVING COALESCE(?, 0) > 0` all refused while
+/// the engine answers every one. The typing law is the projection's
+/// (a CAST target, or the reconciled siblings of a conditional); what
+/// each router lacked was a sink to register the slot into, and the
+/// numbering of its `?` in the statement's textual order (measured:
+/// select list - an aggregate's argument included - then WHERE, GROUP
+/// BY, HAVING, ORDER BY).
+fn resolve_expr_sink(
+    raw: &RawExpr,
+    columns: &[RelationColumn],
+    descs: &[Descriptor],
+    sink: &mut Vec<Option<Descriptor>>,
+) -> Option<Expr> {
+    if raw_has_param(raw) {
+        resolve_proj_expr(raw, columns, descs, sink)
+    } else {
+        resolve_expr(raw, columns, descs)
+    }
 }
 
 fn resolve_proj_expr(
@@ -83911,7 +84137,12 @@ fn texpr_atom_bare(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<RawExpr
         // engine-served, measured): the leaf the group planner later
         // rewrites to its slot. A WHERE carrying one still refuses at
         // resolution, exactly as the bare aggregate does.
-        Tok::Agg(f, target) => RawExpr::Agg(*f, Box::new(target.clone())),
+        Tok::Agg(f, target) => {
+            // the argument's `?` numbers in place, as the lone form's does
+            let mut target = target.clone();
+            renumber_agg_target_params(&mut target, np);
+            RawExpr::Agg(*f, Box::new(target))
+        }
         Tok::LParen => {
             *pos += 1;
             let inner = texpr(t, pos, np)?;
@@ -84325,7 +84556,12 @@ fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
                 Some(Tok::Plus | Tok::Minus | Tok::Star | Tok::Slash | Tok::Concat)
             ) =>
         {
-            let l = RawLhs::Agg(*f, target.clone());
+            // the argument's own `?` numbers here, in text order -
+            // `HAVING SUM(CAST(? AS INTEGER)) > 3` (measured: the HAVING's
+            // slots follow the GROUP BY's)
+            let mut target = target.clone();
+            renumber_agg_target_params(&mut target, np);
+            let l = RawLhs::Agg(*f, target);
             *pos += 1;
             l
         }
@@ -95103,7 +95339,10 @@ fn resolve_having(
             // term against the WRONG slot.
             if let RawLhs::Expr(raw_e) = &rt.lhs {
                 let rhs_e = kind_rhs_expr(&rt.kind);
-                if raw_has_agg(raw_e) || rhs_e.is_some() {
+                // ... or a `?` in it: `HAVING COALESCE(?, 0) > 0` has no
+                // aggregate and a literal right side, and the ExprCond
+                // path below is the one that types a parameter
+                if raw_has_agg(raw_e) || rhs_e.is_some() || raw_has_param(raw_e) {
                     let mut aggs = collect_aggs(raw_e);
                     if let Some(r) = rhs_e {
                         for a in collect_aggs(r) {
@@ -95115,7 +95354,7 @@ fn resolve_having(
                     let mut names: Vec<(AggFn, AggTarget, String)> = Vec::new();
                     for (f, t) in &aggs {
                         let d = agg_result_desc(*f, t, columns, descs)?;
-                        let (src, distinct) = resolve_agg_src(t, columns, descs)?;
+                        let (src, distinct) = resolve_agg_src(t, columns, descs, params)?;
                         if distinct && !matches!(f, AggFn::Count) {
                             return None;
                         }
@@ -95237,7 +95476,7 @@ fn resolve_having(
                         // engine refuses at prepare)
                         AggTarget::Pair(..) | AggTarget::Percentile { .. } => {
                             let d = agg_result_desc(*func, target, columns, descs)?;
-                            let (src, _) = resolve_agg_src(target, columns, descs)?;
+                            let (src, _) = resolve_agg_src(target, columns, descs, params)?;
                             let hk = match family_kind {
                                 Some(k) => k,
                                 // PERCENTILE_DISC keeps the order VALUE's
@@ -95301,7 +95540,7 @@ fn resolve_having(
                         // an EXPRESSION aggregate: resolve it, type it,
                         // and fold it as a HIDDEN output item
                         AggTarget::Expr(raw) => {
-                            let e = resolve_expr(raw, columns, descs)?;
+                            let e = resolve_expr_sink(raw, columns, descs, params)?;
                             let hk = if matches!(func, AggFn::Count) {
                                 HKind::Int
                             } else {
@@ -95324,7 +95563,7 @@ fn resolve_having(
                             if !matches!(func, AggFn::Count) {
                                 return None;
                             }
-                            let e = resolve_expr(raw, columns, descs)?;
+                            let e = resolve_expr_sink(raw, columns, descs, params)?;
                             (None, Some(e), None, HKind::Int, true)
                         }
                     };
@@ -107213,7 +107452,7 @@ mod tests {
         ];
         let d = |offset| Descriptor { dtype: dtype::LONG, scale: 0, length: 4, sub_type: 0, flags: 0, offset };
         let descs = vec![d(4), d(8), d(12)];
-        let keys = |g: &str| parse_group_by(g, &items, &columns, &descs, 100).map(|(k, _)| k);
+        let keys = |g: &str| parse_group_by(g, &items, &columns, &descs, 100, 0, &mut Vec::new()).map(|(k, _)| k);
         assert_eq!(keys("DEPT_ID"), Some(vec![2]));
         assert_eq!(keys("1"), Some(vec![2])); // ordinal = the Col item
         assert!(keys("2").is_none()); // ordinal names an aggregate
@@ -107222,11 +107461,11 @@ mod tests {
         // an expression key takes a SYNTHETIC slot past the real fields,
         // argument commas stay inside their parens, and naming the same
         // tree twice groups once
-        let (k, ke) = parse_group_by("MOD(ID, 2)", &items, &columns, &descs, 100).unwrap();
+        let (k, ke) = parse_group_by("MOD(ID, 2)", &items, &columns, &descs, 100, 0, &mut Vec::new()).unwrap();
         assert_eq!(k, vec![100]);
         assert_eq!(ke.len(), 1);
         let (k, ke) =
-            parse_group_by("MOD(ID, 2), DEPT_ID, mod( id , 2 )", &items, &columns, &descs, 100)
+            parse_group_by("MOD(ID, 2), DEPT_ID, mod( id , 2 )", &items, &columns, &descs, 100, 0, &mut Vec::new())
                 .unwrap();
         assert_eq!(k, vec![100, 2, 100]);
         assert_eq!(ke.len(), 1);

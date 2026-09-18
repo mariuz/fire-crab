@@ -169,23 +169,19 @@ desc_differs "IIF(ID=1, ?, 0.5)"            "SELECT IIF(ID=1, ?, 0.5) FROM T WHE
 desc_differs "CASE .. THEN ? ELSE NN END"   "SELECT CASE WHEN ID=1 THEN ? ELSE NN END FROM T WHERE ID=1"
 desc_differs "IIF(ID=1, ?, NN)"             "SELECT IIF(ID=1, ?, NN) FROM T WHERE ID=1"
 
-echo "-- 7. RECORDED: DIFFERENT ROUTERS, each using resolve_expr --"
-# [resolve_expr] has NO SINK to register a parameter slot into, and 110
-# call sites against resolve_proj_expr's 16, so widening it is its own
-# chunk rather than a side effect of this one:
-#   * ORDER BY  - [parse_order_by_expr], a Fn(&str) string closure
-#   * SUM(...)  - [resolve_agg_src]
-#   * HAVING    - [resolve_having]
-#   * GROUP BY KEY - [parse_group_by] resolves the key through
-#     resolve_expr. A TYPED `CAST(? AS INTEGER)` key refuses too, which
-#     is what shows this is not a sibling-typing matter at all.
-eng_only "ORDER BY COALESCE(?,0)"       "SELECT ID FROM T ORDER BY COALESCE(?,0)"
-eng_only "SUM(COALESCE(?,0))"           "SELECT SUM(COALESCE(?,0)) FROM T"
-eng_only "HAVING COALESCE(?,0) > 0"     "SELECT COUNT(*) FROM T HAVING COALESCE(?,0) > 0"
-eng_only "GROUP BY COALESCE(?,0)"       "SELECT COUNT(*) FROM T GROUP BY COALESCE(?,0)"
-eng_only "GROUP BY CAST(? AS INTEGER)"  "SELECT COUNT(*) FROM T GROUP BY CAST(? AS INTEGER)"
-eng_only "GROUP BY NULLIF(?,0)"         "SELECT COUNT(*) FROM T GROUP BY NULLIF(?,0)"
-eng_only "GROUP BY N + CAST(? AS INT)"  "SELECT COUNT(*) FROM T GROUP BY N + CAST(? AS INTEGER)" '[1]'
+echo "-- 7. THE FOUR OTHER ROUTERS - answered by the fourth-router chunk --"
+# These were RECORDED here as different routers (ORDER BY, SUM(...),
+# HAVING, the GROUP BY key - each resolving through resolve_expr, which
+# has no sink). qa/serve-real-routerparam.sh is that chunk's gate; the
+# cells stay here, promoted from eng_only, so this gate keeps measuring
+# the boundary it once recorded.
+both "ORDER BY COALESCE(?,0)"       "SELECT ID FROM T ORDER BY COALESCE(?,0)"
+both "SUM(COALESCE(?,0))"           "SELECT SUM(COALESCE(?,0)) FROM T"
+both "HAVING COALESCE(?,0) > 0"     "SELECT COUNT(*) FROM T HAVING COALESCE(?,0) > 0"
+both "GROUP BY COALESCE(?,0)"       "SELECT COUNT(*) FROM T GROUP BY COALESCE(?,0)"
+both "GROUP BY CAST(? AS INTEGER)"  "SELECT COUNT(*) FROM T GROUP BY CAST(? AS INTEGER)"
+both "GROUP BY NULLIF(?,0)"         "SELECT COUNT(*) FROM T GROUP BY NULLIF(?,0)"
+both "GROUP BY N + CAST(? AS INT)"  "SELECT COUNT(*) FROM T GROUP BY N + CAST(? AS INTEGER)" '[1]'
 # a `?` in a CONDITION is typed from the COMPARISON, which is
 # [resolve_raw_cond]'s rule - and that resolver refuses parameters
 eng_only "CASE WHEN ID = ? THEN 1 ELSE 0 END" "SELECT CASE WHEN ID = ? THEN 1 ELSE 0 END FROM T WHERE ID=1" '[1]'
