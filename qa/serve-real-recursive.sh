@@ -226,12 +226,59 @@ differs() { # <label> <sql>
     fi
 }
 
+# THIS SERVER REFUSES - and that is ONE HALF OF A PAIR, on purpose.
+# Most `refuses` cells here name shapes THE ENGINE REJECTS TOO, and their
+# other half is an `engine_errs` cell carrying the SAME LABEL, so the two
+# together assert what one two-sided cell would.
+#
+# DO NOT "strengthen" this into demanding that the engine ANSWER. I tried
+# exactly that and it turned SIX paired cells red at once - they were never
+# capability gaps, they are shapes both servers reject. A cell that really
+# means "the engine answers and we refuse" uses [gap] below.
 refuses() { # <label> <sql>
     ran=$((ran + 1))
     r=$(query "$2" "$PORT" "$A")
     case "$r" in
         ERR*) echo "OK   refused: $1" ;;
         *) echo "DIFF $1 answered: [$r]"; fail=1 ;;
+    esac
+}
+
+# A RECORDED CAPABILITY GAP: the ENGINE ANSWERS and this server REFUSES.
+# BOTH sides are asked, because a cell where the ENGINE also fails measures
+# nothing while looking clean - and that is not hypothetical: a one-sided
+# guard scored this server's own 42000 as an ORDER divergence while the
+# recursive join-driver law was being measured. Goes red the day fire-crab
+# answers, which is the signal to promote the cell to `both`.
+gap() { # <label> <sql>
+    ran=$((ran + 1))
+    r=$(query "$2" "$PORT" "$A")
+    e=$(query "$2" "$REAL" "$B")
+    case "$e" in
+        ERR*|CONN_ERR|"") echo "DIFF $1 [VACUOUS: the ENGINE did not answer either: $e]"; fail=1; return ;;
+    esac
+    case "$r" in
+        ERR*) echo "OK   refused (engine answers $e): $1" ;;
+        *) echo "DIFF $1 answered: [$r] - the gap is closed; promote this cell to both"; fail=1 ;;
+    esac
+}
+
+# THE ENGINE'S VERDICT on a shape this server refuses: the other half of a
+# `refuses` pair, carrying the SAME LABEL, so the two together assert that
+# BOTH servers reject it rather than just this one.
+#
+# DEFINED HERE WITH THE OTHER HELPERS ON PURPOSE. It used to sit two-thirds
+# of the way down the file, immediately above its own four call sites, and
+# that placement silently disabled the first cell added ABOVE it: bash runs
+# top to bottom, so a call before the definition is "command not found", the
+# cell does nothing at all, and nothing says so. Only the counted floor
+# noticed - the run reported 75 checks against a floor of 77.
+engine_errs() { # <label> <sql>
+    ran=$((ran + 1))
+    r=$(query "$2" "$REAL" "$B")
+    case "$r" in
+        ERR*) echo "OK   the engine rejects it too: $1" ;;
+        *) echo "DIFF the ENGINE answered [$r] - $1 must not be refused"; fail=1 ;;
     esac
 }
 
@@ -372,6 +419,16 @@ refuses "a row that is its own parent - the same non-termination" \
      "WITH RECURSIVE C AS (SELECT ID, PARENT FROM ORG WHERE ID = 9
         UNION ALL SELECT O.ID, O.PARENT FROM ORG O JOIN C ON O.PARENT = C.ID)
       SELECT COUNT(*) FROM C"
+# its other half, which this cell had been missing: every OTHER `refuses`
+# here is paired with an `engine_errs` of the same label, and without one
+# the cell asserts only "we refuse" - it would stay green if the ENGINE
+# started answering, which is the shape of an assertion that measures
+# nothing. (Measured: the engine raises 54001 here, as it does for the
+# unbounded recursion above.)
+engine_errs "a row that is its own parent - the same non-termination" \
+     "WITH RECURSIVE C AS (SELECT ID, PARENT FROM ORG WHERE ID = 9
+        UNION ALL SELECT O.ID, O.PARENT FROM ORG O JOIN C ON O.PARENT = C.ID)
+      SELECT COUNT(*) FROM C"
 refuses "TWO self-references in the recursive branch" \
      "WITH RECURSIVE C AS (SELECT 1 AS N FROM RDB\$DATABASE
         UNION ALL SELECT C1.N+1 FROM C C1 JOIN C C2 ON C1.N = C2.N WHERE C1.N < 3)
@@ -383,6 +440,13 @@ refuses "UNION rather than UNION ALL" \
      "WITH RECURSIVE C AS (SELECT 1 AS N FROM RDB\$DATABASE
         UNION SELECT N+1 FROM C WHERE N < 3) SELECT N FROM C"
 refuses "a LEFT JOIN to the recursive reference" \
+     "WITH RECURSIVE C AS (SELECT ID, PARENT, 0 AS LVL FROM ORG WHERE PARENT IS NULL
+        UNION ALL SELECT O.ID, O.PARENT, C.LVL+1 FROM ORG O LEFT JOIN C ON O.PARENT = C.ID)
+      SELECT ID, LVL FROM C ORDER BY ID"
+# and its missing other half, for the same reason (measured: the engine
+# rejects it with -104, so this is a shape BOTH servers reject rather than
+# a capability this one lacks)
+engine_errs "a LEFT JOIN to the recursive reference" \
      "WITH RECURSIVE C AS (SELECT ID, PARENT, 0 AS LVL FROM ORG WHERE PARENT IS NULL
         UNION ALL SELECT O.ID, O.PARENT, C.LVL+1 FROM ORG O LEFT JOIN C ON O.PARENT = C.ID)
       SELECT ID, LVL FROM C ORDER BY ID"
@@ -467,6 +531,18 @@ differs "WHERE 1=1 names neither stream"          "$TRW SELECT M.MID FROM C R JO
 both "the table written FIRST"            "$TRW SELECT M.MID FROM JM M JOIN C R ON M.ID = R.ID"
 both "LEFT JOIN from the walk"            "$TRW SELECT R.ID, M.MID FROM C R LEFT JOIN JM M ON M.ID = R.ID"
 both "ORDER BY collapses it"              "$TRW SELECT M.MID FROM C R JOIN JM M ON M.ID = R.ID ORDER BY M.MID"
+# ...and a RECORDED CAPABILITY GAP found while measuring the above: the walk
+# joined to ANOTHER CTE refuses at PREPARE where the engine answers. Joined
+# to a TABLE, a DERIVED TABLE or a VIEW it answers, so it is the second CTE
+# that is not servable rather than the join. Pre-existing on `ae84769`.
+gap "a recursive CTE JOINED to another CTE" \
+     "WITH RECURSIVE C AS (SELECT ID, PARENT FROM TREE WHERE PARENT IS NULL
+        UNION ALL SELECT T2.ID, T2.PARENT FROM TREE T2 JOIN C ON T2.PARENT = C.ID),
+        Q AS (SELECT MID, ID FROM JM) SELECT Q.MID FROM C R JOIN Q ON Q.ID = R.ID"
+gap "...the two written the other way round" \
+     "WITH RECURSIVE C AS (SELECT ID, PARENT FROM TREE WHERE PARENT IS NULL
+        UNION ALL SELECT T2.ID, T2.PARENT FROM TREE T2 JOIN C ON T2.PARENT = C.ID),
+        Q AS (SELECT MID, ID FROM JM) SELECT Q.MID FROM Q JOIN C R ON Q.ID = R.ID"
 # a DIAMOND: 4 hangs under both 2 and 3, so it is emitted TWICE - once per
 # path, each at its own place in the walk (the engine does not de-duplicate)
 both "a diamond emits the node once per path" "WITH RECURSIVE C AS (SELECT ID, PARENT FROM DIA WHERE PARENT IS NULL
@@ -495,16 +571,12 @@ both "1025 levels raise 54001" "WITH RECURSIVE C AS (SELECT ID, PARENT FROM CH W
 both "a cycle raises the same 54001" "WITH RECURSIVE C AS (SELECT ID, PARENT FROM CYC WHERE PARENT IS NULL
         UNION ALL SELECT Y.ID, Y.PARENT FROM CYC Y JOIN C ON Y.PARENT = C.ID) SELECT COUNT(*) AS N FROM C"
 
-# the engine's verdict on each of the above, so this gate cannot drift
-# into asserting a refusal the engine does not share
-engine_errs() { # <label> <sql>
-    ran=$((ran + 1))
-    r=$(query "$2" "$REAL" "$B")
-    case "$r" in
-        ERR*) echo "OK   the engine rejects it too: $1" ;;
-        *) echo "DIFF the ENGINE answered [$r] - $1 must not be refused"; fail=1 ;;
-    esac
-}
+# the engine's verdict on each of the above, so this gate cannot drift into
+# asserting a refusal the engine does not share. [engine_errs] itself now
+# lives with the other helpers at the top: defining it HERE, just above its
+# own call sites, silently disabled the first cell added above it - bash
+# runs top to bottom, so the call was "command not found" and the cell did
+# nothing while the gate still reported OK for everything else.
 engine_errs "a recursion that never terminates" \
      "WITH RECURSIVE C AS (SELECT 1 AS N FROM RDB\$DATABASE
         UNION ALL SELECT N+1 FROM C) SELECT N FROM C"
@@ -520,8 +592,8 @@ engine_errs "UNION rather than UNION ALL" \
         UNION SELECT N+1 FROM C WHERE N < 3) SELECT N FROM C"
 
 rm -f "$A" "$B"
-if [ "$ran" -lt 73 ]; then
-    echo "DIFF only $ran checks ran (expected at least 73) - did one silently skip?"
+if [ "$ran" -lt 77 ]; then
+    echo "DIFF only $ran checks ran (expected at least 77) - did one silently skip?"
     fail=1
 fi
 exit $fail
