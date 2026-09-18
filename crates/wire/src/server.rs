@@ -93253,8 +93253,34 @@ fn param_or_typed_term(
         // 0. The lift is for a real-attachment literal only.
         && !fire_crab_ods::intl::byte_carrier(CURRENT_ATT_CS.with(|c| c.get()))
     {
+        // ...AND THE LIFT IS BY THE ATTACHMENT'S ENCODING, NOT BY UTF-8.
+        // [intl::to_carrier] re-spells a string's UTF-8 BYTES one char per
+        // byte, which is right only when the literal's characters came
+        // from UTF-8 statement text. Under a TABLED single-byte
+        // attachment (WIN1252, ISO8859_1) [stmt_text_decode] has ALREADY
+        // produced one char per byte via `decode_text`, so lifting again
+        // double-encoded it - exactly the failure the guard above records
+        // for a byte-carrier attachment, in a case that guard does not
+        // cover. Measured: the SAME statement text `N = 'caf<C3><A9>'`
+        // answers 1 under a NONE attachment and 0 under WIN1252, with the
+        // same stored value - the attachment was the only variable, and
+        // the trace showed the two prepares byte-identical.
+        //
+        // [transcode_text] from the ATTACHMENT's charset to the column's
+        // is the general form: identity under a tabled attachment (encode
+        // back to the same octets, carrier_decode them), and byte-for-byte
+        // what `to_carrier` did under UTF8 (`encode_text` answers
+        // `Ok(None)` for a non-tabled set, so its `as_bytes` fallback IS
+        // the UTF-8 spelling). A literal that does not spell the
+        // attachment's set keeps its own text - the engine's "no match, no
+        // raise", as everywhere else on this path.
+        let att = CURRENT_ATT_CS.with(|c| c.get());
+        let col_cs = fire_crab_ods::intl::charset_id(d.sub_type);
         let lift = |r: Rhs| match r {
-            Rhs::Str(v) => Rhs::Str(fire_crab_ods::intl::to_carrier(&v)),
+            Rhs::Str(v) => Rhs::Str(match transcode_text(att, col_cs, v.clone()) {
+                Ok(t) => t,
+                Err(_) => v,
+            }),
             other => other,
         };
         match raw {

@@ -228,24 +228,56 @@ agree "nn CONTAINING 'é' @NONE"        "select count(*) n from t where nn conta
 agree "POSITION('é' IN u) @UTF8 ctl"   "select position('é' in u) n from t where id=1;" UTF8
 agree "POSITION('f' IN nn) ascii ctl"  "select position('f' in nn) n from t where id=1;" UTF8
 agree "TRIM(TRAILING 'é' FROM padded)" "select octet_length(trim(trailing 'é' from cast(u as char(8) character set octets))) n from t where id=1;" UTF8
-echo "-- A TABLED SINGLE-BYTE ATTACHMENT IS NOT UTF8: the suite's blind spot --"
+echo "-- A TABLED SINGLE-BYTE ATTACHMENT IS NOT UTF8 (found, then FIXED) --"
 # FOUND 2026-09-18 by probing a FOURTH attachment, and ungated anywhere
-# until now: of this gate's attachment-qualified cells, all but two were
+# until then: of this gate's attachment-qualified cells, all but two were
 # @UTF8, and those two test a WIN1252 COLUMN rather than a carrier column
-# under a tabled attachment. Over a byte-carrier column under WIN1252 or
-# ISO8859_1, LIKE and STARTING WITH answer 0 where the engine answers 1 -
-# a qualifying row silently dropped, the same class as the CONTAINING
-# defect above. Measured IDENTICAL on `302c4d1`, so it is pre-existing and
-# not the carrier-mirror slice's doing; its own chunk, recorded here so it
-# cannot rot. CONTAINING under those attachments was ALREADY right on the
-# previous binary (only @UTF8 was wrong) and stays right - kept as `agree`
-# so a future fix cannot quietly break it.
-differs "nn LIKE '%é%' @WIN1252"        "select count(*) n from t where nn like '%é%';" WIN1252
-differs "nn LIKE '%é%' @ISO8859_1"      "select count(*) n from t where nn like '%é%';" ISO8859_1
-differs "nn STARTING 'café' @WIN1252"   "select count(*) n from t where nn starting with 'café';" WIN1252
-differs "nn STARTING 'café' @ISO8859_1" "select count(*) n from t where nn starting with 'café';" ISO8859_1
+# under a tabled attachment - so nothing here ever ran this shape.
+#
+# FIXED the same day, and the cause was one word in an existing step. A
+# REAL literal compared against a byte-carrier COLUMN is lifted into the
+# carrier spelling before the term is built ([param_or_typed_term]), and
+# the lift used [intl::to_carrier], which re-spells a string's UTF-8
+# BYTES one char per byte. That is right only when the literal's
+# characters came from UTF-8 statement text. Under a TABLED single-byte
+# attachment [stmt_text_decode] has ALREADY decoded one char per byte, so
+# the lift ran twice and 'café' became seven characters against the
+# column's five: `=`, `LIKE` and `STARTING WITH` all missed together,
+# while CONTAINING escaped because it returns before that point. The lift
+# now goes through [transcode_text] from the ATTACHMENT's charset, which
+# is the identity under a tabled attachment and byte-for-byte what
+# `to_carrier` did under UTF8.
+#
+# The trace is what settled it: the SAME statement text under NONE and
+# under WIN1252 - byte-identical prepares - answered 1 and 0. Five
+# hypotheses about the literal's decode and the value's decode died
+# before that, all of them refutable by measurement and none by reading.
+#
+# These cells are `agree` on all four attachments now; the ones that
+# remain `differs` below are an OCTETS CAST under STARTING WITH, which
+# fails under NONE too - where the lift never runs - and is therefore a
+# different cause, recorded rather than folded in.
+agree "nn LIKE '%é%' @WIN1252"        "select count(*) n from t where nn like '%é%';" WIN1252
+agree "nn LIKE '%é%' @ISO8859_1"      "select count(*) n from t where nn like '%é%';" ISO8859_1
+agree "nn STARTING 'café' @WIN1252"   "select count(*) n from t where nn starting with 'café';" WIN1252
+agree "nn STARTING 'café' @ISO8859_1" "select count(*) n from t where nn starting with 'café';" ISO8859_1
 agree "nn CONTAINING 'é' @WIN1252"      "select count(*) n from t where nn containing 'é';" WIN1252
 agree "nn CONTAINING 'é' @ISO8859_1"    "select count(*) n from t where nn containing 'é';" ISO8859_1
+# EQUALITY over a carrier column under a tabled attachment - the shape
+# this gate never had, and the one that showed the defect was not
+# LIKE-specific at all. `nn = 'café'` was engine 1 / here 0 under both
+# tabled attachments while agreeing under NONE and UTF8.
+agree "nn = 'café' @WIN1252"          "select count(*) n from t where nn = 'café';" WIN1252
+agree "nn = 'café' @ISO8859_1"        "select count(*) n from t where nn = 'café';" ISO8859_1
+agree "nn = 'café' @UTF8"             "select count(*) n from t where nn = 'café';" UTF8
+# RECORDED, pre-existing, and a DIFFERENT cause: an OCTETS CAST under
+# STARTING WITH answers 0 where the engine answers 1 - under NONE too,
+# where the carrier lift above never runs at all, so it is not this law.
+# Its UTF8 twin agrees, which is the contrast that pins it. Measured
+# unchanged across this slice's own before/after runs.
+differs "octets STARTING 'café' @NONE"    "select count(*) n from t where cast(u as varchar(20) character set octets) starting with 'café';"
+differs "octets STARTING 'café' @WIN1252" "select count(*) n from t where cast(u as varchar(20) character set octets) starting with 'café';" WIN1252
+agree "octets STARTING 'café' @UTF8"      "select count(*) n from t where cast(u as varchar(20) character set octets) starting with 'café';" UTF8
 
 echo "-- a WRAPPED LITERAL column: RECORDED, pre-existing, NOT this law --"
 echo "--  CONTAINING over a derived/CTE LITERAL column refuses at PLAN --"
@@ -295,8 +327,8 @@ echo "ran $ran checks"
 # derived from the invocations, not guessed: agree + differs + malformed
 # + refuses. A block that stops being read trips this instead of passing
 # quietly over fewer cells.
-if [ "$ran" -lt 96 ]; then
-    echo "FAIL only $ran checks ran (expected at least 96) - did a block silently skip?"
+if [ "$ran" -lt 102 ]; then
+    echo "FAIL only $ran checks ran (expected at least 102) - did a block silently skip?"
     fail=1
 fi
 [ $fail = 0 ] && echo "PASS nonecmp" || echo "FAIL nonecmp"
