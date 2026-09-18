@@ -8829,6 +8829,13 @@ const ATT_SUBTYPE: i32 = -1;
 /// ([resolve_text_cs]).
 const MAX_VARCHAR_BYTES: i32 = 65533;
 
+/// The widest VARCHAR a REAL attachment admits, in BYTES - a declared
+/// `VARCHAR(n)`'s own limit. A NONE attachment admits [MAX_VARCHAR_BYTES]
+/// instead; which applies is decided at emission, where the attachment is
+/// known ([resolve_text_cs]). Probed across NONE, UTF8, WIN1252 and
+/// ISO8859_1 attachments against the computed-length pad.
+const DECLARED_VARCHAR_BYTES: i32 = 32765;
+
 /// A REAL-charset text EXPRESSION column's sub_type sentinel: the
 /// charset id `cs` (>= 2) encoded as `-2 - cs`, with [ProjCol::length]
 /// holding a CHARACTER count. Probed with SQLDA_DISPLAY across UTF8,
@@ -8865,7 +8872,25 @@ fn resolve_text_cs(sub: i32, len: i32, oct: i32, att: &AttCs) -> (i32, i32) {
     // the computed-length pad: 65533 for NONE and WIN1252, 65532 - i.e.
     // 16383 characters - for UTF8). Capping the characters rather than
     // the product is what puts the byte width on the engine's multiple.
-    let cap = |bpc: i32| (len.min(MAX_VARCHAR_BYTES / bpc.max(1))) * bpc;
+    // THE CEILING IS THE ATTACHMENT'S, NOT A CONSTANT. A NONE attachment
+    // admits 65533 bytes; any REAL one admits 32765 - a declared
+    // VARCHAR's own limit. Measured engine-side across four attachments
+    // and four source charsets on the computed-length pad, the only
+    // expression that reaches this sentinel: `LPAD(<utf8>, ID)` is 65532
+    // under NONE, 32764 under UTF8 and 16383 under WIN1252 *and*
+    // ISO8859_1, while a NONE source is 65533 / 32765 / 32765 / 32765.
+    // A previous attempt moved this to 32765 UNCONDITIONALLY and
+    // regressed every NONE-attachment cell (exprshape 54/0 -> 50/5),
+    // because under NONE the old value was exactly right; the ceiling is
+    // conditional, which is what that attempt could not see from the one
+    // attachment it measured. Statically sized expressions are untouched:
+    // their widths (7-14 characters here) are orders below ceiling/bpc.
+    let ceiling = if att.id == 0 {
+        MAX_VARCHAR_BYTES
+    } else {
+        DECLARED_VARCHAR_BYTES
+    };
+    let cap = |bpc: i32| (len.min(ceiling / bpc.max(1))) * bpc;
     if sub == ATT_SUBTYPE {
         (att.id as i32, cap(att.bpc as i32))
     } else if sub <= -2 {
@@ -8887,10 +8912,24 @@ fn resolve_text_cs(sub: i32, len: i32, oct: i32, att: &AttCs) -> (i32, i32) {
             let chars = len / fire_crab_ods::intl::bytes_per_char(col_cs).max(1) as i32;
             (att.id as i32, chars * att.bpc as i32)
         } else {
-            (sub, len)
+            // A BYTE CARRIER TAKES THE ATTACHMENT'S CEILING TOO, and it
+            // reaches it HERE rather than through `cap` above. NONE and
+            // OCTETS keep their own charset (`charset_id <= 1`), so
+            // [build_expr_col] announces them as a PLAIN POSITIVE ttype -
+            // not one of the negative sentinels - and this arm decides
+            // their width. Without the ceiling the computed-length pad
+            // over a NONE, OCTETS or CHAR-NONE source announced 65533
+            // under EVERY attachment, where the engine says 32765 under
+            // a real one (measured on all four; the UTF8 and WIN1252
+            // sources were already right because they travel as
+            // `enc_real_cs` sentinels and were capped above - which is
+            // exactly why only these three sources failed). A stored
+            // column is untouched: its declared width is orders below
+            // any ceiling.
+            (sub, cap(1))
         }
     } else {
-        (sub, len)
+        (sub, cap(1))
     }
 }
 
@@ -19453,7 +19492,31 @@ fn text_form_m(
                     // The division happens at emission, where the
                     // charset is finally known ([resolve_text_cs]).
                     let cs = arg(0).map(|(_, _, c)| c).unwrap_or(TfCs::Att);
-                    Some((true, lit(1).unwrap_or(MAX_VARCHAR_BYTES), cs))
+                    // THE FALLBACK IS COUNTED IN THE **SOURCE'S**
+                    // CHARACTERS. `MAX_VARCHAR_BYTES` is a BYTE limit, so
+                    // handing it back as a character count announced a
+                    // UTF8 source four times too wide. Measured over four
+                    // source charsets x four attachments (NONE, UTF8,
+                    // WIN1252, ISO8859_1), the engine's width is
+                    //
+                    //     chars = 65533 / bpc(SOURCE)
+                    //     bytes = min(chars, ceiling/bpc(OUT)) * bpc(OUT)
+                    //
+                    // with the ceiling the attachment's ([resolve_text_cs]).
+                    // The source's own bpc is what makes a UTF8 source
+                    // announce 16383 under WIN1252 while a NONE source
+                    // announces 32765 - the cell that defeated the
+                    // previous attempt at this, which moved the ceiling
+                    // alone and had to be reverted.
+                    let src_bpc = i32::from(fire_crab_ods::intl::bytes_per_char(match cs {
+                        TfCs::Ttype(t) => fire_crab_ods::intl::charset_id(t as i16),
+                        TfCs::Att => CURRENT_ATT_CS.with(|c| c.get()),
+                    }));
+                    Some((
+                        true,
+                        lit(1).unwrap_or(MAX_VARCHAR_BYTES / src_bpc.max(1)),
+                        cs,
+                    ))
                 }
                 _ => None,
             }
