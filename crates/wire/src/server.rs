@@ -12744,6 +12744,7 @@ fn expr_reads(e: &Expr, f: &dyn Fn(usize) -> bool) -> bool {
         | Expr::Collate(a, _)
         | Expr::CollCanon(a, _, _)
         | Expr::CarrierEnc(a, _)
+        | Expr::CarrierDec(a, _, _)
         | Expr::OctKey(a, _) => expr_reads(a, f),
         Expr::Neg(a) | Expr::Cast(a, _, _) => expr_reads(a, f),
         Expr::Bin(a, _, b) | Expr::Concat(a, b) | Expr::NullIf(a, b) => {
@@ -13696,6 +13697,43 @@ fn carrier_expr_like(
         return Some(Term::MalformedLike(Box::new(lhs.clone())));
     }
     Some(Term::ExprLike(Box::new(lhs.clone()), p, escape, negated))
+}
+
+/// Reconcile a CARRIER/REAL character-set mix between a pattern
+/// predicate's VALUE and its per-row PATTERN, answering the pattern to
+/// use. The value is never rewritten - both directions act on the
+/// pattern alone, which is why this takes the value by reference and
+/// only to read its charset.
+///
+/// MEASURED 2026-09-18, across all four families and all three worlds,
+/// and the rule is NOT per-family (an earlier record said it was, on a
+/// fixture whose carrier pattern happened to be pure ASCII):
+///
+///  * CARRIER value, REAL pattern - byte space. The real pattern is
+///    re-spelled as the carrier of its own octets ([Expr::CarrierEnc]),
+///    exactly what [cmp_sides] does for a comparison, so a non-ASCII row
+///    silently MISSES and nothing raises. Measured: `N LIKE PU` answers
+///    row 2 only, where row 1 holds `caf<E9>` against `caf<C3A9>%`.
+///  * REAL value, CARRIER pattern - the pattern's octets are DECODED into
+///    the real set ([Expr::CarrierDec]), which answers when they spell it
+///    and raises 22000 when they do not. PER ROW: measured, one statement
+///    answers for the row whose pattern is ASCII and raises for the row
+///    whose pattern is not.
+///
+/// Two real sets, or two carriers, are returned unchanged - those are the
+/// paths that already worked.
+fn carrier_pattern(value: &Expr, pattern: Expr, descs: &[Descriptor]) -> Expr {
+    use fire_crab_ods::intl::byte_carrier;
+    let (Some(cv), Some(cp)) =
+        (cmp_text_charset(value, descs), cmp_text_charset(&pattern, descs))
+    else {
+        return pattern;
+    };
+    match (byte_carrier(cv), byte_carrier(cp)) {
+        (true, false) => Expr::CarrierEnc(Box::new(pattern), cp),
+        (false, true) => Expr::CarrierDec(Box::new(pattern), cp, cv),
+        _ => pattern,
+    }
 }
 
 fn carrier_like_raises(pattern: &str, escape: Option<char>) -> bool {
@@ -19583,9 +19621,13 @@ fn text_form_m(
         // transparently, joining [expr_reads], [expr_nullable],
         // `type_of`, `rank_of` and [expr_no_raise]; it was the only one
         // without an arm.
-        Expr::Collate(inner, _) | Expr::CollCanon(inner, _, _) | Expr::CarrierEnc(inner, _) => {
-            text_form(inner, descs)
-        }
+        Expr::Collate(inner, _)
+        | Expr::CollCanon(inner, _, _)
+        | Expr::CarrierEnc(inner, _)
+        // [Expr::CarrierDec] is transparent here for the same reason: it
+        // changes which OCTETS a value is read AS, not the text FORM this
+        // describe is computed from
+        | Expr::CarrierDec(inner, _, _) => text_form(inner, descs),
         // a BINARY literal is CHAR of exactly its BYTES, at OCTETS -
         // never the attachment's charset and never a character count
         Expr::Hex(b) => Some((false, b.len() as i32, TfCs::Ttype(1))),
@@ -52232,6 +52274,7 @@ fn expr_nullable(e: &Expr, is_nn: &dyn Fn(usize) -> bool) -> bool {
         | Expr::TextNumKey(a, _)
         | Expr::OctKey(a, _)
         | Expr::CarrierEnc(a, _)
+        | Expr::CarrierDec(a, _, _)
         | Expr::TextBool(a, _) => expr_nullable(a, is_nn),
         Expr::Bin(a, _, b) | Expr::Concat(a, b) => expr_nullable(a, is_nn) || expr_nullable(b, is_nn),
         // AtNode::make (ExprNodes.cpp:3328): nullable iff the datetime
@@ -67694,15 +67737,9 @@ fn resolve_raw_cond(
                 return None;
             }
             let p = resolve_expr(pat, columns, descs)?;
-            if let (Some(x), Some(y)) =
-                (cmp_text_charset(&e, descs), cmp_text_charset(&p, descs))
-            {
-                if fire_crab_ods::intl::byte_carrier(x)
-                    != fire_crab_ods::intl::byte_carrier(y)
-                {
-                    return None;
-                }
-            }
+            // the carrier/real mix is ANSWERED now, not refused - see
+            // [carrier_pattern] for the measured rule
+            let p = carrier_pattern(&e, p, descs);
             Cond2::LikeExpr(Box::new(e), Box::new(p), *esc, *negated)
         }
         RawCond::StartingExpr(a, pre, negated) => {
@@ -67714,15 +67751,7 @@ fn resolve_raw_cond(
                 return None;
             }
             let p = resolve_expr(pre, columns, descs)?;
-            if let (Some(x), Some(y)) =
-                (cmp_text_charset(&e, descs), cmp_text_charset(&p, descs))
-            {
-                if fire_crab_ods::intl::byte_carrier(x)
-                    != fire_crab_ods::intl::byte_carrier(y)
-                {
-                    return None;
-                }
-            }
+            let p = carrier_pattern(&e, p, descs);
             // [starting_canon]'s decision, with the prefix's half deferred:
             // a canonicalising collation wraps the value and canonicalises
             // the prefix per row; a declared collation with NO canonical
@@ -67748,15 +67777,7 @@ fn resolve_raw_cond(
                 return None;
             }
             let p = resolve_expr(pat, columns, descs)?;
-            if let (Some(x), Some(y)) =
-                (cmp_text_charset(&e, descs), cmp_text_charset(&p, descs))
-            {
-                if fire_crab_ods::intl::byte_carrier(x)
-                    != fire_crab_ods::intl::byte_carrier(y)
-                {
-                    return None;
-                }
-            }
+            let p = carrier_pattern(&e, p, descs);
             // the literal arm desugars into a `Cond2::Like` through
             // [containing_term] at prepare; this one CANNOT, because every
             // step of that rewrite depends on the row's pattern
@@ -67792,15 +67813,7 @@ fn resolve_raw_cond(
                 return None;
             }
             let p = resolve_expr(pat, columns, descs)?;
-            if let (Some(x), Some(y)) =
-                (cmp_text_charset(&e, descs), cmp_text_charset(&p, descs))
-            {
-                if fire_crab_ods::intl::byte_carrier(x)
-                    != fire_crab_ods::intl::byte_carrier(y)
-                {
-                    return None;
-                }
-            }
+            let p = carrier_pattern(&e, p, descs);
             Cond2::SimilarExpr(Box::new(e), Box::new(p), *esc, *negated)
         }
         // A NULL TEST READS NO CONTENT: a BLOB column of ANY sub_type (a
@@ -69415,6 +69428,23 @@ enum Expr {
     /// describe width; it passes type, nullability, rank and reads
     /// through to the inner like [Expr::OctKey].
     CarrierEnc(Box<Expr>, u8),
+    /// THE DECODE COUNTERPART to [Expr::CarrierEnc]: a BYTE-CARRIER value
+    /// read AS a real character set - the first `u8` is the carrier it
+    /// came from, the second the real set it must spell. Octets that do
+    /// not spell that set raise `MalformedString` (SQLSTATE 22000), which
+    /// is [transcode_text]'s own carrier-source vector and the engine's.
+    ///
+    /// It exists for ONE measured shape: a REAL value against a
+    /// BYTE-CARRIER pattern. Measured 2026-09-18, the engine decodes the
+    /// pattern and raises when it cannot - and does so PER ROW, so a
+    /// single statement ANSWERS for a row whose pattern is ASCII and
+    /// RAISES for a row whose pattern is not. Wrapping the pattern here
+    /// reproduces that exactly, because the raise happens at eval.
+    ///
+    /// The MIRROR direction needs no decode: a carrier VALUE against a
+    /// real PATTERN matches in byte space, which is [Expr::CarrierEnc]
+    /// over the pattern, and there the non-ASCII row silently misses.
+    CarrierDec(Box<Expr>, u8, u8),
 }
 
 /// A resolved [RawCond].
@@ -73323,6 +73353,7 @@ impl Expr {
             Expr::CollKey(e, _)
             | Expr::OctKey(e, _)
             | Expr::CarrierEnc(e, _)
+            | Expr::CarrierDec(e, _, _)
             | Expr::Collate(e, _)
             | Expr::CollCanon(e, _, _) => e.type_of(descs),
             Expr::Null => Some(ExprType::Int),
@@ -73879,6 +73910,7 @@ impl Expr {
             | Expr::Collate(_, _)
             | Expr::CollCanon(_, _, _)
             | Expr::CarrierEnc(_, _)
+            | Expr::CarrierDec(..)
             | Expr::OctKey(_, _) => None,
             Expr::Coalesce(args) => args.iter().filter_map(|a| a.rank_of(descs)).max(),
             Expr::Case(branches, else_) => branches
@@ -74401,6 +74433,16 @@ impl Expr {
                     };
                     Value::Text(fire_crab_ods::intl::carrier_decode(&bytes))
                 }
+                v => v,
+            },
+            // read a byte carrier's octets AS a real charset, raising when
+            // they do not spell it. PER ROW and value-gated, which is the
+            // engine's measured rule: the same statement answers for a row
+            // whose pattern is ASCII and raises for one whose pattern is
+            // not. A NULL stays NULL - no raise without a value.
+            Expr::CarrierDec(e, src, dst) => match e.eval(values)? {
+                Value::Null => Value::Null,
+                Value::Text(s) => Value::Text(transcode_text(*src, *dst, s)?),
                 v => v,
             },
             // the OCTETS comparison key (see the variant): trailing
@@ -92492,15 +92534,7 @@ fn resolve_expr_term(
             // The test reads BOTH sides' contributed charsets and compares
             // only CARRIER-NESS, not identity: two real sets meeting is the
             // ordinary text law this path already handles.
-            if let (Some(a), Some(b)) =
-                (cmp_text_charset(&lhs, descs), cmp_text_charset(&pat, descs))
-            {
-                if fire_crab_ods::intl::byte_carrier(a)
-                    != fire_crab_ods::intl::byte_carrier(b)
-                {
-                    return None;
-                }
-            }
+            let pat = carrier_pattern(&lhs, pat, descs);
             Term::ExprLikeExpr(Box::new(lhs), Box::new(pat), *escape, *negated)
         }
         // a `?` against the expression side: synthesize the bind
@@ -92867,12 +92901,9 @@ fn resolve_expr_term(
             if let (Some(x), Some(y)) =
                 (cmp_text_charset(&lhs, descs), cmp_text_charset(&pat, descs))
             {
-                if fire_crab_ods::intl::byte_carrier(x)
-                    != fire_crab_ods::intl::byte_carrier(y)
-                {
-                    return None;
-                }
+                let _ = (x, y); // the mix is reconciled below, not refused
             }
+            let pat = carrier_pattern(&lhs, pat, descs);
             Term::ExprSimilarExpr(Box::new(lhs), Box::new(pat), *escape, *negated)
         }
         RawKind::Similar(..) => return None, // NULL or parameter pattern
@@ -93023,12 +93054,9 @@ fn resolve_expr_term(
             if let (Some(a), Some(b)) =
                 (cmp_text_charset(&lhs, descs), cmp_text_charset(&pre, descs))
             {
-                if fire_crab_ods::intl::byte_carrier(a)
-                    != fire_crab_ods::intl::byte_carrier(b)
-                {
-                    return None;
-                }
+                let _ = (a, b); // the mix is reconciled below, not refused
             }
+            let pre = carrier_pattern(&lhs, pre, descs);
             match collate_canon_of(&lhs) {
                 // the written collation reads the CANONICAL form of both
                 // sides; the prefix's half of that moves per row
@@ -93068,12 +93096,9 @@ fn resolve_expr_term(
             if let (Some(a), Some(b)) =
                 (cmp_text_charset(&lhs, descs), cmp_text_charset(&pat, descs))
             {
-                if fire_crab_ods::intl::byte_carrier(a)
-                    != fire_crab_ods::intl::byte_carrier(b)
-                {
-                    return None;
-                }
+                let _ = (a, b); // the mix is reconciled below, not refused
             }
+            let pat = carrier_pattern(&lhs, pat, descs);
             Term::ExprContainingExpr(
                 Box::new(Expr::CollCanon(Box::new(value), tt, true)),
                 Box::new(pat),
@@ -93647,7 +93672,17 @@ fn expr_no_raise(e: &Expr, descs: &[Descriptor]) -> bool {
         // exactly their value-gated engine behavior, carried by the
         // error-propagating term paths, never admitted where a raise
         // cannot travel
-        Expr::TextNum(_, _) | Expr::TextNumKey(_, _) | Expr::TextBool(_, _) => false,
+        // ...and [Expr::CarrierDec] belongs HERE, not with CarrierEnc
+        // below: re-spelling a real value as its own octets cannot fail,
+        // but DECODING a carrier's octets into a real set can, and raising
+        // 22000 when they do not spell it is the whole point of the
+        // variant. Saying otherwise would let a caller evaluate the
+        // condition where a raise cannot travel - the same silent shape
+        // `cond_no_raise` already refuses for `Cond2::SimilarExpr`.
+        Expr::TextNum(_, _)
+        | Expr::TextNumKey(_, _)
+        | Expr::TextBool(_, _)
+        | Expr::CarrierDec(..) => false,
         Expr::CollKey(a, _)
         | Expr::OctKey(a, _)
         | Expr::CarrierEnc(a, _)

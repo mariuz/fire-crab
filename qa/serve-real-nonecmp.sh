@@ -268,9 +268,16 @@ agree "REPLACE(u,nn,'x') cols @UTF8"    "select octet_length(replace(u,nn,'x')) 
 echo "--  a NON-LITERAL pattern is a MISSING CAPABILITY, not this law:   --"
 echo "--  fire-crab refuses it for SAME-charset operands too (measured), --"
 echo "--  so it ranks below every wrong answer and is recorded, not fixed --"
-refuses "u CONTAINING nn (column pattern)" "select count(*) n from t where u containing nn;"
-refuses "nn CONTAINING u (column pattern)" "select count(*) n from t where nn containing u;"
-refuses "u LIKE nn (column pattern)"       "select count(*) n from t where u like nn;"
+# PROMOTED 2026-09-18, and this is what those cells were for. A COLUMN
+# pattern in a carrier/real mix is no longer refused: [carrier_pattern]
+# reconciles the two sides at prepare - the real side re-spelled as the
+# carrier of its own octets, or the carrier side decoded into the real set
+# with a per-row 22000 when its bytes do not spell it. Confirmed the way
+# this suite requires before believing a red gate: the PREVIOUS binary
+# (d7b5a77) passes all 138 cells, and only these three move.
+agree "u CONTAINING nn (column pattern)" "select count(*) n from t where u containing nn;"
+agree "nn CONTAINING u (column pattern)" "select count(*) n from t where nn containing u;"
+agree "u LIKE nn (column pattern)"       "select count(*) n from t where u like nn;"
 echo "--  controls: BOTH-carrier and BOTH-real need no reconciliation --"
 agree "POSITION('é' IN nn) @NONE"      "select position('é' in nn) n from t where id=1;"
 agree "nn CONTAINING 'é' @NONE"        "select count(*) n from t where nn containing 'é';"
