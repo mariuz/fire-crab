@@ -54161,13 +54161,51 @@ fn plan_group(
                 // the GROUP ROW, so the answer is the slot's own index; the
                 // earlier form paired `cols` with `gitems`, which cannot
                 // reach a slot past the last output column.
-                gitems_cell.borrow().iter().enumerate().find_map(|(slot, g)| match g {
-                    GItem::Key(fid) => columns
-                        .iter()
-                        .find(|rc| rc.field_id as usize == *fid && col_name_is(&rc.name, n))
-                        .map(|_| slot),
-                    _ => None,
-                })
+                // bound in its OWN block so the immutable borrow ENDS before
+                // the seed below takes a mutable one - a RefCell double
+                // borrow here would panic at RUN time, not at compile time
+                let found = {
+                    let gi = gitems_cell.borrow();
+                    gi.iter().enumerate().find_map(|(slot, g)| match g {
+                        GItem::Key(fid) => columns
+                            .iter()
+                            .find(|rc| rc.field_id as usize == *fid && col_name_is(&rc.name, n))
+                            .map(|_| slot),
+                        _ => None,
+                    })
+                };
+                if found.is_some() {
+                    return found;
+                }
+                // ...AND A GROUPED KEY NOTHING HAS CLAIMED YET MUST STILL
+                // RESOLVE. [build_group_items] seeds a slot for every
+                // unclaimed `key_fid`, but ONLY inside `if
+                // !deferred.is_empty()` - so a plain `SELECT COUNT(*) FROM T
+                // GROUP BY N ORDER BY N` never got one and the whole
+                // statement REFUSED where the engine answers `2|1`.
+                //
+                // Measured, and it is the key being UNPROJECTED that decides
+                // it: with `N` in the select list both servers agree, so does
+                // `ORDER BY 1`, and so does an ungrouped `SELECT K FROM T
+                // ORDER BY N`. `GROUP BY N, V ORDER BY V` refused the same
+                // way, which is what showed it is the projection and not the
+                // aggregate.
+                //
+                // Seeded on demand, which is exactly what [resolve_having]
+                // does for the same reason - the SECOND place this one
+                // mechanism was missing, found because a probe varied which
+                // grouped key the ORDER BY named.
+                let fid = columns
+                    .iter()
+                    .find(|rc| {
+                        col_name_is(&rc.name, n) && key_fids.contains(&(rc.field_id as usize))
+                    })
+                    .map(|rc| rc.field_id as usize)?;
+                let mut gitems = gitems_cell.borrow_mut();
+                let mut slot_descs = slot_descs_cell.borrow_mut();
+                gitems.push(GItem::Key(fid));
+                slot_descs.push(descs.get(fid).cloned());
+                Some(gitems.len() - 1)
             },
             |text| {
                 let raw = parse_raw_expr_any(text)?;
@@ -54375,6 +54413,25 @@ fn parse_group_by(
             // engine resolves the alias). A real column of that name
             // wins, which is what makes an alias that shadows one
             // harmless.
+            //
+            // ...EXCEPT WHEN THE ALIAS NAMES AN AGGREGATE, and there the
+            // "harmless" above was a WRONG ANSWER. Measured: the bare
+            // `SELECT COUNT(*) AS N FROM T GROUP BY N` refuses on the
+            // engine with 42000 / -104 / "Cannot use an aggregate
+            // function..." - the alias makes `GROUP BY N` look like it
+            // references the AGGREGATE, and the engine rejects the
+            // statement whether or not HAVING or ORDER BY names it
+            // (`ORDER BY 1` refuses too). This server took the real column
+            // and answered `2|1`. `SELECT COUNT(*) AS C FROM T GROUP BY N`
+            // is fine on both, so it is the COLLISION that is invalid, not
+            // the alias.
+            //
+            // The check runs BEFORE the column lookup precisely because a
+            // real column of that name exists in the failing case - that
+            // is what made it silent.
+            if items.iter().any(|it| matches!(it, SelItem::Agg(_, _, Some(a)) if a == name)) {
+                return None;
+            }
             match find_col(columns, name) {
                 Some(_) => name,
                 None => {
