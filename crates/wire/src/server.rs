@@ -12783,6 +12783,10 @@ fn cond_has_param(c: &Cond2) -> bool {
         | Cond2::Like(a, ..)
         | Cond2::Starting(a, ..)
         | Cond2::Similar(a, ..) => expr_has_param(a),
+        // both sides: a `?` may sit in the PATTERN expression too
+        Cond2::LikeExpr(a, p, ..)
+        | Cond2::StartingExpr(a, p, ..)
+        | Cond2::ContainingExpr(a, p, ..) => expr_has_param(a) || expr_has_param(p),
         Cond2::Not(inner) => cond_has_param(inner),
         Cond2::And(parts) | Cond2::Or(parts) => parts.iter().any(cond_has_param),
     }
@@ -12811,7 +12815,15 @@ fn subst_params_cond(c: &Cond2, args: &[WireParam]) -> Option<Cond2> {
         ),
         // a pattern side carrying a `?` never resolves (the projection
         // resolver types no pattern), so these pass through unchanged
-        Cond2::Like(..) | Cond2::Starting(..) | Cond2::Similar(..) => return None,
+        Cond2::Like(..)
+        | Cond2::Starting(..)
+        | Cond2::Similar(..)
+        // the expression forms likewise: the resolver refuses a `?` inside
+        // a per-row pattern outright ([raw_has_param]), so one never
+        // reaches bind and there is nothing here to substitute
+        | Cond2::LikeExpr(..)
+        | Cond2::StartingExpr(..)
+        | Cond2::ContainingExpr(..) => return None,
     })
 }
 
@@ -12823,6 +12835,11 @@ fn cond_reads(c: &Cond2, f: &dyn Fn(usize) -> bool) -> bool {
         | Cond2::Like(a, ..)
         | Cond2::Starting(a, ..)
         | Cond2::Similar(a, ..) => expr_reads(a, f),
+        // both sides: a pattern that reads a column is a column this
+        // condition reads, and answering otherwise mis-gates a push-down
+        Cond2::LikeExpr(a, p, ..)
+        | Cond2::StartingExpr(a, p, ..)
+        | Cond2::ContainingExpr(a, p, ..) => expr_reads(a, f) || expr_reads(p, f),
         Cond2::Not(inner) => cond_reads(inner, f),
         Cond2::And(parts) | Cond2::Or(parts) => parts.iter().any(|p| cond_reads(p, f)),
     }
@@ -53162,6 +53179,25 @@ fn walk_cond_aggs(c: &RawCond, out: &mut Vec<(AggFn, AggTarget)>) {
         | RawCond::Starting(a, _, _)
         | RawCond::Containing(a, _, _)
         | RawCond::Similar(a, _, _, _) => walk_aggs(a, out),
+        // BOTH sides, and this is not hypothetical: measured answering on
+        // both servers, `SELECT CASE WHEN MAX(U) LIKE MAX(V) THEN 1 ELSE 0
+        // END FROM T GROUP BY U` (and the bare `SELECT MAX(U) LIKE
+        // MAX(V)`), so an aggregate now lives in the PATTERN as well as in
+        // the operand and must be lifted into a grouping slot from there.
+        //
+        // NOTE WHICH SHAPE THIS IS NOT. `HAVING MAX(U) LIKE MAX(V)` does
+        // not pass through here at all: HAVING has its own resolver
+        // ([resolve_having], over `Vec<Vec<RawTerm>>` and a synthetic
+        // group-row view), which is a THIRD routing site that no expression
+        // pattern reaches - `HAVING U LIKE V` refuses with no aggregate in
+        // it whatever, while `HAVING MAX(U) LIKE 'caf%'` answers. Measured,
+        // recorded as a gap, and deliberately not half-fixed from here.
+        RawCond::LikeExpr(a, p, _, _)
+        | RawCond::StartingExpr(a, p, _)
+        | RawCond::ContainingExpr(a, p, _) => {
+            walk_aggs(a, out);
+            walk_aggs(p, out);
+        }
         RawCond::Not(a) => walk_cond_aggs(a, out),
         RawCond::And(v) | RawCond::Or(v) => {
             for x in v {
@@ -53225,6 +53261,11 @@ fn substitute_cond_aggs(
         RawCond::Starting(a, p, n) => RawCond::Starting(subb(a)?, p.clone(), *n),
         RawCond::Containing(a, p, n) => RawCond::Containing(subb(a)?, p.clone(), *n),
         RawCond::Similar(a, p, e, n) => RawCond::Similar(subb(a)?, p.clone(), *e, *n),
+        // the pattern is an EXPRESSION here, so its aggregates are
+        // substituted too - the twin of the walk above
+        RawCond::LikeExpr(a, p, e, n) => RawCond::LikeExpr(subb(a)?, subb(p)?, *e, *n),
+        RawCond::StartingExpr(a, p, n) => RawCond::StartingExpr(subb(a)?, subb(p)?, *n),
+        RawCond::ContainingExpr(a, p, n) => RawCond::ContainingExpr(subb(a)?, subb(p)?, *n),
         RawCond::Not(a) => RawCond::Not(Box::new(substitute_cond_aggs(a, slot_of)?)),
         RawCond::And(v) => RawCond::And(
             v.iter()
@@ -54168,6 +54209,9 @@ fn normalize_cond(c: &RawCond) -> RawCond {
         RawCond::Starting(a, p, n) => RawCond::Starting(nb(a), p.clone(), *n),
         RawCond::Containing(a, p, n) => RawCond::Containing(nb(a), p.clone(), *n),
         RawCond::Similar(a, p, e, n) => RawCond::Similar(nb(a), p.clone(), *e, *n),
+        RawCond::LikeExpr(a, p, e, n) => RawCond::LikeExpr(nb(a), nb(p), *e, *n),
+        RawCond::StartingExpr(a, p, n) => RawCond::StartingExpr(nb(a), nb(p), *n),
+        RawCond::ContainingExpr(a, p, n) => RawCond::ContainingExpr(nb(a), nb(p), *n),
         RawCond::Not(inner) => RawCond::Not(Box::new(normalize_cond(inner))),
         RawCond::And(v) => RawCond::And(v.iter().map(normalize_cond).collect()),
         RawCond::Or(v) => RawCond::Or(v.iter().map(normalize_cond).collect()),
@@ -64098,6 +64142,16 @@ fn expr_contains_genval(e: &Expr) -> bool {
             | Cond2::Like(a, ..)
             | Cond2::Starting(a, ..)
             | Cond2::Similar(a, ..) => expr_contains_genval(a),
+            // BOTH sides: a pattern is an expression here and may hold a
+            // GEN_ID of its own. This match ends in a catch-all, so the
+            // compiler does NOT name these - they are written in
+            // deliberately, and missing one would evaluate a generator the
+            // wrong number of times.
+            Cond2::LikeExpr(a, p, ..)
+            | Cond2::StartingExpr(a, p, ..)
+            | Cond2::ContainingExpr(a, p, ..) => {
+                expr_contains_genval(a) || expr_contains_genval(p)
+            }
             Cond2::Not(inner) => cond(inner),
             Cond2::And(parts) | Cond2::Or(parts) => parts.iter().any(cond),
         }
@@ -65059,6 +65113,23 @@ enum RawCond {
     Starting(Box<RawExpr>, String, bool),
     Containing(Box<RawExpr>, String, bool),
     Similar(Box<RawExpr>, String, Option<char>, bool),
+    /// The VALUE-world twins of [RawKind::LikeExpr] and friends: the
+    /// pattern is an EXPRESSION evaluated per row, not a literal. A
+    /// predicate is also a BOOLEAN value in Firebird, and until these
+    /// existed `WHERE <x> LIKE V` answered while `SELECT <x> LIKE V`
+    /// refused - an asymmetry this server created when the predicate
+    /// world got its expression pattern and this one did not.
+    ///
+    /// Additive variants rather than a widened `String`, for the reason
+    /// the predicate world states: the existing arms stay compiled and
+    /// every EXHAUSTIVE match over `RawCond` breaks until it handles
+    /// these. Nine such sites exist ([renumber_cond_params],
+    /// [subst_params_cond], [cond_reads] among them) and each must read
+    /// BOTH sub-expressions - a pattern that reads a column is a column
+    /// this term reads.
+    LikeExpr(Box<RawExpr>, Box<RawExpr>, Option<char>, bool),
+    StartingExpr(Box<RawExpr>, Box<RawExpr>, bool),
+    ContainingExpr(Box<RawExpr>, Box<RawExpr>, bool),
     /// `<expr> IS [NOT] UNKNOWN` - the NULL test, but with the engine's
     /// BOOLEAN-ONLY operand rule (`ID IS UNKNOWN` refuses at prepare
     /// where `ID IS NULL` answers), so it cannot desugar to IsNull at
@@ -65379,19 +65450,29 @@ fn parse_raw_cond(b: &[char], pos: &mut usize) -> Option<RawCond> {
         let mut after = p2;
         if take_keyword(b, &mut after, "LIKE") {
             skip_ws(b, &mut after);
-            if b.get(after) != Some(&'\'') {
-                return None; // only a literal pattern
-            }
-            after += 1;
-            let start = after;
-            while after < b.len() && b[after] != '\'' {
+            // LITERAL FIRST, EXPRESSION SECOND - the same shape the token
+            // grammar uses. A quote opens a literal; anything else is parsed
+            // as an expression by [expr_add], the very entry point `left`
+            // above used, which reaches [expr_concat] and so takes
+            // `V || '%'`. It stops at the first character it cannot consume,
+            // which is how a trailing ESCAPE still parses below.
+            let mut pat_expr: Option<RawExpr> = None;
+            let pattern: String = if b.get(after) == Some(&'\'') {
                 after += 1;
-            }
-            if after >= b.len() {
-                return None;
-            }
-            let pattern: String = b[start..after].iter().collect();
-            after += 1;
+                let start = after;
+                while after < b.len() && b[after] != '\'' {
+                    after += 1;
+                }
+                if after >= b.len() {
+                    return None;
+                }
+                let p: String = b[start..after].iter().collect();
+                after += 1;
+                p
+            } else {
+                pat_expr = Some(expr_add(b, &mut after)?);
+                String::new()
+            };
             let mut esc = None;
             let mut probe = after;
             if take_keyword(b, &mut probe, "ESCAPE") {
@@ -65410,7 +65491,10 @@ fn parse_raw_cond(b: &[char], pos: &mut usize) -> Option<RawCond> {
                 after = probe;
             }
             *pos = after;
-            return Some(RawCond::Like(Box::new(left), pattern, esc, negated));
+            return Some(match pat_expr {
+                Some(p) => RawCond::LikeExpr(Box::new(left), Box::new(p), esc, negated),
+                None => RawCond::Like(Box::new(left), pattern, esc, negated),
+            });
         }
         // ...and the three predicates that were not also VALUES here.
         // Each lexes its keyword as an identifier (all three are legal
@@ -65423,15 +65507,38 @@ fn parse_raw_cond(b: &[char], pos: &mut usize) -> Option<RawCond> {
             if take_keyword(b, &mut probe, "WITH") {
                 after = probe; // WITH is optional sugar
             }
-            let prefix = read_quoted(b, &mut after)?;
-            *pos = after;
-            return Some(RawCond::Starting(Box::new(left), prefix, negated));
+            // literal first, else an expression - see the LIKE arm above.
+            // [read_quoted] answers None for anything that is not a quoted
+            // literal, which is exactly the rewind signal.
+            let save = after;
+            return Some(match read_quoted(b, &mut after) {
+                Some(prefix) => {
+                    *pos = after;
+                    RawCond::Starting(Box::new(left), prefix, negated)
+                }
+                None => {
+                    after = save;
+                    let p = expr_add(b, &mut after)?;
+                    *pos = after;
+                    RawCond::StartingExpr(Box::new(left), Box::new(p), negated)
+                }
+            });
         }
         let mut after = p2;
         if take_keyword(b, &mut after, "CONTAINING") {
-            let pattern = read_quoted(b, &mut after)?;
-            *pos = after;
-            return Some(RawCond::Containing(Box::new(left), pattern, negated));
+            let save = after;
+            return Some(match read_quoted(b, &mut after) {
+                Some(pattern) => {
+                    *pos = after;
+                    RawCond::Containing(Box::new(left), pattern, negated)
+                }
+                None => {
+                    after = save;
+                    let p = expr_add(b, &mut after)?;
+                    *pos = after;
+                    RawCond::ContainingExpr(Box::new(left), Box::new(p), negated)
+                }
+            });
         }
         let mut after = p2;
         if take_keyword(b, &mut after, "SIMILAR") {
@@ -65657,6 +65764,16 @@ fn renumber_cond_params(c: &mut RawCond, next: &mut usize) {
         | RawCond::Starting(a, _, _)
         | RawCond::Containing(a, _, _)
         | RawCond::Similar(a, _, _, _) => renumber_raw_params(a, next),
+        // BOTH sides, IN SOURCE ORDER. Renumbering the operand and not the
+        // pattern would leave a `?` in the pattern holding a stale slot -
+        // it would then bind the WRONG argument, a wrong answer rather
+        // than a refusal, and the order matters as much as the coverage.
+        RawCond::LikeExpr(a, p, _, _)
+        | RawCond::StartingExpr(a, p, _)
+        | RawCond::ContainingExpr(a, p, _) => {
+            renumber_raw_params(a, next);
+            renumber_raw_params(p, next);
+        }
         RawCond::Not(inner) => renumber_cond_params(inner, next),
         RawCond::And(v) | RawCond::Or(v) => {
             for x in v {
@@ -66684,6 +66801,11 @@ fn raw_cond_bad_substring_len(c: &RawCond) -> Option<i64> {
         | RawCond::Starting(x, ..)
         | RawCond::Containing(x, ..)
         | RawCond::Similar(x, ..) => raw_bad_substring_len(x),
+        RawCond::LikeExpr(x, p, ..)
+        | RawCond::StartingExpr(x, p, ..)
+        | RawCond::ContainingExpr(x, p, ..) => {
+            raw_bad_substring_len(x).or_else(|| raw_bad_substring_len(p))
+        }
         RawCond::Not(inner) => raw_cond_bad_substring_len(inner),
         RawCond::And(parts) | RawCond::Or(parts) => {
             parts.iter().find_map(raw_cond_bad_substring_len)
@@ -67505,6 +67627,94 @@ fn resolve_raw_cond(
                 Term::ExprLike(x, p, esc, n) => Cond2::Like(x, p, esc, n),
                 _ => return None, // containing_term builds only that shape
             }
+        }
+        // THE THREE PER-ROW PATTERN FORMS, with the SAME refusal boundaries
+        // the predicate world draws - a `?` inside the pattern, a
+        // carrier/real mix between the two sides, and (for LIKE) a
+        // collate-canonical left side. Keeping the two worlds' boundaries
+        // identical is what makes the remaining gap one sentence long.
+        RawCond::LikeExpr(a, pat, esc, negated) => {
+            let e = resolve_expr(a, columns, descs)?;
+            if raw_has_param(pat) {
+                return None;
+            }
+            if collate_canon_of(&e).is_some() {
+                return None;
+            }
+            let p = resolve_expr(pat, columns, descs)?;
+            if let (Some(x), Some(y)) =
+                (cmp_text_charset(&e, descs), cmp_text_charset(&p, descs))
+            {
+                if fire_crab_ods::intl::byte_carrier(x)
+                    != fire_crab_ods::intl::byte_carrier(y)
+                {
+                    return None;
+                }
+            }
+            Cond2::LikeExpr(Box::new(e), Box::new(p), *esc, *negated)
+        }
+        RawCond::StartingExpr(a, pre, negated) => {
+            let e = resolve_expr(a, columns, descs)?;
+            if raw_has_param(pre) {
+                return None;
+            }
+            if !matches!(e.type_of(descs)?, ExprType::Text | ExprType::Int) {
+                return None;
+            }
+            let p = resolve_expr(pre, columns, descs)?;
+            if let (Some(x), Some(y)) =
+                (cmp_text_charset(&e, descs), cmp_text_charset(&p, descs))
+            {
+                if fire_crab_ods::intl::byte_carrier(x)
+                    != fire_crab_ods::intl::byte_carrier(y)
+                {
+                    return None;
+                }
+            }
+            // [starting_canon]'s decision, with the prefix's half deferred:
+            // a canonicalising collation wraps the value and canonicalises
+            // the prefix per row; a declared collation with NO canonical
+            // form would compare bytes and is refused, exactly as there.
+            let (value, tt) = collate_operand_ttype(e, descs)?;
+            match fire_crab_ods::coll::icu_strength_of_ttype(tt) {
+                Some(_) => Cond2::StartingExpr(
+                    Box::new(Expr::CollCanon(Box::new(value), tt, false)),
+                    Box::new(p),
+                    Some(tt),
+                    *negated,
+                ),
+                None if fire_crab_ods::intl::collation_id(tt as i16) != 0 => return None,
+                None => Cond2::StartingExpr(Box::new(value), Box::new(p), None, *negated),
+            }
+        }
+        RawCond::ContainingExpr(a, pat, negated) => {
+            let e = resolve_expr(a, columns, descs)?;
+            if raw_has_param(pat) {
+                return None;
+            }
+            if !matches!(e.type_of(descs)?, ExprType::Text | ExprType::Int) {
+                return None;
+            }
+            let p = resolve_expr(pat, columns, descs)?;
+            if let (Some(x), Some(y)) =
+                (cmp_text_charset(&e, descs), cmp_text_charset(&p, descs))
+            {
+                if fire_crab_ods::intl::byte_carrier(x)
+                    != fire_crab_ods::intl::byte_carrier(y)
+                {
+                    return None;
+                }
+            }
+            // the literal arm desugars into a `Cond2::Like` through
+            // [containing_term] at prepare; this one CANNOT, because every
+            // step of that rewrite depends on the row's pattern
+            let (value, tt) = collate_operand_ttype(e, descs)?;
+            Cond2::ContainingExpr(
+                Box::new(Expr::CollCanon(Box::new(value), tt, true)),
+                Box::new(p),
+                tt,
+                *negated,
+            )
         }
         RawCond::Similar(a, pat, esc, negated) => {
             let e = resolve_expr(a, columns, descs)?;
@@ -69152,6 +69362,23 @@ enum Cond2 {
     /// [Term::ExprSimilar] - the pattern is compiled at prepare, so no
     /// per-row raise.
     Similar(Box<Expr>, SimRe, bool),
+    /// `<expr> [NOT] LIKE <expr> [ESCAPE c]` as a VALUE - the pattern
+    /// evaluated per row, mirroring [Term::ExprLikeExpr] exactly. NULL on
+    /// EITHER side is UNKNOWN, and the escape is validated per row because
+    /// that is where the literal arm above validates it.
+    LikeExpr(Box<Expr>, Box<Expr>, Option<char>, bool),
+    /// `<x> [NOT] STARTING WITH <expr>` as a VALUE, mirroring
+    /// [Term::ExprStartingExpr]. The `Option<u16>` is the written
+    /// collation's ttype when one decides the match: [starting_canon]
+    /// canonicalises the prefix at PREPARE, and with a per-row prefix
+    /// there is nothing to canonicalise until the row arrives.
+    StartingExpr(Box<Expr>, Box<Expr>, Option<u16>, bool),
+    /// `<x> [NOT] CONTAINING <expr>` as a VALUE, mirroring
+    /// [Term::ExprContainingExpr]. Unlike the literal form - which
+    /// desugars into a `Cond2::Like` through [containing_term] at prepare
+    /// - this cannot desugar: the pattern's upper-case, canonicalise,
+    /// escape and `%…%` wrapping all depend on the row.
+    ContainingExpr(Box<Expr>, Box<Expr>, u16, bool),
     Not(Box<Cond2>),
     And(Vec<Cond2>),
     Or(Vec<Cond2>),
@@ -69191,6 +69418,62 @@ impl Cond2 {
                 Value::Null => None,
                 v => Some(sim_match(re, &v.render()) != *negated),
             },
+            // THE THREE PER-ROW PATTERN FORMS. Each mirrors its `Term`
+            // twin arm for arm, deliberately written in the same order and
+            // the same shape so the two worlds cannot drift apart silently.
+            Cond2::LikeExpr(a, pat, esc, negated) => {
+                match (a.eval(values)?, pat.eval(values)?) {
+                    (Value::Null, _) | (_, Value::Null) => None,
+                    (v, p) => {
+                        let pattern = p.render();
+                        if invalid_escape(&pattern, *esc) {
+                            return Err(EvalErr::InvalidEscape);
+                        }
+                        Some(like_match(&v.render(), &pattern, *esc) != *negated)
+                    }
+                }
+            }
+            Cond2::StartingExpr(a, pre, tt, negated) => {
+                match (a.eval(values)?, pre.eval(values)?) {
+                    (Value::Null, _) | (_, Value::Null) => None,
+                    (v, p) => {
+                        let prefix = match tt
+                            .and_then(fire_crab_ods::coll::icu_strength_of_ttype)
+                        {
+                            Some(st) => fire_crab_ods::coll::icu_canonical(&p.render(), st),
+                            None => p.render(),
+                        };
+                        Some(v.render().starts_with(prefix.as_str()) != *negated)
+                    }
+                }
+            }
+            Cond2::ContainingExpr(a, pat, tt, negated) => {
+                match (a.eval(values)?, pat.eval(values)?) {
+                    (Value::Null, _) | (_, Value::Null) => None,
+                    (v, p) => {
+                        let cs = fire_crab_ods::intl::charset_id(*tt as i16);
+                        let up = upcase_cs(cs, &p.render());
+                        let canon = match fire_crab_ods::coll::icu_strength_of_ttype(*tt) {
+                            Some(st) => fire_crab_ods::coll::icu_canonical(&up, st),
+                            None => up,
+                        };
+                        let mut escaped = String::with_capacity(canon.len() + 2);
+                        for c in canon.chars() {
+                            if c == CONTAINING_ESCAPE || c == '%' || c == '_' {
+                                escaped.push(CONTAINING_ESCAPE);
+                            }
+                            escaped.push(c);
+                        }
+                        Some(
+                            like_match(
+                                &v.render(),
+                                &format!("%{escaped}%"),
+                                Some(CONTAINING_ESCAPE),
+                            ) != *negated,
+                        )
+                    }
+                }
+            }
             Cond2::Not(c) => c.eval(values)?.map(|b| !b),
             Cond2::And(parts) => {
                 let mut unknown = false;
@@ -76547,6 +76830,14 @@ fn expr_has_corr(e: &Expr) -> bool {
             | Cond2::Like(a, ..)
             | Cond2::Starting(a, ..)
             | Cond2::Similar(a, ..) => expr_has_corr(a),
+            // BOTH sides, and this one is the sharper of the two: a PATTERN
+            // that reads an outer column makes the whole condition
+            // correlated, and answering `false` here would let it be
+            // evaluated once instead of per outer row - a wrong answer.
+            // Silent site: this match ends in a catch-all.
+            Cond2::LikeExpr(a, p, ..)
+            | Cond2::StartingExpr(a, p, ..)
+            | Cond2::ContainingExpr(a, p, ..) => expr_has_corr(a) || expr_has_corr(p),
             Cond2::Not(inner) => cond(inner),
             Cond2::And(parts) | Cond2::Or(parts) => parts.iter().any(cond),
         }
@@ -92661,6 +92952,14 @@ fn resolve_expr_term(
             Cond2::Like(a, ..) | Cond2::Starting(a, ..) | Cond2::Similar(a, ..) => {
                 a.type_of(descs)?;
             }
+            // BOTH sides must type. Silent site: this match ends in a
+            // catch-all, so a new variant would simply skip the check.
+            Cond2::LikeExpr(a, p, ..)
+            | Cond2::StartingExpr(a, p, ..)
+            | Cond2::ContainingExpr(a, p, ..) => {
+                a.type_of(descs)?;
+                p.type_of(descs)?;
+            }
             Cond2::Not(inner) => cond_types(inner, descs)?,
             Cond2::And(parts) | Cond2::Or(parts) => {
                 for p in parts {
@@ -93320,6 +93619,14 @@ fn cond_no_raise(c: &Cond2, descs: &[Descriptor]) -> bool {
         | Cond2::Starting(a, ..)
         // a SIMILAR pattern is compiled at PREPARE, so no per-row raise
         | Cond2::Similar(a, ..) => expr_no_raise(a, descs),
+        // both sides must be raise-free for the condition to be
+        // (an ESCAPE validated per row is the operand's business, as it is
+        // for the literal arm above)
+        Cond2::LikeExpr(a, p, ..)
+        | Cond2::StartingExpr(a, p, ..)
+        | Cond2::ContainingExpr(a, p, ..) => {
+            expr_no_raise(a, descs) && expr_no_raise(p, descs)
+        }
         Cond2::Not(inner) => cond_no_raise(inner, descs),
         Cond2::And(parts) | Cond2::Or(parts) => {
             parts.iter().all(|p| cond_no_raise(p, descs))
