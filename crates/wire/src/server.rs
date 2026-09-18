@@ -91955,10 +91955,36 @@ fn resolve_expr_term(
             // answers None for a blob, so [adopt_carrier_literal] never
             // sees it, which is why `B CONTAINING 'é'` found nothing
             // while the VARCHAR form already agreed.
+            // BOTH DIRECTIONS, which is the same call. This guard used to
+            // read `byte_carrier(att) && !byte_carrier(cs)` - a carrier
+            // ATTACHMENT meeting a real operand - and so did nothing for
+            // the MIRROR: a real attachment meeting a byte-carrier
+            // operand. There the real needle stayed real, and
+            // [containing_term] then upper-cased it in CARRIER space and
+            // matched it against the column's carrier characters, so
+            // `N CONTAINING 'e-acute'` under a UTF8 attachment found
+            // NOTHING where the engine answers 1 - a qualifying row
+            // silently dropped.
+            //
+            // `transcode_text(att, cs, ..)` already goes from the
+            // LITERAL's charset (the attachment's) to the OPERAND's
+            // whichever way round they are, so the fix is the condition,
+            // not the conversion: exactly [cmp_sides]' own test,
+            // `byte_carrier(a) != byte_carrier(b)`. Measured: this is the
+            // THIRD place one defect appears - comparisons were already
+            // operand-keyed, the function path was fixed in the slice
+            // before this ([carrier_fn_operands]), and this arm was the
+            // last one still gated on the attachment.
+            //
+            // LIKE, STARTING WITH and equality are untouched: they build
+            // their own terms and never reach this arm. That matters -
+            // re-keying the SHARED literal path is what turned a correct
+            // `nn LIKE '%e-acute%'` into a wrong answer in a withdrawn
+            // attempt, and this arm is CONTAINING's alone.
             let att = CURRENT_ATT_CS.with(|c| c.get());
             let cs = fire_crab_ods::intl::charset_id(tt as i16);
             let redone = if fire_crab_ods::intl::byte_carrier(att)
-                && !fire_crab_ods::intl::byte_carrier(cs)
+                != fire_crab_ods::intl::byte_carrier(cs)
             {
                 transcode_text(att, cs, p.clone()).unwrap_or_else(|_| p.clone())
             } else {
@@ -93065,7 +93091,42 @@ fn param_or_typed_term(
         let canonical_known =
             coll == 0 || fire_crab_ods::coll::icu_strength_of_ttype(tt).is_some();
         if canonical_known && matches!(kind, ColKind::Text | ColKind::Int) {
-            return Some(containing_term(Expr::Col(idx), tt, p, *negated));
+            // THE MIRROR, for a plain COLUMN. [adopt_carrier_literal]
+            // above handles one direction only - a carrier ATTACHMENT
+            // against a real column - and returns the pattern untouched
+            // when the column is the carrier (its own guard, 93005). So
+            // without this the REAL needle stays real, [containing_term]
+            // upper-cases it in CARRIER space, and it matches nothing:
+            // `N CONTAINING 'e-acute'` under a UTF8 attachment found
+            // NOTHING where the engine answers 1 - a qualifying row
+            // silently dropped.
+            //
+            // CONFINED TO CONTAINING'S OWN ARM ON PURPOSE. The shared
+            // [adopt_carrier_literal] also feeds Cmp, STARTING WITH,
+            // SIMILAR TO and LIKE; re-keying it is exactly what turned a
+            // correct `nn LIKE '%e-acute%'` into a wrong answer in a
+            // withdrawn attempt, and those four are measured AGREEING in
+            // this shape today. The expression arm of the same predicate
+            // took the same narrow fix.
+            //
+            // A NEGATIVE sub_type is attachment-charset text, not a
+            // carrier, so it resolves to `att` and the guard declines -
+            // which keeps a wrapped literal (a derived table's or CTE's
+            // column, [ATT_SUBTYPE]) out of carrier space.
+            let att = CURRENT_ATT_CS.with(|c| c.get());
+            let col_cs = if d.sub_type >= 0 {
+                fire_crab_ods::intl::charset_id(d.sub_type as i16)
+            } else {
+                att
+            };
+            let pat = if !fire_crab_ods::intl::byte_carrier(att)
+                && fire_crab_ods::intl::byte_carrier(col_cs)
+            {
+                transcode_text(att, col_cs, p.clone()).unwrap_or_else(|_| p.clone())
+            } else {
+                p.clone()
+            };
+            return Some(containing_term(Expr::Col(idx), tt, &pat, *negated));
         }
         return None;
     }

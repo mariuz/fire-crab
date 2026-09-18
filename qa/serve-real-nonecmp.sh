@@ -191,17 +191,21 @@ agree "POSITION('é' IN nn) @UTF8"      "select position('é' in nn) n from t wh
 agree "POSITION(nn IN 'xcafé') @UTF8"  "select position(nn in 'xcafé') n from t where id=1;" UTF8
 agree "REPLACE(nn,'é','e') @UTF8"      "select octet_length(replace(nn,'é','e')) n from t where id=1;" UTF8
 agree "TRIM(TRAILING 'é' FROM nn)@UTF8" "select octet_length(trim(trailing 'é' from nn)) n from t where id=1;" UTF8
-# STILL RECORDED, and NOT an oversight: CONTAINING is built by
-# [containing_term] into a `Term::ExprLike` - the shared PREDICATE path,
-# not the function path. An earlier attempt re-keyed that shared path and
-# turned the CORRECT `nn LIKE '%é%'` below into a wrong answer, so this
-# slice deliberately leaves it alone. Measured on this binary: engine 1,
-# this server 0.
-differs "nn CONTAINING 'é' @UTF8"        "select count(*) n from t where nn containing 'é';" UTF8
+# FIXED 2026-09-18 and promoted from `differs`. CONTAINING reaches
+# [containing_term] by TWO routes - a plain COLUMN through
+# [param_or_typed_term]'s fast path, an expression (an OCTETS CAST, a
+# blob) through the expression arm - and BOTH were gated on the
+# ATTACHMENT being a byte carrier, so neither reconciled the MIRROR (a
+# real attachment meeting a carrier column). Each arm now takes the same
+# symmetric step. The shared [adopt_carrier_literal] is NOT re-keyed:
+# it also feeds Cmp, STARTING WITH, SIMILAR TO and LIKE, and re-keying it
+# is what turned the CORRECT `nn LIKE '%é%'` below into a wrong answer in
+# a withdrawn attempt - which is why that cell sits here as a control.
+agree "nn CONTAINING 'é' @UTF8"        "select count(*) n from t where nn containing 'é';" UTF8
 agree "nn LIKE '%é%' @UTF8"            "select count(*) n from t where nn like '%é%';" UTF8
 echo "--  an OCTETS operand is the same carrier case --"
 agree "POSITION('é' IN octets) @UTF8"  "select position('é' in cast(u as varchar(20) character set octets)) n from t where id=1;" UTF8
-differs "octets CONTAINING 'é' @UTF8"    "select count(*) n from t where cast(u as varchar(20) character set octets) containing 'é';" UTF8
+agree "octets CONTAINING 'é' @UTF8"    "select count(*) n from t where cast(u as varchar(20) character set octets) containing 'é';" UTF8
 agree "REPLACE(octets,'é','e') @UTF8"  "select octet_length(replace(cast(u as varchar(20) character set octets),'é','e')) n from t where id=1;" UTF8
 agree "POSITION('é' IN padded) @UTF8"  "select position('é' in cast(u as char(8) character set octets)) n from t where id=1;" UTF8
 echo "--  COLUMN vs COLUMN: no literal exists to rewrite, so the literal --"
@@ -224,6 +228,37 @@ agree "nn CONTAINING 'é' @NONE"        "select count(*) n from t where nn conta
 agree "POSITION('é' IN u) @UTF8 ctl"   "select position('é' in u) n from t where id=1;" UTF8
 agree "POSITION('f' IN nn) ascii ctl"  "select position('f' in nn) n from t where id=1;" UTF8
 agree "TRIM(TRAILING 'é' FROM padded)" "select octet_length(trim(trailing 'é' from cast(u as char(8) character set octets))) n from t where id=1;" UTF8
+echo "-- A TABLED SINGLE-BYTE ATTACHMENT IS NOT UTF8: the suite's blind spot --"
+# FOUND 2026-09-18 by probing a FOURTH attachment, and ungated anywhere
+# until now: of this gate's attachment-qualified cells, all but two were
+# @UTF8, and those two test a WIN1252 COLUMN rather than a carrier column
+# under a tabled attachment. Over a byte-carrier column under WIN1252 or
+# ISO8859_1, LIKE and STARTING WITH answer 0 where the engine answers 1 -
+# a qualifying row silently dropped, the same class as the CONTAINING
+# defect above. Measured IDENTICAL on `302c4d1`, so it is pre-existing and
+# not the carrier-mirror slice's doing; its own chunk, recorded here so it
+# cannot rot. CONTAINING under those attachments was ALREADY right on the
+# previous binary (only @UTF8 was wrong) and stays right - kept as `agree`
+# so a future fix cannot quietly break it.
+differs "nn LIKE '%é%' @WIN1252"        "select count(*) n from t where nn like '%é%';" WIN1252
+differs "nn LIKE '%é%' @ISO8859_1"      "select count(*) n from t where nn like '%é%';" ISO8859_1
+differs "nn STARTING 'café' @WIN1252"   "select count(*) n from t where nn starting with 'café';" WIN1252
+differs "nn STARTING 'café' @ISO8859_1" "select count(*) n from t where nn starting with 'café';" ISO8859_1
+agree "nn CONTAINING 'é' @WIN1252"      "select count(*) n from t where nn containing 'é';" WIN1252
+agree "nn CONTAINING 'é' @ISO8859_1"    "select count(*) n from t where nn containing 'é';" ISO8859_1
+
+echo "-- a WRAPPED LITERAL column: RECORDED, pre-existing, NOT this law --"
+echo "--  CONTAINING over a derived/CTE LITERAL column refuses at PLAN --"
+echo "--  time, for an ASCII needle too, and identically on the previous --"
+echo "--  binary - so it is not the byte-space law and not this slice's  --"
+echo "--  doing. The derived REAL column beside it answers, which is what --"
+echo "--  pins the refusal to the wrapped literal rather than to derived  --"
+echo "--  tables; and the same literal under LIKE answers on both.        --"
+refuses "derived literal CONTAINING"     "select count(*) n from (select 'café' as c from t where id=1) z where z.c containing 'é';"
+refuses "CTE literal CONTAINING"         "with q as (select 'café' as c from t where id=1) select count(*) n from q where q.c containing 'é';"
+agree "derived REAL column CONTAINING"   "select count(*) n from (select u as c from t where id=1) z where z.c containing 'é';"
+agree "derived literal LIKE (control)"   "select count(*) n from (select 'café' as c from t where id=1) z where z.c like '%caf%';"
+
 echo "-- a TEXT BLOB is the same law by a DIFFERENT route: col_kind is None --"
 echo "--  for a blob, so the literal fast path never sees it --"
 agree "b CONTAINING 'é'"              "select count(*) n from t where b containing 'é';"
@@ -260,8 +295,8 @@ echo "ran $ran checks"
 # derived from the invocations, not guessed: agree + differs + malformed
 # + refuses. A block that stops being read trips this instead of passing
 # quietly over fewer cells.
-if [ "$ran" -lt 86 ]; then
-    echo "FAIL only $ran checks ran (expected at least 86) - did a block silently skip?"
+if [ "$ran" -lt 96 ]; then
+    echo "FAIL only $ran checks ran (expected at least 96) - did a block silently skip?"
     fail=1
 fi
 [ $fail = 0 ] && echo "PASS nonecmp" || echo "FAIL nonecmp"
