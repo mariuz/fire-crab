@@ -133,6 +133,24 @@ differs() { # <label> <sql> [client-charset]
 # nothing and scores DIFF, not OK - and it goes red the day fire-crab
 # answers, which is the signal to promote it to `agree` with the engine's
 # own value rather than to delete it.
+# THE ENGINE RAISES AND THIS SERVER ANSWERS - recorded, not asserted.
+# `sig` collapses every failure to REFUSE, so `differs` would score this
+# cell VACUOUS; it needs its own helper. It fails if they CONVERGE (we
+# start raising too - promote it), and it fails if the ENGINE stops
+# raising, which would mean the law itself moved.
+eng_raises() { # <label> <sql> [client-charset]
+    ran=$((ran + 1))
+    local e f
+    e=$(sig "127.0.0.1/3050:$ENG" x "$2" "${3:-}"); f=$(sig "127.0.0.1/$PORT:$FC" x "$2" "${3:-}")
+    if [ "$e" != REFUSE ]; then
+        echo "FAIL $1: the ENGINE no longer raises [$e] - re-measure, the law moved"; fail=1
+    elif [ "$f" = REFUSE ]; then
+        echo "FAIL $1: this server raises now too - promote this cell to agree"; fail=1
+    else
+        echo "OK   engine raises, here answers [$f] (recorded gap): $1"
+    fi
+}
+
 refuses() { # <label> <sql> [client-charset]
     ran=$((ran + 1))
     local e f
@@ -275,9 +293,60 @@ agree "nn = 'café' @UTF8"             "select count(*) n from t where nn = 'caf
 # where the carrier lift above never runs at all, so it is not this law.
 # Its UTF8 twin agrees, which is the contrast that pins it. Measured
 # unchanged across this slice's own before/after runs.
-differs "octets STARTING 'café' @NONE"    "select count(*) n from t where cast(u as varchar(20) character set octets) starting with 'café';"
-differs "octets STARTING 'café' @WIN1252" "select count(*) n from t where cast(u as varchar(20) character set octets) starting with 'café';" WIN1252
+# FIXED 2026-09-18 and promoted: the EXPRESSION path carried the same
+# lift defect as the column path, in BOTH directions at once. Its three
+# sites (LIKE, SIMILAR TO, STARTING WITH) tested `expr_is_octets` and
+# lifted with [intl::to_carrier]. `to_carrier` spells a string's UTF-8
+# BYTES, so under a TABLED attachment - where the literal is already one
+# char per byte - it lifted TWICE (OCTETS answered 0 under NONE/WIN1252/
+# ISO8859_1, 1 under UTF8); and the OCTETS-only test meant a NONE carrier
+# was never lifted AT ALL (the NONE cast answered 0 under UTF8 alone).
+# One root, two opposite symptoms. Each site now lifts through
+# [transcode_text] from the ATTACHMENT's charset, for ANY byte carrier -
+# while `octets_like_term`'s wildcard-free equality MODEL stays keyed on
+# OCTETS, because over a NONE carrier LIKE keeps its wildcards and the
+# engine matches them.
+agree "octets STARTING 'café' @NONE"    "select count(*) n from t where cast(u as varchar(20) character set octets) starting with 'café';"
+agree "octets STARTING 'café' @WIN1252" "select count(*) n from t where cast(u as varchar(20) character set octets) starting with 'café';" WIN1252
 agree "octets STARTING 'café' @UTF8"      "select count(*) n from t where cast(u as varchar(20) character set octets) starting with 'café';" UTF8
+# ...and the shapes that carried the evidence, which this gate had NONE
+# of: no LIKE-over-OCTETS cell and no SIMILAR TO cell existed at all.
+# A WILDCARD LIKE over OCTETS is 0 on BOTH servers by design (the engine's
+# matcher reads the wildcard bytes as data), so only the WILDCARD-FREE
+# form can catch a defect here - every `%...%` cell is vacuously green.
+agree "octets LIKE 'café' exact @NONE"    "select count(*) n from t where cast(u as varchar(20) character set octets) like 'café';"
+agree "octets LIKE 'café' exact @WIN1252" "select count(*) n from t where cast(u as varchar(20) character set octets) like 'café';" WIN1252
+agree "octets LIKE 'café' exact @UTF8"    "select count(*) n from t where cast(u as varchar(20) character set octets) like 'café';" UTF8
+agree "octets SIMILAR '%café%' @NONE"     "select count(*) n from t where cast(u as varchar(20) character set octets) similar to '%café%';"
+agree "octets SIMILAR '%café%' @WIN1252"  "select count(*) n from t where cast(u as varchar(20) character set octets) similar to '%café%';" WIN1252
+# the MIRROR half: a NONE carrier that is not OCTETS, which was never
+# lifted and so missed under a UTF8 attachment only
+agree "none-cast LIKE '%café%' @UTF8"     "select count(*) n from t where cast(u as varchar(20) character set none) like '%café%';" UTF8
+agree "none-cast SIMILAR '%café%' @UTF8"  "select count(*) n from t where cast(u as varchar(20) character set none) similar to '%café%';" UTF8
+agree "none-cast STARTING 'café' @UTF8"   "select count(*) n from t where cast(u as varchar(20) character set none) starting with 'café';" UTF8
+# SIMILAR TO over a NONE COLUMN under a tabled attachment: fixed by the
+# PREVIOUS slice's column-path lift and never gated - found while
+# measuring this one, and pinned here so it cannot regress unnoticed.
+agree "nn SIMILAR '%café%' @WIN1252"      "select count(*) n from t where nn similar to '%café%';" WIN1252
+# RECORDED, pre-existing, NOT this law: over a REAL (UTF8) column under a
+# TABLED attachment, a wildcard-free `LIKE '<non-ascii>'` makes the ENGINE
+# raise 22001 *string right truncation* while this server answers 0 rows.
+# Measured identical on `9bf97ca`, `34df15d` and this binary, so none of
+# the carrier slices caused it. Its neighbours do NOT raise: `LIKE
+# '%café%'`, `STARTING WITH` and `=` all answer 0 on the engine there, so
+# it is specific to the wildcard-free form. This server has no raise path
+# at all under a real attachment ([carrier_expr_like] and
+# [param_or_typed_term]'s LIKE guard are both gated on a byte-carrier
+# ATTACHMENT), which is why it answers instead.
+# NOTE the deliberate contradiction with the cell far above: `u LIKE
+# 'café'` is an `agree` cell under the DEFAULT (NONE) attachment, where
+# BOTH servers answer 1, and an `eng_raises` cell here under the two
+# TABLED attachments, where the engine raises 22001 and this server
+# answers 0. That is not an inconsistency in the gate - it is the law:
+# the engine's behaviour for one statement genuinely turns on the
+# attachment, which is the whole subject of this section.
+eng_raises "u LIKE 'café' exact @WIN1252"   "select count(*) n from t where u like 'café';" WIN1252
+eng_raises "u LIKE 'café' exact @ISO8859_1" "select count(*) n from t where u like 'café';" ISO8859_1
 
 echo "-- a WRAPPED LITERAL column: RECORDED, pre-existing, NOT this law --"
 echo "--  CONTAINING over a derived/CTE LITERAL column refuses at PLAN --"
@@ -327,8 +396,8 @@ echo "ran $ran checks"
 # derived from the invocations, not guessed: agree + differs + malformed
 # + refuses. A block that stops being read trips this instead of passing
 # quietly over fewer cells.
-if [ "$ran" -lt 102 ]; then
-    echo "FAIL only $ran checks ran (expected at least 102) - did a block silently skip?"
+if [ "$ran" -lt 113 ]; then
+    echo "FAIL only $ran checks ran (expected at least 113) - did a block silently skip?"
     fail=1
 fi
 [ $fail = 0 ] && echo "PASS nonecmp" || echo "FAIL nonecmp"

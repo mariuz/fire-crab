@@ -91803,13 +91803,34 @@ fn resolve_expr_term(
             // Escape dies the same way. What is left is a literal byte
             // match over the FULL padded value: a CHAR(4) holding
             // `61620000` matches `x'61620000'` and NOT `x'6162'`.
+            // THE LIFT AND THE MODEL ARE TWO DECISIONS, and this arm used
+            // one test for both. A TEXT pattern against a BYTE-CARRIER
+            // side is byte-copied into it (INTL_convert_bytes,
+            // intl.cpp:465) - that is the LIFT, and it applies to EVERY
+            // carrier, by the ATTACHMENT's encoding. The wildcard-free
+            // equality below is the MODEL, and it belongs to OCTETS
+            // alone: over a NONE carrier `LIKE` keeps its wildcards and
+            // the engine matches them (measured, engine 1).
+            //
+            // The old pairing was wrong in both directions.
+            // [intl::to_carrier] spells a string's UTF-8 BYTES, so under
+            // a TABLED attachment - where [stmt_text_decode] has already
+            // decoded one char per byte - it lifted TWICE; and gating on
+            // `expr_is_octets` meant a NONE carrier was never lifted at
+            // all. Measured against the engine's 1 in every cell:
+            // `<octets> LIKE 'café'` answered 0 under NONE/WIN1252/
+            // ISO8859_1 and 1 under UTF8, while the NONE cast answered 1
+            // under NONE/WIN1252 and 0 under UTF8.
+            let att = CURRENT_ATT_CS.with(|c| c.get());
+            let lifted = match cmp_text_charset(&lhs, descs) {
+                Some(cs) if fire_crab_ods::intl::byte_carrier(cs) => {
+                    transcode_text(att, cs, p.clone()).unwrap_or_else(|_| p.clone())
+                }
+                _ => p.clone(),
+            };
+            let p = &lifted;
             if expr_is_octets(&lhs, descs) {
-                // a TEXT pattern against a binary side is BYTE-COPIED
-                // into it (INTL_convert_bytes, intl.cpp:465: nothing
-                // transliterates to or from binary), so the pattern's
-                // own UTF-8 bytes are what the match sees
-                let p = fire_crab_ods::intl::to_carrier(p);
-                octets_like_term(lhs, &p, *negated)
+                octets_like_term(lhs, p, *negated)
             } else
             // a TEXT-typed side with a literal bad-escape pattern takes
             // the lenient-prefix gate exactly like a text column
@@ -91913,11 +91934,31 @@ fn resolve_expr_term(
             if !matches!(lhs.type_of(descs), Some(ExprType::Text)) {
                 return None;
             }
-            // a text pattern against a binary side is byte-copied into it
-            let p = &if expr_is_octets(&lhs, descs) {
-                fire_crab_ods::intl::to_carrier(p)
-            } else {
-                p.clone()
+            // A TEXT PATTERN AGAINST A BYTE-CARRIER SIDE IS BYTE-COPIED
+            // INTO IT - and the copy is by the ATTACHMENT's encoding, for
+            // EVERY carrier, not by UTF-8 for OCTETS alone.
+            //
+            // This read `expr_is_octets` + [intl::to_carrier], and both
+            // halves were wrong, in opposite directions. `to_carrier`
+            // re-spells a string's UTF-8 BYTES, which is right only when
+            // the literal came from UTF-8 statement text: under a TABLED
+            // attachment [stmt_text_decode] has already decoded one char
+            // per byte, so the lift ran TWICE. And `expr_is_octets` is
+            // strictly `== CS_OCTETS`, so a NONE carrier (a
+            // `CAST(.. AS .. CHARACTER SET NONE)`) was never lifted AT
+            // ALL and missed under a UTF8 attachment. Measured, engine 1
+            // in every cell: OCTETS answered 0 under NONE/WIN1252/
+            // ISO8859_1 and 1 under UTF8; the NONE cast answered 1 under
+            // NONE/WIN1252 and 0 under UTF8 - the same root seen from its
+            // two sides. [transcode_text] from the attachment's charset
+            // is the general form, and the identity when both are
+            // carriers.
+            let att = CURRENT_ATT_CS.with(|c| c.get());
+            let p = &match cmp_text_charset(&lhs, descs) {
+                Some(cs) if fire_crab_ods::intl::byte_carrier(cs) => {
+                    transcode_text(att, cs, p.clone()).unwrap_or_else(|_| p.clone())
+                }
+                _ => p.clone(),
             };
             match sim_compile(p, *escape) {
                 Some(re) => Term::ExprSimilar(Box::new(lhs), re, *negated),
@@ -92023,12 +92064,24 @@ fn resolve_expr_term(
             if !matches!(lhs.type_of(descs)?, ExprType::Text | ExprType::Int) {
                 return None;
             }
-            // a text prefix against a BINARY side is byte-copied into
-            // it, like a LIKE pattern (intl.cpp:465)
-            let p = if expr_is_octets(&lhs, descs) {
-                fire_crab_ods::intl::to_carrier(p)
-            } else {
-                p.clone()
+            // A TEXT PREFIX AGAINST A BYTE-CARRIER SIDE IS BYTE-COPIED
+            // INTO IT (intl.cpp:465) - by the ATTACHMENT's encoding, and
+            // for EVERY carrier rather than for OCTETS alone. The old
+            // `expr_is_octets` + [intl::to_carrier] pair was wrong both
+            // ways: `to_carrier` spells a string's UTF-8 BYTES, so under
+            // a TABLED attachment (where the literal is already one char
+            // per byte) it lifted TWICE; and the OCTETS-only test meant a
+            // NONE carrier was never lifted at all. Measured against the
+            // engine's 1: `<octets> STARTING WITH 'café'` answered 0
+            // under NONE/WIN1252/ISO8859_1 and 1 under UTF8, while
+            // `CAST(.. AS .. NONE) STARTING WITH 'café'` answered 1 under
+            // NONE/WIN1252 and 0 under UTF8. See the LIKE arm above.
+            let att = CURRENT_ATT_CS.with(|c| c.get());
+            let p = match cmp_text_charset(&lhs, descs) {
+                Some(cs) if fire_crab_ods::intl::byte_carrier(cs) => {
+                    transcode_text(att, cs, p.clone()).unwrap_or_else(|_| p.clone())
+                }
+                _ => p.clone(),
             };
             match collate_canon_of(&lhs) {
                 // the WRITTEN collation decides the prefix test, and it
