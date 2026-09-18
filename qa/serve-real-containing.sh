@@ -36,7 +36,12 @@ A="$D/fc-containing-crab.fdb"
 B="$D/fc-containing-engine.fdb"
 LOG="/tmp/fc-serve-containing-$PORT.log"
 mkdir -p "$D"
-fail=0; ran=0
+fail=0
+# COUNTED FLOOR: this gate already counted and PRINTED `ran`, but never
+# compared it to anything - a block that stopped being read would have left
+# it green over fewer cells with no sign. The floor is derived from a
+# measured run, never typed.
+ran=0
 make_db() { rm -f "$1"; "$ISQL" -q -b -ch UTF8 -user "$U" -pas "$P" <<EOF >/dev/null 2>&1 || return 1
 CREATE DATABASE '$1' USER '$U' PASSWORD '$P' PAGE_SIZE 8192 DEFAULT CHARACTER SET UTF8;
 COMMIT;
@@ -186,4 +191,8 @@ gf=$("$GFIX" -v -full -user "$U" -pas "$P" "$A" 2>&1)
 ran=$((ran + 1))
 if [ -z "$gf" ]; then echo "OK   gfix -v -full clean on fc's file"; else echo "DIFF gfix: $gf"; fail=1; fi
 echo "ran $ran checks"
+if [ "$ran" -lt 33 ]; then
+    echo "DIFF only $ran checks ran (expected at least 33) - did a block silently skip?"
+    fail=1
+fi
 exit $fail

@@ -35,6 +35,7 @@ B="$D/fc-intlike-engine.fdb"
 command -v node >/dev/null 2>&1 || { echo "SKIP node not found"; exit 0; }
 mkdir -p "$D"
 fail=0
+ran=0
 
 # the probe fixture: negative, multi-digit and NULL integers; scaled
 # values whose renders carry a padding zero (0.50), a sign (-1.50) and
@@ -94,6 +95,7 @@ query() { # <sql> <json args> <port> <db>
 }
 
 both() { # <label> <sql>
+    ran=$((ran + 1))
     a=$(query "$2" "[]" "$PORT" "$A")
     b=$(query "$2" "[]" "$REAL" "$B")
     if [ "$a" = "$b" ]; then
@@ -166,6 +168,7 @@ where "... and the FALSE invariant kills it" "N LIKE '1!2' ESCAPE '!' AND 1 = 0"
 # with no literal prefix (leading % or _) reaches every non-NULL row;
 # NOT LIKE and a non-text side ('N LIKE' above) raise ungated.
 raises() { # <label> <predicate>
+    ran=$((ran + 1))
     a=$(query "SELECT ID FROM T WHERE $2 ORDER BY ID" "[]" "$PORT" "$A")
     b=$(query "SELECT ID FROM T WHERE $2 ORDER BY ID" "[]" "$REAL" "$B")
     case "$a:$b" in
@@ -187,4 +190,14 @@ both   "HAVING gates the same" "SELECT NAME FROM T GROUP BY NAME HAVING NAME LIK
 both   "a 0-row DELETE succeeds, no raise" "DELETE FROM T WHERE NAME LIKE 'zz!a' ESCAPE '!'"
 
 rm -f "$A" "$B"
+echo "ran $ran checks"
+# COUNTED FLOOR, derived from a measured run (this gate reported 39
+# checks green) - never typed. Without it a block that stops being read
+# leaves the gate green over fewer cells with no sign at all: measured
+# twice today, once catching two cells that a helper defined below its
+# first call had silently disabled.
+if [ "$ran" -lt 39 ]; then
+    echo "DIFF only $ran checks ran (expected at least 39) - did a block silently skip?"
+    fail=1
+fi
 exit $fail

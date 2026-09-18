@@ -46,6 +46,7 @@ B="$D/fc-starting-engine.fdb"
 command -v node >/dev/null 2>&1 || { echo "SKIP node not found"; exit 0; }
 mkdir -p "$D"
 fail=0
+ran=0
 
 # CHAR beside VARCHAR so padding can disagree; a NULL row for the 3VL
 # cases; an empty string; a VARCHAR value with its own trailing blank;
@@ -116,6 +117,7 @@ query() { # <sql> <json args> <port> <db>
 }
 
 both() { # <label> <sql> [json args]
+    ran=$((ran + 1))
     args="${3:-[]}"
     a=$(query "$2" "$args" "$PORT" "$A")
     a2=$(query "$2" "$args" "$PORT2" "$A")
@@ -218,4 +220,14 @@ case "$a:$b" in
 esac
 
 rm -f "$A" "$B"
+echo "ran $ran checks"
+# COUNTED FLOOR, derived from a measured run (this gate reported 32
+# checks green) - never typed. Without it a block that stops being read
+# leaves the gate green over fewer cells with no sign at all: measured
+# twice today, once catching two cells that a helper defined below its
+# first call had silently disabled.
+if [ "$ran" -lt 32 ]; then
+    echo "DIFF only $ran checks ran (expected at least 32) - did a block silently skip?"
+    fail=1
+fi
 exit $fail

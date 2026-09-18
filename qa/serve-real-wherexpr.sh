@@ -71,7 +71,9 @@ kill -0 $srv 2>/dev/null || {
 }
 
 fail=0
+ran=0
 same() { # <label> <sql>
+    ran=$((ran + 1))
     fc=$(printf 'SET HEADING OFF;\n%s;\n' "$2" |
          "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$DB" 2>&1 | tr -s ' \n' ' ')
     en=$(printf 'SET HEADING OFF;\n%s;\n' "$2" |
@@ -116,6 +118,7 @@ same "column length goes negative"  "SELECT ID FROM T WHERE LEFT(S, A - 100) = '
 # the 22018 additionally lacks the offending-string argument (the
 # standing named difference)
 sqlstate() { # <label> <sql> <state>
+    ran=$((ran + 1))
     out=$(printf 'SET HEADING OFF;\n%s;\n' "$2" |
           "$ISQL" -q -user "$U" -pas "$P" "127.0.0.1/$PORT:$DB" 2>&1 | tr -s ' \n' ' ')
     case "$out" in
@@ -183,4 +186,14 @@ case "$v" in
     *) echo "DIFF the raising row gave [$v], want a 22012"; fail=1 ;;
 esac
 
+echo "ran $ran checks"
+# COUNTED FLOOR, derived from a measured run (this gate reported 42
+# checks green) - never typed. Without it a block that stops being read
+# leaves the gate green over fewer cells with no sign at all: measured
+# twice today, once catching two cells that a helper defined below its
+# first call had silently disabled.
+if [ "$ran" -lt 42 ]; then
+    echo "DIFF only $ran checks ran (expected at least 42) - did a block silently skip?"
+    fail=1
+fi
 exit $fail

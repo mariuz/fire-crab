@@ -59,6 +59,7 @@ B="$D/fc-pshape-engine.fdb"
 command -v node >/dev/null 2>&1 || { echo "SKIP node not found"; exit 0; }
 mkdir -p "$D"
 fail=0
+ran=0
 
 make_db() {
     rm -f "$1"
@@ -123,6 +124,7 @@ query() { # <sql> <json args> <port> <db>
 # the same comparison over a WHOLE statement, for shapes that are not a
 # WHERE clause over T (a procedure call in the FROM, say)
 bothq() { # <label> <full sql> <json args>
+    ran=$((ran + 1))
     local a b
     a=$(query "$2" "$3" "$PORT" "$A")
     b=$(query "$2" "$3" "$REAL" "$B")
@@ -137,6 +139,7 @@ bothq() { # <label> <full sql> <json args>
 }
 
 both() { # <label> <predicate> <json args>
+    ran=$((ran + 1))
     q="SELECT ID FROM T WHERE $2 ORDER BY ID"
     a=$(query "$q" "$3" "$PORT" "$A")
     b=$(query "$q" "$3" "$REAL" "$B")
@@ -546,4 +549,14 @@ for pair in "? BETWEEN ? AND ?|[1,1,3]" "? = ?|[1,1]"; do
 done
 
 rm -f "$A" "$B"
+echo "ran $ran checks"
+# COUNTED FLOOR, derived from a measured run (this gate reported 152
+# checks green) - never typed. Without it a block that stops being read
+# leaves the gate green over fewer cells with no sign at all: measured
+# twice today, once catching two cells that a helper defined below its
+# first call had silently disabled.
+if [ "$ran" -lt 152 ]; then
+    echo "DIFF only $ran checks ran (expected at least 152) - did a block silently skip?"
+    fail=1
+fi
 exit $fail

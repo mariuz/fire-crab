@@ -30,7 +30,12 @@ PORT="${1:-4768}"
 REAL="${FC_REAL_PORT:-3050}"
 U="${ISC_USER:-SYSDBA}"; P="${ISC_PASSWORD:-masterkey}"
 D=/tmp/fbhandson
-fail=0; ran=0
+fail=0
+# COUNTED FLOOR: this gate already counted and PRINTED `ran`, but never
+# compared it to anything - a block that stopped being read would have left
+# it green over fewer cells with no sign. The floor is derived from a
+# measured run, never typed.
+ran=0
 mkdir -p "$D"
 if ! command -v node >/dev/null 2>&1 || ! node -e 'require("node-firebird")' >/dev/null 2>&1; then
     echo "SKIP: node-firebird not available"; exit 0
@@ -159,4 +164,8 @@ both  "...either order, since the term reads a row" \
       "S SIMILAR TO '[' AND 1 = 0"
 
 echo "ran $ran checks"
+if [ "$ran" -lt 40 ]; then
+    echo "DIFF only $ran checks ran (expected at least 40) - did a block silently skip?"
+    fail=1
+fi
 exit $fail
