@@ -68641,40 +68641,12 @@ fn resolve_dest_param_expr(
     if !raw_has_param(raw) {
         return resolve_expr(raw, columns, descs);
     }
-    /// A parameter this position leaves UNTYPED. A CAST types its own
-    /// operand and a nested COALESCE types its arguments from its own
-    /// siblings, so a parameter under either is known by the time the
-    /// arithmetic above it is made; anything else this walk does not
-    /// understand counts as untyped, which refuses.
-    fn untyped_param(e: &RawExpr) -> bool {
-        match e {
-            RawExpr::Param(_) => true,
-            RawExpr::Cast(_, _) | RawExpr::Coalesce(_) => false,
-            RawExpr::Neg(a) => untyped_param(a),
-            RawExpr::Bin(a, _, b) | RawExpr::Concat(a, b) | RawExpr::NullIf(a, b) => {
-                untyped_param(a) || untyped_param(b)
-            }
-            _ => raw_has_param(e),
-        }
-    }
-    /// Does this COALESCE argument MULTIPLY, DIVIDE or NEGATE a
-    /// parameter the node cannot type? The engine raises there rather
-    /// than answering - see the Coalesce arm below for the measurement.
-    fn coalesce_arg_raises(a: &RawExpr) -> bool {
-        match a {
-            RawExpr::Bin(l, op, r) => {
-                (matches!(op, ArithOp::Mul | ArithOp::Div)
-                    && (untyped_param(l) || untyped_param(r)))
-                    || coalesce_arg_raises(l)
-                    || coalesce_arg_raises(r)
-            }
-            RawExpr::Neg(x) => untyped_param(x) || coalesce_arg_raises(x),
-            RawExpr::Concat(l, r) | RawExpr::NullIf(l, r) => {
-                coalesce_arg_raises(l) || coalesce_arg_raises(r)
-            }
-            _ => false,
-        }
-    }
+    // [untyped_param] and [coalesce_arg_raises] lived HERE, nested, until
+    // the PROJECTION router needed the same guard. A nested `fn` is
+    // scoped to its enclosing body, so [resolve_proj_expr] could not see
+    // it - E0425, caught by the compiler rather than by a gate. They are
+    // module-level below; they capture nothing, taking `&RawExpr` and
+    // returning bool, so lifting them changes no behaviour here.
     fn set(sink: &mut Vec<Option<Descriptor>>, i: usize, d: Descriptor) {
         if sink.len() <= i {
             sink.resize(i + 1, None);
@@ -68805,7 +68777,7 @@ fn resolve_dest_param_expr(
             // describe-only divergence no value cell can see - and
             // `COALESCE(?, 0, F16)` is DECFLOAT(16), where taking the
             // leading `0` stored 0 against the engine's 1.25.
-            let sd = coalesce_sibling_desc(v, columns, descs)?;
+            let sd = coalesce_sibling_desc(&v.iter().collect::<Vec<_>>(), columns, descs)?;
             // COALESCE PUSHES NO TYPE INTO ITS ARGUMENTS, so a parameter
             // under one is still UNKNOWN when the arithmetic above it is
             // made - and a MULTIPLY, a DIVIDE or a UNARY MINUS over an
@@ -68910,14 +68882,59 @@ fn resolve_dest_param_expr(
 /// -804 "Data type unknown" (this server answered it). `None` refuses,
 /// which is also what a temporal, blob or boolean sibling gets: those
 /// are not a guess this makes.
+/// A parameter this position leaves UNTYPED. A CAST types its own
+/// operand and a nested COALESCE types its arguments from its own
+/// siblings, so a parameter under either is known by the time the
+/// arithmetic above it is made; anything else this walk does not
+/// understand counts as untyped, which refuses.
+///
+/// (module-level because BOTH routers need it - it was nested inside
+/// [resolve_dest_param_expr] while that was the only one)
+fn untyped_param(e: &RawExpr) -> bool {
+    match e {
+        RawExpr::Param(_) => true,
+        RawExpr::Cast(_, _) | RawExpr::Coalesce(_) => false,
+        RawExpr::Neg(a) => untyped_param(a),
+        RawExpr::Bin(a, _, b) | RawExpr::Concat(a, b) | RawExpr::NullIf(a, b) => {
+            untyped_param(a) || untyped_param(b)
+        }
+        _ => raw_has_param(e),
+    }
+}
+
+/// Does this COALESCE argument MULTIPLY, DIVIDE or NEGATE a parameter
+/// the node cannot type? The engine raises there rather than answering -
+/// measured in a DML value AND in a select list (`SELECT COALESCE(? * 2,
+/// 0)` is *Expression evaluation not supported*), which is why both
+/// routers ask it.
+fn coalesce_arg_raises(a: &RawExpr) -> bool {
+    match a {
+        RawExpr::Bin(l, op, r) => {
+            (matches!(op, ArithOp::Mul | ArithOp::Div)
+                && (untyped_param(l) || untyped_param(r)))
+                || coalesce_arg_raises(l)
+                || coalesce_arg_raises(r)
+        }
+        RawExpr::Neg(x) => untyped_param(x) || coalesce_arg_raises(x),
+        RawExpr::Concat(l, r) | RawExpr::NullIf(l, r) => {
+            coalesce_arg_raises(l) || coalesce_arg_raises(r)
+        }
+        _ => false,
+    }
+}
+
+/// (takes BORROWED siblings so a NULLIF's two boxes and a CASE's branch
+/// results can be passed without cloning the tree - the projection
+/// router needs exactly that)
 fn coalesce_sibling_desc(
-    v: &[RawExpr],
+    v: &[&RawExpr],
     columns: &[RelationColumn],
     descs: &[Descriptor],
 ) -> Option<Descriptor> {
     let sibs: Vec<Descriptor> = v
         .iter()
-        .filter(|a| !raw_has_param(a) && !matches!(a, RawExpr::Null))
+        .copied()
+        .filter(|a| !raw_has_param(a) && !matches!(**a, RawExpr::Null))
         .map(|a| build_expr_col(a, "", columns, descs).map(|c| desc_of_projcol(&c)))
         .collect::<Option<Vec<_>>>()?;
     let first = sibs.first()?;
@@ -69005,21 +69022,100 @@ fn resolve_proj_expr(
             Box::new(resolve_proj_expr(a, columns, descs, sink)?),
             Box::new(resolve_proj_expr(b, columns, descs, sink)?),
         ),
-        // a FLOAT branch (CAST(? AS FLOAT)) beside a DOUBLE one widens to
-        // the common DOUBLE here too - resolve_expr's chain never sees a
-        // param-bearing conditional
-        RawExpr::Coalesce(v) => float_conditional(
-            Expr::Coalesce(
-                v.iter()
-                    .map(|a| resolve_proj_expr(a, columns, descs, sink))
-                    .collect::<Option<Vec<_>>>()?,
-            ),
-            descs,
-        ),
-        RawExpr::NullIf(a, b) => Expr::NullIf(
-            Box::new(resolve_proj_expr(a, columns, descs, sink)?),
-            Box::new(resolve_proj_expr(b, columns, descs, sink)?),
-        ),
+        // A CONDITIONAL TYPES ITS PARAMETER FROM ITS SIBLINGS HERE TOO -
+        // the same law chunk 46 measured for a DML value, in the SECOND
+        // router that needs it. A SELECT LIST HAS NO DESTINATION to push
+        // down, and the engine types all four nodes from their
+        // non-parameter arguments: measured on its own input SQLDA,
+        // `COALESCE(?, 0)` describes LONG scale 0, `(?, 0.5)` INT64
+        // scale -1, `(?, NM)` LONG scale -2 subtype 1, `(?, N, BI)`
+        // INT64 (the WIDEST rank), and NULLIF, CASE and IIF all INT64
+        // scale -1 beside a 0.5. Every one of these REFUSED here.
+        //
+        // NOTE THE DIFFERENCE FROM THE DML PATH, which is measured and
+        // not an oversight: there NULLIF/CASE/IIF push the DESTINATION
+        // down and only COALESCE reads its siblings. With no destination
+        // to push, all four read siblings.
+        //
+        // [coalesce_sibling_desc] is chunk 46's reconciliation REUSED,
+        // not written twice, and [resolve_dest_param_expr] types each
+        // child against it - which also carries the CAST and
+        // nested-conditional exceptions it already knows.
+        //
+        // A `?` in a CONDITION is NOT this rule: the engine types it
+        // from the comparison (`CASE WHEN ID = ? THEN 1 ELSE 0 END`
+        // describes ID's own LONG), and [resolve_raw_cond] refuses a
+        // parameter, so those shapes keep refusing - recorded, gated.
+        //
+        // a FLOAT branch (CAST(? AS FLOAT)) beside a DOUBLE one widens
+        // to the common DOUBLE, as it did before
+        RawExpr::Coalesce(v) => {
+            // the engine produces NO VALUE for a multiply, divide or
+            // unary minus over an argument it cannot type - measured in
+            // a select list as well as in a DML value
+            if v.iter().any(coalesce_arg_raises) {
+                return None;
+            }
+            let sd = coalesce_sibling_desc(&v.iter().collect::<Vec<_>>(), columns, descs)?;
+            float_conditional(
+                Expr::Coalesce(
+                    v.iter()
+                        .map(|a| resolve_dest_param_expr(a, &sd, columns, descs, sink))
+                        .collect::<Option<Vec<_>>>()?,
+                ),
+                descs,
+            )
+        }
+        RawExpr::NullIf(a, b) => {
+            let sd = coalesce_sibling_desc(&[&**a, &**b], columns, descs)?;
+            Expr::NullIf(
+                Box::new(resolve_dest_param_expr(a, &sd, columns, descs, sink)?),
+                Box::new(resolve_dest_param_expr(b, &sd, columns, descs, sink)?),
+            )
+        }
+        // CASE and IIF had NO ARM AT ALL here - they fell to the catch-all
+        // below, which is why `CASE WHEN ID=1 THEN ? ELSE 0 END` refused
+        // while the engine answered 1. The siblings are the RESULT
+        // branches (and the ELSE); the conditions are their own rule.
+        RawExpr::Case(branches, else_) => {
+            let sibs: Vec<&RawExpr> = branches
+                .iter()
+                .map(|(_, t)| t)
+                .chain(else_.iter().map(|b| &**b))
+                .collect();
+            let sd = coalesce_sibling_desc(&sibs, columns, descs)?;
+            float_conditional(
+                Expr::Case(
+                    branches
+                        .iter()
+                        .map(|(c, t)| {
+                            Some((
+                                resolve_raw_cond(c, columns, descs)?,
+                                resolve_dest_param_expr(t, &sd, columns, descs, sink)?,
+                            ))
+                        })
+                        .collect::<Option<Vec<_>>>()?,
+                    match else_ {
+                        Some(e) => {
+                            Some(Box::new(resolve_dest_param_expr(e, &sd, columns, descs, sink)?))
+                        }
+                        None => None,
+                    },
+                ),
+                descs,
+            )
+        }
+        RawExpr::Iif(c, a, b) => {
+            let sd = coalesce_sibling_desc(&[&**a, &**b], columns, descs)?;
+            float_conditional(
+                Expr::Iif(
+                    Box::new(resolve_raw_cond(c, columns, descs)?),
+                    Box::new(resolve_dest_param_expr(a, &sd, columns, descs, sink)?),
+                    Box::new(resolve_dest_param_expr(b, &sd, columns, descs, sink)?),
+                ),
+                descs,
+            )
+        }
         // a bare `?` (untyped), or a parameter in a shape this first
         // slice does not carry, refuses
         _ => return None,
