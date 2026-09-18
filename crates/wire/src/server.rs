@@ -94411,29 +94411,78 @@ fn resolve_having(
                 terms.push(Term::Const(b));
                 continue;
             }
-            // an aggregate compared against an EXPRESSION side - a per-row
-            // subquery over the group key, `HAVING COUNT(*) > (SELECT
-            // COUNT(*) FROM D WHERE D.ID = E.TID)` - takes the expression
-            // path below, as `SUM(N) * 2 > 10` does
-            let rt_expr;
-            let rt = if let (RawLhs::Agg(f, t), RawKind::CmpExpr(..)) = (&rt.lhs, &rt.kind) {
-                rt_expr = RawTerm {
+            // DOES THIS KIND CARRY A RIGHT-SIDE EXPRESSION? Exactly four
+            // variants do, and every one of them refused in HAVING until
+            // this slice: the right side had to be a LITERAL. Measured on
+            // `c0fe691`, sixteen shapes refused while the engine answered
+            // all of them - the four families' expression patterns,
+            // `NOT (U LIKE V)`, and comparisons too (`MAX(N) = MAX(ID)`,
+            // `MAX(N) > MAX(ID) - 1`, `MAX(U) = V`, `U = V`) - and NONE was
+            // a wrong answer.
+            fn kind_rhs_expr(k: &RawKind) -> Option<&RawExpr> {
+                match k {
+                    RawKind::CmpExpr(_, e)
+                    | RawKind::LikeExpr(e, ..)
+                    | RawKind::StartingExpr(e, ..)
+                    | RawKind::ContainingExpr(e, ..) => Some(e),
+                    _ => None,
+                }
+            }
+            fn kind_with_rhs(k: &RawKind, e: RawExpr) -> RawKind {
+                match k {
+                    RawKind::CmpExpr(op, _) => RawKind::CmpExpr(*op, e),
+                    RawKind::LikeExpr(_, esc, n) => RawKind::LikeExpr(e, *esc, *n),
+                    RawKind::StartingExpr(_, n) => RawKind::StartingExpr(e, *n),
+                    RawKind::ContainingExpr(_, n) => RawKind::ContainingExpr(e, *n),
+                    other => other.clone(),
+                }
+            }
+            let has_rhs_expr = kind_rhs_expr(&rt.kind).is_some();
+            // THE TESTED SIDE BECOMES AN EXPRESSION so the folding branch
+            // below sees it: an aggregate (`HAVING COUNT(*) > (SELECT ..)`,
+            // the shape this lift already served), and now a plain GROUP KEY
+            // column too - `HAVING U LIKE V` has no aggregate anywhere in it
+            // and still has to reach the synthetic view. The lift happens
+            // ONLY when the kind carries a right-side expression, so the
+            // keyed column path below is untouched for every literal form.
+            let lifted = match &rt.lhs {
+                RawLhs::Agg(f, t) if has_rhs_expr => Some(RawTerm {
                     lhs: RawLhs::Expr(RawExpr::Agg(*f, Box::new(t.clone()))),
                     kind: rt.kind.clone(),
-                };
-                rt_expr
-            } else {
-                rt
+                }),
+                RawLhs::Col(c) if has_rhs_expr => Some(RawTerm {
+                    lhs: RawLhs::Expr(RawExpr::Col(c.clone())),
+                    kind: rt.kind.clone(),
+                }),
+                _ => None,
             };
+            let rt = lifted.unwrap_or(rt);
             // an EXPRESSION OVER AGGREGATES as the tested side - `HAVING
             // SUM(N) * 2 > 10`, `HAVING STDDEV_POP(N) * 2 > 3` (both
             // engine-served, measured): each aggregate folds into an
             // appended slot and the comparison resolves as an ordinary
             // expression term over the synthetic group-row view, exactly
-            // as a select-list expression over aggregates evaluates
+            // as a select-list expression over aggregates evaluates.
+            //
+            // BOTH SIDES ARE FOLDED. Reading `rt.lhs` alone is exactly why
+            // `HAVING MAX(N) = MAX(ID)` refused even though the lift above
+            // already handled its shape: the right side's `MAX(ID)` was
+            // never lifted into a slot, so resolution could not find it.
+            // A column on either side that is NOT a group key is simply
+            // absent from the synthetic view and the term refuses - the
+            // safe failure, and the reason this does not risk landing a
+            // term against the WRONG slot.
             if let RawLhs::Expr(raw_e) = &rt.lhs {
-                if raw_has_agg(raw_e) {
-                    let aggs = collect_aggs(raw_e);
+                let rhs_e = kind_rhs_expr(&rt.kind);
+                if raw_has_agg(raw_e) || rhs_e.is_some() {
+                    let mut aggs = collect_aggs(raw_e);
+                    if let Some(r) = rhs_e {
+                        for a in collect_aggs(r) {
+                            if !aggs.contains(&a) {
+                                aggs.push(a);
+                            }
+                        }
+                    }
                     let mut names: Vec<(AggFn, AggTarget, String)> = Vec::new();
                     for (f, t) in &aggs {
                         let d = agg_result_desc(*f, t, columns, descs)?;
@@ -94445,15 +94494,45 @@ fn resolve_having(
                         slot_descs.push(Some(d));
                         names.push((*f, t.clone(), agg_slot_name(gitems.len() - 1)));
                     }
-                    let subbed = substitute_aggs(raw_e, &|f: &AggFn, t: &AggTarget| {
+                    let lookup = |f: &AggFn, t: &AggTarget| {
                         names
                             .iter()
                             .find(|(nf, nt, _)| nf == f && nt == t)
                             .map(|(_, _, n)| n.clone())
-                    })?;
+                    };
+                    let subbed = substitute_aggs(raw_e, &lookup)?;
+                    // the right side takes the SAME substitution, put back
+                    // into its own kind - a pattern stays a pattern
+                    let kind2 = match rhs_e {
+                        Some(r) => kind_with_rhs(&rt.kind, substitute_aggs(r, &lookup)?),
+                        None => rt.kind.clone(),
+                    };
+                    // EVERY GROUP KEY NEEDS ITS SLOT BEFORE THE VIEW IS
+                    // BUILT. [synth_group_view] exposes a key only once it
+                    // is a `GItem::Key`, and the keyed column path below
+                    // adds those LAZILY - so routing here first left the
+                    // keys absent and every shape naming one refused.
+                    // Measured exactly that way: `MAX(U) LIKE MAX(V)`
+                    // answered (both sides aggregates, both folded above)
+                    // while `U LIKE V`, `MAX(U) LIKE V` and `U = V` still
+                    // refused. This seeds what that path would have added,
+                    // using its own idiom, and only for keys that are real
+                    // columns - a key that is a grouped EXPRESSION lives at
+                    // `synth_base + pos` and is not a column to look up.
+                    //
+                    // A column that is NOT a group key is still absent from
+                    // the view, so such a term REFUSES rather than binding
+                    // to a wrong slot. That is the property that made this
+                    // safe to attempt at all.
+                    for kf in key_fids.iter().filter(|f| **f < synth_base) {
+                        if !gitems.iter().any(|gi| matches!(gi, GItem::Key(f) if f == kf)) {
+                            gitems.push(GItem::Key(*kf));
+                            slot_descs.push(descs.get(*kf).cloned());
+                        }
+                    }
                     let (synth_cols, synth_descs) =
                         synth_group_view(gitems, slot_descs, columns, synth_base);
-                    let rt2 = RawTerm { lhs: RawLhs::Expr(subbed), kind: rt.kind.clone() };
+                    let rt2 = RawTerm { lhs: RawLhs::Expr(subbed), kind: kind2 };
                     terms.push(resolve_expr_term(&rt2, &synth_cols, &synth_descs, params)?);
                     continue;
                 }
