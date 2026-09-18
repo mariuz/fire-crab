@@ -11516,6 +11516,12 @@ enum Term {
     /// half of [containing_term] - upper-case, canonicalise, escape the
     /// wildcards, wrap in `%…%` - is rebuilt per row.
     ExprContainingExpr(Box<Expr>, Box<Expr>, u16, bool),
+    /// `<expression> [NOT] SIMILAR TO <expression> [ESCAPE c]` - both sides
+    /// per row. Unlike [Term::ExprSimilar], whose `SimRe` was compiled and
+    /// validated at PREPARE, this holds the pattern as an EXPRESSION and
+    /// compiles it per row, raising [EvalErr::InvalidSimilar] value-gated
+    /// when a row's pattern is malformed (the engine's measured rule).
+    ExprSimilarExpr(Box<Expr>, Box<Expr>, Option<char>, bool),
     /// an expression side compared against a `?` parameter -
     /// `WHERE UPPER(S) = ?`. The bind target descriptor is SYNTHESIZED
     /// from the expression's type (what the client builds its encoder
@@ -12786,7 +12792,8 @@ fn cond_has_param(c: &Cond2) -> bool {
         // both sides: a `?` may sit in the PATTERN expression too
         Cond2::LikeExpr(a, p, ..)
         | Cond2::StartingExpr(a, p, ..)
-        | Cond2::ContainingExpr(a, p, ..) => expr_has_param(a) || expr_has_param(p),
+        | Cond2::ContainingExpr(a, p, ..)
+        | Cond2::SimilarExpr(a, p, ..) => expr_has_param(a) || expr_has_param(p),
         Cond2::Not(inner) => cond_has_param(inner),
         Cond2::And(parts) | Cond2::Or(parts) => parts.iter().any(cond_has_param),
     }
@@ -12823,7 +12830,8 @@ fn subst_params_cond(c: &Cond2, args: &[WireParam]) -> Option<Cond2> {
         // reaches bind and there is nothing here to substitute
         | Cond2::LikeExpr(..)
         | Cond2::StartingExpr(..)
-        | Cond2::ContainingExpr(..) => return None,
+        | Cond2::ContainingExpr(..)
+        | Cond2::SimilarExpr(..) => return None,
     })
 }
 
@@ -12839,7 +12847,8 @@ fn cond_reads(c: &Cond2, f: &dyn Fn(usize) -> bool) -> bool {
         // condition reads, and answering otherwise mis-gates a push-down
         Cond2::LikeExpr(a, p, ..)
         | Cond2::StartingExpr(a, p, ..)
-        | Cond2::ContainingExpr(a, p, ..) => expr_reads(a, f) || expr_reads(p, f),
+        | Cond2::ContainingExpr(a, p, ..)
+        | Cond2::SimilarExpr(a, p, ..) => expr_reads(a, f) || expr_reads(p, f),
         Cond2::Not(inner) => cond_reads(inner, f),
         Cond2::And(parts) | Cond2::Or(parts) => parts.iter().any(|p| cond_reads(p, f)),
     }
@@ -12874,7 +12883,8 @@ fn term_side_only(t: &Term, win: &std::ops::Range<usize>) -> bool {
         // is a WRONG ANSWER rather than a refusal.
         Term::ExprLikeExpr(e, pat, ..)
         | Term::ExprStartingExpr(e, pat, ..)
-        | Term::ExprContainingExpr(e, pat, ..) => {
+        | Term::ExprContainingExpr(e, pat, ..)
+        | Term::ExprSimilarExpr(e, pat, ..) => {
             !expr_reads(e, &outside) && !expr_reads(pat, &outside)
         }
         Term::ExprLike(e, ..) | Term::ExprStarting(e, ..) | Term::BadExprLike(e, ..) => {
@@ -12919,7 +12929,8 @@ fn collect_term_fids(t: &Term, mark: &dyn Fn(usize) -> bool) -> bool {
         // pattern reads columns of its own and they must be marked too
         Term::ExprLikeExpr(e, pat, ..)
         | Term::ExprStartingExpr(e, pat, ..)
-        | Term::ExprContainingExpr(e, pat, ..) => {
+        | Term::ExprContainingExpr(e, pat, ..)
+        | Term::ExprSimilarExpr(e, pat, ..) => {
             expr_reads(e, mark);
             expr_reads(pat, mark);
             true
@@ -13377,6 +13388,22 @@ impl Term {
                 // pattern was validated at prepare (no per-row raise)
                 v => Some(sim_match(re, &v.render()) != *negated),
             },
+            // ...and with the PATTERN per row too, which is where the raise
+            // comes back. A malformed pattern cannot be caught at prepare
+            // here, and the engine's rule is VALUE-GATED: measured, a row
+            // whose pattern is `[` raises 42000, while the same statement
+            // with that row excluded by a prior conjunct ANSWERS. So NULL on
+            // either side is UNKNOWN first, and only a row that actually
+            // reaches a malformed pattern raises.
+            Term::ExprSimilarExpr(e, pat, esc, negated) => {
+                match (e.eval(values)?, pat.eval(values)?) {
+                    (Value::Null, _) | (_, Value::Null) => None,
+                    (v, p) => match sim_compile(&p.render(), *esc) {
+                        Some(re) => Some(sim_match(&re, &v.render()) != *negated),
+                        None => return Err(EvalErr::InvalidSimilar),
+                    },
+                }
+            }
             Term::ExprStarting(e, prefix, negated) => match e.eval(values)? {
                 Value::Null => None,
                 // rendered to text as the engine coerces (an INTEGER
@@ -40143,6 +40170,7 @@ fn resolve_join_predicate(
                         | RawKind::LikeExpr(..)
                         | RawKind::StartingExpr(..)
                         | RawKind::ContainingExpr(..)
+                        | RawKind::SimilarExpr(..)
                 )
             {
                 let rt = match &rt.lhs {
@@ -53194,7 +53222,8 @@ fn walk_cond_aggs(c: &RawCond, out: &mut Vec<(AggFn, AggTarget)>) {
         // recorded as a gap, and deliberately not half-fixed from here.
         RawCond::LikeExpr(a, p, _, _)
         | RawCond::StartingExpr(a, p, _)
-        | RawCond::ContainingExpr(a, p, _) => {
+        | RawCond::ContainingExpr(a, p, _)
+        | RawCond::SimilarExpr(a, p, _, _) => {
             walk_aggs(a, out);
             walk_aggs(p, out);
         }
@@ -53266,6 +53295,9 @@ fn substitute_cond_aggs(
         RawCond::LikeExpr(a, p, e, n) => RawCond::LikeExpr(subb(a)?, subb(p)?, *e, *n),
         RawCond::StartingExpr(a, p, n) => RawCond::StartingExpr(subb(a)?, subb(p)?, *n),
         RawCond::ContainingExpr(a, p, n) => RawCond::ContainingExpr(subb(a)?, subb(p)?, *n),
+        RawCond::SimilarExpr(a, p, e, n) => {
+            RawCond::SimilarExpr(subb(a)?, subb(p)?, *e, *n)
+        }
         RawCond::Not(a) => RawCond::Not(Box::new(substitute_cond_aggs(a, slot_of)?)),
         RawCond::And(v) => RawCond::And(
             v.iter()
@@ -54212,6 +54244,7 @@ fn normalize_cond(c: &RawCond) -> RawCond {
         RawCond::LikeExpr(a, p, e, n) => RawCond::LikeExpr(nb(a), nb(p), *e, *n),
         RawCond::StartingExpr(a, p, n) => RawCond::StartingExpr(nb(a), nb(p), *n),
         RawCond::ContainingExpr(a, p, n) => RawCond::ContainingExpr(nb(a), nb(p), *n),
+        RawCond::SimilarExpr(a, p, e, n) => RawCond::SimilarExpr(nb(a), nb(p), *e, *n),
         RawCond::Not(inner) => RawCond::Not(Box::new(normalize_cond(inner))),
         RawCond::And(v) => RawCond::And(v.iter().map(normalize_cond).collect()),
         RawCond::Or(v) => RawCond::Or(v.iter().map(normalize_cond).collect()),
@@ -64149,7 +64182,8 @@ fn expr_contains_genval(e: &Expr) -> bool {
             // wrong number of times.
             Cond2::LikeExpr(a, p, ..)
             | Cond2::StartingExpr(a, p, ..)
-            | Cond2::ContainingExpr(a, p, ..) => {
+            | Cond2::ContainingExpr(a, p, ..)
+            | Cond2::SimilarExpr(a, p, ..) => {
                 expr_contains_genval(a) || expr_contains_genval(p)
             }
             Cond2::Not(inner) => cond(inner),
@@ -65130,6 +65164,8 @@ enum RawCond {
     LikeExpr(Box<RawExpr>, Box<RawExpr>, Option<char>, bool),
     StartingExpr(Box<RawExpr>, Box<RawExpr>, bool),
     ContainingExpr(Box<RawExpr>, Box<RawExpr>, bool),
+    /// the VALUE-world twin of [RawKind::SimilarExpr]
+    SimilarExpr(Box<RawExpr>, Box<RawExpr>, Option<char>, bool),
     /// `<expr> IS [NOT] UNKNOWN` - the NULL test, but with the engine's
     /// BOOLEAN-ONLY operand rule (`ID IS UNKNOWN` refuses at prepare
     /// where `ID IS NULL` answers), so it cannot desugar to IsNull at
@@ -65545,7 +65581,15 @@ fn parse_raw_cond(b: &[char], pos: &mut usize) -> Option<RawCond> {
             if !take_keyword(b, &mut after, "TO") {
                 return None;
             }
-            let pattern = read_quoted(b, &mut after)?;
+            // literal first, else an expression - see the LIKE arm above
+            let save = after;
+            let literal = read_quoted(b, &mut after);
+            let pat_expr = if literal.is_none() {
+                after = save;
+                Some(expr_add(b, &mut after)?)
+            } else {
+                None
+            };
             let mut esc = None;
             let mut probe = after;
             if take_keyword(b, &mut probe, "ESCAPE") {
@@ -65558,7 +65602,13 @@ fn parse_raw_cond(b: &[char], pos: &mut usize) -> Option<RawCond> {
                 after = probe;
             }
             *pos = after;
-            return Some(RawCond::Similar(Box::new(left), pattern, esc, negated));
+            return Some(match (literal, pat_expr) {
+                (Some(pattern), _) => RawCond::Similar(Box::new(left), pattern, esc, negated),
+                (None, Some(p)) => {
+                    RawCond::SimilarExpr(Box::new(left), Box::new(p), esc, negated)
+                }
+                (None, None) => return None,
+            });
         }
     }
     // BETWEEN and IN desugar here exactly as they do in the predicate
@@ -65770,7 +65820,8 @@ fn renumber_cond_params(c: &mut RawCond, next: &mut usize) {
         // than a refusal, and the order matters as much as the coverage.
         RawCond::LikeExpr(a, p, _, _)
         | RawCond::StartingExpr(a, p, _)
-        | RawCond::ContainingExpr(a, p, _) => {
+        | RawCond::ContainingExpr(a, p, _)
+        | RawCond::SimilarExpr(a, p, _, _) => {
             renumber_raw_params(a, next);
             renumber_raw_params(p, next);
         }
@@ -66803,7 +66854,8 @@ fn raw_cond_bad_substring_len(c: &RawCond) -> Option<i64> {
         | RawCond::Similar(x, ..) => raw_bad_substring_len(x),
         RawCond::LikeExpr(x, p, ..)
         | RawCond::StartingExpr(x, p, ..)
-        | RawCond::ContainingExpr(x, p, ..) => {
+        | RawCond::ContainingExpr(x, p, ..)
+        | RawCond::SimilarExpr(x, p, ..) => {
             raw_bad_substring_len(x).or_else(|| raw_bad_substring_len(p))
         }
         RawCond::Not(inner) => raw_cond_bad_substring_len(inner),
@@ -67726,6 +67778,30 @@ fn resolve_raw_cond(
                 return None;
             }
             Cond2::Similar(Box::new(e), sim_compile(pat, *esc)?, *negated)
+        }
+        // the per-row pattern. The collated-operand refusal above applies
+        // here for the same reason (a canonicalised character CLASS is a
+        // different operation), and the carrier/real mix refuses as it does
+        // in the predicate world.
+        RawCond::SimilarExpr(a, pat, esc, negated) => {
+            let e = resolve_expr(a, columns, descs)?;
+            if expr_reads_coll(&e, descs) {
+                return None;
+            }
+            if raw_has_param(pat) {
+                return None;
+            }
+            let p = resolve_expr(pat, columns, descs)?;
+            if let (Some(x), Some(y)) =
+                (cmp_text_charset(&e, descs), cmp_text_charset(&p, descs))
+            {
+                if fire_crab_ods::intl::byte_carrier(x)
+                    != fire_crab_ods::intl::byte_carrier(y)
+                {
+                    return None;
+                }
+            }
+            Cond2::SimilarExpr(Box::new(e), Box::new(p), *esc, *negated)
         }
         // A NULL TEST READS NO CONTENT: a BLOB column of ANY sub_type (a
         // BLR blob has no text filter and refuses everywhere else) and an
@@ -69379,6 +69455,9 @@ enum Cond2 {
     /// - this cannot desugar: the pattern's upper-case, canonicalise,
     /// escape and `%…%` wrapping all depend on the row.
     ContainingExpr(Box<Expr>, Box<Expr>, u16, bool),
+    /// the VALUE-world twin of [Term::ExprSimilarExpr] - compiled per row,
+    /// raising value-gated on a malformed pattern
+    SimilarExpr(Box<Expr>, Box<Expr>, Option<char>, bool),
     Not(Box<Cond2>),
     And(Vec<Cond2>),
     Or(Vec<Cond2>),
@@ -69418,6 +69497,17 @@ impl Cond2 {
                 Value::Null => None,
                 v => Some(sim_match(re, &v.render()) != *negated),
             },
+            // the per-row pattern, mirroring [Term::ExprSimilarExpr] arm for
+            // arm - including the value-gated raise
+            Cond2::SimilarExpr(a, pat, esc, negated) => {
+                match (a.eval(values)?, pat.eval(values)?) {
+                    (Value::Null, _) | (_, Value::Null) => None,
+                    (v, p) => match sim_compile(&p.render(), *esc) {
+                        Some(re) => Some(sim_match(&re, &v.render()) != *negated),
+                        None => return Err(EvalErr::InvalidSimilar),
+                    },
+                }
+            }
             // THE THREE PER-ROW PATTERN FORMS. Each mirrors its `Term`
             // twin arm for arm, deliberately written in the same order and
             // the same shape so the two worlds cannot drift apart silently.
@@ -76837,7 +76927,8 @@ fn expr_has_corr(e: &Expr) -> bool {
             // Silent site: this match ends in a catch-all.
             Cond2::LikeExpr(a, p, ..)
             | Cond2::StartingExpr(a, p, ..)
-            | Cond2::ContainingExpr(a, p, ..) => expr_has_corr(a) || expr_has_corr(p),
+            | Cond2::ContainingExpr(a, p, ..)
+            | Cond2::SimilarExpr(a, p, ..) => expr_has_corr(a) || expr_has_corr(p),
             Cond2::Not(inner) => cond(inner),
             Cond2::And(parts) | Cond2::Or(parts) => parts.iter().any(cond),
         }
@@ -83004,7 +83095,22 @@ enum RawKind {
     /// BIND for a `?` pattern. The VALUE side keeps its prepare-time
     /// `CollCanon` wrapper, which does not depend on the pattern.
     ContainingExpr(RawExpr, bool),
-    /// A leaf whose truth is already decided and does not depend on the
+    /// `[NOT] SIMILAR TO <expression> [ESCAPE <c>]` - the pattern computed
+    /// per row. The LAST of the four families, and the one deferred three
+    /// times as "the expensive corner" on the belief that its pattern is a
+    /// compiled regex. READING [sim_compile] refutes that: it is an
+    /// eight-line recursive-descent parse into a small `SimRe` enum tree,
+    /// no regex engine, and `SimRe` derives Clone - a per-row compile is a
+    /// cheap tree build, no dearer than the rebuild [containing_term]'s
+    /// per-row form already does.
+    ///
+    /// A MALFORMED PATTERN RAISES PER ROW, VALUE-GATED. Measured: the
+    /// engine raises 42000 for a row whose pattern is `[`, and ANSWERS
+    /// when a prior conjunct excludes that row. So this cannot refuse at
+    /// prepare - refusing would be wrong for the filtered query - and it
+    /// raises [EvalErr::InvalidSimilar], the error [Term::BadSimilar]
+    /// already uses for the prepare-time-known case.
+    SimilarExpr(RawExpr, Option<char>, bool),
     /// row: what a subquery collapses to once it has been evaluated
     /// (`EXISTS` over an uncorrelated inner query, or an `IN` whose
     /// inner query returned no rows at all). It carries no column, so
@@ -84065,10 +84171,22 @@ fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
                 return None; // a bare `SIMILAR` is a column, handled elsewhere
             }
             *pos += 2; // past SIMILAR TO
-            let pattern = parse_pattern(t, pos, np)?;
-            if matches!(pattern, Rhs::Int(_)) {
+            // literal first, expression second - the shape the other three
+            // families take, with BOTH `*pos` and `*np` rewound before the
+            // fallback so parameter numbering does not leak
+            let save = (*pos, *np);
+            let literal = parse_pattern(t, pos, np);
+            if literal.is_none() {
+                *pos = save.0;
+                *np = save.1;
+            }
+            if matches!(literal, Some(Rhs::Int(_))) {
                 return None; // a numeric SIMILAR pattern is not answered
             }
+            let pat_expr = match literal {
+                Some(_) => None,
+                None => Some(texpr(t, pos, np)?),
+            };
             let escape = if matches!(t.get(*pos), Some(Tok::Escape)) {
                 *pos += 1;
                 let Some(Tok::Str(e)) = t.get(*pos) else { return None };
@@ -84082,7 +84200,11 @@ fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
             } else {
                 None
             };
-            Some(leaf(RawKind::Similar(pattern, escape, negated)))
+            match (literal, pat_expr) {
+                (Some(pattern), _) => Some(leaf(RawKind::Similar(pattern, escape, negated))),
+                (None, Some(e)) => Some(leaf(RawKind::SimilarExpr(e, escape, negated))),
+                (None, None) => None,
+            }
         }
         // CONTAINING - by Ident text, like STARTING below
         Tok::Ident(w) if w.eq_ignore_ascii_case("CONTAINING") => {
@@ -84232,6 +84354,7 @@ fn negate_term(t: &RawTerm) -> Option<RawTerm> {
         // chosen over widening `Rhs` exactly so that this match would break.
         RawKind::LikeExpr(p, e, negated) => RawKind::LikeExpr(p.clone(), *e, !negated),
         RawKind::Similar(p, e, negated) => RawKind::Similar(p.clone(), *e, !negated),
+        RawKind::SimilarExpr(p, e, negated) => RawKind::SimilarExpr(p.clone(), *e, !negated),
         // flipped like LIKE - sound in 3VL (probed: NULL operand rows
         // drop under both polarities)
         RawKind::Starting(p, negated) => RawKind::Starting(p.clone(), !negated),
@@ -91788,12 +91911,13 @@ fn typed_term(idx: usize, kind: ColKind, raw: RawKind) -> Option<Term> {
         | RawKind::Cmp(_, Rhs::Oct(_)) | RawKind::Similar(Rhs::Oct(_), ..) => return None,
         // an expression right side is resolve_expr_term's business - a
         // resolver without that path (HAVING, joins) refuses it, and an
-        // expression PATTERN is the same class of thing, for all three
+        // expression PATTERN is the same class of thing, for all four
         // families that now have one
         RawKind::CmpExpr(..)
         | RawKind::LikeExpr(..)
         | RawKind::StartingExpr(..)
-        | RawKind::ContainingExpr(..) => return None,
+        | RawKind::ContainingExpr(..)
+        | RawKind::SimilarExpr(..) => return None,
         RawKind::Cmp(op, Rhs::Int(n)) => match kind {
             ColKind::Int => Term::Cmp(idx, op, Rhs::Int(n)),
             // a numeric literal against a TEXT column coerces the
@@ -91968,6 +92092,7 @@ fn resolve_predicate(
                         | RawKind::LikeExpr(..)
                         | RawKind::StartingExpr(..)
                         | RawKind::ContainingExpr(..)
+                        | RawKind::SimilarExpr(..)
                 )
             {
                 terms.push(resolve_expr_term(&rt, columns, descs, params)?);
@@ -92724,6 +92849,32 @@ fn resolve_expr_term(
                 None => Term::BadSimilar(Box::new(lhs)),
             }
         }
+        // THE PER-ROW SIMILAR PATTERN. Same declines as its three siblings -
+        // a `?` inside the pattern, and a carrier/real mix between the two
+        // sides (the engine ANSWERS that one, measured, but the literal arm
+        // above reaches its answer by transcoding a LITERAL at prepare,
+        // which a per-row pattern cannot do). A collated operand is already
+        // refused above by the `!is_cmp` guard, as it is for the other
+        // pattern families.
+        RawKind::SimilarExpr(pat, escape, negated) => {
+            if !matches!(lhs.type_of(descs), Some(ExprType::Text)) {
+                return None;
+            }
+            if raw_has_param(pat) {
+                return None;
+            }
+            let pat = resolve_expr(pat, columns, descs)?;
+            if let (Some(x), Some(y)) =
+                (cmp_text_charset(&lhs, descs), cmp_text_charset(&pat, descs))
+            {
+                if fire_crab_ods::intl::byte_carrier(x)
+                    != fire_crab_ods::intl::byte_carrier(y)
+                {
+                    return None;
+                }
+            }
+            Term::ExprSimilarExpr(Box::new(lhs), Box::new(pat), *escape, *negated)
+        }
         RawKind::Similar(..) => return None, // NULL or parameter pattern
         // `<expr> CONTAINING <p>` - the upper-cased substring test. The
         // operand's own ttype decides the case law and the canonical
@@ -92956,7 +93107,8 @@ fn resolve_expr_term(
             // catch-all, so a new variant would simply skip the check.
             Cond2::LikeExpr(a, p, ..)
             | Cond2::StartingExpr(a, p, ..)
-            | Cond2::ContainingExpr(a, p, ..) => {
+            | Cond2::ContainingExpr(a, p, ..)
+            | Cond2::SimilarExpr(a, p, ..) => {
                 a.type_of(descs)?;
                 p.type_of(descs)?;
             }
@@ -92977,7 +93129,8 @@ fn resolve_expr_term(
         // deliberately rather than waited for.
         Term::ExprLikeExpr(e, pat, ..)
         | Term::ExprStartingExpr(e, pat, ..)
-        | Term::ExprContainingExpr(e, pat, ..) => {
+        | Term::ExprContainingExpr(e, pat, ..)
+        | Term::ExprSimilarExpr(e, pat, ..) => {
             e.type_of(descs)?;
             pat.type_of(descs)?;
         }
@@ -93627,6 +93780,11 @@ fn cond_no_raise(c: &Cond2, descs: &[Descriptor]) -> bool {
         | Cond2::ContainingExpr(a, p, ..) => {
             expr_no_raise(a, descs) && expr_no_raise(p, descs)
         }
+        // NOT raise-free, whatever its operands: a per-row SIMILAR pattern
+        // may be MALFORMED, and this arm raises `InvalidSimilar` when a row
+        // reaches one. Saying otherwise would let a caller assume the
+        // condition cannot throw.
+        Cond2::SimilarExpr(..) => false,
         Cond2::Not(inner) => cond_no_raise(inner, descs),
         Cond2::And(parts) | Cond2::Or(parts) => {
             parts.iter().all(|p| cond_no_raise(p, descs))
@@ -93704,7 +93862,8 @@ fn numeric_term(
         RawKind::CmpExpr(..)
         | RawKind::LikeExpr(..)
         | RawKind::StartingExpr(..)
-        | RawKind::ContainingExpr(..) => return None,
+        | RawKind::ContainingExpr(..)
+        | RawKind::SimilarExpr(..) => return None,
         // a numeric operand's CONTAINING renders it to decimal text.
         // A LITERAL pattern is answered by the resolver that holds the
         // column's descriptor; a BOUND one is answered HERE, because a
@@ -93825,7 +93984,8 @@ fn decfloat_term(
         // pattern varies per row and this resolver cannot evaluate one
         RawKind::LikeExpr(..)
         | RawKind::StartingExpr(..)
-        | RawKind::ContainingExpr(..) => return None,
+        | RawKind::ContainingExpr(..)
+        | RawKind::SimilarExpr(..) => return None,
         RawKind::Const(b) => Term::Const(b),
         RawKind::Cmp(_, Rhs::Null) => Term::Unknown,
         // a `?` against a DECFLOAT column: the input slot describes as the
@@ -94424,7 +94584,8 @@ fn resolve_having(
                     RawKind::CmpExpr(_, e)
                     | RawKind::LikeExpr(e, ..)
                     | RawKind::StartingExpr(e, ..)
-                    | RawKind::ContainingExpr(e, ..) => Some(e),
+                    | RawKind::ContainingExpr(e, ..)
+                    | RawKind::SimilarExpr(e, ..) => Some(e),
                     _ => None,
                 }
             }
@@ -94434,6 +94595,7 @@ fn resolve_having(
                     RawKind::LikeExpr(_, esc, n) => RawKind::LikeExpr(e, *esc, *n),
                     RawKind::StartingExpr(_, n) => RawKind::StartingExpr(e, *n),
                     RawKind::ContainingExpr(_, n) => RawKind::ContainingExpr(e, *n),
+                    RawKind::SimilarExpr(_, esc, n) => RawKind::SimilarExpr(e, *esc, *n),
                     other => other.clone(),
                 }
             }
