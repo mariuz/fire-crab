@@ -13405,6 +13405,89 @@ fn carrier_fn_args(resolved: &mut [Expr], descs: &[Descriptor]) {
     }
 }
 
+/// The OPERAND-keyed twin of [carrier_fn_args], for the two shapes that
+/// one cannot reach: a byte-carrier COLUMN meeting a real operand (the
+/// "mirror", where the ATTACHMENT is real so [carrier_fn_args] returns at
+/// its first line), and COLUMN-vs-COLUMN, where there is no literal to
+/// rewrite at all.
+///
+/// The engine treats a byte carrier as BYTES: a function mixing a carrier
+/// operand with a real one runs in the carrier's octet space. So the REAL
+/// operands are re-spelled as the carrier of their own bytes - the
+/// existing [Expr::CarrierEnc], the same wrapper [cmp_sides] already uses
+/// for the comparison path, evaluated by the arm that carries the
+/// `unwrap_or_else(as_bytes)` fallback UTF8 needs (`encode_text` answers
+/// `Ok(None)` for any set `tabled()` does not cover, which is what made
+/// an earlier attempt at this INERT).
+///
+/// Measured, engine against this server, 11 cells that were wrong values:
+/// `POSITION('e-acute' IN N)` 4/0, `POSITION(N IN 'xcafe-acute')` 2/0,
+/// `REPLACE(N,'e-acute','e')` 4/7, `TRIM(TRAILING 'e-acute' FROM N)` 3/5,
+/// the same four over an OCTETS CAST, and column-vs-column
+/// `POSITION(N IN U)` 1/0, `POSITION(U IN N)` 1/0,
+/// `TRIM(TRAILING N FROM U)` 0/5, `REPLACE(U,N,'x')` 1/5. The describes
+/// were ALREADY right in every one and must not move ([text_form_m]
+/// passes the wrapper through).
+///
+/// Runs AFTER [carrier_fn_args] and only if a mix REMAINS, so the
+/// carrier-attachment literal case that function already handles is
+/// untouched: there it rewrites the literal to the real set, no mix is
+/// left, and this is a no-op.
+///
+/// Confined to the three functions whose contract was measured. LIKE and
+/// CONTAINING are deliberately NOT here: they build a `Term` through
+/// [containing_term] / [adopt_carrier_literal], the shared predicate path
+/// whose re-keying turned a CORRECT `nn LIKE '%e-acute%'` into a wrong
+/// answer in an earlier attempt.
+fn carrier_fn_operands(resolved: &mut [Expr], descs: &[Descriptor]) {
+    use fire_crab_ods::intl::byte_carrier;
+    // THE GATE READS THE NON-LITERAL OPERANDS ONLY, and that is not a
+    // refinement - the first draft without it turned a CORRECT answer
+    // wrong. A literal takes the ATTACHMENT's charset, and
+    // [carrier_fn_args] has ALREADY re-spelled it into the real set when
+    // a real non-literal is present; but [cmp_text_charset] still answers
+    // the attachment's charset for it, so counting literals here made
+    // `POSITION('e-acute' IN U)` under a NONE attachment look like a
+    // carrier/real mix. It then wrapped the REAL column into carrier
+    // space and answered 0 where both servers had agreed on 4. Measured,
+    // and caught by this suite's own control cell.
+    //
+    // A carrier among the NON-LITERALS is what this law is about: a
+    // carrier COLUMN, or an OCTETS CAST. A binary literal `x'..'`
+    // ([Expr::Hex]) counts as one too - its OCTETS are intrinsic rather
+    // than the attachment's - which is why the test is on `Expr::Str`
+    // and not on "is a literal".
+    let mut carrier_operand = false;
+    let mut real_any = false;
+    for e in resolved.iter() {
+        // a non-text argument answers None and is skipped: SUBSTRING's
+        // length and POSITION's start are not operands of this law
+        let Some(cs) = cmp_text_charset(e, descs) else {
+            continue;
+        };
+        if byte_carrier(cs) {
+            if !matches!(e, Expr::Str(_)) {
+                carrier_operand = true;
+            }
+        } else {
+            real_any = true;
+        }
+    }
+    if !(carrier_operand && real_any) {
+        return;
+    }
+    for e in resolved.iter_mut() {
+        let Some(cs) = cmp_text_charset(e, descs) else {
+            continue;
+        };
+        if byte_carrier(cs) {
+            continue;
+        }
+        let inner = std::mem::replace(e, Expr::Null);
+        *e = Expr::CarrierEnc(Box::new(inner), cs);
+    }
+}
+
 /// The byte-space reinterpretation for an EXPRESSION-side LIKE - the
 /// twin of [adopt_carrier_literal]'s literal path, for tested sides that
 /// carry no column descriptor. Answers the term to use, or `None` to
@@ -19253,7 +19336,20 @@ fn text_form_m(
         // `S COLLATE UNICODE_CI` over a VARCHAR(20) UTF8 column
         // describes VARYING len 80 charset 4, exactly as S does; only
         // its NAME changes, to CAST)
-        Expr::Collate(inner, _) | Expr::CollCanon(inner, _, _) => text_form(inner, descs),
+        // [Expr::CarrierEnc] is transparent here TOO, and measurement is
+        // why: the announcement of every byte-space shape is ALREADY the
+        // engine's (22 cells, four expressions x two attachments, all
+        // SAME) and is computed from the UNWRAPPED operands - so a
+        // wrapper that reached this function would move a describe that
+        // is currently right, which is the trade that got the LPAD/RPAD
+        // attempt reverted. Passing the inner form through also makes
+        // this the SIXTH prepare-time reader to treat the wrapper
+        // transparently, joining [expr_reads], [expr_nullable],
+        // `type_of`, `rank_of` and [expr_no_raise]; it was the only one
+        // without an arm.
+        Expr::Collate(inner, _) | Expr::CollCanon(inner, _, _) | Expr::CarrierEnc(inner, _) => {
+            text_form(inner, descs)
+        }
         // a BINARY literal is CHAR of exactly its BYTES, at OCTETS -
         // never the attachment's charset and never a character count
         Expr::Hex(b) => Some((false, b.len() as i32, TfCs::Ttype(1))),
@@ -68240,6 +68336,14 @@ fn resolve_expr_inner(
             // comparison. Without it POSITION/REPLACE/TRIM compared
             // carrier chars against real ones and found nothing.
             carrier_fn_args(&mut resolved, descs);
+            // ...and the OPERAND-keyed step for the two shapes that one
+            // cannot reach: a carrier COLUMN under a REAL attachment, and
+            // column-vs-column, where no literal exists to rewrite. Gated
+            // to the three functions whose contract was measured - an
+            // unmeasured function would be shipping a guess.
+            if matches!(f, SysFn::Position | SysFn::Replace | SysFn::Trim(_)) {
+                carrier_fn_operands(&mut resolved, descs);
+            }
             let resolved = resolved;
             // OCTET_LENGTH over a COLUMN of a tabled single-byte set
             // counts the COLUMN's stored bytes (WIN1252 'café' is 4,

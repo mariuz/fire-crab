@@ -71,12 +71,18 @@ done
 kill -0 $srv 2>/dev/null || { echo "FAIL fcwire is not running - port $PORT already in use?"; exit 1; }
 
 fail=0
+# THIS GATE HAD NO COUNTER AT ALL until 2026-09-18: a block that silently
+# stopped being read - an edit that drops a line, a helper renamed - would
+# have left it green over fewer cells with no sign. Every helper counts,
+# and the floor at the bottom is derived from the invocations.
+ran=0
 # the rows/value, or REFUSE, under an optional client charset ($4)
 sig() { local ch="" ; [ -n "${4:-}" ] && ch="-ch $4"; local r; \
     r=$(printf 'set list on;\n%s\n' "$3" | "$ISQL" -q $ch -user "$U" -pas "$P" "$1" 2>&1 | sed 's/  */ /g' | grep -ivE '^$|SQL>'); \
     if printf '%s' "$r" | grep -qi 'failed\|malformed\|error'; then echo "REFUSE"; \
     else printf '%s' "$r" | grep -iE '^(N|ID) ' | tr -d ' \n'; fi; }
 agree() { # <label> <sql> [client-charset]
+    ran=$((ran + 1))
     local e f
     e=$(sig "127.0.0.1/3050:$ENG" x "$2" "${3:-}"); f=$(sig "127.0.0.1/$PORT:$FC" x "$2" "${3:-}")
     if [ "$e" = "$f" ]; then echo "OK   $1 [$e]"; else echo "FAIL $1"; echo "     eng=[$e] fc=[$f]"; fail=1; fi
@@ -110,6 +116,7 @@ mal() { local ch=""; [ -n "${3:-}" ] && ch="-ch $3"
 # answer, so two REFUSEs can never be scored as a difference (sig()
 # collapses every error to that one word).
 differs() { # <label> <sql> [client-charset]
+    ran=$((ran + 1))
     local e f
     e=$(sig "127.0.0.1/3050:$ENG" x "$2" "${3:-}"); f=$(sig "127.0.0.1/$PORT:$FC" x "$2" "${3:-}")
     if [ "$e" = REFUSE ] || [ "$f" = REFUSE ] || [ -z "$e" ] || [ -z "$f" ]; then
@@ -121,7 +128,26 @@ differs() { # <label> <sql> [client-charset]
     fi
 }
 
+# A RECORDED CAPABILITY GAP: the engine ANSWERS and this server REFUSES.
+# Both sides are checked - a cell where the ENGINE also fails measures
+# nothing and scores DIFF, not OK - and it goes red the day fire-crab
+# answers, which is the signal to promote it to `agree` with the engine's
+# own value rather than to delete it.
+refuses() { # <label> <sql> [client-charset]
+    ran=$((ran + 1))
+    local e f
+    e=$(sig "127.0.0.1/3050:$ENG" x "$2" "${3:-}"); f=$(sig "127.0.0.1/$PORT:$FC" x "$2" "${3:-}")
+    if [ "$e" = REFUSE ] || [ -z "$e" ]; then
+        echo "FAIL $1 [VACUOUS: the ENGINE did not answer either] eng=[$e]"; fail=1
+    elif [ "$f" = REFUSE ]; then
+        echo "OK   refused (recorded gap): $1 [engine answers $e]"
+    else
+        echo "FAIL $1 now ANSWERS [$f] - the gap is closed; promote this cell to agree"; fail=1
+    fi
+}
+
 malformed() { # <label> <sql> - BOTH servers must raise 22000 Malformed string
+    ran=$((ran + 1))
     local e f
     e=$(mal "127.0.0.1/3050:$ENG" "$2"); f=$(mal "127.0.0.1/$PORT:$FC" "$2")
     if [ "$e" = MALFORMED ] && [ "$f" = MALFORMED ]; then
@@ -158,17 +184,40 @@ malformed "u||'' LIKE 'é%'"   "select count(*) n from t where u||'' like 'é%';
 agree "CAST(u) LIKE '%é%' ctl" "select count(*) n from t where cast(u as varchar(20)) like '%é%';"
 echo "-- THE MIRROR: the CARRIER is the COLUMN and the literal is REAL --"
 echo "--  (a real attachment; the engine still compares in byte space) --"
-differs "POSITION('é' IN nn) @UTF8"      "select position('é' in nn) n from t where id=1;" UTF8
-differs "POSITION(nn IN 'xcafé') @UTF8"  "select position(nn in 'xcafé') n from t where id=1;" UTF8
-differs "REPLACE(nn,'é','e') @UTF8"      "select octet_length(replace(nn,'é','e')) n from t where id=1;" UTF8
-differs "TRIM(TRAILING 'é' FROM nn)@UTF8" "select octet_length(trim(trailing 'é' from nn)) n from t where id=1;" UTF8
+# FIXED 2026-09-18 and promoted from `differs`: the FUNCTION path now
+# reconciles in byte space when a carrier operand meets a real one
+# ([carrier_fn_operands]), so these seven answer the engine's values.
+agree "POSITION('é' IN nn) @UTF8"      "select position('é' in nn) n from t where id=1;" UTF8
+agree "POSITION(nn IN 'xcafé') @UTF8"  "select position(nn in 'xcafé') n from t where id=1;" UTF8
+agree "REPLACE(nn,'é','e') @UTF8"      "select octet_length(replace(nn,'é','e')) n from t where id=1;" UTF8
+agree "TRIM(TRAILING 'é' FROM nn)@UTF8" "select octet_length(trim(trailing 'é' from nn)) n from t where id=1;" UTF8
+# STILL RECORDED, and NOT an oversight: CONTAINING is built by
+# [containing_term] into a `Term::ExprLike` - the shared PREDICATE path,
+# not the function path. An earlier attempt re-keyed that shared path and
+# turned the CORRECT `nn LIKE '%é%'` below into a wrong answer, so this
+# slice deliberately leaves it alone. Measured on this binary: engine 1,
+# this server 0.
 differs "nn CONTAINING 'é' @UTF8"        "select count(*) n from t where nn containing 'é';" UTF8
 agree "nn LIKE '%é%' @UTF8"            "select count(*) n from t where nn like '%é%';" UTF8
 echo "--  an OCTETS operand is the same carrier case --"
-differs "POSITION('é' IN octets) @UTF8"  "select position('é' in cast(u as varchar(20) character set octets)) n from t where id=1;" UTF8
+agree "POSITION('é' IN octets) @UTF8"  "select position('é' in cast(u as varchar(20) character set octets)) n from t where id=1;" UTF8
 differs "octets CONTAINING 'é' @UTF8"    "select count(*) n from t where cast(u as varchar(20) character set octets) containing 'é';" UTF8
-differs "REPLACE(octets,'é','e') @UTF8"  "select octet_length(replace(cast(u as varchar(20) character set octets),'é','e')) n from t where id=1;" UTF8
-differs "POSITION('é' IN padded) @UTF8"  "select position('é' in cast(u as char(8) character set octets)) n from t where id=1;" UTF8
+agree "REPLACE(octets,'é','e') @UTF8"  "select octet_length(replace(cast(u as varchar(20) character set octets),'é','e')) n from t where id=1;" UTF8
+agree "POSITION('é' IN padded) @UTF8"  "select position('é' in cast(u as char(8) character set octets)) n from t where id=1;" UTF8
+echo "--  COLUMN vs COLUMN: no literal exists to rewrite, so the literal --"
+echo "--  fast path could never have reached these. Both attachments.   --"
+agree "POSITION(nn IN u) cols"          "select position(nn in u) n from t where id=1;"
+agree "POSITION(u IN nn) cols"          "select position(u in nn) n from t where id=1;"
+agree "TRIM(TRAILING nn FROM u) cols"   "select octet_length(trim(trailing nn from u)) n from t where id=1;"
+agree "REPLACE(u,nn,'x') cols"          "select octet_length(replace(u,nn,'x')) n from t where id=1;"
+agree "POSITION(nn IN u) cols @UTF8"    "select position(nn in u) n from t where id=1;" UTF8
+agree "REPLACE(u,nn,'x') cols @UTF8"    "select octet_length(replace(u,nn,'x')) n from t where id=1;" UTF8
+echo "--  a NON-LITERAL pattern is a MISSING CAPABILITY, not this law:   --"
+echo "--  fire-crab refuses it for SAME-charset operands too (measured), --"
+echo "--  so it ranks below every wrong answer and is recorded, not fixed --"
+refuses "u CONTAINING nn (column pattern)" "select count(*) n from t where u containing nn;"
+refuses "nn CONTAINING u (column pattern)" "select count(*) n from t where nn containing u;"
+refuses "u LIKE nn (column pattern)"       "select count(*) n from t where u like nn;"
 echo "--  controls: BOTH-carrier and BOTH-real need no reconciliation --"
 agree "POSITION('é' IN nn) @NONE"      "select position('é' in nn) n from t where id=1;"
 agree "nn CONTAINING 'é' @NONE"        "select count(*) n from t where nn containing 'é';"
@@ -207,5 +256,13 @@ agree "w='café' @WIN1252"   "select count(*) n from t where w='café';" WIN1252
 agree "u ordering @UTF8"    "select id from t where u>'café' order by id;" UTF8
 
 kill $srv 2>/dev/null; wait $srv 2>/dev/null; trap - EXIT
+echo "ran $ran checks"
+# derived from the invocations, not guessed: agree + differs + malformed
+# + refuses. A block that stops being read trips this instead of passing
+# quietly over fewer cells.
+if [ "$ran" -lt 86 ]; then
+    echo "FAIL only $ran checks ran (expected at least 86) - did a block silently skip?"
+    fail=1
+fi
 [ $fail = 0 ] && echo "PASS nonecmp" || echo "FAIL nonecmp"
 exit $fail
