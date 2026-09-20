@@ -12195,7 +12195,7 @@ impl Predicate {
                             },
                         }
                     }
-                    Term::Cmp(fid, op, Rhs::Param(idx, kind0, ..)) => {
+                    Term::Cmp(fid, op, Rhs::Param(idx, kind0, mirrored)) => {
                         // A DOUBLE MESSAGE INTO AN EXACT SLOT - every
                         // driver that sends a JS/Python/Delphi fraction
                         // does this. It compares AS A DOUBLE, unrounded
@@ -12205,7 +12205,7 @@ impl Predicate {
                         let (kind_v, wide) = kind0.unwide();
                         let short = kind0.short_scale();
                         let kind = &kind_v;
-                        match double_exact_term(args.get(*idx), *fid, *op, kind, wide, short) {
+                        match double_exact_term(args.get(*idx), *fid, *op, kind, wide, short, *mirrored) {
                             Err(e) => return Err(ExecErr::Text(e.to_string())),
                             Ok(Some(t)) => t,
                             Ok(None) => match lenient_param(idx, *fid, *op, kind) {
@@ -12224,12 +12224,12 @@ impl Predicate {
                             },
                         }
                     }
-                    Term::NumCmp(fid, op, Rhs::Param(idx, kind0, ..)) => {
+                    Term::NumCmp(fid, op, Rhs::Param(idx, kind0, mirrored)) => {
                         // the scaled twin of the arm above
                         let (kind_v, wide) = kind0.unwide();
                         let short = kind0.short_scale();
                         let kind = &kind_v;
-                        match double_exact_term(args.get(*idx), *fid, *op, kind, wide, short) {
+                        match double_exact_term(args.get(*idx), *fid, *op, kind, wide, short, *mirrored) {
                             Err(e) => return Err(ExecErr::Text(e.to_string())),
                             Ok(Some(t)) => t,
                             Ok(None) => match decfloat_param_term(args.get(*idx), *fid, *op, kind)
@@ -12512,23 +12512,22 @@ impl Predicate {
                                     // keeps its previous reading; every
                                     // other side has no order at all
                                     None if matches!(kind, ColKind::Text) => None,
-                                    // A SINGLE-PRECISION SIDE AND `<`:
-                                    // the ONE operator whose verdict is
-                                    // the engine's in BOTH written orders
-                                    // ([ColKind::ApproxSingle] carries the
-                                    // measurement). [parse_leaf] mirrors
-                                    // `? > FL` into `FL < ?`, so this one
-                                    // term is both spellings and the
-                                    // engine answers no row for each, on
-                                    // the heap and on the indexed twin -
-                                    // which is what the previous binary's
-                                    // equal-reading answers too. Every
-                                    // other operator has one spelling the
-                                    // engine reads the other way, and a
-                                    // DOUBLE side has no such operator at
-                                    // all.
-                                    None if single && matches!(*op, Cmp::Lt) => None,
-                                    None => return Err(NAN_CMP_REFUSAL.into()),
+                                    // THE NaN VERDICT, measured over the
+                                    // whole matrix ([nan_cmp_verdict]):
+                                    // it is decided, not guessed, and the
+                                    // ACCESS PATH matters for exactly one
+                                    // case - a TRUE verdict on a LOWER
+                                    // BOUND, where an index range over a
+                                    // NaN is empty or partial and a scan's
+                                    // is not.
+                                    None => match nan_cmp_verdict(*op, *mirrored, kind, single) {
+                                        Some(v) => Some(Term::ExprCond(Box::new(Cond2::Cmp(
+                                            lhs.clone(),
+                                            if v { Cmp::Ge } else { Cmp::Lt },
+                                            Box::new(Expr::Double(f64::NEG_INFINITY)),
+                                        )))),
+                                        None => return Err(NAN_CMP_REFUSAL.into()),
+                                    },
                                 }
                             }
                             Some(WireParam::Double(x)) => {
@@ -62330,6 +62329,84 @@ fn wide_whole_side_double(
     }
 }
 
+/// THE NaN VERDICT of a bare comparison `lhs <op> ?`, and whether this
+/// server may give it.
+///
+/// MEASURED 2026-09-20 over the full matrix - six operators x both
+/// WRITTEN ORDERS x DOUBLE / FLOAT / INTEGER / SMALLINT / BIGINT / INT128
+/// / NUMERIC(9,2) / NUMERIC(18,1), each on a HEAP twin, an INDEXED twin
+/// and an EXPRESSION-INDEX twin (72 cells, then the derived predicates
+/// and every clause).  Two facts, and they are not the same fact:
+///
+///  * WHICH OPERAND IS THE LESSER.  Against a DOUBLE PRECISION side THE
+///    FIRST-WRITTEN OPERAND IS THE LESSER, so the verdict FLIPS when the
+///    same term is written the other way round: `D < ?` is every row and
+///    `? < D`'s mirror is none.  Against a FLOAT (single) or an EXACT
+///    side the NaN is ALWAYS the lesser, whichever way it is written.
+///    [parse_leaf] rewrites `? op X` into `X mirror(op) ?`, so ONE term
+///    carries both spellings and `mirrored` is the only thing that tells
+///    them apart - which is why this rule could not be written until that
+///    flag existed.
+///
+///  * WHETHER THE ANSWER IS THE SAME ON EVERY ACCESS PATH.  A FALSE
+///    verdict is, always: an emptied index range cannot turn a row that
+///    does not match into one that does.  A TRUE verdict is, EXCEPT on a
+///    LOWER BOUND (`>` / `>=` as the term is stored), where the engine's
+///    index range over a NaN is empty or partial and its scan is not -
+///    `ID > ?` [NaN] is every row on a heap and none on the indexed twin,
+///    and `BI > ?` is every row against `1;2;3;9`.  Those, and only
+///    those, refuse.
+///
+/// Returns `Some(verdict)` when the answer is the engine's on every path,
+/// and `None` where the engine has more than one answer.  The previous
+/// binary read a NaN as EQUAL to everything
+/// (`partial_cmp().unwrap_or(Equal)`), which is the engine's verdict on
+/// some of these and wrong on the rest.
+fn nan_cmp_verdict(op: Cmp, mirrored: bool, kind: &ColKind, single: bool) -> Option<bool> {
+    // a DOUBLE side is the only one whose order depends on the spelling
+    let double = matches!(kind, ColKind::Approx) && !single;
+    let nan_is_lesser = mirrored || !double;
+    // AN EQUALITY IS ONE TREE WITH AN `IN` LIST, AND AN `IN` LIST WITH A
+    // NaN IS A DIFFERENT LAW ENTIRELY - CAPPED HERE, not modelled.
+    // Measured 2026-09-20, and it is not one law but at least two, split
+    // by the column's WIDTH:
+    //   * on a DOUBLE column the list becomes a RANGE whose open end the
+    //     NaN sets, and which end depends on WHERE IN THE LIST it sits:
+    //     `D IN (?, 1)` is `D <= 1` and `D IN (1, ?)` is `D >= 1`, so
+    //     `D NOT IN (?, 1)` is `D > 1` - THREE rows where the OR it
+    //     desugars to gives five;
+    //   * on a SMALLINT or NUMERIC column the NaN is instead ABSORBED AS
+    //     ZERO, so `SM IN (?, 1)` is `SM IN (0, 1)` and picks up the
+    //     SM = 0 row - while an INTEGER column does neither, and the
+    //     boundary between those three readings is UNCHARACTERISED.
+    // Every one of them is ENG-ONE, so they are answerable in principle
+    // and this is a capability given up, not a split ducked.  But an
+    // `IN` arrives here as ordinary `Eq` / `Ne` terms, indistinguishable
+    // from the written `OR` and `AND` whose answers the engine does NOT
+    // share, and the DML twins MUTATE ROWS (`DELETE FROM M WHERE D NOT IN
+    // (?, 1)` removes a different set).  A refusal costs a capability; a
+    // law at an unmeasured edge costs rows.
+    //
+    // The ORDERING operators are unaffected - they are the verdict below,
+    // and they are the whole of what this chunk answers.
+    if matches!(op, Cmp::Eq | Cmp::Ne) {
+        return None;
+    }
+    let verdict = match op {
+        Cmp::Eq => false,
+        Cmp::Ne => true,
+        // `COL < ?` holds when the NaN is the GREATER
+        Cmp::Lt | Cmp::Le => !nan_is_lesser,
+        Cmp::Gt | Cmp::Ge => nan_is_lesser,
+    };
+    // a TRUE lower bound is the one shape an index range answers
+    // differently from a scan
+    if verdict && matches!(op, Cmp::Gt | Cmp::Ge) {
+        return None;
+    }
+    Some(verdict)
+}
+
 /// A NaN BOUND INTO A WHOLE-SIDE RUNG, where the WRITTEN OPERAND ORDER
 /// SURVIVES: can the previous binary's reading be kept?
 ///
@@ -62596,13 +62673,28 @@ fn double_exact_term(
     kind: &ColKind,
     wide: Option<i8>,
     short: Option<i8>,
+    // WHETHER THE `?` WAS WRITTEN FIRST ([RawTerm::mirrored]) - the NaN
+    // verdict is the one reading that depends on it
+    mirrored: bool,
 ) -> Result<Option<Term>, &'static str> {
     let Some(WireParam::Double(x)) = arg else { return Ok(None) };
     if !matches!(kind, ColKind::Int | ColKind::Numeric) {
         return Ok(None);
     }
     if x.is_nan() {
-        return Err(NAN_CMP_REFUSAL);
+        // AN EXACT SIDE IS ALWAYS THE GREATER against a NaN, whichever
+        // way the term was written ([nan_cmp_verdict] carries the
+        // matrix), so the verdict is decided here rather than refused -
+        // except the one TRUE lower bound an index range answers
+        // differently from a scan.
+        return match nan_cmp_verdict(op, mirrored, kind, false) {
+            Some(v) => Ok(Some(Term::ExprCond(Box::new(Cond2::Cmp(
+                Box::new(Expr::Col(fid)),
+                if v { Cmp::Ge } else { Cmp::Lt },
+                Box::new(Expr::Double(f64::NEG_INFINITY)),
+            ))))),
+            None => Err(NAN_CMP_REFUSAL),
+        };
     }
     if let Some(sc) = wide {
         if !double_exact_at(*x, sc) {
@@ -126213,7 +126305,7 @@ mod computed_wide_types {
         assert_eq!(k.short_scale(), Some(0));
         assert_eq!(ColKind::WideExact { numeric: false, scale: 0, short: false }.short_scale(), None);
         let t = |op: Cmp, v: f64| {
-            double_exact_term(Some(&WireParam::Double(v)), 7, op, &ColKind::Int, None, Some(0))
+            double_exact_term(Some(&WireParam::Double(v)), 7, op, &ColKind::Int, None, Some(0), false)
         };
         assert!(matches!(t(Cmp::Eq, 2.5), Err(e) if e == SHORT_IN_REFUSAL));
         assert!(matches!(t(Cmp::Ne, 2.5), Err(e) if e == SHORT_IN_REFUSAL));
@@ -126227,26 +126319,91 @@ mod computed_wide_types {
     /// an ExprCond that compares AS A DOUBLE, never an `Rhs::Dbl`.
     #[test]
     fn a_bound_double_compares_as_a_double_or_refuses() {
-        let narrow = |v: f64| double_exact_term(Some(&WireParam::Double(v)), 7, Cmp::Gt, &ColKind::Int, None, None);
+        let narrow = |v: f64| double_exact_term(Some(&WireParam::Double(v)), 7, Cmp::Gt, &ColKind::Int, None, None, false);
         assert!(matches!(narrow(2.6), Ok(Some(Term::ExprCond(_)))));
+        // A NaN ON AN EXACT SIDE still refuses for `>` - the one TRUE
+        // LOWER BOUND whose index range the engine empties
+        // ([nan_cmp_verdict]) - while every other operator is now
+        // DECIDED rather than refused (see the matrix test below)
         assert!(matches!(narrow(f64::NAN), Err(e) if e == NAN_CMP_REFUSAL));
+        for op in [Cmp::Lt, Cmp::Le] {
+            assert!(
+                matches!(
+                    double_exact_term(
+                        Some(&WireParam::Double(f64::NAN)), 7, op, &ColKind::Int, None, None, false,
+                    ),
+                    Ok(Some(Term::ExprCond(_)))
+                ),
+                "an operator that is not a TRUE lower bound must be decided, not refused"
+            );
+        }
         // a wide key: exact at its scale answers, anything else refuses
         let wide = |v: f64, sc: i8| {
-            double_exact_term(Some(&WireParam::Double(v)), 7, Cmp::Gt, &ColKind::Numeric, Some(sc), None)
+            double_exact_term(Some(&WireParam::Double(v)), 7, Cmp::Gt, &ColKind::Numeric, Some(sc), None, false)
         };
         assert!(matches!(wide(2.49, -2), Ok(Some(Term::ExprCond(_)))));
         assert!(matches!(wide(2.495, -2), Err(e) if e == WIDE_DOUBLE_REFUSAL));
         assert!(matches!(wide(2.5, 0), Err(e) if e == WIDE_DOUBLE_REFUSAL));
         // an INTEGER message is not this arm's business at all
         assert!(matches!(
-            double_exact_term(Some(&WireParam::Int(3, 0)), 7, Cmp::Gt, &ColKind::Int, None, None),
+            double_exact_term(Some(&WireParam::Int(3, 0)), 7, Cmp::Gt, &ColKind::Int, None, None, false),
             Ok(None)
         ));
         // nor is an approximate column's own double
         assert!(matches!(
-            double_exact_term(Some(&WireParam::Double(2.5)), 7, Cmp::Gt, &ColKind::Approx, None, None),
+            double_exact_term(Some(&WireParam::Double(2.5)), 7, Cmp::Gt, &ColKind::Approx, None, None, false),
             Ok(None)
         ));
+    }
+
+    /// THE NaN MATRIX ([nan_cmp_verdict]), which is the whole of what the
+    /// engine does: 72 measured cells - six operators x both WRITTEN
+    /// ORDERS x DOUBLE / FLOAT / exact - on a heap, an indexed twin and an
+    /// expression-index twin, 2026-09-20.
+    #[test]
+    fn a_nan_comparison_is_decided_by_the_written_order_and_the_side() {
+        use Cmp::*;
+        let v = |op: Cmp, mirrored: bool, kind: &ColKind, single: bool| {
+            nan_cmp_verdict(op, mirrored, kind, single)
+        };
+        let dbl = ColKind::Approx;
+        let exact = ColKind::Int;
+
+        // A DOUBLE SIDE, COLUMN WRITTEN FIRST: the column is the lesser,
+        // so `D < ?` is every row and `D > ?` none - and NOTHING SPLITS,
+        // because the one TRUE verdict here is an UPPER bound.
+        assert_eq!(v(Lt, false, &dbl, false), Some(true));
+        assert_eq!(v(Le, false, &dbl, false), Some(true));
+        assert_eq!(v(Gt, false, &dbl, false), Some(false));
+        assert_eq!(v(Ge, false, &dbl, false), Some(false));
+        // ...and the EQUALITY OPERATORS are CAPPED for every class: an
+        // `IN` list is the same tree and the engine reads it as a range
+        // (DOUBLE) or a zero-conversion (SMALLINT / NUMERIC) instead
+        assert_eq!(v(Eq, false, &dbl, false), None);
+        assert_eq!(v(Ne, false, &dbl, false), None);
+
+        // ...and THE SAME TERM WRITTEN THE OTHER WAY ROUND FLIPS IT. This
+        // is the whole reason the `mirrored` flag exists: [parse_leaf]
+        // rewrites `? op X` into `X mirror(op) ?`, so one term carries
+        // both spellings and only this bit tells them apart.
+        assert_eq!(v(Gt, true, &dbl, false), None); // written `? < D`: TRUE, and a lower bound
+        assert_eq!(v(Ge, true, &dbl, false), None); // written `? <= D`
+        assert_eq!(v(Lt, true, &dbl, false), Some(false)); // written `? > D`
+        assert_eq!(v(Le, true, &dbl, false), Some(false)); // written `? >= D`
+
+        // AN EXACT OR SINGLE SIDE: the NaN is ALWAYS the lesser, whichever
+        // way it is written, so the column is always the greater.
+        for mirrored in [false, true] {
+            for (k, single) in [(&exact, false), (&ColKind::Approx, true)] {
+                assert_eq!(v(Eq, mirrored, k, single), None);
+                assert_eq!(v(Ne, mirrored, k, single), None);
+                assert_eq!(v(Lt, mirrored, k, single), Some(false));
+                assert_eq!(v(Le, mirrored, k, single), Some(false));
+                // the TRUE lower bound, and the only thing that refuses
+                assert_eq!(v(Gt, mirrored, k, single), None);
+                assert_eq!(v(Ge, mirrored, k, single), None);
+            }
+        }
     }
 
     /// Which casts stop a NaN from reaching a comparison as a double

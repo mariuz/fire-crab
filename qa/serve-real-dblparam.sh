@@ -725,18 +725,18 @@ desc_differs     "FL < ? [+Inf] - a FLOAT column: the VALUE agrees and the FLOAT
 both             "TI.D < ? [+Inf] - indexed (engine -3;0;1;2;3;9)" "SELECT ID FROM TI WHERE D < ? ORDER BY ID" '["#Inf"]'
 eng_only         "D = ? [NaN] (engine (none))" "SELECT ID FROM T WHERE D = ? ORDER BY ID" '["#NaN"]'
 eng_only         "D <> ? [NaN] (engine -3;0;1;2;3;9)" "SELECT ID FROM T WHERE D <> ? ORDER BY ID" '["#NaN"]'
-eng_only         "D < ? [NaN] (engine -3;0;1;2;3;9)" "SELECT ID FROM T WHERE D < ? ORDER BY ID" '["#NaN"]'
-eng_only         "D <= ? [NaN] (engine -3;0;1;2;3;9)" "SELECT ID FROM T WHERE D <= ? ORDER BY ID" '["#NaN"]'
-eng_only         "D > ? [NaN] (engine (none))" "SELECT ID FROM T WHERE D > ? ORDER BY ID" '["#NaN"]'
-eng_only         "D >= ? [NaN] (engine (none))" "SELECT ID FROM T WHERE D >= ? ORDER BY ID" '["#NaN"]'
+both             "D < ? [NaN] (engine -3;0;1;2;3;9)" "SELECT ID FROM T WHERE D < ? ORDER BY ID" '["#NaN"]'
+both             "D <= ? [NaN] (engine -3;0;1;2;3;9)" "SELECT ID FROM T WHERE D <= ? ORDER BY ID" '["#NaN"]'
+both             "D > ? [NaN] (engine (none))" "SELECT ID FROM T WHERE D > ? ORDER BY ID" '["#NaN"]'
+both             "D >= ? [NaN] (engine (none))" "SELECT ID FROM T WHERE D >= ? ORDER BY ID" '["#NaN"]'
 eng_only         "? < D [NaN] - reversed (engine -3;0;1;2;3;9)" "SELECT ID FROM T WHERE ? < D ORDER BY ID" '["#NaN"]'
 eng_only         "? = D [NaN] - reversed (engine (none))" "SELECT ID FROM T WHERE ? = D ORDER BY ID" '["#NaN"]'
-eng_only         "D + 0 < ? [NaN] - an expression side (engine -3;0;1;2;3;9)" "SELECT ID FROM T WHERE D + 0 < ? ORDER BY ID" '["#NaN"]'
-eng_only         "D BETWEEN ? AND 99 [NaN] (engine (none))" "SELECT ID FROM T WHERE D BETWEEN ? AND 99 ORDER BY ID" '["#NaN"]'
+both             "D + 0 < ? [NaN] - an expression side (engine -3;0;1;2;3;9)" "SELECT ID FROM T WHERE D + 0 < ? ORDER BY ID" '["#NaN"]'
+both             "D BETWEEN ? AND 99 [NaN] (engine (none))" "SELECT ID FROM T WHERE D BETWEEN ? AND 99 ORDER BY ID" '["#NaN"]'
 eng_only         "D IN (?, 99) [NaN] (engine -3;0;1;2;3;9)" "SELECT ID FROM T WHERE D IN (?, 99) ORDER BY ID" '["#NaN"]'
 eng_only         "D IS DISTINCT FROM ? [NaN] (engine -3;0;1;2;3;9)" "SELECT ID FROM T WHERE D IS DISTINCT FROM ? ORDER BY ID" '["#NaN"]'
-eng_only         "TI.D < ? [NaN] - indexed (engine -3;0;1;2;3;9)" "SELECT ID FROM TI WHERE D < ? ORDER BY ID" '["#NaN"]'
-eng_only         "TI.D > ? [NaN] - indexed (engine (none))" "SELECT ID FROM TI WHERE D > ? ORDER BY ID" '["#NaN"]'
+both             "TI.D < ? [NaN] - indexed (engine -3;0;1;2;3;9)" "SELECT ID FROM TI WHERE D < ? ORDER BY ID" '["#NaN"]'
+both             "TI.D > ? [NaN] - indexed (engine (none))" "SELECT ID FROM TI WHERE D > ? ORDER BY ID" '["#NaN"]'
 eng_only         "FL = ? [NaN] (engine (none))" "SELECT ID FROM T WHERE FL = ? ORDER BY ID" '["#NaN"]'
 eng_only         "FL > ? [NaN] (engine -3;0;1;2;3;9)" "SELECT ID FROM T WHERE FL > ? ORDER BY ID" '["#NaN"]'
 eng_only         "ID > ? [NaN] - an EXACT column (engine -3;0;1;2;3;9)" "SELECT ID FROM T WHERE ID > ? ORDER BY ID" '["#NaN"]'
@@ -750,8 +750,8 @@ eng_only         "HAVING SUM(ID) > ? [NaN] (engine 12)" "SELECT SUM(ID) X FROM T
 both             "ID > CAST(? AS INTEGER) [NaN] - a written cast ABSORBS the NaN as 0 (engine 1;2;3;9)" "SELECT ID FROM T WHERE ID > CAST(? AS INTEGER) ORDER BY ID" '["#NaN"]'
 both             "ID = CAST(? AS INTEGER) [NaN] (engine 0)" "SELECT ID FROM T WHERE ID = CAST(? AS INTEGER) ORDER BY ID" '["#NaN"]'
 both             "ID > ? + 0 [NaN] - an operand rung absorbs it (engine 1;2;3;9)" "SELECT ID FROM T WHERE ID > ? + 0 ORDER BY ID" '["#NaN"]'
-dml_rb_eng_only  "DELETE FROM U WHERE D < ? [NaN] - a WRONG DELETE on the previous binary (engine dml=(none) rb=(none))" "DELETE FROM U WHERE D < ?" '["#NaN"]' "SELECT ID, N, NM FROM U ORDER BY ID"
-dml_rb_eng_only  "UPDATE U SET N = 99 WHERE D >= ? [NaN] (engine dml=(none) rb=1,1,1;2,2,2.5;3,3,2.49)" "UPDATE U SET N = 99 WHERE D >= ?" '["#NaN"]' "SELECT ID, N, NM FROM U ORDER BY ID"
+dml_rb           "DELETE FROM U WHERE D < ? [NaN] - a WRONG DELETE on the previous binary (engine dml=(none) rb=(none))" "DELETE FROM U WHERE D < ?" '["#NaN"]' "SELECT ID, N, NM FROM U ORDER BY ID"
+dml_rb           "UPDATE U SET N = 99 WHERE D >= ? [NaN] (engine dml=(none) rb=1,1,1;2,2,2.5;3,3,2.49)" "UPDATE U SET N = 99 WHERE D >= ?" '["#NaN"]' "SELECT ID, N, NM FROM U ORDER BY ID"
 dml_rb           "DELETE FROM U WHERE D < ? [+Inf] (engine dml=(none) rb=(none))" "DELETE FROM U WHERE D < ?" '["#Inf"]' "SELECT ID, N, NM FROM U ORDER BY ID"
 
 echo "-- 9. CONTROLS: what the previous binary already answers --"
@@ -837,6 +837,16 @@ eng_only         "TE.BI + 0 > (?) [2.5] - an INDEX COMPUTED BY (BI + 0) rounds i
 eng_only         "TE.ID + 0 > (?) [2.5] - arithmetic widens a LONG column to INT64 and the computed index rounds (engine 9)" "SELECT ID FROM TE WHERE ID + 0 > (?) ORDER BY ID" '[2.5]'
 eng_only         "T.ID > -? [2.5] - a NEGATED whole-side chain refuses at prepare on both binaries (engine 0;1;2;3;9)" "SELECT ID FROM T WHERE ID > -? ORDER BY ID" '[2.5]'
 
+# 11C. PROMOTED 2026-09-20 by the NaN chunk (`qa/serve-real-nanparam.sh`):
+# the cells below that RECORDED A REFUSAL now ANSWER, with the engine's own
+# answer on every access path.  The refusal was never a law - the engine's
+# NaN order is DETERMINED, by the WRITTEN ORDER of the term and the other
+# side's CLASS - and `mirrored` is what finally told the two spellings
+# apart.  What still refuses here is the one shape that genuinely splits
+# (a TRUE verdict on a LOWER BOUND, where an index range over a NaN is
+# empty) and the two EQUALITY operators, which are one tree with an `IN`
+# list the engine reads as a range or a zero-conversion.
+#
 # 11C. THE NaN ORDER, re-measured over the whole matrix (596 + 1344
 # three-way cells, 2026-09-20).  The engine has TWO orders and the OTHER
 # side's precision picks which: against a DOUBLE side THE FIRST OPERAND IS
@@ -856,15 +866,15 @@ desc_differs     "FLOOR IIF(? > FL, 1, 0) = 1 [NaN] - an IIF condition keeps its
 both             "FLOOR D + 0 > (?) [NaN] - arithmetic is DOUBLE by construction (engine (none))" "SELECT ID FROM T WHERE D + 0 > (?) ORDER BY ID" '["#NaN"]'
 both             "FLOOR D + 0 <= (?) [NaN] - the TRUE verdict, an UPPER bound an index cannot narrow (engine -3;0;1;2;3;9)" "SELECT ID FROM T WHERE D + 0 <= (?) ORDER BY ID" '["#NaN"]'
 both             "FLOOR TI.FL + 0 > (?) [NaN] - FLOAT arithmetic widens to DOUBLE (engine (none))" "SELECT ID FROM TI WHERE FL + 0 > (?) ORDER BY ID" '["#NaN"]'
-eng_only         "D <= ? [NaN] - every row here and NONE for the mirror twin \`? >= D\`, one term (engine -3;0;1;2;3;9)" "SELECT ID FROM T WHERE D <= ? ORDER BY ID" '["#NaN"]'
-eng_only         "? >= D [NaN] - that mirror twin (engine (none))" "SELECT ID FROM T WHERE ? >= D ORDER BY ID" '["#NaN"]'
-eng_only         "TI.D <= ? [NaN] - indexed (engine -3;0;1;2;3;9)" "SELECT ID FROM TI WHERE D <= ? ORDER BY ID" '["#NaN"]'
+both             "D <= ? [NaN] - ANSWERED NOW: every row here and NONE for the mirror twin \`? >= D\`, one term (engine -3;0;1;2;3;9)" "SELECT ID FROM T WHERE D <= ? ORDER BY ID" '["#NaN"]'
+both             "? >= D [NaN] - that mirror twin (engine (none))" "SELECT ID FROM T WHERE ? >= D ORDER BY ID" '["#NaN"]'
+both             "TI.D <= ? [NaN] - indexed (engine -3;0;1;2;3;9)" "SELECT ID FROM TI WHERE D <= ? ORDER BY ID" '["#NaN"]'
 eng_only         "FL >= ? [NaN] - a SINGLE side's TRUE verdict is a LOWER bound and the indexed twin answers none (engine -3;0;1;2;3;9)" "SELECT ID FROM T WHERE FL >= ? ORDER BY ID" '["#NaN"]'
 eng_only         "D IN (?, 99) [NaN] - the engine's IN is not its \`=\` (engine -3;0;1;2;3;9)" "SELECT ID FROM T WHERE D IN (?, 99) ORDER BY ID" '["#NaN"]'
 eng_only         "D NOT IN (?, 99) [NaN] (engine (none))" "SELECT ID FROM T WHERE D NOT IN (?, 99) ORDER BY ID" '["#NaN"]'
-eng_only         "D BETWEEN 0 AND ? [NaN] (engine 0;1;2;3;9)" "SELECT ID FROM T WHERE D BETWEEN 0 AND ? ORDER BY ID" '["#NaN"]'
-eng_only         "D + 0 > ? [NaN] - the BARE spelling: its mirror twin \`? < D + 0\` is every row (engine (none))" "SELECT ID FROM T WHERE D + 0 > ? ORDER BY ID" '["#NaN"]'
-eng_only         "ABS(D) > ? [NaN] (engine (none))" "SELECT ID FROM T WHERE ABS(D) > ? ORDER BY ID" '["#NaN"]'
+both             "D BETWEEN 0 AND ? [NaN] (engine 0;1;2;3;9)" "SELECT ID FROM T WHERE D BETWEEN 0 AND ? ORDER BY ID" '["#NaN"]'
+both             "D + 0 > ? [NaN] - ANSWERED NOW: the BARE spelling: its mirror twin \`? < D + 0\` is every row (engine (none))" "SELECT ID FROM T WHERE D + 0 > ? ORDER BY ID" '["#NaN"]'
+both             "ABS(D) > ? [NaN] (engine (none))" "SELECT ID FROM T WHERE ABS(D) > ? ORDER BY ID" '["#NaN"]'
 eng_only         "TI.ID > CAST(? AS DOUBLE PRECISION) [NaN] - an explicit cast carries no side precision (engine (none))" "SELECT ID FROM TI WHERE ID > CAST(? AS DOUBLE PRECISION) ORDER BY ID" '["#NaN"]'
 
 # 11D. A SHORT-BACKED COLUMN CONVERTS A BOUND DOUBLE INSIDE A MULTI-ITEM
