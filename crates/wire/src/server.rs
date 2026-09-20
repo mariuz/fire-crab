@@ -69788,12 +69788,12 @@ fn resolve_raw_cond(
         }
         // ...and a LIKE inside an EXPRESSION - IIF, CASE WHEN, a
         // projection - is the same law: an INT128 operand converts its
-        // pattern ([int128_expr_pattern]). This router never reaches
+        // pattern ([converting_expr_pattern]). This router never reaches
         // `numeric_term`, which is why it went on answering rows after
         // the WHERE arms were fixed.
         RawCond::Like(a, pat, esc, negated) => {
             let e = resolve_expr(a, columns, descs)?;
-            let pat = int128_expr_pattern(&e, pat, descs)?;
+            let pat = converting_expr_pattern(&e, pat, descs)?;
             Cond2::Like(Box::new(e), pat, *esc, *negated)
         }
         // the prefix test, with the operand's own collation deciding it
@@ -69807,7 +69807,7 @@ fn resolve_raw_cond(
             // 3 on the engine - '01' converts to 1 and renders "1",
             // which every row's text starts with - and was 0 here,
             // because the raw '01' matches nothing.
-            let prefix = int128_expr_pattern(&e, prefix, descs)?;
+            let prefix = converting_expr_pattern(&e, prefix, descs)?;
             match starting_canon(e, &prefix, descs) {
                 Some((wrapped, p)) => Cond2::Starting(Box::new(wrapped), p, *negated),
                 None => return None,
@@ -75747,7 +75747,7 @@ fn nullif_dec_literal(a: Expr, b: Expr, descs: &[Descriptor]) -> Option<Expr> {
 /// answer and is measured right: `N382 STARTING WITH '1e1'` answers
 /// NOTHING on the engine, where converting it to 10 and rendering "10"
 /// would predict 2;3. That branch is the floor, not a new law.
-fn int128_literal_pattern(p: &str, d: &Descriptor) -> Option<String> {
+fn converting_literal_pattern(p: &str, d: &Descriptor) -> Option<String> {
     match d.dtype {
         dtype::INT128 => wide_pattern_text(p, false),
         dtype::DOUBLE => wide_pattern_text(p, true),
@@ -75755,7 +75755,7 @@ fn int128_literal_pattern(p: &str, d: &Descriptor) -> Option<String> {
     }
 }
 
-/// [int128_literal_pattern] keyed on an EXPRESSION's announced type
+/// [converting_literal_pattern] keyed on an EXPRESSION's announced type
 /// rather than on a column's descriptor, because the WHERE resolver is
 /// not the only router that reaches this shape - and the other five were
 /// all answering wrongly.  Measured, every one of these raises the same
@@ -75775,7 +75775,17 @@ fn int128_literal_pattern(p: &str, d: &Descriptor) -> Option<String> {
 /// So the law is about the OPERAND'S TYPE, not about being a plain
 /// column: [Expr::is_wide] is the same INT128 question `dtype::INT128`
 /// asks of a descriptor, asked of an expression.
-fn int128_expr_pattern(e: &Expr, p: &str, descs: &[Descriptor]) -> Option<String> {
+///
+/// A TEMPORAL operand reaches the same five routers for the same reason
+/// ([col_kind] answers None for every temporal too, so even a plain
+/// `WHERE DT LIKE ..` arrives here) and takes [temporal_pattern_text] -
+/// measured through all of them: `SUM(IIF(DT LIKE '2%',1,0))`, the JOIN,
+/// the CASE WHEN twin, `CAST(DT AS TIMESTAMP) LIKE ..` and `DT + 1 LIKE
+/// '2020-1-16'` all convert on the engine.
+fn converting_expr_pattern(e: &Expr, p: &str, descs: &[Descriptor]) -> Option<String> {
+    if let Some(ExprType::Temporal(k)) = e.type_of(descs) {
+        return temporal_pattern_text(p, k);
+    }
     if expr_is_double(e, descs) {
         return wide_pattern_text(p, true);
     }
@@ -75834,6 +75844,193 @@ fn wide_pattern_text(p: &str, approx: bool) -> Option<String> {
             None
         }
     }
+}
+
+/// A LIKE / STARTING WITH pattern written as a string LITERAL against a
+/// **TEMPORAL** operand - the THIRD family whose pattern converts at
+/// prepare, after the INT128-backed exact numerics and DOUBLE
+/// ([wide_pattern_text]), and the one whose render is not a number's.
+///
+/// Measured on the live engine (2026-09-20, five columns carrying the
+/// same instants in every temporal declaration):
+///
+/// ```text
+///   DT  LIKE '2%'          -> RAISES 22018        DT LIKE '2020-1-15'  -> the row
+///   DT  LIKE '15.01.2020'  -> the row             DT LIKE '15-JAN-2020'-> the row
+///   TS  LIKE '2020-1-15 10:20:30'      -> the row TS LIKE '10:20:30'   -> RAISES
+///   TM  LIKE '10:20:30.0'  -> the row             TM LIKE '10:20'      -> (none)
+/// ```
+///
+/// So the pattern is CONVERTED and RENDERED BACK, exactly as a wide
+/// numeric's is - a wildcard, which cannot convert, raises the one-line
+/// 22018 at prepare with no describe - and three things decide the text
+/// that comes back:
+///
+/// * **THE OPERAND'S TYPE PICKS THE GRAMMAR.** A DATE takes a date and
+///   nothing else (`DT LIKE '2020-01-15 00:00:00'` and
+///   `DT LIKE '2020-01-15 +02:00'` both raise); a TIME takes a time
+///   (`TM LIKE '2020-01-15 10:20:30'` raises); a TIMESTAMP takes a date
+///   with an OPTIONAL time (`TS LIKE '2020-01-15'` converts, `TS LIKE
+///   '10:20:30'` raises).
+/// * **THE OPERAND'S TYPE ALSO PICKS THE CORE RENDER**, and a missing
+///   time is filled in: against a row holding today at midnight,
+///   `TS LIKE '<today>'` ANSWERS, so the render is the full
+///   `YYYY-MM-DD HH:MM:SS.FFFF` and not the date alone.
+/// * **THE ZONE COMES FROM THE TEXT, NEVER FROM THE OPERAND.** A zoned
+///   pattern against a ZONELESS operand keeps its zone and so matches
+///   nothing (`TM LIKE '10:20:30 +02:00'` is (none) although a row holds
+///   10:20:30 and another holds the 08:20:30 that a session-zone
+///   conversion would give), and a ZONELESS pattern against a zoned
+///   operand renders without one (`TMZ LIKE '08:20:30'` misses the row
+///   holding `08:20:30 Etc/UTC`). An OFFSET normalises through the zone
+///   id - `'+2:00'` and `'-00:00'` render "+02:00" and "+00:00" - and a
+///   REGION renders its table spelling, so `'europe/bucharest'` matches
+///   the row stored `Europe/Bucharest` while `'GMT'` does NOT match the
+///   row stored `+00:00`.
+///
+/// TODAY / NOW / YESTERDAY / TOMORROW KEEP THE RAW TEXT. They neither
+/// raise nor convert: against a row holding today, `DT LIKE 'TODAY'`,
+/// `TS LIKE 'TODAY'` and `TS STARTING WITH 'TODAY'` are all empty while
+/// `DT LIKE '<today>'` and `TS STARTING WITH '<today>'` answer - and
+/// `'TODAY.'`, `'TODAYX'` and `'TOD'` raise, so it is these four words
+/// and not a lenient special grammar. This is the same shape as the
+/// exact operand's e/E branch: a spelling the conversion does not own
+/// stays the text the user wrote.
+///
+/// WHEN A BLANK-SEPARATED TAIL IS PRESENT, ITS OWN REASON WINS over a
+/// junk head: `TM LIKE '1%'` is 22009 *Invalid time zone region: %* and
+/// `TM LIKE '2020-01-15 10:20:30'` is 22009 *Invalid time zone offset:
+/// -01-15 10:20:30*, while `TM LIKE '10 +02:00'` - a good zone and a
+/// head that is not a time - is the plain 22018. A text that does not
+/// OPEN with a digit never reaches the zone parser at all (`TM LIKE
+/// 'zz'` and `'x%'` are 22018), which is what keeps `'abc def'` from
+/// answering with a zone's vector.
+fn temporal_pattern_text(p: &str, k: TKind) -> Option<String> {
+    let t = p.trim_matches(|c| c == ' ' || c == '\t');
+    if matches!(
+        t.to_ascii_uppercase().as_str(),
+        "TODAY" | "NOW" | "YESTERDAY" | "TOMORROW"
+    ) {
+        return Some(p.to_string());
+    }
+    let expect = match k {
+        TKind::Date => ExpectTemporal::Date,
+        TKind::Time | TKind::TimeTz => ExpectTemporal::Time,
+        TKind::Timestamp | TKind::TimestampTz => ExpectTemporal::Timestamp,
+    };
+    let now = now_date_time();
+    let render = |(d, u): (i32, u32), zone: Option<u16>| -> String {
+        use fire_crab_ods::format::Value;
+        let core = match expect {
+            ExpectTemporal::Date => Value::Date(d).render(),
+            ExpectTemporal::Time => Value::Time(u).render(),
+            ExpectTemporal::Timestamp => Value::Timestamp(d, u).render(),
+        };
+        match zone {
+            // the WALL time and the zone as written - never
+            // [Value::TimeTz], whose render converts a stored UTC
+            // instant into the zone and would move the text
+            Some(z) => format!("{core} {}", fire_crab_ods::tz::zone_text(z)),
+            None => core,
+        }
+    };
+    // the whole text, no zone - the ordinary case, and the one a DATE
+    // operand is limited to
+    if let Some(v) = string_to_datetime(t, expect, now, false) {
+        return Some(render(v, None));
+    }
+    if let Some((head, tail)) = split_pattern_zone(t, expect) {
+        // THE ZONE'S REASON WINS over a junk head: `?` carries
+        // [resolve_zone_tail]'s 22009 out as the statement's refusal,
+        // which is what `TM LIKE '1%'` (region: %) and `TM LIKE
+        // '2020-01-15 10:20:30'` (offset: -01-15 10:20:30) are
+        let z = resolve_zone_tail(tail)?;
+        if let Some(v) = string_to_datetime(head, expect, now, false) {
+            return Some(render(v, Some(z)));
+        }
+        // a GOOD zone and a head that is not a time: the plain
+        // conversion error (measured, `TM LIKE '10 +02:00'`)
+    }
+    // the vector quotes the pattern AS WRITTEN, outer blanks and all
+    // (measured: `DT LIKE ' abc '` is `conversion error from string
+    // " abc "`)
+    refuse_literal_conv(p, false)?;
+    None
+}
+
+/// A temporal PATTERN's value/zone split, which is not
+/// [split_zone_tail]'s - that one takes the final whitespace-separated
+/// token and serves the COMPARISON path, and this law needs the split
+/// the engine's own parser makes: **the value characters are consumed
+/// and EVERYTHING AFTER THEM IS THE ZONE**, whatever it looks like.
+/// Three measured cells need exactly that and no less:
+///
+/// ```text
+///   TM LIKE '1%'                  -> 22009 Invalid time zone region: %
+///   TM LIKE '2020-01-15 10:20:30' -> 22009 Invalid time zone offset: -01-15 10:20:30
+///   TMZ LIKE '10:20:30.0000+02:00' -> the row (no blank before the offset)
+/// ```
+///
+/// A whitespace split sees no tail at all in the first and third and
+/// the wrong one in the second. The value run is `[0-9:.]` for a TIME
+/// and `[0-9/.-]` plus an optional blank-separated time for a
+/// TIMESTAMP; a DATE never splits (`DT LIKE '2020-01-15 zz'` is the
+/// plain 22018), and neither does a text that does not OPEN with a
+/// digit (`'zz'`, `'x%'`).
+///
+/// It runs only AFTER the whole text has failed to parse, so a split
+/// that cuts a valid spelling in two - `'15 JAN 2020'` has no digit run
+/// to speak of - can only turn one failure into another, never an
+/// answer into a failure.
+fn split_pattern_zone(t: &str, expect: ExpectTemporal) -> Option<(&str, &str)> {
+    if expect == ExpectTemporal::Date || !t.as_bytes().first()?.is_ascii_digit() {
+        return None;
+    }
+    let b = t.as_bytes();
+    let run = |from: usize, set: &[u8]| {
+        let mut i = from;
+        while i < b.len() && set.contains(&b[i]) {
+            i += 1;
+        }
+        i
+    };
+    const TIME_RUN: &[u8] = b":.0123456789";
+    let mut i = run(0, if expect == ExpectTemporal::Time { TIME_RUN } else { b"-/.0123456789" });
+    if expect == ExpectTemporal::Timestamp {
+        // a ':' where the DATE's run stopped means the text is a TIME,
+        // and a time alone is a TIMESTAMP's plain conversion error, not
+        // a zone: `TS LIKE '10:20:30'` is 22018 on the engine and was
+        // this splitter's own 22009 *region: :20:30* for one round
+        if b.get(i) == Some(&b':') {
+            return None;
+        }
+        // A TIMESTAMP'S ZONE OPENS ONLY AFTER A COMPLETE DATE - three
+        // numeric components, VALID OR NOT.  Measured: `'2020-01 %'` is
+        // the plain 22018 and `'2020-13-01 %'` is *region: %*, so it is
+        // the COUNT that decides and not the calendar.
+        if b[..i].iter().filter(|c| !c.is_ascii_digit()).count() < 2 {
+            return None;
+        }
+        // the date's own run stops at the blank before the time, so a
+        // written time joins the VALUE rather than opening the zone
+        let mut j = i;
+        while j < b.len() && (b[j] == b' ' || b[j] == b'\t') {
+            j += 1;
+        }
+        if j > i && b.get(j).is_some_and(u8::is_ascii_digit) {
+            i = run(j, TIME_RUN);
+        }
+    }
+    // A SEPARATOR IMMEDIATELY BEFORE THE CUT HAS OPENED A COMPONENT
+    // THAT NEVER ARRIVED, and that is a conversion error rather than a
+    // zone: `TS LIKE '2020-01-15 10:%'` and `TM LIKE '10:20:30.%'` are
+    // both the plain 22018, where their unseparated twins
+    // (`'2020-01-15 10 %'`, `'1:2%'`) are *region: %*.
+    if matches!(b.get(i.wrapping_sub(1)), Some(b':' | b'.' | b'-' | b'/')) {
+        return None;
+    }
+    let (head, tail) = (t[..i].trim(), t[i..].trim());
+    (!head.is_empty() && !tail.is_empty()).then_some((head, tail))
 }
 
 /// A LIKE / STARTING WITH pattern written as a string LITERAL against a
@@ -78307,16 +78504,25 @@ fn string_to_datetime(
                     n = mi as u32 + 1;
                 }
                 None => {
-                    // a special date verb: the WHOLE string, first position.
-                    // The engine's tail scan pre-increments past the char
-                    // that ENDED the letter run (cvt.cpp `while (++p <
-                    // end)`), so exactly ONE junk character rides free -
-                    // 'TODAY.' and 'NOW.  ' convert, 'TODAY..' and
-                    // 'NOW .' refuse (probed; review-caught)
+                    // a special date verb: the WHOLE string, first
+                    // position, and NOTHING BUT BLANKS AFTER IT.
+                    //
+                    // This arm used to let exactly ONE junk character
+                    // ride free, on a reading of the engine's tail scan
+                    // (cvt.cpp `while (++p < end)`) that said 'TODAY.'
+                    // converts.  RE-MEASURED 2026-09-20 against the live
+                    // Firebird 6.0 (LI-T6.0.0.2179, 1c9d56b): it does
+                    // not.  `CAST('TODAY.' AS DATE)`, `INSERT INTO ZZ
+                    // VALUES (1,'TODAY.')` and `TS LIKE 'TODAY.'` all
+                    // raise 22018, while `'TODAY '`, `'TODAY  '`,
+                    // `'TODAY<tab>'` and `'todaY'` all convert and
+                    // `'TODAY,'` raises.  `serve-real-temporaldml.sh`
+                    // had been RED on exactly this row since the claim
+                    // was written (confirmed against the previous
+                    // binary, so it is not this chunk's regression).
                     if !allow_special || i != start {
                         return None;
                     }
-                    p += 1;
                     while p < end {
                         if b[p] != b' ' && b[p] != b'\t' && b[p] != 0 {
                             return None;
@@ -99984,9 +100190,9 @@ fn resolve_expr_term(
             // as in `numeric_term` - this is the arm a JOIN, a COMPUTED
             // BY column, an arithmetic operand and a CAST all land in,
             // because `col_kind` answers None for INT128 and the typed
-            // path is never reached ([int128_expr_pattern]). A narrow
+            // path is never reached ([converting_expr_pattern]). A narrow
             // operand gets its text back unchanged.
-            let lifted = int128_expr_pattern(&lhs, &lifted, descs)?;
+            let lifted = converting_expr_pattern(&lhs, &lifted, descs)?;
             let p = &lifted;
             if expr_is_octets(&lhs, descs) {
                 octets_like_term(lhs, p, *negated)
@@ -100041,7 +100247,16 @@ fn resolve_expr_term(
                 // a numeric expression (INT or scaled NUMERIC) renders to
                 // the fixed 30, matching the literal-pattern arm above,
                 // which already accepts a numeric side
-                ExprType::Int | ExprType::Numeric => NUM_LIKE_PATTERN_LEN,
+                //
+                // A TEMPORAL SIDE TAKES THE SAME FIXED 30 - measured, all
+                // five families announce `VARYING len 30 charset NONE`
+                // for `<temporal> LIKE ?` - and a BOUND pattern is NOT
+                // converted the way a literal one is: it matches the
+                // RENDERED value, wildcards live, which is what makes
+                // `DT LIKE ?` bound '2%' answer rows where the literal
+                // `DT LIKE '2%'` raises.  The conversion is a PREPARE-time
+                // fold and a parameter has no value to fold.
+                ExprType::Int | ExprType::Numeric | ExprType::Temporal(_) => NUM_LIKE_PATTERN_LEN,
                 ExprType::Text => text_param_width(&lhs, descs)
                     .map(|(_, w)| (w as u16).saturating_add(2))
                     .unwrap_or(32765),
@@ -100241,8 +100456,20 @@ fn resolve_expr_term(
         }
         RawKind::Containing(..) => return None, // a binary pattern
         RawKind::Starting(Rhs::Str(p), negated) => {
-            // temporal/bool/numeric rendering under a prefix test is
-            // unprobed - refuse those, answer text and integer sides.
+            // bool/numeric rendering under a prefix test is unprobed -
+            // refuse those, answer text, integer, approximate and
+            // temporal sides.
+            //
+            // A TEMPORAL SIDE IS PROBED NOW, AND THIS REFUSAL WAS THE
+            // WHOLE PREFIX HALF OF THE TEMPORAL LAW: `DT STARTING WITH
+            // '2020-1-15'`, `'15.01.2020'`, `TM STARTING WITH
+            // '10:20:30.0'` and `TMZ STARTING WITH '10:20:30 +02:00'`
+            // all answer the row on the engine, and this server refused
+            // every one with a bare 42000 while its own `DT LIKE
+            // '2020-01-15'` answered.  STARTING converts its prefix
+            // exactly as LIKE converts its pattern - `DT STARTING WITH
+            // '2020'` raises the same 22018 - so the two arms differ
+            // only in the match, never in the conversion.
             //
             // APPROX IS NO LONGER UNPROBED, AND THE REFUSAL WAS COSTING
             // REAL ANSWERS.  Measured: `FL STARTING WITH '1'` is 1;2 on
@@ -100251,16 +100478,16 @@ fn resolve_expr_term(
             // server refused with a bare 42000, while its own
             // `FL LIKE '1%'` had been answering correctly all along.
             // A FLOAT does not convert its pattern, so the prefix is the
-            // raw text; a DOUBLE does, and [int128_expr_pattern] knows
+            // raw text; a DOUBLE does, and [converting_expr_pattern] knows
             // which is which.  Refusing at an edge nobody had measured
             // is the trap the house laws warn about, and this was one.
             if !matches!(
                 lhs.type_of(descs)?,
-                ExprType::Text | ExprType::Int | ExprType::Approx
+                ExprType::Text | ExprType::Int | ExprType::Approx | ExprType::Temporal(_)
             ) {
                 return None;
             }
-            let p = &int128_expr_pattern(&lhs, p, descs)?;
+            let p = &converting_expr_pattern(&lhs, p, descs)?;
             // A TEXT PREFIX AGAINST A BYTE-CARRIER SIDE IS BYTE-COPIED
             // INTO IT (intl.cpp:465) - by the ATTACHMENT's encoding, and
             // for EVERY carrier rather than for OCTETS alone. The old
@@ -101317,9 +101544,9 @@ fn numeric_term(
         RawKind::IsNotNull => Term::IsNotNull(idx),
         // A WIDE column CONVERTS the pattern first; a narrow one matches
         // the rendered value, which is what every width did before
-        // ([int128_literal_pattern] carries the boundary and the cells).
+        // ([converting_literal_pattern] carries the boundary and the cells).
         RawKind::Like(Rhs::Str(p), escape, negated) => {
-            Term::ExprLike(Box::new(Expr::Col(idx)), int128_literal_pattern(&p, d)?, escape, negated)
+            Term::ExprLike(Box::new(Expr::Col(idx)), converting_literal_pattern(&p, d)?, escape, negated)
         }
         RawKind::Like(Rhs::Param(slot, _, ..), escape, negated) => {
             claim_text(slot);
@@ -101331,7 +101558,7 @@ fn numeric_term(
         RawKind::Similar(Rhs::Null, ..) => Term::Unknown,
         RawKind::Similar(..) => return None,
         RawKind::Starting(Rhs::Str(p), negated) => {
-            Term::ExprStarting(Box::new(Expr::Col(idx)), int128_literal_pattern(&p, d)?, negated)
+            Term::ExprStarting(Box::new(Expr::Col(idx)), converting_literal_pattern(&p, d)?, negated)
         }
         RawKind::Starting(Rhs::Param(slot, _, ..), negated) => {
             claim_text(slot);
@@ -116492,7 +116719,7 @@ mod tests {
         assert!(!hits("N STARTING WITH '12.500'"));
         // ...BUT THE INT128 SHAPE DOES NOT RENDER IDENTICALLY, and this
         // assertion used to say it did.  A WIDE exact numeric CONVERTS
-        // its pattern ([int128_literal_pattern]), so a wildcard raises
+        // its pattern ([converting_literal_pattern]), so a wildcard raises
         // where a narrow column matches text - measured, `INT128 LIKE
         // '1%'` and `NUMERIC(19,0) LIKE '1%'` raise on the engine while
         // `NUMERIC(18,0) LIKE '1%'` answers.  `resolve` is None here
@@ -118614,7 +118841,15 @@ mod tests {
         assert!(hit("D BETWEEN DATE'2019-01-01' AND DATE'2021-01-01'"));
         assert!(hit("D IN (DATE'2020-01-01', DATE'2022-12-31')"));
         assert!(!hit("D NOT IN (DATE'2020-01-01')"));
-        assert!(hit("D LIKE '2020%'"));
+        // A LIKE PATTERN AGAINST A TEMPORAL OPERAND CONVERTS
+        // ([temporal_pattern_text]), so a WILDCARD refuses the statement
+        // where this assertion used to expect a rendered-text match -
+        // the engine raises 22018 on `D LIKE '2020%'`, and it was wrong
+        // here since it was written.
+        assert!(build("D LIKE '2020%'").is_none());
+        assert!(hit("D LIKE '2020-1-1'"));
+        assert!(!hit("D LIKE '2020-01-02'"));
+        assert!(hit("D STARTING WITH '2020-01-01'"));
 
         // a DATE against a TIMESTAMP reads as MIDNIGHT (the engine's
         // conversion): the row's 08:30 timestamp is LATER than its date
@@ -124568,9 +124803,17 @@ mod tests {
         assert_eq!(date("now"), Some((d(2026, 8, 24), 12 * 3600 * 10000)));
         assert_eq!(time("TODAY"), None);
         assert_eq!(time("NOW"), Some((d(2026, 8, 24), 12 * 3600 * 10000)));
-        // the engine's tail scan skips ONE character after the verb
-        assert_eq!(date("TODAY."), Some((d(2026, 8, 24), 0)));
-        assert_eq!(date("NOW.  "), Some((d(2026, 8, 24), 12 * 3600 * 10000)));
+        // NOTHING BUT BLANKS MAY FOLLOW THE VERB.  These four lines
+        // asserted a "the tail scan skips ONE character" reading
+        // (`date("TODAY.")` was Some) until it was re-measured on
+        // 2026-09-20: the live engine raises 22018 for 'TODAY.' in a
+        // CAST, in an INSERT and as a LIKE pattern, and had been doing
+        // so all the while `serve-real-temporaldml.sh` was red on it.
+        assert_eq!(date("TODAY "), Some((d(2026, 8, 24), 0)));
+        assert_eq!(date("TODAY\t "), Some((d(2026, 8, 24), 0)));
+        assert_eq!(date("NOW  "), Some((d(2026, 8, 24), 12 * 3600 * 10000)));
+        assert_eq!(date("TODAY."), None);
+        assert_eq!(date("NOW.  "), None);
         assert_eq!(date("NOW ."), None);
         assert_eq!(date("TODAY.."), None);
         assert_eq!(date("TODAYX"), None);
@@ -126747,7 +126990,7 @@ mod computed_wide_types {
 
     /// ROUND 13: a NUMERIC FUNCTION'S `?` is a DOUBLE slot, not the
     /// A LIKE / STARTING PATTERN AGAINST AN INT128-BACKED EXACT NUMERIC
-    /// ([int128_literal_pattern]).  The two halves are asserted against
+    /// ([converting_literal_pattern]).  The two halves are asserted against
     /// each other rather than in isolation, because the law IS the
     /// boundary: the same text must convert on one side of it and pass
     /// through unchanged on the other.
@@ -126761,13 +127004,13 @@ mod computed_wide_types {
         // THE NARROW SIDE NEVER TOUCHES THE TEXT - not even a wildcard,
         // which is what keeps `NUMERIC(18,0) LIKE '1%'` a real pattern.
         for p in ["1%", "01", " 1", "0x1", "", "abc", "1 0"] {
-            assert_eq!(int128_literal_pattern(p, &narrow).as_deref(), Some(p), "{p}");
+            assert_eq!(converting_literal_pattern(p, &narrow).as_deref(), Some(p), "{p}");
         }
         // THE WIDE SIDE CONVERTS AND RENDERS BACK, AT THE LITERAL'S OWN
         // SCALE.  `'10'` becoming "10" and NOT "10.00" is the cell that
         // kills the "render at the column's scale" reading - the column
         // here is scale -2 and the answer still has no decimals.
-        let w = |p: &str| int128_literal_pattern(p, &wide);
+        let w = |p: &str| converting_literal_pattern(p, &wide);
         assert_eq!(w("10").as_deref(), Some("10"));
         assert_eq!(w("01.50").as_deref(), Some("1.50"));
         assert_eq!(w("1.5").as_deref(), Some("1.5"));
@@ -126801,7 +127044,7 @@ mod computed_wide_types {
         // is why `DP LIKE '1.5'` finds nothing against a row rendering
         // "1.500000000000000" - and the e/E half renders canonically.
         let dp = d(dtype::DOUBLE, 0, 8);
-        let a = |p: &str| int128_literal_pattern(p, &dp);
+        let a = |p: &str| converting_literal_pattern(p, &dp);
         assert_eq!(a("1.5").as_deref(), Some("1.5"));
         assert_eq!(a("100").as_deref(), Some("100"));
         assert_eq!(a("01.500000000000000").as_deref(), Some("1.500000000000000"));
@@ -126819,8 +127062,97 @@ mod computed_wide_types {
         // that makes this a dtype test rather than an "approximate" one.
         let fl = d(dtype::REAL, 0, 4);
         for p in ["1%", "1.5", "1.5e0", "abc"] {
-            assert_eq!(int128_literal_pattern(p, &fl).as_deref(), Some(p), "{p}");
+            assert_eq!(converting_literal_pattern(p, &fl).as_deref(), Some(p), "{p}");
         }
+    }
+
+    /// A LIKE / STARTING PATTERN AGAINST A TEMPORAL OPERAND
+    /// ([temporal_pattern_text]) - the THIRD converting family, and the
+    /// one whose law is about WHICH GRAMMAR THE OPERAND SELECTS. The
+    /// three kinds are asserted against each other on the SAME texts,
+    /// because that is where the law lives: a text that converts under
+    /// one raises under another.
+    #[test]
+    fn a_temporal_pattern_converts_by_the_operand_s_own_grammar() {
+        let dt = |p: &str| temporal_pattern_text(p, TKind::Date);
+        let ts = |p: &str| temporal_pattern_text(p, TKind::Timestamp);
+        let tm = |p: &str| temporal_pattern_text(p, TKind::Time);
+        // the whole CVT date grammar converts and renders canonically
+        for p in ["2020-01-15", "2020-1-15", "15.01.2020", "2020/01/15",
+                  "15-JAN-2020", "JAN-15-2020", "2020-JAN-15", "15 JAN 2020",
+                  " 2020-01-15 ", "  2020-01-15"] {
+            assert_eq!(dt(p).as_deref(), Some("2020-01-15"), "{p}");
+        }
+        // THE OPERAND PICKS THE GRAMMAR: the same text, three answers
+        assert_eq!(ts("2020-01-15").as_deref(), Some("2020-01-15 00:00:00.0000"));
+        assert_eq!(tm("2020-01-15"), None);
+        assert_eq!(dt("2020-01-15 00:00:00"), None);
+        assert_eq!(ts("2020-01-15 00:00:00").as_deref(), Some("2020-01-15 00:00:00.0000"));
+        assert_eq!(tm("10:20:30").as_deref(), Some("10:20:30.0000"));
+        assert_eq!(ts("10:20:30"), None);
+        // a missing second is 00 and the fraction always renders four
+        assert_eq!(tm("10:20").as_deref(), Some("10:20:00.0000"));
+        assert_eq!(tm("10:20:30.0").as_deref(), Some("10:20:30.0000"));
+        assert_eq!(tm("1:2:3.1234").as_deref(), Some("01:02:03.1234"));
+        // THE ZONE COMES FROM THE TEXT, NEVER FROM THE OPERAND: a plain
+        // TIME keeps a written zone (and so matches no zoneless value),
+        // a zoned operand renders none when none is written
+        assert_eq!(tm("10:20:30 +02:00").as_deref(), Some("10:20:30.0000 +02:00"));
+        assert_eq!(
+            temporal_pattern_text("10:20:30", TKind::TimeTz).as_deref(),
+            Some("10:20:30.0000")
+        );
+        // an OFFSET normalises through the zone id, a REGION through the
+        // zone table - which is why GMT does not become "+00:00"
+        assert_eq!(tm("10:20:30 +2:00").as_deref(), Some("10:20:30.0000 +02:00"));
+        assert_eq!(tm("10:20:30 -00:00").as_deref(), Some("10:20:30.0000 +00:00"));
+        assert_eq!(tm("10:20:30.0000+02:00").as_deref(), Some("10:20:30.0000 +02:00"));
+        assert_eq!(tm("10:20:30 gmt").as_deref(), Some("10:20:30.0000 GMT"));
+        assert_eq!(
+            ts("2020-01-15 10:20:30 europe/bucharest").as_deref(),
+            Some("2020-01-15 10:20:30.0000 Europe/Bucharest")
+        );
+        // THE FOUR SPECIALS KEEP THE RAW TEXT - they neither raise nor
+        // convert, in EVERY kind, including the one whose grammar has no
+        // such value (`TM LIKE 'TODAY'` does not raise on the engine)
+        for p in ["TODAY", "now", " YESTERDAY ", "TOMORROW"] {
+            assert_eq!(dt(p).as_deref(), Some(p), "{p}");
+            assert_eq!(tm(p).as_deref(), Some(p), "{p}");
+        }
+        for p in ["TODAYX", "TOD", "TODAY."] {
+            assert_eq!(dt(p), None, "{p} is not one of the four words");
+        }
+        // a wildcard cannot convert, and neither can junk
+        for p in ["2%", "%", "_", "2020-01-1_", "2020-01-15%", "abc", "", " abc ",
+                  "20-01-15", "2020-02-30", "32768-01-01", "2 0 2 0-01-15"] {
+            assert_eq!(dt(p), None, "{p} must refuse on a DATE operand");
+        }
+        // WHERE THE ZONE MAY OPEN AT ALL ([split_pattern_zone]): a TIME
+        // hands over the rest after ONE component, a TIMESTAMP only
+        // after THREE - valid or not - and neither after a separator
+        // that opened a component which never arrived.
+        assert_eq!(split_pattern_zone("1%", ExpectTemporal::Time), Some(("1", "%")));
+        assert_eq!(split_pattern_zone("1:2%", ExpectTemporal::Time), Some(("1:2", "%")));
+        assert_eq!(split_pattern_zone("10:20:30.%", ExpectTemporal::Time), None);
+        assert_eq!(split_pattern_zone("zz", ExpectTemporal::Time), None);
+        assert_eq!(split_pattern_zone("2%", ExpectTemporal::Timestamp), None);
+        assert_eq!(split_pattern_zone("2020-01 %", ExpectTemporal::Timestamp), None);
+        assert_eq!(
+            split_pattern_zone("2020-13-01 %", ExpectTemporal::Timestamp),
+            Some(("2020-13-01", "%"))
+        );
+        assert_eq!(
+            split_pattern_zone("2020-01-15zz", ExpectTemporal::Timestamp),
+            Some(("2020-01-15", "zz"))
+        );
+        assert_eq!(
+            split_pattern_zone("2020-01-15 10 %", ExpectTemporal::Timestamp),
+            Some(("2020-01-15 10", "%"))
+        );
+        assert_eq!(split_pattern_zone("2020-01-15 10:%", ExpectTemporal::Timestamp), None);
+        assert_eq!(split_pattern_zone("10:20:30", ExpectTemporal::Timestamp), None);
+        // a DATE never splits one at all
+        assert_eq!(split_pattern_zone("2020-01-15 zz", ExpectTemporal::Date), None);
     }
 
     /// A STRING LITERAL AGAINST A DECFLOAT COLUMN has its OWN grammar -

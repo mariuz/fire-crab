@@ -314,10 +314,15 @@ both      "8 (N92 * 1) LIKE '1%' - a narrow arithmetic result"  "SELECT ID FROM 
 both      "8 CAST(N382 AS VARCHAR(20)) LIKE '1%' - rendered FIRST, so it is a real pattern again" "SELECT ID FROM T WHERE CAST(N382 AS VARCHAR(20)) LIKE '1%' ORDER BY ID"
 eng_err_only "8 CAST(N92 AS DOUBLE PRECISION) LIKE '1%' - DOUBLE converts too, and this server still answers rows" \
              "SELECT ID FROM T WHERE CAST(N92 AS DOUBLE PRECISION) LIKE '1%' ORDER BY ID" '[]' "1;2;3"
-eng_err_only "8 CURRENT_DATE LIKE '2%' - and so does a DATE" \
-             "SELECT ID FROM T WHERE CURRENT_DATE LIKE '2%' ORDER BY ID" '[]' "1;2;3"
-eng_err_only "8 CAST('2020-01-01' AS DATE) LIKE '1%' - a written DATE cast" \
-             "SELECT ID FROM T WHERE CAST('2020-01-01' AS DATE) LIKE '1%' ORDER BY ID" '[]' "(none)"
+# THE TEMPORAL HALF LANDED (`serve-real-tmplike.sh`), so these two are
+# no longer recorded wrong answers - they are the law, and the cells
+# self-expired exactly as they were meant to.
+err_same  "8 CURRENT_DATE LIKE '2%' - a DATE operand converts its pattern too" \
+          "SELECT ID FROM T WHERE CURRENT_DATE LIKE '2%'"
+err_same  "8 CAST('2020-01-01' AS DATE) LIKE '1%' - a written DATE cast" \
+          "SELECT ID FROM T WHERE CAST('2020-01-01' AS DATE) LIKE '1%'"
+both      "8 CAST('2020-01-01' AS DATE) LIKE '2020-1-1' - ...and a converting pattern answers every row" \
+          "SELECT ID FROM T WHERE CAST('2020-01-01' AS DATE) LIKE '2020-1-1' ORDER BY ID"
 
 echo "--- 9. THE DOUBLE HALF: the SAME law with the exponent branch FLIPPED"
 # An EXACT wide operand renders a non-exponent spelling at the literal's
