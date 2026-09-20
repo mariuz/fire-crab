@@ -297,15 +297,22 @@ both      "6 D LIKE '1.5'   - it converts, so it matches"    "SELECT ID FROM M W
 both      "6 D LIKE '1.50'  - ...and 1.50 renders '1.50', which matches NOTHING" "SELECT ID FROM M WHERE D LIKE '1.50' ORDER BY ID"
 both      "6 D LIKE '+1.5'  - THE ROUND TRIP: the sign is normalised away" "SELECT ID FROM M WHERE D LIKE '+1.5' ORDER BY ID"
 both      "6 D LIKE ' 1.5 ' - ...and the blanks with it"     "SELECT ID FROM M WHERE D LIKE ' 1.5 ' ORDER BY ID"
-# ...BUT ONLY WITHOUT AN EXPONENT.  With one the engine renders the
-# pattern as a DOUBLE ("1E2" becomes the text "100.0000000000000"), not
-# as a DECFLOAT, so this server's DECFLOAT re-rendering finds the row
-# whose own rendering is "1E+2" and the engine finds nothing.  Recorded,
-# not modelled: the double text belongs to the double-literal law.
-divergence "6 D LIKE '1E2' - the exponent pattern renders as a DOUBLE on the engine and as a DECFLOAT here" \
-           "SELECT ID FROM M WHERE D LIKE '1E2' ORDER BY ID" '[]' "(none)" "7"
-divergence "6 D LIKE '1E+2' - the same gap spelled with the sign" \
-           "SELECT ID FROM M WHERE D LIKE '1E+2' ORDER BY ID" '[]' "(none)" "7"
+# ...BUT ONLY WITHOUT AN EXPONENT.  AN e/E SPELLING IS AN SQL **DOUBLE**
+# LITERAL and renders in double form, never at the DECFLOAT's own
+# quantum.  These two cells were RECORDED AS A DIVERGENCE when this gate
+# was written and they SELF-EXPIRED the moment the double clause landed -
+# which is what they were for.  They were also hiding a REGRESSION this
+# gate did not catch: rendering an e/E pattern at the DECFLOAT quantum
+# made `D LIKE '1.5e0'` answer a row the engine does not, on ORDINARY
+# rows, and the cells below are the ones that would have caught it.
+both      "6 D LIKE '1E2'  - the exponent pattern is a DOUBLE literal on BOTH sides now" "SELECT ID FROM M WHERE D LIKE '1E2' ORDER BY ID"
+both      "6 D LIKE '1E+2' - the same, spelled with the sign"  "SELECT ID FROM M WHERE D LIKE '1E+2' ORDER BY ID"
+both      "6 D LIKE '1.5e0'  - THE REGRESSION CELL: a row renders \"1.5\" and the pattern renders \"1.500000000000000\"" "SELECT ID FROM M WHERE D LIKE '1.5e0' ORDER BY ID"
+both      "6 D LIKE '15e-1'  - ...whatever the spelling of the same value" "SELECT ID FROM M WHERE D LIKE '15e-1' ORDER BY ID"
+both      "6 D LIKE '0.15e1'"                                  "SELECT ID FROM M WHERE D LIKE '0.15e1' ORDER BY ID"
+both      "6 S LIKE '1.5e0'   - and at DECFLOAT(16) too"       "SELECT ID FROM M WHERE S LIKE '1.5e0' ORDER BY ID"
+both      "6 D STARTING WITH '1.5e0' - and through STARTING"   "SELECT ID FROM M WHERE D STARTING WITH '1.5e0' ORDER BY ID"
+both      "6 CONTROL D LIKE '1.5' - the NON-exponent spelling still renders at the DECFLOAT quantum" "SELECT ID FROM M WHERE D LIKE '1.5' ORDER BY ID"
 both      "6 D LIKE '1 0 0' - the lenient blank rule reaches the pattern" "SELECT ID FROM M WHERE D LIKE '1 0 0' ORDER BY ID"
 both      "6 D STARTING WITH '01' - THE CELL NO 'keep the text' RULE FITS: '01' renders '1'" "SELECT ID FROM M WHERE D STARTING WITH '01' ORDER BY ID"
 both      "6 D STARTING WITH '1'"                            "SELECT ID FROM M WHERE D STARTING WITH '1' ORDER BY ID"
@@ -426,5 +433,5 @@ else echo "OK   no panic and the server is still up"; fi
 # A COUNTED FLOOR, from a measured run: a cell that silently stops running
 # reads exactly like one that passes.
 echo "ran $ran checks"
-if [ "$ran" -lt 127 ]; then echo "FAIL only $ran checks ran (floor 127) - cells went missing"; fail=1; fi
+if [ "$ran" -lt 133 ]; then echo "FAIL only $ran checks ran (floor 133) - cells went missing"; fail=1; fi
 exit $fail

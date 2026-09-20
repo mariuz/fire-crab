@@ -75748,10 +75748,11 @@ fn nullif_dec_literal(a: Expr, b: Expr, descs: &[Descriptor]) -> Option<Expr> {
 /// NOTHING on the engine, where converting it to 10 and rendering "10"
 /// would predict 2;3. That branch is the floor, not a new law.
 fn int128_literal_pattern(p: &str, d: &Descriptor) -> Option<String> {
-    if d.dtype != dtype::INT128 {
-        return Some(p.to_string());
+    match d.dtype {
+        dtype::INT128 => wide_pattern_text(p, false),
+        dtype::DOUBLE => wide_pattern_text(p, true),
+        _ => Some(p.to_string()),
     }
-    wide_pattern_text(p)
 }
 
 /// [int128_literal_pattern] keyed on an EXPRESSION's announced type
@@ -75775,15 +75776,48 @@ fn int128_literal_pattern(p: &str, d: &Descriptor) -> Option<String> {
 /// column: [Expr::is_wide] is the same INT128 question `dtype::INT128`
 /// asks of a descriptor, asked of an expression.
 fn int128_expr_pattern(e: &Expr, p: &str, descs: &[Descriptor]) -> Option<String> {
+    if expr_is_double(e, descs) {
+        return wide_pattern_text(p, true);
+    }
     if !e.is_wide(descs) {
         return Some(p.to_string());
     }
-    wide_pattern_text(p)
+    wide_pattern_text(p, false)
+}
+
+/// Does this expression announce DOUBLE PRECISION - the other operand type
+/// whose LIKE pattern converts?
+///
+/// FLOAT is deliberately NOT included: `dtype_real` does NOT convert, and
+/// `FL LIKE '1%'` answers rows on the engine where the DOUBLE twin raises.
+/// That one cell is why this asks for the dtype rather than for
+/// "approximate".
+fn expr_is_double(e: &Expr, descs: &[Descriptor]) -> bool {
+    matches!(e, Expr::Col(fid) if descs.get(*fid).is_some_and(|d| d.dtype == dtype::DOUBLE))
 }
 
 /// The conversion itself, written ONCE so the column entry point and the
 /// expression one cannot drift apart. `None` refuses the statement.
-fn wide_pattern_text(p: &str) -> Option<String> {
+///
+/// `approx` says WHICH GRAMMAR OWNS THE OPERAND, and it is the only thing
+/// that differs between a wide EXACT operand and a DOUBLE one - measured,
+/// and the flip is not arbitrary:
+///
+/// * an EXACT operand renders a non-exponent spelling AT THE LITERAL'S OWN
+///   SCALE (`N382 LIKE '10'` is "10", not the column's "10.00") and leaves
+///   an e/E spelling as RAW TEXT (`N382 STARTING WITH '1e1'` answers
+///   nothing, where rendering "10" would predict two rows);
+/// * a DOUBLE operand does the OPPOSITE with the exponent half - `DP LIKE
+///   '1.5e0'`, `'15e-1'`, `'0.15e1'` and `'1e2'` all ANSWER, through the
+///   engine's canonical 15-decimal double text - while still rendering a
+///   non-exponent spelling at its own scale, which is why `DP LIKE '1.5'`
+///   answers NOTHING and `'1.500000000000000'` answers the row.
+///
+/// Nine further cells were PREDICTED from that reading and then measured,
+/// all nine correct, including `'01.500000000000000'` and
+/// `'1 . 500000000000000'` (the lenient grammar's blanks) answering and
+/// `'1.5 e0'` raising (the double grammar's do not).
+fn wide_pattern_text(p: &str, approx: bool) -> Option<String> {
     match text_col_num(p) {
         ColNum::Exact(m, e) => Some(match i8::try_from(e) {
             Ok(sc) => fire_crab_ods::format::Value::Int128(m, sc).render(),
@@ -75791,7 +75825,9 @@ fn wide_pattern_text(p: &str) -> Option<String> {
             // invent a rendering for it
             Err(_) => p.to_string(),
         }),
-        // the double path - see the `1e1` cell above
+        ColNum::Dbl(d) if approx => Some(fire_crab_ods::format::render_double(d)),
+        // an exact operand does not own the exponent spelling - see the
+        // `1e1` cell above
         ColNum::Dbl(_) => Some(p.to_string()),
         ColNum::HexHigh | ColNum::Raise => {
             refuse_literal_conv(p, false)?;
@@ -75806,6 +75842,19 @@ fn wide_pattern_text(p: &str) -> Option<String> {
 /// text the user wrote - is what the engine matches with.  `None`
 /// refuses the statement through [refuse_literal_conv].
 fn dec_literal_pattern(p: &str, d: &Descriptor) -> Option<String> {
+    // AN e/E SPELLING IS AN SQL **DOUBLE** LITERAL AND RENDERS IN DOUBLE
+    // FORM, never at the DECFLOAT's own quantum - and getting that wrong
+    // was a REGRESSION this chunk's predecessor shipped.  Measured:
+    // `D34 LIKE '1.5e0'`, `'15e-1'`, `'0.15e1'` and
+    // `D34 STARTING WITH '1.5e0'` all answer NOTHING on the engine
+    // against a row rendering "1.5", because the pattern renders
+    // "1.500000000000000"; `4431ddf` answered none, `4097ec8` answered
+    // the row.  It is the same clause the DOUBLE operand needs
+    // ([wide_pattern_text]'s `approx` arm), and the two were measured
+    // together.
+    if let ColNum::Dbl(v) = text_col_num(p) {
+        return Some(fire_crab_ods::format::render_double(v));
+    }
     match literal_to_dec128(p) {
         Ok(bits) => {
             let bits = if d.dtype == dtype::DEC64 { narrow_dec16_bind(bits) } else { bits };
@@ -100192,11 +100241,26 @@ fn resolve_expr_term(
         }
         RawKind::Containing(..) => return None, // a binary pattern
         RawKind::Starting(Rhs::Str(p), negated) => {
-            // temporal/approx/bool/numeric rendering under a prefix test
-            // is unprobed - refuse those, answer text and integer sides
-            if !matches!(lhs.type_of(descs)?, ExprType::Text | ExprType::Int) {
+            // temporal/bool/numeric rendering under a prefix test is
+            // unprobed - refuse those, answer text and integer sides.
+            //
+            // APPROX IS NO LONGER UNPROBED, AND THE REFUSAL WAS COSTING
+            // REAL ANSWERS.  Measured: `FL STARTING WITH '1'` is 1;2 on
+            // the engine, `FL STARTING WITH '1.5'` is 1 and
+            // `FL STARTING WITH 'abc'` is no rows - three answers this
+            // server refused with a bare 42000, while its own
+            // `FL LIKE '1%'` had been answering correctly all along.
+            // A FLOAT does not convert its pattern, so the prefix is the
+            // raw text; a DOUBLE does, and [int128_expr_pattern] knows
+            // which is which.  Refusing at an edge nobody had measured
+            // is the trap the house laws warn about, and this was one.
+            if !matches!(
+                lhs.type_of(descs)?,
+                ExprType::Text | ExprType::Int | ExprType::Approx
+            ) {
                 return None;
             }
+            let p = &int128_expr_pattern(&lhs, p, descs)?;
             // A TEXT PREFIX AGAINST A BYTE-CARRIER SIDE IS BYTE-COPIED
             // INTO IT (intl.cpp:465) - by the ATTACHMENT's encoding, and
             // for EVERY carrier rather than for OCTETS alone. The old
@@ -126729,6 +126793,33 @@ mod computed_wide_types {
         // sees None and PREPARE_REFUSAL carries the engine's vector
         for p in ["1%", "1_", "%.5%", "0x1", "", "abc", "-"] {
             assert_eq!(w(p), None, "{p} must refuse on a wide column");
+        }
+
+        // A DOUBLE OPERAND IS THE SAME LAW WITH THE EXPONENT BRANCH
+        // FLIPPED, because that is the grammar it owns.  The
+        // non-exponent half is IDENTICAL to the wide-exact one - which
+        // is why `DP LIKE '1.5'` finds nothing against a row rendering
+        // "1.500000000000000" - and the e/E half renders canonically.
+        let dp = d(dtype::DOUBLE, 0, 8);
+        let a = |p: &str| int128_literal_pattern(p, &dp);
+        assert_eq!(a("1.5").as_deref(), Some("1.5"));
+        assert_eq!(a("100").as_deref(), Some("100"));
+        assert_eq!(a("01.500000000000000").as_deref(), Some("1.500000000000000"));
+        assert_eq!(a("1 . 500000000000000").as_deref(), Some("1.500000000000000"));
+        assert_eq!(a("1.5e0").as_deref(), Some("1.500000000000000"));
+        assert_eq!(a("15e-1").as_deref(), Some("1.500000000000000"));
+        assert_eq!(a("0.15e1").as_deref(), Some("1.500000000000000"));
+        assert_eq!(a("1e2").as_deref(), Some("100.0000000000000"));
+        assert_eq!(a("-25e-1").as_deref(), Some("-2.500000000000000"));
+        for p in ["1%", "abc", "_", "1.5 e0", "0x1", ""] {
+            assert_eq!(a(p), None, "{p} must refuse on a DOUBLE operand");
+        }
+        // ...and FLOAT is NOT in the set: `FL LIKE '1%'` answers rows on
+        // the engine where its DOUBLE twin raises, which is the one cell
+        // that makes this a dtype test rather than an "approximate" one.
+        let fl = d(dtype::REAL, 0, 4);
+        for p in ["1%", "1.5", "1.5e0", "abc"] {
+            assert_eq!(int128_literal_pattern(p, &fl).as_deref(), Some(p), "{p}");
         }
     }
 

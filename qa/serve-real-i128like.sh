@@ -62,14 +62,15 @@ CREATE TABLE T (
   N92 NUMERIC(9,2), N180 NUMERIC(18,0), N184 NUMERIC(18,4), N1818 NUMERIC(18,18),
   N190 NUMERIC(19,0), N194 NUMERIC(19,4), N382 NUMERIC(38,2), N380 NUMERIC(38,0),
   DC192 DECIMAL(19,2), DC382 DECIMAL(38,2),
-  I128 INT128, BI BIGINT, SM SMALLINT, IN4 INTEGER, S VARCHAR(20));
+  I128 INT128, BI BIGINT, SM SMALLINT, IN4 INTEGER, S VARCHAR(20),
+  DP DOUBLE PRECISION, FL FLOAT);
 CREATE TABLE W (ID INTEGER, N382 NUMERIC(38,2));
 CREATE TABLE U (ID INTEGER, TAG VARCHAR(5));
 CREATE TABLE C (ID INTEGER, N382 NUMERIC(38,2), CP COMPUTED BY (N382 * 1), N92 NUMERIC(9,2));
 COMMIT;
-INSERT INTO T VALUES (1, 1.50, 1, 1.5000, 0.5, 1, 1.5000, 1.50, 1, 1.50, 1.50, 1, 1, 1, 1, '1.50');
-INSERT INTO T VALUES (2, 10.00, 10, 10.0000, 0.1, 10, 10.0000, 10.00, 10, 10.00, 10.00, 10, 10, 10, 10, '10.00');
-INSERT INTO T VALUES (3, 100.50, 100, 100.5000, 0.0, 100, 100.5000, 100.50, 100, 100.50, 100.50, 100, 100, 100, 100, '100.50');
+INSERT INTO T VALUES (1, 1.50, 1, 1.5000, 0.5, 1, 1.5000, 1.50, 1, 1.50, 1.50, 1, 1, 1, 1, '1.50', 1.5, 1.5);
+INSERT INTO T VALUES (2, 10.00, 10, 10.0000, 0.1, 10, 10.0000, 10.00, 10, 10.00, 10.00, 10, 10, 10, 10, '10.00', 100.0, 100.0);
+INSERT INTO T VALUES (3, 100.50, 100, 100.5000, 0.0, 100, 100.5000, 100.50, 100, 100.50, 100.50, 100, 100, 100, 100, '100.50', -2.5, -2.5);
 INSERT INTO W VALUES (1, 1.50);
 INSERT INTO W VALUES (2, 10.00);
 INSERT INTO W VALUES (3, 100.50);
@@ -318,6 +319,58 @@ eng_err_only "8 CURRENT_DATE LIKE '2%' - and so does a DATE" \
 eng_err_only "8 CAST('2020-01-01' AS DATE) LIKE '1%' - a written DATE cast" \
              "SELECT ID FROM T WHERE CAST('2020-01-01' AS DATE) LIKE '1%' ORDER BY ID" '[]' "(none)"
 
+echo "--- 9. THE DOUBLE HALF: the SAME law with the exponent branch FLIPPED"
+# An EXACT wide operand renders a non-exponent spelling at the literal's
+# own scale and leaves an e/E one as raw text.  A DOUBLE operand renders
+# the non-exponent spelling the same way - which is why `DP LIKE '1.5'`
+# answers NOTHING against a row rendering "1.500000000000000" - and
+# renders an e/E one through the ENGINE'S CANONICAL DOUBLE TEXT, which is
+# why `'1.5e0'`, `'15e-1'`, `'0.15e1'` and `'1e2'` all answer.
+# Nine of these were PREDICTED from that reading before being measured.
+err_same  "9 DP LIKE '1%'   - a wildcard cannot convert"     "SELECT ID FROM T WHERE DP LIKE '1%'"
+err_same  "9 DP LIKE 'abc'"                                  "SELECT ID FROM T WHERE DP LIKE 'abc'"
+err_same  "9 DP LIKE '_'"                                    "SELECT ID FROM T WHERE DP LIKE '_'"
+err_same  "9 DP NOT LIKE '1%' - negation does not excuse it" "SELECT ID FROM T WHERE DP NOT LIKE '1%'"
+err_same  "9 1 = 0 AND DP LIKE '1%' - and it raises at PREPARE" "SELECT ID FROM T WHERE 1 = 0 AND DP LIKE '1%'"
+both      "9 DP LIKE '1.5'   - scale 1, so \"1.5\", which the row's text is not" "SELECT ID FROM T WHERE DP LIKE '1.5' ORDER BY ID"
+both      "9 DP LIKE '1.50'  - nor is \"1.50\""            "SELECT ID FROM T WHERE DP LIKE '1.50' ORDER BY ID"
+both      "9 DP LIKE '1.5000000000000000' - sixteen decimals, one too many" "SELECT ID FROM T WHERE DP LIKE '1.5000000000000000' ORDER BY ID"
+both      "9 DP LIKE '1.500000000000000' - ...and at FIFTEEN it is the render" "SELECT ID FROM T WHERE DP LIKE '1.500000000000000' ORDER BY ID"
+both      "9 DP LIKE '100'   - scale 0"                      "SELECT ID FROM T WHERE DP LIKE '100' ORDER BY ID"
+both      "9 DP LIKE '100.0000000000000'"                    "SELECT ID FROM T WHERE DP LIKE '100.0000000000000' ORDER BY ID"
+both      "9 DP LIKE '-2.500000000000000' - and a negative one" "SELECT ID FROM T WHERE DP LIKE '-2.500000000000000' ORDER BY ID"
+both      "9 DP LIKE '1.5e0'  - AN EXPONENT TAKES THE DOUBLE GRAMMAR" "SELECT ID FROM T WHERE DP LIKE '1.5e0' ORDER BY ID"
+both      "9 DP LIKE '15e-1'  - ...whatever the spelling of the value" "SELECT ID FROM T WHERE DP LIKE '15e-1' ORDER BY ID"
+both      "9 DP LIKE '0.15e1'"                               "SELECT ID FROM T WHERE DP LIKE '0.15e1' ORDER BY ID"
+both      "9 DP LIKE '1e2'"                                  "SELECT ID FROM T WHERE DP LIKE '1e2' ORDER BY ID"
+both      "9 DP LIKE '-25e-1'"                               "SELECT ID FROM T WHERE DP LIKE '-25e-1' ORDER BY ID"
+both      "9 DP LIKE '01.500000000000000' - the leading zero goes in the conversion" "SELECT ID FROM T WHERE DP LIKE '01.500000000000000' ORDER BY ID"
+both      "9 DP LIKE ' 1.500000000000000 ' - and the surrounding blanks" "SELECT ID FROM T WHERE DP LIKE ' 1.500000000000000 ' ORDER BY ID"
+both      "9 DP LIKE '1 . 500000000000000' - and an INTERIOR one: the lenient grammar" "SELECT ID FROM T WHERE DP LIKE '1 . 500000000000000' ORDER BY ID"
+both      "9 DP LIKE '1.5e0 ' - a trailing blank AFTER an exponent is fine" "SELECT ID FROM T WHERE DP LIKE '1.5e0 ' ORDER BY ID"
+err_same  "9 DP LIKE '1.5 e0' - ...an INTERIOR one is not: the double grammar refuses" "SELECT ID FROM T WHERE DP LIKE '1.5 e0'"
+both      "9 CONTROL FL LIKE '1%' - FLOAT DOES NOT CONVERT, which is why this asks for the dtype and not for \"approximate\"" "SELECT ID FROM T WHERE FL LIKE '1%' ORDER BY ID"
+both      "9 CONTROL FL LIKE '1.5'"                          "SELECT ID FROM T WHERE FL LIKE '1.5' ORDER BY ID"
+both      "9 CONTROL S LIKE '1%' - and a VARCHAR is a real pattern" "SELECT ID FROM T WHERE S LIKE '1%' ORDER BY ID"
+
+echo "--- 10. STARTING WITH over an APPROXIMATE operand, which this server used to REFUSE"
+# `resolve_expr_term`'s STARTING arm refused every approximate operand
+# with a bare 42000 on the grounds that the rendering was "unprobed".
+# It is probed now, and the refusal was costing THREE real answers on
+# FLOAT alone - while the same server's `FL LIKE '1%'` had been right all
+# along.  A refusal planted at an edge nobody measured is the trap the
+# house laws warn about; this was one.
+both      "10 FL STARTING WITH '1'   - FLOAT does not convert: a plain text prefix" "SELECT ID FROM T WHERE FL STARTING WITH '1' ORDER BY ID"
+both      "10 FL STARTING WITH '1.5'"                        "SELECT ID FROM T WHERE FL STARTING WITH '1.5' ORDER BY ID"
+both      "10 FL STARTING WITH 'abc' - ...and junk simply matches nothing" "SELECT ID FROM T WHERE FL STARTING WITH 'abc' ORDER BY ID"
+both      "10 FL STARTING WITH '01'  - ...which a CONVERTING operand would have matched" "SELECT ID FROM T WHERE FL STARTING WITH '01' ORDER BY ID"
+both      "10 DP STARTING WITH '1'   - a DOUBLE DOES convert its prefix" "SELECT ID FROM T WHERE DP STARTING WITH '1' ORDER BY ID"
+both      "10 DP STARTING WITH '+1'  - THE CELL RAW TEXT CANNOT PRODUCE: '+1' renders \"1\"" "SELECT ID FROM T WHERE DP STARTING WITH '+1' ORDER BY ID"
+both      "10 DP STARTING WITH '1.5'"                        "SELECT ID FROM T WHERE DP STARTING WITH '1.5' ORDER BY ID"
+both      "10 DP STARTING WITH '1.5e0' - and the exponent form goes through DOUBLE here too" "SELECT ID FROM T WHERE DP STARTING WITH '1.5e0' ORDER BY ID"
+err_same  "10 DP STARTING WITH 'abc' - and what cannot convert raises, as LIKE does" "SELECT ID FROM T WHERE DP STARTING WITH 'abc'"
+both      "10 CONTROL S STARTING WITH '1' - a VARCHAR operand is untouched" "SELECT ID FROM T WHERE S STARTING WITH '1' ORDER BY ID"
+
 # ---------------------------------------------------------------
 echo "--- panic check"
 ran=$((ran + 1))
@@ -328,5 +381,5 @@ elif ! kill -0 $srv 2>/dev/null; then
 else echo "OK   no panic and the server is still up"; fi
 
 echo "ran $ran checks"
-if [ "$ran" -lt 85 ]; then echo "FAIL only $ran checks ran (floor 85) - cells went missing"; fail=1; fi
+if [ "$ran" -lt 120 ]; then echo "FAIL only $ran checks ran (floor 120) - cells went missing"; fail=1; fi
 exit $fail
