@@ -69786,18 +69786,29 @@ fn resolve_raw_cond(
             let (l, r) = cmp_sides(l, rb, descs)?;
             Cond2::Cmp(Box::new(l), *op, Box::new(r))
         }
-        RawCond::Like(a, pat, esc, negated) => Cond2::Like(
-            Box::new(resolve_expr(a, columns, descs)?),
-            pat.clone(),
-            *esc,
-            *negated,
-        ),
+        // ...and a LIKE inside an EXPRESSION - IIF, CASE WHEN, a
+        // projection - is the same law: an INT128 operand converts its
+        // pattern ([int128_expr_pattern]). This router never reaches
+        // `numeric_term`, which is why it went on answering rows after
+        // the WHERE arms were fixed.
+        RawCond::Like(a, pat, esc, negated) => {
+            let e = resolve_expr(a, columns, descs)?;
+            let pat = int128_expr_pattern(&e, pat, descs)?;
+            Cond2::Like(Box::new(e), pat, *esc, *negated)
+        }
         // the prefix test, with the operand's own collation deciding it
         // exactly as it does in a WHERE: an explicit COLLATE, or the
         // column's, canonicalises both sides ([Expr::CollCanon])
         RawCond::Starting(a, prefix, negated) => {
             let e = resolve_expr(a, columns, descs)?;
-            match starting_canon(e, prefix, descs) {
+            // the STARTING twin of the LIKE arm above, and it was the
+            // last of the six routers still answering rows: measured,
+            // `SELECT SUM(IIF(N382 STARTING WITH '01', 1, 0)) FROM T` is
+            // 3 on the engine - '01' converts to 1 and renders "1",
+            // which every row's text starts with - and was 0 here,
+            // because the raw '01' matches nothing.
+            let prefix = int128_expr_pattern(&e, prefix, descs)?;
+            match starting_canon(e, &prefix, descs) {
                 Some((wrapped, p)) => Cond2::Starting(Box::new(wrapped), p, *negated),
                 None => return None,
             }
@@ -75614,8 +75625,14 @@ fn literal_to_dec128(s: &str) -> Result<u128, bool> {
     text_to_dec128_clamped(&t)
 }
 
-/// Post the engine's own vector for a string LITERAL a DECFLOAT
+/// Post the engine's own vector for a string LITERAL a numeric
 /// comparison cannot convert, and REFUSE THE STATEMENT.
+///
+/// It serves TWO families and the name has to say so: the DECFLOAT
+/// literal law ([literal_to_dec128]) and the INT128-backed exact
+/// numeric's LIKE / STARTING pattern ([wide_pattern_text]). It was
+/// called `refuse_dec_literal` while it had one caller, and a name that
+/// hides a router is how a grep undercounts.
 ///
 /// It is a prepare-time refusal rather than a per-row [Term::CmpConvErr]
 /// because the engine's raise is NOT VALUE-GATED: `WHERE 1 = 0 AND
@@ -75629,7 +75646,7 @@ fn literal_to_dec128(s: &str) -> Result<u128, bool> {
 /// `overflow` carries [literal_to_dec128]'s `Err(true)`: an exponent past
 /// decimal128's range is 22003 *Decimal float overflow* instead, measured
 /// for `'1e7000'` at both widths.
-fn refuse_dec_literal(text: &str, overflow: bool) -> Option<Term> {
+fn refuse_literal_conv(text: &str, overflow: bool) -> Option<Term> {
     PREPARE_REFUSAL.with(|r| {
         *r.borrow_mut() = Some(if overflow {
             EvalErr::DecfloatOverflow
@@ -75656,7 +75673,7 @@ fn refuse_dec_literal(text: &str, overflow: bool) -> Option<Term> {
 /// raise a prepare-time one: the conversion used to sit in the per-row
 /// `Expr::NullIf` evaluator, so the prepare answered with a describe and
 /// the error arrived from inside the fetch - `serve-real-absround.sh`'s
-/// red cell. `None` refuses the statement through [refuse_dec_literal].
+/// red cell. `None` refuses the statement through [refuse_literal_conv].
 fn nullif_dec_literal(a: Expr, b: Expr, descs: &[Descriptor]) -> Option<Expr> {
     let width = |e: &Expr| -> Option<bool> {
         match e {
@@ -75680,7 +75697,104 @@ fn nullif_dec_literal(a: Expr, b: Expr, descs: &[Descriptor]) -> Option<Expr> {
             Box::new(Expr::DecFloat34(if wide { bits } else { narrow_dec16_bind(bits) })),
         )),
         Err(overflow) => {
-            refuse_dec_literal(t, overflow)?;
+            refuse_literal_conv(t, overflow)?;
+            None
+        }
+    }
+}
+
+/// A LIKE / STARTING WITH pattern written as a string LITERAL against an
+/// **INT128-BACKED** exact numeric column - and the whole of this rule is
+/// that the boundary exists at all.
+///
+/// Measured on the live engine (2026-09-20, one table carrying the same
+/// three values in every declared width):
+///
+/// ```text
+///   NUMERIC(9,2)  LIKE '1%' -> 1;2;3      NUMERIC(19,0) LIKE '1%' -> RAISES
+///   NUMERIC(18,0) LIKE '1%' -> 1;2;3      NUMERIC(38,2) LIKE '1%' -> RAISES
+///   NUMERIC(18,4) LIKE '1%' -> 1;2;3      INT128        LIKE '1%' -> RAISES
+/// ```
+///
+/// A NARROW column matches the pattern against the RENDERED value, which
+/// is what this server does for every width today. A WIDE one CONVERTS
+/// the pattern first, so a wildcard - which cannot convert - raises the
+/// one-line 22018 `conversion error from string "1%"`, AT PREPARE and
+/// with no describe (`1 = 0 AND`, `ID = 99 AND` and an empty table all
+/// raise). **The boundary is the STORAGE TYPE**, precision >= 19 being
+/// only what selects it: `NUMERIC(18,0)` describes sqltype 580 INT64 and
+/// `NUMERIC(19,0)` describes 32752 INT128, so `dtype::INT128` is the
+/// whole test and no precision arithmetic is needed here.
+///
+/// WHEN IT CONVERTS, THE VALUE IS RENDERED BACK - at the LITERAL's own
+/// scale, not the column's. Four cells fix that, and the NARROW column
+/// answers the other way on the same cell, which is what makes them
+/// proof rather than illustration:
+///
+/// ```text
+///   N382 STARTING WITH '01' -> 1;2;3   |  N92 STARTING WITH '01' -> (none)
+///   N382 STARTING WITH ' 1' -> 1;2;3      (the blank goes in the conversion)
+///   N382 LIKE '01.50'       -> 1          (-> 1.50 -> "1.50")
+///   N382 LIKE '10'          -> (none)     (-> "10", NOT the column's "10.00")
+/// ```
+///
+/// The grammar is the LENIENT compare one ([text_col_num]), not the
+/// strict store grammar [literal_num_rhs] uses: `N382 STARTING WITH
+/// '1 0'` answers 2;3, an interior blank skipped exactly as in the
+/// DECFLOAT literal law. Hex and the empty string raise.
+///
+/// An e/E spelling KEEPS THE RAW TEXT, which is the previous binary's
+/// answer and is measured right: `N382 STARTING WITH '1e1'` answers
+/// NOTHING on the engine, where converting it to 10 and rendering "10"
+/// would predict 2;3. That branch is the floor, not a new law.
+fn int128_literal_pattern(p: &str, d: &Descriptor) -> Option<String> {
+    if d.dtype != dtype::INT128 {
+        return Some(p.to_string());
+    }
+    wide_pattern_text(p)
+}
+
+/// [int128_literal_pattern] keyed on an EXPRESSION's announced type
+/// rather than on a column's descriptor, because the WHERE resolver is
+/// not the only router that reaches this shape - and the other five were
+/// all answering wrongly.  Measured, every one of these raises the same
+/// one-line 22018 on the engine and answered rows here:
+///
+/// ```text
+///   SELECT T.ID FROM T JOIN U ON .. WHERE T.N382 LIKE '1%'   (col_kind is
+///       None for INT128, so a JOIN diverts to resolve_expr_term and the
+///       column's own width never reaches numeric_term)
+///   WHERE IIF(N382 LIKE '1%', 1, 0) = 1        and the CASE WHEN twin
+///   SELECT SUM(IIF(N382 LIKE '1%', 1, 0)) FROM T   - a PROJECTION
+///   WHERE CP LIKE '1%'                         - a COMPUTED BY column
+///   WHERE N382 + 0 LIKE '1%'                   - an arithmetic operand
+///   WHERE CAST(ID AS NUMERIC(38,2)) LIKE '1%'  - a CAST
+/// ```
+///
+/// So the law is about the OPERAND'S TYPE, not about being a plain
+/// column: [Expr::is_wide] is the same INT128 question `dtype::INT128`
+/// asks of a descriptor, asked of an expression.
+fn int128_expr_pattern(e: &Expr, p: &str, descs: &[Descriptor]) -> Option<String> {
+    if !e.is_wide(descs) {
+        return Some(p.to_string());
+    }
+    wide_pattern_text(p)
+}
+
+/// The conversion itself, written ONCE so the column entry point and the
+/// expression one cannot drift apart. `None` refuses the statement.
+fn wide_pattern_text(p: &str) -> Option<String> {
+    match text_col_num(p) {
+        ColNum::Exact(m, e) => Some(match i8::try_from(e) {
+            Ok(sc) => fire_crab_ods::format::Value::Int128(m, sc).render(),
+            // an exponent past a scale byte: keep the floor rather than
+            // invent a rendering for it
+            Err(_) => p.to_string(),
+        }),
+        // the double path - see the `1e1` cell above
+        ColNum::Dbl(_) => Some(p.to_string()),
+        ColNum::HexHigh | ColNum::Raise => {
+            refuse_literal_conv(p, false)?;
             None
         }
     }
@@ -75690,7 +75804,7 @@ fn nullif_dec_literal(a: Expr, b: Expr, descs: &[Descriptor]) -> Option<Expr> {
 /// DECFLOAT column: converted by [literal_to_dec128] at the column's
 /// width and then RENDERED BACK, because that rendered text - not the
 /// text the user wrote - is what the engine matches with.  `None`
-/// refuses the statement through [refuse_dec_literal].
+/// refuses the statement through [refuse_literal_conv].
 fn dec_literal_pattern(p: &str, d: &Descriptor) -> Option<String> {
     match literal_to_dec128(p) {
         Ok(bits) => {
@@ -75699,11 +75813,11 @@ fn dec_literal_pattern(p: &str, d: &Descriptor) -> Option<String> {
                 &fire_crab_ods::decfloat::decode_dec128(bits),
             ))
         }
-        // `refuse_dec_literal` is always None - it is the POSTING that
+        // `refuse_literal_conv` is always None - it is the POSTING that
         // matters - and the `?` carries that None out, the same shape
         // [nullif_dec_literal] uses
         Err(overflow) => {
-            refuse_dec_literal(p, overflow)?;
+            refuse_literal_conv(p, overflow)?;
             None
         }
     }
@@ -99817,6 +99931,13 @@ fn resolve_expr_term(
                 }
                 _ => p.clone(),
             };
+            // ...AND AN INT128-TYPED OPERAND CONVERTS ITS PATTERN, here
+            // as in `numeric_term` - this is the arm a JOIN, a COMPUTED
+            // BY column, an arithmetic operand and a CAST all land in,
+            // because `col_kind` answers None for INT128 and the typed
+            // path is never reached ([int128_expr_pattern]). A narrow
+            // operand gets its text back unchanged.
+            let lifted = int128_expr_pattern(&lhs, &lifted, descs)?;
             let p = &lifted;
             if expr_is_octets(&lhs, descs) {
                 octets_like_term(lhs, p, *negated)
@@ -101130,8 +101251,11 @@ fn numeric_term(
         RawKind::Cmp(_, Rhs::Dbl(_)) => return None,
         RawKind::IsNull => Term::IsNull(idx),
         RawKind::IsNotNull => Term::IsNotNull(idx),
+        // A WIDE column CONVERTS the pattern first; a narrow one matches
+        // the rendered value, which is what every width did before
+        // ([int128_literal_pattern] carries the boundary and the cells).
         RawKind::Like(Rhs::Str(p), escape, negated) => {
-            Term::ExprLike(Box::new(Expr::Col(idx)), p, escape, negated)
+            Term::ExprLike(Box::new(Expr::Col(idx)), int128_literal_pattern(&p, d)?, escape, negated)
         }
         RawKind::Like(Rhs::Param(slot, _, ..), escape, negated) => {
             claim_text(slot);
@@ -101143,7 +101267,7 @@ fn numeric_term(
         RawKind::Similar(Rhs::Null, ..) => Term::Unknown,
         RawKind::Similar(..) => return None,
         RawKind::Starting(Rhs::Str(p), negated) => {
-            Term::ExprStarting(Box::new(Expr::Col(idx)), p, negated)
+            Term::ExprStarting(Box::new(Expr::Col(idx)), int128_literal_pattern(&p, d)?, negated)
         }
         RawKind::Starting(Rhs::Param(slot, _, ..), negated) => {
             claim_text(slot);
@@ -101252,7 +101376,7 @@ fn decfloat_term(
                 op,
                 Rhs::DecFloat34(if d.dtype == dtype::DEC64 { narrow_dec16_bind(bits) } else { bits }),
             ),
-            Err(overflow) => refuse_dec_literal(&v, overflow)?,
+            Err(overflow) => refuse_literal_conv(&v, overflow)?,
         },
         RawKind::Cmp(op, rhs) => Term::NumCmp(idx, op, Rhs::DecFloat34(rhs_to_dec128(&rhs)?)),
         RawKind::IsNull => Term::IsNull(idx),
@@ -116302,9 +116426,21 @@ mod tests {
         assert!(hits("N LIKE '12.50'"));
         assert!(hits("N STARTING WITH '12.5'"));
         assert!(!hits("N STARTING WITH '12.500'"));
-        // ... and the INT128 shape renders identically
-        assert!(hits("I LIKE '4%'"));
+        // ...BUT THE INT128 SHAPE DOES NOT RENDER IDENTICALLY, and this
+        // assertion used to say it did.  A WIDE exact numeric CONVERTS
+        // its pattern ([int128_literal_pattern]), so a wildcard raises
+        // where a narrow column matches text - measured, `INT128 LIKE
+        // '1%'` and `NUMERIC(19,0) LIKE '1%'` raise on the engine while
+        // `NUMERIC(18,0) LIKE '1%'` answers.  `resolve` is None here
+        // because the statement refuses at prepare.
+        assert!(resolve("I LIKE '4%'").is_none());
+        // a pattern that CONVERTS still answers, through its rendering:
+        // '42' -> 42 -> "42", which is the value's own text
         assert!(hits("I STARTING WITH '42'"));
+        // ...and the round trip shows: '042' renders "42" and matches,
+        // where the raw text would not
+        assert!(hits("I STARTING WITH '042'"));
+        assert!(!hits("I STARTING WITH '43'"));
         // a parameter claims the numeric column's descriptor and binds
         // with its wire scale (12.5 arriving as raw 125 scale -1)
         let toks = tokenize("N = ?").unwrap();
@@ -126546,6 +126682,56 @@ mod computed_wide_types {
     }
 
     /// ROUND 13: a NUMERIC FUNCTION'S `?` is a DOUBLE slot, not the
+    /// A LIKE / STARTING PATTERN AGAINST AN INT128-BACKED EXACT NUMERIC
+    /// ([int128_literal_pattern]).  The two halves are asserted against
+    /// each other rather than in isolation, because the law IS the
+    /// boundary: the same text must convert on one side of it and pass
+    /// through unchanged on the other.
+    #[test]
+    fn a_wide_exact_numeric_converts_its_pattern_and_a_narrow_one_does_not() {
+        let d = |dt: u8, s: i8, len: u16| Descriptor {
+            dtype: dt, scale: s, length: len, sub_type: 0, flags: 0, offset: 4,
+        };
+        let wide = d(dtype::INT128, -2, 16);
+        let narrow = d(dtype::INT64, -2, 8);
+        // THE NARROW SIDE NEVER TOUCHES THE TEXT - not even a wildcard,
+        // which is what keeps `NUMERIC(18,0) LIKE '1%'` a real pattern.
+        for p in ["1%", "01", " 1", "0x1", "", "abc", "1 0"] {
+            assert_eq!(int128_literal_pattern(p, &narrow).as_deref(), Some(p), "{p}");
+        }
+        // THE WIDE SIDE CONVERTS AND RENDERS BACK, AT THE LITERAL'S OWN
+        // SCALE.  `'10'` becoming "10" and NOT "10.00" is the cell that
+        // kills the "render at the column's scale" reading - the column
+        // here is scale -2 and the answer still has no decimals.
+        let w = |p: &str| int128_literal_pattern(p, &wide);
+        assert_eq!(w("10").as_deref(), Some("10"));
+        assert_eq!(w("01.50").as_deref(), Some("1.50"));
+        assert_eq!(w("1.5").as_deref(), Some("1.5"));
+        assert_eq!(w("01").as_deref(), Some("1"));
+        assert_eq!(w(" 1").as_deref(), Some("1"));
+        assert_eq!(w("+1").as_deref(), Some("1"));
+        // the LENIENT grammar: an interior blank is skipped, which the
+        // strict store grammar `literal_num_rhs` would have refused
+        assert_eq!(w("1 0").as_deref(), Some("10"));
+        assert_eq!(w("1 0 0.50").as_deref(), Some("100.50"));
+        // ...and an i128-magnitude pattern survives, which is the one
+        // thing `lenient_num_rhs`'s i64 cap could not have carried
+        assert_eq!(
+            w("99999999999999999999999.50").as_deref(),
+            Some("99999999999999999999999.50")
+        );
+        // AN e/E SPELLING KEEPS THE RAW TEXT.  That is the previous
+        // binary's answer and it is measured RIGHT: `N382 STARTING WITH
+        // '1e1'` answers nothing on the engine, where converting it to
+        // 10 and rendering "10" would predict two rows.
+        assert_eq!(w("1e1").as_deref(), Some("1e1"));
+        // and what cannot convert refuses the STATEMENT - the caller
+        // sees None and PREPARE_REFUSAL carries the engine's vector
+        for p in ["1%", "1_", "%.5%", "0x1", "", "abc", "-"] {
+            assert_eq!(w(p), None, "{p} must refuse on a wide column");
+        }
+    }
+
     /// A STRING LITERAL AGAINST A DECFLOAT COLUMN has its OWN grammar -
     /// [literal_to_dec128] - and the two ways it differs from the
     /// decNumber grammar a PARAMETER or a CAST gets ([text_to_dec128])
