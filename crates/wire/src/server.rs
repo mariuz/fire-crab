@@ -37071,7 +37071,15 @@ fn execute_dml_collecting_inner(
                     // (btr.cpp:5629 key_all_nulls) - and a key held only
                     // by entries whose records are GONE is not taken
                     insert_entry_verified(
-                        &mut work, db.page_size, *rel, op, &key, recno, all_null, &stmt_own,
+                        &mut work,
+                        db.page_size,
+                        *rel,
+                        op,
+                        &key,
+                        recno,
+                        all_null,
+                        key_carries_nan(op, &values),
+                        &stmt_own,
                     )
                     .map_err(|e| entry_err_to_exec(db, table, op, &values, e))?;
                 }
@@ -39450,11 +39458,47 @@ fn write_updated_row(
         let (new_key, all_null) =
             op.key_for(&new_values).ok_or("unsupported value for an index key")?;
         if new_key != old_key {
-            insert_entry_verified(work, db.page_size, rel, op, &new_key, recno, all_null, stmt_own)
+            insert_entry_verified(
+                work,
+                db.page_size,
+                rel,
+                op,
+                &new_key,
+                recno,
+                all_null,
+                key_carries_nan(op, &new_values),
+                stmt_own,
+            )
                 .map_err(|e| entry_err_to_exec(db, table, op, &new_values, e))?;
         }
     }
     Ok(())
+}
+
+/// A NaN INDEX KEY NEVER CONFLICTS WITH ANOTHER, even though the two
+/// encode to IDENTICAL key bytes.
+///
+/// `double_key` is an order-preserving transform, so two NaN rows land
+/// on one key and the B-tree's own entry-level check calls the second a
+/// duplicate.  The engine does not: a NaN is NEVER EQUAL TO ANYTHING,
+/// not even itself ([nan_row_cmp]), and UNIQUE/PRIMARY-KEY equality
+/// follows that same rule.  Measured 2026-09-20 on a `PRIMARY KEY (D
+/// DOUBLE PRECISION)` holding a NaN: the engine ACCEPTS a second and a
+/// third NaN key - through `VALUES (?)` and through `INSERT .. SELECT`
+/// alike - while STILL raising a proper violation for a duplicate 1.5 or
+/// a duplicate `inf`, both of which this server already got right.
+///
+/// It is exempt for a DIFFERENT REASON from an all-NULL key
+/// (btr.cpp:5629 `key_all_nulls`), so it travels as its own flag rather
+/// than being folded into that one.
+///
+/// Only a PLAIN COLUMN segment is read.  An expression index computes
+/// its key elsewhere, so it keeps enforcing - the conservative side, and
+/// the side this server was already on.
+fn key_carries_nan(op: &IndexOp, values: &[Value]) -> bool {
+    op.segs
+        .iter()
+        .any(|(fid, ..)| values.get(*fid).and_then(approx_of).is_some_and(f64::is_nan))
 }
 
 fn insert_entry_verified(
@@ -39465,9 +39509,12 @@ fn insert_entry_verified(
     key: &[u8],
     recno: u64,
     all_null: bool,
+    // ...and a key carrying a NaN is exempt too, for its own reason
+    // ([key_carries_nan])
+    has_nan: bool,
     own: &fire_crab_ods::tra::OwnTx,
 ) -> Result<(), EntryErr> {
-    let enforce = op.unique && !all_null;
+    let enforce = op.unique && !all_null && !has_nan;
     match fire_crab_ods::btw::insert_index_entry(
         work, page_size, rel, op.id, key, recno, enforce, op.descending,
     ) {

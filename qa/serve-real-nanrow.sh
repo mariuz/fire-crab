@@ -67,6 +67,8 @@ CREATE DATABASE '127.0.0.1/$REAL:$ENG' USER '$U' PASSWORD '$P' PAGE_SIZE 8192;
 CREATE TABLE M  (ID INTEGER, D DOUBLE PRECISION, D2 DOUBLE PRECISION, FL FLOAT, N INTEGER, NM NUMERIC(9,2));
 CREATE TABLE MI (ID INTEGER NOT NULL PRIMARY KEY, D DOUBLE PRECISION, D2 DOUBLE PRECISION, FL FLOAT, N INTEGER, NM NUMERIC(9,2));
 CREATE TABLE W  (ID INTEGER, D DOUBLE PRECISION, N INTEGER);
+/* a PRIMARY KEY on a DOUBLE - key equality, not predicate truth */
+CREATE TABLE UD (D DOUBLE PRECISION NOT NULL PRIMARY KEY, V INTEGER);
 COMMIT;
 CREATE INDEX MI_D  ON MI (D);
 CREATE INDEX MI_FL ON MI (FL);
@@ -92,6 +94,7 @@ const R=[[1,   NN,   NN,   NN,   1,  1.0],
 const jobs=[];
 for(const t of ["M","MI"]) for(const r of R) jobs.push(["INSERT INTO "+t+" (ID,D,D2,FL,N,NM) VALUES (?,?,?,?,?,?)",r]);
 for(const r of R) jobs.push(["INSERT INTO W (ID,D,N) VALUES (?,?,?)",[r[0],r[1],r[4]]]);
+for(const u of [[NN,1],[1.5,2],[PI,3],[MI,4],[0.0,5]]) jobs.push(["INSERT INTO UD (D,V) VALUES (?,?)",u]);
 F.attach({host:"127.0.0.1",port:+process.argv[2],database:process.argv[3],user:"SYSDBA",password:"masterkey"},(e,db)=>{
  if(e){console.log("LOAD ATTACH FAIL "+e.message);process.exit(1);}
  let i=0,bad=0;
@@ -100,11 +103,11 @@ F.attach({host:"127.0.0.1",port:+process.argv[2],database:process.argv[3],user:"
    // SENTINEL: the rows must be there AND the NaNs must really be NaN -
    // a fixture that silently failed makes every cell compare empty with
    // empty and print OK.
-   db.query("SELECT (SELECT COUNT(*) FROM M) CM,(SELECT COUNT(*) FROM MI) CMI,(SELECT COUNT(*) FROM W) CW,(SELECT COUNT(*) FROM M WHERE CAST(D AS VARCHAR(20))='nan') NANM FROM RDB$DATABASE",[],(e2,r)=>{
+   db.query("SELECT (SELECT COUNT(*) FROM M) CM,(SELECT COUNT(*) FROM MI) CMI,(SELECT COUNT(*) FROM W) CW,(SELECT COUNT(*) FROM UD) CU,(SELECT COUNT(*) FROM M WHERE CAST(D AS VARCHAR(20))='nan') NANM FROM RDB$DATABASE",[],(e2,r)=>{
      if(e2){console.log("SENTINEL FAIL "+e2.message);process.exit(1);}
      const s=r[0];
      console.log("errors="+bad+" sentinel="+JSON.stringify(s));
-     if(bad||s.CM!=8||s.CMI!=8||s.CW!=8||s.NANM!=2){console.log("LOAD SENTINEL MISMATCH");process.exit(1);}
+     if(bad||s.CM!=8||s.CMI!=8||s.CW!=8||s.CU!=5||s.NANM!=2){console.log("LOAD SENTINEL MISMATCH");process.exit(1);}
      db.detach();process.exit(0);});
    return;
   }
@@ -251,6 +254,23 @@ dml_rb_eng_only() {
 }
 
 
+# BOTH servers RAISE the DML inside the rolled-back transaction and the
+# read-backs agree - the rows are untouched on both.  A duplicate key is
+# supposed to raise, so `dml_rb` (which fails when the ENGINE refuses)
+# cannot express it.
+dml_rb_both_err() {
+    ran=$((ran + 1))
+    local js="${3:-[]}" rb="$4" ev fv
+    ev=$(runtx "$REAL" "$ENG" "$2" "$js" "$rb"); fv=$(runtx "$PORT" "$FC" "$2" "$js" "$rb")
+    if [ "$ev" = CONN_ERR ] || [ "$fv" = CONN_ERR ]; then
+        echo "FAIL $1 [CONN_ERR - the cell never ran]"; fail=1
+    elif [ "${ev#dml=ERR}" = "$ev" ]; then echo "FAIL $1 - the ENGINE did not raise [$ev]"; fail=1
+    elif [ "${fv#dml=ERR}" = "$fv" ]; then echo "FAIL $1 - THIS server did not raise [$fv]"; fail=1
+    elif [ "${ev#*rb=}" != "${fv#*rb=}" ]; then
+        echo "FAIL $1 (the read-back after the raise differs)"; echo "     eng=[$ev] fc=[$fv]"; fail=1
+    else echo "OK   $1 [$ev] (both raise; rolled back)"; fi
+}
+
 # A RECORDED DIVERGENCE, pinned on BOTH sides: the engine's answer and
 # this server's, each stated.  It fails when they start AGREEING (promote
 # it), when either side moves, and when either side refuses.
@@ -333,6 +353,23 @@ both             "3b M WHERE D > 0 (engine 2;5)" "SELECT ID FROM M WHERE D > 0 O
 both             "3b MI WHERE D > 0 - indexed, the same (engine 2;5)" "SELECT ID FROM MI WHERE D > 0 ORDER BY ID" '[]'
 both             "3b MI WHERE D = D - and the EQUALITY rule is path-independent (engine 2;3;5;6;7)" "SELECT ID FROM MI WHERE D = D ORDER BY ID" '[]'
 
+echo "-- 3c. KEY EQUALITY FOLLOWS THE SAME RULE: a NaN key never conflicts --"
+# A UNIQUE/PRIMARY KEY asks the SAME question the predicate does, and gets
+# the same answer: a NaN is not equal to itself, so a PK on a DOUBLE
+# accepts a SECOND NaN.  Measured on the live engine, which then holds two
+# NaN keys, while a duplicate 1.5 or a duplicate `inf` STILL raises.
+#
+# The mechanism is worth stating because it is not the comparator: the
+# index KEY BYTES of two NaNs are IDENTICAL (`double_key` is an
+# order-preserving transform), so the B-tree's own entry-level check calls
+# the second a duplicate.  A NaN key is therefore EXEMPT from uniqueness -
+# for a DIFFERENT reason from an all-NULL key, so it travels as its own
+# flag ([key_carries_nan]).
+dml_rb           "3c INSERT INTO UD VALUES (?, 9) [NaN] - a SECOND NaN key is accepted (engine dml=(none) rb=1,nan;2,1.500000000000000;3,inf;4,-inf;5,0.000000000000000;9,nan)" "INSERT INTO UD (D, V) VALUES (?, 9)" '["#NaN"]' "SELECT V AS A, CAST(D AS VARCHAR(25)) AS B FROM UD ORDER BY V"
+dml_rb_both_err  "3c CONTROL a duplicate 1.5 STILL raises (engine dml=ERR, the table unchanged)" "INSERT INTO UD (D, V) VALUES (?, 9)" '[1.5]' "SELECT V AS A, CAST(D AS VARCHAR(25)) AS B FROM UD ORDER BY V"
+dml_rb_both_err  "3c CONTROL a duplicate +Inf STILL raises - an infinity is an ordinary value (engine dml=ERR)" "INSERT INTO UD (D, V) VALUES (?, 9)" '["#Inf"]' "SELECT V AS A, CAST(D AS VARCHAR(25)) AS B FROM UD ORDER BY V"
+dml_rb           "3c CONTROL a NEW finite key inserts (engine dml=(none) rb=...;9,7.500000000000000)" "INSERT INTO UD (D, V) VALUES (?, 9)" '[7.5]' "SELECT V AS A, CAST(D AS VARCHAR(25)) AS B FROM UD ORDER BY V"
+
 echo "-- 4. WHAT THIS CHUNK DOES NOT FIX, pinned so it cannot be mistaken for agreement --"
 # Each of these is a DIFFERENT rule from the equality one above, each
 # measured, and each still divergent here.  A wrong answer cannot be a
@@ -359,7 +396,7 @@ kill $srv 2>/dev/null; wait $srv 2>/dev/null; trap - EXIT
 rm -f "$ENG" "$FC"
 echo "ran $ran checks"
 # THE FLOOR IS COUNTED FROM A MEASURED RUN, never typed.
-if [ "$ran" -lt 40 ]; then
-    echo "FAIL only $ran checks ran; 40 were measured - cells went missing"; fail=1
+if [ "$ran" -lt 44 ]; then
+    echo "FAIL only $ran checks ran; 44 were measured - cells went missing"; fail=1
 fi
 exit $fail
