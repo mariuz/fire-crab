@@ -74473,8 +74473,13 @@ impl Cond2 {
                 if matches!(x, Value::Null) || matches!(y, Value::Null) {
                     None
                 } else {
-                    // exact numeric alignment first (see NullIf)
-                    let o = num_cmp(&x, &y).unwrap_or_else(|| value_cmp(&x, &y));
+                    // A NaN ON EITHER SIDE has the engine's own order,
+                    // which `value_cmp` cannot give: its approximate arm
+                    // ends in `partial_cmp().unwrap_or(Equal)` and so
+                    // makes a NaN EQUAL TO EVERYTHING ([nan_row_cmp]
+                    // carries the measurements).
+                    let o = nan_row_cmp(&x, &y)
+                        .unwrap_or_else(|| num_cmp(&x, &y).unwrap_or_else(|| value_cmp(&x, &y)));
                     Some(match op {
                         Cmp::Eq => o == std::cmp::Ordering::Equal,
                         Cmp::Ne => o != std::cmp::Ordering::Equal,
@@ -75215,6 +75220,51 @@ fn approx_store_text(x: f64, single: bool, d: &Descriptor) -> Option<String> {
         as usize;
     let s = approx_fit_text(x, single, chars * bpc)?;
     (s.chars().count() <= chars).then_some(s)
+}
+
+/// THE ENGINE'S VERDICT FOR A COMPARISON WHOSE OPERAND IS A NaN ROW
+/// VALUE - the ordering that ~200 measured predicate cells fit, over
+/// stored NaN / +-Infinity / NULL rows on a heap twin, an indexed twin
+/// and an expression-index twin (2026-09-20).
+///
+///   * THE RESULT IS NEVER "EQUAL", so `=` is FALSE and `<>` is TRUE -
+///     and it is TWO-VALUED, not UNKNOWN: `NOT (D >= 0.0e0)` is TRUE.
+///     `D = D` is FALSE on a NaN row, `D IS NOT DISTINCT FROM D` is
+///     FALSE, and a PRIMARY KEY on a DOUBLE accepts a SECOND NaN while
+///     still raising for a duplicate 1.5 - key equality follows this
+///     same rule.
+///   * ONE OPERAND IS THE **PRIMARY** AND IT IS THE LESSER.  The primary
+///     is the operand of HIGHER TYPE RANK - DOUBLE > FLOAT > exact - and
+///     on a TIE it is THE FIRST-WRITTEN one.  That is why the two
+///     spellings of one mathematical question disagree: `D < D2` is TRUE
+///     on a NaN row and `D2 < D` is TRUE on the same row.
+///
+/// The rank clause is what a first cut got wrong by carrying the
+/// PARAMETER law over unchanged: "against a FLOAT side the NaN is always
+/// the lesser" predicts `FL > 0.0e0` FALSE, and it is TRUE - a NaN in a
+/// FLOAT column meeting a DOUBLE is the GREATER operand, because the
+/// DOUBLE outranks it.
+///
+/// `None` when neither side is a NaN, and the ordinary comparison runs.
+fn nan_row_cmp(x: &Value, y: &Value) -> Option<std::cmp::Ordering> {
+    let nan = |v: &Value| approx_of(v).is_some_and(f64::is_nan);
+    if !nan(x) && !nan(y) {
+        return None;
+    }
+    // DOUBLE 2 > FLOAT 1 > exact 0; anything else ranks as exact, which
+    // is the side a NaN is never on
+    let rank = |v: &Value| match v {
+        Value::Double(_) => 2u8,
+        Value::Float(_) => 1,
+        Value::Rounded(..) => 2,
+        _ => 0,
+    };
+    Some(match rank(x).cmp(&rank(y)) {
+        // the higher-ranked side is the primary, and the primary is the
+        // lesser; on a tie the FIRST-WRITTEN one is
+        std::cmp::Ordering::Greater | std::cmp::Ordering::Equal => std::cmp::Ordering::Less,
+        std::cmp::Ordering::Less => std::cmp::Ordering::Greater,
+    })
 }
 
 fn approx_of(v: &Value) -> Option<f64> {
@@ -126384,6 +126434,57 @@ mod computed_wide_types {
             double_exact_term(Some(&WireParam::Double(2.5)), 7, Cmp::Gt, &ColKind::Approx, None, None, false),
             Ok(None)
         ));
+    }
+
+    /// A NaN THAT IS A ROW VALUE ([nan_row_cmp]) - the rule ~200
+    /// measured predicate cells fit, over stored NaN / +-Infinity /
+    /// NULL rows on a heap twin, an indexed twin and an
+    /// expression-index twin (2026-09-20).
+    #[test]
+    fn a_nan_row_value_is_never_equal_and_the_higher_rank_is_the_lesser() {
+        use std::cmp::Ordering::*;
+        let nan = Value::Double(f64::NAN);
+        let fnan = Value::Float(f32::NAN);
+        let dbl = Value::Double(0.0);
+        let flt = Value::Float(0.0);
+        let int = Value::Int(0);
+
+        // NOTHING to decide when neither side is a NaN
+        assert_eq!(nan_row_cmp(&dbl, &int), None);
+        assert_eq!(nan_row_cmp(&Value::Double(f64::INFINITY), &dbl), None);
+
+        // A TIE goes to the FIRST-WRITTEN operand, which is the LESSER -
+        // so the two spellings of one question disagree, and that is the
+        // engine's own answer (`D < D2` and `D2 < D` are both TRUE on a
+        // NaN row)
+        // BOTH DIRECTIONS OF `<` ARE TRUE and both of `>` are FALSE,
+        // which is the strangest thing the engine does here and the
+        // clearest proof that the tie really is decided by the writing
+        // order: `D < D2` is TRUE on a NaN row and so is `D2 < D`.
+        assert_eq!(nan_row_cmp(&nan, &dbl), Some(Less));
+        assert_eq!(nan_row_cmp(&dbl, &nan), Some(Less));
+        assert_eq!(nan_row_cmp(&nan, &nan), Some(Less));
+
+        // ...but RANK OUTRANKS the writing order: DOUBLE > FLOAT >
+        // exact, and the higher-ranked side is the lesser.  This is the
+        // clause a first cut got wrong by carrying the PARAMETER law
+        // over: a NaN in a FLOAT column meeting a DOUBLE is the GREATER
+        // operand, so `FL > 0.0e0` is TRUE and not FALSE.
+        assert_eq!(nan_row_cmp(&fnan, &dbl), Some(Greater));
+        assert_eq!(nan_row_cmp(&dbl, &fnan), Some(Less));
+        // ...while against an EXACT side the NaN is the lesser either way
+        assert_eq!(nan_row_cmp(&nan, &int), Some(Less));
+        assert_eq!(nan_row_cmp(&int, &nan), Some(Greater));
+        assert_eq!(nan_row_cmp(&fnan, &int), Some(Less));
+        // a FLOAT NaN against a FLOAT ties, so the first-written wins
+        assert_eq!(nan_row_cmp(&fnan, &flt), Some(Less));
+        assert_eq!(nan_row_cmp(&flt, &fnan), Some(Less));
+
+        // AND IT IS NEVER `Equal`, whichever way round - which is what
+        // makes `=` FALSE and `<>` TRUE without either being special-cased
+        for (a, b) in [(&nan, &dbl), (&dbl, &nan), (&nan, &nan), (&fnan, &int)] {
+            assert_ne!(nan_row_cmp(a, b), Some(Equal));
+        }
     }
 
     /// THE NaN MATRIX ([nan_cmp_verdict]), which is the whole of what the
