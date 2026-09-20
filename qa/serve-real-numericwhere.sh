@@ -295,21 +295,32 @@ SQL
     check "text 22018 [$2]" "$fcok/$isok" "raise/raise"
 }
 convraise "bad text"   "D = 'abc'"
-convraise "spaced num" "D = ' 1.5 '"
 convraise "empty text" "D = ''"
-# the decNumber SPECIALS: `inf`/`infinity` (case-insensitive, optional
-# sign) converts to a ±Infinity that ORDERS in a comparison (row 6 of DF2
-# is +Infinity); `nan`/`snan` converts to a NaN that TRAPS (22000).
-predf "text Infinity"   "D = 'Infinity'"
-predf "text inf lower"  "D = 'inf'"
-predf "text +INF"       "D = '+INF'"
-predf "col < Infinity"  "D < 'Infinity'"
-predf "col > finite"    "D > '0'"
-convraise "special junk" "D = 'Infinityx'"
-# `= 'NaN'` traps on any non-NULL row (DFNAN has one), like a NaN column
-raisef "text NaN"   "D = 'NaN'"
-raisef "text nan"   "D = 'nan'"
-raisef "text sNaN"  "D = 'sNaN'"
+# A BLANK-BEARING SPELLING ANSWERS.  This cell used to assert a RAISE and
+# the assertion was simply wrong - re-measured 2026-09-20, the engine
+# converts it.  The DECFLOAT literal grammar is the LENIENT compare one:
+# a blank is IGNORED WHEREVER IT STANDS as long as there is no exponent.
+# The full law, both widths and all four routers, is in
+# `serve-real-dfnflit.sh`.
+predf "spaced num"     "D = ' 1.5 '"
+predf "interior blank" "D = '1 0 0'"
+predf "blank after sign" "D = '- 2.5'"
+# THE decNumber SPECIALS ARE REJECTED IN A LITERAL, and these ten cells
+# used to say the opposite.  They were written believing a literal takes
+# the decNumber grammar - that `'inf'` becomes an Infinity that ORDERS and
+# `'NaN'` becomes a NaN that TRAPS with 22000.  Re-measured 2026-09-20:
+# every one of them raises the ONE-LINE 22018 `conversion error from
+# string`, at PREPARE.  The decNumber grammar is what a bound PARAMETER
+# and an explicit CAST get, not a literal (`serve-real-dfnflit.sh`).
+convraise "text Infinity"  "D = 'Infinity'"
+convraise "text inf lower" "D = 'inf'"
+convraise "text +INF"      "D = '+INF'"
+convraise "col < Infinity" "D < 'Infinity'"
+predf     "col > finite"   "D > '0'"
+convraise "special junk"   "D = 'Infinityx'"
+convraise "text NaN"       "D = 'NaN'"
+convraise "text nan"       "D = 'nan'"
+convraise "text sNaN"      "D = 'sNaN'"
 
 # a `?` parameter against a DECFLOAT column: the input slot describes
 # DECFLOAT(34) len 16 and the driver's value promotes to decimal128 - an
@@ -350,14 +361,22 @@ dfparam "D16 double"  "S = ?"  "[1.5]"
 # the pattern per row - a literal pattern or a `?`. (SIMILAR TO stays text-
 # only, as for the exact-numeric columns; the pattern-slot describe width is
 # a pre-existing numeric simplification, node ignores it.)
-predf "DECFLOAT col LIKE exact" "D LIKE '1.5'"
-predf "DECFLOAT col LIKE wild"  "D LIKE '1%'"
-predf "DECFLOAT col LIKE under" "D LIKE '1_0'"
-predf "DECFLOAT col LIKE sci"   "D LIKE '%E+38'"
-predf "DECFLOAT col STARTING -" "D STARTING WITH '-'"
-predf "DECFLOAT col STARTING 1" "D STARTING WITH '1'"
-predf "DECFLOAT col NOT LIKE"   "D NOT LIKE '1%'"
-predf "DECFLOAT(16) col LIKE"   "S LIKE '2%'"
+# ...AND A PATTERN IS NOT A PATTERN UNTIL IT CONVERTS.  A LIKE or
+# STARTING WITH pattern written as a LITERAL takes the same prepare-time
+# conversion the comparison does, wildcards and all, so the six cells
+# below that carry a `%`, a `_` or a bare sign RAISE - they never reach
+# the per-row render at all.  The ones that DO convert are rendered back
+# and matched, which is why `'1.5'` still answers and `'01'` answers
+# through "1".
+predf     "DECFLOAT col LIKE exact" "D LIKE '1.5'"
+convraise "DECFLOAT col LIKE wild"  "D LIKE '1%'"
+convraise "DECFLOAT col LIKE under" "D LIKE '1_0'"
+convraise "DECFLOAT col LIKE sci"   "D LIKE '%E+38'"
+convraise "DECFLOAT col STARTING -" "D STARTING WITH '-'"
+predf     "DECFLOAT col STARTING 1" "D STARTING WITH '1'"
+predf     "DECFLOAT col STARTING 01" "D STARTING WITH '01'"
+convraise "DECFLOAT col NOT LIKE"   "D NOT LIKE '1%'"
+convraise "DECFLOAT(16) col LIKE"   "S LIKE '2%'"
 dfparam "LIKE pat"     "D LIKE ?"          '["1%"]'
 dfparam "LIKE sci"     "D LIKE ?"          '["%E+38"]'
 dfparam "STARTING pat" "D STARTING WITH ?" '["-"]'

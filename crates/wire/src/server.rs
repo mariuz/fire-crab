@@ -40756,7 +40756,7 @@ fn resolve_join_predicate(
                         if !comb_cols.iter().any(|k| col_name_is(&k.name, bare)) {
                             return None; // ambiguous, or not in the view
                         }
-                        RawTerm { lhs: RawLhs::Col(bare.to_string()), kind: rt.kind, mirrored: rt.mirrored }
+                        RawTerm { lhs: RawLhs::Col(bare.to_string()), kind: rt.kind, mirrored: rt.mirrored, in_list: rt.in_list }
                     }
                     _ => rt,
                 };
@@ -40797,6 +40797,7 @@ fn resolve_join_predicate(
                         lhs: RawLhs::Col(name.to_string()),
                         kind: rt.kind,
                         mirrored: rt.mirrored,
+                        in_list: rt.in_list,
                     };
                     terms.push(resolve_expr_term(&rt2, &comb_cols, &comb_descs, params)?);
                 }
@@ -73529,10 +73530,14 @@ fn resolve_proj_expr(
         }
         RawExpr::NullIf(a, b) => {
             let sd = coalesce_sibling_desc(&[&**a, &**b], columns, descs)?;
-            Expr::NullIf(
-                Box::new(resolve_dest_param_expr(a, &sd, columns, descs, sink)?),
-                Box::new(resolve_dest_param_expr(b, &sd, columns, descs, sink)?),
-            )
+            // the SECOND of NULLIF's two routers - the projection one.
+            // A grep for `Expr::NullIf` finds it; a grep for the per-row
+            // conversion it used to rely on does not.
+            nullif_dec_literal(
+                resolve_dest_param_expr(a, &sd, columns, descs, sink)?,
+                resolve_dest_param_expr(b, &sd, columns, descs, sink)?,
+                descs,
+            )?
         }
         // CASE and IIF had NO ARM AT ALL here - they fell to the catch-all
         // below, which is why `CASE WHEN ID=1 THEN ? ELSE 0 END` refused
@@ -73769,10 +73774,11 @@ fn resolve_expr_inner(
                 .map(|a| resolve_expr(a, columns, descs))
                 .collect::<Option<Vec<_>>>()?,
         ),
-        RawExpr::NullIf(a, b) => Expr::NullIf(
-            Box::new(resolve_expr(a, columns, descs)?),
-            Box::new(resolve_expr(b, columns, descs)?),
-        ),
+        RawExpr::NullIf(a, b) => nullif_dec_literal(
+            resolve_expr(a, columns, descs)?,
+            resolve_expr(b, columns, descs)?,
+            descs,
+        )?,
         RawExpr::Iif(c, a, b) => Expr::Iif(
             Box::new(resolve_raw_cond(c, columns, descs)?),
             Box::new(resolve_expr(a, columns, descs)?),
@@ -75537,6 +75543,172 @@ fn narrow_dec16_bind(bits: u128) -> u128 {
     bits
 }
 
+/// Is this text one of decNumber's SPECIAL spellings - an Infinity or a
+/// NaN?  `inf`, `infinity`, `nan`, `snan`, case-insensitive, with an
+/// optional sign and, for a NaN, an optional all-digit payload.  It is
+/// the shape [text_to_dec128] ACCEPTS and [literal_to_dec128] must
+/// REJECT, and it is written once so the two cannot drift apart.
+fn dec_special_text(s: &str) -> bool {
+    let t = s.strip_prefix(['+', '-']).unwrap_or(s).to_ascii_lowercase();
+    if t == "inf" || t == "infinity" {
+        return true;
+    }
+    match t.strip_prefix("snan").or_else(|| t.strip_prefix("nan")) {
+        Some(payload) => payload.bytes().all(|c| c.is_ascii_digit()),
+        None => false,
+    }
+}
+
+/// A string LITERAL compared against a DECFLOAT column, converted the way
+/// the ENGINE converts one: ONCE, AT PREPARE, by the EXACT-NUMERIC
+/// grammar - which is NOT the decNumber grammar a bound PARAMETER or an
+/// explicit CAST gets ([text_to_dec128], [decfloat_param_term]).  The two
+/// grammars differ in exactly two places and both were measured on the
+/// live engine (2026-09-20, DECFLOAT(34) and DECFLOAT(16) side by side):
+///
+/// * surrounding BLANKS are TRIMMED, so `D = ' 1.5 '` and `D = '  100  '`
+///   ANSWER - where the same text BOUND to a DECFLOAT(34) parameter
+///   raises;
+/// * every SPECIAL is REJECTED - `'inf'`, `'Infinity'`, `'+INF'`,
+///   `'NaN'`, `'nan'`, `'sNaN'` all raise - where the same text bound to
+///   a parameter, or written `CAST('inf' AS DECFLOAT(34))`, is a VALUE.
+///
+/// A sign and an exponent are allowed (`'1.5e0'`, `'150e-2'`, `'+1.5'`).
+///
+///   `Ok(bits)`   - the converted decimal128.
+///   `Err(false)` - the engine's ONE-LINE 22018 `conversion error from
+///                  string "<text>"`.  Note ONE line: the two-line
+///                  compound *Decimal float invalid operation* vector
+///                  ([EvalErr::DecfloatConvError]) belongs to the
+///                  per-row paths, and emitting it here was the whole
+///                  of `serve-real-bindconv.sh`'s last red cell.
+///   `Err(true)`  - 22003 *Decimal float overflow.  The exponent of a
+///                  result is greater than the magnitude allowed.*
+///                  ([EvalErr::DecfloatOverflow]), measured for
+///                  `'1e7000'` at BOTH widths.
+fn literal_to_dec128(s: &str) -> Result<u128, bool> {
+    // THE BLANK RULE HAS TWO HALVES AND THE e/E DECIDES WHICH (measured,
+    // both widths). Without an exponent a blank is IGNORED WHEREVER IT
+    // STANDS - the engine's LENIENT compare grammar, cvt2.cpp's
+    // `cmp_numeric_string`: `D = '1 0 0'` answers the 100 row, `'- 2.5'`
+    // the -2.5 row, `'1 . 5'` the 1.5 row, and `'1 5'` converts to 15 and
+    // simply matches nothing rather than raising. WITH an exponent the
+    // whole string goes to the DOUBLE grammar, which trims its ENDS and
+    // refuses an INTERIOR blank: `' 1.5e0 '` answers while `'1 e2'`,
+    // `'1e 2'`, `'1.5 e0'` and `'1 . 5 e 0'` all raise.
+    //
+    // A first cut here trimmed only the ends, which raised on all five of
+    // the lenient spellings the engine answers.
+    let t = if s.bytes().any(|c| c == b'e' || c == b'E') {
+        let t = s.trim_matches(' ');
+        if t.bytes().any(|c| c == b' ') {
+            return Err(false);
+        }
+        t.to_string()
+    } else {
+        s.chars().filter(|c| *c != ' ').collect::<String>()
+    };
+    if dec_special_text(&t) {
+        return Err(false);
+    }
+    text_to_dec128_clamped(&t)
+}
+
+/// Post the engine's own vector for a string LITERAL a DECFLOAT
+/// comparison cannot convert, and REFUSE THE STATEMENT.
+///
+/// It is a prepare-time refusal rather than a per-row [Term::CmpConvErr]
+/// because the engine's raise is NOT VALUE-GATED: `WHERE 1 = 0 AND
+/// D = 'inf'`, `WHERE ID = 99 AND D = 'inf'` and the same predicate over
+/// an EMPTY table all raise, and none of them evaluates a row.  The
+/// vector is the ONE-LINE `conversion error from string "<text>"` - the
+/// two-line compound that opens with *Decimal float invalid operation*
+/// ([EvalErr::DecfloatConvError]) belongs to the per-row paths, and
+/// emitting it here was `serve-real-bindconv.sh`'s last red cell.
+///
+/// `overflow` carries [literal_to_dec128]'s `Err(true)`: an exponent past
+/// decimal128's range is 22003 *Decimal float overflow* instead, measured
+/// for `'1e7000'` at both widths.
+fn refuse_dec_literal(text: &str, overflow: bool) -> Option<Term> {
+    PREPARE_REFUSAL.with(|r| {
+        *r.borrow_mut() = Some(if overflow {
+            EvalErr::DecfloatOverflow
+        } else {
+            EvalErr::ConversionError(Some(text.to_string()))
+        })
+    });
+    None
+}
+
+/// `NULLIF(<a DECFLOAT>, '<text>')` - the fourth router of the literal
+/// law, and the one that is an EXPRESSION rather than a Term.
+///
+/// NULLIF's second operand is a string LITERAL compared against a
+/// DECFLOAT, so it takes the same prepare-time conversion the comparison
+/// arm of [decfloat_term] takes, and it does so IN BOTH CONTEXTS -
+/// measured on the live engine, `SELECT ID FROM M WHERE NULLIF(D,'inf')
+/// IS NULL` and `SELECT NULLIF(D,'inf') FROM M` raise the SAME one-line
+/// 22018, while `NULLIF(D,' 1.5 ')` and `NULLIF(D,'1 0 0')` both ANSWER
+/// in both contexts. (A probe reported the two contexts using different
+/// grammars; re-measured, they do not.)
+///
+/// Converting HERE, where the expression is resolved, is what makes the
+/// raise a prepare-time one: the conversion used to sit in the per-row
+/// `Expr::NullIf` evaluator, so the prepare answered with a describe and
+/// the error arrived from inside the fetch - `serve-real-absround.sh`'s
+/// red cell. `None` refuses the statement through [refuse_dec_literal].
+fn nullif_dec_literal(a: Expr, b: Expr, descs: &[Descriptor]) -> Option<Expr> {
+    let width = |e: &Expr| -> Option<bool> {
+        match e {
+            Expr::Col(fid) => match descs.get(*fid)?.dtype {
+                dtype::DEC128 => Some(true),
+                dtype::DEC64 => Some(false),
+                _ => None,
+            },
+            Expr::DecFloat34(_) => Some(true),
+            _ => None,
+        }
+    };
+    // only the plain `NULLIF(<decfloat>, '<literal>')` shape moves; every
+    // other pairing keeps exactly what it did before
+    let (Some(wide), Expr::Str(t)) = (width(&a), &b) else {
+        return Some(Expr::NullIf(Box::new(a), Box::new(b)));
+    };
+    match literal_to_dec128(t) {
+        Ok(bits) => Some(Expr::NullIf(
+            Box::new(a),
+            Box::new(Expr::DecFloat34(if wide { bits } else { narrow_dec16_bind(bits) })),
+        )),
+        Err(overflow) => {
+            refuse_dec_literal(t, overflow)?;
+            None
+        }
+    }
+}
+
+/// A LIKE / STARTING WITH pattern written as a string LITERAL against a
+/// DECFLOAT column: converted by [literal_to_dec128] at the column's
+/// width and then RENDERED BACK, because that rendered text - not the
+/// text the user wrote - is what the engine matches with.  `None`
+/// refuses the statement through [refuse_dec_literal].
+fn dec_literal_pattern(p: &str, d: &Descriptor) -> Option<String> {
+    match literal_to_dec128(p) {
+        Ok(bits) => {
+            let bits = if d.dtype == dtype::DEC64 { narrow_dec16_bind(bits) } else { bits };
+            Some(fire_crab_ods::decfloat::to_string(
+                &fire_crab_ods::decfloat::decode_dec128(bits),
+            ))
+        }
+        // `refuse_dec_literal` is always None - it is the POSTING that
+        // matters - and the `?` carries that None out, the same shape
+        // [nullif_dec_literal] uses
+        Err(overflow) => {
+            refuse_dec_literal(p, overflow)?;
+            None
+        }
+    }
+}
+
 /// [text_to_dec128] with decNumber's exponent CLAMPING: a coefficient
 /// rounded to 34 digits (HALF-UP) whose exponent falls below decimal128's
 /// minimum -6176 rounds away the digits it cannot carry (1e-6177 is 0,
@@ -76212,16 +76384,13 @@ fn text_to_dec128(s: &str) -> Option<u128> {
     // optional payload of digits) is a NaN, which TRAPS the comparison
     // (SQLSTATE 22000, handled at [Term::matches]). Case-insensitive;
     // anything trailing (`Infinityx`) falls through and raises 22018.
-    {
+    // [dec_special_text] is the SINGLE gate on this shape: the literal
+    // path has to reject exactly what this one accepts, so the two read
+    // the same predicate rather than two copies that can drift.
+    if dec_special_text(s) {
         let rest = s[i..].to_ascii_lowercase();
-        if rest == "inf" || rest == "infinity" {
-            return Some(fire_crab_ods::decfloat::encode_dec128_special(neg, false));
-        }
-        if let Some(payload) = rest.strip_prefix("snan").or_else(|| rest.strip_prefix("nan")) {
-            if payload.bytes().all(|c| c.is_ascii_digit()) {
-                return Some(fire_crab_ods::decfloat::encode_dec128_special(neg, true));
-            }
-        }
+        let inf = rest == "inf" || rest == "infinity";
+        return Some(fire_crab_ods::decfloat::encode_dec128_special(neg, !inf));
     }
     let mut digits: Vec<u8> = Vec::new();
     let mut seen_dot = false;
@@ -89399,6 +89568,26 @@ struct RawTerm {
     /// [negate_term] and the LHS rewrites carry it along.  Read by
     /// [nan_cmp_verdict] and nothing else.
     mirrored: bool,
+    /// `Some(width)` when this leaf came from a MULTI-ELEMENT IN-LIST,
+    /// carrying the width the engine pads that list's elements to.
+    ///
+    /// A multi-value IN is not the OR it desugars to, and the reason is
+    /// measurable: the engine treats the list as a CHAR list, so every
+    /// element is BLANK-PADDED TO THE WIDEST ONE and then converted PER
+    /// ROW by the decNumber grammar - which accepts `inf` and REJECTS a
+    /// trailing blank. The error text says so outright: `D IN ('2.5','7')`
+    /// raises *conversion error from string "7  "* - two blanks, the
+    /// width of `'2.5'` - and `D IN ('-2.5','7')` names `"7   "`. That is
+    /// why `D IN ('inf','100')` ANSWERS (both three wide, nothing padded,
+    /// `inf` a perfectly good decNumber Infinity) while `D IN
+    /// ('inf','9999')` RAISES on `"inf "`, and why a one-element
+    /// `D IN ('inf')` raises the ordinary literal's ONE-LINE vector at
+    /// PREPARE instead: with nothing to pad against, it is not a list.
+    ///
+    /// Only [decfloat_term] reads it. Everywhere else the padding is
+    /// invisible - a text column ignores trailing blanks and an exact
+    /// numeric one has its own guard at the desugar.
+    in_list: Option<usize>,
 }
 #[derive(Clone)]
 enum RawLhs {
@@ -89632,6 +89821,7 @@ fn parse_unary(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
                 lhs: RawLhs::Col(String::new()),
                 kind: RawKind::Const(b),
                 mirrored: false,
+                in_list: None,
             }))
         }
         _ => parse_leaf(t, pos, np),
@@ -89951,6 +90141,7 @@ fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
                         // and only this flag remembers that the engine
                         // saw `? op X`
                         mirrored: true,
+                        in_list: None,
                     }));
                 }
             }
@@ -89980,6 +90171,7 @@ fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
                         lhs: RawLhs::Param(slot),
                         kind: if not { RawKind::IsNotNull } else { RawKind::IsNull },
                         mirrored: false,
+                        in_list: None,
                     }));
                 }
                 // `? IS TRUE/FALSE/DISTINCT FROM` with a param left
@@ -90048,6 +90240,7 @@ fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
                         lhs: RawLhs::Param(slot),
                         kind: RawKind::Like(pattern, escape, negated),
                         mirrored: false,
+                        in_list: None,
                     }));
                 }
                 // `? [NOT] STARTING [WITH] <prefix>` - same shape,
@@ -90068,6 +90261,7 @@ fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
                         lhs: RawLhs::Param(slot),
                         kind: RawKind::Starting(prefix, negated),
                         mirrored: false,
+                        in_list: None,
                     }));
                 }
                 // `? [NOT] SIMILAR TO <pattern> [ESCAPE 'c']` - the last
@@ -90109,6 +90303,7 @@ fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
                         lhs: RawLhs::Param(slot),
                         kind: RawKind::Similar(pattern, escape, negated),
                         mirrored: false,
+                        in_list: None,
                     }));
                 }
                 // `? [NOT] BETWEEN <lo> AND <hi>` desugars into the
@@ -90140,6 +90335,7 @@ fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
                             // `? BETWEEN lo AND hi` is WRITTEN `? >= lo`
                             // and `? <= hi`; the desugar mirrors both
                             mirrored: true,
+                            in_list: None,
                         }))
                     };
                     // THE LOW BOUND TYPES THE SLOT, and it does so
@@ -90222,6 +90418,7 @@ fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
                             lhs: RawLhs::Expr(raw_of(item)?),
                             kind: RawKind::Cmp(Cmp::Eq, param.clone()),
                             mirrored: true,
+                            in_list: None,
                         }));
                     }
                     let body = Ast::Or(ors);
@@ -90254,6 +90451,7 @@ fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
                     lhs: RawLhs::Expr(RawExpr::Bool(true)),
                     kind: RawKind::Cmp(Cmp::Eq, param),
                     mirrored: false,
+                    in_list: None,
                 }));
             }
         }
@@ -90285,7 +90483,7 @@ fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
             e => RawLhs::Expr(e),
         },
     };
-    let leaf = |kind: RawKind| Ast::Leaf(RawTerm { lhs: lhs.clone(), kind, mirrored: false });
+    let leaf = |kind: RawKind| Ast::Leaf(RawTerm { lhs: lhs.clone(), kind, mirrored: false, in_list: None });
     // an optional NOT immediately before LIKE/BETWEEN/IN/STARTING/
     // CONTAINING (the last three lex as Idents - each is a usable
     // column name, probed: CREATE TABLE T2 (STARTING INT) succeeds -
@@ -90420,11 +90618,13 @@ fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
                             lhs: lhs.clone(),
                             kind: RawKind::Cmp(op, v.clone()),
                             mirrored: false,
+                            in_list: None,
                         }),
                         Side::Expr(e) => Ast::Leaf(RawTerm {
                             lhs: lhs.clone(),
                             kind: RawKind::CmpExpr(op, e.clone()),
                             mirrored: false,
+                            in_list: None,
                         }),
                     }
                 };
@@ -90434,18 +90634,18 @@ fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
                         cmp_leaf(Cmp::Eq),
                         Ast::And(vec![
                             leaf(RawKind::IsNull),
-                            Ast::Leaf(RawTerm { lhs: rl, kind: RawKind::IsNull, mirrored: false }),
+                            Ast::Leaf(RawTerm { lhs: rl, kind: RawKind::IsNull, mirrored: false, in_list: None }),
                         ]),
                     ]),
                     (false, Some(rl)) => Ast::Or(vec![
                         cmp_leaf(Cmp::Ne),
                         Ast::And(vec![
                             leaf(RawKind::IsNull),
-                            Ast::Leaf(RawTerm { lhs: rl.clone(), kind: RawKind::IsNotNull, mirrored: false }),
+                            Ast::Leaf(RawTerm { lhs: rl.clone(), kind: RawKind::IsNotNull, mirrored: false, in_list: None }),
                         ]),
                         Ast::And(vec![
                             leaf(RawKind::IsNotNull),
-                            Ast::Leaf(RawTerm { lhs: rl, kind: RawKind::IsNull, mirrored: false }),
+                            Ast::Leaf(RawTerm { lhs: rl, kind: RawKind::IsNull, mirrored: false, in_list: None }),
                         ]),
                     ]),
                     // the right side is a value that is not NULL
@@ -90582,8 +90782,32 @@ fn parse_leaf(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Ast> {
             {
                 return None;
             }
-            let items: Vec<Ast> =
-                sides.into_iter().map(|s| leaf(side_kind(Cmp::Eq, s))).collect();
+            // A MULTI-ELEMENT LIST IS A CHAR LIST, so each leaf carries
+            // the width the engine pads it to ([RawTerm::in_list]); a
+            // ONE-element list is not a list and carries nothing, which
+            // is what makes `D IN ('inf')` raise at prepare while
+            // `D IN ('1.5','inf')` answers.
+            let pad = if sides.len() > 1 {
+                sides
+                    .iter()
+                    .filter_map(|s| match s {
+                        Side::Val(Rhs::Str(v)) => Some(v.chars().count()),
+                        _ => None,
+                    })
+                    .max()
+            } else {
+                None
+            };
+            let items: Vec<Ast> = sides
+                .into_iter()
+                .map(|s| match (pad, leaf(side_kind(Cmp::Eq, s))) {
+                    (Some(w), Ast::Leaf(mut t)) => {
+                        t.in_list = Some(w);
+                        Ast::Leaf(t)
+                    }
+                    (_, a) => a,
+                })
+                .collect();
             let body = Ast::Or(items);
             Some(if negated { Ast::Not(Box::new(body)) } else { body })
         }
@@ -90791,7 +91015,7 @@ fn negate_term(t: &RawTerm) -> Option<RawTerm> {
         // three-valued subtlety, it is TRUE or FALSE, never UNKNOWN
         RawKind::Const(b) => RawKind::Const(!b),
     };
-    Some(RawTerm { lhs: t.lhs.clone(), kind, mirrored: t.mirrored })
+    Some(RawTerm { lhs: t.lhs.clone(), kind, mirrored: t.mirrored, in_list: t.in_list })
 }
 
 /// Split a token slice on top-level commas only - commas nested inside
@@ -98951,7 +99175,7 @@ fn resolve_predicate(
                 // numeric comparison surface
                 None if is_numeric_col(d) => numeric_term(fid, rt.kind, d, params, rt.mirrored)?,
                 // DECFLOAT columns: the decimal128 comparison surface
-                None if is_decfloat_col(d) => decfloat_term(fid, rt.kind, d, params, rt.mirrored)?,
+                None if is_decfloat_col(d) => decfloat_term(fid, rt.kind, d, params, rt.mirrored, rt.in_list)?,
                 // a DATE/TIME/TIMESTAMP column takes the EXPRESSION
                 // path. Its comparison rules already live there -
                 // `value_cmp` converts a DATE to midnight against a
@@ -99520,7 +99744,7 @@ fn resolve_expr_term(
                 return Some(octets_like_term(lhs, &p, *negated));
             }
             return resolve_expr_term(
-                &RawTerm { lhs: rt.lhs.clone(), kind: RawKind::Like(Rhs::Str(p), *escape, *negated), mirrored: rt.mirrored },
+                &RawTerm { lhs: rt.lhs.clone(), kind: RawKind::Like(Rhs::Str(p), *escape, *negated), mirrored: rt.mirrored, in_list: rt.in_list },
                 columns,
                 descs,
                 params,
@@ -99529,7 +99753,7 @@ fn resolve_expr_term(
         RawKind::Starting(Rhs::Oct(b), negated) => {
             let p = fire_crab_ods::intl::carrier_decode(b);
             return resolve_expr_term(
-                &RawTerm { lhs: rt.lhs.clone(), kind: RawKind::Starting(Rhs::Str(p), *negated), mirrored: rt.mirrored },
+                &RawTerm { lhs: rt.lhs.clone(), kind: RawKind::Starting(Rhs::Str(p), *negated), mirrored: rt.mirrored, in_list: rt.in_list },
                 columns,
                 descs,
                 params,
@@ -99686,7 +99910,7 @@ fn resolve_expr_term(
         RawKind::Similar(Rhs::Oct(b), escape, negated) => {
             let p = fire_crab_ods::intl::carrier_decode(b);
             return resolve_expr_term(
-                &RawTerm { lhs: rt.lhs.clone(), kind: RawKind::Similar(Rhs::Str(p), *escape, *negated), mirrored: rt.mirrored },
+                &RawTerm { lhs: rt.lhs.clone(), kind: RawKind::Similar(Rhs::Str(p), *escape, *negated), mirrored: rt.mirrored, in_list: rt.in_list },
                 columns,
                 descs,
                 params,
@@ -100945,6 +101169,7 @@ fn decfloat_term(
     d: &Descriptor,
     params: &mut Vec<Option<Descriptor>>,
     mirrored: bool,
+    in_list: Option<usize>,
 ) -> Option<Term> {
     // a LIKE/STARTING pattern `?` is plain VARYING text whatever the column
     // (the engine renders the DECFLOAT value and matches against text) -
@@ -100981,36 +101206,81 @@ fn decfloat_term(
                 Rhs::Param(slot, ColKind::DecFloat { wide: d.dtype == dtype::DEC128 }, mirrored),
             )
         }
-        // a TEXT literal converts to decimal128 by the engine's decNumber
-        // grammar; a non-convertible one raises 22018 PER ROW (UNKNOWN over
-        // NULL, no raise on an empty table), which is exactly what
-        // [Term::CmpConvErr] with no lenient fallback does
-        // a DECFLOAT(16) column reads the literal by the parameter rule
-        // ([decfloat_param_term]): blanks trimmed, narrowed to 16 digits,
-        // every special a per-row conversion error (`D16 = 'inf'` raises,
-        // measured)
-        RawKind::Cmp(op, Rhs::Str(v)) if d.dtype == dtype::DEC64 => {
-            match decfloat_param_term(Some(&WireParam::Text(v.clone())), idx, op, &ColKind::DecFloat { wide: false }) {
-                Some(t) => t,
-                None => Term::CmpConvErr(idx, op, v, None),
+        // A STRING LITERAL IS CONVERTED ONCE, AT PREPARE, BY THE
+        // EXACT-NUMERIC GRAMMAR ([literal_to_dec128]) - and it converts
+        // at the COLUMN's width.  It is NOT the decNumber grammar the
+        // same text gets as a bound PARAMETER or inside an explicit CAST,
+        // and the difference shows in BOTH directions (measured, both
+        // widths): `D = ' 1.5 '` ANSWERS here and RAISES as a parameter,
+        // and `D = 'inf'` RAISES here and is a VALUE as a parameter.
+        //
+        // A FAILURE IS NOT A PER-ROW TERM.  It fires over an empty table,
+        // under `1 = 0 AND` and under `ID = 99 AND` - all three measured -
+        // so it refuses the STATEMENT through [PREPARE_REFUSAL], the way
+        // the LIKE-truncation raise in [param_or_typed_term] does, and the
+        // client sees NO describe line before the error.  That last part
+        // is the whole of `serve-real-absround.sh`'s red: this server used
+        // to answer the prepare and then raise from inside the fetch.
+        // ...UNLESS IT IS AN ELEMENT OF A MULTI-VALUE IN-LIST, which is
+        // a CHAR list and a different grammar entirely: blank-padded to
+        // the widest element and converted PER ROW by decNumber, specials
+        // and all ([RawTerm::in_list] carries the measurements).
+        RawKind::Cmp(op, Rhs::Str(v)) if in_list.is_some() => {
+            // `is_some` in the guard, so the width is present; 0 pads
+            // nothing, which is also what a same-width list wants
+            let pad = in_list.unwrap_or(0).saturating_sub(v.chars().count());
+            let padded = format!("{}{}", v, " ".repeat(pad));
+            // decNumber, and NOT the parameter path's `trim_matches(' ')`
+            // - the padding IS the failure, so trimming it away would
+            // answer where the engine raises (`S IN ('2.5','7')`, on a
+            // DECFLOAT(16) column holding 2.5, raises on `"7  "`).
+            // The vector is the TWO-LINE compound at BOTH widths here,
+            // which is the other way this arm differs from the one-line
+            // literal above.
+            match text_to_dec128_clamped(&padded) {
+                Ok(bits) => Term::NumCmp(
+                    idx,
+                    op,
+                    Rhs::DecFloat34(if d.dtype == dtype::DEC64 { narrow_dec16_bind(bits) } else { bits }),
+                ),
+                Err(_) => Term::DfConvErr(idx, op, padded),
             }
         }
-        RawKind::Cmp(op, Rhs::Str(v)) => match text_to_dec128_clamped(&v) {
-            Ok(bits) => Term::NumCmp(idx, op, Rhs::DecFloat34(bits)),
-            // the WIDE column's own vector: *Decimal float invalid
-            // operation* and then the conversion error (probed: `D34 =
-            // 'abc'`; a DECFLOAT(16) column raises the conversion error
-            // ALONE, which is the DEC64 arm above)
-            Err(_) => Term::DfConvErr(idx, op, v),
+        RawKind::Cmp(op, Rhs::Str(v)) => match literal_to_dec128(&v) {
+            Ok(bits) => Term::NumCmp(
+                idx,
+                op,
+                Rhs::DecFloat34(if d.dtype == dtype::DEC64 { narrow_dec16_bind(bits) } else { bits }),
+            ),
+            Err(overflow) => refuse_dec_literal(&v, overflow)?,
         },
         RawKind::Cmp(op, rhs) => Term::NumCmp(idx, op, Rhs::DecFloat34(rhs_to_dec128(&rhs)?)),
         RawKind::IsNull => Term::IsNull(idx),
         RawKind::IsNotNull => Term::IsNotNull(idx),
         // LIKE/STARTING render the DECFLOAT value to its decNumber string
         // (Value::render) and match the pattern per row - exactly the
-        // [Term::ExprLike]/[Term::ExprStarting] path [numeric_term] uses
+        // [Term::ExprLike]/[Term::ExprStarting] path [numeric_term] uses.
+        //
+        // ...BUT THE PATTERN IS NOT A PATTERN UNTIL IT CONVERTS.  It goes
+        // through the SAME prepare-time literal conversion the comparison
+        // arm above uses, wildcards and all, so `D LIKE '1%'`, `'1_0'`,
+        // `'%E+38'` and `D STARTING WITH '-'` raise the one-line 22018 at
+        // prepare rather than matching rendered text.  When it DOES
+        // convert, the converted value is RENDERED BACK and THAT is the
+        // pattern ([dec_literal_pattern]) - and no "keep the original
+        // text" rule fits the measurements: `D STARTING WITH '01'`
+        // answers 1;2;4 (through "1"), `D LIKE '+1.5'` answers 1 (through
+        // "1.5") and `D LIKE ' 1.5 '` likewise, none of which the raw
+        // text matches.
+        //
+        // CAPPED: an EXPONENT-BEARING pattern is rendered by the engine
+        // as a DOUBLE ("1E2" becomes the text "100.0000000000000"), not
+        // as a DECFLOAT, so this arm finds the row whose own rendering is
+        // "1E+2" and the engine finds nothing. Recorded as a divergence
+        // in `serve-real-dfnflit.sh` rather than modelled, because the
+        // double text belongs to the double-literal law.
         RawKind::Like(Rhs::Str(p), escape, negated) => {
-            Term::ExprLike(Box::new(Expr::Col(idx)), p, escape, negated)
+            Term::ExprLike(Box::new(Expr::Col(idx)), dec_literal_pattern(&p, d)?, escape, negated)
         }
         RawKind::Like(Rhs::Param(slot, _, ..), escape, negated) => {
             claim_text(slot);
@@ -101019,7 +101289,7 @@ fn decfloat_term(
         RawKind::Like(Rhs::Null, ..) => Term::Unknown,
         RawKind::Like(..) => return None,
         RawKind::Starting(Rhs::Str(p), negated) => {
-            Term::ExprStarting(Box::new(Expr::Col(idx)), p, negated)
+            Term::ExprStarting(Box::new(Expr::Col(idx)), dec_literal_pattern(&p, d)?, negated)
         }
         RawKind::Starting(Rhs::Param(slot, _, ..), negated) => {
             claim_text(slot);
@@ -101622,11 +101892,13 @@ fn resolve_having(
                     lhs: RawLhs::Expr(RawExpr::Agg(*f, Box::new(t.clone()))),
                     kind: rt.kind.clone(),
                     mirrored: rt.mirrored,
+                    in_list: rt.in_list,
                 }),
                 RawLhs::Col(c) if has_rhs_expr => Some(RawTerm {
                     lhs: RawLhs::Expr(RawExpr::Col(c.clone())),
                     kind: rt.kind.clone(),
                     mirrored: rt.mirrored,
+                    in_list: rt.in_list,
                 }),
                 _ => None,
             };
@@ -101745,7 +102017,7 @@ fn resolve_having(
                     }
                     let (synth_cols, synth_descs) =
                         synth_group_view(gitems, slot_descs, columns, synth_base);
-                    let rt2 = RawTerm { lhs: RawLhs::Expr(subbed), kind: kind2, mirrored: rt.mirrored };
+                    let rt2 = RawTerm { lhs: RawLhs::Expr(subbed), kind: kind2, mirrored: rt.mirrored, in_list: rt.in_list };
                     HAVING_MUL_WIDTHS.with(|h| *h.borrow_mut() = vouched);
                     let term = resolve_expr_term(&rt2, &synth_cols, &synth_descs, params);
                     HAVING_MUL_WIDTHS.with(|h| h.borrow_mut().clear());
@@ -126274,6 +126546,56 @@ mod computed_wide_types {
     }
 
     /// ROUND 13: a NUMERIC FUNCTION'S `?` is a DOUBLE slot, not the
+    /// A STRING LITERAL AGAINST A DECFLOAT COLUMN has its OWN grammar -
+    /// [literal_to_dec128] - and the two ways it differs from the
+    /// decNumber grammar a PARAMETER or a CAST gets ([text_to_dec128])
+    /// are the whole of the chunk, so both are asserted here against
+    /// each other rather than in isolation.
+    #[test]
+    fn a_decfloat_literal_skips_blanks_and_refuses_every_special() {
+        use fire_crab_ods::decfloat::{decode_dec128, Dec};
+        let fin = |s: &str| match decode_dec128(literal_to_dec128(s).expect(s)) {
+            Dec::Finite { neg, coeff, exp } => (neg, coeff, exp),
+            _ => panic!("{s} converted to a special, which a literal must never do"),
+        };
+        // WITHOUT AN EXPONENT A BLANK IS IGNORED WHEREVER IT STANDS: all
+        // six of these are the number 100, and the engine answers the
+        // 100 row for every one of them.
+        for s in ["100", " 100 ", "1 0 0", "1 0 0 ", "  100  ", "+ 100"] {
+            assert_eq!(fin(s), (false, 100, 0), "{s}");
+        }
+        assert_eq!(fin("- 2.5"), (true, 25, -1));
+        // ...and `'1 5'` is FIFTEEN, not a refusal - the cell that says
+        // this rule is "skip blanks", not "raise on anything with one".
+        assert_eq!(fin("1 5"), (false, 15, 0));
+        // WITH an exponent it is the DOUBLE grammar: the ends trim and an
+        // interior blank refuses.
+        assert_eq!(fin(" 1.5e0 "), (false, 15, -1));
+        for s in ["1 e2", "1e 2", "1.5 e0", "1 . 5 e 0"] {
+            assert_eq!(literal_to_dec128(s), Err(false), "{s} must refuse");
+        }
+        // EVERY SPECIAL IS REJECTED - and [text_to_dec128], the grammar a
+        // PARAMETER and a CAST get, ACCEPTS every one of them. That
+        // opposition is the law; asserting only one half of it would let
+        // the two drift back together.
+        for s in ["inf", "Infinity", "+INF", "-inf", "nan", "NaN", "sNaN", "nan123"] {
+            assert_eq!(literal_to_dec128(s), Err(false), "{s} must refuse as a literal");
+            assert!(text_to_dec128(s).is_some(), "{s} must still convert as a parameter");
+            assert!(dec_special_text(s), "{s}");
+        }
+        // a near miss is ordinary junk on BOTH sides
+        for s in ["Infinityx", "abc", "", "  ", "1,5", "0x1", "nan1x"] {
+            assert_eq!(literal_to_dec128(s), Err(false), "{s}");
+            assert!(text_to_dec128(s).is_none(), "{s}");
+        }
+        // the exponent range, where the verdict is 22003 and NOT 22018 -
+        // a different wire vector, so `Err(true)` is load-bearing
+        assert_eq!(literal_to_dec128("1e6145"), Err(true));
+        assert!(literal_to_dec128("1e6144").is_ok());
+        // ...and an UNDERFLOW is not an error at all, it clamps to zero
+        assert_eq!(fin("1e-7000"), (false, 0, -6176));
+    }
+
     /// destination's - the engine announces `sqltype 480 DOUBLE` for the
     /// argument of ABS / SIGN / ROUND / TRUNC / FLOOR / CEIL / CEILING,
     /// and passing the destination down converted the value BEFORE the
