@@ -182,10 +182,11 @@ both "GROUP BY COALESCE(?,0)"       "SELECT COUNT(*) FROM T GROUP BY COALESCE(?,
 both "GROUP BY CAST(? AS INTEGER)"  "SELECT COUNT(*) FROM T GROUP BY CAST(? AS INTEGER)"
 both "GROUP BY NULLIF(?,0)"         "SELECT COUNT(*) FROM T GROUP BY NULLIF(?,0)"
 both "GROUP BY N + CAST(? AS INT)"  "SELECT COUNT(*) FROM T GROUP BY N + CAST(? AS INTEGER)" '[1]'
-# a `?` in a CONDITION is typed from the COMPARISON, which is
-# [resolve_raw_cond]'s rule - and that resolver refuses parameters
-eng_only "CASE WHEN ID = ? THEN 1 ELSE 0 END" "SELECT CASE WHEN ID = ? THEN 1 ELSE 0 END FROM T WHERE ID=1" '[1]'
-eng_only "IIF(N = ?, 1, 0)"             "SELECT IIF(N = ?, 1, 0) FROM T WHERE ID=1" '[3]'
+# a `?` in a CONDITION is typed from the COMPARISON's other side
+# (measured: ID's own LONG Nullable) - resolve_raw_cond_sink's rule since
+# the comparison-typing chunk; serve-real-cmpparam carries the law
+both "CASE WHEN ID = ? THEN 1 ELSE 0 END" "SELECT CASE WHEN ID = ? THEN 1 ELSE 0 END FROM T WHERE ID=1" '[1]'
+both "IIF(N = ?, 1, 0)"                 "SELECT IIF(N = ?, 1, 0) FROM T WHERE ID=1" '[3]'
 
 kill $srv 2>/dev/null; wait $srv 2>/dev/null; trap - EXIT
 rm -f "$ENG" "$FC"

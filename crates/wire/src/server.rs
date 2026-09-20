@@ -2602,6 +2602,33 @@ impl CryptOffer {
 /// added the bit. The on-disk `dsc_flags` has no consumer here, so the
 /// planners overwrite it on the COPY they register.
 const PARAM_NOT_NULL: u16 = 8;
+/// A subquery body's `?` typed as a whole-side EXACT rung - a mark the
+/// body's bind reads ([corr_whole_exact_raise]) and no describe carries
+/// (round 11).
+const PARAM_WHOLE_EXACT: u16 = 0x4000;
+/// A CHUNK-NEW slot (round 12): a `?` the previous binary could not
+/// plan - one typed from the OTHER side of a comparison
+/// ([resolve_cmp_param_side]) or sitting in a CASE / IIF CONDITION
+/// ([resolve_raw_cond_sink]), or a classic `<expr> = ?` whose other side
+/// itself carries a `?` (the previous binary prepared those and failed
+/// every execute). Set where the descriptor is registered
+/// ([marking_chunk_new]) and carried by the descriptor itself, so it
+/// survives every renumbering a nested plan does (a subquery body's
+/// slots, an INSERT .. SELECT source, a re-plan after `params.clear()`).
+/// Two caps read it and nothing else: [chunk_new_mixed] at prepare (K1)
+/// and [chunk_new_text_off_grammar] at execute (K2). No describe carries
+/// it ([append_bind_section] reads [PARAM_NOT_NULL] only).
+const PARAM_CHUNK_NEW: u16 = 0x2000;
+/// A subquery body's CLASSIC numeric compare `?` (`ID IN (SELECT b.ID FROM
+/// TW b WHERE b.N = ?)`): its text bind is spelled by this chunk's
+/// [corr_text_cmp_literal] / [corr_whole_exact_literal], where the
+/// previous binary's '<text>' spelling failed at execute on every text
+/// past the literal compare's coefficient. Round 12 caps that spelling:
+/// such a text carrying a BLANK raises the conversion error at execute
+/// ([chunk_new_text_off_grammar]) - '1.' + 38 zeros + '1 ' answered row 1
+/// where the engine raises *Decimal float invalid operation* (round 11's
+/// refuter). Set in [corr_register]; no describe carries it.
+const PARAM_BODY_CMP: u16 = 0x1000;
 
 fn append_bind_section(d: &mut Vec<u8>, params: &[Descriptor], att: AttCs) {
     fn int_item(d: &mut Vec<u8>, code: u8, val: i32) {
@@ -9971,7 +9998,11 @@ AlterDomainRename {
         /// driver's value at the slot, before the arithmetic, and the
         /// per-row text is planned after the substitution, so there is
         /// nowhere later for the conversion to happen ([merge_subst]).
-        param_slots: Vec<(Descriptor, bool)>,
+        /// The third flag: the marker is at a VALUE position (the bare
+        /// value, a COALESCE / NULLIF / IIF / CASE value arm, a `||`
+        /// operand), where the slot cast carries [CS_SLOT_CAST]; any other
+        /// marker's cast is an operand's [CS_SLOT_OPERAND] (round 9).
+        param_slots: Vec<(Descriptor, bool, bool)>,
     },
     /// `DELETE FROM <t> [WHERE ...]`: op_execute rewrites each matching
     /// primary record as a deleted stub over its version chain
@@ -12333,6 +12364,19 @@ impl Predicate {
                     // the literal spelling of the same comparison
                     // (the gate pins the plain-column rows).
                     Term::ExprParam(lhs, op, idx, kind, cs) => {
+                        // the tested side's OWN `?`s bind here too
+                        // (`CAST(? AS INTEGER) = ?`, `IIF(ID = ?, 1, 0) = ?`
+                        // - engine 1;2;3 and 2; this server errored at
+                        // eval with the inner Param unbound)
+                        let lhs_b: Box<Expr> = if expr_has_param(lhs) {
+                            Box::new(
+                                subst_params_expr(lhs, args)
+                                    .ok_or("parameter type does not match its column")?,
+                            )
+                        } else {
+                            lhs.clone()
+                        };
+                        let lhs = &lhs_b;
                         let num_lit = if matches!(kind, ColKind::Text) {
                             match args.get(*idx).ok_or("missing parameter value")? {
                                 WireParam::Int(v, 0) => Some(Expr::Int(*v)),
@@ -12708,6 +12752,24 @@ fn expr_has_col(e: &Expr) -> bool {
     expr_reads(e, &|_| true)
 }
 
+/// Does this resolved side read a WITH TIME ZONE column? A whole-side
+/// `?` typed from such a side (`IIF(CAST(TZ AS TIMESTAMP) = ?, 1, 0)`,
+/// `CAST(TMZ AS TIME) = ?` under a condition) refuses at prepare: the
+/// zoned cast keeps its pre-existing conversion error at execute (round
+/// 7, THE SCOPE CUT: round 5's session-zone conversion was outside this
+/// chunk's scope), and the previous binary refused every one of these
+/// at prepare - never described and then failed.
+fn expr_reads_zoned_col(e: &Expr, descs: &[Descriptor]) -> bool {
+    expr_reads(e, &|fid| {
+        descs.get(fid).is_some_and(|d| {
+            matches!(
+                d.dtype,
+                dtype::SQL_TIME_TZ | dtype::TIMESTAMP_TZ | dtype::EX_TIME_TZ | dtype::EX_TIMESTAMP_TZ
+            )
+        })
+    })
+}
+
 /// Does this resolved expression read a row slot the test accepts? A
 /// generator value counts as read whatever the test says - it is a slot
 /// with no field of its own. The whole-expression question is
@@ -12802,16 +12864,40 @@ fn cond_has_param(c: &Cond2) -> bool {
 
 /// Substitute the bound arguments into a condition's `?` placeholders,
 /// the [subst_params_expr] twin for the predicate side. The CAST that
-/// types each one then converts it PER ROW, which is where the engine
-/// raises from (probed: a NULL column still raises, an empty table does
-/// not, and a FALSE conjunct written in front silences it).
+/// types an OPERAND `?` then converts it PER ROW, which is where the
+/// engine raises from (probed: a NULL column still raises, an empty table
+/// does not, and a FALSE conjunct written in front silences it) - while a
+/// `?` that is a WHOLE side of the comparison ([whole_side_rung]) binds
+/// the client's value whole, never converted into its slot.
 fn subst_params_cond(c: &Cond2, args: &[WireParam]) -> Option<Cond2> {
+    // a `?`-free condition is returned as it is - a param-free LIKE arm
+    // beside a `?`-carrying comparison inside one AND/OR (`IIF(ID = ?
+    // AND S LIKE 'c%', 1, 0)`, engine 0;1;0) must not turn into the
+    // bind error the pattern arms below answer for a `?` of their own
+    if !cond_has_param(c) {
+        return Some(c.clone());
+    }
     Some(match c {
-        Cond2::Cmp(a, op, b) => Cond2::Cmp(
-            Box::new(subst_params_expr(a, args)?),
-            *op,
-            Box::new(subst_params_expr(b, args)?),
-        ),
+        Cond2::Cmp(a, op, b) => {
+            // a number bound into a whole-side TEXT rung turns the
+            // comparison numeric ([bind_whole_side_text_cmp]); every
+            // other pair substitutes side by side (a whole-side EXACT
+            // rung binds whole inside [subst_params_expr])
+            if let Some(bound) = bind_whole_side_text_cmp(a, *op, b, args) {
+                return bound;
+            }
+            // a TEXT bound into a whole-side EXACT rung raises the
+            // engine's alignment error against the other side, row by
+            // row ([bind_whole_side_exact_cmp], round 11)
+            if let Some(bound) = bind_whole_side_exact_cmp(a, *op, b, args) {
+                return bound;
+            }
+            Cond2::Cmp(
+                Box::new(subst_params_expr(a, args)?),
+                *op,
+                Box::new(subst_params_expr(b, args)?),
+            )
+        }
         Cond2::IsNull(a) => Cond2::IsNull(Box::new(subst_params_expr(a, args)?)),
         Cond2::IsNotNull(a) => Cond2::IsNotNull(Box::new(subst_params_expr(a, args)?)),
         Cond2::Not(inner) => Cond2::Not(Box::new(subst_params_cond(inner, args)?)),
@@ -12822,7 +12908,10 @@ fn subst_params_cond(c: &Cond2, args: &[WireParam]) -> Option<Cond2> {
             parts.iter().map(|p| subst_params_cond(p, args)).collect::<Option<Vec<_>>>()?,
         ),
         // a pattern side carrying a `?` never resolves (the projection
-        // resolver types no pattern), so these pass through unchanged
+        // resolver types no pattern, and [resolve_raw_cond_sink] hands
+        // these arms to the sink-less resolver), so one reaching here
+        // WITH a `?` is a shape no resolver built - refuse the bind; the
+        // `?`-free form returned above
         Cond2::Like(..)
         | Cond2::Starting(..)
         | Cond2::Similar(..)
@@ -19207,6 +19296,17 @@ fn numeric_subtype(e: &Expr, descs: &[Descriptor]) -> i16 {
             Some(NumRank::I64 | NumRank::I128) => numeric_subtype(&v[0], descs),
             _ => 0,
         },
+        // a CORRELATED scalar subquery's value carries its inner column's
+        // family code, as the uncorrelated fold ([corr_fold_typed_tok])
+        // already does: `? * ID = (SELECT b.NM FROM T b WHERE b.ID = T.ID
+        // + 1)` announces 496 LONG scale -2 SUBTYPE 1 on the engine (2
+        // for a DECIMAL cast, 1 for `b.NM + 0`), and this answered 0
+        // (measured 2026-09-19, describe-only - the width and the values
+        // already agreed)
+        Expr::CorrSub { desc: Some(pc), .. } => match pc.sub_type {
+            1 | 2 => pc.sub_type as i16,
+            _ => 0,
+        },
         // a temporal difference carries its own family code, and it is
         // NOT a blanket 1: a DATE pair is 0, and this function is called
         // for Int-typed expressions too - which is exactly the path a
@@ -20428,7 +20528,7 @@ fn build_projcols(
             // the expression's own form ([computed_cast_target] is None).
             if let Some(target) = computed_cast_target(d) {
                 let e = resolve_expr(raw, columns, descs)?;
-                let cs = err_spell_charset(&e, descs);
+                let cs = computed_cast_stamp(&target, err_spell_charset(&e, descs));
                 let (wire, sql_type, length, scale, sub_type) = wire_for(d);
                 out.push(ProjCol {
                     name: rc.name.clone(),
@@ -31251,6 +31351,20 @@ fn plan_insert_select(
     // `496 LONG`, then `448 VARYING len 10`).
     let mut sink: Vec<Option<Descriptor>> = Vec::new();
     let src = plan_query_inner(s[sel..].trim(), db, &mut sink)?;
+    // A SOURCE THE PLANNER REFUSED refuses the INSERT at prepare too. A
+    // derived-table source whose outer clauses do not resolve comes back
+    // as [Plan::Refused] (not None), and carried into the INSERT it
+    // PREPARED - the WHERE's `?` had claimed its slot before the refusal
+    // - and failed at execute with *the SELECT feeding this INSERT is
+    // not one this server can run* (measured 2026-09-19 on `INSERT INTO
+    // T (ID, NN) SELECT d.ID + 10, 1 FROM (SELECT ID, 1.5 AS L FROM T) d
+    // WHERE ? * d.L = CAST(4.5 AS NUMERIC(9,1))` once the multiply's
+    // whitelist refused `d.L`); a typed refusal keeps its engine vector.
+    let src = match src {
+        Plan::Refused => return None,
+        Plan::RefusedEval(e) => return Some((Plan::RefusedEval(e), Vec::new())),
+        other => other,
+    };
     // an approximate source that is not a RUNTIME double - a literal,
     // ROUND / TRUNC, a conditional - into a DECFLOAT column refuses: the
     // engine stores the literal's text / evlRound's exact 2.68, where this
@@ -32436,6 +32550,7 @@ fn read_param_message(
     slots: &[PSlot],
     att_id: u8,
 ) -> std::io::Result<Vec<WireParam>> {
+    note_param_message_widths(slots);
     let n = slots.len();
     let bitmap = read_n(s, dec, n.div_ceil(8).div_ceil(4) * 4)?;
     let mut out = Vec::with_capacity(n);
@@ -37925,6 +38040,23 @@ enum TextFit {
 /// [encode_wire_value] returns a plain `None` and every caller mapped it
 /// to a generic message, throwing away the two counts the error carries.
 fn wire_value_fit_error(d: &Descriptor, wp: &WireParam) -> Option<EvalErr> {
+    // AN EXACT VALUE THAT DOES NOT FIT AN EXACT COLUMN is the engine's
+    // 22003 *numeric value is out of range* - what `SET NM = -? + 0`
+    // ['-2147483648'], `SM = ? + 1` [32767] and `N = ? + 1` [2147483647]
+    // raise there; the generic text below masked the overflow of an
+    // 8-byte SUM as a bare *Dynamic SQL Error* (round 6, stabilisation:
+    // the previous binary carried the engine's text for the first)
+    if matches!(d.dtype, dtype::SHORT | dtype::LONG | dtype::INT64 | dtype::INT128) {
+        if let WireParam::Int(v, ws) = wp {
+            if rescale_int_round(*v as i128, *ws, d.scale)
+                .and_then(|s| exact_int_le(d.dtype, s))
+                .is_none()
+            {
+                return Some(EvalErr::NumericOutOfRange);
+            }
+        }
+        return None;
+    }
     if !matches!(d.dtype, dtype::TEXT | dtype::VARYING) {
         return None;
     }
@@ -42902,7 +43034,26 @@ fn plan_query(sql: &str, db: &Option<Database>) -> (Plan, Vec<Descriptor>) {
     let delocked = strip_row_locking(sql, db);
     let sql = delocked.as_deref().unwrap_or(sql);
     let mut params = Vec::new();
-    let planned = timed("plan:query-inner", || plan_query_inner(sql, db, &mut params));
+    let planned = timed("plan:query-inner", || plan_unmixed(|| plan_query_inner(sql, db, &mut params)));
+    // K1 (round 12): a statement carrying a chunk-new slot beside one that
+    // is not refuses at prepare ([chunk_new_mixed]) - the previous binary
+    // refused every statement carrying a chunk-new slot
+    let planned = planned.filter(|_| {
+        let mixed = chunk_new_mixed(params.iter().flatten());
+        if mixed {
+            cap_note("K1 (a chunk-new slot beside a classic one)");
+        }
+        !mixed
+    });
+    // ...and a chunk-new statement calling a QUALIFIED built-in refuses, as
+    // the engine does ([sql_qualified_builtin_call])
+    let planned = planned.filter(|_| {
+        let qb = has_chunk_new(params.iter().flatten()) && sql_qualified_builtin_call(sql);
+        if qb {
+            cap_note("QB (a qualified built-in in a chunk-new statement)");
+        }
+        !qb
+    });
     // A SELECT THAT DRAWS A GENERATOR IS A WRITE, and a read-only
     // database refuses it with the engine's own vector - the same bare
     // `isc_read_only_database` a DML statement gets (measured: `SELECT
@@ -45414,12 +45565,27 @@ enum ViewTrigBody<'a> {
 /// TEXT ORDER (SET first, then WHERE), which is the order the client
 /// binds. Returns the SQL and the assigned columns as indexes into
 /// `cols`.
+#[cfg(test)]
 fn view_trig_rows_sql(
     view: &str,
     cols: &[(String, String)],
     shape: &ViewTrigShape<'_>,
 ) -> Option<(String, Vec<usize>)> {
+    view_trig_rows_sql_marked(view, cols, shape).map(|(sql, assigned, _)| (sql, assigned))
+}
+
+/// [view_trig_rows_sql], and the statement's `?` indexes whose cast it
+/// GENERATED ([view_trig_type_params_marked]): the values are spelled in
+/// the select list in SET / VALUES order, which is the statement's text
+/// order, so a running count of every `?` they hold is the index the
+/// planner numbers each one with (the WHERE's come after them).
+fn view_trig_rows_sql_marked(
+    view: &str,
+    cols: &[(String, String)],
+    shape: &ViewTrigShape<'_>,
+) -> Option<(String, Vec<usize>, Vec<usize>)> {
     let names: Vec<String> = cols.iter().map(|(n, _)| view_ident_text(n)).collect();
+    let generated: std::cell::RefCell<(usize, Vec<usize>)> = std::cell::RefCell::new((0, Vec::new()));
     let alias: Option<&str> = match shape {
         ViewTrigShape::Update { alias, .. } | ViewTrigShape::Delete { alias, .. } => *alias,
         ViewTrigShape::Insert { .. } => None,
@@ -45449,7 +45615,22 @@ fn view_trig_rows_sql(
         if v.eq_ignore_ascii_case("DEFAULT") {
             return Some(format!("CAST(NULL AS {})", cols[ix].1));
         }
-        Some(view_trig_type_params(v, &cols[ix].1))
+        // a `?` in a CONDITION of the value refuses: the generated
+        // `CAST(? AS <destination>)` would round it before the compare
+        // ([raw_param_in_condition], round 10)
+        if value_text_param_in_condition(v) {
+            return None;
+        }
+        let (text, marks) = view_trig_type_params_marked(v, &cols[ix].1);
+        let mut g = generated.borrow_mut();
+        for m in marks {
+            let k = g.0;
+            if m {
+                g.1.push(k);
+            }
+            g.0 += 1;
+        }
+        Some(text)
     };
     let where_sql = |w: Option<&str>| match w {
         Some(w) if !w.trim().is_empty() => format!(" WHERE {}", w.trim()),
@@ -45459,7 +45640,7 @@ fn view_trig_rows_sql(
         Some(a) => format!("{} {}", view_ident_text(view), render_canon_ref(a)),
         None => view_ident_text(view),
     };
-    match shape {
+    let pair = match shape {
         ViewTrigShape::Update { set_text, where_text, .. } => {
             let parts = split_set_list(set_text);
             if parts.is_empty() || parts.len() != count_top_commas(set_text) + 1 {
@@ -45529,7 +45710,10 @@ fn view_trig_rows_sql(
                 }
             }
         }
-    }
+    };
+    let (sql, assigned) = pair?;
+    let generated = generated.borrow().1.clone();
+    Some((sql, assigned, generated))
 }
 
 /// A view row (values indexed by field id) as a record image under the
@@ -45623,7 +45807,20 @@ fn param_is_mul_left(masked: &str, at: usize) -> bool {
     b.get(j) == Some(&b'*')
 }
 
+#[cfg(test)]
 fn view_trig_type_params(value: &str, ty: &str) -> String {
+    view_trig_type_params_marked(value, ty).0
+}
+
+/// [view_trig_type_params], and one flag per `?` of `value` in TEXT
+/// ORDER: true for each whose `CAST(? AS <type>)` this GENERATED (a `?`
+/// inside a subquery or already a CAST's operand keeps the statement's
+/// own spelling, false). The planner cannot tell a generated cast from a
+/// user's once it is text, and the two read a bound text differently
+/// ([int_cast_gates_coefficient]) - [plan_view_trig] hands these ordinals
+/// to the resolver through [GENERATED_SLOT_CASTS] (round 9, P1).
+fn view_trig_type_params_marked(value: &str, ty: &str) -> (String, Vec<bool>) {
+    let mut marks: Vec<bool> = Vec::new();
     let masked = mask_literals(&value.to_ascii_uppercase());
     let m = masked.as_bytes();
     let mut out = String::with_capacity(value.len() + 32);
@@ -45653,6 +45850,7 @@ fn view_trig_type_params(value: &str, ty: &str) -> String {
                     .map(|h| h.trim_end())
                     .and_then(|h| h.strip_suffix("CAST"))
                     .is_some_and(|h| !h.ends_with(|ch: char| ch.is_ascii_alphanumeric() || ch == '_'));
+                marks.push(!(in_subquery || cast_operand));
                 if in_subquery || cast_operand {
                     out.push('?');
                 } else {
@@ -45692,7 +45890,45 @@ fn view_trig_type_params(value: &str, ty: &str) -> String {
         }
         i += 1;
     }
-    out
+    (out, marks)
+}
+
+thread_local! {
+    /// The statement's `?` indexes whose `CAST(? AS <type>)` the
+    /// trigger-view path GENERATED ([view_trig_type_params_marked]), set
+    /// while [plan_view_trig] plans its row SELECT and empty otherwise.
+    /// Such a cast is an IMPLICIT SLOT CAST - the table planner's
+    /// `CAST(? AS <slot>)` spelled as text - so the resolver stamps it
+    /// [CS_SLOT_CAST] and an operand's is restamped [CS_SLOT_OPERAND]
+    /// ([resolve_proj_expr], [resolve_dest_param_expr]); a CAST the
+    /// statement wrote keeps its own stamp. Before round 9 every one of
+    /// them read as the user's: `UPDATE <trigger view> SET N = ? + 1`
+    /// ['4.999999999999'] failed where the engine and the previous binary
+    /// store 6.
+    static GENERATED_SLOT_CASTS: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Is parameter `i` of the statement being planned a generated slot cast
+/// ([GENERATED_SLOT_CASTS])?
+fn generated_slot_cast(i: usize) -> bool {
+    GENERATED_SLOT_CASTS.with(|g| g.borrow().contains(&i))
+}
+
+/// Holds [GENERATED_SLOT_CASTS] for one planning call and empties it on
+/// every exit, the early `?` returns included.
+struct GeneratedSlotCasts;
+
+impl GeneratedSlotCasts {
+    fn set(ordinals: Vec<usize>) -> Self {
+        GENERATED_SLOT_CASTS.with(|g| *g.borrow_mut() = ordinals);
+        GeneratedSlotCasts
+    }
+}
+
+impl Drop for GeneratedSlotCasts {
+    fn drop(&mut self) {
+        GENERATED_SLOT_CASTS.with(|g| g.borrow_mut().clear());
+    }
 }
 
 /// The byte length of the UTF-8 character starting at `at`.
@@ -45918,12 +46154,17 @@ fn plan_view_trig(
             (c.name.clone(), ty)
         })
         .collect();
-    let (sql, assigned_ix) = view_trig_rows_sql(&vt.view, &typed, &shape)?;
+    let (sql, assigned_ix, generated) = view_trig_rows_sql_marked(&vt.view, &typed, &shape)?;
     if trace_on() {
         eprintln!("[srv] view dml: {}", sql);
     }
     let mut params: Vec<Option<Descriptor>> = Vec::new();
-    let rows = plan_query_inner(&sql, db_outer, &mut params)?;
+    // the casts this path spelled are IMPLICIT slot casts, not the
+    // statement's own ([GENERATED_SLOT_CASTS], round 9)
+    let rows = {
+        let _generated = GeneratedSlotCasts::set(generated);
+        plan_query_inner(&sql, db_outer, &mut params)
+    }?;
     let default_values = matches!(
         &shape,
         ViewTrigShape::Insert { body: ViewTrigBody::DefaultValues, .. }
@@ -53360,7 +53601,7 @@ fn raw_described_not_null(e: &RawExpr) -> bool {
         RawExpr::Coalesce(v) => v.iter().all(raw_described_not_null),
         RawExpr::Func(_, v) => v.iter().all(raw_described_not_null),
         RawExpr::Iif(_, a, b) => raw_described_not_null(a) && raw_described_not_null(b),
-        RawExpr::Case(branches, else_) => {
+        RawExpr::Case(branches, else_, _) => {
             else_.as_deref().is_some_and(raw_described_not_null)
                 && branches.iter().all(|(_, t)| raw_described_not_null(t))
         }
@@ -53396,7 +53637,7 @@ fn walk_aggs(e: &RawExpr, out: &mut Vec<(AggFn, AggTarget)>) {
             walk_aggs(a, out);
             walk_aggs(b, out);
         }
-        RawExpr::Case(branches, else_) => {
+        RawExpr::Case(branches, else_, _) => {
             for (c, t) in branches {
                 walk_cond_aggs(c, out);
                 walk_aggs(t, out);
@@ -53478,7 +53719,7 @@ fn substitute_aggs(e: &RawExpr, slot_of: &dyn Fn(&AggFn, &AggTarget) -> Option<S
             subb(a)?,
             subb(b)?,
         ),
-        RawExpr::Case(branches, else_) => RawExpr::Case(
+        RawExpr::Case(branches, else_, simple) => RawExpr::Case(
             branches
                 .iter()
                 .map(|(c, t)| Some((substitute_cond_aggs(c, slot_of)?, sub(t)?)))
@@ -53487,6 +53728,7 @@ fn substitute_aggs(e: &RawExpr, slot_of: &dyn Fn(&AggFn, &AggTarget) -> Option<S
                 None => None,
                 Some(x) => Some(subb(x)?),
             },
+            *simple,
         ),
         RawExpr::Cond(c) => RawExpr::Cond(Box::new(substitute_cond_aggs(c, slot_of)?)),
         other => other.clone(),
@@ -54493,12 +54735,13 @@ fn normalize_raw(e: &RawExpr) -> RawExpr {
         RawExpr::NullIf(a, b) => RawExpr::NullIf(nb(a), nb(b)),
         RawExpr::Iif(c, a, b) => RawExpr::Iif(Box::new(normalize_cond(c)), nb(a), nb(b)),
         RawExpr::Func(f, v) => RawExpr::Func(*f, nv(v)),
-        RawExpr::Case(branches, else_) => RawExpr::Case(
+        RawExpr::Case(branches, else_, simple) => RawExpr::Case(
             branches
                 .iter()
                 .map(|(c, t)| (normalize_cond(c), normalize_raw(t)))
                 .collect(),
             else_.as_ref().map(|e| Box::new(normalize_raw(e))),
+            *simple,
         ),
         other => other.clone(),
     }
@@ -57067,6 +57310,18 @@ fn value_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
         // engine's comparison rule
         (Value::Date(x), Value::Timestamp(dy, ty)) => (*x, 0u32).cmp(&(*dy, *ty)),
         (Value::Timestamp(dx, tx), Value::Date(y)) => (*dx, *tx).cmp(&(*y, 0u32)),
+        // a TIME against a TIMESTAMP converts with the CURRENT date
+        // (cvt.cpp CVT_move sql_time -> timestamp takes the current
+        // date; measured 2026-09-19: every stored TIME compares above a
+        // 2024 timestamp - `IIF(TM > ?, 1, 0) = 1 ['2024-01-10
+        // 12:30:00']` -> 1;2;3, `IIF(TM < ?..)` and `IIF(TM = ?..)` -> no
+        // row, `IIF(TM = ?..) ['12:30:00']` (the driver's timestamp on
+        // today's date) -> the 12:30 row). Reachable only through a
+        // whole-side TIME slot bound from a TIMESTAMP message
+        // ([bind_whole_side_temporal]); a mixed literal compare refuses
+        // at prepare
+        (Value::Time(x), Value::Timestamp(dy, ty)) => (session_now().0, *x).cmp(&(*dy, *ty)),
+        (Value::Timestamp(dx, tx), Value::Time(y)) => (*dx, *tx).cmp(&(session_now().0, *y)),
         // WITH TIME ZONE values order by their UTC instant - the zone
         // is presentation, not identity
         (Value::TimeTz(tx, _), Value::TimeTz(ty, _)) => tx.cmp(ty),
@@ -57606,12 +57861,17 @@ fn plan_win_item(
                 None => None,
                 Some(d) => {
                     let e = resolve_expr(d, &columns, &descs)?;
+                    // an IMPLICIT cast at a VALUE position: the default
+                    // moves into the result's slot, and the engine gates a
+                    // text's digits there (`LAG(N, 1, '4.999999999999')`
+                    // raises *numeric value is out of range*, measured
+                    // 2026-09-19, round 9 census) - [CS_SLOT_CAST]
+                    let cs = match t_is_numeric(&cast_target_of_col(&pc)) {
+                        true => CS_SLOT_CAST,
+                        false => fire_crab_ods::intl::CS_UTF8,
+                    };
                     Some(match cast_target_of_col(&pc) {
-                        Some(t) => Expr::Cast(
-                            Box::new(e),
-                            t,
-                            fire_crab_ods::intl::CS_UTF8,
-                        ),
+                        Some(t) => Expr::Cast(Box::new(e), t, cs),
                         None => e,
                     })
                 }
@@ -60125,6 +60385,13 @@ fn cast_source_charset(e: &Expr, t: &CastTarget, descs: &[Descriptor]) -> u8 {
 
 fn conv_err(cs: u8, s: String) -> EvalErr {
     use fire_crab_ods::intl;
+    let cs = if matches!(cs, CS_SLOT_CAST | CS_SLOT_OPERAND | CS_MUL_I64 | CS_TEXT_FIT | CS_TEXT_FIT_CHAR | CS_OPERATOR_READ | CS_COMPUTED_UTF8) {
+        intl::CS_UTF8
+    } else if cs == CS_COMPUTED_CARRIER {
+        intl::CS_NONE
+    } else {
+        cs
+    };
     let bytes = if intl::byte_carrier(cs) {
         intl::carrier_encode(&s)
     } else {
@@ -61530,6 +61797,73 @@ fn param_to_expr(p: &WireParam) -> Option<Expr> {
     })
 }
 
+thread_local! {
+    /// Which slots of the client's CURRENT input message arrived in a
+    /// FOUR-BYTE integer form (blr_short / blr_long), recorded by
+    /// [read_param_message] for [param_to_expr_msg]. THE ENGINE NEGATES
+    /// A PARAMETER IN ITS MESSAGE WIDTH: NegateNode::execute switches on
+    /// the runtime descriptor, which ParameterNode::execute takes from
+    /// the client's own format (DsqlRequests.cpp metadataToFormat), so a
+    /// blr_long -2147483648 raises *Integer overflow* under `-?` while
+    /// the same value in a blr_int64 message negates to 2147483648
+    /// (measured 2026-09-18: `-? = ID [-2147483648]` from node's 32-bit
+    /// message raises in every shape - whole side, `-(-?)`, `-? + 0`,
+    /// `-? * 1`, `-? = BI`, `IIF(-? = ID, ..)`, `HAVING -? = SUM(ID)` -
+    /// and `[-2147483649]`, `[-100000000000]` answer no row). A
+    /// [WireParam::Int] carries no width, so the fact lives here, per
+    /// connection thread, from the read to the bind of the same request.
+    static LONG_MSG_SLOTS: std::cell::RefCell<Vec<bool>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Record the client's input-message widths for the statement about to
+/// bind ([LONG_MSG_SLOTS]).
+fn note_param_message_widths(slots: &[PSlot]) {
+    LONG_MSG_SLOTS.with(|w| {
+        *w.borrow_mut() = slots.iter().map(|s| matches!(s, PSlot::Int32(_))).collect();
+    });
+}
+
+/// Did slot `i` of the current input message arrive as a 4-byte integer?
+fn param_msg_is_long(i: usize) -> bool {
+    LONG_MSG_SLOTS.with(|w| w.borrow().get(i).copied().unwrap_or(false))
+}
+
+/// [param_to_expr] for slot `i`, keeping the ONE fact the bare literal
+/// cannot carry: a 4-byte message value AT THE 32-BIT MINIMUM travels as
+/// a 4-byte CAST over its literal, so a negation above it overflows
+/// exactly where the engine's does ([Expr::Neg]'s eval reads the
+/// operand's cast width; [LONG_MSG_SLOTS]). Every other value is the
+/// plain literal - the width shows at that one value and nowhere else,
+/// so nothing downstream sees a different tree for any other bind.
+fn param_to_expr_msg(i: usize, args: &[WireParam]) -> Option<Expr> {
+    use fire_crab_ods::intl::CS_UTF8;
+    let arg = args.get(i)?;
+    if let WireParam::Int(v, s) = arg {
+        if *v == i64::from(i32::MIN) && param_msg_is_long(i) {
+            return Some(if *s == 0 {
+                Expr::Cast(Box::new(Expr::Int(*v)), CastTarget::Int { bytes: 4 }, CS_UTF8)
+            } else {
+                Expr::Cast(
+                    Box::new(Expr::Dec(*v, *s)),
+                    CastTarget::Numeric { scale: *s, bytes: 4, sub_type: 1 },
+                    CS_UTF8,
+                )
+            });
+        }
+    }
+    param_to_expr(arg)
+}
+
+/// A bare `?`, or one under nothing but unary minuses - a node with no
+/// type of its own, typed by the CAST above it.
+fn is_untyped_param(e: &Expr) -> bool {
+    match e {
+        Expr::Param(_) => true,
+        Expr::Neg(a) => is_untyped_param(a),
+        _ => false,
+    }
+}
+
 /// Does a resolved projection expression carry a `?` parameter?
 fn expr_has_param(e: &Expr) -> bool {
     match e {
@@ -61541,15 +61875,31 @@ fn expr_has_param(e: &Expr) -> bool {
             expr_has_param(a) || expr_has_param(b)
         }
         Expr::Coalesce(v) | Expr::Func(_, v) => v.iter().any(expr_has_param),
-        // a DML value expression can carry a parameter in a function
-        // argument or a conditional BRANCH (never in a condition - that
-        // is typed from the other side of the compare and refuses at
-        // resolution)
-        Expr::Iif(_, a, b) => expr_has_param(a) || expr_has_param(b),
+        // a value expression can carry a parameter in a function
+        // argument, a conditional BRANCH, or a conditional's CONDITION
+        // (typed from the other side of its compare - the Cond2 carries
+        // the rung [resolve_raw_cond_sink] built, and a `?` left in it
+        // at eval is a hard error, not a refusal)
+        Expr::Iif(c, a, b) => cond_has_param(c) || expr_has_param(a) || expr_has_param(b),
         Expr::Case(branches, else_) => {
-            branches.iter().any(|(_, t)| expr_has_param(t))
+            branches.iter().any(|(c, t)| cond_has_param(c) || expr_has_param(t))
                 || else_.as_deref().is_some_and(expr_has_param)
         }
+        Expr::Cond(c) => cond_has_param(c),
+        // the wrappers [cmp_sides] puts around a comparison side - a
+        // text rung under a CollKey/CarrierEnc/OctKey, a numeric one
+        // under TextNum - are walked through, or the `?` beneath them
+        // would go unbound
+        Expr::TextNum(a, _)
+        | Expr::TextNumKey(a, _)
+        | Expr::TextBool(a, _)
+        | Expr::CollKey(a, _)
+        | Expr::CollCanon(a, _, _)
+        | Expr::Collate(a, _)
+        | Expr::OctKey(a, _)
+        | Expr::CarrierEnc(a, _)
+        | Expr::CarrierDec(a, _, _) => expr_has_param(a),
+        Expr::AtTimeZone(a, z) => expr_has_param(a) || z.as_deref().is_some_and(expr_has_param),
         _ => false,
     }
 }
@@ -61557,11 +61907,43 @@ fn expr_has_param(e: &Expr) -> bool {
 /// Substitute the bound arguments into a projection expression's `?`
 /// placeholders, once, before the row loop - the CAST that types each
 /// one then converts it (reusing the string->integer rounding and the
-/// width check). Only the shapes [resolve_proj_expr] can build a param
-/// under appear here.
+/// width check), EXCEPT the whole-side rung of a comparison
+/// ([whole_side_rung], [bind_whole_side]), which the engine never
+/// converts. Only the shapes [resolve_proj_expr] can build a param under
+/// appear here.
 fn subst_params_expr(e: &Expr, args: &[WireParam]) -> Option<Expr> {
+    // A WHOLE-SIDE exact rung, under its unary minuses, binds the
+    // client's value whole ([bind_whole_side]) - before the generic Cast
+    // and Neg arms below would substitute UNDER the cast and round it
+    if let Some((i, negs)) = whole_side_exact(e) {
+        if let Expr::Cast(_, CastTarget::Temporal(kind), cs) = e {
+            return bind_whole_side_temporal(i, *kind, *cs, args);
+        }
+        let slot_scale = match e {
+            Expr::Cast(_, CastTarget::Numeric { scale, .. }, _) => *scale,
+            _ => 0,
+        };
+        // an EXACT rung whose text overflows on its own alignment: the
+        // comparison's bind raises it against a non-null other side
+        // ([bind_whole_side_exact_cmp]); a rung reaching here outside
+        // one raises per evaluation, the strict CAST of an out-of-range
+        // literal (*numeric value is out of range*)
+        if negs == 0 && matches!(e, Expr::Cast(_, CastTarget::Int { .. } | CastTarget::Numeric { .. }, _)) {
+            if let Some(WireParam::Text(s) | WireParam::TextCs(s, _)) = args.get(i) {
+                if whole_side_text_overflows(s, slot_scale) {
+                    return Some(Expr::Cast(
+                        Box::new(Expr::Str("99999999999999999999".into())),
+                        CastTarget::Numeric { scale: 0, bytes: 8, sub_type: 1 },
+                        fire_crab_ods::intl::CS_UTF8,
+                    ));
+                }
+            }
+        }
+        return bind_whole_side(i, negs, slot_scale, args);
+    }
     Some(match e {
-        Expr::Param(i) => param_to_expr(args.get(*i)?)?,
+        // the bound value, a 4-byte message's minimum kept at its width
+        Expr::Param(i) => param_to_expr_msg(*i, args)?,
         // the subquery's own `?`s: each marker becomes the bound value's
         // SQL literal, so the text the per-row walk plans has none left.
         // The bound node takes a FRESH cache - two executions of one
@@ -61569,9 +61951,44 @@ fn subst_params_expr(e: &Expr, args: &[WireParam]) -> Option<Expr> {
         Expr::CorrSub { text, outer, prm, kind, ty, scale, rank, desc, .. }
             if !prm.is_empty() =>
         {
+            let cmp_sides = corr_cmp_side_slots(text);
             let t = subst_prm_markers(text, &|slot| {
                 let d = prm.iter().find(|(s, _)| *s == slot).map(|(_, d)| d)?;
-                let v = param_to_expr(args.get(slot)?)?.eval(&[]).ok()?;
+                let arg = args.get(slot)?;
+                // a TEXT bound into a numeric WHOLE COMPARISON SIDE of the
+                // body reads by the compare grammar, as the outer
+                // whole-side rung does ([corr_text_cmp_literal])
+                if let WireParam::Text(s) | WireParam::TextCs(s, _) = arg {
+                    if d.flags & PARAM_WHOLE_EXACT != 0 {
+                        // a text the literal compare can take is spelled
+                        // AS that literal, and the inner compare carries
+                        // the engine's per-row alignment raise
+                        // ([cmp_align_wrap]); one it cannot take raises
+                        // where every non-zero value would
+                        if let Some(lit) = corr_whole_exact_literal(s, d) {
+                            return Some(lit);
+                        }
+                        if let Some(raise) = corr_whole_exact_raise(s, d) {
+                            return Some(raise);
+                        }
+                    }
+                    if cmp_sides.contains(&slot) && corr_slot_is_number(d) {
+                        // a text past the literal compare's coefficient that
+                        // ALIGNS: the previous binary's '<text>' spelling
+                        // failed on it (Dynamic SQL Error / conversion
+                        // error), the numeric one compared it without the
+                        // engine's per-row raise - the constant-text side
+                        // carries both the value and the raise
+                        // ([corr_whole_exact_literal], round 11)
+                        if matches!(d.dtype, dtype::SHORT | dtype::LONG | dtype::INT64) && num_literal_expr(s).is_none() {
+                            if let Some(lit) = corr_whole_exact_literal(s, d) {
+                                return Some(lit);
+                            }
+                        }
+                        return corr_text_cmp_literal(s, d);
+                    }
+                }
+                let v = param_to_expr(arg)?.eval(&[]).ok()?;
                 corr_literal(&v, d)
             })?;
             Expr::CorrSub {
@@ -61586,7 +62003,45 @@ fn subst_params_expr(e: &Expr, args: &[WireParam]) -> Option<Expr> {
                 cache: corr_cache_new(),
             }
         }
+        // A NEGATED `?` BOUND A TEXT is the negate's own conversion of
+        // it - CVT_get_double, the STRICT grammar ([Expr::Neg]'s text
+        // arm) - spelled as the CAST so the bound tree still TYPES
+        // where a typed tree is demanded (the DML assignment's bind
+        // gate): `-?` sits UNDER its destination or operator cast
+        // ([resolve_dest_param_expr], [arith_operand_rung]) and a bare
+        // `-'1.5'` has no type of its own
+        Expr::Neg(a) if matches!(**a, Expr::Param(_)) => {
+            let Expr::Param(i) = **a else { return None };
+            match args.get(i)? {
+                WireParam::Text(s) | WireParam::TextCs(s, _) => {
+                    let cs = match args.get(i)? {
+                        WireParam::TextCs(_, c) => *c,
+                        _ => fire_crab_ods::intl::CS_UTF8,
+                    };
+                    Expr::Neg(Box::new(Expr::Cast(Box::new(Expr::Str(s.clone())), CastTarget::Approx, cs)))
+                }
+                _ => Expr::Neg(Box::new(param_to_expr_msg(i, args)?)),
+            }
+        }
         Expr::Neg(a) => Expr::Neg(Box::new(subst_params_expr(a, args)?)),
+        // THE TEXT RUNG COLLAPSES TO THE BOUND STRING - exactly the
+        // literal twin `S = 'cd'` gets, under whatever CarrierEnc/OctKey/
+        // CollKey wrapper cmp_sides chose at prepare. The engine adopts the
+        // client's text at execute with no width check (`IIF(S = ?, 1, 0)
+        // ['abcdefghijkl']` -> 0;0;0, `S || ? = 'abx' ['xyzw']` -> none,
+        // measured); an evaluated CAST(.. AS VARCHAR(n)) would raise 22001.
+        // A non-text value keeps the cast and renders through it (a `||`
+        // operand: `S || ? = 'ab2' [2]`); for a WHOLE-side text rung the
+        // Cmp arm of [subst_params_cond] has already turned the compare
+        // numeric before this is reached.
+        Expr::Cast(inner, t, cs) if is_text_param_rung(e) => {
+            let Expr::Param(i) = **inner else { return None };
+            match args.get(i)? {
+                WireParam::Text(s) | WireParam::TextCs(s, _) => Expr::Str(s.clone()),
+                WireParam::Null => Expr::Null,
+                other => Expr::Cast(Box::new(param_to_expr(other)?), *t, *cs),
+            }
+        }
         Expr::Cast(a, t, cs) => Expr::Cast(Box::new(subst_params_expr(a, args)?), *t, *cs),
         Expr::Bin(a, op, b) => Expr::Bin(
             Box::new(subst_params_expr(a, args)?),
@@ -61604,15 +62059,17 @@ fn subst_params_expr(e: &Expr, args: &[WireParam]) -> Option<Expr> {
             *f,
             v.iter().map(|x| subst_params_expr(x, args)).collect::<Option<Vec<_>>>()?,
         ),
+        // a conditional's CONDITION binds too (the comparison-typed
+        // `?` of `IIF(ID = ?, 1, 0)`)
         Expr::Iif(c, a, b) => Expr::Iif(
-            c.clone(),
+            Box::new(subst_params_cond(c, args)?),
             Box::new(subst_params_expr(a, args)?),
             Box::new(subst_params_expr(b, args)?),
         ),
         Expr::Case(branches, else_) => Expr::Case(
             branches
                 .iter()
-                .map(|(c, t)| Some((c.clone(), subst_params_expr(t, args)?)))
+                .map(|(c, t)| Some((subst_params_cond(c, args)?, subst_params_expr(t, args)?)))
                 .collect::<Option<Vec<_>>>()?,
             match else_ {
                 Some(e) => Some(Box::new(subst_params_expr(e, args)?)),
@@ -61622,6 +62079,24 @@ fn subst_params_expr(e: &Expr, args: &[WireParam]) -> Option<Expr> {
         Expr::NullIf(a, b) => Expr::NullIf(
             Box::new(subst_params_expr(a, args)?),
             Box::new(subst_params_expr(b, args)?),
+        ),
+        Expr::Cond(c) => Expr::Cond(Box::new(subst_params_cond(c, args)?)),
+        // the [cmp_sides] wrappers, rebuilt around their bound operand
+        Expr::TextNum(a, cs) => Expr::TextNum(Box::new(subst_params_expr(a, args)?), *cs),
+        Expr::TextNumKey(a, cs) => Expr::TextNumKey(Box::new(subst_params_expr(a, args)?), *cs),
+        Expr::TextBool(a, cs) => Expr::TextBool(Box::new(subst_params_expr(a, args)?), *cs),
+        Expr::CollKey(a, tt) => Expr::CollKey(Box::new(subst_params_expr(a, args)?), *tt),
+        Expr::CollCanon(a, tt, f) => Expr::CollCanon(Box::new(subst_params_expr(a, args)?), *tt, *f),
+        Expr::Collate(a, tt) => Expr::Collate(Box::new(subst_params_expr(a, args)?), *tt),
+        Expr::OctKey(a, b) => Expr::OctKey(Box::new(subst_params_expr(a, args)?), *b),
+        Expr::CarrierEnc(a, cs) => Expr::CarrierEnc(Box::new(subst_params_expr(a, args)?), *cs),
+        Expr::CarrierDec(a, x, y) => Expr::CarrierDec(Box::new(subst_params_expr(a, args)?), *x, *y),
+        Expr::AtTimeZone(a, z) => Expr::AtTimeZone(
+            Box::new(subst_params_expr(a, args)?),
+            match z {
+                Some(z) => Some(Box::new(subst_params_expr(z, args)?)),
+                None => None,
+            },
         ),
         other => other.clone(),
     })
@@ -64642,7 +65117,7 @@ fn raw_contains_gen(e: &RawExpr) -> bool {
             args.iter().any(raw_contains_gen)
         }
         RawExpr::Iif(_, a, b) => raw_contains_gen(a) || raw_contains_gen(b),
-        RawExpr::Case(branches, else_) => {
+        RawExpr::Case(branches, else_, _) => {
             branches.iter().any(|(_, t)| raw_contains_gen(t))
                 || else_.as_deref().is_some_and(raw_contains_gen)
         }
@@ -65215,7 +65690,11 @@ enum RawExpr {
     /// which carries the engine's rule for free: `WHEN NULL` never
     /// matches, because `x = NULL` is UNKNOWN (probed). The engine
     /// parses IIF into this same node (its un-aliased header is CASE).
-    Case(Vec<(RawCond, RawExpr)>, Option<Box<RawExpr>>),
+    /// the branches, the ELSE, and whether this is the SIMPLE form
+    /// (`CASE <subject> WHEN <value>` / DECODE - the engine's DecodeNode,
+    /// which never casts its result: [resolve_proj_expr]'s Case arm) as
+    /// opposed to the searched form (a ValueIfNode, which does)
+    Case(Vec<(RawCond, RawExpr)>, Option<Box<RawExpr>>, bool),
     /// `DATE 'yyyy-mm-dd'` - days since the MJD epoch (1858-11-17)
     DateLit(i32),
     /// `TIME 'hh:mm[:ss[.ffff]]'` - units of 1/10000 s since midnight
@@ -66033,6 +66512,15 @@ fn parse_raw_cond(b: &[char], pos: &mut usize) -> Option<RawCond> {
         }
         let mut after = p2;
         if take_keyword(b, &mut after, "BETWEEN") {
+            // A `?` IN THE TESTED SIDE REFUSES: the side is CLONED into
+            // two leaves and [renumber_cond_params] numbers every `?` it
+            // meets, so `IIF(? BETWEEN 1 AND 2, ..)` announced TWO slots
+            // where the engine has one (measured: LONG NOT NULL, typed
+            // from the LOWER bound). The predicate grammar's own BETWEEN
+            // numbers its `?` once, before it clones - this one cannot.
+            if raw_has_param(&left) {
+                return None;
+            }
             let lo = expr_add(b, &mut after)?;
             if !take_keyword(b, &mut after, "AND") {
                 return None;
@@ -66068,6 +66556,31 @@ fn parse_raw_cond(b: &[char], pos: &mut usize) -> Option<RawCond> {
                         break;
                     }
                     _ => return None,
+                }
+            }
+            // the BETWEEN rule again: a `?` tested side cloned into more
+            // than one leaf would number once per leaf (`IIF(? IN (1, 2),
+            // ..)` - engine one slot, LONG NOT NULL from the reconciled
+            // list); a one-item list keeps the one leaf and numbers right
+            if items.len() > 1 && raw_has_param(&left) {
+                return None;
+            }
+            // A `?` LIST ITEM BESIDE A `?`-FREE ONE REFUSES (round 11). The
+            // engine's IN list is not the OR of its compares it desugars to
+            // here: once the list mixes types it reads the `?` INTO its
+            // described slot first - `IIF(SM IN (?, 7), 1, 0)` over a
+            // SMALLINT bound '1.5' takes the SM = 2 row and '1.4' the
+            // SM = 1 row (the WHERE twin likewise), `N IN (?, CAST(7 AS
+            // BIGINT))` ['1.5'] the N = 2 row, while `SM IN (?, ?)`, `SM =
+            // ? OR SM = 7`, BETWEEN, a simple CASE and DECODE all compare
+            // the text whole (measured 2026-09-19). That conversion is no
+            // law this server has, so the mixed list is not answered - the
+            // previous binary refused every `?` inside a condition; an
+            // all-`?` list keeps the whole-side compares.
+            if items.len() > 1 {
+                let with = items.iter().filter(|c| matches!(c, RawCond::Cmp(_, _, v) if raw_has_param(v))).count();
+                if with > 0 && with < items.len() {
+                    return None;
                 }
             }
             *pos = after;
@@ -66168,7 +66681,7 @@ fn renumber_raw_params(e: &mut RawExpr, next: &mut usize) {
             renumber_raw_params(a, next);
             renumber_raw_params(b, next);
         }
-        RawExpr::Case(branches, else_) => {
+        RawExpr::Case(branches, else_, _) => {
             for (c, t) in branches {
                 renumber_cond_params(c, next);
                 renumber_raw_params(t, next);
@@ -66903,6 +67416,11 @@ fn expr_atom_bare(b: &[char], pos: &mut usize) -> Option<RawExpr> {
                     }
                     *pos += 1;
                     let c = expr_add(b, pos)?;
+                    // a branch the ValueIfNode cannot type
+                    // ([raw_branch_untypable]) refuses as the engine does
+                    if raw_branch_untypable(&a) || raw_branch_untypable(&c) {
+                        return None;
+                    }
                     RawExpr::Iif(Box::new(cond), Box::new(a), Box::new(c))
                 } else {
                     let mut args = vec![expr_add(b, pos)?];
@@ -67017,6 +67535,20 @@ fn expr_atom_bare(b: &[char], pos: &mut usize) -> Option<RawExpr> {
                 // an ODD number of remaining arguments ends with a
                 // DEFAULT; an even number has none, and no match is NULL
                 let default = if args.len() % 2 == 1 { Some(args.pop()?) } else { None };
+                // a `-?` / arithmetic `?` subject or search value: the
+                // engine's -804 ([raw_untyped_arith_param])
+                if raw_untyped_arith_param(&subject)
+                    || args.chunks(2).any(|pair| raw_untyped_arith_param(&pair[0]))
+                {
+                    return None;
+                }
+                // a result or default value the DecodeNode cannot type
+                // ([raw_decode_untypable])
+                if args.chunks(2).any(|pair| raw_decode_untypable(&pair[1], false))
+                    || default.as_ref().is_some_and(|d| raw_decode_untypable(d, false))
+                {
+                    return None;
+                }
                 let mut branches = Vec::new();
                 for pair in args.chunks(2) {
                     branches.push((
@@ -67028,7 +67560,7 @@ fn expr_atom_bare(b: &[char], pos: &mut usize) -> Option<RawExpr> {
                         pair[1].clone(),
                     ));
                 }
-                Some(RawExpr::Case(branches, default.map(Box::new)))
+                Some(RawExpr::Case(branches, default.map(Box::new), true))
             } else if !quoted && agg_named(&word) && {
                 skip_ws(b, pos);
                 b.get(*pos) == Some(&'(')
@@ -67250,7 +67782,7 @@ fn raw_bad_substring_len(e: &RawExpr) -> Option<i64> {
         RawExpr::Iif(c, a, b) => raw_cond_bad_substring_len(c)
             .or_else(|| raw_bad_substring_len(a))
             .or_else(|| raw_bad_substring_len(b)),
-        RawExpr::Case(branches, else_) => branches
+        RawExpr::Case(branches, else_, _) => branches
             .iter()
             .find_map(|(c, t)| {
                 raw_cond_bad_substring_len(c).or_else(|| raw_bad_substring_len(t))
@@ -67637,6 +68169,123 @@ fn parse_sysfn_call(up: &str, b: &[char], pos: &mut usize) -> Option<RawExpr> {
 /// <value>` - which is the engine's own semantics: only a TRUE
 /// comparison takes a branch, so a NULL operand (or `WHEN NULL`) never
 /// matches and falls to ELSE (probed). Missing ELSE is NULL.
+/// A `?` the engine cannot type in a simple CASE's subject or WHEN
+/// value: a negation or an arithmetic over one. `CASE ID WHEN -? THEN`,
+/// `WHEN ? + 1`, `WHEN ? * 2`, `WHEN -(-?)`, `WHEN 1 + ?`, `CASE -? WHEN
+/// 2`, `DECODE(ID, -?, ..)` all refuse at prepare with -804 *Data type
+/// unknown* (measured 2026-09-18), where the bare `?`, `CAST(? AS
+/// INTEGER)` and `COALESCE(?, 1)` answer - and a searched `CASE WHEN ID
+/// = -?` answers too. The desugar to `subject = value` would hand the
+/// comparison router a shape it types happily, so the simple form
+/// refuses it here, before any describe.
+fn raw_untyped_arith_param(e: &RawExpr) -> bool {
+    matches!(e, RawExpr::Neg(_) | RawExpr::Bin(..)) && raw_has_param(e)
+}
+
+/// A `?` that NOTHING has typed yet: bare, or under nothing but unary
+/// minuses and arithmetic that cannot type it. An ADD or SUBTRACT with
+/// ONE typed operand IS typed (the engine's ArithmeticNode makes its
+/// descriptor from the typed side: `? + 1` is INT64, `? + 1.5` DOUBLE) -
+/// so `-(? + 1)`, `(? + 1) * 1`, `(? + 1) / 1`, `ABS(? + 1)` and
+/// `-(? + 1.5)` all answer in a simple CASE / DECODE value (row 2 for
+/// [2], measured 2026-09-19) - and only an add whose BOTH operands are
+/// untyped (`? + ?`, `-? - ?`) stays untyped (-802 *Invalid data type
+/// for addition or subtraction*). A MULTIPLY or DIVIDE with any untyped
+/// operand is untyped (`-(? * 2)` and `(? * 2) + 1` refuse). Round 4
+/// walked every operator the same way and refused the typed adds: a
+/// regression against the previous binary, caught by the X5 matrix. A
+/// CAST, a COALESCE, a conditional or a function above a `?` types it
+/// or refuses on its own.
+fn raw_untyped_num(e: &RawExpr) -> bool {
+    match e {
+        RawExpr::Param(_) => true,
+        RawExpr::Neg(a) => raw_untyped_num(a),
+        RawExpr::Bin(a, ArithOp::Add | ArithOp::Sub, b) => raw_untyped_num(a) && raw_untyped_num(b),
+        RawExpr::Bin(a, _, b) => raw_untyped_num(a) || raw_untyped_num(b),
+        _ => false,
+    }
+}
+
+/// CAN A SEARCHED CASE / IIF BRANCH TYPE THIS VALUE? A ValueIfNode types
+/// a bare `-?` or an arithmetic `?` from its sibling branch (`IIF(ID =
+/// 2, -?, 0)` -> the 2 row, `CASE WHEN ID = 2 THEN ? * 2` -> the same,
+/// measured 2026-09-19), but not one under a CAST, a function, a `||` or
+/// a COALESCE: `IIF(ID = 2, CAST(-? AS INTEGER), 0)`, `IIF(ID = 2,
+/// ABS(-?), 0)`, `IIF(ID = 2, CAST(? * 2 AS INTEGER), 0)`, `CASE WHEN ID =
+/// 2 THEN CAST(-? AS INTEGER)` and `IIF(ID = 2, COALESCE(-?, 0), 0)` all
+/// refuse at prepare (-802 *Invalid data type for negation /
+/// multiplication*), as the bare `CAST(-? AS INTEGER) = -2` and `ABS(-?) =
+/// 2` do. The previous binary answered the CAST and ABS forms (row 2).
+fn raw_branch_untypable(e: &RawExpr) -> bool {
+    match e {
+        RawExpr::Neg(a) => raw_branch_untypable(a),
+        RawExpr::Bin(a, _, b) => raw_branch_untypable(a) || raw_branch_untypable(b),
+        _ => raw_decode_untypable(e, false),
+    }
+}
+
+/// CAN THE ENGINE'S DECODE NODE TYPE THIS THEN / ELSE VALUE? A simple
+/// CASE and DECODE compile to a DecodeNode, which sets no parameter's
+/// type from its siblings (a searched CASE / IIF / NULLIF - ValueIfNode
+/// - does, through PASS1_set_parameter_type), so a value whose type is
+/// an untyped `?`'s arithmetic refuses at prepare. Measured 2026-09-19
+/// (`CASE ID WHEN 2 THEN <v> ELSE 0 END = ..`, and `.. ELSE <v>`):
+///  * a NEGATION of an untyped `?` refuses everywhere below - `-?`,
+///    `-(?)`, `(-?)`, `-? * 1`, `-? * 1.5`, `CAST(-? AS INTEGER)`,
+///    `COALESCE(-?, 0)`, `ABS(-?)`, `-? || ''`, `CAST(-? AS VARCHAR(5))`
+///    (-802 *Invalid data type for negation (minus operator)*);
+///  * a MULTIPLY or DIVIDE with an untyped operand refuses - `? * 2`, `2 *
+///    ?`, `? / 2`, `COALESCE(? * 2, 0)`, `CAST(? * 2 AS INTEGER)` (*Invalid
+///    data type for multiplication in dialect 3*);
+///  * an ADD or SUBTRACT with an untyped operand ANSWERS at the top and
+///    under COALESCE - `? + 1`, `? - 1`, `1 + ?`, `COALESCE(? + 1, 0)`,
+///    `COALESCE(? - 1, 0)` (the DecodeNode's makeFromList walks past it) -
+///    but refuses under a CAST or a function (`CAST(? + 1 AS INTEGER)` is
+///    -804 *Data type unknown*);
+///  * a `?` typed by its own node answers, arithmetic above or below it
+///    included: `CAST(? AS INTEGER) * 2`, `-CAST(? AS INTEGER)`,
+///    `COALESCE(CAST(? AS INTEGER) * 2, 0)`, `CAST(COALESCE(?, 0) AS
+///    INTEGER)`, `COALESCE(?, 0)`, `?`, `? || 'x'`; and so does a
+///    comparison-typed one - `NULLIF(-?, 0)`, `IIF(NN = 6, -?, 0)`.
+/// The previous binary answered the `WHEN 2 THEN -?` forms (0;-2;0 in a
+/// select list, row 2 in a WHERE, the UPDATE twin changed a row) where
+/// the engine refuses every one: a refusal replacing a divergent answer.
+/// `strict` is the CAST / function / `||` context.
+fn raw_decode_untypable(e: &RawExpr, strict: bool) -> bool {
+    match e {
+        // (a minus over a `||` carrying a `?` is the engine's *Strings
+        // cannot be added or subtracted*, refused with the rest)
+        RawExpr::Neg(a) => {
+            raw_untyped_num(a)
+                || (matches!(**a, RawExpr::Concat(..)) && raw_has_param(a))
+                || raw_decode_untypable(a, strict)
+        }
+        // a multiply or divide with an untyped operand refuses; an add
+        // or subtract refuses when BOTH operands are untyped (`? + ?`,
+        // `-? - ?`, `(? + ?) * 1`, `ABS(? + ?)`: -802 on the engine, where
+        // the previous binary answered), or with one untyped operand only
+        // under a CAST or a `||` (`CAST(? + 1 AS INTEGER)` -804, `(? + 1)
+        // || 'x'` *Expression evaluation not supported*) - never under a
+        // FUNCTION: `ABS(? + 1)`, `ABS(1 + ?)`, `ABS((? + 1) * 1)` answer
+        // (measured 2026-09-19)
+        RawExpr::Bin(a, op, b) => {
+            let (ua, ub) = (raw_untyped_num(a), raw_untyped_num(b));
+            let refuse = match op {
+                ArithOp::Mul | ArithOp::Div => ua || ub,
+                ArithOp::Add | ArithOp::Sub => (ua && ub) || (strict && (ua || ub)),
+            };
+            refuse || raw_decode_untypable(a, strict) || raw_decode_untypable(b, strict)
+        }
+        RawExpr::Cast(a, _) | RawExpr::Collate(a, _) => raw_decode_untypable(a, true),
+        RawExpr::Concat(a, b) => raw_decode_untypable(a, true) || raw_decode_untypable(b, true),
+        RawExpr::Func(_, v) | RawExpr::UserFn(_, v) => v.iter().any(|x| raw_decode_untypable(x, false)),
+        RawExpr::Coalesce(v) => v.iter().any(|x| raw_decode_untypable(x, strict)),
+        // a conditional, NULLIF or a subquery types its `?` by a
+        // comparison of its own, or refuses on its own
+        _ => false,
+    }
+}
+
 fn parse_case_tail(b: &[char], pos: &mut usize) -> Option<RawExpr> {
     // the simple form's operand: whatever sits between CASE and the
     // first WHEN (peeked with a position copy)
@@ -67648,11 +68297,17 @@ fn parse_case_tail(b: &[char], pos: &mut usize) -> Option<RawExpr> {
             Some(expr_add(b, pos)?)
         }
     };
+    if operand.as_ref().is_some_and(raw_untyped_arith_param) {
+        return None; // the engine's -804 ([raw_untyped_arith_param])
+    }
     let mut branches = Vec::new();
     while take_keyword(b, pos, "WHEN") {
         let cond = match &operand {
             Some(op) => {
                 let v = expr_add(b, pos)?;
+                if raw_untyped_arith_param(&v) {
+                    return None;
+                }
                 RawCond::Cmp(Box::new(op.clone()), Cmp::Eq, Box::new(v))
             }
             None => parse_cond_or(b, pos)?,
@@ -67660,20 +68315,52 @@ fn parse_case_tail(b: &[char], pos: &mut usize) -> Option<RawExpr> {
         if !take_keyword(b, pos, "THEN") {
             return None;
         }
-        branches.push((cond, expr_add(b, pos)?));
+        let value = expr_add(b, pos)?;
+        // the simple form's THEN value the engine's DecodeNode cannot
+        // type ([raw_decode_untypable]); a searched CASE types a bare
+        // `-?` / arithmetic `?` from its sibling branches and answers,
+        // but not one under a CAST or a function ([raw_branch_untypable])
+        let untypable = match &operand {
+            Some(_) => raw_decode_untypable(&value, false),
+            None => raw_branch_untypable(&value),
+        };
+        if untypable {
+            return None;
+        }
+        branches.push((cond, value));
     }
     if branches.is_empty() {
         return None; // CASE with no WHEN is a syntax error
     }
+    // A `?` SUBJECT WITH TWO OR MORE WHENs: the desugar clones the subject
+    // into every branch and each clone would be numbered as its own
+    // parameter - `CASE ? WHEN 2 THEN 1 WHEN 3 THEN 2 ELSE 0 END`
+    // described TWO slots for one `?`, failed with one bind and ANSWERED
+    // with two where the engine rejects the count (the refuter's round-4
+    // finding). The engine evaluates the subject once; until the clones
+    // share a slot this refuses at prepare, which is what the previous
+    // binary did. A single WHEN keeps answering (`CASE ? WHEN 2 THEN 1
+    // ELSE 0 END = 1` [2] -> 1;2;3 on the engine and here).
+    if branches.len() > 1 && operand.as_ref().is_some_and(raw_has_param) {
+        return None;
+    }
     let else_ = if take_keyword(b, pos, "ELSE") {
-        Some(Box::new(expr_add(b, pos)?))
+        let value = expr_add(b, pos)?;
+        let untypable = match &operand {
+            Some(_) => raw_decode_untypable(&value, false),
+            None => raw_branch_untypable(&value),
+        };
+        if untypable {
+            return None;
+        }
+        Some(Box::new(value))
     } else {
         None
     };
     if !take_keyword(b, pos, "END") {
         return None;
     }
-    Some(RawExpr::Case(branches, else_))
+    Some(RawExpr::Case(branches, else_, operand.is_some()))
 }
 
 /// Consume a whole-word keyword (case-insensitive) at `pos`, skipping
@@ -68252,6 +68939,76 @@ fn resolve_raw_cond(
     })
 }
 
+/// [resolve_raw_cond] with a `?` SINK: a comparison with a `?` on exactly
+/// one side types it from the OTHER side (the engine's MAKE_desc of that
+/// side - see [resolve_cmp_pair]; measured `IIF(ID = ?, 1, 0)` LONG
+/// Nullable, `IIF(NN = ?, ..)` LONG NOT NULL, `IIF(NM = ?, ..)` LONG
+/// scale -2 subtype 1, `IIF(S = ?, ..)` VARYING 10, `IIF(DT = ?, ..)`
+/// SQL_DATE, `IIF(? = 1, ..)` LONG NOT NULL, and the same with the `?`
+/// inside arithmetic: `IIF(ID * ? = 2, ..)` LONG NOT NULL, `CASE WHEN ID
+/// > ? + 1` LONG Nullable). NOT/AND/OR recurse with the sink; every
+/// other arm delegates to the sink-less resolver and therefore keeps
+/// refusing a `?` (LIKE/STARTING/CONTAINING/SIMILAR patterns, `? IS
+/// NULL` - the SQL_NULL slot - all recorded boundaries).
+///
+/// ROUND 12: EVERY SLOT A CONDITION REGISTERS IS CHUNK-NEW - the previous
+/// binary refused any `?` in a CASE / IIF condition - and is marked so
+/// here ([marking_chunk_new]), whatever arm typed it. K4: a condition
+/// that registered a TEXT slot and carries a conditional with a bare-`?`
+/// value arm refuses ([raw_text_arm_param]).
+fn resolve_raw_cond_sink(
+    c: &RawCond,
+    columns: &[RelationColumn],
+    descs: &[Descriptor],
+    sink: &mut Vec<Option<Descriptor>>,
+) -> Option<Cond2> {
+    let (r, fresh) = marking_chunk_new(sink, |sink| resolve_raw_cond_sink_body(c, columns, descs, sink))?;
+    if chunk_new_text_slot(sink, &fresh) && raw_cond_any(c, &text_arm_node) {
+        cap_note("K4 (a text-slot conditional value arm in a condition)");
+        return None;
+    }
+    Some(r)
+}
+
+fn resolve_raw_cond_sink_body(
+    c: &RawCond,
+    columns: &[RelationColumn],
+    descs: &[Descriptor],
+    sink: &mut Vec<Option<Descriptor>>,
+) -> Option<Cond2> {
+    Some(match c {
+        RawCond::Cmp(a, op, b) => {
+            if matches!(**b, RawExpr::BareTrue) {
+                // the bare-column desugar: a `?` beside it refuses
+                if raw_has_param(a) {
+                    return None;
+                }
+                return resolve_raw_cond(c, columns, descs);
+            }
+            let (l, r) = resolve_cmp_pair(a, b, columns, descs, sink)?;
+            Cond2::Cmp(Box::new(l), *op, Box::new(r))
+        }
+        RawCond::Not(inner) => {
+            Cond2::Not(Box::new(resolve_raw_cond_sink(inner, columns, descs, sink)?))
+        }
+        RawCond::And(parts) => {
+            let mut v = Vec::with_capacity(parts.len());
+            for p in parts {
+                v.push(resolve_raw_cond_sink(p, columns, descs, sink)?);
+            }
+            Cond2::And(v)
+        }
+        RawCond::Or(parts) => {
+            let mut v = Vec::with_capacity(parts.len());
+            for p in parts {
+                v.push(resolve_raw_cond_sink(p, columns, descs, sink)?);
+            }
+            Cond2::Or(v)
+        }
+        other => resolve_raw_cond(other, columns, descs)?,
+    })
+}
+
 fn resolve_expr(
     raw: &RawExpr,
     columns: &[RelationColumn],
@@ -68637,7 +69394,7 @@ fn raw_expr_col_names(e: &RawExpr, out: &mut Vec<String>) {
             raw_expr_col_names(a, out);
             raw_expr_col_names(b, out);
         }
-        RawExpr::Case(branches, else_) => {
+        RawExpr::Case(branches, else_, _) => {
             for (c, t) in branches {
                 raw_cond_col_names(c, out);
                 raw_expr_col_names(t, out);
@@ -68673,6 +69430,181 @@ fn raw_cond_col_names(c: &RawCond, out: &mut Vec<String>) {
     }
 }
 
+/// A `?` under nothing but unary minuses: its slot and the minus count
+/// (`?` is 0, `-?` 1, `-(-?)` 2). None for any other shape.
+fn neg_param_chain_of(e: &RawExpr) -> Option<(usize, u32)> {
+    match e {
+        RawExpr::Param(i) => Some((*i, 0)),
+        RawExpr::Neg(a) => neg_param_chain_of(a).map(|(i, n)| (i, n + 1)),
+        _ => None,
+    }
+}
+
+/// IS this side a SIMPLE CASE (under nothing but unary minuses) whose
+/// THEN or ELSE value is a bare `?`? The narrow S4 shape of round 7's
+/// scope cut ([simple_case_bare_vs_param_refuses]); nothing nested, and
+/// nothing under arithmetic, CAST, COALESCE or a conditional - those
+/// shapes the previous binary answered right on every measured bind.
+fn raw_is_simple_case_bare_value(e: &RawExpr) -> bool {
+    let bare = |x: &RawExpr| matches!(x, RawExpr::Param(_));
+    match e {
+        RawExpr::Neg(a) => raw_is_simple_case_bare_value(a),
+        RawExpr::Case(branches, else_, true) => {
+            branches.iter().any(|(_, t)| bare(t)) || else_.as_deref().is_some_and(bare)
+        }
+        _ => false,
+    }
+}
+
+/// Does the side hold, at any depth, an IIF / CASE / NULLIF whose branch
+/// value is a bare `?`? Such a `?` takes its SIBLING's slot here (LONG
+/// beside a 0), where the engine refines it by the comparison's other
+/// side - so against an INT128 or a DECFLOAT column the two slots part:
+/// `IIF(ID = 1, ?, 0) = I1` ['3000000000'] raised *numeric value is out
+/// of range* on the previous binary (the LONG cast) where the engine
+/// answers no row, `= DF` ['2.5'] answered none where the engine answers
+/// row 1, and a 25-digit text raised here where the engine compares -
+/// measured 2026-09-19, cmpcut. Round 7, THE SCOPE CUT: that comparison
+/// REFUSES at prepare ([resolve_expr_term], [resolve_cmp_pair] -
+/// [wide_exact_side]); COALESCE is not refined by the engine either and
+/// keeps answering (`COALESCE(?, 0) = I1` ['2.44'] is row 1 on all three).
+fn raw_conditional_bare_param(e: &RawExpr) -> bool {
+    let bare = |x: &RawExpr| matches!(x, RawExpr::Param(_));
+    let again = raw_conditional_bare_param;
+    match e {
+        RawExpr::Case(branches, else_, _) => {
+            branches.iter().any(|(_, t)| bare(t) || again(t)) || else_.as_deref().is_some_and(|x| bare(x) || again(x))
+        }
+        RawExpr::Iif(_, a, b) | RawExpr::NullIf(a, b) => bare(a) || bare(b) || again(a) || again(b),
+        RawExpr::Neg(a) => again(a),
+        RawExpr::Bin(a, _, b) | RawExpr::Concat(a, b) => again(a) || again(b),
+        // a CAST, a function or a COALESCE types its own operand and the
+        // comparison's other side never reaches the conditional beneath
+        // it: `CAST(CASE ID WHEN 2 THEN ? ELSE 0 END AS INTEGER) = D`
+        // ['2.4'] answers none on all three
+        _ => false,
+    }
+}
+
+/// Is this resolved comparison side an INT128 or a DECFLOAT value (the
+/// slots a conditional's bare `?` cannot take here - [raw_conditional_bare_param])?
+fn wide_exact_side(e: &Expr, descs: &[Descriptor]) -> bool {
+    // ...or a side that READS a DOUBLE / FLOAT column (`IIF(ID = 2, ?, 0)
+    // = D`: the engine's slot is DOUBLE, the previous binary's LONG cast
+    // answered none for ['2.5'] where the engine answers row 2 and raised
+    // for ['3000000000'] where it answers none); a double LITERAL side
+    // (`= 1e0 * 2`, `= CAST(2.4 AS DOUBLE PRECISION)`) keeps answering -
+    // the previous binary was right on every measured bind there
+    param_desc_from_expr(e, descs)
+        .is_some_and(|(d, _)| matches!(d.dtype, dtype::INT128 | dtype::DEC64 | dtype::DEC128))
+        || expr_reads(e, &|fid| {
+            descs.get(fid).is_some_and(|d| {
+                matches!(d.dtype, dtype::DOUBLE | dtype::REAL | dtype::INT128 | dtype::DEC64 | dtype::DEC128)
+            })
+        })
+}
+
+/// A bare `?`, or `CAST(? AS ..)` over one.
+fn raw_is_bare_or_cast_param(e: &RawExpr) -> bool {
+    match e {
+        RawExpr::Param(_) => true,
+        RawExpr::Cast(inner, _) => matches!(**inner, RawExpr::Param(_)),
+        _ => false,
+    }
+}
+
+/// The narrow S4 refusal (round 7, THE SCOPE CUT): `side` is a simple
+/// CASE with a bare `?` value ([raw_is_simple_case_bare_value]) and the
+/// comparison's other side is a bare `?` (the previous binary prepared
+/// then failed: refuse) or a `CAST(? AS ..)` while the CASE's sibling
+/// slot is a scale-0 exact (the previous binary rounded the CASE's 2.4
+/// to 2 and answered row 2 where the engine answers none: refuse). Any
+/// other other side keeps the previous binary's answer.
+fn simple_case_bare_vs_param_refuses(
+    side: &RawExpr,
+    kind: &RawKind,
+    columns: &[RelationColumn],
+    descs: &[Descriptor],
+) -> bool {
+    if !raw_is_simple_case_bare_value(side) {
+        return false;
+    }
+    let (other_bare, other_cast) = match kind {
+        RawKind::Cmp(_, Rhs::Param(..)) => (true, false),
+        RawKind::CmpExpr(_, r) => (
+            matches!(r, RawExpr::Param(_)),
+            matches!(r, RawExpr::Cast(inner, _) if matches!(**inner, RawExpr::Param(_))),
+        ),
+        _ => (false, false),
+    };
+    if other_bare {
+        return true;
+    }
+    if !other_cast {
+        return false;
+    }
+    // the CASE's own sibling slot, as [resolve_proj_expr]'s Case arm reads it
+    let mut cur = side;
+    while let RawExpr::Neg(a) = cur {
+        cur = a;
+    }
+    let RawExpr::Case(branches, else_, _) = cur else { return false };
+    let sibs: Vec<&RawExpr> = branches.iter().map(|(_, t)| t).chain(else_.iter().map(|b| &**b)).collect();
+    match coalesce_sibling_desc(&sibs, columns, descs) {
+        Some(d) => matches!(d.dtype, dtype::SHORT | dtype::LONG | dtype::INT64 | dtype::INT128) && d.scale == 0,
+        None => false,
+    }
+}
+
+/// Does `e` hold, at any depth, a SIMPLE CASE whose THEN or ELSE value is
+/// a bare `?` and whose reconciled sibling slot is NOT text? Read by the
+/// two Concat arms ([resolve_proj_expr], [resolve_dest_param_expr]):
+/// such a CASE under a `||` refuses at prepare (round 7, THE SCOPE CUT).
+fn raw_concat_over_numeric_simple_case(e: &RawExpr, columns: &[RelationColumn], descs: &[Descriptor]) -> bool {
+    let bare = |x: &RawExpr| matches!(x, RawExpr::Param(_));
+    let again = |x: &RawExpr| raw_concat_over_numeric_simple_case(x, columns, descs);
+    match e {
+        RawExpr::Case(branches, else_, simple) => {
+            if *simple && (branches.iter().any(|(_, t)| bare(t)) || else_.as_deref().is_some_and(bare)) {
+                let sibs: Vec<&RawExpr> =
+                    branches.iter().map(|(_, t)| t).chain(else_.iter().map(|b| &**b)).collect();
+                match coalesce_sibling_desc(&sibs, columns, descs) {
+                    Some(d) if matches!(d.dtype, dtype::TEXT | dtype::VARYING) => {}
+                    _ => return true,
+                }
+            }
+            branches.iter().any(|(_, t)| again(t)) || else_.as_deref().is_some_and(again)
+        }
+        RawExpr::Neg(a) | RawExpr::Cast(a, _) | RawExpr::Collate(a, _) => again(a),
+        RawExpr::Bin(a, _, b) | RawExpr::Concat(a, b) | RawExpr::NullIf(a, b) => again(a) || again(b),
+        RawExpr::Iif(_, a, b) => again(a) || again(b),
+        RawExpr::Coalesce(v) | RawExpr::Func(_, v) | RawExpr::UserFn(_, v) | RawExpr::Subscript(_, v) => {
+            v.iter().any(again)
+        }
+        RawExpr::AtTimeZone(a, z) => again(a) || z.as_deref().is_some_and(again),
+        _ => false,
+    }
+}
+
+/// A bare `?` operand the engine cannot type under a string function
+/// (-804 *Data type unknown*, or *Expression evaluation not supported*
+/// for a SUBSTRING start): the source of LEFT / RIGHT / REVERSE / LPAD /
+/// RPAD / CHAR_LENGTH / OCTET_LENGTH, the pad of LPAD / RPAD, both
+/// operands of MOD, the FROM bound of SUBSTRING (measured 2026-09-19;
+/// [resolve_dest_param_expr]'s refusal arm). `LEFT(S, ?)`, `MOD(?, 2)`,
+/// `MOD(5, ?)` and `SUBSTRING(? FROM 1 FOR 1)` are typed by the engine
+/// and keep answering.
+fn strfn_bare_param_untypable(f: SysFn, args: &[RawExpr]) -> bool {
+    let bare = |k: usize| matches!(args.get(k), Some(RawExpr::Param(_)));
+    match f {
+        SysFn::Left | SysFn::Right | SysFn::Reverse | SysFn::CharLength | SysFn::OctetLength => bare(0),
+        SysFn::Lpad | SysFn::Rpad => bare(0) || bare(2),
+        SysFn::Mod => bare(0) && bare(1),
+        SysFn::Substring => bare(1),
+        _ => false,
+    }
+}
+
 fn raw_has_param(e: &RawExpr) -> bool {
     match e {
         RawExpr::Param(_) => true,
@@ -68681,16 +69613,87 @@ fn raw_has_param(e: &RawExpr) -> bool {
             raw_has_param(a) || raw_has_param(b)
         }
         RawExpr::Coalesce(v) | RawExpr::Func(_, v) => v.iter().any(raw_has_param),
-        RawExpr::Iif(_, a, b) => raw_has_param(a) || raw_has_param(b),
         // a CASE's BRANCHES carry values like any other node - without
         // this arm a `CASE WHEN ... THEN ? END` looked parameterless,
         // took the ordinary resolver and refused there (IIF, which is
-        // the same shape, answered - the asymmetry is what found it)
-        RawExpr::Case(branches, else_) => {
-            branches.iter().any(|(_, t)| raw_has_param(t))
+        // the same shape, answered - the asymmetry is what found it).
+        // THE CONDITIONS COUNT TOO: `IIF(ID = ?, 1, 0)` carries a `?`
+        // the engine types from the comparison's OTHER side (measured:
+        // ID's own LONG), and while this walk skipped conditions the
+        // node looked parameterless, took the sink-less resolver and
+        // refused there - in every router, since every one asks here
+        RawExpr::Iif(c, a, b) => raw_cond_has_param(c) || raw_has_param(a) || raw_has_param(b),
+        RawExpr::Case(branches, else_, _) => {
+            branches.iter().any(|(c, t)| raw_cond_has_param(c) || raw_has_param(t))
                 || else_.as_deref().is_some_and(raw_has_param)
         }
+        RawExpr::Cond(c) => raw_cond_has_param(c),
         _ => false,
+    }
+}
+
+/// Does any side, operand or pattern of the condition hold a `?` - the
+/// predicate twin of [renumber_cond_params], arm for arm, so that "it
+/// has one" and "it gets numbered" can never disagree.
+/// Does a `?` of `e` sit in a CONDITION - an IIF or searched-CASE
+/// condition, a simple CASE's operand or WHEN value, a DECODE's tested or
+/// searched argument (both desugared into the branch conditions), a
+/// boolean expression - rather than at a value or an operand position?
+/// NULLIF is not a condition here (its arguments are values the engine
+/// compares inside the node; the previous binary answered it in every
+/// router and still does).
+///
+/// MERGE and the trigger view REFUSE such a value at prepare (round 10):
+/// both re-plan GENERATED TEXT - MERGE spells each marker as its value
+/// converted through the destination's slot ([merge_slot_cast]), the
+/// trigger view as `CAST(? AS <destination>)` - so a condition's `?` was
+/// ROUNDED into the destination before the compare, where the engine
+/// compares the client's value whole: `MERGE .. SET N = IIF(? = 5, 1, 7)`
+/// ['4.6'] stored 1 (the engine 7), `UPDATE <trigger view> SET BI = CASE
+/// WHEN ? + 1 > 5 THEN 1 ELSE 7 END` ['1.9999999999999999999'] stored 7
+/// where the engine raises. Neither path can carry the whole-side binding
+/// the table routers use, and the previous binary refused every such
+/// shape at prepare (measured 2026-09-19, 140 shapes x 4 routers).
+fn raw_param_in_condition(e: &RawExpr) -> bool {
+    match e {
+        RawExpr::Neg(a) | RawExpr::Cast(a, _) => raw_param_in_condition(a),
+        RawExpr::Bin(a, _, b) | RawExpr::Concat(a, b) | RawExpr::NullIf(a, b) => {
+            raw_param_in_condition(a) || raw_param_in_condition(b)
+        }
+        RawExpr::Coalesce(v) | RawExpr::Func(_, v) => v.iter().any(raw_param_in_condition),
+        RawExpr::Iif(c, a, b) => {
+            raw_cond_has_param(c) || raw_param_in_condition(a) || raw_param_in_condition(b)
+        }
+        RawExpr::Case(branches, else_, _) => {
+            branches.iter().any(|(c, t)| raw_cond_has_param(c) || raw_param_in_condition(t))
+                || else_.as_deref().is_some_and(raw_param_in_condition)
+        }
+        RawExpr::Cond(c) => raw_cond_has_param(c),
+        _ => false,
+    }
+}
+
+/// [raw_param_in_condition] over a value's TEXT (a `?` spelled as such); a
+/// text the raw parser does not read answers false, leaving the caller's
+/// own path as it was.
+fn value_text_param_in_condition(text: &str) -> bool {
+    parse_raw_expr_any(text).is_some_and(|raw| raw_param_in_condition(&raw))
+}
+
+fn raw_cond_has_param(c: &RawCond) -> bool {
+    match c {
+        RawCond::Cmp(a, _, b) => raw_has_param(a) || raw_has_param(b),
+        RawCond::IsNull(a) | RawCond::IsNotNull(a) | RawCond::IsUnknown(a, _) => raw_has_param(a),
+        RawCond::Like(a, ..)
+        | RawCond::Starting(a, ..)
+        | RawCond::Containing(a, ..)
+        | RawCond::Similar(a, ..) => raw_has_param(a),
+        RawCond::LikeExpr(a, p, ..)
+        | RawCond::StartingExpr(a, p, ..)
+        | RawCond::ContainingExpr(a, p, ..)
+        | RawCond::SimilarExpr(a, p, ..) => raw_has_param(a) || raw_has_param(p),
+        RawCond::Not(inner) => raw_cond_has_param(inner),
+        RawCond::And(v) | RawCond::Or(v) => v.iter().any(raw_cond_has_param),
     }
 }
 
@@ -68839,6 +69842,12 @@ fn resolve_dest_param_expr(
     if !raw_has_param(raw) {
         return resolve_expr(raw, columns, descs);
     }
+    // K4 (round 12): a TRIM over a bare `?` inside a conditional's value
+    // arm refuses at prepare ([raw_cond_arm_trim_param])
+    if raw_cond_arm_trim_param(raw) {
+        cap_note("K4 (a one-operand TRIM over a `?` in a conditional's value arm)");
+        return None;
+    }
     // [untyped_param] and [coalesce_arg_raises] lived HERE, nested, until
     // the PROJECTION router needed the same guard. A nested `fn` is
     // scoped to its enclosing body, so [resolve_proj_expr] could not see
@@ -68865,7 +69874,13 @@ fn resolve_dest_param_expr(
             // slot says, which is exactly the case this fixes.
             match dest_cast_target(dest) {
                 Some(t) => {
-                    Expr::Cast(Box::new(Expr::Param(*i)), t, fire_crab_ods::intl::CS_UTF8)
+                    // a numeric slot cast carries the [CS_SLOT_CAST] stamp
+                    let cs = match t {
+                        CastTarget::Int { .. } | CastTarget::Numeric { .. } | CastTarget::Approx => CS_SLOT_CAST,
+                        _ => fire_crab_ods::intl::CS_UTF8,
+                    };
+                    note_implicit_int(&t);
+                    Expr::Cast(Box::new(Expr::Param(*i)), t, cs)
                 }
                 // a text / temporal slot has no cast rung here yet
                 None => Expr::Param(*i),
@@ -68873,12 +69888,61 @@ fn resolve_dest_param_expr(
         }
         RawExpr::Cast(inner, t) => {
             let td = cast_target_descriptor(t)?;
+            // a trigger view's GENERATED `CAST(? AS <slot>)` IS the
+            // implicit slot cast the Param arm above builds - one cast,
+            // stamped [CS_SLOT_CAST] and restamped by the operator above
+            // it ([GENERATED_SLOT_CASTS], round 9)
+            if let RawExpr::Param(i) = &**inner {
+                if generated_slot_cast(*i)
+                    && matches!(t, CastTarget::Int { .. } | CastTarget::Numeric { .. } | CastTarget::Approx)
+                {
+                    set(sink, *i, td);
+                    note_implicit_int(t);
+                    return Some(Expr::Cast(Box::new(Expr::Param(*i)), *t, CS_SLOT_CAST));
+                }
+                // A CAST THE STATEMENT WROTE, straight over a `?`, READS THE
+                // TEXT ITSELF (round 10). The Param arm would put an
+                // implicit slot cast of the SAME type beneath it, and that
+                // cast - stamped implicit, so reading the text as the
+                // previous binary did - converted first, leaving the written
+                // cast an integer: `SET N = CAST(? AS INTEGER) + 1`
+                // ['4.999999999999'] stored 6 and `SET NM = CAST(? AS
+                // NUMERIC(9,2))` ['2.555e0'] failed, where the engine reads
+                // the text at the written type (out of range; 2.56) and so
+                // does `SELECT CAST(? AS INTEGER) + 1`. One cast, the
+                // written one's stamp - the same value the pair computed,
+                // since the slot is the cast's own type.
+                if matches!(t, CastTarget::Int { bytes: 2 | 4 | 8 } | CastTarget::Numeric { .. })
+                    && dest_cast_target(&td) == Some(*t)
+                {
+                    set(sink, *i, td.clone());
+                    // a written NUMERIC cast reads the previous binary's
+                    // fraction zeros ([note_implicit_int], round 11)
+                    if matches!(t, CastTarget::Numeric { .. }) {
+                        mix_note(MIX_IMPL);
+                    }
+                    let pair = Expr::Cast(Box::new(Expr::Param(*i)), *t, CS_SLOT_CAST);
+                    let cs = cast_source_charset(&pair, t, descs);
+                    return Some(Expr::Cast(Box::new(Expr::Param(*i)), *t, cs));
+                }
+            }
             let e = resolve_dest_param_expr(inner, &td, columns, descs, sink)?;
             let cs = cast_source_charset(&e, t, descs);
             Expr::Cast(Box::new(e), *t, cs)
         }
+        // A NEGATED `?` IS THE PREVIOUS BINARY'S TREE: the minus ON TOP of
+        // the cast into the slot, `-(CAST(? AS <slot>))` - and the
+        // MESSAGE-WIDTH law (X6: `SET BI = -?` bound the 4-byte minimum
+        // raises Integer overflow; A: `SET N = -(-?)` bound the text
+        // '-2147483648' stores) lives in [Expr::Neg]'s overflow check,
+        // which looks through the stamped slot cast ([CS_SLOT_CAST], an
+        // operand's [CS_SLOT_OPERAND] - round 8) to the message beneath
+        // it. Rounds 4-6 cast the NEGATED value into
+        // the slot instead, which raised on `IIF(ID = 2, -? * 1, SM)`
+        // [-32768] and `IIF(ID = 2, -?, SM) = 32768` where the engine and
+        // the previous binary answer 32768 (round 7, THE SCOPE CUT).
         RawExpr::Neg(a) => {
-            Expr::Neg(Box::new(resolve_dest_param_expr(a, dest, columns, descs, sink)?))
+            Expr::Neg(Box::new(slot_operand(resolve_dest_param_expr(a, dest, columns, descs, sink)?)))
         }
         // A MULTIPLY CONVERTS ITS LEFT OPERAND AT SCALE 0 when the
         // destination is an exact SCALED type - and only there. Measured
@@ -68921,7 +69985,20 @@ fn resolve_dest_param_expr(
                     _ => None,
                 }
             };
+            // (a TEXT destination under arithmetic with a direct `?`
+            // operand refuses at prepare - both binaries prepared `SET S
+            // = ? * 2` and failed at execute; a refusal replaces that.
+            // Round 7, THE SCOPE CUT: everything else in this arm is
+            // chunk 45's tree exactly - no side rule by destination
+            // width, no divisor rounding, no dividend reading, no
+            // destination-width cast, no message-width negation under an
+            // operator here; rounds 5-6 tried each and regressed.)
             let lp = left_param(a);
+            let direct_right = matches!(&**b, RawExpr::Param(_))
+                || matches!(&**b, RawExpr::Neg(inner) if matches!(**inner, RawExpr::Param(_)));
+            if (lp.is_some() || direct_right) && matches!(dest.dtype, dtype::TEXT | dtype::VARYING) {
+                return None;
+            }
             let scale0 = matches!(op, ArithOp::Mul)
                 && dest.scale != 0
                 && lp.is_some()
@@ -68935,23 +70012,34 @@ fn resolve_dest_param_expr(
                         dtype::INT64 => 8,
                         _ => 16,
                     };
-                    let cast = Expr::Cast(
-                        Box::new(Expr::Param(i)),
-                        CastTarget::Int { bytes },
-                        fire_crab_ods::intl::CS_UTF8,
-                    );
+                    // STAMPED [CS_SLOT_OPERAND], the stamp of a direct
+                    // operand's implicit slot cast, so [Expr::Neg] looks
+                    // THROUGH it to the MESSAGE's width. Left as CS_UTF8
+                    // it overflowed at the destination's 2 / 4 bytes:
+                    // `IIF(ID = 2, -? * 1, N41)` [-32768] and `IIF(ID =
+                    // 2, -? * 1, NM)` ['-2147483648'] raised Integer
+                    // overflow where the engine and the previous binary
+                    // answer 32768 / 2147483648 (round 8, Q1); the 4-byte
+                    // message -2147483648 beside NM still overflows, as
+                    // the engine does
+                    let cast = Expr::Cast(Box::new(Expr::Param(i)), CastTarget::Int { bytes }, CS_SLOT_OPERAND);
+                    note_implicit_int(&CastTarget::Int { bytes });
                     // the negation goes back ON TOP of the converted
                     // value: -(CAST(? AS INTEGER)) * 2, which measures -2
                     if negated { Expr::Neg(Box::new(cast)) } else { cast }
                 }
-                _ => resolve_dest_param_expr(a, dest, columns, descs, sink)?,
+                _ => slot_operand(resolve_dest_param_expr(a, dest, columns, descs, sink)?),
             };
             Expr::Bin(
                 Box::new(left),
                 *op,
-                Box::new(resolve_dest_param_expr(b, dest, columns, descs, sink)?),
+                Box::new(slot_operand(resolve_dest_param_expr(b, dest, columns, descs, sink)?)),
             )
         }
+        // (a DML VALUE keeps the concatenation: `SET N = CASE ID WHEN 2
+        // THEN ? ELSE 0 END || ''` ['2.4'] stores 2 on the engine and the
+        // previous binary - the CASE's LONG slot value - where the WHERE
+        // twin compares the text; [resolve_proj_expr]'s Concat arm refuses)
         RawExpr::Concat(a, b) => Expr::Concat(
             Box::new(resolve_dest_param_expr(a, dest, columns, descs, sink)?),
             Box::new(resolve_dest_param_expr(b, dest, columns, descs, sink)?),
@@ -68999,32 +70087,84 @@ fn resolve_dest_param_expr(
             if v.iter().any(coalesce_arg_raises) {
                 return None;
             }
+            // a bare `?` in a TEXT-reconciled COALESCE carries the length
+            // check the engine makes when the node is evaluated
+            // ([CS_TEXT_FIT], round 8, Q4) - a check only, never a
+            // conversion: the value passes through as it did
+            let text_len = matches!(sd.dtype, dtype::TEXT | dtype::VARYING)
+                .then(|| fire_crab_ods::intl::char_length(sd.dtype, sd.length, sd.sub_type));
+            // (round 9, P4: the slot's CHARACTER SET rides in the synthetic
+            // target - [text_form] measures through a synthetic cast and
+            // never reads it - and a fixed CHAR slot is stamped
+            // [CS_TEXT_FIT_CHAR], the one the byte-length fast path is on)
+            let slot_cs = Some(fire_crab_ods::intl::charset_id(sd.sub_type));
+            let fit = if sd.dtype == dtype::TEXT { CS_TEXT_FIT_CHAR } else { CS_TEXT_FIT };
             Expr::Coalesce(
                 v.iter()
-                    .map(|a| resolve_dest_param_expr(a, &sd, columns, descs, sink))
+                    .map(|a| {
+                        let e = resolve_dest_param_expr(a, &sd, columns, descs, sink)?;
+                        Some(match (text_len, e) {
+                            (Some(len), Expr::Param(i)) => Expr::Cast(
+                                Box::new(Expr::Param(i)),
+                                CastTarget::Text { len, pad: false, synthetic: true, cs: slot_cs },
+                                fit,
+                            ),
+                            (_, e) => e,
+                        })
+                    })
                     .collect::<Option<Vec<_>>>()?,
             )
         }
+        // A BARE `?` AS TRIM'S ONLY OPERAND is answered into a TEXT slot
+        // alone (`UPDATE T SET S = TRIM(?)` [' ab '] stores 'ab' - the
+        // engine describes the destination's own VARYING; `IIF(ID = 2,
+        // TRIM(?), 'a') = 'b'` ['b '] row 2, described TEXT(1) beside its
+        // sibling on the engine) and REFUSES at prepare into any other
+        // (a LONG sibling: the engine types TRIM's `?` as a VARYING(11)
+        // under a simple CASE / COALESCE and as the LONG itself under
+        // IIF - unmeasured beyond the describe, and the previous binary
+        // refused every one; round 6, stabilisation)
+        RawExpr::Func(SysFn::Trim(_), args)
+            if matches!(args.as_slice(), [RawExpr::Param(_)])
+                && !matches!(dest.dtype, dtype::TEXT | dtype::VARYING) =>
+        {
+            return None;
+        }
+        // A BARE `?` THE ENGINE CANNOT TYPE UNDER A STRING FUNCTION refuses
+        // at prepare ([strfn_bare_param_untypable]): the engine answers -804
+        // *Data type unknown* for `LEFT(?, 1)`, `RIGHT(?, 1)`, `REVERSE(?)`,
+        // `LPAD(?, 3)`, `RPAD(?, 3, 'x')`, `LPAD(S, 3, ?)`, `MOD(?, ?)`,
+        // `CHAR_LENGTH(?)`, `OCTET_LENGTH(?)` and *Expression evaluation
+        // not supported* for `SUBSTRING(? FROM ?)` / `SUBSTRING(S FROM ?
+        // FOR 1)` - in a conditional branch beside a numeric OR a text
+        // sibling, in a select list and as a DML value alike (measured
+        // 2026-09-19, cmpcut); the previous binary prepared then failed on
+        // the numeric-sibling ones and answered the rest where the engine
+        // refuses. `LEFT(S, ?)`, `MOD(?, 2)`, `MOD(5, ?)`, `SUBSTRING(?
+        // FROM 1 FOR 1)` keep answering (the engine types those).
+        RawExpr::Func(f, args) if strfn_bare_param_untypable(*f, args) => return None,
         RawExpr::Func(f, args) => Expr::Func(
             *f,
             args.iter()
-                .map(|a| resolve_dest_param_expr(a, dest, columns, descs, sink))
+                .map(|a| resolve_dest_param_expr(a, dest, columns, descs, sink).map(slot_operand))
                 .collect::<Option<Vec<_>>>()?,
         ),
-        // a CONDITION carrying a parameter refuses inside
-        // [resolve_raw_cond] on its own - only the VALUE arms below
+        // a CONDITION's `?` is typed from the other side of ITS
+        // comparison ([resolve_raw_cond_sink]) - the destination plays
+        // no role there (measured: `UPDATE T SET N = IIF(ID = ?, 99, N)`
+        // describes ID's own LONG, not N's); only the VALUE arms below
         // carry the destination down
         RawExpr::Iif(c, a, b) => Expr::Iif(
-            Box::new(resolve_raw_cond(c, columns, descs)?),
+            Box::new(resolve_raw_cond_sink(c, columns, descs, sink)?),
             Box::new(resolve_dest_param_expr(a, dest, columns, descs, sink)?),
             Box::new(resolve_dest_param_expr(b, dest, columns, descs, sink)?),
         ),
-        RawExpr::Case(branches, else_) => Expr::Case(
+        RawExpr::Case(branches, else_, _) => Expr::Case(
             branches
                 .iter()
                 .map(|(c, t)| {
                     Some((
-                        resolve_raw_cond(c, columns, descs)?,
+                        resolve_raw_cond_sink(c, columns, descs, sink)?,
                         resolve_dest_param_expr(t, dest, columns, descs, sink)?,
                     ))
                 })
@@ -69107,9 +70247,16 @@ fn untyped_param(e: &RawExpr) -> bool {
 /// routers ask it.
 fn coalesce_arg_raises(a: &RawExpr) -> bool {
     match a {
+        // an ADD whose BOTH operands are untyped is -802 too:
+        // `COALESCE(? + ?, 0)` and `COALESCE(? - ?, 0)` refuse on the
+        // engine where both binaries answered (measured 2026-09-19);
+        // `? + 1` beside a typed sibling keeps answering
         RawExpr::Bin(l, op, r) => {
             (matches!(op, ArithOp::Mul | ArithOp::Div)
                 && (untyped_param(l) || untyped_param(r)))
+                || (matches!(op, ArithOp::Add | ArithOp::Sub)
+                    && raw_untyped_num(l)
+                    && raw_untyped_num(r))
                 || coalesce_arg_raises(l)
                 || coalesce_arg_raises(r)
         }
@@ -69119,6 +70266,1828 @@ fn coalesce_arg_raises(a: &RawExpr) -> bool {
         }
         _ => false,
     }
+}
+
+/// TRUE when a `?` is reachable from the root through ONLY unary minus,
+/// `+ - * /` and `||` - a side with no type of its own, which the engine
+/// types from the OTHER side of its comparison (measured, 262 cells:
+/// `ID * ? = 2` LONG NOT NULL, `? + 1 = ID` LONG Nullable, `S || ? =
+/// 'abx'` TEXT 3). A `?` under CAST, COALESCE, NULLIF, CASE, IIF or a
+/// function answers FALSE even though [raw_has_param] is true: those
+/// nodes type their own `?` (or refuse) through [resolve_proj_expr],
+/// and the engine refuses `ABS(ID * ?) = 2` and `COALESCE(ID * ?, 0) =
+/// 2` with -804 exactly as it refuses the uncompared `SELECT ID * ?`.
+/// NOT [untyped_param], which counts a Func/Iif/Case with a `?` as
+/// untyped.
+fn raw_bare_cmp_param(e: &RawExpr) -> bool {
+    match e {
+        RawExpr::Param(_) => true,
+        RawExpr::Neg(a) => raw_bare_cmp_param(a),
+        RawExpr::Bin(a, _, b) | RawExpr::Concat(a, b) => {
+            raw_bare_cmp_param(a) || raw_bare_cmp_param(b)
+        }
+        _ => false,
+    }
+}
+
+/// A literal right side as its literal expression - the `rhs_expr`
+/// closure of [resolve_expr_term], lifted so the bare-lhs branch can
+/// use it before the closure is in scope. Dbl exists only at bind; a
+/// StrKey keeps its grammar marker; an Oct is a byte pattern - all None.
+fn rhs_literal_expr(rhs: &Rhs) -> Option<Expr> {
+    Some(match rhs {
+        Rhs::Int(n) => Expr::Int(*n),
+        Rhs::Int128(n) => Expr::Int128(*n),
+        Rhs::Num(r, s) => Expr::Dec(*r, *s),
+        Rhs::Str(s) => Expr::Str(s.clone()),
+        Rhs::Null => Expr::Null,
+        Rhs::DecFloat34(b) => Expr::DecFloat34(*b),
+        Rhs::Dbl(_) | Rhs::Param(..) | Rhs::StrKey(_) | Rhs::Oct(_) => return None,
+    })
+}
+
+/// The INPUT descriptor a `?` announces when `other` is the OTHER side of
+/// its comparison - the engine's MAKE_desc of that side, measured slot by
+/// slot: dtype and width from the expression's own integer/numeric width
+/// ([result_width_bytes]: a literal is LONG, `N + 1` INT64, `2 * 1.5`
+/// INT128, a NUMERIC(9,2) column LONG), scale from [Expr::result_scale],
+/// NUMERIC/DECIMAL family from [numeric_subtype] (`NM * 2 > ?` is subtype
+/// 1), text width/charset as before, and NULLABILITY from
+/// [expr_nullable] - the same rule the output describe uses: a literal
+/// NOT NULL, a nullable column Nullable, `NN + 1` NOT NULL, a `?`, NULLIF
+/// or NULL Nullable. (This used to be the inline block of the
+/// `Cmp(op, Rhs::Param)` arm, with INT64 hard-coded for Numeric, sub_type
+/// 0 and `!expr_has_col` for the flag - three measured describe faults:
+/// `? = CAST(2.5 AS NUMERIC(9,1))` is LONG, `NM * 2 > ?` subtype 1,
+/// `NN + 1 = ?` NOT NULL.)
+/// Does NOT refuse Expr::Null (it types as Int there, as it always did);
+/// the comparison-side callers refuse Null themselves (the SQL_NULL slot).
+fn param_desc_from_expr(other: &Expr, descs: &[Descriptor]) -> Option<(Descriptor, ColKind)> {
+    let is_nn = |fid: usize| descs.get(fid).is_some_and(|d| d.flags & PARAM_NOT_NULL != 0);
+    let flags = if expr_nullable(other, &is_nn) { 0 } else { PARAM_NOT_NULL };
+    let d = |dt: u8, len: u16, sc: i8| Descriptor {
+        dtype: dt,
+        scale: sc,
+        length: len,
+        sub_type: 0,
+        flags,
+        offset: 4,
+    };
+    let exact_dtype = |bytes: u8| match bytes {
+        2 => dtype::SHORT,
+        4 => dtype::LONG,
+        16 => dtype::INT128,
+        _ => dtype::INT64,
+    };
+    Some(match other.type_of(descs)? {
+        // the expression's own integer width ([result_width_bytes],
+        // whose doc already carries the probe: a literal is LONG
+        // when it fits 32 bits, BIGINT past it, never SMALLINT)
+        ExprType::Int => {
+            let bytes = result_width_bytes(other, descs);
+            (d(exact_dtype(bytes), bytes as u16, 0), ColKind::Int)
+        }
+        ExprType::Numeric => {
+            let bytes = result_width_bytes(other, descs);
+            let mut desc = d(exact_dtype(bytes), bytes as u16, other.result_scale(descs)?);
+            desc.sub_type = numeric_subtype(other, descs);
+            (desc, ColKind::Numeric)
+        }
+        // a fixed-text side (a literal, CAST AS CHAR, UPPER of
+        // one) is 452 TEXT and a varying one 448, at a CHARACTER
+        // width behind the charset sentinel - the same pair
+        // [build_expr_col_from] announces for a projection
+        ExprType::Text => {
+            let desc = match text_param_width(other, descs) {
+                Some((varying, w)) => {
+                    let (dt, len) = if varying {
+                        (dtype::VARYING, (w as u16).saturating_add(2))
+                    } else {
+                        (dtype::TEXT, w as u16)
+                    };
+                    Descriptor {
+                        dtype: dt,
+                        scale: 0,
+                        length: len,
+                        sub_type: text_param_cs(other, descs),
+                        flags,
+                        offset: 4,
+                    }
+                }
+                // no statically known width: the old catch-all
+                None => d(dtype::VARYING, 32765, 0),
+            };
+            (desc, ColKind::Text)
+        }
+        // a temporal or approximate side asks the client for
+        // that type: the descriptor IS the contract, so the
+        // driver encodes a DATE where a DATE is announced and
+        // the value arrives already decoded
+        ExprType::Temporal(TKind::Date) => {
+            (d(dtype::SQL_DATE, 4, 0), ColKind::Temporal(TKind::Date))
+        }
+        ExprType::Temporal(TKind::Time) => {
+            (d(dtype::SQL_TIME, 4, 0), ColKind::Temporal(TKind::Time))
+        }
+        ExprType::Temporal(TKind::Timestamp) => (
+            d(dtype::TIMESTAMP, 8, 0),
+            ColKind::Temporal(TKind::Timestamp),
+        ),
+        ExprType::Temporal(TKind::TimeTz) => (d(dtype::SQL_TIME_TZ, 8, 0), ColKind::Temporal(TKind::TimeTz)),
+        ExprType::Temporal(TKind::TimestampTz) => (d(dtype::TIMESTAMP_TZ, 12, 0), ColKind::Temporal(TKind::TimestampTz)),
+        ExprType::Approx => (d(dtype::DOUBLE, 8, 0), ColKind::Approx),
+        ExprType::Bool => (d(dtype::BOOLEAN, 1, 0), ColKind::Bool),
+    })
+}
+
+/// Register slot `i` as `d` for a rung. FIRST CLAIM WINS and an UNEQUAL
+/// re-claim REFUSES: a BETWEEN/IN desugar clones the tested side into
+/// several leaves, each of which types the one `?` from ITS bound, and a
+/// slot must announce one descriptor (engine: BETWEEN from the LOWER
+/// bound, IN from the reconciled list - `ID * ? BETWEEN 1 AND 2` and `IN
+/// (2, 6)` agree, `BETWEEN 1.5 AND 2` and `IN (2, 3.5)` refuse here,
+/// recorded). An unrenumbered placeholder (usize::MAX) can never resize
+/// the sink.
+fn claim_param_slot(sink: &mut Vec<Option<Descriptor>>, i: usize, d: &Descriptor) -> Option<()> {
+    if i == usize::MAX {
+        return None;
+    }
+    if sink.len() <= i {
+        sink.resize(i + 1, None);
+    }
+    match &sink[i] {
+        None => {
+            sink[i] = Some(d.clone());
+            Some(())
+        }
+        Some(prev) => {
+            // (the round-12 chunk-new mark is bookkeeping, not type: a
+            // slot claimed again by the same rung compares without it)
+            let same = prev.dtype == d.dtype
+                && prev.scale == d.scale
+                && prev.length == d.length
+                && prev.sub_type == d.sub_type
+                && prev.flags & !PARAM_CHUNK_NEW == d.flags & !PARAM_CHUNK_NEW;
+            if same {
+                Some(())
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// The typed node a comparison-side `?` that is an OPERAND becomes (an
+/// arithmetic operand under a non-exact slot, a `||` operand): the CAST
+/// the bound value converts through INTO THE SLOT before the arithmetic
+/// (chunk 45's law), which is also what gives the tree a type for
+/// [cmp_sides]. A `?` that is the WHOLE side takes [whole_side_rung] -
+/// this shape stamped so the bind never converts it. Exact slots
+/// cast at EIGHT bytes whatever the slot's width: the engine reads a
+/// client's value-derived message and a wide bind against a LONG slot is
+/// silently no-match (`ID * ? = 2 [100000000000]` -> none, `> 1` -> 1;2;3,
+/// measured), where a 4-byte cast would raise 22003. INT128 and DECFLOAT
+/// slots have no input encoder here (the HAVING arm's own rule) - None.
+/// A text slot takes the TEXT RUNG (see [is_text_param_rung]): typed like
+/// a literal in the attachment charset, collapsed to the bound string at
+/// bind, never evaluated as a CAST.
+fn cmp_param_rung(i: usize, slot: &Descriptor) -> Option<Expr> {
+    use fire_crab_ods::intl::CS_UTF8;
+    let p = Box::new(Expr::Param(i));
+    Some(match slot.dtype {
+        // an exact rung reads at the operator's width: [CS_OPERATOR_READ]
+        dtype::SHORT | dtype::LONG | dtype::INT64 => {
+            if slot.scale != 0 || matches!(slot.sub_type, 1 | 2) {
+                Expr::Cast(
+                    p,
+                    CastTarget::Numeric { scale: slot.scale, bytes: 8, sub_type: slot.sub_type },
+                    CS_OPERATOR_READ,
+                )
+            } else {
+                Expr::Cast(p, CastTarget::Int { bytes: 8 }, CS_OPERATOR_READ)
+            }
+        }
+        dtype::DOUBLE => Expr::Cast(p, CastTarget::Approx, CS_UTF8),
+        dtype::REAL => Expr::Cast(p, CastTarget::Float, CS_UTF8),
+        dtype::SQL_DATE => Expr::Cast(p, CastTarget::Temporal(TKind::Date), CS_UTF8),
+        dtype::SQL_TIME => Expr::Cast(p, CastTarget::Temporal(TKind::Time), CS_UTF8),
+        dtype::TIMESTAMP => Expr::Cast(p, CastTarget::Temporal(TKind::Timestamp), CS_UTF8),
+        dtype::BOOLEAN => Expr::Cast(p, CastTarget::Bool, CS_UTF8),
+        dtype::TEXT | dtype::VARYING => Expr::Cast(
+            p,
+            CastTarget::Text { len: 32765, pad: false, synthetic: false, cs: None },
+            CS_UTF8,
+        ),
+        // INT128, DEC64, DEC128, the TZ types, BLOB
+        _ => return None,
+    })
+}
+
+/// The text rung [cmp_param_rung] builds - the one CAST shape
+/// [subst_params_expr] collapses to the bound string. (A user-written
+/// `CAST(? AS VARCHAR(32765))` has the same shape; collapsing it is a
+/// no-op conversion at the maximum width, so the coincidence is harmless.)
+fn is_text_param_rung(e: &Expr) -> bool {
+    matches!(e, Expr::Cast(inner, CastTarget::Text { len: 32765, pad: false, synthetic: false, cs: None }, _)
+        if matches!(**inner, Expr::Param(_)))
+}
+
+/// The charset stamp that marks a WHOLE-SIDE rung ([whole_side_rung]):
+/// a value no character set id takes (the engine's ids stop below 100
+/// and CS_dynamic is 127), carried in [Expr::Cast]'s SOURCE-charset
+/// field - which nothing but the 22018 spelling of an EVALUATED cast
+/// reads, and a whole-side rung is collapsed at bind and never evaluated.
+const CS_WHOLE_SIDE: u8 = 0xFE;
+
+/// The charset stamp of an IMPLICIT SLOT CAST - the `CAST(? AS <slot>)`
+/// [resolve_dest_param_expr] builds for a bare `?` whose described slot
+/// is exact or approximate (never a text slot, whose charset is real).
+/// [Expr::Neg]'s overflow check looks THROUGH it to the MESSAGE beneath:
+/// the engine negates a bound value at the message's width, not at the
+/// described slot's - `IIF(ID = 2, -? * 1, SM)` bound the 4-byte -32768
+/// is 2;32768;3, `IIF(ID = 2, -?, SM) = 32768` row 2, while `SET BI =
+/// -?` bound the 4-byte -2147483648 raises Integer overflow (X6) and
+/// `-CAST(? AS SMALLINT)` on -32768 raises (an EXPLICIT cast is its own
+/// width) - measured 2026-09-18/19. Round 7, THE SCOPE CUT. Nothing but
+/// that check and [conv_err] (which reads it as UTF8) looks at it.
+const CS_SLOT_CAST: u8 = 0xFD;
+
+/// [CS_SLOT_CAST] on an implicit slot cast that is the DIRECT OPERAND of
+/// an arithmetic node, a unary minus or a function ([slot_operand]) -
+/// every position where the engine does NOT convert the bound value
+/// into the slot but reads the client's message at the OPERATOR's own
+/// width (an add at int128, an int64 multiply at int64, NegateNode and
+/// ABS / ROUND over a text as a double). There the Int arm's
+/// coefficient gate at the SLOT's width ([Expr::eval], `CAST(.. AS
+/// INTEGER)`'s rule) is wrong, and it answered *numeric value is out of
+/// range* where the engine and the previous binary answer: `SET N = ? +
+/// 1` ['1.999999999999'] stores 3, `SET N = -?` ['-1.999999999999'] 2,
+/// `SET NM = ? * 1` ['1.999999999999'] 2.00, `SET N = MOD(?, 5)` 2,
+/// `IIF(ID = 2, -? * 1, N41)` ['-32767.6'] 32768 (measured 2026-09-19,
+/// round 8 - the refuter's Q1 twin that the look-through alone did not
+/// repair). A VALUE position keeps the gate, and is right with it: `IIF(ID
+/// = 2, ?, N)`, `COALESCE(?, N)`, `SET N = IIF(ID = 1, ?, N)` and `SET N
+/// = ? || ''` raise on ['1.999999999999'] exactly as the engine does.
+/// [Expr::Neg] looks through this stamp as through [CS_SLOT_CAST] (the
+/// scale-0 multiply rounding cast of chunk 45 carries it too - round 8,
+/// Q1).
+const CS_SLOT_OPERAND: u8 = 0xFA;
+
+/// Every stamp at or above this marks a cast THE STATEMENT DID NOT WRITE
+/// (an implicit slot cast, a compare rung, a check-only wrap). A real
+/// character-set id - what a user-written `CAST(..)` or a computed
+/// column's own `blr_cast` carries - is always below it (the engine's
+/// ids stop below 100, CS_dynamic is 127). [int_cast_gates_coefficient]
+/// reads the split.
+const CS_IMPLICIT_FLOOR: u8 = 0xF0;
+
+/// The charset stamp of a comparison side's ARITHMETIC OPERAND RUNG
+/// ([cmp_param_rung], [arith_operand_rung]): an implicit cast built at
+/// the width the ENGINE'S OPERATOR reads its operand at (an add or an
+/// int64 multiply at eight bytes, an int128 multiply or divide at
+/// sixteen), so the coefficient gate at that width is the engine's own
+/// read and stays on: `? + 1 = N` ['1.9999999999999999999'] raises
+/// *numeric value is out of range* on the engine and here, where the
+/// ungated read answered row 1 (measured 2026-09-19, round 9 census).
+/// It was CS_UTF8 - the user-written CAST's spelling - which is exactly
+/// the ambiguity round 9 removes.
+const CS_OPERATOR_READ: u8 = 0xF9;
+
+/// [CS_TEXT_FIT] on a fixed CHAR slot (not a VARCHAR): the check also
+/// takes the engine's BYTE-LENGTH fast path - a text message exactly as
+/// long, in bytes, as the slot the describe announced passes and is cut
+/// to the slot's characters (round 9, P4).
+const CS_TEXT_FIT_CHAR: u8 = 0xF7;
+
+thread_local! {
+    /// What the statement being planned carries, for [plan_unmixed]:
+    /// [MIX_CMP] once a comparison `?` the previous binary refused is
+    /// typed ([resolve_cmp_pair], [resolve_expr_term]), [MIX_IMPL] once
+    /// an implicit integer cast over a `?` reads its text the previous
+    /// binary's way ([note_implicit_int]).
+    static MIX_FLAGS: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+const MIX_CMP: u8 = 1;
+const MIX_IMPL: u8 = 2;
+
+fn mix_note(bit: u8) {
+    MIX_FLAGS.with(|f| f.set(f.get() | bit));
+}
+
+/// An implicit cast over a `?` that reads its text the previous binary's
+/// way marks the statement [MIX_IMPL]: an INTEGER-family target of 8
+/// bytes or fewer (the reading [int_cast_gates_coefficient] leaves
+/// ungated), a NUMERIC / DECIMAL target of any width (its fraction-zero
+/// drop and its implicit exponent refusal are the previous binary's -
+/// `UPDATE TW SET NM = IIF(ID = 1, ?, 0) WHERE ID * ? = 1` ['2.00000000000
+/// ', '1'] stored 2.00 where the engine raises, and `SET NM = ? + 0 ..`
+/// ['4.999999999999', '1'] prepared then failed where the engine stores
+/// 5 - round 10's refuter; round 10 marked the INTEGER targets only), and
+/// an APPROXIMATE target (the previous binary's correctly rounded text
+/// read, where the engine accumulates digit by digit - round 11's W1).
+/// A written NUMERIC CAST straight over a `?` reads the same fraction
+/// zeros the previous binary's way and is marked by its builders too.
+/// An INT128 target reads as the engine does and marks nothing.
+fn note_implicit_int(t: &CastTarget) {
+    if matches!(t, CastTarget::Int { bytes } if *bytes <= 8)
+        || matches!(t, CastTarget::Numeric { .. } | CastTarget::Approx | CastTarget::Float)
+    {
+        mix_note(MIX_IMPL);
+    }
+}
+
+/// Plan ONE STATEMENT and refuse it when it MIXES a comparison `?` the
+/// previous binary refused ([MIX_CMP]) with an implicit integer cast over
+/// a `?` that reads its text the previous binary's way ([MIX_IMPL]).
+///
+/// Round 10 put every implicit position back on the previous binary's
+/// reading, and that reading is wrong for some texts (`SET N =
+/// COALESCE(?, 0)` ['4.999999999999'] stores 5 where the engine raises -
+/// recorded, shared). The previous binary could only answer it that way
+/// in a statement it could plan at all, and it refused every statement
+/// carrying a `?` inside comparison arithmetic or in an expression's
+/// condition - so where this chunk's comparison typing is what makes the
+/// statement plannable, the old wrong reading would be a NEW wrong answer
+/// (`UPDATE T SET N = COALESCE(?, 0) WHERE ID * ? = 1` ['4.999999999999',
+/// '1'] stored 5; `UPDATE T SET N = IIF(? = 5, ?, 7)`, `SELECT IIF(ID =
+/// ?, ?, N)` likewise - measured 2026-09-19, 55 cells). Such a statement
+/// is refused at prepare, exactly as the previous binary refused it; one
+/// that carries only the comparison, or only the implicit cast, plans as
+/// before. Nested plans report their flags upward.
+fn plan_unmixed<T>(f: impl FnOnce() -> Option<T>) -> Option<T> {
+    let outer = MIX_FLAGS.with(|m| m.replace(0));
+    let r = f();
+    let mine = MIX_FLAGS.with(|m| m.get());
+    MIX_FLAGS.with(|m| m.set(outer | mine));
+    if mine & (MIX_CMP | MIX_IMPL) == (MIX_CMP | MIX_IMPL) {
+        cap_note("MIX (round 11's census, kept beside K1)");
+        return None;
+    }
+    r
+}
+
+// ROUND 12 - THE CAPS. Eleven rounds of engine laws did not converge:
+// every refuter found new wrong answers, almost all from exotic text
+// spellings or from one chunk-new `?` sharing a statement with an older
+// reading. Round 12 adds no law; it caps what the chunk-new code accepts,
+// driven by ONE mark ([PARAM_CHUNK_NEW]) set where a chunk-new slot is
+// registered:
+//
+//   K1 [chunk_new_mixed]: a statement carrying a chunk-new slot AND a slot
+//      that is not chunk-new refuses at prepare (the previous binary
+//      refused every statement carrying a chunk-new slot, so this cannot
+//      regress). [plan_unmixed] stays beside it: it also refuses a chunk-
+//      new condition whose OWN slot is a written NUMERIC cast
+//      (`IIF(CAST(? AS NUMERIC(9,2)) = NM, ..)`), which K1 alone admits.
+//   K2 [chunk_new_text_off_grammar]: a TEXT message bound to a chunk-new
+//      NUMERIC slot must be canonical ([canonical_numeric_text]) or it
+//      raises the engine's conversion error at execute - a recorded
+//      boundary, never a wrong answer.
+//   K3 [chunk_new_approx_refuses], [arith_operand_rung]: a chunk-new
+//      comparison whose `?` is read in DOUBLE refuses at prepare, except
+//      a bare `?` that is the WHOLE side (measured right every round).
+//   K4 [raw_text_arm_param], [raw_cond_arm_trim_param]: a conditional
+//      whose value arm is a bare `?` (or a string function over one)
+//      reconciled to a TEXT slot refuses inside a chunk-new router, and a
+//      TRIM over a bare `?` in any conditional's value arm refuses (the
+//      previous binary panicked on every non-null bind of it).
+
+/// Run a chunk-new router and mark every slot it REGISTERED (a slot that
+/// was empty before and holds a descriptor after) [PARAM_CHUNK_NEW] - on
+/// success only, so a failed attempt leaves no mark behind (round 11's
+/// lesson for [MIX_FLAGS]). Returns the newly registered slot indices.
+fn marking_chunk_new<T>(
+    sink: &mut Vec<Option<Descriptor>>,
+    f: impl FnOnce(&mut Vec<Option<Descriptor>>) -> Option<T>,
+) -> Option<(T, Vec<usize>)> {
+    let before: Vec<bool> = sink.iter().map(Option::is_some).collect();
+    let r = f(sink)?;
+    let mut fresh = Vec::new();
+    for (i, d) in sink.iter_mut().enumerate() {
+        if let Some(d) = d {
+            if !before.get(i).copied().unwrap_or(false) {
+                d.flags |= PARAM_CHUNK_NEW;
+                fresh.push(i);
+            }
+        }
+    }
+    Some((r, fresh))
+}
+
+/// K1: does a statement's input carry a chunk-new slot AND one that is
+/// not? Such a statement refuses at prepare.
+fn chunk_new_mixed<'a>(ds: impl IntoIterator<Item = &'a Descriptor>) -> bool {
+    let (mut new, mut old) = (false, false);
+    for d in ds {
+        if d.flags & PARAM_CHUNK_NEW != 0 {
+            new = true;
+        } else {
+            old = true;
+        }
+    }
+    new && old
+}
+
+/// K2's grammar: `^[+-]?[0-9]+(\.[0-9]*)?$` or `^[+-]?\.[0-9]+$`, with at
+/// most 18 significant digits - leading zeros excluded, TRAILING FRACTION
+/// ZEROS INCLUDED (they are what broke rounds 9-11: '2.' + 38 zeros,
+/// '0.5' + 18 zeros). No blank, no exponent, no second sign.
+fn canonical_numeric_text(s: &str) -> bool {
+    let body = s.strip_prefix(['+', '-']).unwrap_or(s);
+    let (ip, fp) = match body.split_once('.') {
+        Some((i, f)) => (i, Some(f)),
+        None => (body, None),
+    };
+    if !ip.bytes().all(|c| c.is_ascii_digit()) || !fp.unwrap_or("").bytes().all(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    // `[0-9]+` before an optional point, or `\.[0-9]+`
+    if ip.is_empty() && fp.is_none_or(str::is_empty) {
+        return false;
+    }
+    let digits = ip.len() + fp.map_or(0, str::len);
+    let leading = ip.bytes().chain(fp.unwrap_or("").bytes()).take_while(|&c| c == b'0').count();
+    digits - leading <= 18
+}
+
+/// K2: the first TEXT message bound to a chunk-new NUMERIC slot (exact,
+/// approximate or DECFLOAT) that is not [canonical_numeric_text] - the
+/// statement then raises the engine's `conversion error from string
+/// "<text>"` (22018) at execute, before it reads or writes a row. A text
+/// into a chunk-new TEXT slot, and every integer or double message, is
+/// untouched.
+fn chunk_new_text_off_grammar(params: &[Descriptor], args: &[WireParam]) -> Option<String> {
+    for (d, a) in params.iter().zip(args) {
+        // [PARAM_BODY_CMP]: a text past the literal compare's coefficient
+        // (where the previous binary failed on every text) that carries a
+        // blank raises, as the previous binary did
+        if d.flags & PARAM_BODY_CMP != 0 && d.flags & PARAM_CHUNK_NEW == 0 {
+            if let WireParam::Text(s) | WireParam::TextCs(s, _) = a {
+                if s.contains([' ', '\t']) && num_literal_expr(s).is_none() {
+                    return Some(s.clone());
+                }
+            }
+            continue;
+        }
+        if d.flags & PARAM_CHUNK_NEW == 0 {
+            continue;
+        }
+        let numeric = matches!(
+            d.dtype,
+            dtype::SHORT
+                | dtype::LONG
+                | dtype::INT64
+                | dtype::INT128
+                | dtype::REAL
+                | dtype::DOUBLE
+                | dtype::DEC64
+                | dtype::DEC128
+        );
+        if !numeric {
+            continue;
+        }
+        if let WireParam::Text(s) | WireParam::TextCs(s, _) = a {
+            if !canonical_numeric_text(s) {
+                return Some(s.clone());
+            }
+        }
+    }
+    None
+}
+
+/// Every node of a raw expression, conditions included: does `f` hold for
+/// any of them?
+fn raw_any(e: &RawExpr, f: &dyn Fn(&RawExpr) -> bool) -> bool {
+    if f(e) {
+        return true;
+    }
+    match e {
+        RawExpr::Neg(a) | RawExpr::Cast(a, _) | RawExpr::Collate(a, _) => raw_any(a, f),
+        RawExpr::Bin(a, _, b) | RawExpr::Concat(a, b) | RawExpr::NullIf(a, b) => raw_any(a, f) || raw_any(b, f),
+        RawExpr::Coalesce(v) | RawExpr::Func(_, v) | RawExpr::UserFn(_, v) | RawExpr::Subscript(_, v) => {
+            v.iter().any(|x| raw_any(x, f))
+        }
+        RawExpr::Iif(c, a, b) => raw_cond_any(c, f) || raw_any(a, f) || raw_any(b, f),
+        RawExpr::Case(branches, else_, _) => {
+            branches.iter().any(|(c, t)| raw_cond_any(c, f) || raw_any(t, f))
+                || else_.as_deref().is_some_and(|x| raw_any(x, f))
+        }
+        RawExpr::Cond(c) => raw_cond_any(c, f),
+        _ => false,
+    }
+}
+
+/// [raw_any] over a condition's operands.
+fn raw_cond_any(c: &RawCond, f: &dyn Fn(&RawExpr) -> bool) -> bool {
+    match c {
+        RawCond::Cmp(a, _, b) => raw_any(a, f) || raw_any(b, f),
+        RawCond::IsNull(a) | RawCond::IsNotNull(a) | RawCond::IsUnknown(a, _) => raw_any(a, f),
+        RawCond::Like(a, ..) | RawCond::Starting(a, ..) | RawCond::Containing(a, ..) | RawCond::Similar(a, ..) => {
+            raw_any(a, f)
+        }
+        RawCond::LikeExpr(a, p, ..)
+        | RawCond::StartingExpr(a, p, ..)
+        | RawCond::ContainingExpr(a, p, ..)
+        | RawCond::SimilarExpr(a, p, ..) => raw_any(a, f) || raw_any(p, f),
+        RawCond::Not(inner) => raw_cond_any(inner, f),
+        RawCond::And(v) | RawCond::Or(v) => v.iter().any(|x| raw_cond_any(x, f)),
+    }
+}
+
+/// The VALUE arms of a conditional node (COALESCE's arguments, NULLIF's
+/// two, IIF's two branches, CASE's results and ELSE); None for any other
+/// node.
+fn raw_value_arms(e: &RawExpr) -> Option<Vec<&RawExpr>> {
+    Some(match e {
+        RawExpr::Coalesce(v) => v.iter().collect(),
+        RawExpr::NullIf(a, b) | RawExpr::Iif(_, a, b) => vec![&**a, &**b],
+        RawExpr::Case(branches, else_, _) => {
+            branches.iter().map(|(_, t)| t).chain(else_.iter().map(|b| &**b)).collect()
+        }
+        _ => return None,
+    })
+}
+
+/// K4 (inside a chunk-new router): does some conditional carry a value
+/// arm that is a bare `?`, or a string function / concatenation straight
+/// over one? With a TEXT slot registered that is the text-fit reading
+/// round 11's refuter found wrong (`IIF(ID = ?, S, ?)`, `COALESCE(TRIM(?),
+/// 'a') = 'b'`): refused, not fitted.
+fn raw_text_arm_param(e: &RawExpr) -> bool {
+    raw_any(e, &text_arm_node)
+}
+
+/// [raw_text_arm_param]'s node test.
+fn text_arm_node(n: &RawExpr) -> bool {
+    let bare_or_over = |a: &RawExpr| match a {
+        RawExpr::Param(_) => true,
+        RawExpr::Func(_, args) => args.iter().any(|x| matches!(x, RawExpr::Param(_))),
+        RawExpr::Concat(x, y) => matches!(**x, RawExpr::Param(_)) || matches!(**y, RawExpr::Param(_)),
+        _ => false,
+    };
+    raw_value_arms(n).is_some_and(|arms| arms.into_iter().any(|a| bare_or_over(a)))
+}
+
+/// K4 (any router): a TRIM over a bare `?` somewhere inside a
+/// conditional's VALUE arm. The previous binary PANICKED on every
+/// non-null bind of it (server.rs:76616, TRIM's missing second operand)
+/// and this chunk's answer misses the engine's text fit on the arm's
+/// CHAR(1) slot (`IIF(ID = 2, TRIM(?), 'a') = 'b'` ['bbbb'] answered none
+/// where the engine cuts to 'b' and answers 2; ['bb'] answered where the
+/// engine raises - round 11's refuter). Refused at prepare.
+fn raw_cond_arm_trim_param(e: &RawExpr) -> bool {
+    // the ONE-operand TRIM over a bare `?` (`TRIM(?)`, `TRIM(LEADING FROM
+    // ?)`) - the shape the previous binary panicked on; a TRIM naming its
+    // characters (`TRIM(' ' FROM ?)`) carried both operands there and was
+    // answered, and keeps answering
+    let trim_param = |n: &RawExpr| {
+        matches!(n, RawExpr::Func(SysFn::Trim(_), args) if matches!(args.as_slice(), [RawExpr::Param(_)]))
+    };
+    raw_any(e, &|n| raw_value_arms(n).is_some_and(|arms| arms.into_iter().any(|a| raw_any(a, &trim_param))))
+}
+
+/// K3: after a chunk-new router registered `fresh`, does one of them read
+/// its text in DOUBLE? Every approximate (DOUBLE / REAL) slot does - an
+/// operand rung, a COALESCE or CAST beside a DOUBLE, a written `CAST(? AS
+/// DOUBLE PRECISION | FLOAT)` in a condition - except `whole`: the one
+/// slot that is a bare `?` as the WHOLE comparison side, measured right
+/// in every round. The engine reads such a text with CVT_get_double's
+/// digit-by-digit accumulation (`? * 1e0 = 1` ['0.9999999999999999'] is a
+/// row there and ['0.99999999999999999'] is not; the correctly rounded
+/// read here answered the opposite, and `DELETE FROM TW WHERE ? + 0e0 =
+/// ID` deleted the row the engine keeps - round 11's refuter).
+fn chunk_new_approx_refuses(sink: &[Option<Descriptor>], fresh: &[usize], whole: Option<usize>) -> bool {
+    fresh.iter().any(|&i| {
+        Some(i) != whole
+            && sink
+                .get(i)
+                .and_then(|d| d.as_ref())
+                .is_some_and(|d| matches!(d.dtype, dtype::DOUBLE | dtype::REAL))
+    })
+}
+
+/// Does the statement text CALL a built-in under an alias or schema
+/// qualifier (`b.IIF(..)`, `b.COALESCE(..)`, `b.ABS(..)`)? The engine
+/// refuses every such call at prepare (*Function unknown "B"."IIF"*);
+/// this parser drops the qualifier and plans the built-in - a leniency the
+/// previous binary shares on `?`-free statements. Round 12 refuses it on
+/// any statement carrying a chunk-new slot, where the previous binary
+/// refused and this chunk answered (`SELECT ID FROM TW b WHERE b.IIF(ID =
+/// ?, 1, 0) = 1` ['1'] -> 1, round 11's refuter).
+fn sql_qualified_builtin_call(sql: &str) -> bool {
+    let up = mask_literals(&sql.to_ascii_uppercase());
+    let b = up.as_bytes();
+    let word = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$' || c == b'"';
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'.' && i > 0 && word(b[i - 1]) {
+            let mut j = i + 1;
+            while j < b.len() && b[j] == b' ' {
+                j += 1;
+            }
+            let start = j;
+            while j < b.len() && word(b[j]) && b[j] != b'"' {
+                j += 1;
+            }
+            let name = &up[start..j];
+            let mut k = j;
+            while k < b.len() && b[k].is_ascii_whitespace() {
+                k += 1;
+            }
+            if !name.is_empty()
+                && k < b.len()
+                && b[k] == b'('
+                && (matches!(name, "IIF" | "COALESCE" | "NULLIF" | "DECODE" | "CAST") || sysfn_named(name).is_some())
+            {
+                return true;
+            }
+            i = j.max(i + 1);
+        } else {
+            i += 1;
+        }
+    }
+    false
+}
+
+/// Which round-12 cap refused (FC_SRV_TRACE only): the gate's re-derived
+/// cells are labelled from this, measured rather than guessed.
+fn cap_note(k: &str) {
+    if trace_on() {
+        eprintln!("[srv] R12 cap {k}");
+    }
+}
+
+/// Does a statement's input carry a chunk-new slot?
+fn has_chunk_new<'a>(ds: impl IntoIterator<Item = &'a Descriptor>) -> bool {
+    ds.into_iter().any(|d| d.flags & PARAM_CHUNK_NEW != 0)
+}
+
+/// K4's slot test: did the router register a TEXT slot?
+fn chunk_new_text_slot(sink: &[Option<Descriptor>], fresh: &[usize]) -> bool {
+    fresh.iter().any(|&i| {
+        sink.get(i)
+            .and_then(|d| d.as_ref())
+            .is_some_and(|d| matches!(d.dtype, dtype::TEXT | dtype::VARYING))
+    })
+}
+
+/// THE ONE RULE FOR THE INT ARM'S COEFFICIENT GATE (round 5's
+/// `CAST(text AS INTEGER)` law: the text's digits must fit the TARGET's
+/// width before it rounds). It runs for exactly two kinds of cast:
+///
+///   * a CAST THE STATEMENT WROTE - a real charset id below
+///     [CS_IMPLICIT_FLOOR] (`CAST(? AS INTEGER)` ['4.999999999999'] and
+///     `CAST('2.0000000000000000001' AS INTEGER)` raise like the engine);
+///   * a comparison operand rung ([CS_OPERATOR_READ], [CS_MUL_I64]) -
+///     built only by [resolve_cmp_param_side], on a comparison shape the
+///     previous binary REFUSED ENTIRELY (a `?` inside arithmetic on a
+///     compare side, a condition's `?`), so it has no previous reading to
+///     keep, and the ungated read would be a NEW wrong answer there: `? +
+///     1 = N` ['1.9999999999999999999'] raises on the engine and here,
+///     where the int128 read answers a row.
+///
+/// EVERY OTHER CAST THE STATEMENT DID NOT WRITE reads the text EXACTLY
+/// AS THE PREVIOUS BINARY'S INT ARM READ IT (the grammar, rounded at
+/// int128, then fitted - no gate): a value position ([CS_SLOT_CAST]), a
+/// direct operand ([CS_SLOT_OPERAND]), a MERGE marker, a trigger view's
+/// generated `CAST(? AS t)`, a LAG default, a computed column's own
+/// `blr_cast` ([CS_COMPUTED_UTF8] / [CS_COMPUTED_CARRIER] - the previous
+/// binary gated none). Round 10: nine rounds of value laws at IMPLICIT
+/// positions each regressed a shape elsewhere - the last was a value arm
+/// beside a WIDER sibling (`UPDATE T SET N = IIF(ID = 1, ?, BI)`
+/// ['4.999999999999'], which the engine reads at the sibling-reconciled
+/// INT64 and stores 5, raised here at the destination's LONG) - so the
+/// implicit positions no longer carry the law at all, and the
+/// regression class is gone by construction rather than by census. Where
+/// the gate was right at such a position (`SET N = IIF(ID = 1, ?, N)`
+/// ['4.999999999999'] raises on the engine), the previous binary's
+/// answer is back, recorded as pre-existing.
+fn int_cast_gates_coefficient(cs: u8) -> bool {
+    match cs {
+        CS_OPERATOR_READ | CS_MUL_I64 => true,
+        c => c < CS_IMPLICIT_FLOOR,
+    }
+}
+
+/// A COMPUTED COLUMN's own `blr_cast` to its declared INTEGER-family
+/// type, over a source whose 22018 spells in UTF8 ([err_spell_charset]
+/// answered CS_UTF8): not a cast the statement wrote, so the Int arm
+/// reads its text as the previous binary did ([int_cast_gates_coefficient];
+/// `INTEGER COMPUTED BY (S)` over '4.999999999999' is 5 on the previous
+/// binary, *out of range* on the engine - recorded, round 10).
+/// [conv_err] spells it as UTF8.
+const CS_COMPUTED_UTF8: u8 = 0xF0;
+/// The same over a BYTE-CARRIER source (NONE / OCTETS / ASCII - one
+/// spelling, [fire_crab_ods::intl::carrier_encode]); [conv_err] spells it
+/// as NONE. A TABLED single-byte source keeps its real charset id, since
+/// its 22018 needs that table - and with it the gate, the engine's read.
+const CS_COMPUTED_CARRIER: u8 = 0xF1;
+
+/// The stamp of a computed column's `blr_cast` ([build_projcols],
+/// [resolve_expr_inner]): the spelling charset `cs`, moved above
+/// [CS_IMPLICIT_FLOOR] for an exact target (INTEGER family, NUMERIC)
+/// where the spelling survives the move (UTF8, a byte carrier) - so the
+/// Int arm's coefficient gate and the NUMERIC arm's exponent read, both
+/// this chunk's, stay off it as they were on the previous binary. A
+/// DOUBLE target keeps `cs` (neither law reaches it).
+fn computed_cast_stamp(t: &CastTarget, cs: u8) -> u8 {
+    use fire_crab_ods::intl;
+    match t {
+        CastTarget::Int { .. } | CastTarget::Numeric { .. } if cs == intl::CS_UTF8 => CS_COMPUTED_UTF8,
+        CastTarget::Int { .. } | CastTarget::Numeric { .. } if intl::byte_carrier(cs) => CS_COMPUTED_CARRIER,
+        _ => cs,
+    }
+}
+
+/// Is a (possible) cast target one of the numeric ones an implicit slot
+/// cast is stamped on ([CS_SLOT_CAST] / [CS_SLOT_OPERAND])? A text,
+/// blob or temporal target reads its stamp as a real character set.
+fn t_is_numeric(t: &Option<CastTarget>) -> bool {
+    matches!(t, Some(CastTarget::Int { .. } | CastTarget::Numeric { .. } | CastTarget::Approx))
+}
+
+/// A direct operand's implicit slot cast takes [CS_SLOT_OPERAND].
+fn slot_operand(e: Expr) -> Expr {
+    match e {
+        Expr::Cast(x, t, CS_SLOT_CAST) => Expr::Cast(x, t, CS_SLOT_OPERAND),
+        other => other,
+    }
+}
+
+/// The charset stamp of the two OPERAND RUNGS of a comparison side's `? *
+/// ?` under a 2- or 4-byte exact slot ([resolve_cmp_param_side]). Both
+/// `?` are described at the slot's width, so the engine's
+/// DSC_multiply_result takes its INT64 branch (neither compile-time
+/// operand is INT64 or wider) and multiplyDialect3 raises *Integer
+/// overflow* when the i64 product overflows: `? * ? = 4` [3037000500,
+/// 3037000500] raises on the engine where the i128 product here answered
+/// no row (round 8, Q3; [3037000499, 3037000499] is none on both). [Expr::eval]'s multiply arm reads the stamp on BOTH
+/// operands; [conv_err] reads it as UTF8, like [CS_SLOT_CAST].
+const CS_MUL_I64: u8 = 0xFC;
+
+/// The charset stamp of a bare `?` argument of a COALESCE whose
+/// reconciled sibling type is TEXT ([resolve_dest_param_expr]'s Coalesce
+/// arm): a SYNTHETIC `CAST(? AS VARCHAR(n))` that converts nothing - the
+/// value passes through untouched - and only CHECKS the length. The
+/// engine moves the bound text into the described CHAR(n)/VARCHAR(n)
+/// when the COALESCE is evaluated, so a text whose non-blank characters
+/// run past `n` is 22001 *string right truncation* (`expected n, actual
+/// <its length>`): `IIF(ID = 2, COALESCE(?, 'x'), 0) = 2` ['2.5'] raises
+/// where this answered no row, while ['2 '] answers 2 and a branch never
+/// evaluated raises nothing (`IIF(ID = 99, ..)`, measured). Round 8, Q4.
+/// Synthetic, so [text_form] measures through it to the `?` exactly as
+/// before; [Expr::eval]'s Cast arm returns before any conversion.
+const CS_TEXT_FIT: u8 = 0xFB;
+
+/// THE ENGINE'S ALIGNMENT CHECK ON THE OTHER SIDE OF A WHOLE-SIDE TEXT
+/// COMPARE (round 11, W2). The engine compares a text with an exact
+/// number by first classing the text (cvt.cpp `CVT_get_numeric`, via
+/// cvt2.cpp `cmp_numeric_string`): digits that fit its INT64
+/// accumulator are an int64 at the text's own scale, digits that outrun
+/// it are re-read as an INT128 ([engine_cmp_class]). Both operands are
+/// then ALIGNED to the finer of the two scales in that width, and an
+/// operand that leaves the width raises *numeric value is out of range*
+/// - the COLUMN's value included, row by row: `IIF(N = ?, 1, 0)` bound
+/// '1.' + 38 zeros (int128 at scale -38) answers row 1 and raises on
+/// row 2 (2 x 10^38 leaves int128), '0.5' + 18 zeros (int64 at scale
+/// -19) raises on every non-zero row, while '2.' + 38 zeros (past int128:
+/// a decimal128) compares on both (measured 2026-09-19, the W2 matrix).
+/// A SYNTHETIC `CAST(<other side> AS NUMERIC(w, -scale))` stamped with
+/// this: it converts nothing - the value passes through untouched, so
+/// the comparison's value law is unchanged - and only CHECKS that the
+/// value, aligned to the target's scale, fits the target's 8- or
+/// 16-byte width ([cmp_align_check]). NULL passes (the engine never
+/// compares it).
+const CS_CMP_ALIGN: u8 = 0xF2;
+
+/// The text-side twin of [CS_CMP_ALIGN]: the TEXT's own alignment to the
+/// other side's finer scale leaves the class width (`IIF(NM = ?, 1, 0)`
+/// bound '1' + 38 zeros + 'e0' - an int128 at scale 0 read through the
+/// exponent - raises: x 100 leaves int128), so every comparison against a
+/// NON-NULL value raises; a NULL one is never compared and raises
+/// nothing. Stamped on the same synthetic cast over the other side.
+const CS_CMP_RAISE: u8 = 0xF3;
+
+/// The rung a `?` that is a WHOLE comparison side (`IIF(ID = ?, ..)`,
+/// `? = 2.5` in a condition, `-? = ID`, `ID = -(-?)`) becomes: typed for
+/// [cmp_sides] exactly like [cmp_param_rung]'s, but STAMPED
+/// [CS_WHOLE_SIDE] on an exact or text slot so the bind can tell it from
+/// an arithmetic operand's rung and from a user's own `CAST(? AS
+/// BIGINT)`. THE ENGINE NEVER CONVERTS A WHOLE-SIDE BIND INTO THE
+/// DESCRIBED SLOT: the slot tells the client what to send, and the
+/// compare then reads the client's value whole (measured 2026-09-18 on
+/// clean fixtures: `WHERE IIF(ID = ?, 1, 0) = 1 ['2.4']` -> none, `SELECT
+/// IIF(? = 2.5, 1, 0) ['2.45']` -> 0;0;0, `IIF(NM = ?, 1, 0) = 1
+/// ['7.245']` -> none, `IIF(BI = ?, 1, 0) = 1 ['8.5']` -> none, `-? = ID
+/// ['-2.4']` -> none, `-? < 2 ['-1.5']` -> 1;2;3, `HAVING -? = SUM(ID)
+/// ['-4.5']` -> none, and `IIF(ID = ?, 1, 0) = 1 ['0x2']` raises
+/// *conversion error from string "0x2"* - where the exact-slot CAST
+/// rounded every one of them and answered a row, and `DELETE FROM T WHERE
+/// -? = ID ['-2.4']` deleted row 2). [bind_whole_side] is the bind; the
+/// classic bare `ID = ?` ([Term::ExprParam] and its bind_literal) already
+/// agreed with the engine on these binds. A DOUBLE/REAL slot is stamped
+/// the same way: the compare grammar reads a whole-side text there too
+/// (`IIF(D = ?, 1, 0) = 1` bound '1 2', '- 2.5', '0X2', '1e400' -> no row
+/// and `= 0` -> 1;2;3, '0x2' / '2.5x' / '' / 'abc' raise, ' 2.5 ' and
+/// '2 .5' take the 2.5 row - the same spellings the classic bare `D = ?`
+/// answers, measured 2026-09-18), where the evaluated `CAST(? AS DOUBLE
+/// PRECISION)` this took before raised *conversion error* on the first
+/// four. A TEMPORAL slot is stamped too and bound at the MESSAGE's own
+/// type ([bind_whole_side_temporal]): node-firebird sends every string
+/// bound into a described DATE / TIME / TIMESTAMP slot as a blr_timestamp
+/// (lib/wire/connection.js PrepareParams -> SQLParamDate, xsqlvar.js
+/// calcBlr), and the engine compares the column against THAT timestamp
+/// (cvt2.cpp CVT2_compare converts the narrower temporal to the wider: a
+/// DATE to the timestamp at midnight, a TIME to the timestamp with the
+/// CURRENT date) - where the evaluated `CAST(? AS DATE)` this took
+/// before truncated the time part first. Measured 2026-09-19 on
+/// cmpfix4: `IIF(DT = ?, 1, 0) = 1 ['2024-01-10 12:30:00']` -> no row
+/// (the cast answered 1), `= 0` -> 1;2;3, `IIF(DT < ?..)` -> 1, `IIF(DT
+/// > ?..)` -> 2;3, `IIF(DT <> ?..)` -> 1;2;3, `['2024-01-10 00:00:00']`
+/// and `['2024-01-10']` -> 1 (midnight agrees either way); `IIF(TM = ?,
+/// 1, 0) = 1 ['2024-01-10 12:30:00']` -> no row, `IIF(TM > ?..)` ->
+/// 1;2;3 and `IIF(TM < ?..)` -> no row (every TIME row sits on today's
+/// date, past 2024), `IIF(TM <> ?..)` -> 1;2;3, and `IIF(TSC = ?..)` on
+/// a TIMESTAMP column -> 2 unchanged; the DML twins (`UPDATE .. WHERE
+/// IIF(DT = ?, 1, 0) = 1` leaves the rows, `DELETE` deletes none, `WHERE
+/// IIF(DT < ?..)` updates row 1, `UPDATE TS .. WHERE IIF(TM > ?..)` every
+/// row) follow. A BOOLEAN slot keeps the plain evaluated cast, which
+/// measured right (`IIF(? = TRUE, ..)`).
+fn whole_side_rung(i: usize, slot: &Descriptor) -> Option<Expr> {
+    // A TIME slot INSIDE A SUBQUERY BODY refuses at prepare. node-firebird
+    // binds every string into a TIME slot as a blr_timestamp message; the
+    // outer whole side promotes it per row ([bind_whole_side_temporal],
+    // [value_cmp]'s (Time, Timestamp) arm), but the body's bind must be
+    // SPELLED as a literal the inner planner takes, and a TIME column
+    // against a TIMESTAMP literal is a prepare refusal there (recorded:
+    // `TM = TIMESTAMP '..'` refuses on both binaries). Round 4 prepared
+    // `ID IN (SELECT b.ID FROM TS b WHERE IIF(b.TM = ?, 1, 0) = 1)` with
+    // the right describe and failed at execute with *Dynamic SQL Error*
+    // where the engine answers 1 and the previous binary refused at
+    // prepare - prepare-then-fail is worse than either. The classic bare
+    // `b.TM = ?` body is not this rung and keeps its pre-existing path.
+    if slot.dtype == dtype::SQL_TIME && CORR_INNER_PLAN.with(|c| c.get()) {
+        return None;
+    }
+    // an EXACT slot inside a subquery body is remembered for the body's
+    // bind ([CORR_WHOLE_EXACT], round 11)
+    if matches!(slot.dtype, dtype::SHORT | dtype::LONG | dtype::INT64) && CORR_INNER_PLAN.with(|c| c.get()) {
+        CORR_WHOLE_EXACT.with(|c| c.borrow_mut().push(i));
+    }
+    Some(match cmp_param_rung(i, slot)? {
+        Expr::Cast(
+            p,
+            t @ (CastTarget::Int { .. }
+            | CastTarget::Numeric { .. }
+            | CastTarget::Text { .. }
+            | CastTarget::Approx
+            | CastTarget::Float
+            | CastTarget::Temporal(_)),
+            _,
+        ) => Expr::Cast(p, t, CS_WHOLE_SIDE),
+        other => other,
+    })
+}
+
+/// A whole-side NUMERIC or TEMPORAL rung under any number of unary
+/// minuses: (slot index, minus count). The [cmp_sides] wrappers never
+/// sit on a numeric side, so nothing else is looked through. (A temporal
+/// side never carries a minus - [resolve_cmp_param_side] refuses the
+/// negation of a non-arithmetic slot - so its count is always 0.)
+fn whole_side_exact(e: &Expr) -> Option<(usize, u32)> {
+    match e {
+        Expr::Neg(a) => whole_side_exact(a).map(|(i, n)| (i, n + 1)),
+        Expr::Cast(
+            inner,
+            CastTarget::Int { .. }
+            | CastTarget::Numeric { .. }
+            | CastTarget::Approx
+            | CastTarget::Float
+            | CastTarget::Temporal(_),
+            CS_WHOLE_SIDE,
+        ) => {
+            match **inner {
+                Expr::Param(i) => Some(i),
+                _ => None,
+            }
+            .map(|i| (i, 0))
+        }
+        _ => None,
+    }
+}
+
+/// A whole-side TEXT rung under the [cmp_sides] text wrappers (a
+/// CarrierEnc, OctKey, CollKey, CollCanon or Collate): the slot index.
+fn whole_side_text(e: &Expr) -> Option<usize> {
+    match e {
+        Expr::CarrierEnc(a, _)
+        | Expr::OctKey(a, _)
+        | Expr::CollKey(a, _)
+        | Expr::CollCanon(a, _, _)
+        | Expr::Collate(a, _) => whole_side_text(a),
+        Expr::Cast(inner, CastTarget::Text { .. }, CS_WHOLE_SIDE) => match **inner {
+            Expr::Param(i) => Some(i),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Strip the [cmp_sides] text wrappers off a side: the bare expression,
+/// and the charset a CarrierEnc named for it (None when nothing did).
+fn peel_text_wrap(e: &Expr) -> (&Expr, Option<u8>) {
+    match e {
+        Expr::CarrierEnc(a, cs) => (peel_text_wrap(a).0, Some(*cs)),
+        Expr::OctKey(a, _) | Expr::CollKey(a, _) | Expr::CollCanon(a, _, _) | Expr::Collate(a, _) => {
+            peel_text_wrap(a)
+        }
+        other => (other, None),
+    }
+}
+
+/// THE BIND OF A WHOLE-SIDE EXACT RUNG ([whole_side_rung]): the client's
+/// value whole, at the driver's own scale, under `negs` unary minuses -
+/// never converted into the slot.
+///  * an integer or scaled bind is its literal (`IIF(ID = ?, 1, 0) [2]`
+///    takes the 2 row, `-? = ID [-2]` -> 2);
+///  * a TEXT bind is read PER ROW with the engine's COMPARE grammar
+///    ([Expr::TextNum], the lenient one), so a fraction compares at full
+///    precision. Measured against the bare `ID = ?` spelling by
+///    spelling, and the two agree on every one: ' 2', '2 ', '+2', '2.',
+///    '2.0' and '2e0' take the 2 row; '1 2' is 12 and '- 2' is -2 (no row,
+///    no raise); '0X2' is the hex garbage path (no row); '0x2' and 'x'
+///    raise *conversion error from string*;
+///  * a NEGATED text bind is a DOUBLE: the engine's negate converts the
+///    text with CVT_get_double, whose grammar refuses what the compare
+///    grammar takes (`-? = ID` bound '1 2', '- 2' and '0X2' all raise
+///    where the bare `ID = ?` answers no row; ' 2', '2 ' and '2e0'
+///    convert to -2) - the evaluated `CAST(<text> AS DOUBLE PRECISION)`
+///    is that grammar, per row;
+///  * a DOUBLE bind (a driver's JS fraction) compares as the double it is
+///    (`IIF(ID = ?, 1, 0) = 1 [2.4]` -> none, `[2.0]` -> 2), where the
+///    exact-slot cast rounded it to the 2 row;
+///  * an integer bind from a 4-byte message keeps its width under the
+///    minuses ([param_to_expr_msg]: `-? = ID [-2147483648]` raises
+///    *Integer overflow* like the engine's negate, `[-2147483649]` from
+///    an 8-byte message answers no row);
+///  * NULL is the UNKNOWN compare.
+/// The same bind serves a DOUBLE/REAL slot ([whole_side_rung]).
+fn bind_whole_side(i: usize, negs: u32, _slot_scale: i8, args: &[WireParam]) -> Option<Expr> {
+    use fire_crab_ods::intl::CS_UTF8;
+    let arg = args.get(i)?;
+    let v = match arg {
+        WireParam::Null => Expr::Null,
+        WireParam::Text(s) | WireParam::TextCs(s, _) => {
+            let cs = match arg {
+                WireParam::TextCs(_, c) => *c,
+                _ => CS_UTF8,
+            };
+            if negs > 0 {
+                Expr::Cast(Box::new(Expr::Str(s.clone())), CastTarget::Approx, cs)
+            } else {
+                // (the scaled-slot overflow class of an EXACT slot - the
+                // text's alignment to the slot's scale leaving its class
+                // width - is [whole_side_text_overflows], raised by the
+                // comparison's bind, [bind_whole_side_exact_cmp], against
+                // a non-null other side only, as the engine raises it;
+                // round 11 moved it off this per-row literal, which
+                // raised against a NULL too and read the class from the
+                // value's magnitude rather than the engine's accumulator)
+                Expr::TextNum(Box::new(Expr::Str(s.clone())), cs)
+            }
+        }
+        _ => param_to_expr_msg(i, args)?,
+    };
+    Some((0..negs).fold(v, |e, _| Expr::Neg(Box::new(e))))
+}
+
+/// THE BIND OF A WHOLE-SIDE TEMPORAL RUNG ([whole_side_rung]): the
+/// client's value at the MESSAGE's own type, so the compare promotes the
+/// narrower side the way the engine's CVT2_compare does ([value_cmp]: a
+/// DATE against a TIMESTAMP reads as midnight, a TIME against a
+/// TIMESTAMP takes the CURRENT date) instead of the slot's CAST
+/// truncating the message into the slot first. A TIMESTAMP message is
+/// its literal whatever the slot (the node-firebird case for every
+/// string bound into a DATE / TIME / TIMESTAMP slot); a DATE message
+/// into a TIMESTAMP slot is midnight (the classic [Term::ExprParam]
+/// bind's rule); the matching message type is its literal; a TIME
+/// message into a TIMESTAMP slot is its literal (promoted per row); a
+/// DATE message into a TIME slot, or a TIME one into a DATE slot, has no
+/// measured compare and refuses the bind; a TEXT value keeps the
+/// evaluated cast into the slot (the engine's text-to-temporal
+/// conversion), as does anything else, and NULL is the UNKNOWN compare.
+fn bind_whole_side_temporal(i: usize, kind: TKind, cs: u8, args: &[WireParam]) -> Option<Expr> {
+    let arg = args.get(i)?;
+    let cast = |e: Expr| Expr::Cast(Box::new(e), CastTarget::Temporal(kind), cs);
+    Some(match (kind, arg) {
+        (_, WireParam::Null) => Expr::Null,
+        (_, WireParam::Timestamp(d, t)) => Expr::TsLit(*d, *t),
+        (TKind::Date, WireParam::Date(d)) => Expr::DateLit(*d),
+        (TKind::Timestamp, WireParam::Date(d)) => Expr::TsLit(*d, 0),
+        (TKind::Time | TKind::Timestamp, WireParam::Time(t)) => Expr::TimeLit(*t),
+        (TKind::Time, WireParam::Date(_)) | (TKind::Date, WireParam::Time(_)) => return None,
+        (_, WireParam::Text(s) | WireParam::TextCs(s, _)) => cast(Expr::Str(s.clone())),
+        (_, other) => cast(param_to_expr(other)?),
+    })
+}
+
+/// A NUMBER BOUND INTO A WHOLE-SIDE TEXT RUNG: the OTHER side converts
+/// per row, the way the classic `S = ? [2]` ([Term::ExprParam]'s TextNum
+/// wrap) does - the engine reads the column's text as a number and raises
+/// *conversion error from string "ab"* (`IIF(S = ?, 1, 0) = 1 [2]`,
+/// measured; the text rung compared 'ab' = '2' AS TEXT and answered no
+/// row). The [cmp_sides] text wrappers come off both sides, since the
+/// comparison is numeric now. None when neither side is a whole-side
+/// text rung or the bind is text/NULL (the rung's own collapse in
+/// [subst_params_expr] handles those); Some(None) is a bind error.
+fn bind_whole_side_text_cmp(
+    a: &Expr,
+    op: Cmp,
+    b: &Expr,
+    args: &[WireParam],
+) -> Option<Option<Cond2>> {
+    use fire_crab_ods::intl::CS_UTF8;
+    let (rung_left, i) = match (whole_side_text(a), whole_side_text(b)) {
+        (Some(i), _) => (true, i),
+        (None, Some(i)) => (false, i),
+        (None, None) => return None,
+    };
+    let lit = match args.get(i) {
+        None => return Some(None),
+        Some(WireParam::Int(v, 0)) => Expr::Int(*v),
+        Some(WireParam::Int(v, s)) => Expr::Dec(*v, *s),
+        Some(WireParam::Double(d)) => Expr::Double(*d),
+        Some(WireParam::Single(f)) => Expr::Double(*f as f64),
+        Some(_) => return None,
+    };
+    let (base, cs) = peel_text_wrap(if rung_left { b } else { a });
+    let Some(base) = subst_params_expr(base, args) else { return Some(None) };
+    let coerced = Expr::TextNum(Box::new(base), cs.unwrap_or(CS_UTF8));
+    Some(Some(if rung_left {
+        Cond2::Cmp(Box::new(lit), op, Box::new(coerced))
+    } else {
+        Cond2::Cmp(Box::new(coerced), op, Box::new(lit))
+    }))
+}
+
+/// Does a TEXT bound into a whole-side EXACT rung of scale `slot_scale`
+/// raise on the TEXT's own alignment? The engine aligns both operands to
+/// the finer scale in the text's class width ([engine_cmp_class]); when
+/// the text's scale is the coarser one, the TEXT is scaled up, and a
+/// mantissa that leaves the width raises *numeric value is out of range*
+/// against every non-null value (`IIF(NM = ?, 1, 0)` bound
+/// '99999999999999999' or '1' + 38 zeros + 'e0' raises; '1' + 39 zeros
+/// is a decimal128 and compares - measured 2026-09-19).
+fn whole_side_text_overflows(s: &str, slot_scale: i8) -> bool {
+    let Some((wide, m, st)) = engine_cmp_class(s) else { return false };
+    let k = st - slot_scale as i32;
+    if k <= 0 || m == 0 {
+        return false;
+    }
+    let limit: i128 = if wide { i128::MAX } else { i64::MAX as i128 };
+    !10i128
+        .checked_pow(k as u32)
+        .and_then(|p| m.checked_mul(p))
+        .is_some_and(|x| x <= limit && x >= -limit)
+}
+
+/// THE BIND OF A COMPARISON WITH A WHOLE-SIDE EXACT RUNG BOUND TO A TEXT
+/// (round 11, W2): the engine's ALIGNMENT RAISE, placed where the engine
+/// raises it - in the compare, against a non-null other side, row by row.
+/// The text keeps its compare-grammar value ([Expr::TextNum], the value
+/// law unchanged); the OTHER side is wrapped in a synthetic check cast:
+///  * [CS_CMP_ALIGN] when the text's scale is the FINER one - the other
+///    side's value, aligned to it in the text's class width, must fit
+///    (`IIF(N = ?, 1, 0)` ['1.' + 38 zeros] -> row 1 answers, row 2
+///    raises; ['0.5' + 18 zeros] raises on every non-zero row);
+///  * [CS_CMP_RAISE] when the TEXT's own alignment leaves its width
+///    ([whole_side_text_overflows]).
+/// None for every other pair - a non-text bind, a text of the double /
+/// decimal128 class, a text at the slot's own scale - which keeps the
+/// ordinary side-by-side bind. A NEGATED rung never reaches here (round
+/// 11 refuses it at prepare).
+fn bind_whole_side_exact_cmp(a: &Expr, op: Cmp, b: &Expr, args: &[WireParam]) -> Option<Option<Cond2>> {
+    use fire_crab_ods::intl::CS_UTF8;
+    let rung = |e: &Expr| -> Option<(usize, i8)> {
+        match e {
+            Expr::Cast(inner, t @ (CastTarget::Int { .. } | CastTarget::Numeric { .. }), CS_WHOLE_SIDE) => {
+                let Expr::Param(i) = **inner else { return None };
+                let scale = match t {
+                    CastTarget::Numeric { scale, .. } => *scale,
+                    _ => 0,
+                };
+                Some((i, scale))
+            }
+            _ => None,
+        }
+    };
+    let (rung_left, i, slot_scale) = match (rung(a), rung(b)) {
+        (Some((i, sc)), _) => (true, i, sc),
+        (None, Some((i, sc))) => (false, i, sc),
+        (None, None) => return None,
+    };
+    let (s, cs) = match args.get(i) {
+        Some(WireParam::Text(s)) => (s, CS_UTF8),
+        Some(WireParam::TextCs(s, c)) => (s, *c),
+        _ => return None,
+    };
+    let (wide, _, st) = engine_cmp_class(s)?;
+    let stamp = if whole_side_text_overflows(s, slot_scale) {
+        (CS_CMP_RAISE, slot_scale)
+    } else if st < slot_scale as i32 {
+        (CS_CMP_ALIGN, i8::try_from(st).ok()?)
+    } else {
+        return None;
+    };
+    let other = if rung_left { b } else { a };
+    let Some(other) = subst_params_expr(other, args) else { return Some(None) };
+    let checked = Expr::Cast(
+        Box::new(other),
+        CastTarget::Numeric { scale: stamp.1, bytes: if wide { 16 } else { 8 }, sub_type: 0 },
+        stamp.0,
+    );
+    let text = Expr::TextNum(Box::new(Expr::Str(s.clone())), cs);
+    Some(Some(if rung_left {
+        Cond2::Cmp(Box::new(text), op, Box::new(checked))
+    } else {
+        Cond2::Cmp(Box::new(checked), op, Box::new(text))
+    }))
+}
+
+thread_local! {
+    /// TRUE while [corr_register] plans a SUBQUERY BODY's stand-in text
+    /// for its `?` descriptors - the one planning whose parameter binds
+    /// are later SPELLED into SQL ([subst_prm_markers]) rather than
+    /// evaluated, so a rung that cannot be spelled refuses here rather
+    /// than at execute ([whole_side_rung]'s TIME arm).
+    static CORR_INNER_PLAN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The INNER slots a subquery body's plan typed as whole-side EXACT
+    /// rungs ([whole_side_rung] pushes them while [CORR_INNER_PLAN] is
+    /// set); [corr_register] collects them around its one inner plan and
+    /// marks those slots' descriptors [PARAM_WHOLE_EXACT] for the bind
+    /// ([corr_whole_exact_raise], round 11).
+    static CORR_WHOLE_EXACT: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// THE HAVING SLOTS A MULTIPLY MAY SIZE, filled by [resolve_having]
+    /// for the one [resolve_expr_term] call that reads them and cleared
+    /// after it: the synthetic group-row column name of each aggregate
+    /// fold that is on [mul_sibling_width]'s whitelist, with its BLR
+    /// width. A HAVING sibling reaches the width helper as a bare
+    /// column of the synthetic view (`\0agg<n>`, [agg_slot_name]) whose
+    /// descriptor cannot say what fold made it (a `MIN(1.5)` slot and a
+    /// `COUNT(*)` slot both carry a synthetic INT64), so the whitelist
+    /// decision is taken where the fold is known and handed over here.
+    static HAVING_MUL_WIDTHS: std::cell::RefCell<Vec<(String, u8)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Is `d` the descriptor of a STORED FIELD of a base table - decoded
+/// from the relation's format - rather than a synthetic one? A record
+/// image starts with the null bitmap, `FLAG_BYTES(n)` of it (val.h:42
+/// with BITS_PER_LONG 32: at least 4 bytes, [fire_crab_ods::format::
+/// flag_bytes]), so a stored field's offset is never below 4; every
+/// descriptor this server makes up sits at offset 1 (a derived table's,
+/// a view's or a CTE's column - [desc_of_projcol] - and a group-row
+/// fold slot - [agg_result_desc]) or 0 (a COMPUTED BY column,
+/// [is_computed_fid]).
+fn desc_is_stored_field(d: &Descriptor) -> bool {
+    d.offset >= 4
+}
+
+/// THE WHITELIST OF SIBLING SHAPES A MULTIPLY'S SIDE RULE MAY SIZE, and
+/// the BLR width of each: `Some(width)` for a shape on the list, `None`
+/// for everything else - and None makes the `*` REFUSE at prepare
+/// ([arith_operand_rung]).
+///
+/// WHY A WHITELIST AND NOT A TABLE. The rounded operand of `*` under a
+/// SHORT/LONG slot is decided by the SIBLING's BLR-level width
+/// (DSC_multiply_result picks the int128 branch iff either compile-time
+/// operand is INT64 or wider, and multiplyDialect3's two branches read
+/// the operands in opposite order), which is NOT the DSQL width the
+/// projection describes and [result_width_bytes] answers. Three refuter
+/// rounds of 2026-09-18 each found a new sibling shape whose BLR width
+/// an open-ended table got wrong: a scaled decimal literal (blr_long
+/// while DSQL says INT64), ABS over a SHORT (makeAbs: SHORT -> LONG,
+/// LONG -> INT64, where the table said 8 for every exact operand), and
+/// a derived-table / CTE / view column carrying a literal (the outer
+/// query sees the inner projection's DSQL describe, INT64, while the
+/// engine's multiply sees the inner expression's blr_long) - each one a
+/// WRONG ANSWER, and for UPDATE / DELETE / INSERT .. SELECT the wrong
+/// rows mutated. A table that sizes "everything else" by a default is
+/// wrong for every shape nobody measured; a whitelist is wrong for
+/// nothing and refuses the rest, which the previous committed binary
+/// refused too (it answered no `?`-in-arithmetic shape at all).
+///
+/// THE LIST, each entry proven on the live engine on 2026-09-19 (clean
+/// fixture cmpfix4, `SELECT ID FROM T WHERE ? * <sib> <> CAST(0.0 AS
+/// NUMERIC(9,1)) ['0.4']` under the LONG slot and `.. NUMERIC(4,1)` under
+/// the SHORT slot, in BOTH operand orders: a NARROW sibling makes the
+/// LEFT `?` round to 0 - `? * <sib>` answers no row and `<sib> * ?`
+/// answers 1;2;3 - and a WIDE one makes the RIGHT `?` round - the other
+/// way round; scratchpad W.out / W2.out hold every row):
+///  (a) a BASE-TABLE column, at its own stored width - ID, NM, N, NN
+///      (LONG) and SM (SHORT) narrow, BI and N18 (INT64) wide, also as
+///      a JOIN side's column (`a.ID` narrow, `b.BI` wide) and as a GROUP
+///      BY key in HAVING (`? * ID` narrow, `? * BI` wide). NOT a
+///      derived-table, CTE or view column ([desc_is_stored_field]): `d.L`
+///      over `(SELECT ID, 1.5 AS L FROM T) d`, `q.L` of a CTE, `V.L` /
+///      `V.C` / `V.R` of a view are narrow on the engine while their
+///      describe is INT64, and `d.NM` / `V.ID` only agree by
+///      coincidence - every one of them is None;
+///  (b) an INTEGER literal: 2 and 2147483647 narrow, 2147483648 and
+///      3000000000 wide (4 when it fits i32, else 8);
+///  (c) a SCALED DECIMAL literal: 1.5, 0.25, 1.50000, 214748364.7 narrow,
+///      214748364.8 and 99999.99999 wide (4 when the UNSCALED integer
+///      fits i32 - gen.cpp GEN_constant emits blr_long for it while
+///      make.cpp MAKE_const_sint64 describes it INT64 - else 8); under
+///      unary minuses the SIGNED value decides: -1.5, -(1.5), - -1.5,
+///      -2, -0.25, -2147483648 and -214748364.8 narrow, -3000000000 and
+///      -99999.99999 wide (W2.out);
+///  (d) an explicit CAST to an exact type, at the TARGET's width:
+///      CAST(ID AS SMALLINT), CAST(2 AS SMALLINT), CAST(1.5 AS
+///      NUMERIC(9,1)), CAST(1.5 AS NUMERIC(4,1)), CAST(NM AS INTEGER)
+///      narrow; CAST(1.5 AS NUMERIC(18,1)), CAST(ID AS BIGINT) wide
+///      (CAST(1.5 AS INT128) measured wide too, though an INT128 sibling
+///      refuses earlier for its type);
+///  (e) another direct `?`, at the slot's own width - handled by the
+///      caller ([arith_operand_rung] passes no sibling shape for it):
+///      `? * ? <> CAST(0.0 AS NUMERIC(9,1))` ['0.4', '1'] no row and
+///      ['1', '0.4'] 1;2;3 (the left rounds under LONG and SHORT),
+///      `<> 0.0` the other way round (the right rounds under INT64);
+///  (f) in HAVING ([HAVING_MUL_WIDTHS]): COUNT(*), COUNT(ID), COUNT(DISTINCT
+///      ID), SUM and AVG over ID / NM / BI / SM are 8 (all wide, SUM(SM)
+///      and AVG(SM) included), MIN / MAX over a BASE column at the
+///      column's width (MIN(ID), MAX(NM), MAX(N), MIN(SM), MAX(SM) narrow;
+///      MIN(BI), MIN(N18) wide); MIN(1.5), MIN(CAST(ID AS SMALLINT)),
+///      MAX(ID + 0), MIN(d.L) are not on the list;
+///  (g) parentheses around any of these - (1.5), (2), (-1.5), ((ID)),
+///      (BI), (CAST(ID AS SMALLINT)) - which the parse does not even keep.
+/// Measured on the same run and REFUSED by design (`prev` = the previous
+/// committed binary refused every one of them too): every function -
+/// ABS(ID) wide but ABS(CAST(ID AS SMALLINT)) narrow, SIGN(ID) narrow,
+/// SIGN(D) narrow (and unevaluable before this round), MOD(ID, 2) narrow,
+/// ROUND(1.5), TRUNC(1.5), ROUND(NM, 1) narrow, EXTRACT(YEAR FROM DT)
+/// and CHAR_LENGTH(S) narrow, CEIL(ID) and FLOOR(NM) wide, MAXVALUE(1.5,
+/// 2) and BIT_LENGTH(S) narrow, COALESCE(1.5, 0) and COALESCE(ID, 0)
+/// narrow, NULLIF(1.5, 0) and IIF(NN = 5, 1.5, 2.5) wide, a searched
+/// CASE wide and its simple twin narrow, DECODE narrow; every arithmetic
+/// sibling ((ID + 0), (1.5 + 0), (ID * 1) wide); every subquery ((SELECT
+/// b.ID ..) narrow, (SELECT 1.5 FROM RDB$DATABASE) narrow); an INT128 or
+/// DECFLOAT literal or cast; a DOUBLE literal or an approximate CAST is
+/// never sized at all (an approximate sibling makes the node DOUBLE and
+/// takes [arith_operand_rung]'s approximate rung, no operand rounds).
+fn mul_sibling_width(raw: &RawExpr, columns: &[RelationColumn], descs: &[Descriptor]) -> Option<u8> {
+    // (b) / (c): blr_long when the (unscaled) value fits SLONG, else
+    // blr_int64
+    fn literal_width(n: i64) -> u8 {
+        if i32::try_from(n).is_ok() {
+            4
+        } else {
+            8
+        }
+    }
+    // a literal under unary minuses: EXACTLY ONE minus is the parser's
+    // negative-literal rule, folded into the constant, so the SIGNED
+    // value decides - `-2147483648` and `-214748364.8` are blr_long
+    // (narrow) while `-3000000000` and `-99999.99999` are blr_int64
+    // (wide), measured. EVERY FURTHER minus is a runtime NegateNode over
+    // that constant's own width, and it OVERFLOWS where the negation does
+    // not fit the width: `- -2147483648`, `-(-2147483648)`,
+    // `-(-(-2147483648))`, `-(-(-(-2147483648)))`, `-(-(2147483648))` and
+    // `-(-214748364.8)` all raise *Integer overflow* on the engine,
+    // parameter-free and as a `*` sibling (measured 2026-09-19, cmpfix5;
+    // the refuter's claim that the triple minus is fine did not survive
+    // the measurement), so they answer None and the `*` refuses at
+    // prepare - round 4 folded every minus and answered `? * -(-
+    // 2147483648)` (1;2;3, the UPDATE twin rewrote every row). `- -1.5`,
+    // `-(-2147483647)` and `-(-3000000000)` (INT64) fold and stay on
+    // the list.
+    fn neg_literal(e: &RawExpr) -> Option<u8> {
+        let mut minuses = 0u32;
+        let mut cur = e;
+        while let RawExpr::Neg(a) = cur {
+            minuses += 1;
+            cur = a;
+        }
+        let n = match cur {
+            RawExpr::Int(n) | RawExpr::Dec(n, _) => *n,
+            _ => return None,
+        };
+        if minuses == 0 {
+            return Some(literal_width(n));
+        }
+        // a NEGATIVE literal is the lexer's own fold of one minus
+        // (`- -2147483648` and `-(-2147483648) * ?` arrive as a minus over
+        // Int(-2147483648)), so every minus above it is a runtime one;
+        // over a positive literal the first minus is the fold
+        let (mut v, runtime) = if n < 0 { (n, minuses) } else { (n.checked_neg()?, minuses - 1) };
+        let width = literal_width(v);
+        for _ in 0..runtime {
+            v = v.checked_neg()?;
+            if width == 4 && i32::try_from(v).is_err() {
+                return None;
+            }
+        }
+        Some(width)
+    }
+    match raw {
+        RawExpr::Int(n) | RawExpr::Dec(n, _) => Some(literal_width(*n)),
+        RawExpr::Neg(_) => neg_literal(raw),
+        RawExpr::Cast(_, CastTarget::Int { bytes }) | RawExpr::Cast(_, CastTarget::Numeric { bytes, .. }) => {
+            Some(*bytes)
+        }
+        RawExpr::Col(name) => {
+            // (f): a HAVING fold slot the group planner vouched for
+            if let Some(w) = HAVING_MUL_WIDTHS.with(|h| h.borrow().iter().find(|(n, _)| n == name).map(|(_, w)| *w)) {
+                return Some(w);
+            }
+            // (a): a stored base-table field of an exact type
+            let rc = find_col(columns, name)?;
+            let d = descs.get(rc.field_id as usize)?;
+            if !desc_is_stored_field(d) {
+                return None;
+            }
+            exact_dtype_bytes(d.dtype)
+        }
+        _ => None,
+    }
+}
+
+/// The rung a `?` (or `-?`) that is a DIRECT operand of `op` becomes,
+/// given its SIBLING operand (`None` when the sibling is a direct `?` too,
+/// which then takes the slot's own scale). THE MEASURED VALUE LAW: the
+/// engine reads the client's value straight from the client's own message
+/// (DsqlRequests.cpp metadataToFormat swaps the client's metadata in as
+/// the request's format) at the scale each arithmetic node asks for, and
+/// the DESCRIBED slot decides only the width the client is told:
+///  * an APPROXIMATE sibling makes the node DOUBLE and the value is read
+///    whole - `ID = D * ? ['0.8']` -> 2, `ID = D - ? ['0.5']` -> 1;2;3,
+///    `ID * 2 = D + ? ['0.5']` -> 1, `ID = D / ? ['1.25']` -> 2 (a LONG or
+///    INT64 slot in every case; the slot's scale would have rounded them);
+///  * `+` and `-` read BOTH operands at the node's scale, the finer of the
+///    slot's and the sibling's (addDialect3: MOV_get_int128(desc,
+///    nodScale)) - `ID = 2.5 + ? ['-0.45']` -> 2 (the sibling's -1 over
+///    the LONG slot), `ID + ? = 3.0 ['1.9']` -> none (the slot's -1 over
+///    ID's 0), `NM = 2 + ? ['0.5']` -> 3 (the slot's -2), `ID = 2 + ?
+///    ['0.45']` -> 2 (both 0), `ID = 2.5 + ? + 1.5 ['-0.5']` -> none;
+///  * `*` ROUNDS EXACTLY ONE OPERAND to an integer first (half away from
+///    zero, then re-scaled to the slot's scale) and reads the other at the
+///    slot's scale - and WHICH one is decided by the WIDTHS of the slot
+///    and the sibling, THE MEASURED SIDE RULE (the refuter's 96-cell
+///    matrix of 2026-09-18: 12 siblings x {INT64, LONG} slot x {left,
+///    right} x {keep, round}, re-driven after this fix; the widths are
+///    the BLR ones, [mul_sibling_width] - a scaled literal's is NOT what
+///    the projection describes): the LEFT operand
+///    is the rounded one when the slot AND the sibling are both 4-byte-
+///    or-narrower exact types (SHORT/LONG, scaled or not) - `NM = ? * ID
+///    ['7.25']` -> none, `? * ID = CAST(9.0 AS NUMERIC(9,1)) ['2.5']` ->
+///    3, `? * 2 = CAST(6.0 AS NUMERIC(9,1)) ['2.5']` -> 1;2;3, `? * NM =
+///    CAST(7.25 AS NUMERIC(9,3)) ['0.5']` -> 1, `? * ID = CAST(9.0 AS
+///    NUMERIC(4,1)) ['2.5']` -> 3 (SHORT), while the right keeps: `NM = 2
+///    * ? ['1.25']` -> 3, `NM = ID * ? ['7.25']` -> 1, `CAST(ID AS
+///    SMALLINT) * ? = CAST(7.5 AS NUMERIC(9,1)) ['2.5']` -> 3; the RIGHT
+///    operand is the rounded one OTHERWISE - under an INT64 slot (`ID * ?
+///    = 6.0 ['2.5']` -> 2, `BI = 2 * ? ['4.5']` -> none, and the left
+///    keeps: `? * ID = 7.5 ['2.5']` -> 3, `? * BI = 22.5` -> 1) and under
+///    a SHORT/LONG slot beside an INT64 SIBLING (BI, a literal past 32
+///    bits, `(ID + 0)`, `(ID * 1)`, `CAST(ID AS BIGINT)`, `CAST(2.5 AS
+///    NUMERIC(18,1))`, `COUNT(*)`: `BI * ? = CAST(27.0 AS NUMERIC(9,1))
+///    ['2.5']` -> 1, `(ID + 0) * ? = CAST(9.0 AS NUMERIC(9,1))` -> 3,
+///    `CAST(ID AS BIGINT) * ? = CAST(7.5 AS NUMERIC(9,1))` -> none, `BI *
+///    ? = CAST(27.0 AS NUMERIC(4,1))` -> 1, and the left keeps: `? * BI =
+///    CAST(22.5 AS NUMERIC(9,1))` -> 1, `? * (ID + 0) = CAST(7.5 AS
+///    NUMERIC(9,1))` -> 3). A direct `?` sibling counts as the slot's
+///    own width (`? * ? = NM ['2.5', '1']` -> none and `['1', '2.5']` ->
+///    3: the left rounds under the LONG slot; `? * ? = 2.5 ['2.5',
+///    '1.4']` -> 1;2;3 and `['1', '2.5']` -> none: the right rounds under
+///    the INT64 slot). The first cut of this rung rounded only the right
+///    operand under an INT64 slot and answered 1 for `NM = ? * ID
+///    ['7.25']`, 2 for `NM = ? * ID ['0.5']` and DELETED row 1 for `DELETE
+///    FROM T WHERE NM = ? * ID ['7.25']` - wrong answers, not refusals;
+///  * EVERY exact divisor is rounded the same way, whatever the widths
+///    (39 cells, no sibling dependence) and whether or not the dividend
+///    is a direct `?` itself, so the exact divide aligns the dividend by
+///    the divisor's scale (`ID / 2.0@-1` is 100/20 = 5@-1) - `ID / ? =
+///    0.5 ['1.6']` -> 1 and `['1.4']` -> none, `ID / ? = CAST(0.5 AS
+///    NUMERIC(9,1)) ['1.6']` -> 1, `= 2.5 ['0.4']` -> divide by zero, `? /
+///    ? = 2.5 ['2.5', '1.4']` -> 1;2;3 (the dividend keeps: `['1', '2.5']`
+///    -> none). Integer binds are unaffected by any of this.
+/// WHY THE WIDTHS DECIDE (ExprNodes.cpp, read after the matrix): the
+/// multiply's two exact branches read their operands in OPPOSITE order.
+/// DSC_multiply_result picks int128 as soon as either compile-time
+/// operand is INT64 or wider, else int64; multiplyDialect3's int64
+/// branch reads arg1 at ITS OWN runtime scale (a text bind is scale 0 -
+/// rounded) and arg2 at nodScale minus that, the int128 branch reads
+/// arg2 at its own scale and arg1 at the rest - and a bind is read
+/// straight from the client's message (metadataToFormat), never
+/// converted into the described slot first. That is the whole side
+/// rule, and why a sibling's BLR width, not its describe, is what
+/// counts.
+/// A `-?` negates the PARAMETER under the rung (`CAST(-? ..)`, the
+/// engine's NegateNode over the ParameterNode with the arithmetic node
+/// converting its result), so a 4-byte message's -2147483648 overflows
+/// there as it does whole ([Expr::Neg], measured `-? + 0 = ID` and `-? *
+/// 1 = ID` raise) and a text bind meets the negate's double grammar
+/// first (`-? + 1 = ID ['-1.4']` -> 2, `['abc']` raises, unchanged).
+/// A DOUBLE/REAL slot or a DOUBLE sibling refuses (round 12, K3); a
+/// sibling of any other type (text, temporal, DECFLOAT) refuses too.
+fn arith_operand_rung(
+    i: usize,
+    negated: bool,
+    slot: &Descriptor,
+    op: ArithOp,
+    is_left: bool,
+    sibling: Option<&Expr>,
+    // the sibling's RAW shape, what [mul_sibling_width] reads (the
+    // resolved one carries [align_conditional]'s casts)
+    sib_raw: Option<&RawExpr>,
+    columns: &[RelationColumn],
+    descs: &[Descriptor],
+    sink: &mut Vec<Option<Descriptor>>,
+) -> Option<Expr> {
+    let exact_slot = matches!(slot.dtype, dtype::SHORT | dtype::LONG | dtype::INT64);
+    let sib_ty = match sibling {
+        Some(s) => Some(s.type_of(descs)?),
+        None => None,
+    };
+    // K3 (round 12): AN OPERAND RUNG WHOSE OPERATOR COMPUTES IN DOUBLE
+    // REFUSES AT PREPARE - a DOUBLE / REAL slot (`? + 0 = D`, `? * 1 =
+    // FL + 0.9`, `ID * ? = 1E0`) or a DOUBLE sibling (`? * 1e0 = 1`, `? *
+    // D = 1.5`, `? * PI() > ..`). The engine reads the text operand with
+    // CVT_get_double's digit-by-digit accumulation, which the correctly
+    // rounded read here does not model: `? * 1e0 = 1` ['0.9999999999999999']
+    // is a row on the engine and ['0.99999999999999999'] is not, the
+    // opposite here, and `DELETE FROM TW WHERE ? + 0e0 = ID` deleted the
+    // row the engine keeps (round 11's refuter, 118 cells). The previous
+    // binary refused every one. No law is added; the shape is not answered.
+    if !exact_slot || matches!(sib_ty, Some(ExprType::Approx)) {
+        cap_note("K3 (an operand rung computing in DOUBLE)");
+        return None;
+    }
+    claim_param_slot(sink, i, slot)?;
+    let p = || {
+        let param = Expr::Param(i);
+        Box::new(if negated { Expr::Neg(Box::new(param)) } else { param })
+    };
+    let rung = match sib_ty {
+        Some(ExprType::Int | ExprType::Numeric) | None => {
+            let sib_scale = match sibling {
+                Some(s) if matches!(sib_ty, Some(ExprType::Numeric)) => s.result_scale(descs)?,
+                Some(_) => 0,
+                None => slot.scale,
+            };
+            let slot_bytes = exact_dtype_bytes(slot.dtype).unwrap_or(8);
+            // the BLR widths the side rule reads ([mul_sibling_width], THE
+            // WHITELIST; a shape not on it refuses a multiply): a direct
+            // `?` sibling carries the slot's own
+            let sib_bytes = match (op, sib_raw) {
+                (ArithOp::Mul, Some(r)) => Some(mul_sibling_width(r, columns, descs)?),
+                (ArithOp::Mul, None) => Some(slot_bytes),
+                // a divide reads the same widths, but its sibling was
+                // never on the whitelist's path: an unlisted shape keeps
+                // the eight-byte read it had rather than refuse
+                (ArithOp::Div, Some(r)) => mul_sibling_width(r, columns, descs),
+                (ArithOp::Div, None) => Some(slot_bytes),
+                _ => None,
+            };
+            let round = match op {
+                ArithOp::Mul => {
+                    if slot_bytes <= 4 && sib_bytes.unwrap_or(slot_bytes) <= 4 {
+                        is_left
+                    } else {
+                        !is_left
+                    }
+                }
+                ArithOp::Div => !is_left,
+                _ => false,
+            };
+            // THE INT128 BRANCH READS AT SIXTEEN BYTES. DSC_multiply_result
+            // (a divide too) takes int128 as soon as either compile-time
+            // operand is INT64 or wider, and multiplyDialect3 / divide
+            // then read the operand with MOV_get_int128 - so a bound text
+            // is decomposed at int128, not at the slot's int64: `BI = ? *
+            // 1` ['8.9999999999999999999'] is row 1 and `? * 1 = N18`
+            // ['3e20'] no row on the engine, where the eight-byte rung
+            // raised *numeric value is out of range* after a describe -
+            // prepare-then-fail (round 9, P5). An add stays at int64 (`? +
+            // 0 = BI` with the same text raises on both).
+            let wide = matches!(op, ArithOp::Mul | ArithOp::Div)
+                && (slot_bytes >= 8 || sib_bytes.is_some_and(|b| b >= 8));
+            let bytes = if wide { 16 } else { 8 };
+            let numeric = |scale: i8| CastTarget::Numeric { scale, bytes, sub_type: slot.sub_type };
+            // an exact rung reads at its operator's width: [CS_OPERATOR_READ]
+            let scaled = |scale: i8| {
+                if scale == 0 && !matches!(slot.sub_type, 1 | 2) && !wide {
+                    Expr::Cast(p(), CastTarget::Int { bytes: 8 }, CS_OPERATOR_READ)
+                } else {
+                    Expr::Cast(p(), numeric(scale), CS_OPERATOR_READ)
+                }
+            };
+            if round {
+                let int = if wide {
+                    Expr::Cast(p(), numeric(0), CS_OPERATOR_READ)
+                } else {
+                    Expr::Cast(p(), CastTarget::Int { bytes: 8 }, CS_OPERATOR_READ)
+                };
+                if slot.scale == 0 && !matches!(slot.sub_type, 1 | 2) {
+                    int
+                } else {
+                    Expr::Cast(Box::new(int), numeric(slot.scale), CS_OPERATOR_READ)
+                }
+            } else {
+                match op {
+                    ArithOp::Add | ArithOp::Sub => scaled(slot.scale.min(sib_scale)),
+                    _ => scaled(slot.scale),
+                }
+            }
+        }
+        _ => return None,
+    };
+    Some(rung)
+}
+
+/// Resolve the comparison side whose bare `?`s (per [raw_bare_cmp_param])
+/// all take `slot`, the other side's descriptor. Every `?` that is a
+/// DIRECT operand of `+ - * /` (or its `-?`) becomes the rung
+/// [arith_operand_rung] builds from its operator, its position and its
+/// sibling - THE MEASURED VALUE LAW lives there; a `?` that is THE WHOLE
+/// SIDE (`whole`: a bare `?`, or one under nothing but unary minuses -
+/// the callers pass true for the root of a side, the recursion false)
+/// takes [whole_side_rung], bound at full precision because the engine
+/// never converts a whole-side bind into the slot; a `||` operand takes
+/// [cmp_param_rung], the plain conversion into the slot. Arithmetic needs
+/// an exact or approximate slot; `||` a text slot; any other pairing
+/// refuses (`ID * ? = '2'`, `DT - ? = DATE ..`, `HAVING MAX(DT) > ? + 1`
+/// - the engine answers some of these; recorded eng_only).
+/// A non-bare subtree (CAST/COALESCE/NULLIF/CASE/IIF/Func with a `?`, or
+/// anything param-free) delegates to [resolve_expr_sink]: it types its own
+/// `?` or refuses exactly as today (`ABS(ID * ?)` never reaches here - its
+/// root is not bare; `COALESCE(?, 0) + ?` answers: LONG Nullable, INT64
+/// Nullable, measured). NEVER calls [resolve_dest_param_expr], so chunk
+/// 45's DML multiply rule cannot fire for a comparison.
+///
+/// ROUND 12: EVERY SLOT THIS REGISTERS IS CHUNK-NEW (the previous binary
+/// planned none of them) and is marked so ([marking_chunk_new]). K3: an
+/// approximate slot refuses unless it is `raw` itself as the WHOLE side
+/// ([chunk_new_approx_refuses]); K4: a TEXT slot beside a conditional's
+/// bare-`?` value arm refuses ([raw_text_arm_param]).
+fn resolve_cmp_param_side(
+    raw: &RawExpr,
+    slot: &Descriptor,
+    columns: &[RelationColumn],
+    descs: &[Descriptor],
+    sink: &mut Vec<Option<Descriptor>>,
+    whole: bool,
+) -> Option<Expr> {
+    let (e, fresh) = marking_chunk_new(sink, |sink| {
+        resolve_cmp_param_side_body(raw, slot, columns, descs, sink, whole)
+    })?;
+    let whole_slot = match raw {
+        RawExpr::Param(i) if whole => Some(*i),
+        _ => None,
+    };
+    if chunk_new_approx_refuses(sink, &fresh, whole_slot) {
+        cap_note("K3 (an approximate chunk-new slot that is not a whole side)");
+        return None;
+    }
+    if chunk_new_text_slot(sink, &fresh) && raw_text_arm_param(raw) {
+        cap_note("K4 (a text-slot conditional value arm in a chunk-new comparison)");
+        return None;
+    }
+    Some(e)
+}
+
+fn resolve_cmp_param_side_body(
+    raw: &RawExpr,
+    slot: &Descriptor,
+    columns: &[RelationColumn],
+    descs: &[Descriptor],
+    sink: &mut Vec<Option<Descriptor>>,
+    whole: bool,
+) -> Option<Expr> {
+    let arith_ok = matches!(
+        slot.dtype,
+        dtype::SHORT | dtype::LONG | dtype::INT64 | dtype::DOUBLE | dtype::REAL
+    );
+    let text = matches!(slot.dtype, dtype::TEXT | dtype::VARYING);
+    // the `?` (or `-?`) that is a DIRECT operand of this operator, if any
+    let direct_param = |e: &RawExpr| -> Option<(usize, bool)> {
+        match e {
+            RawExpr::Param(i) => Some((*i, false)),
+            RawExpr::Neg(inner) => match &**inner {
+                RawExpr::Param(i) => Some((*i, true)),
+                _ => None,
+            },
+            _ => None,
+        }
+    };
+    // a `?` under nothing but unary minuses - `-?`, `-(-?)` - is still
+    // the whole side (`ID = -(-?) ['2.4']` -> none, measured)
+    fn neg_param_chain(e: &RawExpr) -> bool {
+        match e {
+            RawExpr::Param(_) => true,
+            RawExpr::Neg(a) => neg_param_chain(a),
+            _ => false,
+        }
+    }
+    Some(match raw {
+        RawExpr::Param(i) => {
+            claim_param_slot(sink, *i, slot)?;
+            if whole {
+                whole_side_rung(*i, slot)?
+            } else {
+                cmp_param_rung(*i, slot)?
+            }
+        }
+        RawExpr::Neg(a) => {
+            if !arith_ok {
+                return None;
+            }
+            let w = whole && neg_param_chain(a);
+            // ROUND 11: A NEGATION CHAIN OVER A `?` AS A WHOLE COMPARISON
+            // SIDE (`-? = -N`, `-(-?) = N`, `N = -(-?)`, `-? IN (..)`,
+            // `-? BETWEEN ..`, `IIF(-? = ..)`, `CASE WHEN -? = ..`, the
+            // HAVING / DELETE / UPDATE twins) REFUSES AT PREPARE, as the
+            // previous binary refused every one. The engine's NegateNode
+            // reads a text message with CVT_get_double, whose digit-by-
+            // digit double accumulation rounds a long fraction its own
+            // way: `-? = -N` ['0.9999999999999999'] (16 nines) matches the
+            // 1 row there and ['0.999999999999999999'] does not, where the
+            // correctly rounded read here answered the opposite (and a
+            // DELETE twin deleted the row the engine keeps) - measured
+            // 2026-09-19, round 10's refuter, 126 + 24 + 46 cells. No
+            // model of that accumulation is added; the shape is simply
+            // not answered. A negated `?` that is an OPERAND of `+ - * /`
+            // (`ID = -? * -1`, `0 - ? = -ID`) is not this chain and keeps
+            // round 4's operand rung - measured right on every bind.
+            if w {
+                return None;
+            }
+            Expr::Neg(Box::new(resolve_cmp_param_side(a, slot, columns, descs, sink, w)?))
+        }
+        RawExpr::Bin(a, op, b) => {
+            if !arith_ok {
+                return None;
+            }
+            // the non-`?` operands resolve first: a direct `?` reads its
+            // SIBLING's type and scale ([arith_operand_rung]). The claim
+            // order does not number anything - a slot is the parser's
+            // index, claimed by index - so text order is kept regardless.
+            // ROUND 7, THE SCOPE CUT: a chain of TWO OR MORE minuses over a
+            // `?` as a direct operand (`-(-?) + 0`, `-(-?) * 1 = NM`)
+            // refuses at prepare - the previous binary refused every one,
+            // and the message-width chain round 6 built here was outside
+            // this chunk's scope (only the BARE chain negates at the
+            // message width, [bind_whole_side]); round 5's tree answered
+            // `-(-?) + 0 = -2147483648` [-2147483648] every row where the
+            // engine raises Integer overflow, and a wrong answer is worse
+            // than a refusal.
+            if [&**a, &**b].iter().any(|e| neg_param_chain_of(e).is_some_and(|(_, n)| n >= 2)) {
+                return None;
+            }
+            let (da, db) = (direct_param(a), direct_param(b));
+            let mut l = match da {
+                None => Some(resolve_cmp_param_side(a, slot, columns, descs, sink, false)?),
+                Some(_) => None,
+            };
+            let mut r = match db {
+                None => Some(resolve_cmp_param_side(b, slot, columns, descs, sink, false)?),
+                Some(_) => None,
+            };
+            // a direct `?` SIBLING is handed over as None whether or not
+            // its own rung is built yet: the rung casts at eight bytes
+            // (see [cmp_param_rung]), and reading that width as the
+            // sibling's made BOTH operands of `? * ? = NM` round (the
+            // engine: `['1', '2.5']` -> 3, the left alone rounds)
+            if let Some((i, negated)) = da {
+                let (sib, sib_raw) = if db.is_some() { (None, None) } else { (r.as_ref(), Some(&**b)) };
+                l = Some(arith_operand_rung(i, negated, slot, *op, true, sib, sib_raw, columns, descs, sink)?);
+            }
+            if let Some((i, negated)) = db {
+                let (sib, sib_raw) = if da.is_some() { (None, None) } else { (l.as_ref(), Some(&**a)) };
+                r = Some(arith_operand_rung(i, negated, slot, *op, false, sib, sib_raw, columns, descs, sink)?);
+            }
+            // `? * ?` UNDER A 2- OR 4-BYTE EXACT SLOT: both operands are
+            // described at that width, so the engine multiplies in INT64
+            // and raises *Integer overflow* past it ([CS_MUL_I64]; round
+            // 8, Q3) - the two rungs carry the stamp the multiply reads
+            let (mut l, mut r) = (l?, r?);
+            // ...AND SO IS A SINGLE `?` TIMES A 4-BYTE-OR-NARROWER EXACT
+            // OPERAND (a column, a literal, `NM`): the engine's multiply
+            // takes the same int64 branch and raises *Integer overflow*
+            // past it - `? * N = 12` ['4611686018427387904'], `ID * ? = 4`
+            // ['9223372036854775807'], `? * NM = 1` [4000000000000000000]
+            // answered no row here (round 9, P3). An INT64-or-wider
+            // sibling is the int128 branch ([arith_operand_rung]) and
+            // takes no stamp.
+            let narrow_sibling = |e: &RawExpr| mul_sibling_width(e, columns, descs).is_some_and(|w| w <= 4);
+            let one_param_narrow = match (da.is_some(), db.is_some()) {
+                (true, false) => narrow_sibling(b),
+                (false, true) => narrow_sibling(a),
+                _ => false,
+            };
+            if (da.is_some() && db.is_some() || one_param_narrow)
+                && matches!(op, ArithOp::Mul)
+                && matches!(slot.dtype, dtype::SHORT | dtype::LONG)
+            {
+                // (every rung [arith_operand_rung] builds for an exact
+                // slot with a direct `?` sibling is one of these casts)
+                let stamp = |e: Expr| match e {
+                    Expr::Cast(x, t @ (CastTarget::Int { bytes: 8 } | CastTarget::Numeric { bytes: 8, .. }), _) => {
+                        Expr::Cast(x, t, CS_MUL_I64)
+                    }
+                    other => other,
+                };
+                l = stamp(l);
+                r = stamp(r);
+            }
+            Expr::Bin(Box::new(l), *op, Box::new(r))
+        }
+        RawExpr::Concat(a, b) => {
+            if !text {
+                return None;
+            }
+            Expr::Concat(
+                Box::new(resolve_cmp_param_side(a, slot, columns, descs, sink, false)?),
+                Box::new(resolve_cmp_param_side(b, slot, columns, descs, sink, false)?),
+            )
+        }
+        other => resolve_expr_sink(other, columns, descs, sink)?,
+    })
+}
+
+/// The two sides of a comparison with a `?` sink: BOTH sides carrying a
+/// `?` with one of them bare refuses (the engine's order-dependent rule -
+/// `ID * ? = N + ?` answers, `N + ? = ID * ?` refuses - is out of scope);
+/// one bare side types from the other; an Expr::Null other side is the
+/// SQL_NULL slot (32766) - refuse; neither bare keeps today's path.
+fn resolve_cmp_pair(
+    a: &RawExpr,
+    b: &RawExpr,
+    columns: &[RelationColumn],
+    descs: &[Descriptor],
+    sink: &mut Vec<Option<Descriptor>>,
+) -> Option<(Expr, Expr)> {
+    let (ba, bb) = (raw_bare_cmp_param(a), raw_bare_cmp_param(b));
+    let (pa, pb) = (raw_has_param(a), raw_has_param(b));
+    if (ba && pb) || (bb && pa) {
+        return None;
+    }
+    let (l, r) = if ba {
+        let other = resolve_expr(b, columns, descs)?;
+        if matches!(other, Expr::Null) || expr_reads_zoned_col(&other, descs) {
+            return None;
+        }
+        let (slot, _) = param_desc_from_expr(&other, descs)?;
+        if !param_target_ok(&slot) {
+            return None;
+        }
+        (resolve_cmp_param_side(a, &slot, columns, descs, sink, true)?, other)
+    } else if bb {
+        let other = resolve_expr(a, columns, descs)?;
+        if matches!(other, Expr::Null) || expr_reads_zoned_col(&other, descs) {
+            return None;
+        }
+        let (slot, _) = param_desc_from_expr(&other, descs)?;
+        if !param_target_ok(&slot) {
+            return None;
+        }
+        (other, resolve_cmp_param_side(b, &slot, columns, descs, sink, true)?)
+    } else {
+        // (a conditional's bare `?` branch against an INT128 / DECFLOAT
+        // other side refuses here too - [raw_conditional_bare_param])
+        if pa && !pb && raw_conditional_bare_param(a) {
+            if resolve_expr(b, columns, descs).is_some_and(|o| wide_exact_side(&o, descs)) {
+                return None;
+            }
+        }
+        if pb && !pa && raw_conditional_bare_param(b) {
+            if resolve_expr(a, columns, descs).is_some_and(|o| wide_exact_side(&o, descs)) {
+                return None;
+            }
+        }
+        // K3 (round 12): neither side is a bare `?`, so no slot here is a
+        // whole side - an approximate one (`IIF(CAST(? AS DOUBLE
+        // PRECISION) = 1, ..)`, `IIF(COALESCE(?, D) = 1.5, ..)`) reads its
+        // text in DOUBLE and refuses
+        let (pair, fresh) = marking_chunk_new(sink, |sink| {
+            Some((
+                resolve_expr_sink(a, columns, descs, sink)?,
+                resolve_expr_sink(b, columns, descs, sink)?,
+            ))
+        })?;
+        if chunk_new_approx_refuses(sink, &fresh, None) {
+            cap_note("K3 (an approximate slot in a condition)");
+            return None;
+        }
+        pair
+    };
+    let sides = cmp_sides(l, r, descs)?;
+    // a `?` in an expression's condition: the previous binary refused
+    // every one ([plan_unmixed]) - noted once the pair is built, so a
+    // failed attempt leaves no flag behind (round 11)
+    if pa || pb {
+        mix_note(MIX_CMP);
+    }
+    Some(sides)
 }
 
 /// (takes BORROWED siblings so a NULLIF's two boxes and a CASE's branch
@@ -69213,6 +72182,12 @@ fn resolve_proj_expr(
     if !raw_has_param(raw) {
         return resolve_expr(raw, columns, descs);
     }
+    // K4 (round 12): a TRIM over a bare `?` inside a conditional's value
+    // arm refuses at prepare ([raw_cond_arm_trim_param])
+    if raw_cond_arm_trim_param(raw) {
+        cap_note("K4 (a one-operand TRIM over a `?` in a conditional's value arm)");
+        return None;
+    }
     fn set(sink: &mut Vec<Option<Descriptor>>, i: usize, d: Descriptor) {
         if sink.len() <= i {
             sink.resize(i + 1, None);
@@ -69223,7 +72198,23 @@ fn resolve_proj_expr(
         RawExpr::Cast(inner, t) => {
             if let RawExpr::Param(i) = &**inner {
                 set(sink, *i, cast_target_descriptor(t)?);
-                Expr::Cast(Box::new(Expr::Param(*i)), *t, fire_crab_ods::intl::CS_UTF8)
+                // a trigger view's GENERATED `CAST(? AS <slot>)` is an
+                // implicit slot cast ([GENERATED_SLOT_CASTS], round 9);
+                // a CAST the statement wrote keeps the written stamp
+                let cs = if generated_slot_cast(*i)
+                    && matches!(t, CastTarget::Int { .. } | CastTarget::Numeric { .. } | CastTarget::Approx)
+                {
+                    note_implicit_int(t);
+                    CS_SLOT_CAST
+                } else {
+                    // a written NUMERIC cast reads the previous binary's
+                    // fraction zeros ([note_implicit_int], round 11)
+                    if matches!(t, CastTarget::Numeric { .. }) {
+                        mix_note(MIX_IMPL);
+                    }
+                    fire_crab_ods::intl::CS_UTF8
+                };
+                Expr::Cast(Box::new(Expr::Param(*i)), *t, cs)
             } else {
                 if let Some(fid) = blob_col_cast(inner, t, columns, descs) {
                     Expr::Cast(
@@ -69238,16 +72229,34 @@ fn resolve_proj_expr(
                 }
             }
         }
-        RawExpr::Neg(a) => Expr::Neg(Box::new(resolve_proj_expr(a, columns, descs, sink)?)),
+        // (a direct operand's implicit slot cast is an OPERAND's -
+        // [slot_operand] touches nothing but a [CS_SLOT_CAST] stamp, which
+        // only a trigger view's generated cast carries here; round 9)
+        RawExpr::Neg(a) => Expr::Neg(Box::new(slot_operand(resolve_proj_expr(a, columns, descs, sink)?))),
         RawExpr::Bin(a, op, b) => Expr::Bin(
-            Box::new(resolve_proj_expr(a, columns, descs, sink)?),
+            Box::new(slot_operand(resolve_proj_expr(a, columns, descs, sink)?)),
             *op,
-            Box::new(resolve_proj_expr(b, columns, descs, sink)?),
+            Box::new(slot_operand(resolve_proj_expr(b, columns, descs, sink)?)),
         ),
-        RawExpr::Concat(a, b) => Expr::Concat(
-            Box::new(resolve_proj_expr(a, columns, descs, sink)?),
-            Box::new(resolve_proj_expr(b, columns, descs, sink)?),
-        ),
+        // A SIMPLE CASE WHOSE BARE `?` VALUE HAS A NUMERIC SIBLING, UNDER
+        // A `||`, REFUSES AT PREPARE ([raw_concat_over_numeric_simple_case]):
+        // `CASE ID WHEN 2 THEN ? ELSE 0 END || '' = 2` [2.4] took row 2
+        // and its UPDATE twin MUTATED it, where the engine answers no row
+        // (the CASE's slot is LONG here and the engine compares the text
+        // '2.4'); the previous binary prepared then failed. A text sibling
+        // (`ELSE 'q'`) keeps answering (row 2 for ['cd'] on all three).
+        // Round 7, THE SCOPE CUT.
+        RawExpr::Concat(a, b) => {
+            if raw_concat_over_numeric_simple_case(a, columns, descs)
+                || raw_concat_over_numeric_simple_case(b, columns, descs)
+            {
+                return None;
+            }
+            Expr::Concat(
+                Box::new(resolve_proj_expr(a, columns, descs, sink)?),
+                Box::new(resolve_proj_expr(b, columns, descs, sink)?),
+            )
+        }
         // A CONDITIONAL TYPES ITS PARAMETER FROM ITS SIBLINGS HERE TOO -
         // the same law chunk 46 measured for a DML value, in the SECOND
         // router that needs it. A SELECT LIST HAS NO DESTINATION to push
@@ -69270,8 +72279,8 @@ fn resolve_proj_expr(
         //
         // A `?` in a CONDITION is NOT this rule: the engine types it
         // from the comparison (`CASE WHEN ID = ? THEN 1 ELSE 0 END`
-        // describes ID's own LONG), and [resolve_raw_cond] refuses a
-        // parameter, so those shapes keep refusing - recorded, gated.
+        // describes ID's own LONG) - [resolve_raw_cond_sink] carries
+        // that law, and the siblings never see the condition's `?`.
         //
         // a FLOAT branch (CAST(? AS FLOAT)) beside a DOUBLE one widens
         // to the common DOUBLE, as it did before
@@ -69303,7 +72312,16 @@ fn resolve_proj_expr(
         // below, which is why `CASE WHEN ID=1 THEN ? ELSE 0 END` refused
         // while the engine answered 1. The siblings are the RESULT
         // branches (and the ELSE); the conditions are their own rule.
-        RawExpr::Case(branches, else_) => {
+        // ROUND 7, THE SCOPE CUT: a simple CASE's THEN / ELSE value - a
+        // bare `?` included - is CAST into the reconciled sibling slot,
+        // chunk 47's reading and the previous binary's (`CASE ID WHEN 2
+        // THEN ? ELSE 0 END = 2` ['2.4'] answers row 2 here where the
+        // engine compares 2.4 whole and answers none - a pre-existing
+        // wrong answer, RECORDED). Round 5's whole-side binding of that
+        // `?` and round 6's direct-side flag were outside this chunk's
+        // scope and regressed the nested shapes. The `simple` flag is the
+        // parser's; only [raw_is_simple_case_bare_value] reads it now.
+        RawExpr::Case(branches, else_, _) => {
             let sibs: Vec<&RawExpr> = branches
                 .iter()
                 .map(|(_, t)| t)
@@ -69316,7 +72334,7 @@ fn resolve_proj_expr(
                         .iter()
                         .map(|(c, t)| {
                             Some((
-                                resolve_raw_cond(c, columns, descs)?,
+                                resolve_raw_cond_sink(c, columns, descs, sink)?,
                                 resolve_dest_param_expr(t, &sd, columns, descs, sink)?,
                             ))
                         })
@@ -69335,7 +72353,7 @@ fn resolve_proj_expr(
             let sd = coalesce_sibling_desc(&[&**a, &**b], columns, descs)?;
             float_conditional(
                 Expr::Iif(
-                    Box::new(resolve_raw_cond(c, columns, descs)?),
+                    Box::new(resolve_raw_cond_sink(c, columns, descs, sink)?),
                     Box::new(resolve_dest_param_expr(a, &sd, columns, descs, sink)?),
                     Box::new(resolve_dest_param_expr(b, &sd, columns, descs, sink)?),
                 ),
@@ -69452,7 +72470,7 @@ fn resolve_expr_inner(
                 let e = inner?;
                 return Some(match computed_cast_target(descs.get(fid)?) {
                     Some(target) => {
-                        let cs = err_spell_charset(&e, descs);
+                        let cs = computed_cast_stamp(&target, err_spell_charset(&e, descs));
                         Expr::Cast(Box::new(e), target, cs)
                     }
                     None => e,
@@ -69725,7 +72743,7 @@ fn resolve_expr_inner(
             FN_CALLS.with(|l| l.borrow_mut().push(FnCall { id, name: name.clone(), args: resolved.clone() }));
             Expr::UserFn { name: name.clone(), args: resolved, ret, id }
         }
-        RawExpr::Case(branches, else_) => Expr::Case(
+        RawExpr::Case(branches, else_, _) => Expr::Case(
             branches
                 .iter()
                 .map(|(c, t)| {
@@ -72486,6 +75504,288 @@ fn text_col_num(raw: &str) -> ColNum {
     ColNum::Exact(mantissa, scale.clamp(i32::MIN as i64, i32::MAX as i64) as i32)
 }
 
+/// THE SCALED-SLOT OVERFLOW CLASS of a text compared with an exact
+/// column: the engine's compare converts the text into an INT64 at the
+/// SLOT's scale when its digits fit the int64 accumulator, and RAISES
+/// *numeric value is out of range* when scaling them UP to the slot's
+/// decimals overflows - `IIF(NM = ?, 1, 0)` over a NUMERIC(9,2) bound
+/// '99999999999999999' (17 digits), '9223372036854775807',
+/// '99999999999999999.0', '92233720368547759.0', '-99999999999999999' and
+/// '9999999999999999 9' (the compare grammar's interior blank) all raise,
+/// while '9999999999999999' (16), '92233720368547758.0' and
+/// '92233720368547758.07' compare (no row), and a text whose digits
+/// OUTRUN the accumulator takes the wider path and compares too:
+/// '92233720368547758.08', '7.25000000000000000000001', the 38 and 39
+/// nines against ID / BI / N18. A NUMERIC(4,1) (SHORT -1) slot raises on
+/// '922337203685477581' and takes '922337203685477580.7'. Measured
+/// 2026-09-19 (cmpfix5); both binaries answered no row for every one. A
+/// scale-0 slot never scales up, so it never raises here.
+fn text_overflows_scaled_slot(m: i128, sc: i32, slot_scale: i8) -> bool {
+    if slot_scale >= 0 || sc > 0 {
+        // a scale-0 slot never scales up; a positive scale is the dec128
+        // class (past 39 digits), which compares without raising
+        return false;
+    }
+    let text_dec = -sc;
+    let slot_dec = -(slot_scale as i32);
+    if text_dec >= slot_dec {
+        return false;
+    }
+    let k = (slot_dec - text_dec) as u32;
+    // the digits that fit the int64 accumulator align in INT64 and raise
+    // past it; the ones that outran it align in INT128 and raise past THAT
+    // (36 nines against NUMERIC(9,2) compare, 37 nines and 1e38 raise -
+    // 10^37 x 100 leaves i128 - and '1701411834604692317316873037158841057'
+    // compares where '..058' raises: i128::MAX / 100, measured 2026-09-19)
+    // ...and the accumulator is SIGNED: '-9223372036854775808' (exactly
+    // i64::MIN) fits it and raises on the alignment, as the engine does
+    // (`IIF(NM = ?, 1, 0) = 1`, N41, N18, the body twins, the UPDATE twin:
+    // *numeric value is out of range*, measured 2026-09-19); an unsigned
+    // test sent it to the INT128 alignment and answered no row (round 6)
+    let (lo, hi): (i128, i128) = if m >= i64::MIN as i128 && m <= i64::MAX as i128 {
+        (i64::MIN as i128, i64::MAX as i128)
+    } else {
+        (i128::MIN, i128::MAX)
+    };
+    match 10i128.checked_pow(k).and_then(|p| m.checked_mul(p)) {
+        Some(v) => v < lo || v > hi,
+        None => true,
+    }
+}
+
+/// THE ENGINE'S CLASS OF A TEXT COMPARED WITH AN EXACT NUMBER - cvt.cpp
+/// `CVT_get_numeric` as cvt2.cpp `cmp_numeric_string` calls it, step for
+/// step (round 11, W2). It decides nothing about the VALUE compared
+/// (that stays [text_col_num]'s); it answers only the WIDTH the engine
+/// aligns the two operands in, and the text's own mantissa and scale:
+///  * `Some((false, m, s))` - the INT64 class: the digits (spaces
+///    anywhere skipped, one sign, one dot) fit the int64 accumulator,
+///    whose overflow test is `value >= INT64_LIMIT` ((1 << 62) / 5)
+///    before each digit, the next digit past 7 (8 for a minus) tipping
+///    it; `s` counts every fraction digit, trailing zeros included;
+///  * `Some((true, m, s))` - the INT128 class: the accumulator
+///    overflowed (or the scale left -128..127), and the engine re-read
+///    the text with `CVT_decompose` into an int128 - no interior spaces,
+///    trailing FRACTION zeros past the width dropped when nothing but
+///    zeros follows, an exponent folded into the scale - landing a scale
+///    inside -128..127;
+///  * `None` - every other class: an exponent with no accumulator
+///    overflow (a DOUBLE), a text `CVT_decompose` refuses (a DECFLOAT(34)
+///    read), capital-X hex, and a conversion error. None of these aligns
+///    in an integer width, so none raises the alignment error.
+/// Measured on the W2 matrix (2026-09-19): '0.5' + 18 zeros is int64 at
+/// -19, '0.' + 38 ones int128 at -38, '1.' + 39 zeros int128 at -38 (the
+/// last zero dropped), '1.' + 39 zeros + ' ' a decimal128, '1' + 38
+/// zeros + 'e0' int128 at 0, '1e38' a double.
+fn engine_cmp_class(s: &str) -> Option<(bool, i128, i32)> {
+    let b = s.as_bytes();
+    let len = b.len();
+    if len > 2 && b[0] == b'0' && b[1] == b'X' {
+        return None;
+    }
+    // cvt.cpp INT64_LIMIT, the accumulator's NUMERIC_LIMIT
+    const LIMIT: u64 = (1u64 << 62) / 5;
+    let mut value: i64 = 0;
+    let mut local_scale: i32 = 0;
+    let mut sign: i8 = 0;
+    let (mut digit_seen, mut fraction, mut over) = (false, false, false);
+    let mut p = 0usize;
+    while p < len {
+        let c = b[p];
+        if c.is_ascii_digit() {
+            digit_seen = true;
+            if !over {
+                if value as u64 >= LIMIT
+                    && (value as u64 > LIMIT || (c > b'8' && sign == -1) || (c > b'7' && sign != -1))
+                {
+                    over = true;
+                }
+                value = value.wrapping_mul(10).wrapping_add((c - b'0') as i64);
+            }
+            if fraction {
+                local_scale -= 1;
+            }
+        } else if c == b'.' {
+            if fraction {
+                return None;
+            }
+            fraction = true;
+        } else if c == b'-' && !digit_seen && sign == 0 && !fraction {
+            sign = -1;
+        } else if c == b'+' && !digit_seen && sign == 0 && !fraction {
+            sign = 1;
+        } else if c == b'e' || c == b'E' || c == 0 {
+            break;
+        } else if c != b' ' {
+            return None;
+        }
+        p += 1;
+    }
+    if !digit_seen {
+        return None;
+    }
+    if !(-128..=127).contains(&local_scale) {
+        over = true;
+    }
+    let exponent = p < len && b[p] != 0;
+    if !over && (exponent || (value < 0 && sign != -1)) {
+        // the double class; a double that overflows goes on to
+        // CVT_decompose with a scale past 127, a decimal128 - None too
+        return None;
+    }
+    if over {
+        return engine_decompose_i128(b).map(|(m, sc)| (true, m, sc));
+    }
+    let v = if sign == -1 { value.wrapping_neg() } else { value };
+    Some((false, v as i128, local_scale))
+}
+
+/// cvt.cpp `cvt_decompose` into an int128 (`RetI128`), as
+/// [engine_cmp_class] needs it: the mantissa and the scale, or None
+/// where the engine's decompose raises (and `CVT_get_numeric` falls to
+/// its decimal128 read) or lands a scale outside -128..127.
+fn engine_decompose_i128(b: &[u8]) -> Option<(i128, i32)> {
+    let len = b.len();
+    let mut p = 0usize;
+    while p < len && b[p] == b' ' {
+        p += 1;
+    }
+    if p + 2 < len && b[p] == b'0' && (b[p + 1] == b'x' || b[p + 1] == b'X') {
+        return None;
+    }
+    let by10: i128 = i128::MAX / 10;
+    let mut value: i128 = 0;
+    let mut scale: i32 = 0;
+    let mut sign: i8 = 0;
+    let (mut digit_seen, mut fraction) = (false, false);
+    let mut exponent_at: Option<usize> = None;
+    while p < len {
+        let c = b[p];
+        if c.is_ascii_digit() {
+            digit_seen = true;
+            if value > by10 || value < 0 {
+                // RETVAL_OVERFLOW: a FRACTION whose rest is all zeros
+                // drops them; anything else is out of range
+                if fraction {
+                    let mut q = p;
+                    while q < len && b[q] == b'0' {
+                        q += 1;
+                    }
+                    if q >= len {
+                        break;
+                    }
+                }
+                return None;
+            }
+            if value == by10 && ((c > b'8' && sign == -1) || (c > b'7' && sign != -1)) {
+                return None;
+            }
+            value = value.wrapping_mul(10).wrapping_add((c - b'0') as i128);
+            if fraction {
+                scale -= 1;
+            }
+        } else if c == b'.' {
+            if fraction {
+                return None;
+            }
+            fraction = true;
+        } else if c == b'-' && !digit_seen && sign == 0 && !fraction {
+            sign = -1;
+        } else if c == b'+' && !digit_seen && sign == 0 && !fraction {
+            sign = 1;
+        } else if c == b'e' || c == b'E' {
+            exponent_at = Some(p);
+            break;
+        } else if c == b' ' {
+            while p < len && b[p] == b' ' {
+                p += 1;
+            }
+            if p < len {
+                return None;
+            }
+            break;
+        } else {
+            return None;
+        }
+        p += 1;
+    }
+    if !digit_seen {
+        return None;
+    }
+    if sign == -1 && value != i128::MIN {
+        value = -value;
+    }
+    if let Some(at) = exponent_at {
+        let mut esign: i8 = 0;
+        let mut exp: i32 = 0;
+        let mut edigit = false;
+        let mut q = at + 1;
+        while q < len {
+            let c = b[q];
+            if c.is_ascii_digit() {
+                edigit = true;
+                exp = exp * 10 + (c - b'0') as i32;
+                // cvt.cpp SHORT_LIMIT ((1 << 14) / 5)
+                if exp >= (1 << 14) / 5 {
+                    return None;
+                }
+            } else if c == b'-' && !edigit && esign == 0 {
+                esign = -1;
+            } else if c == b'+' && !edigit && esign == 0 {
+                esign = 1;
+            } else if c == b' ' {
+                while q < len && b[q] == b' ' {
+                    q += 1;
+                }
+                if q < len {
+                    return None;
+                }
+                break;
+            } else {
+                return None;
+            }
+            q += 1;
+        }
+        if !edigit {
+            return None;
+        }
+        scale += if esign == -1 { -exp } else { exp };
+    }
+    if !(-128..=127).contains(&scale) {
+        return None;
+    }
+    Some((value, scale))
+}
+
+/// [CS_CMP_ALIGN]'s check: an exact value aligned to `to` (a finer scale
+/// than its own) must fit the class width - 8 bytes for the int64 class,
+/// 16 for the int128 one - or the engine's alignment raises *numeric
+/// value is out of range* (cvt.cpp adjustForScale / Int128::setScale:
+/// `|v| > limit` before each x10, the limit the width's max / 10). Zero
+/// never overflows; a value already at or finer than `to` never scales.
+fn cmp_align_check(v: &Value, to: i8, bytes: u8) -> Result<(), EvalErr> {
+    let (raw, from): (i128, i8) = match v {
+        Value::Int(n) => (*n as i128, 0),
+        Value::Scaled(r, s) | Value::Rounded(r, s) => (*r as i128, *s),
+        Value::Int128(r, s) => (*r, *s),
+        _ => return Ok(()),
+    };
+    let k = from as i32 - to as i32;
+    if raw == 0 || k <= 0 {
+        return Ok(());
+    }
+    let limit: i128 = if bytes == 16 { i128::MAX } else { i64::MAX as i128 };
+    let fits = 10i128
+        .checked_pow(k as u32)
+        .and_then(|p| raw.checked_mul(p))
+        .is_some_and(|x| x <= limit && x >= -limit);
+    if fits {
+        Ok(())
+    } else {
+        Err(EvalErr::NumericOutOfRange)
+    }
+}
+
 /// The exponent path of [text_col_num]: the WHOLE string through the
 /// double grammar - outer spaces trimmed, NO interior spaces, shape
 /// `[+-]?(digits[.digits*]? | .digits)[eE][+-]?digits` - then Rust's
@@ -72635,7 +75935,64 @@ fn text_num_matches(s: &str, op: Cmp, rhs: &Rhs) -> Result<Option<bool>, EvalErr
 /// the stored value - which is what refuses `'9223372036854775807'` into
 /// `NUMERIC(18,4)`, where the mantissa fits an i64 but the x10^4 does
 /// not.
+///
+/// THE STORE PATH'S READER - a text parameter into a column
+/// ([encode_wire_value]) and into a procedure input ([bind_proc_args]) -
+/// and it reads EXACTLY as the previous binary did: no trailing-zero
+/// forgiveness. The engine does forgive a plain decimal's trailing
+/// fraction zeros that END the text (`SET N = ?` ['2.00000000000'] stores
+/// 2 where this refuses), but rounds 5 and 9 carried that forgiveness
+/// onto this path and it answered a text the engine's 22-byte SMALLINT /
+/// NUMERIC(4,1) buffer refuses (`SET SM = ?` ['1.000000000000000000000']
+/// wrote 1; the engine raises 22001) - so round 10 put the store path
+/// back to the previous binary's reading, and the refusal of
+/// ['2.00000000000'] is recorded as pre-existing. Only the compare rungs
+/// and a written CAST read through [text_to_exact_spelled].
 fn text_to_exact(n: TextNum, dtype: u8, scale: i8) -> Option<i128> {
+    text_to_exact_z(n, dtype, scale, false)
+}
+
+/// [text_to_exact] for the text `s` it was read from: the engine forgives
+/// a plain decimal's trailing fraction zeros ONLY WHEN THEY ARE THE LAST
+/// CHARACTERS OF THE TEXT ([frac_zeros_reach_end]) - cvt.cpp's decompose
+/// looks past an overflowing digit for zeros running to the end, and an
+/// exponent or a trailing blank stops that run. Round 5 dropped them
+/// from every spelling, so `UPDATE TS SET SM = ?` ['1.00000e0'] and
+/// ['1.00000 '], `SET N = ?` ['2.00000000000e0'] and ['2.00000000000 ']
+/// and `? + 1 = N` ['3.00000000000000000000e0'] answered where the engine
+/// raises *numeric value is out of range* (measured 2026-09-19, round 9,
+/// P2); ['2.00000000000'] and [' 2.00000000000'] still store 2.
+fn text_to_exact_spelled(n: TextNum, dtype: u8, scale: i8, s: &str) -> Option<i128> {
+    text_to_exact_z(n, dtype, scale, frac_zeros_reach_end(s))
+}
+
+/// Does a text end in its own digits - no exponent spelled, no trailing
+/// blank? Only then can its fraction zeros run to the end of the text.
+/// (Leading blanks do not matter: `' 2.00000000000'` stores 2.)
+fn frac_zeros_reach_end(s: &str) -> bool {
+    s.as_bytes().last().is_some_and(|c| c.is_ascii_digit()) && !s.bytes().any(|c| c == b'e' || c == b'E')
+}
+
+/// A COMPARE OPERAND RUNG's text whose trailing FRACTION zeros run to the
+/// end ([frac_zeros_reach_end]) with those zeros taken off - the engine's
+/// decompose drops them once the width overflows (cvt.cpp
+/// `cvt_decompose`, RETVAL_OVERFLOW in a fraction), so they never count,
+/// however many there are. [text_number] and [decimal_parts] stop at
+/// i128 / 38 fraction digits, and `? + 0 = N` ['2.' + 38 zeros] raised
+/// *conversion error* after a describe where the engine answers row 2
+/// ('0.5' + 40 zeros is 0.5 there and rounds to row 1) - round 11,
+/// the prepare-then-fail cells of round 10's refuter. None when there is
+/// nothing to take off; the value law is the one the rung already reads
+/// with its zeros dropped.
+fn strip_end_frac_zeros(s: &str) -> Option<String> {
+    if !frac_zeros_reach_end(s) || !s.contains('.') {
+        return None;
+    }
+    let t = s.trim_end_matches('0');
+    (t.len() < s.len()).then(|| t.to_string())
+}
+
+fn text_to_exact_z(n: TextNum, dtype: u8, scale: i8, zeros_drop: bool) -> Option<i128> {
     let (lo, hi, bytes) = match dtype {
         dtype::SHORT => (i16::MIN as i128, i16::MAX as i128, 2u32),
         dtype::LONG => (i32::MIN as i128, i32::MAX as i128, 4),
@@ -72663,6 +76020,20 @@ fn text_to_exact(n: TextNum, dtype: u8, scale: i8) -> Option<i128> {
             };
             (signed, 0)
         }
+    };
+    // a plain decimal's TRAILING FRACTION ZEROS are not significant
+    // digits: the engine drops them before the coefficient gate
+    // (`CAST('2.0000000000000000000' AS INTEGER)` is 2 where
+    // `'2.0000000000000000001'` is out of range, measured 2026-09-19 -
+    // the same rule the NUMERIC cast arm carries for '0.9999000') - when
+    // they end the text ([text_to_exact_spelled], round 9)
+    let (mantissa, exp) = {
+        let (mut m, mut x) = (mantissa, exp);
+        while zeros_drop && x < 0 && m != 0 && m % 10 == 0 {
+            m /= 10;
+            x += 1;
+        }
+        (m, x)
     };
     if mantissa < lo || mantissa > hi {
         return None;
@@ -72740,7 +76111,201 @@ fn decimal_parts(s: &str) -> Option<(i128, i8)> {
     Some((raw, -(frac.len() as i8)))
 }
 
+/// An EXPONENT-SPELLED text (`'2.5e0'`, `'25e-1'`, `'1e-40'`) read into
+/// an exact NUMERIC of backing width `bytes` (2 / 4 / 8) at `scale`, the
+/// way the engine reads it: cvt.cpp's `cvt_decompose` into the backing
+/// integer and then `adjustForScale` - which is NOT [text_to_exact]'s
+/// reading, in two places a text with an exponent reaches:
+///
+///   * the mantissa accumulates in the BACKING width and a digit that
+///     would overflow it is 22003 *numeric value is out of range* at
+///     once - its trailing fraction zeros are forgiven only when they run
+///     to the END of the text, which an exponent never lets them do
+///     (`'2.50000000000e0'` into NUMERIC(9,2) is out of range);
+///   * an integer-part zero run is never dropped (`'100000000000e-10'`
+///     is out of range), and the dropped digits round on the FIRST one
+///     dropped, half away from zero (`'2.555e0'` is 2.56, `'-2.555e0'`
+///     -2.56, `'4.99e-3'` 0, `'5e-3'` 0.01).
+///
+/// An exponent of 3276 or more is out of range in the scan itself
+/// (SHORT_LIMIT); `'1e-400'` is 0 and `'1e400'` out of range. Measured
+/// on the engine 2026-09-19, round 8 (Q2).
+///
+/// `None`: not this path - no exponent, a hex literal, an INT128 backing
+/// (left as it was) - or the engine's 22018 conversion error; the caller
+/// raises that. `Some(None)`: 22003. `Some(Some(raw))`: the value at
+/// `scale`.
+#[cfg(test)]
+fn exp_text_to_scaled(s: &str, bytes: u8, scale: i8) -> Option<Option<i128>> {
+    exp_text_to_scaled_at(s, bytes, scale, false)
+}
+
+/// [exp_text_to_scaled], and at an INT128 backing too when `int128` - the
+/// read an int128 multiply or divide makes of its operand (MOV_get_int128
+/// runs the same decompose with the Int128 limits; round 9, P5). Only the
+/// compare operand rung asks for it ([CS_OPERATOR_READ]); a CAST to
+/// NUMERIC(38, x) keeps its recorded conversion error.
+fn exp_text_to_scaled_at(s: &str, bytes: u8, scale: i8, int128: bool) -> Option<Option<i128>> {
+    let b = s.as_bytes();
+    let end = b.len();
+    let mut p = 0;
+    while p < end && b[p] == b' ' {
+        p += 1;
+    }
+    let backing_ok = bytes <= 8 || (int128 && bytes == 16);
+    if !backing_ok || !b[p..].iter().any(|&c| c == b'e' || c == b'E') {
+        return None;
+    }
+    // the hex form is decompose's other branch, and not this one
+    if p + 2 < end && b[p] == b'0' && (b[p + 1] == b'x' || b[p + 1] == b'X') {
+        return None;
+    }
+    // UPPER_LIMIT_BY_10 of the backing type - also adjustForScale's
+    // SHORT_LIMIT / LONG_LIMIT / INT64_LIMIT, the same three numbers
+    let lim10: i128 = match bytes {
+        2 => i128::from(i16::MAX / 10),
+        4 => i128::from(i32::MAX / 10),
+        8 => i128::from(i64::MAX / 10),
+        _ => i128::MAX / 10,
+    };
+    let mut value: i128 = 0; // the magnitude; the sign lands after the scan
+    let mut dscale: i32 = 0;
+    let mut sign = 0i8;
+    let (mut digit_seen, mut fraction) = (false, false);
+    while p < end {
+        let c = b[p];
+        if c.is_ascii_digit() {
+            digit_seen = true;
+            if value > lim10 {
+                if fraction {
+                    let mut q = p;
+                    while q < end && b[q] == b'0' {
+                        q += 1;
+                    }
+                    if q >= end {
+                        p = q;
+                        continue;
+                    }
+                }
+                return Some(None);
+            }
+            if value == lim10 && ((c > b'8' && sign == -1) || (c > b'7' && sign != -1)) {
+                return Some(None);
+            }
+            value = value * 10 + i128::from(c - b'0');
+            if fraction {
+                dscale -= 1;
+            }
+        } else if c == b'.' {
+            if fraction {
+                return None;
+            }
+            fraction = true;
+        } else if c == b'-' && !digit_seen && sign == 0 && !fraction {
+            sign = -1;
+        } else if c == b'+' && !digit_seen && sign == 0 && !fraction {
+            sign = 1;
+        } else if c == b'e' || c == b'E' {
+            break;
+        } else if c == b' ' {
+            while p < end && b[p] == b' ' {
+                p += 1;
+            }
+            if p < end {
+                return None;
+            }
+            break;
+        } else {
+            return None;
+        }
+        p += 1;
+    }
+    if !digit_seen {
+        return None;
+    }
+    let mut val = if sign == -1 { -value } else { value };
+    if p < end {
+        // the explicit exponent
+        let (mut esign, mut exp, mut edigit) = (0i8, 0i32, false);
+        p += 1;
+        while p < end {
+            let c = b[p];
+            if c.is_ascii_digit() {
+                edigit = true;
+                exp = exp * 10 + i32::from(c - b'0');
+                if exp >= 3276 {
+                    return Some(None);
+                }
+            } else if c == b'-' && !edigit && esign == 0 {
+                esign = -1;
+            } else if c == b'+' && !edigit && esign == 0 {
+                esign = 1;
+            } else if c == b' ' {
+                while p < end && b[p] == b' ' {
+                    p += 1;
+                }
+                if p < end {
+                    return None;
+                }
+                break;
+            } else {
+                return None;
+            }
+            p += 1;
+        }
+        dscale += if esign == -1 { -exp } else { exp };
+        if !edigit {
+            return None;
+        }
+    }
+    // adjustForScale: drop digits rounding on the first one dropped, or
+    // add them with the backing limit checked before every step
+    let mut adj = i32::from(scale) - dscale;
+    if adj > 0 {
+        let mut first_dropped = 0i128;
+        while adj > 0 {
+            if adj == 1 {
+                first_dropped = val % 10;
+            }
+            val /= 10;
+            adj -= 1;
+        }
+        if first_dropped > 4 {
+            val += 1;
+        } else if first_dropped < -4 {
+            val -= 1;
+        }
+    } else {
+        while adj < 0 {
+            if val > lim10 || val < -lim10 {
+                return Some(None);
+            }
+            val *= 10;
+            adj += 1;
+        }
+    }
+    Some(Some(val))
+}
+
 /// so it covers `INT128`-backed numerics; the caller narrows to `i64`.
+/// An approximate value rounded to an integer the way the engine's MOD
+/// reads it (SysFunction.cpp evlMod: MOV_get_int64 over a double rounds
+/// half away from zero and raises past the INT64 range) - the
+/// non-finite values raise the same *numeric value is out of range*.
+fn approx_to_int64(x: f64) -> Result<i128, EvalErr> {
+    if !x.is_finite() {
+        return Err(EvalErr::NumericOutOfRange);
+    }
+    let r = x.round();
+    // 2^63 as a double is exactly 9223372036854775808 - and MOV_get_int64
+    // rejects -2^63 exactly too (MOD(-9223372036854775807e0, 2) raises on
+    // the engine; the refuter's finding, measured 2026-09-19)
+    if r >= 9223372036854775808.0 || r <= -9223372036854775808.0 {
+        return Err(EvalErr::NumericOutOfRange);
+    }
+    Ok(r as i128)
+}
+
 fn round_scaled_to_int(raw: i128, scale: i8) -> i128 {
     if scale >= 0 {
         return raw * 10i128.pow(scale as u32);
@@ -74132,7 +77697,9 @@ impl Expr {
                 // its own (type_of returns None for it), but a CAST OUT
                 // of DECFLOAT is valid - the target arm below types the
                 // result and the eval reads the operand as a Dec.
-                if !matches!(**e, Expr::Param(_)) && !is_decfloat_arith(e, descs) {
+                // (a `-?` likewise: [arith_operand_rung] negates the
+                // parameter under its rung's cast)
+                if !is_untyped_param(e) && !is_decfloat_arith(e, descs) {
                     e.type_of(descs)?;
                 }
                 Some(match t {
@@ -75186,7 +78753,52 @@ impl Expr {
             // became spellable (see [neg_i64_min]); the engine describes
             // `- -9223372036854775808` as INT64 and raises 22003 when the
             // row is built, which is this arm.
-            Expr::Neg(e) => match e.eval(values)? {
+            // THE NEGATE RUNS AT ITS OPERAND'S OWN WIDTH: a value typed
+            // SHORT or INTEGER by a CAST - a user's `-CAST(? AS
+            // INTEGER)`, or the 4-byte message minimum
+            // [param_to_expr_msg] spells - overflows at THAT width's
+            // minimum, as NegateNode does on its operand's descriptor
+            // (measured 2026-09-18: `ID = -CAST(? AS INTEGER)` and `-? =
+            // ID` from a blr_long message both raise *Integer overflow*
+            // on -2147483648, `-CAST(? AS SMALLINT)` on -32768, while
+            // `-CAST(? AS BIGINT)` and a blr_int64 message answer no
+            // row)
+            // ...AND THROUGH AN IMPLICIT SLOT CAST ([CS_SLOT_CAST] /
+            // [CS_SLOT_OPERAND]) it is
+            // the MESSAGE'S width beneath that decides: a `?` described
+            // SMALLINT and bound a 4-byte -32768 negates to 32768 (the
+            // engine: `IIF(ID = 2, -? * 1, SM)` 2;32768;3), a `?` described
+            // BIGINT and bound the 4-byte -2147483648 overflows (`SET BI =
+            // -?`, X6), a bound text never overflows here (round 7)
+            Expr::Neg(e) => {
+                let mut op: &Expr = &**e;
+                let mut through = false;
+                while let Expr::Cast(inner, CastTarget::Int { .. } | CastTarget::Numeric { .. } | CastTarget::Approx, CS_SLOT_CAST | CS_SLOT_OPERAND) = op {
+                    op = inner;
+                    through = true;
+                }
+                let narrow_min: Option<i64> = match op {
+                    Expr::Cast(_, CastTarget::Int { bytes }, _)
+                    | Expr::Cast(_, CastTarget::Numeric { bytes, .. }, _)
+                        if *bytes <= 4 =>
+                    {
+                        Some(-(1i64 << (8 * u32::from(*bytes) - 1)))
+                    }
+                    _ => None,
+                };
+                // beneath a slot cast the MESSAGE's own value is the one at
+                // the minimum (a DOUBLE slot already holds -2147483648.0:
+                // `SET D = -?` [-2147483648] raises Integer overflow, X6)
+                if through && narrow_min.is_some() {
+                    match op.eval(values)? {
+                        Value::Int(n) if Some(n) == narrow_min => return Err(EvalErr::IntegerOverflow),
+                        Value::Scaled(r, _) if Some(r) == narrow_min => return Err(EvalErr::IntegerOverflow),
+                        _ => {}
+                    }
+                }
+                match e.eval(values)? {
+                Value::Int(n) if Some(n) == narrow_min => return Err(EvalErr::IntegerOverflow),
+                Value::Scaled(r, _) if Some(r) == narrow_min => return Err(EvalErr::IntegerOverflow),
                 Value::Int(n) => {
                     Value::Int(n.checked_neg().ok_or(EvalErr::IntegerOverflow)?)
                 }
@@ -75211,8 +78823,49 @@ impl Expr {
                 Value::DecFloat16(bits) => Value::DecFloat34(fire_crab_ods::decfloat::dec_to_bits(
                     &fire_crab_ods::decfloat::negate(&fire_crab_ods::decfloat::decode_dec64(bits)),
                 )),
+                // a TEXT operand negates as the DOUBLE the strict CVT
+                // grammar reads it as - NegateNode's default arm
+                // (MOV_get_double): what a text bound to `-?` under an
+                // arithmetic rung meets first ([arith_operand_rung]
+                // negates the parameter before the rung converts it)
+                Value::Text(s) => match text_number(&s) {
+                    None | Some(TextNum::Hex { .. }) => {
+                        return Err(conv_err(fire_crab_ods::intl::CS_UTF8, s))
+                    }
+                    Some(tn) => match text_to_approx(tn, &s) {
+                        Some(d) => Value::Double(-d),
+                        None => return Err(EvalErr::NumericOutOfRange),
+                    },
+                },
                 _ => Value::Null,
-            },
+                }
+            }
+            // `? * ?` under a 2- or 4-byte slot ([CS_MUL_I64]): the exact
+            // product, computed as the arm below computes it, must fit
+            // the engine's INT64 or it is *Integer overflow* (round 8, Q3)
+            // (one stamped side is enough: a single `?` beside a 4-byte
+            // exact operand is the same int64 branch - round 9, P3)
+            Expr::Bin(a, ArithOp::Mul, b)
+                if matches!(&**a, Expr::Cast(_, _, CS_MUL_I64)) || matches!(&**b, Expr::Cast(_, _, CS_MUL_I64)) =>
+            {
+                let va = a.eval(values)?;
+                let vb = b.eval(values)?;
+                if matches!(va, Value::Null) || matches!(vb, Value::Null) {
+                    return Ok(Value::Null);
+                }
+                // a rung casts to an 8-byte exact target and its sibling
+                // is a narrow exact operand: an integer or a scaled value,
+                // never anything else
+                let ((r1, s1), (r2, s2)) = match (numeric_parts(&va), numeric_parts(&vb)) {
+                    (Some(x), Some(y)) => (x, y),
+                    _ => return Err(EvalErr::Unsupported),
+                };
+                let raw = r1.checked_mul(r2).ok_or(EvalErr::IntegerOverflow)?;
+                if i64::try_from(raw).is_err() {
+                    return Err(EvalErr::IntegerOverflow);
+                }
+                scaled_value(raw, s1 + s2)
+            }
             Expr::Bin(a, op, b) => {
                 let va = a.eval(values)?;
                 let vb = b.eval(values)?;
@@ -75477,6 +79130,132 @@ impl Expr {
                 if matches!(v, Value::Null) {
                     return Ok(Value::Null); // NULL casts to NULL of any type
                 }
+                // [CS_CMP_ALIGN] / [CS_CMP_RAISE]: CHECKS on the other side
+                // of a whole-side text compare, not conversions - the value
+                // passes through untouched (round 11, W2)
+                if *cs == CS_CMP_RAISE {
+                    return Err(EvalErr::NumericOutOfRange);
+                }
+                if *cs == CS_CMP_ALIGN {
+                    if let CastTarget::Numeric { scale, bytes, .. } = t {
+                        cmp_align_check(&v, *scale, *bytes)?;
+                    }
+                    return Ok(v);
+                }
+                // [CS_TEXT_FIT]: a CHECK, not a conversion. The characters
+                // past the slot's length must all be blanks (`'2 '` into
+                // CHAR(1) answers), else 22001 naming the text's whole
+                // length (`'2.5  '` is `expected 1, actual 5`, measured)
+                if *cs == CS_TEXT_FIT || *cs == CS_TEXT_FIT_CHAR {
+                    if let CastTarget::Text { len, cs: slot_cs, .. } = t {
+                        use fire_crab_ods::intl;
+                        // THE SLOT'S LENGTH IN BYTES, as the describe
+                        // announces it: a text slot in any character set
+                        // but NONE / OCTETS is described in the
+                        // ATTACHMENT's (a UTF8 CHAR(1) is 4 bytes, a
+                        // WIN1252 CHAR(2) 8 under a UTF8 attachment) -
+                        // round 9, P4
+                        let slot_charset = slot_cs.unwrap_or(intl::CS_NONE);
+                        let att = CURRENT_ATT_CS.with(|c| c.get());
+                        let bpc = if matches!(slot_charset, intl::CS_NONE | intl::CS_OCTETS) {
+                            1
+                        } else if att == intl::CS_NONE {
+                            intl::bytes_per_char(slot_charset).max(1) as usize
+                        } else {
+                            intl::bytes_per_char(att).max(1) as usize
+                        };
+                        let slot_bytes = *len * bpc;
+                        let (kept, actual) = match &v {
+                            // THE ENGINE'S BYTE-LENGTH FAST PATH: a text
+                            // message EXACTLY as long in bytes as a CHAR
+                            // slot moves in without its characters being
+                            // counted, and the slot keeps its first `len`
+                            // (`IIF(ID = 2, COALESCE(?, 'xyz'), 'q') =
+                            // 'abc'` ['abcdefghijkl'] is row 2, ['éé'] into
+                            // a CHAR(1) and ['éééé'] into a UTF8 CHAR(2) pass,
+                            // while 11 and 13 bytes raise - measured
+                            // 2026-09-19, round 9, P4)
+                            Value::Text(s) if *cs == CS_TEXT_FIT_CHAR && bpc > 1 && s.len() == slot_bytes => {
+                                return Ok(Value::Text(s.chars().take(*len).collect()));
+                            }
+                            // ...AND ON A VARCHAR SLOT, at the ATTACHMENT's
+                            // width whatever the slot's own set: a text of
+                            // exactly 4 x 10 bytes into `COALESCE(?, S)`
+                            // (S a NONE VARCHAR(10)) passes and is cut to
+                            // 10 characters - 40 x's, 'cd' + 38 blanks, 38
+                            // x's + 'é' - while 11..39 and 41+ bytes raise
+                            // (round 11's refuter, lengths 10-44). The
+                            // previous binary answered those 40-byte cells
+                            // (`IIF(ID = 2, COALESCE(?, S), 'q') = 'cd'` -> none)
+                            // and round 9's check raised on them; round 12
+                            // keeps them answering (K4's re-measure)
+                            //
+                            // The engine keeps the first `len` CHARACTERS
+                            // and they must fit the slot's BYTE capacity
+                            // (a NONE slot's 10 bytes, trailing blanks
+                            // aside): 'é' x 20 raises `actual 20` (the
+                            // bytes of those 10 characters), 'é' + 38 x's
+                            // `actual 11`, 'éééé' + 30 blanks passes; what
+                            // passes is cut to that capacity ('ééééé' +
+                            // 30 blanks answers 'ééééé', 'cd' + 38 blanks
+                            // 'cd' + 8 blanks). Measured 2026-09-19, 46
+                            // engine cells over S and C.
+                            Value::Text(s)
+                                if *cs == CS_TEXT_FIT
+                                    && att != intl::CS_NONE
+                                    && intl::bytes_per_char(att) > 1
+                                    && s.len() == *len * intl::bytes_per_char(att) as usize =>
+                            {
+                                let kept: String = s.chars().take(*len).collect();
+                                if kept.trim_end_matches(' ').len() > slot_bytes {
+                                    return Err(EvalErr::StringTruncation {
+                                        expected: *len as i64,
+                                        actual: kept.len() as i64,
+                                    });
+                                }
+                                let mut out = String::new();
+                                for ch in kept.chars() {
+                                    if out.len() + ch.len_utf8() > slot_bytes {
+                                        break;
+                                    }
+                                    out.push(ch);
+                                }
+                                return Ok(Value::Text(out));
+                            }
+                            Value::Text(s) => (s.trim_end_matches(' ').chars().count(), s.chars().count()),
+                            // an INTEGER message moves in as its digits
+                            // (`[25]` is `expected 1, actual 2`, measured)
+                            Value::Int(n) => (n.to_string().len(), n.to_string().len()),
+                            Value::Int128(n, 0) => (n.to_string().len(), n.to_string().len()),
+                            // A DOUBLE MESSAGE (node-firebird's JS 2.5) is
+                            // RENDERED by the engine's float_to_text into
+                            // the slot's BYTE width ([approx_fit_text]:
+                            // `%- #.16g`, the precision cut to fit, below two
+                            // digits *numeric value is out of range*), and
+                            // that text is what the characters are counted
+                            // on: [2.5] into a UTF8 CHAR(1) is `expected 1,
+                            // actual 3`, CHAR(2) actual 7, CHAR(3) 11,
+                            // CHAR(5+) 17, [-2.5] one more, [0.1] and
+                            // [123.456] into CHAR(1) out of range (measured,
+                            // round 9, P4 - it passed unchecked and `SET S =
+                            // COALESCE(?, 'x')` [2.5] stored a row). A text
+                            // that fits IS the value, as on the engine.
+                            Value::Double(x) => {
+                                let r = approx_fit_text(*x, false, slot_bytes).ok_or(EvalErr::NumericOutOfRange)?;
+                                let n = r.chars().count();
+                                if n > *len {
+                                    return Err(EvalErr::StringTruncation { expected: *len as i64, actual: n as i64 });
+                                }
+                                return Ok(Value::Text(r));
+                            }
+                            _ => (0, 0),
+                        };
+                        if kept > *len {
+                            return Err(EvalErr::StringTruncation { expected: *len as i64, actual: actual as i64 });
+                        }
+                    }
+                    return Ok(v);
+                }
                 // The engine moves a TEXT source into the target's
                 // fixed conversion buffer BEFORE its grammar reads a
                 // character of it, so a source too long for that buffer
@@ -75633,11 +79412,72 @@ impl Expr {
                             // literal converts, and a magnitude past i128
                             // is out of range - while a non-numeric
                             // spelling is the 22018 conversion error
+                            // THE COEFFICIENT IS GATED AT THE TARGET'S OWN
+                            // WIDTH BEFORE IT ROUNDS ([text_to_exact], the
+                            // store's rule): `CAST('2.0000000000000000001'
+                            // AS INTEGER)`, `'2.4999999999999999999'`,
+                            // `'214748364.75'` and `'2147483647.4'` are
+                            // *numeric value is out of range*, `'1.999999'`
+                            // and `'3276.75'` into SMALLINT too, while
+                            // `'2.0000000000000000000'` is 2 and `'0.99995'`
+                            // into INTEGER 1 (measured 2026-09-19; both
+                            // binaries answered 2 / 214748365 / 3277)
+                            // ...WHERE THE ENGINE READS THE TEXT AT THIS
+                            // WIDTH ([int_cast_gates_coefficient], round 9:
+                            // a written CAST, a value position, an operator
+                            // rung); every other implicit cast reads the
+                            // text as the previous binary did
                             Value::Text(s) => match text_number(&s) {
+                                Some(tn @ TextNum::Dec { .. }) if *bytes <= 8 && int_cast_gates_coefficient(*cs) => {
+                                    let dt = match *bytes {
+                                        2 => dtype::SHORT,
+                                        4 => dtype::LONG,
+                                        _ => dtype::INT64,
+                                    };
+                                    match text_to_exact_spelled(tn, dt, 0, &s) {
+                                        Some(x) => fit(x)?,
+                                        None => return Err(EvalErr::NumericOutOfRange),
+                                    }
+                                }
+                                // an OPERATOR rung reads a hex text as the
+                                // engine's MOV_get_int64 does: sized by its
+                                // digit count and SIGNED at the width
+                                // (`? + 0 = N` ['0xFFFFFFFFFFFFFFFF'] is -1
+                                // and ['0x8000000000000000'] the minimum -
+                                // no row on the engine, where the unsigned
+                                // read raised out of range; round 9, P5)
+                                Some(tn @ TextNum::Hex { .. })
+                                    if *bytes == 8 && matches!(*cs, CS_OPERATOR_READ | CS_MUL_I64) =>
+                                {
+                                    match text_to_exact_z(tn, dtype::INT64, 0, false) {
+                                        Some(x) => fit(x)?,
+                                        None => return Err(EvalErr::NumericOutOfRange),
+                                    }
+                                }
                                 Some(tn) => match textnum_to_int128(tn) {
                                     Some(x) => fit(x)?,
                                     None => return Err(EvalErr::NumericOutOfRange),
                                 },
+                                // a compare OPERAND rung past the grammar's
+                                // i128: its end-running fraction zeros never
+                                // count ([strip_end_frac_zeros], round 11)
+                                None if *bytes <= 8 && matches!(*cs, CS_OPERATOR_READ | CS_MUL_I64) => {
+                                    let stripped = strip_end_frac_zeros(&s);
+                                    match stripped.as_deref().and_then(|t| text_number(t).map(|tn| (tn, t))) {
+                                        Some((tn @ TextNum::Dec { .. }, t)) => {
+                                            let dt = match *bytes {
+                                                2 => dtype::SHORT,
+                                                4 => dtype::LONG,
+                                                _ => dtype::INT64,
+                                            };
+                                            match text_to_exact_spelled(tn, dt, 0, t) {
+                                                Some(x) => fit(x)?,
+                                                None => return Err(EvalErr::NumericOutOfRange),
+                                            }
+                                        }
+                                        _ => return Err(conv_err(*cs, s)),
+                                    }
+                                }
                                 None => return Err(conv_err(*cs, s)),
                             },
                             // an approximate source rounds the same way -
@@ -75667,6 +79507,15 @@ impl Expr {
                                 // 8000000000000001, measured)
                                 let r = if x > 0.0 { x + (0.5 + eps) } else { x - (0.5 + eps) }.trunc();
                                 if r.abs() >= 1.701_411_834_604_692_3e38 {
+                                    return Err(EvalErr::NumericOutOfRange);
+                                }
+                                // MOV_get_int64 rejects EXACTLY -2^63 from a
+                                // double as it rejects +2^63 (`SET BI =
+                                // -(-?)` bound '-9223372036854775808' is
+                                // *numeric value is out of range* on the
+                                // engine, measured 2026-09-19; this stored
+                                // i64::MIN)
+                                if *bytes <= 8 && r <= -9_223_372_036_854_775_808.0 {
                                     return Err(EvalErr::NumericOutOfRange);
                                 }
                                 fit(r as i128)?
@@ -75890,15 +79739,76 @@ impl Expr {
                     // (probed: 12.55 to scale 1 is 12.6, -12.55 is -12.6)
                     CastTarget::Numeric { scale, bytes, .. } => {
                         let (raw, from) = match &v {
+                            // AN EXPONENT SPELLING reads by the engine's own
+                            // decompose ([exp_text_to_scaled]) - where
+                            // [decimal_parts] below knows no exponent and
+                            // answered *Conversion error* for
+                            // `CAST('2.5e0' AS NUMERIC(9,2))`, which the
+                            // engine answers 2.5 (round 8, Q2). Only a text
+                            // decimal_parts refuses can take it, so every
+                            // spelling that converted before converts as
+                            // it did.
+                            // ...AND ONLY WHERE THE STATEMENT WROTE THE CAST
+                            // or a compare rung reads it (round 10): every
+                            // implicit cast - a DML / MERGE / trigger-view
+                            // value or operand, a computed column - keeps
+                            // the previous binary's *Conversion error*
+                            // (`SET N41 = ? + 0` ['1.00000e0'] fails there
+                            // as it did; the engine stores 1 - recorded).
+                            // A HEX TEXT READ BY AN OPERATOR RUNG converts as
+                            // the unscaled rung's Int arm already reads it:
+                            // sized by its digit count at the backing width,
+                            // then scaled (`? + 0 = NM` and `? * 1 = N18`
+                            // ['0x10'] answer no row on the engine, where
+                            // this raised *Conversion error* after a
+                            // describe - prepare-then-fail; round 9, P5). A
+                            // CAST keeps the recorded conversion error.
+                            Value::Text(t)
+                                if *cs == CS_OPERATOR_READ && matches!(text_number(t), Some(TextNum::Hex { .. })) =>
+                            {
+                                let dt = if *bytes == 16 { dtype::INT128 } else { dtype::INT64 };
+                                let tn = text_number(t).ok_or(EvalErr::ConversionError(None))?;
+                                match text_to_exact_z(tn, dt, *scale, false) {
+                                    Some(raw) => (raw, *scale),
+                                    None => return Err(EvalErr::NumericOutOfRange),
+                                }
+                            }
+                            Value::Text(t)
+                                if decimal_parts(t).is_none() && (*cs < CS_IMPLICIT_FLOOR || *cs == CS_OPERATOR_READ) =>
+                            {
+                                match exp_text_to_scaled_at(t, *bytes, *scale, *cs == CS_OPERATOR_READ) {
+                                    Some(Some(raw)) => (raw, *scale),
+                                    Some(None) => return Err(EvalErr::NumericOutOfRange),
+                                    None => return Err(conv_err(*cs, t.clone())),
+                                }
+                            }
                             Value::Text(t) => {
-                                let (mut raw, mut from) = decimal_parts(t)
+                                // a compare OPERAND rung's end-running
+                                // fraction zeros never count, however many
+                                // ([strip_end_frac_zeros], round 11)
+                                let parts = match decimal_parts(t) {
+                                    None if *cs == CS_OPERATOR_READ => {
+                                        strip_end_frac_zeros(t).and_then(|u| decimal_parts(&u))
+                                    }
+                                    p => p,
+                                };
+                                let (mut raw, mut from) = parts
                                     .ok_or_else(|| conv_err(*cs, t.clone()))?;
                                 // a PLAIN decimal's trailing FRACTION zeros
                                 // are not significant digits and the engine
                                 // drops them before the coefficient gate:
                                 // '0.9999000' has coefficient 9999, not
                                 // 9999000, so it fits NUMERIC(4,4)
-                                while from < 0 && raw % 10 == 0 {
+                                // ...ON A COMPARE OPERAND RUNG only when they
+                                // END the text ([frac_zeros_reach_end]): a
+                                // trailing blank stops the engine's zero run,
+                                // so `? + 0 = N18` ['2.0000000000000000000 ']
+                                // raises *out of range* there, where this
+                                // answered row 2 (round 10 - a shape the
+                                // previous binary refused). Every other cast
+                                // keeps the previous binary's drop.
+                                let zeros_drop = *cs != CS_OPERATOR_READ || frac_zeros_reach_end(t);
+                                while zeros_drop && from < 0 && raw % 10 == 0 {
                                     raw /= 10;
                                     from += 1;
                                 }
@@ -76613,7 +80523,20 @@ impl Expr {
                         Value::Text(substring_impl(&fn_text(&vs[0]), fn_int(&vs[1])?, len)?)
                     }
                     SysFn::Trim(side) => {
-                        Value::Text(trim_impl(*side, &fn_text(&vs[0]), &fn_text(&vs[1])))
+                        // ONE ARGUMENT IS THE SOURCE ALONE and the pad is
+                        // the blank: the parameter path builds `TRIM(?)`
+                        // with no pad argument, and reading `vs[1]` here
+                        // PANICKED the server thread at execute (index out
+                        // of bounds) on both binaries - `UPDATE T SET S =
+                        // TRIM(?)` - and, once round 5's conditional arms
+                        // reached it, on `IIF(ID = 2, TRIM(?), 'a') = 'b'`
+                        // too (round 6, stabilisation: no panic, ever)
+                        let (what, src) = match vs.as_slice() {
+                            [what, src, ..] => (fn_text(what), fn_text(src)),
+                            [src] => (" ".to_string(), fn_text(src)),
+                            [] => return Err(EvalErr::Unsupported),
+                        };
+                        Value::Text(trim_impl(*side, &what, &src))
                     }
                     // LEFT/RIGHT go through the engine's SUBSTRING (their
                     // negative-length error NAMES it, probed) - so they
@@ -76688,8 +80611,20 @@ impl Expr {
                     // round each operand to an integer first (the
                     // engine's rule, probed: MOD(12.50, 5) = 3), then a
                     // truncated `%` - C's and Rust's share the sign rule
+                    // ... and an APPROXIMATE operand rounds the same way,
+                    // half away from zero into an INT64 (measured
+                    // 2026-09-19 over D = 1.5 / 2.5 / 3.5: MOD(D, 2) ->
+                    // 0;1;0, MOD(D, 2.5) -> 2;0;1, MOD(2, D) -> 0;2;2,
+                    // MOD(NM, D) -> 1;1;3, MOD(-D, 2) -> 0;-1;0, MOD(D,
+                    // 0.4e0) raises *Integer divide by zero*, MOD(1e19, 7)
+                    // and MOD(7, 1e19) raise *numeric value is out of
+                    // range*; before this every one of them prepared with
+                    // its INT64 describe and failed at execute)
                     SysFn::Mod => {
                         let to_int = |v: &Value| -> Result<i128, EvalErr> {
+                            if let Some(x) = approx_of(v) {
+                                return approx_to_int64(x);
+                            }
                             let (raw, scale) =
                                 numeric_parts(v).ok_or(EvalErr::ConversionError(None))?;
                             Ok(round_scaled_to_int(raw, scale))
@@ -76749,10 +80684,24 @@ impl Expr {
                         };
                         scaled_value(result, 0)
                     }
+                    // SIGN of an approximate operand is its sign as a SHORT
+                    // (measured 2026-09-19: SIGN(D) -> 1;1;1, SIGN(-D) ->
+                    // -1;-1;-1, SIGN(D - 2.5) -> -1;0;1, SIGN(0.0e0) -> 0;
+                    // before this it prepared as SHORT and failed at execute)
                     SysFn::Sign => {
-                        let (raw, _) =
-                            numeric_parts(&vs[0]).ok_or(EvalErr::ConversionError(None))?;
-                        Value::Int(raw.signum() as i64)
+                        if let Some(x) = approx_of(&vs[0]) {
+                            Value::Int(if x > 0.0 {
+                                1
+                            } else if x < 0.0 {
+                                -1
+                            } else {
+                                0
+                            })
+                        } else {
+                            let (raw, _) =
+                                numeric_parts(&vs[0]).ok_or(EvalErr::ConversionError(None))?;
+                            Value::Int(raw.signum() as i64)
+                        }
                     }
                     // ASCII_VAL(s): the code of the first character (a
                     // carrier char's code IS its byte, 0..255), 0 for empty.
@@ -78376,6 +82325,236 @@ fn subst_prm_markers(text: &str, lit: &dyn Fn(usize) -> Option<String>) -> Optio
     Some(out)
 }
 
+/// Is the `FC$PRM` marker at `at..end` of a MASKED subquery text a WHOLE
+/// COMPARISON SIDE - the operand right beside a comparison operator,
+/// through any parentheses (`b.ID = FC$PRM0`, `(FC$PRM0) = b.ID`, `IIF(b.D
+/// < FC$PRM0, ..)`) - or an element of an IN list (`b.ID IN (FC$PRM0, 3)`,
+/// `.. IN (3, FC$PRM0)`)? Those are the positions the engine reads a
+/// text bind at with its COMPARE grammar; a marker under a CAST
+/// (`CAST(FC$PRM0 AS INTEGER)`, the strict grammar), a `||`, a COALESCE
+/// or a function argument is not one.
+fn corr_marker_is_cmp_side(b: &[u8], at: usize, end: usize) -> bool {
+    let is_cmp = |c: u8| matches!(c, b'=' | b'<' | b'>' | b'!' | b'~' | b'^');
+    let mut i = at;
+    loop {
+        while i > 0 && b[i - 1].is_ascii_whitespace() {
+            i -= 1;
+        }
+        if i > 0 && b[i - 1] == b'(' {
+            i -= 1;
+        } else {
+            break;
+        }
+    }
+    if i > 0 && is_cmp(b[i - 1]) {
+        return true;
+    }
+    // a simple CASE's WHEN value - `CASE b.ID WHEN FC$PRM0 THEN ..` - is
+    // the DecodeNode's compare of the subject against it, read with the
+    // compare grammar like any comparison side (`CASE b.ID WHEN ? ..`
+    // bound '2.0000000000000000001' answers no row, bound
+    // '2.00000000000000000000000000000000000001' row 2, measured
+    // 2026-09-19; the strict spelling prepared and failed at execute)
+    {
+        let mut s = i;
+        while s > 0 && b[s - 1].is_ascii_alphabetic() {
+            s -= 1;
+        }
+        if b[s..i].eq_ignore_ascii_case(b"WHEN") && (s == 0 || !is_ident_byte(b[s - 1])) {
+            return true;
+        }
+    }
+    let mut j = end;
+    loop {
+        while j < b.len() && b[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if j < b.len() && b[j] == b')' {
+            j += 1;
+        } else {
+            break;
+        }
+    }
+    if j < b.len() && is_cmp(b[j]) {
+        return true;
+    }
+    // an IN-list element: the innermost enclosing parenthesis is `IN (`
+    let mut depth = 0usize;
+    let mut k = at;
+    while k > 0 {
+        k -= 1;
+        match b[k] {
+            b')' => depth += 1,
+            b'(' if depth > 0 => depth -= 1,
+            b'(' => {
+                let mut w = k;
+                while w > 0 && b[w - 1].is_ascii_whitespace() {
+                    w -= 1;
+                }
+                let mut s = w;
+                while s > 0 && (b[s - 1].is_ascii_alphanumeric() || b[s - 1] == b'_') {
+                    s -= 1;
+                }
+                return b[s..w].eq_ignore_ascii_case(b"IN");
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// The statement slots of every `FC$PRM<slot>` marker in a subquery text
+/// that [corr_marker_is_cmp_side] holds for, read off the masked text so
+/// a `?` or an operator inside a string literal is data.
+fn corr_cmp_side_slots(text: &str) -> Vec<usize> {
+    let masked = mask_literals(text);
+    let b = masked.as_bytes();
+    let mut out = Vec::new();
+    let mut from = 0usize;
+    while let Some(p) = masked[from..].find("FC$PRM") {
+        let at = from + p;
+        let mut end = at + 6;
+        while end < b.len() && b[end].is_ascii_digit() {
+            end += 1;
+        }
+        if end > at + 6 {
+            if let Ok(idx) = masked[at + 6..end].parse::<usize>() {
+                if corr_marker_is_cmp_side(b, at, end) {
+                    out.push(idx);
+                }
+            }
+        }
+        from = end;
+    }
+    out
+}
+
+/// A subquery slot the compare grammar applies to: an exact or an
+/// approximate number.
+fn corr_slot_is_number(d: &Descriptor) -> bool {
+    matches!(
+        d.dtype,
+        dtype::SHORT | dtype::LONG | dtype::INT64 | dtype::INT128 | dtype::DOUBLE | dtype::REAL
+    )
+}
+
+/// THE SPELLING OF A TEXT BOUND INTO A NUMERIC WHOLE-SIDE `?` INSIDE A
+/// SUBQUERY BODY. The engine reads it with the COMPARE grammar
+/// ([Expr::TextNum], [text_col_num]) exactly as it reads the outer
+/// `IIF(ID = ?, 1, 0)`, and the two agree spelling by spelling (measured
+/// 2026-09-19, cmpfix4, `ID IN (SELECT b.ID FROM T b WHERE IIF(b.ID = ?,
+/// 1, 0) = 1)` against the outer `IIF(ID = ?, 1, 0) = 1`): a number
+/// class spells back as the number it reads - '1 2' is 12, '2 .5' is
+/// 2.5 (`IIF(b.D = ?..)` -> row 2), '+2', '2.', '2e0', ' 2 ' are 2,
+/// '2.0000000000000000001' keeps its 19 decimals (`b.ID = ?` no row,
+/// `b.ID < ?` -> 1;2 - a NUMERIC(38,19) CAST, [corr_literal]); the
+/// orders-high class - a capital-X hex ('0X2', '0XG') or an overflowing
+/// exponent ('1e400', '1.5e400') - spells as the largest double, which
+/// no row equals and every row sits below (`b.ID < ?` -> 1;2;3, `b.ID >
+/// ?` -> none, `b.ID <> ?` -> 1;2;3, all measured); and the
+/// conversion-error class ('', 'abc', '0x2', '0X', '1e', 'x', a quote
+/// or a comment inside the text) spells as a CAST of the text to the
+/// slot's type, which the inner evaluation raises *conversion error
+/// from string ".."* on - the engine's own error at execute (measured
+/// with the quote and comment texts through the inner planner's string
+/// literal). Before this, every one of these texts was spelled as a
+/// bare string literal that the inner planner could not take, and the
+/// statement PREPARED with a describe and then failed at execute with
+/// *Dynamic SQL Error* where the engine answers or raises the
+/// conversion error.
+/// THE ENGINE'S ALIGNMENT RAISE FOR A TEXT BOUND INTO A WHOLE-SIDE EXACT
+/// `?` INSIDE A SUBQUERY BODY (round 11, W2's body twin). The body is
+/// spelled into SQL with the value as a literal, so the per-row check
+/// the outer compare carries ([bind_whole_side_exact_cmp]) has no place
+/// to live; what the spelling CAN carry is the raise the engine makes
+/// against every NON-ZERO value: a text whose own alignment leaves its
+/// class width ([whole_side_text_overflows]), and a text whose finer
+/// scale pushes the other side 19+ places in the int64 class or 39+ in
+/// the int128 one (`ID IN (SELECT b.ID FROM TW b WHERE IIF(b.N = ?, 1,
+/// 0) = 1)` bound '0.5' + 18 zeros raises there; so does '0.' + 38
+/// ones... measured 2026-09-19). The spelling is a CAST that raises
+/// *numeric value is out of range* when the body's compare evaluates it.
+/// RECORDED, not modelled: a body whose compared values are all zero or
+/// NULL (the engine raises nothing there), and an alignment of 1..18
+/// (38) places that only overflows for a huge column value.
+/// A subquery body's whole-side EXACT `?` bound to a text whose compare
+/// ALIGNS (the text's scale finer than the slot's, or its own alignment
+/// leaving the width): spelled as the quoted text itself, so the inner
+/// plan compares `b.NM = '<text>'` - the literal compare, which converts
+/// it to the same value and carries the engine's per-row alignment raise
+/// ([cmp_align_wrap]). None when the text does not align (the numeric
+/// spelling of [corr_text_cmp_literal] is exact there) or the literal
+/// compare cannot convert it (past an int64 coefficient).
+fn corr_whole_exact_literal(s: &str, d: &Descriptor) -> Option<String> {
+    let (_, _, st) = engine_cmp_class(s)?;
+    if !(st < d.scale as i32 || whole_side_text_overflows(s, d.scale)) {
+        return None;
+    }
+    if s.contains('\'') || s.contains('\0') {
+        return None;
+    }
+    if num_literal_expr(s).is_some() {
+        return Some(format!("'{}'", s));
+    }
+    // past the literal compare's int64 coefficient: a constant TEXT side,
+    // compared per row with the compare grammar and aligned the same way
+    Some(format!("CAST('{}' AS VARCHAR({}))", s, s.chars().count().max(1)))
+}
+
+fn corr_whole_exact_raise(s: &str, d: &Descriptor) -> Option<String> {
+    let raise = || Some("CAST('99999999999999999999' AS NUMERIC(18,0))".to_string());
+    if whole_side_text_overflows(s, d.scale) {
+        return raise();
+    }
+    let (wide, _, st) = engine_cmp_class(s)?;
+    let k = d.scale as i32 - st;
+    if (!wide && k >= 19) || (wide && k >= 39) {
+        return raise();
+    }
+    None
+}
+
+fn corr_text_cmp_literal(s: &str, d: &Descriptor) -> Option<String> {
+    let v = match text_col_num(s) {
+        // the scaled-slot overflow class raises *numeric value is out of
+        // range* at execute, as the engine does ([text_overflows_scaled_slot]):
+        // spelled as the strict CAST of the same digits at the slot's
+        // scale, which the inner evaluation raises on
+        ColNum::Exact(m, sc) if text_overflows_scaled_slot(m, sc, d.scale) => {
+            let digits = Value::Int128(m, sc as i8).render();
+            return Some(format!("CAST('{}' AS NUMERIC(18,{}))", digits, -(d.scale as i32)));
+        }
+        // a POSITIVE scale is the dec128 path's absorbed places of a text
+        // past 38 digits (`999..9` x39 is 10^34 x 10^5): no NUMERIC(38,n)
+        // spells it, so it travels as the double it compares as (the
+        // engine: no row equals it, every row sits below it - measured
+        // 2026-09-19; a NUMERIC(38,-5) spelling prepared then failed)
+        ColNum::Exact(m, sc) if sc > 0 => {
+            Value::Double(exact_to_f64(m, sc).clamp(-f64::MAX, f64::MAX))
+        }
+        ColNum::Exact(m, sc) => match i8::try_from(sc) {
+            Ok(sc8) => Value::Int128(m, sc8),
+            Err(_) => Value::Double(exact_to_f64(m, sc)),
+        },
+        ColNum::Dbl(x) => {
+            if x.is_nan() {
+                return None;
+            }
+            Value::Double(x.clamp(-f64::MAX, f64::MAX))
+        }
+        ColNum::HexHigh => Value::Double(f64::MAX),
+        // spelled as a DOUBLE cast whatever the slot: the exact CAST
+        // grammar reads a lowercase hex ('0x2') as a number where the
+        // compare grammar raises, the double grammar raises on every
+        // text of this class (measured: `CAST('0x2' AS DOUBLE
+        // PRECISION)` raises inside the body, `.. AS INTEGER` answered 2)
+        ColNum::Raise => {
+            return Some(format!("CAST('{}' AS DOUBLE PRECISION)", s.replace('\'', "''")));
+        }
+    };
+    corr_literal(&v, d)
+}
+
 /// Rewrite each `?` OUTSIDE a string literal into an `FC$PRM<slot>`
 /// marker, numbering from `base` in TEXT order, and answer the markers
 /// made. `None` when the text holds no placeholder at all, so a caller
@@ -78453,7 +82632,15 @@ fn corr_literal(v: &Value, d: &Descriptor) -> Option<String> {
             // column's bytes and its set; the width is the column's own.
             let cs = fire_crab_ods::intl::charset_id(d.sub_type);
             let name = charset_sql_name(cs)?;
-            let chars = fire_crab_ods::intl::char_length(d.dtype, d.length, d.sub_type).max(1);
+            // at the WIDER of the column's width and the TEXT's own: an
+            // outer row's value always fits its column, but a BOUND text
+            // longer than the slot compares untruncated on the engine
+            // (`IIF(b.S = ?, 1, 0)` bound 21 characters into a VARCHAR(10)
+            // answers no row, `b.S < ?` row 1, measured 2026-09-19) where
+            // the column's width raised *string right truncation*
+            let chars = fire_crab_ods::intl::char_length(d.dtype, d.length, d.sub_type)
+                .max(1)
+                .max(t.chars().count());
             let kw = if d.dtype == dtype::VARYING { "VARCHAR" } else { "CHAR" };
             if t.is_empty() {
                 format!("CAST('' AS {}({}) CHARACTER SET {})", kw, chars, name)
@@ -78717,6 +82904,59 @@ fn text_has_param(text: &str) -> bool {
     mask_literals(text).contains('?')
 }
 
+/// Does the text put a `?` under a unary minus or as a DIRECT operand of
+/// `+ - * /` (`-? = b.ID`, `b.NM = ? * b.ID`, `b.ID - ? = 1`, `-(?)`)?
+/// Inside a subquery body such a `?` is spelled back into the text as a
+/// bare literal at bind ([subst_prm_markers]) - `-'-2' = b.ID`, `'2.5' *
+/// b.ID` - which the per-row re-plan refuses AFTER the prepare has
+/// answered a describe, the worst boundary (measured 2026-09-18: `EXISTS
+/// (SELECT 1 FROM T b WHERE b.ID = T.ID AND -? = b.ID) ['-2']` described
+/// LONG and failed at execute with *Dynamic SQL Error*, engine 2). The
+/// statement refuses at prepare instead, as it did before the rungs
+/// existed. A `?` whose neighbours are anything else spells back and
+/// answers (`b.ID = ?`, `IIF(b.ID = ?, ..)`, `CAST(? AS INTEGER) + 1`,
+/// `? || ''`, `(?) = b.ID`, `IN (?, 3)`, `b.ID < ?` - all measured
+/// against the engine). Parentheses opened directly before the `?` are
+/// looked through on both sides, so `-(?)` and `(? * 2)` count.
+fn text_param_under_operator(text: &str) -> bool {
+    let m = mask_literals(text);
+    let b = m.as_bytes();
+    let is_op = |c: u8| matches!(c, b'+' | b'-' | b'*' | b'/');
+    (0..b.len()).filter(|&i| b[i] == b'?').any(|i| {
+        // left: past blanks and opening parens (counted)
+        let mut l = i;
+        let mut opens = 0usize;
+        while l > 0 {
+            let c = b[l - 1];
+            if c.is_ascii_whitespace() {
+                l -= 1;
+            } else if c == b'(' {
+                opens += 1;
+                l -= 1;
+            } else {
+                break;
+            }
+        }
+        if l > 0 && is_op(b[l - 1]) {
+            return true;
+        }
+        // right: past blanks and up to `opens` closing parens
+        let mut r = i + 1;
+        let mut closes = 0usize;
+        loop {
+            match b.get(r) {
+                Some(c) if c.is_ascii_whitespace() => r += 1,
+                Some(b')') if closes < opens => {
+                    closes += 1;
+                    r += 1;
+                }
+                _ => break,
+            }
+        }
+        b.get(r).is_some_and(|&c| is_op(c))
+    })
+}
+
 /// Register a scanned subquery under a fresh id.
 fn corr_register(
     source: &str,
@@ -78735,14 +82975,56 @@ fn corr_register(
     // still carries the placeholder, so planning it announces the slot.
     let params: Vec<(usize, Descriptor)> = if text_has_param(&scan.text) {
         let base = param_base?;
+        if text_param_under_operator(&scan.text) {
+            return None; // spelled back as a bare literal, it would fail after the describe
+        }
         let (marked, slots) = mark_text_params(&scan.text, base)?;
         let standin = corr_standin_text(&scan)?;
         let mut ip: Vec<Option<Descriptor>> = Vec::new();
-        plan_query_inner(&standin, db_opt, &mut ip)?;
+        // the inner plan knows it is one ([CORR_INNER_PLAN]: a whole-side
+        // TIME slot refuses there, [whole_side_rung]); restored whatever
+        // the plan answers, and nested bodies keep it set
+        let was = CORR_INNER_PLAN.with(|c| c.replace(true));
+        let outer_whole = CORR_WHOLE_EXACT.with(|c| c.replace(Vec::new()));
+        let planned = plan_query_inner(&standin, db_opt, &mut ip);
+        let whole_exact = CORR_WHOLE_EXACT.with(|c| c.replace(outer_whole));
+        CORR_INNER_PLAN.with(|c| c.set(was));
+        // A REFUSED INNER PLAN IS A REFUSAL HERE. This is THE ONE place
+        // every subquery body with a `?` is planned for the describe,
+        // and `Plan::Refused` used to pass the `?` above unnoticed: a
+        // body whose whole-side TIME slot refused inside a DERIVED TABLE
+        // (`ID IN (SELECT x.ID FROM (SELECT ID, TM FROM TS) x WHERE
+        // IIF(x.TM = ?, 1, 0) = 1)`, the scalar / EXISTS / = ANY forms,
+        // a UNION or UNION ALL body's first branch, a derived table's
+        // own WHERE) came back as a Refused plan with its slot already
+        // claimed, the statement prepared with the TIME describe and
+        // failed at execute (round 5's E reached only the plain body).
+        // The previous binary refused every one at prepare; so does this
+        // (round 6, stabilisation). The DATE / TIMESTAMP twins still
+        // answer: their inner plans are not refused.
+        if matches!(planned?, Plan::Refused | Plan::RefusedEval(_)) {
+            return None;
+        }
         if ip.len() != slots.len() {
             return None; // the inner plan numbered them differently
         }
-        let ds: Vec<Descriptor> = ip.into_iter().collect::<Option<Vec<_>>>()?;
+        let mut ds: Vec<Descriptor> = ip.into_iter().collect::<Option<Vec<_>>>()?;
+        // a whole-side EXACT rung's slot carries the mark to the bind
+        // ([corr_whole_exact_raise]); the statement's describe never sees
+        // it ([CORR_PRM] is published without it below)
+        for j in whole_exact {
+            if let Some(d) = ds.get_mut(j) {
+                d.flags |= PARAM_WHOLE_EXACT;
+            }
+        }
+        // a CLASSIC numeric compare side of the body carries the round-12
+        // blank cap to the statement's bind ([PARAM_BODY_CMP])
+        let cmp_sides = corr_cmp_side_slots(&marked);
+        for (slot, d) in slots.iter().zip(ds.iter_mut()) {
+            if d.flags & PARAM_WHOLE_EXACT == 0 && cmp_sides.contains(slot) && corr_slot_is_number(d) {
+                d.flags |= PARAM_BODY_CMP;
+            }
+        }
         scan.text = marked;
         slots.into_iter().zip(ds).collect()
     } else {
@@ -78794,7 +83076,13 @@ fn corr_register(
     }
     // the describe cannot see a `?` that lives inside this text, so the
     // slots it claimed are published for the statement's sink
-    CORR_PRM.with(|r| r.borrow_mut().extend(params.iter().cloned()));
+    CORR_PRM.with(|r| {
+        r.borrow_mut().extend(params.iter().map(|(i, d)| {
+            let mut d = d.clone();
+            d.flags &= !PARAM_WHOLE_EXACT;
+            (*i, d)
+        }))
+    });
     let t = CorrTemplate { source: source.to_string(), text: scan.text, refs, params, kind, desc };
     CORR_REG.with(|r| {
         let mut reg = r.borrow_mut();
@@ -81425,7 +85713,15 @@ fn resolve_subqueries(
                 // a SCALAR subquery is a singleton stream, never a hash
                 // key: `A = (SELECT T FROM J2)` answers where the same
                 // value through `A IN (SELECT T FROM J2)` raises (probed)
-                out.push(value_to_tok(&rows.values[0], false)?);
+                let lit = value_to_tok(&rows.values[0], false)?;
+                // a `?` elsewhere in the statement may take ITS slot from
+                // this fold: the literal then carries the inner column's
+                // own exact type ([corr_fold_typed_tok])
+                out.push(if toks.iter().any(|t| matches!(t, Tok::Param)) {
+                    corr_fold_typed_tok(lit, sql, db_opt)?
+                } else {
+                    lit
+                });
                 i += 2;
             }
             // a subquery anywhere else (bare, or as an LHS) is a scalar
@@ -81448,6 +85744,57 @@ fn resolve_subqueries(
         }
     }
     Some(out)
+}
+
+/// A folded scalar subquery's literal, typed as the INNER COLUMN
+/// describes when a `?` in the statement may take its slot from it. The
+/// engine types `? * ID = (SELECT b.NM FROM T b WHERE b.ID = 3)` from
+/// the subquery's column - 496 LONG scale -2 sub_type 1 - and the
+/// multiply's side rule then rounds the LEFT `?` (`['1.25']` -> no row,
+/// `ID * ? = ..` -> 2; `? * ID = (SELECT CAST(2.5 AS NUMERIC(4,1)) ..)`
+/// -> no row from a SHORT slot); folded to the bare literal 2.50 the
+/// slot read 580 INT64, the RIGHT rounded, and row 2 answered - and
+/// `UPDATE T SET N = 99 WHERE ? * ID = (SELECT b.NM ..)` changed it
+/// (measured 2026-09-18). The literal is wrapped in a CAST to the
+/// column's exact type exactly when its own describe would differ (a
+/// scaled value reads INT64 where the column is LONG or SHORT; a small
+/// integer reads LONG where the column is BIGINT / COUNT / SUM; the
+/// NUMERIC sub_type); an integer literal that already reads as its
+/// column stays the bare literal, index-friendly. Text, approximate,
+/// temporal and NULL folds are untouched (their describe gaps are
+/// recorded elsewhere and no side rule reads them). The inner text is
+/// planned once more for its describe; a text this cannot plan refuses
+/// rather than keep the mis-typed literal.
+fn corr_fold_typed_tok(lit: Tok, sql: &str, db_opt: &Option<Database>) -> Option<Tok> {
+    let raw = match &lit {
+        Tok::Int(n) => RawExpr::Int(*n),
+        Tok::Dec(r, s) => RawExpr::Dec(*r, *s),
+        _ => return Some(lit),
+    };
+    let mut ip: Vec<Option<Descriptor>> = Vec::new();
+    let plan = plan_query_inner(sql, db_opt, &mut ip)?;
+    let col = output_cols_of(&plan).into_iter().next()?;
+    let bytes: u8 = match col.sql_type & !1 {
+        500 => 2,
+        496 => 4,
+        580 => 8,
+        _ => return Some(lit),
+    };
+    let (scale, sub_type) = (i8::try_from(col.scale).ok()?, i16::try_from(col.sub_type).ok()?);
+    let natural: (u8, i8, i16) = match &raw {
+        RawExpr::Int(n) => (if i32::try_from(*n).is_ok() { 4 } else { 8 }, 0, 0),
+        RawExpr::Dec(_, s) => (8, *s, 0),
+        _ => return Some(lit),
+    };
+    if natural == (bytes, scale, sub_type) {
+        return Some(lit);
+    }
+    let target = if scale == 0 && sub_type == 0 {
+        CastTarget::Int { bytes }
+    } else {
+        CastTarget::Numeric { scale, bytes, sub_type }
+    };
+    Some(Tok::FnExpr(RawExpr::Cast(Box::new(raw), target)))
 }
 
 /// A comparison's left operand token as the expression it is - what a
@@ -83994,11 +88341,14 @@ fn parse_value(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<Rhs> {
 /// arithmetic operators back into a [RawExpr] - the comparison SIDES of
 /// a predicate (`WHERE A + 1 > B * 2`). Mirrors the char-level parser's
 /// precedence (`+`/`-` over `*`/`/` over unary `-` over atoms); function
-/// calls arrive pre-parsed as [Tok::FnExpr]. A bare `?` is NOT an
-/// expression atom - it stays on the classic Rhs path, where its bind
-/// machinery lives - but a `?` INSIDE a pre-parsed call (`CAST(? AS
-/// INTEGER)`) is numbered here, at its textual place, because the whole
-/// call lexed as ONE token and [parse_value] never saw its placeholder.
+/// calls arrive pre-parsed as [Tok::FnExpr]. A `?` that is a whole
+/// side stays on the classic Rhs path, where its bind machinery lives
+/// ([parse_side] and [parse_leaf] try [parse_value] first); a `?`
+/// INSIDE arithmetic (`ID * ? = 2`, `SUM(ID) > ? + 1`) is an atom here
+/// ([texpr_atom_bare]'s Tok::Param arm), numbered at its textual place,
+/// as is a `?` inside a pre-parsed call (`CAST(? AS INTEGER)`), because
+/// the whole call lexed as ONE token and [parse_value] never saw its
+/// placeholder.
 fn texpr(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<RawExpr> {
     let mut left = texpr_mul(t, pos, np)?;
     loop {
@@ -84150,6 +88500,20 @@ fn texpr_atom_bare(t: &[Tok], pos: &mut usize, np: &mut usize) -> Option<RawExpr
                 return None;
             }
             inner
+        }
+        // a `?` as an ARITHMETIC ATOM - `ID * ? = 2`, `? + 1 = ID`, `SUM(ID)
+        // > ? + 1`, `S || ? = 'abx'` (all engine-answered, measured; every
+        // one refused HERE, at parse, before any resolver saw it). It
+        // claims its slot once, at its place in the text. A BARE `?` never
+        // reaches this arm: parse_side and parse_leaf try parse_value FIRST
+        // on a speculative np and keep the classic Rhs::Param leaf when the
+        // `?` ends the side; when it does not, the speculation is discarded
+        // before texpr runs, so the slot is counted exactly once. The
+        // `?`-first leaf (`? = ID * 2`) is unchanged; `? = ?` and `? = ID *
+        // ?` now PARSE and refuse at resolution (both sides).
+        Tok::Param => {
+            *np += 1;
+            RawExpr::Param(*np - 1)
         }
         _ => return None,
     };
@@ -87337,6 +91701,8 @@ fn plan_merge(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor>
     // value take the destination COLUMN's descriptor; a parameter
     // compared in the ON clause or a branch's AND takes the column it
     // is compared with. Anything else keeps the old refusal.
+    // (the markers the value typing finds at a VALUE position - round 9)
+    let mut value_slots: std::collections::HashSet<usize> = std::collections::HashSet::new();
     let params: Vec<Descriptor> = if nparams == 0 {
         Vec::new()
     } else {
@@ -87350,7 +91716,7 @@ fn plan_merge(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor>
             }
             match act {
                 MergeAction::Update(sets) => {
-                    type_markers_in_sets(sets, &columns, descs, &tgt_alias, &mut slots)?
+                    type_markers_in_sets(sets, &columns, descs, &tgt_alias, &mut slots, &mut value_slots)?
                 }
                 MergeAction::Delete => {}
             }
@@ -87359,7 +91725,7 @@ fn plan_merge(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor>
             if let Some(c) = cond {
                 type_markers_in_cond(c, &columns, descs, &tgt_alias, &mut slots)?;
             }
-            type_markers_in_values(cols.as_ref(), vals, &columns, descs, &mut slots)?;
+            type_markers_in_values(cols.as_ref(), vals, &columns, descs, &mut slots, &mut value_slots)?;
         }
         // a marker in the SOURCE query - or anywhere else this walk did
         // not reach - has no type here
@@ -87380,7 +91746,7 @@ fn plan_merge(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor>
     for (_, _, vals) in &not_matched {
         merge_scale0_slots(vals, &mut scale0);
     }
-    let param_slots: Vec<(Descriptor, bool)> = params
+    let param_slots: Vec<(Descriptor, bool, bool)> = params
         .iter()
         .enumerate()
         .map(|(i, d)| {
@@ -87388,7 +91754,8 @@ fn plan_merge(sql: &str, db: &Option<Database>) -> Option<(Plan, Vec<Descriptor>
                 d.dtype,
                 dtype::SHORT | dtype::LONG | dtype::INT64 | dtype::INT128
             );
-            (d.clone(), scale0.contains(&i) && exact && d.scale != 0)
+            let s0 = scale0.contains(&i) && exact && d.scale != 0;
+            (d.clone(), s0, !s0 && value_slots.contains(&i))
         })
         .collect();
     Some((
@@ -87435,8 +91802,17 @@ fn merge_scale0_slots(text: &str, out: &mut std::collections::HashSet<usize>) {
 /// The CAST a marker's bound value converts through before it is
 /// spelled: its slot's own type, or the SCALE-0 integer rung for the
 /// left-of-multiply position.
-fn merge_slot_cast(e: Expr, d: &Descriptor, scale0: bool) -> Expr {
-    let cs = fire_crab_ods::intl::CS_UTF8;
+///
+/// STAMPED AS THE DML ROUTER STAMPS ([resolve_dest_param_expr], round 9):
+/// a marker at a VALUE position (`value`) converts through [CS_SLOT_CAST]
+/// - `SET N = ?` ['1.999999999999'] raises like the engine - and every
+/// other one, the scale-0 rung included, through [CS_SLOT_OPERAND], the
+/// previous binary's reading: `SET N = ? + 1` ['4.999999999999'] stores
+/// 6, `SET NM = ? * 2` 10, `SET SM = ? + 1` ['1.999999'] 3, where the
+/// CS_UTF8 this carried met the round-5 coefficient gate at the slot's
+/// width and raised (the refuter's 86 shapes / 202 cells). A text or
+/// temporal slot keeps CS_UTF8, as the DML router's does.
+fn merge_slot_cast(e: Expr, d: &Descriptor, scale0: bool, value: bool) -> Expr {
     if scale0 {
         let bytes = match d.dtype {
             dtype::SHORT => 2,
@@ -87444,10 +91820,22 @@ fn merge_slot_cast(e: Expr, d: &Descriptor, scale0: bool) -> Expr {
             dtype::INT64 => 8,
             _ => 16,
         };
-        return Expr::Cast(Box::new(e), CastTarget::Int { bytes }, cs);
+        return Expr::Cast(Box::new(e), CastTarget::Int { bytes }, CS_SLOT_OPERAND);
     }
     match dest_cast_target(d) {
-        Some(t) => Expr::Cast(Box::new(e), t, cs),
+        Some(t) => {
+            let cs = match t {
+                CastTarget::Int { .. } | CastTarget::Numeric { .. } | CastTarget::Approx => {
+                    if value {
+                        CS_SLOT_CAST
+                    } else {
+                        CS_SLOT_OPERAND
+                    }
+                }
+                _ => fire_crab_ods::intl::CS_UTF8,
+            };
+            Expr::Cast(Box::new(e), t, cs)
+        }
         None => e,
     }
 }
@@ -87570,6 +91958,7 @@ fn type_markers_in_sets(
     descs: &[Descriptor],
     tgt_alias: &str,
     params: &mut [Option<Descriptor>],
+    value_slots: &mut std::collections::HashSet<usize>,
 ) -> Option<()> {
     for part in split_set_list(sets) {
         let eq = part.find('=')?;
@@ -87586,13 +91975,20 @@ fn type_markers_in_sets(
         if !merge_decfloat_marker_ok(&d, &part[eq + 1..]) {
             return None;
         }
+        // a marker in a CONDITION of the value refuses ([raw_param_in_condition])
+        if merge_markers_as_params(&part[eq + 1..]).is_some_and(|t| value_text_param_in_condition(&t)) {
+            return None;
+        }
         // THE TREE FIRST - the engine's overrides live there
         // ([merge_marker_descs]). Destination-typing is what is left when
         // the value is not a tree that resolver reads.
         match merge_marker_descs(&part[eq + 1..], &d, columns, descs) {
             Some(typed) => {
-                for (slot, sd) in typed {
+                for (slot, sd, value) in typed {
                     set_marker_desc(params, slot, sd)?;
+                    if value {
+                        value_slots.insert(slot);
+                    }
                 }
             }
             None => {
@@ -87674,7 +92070,7 @@ fn merge_marker_descs(
     dest: &Descriptor,
     columns: &[RelationColumn],
     descs: &[Descriptor],
-) -> Option<Vec<(usize, Descriptor)>> {
+) -> Option<Vec<(usize, Descriptor, bool)>> {
     let slots = marker_slots(value);
     let mut raw = parse_raw_expr_any(&merge_markers_as_params(value)?)?;
     let mut next = 0usize;
@@ -87685,11 +92081,56 @@ fn merge_marker_descs(
         return None;
     }
     let mut sink: Vec<Option<Descriptor>> = Vec::new();
-    resolve_dest_param_expr(&raw, dest, columns, descs, &mut sink)?;
+    let tree = resolve_dest_param_expr(&raw, dest, columns, descs, &mut sink)?;
     if sink.len() != slots.len() {
         return None;
     }
-    slots.into_iter().zip(sink).map(|(s, d)| Some((s, d?))).collect()
+    // WHICH MARKERS ARE VALUES: the DML router's own stamps say so - a
+    // `?` whose slot cast kept [CS_SLOT_CAST] is at a value position, a
+    // restamped operand's is not ([value_slot_params]). The MERGE's
+    // per-row text is spelled from the same distinction (round 9, P1).
+    let mut vals = Vec::new();
+    value_slot_params(&tree, &mut vals);
+    slots
+        .into_iter()
+        .zip(sink)
+        .enumerate()
+        .map(|(k, (s, d))| Some((s, d?, vals.contains(&k))))
+        .collect()
+}
+
+/// The `?` indexes whose implicit slot cast in `e` kept the VALUE-position
+/// stamp [CS_SLOT_CAST] ([resolve_dest_param_expr]: a bare value, a
+/// COALESCE / NULLIF / IIF / CASE value arm, a `||` operand). A marker
+/// anywhere else - a restamped operand, a condition's compare rung, a
+/// shape this walk does not enter - is not listed, so it reads the text
+/// the previous binary's way. MERGE uses it to stamp each marker's cast.
+fn value_slot_params(e: &Expr, out: &mut Vec<usize>) {
+    match e {
+        Expr::Cast(inner, _, cs) => {
+            if let (Expr::Param(i), &CS_SLOT_CAST) = (&**inner, cs) {
+                out.push(*i);
+            }
+            value_slot_params(inner, out);
+        }
+        Expr::Neg(a) => value_slot_params(a, out),
+        Expr::Bin(a, _, b) | Expr::Concat(a, b) | Expr::NullIf(a, b) => {
+            value_slot_params(a, out);
+            value_slot_params(b, out);
+        }
+        Expr::Coalesce(v) | Expr::Func(_, v) => v.iter().for_each(|x| value_slot_params(x, out)),
+        Expr::Iif(_, a, b) => {
+            value_slot_params(a, out);
+            value_slot_params(b, out);
+        }
+        Expr::Case(branches, else_) => {
+            branches.iter().for_each(|(_, t)| value_slot_params(t, out));
+            if let Some(x) = else_ {
+                value_slot_params(x, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Every `FC$P<n>` marker back to the `?` it was made from, so the raw
@@ -87718,6 +92159,7 @@ fn type_markers_in_values(
     columns: &[RelationColumn],
     descs: &[Descriptor],
     params: &mut [Option<Descriptor>],
+    value_slots: &mut std::collections::HashSet<usize>,
 ) -> Option<()> {
     let items = split_set_list(vals);
     let targets: Vec<&RelationColumn> = match cols {
@@ -87745,11 +92187,18 @@ fn type_markers_in_values(
         if !merge_decfloat_marker_ok(&d, item) {
             return None;
         }
+        // a marker in a CONDITION of the value refuses ([raw_param_in_condition])
+        if merge_markers_as_params(item).is_some_and(|t| value_text_param_in_condition(&t)) {
+            return None;
+        }
         // the SET list's twin, one column at a time
         match merge_marker_descs(item, &d, columns, descs) {
             Some(typed) => {
-                for (slot, sd) in typed {
+                for (slot, sd, value) in typed {
                     set_marker_desc(params, slot, sd)?;
+                    if value {
+                        value_slots.insert(slot);
+                    }
                 }
             }
             None => {
@@ -87883,7 +92332,7 @@ fn merge_subst(
     // per `?` slot: the destination descriptor and the scale-0 flag
     // ([Plan::Merge::param_slots]) - a marker in a VALUE POSITION
     // (`typed_mode` 1) is spelled as its value CONVERTED THROUGH THIS
-    slots: &[(Descriptor, bool)],
+    slots: &[(Descriptor, bool, bool)],
     // per SOURCE column: is its value a RUNTIME approximate to the engine
     // ([approx_runtime_expr] of the source's select-list expression; a
     // plain column is)? Only such a value is spelled as its TYPED cast
@@ -87952,9 +92401,25 @@ fn merge_subst(
             // per-row statement is planned from this text
             if let Some(n) = first.strip_prefix(MERGE_PARAM_MARK).and_then(|d| d.parse::<usize>().ok())
             {
-                let wp = args.get(n).ok_or("missing parameter value")?;
-                let e = param_to_expr(wp)
+                let e = param_to_expr_msg(n, args)
                     .ok_or("a parameter this MERGE cannot write as a literal")?;
+                // A 4-BYTE MESSAGE'S -2147483648 keeps its width into the
+                // per-row text ([param_to_expr_msg]'s cast, spelled): the
+                // per-row `SET BI = -CAST(-2147483648 AS INTEGER)` then
+                // overflows under its minus as the engine's NegateNode
+                // does on the client's format (measured 2026-09-19: `MERGE
+                // .. WHEN MATCHED THEN UPDATE SET BI = -? [-2147483648]`
+                // raises *Integer overflow*; spelled through the slot's
+                // BIGINT cast it stored 2147483648). The value fits every
+                // exact slot four bytes or wider, so the slot cast is
+                // redundant for it; a narrower slot raises its own
+                // out-of-range at the store, as the engine's does.
+                if let Expr::Cast(inner, CastTarget::Int { bytes: 4 }, _) = &e {
+                    if let Expr::Int(v) = **inner {
+                        out.push_str(&format!("CAST({} AS INTEGER)", v));
+                        continue;
+                    }
+                }
                 // IN A VALUE POSITION the value converts AT ITS SLOT
                 // first - the engine reads the driver's value there and
                 // evaluates from it, so `SET I = ? * 2` bound 1.6 is
@@ -87962,7 +92427,7 @@ fn merge_subst(
                 // condition are COMPARISONS, not assignments, and keep
                 // the value as it arrived.
                 let e = match (typed_mode == 1, slots.get(n)) {
-                    (true, Some((d, s0))) => merge_slot_cast(e, d, *s0),
+                    (true, Some((d, s0, v))) => merge_slot_cast(e, d, *s0, *v),
                     _ => e,
                 };
                 let v = match e.eval(&[]) {
@@ -93077,6 +97542,58 @@ fn resolve_expr_term(
     descs: &[Descriptor],
     params: &mut Vec<Option<Descriptor>>,
 ) -> Option<Term> {
+    // A BARE `?` INSIDE ARITHMETIC OR `||` AS THE TESTED SIDE - `ID * ? = 2`,
+    // `? + 1 = ID`, `S || ? = 'abx'`, `SUM(ID) * ? > 3` (over the HAVING
+    // view). The engine describes such a `?` as the OTHER side's complete
+    // descriptor and ignores the arithmetic sibling (measured, 262 cells):
+    // resolve the other side first, type the `?` from it, then the
+    // ordinary side coercion. Both spellings arrive here: the parenthesised
+    // `(ID * ?) = 2` as a renumbered FnExpr, the bare one through
+    // texpr_atom_bare's Tok::Param arm.
+    if let RawLhs::Expr(e) = &rt.lhs {
+        if raw_bare_cmp_param(e) {
+            let (op, other) = match &rt.kind {
+                // `ID * ? = ?`: both sides (the engine refuses too)
+                RawKind::Cmp(_, Rhs::Param(..)) => return None,
+                RawKind::Cmp(op, r) => (*op, rhs_literal_expr(r)?),
+                RawKind::CmpExpr(op, r)
+                    if !matches!(r, RawExpr::BareTrue) && !raw_has_param(r) =>
+                {
+                    (*op, resolve_expr(r, columns, descs)?)
+                }
+                // IS NULL (the SQL_NULL slot), LIKE/STARTING/BETWEEN-with-
+                // mixed-bounds, a `?` on the other side, BareTrue: refuse
+                _ => return None,
+            };
+            if matches!(other, Expr::Null) {
+                return None; // `ID * ? = NULL` describes SQL_NULL - out of scope
+            }
+            if expr_reads_zoned_col(&other, descs) {
+                return None; // a zoned other side ([expr_reads_zoned_col])
+            }
+            let (slot, _) = param_desc_from_expr(&other, descs)?;
+            if !param_target_ok(&slot) {
+                return None;
+            }
+            let l = resolve_cmp_param_side(e, &slot, columns, descs, params, true)?;
+            let (l, r) = cmp_sides(l, other, descs)?;
+            // EVERY `?` THIS BRANCH TYPES IS ONE THE PREVIOUS BINARY
+            // REFUSED ([plan_unmixed]): a `?` inside comparison arithmetic
+            // or under a minus, AND the parenthesised bare `(?) = ID` /
+            // `((?)) >= ID`, which arrives here as RawLhs::Expr(Param) -
+            // the previous binary's resolver refused a bare `?` on that
+            // path (its resolve_proj_expr has no Param arm), and round 10
+            // left it unmarked, so `UPDATE TW SET N = COALESCE(?, 0)
+            // WHERE (?) = ID` ['4.999999999999', '1'] stored 5 where the
+            // engine raises (round 10's refuter). The bare `? = ID` the
+            // previous binary answered is a RawLhs::Param and is routed
+            // by resolve_predicate before this runs. Noted on SUCCESS
+            // only, so a failed attempt leaves no flag behind (round 11).
+            mix_note(MIX_CMP);
+            return Some(Term::ExprCond(Box::new(Cond2::Cmp(Box::new(l), op, Box::new(r)))));
+        }
+    }
+    let lhs_has_param = matches!(&rt.lhs, RawLhs::Expr(e) if raw_has_param(e));
     // the left side as a resolved expression: the call itself, or the
     // plain column a CmpExpr right side compares against
     let lhs = match &rt.lhs {
@@ -93088,6 +97605,34 @@ fn resolve_expr_term(
         // a bare `?` included - so this admits the typed cast and
         // nothing else. The value is substituted at bind.
         RawLhs::Expr(e) if raw_has_param(e) => {
+            // A SIMPLE CASE'S BARE `?` VALUE THAT IS THE COMPARISON SIDE
+            // (or sits under unary minuses) AGAINST A BARE `?` OTHER SIDE
+            // (`CASE ID WHEN 2 THEN ? ELSE 0 END = ?`, `-CASE .. = ?`)
+            // REFUSES AT PREPARE - the previous binary prepared then
+            // failed there - and against a `CAST(? AS ..)` other side
+            // when the CASE's sibling slot is a SCALE-0 exact (`ELSE 0
+            // END = CAST(? AS INTEGER)` [2.4, 2.4]: the slot rounds the
+            // CASE's 2.4 to 2 and the previous binary answered row 2
+            // where the engine answers none; `ELSE 1.5 END = CAST(? AS
+            // INTEGER)` keeps answering - right on every measured bind).
+            // Round 7, THE SCOPE CUT: the narrow S4, nothing wider.
+            if simple_case_bare_vs_param_refuses(e, &rt.kind, columns, descs) {
+                return None;
+            }
+            // ...and a conditional's bare `?` branch against an INT128 /
+            // DECFLOAT other side ([raw_conditional_bare_param])
+            if raw_conditional_bare_param(e) {
+                let other: Option<Expr> = match &rt.kind {
+                    RawKind::Cmp(_, r) => rhs_literal_expr(r),
+                    RawKind::CmpExpr(_, r) if !matches!(r, RawExpr::BareTrue) && !raw_has_param(r) => {
+                        resolve_expr(r, columns, descs)
+                    }
+                    _ => None,
+                };
+                if other.is_some_and(|o| wide_exact_side(&o, descs)) {
+                    return None;
+                }
+            }
             resolve_proj_expr(e, columns, descs, params)?
         }
         RawLhs::Expr(e) => resolve_expr(e, columns, descs)?,
@@ -93215,84 +97760,28 @@ fn resolve_expr_term(
             // attachment's charset (not a 32765-byte NONE catch-all),
             // `? = U || 'x'` a VARYING of the JOINED charset.
             //
-            // ...AND IT IS NOT NULL WHEN THE EXPRESSION READS NO COLUMN.
-            // A slot typed by a literal can never be null, and the
-            // engine says so: `? = 1 + 1`, `? = CAST('x' AS CHAR(3))`
-            // and `? = UPPER('abc')` are all NOT NULL, while `? = I + 1`
-            // and `? = UPPER(U)` stay nullable - the difference is
-            // exactly [expr_has_col].
-            let nn = !expr_has_col(&lhs);
-            let flags = if nn { PARAM_NOT_NULL } else { 0 };
-            let d = |dt: u8, len: u16, sc: i8| Descriptor {
-                dtype: dt,
-                scale: sc,
-                length: len,
-                sub_type: 0,
-                flags,
-                offset: 4,
-            };
-            let (desc, kind) = match lhs.type_of(descs)? {
-                // the expression's own integer width ([result_width_bytes],
-                // whose doc already carries the probe: a literal is LONG
-                // when it fits 32 bits, BIGINT past it, never SMALLINT)
-                ExprType::Int => {
-                    let bytes = result_width_bytes(&lhs, descs);
-                    let dt = match bytes {
-                        2 => dtype::SHORT,
-                        4 => dtype::LONG,
-                        16 => dtype::INT128,
-                        _ => dtype::INT64,
-                    };
-                    (d(dt, bytes as u16, 0), ColKind::Int)
-                }
-                ExprType::Numeric => {
-                    (d(dtype::INT64, 8, lhs.result_scale(descs)?), ColKind::Numeric)
-                }
-                // a fixed-text side (a literal, CAST AS CHAR, UPPER of
-                // one) is 452 TEXT and a varying one 448, at a CHARACTER
-                // width behind the charset sentinel - the same pair
-                // [build_expr_col_from] announces for a projection
-                ExprType::Text => {
-                    let desc = match text_param_width(&lhs, descs) {
-                        Some((varying, w)) => {
-                            let (dt, len) = if varying {
-                                (dtype::VARYING, (w as u16).saturating_add(2))
-                            } else {
-                                (dtype::TEXT, w as u16)
-                            };
-                            Descriptor {
-                                dtype: dt,
-                                scale: 0,
-                                length: len,
-                                sub_type: text_param_cs(&lhs, descs),
-                                flags,
-                                offset: 4,
-                            }
-                        }
-                        // no statically known width: the old catch-all
-                        None => d(dtype::VARYING, 32765, 0),
-                    };
-                    (desc, ColKind::Text)
-                }
-                // a temporal or approximate side asks the client for
-                // that type: the descriptor IS the contract, so the
-                // driver encodes a DATE where a DATE is announced and
-                // the value arrives already decoded
-                ExprType::Temporal(TKind::Date) => {
-                    (d(dtype::SQL_DATE, 4, 0), ColKind::Temporal(TKind::Date))
-                }
-                ExprType::Temporal(TKind::Time) => {
-                    (d(dtype::SQL_TIME, 4, 0), ColKind::Temporal(TKind::Time))
-                }
-                ExprType::Temporal(TKind::Timestamp) => (
-                    d(dtype::TIMESTAMP, 8, 0),
-                    ColKind::Temporal(TKind::Timestamp),
-                ),
-                ExprType::Temporal(TKind::TimeTz) => (d(dtype::SQL_TIME_TZ, 8, 0), ColKind::Temporal(TKind::TimeTz)),
-                ExprType::Temporal(TKind::TimestampTz) => (d(dtype::TIMESTAMP_TZ, 12, 0), ColKind::Temporal(TKind::TimestampTz)),
-                ExprType::Approx => (d(dtype::DOUBLE, 8, 0), ColKind::Approx),
-                ExprType::Bool => (d(dtype::BOOLEAN, 1, 0), ColKind::Bool),
-            };
+            // ...AND ITS NULLABILITY IS THE EXPRESSION'S OWN, the rule
+            // the output describe uses ([expr_nullable]): `? = 1 + 1`,
+            // `? = CAST('x' AS CHAR(3))` and `? = UPPER('abc')` are NOT
+            // NULL, `? = I + 1` and `? = UPPER(U)` nullable - and so are
+            // `? = NULLIF(1, 1)` and `? = CAST(NULL AS INTEGER)`, while
+            // `NN + 1 = ?` over a NOT NULL column is NOT NULL (measured;
+            // the old `!expr_has_col` test got those three wrong).
+            // [param_desc_from_expr] is that block, lifted so the
+            // arithmetic-`?` branch above types from the same rule.
+            let (mut desc, kind) = param_desc_from_expr(&lhs, descs)?;
+            // ROUND 12: A `?` COMPARED WITH A SIDE THAT ITSELF CARRIES A
+            // `?` (`IIF(ID = 2, ?, 0) = ?`, `COALESCE(?, 0) = ?`, `CAST(?
+            // AS INTEGER) = ?`) is chunk-new: the previous binary prepared
+            // every such statement and failed every execute, and this
+            // chunk answers it with the older reading of the left side's
+            // `?` - ['0.9999999999999999', '2.4'] answered none where the
+            // engine raises out of range (round 11's refuter). Marked, so
+            // K1 refuses the statement whenever that left `?` is not
+            // chunk-new itself ([chunk_new_mixed]).
+            if lhs_has_param {
+                desc.flags |= PARAM_CHUNK_NEW;
+            }
             if params.len() <= *slot {
                 params.resize(*slot + 1, None);
             }
@@ -93308,18 +97797,57 @@ fn resolve_expr_term(
             // the bare-column desugar (`WHERE B`): only a BOOLEAN side
             // takes it - the engine refuses `WHERE NAME` at prepare,
             // where the explicit `NAME = TRUE` coerces per row
+            // set when the right side is a comparison `?` the previous
+            // binary refused; noted for [plan_unmixed] once the term is
+            // built (round 11: a failed attempt leaves no flag behind)
+            let mut cmp_new = false;
             let rhs = if matches!(e, RawExpr::BareTrue) {
                 if !matches!(lhs.type_of(descs), Some(ExprType::Bool)) {
                     return None;
                 }
                 Expr::Bool(true)
+            } else if raw_bare_cmp_param(e) {
+                // the twin of the bare-lhs branch above: `ID = ? - 1`,
+                // `NN > ? + 1`, `HAVING SUM(ID) > ? + 1`, `MAX(S) = ? ||
+                // 'b'` - the `?` takes the LEFT side's complete descriptor
+                if lhs_has_param || matches!(lhs, Expr::Null) || expr_reads_zoned_col(&lhs, descs) {
+                    return None;
+                }
+                let (slot, _) = param_desc_from_expr(&lhs, descs)?;
+                if !param_target_ok(&slot) {
+                    return None;
+                }
+                // (the classic `ID = ?` never reaches here - its `?` is
+                // an Rhs::Param; `ID = (?)` and `ID = -?` do, and the
+                // previous binary refused both)
+                cmp_new = true;
+                resolve_cmp_param_side(e, &slot, columns, descs, params, true)?
             } else if raw_has_param(e) {
-                // the twin of the lhs arm above: `I = CAST(? AS INTEGER)`
+                // the twin of the lhs arm above: `I = CAST(? AS INTEGER)`;
+                // and the narrow S4 refusal with the sides swapped
+                // (`CAST(? AS INTEGER) = CASE ID WHEN 2 THEN ? ELSE 0 END`)
+                if lhs_has_param {
+                    if let RawLhs::Expr(l) = &rt.lhs {
+                        if raw_is_bare_or_cast_param(l)
+                            && simple_case_bare_vs_param_refuses(e, &RawKind::CmpExpr(*op, l.clone()), columns, descs)
+                        {
+                            return None;
+                        }
+                    }
+                }
+                // a conditional's bare `?` branch against an INT128 /
+                // DECFLOAT left side ([raw_conditional_bare_param])
+                if !lhs_has_param && raw_conditional_bare_param(e) && wide_exact_side(&lhs, descs) {
+                    return None;
+                }
                 resolve_proj_expr(e, columns, descs, params)?
             } else {
                 resolve_expr(e, columns, descs)?
             };
             let (l, r) = cmp_sides(lhs, rhs, descs)?;
+            if cmp_new {
+                mix_note(MIX_CMP);
+            }
             Term::ExprCond(Box::new(Cond2::Cmp(Box::new(l), *op, Box::new(r))))
         }
         RawKind::IsNull => Term::ExprCond(Box::new(Cond2::IsNull(Box::new(lhs)))),
@@ -94061,18 +98589,28 @@ fn cmp_sides(lhs: Expr, rhs: Expr, descs: &[Descriptor]) -> Option<(Expr, Expr)>
         (ExprType::Int | ExprType::Numeric, ExprType::Text) => {
             if let Expr::Str(s) = &rhs {
                 let r = num_literal_expr(s)?;
-                Some((lhs, r))
+                Some((cmp_align_wrap(lhs, s, descs), r))
             } else {
                 let cs = err_spell_charset(&rhs, descs);
+                // a CONSTANT text (`CAST('..' AS VARCHAR(n))`) aligns as
+                // the literal does ([cmp_align_wrap], round 11)
+                let lhs = match const_cast_text(&rhs) {
+                    Some(s) => cmp_align_wrap(lhs, s, descs),
+                    None => lhs,
+                };
                 Some((lhs, Expr::TextNum(Box::new(rhs), cs)))
             }
         }
         (ExprType::Text, ExprType::Int | ExprType::Numeric) => {
             if let Expr::Str(s) = &lhs {
                 let l = num_literal_expr(s)?;
-                Some((l, rhs))
+                Some((l, cmp_align_wrap(rhs, s, descs)))
             } else {
                 let cs = err_spell_charset(&lhs, descs);
+                let rhs = match const_cast_text(&lhs) {
+                    Some(s) => cmp_align_wrap(rhs, s, descs),
+                    None => rhs,
+                };
                 Some((Expr::TextNum(Box::new(lhs), cs), rhs))
             }
         }
@@ -94233,6 +98771,56 @@ fn cmp_sides(lhs: Expr, rhs: Expr, descs: &[Descriptor]) -> Option<(Expr, Expr)>
 /// here, and its value stands with no raiser beside it (probed:
 /// `I + 0 = '1 2'` answers the 12 row where this had refused the
 /// statement).
+/// THE ENGINE'S ALIGNMENT RAISE FOR AN EXACT EXPRESSION COMPARED WITH A
+/// TEXT LITERAL (round 11) - the same compare the whole-side `?` takes
+/// (cvt2.cpp `cmp_numeric_string`, [bind_whole_side_exact_cmp]): the
+/// literal is classed ([engine_cmp_class]), both operands align to the
+/// finer scale in the class width, and a side that leaves it raises
+/// *numeric value is out of range* per compared row. `IIF(NM =
+/// '0.5000000000000000000', 1, 0)` raises there, `IIF(N + 0 =
+/// '1.' + 38 zeros, 1, 0) .. WHERE ID = 1` answers 1 (both measured
+/// 2026-09-19; the previous binary answered 0;0 and failed the second),
+/// and a subquery body's whole-side exact `?` is spelled as exactly
+/// such a literal ([corr_text_cmp_literal]). The value compared is the
+/// literal [num_literal_expr] converts, untouched; the side is wrapped
+/// in the synthetic check cast only when the literal's scale is the
+/// finer one ([CS_CMP_ALIGN]) or its own alignment leaves the width
+/// ([CS_CMP_RAISE]), and only over an exact side of 8 bytes or fewer.
+fn cmp_align_wrap(side: Expr, s: &str, descs: &[Descriptor]) -> Expr {
+    let Some((d, _)) = param_desc_from_expr(&side, descs) else { return side };
+    if !matches!(d.dtype, dtype::SHORT | dtype::LONG | dtype::INT64) {
+        return side;
+    }
+    let Some((wide, _, st)) = engine_cmp_class(s) else { return side };
+    let (stamp, scale) = if whole_side_text_overflows(s, d.scale) {
+        (CS_CMP_RAISE, d.scale)
+    } else if st < d.scale as i32 {
+        match i8::try_from(st) {
+            Ok(sc) => (CS_CMP_ALIGN, sc),
+            Err(_) => return side,
+        }
+    } else {
+        return side;
+    };
+    Expr::Cast(
+        Box::new(side),
+        CastTarget::Numeric { scale, bytes: if wide { 16 } else { 8 }, sub_type: 0 },
+        stamp,
+    )
+}
+
+/// The string of a `CAST('<text>' AS VARCHAR/CHAR(n))` over a literal -
+/// a constant text side [cmp_align_wrap] can class at prepare.
+fn const_cast_text(e: &Expr) -> Option<&str> {
+    match e {
+        Expr::Cast(inner, CastTarget::Text { .. }, _) => match &**inner {
+            Expr::Str(s) => Some(s.as_str()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 fn num_literal_expr(s: &str) -> Option<Expr> {
     let rhs = match literal_num_rhs(s, false) {
         LitNum::Rhs(rhs) => rhs,
@@ -95242,6 +99830,22 @@ fn param_or_typed_term(
     }
 }
 
+/// The flags a HAVING aggregate slot carries for a `?` typed from it -
+/// the engine's own: COUNT(*) and COUNT(x) are NOT NULL, SUM/AVG/MIN/MAX
+/// Nullable EVEN OVER A NOT NULL COLUMN (measured: `MAX(NN) > ?` Nullable,
+/// `COUNT(*) > ?` NOT NULL - this server announced both the other way).
+/// Applied at the two HAVING claim sites only; [agg_result_desc] itself
+/// is untouched (11 callers, and the OUTPUT describe already agrees
+/// through its own rule).
+fn agg_param_flags(func: AggFn, mut d: Descriptor) -> Descriptor {
+    if matches!(func, AggFn::Count) {
+        d.flags |= PARAM_NOT_NULL;
+    } else {
+        d.flags &= !PARAM_NOT_NULL;
+    }
+    d
+}
+
 /// Resolve a HAVING predicate against a grouped query's OUTPUT rows. A
 /// column left side must be one of the group keys (anything else is
 /// invalid SQL); an aggregate left side is any supported aggregate call,
@@ -95359,7 +99963,10 @@ fn resolve_having(
                             return None;
                         }
                         gitems.push(GItem::Agg(*f, src, distinct));
-                        slot_descs.push(Some(d));
+                        // the synthetic view's slot carries the engine's
+                        // nullability for a `?` typed from it (COUNT NOT
+                        // NULL, the folds Nullable - [agg_param_flags])
+                        slot_descs.push(Some(agg_param_flags(*f, d)));
                         names.push((*f, t.clone(), agg_slot_name(gitems.len() - 1)));
                     }
                     let lookup = |f: &AggFn, t: &AggTarget| {
@@ -95375,6 +99982,39 @@ fn resolve_having(
                         Some(r) => kind_with_rhs(&rt.kind, substitute_aggs(r, &lookup)?),
                         None => rt.kind.clone(),
                     };
+                    // THE FOLD SLOTS A MULTIPLY MAY SIZE ([mul_sibling_width]'s
+                    // whitelist, entry (f)): COUNT / SUM / AVG are 8 bytes
+                    // to the engine's multiply (measured wide under a LONG
+                    // and a SHORT slot, SUM(SM) and AVG(SM) included), a
+                    // MIN / MAX over a BASE column carries the column's
+                    // own width (MIN(ID) narrow, MIN(BI) wide) - handed to
+                    // the width helper by slot name ([HAVING_MUL_WIDTHS]),
+                    // since the synthetic view's descriptor cannot tell a
+                    // `MIN(1.5)` slot (INT64 described, blr_long to the
+                    // multiply: `HAVING ? * MIN(1.5) <> CAST(0.0 AS
+                    // NUMERIC(9,1)) ['0.4']` rounds the `?`, measured) from
+                    // a `COUNT(*)` one. Every other fold - MIN / MAX over
+                    // an expression or a derived column - is absent from
+                    // the list, and a `?` that is a direct `*` operand
+                    // beside it refuses rather than take a width.
+                    let vouched: Vec<(String, u8)> = names
+                        .iter()
+                        .filter_map(|(f, t, n)| {
+                            let w = match (f, t) {
+                                (AggFn::Count | AggFn::Sum | AggFn::Avg, _) => 8,
+                                (AggFn::Min | AggFn::Max, AggTarget::Col(c)) => {
+                                    let rc = find_col(columns, c)?;
+                                    let d = descs.get(rc.field_id as usize)?;
+                                    if !desc_is_stored_field(d) {
+                                        return None;
+                                    }
+                                    exact_dtype_bytes(d.dtype)?
+                                }
+                                _ => return None,
+                            };
+                            Some((n.clone(), w))
+                        })
+                        .collect();
                     // EVERY GROUP KEY NEEDS ITS SLOT BEFORE THE VIEW IS
                     // BUILT. [synth_group_view] exposes a key only once it
                     // is a `GItem::Key`, and the keyed column path below
@@ -95401,7 +100041,10 @@ fn resolve_having(
                     let (synth_cols, synth_descs) =
                         synth_group_view(gitems, slot_descs, columns, synth_base);
                     let rt2 = RawTerm { lhs: RawLhs::Expr(subbed), kind: kind2 };
-                    terms.push(resolve_expr_term(&rt2, &synth_cols, &synth_descs, params)?);
+                    HAVING_MUL_WIDTHS.with(|h| *h.borrow_mut() = vouched);
+                    let term = resolve_expr_term(&rt2, &synth_cols, &synth_descs, params);
+                    HAVING_MUL_WIDTHS.with(|h| h.borrow_mut().clear());
+                    terms.push(term?);
                     continue;
                 }
             }
@@ -95437,7 +100080,8 @@ fn resolve_having(
                     // > ? is VARYING len). None for a fold with no
                     // describe here (an approximate SUM/AVG), so its `?`
                     // refuses.
-                    let ad = agg_result_desc(*func, target, columns, descs);
+                    let ad = agg_result_desc(*func, target, columns, descs)
+                        .map(|d| agg_param_flags(*func, d));
                     // the aggregate's OUTPUT shape decides how the
                     // HAVING comparison resolves: COUNT and integer
                     // sources compare as integers, numeric sources
@@ -97215,6 +101859,10 @@ fn after_auth(
                     // the RETURNING resolver may bind that name
                     // ([dml_binds_alias])
                     let dml_aliased = dml_binds_alias(&stmt_sql);
+                    // (asked of the text AS WRITTEN too: the alias strip
+                    // below would hide a qualified built-in call from K1's
+                    // twin - [sql_qualified_builtin_call])
+                    let qualified_builtin = sql_qualified_builtin_call(&stmt_sql);
                     let stmt_sql = strip_dml_alias(&stmt_sql, alias_view)
                         .unwrap_or_else(|| stmt_sql.clone());
                     let stmt_sql = unqualify_dml(&stmt_sql, &database, dml_aliased)
@@ -97238,12 +101886,30 @@ fn after_auth(
                     });
                     PREPARE_REFUSAL.with(|r| *r.borrow_mut() = None);
                     let planned = timed("plan(dml)", || {
-                        let build = || match kw {
-                            "INSERT" => plan_insert(&dml_sql, &database),
-                            "UPDATE" => plan_upsert(&dml_sql, &database)
-                                .or_else(|| plan_update(&dml_sql, &database)),
-                            "MERGE" => plan_merge(&dml_sql, &database),
-                            _ => plan_delete(&dml_sql, &database),
+                        let build = || {
+                            plan_unmixed(|| match kw {
+                                "INSERT" => plan_insert(&dml_sql, &database),
+                                "UPDATE" => plan_upsert(&dml_sql, &database)
+                                    .or_else(|| plan_update(&dml_sql, &database)),
+                                "MERGE" => plan_merge(&dml_sql, &database),
+                                _ => plan_delete(&dml_sql, &database),
+                            })
+                            // K1 (round 12): chunk-new beside not
+                            // ([chunk_new_mixed]) refuses at prepare
+                            .filter(|(_, d)| {
+                                let mixed = chunk_new_mixed(d.iter());
+                                if mixed {
+                                    cap_note("K1 (a chunk-new slot beside a classic one)");
+                                }
+                                !mixed
+                            })
+                            .filter(|(_, d)| {
+                                let qb = qualified_builtin && has_chunk_new(d.iter());
+                                if qb {
+                                    cap_note("QB (a qualified built-in in a chunk-new statement)");
+                                }
+                                !qb
+                            })
                         };
                         match database.as_ref() {
                             Some(db) => db.stmts.plan_if(
@@ -97512,6 +102178,13 @@ fn after_auth(
                 if bound_args.len() != stmt_params.len() {
                     last_dml = (0, 0, 0);
                     respond_error(&mut s, &mut enc, GDS_DSQL_ERROR)?;
+                } else if let Some(t) = chunk_new_text_off_grammar(&stmt_params, &bound_args) {
+                    // K2 (round 12): a text off the canonical grammar into
+                    // a chunk-new numeric slot raises the engine's
+                    // conversion error before a row is read or written - a
+                    // recorded boundary, never a wrong answer
+                    last_dml = (0, 0, 0);
+                    respond_eval_error(&mut s, &mut enc, &EvalErr::ConversionError(Some(t)))?;
                 } else if matches!(
                     &*plan,
                     Plan::Insert { .. }
@@ -98572,7 +103245,12 @@ fn after_auth(
                     if unknown.is_some() {
                         break;
                     }
-                    match timed("batch execute", || execute_dml(&*plan, &mut database, args, &ctx)) {
+                    // K2 (round 12): a batch message is an execute too
+                    let res = match chunk_new_text_off_grammar(&stmt_params, args) {
+                        Some(t) => Err(ExecErr::Eval(EvalErr::ConversionError(Some(t)))),
+                        None => timed("batch execute", || execute_dml(&*plan, &mut database, args, &ctx)),
+                    };
+                    match res {
                         Ok((ins, upd, del)) => states.push(ins + upd + del),
                         Err(e) => {
                             if std::env::var("FC_SRV_TRACE").is_ok() {
@@ -100742,6 +105420,16 @@ fn after_auth(
                 if database.as_ref().is_some_and(|d| d.prepared) {
                     respond_error(&mut s, &mut enc, GDS_REQ_NO_TRANS)?;
                     continue;
+                }
+                // K2 (round 12), as on op_execute: a text off the
+                // canonical grammar into a chunk-new numeric slot raises
+                // the engine's conversion error before anything runs
+                if exec2_args.len() == stmt_params.len() {
+                    if let Some(t) = chunk_new_text_off_grammar(&stmt_params, &exec2_args) {
+                        last_dml = (0, 0, 0);
+                        respond_eval_error(&mut s, &mut enc, &EvalErr::ConversionError(Some(t)))?;
+                        continue;
+                    }
                 }
                 // A singleton execute: EXECUTE PROCEDURE with output
                 // parameters comes here (the statement announces
@@ -105390,7 +110078,7 @@ mod tests {
         };
         // it compiles to a CASE - two branches and a default...
         match &items[0] {
-            SelItem::Expr(RawExpr::Case(branches, else_), name, _) => {
+            SelItem::Expr(RawExpr::Case(branches, else_, _), name, _) => {
                 assert_eq!(branches.len(), 2);
                 assert!(else_.is_some());
                 // ... and each branch is an `=` comparison, which is why
@@ -105407,7 +110095,7 @@ mod tests {
             Proj::Items(v) => v,
             Proj::Star => panic!("not a star"),
         };
-        assert!(matches!(&items[0], SelItem::Expr(RawExpr::Case(b, None), ..) if b.len() == 1));
+        assert!(matches!(&items[0], SelItem::Expr(RawExpr::Case(b, None, true), ..) if b.len() == 1));
         // the name is DECODE only when the WHOLE item is the call
         let items = match parse_projection("DECODE(D, 1, 10, 20) + 1").unwrap() {
             Proj::Items(v) => v,
@@ -111751,6 +116439,1504 @@ mod tests {
         // rather than answer confidently from rendered text
         assert!(build("TM > TS").is_none());
         assert!(build("D > TIME'09:00:00'").is_none());
+    }
+
+    /// THE COMPARISON-TYPED ARITHMETIC `?` (serve-real-cmpparam's law in
+    /// miniature): a `?` inside `+ - * /` or `||` on one side of a compare
+    /// describes as the OTHER side's complete descriptor, its value follows
+    /// the measured node-scale/rounding law, both-sides and function shapes
+    /// refuse, and a conditional's CONDITION `?` types the same way.
+    #[test]
+    fn a_comparison_types_its_arithmetic_parameter_from_the_other_side() {
+        let columns = vec![
+            RelationColumn { name: "A".into(), field_id: 0, position: 0 },
+            RelationColumn { name: "NAME".into(), field_id: 1, position: 1 },
+            RelationColumn { name: "NN".into(), field_id: 2, position: 2 },
+            RelationColumn { name: "D".into(), field_id: 3, position: 3 },
+            RelationColumn { name: "DT".into(), field_id: 4, position: 4 },
+            RelationColumn { name: "TM".into(), field_id: 5, position: 5 },
+            // a DERIVED-TABLE column: a describe-made descriptor at offset
+            // 1 ([desc_of_projcol]), INT64 like `1.5 AS DL`
+            RelationColumn { name: "DL".into(), field_id: 6, position: 6 },
+        ];
+        let mut nn = desc(dtype::LONG, 4, 0);
+        nn.flags = PARAM_NOT_NULL;
+        let mut dl = desc(dtype::INT64, 8, -1);
+        dl.offset = 1;
+        let descs = vec![
+            desc(dtype::LONG, 4, 0),
+            desc(dtype::VARYING, 10, 0),
+            nn,
+            desc(dtype::DOUBLE, 8, 0),
+            desc(dtype::SQL_DATE, 4, 0),
+            desc(dtype::SQL_TIME, 4, 0),
+            dl,
+        ];
+        // DT = MJD 60000, TM = 12:30:00
+        let row = vec![
+            Value::Int(-7),
+            Value::Text("ab".into()),
+            Value::Int(5),
+            Value::Double(1.5),
+            Value::Date(60000),
+            Value::Time(450_000_000),
+            Value::Scaled(15, -1),
+        ];
+        let parse = |s: &str| -> Option<((Vec<Vec<RawTerm>>, Vec<Vec<u32>>), usize)> {
+            let toks = tokenize(s)?;
+            let mut np = 0usize;
+            let raw = parse_predicate(&toks, &mut np)?;
+            Some((raw, np))
+        };
+        let build = |s: &str| -> Option<(Predicate, Vec<Option<Descriptor>>)> {
+            let (raw, _) = parse(s)?;
+            let mut params: Vec<Option<Descriptor>> = Vec::new();
+            let p = resolve_predicate(raw, &columns, &descs, &mut params)?;
+            Some((p, params))
+        };
+        let slot = |params: &Vec<Option<Descriptor>>, i: usize| -> (u8, u16, i8, i16, u16) {
+            let d = params[i].as_ref().unwrap_or_else(|| panic!("slot {i} unclaimed"));
+            (d.dtype, d.length, d.scale, d.sub_type, d.flags & PARAM_NOT_NULL)
+        };
+        let hits = |s: &str, args: &[WireParam]| -> bool {
+            let (p, _) = build(s).unwrap_or_else(|| panic!("{s} refused"));
+            p.bind(args).unwrap_or_else(|e| panic!("{s} bind: {e:?}")).matches(&row).unwrap()
+        };
+        // the per-row raise a bound value earns (the engine's 22018)
+        let raises = |s: &str, args: &[WireParam]| -> Option<String> {
+            let (p, _) = build(s).unwrap_or_else(|| panic!("{s} refused"));
+            match p.bind(args).unwrap_or_else(|e| panic!("{s} bind: {e:?}")).matches(&row) {
+                Err(EvalErr::ConversionError(t)) => Some(t.unwrap_or_default()),
+                _ => None,
+            }
+        };
+        let refused = |s: &str| build(s).is_none();
+
+        // PARSE: a `?` inside arithmetic is an atom, numbered at its place
+        assert_eq!(parse("A * ? = 2").unwrap().1, 1);
+        assert_eq!(parse("? + 1 = A").unwrap().1, 1);
+        assert_eq!(parse("A * ? = 2 AND A + ? = 5").unwrap().1, 2);
+        assert_eq!(parse("? = ?").unwrap().1, 2); // parses, refuses below
+        assert!(parse("? BETWEEN ? AND 3").is_none()); // unchanged
+
+        // DESCRIBE: the other side's complete descriptor
+        let (_, p) = build("A * ? = 14").unwrap();
+        assert_eq!(slot(&p, 0), (dtype::LONG, 4, 0, 0, PARAM_NOT_NULL));
+        let (_, p) = build("? + 1 = A").unwrap();
+        assert_eq!(slot(&p, 0), (dtype::LONG, 4, 0, 0, 0));
+        let (_, p) = build("A * ? = -21.0").unwrap();
+        assert_eq!(slot(&p, 0), (dtype::INT64, 8, -1, 0, PARAM_NOT_NULL));
+        // (the text slot's sub_type is the charset SENTINEL here, which the
+        // describe resolves to the attachment's charset - not pinned)
+        let (_, p) = build("NAME || ? = 'abx'").unwrap();
+        let t = slot(&p, 0);
+        assert_eq!((t.0, t.1, t.2, t.4), (dtype::TEXT, 3, 0, PARAM_NOT_NULL));
+        let (_, p) = build("NN > ? + 1").unwrap();
+        assert_eq!(slot(&p, 0), (dtype::LONG, 4, 0, 0, PARAM_NOT_NULL));
+        // the bare-`?` path now shares the rule: NN + 1 is NOT NULL, a
+        // NULLIF nullable, a NUMERIC(9,1) cast a LONG of subtype 1
+        let (_, p) = build("NN + 1 = ?").unwrap();
+        assert_eq!(slot(&p, 0), (dtype::INT64, 8, 0, 0, PARAM_NOT_NULL));
+        let (_, p) = build("? = NULLIF(1, 1)").unwrap();
+        assert_eq!(slot(&p, 0).4, 0);
+        let (_, p) = build("? = CAST(2.5 AS NUMERIC(9,1))").unwrap();
+        assert_eq!(slot(&p, 0), (dtype::LONG, 4, -1, 1, PARAM_NOT_NULL));
+        // a BETWEEN/IN desugar claims the one slot once
+        let (_, p) = build("A * ? BETWEEN 1 AND 2").unwrap();
+        assert_eq!(p.len(), 1);
+        let (_, p) = build("A * ? IN (2, 6)").unwrap();
+        assert_eq!(slot(&p, 0), (dtype::LONG, 4, 0, 0, PARAM_NOT_NULL));
+        // two slots, the tested side's own `?` bound too
+        let (_, p) = build("CAST(? AS INTEGER) = ?").unwrap();
+        assert_eq!(slot(&p, 1).4, 0);
+        assert!(hits("CAST(? AS INTEGER) = ?", &[WireParam::Int(1, 0), WireParam::Int(1, 0)]));
+
+        // VALUES: the measured law. A = -7.
+        assert!(hits("A * ? = 14", &[WireParam::Int(-2, 0)]));
+        assert!(!hits("A * ? = 14", &[WireParam::Int(2, 0)]));
+        assert!(hits("(A * ?) = 14", &[WireParam::Int(-2, 0)]));
+        assert!(hits("? + 1 = A", &[WireParam::Int(-8, 0)]));
+        // THE MEASURED SIDE RULE of `*` ([arith_operand_rung]): under an
+        // INT64 slot the RIGHT operand rounds to an integer and the left
+        // keeps its fraction
+        assert!(hits("A * ? = -21.0", &[WireParam::Int(25, -1)]));
+        assert!(hits("A * ? = -21.0", &[WireParam::Text("2.5".into())]));
+        assert!(!hits("A * ? = -17.5", &[WireParam::Int(25, -1)]));
+        assert!(hits("A * -? = 21.0", &[WireParam::Int(25, -1)]));
+        assert!(hits("? * A = -17.5", &[WireParam::Text("2.5".into())]));
+        assert!(!hits("? * A = -21.0", &[WireParam::Text("2.5".into())]));
+        // ...under a LONG slot beside a LONG sibling the LEFT operand is
+        // the rounded one and the right keeps (the first cut rounded the
+        // right one only under INT64 and answered the reverse)
+        assert!(hits("? * A = CAST(-21.0 AS NUMERIC(9,1))", &[WireParam::Text("2.5".into())]));
+        assert!(!hits("? * A = CAST(-17.5 AS NUMERIC(9,1))", &[WireParam::Text("2.5".into())]));
+        assert!(hits("A * ? = CAST(-17.5 AS NUMERIC(9,1))", &[WireParam::Text("2.5".into())]));
+        assert!(!hits("A * ? = CAST(-21.0 AS NUMERIC(9,1))", &[WireParam::Text("2.5".into())]));
+        // ...and under a LONG slot beside an INT64 sibling (`CAST(A AS
+        // BIGINT)` - an arithmetic `A + 0` is off the whitelist) the
+        // RIGHT one rounds again
+        assert!(hits("CAST(A AS BIGINT) * ? = CAST(-21.0 AS NUMERIC(9,1))", &[WireParam::Text("2.5".into())]));
+        assert!(hits("? * CAST(A AS BIGINT) = CAST(-17.5 AS NUMERIC(9,1))", &[WireParam::Text("2.5".into())]));
+        // a direct `?` sibling counts as the slot's width: LONG -> the left
+        assert!(hits("? * ? = CAST(-21.0 AS NUMERIC(9,1))", &[WireParam::Text("2.5".into()), WireParam::Int(-7, 0)]));
+        assert!(!hits("? * ? = CAST(-17.5 AS NUMERIC(9,1))", &[WireParam::Text("2.5".into()), WireParam::Int(-7, 0)]));
+        // every divisor rounds, and the divide keeps the slot's scale -
+        // a direct `?` dividend included
+        assert!(hits("A / ? = -3.5", &[WireParam::Int(16, -1)]));
+        assert!(!hits("A / ? = -3.5", &[WireParam::Int(14, -1)]));
+        assert!(hits("? / ? = -3.5", &[WireParam::Int(-7, 0), WireParam::Int(16, -1)]));
+        // `+` reads at the FINER of the slot's and the sibling's scale:
+        // the LONG slot would round -9.5, the sibling 2.5 keeps it
+        assert!(hits("A = 2.5 + ?", &[WireParam::Int(-95, -1)]));
+        assert!(hits("A = 2.5 + ?", &[WireParam::Text("-9.5".into())]));
+        // ...and with an integer sibling the slot's scale 0 rounds it
+        assert!(hits("A + ? = 3", &[WireParam::Text("9.6".into())]));
+        // the text rung collapses to the bound string
+        assert!(hits("NAME || ? = 'abx'", &[WireParam::Text("x".into())]));
+        assert!(!hits("NAME || ? = 'abx'", &[WireParam::Text("y".into())]));
+        assert!(hits("NN > ? + 1", &[WireParam::Int(3, 0)]));
+        assert!(hits("A * ? BETWEEN 13 AND 15", &[WireParam::Int(-2, 0)]));
+
+        // REFUSALS: both sides, functions, the SQL_NULL slot, text/number
+        for s in [
+            "A * ? = ?", "? = ?", "? = A * ?", "A * ? = A + ?", "ABS(A * ?) = 2",
+            "COALESCE(A * ?, 0) = 2", "A * ? IS NULL", "A * ? = NULL",
+            "A * ? BETWEEN 1.5 AND 2", "A * ? IN (2, 3.5)", "A * ? = 'x'",
+        ] {
+            assert!(refused(s), "{s} should refuse");
+        }
+
+        // A WHOLE SIDE binds at full precision ([whole_side_rung]): the
+        // slot is what the client is told, never what the value converts
+        // into - the exact-slot cast rounded '-7.4' to -7 and answered
+        // the row
+        assert!(!hits("IIF(A = ?, 1, 0) = 1", &[WireParam::Text("-7.4".into())]));
+        assert!(hits("IIF(A = ?, 1, 0) = 1", &[WireParam::Text("-7.0".into())]));
+        assert!(hits("IIF(A = ?, 1, 0) = 1", &[WireParam::Text(" -7 ".into())]));
+        assert!(!hits("IIF(A = ?, 1, 0) = 1", &[WireParam::Int(-74, -1)]));
+        assert!(!hits("IIF(A = ?, 1, 0) = 1", &[WireParam::Double(-7.4)]));
+        assert!(hits("IIF(A = ?, 1, 0) = 1", &[WireParam::Double(-7.0)]));
+        assert!(!hits("IIF(? = 1, 1, 0) = 1", &[WireParam::Text("1.4".into())]));
+        assert!(!hits("IIF(A = ?, ?, 0) = 5", &[WireParam::Text("-7.4".into()), WireParam::Int(5, 0)]));
+        assert_eq!(raises("IIF(A = ?, 1, 0) = 1", &[WireParam::Text("x".into())]).as_deref(), Some("x"));
+        assert_eq!(raises("IIF(A = ?, 1, 0) = 1", &[WireParam::Text("0x2".into())]).as_deref(), Some("0x2"));
+        // `-?` as a whole side REFUSES at prepare (round 11): the engine's
+        // negate reads a text with its own digit-accumulating double,
+        // which no law here models - every spelling of the chain, in
+        // every router
+        for s in ["-? = A", "A = -?", "A = -(-?)", "-(-?) = A", "-? < 2", "IIF(-? = A, 1, 0) = 1", "IIF(A = -?, 1, 0) = 1"] {
+            assert!(refused(s), "{s} answered");
+        }
+        // a number bound into a whole-side TEXT rung converts the OTHER
+        // side per row - the engine's *conversion error from string "ab"*
+        assert_eq!(raises("IIF(NAME = ?, 1, 0) = 1", &[WireParam::Int(2, 0)]).as_deref(), Some("ab"));
+        assert!(hits("IIF(NAME = ?, 1, 0) = 1", &[WireParam::Text("ab".into())]));
+        // under an operator the operator's rung still converts (measured
+        // both ways: `A * -? = 21.0` rounds above, `-? + 1 = A` here)
+        assert!(hits("-? + 1 = A", &[WireParam::Text("8.4".into())]));
+
+        // CONDITIONS: a `?` on one side of a conditional's comparison
+        let (_, p) = build("IIF(A = ?, 1, 0) = 1").unwrap();
+        assert_eq!(slot(&p, 0), (dtype::LONG, 4, 0, 0, 0));
+        assert!(hits("IIF(A = ?, 1, 0) = 1", &[WireParam::Int(-7, 0)]));
+        assert!(!hits("IIF(A = ?, 1, 0) = 1", &[WireParam::Int(1, 0)]));
+        let (_, p) = build("IIF(? = 1, 1, 0) = 1").unwrap();
+        assert_eq!(slot(&p, 0), (dtype::LONG, 4, 0, 0, PARAM_NOT_NULL));
+        let (_, p) = build("IIF(NN = ?, 1, 0) = 1").unwrap();
+        assert_eq!(slot(&p, 0), (dtype::LONG, 4, 0, 0, PARAM_NOT_NULL));
+        assert!(hits("CASE WHEN A > ? + 1 THEN 1 ELSE 0 END = 1", &[WireParam::Int(-9, 0)]));
+        // a condition `?` and a branch `?` number in text order and type
+        // apart (the branch slot's NOT NULL flag is the recorded, pre-
+        // existing sibling-typing difference - the engine says NOT NULL
+        // from the literal 0, this server Nullable - so only its type is
+        // pinned here)
+        let (_, p) = build("IIF(A = ?, ?, 0) = 5").unwrap();
+        assert_eq!(slot(&p, 0), (dtype::LONG, 4, 0, 0, 0));
+        let b = slot(&p, 1);
+        assert_eq!((b.0, b.1, b.2), (dtype::LONG, 4, 0));
+        assert!(hits("IIF(A = ?, ?, 0) = 5", &[WireParam::Int(-7, 0), WireParam::Int(5, 0)]));
+        // the tested side's condition `?` binds beside the bare rhs `?`
+        assert!(hits("IIF(A = ?, 1, 0) = ?", &[WireParam::Int(-7, 0), WireParam::Int(1, 0)]));
+        // a `?`-free LIKE arm beside a `?` comparison binds (no bind error)
+        assert!(hits("IIF(A = ? AND NAME LIKE 'a%', 1, 0) = 1", &[WireParam::Int(-7, 0)]));
+        for s in [
+            "IIF(A = ?, ?, ?) = 1", "IIF(NULL = ?, 1, 0) = 1", "IIF(? IS NULL, 1, 0) = 1",
+            "IIF(NAME LIKE ?, 1, 0) = 1", "IIF(? BETWEEN 1 AND 2, 1, 0) = 1",
+            "IIF(? IN (1, 2), 1, 0) = 1",
+        ] {
+            assert!(refused(s), "{s} should refuse");
+        }
+
+        // HELPERS
+        assert!(raw_has_param(&parse_raw_expr_any("IIF(A = ?, 1, 0)").unwrap()));
+        let rung = Expr::Cast(
+            Box::new(Expr::Param(0)),
+            CastTarget::Text { len: 32765, pad: false, synthetic: false, cs: None },
+            fire_crab_ods::intl::CS_UTF8,
+        );
+        assert!(is_text_param_rung(&rung));
+        assert!(expr_has_param(&Expr::CollKey(Box::new(rung.clone()), 0)));
+        assert!(matches!(
+            subst_params_expr(&rung, &[WireParam::Text("x".into())]),
+            Some(Expr::Str(s)) if s == "x"
+        ));
+        assert!(matches!(subst_params_expr(&rung, &[WireParam::Null]), Some(Expr::Null)));
+        // the whole-side rung: stamped, found under its minuses, bound whole
+        let d4 = desc(dtype::LONG, 4, 0);
+        let ws = whole_side_rung(0, &d4).unwrap();
+        assert!(matches!(ws, Expr::Cast(_, CastTarget::Int { bytes: 8 }, CS_WHOLE_SIDE)));
+        assert_eq!(whole_side_exact(&ws), Some((0, 0)));
+        assert_eq!(whole_side_exact(&Expr::Neg(Box::new(Expr::Neg(Box::new(ws.clone()))))), Some((0, 2)));
+        assert_eq!(whole_side_exact(&cmp_param_rung(0, &d4).unwrap()), None);
+        assert!(matches!(bind_whole_side(0, 0, 0, &[WireParam::Int(25, -1)]), Some(Expr::Dec(25, -1))));
+        assert!(matches!(bind_whole_side(0, 0, 0, &[WireParam::Text("2.5".into())]), Some(Expr::TextNum(..))));
+        assert!(matches!(bind_whole_side(0, 1, 0, &[WireParam::Text("2.5".into())]), Some(Expr::Neg(_))));
+        assert!(matches!(bind_whole_side(0, 0, 0, &[WireParam::Null]), Some(Expr::Null)));
+        let wt = whole_side_rung(0, &desc(dtype::VARYING, 10, 0)).unwrap();
+        assert!(is_text_param_rung(&wt));
+        assert_eq!(whole_side_text(&Expr::CarrierEnc(Box::new(wt.clone()), 4)), Some(0));
+        assert_eq!(whole_side_text(&rung), None);
+        let mut sink: Vec<Option<Descriptor>> = Vec::new();
+        assert!(claim_param_slot(&mut sink, 1, &d4).is_some());
+        assert!(claim_param_slot(&mut sink, 1, &d4).is_some());
+        assert!(claim_param_slot(&mut sink, 1, &desc(dtype::INT64, 8, -1)).is_none());
+        assert!(claim_param_slot(&mut sink, usize::MAX, &d4).is_none());
+        assert_eq!(agg_param_flags(AggFn::Count, d4.clone()).flags & PARAM_NOT_NULL, PARAM_NOT_NULL);
+        let mut nnd = d4.clone();
+        nnd.flags = PARAM_NOT_NULL;
+        assert_eq!(agg_param_flags(AggFn::Max, nnd).flags & PARAM_NOT_NULL, 0);
+
+        // THE SIX CLASSES OF THE THIRD ROUND (engine-measured 2026-09-18)
+        // R1: a scaled literal sibling is NARROW to the multiply when its
+        // unscaled integer fits 32 bits ([mul_sibling_width]): under a
+        // LONG slot the LEFT `?` rounds beside it (-7.5 -> -8, -8 * 1.5 =
+        // -12.0) and the RIGHT keeps (-7.5 * 1.5 = -11.25)
+        let t = |s: &str| [WireParam::Text(s.into())];
+        assert!(hits("? * 1.5 = CAST(-12.0 AS NUMERIC(9,1))", &t("-7.5")));
+        assert!(!hits("1.5 * ? = CAST(-12.0 AS NUMERIC(9,1))", &t("-7.5")));
+        assert!(hits("1.5 * ? = CAST(-11.25 AS NUMERIC(9,2))", &t("-7.5")));
+        // carried by a minus and parentheses; a base column, a CAST
+        assert!(hits("? * -1.5 = CAST(12.0 AS NUMERIC(9,1))", &t("-7.5")));
+        assert!(hits("? * (1.5) = CAST(-12.0 AS NUMERIC(9,1))", &t("-7.5")));
+        assert!(hits("? * CAST(1.5 AS NUMERIC(9,1)) = CAST(-12.0 AS NUMERIC(9,1))", &t("-7.5")));
+        assert!(hits("? * CAST(1.5 AS NUMERIC(18,1)) = CAST(-11.25 AS NUMERIC(9,2))", &t("-7.5")));
+        // an INT64 slot: the right rounds whatever the sibling
+        assert!(hits("? * 1.5 = -11.25", &t("-7.5")));
+        assert!(!hits("1.5 * ? = -11.25", &t("-7.5")));
+        // THE FOURTH ROUND: THE SIDE RULE READS A WHITELIST, NOT A TABLE
+        // ([mul_sibling_width]) - every function, conditional, arithmetic
+        // sibling, subquery and derived column refuses at prepare, and so
+        // does a CASE of either form; a DOUBLE sibling is never sized
+        for s in [
+            "? * COALESCE(1.5, 0) = CAST(-12.0 AS NUMERIC(9,1))",
+            "? * ROUND(1.5) = CAST(-16.0 AS NUMERIC(9,1))",
+            "? * IIF(NN = 5, 1.5, 2.5) = CAST(-11.25 AS NUMERIC(9,2))",
+            "? * NULLIF(1.5, 0) = CAST(-11.25 AS NUMERIC(9,2))",
+            "? * CASE NN WHEN 5 THEN 1.5 ELSE 2.5 END = CAST(-12.0 AS NUMERIC(9,1))",
+            "? * CASE NN WHEN 5 THEN 2 ELSE 3 END = CAST(-16.0 AS NUMERIC(9,1))",
+            "? * ABS(A) = CAST(56.0 AS NUMERIC(9,1))",
+            "ABS(A) * ? = CAST(56.0 AS NUMERIC(9,1))",
+            "? * SIGN(A) = CAST(8.0 AS NUMERIC(9,1))",
+            "? * MOD(A, 2) = CAST(8.0 AS NUMERIC(9,1))",
+            "? * (A + 0) = CAST(56.0 AS NUMERIC(9,1))",
+            "? * DL = CAST(-12.0 AS NUMERIC(9,1))",
+            "DL * ? = CAST(-12.0 AS NUMERIC(9,1))",
+        ] {
+            assert!(refused(s), "{s} should refuse (whitelist)");
+        }
+        // ROUND 12, K3: a DOUBLE sibling beside a direct `?` computes in
+        // DOUBLE and refuses at prepare (it answered here before)
+        assert!(refused("? * D = -11.25"), "a DOUBLE sibling refuses (K3)");
+        let w = |s: &str| mul_sibling_width(&parse_raw_expr_any(s).unwrap(), &columns, &descs);
+        assert_eq!(w("1.5"), Some(4));
+        assert_eq!(w("214748364.7"), Some(4));
+        assert_eq!(w("214748364.8"), Some(8));
+        assert_eq!(w("2"), Some(4));
+        assert_eq!(w("2147483647"), Some(4));
+        assert_eq!(w("2147483648"), Some(8));
+        assert_eq!(w("-1.5"), Some(4));
+        assert_eq!(w("-(1.5)"), Some(4));
+        assert_eq!(w("-2147483648"), Some(4)); // the sign folds into the literal
+        assert_eq!(w("-214748364.8"), Some(4));
+        assert_eq!(w("-3000000000"), Some(8));
+        // ONE minus folds into the literal; a further one is a runtime
+        // LONG negation that overflows (round 5: the engine raises
+        // *Integer overflow* for `- -2147483648`, `-(-(-2147483648))` and
+        // `-(-214748364.8)`, so each refuses), while `- -1.5` and
+        // `-(-3000000000)` (INT64) fold
+        assert_eq!(w("-(-2147483648)"), None);
+        assert_eq!(w("- -2147483648"), None);
+        assert_eq!(w("-(-(-2147483648))"), None);
+        assert_eq!(w("-(-214748364.8)"), None);
+        assert_eq!(w("-(-2147483647)"), Some(4));
+        assert_eq!(w("- -1.5"), Some(4));
+        assert_eq!(w("-(-3000000000)"), Some(8));
+        assert_eq!(w("(2)"), Some(4));
+        assert_eq!(w("CAST(A AS SMALLINT)"), Some(2));
+        assert_eq!(w("CAST(1.5 AS NUMERIC(9,1))"), Some(4));
+        assert_eq!(w("CAST(1.5 AS NUMERIC(18,1))"), Some(8));
+        assert_eq!(w("CAST(A AS BIGINT)"), Some(8));
+        assert_eq!(w("A"), Some(4));
+        assert_eq!(w("(A)"), Some(4));
+        for s in [
+            "COALESCE(1.5, 0)", "COALESCE(NULL, 1.5)", "NULLIF(1.5, 0)", "1.5 + 0", "ABS(A)",
+            "ROUND(1.5)", "IIF(NN = 5, 1.5, 2)", "IIF(NN = 5, 3, 2)", "CASE WHEN NN = 5 THEN 3 ELSE 2 END",
+            "CASE NN WHEN 5 THEN 1.5 ELSE 2.5 END", "SIGN(A)", "MOD(A, 2)", "EXTRACT(YEAR FROM DT)",
+            "CHAR_LENGTH(NAME)", "DL", "D", "NAME", "CAST(1.5 AS DOUBLE PRECISION)", "?",
+        ] {
+            assert_eq!(w(s), None, "{s} is not on the whitelist");
+        }
+        assert!(desc_is_stored_field(&desc(dtype::LONG, 4, 0)) && !desc_is_stored_field(&dl));
+        assert_eq!(result_width_bytes(&Expr::Dec(15, -1), &descs), 8); // the describe, unchanged
+
+        // R3: a whole-side text into a DOUBLE slot reads by the compare
+        // grammar - '1 2' is 12 and '1e400' past every double (no row, no
+        // raise); '0x2' raises
+        assert!(hits("IIF(D = ?, 1, 0) = 1", &t("1.5")));
+        assert!(!hits("IIF(D = ?, 1, 0) = 1", &t("1 2")));
+        assert!(!hits("IIF(D = ?, 1, 0) = 1", &t("1e400")));
+        assert_eq!(raises("IIF(D = ?, 1, 0) = 1", &t("0x2")).as_deref(), Some("0x2"));
+        let wd = whole_side_rung(0, &desc(dtype::DOUBLE, 8, 0)).unwrap();
+        assert!(matches!(wd, Expr::Cast(_, CastTarget::Approx, CS_WHOLE_SIDE)));
+        assert_eq!(whole_side_exact(&wd), Some((0, 0)));
+
+        // R4: `-?` of a 4-byte message's -2147483648 overflows like the
+        // engine's negate; the same value from an 8-byte message negates
+        let overflows = |s: &str, args: &[WireParam]| -> bool {
+            let (p, _) = build(s).unwrap_or_else(|| panic!("{s} refused"));
+            matches!(
+                p.bind(args).unwrap_or_else(|e| panic!("{s} bind: {e:?}")).matches(&row),
+                Err(EvalErr::IntegerOverflow)
+            )
+        };
+        let min = || [WireParam::Int(i64::from(i32::MIN), 0)];
+        note_param_message_widths(&[PSlot::Int32(0)]);
+        // (the WHOLE-side chain `-? = A`, `A = -(-?)`, `IIF(-? = A ..)`
+        // refuses at prepare since round 11; the operand rungs keep it)
+        assert!(overflows("-? + 0 = A", &min()));
+        assert!(overflows("-? * 1 = A", &min()));
+        assert!(!hits("? = A", &min()));
+        assert!(!overflows("-? + 0 = A", &[WireParam::Int(i64::from(i32::MIN) + 1, 0)]));
+        note_param_message_widths(&[PSlot::Int64(0)]);
+        assert!(!overflows("-? + 0 = A", &min()));
+        assert!(!hits("-? + 0 = A", &min()));
+        // the CAST path negates at the cast's width whatever the message
+        assert!(overflows("A = -CAST(? AS INTEGER)", &min()));
+        assert!(overflows("A = -CAST(? AS INTEGER)", &t("-2147483648")));
+        assert!(!overflows("A = -CAST(? AS BIGINT)", &min()));
+        assert!(overflows("A = -CAST(? AS SMALLINT)", &[WireParam::Int(-32768, 0)]));
+        note_param_message_widths(&[]);
+        // a text under a negated operator rung still reads and rounds
+        assert!(hits("-? + 1 = A", &t("8.4")));
+        assert_eq!(raises("-? + 1 = A", &t("abc")).as_deref(), Some("abc"));
+
+        // R5: a simple CASE / DECODE cannot type `-?` or an arithmetic `?`
+        // - as a subject or WHEN value (round 3), and as a THEN / ELSE
+        // value (round 4, [raw_decode_untypable])
+        for s in [
+            "CASE A WHEN -? THEN 1 ELSE 0 END = 1",
+            "CASE A WHEN ? + 1 THEN 1 ELSE 0 END = 1",
+            "CASE -? WHEN 2 THEN 1 ELSE 0 END = 1",
+            "DECODE(A, -?, 1, 0) = 1",
+            "CASE A WHEN -7 THEN -? ELSE 0 END = 7",
+            "CASE A WHEN -7 THEN ? * 2 ELSE 0 END = -14",
+            "CASE A WHEN -7 THEN 2 * ? ELSE 0 END = -14",
+            "CASE A WHEN -7 THEN ? / 2 ELSE 0 END = -4",
+            "CASE A WHEN -7 THEN 0 ELSE -? END = 7",
+            "CASE A WHEN -7 THEN CAST(-? AS INTEGER) ELSE 0 END = 7",
+            "CASE A WHEN -7 THEN CAST(? + 1 AS INTEGER) ELSE 0 END = -6",
+            "CASE A WHEN -7 THEN COALESCE(-?, 0) ELSE 0 END = 7",
+            "CASE A WHEN -7 THEN COALESCE(? * 2, 0) ELSE 0 END = -14",
+            "CASE A WHEN -7 THEN ABS(-?) ELSE 0 END = 7",
+            "CASE A WHEN -7 THEN -(?) ELSE 0 END = 7",
+            "CASE A WHEN -7 THEN (-?) ELSE 0 END = 7",
+            "CASE A WHEN -7 THEN -? * 1 ELSE 0 END = 7",
+            "CASE A WHEN -7 THEN 1 WHEN 5 THEN -? END = 7",
+            "COALESCE(CASE A WHEN -7 THEN -? END, 0) = 7",
+            "DECODE(A, -7, -?, 0) = 7",
+            "DECODE(A, -7, 1, ? * 2) = -14",
+        ] {
+            assert!(refused(s), "{s} should refuse");
+        }
+        assert!(hits("CASE A WHEN ? THEN 1 ELSE 0 END = 1", &[WireParam::Int(-7, 0)]));
+        assert!(refused("CASE WHEN A = -? THEN 1 ELSE 0 END = 1"));
+        // ... while a typed or comparison-typed `?`, an add / subtract, and
+        // every searched-CASE / IIF branch keep answering
+        assert!(hits("CASE A WHEN -7 THEN ? + 1 ELSE 0 END = -6", &[WireParam::Int(-7, 0)]));
+        assert!(hits("CASE A WHEN -7 THEN COALESCE(? - 1, 0) ELSE 0 END = -8", &[WireParam::Int(-7, 0)]));
+        assert!(hits("CASE A WHEN -7 THEN -CAST(? AS INTEGER) ELSE 0 END = 7", &[WireParam::Int(-7, 0)]));
+        assert!(hits("CASE A WHEN -7 THEN CAST(? AS INTEGER) * 2 ELSE 0 END = -14", &[WireParam::Int(-7, 0)]));
+        assert!(hits("CASE A WHEN -7 THEN NULLIF(-?, 0) ELSE 0 END = 7", &[WireParam::Int(-7, 0)]));
+        assert!(hits("CASE A WHEN -7 THEN IIF(NN = 5, -?, 0) ELSE 0 END = 7", &[WireParam::Int(-7, 0)]));
+        assert!(hits("IIF(A = -7, -?, 0) = 7", &[WireParam::Int(-7, 0)]));
+        assert!(hits("CASE WHEN A = -7 THEN ? * 2 ELSE 0 END = -14", &[WireParam::Int(-7, 0)]));
+        assert!(hits("IIF(A = -7, ? + 1, 0) = -6", &[WireParam::Int(-7, 0)]));
+        // ... and a searched branch under a CAST / function refuses too
+        for s in [
+            "IIF(A = -7, CAST(-? AS INTEGER), 0) = 7",
+            "IIF(A = -7, ABS(-?), 0) = 7",
+            "IIF(A = -7, CAST(? * 2 AS INTEGER), 0) = -14",
+            "CASE WHEN A = -7 THEN CAST(-? AS INTEGER) ELSE 0 END = 7",
+            "CASE A WHEN -7 THEN -? || '' ELSE '0' END = '7'",
+        ] {
+            assert!(refused(s), "{s} should refuse");
+        }
+        let u = |s: &str| raw_decode_untypable(&parse_raw_expr_any(s).unwrap(), false);
+        assert!(u("-?") && u("? * 2") && u("? / 2") && u("CAST(-? AS INTEGER)") && u("COALESCE(-?, 0)"));
+        assert!(u("ABS(-?)") && u("CAST(? + 1 AS INTEGER)") && u("-? || ''") && u("COALESCE(? * 2, 0)"));
+        assert!(!u("?") && !u("? + 1") && !u("1 - ?") && !u("COALESCE(? + 1, 0)") && !u("CAST(? AS INTEGER) * 2"));
+        assert!(!u("-CAST(? AS INTEGER)") && !u("NULLIF(-?, 0)") && !u("IIF(NN = 5, -?, 0)") && !u("? || 'x'"));
+
+        // X2 (round 4): a TEMPORAL whole side binds at the MESSAGE's type
+        // and the compare promotes - a DATE column against a TIMESTAMP
+        // message reads as midnight, a TIME column takes today's date
+        assert!(hits("IIF(DT = ?, 1, 0) = 1", &[WireParam::Timestamp(60000, 0)]));
+        assert!(!hits("IIF(DT = ?, 1, 0) = 1", &[WireParam::Timestamp(60000, 450_000_000)]));
+        assert!(hits("IIF(DT < ?, 1, 0) = 1", &[WireParam::Timestamp(60000, 450_000_000)]));
+        assert!(!hits("IIF(DT > ?, 1, 0) = 1", &[WireParam::Timestamp(60000, 450_000_000)]));
+        assert!(hits("IIF(DT <> ?, 1, 0) = 1", &[WireParam::Timestamp(60000, 450_000_000)]));
+        assert!(hits("IIF(DT = ?, 1, 0) = 1", &[WireParam::Date(60000)]));
+        assert!(hits("IIF(? = DT, 1, 0) = 1", &[WireParam::Date(60000)]));
+        assert!(hits("IIF(TM > ?, 1, 0) = 1", &[WireParam::Timestamp(60000, 450_000_000)]));
+        assert!(!hits("IIF(TM = ?, 1, 0) = 1", &[WireParam::Timestamp(60000, 450_000_000)]));
+        assert!(hits("IIF(TM = ?, 1, 0) = 1", &[WireParam::Timestamp(session_now().0, 450_000_000)]));
+        assert!(hits("IIF(TM = ?, 1, 0) = 1", &[WireParam::Time(450_000_000)]));
+        assert!(!hits("IIF(DT = ?, 1, 0) = 1", &[WireParam::Null]));
+        let wdt = whole_side_rung(0, &desc(dtype::SQL_DATE, 4, 0)).unwrap();
+        assert!(matches!(wdt, Expr::Cast(_, CastTarget::Temporal(TKind::Date), CS_WHOLE_SIDE)));
+        assert_eq!(whole_side_exact(&wdt), Some((0, 0)));
+        assert!(matches!(
+            bind_whole_side_temporal(0, TKind::Date, CS_WHOLE_SIDE, &[WireParam::Timestamp(60000, 5)]),
+            Some(Expr::TsLit(60000, 5))
+        ));
+        assert!(matches!(
+            bind_whole_side_temporal(0, TKind::Timestamp, CS_WHOLE_SIDE, &[WireParam::Date(60000)]),
+            Some(Expr::TsLit(60000, 0))
+        ));
+        assert!(bind_whole_side_temporal(0, TKind::Time, CS_WHOLE_SIDE, &[WireParam::Date(60000)]).is_none());
+        assert!(matches!(
+            bind_whole_side_temporal(0, TKind::Date, CS_WHOLE_SIDE, &[WireParam::Text("2024-01-10".into())]),
+            Some(Expr::Cast(_, CastTarget::Temporal(TKind::Date), _))
+        ));
+        assert_eq!(
+            value_cmp(&Value::Time(450_000_000), &Value::Timestamp(60000, 450_000_000)),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(
+            value_cmp(&Value::Time(450_000_000), &Value::Timestamp(session_now().0, 450_000_000)),
+            std::cmp::Ordering::Equal
+        );
+
+        // X3 (round 4): a whole-side text inside a subquery body spells
+        // back by the compare grammar ([corr_text_cmp_literal])
+        assert_eq!(corr_cmp_side_slots("IIF(b.ID = FC$PRM0, 1, 0) = 1"), vec![0]);
+        assert_eq!(corr_cmp_side_slots("(FC$PRM0) = b.ID"), vec![0]);
+        assert_eq!(corr_cmp_side_slots("b.ID <> FC$PRM0 AND b.ID IN (3, FC$PRM1)"), vec![0, 1]);
+        assert_eq!(corr_cmp_side_slots("b.ID NOT IN (FC$PRM0, 3)"), vec![0]);
+        assert_eq!(corr_cmp_side_slots("b.ID = CAST(FC$PRM0 AS INTEGER)"), Vec::<usize>::new());
+        assert_eq!(corr_cmp_side_slots("COALESCE(FC$PRM0, 0) = 1"), Vec::<usize>::new());
+        assert_eq!(corr_cmp_side_slots("IIF(b.ID = 3, FC$PRM0, 0) = 1"), Vec::<usize>::new());
+        assert_eq!(corr_cmp_side_slots("b.S = 'FC$PRM0 = x' AND b.ID = FC$PRM0"), vec![0]);
+        let long4 = desc(dtype::LONG, 4, 0);
+        assert_eq!(corr_text_cmp_literal("1 2", &long4).as_deref(), Some("12"));
+        assert_eq!(corr_text_cmp_literal(" 2 ", &long4).as_deref(), Some("2"));
+        assert_eq!(corr_text_cmp_literal("2 .5", &long4).as_deref(), Some("CAST('2.5' AS NUMERIC(38,1))"));
+        assert!(corr_text_cmp_literal("0X2", &long4).unwrap().contains("e308"));
+        assert!(corr_text_cmp_literal("1e400", &long4).unwrap().contains("e308"));
+        assert_eq!(corr_text_cmp_literal("abc", &long4).as_deref(), Some("CAST('abc' AS DOUBLE PRECISION)"));
+        assert_eq!(corr_text_cmp_literal("0x2", &long4).as_deref(), Some("CAST('0x2' AS DOUBLE PRECISION)"));
+        assert_eq!(corr_text_cmp_literal("2'", &long4).as_deref(), Some("CAST('2''' AS DOUBLE PRECISION)"));
+        assert!(corr_slot_is_number(&long4) && !corr_slot_is_number(&desc(dtype::VARYING, 10, 0)));
+
+        // X4 (round 4): SIGN and MOD evaluate over an approximate operand
+        assert!(hits("SIGN(D) = 1", &[]));
+        assert!(hits("SIGN(-D) = -1", &[]));
+        assert!(hits("MOD(D, 2) = 0", &[])); // 1.5 rounds to 2
+        assert!(hits("MOD(2, D) = 0", &[]));
+        assert!(hits("MOD(D * 10, 7) = 1", &[]));
+        assert_eq!(approx_to_int64(2.5).unwrap(), 3);
+        assert_eq!(approx_to_int64(-2.5).unwrap(), -3);
+        assert_eq!(approx_to_int64(0.4).unwrap(), 0);
+        assert!(matches!(approx_to_int64(1e19), Err(EvalErr::NumericOutOfRange)));
+        assert!(matches!(approx_to_int64(f64::INFINITY), Err(EvalErr::NumericOutOfRange)));
+
+        // X6 (round 4): a DML destination's `-?` negates in the message
+        // width, then converts ([resolve_dest_param_expr])
+        let mut dsink: Vec<Option<Descriptor>> = Vec::new();
+        let dest8 = desc(dtype::INT64, 8, 0);
+        // (a parsed `?` is unnumbered until [renumber_raw_params])
+        let mut dneg = parse_raw_expr_any("-?").unwrap();
+        renumber_raw_params(&mut dneg, &mut 0);
+        let de = resolve_dest_param_expr(&dneg, &dest8, &columns, &descs, &mut dsink).unwrap();
+        assert!(matches!(&de, Expr::Neg(inner) if matches!(**inner, Expr::Cast(_, CastTarget::Int { bytes: 8 }, CS_SLOT_OPERAND))));
+        assert_eq!(dsink[0].as_ref().map(|d| d.dtype), Some(dtype::INT64));
+        note_param_message_widths(&[PSlot::Int32(0)]);
+        let bound = subst_params_expr(&de, &min()).unwrap();
+        assert!(matches!(bound.eval(&[]), Err(EvalErr::IntegerOverflow)));
+        let bound = subst_params_expr(&de, &[WireParam::Int(i64::from(i32::MIN) + 1, 0)]).unwrap();
+        assert!(matches!(bound.eval(&[]), Ok(Value::Int(2147483647))));
+        note_param_message_widths(&[PSlot::Int64(0)]);
+        let bound = subst_params_expr(&de, &min()).unwrap();
+        assert!(matches!(bound.eval(&[]), Ok(Value::Int(2147483648))));
+        note_param_message_widths(&[]);
+        let de4 = resolve_dest_param_expr(&dneg, &desc(dtype::LONG, 4, 0), &columns, &descs, &mut dsink).unwrap();
+        let bound = subst_params_expr(&de4, &t("1.5")).unwrap();
+        assert!(matches!(bound.eval(&[]), Ok(Value::Int(-2))));
+
+        // R6: a `?` under an operator inside a subquery body is spotted
+        // in the text ([text_param_under_operator])
+        for s in ["-? = b.ID", "b.NM = ? * b.ID", "b.ID - ? = 1", "b.ID = -(?)", "(? * 2) = b.ID", "b.ID = ? / 2"] {
+            assert!(text_param_under_operator(s), "{s}");
+        }
+        for s in ["b.ID = ?", "IIF(b.ID = ?, 1, 0) = 1", "b.ID = CAST(? AS INTEGER) + 1", "b.S = ? || ''", "(?) = b.ID", "b.ID IN (?, 3)", "b.ID < ?", "b.S = '-?'"] {
+            assert!(!text_param_under_operator(s), "{s}");
+        }
+    }
+
+    /// Round 5 (2026-09-19): the refuter's A-L findings, each rule as
+    /// measured on the live engine (cmpfix5) - see the doc comments on
+    /// [resolve_dest_param_expr], [raw_untyped_num], [mul_sibling_width],
+    /// [parse_case_tail], [whole_side_rung], [corr_marker_is_cmp_side],
+    /// [corr_text_cmp_literal], [text_overflows_scaled_slot] and
+    /// [text_to_exact] (round 7's scope cut took I, J, K, H and S7 back
+    /// out again: [resolve_dest_param_expr], [resolve_proj_expr]).
+    #[test]
+    fn round5_fixes_a_to_l() {
+        let columns = vec![
+            RelationColumn { name: "N".into(), field_id: 0, position: 0 },
+            RelationColumn { name: "BI".into(), field_id: 1, position: 1 },
+            RelationColumn { name: "N18".into(), field_id: 2, position: 2 },
+            RelationColumn { name: "NM".into(), field_id: 3, position: 3 },
+        ];
+        let mut stored = |dt: u8, len: u16, sc: i8, st: i16| {
+            let mut d = desc(dt, len, sc);
+            d.sub_type = st;
+            d.offset = 8; // a stored base-table field ([desc_is_stored_field])
+            d
+        };
+        let descs = vec![
+            stored(dtype::LONG, 4, 0, 0),
+            stored(dtype::INT64, 8, 0, 0),
+            stored(dtype::INT64, 8, -1, 1),
+            stored(dtype::LONG, 4, -2, 1),
+        ];
+        let raw = |s: &str| {
+            let mut r = parse_raw_expr_any(s).unwrap();
+            renumber_raw_params(&mut r, &mut 0);
+            r
+        };
+        let t = |s: &str| vec![WireParam::Text(s.into())];
+
+        // A: the whole minus chain negates at the message's width and the
+        // destination casts ONCE - `-(-?)` ['-2147483648'] fits INTEGER
+        let mut sink = Vec::new();
+        // (round 7: the previous tree - the minuses on top of the stamped
+        // slot cast; the text still stores, the 4-byte message minimum
+        // still overflows under its first minus through the stamp)
+        let e = resolve_dest_param_expr(&raw("-(-?)"), &descs[0], &columns, &descs, &mut sink).unwrap();
+        assert!(matches!(&e, Expr::Neg(a) if matches!(&**a, Expr::Neg(c)
+            if matches!(&**c, Expr::Cast(p, CastTarget::Int { bytes: 4 }, CS_SLOT_OPERAND) if matches!(**p, Expr::Param(0))))));
+        assert_eq!(subst_params_expr(&e, &t("-2147483648")).unwrap().eval(&[]).unwrap(), Value::Int(-2147483648));
+        // `-(-(-?))` of the same text is 2147483648 here; the STORE into
+        // INTEGER raises *numeric value is out of range*, as the engine's
+        let e3 = resolve_dest_param_expr(&raw("-(-(-?))"), &descs[0], &columns, &descs, &mut sink).unwrap();
+        assert_eq!(subst_params_expr(&e3, &t("-2147483648")).unwrap().eval(&[]).unwrap(), Value::Int(2147483648));
+        // a 4-byte MESSAGE minimum still overflows under its first minus
+        note_param_message_widths(&[PSlot::Int32(0)]);
+        let b = subst_params_expr(&e, &[WireParam::Int(i64::from(i32::MIN), 0)]).unwrap();
+        assert!(matches!(b.eval(&[]), Err(EvalErr::IntegerOverflow)));
+        note_param_message_widths(&[]);
+        assert_eq!(neg_param_chain_of(&raw("-(-?)")), Some((0, 2)));
+        assert_eq!(neg_param_chain_of(&raw("-(? + 1)")), None);
+
+        // B / G: an add with one typed operand is typed, a both-untyped one is not
+        assert!(!raw_untyped_num(&raw("? + 1")));
+        assert!(raw_untyped_num(&raw("? + ?")));
+        assert!(raw_untyped_num(&raw("? * 2")));
+        for s in ["-(? + 1)", "(? + 1) * 1", "(? + 1) / 1", "ABS(? + 1)", "-(? + 1.5)", "2 * (? + 1)", "ABS(?)", "? || 'x'"] {
+            assert!(!raw_decode_untypable(&raw(s), false), "{s} answers in a DECODE value");
+        }
+        for s in ["? + ?", "-? - ?", "(? + ?) * 1", "ABS(? + ?)", "-(? + ?)", "-(? * 2)", "(? * 2) + 1", "CAST(? + 1 AS INTEGER)", "(? + 1) || 'x'", "-?"] {
+            assert!(raw_decode_untypable(&raw(s), false), "{s} refuses in a DECODE value");
+        }
+        assert!(coalesce_arg_raises(&raw("? + ?")));
+        assert!(coalesce_arg_raises(&raw("? - ?")));
+        assert!(!coalesce_arg_raises(&raw("? + 1")));
+
+        // C: one minus folds into the literal, a further one that overflows
+        // the LONG width refuses; a lexer-folded negative literal counts
+        let w = |s: &str| mul_sibling_width(&parse_raw_expr_any(s).unwrap(), &columns, &descs);
+        assert_eq!(w("-2147483648"), Some(4));
+        assert_eq!(w("-(-2147483648)"), None);
+        assert_eq!(w("- -2147483648"), None);
+        assert_eq!(w("-(-(-2147483648))"), None);
+        assert_eq!(w("-(-(2147483648))"), None);
+        assert_eq!(w("-(-214748364.8)"), None);
+        assert_eq!(w("-(-2147483647)"), Some(4));
+        assert_eq!(w("- -1.5"), Some(4));
+        assert_eq!(w("-(-3000000000)"), Some(8));
+
+        // D: a `?` subject with two or more WHENs refuses at prepare
+        assert!(parse_raw_expr_any("CASE ? WHEN 2 THEN 1 WHEN 3 THEN 2 ELSE 0 END").is_none());
+        assert!(parse_raw_expr_any("CASE ? WHEN 2 THEN 1 ELSE 0 END").is_some());
+        // J: the simple form is flagged, the searched form is not
+        assert!(matches!(parse_raw_expr_any("CASE N WHEN 2 THEN 1 ELSE 0 END"), Some(RawExpr::Case(_, _, true))));
+        assert!(matches!(parse_raw_expr_any("CASE WHEN N = 2 THEN 1 ELSE 0 END"), Some(RawExpr::Case(_, _, false))));
+
+        // E: a TIME whole side refuses inside a subquery body, not outside
+        let tm = desc(dtype::SQL_TIME, 4, 0);
+        assert!(whole_side_rung(0, &tm).is_some());
+        CORR_INNER_PLAN.with(|c| c.set(true));
+        assert!(whole_side_rung(0, &tm).is_none());
+        assert!(whole_side_rung(0, &descs[0]).is_some());
+        CORR_INNER_PLAN.with(|c| c.set(false));
+
+        // F(a): a simple CASE's WHEN value is a compare side in a body
+        let is_side = |txt: &str| {
+            let at = txt.find("FC$PRM0").unwrap();
+            corr_marker_is_cmp_side(txt.as_bytes(), at, at + 7)
+        };
+        assert!(is_side("CASE b.ID WHEN FC$PRM0 THEN 1 ELSE 0 END = 1"));
+        assert!(is_side("b.ID = FC$PRM0"));
+        assert!(!is_side("CAST(FC$PRM0 AS INTEGER) = b.ID"));
+        // F(b) / L: the spellings of a text into a numeric body side
+        let nm = &descs[3];
+        assert_eq!(
+            corr_text_cmp_literal("999999999999999999999999999999999999999", &descs[0]).as_deref(),
+            Some("CAST('1e39' AS DOUBLE PRECISION)")
+        );
+        assert_eq!(corr_text_cmp_literal("99999999999999999", nm).as_deref(), Some("CAST('99999999999999999' AS NUMERIC(18,2))"));
+        assert_eq!(corr_text_cmp_literal("9999999999999999", nm).as_deref(), Some("9999999999999999"));
+
+        // ROUND 7, THE SCOPE CUT: the DML destination router is chunk 45's
+        // tree again - a multiply's LEFT `?` rounds at the destination's
+        // own width into every scaled exact destination, every other `?`
+        // casts into the destination; no side rule, no divisor rounding,
+        // no dividend reading (rounds 5-6's K, reverted)
+        let shape = |s: &str, d: &Descriptor| {
+            let mut sink = Vec::new();
+            resolve_dest_param_expr(&raw(s), d, &columns, &descs, &mut sink).unwrap()
+        };
+        let is_rounded = |e: &Expr| matches!(e, Expr::Cast(_, CastTarget::Int { bytes: 8 }, _));
+        let is_at_scale = |e: &Expr, sc: i8| matches!(e, Expr::Cast(_, CastTarget::Numeric { scale, bytes: 8, .. }, _) if *scale == sc);
+        // round 6: a multiply / divide casts at the DESTINATION'S width
+        let is_rounded_w = |e: &Expr, w: u8| matches!(e, Expr::Cast(_, CastTarget::Int { bytes }, _) if *bytes == w);
+        let is_at_scale_w = |e: &Expr, sc: i8, w: u8| matches!(e, Expr::Cast(_, CastTarget::Numeric { scale, bytes, .. }, _) if *scale == sc && *bytes == w);
+        // NUMERIC(18,1): the LEFT `?` rounds at eight bytes, a right `?`
+        // casts into the destination
+        let Expr::Bin(l, _, r) = shape("? * 2", &descs[2]) else { panic!() };
+        assert!(is_rounded_w(&l, 8) && matches!(*r, Expr::Int(2)));
+        let Expr::Bin(l, _, r) = shape("2 * ?", &descs[2]) else { panic!() };
+        assert!(matches!(*l, Expr::Int(2)) && is_at_scale_w(&r, -1, 8));
+        let Expr::Bin(l, _, r) = shape("? * ?", &descs[2]) else { panic!() };
+        assert!(is_rounded_w(&l, 8) && is_at_scale_w(&r, -1, 8));
+        // NUMERIC(9,2): the LEFT `?` rounds at four bytes whatever the sibling
+        let Expr::Bin(l, _, _) = shape("? * 2", &descs[3]) else { panic!() };
+        assert!(is_rounded_w(&l, 4));
+        let Expr::Bin(l, _, r) = shape("? * BI", &descs[3]) else { panic!() };
+        assert!(is_rounded_w(&l, 4) && matches!(*r, Expr::Col(1)));
+        let Expr::Bin(l, _, r) = shape("BI * ?", &descs[3]) else { panic!() };
+        assert!(matches!(*l, Expr::Col(1)) && is_at_scale_w(&r, -2, 4));
+        // a `-?` left operand: the negation sits on top of the rounding cast
+        let Expr::Bin(l, _, _) = shape("-? * 2", &descs[3]) else { panic!() };
+        assert!(matches!(&*l, Expr::Neg(inner) if is_rounded_w(inner, 4)));
+        // a divisor `?` casts into the destination (no rounding)
+        let Expr::Bin(l, _, r) = shape("2 / ?", &descs[2]) else { panic!() };
+        assert!(matches!(*l, Expr::Int(2)) && is_at_scale_w(&r, -1, 8));
+        let Expr::Bin(_, _, r) = shape("2 / ?", &descs[3]) else { panic!() };
+        assert!(is_at_scale_w(&r, -2, 4));
+        // a TEXT destination under arithmetic refuses (the one guard kept)
+        let mut sink = Vec::new();
+        assert!(resolve_dest_param_expr(&raw("? * 2"), &desc(dtype::VARYING, 10, 0), &columns, &descs, &mut sink).is_none());
+        // a `?` dividend over a `?` divisor: both cast into the destination
+        let Expr::Bin(l, _, r) = shape("? / ?", &descs[0]) else { panic!() };
+        assert!(is_rounded_w(&l, 4) && is_rounded_w(&r, 4));
+        // a negated `?` OPERAND: the minus on top of the cast (the previous
+        // tree), where a bare `-?` DESTINATION casts the negated value
+        let Expr::Bin(l, _, _) = shape("-? / ?", &descs[0]) else { panic!() };
+        assert!(matches!(&*l, Expr::Neg(inner) if is_rounded_w(inner, 4)));
+        let Expr::Bin(_, _, r) = shape("1 - -?", &descs[0]) else { panic!() };
+        assert!(matches!(&*r, Expr::Neg(inner) if is_rounded_w(inner, 4)));
+        let e = shape("-?", &descs[0]);
+        assert!(matches!(&e, Expr::Neg(inner) if matches!(**inner, Expr::Cast(_, CastTarget::Int { bytes: 4 }, CS_SLOT_OPERAND))));
+        // the stamped SHORT slot cast: the 4-byte message -32768 negates to 32768
+        let e = shape("-?", &stored(dtype::SHORT, 2, 0, 0));
+        note_param_message_widths(&[PSlot::Int32(0)]);
+        assert_eq!(subst_params_expr(&e, &[WireParam::Int(-32768, 0)]).unwrap().eval(&[]).unwrap(), Value::Int(32768));
+        note_param_message_widths(&[]);
+        // ...where an EXPLICIT CAST(? AS SMALLINT) is its own width
+        let mut psink = Vec::new();
+        let ec = resolve_proj_expr(&raw("-CAST(? AS SMALLINT)"), &columns, &descs, &mut psink).unwrap();
+        note_param_message_widths(&[PSlot::Int32(0)]);
+        assert!(matches!(subst_params_expr(&ec, &[WireParam::Int(-32768, 0)]).unwrap().eval(&[]), Err(EvalErr::IntegerOverflow)));
+        note_param_message_widths(&[]);
+        // a conditional's bare `?` branch is recognised for the INT128 / DECFLOAT refusal
+        assert!(raw_conditional_bare_param(&raw("IIF(N = 1, ?, 0)")));
+        assert!(raw_conditional_bare_param(&raw("CASE N WHEN 1 THEN ? ELSE 0 END + 0")));
+        assert!(raw_conditional_bare_param(&raw("NULLIF(?, 0)")));
+        assert!(!raw_conditional_bare_param(&raw("COALESCE(?, 0)")));
+        assert!(!raw_conditional_bare_param(&raw("IIF(N = 1, ? + 0, 0)")));
+        assert!(!raw_conditional_bare_param(&raw("IIF(N = 1, CAST(? AS INTEGER), 0)")));
+        assert!(!raw_conditional_bare_param(&raw("CAST(CASE N WHEN 2 THEN ? ELSE 0 END AS INTEGER)")));
+        assert!(raw_conditional_bare_param(&raw("-IIF(N = 1, ?, 0) + 1")));
+        let Expr::Bin(_, _, r) = shape("ABS(?) / ?", &descs[3]) else { panic!() };
+        assert!(is_at_scale_w(&r, -2, 4));
+        // a scaled dividend over a `?` divisor answers (the previous tree)
+        assert!(resolve_dest_param_expr(&raw("NM / ?"), &descs[3], &columns, &descs, &mut sink).is_some());
+        assert!(resolve_dest_param_expr(&raw("(? + 1) / ?"), &descs[3], &columns, &descs, &mut sink).is_some());
+        // an add casts into the destination too
+        let Expr::Bin(l, _, _) = shape("? + 1", &descs[3]) else { panic!() };
+        assert!(is_at_scale_w(&l, -2, 4));
+        // the string functions the engine cannot type over a bare `?` refuse
+        for s in ["LEFT(?, 1)", "RIGHT(?, 1)", "REVERSE(?)", "LPAD(?, 3)", "RPAD(?, 3, 'x')", "MOD(?, ?)", "CHAR_LENGTH(?)", "SUBSTRING(? FROM ?)"] {
+            assert!(resolve_dest_param_expr(&raw(s), &desc(dtype::VARYING, 10, 0), &columns, &descs, &mut sink).is_none(), "{s}");
+            assert!(resolve_dest_param_expr(&raw(s), &descs[0], &columns, &descs, &mut sink).is_none(), "{s}");
+        }
+        for s in ["MOD(?, 2)", "MOD(5, ?)", "SUBSTRING(? FROM 1 FOR 1)", "UPPER(?)"] {
+            assert!(resolve_dest_param_expr(&raw(s), &desc(dtype::VARYING, 10, 0), &columns, &descs, &mut sink).is_some(), "{s}");
+        }
+        // a numeric simple CASE's bare `?` under a `||` refuses in the
+        // PROJECTION router (a comparison side, a select list); a DML value
+        // keeps it, and a text sibling answers everywhere
+        let mut psink = Vec::new();
+        assert!(resolve_proj_expr(&raw("CASE N WHEN 2 THEN ? ELSE 0 END || 'x'"), &columns, &descs, &mut psink).is_none());
+        assert!(resolve_proj_expr(&raw("CASE N WHEN 2 THEN ? ELSE 'q' END || 'x'"), &columns, &descs, &mut psink).is_some());
+        assert!(resolve_dest_param_expr(&raw("CASE N WHEN 2 THEN ? ELSE 0 END || 'x'"), &desc(dtype::VARYING, 10, 0), &columns, &descs, &mut sink).is_some());
+        // TRIM(?) with a bare `?` operand answers into a text slot only
+        assert!(resolve_dest_param_expr(&raw("TRIM(?)"), &descs[0], &columns, &descs, &mut sink).is_none());
+        assert!(resolve_dest_param_expr(&raw("TRIM(?)"), &desc(dtype::VARYING, 10, 0), &columns, &descs, &mut sink).is_some());
+        // ...and the evaluation of a one-argument TRIM never indexes past it
+        assert_eq!(
+            Expr::Func(SysFn::Trim(TrimSide::Both), vec![Expr::Str(" ab ".into())]).eval(&[]).unwrap(),
+            Value::Text("ab".into())
+        );
+        // the narrow S4: a simple CASE's bare `?` value IS the side (or
+        // sits under a minus) - nothing nested, nothing under arithmetic
+        assert!(raw_is_simple_case_bare_value(&raw("CASE N WHEN 2 THEN ? ELSE 0 END")));
+        assert!(raw_is_simple_case_bare_value(&raw("-CASE N WHEN 2 THEN ? ELSE 0 END")));
+        assert!(!raw_is_simple_case_bare_value(&raw("CASE N WHEN 2 THEN ? ELSE 0 END + 1")));
+        assert!(!raw_is_simple_case_bare_value(&raw("CASE WHEN N = 2 THEN ? ELSE 0 END")));
+        assert!(!raw_is_simple_case_bare_value(&raw("CASE N WHEN 2 THEN ? + 1 ELSE 0 END")));
+        assert!(!raw_is_simple_case_bare_value(&raw("IIF(N = 2, CASE N WHEN 2 THEN ? ELSE 0 END, 0)")));
+        let case0 = raw("CASE N WHEN 2 THEN ? ELSE 0 END");
+        let case15 = raw("CASE N WHEN 2 THEN ? ELSE 1.5 END");
+        let vs_bare = RawKind::CmpExpr(Cmp::Eq, raw("?"));
+        let vs_cast = RawKind::CmpExpr(Cmp::Eq, raw("CAST(? AS INTEGER)"));
+        let vs_coal = RawKind::CmpExpr(Cmp::Eq, raw("COALESCE(?, 0)"));
+        assert!(simple_case_bare_vs_param_refuses(&case0, &vs_bare, &columns, &descs));
+        assert!(simple_case_bare_vs_param_refuses(&case15, &vs_bare, &columns, &descs));
+        assert!(simple_case_bare_vs_param_refuses(&case0, &vs_cast, &columns, &descs));
+        assert!(!simple_case_bare_vs_param_refuses(&case15, &vs_cast, &columns, &descs));
+        assert!(!simple_case_bare_vs_param_refuses(&case0, &vs_coal, &columns, &descs));
+        // the int64 accumulator of the scaled-slot overflow class is signed
+        assert!(text_overflows_scaled_slot(i64::MIN as i128, 0, -2));
+        assert!(text_overflows_scaled_slot(i64::MIN as i128, 0, -1));
+        // an exact value that does not fit its column is 22003
+        assert!(matches!(
+            wire_value_fit_error(&descs[3], &WireParam::Int(-214748364800, -2)),
+            Some(EvalErr::NumericOutOfRange)
+        ));
+        assert!(wire_value_fit_error(&descs[3], &WireParam::Int(725, -2)).is_none());
+
+        // L(a): the scaled-slot overflow class
+        assert!(text_overflows_scaled_slot(99999999999999999, 0, -2));
+        assert!(text_overflows_scaled_slot(9223372036854775807, 0, -2));
+        assert!(text_overflows_scaled_slot(922337203685477590, -1, -2));
+        assert!(!text_overflows_scaled_slot(922337203685477580, -1, -2));
+        assert!(!text_overflows_scaled_slot(9999999999999999, 0, -2));
+        assert!(!text_overflows_scaled_slot(9223372036854775808, -2, -2));
+        assert!(text_overflows_scaled_slot(99999999999999999999999999999999999999, 0, -2));
+        assert!(!text_overflows_scaled_slot(999999999999999999999999999999999999, 0, -2));
+        assert!(!text_overflows_scaled_slot(99999999999999999, 0, 0));
+        // L(b): CAST(text AS exact) gates the coefficient at the target's width
+        let cast_int = |s: &str, bytes: u8| {
+            Expr::Cast(Box::new(Expr::Str(s.into())), CastTarget::Int { bytes }, fire_crab_ods::intl::CS_UTF8).eval(&[])
+        };
+        assert!(matches!(cast_int("2.0000000000000000001", 4), Err(EvalErr::NumericOutOfRange)));
+        assert!(matches!(cast_int("2.0000000000000000000", 4), Ok(Value::Int(2))));
+        assert!(matches!(cast_int("214748364.75", 4), Err(EvalErr::NumericOutOfRange)));
+        assert!(matches!(cast_int("1.999999", 2), Err(EvalErr::NumericOutOfRange)));
+        assert!(matches!(cast_int("0.99995", 4), Ok(Value::Int(1))));
+        assert!(matches!(cast_int("2.5", 4), Ok(Value::Int(3))));
+        // and a double at exactly -2^63 is out of range for BIGINT
+        assert!(matches!(approx_to_int64(-9223372036854775808.0), Err(EvalErr::NumericOutOfRange)));
+    }
+
+    #[test]
+    fn round8_q1_to_q4() {
+        let columns = vec![
+            RelationColumn { name: "N".into(), field_id: 0, position: 0 },
+            RelationColumn { name: "BI".into(), field_id: 1, position: 1 },
+            RelationColumn { name: "N18".into(), field_id: 2, position: 2 },
+            RelationColumn { name: "NM".into(), field_id: 3, position: 3 },
+        ];
+        let stored = |dt: u8, len: u16, sc: i8, st: i16| {
+            let mut d = desc(dt, len, sc);
+            d.sub_type = st;
+            d.offset = 8;
+            d
+        };
+        let descs = vec![
+            stored(dtype::LONG, 4, 0, 0),
+            stored(dtype::INT64, 8, 0, 0),
+            stored(dtype::INT64, 8, -1, 1),
+            stored(dtype::LONG, 4, -2, 1),
+        ];
+        let n41 = stored(dtype::SHORT, 2, -1, 1);
+        let raw = |s: &str| {
+            let mut r = parse_raw_expr_any(s).unwrap();
+            renumber_raw_params(&mut r, &mut 0);
+            r
+        };
+        let dest = |s: &str, d: &Descriptor| {
+            let mut sink = Vec::new();
+            resolve_dest_param_expr(&raw(s), d, &columns, &descs, &mut sink).unwrap()
+        };
+        let t = |s: &str| vec![WireParam::Text(s.into())];
+        let run = |e: &Expr, a: &[WireParam]| subst_params_expr(e, a).unwrap().eval(&[]);
+
+        // Q1: the scale-0 multiply rounding cast carries the operand stamp,
+        // so the minus looks through it to the MESSAGE's width
+        let e = dest("-? * 1", &n41);
+        let Expr::Bin(l, ArithOp::Mul, _) = &e else { panic!() };
+        assert!(matches!(&**l, Expr::Neg(c) if matches!(**c, Expr::Cast(_, CastTarget::Int { bytes: 2 }, CS_SLOT_OPERAND))));
+        note_param_message_widths(&[PSlot::Int32(0)]);
+        assert_eq!(run(&e, &[WireParam::Int(-32768, 0)]).unwrap(), Value::Int(32768));
+        note_param_message_widths(&[]);
+        assert_eq!(run(&e, &t("-32768")).unwrap(), Value::Int(32768));
+        // ...and an operand's cast reads the text as the previous binary did
+        assert_eq!(run(&e, &t("-32767.6")).unwrap(), Value::Int(32768));
+        let e = dest("-? * 1", &descs[3]);
+        assert_eq!(run(&e, &t("-2147483648")).unwrap(), Value::Int(2147483648));
+        note_param_message_widths(&[PSlot::Int32(0)]);
+        assert!(matches!(run(&e, &[WireParam::Int(i64::from(i32::MIN), 0)]), Err(EvalErr::IntegerOverflow)));
+        note_param_message_widths(&[]);
+        assert_eq!(run(&dest("? + 1", &descs[0]), &t("1.999999999999")).unwrap(), Value::Int(3));
+        assert_eq!(run(&dest("-?", &descs[0]), &t("-1.999999999999")).unwrap(), Value::Int(2));
+        // a VALUE position reads the text as the previous binary did
+        // (round 10: the slot-width gate there was right for this bind
+        // but wrong beside a wider sibling - recorded, pre-existing)
+        let v = dest("?", &descs[0]);
+        assert!(matches!(v, Expr::Cast(_, CastTarget::Int { bytes: 4 }, CS_SLOT_CAST)));
+        assert_eq!(run(&v, &t("1.999999999999")).unwrap(), Value::Int(2));
+
+        // Q2: an exponent spelling into an exact NUMERIC reads by decompose
+        let cast_num = |s: &str, scale: i8, bytes: u8| {
+            Expr::Cast(
+                Box::new(Expr::Str(s.into())),
+                CastTarget::Numeric { scale, bytes, sub_type: 1 },
+                fire_crab_ods::intl::CS_UTF8,
+            )
+            .eval(&[])
+        };
+        assert_eq!(cast_num("2.5e0", -2, 4).unwrap(), Value::Scaled(250, -2));
+        assert_eq!(cast_num(" 25e-1 ", -2, 4).unwrap(), Value::Scaled(250, -2));
+        assert_eq!(cast_num("1e-40", -2, 4).unwrap(), Value::Scaled(0, -2));
+        assert_eq!(cast_num("2.555e0", -2, 4).unwrap(), Value::Scaled(256, -2));
+        assert_eq!(cast_num("-2.555e0", -2, 4).unwrap(), Value::Scaled(-256, -2));
+        assert_eq!(cast_num("4.99e-3", -2, 4).unwrap(), Value::Scaled(0, -2));
+        assert_eq!(cast_num("5e-3", -2, 4).unwrap(), Value::Scaled(1, -2));
+        assert_eq!(cast_num("2147483647e-2", -2, 4).unwrap(), Value::Scaled(2147483647, -2));
+        assert_eq!(cast_num("3276.7e0", -1, 2).unwrap(), Value::Scaled(32767, -1));
+        assert_eq!(cast_num("2.5e0", -1, 8).unwrap(), Value::Scaled(25, -1));
+        for bad in ["3e20", "1e400", "1e-3276", "2147483648e-2", "2.50000000000e0", "100000000000e-10"] {
+            assert!(matches!(cast_num(bad, -2, 4), Err(EvalErr::NumericOutOfRange)), "{bad}");
+        }
+        assert!(matches!(cast_num("3276.8e0", -1, 2), Err(EvalErr::NumericOutOfRange)));
+        for bad in ["1e", "e1", "2.5e0x", "2.5 e0", "1e+-1", "--1e0", "0x10"] {
+            assert!(matches!(cast_num(bad, -2, 4), Err(EvalErr::ConversionError(_) | EvalErr::ConversionErrorBytes(_))), "{bad}");
+        }
+        // no exponent: not this path (the plain decimal reading stands)
+        assert_eq!(exp_text_to_scaled("2.5", 4, -2), None);
+        assert_eq!(cast_num("2.5", -2, 4).unwrap(), Value::Scaled(250, -2));
+        // an INT128 backing is left as it was
+        assert_eq!(exp_text_to_scaled("2.5e0", 16, -2), None);
+
+        // Q3: `? * ?` under a LONG slot multiplies in INT64
+        let mut sink = Vec::new();
+        let e = resolve_cmp_param_side(&raw("? * ?"), &descs[0], &columns, &descs, &mut sink, true).unwrap();
+        let Expr::Bin(a, ArithOp::Mul, b) = &e else { panic!() };
+        assert!(matches!(**a, Expr::Cast(_, _, CS_MUL_I64)) && matches!(**b, Expr::Cast(_, _, CS_MUL_I64)));
+        let ints = |x: i64, y: i64| vec![WireParam::Int(x, 0), WireParam::Int(y, 0)];
+        assert!(matches!(run(&e, &ints(3037000500, 3037000500)), Err(EvalErr::IntegerOverflow)));
+        assert!(matches!(run(&e, &ints(100000000000, 100000000000)), Err(EvalErr::IntegerOverflow)));
+        assert_eq!(run(&e, &ints(3037000499, 3037000499)).unwrap(), Value::Int(9223372030926249001));
+        assert_eq!(run(&e, &ints(2, 2)).unwrap(), Value::Int(4));
+        assert!(matches!(run(&e, &[WireParam::Text("3037000500".into()), WireParam::Text("3037000500".into())]), Err(EvalErr::IntegerOverflow)));
+        assert_eq!(run(&e, &[WireParam::Null, WireParam::Int(2, 0)]).unwrap(), Value::Null);
+        // ...and under an INT64 slot the engine's int128 branch: no stamp
+        let mut sink = Vec::new();
+        let e = resolve_cmp_param_side(&raw("? * ?"), &descs[1], &columns, &descs, &mut sink, true).unwrap();
+        let Expr::Bin(a, ArithOp::Mul, _) = &e else { panic!() };
+        assert!(!matches!(**a, Expr::Cast(_, _, CS_MUL_I64)));
+
+        // Q4: a bare `?` in a TEXT-reconciled COALESCE checks the length
+        let e = dest("COALESCE(?, 'x')", &descs[0]);
+        let Expr::Coalesce(args) = &e else { panic!() };
+        assert!(matches!(&args[0], Expr::Cast(_, CastTarget::Text { len: 1, synthetic: true, .. }, CS_TEXT_FIT_CHAR)));
+        assert!(matches!(run(&e, &t("2.5")), Err(EvalErr::StringTruncation { expected: 1, actual: 3 })));
+        assert!(matches!(run(&e, &t("2.5  ")), Err(EvalErr::StringTruncation { expected: 1, actual: 5 })));
+        assert!(matches!(run(&e, &[WireParam::Int(25, 0)]), Err(EvalErr::StringTruncation { expected: 1, actual: 2 })));
+        assert_eq!(run(&e, &t("2 ")).unwrap(), Value::Text("2 ".into()));
+        assert_eq!(run(&e, &t("2")).unwrap(), Value::Text("2".into()));
+        assert_eq!(run(&e, &[WireParam::Null]).unwrap(), Value::Text("x".into()));
+        // a numeric sibling carries no check
+        let e = dest("COALESCE(?, 0)", &descs[0]);
+        let Expr::Coalesce(args) = &e else { panic!() };
+        assert!(!matches!(&args[0], Expr::Cast(_, _, CS_TEXT_FIT | CS_TEXT_FIT_CHAR)));
+    }
+
+    #[test]
+    fn round9_p1_to_p5() {
+        let columns = vec![
+            RelationColumn { name: "N".into(), field_id: 0, position: 0 },
+            RelationColumn { name: "BI".into(), field_id: 1, position: 1 },
+            RelationColumn { name: "N18".into(), field_id: 2, position: 2 },
+            RelationColumn { name: "NM".into(), field_id: 3, position: 3 },
+            RelationColumn { name: "S".into(), field_id: 4, position: 4 },
+        ];
+        let stored = |dt: u8, len: u16, sc: i8, st: i16| {
+            let mut d = desc(dt, len, sc);
+            d.sub_type = st;
+            d.offset = 8;
+            d
+        };
+        let descs = vec![
+            stored(dtype::LONG, 4, 0, 0),
+            stored(dtype::INT64, 8, 0, 0),
+            stored(dtype::INT64, 8, -1, 1),
+            stored(dtype::LONG, 4, -2, 1),
+            stored(dtype::VARYING, 12, 0, 0),
+        ];
+        let sm = stored(dtype::SHORT, 2, 0, 0);
+        let row = vec![Value::Int(3), Value::Int(9), Value::Scaled(25, -1), Value::Scaled(725, -2), Value::Text("ab".into())];
+        let raw = |s: &str| {
+            let mut r = parse_raw_expr_any(s).unwrap();
+            renumber_raw_params(&mut r, &mut 0);
+            r
+        };
+        let t = |s: &str| vec![WireParam::Text(s.into())];
+        let run = |e: &Expr, a: &[WireParam]| subst_params_expr(e, a).unwrap().eval(&row);
+        let side = |s: &str, slot: &Descriptor| {
+            let mut sink = Vec::new();
+            resolve_cmp_param_side(&raw(s), slot, &columns, &descs, &mut sink, true).unwrap()
+        };
+
+        // P1: ONE rule decides the gate - the stamp, not the router (round
+        // 10: a written CAST and a compare rung; a value position reads as
+        // the previous binary did)
+        for cs in [fire_crab_ods::intl::CS_UTF8, 0, 3, 53, 127, CS_OPERATOR_READ, CS_MUL_I64] {
+            assert!(int_cast_gates_coefficient(cs), "{cs}");
+        }
+        for cs in [CS_SLOT_CAST, CS_SLOT_OPERAND, CS_WHOLE_SIDE, CS_TEXT_FIT, CS_TEXT_FIT_CHAR, CS_COMPUTED_UTF8, CS_COMPUTED_CARRIER] {
+            assert!(!int_cast_gates_coefficient(cs), "{cs}");
+        }
+        let int4 = |s: &str, cs: u8| Expr::Cast(Box::new(Expr::Str(s.into())), CastTarget::Int { bytes: 4 }, cs).eval(&[]);
+        assert!(matches!(int4("4.999999999999", fire_crab_ods::intl::CS_UTF8), Err(EvalErr::NumericOutOfRange)));
+        assert_eq!(int4("4.999999999999", CS_SLOT_CAST).unwrap(), Value::Int(5));
+        assert_eq!(int4("4.999999999999", CS_SLOT_OPERAND).unwrap(), Value::Int(5));
+        // MERGE: each marker is stamped as the DML router stamps its `?`
+        let marks = |v: &str, d: &Descriptor| -> Vec<bool> {
+            merge_marker_descs(v, d, &columns, &descs).unwrap().into_iter().map(|(_, _, m)| m).collect()
+        };
+        assert_eq!(marks("FC$P0", &descs[0]), vec![true]);
+        assert_eq!(marks("FC$P0 + 1", &descs[0]), vec![false]);
+        assert_eq!(marks("-FC$P0", &descs[0]), vec![false]);
+        assert_eq!(marks("MOD(FC$P0, 7)", &descs[0]), vec![false]);
+        assert_eq!(marks("COALESCE(FC$P0, 0)", &descs[0]), vec![true]);
+        assert_eq!(marks("IIF(N = 1, FC$P0, FC$P1 * 2)", &descs[0]), vec![true, false]);
+        // every MERGE marker reads its text as the previous binary did
+        // (round 10), a value marker included
+        let m = |d: &Descriptor, s0: bool, v: bool| merge_slot_cast(Expr::Str("4.999999999999".into()), d, s0, v).eval(&[]);
+        assert_eq!(m(&descs[0], false, false).unwrap(), Value::Int(5));
+        assert_eq!(m(&descs[0], false, true).unwrap(), Value::Int(5));
+        assert_eq!(m(&descs[3], true, false).unwrap(), Value::Int(5));
+        let m7 = |v: bool| merge_slot_cast(Expr::Str("1.999999".into()), &sm, false, v).eval(&[]);
+        assert_eq!(m7(false).unwrap(), Value::Int(2));
+        assert_eq!(m7(true).unwrap(), Value::Int(2));
+        // the trigger view: the casts it GENERATES are implicit slot casts
+        assert_eq!(view_trig_type_params_marked("? + 1", "INTEGER"), ("CAST(? AS INTEGER) + 1".to_string(), vec![true]));
+        assert_eq!(
+            view_trig_type_params_marked("CAST(? AS BIGINT) + ?", "INTEGER"),
+            ("CAST(? AS BIGINT) + CAST(? AS INTEGER)".to_string(), vec![false, true])
+        );
+        assert_eq!(
+            view_trig_type_params_marked("(SELECT A FROM D WHERE ID = ?) + ?", "INTEGER").1,
+            vec![false, true]
+        );
+        let cols = vec![("ID".to_string(), "INTEGER".to_string()), ("N".to_string(), "INTEGER".to_string()), ("BI".to_string(), "BIGINT".to_string())];
+        let shape = ViewTrigShape::Update { set_text: "N = ? + 1, BI = CAST(? AS BIGINT) + ?", where_text: Some("ID = ?"), alias: None };
+        let (_, assigned, generated) = view_trig_rows_sql_marked("V", &cols, &shape).unwrap();
+        assert_eq!(assigned, vec![1, 2]);
+        assert_eq!(generated, vec![0, 2]);
+        let proj = |s: &str, gen: Vec<usize>| {
+            let _g = GeneratedSlotCasts::set(gen);
+            let mut sink = Vec::new();
+            resolve_proj_expr(&raw(s), &columns, &descs, &mut sink).unwrap()
+        };
+        let e = proj("CAST(? AS INTEGER) + 1", vec![0]);
+        let Expr::Bin(l, ArithOp::Add, _) = &e else { panic!() };
+        assert!(matches!(**l, Expr::Cast(_, CastTarget::Int { bytes: 4 }, CS_SLOT_OPERAND)));
+        assert_eq!(run(&e, &t("4.999999999999")).unwrap(), Value::Int(6));
+        assert!(matches!(proj("CAST(? AS INTEGER)", vec![0]), Expr::Cast(_, _, CS_SLOT_CAST)));
+        // the written CAST keeps its own stamp - and its gate
+        let e = proj("CAST(? AS INTEGER) + 1", vec![]);
+        assert!(matches!(run(&e, &t("4.999999999999")), Err(EvalErr::NumericOutOfRange)));
+        assert!(!generated_slot_cast(0), "the guard empties the set");
+        // a compare rung is an OPERATOR read and keeps the gate at its width
+        assert!(matches!(cmp_param_rung(0, &descs[0]).unwrap(), Expr::Cast(_, CastTarget::Int { bytes: 8 }, CS_OPERATOR_READ)));
+        assert!(matches!(run(&side("? + 1", &descs[0]), &t("1.9999999999999999999")), Err(EvalErr::NumericOutOfRange)));
+        assert_eq!(run(&side("? + 1", &descs[0]), &t("4.999999999999")).unwrap(), Value::Int(6));
+        assert_eq!(t_is_numeric(&Some(CastTarget::Int { bytes: 4 })), true);
+        assert_eq!(t_is_numeric(&Some(CastTarget::Bool)), false);
+
+        // P2: the zeros are forgiven only when they END the text
+        let ex = |s: &str, dt: u8| text_to_exact_spelled(text_number(s).unwrap(), dt, 0, s);
+        assert_eq!(ex("2.00000000000", dtype::LONG), Some(2));
+        assert_eq!(ex(" 2.00000000000", dtype::LONG), Some(2));
+        for bad in ["2.00000000000 ", "2.00000000000e0", "2.0000000000e0", "20000000000e-10", "2.00000000000E+0"] {
+            assert_eq!(ex(bad, dtype::LONG), None, "{bad}");
+        }
+        assert_eq!(ex("1.00000e0", dtype::SHORT), None);
+        assert_eq!(ex("1.00000 ", dtype::SHORT), None);
+        assert_eq!(ex("32767.0e0", dtype::SHORT), None);
+        assert_eq!(ex("1.0e0", dtype::SHORT), Some(1));
+        assert_eq!(ex("3.2767e4", dtype::SHORT), Some(32767));
+        assert_eq!(ex("2.5e0", dtype::LONG), Some(3));
+        assert_eq!(ex("2.0000000000000000000", dtype::INT64), Some(2));
+        assert_eq!(ex("2.0000000000000000000e0", dtype::INT64), None);
+        assert_eq!(text_to_exact_spelled(text_number("2.50000000000e0").unwrap(), dtype::LONG, -2, "2.50000000000e0"), None);
+        // (a written CAST reads the spelling; a value position reads the
+        // text as the previous binary did - round 10)
+        assert!(matches!(int4("2.00000000000e0", fire_crab_ods::intl::CS_UTF8), Err(EvalErr::NumericOutOfRange)));
+        assert_eq!(int4("2.00000000000", fire_crab_ods::intl::CS_UTF8).unwrap(), Value::Int(2));
+        assert_eq!(int4("2.00000000000e0", CS_SLOT_CAST).unwrap(), Value::Int(2));
+        assert_eq!(int4("2.00000000000", CS_SLOT_CAST).unwrap(), Value::Int(2));
+        assert!(matches!(run(&side("? + 1", &descs[0]), &t("3.00000000000000000000e0")), Err(EvalErr::NumericOutOfRange)));
+        assert_eq!(run(&side("? + 1", &descs[0]), &t("3.00000000000000000000")).unwrap(), Value::Int(4));
+
+        // P3: ONE `?` times a 4-byte exact operand multiplies in INT64
+        for (s, bind) in [("? * N", 4611686018427387904i64), ("N * ?", 4611686018427387904), ("? * NM", 4000000000000000000)] {
+            let e = side(s, &descs[0]);
+            let Expr::Bin(a, ArithOp::Mul, b) = &e else { panic!() };
+            assert!(matches!(**a, Expr::Cast(_, _, CS_MUL_I64)) || matches!(**b, Expr::Cast(_, _, CS_MUL_I64)), "{s}");
+            assert!(matches!(run(&e, &[WireParam::Int(bind, 0)]), Err(EvalErr::IntegerOverflow)), "{s}");
+            assert!(matches!(run(&e, &t(&bind.to_string())), Err(EvalErr::IntegerOverflow)), "{s}");
+        }
+        assert_eq!(run(&side("? * N", &descs[0]), &[WireParam::Int(4, 0)]).unwrap(), Value::Int(12));
+        assert_eq!(run(&side("? * N", &descs[0]), &[WireParam::Int(3037000500, 0)]).unwrap(), Value::Int(9111001500));
+        // an INT64 sibling is the int128 branch: no stamp, no overflow
+        let e = side("? * BI", &descs[0]);
+        let Expr::Bin(a, ArithOp::Mul, b) = &e else { panic!() };
+        assert!(!matches!(**a, Expr::Cast(_, _, CS_MUL_I64)) && !matches!(**b, Expr::Cast(_, _, CS_MUL_I64)));
+
+        // P5: under an INT64 slot a multiply / divide reads at INT128
+        let e = side("? * 1", &descs[1]);
+        let Expr::Bin(a, ArithOp::Mul, _) = &e else { panic!() };
+        assert!(matches!(**a, Expr::Cast(_, CastTarget::Numeric { bytes: 16, scale: 0, .. }, CS_OPERATOR_READ)));
+        let np = |r: Result<Value, EvalErr>| numeric_parts(&r.unwrap());
+        assert_eq!(np(run(&e, &t("8.9999999999999999999"))), Some((9, 0)));
+        assert_eq!(np(run(&side("? / 1", &descs[1]), &t("8.9999999999999999999"))), Some((9, 0)));
+        assert_eq!(np(run(&side("? * 1", &descs[1]), &t("3e20"))), Some((300000000000000000000, 0)));
+        assert_eq!(np(run(&side("? * 1", &descs[2]), &t("3e20"))), Some((3000000000000000000000, -1)));
+        assert_eq!(np(run(&side("? * 1", &descs[2]), &t("2.49999999999999999999"))), Some((25, -1)));
+        // an add stays at int64, and a CAST to NUMERIC(38, x) keeps its
+        // recorded reading of an exponent
+        assert!(matches!(run(&side("? + 0", &descs[1]), &t("8.9999999999999999999")), Err(EvalErr::NumericOutOfRange)));
+        assert_eq!(exp_text_to_scaled("2.5e0", 16, -2), None);
+        assert_eq!(exp_text_to_scaled_at("2.5e0", 16, -2, true), Some(Some(250)));
+        assert_eq!(exp_text_to_scaled_at("1e39", 16, 0, true), Some(None));
+        // a hex text under a SCALED operator rung reads as the Int rung's
+        assert_eq!(np(run(&side("? + 0", &descs[3]), &t("0x10"))), Some((1600, -2)));
+        assert_eq!(np(run(&side("? * 1", &descs[2]), &t("0X10"))), Some((160, -1)));
+        assert_eq!(run(&side("? + 0", &descs[0]), &t("0xFFFFFFFFFFFFFFFF")).unwrap(), Value::Int(-1));
+        assert_eq!(run(&side("? + 0", &descs[0]), &t("0x8000000000000000")).unwrap(), Value::Int(i64::MIN));
+        assert_eq!(int4("0xFFFF", fire_crab_ods::intl::CS_UTF8).unwrap(), Value::Int(65535));
+        let hex_cast = Expr::Cast(Box::new(Expr::Str("0x10".into())), CastTarget::Numeric { scale: -2, bytes: 4, sub_type: 1 }, fire_crab_ods::intl::CS_UTF8);
+        assert!(matches!(hex_cast.eval(&[]), Err(EvalErr::ConversionError(_) | EvalErr::ConversionErrorBytes(_))));
+
+        // P4: a DOUBLE message renders the engine's way into the slot's
+        // BYTE width; a text of exactly that many bytes takes the fast path
+        CURRENT_ATT_CS.with(|c| c.set(fire_crab_ods::intl::CS_UTF8));
+        let dest = |s: &str, d: &Descriptor| {
+            let mut sink = Vec::new();
+            resolve_dest_param_expr(&raw(s), d, &columns, &descs, &mut sink).unwrap()
+        };
+        let x1 = dest("COALESCE(?, 'x')", &descs[4]);
+        let Expr::Coalesce(args) = &x1 else { panic!() };
+        // (a literal's slot carries the ATTACHMENT sentinel 255, resolved
+        // to the attachment's bytes per character at the check)
+        assert!(matches!(&args[0], Expr::Cast(_, CastTarget::Text { len: 1, cs: Some(255), .. }, CS_TEXT_FIT_CHAR)));
+        let d = |x: f64| vec![WireParam::Double(x)];
+        assert!(matches!(run(&x1, &d(2.5)), Err(EvalErr::StringTruncation { expected: 1, actual: 3 })));
+        assert!(matches!(run(&x1, &d(-2.5)), Err(EvalErr::StringTruncation { expected: 1, actual: 4 })));
+        assert!(matches!(run(&x1, &d(0.1)), Err(EvalErr::NumericOutOfRange)));
+        assert!(matches!(run(&x1, &d(123.456)), Err(EvalErr::NumericOutOfRange)));
+        let x2 = dest("COALESCE(?, 'xx')", &descs[4]);
+        assert!(matches!(run(&x2, &d(2.5)), Err(EvalErr::StringTruncation { expected: 2, actual: 7 })));
+        let x3 = dest("COALESCE(?, 'xyz')", &descs[4]);
+        assert!(matches!(run(&x3, &d(-2.5)), Err(EvalErr::StringTruncation { expected: 3, actual: 12 })));
+        assert_eq!(run(&x3, &t("abcdefghijkl")).unwrap(), Value::Text("abc".into()));
+        assert_eq!(run(&x3, &t("abcdefghij  ")).unwrap(), Value::Text("abc".into()));
+        assert!(matches!(run(&x3, &t("abcdefghij ")), Err(EvalErr::StringTruncation { expected: 3, actual: 11 })));
+        assert!(matches!(run(&x3, &t("abcdefghijklm")), Err(EvalErr::StringTruncation { expected: 3, actual: 13 })));
+        assert_eq!(run(&x1, &t("\u{e9}\u{e9}")).unwrap(), Value::Text("\u{e9}".into()));
+        assert!(matches!(run(&x1, &t("\u{e9}\u{e9}\u{e9}")), Err(EvalErr::StringTruncation { expected: 1, actual: 3 })));
+        // a NONE VARCHAR(10) sibling: 2.5 renders '2.5000000' and fits
+        let xs = dest("COALESCE(?, S)", &descs[4]);
+        assert_eq!(run(&xs, &d(2.5)).unwrap(), Value::Text("2.5000000".into()));
+        assert_eq!(run(&x1, &[WireParam::Int(25, 0)]).is_err(), true);
+        // round 10: a CAST the statement wrote over a `?` in the DML router
+        // reads the text itself (one cast, the written stamp)
+        let wc = dest("CAST(? AS INTEGER) + 1", &descs[0]);
+        assert!(matches!(run(&wc, &t("4.999999999999")), Err(EvalErr::NumericOutOfRange)));
+        assert_eq!(run(&wc, &t("2")).unwrap(), Value::Int(3));
+        let Expr::Bin(l, ArithOp::Add, _) = &wc else { panic!() };
+        assert!(matches!(&**l, Expr::Cast(p, CastTarget::Int { bytes: 4 }, fire_crab_ods::intl::CS_UTF8) if matches!(**p, Expr::Param(0))));
+        let wn = dest("CAST(? AS NUMERIC(9,2))", &descs[3]);
+        assert_eq!(numeric_parts(&run(&wn, &t("2.555e0")).unwrap()), Some((256, -2)));
+        CURRENT_ATT_CS.with(|c| c.set(0));
+    }
+
+    #[test]
+    fn round10_implicit_positions_read_as_the_previous_binary() {
+        use fire_crab_ods::intl;
+        let int4 = |s: &str, cs: u8| Expr::Cast(Box::new(Expr::Str(s.into())), CastTarget::Int { bytes: 4 }, cs).eval(&[]);
+        let int2 = |s: &str, cs: u8| Expr::Cast(Box::new(Expr::Str(s.into())), CastTarget::Int { bytes: 2 }, cs).eval(&[]);
+        // V1: the gate runs for a written CAST and a compare rung only
+        assert!(matches!(int4("4.999999999999", intl::CS_UTF8), Err(EvalErr::NumericOutOfRange)));
+        assert!(matches!(int4("4.999999999999", CS_OPERATOR_READ), Err(EvalErr::NumericOutOfRange)));
+        for cs in [CS_SLOT_CAST, CS_SLOT_OPERAND, CS_COMPUTED_UTF8, CS_COMPUTED_CARRIER] {
+            assert_eq!(int4("4.999999999999", cs).unwrap(), Value::Int(5), "{cs}");
+            assert_eq!(int2("1.999999", cs).unwrap(), Value::Int(2), "{cs}");
+            assert_eq!(int4("214748364.75", cs).unwrap(), Value::Int(214748365), "{cs}");
+        }
+        // a computed column's blr_cast: moved above the floor where its
+        // 22018 spelling survives, a tabled charset keeps its id (and gate)
+        let it = CastTarget::Int { bytes: 4 };
+        assert_eq!(computed_cast_stamp(&it, intl::CS_UTF8), CS_COMPUTED_UTF8);
+        for c in [intl::CS_NONE, intl::CS_OCTETS, intl::CS_ASCII] {
+            assert_eq!(computed_cast_stamp(&it, c), CS_COMPUTED_CARRIER);
+        }
+        assert_eq!(computed_cast_stamp(&it, 53), 53);
+        let nt = CastTarget::Numeric { scale: -2, bytes: 4, sub_type: 1 };
+        assert_eq!(computed_cast_stamp(&nt, intl::CS_UTF8), CS_COMPUTED_UTF8);
+        assert_eq!(computed_cast_stamp(&CastTarget::Approx, intl::CS_UTF8), intl::CS_UTF8);
+        // the NUMERIC arm's exponent read: a written CAST and a compare
+        // rung only; an implicit cast keeps the previous binary's 22018
+        let num92 = |s: &str, cs: u8| Expr::Cast(Box::new(Expr::Str(s.into())), nt, cs).eval(&[]);
+        assert!(matches!(num92("2.5e0", intl::CS_UTF8), Ok(_)));
+        assert!(matches!(num92("2.5e0", CS_OPERATOR_READ), Ok(_)));
+        for cs in [CS_SLOT_CAST, CS_SLOT_OPERAND, CS_COMPUTED_UTF8] {
+            assert!(matches!(num92("2.5e0", cs), Err(EvalErr::ConversionError(_) | EvalErr::ConversionErrorBytes(_))), "{cs}");
+        }
+        // ...and a non-number spells its 22018 as before
+        assert!(matches!(int4("abc", CS_COMPUTED_UTF8), Err(EvalErr::ConversionErrorBytes(_) | EvalErr::ConversionError(_))));
+        assert!(matches!(int4("abc", CS_COMPUTED_CARRIER), Err(EvalErr::ConversionErrorBytes(_) | EvalErr::ConversionError(_))));
+        // V2: the store path reads as the previous binary did (no zero
+        // forgiveness); a written CAST still reads the spelling
+        let st = |s: &str, dt: u8| text_to_exact(text_number(s).unwrap(), dt, 0);
+        assert_eq!(st("2.00000000000", dtype::LONG), None);
+        assert_eq!(st("1.000000000000000000000", dtype::SHORT), None);
+        assert_eq!(st("2.5", dtype::LONG), Some(3));
+        assert_eq!(st("2.0000", dtype::SHORT), Some(2));
+        assert_eq!(int4("2.00000000000", intl::CS_UTF8).unwrap(), Value::Int(2));
+        // ...and a SCALED compare rung drops fraction zeros only when they
+        // END the text
+        let num18 = |s: &str, cs: u8| {
+            Expr::Cast(Box::new(Expr::Str(s.into())), CastTarget::Numeric { scale: -1, bytes: 8, sub_type: 1 }, cs).eval(&[])
+        };
+        assert!(matches!(num18("2.0000000000000000000 ", CS_OPERATOR_READ), Err(EvalErr::NumericOutOfRange)));
+        assert!(matches!(num18("2.0000000000000000000", CS_OPERATOR_READ), Ok(_)));
+        assert!(matches!(num18("2.00 ", CS_OPERATOR_READ), Ok(_)));
+        assert!(matches!(num18("2.0000000000000000000 ", CS_SLOT_OPERAND), Ok(_)));
+        // V3: a `?` in a CONDITION of a value
+        let cond = |s: &str| raw_param_in_condition(&parse_raw_expr_any(s).unwrap_or_else(|| panic!("unparsed: {s}")));
+        for s in [
+            "IIF(? = 5, 1, 7)",
+            "IIF(N = ?, 5, 7)",
+            "CASE WHEN ? + 1 > 5 THEN 1 ELSE 7 END",
+            "CASE ? WHEN 5 THEN 1 ELSE 7 END",
+            "CASE 5 WHEN ? THEN 1 ELSE 7 END",
+            "DECODE(?, 5, 1, 7)",
+            "IIF(? > 4, 1, 7) + 1",
+            "COALESCE(IIF(NOT (? = 5) AND ID = 1, 1, 7), 0)",
+        ] {
+            assert!(cond(s), "{s}");
+        }
+        for s in ["NULLIF(5, ?)", "NULLIF(?, 5)", "IIF(ID = 1, ?, 7)", "CASE WHEN ID = 1 THEN ? ELSE 7 END", "COALESCE(?, 7)", "? + 1", "-?"] {
+            assert!(!cond(s), "{s}");
+        }
+        let cols = vec![("ID".to_string(), "INTEGER".to_string()), ("N".to_string(), "INTEGER".to_string())];
+        let upd = |set: &'static str| ViewTrigShape::Update { set_text: set, where_text: Some("ID = 1"), alias: None };
+        assert!(view_trig_rows_sql_marked("V", &cols, &upd("N = IIF(? = 5, 1, 7)")).is_none());
+        assert!(view_trig_rows_sql_marked("V", &cols, &upd("N = CASE WHEN ? + 1 > 5 THEN 1 ELSE 7 END")).is_none());
+        assert!(view_trig_rows_sql_marked("V", &cols, &upd("N = IIF(ID = 1, ?, 7)")).is_some());
+        assert!(view_trig_rows_sql_marked("V", &cols, &upd("N = NULLIF(5, ?)")).is_some());
+        // a statement MIXING a refused-before comparison `?` with an
+        // implicit integer cast over a `?` refuses; either alone plans,
+        // and a nested plan reports its flags upward
+        assert_eq!(plan_unmixed(|| { mix_note(MIX_CMP); Some(1) }), Some(1));
+        assert_eq!(plan_unmixed(|| { note_implicit_int(&CastTarget::Int { bytes: 4 }); Some(2) }), Some(2));
+        assert_eq!(plan_unmixed(|| { note_implicit_int(&CastTarget::Int { bytes: 16 }); mix_note(MIX_CMP); Some(3) }), Some(3));
+        assert_eq!(plan_unmixed(|| { mix_note(MIX_CMP); note_implicit_int(&CastTarget::Int { bytes: 8 }); Some(4) }), None);
+        assert_eq!(
+            plan_unmixed(|| {
+                note_implicit_int(&CastTarget::Int { bytes: 2 });
+                plan_unmixed(|| { mix_note(MIX_CMP); Some(()) })?;
+                Some(5)
+            }),
+            None
+        );
+        // what an earlier statement left in the thread never reaches the
+        // next statement's own check
+        assert_ne!(MIX_FLAGS.with(|f| f.get()), 0);
+        assert_eq!(plan_unmixed(|| { mix_note(MIX_CMP); Some(6) }), Some(6));
+    }
+
+    /// Round 11: W1 (a negated whole side refuses - asserted in
+    /// a_comparison_types_its_arithmetic_parameter_from_the_other_side),
+    /// W2 (the engine's text class and its alignment raise), W3 (the
+    /// mixed-statement census) and the IN-list / operator-rung /
+    /// subquery-body cells measured beside them.
+    #[test]
+    fn round12_caps_mark_and_refuse_the_chunk_new_surface() {
+        let z = |n: usize| "0".repeat(n);
+        // K2'S GRAMMAR: sign, digits, one point, at most 18 significant
+        // digits - leading zeros excluded, trailing fraction zeros counted
+        for ok in [
+            "1", "-1", "+2", "2.", ".5", "-.5", "0", "000", "0.0", "1.5",
+            "0.999999999999999999", "000000000000000000001", "123456789012345678",
+            "1.00000000000000000", "-12345678901234567.8", "0.000000000000000001",
+        ] {
+            assert!(canonical_numeric_text(ok), "{ok:?} is canonical");
+        }
+        for bad in [
+            "", ".", "+", "-", " 2", "2 ", "2e0", "1E1", "1..2", "1.2.3", "0x2", "abc", "+-1",
+            "1.000000000000000000", "0.5000000000000000000", "1234567890123456789", "\t1",
+        ] {
+            assert!(!canonical_numeric_text(bad), "{bad:?} is off the grammar");
+        }
+        assert!(!canonical_numeric_text(&format!("2.{}", z(38))));
+        assert!(!canonical_numeric_text(&format!("1.{}1 ", z(38))));
+        assert!(!canonical_numeric_text("1e-400"));
+
+        // THE MARK: only the slots a chunk-new router REGISTERS, only on
+        // success
+        let d4 = desc(dtype::LONG, 4, 0);
+        let mut sink: Vec<Option<Descriptor>> = vec![Some(d4)];
+        let (_, fresh) = marking_chunk_new(&mut sink, |s| {
+            s.resize(3, None);
+            s[2] = Some(d4);
+            Some(())
+        })
+        .unwrap();
+        assert_eq!(fresh, vec![2]);
+        assert_eq!(sink[0].unwrap().flags & PARAM_CHUNK_NEW, 0);
+        assert_ne!(sink[2].unwrap().flags & PARAM_CHUNK_NEW, 0);
+        let mut sink2: Vec<Option<Descriptor>> = Vec::new();
+        assert!(marking_chunk_new(&mut sink2, |s| -> Option<()> {
+            s.push(Some(d4));
+            None
+        })
+        .is_none());
+        assert_eq!(sink2[0].unwrap().flags & PARAM_CHUNK_NEW, 0, "a failed attempt leaves no mark");
+        // a re-claim by the same rung compares without the mark
+        let mut marked = d4;
+        marked.flags |= PARAM_CHUNK_NEW;
+        let mut sink3 = vec![Some(marked)];
+        assert!(claim_param_slot(&mut sink3, 0, &d4).is_some());
+
+        // K1: chunk-new beside not
+        let new = marked;
+        let old = d4;
+        assert!(!chunk_new_mixed([].iter()));
+        assert!(!chunk_new_mixed([new, new].iter()));
+        assert!(!chunk_new_mixed([old, old].iter()));
+        assert!(chunk_new_mixed([new, old].iter()));
+        assert!(chunk_new_mixed([old, new, new].iter()));
+
+        // K2: a text off the grammar into a chunk-new NUMERIC slot raises;
+        // a canonical text, an integer or double message, a text into a
+        // chunk-new TEXT slot and every classic slot are untouched
+        let t = |s: &str| WireParam::Text(s.to_string());
+        let mut vtext = desc(dtype::VARYING, 10, 0);
+        vtext.flags |= PARAM_CHUNK_NEW;
+        let mut dbl = desc(dtype::DOUBLE, 8, 0);
+        dbl.flags |= PARAM_CHUNK_NEW;
+        let mut i128d = desc(dtype::INT128, 16, 0);
+        i128d.flags |= PARAM_CHUNK_NEW;
+        assert_eq!(chunk_new_text_off_grammar(&[new], &[t(" 2")]), Some(" 2".into()));
+        assert_eq!(chunk_new_text_off_grammar(&[new], &[t("2e0")]), Some("2e0".into()));
+        assert_eq!(chunk_new_text_off_grammar(&[dbl], &[t("0.99999999999999999 ")]), Some("0.99999999999999999 ".into()));
+        assert_eq!(chunk_new_text_off_grammar(&[i128d], &[t(&format!("2.{}", z(38)))]), Some(format!("2.{}", z(38))));
+        assert_eq!(chunk_new_text_off_grammar(&[new], &[t("2.5")]), None);
+        assert_eq!(chunk_new_text_off_grammar(&[new], &[WireParam::Int(2, 0)]), None);
+        assert_eq!(chunk_new_text_off_grammar(&[new], &[WireParam::Double(2.5)]), None);
+        assert_eq!(chunk_new_text_off_grammar(&[new], &[WireParam::Null]), None);
+        assert_eq!(chunk_new_text_off_grammar(&[vtext], &[t(" b ")]), None);
+        assert_eq!(chunk_new_text_off_grammar(&[old], &[t(" 2")]), None);
+        // the first offender is named, whatever its position
+        assert_eq!(chunk_new_text_off_grammar(&[new, new], &[t("1"), t("1e0")]), Some("1e0".into()));
+        // a subquery body's CLASSIC compare slot: a blank text past the
+        // literal coefficient raises; within it, and blank-free, it does not
+        let mut body = d4;
+        body.flags |= PARAM_BODY_CMP;
+        assert_eq!(chunk_new_text_off_grammar(&[body], &[t(&format!("1.{}1 ", z(38)))]), Some(format!("1.{}1 ", z(38))));
+        assert_eq!(chunk_new_text_off_grammar(&[body], &[t(&format!("1.{}1", z(38)))]), None);
+        assert_eq!(chunk_new_text_off_grammar(&[body], &[t("2 ")]), None);
+        assert_eq!(chunk_new_text_off_grammar(&[body], &[t("1e0")]), None);
+
+        // K3: an approximate chunk-new slot refuses unless it is the whole
+        // side
+        let sink4 = vec![Some(desc(dtype::DOUBLE, 8, 0)), Some(d4)];
+        assert!(chunk_new_approx_refuses(&sink4, &[0], None));
+        assert!(!chunk_new_approx_refuses(&sink4, &[0], Some(0)));
+        assert!(!chunk_new_approx_refuses(&sink4, &[1], None));
+        let columns = vec![
+            RelationColumn { name: "A".into(), field_id: 0, position: 0 },
+            RelationColumn { name: "D".into(), field_id: 1, position: 1 },
+            RelationColumn { name: "S".into(), field_id: 2, position: 2 },
+        ];
+        let descs = vec![desc(dtype::LONG, 4, 0), desc(dtype::DOUBLE, 8, 0), desc(dtype::VARYING, 10, 0)];
+        let side = |s: &str, slot: &Descriptor| {
+            let mut e = parse_raw_expr_any(s).unwrap_or_else(|| panic!("{s} parses"));
+            renumber_raw_params(&mut e, &mut 0);
+            let mut sk: Vec<Option<Descriptor>> = Vec::new();
+            resolve_cmp_param_side(&e, slot, &columns, &descs, &mut sk, true).map(|_| sk)
+        };
+        let dslot = desc(dtype::DOUBLE, 8, 0);
+        let lslot = desc(dtype::LONG, 4, 0);
+        let whole = side("?", &dslot).expect("a bare `?` whole side against a DOUBLE answers");
+        assert_ne!(whole[0].unwrap().flags & PARAM_CHUNK_NEW, 0, "and is marked chunk-new");
+        assert!(side("? + 0", &dslot).is_none(), "a DOUBLE slot for an operand rung");
+        assert!(side("? * 1e0", &lslot).is_none(), "a DOUBLE sibling");
+        assert!(side("? * D", &lslot).is_none(), "a DOUBLE column sibling");
+        assert!(side("A * ?", &lslot).is_some(), "an exact operand rung answers");
+        assert!(side("COALESCE(?, D) + ?", &lslot).is_none(), "a COALESCE beside a DOUBLE");
+
+        // K4: a TEXT slot beside a conditional's bare-`?` value arm, and a
+        // one-operand TRIM over a `?` in any conditional's value arm
+        let rx = |s: &str| parse_raw_expr_any(s).unwrap_or_else(|| panic!("{s} parses"));
+        assert!(raw_text_arm_param(&rx("COALESCE(?, S)")));
+        assert!(raw_text_arm_param(&rx("IIF(A = 2, TRIM(?), 'a')")));
+        assert!(raw_text_arm_param(&rx("NULLIF(? || 'x', 'a')")));
+        assert!(!raw_text_arm_param(&rx("COALESCE(S, 'a')")));
+        assert!(raw_cond_arm_trim_param(&rx("COALESCE(TRIM(?), 'a')")));
+        assert!(raw_cond_arm_trim_param(&rx("IIF(A = 2, TRIM(LEADING FROM ?), 'a')")));
+        assert!(raw_cond_arm_trim_param(&rx("IIF(A = 2, TRIM(?) || 'x', 'a')")));
+        assert!(!raw_cond_arm_trim_param(&rx("IIF(A = 2, TRIM(' ' FROM ?), 'a')")), "two operands: answered");
+        assert!(!raw_cond_arm_trim_param(&rx("TRIM(?)")), "not a conditional's arm");
+        assert!(!raw_cond_arm_trim_param(&rx("COALESCE(UPPER(?), 'a')")));
+        assert!(side("COALESCE(?, S) || ?", &desc(dtype::VARYING, 10, 0)).is_none(), "K4 inside a chunk-new side");
+
+        // the qualified built-in call the engine refuses
+        assert!(sql_qualified_builtin_call("SELECT ID FROM TW b WHERE b.IIF(ID = ?, 1, 0) = 1"));
+        assert!(sql_qualified_builtin_call("SELECT b.COALESCE(?, 1) FROM TW b"));
+        assert!(sql_qualified_builtin_call("SELECT ID FROM TW b WHERE b.ABS (ID) = ?"));
+        assert!(!sql_qualified_builtin_call("SELECT b.ID FROM TW b WHERE b.ID = ?"));
+        assert!(!sql_qualified_builtin_call("SELECT 'b.IIF(' FROM TW"));
+        assert!(!sql_qualified_builtin_call("SELECT PKG.FN(1) FROM TW"));
+        assert!(!sql_qualified_builtin_call("SELECT IIF(ID = ?, 1, 0) FROM TW"));
+    }
+
+    #[test]
+    fn round11_alignment_class_and_mixed_census() {
+        let z = |n: usize| "0".repeat(n);
+        // THE CLASS: int64 accumulator, int128 decompose, or neither
+        assert_eq!(engine_cmp_class("2.5"), Some((false, 25, -1)));
+        assert_eq!(engine_cmp_class(" -1 2 "), Some((false, -12, 0)));
+        assert_eq!(engine_cmp_class(&format!("0.5{}", z(18))), Some((false, 5 * 10i128.pow(18), -19)));
+        assert_eq!(engine_cmp_class("9223372036854775807"), Some((false, i64::MAX as i128, 0)));
+        assert_eq!(engine_cmp_class("-9223372036854775808"), Some((false, i64::MIN as i128, 0)));
+        assert_eq!(engine_cmp_class("9223372036854775808"), Some((true, 9223372036854775808, 0)));
+        assert_eq!(engine_cmp_class(&format!("0.{}", "1".repeat(38))).map(|c| (c.0, c.2)), Some((true, -38)));
+        // the last fraction zero past the width is dropped...
+        assert_eq!(engine_cmp_class(&format!("1.{}", z(39))), Some((true, 10i128.pow(38), -38)));
+        // ...unless anything follows it: a decimal128
+        assert_eq!(engine_cmp_class(&format!("1.{} ", z(39))), None);
+        assert_eq!(engine_cmp_class(&format!("2.{}", z(38))), Some((true, 2 * 10i128.pow(37), -37)));
+        assert_eq!(engine_cmp_class(&format!("1{}", z(39))), None); // integer part past int128
+        assert_eq!(engine_cmp_class(&format!("1{}e0", z(38))), Some((true, 10i128.pow(38), 0)));
+        assert_eq!(engine_cmp_class("1e38"), None); // a double
+        assert_eq!(engine_cmp_class("0X10"), None);
+        assert_eq!(engine_cmp_class("abc"), None);
+        assert_eq!(engine_cmp_class(&format!("0.{}1", z(130))), None); // scale past -128
+        // THE CHECK: the other side aligned to the text's scale in its width
+        assert!(cmp_align_check(&Value::Int(1), -38, 16).is_ok());
+        assert_eq!(cmp_align_check(&Value::Int(2), -38, 16), Err(EvalErr::NumericOutOfRange));
+        assert_eq!(cmp_align_check(&Value::Int(1), -19, 8), Err(EvalErr::NumericOutOfRange));
+        assert!(cmp_align_check(&Value::Int(0), -100, 8).is_ok());
+        assert!(cmp_align_check(&Value::Int(9), -18, 8).is_ok());
+        assert_eq!(cmp_align_check(&Value::Int(10), -18, 8), Err(EvalErr::NumericOutOfRange));
+        assert!(cmp_align_check(&Value::Scaled(200, -2), -2, 8).is_ok()); // no scaling
+        // the text's own alignment
+        assert!(whole_side_text_overflows(&format!("1{}e0", z(38)), -2));
+        assert!(!whole_side_text_overflows(&format!("1{}e0", z(38)), 0));
+        assert!(whole_side_text_overflows("99999999999999999", -2));
+        assert!(!whole_side_text_overflows("9999999999999999", -2));
+        assert!(!whole_side_text_overflows(&format!("1{}", z(39)), -2)); // a decimal128
+        // THE BIND: the other side is wrapped only when the text is finer
+        let rung = Expr::Cast(Box::new(Expr::Param(0)), CastTarget::Int { bytes: 8 }, CS_WHOLE_SIDE);
+        let col = Expr::Col(0);
+        let bound = |s: &str| bind_whole_side_exact_cmp(&col, Cmp::Eq, &rung, &[WireParam::Text(s.into())]);
+        assert!(bound("2").is_none());
+        assert!(bound("2.5").is_some());
+        assert!(bound("1e0").is_none());
+        let c = bound(&format!("0.5{}", z(18))).unwrap().unwrap();
+        assert_eq!(c.eval(&[Value::Int(1)]), Err(EvalErr::NumericOutOfRange));
+        assert_eq!(c.eval(&[Value::Int(0)]), Ok(Some(false)));
+        assert_eq!(c.eval(&[Value::Null]), Ok(None));
+        let c = bound(&format!("1.{}", z(38))).unwrap().unwrap();
+        assert_eq!(c.eval(&[Value::Int(1)]), Ok(Some(true)));
+        assert_eq!(c.eval(&[Value::Int(2)]), Err(EvalErr::NumericOutOfRange));
+        let nm = Expr::Cast(Box::new(Expr::Param(0)), CastTarget::Numeric { scale: -2, bytes: 8, sub_type: 1 }, CS_WHOLE_SIDE);
+        let c = bind_whole_side_exact_cmp(&nm, Cmp::Eq, &col, &[WireParam::Text(format!("1{}e0", z(38)))]).unwrap().unwrap();
+        assert_eq!(c.eval(&[Value::Scaled(100, -2)]), Err(EvalErr::NumericOutOfRange));
+        assert_eq!(c.eval(&[Value::Null]), Ok(None));
+        // a subquery body's whole-side exact `?`
+        let d = Descriptor { dtype: dtype::LONG, scale: 0, length: 4, sub_type: 0, flags: PARAM_WHOLE_EXACT, offset: 0 };
+        assert!(corr_whole_exact_raise(&format!("0.5{}", z(18)), &d).is_some());
+        assert!(corr_whole_exact_raise(&format!("0.5{}", z(17)), &d).is_none());
+        assert!(corr_whole_exact_raise(&format!("0.{}", "1".repeat(39)), &d).is_some());
+        assert!(corr_whole_exact_raise("2.5", &d).is_none());
+        // ...spelled as the literal (or the constant text past its
+        // coefficient) whose compare carries the per-row raise
+        assert_eq!(corr_whole_exact_literal(&format!("0.5{}", z(18)), &d), Some(format!("'0.5{}'", z(18))));
+        assert_eq!(corr_whole_exact_literal(&format!("1.{}", z(38)), &d), Some(format!("CAST('1.{}' AS VARCHAR(40))", z(38))));
+        assert_eq!(corr_whole_exact_literal("2", &d), None); // no alignment
+        assert_eq!(corr_whole_exact_literal("2e0", &d), None); // a double
+        let descs = [Descriptor { dtype: dtype::LONG, scale: -2, length: 4, sub_type: 1, flags: 0, offset: 0 }];
+        let w = cmp_align_wrap(Expr::Col(0), &format!("0.5{}", z(18)), &descs);
+        assert!(matches!(w, Expr::Cast(_, CastTarget::Numeric { scale: -19, bytes: 8, .. }, CS_CMP_ALIGN)));
+        assert!(matches!(cmp_align_wrap(Expr::Col(0), "2.5", &descs), Expr::Col(0)));
+        assert!(matches!(cmp_align_wrap(Expr::Col(0), "99999999999999999", &descs), Expr::Cast(_, _, CS_CMP_RAISE)));
+        let (l, _) = cmp_sides(Expr::Col(0), Expr::Str(format!("0.5{}", z(18))), &descs).unwrap();
+        assert_eq!(l.eval(&[Value::Scaled(100, -2)]), Err(EvalErr::NumericOutOfRange));
+        assert_eq!(l.eval(&[Value::Scaled(0, -2)]), Ok(Value::Scaled(0, -2)));
+        // THE OPERATOR RUNG's end-running zeros past i128
+        let op = |s: &str| Expr::Cast(Box::new(Expr::Str(s.into())), CastTarget::Int { bytes: 8 }, CS_OPERATOR_READ).eval(&[]);
+        assert_eq!(op(&format!("2.{}", z(38))), Ok(Value::Int(2)));
+        assert_eq!(op(&format!("0.5{}", z(40))), Ok(Value::Int(1)));
+        assert!(op(&format!("2.{} ", z(38))).is_err());
+        assert_eq!(strip_end_frac_zeros("2.500"), Some("2.5".into()));
+        assert_eq!(strip_end_frac_zeros("2500"), None);
+        assert_eq!(strip_end_frac_zeros("2.50 "), None);
+        // W3: every implicit NUMERIC / approximate cast marks the statement
+        assert_eq!(plan_unmixed(|| { mix_note(MIX_CMP); note_implicit_int(&CastTarget::Numeric { scale: -2, bytes: 4, sub_type: 1 }); Some(7) }), None);
+        assert_eq!(plan_unmixed(|| { mix_note(MIX_CMP); note_implicit_int(&CastTarget::Approx); Some(8) }), None);
+        assert_eq!(plan_unmixed(|| { note_implicit_int(&CastTarget::Numeric { scale: -2, bytes: 4, sub_type: 1 }); Some(9) }), Some(9));
+        // an IN list mixing a `?` item with a `?`-free one refuses at parse
+        let cond = |s: &str| {
+            let b: Vec<char> = s.chars().collect();
+            let mut pos = 0usize;
+            parse_cond_or(&b, &mut pos)
+        };
+        assert!(cond("SM IN (?, 7)").is_none());
+        assert!(cond("SM IN (7, ?)").is_none());
+        assert!(cond("SM IN (?, ?)").is_some());
+        assert!(cond("SM IN (?)").is_some());
+        assert!(cond("SM IN (1, 7)").is_some());
     }
 
     #[test]

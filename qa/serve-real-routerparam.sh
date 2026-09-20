@@ -205,20 +205,24 @@ both "SUM(ID * 2) - no parameter"         "SELECT SUM(ID * 2) FROM T"
 both "ORDER BY ID * -1 - no parameter"    "SELECT ID FROM T ORDER BY ID * -1"
 both "GROUP BY N + 1 - no parameter"      "SELECT COUNT(*) FROM T GROUP BY N + 1"
 both "a typed ? in a grouped select list" "SELECT CAST(? AS INTEGER), COUNT(*) FROM T GROUP BY N" '[7]'
-# FOUND ALONG THE WAY, PRE-EXISTING: the engine types a HAVING `?` from
-# COUNT(*) INCLUDING its NOT NULL, this server announces it Nullable
-desc_differs "HAVING COUNT(*) > ? - the input slot's nullability" "SELECT COUNT(*) FROM T HAVING COUNT(*) > ?" '[1]'
+# the engine types a HAVING `?` from COUNT(*) INCLUDING its NOT NULL -
+# this server announced it Nullable until the comparison-typing chunk
+# gave the HAVING claim the aggregate's own nullability (agg_param_flags)
+both "HAVING COUNT(*) > ? - the input slot's nullability" "SELECT COUNT(*) FROM T HAVING COUNT(*) > ?" '[1]'
 
-echo "-- 7. RECORDED: the comparison-typing law (a ? inside arithmetic under a compare) --"
+echo "-- 7. the comparison-typing law (a ? inside arithmetic under a compare) --"
 # the engine types such a `?` from the OTHER side of the comparison
 # (measured: `HAVING SUM(ID) > ? + 1` describes INT64, `N + ? > 4` LONG
-# NOT NULL from the literal); this server's resolve_expr_term refuses it
-eng_only "HAVING SUM(ID) > ? + 1"         "SELECT N FROM T GROUP BY N HAVING SUM(ID) > ? + 1" '[2]'
-eng_only "HAVING N + ? > 4"               "SELECT N FROM T GROUP BY N HAVING N + ? > 4" '[1]'
-eng_only "WHERE ID * ? = 2"               "SELECT ID FROM T WHERE ID * ? = 2" '[2]'
+# NOT NULL from the literal). These refused at PARSE - texpr_atom_bare
+# had no Tok::Param arm, so the term never reached resolve_expr_term -
+# until the comparison-typing chunk; serve-real-cmpparam carries the law
+both "HAVING SUM(ID) > ? + 1"             "SELECT N FROM T GROUP BY N HAVING SUM(ID) > ? + 1" '[2]'
+both "HAVING N + ? > 4"                   "SELECT N FROM T GROUP BY N HAVING N + ? > 4" '[1]'
+both "WHERE ID * ? = 2"                   "SELECT ID FROM T WHERE ID * ? = 2" '[2]'
 # a `?` in a CASE/IIF CONDITION is typed from the comparison - the same
-# law, inside the conditional; resolve_raw_cond refuses a parameter
-eng_only "ORDER BY IIF(ID = CAST(? AS INTEGER), 0, 1)" "SELECT ID FROM T ORDER BY IIF(ID = CAST(? AS INTEGER), 0, 1), ID" '[2]'
+# law, inside the conditional, through resolve_raw_cond_sink; the ORDER
+# BY router reaches it through resolve_expr_sink
+both "ORDER BY IIF(ID = CAST(? AS INTEGER), 0, 1)" "SELECT ID FROM T ORDER BY IIF(ID = CAST(? AS INTEGER), 0, 1), ID" '[2]'
 
 echo "-- 8. RECORDED: a grouped query's NON-AGGREGATE order expression (not a parameter matter) --"
 eng_only "GROUP BY N ORDER BY COALESCE(?, N) DESC" "SELECT N, COUNT(*) FROM T GROUP BY N ORDER BY COALESCE(?, N) DESC" '[null]'

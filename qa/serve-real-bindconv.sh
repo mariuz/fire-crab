@@ -320,9 +320,10 @@ both "SELECT ID FROM P WHERE I = ? AND ID IN (SELECT ID FROM J WHERE I = ?) ORDE
 both "SELECT ID FROM P WHERE ID IN (SELECT ID FROM J WHERE I = ?) AND I = ? ORDER BY 1" '[1, 5]'
 both "SELECT ID FROM P WHERE I = ? AND ID IN (SELECT ID FROM J WHERE I = ?) ORDER BY 1" '[9, 1]'
 
+echo "-- a written text CAST over a ? as a comparison side (answered since the comparison-typing chunk; was a recorded refusal) --"
+both "SELECT ID FROM P WHERE S = CAST(? AS VARCHAR(5))" '["a"]'
+both "SELECT ID FROM P WHERE S = CAST(? AS VARCHAR(5))" '["abcdefghij"]'
 echo "-- recorded refusals (fire-crab only) --"
-refuses "SELECT ID FROM P WHERE S = CAST(? AS VARCHAR(5))" '["a"]'
-refuses "SELECT ID FROM P WHERE S = CAST(? AS VARCHAR(5))" '["abcdefghij"]'
 refuses "SELECT ID FROM P WHERE I < ?" '["1e-400"]'
 refuses "SELECT ID FROM P WHERE I = ?" '["0X10"]'
 
