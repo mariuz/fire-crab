@@ -338,11 +338,18 @@ pub fn render_double(d: f64) -> String {
 
 fn render_approx(d: f64, p: i32) -> String {
     let P = p; // significant digits
+    // THE ENGINE SPELLS A NON-FINITE DOUBLE IN LOWER CASE AND SHORT:
+    // `nan`, `inf`, `-inf`.  Measured 2026-09-20 through CAST to VARCHAR
+    // and to CHAR (where it pads to `inf       `), and it is NOT
+    // cosmetic - `CAST(? AS VARCHAR(30)) = 'inf'` is 1 on the engine and
+    // was 0 here, and `CHAR_LENGTH` of it is 3 and not 8.  The refuter
+    // counted ELEVEN routers the text reaches, two of them row-mutating
+    // (a stored VARCHAR column and a trigger's computed text).
     if d.is_nan() {
-        return "NaN".into();
+        return "nan".into();
     }
     if d.is_infinite() {
-        return if d < 0.0 { "-Infinity".into() } else { "Infinity".into() };
+        return if d < 0.0 { "-inf".into() } else { "inf".into() };
     }
     if d == 0.0 {
         return format!("{:.*}", (P - 1) as usize, 0.0);
@@ -912,6 +919,25 @@ fn scan_formats(
 
 #[cfg(test)]
 mod tests {
+
+    /// THE ENGINE SPELLS A NON-FINITE DOUBLE IN LOWER CASE AND SHORT.
+    /// Measured 2026-09-20 against the live engine through CAST to
+    /// VARCHAR and to CHAR, and it is not cosmetic: `CAST(? AS
+    /// VARCHAR(30)) = 'inf'` is TRUE on the engine and was FALSE here,
+    /// `CHAR_LENGTH` of it is 3 and not 8, and the refuter counted
+    /// eleven routers the text reaches, two of them row-mutating.
+    #[test]
+    fn a_non_finite_double_renders_the_way_the_engine_spells_it() {
+        assert_eq!(render_double(f64::NAN), "nan");
+        assert_eq!(render_double(f64::INFINITY), "inf");
+        assert_eq!(render_double(f64::NEG_INFINITY), "-inf");
+        assert_eq!(render_float(f32::NAN), "nan");
+        assert_eq!(render_float(f32::INFINITY), "inf");
+        assert_eq!(render_float(f32::NEG_INFINITY), "-inf");
+        // ...and a FINITE value is untouched by the rule
+        assert_eq!(render_double(2.5), "2.500000000000000");
+        assert_eq!(render_double(0.0), "0.000000000000000");
+    }
 
     #[test]
     fn reads_the_default_section_the_engine_wrote() {

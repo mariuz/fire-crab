@@ -62194,6 +62194,21 @@ fn nan_param_reaches(e: &Expr, args: &[WireParam]) -> bool {
         {
             false
         }
+        // A WRITTEN CAST TO TEXT ABSORBS IT TOO, by RENDERING it: past
+        // the cast there is no double left, only the string `nan`, and
+        // the comparison above it is an ordinary text comparison.
+        // Measured 2026-09-20 over all six operators against 'inf' plus
+        // a text COLUMN on either side - the engine's answers are
+        // exactly what comparing the literal string `nan` gives
+        // (`'nan' < 'inf'` is 0, `'nan' > 'inf'` is 1), and the
+        // +-Infinity twins already matched once [render_approx] spelled
+        // them the engine's way.  Only a WRITTEN cast: the implicit slot
+        // cast is excluded for the same reason it is above.
+        Expr::Cast(_, CastTarget::Text { .. }, cs)
+            if !(matches!(*cs, CS_SLOT_CAST) || is_whole_side(*cs)) =>
+        {
+            false
+        }
         Expr::Cast(a, _, _) | Expr::Neg(a) => nan_param_reaches(a, args),
         Expr::Bin(a, _, b) | Expr::Concat(a, b) | Expr::NullIf(a, b) => {
             nan_param_reaches(a, args) || nan_param_reaches(b, args)
@@ -100406,7 +100421,22 @@ fn bool_literal(e: &Expr) -> Option<Expr> {
 /// wrong answer.
 fn approx_literal(e: &Expr) -> Option<Expr> {
     match e {
-        Expr::Str(s) => s.trim_matches(' ').parse::<f64>().ok().map(Expr::Double),
+        // ...and a NON-FINITE SPELLING IS NOT A NUMBER TO THIS ENGINE.
+        // Rust's f64 parser accepts `nan`, `inf`, `infinity` and their
+        // signed and cased variants; the engine accepts NONE of them and
+        // raises 22018 - measured 2026-09-20: `D = 'Infinity'`,
+        // `D = 'inf'`, `D = 'nan'` and `D < 'Infinity'` all raise there,
+        // while this server answered, and `D = 'nan'` answered EVERY ROW
+        // because the NaN it parsed compares equal to everything.  The
+        // sibling paths already refuse ([text_to_approx] ends with
+        // `d.is_finite()`, and a TEXT *bind* refuses too); this literal
+        // arm was the one that did not.
+        Expr::Str(s) => s
+            .trim_matches(' ')
+            .parse::<f64>()
+            .ok()
+            .filter(|d| d.is_finite())
+            .map(Expr::Double),
         _ => None,
     }
 }
