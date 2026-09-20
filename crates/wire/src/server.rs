@@ -12427,12 +12427,12 @@ impl Predicate {
                         match args.get(*slot).ok_or("missing parameter value")? {
                             WireParam::Null => Term::Unknown,
                             WireParam::Text(t) | WireParam::TextCs(t, _) => {
-                                containing_term((**e).clone(), *tt, t, *negated)
+                                containing_term((**e).clone(), *tt, t, *negated, true)
                             }
                             // an integer bind renders to its decimal
                             // text, as it does for LIKE and STARTING
                             WireParam::Int(v, 0) => {
-                                containing_term((**e).clone(), *tt, &v.to_string(), *negated)
+                                containing_term((**e).clone(), *tt, &v.to_string(), *negated, true)
                             }
                             _ => {
                                 return Err(
@@ -69822,7 +69822,7 @@ fn resolve_raw_cond(
                 return None;
             }
             let (value, tt) = collate_operand_ttype(e, descs)?;
-            match containing_term(value, tt, pat, *negated) {
+            match containing_term(value, tt, pat, *negated, true) {
                 Term::ExprLike(x, p, esc, n) => Cond2::Like(x, p, esc, n),
                 _ => return None, // containing_term builds only that shape
             }
@@ -75786,6 +75786,19 @@ fn converting_expr_pattern(e: &Expr, p: &str, descs: &[Descriptor]) -> Option<St
     if let Some(ExprType::Temporal(k)) = e.type_of(descs) {
         return temporal_pattern_text(p, k);
     }
+    // A DECFLOAT OPERAND CONVERTS TOO, and this router was the
+    // DECFLOAT law's own unclosed hole: [ExprType] has no DECFLOAT
+    // member (a DECFLOAT column types as `Numeric`, which is not
+    // `is_wide`), so the pattern passed through untouched and
+    // `SUM(IIF(D34 LIKE '1%',1,0))` ANSWERED 3 where the engine raises
+    // 22018, while `SUM(IIF(D34 STARTING WITH '01',1,0))` answered 0
+    // where the engine answers 3.  Two silent wrong answers, found by
+    // asking the INT128 chunk's router question of the family next door.
+    // The conversion itself is [dec_literal_pattern]'s, unchanged, so
+    // the two entry points cannot drift.
+    if let Some(d) = expr_decfloat_desc(e, descs) {
+        return dec_literal_pattern(p, d);
+    }
     if expr_is_double(e, descs) {
         return wide_pattern_text(p, true);
     }
@@ -75804,6 +75817,39 @@ fn converting_expr_pattern(e: &Expr, p: &str, descs: &[Descriptor]) -> Option<St
 /// "approximate".
 fn expr_is_double(e: &Expr, descs: &[Descriptor]) -> bool {
     matches!(e, Expr::Col(fid) if descs.get(*fid).is_some_and(|d| d.dtype == dtype::DOUBLE))
+}
+
+/// Is this a pattern operand that legitimately has NO [ExprType] - a
+/// DECFLOAT column or a DECFLOAT arithmetic tree?
+///
+/// [expr_type_of_desc] ends at the temporals, so a DECFLOAT has no
+/// member to answer with; every `type_of(..)?` in the resolvers and in
+/// the post-resolution type check therefore reads it as "untypable" and
+/// refuses. The comparison arms already carry this exception
+/// ([is_decfloat_arith]); the pattern arms need it for the same reason.
+/// A DECFLOAT ARITHMETIC TREE IS DELIBERATELY NOT HERE. Its pattern has
+/// no conversion yet ([converting_expr_pattern] reaches a COLUMN's
+/// descriptor and nothing else), so admitting it turned two refusals
+/// into WRONG ANSWERS in this chunk's own first draft: `D34 + 0 LIKE
+/// '1%'` and `CAST(N92 AS DECFLOAT(34)) LIKE '1%'` answered rows where
+/// the engine raises 22018. Refusing an operand whose pattern cannot be
+/// converted is the whole reason this predicate is narrow.
+fn pattern_operand_untyped(e: &Expr, descs: &[Descriptor]) -> bool {
+    expr_decfloat_desc(e, descs).is_some()
+}
+
+/// The descriptor of a DECFLOAT COLUMN operand, or None.
+///
+/// A DECFLOAT descriptor has NO [ExprType] at all ([expr_type_of_desc]
+/// ends at the temporals), so every `lhs.type_of(descs)?` gate in the
+/// expression resolver refuses one outright - which is why the family's
+/// pattern law kept ending at the typed path. This is the one question
+/// those gates can ask instead.
+fn expr_decfloat_desc<'a>(e: &Expr, descs: &'a [Descriptor]) -> Option<&'a Descriptor> {
+    match e {
+        Expr::Col(fid) => descs.get(*fid).filter(|d| matches!(d.dtype, dtype::DEC64 | dtype::DEC128)),
+        _ => None,
+    }
 }
 
 /// The conversion itself, written ONCE so the column entry point and the
@@ -99122,7 +99168,16 @@ const CONTAINING_ESCAPE: char = '\\';
 /// and escape character are escaped before the `%…%` wrap. An EMPTY
 /// pattern becomes `%%`, which matches every non-NULL row, as the
 /// engine does.
-fn containing_term(value: Expr, ttype: u16, pattern: &str, negated: bool) -> Term {
+///
+/// `wrap_canon` says whether the VALUE is wrapped in [Expr::CollCanon] for the
+/// match. It is true everywhere a case can be folded, and FALSE for a
+/// DECFLOAT operand: that wrap borrows the inner expression's
+/// [ExprType], a DECFLOAT descriptor has none ([expr_decfloat_desc]),
+/// and the untypable term then refuses the statement - which is how
+/// `D34 CONTAINING '0'` stayed a refusal after its whole family had been
+/// routed here. A rendered decimal has no case to fold, so nothing is
+/// lost by dropping it.
+fn containing_term(value: Expr, ttype: u16, pattern: &str, negated: bool, wrap_canon: bool) -> Term {
     let cs = fire_crab_ods::intl::charset_id(ttype as i16);
     let up = upcase_cs(cs, pattern);
     let canon = match fire_crab_ods::coll::icu_strength_of_ttype(ttype) {
@@ -99136,8 +99191,9 @@ fn containing_term(value: Expr, ttype: u16, pattern: &str, negated: bool) -> Ter
         }
         escaped.push(c);
     }
+    let value = if wrap_canon { Expr::CollCanon(Box::new(value), ttype, true) } else { value };
     Term::ExprLike(
-        Box::new(Expr::CollCanon(Box::new(value), ttype, true)),
+        Box::new(value),
         format!("%{escaped}%"),
         Some(CONTAINING_ESCAPE),
         negated,
@@ -99534,6 +99590,25 @@ fn resolve_predicate(
             if matches!(d.dtype, dtype::TEXT | dtype::VARYING)
                 && fire_crab_ods::intl::charset_id(d.sub_type)
                     == fire_crab_ods::intl::CS_OCTETS
+            {
+                terms.push(resolve_expr_term(&rt, columns, descs, params)?);
+                continue;
+            }
+            // CONTAINING over an exact-numeric or DECFLOAT column, and
+            // SIMILAR TO over ANY non-text column, take the EXPRESSION
+            // path as well: that is where the pattern family's single
+            // conversion law lives, and both typed resolvers refuse the
+            // two outright.  Every one of these is an answer the engine
+            // gives and this server refused - `N92 CONTAINING '.5'` is
+            // 1;3, `D16 CONTAINING '.5'` is 3, `SM SIMILAR TO '1%'` is
+            // every row, `N92 SIMILAR TO '1%'` likewise, and
+            // `N382 SIMILAR TO '1.50'` answers through the converted
+            // "1.50" while `N382 SIMILAR TO '1%'` raises the same 22018
+            // its LIKE twin does.
+            if (matches!(rt.kind, RawKind::Containing(Rhs::Str(_) | Rhs::Param(..), _))
+                && (is_numeric_col(d) || is_decfloat_col(d)))
+                || (matches!(rt.kind, RawKind::Similar(Rhs::Str(..), ..))
+                    && !matches!(d.dtype, dtype::TEXT | dtype::VARYING))
             {
                 terms.push(resolve_expr_term(&rt, columns, descs, params)?);
                 continue;
@@ -100256,11 +100331,23 @@ fn resolve_expr_term(
                 // `DT LIKE ?` bound '2%' answer rows where the literal
                 // `DT LIKE '2%'` raises.  The conversion is a PREPARE-time
                 // fold and a parameter has no value to fold.
-                ExprType::Int | ExprType::Numeric | ExprType::Temporal(_) => NUM_LIKE_PATTERN_LEN,
+                //
+                // AN APPROXIMATE AND A BOOLEAN SIDE TAKE IT TOO, and
+                // leaving them out cost real answers at both: `DP LIKE ?`
+                // bound '1%' is 1;2 on the engine and `B LIKE ?` bound
+                // 'F%' is the FALSE row, while this server refused each
+                // with a Dynamic SQL Error.  Every non-text operand
+                // announces the same `VARYING len 30 charset NONE`
+                // (measured, all eight families), so the arm is the type
+                // list and nothing else.
+                ExprType::Int
+                | ExprType::Numeric
+                | ExprType::Temporal(_)
+                | ExprType::Approx
+                | ExprType::Bool => NUM_LIKE_PATTERN_LEN,
                 ExprType::Text => text_param_width(&lhs, descs)
                     .map(|(_, w)| (w as u16).saturating_add(2))
                     .unwrap_or(32765),
-                _ => return None,
             };
             if params.len() <= *slot {
                 params.resize(*slot + 1, None);
@@ -100303,11 +100390,37 @@ fn resolve_expr_term(
         }
         RawKind::Similar(Rhs::Str(p), escape, negated) => {
             // a TEXT-typed expression against a literal pattern, compiled
-            // once (malformed refuses at prepare). A non-text side, or a
-            // parameter pattern, is a later slice.
-            if !matches!(lhs.type_of(descs), Some(ExprType::Text)) {
+            // once (malformed refuses at prepare). A parameter pattern is
+            // a later slice.
+            //
+            // A NON-TEXT OPERAND IS RENDERED TEXT HERE EXACTLY AS IT IS
+            // FOR LIKE - and the CONVERSION IS THE SAME ONE, which is
+            // what makes this arm three lines rather than a law of its
+            // own.  Measured: `SM SIMILAR TO '1%'` and `FL SIMILAR TO
+            // '1%'` ANSWER (neither converts), `N92 SIMILAR TO '1%'`
+            // answers, while `N382`, `I128`, `DP` and `D34` raise the
+            // same one-line 22018 a LIKE wildcard raises, and
+            // `N382 SIMILAR TO '1.50'` - a pattern that CAN convert -
+            // answers the row through the rendered "1.50".
+            //
+            // A TEMPORAL operand is left refusing: there the engine
+            // raises whatever the pattern is - 22018 for `'2020%'` and
+            // *Invalid SIMILAR TO pattern* for `'2020-01-15'`, which
+            // converts and then will not compile - and a refusal loses
+            // no answer.
+            if expr_decfloat_desc(&lhs, descs).is_none()
+                && !matches!(
+                    lhs.type_of(descs)?,
+                    ExprType::Text
+                        | ExprType::Int
+                        | ExprType::Numeric
+                        | ExprType::Approx
+                        | ExprType::Bool
+                )
+            {
                 return None;
             }
+            let p = &converting_expr_pattern(&lhs, p, descs)?;
             // A TEXT PATTERN AGAINST A BYTE-CARRIER SIDE IS BYTE-COPIED
             // INTO IT - and the copy is by the ATTACHMENT's encoding, for
             // EVERY carrier, not by UTF-8 for OCTETS alone.
@@ -100371,9 +100484,47 @@ fn resolve_expr_term(
         // form; an explicit COLLATE on it replaces that ttype, as it
         // does everywhere else.
         RawKind::Containing(Rhs::Str(p), negated) => {
-            if !matches!(lhs.type_of(descs)?, ExprType::Text | ExprType::Int) {
+            // EVERY RENDERABLE NON-TEMPORAL OPERAND, not just text and
+            // integers.  Measured: `N92 CONTAINING '.5'` is 1;3,
+            // `N382 CONTAINING '.5'` is 3, `I128 CONTAINING '0'` is 2;3,
+            // `FL CONTAINING '.5'` is 1;3, `D16 CONTAINING '.5'` is 3 and
+            // `B CONTAINING 'ru'` is the TRUE row (the substring test
+            // folds case, so a lower-case needle finds "TRUE") - all of
+            // them answers this server refused, and the INT128 chunk had
+            // recorded one of them as a boundary without knowing it was
+            // the whole family.
+            //
+            // AND IT CONVERTS ITS NEEDLE BY THE SAME LAW LIKE DOES -
+            // which took a second reading, because most CONTAINING cells
+            // answer the same either way.  THE THREE THAT DISCRIMINATE:
+            // `D16 CONTAINING '.5'` is 3 alone (converted to "0.5", which
+            // only "100.50" contains) where the raw needle would take 1
+            // as well; `DP CONTAINING '.5'` is NO ROWS (converted to the
+            // canonical "0.500000000000000"); and `DT CONTAINING '2020'`
+            // RAISES 22018 while `DT CONTAINING '15.01.2020'` answers
+            // through the date grammar.  `FL` and the narrow numerics
+            // answer the RAW needle, exactly as they do for LIKE.
+            //
+            // The conversion happens BEFORE the `%…%` wrap - the engine's
+            // vector quotes `"2020"`, not `"%2020%"` - so it is the same
+            // [converting_expr_pattern] call the LIKE arm makes, on the
+            // same operand, and no second law is written here.
+            // a DECFLOAT operand is asked for SEPARATELY because it has
+            // no `ExprType` to match ([expr_decfloat_desc])
+            if expr_decfloat_desc(&lhs, descs).is_none()
+                && !matches!(
+                    lhs.type_of(descs)?,
+                    ExprType::Text
+                        | ExprType::Int
+                        | ExprType::Numeric
+                        | ExprType::Approx
+                        | ExprType::Bool
+                        | ExprType::Temporal(_)
+                )
+            {
                 return None;
             }
+            let p = &converting_expr_pattern(&lhs, p, descs)?;
             let (value, tt) = match &lhs {
                 Expr::Collate(inner, tt) => ((**inner).clone(), *tt),
                 other => (
@@ -100428,7 +100579,7 @@ fn resolve_expr_term(
             } else {
                 p.clone()
             };
-            containing_term(value, tt, &redone, *negated)
+            containing_term(value, tt, &redone, *negated, expr_decfloat_desc(&lhs, descs).is_none())
         }
         RawKind::Containing(Rhs::Null, _) => Term::Never,
         // `<numeric side> CONTAINING ?` - the bound-pattern twin of the
@@ -100445,7 +100596,24 @@ fn resolve_expr_term(
         // descriptor, which is what the engine announces), and a text
         // EXPRESSION's slot width is unprobed.
         RawKind::Containing(Rhs::Param(slot, _, ..), negated) => {
-            if !matches!(lhs.type_of(descs)?, ExprType::Int | ExprType::Numeric) {
+            // EVERY non-text family, and the needle is NOT CONVERTED -
+            // which is where this arm's law is sharpest.  The same text,
+            // written as a literal and bound as a parameter, gives
+            // DIFFERENT answers on a converting operand: `DP CONTAINING
+            // '.5'` is NO ROWS (the literal converts to the canonical
+            // "0.500000000000000") while `DP CONTAINING ?` bound '.5' is
+            // 1;3, and `DT CONTAINING '2020'` RAISES 22018 while
+            // `DT CONTAINING ?` bound '2020' answers the row.
+            if expr_decfloat_desc(&lhs, descs).is_none()
+                && !matches!(
+                    lhs.type_of(descs)?,
+                    ExprType::Int
+                        | ExprType::Numeric
+                        | ExprType::Approx
+                        | ExprType::Bool
+                        | ExprType::Temporal(_)
+                )
+            {
                 return None;
             }
             if params.len() <= *slot {
@@ -100481,9 +100649,17 @@ fn resolve_expr_term(
             // raw text; a DOUBLE does, and [converting_expr_pattern] knows
             // which is which.  Refusing at an edge nobody had measured
             // is the trap the house laws warn about, and this was one.
+            // ...and a BOOLEAN is simply RENDERED TEXT: `B STARTING WITH
+            // 'T'` is the TRUE row on the engine, `'t'` is no rows (the
+            // prefix is case-sensitive) and `'TRUEX'` is no rows.  It
+            // converts nothing, so it takes the raw prefix.
             if !matches!(
                 lhs.type_of(descs)?,
-                ExprType::Text | ExprType::Int | ExprType::Approx | ExprType::Temporal(_)
+                ExprType::Text
+                    | ExprType::Int
+                    | ExprType::Approx
+                    | ExprType::Temporal(_)
+                    | ExprType::Bool
             ) {
                 return None;
             }
@@ -100517,6 +100693,47 @@ fn resolve_expr_term(
                 ),
                 None => Term::ExprStarting(Box::new(lhs), p, *negated),
             }
+        }
+        // `<non-text expression> STARTING WITH ?` - the prefix twin of
+        // the bound-pattern arm above, and until it existed there was NO
+        // arm here at all: `DP STARTING WITH ?`, `DT`, `TS`, `TM` and
+        // `B STARTING WITH ?` every one refused with a Dynamic SQL Error
+        // where the engine answers rows.  (A plain TEXT or INTEGER
+        // COLUMN never arrives here - [col_kind] answers for those and
+        // the typed path has carried them all along - which is exactly
+        // why the hole was invisible.)
+        //
+        // A TEXT-typed EXPRESSION is deliberately still refused: its
+        // prefix test is decided by the operand's COLLATION, which the
+        // literal arm above wraps in [Expr::CollCanon] and a value known
+        // only at bind cannot be wrapped the same way.  Refusing there
+        // keeps a law this arm has not measured from being invented.
+        RawKind::Starting(Rhs::Param(slot, _, ..), negated) => {
+            if !matches!(
+                lhs.type_of(descs)?,
+                ExprType::Int
+                    | ExprType::Numeric
+                    | ExprType::Approx
+                    | ExprType::Temporal(_)
+                    | ExprType::Bool
+            ) {
+                return None;
+            }
+            if params.len() <= *slot {
+                params.resize(*slot + 1, None);
+            }
+            // the same slot the LIKE twin announces, measured on the
+            // engine for every one of these families: VARYING len 30,
+            // charset NONE
+            params[*slot] = Some(Descriptor {
+                dtype: dtype::VARYING,
+                scale: 0,
+                length: NUM_LIKE_PATTERN_LEN,
+                sub_type: ATT_SUBTYPE as i16,
+                flags: if expr_has_col(&lhs) { 0 } else { PARAM_NOT_NULL },
+                offset: 4,
+            });
+            Term::ExprStartingParam(Box::new(lhs), *slot, *negated)
         }
         RawKind::Starting(Rhs::Null, _) => Term::Never,
         RawKind::Starting(..) => return None, // non-literal prefix
@@ -100612,7 +100829,9 @@ fn resolve_expr_term(
                 }
             }
             Cond2::Like(a, ..) | Cond2::Starting(a, ..) | Cond2::Similar(a, ..) => {
-                a.type_of(descs)?;
+                if !pattern_operand_untyped(a, descs) {
+                    a.type_of(descs)?;
+                }
             }
             // BOTH sides must type. Silent site: this match ends in a
             // catch-all, so a new variant would simply skip the check.
@@ -100646,7 +100865,18 @@ fn resolve_expr_term(
             pat.type_of(descs)?;
         }
         Term::ExprLike(e, ..) | Term::ExprStarting(e, ..) => {
-            e.type_of(descs)?;
+            // ...and a DECFLOAT operand is EXEMPT, the same exception the
+            // comparison arms above already make for a DECFLOAT
+            // arithmetic side.  This one line is where every routed
+            // DECFLOAT pattern died: the resolver built the right term
+            // and this check - the LAST thing between it and the
+            // planner - refused it for having no [ExprType], which a
+            // DECFLOAT descriptor never has.  `D34 CONTAINING '0'`
+            // reached `containing_term`, came back a correct
+            // `Term::ExprLike`, and was thrown away here.
+            if !pattern_operand_untyped(e, descs) {
+                e.type_of(descs)?;
+            }
         }
         _ => {}
     }
@@ -101892,7 +102122,7 @@ fn param_or_typed_term(
             } else {
                 p.clone()
             };
-            return Some(containing_term(Expr::Col(idx), tt, &pat, *negated));
+            return Some(containing_term(Expr::Col(idx), tt, &pat, *negated, true));
         }
         return None;
     }
@@ -102059,19 +102289,36 @@ fn param_or_typed_term(
     } else {
         raw
     };
-    let mut claim = |slot: usize| -> Option<()> {
+    // `varying` is the PATTERN half of the claim: a pattern's slot is
+    // ALWAYS VARYING, where a COMPARISON's is the column's own type.
+    // Measured on a CHAR(6) column: `C = ?` announces 452 TEXT len 6 on
+    // both servers, while `C LIKE ?`, `C STARTING WITH ?` and
+    // `C CONTAINING ?` announce 448 VARYING len 6 on the engine and
+    // announced TEXT here - the value agreed in every cell and only the
+    // announcement did not, which is the class of divergence a
+    // describe-comparing gate exists to catch.
+    let mut claim_as = |slot: usize, varying: bool| -> Option<()> {
         if !param_target_ok(d) {
             return None;
         }
         if params.len() <= slot {
             params.resize(slot + 1, None);
         }
-        params[slot] = Some(d.clone());
+        params[slot] = Some(if varying && d.dtype == dtype::TEXT {
+            // a VARYING descriptor's length carries the 2-byte count, so
+            // a CHAR(6) becomes VARYING len 8 to be ANNOUNCED as 6 - the
+            // engine's own `C LIKE ?` slot.  A VARCHAR column is already
+            // VARYING and already carries it, which is why this adds the
+            // two only on the CHAR -> VARYING crossing.
+            Descriptor { dtype: dtype::VARYING, length: d.length.saturating_add(2), ..d.clone() }
+        } else {
+            d.clone()
+        });
         Some(())
     };
     match raw {
         RawKind::Cmp(op, Rhs::Param(slot, _, ..)) => {
-            claim(slot)?;
+            claim_as(slot, false)?;
             // a `?` against a COLLATED column compares by the
             // collation like a literal does: the ExprParam's lhs is
             // already the CollKey wrap, and the BIND arm wraps the
@@ -102105,7 +102352,7 @@ fn param_or_typed_term(
         }
         RawKind::Like(Rhs::Param(slot, _, ..), escape, negated) => match kind {
             ColKind::Text => {
-                claim(slot)?;
+                claim_as(slot, true)?;
                 Some(Term::Like(idx, Rhs::Param(slot, ColKind::Text, false), escape, negated))
             }
             // an INTEGER column: the engine renders the column to its
@@ -102152,7 +102399,7 @@ fn param_or_typed_term(
                 if !canonical_known {
                     return None;
                 }
-                claim(slot)?;
+                claim_as(slot, true)?;
                 Some(Term::ExprContainingParam(
                     Box::new(Expr::Col(idx)),
                     tt,
@@ -102187,14 +102434,14 @@ fn param_or_typed_term(
         // A non-text column is a later slice.
         RawKind::Similar(Rhs::Param(slot, _, ..), escape, negated) => match kind {
             ColKind::Text => {
-                claim(slot)?;
+                claim_as(slot, true)?;
                 Some(Term::ParamSimilar(idx, slot, escape, negated))
             }
             _ => None,
         },
         RawKind::Starting(Rhs::Param(slot, _, ..), negated) => match kind {
             ColKind::Text => {
-                claim(slot)?;
+                claim_as(slot, true)?;
                 Some(Term::Starting(idx, Rhs::Param(slot, ColKind::Text, false), negated))
             }
             // an INTEGER column: the engine renders the column to its
@@ -127064,6 +127311,22 @@ mod computed_wide_types {
         for p in ["1%", "1.5", "1.5e0", "abc"] {
             assert_eq!(converting_literal_pattern(p, &fl).as_deref(), Some(p), "{p}");
         }
+
+        // A DECFLOAT OPERAND CONVERTS THROUGH THE EXPRESSION ROUTER TOO.
+        // It has no [ExprType] at all, so it reached neither the wide
+        // test nor the double one and its pattern passed through
+        // untouched - `SUM(IIF(D34 LIKE '1%',1,0))` ANSWERED 3 where the
+        // engine raises, and `STARTING WITH '01'` answered 0 where the
+        // engine answers 3.  The conversion is [dec_literal_pattern]'s,
+        // reached through [expr_decfloat_desc].
+        let dec = vec![d(dtype::DEC128, 0, 16)];
+        let col = Expr::Col(0);
+        assert_eq!(converting_expr_pattern(&col, "01", &dec).as_deref(), Some("1"));
+        assert_eq!(converting_expr_pattern(&col, "1.50", &dec).as_deref(), Some("1.50"));
+        assert_eq!(converting_expr_pattern(&col, "1%", &dec), None);
+        // ...while a FLOAT expression still passes its pattern through
+        let fls = vec![d(dtype::REAL, 0, 4)];
+        assert_eq!(converting_expr_pattern(&Expr::Col(0), "1%", &fls).as_deref(), Some("1%"));
     }
 
     /// A LIKE / STARTING PATTERN AGAINST A TEMPORAL OPERAND

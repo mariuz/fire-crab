@@ -423,8 +423,11 @@ both      "10 CONTROL N92 LIKE '1.50'  - the narrow numeric's rendered match" "S
 both      "10 CONTROL EXTRACT(YEAR FROM DT) = 2020 - a temporal FUNCTION is not a pattern" "SELECT ID FROM T WHERE EXTRACT(YEAR FROM DT) = 2020 ORDER BY ID"
 
 echo "--- 11. RECORDED, NOT FIXED"
-err_differs "11 DT CONTAINING '2020' - the engine converts and raises; this server refuses the shape" \
-            "SELECT ID FROM T WHERE DT CONTAINING '2020'" "22018" "42000"
+# CONTAINING over a temporal CONVERTS, exactly as LIKE does - it was a
+# recorded vector gap here until `serve-real-patternfam.sh` routed the
+# whole pattern family through one conversion, and the cell self-expired.
+err_same  "11 DT CONTAINING '2020' - the needle converts, and a bare year is no date" "SELECT ID FROM T WHERE DT CONTAINING '2020'"
+both      "11 DT CONTAINING '15.01.2020' - ...while a convertible one answers through the render" "SELECT ID FROM T WHERE DT CONTAINING '15.01.2020' ORDER BY ID"
 err_differs "11 DT SIMILAR TO '2%'   - likewise" \
             "SELECT ID FROM T WHERE DT SIMILAR TO '2%'" "22018" "42000"
 # fire-crab knows the zone NAMES but not the tzdata RULES, so it cannot
@@ -454,8 +457,8 @@ both      "12 TM LIKE ? ['10:20:30.0000'] - which at the full render does match"
 # is the one this chunk widened), so a bound prefix over a temporal
 # refuses.  Recorded rather than answered - the engine's answers are
 # pinned here, so the day the arm exists these two cells say so.
-eng_only  "12 DT STARTING WITH ? ['2020'] - a bare year IS a prefix of the render, and this server refuses the shape" "SELECT ID FROM T WHERE DT STARTING WITH ? ORDER BY ID" '["2020"]'
-eng_only  "12 DT STARTING WITH ? ['2020-1-15'] - ...and so is the converting spelling's miss" "SELECT ID FROM T WHERE DT STARTING WITH ? ORDER BY ID" '["2020-1-15"]'
+both      "12 DT STARTING WITH ? ['2020'] - A BARE YEAR IS A PREFIX HERE, where the LITERAL form raises" "SELECT ID FROM T WHERE DT STARTING WITH ? ORDER BY ID" '["2020"]'
+both      "12 DT STARTING WITH ? ['2020-1-15'] - ...and the CONVERTING spelling matches nothing, because nothing converted" "SELECT ID FROM T WHERE DT STARTING WITH ? ORDER BY ID" '["2020-1-15"]'
 
 # ---------------------------------------------------------------
 echo "--- panic check"

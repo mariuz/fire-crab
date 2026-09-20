@@ -270,9 +270,16 @@ echo "--- 6. RECORDED, NOT FIXED"
 # rendering "10" would predict 2;3 and the engine answers nothing.
 both      "6 N382 STARTING WITH '1e1' - the exponent keeps the raw text, and the engine agrees" "SELECT ID FROM T WHERE N382 STARTING WITH '1e1' ORDER BY ID"
 both      "6 N382 LIKE '99999999999999999999999.50' - an INT128-magnitude pattern converts and misses" "SELECT ID FROM T WHERE N382 LIKE '99999999999999999999999.50' ORDER BY ID"
-eng_only  "6 N382 CONTAINING '1' - this server refuses CONTAINING over a numeric column, on both binaries" "SELECT ID FROM T WHERE N382 CONTAINING '1' ORDER BY ID"
-err_differs "6 N382 SIMILAR TO '1%' - the engine converts and raises; this server refuses the shape" \
-            "SELECT ID FROM T WHERE N382 SIMILAR TO '1%'" "22018" "42000"
+# CONTAINING and SIMILAR TO over a wide numeric were a recorded
+# boundary and a recorded vector gap until `serve-real-patternfam.sh`
+# took the whole pattern family through one conversion: CONTAINING
+# matches the RENDERED text (it converts by the same law, which the
+# `'.5'` cells in that gate fix), and SIMILAR TO raises the very 22018
+# its LIKE twin does.  Both cells self-expired, exactly as written.
+both      "6 N382 CONTAINING '1' - the substring test over the rendered value" "SELECT ID FROM T WHERE N382 CONTAINING '1' ORDER BY ID"
+both      "6 N382 CONTAINING '1.50' - ...and the converted needle renders back" "SELECT ID FROM T WHERE N382 CONTAINING '1.50' ORDER BY ID"
+err_same  "6 N382 SIMILAR TO '1%' - a wildcard cannot convert here either" "SELECT ID FROM T WHERE N382 SIMILAR TO '1%'"
+both      "6 N382 SIMILAR TO '1.50' - ...and a convertible pattern answers" "SELECT ID FROM T WHERE N382 SIMILAR TO '1.50' ORDER BY ID"
 
 echo "--- 7. THE OTHER FIVE ROUTERS, because a WHERE over a plain column is not the only way in"
 # `col_kind` answers None for every INT128 column, so a JOIN, a COMPUTED

@@ -294,7 +294,15 @@ impl Value {
             Value::Float(f) => render_float(*f),
             Value::Rounded(raw, scale) if *scale > 0 => format!("{}{}", raw, "0".repeat(*scale as usize)),
             Value::Rounded(raw, scale) => render_scaled(*raw, *scale),
-            Value::Bool(b) => if *b { "true" } else { "false" }.into(),
+            // THE ENGINE SPELLS A BOOLEAN IN CAPITALS EVERYWHERE it
+            // renders one - `CAST(B AS VARCHAR(10))`, `B||'x'` and the
+            // text a LIKE pattern is matched against are all TRUE/FALSE
+            // - and this arm said "true" while SIX hand-written twins in
+            // the wire crate said "TRUE".  The one that disagreed is the
+            // one the pattern matcher uses, so `B LIKE 'T%'` answered
+            // NOTHING where the engine answers the row: a silent wrong
+            // answer, not a refusal.
+            Value::Bool(b) => if *b { "TRUE" } else { "FALSE" }.into(),
             Value::Date(d) => render_date(*d),
             Value::Time(t) => render_time(*t),
             Value::Timestamp(d, t) => format!("{} {}", render_date(*d), render_time(*t)),
@@ -1175,6 +1183,17 @@ mod tests {
 
         // (f) AN UNCHANGED FORMAT is a byte-for-byte identity
         assert_eq!(relay_image(&img, &old, &old).unwrap(), img);
+    }
+
+    /// A BOOLEAN RENDERS IN CAPITALS, and this test exists because the
+    /// one arm that said otherwise was the one a LIKE pattern reads:
+    /// `B LIKE 'T%'` answered NOTHING where the engine answers the row,
+    /// while `CAST(B AS VARCHAR(5))` - which goes through a hand-written
+    /// twin in the wire crate - said TRUE all along.
+    #[test]
+    fn a_boolean_renders_in_capitals() {
+        assert_eq!(Value::Bool(true).render(), "TRUE");
+        assert_eq!(Value::Bool(false).render(), "FALSE");
     }
 
     #[test]
